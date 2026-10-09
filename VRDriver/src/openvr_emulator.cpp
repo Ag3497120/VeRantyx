@@ -1,12 +1,8 @@
-#include "d3d11_depth_hook.h"
-
-#include "minhook/include/MinHook.h"
-#pragma comment(lib, "minhook/libMinHook.x64.a")
-
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <algorithm>
 
 void LogMsg(const char* msg) {
 }
@@ -45,8 +41,13 @@ const int MAX_PIXEL_DATA_SIZE = 4096 * 4096 * 8;
 const int FRAME_BLOCK_SIZE = sizeof(SharedFrame) + MAX_PIXEL_DATA_SIZE;
 
 struct DoubleBufferHeader {
-    uint32_t latestReadyIndex;
-    uint32_t padding[15];
+    volatile LONG latestReadyIndex;
+    volatile LONG pendingTextureHandle;
+    volatile LONG captureRequestSequence;
+    volatile LONG captureAckSequence;
+    volatile LONG captureSourceMode;
+    volatile LONG poseSequence;
+    uint32_t padding[10];
 };
 
 #pragma pack(push, 1)
@@ -54,8 +55,8 @@ struct SharedHands {
     float headTransform[16];
     float leftTransform[16];
     float rightTransform[16];
-    uint8_t leftPinch;
-    uint8_t rightPinch;
+    uint8_t leftTracked;
+    uint8_t rightTracked;
     uint8_t leftTrigger;
     uint8_t rightTrigger;
     uint32_t rightButtons;
@@ -69,8 +70,14 @@ struct SharedHands {
     double visionTimestamp;
     float leftTangents[4];
     float rightTangents[4];
+    uint8_t leftGrip;
+    uint8_t rightGrip;
+    uint8_t headTracked;
 };
 #pragma pack(pop)
+
+static_assert(sizeof(DoubleBufferHeader) == 64, "DoubleBufferHeader layout must match HardwareEncoder.swift");
+static_assert(sizeof(SharedHands) == 287, "SharedHands layout must match HardwareEncoder.swift");
 
 static HANDLE hMapFile = NULL;
 static void* pBuf = NULL;
@@ -79,6 +86,21 @@ static SharedFrame* pHeaders[2] = {NULL, NULL};
 static uint8_t* pPixelDatas[2] = {NULL, NULL};
 static SharedHands* pSharedHands = NULL;
 static uint32_t frameSeq = 1;
+
+static bool ReadSharedHandsSnapshot(SharedHands* snapshot) {
+    if (!snapshot || !pSharedHands || !pDbHeader) return false;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const LONG before = InterlockedCompareExchange(&pDbHeader->poseSequence, 0, 0);
+        if (before & 1) continue;
+        MemoryBarrier();
+        memcpy(snapshot, pSharedHands, sizeof(*snapshot));
+        MemoryBarrier();
+        const LONG after = InterlockedCompareExchange(&pDbHeader->poseSequence, 0, 0);
+        if (before == after && !(after & 1)) return true;
+    }
+    return false;
+}
+
 #define STAGING_BUFFER_SIZE 3
 struct StagingFrame {
     ID3D11Texture2D* pColorLeft = nullptr;
@@ -526,10 +548,12 @@ class Mock_IVRSystem : public vr::IVRSystem {
 public:
     virtual void GetRecommendedRenderTargetSize(uint32_t *pnWidth, uint32_t *pnHeight) override {
         LogMsg("Called: IVRSystem::GetRecommendedRenderTargetSize\n");
+        SharedHands handsSnapshot = {};
+        const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
         // Dynamically calculate the perfect aspect ratio directly from the physical tangents!
-        if (pSharedHands && !std::isnan(pSharedHands->leftTangents[0]) && pSharedHands->leftTangents[0] != 0.0f) {
-            float widthScale = (pSharedHands->leftTangents[1] - pSharedHands->leftTangents[0]);
-            float heightScale = std::abs(pSharedHands->leftTangents[2] - pSharedHands->leftTangents[3]);
+        if (haveHands && !std::isnan(handsSnapshot.leftTangents[0]) && handsSnapshot.leftTangents[0] != 0.0f) {
+            float widthScale = (handsSnapshot.leftTangents[1] - handsSnapshot.leftTangents[0]);
+            float heightScale = std::abs(handsSnapshot.leftTangents[2] - handsSnapshot.leftTangents[3]);
             // Apply 1.15x over-render margin to the base resolution
             if(pnWidth) *pnWidth = (uint32_t)(2000.0f * (widthScale / 2.0f) * 1.15f);
             if(pnHeight) *pnHeight = (uint32_t)(2000.0f * (heightScale / 2.0f) * 1.15f);
@@ -557,8 +581,10 @@ public:
     virtual void GetProjectionRaw(EVREye eEye, float *pfLeft, float *pfRight, float *pfTop, float *pfBottom) override {
         // OVERRENDER MARGIN: Render 15% more FOV to hide black borders during fast head movements
         float overrender = 1.15f;
-        if (pSharedHands && !std::isnan(pSharedHands->leftTangents[0]) && pSharedHands->leftTangents[0] != 0.0f) {
-            float* t = (eEye == vr::Eye_Left) ? pSharedHands->leftTangents : pSharedHands->rightTangents;
+        SharedHands handsSnapshot = {};
+        const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
+        if (haveHands && !std::isnan(handsSnapshot.leftTangents[0]) && handsSnapshot.leftTangents[0] != 0.0f) {
+            float* t = (eEye == vr::Eye_Left) ? handsSnapshot.leftTangents : handsSnapshot.rightTangents;
             // Vision Pro tangents: [0]=left, [1]=right, [2]=top, [3]=bottom
             if(pfLeft) *pfLeft = t[0] * overrender;
             if(pfRight) *pfRight = t[1] * overrender;
@@ -621,6 +647,8 @@ public:
     virtual void GetDeviceToAbsoluteTrackingPose(ETrackingUniverseOrigin eOrigin, float fPredictedSecondsToPhotonsFromNow, VR_ARRAY_COUNT(unTrackedDevicePoseArrayCount) TrackedDevicePose_t *pTrackedDevicePoseArray, uint32_t unTrackedDevicePoseArrayCount) override {
         LogMsg("Called: IVRSystem::GetDeviceToAbsoluteTrackingPose\n");
         if(pTrackedDevicePoseArray && unTrackedDevicePoseArrayCount > 0) { 
+            SharedHands handsSnapshot = {};
+            const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
             static auto lastTime = std::chrono::high_resolution_clock::now();
             auto now = std::chrono::high_resolution_clock::now();
             float dt = std::chrono::duration<float>(now - lastTime).count();
@@ -629,36 +657,18 @@ public:
 
             memset(pTrackedDevicePoseArray, 0, sizeof(vr::TrackedDevicePose_t) * unTrackedDevicePoseArrayCount); 
             for(uint32_t i=0; i<3 && i<unTrackedDevicePoseArrayCount; ++i) { 
-                pTrackedDevicePoseArray[i].bPoseIsValid = true; 
                 pTrackedDevicePoseArray[i].bDeviceIsConnected = true; 
-                pTrackedDevicePoseArray[i].eTrackingResult = vr::TrackingResult_Running_OK; 
+                pTrackedDevicePoseArray[i].eTrackingResult = vr::TrackingResult_Running_OutOfRange;
                 
-                if (i == 0 && pSharedHands && pSharedHands->headTransform[0] != 0.0f) {
-                    ApplyHeadExtrapolation(&pTrackedDevicePoseArray[i], pSharedHands->headTransform, pSharedHands->visionTimestamp, fPredictedSecondsToPhotonsFromNow);
+                if (i == 0 && haveHands && handsSnapshot.headTracked) {
+                    ApplyHeadExtrapolation(&pTrackedDevicePoseArray[i], handsSnapshot.headTransform, handsSnapshot.visionTimestamp, fPredictedSecondsToPhotonsFromNow);
                 } else if (i == 1 || i == 2) {
-                    float* srcTransform = nullptr;
-                    if (i == 1) srcTransform = pSharedHands ? pSharedHands->leftTransform : nullptr;
-                    if (i == 2) srcTransform = pSharedHands ? pSharedHands->rightTransform : nullptr;
-                    
-                    if (srcTransform && srcTransform[0] != 0.0f) {
+                    const bool tracked = haveHands && (i == 1 ? handsSnapshot.leftTracked : handsSnapshot.rightTracked);
+                    float* srcTransform = i == 1 ? handsSnapshot.leftTransform : handsSnapshot.rightTransform;
+                    if (tracked) {
                         if (i == 1) ApplySmoothPose(&pTrackedDevicePoseArray[i], srcTransform, g_lastLeftTransform, g_lastLeftVel, g_lastLeftAngularVel, fPredictedSecondsToPhotonsFromNow, dt);
                         if (i == 2) ApplySmoothPose(&pTrackedDevicePoseArray[i], srcTransform, g_lastRightTransform, g_lastRightVel, g_lastRightAngularVel, fPredictedSecondsToPhotonsFromNow, dt);
-                    } else if (pTrackedDevicePoseArray[0].bPoseIsValid) {
-                        // Fallback to head tracking
-                        pTrackedDevicePoseArray[i] = pTrackedDevicePoseArray[0];
-                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] -= 0.3f;
-                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] -= 0.5f;
-                        if (i == 1) pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] -= 0.2f;
-                        if (i == 2) pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] += 0.2f;
-                    } else {
-                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1; 
-                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1; 
-                        pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1; 
                     }
-                } else {
-                    pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1; 
-                    pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1; 
-                    pTrackedDevicePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1; 
                 }
             } 
         }
@@ -799,20 +809,24 @@ public:
         static uint64_t lastLeftVRButtons = 0;
         static uint64_t lastRightVRButtons = 0;
         
-        if (pSharedHands && pEvent) {
-            uint32_t lb = pSharedHands->leftButtons;
-            uint32_t rb = pSharedHands->rightButtons;
+        SharedHands handsSnapshot = {};
+        const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
+        if (haveHands && pEvent) {
+            uint32_t lb = handsSnapshot.leftButtons;
+            uint32_t rb = handsSnapshot.rightButtons;
             uint64_t currentLeftVRButtons = 0;
             uint64_t currentRightVRButtons = 0;
             
-            if (pSharedHands->leftPinch > 128) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
-            if (pSharedHands->leftTrigger > 128) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
+            if (handsSnapshot.leftTracked && handsSnapshot.leftTrigger >= 128) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
+            if (handsSnapshot.leftTracked && handsSnapshot.leftGrip >= 150) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
+            if (handsSnapshot.leftTracked && (lb & (1u << 8))) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_A); // Vision Pro left primary (X)
+            if (handsSnapshot.leftTracked && (lb & (1u << 9))) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu); // Vision Pro left secondary (Y)
             if (lb & (1<<4)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); // ZL
             if (lb & (1<<5)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad); // L3
             if (lb & (1<<6)) currentLeftVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_System); // Minus
 
-            if (pSharedHands->rightPinch > 128) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
-            if (pSharedHands->rightTrigger > 128) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
+            if (handsSnapshot.rightTracked && handsSnapshot.rightTrigger >= 128) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
+            if (handsSnapshot.rightTracked && handsSnapshot.rightGrip >= 150) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
             if (rb & (1<<2)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger); // ZR
             if (rb & (1<<0)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_A); // A
             if (rb & (1<<1)) currentRightVRButtons |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu); // B -> App Menu
@@ -868,41 +882,47 @@ public:
         if(pControllerState) {
             memset(pControllerState, 0, unControllerStateSize);
             pControllerState->unPacketNum = frameSeq;
-            if (pSharedHands) {
-                uint32_t lb = pSharedHands->leftButtons;
-                uint32_t rb = pSharedHands->rightButtons;
+            SharedHands handsSnapshot = {};
+            const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
+            if (haveHands) {
+                uint32_t lb = handsSnapshot.leftButtons;
+                uint32_t rb = handsSnapshot.rightButtons;
                 if (unControllerDeviceIndex == 0) {
                     pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_ProximitySensor);
                 } else if (unControllerDeviceIndex == 1) {
+                    const bool tracked = handsSnapshot.leftTracked != 0;
+                    const float trigger = tracked ? handsSnapshot.leftTrigger / 255.0f : 0.0f;
+                    const float grip = tracked ? handsSnapshot.leftGrip / 255.0f : 0.0f;
                     // Left JoyCon Buttons
-                    // ZL (Trigger)
-                    if (lb & (1<<4)) {
+                    // Vision Pro pinch plus JoyCon ZL map to the SteamVR trigger.
+                    pControllerState->rAxis[1].x = std::max(trigger, (lb & (1<<4)) ? 1.0f : 0.0f);
+                    if (pControllerState->rAxis[1].x >= 0.5f) {
                         pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
-                        pControllerState->rAxis[1].x = 1.0f;
                     }
-                    // SL or SR (Grip) -> Bits 7 and 8
-                    if ((lb & (1<<7)) || (lb & (1<<8))) {
+                    // Vision Pro finger curl plus JoyCon SL/SR map to grip.
+                    pControllerState->rAxis[2].x = std::max(grip, ((lb & (1<<7)) || (lb & (1<<8))) ? 1.0f : 0.0f);
+                    if (pControllerState->rAxis[2].x >= 0.5f) {
                         pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
-                        pControllerState->rAxis[2].x = 1.0f;
                     }
                     // L3 (Stick Click)
                     if (lb & (1<<5)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad);
                     // Minus (System/Menu)
                     if (lb & (1<<6)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System);
                     
-                    pControllerState->rAxis[0].x = pSharedHands->leftStickX;
-                    pControllerState->rAxis[0].y = -pSharedHands->leftStickY;
+                    pControllerState->rAxis[0].x = tracked ? handsSnapshot.leftStickX : 0.0f;
+                    pControllerState->rAxis[0].y = tracked ? -handsSnapshot.leftStickY : 0.0f;
                 } else if (unControllerDeviceIndex == 2) {
+                    const bool tracked = handsSnapshot.rightTracked != 0;
+                    const float trigger = tracked ? handsSnapshot.rightTrigger / 255.0f : 0.0f;
+                    const float grip = tracked ? handsSnapshot.rightGrip / 255.0f : 0.0f;
                     // Right JoyCon Buttons
-                    // ZR (Trigger)
-                    if (rb & (1<<2)) {
+                    pControllerState->rAxis[1].x = std::max(trigger, (rb & (1<<2)) ? 1.0f : 0.0f);
+                    if (pControllerState->rAxis[1].x >= 0.5f) {
                         pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
-                        pControllerState->rAxis[1].x = 1.0f;
                     }
-                    // SL or SR (Grip) -> Bits 5 and 6
-                    if ((rb & (1<<5)) || (rb & (1<<6))) {
+                    pControllerState->rAxis[2].x = std::max(grip, ((rb & (1<<5)) || (rb & (1<<6))) ? 1.0f : 0.0f);
+                    if (pControllerState->rAxis[2].x >= 0.5f) {
                         pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
-                        pControllerState->rAxis[2].x = 1.0f;
                     }
                     // A
                     if (rb & (1<<0)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_A);
@@ -913,8 +933,8 @@ public:
                     // Plus
                     if (rb & (1<<4)) pControllerState->ulButtonPressed |= vr::ButtonMaskFromId(vr::k_EButton_System);
                     
-                    pControllerState->rAxis[0].x = pSharedHands->rightStickX;
-                    pControllerState->rAxis[0].y = -pSharedHands->rightStickY;
+                    pControllerState->rAxis[0].x = tracked ? handsSnapshot.rightStickX : 0.0f;
+                    pControllerState->rAxis[0].y = tracked ? -handsSnapshot.rightStickY : 0.0f;
                 }
             }
         }
@@ -927,11 +947,15 @@ public:
             pTrackedDevicePose->bPoseIsValid = true;
             pTrackedDevicePose->bDeviceIsConnected = true;
             pTrackedDevicePose->eTrackingResult = vr::TrackingResult_Running_OK;
-            if (unControllerDeviceIndex == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
-                ApplySmoothPose(pTrackedDevicePose, pSharedHands->leftTransform, g_lastLeftTransform, g_lastLeftVel, g_lastLeftAngularVel, 0.0f, 0.011f);
-            } else if (unControllerDeviceIndex == 2) {
-                ApplySmoothPose(pTrackedDevicePose, pSharedHands->rightTransform, g_lastRightTransform, g_lastRightVel, g_lastRightAngularVel, 0.0f, 0.011f);
+            SharedHands handsSnapshot = {};
+            const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
+            if (unControllerDeviceIndex == 1 && haveHands && handsSnapshot.leftTracked) {
+                ApplySmoothPose(pTrackedDevicePose, handsSnapshot.leftTransform, g_lastLeftTransform, g_lastLeftVel, g_lastLeftAngularVel, 0.0f, 0.011f);
+            } else if (unControllerDeviceIndex == 2 && haveHands && handsSnapshot.rightTracked) {
+                ApplySmoothPose(pTrackedDevicePose, handsSnapshot.rightTransform, g_lastRightTransform, g_lastRightVel, g_lastRightAngularVel, 0.0f, 0.011f);
             } else {
+                pTrackedDevicePose->bPoseIsValid = false;
+                pTrackedDevicePose->eTrackingResult = vr::TrackingResult_Running_OutOfRange;
                 pTrackedDevicePose->mDeviceToAbsoluteTracking.m[0][0] = 1; pTrackedDevicePose->mDeviceToAbsoluteTracking.m[1][1] = 1; pTrackedDevicePose->mDeviceToAbsoluteTracking.m[2][2] = 1;
             }
         }
@@ -1785,81 +1809,43 @@ public:
         return (ETrackingUniverseOrigin)0;
     }
     virtual EVRCompositorError WaitGetPoses(VR_ARRAY_COUNT( unRenderPoseArrayCount ) TrackedDevicePose_t* pRenderPoseArray, uint32_t unRenderPoseArrayCount, VR_ARRAY_COUNT( unGamePoseArrayCount ) TrackedDevicePose_t* pGamePoseArray, uint32_t unGamePoseArrayCount) override {
+        SharedHands handsSnapshot = {};
+        const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
         if(pRenderPoseArray && unRenderPoseArrayCount > 0) {
             memset(pRenderPoseArray, 0, sizeof(vr::TrackedDevicePose_t) * unRenderPoseArrayCount);
             for(uint32_t i=0; i<3 && i<unRenderPoseArrayCount; ++i) {
-                pRenderPoseArray[i].bPoseIsValid = true;
                 pRenderPoseArray[i].bDeviceIsConnected = true;
+                pRenderPoseArray[i].eTrackingResult = vr::TrackingResult_Running_OutOfRange;
+                const bool tracked = haveHands && (i == 0 ? handsSnapshot.headTracked != 0 :
+                    (i == 1 ? handsSnapshot.leftTracked != 0 : handsSnapshot.rightTracked != 0));
+                if (!tracked) continue;
+                pRenderPoseArray[i].bPoseIsValid = true;
                 pRenderPoseArray[i].eTrackingResult = vr::TrackingResult_Running_OK;
-                if (pSharedHands) {
-                    float* srcTransform = nullptr;
-                    if (i == 0) srcTransform = pSharedHands->headTransform;
-                    else if (i == 1) srcTransform = pSharedHands->leftTransform;
-                    else if (i == 2) srcTransform = pSharedHands->rightTransform;
-                    
-                    // Fallback to head tracking if controller tracking is empty (e.g. JoyCon only)
-                    if (srcTransform && srcTransform[0] == 0.0f && i > 0) {
-                        srcTransform = pSharedHands->headTransform;
-                    }
-                    
-                    if (srcTransform && srcTransform[15] != 0.0f) {
-                        if (i == 0) {
-                            // Apply head extrapolation
-                            ApplyHeadExtrapolation(&pRenderPoseArray[i], srcTransform, pSharedHands->visionTimestamp, 0.0f);
-                        } else {
-                            for(int r=0;r<3;r++) for(int c=0;c<4;c++) pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = srcTransform[c*4 + r];
-                        }
-                        
-                        if (i > 0 && srcTransform == pSharedHands->headTransform) {
-                            // Offset controller slightly from head so laser isn't in eyes
-                            pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][3] += (i == 1) ? -0.2f : 0.2f;
-                            pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][3] -= 0.2f;
-                            pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][3] -= 0.3f;
-                        }
-                    } else {
-                        // Safe offset fallback
-                        pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1.0f;
-                        pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1.0f;
-                        pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1.0f;
-                        if (i == 0) { pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.5f; }
-                        else if (i == 1) { pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][3] = -0.2f; pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.3f; pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][3] = -0.3f; }
-                        else if (i == 2) { pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[0][3] = 0.2f; pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.3f; pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[2][3] = -0.3f; }
-                    }
+                float* srcTransform = i == 0 ? handsSnapshot.headTransform :
+                    (i == 1 ? handsSnapshot.leftTransform : handsSnapshot.rightTransform);
+                if (i == 0) {
+                    ApplyHeadExtrapolation(&pRenderPoseArray[i], srcTransform, handsSnapshot.visionTimestamp, 0.0f);
+                } else {
+                    for(int r=0;r<3;r++) for(int c=0;c<4;c++) pRenderPoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = srcTransform[c*4 + r];
                 }
             }
         }
         if(pGamePoseArray && unGamePoseArrayCount > 0) {
             memset(pGamePoseArray, 0, sizeof(vr::TrackedDevicePose_t) * unGamePoseArrayCount);
             for(uint32_t i=0; i<3 && i<unGamePoseArrayCount; ++i) {
-                pGamePoseArray[i].bPoseIsValid = true;
                 pGamePoseArray[i].bDeviceIsConnected = true;
+                pGamePoseArray[i].eTrackingResult = vr::TrackingResult_Running_OutOfRange;
+                const bool tracked = haveHands && (i == 0 ? handsSnapshot.headTracked != 0 :
+                    (i == 1 ? handsSnapshot.leftTracked != 0 : handsSnapshot.rightTracked != 0));
+                if (!tracked) continue;
+                pGamePoseArray[i].bPoseIsValid = true;
                 pGamePoseArray[i].eTrackingResult = vr::TrackingResult_Running_OK;
-                if (pSharedHands) {
-                    float* srcTransform = nullptr;
-                    if (i == 0) srcTransform = pSharedHands->headTransform;
-                    else if (i == 1) srcTransform = pSharedHands->leftTransform;
-                    else if (i == 2) srcTransform = pSharedHands->rightTransform;
-                    
-                    if (srcTransform && srcTransform[0] == 0.0f && i > 0) {
-                        srcTransform = pSharedHands->headTransform;
-                    }
-                    
-                    if (srcTransform && srcTransform[15] != 0.0f) {
-                        for(int r=0;r<3;r++) for(int c=0;c<4;c++) pGamePoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = srcTransform[c*4 + r];
-                        if (i > 0 && srcTransform == pSharedHands->headTransform) {
-                            pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] += (i == 1) ? -0.2f : 0.2f;
-                            pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] -= 0.2f;
-                            pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] -= 0.3f;
-                        }
-                    } else {
-                        // Safe offset fallback
-                        pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][0] = 1.0f;
-                        pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][1] = 1.0f;
-                        pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][2] = 1.0f;
-                        if (i == 0) { pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.5f; }
-                        else if (i == 1) { pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] = -0.2f; pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.3f; pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] = -0.3f; }
-                        else if (i == 2) { pGamePoseArray[i].mDeviceToAbsoluteTracking.m[0][3] = 0.2f; pGamePoseArray[i].mDeviceToAbsoluteTracking.m[1][3] = 1.3f; pGamePoseArray[i].mDeviceToAbsoluteTracking.m[2][3] = -0.3f; }
-                    }
+                float* srcTransform = i == 0 ? handsSnapshot.headTransform :
+                    (i == 1 ? handsSnapshot.leftTransform : handsSnapshot.rightTransform);
+                if (i == 0) {
+                    ApplyHeadExtrapolation(&pGamePoseArray[i], srcTransform, handsSnapshot.visionTimestamp, 0.0f);
+                } else {
+                    for(int r=0;r<3;r++) for(int c=0;c<4;c++) pGamePoseArray[i].mDeviceToAbsoluteTracking.m[r][c] = srcTransform[c*4 + r];
                 }
             }
         }
@@ -1873,10 +1859,10 @@ public:
         if (dt < 0.001f) dt = 0.001f;
         if (dt > 0.1f) dt = 0.1f;
         
-        if (pSharedHands) {
-            float curLeft[3] = { pSharedHands->leftTransform[3], pSharedHands->leftTransform[7], pSharedHands->leftTransform[11] }; // Wait, translation is at indices 3, 7, 11 (if row-major) or 12, 13, 14 (if col-major)! In my previous code, I assigned m[r][c] = leftTransform[c*4+r]. That means 12,13,14 are translation!
-            float cL[3] = { pSharedHands->leftTransform[12], pSharedHands->leftTransform[13], pSharedHands->leftTransform[14] };
-            float cR[3] = { pSharedHands->rightTransform[12], pSharedHands->rightTransform[13], pSharedHands->rightTransform[14] };
+        if (haveHands) {
+            float curLeft[3] = { handsSnapshot.leftTransform[3], handsSnapshot.leftTransform[7], handsSnapshot.leftTransform[11] }; // Retained for compatibility with the old velocity path.
+            float cL[3] = { handsSnapshot.leftTransform[12], handsSnapshot.leftTransform[13], handsSnapshot.leftTransform[14] };
+            float cR[3] = { handsSnapshot.rightTransform[12], handsSnapshot.rightTransform[13], handsSnapshot.rightTransform[14] };
             
             // Set velocities to zero. Vision Pro sends data at 250Hz.
             // Allowing SteamVR to predict motion causes extreme jitter in Alyx.
@@ -4043,11 +4029,14 @@ public:
     virtual EVRInputError GetDigitalActionData(VRActionHandle_t action, InputDigitalActionData_t *pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice) override {
         if(pActionData && unActionDataSize > 0) {
             vr::InputDigitalActionData_t temp = {0};
-            temp.bActive = true;
-            if (pSharedHands) {
+            SharedHands handsSnapshot = {};
+            const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
+            if (haveHands) {
                 bool pressed = false;
                 uint64_t origin = ulRestrictToDevice;
                 if (origin == 0) origin = 2;
+                const bool tracked = origin == 1 ? handsSnapshot.leftTracked != 0 : handsSnapshot.rightTracked != 0;
+                temp.bActive = tracked;
                 
                 std::string name = g_actionNames[action];
                 
@@ -4056,8 +4045,8 @@ public:
                 static uint32_t lastLeftBtns = 0;
                 static uint32_t lastRightBtns = 0;
                 
-                uint32_t lb = pSharedHands->leftButtons;
-                uint32_t rb = pSharedHands->rightButtons;
+                uint32_t lb = handsSnapshot.leftButtons;
+                uint32_t rb = handsSnapshot.rightButtons;
                 
                 if ((lb & (1<<7)) && !(lastLeftBtns & (1<<7))) leftGripToggle = !leftGripToggle;
                 if ((lb & (1<<8)) && !(lastLeftBtns & (1<<8))) leftGripToggle = !leftGripToggle;
@@ -4068,21 +4057,21 @@ public:
                 lastRightBtns = rb;
                 
                 if (name.find("Interact") != std::string::npos || name.find("Use") != std::string::npos) {
-                    if (origin == 1) pressed = pSharedHands->leftPinch || leftGripToggle || ((lb & (1<<4)) != 0) || ((lb & (1<<0)) != 0);
-                    else pressed = pSharedHands->rightPinch || rightGripToggle || ((rb & (1<<2)) != 0) || ((rb & (1<<0)) != 0);
+                    if (origin == 1) pressed = (tracked && handsSnapshot.leftTrigger >= 128) || leftGripToggle || ((lb & (1<<4)) != 0) || ((lb & (1<<0)) != 0);
+                    else pressed = (tracked && handsSnapshot.rightTrigger >= 128) || rightGripToggle || ((rb & (1<<2)) != 0) || ((rb & (1<<0)) != 0);
                 }
                 else if (name.find("GrabGrip") != std::string::npos || 
                     name.find("Grip") != std::string::npos ||
                     name.find("Grab") != std::string::npos) {
-                    if (origin == 1) pressed = (pSharedHands->leftTrigger > 128) || leftGripToggle;
-                    else pressed = (pSharedHands->rightTrigger > 128) || rightGripToggle;
+                    if (origin == 1) pressed = (tracked && handsSnapshot.leftGrip >= 150) || leftGripToggle;
+                    else pressed = (tracked && handsSnapshot.rightGrip >= 150) || rightGripToggle;
                 }
                 else if (name.find("GrabPinch") != std::string::npos ||
                     name.find("Pinch") != std::string::npos ||
                     name.find("Trigger") != std::string::npos || 
                     name.find("Fire") != std::string::npos) {
-                    if (origin == 1) pressed = pSharedHands->leftPinch || ((lb & (1<<4)) != 0);
-                    else pressed = pSharedHands->rightPinch || ((rb & (1<<2)) != 0);
+                    if (origin == 1) pressed = (tracked && handsSnapshot.leftTrigger >= 128) || ((lb & (1<<4)) != 0);
+                    else pressed = (tracked && handsSnapshot.rightTrigger >= 128) || ((rb & (1<<2)) != 0);
                 }
                 else if (name.find("Teleport") != std::string::npos) {
                     if (origin == 2) pressed = (rb & (1<<3)) != 0;
@@ -4093,6 +4082,12 @@ public:
                 }
                 else if (name.find("b_button") != std::string::npos || name.find("BButton") != std::string::npos) {
                     if (origin == 2) pressed = (rb & (1<<1)) != 0;
+                }
+                else if (name.find("x_button") != std::string::npos || name.find("XButton") != std::string::npos) {
+                    if (origin == 1) pressed = tracked && (lb & (1<<8)) != 0;
+                }
+                else if (name.find("y_button") != std::string::npos || name.find("YButton") != std::string::npos) {
+                    if (origin == 1) pressed = tracked && (lb & (1<<9)) != 0;
                 }
                 else if (name.find("Pause") != std::string::npos || name.find("System") != std::string::npos || name.find("Menu") != std::string::npos) {
                     if (origin == 2) pressed = (rb & (1<<4)) != 0;
@@ -4120,36 +4115,39 @@ public:
     virtual EVRInputError GetAnalogActionData(VRActionHandle_t action, InputAnalogActionData_t *pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice) override {
         if(pActionData && unActionDataSize > 0) {
             vr::InputAnalogActionData_t temp = {0};
-            temp.bActive = true;
-            if (pSharedHands) {
+            SharedHands handsSnapshot = {};
+            const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
+            if (haveHands) {
                 float x = 0.0f;
                 float y = 0.0f;
                 uint64_t origin = ulRestrictToDevice;
                 if (origin == 0) origin = 2;
+                const bool tracked = origin == 1 ? handsSnapshot.leftTracked != 0 : handsSnapshot.rightTracked != 0;
+                temp.bActive = tracked;
 
                 std::string name = g_actionNames[action];
-                uint32_t lb = pSharedHands->leftButtons;
-                uint32_t rb = pSharedHands->rightButtons;
+                uint32_t lb = handsSnapshot.leftButtons;
+                uint32_t rb = handsSnapshot.rightButtons;
 
                 if (name.find("Move") != std::string::npos || name.find("Trackpad") != std::string::npos || name.find("Thumbstick") != std::string::npos || name.find("Turn") != std::string::npos || name.find("Scroll") != std::string::npos) {
                     if (origin == 1) {
-                        x = pSharedHands->leftStickX;
-                        y = -pSharedHands->leftStickY;
+                        x = tracked ? handsSnapshot.leftStickX : 0.0f;
+                        y = tracked ? -handsSnapshot.leftStickY : 0.0f;
                     } else {
-                        x = pSharedHands->rightStickX;
-                        y = -pSharedHands->rightStickY;
+                        x = tracked ? handsSnapshot.rightStickX : 0.0f;
+                        y = tracked ? -handsSnapshot.rightStickY : 0.0f;
                     }
                 }
                 else if (name.find("Trigger") != std::string::npos || name.find("Pull") != std::string::npos || name.find("Pinch") != std::string::npos || name.find("Use") != std::string::npos) {
                     if (origin == 1) {
-                        x = (pSharedHands->leftPinch || (lb & (1<<4))) ? 1.0f : 0.0f;
+                        x = std::max(tracked ? handsSnapshot.leftTrigger / 255.0f : 0.0f, (lb & (1<<4)) ? 1.0f : 0.0f);
                     } else {
-                        x = (pSharedHands->rightPinch || (rb & (1<<2))) ? 1.0f : 0.0f;
+                        x = std::max(tracked ? handsSnapshot.rightTrigger / 255.0f : 0.0f, (rb & (1<<2)) ? 1.0f : 0.0f);
                     }
                 }
                 else if (name.find("Grip") != std::string::npos || name.find("GrabGrip") != std::string::npos) {
-                    if (origin == 1) x = pSharedHands->leftTrigger / 255.0f;
-                    else x = pSharedHands->rightTrigger / 255.0f;
+                    if (origin == 1) x = tracked ? handsSnapshot.leftGrip / 255.0f : 0.0f;
+                    else x = tracked ? handsSnapshot.rightGrip / 255.0f : 0.0f;
                 }
                 
                 static std::map<std::pair<VRActionHandle_t, uint64_t>, std::pair<float, float>> s_lastAnalog;
@@ -4173,18 +4171,21 @@ public:
     virtual EVRInputError GetPoseActionDataRelativeToNow(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, float fPredictedSecondsFromNow, InputPoseActionData_t *pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice) override {
         if(pActionData && unActionDataSize > 0) {
             vr::InputPoseActionData_t temp = {0};
-            temp.bActive = true;
-            temp.pose.bPoseIsValid = true;
             temp.pose.bDeviceIsConnected = true;
-            temp.pose.eTrackingResult = vr::TrackingResult_Running_OK;
+            temp.pose.eTrackingResult = vr::TrackingResult_Running_OutOfRange;
             uint64_t origin = ulRestrictToDevice;
             if (origin == 0) origin = 2;
             temp.activeOrigin = origin;
-            if (origin == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
-                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->leftTransform[c*4 + r];
+            SharedHands handsSnapshot = {};
+            const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
+            const bool tracked = haveHands && (origin == 1 ? handsSnapshot.leftTracked != 0 : handsSnapshot.rightTracked != 0);
+            temp.bActive = tracked;
+            temp.pose.bPoseIsValid = tracked;
+            if (origin == 1 && tracked) {
+                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = handsSnapshot.leftTransform[c*4 + r];
                 temp.pose.vVelocity.v[0] = g_handVelocityL[0]; temp.pose.vVelocity.v[1] = g_handVelocityL[1]; temp.pose.vVelocity.v[2] = g_handVelocityL[2];
-            } else if (origin == 2 && pSharedHands && pSharedHands->rightTransform[0] != 0.0f) {
-                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->rightTransform[c*4 + r];
+            } else if (origin == 2 && tracked) {
+                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = handsSnapshot.rightTransform[c*4 + r];
                 temp.pose.vVelocity.v[0] = g_handVelocityR[0]; temp.pose.vVelocity.v[1] = g_handVelocityR[1]; temp.pose.vVelocity.v[2] = g_handVelocityR[2];
             } else {
                 temp.pose.mDeviceToAbsoluteTracking.m[0][0] = 1; temp.pose.mDeviceToAbsoluteTracking.m[1][1] = 1; temp.pose.mDeviceToAbsoluteTracking.m[2][2] = 1;
@@ -4196,18 +4197,21 @@ public:
     virtual EVRInputError GetPoseActionDataForNextFrame(VRActionHandle_t action, ETrackingUniverseOrigin eOrigin, InputPoseActionData_t *pActionData, uint32_t unActionDataSize, VRInputValueHandle_t ulRestrictToDevice) override {
         if(pActionData && unActionDataSize > 0) {
             vr::InputPoseActionData_t temp = {0};
-            temp.bActive = true;
-            temp.pose.bPoseIsValid = true;
             temp.pose.bDeviceIsConnected = true;
-            temp.pose.eTrackingResult = vr::TrackingResult_Running_OK;
+            temp.pose.eTrackingResult = vr::TrackingResult_Running_OutOfRange;
             uint64_t origin = ulRestrictToDevice;
             if (origin == 0) origin = 2;
             temp.activeOrigin = origin;
-            if (origin == 1 && pSharedHands && pSharedHands->leftTransform[0] != 0.0f) {
-                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->leftTransform[c*4 + r];
+            SharedHands handsSnapshot = {};
+            const bool haveHands = ReadSharedHandsSnapshot(&handsSnapshot);
+            const bool tracked = haveHands && (origin == 1 ? handsSnapshot.leftTracked != 0 : handsSnapshot.rightTracked != 0);
+            temp.bActive = tracked;
+            temp.pose.bPoseIsValid = tracked;
+            if (origin == 1 && tracked) {
+                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = handsSnapshot.leftTransform[c*4 + r];
                 temp.pose.vVelocity.v[0] = g_handVelocityL[0]; temp.pose.vVelocity.v[1] = g_handVelocityL[1]; temp.pose.vVelocity.v[2] = g_handVelocityL[2];
-            } else if (origin == 2 && pSharedHands && pSharedHands->rightTransform[0] != 0.0f) {
-                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = pSharedHands->rightTransform[c*4 + r];
+            } else if (origin == 2 && tracked) {
+                for(int r=0;r<3;r++) for(int c=0;c<4;c++) temp.pose.mDeviceToAbsoluteTracking.m[r][c] = handsSnapshot.rightTransform[c*4 + r];
                 temp.pose.vVelocity.v[0] = g_handVelocityR[0]; temp.pose.vVelocity.v[1] = g_handVelocityR[1]; temp.pose.vVelocity.v[2] = g_handVelocityR[2];
             } else {
                 temp.pose.mDeviceToAbsoluteTracking.m[0][0] = 1; temp.pose.mDeviceToAbsoluteTracking.m[1][1] = 1; temp.pose.mDeviceToAbsoluteTracking.m[2][2] = 1;
@@ -4879,7 +4883,7 @@ extern "C" __declspec(dllexport) uint32_t VR_GetInitToken() {
 extern "C" __declspec(dllexport) void* VRControlPanel() { return nullptr; }
 extern "C" __declspec(dllexport) bool VR_GetRuntimePath(char *pchPathBuffer, uint32_t unBufferSize, uint32_t *punRequiredBufferSize) { 
     if (punRequiredBufferSize) *punRequiredBufferSize = 1; 
-    if (pchPathBuffer && unBufferSize > 0) pchPathBuffer[0] = ' '; 
+    if (pchPathBuffer && unBufferSize > 0) pchPathBuffer[0] = '\0';
     return true; 
 }
 extern "C" __declspec(dllexport) const char* VR_GetStringForHmdError(vr::EVRInitError error) { return ""; }
@@ -5007,4 +5011,3 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     }
     return TRUE;
 }
-

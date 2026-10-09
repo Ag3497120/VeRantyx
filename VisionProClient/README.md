@@ -1,5 +1,7 @@
 # Vision Spatial Tools
 
+> This document describes a legacy app prototype. The current Half-Life: Alyx streaming client and setup instructions are in the repository [README](../README.md). The active Xcode project is `VisionProClient/VisionSpatialTools/VisionSpatialTools.xcodeproj`.
+
 > ⚠️ **Note**: This project has not been fully tested yet due to time constraints. The Xcode project setup may require additional configuration. We welcome contributions and feedback!
 
 A revolutionary spatial computing application for Apple Vision Pro that allows you to attach virtual tools (keyboard, trackpad, memo, drawing canvas, calculator) to real-world objects. The tools automatically follow object movements and adapt to object size.

@@ -3,6 +3,8 @@ GPTK/
 *gptk*
 *GPTK*
 .DS_Store
+/build/
+/logs/
 
 *.exe
 *.o

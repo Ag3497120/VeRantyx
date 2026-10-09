@@ -1,5 +1,7 @@
 # Vision Spatial Tools
 
+> この文書は旧版アプリの説明です。現在のHalf-Life: Alyxストリーミング用クライアントとセットアップ手順は、リポジトリルートの[README](../README.md)を参照してください。現在のXcodeプロジェクトは`VisionProClient/VisionSpatialTools/VisionSpatialTools.xcodeproj`です。
+
 Apple Vision Pro向けの空間コンピューティングアプリケーション。任意のオブジェクトにキーボード、メモ、描画キャンバス、計算機などのツールを配置して操作できます。
 
 ## 主な機能

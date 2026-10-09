@@ -1,159 +1,61 @@
-# MBP-AVP-VR: The Ultimate Ultra-Low Latency VR Streaming Architecture
+# MBP-AVP-VR
 
-> **A native stereoscopic VR engine for Mac and Apple Vision Pro. Bypasses D3DMetal IPC constraints to stream x86 AAA PCVR titles (e.g., Source 2) at 120Hz/150Mbps via low-level C++ `openvr_api.dll` VTable hooking, direct memory mapping, and visionOS hardware compositing—complete with controller-free full hand tracking.**
+Windows Steam runs through the transferred Wine 11.9 runtime. SteamVR uses the Verantyx virtual HMD driver. Half-Life: Alyx submits stereo textures through OpenVR; the Mac capture proxy reads each eye before SteamVR's compositor rejects the texture format, then the Mac encodes a fixed 1440×810 HEVC stream for Apple Vision Pro. The Vision Pro sends head and hand poses back to SteamVR.
 
-## Table of Contents
-1. [Introduction & The "Mirage" Concept](#1-introduction--the-mirage-concept)
-2. [System Architecture & Data Flow (Deep Technical Dive)](#2-system-architecture--data-flow-deep-technical-dive)
-    - [Game Porting Toolkit (D3DMetal)](#game-porting-toolkit-d3dmetal)
-    - [The OpenVR Mocking Engine (`openvr_api.dll`)](#the-openvr-mocking-engine-openvr_apidll)
-    - [Shared Memory IPC (`vr_shared_frame.dat`)](#shared-memory-ipc-vr_shared_framedat)
-    - [HardwareEncoder (Swift)](#hardwareencoder-swift)
-3. [The Ultimate Full Hand Tracking Engine](#3-the-ultimate-full-hand-tracking-engine)
-    - [Skeletal Joint Calculations](#skeletal-joint-calculations)
-    - [Gesture Recognition Logic](#gesture-recognition-logic)
-    - [The Virtual Joystick (Locomotion)](#the-virtual-joystick-locomotion)
-4. [Custom UDP Networking Protocol (`VRAN`)](#4-custom-udp-networking-protocol-vran)
-    - [AWDL / Bonjour Discovery](#awdl--bonjour-discovery)
-    - [Packet Fragmentation & I-Frame Recovery](#packet-fragmentation--i-frame-recovery)
-5. [Setup & Installation Guide](#5-setup--installation-guide)
-    - [Requirements](#requirements)
-    - [Cloning and Compilation](#cloning-and-compilation)
-    - [Boot Sequence](#boot-sequence)
-6. [Troubleshooting](#6-troubleshooting)
+## このMacで確認した状態
 
----
+- Half-Life: AlyxのWindows版`hlvr.exe`と約73GBのゲームデータが`~/Verantyx_VR_Drive/SteamVR_Prefix`内にあります。再ダウンロードは不要です。
+- Windows Steamの`steam.exe`とSteamVR本体は同じprefixにあります。SSDから転送された`~/Verantyx_VR_Drive/Beer/wine/WineStaging.app`のWine 11.9でWindows Steamを起動し、Steam UIの表示とサインインをテスト用クローンで確認しました。
+- `~/Verantyx_VR_Drive/wine_wrapper`はGame Porting Toolkit 1.1のWine 7.7を指していました。`VRDriver/wine_launcher.sh`はWine 11.9を優先し、見つからない場合のみ従来の独自wrapperへフォールバックします。
+- 認証済みSteamセッションは`~/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test`というAPFSクローン上で確認しています。本番PrefixのSteamファイルは変更していません。
+- 転送済みSteamVR本体は`steamapps/common/SteamVR`にあり、Steamがインストール済みとして認識するappmanifestを所定の`steamapps`直下に登録しました。
+- リポジトリのVerantyx HMDドライバーをWindows x64 DLLとしてビルドし、登録済みフォルダーとSteamVR同梱の同名ドライバーへ配置しました。古いSteamVRログで同梱側が優先されることを確認したため、元DLLは両方の場所で`.mbp-avp-vr-original`として保存します。
+- Vision Proには修正版をインストールできていますが、Macからのリモート起動はCoreDeviceのタイムアウトで失敗するため、ヘッドセット上で手動起動が必要です。現時点ではSteamVRと配信エンコーダーが起動し、Vision Proから最初の姿勢パケットが届くのを待っています。
+- Windows SteamとAlyxのファイルはローカルにあります。サインイン情報はリポジトリに保存しません。
 
-## 1. Introduction & The "Mirage" Concept
+これらの実行ファイル、Steamライブラリ、ゲームデータ、カスタムWindows実行環境はGitには含まれません。
 
-Conventional VR streaming solutions (such as Virtual Desktop or Steam Link) rely heavily on the SteamVR compositor. They capture frames *after* they have been processed by SteamVR, incurring substantial IPC overhead, process switching delays, and unpredictable frame pacing.
+## 実装
 
-**MBP-AVP-VR** eliminates the middleman. We engineered a complete C++ proxy DLL (`openvr_api.dll`) that forcibly injects itself into the game process. By mimicking the VTable structure of SteamVR's COM interfaces, we trick the game engine (like Half-Life: Alyx's Source 2 engine) into directly handing us raw DirectX 11 textures. We instantly dump these textures into shared memory and compress them using Apple's hardware media engine (VideoToolbox). The result is a "Mirage"—an illusion so perfectly orchestrated that the game believes it's rendering to a tethered PCVR headset, while delivering a wireless 120Hz retinal experience to the Apple Vision Pro.
+- `VRDriver/src/driver_verantyx.cpp`はSteamVRの仮想HMDとして頭部・コントローラー姿勢を登録し、SteamVRの共有D3D11フレームを読み出して共有メモリーへコピーします。Alyxの直接キャプチャが有効な間は、このフォールバック取得を止めます。ピンチをトリガーとしてSteamVR Inputへ反映します。
+- `VRDriver/src/openvr_capture_proxy.cpp`はAlyxの左右`IVRCompositor::Submit`を捕捉し、typeless RGBAテクスチャをステレオ画像へ読み出します。取得間隔の既定値は1ペアです。
+- `MacEncoder/HardwareEncoder.swift`は共有フレームをVideoToolboxで1440×810のHEVCに変換し、Bonjourで見つけたVision ProへUDP送信します。SteamVRのレンダー倍率は既定0.5、HEVCビットレートは12 Mbpsです。出力幅・高さは`VERANTYX_STREAM_WIDTH`と`VERANTYX_STREAM_HEIGHT`で変更できます。
+- `VisionProClient/VisionSpatialTools`はBonjourでMacを探し、UDPでHEVCを受信・再構成して、VideoToolboxで専用キュー上にデコードします。遅れているときは古いデコード待ちフレームを捨て、表示時点の頭部姿勢でステレオ画像を再投影します。ARKitの頭部・手姿勢とピンチ、グリップ、ボタン、スティック値をMacへ送り、画面に受信fpsと現在の入力値を表示します。
+- `scripts/install_openvr_driver.sh`は外部登録先とSteamVR同梱先の両方へ同じDLLを配置します。SteamVRが同梱側を優先する場合も更新版が使われ、置き換え前のDLLは隣にバックアップされます。
+- `scripts/build_steamwebhelper_shim.sh`と`install_steamwebhelper_shim.sh`は、WineでCEFが初期化できない場合に備え、Steam WebHelperへ`--disable-gpu --single-process`を付けるWindows x64 shimを作成・導入します。元のWebHelperは`steamwebhelper_real.exe`に保存します。
+- `scripts/launch_vision_pro_vr.sh`は必要なshimを導入し、WebHelper初期化とSteamの認証状態を確認してからSteamVR（App ID `250820`）を起動します。Verantyx HMDの有効化後にAlyx（App ID `546560`）を起動します。Steamの起動をバックグラウンド化し、Steamが終了まで制御を返さず後続処理が止まるのを防ぎます。
 
----
+以前のテストではSteamVR、Alyx起動、Alyxの左右テクスチャ取得まで確認しています。今回の起動ではSteamVR設定を0.5にして再起動し、AlyxはVision Proの姿勢パケット到着後に起動するよう待機しています。SteamVR自身へのAlyxテクスチャ提出は`TextureUsesUnsupportedFormat`になりますが、配信用フレームは別経路で取得します。
 
-## 2. System Architecture & Data Flow (Deep Technical Dive)
+## 起動
 
-### Game Porting Toolkit (D3DMetal)
-We rely on Apple's **Game Porting Toolkit (GPTK)**, specifically the **D3DMetal** translation layer. When we launch `hlvr.exe` via Wine with the `-dx11` flag, D3DMetal intercepts all DirectX 11 API calls and translates them directly into native Apple Metal API calls. **Vulkan (and DXVK) are completely bypassed**, eliminating an entire translation step and unlocking native-level Metal performance on Apple Silicon.
-
-### The OpenVR Mocking Engine (`openvr_api.dll`)
-Located in `VRDriver/src/openvr_emulator.cpp`, this is the heart of the hijacking system. OpenVR is built on C++ COM interfaces with virtual function tables (VTables). We reverse-engineered the memory layout of `IVRSystem`, `IVRCompositor`, and `IVRSettings`.
-To prevent segmentation faults caused by missing vtable entries, our `UniversalMock` class injects precisely 100 dummy padding functions (`Dummy0()` to `Dummy99()`). This guarantees memory alignment.
-When the game calls `IVRCompositor::Submit()`, instead of sending the frame to SteamVR, our emulator extracts the `ID3D11Texture2D` object directly.
-
-### Shared Memory IPC (`vr_shared_frame.dat`)
-Inter-Process Communication (IPC) is the enemy of low latency. We use an ultra-fast memory-mapped file `C:\vr_shared_frame.dat` mapped via `CreateFileMappingA`.
-- **Texture Staging**: A CPU-readable `ID3D11Texture2D` staging buffer is created. The raw 4K NV12/BGRA pixel data is copied from VRAM to RAM.
-- **The Payload**: The memory map consists of a 16-byte header, the raw pixel buffer, and a `SharedHands` struct (236 bytes) containing full `simd_float4x4` transform matrices, button states, and stick states from the Vision Pro. This bidirectional memory pool allows the Mac encoder and the Windows game process to communicate synchronously at 120Hz.
-
-### HardwareEncoder (Swift)
-Located in `MacEncoder/HardwareEncoder.swift`, this standalone macOS daemon continuously polls the shared memory.
-- **Color Correction**: D3DMetal outputs BGRA, but Apple's VideoToolbox requires ARGB or NV12 formats, resulting in blue-skinned characters if encoded natively. We utilize Apple's `Accelerate` framework (`vImagePermuteChannels_ARGB8888`) to execute SIMD hardware-accelerated Red/Blue channel swapping in less than 1ms for a 4K frame.
-- **VideoToolbox Extremes**: We drive the hardware HEVC encoder at extreme parameters:
-  - `kVTCompressionPropertyKey_AllowFrameReordering = false` (Disables B-Frames).
-  - `kVTCompressionPropertyKey_ExpectedFrameRate = 120` (Paced for 120fps).
-  - `kVTCompressionPropertyKey_AverageBitRate = 150_000_000` (150 Mbps for zero artifacting).
-  - `kVTCompressionPropertyKey_MaxKeyFrameInterval = 60` (I-Frame every 0.5s for immediate packet loss recovery).
-
----
-
-## 3. The Ultimate Full Hand Tracking Engine
-
-We completely eradicated the need for physical controllers (e.g., Joy-Cons). We leverage VisionOS's `HandTrackingProvider` to turn your bare hands into precision VR input devices.
-
-### Skeletal Joint Calculations
-In `VisionProClient/VisionSpatialToolsApp/VisionSpatialTools/VisionSpatialTools/Models/AppModel.swift`, we track 25 skeletal joints per hand. Using `simd_distance`, we calculate the precise physical distance between spatial points (e.g., `.thumbTip` and `.indexFingerTip`).
-
-### Gesture Recognition Logic
-We map organic human movements to discrete OpenVR `VRControllerState_t` axis and button inputs:
-- **Trigger (Fire / Select)**: Distance between Thumb Tip and Index Tip `< 0.025m (2.5cm)`. This sets the OpenVR trigger axis (`rAxis[1].x`) to `1.0`.
-- **Grip (Grab / Gravity Gloves)**: Distance between Middle, Ring, and Pinky Tips to the Palm Center `< 0.06m (6.0cm)`. Sets the OpenVR grip axis (`rAxis[2].x`).
-- **A Button**: Thumb Tip to Ring Tip `< 2.5cm`.
-- **B Button**: Thumb Tip to Pinky Tip `< 2.5cm`.
-
-### The Virtual Joystick (Locomotion)
-To simulate an analog thumbstick for walking and turning, we created a revolutionary "Virtual Joystick" mechanic.
-1. When the user pinches their Thumb and Middle finger together, we capture the hand's current rotational matrix as the **Neutral Anchor**.
-2. As the user tilts their wrist (Pitch) while holding the pinch, we calculate `matrix_multiply(simd_inverse(neutral), currentRot)`.
-3. The extracted Pitch translates to `Stick Y` (Forward/Backward), and Roll translates to `Stick X` (Strafe/Turn).
-Releasing the pinch instantly snaps the analog stick back to `0.0, 0.0`.
-
----
-
-## 4. Custom UDP Networking Protocol (`VRAN`)
-
-Standard TCP is catastrophic for VR streaming due to Head-of-Line blocking and retransmission delays. We built a pure, fragmented UDP pipeline.
-
-### AWDL / Bonjour Discovery
-The Mac encoder and the Vision Pro discover each other instantly using Apple Wireless Direct Link (AWDL) and `_verantyxvr._udp` Bonjour broadcasts. By connecting directly to the Mac's Internet Sharing Wi-Fi AP, we completely bypass router latency.
-
-### Packet Fragmentation & I-Frame Recovery
-A 4K HEVC encoded frame vastly exceeds the standard 1500-byte UDP MTU.
-1. The Swift encoder splits the `CMSampleBuffer` into `1400-byte` fragments.
-2. Each fragment is prepended with a custom 16-byte `VRAN` header (`Sequence Number`, `Chunk Index`, `Total Chunks`).
-3. `VisionClientCompositor.swift` receives these chunks, drops incomplete sequences to prevent decoding corruption, and assembles full NAL units.
-4. The NAL units are fed into `AVSampleBufferDisplayLayer` for zero-latency hardware decoding. If a packet is lost, the encoder's 0.5s I-Frame interval guarantees immediate visual recovery.
-
----
-
-## 5. Setup & Installation Guide
-
-### Requirements
-- Apple Silicon Mac (M1/M2/M3)
-- Apple Vision Pro
-- macOS Sonoma or newer
-- Xcode 15 or newer
-- Game Porting Toolkit (GPTK / D3DMetal)
-- Windows Steam + Half-Life: Alyx (installed inside the GPTK Wine prefix)
-  > [!WARNING]
-  > **Game Data Not Included**: Due to GitHub file size limits and Steam Terms of Service (copyright restrictions), the 70GB+ game data for Half-Life: Alyx and the Windows Steam prefix cannot be provided in this repository. You **must** manually install Steam inside your Wine/GPTK wrapper, log into your own Steam account, and install Half-Life: Alyx into the `drive_c/Program Files (x86)/Steam/steamapps/common/Half-Life Alyx/` directory to use this system.
-- MinGW (`x86_64-w64-mingw32-g++`), Python 3, Swift compiler
-
-### Cloning and Compilation
-
-This repository consolidates the OpenVR emulator, the Mac Hardware Encoder, and the Vision Pro Client.
+1. Vision Proで「MBP AVP VR」を開き、「ステレオVRを開始」をタップします。初回プロンプトが出たらローカルネットワークと手のトラッキングを許可します。
+2. Mac側で起動スクリプトを実行します。SteamVR起動後、Vision Proの姿勢パケットが届くまでAlyxは起動せずに待ちます。Windows Steamに未サインインならクライアントを開き、CEF画面の準備とサインインを待ってから続行します。
+3. Vision Proアプリ画面でMac接続、受信fps、頭・手の追跡状態、左右のtrigger/grip/button値を確認します。
 
 ```bash
-# Clone the unified repository
-git clone https://github.com/Ag3497120/MBP-AVP-VR.git
-cd MBP-AVP-VR
-
-# 1. Compile the OpenVR Emulator DLL (Cross-compile to Windows DLL)
-cd VRDriver/src
-x86_64-w64-mingw32-g++ -shared -static-libgcc -static-libstdc++ -I../include openvr_emulator.cpp ../openvr_api.def -o openvr_api.dll
-
-# Replace the game's actual openvr_api.dll with our mock DLL
-cp openvr_api.dll "$HOME/Verantyx_VR_Drive/SteamVR_Prefix/drive_c/Program Files (x86)/Steam/steamapps/common/Half-Life Alyx/game/bin/win64/openvr_api.dll"
-
-# 2. Compile the Mac Hardware Encoder
-cd ../../MacEncoder
-swiftc HardwareEncoder.swift -o HardwareEncoder -O
+WINEPREFIX="$HOME/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test" ./scripts/launch_vision_pro_vr.sh
 ```
 
-### 3. Deploying the Vision Pro Client
-Open `VisionProClient/VisionSpatialToolsApp/VisionSpatialToolsApp.xcodeproj` in Xcode. Select your Apple Vision Pro as the target, and press `Cmd + R` to build and run the immersive app.
+SteamVRだけを起動して確認する場合:
 
-### Boot Sequence
-1. Enable **Internet Sharing** on your Mac (System Settings > General > Sharing) and connect your Vision Pro to this direct Wi-Fi network.
-2. Launch the server script:
-   ```bash
-   cd ~/MBP-AVP-VR/scripts
-   ./launch_vision_pro_vr.sh
-   ```
-   This script spins up the `HardwareEncoder` daemon and then boots `hlvr.exe` via Wine/D3DMetal.
-3. Put on your Vision Pro. The client will automatically discover the Mac via Bonjour and stream the 120Hz VR matrix straight into your eyes.
+```bash
+WINEPREFIX="$HOME/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test" STEAMVR_ONLY=1 ./scripts/launch_vision_pro_vr.sh
+```
 
----
+ログは`logs/`に出力します。SteamVR起動待ちは`STEAMVR_STARTUP_TIMEOUT=300`、WebHelper準備待ちは`STEAM_WEBHELPER_STARTUP_TIMEOUT=120`、サインイン待ちは`STEAM_LOGIN_TIMEOUT=900`のように変更できます。別のprefixやドライバーフォルダーを使う場合は`WINEPREFIX`、`VERANTYX_VR_DRIVE`、`VR_DRIVER_DIR`、`STEAMVR_DRIVER_DIR`を指定してください。
 
-## 6. Troubleshooting
+## ドライバーのビルド
 
-- **Symptom: The screen is blue (Smurf characters).**
-  - **Fix**: The BGRA to ARGB `vImage` permutation in `HardwareEncoder.swift` failed. Ensure you are compiling with `-O` to enable Accelerate optimizations.
-- **Symptom: Game crashes immediately upon opening.**
-  - **Fix**: The VTable signature for `IVRSystem` may have changed in a recent SteamVR update. You must manually verify `openvr.h` and update the `Dummy()` padding counts in `openvr_emulator.cpp` to prevent segfaults.
-- **Symptom: Severe visual stuttering.**
-  - **Fix**: You are likely routed through a physical router. Connect the Vision Pro **directly** to the Mac's Internet Sharing Access Point to avoid local network congestion.
+```bash
+./scripts/build_openvr_driver.sh
+./scripts/install_openvr_driver.sh
+```
 
----
-*Architected and developed by the Verantyx Advanced AI Team.*
+このMacには`x86_64-w64-mingw32-g++`があるため、Windows x64用ドライバーを再ビルドできます。カスタムWindowsランチャーとruntimeはSSDから転送済みのものを利用します。リポジトリはそのruntimeを置き換えません。
+
+## 確認状況と制約
+
+- Windows x64ドライバーDLL、Steam WebHelper shim、Mac HEVCエンコーダーはコンパイルできます。
+- テストクローンではWine 11.9でSteam UI表示とオンラインサインインを確認済みです。SteamVRの起動、ドライバー有効化、D3D11デバイス作成、Alyx起動、アプリの直接キャプチャ、VideoToolboxのHEVC出力まで確認しました。
+- Vision Proアプリの修正版ビルドとインストールは成功していますが、`devicectl`からの起動はCoreDeviceタイムアウトで未確認です。手トラッキング権限を署名へ追加すると、現在の`iOS Team Provisioning Profile: *`に`com.apple.developer.arkit.hand-tracking`が含まれないとXcodeが拒否します。ARKitの許可結果、頭・手トラッキング、実機映像とゲーム内入力はヘッドセットで確認が必要です。資格情報をコマンドラインやリポジトリへ書き込みません。

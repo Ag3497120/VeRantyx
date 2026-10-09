@@ -7,29 +7,27 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		5FC0DD760001000100000001 /* VRStreamerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC0DD760001000100000002 /* VRStreamerApp.swift */; };
 		4A2B89C356C5FF9356A649C0 /* SteamVRStreamerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2244F132F1BF484E3C485595 /* SteamVRStreamerView.swift */; };
-		8BB52FF2B9D3FFD38DB15B4E /* VRUDPSender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C6DF061258129E4E06E83F6 /* VRUDPSender.swift */; };
 		B32A53F92F634C6400A375D2 /* RealityKitContent in Frameworks */ = {isa = PBXBuildFile; productRef = B32A53F82F634C6400A375D2 /* RealityKitContent */; };
 		D75B2ACA8602151C3A3DA87B /* VRUDPReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A376C816EA438109002C624 /* VRUDPReceiver.swift */; };
 		F44BEF7EF6006A875BA18565 /* VRVideoDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93D5401B9519BB8B33803C45 /* VRVideoDecoder.swift */; };
+		7F92B3861C4B4C28935A112A /* VisionTrackingManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F92B3861C4B4C28935A112B /* VisionTrackingManager.swift */; };
+		91A467D05E174D6E93657D48 /* VRStreamerModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91A467D05E174D6E93657D49 /* VRStreamerModel.swift */; };
+		91A467D05E174D6E93657D4A /* VRCompositorRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91A467D05E174D6E93657D4B /* VRCompositorRenderer.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		5FC0DD760001000100000002 /* VRStreamerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VRStreamerApp.swift; sourceTree = "<group>"; };
 		2244F132F1BF484E3C485595 /* SteamVRStreamerView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SteamVRStreamerView.swift; sourceTree = "<group>"; };
 		4A376C816EA438109002C624 /* VRUDPReceiver.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRUDPReceiver.swift; sourceTree = "<group>"; };
-		7C6DF061258129E4E06E83F6 /* VRUDPSender.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRUDPSender.swift; sourceTree = "<group>"; };
 		93D5401B9519BB8B33803C45 /* VRVideoDecoder.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRVideoDecoder.swift; sourceTree = "<group>"; };
+		7F92B3861C4B4C28935A112B /* VisionTrackingManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VisionTrackingManager.swift; sourceTree = "<group>"; };
+		91A467D05E174D6E93657D49 /* VRStreamerModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRStreamerModel.swift; sourceTree = "<group>"; };
+		91A467D05E174D6E93657D4B /* VRCompositorRenderer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRCompositorRenderer.swift; sourceTree = "<group>"; };
 		B32A53F32F634C6400A375D2 /* VisionSpatialTools.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VisionSpatialTools.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B32A53F72F634C6400A375D2 /* RealityKitContent */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = RealityKitContent; sourceTree = "<group>"; };
 /* End PBXFileReference section */
-
-/* Begin PBXFileSystemSynchronizedRootGroup section */
-		B32A53F52F634C6400A375D2 /* VisionSpatialTools */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = VisionSpatialTools;
-			sourceTree = "<group>";
-		};
-/* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		B32A53F02F634C6400A375D2 /* Frameworks */ = {
@@ -46,6 +44,7 @@
 		29DCCBE0B739D1B2A0056E45 /* VisionSpatialToolsApp */ = {
 			isa = PBXGroup;
 			children = (
+				5FC0DD760001000100000002 /* VRStreamerApp.swift */,
 				EE504848AF3837B17A4CA272 /* Services */,
 				2CC411A1F11B6D4B810F2DE2 /* Views */,
 			);
@@ -63,11 +62,9 @@
 		B32A53EA2F634C6400A375D2 = {
 			isa = PBXGroup;
 			children = (
-				B32A53F52F634C6400A375D2 /* VisionSpatialTools */,
 				B32A53F62F634C6400A375D2 /* Packages */,
 				B32A53F42F634C6400A375D2 /* Products */,
 				29DCCBE0B739D1B2A0056E45 /* VisionSpatialToolsApp */,
-				7C6DF061258129E4E06E83F6 /* VRUDPSender.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -92,6 +89,9 @@
 			children = (
 				4A376C816EA438109002C624 /* VRUDPReceiver.swift */,
 				93D5401B9519BB8B33803C45 /* VRVideoDecoder.swift */,
+				7F92B3861C4B4C28935A112B /* VisionTrackingManager.swift */,
+				91A467D05E174D6E93657D49 /* VRStreamerModel.swift */,
+				91A467D05E174D6E93657D4B /* VRCompositorRenderer.swift */,
 			);
 			name = Services;
 			sourceTree = "<group>";
@@ -110,9 +110,6 @@
 			buildRules = (
 			);
 			dependencies = (
-			);
-			fileSystemSynchronizedGroups = (
-				B32A53F52F634C6400A375D2 /* VisionSpatialTools */,
 			);
 			name = VisionSpatialTools;
 			packageProductDependencies = (
@@ -171,10 +168,13 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5FC0DD760001000100000001 /* VRStreamerApp.swift in Sources */,
 				D75B2ACA8602151C3A3DA87B /* VRUDPReceiver.swift in Sources */,
 				F44BEF7EF6006A875BA18565 /* VRVideoDecoder.swift in Sources */,
 				4A2B89C356C5FF9356A649C0 /* SteamVRStreamerView.swift in Sources */,
-				8BB52FF2B9D3FFD38DB15B4E /* VRUDPSender.swift in Sources */,
+				7F92B3861C4B4C28935A112A /* VisionTrackingManager.swift in Sources */,
+				91A467D05E174D6E93657D48 /* VRStreamerModel.swift in Sources */,
+				91A467D05E174D6E93657D4A /* VRCompositorRenderer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -193,7 +193,7 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ../Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
-				INFOPLIST_KEY_UIApplicationSupportsMultipleScenes = NO;
+				INFOPLIST_KEY_UIApplicationSupportsMultipleScenes = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -225,7 +225,7 @@
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ../Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
-				INFOPLIST_KEY_UIApplicationSupportsMultipleScenes = NO;
+				INFOPLIST_KEY_UIApplicationSupportsMultipleScenes = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

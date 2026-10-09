@@ -1,5 +1,7 @@
 # Vision Spatial Tools - セットアップガイド
 
+> このガイドは旧版アプリ用です。現在のXcodeプロジェクトとセットアップ手順は、リポジトリルートの[README](../README.md)を参照してください。
+
 このガイドでは、Vision Spatial Toolsプロジェクトのセットアップ手順を詳しく説明します。
 
 ## 前提条件

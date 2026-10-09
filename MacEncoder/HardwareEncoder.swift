@@ -20,13 +20,20 @@ struct SharedFrame {
 
 struct DoubleBufferHeader {
     var latestReadyIndex: UInt32
-    var padding: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32)
+    var pendingTextureHandle: UInt32
+    var captureRequestSequence: UInt32
+    var captureAckSequence: UInt32
+    var captureSourceMode: UInt32
+    var poseSequence: UInt32
+    var padding: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32)
 }
 
 struct FrameContext {
     var sequence: UInt32
     var visionTimestamp: Double
     var transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
+    // Keep the source image alive until VideoToolbox finishes reading it.
+    var pixelBuffer: CVPixelBuffer
 }
 struct UDPHeader {
     var magic: UInt32 // 0x5652414E ("VRAN")
@@ -82,27 +89,139 @@ struct JoyconPacket {
     var leftVelocityZ: Float
 }
 
-// MARK: - Setup Network
-
-var vrConnection: NWConnection?
-
 // MARK: - Hand Tracking & Video Connection (AWDL Bonjour)
-let netService = NetService(domain: "local.", type: "_verantyxvr._udp.", name: "VerantyxVR", port: 9999)
-netService.includesPeerToPeer = true
-netService.publish(options: [])
-print("Published Bonjour _verantyxvr._udp on port 9999. Waiting for Vision Pro connection (AWDL enabled)...")
+
+let transportQueue = DispatchQueue(label: "com.verantyx.encoder.transport", qos: .userInteractive)
+let peerLock = NSLock()
+var videoPeer: NWConnection?
+let retiredVideoPeers = NSHashTable<NWConnection>(options: [.weakMemory, .objectPointerPersonality])
+var peerNeedsKeyFrame = true
+var keyFrameRequested = true
+var peerGeneration: UInt64 = 0
+var lastClientDiagnosticsAt: TimeInterval = -.infinity
+let videoDatagramsInFlight = DispatchSemaphore(value: 8)
+let outputLock = NSLock()
+
+func requestKeyFrame() {
+    peerLock.lock()
+    keyFrameRequested = true
+    peerLock.unlock()
+}
+
+func consumeKeyFrameRequest() -> Bool {
+    peerLock.lock()
+    defer { peerLock.unlock() }
+    let requested = keyFrameRequested
+    keyFrameRequested = false
+    return requested
+}
+
+func registerVideoPeer(_ connection: NWConnection, handshake: Bool) {
+    peerLock.lock()
+    guard !retiredVideoPeers.contains(connection) else {
+        peerLock.unlock()
+        return
+    }
+    let changed = videoPeer !== connection
+    let oldPeer = changed ? videoPeer : nil
+    if let oldPeer { retiredVideoPeers.add(oldPeer) }
+    if changed { lastClientDiagnosticsAt = -.infinity }
+    videoPeer = connection
+    if changed || handshake {
+        peerGeneration &+= 1
+        peerNeedsKeyFrame = true
+        keyFrameRequested = true
+    }
+    peerLock.unlock()
+    oldPeer?.cancel()
+    if changed || handshake {
+        print("Vision Pro endpoint \(connection.endpoint); keyframe requested, path=\(String(describing: connection.currentPath))")
+    }
+}
 
 // MARK: - VideoToolbox Callback
 
 var cachedVPS: Data?
 var cachedSPS: Data?
 var cachedPPS: Data?
+let encoderDiagnosticLock = NSLock()
+var compressedFrameCount = 0
+var sentVideoPacketCount = 0
+var videoPacketSendErrorCount = 0
+var videoBytesSent = 0
+var transmittedFrameCount = 0
+var droppedTransportFrames = 0
+var capturedFrameCount = 0
+var submittedFrameCount = 0
+var posePacketCount = 0
+var lastPoseReceivedAt: TimeInterval = 0
+
+final class DatagramBatch {
+    let completion = DispatchGroup()
+    private let lock = NSLock()
+    private var failed = false
+
+    func markFailed() {
+        lock.lock()
+        failed = true
+        lock.unlock()
+    }
+
+    var hasFailed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return failed
+    }
+}
+
+// All chunks of one frame use the same Network.framework flow. This retains the
+// interface and local address chosen by Bonjour, including link-local AWDL.
+func sendVideoPacket(_ packet: Data, to peer: NWConnection, batch: DatagramBatch,
+                     deadline: DispatchTime) -> Bool {
+    guard videoDatagramsInFlight.wait(timeout: deadline) == .success else {
+        batch.markFailed()
+        return false
+    }
+    batch.completion.enter()
+    peer.send(content: packet, completion: .contentProcessed { error in
+        encoderDiagnosticLock.lock()
+        if let error {
+            videoPacketSendErrorCount += 1
+            if videoPacketSendErrorCount <= 3 || videoPacketSendErrorCount % 100 == 0 {
+                print("UDP video send failed: \(error)")
+            }
+            batch.markFailed()
+        } else {
+            sentVideoPacketCount += 1
+            videoBytesSent += packet.count
+        }
+        encoderDiagnosticLock.unlock()
+        videoDatagramsInFlight.signal()
+        batch.completion.leave()
+    })
+    return true
+}
 
 func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSequence: UInt32, visionTimestamp: Double, transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)) {
+    // Keep parameter sets, packet ordering and the bounded network backpressure
+    // in one place even if VideoToolbox invokes output on different threads.
+    outputLock.lock()
+    defer { outputLock.unlock() }
+    encoderDiagnosticLock.lock()
+    compressedFrameCount += 1
+    let outputFrameNumber = compressedFrameCount
+    encoderDiagnosticLock.unlock()
+    peerLock.lock()
+    let peer = videoPeer
+    let waitingForKeyFrame = peerNeedsKeyFrame
+    let generation = peerGeneration
+    peerLock.unlock()
+    guard let peer, !waitingForKeyFrame || isKeyFrame else { return }
     guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
     var length = 0
     var dataPointer: UnsafeMutablePointer<Int8>? = nil
-    CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPointer)
+    guard CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil,
+        totalLengthOut: &length, dataPointerOut: &dataPointer) == noErr else { return }
     
     guard let data = dataPointer else { return }
     
@@ -154,6 +273,11 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
         var nalLength: UInt32 = 0
         memcpy(&nalLength, data + offset, 4)
         nalLength = UInt32(bigEndian: nalLength)
+        guard nalLength > 0, Int(nalLength) <= length - offset - 4 else {
+            print("Discarding invalid HEVC NAL length \(nalLength) in \(length)-byte frame")
+            requestKeyFrame()
+            return
+        }
         
         let startCode: [UInt8] = [0, 0, 0, 1]
         frameData.append(contentsOf: startCode)
@@ -163,14 +287,28 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
     }
     
     // 3. UDP Fragmentation and Transmission
-    let mtu = 1300 // Reduced from 1400 to prevent MTU fragmentation (1300 + 96 header + 28 IP/UDP <= 1500 MTU)
+    // 1100 + 96-byte VR header + 48-byte IPv6/UDP header fits even a 1280 MTU.
+    let mtu = 1100
     let totalBytes = frameData.count
     let numFragments = (totalBytes + mtu - 1) / mtu
+
+    if outputFrameNumber <= 3 || waitingForKeyFrame {
+        print("Encoded HEVC frame seq=\(frameSequence), bytes=\(totalBytes), keyFrame=\(isKeyFrame)")
+    }
     
+    let batch = DatagramBatch()
+    // A first IDR can be much larger than a predicted frame. Allow its bounded
+    // burst to finish inside the receiver's one-second assembly lifetime.
+    let deadline = DispatchTime.now() + .milliseconds(isKeyFrame ? 750 : 250)
+    var nextSendAt = ProcessInfo.processInfo.systemUptime
     frameData.withUnsafeBytes { rawBuffer in
         guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return }
         
         for i in 0..<numFragments {
+            guard DispatchTime.now() < deadline, !batch.hasFailed else {
+                batch.markFailed()
+                break
+            }
             let chunkOffset = i * mtu
             let fragSize = min(mtu, totalBytes - chunkOffset)
             
@@ -191,83 +329,97 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
             }
             packet.append(baseAddress + chunkOffset, count: fragSize)
             
-            packet.withUnsafeBytes { rawBytes in
-                if targetAddrLen > 0 {
-                    let _ = sendto(sock, rawBytes.baseAddress, packet.count, 0, withUnsafePointer(to: &targetAddr) {
-                        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
-                    }, targetAddrLen)
-                }
-            }
-            
-            // Smart Pacing: Avoid overwhelming AWDL buffer with sudden UDP bursts.
-            // 200 packets per frame is common; pacing every 10 packets with 500us rest allows smooth draining.
-            if i % 15 == 14 { usleep(500) }
+            guard sendVideoPacket(packet, to: peer, batch: batch, deadline: deadline) else { break }
+            // Limit keyframe bursts to 24 Mbps. In-flight completion alone only
+            // bounds the userspace queue; it does not mean radio delivery.
+            nextSendAt += Double(packet.count) / 3_000_000
+            let pause = nextSendAt - ProcessInfo.processInfo.systemUptime
+            if pause > 0 { usleep(useconds_t(min(pause, 0.01) * 1_000_000)) }
         }
     }
+    let finished = batch.completion.wait(timeout: deadline) == .success
+    let succeeded = finished && !batch.hasFailed
+    peerLock.lock()
+    if videoPeer === peer && peerGeneration == generation {
+        if succeeded && isKeyFrame { peerNeedsKeyFrame = false }
+        if !succeeded {
+            peerNeedsKeyFrame = true
+            keyFrameRequested = true
+        }
+    }
+    peerLock.unlock()
+    encoderDiagnosticLock.lock()
+    if succeeded { transmittedFrameCount += 1 } else { droppedTransportFrames += 1 }
+    encoderDiagnosticLock.unlock()
 }
 
 // MARK: - VideoToolbox Setup
 
-var targetIP = ""
-
-var sock = socket(AF_INET6, SOCK_DGRAM, 0)
-var opt: Int32 = 1
-setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout<Int32>.size))
-
-var v6only: Int32 = 0
-setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, socklen_t(MemoryLayout<Int32>.size))
-
-var bindAddr = sockaddr_in6()
-bindAddr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-bindAddr.sin6_family = sa_family_t(AF_INET6)
-bindAddr.sin6_port = in_port_t(9999).bigEndian
-bindAddr.sin6_addr = in6addr_any
-
-let bindResult = withUnsafePointer(to: &bindAddr) {
-    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
-    }
-}
-
-if bindResult < 0 {
-    print("Failed to bind sock to 9999")
-    exit(1)
-}
-
-var targetAddr = sockaddr_storage()
-var targetAddrLen: socklen_t = 0
-
 var compressionSession: VTCompressionSession?
+var pixelBufferPool: CVPixelBufferPool?
+let encoderInFlightFrames = DispatchSemaphore(value: 3)
 var isEncoding = true
 var totalBytesEncoded = 0
+
+func makePixelBufferPool(width: Int, height: Int) -> CVPixelBufferPool? {
+    let poolAttributes: [CFString: Any] = [
+        kCVPixelBufferPoolMinimumBufferCountKey: 3
+    ]
+    let pixelBufferAttributes: [CFString: Any] = [
+        kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferWidthKey: width,
+        kCVPixelBufferHeightKey: height,
+        kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
+        kCVPixelBufferMetalCompatibilityKey: true
+    ]
+    var pool: CVPixelBufferPool?
+    let status = CVPixelBufferPoolCreate(
+        kCFAllocatorDefault,
+        poolAttributes as CFDictionary,
+        pixelBufferAttributes as CFDictionary,
+        &pool
+    )
+    guard status == kCVReturnSuccess else {
+        print("CVPixelBufferPoolCreate failed: \(status)")
+        return nil
+    }
+    return pool
+}
 
 func setupEncoder(width: Int32, height: Int32) {
     let status = VTCompressionSessionCreate(allocator: kCFAllocatorDefault,
                                             width: width,
                                             height: height,
                                             codecType: kCMVideoCodecType_HEVC,
-                                            encoderSpecification: nil,
+                                            encoderSpecification: [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary,
                                             imageBufferAttributes: nil,
                                             compressedDataAllocator: nil,
                                             outputCallback: { (outputCallbackRefCon, sourceFrameRefCon, status, infoFlags, sampleBuffer) in
-        var frameSequence: UInt32 = 0
-        var visionTimestamp: Double = 0.0
-        var transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float) = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
-        if let sourceFrameRefCon = sourceFrameRefCon {
-            let refConPtr = sourceFrameRefCon.assumingMemoryBound(to: FrameContext.self)
-            frameSequence = refConPtr.pointee.sequence
-            visionTimestamp = refConPtr.pointee.visionTimestamp
-            transform = refConPtr.pointee.transform
+        guard let sourceFrameRefCon else {
+            encoderInFlightFrames.signal()
+            return
+        }
+        let refConPtr = sourceFrameRefCon.assumingMemoryBound(to: FrameContext.self)
+        let frameSequence = refConPtr.pointee.sequence
+        let visionTimestamp = refConPtr.pointee.visionTimestamp
+        let transform = refConPtr.pointee.transform
+        defer {
             refConPtr.deinitialize(count: 1)
             refConPtr.deallocate()
+            encoderInFlightFrames.signal()
         }
         
         if status != noErr {
             print("Encoding error: \(status)")
+            requestKeyFrame()
             return
         }
-        guard let sampleBuffer = sampleBuffer else { return }
-        let isKeyFrame = !infoFlags.contains(.frameDropped) && (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]] == nil || (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]])?.first?[kCMSampleAttachmentKey_NotSync] == nil)
+        guard !infoFlags.contains(.frameDropped), let sampleBuffer else {
+            requestKeyFrame()
+            return
+        }
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
+        let isKeyFrame = (attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) != true
         
         processSampleBuffer(sampleBuffer: sampleBuffer, isKeyFrame: isKeyFrame, frameSequence: frameSequence, visionTimestamp: visionTimestamp, transform: transform)
         
@@ -287,17 +439,21 @@ func setupEncoder(width: Int32, height: Int32) {
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse) // Disable B-frames
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
     
-    var bitrate: Int32 = 30_000_000 // Sweet spot for ultra-smooth AWDL streaming at lower resolution
+    var bitrate: Int32 = 12_000_000 // Keep AWDL delivery smooth while the headset decodes both eyes.
     let bitrateNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &bitrate)
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateNum)
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_DataRateLimits,
+        value: [1_500_000, 1] as CFArray)
     
-    // Explicitly tell the encoder to pace itself at 90fps for buttery smoothness (native AVP refresh rate)
+    // This is an initial rate-control hint, not the display refresh rate. The
+    // main loop updates it from observed capture cadence every five seconds.
     var expectedFPS: Int32 = 90
     let expectedFPSNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &expectedFPS)
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: expectedFPSNum)
     
-    // Force an I-frame every 0.5 seconds (45 frames at 90fps) to ensure immediate recovery from dropped UDP packets!
+    // Bound recovery in elapsed time even when the game only produces 4fps.
     VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 45 as CFNumber)
+    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 0.5 as CFNumber)
     
     // FORCE ZERO FRAME DELAY in the encoder queue
     var maxFrameDelayCount: Int32 = 1
@@ -306,12 +462,18 @@ func setupEncoder(width: Int32, height: Int32) {
 
     
     VTCompressionSessionPrepareToEncodeFrames(compressionSession!)
+    requestKeyFrame()
 }
 
 // MARK: - Main IPC Loop
 
-let filePath = NSHomeDirectory() + "/Verantyx_VR_Drive/SteamVR_Prefix/drive_c/vr_shared_frame.dat"
-let mapSize = MemoryLayout<DoubleBufferHeader>.size + (Int(MemoryLayout<SharedFrame>.size) + 4096 * 4096 * 8) * 2 + 264 + 1024
+let winePrefix = ProcessInfo.processInfo.environment["WINEPREFIX"]
+    ?? (NSHomeDirectory() + "/Verantyx_VR_Drive/SteamVR_Prefix")
+let filePath = URL(fileURLWithPath: winePrefix)
+    .appendingPathComponent("drive_c/vr_shared_frame.dat")
+    .path
+let sharedHandsSize = 287 // Keep in sync with SharedHands in driver_verantyx.cpp.
+let mapSize = MemoryLayout<DoubleBufferHeader>.size + (Int(MemoryLayout<SharedFrame>.size) + 4096 * 4096 * 8) * 2 + sharedHandsSize + 1024
 
 print("Waiting for vr_shared_frame.dat...")
 while true {
@@ -319,7 +481,7 @@ while true {
         do {
             let attr = try FileManager.default.attributesOfItem(atPath: filePath)
             if let fileSize = attr[FileAttributeKey.size] as? UInt64 {
-                if fileSize >= 134217000 { // Allow for struct padding differences between Swift and MinGW
+                if fileSize >= UInt64(mapSize) {
                     break
                 }
             }
@@ -355,13 +517,156 @@ let pixelDatas: [UnsafeMutableRawPointer] = [
 
 let handsMapPtr = basePtr + (frameBlockSize * 2)
 let dbHeaderPtr = mapPtr!.bindMemory(to: DoubleBufferHeader.self, capacity: 1)
+let sharedHandsWriteLock = NSLock()
+
+func withSharedHandsWrite(_ write: () -> Void) {
+    sharedHandsWriteLock.lock()
+    defer { sharedHandsWriteLock.unlock() }
+    let current = dbHeaderPtr.pointee.poseSequence
+    let odd = (current & 1) == 0 ? current &+ 1 : current &+ 2
+    dbHeaderPtr.pointee.poseSequence = odd
+    OSMemoryBarrier()
+    write()
+    OSMemoryBarrier()
+    dbHeaderPtr.pointee.poseSequence = odd &+ 1
+}
 
 var lastSeq: UInt32 = 0
-var pixelBuffer: CVPixelBuffer?
+let initialSequence0 = headers[0].pointee.sequenceNumber
+let initialSequence1 = headers[1].pointee.sequenceNumber
+var streamSequence = Int32(bitPattern: initialSequence0 &- initialSequence1) > 0
+    ? initialSequence0 : initialSequence1
 var framesEncoded = 0
-var currentFrameSequence: UInt32 = 0
-var currentWidth = 0
-var currentHeight = 0
+var droppedEncoderFrames = 0
+var lastCaptureSourceMode = dbHeaderPtr.pointee.captureSourceMode
+let presentationEpoch = ProcessInfo.processInfo.systemUptime
+var lastPresentationSeconds: TimeInterval = -1
+var lastForcedKeyFrameAt: TimeInterval = -.infinity
+var lastDiagnosticsAt = ProcessInfo.processInfo.systemUptime
+var lastDiagnostics = (capture: 0, submit: 0, encode: 0, sent: 0, packets: 0, bytes: 0, errors: 0, drops: 0, poses: 0)
+let configuredOutputWidth = Int(ProcessInfo.processInfo.environment["VERANTYX_STREAM_WIDTH"] ?? "1440") ?? 1440
+let configuredOutputHeight = Int(ProcessInfo.processInfo.environment["VERANTYX_STREAM_HEIGHT"] ?? "810") ?? 810
+let hasExplicitOutputSize = ProcessInfo.processInfo.environment["VERANTYX_STREAM_WIDTH"] != nil ||
+    ProcessInfo.processInfo.environment["VERANTYX_STREAM_HEIGHT"] != nil
+var outputWidth = min(4096, max(2, configuredOutputWidth & ~1))
+var outputHeight = min(4096, max(2, configuredOutputHeight & ~1))
+var outputSourceAspect: Double?
+
+func reportDiagnosticsIfDue() {
+    let now = ProcessInfo.processInfo.systemUptime
+    let elapsed = now - lastDiagnosticsAt
+    guard elapsed >= 5 else { return }
+    encoderDiagnosticLock.lock()
+    let current = (capture: capturedFrameCount, submit: submittedFrameCount,
+        encode: compressedFrameCount, sent: transmittedFrameCount,
+        packets: sentVideoPacketCount, bytes: videoBytesSent,
+        errors: videoPacketSendErrorCount, drops: droppedTransportFrames, poses: posePacketCount)
+    let poseAge = lastPoseReceivedAt > 0 ? now - lastPoseReceivedAt : -1
+    encoderDiagnosticLock.unlock()
+    peerLock.lock()
+    let endpoint = videoPeer.map { String(describing: $0.endpoint) } ?? "none"
+    peerLock.unlock()
+    let captureFPS = Double(current.capture - lastDiagnostics.capture) / elapsed
+    print(String(format: "Pipeline %.1fs source=%u capture=%.1ffps submit=%.1ffps encoded=%.1ffps sent=%.1ffps UDP=%.2fMbps packets=%d sendErrors=%d networkDrops=%d encoderDrops=%d pose=%.1fHz poseAge=%.2fs peer=%@",
+        elapsed, dbHeaderPtr.pointee.captureSourceMode, captureFPS,
+        Double(current.submit - lastDiagnostics.submit) / elapsed,
+        Double(current.encode - lastDiagnostics.encode) / elapsed,
+        Double(current.sent - lastDiagnostics.sent) / elapsed,
+        Double(current.bytes - lastDiagnostics.bytes) * 8 / elapsed / 1_000_000,
+        current.packets - lastDiagnostics.packets, current.errors - lastDiagnostics.errors,
+        current.drops - lastDiagnostics.drops, droppedEncoderFrames,
+        Double(current.poses - lastDiagnostics.poses) / elapsed, poseAge, endpoint))
+    if let compressionSession, captureFPS > 0 {
+        VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ExpectedFrameRate,
+            value: NSNumber(value: min(90, max(1, captureFPS.rounded()))))
+    }
+    lastDiagnostics = current
+    lastDiagnosticsAt = now
+}
+
+@discardableResult
+func resolveOutputSize(sourceWidth: Int, sourceHeight: Int) -> Bool {
+    guard !hasExplicitOutputSize, sourceWidth > 0, sourceHeight > 0 else {
+        return false
+    }
+
+    // Preserve the eye frustum's aspect ratio while keeping the same pixel
+    // budget as 1440x810. This avoids stretching when the headset supplies an
+    // asymmetric per-eye projection.
+    let sourceAspect = min(2.5, max(0.5, Double(sourceWidth) / Double(sourceHeight)))
+    if let previousAspect = outputSourceAspect,
+       abs(sourceAspect - previousAspect) / previousAspect < 0.01 {
+        return false
+    }
+    outputSourceAspect = sourceAspect
+    let pixelBudget = Double(configuredOutputWidth * configuredOutputHeight)
+    let evenDimension: (Double) -> Int = { value in
+        min(4096, max(2, (Int(value.rounded()) + 1) & ~1))
+    }
+    let previousWidth = outputWidth
+    let previousHeight = outputHeight
+    outputWidth = evenDimension(sqrt(pixelBudget * sourceAspect))
+    outputHeight = evenDimension(sqrt(pixelBudget / sourceAspect))
+    return previousWidth != outputWidth || previousHeight != outputHeight
+}
+
+func copyFrameToBGRA(
+    source: UnsafeMutableRawPointer,
+    sourceFormat: UInt32,
+    sourceWidth: Int,
+    sourceHeight: Int,
+    destination: UnsafeMutableRawPointer,
+    destinationBytesPerRow: Int
+) -> Bool {
+    guard sourceWidth > 0, sourceHeight > 0,
+          sourceWidth <= 4096, sourceHeight <= 4096,
+          sourceFormat == 87 || sourceFormat == 91 || sourceFormat == 28 || sourceFormat == 29
+    else { return false }
+
+    var destinationBuffer = vImage_Buffer(
+        data: destination,
+        height: vImagePixelCount(outputHeight),
+        width: vImagePixelCount(outputWidth),
+        rowBytes: destinationBytesPerRow
+    )
+
+    let isRGBA = sourceFormat == 28 || sourceFormat == 29
+    if sourceWidth == outputWidth && sourceHeight == outputHeight {
+        for row in 0..<outputHeight {
+            memcpy(destination.advanced(by: row * destinationBytesPerRow),
+                   source.advanced(by: row * sourceWidth * 4),
+                   outputWidth * 4)
+        }
+    } else {
+        var sourceBuffer = vImage_Buffer(
+            data: source,
+            height: vImagePixelCount(sourceHeight),
+            width: vImagePixelCount(sourceWidth),
+            rowBytes: sourceWidth * 4
+        )
+        guard vImageScale_ARGB8888(
+            &sourceBuffer,
+            &destinationBuffer,
+            nil,
+            vImage_Flags(kvImageNoFlags)
+        ) == kvImageNoError else { return false }
+    }
+
+    // DXGI format 28/29 is RGBA, while VideoToolbox expects BGRA. Scale first,
+    // then swap R/B in the smaller output buffer to avoid a full-size temporary.
+    if isRGBA {
+        for row in 0..<outputHeight {
+            let channels = destination.advanced(by: row * destinationBytesPerRow)
+                .assumingMemoryBound(to: UInt8.self)
+            for offset in stride(from: 0, to: outputWidth * 4, by: 4) {
+                let red = channels[offset]
+                channels[offset] = channels[offset + 2]
+                channels[offset + 2] = red
+            }
+        }
+    }
+    return true
+}
 
 // MARK: - Joy-Con UDP Server
 DispatchQueue.global(qos: .userInteractive).async {
@@ -398,31 +703,30 @@ DispatchQueue.global(qos: .userInteractive).async {
                 let jc = rawBuffer.load(as: JoyconPacket.self)
                 if jc.magic == UInt32(0x4A4F5943) { // "JOYC"
                     // SharedHands offsets:
-                    // 0-191: Matrices
-                    // 192-195: Pinch & Triggers
+                    // 0-191: Matrices; 192-195: hand tracking and trigger state
                     // 196: rightButtons, 200: leftButtons
                     // 204: rightStickX, 208: rightStickY, 212: leftStickX, 216: leftStickY
                     // 220: rightVel, 232: leftVel
-                    handsMapPtr.advanced(by: 196).storeBytes(of: jc.rightButtons, as: UInt32.self)
-                    handsMapPtr.advanced(by: 200).storeBytes(of: jc.leftButtons, as: UInt32.self)
-                    handsMapPtr.advanced(by: 204).storeBytes(of: jc.rightStickX, as: Float.self)
-                    handsMapPtr.advanced(by: 208).storeBytes(of: jc.rightStickY, as: Float.self)
-                    handsMapPtr.advanced(by: 212).storeBytes(of: jc.leftStickX, as: Float.self)
-                    handsMapPtr.advanced(by: 216).storeBytes(of: jc.leftStickY, as: Float.self)
-                    handsMapPtr.advanced(by: 220).storeBytes(of: jc.rightVelocityX, as: Float.self)
-                    handsMapPtr.advanced(by: 224).storeBytes(of: jc.rightVelocityY, as: Float.self)
-                    handsMapPtr.advanced(by: 228).storeBytes(of: jc.rightVelocityZ, as: Float.self)
-                    handsMapPtr.advanced(by: 232).storeBytes(of: jc.leftVelocityX, as: Float.self)
-                    handsMapPtr.advanced(by: 236).storeBytes(of: jc.leftVelocityY, as: Float.self)
-                    handsMapPtr.advanced(by: 240).storeBytes(of: jc.leftVelocityZ, as: Float.self)
+                    withSharedHandsWrite {
+                        handsMapPtr.advanced(by: 196).storeBytes(of: jc.rightButtons, as: UInt32.self)
+                        handsMapPtr.advanced(by: 200).storeBytes(of: jc.leftButtons, as: UInt32.self)
+                        handsMapPtr.advanced(by: 204).storeBytes(of: jc.rightStickX, as: Float.self)
+                        handsMapPtr.advanced(by: 208).storeBytes(of: jc.rightStickY, as: Float.self)
+                        handsMapPtr.advanced(by: 212).storeBytes(of: jc.leftStickX, as: Float.self)
+                        handsMapPtr.advanced(by: 216).storeBytes(of: jc.leftStickY, as: Float.self)
+                        handsMapPtr.advanced(by: 220).storeBytes(of: jc.rightVelocityX, as: Float.self)
+                        handsMapPtr.advanced(by: 224).storeBytes(of: jc.rightVelocityY, as: Float.self)
+                        handsMapPtr.advanced(by: 228).storeBytes(of: jc.rightVelocityZ, as: Float.self)
+                        handsMapPtr.advanced(by: 232).storeBytes(of: jc.leftVelocityX, as: Float.self)
+                        handsMapPtr.advanced(by: 236).storeBytes(of: jc.leftVelocityY, as: Float.self)
+                        handsMapPtr.advanced(by: 240).storeBytes(of: jc.leftVelocityZ, as: Float.self)
+                    }
                 }
             }
         }
     }
 }
 
-// removed duplicate netservice
-print("Published Bonjour _verantyxvr._udp on port 9999. Waiting for Vision Pro connection (AWDL enabled)...")
 
 struct VRPosePacket {
     var magic: UInt32 // 0x45534F50 ("POSE" little endian)
@@ -435,181 +739,321 @@ struct VRPosePacket {
     var rightPinch: UInt8
 }
 
-// Receive loop using POSIX socket on port 9999
-DispatchQueue.global(qos: .userInteractive).async {
-    var buffer = [UInt8](repeating: 0, count: 2048)
-    while true {
-        var senderAddr = sockaddr_storage()
-        var senderLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
-        
-        let bytesRead = withUnsafeMutablePointer(to: &senderAddr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                recvfrom(sock, &buffer, buffer.count, 0, $0, &senderLen)
-            }
+func receiveVideoPeerPacket(_ packet: Data, from connection: NWConnection) {
+    peerLock.lock()
+    let retired = retiredVideoPeers.contains(connection)
+    peerLock.unlock()
+    guard !retired else { return }
+    if packet.starts(with: Data("CLIENT_STATS ".utf8)) {
+        // Only the active headset can report diagnostics. Bound both the log
+        // frequency and payload, and prevent remote newlines from forging rows.
+        let now = ProcessInfo.processInfo.systemUptime
+        peerLock.lock()
+        let shouldLog = videoPeer === connection && now - lastClientDiagnosticsAt >= 4
+        if shouldLog { lastClientDiagnosticsAt = now }
+        peerLock.unlock()
+        if shouldLog, let message = String(data: packet.prefix(512), encoding: .utf8) {
+            let singleLine = message.components(separatedBy: .controlCharacters).joined(separator: " ")
+            print(String(format: "Headset diagnostics uptime=%.3f %@", now, singleLine))
         }
-        
-        if bytesRead >= 210 {
-            buffer.withUnsafeBytes { rawBuffer in
-                guard let baseAddr = rawBuffer.baseAddress else { return }
-                var magic: UInt32 = 0
-                memcpy(&magic, baseAddr, 4)
+        return
+    }
+    if packet == Data("HELLO_VR".utf8) {
+        registerVideoPeer(connection, handshake: true)
+        return
+    }
+    if packet == Data("REQUEST_KEYFRAME".utf8) {
+        registerVideoPeer(connection, handshake: true)
+        return
+    }
+    if packet.count >= 271 {
+        packet.withUnsafeBytes { rawBuffer in
+            guard let baseAddr = rawBuffer.baseAddress else { return }
+            var magic: UInt32 = 0
+            memcpy(&magic, baseAddr, 4)
 
-                if magic == 0x45534F50 || magic == 0x504F5345 { print("UDP POSE PACKET SIZE: \(bytesRead)") // "POSE"
-                    let visionTs = baseAddr.load(fromByteOffset: 8, as: Double.self)
-                    
-                    // Vision Pro payload: magic(4) + pad(4) + ts(8) = 16 bytes offset
+            if magic == 0x45534F50 || magic == 0x504F5345 {
+                encoderDiagnosticLock.lock()
+                posePacketCount += 1
+                let posePacketsReceived = posePacketCount
+                lastPoseReceivedAt = ProcessInfo.processInfo.systemUptime
+                encoderDiagnosticLock.unlock()
+                if posePacketsReceived == 1 || posePacketsReceived % 900 == 0 {
+                    print("Received Vision Pro pose packet #\(posePacketsReceived) (\(packet.count) bytes)")
+                }
+                let visionTs = rawBuffer.loadUnaligned(fromByteOffset: 8, as: Double.self)
+
+                // Vision Pro payload: magic(4) + pad(4) + ts(8) = 16 bytes offset
+                let leftTracked = rawBuffer.loadUnaligned(fromByteOffset: 208, as: UInt8.self)
+                let rightTracked = rawBuffer.loadUnaligned(fromByteOffset: 209, as: UInt8.self)
+                let leftTrigger = rawBuffer.loadUnaligned(fromByteOffset: 210, as: UInt8.self)
+                let rightTrigger = rawBuffer.loadUnaligned(fromByteOffset: 211, as: UInt8.self)
+                let rightButtons = rawBuffer.loadUnaligned(fromByteOffset: 212, as: UInt32.self)
+                let leftButtons = rawBuffer.loadUnaligned(fromByteOffset: 216, as: UInt32.self)
+                let rightStickX = rawBuffer.loadUnaligned(fromByteOffset: 220, as: Float.self)
+                let rightStickY = rawBuffer.loadUnaligned(fromByteOffset: 224, as: Float.self)
+                let leftStickX = rawBuffer.loadUnaligned(fromByteOffset: 228, as: Float.self)
+                let leftStickY = rawBuffer.loadUnaligned(fromByteOffset: 232, as: Float.self)
+                let leftGrip = rawBuffer.loadUnaligned(fromByteOffset: 268, as: UInt8.self)
+                let rightGrip = rawBuffer.loadUnaligned(fromByteOffset: 269, as: UInt8.self)
+                let headTracked = rawBuffer.loadUnaligned(fromByteOffset: 270, as: UInt8.self)
+                withSharedHandsWrite {
                     memcpy(handsMapPtr, baseAddr + 16, 64)       // Head (offset 0)
                     memcpy(handsMapPtr + 64, baseAddr + 80, 64)  // Left (offset 64)
                     memcpy(handsMapPtr + 128, baseAddr + 144, 64)// Right (offset 128)
-                    
-                    let visionLeftPinch = baseAddr.load(fromByteOffset: 208, as: UInt8.self)
-                    let visionRightPinch = baseAddr.load(fromByteOffset: 209, as: UInt8.self)
-                    let visionLeftTrigger = baseAddr.load(fromByteOffset: 210, as: UInt8.self)
-                    let visionRightTrigger = baseAddr.load(fromByteOffset: 211, as: UInt8.self)
-                    
-                    handsMapPtr.advanced(by: 192).storeBytes(of: visionLeftPinch, as: UInt8.self)
-                    handsMapPtr.advanced(by: 193).storeBytes(of: visionRightPinch, as: UInt8.self)
-                    handsMapPtr.advanced(by: 194).storeBytes(of: visionLeftTrigger, as: UInt8.self)
-                    handsMapPtr.advanced(by: 195).storeBytes(of: visionRightTrigger, as: UInt8.self)
+                    handsMapPtr.advanced(by: 192).storeBytes(of: leftTracked, as: UInt8.self)
+                    handsMapPtr.advanced(by: 193).storeBytes(of: rightTracked, as: UInt8.self)
+                    handsMapPtr.advanced(by: 194).storeBytes(of: leftTrigger, as: UInt8.self)
+                    handsMapPtr.advanced(by: 195).storeBytes(of: rightTrigger, as: UInt8.self)
+                    handsMapPtr.advanced(by: 196).storeBytes(of: rightButtons, as: UInt32.self)
+                    handsMapPtr.advanced(by: 200).storeBytes(of: leftButtons, as: UInt32.self)
+                    handsMapPtr.advanced(by: 204).storeBytes(of: rightStickX, as: Float.self)
+                    handsMapPtr.advanced(by: 208).storeBytes(of: rightStickY, as: Float.self)
+                    handsMapPtr.advanced(by: 212).storeBytes(of: leftStickX, as: Float.self)
+                    handsMapPtr.advanced(by: 216).storeBytes(of: leftStickY, as: Float.self)
                     handsMapPtr.advanced(by: 244).storeBytes(of: visionTs, as: Double.self)
-                    
-                    if bytesRead >= 236 {
-                        let rightButtons = baseAddr.load(fromByteOffset: 212, as: UInt32.self)
-                        let leftButtons = baseAddr.load(fromByteOffset: 216, as: UInt32.self)
-                        let rightStickX = baseAddr.load(fromByteOffset: 220, as: Float.self)
-                        let rightStickY = baseAddr.load(fromByteOffset: 224, as: Float.self)
-                        let leftStickX = baseAddr.load(fromByteOffset: 228, as: Float.self)
-                        let leftStickY = baseAddr.load(fromByteOffset: 232, as: Float.self)
-                        
-                        handsMapPtr.advanced(by: 196).storeBytes(of: rightButtons, as: UInt32.self)
-                        handsMapPtr.advanced(by: 200).storeBytes(of: leftButtons, as: UInt32.self)
-                        handsMapPtr.advanced(by: 204).storeBytes(of: rightStickX, as: Float.self)
-                        handsMapPtr.advanced(by: 208).storeBytes(of: rightStickY, as: Float.self)
-                        handsMapPtr.advanced(by: 212).storeBytes(of: leftStickX, as: Float.self)
-                        handsMapPtr.advanced(by: 216).storeBytes(of: leftStickY, as: Float.self)
-                    }
-                    
-                    if bytesRead >= 268 { print("TANGENTS RECV: \(baseAddr.load(fromByteOffset: 236, as: simd_float4.self))")
-                        // baseAddr offset 236 is leftTangents, 252 is rightTangents
+                    handsMapPtr.advanced(by: 284).storeBytes(of: leftGrip, as: UInt8.self)
+                    handsMapPtr.advanced(by: 285).storeBytes(of: rightGrip, as: UInt8.self)
+                    handsMapPtr.advanced(by: 286).storeBytes(of: headTracked, as: UInt8.self)
+                    if packet.count >= 268 {
                         memcpy(handsMapPtr + 252, baseAddr + 236, 16)
                         memcpy(handsMapPtr + 268, baseAddr + 252, 16)
                     }
-                    
-                    var ipStr = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-                    if senderAddr.ss_family == sa_family_t(AF_INET6) {
-                        let senderAddrIn6 = withUnsafePointer(to: &senderAddr) {
-                            $0.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee }
-                        }
-                        var sin6_addr = senderAddrIn6.sin6_addr
-                        inet_ntop(AF_INET6, &sin6_addr, &ipStr, socklen_t(INET6_ADDRSTRLEN))
-                    } else if senderAddr.ss_family == sa_family_t(AF_INET) {
-                        let senderAddrIn = withUnsafePointer(to: &senderAddr) {
-                            $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
-                        }
-                        var sin_addr = senderAddrIn.sin_addr
-                        inet_ntop(AF_INET, &sin_addr, &ipStr, socklen_t(INET_ADDRSTRLEN))
-                    }
-                    
-                    let currentSenderIP = String(cString: ipStr)
-                    
-                    if targetIP != currentSenderIP && currentSenderIP != "127.0.0.1" && currentSenderIP != "::1" && currentSenderIP != "" {
-                        targetIP = currentSenderIP
-                        print("Auto-discovered Vision Pro IP: \(targetIP)")
-                    }
-                    
-                    // Store the entire sockaddr_storage to respond exactly to the same address/port
-                    targetAddr = senderAddr
-                    targetAddrLen = senderLen
                 }
+
+                registerVideoPeer(connection, handshake: false)
             }
         }
     }
 }
-print("Published Bonjour _verantyxvr._udp. Waiting for Vision Pro connection (AWDL enabled)...")
+
+func receiveFromVideoPeer(_ connection: NWConnection) {
+    connection.receiveMessage { content, _, _, error in
+        if let content { receiveVideoPeerPacket(content, from: connection) }
+        if let error {
+            print("Vision Pro receive failed: \(error)")
+            connection.cancel()
+        } else {
+            receiveFromVideoPeer(connection)
+        }
+    }
+}
+
+let networkParameters = NWParameters.udp
+networkParameters.includePeerToPeer = true
+let videoListener: NWListener
+do {
+    videoListener = try NWListener(using: networkParameters, on: 9999)
+} catch {
+    print("Could not listen for Vision Pro on port 9999: \(error)")
+    exit(1)
+}
+videoListener.service = NWListener.Service(name: "VerantyxVR", type: "_verantyxvr._udp")
+videoListener.stateUpdateHandler = { state in
+    if case .ready = state {
+        print("Published Bonjour _verantyxvr._udp on 9999 using peer-to-peer Network.framework")
+    } else if case .failed(let error) = state {
+        print("Vision Pro listener failed: \(error)")
+        exit(1)
+    }
+}
+videoListener.newConnectionHandler = { connection in
+    connection.stateUpdateHandler = { state in
+        if case .ready = state {
+            print("Vision Pro flow ready: \(connection.endpoint), path=\(String(describing: connection.currentPath))")
+        }
+        if case .failed(let error) = state {
+            print("Vision Pro flow failed: \(error)")
+            connection.cancel()
+        }
+        if case .cancelled = state {
+            peerLock.lock()
+            retiredVideoPeers.add(connection)
+            if videoPeer === connection { videoPeer = nil; peerNeedsKeyFrame = true }
+            peerLock.unlock()
+            connection.stateUpdateHandler = nil
+        }
+    }
+    connection.start(queue: transportQueue)
+    receiveFromVideoPeer(connection)
+}
+videoListener.start(queue: transportQueue)
 
 print("Starting native read loop and UDP transmission on port 9999...")
 
-var lastReadIndex: UInt32 = 0xFFFFFFFF
-
 while isEncoding {
     autoreleasepool {
+        reportDiagnosticsIfDue()
+        let sourceMode = dbHeaderPtr.pointee.captureSourceMode
+        if sourceMode != lastCaptureSourceMode {
+            print("Capture source changed \(lastCaptureSourceMode)->\(sourceMode); continuing stream sequence \(streamSequence)")
+            lastCaptureSourceMode = sourceMode
+            lastSeq = 0
+            requestKeyFrame()
+        }
         let readyIndex = dbHeaderPtr.pointee.latestReadyIndex
-        if readyIndex != lastReadIndex && readyIndex < 2 {
+        OSMemoryBarrier()
+        if readyIndex < 2 {
             let headerPtr = headers[Int(readyIndex)]
             let currentSeq = headerPtr.pointee.sequenceNumber
             
             if currentSeq != lastSeq && currentSeq > 0 {
-                let width = Int(headerPtr.pointee.width)
-                let height = Int(headerPtr.pointee.height)
-                
-                if width != currentWidth || height != currentHeight {
-                    if compressionSession != nil {
-                        VTCompressionSessionInvalidate(compressionSession!)
-                        compressionSession = nil
-                    }
-                    pixelBuffer = nil
-                    currentWidth = width
-                    currentHeight = height
-                    print("Resolution changed to \(width)x\(height)")
+                let frameHeader = headerPtr.pointee
+                let width = Int(frameHeader.width)
+                let height = Int(frameHeader.height)
+                encoderDiagnosticLock.lock()
+                capturedFrameCount += 1
+                encoderDiagnosticLock.unlock()
+
+                guard width > 0, height > 0, width <= 4096, height <= 4096 else {
+                    lastSeq = currentSeq
+                    return
                 }
-                
-                if compressionSession == nil && width > 0 && height > 0 {
-                    print("Initializing VideoToolbox encoder for \(width)x\(height)...")
+
+                let outputSizeChanged = resolveOutputSize(sourceWidth: width, sourceHeight: height)
+                if outputSizeChanged, let oldSession = compressionSession {
+                    // SteamVR can switch to the headset's measured frustum after
+                    // the first Vision Pro pose arrives. Drain the old session
+                    // before changing pixel-buffer dimensions and its HEVC SPS.
+                    // Complete first: an encoder may hold its last output until
+                    // this call, so waiting for all callbacks first can deadlock.
+                    VTCompressionSessionCompleteFrames(oldSession, untilPresentationTimeStamp: .invalid)
+                    for _ in 0..<3 { encoderInFlightFrames.wait() }
+                    VTCompressionSessionInvalidate(oldSession)
+                    compressionSession = nil
+                    pixelBufferPool = nil
+                    for _ in 0..<3 { encoderInFlightFrames.signal() }
+                    print("Reconfiguring HEVC encoder for source aspect \(String(format: "%.3f", Double(width) / Double(height)))")
+                }
+
+                if compressionSession == nil {
+                    resolveOutputSize(sourceWidth: width, sourceHeight: height)
+                    print("Initializing fixed-size VideoToolbox encoder for \(outputWidth)x\(outputHeight)...")
                     fflush(stdout)
-                    setupEncoder(width: Int32(width), height: Int32(height))
+                    setupEncoder(width: Int32(outputWidth), height: Int32(outputHeight))
                 }
-                
-                if width > 0 && height > 0 {
-                    if pixelBuffer == nil {
-                        CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
-                    }
-                    
-                    if let pb = pixelBuffer {
-                        CVPixelBufferLockBaseAddress(pb, [])
-                        let dst = CVPixelBufferGetBaseAddress(pb)!
-                        let bytesPerRow = CVPixelBufferGetBytesPerRow(pb)
-                        
-                        let pixelPtr = pixelDatas[Int(readyIndex)]
-                        var srcBuffer = vImage_Buffer(data: pixelPtr, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: Int(width * 4))
-                        var dstBuffer = vImage_Buffer(data: dst, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: bytesPerRow)
-                        let map: [UInt8] = [2, 1, 0, 3] // Swap R (0) and B (2) -> BGRA
-                        vImagePermuteChannels_ARGB8888(&srcBuffer, &dstBuffer, map, vImage_Flags(kvImageNoFlags))
-                        
-                        CVPixelBufferUnlockBaseAddress(pb, [])
-                        
-                        let presentationTime = CMTime(value: CMTimeValue(framesEncoded), timescale: 90)
-                        currentFrameSequence = currentSeq
-                        let currentVisionTimestamp = headerPtr.pointee.visionTimestamp
-                        let currentTransform = headerPtr.pointee.renderHeadTransform
-                        
-                        let refConPtr = UnsafeMutablePointer<FrameContext>.allocate(capacity: 1)
-                        refConPtr.initialize(to: FrameContext(sequence: currentSeq, visionTimestamp: currentVisionTimestamp, transform: currentTransform))
-                        
-                        var frameProps: CFDictionary? = nil
-                        if framesEncoded % 45 == 0 {
-                            let dict: [CFString: Any] = [kVTEncodeFrameOptionKey_ForceKeyFrame: true]
-                            frameProps = dict as CFDictionary
-                        }
-                        
-                        let status = VTCompressionSessionEncodeFrame(compressionSession!,
-                                                                     imageBuffer: pb,
-                                                                     presentationTimeStamp: presentationTime,
-                                                                     duration: CMTime.invalid,
-                                                                     frameProperties: frameProps,
-                                                                     sourceFrameRefcon: UnsafeMutableRawPointer(refConPtr),
-                                                                     infoFlagsOut: nil)
-                        
-                        if status != noErr {
-                            print("VTCompressionSessionEncodeFrame failed: \(status)")
-                            refConPtr.deinitialize(count: 1)
-                            refConPtr.deallocate()
-                        }
-                        
-                        framesEncoded += 1
-                    }
+
+                if pixelBufferPool == nil {
+                    pixelBufferPool = makePixelBufferPool(width: outputWidth, height: outputHeight)
                 }
+
+                guard encoderInFlightFrames.wait(timeout: .now()) == .success else {
+                    droppedEncoderFrames += 1
+                    lastSeq = currentSeq
+                    if droppedEncoderFrames == 1 || droppedEncoderFrames % 90 == 0 {
+                        print("Dropped capture frame: VideoToolbox has 3 frames in flight (total dropped=\(droppedEncoderFrames))")
+                    }
+                    return
+                }
+
+                guard let pool = pixelBufferPool else {
+                    encoderInFlightFrames.signal()
+                    print("Could not create VideoToolbox input pixel buffer pool")
+                    lastSeq = currentSeq
+                    return
+                }
+                var pixelBuffer: CVPixelBuffer?
+                let poolStatus = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
+                guard poolStatus == kCVReturnSuccess, let pb = pixelBuffer else {
+                    encoderInFlightFrames.signal()
+                    droppedEncoderFrames += 1
+                    lastSeq = currentSeq
+                    if droppedEncoderFrames == 1 || droppedEncoderFrames % 90 == 0 {
+                        print("Could not acquire VideoToolbox pixel buffer: \(poolStatus) (total dropped=\(droppedEncoderFrames))")
+                    }
+                    return
+                }
+                guard CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else {
+                    encoderInFlightFrames.signal()
+                    lastSeq = currentSeq
+                    return
+                }
+                guard let destination = CVPixelBufferGetBaseAddress(pb) else {
+                    CVPixelBufferUnlockBaseAddress(pb, [])
+                    encoderInFlightFrames.signal()
+                    lastSeq = currentSeq
+                    return
+                }
+
+                let sourceFormat = frameHeader.format
+                let didCopy = copyFrameToBGRA(
+                    source: pixelDatas[Int(readyIndex)],
+                    sourceFormat: sourceFormat,
+                    sourceWidth: width,
+                    sourceHeight: height,
+                    destination: destination,
+                    destinationBytesPerRow: CVPixelBufferGetBytesPerRow(pb)
+                )
+                CVPixelBufferUnlockBaseAddress(pb, [])
+                guard didCopy else {
+                    encoderInFlightFrames.signal()
+                    print("Could not convert SteamVR DXGI frame \(width)x\(height), format \(sourceFormat)")
+                    lastSeq = currentSeq
+                    return
+                }
+
+                // The two shared buffers can be reused if encoding falls behind. Drop
+                // a frame if its producer overwrote this slot while we copied it.
+                OSMemoryBarrier()
+                guard headerPtr.pointee.sequenceNumber == currentSeq,
+                      dbHeaderPtr.pointee.captureSourceMode == sourceMode else {
+                    encoderInFlightFrames.signal()
+                    lastSeq = currentSeq
+                    return
+                }
+
+                streamSequence &+= 1
+                let outputSequence = streamSequence
+                let now = ProcessInfo.processInfo.systemUptime
+                // Capture is irregular under translation; numbering frames at
+                // 90fps would misstate bitrate and keyframe timing by >20x at4fps.
+                let presentationSeconds = max(now - presentationEpoch, lastPresentationSeconds + 0.000001)
+                let presentationTime = CMTime(seconds: presentationSeconds, preferredTimescale: 1_000_000)
+                lastPresentationSeconds = presentationSeconds
+                let currentVisionTimestamp = frameHeader.visionTimestamp
+                let currentTransform = frameHeader.renderHeadTransform
+
+                let refConPtr = UnsafeMutablePointer<FrameContext>.allocate(capacity: 1)
+                refConPtr.initialize(to: FrameContext(
+                    sequence: outputSequence,
+                    visionTimestamp: currentVisionTimestamp,
+                    transform: currentTransform,
+                    pixelBuffer: pb
+                ))
+
+                var frameProps: CFDictionary? = nil
+                if consumeKeyFrameRequest() || now - lastForcedKeyFrameAt >= 0.5 {
+                    let dict: [CFString: Any] = [kVTEncodeFrameOptionKey_ForceKeyFrame: true]
+                    frameProps = dict as CFDictionary
+                    lastForcedKeyFrameAt = now
+                }
+
+                let status = VTCompressionSessionEncodeFrame(compressionSession!,
+                                                             imageBuffer: pb,
+                                                             presentationTimeStamp: presentationTime,
+                                                             duration: CMTime.invalid,
+                                                             frameProperties: frameProps,
+                                                             sourceFrameRefcon: UnsafeMutableRawPointer(refConPtr),
+                                                             infoFlagsOut: nil)
+
+                if framesEncoded < 3 || framesEncoded % 90 == 0 {
+                    print("Queued capture frame seq=\(currentSeq), source=\(width)x\(height) format=\(sourceFormat), status=\(status)")
+                }
+
+                if status != noErr {
+                    print("VTCompressionSessionEncodeFrame failed: \(status)")
+                    refConPtr.deinitialize(count: 1)
+                    refConPtr.deallocate()
+                    encoderInFlightFrames.signal()
+                    requestKeyFrame()
+                } else {
+                    encoderDiagnosticLock.lock()
+                    submittedFrameCount += 1
+                    encoderDiagnosticLock.unlock()
+                }
+
+                framesEncoded += 1
                 lastSeq = currentSeq
-                lastReadIndex = readyIndex
             } else {
                 // Weak memory ordering on Apple Silicon: latestReadyIndex was updated, 
                 // but sequenceNumber isn't visible yet. Do NOT update lastReadIndex, 

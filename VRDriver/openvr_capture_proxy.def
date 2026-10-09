@@ -1,0 +1,19 @@
+EXPORTS
+    LiquidVR=openvr_api_valve.LiquidVR @1
+    VRControlPanel=openvr_api_valve.VRControlPanel @2
+    VRHeadsetView=openvr_api_valve.VRHeadsetView @3
+    VRPaths=openvr_api_valve.VRPaths @4
+    VRVirtualDisplay=openvr_api_valve.VRVirtualDisplay @5
+    VR_GetGenericInterface @6
+    VR_GetInitToken @7
+    VR_GetRuntimePath @8
+    VR_GetStringForHmdError @9
+    VR_GetVRInitErrorAsEnglishDescription @10
+    VR_GetVRInitErrorAsSymbol @11
+    VR_InitInternal @12
+    VR_InitInternal2 @13
+    VR_IsHmdPresent @14
+    VR_IsInterfaceVersionValid @15
+    VR_IsRuntimeInstalled @16
+    VR_RuntimePath=openvr_api_valve.VR_RuntimePath @17
+    VR_ShutdownInternal @18
