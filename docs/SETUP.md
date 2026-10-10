@@ -76,6 +76,24 @@ on both at the same time to merge them into one controller. The app's
 *Controller* row shows the controller in use and which motion sensors
 visionOS exposes.
 
+Without Joy-Con, everything is done with the hands (both hands, per hand):
+
+| Gesture | Touch input |
+|---|---|
+| Thumb–index pinch | Trigger (fire / use) |
+| Curl middle, ring and little fingers | Grip (grab, gravity-glove lock) |
+| Thumb–ring pinch | A / X (eject clip, health pen, laser sight) |
+| Thumb–little pinch | B / Y (reload; left Y opens the game menu) |
+| Thumb–middle pinch, then move the hand | Joystick (left: teleport aim, right: turn / jump / dash) |
+| Left: thumb–middle pinch held 0.15 s | Stick forward (teleport aim; release to go) |
+| Right: thumb–middle pinch held still 0.45 s | Stick click (weapon inventory) |
+| Both fists raised above the head for 1.5 s | Recenter |
+
+Gravity gloves without Joy-Con: aim the open hand at the item, curl the
+fingers (grip) so it locks on, then flick the wrist sharply toward you and
+keep the grip to catch it. The hand's velocity comes from hand tracking
+alone, so make the flick quick and keep the hand inside the cameras' view.
+
 ## 4. Play
 
 ```bash
@@ -162,7 +180,7 @@ The Vision Pro's ARKit origin is on the floor, so the game's floor matches the
 real floor and your eye height is your real one (standing or seated). The
 horizontal position and yaw are recentered when the immersive view starts;
 to recenter again while playing, hold both Joy-Con stick clicks for one
-second. The launch script writes a SteamVR chaperone universe with an identity
+second, or, without Joy-Con, raise both fists above your head for 1.5 s. The launch script writes a SteamVR chaperone universe with an identity
 standing transform and a `VERANTYX_PLAY_AREA_METERS` (default 3) square play
 area, replacing the 1x1 m one that SteamVR's room setup wrote.
 

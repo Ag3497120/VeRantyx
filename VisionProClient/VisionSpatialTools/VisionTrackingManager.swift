@@ -213,9 +213,13 @@ final class VRPoseSampler: @unchecked Sendable {
         // Recenter: hold both Joy-Con stick clicks for one second. Resets the
         // horizontal position and yaw to the current head pose (height stays
         // floor-based).
-        if pads.left?.stickClick == true, pads.right?.stickClick == true {
+        // Without Joy-Con: both fists held above head height for 1.5 s.
+        let headY = headTransform.columns.3.y
+        let fistsRaised = headIsTracked && leftHand.isFistRaised(above: headY) && rightHand.isFistRaised(above: headY)
+        let bothStickClicks = pads.left?.stickClick == true && pads.right?.stickClick == true
+        if bothStickClicks || fistsRaised {
             if recenterHeldSince == nil { recenterHeldSince = now }
-            if let since = recenterHeldSince, now - since >= 1.0, !recenterFired {
+            if let since = recenterHeldSince, now - since >= (bothStickClicks ? 1.0 : 1.5), !recenterFired {
                 recenterFired = true
                 worldToSteamVR = nil
                 print("Recentered SteamVR space on request")
@@ -449,7 +453,20 @@ private struct HandState {
         if let lastWorldPosition, let lastWorldRotation, now - lastWorldTime > 0.001, now - lastWorldTime < 0.1 {
             let dt = Float(now - lastWorldTime)
             let measured = (rawPosition - lastWorldPosition) / dt
-            velocity += (measured - velocity) * 0.5
+            if controller?.motion != nil {
+                velocity += (measured - velocity) * 0.5
+            } else {
+                // Hand tracking alone: a wrist flick lasts a few samples, and
+                // averaging halved its peak so Alyx's gravity gloves ignored
+                // it. Follow a rising speed at once and let it decay over
+                // ~80 ms so the peak reaches the game.
+                let speed = simd_length(measured), current = simd_length(velocity)
+                if speed >= current {
+                    velocity = measured
+                } else {
+                    velocity += (measured - velocity) * min(1, dt / 0.08)
+                }
+            }
             var delta = rawRotation * lastWorldRotation.inverse
             if delta.real < 0 { delta = simd_quatf(real: -delta.real, imag: -delta.imag) }
             let axisLength = simd_length(delta.imag)
@@ -655,6 +672,12 @@ private struct HandState {
         if controller.stickClick || simd_length(controller.stick) > 0.1 { bits |= 8 }
         if controller.menu { bits |= 16 }
         buttonBits = bits
+    }
+
+    /// A tracked fist (grip engaged by finger curl, no controller) whose palm
+    /// is above the given height: the hands-only recenter gesture.
+    func isFistRaised(above height: Float) -> Bool {
+        trackingState == 1 && gripEngaged && transform.columns.3.y > height
     }
 
     private mutating func updateFingerPinch(middle: Float?, ring: Float?, little: Float?, index: Float?) {

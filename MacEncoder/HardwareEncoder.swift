@@ -452,7 +452,7 @@ func createCompressionSession(width: Int32, height: Int32, lowLatency: Bool) -> 
 }
 
 // Lowers the HEVC bitrate while the link loses packets (the headset's
-// incomplete-frame and gap counters, or local send errors) and raises it back
+// incomplete-frame counter, or local send errors) and raises it back
 // slowly once the link has been clean for a while. VERANTYX_BITRATE_MBPS is
 // the ceiling, VERANTYX_BITRATE_MIN_MBPS the floor; VERANTYX_ADAPTIVE_BITRATE=0
 // keeps the ceiling fixed.
@@ -462,7 +462,7 @@ final class AdaptiveBitrate {
     private(set) var current: Int32
     private let enabled = ProcessInfo.processInfo.environment["VERANTYX_ADAPTIVE_BITRATE"] != "0"
     private let lock = NSLock()
-    private var headsetLossTotal = 0      // incomplete + gaps reported by the headset
+    private var headsetLossTotal = 0      // incomplete frames reported by the headset
     private var headsetLossAtLastCheck = 0
     private var cleanSeconds: TimeInterval = 0
 
@@ -474,11 +474,13 @@ final class AdaptiveBitrate {
     }
 
     func noteHeadsetStatistics(_ message: String) {
+        // Only frames that arrived with packets missing count as link loss.
+        // The headset's gap counter also grows when the encoder itself skips
+        // a frame, which lowered the bitrate for no reason (8 Mbps in play).
         var total = 0
-        for key in ["incomplete=", "gaps="] {
-            guard let range = message.range(of: key) else { continue }
+        if let range = message.range(of: "incomplete=") {
             let digits = message[range.upperBound...].prefix { $0.isNumber }
-            total += Int(digits) ?? 0
+            total = Int(digits) ?? 0
         }
         lock.lock()
         headsetLossTotal = total
