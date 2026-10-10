@@ -206,10 +206,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
 void EnsureD3D11Loaded() {
     if (!g_hOriginalD3D11) {
+        // With the DXMT backend, system32\d3d11.dll is DXMT for the game and
+        // DXVK is kept beside it as d3d11_dxvk.dll; the compositor stays on DXVK.
         char path[MAX_PATH];
         GetSystemDirectoryA(path, MAX_PATH);
-        strcat_s(path, "\\d3d11.dll");
+        strcat_s(path, "\\d3d11_dxvk.dll");
         g_hOriginalD3D11 = LoadLibraryA(path);
+        if (!g_hOriginalD3D11) {
+            GetSystemDirectoryA(path, MAX_PATH);
+            strcat_s(path, "\\d3d11.dll");
+            g_hOriginalD3D11 = LoadLibraryA(path);
+        }
     }
 }
 

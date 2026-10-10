@@ -22,7 +22,7 @@ for assignment in "$@"; do
     export "${assignment?}"
     # The game inherits its environment from the Steam client, so MoltenVK,
     # DXVK and Wine variables only reach it through a restarted Steam.
-    [[ "$assignment" =~ ^(MVK_|DXVK_|WINE|HLA_|VERANTYX_DISPLAY_HZ) ]] && restart_steam=1
+    [[ "$assignment" =~ ^(MVK_|DXVK_|DXMT_|WINE|HLA_|VERANTYX_DISPLAY_HZ|VERANTYX_D3D_BACKEND) ]] && restart_steam=1
 done
 [[ "${BENCH_RESTART_STEAM:-auto}" == "1" ]] && restart_steam=1
 
@@ -106,11 +106,8 @@ else
     stop_steamvr
 fi
 if (( restart_steam == 1 )) && pgrep -f '[S]team[/\\]steam\.exe|[s]team\.exe' >/dev/null 2>&1; then
-    say "Restarting the Windows Steam client so the game inherits the new environment."
+    say "Stopping the Windows Steam client so the launch script restarts it with the new environment."
     stop_processes '[s]teamwebhelper|[s]team\.exe'
-    "$REPO_ROOT/VRDriver/wine_launcher.sh" "$STEAM_ROOT/steam.exe" -no-cef-sandbox -cef-single-process -noverifyfiles \
-        >>"$OUT_DIR/$STAMP-$LABEL.steam.log" 2>&1 &
-    sleep 30
 fi
 
 proxy_offset="$(stat -f %z "$PROXY_LOG" 2>/dev/null || echo 0)"

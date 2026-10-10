@@ -170,6 +170,7 @@ display rate for frame rate; the encoder then adapts on its own:
 | `VERANTYX_AUDIO` | 1 | Stream the Mac's audio to the headset (Mac speakers are muted meanwhile); `VERANTYX_AUDIO_KEEP_MAC_SPEAKERS=1` keeps them on |
 | `VERANTYX_LOW_LATENCY_ENCODER` | 0 | VideoToolbox low-latency rate control (slower on M1 Max) |
 | `HLA_FIDELITY_LEVEL` | profile | Adds Alyx's `vr_fidelity_level` console variables (0–8); unset lets Alyx choose |
+| `VERANTYX_D3D_BACKEND` | dxvk | `dxmt` renders the game through [DXMT](https://github.com/3Shain/dxmt) (Direct3D 11 → Metal in one layer) instead of DXVK → MoltenVK; SteamVR's compositor keeps DXVK. Experimental: the script installs DXMT (system32 `d3d11.dll`, with DXVK kept as `d3d11_dxvk.dll` for the compositor) and restarts Steam, and Alyx starts and reaches its first level load with it, but on Wine 11.9 it exits during that load. Left opt-in until that is understood |
 
 ### Measuring on your Mac
 

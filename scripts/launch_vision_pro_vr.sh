@@ -186,6 +186,40 @@ else
     echo "VERANTYX_USE_DXVK=0: using the runtime's built-in D3D translation."
 fi
 
+# VERANTYX_D3D_BACKEND=dxmt: the game renders through DXMT (D3D11 → Metal in
+# one layer) instead of DXVK → MoltenVK; SteamVR's compositor keeps DXVK.
+# The game inherits its environment from the Steam client, so Steam is
+# restarted when the backend differs from the one it was started with.
+D3D_BACKEND="${VERANTYX_D3D_BACKEND:-dxvk}"
+if [[ "$D3D_BACKEND" == "dxmt" ]]; then
+    dxmt_output="$(WINEPREFIX="$WINEPREFIX" VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" STEAM_ROOT="$STEAM_ROOT" \
+        DXVK_SOURCE_DIR="$DXVK_SOURCE_DIR" "$REPO_ROOT/scripts/install_dxmt.sh")"
+    printf '%s\n' "$dxmt_output" | grep -v '^DXMT_UNIX_DIR='
+    DXMT_UNIX_DIR="$(printf '%s\n' "$dxmt_output" | sed -n 's/^DXMT_UNIX_DIR=//p')"
+    export WINEDLLPATH_PREPEND="$DXMT_UNIX_DIR${WINEDLLPATH_PREPEND:+:$WINEDLLPATH_PREPEND}"
+    export WINEDLLOVERRIDES="dxgi=n,b;${WINEDLLOVERRIDES:-}"
+    export DXMT_LOG_LEVEL="${DXMT_LOG_LEVEL:-error}"
+    export DXMT_LOG_PATH="${DXMT_LOG_PATH:-$LOG_DIR}"
+elif [[ -f "$STEAM_ROOT/steamapps/common/Half-Life Alyx/game/bin/win64/.verantyx-dxmt" ]] && ! pgrep -f '[h]lvr\.exe' >/dev/null 2>&1; then
+    WINEPREFIX="$WINEPREFIX" VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" STEAM_ROOT="$STEAM_ROOT" \
+        DXVK_SOURCE_DIR="$DXVK_SOURCE_DIR" "$REPO_ROOT/scripts/install_dxmt.sh" remove
+fi
+STEAM_BACKEND_MARKER="$LOG_DIR/.steam-d3d-backend"
+if pgrep -f '[s]team\.exe' >/dev/null 2>&1 && [[ -f "$STEAM_BACKEND_MARKER" ]] && \
+    [[ "$(cat "$STEAM_BACKEND_MARKER")" != "$D3D_BACKEND" ]] && ! pgrep -f '[h]lvr\.exe' >/dev/null 2>&1; then
+    echo "Windows Steam was started for the $(cat "$STEAM_BACKEND_MARKER") backend; restarting it for $D3D_BACKEND."
+    pkill -TERM -f '[v]rstartup\.exe|[v]rmonitor\.exe|[v]rserver\.exe|[v]rcompositor\.exe|[v]rwebhelper|[v]rdashboard' 2>/dev/null || true
+    pkill -TERM -f '[s]teamwebhelper|[s]team\.exe' 2>/dev/null || true
+    for ((waited = 0; waited < 30; waited++)); do
+        pgrep -f '[s]team\.exe|[v]rserver\.exe' >/dev/null 2>&1 || break
+        sleep 1
+    done
+    pkill -KILL -f '[s]teamwebhelper|[s]team\.exe|[v]rserver\.exe|[v]rcompositor\.exe' 2>/dev/null || true
+    sleep 2
+fi
+mkdir -p "$LOG_DIR"
+pgrep -f '[s]team\.exe' >/dev/null 2>&1 || echo "$D3D_BACKEND" >"$STEAM_BACKEND_MARKER"
+
 export WINEPREFIX
 # An encoder left over from an interrupted run still holds UDP port 9999.
 if pgrep -f "$ENCODER" >/dev/null 2>&1; then
@@ -574,6 +608,8 @@ game_has_script_options() {
     ps -o args= -p "$1" 2>/dev/null | grep -q -- '-condebug'
 }
 launch_alyx() {
+    # Steam starts here when it is not running, with this script's environment.
+    pgrep -f '[s]team\.exe' >/dev/null 2>&1 || echo "$D3D_BACKEND" >"$STEAM_BACKEND_MARKER"
     "$WINE_BIN" "$STEAM_EXE" -no-cef-sandbox -cef-single-process -noverifyfiles \
         -applaunch 546560 "$@" >>"$LOG_DIR/half-life-alyx.log" 2>&1 &
 }
