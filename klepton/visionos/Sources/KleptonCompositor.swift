@@ -1,0 +1,4944 @@
+//
+//  KleptonCompositor.swift — the Compositor Services half of the eye seam.
+//
+//  What this file owns:
+//
+//    1. The eye textures. The guest asks OVRPlugin for eye storage
+//       (ovrp_SetupEyeTexture2), kl_ovrp forwards that to kl_glfb, and
+//       kl_glfb asks the registered provider for an MTLTexture. That provider
+//       is `provideEyeTexture` below. The textures are OURS and outlive the
+//       frame — see "why not zero-copy" below.
+//    2. The frame clock. On device the deadline belongs to Compositor
+//       Services, so this loop calls kl_app_frame() once per drawable rather
+//       than letting the guest own a pump loop. That is why CADisplayLink was
+//       never added as an interim pacer: it would be a third mechanism to
+//       then remove.
+//    3. The composite pass — which is also the reprojection pass. See
+//       runtime/gfx/kl_reproject.h: the guest's picture is placed as a quad at a
+//       fixed far distance, sized by the frustum it was *rendered* with, in the
+//       space the pose it was rendered with defines, and then looked at from
+//       where the head is now through the projection this drawable wants. That
+//       corrects two things at once — the stale pose (timewarp) and the fact
+//       that the guest's Quest-shaped frustum is not the Vision Pro's.
+//
+//  **Why not zero-copy.** Handing the guest a cp_drawable's own texture would
+//  avoid a copy, but drawables are per-frame while eye textures are created
+//  once per (eye, stage) and reused. Timewarp needs the latter: reprojection
+//  resamples an already-rendered eye image against a newer pose, so the image
+//  has to still exist. Zero-copy and timewarp are mutually exclusive and
+//  timewarp wins — the resampling pass reprojection needs *is* this composite
+//  pass, so the copy is not actually extra work.
+//
+//  **Two reprojections happen, and they are not the same one.** This pass moves
+//  the guest's picture from the pose it was rendered with to the pose we
+//  predict for presentation. Compositor Services then does its own correction
+//  from that predicted pose to what the hardware actually reports at scanout —
+//  which is what `drawable.deviceAnchor` is for, and why the anchor set below
+//  is the *display* one and not the render one. Setting the render pose there
+//  instead would apply our delta twice. ALVR's visionOS client splits it the
+//  same way (`ALVRClient/Renderer.swift`).
+//
+//  **The flip is not cosmetic.** GL renders bottom-up; Metal and the display
+//  are top-down. The first host dump of these textures came out upside down
+//. It is done in the shared shader, because the composite is the only
+//  pass that reads the eye textures.
+//
+import SwiftUI
+import CompositorServices
+import Metal
+import MetalFX
+import CoreGraphics
+import ImageIO
+import simd
+import ARKit
+import AVFoundation
+import CoreVideo
+import QuartzCore
+
+// What the drawable costs, and therefore how much of the display we can afford
+// to actually use. Three settings here decide that, and they are entangled:
+//
+//   * **8-bit sRGB colour, not RGBA16F.** The eye textures the guest renders
+//     into stay RGBA16F — that is where Unity's HDR range lives and nothing
+//     about it changes. What changes is the *drawable* this pass resolves into,
+//     which is the last step before the display and holds a tone-mapped picture
+//     with no headroom left to preserve. Halving its bytes per pixel halves the
+//     bandwidth of every composite, and `bgra8Unorm_srgb` encodes on write, so
+//     the linear values the shader produces are converted by the hardware
+//     rather than thrown away. This is ALVR's choice on the same headset.
+//     KL_CP_FORMAT=16 is the A/B back to rgba16Float.
+//   * **Foveation.** The drawable is then rasterized through a variable rate
+//     map: dense where the eye looks, sparse at the periphery. The composite
+//     pass MUST set that map on its render pass — a pass that ignores it fills
+//     the physical texture as if it were uniform, and the system's unwarp then
+//     shows a distorted picture. That is why this was off until now, and it is
+//     the reason for the amplified single-pass composite below.
+//   * **maxRenderQuality = 1.0.** With foveation on, this is what buys the
+//     resolution: ALVR measures the drawable going from 1888x1792 physical /
+//     4338x3478 screen at the default to 2496x2432 / 6262x5020 at 1.0. It
+//     costs memory (it is billed to the app) and per-frame GPU time, which is
+//     why the ceiling and the *running* quality are two separate settings —
+//     see `applyRenderQuality`.
+//
+// KL_CP_FOVEATION=0 turns the last two off together, because the quality knob
+// is only accepted alongside foveation.
+struct KleptonStageConfiguration: CompositorLayerConfiguration {
+    /// The render quality to ask for, 0..1. Also read by the render loop, which
+    /// has to set the *running* quality separately.
+    static var requestedQuality: Float {
+        let e = ProcessInfo.processInfo.environment["KL_CP_QUALITY"]
+        let v = e.flatMap { Float($0) } ?? 1.0
+        return min(max(v, 0.0), 1.0)
+    }
+    static var wantFoveation: Bool { klEnvOn("KL_CP_FOVEATION", default: true) }
+
+    /// Whether `maxRenderQuality` was actually configured on the layer.
+    ///
+    /// Not the same question as `wantFoveation`, and the difference is a crash.
+    /// The ceiling is only set when foveation is genuinely available; the
+    /// *running* quality is set later by `applyRenderQuality`, and asking for a
+    /// quality above a ceiling that was never configured is a configuration
+    /// error, which Compositor Services reports as `__BUG_IN_CLIENT__` inside
+    /// `cp_layer_renderer_set_render_quality` — an abort with no mention of
+    /// either setting. The visionOS simulator is where the two diverge: it
+    /// supports no foveation at all and reports its default render quality as
+    /// **NaN**, so every immersive run there died on the second setting.
+    nonisolated(unsafe) static var ceilingConfigured = false
+
+    /// Foveation is only honourable with vertex amplification, so it is only
+    /// asked for when the GPU has it.
+    ///
+    /// A foveated drawable's rate map has one layer per eye and Metal picks the
+    /// layer by render-target array index, which only an amplified single pass
+    /// can address (see `encodeComposite`). Without amplification the composite
+    /// would have to ignore the map, and a pass that ignores the map does not
+    /// render *slower*, it renders a **distorted picture** — the system unwarps
+    /// something that was never warped. So the honest configuration on such a
+    /// device is no foveation at all, decided here rather than discovered three
+    /// layers down. Every Apple silicon GPU reports 2; this is a guard, not an
+    /// expected path.
+    static var canAmplify: Bool {
+        MTLCreateSystemDefaultDevice()?.supportsVertexAmplificationCount(2) ?? false
+    }
+
+    func makeConfiguration(capabilities: LayerRenderer.Capabilities,
+                           configuration: inout LayerRenderer.Configuration) {
+        // (supportedColorFormats(options:) is visionOS 26+ and deprecated in
+        // the same release, so it is not asked here — the drawable reports the
+        // format it actually got instead, in the one-time log below.)
+        let want: MTLPixelFormat =
+            ProcessInfo.processInfo.environment["KL_CP_FORMAT"] == "16"
+            ? .rgba16Float : .bgra8Unorm_srgb
+        configuration.colorFormat = want
+        configuration.depthFormat = .depth32Float
+
+        // KL_CP_AMPLIFY=0 takes foveation down with it: without an amplified
+        // single pass the rate map cannot be honoured (see encodeComposite),
+        // so one knob restores the entire pre-session composite rather than
+        // half of it.
+        let amplify = Self.canAmplify && klEnvOn("KL_CP_AMPLIFY", default: true)
+        let foveate = capabilities.supportsFoveation && Self.wantFoveation && amplify
+        configuration.isFoveationEnabled = foveate
+        if !amplify && capabilities.supportsFoveation && Self.wantFoveation {
+            NSLog("[cp] foveation refused: this GPU has no vertex amplification, "
+                  + "so the composite could not honour the rate map")
+        }
+        let quality = Self.requestedQuality
+        if foveate {
+            // Gated on foveation deliberately, as ALVR gates it: an
+            // unsupported render quality is a *configuration error*, which
+            // fails the whole layer rather than degrading, and there is no
+            // point paying for resolution the rate map is not there to spend.
+            configuration.maxRenderQuality = .init(quality)
+        }
+        Self.ceilingConfigured = foveate
+        NSLog("[cp] colour format \(want.rawValue), foveation \(foveate) "
+              + "(supported \(capabilities.supportsFoveation)), "
+              + "max render quality \(foveate ? String(quality) : "default") "
+              + "(device default \(capabilities.defaultRenderQuality))")
+
+        // The layout query has to be told about foveation too — the supported
+        // layouts are not the same set with a rate map in play.
+        let layouts = capabilities.supportedLayouts(options: foveate ? [.foveationEnabled] : [])
+        configuration.layout = layouts.contains(.layered) ? .layered : .dedicated
+    }
+}
+
+// Compositor Services hands out `Duration`s from its own clock epoch, and
+// ARKit wants a TimeInterval. There is no bridge in the SDK, so this is it.
+extension Duration {
+    var timeInterval: TimeInterval {
+        let c = components
+        return TimeInterval(c.seconds) + TimeInterval(c.attoseconds) * 1e-18
+    }
+}
+
+// One (eye, stage) allocation. `slice` is which slice of `texture` the eye
+// owns: both eyes share one 2-slice array, which is what the guest's own
+// texture-array path expects and what `make mtltex` [Q3] proved works.
+private struct EyeAllocation {
+    var texture: MTLTexture
+    var slice: Int
+    // 1 if the guest drew this picture with its origin at the TOP left — i.e.
+    // with Vulkan rather than GL. Recorded per texture rather than decided once
+    // (kl_reproject.h): getting it wrong is a correct-looking picture that is
+    // upside down, and nothing in Metal, Compositor Services or the guest can
+    // report it.
+    var flipY: Bool = false
+}
+
+/// GL internal format -> MTLPixelFormat, for the eye textures the guest asks
+/// for storage for.
+///
+/// **This is a requirement, not a preference.** ANGLE compares the GL internal
+/// format we claim against the MTLTexture's own pixel format and refuses the
+/// pair — `TextureImageSiblingMtl::ValidateClientBuffer`, "Incompatible format"
+/// — so a provider hardwired to RGBA16F cannot back a guest that asked for
+/// anything else. Unity asks for RGBA16F through OVRPlugin; Steam Link's OpenXR
+/// swapchains ask for SRGB8_ALPHA8, which is what put this here. `nil` means
+/// decline, and the guest then gets ordinary GL storage of the right format —
+/// black in the headset, which is visible, rather than colour that is subtly
+/// wrong, which is not.
+private func klEyePixelFormat(_ glInternal: UInt32) -> MTLPixelFormat? {
+    switch glInternal {
+    case 0x881A: return .rgba16Float        // GL_RGBA16F
+    case 0x8C43: return .rgba8Unorm_srgb    // GL_SRGB8_ALPHA8
+    case 0x8058: return .rgba8Unorm         // GL_RGBA8
+    default:     return nil
+    }
+}
+
+final class KleptonCompositor {
+    private let layerRenderer: LayerRenderer
+    private var device: MTLDevice!
+    // Optional, not implicitly unwrapped, and that is the whole fix for one
+    // crash: when ANGLE has no MTLDevice this used to stay nil while the loop
+    // carried on, and primeDisplay trapped on it before the guest thread was
+    // even started — so the immersive path could not run at all without
+    // KL_GLFB, which is exactly the configuration you want when the question
+    // is about the lifecycle rather than the picture.
+    private var queue: MTLCommandQueue?
+    private var pipeline: MTLRenderPipelineState!
+    private var depthState: MTLDepthStencilState?
+    /// Always-pass, no write — for coplanar draws after the first. See where
+    /// `depthState` is built for why the two cannot be one.
+    private var depthPassState: MTLDepthStencilState?
+    private var sampler: MTLSamplerState!
+    /// KL_EYE_MIPS=1: sample a mipmapped copy of each eye texture, so the
+    /// foveated periphery (where the eye image is minified) stops shimmering.
+    /// The guest's eye images have one level; each frame they are copied into
+    /// level 0 of these and the chain is generated, on a command buffer
+    /// committed ahead of the composite.
+    private let eyeMipsOn = ProcessInfo.processInfo.environment["KL_EYE_MIPS"] == "1"
+    /// KL_EYE_SHARPEN=<stops>: contrast-adaptive sharpening of each eye image once per guest frame (FSR1's RCAS: a
+    /// 5-tap cross whose lobe is limited to the neighbourhood's min/max, so no halos; 0 = strongest, 1 = half as strong,
+    /// 2 = a quarter). The compositor magnifies the eye image 2-2.7x in the centre, and bilinear magnification is what
+    /// reads as soft and blocky. Off when unset. Mac: 0.03 ms GPU per eye at 2400x1536.
+    private let eyeSharpen: Float? = {
+        guard let v = ProcessInfo.processInfo.environment["KL_EYE_SHARPEN"], let f = Float(v), f >= 0, f <= 4 else { return nil }
+        return f
+    }()
+    /// KL_EYE_SHARPEN_UNTIL=<s>: sharpen only for the first <s> seconds after the first eye frame, then stop (logged
+    /// with the wall clock), so one run shows the picture with and without it ("first half or second half").
+    private let eyeSharpenUntil: Double? = Double(ProcessInfo.processInfo.environment["KL_EYE_SHARPEN_UNTIL"] ?? "")
+    private var sharpT0 = 0.0
+    private var sharpOffLogged = false
+    /// KL_EYE_FXAA=1: FXAA 3.11 (quality preset, 12-step edge search) on each eye image once per guest frame, in the
+    /// same prep as KL_EYE_SHARPEN (which it replaces in the fixed variants). Smooths the stair-steps that the
+    /// compositor's ~1.8x magnification of a 2x-MSAA image makes visible. Mac: 0.126 ms per eye at 2784x2208.
+    private let eyeFXAA = ProcessInfo.processInfo.environment["KL_EYE_FXAA"] == "1"
+    /// KL_EYE_FXAA_UNTIL=<s>: FXAA only for the first <s> seconds after the first eye frame (a two-half run: the
+    /// second half is 4x MSAA and needs none), the switch logged with the wall clock.
+    private let eyeFXAAUntil: Double? = Double(ProcessInfo.processInfo.environment["KL_EYE_FXAA_UNTIL"] ?? "")
+    private var fxaaT0 = 0.0
+    private var fxaaOffLogged = false
+    /// Tuned to smooth real edges and leave texture alone (2026-09-29 Mac crops): sub-pixel blending KL_EYE_FXAA_SUBPIX
+    /// (0; FXAA's own default 0.75 softened brick and roof texture visibly), edge threshold KL_EYE_FXAA_EDGE (0.25 of
+    /// the local maximum luma; default FXAA 0.125-0.166).
+    private let fxaaParams: SIMD2<Float> = SIMD2(Float(ProcessInfo.processInfo.environment["KL_EYE_FXAA_SUBPIX"] ?? "") ?? 0,
+                                                 Float(ProcessInfo.processInfo.environment["KL_EYE_FXAA_EDGE"] ?? "") ?? 0.25)
+    private var fxaaPipeline: MTLRenderPipelineState?
+    private var fxaaOut: [MTLTexture?] = [nil, nil]
+    private var loggedFXAA = false
+    private var sharpPipeline: MTLRenderPipelineState?
+    private var sharpOut: [MTLTexture?] = [nil, nil]
+    private var loggedSharpen = false
+    private var eyeMipTex: [MTLTexture?] = [nil, nil]
+    private var mipSampler: MTLSamplerState?
+    private var loggedEyeMips = false
+    /// KL_EYE_FX=<scale> (e.g. 1.5): MetalFX spatial upscaling of each eye
+    /// texture before the composite samples it, to sharpen the fovea where the
+    /// compositor magnifies our image ~2x. A trial; off by default.
+    private let eyeFXScale: Float = {
+        guard let v = ProcessInfo.processInfo.environment["KL_EYE_FX"], let f = Float(v), f > 1.0, f <= 3.0 else { return 0 }
+        return f
+    }()
+    private var eyeFXScaler: [MTLFXSpatialScaler?] = [nil, nil]
+    private var eyeFXOut: [MTLTexture?] = [nil, nil]
+    private var loggedEyeFX = false
+    /// KL_CP_CAPTURE="t1,t2,..." (seconds after the first eye frame): write the
+    /// texture the composite samples for each eye (after MetalFX and mips, i.e.
+    /// what the display gets before the lens warp) as PNG to Documents/captures.
+    /// Readback only on those frames, and the guest's frame path is untouched,
+    /// so the frame rate stays representative.
+    private let cpCaptureTimes: [Double] = (ProcessInfo.processInfo.environment["KL_CP_CAPTURE"] ?? "")
+        .split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }.sorted()
+    private var cpCaptureNext = 0
+    /// KL_CP_VIDEO=1: short hardware-encoded clips of the left eye image (KLEyeRecorder, end of this file).
+    private lazy var eyeRecorder: KLEyeRecorder? = KLEyeRecorder.fromEnvironment(device: device)
+    /// Prep (FX/mips) cache: the compositor runs every display frame (90 Hz)
+    /// but the guest delivers one frame per two at 45 fps, so the prep is only
+    /// re-encoded when the guest's frame serial or source texture changes.
+    private var prepSerial: UInt64 = .max
+    private var prepSrc: [ObjectIdentifier?] = [nil, nil]
+    private var prepOut: [MTLTexture?] = [nil, nil]
+    private var prepStats = (n: 0, reused: 0, cpu: 0.0, gpu: 0.0, gpuN: 0, t0: 0.0)
+    private let prepLock = NSLock()
+    private var cpCaptureT0: Double = 0
+    /// Views this GPU can draw in one amplified pass. 2 everywhere real; 1
+    /// forces the old per-view passes, and forces foveation off with them
+    /// (KleptonStageConfiguration.canAmplify).
+    private var amplification = 1
+
+    // KL_CP_PROBE — the bisection ladder for a black immersive space. The pass
+    // has many links and a black frame indicts all of them equally; each rung
+    // removes one and keeps the rest, so whichever rung first shows something
+    // names the link below it.
+    //
+    //   1  clear only, solid blue, no draw   does ANY drawable reach the display?
+    //   2  the quad, flat magenta            does the reprojected quad land in
+    //                                        the viewport at all? (geometry,
+    //                                        poses, projection, 500 m depth)
+    //   3  the quad, sampled, alpha := 1     is the picture arriving alpha-0?
+    //   4  full-viewport blit, alpha := 1    is the eye texture lit? bypasses
+    //                                        the quad, the poses and the
+    //                                        projection — the viewer's own
+    //                                        proven path, on device
+    //
+    // Read them in order: the FIRST rung that shows something is the answer,
+    // and every rung above it is then known-good.
+    private let probe = Int(ProcessInfo.processInfo.environment["KL_CP_PROBE"] ?? "") ?? 0
+    /// The overlay pass — a guest's non-eye layers. nil when it failed to
+    /// build, which is named at construction rather than per frame.
+    private var overlayPipeline: MTLRenderPipelineState?
+    /// The equirect (360 panorama) overlay pipeline and its depth state.
+    /// Drawn as a skybox behind the eye content: depth-tests .greaterEqual at
+    /// the far plane and writes no depth, so real eye pixels stay in front and
+    /// the panorama fills the rest (which, during shader warmup, is everything).
+    private var equirectPipeline: MTLRenderPipelineState?
+    private var equirectDepthState: MTLDepthStencilState?
+    private var loadingSkyboxDepthState: MTLDepthStencilState?
+    private var probePipeline: MTLRenderPipelineState?
+    /// KL_CP_DEPTH=1 — the composite writes the game's OWN per-pixel depth (kl_reproject_depth_f, from the depth it
+    /// submits with Submit_TextureWithDepth) instead of one depth for the whole eye, so visionOS's reprojection can
+    /// correct head TRANSLATION as well as rotation. Off by default: a prototype.
+    private static let gameDepth: Bool = {
+        guard let e = getenv("KL_CP_DEPTH"), String(cString: e) == "1" else { return false }
+        NSLog("[cp] KL_CP_DEPTH=1 — compositing with the game's per-pixel depth")
+        return true
+    }()
+    private var depthPipeline: MTLRenderPipelineState?
+    private var depthDummy: MTLTexture?
+    private var loggedGameDepth = false
+    /// Red, green, blue — one second each, off the wall clock. Deliberately
+    /// full-intensity primaries: whatever tone mapping or colour management sits
+    /// between the drawable and the display, these stay obviously themselves.
+    private static func cyclingClear() -> MTLClearColor {
+        switch Int(Date().timeIntervalSince1970) % 3 {
+        case 0:  return MTLClearColorMake(1, 0, 0, 1)
+        case 1:  return MTLClearColorMake(0, 1, 0, 1)
+        default: return MTLClearColorMake(0, 0, 1, 1)
+        }
+    }
+
+    private static func probeName(_ p: Int) -> String {
+        switch p {
+        case 1: return "clear only, solid blue, no draw"
+        case 2: return "quad with flat magenta — geometry only"
+        case 3: return "quad, sampled, alpha forced to 1"
+        case 4: return "full-viewport blit of the eye texture, alpha forced to 1"
+        default: return "unknown"
+        }
+    }
+
+    // GPU ordering, not CPU. The guest's frame is in ANGLE's Metal command
+    // queue and this pass is in ours, and Metal orders nothing across queues:
+    // without an explicit wait the composite samples a texture ANGLE may still
+    // be rendering into. That reads as intermittent tearing and is exactly the
+    // kind of bug that gets blamed on the guest. kl_glfb signals this event at
+    // each eglSwapBuffers (EGL_ANGLE_metal_shared_event_sync); the value is
+    // also how this loop tells a fresh guest frame from a reused one.
+    private var guestFrameEvent: MTLSharedEvent!
+    private var lastGuestFrame: UInt64 = 0
+    private var staleInARow = 0
+
+    // Keyed by (eye, stage). Indexed by stage from the start rather than kept
+    // as a "last texture" global, because ovrp_GetEyeTextureStageCount is ours
+    // to answer and Unity cycles stages: a pose or an image keyed to anything
+    // but the stage reprojects one frame's picture with another frame's pose,
+    // which looks like latency-dependent judder rather than like a bug.
+    private var eyes: [Int: EyeAllocation] = [:]
+    private let eyesLock = NSLock()
+    private static func key(_ eye: Int, _ stage: Int) -> Int { eye &* 64 &+ stage }
+
+    /// The same storage for a layer that is NOT an eye — an OpenXR quad, which
+    /// for a guest in cinematic mode is the whole picture. Its own table because
+    /// the shapes differ: an eye is one slice of a shared 2-slice array, a layer
+    /// is a plain 2D texture of whatever size the guest's swapchain is.
+    private var layers: [Int: MTLTexture] = [:]
+    private let layersLock = NSLock()
+
+    // The GUEST's foveation map (KL_VRR=1), and the eye size it was built for.
+    //
+    // Not to be confused with `drawable.rasterizationRateMaps` — that is the
+    // system foveating THIS file's composite pass, and the two are deliberately
+    // detached (see unwarpGrid). This one makes the guest rasterize its own
+    // expensive pass at a reduced peripheral rate, which leaves the eye texture
+    // warped, which `unwarpGrid` then undoes.
+    //
+    // Touched only from the guest's render thread, inside provideEyeTexture.
+    private var guestRateMap: MTLRasterizationRateMap?
+    private var guestRateW = 0, guestRateH = 0
+    private var guestRateRefused = false
+
+    // The display's own foveation curve, sampled off the drawable's rate maps
+    // in primeDisplay and re-issued at the guest's eye size. Empty when the
+    // drawable is not foveated, and then the synthetic curve in kl_glfb is used
+    // instead.
+    private var displayQualityX: [Float] = []
+    private var displayQualityY: [Float] = []
+
+    // ARKit is the pose-in seam kl_ovrp.h describes: "on visionOS it is ARKit's
+    // WorldTrackingProvider answering the same call" the SDL viewer answers on
+    // the host. Nothing below the seam changes — kl_ovrp still reports node 9
+    // for the head and nodes 3/4 for the hands.
+    private let arSession = ARKitSession()
+    private let worldTracking = WorldTrackingProvider()
+    /// `KL_HANDS=0` leaves hand tracking out of the session, so the app never asks for the hand-tracking permission.
+    /// Hands are only the per-hand fallback for a missing Sense controller (KleptonControllers.swift); a guest that
+    /// needs the controllers' buttons, like Alyx, gets nothing from them. Read once when the compositor is made, which
+    /// is after boot has applied the app's env file. Built with KL_NO_HANDS (gen_xcodeproj.py KLEPTON_NO_HANDS=1),
+    /// hand tracking is not compiled in at all, so the app needs no NSHandsTrackingUsageDescription.
+    #if KL_NO_HANDS
+    private let handsWanted = false
+    #else
+    private let handTracking = HandTrackingProvider()
+    private let handsWanted = HandTrackingProvider.isSupported && klEnvOn("KL_HANDS", default: true)
+    #endif
+    private let controllers = KleptonControllers()
+    private var arRunning = false
+
+    // How much work reprojection is doing, sampled for the log.
+    private var reprojectFrames = 0
+    private var worstDelta: Float = 0
+
+    // KL_SYNC_GUEST=1 restores the inline shape: kl_app_frame() called on
+    // this thread, inside the submission window. That is the clock the lifecycle's
+    // device numbers were measured against, so it stays reachable — and it is
+    // the A/B for anything that looks like a pacing problem.
+    // ...and it is not offered for a guest that brought its own frame loop —
+    // Steam Link's OpenXR thread, or an Unreal guest's game thread — because
+    // there is no inline frame to make: `kl_app_frame()` returns -1 for both by
+    // design, and taking this arm would present black forever while looking
+    // like a pacing choice.
+    private let syncGuest = klEnvOn("KL_SYNC_GUEST", default: false)
+                            && kl_app_target_owns_frame_loop() == 0
+
+    // How many drawables went out before the guest had a picture to put in
+    // them. Counted rather than logged per frame, because on device it is
+    // legitimately hundreds and each one is uninteresting.
+    private var blackFrames = 0
+    private var loggedDepthRange = false
+
+    // --- Frame cadence ------------------------------------------------------
+    //
+    // Whether our frames actually reach the display once per display period, or
+    // whether the system is holding each one across two. This is the difference
+    // between a picture that is merely late — which reprojection fixes every
+    // period, and which is what this whole file is built to do — and a picture
+    // that is REPEATED, which reprojection never gets to touch on the repeated
+    // period. A held frame during head rotation is two images in the same place
+    // the eye is not, i.e. temporal doubling, and it is invisible from every
+    // other counter here: `presented`, `cmdbuf done/committed` and the timewarp
+    // delta all look perfect while it happens.
+    //
+    // Measured against the display period this run actually observed
+    // (primeDisplay), not against an assumed 90 or 120 Hz.
+    private var displayPeriod: TimeInterval = 0
+    private var lastPresentation: TimeInterval = 0
+
+    // --- The boot rate SETTLE gate -------------------------------------------
+    //
+    // The panel does not start at the rate it runs at. A Vision Pro brings the
+    // layer up at 120 Hz and drops to 90 once the immersive session is properly
+    // engaged, some hundreds of milliseconds later — and priming takes a fixed
+    // eight frames, i.e. ~66 ms, which lands squarely inside that window. So
+    // the rate the guest is told is decided by a race.
+    //
+    // That race matters more than the two numbers suggest, because the guest
+    // reads its refresh rate exactly ONCE, early, and paces everything off it
+    // for the rest of the session. Measured on device: a boot that lost the
+    // race told the guest 120 while the panel delivered 90 slots a second all
+    // session. 120:90 is 4:3, so every fourth guest frame shares a panel slot
+    // with its neighbour and displayed motion steps alternate one slot / two
+    // slots — a whole-image zigzag proportional to head speed, identical in
+    // feel to a pose bug and not one. Five consecutive sessions won the race
+    // and validated the design on luck; the sixth lost it.
+    //
+    // So: measure until the cadence has been the SAME cadence for a while, and
+    // only then latch. This holds every downstream consumer with no extra
+    // plumbing, because primeDisplay runs before kl_app_guest_start — the guest
+    // thread does not exist yet, so its one early Hz read cannot precede the
+    // latch.
+    //
+    // The numbers, and why:
+    //   KL_HZ_SETTLE_MS (500) — the run of agreeing intervals must span half a
+    //     second. That is ~45 slots at 90 Hz and ~60 at 120, far longer than
+    //     the 120->90 transition itself (under a second, end to end, in the
+    //     device log), and long enough that a rate still in motion cannot fake
+    //     it. Half a second of black at boot is free: the guest takes tens of
+    //     seconds to come up behind it.
+    //   KL_HZ_SETTLE_MIN_GAPS (120) — DURATION IS NOT RESOLUTION. Sixty
+    //     intervals cannot resolve a tenth of a percent, and a tenth of a
+    //     percent is 8 microseconds a frame. 120 intervals is ~1.0 s at 120 Hz
+    //     and ~1.3 s at 90.
+    //   KL_HZ_SETTLE_TIMEOUT_MS (3000) — a panel that never gives a steady half
+    //     second is real (thermal ramping, a loaded device), and blocking the
+    //     boot on it forever is worse than guessing. At three seconds we latch
+    //     the median of everything seen and SAY SO, so a confounded session is
+    //     identifiable from its own log.
+    //   tolerance 6% — 120 and 90 are 33% apart, so this discriminates them
+    //     with an order of magnitude to spare while absorbing sub-millisecond
+    //     scheduling noise.
+    // A gap that is a near-exact 2x or 3x of the run's period is a HELD frame,
+    // not a rate change; it extends the run rather than breaking it.
+    private let hzSettle          = klEnvOn("KL_HZ_SETTLE", default: true)
+    private let hzSettleMs        = Double(klEnvFloat("KL_HZ_SETTLE_MS", 500))
+    private let hzSettleTimeoutMs = Double(klEnvFloat("KL_HZ_SETTLE_TIMEOUT_MS", 3000))
+    private let hzSettleTol       = Double(klEnvFloat("KL_HZ_SETTLE_TOL", 0.06))
+    private let hzSettleMinGaps   = Int(klEnvFloat("KL_HZ_SETTLE_MIN_GAPS", 120))
+    private let hzSnapTol         = Double(klEnvFloat("KL_HZ_SNAP_TOL", 0.005))
+
+    // THE ESTIMATOR IS A MEDIAN, and that is the load-bearing choice rather
+    // than a detail. The obvious way to turn a settled run into a period is the
+    // mean — total span over total slots — and it is measurably wrong here: the
+    // run necessarily begins at the layer's very first frames, which is where
+    // primeDisplay is also computing the foveation curve and pushing the eye
+    // textures, so the slowest frames of the whole session are inside the
+    // measured window. Worse, if the running mean is also the tolerance
+    // reference, those outliers drag the reference far enough to keep accepting
+    // themselves. Measured on device, that mean came out 0.16% low against a
+    // dead-steady panel — 13.9 microseconds a frame, which is enough to walk
+    // the guest a whole panel slot every five seconds. A median of the same
+    // samples is immune to it, and averaging for longer is not: the error was
+    // bias, not noise. (The eight-frame code this replaced took a median for
+    // precisely this reason, and said so.)
+    //
+    // ...and the last step, snapping: a measurement within half a percent of a
+    // rate the panel actually runs IS that rate. The guest is told this number
+    // once and paces against it forever, so our estimate's last two digits
+    // would otherwise become a permanent frequency offset against the panel.
+    // The candidates are what visionOS documents for this panel plus the 60 a
+    // thermal demotion produces; the closest pair is 96 and 100, 4.2% apart, so
+    // half a percent has eight times the margin it needs.
+    private static let canonicalHz: [Double] = [120, 100, 96, 90, 60]
+
+    private var cadenceN = 0
+    private var cadenceSum = 0.0
+    private var cadenceMax = 0.0
+    private var cadenceRepeats = 0      // gaps of 1.5 periods or more
+    private var missedDeadline = 0
+    // Consecutive liveness reports whose mean gap disagrees with the latched
+    // display period by more than 10%. See cadenceSummary().
+    private var cadenceDisagreed = 0
+    // The panel rate as it runs (not just the boot latch): the shortest present-to-present gap of each half-second
+    // window is one panel period whatever frames were held, snapped to the canonical rates. Logged every ~5 s and,
+    // with a timestamp, whenever it changes (two windows in a row agreeing) — visionOS picks 90, 120 or 60 Hz itself.
+    private var cadenceMin = Double.infinity
+    private var rateHz = 0.0, rateCandidate = 0.0, rateCandidateSeen = 0, rateWindows = 0
+    private let noFence = klEnvOn("KL_CP_NOFENCE", default: false)
+    // The last device anchor the tracker actually answered with, and how often
+    // it has had to stand in. See displayOriginFromDevice for why holding it is
+    // not the same kind of guess as the identity it replaced.
+    private var lastGoodOriginFromDevice: simd_float4x4?
+    private var anchorWalkedBack = 0
+    private var anchorHeld = 0
+    private var anchorUnknown = 0
+    private let holdAnchor = klEnvOn("KL_CP_ANCHOR_HOLD", default: true)
+    // Host recenter — the Quest Oculus-button hold, done where the Quest does
+    // it: in the OS layer. `recenterXform` rebases the world origin so the
+    // head's current yaw+XZ become identity; folded into originFromDevice(),
+    // the ONE function every consumer reads, so published guest poses and the
+    // compositor's own placement shift together and the streamed view (Steam
+    // Link -> SteamVR) snaps to the new forward coherently. Set by holding the
+    // right Sense Options button >= 1 s (KleptonControllers).
+    nonisolated(unsafe) static var pendingRecenter = false
+    private var recenterXform = matrix_identity_float4x4
+    private var cmdCommitted = 0
+    private let cmdLock = NSLock()
+    private var cmdCompleted = 0
+    private var cmdError: Error?
+    // Startup diagnostics for the signal-9 wall: what the last renderFrame saw,
+    // surfaced into the alive report, plus a short per-frame trace of the first
+    // few seconds so the log can say whether the loop keeps iterating and
+    // whether its command buffers complete — the two things a 2 s report cannot
+    // catch on an app that dies in ~1 s.
+    private var lastGlFenceSeen: UInt64 = 0
+    private var lastProjLayersSeen = 0
+    private var lastEncodedSeen = 0
+    private var startupTrace = 0
+    // Startup-deadlock guard: the guest's fence value goes non-zero after its
+    // first swap, then every frame waits on it. If the guest then goes
+    // heads-down (loading a multi-GB OBB, compiling shaders) the signalling
+    // command buffer stalls behind that GPU work and the composite buffers pile
+    // up uncompleted — the drawable pool starves, this loop stops presenting,
+    // and visionOS SIGKILLs the app with no report. Bounding the outstanding
+    // fenced buffers keeps a drawable free so the loop always presents (black
+    // if need be) and survives until the guest catches up.
+    private let maxFenceBacklog = Int(klEnvFloat("KL_CP_FENCE_BACKLOG", 2))
+    private var fenceBacklogSkips = 0
+    private var warnedFenceBacklog = false
+    private var loggedFirstPicture = false
+    private var loggedGuestEnd = false
+
+    // Why a frame produced nothing. Compositor Services expects this loop to
+    // keep presenting, and every one of these three is a path that leaves
+    // WITHOUT presenting — so if the system tears the app down for not holding
+    // up its end, the reason is one of these counters and nothing else in the
+    // log would say so. Reported by the liveness line in renderLoop().
+    private var bailNoFrame = 0
+    private var bailNoDrawable = 0
+    private var bailNoPipeline = 0
+
+    init(_ layerRenderer: LayerRenderer) {
+        self.layerRenderer = layerRenderer
+
+        // The system's own pinch, rather than our arithmetic on two fingertip
+        // joints. `onSpatialEvent` is how a fully-immersive Metal app is told
+        // that the user selected something — the same recogniser the rest of
+        // visionOS uses, with the platform's own hysteresis, its own idea of
+        // what counts as a pinch, and gaze already folded in. Two rounds of
+        // hand-rolled distance thresholding were unstable at exactly the
+        // moment they mattered, and there is no version of that arithmetic
+        // that beats the recogniser the OS ships.
+        let controllers = self.controllers
+        layerRenderer.onSpatialEvent = { events in
+            controllers.handleSpatialEvents(events)
+        }
+    }
+
+    // MARK: - Poses
+
+    private func startARKit() { Task { await runARKit() } }
+
+    /// Build the provider set and run the session.
+    ///
+    /// Idempotent and **re-runnable**: `AccessoryTrackingProvider` takes its
+    /// accessory list at construction, so a controller connecting or
+    /// disconnecting means a new provider, which means running the session
+    /// again with a rebuilt list. That is not a restart — the session is not
+    /// stopped first, world and hand tracking carry straight on, and this is
+    /// how reconnects are meant to be handled.
+    private func runARKit() async {
+        do {
+            // Hand tracking is requested separately because it is the half
+            // that can be refused: world tracking is available to any full
+            // immersive space, hand tracking needs the user's consent. A
+            // refusal must leave the head working rather than take the
+            // whole seam down with it.
+            // The guest asks for views at an instant; only the tracker can
+            // answer that, so it is handed to kl_ovrp here rather than having
+            // kl_openxr guess from the pose we last published.
+            Self.headAtTracker = worldTracking
+            kl_ovrp_set_head_at(Self.headAt)
+            var providers: [any DataProvider] = [worldTracking]
+            #if !KL_NO_HANDS
+            if handsWanted { providers.append(handTracking) }
+            #endif
+            let accessories = await controllers.makeAccessoryProvider()
+            if let accessories { providers.append(accessories) }
+            try await arSession.run(providers)
+            arRunning = true
+            NSLog("[cp] ARKit running (hands: \(handsWanted ? "on" : "off (KL_HANDS=0 or KL_NO_HANDS)"), "
+                  + "sense: \(controllers.senseConnected))")
+            if let accessories {
+                // A fresh anchor stream per provider. The previous one ends
+                // when its provider is replaced, so these do not accumulate.
+                Task { await controllers.consumeAccessoryAnchors(accessories) }
+            }
+        } catch {
+            NSLog("[cp] ARKit failed to start: \(error) — falling back to the "
+                  + "synthetic standing head kl_ovrp provides")
+        }
+    }
+
+    /// Decompose a visionOS transform into the position+quaternion kl_ovrp wants.
+    ///
+    /// No basis change: visionOS and the Oculus tracking space share the
+    /// convention the guest expects — right-handed, +Y up, -Z forward — so a
+    /// flip here would be inventing a bug rather than fixing one.
+    private static func decompose(_ m: simd_float4x4) -> (SIMD3<Float>, simd_quatf) {
+        (SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z), simd_quatf(m))
+    }
+
+    /// The device anchor for the instant the composite is about to draw at.
+    ///
+    /// This and `originFromDevice` below are one answer in two halves, and what
+    /// they exist for is that **`origin_from_device` is never the identity while
+    /// the session has ever tracked.** `queryDeviceAnchor` answers nil for an instant it will not
+    /// predict to, and how far ahead that is is neither documented nor fixed —
+    /// a guest hitch that pushes the presentation time out, or a tracking
+    /// interruption, is enough to reach it.
+    ///
+    /// Substituting the identity there does not weaken the correction, it
+    /// asserts something false: that the head is at the world origin, unrotated.
+    /// The composite places the guest's picture in the space its render pose
+    /// defines and looks at it from this one, so the quad stops counteracting
+    /// head motion and sits fixed in front of the face — and stays there for as
+    /// long as the tracker keeps refusing, which is what makes it read as stuck
+    /// rather than as a glitch.
+    ///
+    /// Holding the last pose actually measured is wrong by however far the head
+    /// has moved since, which is bounded by the length of the outage. It is also
+    /// the answer `updatePoses` already gives the guest, by skipping the push
+    /// and leaving the previous pose in place: the two seams now fail the same
+    /// way instead of opposite ways, which is what made the disagreement
+    /// invisible.
+    ///
+    /// The walk-back is `headAt`'s, for `headAt`'s reason — stepping back finds
+    /// the edge of what the tracker will predict to instead of guessing where it
+    /// is. `KL_CP_ANCHOR_HOLD=0` restores the identity fallback as the A/B.
+    private func displayAnchor(at presentation: TimeInterval) -> DeviceAnchor? {
+        var t = presentation
+        var steps = 0
+        while steps < 10 {
+            if let a = worldTracking.queryDeviceAnchor(atTimestamp: t) {
+                if steps > 0 { anchorWalkedBack += 1 }
+                return a
+            }
+            t -= 0.005
+            steps += 1
+        }
+        return nil
+    }
+
+    /// ...and the transform the composite's own math uses, which is where the
+    /// holding happens. Kept separate from the anchor above because the anchor
+    /// OBJECT goes to `cp_drawable.deviceAnchor`, and that is the system's
+    /// input to its own reprojection: handing it one we invented would put our
+    /// correction and the system's on different heads. Nil there is a refusal
+    /// the system understands; the identity here is a lie it cannot see.
+    private func originFromDevice(_ anchor: DeviceAnchor?) -> simd_float4x4 {
+        if let anchor {
+            lastGoodOriginFromDevice = anchor.originFromAnchorTransform
+            return recenterXform * anchor.originFromAnchorTransform
+        }
+        guard holdAnchor, let held = lastGoodOriginFromDevice else {
+            // Nothing has ever tracked — the frames before ARKit starts — or the
+            // knob is off. The identity is the only answer left, and it is
+            // counted so that it can never again be taken silently.
+            anchorUnknown += 1
+            return matrix_identity_float4x4
+        }
+        anchorHeld += 1
+        return recenterXform * held
+    }
+
+    /// Sample every pose for this frame and push it across the seam.
+    ///
+    /// Called once per frame, *before* kl_app_frame(), so the guest renders
+    /// with this frame's pose rather than the previous one's — the same
+    /// ordering reason the Choreographer is ticked before nativeRender.
+    private func updatePoses(at presentationTime: TimeInterval) {
+        guard arRunning else { return }
+
+        // Predicted to the presentation time, not "now": the pose the guest
+        // renders with should be the pose the display will show it at, which is
+        // the whole point of having a deadline to render against.
+        if let anchor = worldTracking.queryDeviceAnchor(atTimestamp: presentationTime) {
+            // This is the pose the guest will render with, and kl_ovrp latches
+            // it into the stage record when the guest reaches ovrp_BeginFrame —
+            // which is what the composite pass reads back to know where the
+            // picture it is about to show was drawn from.
+            // In head space, not device space — see the midpoint argument at
+            // originFromHead. The guest derives its eye positions from this
+            // pose and the offsets pushEyeOffsets sent, and those two have to
+            // be stated about one origin or every near object sits wrong.
+            let (p, q) = Self.decompose(
+                Self.headFrom(anchor.originFromAnchorTransform, midpoint: eyeMidpointInDevice))
+            // Date the pose with the instant it is about. It was predicted to
+            // `presentationTime`, so that — not "now" — is the clock the head
+            // velocity has to be differenced on. The two differ by this
+            // thread's scheduling jitter, and dividing a uniform
+            // presentation-time step by a jittery call-time one multiplies the
+            // derived velocity by a per-frame noise factor. See
+            // klovrp_derive_motion in runtime/xr/kl_ovrp.c.
+            kl_ovrp_set_head_pose_time(presentationTime)
+            kl_ovrp_set_head_pose(p.x, p.y, p.z, q.imag.x, q.imag.y, q.imag.z, q.real)
+        }
+
+        // Hands and controllers both go through KleptonControllers, which is a
+        // merge rather than a switch: a Sense controller wins per hand where it
+        // is present, the wrist anchor fills in where it is not. Only a Sense
+        // controller can press anything.
+        // Controllers pair and unpair mid-run, and the provider list is fixed
+        // at ARKitSession.run — so a changed set means rebuilding the accessory
+        // provider and running the session again. Not a restart: world and hand
+        // tracking carry on untouched.
+        if controllers.spatialControllersChanged() {
+            NSLog("[cp] spatial controller set changed — rebuilding providers")
+            // The old provider's anchors are about to stop arriving; drop what
+            // it left behind so a disconnected controller cannot hold its last
+            // pose while the hand fallback waits behind it.
+            controllers.forgetAccessoryPoses()
+            Task { await runARKit() }
+        }
+
+        // The anchors themselves, not their transforms: the grip pose is built
+        // from the hand skeleton (the metacarpal a fist closes around) and so
+        // is the pinch trigger, and neither is recoverable from the anchor
+        // origin alone.
+        //
+        // Predicted to the presentation time, like the head above and like the
+        // Sense controllers inside `update`. `latestAnchors` is the last sample
+        // the tracker delivered, which arrives well below display rate — so a
+        // 90 Hz render loop reading it draws the same hand pose for two or
+        // three frames running, and hands do not hold still that long. That
+        // reads as the hands running at a third of the frame rate, which is
+        // exactly what it is.
+        var left: HandAnchor?, right: HandAnchor?
+        #if !KL_NO_HANDS
+        if handsWanted {
+            let hands = handTracking.handAnchors(at: presentationTime)
+            if let a = hands.leftHand,  a.isTracked { left  = a }
+            if let a = hands.rightHand, a.isTracked { right = a }
+        }
+        #endif
+        controllers.update(leftHand: left, rightHand: right, at: presentationTime)
+        // ...and the same seam in the other direction: whatever the guest
+        // queued for the controllers to play. Here rather than inside `update`
+        // because it has nothing to do with the anchors that call takes — it is
+        // output, and the only thing it shares with the input half is being
+        // once a frame.
+        controllers.pumpHaptics()
+    }
+
+    // MARK: - Setup
+
+    /// Must run before the guest asks for eye storage, because the provider is
+    /// what answers that question.
+    func installProvider() {
+        // ANGLE's own MTLDevice, not MTLCreateSystemDefaultDevice(). The
+        // EGL_ANGLE_metal_texture_client_buffer extension requires the texture
+        // to belong to the display's device; a texture from another device
+        // creates an EGLImage that fails at bind time, and on a single-GPU Mac
+        // the two happen to be the same object, so testing on the host would
+        // not catch getting this wrong.
+        let angle = kl_glfb_mtl_device()
+        if let d = angle {
+            device = Unmanaged<MTLDevice>.fromOpaque(d).takeUnretainedValue() as MTLDevice
+        } else {
+            // No ANGLE: the null GL driver, i.e. a run asking about the
+            // lifecycle rather than the picture. There will be no eye textures
+            // to composite — but this loop still has to hold up its end of the
+            // bargain, which is to prime the display, present cleared drawables
+            // and keep publishing poses to the guest. Its own device is enough
+            // for all three, and *not* taking one here is what used to kill the
+            // whole compositor in primeDisplay.
+            guard let d = MTLCreateSystemDefaultDevice() else {
+                NSLog("[cp] no MTLDevice at all — the compositor cannot run")
+                return
+            }
+            device = d
+        }
+        queue = device.makeCommandQueue()
+        if let q = queue { kl_gpu_time_watch_compositor(Unmanaged.passUnretained(q).toOpaque()) }
+        buildPipeline()
+
+        guard angle != nil else {
+            // Not necessarily a run without a picture: a VULKAN guest never
+            // brings ANGLE up at all, and its eye textures arrive from MoltenVK
+            // through kl_glfb's eye table instead of through the provider below
+            // (see eyeSource). Everything ANGLE-specific — the provider and the
+            // shared event — is what is skipped here, and neither exists on
+            // that path.
+            NSLog("[cp] ANGLE has no MTLDevice — no GL provider and no GL frame "
+                  + "fence this run (KL_GLFB unset, or the guest is Vulkan); "
+                  + "drawables will be cleared and presented, and any eye "
+                  + "texture that reaches kl_glfb's table is still composited")
+            return
+        }
+
+        // Register the shared event before the guest can swap, so no frame is
+        // ever composited without the wait.
+        if let ev = device.makeSharedEvent() {
+            guestFrameEvent = ev
+            kl_glfb_set_gpu_fence(Unmanaged.passUnretained(ev).toOpaque())
+        } else {
+            NSLog("[cp] no MTLSharedEvent — the composite cannot be ordered "
+                  + "against ANGLE's queue")
+        }
+
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        kl_glfb_set_mtl_provider({ (eye, stage, w, h, fmt, out, ctx) -> Int32 in
+            guard let ctx, let out else { return 0 }
+            let me = Unmanaged<KleptonCompositor>.fromOpaque(ctx).takeUnretainedValue()
+            return me.provideEyeTexture(eye: Int(eye), stage: Int(stage),
+                                        w: Int(w), h: Int(h), format: fmt, out: out)
+        }, ctx)
+        // ...and the same for the layers that are not eyes, without which a
+        // guest whose whole frame is a quad has nothing for the overlay pass to
+        // sample (kl_glfb.h).
+        kl_glfb_set_mtl_layer_provider({ (layer, stage, w, h, fmt, out, ctx) -> Int32 in
+            guard let ctx, let out else { return 0 }
+            let me = Unmanaged<KleptonCompositor>.fromOpaque(ctx).takeUnretainedValue()
+            return me.provideLayerTexture(layer: Int(layer), stage: Int(stage),
+                                          w: Int(w), h: Int(h), format: fmt, out: out)
+        }, ctx)
+        NSLog("[cp] MTL eye and layer providers installed on \(device.name) "
+              + "(vertex amplification \(amplification))")
+    }
+
+    private func buildPipeline() {
+        // The shader is kl_reproject.c's, shared verbatim with the macOS
+        // viewer's compositor (runtime/gfx/kl_view_mtl.m) — one copy of the flip,
+        // the quad and the array-slice sampler, because having them diverge
+        // means debugging the picture twice, and the viewer is where this math
+        // can actually be run before a device is available. Compiled from
+        // source rather than shipped as a .metal so it stays beside the
+        // matrices that feed it (kl_reproject_build).
+        let src = String(cString: kl_reproject_msl())
+        // The pipeline has to be linked against the format the LAYER got, not
+        // against a constant: with the drawable now 8-bit sRGB by default, a
+        // pipeline still claiming rgba16Float does not merely look wrong, it
+        // fails to encode at all (Metal refuses the attachment mismatch) and
+        // every frame goes out cleared.
+        let color = layerRenderer.configuration.colorFormat
+        do {
+            let lib = try device.makeLibrary(source: src, options: nil)
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
+            desc.fragmentFunction = lib.makeFunction(name: "kl_reproject_f")
+            desc.colorAttachments[0].pixelFormat = color
+            desc.depthAttachmentPixelFormat = .depth32Float
+            // Both eyes in one pass — see encodeComposite. Declared whatever
+            // the layout turns out to be, because a pipeline that permits
+            // amplification costs nothing when it is not amplified. Clamped to
+            // what the GPU has: asking for 2 where only 1 exists does not
+            // degrade, it fails the pipeline, and a nil pipeline is a black
+            // display for the whole run.
+            amplification = device.supportsVertexAmplificationCount(2) ? 2 : 1
+            desc.maxVertexAmplificationCount = amplification
+            pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            if Self.gameDepth {
+                // Same pass, the fragment that also writes [[depth(any)]]. Linked here so a failure says so once and
+                // the composite simply keeps the quad's depth.
+                desc.fragmentFunction = lib.makeFunction(name: "kl_reproject_depth_f")
+                depthPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+                NSLog("[cp] game-depth pipeline: " + (depthPipeline == nil ? "FAILED to link — quad depth only" : "ready"))
+                desc.fragmentFunction = lib.makeFunction(name: "kl_reproject_f")
+                let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 1, height: 1, mipmapped: false)
+                dd.usage = .shaderRead
+                depthDummy = device.makeTexture(descriptor: dd)
+            }
+
+            // Depth WRITES, which this pass never did. visionOS reprojects the
+            // submitted frame using its depth buffer, so a pass that writes no
+            // depth submits perfect colour with the geometry "nothing is here at
+            // any finite distance" — and the compositor honours that literally.
+            // Measured on device: a fullscreen quad at reverse-Z 0 with writes
+            // off is invisible; the same quad at 0.05 (2 m) with writes on
+            // appears. .greater matches the reverse-Z clear of 0.
+            let dsd = MTLDepthStencilDescriptor()
+            dsd.depthCompareFunction = .greater
+            dsd.isDepthWriteEnabled = true
+            depthState = device.makeDepthStencilState(descriptor: dsd)
+
+            // ...and the state for everything drawn AFTER the first thing at a
+            // given distance. `.greater` against a depth already written is
+            // false for an EQUAL depth, and every projection layer is a quad at
+            // KL_REPROJECT_DEPTH — so with the state above left in force, layer
+            // 0 writes its depth and every layer after it is discarded by the
+            // depth test. That is the picture losing everything the guest
+            // stacked on it, with no error surface: each draw is issued, each
+            // returns, and the display shows the backdrop. Measured on device
+            // as a lower-detail, shimmering picture, shimmering because WHICH
+            // layer is first changes while the guest runs.
+            let dsdAlways = MTLDepthStencilDescriptor()
+            dsdAlways.depthCompareFunction = .always
+            dsdAlways.isDepthWriteEnabled = false
+            depthPassState = device.makeDepthStencilState(descriptor: dsdAlways)
+
+            // The overlay pass — the guest's non-eye layers, which are the whole
+            // of an Unreal title's UI. See encodeOverlays.
+            //
+            // The one pipeline here that BLENDS, and the eye pass must not: a
+            // guest leaves the eye texture's alpha at 0 because that layer is
+            // composited opaque, so a blending eye pass hands the
+            // display a transparent frame over a correct picture. A UI quad's
+            // alpha is authored and is the point of it.
+            let odesc = MTLRenderPipelineDescriptor()
+            let olib = try device.makeLibrary(source: String(cString: kl_reproject_overlay_msl()),
+                                              options: nil)
+            odesc.vertexFunction   = olib.makeFunction(name: "kl_ov_v")
+            odesc.fragmentFunction = olib.makeFunction(name: "kl_ov_f")
+            odesc.colorAttachments[0].pixelFormat = color
+            odesc.depthAttachmentPixelFormat = .depth32Float
+            odesc.maxVertexAmplificationCount = amplification
+            odesc.colorAttachments[0].isBlendingEnabled = true
+            odesc.colorAttachments[0].rgbBlendOperation = .add
+            odesc.colorAttachments[0].alphaBlendOperation = .add
+            odesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            odesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            odesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            odesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            overlayPipeline = try? device.makeRenderPipelineState(descriptor: odesc)
+            if overlayPipeline == nil {
+                NSLog("[cp] the overlay pipeline failed to build — a guest's non-eye "
+                      + "layers will not be composited (on Unreal that is its whole UI)")
+            }
+
+            // The equirect panorama pipeline — a 360 skybox behind everything.
+            // Opaque (a background is not blended), same formats/amplification as
+            // the quad pass. See kl_msl_equirect and encodeOverlays.
+            let qdesc = MTLRenderPipelineDescriptor()
+            if let qlib = try? device.makeLibrary(source: String(cString: kl_reproject_equirect_msl()),
+                                                  options: nil) {
+                qdesc.vertexFunction   = qlib.makeFunction(name: "kl_eq_v")
+                qdesc.fragmentFunction = qlib.makeFunction(name: "kl_eq_f")
+                qdesc.colorAttachments[0].pixelFormat = color
+                qdesc.depthAttachmentPixelFormat = .depth32Float
+                qdesc.maxVertexAmplificationCount = amplification
+                equirectPipeline = try? device.makeRenderPipelineState(descriptor: qdesc)
+            }
+            if equirectPipeline == nil {
+                NSLog("[cp] the equirect pipeline failed to build — 360 background "
+                      + "overlays (AC Nexus loading skybox) will not be composited")
+            }
+            // Far-plane, read-only depth so the panorama sits behind eye content.
+            let qds = MTLDepthStencilDescriptor()
+            qds.depthCompareFunction = .greaterEqual
+            qds.isDepthWriteEnabled = false
+            equirectDepthState = device.makeDepthStencilState(descriptor: qds)
+            // The loading skybox WRITES a finite far depth. visionOS reprojects
+            // using the submitted depth and discards a frame whose depth is all
+            // 0 (reverse-Z infinity) as "nothing there" - which is why a
+            // colour-correct skybox (and even its clear) showed black. Writing a
+            // distant-but-finite depth makes it a real backdrop the compositor
+            // keeps.
+            let lsds = MTLDepthStencilDescriptor()
+            lsds.depthCompareFunction = .greaterEqual
+            lsds.isDepthWriteEnabled = true
+            loadingSkyboxDepthState = device.makeDepthStencilState(descriptor: lsds)
+
+            // KL_CP_PROBE: swap ONE thing about the pass and see if the black
+            // moves. Each rung isolates a different link in the chain, so a
+            // single device run localises a dark picture instead of a session
+            // of one-hypothesis-per-build. See kl_reproject.c for the shaders.
+            if probe > 0 {
+                let d = MTLRenderPipelineDescriptor()
+                d.colorAttachments[0].pixelFormat = color
+                d.depthAttachmentPixelFormat = .depth32Float
+                d.maxVertexAmplificationCount = amplification
+                switch probe {
+                case 2:  d.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
+                         d.fragmentFunction = lib.makeFunction(name: "kl_probe_solid_f")
+                case 3:  d.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
+                         d.fragmentFunction = lib.makeFunction(name: "kl_probe_opaque_f")
+                case 4:  d.vertexFunction   = lib.makeFunction(name: "kl_probe_full_v")
+                         d.fragmentFunction = lib.makeFunction(name: "kl_probe_full_f")
+                default: d.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
+                         d.fragmentFunction = lib.makeFunction(name: "kl_reproject_f")
+                }
+                if probe >= 2 && probe <= 4 {
+                    probePipeline = try? device.makeRenderPipelineState(descriptor: d)
+                }
+                NSLog("[cp] PROBE \(probe): \(Self.probeName(probe)) — "
+                      + "this is a DIAGNOSTIC frame, not the real pass")
+            }
+        } catch {
+            NSLog("[cp] composite pipeline failed: \(error)")
+            return
+        }
+        let sd = MTLSamplerDescriptor()
+        sd.minFilter = .linear; sd.magFilter = .linear
+        sd.sAddressMode = .clampToEdge; sd.tAddressMode = .clampToEdge
+        sampler = device.makeSamplerState(descriptor: sd)
+        sd.mipFilter = .linear
+        sd.maxAnisotropy = 4
+        mipSampler = device.makeSamplerState(descriptor: sd)
+    }
+
+    /// `src` (one slice) upscaled by `eyeFXScale` with MetalFX into
+    /// `eyeFXOut[slot]` (same texture type, so the shader binds it unchanged).
+    private func upscaledEye(_ src: MTLTexture, slot: Int, cmd: MTLCommandBuffer) -> MTLTexture {
+        let ow = Int(Float(src.width) * eyeFXScale), oh = Int(Float(src.height) * eyeFXScale)
+        if eyeFXScaler[slot] == nil || eyeFXOut[slot]?.width != ow || eyeFXOut[slot]?.height != oh {
+            let d = MTLFXSpatialScalerDescriptor()
+            d.inputWidth = src.width; d.inputHeight = src.height
+            d.outputWidth = ow; d.outputHeight = oh
+            d.colorTextureFormat = src.pixelFormat
+            d.outputTextureFormat = src.pixelFormat
+            d.colorProcessingMode = .perceptual
+            guard let sc = d.makeSpatialScaler(device: src.device) else {
+                if !loggedEyeFX { loggedEyeFX = true; NSLog("[cp] eye FX: MetalFX spatial scaler unavailable for \(src.pixelFormat.rawValue)") }
+                return src
+            }
+            let td = MTLTextureDescriptor()
+            td.textureType = src.textureType
+            td.pixelFormat = src.pixelFormat
+            td.width = ow; td.height = oh
+            td.arrayLength = src.arrayLength
+            td.usage = sc.outputTextureUsage.union([.shaderRead, .pixelFormatView])
+            td.storageMode = .private
+            eyeFXOut[slot] = src.device.makeTexture(descriptor: td)
+            eyeFXScaler[slot] = sc
+            if !loggedEyeFX {
+                loggedEyeFX = true
+                NSLog("[cp] eye FX (KL_EYE_FX): MetalFX spatial \(src.width)x\(src.height) -> \(ow)x\(oh), fmt \(src.pixelFormat.rawValue)")
+            }
+        }
+        guard let sc = eyeFXScaler[slot], let out = eyeFXOut[slot] else { return src }
+        // MetalFX takes 2D textures: slice 0 of each, as a 2D view.
+        let inV = src.textureType == .type2D ? src
+            : src.makeTextureView(pixelFormat: src.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 0..<1)
+        let outV = out.textureType == .type2D ? out
+            : out.makeTextureView(pixelFormat: out.pixelFormat, textureType: .type2D, levels: 0..<1, slices: 0..<1)
+        guard let inV, let outV else { return src }
+        sc.colorTexture = inV
+        sc.outputTexture = outV
+        sc.inputContentWidth = src.width; sc.inputContentHeight = src.height
+        sc.encode(commandBuffer: cmd)
+        return out
+    }
+
+    /// Read slice 0 level 0 of `tex` back and write it as a PNG (RGBA8 formats only).
+    private func captureEye(_ tex: MTLTexture, name: String, cmd: MTLCommandBuffer) {
+        let fmt = tex.pixelFormat
+        guard fmt == .rgba8Unorm || fmt == .rgba8Unorm_srgb || fmt == .bgra8Unorm || fmt == .bgra8Unorm_srgb,
+              let blit = cmd.makeBlitCommandEncoder() else {
+            NSLog("[cp] capture: format \(fmt.rawValue) not handled"); return
+        }
+        let w = tex.width, h = tex.height, bpr = w * 4
+        guard let buf = tex.device.makeBuffer(length: bpr * h, options: .storageModeShared) else { blit.endEncoding(); return }
+        blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: w, height: h, depth: 1), to: buf, destinationOffset: 0,
+                  destinationBytesPerRow: bpr, destinationBytesPerImage: bpr * h)
+        blit.endEncoding()
+        let bgra = fmt == .bgra8Unorm || fmt == .bgra8Unorm_srgb
+        cmd.addCompletedHandler { _ in
+            DispatchQueue.global(qos: .utility).async {
+                let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                let dir = docs.appendingPathComponent("captures")
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let info = CGBitmapInfo(rawValue: bgra
+                    ? CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+                    : CGImageAlphaInfo.noneSkipLast.rawValue)
+                guard let ctx = CGContext(data: buf.contents(), width: w, height: h, bitsPerComponent: 8,
+                                          bytesPerRow: bpr, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                          bitmapInfo: info.rawValue),
+                      let img = ctx.makeImage(),
+                      let dst = CGImageDestinationCreateWithURL(dir.appendingPathComponent(name) as CFURL,
+                                                                "public.png" as CFString, 1, nil) else { return }
+                CGImageDestinationAddImage(dst, img, nil)
+                CGImageDestinationFinalize(dst)
+                NSLog("[cp] capture written: \(name) \(w)x\(h)")
+            }
+        }
+    }
+
+    /// FXAA (KL_EYE_FXAA) of `src` into `fxaaOut[slot]`: a render pass whose sRGB target encodes the result; luma is
+    /// taken in a perceptual space (square root of linear), the blends in linear. Returns `src` if anything is missing.
+    private func fxaaEye(_ src: MTLTexture, slot: Int, cmd: MTLCommandBuffer) -> MTLTexture {
+        guard src.textureType == .type2D else { return src }
+        if fxaaPipeline == nil {
+            let msl = """
+            #include <metal_stdlib>
+            using namespace metal;
+            struct V { float4 p [[position]]; };
+            vertex V klfx_v(uint vid [[vertex_id]]) {
+                float2 p = float2((vid << 1) & 2, vid & 2); V o; o.p = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;
+            }
+            static float klfx_l(float3 c) { return dot(sqrt(max(c, 0.0)), float3(0.299, 0.587, 0.114)); }
+            fragment float4 klfx_f(V in [[stage_in]], texture2d<float> s [[texture(0)]], constant float2 &q [[buffer(0)]]) {
+                constexpr sampler ls(filter::linear, address::clamp_to_edge);
+                float2 rcp = 1.0 / float2(s.get_width(), s.get_height()), uv = in.p.xy * rcp;
+                float4 rgbM = s.sample(ls, uv);
+                float M = klfx_l(rgbM.rgb);
+                float N = klfx_l(s.sample(ls, uv + float2(0, -1) * rcp).rgb), S = klfx_l(s.sample(ls, uv + float2(0, 1) * rcp).rgb);
+                float E = klfx_l(s.sample(ls, uv + float2(1, 0) * rcp).rgb), Wl = klfx_l(s.sample(ls, uv + float2(-1, 0) * rcp).rgb);
+                float rMax = max(max(max(N, S), max(E, Wl)), M), rMin = min(min(min(N, S), min(E, Wl)), M), range = rMax - rMin;
+                if (range < max(0.0312, rMax * q.y)) return float4(rgbM.rgb, 1.0);
+                float NW = klfx_l(s.sample(ls, uv + float2(-1, -1) * rcp).rgb), NE = klfx_l(s.sample(ls, uv + float2(1, -1) * rcp).rgb);
+                float SW = klfx_l(s.sample(ls, uv + float2(-1, 1) * rcp).rgb), SE = klfx_l(s.sample(ls, uv + float2(1, 1) * rcp).rgb);
+                float NS = N + S, WE = Wl + E, subA = (NS + WE) * 2.0 + (NW + SW + NE + SE);
+                float eH = abs(-2.0 * Wl + NW + SW) + abs(-2.0 * M + NS) * 2.0 + abs(-2.0 * E + NE + SE);
+                float eV = abs(-2.0 * S + SW + SE) + abs(-2.0 * M + WE) * 2.0 + abs(-2.0 * N + NW + NE);
+                bool horz = eH >= eV;
+                float lumaN = horz ? N : Wl, lumaS = horz ? S : E;
+                float len = horz ? rcp.y : rcp.x;
+                float gN = lumaN - M, gS = lumaS - M;
+                bool pairN = abs(gN) >= abs(gS);
+                float grad = max(abs(gN), abs(gS));
+                if (pairN) len = -len;
+                float subC = saturate(abs(subA / 12.0 - M) / range);
+                float2 posB = uv; if (horz) posB.y += len * 0.5; else posB.x += len * 0.5;
+                float2 off = horz ? float2(rcp.x, 0) : float2(0, rcp.y);
+                float lumaNN = (pairN ? lumaN : lumaS) + M;
+                float gScaled = grad * 0.25;
+                bool mLTZero = (M - lumaNN * 0.5) < 0.0;
+                float2 pN = posB - off, pP = posB + off;
+                float eN = klfx_l(s.sample(ls, pN).rgb) - lumaNN * 0.5, eP = klfx_l(s.sample(ls, pP).rgb) - lumaNN * 0.5;
+                bool dN = abs(eN) >= gScaled, dP = abs(eP) >= gScaled;
+                const float steps[11] = {1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0, 8.0, 8.0, 8.0, 8.0};
+                for (int i = 0; i < 11 && !(dN && dP); i++) {
+                    if (!dN) { pN -= off * steps[i]; eN = klfx_l(s.sample(ls, pN).rgb) - lumaNN * 0.5; dN = abs(eN) >= gScaled; }
+                    if (!dP) { pP += off * steps[i]; eP = klfx_l(s.sample(ls, pP).rgb) - lumaNN * 0.5; dP = abs(eP) >= gScaled; }
+                }
+                float dstN = horz ? uv.x - pN.x : uv.y - pN.y, dstP = horz ? pP.x - uv.x : pP.y - uv.y;
+                bool goodN = (eN < 0.0) != mLTZero, goodP = (eP < 0.0) != mLTZero;
+                float span = dstP + dstN, dst = min(dstN, dstP);
+                bool good = dstN < dstP ? goodN : goodP;
+                float pixOff = good ? (0.5 - dst / span) : 0.0;
+                float subF = (-2.0 * subC + 3.0) * subC * subC;
+                float offF = max(pixOff, subF * subF * q.x);
+                float2 fuv = uv; if (horz) fuv.y += offF * len; else fuv.x += offF * len;
+                return float4(s.sample(ls, fuv).rgb, 1.0);
+            }
+            """
+            guard let lib = try? src.device.makeLibrary(source: msl, options: nil) else { return src }
+            let pd = MTLRenderPipelineDescriptor()
+            pd.vertexFunction = lib.makeFunction(name: "klfx_v")
+            pd.fragmentFunction = lib.makeFunction(name: "klfx_f")
+            pd.colorAttachments[0].pixelFormat = src.pixelFormat
+            fxaaPipeline = try? src.device.makeRenderPipelineState(descriptor: pd)
+        }
+        guard let ps = fxaaPipeline else { return src }
+        var t = fxaaOut[slot]
+        if t == nil || t!.width != src.width || t!.height != src.height || t!.pixelFormat != src.pixelFormat {
+            let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: src.pixelFormat, width: src.width, height: src.height, mipmapped: false)
+            td.usage = [.renderTarget, .shaderRead]
+            td.storageMode = .private
+            t = src.device.makeTexture(descriptor: td)
+            fxaaOut[slot] = t
+            if !loggedFXAA {
+                loggedFXAA = true
+                NSLog("[cp] eye FXAA (KL_EYE_FXAA): \(src.width)x\(src.height) fmt \(src.pixelFormat.rawValue) once per guest frame")
+            }
+        }
+        guard let out = t else { return src }
+        let rp = MTLRenderPassDescriptor()
+        rp.colorAttachments[0].texture = out
+        rp.colorAttachments[0].loadAction = .dontCare
+        rp.colorAttachments[0].storeAction = .store
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rp) else { return src }
+        enc.label = "klepton eye FXAA"
+        enc.setRenderPipelineState(ps)
+        enc.setFragmentTexture(src, index: 0)
+        var qq = fxaaParams
+        enc.setFragmentBytes(&qq, length: MemoryLayout<SIMD2<Float>>.size, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+        return out
+    }
+
+    /// Whether the FXAA pass runs this frame (KL_EYE_FXAA_UNTIL).
+    private func fxaaActive() -> Bool {
+        let now = CACurrentMediaTime()
+        if fxaaT0 == 0 {
+            fxaaT0 = now
+            if let u = eyeFXAAUntil { NSLog(String(format: "[cp] eye FXAA ON for the first %.0f s from the first eye frame (%@)", u, Self.wallClock())) }
+        }
+        guard let u = eyeFXAAUntil else { return true }
+        if now - fxaaT0 < u { return true }
+        if !fxaaOffLogged {
+            fxaaOffLogged = true
+            NSLog(String(format: "[cp] eye FXAA OFF at %.1f s after the first eye frame (%@)", now - fxaaT0, Self.wallClock()))
+        }
+        return false
+    }
+
+    /// Whether the RCAS pass runs this frame (KL_EYE_SHARPEN_UNTIL).
+    private func sharpenActive() -> Bool {
+        let now = CACurrentMediaTime()
+        if sharpT0 == 0 {
+            sharpT0 = now
+            if let u = eyeSharpenUntil { NSLog(String(format: "[cp] eye sharpen ON for the first %.0f s from the first eye frame (%@)", u, Self.wallClock())) }
+        }
+        guard let u = eyeSharpenUntil else { return true }
+        if now - sharpT0 < u { return true }
+        if !sharpOffLogged {
+            sharpOffLogged = true
+            NSLog(String(format: "[cp] eye sharpen OFF at %.1f s after the first eye frame (%@)", now - sharpT0, Self.wallClock()))
+        }
+        return false
+    }
+    static func wallClock() -> String {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f.string(from: Date())
+    }
+
+    /// RCAS (KL_EYE_SHARPEN) of `src` into `sharpOut[slot]`, a render pass so the sRGB target encodes for free. Works in
+    /// a perceptual space (square root of linear), as FSR does. Returns `src` if anything is missing.
+    private func sharpenedEye(_ src: MTLTexture, slot: Int, cmd: MTLCommandBuffer) -> MTLTexture {
+        guard let stops = eyeSharpen, src.textureType == .type2D else { return src }
+        if sharpPipeline == nil {
+            let msl = """
+            #include <metal_stdlib>
+            using namespace metal;
+            struct V { float4 p [[position]]; };
+            vertex V klsh_v(uint vid [[vertex_id]]) {
+                float2 p = float2((vid << 1) & 2, vid & 2); V o; o.p = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;
+            }
+            static float3 klsh_ld(texture2d<float, access::read> s, int2 q, int2 lim) {
+                return sqrt(max(s.read(uint2(clamp(q, int2(0), lim))).rgb, 0.0));
+            }
+            fragment float4 klsh_f(V in [[stage_in]], texture2d<float, access::read> s [[texture(0)]],
+                                   constant float &sharp [[buffer(0)]]) {
+                int2 p = int2(in.p.xy), lim = int2(s.get_width() - 1, s.get_height() - 1);
+                float3 e = klsh_ld(s, p, lim);
+                float3 b = klsh_ld(s, p + int2(0, -1), lim), h = klsh_ld(s, p + int2(0, 1), lim);
+                float3 d = klsh_ld(s, p + int2(-1, 0), lim), f = klsh_ld(s, p + int2(1, 0), lim);
+                float3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));
+                float3 hitMin = mn4 / (4.0 * mx4 + 1e-5);
+                float3 hitMax = (1.0 - mx4) / (4.0 * mn4 - 4.0 - 1e-5);
+                float3 lobeRGB = max(-hitMin, hitMax);
+                float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * sharp;
+                float3 c = (lobe * (b + d + h + f) + e) / (4.0 * lobe + 1.0);
+                return float4(c * c, 1.0);
+            }
+            """
+            guard let lib = try? src.device.makeLibrary(source: msl, options: nil) else { return src }
+            let pd = MTLRenderPipelineDescriptor()
+            pd.vertexFunction = lib.makeFunction(name: "klsh_v")
+            pd.fragmentFunction = lib.makeFunction(name: "klsh_f")
+            pd.colorAttachments[0].pixelFormat = src.pixelFormat
+            sharpPipeline = try? src.device.makeRenderPipelineState(descriptor: pd)
+        }
+        guard let ps = sharpPipeline else { return src }
+        var t = sharpOut[slot]
+        if t == nil || t!.width != src.width || t!.height != src.height || t!.pixelFormat != src.pixelFormat {
+            let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: src.pixelFormat, width: src.width, height: src.height, mipmapped: false)
+            td.usage = [.renderTarget, .shaderRead]
+            td.storageMode = .private
+            t = src.device.makeTexture(descriptor: td)
+            sharpOut[slot] = t
+            if !loggedSharpen {
+                loggedSharpen = true
+                NSLog("[cp] eye sharpen (KL_EYE_SHARPEN=\(stops)): RCAS \(src.width)x\(src.height) fmt \(src.pixelFormat.rawValue) once per guest frame")
+            }
+        }
+        guard let out = t else { return src }
+        let rp = MTLRenderPassDescriptor()
+        rp.colorAttachments[0].texture = out
+        rp.colorAttachments[0].loadAction = .dontCare
+        rp.colorAttachments[0].storeAction = .store
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rp) else { return src }
+        enc.label = "klepton eye sharpen"
+        var sharp = exp2(-stops)
+        enc.setRenderPipelineState(ps)
+        enc.setFragmentTexture(src, index: 0)
+        enc.setFragmentBytes(&sharp, length: MemoryLayout<Float>.size, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+        return out
+    }
+
+    /// Level 0 of `eyeMipTex[slot]` <- `src`, then the whole chain. Returns the
+    /// mipmapped texture, or `src` if anything is missing.
+    private func mippedEye(_ src: MTLTexture, slot: Int, blit: MTLBlitCommandEncoder) -> MTLTexture {
+        var t = eyeMipTex[slot]
+        if t == nil || t!.width != src.width || t!.height != src.height
+            || t!.pixelFormat != src.pixelFormat || t!.arrayLength != src.arrayLength
+            || t!.textureType != src.textureType {
+            let d = MTLTextureDescriptor()
+            d.textureType = src.textureType
+            d.pixelFormat = src.pixelFormat
+            d.width = src.width; d.height = src.height
+            d.arrayLength = src.arrayLength
+            d.mipmapLevelCount = Int(floor(log2(Double(max(src.width, src.height))))) + 1
+            d.usage = [.shaderRead]
+            d.storageMode = .private
+            t = src.device.makeTexture(descriptor: d)
+            eyeMipTex[slot] = t
+            if !loggedEyeMips {
+                loggedEyeMips = true
+                NSLog("[cp] eye mips (KL_EYE_MIPS): \(src.width)x\(src.height) x\(src.arrayLength) -> \(d.mipmapLevelCount) levels")
+            }
+        }
+        guard let t else { return src }
+        for sl in 0..<src.arrayLength {
+            blit.copy(from: src, sourceSlice: sl, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: src.width, height: src.height, depth: 1),
+                      to: t, destinationSlice: sl, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        }
+        blit.generateMipmaps(for: t)
+        return t
+    }
+
+    // MARK: - The provider
+
+    /// Sample one rate map's per-axis quality curve into `n` uniform screen-space
+    /// zones.
+    ///
+    /// A rate map is `screen -> physical`, and its local *rate* is that
+    /// function's slope. So walking `physicalCoordinates(screenCoordinates:)`
+    /// across uniform screen steps and differencing recovers the curve directly
+    /// — no need for the descriptor that built it, which a built map does not
+    /// report (the same reason `kl_glfb_eye_rate_zones` has to carry the zone
+    /// count for maps we *do* build).
+    ///
+    /// Metal renormalizes quality so the peak is one sample per pixel, so the
+    /// scale of what comes back does not matter, only the shape.
+    private static func sampleCurve(_ map: MTLRasterizationRateMap, layer: Int,
+                                    zonesX: Int, zonesY: Int) -> ([Float], [Float]) {
+        let scr = map.screenSize
+        func axis(_ n: Int, _ extent: Int, _ physicalAt: (Float) -> Float) -> [Float] {
+            var q = [Float](repeating: 0, count: n)
+            var prev = physicalAt(0)
+            var peak: Float = 0
+            for i in 0..<n {
+                let next = physicalAt(Float(extent) * Float(i + 1) / Float(n))
+                q[i] = max(0, next - prev)
+                peak = max(peak, q[i])
+                prev = next
+            }
+            // A degenerate map would make the descriptor invalid; flat full rate
+            // is the honest reading of "no variation along this axis".
+            guard peak > 0 else { return [Float](repeating: 1, count: n) }
+            // Metal renormalizes so the peak is one sample per pixel, so only
+            // the shape survives; the floor keeps a zero-width zone out of the
+            // descriptor.
+            for i in 0..<n { q[i] = max(q[i] / peak, 0.01) }
+            return q
+        }
+        let qx = axis(zonesX, scr.width) {
+            map.physicalCoordinates(screenCoordinates: MTLSamplePosition(x: $0, y: 0),
+                                    layer: layer).x
+        }
+        let qy = axis(zonesY, scr.height) {
+            map.physicalCoordinates(screenCoordinates: MTLSamplePosition(x: 0, y: $0),
+                                    layer: layer).y
+        }
+        return (qx, qy)
+    }
+
+    /// Take the display's own foveation curve off a drawable, so the guest
+    /// rasterizes the way the compositor already does instead of the way we
+    /// guessed.
+    ///
+    /// Called from `primeDisplay`, which is before the guest boots and therefore
+    /// before any eye texture exists — the ordering `updateGuestRateMap` needs.
+    /// Sampled once, from the first drawable, exactly as `pushEyeTextureSize`
+    /// is: `renderQuality` ramps rather than switching, so an early drawable can
+    /// still carry the old quality — but quality scales the *resolution*, and
+    /// only the normalized shape of the curve is taken from here.
+    ///
+    /// **The two eyes' maps are combined, per zone, by maximum.** visionOS gives
+    /// each view its own map and they are not the same map mirrored-and-centred:
+    /// the eyes converge, so each one's dense region sits inboard, and the pair
+    /// are mirror images of each other. The guest cannot be given two, because
+    /// both eyes render through ONE multisampled scene renderbuffer and resolve
+    /// into ONE two-slice array texture — the map is registered against those
+    /// objects, and neither of them knows which eye is in flight. Taking the
+    /// envelope makes a symmetric curve that is dense wherever *either* eye
+    /// wants density: strictly more samples than either map alone, so no eye is
+    /// ever under-rendered, at the cost of some fragments the other eye did not
+    /// need. Per-eye guest maps would mean per-eye scene storage, which is a
+    /// different change to make deliberately.
+    private func captureDisplayFoveation(_ drawable: LayerRenderer.Drawable) {
+        guard displayQualityX.isEmpty else { return }
+        let maps = drawable.rasterizationRateMaps
+        guard let first = maps.first else {
+            NSLog("[cp] drawable is not foveated — KL_VRR would use the synthetic "
+                  + "curve (KL_VRR_ZONES / KL_VRR_EDGE)")
+            return
+        }
+        // The zone count, ALVR's way (DummyMetalRenderer): a built map does not
+        // report its zones, but physicalSize / physicalGranularity is the number
+        // of cells it actually resolves to. Capped at the unwarp grid's own
+        // limit, since a grid cell per zone is what makes the unwarp exact.
+        let gran = first.physicalGranularity
+        let phys = first.physicalSize(layer: 0)
+        let cap = Int(KL_REPROJECT_GRID_MAX)
+        let nx = max(1, min(cap, gran.width  > 0 ? phys.width  / gran.width  : 16))
+        let ny = max(1, min(cap, gran.height > 0 ? phys.height / gran.height : 16))
+
+        var qx = [Float](repeating: 0, count: nx)
+        var qy = [Float](repeating: 0, count: ny)
+        var sampled = 0
+        for map in maps {
+            for layer in 0..<map.layerCount {
+                let (mx, my) = Self.sampleCurve(map, layer: layer, zonesX: nx, zonesY: ny)
+                for i in 0..<nx { qx[i] = max(qx[i], mx[i]) }
+                for i in 0..<ny { qy[i] = max(qy[i], my[i]) }
+                sampled += 1
+            }
+        }
+        guard sampled > 0 else { return }
+        displayQualityX = qx
+        displayQualityY = qy
+        // BOTH curves, and y is not decoration: the horizontal one is an
+        // envelope of two mirrored maps and is symmetric by construction, so it
+        // can never show an up/down asymmetry even when one exists. The
+        // vertical one is the only place a "the top periphery looks different
+        // from the bottom" observation can be settled — a lopsided qy is the
+        // display's own distribution being copied faithfully, a symmetric one
+        // means look at our unwarp instead. Screen y=0 here is the render
+        // target's row 0, which is the picture's BOTTOM (the guest stores it
+        // GL-side-up), so qy is printed bottom-to-top.
+        func curve(_ q: [Float]) -> String {
+            q.map { String(format: "%.2f", $0) }.joined(separator: " ")
+        }
+        NSLog("%@", "[cp] display foveation curve: \(nx)x\(ny) zones from \(sampled) "
+              + "view map(s), screen \(first.screenSize.width)x\(first.screenSize.height) "
+              + "-> physical \(phys.width)x\(phys.height), granularity "
+              + "\(gran.width)x\(gran.height)\n"
+              + "[cp]   x rate (left to right): \(curve(qx))\n"
+              + "[cp]   y rate (bottom to top): \(curve(qy))")
+    }
+
+    /// Build (or rebuild) the guest's foveation map for a `w` x `h` eye and push
+    /// it to kl_glfb.
+    ///
+    /// **The curve is the display's**, resampled to the guest's screen size —
+    /// which is why this is not simply handing the drawable's map straight
+    /// through. The guest's eye size is not the drawable's: it comes from
+    /// `kl_ovrp_set_eye_texture_size`, which caps and scales (`KL_OVRP_EYE_MAX`,
+    /// `KL_OVRP_EYE_SCALE`) because Unity allocates stages x eyes of RGBA16F at
+    /// whatever it is told. A rate map is bound to the `screenSize` it was built
+    /// for, so a map for the drawable's resolution applied to a smaller eye
+    /// texture would foveate against coordinates the guest never renders. Same
+    /// shape, our size. `KL_VRR_ZONES` / `KL_VRR_EDGE` are the fallback for an
+    /// unfoveated drawable, and are what the host stand-in
+    /// (`klmtl_update_rate_map` in tests/t_mtl_provider.m) always uses.
+    ///
+    /// **Called before the eye texture is handed back**, deliberately. kl_glfb
+    /// binds the texture as soon as this provider returns, and `FramebufferMtl`
+    /// caches its render pass descriptor — a map that arrives after the first
+    /// pass into a texture is silently ignored for that pass, and re-attaching
+    /// the texture is not enough to force the rebuild.
+    ///
+    /// Keyed on the size because Unity re-creates its eye textures mid-startup
+    /// at a different one; a map built for the old screen size would foveate
+    /// against coordinates that no longer exist.
+    private func updateGuestRateMap(w: Int, h: Int) {
+        var zones: Int32 = 0
+        var edge: Float = 0
+        guard kl_glfb_foveation_wanted(&zones, &edge) != 0 else { return }
+        if guestRateMap != nil, guestRateW == w, guestRateH == h { return }
+        guard !guestRateRefused else { return }
+        guard device.supportsRasterizationRateMap(layerCount: 1) else {
+            // Said once: this is a property of the GPU, so it will not become
+            // true later in the run.
+            guestRateRefused = true
+            NSLog("[cp] this GPU has no variable rasterization rate — KL_VRR ignored")
+            return
+        }
+        var qx = displayQualityX, qy = displayQualityY
+        var source = "the display's own"
+        if qx.isEmpty || qy.isEmpty {
+            let n = Int(zones)
+            qx = [Float](repeating: 0, count: n)
+            qy = [Float](repeating: 0, count: n)
+            qx.withUnsafeMutableBufferPointer { kl_glfb_foveation_quality($0.baseAddress, zones, edge) }
+            qy.withUnsafeMutableBufferPointer { kl_glfb_foveation_quality($0.baseAddress, zones, edge) }
+            source = "synthetic, edge rate \(String(format: "%.2f", edge))"
+        }
+        // `__sampleCount:` is the pointer-taking initializer as Swift imports
+        // it; the array-taking spelling does not exist here.
+        let layer = qx.withUnsafeBufferPointer { hp in
+            qy.withUnsafeBufferPointer { vp in
+                MTLRasterizationRateLayerDescriptor(
+                    __sampleCount: MTLSize(width: qx.count, height: qy.count, depth: 0),
+                    horizontal: hp.baseAddress!, vertical: vp.baseAddress!)
+            }
+        }
+        let desc = MTLRasterizationRateMapDescriptor()
+        desc.screenSize = MTLSize(width: w, height: h, depth: 0)
+        desc.label = "klepton guest foveation"
+        desc.setLayer(layer, at: 0)
+        guard let map = device.makeRasterizationRateMap(descriptor: desc) else {
+            guestRateRefused = true
+            NSLog("[cp] makeRasterizationRateMap \(w)x\(h) failed — KL_VRR ignored")
+            return
+        }
+        let phys = map.physicalSize(layer: 0)
+        // "%@", not the string itself: NSLog's first argument is a FORMAT
+        // string, and this one contains a literal per-cent sign — "% o" was
+        // being eaten as a conversion, so the device's first foveation line
+        // read "33.50f the fragments".
+        NSLog("%@", "[cp] guest foveation: screen \(w)x\(h) -> physical "
+              + "\(phys.width)x\(phys.height) "
+              + "(\(String(format: "%.1f", 100.0 * Double(phys.width * phys.height) / Double(w * h)))% "
+              + "of the fragments, \(qx.count)x\(qy.count) zones, \(source))")
+        // Held by this property, which is what keeps it alive: kl_glfb takes an
+        // unmanaged pointer and never retains, exactly as it does not retain the
+        // eye textures.
+        guestRateMap = map
+        guestRateW = w; guestRateH = h
+        kl_glfb_set_eye_rate_map(Int32(w), Int32(h), Int32(qx.count), Int32(qy.count),
+                                 Unmanaged.passUnretained(map).toOpaque())
+    }
+
+    /// kl_glfb calls this when the guest asks for storage for one (eye, stage).
+    ///
+    /// Two things here are load-bearing and both were learned by running it
+    ///: the texture must be allocated on ANGLE's device, and the `w`/`h`
+    /// reported back must be the texture's *real* size. The EGL extension takes
+    /// the size from the MTLTexture and ignores what we claim, so a wrong-sized
+    /// texture binds **successfully** and the guest renders into storage it does
+    /// not have. kl_glfb refuses a mismatch rather than accept that.
+    private func provideEyeTexture(eye: Int, stage: Int, w: Int, h: Int,
+                                   format: UInt32,
+                                   out: UnsafeMutablePointer<kl_mtl_eye_texture>) -> Int32 {
+        let k = Self.key(eye, stage)
+        let partnerKey = Self.key(eye == 0 ? 1 : 0, stage)
+
+        guard let pixelFormat = klEyePixelFormat(format) else {
+            NSLog("[cp] eye \(eye) stage \(stage) asks for GL internalformat "
+                  + String(format: "0x%x", format)
+                  + ", which has no MTLPixelFormat here — declining, so this eye "
+                  + "renders into GL storage nothing composites")
+            return 0
+        }
+
+        // Before anything is handed back, including on the cached path: the
+        // size is only knowable here, and the map has to be in force before the
+        // texture is bound. A no-op once the map matches this size.
+        updateGuestRateMap(w: w, h: h)
+
+        // **Nothing slow happens under eyesLock.** The render loop takes it once
+        // per view per frame, so anything held across it stops frame submission
+        // dead — and Compositor Services kills a client that stops submitting.
+        // This function used to hold it across `makeTexture`, which at a loading
+        // transition means three ~164 MB private allocations back to back while
+        // the guest is also allocating hard. That is seconds of no frames, and
+        // it presented as the app being backgrounded or killed *during loading
+        // transitions* specifically — the one moment the eye swapchain is
+        // re-created. The lock now covers dictionary access only.
+        //
+        // Unity really does re-create its eye textures at a different size
+        // mid-startup — 1832x1920 during nativeRecreateGfxState, then 2198x2304
+        // once the VRDevice has settled, and again on entering a map. A provider
+        // that caches one texture per stage (the obvious implementation) hands
+        // back the small one, so the size is part of the identity, not just the
+        // key.
+        eyesLock.lock()
+        let cached = eyes[k]
+        var partner = eyes[partnerKey]
+        eyesLock.unlock()
+
+        // The format is part of the identity for the same reason the size is:
+        // handing back a texture whose pixel format is not the one the guest
+        // asked for gets the pair refused by ANGLE, and the eye then quietly
+        // falls back to GL storage nothing samples.
+        func fits(_ a: EyeAllocation) -> Bool {
+            a.texture.width == w && a.texture.height == h
+                && a.texture.pixelFormat == pixelFormat
+        }
+
+        if let a = cached, fits(a) {
+            out.pointee = kl_mtl_eye_texture(texture: Unmanaged.passUnretained(a.texture).toOpaque(),
+                                             slice: Int32(a.slice),
+                                             w: Int32(a.texture.width),
+                                             h: Int32(a.texture.height))
+            return 1
+        }
+
+        // Both eyes share one array texture, so the second eye must find the
+        // first eye's allocation rather than make its own.
+        var tex: MTLTexture? = nil
+        if let p = partner, fits(p) { tex = p.texture }
+
+        if tex == nil {
+            let desc = MTLTextureDescriptor()
+            desc.textureType = .type2DArray
+            desc.pixelFormat = pixelFormat
+            desc.width = w; desc.height = h
+            desc.arrayLength = 2                 // one slice per eye
+            desc.mipmapLevelCount = 1
+            // renderTarget because the guest draws into it through the EGLImage;
+            // shaderRead because this file's composite pass samples it back.
+            desc.usage = [.renderTarget, .shaderRead]
+            desc.storageMode = .private
+
+            guard let t = device.makeTexture(descriptor: desc) else {
+                NSLog("[cp] could not allocate eye \(eye) stage \(stage) \(w)x\(h)")
+                return 0
+            }
+            t.label = "klepton eye stage \(stage)"
+            tex = t
+            // The real cost, not the arithmetic one. Metal reports what it
+            // actually reserved, so this is the only honest input to "is the
+            // eye swapchain why we are at 3.5 GB".
+            let naive = w * h * 8 * 2
+            NSLog("[cp] stage \(stage): GL "
+                  + String(format: "0x%x", format) + " \(w)x\(h) array, 2 slices — "
+                  + "\(t.allocatedSize / (1024 * 1024)) MiB allocated "
+                  + "(uncompressed would be \(naive / (1024 * 1024)) MiB), "
+                  + "compression=\(t.compressionType == .lossy ? "lossy" : "lossless")")
+        }
+
+        eyesLock.lock()
+        // Re-check the partner: allocating outside the lock means the other eye
+        // may have published one meanwhile. Adopting it is what keeps both eyes
+        // on ONE array texture — the composite drops a view outright if they
+        // disagree — and the one we just made is simply released. In practice
+        // ovrp_SetupEyeTexture2 arrives serially on the guest's render thread,
+        // so this costs nothing and exists so that assumption is not load-bearing.
+        partner = eyes[partnerKey]
+        if let p = partner, fits(p) { tex = p.texture }
+        let final = tex!
+        eyes[k] = EyeAllocation(texture: final, slice: eye)
+        eyesLock.unlock()
+
+        out.pointee = kl_mtl_eye_texture(texture: Unmanaged.passUnretained(final).toOpaque(),
+                                         slice: Int32(eye),
+                                         w: Int32(final.width), h: Int32(final.height))
+        return 1
+    }
+
+    /// Storage for a guest's non-eye LAYER. See `layers` above and kl_glfb.h.
+    ///
+    /// Simpler than the eye allocator in every respect that made that one
+    /// complicated: nothing is shared between two callers, there is no slice and
+    /// no rate map. What it keeps is the identity rule — size and format are
+    /// part of it, so a guest that rebuilds its swapchain is not handed the
+    /// previous allocation and left rendering into storage it does not have.
+    private func provideLayerTexture(layer: Int, stage: Int, w: Int, h: Int,
+                                     format: UInt32,
+                                     out: UnsafeMutablePointer<kl_mtl_eye_texture>) -> Int32 {
+        guard let pixelFormat = klEyePixelFormat(format) else {
+            NSLog("[cp] layer \(layer) stage \(stage) asks for GL internalformat "
+                  + String(format: "0x%x", format)
+                  + ", which has no MTLPixelFormat here — declining, so the layer "
+                  + "renders into GL storage nothing composites")
+            return 0
+        }
+        let k = layer &* 64 &+ stage
+        layersLock.lock()
+        let cached = layers[k]
+        layersLock.unlock()
+        var tex = cached
+        if tex == nil || tex!.width != w || tex!.height != h ||
+           tex!.pixelFormat != pixelFormat {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: pixelFormat, width: w, height: h, mipmapped: false)
+            desc.usage = [.renderTarget, .shaderRead]
+            desc.storageMode = .private
+            guard let t = device.makeTexture(descriptor: desc) else {
+                NSLog("[cp] could not allocate layer \(layer) stage \(stage) \(w)x\(h)")
+                return 0
+            }
+            t.label = "klepton layer \(layer) stage \(stage)"
+            tex = t
+            layersLock.lock()
+            layers[k] = t
+            layersLock.unlock()
+            NSLog("[cp] layer \(layer) stage \(stage): GL "
+                  + String(format: "0x%x", format) + " \(w)x\(h) — "
+                  + "\(t.allocatedSize / (1024 * 1024)) MiB allocated")
+        }
+        let final = tex!
+        out.pointee = kl_mtl_eye_texture(texture: Unmanaged.passUnretained(final).toOpaque(),
+                                         slice: 0,
+                                         w: Int32(final.width), h: Int32(final.height))
+        return 1
+    }
+
+    // MARK: - The frame loop
+
+    func startRenderLoop() {
+        let t = Thread { self.renderLoop() }
+        t.name = "Klepton Compositor"
+        // The guest blocks — Baselib futexes, IL2CPP's GC suspending the world —
+        // and this thread now calls into it, so it must not be the main thread.
+        t.start()
+    }
+
+    /// KL_CP_PROBE=9 — the floor. Apple's template minus the cube: wait for the
+    /// layer, then nothing but query / update / drawable / submit / clear /
+    /// present, forever. No ARKit, no priming pass, no eye-texture provider, no
+    /// guest, no shared-event wait, no pipeline, no poses, no anchor.
+    ///
+    /// Every rung above this one has come back clean while the display stayed
+    /// black, which means the thing being bisected is not a feature of the pass.
+    /// This establishes whether THIS APP can put any colour on THIS display at
+    /// all. Blue here and black at rung 1 localises the fault to what rung 1
+    /// still has that this does not; black here says the fault is structural —
+    /// the scene, the configuration, or the layer — and nothing in renderFrame()
+    /// was ever going to fix it.
+    private func minimalLoop() {
+        NSLog("[cp] PROBE 9: MINIMAL LOOP — clear to blue, present, nothing else")
+        var n = 0
+        var next = Date()
+        while true {
+            if layerRenderer.state == .invalidated { break }
+            if layerRenderer.state == .paused { layerRenderer.waitUntilRunning(); continue }
+            guard let frame = layerRenderer.queryNextFrame() else { continue }
+            frame.startUpdate()
+            frame.endUpdate()
+            if let t = frame.predictTiming() {
+                LayerRenderer.Clock().wait(until: t.optimalInputTime)
+            }
+            guard let drawable = frame.queryDrawables().first else { continue }
+            frame.startSubmission()
+            // deviceAnchor is deliberately LEFT ALONE. Stripping it would be
+            // stripping something already measured as working (anchor=set), and
+            // the system uses it to place and reproject the frame — so a black
+            // result would no longer distinguish "structural fault" from "the
+            // probe broke it". A floor test may remove only what is suspect.
+            if let cmd = queue?.makeCommandBuffer() {
+                for view in drawable.views {
+                    let map = view.textureMap
+                    let pass = MTLRenderPassDescriptor()
+                    pass.colorAttachments[0].texture     = drawable.colorTextures[map.textureIndex]
+                    pass.colorAttachments[0].slice       = map.sliceIndex
+                    pass.colorAttachments[0].loadAction  = .clear
+                    pass.colorAttachments[0].storeAction = .store
+                    pass.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 1, 1)
+                    cmd.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+                }
+                drawable.encodePresent(commandBuffer: cmd)
+                cmd.commit()
+            }
+            frame.endSubmission()
+            n += 1
+            if Date() >= next {
+                next = Date().addingTimeInterval(2)
+                NSLog("[cp] minimal: \(n) frames presented, state=\(String(describing: layerRenderer.state))")
+            }
+        }
+        NSLog("[cp] minimal loop ended after \(n) frames")
+    }
+
+    private func renderLoop() {
+        layerRenderer.waitUntilRunning()
+        if probe == 9 {
+            // The system default device, exactly as Apple's template uses —
+            // not ANGLE's. Nothing here samples a guest texture, so there is no
+            // reason to involve the device that owns them, and every reason not
+            // to: it is one of the things being ruled out.
+            queue = MTLCreateSystemDefaultDevice()?.makeCommandQueue()
+            minimalLoop()
+            return
+        }
+        installProvider()
+        applyRenderQuality()
+        applyFrameRepeat()
+        logPowerState("start")
+        startARKit()
+
+        // Before the guest, not after: the frustum and the display rate can
+        // only be read from a drawable, and the guest reads both exactly once
+        // during the lifecycle below. See primeDisplay().
+        primeDisplay()
+
+        // Bring the guest up, on its own thread. _begin is
+        // once per process and does the /proc report, nativeRecreateGfxState,
+        // nativeResume and the first nativeRender, and it happens over there
+        // rather than here: this loop must be free to present black while the
+        // guest is still starting, which can take tens of seconds on device.
+        //
+        // Under KL_SYNC_GUEST the old inline shape is kept instead, because
+        // The device measurement was taken against it and the device has
+        // never been run with either. It is the A/B for anything that looks
+        // like a pacing regression.
+        if syncGuest {
+            NSLog("[cp] KL_SYNC_GUEST — driving the guest inline on this thread")
+            if kl_app_lifecycle_begin() != 0 {
+                NSLog("[cp] lifecycle_begin failed: \(String(cString: kl_app_status()))")
+                return
+            }
+        } else if kl_app_guest_start() != 0 {
+            NSLog("[cp] guest thread failed to start: \(String(cString: kl_app_status()))")
+            return
+        }
+
+        // This loop's own liveness, logged on a wall clock rather than a frame
+        // count. The device kills an immersive app that stops presenting, and
+        // that kill arrives as a bare SIGKILL with no crash report at all — so
+        // "was this loop still running, and was it producing anything" is a
+        // question the log has to be able to answer after the fact. A frame
+        // counter cannot answer it: a loop that has stopped iterating stops
+        // incrementing, and the absence of a line is exactly what a healthy
+        // quiet loop looks like too.
+        var presented = 0
+        var iterations = 0
+        var nextReport = Date()
+        NSLog("[cp] render loop entered (startup frame-trace on; build has fence content-gate + diag)")
+        loop: while true {
+            switch layerRenderer.state {
+            case .invalidated:
+                break loop
+            case .paused:
+                NSLog("[cp] layer paused at iteration \(iterations) — waiting")
+                layerRenderer.waitUntilRunning()
+                NSLog("[cp] layer running again")
+                // ...and the audio, which does NOT come back on its own.
+                //
+                // This transition is the immersive space being temporarily
+                // dismissed and restored — a Digital Crown press to passthrough,
+                // the app's window being closed out from under it — and visionOS
+                // silently stops calling CoreAudio's render callback across it:
+                // no error, no interruption notification, and an output unit
+                // that still reports itself started. It is the same OS bug ALVR
+                // works around, and the same workaround (rebuild, do not
+                // restart). kl_audio's own heartbeat finds it too, about a
+                // second later; this is the half that knows the exact moment,
+                // and a second of dropped music is the difference.
+                kl_audio_resume()
+                continue loop
+            default:
+                autoreleasepool { presented += renderFrame() }
+                if presented > 0 && !Lifecycle.firstPicture { Lifecycle.firstPicture = true; NSLog("[cp] first frame with a picture") }
+            }
+            iterations += 1
+            if Date() >= nextReport {
+                nextReport = Date().addingTimeInterval(0.5)
+                cmdLock.lock(); let done = cmdCompleted; cmdLock.unlock()
+                NSLog("[cp] alive: \(iterations) iters, \(presented) with a picture, "
+                      + "\(blackFrames) black, guest=\(kl_app_guest_state()), "
+                      + "bail(frame/drawable/pipeline)="
+                      + "\(bailNoFrame)/\(bailNoDrawable)/\(bailNoPipeline), "
+                      // committed vs completed: if these diverge and stay
+                      // diverged, the GPU is waiting on the guest's fence and
+                      // nothing is being drawn at all.
+                      + "cmdbuf \(done)/\(cmdCommitted) done"
+                      + " fence=\(lastGlFenceSeen) layers=\(lastProjLayersSeen) enc=\(lastEncodedSeen)"
+                      + (fenceBacklogSkips > 0 ? " fence-skips \(fenceBacklogSkips)" : "")
+                      + (noFence ? " (NOFENCE)" : ""))
+                NSLog("[cp] \(cadenceSummary())")
+                NSLog("[cp] \(stageSummary())")
+            }
+        }
+        NSLog("[cp] render loop ended after \(presented) presented frames, "
+              + "\(iterations) iterations, state=\(String(describing: layerRenderer.state))")
+        // Ends the guest's loop and joins it, so its report — which is the
+        // lifecycle report, and belongs to the guest's end of the run rather than
+        // to this one — has been written before this returns.
+        if syncGuest { kl_app_lifecycle_report() } else { kl_app_guest_stop() }
+    }
+
+    /// What each swapchain stage actually holds, per report interval.
+    ///
+    /// The doubling that survived every pose fix alternates
+    /// with the stage count, and the only thing that differs between one stage
+    /// and N is *which texture this pass samples*. So the remaining hypothesis
+    /// is not two positions but two **pictures**: one stage holding a stale or
+    /// wrong-generation image while another holds the live one. That is immune
+    /// to every pose measurement, which is why all four of them came back clean.
+    ///
+    /// Three independent numbers per stage, chosen so that each failure reads
+    /// differently instead of all three looking like "doubling":
+    ///
+    ///   draws   how many times the GUEST bound this stage as its draw target,
+    ///           straight off the GL thunks and through no bookkeeping of ours.
+    ///           Frozen here = the guest stopped drawing this stage.
+    ///   serial  the guest frame whose pose is filed against it. Frozen while
+    ///           `draws` climbs = the association, not the picture.
+    ///   tex     the MTLTexture the guest is bound to, from kl_glfb's own
+    ///           record — compared against the one this pass samples. These are
+    ///           set by the same call and can still diverge, because the
+    ///           provider caches per (eye, stage) on size while Unity re-creates
+    ///           the swapchain mid-run at two different sizes. A divergence here
+    ///           is the whole hypothesis, and nothing else in the run would show
+    ///           it: every count stays healthy while the compositor samples a
+    ///           texture the guest has stopped writing to.
+    /// The storage to sample for one (eye, stage), from whichever half of the
+    /// seam produced it.
+    ///
+    /// Two halves, and they run in opposite directions. On the **GL** path this
+    /// compositor ALLOCATES the eye texture and hands it to ANGLE through the
+    /// provider, so `eyes` is the authority and the guest renders into
+    /// something we already hold. On the **VULKAN** path there is no provider at
+    /// all: MoltenVK has already backed the guest's eye VkImage with an
+    /// MTLTexture of its own, and kl_vulkan publishes that one into kl_glfb's
+    /// eye table (`kl_glfb_note_eye_mtl_texture`). Nothing here can allocate it,
+    /// so nothing here can be asked for it — the only way to find it is to look
+    /// it up.
+    ///
+    /// The table is checked FIRST, and that is not arbitrary: it is filled by
+    /// both paths (the provider registers its allocation there too), so it is
+    /// the one place that always describes the storage the guest is actually
+    /// rendering into. `eyes` remains the fallback because it survives the gap
+    /// between ovrp_DestroyEyeTexture and the next SetupEyeTexture2, where the
+    /// table is deliberately empty and showing the last good frame beats showing
+    /// black.
+    private func eyeSource(_ eye: Int, _ stage: Int) -> EyeAllocation? {
+        var slice: Int32 = 0
+        if let t = kl_glfb_eye_mtl_texture(Int32(eye), Int32(stage), &slice) {
+            let tex = Unmanaged<MTLTexture>.fromOpaque(t).takeUnretainedValue() as MTLTexture
+            return EyeAllocation(texture: arrayView(tex), slice: Int(slice),
+                                 flipY: kl_glfb_eye_mtl_origin_top_left(Int32(eye),
+                                                                        Int32(stage)) != 0)
+        }
+        eyesLock.lock(); let a = eyes[Self.key(eye, stage)]; eyesLock.unlock()
+        return a
+    }
+
+    /// Every shader in kl_reproject.c samples a `texture2d_array<float>`, and
+    /// binding a non-array texture to that slot does not fail — it samples
+    /// nothing useful, which composites as a FLAT COLOUR over storage that is
+    /// full of picture. Until Open Brush nothing here could produce one: the
+    /// provider below allocates `.type2DArray` explicitly, and BONELAB's Vulkan
+    /// eye image carries two array layers because the eye IS the layer there. An
+    /// OpenXR guest on Vulkan has one swapchain per eye, so MoltenVK hands back a
+    /// plain `.type2D` and the assumption breaks.
+    ///
+    /// A view rather than a second pipeline: only the type is wrong, and one
+    /// shader shared by both compositors is worth more than two that can drift.
+    /// Cached, because a view per frame is an allocation per frame. If the view
+    /// cannot be made it says so once and returns the original — which
+    /// composites exactly as badly as before, but names the reason rather than
+    /// leaving a flat colour to be read as a guest that drew nothing.
+    private var arrayViews: [ObjectIdentifier: MTLTexture] = [:]
+    private var saidNoArrayView = false
+
+    private func arrayView(_ tex: MTLTexture) -> MTLTexture {
+        if tex.textureType == .type2DArray { return tex }
+        let key = ObjectIdentifier(tex)
+        if let v = arrayViews[key] { return v }
+        guard let v = tex.makeTextureView(pixelFormat: tex.pixelFormat,
+                                          textureType: .type2DArray,
+                                          levels: 0..<tex.mipmapLevelCount,
+                                          slices: 0..<1) else {
+            if !saidNoArrayView {
+                saidNoArrayView = true
+                NSLog("[cp] the eye texture is textureType \(tex.textureType.rawValue) "
+                      + "and an array VIEW of it could not be made — the shaders "
+                      + "sample texture2d_array, so this composites as a flat colour")
+            }
+            return tex
+        }
+        arrayViews[key] = v
+        return v
+    }
+
+    private func stageSummary() -> String {
+        var out = "stages:"
+        var bad = false
+        for s in 0..<Int(kl_ovrp_stage_count()) {
+            var r = kl_ovrp_render_pose()
+            let have = withUnsafeMutablePointer(to: &r) {
+                kl_ovrp_stage_render_pose(Int32(s), $0) != 0
+            }
+            out += " s\(s) draws=\(kl_glfb_stage_draw_count(Int32(s)))"
+            out += " serial=\(have ? String(r.serial) : "-")"
+            for eye in 0..<2 {
+                var slice: Int32 = 0
+                let guestTex = kl_glfb_eye_mtl_texture(Int32(eye), Int32(s), &slice)
+                // tryLock, never lock: this runs on the render loop and a
+                // diagnostic that can block frame submission is a worse bug
+                // than the one it is chasing. A contended read just prints "?".
+                var mine: EyeAllocation? = nil
+                var read = false
+                if eyesLock.try() { mine = eyes[Self.key(eye, s)]; eyesLock.unlock(); read = true }
+                let mineTex = mine.map { Unmanaged.passUnretained($0.texture).toOpaque() }
+                // A nil guest texture is not a disagreement: between
+                // ovrp_DestroyEyeTexture and the next SetupEyeTexture2 the slot
+                // is deliberately empty, and this cache still holds the old
+                // texture on purpose — compositing the last good frame through
+                // a loading transition is better than a black one. Only two
+                // *different* live textures mean the two sides have diverged.
+                //
+                // ...and a nil CACHE entry is not one either. `eyes` is filled
+                // by the GL provider path only; a Vulkan guest's eye storage
+                // lives in kl_glfb's table (checked first by eyeSource) and
+                // never appears here. Comparing against the empty cache flagged
+                // every Vulkan run as "DIFFERENT textures" — which is what sent
+                // the wrath2 black-screen hunt to the eye seam when the actual
+                // fault was the overlay quad's size parse (kl_ovrp.c).
+                if read && guestTex != nil && mineTex != nil && guestTex != mineTex { bad = true }
+                // Only the low bits: two pointers into the same heap differ
+                // there, and a full 64-bit address per eye per stage makes the
+                // line unreadable at the moment it matters most.
+                let tag = guestTex.map { String(UInt(bitPattern: $0) & 0xffffff, radix: 16) } ?? "nil"
+                out += " e\(eye)=\(tag)"
+                if !read { out += "?" }
+                else if guestTex != nil && mineTex != nil && guestTex != mineTex { out += "!=SAMPLED" }
+            }
+            out += " |"
+        }
+        // The association's own health, live. A device run normally ends by the
+        // immersive space being invalidated rather than by the guest finishing,
+        // so the end-of-run report is the one thing that often is not written —
+        // and these four numbers are exactly what it would have carried.
+        var dropped: UInt64 = 0, multi: UInt64 = 0, cross: UInt64 = 0, disagree: UInt64 = 0
+        kl_ovrp_association_stats(&dropped, &multi, &cross, &disagree)
+        if dropped != 0 || multi != 0 || cross != 0 || disagree != 0 {
+            out += " assoc: \(dropped) drew nothing, \(multi) multi-stage,"
+            out += " \(cross) off-thread, \(disagree) index disagreed"
+        }
+        return out + (bad ? "  <-- the guest and the composite are on DIFFERENT textures" : "")
+    }
+
+    private func renderFrame() -> Int {
+        guard let frame = layerRenderer.queryNextFrame() else { bailNoFrame += 1; return 0 }
+        frame.startUpdate()
+        frame.endUpdate()
+
+        // Wait for the input deadline before sampling the pose, so the pose the
+        // guest renders with is as late as the compositor allows. This is the
+        // pacing that replaces a free-running pump.
+        let timing = frame.predictTiming()
+        if let timing {
+            LayerRenderer.Clock().wait(until: timing.optimalInputTime)
+        }
+        // NOT `defer { frame.endSubmission() }`. Compositor Services treats
+        // ending a submission that never presented a drawable as a client bug
+        // and aborts the process:
+        //
+        //   __BUG_IN_CLIENT__  <- cp_frame_end_submission
+        //                      <- $defer #1 in renderFrame()
+        //
+        // — SIGABRT on the compositor thread, 2026-08-07 on device, after
+        // thousands of healthy frames. A defer is exactly wrong here: the whole
+        // point of the early returns below is that this frame will NOT be
+        // presented, and those are the frames that must not be ended. ALVR's
+        // Renderer.swift and Apple's own template both simply abandon the frame
+        // — no endSubmission on that path — and this now does the same.
+        // ...and it is started AFTER the drawable is in hand, below — which is
+        // the order Apple's template and ALVR both use:
+        //
+        //   queryNextFrame -> startUpdate/endUpdate -> predictTiming
+        //     -> wait(optimalInputTime) -> queryDrawable -> startSubmission
+        //     -> encode -> encodePresent -> commit -> endSubmission
+        //
+        // startSubmission must NOT be called before queryDrawable: the two
+        // bail paths below would then abandon a submission they had already
+        // started, which Compositor Services aborts on.
+
+        // Poses first, then the frame that uses them.
+        if let timing {
+            updatePoses(at: LayerRenderer.Clock.Instant.epoch.duration(to: timing.presentationTime)
+                            .timeInterval)
+        }
+
+        // Offer the guest this frame's pose and carry straight on. The guest
+        // wakes on its own thread, ticks the Choreographer,
+        // calls nativeRender and renders into the eye textures the provider
+        // handed it, and this loop does not wait for any of it. A guest that
+        // keeps up finishes before the next publish and behaves exactly as the
+        // synchronous version did; a guest that does not simply leaves the
+        // stage record where it was, and the composite below reprojects the
+        // picture already there against the newer pose. That case is the whole
+        // reason the pass exists, and it was unreachable while the thing being
+        // reprojected was the thing blocking this loop.
+        if syncGuest {
+            _ = kl_app_frame()
+        } else {
+            kl_app_guest_publish()
+            // A guest that has *ended* looks exactly like a guest that is
+            // merely slow — both leave the stage record where it was and both
+            // make `stale` climb. Say which, once, or the log below cannot be
+            // read: the same numbers mean "reprojection is earning its keep"
+            // in one case and "there is nothing left to reproject" in the other.
+            if !loggedGuestEnd && kl_app_guest_state() < 0 {
+                loggedGuestEnd = true
+                NSLog("[cp] the guest thread has ended (\(String(cString: kl_app_status())))"
+                      + " — everything from here is its last picture, reprojected")
+            }
+        }
+
+        // ALL of them, not just the first. visionOS 26 hands out more than one
+        // drawable while the render quality is moving between two resolutions —
+        // the system crossfades them so the change is not visible — and a loop
+        // that renders drawables[0] and presents nothing else shows a half-empty
+        // frame for the whole transition. That is exactly the transition
+        // maxRenderQuality = 1.0 provokes, so the two changes belong together;
+        // queryDrawable() is deprecated in 26 in favour of this for the same
+        // reason, and ALVR loops over the array likewise.
+        let drawables = frame.queryDrawables()
+        guard !drawables.isEmpty else { bailNoDrawable += 1; return 0 }
+        guard let cmd = queue?.makeCommandBuffer(), pipeline != nil, sampler != nil else {
+            bailNoPipeline += 1
+            return 0
+        }
+        // Everything above may abandon the frame; from here it will be
+        // presented, so the submission can be opened.
+        frame.startSubmission()
+        let main = drawables[0]
+
+        // Which stage holds a *finished* picture. -1 means the guest has not
+        // completed a frame yet (ovrp_EndFrame never seen) — there is nothing
+        // to show, but the drawable still has to be presented or Compositor
+        // Services stalls waiting for it.
+        //
+        // Sampling stage 0 anyway would be worse than showing black: with the
+        // guest decoupled it may well be *mid-draw* into exactly that texture,
+        // so the frames before the first EndFrame would be a torn picture
+        // rather than an empty one, and reprojected against no pose at all.
+        let completeStage = Int(kl_ovrp_last_complete_stage())
+        let stage = max(0, completeStage)
+        var rendered = kl_ovrp_render_pose()
+        var haveRendered = withUnsafeMutablePointer(to: &rendered) {
+            kl_ovrp_stage_render_pose(Int32(stage), $0) != 0
+        }
+        // `complete` is redundant today and will not be: with one stage, the
+        // guest's *next* ovrp_BeginFrame overwrites the record this one is
+        // reading, so the moment the guest stops being driven synchronously
+        // from this thread a record can describe a frame still being drawn.
+        // Reprojecting against a pose whose picture does not exist yet is a
+        // silent wrong answer, so it is checked now rather than after the
+        // change that makes it possible.
+        if haveRendered && rendered.complete == 0 { haveRendered = false }
+
+        // Order this pass after the guest's rendering. The value only advances
+        // when the guest swaps, so an unchanged one also means "no new picture"
+        // — which is not an error, it is the case reprojection is for.
+        // Which guest frame this composite would show. Two sources, one
+        // quantity: ANGLE signals our MTLSharedEvent from inside its own
+        // command stream, and a VULKAN guest has no such event — kl_vulkan
+        // makes the guest's queue idle at ovrp_EndFrame4 and publishes a serial
+        // instead. `guestFrameEvent` being nil on that path is what keeps the
+        // wait below from being encoded against a value nothing ever signals,
+        // which would be a command buffer that is committed and never executes.
+        // The guest's projection layers, snapshotted BEFORE the fence below is
+        // read, and that order is the whole of it: the guest publishes its
+        // frame's completion before the records that describe it
+        // (klxr_EndFrame), so a list read first can only be OLDER than the
+        // fence read second — never newer, which would be drawing layers whose
+        // blits this pass never waited for. Seen as one frame of the display
+        // showing a picture from several frames ago, a few seconds apart.
+        projLayerCount = projLayers.withUnsafeMutableBufferPointer {
+            kl_ovrp_eye_layer_live() != 0
+                ? Int(kl_ovrp_proj_layers_snapshot($0.baseAddress, Int32($0.count)))
+                : 0
+        }
+        let glFence = kl_glfb_gpu_fence_value()
+        lastGlFenceSeen = glFence; lastProjLayersSeen = projLayerCount
+        let frameValue = glFence != 0 ? glFence : kl_vulkan_frame_serial()
+        // KL_CP_NOFENCE=1 skips the wait. A composite command buffer that waits
+        // on an event value the guest's queue never signals is COMMITTED and
+        // never EXECUTES: the drawable is presented, every counter here looks
+        // healthy, and the display shows nothing. That failure is invisible
+        // from this side, so it needs its own A/B — and cmdCompleted below is
+        // the measurement that says whether it is happening.
+        // Only wait on the guest fence while the backlog of committed-but-not-
+        // completed composite buffers is small. Once it grows, the guest's
+        // signal is not arriving (it is heads-down), and continuing to wait
+        // would starve the drawable pool and get the app watchdog-killed — so
+        // present without the wait until the guest catches up. A no-op for a
+        // healthy guest, whose buffers complete every frame (backlog stays 0-1).
+        //
+        // Two gates, both about NOT deadlocking the drawable pool:
+        //   1. Content: a black frame (no projection layers yet) has nothing to
+        //      order against, so it must not wait — the guest sets the fence
+        //      non-zero on its first swap but then goes heads-down (loading a
+        //      multi-GB OBB, compiling shaders) without signalling it. Waiting
+        //      there is a command buffer that never completes; it holds the one
+        //      drawable, the next frame blocks acquiring one, the loop stops
+        //      presenting after a SINGLE committed buffer (cmdbuf 0/1), and
+        //      visionOS SIGKILLs with no report. Present black, unwaited.
+        //   2. Backlog: even with content, if committed buffers stop completing
+        //      the guest is stalling — present without the wait so a drawable
+        //      stays free. Belt-and-braces behind gate 1.
+        // Both are no-ops for a healthy guest: it submits layers every frame
+        // and its buffers complete, so the wait is always encoded as before.
+        cmdLock.lock(); let doneNow = cmdCompleted; cmdLock.unlock()
+        let outstanding = cmdCommitted - doneNow
+        let haveGuestContent = projLayerCount > 0
+        if let ev = guestFrameEvent, glFence != 0, !noFence,
+           haveGuestContent, outstanding <= maxFenceBacklog {
+            cmd.encodeWaitForEvent(ev, value: glFence)
+        } else if glFence != 0 && !noFence && (!haveGuestContent || outstanding > maxFenceBacklog) {
+            fenceBacklogSkips += 1
+            if !warnedFenceBacklog {
+                warnedFenceBacklog = true
+                NSLog("[cp] guest fence set (\(glFence)) but "
+                      + (haveGuestContent
+                         ? "backlog \(outstanding) buffers not completed"
+                         : "no projection layers yet")
+                      + " — presenting WITHOUT the fence wait so the drawable pool "
+                      + "does not starve (the guest is still loading). "
+                      + "Further skips silenced.")
+            }
+        }
+        if frameValue != 0 && frameValue == lastGuestFrame {
+            staleInARow += 1
+        } else {
+            staleInARow = 0
+            lastGuestFrame = frameValue
+        }
+        if frameValue != 0 { kl_guest_stall_check(UInt32(staleInARow)) }
+
+        // The pose the picture will be *shown* at, as freshly predicted as we
+        // can make it: re-queried here rather than reused from updatePoses,
+        // because the guest's render has happened in between and the prediction
+        // is that much better for it. This is what the pass reprojects to, and
+        // therefore also what the drawable is told it was rendered with.
+        let presentation = LayerRenderer.Clock.Instant.epoch
+            .duration(to: main.frameTiming.presentationTime).timeInterval
+        let displayAnchor = displayAnchor(at: presentation)
+        let originFromDevice = originFromDevice(displayAnchor)
+        // OpenXR's VIEW space is DEFINED as the midpoint between the eyes.
+        // visionOS's device anchor is a point on the hardware and is not that
+        // midpoint, so treating the two as equal declares an equality that is
+        // false at both seams at once: the guest is told its head is somewhere
+        // it is not, and the timewarp rotates about a centre the picture was
+        // not drawn about. The second one is the expensive half — a rotation
+        // applied about the wrong centre moves the eyes along a lever arm
+        // nothing models, so a pure head turn smears near content while the
+        // measured delta stays small and healthy-looking.
+        //
+        // The drawable states the midpoint every frame and it needs no tuning:
+        // it is the average of the two eyes' own transforms. `deviceAnchor`
+        // below still gets the raw anchor, which is what that API means.
+        let originFromHead = Self.headFrom(originFromDevice, midpoint: eyeMidpointInDevice)
+        if Self.pendingRecenter {
+            Self.pendingRecenter = false
+            // Yaw + horizontal position only, exactly Quest's recenter: height
+            // and pitch/roll stay physical. Build the head's yaw-XZ frame and
+            // fold its inverse into the origin, so from the NEXT frame the
+            // current gaze direction is the world's -Z at the world's origin.
+            let c2 = originFromHead.columns.2
+            let yaw = atan2f(c2.x, c2.z)          // head +Z projected to XZ
+            let px = originFromHead.columns.3.x
+            let pz = originFromHead.columns.3.z
+            let cy = cosf(yaw), sy = sinf(yaw)
+            let m = simd_float4x4(
+                simd_float4( cy, 0, -sy, 0),
+                simd_float4(  0, 1,   0, 0),
+                simd_float4( sy, 0,  cy, 0),
+                simd_float4( px, 0,  pz, 1))
+            recenterXform = m.inverse * recenterXform
+            NSLog("[cp] RECENTER: yaw %.1f deg, pos (%.2f, %.2f) folded into the origin",
+                  yaw * 180 / .pi, px, pz)
+        }
+
+        // Measure the pose the composite is about to DRAW with, which is not
+        // always the frame record. With the layer path live the eye picture is
+        // placed by the guest's own submitted layer pose; the frame record is
+        // the head pose we latched when the guest opened the frame. Those are
+        // different poses, and reporting the second while drawing the first
+        // describes a correction nobody is applying — the delta reads healthy
+        // while the picture swims.
+        var measured = haveRendered ? rendered : nil
+        if projLayerCount > 0 {
+            var r = kl_ovrp_render_pose()
+            r.serial = rendered.serial
+            r.submit_ns = rendered.submit_ns
+            let pl = projLayers[0]
+            r.px = pl.pose.0; r.py = pl.pose.1; r.pz = pl.pose.2
+            r.qx = pl.pose.3; r.qy = pl.pose.4; r.qz = pl.pose.5; r.qw = pl.pose.6
+            measured = r
+        }
+        // EXPERIMENT (missioniss head-lock): log the DISPLAY head yaw (live) next
+        // to the RENDER pose yaw (what the guest drew), once a second. Both
+        // tracking together means the reprojection inputs are correct and the
+        // frozen view is the guest's own render; a fixed display yaw means the
+        // compositor is not getting live head rotation.
+        Self.headLockTraceN += 1
+        if Self.headLockTraceN % 90 == 0, projLayerCount > 0 {
+            let c2 = originFromHead.columns.2
+            let dispYaw = atan2f(c2.x, c2.z) * 180 / .pi
+            let pl = projLayers[0]
+            let qy = pl.pose.4, qz = pl.pose.5, qw = pl.pose.6, qx = pl.pose.3
+            let rendYaw = atan2f(2*(qw*qy + qx*qz), 1 - 2*(qy*qy + qz*qz)) * 180 / .pi
+            NSLog("[cp] headlock-probe: display yaw %.1f  render yaw %.1f", dispYaw, rendYaw)
+        }
+        noteReprojection(rendered: measured,
+                         originFromHead: originFromHead, stage: stage)
+
+        // The drawable's depth range, once, with the depth our quad actually
+        // reaches. This is not curiosity. The quad's distance is what the
+        // system's own reprojection is told about our content, so it decides
+        // how much parallax gets applied to a picture that has none — and the
+        // one time it was chosen from a measurement, the measurement had two
+        // variables in it and the wrong one got the blame. Both numbers, side
+        // by side, so the next person does not have to take anyone's word.
+        if !loggedDepthRange {
+            loggedDepthRange = true
+            let drawable = main
+            let r = drawable.depthRange
+            // The quad's ACTUAL clip-space depth, against the projection this
+            // drawable really handed us — not the distance in metres, which
+            // says nothing without the projection. In reverse-Z anything in
+            // [0,1] is inside the clip range; a value near 0 means "far away",
+            // which is what we want the system's own reprojection to believe
+            // and is NOT the same thing as being clipped. `far = inf` above is
+            // what makes that safe. Printed because this exact question was
+            // argued about and settled wrongly once (kl_reproject_build).
+            // No recorded pose: the depth does not depend on one, and asking
+            // with nil is the case kl_reproject_build already handles.
+            var probe = kl_reproject_build(nil, 0, matrix_identity_float4x4,
+                                           drawable.views[0].transform,
+                                           drawable.computeProjection(viewIndex: 0), 0, 0, 0)
+            let ndcZ = withUnsafePointer(to: &probe) { kl_reproject_ndc_depth($0) }
+            NSLog(String(format: "[cp] drawable depthRange = %@ (x=far, y=near in "
+                                 + "reverse-Z); quad at %.1f m lands at NDC z %.6f "
+                                 + "(%@)", "\(r)", probe.depth, ndcZ,
+                         (ndcZ >= 0 && ndcZ <= 1) ? "inside the clip range"
+                                                  : "*** OUTSIDE THE CLIP RANGE ***"))
+            // The drawable's actual shape, once. A clear fills the whole
+            // attachment whatever the viewport says, so a blue clear that is
+            // not visible means the texture being cleared is not the texture
+            // being displayed — and these are the numbers that say which.
+            NSLog("[cp] \(drawables.count) drawable(s); [0]: "
+                  + "\(drawable.colorTextures.count) color texture(s), "
+                  + "\(drawable.views.count) view(s), layout="
+                  + (layerRenderer.configuration.layout == .layered ? "layered" : "dedicated")
+                  + ", render quality \(layerRenderer.renderQuality) of max "
+                  + "\(layerRenderer.configuration.maxRenderQuality)")
+            // Whose device owns what. installProvider() takes ANGLE's MTLDevice
+            // so the eye textures can be shared with the guest, and its own
+            // comment notes that on the host ANGLE's device and the system
+            // default "happen to be the same object, so testing on the host
+            // would not catch getting this wrong". Compositor Services allocates
+            // the drawable on ITS device. If those are two different objects,
+            // every render pass here attaches textures the command queue does
+            // not own — which is not a picture that comes out wrong, it is a
+            // picture that never happens.
+            if let dt = drawable.colorTextures.first?.device {
+                let ours = queue?.device
+                NSLog("[cp] devices: queue=\(ours?.name ?? "nil")/"
+                      + "\(ours.map { String($0.registryID) } ?? "-") "
+                      + "drawable=\(dt.name)/\(dt.registryID) "
+                      + (ours === dt ? "SAME OBJECT" : "*** DIFFERENT OBJECTS ***"))
+            }
+            for (i, t) in drawable.colorTextures.enumerated() {
+                NSLog("[cp]   color[\(i)] \(t.width)x\(t.height) "
+                      + "array=\(t.arrayLength) type=\(t.textureType.rawValue) "
+                      + "fmt=\(t.pixelFormat.rawValue)")
+            }
+            for (i, v) in drawable.views.enumerated() {
+                let m = v.textureMap
+                NSLog("[cp]   view[\(i)] -> texture \(m.textureIndex) slice "
+                      + "\(m.sliceIndex) viewport \(m.viewport)")
+            }
+            // The rate map is the whole point of foveation, and the two numbers
+            // it carries are the ones to size the GUEST's eye textures against:
+            // `screenSize` is the resolution the picture is rasterized at in
+            // the fovea, `physicalSize` is what is actually stored. Rendering
+            // the guest at much less than the screen size throws away the
+            // resolution maxRenderQuality just paid for; much more is wasted.
+            // (ALVR measures 4338x3478 screen / 1888x1792 physical at the
+            // default quality, 6262x5020 / 2496x2432 at 1.0.)
+            if let rm = drawable.rasterizationRateMaps.first {
+                var line = "[cp] rate map: screen \(rm.screenSize.width)x\(rm.screenSize.height), "
+                         + "\(rm.layerCount) layer(s)"
+                for l in 0..<rm.layerCount {
+                    let p = rm.physicalSize(layer: l)
+                    line += ", physical[\(l)] \(p.width)x\(p.height)"
+                }
+                NSLog("%@", line)
+            } else {
+                NSLog("[cp] no rasterization rate map — foveation is off, the "
+                      + "drawable is rasterized uniformly")
+            }
+        }
+
+        // The guest's stereo separation, refreshed from the display itself.
+        pushEyeOffsets(main)
+
+        var encoded = 0
+        for drawable in drawables {
+            // Per drawable, not once: each one is presented separately and each
+            // is reprojected by the system against its own anchor.
+            drawable.deviceAnchor = displayAnchor
+            encoded += encodeComposite(drawable, cmd: cmd, stage: stage,
+                                       completeStage: completeStage,
+                                       rendered: rendered, haveRendered: haveRendered,
+                                       originFromHead: originFromHead)
+            if let rec = eyeRecorder, let q = queue, let v = drawable.views.first,
+               v.textureMap.textureIndex < drawable.colorTextures.count {
+                let maps = drawable.rasterizationRateMaps
+                rec.afterComposite(src: drawable.colorTextures[v.textureMap.textureIndex], slice: v.textureMap.sliceIndex,
+                                   viewport: v.textureMap.viewport,
+                                   map: maps.count == drawable.views.count ? maps[0] : maps.first,
+                                   cmd: cmd, queue: q)
+            }
+            drawable.encodePresent(commandBuffer: cmd)
+        }
+
+        // The one thing worth saying out loud about the decoupling: how long
+        // the guest took to put anything in a drawable. Under the old inline
+        // shape this could not be measured, because the loop did not run until
+        // the guest had already produced its first frame.
+        if encoded == 0 {
+            blackFrames += 1
+        } else if !loggedFirstPicture {
+            loggedFirstPicture = true
+            NSLog("[cp] first guest picture composited, after \(blackFrames) black frames")
+        }
+
+        // Did this command buffer actually RUN? "Presented" only means committed,
+        // and a buffer stalled on a shared-event wait never executes — so a
+        // black display and a perfect frame count are the same picture from
+        // here. Counted, with the first error printed, because "committed but
+        // never completed" is otherwise indistinguishable from "completed and
+        // drew black".
+        cmd.addCompletedHandler { [weak self] b in
+            guard let self else { return }
+            self.cmdLock.lock()
+            self.cmdCompleted += 1
+            let n = self.cmdCompleted
+            let first = self.cmdError == nil && b.error != nil
+            if first { self.cmdError = b.error }
+            self.cmdLock.unlock()
+            if n <= 12 { NSLog("[cp] cmdbuf #\(n) COMPLETED" + (b.error != nil ? " err=\(b.error!)" : "")) }
+            if first { NSLog("[cp] composite command buffer error: \(b.error!)") }
+        }
+        cmd.commit()
+        cmdCommitted += 1
+        lastEncodedSeen = encoded
+        if startupTrace < 300 {
+            startupTrace += 1
+            cmdLock.lock(); let dn = cmdCompleted; cmdLock.unlock()
+            NSLog("[cp] trace f\(startupTrace) fence=\(glFence) layers=\(projLayerCount) "
+                  + "enc=\(encoded) cmd=\(cmdCommitted)/\(dn)")
+        }
+        noteCadence(presentation: presentation, drawable: main)
+        frame.endSubmission()      // only here — see startSubmission above
+        return encoded > 0 ? 1 : 0
+    }
+
+    /// One drawable, every eye it carries. Returns how many eyes got a picture.
+    ///
+    /// **Both eyes go through ONE render pass now, and that is what foveation
+    /// costs.** A foveated drawable comes with a rasterization rate map, and
+    /// Metal applies that map's *layer N* to render-target array index N. A
+    /// pass that selects one slice with `colorAttachments[0].slice` has a
+    /// render-target array length of 1, so it can only ever reach the map's
+    /// layer 0 — the right eye would be rasterized through the left eye's
+    /// foveation pattern, and the system's unwarp would then be undoing a
+    /// distortion that was never applied. So the layered path sets
+    /// `renderTargetArrayLength = views.count` and draws both eyes in one draw
+    /// call with vertex amplification, picking its per-eye uniforms by
+    /// `[[amplification_id]]`. Apple's template and ALVR are both this shape.
+    ///
+    /// The `.dedicated` layout keeps the old per-view pass, with that view's
+    /// own single-layer rate map, because there is nothing to amplify.
+    private func encodeComposite(_ drawable: LayerRenderer.Drawable,
+                                 cmd: MTLCommandBuffer, stage: Int, completeStage: Int,
+                                 rendered: kl_ovrp_render_pose, haveRendered: Bool,
+                                 originFromHead: simd_float4x4) -> Int {
+        // KL_CP_AMPLIFY=0 — back to ONE RENDER PASS PER EYE, selecting the
+        // slice on the attachment, with no rate map and no amplification.
+        //
+        // That is exactly the composite that existed before this session, and
+        // it is the A/B that has been missing: every fix stacked on the
+        // doubling so far has assumed the bug predates the amplified pass, and
+        // nothing has tested that assumption. If both amplifications were
+        // landing on array index 0 and viewport 0 — the failure mode of a view
+        // mapping that is not being applied — then both eyes' quads are drawn
+        // over each other into one slice, which is two overlapping images and
+        // would be indifferent to the cant, the pose source and the swapchain
+        // alike. Take this rung first; it splits "regression from this session"
+        // from "pre-existing", and nothing else does.
+        let layered = layerRenderer.configuration.layout == .layered
+                      && drawable.views.count > 1
+                      && amplification >= drawable.views.count
+                      && klEnvOn("KL_CP_AMPLIFY", default: true)
+        if layered {
+            return encodeViews(Array(drawable.views.indices), drawable: drawable,
+                               layered: true,
+                               rateMap: drawable.rasterizationRateMaps.first,
+                               cmd: cmd, stage: stage, completeStage: completeStage,
+                               rendered: rendered, haveRendered: haveRendered,
+                               originFromHead: originFromHead)
+        }
+        var n = 0
+        let maps = drawable.rasterizationRateMaps
+        // One map per view, or none. A LAYERED drawable has a single map whose
+        // layers are the eyes, and a pass that selects one slice can only ever
+        // reach layer 0 — so handing it that map rasterizes the right eye
+        // through the left eye's foveation pattern. Better no map at all.
+        let perView = maps.count == drawable.views.count
+        for i in drawable.views.indices {
+            n += encodeViews([i], drawable: drawable, layered: false,
+                             rateMap: perView ? maps[i] : nil,
+                             cmd: cmd, stage: stage, completeStage: completeStage,
+                             rendered: rendered, haveRendered: haveRendered,
+                             originFromHead: originFromHead)
+        }
+        return n
+    }
+
+    /// A group of views sharing one attachment, and therefore one render pass.
+    private func encodeViews(_ viewIndices: [Int],
+                             drawable: LayerRenderer.Drawable,
+                             layered: Bool,
+                             rateMap: MTLRasterizationRateMap?,
+                             cmd: MTLCommandBuffer, stage: Int, completeStage: Int,
+                             rendered: kl_ovrp_render_pose, haveRendered: Bool,
+                             originFromHead: simd_float4x4) -> Int {
+        guard let first = viewIndices.first else { return 0 }
+        let firstMap = drawable.views[first].textureMap
+
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture     = drawable.colorTextures[firstMap.textureIndex]
+        pass.colorAttachments[0].loadAction  = .clear
+        pass.colorAttachments[0].storeAction = .store
+        // Rung 1 clears to blue instead of black and draws nothing at all:
+        // if the display stays black through THAT, nothing this file draws
+        // was ever going to be seen and the fault is below the pass.
+        // Rung 1's colour CYCLES — red, green, blue, one second each — and
+        // that is the point. A static colour cannot distinguish "our clear
+        // is reaching the display" from "the display is showing black for
+        // its own reasons", because both look like a constant field. A
+        // colour that changes on a known period can: if it cycles, our
+        // content is being composited and the question moves to what we
+        // draw; if it is a steady anything, it is not ours at all.
+        // Transparent until the guest's first picture: the space is .mixed then
+        // (Immersive.prepPassthrough), so the room shows around the launcher.
+        pass.colorAttachments[0].clearColor  = probe == 1
+            ? Self.cyclingClear() : MTLClearColorMake(0, 0, 0, Lifecycle.firstPicture ? 1 : 0)
+        if firstMap.textureIndex < drawable.depthTextures.count {
+            pass.depthAttachment.texture     = drawable.depthTextures[firstMap.textureIndex]
+            pass.depthAttachment.loadAction  = .clear
+            // .store, NOT .dontCare. visionOS reprojects the submitted frame
+            // using its depth buffer, so throwing the depth away hands the
+            // compositor a colour image with no geometry — and a reverse-Z
+            // clear of 0 reads as "everything is infinitely far away".
+            // .dontCare here meant the quad's colour was correct and its
+            // depth said nothing was there.
+            pass.depthAttachment.storeAction = .store
+            pass.depthAttachment.clearDepth  = 0.0
+        }
+        if layered {
+            // The array length, not a slice: this is what lets the rate map's
+            // per-eye layers be reached at all (see encodeComposite).
+            pass.renderTargetArrayLength = viewIndices.count
+        } else {
+            pass.colorAttachments[0].slice = firstMap.sliceIndex
+            if pass.depthAttachment.texture != nil {
+                pass.depthAttachment.slice = firstMap.sliceIndex
+            }
+        }
+        // Foveation. Metal rasterizes into the (smaller) physical texture and
+        // the system unwarps on the way to the display; a pass that leaves this
+        // nil while the drawable is foveated fills the physical texture
+        // uniformly and the unwarp then distorts a correct picture.
+        pass.rasterizationRateMap = rateMap
+
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return 0 }
+        enc.label = "klepton composite view\(viewIndices)"
+        if probe == 1 { enc.endEncoding(); return viewIndices.count }
+        guard let pipeline, let sampler else { enc.endEncoding(); return 0 }
+
+        // Loading skybox. While an Equirect loading layer is live the guest's
+        // eye is black - AC Nexus feeds that layer an Android MediaPlayer video
+        // surface that does not exist on visionOS - so rather than reproject a
+        // black eye, play the game's own loading mp4 and draw it as the 360
+        // environment. When the guest finishes loading it destroys the layer,
+        // this tears the player down, and the eye path below resumes.
+        if kl_loadingvideo_active() == 0 {
+            if loadingVideo != nil {
+                loadingVideo?.stop(); loadingVideo = nil; loadingVideoTried = false
+            }
+        } else if let tex = loadingVideoTexture() {
+            drawLoadingSkybox(enc, viewIndices: viewIndices, drawable: drawable,
+                              layered: layered, originFromHead: originFromHead,
+                              texture: tex, sampler: sampler)
+            // The menu is the video backdrop PLUS the guest's UI quad overlays on
+            // top (once it can allocate its layers). Draw them over the skybox so
+            // the menu shows through instead of only the loading environment.
+            _ = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
+                               originFromHead: originFromHead, writeDepth: true)
+            enc.endEncoding()
+            return viewIndices.count
+        }
+
+        // One uniform per view, in the order the viewports and the amplification
+        // mappings are given — the vertex shader indexes this array by
+        // [[amplification_id]].
+        var uniforms: [kl_reproject_uniforms] = []
+        // Which texture each view samples, in the PASS's own order — index n
+        // here is the [[amplification_id]] the vertex shader reads, so it is
+        // parallel to `uniforms` and must be appended to on every path through
+        // the loop, including the ones that skip a view.
+        var sources: [MTLTexture?] = []
+        var visible = 0
+        for vi in viewIndices {
+            let view = drawable.views[vi]
+            let a = eyeSource(vi, stage)
+            // No eye texture yet — the guest is still in _begin, or it has not
+            // reached ovrp_SetupEyeTexture2 for this stage. The pass still runs,
+            // because the clear above is the point: a drawable that is presented
+            // without being written shows whatever was in that texture last, and
+            // with the guest taking its own time to start there are a great many
+            // such frames.
+            // ...and nil again when the guest's last frame carried no eye
+            // picture at all. The eye textures outlive the frame that filled
+            // them, so without this the eye keeps being drawn after the guest
+            // has stopped submitting a projection layer — and on a guest that
+            // alternates (JKXR: a projection pair in the world, a quad in the
+            // menu, out of the SAME swapchains) that is one screen composited
+            // twice, full-field underneath its own panel. kl_ovrp.h has the
+            // measurement.
+            let alloc = (completeStage < 0 || kl_ovrp_eye_layer_live() == 0) ? nil : a
+            var u = withUnsafePointer(to: rendered) { r in
+                kl_reproject_build(haveRendered ? r : nil, Int32(vi),
+                                   originFromHead,
+                                   Self.headFromView(view.transform,
+                                                     midpoint: eyeMidpointInDevice),
+                                   drawable.computeProjection(viewIndex: vi),
+                                   UInt32(alloc?.slice ?? 0),
+                                   (alloc?.flipY ?? false) ? 1 : 0,
+                                   // Shared grid for now; the block per eye is
+                                   // assigned below, once the grid is known.
+                                   0)
+            }
+            // KL_CP_EYE=<0|1> — composite ONLY that eye and leave the other
+            // cleared. The measurement this whole hunt has been missing: it
+            // separates BINOCULAR doubling (the two eyes disagree and cannot be
+            // fused — the failure every fix so far has assumed) from TEMPORAL
+            // doubling (one eye seeing two copies over time, i.e. a frame held
+            // across display periods, which no amount of per-eye correctness
+            // touches). If the doubling survives with one eye blanked, it is
+            // temporal and everything tried so far was aimed at the wrong half.
+            if let only = Self.onlyEye, only != vi {
+                u.visible = 0
+                uniforms.append(u)
+                sources.append(nil)
+                continue
+            }
+            u.visible = alloc == nil ? 0 : 1
+            uniforms.append(u)
+            sources.append(alloc?.texture)
+        }
+
+        // The two texture slots the shader has, and which view reaches which.
+        //
+        // This used to bind ONE texture and drop any view whose eye was not
+        // identical to it, on the reasoning that both eyes share a single
+        // 2-slice array. They do for every guest that goes through the eye
+        // provider, which allocates exactly that, and for a Vulkan guest whose
+        // eye IS the layer. They do NOT for an OpenXR guest on Vulkan: one
+        // swapchain per eye means two unrelated MTLTextures, and the right eye
+        // was dropped from the composite for the whole run — the log said so
+        // and nothing joined it to a person seeing one eye go dark. Open Brush
+        // is the first guest of that shape.
+        //
+        // So the shader takes two textures and each view says which is its own
+        // (kl_reproject.c, `src`). View 0 samples slot 0 and every other view
+        // samples slot 1, which is the two eyes; when they really do share one
+        // texture it is bound twice and this reduces to what it was, bit for
+        // bit, for every guest that has run here.
+        let rawBind0 = sources.first.flatMap { $0 } ?? sources.compactMap { $0 }.first
+        let rawBind1 = (sources.count > 1 ? sources[1] : nil) ?? rawBind0
+        var bind0 = rawBind0, bind1 = rawBind1
+        if eyeMipsOn || eyeFXScale > 0 || eyeSharpen != nil || eyeFXAA, let r0 = rawBind0, let r1 = rawBind1, let q = queue {
+            let c0 = CACurrentMediaTime()
+            let serial = UInt64(kl_vulkan_frame_serial())
+            var m0 = r0, m1 = r1
+            if serial == prepSerial, prepSrc[0] == ObjectIdentifier(r0), prepSrc[1] == ObjectIdentifier(r1),
+               let o0 = prepOut[0], let o1 = prepOut[1] {
+                m0 = o0; m1 = o1                 // same guest frame: reuse the prepared textures
+                prepStats.reused += 1
+            } else if let pcmd = q.makeCommandBuffer() {
+                pcmd.label = "klepton eye prep"
+                if eyeFXScale > 0 {
+                    m0 = upscaledEye(r0, slot: 0, cmd: pcmd)
+                    m1 = r1 === r0 ? m0 : upscaledEye(r1, slot: 1, cmd: pcmd)
+                }
+                if eyeFXAA, fxaaActive() {
+                    let f0 = m0, f1 = m1
+                    m0 = fxaaEye(f0, slot: 0, cmd: pcmd)
+                    m1 = f1 === f0 ? m0 : fxaaEye(f1, slot: 1, cmd: pcmd)
+                }
+                if eyeSharpen != nil, sharpenActive() {
+                    let s0 = m0, s1 = m1
+                    m0 = sharpenedEye(s0, slot: 0, cmd: pcmd)
+                    m1 = s1 === s0 ? m0 : sharpenedEye(s1, slot: 1, cmd: pcmd)
+                }
+                if eyeMipsOn, let blit = pcmd.makeBlitCommandEncoder() {
+                    let u0 = m0, u1 = m1
+                    m0 = mippedEye(u0, slot: 0, blit: blit)
+                    m1 = u1 === u0 ? m0 : mippedEye(u1, slot: 1, blit: blit)
+                    blit.endEncoding()
+                }
+                pcmd.addCompletedHandler { [weak self] cb in
+                    guard let self else { return }
+                    let g = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+                    self.prepLock.lock(); self.prepStats.gpu += g; self.prepStats.gpuN += 1; self.prepLock.unlock()
+                }
+                pcmd.commit()           // ahead of `cmd` on the same queue, so it runs first
+                prepSerial = serial
+                prepSrc = [ObjectIdentifier(r0), ObjectIdentifier(r1)]
+                prepOut = [m0, m1]
+            }
+            // Per-5 s report: how often the prep ran, its CPU cost here and its GPU cost.
+            prepStats.n += 1
+            prepStats.cpu += (CACurrentMediaTime() - c0) * 1000
+            if prepStats.t0 == 0 { prepStats.t0 = c0 }
+            if c0 - prepStats.t0 >= 5 {
+                prepLock.lock(); let gpu = prepStats.gpu, gn = prepStats.gpuN; prepStats.gpu = 0; prepStats.gpuN = 0; prepLock.unlock()
+                NSLog(String(format: "[cp] eye prep: %d composites, %d reused, %d encoded; CPU %.2f ms avg; GPU %.2f ms avg per encode",
+                             prepStats.n, prepStats.reused, gn, prepStats.cpu / Double(max(1, prepStats.n)),
+                             gn > 0 ? gpu / Double(gn) : 0))
+                prepStats = (0, 0, 0, 0, 0, c0)
+            }
+            bind0 = m0; bind1 = m1
+            for n in sources.indices {
+                if sources[n] === r0 { sources[n] = m0 } else if sources[n] === r1 { sources[n] = m1 }
+            }
+        }
+        if let rec = eyeRecorder, let c0 = bind0 { rec.noteEye(c0, serial: UInt64(kl_vulkan_frame_serial())) }
+        if !cpCaptureTimes.isEmpty, cpCaptureNext < cpCaptureTimes.count, let c0 = bind0, let c1 = bind1,
+           let q = queue, let ccmd = q.makeCommandBuffer() {
+            let now = CACurrentMediaTime()
+            if cpCaptureT0 == 0 { cpCaptureT0 = now }
+            if now - cpCaptureT0 >= cpCaptureTimes[cpCaptureNext] {
+                let t = Int(cpCaptureTimes[cpCaptureNext])
+                captureEye(c0, name: String(format: "cp_t%04d_eye0.png", t), cmd: ccmd)
+                if c1 !== c0 { captureEye(c1, name: String(format: "cp_t%04d_eye1.png", t), cmd: ccmd) }
+                ccmd.commit()
+                cpCaptureNext += 1
+            }
+        }
+        // No eye texture is not the same as no picture, and this used to return
+        // here as if it were. A guest can present its whole frame as an OpenXR
+        // QUAD layer and submit no projection layer at all — JKXR does, every
+        // frame — so the eye pass is skipped and the overlay pass at the end of
+        // this function is the composite. Everything between is the eye's.
+        let haveEyes = bind0 != nil && bind1 != nil
+        if !haveEyes {
+            for n in uniforms.indices { uniforms[n].visible = 0 }
+        }
+        for n in uniforms.indices where haveEyes && uniforms[n].visible != 0 {
+            // What the fragment stage will actually sample for this view. A
+            // third distinct texture cannot be named — there are two slots —
+            // so it is dropped rather than shown another eye's picture, which
+            // is the one thing the old gate got right.
+            if sources[n] === (n == 0 ? bind0 : bind1) {
+                visible += 1
+            } else {
+                uniforms[n].visible = 0
+                if !loggedSplitEyes {
+                    loggedSplitEyes = true
+                    NSLog("[cp] view \(viewIndices[n]) samples a third distinct "
+                          + "eye texture at stage \(stage) — dropped from the "
+                          + "composite (the shader binds two)")
+                }
+            }
+        }
+        // The viewport matters here in a way it did not for a full-screen
+        // triangle: the quad is projected, so it lands where the projection
+        // says, and the view's own bounds within a shared texture are part of
+        // that. With amplification there is one per view, selected by the
+        // mapping below rather than by the shader.
+        enc.setViewports(viewIndices.map { drawable.views[$0].textureMap.viewport })
+        if layered && viewIndices.count > 1 {
+            var mappings = viewIndices.enumerated().map { (n, vi) in
+                MTLVertexAmplificationViewMapping(
+                    viewportArrayIndexOffset: UInt32(n),
+                    renderTargetArrayIndexOffset: UInt32(drawable.views[vi].textureMap.sliceIndex))
+            }
+            enc.setVertexAmplificationCount(viewIndices.count, viewMappings: &mappings)
+        }
+
+        // The PER-LAYER composite, when the guest's last frame described its
+        // projection layers one by one. It replaces everything the eye pass
+        // does below — the layers ARE the eye picture — so `visible` comes from
+        // it and the eye branch is skipped entirely. Zero is every guest that
+        // files no list, which is every guest but Steam Link and every run
+        // under KL_XR_LAYERS=0, and those take the eye pass unchanged.
+        let nproj = projLayerCount
+        if nproj > 0 {
+            visible = encodeProjLayers(enc, viewIndices: viewIndices,
+                                       drawable: drawable,
+                                       originFromHead: originFromHead,
+                                       count: nproj) > 0 ? viewIndices.count : 0
+        }
+        // The EYE pass, and only when there is an eye. `haveEyes` is false for
+        // a guest whose whole picture is a composition layer (see above), and
+        // the overlay pass below is then the entire composite rather than a
+        // decoration on top of one.
+        if nproj == 0, visible > 0, let bind0, let bind1 {
+            if !loggedEyeTextures {
+                loggedEyeTextures = true
+                NSLog("[cp] eye textures: slot0 \(bind0.width)x\(bind0.height) "
+                      + "type \(bind0.textureType.rawValue), slot1 "
+                      + (bind1 === bind0 ? "= slot0 (the eyes share one texture)"
+                                         : "\(bind1.width)x\(bind1.height) "
+                                           + "type \(bind1.textureType.rawValue) "
+                                           + "(one swapchain per eye)"))
+            }
+
+            // What each eye is ACTUALLY being placed with, said once per pass shape.
+            //
+            // This exists because a stereo geometry error has no error surface at
+            // all: every call succeeds, the counters stay healthy, and the only
+            // instrument is a person wearing the headset saying one eye looks wrong
+            // — which cannot say WHICH of three things is wrong. The three are
+            // separable from these numbers alone:
+            //
+            //   * `slice` — eye 1 sampling slice 0 is the right eye showing the
+            //     LEFT eye's picture. Placed with eye 1's quad, that is a ~20 degree
+            //     horizontal shift, because the display's per-eye tangents are
+            //     mirror images (l=1.73/r=1.00 against l=1.00/r=1.73).
+            //   * `tan` — the same shift with the pictures the right way round, if
+            //     the quad is built with the other eye's frustum.
+            //   * `rec=no` — no frame record, so BOTH quads fall back to the
+            //     symmetric 90 degree default while the guest rendered asymmetric
+            //     pictures. That one is wrong in both eyes, unequally.
+            //
+            // Keyed on the values rather than a bare `once`: the interesting case is
+            // the one where they CHANGE (a stage re-created, a swapchain rebuilt),
+            // and a first-frame-only line is exactly what would miss it.
+            let shape = viewIndices.map { vi -> String in
+                let u = uniforms[viewIndices.firstIndex(of: vi)!]
+                return String(format: "v%d slice=%u tan(l%.3f r%.3f t%.3f b%.3f) vis=%u flip=%u",
+                              vi, u.slice, u.tangents.x, u.tangents.y, u.tangents.z,
+                              u.tangents.w, u.visible, u.flip_y)
+            }.joined(separator: " | ")
+            if shape != lastEyeShape {
+                lastEyeShape = shape
+                NSLog("[cp] eye placement: \(shape) | rec=\(haveRendered ? "yes" : "no") "
+                      + "layered=\(layered) stage=\(stage)")
+            }
+
+            // ---------------------------------------------------------------
+            // The crop, from the same frame record `rendered` came from — and it is
+            // read PER EYE.
+            //
+            // The comment that stood here said one grid serves the amplified pass,
+            // so two eyes with different viewports could not both be honoured, took
+            // eye 0's, and justified it: Unity derives both from a single
+            // `renderViewportScale`, so they are equal in every measured run. That
+            // is true of a title that scales its resolution and FALSE of one using
+            // Oculus symmetric projection, where both eyes are rendered with one
+            // union frustum into a widened texture and each eye's own cone is a
+            // different sub-rect of it — measured on BONELAB, eye 0 at x=0 and eye 1
+            // at x=609, both 2271 wide of 2880. Eye 1 read
+            // through eye 0's crop is its picture shifted by that offset, with every
+            // call on the path returning success.
+            //
+            // So the grid carries a BLOCK PER EYE when the two rects differ, and one
+            // block when they do not — which is bit-for-bit the old path for every
+            // guest that has ever run here.
+            var vp0 = SIMD4<Float>.zero
+            var vp1 = SIMD4<Float>.zero
+            var vpOf = SIMD2<Float>.zero
+            if haveRendered {
+                let l = rendered.viewport.0, r = rendered.viewport.1
+                vp0 = SIMD4<Float>(Float(l.0), Float(l.1), Float(l.2), Float(l.3))
+                vp1 = SIMD4<Float>(Float(r.0), Float(r.1), Float(r.2), Float(r.3))
+                vpOf = SIMD2<Float>(Float(rendered.viewport_of.0),
+                                    Float(rendered.viewport_of.1))
+                // Said once, and said even when it is ZERO — which is the whole
+                // point. `[ovrp] render viewport` is printed by the guest's own
+                // EndFrame4 on the guest's thread, and until this line existed there
+                // was nothing anywhere saying whether the number reached the
+                // COMPOSITE. Those are different failures with one symptom: a rect
+                // the submit never carried, a rect filed against another stage, and
+                // a rect read correctly and cropped wrongly all look identical from
+                // inside the headset. Zeroes here beside a non-100% line there is
+                // the first; agreement is the third.
+                if !loggedReadViewport {
+                    loggedReadViewport = true
+                    NSLog("[cp] first render viewport read from the frame record: "
+                          + "\(l.0),\(l.1) \(l.2)x\(l.3) (stage \(stage), serial "
+                          + "\(rendered.serial))"
+                          + (l.2 <= 0 ? " — ZERO, so no crop is applied; compare "
+                                      + "against the [ovrp] render viewport line" : ""))
+                }
+            }
+            // Built from slot 0. The grid is a function of the eye texture's SIZE
+            // and its rate map, and the two eyes agree on both — a guest that
+            // rendered them at different sizes would already be failing the
+            // viewport arithmetic below.
+            let (gridBuf, gridVerts, gridPerEye) =
+                unwarpGrid(bind0, viewport0: vp0, viewport1: vp1, viewportOf: vpOf)
+            // ...and which block each view reads. Assigned here rather than passed
+            // to kl_reproject_build above because the decision needs the eye
+            // texture, which is not known until the loop that builds the uniforms
+            // has run — so the uniforms are built for a shared grid (grid_per_eye
+            // 0, the default and the old behaviour) and only a grid that really
+            // carries two blocks moves eye 1 onto its own.
+            if gridPerEye {
+                for (n, vi) in viewIndices.enumerated() where vi == 1 {
+                    uniforms[n].grid_eye = 1
+                }
+            }
+            // KL_CP_DEPTH: each view's copy of the game's depth for this stage (fragment textures 2 and 3, by the
+            // view's amplification index, like the eye textures) and the mapping it was rendered with.
+            var depthTex: [MTLTexture?] = [nil, nil]
+            if Self.gameDepth, depthPipeline != nil, probePipeline == nil {
+                for (n, vi) in viewIndices.enumerated() where n < 2 && vi < 2 {
+                    var w: Int32 = 0, h: Int32 = 0, m22: Float = 0, m23: Float = 0
+                    guard uniforms[n].visible != 0,
+                          let p = kl_vulkan_eye_depth_mtl(Int32(stage), Int32(vi), &w, &h, &m22, &m23),
+                          let t = Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue() as? MTLTexture else { continue }
+                    depthTex[n] = t
+                    uniforms[n].depth_on = 1
+                    uniforms[n].depth_m22 = m22
+                    uniforms[n].depth_m23 = m23
+                    if !loggedGameDepth {
+                        loggedGameDepth = true
+                        NSLog("[cp] game depth in use: stage \(stage) eye \(vi) \(w)x\(h), m22 \(m22) m23 \(m23)")
+                    }
+                }
+            }
+            let useDepth = depthTex[0] != nil || depthTex[1] != nil
+            enc.setRenderPipelineState(probePipeline ?? (useDepth ? depthPipeline! : pipeline))
+            if let depthState { enc.setDepthStencilState(depthState) }
+            enc.setFragmentTexture(bind0, index: 0)
+            enc.setFragmentTexture(bind1, index: 1)
+            if useDepth {
+                enc.setFragmentTexture(depthTex[0] ?? depthTex[1] ?? depthDummy, index: 2)
+                enc.setFragmentTexture(depthTex[1] ?? depthTex[0] ?? depthDummy, index: 3)
+            }
+            enc.setFragmentSamplerState(eyeMipsOn ? (mipSampler ?? sampler) : sampler, index: 0)
+            uniforms.withUnsafeBytes { buf in
+                // Vertex only: the fragment stage has no amplification_id to index
+                // this array with, so the one thing it needs — the eye's array
+                // slice — arrives as a flat varying instead (kl_reproject.c).
+                enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            }
+            // The unwarp grid, bound to the VERTEX stage. Identity until the guest's
+            // eye textures are foveated; after that it carries the squeeze this pass
+            // has to undo. See unwarpGrid and kl_reproject.h.
+            enc.setVertexBuffer(gridBuf, offset: 0, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
+        }
+        let panels = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
+                                    originFromHead: originFromHead,
+                                    writeDepth: visible == 0)
+        enc.endEncoding()
+        // "How many eyes got a picture", which is what the caller counts black
+        // frames with — and a panel IS a picture. Without this a guest that
+        // composites only quad layers reports every frame black while showing
+        // its menu correctly, which is an instrument contradicting the display.
+        if visible > 0 { return visible }
+        return panels > 0 ? viewIndices.count : 0
+    }
+
+    /// The guest's PROJECTION layers, each as its own quad with its own frustum,
+    /// in submission order — the macOS viewer's klvm_draw_proj_layers, on the
+    /// device. Returns how many were drawn, which is what the caller's
+    /// black-frame count needs.
+    ///
+    /// This REPLACES the eye pass rather than adding to it: the layers are the
+    /// eye picture, stated whole instead of flattened into one texture. A guest
+    /// that files no list — every guest but Steam Link, and every run under
+    /// `KL_XR_LAYERS=0` — takes the eye pass unchanged, so nothing here is on
+    /// any other target's path.
+    ///
+    /// Ordering is the draw order and nothing else. Each layer is a quad at
+    /// `KL_REPROJECT_DEPTH`, so they are coplanar and the depth test cannot
+    /// separate them; back to front is what OpenXR specifies and what
+    /// submission order means. Depth is written by the FIRST layer drawn — the
+    /// backdrop — because visionOS reprojects using the depth buffer and a
+    /// frame that writes none is treated as empty (see encodeOverlays), while
+    /// letting every layer write would stamp a nearer quad's depth over the
+    /// same plane for no gain.
+    @discardableResult
+    private func encodeProjLayers(_ enc: MTLRenderCommandEncoder,
+                                  viewIndices: [Int],
+                                  drawable: LayerRenderer.Drawable,
+                                  originFromHead: simd_float4x4,
+                                  count: Int) -> Int {
+        guard let pipeline, let sampler else { return 0 }
+        let grid = identityGrid()
+        var drawn = 0
+        for i in 0..<min(count, projLayers.count) {
+            let pl = projLayers[i]
+            // One uniform per amplified view, in the pass's own order — the
+            // vertex shader indexes this by [[amplification_id]], so a view this
+            // layer does not cover says so with visible = 0 rather than by not
+            // being drawn.
+            var uniforms: [kl_reproject_uniforms] = []
+            var sources: [MTLTexture?] = []
+            for vi in viewIndices {
+                let slot = vi == 1 ? pl.slot.1 : pl.slot.0
+                var tex: MTLTexture? = nil
+                var slice: Int32 = 0
+                if slot >= 0,
+                   let t = kl_glfb_eye_mtl_texture(Int32(vi), slot, &slice) {
+                    // Through the array view for the reason the eye pass is:
+                    // every shader in kl_reproject.c samples a
+                    // texture2d_array, and a plain 2D bound to one samples
+                    // nothing with no error at all.
+                    tex = arrayView(Unmanaged<MTLTexture>.fromOpaque(t)
+                                        .takeUnretainedValue() as MTLTexture)
+                }
+                var u = withUnsafePointer(to: pl) {
+                    kl_proj_layer_build($0, Int32(vi), originFromHead,
+                                        Self.headFromView(drawable.views[vi].transform,
+                                                          midpoint: eyeMidpointInDevice),
+                                        drawable.computeProjection(viewIndex: vi),
+                                        UInt32(slice))
+                }
+                if tex == nil { u.visible = 0 }
+                if let only = Self.onlyEye, only != vi { u.visible = 0 }
+                uniforms.append(u)
+                sources.append(tex)
+            }
+            // Two texture slots, view 0 in the first and every other view in the
+            // second — the eye pass's rule, and for the same reason: a layer's
+            // two eyes are either two slices of one texture or two textures.
+            let bind0 = sources.first.flatMap { $0 } ?? sources.compactMap { $0 }.first
+            let bind1 = (sources.count > 1 ? sources[1] : nil) ?? bind0
+            guard let bind0, let bind1,
+                  uniforms.contains(where: { $0.visible != 0 }) else {
+                // Named once per layer index: "the guest submitted a layer we
+                // cannot reach" and "the guest submitted fewer layers" are the
+                // same picture, which is the failure this pass exists to end.
+                if !loggedProjMiss.contains(i) {
+                    loggedProjMiss.insert(i)
+                    NSLog("[cp] projection layer \(i) (slots \(pl.slot.0)/\(pl.slot.1)) "
+                          + "has no MTLTexture — not composited")
+                }
+                continue
+            }
+            // A view whose texture is neither bound slot is dropped rather than
+            // shown another eye's picture — the eye pass's rule again.
+            for n in uniforms.indices where uniforms[n].visible != 0 {
+                if sources[n] !== (n == 0 ? bind0 : bind1) { uniforms[n].visible = 0 }
+            }
+            // The FIRST layer drawn writes depth and every one after it only
+            // passes. visionOS reprojects from the depth buffer, so the frame
+            // must carry some — but the layers are coplanar at
+            // KL_REPROJECT_DEPTH, and a `.greater` test against a depth already
+            // written discards every one of them.
+            if let d = drawn == 0 ? depthState : depthPassState {
+                enc.setDepthStencilState(d)
+            }
+            enc.setRenderPipelineState(pipeline)
+            enc.setFragmentTexture(bind0, index: 0)
+            enc.setFragmentTexture(bind1, index: 1)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            uniforms.withUnsafeBytes { buf in
+                enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            }
+            enc.setVertexBuffer(grid, offset: 0, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0,
+                               vertexCount: Int(kl_reproject_grid_vertices(1, 1)))
+            drawn += 1
+        }
+        // What each layer is ACTUALLY being placed with, said when it CHANGES —
+        // this guest's layer arrangement moves while it runs (a layer appears
+        // and disappears about once a second, and one layer's frustum halves
+        // and doubles), so a first-frame-only line describes a shape the run
+        // spends most of its time not being in.
+        if drawn > 0 {
+            let shape = "\(count) layer(s), \(drawn) composited"
+            if shape != lastProjShape {
+                lastProjShape = shape
+                NSLog("[cp] per-layer composite: \(shape)")
+            }
+        }
+        return drawn
+    }
+
+    /// The identity unwarp grid, built once. The per-layer pass binds this
+    /// rather than `unwarpGrid`'s: a layer's picture is a whole guest swapchain
+    /// image copied as it is, so there is no rate map to undo and no render
+    /// viewport smaller than the texture.
+    private func identityGrid() -> MTLBuffer? {
+        if identityGridBuffer == nil {
+            var tmp = [SIMD2<Float>](repeating: .zero,
+                                     count: Int(kl_reproject_grid_entries(1, 1)))
+            tmp.withUnsafeMutableBufferPointer { kl_reproject_grid_identity($0.baseAddress) }
+            identityGridBuffer = tmp.withUnsafeBytes {
+                device.makeBuffer(bytes: $0.baseAddress!, length: $0.count, options: [])
+            }
+        }
+        return identityGridBuffer
+    }
+    /// This frame's projection layers, taken whole and taken EARLY — see where
+    /// it is filled for why the read order against the frame fence matters.
+    /// Read only on the render loop, which is also the only thread that writes
+    /// it, so it needs no lock of its own.
+    private var projLayers = [kl_ovrp_proj_layer](repeating: kl_ovrp_proj_layer(),
+                                                  count: 8)
+    private var projLayerCount = 0
+    nonisolated(unsafe) static var headLockTraceN = 0
+    private var identityGridBuffer: MTLBuffer?
+    private var loggedProjMiss = Set<Int>()
+    private var lastProjShape = ""
+
+    /// The layers that are NOT the eye, drawn on top of it in the same encoder.
+    ///
+    /// `ovrp_EndFrame4` is handed a list and every reader of it here used to walk
+    /// past anything but the eye layer. That is right for the frame record and it
+    /// silently dropped everything else. Unity's only other layer is a 1x1 nothing
+    /// renders into; **Unreal draws its UI this way**, so on RE4 it dropped the
+    /// studio splash, the loading screens and the menus while the world
+    /// composited perfectly.
+    ///
+    /// No depth ordering is needed: the eye quad sits at `KL_REPROJECT_DEPTH`
+    /// (500 m) and an overlay is a few metres away, so it is in front by geometry.
+    /// `KL_GUEST_OVERLAYS=0` is the A/B. Deliberately not `KL_OVERLAYS`, which is
+    /// already the SYSTEM overlays (the Home indicator, KleptonApp.swift) — two
+    /// knobs one letter apart, fighting over one name, is a bug with no error
+    /// surface at all.
+    ///
+    /// Returns how many layers were actually drawn — for a guest whose whole
+    /// frame is a quad that IS the picture, and the caller's black-frame count
+    /// depends on knowing it.
+    ///
+    /// `writeDepth` is set when the overlays ARE the frame — the eye pass drew
+    /// nothing, so nothing else in this pass will write depth.
+    ///
+    /// That distinction is the whole of it. visionOS reprojects the submitted
+    /// frame using its depth buffer, and the encoder's default state writes no
+    /// depth at all, so a frame whose only content is a quad layer arrives as
+    /// perfect colour over a depth buffer still holding the reverse-Z clear of
+    /// 0 — "nothing is here at any finite distance" — and the compositor
+    /// honours that literally. It is the same measurement the eye pipeline's
+    /// depth state records: a quad with writes off is invisible, the same quad
+    /// with writes on appears. It never showed on the guest this pass was
+    /// written for, because an Unreal title draws its eye first and its UI
+    /// second, so the depth was already there to ride on.
+    ///
+    /// Left OFF when the eye pass did draw, which is not timidity: an overlay
+    /// blends, so a transparent region of a UI quad would otherwise stamp the
+    /// quad's near depth over the world behind it and reproject that patch of
+    /// the world at the panel's distance.
+    @discardableResult
+    private func encodeOverlays(_ enc: MTLRenderCommandEncoder,
+                                viewIndices: [Int],
+                                drawable: LayerRenderer.Drawable,
+                                originFromHead: simd_float4x4,
+                                writeDepth: Bool) -> Int {
+        guard overlaysEnabled, let pipe = overlayPipeline else { return 0 }
+        // .greater against that same clear, and the shader's own projected
+        // position carries the quad's real distance, so what lands in the
+        // buffer is where the panel actually is.
+        if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
+        let n = Int(kl_ovrp_overlay_count())
+        if n == 0 { return 0 }
+        var drawn = 0
+        var drewEquirect = false
+        for i in 0..<n {
+            var ov = kl_ovrp_overlay()
+            guard kl_ovrp_overlay_get(Int32(i), &ov) != 0 else { continue }
+            // Equirect layers are the loading/menu backdrop, which the host
+            // draws itself from the real mp4 (drawLoadingSkybox). The guest's
+            // own equirect layers here are 2x2 placeholders or the wild video
+            // handle - drawing them as a full skybox stretches 4 pixels over the
+            // sphere and flickers over everything. Skip them; the backdrop is
+            // already handled.
+            if ov.shape == 5 {
+                // The guest's own equirect layer — the menu ENVIRONMENT backdrop.
+                // Skipped while these were 2x2 placeholders; now that the menu
+                // renders for real, the 512x512+ ones carry the backdrop the user
+                // sees as "missing background". Draw the first per pass whose texL
+                // resolves, through the same skybox pipeline the loading video
+                // uses (behind everything at far depth). KL_OVERLAY_EQ=0 restores
+                // the old skip. The quad restore below puts the pipeline and depth
+                // state back for the panels that follow.
+                // ov.tex != 0: an equirect whose texL is NULL (layer 4, the video
+                // placeholder) must NOT fall back to its empty swapchain image —
+                // that drew a BLACK sphere over the far plane. And the depth
+                // state is restored UNCONDITIONALLY: encodeEquirect swaps in the
+                // greaterEqual-at-far compare, and leaking it into the quad
+                // draws below made every panel fail the depth test — composited
+                // in the log, invisible in the headset (the post-equirect
+                // regression).
+                if Self.drawEquirectOverlays, !drewEquirect, ov.tex_w >= 64, ov.tex != 0,
+                   encodeEquirect(enc, ov: ov, viewIndices: viewIndices,
+                                  drawable: drawable, originFromHead: originFromHead) {
+                    drewEquirect = true
+                }
+                if drewEquirect, let depthState { enc.setDepthStencilState(depthState) }
+                continue
+            }
+            // KL_OVERLAY_SKIP_HEADLOCKED=1: drop head-locked overlays. In AC Nexus
+            // the interactive menu is entirely WORLD-locked (buttons/panels placed
+            // in the scene); the only head-locked quads are the fullscreen loading
+            // /fade cover (e.g. layer 3 1024x1024 and layer 5 1.35m, both glued
+            // 0.5 m in front of the eyes) which the game leaves up in its init loop
+            // and which draws over the menu behind it. Skipping them reveals the
+            // menu; off by default so no other guest's head-locked HUD regresses.
+            if Self.skipHeadLockedOverlays && ov.head_locked != 0 {
+                if !loggedOverlayMiss.contains(ov.layer_id) {
+                    loggedOverlayMiss.insert(ov.layer_id)
+                    NSLog("[cp] overlay layer \(ov.layer_id) (shape \(ov.shape), "
+                          + "\(ov.size.0)x\(ov.size.1) m) SKIPPED — head-locked "
+                          + "(KL_OVERLAY_SKIP_HEADLOCKED)")
+                }
+                continue
+            }
+            // One uniform per amplified view, exactly as the eye pass does — the
+            // array is indexed by [[amplification_id]] and a view with no
+            // placement says so with `visible = 0` rather than by not drawing,
+            // because with amplification there is one draw for both.
+            var uniforms: [kl_overlay_uniforms] = []
+            var texture: MTLTexture? = nil
+            for vi in viewIndices {
+                var w: Int32 = 0, h: Int32 = 0
+                // Two producers, one consumer, asked in the order they can
+                // answer: a Vulkan guest's layer image belongs to kl_vulkan, and
+                // everything else reaches a compositor through kl_glfb's layer
+                // table — an OpenXR quad on GL is bound there and a Vulkan one
+                // is recorded there too. Vulkan first, so RE4's path is
+                // untouched.
+                // The guest-submitted texL first: AC Nexus draws its menu UI
+                // into its own textures and submits those, not into the swapchain
+                // image we handed out — so that handle, resolved to its MTLTexture,
+                // is where the panel pixels actually are. Falls back to the layer
+                // image (RE4's path) then kl_glfb when texL carries nothing.
+                let t = kl_vulkan_mtl_for_handle(ov.tex)
+                    ?? kl_vulkan_layer_mtl_texture(ov.layer_id, ov.stage, Int32(vi), &w, &h)
+                    ?? kl_glfb_layer_mtl_texture(ov.layer_id, ov.stage, &w, &h)
+                if texture == nil, let t { texture = Unmanaged<MTLTexture>
+                    .fromOpaque(t).takeUnretainedValue() }
+                var u = kl_overlay_build(&ov, Int32(vi), originFromHead,
+                                         Self.headFromView(drawable.views[vi].transform,
+                                                           midpoint: eyeMidpointInDevice),
+                                         drawable.computeProjection(viewIndex: vi))
+                if t == nil { u.visible = 0 }
+                uniforms.append(u)
+            }
+            guard let texture, uniforms.contains(where: { $0.visible != 0 }) else {
+                // Named once per layer: "the guest submitted a layer we cannot
+                // reach" and "the guest submitted none" are the same picture.
+                if !loggedOverlayMiss.contains(ov.layer_id) {
+                    loggedOverlayMiss.insert(ov.layer_id)
+                    NSLog("[cp] overlay layer \(ov.layer_id) (shape \(ov.shape), stage "
+                          + "\(ov.stage), \(ov.size.0)x\(ov.size.1) m) has no placement "
+                          + "or no MTLTexture — not composited")
+                }
+                continue
+            }
+            // The equirect branch above may have swapped the depth state for
+            // its behind-everything compare; restore the quad's before drawing.
+            if writeDepth, let depthState { enc.setDepthStencilState(depthState) }
+            enc.setRenderPipelineState(pipe)
+            enc.setFragmentTexture(texture, index: 0)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            uniforms.withUnsafeBytes { buf in
+                enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+                enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+            }
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            drawn += 1
+            if !loggedOverlayDraw.contains(ov.layer_id) {
+                loggedOverlayDraw.insert(ov.layer_id)
+                NSLog("[cp] compositing overlay layer \(ov.layer_id): "
+                      + "\(ov.size.0)x\(ov.size.1) m at (\(ov.pose.4), \(ov.pose.5), "
+                      + "\(ov.pose.6))"
+                      + (ov.head_locked != 0 ? ", HEAD-LOCKED" : ""))
+            }
+        }
+        return drawn
+    }
+    /// Matches `struct KLEq` in kl_msl_equirect (kl_reproject.c) byte for byte:
+    /// two float4x4 then four uint, 144 bytes, 16-aligned. One per amplified
+    /// view, indexed by [[amplification_id]].
+    private struct KLEqUniform {
+        var invProj: simd_float4x4 = matrix_identity_float4x4
+        var worldRot: simd_float4x4 = matrix_identity_float4x4
+        var slice: UInt32 = 0
+        var flipY: UInt32 = 0
+        var srgbDecode: UInt32 = 0
+        var visible: UInt32 = 0
+        var test: UInt32 = 0
+        var hscale: Float = 1
+    }
+
+    /// The 3x3 rotation of a rigid transform, re-homed as a 4x4 with no
+    /// translation — the panorama is at infinity, so only orientation maps a
+    /// view-space ray into the sphere\'s world space.
+    private static func rotationOnly(_ m: simd_float4x4) -> simd_float4x4 {
+        var r = matrix_identity_float4x4
+        r.columns.0 = SIMD4<Float>(m.columns.0.x, m.columns.0.y, m.columns.0.z, 0)
+        r.columns.1 = SIMD4<Float>(m.columns.1.x, m.columns.1.y, m.columns.1.z, 0)
+        r.columns.2 = SIMD4<Float>(m.columns.2.x, m.columns.2.y, m.columns.2.z, 0)
+        r.columns.3 = SIMD4<Float>(0, 0, 0, 1)
+        return r
+    }
+
+    /// V flips and sRGB decode differ by how the guest authored the panorama;
+    /// both are one device run to settle, so they are env-switchable.
+    private static let skipHeadLockedOverlays = klEnvOn("KL_OVERLAY_SKIP_HEADLOCKED", default: false)
+    private static let drawEquirectOverlays = klEnvOn("KL_OVERLAY_EQ", default: true)
+    private static let eqFlipY = klEnvOn("KL_EQ_FLIP", default: false)
+    private static let eqSrgbDecode = klEnvOn("KL_EQ_SRGB", default: false)
+    // KL_EQ_TEST=1 solid magenta (pass reaches display?), 2 UV gradient
+    // (mapping), 3 sampled texture brightened (dim content?), 4 world-ray
+    // colour (reconstruction). 0 = normal. A no-rebuild localiser for a black
+    // skybox.
+    private static let eqTest: UInt32 = {
+        if let s = ProcessInfo.processInfo.environment["KL_EQ_TEST"],
+           let v = UInt32(s) { return v }
+        return 0
+    }()
+    // Horizontal angular scale for the equirect: 1.0 = full 360 deg across the
+    // texture width (2:1 vs the 180 deg vertical, so a square video looks
+    // stretched), 2.0 = 180 deg across the width (square texture -> square
+    // angular, un-stretched). KL_EQ_HSCALE overrides.
+    private static let eqHScale: Float = {
+        if let s = ProcessInfo.processInfo.environment["KL_EQ_HSCALE"],
+           let v = Float(s) { return v }
+        return 2.0
+    }()
+
+    /// Composite a 360 equirect panorama (shape 5). A fullscreen triangle whose
+    /// fragment shader turns each pixel back into a world ray and samples the
+    /// sphere, at far-plane reverse-Z so eye content (when there is any) sits in
+    /// front. During shader warmup there is no eye content and this is the whole
+    /// picture — which on Quest is the loading skybox and here was black.
+    private func encodeEquirect(_ enc: MTLRenderCommandEncoder,
+                                ov: kl_ovrp_overlay,
+                                viewIndices: [Int],
+                                drawable: LayerRenderer.Drawable,
+                                originFromHead: simd_float4x4) -> Bool {
+        guard let pipe = equirectPipeline else { return false }
+        var w: Int32 = 0, h: Int32 = 0
+        // texL first — AC Nexus renders its backdrop into its OWN texture and
+        // submits that handle, exactly as its menu quads do; the layer swapchain
+        // image is the empty fallback. Same ladder, same reason, as the quad path.
+        let t = kl_vulkan_mtl_for_handle(ov.tex)
+            ?? kl_vulkan_layer_mtl_texture(ov.layer_id, ov.stage,
+                                            Int32(viewIndices.first ?? 0), &w, &h)
+            ?? kl_glfb_layer_mtl_texture(ov.layer_id, ov.stage, &w, &h)
+        guard let t else {
+            if !loggedOverlayMiss.contains(ov.layer_id) {
+                loggedOverlayMiss.insert(ov.layer_id)
+                NSLog("[cp] equirect overlay layer \(ov.layer_id) (stage "
+                      + "\(ov.stage)) has no MTLTexture — not composited")
+            }
+            return false
+        }
+        let texture = Unmanaged<MTLTexture>.fromOpaque(t).takeUnretainedValue()
+        var uniforms: [KLEqUniform] = []
+        for vi in viewIndices {
+            let proj = drawable.computeProjection(viewIndex: vi)
+            let originFromView = originFromHead
+                * Self.headFromView(drawable.views[vi].transform,
+                                    midpoint: eyeMidpointInDevice)
+            var u = KLEqUniform()
+            u.invProj = proj.inverse
+            u.worldRot = Self.rotationOnly(originFromView)
+            u.flipY = Self.eqFlipY ? 1 : 0
+            u.srgbDecode = Self.eqSrgbDecode ? 1 : 0
+            u.visible = 1
+            u.test = Self.eqTest
+            u.hscale = Self.eqHScale
+            uniforms.append(u)
+        }
+        enc.setRenderPipelineState(pipe)
+        if let equirectDepthState { enc.setDepthStencilState(equirectDepthState) }
+        enc.setFragmentTexture(texture, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        uniforms.withUnsafeBytes { buf in
+            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+        }
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        if !loggedOverlayDraw.contains(ov.layer_id) {
+            loggedOverlayDraw.insert(ov.layer_id)
+            NSLog("[cp] compositing EQUIRECT panorama layer \(ov.layer_id): "
+                  + "\(w)x\(h) tex, flipY=\(Self.eqFlipY) srgb=\(Self.eqSrgbDecode)")
+        }
+        return true
+    }
+
+    // The host-driven loading skybox player (AC Nexus). Created lazily the
+    // first frame an Equirect loading layer is live, torn down when it clears.
+    private var loadingVideo: LoadingVideoPlayer?
+    private var loadingVideoTried = false
+    private var loadingSkyboxDraws = 0
+
+    /// The current video frame as an MTLTexture, creating the player on first
+    /// use. The loading videos are staged beside the rest of the asset tree, so
+    /// the path comes from kl_app_assets_dir(). nil until a frame is decoded.
+    private func loadingVideoTexture() -> MTLTexture? {
+        // DIAGNOSTIC (KL_SCRATCH_DEBUG=1): draw the wild-handle scratch — the one
+        // image AC Nexus actually composites its frame into — as the skybox, so
+        // we can SEE what the guest produced. Spread over the sphere it is
+        // distorted, but it answers whether the guest's real content is in there.
+        if ProcessInfo.processInfo.environment["KL_SCRATCH_DEBUG"] == "1" {
+            var sw: Int32 = 0, sh: Int32 = 0
+            if let t = kl_vulkan_wild_scratch_mtl(&sw, &sh) {
+                return Unmanaged<MTLTexture>.fromOpaque(t).takeUnretainedValue()
+            }
+        }
+        if loadingVideo == nil {
+            if loadingVideoTried { return nil }
+            loadingVideoTried = true
+            guard let dir = kl_app_assets_dir() else { return nil }
+            let base = String(cString: dir)
+            // The init loop is the long warmup environment; fall back to the
+            // shorter background loop if the build ships only that.
+            let candidates = ["Background-with-Initialisation-Loop.mp4",
+                              "Background-Looping.mp4"]
+            var found: URL? = nil
+            for c in candidates {
+                let path = base + "/" + c
+                if FileManager.default.fileExists(atPath: path) {
+                    found = URL(fileURLWithPath: path); break
+                }
+            }
+            guard let url = found,
+                  let lv = LoadingVideoPlayer(device: device, url: url) else {
+                NSLog("[cp] loading skybox: no playable loading video under \(base)")
+                return nil
+            }
+            NSLog("[cp] loading skybox: playing \(url.lastPathComponent)")
+            lv.start()
+            loadingVideo = lv
+        }
+        return loadingVideo?.latestTexture()
+    }
+
+    /// Draw a video frame as a 360 equirect environment filling every view -
+    /// the same fullscreen-triangle equirect pass the guest-overlay path uses,
+    /// but sourced from our own player instead of a (missing) guest texture.
+    private func drawLoadingSkybox(_ enc: MTLRenderCommandEncoder,
+                                   viewIndices: [Int],
+                                   drawable: LayerRenderer.Drawable,
+                                   layered: Bool,
+                                   originFromHead: simd_float4x4,
+                                   texture: MTLTexture,
+                                   sampler: MTLSamplerState) {
+        guard let pipe = equirectPipeline else { return }
+        // Same viewport + amplification wiring the eye pass uses, so the
+        // fullscreen triangle covers both eyes in the layered (amplified) path
+        // rather than only view 0.
+        enc.setViewports(viewIndices.map { drawable.views[$0].textureMap.viewport })
+        if layered && viewIndices.count > 1 {
+            var mappings = viewIndices.enumerated().map { (n, vi) in
+                MTLVertexAmplificationViewMapping(
+                    viewportArrayIndexOffset: UInt32(n),
+                    renderTargetArrayIndexOffset: UInt32(drawable.views[vi].textureMap.sliceIndex))
+            }
+            enc.setVertexAmplificationCount(viewIndices.count, viewMappings: &mappings)
+        }
+        var uniforms: [KLEqUniform] = []
+        for vi in viewIndices {
+            let proj = drawable.computeProjection(viewIndex: vi)
+            let originFromView = originFromHead
+                * Self.headFromView(drawable.views[vi].transform,
+                                    midpoint: eyeMidpointInDevice)
+            var u = KLEqUniform()
+            u.invProj = proj.inverse
+            u.worldRot = Self.rotationOnly(originFromView)
+            u.flipY = Self.eqFlipY ? 1 : 0
+            u.srgbDecode = Self.eqSrgbDecode ? 1 : 0
+            u.visible = 1
+            u.test = Self.eqTest
+            u.hscale = Self.eqHScale
+            uniforms.append(u)
+        }
+        enc.setRenderPipelineState(pipe)
+        if let loadingSkyboxDepthState { enc.setDepthStencilState(loadingSkyboxDepthState) }
+        enc.setFragmentTexture(texture, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        uniforms.withUnsafeBytes { buf in
+            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+        }
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        loadingSkyboxDraws += 1
+        if loadingSkyboxDraws == 1 || loadingSkyboxDraws % 120 == 0 {
+            NSLog("[cp] loading skybox: drew \(loadingSkyboxDraws) frames "
+                  + "(\(texture.width)x\(texture.height), amp=\(viewIndices.count), "
+                  + "TEST=\(Self.eqTest), FLIP=\(Self.eqFlipY), SRGB=\(Self.eqSrgbDecode))")
+        }
+    }
+
+    private let overlaysEnabled = klEnvOn("KL_GUEST_OVERLAYS", default: true)
+    private var loggedOverlayMiss = Set<Int32>()
+    private var loggedOverlayDraw = Set<Int32>()
+    private var loggedSplitEyes = false
+    /// Said once: what the two texture slots resolved to, and whether the eyes
+    /// share one texture or arrive as one swapchain each. Two guests of
+    /// different shapes composite through this one pass and nothing else says
+    /// which shape a run is.
+    private var loggedEyeTextures = false
+    /// The last per-eye placement described by `[cp] eye placement`, so the line
+    /// is printed when it CHANGES rather than only on the first frame.
+    private var lastEyeShape = ""
+    /// KL_CP_EYE=<0|1>, the binocular/temporal split. See encodeViews.
+    private static let onlyEye: Int? = {
+        guard let e = ProcessInfo.processInfo.environment["KL_CP_EYE"],
+              let v = Int(e), v == 0 || v == 1 else { return nil }
+        NSLog("[cp] KL_CP_EYE=\(v) — compositing that eye ONLY; the other "
+              + "stays cleared. Doubling that survives this is TEMPORAL.")
+        return v
+    }()
+
+    /// Did this frame get its own display period, or is it being held?
+    ///
+    /// Two numbers, and they answer different questions. The **gap** between
+    /// consecutive presentation times says what the system did with our frames:
+    /// 1.00 periods means every frame we submit is shown once, 2.00 means each
+    /// is being shown twice and half our reprojections never reach the display.
+    /// The **deadline** says whether that is our fault: encoding that finishes
+    /// after `renderingDeadline` is a frame the system had to fall back on.
+    ///
+    /// A picture can be several frames stale and still look perfect here, which
+    /// is the point — staleness is reprojection's job and it does it every
+    /// period. A repeat is the case reprojection cannot reach.
+    private func noteCadence(presentation: TimeInterval,
+                             drawable: LayerRenderer.Drawable) {
+        // The deadline for THIS frame, against the same clock it is expressed
+        // in. Checked after commit, so it measures the encode we just did.
+        let now = LayerRenderer.Clock.Instant.epoch
+            .duration(to: LayerRenderer.Clock().now).timeInterval
+        let deadline = LayerRenderer.Clock.Instant.epoch
+            .duration(to: drawable.frameTiming.renderingDeadline).timeInterval
+        if now > deadline { missedDeadline += 1 }
+
+        defer { lastPresentation = presentation }
+        guard lastPresentation > 0 else { return }
+        // The period, from whatever source has one. primeDisplay's measurement
+        // is the good one, but it can fail to get eight drawables — and a
+        // cadence report that silently does not exist because a DIFFERENT
+        // measurement failed is exactly the kind of instrument that wastes a
+        // device run. Falling back to the rate the guest is being told keeps
+        // the ratio meaningful; failing that the raw milliseconds still are.
+        if displayPeriod <= 0 {
+            let hz = Double(kl_ovrp_display_frequency())
+            displayPeriod = hz > 1 ? 1.0 / hz : 0
+        }
+        let seconds = presentation - lastPresentation
+        let gap = displayPeriod > 0 ? seconds / displayPeriod : 0
+        // A gap of zero or a negative one is the same drawable seen twice or a
+        // clock that moved backwards; neither is a cadence measurement.
+        guard seconds > 0 else { return }
+        cadenceN += 1
+        cadenceSum += seconds
+        cadenceMax = max(cadenceMax, seconds)
+        cadenceMin = min(cadenceMin, seconds)
+        if gap >= 1.5 { cadenceRepeats += 1 }
+    }
+
+    /// The cadence numbers, for the liveness line — which is the one report
+    /// here that is known to print, on a wall clock, whatever else has failed.
+    /// Reported there rather than on a sample count of its own so that "the
+    /// cadence line is missing" can only ever mean "no frames were presented".
+    private func cadenceSummary() -> String {
+        guard cadenceN > 0 else { return "cadence n/a (no presents yet)" }
+        let meanS = cadenceSum / Double(cadenceN)
+        let periods = displayPeriod > 0 ? meanS / displayPeriod : 0
+        let out = String(format: "cadence %.2f ms mean / %.2f max", meanS * 1000,
+                         cadenceMax * 1000)
+            + (displayPeriod > 0 ? String(format: " = %.2f periods", periods) : "")
+            + ", \(cadenceRepeats)/\(cadenceN) held >=1.5, "
+            + "\(missedDeadline) past deadline"
+            + ", thermal \(Self.thermalName(ProcessInfo.processInfo.thermalState))"
+            // Only when it has happened: a permanently-zero clause on the one
+            // line known to print is noise, and a NON-zero one here is the
+            // tracker refusing the instant the composite asked about — which is
+            // the quad going head-locked, named. See displayOriginFromDevice.
+            + (anchorWalkedBack + anchorHeld + anchorUnknown > 0
+               ? ", anchor \(anchorWalkedBack) walked back"
+                 + " / \(anchorHeld) held / \(anchorUnknown) unknown"
+               : "")
+        // The latch is a BOOT measurement, and visionOS reserves the right to
+        // change the panel rate mid-session — a demotion to 59.98 Hz has been
+        // seen on this hardware. That recreates the mismatch at a point where
+        // nothing can be re-told: the guest read its rate once, early, and
+        // stored it. Detection is therefore the whole of what is available, and
+        // it is still worth having, because the alternative is diagnosing the
+        // same thing from scratch off a log that never remarked on it. Three
+        // consecutive reports — six seconds — of the cadence disagreeing with
+        // the latched period by more than 10% is not a hitch.
+        if displayPeriod > 0 && cadenceN >= 30 && abs(periods - 1.0) > 0.10 {
+            cadenceDisagreed += 1
+            if cadenceDisagreed == 3 {
+                NSLog(String(format: "[cp] THE PANEL IS NO LONGER RUNNING AT THE RATE WE "
+                             + "LATCHED. We latched %.2f Hz at boot and told the guest "
+                             + "%.2f Hz; the last six seconds present every %.2f ms, "
+                             + "i.e. %.2f Hz. The guest cannot be re-told — it read its "
+                             + "rate once, at boot — so its pacing is now incoherent with "
+                             + "the panel and motion will judder. Treat any smoothness "
+                             + "verdict from here on as confounded.",
+                             1.0 / displayPeriod, kl_ovrp_display_frequency(),
+                             meanS * 1000, meanS > 0 ? 1.0 / meanS : 0))
+            }
+        } else {
+            cadenceDisagreed = 0
+        }
+        notePanelRate()
+        cadenceN = 0; cadenceSum = 0; cadenceMax = 0; cadenceMin = .infinity
+        cadenceRepeats = 0; missedDeadline = 0
+        anchorWalkedBack = 0; anchorHeld = 0; anchorUnknown = 0
+        return out
+    }
+
+    /// The running panel rate (see cadenceMin): "[cp] display rate N Hz" every ~5 s, and
+    /// "[cp] DISPLAY RATE CHANGED a -> b Hz at HH:mm:ss.SSS" when two half-second windows in a row agree on a new one.
+    private static let rateClock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f }()
+    private func notePanelRate() {
+        guard cadenceN >= 10, cadenceMin.isFinite, cadenceMin > 0 else { return }
+        let raw = 1.0 / cadenceMin
+        let snapped = Self.canonicalHz.min(by: { abs($0 - raw) < abs($1 - raw) }) ?? raw
+        let hz = abs(snapped - raw) / snapped < 0.06 ? snapped : raw
+        let f = Self.rateClock
+        if rateHz == 0 {
+            rateHz = hz
+            NSLog(String(format: "[cp] display rate %.0f Hz (first running measurement, %@)", hz, f.string(from: Date())))
+        } else if abs(hz - rateHz) / rateHz > 0.06 {
+            rateCandidateSeen = abs(hz - rateCandidate) / max(rateCandidate, 1) < 0.06 ? rateCandidateSeen + 1 : 1
+            rateCandidate = hz
+            if rateCandidateSeen >= 2 {
+                NSLog(String(format: "[cp] DISPLAY RATE CHANGED %.0f -> %.0f Hz at %@", rateHz, hz, f.string(from: Date())))
+                rateHz = hz; rateCandidateSeen = 0
+            }
+        } else {
+            rateCandidateSeen = 0
+        }
+        rateWindows += 1
+        if rateWindows % 10 == 0 {
+            NSLog(String(format: "[cp] display rate %.0f Hz (min gap %.2f ms, %@)", rateHz, cadenceMin * 1000, f.string(from: Date())))
+        }
+    }
+
+    /// Harvest what only a drawable can tell us, before the guest exists to
+    /// ask: the per-eye frustum and the display's real frame rate.
+    ///
+    /// An ordering problem. Both numbers can only be read from a `cp_drawable`,
+    /// which arrives once the frame loop is running, but the guest reads both
+    /// ONCE and early — Unity latches the frustum when its VRDevice initializes
+    /// and the display frequency into its VR timing config. Answering correctly
+    /// one frame later answers a question nobody asks again. So a throwaway
+    /// frame is rendered here purely to harvest them, before
+    /// `kl_app_lifecycle_begin()`.
+    ///
+    /// Tangents come from the projection matrix rather than `cp_view_tangents`,
+    /// which visionOS 2.0 deprecated, and the matrix is what the composite pass
+    /// projects with.
+    /// Tell the guest where this display's eyes actually are.
+    ///
+    /// `view.transform` is `device_from_view`, so its translation is the
+    /// head->eye offset in the head's own frame, which is what
+    /// `kl_ovrp_set_eye_offset` wants. Without it nodes 0 and 1 both answer the
+    /// head pose: an IPD of zero, both eyes rendering from the same point, and
+    /// a world with no disparity in it.
+    ///
+    /// Pushed from `primeDisplay` so it is right before the guest's first
+    /// frame, and again each frame because it costs two stores and the user can
+    /// change the fit of the headset mid-run.
+    ///
+    /// Tell the guest how big its eye render targets should be.
+    ///
+    /// Everything else about the synthetic headset describes a Quest 2 on
+    /// purpose — `Build.MODEL`, `ovrp_GetSystemHeadsetType`, the version string
+    /// — because every Oculus branch in the guest is written against one. The
+    /// eye SIZE is different in kind: nothing branches on it, it is just a
+    /// resolution, and the Quest's 2290x2400 is wrong in both axes for the
+    /// display underneath. So it is measured rather than claimed.
+    ///
+    /// Which number: with foveation on, the drawable's colour textures are the
+    /// PHYSICAL size — already reduced — while the rate map's `screenSize`
+    /// is the logical resolution the fovea is rasterized at. The guest should be
+    /// sized against the latter: matching the physical size would throw away
+    /// exactly the resolution `maxRenderQuality` was set to buy. Without a rate
+    /// map there is no distinction and the texture size is the answer.
+    ///
+    /// The clamping lives in `kl_ovrp_set_eye_texture_size`, not here, so a host
+    /// run through `t_mtl_provider` gets the same policy.
+
+    // MARK: - The unwarp grid
+
+    /// Screen -> physical, as `kl_reproject_grid_build` wants it. No captures,
+    /// so it converts to a C function pointer.
+    private static let screenToPhysical: kl_reproject_s2p = { ctx, sx, sy, px, py in
+        guard let ctx,
+              let map = Unmanaged<AnyObject>.fromOpaque(ctx)
+                  .takeUnretainedValue() as? MTLRasterizationRateMap else { return }
+        let p = map.physicalCoordinates(
+            screenCoordinates: MTLSamplePosition(x: sx, y: sy), layer: 0)
+        px?.pointee = p.x
+        py?.pointee = p.y
+    }
+
+    private var gridBuffer: MTLBuffer?
+    /// The grid was built for a Klepton-foveated Vulkan eye (one block per eye; kl_vrr_s2p).
+    private var vrrGrid = false
+    private var gridMap: UnsafeMutableRawPointer?
+    private var gridTexW = -1, gridTexH = -1
+    private var gridVertexCount = 0
+    private var gridViewport: SIMD4<Float> = .zero
+    /// Eye 1's rect, and whether the built grid carries a block for it. Part of
+    /// the cache key: a guest that starts using symmetric projection partway
+    /// through (BONELAB does — the plugin turns it on once the eye textures are
+    /// sized) changes only this one, and a grid keyed on eye 0's alone would
+    /// never be rebuilt.
+    private var gridViewportR: SIMD4<Float> = .zero
+    private var gridPerEye = false
+    private var loggedSplitViewports = false
+    private var loggedReadViewport = false
+    private var loggedViewportOfSkew = false
+
+    /// The reprojection quad's mesh, with texture coordinates that already undo
+    /// the guest's foveation.
+    ///
+    /// Rebuilt only when the rate map or the eye texture's size changes — a rate
+    /// map is static, so the unwarp is resolved once here and the rasterizer
+    /// interpolates it for free, instead of every fragment paying a
+    /// `map_screen_to_physical_coordinates` decode. One cell per ZONE, so the
+    /// grid's vertices land on the map's own piecewise-linear breakpoints and
+    /// the result is exact rather than a sampling of the curve.
+    ///
+    /// Note this is the GUEST's map (kl_glfb_eye_rate_map), which has nothing to
+    /// do with the drawable's own foveation: Compositor Services rasterizes THIS
+    /// pass through its own map, set on the render pass descriptor. Two maps,
+    /// two purposes, deliberately detached.
+    ///
+    /// `viewport` is the guest's render viewport for this frame in eye-texture
+    /// pixels, `.zero` for the whole texture — kl_ovrp_render_pose.viewport,
+    /// taken from the same frame record the uniforms come from. It is part of
+    /// the key: Beat Saber shrinks it on entering a map (the render-viewport
+    /// note in kl_ovrp.h), and a grid built for the previous viewport crops the
+    /// wrong rectangle with nothing anywhere reporting it.
+    /// Returns the grid, the vertex count, and whether it carries a BLOCK PER
+    /// EYE — which it does exactly when the two eyes submitted different rects.
+    private func unwarpGrid(_ source: MTLTexture?,
+                            viewport0: SIMD4<Float>,
+                            viewport1: SIMD4<Float>,
+                            viewportOf: SIMD2<Float>) -> (MTLBuffer?, Int, Bool) {
+        let tw = source?.width ?? 0, th = source?.height ?? 0
+        // A Klepton-foveated Vulkan eye (KL_VRR=1) is unwarped with the map of ITS size: across a fidelity
+        // change the image in hand can still be the previous level's, rasterized through the previous map.
+        let map = kl_vrr_map_for(Int32(tw), Int32(th)) ?? kl_glfb_eye_rate_map()
+        // A viewport that IS the whole texture is not a crop, and keeping it as
+        // .zero means an unscaled title never leaves the pre-existing path.
+        //
+        // **A rect measured against another texture is not a crop, it is a
+        // coincidence.** `viewportOf` is the eye texture size the guest's submit
+        // was relative to (kl_ovrp.h); when it is not the texture in hand, the
+        // rect says nothing about which texels of THIS one were written, and
+        // cropping by it magnifies the picture by the ratio of the two — 1.2x on
+        // device, which reads as a distorted, cross-eyed view rather than as a
+        // cropping bug, because the binocular disparity is magnified with it.
+        // Measured on a headset, 2026-08-12: a 3072x2464 rect against a
+        // 3686x2956 texture, persistently, after Unity's fourth eye layer.
+        //
+        // The cause is fixed in klovrp_SetupLayer. This is the guard, and it is
+        // deliberately NOT a rescale: with the two disagreeing we do not know
+        // which region the guest wrote, and inventing one is how the first
+        // version of this went wrong. Not cropping is the pre-viewport
+        // behaviour — visibly wrong if it ever fires, which is the point.
+        //
+        // Applied to BOTH eyes, and it is one decision for the pair: a texture
+        // the rects do not describe does not describe either of them.
+        func sanitise(_ r: SIMD4<Float>) -> SIMD4<Float> {
+            var vp = r
+            if vp.z > 0, viewportOf.x > 0, viewportOf.y > 0,
+               Int(viewportOf.x) != tw || Int(viewportOf.y) != th {
+                if !loggedViewportOfSkew {
+                    loggedViewportOfSkew = true
+                    NSLog("[cp] the render viewport is \(Int(vp.z))x\(Int(vp.w)) of a "
+                          + "\(Int(viewportOf.x))x\(Int(viewportOf.y)) eye texture, but "
+                          + "the texture in hand is \(tw)x\(th) — NOT cropping, because "
+                          + "that rect describes another texture (kl_ovrp.h viewport_of)")
+                }
+                vp = .zero
+            }
+            if vp.z <= 0 || vp.w <= 0 ||
+                (vp.x == 0 && vp.y == 0 && Int(vp.z) == tw && Int(vp.w) == th) { vp = .zero }
+            return vp
+        }
+        let vp = sanitise(viewport0)
+        let vpR = sanitise(viewport1)
+        // Two blocks only when the eyes really disagree. Equal rects — every
+        // guest measured here before BONELAB's symmetric projection — take the
+        // single-block path unchanged, cache key and all.
+        let perEye = vp != vpR
+        if perEye, !loggedSplitViewports {
+            loggedSplitViewports = true
+            NSLog("[cp] the eyes submitted DIFFERENT render viewports "
+                  + "(\(Int(vp.x)),\(Int(vp.y)) \(Int(vp.z))x\(Int(vp.w)) vs "
+                  + "\(Int(vpR.x)),\(Int(vpR.y)) \(Int(vpR.z))x\(Int(vpR.w))) "
+                  + "— the unwarp grid carries a block per eye")
+        }
+        let cropped = vp.z > 0 && vp.w > 0
+        let croppedR = vpR.z > 0 && vpR.w > 0
+        let eyes: UInt32 = perEye ? 2 : 1
+        if gridBuffer == nil || map != gridMap || tw != gridTexW || th != gridTexH
+            || vp != gridViewport || vpR != gridViewportR {
+            gridMap = map; gridTexW = tw; gridTexH = th
+            vrrGrid = false
+            gridViewport = vp; gridViewportR = vpR
+            var nx: UInt32 = 1, ny: UInt32 = 1
+            if let map, tw > 0, th > 0,
+               let rm = Unmanaged<AnyObject>.fromOpaque(map)
+                   .takeUnretainedValue() as? MTLRasterizationRateMap {
+                var zx: Int32 = 0, zy: Int32 = 0
+                kl_glfb_eye_rate_zones(&zx, &zy)
+                if zx <= 0 || zy <= 0 {
+                    // A map we did not build does not report its zones, but the
+                    // GRANULARITY cell count is recoverable — the trick ALVR's
+                    // DummyMetalRenderer uses to reconstruct a descriptor.
+                    // Uniform in physical rather than screen space, so it is a
+                    // dense sampling of the curve rather than zone-aligned and
+                    // exact; at ~32px granules the residual is under a texel.
+                    let gran = rm.physicalGranularity
+                    let phys = rm.physicalSize(layer: 0)
+                    zx = gran.width  > 0 ? Int32(phys.width  / gran.width)  : 16
+                    zy = gran.height > 0 ? Int32(phys.height / gran.height) : 16
+                }
+                let cap = Int32(KL_REPROJECT_GRID_MAX)
+                nx = UInt32(max(1, min(cap, zx)))
+                ny = UInt32(max(1, min(cap, zy)))
+                // A Vulkan guest foveated by Klepton (KL_VRR=1, kl_gpu_time.m): one map LAYER per eye, each
+                // centred on that eye's optical axis, and the eye image stored top-down. kl_vrr_s2p covers
+                // both, so it takes one block per eye whatever the viewports say.
+                let vrr = kl_vrr_grid_ctx(0, map, Float(th)) != nil
+                let eyesN: UInt32 = vrr ? 2 : eyes
+                vrrGrid = vrr
+                let n = Int(kl_reproject_grid_entries_n(nx, ny, eyesN))
+                var table = [SIMD2<Float>](repeating: .zero, count: n)
+                let scr = rm.screenSize
+                var rects = [[vp.x, vp.y, vp.z, vp.w], [vpR.x, vpR.y, vpR.z, vpR.w]]
+                let croppedEye = [cropped, croppedR]
+                for e in 0..<Int(eyesN) {
+                    let fn: kl_reproject_s2p = vrr ? kl_vrr_s2p : Self.screenToPhysical
+                    let ctx = vrr ? kl_vrr_grid_ctx(Int32(e), map, Float(th)) : map
+                    table.withUnsafeMutableBufferPointer { buf in
+                        rects[e].withUnsafeBufferPointer { r in
+                            kl_reproject_grid_build_eye(buf.baseAddress, UInt32(e), nx, ny,
+                                                        croppedEye[e] ? r.baseAddress : nil,
+                                                        Float(scr.width), Float(scr.height),
+                                                        Float(tw), Float(th),
+                                                        fn, ctx)
+                        }
+                    }
+                }
+                gridBuffer = queue?.device.makeBuffer(bytes: table,
+                                                      length: n * MemoryLayout<SIMD2<Float>>.stride)
+                NSLog("[cp] unwarp grid \(nx)x\(ny)\(perEye ? " x2 eyes" : "") for a "
+                      + "\(tw)x\(th) eye texture "
+                      + "(map screen \(scr.width)x\(scr.height), viewport "
+                      + (cropped ? "\(Int(vp.x)),\(Int(vp.y)) \(Int(vp.z))x\(Int(vp.w))"
+                                 : "whole texture")
+                      + (perEye ? " / \(Int(vpR.x)),\(Int(vpR.y)) "
+                                  + "\(Int(vpR.z))x\(Int(vpR.w))" : "") + ")")
+            } else if cropped || croppedR {
+                // No rate map, and still a crop to do. One cell suffices: with
+                // no map the screen->texture mapping is affine, so the four
+                // corners carry it exactly. THIS is the path a KL_VRR=0 run
+                // takes, and the one the corner-of-the-eye bug lived on — and
+                // the one BONELAB's symmetric projection lands on today.
+                let n = Int(kl_reproject_grid_entries_n(1, 1, eyes))
+                var table = [SIMD2<Float>](repeating: .zero, count: n)
+                var rects = [[vp.x, vp.y, vp.z, vp.w], [vpR.x, vpR.y, vpR.z, vpR.w]]
+                let croppedEye = [cropped, croppedR]
+                for e in 0..<Int(eyes) {
+                    table.withUnsafeMutableBufferPointer { buf in
+                        rects[e].withUnsafeBufferPointer { r in
+                            kl_reproject_grid_build_eye(buf.baseAddress, UInt32(e), 1, 1,
+                                                        croppedEye[e] ? r.baseAddress : nil,
+                                                        Float(tw), Float(th),
+                                                        Float(tw), Float(th), nil, nil)
+                        }
+                    }
+                }
+                gridBuffer = queue?.device.makeBuffer(bytes: table,
+                                                      length: n * MemoryLayout<SIMD2<Float>>.stride)
+                NSLog("[cp] render viewport \(Int(vp.x)),\(Int(vp.y)) "
+                      + "\(Int(vp.z))x\(Int(vp.w))"
+                      + (perEye ? " / \(Int(vpR.x)),\(Int(vpR.y)) "
+                                  + "\(Int(vpR.z))x\(Int(vpR.w))" : "")
+                      + " of a \(tw)x\(th) eye texture — compositing that sub-rect")
+            } else {
+                let n = Int(kl_reproject_grid_entries(1, 1))
+                var table = [SIMD2<Float>](repeating: .zero, count: n)
+                table.withUnsafeMutableBufferPointer { kl_reproject_grid_identity($0.baseAddress) }
+                gridBuffer = queue?.device.makeBuffer(bytes: table,
+                                                      length: n * MemoryLayout<SIMD2<Float>>.stride)
+            }
+            gridVertexCount = Int(kl_reproject_grid_vertices(nx, ny))
+            gridPerEye = perEye || vrrGrid
+        }
+        return (gridBuffer, gridVertexCount, gridPerEye)
+    }
+
+    private func pushEyeTextureSize(_ drawable: LayerRenderer.Drawable) {
+        var w = 0, h = 0
+        var source = "none"
+        if let rm = drawable.rasterizationRateMaps.first {
+            w = Int(rm.screenSize.width); h = Int(rm.screenSize.height)
+            source = "rate map screenSize"
+        } else if let t = drawable.colorTextures.first {
+            w = t.width; h = t.height
+            source = "colour texture"
+        }
+        guard w > 0, h > 0 else {
+            NSLog("[cp] no drawable size to push — the guest keeps its default eye size")
+            return
+        }
+        // The per-view viewport, logged rather than used. In a layered drawable
+        // each view is a whole slice and the viewport is the full texture, so it
+        // says the same thing; in a dedicated one it would not, and this is the
+        // line that would show that before it became a wrong-sized picture.
+        if let vp = drawable.views.first?.textureMap.viewport {
+            NSLog(String(format: "[cp] eye size from %@: %dx%d "
+                                 + "(view[0] viewport %.0fx%.0f, %d colour texture(s))",
+                         source, w, h, vp.width, vp.height, drawable.colorTextures.count))
+        }
+        kl_ovrp_set_eye_texture_size(Int32(w), Int32(h))
+    }
+
+    /// The tracker the pose-at-time callback queries.
+    ///
+    /// Static because kl_ovrp takes a plain C function pointer, which cannot
+    /// capture. Written once during setup and only read afterwards.
+    nonisolated(unsafe) static var headAtTracker: WorldTrackingProvider?
+
+    /// A head pose for an instant, for `kl_ovrp_set_head_at`.
+    ///
+    /// Two things here are defensive rather than obvious, and both come from
+    /// this API's history:
+    ///
+    ///   * **The anchor is re-queried, never cached.** Device anchors have
+    ///     carried hidden state, so an anchor object held across a frame is
+    ///     not reliably the pose it was fetched for. Every call fetches.
+    ///   * **The timestamp is walked back.** The tracker returns nil for an
+    ///     instant it will not predict to, and how far ahead that is is not
+    ///     documented and not fixed. Stepping back 5 ms at a time finds the
+    ///     edge instead of guessing where it is; the interval is already
+    ///     capped at 50 ms by the caller, so this walks at most that far.
+    ///
+    /// Returning 0 leaves the guest with the current pose, which is what it
+    /// had before this existed — strictly better than inventing one.
+    nonisolated(unsafe) static let headAt: @convention(c)
+        (Double, UnsafeMutablePointer<Float>?) -> Int32 = { time, out in
+        guard let out, let tracker = KleptonCompositor.headAtTracker else { return 0 }
+        var t = time
+        var anchor = tracker.queryDeviceAnchor(atTimestamp: t)
+        var steps = 0
+        while anchor == nil && steps < 10 {
+            t -= 0.005
+            anchor = tracker.queryDeviceAnchor(atTimestamp: t)
+            steps += 1
+        }
+        guard let a = anchor else { return 0 }
+        let (p, q) = KleptonCompositor.decompose(a.originFromAnchorTransform)
+        // Head space, matching every other pose this file publishes.
+        let m = KleptonCompositor.headFrom(a.originFromAnchorTransform,
+                                           midpoint: KleptonCompositor.headAtMidpoint)
+        let (hp, hq) = KleptonCompositor.decompose(m)
+        _ = p; _ = q
+        out[0] = hq.imag.x; out[1] = hq.imag.y; out[2] = hq.imag.z; out[3] = hq.real
+        out[4] = hp.x;      out[5] = hp.y;      out[6] = hp.z
+        return 1
+    }
+
+    /// The midpoint the callback uses — the instance's, copied out so a C
+    /// function pointer can reach it.
+    nonisolated(unsafe) static var headAtMidpoint = SIMD3<Float>(0, 0, 0)
+    nonisolated(unsafe) static var loggedEyeMidpoint = false
+
+    /// The eye midpoint in the device anchor's frame — the offset between what
+    /// visionOS calls the device and what OpenXR calls VIEW.
+    ///
+    /// Zero until `pushEyeOffsets` has seen a drawable, and zero forever if
+    /// `KL_HEAD_MIDPOINT=0`; both helpers below are the identity at zero, so
+    /// the knob and the not-yet-measured case are one code path.
+    private var eyeMidpointInDevice = SIMD3<Float>(0, 0, 0)
+
+    /// `origin_from_head` from `origin_from_device`.
+    private static func headFrom(_ originFromDevice: simd_float4x4,
+                                 midpoint m: SIMD3<Float>) -> simd_float4x4 {
+        if m == SIMD3<Float>(0, 0, 0) { return originFromDevice }
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4<Float>(m.x, m.y, m.z, 1)
+        return originFromDevice * t
+    }
+
+    /// `head_from_view` from `device_from_view` — the drawable's own per-eye
+    /// transform, restated about the midpoint so the whole composite chain is
+    /// in one space.
+    private static func headFromView(_ deviceFromView: simd_float4x4,
+                                     midpoint m: SIMD3<Float>) -> simd_float4x4 {
+        if m == SIMD3<Float>(0, 0, 0) { return deviceFromView }
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4<Float>(-m.x, -m.y, -m.z, 1)
+        return t * deviceFromView
+    }
+
+    private func pushEyeOffsets(_ drawable: LayerRenderer.Drawable) {
+        // Latched, not re-read per frame. A streaming guest sends its eye
+        // transform to the host ONCE and the host will not revise it, so the
+        // number the guest was given has to stay the number it was given; the
+        // display side is free to move underneath it, and bridging the two is
+        // the composite's job rather than something to hide by re-pushing.
+        if ProcessInfo.processInfo.environment["KL_HEAD_MIDPOINT"] != "0",
+           drawable.views.count >= 2 {
+            let a = drawable.views[0].transform.columns.3
+            let b = drawable.views[1].transform.columns.3
+            eyeMidpointInDevice = SIMD3<Float>((a.x + b.x) * 0.5,
+                                               (a.y + b.y) * 0.5,
+                                               (a.z + b.z) * 0.5)
+            Self.headAtMidpoint = eyeMidpointInDevice
+            // Once, not per frame: this fires on every drawable and the value is
+            // ~constant, so an unconditional NSLog is thousands of writes/sec on
+            // the render thread — a frame-pacing / watchdog hazard.
+            if !Self.loggedEyeMidpoint {
+                Self.loggedEyeMidpoint = true
+                NSLog(String(format: "[cp] eye midpoint (%.4f, %.4f, %.4f) m from the "
+                                     + "device anchor — head space is this, not the anchor "
+                                     + "(KL_HEAD_MIDPOINT=0 restores the anchor)",
+                             eyeMidpointInDevice.x, eyeMidpointInDevice.y,
+                             eyeMidpointInDevice.z))
+            }
+        }
+        for (i, view) in drawable.views.enumerated() where i < 2 {
+            // Relative to the eye MIDPOINT, because that is what the guest
+            // calls its head. The drawable states these about the device
+            // anchor.
+            let t = view.transform.columns.3 - SIMD4<Float>(eyeMidpointInDevice.x,
+                                                            eyeMidpointInDevice.y,
+                                                            eyeMidpointInDevice.z, 0)
+            kl_ovrp_set_eye_offset(Int32(i), t.x, t.y, t.z)
+            // ...and the eye's ROTATION, which this loop used to discard.
+            //
+            // These displays are canted, so device_from_view is not a pure
+            // translation — and the tangents pushed by primeDisplay come from
+            // computeProjection, i.e. they are expressed in the *canted* frame.
+            // Sending the shape without the direction told the guest to render
+            // the right cone aimed straight ahead, and the composite then
+            // viewed that picture through the real canted eye. The residual is
+            // a per-eye rotation, equal and opposite between the two, which is
+            // seen as a doubled image rather than as a blurred one.
+            let q = simd_quatf(view.transform)
+            kl_ovrp_set_eye_rotation(Int32(i), q.imag.x, q.imag.y, q.imag.z, q.real)
+            if !loggedEyeOffsets && i == drawable.views.count - 1 {
+                loggedEyeOffsets = true
+                // Both eyes in the SAME space — the midpoint-relative one that
+                // is actually pushed. Printing view[0]'s raw column beside
+                // view[1]'s corrected one made the two eyes look wildly
+                // asymmetric (2.6 cm apart vertically, 3.4 cm in depth) when
+                // the pushed values are symmetric to a tenth of a millimetre,
+                // and that read as a geometry fault for as long as it took to
+                // subtract the midpoint by hand.
+                let l = drawable.views[0].transform.columns.3
+                    - SIMD4<Float>(eyeMidpointInDevice.x, eyeMidpointInDevice.y,
+                                   eyeMidpointInDevice.z, 0)
+                NSLog(String(format: "[cp] eye offsets from the midpoint: "
+                             + "L (%.4f, %.4f, %.4f) R (%.4f, %.4f, %.4f) "
+                             + "— IPD %.1f mm",
+                             l.x, l.y, l.z, t.x, t.y, t.z,
+                             abs(t.x - l.x) * 1000))
+                // The half of view.transform the guest is NOT told about.
+                //
+                // We push the translation above, and the frustum tangents
+                // separately — but nodes 0/1 report the HEAD's orientation, so
+                // if these transforms are also rotated (canted displays), the
+                // guest renders without that rotation while the composite
+                // places the picture with it. Equal and opposite in the two
+                // eyes, which is the error shape that reads as doubling rather
+                // than as blur. Measured, not assumed: if these are ~0 the
+                // whole concern is void, and if they are degrees then
+                // KL_REPROJECT_NOCANT=1 is the A/B.
+                for (i, v) in drawable.views.enumerated() where i < 2 {
+                    let q = simd_quatf(v.transform)
+                    let deg = q.angle * 180 / .pi
+                    // The axis of a near-identity rotation is numerically
+                    // meaningless (and may be NaN), so it is only worth
+                    // printing once there is an angle to have an axis about.
+                    if deg.isFinite && deg > 0.01 {
+                        NSLog(String(format: "[cp] eye %d view rotation: %.3f deg "
+                                     + "about (%.3f, %.3f, %.3f) — the guest is "
+                                     + "NOT told this; KL_REPROJECT_NOCANT=1 drops it",
+                                     i, deg, q.axis.x, q.axis.y, q.axis.z))
+                    } else {
+                        NSLog("[cp] eye \(i) view rotation: none (pure translation)")
+                    }
+                }
+            }
+        }
+    }
+    private var loggedEyeOffsets = false
+
+    /// Ask for the resolution the configuration already paid for.
+    ///
+    /// `maxRenderQuality` is a **ceiling on memory**: it decides how large the
+    /// drawable textures are allocated. The quality actually rendered at is a
+    /// separate, runtime setting on the layer, and it starts at the device's
+    /// default — so setting only the ceiling allocates the big textures and
+    /// then draws into a fraction of them, which costs the memory and buys
+    /// nothing. Both have to be set, and this is the second one.
+    ///
+    /// The system ramps between qualities over a short period rather than
+    /// switching, which is why a frame can carry more than one drawable — see
+    /// queryDrawables in renderFrame.
+    /// KL_CP_FRAME_REPEAT=N sets the layer's minimumFrameRepeatCount: every frame is shown N+1 times.
+    /// It is the one frame-rate lever Compositor Services has (no panel-rate request exists); the
+    /// resulting rate shows in the "display rate SETTLED" and cadence lines.
+    private func applyFrameRepeat() {
+        if let e = getenv("KL_CP_FRAME_REPEAT"), let n = Int32(String(cString: e)) {
+            layerRenderer.minimumFrameRepeatCount = n
+            NSLog("[cp] minimumFrameRepeatCount set to \(n) (KL_CP_FRAME_REPEAT), reads back "
+                  + "\(layerRenderer.minimumFrameRepeatCount)")
+        } else {
+            NSLog("[cp] minimumFrameRepeatCount \(layerRenderer.minimumFrameRepeatCount) (default)")
+        }
+    }
+
+    /// Thermal state and Low Power Mode, at start and on every change: visionOS lowers the panel rate
+    /// mid-session (120 -> 60 Hz seen on the M5 unit), and heat is the first suspect.
+    private var powerObservers: [NSObjectProtocol] = []
+    private func logPowerState(_ why: String) {
+        let pi = ProcessInfo.processInfo
+        NSLog("[cp] power (\(why)): thermal \(Self.thermalName(pi.thermalState)), low power \(pi.isLowPowerModeEnabled)")
+        if powerObservers.isEmpty {
+            let nc = NotificationCenter.default
+            powerObservers.append(nc.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification,
+                                                 object: nil, queue: nil) { [weak self] _ in
+                self?.logPowerState("thermal changed")
+            })
+            powerObservers.append(nc.addObserver(forName: .NSProcessInfoPowerStateDidChange,
+                                                 object: nil, queue: nil) { [weak self] _ in
+                self?.logPowerState("power state changed")
+            })
+        }
+    }
+    static func thermalName(_ t: ProcessInfo.ThermalState) -> String {
+        switch t {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown(\(t.rawValue))"
+        }
+    }
+
+    private func applyRenderQuality() {
+        let want = KleptonStageConfiguration.requestedQuality
+        // On whether the ceiling was CONFIGURED, not on whether it was wanted.
+        // The knob can be on and the ceiling still absent — the simulator
+        // supports no foveation — and setting the running quality then aborts
+        // the process inside Compositor Services. See `ceilingConfigured`.
+        guard KleptonStageConfiguration.ceilingConfigured else {
+            NSLog("[cp] render quality left at \(layerRenderer.renderQuality) "
+                  + "(no maxRenderQuality ceiling was configured)")
+            return
+        }
+        let before = layerRenderer.renderQuality
+        layerRenderer.renderQuality = .init(want)
+        NSLog("[cp] render quality \(before) -> \(layerRenderer.renderQuality) "
+              + "(asked \(want), ceiling \(layerRenderer.configuration.maxRenderQuality))")
+    }
+
+    private func primeDisplay() {
+        var stamps: [TimeInterval] = []
+        var tangents: [SIMD4<Float>] = []
+
+        // The settle run: a stretch of presentations that all agree on one
+        // period. `runUnits` is how many PANEL SLOTS the run spans (a held
+        // frame contributes 2). The span/slots mean is the run's own coarse
+        // reference for deciding membership; the LATCHED value is the median of
+        // the per-slot gaps, for the reason set out beside the knobs above.
+        var runStart:  TimeInterval = 0
+        var runEnd:    TimeInterval = 0
+        var runUnits   = 0.0
+        var runGaps    = 0
+        var runUnitGaps: [TimeInterval] = []
+        // ...and what was thrown away getting there, which is the interesting
+        // half of the report: it is the rate a fixed-length measurement would
+        // have latched instead.
+        var deadSpan:  TimeInterval = 0
+        var deadUnits  = 0.0
+        var deadGaps   = 0
+        var latched:   TimeInterval = 0
+        var latchedMean: TimeInterval = 0
+        var latchedGaps = 0
+        var latchedMs  = 0.0
+        let clockNow: () -> TimeInterval = {
+            LayerRenderer.Clock.Instant.epoch
+                .duration(to: LayerRenderer.Clock().now).timeInterval
+        }
+        let t0 = clockNow()
+
+        while true {
+            if hzSettle {
+                if latched > 0 { break }
+                if (clockNow() - t0) * 1000 >= hzSettleTimeoutMs { break }
+            } else if stamps.count >= 8 {
+                // Eight frames: enough for a median frame interval that a slow
+                // first frame cannot drag, and under 100 ms of startup. This is
+                // the pre-settle behaviour, kept byte-for-byte behind
+                // KL_HZ_SETTLE=0 so the gate has a one-launch A/B.
+                break
+            }
+            guard layerRenderer.state == .running,
+                  let frame = layerRenderer.queryNextFrame() else { break }
+            frame.startUpdate()
+            frame.endUpdate()
+            let timing = frame.predictTiming()
+            if let timing { LayerRenderer.Clock().wait(until: timing.optimalInputTime) }
+            // Drawable first, THEN startSubmission — the documented order, and
+            // the same correction as renderFrame(). These are the layer's first
+            // frames, so getting the sequence wrong here is not a local
+            // matter: it is the state the whole session starts from.
+            let all = frame.queryDrawables()
+            guard let drawable = all.first else { continue }
+            frame.startSubmission()
+            let stamp = LayerRenderer.Clock.Instant.epoch
+                .duration(to: drawable.frameTiming.presentationTime).timeInterval
+            let prev = stamps.last ?? 0
+            stamps.append(stamp)
+            if hzSettle, prev > 0, stamp - prev > 0 {
+                let gap = stamp - prev
+                let ref = runUnits > 0 ? (runEnd - runStart) / runUnits : 0
+                // How many slots this gap spans, if it belongs to the run at
+                // all. Held frames (2x, 3x) are the same rate; anything else
+                // is a different cadence and starts the run over.
+                let mult = ref > 0 ? (gap / ref).rounded() : 0
+                let belongs = ref > 0 && mult >= 1 && mult <= 3
+                    && abs(gap / mult - ref) <= hzSettleTol * ref
+                if belongs {
+                    runEnd = stamp
+                    runUnits += mult
+                    runGaps += 1
+                    runUnitGaps.append(gap / mult)
+                } else {
+                    if runGaps > 0 {
+                        deadSpan  += runEnd - runStart
+                        deadUnits += runUnits
+                        deadGaps  += runGaps
+                    }
+                    runStart = prev
+                    runEnd   = stamp
+                    runUnits = 1
+                    runGaps  = 1
+                    runUnitGaps = [gap]
+                }
+                if (runEnd - runStart) * 1000 >= hzSettleMs
+                    && runGaps >= hzSettleMinGaps && !runUnitGaps.isEmpty {
+                    let sorted = runUnitGaps.sorted()
+                    latched     = sorted[sorted.count / 2]
+                    latchedMean = (runEnd - runStart) / runUnits
+                    latchedGaps = runGaps
+                    latchedMs   = (runEnd - runStart) * 1000
+                }
+            }
+            if tangents.isEmpty {
+                tangents = (0..<drawable.views.count).map {
+                    kl_reproject_tangents(drawable.computeProjection(viewIndex: $0))
+                }
+                pushEyeOffsets(drawable)
+                // Before the guest boots, so it allocates the right swapchain
+                // once instead of rebuilding when the size changes under it —
+                // and each of those rebuilds used to leak a whole generation
+                //.
+                pushEyeTextureSize(drawable)
+                // Also before the guest boots, and for a stricter reason: the
+                // eye-texture provider builds the guest's own rate map from
+                // this curve, and it must be in force before the first render
+                // pass into an eye texture.
+                captureDisplayFoveation(drawable)
+            }
+            // Every drawable the frame carries, not just the one measured from:
+            // a frame that leaves one unpresented is a frame half-written.
+            for d in all { clearAndPresent(d) }
+            // Only after a drawable was actually presented: ending a
+            // submission on the no-drawable path is an abort.
+            frame.endSubmission()
+        }
+
+        for (i, t) in tangents.enumerated() where i < 2 {
+            NSLog(String(format: "[cp] eye %d display tangents l=%.4f r=%.4f t=%.4f b=%.4f "
+                                 + "(%.1f x %.1f degrees)", i, t.x, t.y, t.z, t.w,
+                         (atan(t.x) + atan(t.y)) * 180 / .pi,
+                         (atan(t.z) + atan(t.w)) * 180 / .pi))
+            kl_ovrp_set_eye_frustum(Int32(i), t.x, t.y, t.z, t.w)
+        }
+
+        // The frame interval, as the median of the gaps between successive
+        // presentation times. Median rather than mean because the first frames
+        // of a freshly-started layer are not representative and one of them is
+        // enough to move an average by several Hz.
+        let gaps = zip(stamps.dropFirst(), stamps).map(-).filter { $0 > 0 }.sorted()
+        let median: TimeInterval? = gaps.isEmpty ? nil : gaps[gaps.count / 2]
+
+        // What the settle gate decided, and — the part that matters when a
+        // session goes wrong — what it REFUSED. Discarded frames suggesting
+        // 120 Hz in front of a latch at 90 is the whole race, printed.
+        var chosen = median
+        var chosenGaps = gaps.count
+        if hzSettle {
+            let deadHz = deadUnits > 0 ? 1.0 / (deadSpan / deadUnits) : 0
+            if latched > 0 {
+                chosen = latched
+                chosenGaps = latchedGaps
+                let rawHz = 1.0 / latched
+                var snapHz = rawHz
+                for c in Self.canonicalHz where abs(rawHz - c) <= hzSnapTol * c {
+                    snapHz = c
+                    break
+                }
+                if snapHz != rawHz { chosen = 1.0 / snapHz }
+                NSLog(String(format: "[cp] display rate SETTLED at %.3f Hz after %.0f ms "
+                             + "of steady cadence (%d intervals in the settled run, "
+                             + "median of one-slot gaps; their mean says %.3f Hz); "
+                             + "%d pre-settle interval(s) discarded%@%@",
+                             rawHz, latchedMs, latchedGaps,
+                             latchedMean > 0 ? 1.0 / latchedMean : 0, deadGaps,
+                             deadHz > 0 ? String(format: ", and they suggested %.2f Hz",
+                                                 deadHz) : "",
+                             snapHz != rawHz
+                                ? String(format: " — SNAPPED to the panel's %.2f Hz "
+                                         + "(within %.1f%%)", snapHz, hzSnapTol * 100)
+                                : " — no canonical rate within "
+                                  + String(format: "%.1f%%, keeping the measurement",
+                                           hzSnapTol * 100)))
+            } else {
+                NSLog(String(format: "[cp] THE DISPLAY RATE NEVER SETTLED — %.0f ms went by "
+                             + "without %.0f ms of cadence agreeing with itself to within "
+                             + "%.0f%%, so the guest is being paced off the median of all "
+                             + "%d interval(s) instead. Treat any smoothness verdict from "
+                             + "this session as confounded.",
+                             hzSettleTimeoutMs, hzSettleMs, hzSettleTol * 100, gaps.count))
+            }
+        }
+        if let mid = chosen, mid > 0 {
+            displayPeriod = mid          // what the cadence check measures against
+            let hz = Float(1.0 / mid)
+            NSLog(String(format: "[cp] display %.2f Hz measured over %d frames",
+                         hz, chosenGaps))
+            kl_ovrp_set_display_frequency(hz)
+        } else {
+            NSLog("[cp] could not measure the display rate — the guest keeps "
+                  + "\(kl_ovrp_display_frequency()) Hz")
+        }
+        NSLog(String(format: "[cp] guest will be told %.2f Hz",
+                     kl_ovrp_display_frequency()))
+    }
+
+    /// A drawable with nothing in it. The priming frames are shown to the user,
+    /// so they have to be *something*; an unwritten drawable is whatever was in
+    /// that texture last.
+    private func clearAndPresent(_ drawable: LayerRenderer.Drawable) {
+        guard let cmd = queue?.makeCommandBuffer() else { return }
+        for view in drawable.views {
+            let map = view.textureMap
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture     = drawable.colorTextures[map.textureIndex]
+            pass.colorAttachments[0].slice       = map.sliceIndex
+            pass.colorAttachments[0].loadAction  = .clear
+            pass.colorAttachments[0].storeAction = .store
+            pass.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, Lifecycle.firstPicture ? 1 : 0)
+            cmd.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+        }
+        drawable.encodePresent(commandBuffer: cmd)
+        cmd.commit()
+    }
+
+    /// The measurement that says whether any of this is doing anything.
+    ///
+    /// `delta` is how far the head turned between the pose the picture was
+    /// rendered with and the pose it is being displayed at — zero means the
+    /// guest is keeping up and the pass is a blit, and a growing value with
+    /// `stale` frames behind it means pictures are being reused, which is
+    /// reprojection earning its place rather than a fault.
+    /// Worst pose age seen since the last line, in milliseconds.
+    private var worstAgeMs: Double = 0
+
+    private func noteReprojection(rendered: kl_ovrp_render_pose?,
+                                  originFromHead: simd_float4x4, stage: Int) {
+        reprojectFrames += 1
+        var delta: Float = 0
+        if var r = rendered {
+            delta = withUnsafePointer(to: &r) {
+                kl_reproject_delta_degrees($0, originFromHead)
+            }
+        }
+        worstDelta = max(worstDelta, delta)
+        // How OLD the pose being corrected against is. An angle on its own
+        // cannot separate a fast head from a stale pose — it is the product of
+        // the two — and those want opposite fixes. One displayed frame at
+        // 120 Hz is 8.3 ms; tens of milliseconds means the record is not this
+        // frame's and the correction is aimed at the wrong instant.
+        var ageMs: Double = 0
+        if let sub = rendered?.submit_ns, sub != 0 {
+            var ts = timespec()
+            clock_gettime(CLOCK_MONOTONIC, &ts)
+            let now = UInt64(ts.tv_sec) * 1_000_000_000 + UInt64(ts.tv_nsec)
+            if now > sub { ageMs = Double(now - sub) / 1_000_000 }
+        }
+        worstAgeMs = max(worstAgeMs, ageMs)
+        guard reprojectFrames % 90 == 0 else { return }
+        NSLog(String(format: "[cp] timewarp: stage %d serial %llu, delta %.2f deg "
+                             + "(worst %.2f), pose age %.1f ms (worst %.1f), "
+                             + "%d stale in a row",
+                     stage, rendered?.serial ?? 0, delta, worstDelta,
+                     ageMs, worstAgeMs, staleInARow))
+        worstDelta = 0
+        worstAgeMs = 0
+    }
+}
+
+
+/// Plays one of AC Nexus's loading mp4s (HEVC) and hands the compositor the
+/// current frame as an MTLTexture. This is the visionOS stand-in for the Android
+/// MediaPlayer the game drives its OVROverlay video background with: there is no
+/// Android Surface here, so the host decodes the same file itself and the
+/// compositor draws it as the equirect skybox. Looping, muted (the guest owns
+/// audio), and single-item so the video output stays attached across loops.
+final class LoadingVideoPlayer {
+    private let url: URL
+    private var player: AVPlayer?
+    private var output: AVPlayerItemVideoOutput?
+    private var cache: CVMetalTextureCache?
+    // Held so the CVPixelBuffer behind `current` stays alive while the GPU
+    // samples it; replaced, not accumulated, each new frame.
+    private var retained: CVMetalTexture?
+    private var current: MTLTexture?
+    private var endObserver: NSObjectProtocol?
+
+    init?(device: MTLDevice, url: URL) {
+        self.url = url
+        var c: CVMetalTextureCache?
+        guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &c)
+                == kCVReturnSuccess, let c else { return nil }
+        self.cache = c
+    }
+
+    func start() {
+        guard player == nil else { return }
+        let item = AVPlayerItem(url: url)
+        let attrs: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+        ]
+        let out = AVPlayerItemVideoOutput(outputSettings: attrs)
+        item.add(out)
+        output = out
+        let p = AVPlayer(playerItem: item)
+        p.isMuted = true
+        p.actionAtItemEnd = .none
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak p] _ in
+            p?.seek(to: .zero)
+            p?.play()
+        }
+        player = p
+        p.play()
+    }
+
+    /// The newest decoded frame, or the last one if none is ready this vsync.
+    func latestTexture() -> MTLTexture? {
+        guard let output, let cache else { return current }
+        let host = CACurrentMediaTime()
+        let t = output.itemTime(forHostTime: host)
+        guard t.isValid, output.hasNewPixelBuffer(forItemTime: t),
+              let pb = output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil) else {
+            return current
+        }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        var cvtex: CVMetalTexture?
+        let r = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, cache, pb, nil, .bgra8Unorm, w, h, 0, &cvtex)
+        if r == kCVReturnSuccess, let cvtex, let mtl = CVMetalTextureGetTexture(cvtex) {
+            retained = cvtex
+            current = mtl
+        }
+        return current
+    }
+
+    func stop() {
+        player?.pause()
+        player = nil
+        output = nil
+        current = nil
+        retained = nil
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        endObserver = nil
+        if let cache { CVMetalTextureCacheFlush(cache, 0) }
+    }
+}
+
+// MARK: - Eye video (KL_CP_VIDEO)
+
+/// KL_CP_VIDEO=1: short H.264 clips of the LEFT eye as the headset got it, so a run brings back moving pictures.
+/// Source, decided at the first frame and logged ("[cp] eye video source: ..."):
+///   - composite: our composite's output. After the composite passes, slice/view 0 of the drawable's colour texture
+///     is blitted (it is stored foveated, at the physical size) into a texture of ours, and the downscale undoes the
+///     system's foveation per pixel with the drawable's own rate map (rasterization_rate_map_decoder), so the clip is
+///     what our composite drew: reprojection, our unwarp and all, before the lens. Needs a blittable drawable.
+///   - eye: the eye image the composite samples (before reprojection; with KL_VRR=1 the foveated physical image),
+///     when the drawable cannot be read (framebuffer-only or memoryless).
+/// One clip of KL_CP_VIDEO_SECS (10) s at the first frame, one every KL_CP_VIDEO_EVERY (60) s and one from each change
+/// of the eye image's size (a fidelity level change). 960 wide, a 4-tap box filter on the GPU, the hardware encoder at
+/// 2.5 Mbit/s, at most 30 fps and only new guest frames, into Documents/captures/vid_tNNNN_<why>_<w>x<h>.mp4.
+/// At most KL_CP_VIDEO_MAX (24) clips (~75 MB).
+final class KLEyeRecorder {
+    private let device: MTLDevice
+    private let eyePipeline: MTLRenderPipelineState
+    private let compPipeline: MTLRenderPipelineState?
+    private let sampler: MTLSamplerState
+    private var cache: CVMetalTextureCache?
+    private let io = DispatchQueue(label: "kl.eyevideo")
+    private let secs: Double, every: Double, maxClips: Int
+    private let outW = 960
+    private var writer: AVAssetWriter?
+    private var input: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var clipStart = 0.0, t0 = 0.0, nextPeriodic = 0.0, lastAppend = 0.0
+    private var lastSerial: UInt64 = .max
+    private var lastW = 0, lastH = 0, clips = 0
+    private var name = ""
+    private var starting = false
+    private var pending: (AVAssetWriter?, AVAssetWriterInput?, AVAssetWriterInputPixelBufferAdaptor?, Double)?
+    private let pendLock = NSLock()
+    private var flushN = 0
+    private var stats = (frames: 0, skipped: 0, gpu: 0.0, gpuN: 0)
+    private let statLock = NSLock()
+    private var eyeTex: MTLTexture?
+    private var eyeSerial: UInt64 = 0
+    private var source = 0          // 0 undecided, 1 composite output, 2 eye image
+    private var copyTex: MTLTexture?
+    private var mapBuf: MTLBuffer?
+    /// KL_CP_STILLS="60,180": at those seconds after the first eye frame, two 1:1 PNG crops (768x768) around the view's
+    /// centre (KL_CP_STILL_CENTRE, fractions of the image, default 0.634,0.457 = the optical axis of the left eye's
+    /// asymmetric frustum): still_tNNNN_eye.png from the eye image the composite samples, and still_tNNNN_drawable.png
+    /// from our composite's output at the drawable's own resolution with the system's foveation undone. The video's
+    /// 960-wide clips cannot show pixel-level blockiness; these can.
+    private let stillTimes: [Double] = (ProcessInfo.processInfo.environment["KL_CP_STILLS"] ?? "")
+        .split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }.sorted()
+    private var stillNext = 0
+    private let stillCentre: (Double, Double) = {
+        let v = (ProcessInfo.processInfo.environment["KL_CP_STILL_CENTRE"] ?? "").split(separator: ",").compactMap { Double($0) }
+        return v.count == 2 ? (v[0], v[1]) : (0.634, 0.457)
+    }()
+
+    static func fromEnvironment(device: MTLDevice) -> KLEyeRecorder? {
+        let env = ProcessInfo.processInfo.environment
+        guard env["KL_CP_VIDEO"] == "1" || !(env["KL_CP_STILLS"] ?? "").isEmpty else { return nil }
+        let r = KLEyeRecorder(device: device, secs: Double(env["KL_CP_VIDEO_SECS"] ?? "") ?? 10,
+                              every: Double(env["KL_CP_VIDEO_EVERY"] ?? "") ?? 60,
+                              maxClips: env["KL_CP_VIDEO"] == "1" ? (Int(env["KL_CP_VIDEO_MAX"] ?? "") ?? 24) : 0,
+                              forceEye: env["KL_CP_VIDEO_SOURCE"] == "eye")
+        if r == nil { NSLog("[cp] eye video: could not set up (KL_CP_VIDEO ignored)") }
+        return r
+    }
+
+    init?(device: MTLDevice, secs: Double, every: Double, maxClips: Int, forceEye: Bool = false) {
+        self.device = device; self.secs = secs; self.every = every; self.maxClips = maxClips
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct V { float4 p [[position]]; float2 uv; };
+        vertex V klrec_v(uint vid [[vertex_id]]) {
+            float2 p = float2((vid << 1) & 2, vid & 2);
+            V o; o.p = float4(p * 2.0 - 1.0, 0.0, 1.0); o.uv = float2(p.x, 1.0 - p.y); return o;
+        }
+        // The eye image: a plain 4-tap box downscale.
+        fragment float4 klrec_f(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],
+                                constant float2 &d [[buffer(0)]]) {
+            float3 c = t.sample(s, in.uv + float2(-d.x, -d.y)).rgb + t.sample(s, in.uv + float2(d.x, -d.y)).rgb
+                     + t.sample(s, in.uv + float2(-d.x, d.y)).rgb + t.sample(s, in.uv + float2(d.x, d.y)).rgb;
+            return float4(c * 0.25, 1.0);
+        }
+        // The composite's output: a copy of one foveated (physical) slice. Each tap is a point on the view's
+        // screen (logical) viewport, mapped to the physical texture by the drawable's own rate map.
+        struct KLRecComp { float4 viewport; float2 physInv; float2 d; uint layer; uint hasMap; };
+        fragment float4 klrec_fc(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],
+                                 constant KLRecComp &p [[buffer(0)]], constant rasterization_rate_map_data &rm [[buffer(1)]]) {
+            float3 c = 0.0;
+            for (int i = 0; i < 4; i++) {
+                float2 uv = in.uv + float2((i & 1) ? p.d.x : -p.d.x, (i & 2) ? p.d.y : -p.d.y);
+                float2 sp = p.viewport.xy + uv * p.viewport.zw;
+                float2 pp = sp;
+                if (p.hasMap != 0) {
+                    rasterization_rate_map_decoder dec(rm);
+                    pp = dec.map_screen_to_physical_coordinates(sp, p.layer);
+                }
+                c += t.sample(s, pp * p.physInv).rgb;
+            }
+            return float4(c * 0.25, 1.0);
+        }
+        """
+        guard let lib = try? device.makeLibrary(source: src, options: nil) else { return nil }
+        let pd = MTLRenderPipelineDescriptor()
+        pd.vertexFunction = lib.makeFunction(name: "klrec_v")
+        pd.fragmentFunction = lib.makeFunction(name: "klrec_f")
+        pd.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
+        guard let ps = try? device.makeRenderPipelineState(descriptor: pd) else { return nil }
+        eyePipeline = ps
+        pd.fragmentFunction = lib.makeFunction(name: "klrec_fc")
+        compPipeline = forceEye ? nil : try? device.makeRenderPipelineState(descriptor: pd)
+        let sd = MTLSamplerDescriptor()
+        sd.minFilter = .linear; sd.magFilter = .linear
+        sd.sAddressMode = .clampToEdge; sd.tAddressMode = .clampToEdge
+        guard let smp = device.makeSamplerState(descriptor: sd) else { return nil }
+        sampler = smp
+        guard CVMetalTextureCacheCreate(nil, nil, device, nil, &cache) == kCVReturnSuccess else { return nil }
+        NSLog("[cp] eye video on: \(Int(secs)) s at the first frame, every \(Int(every)) s and at each eye size change; "
+              + "at most \(maxClips) clips, 960 wide, H.264 2.5 Mbit/s, <= 30 fps")
+    }
+
+    /// From the composite, every display frame: the left eye image in hand and the guest's frame serial.
+    func noteEye(_ tex: MTLTexture, serial: UInt64) { eyeTex = tex; eyeSerial = serial }
+
+    /// After the composite passes are encoded into `cmd`, before present. `src` is the colour texture view 0 was
+    /// drawn into (`slice` of it), `viewport` that view's viewport in screen coordinates, `map` the drawable's rate
+    /// map (nil when not foveated).
+    func afterComposite(src: MTLTexture, slice: Int, viewport: MTLViewport, map: MTLRasterizationRateMap?,
+                        cmd: MTLCommandBuffer, queue: MTLCommandQueue) {
+        guard let eye = eyeTex else { return }
+        if stillNext < stillTimes.count, t0 > 0, CACurrentMediaTime() - t0 >= stillTimes[stillNext] {
+            let t = Int(stillTimes[stillNext]); stillNext += 1
+            takeStills(t: t, eye: eye, src: src, slice: slice, viewport: viewport, map: map, cmd: cmd)
+        }
+        if source == 0 {
+            let readable = !src.isFramebufferOnly && src.storageMode != .memoryless && compPipeline != nil
+            source = readable ? 1 : 2
+            NSLog("[cp] eye video source: \(readable ? "composite output" : "eye image") (drawable colour \(src.width)x\(src.height) "
+                  + "fmt \(src.pixelFormat.rawValue) type \(src.textureType.rawValue) framebufferOnly \(src.isFramebufferOnly) "
+                  + "storage \(src.storageMode.rawValue) usage \(src.usage.rawValue); rate map \(map.map { "\($0.screenSize.width)x\($0.screenSize.height), \($0.layerCount) layer(s)" } ?? "none"))")
+        }
+        // The clip's shape: the view's (composite output) or the eye image's.
+        let aspect = source == 1 && viewport.width > 0 ? viewport.height / viewport.width : Double(eye.height) / Double(max(1, eye.width))
+        guard let (pb, ct, dst) = begin(levelW: eye.width, levelH: eye.height, serial: eyeSerial, aspect: aspect) else { return }
+        if source == 1 {
+            guard encodeComposite(src: src, slice: slice, viewport: viewport, map: map, dst: dst, cmd: cmd) else {
+                stats.skipped += 1; return
+            }
+            end(pb, ct, cmd: cmd, commit: false)
+        } else {
+            guard let c = queue.makeCommandBuffer() else { stats.skipped += 1; return }
+            encodeEye(eye, dst: dst, cmd: c)
+            end(pb, ct, cmd: c, commit: true)
+        }
+    }
+
+    /// KL_CP_STILLS: 1:1 crops of the eye image and (when the drawable is readable) of the composite output.
+    private func takeStills(t: Int, eye: MTLTexture, src: MTLTexture, slice: Int, viewport: MTLViewport,
+                            map: MTLRasterizationRateMap?, cmd: MTLCommandBuffer) {
+        let side = 768
+        // The eye image: a blit of the region around the centre into a shared buffer.
+        let ew = min(side, eye.width), eh = min(side, eye.height)
+        let ex = max(0, min(eye.width - ew, Int(stillCentre.0 * Double(eye.width)) - ew / 2))
+        let ey = max(0, min(eye.height - eh, Int(stillCentre.1 * Double(eye.height)) - eh / 2))
+        let fmt = eye.pixelFormat
+        let rgba8 = fmt == .rgba8Unorm || fmt == .rgba8Unorm_srgb, bgra8 = fmt == .bgra8Unorm || fmt == .bgra8Unorm_srgb
+        if (rgba8 || bgra8), let eb = device.makeBuffer(length: ew * eh * 4, options: .storageModeShared), let bl = cmd.makeBlitCommandEncoder() {
+            bl.label = "klepton still (eye)"
+            bl.copy(from: eye, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: ex, y: ey, z: 0),
+                    sourceSize: MTLSize(width: ew, height: eh, depth: 1), to: eb, destinationOffset: 0,
+                    destinationBytesPerRow: ew * 4, destinationBytesPerImage: ew * eh * 4)
+            bl.endEncoding()
+            let name = String(format: "still_t%04d_eye_%dx%d.png", t, eye.width, eye.height)
+            cmd.addCompletedHandler { [weak self] _ in self?.io.async { Self.writePNG(eb, ew, eh, bgra: bgra8, name: name) } }
+        }
+        // The composite output: the same fractions of the view's viewport, 1:1 in the drawable's screen pixels.
+        guard source != 2, !src.isFramebufferOnly, src.storageMode != .memoryless else { return }
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm_srgb, width: side, height: side, mipmapped: false)
+        td.usage = [.renderTarget, .shaderRead]; td.storageMode = .private
+        guard let dt = device.makeTexture(descriptor: td) else { return }
+        let cx = viewport.originX + stillCentre.0 * viewport.width, cy = viewport.originY + stillCentre.1 * viewport.height
+        let crop = MTLViewport(originX: cx - Double(side) / 2, originY: cy - Double(side) / 2, width: Double(side), height: Double(side), znear: 0, zfar: 1)
+        guard encodeComposite(src: src, slice: slice, viewport: crop, map: map, dst: dt, cmd: cmd),
+              let db = device.makeBuffer(length: side * side * 4, options: .storageModeShared), let bl = cmd.makeBlitCommandEncoder() else { return }
+        bl.label = "klepton still (drawable)"
+        bl.copy(from: dt, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                sourceSize: MTLSize(width: side, height: side, depth: 1), to: db, destinationOffset: 0,
+                destinationBytesPerRow: side * 4, destinationBytesPerImage: side * side * 4)
+        bl.endEncoding()
+        let name = String(format: "still_t%04d_drawable_%dx%d.png", t, Int(viewport.width), Int(viewport.height))
+        cmd.addCompletedHandler { [weak self] _ in self?.io.async { Self.writePNG(db, side, side, bgra: true, name: name) } }
+    }
+
+    static func writePNG(_ buf: MTLBuffer, _ w: Int, _ h: Int, bgra: Bool, name: String) {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = docs.appendingPathComponent("captures")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let info = CGBitmapInfo(rawValue: bgra
+            ? CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+            : CGImageAlphaInfo.noneSkipLast.rawValue)
+        guard let ctx = CGContext(data: buf.contents(), width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: info.rawValue),
+              let img = ctx.makeImage(),
+              let dst = CGImageDestinationCreateWithURL(dir.appendingPathComponent(name) as CFURL, "public.png" as CFString, 1, nil)
+        else { NSLog("[cp] still: could not write \(name)"); return }
+        CGImageDestinationAddImage(dst, img, nil)
+        CGImageDestinationFinalize(dst)
+        NSLog("[cp] still written: \(name) \(w)x\(h)")
+    }
+
+    /// The Mac harness's entry (and the eye-image path): the eye image only.
+    func frame(_ tex: MTLTexture, serial: UInt64, queue: MTLCommandQueue) {
+        noteEye(tex, serial: serial)
+        guard let (pb, ct, dst) = begin(levelW: tex.width, levelH: tex.height, serial: serial,
+                                        aspect: Double(tex.height) / Double(max(1, tex.width))),
+              let c = queue.makeCommandBuffer() else { return }
+        encodeEye(tex, dst: dst, cmd: c)
+        end(pb, ct, cmd: c, commit: true)
+    }
+
+    /// Clip bookkeeping for this frame; a pixel buffer to draw into when this frame is to be recorded.
+    private func begin(levelW: Int, levelH: Int, serial: UInt64, aspect: Double) -> (CVPixelBuffer, CVMetalTexture, MTLTexture)? {
+        let now = CACurrentMediaTime()
+        if t0 == 0 { t0 = now; nextPeriodic = every }
+        let sizeChanged = lastW != 0 && (levelW != lastW || levelH != lastH)
+        let firstFrame = lastW == 0
+        lastW = levelW; lastH = levelH
+        if writer != nil, sizeChanged || now - clipStart >= secs { finish() }
+        if writer == nil, !starting, clips < maxClips {
+            let rel = now - t0
+            if firstFrame { start(w: levelW, h: levelH, aspect: aspect, why: "launch", now: now) }
+            else if sizeChanged { start(w: levelW, h: levelH, aspect: aspect, why: "level", now: now) }
+            else if rel >= nextPeriodic { start(w: levelW, h: levelH, aspect: aspect, why: "every", now: now) }
+            if starting { while nextPeriodic <= rel { nextPeriodic += every } }
+        }
+        // The writer is created on the io queue (creating one blocks for tens of ms), and handed over here.
+        if starting {
+            pendLock.lock(); let p = pending; pending = nil; pendLock.unlock()
+            guard let (wr, inp, ad, t) = p else { return nil }
+            starting = false
+            if wr == nil { return nil }
+            writer = wr; input = inp; adaptor = ad; clipStart = t; lastSerial = .max; lastAppend = 0
+        }
+        guard writer != nil, let input = input, let adaptor = adaptor, let cache = cache else { return nil }
+        guard serial != lastSerial, now - lastAppend >= 1.0 / 30.0 - 0.002 else { return nil }
+        lastSerial = serial
+        guard input.isReadyForMoreMediaData, let pool = adaptor.pixelBufferPool else { stats.skipped += 1; return nil }
+        var pbOut: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pbOut) == kCVReturnSuccess, let pb = pbOut else { stats.skipped += 1; return nil }
+        var cvt: CVMetalTexture?
+        guard CVMetalTextureCacheCreateTextureFromImage(nil, cache, pb, nil, .bgra8Unorm_srgb, CVPixelBufferGetWidth(pb),
+                                                        CVPixelBufferGetHeight(pb), 0, &cvt) == kCVReturnSuccess,
+              let ct = cvt, let dst = CVMetalTextureGetTexture(ct) else { stats.skipped += 1; return nil }
+        lastAppend = now
+        return (pb, ct, dst)
+    }
+
+    private func pass(_ dst: MTLTexture, _ cmd: MTLCommandBuffer) -> MTLRenderCommandEncoder? {
+        let rp = MTLRenderPassDescriptor()
+        rp.colorAttachments[0].texture = dst
+        rp.colorAttachments[0].loadAction = .dontCare
+        rp.colorAttachments[0].storeAction = .store
+        return cmd.makeRenderCommandEncoder(descriptor: rp)
+    }
+
+    private func encodeEye(_ tex: MTLTexture, dst: MTLTexture, cmd: MTLCommandBuffer) {
+        guard let enc = pass(dst, cmd) else { return }
+        enc.label = "klepton eye video"
+        var d = SIMD2<Float>(0.25 / Float(dst.width), 0.25 / Float(dst.height))
+        enc.setRenderPipelineState(eyePipeline)
+        enc.setFragmentTexture(tex, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        enc.setFragmentBytes(&d, length: MemoryLayout<SIMD2<Float>>.size, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+    }
+
+    struct CompParams { var viewport: SIMD4<Float>; var physInv: SIMD2<Float>; var d: SIMD2<Float>; var layer: UInt32; var hasMap: UInt32 }
+
+    private func encodeComposite(src: MTLTexture, slice: Int, viewport: MTLViewport, map: MTLRasterizationRateMap?,
+                                 dst: MTLTexture, cmd: MTLCommandBuffer) -> Bool {
+        guard let comp = compPipeline else { return false }
+        if copyTex == nil || copyTex!.width != src.width || copyTex!.height != src.height || copyTex!.pixelFormat != src.pixelFormat {
+            let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: src.pixelFormat, width: src.width, height: src.height, mipmapped: false)
+            td.usage = [.shaderRead]
+            td.storageMode = .private
+            copyTex = device.makeTexture(descriptor: td)
+        }
+        guard let copy = copyTex, let blit = cmd.makeBlitCommandEncoder() else { return false }
+        blit.label = "klepton eye video copy"
+        blit.copy(from: src, sourceSlice: slice, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: src.width, height: src.height, depth: 1),
+                  to: copy, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        var hasMap: UInt32 = 0
+        if let m = map {
+            let need = m.parameterDataSizeAndAlign.size
+            if mapBuf == nil || mapBuf!.length < need { mapBuf = device.makeBuffer(length: max(need, 16), options: .storageModeShared) }
+            if let b = mapBuf { m.copyParameterData(buffer: b, offset: 0); hasMap = 1 }
+        }
+        if mapBuf == nil { mapBuf = device.makeBuffer(length: 16, options: .storageModeShared) }
+        guard let enc = pass(dst, cmd), let mb = mapBuf else { return false }
+        enc.label = "klepton eye video (composite output)"
+        let layer = map.map { $0.layerCount > 1 ? UInt32(slice) : 0 } ?? 0
+        var p = CompParams(viewport: SIMD4<Float>(Float(viewport.originX), Float(viewport.originY), Float(viewport.width), Float(viewport.height)),
+                           physInv: SIMD2<Float>(1 / Float(src.width), 1 / Float(src.height)),
+                           d: SIMD2<Float>(0.25 / Float(dst.width), 0.25 / Float(dst.height)), layer: layer, hasMap: hasMap)
+        enc.setRenderPipelineState(comp)
+        enc.setFragmentTexture(copy, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        enc.setFragmentBytes(&p, length: MemoryLayout<CompParams>.stride, index: 0)
+        enc.setFragmentBuffer(mb, offset: 0, index: 1)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+        return true
+    }
+
+    private func end(_ pb: CVPixelBuffer, _ ct: CVMetalTexture, cmd: MTLCommandBuffer, commit: Bool) {
+        guard let input = input, let adaptor = adaptor else { return }
+        let t = CMTime(seconds: lastAppend - clipStart, preferredTimescale: 90000)
+        let t0c = CACurrentMediaTime()
+        cmd.addCompletedHandler { [weak self] c in
+            guard let self = self else { return }
+            // Composite source: the frame's command buffer also carries the composite, so its GPU span is not ours;
+            // the eye path's is. Count the eye path's GPU span only.
+            let g = commit ? (c.gpuEndTime - c.gpuStartTime) * 1000 : -1
+            self.io.async {
+                _ = ct
+                if input.isReadyForMoreMediaData, adaptor.append(pb, withPresentationTime: t) {
+                    self.statLock.lock(); self.stats.frames += 1
+                    if g >= 0 { self.stats.gpu += g; self.stats.gpuN += 1 }
+                    self.statLock.unlock()
+                } else {
+                    self.statLock.lock(); self.stats.skipped += 1; self.statLock.unlock()
+                }
+            }
+        }
+        _ = t0c
+        if commit { cmd.commit() }
+        flushN += 1
+        if flushN % 30 == 0, let cache = cache { CVMetalTextureCacheFlush(cache, 0) }
+    }
+
+    private func start(w levelW: Int, h levelH: Int, aspect: Double, why: String, now: Double) {
+        let w = outW
+        let h = max(2, (Int((Double(outW) * aspect).rounded()) + 1) & ~1)
+        name = String(format: "vid_t%04d_%@_%dx%d.mp4", Int(now - t0), why, levelW, levelH)
+        let n = name
+        starting = true
+        clips += 1
+        io.async { [weak self] in
+            guard let self = self else { return }
+            var made: (AVAssetWriter?, AVAssetWriterInput?, AVAssetWriterInputPixelBufferAdaptor?, Double) = (nil, nil, nil, 0)
+            defer { self.pendLock.lock(); self.pending = made; self.pendLock.unlock() }
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let dir = docs.appendingPathComponent("captures")
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let url = dir.appendingPathComponent(n)
+            try? FileManager.default.removeItem(at: url)
+            guard let wr = try? AVAssetWriter(outputURL: url, fileType: .mp4) else { NSLog("[cp] eye video: no writer for \(n)"); return }
+            let settings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h,
+                AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 2_500_000, AVVideoMaxKeyFrameIntervalKey: 30,
+                                                  AVVideoExpectedSourceFrameRateKey: 30,
+                                                  AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel]]
+            let inp = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+            inp.expectsMediaDataInRealTime = true
+            let ad = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: inp, sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h,
+                kCVPixelBufferMetalCompatibilityKey as String: true])
+            guard wr.canAdd(inp) else { NSLog("[cp] eye video: cannot add the input for \(n)"); return }
+            wr.add(inp)
+            guard wr.startWriting() else { NSLog("[cp] eye video: startWriting failed: \(String(describing: wr.error))"); return }
+            wr.startSession(atSourceTime: .zero)
+            made = (wr, inp, ad, CACurrentMediaTime())
+        }
+    }
+
+    private func finish() {
+        guard let wr = writer, let inp = input else { return }
+        writer = nil; input = nil; adaptor = nil
+        let n = name, dur = CACurrentMediaTime() - clipStart, src = source == 1 ? "composite output" : "eye image"
+        io.async { [weak self] in
+            // Every append of this clip was queued before this block (same serial queue), so the count is final here.
+            guard let self = self else { return }
+            self.statLock.lock(); let s = self.stats; self.stats = (0, 0, 0, 0); self.statLock.unlock()
+            inp.markAsFinished()
+            wr.finishWriting {
+                let bytes = (try? FileManager.default.attributesOfItem(atPath: wr.outputURL.path)[.size] as? Int) ?? 0
+                NSLog(String(format: "[cp] eye video written: %@ (%@) %.1f s, %d frames, %d skipped, %@, %.1f MB%@",
+                             n, src, dur, s.frames, s.skipped,
+                             s.gpuN > 0 ? String(format: "downscale GPU %.3f ms avg", s.gpu / Double(s.gpuN)) : "GPU in the frame's buffer",
+                             Double(bytes) / 1e6,
+                             wr.status == .completed ? "" : " (status \(wr.status.rawValue): \(String(describing: wr.error)))"))
+            }
+        }
+    }
+}

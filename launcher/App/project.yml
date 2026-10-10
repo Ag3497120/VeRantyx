@@ -1,0 +1,36 @@
+# XcodeGen spec for the standalone launcher preview (`brew install xcodegen && xcodegen`).
+# The full app embeds the same views and SteamLauncherKit through the Klepton project.
+name: AlyxLauncher
+options:
+  bundleIdPrefix: io.github.glovebox-vr
+  deploymentTarget:
+    visionOS: "2.0"
+packages:
+  SteamLauncherKit:
+    path: ..
+  GloveboxReports:
+    path: ../../diagnostics
+targets:
+  AlyxLauncher:
+    type: application
+    platform: visionOS
+    sources: [AlyxLauncher]
+    dependencies:
+      - package: SteamLauncherKit
+        product: SteamLauncherKit
+      - package: GloveboxReports
+        product: GloveboxReports
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.glovebox-vr.launcher
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: "Alyx"
+        # Asked at Play (Controllers.swift); the same text as the game app's.
+        INFOPLIST_KEY_NSAccessoryTrackingUsageDescription: "Half-Life: Alyx tracks PlayStation VR2 Sense controllers to use them as the game's controllers."
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UIApplicationPreferredDefaultSceneSessionRole: UIWindowSceneSessionRoleApplication
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "7"

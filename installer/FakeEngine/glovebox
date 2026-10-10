@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# A stand-in for engine/glovebox.py (glovebox-vr/glovebox) that prints what it prints with --json,
+# for the app's development, its tests and CI screenshots. It builds nothing and touches nothing
+# outside $GLOVEBOX_WORK.
+#
+#   FAKE_FAIL="xcode:2,team:1"      that doctor check is missing for its first N doctor runs
+#   FAKE_TEAM=free|none             how `team` fails (default free: only a free team in Xcode)
+#   FAKE_HEADSET=unpaired|devmode|asleep   how `headset` fails (default unpaired)
+#   FAKE_BUILD_FAIL=translate|app|install  build stops with an error at that step (until $GLOVEBOX_WORK/.fake/build-ok
+#                                   exists); install says the headset is locked the first time, then goes through
+#   FAKE_BUILD_FAIL=signin          the app step fails the way it does once Xcode's saved sign-in expired (a tester's
+#                                   beta 3 message), until build-ok exists
+#   FAKE_BUILD_FAIL=agreement       the app step fails the way it does while Apple's new developer agreement isn't
+#                                   accepted (the same tester's next message), until build-ok exists
+#   FAKE_STEP=0.05                  seconds between progress lines
+
+set -u
+WORK="${GLOVEBOX_WORK:-${TMPDIR:-/tmp}/glovebox-fake}"
+STATE="$WORK/.fake"
+mkdir -p "$STATE"
+STEP="${FAKE_STEP:-0.05}"
+args=()
+for a in "$@"; do [ "$a" = --json ] || args+=("$a"); done
+cmd="${args[0]:-}"
+
+emit() { printf '%s\n' "$1"; }
+trap 'exit 130' INT
+
+# failing <check>: true while that check still has missing runs left.
+failing() {
+  local item id n f done
+  IFS=',' read -ra items <<< "${FAKE_FAIL:-}"
+  for item in "${items[@]:-}"; do
+    IFS=':' read -r id n <<< "$item"
+    [ "$id" = "$1" ] || continue
+    f="$STATE/runs-$id"; done=0
+    [ -f "$f" ] && done=$(cat "$f")
+    [ "$done" -ge 999 ] && return 1
+    if [ "$done" -lt "${n:-1}" ]; then echo $((done + 1)) > "$f"; return 0; fi
+    return 1
+  done
+  return 1
+}
+
+check() { # check <id> <title> <status> <detail> [fix]
+  emit "{\"event\": \"check\", \"check\": \"$1\", \"title\": \"$2\", \"status\": \"$3\", \"detail\": \"$4\", \"fix\": ${5:-null}}"
+}
+
+step() { # step <name> <lines> <detail> <error message if FAKE_BUILD_FAIL names it>
+  local i
+  for i in $(seq 1 "$2"); do
+    if [ "$1" = translate ]; then
+      emit "{\"event\": \"progress\", \"step\": \"$1\", \"line\": \"libfake$i.so\", \"done\": $i, \"total\": $2}"
+    else
+      emit "{\"event\": \"progress\", \"step\": \"$1\", \"line\": \"$1 line $i\"}"
+    fi
+    sleep "$STEP"
+    local fail="${FAKE_BUILD_FAIL:-}" message="$4"
+    if [ "$fail" = signin ] && [ "$1" = app ]; then
+      fail=app
+      message="the app did not build: No 'iOS Development' signing certificate matching team ID 'A1B2C3D4E5' with a private key was found. | Unable to log in with account 'jane@example.com'. The login details for account 'jane@example.com' were rejected."
+    elif [ "$fail" = agreement ] && [ "$1" = app ]; then
+      fail=app
+      message="the app did not build: No 'iOS Development' signing certificate matching team ID 'A1B2C3D4E5' with a private key was found. | Unable to process request - PLA Update available: You currently don't have access to this membership resource. To resolve this issue, agree to the latest Program License Agreement in your developer account."
+    fi
+    if [ "$fail" = "$1" ] && [ "$i" -ge 2 ] && [ ! -f "$STATE/build-ok" ]; then
+      echo "fake: failing $1 on purpose" >&2
+      echo "$(date +%s)" >> "$STATE/build-failed"
+      emit "{\"event\": \"error\", \"message\": \"$message\"}"
+      exit 1
+    fi
+  done
+  emit "{\"event\": \"step\", \"step\": \"$1\", \"status\": \"ok\", \"detail\": \"$3\"}"
+}
+
+case "$cmd" in
+  doctor)
+    check mac "This Mac" ok "Apple silicon, macOS 26.0"
+    check disk "Space" ok "120 GB free"
+    if failing xcode; then
+      check xcode "Xcode" missing "Xcode is not installed" \
+        '{"kind": "open-url", "label": "Get Xcode", "url": "macappstore://apps.apple.com/app/xcode/id497799835"}'
+      emit '{"event": "done", "step": "doctor", "ok": false}'; exit 1
+    fi
+    check xcode "Xcode" ok "Xcode 26.0.1"
+    bad=0
+    if failing visionos; then
+      check visionos "visionOS support" missing "Xcode's visionOS support is not installed" \
+        "{\"kind\": \"command\", \"label\": \"Install visionOS support\", \"command\": \"'$0' fake-platform\"}"
+      bad=1
+    else
+      check visionos "visionOS support" ok "visionOS SDK 26.0"
+    fi
+    if failing team; then
+      if [ "${FAKE_TEAM:-free}" = none ]; then
+        check team "Apple developer account" missing "Xcode is not signed in to an Apple account" \
+          '{"kind": "open-app", "label": "Open Xcode'"'"'s Accounts settings", "url": "xcode://"}'
+      else
+        check team "Apple developer account" missing "Xcode is signed in, but only with a free team (the game needs the paid program's memory limit)" \
+          '{"kind": "open-url", "label": "Join the Apple Developer Program", "url": "https://developer.apple.com/programs/enroll/"}'
+      fi
+      bad=1
+    else
+      check team "Apple developer account" ok "Apple Developer Program team in Xcode"
+    fi
+    if failing headset; then
+      case "${FAKE_HEADSET:-unpaired}" in
+        devmode) check headset "Vision Pro" missing "Jane’s Vision Pro: Developer Mode is off" \
+                   '{"kind": "guide", "label": "Turn on Developer Mode", "guide": "developer-mode"}'; bad=1 ;;
+        asleep) check headset "Vision Pro" warn "Jane’s Vision Pro is paired but not reachable right now (wake it, same Wi-Fi)" ;;
+        *) check headset "Vision Pro" missing "No Vision Pro paired with this Mac" \
+             '{"kind": "guide", "label": "Pair your Vision Pro", "guide": "pair-headset"}'; bad=1 ;;
+      esac
+    else
+      check headset "Vision Pro" ok "Jane’s Vision Pro (visionOS 26.0)"
+    fi
+    if [ "$bad" = 0 ]; then emit '{"event": "done", "step": "doctor", "ok": true}'; else emit '{"event": "done", "step": "doctor", "ok": false}'; exit 1; fi ;;
+  fake-platform)
+    # What `xcodebuild -downloadPlatform visionOS` prints, roughly.
+    for p in 5 20 40 60 80 100; do echo "Downloading visionOS 26.0 Simulator (23M5263a): $p.0% (1.$p GB of 8.2 GB)"; sleep "$STEP"; done
+    echo 999 > "$STATE/runs-visionos" ;;
+  build)
+    for n in bin/linuxsteamrtarm64 hlvr/bin/linuxsteamrtarm64; do
+      if [ ! -e "$WORK/linux/game/$n" ]; then
+        emit "{\"event\": \"error\", \"message\": \"game files missing in $WORK/linux/game: $n\"}"; exit 1
+      fi
+    done
+    step kit 2 "runtime kit fake (MoltenVK 1.4.0)" "no runtime kit: set GLOVEBOX_KIT"
+    step runtime 4 "41 runtime libraries" "curl failed"
+    step game 1 "$WORK/linux/game" ""
+    step pipelines 4 "56 MB pipeline list" "python3 failed (1)"
+    step defaults 1 "settings (texture cap 1024)" ""
+    # The player's answer to sharing stutter reports, where the real build puts it (gb/build.py).
+    mkdir -p "$WORK/KleptonAlyx.app/alyx-demo"
+    case "${GLOVEBOX_SHARE_STUTTERS:-}" in
+      0|1) printf 'GLOVEBOX_SHARE_STUTTERS=%s\nGLOVEBOX_SHARE_STUTTERS_AT=%s\n' "$GLOVEBOX_SHARE_STUTTERS" \
+             "${GLOVEBOX_SHARE_STUTTERS_AT:-$(date +%s)}" > "$WORK/KleptonAlyx.app/alyx-demo/alyx-env.txt" ;;
+      *) : > "$WORK/KleptonAlyx.app/alyx-demo/alyx-env.txt" ;;
+    esac
+    step translate 12 "89 game libraries translated" "bash failed (1): klepton-ld: error: undefined symbol"
+    step app 6 "signed for team A1B2C3D4E5 as com.glovebox.alyx.ta1b2c3d4e5" \
+      "the app did not build: No profiles for 'com.glovebox.alyx.ta1b2c3d4e5' were found"
+    mkdir -p "$WORK/KleptonAlyx.app"
+    printf 'CMS<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>ExpirationDate</key><date>2027-10-05T00:00:00Z</date></dict></plist>sig' \
+      > "$WORK/KleptonAlyx.app/embedded.mobileprovision"
+    printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.glovebox.alyx.ta1b2c3d4e5</string></dict></plist>' \
+      > "$WORK/KleptonAlyx.app/Info.plist"
+    emit "{\"event\": \"done\", \"step\": \"build\", \"ok\": true, \"app\": \"$WORK/KleptonAlyx.app\"}" ;;
+  install)
+    if [ ! -d "$WORK/KleptonAlyx.app" ]; then emit '{"event": "error", "message": "nothing built yet: run glovebox build"}'; exit 1; fi
+    if [ "${FAKE_BUILD_FAIL:-}" = install ] && [ ! -f "$STATE/install-failed" ]; then
+      touch "$STATE/install-failed"
+      emit '{"event": "progress", "step": "install", "line": "Acquired tunnel connection to device."}'
+      emit '{"event": "error", "message": "devicectl failed (1): ERROR: The device is locked."}'; exit 1
+    fi
+    FAKE_BUILD_FAIL= step install 3 "installed on the headset" ""  # failed once above: this time it goes through
+    emit '{"event": "done", "step": "install", "ok": true}' ;;
+  *)
+    echo "usage: glovebox doctor|build|install [--json]" >&2; exit 2 ;;
+esac

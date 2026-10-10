@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The tester build's permission texts (build-tf.sh passes this file as KLEPTON_INFOPLIST_SET): plain wording for
+     Half-Life: Alyx instead of Klepton's generic ones, which name Steam Link, "the guest" and Klepton. Shown by
+     visionOS when the app first asks for each permission. -->
+<plist version="1.0">
+<dict>
+	<!-- Removed (empty): the tester build has no hand tracking compiled in (KLEPTON_NO_HANDS); Alyx plays on the PSVR2
+	     Sense controllers. -->
+	<key>NSHandsTrackingUsageDescription</key>
+	<string></string>
+	<key>NSAccessoryTrackingUsageDescription</key>
+	<string>Half-Life: Alyx tracks PlayStation VR2 Sense controllers to use them as the game's controllers.</string>
+	<key>NSWorldSensingUsageDescription</key>
+	<string>Half-Life: Alyx uses your headset's position in the room to place you in the game.</string>
+	<!-- Removed for Alyx (an empty string removes the key): nothing links CoreBluetooth or a local-network API (PSVR2
+	     Sense controllers come through ARKit accessory tracking and GameController), and the game opened no LAN,
+	     broadcast or multicast socket on the Mac (tools/alyx-test/mac/tf-netcheck.sh). Klepton's other targets keep
+	     them (Steam Link). -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string></string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string></string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Half-Life: Alyx uses the microphone only when you turn on its Microphone setting.</string>
+</dict>
+</plist>

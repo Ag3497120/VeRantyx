@@ -1,0 +1,51 @@
+<!doctype html>
+<!-- The disk image window's art: background.png (660x440) and background@2x.png (1320x880).
+     Render at scale 1 and 2, then crop the top 440 pt:
+       chromium --headless=new --hide-scrollbars --window-size=660,700 --force-device-scale-factor=2 \
+         --screenshot=raw@2x.png background.html
+     It uses Inter (SIL Open Font License, github.com/rsms/inter), put at fonts/inter/InterVariable.ttf to render.
+     The glow and the arrow sit around the icon centres in settings.py: Glovebox (170, 182), Applications (490, 182). -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @font-face { font-family: "Inter"; src: url("fonts/inter/InterVariable.ttf"); font-weight: 100 900; }
+  /* 440 tall: the window shows the top ~400. Finder sizes the window with or without its title bar depending on
+     the macOS version, so the spare 40 below is plain gradient, never a white strip. */
+  html, body { margin: 0; width: 660px; height: 440px; overflow: hidden; }
+  body {
+    position: relative;
+    font-family: "Inter", sans-serif;
+    /* Finder always draws file names black over a background picture, so the window stays light. */
+    background:
+      radial-gradient(150px 130px at 170px 182px, rgba(255, 128, 32, 0.22), rgba(255, 128, 32, 0) 72%),
+      radial-gradient(900px 520px at 50% -10%, #ffffff 0%, #f4f4f6 45%, #e8e9ed 100%);
+  }
+  /* Faint grain so the gradient doesn't band. */
+  .grain {
+    position: absolute; inset: 0; opacity: 0.035;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  }
+  svg.arrow { position: absolute; left: 0; top: 0; }
+  .hint {
+    position: absolute; left: 0; right: 0; top: 330px; text-align: center;
+    font-size: 14px; font-weight: 500; letter-spacing: -0.1px; color: #6e6e73;
+  }
+  .hint b { color: #1d1d1f; font-weight: 650; }
+</style>
+</head>
+<body>
+  <div class="grain"></div>
+  <svg class="arrow" width="660" height="440" viewBox="0 0 660 440">
+    <defs>
+      <linearGradient id="g" x1="0" x2="1" y1="0" y2="0">
+        <stop offset="0" stop-color="#ff9a3d" stop-opacity="0.55"/>
+        <stop offset="1" stop-color="#ff7a1a"/>
+      </linearGradient>
+    </defs>
+    <path d="M 268 178 C 316 152, 354 152, 398 174" fill="none" stroke="url(#g)" stroke-width="3.5" stroke-linecap="round"/>
+    <path d="M 386 160 L 400 175 L 381 181" fill="none" stroke="#ff7a1a" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <div class="hint">Drag <b>Glovebox</b> into <b>Applications</b></div>
+</body>
+</html>

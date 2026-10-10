@@ -1,0 +1,11 @@
+build/
+__pycache__/
+*.pyc
+.DS_Store
+.build/
+*.xcodeproj/xcuserdata/
+/kit/
+/glovebox-kit/
+/glovebox-kit.zip
+node_modules/
+/src

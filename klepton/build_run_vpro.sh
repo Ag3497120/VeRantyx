@@ -1,0 +1,284 @@
+#!/bin/bash
+# Build, install and run Klepton on a physical Apple Vision Pro — the quick loop.
+#
+# This is a thin, opinionated wrapper over visionos/run.sh: that script owns the
+# build/install/stage/launch mechanics and stays the general one. This one adds
+# the two things a quick iteration wants — not re-uploading the 2.2 GB of assets,
+# and reading the log back so the run ends with an answer rather than a file path
+# — plus short flags for the diagnostic shapes.
+#
+# It deliberately does NOT turn on immersive or ANGLE: those are the app's own
+# defaults now, so what you get here is what you get tapping the icon.
+#
+#   ./build_run_vpro.sh                 # what a normal launch does: immersive +
+#                                       #   ANGLE, autoboot, frames until stopped
+#   ./build_run_vpro.sh superhot        # ...for another guest. The first bare
+#                                       #   argument is the TARGET, defaulting to
+#                                       #   beatsaber; `--list` names them. Each
+#                                       #   one has its own bundle id, its own
+#                                       #   app, its own container and so its own
+#                                       #   userdata — visionos/targets.py is the
+#                                       #   table, and everything downstream (the
+#                                       #   .xcodeproj, the .app, the derived
+#                                       #   data, the log this script pulls back)
+#                                       #   is keyed on it
+#   ./build_run_vpro.sh --frames 30     # bound the guest's frame count
+#   ./build_run_vpro.sh --p4            # boot to initJni, no compositor
+#   ./build_run_vpro.sh --window --frames 300
+#                                       # the lifecycle in the window, no immersive
+#                                       #   space. --window ALONE is just --p4: the
+#                                       #   window path runs the lifecycle only when
+#                                       #   KL_FRAMES says how many frames to pump
+#   ./build_run_vpro.sh --null          # the null GL driver instead of ANGLE
+#   ./build_run_vpro.sh --stage         # re-upload the 2.2 GB of assets (first run only)
+#   ./build_run_vpro.sh --sync          # drive the guest on the compositor thread
+#   ./build_run_vpro.sh --log           # pull + summarise the last run, build nothing
+#
+# Anything already set in the environment wins, so a one-off knob the flags do
+# not cover still works:
+#
+#   KL_PERMISSIVE=1 ./build_run_vpro.sh --frames 60
+#
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# The app's own defaults are now "immersive, with ANGLE, booting on its own"
+# (KleptonApp.swift / kl_app_configure), so this script does not have to turn any
+# of that on — it only has to be able to turn it OFF. Hence the empty defaults
+# and the explicit =0 in the flags below: a flag that merely omitted a knob used
+# to disable it and now would not.
+FRAMES=""
+IMMERSIVE=""      # unset => the app's default (on)
+GLFB=""           # unset => the app's default (on)
+STAGE=""          # empty => KL_SKIP_STAGE=1 (assets persist across installs)
+LOG_ONLY=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --list)       python3 visionos/targets.py --list; exit 0 ;;
+    --frames)     FRAMES="$2"; shift 2 ;;
+    --p4)         FRAMES=""; IMMERSIVE=0; shift ;;    # boot only, no lifecycle
+    --window)     IMMERSIVE=0; shift ;;
+    --null)       GLFB=0; shift ;;
+    --stage)      STAGE=1; shift ;;
+    --sync)       export KL_SYNC_GUEST=1; shift ;;
+    --log)        LOG_ONLY=1; shift ;;
+    -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
+    -*)           echo "unknown flag: $1 (try --help)" >&2; exit 2 ;;
+    # A bare word is the TARGET. One only: a second would silently be ignored,
+    # and "which guest did that run actually build" is not a question worth
+    # having to ask of a device run that takes minutes.
+    *)            [ -z "${TARGET_ARG:-}" ] || {
+                    echo "!! two targets given ($TARGET_ARG and $1)" >&2; exit 2; }
+                  TARGET_ARG="$1"; shift ;;
+  esac
+done
+
+# The target decides the bundle id, and the bundle id is what the log is pulled
+# out of — so a wrong one here does not fail, it silently reads the OTHER app's
+# log and reports on a run that never happened. targets.py resolves it, and an
+# unknown name stops the script there rather than after a build.
+export KLEPTON_TARGET="${TARGET_ARG:-${KLEPTON_TARGET:-}}"
+# Resolved into a variable first, because `eval "$(...)"` reports the EVAL's
+# status, not the command's: an unknown target printed its own error and then
+# the script carried on to die on an unbound KLT_NAME, which buries the one line
+# that said what was wrong.
+KLT_VARS=$(python3 visionos/targets.py "$KLEPTON_TARGET") || exit 1
+eval "$KLT_VARS"
+export KLEPTON_TARGET="$KLT_NAME"
+BUNDLE_ID="${KLEPTON_BUNDLE_ID:-$KLT_BUNDLE}"
+
+# ...and the log lands under the target's own name, for the same reason: two
+# targets writing to one path means the second run's summary describes the
+# first, and the "keep the longest log" rule below would actively preserve the
+# wrong one.
+LOCAL_LOG="${KL_LOG_OUT:-/tmp/klepton-$KLT_NAME.log}"
+
+# Device discovery, so --log works without a build and so the summary below can
+# name the device. Same JSON route as run.sh: device names contain non-breaking
+# spaces, which makes column parsing pick the wrong field.
+find_device() {
+  local json; json=$(mktemp)
+  xcrun devicectl list devices --json-output "$json" >/dev/null 2>&1 || true
+  python3 -c '
+import json, sys
+try:
+    devs = json.load(open(sys.argv[1]))["result"]["devices"]
+except Exception:
+    sys.exit(0)
+phys = [d for d in devs
+        if d.get("hardwareProperties", {}).get("reality") == "physical"
+        and d.get("hardwareProperties", {}).get("platform") == "visionOS"]
+if not phys:
+    sys.exit(0)
+phys.sort(key=lambda d: d.get("connectionProperties", {}).get("tunnelState") != "connected")
+print(phys[0]["identifier"])
+' "$json"
+  rm -f "$json"
+}
+DEVID="${KLEPTON_DEVICE:-$(find_device || true)}"
+[ -n "$DEVID" ] || { echo "!! no physical Vision Pro — pair it in Xcode, or set KLEPTON_DEVICE"; exit 1; }
+export KLEPTON_DEVICE="$DEVID"
+
+# Pull the log, but never let a shorter one overwrite a longer one — keep the
+# long one and park the new one alongside.
+#
+# The app is RELAUNCHED after it dies here, and the fresh process truncates
+# klepton-boot.log on the way up. So the interesting log — the one belonging to
+# the run that failed — is destroyed a few seconds after it is written, and the
+# poller happily replaces a 701-line crash with a 200-line clean boot. That is
+# not a stale-log problem (the file really is current), it is the opposite: the
+# evidence is overwritten by something newer and less interesting.
+# The crash report, which is a SEPARATE file on purpose: the boot log is stdout
+# with stderr duped onto it, and a fault can lose both (a guest may take the
+# fds; stdio can hold the last writes behind a lock the dying thread never
+# releases). kl_fault writes this one by path and fsyncs it, so when a run ends
+# in a signal this is the file that actually has the registers, what each one
+# pointed at, and the frame chain. Pulled after the log and printed, because a
+# crash report nobody reads is the same as no crash report.
+pull_crash() {
+  local out="${LOCAL_LOG%.log}-crash.log"
+  xcrun devicectl device copy from --device "$DEVID" \
+    --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+    --source Documents/klepton-crash.log --destination "$out" >/dev/null 2>&1 || return 1
+  [ -s "$out" ] || { rm -f "$out"; return 1; }
+  echo
+  echo "!! a crash report was left on device — $out"
+  LC_ALL=C sed -n '1,40p' "$out"
+}
+
+pull_log() {
+  local tmp; tmp="$(mktemp)"
+  xcrun devicectl device copy from --device "$DEVID" \
+    --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+    --source Documents/klepton-boot.log --destination "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+  local new old
+  new=$(wc -l < "$tmp" | tr -d ' ')
+  old=0; [ -f "$LOCAL_LOG" ] && old=$(wc -l < "$LOCAL_LOG" | tr -d ' ')
+  if [ "$new" -lt "$old" ] && [ -n "${KL_KEEP_LONGEST:-1}" ]; then
+    mv "$tmp" "$LOCAL_LOG.relaunch"
+    echo "    (device relaunched the app: its $new-line log is in $LOCAL_LOG.relaunch;" \
+         "keeping the $old-line one)" >&2
+  else
+    mv "$tmp" "$LOCAL_LOG"
+  fi
+}
+
+# The summary is the point of the wrapper. Three questions, in the order they
+# get asked of every run: did the guest boot, did the compositor come up, and
+# how did it end. LC_ALL=C throughout — the log carries guest bytes and grep
+# otherwise bails with "illegal byte sequence" and shows nothing.
+summarise() {
+  [ -f "$LOCAL_LOG" ] || { echo "!! no log at $LOCAL_LOG"; return 1; }
+  echo
+  echo "──────── $LOCAL_LOG ($(wc -l < "$LOCAL_LOG" | tr -d ' ') lines) ────────"
+
+  # Whose run is this? A device log that looks stalled is often simply the
+  # PREVIOUS run's file, left behind because the launch never happened. The
+  # first heartbeat is the run's own start time and settles it in one line.
+  #
+  # Compare the two as a DELTA, not as clock readings: the headset keeps its own
+  # timezone and is currently an hour behind this Mac, so a run that started ten
+  # seconds ago prints an hour earlier than "now" and reads as an hour-old file.
+  echo "  started : $(LC_ALL=C grep -am1 '^\[hb\]' "$LOCAL_LOG" | awk '{print $2}')  (device clock; this Mac says $(date +%H:%M:%S))"
+
+  echo "  -- boot --"
+  LC_ALL=C grep -aE 'EXIT CRITERION|classes:|natives registered|ids requested|guard verified' \
+    "$LOCAL_LOG" | sed 's/^/    /' || true
+
+  echo "  -- compositor / graphics --"
+  LC_ALL=C grep -aE '\[glfb\]|\[cp\]' "$LOCAL_LOG" | sed 's/^/    /' | head -40 || true
+
+  echo "  -- how it ended --"
+  # The heartbeat separates the three failures that otherwise look identical:
+  # a timestamp gap is a suspension, a log that simply ends is a kill, and a
+  # heartbeat still ticking while the guest goes quiet is a stuck guest thread.
+  echo "    last heartbeat: $(LC_ALL=C grep -a '^\[hb\]' "$LOCAL_LOG" | tail -1)"
+  echo "    last output   : $(LC_ALL=C grep -av '^\[hb\]' "$LOCAL_LOG" | grep -av '^ *$' | tail -1 | cut -c1-120)"
+  if LC_ALL=C grep -aq 'klepton\] fault' "$LOCAL_LOG"; then
+    echo "    FAULT:"
+    LC_ALL=C grep -a -A14 'klepton\] fault' "$LOCAL_LOG" | sed 's/^/      /'
+  fi
+  echo
+}
+
+if [ -n "$LOG_ONLY" ]; then
+  pull_log || { echo "!! could not copy the log off $DEVID"; exit 1; }
+  pull_crash || true
+  summarise
+  exit 0
+fi
+
+# KL_FULL=1 (alias KL_VERBOSE_ALL=1): one switch for a full-debug run, so a black
+# app can be probed on every front in a SINGLE deploy instead of round-tripping a
+# flag at a time. Expands to the whole diagnostic set — traces, probes, the mem
+# log, UE stdout, and the periodic stack sampler — with the exact values a bool
+# switch can't carry. Each is set with :=-defaults so an explicit override on the
+# command line still wins, and only LOGGING knobs are turned on here: behavioural
+# flags (KL_OVERLAY_*, KL_NET_OFFLINE, KL_JNI_SOFT_NULLCLASS, KL_DLOPEN_REFUSE, ...)
+# stay opt-in per run. run.sh forwards every KL_* to the device automatically. The
+# runtime also honours KL_VERBOSE_ALL directly (kl_env.c) for any bool diag flag
+# not listed here, so the two layers together cover on-device launches too.
+if [ -n "${KL_FULL:-}" ] || [ -n "${KL_VERBOSE_ALL:-}" ]; then
+  export KL_VERBOSE_ALL="${KL_VERBOSE_ALL:-1}"   # arms the runtime kl_env.c switch
+  export KL_TRACE_DLSYM="${KL_TRACE_DLSYM:-1}"
+  export KL_TRACE_FMOD="${KL_TRACE_FMOD:-1}"
+  export KL_TRACE_OBB="${KL_TRACE_OBB:-1}"
+  export KL_TRACE_FS="${KL_TRACE_FS:-fail}"
+  export KL_OVRP_VERBOSE="${KL_OVRP_VERBOSE:-1}"
+  export KL_MVK_VERBOSE="${KL_MVK_VERBOSE:-1}"
+  export KL_MEM_LOG="${KL_MEM_LOG:-1}"
+  export KL_RT_DEBUG="${KL_RT_DEBUG:-1}"
+  export KL_SCRATCH_DEBUG="${KL_SCRATCH_DEBUG:-1}"
+  export KL_UE4_STDOUT="${KL_UE4_STDOUT:-1}"
+  export KL_GLFB_PROBE_VIDEO="${KL_GLFB_PROBE_VIDEO:-1}"
+  export KL_GLFB_DRAW_CENSUS="${KL_GLFB_DRAW_CENSUS:-1}"   # periodic draws-per-fb + attachments (low spam)
+  export KL_GLFB_ERRPROBE="${KL_GLFB_ERRPROBE:-1}"         # GL errors after draws/blits (error-only, low spam)
+  # KL_GLFB_BLIT_LOG (per-blit src/dst/status firehose) stays OPT-IN — too spammy for KL_FULL
+  export KL_OVRP_MIRROR_PROBE="${KL_OVRP_MIRROR_PROBE:-1}"
+  export KL_VK_EMU_PROBE="${KL_VK_EMU_PROBE:-1}"
+  export KL_VK_TEXELBUF_PROBE="${KL_VK_TEXELBUF_PROBE:-1}"
+  export KL_VK_DUMP_TEXELBUF="${KL_VK_DUMP_TEXELBUF:-1}"
+  export KL_SAMPLE_MS="${KL_SAMPLE_MS:-2000}"
+  export KL_SAMPLE_STACKS="${KL_SAMPLE_STACKS:-1}"
+  export KL_SAMPLE_REPORT_S="${KL_SAMPLE_REPORT_S:-15}"
+  echo "full-debug: KL_FULL on — all traces/probes/sampler armed (override any by setting it)"
+fi
+
+# Knobs, exported for run.sh's FORWARD list. Set with :=-style defaults so an
+# environment that already has one keeps it.
+[ -z "$FRAMES" ]    || export KL_FRAMES="${KL_FRAMES:-$FRAMES}"
+[ -z "$IMMERSIVE" ] || export KL_IMMERSIVE="${KL_IMMERSIVE:-$IMMERSIVE}"
+[ -z "$GLFB" ]      || export KL_GLFB="${KL_GLFB:-$GLFB}"
+[ -n "$STAGE" ]     || export KL_SKIP_STAGE=1
+export KL_ALARM="${KL_ALARM:-180}"
+export KL_LOG_OUT="$LOCAL_LOG"
+
+echo "target    : $KLT_NAME ($BUNDLE_ID, $KLT_PRODUCT.app)"
+echo "device    : $DEVID"
+echo "knobs     : ${KL_FRAMES:+KL_FRAMES=$KL_FRAMES }${KL_IMMERSIVE:+KL_IMMERSIVE=$KL_IMMERSIVE }${KL_GLFB:+KL_GLFB=$KL_GLFB }KL_ALARM=$KL_ALARM${KL_SYNC_GUEST:+ KL_SYNC_GUEST=1}${KL_SKIP_STAGE:+ (assets not re-staged)}"
+echo "            (unset knobs take the app's defaults: immersive + ANGLE, autoboot)"
+echo
+
+# Cleared before, not after: the sentinel says how THIS run produced its log, and
+# a leftover from the previous one would make a KL_CONSOLE=0 run skip the pull it
+# needs and then summarise the older run's file.
+rm -f "$LOCAL_LOG.streamed"
+
+visionos/run.sh device
+
+# run.sh polls the log itself while the run is live; this is the final read, and
+# it re-pulls because the run may have written more after the poller gave up.
+#
+# ...unless the run STREAMED it (run.sh's --console path, the default for an
+# open-ended run). There the log in $LOCAL_LOG is the live one and the container
+# holds only whatever a previous file-logging run left behind — so pulling would
+# replace this run's output with an older run's, and the "keep the longest"
+# rule protects the wrong one when the stale log is the longer.
+if [ -f "$LOCAL_LOG.streamed" ]; then
+  echo "    (streamed live over --console; the container's log is not this run's)"
+else
+  pull_log || true
+  pull_crash || true
+fi
+summarise

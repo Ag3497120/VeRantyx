@@ -1,0 +1,22 @@
+{
+  "default_bindings": [
+    { "controller_type": "knuckles", "binding_url": "bindings_knuckles.json" },
+    { "controller_type": "oculus_touch", "binding_url": "bindings_oculus_touch.json" }
+  ],
+  "action_sets": [
+    { "name": "/actions/default", "usage": "leftright" },
+    { "name": "/actions/menu", "usage": "single" }
+  ],
+  "actions": [
+    { "name": "/actions/default/in/Trigger", "type": "boolean" },
+    { "name": "/actions/default/in/TriggerPull", "type": "vector1" },
+    { "name": "/actions/default/in/Move", "type": "vector2" },
+    { "name": "/actions/default/in/Teleport", "type": "boolean" },
+    { "name": "/actions/default/in/Grab", "type": "boolean" },
+    { "name": "/actions/default/in/HandPose", "type": "pose" },
+    { "name": "/actions/default/in/SkeletonLeft", "type": "skeleton", "skeleton": "/skeleton/hand/left" },
+    { "name": "/actions/default/in/SkeletonRight", "type": "skeleton", "skeleton": "/skeleton/hand/right" },
+    { "name": "/actions/default/out/Haptic", "type": "vibration" },
+    { "name": "/actions/menu/in/Select", "type": "boolean" }
+  ]
+}

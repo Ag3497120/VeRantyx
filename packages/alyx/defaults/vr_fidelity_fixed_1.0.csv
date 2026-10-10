@@ -1,0 +1,3 @@
+hlvr,default,vr_msaa,vr_render_target_scale,min_gpu_memory,min_width,min_height,r_ssao,r_post_bloom,sc_disable_spotlight_shadows,r_high_quality_shadows,vr_single_light_fast_path_sun_cascade_0_texels_per_world,vr_single_light_fast_path_sun_cascade_1_texels_per_world,
+0,1,4,1.0,,,,1,1,1,0,3,0,
+end,,,,,,,,,,,,,

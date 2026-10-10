@@ -1,0 +1,567 @@
+// See kl_fault.h. This was tests/t_boot.c's report_fault() until the visionOS
+// port needed the same reporter inside an app bundle; it is
+// the same code, moved rather than copied, because a signal handler that
+// exists twice gets fixed once.
+#include <dlfcn.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/ucontext.h>
+#include <mach/mach.h>
+#include "klepton.h"
+#include "kl_fault.h"
+#include "kl_egl.h"
+#include "kl_opensl.h"
+#include "kl_ovrp.h"
+#include "kl_ovrplat.h"
+#include "kl_openxr.h"
+#include "kl_mediandk.h"
+#include "kl_aaudio.h"
+#include "kl_il2cpp.h"
+#include "kl_x18.h"
+
+// ---- where a crash report goes so that it SURVIVES ------------------------
+//
+// The report used to go to fd 2 alone, and on device it was not there to read:
+// the app points stdout at the container's log and dups it onto stderr, but a
+// guest is free to `dup2` its own pipe over both (one shipped library does
+// exactly that), and anything the process wrote through stdio is buffered
+// behind whatever the dying thread was holding. The result is the one output
+// that only exists when something has gone wrong being the one output that goes
+// missing — and every diagnosis after that is guesswork about a crash nobody
+// can see.
+//
+// So the report is ALSO written to a file of its own, opened by path at fault
+// time and fsync'd before the process is allowed to die. Opening by path is the
+// point: it cannot be inherited, redirected, or buffered by anyone else.
+static char g_crash_path[1024];
+static int  g_crash_fd = -1;
+
+void kl_fault_set_crash_path(const char *path) {
+    if (!path) { g_crash_path[0] = 0; return; }
+    snprintf(g_crash_path, sizeof g_crash_path, "%s", path);
+}
+
+// Every line of the report goes through here: fd 2 as before, plus the crash
+// file once it is open. Never allocates and never uses stdio.
+static void klf_emit(const char *b, size_t n) {
+    ssize_t w = write(2, b, n); (void)w;
+    if (g_crash_fd >= 0) { w = write(g_crash_fd, b, n); (void)w; }
+}
+
+static void (*g_extra[KL_FAULT_MAX_REPORTERS])(FILE *);
+static unsigned g_extra_n;
+
+void kl_fault_add_reporter(void (*fn)(FILE *)) {
+    if (fn && g_extra_n < KL_FAULT_MAX_REPORTERS) g_extra[g_extra_n++] = fn;
+}
+
+// Walk an AAPCS64 frame chain and name each return address, guest images
+// included. x29 is the frame pointer and {fp, lr} sit at [fp], which both the
+// guest and our own code honour.
+//
+// This is the fault handler's own walk, lifted out so the ORDERLY abort paths
+// can use it too. They could not before, and the gap is a real one: an abort by
+// name says WHAT the guest asked for and nothing about WHO asked. For an
+// unimplemented call that is enough, because the name is the work item — but
+// for a call that is malformed rather than missing (a JNI handle that never
+// came from us, an out pointer we were handed as NULL) the name is the one
+// thing already known and the caller is the entire question.
+//
+// `fp` is NULL for "start from here", which drops this function's own frame.
+void kl_fault_print_frames(FILE *f, void *fp_) {
+    void **fp = fp_ ? (void **)fp_ : (void **)__builtin_frame_address(0);
+    for (int depth = 0; fp && depth < 16; depth++) {
+        void *ret = fp[1];
+        if (!ret) break;
+        size_t roff = 0;
+        const char *rimg = kl_addr_image(ret, &roff);
+        const char *mm = kl_il2cpp_method_at(ret);
+        Dl_info rdi;
+        if (mm)                      fprintf(f, "    #%-2d %s  [%s+0x%zx]\n", depth, mm,
+                                             rimg ? rimg : "?", roff);
+        else if (rimg)               fprintf(f, "    #%-2d %s+0x%zx\n", depth, rimg, roff);
+        else if (dladdr(ret, &rdi) && rdi.dli_sname)
+            fprintf(f, "    #%-2d %s+0x%tx\n", depth, rdi.dli_sname,
+                    (const char *)ret - (const char *)rdi.dli_saddr);
+        else                         fprintf(f, "    #%-2d %p\n", depth, ret);
+        void **next = (void **)fp[0];
+        if (next <= fp) break;                  // stacks grow down; anything else is junk
+        fp = next;
+    }
+    fflush(f);
+}
+
+// Is `n` bytes at `p` actually mapped and readable?
+//
+// Every dereference the reporter makes goes through here first. It is reading
+// memory in a process that has already proved it cannot be trusted, and a
+// second fault inside a signal handler does not produce a second report — it
+// produces no report at all, from the run that most needed one.
+static int klf_readable(const void *p, size_t n) {
+    if (!p) return 0;
+    vm_address_t start = (vm_address_t)(uintptr_t)p;
+    vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    if (vm_region_64(mach_task_self(), &start, &sz, VM_REGION_BASIC_INFO_64,
+                     (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS)
+        return 0;
+    if (start > (vm_address_t)(uintptr_t)p) return 0;          // landed in a hole
+    if (!(info.protection & VM_PROT_READ)) return 0;
+    return (vm_address_t)(uintptr_t)p + n <= start + sz;
+}
+
+// This has to survive being called in a broken process, so it uses write(2)
+// rather than stdio and does not attempt a symbolised backtrace.
+static volatile unsigned long g_x18_recoveries;
+
+static void report_fault(int sig, siginfo_t *si, void *uctx) {
+    // Our own handler, so this is a Darwin ucontext_t and reading it is safe.
+    // The layout mismatch only bites the GUEST's handlers.
+    ucontext_t *uc = uctx;
+
+    // ---- x18-veneer race recovery (see kl_x18.c, KLX_HZ_TERMBR) ----------
+    // Darwin's kernel zeroes x18 on every exception return — x18 is the reserved
+    // platform register. The `br x18` veneer holds its target in x18 across two
+    // one-instruction windows:
+    //
+    //      mrs x18, tpidrro_el0        <-- window 1: a zero here makes the ldr
+    //      ldr x18, [x18, #slot*8]         dereference 0 -> fault at slot*8
+    //      br  x18                     <-- window 2: a zero here branches to 0
+    //
+    // Both are unclosable in pure code (a64 has no memory-indirect branch), but
+    // both are RECOVERABLE: the TSD slot still holds the guest's intended x18,
+    // which is the branch target, so we recompute it and resume the guest there.
+    // Window 1 is unambiguous — nothing but this veneer ever faults at exactly
+    // slot*8. Window 2 (fault at 0, pc 0) is guarded by requiring the recovered
+    // target to resolve into a mapped guest image, so an ordinary null call is
+    // not silently redirected.
+    if (uc && (sig == SIGSEGV || sig == SIGBUS)) {
+        uintptr_t fa = si ? (uintptr_t)si->si_addr : (uintptr_t)-1;
+        uintptr_t fpc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+        int win1 = (fa == (uintptr_t)KLX_TSD_SLOT * 8);
+        int win2 = (fa == 0 && fpc == 0);
+        if (win1 || win2) {
+            void *target = pthread_getspecific(KLX_TSD_SLOT);
+            size_t toff = 0;
+            int target_is_guest = target && kl_addr_image(target, &toff) != NULL;
+            // window 1 is self-identifying; window 2 must land in guest code.
+            if (target && (win1 || target_is_guest)) {
+                uc->uc_mcontext->__ss.__pc    = (uint64_t)(uintptr_t)target;
+                uc->uc_mcontext->__ss.__x[18] = (uint64_t)(uintptr_t)target;
+                unsigned long n = ++g_x18_recoveries;
+                if (n <= 8 || n % 1000 == 0) {
+                    char rb[192];
+                    int rn = snprintf(rb, sizeof rb,
+                        "[x18] recovered veneer race (window %d) -> resumed guest at "
+                        "%p [%s] (recovery #%lu)\n",
+                        win1 ? 1 : 2, target,
+                        target_is_guest ? kl_addr_image(target, &toff) : "?", n);
+                    if (rn > 0) klf_emit(rb, (size_t)rn);
+                }
+                return;   // resume the guest at the real jump-table target
+            }
+        }
+    }
+    // Before anything else can fail: a report that is written only after the
+    // interesting work has succeeded is missing exactly when it is needed.
+    if (g_crash_path[0] && g_crash_fd < 0)
+        g_crash_fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    void *pc = uc ? (void *)uc->uc_mcontext->__ss.__pc : NULL;
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+
+    size_t      off = 0;
+    const char *img = kl_addr_image(pc, &off);
+    // Not a guest image, so it is ours or the system's — dladdr names it, which
+    // turns "<host>+0x0" into something actionable. Only safe-ish because we are
+    // already dying; it is not async-signal-safe.
+    Dl_info di;
+    if (!img && pc && dladdr(pc, &di) && di.dli_sname) {
+        img = di.dli_sname;
+        off = (size_t)((const char *)pc - (const char *)di.dli_saddr);
+    }
+
+    char buf[256];
+    int  n = snprintf(buf, sizeof buf,
+                      "\n[klepton] fault: signal %d at %p, pc %s+0x%zx (%p), thread %llu%s\n",
+                      sig, si ? si->si_addr : NULL, img ? img : "<host>", off, pc,
+                      (unsigned long long)tid,
+                      pthread_main_np() ? " (main)" : " (a guest worker thread)");
+    if (n > 0) { klf_emit(buf, (size_t)n); }
+
+    // WHAT KIND OF PAGE the address is, for a memory fault.
+    //
+    // "signal 10 at 0x13fc5c000" and "signal 11 at 0x9c0" are different bugs
+    // that the signal number alone barely separates, and the interesting middle
+    // case is invisible without this: an address that IS mapped, at a
+    // protection that refuses the access. A page-aligned SIGBUS one page past
+    // live data is a GUARD page — a buffer walked off its end — and reads
+    // identically to an unmapped address from here.
+    //
+    // mach_vm_region names the enclosing region and its protection, so the line
+    // says which of the three it is. It is not async-signal-safe and neither is
+    // anything else in this function; we are already dying.
+    if ((sig == SIGSEGV || sig == SIGBUS) && si && si->si_addr) {
+        // vm_region_64, not mach_vm_region: `mach/mach_vm.h` is an `#error` on
+        // the xrOS SDK, and on arm64 vm_address_t is 64 bits anyway, so the
+        // portable spelling loses nothing and builds for every platform this
+        // reporter has to exist on.
+        vm_address_t a = (vm_address_t)(uintptr_t)si->si_addr;
+        vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        vm_address_t start = a;
+        kern_return_t kr = vm_region_64(mach_task_self(), &start, &sz,
+                                        VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS)
+            n = snprintf(buf, sizeof buf,
+                         "    the address is in NO mapping at all\n");
+        else if (start > a)
+            // The first region at or after the address starts past it, so the
+            // address itself is in a hole.
+            n = snprintf(buf, sizeof buf,
+                         "    the address is UNMAPPED — the next region starts "
+                         "%llu bytes on\n", (unsigned long long)(start - a));
+        else
+            n = snprintf(buf, sizeof buf,
+                         "    in a %llu-byte region at %p, prot %c%c%c (max %c%c%c)"
+                         "%s%s\n",
+                         (unsigned long long)sz, (void *)(uintptr_t)start,
+                         info.protection & VM_PROT_READ    ? 'r' : '-',
+                         info.protection & VM_PROT_WRITE   ? 'w' : '-',
+                         info.protection & VM_PROT_EXECUTE ? 'x' : '-',
+                         info.max_protection & VM_PROT_READ    ? 'r' : '-',
+                         info.max_protection & VM_PROT_WRITE   ? 'w' : '-',
+                         info.max_protection & VM_PROT_EXECUTE ? 'x' : '-',
+                         info.protection == VM_PROT_NONE
+                             ? " — a GUARD page: something walked off the end of "
+                               "the mapping before it" : "",
+                         info.reserved ? " (reserved)" : "");
+        if (n > 0) { klf_emit(buf, (size_t)n); }
+    }
+
+    // THE REGISTER FILE, and the guest's logical x18 beside it.
+    //
+    // A guest fault's whole diagnosis is usually "which operand was wrong", and
+    // the frame chain cannot say — it names the callers of a function whose
+    // arguments are long gone. `ldrh w22, [x9]` faulting at 0 is a different bug
+    // depending on whether x9 came out of the veneer or out of the guest's own
+    // arithmetic, and that is one word of state.
+    //
+    // x18 is printed SEPARATELY and from the TSD slot rather than from the
+    // context, because the architectural x18 carries nothing here: every guest
+    // access to it is veneered to tsd[KLX_TSD_SLOT] (kl_x18.c), so the register
+    // in the ucontext is Darwin's reserved value and the slot is the guest's.
+    // Reading the register instead reports the platform's business as the
+    // guest's.
+    if (uc) {
+        const uint64_t *x = (const uint64_t *)uc->uc_mcontext->__ss.__x;
+        for (int i = 0; i < 29; i += 4) {
+            int m = snprintf(buf, sizeof buf,
+                             "    x%-2d %016llx  x%-2d %016llx  x%-2d %016llx  "
+                             "x%-2d %016llx\n",
+                             i, (unsigned long long)x[i],
+                             i + 1, (unsigned long long)x[i + 1],
+                             i + 2, (unsigned long long)x[i + 2],
+                             i + 3, (unsigned long long)x[i + 3]);
+            if (m > 0) { klf_emit(buf, (size_t)m); }
+        }
+        int m = snprintf(buf, sizeof buf,
+                         "    fp  %016llx  lr  %016llx  sp  %016llx  "
+                         "x18 %016llx (the GUEST's, from tsd[%d])\n",
+                         (unsigned long long)uc->uc_mcontext->__ss.__fp,
+                         (unsigned long long)uc->uc_mcontext->__ss.__lr,
+                         (unsigned long long)uc->uc_mcontext->__ss.__sp,
+                         (unsigned long long)(uintptr_t)
+                             pthread_getspecific(KLX_TSD_SLOT),
+                         KLX_TSD_SLOT);
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+    }
+
+    // The x18-veneer TSD read: `ldr x18, [x18, #KLX_TSD_SLOT*8]` after
+    // `mrs x18, tpidrro_el0`. A fault whose address is exactly that offset means
+    // the veneer's mrs produced a zero base — the thread pointer was 0 when the
+    // veneer ran, even though pthread_getspecific works here now. Read the live
+    // tpidrro_el0 in the handler so a transient-zero can be told from a thread
+    // that genuinely has no thread pointer, which is the open question on the
+    // Liminal animation-worker crash.
+    if ((sig == SIGSEGV || sig == SIGBUS) && si &&
+        (uintptr_t)si->si_addr == (uintptr_t)KLX_TSD_SLOT * 8) {
+        uint64_t tp_now = 0;
+        __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp_now));
+        int m = snprintf(buf, sizeof buf,
+                         "    [x18] veneer TSD read faulted at slot %d (off 0x%x): "
+                         "the mrs saw tpidrro_el0=0; live tpidrro_el0 now = 0x%llx "
+                         "(%s)\n",
+                         KLX_TSD_SLOT, (unsigned)KLX_TSD_SLOT * 8,
+                         (unsigned long long)tp_now,
+                         tp_now ? "valid now -> transient/racy zero during the veneer"
+                                : "still zero -> this thread has no thread pointer");
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+    }
+
+    // WHO DISPATCHED IT — lr, named the way pc is named.
+    //
+    // **For a fault whose pc is not mapped, this is the whole answer and the
+    // frame chain is not.** A branch through a bad function pointer (`br x3`)
+    // is a TAIL call: it leaves x30 pointing into the caller and never builds a
+    // frame, so the fp chain below either describes some older frame or, if x29
+    // was reused, is garbage — one such crash symbolised as a host variable
+    // plus a 16-digit offset, which is a wrong answer wearing the shape of a
+    // right one. x30 is the caller, directly, with no walk to be wrong about.
+    if (uc) {
+        void *lr = (void *)uc->uc_mcontext->__ss.__lr;
+        size_t loff = 0;
+        const char *limg = kl_addr_image(lr, &loff);
+        const char *lmm = kl_il2cpp_method_at(lr);
+        Dl_info ldi;
+        int m;
+        if (lmm)
+            m = snprintf(buf, sizeof buf, "    lr (who called it): %s  [%s+0x%zx]\n",
+                         lmm, limg ? limg : "?", loff);
+        else if (limg)
+            m = snprintf(buf, sizeof buf, "    lr (who called it): %s+0x%zx\n",
+                         limg, loff);
+        else if (dladdr(lr, &ldi) && ldi.dli_sname && ldi.dli_fname)
+            m = snprintf(buf, sizeof buf, "    lr (who called it): %s`%s+0x%tx\n",
+                         ldi.dli_fname, ldi.dli_sname,
+                         (const char *)lr - (const char *)ldi.dli_saddr);
+        else
+            m = snprintf(buf, sizeof buf, "    lr (who called it): %p — in no known image\n", lr);
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+    }
+
+    // WHAT EACH REGISTER POINTS AT, for the registers that point at anything.
+    //
+    // The register file says which operand was wrong; this says what was in it.
+    // The case it exists for is a value that is not a pointer at all and is not
+    // obviously wrong either — a corrupted dispatch slot reads as a plausible
+    // address until you notice its bytes spell text, and then the ASCII column
+    // names the data that overwrote it. Sixteen bytes is enough for that and
+    // short enough that thirty-one of them stay readable.
+    //
+    // vm_region first, every time: the whole point is to survive a process that
+    // is already broken, so a pointer is only followed once the kernel has said
+    // the page is there and readable. An unreadable one prints nothing rather
+    // than taking the reporter down with it.
+    // KL_FAULT_PEEK is how many bytes per register, rounded down to a row of 16.
+    // The default is one row, which is enough to see that a value is text; a
+    // bigger one is for the question "is this object live or is it freed memory
+    // somebody else has since written" — that needs the shape of the whole
+    // object, not its first word.
+    int want = kl_env_int("KL_FAULT_PEEK", 16);
+    if (want < 16) want = 16;
+    if (want > 512) want = 512;
+    if (uc) {
+        const uint64_t *x = (const uint64_t *)uc->uc_mcontext->__ss.__x;
+        for (int i = 0; i < 29; i++) {
+            uint64_t v = x[i];
+            if (v < 0x1000 || (v & 3)) continue;      // not a plausible pointer
+            if (!klf_readable((const void *)(uintptr_t)v, 16)) continue;
+            const unsigned char *b = (const unsigned char *)(uintptr_t)v;
+            for (int row = 0; row < want / 16; row++) {
+                if (!klf_readable(b + row * 16, 16)) break;
+                char hex[64], asc[24];
+                for (int k = 0; k < 16; k++) {
+                    static const char d[] = "0123456789abcdef";
+                    unsigned char c = b[row * 16 + k];
+                    hex[k * 3 + 0] = d[c >> 4];
+                    hex[k * 3 + 1] = d[c & 15];
+                    hex[k * 3 + 2] = ' ';
+                    asc[k] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+                }
+                hex[48] = 0; asc[16] = 0;
+                int m = row == 0
+                    ? snprintf(buf, sizeof buf, "    [x%-2d]        %s |%s|\n", i, hex, asc)
+                    : snprintf(buf, sizeof buf, "          +0x%-3x %s |%s|\n",
+                               row * 16, hex, asc);
+                if (m > 0) { klf_emit(buf, (size_t)m); }
+            }
+        }
+    }
+
+    // THE INSTRUCTION WORD AT THE PC, and its two neighbours.
+    //
+    // "pc libUE4.so+0x975710c" identifies a site in the FILE, and the file is
+    // not what is executing: kl_image.c rewrites TLS reads and replaces every
+    // x18 site with a branch to a veneer, so an offset that disassembles as
+    // `ldrh w22, [x18]` in the .so may be a `b` in memory. Reading the offset
+    // back out of the image and reasoning about the original word is how a
+    // an x18 bug gets diagnosed when the veneer is working.
+    //
+    // Four words, because the interesting question is usually whether the pc is
+    // inside a veneer body (a `stp`/`mrs`/`ldr` prologue is unmistakable) or in
+    // the guest's own code.
+    //
+    // **The pc is only read once the kernel says it is there.** When the fault
+    // is a BRANCH to a bad address the pc IS that address, so reading it faults
+    // a second time — inside the handler, which then dies without printing the
+    // frame chain. That is the worst possible moment to lose: a jump through a
+    // corrupted function pointer says nothing about who dispatched it, and the
+    // frame chain immediately below is the only thing that does.
+    if (pc && klf_readable(pc, 16)) {
+        const uint32_t *w = (const uint32_t *)((uintptr_t)pc & ~(uintptr_t)3);
+        // [-1] is behind `pc`, so it needs its own check.
+        uint32_t prev = klf_readable((const char *)w - 4, 4) ? w[-1] : 0;
+        int m = snprintf(buf, sizeof buf,
+                         "    insn at pc: %08x  [-1] %08x  [+1] %08x  [+2] %08x\n",
+                         w[0], prev, w[1], w[2]);
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+    } else if (pc) {
+        int m = snprintf(buf, sizeof buf,
+                         "    insn at pc: UNREADABLE — the pc itself is not mapped, "
+                         "so this fault is a BRANCH to a bad address, not a bad "
+                         "access by a good instruction. The frames below are who "
+                         "dispatched it.\n");
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+    }
+
+    // Walk the frame chain. The faulting pc is usually in libsystem — memmove
+    // with a null pointer says nothing about who passed it — so what matters is
+    // the first guest frame above it. AAPCS64 keeps x29 as the frame pointer and
+    // stores {fp, lr} at [fp], which both the guest and our own code honour.
+    // AArch64 keeps the frame pointer 16-byte aligned; anything else is not a
+    // frame and walking it manufactures callers that were never there.
+    void **fp = uc ? (void **)uc->uc_mcontext->__ss.__fp : NULL;
+    if ((uintptr_t)fp & 15) {
+        int m = snprintf(buf, sizeof buf,
+                         "    fp %p is not 16-byte aligned — not a frame chain, "
+                         "not walked. Use lr above.\n", (void *)fp);
+        if (m > 0) { klf_emit(buf, (size_t)m); }
+        fp = NULL;
+        // The frame chain is smashed, so scan the stack conservatively instead:
+        // every word above sp that points into code, oldest callers last. Some
+        // are stale, but the call path that led here is among them.
+        void **sp = uc ? (void **)uc->uc_mcontext->__ss.__sp : NULL;
+        for (int i = 0, shown = 0; sp && i < 2048 && shown < 40; i++) {
+            if (!klf_readable(sp + i, 8)) break;
+            void *w = sp[i];
+            size_t woff = 0;
+            const char *wimg = kl_addr_image(w, &woff);
+            Dl_info wdi;
+            int host = !wimg && w && dladdr(w, &wdi) && wdi.dli_sname;
+            if (!wimg && !host) continue;
+            m = host ? snprintf(buf, sizeof buf, "    stack[sp+%#x] %s+%#zx\n", i * 8, wdi.dli_sname,
+                                (size_t)((char *)w - (char *)wdi.dli_saddr))
+                     : snprintf(buf, sizeof buf, "    stack[sp+%#x] %s+%#zx\n", i * 8, wimg, woff);
+            if (m > 0) { klf_emit(buf, (size_t)m); }
+            shown++;
+        }
+    }
+    for (int depth = 0; fp && klf_readable(fp, 16) && depth < 12; depth++) {
+        void *ret = fp[1];
+        if (!ret) break;
+        size_t roff = 0;
+        const char *rimg = kl_addr_image(ret, &roff);
+        const char *mm = kl_il2cpp_method_at(ret);
+        Dl_info rdi;
+        if (mm)
+            n = snprintf(buf, sizeof buf, "    #%-2d %s  [%s+0x%zx]\n", depth, mm,
+                         rimg ? rimg : "?", roff);
+        else if (rimg)
+            n = snprintf(buf, sizeof buf, "    #%-2d %s+0x%zx\n", depth, rimg, roff);
+        else if (dladdr(ret, &rdi) && rdi.dli_sname)
+            n = snprintf(buf, sizeof buf, "    #%-2d %s+0x%tx\n", depth, rdi.dli_sname,
+                         (const char *)ret - (const char *)rdi.dli_saddr);
+        else
+            n = snprintf(buf, sizeof buf, "    #%-2d %p\n", depth, ret);
+        if (n > 0) { klf_emit(buf, (size_t)n); }
+        void **next = (void **)fp[0];
+        if (next <= fp) break;                  // stacks grow down; anything else is junk
+        fp = next;
+    }
+
+    // SIGABRT here is usually the *guest* dying, not us — Unity's audio thread
+    // aborts outright when FMOD cannot open an output device. Those paths never
+    // touch kl_fatal_prepare(), so this is the only place the graphics surface
+    // report can still be emitted. Not async-signal-safe, but nothing after this
+    // point is going to run anyway.
+    // SIGALRM means the guest is still alive and blocked, which is a different
+    // question from a crash — the surface reports say how far it got and what it
+    // was waiting on, so emit them here too.
+    // Print on every fatal signal, not just the orderly ones. A SIGSEGV loses
+    // the surface reports otherwise, and under KL_PERMISSIVE a crash is the
+    // *expected* end of a scouting run — the guest carries on with answers we
+    // invented and eventually walks into one.
+    if (sig == SIGABRT || sig == SIGALRM || sig == SIGSEGV || sig == SIGBUS ||
+        sig == SIGTRAP || sig == SIGILL || sig == SIGFPE) {
+        for (unsigned i = 0; i < g_extra_n; i++) g_extra[i](stderr);
+        kl_pthread_report(stderr);
+        kl_egl_report(stderr);
+        kl_opensl_report(stderr);
+        kl_ovrp_report(stderr);
+        kl_ovrplat_report(stderr);
+        kl_openxr_report(stderr);
+        kl_mediandk_report(stderr);
+        kl_aaudio_report(stderr);
+    }
+
+    // KL_FAULT_WAIT=1: park here instead of dying so a debugger can attach and
+    // inspect every thread at the moment of the fault. This exists because the
+    // AGX abort is masked when the guest runs *under* lldb from the start (the
+    // debugger's signal traffic serializes the run enough to avoid the race),
+    // so the only way to get a symbolicated look at it is post-mortem attach.
+    if (kl_env_on("KL_FAULT_WAIT", 0)) {
+        n = snprintf(buf, sizeof buf,
+                     "[klepton] KL_FAULT_WAIT: pid %d parked on signal %d — "
+                     "attach with `lldb -p %d`, then `bt all`\n", getpid(), sig,
+                     getpid());
+        if (n > 0) { klf_emit(buf, (size_t)n); }
+        for (;;) pause();
+    }
+
+    // The subsystem reports above go through stdio to stderr, so push them into
+    // the same file before it closes — otherwise the crash copy has the
+    // registers and not the surface state, which is half an answer.
+    fflush(stderr);
+    fflush(stdout);
+
+    // fsync before dying, not just close: the report is worth nothing if it is
+    // still in the page cache when the process goes away.
+    if (g_crash_fd >= 0) {
+        fsync(g_crash_fd);
+        close(g_crash_fd);
+        g_crash_fd = -1;
+    }
+
+    // Die of the original signal, so whoever is watching still reports it as one.
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void kl_fault_install(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = report_fault;
+    sa.sa_flags     = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGALRM, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);   // guest __builtin_trap / brk assertions
+    // SIGILL was missing here for the whole project, and `kl_fatal_prepare()`
+    // has always known about it — its restore list is
+    // {ABRT, SEGV, BUS, ILL, FPE, TRAP} — so the asymmetry was visible and
+    // nothing had ever raised one. The first Steam Link shell run on a physical
+    // Vision Pro did: it died with `App terminated due to signal 4` and a log
+    // that simply stopped, which reads as a hang or an OS kill rather than as a
+    // crash with a pc. An undefined instruction is exactly the failure a guest
+    // executing DATA produces, so it is the last signal that should be silent
+    // here.
+    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGFPE,  &sa, NULL);
+}

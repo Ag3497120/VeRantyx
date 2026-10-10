@@ -1,0 +1,5 @@
+.build/
+App/build/
+App/shots/
+App/Glovebox.xcodeproj/
+App/Glovebox/Info.plist

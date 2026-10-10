@@ -1,0 +1,35 @@
+{
+  "id": "alyx",
+  "game": "Half-Life: Alyx",
+  "app_name": "Glovebox: HLA",
+  "icon": "icon/",
+  "steam": {
+    "app": 546560,
+    "depots": { "content": 546561, "linux-arm64": 546564 },
+    "build": 25487405,
+    "manifests": { "546561": "1436897171613240821", "546564": "9198205754520568813" },
+    "mac_download": [
+      "game/bin/linuxsteamrtarm64/",
+      "game/hlvr/bin/linuxsteamrtarm64/",
+      "game/core/shaders_vulkan_",
+      "game/hlvr/shaders_vulkan_"
+    ],
+    "headset_download": "everything except the x86-64 and Windows binaries (the launcher's GameProfile.halfLifeAlyx)"
+  },
+  "runtime_debs": "runtime-debs.json",
+  "defaults": {
+    "env": "defaults/DEMO.txt",
+    "convars": "defaults/app-convars.lua",
+    "fidelity": "defaults/vr_fidelity_fixed_1.0.csv",
+    "video": "defaults/video2-visionpro-demo.txt",
+    "purpose_strings": "defaults/purpose-strings.plist",
+    "texture_max": 1024,
+    "device_info": "defaults/device-info.json"
+  },
+  "pipelines": "pipelines/",
+  "requires": {
+    "headset": "Apple Vision Pro (tested on M5; M2 untested)",
+    "controllers": "PlayStation VR2 Sense controllers",
+    "developer_program": "paid (the game needs the Increased Memory Limit entitlement)"
+  }
+}

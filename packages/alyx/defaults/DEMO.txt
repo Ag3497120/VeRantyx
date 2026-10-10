@@ -1,0 +1,15 @@
+# DEMO: the locked demo settings (2026-09-29; validated by a headset run, batch-0929-2323: "looked great").
+# Identical to FIX-B4-demo.txt (the test twin, variant FIXB4DEMO) without the recorder, the stills and the per-pass
+# capture. 4x MSAA at 2784x2208 per eye (17 px/deg), asymmetric frustum, scale 1.0 (density from KLVR_EYE_SIZE, a
+# multiple of 96), merged scene passes, no foveation, no FXAA/sharpening/depth re-aim, texture-streaming throttle x2,
+# compositor render quality 0.40. KL_GUEST_PACE_HZ=60 paces to every 2nd display frame: 45 fps at 90 Hz, 60 fps at
+# 120 Hz (the device gave 120 Hz in the validation run). Convars: FIX-demo-convars.lua (AO proxies off, the fixed
+# table pinned at every spawn); video settings video2-visionpro-demo.txt; fidelity table vr_fidelity_fixed_1.0.csv.
+KL_ALYX_PROFILE_ARGS=+vr_fidelity_level_auto 0 +vr_fidelity_level 0 +vr_msaa 4 +vr_symmetric_fov 0 +r_texture_stream_throttle_count 6 +r_texture_stream_throttle_amount 20 +log_verbosity VR max
+KLVR_EYE_SIZE=2784,2208
+KL_GUEST_PACE_HZ=60
+KL_VK_MERGE=1
+KL_VK_MERGE_VIS=1
+KLVR_PACE_FALLBACK=0
+KL_CP_QUALITY=0.40
+KL_VRR=0

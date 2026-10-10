@@ -1,0 +1,114 @@
+{
+ "note": "Debian's arm64 builds of the C++ runtime and libraries the game expects from the system; fetched from snapshot.debian.org by content hash and checked against sha256. `files` are the libraries the game loads, copied out of the packages under these names.",
+ "packages": [
+  {
+   "file": "libatomic1_14.2.0-19_arm64.deb",
+   "sha256": "7ccff90234484bf21ae5ecb79d25b6a84b2f4038f65dd139085b2e3a937cd8dc",
+   "url": "https://snapshot.debian.org/file/1c253948664b91d1351b0fe793a8528d75369561"
+  },
+  {
+   "file": "libblkid1_2.42.4-1_arm64.deb",
+   "sha256": "53ee740e15f0435ddfefc5a532208d0e984fcf1dcc6d19197211470c1ce32a61",
+   "url": "https://snapshot.debian.org/file/0c9d624f33c89673bc536934d8bca041272fb634"
+  },
+  {
+   "file": "libbrotli1_1.2.0-4+b1_arm64.deb",
+   "sha256": "a82df9802badacb22de9d7103f0093b587c1779df5d830c197afbc6e100b43e9",
+   "url": "https://snapshot.debian.org/file/426b0f4af146b651a9788b3b9fb43199b15a0bbf"
+  },
+  {
+   "file": "libbz2-1.0_1.0.8-6_arm64.deb",
+   "sha256": "3537fe4fc577a60c8a9568873cd577db7ebc135eb8bb1825f18caf8972d9d2f2",
+   "url": "https://snapshot.debian.org/file/776bcf9f762ce2e2a1af4b72a697817058c9ece4"
+  },
+  {
+   "file": "libexpat1_2.8.5-1_arm64.deb",
+   "sha256": "74780f62a8fca12f5953b7122d676c100d8c02dabc900d5fc4dcb7f594757b16",
+   "url": "https://snapshot.debian.org/file/b8c913be90109efc1c46d6e61f99fef79f9b800c"
+  },
+  {
+   "file": "libffi8_3.8.0-2_arm64.deb",
+   "sha256": "b6e6930ad3b9423237fb64bcf5fb65fdd36890613b7f083094fcf16041c5e851",
+   "url": "https://snapshot.debian.org/file/abe192583cfd50f21b9f85bd2c0dfc0205adc509"
+  },
+  {
+   "file": "libfribidi0_1.0.16-5+b1_arm64.deb",
+   "sha256": "88defb3c6c3edcef1010083fe225402446337df98e338170a6c7b3c9cdfcfcef",
+   "url": "https://snapshot.debian.org/file/9190f5b90d75f832705be63b9124c6e759720d3a"
+  },
+  {
+   "file": "libgcc-s1_14.2.0-19_arm64.deb",
+   "sha256": "1108bc87879833d6d9a145f22a4a15cddb34e065b4b5f4b97bee586adbac2851",
+   "url": "https://snapshot.debian.org/file/8f3629cf95590aa5492ea87bbfd3ae785c99ebf3"
+  },
+  {
+   "file": "libglib2.0-0t64_2.90.0-1_arm64.deb",
+   "sha256": "c617600f309a7d0e7067a619657cc022a20f77d664324d56a1c26c7fe4356d31",
+   "url": "https://snapshot.debian.org/file/889e133aeb69bd176e1f86b611a5c7520e12ceda"
+  },
+  {
+   "file": "libmount1_2.42.4-1_arm64.deb",
+   "sha256": "75557252326f9a911a4a0b7f4ee99b61cb73d9a92a25b7c93dd8bab16373e048",
+   "url": "https://snapshot.debian.org/file/5b4eebcd09cb6723305cd7012be3cbed6fd45bc3"
+  },
+  {
+   "file": "libogg0_1.3.5-3+b2_arm64.deb",
+   "sha256": "d59a83ab352bf0c16ce9513fdf264f87214813ca8c628c652801ef476ece8286",
+   "url": "https://snapshot.debian.org/file/dc0010c88284b88a4f92bb983ca2ec92b91c34fc"
+  },
+  {
+   "file": "libpcre2-8-0_10.48-3_arm64.deb",
+   "sha256": "29515761fbb78b363aecabb795cc5a0fd20ddfc11384c065aa89a2e465e7fb48",
+   "url": "https://snapshot.debian.org/file/5c14ac91b171e8dd548f973790bec800ebe4e906"
+  },
+  {
+   "file": "libpng16-16t64_1.6.58-1_arm64.deb",
+   "sha256": "3835c62ced8c5f4349439c88ada813dc9274f7a17b7cd535a22e0f1e34c9ea83",
+   "url": "https://snapshot.debian.org/file/6ce0c4eb037c5175cdb9f82b91c556ead6b18309"
+  },
+  {
+   "file": "libselinux1_3.11-2_arm64.deb",
+   "sha256": "61c955ed1b6dc7e99370d87a0b9ab6fd0e378766bdecf0a1e2f84e99644985bc",
+   "url": "https://snapshot.debian.org/file/896e9a5f479b6ac5989781ac7fd091cdf214d989"
+  },
+  {
+   "file": "libssl3t64_3.5.7-1~deb13u2_arm64.deb",
+   "sha256": "ec131326aa9fa9ec934eca386bc7991f328fe383eaefd3e43bd8901a9199c5ae",
+   "url": "https://snapshot.debian.org/file/0fe8373a670506d7e7633d3ddfc9a4f3f58bfe49"
+  },
+  {
+   "file": "libstdc++6_14.2.0-19_arm64.deb",
+   "sha256": "6669b0c52a2e7c6af9adfdabce3ff6e286065cdfbc7b85280862b5f799daebee",
+   "url": "https://snapshot.debian.org/file/4582e5523e677deab65d98eae40f56372f6dc456"
+  },
+  {
+   "file": "libzstd1_1.5.7+dfsg-1_arm64.deb",
+   "sha256": "924540bd59fdbfa77a0604360efdaca54411a43daf11c7e002a3c64791b67448",
+   "url": "https://snapshot.debian.org/file/fb2129135f3cc38e40faa0d7cdc7bc0048955075"
+  }
+ ],
+ "files": [
+  "libatomic.so.1",
+  "libblkid.so.1",
+  "libbrotlicommon.so.1",
+  "libbrotlidec.so.1",
+  "libbz2.so.1.0",
+  "libcrypto.so.3",
+  "libexpat.so.1",
+  "libffi.so.8",
+  "libfribidi.so.0",
+  "libgcc_s.so.1",
+  "libgio-2.0.so.0",
+  "libglib-2.0.so.0",
+  "libgmodule-2.0.so.0",
+  "libgobject-2.0.so.0",
+  "libmount.so.1",
+  "libogg.so.0",
+  "libpcre2-8.so.0",
+  "libpng16.so.16",
+  "libselinux.so.1",
+  "libssl.so.3",
+  "libstdc++.so.6",
+  "libzstd.so.1"
+ ]
+}

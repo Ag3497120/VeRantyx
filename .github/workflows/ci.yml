@@ -1,0 +1,14 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  scrub:
+    # Nothing from the game, no compiled shaders, no executables, no private identifiers: on every push.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.9" }
+      - run: python3 tools/scrub_check.py
+      - run: python3 tools/licenses.py check
+      - name: engine sources parse on the Python that ships with Xcode
+        run: python3 -m py_compile engine/*.py engine/gb/*.py klepton/tools/klepton_ldwrap.py klepton/visionos/gen_xcodeproj.py

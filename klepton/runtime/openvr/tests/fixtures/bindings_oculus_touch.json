@@ -1,0 +1,39 @@
+{
+  // SteamVR binding files may carry comments.
+  "controller_type": "oculus_touch",
+  "bindings": {
+    "/actions/default": {
+      "sources": [
+        { "path": "/user/hand/right/input/trigger", "mode": "trigger",
+          "inputs": { "click": { "output": "/actions/default/in/Trigger" },
+                      "pull": { "output": "/actions/default/in/TriggerPull" } } },
+        { "path": "/user/hand/left/input/joystick", "mode": "joystick",
+          "inputs": { "position": { "output": "/actions/default/in/Move" } } },
+        { "path": "/user/hand/right/input/joystick", "mode": "dpad",
+          "parameters": { "sub_mode": "touch" },
+          "inputs": { "north": { "output": "/actions/default/in/Teleport" } } },
+        { "path": "/user/hand/left/input/grip", "mode": "button",
+          "inputs": { "click": { "output": "/actions/default/in/Grab" } } },
+        { "path": "/user/hand/right/input/grip", "mode": "button",
+          "inputs": { "click": { "output": "/actions/default/in/Grab" } } }
+      ],
+      "poses": [
+        { "output": "/actions/default/in/HandPose", "path": "/user/hand/left/pose/raw" },
+        { "output": "/actions/default/in/HandPose", "path": "/user/hand/right/pose/raw" }
+      ],
+      "haptics": [
+        { "output": "/actions/default/out/Haptic", "path": "/user/hand/left/output/haptic" },
+        { "output": "/actions/default/out/Haptic", "path": "/user/hand/right/output/haptic" }
+      ],
+      "skeleton": [
+        { "output": "/actions/default/in/SkeletonLeft", "path": "/user/hand/left/input/skeleton/left" }
+      ]
+    },
+    "/actions/menu": {
+      "sources": [
+        { "path": "/user/hand/right/input/a", "mode": "button",
+          "inputs": { "click": { "output": "/actions/menu/in/Select" } } }
+      ]
+    }
+  }
+}

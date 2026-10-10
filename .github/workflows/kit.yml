@@ -1,0 +1,21 @@
+name: kit
+# The runtime kit (engine/kit/build-kit.sh) for a release: everything players link that is the same for everyone
+# and open source. Attached to the release the tag names; the Glovebox app downloads it from there.
+# Run by hand for now: GitHub's macOS images have to carry an Xcode with the visionOS SDK this build needs, which
+# is unverified; until then release kits are built with engine/kit/build-kit.sh on the maintainer's Mac.
+on:
+  workflow_dispatch:
+jobs:
+  kit:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: visionOS platform
+        run: xcodebuild -downloadPlatform visionOS
+      - run: brew install cmake
+      - run: KIT_VERSION=${GITHUB_REF_NAME} zsh engine/kit/build-kit.sh build/glovebox-kit
+      - uses: actions/upload-artifact@v4
+        with: { name: glovebox-kit, path: build/glovebox-kit.zip }
+      - if: startsWith(github.ref, 'refs/tags/')
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh release upload "$GITHUB_REF_NAME" build/glovebox-kit.zip --clobber

@@ -1,0 +1,127 @@
+From fad93b82c005ea92b5df00af940efc9650b58e83 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 27 Sep 2026 23:37:26 +0000
+Subject: [PATCH] m_alyx: bind libopenvr_api.so to the OpenVR shim
+
+- Makefile: build the project's shim/openvr (KLVR_DIR, default
+  runtime/openvr) into m_alyx when it is present; without it the build is
+  unchanged
+- m_alyx: libopenvr_api.so is served (never mapped) and its VR_* imports
+  resolve to the shim ahead of the glibc personality, in --run and --gap
+- no frame pacer is installed on the Mac, so the shim runs in host mode:
+  fixed head, still hands, timer-paced frames, no eye copies; the game's
+  own window is the picture
+---
+ Makefile       | 24 +++++++++++++++++++++---
+ mains/m_alyx.c | 33 +++++++++++++++++++++++++++++----
+ 2 files changed, 50 insertions(+), 7 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index de7281c..37a3f56 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1237,8 +1237,26 @@ build/kl_steamnet.o: runtime/linux/kl_steamnet.cpp $(wildcard runtime/linux/stea
+ 	@mkdir -p build
+ 	clang++ -std=c++17 -g -O1 -arch arm64 -Iruntime/linux -c -o $@ runtime/linux/kl_steamnet.cpp
+ 
+-build/m_alyx: mains/m_alyx.c $(RUNTIME) $(RUNTIME_LINUX) $(RUNTIME_HDRS) build/kl_steamnet.o
++# The OpenVR shim (the project repo's shim/openvr): Alyx's libopenvr_api.so,
++# replaced. Symlink runtime/openvr to it or pass KLVR_DIR=<path>. Without it
++# m_alyx builds as before and the VR_* imports stay unresolved (-novr runs).
++KLVR_DIR ?= runtime/openvr
++ifneq ($(wildcard $(KLVR_DIR)/src/klvr_core.cpp),)
++KLVR_SRC := $(wildcard $(KLVR_DIR)/src/klvr_*.cpp)
++KLVR_OBJ := $(patsubst $(KLVR_DIR)/src/%.cpp,build/klvr/%.o,$(KLVR_SRC)) build/klvr/klvr_platform_klepton.o
++KLVR_DEF := -DKL_OPENVR_SHIM -I$(KLVR_DIR)/src
++build/klvr/%.o: $(KLVR_DIR)/src/%.cpp $(wildcard $(KLVR_DIR)/src/*.h) $(wildcard $(KLVR_DIR)/src/generated/*)
++	@mkdir -p build/klvr
++	clang++ -std=c++17 -g -O1 -arch arm64 -fvisibility=hidden -Wall -Wextra -Wno-unused-parameter \
++	  -Werror=missing-declarations -DVR_API_EXPORT -I$(KLVR_DIR)/src -I$(KLVR_DIR)/third_party/openvr \
++	  $(MVK_INC) -c -o $@ $<
++build/klvr/klvr_platform_klepton.o: $(KLVR_DIR)/platform/klvr_platform_klepton.c $(KLVR_DIR)/src/klvr_platform.h
++	@mkdir -p build/klvr
++	$(CC) $(CFLAGS) -I$(KLVR_DIR)/src -c -o $@ $<
++endif
++
++build/m_alyx: mains/m_alyx.c $(RUNTIME) $(RUNTIME_LINUX) $(RUNTIME_HDRS) build/kl_steamnet.o $(KLVR_OBJ)
+ 	@mkdir -p build
+-	$(CC) $(CFLAGS) -fobjc-arc -o $@ mains/m_alyx.c $(RUNTIME) $(filter-out %.cpp,$(RUNTIME_LINUX)) \
+-	  build/kl_steamnet.o \
++	$(CC) $(CFLAGS) $(KLVR_DEF) -fobjc-arc -o $@ mains/m_alyx.c $(RUNTIME) $(filter-out %.cpp,$(RUNTIME_LINUX)) \
++	  build/kl_steamnet.o $(KLVR_OBJ) \
+ 	  $(LDLIBS) -framework Metal -framework QuartzCore -framework Foundation -framework CoreAudio -liconv -lc++ -Wl,-force_load,../src/LuaJIT/src/libluajit.a
+diff --git a/mains/m_alyx.c b/mains/m_alyx.c
+index 73466b5..c42ab54 100644
+--- a/mains/m_alyx.c
++++ b/mains/m_alyx.c
+@@ -5,6 +5,12 @@
+ // <game dir> is the depot's game/ folder; <sysroot dir> holds the guest C++
+ // runtime (Debian libstdc++.so.6, libgcc_s.so.1). --gap maps and relocates
+ // every library and prints the unresolved imports without running anything.
++//
++// Built with the OpenVR shim (KL_OPENVR_SHIM, see the Makefile), the game's
++// libopenvr_api.so is never loaded: its VR_* entry points bind to the shim,
++// so a run without -novr gets a headset. On the Mac there is none, and the
++// shim's host mode stands in (fixed head, still hands, the game's own window
++// as the picture); see shim/openvr/README.md in the project repo.
+ #include <dirent.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -16,6 +22,24 @@
+ #include "../runtime/kl_fault.h"
+ #include "../runtime/linux/kl_glibc.h"
+ 
++#ifdef KL_OPENVR_SHIM
++int klvr_klepton_claims(const char *soname);
++void *klvr_klepton_lookup(const char *name);
++#else
++static int klvr_klepton_claims(const char *soname) { (void)soname; return 0; }
++static void *klvr_klepton_lookup(const char *name) { (void)name; return NULL; }
++#endif
++
++// The glibc personality, with the OpenVR shim in front of it: libopenvr_api.so
++// is "served" (never mapped), and its imports resolve to the shim.
++static int alyx_serves_soname(const char *s) {
++    return klvr_klepton_claims(s) || kl_glibc_serves_soname(s);
++}
++static void *alyx_lookup(const char *name) {
++    void *p = name[0] == 'V' && name[1] == 'R' && name[2] == '_' ? klvr_klepton_lookup(name) : NULL;
++    return p ? p : kl_glibc_lookup(name);
++}
++
+ static const char *g_dirs[4];
+ static int g_ndirs;
+ 
+@@ -76,7 +100,7 @@ static kl_image *load(const char *path, int run_init) {
+     char names[48][128];
+     int nn = kl_list_needed(path, names, 48);
+     for (int i = 0; i < nn; i++) {
+-        if (kl_glibc_serves_soname(names[i]) || skipped(names[i])) continue;
++        if (alyx_serves_soname(names[i]) || skipped(names[i])) continue;
+         char full[1024];
+         if (!find_lib(names[i], full, sizeof full)) {
+             int dup = 0;
+@@ -138,8 +162,8 @@ static int run_launcher(const char *game, const char *sysroot, int gargc, char *
+     kl_set_library_path(bin);
+     kl_add_library_path(sysroot);
+     kl_add_library_path(hbin);
+-    kl_soname_served_hook = kl_glibc_serves_soname;
+-    kl_shim_override = kl_glibc_lookup;
++    kl_soname_served_hook = alyx_serves_soname;
++    kl_shim_override = alyx_lookup;
+     { extern void *kl_lua_preload(const char *); kl_preload_hook = kl_lua_preload; }
+     kl_fault_install();
+     if (getenv("KL_SIGWATCH")) { pthread_t t; pthread_create(&t, NULL, sigwatch, NULL); }
+@@ -193,7 +217,8 @@ int main(int argc, char **argv) {
+     g_dirs[g_ndirs++] = d1;
+     kl_set_library_path(d0);
+     kl_fault_install();
+-    kl_shim_override = kl_glibc_lookup;
++    kl_soname_served_hook = alyx_serves_soname;
++    kl_shim_override = alyx_lookup;
+ 
+     // The C++ runtime first, so every later image's C++ ABI imports bind to it.
+     char p[1024];
+-- 
+2.43.0
+

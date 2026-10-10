@@ -1,0 +1,129 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 47eb732..822fd60 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -353,7 +353,7 @@ if(APPLE)
+   target_link_libraries(SDL2 PRIVATE
+     "-Wl,-compatibility_version,${SDL_DYLIB_COMPAT_VERSION}"
+     "-Wl,-current_version,${SDL_DYLIB_CURRENT_VERSION}"
+-    "-Wl,-framework,AppKit"
++    "$<IF:$<STREQUAL:${CMAKE_SYSTEM_NAME},Darwin>,-Wl$<COMMA>-framework$<COMMA>AppKit,-Wl$<COMMA>-framework$<COMMA>Foundation>"
+   )
+   set_target_properties(SDL2 PROPERTIES
+       OUTPUT_NAME "SDL2-2.0"
+diff --git a/src/sdl2_compat.c b/src/sdl2_compat.c
+index 82fe255..8a452fe 100644
+--- a/src/sdl2_compat.c
++++ b/src/sdl2_compat.c
+@@ -203,8 +203,18 @@ do { \
+         SDL3_free(ptr);               \
+     }
+ 
++#ifdef SDL_PLATFORM_IOS
++/* visionOS port: SDL_opengl.h declares nothing on iOS-family platforms, but
++   this file needs the GL *types* (entry points come from SDL_GL_GetProcAddress),
++   so read it as a non-iOS platform would. */
++#undef SDL_PLATFORM_IOS
++#include <SDL3/SDL_opengl.h>
++#include <SDL3/SDL_opengl_glext.h>
++#define SDL_PLATFORM_IOS 1
++#else
+ #include <SDL3/SDL_opengl.h>
+ #include <SDL3/SDL_opengl_glext.h>
++#endif
+ 
+ /* !!! FIXME: collect all the properties in one place near the top of the source file */
+ #define PROP_WINDOW_BRIGHTNESS "sdl2-compat.window.brightness"
+@@ -404,6 +414,7 @@ static char loaderror[256];
+             "@loader_path/../Frameworks/" SDL3_FRAMEWORK, /* MyApp.app/Contents/Frameworks/SDL3.framework */
+             "@executable_path/" SDL3_LIBNAME, /* MyApp.app/Contents/MacOS/libSDL3.dylib */
+             "@executable_path/../Frameworks/" SDL3_FRAMEWORK, /* MyApp.app/Contents/Frameworks/SDL3.framework */
++            "@executable_path/Frameworks/SDL3.framework/SDL3", /* iOS/visionOS: MyApp.app/Frameworks/SDL3.framework (flat) */
+             NULL,  /* /Users/username/Library/Frameworks/SDL3.framework */
+             "/Library/Frameworks/" SDL3_FRAMEWORK, /* /Library/Frameworks/SDL3.framework */
+             SDL3_LIBNAME /* oh well, anywhere the system can see the .dylib (/usr/local/lib or whatever) */
+@@ -12719,7 +12730,7 @@ SDL_GDKRunApp(SDL_main_func mainFunction, void *reserved)
+ }
+ #endif
+ 
+-#ifdef SDL_PLATFORM_IOS
++#if defined(SDL_PLATFORM_IOS) && defined(SDL2COMPAT_IOS_EXTRAS) /* visionOS port: iOS-only extras compiled out */
+ SDL_DECLSPEC int SDLCALL
+ SDL_UIKitRunApp(int argc, char *argv[], SDL_main_func mainFunction)
+ {
+diff --git a/src/sdl2_compat_objc.m b/src/sdl2_compat_objc.m
+index 320a6ea..51feb33 100644
+--- a/src/sdl2_compat_objc.m
++++ b/src/sdl2_compat_objc.m
+@@ -22,6 +22,25 @@
+ /* This file contains some macOS-specific support code */
+ 
+ #if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++#if defined(__APPLE__) && !TARGET_OS_OSX
++/* iOS/tvOS/visionOS: no AppKit. Log through Foundation; a fatal error goes to
++   stderr (there is no modal alert to raise from here). */
++#include <Foundation/Foundation.h>
++#include <stdio.h>
++#define SDL2_PRIVATE __attribute__((visibility("hidden")))
++SDL2_PRIVATE void SDL2Compat_NSLog(const char *prefix, const char *text)
++{
++    @autoreleasepool {
++        NSLog(@"%s%s", prefix ? prefix : "", text ? text : "");
++    }
++}
++SDL2_PRIVATE void error_dialog(const char *errorMsg)
++{
++    fprintf(stderr, "sdl2-compat: fatal error: %s\n", errorMsg ? errorMsg : "(null)");
++}
++#elif defined(__APPLE__)
+ #include <Cocoa/Cocoa.h>
+ 
+ #if __GNUC__ >= 4
+diff --git a/src/sdl2_protos.h b/src/sdl2_protos.h
+index 32751ad..d00fd9b 100644
+--- a/src/sdl2_protos.h
++++ b/src/sdl2_protos.h
+@@ -63,8 +63,8 @@ SDL2_PROTO(int,Direct3D9GetAdapterIndex,(int a))
+ SDL2_PROTO(IDirect3DDevice9*,RenderGetD3D9Device,(SDL_Renderer *a))
+ #endif
+ 
+-#ifdef SDL_PLATFORM_IOS
+-SDL2_PROTO(int,iPhoneSetAnimationCallback,(SDL_Window *a, int b, void (SDLCALL *c)(void *))
++#if defined(SDL_PLATFORM_IOS) && defined(SDL2COMPAT_IOS_EXTRAS) /* visionOS port: iOS-only extras compiled out */
++SDL2_PROTO(int,iPhoneSetAnimationCallback,(SDL_Window *a, int b, void (SDLCALL *c)(void *)))
+ SDL2_PROTO(void,iPhoneSetEventPump,(SDL2_bool a))
+ #endif
+ 
+@@ -749,7 +749,7 @@ SDL2_PROTO(int,RenderFillRectsF,(SDL_Renderer *a, const SDL_FRect *b, int c))
+ SDL2_PROTO(int,RenderCopyF,(SDL_Renderer *a, SDL_Texture *b, const SDL_Rect *c, const SDL_FRect *d))
+ SDL2_PROTO(int,RenderCopyExF,(SDL_Renderer *a, SDL_Texture *b, const SDL_Rect *c, const SDL_FRect *d, const double e, const SDL_FPoint *f, const SDL_FlipMode g))
+ SDL2_PROTO(SDL_TouchDeviceType,GetTouchDeviceType,(SDL_TouchID a))
+-#ifdef SDL_PLATFORM_IOS
++#if defined(SDL_PLATFORM_IOS) && defined(SDL2COMPAT_IOS_EXTRAS) /* visionOS port: iOS-only extras compiled out */
+ SDL2_PROTO(int,UIKitRunApp,(int a, char *b[], SDL_main_func c))
+ #endif
+ SDL2_PROTO(size_t,SIMDGetAlignment,(void))
+@@ -783,7 +783,7 @@ SDL2_PROTO(void,OnApplicationWillResignActive,(void))
+ SDL2_PROTO(void,OnApplicationDidEnterBackground,(void))
+ SDL2_PROTO(void,OnApplicationWillEnterForeground,(void))
+ SDL2_PROTO(void,OnApplicationDidBecomeActive,(void))
+-#ifdef SDL_PLATFORM_IOS
++#if defined(SDL_PLATFORM_IOS) && defined(SDL2COMPAT_IOS_EXTRAS) /* visionOS port: iOS-only extras compiled out */
+ SDL2_PROTO(void,OnApplicationDidChangeStatusBarOrientation,(void))
+ #endif
+ #ifdef SDL_PLATFORM_ANDROID
+diff --git a/src/sdl3_syms.h b/src/sdl3_syms.h
+index 1836419..f8df78c 100644
+--- a/src/sdl3_syms.h
++++ b/src/sdl3_syms.h
+@@ -73,7 +73,7 @@ SDL3_SYM(bool,GetDXGIOutputInfo,(SDL_DisplayID a,int *b, int *c),(a,b,c),return)
+ SDL3_SYM_RENAMED_RETCODE(bool,GDKGetTaskQueue,GetGDKTaskQueue,(XTaskQueueHandle *a),(a),return)
+ SDL3_SYM_RENAMED_RETCODE(bool,GDKGetDefaultUser,GetGDKDefaultUser,(XUserHandle *a),(a),return)
+ #endif
+-#ifdef SDL_PLATFORM_IOS
++#if defined(SDL_PLATFORM_IOS) && defined(SDL2COMPAT_IOS_EXTRAS) /* visionOS port: iOS-only extras compiled out */
+ SDL3_SYM_RENAMED_RETCODE(bool,iPhoneSetAnimationCallback,SetiOSAnimationCallback,(SDL_Window *a, int b, SDL_iOSAnimationCallback c, void *d),(a,b,c,d),return)
+ SDL3_SYM(void,iPhoneSetEventPump,SetiOSEventPump,(bool a),(a),)
+ SDL3_SYM_PASSTHROUGH(void,OnApplicationDidChangeStatusBarOrientation,(void),(),)

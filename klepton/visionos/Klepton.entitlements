@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Memory. Both keys are supported on visionOS, neither needs Apple's approval
+  (Xcode's own capability database: supportedSDKs includes VISION_OS,
+  distributionApprovalRequired false), and automatic signing adds them to the
+  App ID on the next build with -allowProvisioningUpdates.
+
+  We want them because this app is not shaped like a normal one: it hosts a
+  whole other runtime. Measured on device at three swapchain stages, the
+  footprint is ~3.5 GB — IL2CPP's heap, Unity's assets and textures, ANGLE, and
+  ~490 MB of eye textures, with a transient spike at every loading transition
+  where two generations of the eye swapchain are briefly live at once.
+
+  increased-memory-limit
+      Raises the jetsam limit — how much the app may use before the OS kills it.
+      This is the one that matters for the transition spike.
+
+  extended-virtual-addressing
+      Raises the limit on address SPACE rather than resident memory. A separate
+      ceiling, and one this design leans on independently of footprint: the
+      guest ELF images are mmapped, the veneer pool and stub cells are mapped,
+      ANGLE maps its own, and the synthetic /proc tree is materialised on disk
+      and mapped too. Address space is cheap to consume and expensive to
+      discover you have run out of.
+
+  NOT increased-debugging-memory-limit: iOS only, no VISION_OS in its
+  supportedSDKs, and an entitlement the platform does not know is a
+  provisioning failure rather than a no-op.
+
+  ===========================================================================
+  And NOT com.apple.developer.networking.multicast, which was here and is gone.
+
+  Steam Link discovers hosts by UDP BROADCAST to port 27036 (SL-5 measured it),
+  and visionOS gates broadcast behind that entitlement — which Apple grants by
+  REQUEST rather than by ticking a capability box. That makes it categorically
+  different from the two above: they are self-service, it is a wait, and until
+  it is granted attaching it fails the BUILD and takes the memory pair with it.
+
+  It is not needed. kl_shim.c delivers the guest's broadcast as unicast to each
+  host on the subnet instead (`make bcast`), which needs only the free
+  local-network permission — Info.plist's NSLocalNetworkUsageDescription — and
+  that is what found the PC on a physical Vision Pro. Do not put it back
+  without a measurement saying the fan-out is insufficient; the entitlement is
+  also genuinely broad, since it lets the app send to and receive from every
+  device on the network, and the fan-out's reach is one subnet sweep.
+
+  ===========================================================================
+  low-latency-streaming, which is in the third category: WANTED, and NOT
+  self-service.
+
+  This app is a real-time video client — HEVC off the wire, decoded on
+  VideoToolbox, presented at display rate in an immersive space — which is the
+  workload the key names. Added at the user's request.
+
+  What is known and what is not, stated plainly so the next session does not
+  re-derive it: the key does not appear anywhere in the XROS SDK or Xcode's
+  Library tree. That is NOT evidence against it — neither of the two memory
+  keys above appears there either, and those demonstrably work, so Xcode's
+  capability database simply is not a greppable file. It is listed here as
+  unverified rather than as confirmed.
+
+  Because it is unverified it is FILTERABLE: gen_xcodeproj.py drops it when
+  KLEPTON_LOW_LATENCY=0, writing a generated copy. That exists for exactly the
+  failure the multicast section above describes — attaching a key the App ID
+  has not been granted, or that the platform does not recognise, fails the
+  whole signing step and takes the two memory keys with it. One knob, and the
+  memory keys survive.
+
+  It is also not a diagnosis. It was added while chasing a streaming
+  regression, and the change that actually altered what the client publishes to
+  the host is the interaction profile now being answered — KL_XR_PROFILE=0 in
+  runtime/xr/kl_openxr.c is that A/B. Settle the cause there before concluding
+  anything about this key.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>com.apple.developer.low-latency-streaming</key>
+	<true/>
+</dict>
+</plist>

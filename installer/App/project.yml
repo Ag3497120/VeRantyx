@@ -1,0 +1,97 @@
+# XcodeGen spec for the Glovebox Mac installer (`brew install xcodegen && xcodegen`).
+name: Glovebox
+options:
+  bundleIdPrefix: io.github.glovebox-vr
+  deploymentTarget:
+    macOS: "15.0"
+packages:
+  GloveboxKit:
+    path: ..
+  SteamLauncherKit:
+    path: ../../launcher
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.6.4
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Where Sparkle looks for new versions, and the public half of the EdDSA key that signs them
+    # (scripts/release.sh). Updates stay off until the key is set.
+    GLOVEBOX_APPCAST_URL: "https://github.com/glovebox-vr/glovebox/releases/latest/download/appcast.xml"
+    GLOVEBOX_SPARKLE_KEY: "TZcIH8qsRTrYYIG6eWvrZaVLZUxh0yp4zyuEpX7Or2M="
+    # The Steam session's keychain item; empty is the "(dev)" one. release.sh sets the real name.
+    GLOVEBOX_KEYCHAIN_SERVICE: ""
+targets:
+  Glovebox:
+    type: application
+    platform: macOS
+    sources:
+      - Glovebox
+    dependencies:
+      - package: GloveboxKit
+        product: GloveboxKit
+      - package: SteamLauncherKit
+        product: SteamLauncherKit
+      - package: Sparkle
+        product: Sparkle
+    info:
+      path: Glovebox/Info.plist
+      properties:
+        CFBundleDisplayName: Glovebox
+        CFBundleName: Glovebox
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.utilities
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSHumanReadableCopyright: "Open source. Not affiliated with Valve or Apple."
+        SUFeedURL: $(GLOVEBOX_APPCAST_URL)
+        SUPublicEDKey: $(GLOVEBOX_SPARKLE_KEY)
+        SUEnableAutomaticChecks: true
+        # The keychain item for the Steam session: only release.sh sets it (empty: the "(dev)" one, SteamKeychain)
+        GloveboxKeychainService: $(GLOVEBOX_KEYCHAIN_SERVICE)
+    entitlements:
+      path: Glovebox/Glovebox.entitlements
+      properties: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.glovebox-vr.installer
+        PRODUCT_NAME: Glovebox
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.0"
+        COMBINE_HIDPI_IMAGES: YES
+        # The "Hello" glove logo, drawn on the macOS icon grid.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # The engine-bundling script reads outside the target (the Glovebox source).
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    postCompileScripts:
+      - name: Bundle the engine
+        basedOnDependencyAnalysis: false
+        script: |
+          # The engine is the Glovebox source (engine/glovebox.py and what it builds from), run with
+          # Xcode's Python. GLOVEBOX_SRC is a glovebox-vr/glovebox checkout; GLOVEBOX_KIT_ZIP the
+          # runtime kit the release names. Without a source, Debug builds bundle the fake engine so
+          # the app runs end to end, and Release builds stop, so a release never ships without it.
+          res="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          # The kit goes at the source root as glovebox-kit.zip, where the engine looks for it
+          # (docs/INSTALLER.md, "Bundling"); the app copies the whole folder out before running it.
+          rm -rf "$res/glovebox" "$res/engine" "$res/kit.zip"
+          if [ -n "${GLOVEBOX_SRC:-}" ] && [ -f "$GLOVEBOX_SRC/engine/glovebox.py" ]; then
+            mkdir -p "$res/glovebox"
+            rsync -a --exclude .git --exclude build --exclude /src --exclude __pycache__ --exclude '.build' --exclude '*.xcodeproj' \
+              "$GLOVEBOX_SRC/" "$res/glovebox/"
+            if [ -n "${GLOVEBOX_KIT_ZIP:-}" ]; then cp "$GLOVEBOX_KIT_ZIP" "$res/glovebox/glovebox-kit.zip"; fi
+          elif [ "$CONFIGURATION" = "Debug" ]; then
+            mkdir -p "$res/engine" && cp "$SRCROOT/../FakeEngine/glovebox" "$res/engine/glovebox"
+          else
+            echo "error: no Glovebox source (set GLOVEBOX_SRC to a glovebox-vr/glovebox checkout)"; exit 1
+          fi
+          # Notarization needs every binary signed: sign the engine's with the app's identity.
+          if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "$EXPANDED_CODE_SIGN_IDENTITY" != "-" ]; then
+            find "$res/glovebox" "$res/engine" -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+              if file -b "$f" | grep -q Mach-O; then
+                codesign --force --options runtime --timestamp --sign "$EXPANDED_CODE_SIGN_IDENTITY" "$f"
+              fi
+            done
+          fi

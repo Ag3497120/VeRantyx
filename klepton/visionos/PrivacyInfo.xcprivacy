@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The app's privacy manifest (bundled by gen_xcodeproj.py with KLEPTON_ALYX_DEMO, i.e. release builds of the
+  Alyx app). No tracking, no data collected. The required-reason APIs the code calls, each with its reason:
+
+  UserDefaults (CA92.1, the app's own settings): KleptonChroma.swift, KleptonMic.swift, KleptonHL1.swift,
+    KleptonLauncher.swift.
+  File timestamps (C617.1, files inside the app container): stat/fstat/lstat in the glibc personality
+    (runtime/linux/kl_glibc.c, the game's own file checks) and runtime/libc; every file the game touches is in
+    the app's container.
+  Disk space (E174.1, checking there is room before writing): statfs/statvfs/fstatfs in the glibc personality,
+    answering the game's free-space checks before it writes saves and caches.
+  System boot time (35F9.1, elapsed time between events in the app): ProcessInfo.systemUptime in
+    KleptonControllers.swift and mach_absolute_time in runtime/xr/kl_ovrp.c (frame and input timing).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>C617.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>E174.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>35F9.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
