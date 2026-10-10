@@ -13,7 +13,9 @@ come from a pair of Nintendo Switch Joy-Con.
      on github.com, replace the poster link below with the generated
      https://github.com/user-attachments/... URL on its own line; GitHub then
      renders a player. -->
-[![Half-Life: Alyx in Apple Vision Pro, rendered on a MacBook Pro](docs/media/poster.jpg)](https://youtu.be/6xVGgdChDes)
+![Half-Life: Alyx in Apple Vision Pro: grabbing objects, then the room through the headset's passthrough](docs/media/highlight.gif)
+
+[![Watch the full recording on YouTube](docs/media/poster.jpg)](https://youtu.be/6xVGgdChDes)
 
 *54-second highlight: [docs/media/highlight.mp4](docs/media/highlight.mp4) — the last seconds show the room through the Vision Pro's passthrough, where it was recorded. Full 6-minute unedited recording: https://youtu.be/6xVGgdChDes.*
 
