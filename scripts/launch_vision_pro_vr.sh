@@ -392,7 +392,7 @@ if [[ "${WAIT_FOR_VISION_PRO_TRACKING:-1}" == "1" ]]; then
         sleep 1
     done
     if (( pose_ready == 0 )); then
-        echo "No Vision Pro pose packet arrived within ${VISION_TRACKING_TIMEOUT}s. Open MBP AVP VR and start stereo VR, then rerun this script." >&2
+        echo "No Vision Pro pose packet arrived within ${VISION_TRACKING_TIMEOUT}s. Open VeRantyx and start stereo VR, then rerun this script." >&2
         exit 1
     fi
     echo "Vision Pro pose packets are arriving. Starting Half-Life: Alyx."
