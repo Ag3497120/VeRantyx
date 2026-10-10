@@ -126,6 +126,16 @@ if [[ "${VERANTYX_DXVK_GPU_SPOOF:-1}" == "1" ]]; then
 elif [[ -f "$HLA_DXVK_CONF" ]] && grep -q 'Written by VeRantyx' "$HLA_DXVK_CONF"; then
     rm -f "$HLA_DXVK_CONF"
 fi
+# The adapter description the game sees comes from Wine's own DXGI (the DXVK
+# package has no dxgi.dll), which takes the GPU identity from these registry
+# values: 0x10de/0x2206 is an RTX 3080 in wined3d's table.
+if [[ "${VERANTYX_DXVK_GPU_SPOOF:-1}" == "1" ]]; then
+    if ! WINEDEBUG=-all "$WINE_BIN" reg query 'HKCU\Software\Wine\Direct3D' /v VideoPciDeviceID 2>/dev/null | grep -q '0x2206'; then
+        WINEDEBUG=-all "$WINE_BIN" reg add 'HKCU\Software\Wine\Direct3D' /v VideoPciVendorID /t REG_DWORD /d 0x10de /f >/dev/null 2>&1 || true
+        WINEDEBUG=-all "$WINE_BIN" reg add 'HKCU\Software\Wine\Direct3D' /v VideoPciDeviceID /t REG_DWORD /d 0x2206 /f >/dev/null 2>&1 || true
+        echo "Set Wine's Direct3D GPU identity to an RTX 3080 so Alyx stops asking about the specification."
+    fi
+fi
 STEAM_WEBHELPER_EXE="$STEAM_ROOT/bin/cef/cef.win64/steamwebhelper.exe"
 if [[ ! -f "$STEAM_WEBHELPER_EXE" ]]; then
     # SteamSetup.exe only installs the bootstrapper; the client (including

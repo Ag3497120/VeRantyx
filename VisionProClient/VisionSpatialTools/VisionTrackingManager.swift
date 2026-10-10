@@ -96,6 +96,9 @@ final class VRPoseSampler: @unchecked Sendable {
     private var eyeCenterOffset = SIMD3<Float>.zero
     private var recenterHeldSince: CFTimeInterval?
     private var recenterFired = false
+    private var originCandidateSince: CFTimeInterval?
+    private var implausibleHeightSince: CFTimeInterval?
+    private var lastOriginWarningAt: CFTimeInterval = 0
     private var headIsTracked = false
     private var lastPoseID: CFTimeInterval = 0
     // How far ahead of the display the Mac's frame arrives, learned from
@@ -195,15 +198,50 @@ final class VRPoseSampler: @unchecked Sendable {
         if let deviceAnchor, deviceAnchor.isTracked {
             history.append(deviceAnchor, id: poseID, sampledAt: now)
             let worldHead = deviceAnchor.originFromAnchorTransform
+            let worldY = worldHead.columns.3.y
             if worldToSteamVR == nil {
-                worldToSteamVR = Self.makeWorldToSteamVR(from: worldHead)
+                // Take the origin only from a settled, plausible head pose:
+                // right after the space opens, or while ARKit relocalizes,
+                // the anchor can sit at a wrong height for a moment, and an
+                // origin taken then put the player in the ceiling or floor.
+                if worldY > 0.6 && worldY < 2.4 {
+                    if originCandidateSince == nil { originCandidateSince = now }
+                    if now - (originCandidateSince ?? now) >= 0.5 {
+                        worldToSteamVR = Self.makeWorldToSteamVR(from: worldHead)
+                        originCandidateSince = nil
+                    }
+                } else {
+                    originCandidateSince = nil
+                    if now - lastOriginWarningAt > 5 {
+                        lastOriginWarningAt = now
+                        print(String(format: "Waiting for a plausible head height before placing the SteamVR origin (ARKit y = %.2f m)", worldY))
+                    }
+                }
             }
             var eyeCenter = matrix_identity_float4x4
             eyeCenter.columns.3 = SIMD4<Float>(eyeCenterOffset, 1)
-            headTransform = (worldToSteamVR ?? matrix_identity_float4x4) * worldHead * eyeCenter
-            headIsTracked = true
+            if let worldToSteamVR {
+                headTransform = worldToSteamVR * worldHead * eyeCenter
+                headIsTracked = true
+                // ARKit relocalized under us (the floor moved): the head is
+                // suddenly far from any real eye height. Re-place the origin.
+                let steamY = headTransform.columns.3.y
+                if steamY < 0.3 || steamY > 2.5 {
+                    if implausibleHeightSince == nil { implausibleHeightSince = now }
+                    if now - (implausibleHeightSince ?? now) >= 0.5 {
+                        print(String(format: "Head height %.2f m in SteamVR space is implausible; re-placing the origin", steamY))
+                        self.worldToSteamVR = nil
+                        implausibleHeightSince = nil
+                    }
+                } else {
+                    implausibleHeightSince = nil
+                }
+            } else {
+                headIsTracked = false
+            }
         } else {
             headIsTracked = false
+            originCandidateSince = nil
         }
         lastPoseID = poseID
 

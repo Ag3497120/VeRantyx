@@ -22,8 +22,10 @@ final class VRAudioPlayer {
     // Wi-Fi delivers the 5 ms packets in bursts around the video frames.
     // Hold this much before (re)starting playback so bursts do not empty the
     // player, and drop audio only when far more than that has piled up.
-    private let prebufferSeconds = 0.08
-    private let maximumBacklogSeconds = 0.25
+    // 150 ms: Wi-Fi gaps of 100 ms were common in play and emptied an 80 ms
+    // buffer, which sounded choppy. Latency is not critical for game audio.
+    private let prebufferSeconds = 0.15
+    private let maximumBacklogSeconds = 0.5
 
     func enqueue(_ data: Data) {
         queue.async { [self] in

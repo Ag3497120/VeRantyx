@@ -1177,7 +1177,7 @@ final class GameAudioStreamer {
     private var channels: UInt32 = 2
     private var sentPackets = 0
     private var lastLogAt: TimeInterval = 0
-    private let framesPerPacket = 240 // 5 ms at 48 kHz; 960 bytes of stereo PCM
+    private let framesPerPacket = 480 // 10 ms at 48 kHz; 1920 bytes of stereo PCM (half the packets of 5 ms)
 
     func start() {
         guard ProcessInfo.processInfo.environment["VERANTYX_AUDIO"] != "0" else {
