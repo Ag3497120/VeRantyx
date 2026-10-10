@@ -49,6 +49,7 @@ if os.path.exists(path):
     backup = path + ".mbp-avp-vr-original"
     if not os.path.exists(backup):
         shutil.copy2(path, backup)
+os.makedirs(os.path.dirname(path), exist_ok=True)  # fresh prefix: Steam has not created config/ yet
 with open(path, "w", encoding="utf-8") as target:
     json.dump(data, target, indent=3)
 print(f"Wrote SteamVR chaperone universe 1: {size:g}x{size:g} m play area, floor at the headset's floor.")
