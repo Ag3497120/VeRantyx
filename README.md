@@ -109,7 +109,7 @@ Half-Life: Alyx, 2026-10-10. Numbers come from the pipeline's own logs
 
 | Metric | Value | Conditions |
 |---|---|---|
-| Game render rate (Alyx, in game) | 29–35 fps (median 30) | 1115×900 per eye (SteamVR scale 0.7, Alyx's automatic top fidelity level), 60 Hz virtual display |
+| Game render rate (Alyx, in game) | 29–35 fps (median 30) | 1115×900 per eye (SteamVR scale 0.7, Alyx's automatic top fidelity level), 60 Hz virtual display; the default scale is now 0.55 |
 | Game render rate, before resolution/compositor changes | 13–24 fps | 1636×1319 per eye, 90 Hz virtual display |
 | Game render rate, main menu | 31–72 fps depending on the menu scene | |
 | Frames received by the headset | up to 60 fps; 43–46 new frames/s in game | HEVC 20 Mbps, 2276×910 for both eyes |

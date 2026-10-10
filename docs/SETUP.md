@@ -99,7 +99,7 @@ All of these are environment variables for `launch_vision_pro_vr.sh`:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `VERANTYX_RENDER_TARGET_SCALE` | 0.7 | SteamVR render resolution (area scale, like SteamVR's custom resolution). Applied at the next SteamVR start |
+| `VERANTYX_RENDER_TARGET_SCALE` | 0.55 | SteamVR render resolution (area scale, like SteamVR's custom resolution). Applied at the next SteamVR start |
 | `VERANTYX_DISPLAY_HZ` | 60 | Virtual display refresh; lower is less compositor CPU |
 | `VERANTYX_BITRATE_MBPS` | 20 | HEVC bitrate |
 | `VERANTYX_STREAM_WIDTH` x `VERANTYX_STREAM_HEIGHT` | 1920x1080 | Pixel budget for both eyes; the aspect follows the headset's frustum |
@@ -109,6 +109,16 @@ All of these are environment variables for `launch_vision_pro_vr.sh`:
 | `VERANTYX_AUDIO` | 1 | Stream the Mac's audio to the headset (Mac speakers are muted meanwhile); `VERANTYX_AUDIO_KEEP_MAC_SPEAKERS=1` keeps them on |
 | `VERANTYX_LOW_LATENCY_ENCODER` | 0 | VideoToolbox low-latency rate control (slower on M1 Max) |
 | `HLA_FIDELITY_LEVEL` | unset | Adds Alyx's `vr_fidelity_level` console variables |
+
+## Floor height and recentering
+
+The Vision Pro's ARKit origin is on the floor, so the game's floor matches the
+real floor and your eye height is your real one (standing or seated). The
+horizontal position and yaw are recentered when the immersive view starts;
+to recenter again while playing, hold both Joy-Con stick clicks for one
+second. The launch script writes a SteamVR chaperone universe with an identity
+standing transform and a `VERANTYX_PLAY_AREA_METERS` (default 3) square play
+area, replacing the 1x1 m one that SteamVR's room setup wrote.
 
 ## Troubleshooting
 

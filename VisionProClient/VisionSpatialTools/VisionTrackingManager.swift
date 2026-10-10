@@ -94,6 +94,8 @@ final class VRPoseSampler: @unchecked Sendable {
     private var rightHand = HandState(isLeft: false)
     private var headTransform = VRPoseSampler.untrackedTransform
     private var eyeCenterOffset = SIMD3<Float>.zero
+    private var recenterHeldSince: CFTimeInterval?
+    private var recenterFired = false
     private var headIsTracked = false
     private var lastPoseID: CFTimeInterval = 0
     // How far ahead of the display the Mac's frame arrives, learned from
@@ -208,6 +210,20 @@ final class VRPoseSampler: @unchecked Sendable {
         let handTime = now + min(max(poseID - now, 0), Self.maximumHandPrediction)
         let anchors = handTracking.handAnchors(at: handTime)
         let pads = gameController.snapshot()
+        // Recenter: hold both Joy-Con stick clicks for one second. Resets the
+        // horizontal position and yaw to the current head pose (height stays
+        // floor-based).
+        if pads.left?.stickClick == true, pads.right?.stickClick == true {
+            if recenterHeldSince == nil { recenterHeldSince = now }
+            if let since = recenterHeldSince, now - since >= 1.0, !recenterFired {
+                recenterFired = true
+                worldToSteamVR = nil
+                print("Recentered SteamVR space on request")
+            }
+        } else {
+            recenterHeldSince = nil
+            recenterFired = false
+        }
         if let worldToSteamVR {
             leftHand.update(anchor: anchors.leftHand, worldToSteamVR: worldToSteamVR,
                             head: headTransform, headTracked: headIsTracked, now: now, controller: pads.left)
@@ -286,6 +302,11 @@ final class VRPoseSampler: @unchecked Sendable {
         appendRaw(value.z, to: &data)
     }
 
+    /// visionOS puts the ARKit world origin on the floor beneath the wearer,
+    /// so the head's y is the real eye height above the floor and maps to
+    /// SteamVR's floor-level origin directly. Only x/z and yaw are recentered.
+    /// (A fixed 1.65 m eye height put the floor wrong for anyone who was not
+    /// that tall, or who started seated.)
     private static func makeWorldToSteamVR(from initialHead: simd_float4x4) -> simd_float4x4 {
         let position = SIMD3<Float>(initialHead.columns.3.x, initialHead.columns.3.y, initialHead.columns.3.z)
         let forward = -SIMD3<Float>(initialHead.columns.2.x, 0, initialHead.columns.2.z)
@@ -294,10 +315,12 @@ final class VRPoseSampler: @unchecked Sendable {
             : 0
         let recenterYaw = simd_float4x4(simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0)))
         var removeInitialPosition = matrix_identity_float4x4
-        removeInitialPosition.columns.3 = SIMD4<Float>(-position.x, -position.y, -position.z, 1)
-        var standingEyeHeight = matrix_identity_float4x4
-        standingEyeHeight.columns.3.y = 1.65
-        return standingEyeHeight * recenterYaw * removeInitialPosition
+        // Keep the floor-relative height unless it is implausible (origin not
+        // on the floor), in which case assume a standing 1.65 m eye height.
+        let floorIsValid = position.y > 0.6 && position.y < 2.4
+        removeInitialPosition.columns.3 = SIMD4<Float>(-position.x, floorIsValid ? 0 : 1.65 - position.y, -position.z, 1)
+        print("Vision Pro world → SteamVR: eye height \(position.y) m \(floorIsValid ? "from the ARKit floor" : "(implausible, using 1.65 m)")")
+        return recenterYaw * removeInitialPosition
     }
 
     static var untrackedTransform: simd_float4x4 {

@@ -8,7 +8,9 @@ STEAMVR_SETTINGS="${STEAMVR_SETTINGS:-$WINEPREFIX/drive_c/Program Files (x86)/St
 # x sqrt(scale). It ignored renderTargetMultiplier and used its own GPU
 # estimate (1.5) instead, which gave 1156x932; Alyx's automatic fidelity then
 # picked 1.4x that. 0.7 gives ~794x635, so Alyx's top level is ~1124x899.
-RENDER_TARGET_SCALE="${VERANTYX_RENDER_TARGET_SCALE:-0.7}"
+RENDER_TARGET_SCALE="${VERANTYX_RENDER_TARGET_SCALE:-0.55}"
+CHAPERONE_FILE="${CHAPERONE_FILE:-$(dirname "$STEAMVR_SETTINGS")/chaperone_info.vrchap}"
+PLAY_AREA_METERS="${VERANTYX_PLAY_AREA_METERS:-3}"
 
 if [[ "$(basename "$WINEPREFIX")" != "SteamVR_Prefix_Wine11_Test" ]]; then
     echo "Refusing to modify SteamVR settings outside the test prefix: $WINEPREFIX" >&2
@@ -18,6 +20,38 @@ if ! command -v python3 >/dev/null 2>&1; then
     echo "python3 is required to update SteamVR settings." >&2
     exit 1
 fi
+
+# Room setup auto-launches on every start and writes a 1x1 m play area with a
+# floor offset; the headset already supplies floor-level poses, so give
+# SteamVR an identity standing transform and a roomy play area instead.
+python3 - "$CHAPERONE_FILE" "$PLAY_AREA_METERS" <<'PY'
+import json, os, shutil, sys
+path, size = sys.argv[1], float(sys.argv[2])
+half = size / 2
+height = 2.43
+corners = [(-half, -half), (-half, half), (half, half), (half, -half)]
+bounds = []
+for i in range(4):
+    (x0, z0), (x1, z1) = corners[i], corners[(i + 1) % 4]
+    bounds.append([[x0, 0, z0], [x0, height, z0], [x1, height, z1], [x1, 0, z1]])
+wanted = {"collision_bounds": bounds, "play_area": [size, size],
+          "standing": {"translation": [0, 0, 0], "yaw": 0}, "universeID": "1"}
+data = {"jsonid": "chaperone_info", "universes": [wanted], "version": 5}
+if os.path.exists(path):
+    try:
+        current = json.load(open(path))
+        universes = [u for u in current.get("universes", []) if str(u.get("universeID")) == "1"]
+        if universes and universes[0].get("standing") == wanted["standing"] and universes[0].get("play_area") == wanted["play_area"]:
+            raise SystemExit(0)
+    except (ValueError, OSError):
+        pass
+    backup = path + ".mbp-avp-vr-original"
+    if not os.path.exists(backup):
+        shutil.copy2(path, backup)
+with open(path, "w", encoding="utf-8") as target:
+    json.dump(data, target, indent=3)
+print(f"Wrote SteamVR chaperone universe 1: {size:g}x{size:g} m play area, floor at the headset's floor.")
+PY
 
 python3 - "$STEAMVR_SETTINGS" "$RENDER_TARGET_SCALE" <<'PY'
 import json
