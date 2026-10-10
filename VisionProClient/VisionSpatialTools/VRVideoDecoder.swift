@@ -91,6 +91,8 @@ final class VRVideoDecoder: ObservableObject {
     @Published private(set) var status = "MacからのHEVC映像を待っています。"
     @Published private(set) var decodedVideoFPS = 0
     @Published private(set) var decodeDiagnostics = "デコード済み 0 フレーム"
+    // ASCII counters for the diagnostics sent to the Mac.
+    @Published private(set) var diagnosticsSummary = "decoded=0 recoveries=0 gaps=0 late_drops=0"
 
     // Configure before starting the receiver; invoked from the decode queue.
     var requestKeyFrame: (() -> Void)?
@@ -116,6 +118,7 @@ final class VRVideoDecoder: ObservableObject {
     private var lastKeyFrameRequestAt: TimeInterval = 0
     private var decodedFrameCount = 0
     private var recoveryCount = 0
+    private var gapCount = 0
     private var fpsWindowFrames = 0
     private var fpsWindowStart = ProcessInfo.processInfo.systemUptime
     private var lastDecodedAt: TimeInterval?
@@ -176,7 +179,7 @@ final class VRVideoDecoder: ObservableObject {
         pendingFrameLock.unlock()
 
         if isActive {
-            if discontinuity { requireKeyFrame("復号待ちを短縮し、基準フレームを再取得しています。") }
+            if discontinuity { continueAfterGap("復号が遅れたため古いフレームを捨てました。基準フレームを要求しています。") }
             if let pending { decodeFrameOnQueue(pending.frame) }
         }
 
@@ -213,6 +216,7 @@ final class VRVideoDecoder: ObservableObject {
             needsKeyFrame = true
             decodedFrameCount = 0
             recoveryCount = 0
+            gapCount = 0
             fpsWindowFrames = 0
             fpsWindowStart = ProcessInfo.processInfo.systemUptime
             lastDecodedAt = nil
@@ -257,7 +261,7 @@ final class VRVideoDecoder: ObservableObject {
         if let lastSequence {
             guard Int32(bitPattern: frame.sequence &- lastSequence) > 0 else { return }
             if frame.sequence != lastSequence &+ 1 {
-                requireKeyFrame("映像パケットの欠落を検出。基準フレームを再取得しています。")
+                continueAfterGap("映像パケットの欠落を検出。基準フレームを要求しています。")
             }
         }
         lastSequence = frame.sequence
@@ -356,6 +360,15 @@ final class VRVideoDecoder: ObservableObject {
         }
     }
 
+    /// A lost frame only damages the frames that refer to it. Keep decoding
+    /// (brief artifacts) and ask for a keyframe at once. Stopping until the
+    /// next keyframe froze the picture every time Wi-Fi dropped one packet.
+    private func continueAfterGap(_ message: String) {
+        gapCount += 1
+        updateStatus(message)
+        requestRecoveryFrame()
+    }
+
     private func requireKeyFrame(_ message: String) {
         if !needsKeyFrame { recoveryCount += 1 }
         needsKeyFrame = true
@@ -366,7 +379,7 @@ final class VRVideoDecoder: ObservableObject {
 
     private func requestRecoveryFrame() {
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastKeyFrameRequestAt >= 0.75 else { return }
+        guard now - lastKeyFrameRequestAt >= 0.2 else { return }
         lastKeyFrameRequestAt = now
         requestKeyFrame?()
     }
@@ -381,12 +394,14 @@ final class VRVideoDecoder: ObservableObject {
         let dropped = droppedPendingFrames
         let queued = pendingFrames.count
         pendingFrameLock.unlock()
-        let text = "デコード済み \(decodedFrameCount)／復旧 \(recoveryCount)／待ち \(queued)／遅延破棄 \(dropped)"
+        let text = "デコード済み \(decodedFrameCount)／欠落 \(gapCount)／復旧 \(recoveryCount)／待ち \(queued)／遅延破棄 \(dropped)"
+        let summary = "decoded=\(decodedFrameCount) gaps=\(gapCount) recoveries=\(recoveryCount) late_drops=\(dropped)"
         let currentGeneration = generation
         DispatchQueue.main.async { [weak self] in
             guard let self, self.uiGeneration == currentGeneration else { return }
             self.decodedVideoFPS = fps
             self.decodeDiagnostics = text
+            self.diagnosticsSummary = summary
         }
         if needsKeyFrame { requestRecoveryFrame() }
         if let lastDecodedAt, now - lastDecodedAt > 3 {
@@ -521,6 +536,10 @@ final class VRVideoDecoder: ObservableObject {
         if status != noErr {
             print("[VRVideoDecoder] VTDecompressionSessionCreate failed: \(status)")
             decompressionSession = nil
+        } else if let decompressionSession {
+            // Ask VideoToolbox to schedule decoding ahead of background work.
+            VTSessionSetProperty(decompressionSession, key: kVTDecompressionPropertyKey_RealTime,
+                                 value: kCFBooleanTrue)
         }
     }
 

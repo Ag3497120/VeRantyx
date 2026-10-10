@@ -32,7 +32,7 @@ for dll in d3d11.dll d3d10core.dll; do
         echo "Required DXVK DLL is missing: $source" >&2
         exit 1
     fi
-    if ! file "$source" | rg -q 'PE32\+ executable.*x86-64'; then
+    if ! file "$source" | grep -Eq 'PE32\+ executable.*x86-64'; then
         echo "DXVK DLL is not a Windows x64 DLL: $source" >&2
         exit 1
     fi
@@ -42,7 +42,7 @@ for dll in d3d11.dll d3d10core.dll; do
         echo "Saved original system32/$dll."
     fi
     if ! cmp -s "$target" "$source"; then
-        cp -p "$source" "$target"
+        cp -p "$source" "$target.verantyx-tmp" && mv -f "$target.verantyx-tmp" "$target"
         echo "Installed DXVK $dll into the selected test prefix."
     else
         echo "DXVK $dll is already installed."

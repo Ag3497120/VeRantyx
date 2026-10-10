@@ -35,6 +35,13 @@
 	<string>SteamVRへVision Proの頭部位置を送るため、空間トラッキングを使用します。</string>
 	<key>NSHandsTrackingUsageDescription</key>
 	<string>SteamVRのコントローラー位置とトリガー入力を再現するため、ハンドトラッキングを使用します。</string>
+	<key>GCSupportedGameControllers</key>
+	<array>
+		<dict>
+			<key>ProfileName</key>
+			<string>ExtendedGamepad</string>
+		</dict>
+	</array>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_verantyxvr._udp</string>

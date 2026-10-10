@@ -4,6 +4,8 @@ import VideoToolbox
 import CoreMedia
 import Network
 import Accelerate
+import CoreAudio
+import Metal
 
 import simd
 
@@ -330,9 +332,9 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
             packet.append(baseAddress + chunkOffset, count: fragSize)
             
             guard sendVideoPacket(packet, to: peer, batch: batch, deadline: deadline) else { break }
-            // Limit keyframe bursts to 24 Mbps. In-flight completion alone only
+            // Pace bursts (60 Mbps by default). In-flight completion alone only
             // bounds the userspace queue; it does not mean radio delivery.
-            nextSendAt += Double(packet.count) / 3_000_000
+            nextSendAt += Double(packet.count) / sendPacingBytesPerSecond
             let pause = nextSendAt - ProcessInfo.processInfo.systemUptime
             if pause > 0 { usleep(useconds_t(min(pause, 0.01) * 1_000_000)) }
         }
@@ -386,12 +388,33 @@ func makePixelBufferPool(width: Int, height: Int) -> CVPixelBufferPool? {
     return pool
 }
 
-func setupEncoder(width: Int32, height: Int32) {
-    let status = VTCompressionSessionCreate(allocator: kCFAllocatorDefault,
+func environmentDouble(_ name: String, default fallback: Double, range: ClosedRange<Double>) -> Double {
+    guard let text = ProcessInfo.processInfo.environment[name], let value = Double(text),
+          range.contains(value) else { return fallback }
+    return value
+}
+
+// IDRs are several times larger than predicted frames. Sending one every 0.5 s
+// made a visible hitch twice a second; lost frames already request an IDR.
+let keyFrameIntervalSeconds = environmentDouble("VERANTYX_KEYFRAME_INTERVAL", default: 3.0, range: 0.5...30)
+let videoBitrate = Int32(environmentDouble("VERANTYX_BITRATE_MBPS", default: 20, range: 2...80) * 1_000_000)
+// Pace UDP bursts so AWDL does not drop them, but fast enough that a frame
+// does not spend most of its interval queued behind the previous one.
+let sendPacingBytesPerSecond = environmentDouble("VERANTYX_SEND_PACING_MBPS", default: 60, range: 8...400) * 1_000_000 / 8
+
+func createCompressionSession(width: Int32, height: Int32, lowLatency: Bool) -> OSStatus {
+    var specification: [CFString: Any] = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true]
+    if lowLatency {
+        // Low-latency rate control keeps frame sizes even, but on an M-series
+        // Mac it took 12 ms per 1442x810 frame versus 8 ms for the standard
+        // real-time encoder, so it is opt-in (VERANTYX_LOW_LATENCY_ENCODER=1).
+        specification[kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = true
+    }
+    return VTCompressionSessionCreate(allocator: kCFAllocatorDefault,
                                             width: width,
                                             height: height,
                                             codecType: kCMVideoCodecType_HEVC,
-                                            encoderSpecification: [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary,
+                                            encoderSpecification: specification as CFDictionary,
                                             imageBufferAttributes: nil,
                                             compressedDataAllocator: nil,
                                             outputCallback: { (outputCallbackRefCon, sourceFrameRefCon, status, infoFlags, sampleBuffer) in
@@ -422,46 +445,53 @@ func setupEncoder(width: Int32, height: Int32) {
         let isKeyFrame = (attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) != true
         
         processSampleBuffer(sampleBuffer: sampleBuffer, isKeyFrame: isKeyFrame, frameSequence: frameSequence, visionTimestamp: visionTimestamp, transform: transform)
-        
+
     },
                                             refcon: nil,
                                             compressionSessionOut: &compressionSession)
-    
-    if status != noErr {
-        print("Failed to create VTCompressionSession")
+}
+
+func setupEncoder(width: Int32, height: Int32) {
+    var lowLatency = ProcessInfo.processInfo.environment["VERANTYX_LOW_LATENCY_ENCODER"] == "1"
+    var status = createCompressionSession(width: width, height: height, lowLatency: lowLatency)
+    if status != noErr && lowLatency {
+        print("Low-latency HEVC rate control is unavailable (\(status)); using the standard real-time encoder")
+        lowLatency = false
+        status = createCompressionSession(width: width, height: height, lowLatency: false)
+    }
+    guard status == noErr, let session = compressionSession else {
+        print("Failed to create VTCompressionSession: \(status)")
         exit(1)
     }
-    
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel)
-    
+
+    func set(_ key: CFString, _ value: CFTypeRef, _ label: String) {
+        let result = VTSessionSetProperty(session, key: key, value: value)
+        if result != noErr { print("HEVC encoder ignored \(label): \(result)") }
+    }
+
+    set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, "real-time mode")
+    set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel, "profile")
     // Critical settings for ultra-low latency VR streaming
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse) // Disable B-frames
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
-    
-    var bitrate: Int32 = 12_000_000 // Keep AWDL delivery smooth while the headset decodes both eyes.
-    let bitrateNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &bitrate)
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateNum)
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_DataRateLimits,
-        value: [1_500_000, 1] as CFArray)
-    
+    set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "no B-frames")
+    set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue, "speed priority")
+    set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: videoBitrate), "average bitrate")
+    // Hard cap each second at the average: the game runs 15-25 fps and the
+    // encoder overshot to 35 Mbps at a 20 Mbps average, which lost packets.
+    set(kVTCompressionPropertyKey_DataRateLimits,
+        [NSNumber(value: Double(videoBitrate) / 8), NSNumber(value: 1)] as CFArray, "data-rate limit")
+
     // This is an initial rate-control hint, not the display refresh rate. The
     // main loop updates it from observed capture cadence every five seconds.
-    var expectedFPS: Int32 = 90
-    let expectedFPSNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &expectedFPS)
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: expectedFPSNum)
-    
-    // Bound recovery in elapsed time even when the game only produces 4fps.
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 45 as CFNumber)
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 0.5 as CFNumber)
-    
-    // FORCE ZERO FRAME DELAY in the encoder queue
-    var maxFrameDelayCount: Int32 = 1
-    let maxFrameDelayCountNum = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &maxFrameDelayCount)
-    VTSessionSetProperty(compressionSession!, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: maxFrameDelayCountNum)
+    set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: 30), "expected frame rate")
 
-    
-    VTCompressionSessionPrepareToEncodeFrames(compressionSession!)
+    // Bound recovery in elapsed time even when the game only produces 4fps.
+    set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: Int(keyFrameIntervalSeconds * 90)), "keyframe interval")
+    set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: keyFrameIntervalSeconds), "keyframe duration")
+
+    VTCompressionSessionPrepareToEncodeFrames(session)
+    print(String(format: "HEVC encoder ready: %dx%d %.1f Mbps keyframe=%.1fs pacing=%.0f Mbps lowLatency=%@",
+        width, height, Double(videoBitrate) / 1_000_000, keyFrameIntervalSeconds,
+        sendPacingBytesPerSecond * 8 / 1_000_000, lowLatency ? "yes" : "no"))
     requestKeyFrame()
 }
 
@@ -472,7 +502,7 @@ let winePrefix = ProcessInfo.processInfo.environment["WINEPREFIX"]
 let filePath = URL(fileURLWithPath: winePrefix)
     .appendingPathComponent("drive_c/vr_shared_frame.dat")
     .path
-let sharedHandsSize = 287 // Keep in sync with SharedHands in driver_verantyx.cpp.
+let sharedHandsSize = 312 // Keep in sync with SharedHands in driver_verantyx.cpp.
 let mapSize = MemoryLayout<DoubleBufferHeader>.size + (Int(MemoryLayout<SharedFrame>.size) + 4096 * 4096 * 8) * 2 + sharedHandsSize + 1024
 
 print("Waiting for vr_shared_frame.dat...")
@@ -544,13 +574,55 @@ var lastPresentationSeconds: TimeInterval = -1
 var lastForcedKeyFrameAt: TimeInterval = -.infinity
 var lastDiagnosticsAt = ProcessInfo.processInfo.systemUptime
 var lastDiagnostics = (capture: 0, submit: 0, encode: 0, sent: 0, packets: 0, bytes: 0, errors: 0, drops: 0, poses: 0)
-let configuredOutputWidth = Int(ProcessInfo.processInfo.environment["VERANTYX_STREAM_WIDTH"] ?? "1440") ?? 1440
-let configuredOutputHeight = Int(ProcessInfo.processInfo.environment["VERANTYX_STREAM_HEIGHT"] ?? "810") ?? 810
+// Default pixel budget for both eyes (~2 MP, 2276x910 for the Vision Pro's
+// frustum). 1440x810 left ~8 pixels per degree and aliased text; ~3 MP at
+// 30 Mbps lost packets on Wi-Fi often enough to stall decoding.
+let configuredOutputWidth = Int(ProcessInfo.processInfo.environment["VERANTYX_STREAM_WIDTH"] ?? "1920") ?? 1920
+let configuredOutputHeight = Int(ProcessInfo.processInfo.environment["VERANTYX_STREAM_HEIGHT"] ?? "1080") ?? 1080
 let hasExplicitOutputSize = ProcessInfo.processInfo.environment["VERANTYX_STREAM_WIDTH"] != nil ||
     ProcessInfo.processInfo.environment["VERANTYX_STREAM_HEIGHT"] != nil
 var outputWidth = min(4096, max(2, configuredOutputWidth & ~1))
 var outputHeight = min(4096, max(2, configuredOutputHeight & ~1))
 var outputSourceAspect: Double?
+
+// The driver publishes the eye frustum SteamVR renders with in the shared
+// header's padding (8 tangents + "VTAN"). The headset needs it to draw each
+// eye at the angles the game actually used.
+let sourceProjectionMagic: UInt32 = 0x4E415456 // "VTAN"
+var lastSourceProjectionSentAt: TimeInterval = -.infinity
+var lastSourceProjection: [Float] = []
+
+func readSourceProjection() -> [Float]? {
+    var header = dbHeaderPtr.pointee
+    return withUnsafeBytes(of: &header.padding) { raw -> [Float]? in
+        guard raw.load(fromByteOffset: 32, as: UInt32.self) == sourceProjectionMagic else { return nil }
+        let values = (0..<8).map { raw.load(fromByteOffset: $0 * 4, as: Float.self) }
+        guard values.allSatisfy({ $0.isFinite }), values[0] < 0, values[1] > 0, values[2] < 0, values[3] > 0,
+              values[4] < 0, values[5] > 0, values[6] < 0, values[7] > 0 else { return nil }
+        return values
+    }
+}
+
+func sendSourceProjectionIfDue() {
+    let now = ProcessInfo.processInfo.systemUptime
+    guard now - lastSourceProjectionSentAt >= 1 else { return }
+    lastSourceProjectionSentAt = now
+    guard let tangents = readSourceProjection() else { return }
+    peerLock.lock()
+    let peer = videoPeer
+    peerLock.unlock()
+    guard let peer else { return }
+    if tangents != lastSourceProjection {
+        lastSourceProjection = tangents
+        print("SteamVR eye frustum sent to Vision Pro: \(tangents.map { String(format: "%.3f", $0) }.joined(separator: " "))")
+    }
+    var packet = Data(capacity: 36)
+    withUnsafeBytes(of: sourceProjectionMagic.littleEndian) { packet.append(contentsOf: $0) }
+    for value in tangents {
+        withUnsafeBytes(of: value.bitPattern.littleEndian) { packet.append(contentsOf: $0) }
+    }
+    peer.send(content: packet, completion: .idempotent)
+}
 
 func reportDiagnosticsIfDue() {
     let now = ProcessInfo.processInfo.systemUptime
@@ -591,7 +663,7 @@ func resolveOutputSize(sourceWidth: Int, sourceHeight: Int) -> Bool {
     }
 
     // Preserve the eye frustum's aspect ratio while keeping the same pixel
-    // budget as 1440x810. This avoids stretching when the headset supplies an
+    // budget as the configured size. This avoids stretching when the headset supplies an
     // asymmetric per-eye projection.
     let sourceAspect = min(2.5, max(0.5, Double(sourceWidth) / Double(sourceHeight)))
     if let previousAspect = outputSourceAspect,
@@ -608,6 +680,102 @@ func resolveOutputSize(sourceWidth: Int, sourceHeight: Int) -> Bool {
     outputWidth = evenDimension(sqrt(pixelBudget * sourceAspect))
     outputHeight = evenDimension(sqrt(pixelBudget / sourceAspect))
     return previousWidth != outputWidth || previousHeight != outputHeight
+}
+
+// GPU path: a Metal compute kernel scales the RGBA/BGRA capture into the
+// encoder's BGRA buffer (bilinear) and handles the channel order through the
+// texture formats. The CPU path below (vImage) stays as the fallback; it cost
+// 3-5 ms of CPU per frame.
+final class GPUFrameConverter {
+    private let device: MTLDevice
+    private let queue: MTLCommandQueue
+    private let pipeline: MTLComputePipelineState
+    private let textureCache: CVMetalTextureCache
+    private var source: MTLTexture?
+    private var sourceFormat: MTLPixelFormat = .invalid
+    private(set) var convertedFrames = 0
+
+    init?() {
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
+        let shader = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void scaleFrame(texture2d<float, access::sample> src [[texture(0)]],
+                               texture2d<float, access::write> dst [[texture(1)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+            if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+            constexpr sampler s(filter::linear, address::clamp_to_edge, coord::normalized);
+            float2 uv = (float2(gid) + 0.5) / float2(dst.get_width(), dst.get_height());
+            dst.write(src.sample(s, uv), gid);
+        }
+        """
+        var cache: CVMetalTextureCache?
+        guard let library = try? device.makeLibrary(source: shader, options: nil),
+              let function = library.makeFunction(name: "scaleFrame"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess,
+              let cache else { return nil }
+        self.device = device
+        self.queue = queue
+        self.pipeline = pipeline
+        self.textureCache = cache
+    }
+
+    func convert(source bytes: UnsafeMutableRawPointer, dxgiFormat: UInt32, width: Int, height: Int,
+                 destination: CVPixelBuffer) -> Bool {
+        let format: MTLPixelFormat = (dxgiFormat == 28 || dxgiFormat == 29) ? .rgba8Unorm : .bgra8Unorm
+        if source == nil || source?.width != width || source?.height != height || sourceFormat != format {
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
+            descriptor.usage = .shaderRead
+            descriptor.storageMode = .shared
+            guard let texture = device.makeTexture(descriptor: descriptor) else { return false }
+            source = texture
+            sourceFormat = format
+        }
+        guard let source else { return false }
+        source.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: bytes, bytesPerRow: width * 4)
+
+        var cvTexture: CVMetalTexture?
+        let outWidth = CVPixelBufferGetWidth(destination), outHeight = CVPixelBufferGetHeight(destination)
+        guard CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, destination, nil,
+                                                        .bgra8Unorm, outWidth, outHeight, 0, &cvTexture) == kCVReturnSuccess,
+              let cvTexture, let target = CVMetalTextureGetTexture(cvTexture),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(source, index: 0)
+        encoder.setTexture(target, index: 1)
+        let threads = MTLSize(width: 16, height: 16, depth: 1)
+        let groups = MTLSize(width: (outWidth + 15) / 16, height: (outHeight + 15) / 16, depth: 1)
+        encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: threads)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else { return false }
+        convertedFrames += 1
+        return true
+    }
+}
+
+var gpuConverter: GPUFrameConverter? = ProcessInfo.processInfo.environment["VERANTYX_GPU_CONVERT"] == "0" ? nil : GPUFrameConverter()
+var gpuConverterAnnounced = false
+
+func transferFrameOnGPU(
+    source: UnsafeMutableRawPointer, sourceFormat: UInt32, sourceWidth: Int, sourceHeight: Int,
+    destination: CVPixelBuffer
+) -> Bool {
+    guard let converter = gpuConverter else { return false }
+    guard converter.convert(source: source, dxgiFormat: sourceFormat, width: sourceWidth, height: sourceHeight,
+                            destination: destination) else {
+        print("GPU frame conversion failed; converting frames on the CPU from now on")
+        gpuConverter = nil
+        return false
+    }
+    if !gpuConverterAnnounced {
+        gpuConverterAnnounced = true
+        print("Frames are scaled and converted on the GPU (Metal)")
+    }
+    return true
 }
 
 func copyFrameToBGRA(
@@ -654,16 +822,12 @@ func copyFrameToBGRA(
 
     // DXGI format 28/29 is RGBA, while VideoToolbox expects BGRA. Scale first,
     // then swap R/B in the smaller output buffer to avoid a full-size temporary.
+    // vImage does this with SIMD; the old per-byte loop cost several ms a frame.
     if isRGBA {
-        for row in 0..<outputHeight {
-            let channels = destination.advanced(by: row * destinationBytesPerRow)
-                .assumingMemoryBound(to: UInt8.self)
-            for offset in stride(from: 0, to: outputWidth * 4, by: 4) {
-                let red = channels[offset]
-                channels[offset] = channels[offset + 2]
-                channels[offset + 2] = red
-            }
-        }
+        let swapRedBlue: [UInt8] = [2, 1, 0, 3]
+        guard vImagePermuteChannels_ARGB8888(
+            &destinationBuffer, &destinationBuffer, swapRedBlue, vImage_Flags(kvImageNoFlags)
+        ) == kvImageNoError else { return false }
     }
     return true
 }
@@ -752,7 +916,9 @@ func receiveVideoPeerPacket(_ packet: Data, from connection: NWConnection) {
         let shouldLog = videoPeer === connection && now - lastClientDiagnosticsAt >= 4
         if shouldLog { lastClientDiagnosticsAt = now }
         peerLock.unlock()
-        if shouldLog, let message = String(data: packet.prefix(512), encoding: .utf8) {
+        if shouldLog {
+            // Lossy decoding keeps a message whose multibyte text was cut off.
+            let message = String(decoding: packet.prefix(1200), as: UTF8.self)
             let singleLine = message.components(separatedBy: .controlCharacters).joined(separator: " ")
             print(String(format: "Headset diagnostics uptime=%.3f %@", now, singleLine))
         }
@@ -819,6 +985,15 @@ func receiveVideoPeerPacket(_ packet: Data, from connection: NWConnection) {
                         memcpy(handsMapPtr + 252, baseAddr + 236, 16)
                         memcpy(handsMapPtr + 268, baseAddr + 252, 16)
                     }
+                    // Optional velocities: left/right linear, left/right angular.
+                    if packet.count >= 319 {
+                        memcpy(handsMapPtr + 232, baseAddr + 271, 12) // leftVelocity
+                        memcpy(handsMapPtr + 220, baseAddr + 283, 12) // rightVelocity
+                        memcpy(handsMapPtr + 287, baseAddr + 295, 24) // angular left, right
+                        handsMapPtr.advanced(by: 311).storeBytes(of: UInt8(1), as: UInt8.self)
+                    } else {
+                        handsMapPtr.advanced(by: 311).storeBytes(of: UInt8(0), as: UInt8.self)
+                    }
                 }
 
                 registerVideoPeer(connection, handshake: false)
@@ -879,11 +1054,173 @@ videoListener.newConnectionHandler = { connection in
 }
 videoListener.start(queue: transportQueue)
 
+// MARK: - Game audio to the headset
+
+/// Captures the Mac's audio output with a Core Audio process tap and sends it
+/// as 16-bit PCM "AUDI" datagrams: magic, sequence, sample rate, channels,
+/// frame count, then interleaved samples. The Mac's own speakers are muted
+/// while the tap runs so the game is heard only in the headset.
+final class GameAudioStreamer {
+    private var tapID = AudioObjectID(kAudioObjectUnknown)
+    private var aggregateID = AudioObjectID(kAudioObjectUnknown)
+    private var procID: AudioDeviceIOProcID?
+    private var sequence: UInt32 = 0
+    private var pending: [Int16] = []
+    private var sampleRate: UInt32 = 48_000
+    private var channels: UInt32 = 2
+    private var sentPackets = 0
+    private var lastLogAt: TimeInterval = 0
+    private let framesPerPacket = 240 // 5 ms at 48 kHz; 960 bytes of stereo PCM
+
+    func start() {
+        guard ProcessInfo.processInfo.environment["VERANTYX_AUDIO"] != "0" else {
+            print("Game audio streaming disabled (VERANTYX_AUDIO=0)")
+            return
+        }
+        guard #available(macOS 14.2, *) else {
+            print("Game audio streaming needs macOS 14.2 or later")
+            return
+        }
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        description.name = "Verantyx VR headset audio"
+        description.muteBehavior = ProcessInfo.processInfo.environment["VERANTYX_AUDIO_KEEP_MAC_SPEAKERS"] == "1"
+            ? .unmuted : .mutedWhenTapped
+        description.isPrivate = true
+        var status = AudioHardwareCreateProcessTap(description, &tapID)
+        guard status == noErr else {
+            print("Game audio: could not create the system audio tap (\(status)). Allow this terminal under System Settings > Privacy & Security > Screen & System Audio Recording, then relaunch.")
+            return
+        }
+
+        var format = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioTapPropertyFormat,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        status = AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &format)
+        guard status == noErr, format.mSampleRate > 0, format.mChannelsPerFrame > 0 else {
+            print("Game audio: could not read the tap format (\(status))")
+            return
+        }
+        sampleRate = UInt32(format.mSampleRate)
+        channels = min(2, format.mChannelsPerFrame)
+
+        let aggregate: [String: Any] = [
+            kAudioAggregateDeviceNameKey as String: "Verantyx VR tap",
+            kAudioAggregateDeviceUIDKey as String: "com.verantyx.vr.audio-tap",
+            kAudioAggregateDeviceIsPrivateKey as String: true,
+            kAudioAggregateDeviceTapAutoStartKey as String: true,
+            kAudioAggregateDeviceTapListKey as String: [[
+                kAudioSubTapUIDKey as String: description.uuid.uuidString,
+                kAudioSubTapDriftCompensationKey as String: true,
+            ]],
+        ]
+        status = AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &aggregateID)
+        guard status == noErr else {
+            print("Game audio: could not create the tap device (\(status))")
+            return
+        }
+        let isFloat = format.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        let isInterleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        let sourceChannels = Int(format.mChannelsPerFrame)
+        status = AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateID, transportQueue) { [self] _, input, _, _, _ in
+            handle(input, isFloat: isFloat, interleaved: isInterleaved, sourceChannels: sourceChannels)
+        }
+        guard status == noErr, let procID else {
+            print("Game audio: could not attach to the tap device (\(status))")
+            return
+        }
+        status = AudioDeviceStart(aggregateID, procID)
+        guard status == noErr else {
+            print("Game audio: could not start the tap device (\(status))")
+            return
+        }
+        print("Game audio: streaming \(sampleRate) Hz \(channels)ch PCM to the headset; Mac speakers \(description.muteBehavior == .unmuted ? "stay on" : "muted while streaming")")
+    }
+
+    private func handle(_ input: UnsafePointer<AudioBufferList>, isFloat: Bool, interleaved: Bool, sourceChannels: Int) {
+        let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
+        guard let first = buffers.first, let data = first.mData else { return }
+        let outChannels = Int(channels)
+        if interleaved {
+            let frames = Int(first.mDataByteSize) / (sourceChannels * (isFloat ? 4 : 2))
+            pending.reserveCapacity(pending.count + frames * outChannels)
+            if isFloat {
+                let samples = data.assumingMemoryBound(to: Float.self)
+                for frame in 0..<frames {
+                    for channel in 0..<outChannels {
+                        pending.append(Self.int16(samples[frame * sourceChannels + min(channel, sourceChannels - 1)]))
+                    }
+                }
+            } else {
+                let samples = data.assumingMemoryBound(to: Int16.self)
+                for frame in 0..<frames {
+                    for channel in 0..<outChannels {
+                        pending.append(samples[frame * sourceChannels + min(channel, sourceChannels - 1)])
+                    }
+                }
+            }
+        } else {
+            let frames = Int(first.mDataByteSize) / (isFloat ? 4 : 2)
+            pending.reserveCapacity(pending.count + frames * outChannels)
+            for frame in 0..<frames {
+                for channel in 0..<outChannels {
+                    let buffer = buffers[min(channel, buffers.count - 1)]
+                    guard let channelData = buffer.mData else { continue }
+                    if isFloat {
+                        pending.append(Self.int16(channelData.assumingMemoryBound(to: Float.self)[frame]))
+                    } else {
+                        pending.append(channelData.assumingMemoryBound(to: Int16.self)[frame])
+                    }
+                }
+            }
+        }
+        flush()
+    }
+
+    private static func int16(_ value: Float) -> Int16 {
+        Int16(max(-32768, min(32767, (value * 32767).rounded())))
+    }
+
+    private func flush() {
+        let samplesPerPacket = framesPerPacket * Int(channels)
+        guard pending.count >= samplesPerPacket else { return }
+        peerLock.lock()
+        let peer = videoPeer
+        peerLock.unlock()
+        guard let peer else {
+            // Nobody listening: keep only the newest packet's worth.
+            pending.removeFirst(pending.count - pending.count % samplesPerPacket)
+            return
+        }
+        while pending.count >= samplesPerPacket {
+            var packet = Data(capacity: 20 + samplesPerPacket * 2)
+            for value in [UInt32(0x49445541), sequence, sampleRate, channels, UInt32(framesPerPacket)] {
+                withUnsafeBytes(of: value.littleEndian) { packet.append(contentsOf: $0) }
+            }
+            pending[0..<samplesPerPacket].withUnsafeBytes { packet.append(contentsOf: $0) }
+            pending.removeFirst(samplesPerPacket)
+            sequence &+= 1
+            peer.send(content: packet, completion: .idempotent)
+            sentPackets += 1
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastLogAt >= 30 {
+            lastLogAt = now
+            print("Game audio: \(sentPackets) packets sent")
+        }
+    }
+}
+
+let gameAudio = GameAudioStreamer()
+gameAudio.start()
+
 print("Starting native read loop and UDP transmission on port 9999...")
 
 while isEncoding {
     autoreleasepool {
         reportDiagnosticsIfDue()
+        sendSourceProjectionIfDue()
         let sourceMode = dbHeaderPtr.pointee.captureSourceMode
         if sourceMode != lastCaptureSourceMode {
             print("Capture source changed \(lastCaptureSourceMode)->\(sourceMode); continuing stream sequence \(streamSequence)")
@@ -963,28 +1300,28 @@ while isEncoding {
                     }
                     return
                 }
-                guard CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else {
-                    encoderInFlightFrames.signal()
-                    lastSeq = currentSeq
-                    return
-                }
-                guard let destination = CVPixelBufferGetBaseAddress(pb) else {
-                    CVPixelBufferUnlockBaseAddress(pb, [])
-                    encoderInFlightFrames.signal()
-                    lastSeq = currentSeq
-                    return
-                }
-
                 let sourceFormat = frameHeader.format
-                let didCopy = copyFrameToBGRA(
-                    source: pixelDatas[Int(readyIndex)],
-                    sourceFormat: sourceFormat,
-                    sourceWidth: width,
-                    sourceHeight: height,
-                    destination: destination,
-                    destinationBytesPerRow: CVPixelBufferGetBytesPerRow(pb)
-                )
-                CVPixelBufferUnlockBaseAddress(pb, [])
+                var didCopy = transferFrameOnGPU(
+                    source: pixelDatas[Int(readyIndex)], sourceFormat: sourceFormat,
+                    sourceWidth: width, sourceHeight: height, destination: pb)
+                if !didCopy {
+                    guard CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else {
+                        encoderInFlightFrames.signal()
+                        lastSeq = currentSeq
+                        return
+                    }
+                    if let destination = CVPixelBufferGetBaseAddress(pb) {
+                        didCopy = copyFrameToBGRA(
+                            source: pixelDatas[Int(readyIndex)],
+                            sourceFormat: sourceFormat,
+                            sourceWidth: width,
+                            sourceHeight: height,
+                            destination: destination,
+                            destinationBytesPerRow: CVPixelBufferGetBytesPerRow(pb)
+                        )
+                    }
+                    CVPixelBufferUnlockBaseAddress(pb, [])
+                }
                 guard didCopy else {
                     encoderInFlightFrames.signal()
                     print("Could not convert SteamVR DXGI frame \(width)x\(height), format \(sourceFormat)")
@@ -1022,7 +1359,9 @@ while isEncoding {
                 ))
 
                 var frameProps: CFDictionary? = nil
-                if consumeKeyFrameRequest() || now - lastForcedKeyFrameAt >= 0.5 {
+                // Keyframes only on request (new peer, loss, decoder recovery);
+                // VideoToolbox adds the periodic safety IDR on its own.
+                if now - lastForcedKeyFrameAt >= 0.1 && consumeKeyFrameRequest() {
                     let dict: [CFString: Any] = [kVTEncodeFrameOptionKey_ForceKeyFrame: true]
                     frameProps = dict as CFDictionary
                     lastForcedKeyFrameAt = now

@@ -1,9 +1,0 @@
-LIBRARY "dxgi.dll"
-EXPORTS
-    CreateDXGIFactory=dxgi_real.CreateDXGIFactory
-    CreateDXGIFactory1=dxgi_real.CreateDXGIFactory1
-    CreateDXGIFactory2=dxgi_real.CreateDXGIFactory2
-    DXGID3D10CreateDevice=dxgi_real.DXGID3D10CreateDevice
-    DXGID3D10RegisterLayers=dxgi_real.DXGID3D10RegisterLayers
-    DXGIDeclareAdapterRemovalSupport=dxgi_real.DXGIDeclareAdapterRemovalSupport
-    DXGIGetDebugInterface1=dxgi_real.DXGIGetDebugInterface1

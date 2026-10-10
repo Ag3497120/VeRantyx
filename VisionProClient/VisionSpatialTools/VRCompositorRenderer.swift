@@ -10,23 +10,56 @@ struct VRRenderStatistics {
     let frameAgeMilliseconds: Int
     let anchored: Bool
     let gpuErrors: Int
+    let eyeGeometry: String
+}
+
+/// The eye frustum SteamVR renders with, sent by the Mac encoder. SteamVR
+/// fixes it when it starts, which can be before this headset connects, so it
+/// may differ from the Vision Pro's own eye frustum.
+final class VRSourceProjectionStore {
+    static let shared = VRSourceProjectionStore()
+
+    private let lock = NSLock()
+    private var tangents: (left: SIMD4<Float>, right: SIMD4<Float>)?
+
+    func update(left: SIMD4<Float>, right: SIMD4<Float>) {
+        func valid(_ t: SIMD4<Float>) -> Bool {
+            t.x.isFinite && t.y.isFinite && t.z.isFinite && t.w.isFinite &&
+                t.x < 0 && t.y > 0 && t.z < 0 && t.w > 0
+        }
+        guard valid(left), valid(right) else { return }
+        lock.lock()
+        tangents = (left, right)
+        lock.unlock()
+    }
+
+    func snapshot() -> (left: SIMD4<Float>, right: SIMD4<Float>)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return tangents
+    }
 }
 
 final class VRCompositorRenderer {
     private let layerRenderer: LayerRenderer
-    private let worldTrackingProvider: WorldTrackingProvider
-    private let deviceAnchorHistory: DeviceAnchorHistory
+    private let poseSampler: VRPoseSampler
     private let projectionTangents: VisionProjectionTangents
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let textureCache: CVMetalTextureCache
     private let pipelineState: MTLRenderPipelineState
+    private let depthState: MTLDepthStencilState
     private let samplerState: MTLSamplerState
     private var didPublishProjectionTangents = false
     private let reportStatistics: (VRRenderStatistics) -> Void
+    private let reportState: (String) -> Void
+    private var lastReportedState = ""
+    private var lastHeartbeatAt: CFTimeInterval = 0
     private var cachedVideoFrame: VRDecodedFrame?
     private var cachedVideoTexture: CVMetalTexture?
-    private var cachedSourceAnchor: DeviceAnchor?
+    private var cachedSource: DeviceAnchorHistory.Sample?
+    private var eyeCenter = SIMD3<Float>.zero
+    private var eyeSeparation: Float = 0
     private let statisticsLock = NSLock()
     private var completedFrames = 0
     private var gpuErrors = 0
@@ -35,15 +68,14 @@ final class VRCompositorRenderer {
 
     init(
         layerRenderer: LayerRenderer,
-        worldTrackingProvider: WorldTrackingProvider,
-        deviceAnchorHistory: DeviceAnchorHistory,
-        projectionTangents: VisionProjectionTangents,
-        reportStatistics: @escaping (VRRenderStatistics) -> Void
+        poseSampler: VRPoseSampler,
+        reportStatistics: @escaping (VRRenderStatistics) -> Void,
+        reportState: @escaping (String) -> Void = { _ in }
     ) throws {
+        self.reportState = reportState
         self.layerRenderer = layerRenderer
-        self.worldTrackingProvider = worldTrackingProvider
-        self.deviceAnchorHistory = deviceAnchorHistory
-        self.projectionTangents = projectionTangents
+        self.poseSampler = poseSampler
+        self.projectionTangents = poseSampler.projectionTangents
         self.reportStatistics = reportStatistics
         self.device = layerRenderer.device
 
@@ -69,6 +101,13 @@ final class VRCompositorRenderer {
         }
         self.samplerState = samplerState
         self.pipelineState = try Self.makePipeline(device: device, configuration: layerRenderer.configuration)
+        let depthDescriptor = MTLDepthStencilDescriptor()
+        depthDescriptor.depthCompareFunction = .always
+        depthDescriptor.isDepthWriteEnabled = true
+        guard let depthState = device.makeDepthStencilState(descriptor: depthDescriptor) else {
+            throw RendererError.depthStateUnavailable
+        }
+        self.depthState = depthState
     }
 
     func startRenderLoop() {
@@ -78,7 +117,24 @@ final class VRCompositorRenderer {
     }
 
     private func runRenderLoop() {
+        // This thread also paces the pose stream to the Mac.
+        Thread.current.qualityOfService = .userInteractive
+        defer { reportState("loop exited (layer invalidated)") }
         while layerRenderer.state != .invalidated {
+            // Log when visionOS pauses the space (Home View or Control Center
+            // opened over it) and when it resumes.
+            let stateName = layerRenderer.state == .paused ? "paused" : "running"
+            if stateName != lastReportedState {
+                lastReportedState = stateName
+                reportState(stateName)
+            }
+            // Heartbeat: a crash report without this thread would otherwise
+            // leave no trace of whether the loop had stalled or exited.
+            let heartbeatNow = CACurrentMediaTime()
+            if heartbeatNow - lastHeartbeatAt >= 15 {
+                lastHeartbeatAt = heartbeatNow
+                reportState("alive (\(stateName), video \(cachedVideoFrame == nil ? "none" : "cached"))")
+            }
             if layerRenderer.state == .paused {
                 Thread.sleep(forTimeInterval: 0.05)
                 continue
@@ -96,13 +152,29 @@ final class VRCompositorRenderer {
                 continue
             }
             LayerRenderer.Clock().wait(until: timing.optimalInputTime)
+            let presentationTime = Self.seconds(timing.presentationTime)
+            // One pose packet per displayed frame keeps SteamVR's head stream
+            // as even as the display itself.
+            poseSampler.sample(presentationTime: presentationTime, now: CACurrentMediaTime())
 
             frame.startSubmission()
-            defer { frame.endSubmission() }
-
             let drawables = frame.queryDrawables()
+            // No drawables means visionOS cancelled the frame (the space is
+            // paused, for example while a level loads or Home View is open).
+            // Such a frame is invalid: ending its submission made visionOS
+            // abort the app with "BUG IN CLIENT".
             guard let drawable = drawables.first(where: { $0.target == .builtIn }) ?? drawables.first else {
                 continue
+            }
+
+            if drawable.views.count >= 2 {
+                // SteamVR places its eyes ±IPD/2 around the HMD pose. Send the
+                // midpoint of the real eyes as that pose so near objects line up.
+                let t0 = drawable.views[0].transform.columns.3
+                let t1 = drawable.views[1].transform.columns.3
+                eyeCenter = SIMD3<Float>((t0.x + t1.x) / 2, (t0.y + t1.y) / 2, (t0.z + t1.z) / 2)
+                eyeSeparation = simd_distance(SIMD3<Float>(t0.x, t0.y, t0.z), SIMD3<Float>(t1.x, t1.y, t1.z))
+                poseSampler.updateEyeCenter(eyeCenter)
             }
 
             if !didPublishProjectionTangents,
@@ -115,38 +187,53 @@ final class VRCompositorRenderer {
             }
 
             let videoFrame = VRVideoFrameStore.shared.snapshot()
+            var isNewVideoFrame = false
             if videoFrame?.pixelBuffer !== cachedVideoFrame?.pixelBuffer {
                 cachedVideoFrame = videoFrame
                 cachedVideoTexture = nil
-                cachedSourceAnchor = nil
+                cachedSource = nil
+                isNewVideoFrame = videoFrame != nil
                 if videoFrame != nil { newVideoFrames += 1 }
             }
             // The drawable anchor must describe the pose used to make its pixels.
-            // For a streamed frame that is the Vision Pro pose timestamped by the
-            // Mac capture path. Supplying the display-time pose here tells the
-            // compositor that the older image was rendered from a newer viewpoint,
-            // which disables useful late reprojection and looks warped when the
-            // wearer moves their head.
+            // The frame carries the ID of the exact pose SteamVR rendered with,
+            // so the compositor reprojects from that pose to the display pose.
+            // Supplying the display-time pose instead would tell it the image
+            // was rendered from a newer viewpoint, which warps head motion.
+            var anchor: DeviceAnchor?
             if let videoFrame {
                 if videoFrame.timestamp > 0,
-                   let sourceAnchor = cachedSourceAnchor ?? deviceAnchorHistory.anchor(near: videoFrame.timestamp),
-                   sourceAnchor.isTracked {
+                   let source = cachedSource ?? poseSampler.history.sample(for: videoFrame.timestamp),
+                   source.anchor.isTracked,
+                   // While the game loads a level no frames arrive for many
+                   // seconds. Reprojecting the last frame from a pose that old
+                   // swings it across the view and gives the compositor's warp
+                   // pass an enormous delta; show it head-locked instead.
+                   presentationTime - source.sampledAt < 0.5 {
                     // Keep this frame's source anchor while reusing its pixels.
-                    // A slow game can outlive the tracking history's two-second
-                    // window; that must not disable head-motion reprojection.
-                    cachedSourceAnchor = sourceAnchor
-                    drawable.deviceAnchor = sourceAnchor
-                } else {
-                    // Never label an old or untracked SteamVR frame with the
-                    // current head pose. That makes compositor reprojection apply
-                    // the wrong transform and bends the streamed image.
-                    drawable.deviceAnchor = nil
+                    cachedSource = source
+                    anchor = source.anchor
+                    if isNewVideoFrame {
+                        poseSampler.reportDisplayed(poseID: source.id, sampledAt: source.sampledAt,
+                                                    presentationTime: presentationTime)
+                    }
                 }
-            } else if let predictedAnchor = worldTrackingProvider.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()),
-                      predictedAnchor.isTracked {
-                drawable.deviceAnchor = predictedAnchor
             }
-            render(drawable: drawable, videoFrame: videoFrame)
+            if anchor == nil {
+                // No fresh frame (level load, or a frame whose pose is unknown):
+                // give the compositor the predicted display pose, which shows
+                // the last image head-locked. Both a seconds-old anchor and no
+                // anchor at all were followed by the system killing the app a
+                // few seconds into every level load.
+                anchor = poseSampler.queryDeviceAnchor(at: Self.seconds(timing.trackableAnchorTime))
+            }
+            // Every drawable must be presented, including the extra one
+            // visionOS adds while recording or taking a screenshot.
+            for target in drawables {
+                target.deviceAnchor = anchor
+                render(drawable: target, videoFrame: videoFrame)
+            }
+            frame.endSubmission()
             let now = CACurrentMediaTime()
             let interval = now - statisticsStartedAt
             if interval >= 5 {
@@ -155,18 +242,25 @@ final class VRCompositorRenderer {
                 let errors = gpuErrors
                 completedFrames = 0
                 statisticsLock.unlock()
-                let age = videoFrame.flatMap { $0.timestamp > 0 ? Int(max(0, now - $0.timestamp) * 1000) : nil } ?? -1
+                let age = cachedSource.map { Int(max(0, presentationTime - $0.sampledAt) * 1000) } ?? -1
                 reportStatistics(VRRenderStatistics(
                     renderFPS: Int((Double(completed) / interval).rounded()),
                     newFrameFPS: Int((Double(newVideoFrames) / interval).rounded()),
                     frameAgeMilliseconds: age,
                     anchored: drawable.deviceAnchor != nil,
-                    gpuErrors: errors
+                    gpuErrors: errors,
+                    eyeGeometry: String(format: "eye_center=(%.3f,%.3f,%.3f) ipd=%.1fmm",
+                                        eyeCenter.x, eyeCenter.y, eyeCenter.z, eyeSeparation * 1000)
                 ))
                 statisticsStartedAt = now
                 newVideoFrames = 0
             }
         }
+    }
+
+    private static func seconds(_ instant: LayerRenderer.Clock.Instant) -> CFTimeInterval {
+        let components = LayerRenderer.Clock.Instant.epoch.duration(to: instant).components
+        return CFTimeInterval(components.seconds) + CFTimeInterval(components.attoseconds) * 1e-18
     }
 
     private static func openVRTangents(
@@ -186,12 +280,29 @@ final class VRCompositorRenderer {
         // In right-up-back clip space, left/right are -1/+1 and bottom/top are
         // -1/+1. OpenVR names the vertical clipping arguments in the opposite
         // order, so SIMD lanes are [left, right, bottom, top].
-        let tangents = SIMD4<Float>(
-            (-1 + xOffset) / xScale,
-            (1 + xOffset) / xScale,
-            (-1 + yOffset) / yScale,
-            (1 + yOffset) / yScale
+        let left = (-1 + xOffset) / xScale
+        let right = (1 + xOffset) / xScale
+        let bottom = (-1 + yOffset) / yScale
+        let top = (1 + yOffset) / yScale
+        // SteamVR renders each eye facing straight ahead from the head. If a
+        // Vision Pro view is rotated relative to the device, express its
+        // frustum in device axes so the game's image still covers it.
+        let viewTransform = drawable.views[viewIndex].transform
+        let rotation = simd_float3x3(
+            SIMD3<Float>(viewTransform.columns.0.x, viewTransform.columns.0.y, viewTransform.columns.0.z),
+            SIMD3<Float>(viewTransform.columns.1.x, viewTransform.columns.1.y, viewTransform.columns.1.z),
+            SIMD3<Float>(viewTransform.columns.2.x, viewTransform.columns.2.y, viewTransform.columns.2.z)
         )
+        var bounds = SIMD4<Float>(.infinity, -.infinity, .infinity, -.infinity)
+        for (u, v) in [(left, bottom), (right, bottom), (left, top), (right, top)] {
+            let direction = rotation * SIMD3<Float>(u, v, -1)
+            guard direction.z < -0.0001 else { return nil }
+            let deviceU = direction.x / -direction.z
+            let deviceV = direction.y / -direction.z
+            bounds = SIMD4<Float>(min(bounds.x, deviceU), max(bounds.y, deviceU),
+                                  min(bounds.z, deviceV), max(bounds.w, deviceV))
+        }
+        let tangents = bounds
         guard tangents.x < 0, tangents.y > 0, tangents.z < 0, tangents.w > 0,
               tangents.x.isFinite, tangents.y.isFinite,
               tangents.z.isFinite, tangents.w.isFinite else {
@@ -238,7 +349,9 @@ final class VRCompositorRenderer {
             renderPass.depthAttachment.texture = drawable.depthTextures[0]
             renderPass.depthAttachment.loadAction = .clear
             renderPass.depthAttachment.storeAction = .store
-            renderPass.depthAttachment.clearDepth = 1.0
+            // Compositor Services uses reverse-Z: 1 is the near plane, 0 is
+            // far. The video quad writes its own depth below.
+            renderPass.depthAttachment.clearDepth = 0.0
         }
         if layerRenderer.configuration.layout == .layered {
             renderPass.renderTargetArrayLength = drawable.views.count
@@ -248,13 +361,12 @@ final class VRCompositorRenderer {
             return
         }
         encoder.setRenderPipelineState(pipelineState)
+        encoder.setDepthStencilState(depthState)
         encoder.setCullMode(.none)
-        let sourceAspect = videoFrame.map {
-            Double(CVPixelBufferGetWidth($0.pixelBuffer)) / 2.0 / Double(CVPixelBufferGetHeight($0.pixelBuffer))
-        } ?? (8.0 / 9.0)
-        encoder.setViewports(drawable.views.map {
-            Self.aspectFitViewport($0.textureMap.viewport, contentAspect: sourceAspect)
-        })
+        var corners = Self.videoCorners(drawable: drawable, source: VRSourceProjectionStore.shared.snapshot(),
+                                        eyeCenter: eyeCenter)
+        encoder.setVertexBytes(&corners, length: MemoryLayout<SIMD4<Float>>.stride * corners.count, index: 0)
+        encoder.setViewports(drawable.views.map { $0.textureMap.viewport })
 
         if layerRenderer.configuration.layout == .layered {
             var mappings = drawable.views.indices.map { index in
@@ -287,19 +399,37 @@ final class VRCompositorRenderer {
         commandBuffer.commit()
     }
 
-    private static func aspectFitViewport(_ viewport: MTLViewport, contentAspect: Double) -> MTLViewport {
-        guard viewport.width > 0, viewport.height > 0, contentAspect > 0 else { return viewport }
-        let viewportAspect = viewport.width / viewport.height
-        var fitted = viewport
-
-        if contentAspect > viewportAspect {
-            fitted.height = viewport.width / contentAspect
-            fitted.originY += (viewport.height - fitted.height) * 0.5
-        } else {
-            fitted.width = viewport.height * contentAspect
-            fitted.originX += (viewport.width - fitted.width) * 0.5
+    /// Clip-space corners of each eye's video image, 4 per view: bottom-left,
+    /// bottom-right, top-left, top-right. Each eye image is the plane SteamVR
+    /// rendered: its frustum `source` (tangents in head axes) seen from that
+    /// eye, placed 10 m away. Projecting it with the Vision Pro view keeps the
+    /// image at the true angles even when SteamVR's frustum differs from the
+    /// display's, instead of stretching it over the viewport. The 10 m depth
+    /// also gives the compositor a real distance: depth 1 (the near plane)
+    /// made its reprojection swing the image, and depth 0 hid it.
+    private static func videoCorners(
+        drawable: LayerRenderer.Drawable,
+        source: (left: SIMD4<Float>, right: SIMD4<Float>)?,
+        eyeCenter: SIMD3<Float>
+    ) -> [SIMD4<Float>] {
+        let distance: Float = 10
+        let halfIPD: Float = 0.0315 // SteamVR's default 63 mm, which the driver reports.
+        var corners: [SIMD4<Float>] = []
+        for index in 0..<min(drawable.views.count, 2) {
+            let fallback = SIMD4<Float>(-1, 1, -1, 1)
+            let tangents = (index == 0 ? source?.left : source?.right)
+                ?? openVRTangents(from: drawable, viewIndex: index) ?? fallback
+            let projection = drawable.computeProjection(convention: .rightUpBack, viewIndex: index)
+            let viewFromDevice = drawable.views[index].transform.inverse
+            // SteamVR's eyes: the sent HMD pose (the real eye midpoint) ± IPD/2.
+            let eye = eyeCenter + SIMD3<Float>(index == 0 ? -halfIPD : halfIPD, 0, 0)
+            for (u, v) in [(tangents.x, tangents.z), (tangents.y, tangents.z), (tangents.x, tangents.w), (tangents.y, tangents.w)] {
+                let point = eye + SIMD3<Float>(u, v, -1) * distance
+                corners.append(projection * viewFromDevice * SIMD4<Float>(point, 1))
+            }
         }
-        return fitted
+        while corners.count < 8 { corners.append(SIMD4<Float>(0, 0, 0, 1)) }
+        return corners
     }
 
     private static func makePipeline(
@@ -316,18 +446,17 @@ final class VRCompositorRenderer {
             uint eyeIndex;
         };
 
-        vertex VertexOut vrVertexShader(uint vertexID [[vertex_id]], uint eyeIndex [[amplification_id]]) {
-            const float2 positions[6] = {
-                float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0),
-                float2(-1.0, 1.0), float2(1.0, -1.0), float2(1.0, 1.0)
+        vertex VertexOut vrVertexShader(uint vertexID [[vertex_id]], uint eyeIndex [[amplification_id]],
+                                        constant float4 *corners [[buffer(0)]]) {
+            // Corners per eye: bottom-left, bottom-right, top-left, top-right.
+            const uint cornerForVertex[6] = { 0, 1, 2, 2, 1, 3 };
+            const float2 texCoords[4] = {
+                float2(0.0, 1.0), float2(1.0, 1.0), float2(0.0, 0.0), float2(1.0, 0.0)
             };
-            const float2 texCoords[6] = {
-                float2(0.0, 1.0), float2(1.0, 1.0), float2(0.0, 0.0),
-                float2(0.0, 0.0), float2(1.0, 1.0), float2(1.0, 0.0)
-            };
+            uint corner = cornerForVertex[vertexID];
             VertexOut out;
-            out.position = float4(positions[vertexID], 0.0, 1.0);
-            out.uv = texCoords[vertexID];
+            out.position = corners[eyeIndex * 4 + corner];
+            out.uv = texCoords[corner];
             out.eyeIndex = eyeIndex;
             return out;
         }
@@ -357,5 +486,6 @@ final class VRCompositorRenderer {
         case commandQueueUnavailable
         case textureCacheUnavailable(CVReturn)
         case samplerUnavailable
+        case depthStateUnavailable
     }
 }

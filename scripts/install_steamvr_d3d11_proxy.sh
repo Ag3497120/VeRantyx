@@ -25,7 +25,7 @@ if [[ ! -d "$STEAMVR_BIN" ]]; then
     exit 1
 fi
 
-if ! file "$SOURCE_DLL" | rg -q 'PE32\+ executable.*x86-64'; then
+if ! file "$SOURCE_DLL" | grep -Eq 'PE32\+ executable.*x86-64'; then
     echo "Proxy DLL is not a Windows x64 DLL: $SOURCE_DLL" >&2
     exit 1
 fi
@@ -36,7 +36,8 @@ if [[ -f "$TARGET_DLL" ]] && ! cmp -s "$TARGET_DLL" "$SOURCE_DLL" && [[ ! -f "$B
     echo "Saved the prior SteamVR-local d3d11.dll."
 fi
 if ! cmp -s "$TARGET_DLL" "$SOURCE_DLL"; then
-    cp -p "$SOURCE_DLL" "$TARGET_DLL"
+    # Rename into place so a running compositor keeps its mapped copy.
+    cp -p "$SOURCE_DLL" "$TARGET_DLL.verantyx-tmp" && mv -f "$TARGET_DLL.verantyx-tmp" "$TARGET_DLL"
     echo "Installed the D3D11 proxy in the test clone's SteamVR bin directory."
 else
     echo "The SteamVR-local D3D11 proxy is already current."

@@ -1,5 +1,0 @@
-esync: up and running.
-Starting D3DMetal Texture Analysis...
-D3D11 Device created: 00007fb16b042400
-First pixel: 00 00 00 00
-CopyResource + Map took: 46.564 ms

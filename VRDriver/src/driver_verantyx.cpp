@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include <stddef.h>
 
 void LogDriver(const char* msg) {
@@ -54,6 +55,11 @@ struct SharedHands {
     uint8_t leftGrip;
     uint8_t rightGrip;
     uint8_t headTracked;
+    // Hand velocities in SteamVR space from the headset (hand tracking fused
+    // with Joy-Con inertial sensors). Linear ones use the fields above.
+    float leftAngularVelocity[3];
+    float rightAngularVelocity[3];
+    uint8_t velocityValid;
 };
 #pragma pack(pop)
 
@@ -67,24 +73,53 @@ struct DoubleBufferHeader {
     uint32_t padding[10];
 };
 
+// The driver records every HMD pose it hands to SteamVR. The game-side capture
+// proxy matches WaitGetPoses' render pose against this ring, so each streamed
+// frame carries the exact Vision Pro pose ID that the game rendered with.
+#pragma pack(push, 1)
+struct PoseHistoryEntry {
+    double visionTimestamp;
+    float position[3];
+    float rotation[4]; // w, x, y, z
+    float reserved;
+};
+
+struct PoseHistory {
+    volatile LONG writeCount;
+    uint32_t magic;
+    uint32_t reserved[2];
+    PoseHistoryEntry entries[16];
+};
+#pragma pack(pop)
+
 static_assert(sizeof(SharedFrame) == 88, "SharedFrame layout must match HardwareEncoder.swift");
 static_assert(sizeof(DoubleBufferHeader) == 64, "DoubleBufferHeader layout must match HardwareEncoder.swift");
-static_assert(sizeof(SharedHands) == 287, "SharedHands layout must match HardwareEncoder.swift offsets");
+static_assert(sizeof(SharedHands) == 312, "SharedHands layout must match HardwareEncoder.swift offsets");
 static_assert(offsetof(SharedHands, visionTimestamp) == 244, "SharedHands timestamp offset changed");
 static_assert(offsetof(SharedHands, leftTangents) == 252, "SharedHands tangent offsets changed");
 static_assert(offsetof(SharedHands, leftGrip) == 284, "SharedHands grip offsets changed");
+static_assert(offsetof(SharedHands, leftAngularVelocity) == 287, "SharedHands angular velocity offset changed");
+static_assert(offsetof(SharedHands, velocityValid) == 311, "SharedHands velocity flag offset changed");
 static_assert(offsetof(DoubleBufferHeader, poseSequence) == 20, "Pose sequence offset changed");
+static_assert(sizeof(PoseHistoryEntry) == 40, "PoseHistoryEntry layout must match openvr_capture_proxy.cpp");
+static_assert(sizeof(PoseHistory) == 656, "PoseHistory layout must match openvr_capture_proxy.cpp");
 
 static const size_t kMaxPixelBytes = 4096ull * 4096ull * 8ull;
 static const size_t kFrameBlockSize = sizeof(SharedFrame) + kMaxPixelBytes;
 static const size_t kSharedMapSize = sizeof(DoubleBufferHeader) +
     (kFrameBlockSize * 2) + sizeof(SharedHands) + 1024;
+static const size_t kHandsOffset = sizeof(DoubleBufferHeader) + (kFrameBlockSize * 2);
+// Lives in the map's existing 1024-byte tail, so the encoder's layout is unchanged.
+static const size_t kPoseHistoryOffset = kHandsOffset + 512;
+static const uint32_t kPoseHistoryMagic = 0x53485056; // "VPHS"
+static_assert(kPoseHistoryOffset + sizeof(PoseHistory) <= kSharedMapSize, "Pose history must fit in the shared map");
 static HANDLE hMapFile = NULL;
 static void* g_sharedMap = nullptr;
 static DoubleBufferHeader* g_doubleBufferHeader = nullptr;
 static SharedFrame* g_frameHeaders[2] = { nullptr, nullptr };
 static uint8_t* g_framePixels[2] = { nullptr, nullptr };
 static SharedHands* pSharedHands = NULL;
+static PoseHistory* g_poseHistory = nullptr;
 static std::mutex g_sharedMemoryMutex;
 static uint32_t g_frameSequence = 0;
 static ID3D11Device* g_captureDevice = nullptr;
@@ -208,7 +243,14 @@ static bool IsFourByteColorFormat(DXGI_FORMAT format) {
 static void CapturePresentedTexture(const vr::PresentInfo_t* presentInfo) {
     if (!presentInfo || presentInfo->backbufferTextureHandle == INVALID_SHARED_TEXTURE_HANDLE) return;
     if (!InitSharedMemoryDriver()) return;
-    if (InterlockedCompareExchange(&g_doubleBufferHeader->captureSourceMode, 0, 0) == 2) return;
+    if (InterlockedCompareExchange(&g_doubleBufferHeader->captureSourceMode, 0, 0) == 2) {
+        // The game's capture proxy owns the stream while it submits frames.
+        // padding[9] is its last Submit tick; after 1.5 s without one (level
+        // load) fall back to the compositor's output so the headset shows the
+        // loading screen rather than a frozen frame.
+        const DWORD lastSubmit = (DWORD)InterlockedCompareExchange((volatile LONG*)&g_doubleBufferHeader->padding[9], 0, 0);
+        if (lastSubmit == 0 || GetTickCount() - lastSubmit < 1500) return;
+    }
 
     std::lock_guard<std::mutex> captureLock(g_captureMutex);
     if (!EnsureCaptureDevice()) return;
@@ -432,6 +474,7 @@ static bool InitSharedMemoryDriver() {
         g_framePixels[index] = block + sizeof(SharedFrame);
     }
     pSharedHands = (SharedHands*)(frameBase + (kFrameBlockSize * 2));
+    g_poseHistory = (PoseHistory*)((uint8_t*)g_sharedMap + kPoseHistoryOffset);
 
     // The file can survive a reboot or be copied from another machine. Reset
     // only the small metadata area so the encoder never treats an old frame as
@@ -440,6 +483,8 @@ static bool InitSharedMemoryDriver() {
     memset(g_frameHeaders[0], 0, sizeof(SharedFrame));
     memset(g_frameHeaders[1], 0, sizeof(SharedFrame));
     memset(pSharedHands, 0, sizeof(SharedHands));
+    memset(g_poseHistory, 0, sizeof(PoseHistory));
+    g_poseHistory->magic = kPoseHistoryMagic;
     g_frameSequence = 0;
     MemoryBarrier();
 
@@ -475,7 +520,145 @@ static vr::HmdQuaternion_t ExtractQuaternion(const float* m) {
         q.y = (m[6] + m[9]) / S;
         q.z = 0.25f * S;
     }
+    const double length = sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (length > 1e-6 && std::isfinite(length)) {
+        q.w /= length; q.x /= length; q.y /= length; q.z /= length;
+    } else {
+        q = { 1, 0, 0, 0 };
+    }
     return q;
+}
+
+static bool IsFiniteTransform(const float* m) {
+    for (int i = 0; i < 16; ++i) {
+        if (!std::isfinite(m[i])) return false;
+    }
+    return true;
+}
+
+static double ReadEnvironmentNumber(const char* name, double fallback, double minimum, double maximum) {
+    char value[32] = {};
+    const DWORD length = GetEnvironmentVariableA(name, value, sizeof(value));
+    if (length == 0 || length >= sizeof(value)) return fallback;
+    char* end = nullptr;
+    const double parsed = strtod(value, &end);
+    if (end == value || !std::isfinite(parsed) || parsed < minimum || parsed > maximum) return fallback;
+    return parsed;
+}
+
+static double DisplayFrequency() {
+    // 60 Hz: SteamVR's compositor redraws the (virtual) display every vsync,
+    // and the game runs well below 60 fps on this CPU-bound Mac anyway.
+    static const double frequency = ReadEnvironmentNumber("VERANTYX_DISPLAY_HZ", 60.0, 30.0, 144.0);
+    return frequency;
+}
+
+// One virtual panel clock drives both the compositor's vsync estimate and its
+// present throttle. Sleeping a fixed 11 ms after each Present drifted against
+// this clock, so Alyx was released from WaitGetPoses at irregular intervals.
+static const std::chrono::steady_clock::time_point g_vsyncEpoch = std::chrono::steady_clock::now();
+
+static double SecondsSinceVsyncEpoch() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_vsyncEpoch).count();
+}
+
+static void SleepUntilVsyncSeconds(double target) {
+    for (;;) {
+        const double remaining = target - SecondsSinceVsyncEpoch();
+        if (remaining <= 0.0) return;
+        if (remaining > 0.0015) {
+            Sleep((DWORD)std::max(1.0, floor((remaining - 0.0005) * 1000.0)));
+        } else {
+            SwitchToThread();
+        }
+    }
+}
+
+static vr::HmdQuaternion_t MultiplyQuaternions(const vr::HmdQuaternion_t& a, const vr::HmdQuaternion_t& b) {
+    return {
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w
+    };
+}
+
+static vr::HmdQuaternion_t ConjugateQuaternion(const vr::HmdQuaternion_t& q) {
+    return { q.w, -q.x, -q.y, -q.z };
+}
+
+// ARKit poses carry no velocity. Alyx needs controller velocity for throws and
+// SteamVR uses it to predict hands to photon time, so estimate it from
+// consecutive Vision Pro samples and smooth out tracking noise.
+struct MotionEstimator {
+    bool hasSample = false;
+    double lastTimestamp = 0.0;
+    double lastPosition[3] = { 0, 0, 0 };
+    vr::HmdQuaternion_t lastRotation = { 1, 0, 0, 0 };
+    double velocity[3] = { 0, 0, 0 };
+    double angularVelocity[3] = { 0, 0, 0 };
+
+    void Reset() {
+        hasSample = false;
+        for (int i = 0; i < 3; ++i) velocity[i] = angularVelocity[i] = 0.0;
+    }
+
+    void Update(double timestamp, const float* position, const vr::HmdQuaternion_t& rotation) {
+        if (hasSample && timestamp > lastTimestamp) {
+            const double dt = timestamp - lastTimestamp;
+            if (dt >= 0.002 && dt <= 0.1) {
+                constexpr double kSmoothing = 0.45;
+                double linear[3];
+                double speedSquared = 0.0;
+                for (int i = 0; i < 3; ++i) {
+                    linear[i] = (position[i] - lastPosition[i]) / dt;
+                    speedSquared += linear[i] * linear[i];
+                }
+                // A tracking pop is not motion; drop it instead of flinging objects.
+                if (speedSquared < 12.0 * 12.0) {
+                    for (int i = 0; i < 3; ++i) velocity[i] += (linear[i] - velocity[i]) * kSmoothing;
+                }
+
+                vr::HmdQuaternion_t delta = MultiplyQuaternions(rotation, ConjugateQuaternion(lastRotation));
+                if (delta.w < 0) delta = { -delta.w, -delta.x, -delta.y, -delta.z };
+                const double sinHalf = sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+                double angular[3] = { 0, 0, 0 };
+                if (sinHalf > 1e-7) {
+                    const double angle = 2.0 * atan2(sinHalf, std::min(1.0, delta.w));
+                    const double scale = angle / (sinHalf * dt);
+                    angular[0] = delta.x * scale;
+                    angular[1] = delta.y * scale;
+                    angular[2] = delta.z * scale;
+                }
+                const double angularSpeedSquared = angular[0] * angular[0] + angular[1] * angular[1] + angular[2] * angular[2];
+                if (angularSpeedSquared < 40.0 * 40.0) {
+                    for (int i = 0; i < 3; ++i) angularVelocity[i] += (angular[i] - angularVelocity[i]) * kSmoothing;
+                }
+            } else {
+                for (int i = 0; i < 3; ++i) velocity[i] = angularVelocity[i] = 0.0;
+            }
+        } else if (hasSample && timestamp < lastTimestamp) {
+            Reset();
+        }
+        hasSample = true;
+        lastTimestamp = timestamp;
+        for (int i = 0; i < 3; ++i) lastPosition[i] = position[i];
+        lastRotation = rotation;
+    }
+};
+
+static void RecordPushedHmdPose(double visionTimestamp, const vr::DriverPose_t& pose) {
+    if (!g_poseHistory) return;
+    const LONG count = InterlockedCompareExchange(&g_poseHistory->writeCount, 0, 0);
+    PoseHistoryEntry& entry = g_poseHistory->entries[(uint32_t)count % 16u];
+    entry.visionTimestamp = visionTimestamp;
+    for (int i = 0; i < 3; ++i) entry.position[i] = (float)pose.vecPosition[i];
+    entry.rotation[0] = (float)pose.qRotation.w;
+    entry.rotation[1] = (float)pose.qRotation.x;
+    entry.rotation[2] = (float)pose.qRotation.y;
+    entry.rotation[3] = (float)pose.qRotation.z;
+    MemoryBarrier();
+    InterlockedExchange(&g_poseHistory->writeCount, count + 1);
 }
 
 class CVerantyxDirectMode : public vr::IVRDriverDirectModeComponent {
@@ -497,18 +680,21 @@ public:
     }
     
     virtual void WaitForPresent() override {
-        std::this_thread::sleep_for(std::chrono::milliseconds(11));
+        // Return at the next virtual vsync, like a real panel scanning out
+        // the frame. The compositor then stays phase-locked to the same clock
+        // that GetTimeSinceLastVsync reports to it.
+        const double period = 1.0 / DisplayFrequency();
+        const double now = SecondsSinceVsyncEpoch();
+        SleepUntilVsyncSeconds((floor(now / period) + 1.0) * period);
     }
-    
+
     virtual bool GetTimeSinceLastVsync(float *pfSecondsSinceLastVsync, uint64_t *pulFrameCounter) override {
-        static auto startTime = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - startTime).count();
-        double frameDuration = 1.0 / 90.0;
-        const uint64_t frameCounter = (uint64_t)(elapsed / frameDuration);
+        const double period = 1.0 / DisplayFrequency();
+        const double elapsed = SecondsSinceVsyncEpoch();
+        const uint64_t frameCounter = (uint64_t)(elapsed / period);
         if (pulFrameCounter) *pulFrameCounter = frameCounter;
         if (pfSecondsSinceLastVsync) {
-            *pfSecondsSinceLastVsync = (float)(elapsed - (frameCounter * frameDuration));
+            *pfSecondsSinceLastVsync = (float)(elapsed - ((double)frameCounter * period));
         }
         return true;
     }
@@ -527,21 +713,109 @@ struct EyeRenderSize {
     uint32_t height;
 };
 
-static EyeRenderSize GetEyeRenderSize() {
-    constexpr float kFallbackEyeAspect = 8.0f / 9.0f;
-    constexpr double kTargetPixelsPerEye = 800.0 * 900.0;
-    float eyeAspect = kFallbackEyeAspect;
+// SteamVR reads the eye frustum once, when it starts, which is before the
+// Vision Pro connects. The driver therefore answers with the frustum saved
+// from the previous session, and never changes it during a session: Alyx
+// builds its projection from the first answer. The value in use is published
+// in the shared header so the headset can place the image at the right angles.
+struct EyeTangents {
+    float left[4];
+    float right[4];
+};
 
-    InitSharedMemoryDriver();
-    SharedHands snapshot = {};
-    if (ReadSharedHandsSnapshot(&snapshot) &&
-        HasValidProjectionTangents(snapshot.leftTangents)) {
-        const float horizontal = snapshot.leftTangents[1] - snapshot.leftTangents[0];
-        const float vertical = snapshot.leftTangents[3] - snapshot.leftTangents[2];
-        if (horizontal > 0.01f && vertical > 0.01f) {
-            eyeAspect = horizontal / vertical;
-        }
+static const char* kTangentFile = "C:\\vr_verantyx_tangents.txt";
+static const uint32_t kTangentMagic = 0x4E415456; // "VTAN"
+static std::mutex g_tangentMutex;
+static bool g_tangentsLatched = false;
+static EyeTangents g_latchedTangents = {};
+static EyeTangents g_lastPersistedTangents = {};
+
+static bool LoadPersistedTangents(EyeTangents* tangents) {
+    FILE* file = fopen(kTangentFile, "r");
+    if (!file) return false;
+    EyeTangents loaded = {};
+    const int count = fscanf(file, "%f %f %f %f %f %f %f %f",
+        &loaded.left[0], &loaded.left[1], &loaded.left[2], &loaded.left[3],
+        &loaded.right[0], &loaded.right[1], &loaded.right[2], &loaded.right[3]);
+    fclose(file);
+    if (count != 8 || !HasValidProjectionTangents(loaded.left) || !HasValidProjectionTangents(loaded.right)) return false;
+    *tangents = loaded;
+    return true;
+}
+
+static void PublishEffectiveTangents() {
+    if (!g_doubleBufferHeader) return;
+    EyeTangents tangents;
+    {
+        std::lock_guard<std::mutex> lock(g_tangentMutex);
+        if (!g_tangentsLatched) return;
+        tangents = g_latchedTangents;
     }
+    // Another process that maps the file clears the header on start, so the
+    // pose thread calls this repeatedly.
+    if (g_doubleBufferHeader->padding[8] == kTangentMagic) return;
+    memcpy(&g_doubleBufferHeader->padding[0], tangents.left, sizeof(tangents.left));
+    memcpy(&g_doubleBufferHeader->padding[4], tangents.right, sizeof(tangents.right));
+    MemoryBarrier();
+    g_doubleBufferHeader->padding[8] = kTangentMagic;
+}
+
+static EyeTangents LatchedTangents() {
+    EyeTangents result;
+    {
+        std::lock_guard<std::mutex> lock(g_tangentMutex);
+        if (!g_tangentsLatched) {
+            const char* source = "8:9 fallback (no saved Vision Pro frustum yet)";
+            EyeTangents chosen = { { -8.0f / 9.0f, 8.0f / 9.0f, -1.0f, 1.0f },
+                                   { -8.0f / 9.0f, 8.0f / 9.0f, -1.0f, 1.0f } };
+            SharedHands snapshot = {};
+            if (InitSharedMemoryDriver() && ReadSharedHandsSnapshot(&snapshot) &&
+                HasValidProjectionTangents(snapshot.leftTangents) &&
+                HasValidProjectionTangents(snapshot.rightTangents)) {
+                memcpy(chosen.left, snapshot.leftTangents, sizeof(chosen.left));
+                memcpy(chosen.right, snapshot.rightTangents, sizeof(chosen.right));
+                source = "live Vision Pro frustum";
+            } else if (LoadPersistedTangents(&chosen)) {
+                source = "Vision Pro frustum saved by a previous session";
+            }
+            g_latchedTangents = chosen;
+            g_tangentsLatched = true;
+            char message[256];
+            snprintf(message, sizeof(message),
+                "[Verantyx] Eye frustum for this SteamVR session: %s; left=(%.3f %.3f %.3f %.3f) right=(%.3f %.3f %.3f %.3f)",
+                source, chosen.left[0], chosen.left[1], chosen.left[2], chosen.left[3],
+                chosen.right[0], chosen.right[1], chosen.right[2], chosen.right[3]);
+            LogDriver(message);
+        }
+        result = g_latchedTangents;
+    }
+    PublishEffectiveTangents();
+    return result;
+}
+
+// Save the headset's real frustum for the next SteamVR start.
+static void PersistLiveTangents(const SharedHands& hands) {
+    if (!HasValidProjectionTangents(hands.leftTangents) || !HasValidProjectionTangents(hands.rightTangents)) return;
+    if (memcmp(hands.leftTangents, g_lastPersistedTangents.left, sizeof(hands.leftTangents)) == 0 &&
+        memcmp(hands.rightTangents, g_lastPersistedTangents.right, sizeof(hands.rightTangents)) == 0) return;
+    memcpy(g_lastPersistedTangents.left, hands.leftTangents, sizeof(hands.leftTangents));
+    memcpy(g_lastPersistedTangents.right, hands.rightTangents, sizeof(hands.rightTangents));
+    EyeTangents saved = {};
+    if (LoadPersistedTangents(&saved) &&
+        memcmp(&saved, &g_lastPersistedTangents, sizeof(saved)) == 0) return;
+    FILE* file = fopen(kTangentFile, "w");
+    if (!file) return;
+    fprintf(file, "%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+        hands.leftTangents[0], hands.leftTangents[1], hands.leftTangents[2], hands.leftTangents[3],
+        hands.rightTangents[0], hands.rightTangents[1], hands.rightTangents[2], hands.rightTangents[3]);
+    fclose(file);
+    LogDriver("[Verantyx] Saved the Vision Pro eye frustum; SteamVR uses it from its next start");
+}
+
+static EyeRenderSize GetEyeRenderSize() {
+    constexpr double kTargetPixelsPerEye = 800.0 * 900.0;
+    const EyeTangents tangents = LatchedTangents();
+    float eyeAspect = (tangents.left[1] - tangents.left[0]) / (tangents.left[3] - tangents.left[2]);
     eyeAspect = std::min(2.0f, std::max(0.5f, eyeAspect));
 
     const double height = sqrt(kTargetPixelsPerEye / eyeAspect);
@@ -593,13 +867,23 @@ public:
     vr::VRInputComponentHandle_t m_proximityComponent = 0;
     HeadPresenceState m_headPresence;
     bool m_userPresent = false;
+    ULONGLONG m_lastPresenceUpdateMs = 0;
+    // Set once Activate has created every component the pose thread touches.
+    std::atomic<bool> m_ready{ false };
 
     virtual vr::EVRInitError Activate(uint32_t unObjectId) override {
         LogDriver("[Verantyx] CVerantyxDeviceDriver Activated!");
         m_unObjectId = unObjectId;
         m_ulPropertyContainer = vr::VRProperties()->TrackedDeviceToPropertyContainer(m_unObjectId);
-        
-        vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ManufacturerName_String, "Verantyx");
+
+        // Half-Life: Alyx picks its fallback controller scheme from the HMD
+        // manufacturer. "Verantyx" made it log "falling back to gamepad" and
+        // drop the Touch scheme whenever a hand briefly lost tracking. These
+        // controllers emulate Oculus Touch, so report the matching vendor.
+        char manufacturer[64] = "Oculus";
+        const DWORD manufacturerLength = GetEnvironmentVariableA("VERANTYX_HMD_MANUFACTURER", manufacturer, sizeof(manufacturer));
+        if (manufacturerLength == 0 || manufacturerLength >= sizeof(manufacturer)) strcpy(manufacturer, "Oculus");
+        vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ManufacturerName_String, manufacturer);
         vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ModelNumber_String, "VerantyxHMD");
         vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_HasVirtualDisplayComponent_Bool, true);
         vr::VRProperties()->SetUint64Property(m_ulPropertyContainer, vr::Prop_CurrentUniverseId_Uint64, 1);
@@ -612,9 +896,11 @@ public:
         vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
         vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_UserIpdMeters_Float, 0.063f);
         vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_UserHeadToEyeDepthMeters_Float, 0.f);
-        vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_DisplayFrequency_Float, 90.0f);
+        vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_DisplayFrequency_Float, (float)DisplayFrequency());
         vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_SecondsFromVsyncToPhotons_Float, 0.011f);
-        LogDriver("[Verantyx] HMD Activate: properties set");
+        char message[128];
+        snprintf(message, sizeof(message), "[Verantyx] HMD Activate: properties set (virtual display %.1f Hz)", DisplayFrequency());
+        LogDriver(message);
 
         m_headPresence = {};
         m_userPresent = false;
@@ -631,24 +917,49 @@ public:
             LogDriver("[Verantyx] Could not create HMD proximity input; presence sensor remains disabled");
         }
         LogDriver("[Verantyx] HMD Activate: complete");
+        m_ready = true;
         return vr::VRInitError_None;
     }
-    void UpdatePresence() {
+    void UpdatePresence(const SharedHands* hands) {
         if (!m_proximityComponent) return;
         const uint64_t nowMs = GetTickCount64();
         bool present = m_headPresence.IsFresh(nowMs);
-        SharedHands hands = {};
-        if (ReadSharedHandsSnapshot(&hands)) {
-            bool validHead = hands.headTracked != 0;
-            for (float value : hands.headTransform) validHead = validHead && std::isfinite(value);
-            present = m_headPresence.Update(hands.visionTimestamp, validHead, nowMs);
+        if (hands) {
+            const bool validHead = hands->headTracked != 0 && IsFiniteTransform(hands->headTransform);
+            present = m_headPresence.Update(hands->visionTimestamp, validHead, nowMs);
         }
-        if (present != m_userPresent) {
+        const bool changed = present != m_userPresent;
+        if (changed) {
             m_userPresent = present;
             LogDriver(present ? "[Verantyx] HMD proximity: present (fresh Vision Pro tracking)"
                 : "[Verantyx] HMD proximity: absent (tracking stopped or older than 500ms)");
         }
-        vr::VRDriverInput()->UpdateBooleanComponent(m_proximityComponent, present, 0.0);
+        if (changed || nowMs - m_lastPresenceUpdateMs >= 100) {
+            m_lastPresenceUpdateMs = nowMs;
+            vr::VRDriverInput()->UpdateBooleanComponent(m_proximityComponent, present, 0.0);
+        }
+    }
+
+    vr::DriverPose_t MakePose(const SharedHands& hands) const {
+        vr::DriverPose_t pose = { 0 };
+        pose.poseIsValid = false;
+        pose.result = vr::TrackingResult_Running_OutOfRange;
+        pose.deviceIsConnected = true;
+        pose.qWorldFromDriverRotation = { 1, 0, 0, 0 };
+        pose.qDriverFromHeadRotation = { 1, 0, 0, 0 };
+        pose.qRotation = { 1, 0, 0, 0 };
+        if (hands.headTracked && IsFiniteTransform(hands.headTransform)) {
+            // No velocity on purpose: SteamVR then renders exactly this pose,
+            // which the headset's late reprojection identifies by timestamp.
+            // Vision Pro already predicts this pose to the expected display time.
+            pose.poseIsValid = true;
+            pose.result = vr::TrackingResult_Running_OK;
+            pose.qRotation = ExtractQuaternion(hands.headTransform);
+            pose.vecPosition[0] = hands.headTransform[12];
+            pose.vecPosition[1] = hands.headTransform[13];
+            pose.vecPosition[2] = hands.headTransform[14];
+        }
+        return pose;
     }
     virtual void Deactivate() override {}
     virtual void EnterStandby() override {}
@@ -667,23 +978,10 @@ public:
 #else
     virtual vr::DriverPose_t GetPose() override {
 #endif
-        vr::DriverPose_t pose = { 0 };
-        pose.poseIsValid = false;
-        pose.result = vr::TrackingResult_Running_OutOfRange;
-        pose.deviceIsConnected = true;
-        pose.qWorldFromDriverRotation = { 1, 0, 0, 0 };
-        pose.qDriverFromHeadRotation = { 1, 0, 0, 0 };
-        pose.qRotation = { 1, 0, 0, 0 };
         InitSharedMemoryDriver();
         SharedHands handsSnapshot = {};
-        if (ReadSharedHandsSnapshot(&handsSnapshot) && handsSnapshot.headTracked) {
-            pose.poseIsValid = true;
-            pose.result = vr::TrackingResult_Running_OK;
-            pose.qRotation = ExtractQuaternion(handsSnapshot.headTransform);
-            pose.vecPosition[0] = handsSnapshot.headTransform[12];
-            pose.vecPosition[1] = handsSnapshot.headTransform[13];
-            pose.vecPosition[2] = handsSnapshot.headTransform[14];
-        }
+        if (!ReadSharedHandsSnapshot(&handsSnapshot)) handsSnapshot.headTracked = 0;
+        const vr::DriverPose_t pose = MakePose(handsSnapshot);
 
 #if defined(__GNUC__) && !defined(__clang__)
         if (ret) *ret = pose;
@@ -719,28 +1017,12 @@ public:
     virtual void GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, float* pfTop, float* pfBottom) override {
         // OpenVR names these values from the clipped plane: pfTop is the
         // tangent for the bottom (-Y) edge and pfBottom is for the top (+Y).
-        constexpr float fallbackTangents[4] = { -8.0f / 9.0f, 8.0f / 9.0f, -1.0f, 1.0f };
-        SharedHands snapshot = {};
-        const float* tangents = nullptr;
-        if (InitSharedMemoryDriver() && ReadSharedHandsSnapshot(&snapshot)) {
-            tangents = eEye == vr::Eye_Left ? snapshot.leftTangents : snapshot.rightTangents;
-        }
-        if (!HasValidProjectionTangents(tangents)) tangents = fallbackTangents;
-
+        const EyeTangents latched = LatchedTangents();
+        const float* tangents = eEye == vr::Eye_Left ? latched.left : latched.right;
         *pfLeft = tangents[0];
         *pfRight = tangents[1];
         *pfTop = tangents[2];
         *pfBottom = tangents[3];
-        if (tangents != fallbackTangents) {
-            static LONG logged = 0;
-            if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
-                char message[192];
-                snprintf(message, sizeof(message),
-                    "[Verantyx] Vision Pro frustum received: left=%.3f right=%.3f bottom=%.3f top=%.3f",
-                    tangents[0], tangents[1], tangents[2], tangents[3]);
-                LogDriver(message);
-            }
-        }
     }
     virtual vr::DistortionCoordinates_t* ComputeDistortion(vr::DistortionCoordinates_t* pRet, vr::EVREye eEye, float fU, float fV) override {
         pRet->rfBlue[0] = fU; pRet->rfBlue[1] = fV;
@@ -758,7 +1040,10 @@ public:
     vr::TrackedDeviceIndex_t m_unObjectId = vr::k_unTrackedDeviceIndexInvalid;
     vr::PropertyContainerHandle_t m_ulPropertyContainer = vr::k_ulInvalidPropertyContainer;
     bool m_bIsLeft = false;
-    
+    MotionEstimator m_motion;
+    // Set once Activate has created every component the pose thread touches.
+    std::atomic<bool> m_ready{ false };
+
     vr::VRInputComponentHandle_t m_compTrigger = 0;
     vr::VRInputComponentHandle_t m_compTriggerValue = 0;
     vr::VRInputComponentHandle_t m_compTriggerTouch = 0;
@@ -774,6 +1059,8 @@ public:
     vr::VRInputComponentHandle_t m_compATouch = 0;
     vr::VRInputComponentHandle_t m_compBTouch = 0;
     vr::VRInputComponentHandle_t m_compThumbrestTouch = 0;
+    vr::VRInputComponentHandle_t m_compSystem = 0;
+    vr::VRInputComponentHandle_t m_compSystemTouch = 0;
 
     CVerantyxControllerDriver(bool isLeft) : m_bIsLeft(isLeft) {}
 
@@ -781,6 +1068,7 @@ public:
         m_unObjectId = unObjectId;
         m_ulPropertyContainer = vr::VRProperties()->TrackedDeviceToPropertyContainer(m_unObjectId);
 
+        vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ManufacturerName_String, "Oculus");
         vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_ModelNumber_String, m_bIsLeft ? "Oculus Rift S (Left Controller)" : "Oculus Rift S (Right Controller)");
         vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_RenderModelName_String, m_bIsLeft ? "oculus_rifts_controller_left" : "oculus_rifts_controller_right");
         
@@ -842,7 +1130,15 @@ public:
             m_ulPropertyContainer, "/input/thumbrest/touch", &m_compThumbrestTouch));
         LogInputComponentStatus("/input/joystick/touch", vr::VRDriverInput()->CreateBooleanComponent(
             m_ulPropertyContainer, "/input/joystick/touch", &m_compJoystickTouch));
+        if (m_bIsLeft) {
+            // The Touch menu button; the Oculus profile defines it on the left hand only.
+            LogInputComponentStatus("/input/system/click", vr::VRDriverInput()->CreateBooleanComponent(
+                m_ulPropertyContainer, "/input/system/click", &m_compSystem));
+            LogInputComponentStatus("/input/system/touch", vr::VRDriverInput()->CreateBooleanComponent(
+                m_ulPropertyContainer, "/input/system/touch", &m_compSystemTouch));
+        }
         
+        m_ready = true;
         return vr::VRInitError_None;
     }
     virtual void Deactivate() override {}
@@ -854,28 +1150,11 @@ public:
 #else
     virtual vr::DriverPose_t GetPose() override {
 #endif
-        vr::DriverPose_t pose = { 0 };
-        pose.poseIsValid = false;
-        pose.result = vr::TrackingResult_Running_OutOfRange;
-        pose.deviceIsConnected = true;
-        pose.qWorldFromDriverRotation = { 1, 0, 0, 0 };
-        pose.qDriverFromHeadRotation = { 1, 0, 0, 0 };
-        pose.qRotation = { 1, 0, 0, 0 };
-        
         InitSharedMemoryDriver();
         SharedHands handsSnapshot = {};
-        if (ReadSharedHandsSnapshot(&handsSnapshot)) {
-            const bool tracked = m_bIsLeft ? handsSnapshot.leftTracked != 0 : handsSnapshot.rightTracked != 0;
-            const float* srcTransform = m_bIsLeft ? handsSnapshot.leftTransform : handsSnapshot.rightTransform;
-            if (tracked) {
-                pose.poseIsValid = true;
-                pose.result = vr::TrackingResult_Running_OK;
-                pose.qRotation = ExtractQuaternion(srcTransform);
-                pose.vecPosition[0] = srcTransform[12];
-                pose.vecPosition[1] = srcTransform[13];
-                pose.vecPosition[2] = srcTransform[14];
-            }
-        }
+        const bool hasSnapshot = ReadSharedHandsSnapshot(&handsSnapshot);
+        // SteamVR may call this on its own thread; leave velocity state to the pose thread.
+        const vr::DriverPose_t pose = MakePose(handsSnapshot, hasSnapshot, false, false);
 
 #if defined(__GNUC__) && !defined(__clang__)
         if (ret) *ret = pose;
@@ -886,57 +1165,124 @@ public:
     }
 #endif
 
-    void UpdateInputs() {
-        if (m_unObjectId == vr::k_unTrackedDeviceIndexInvalid) return;
-        SharedHands handsSnapshot = {};
-        const bool hasSnapshot = ReadSharedHandsSnapshot(&handsSnapshot);
-        const bool tracked = hasSnapshot && (m_bIsLeft ? handsSnapshot.leftTracked != 0 : handsSnapshot.rightTracked != 0);
-        const uint8_t triggerValue = tracked ? (m_bIsLeft ? handsSnapshot.leftTrigger : handsSnapshot.rightTrigger) : 0;
-        const uint8_t gripValue = tracked ? (m_bIsLeft ? handsSnapshot.leftGrip : handsSnapshot.rightGrip) : 0;
-        vr::VRDriverInput()->UpdateBooleanComponent(m_compTrigger, triggerValue >= 128, 0.0);
-        vr::VRDriverInput()->UpdateScalarComponent(m_compTriggerValue, (float)triggerValue / 255.0f, 0.0);
-        vr::VRDriverInput()->UpdateBooleanComponent(m_compTriggerTouch, tracked && triggerValue > 0, 0.0);
-        vr::VRDriverInput()->UpdateBooleanComponent(m_compGrip, gripValue >= 150, 0.0);
-        vr::VRDriverInput()->UpdateScalarComponent(m_compGripValue, (float)gripValue / 255.0f, 0.0);
-        vr::VRDriverInput()->UpdateBooleanComponent(m_compGripTouch, tracked && gripValue > 0, 0.0);
+    // Vision Pro hand states: 0 = not tracked, 1 = measured this frame,
+    // 2 = briefly out of the cameras' view and held relative to the head.
+    static constexpr uint8_t kHandMeasured = 1;
 
-        const float stickX = tracked ? (m_bIsLeft ? handsSnapshot.leftStickX : handsSnapshot.rightStickX) : 0.0f;
-        const float stickY = tracked ? (m_bIsLeft ? handsSnapshot.leftStickY : handsSnapshot.rightStickY) : 0.0f;
+    vr::DriverPose_t MakePose(const SharedHands& hands, bool fresh, bool newSample, bool ownsMotion = true) {
+        vr::DriverPose_t pose = { 0 };
+        pose.poseIsValid = false;
+        pose.result = vr::TrackingResult_Running_OutOfRange;
+        pose.deviceIsConnected = true;
+        pose.qWorldFromDriverRotation = { 1, 0, 0, 0 };
+        pose.qDriverFromHeadRotation = { 1, 0, 0, 0 };
+        pose.qRotation = { 1, 0, 0, 0 };
+
+        const uint8_t state = m_bIsLeft ? hands.leftTracked : hands.rightTracked;
+        const float* transform = m_bIsLeft ? hands.leftTransform : hands.rightTransform;
+        if (!fresh || state == 0 || !IsFiniteTransform(transform)) {
+            if (ownsMotion) m_motion.Reset();
+            return pose;
+        }
+        pose.poseIsValid = true;
+        pose.result = vr::TrackingResult_Running_OK;
+        pose.qRotation = ExtractQuaternion(transform);
+        pose.vecPosition[0] = transform[12];
+        pose.vecPosition[1] = transform[13];
+        pose.vecPosition[2] = transform[14];
+        if (!ownsMotion) return pose;
+        if (hands.velocityValid) {
+            // The headset measured these (Joy-Con gyro/accelerometer fused with
+            // hand tracking); they carry the sharp wrist flick that Alyx's
+            // gravity gloves look for, which position differences smooth away.
+            const float* linear = m_bIsLeft ? hands.leftVelocity : hands.rightVelocity;
+            const float* angular = m_bIsLeft ? hands.leftAngularVelocity : hands.rightAngularVelocity;
+            for (int i = 0; i < 3; ++i) {
+                pose.vecVelocity[i] = std::isfinite(linear[i]) ? linear[i] : 0.0;
+                pose.vecAngularVelocity[i] = std::isfinite(angular[i]) ? angular[i] : 0.0;
+            }
+            m_motion.Reset();
+        } else if (state == kHandMeasured) {
+            if (newSample) m_motion.Update(hands.visionTimestamp, &transform[12], pose.qRotation);
+            for (int i = 0; i < 3; ++i) {
+                pose.vecVelocity[i] = m_motion.velocity[i];
+                pose.vecAngularVelocity[i] = m_motion.angularVelocity[i];
+            }
+        } else {
+            m_motion.Reset();
+        }
+        return pose;
+    }
+
+    void UpdateInputs(const SharedHands& hands, bool fresh) {
+        if (m_unObjectId == vr::k_unTrackedDeviceIndexInvalid) return;
+        const uint8_t state = m_bIsLeft ? hands.leftTracked : hands.rightTracked;
+        // Inputs do not depend on the hand being tracked: Joy-Con buttons
+        // keep working out of the cameras' view, and the headset already
+        // zeroes gesture inputs for a lost hand.
+        const bool tracked = fresh;
+        const float trigger = tracked ? (float)(m_bIsLeft ? hands.leftTrigger : hands.rightTrigger) / 255.0f : 0.0f;
+        const float grip = tracked ? (float)(m_bIsLeft ? hands.leftGrip : hands.rightGrip) / 255.0f : 0.0f;
+        // Vision Pro applies hysteresis and keeps engaged values above Alyx's
+        // 0.75 click threshold, so these clicks match the analog values.
+        vr::VRDriverInput()->UpdateBooleanComponent(m_compTrigger, trigger >= 0.75f, 0.0);
+        vr::VRDriverInput()->UpdateScalarComponent(m_compTriggerValue, trigger, 0.0);
+        vr::VRDriverInput()->UpdateBooleanComponent(m_compTriggerTouch, trigger > 0.05f, 0.0);
+        vr::VRDriverInput()->UpdateBooleanComponent(m_compGrip, grip >= 0.75f, 0.0);
+        vr::VRDriverInput()->UpdateScalarComponent(m_compGripValue, grip, 0.0);
+        vr::VRDriverInput()->UpdateBooleanComponent(m_compGripTouch, grip > 0.05f, 0.0);
+
+        // Right-hand bits 0-4 and left-hand bits 8-12: primary (A/X),
+        // secondary (B/Y), joystick click, joystick touch, menu (system).
+        const uint32_t shift = m_bIsLeft ? 8u : 0u;
+        const uint32_t buttons = tracked ? (m_bIsLeft ? hands.leftButtons : hands.rightButtons) : 0;
+        const bool primaryPressed = (buttons & (1u << shift)) != 0;
+        const bool secondaryPressed = (buttons & (2u << shift)) != 0;
+        const bool stickClicked = (buttons & (4u << shift)) != 0;
+        const bool stickEngaged = (buttons & (8u << shift)) != 0;
+        const bool menuPressed = (buttons & (16u << shift)) != 0;
+
+        float stickX = tracked ? (m_bIsLeft ? hands.leftStickX : hands.rightStickX) : 0.0f;
+        float stickY = tracked ? (m_bIsLeft ? hands.leftStickY : hands.rightStickY) : 0.0f;
+        if (!std::isfinite(stickX) || !std::isfinite(stickY)) stickX = stickY = 0.0f;
+        stickX = std::max(-1.0f, std::min(1.0f, stickX));
+        stickY = std::max(-1.0f, std::min(1.0f, stickY));
         vr::VRDriverInput()->UpdateScalarComponent(m_compJoystickX, stickX, 0.0);
         vr::VRDriverInput()->UpdateScalarComponent(m_compJoystickY, stickY, 0.0);
-        vr::VRDriverInput()->UpdateBooleanComponent(m_compJoystickClick, tracked && gripValue >= 230, 0.0);
+        vr::VRDriverInput()->UpdateBooleanComponent(m_compJoystickClick, stickClicked, 0.0);
         // Half-Life: Alyx's Oculus Touch locomotion binding uses a joystick
         // d-pad in "touch" mode. Without this component SteamVR silently
         // ignores those move/turn bindings even when the axes change.
         vr::VRDriverInput()->UpdateBooleanComponent(
             m_compJoystickTouch,
-            tracked && (fabsf(stickX) >= 0.02f || fabsf(stickY) >= 0.02f),
+            stickEngaged || stickClicked || fabsf(stickX) >= 0.02f || fabsf(stickY) >= 0.02f,
             0.0
         );
 
-        const uint32_t buttons = tracked ? (m_bIsLeft ? handsSnapshot.leftButtons : handsSnapshot.rightButtons) : 0;
-        const uint32_t primaryMask = m_bIsLeft ? (1u << 8) : (1u << 0);
-        const uint32_t secondaryMask = m_bIsLeft ? (1u << 9) : (1u << 1);
-        const bool primaryPressed = (buttons & primaryMask) != 0;
-        const bool secondaryPressed = (buttons & secondaryMask) != 0;
         vr::VRDriverInput()->UpdateBooleanComponent(m_compA, primaryPressed, 0.0);
         vr::VRDriverInput()->UpdateBooleanComponent(m_compB, secondaryPressed, 0.0);
         vr::VRDriverInput()->UpdateBooleanComponent(m_compATouch, primaryPressed, 0.0);
         vr::VRDriverInput()->UpdateBooleanComponent(m_compBTouch, secondaryPressed, 0.0);
-        vr::VRDriverInput()->UpdateBooleanComponent(m_compThumbrestTouch, tracked && gripValue > 0, 0.0);
+        vr::VRDriverInput()->UpdateBooleanComponent(m_compThumbrestTouch, grip > 0.05f, 0.0);
+        if (m_compSystem) {
+            vr::VRDriverInput()->UpdateBooleanComponent(m_compSystem, menuPressed, 0.0);
+            vr::VRDriverInput()->UpdateBooleanComponent(m_compSystemTouch, menuPressed, 0.0);
+        }
 
-        static ULONGLONG lastInputLogAt = 0;
         const ULONGLONG now = GetTickCount64();
-        if (now - lastInputLogAt >= 5000) {
-            lastInputLogAt = now;
-            char message[224];
+        if (now - m_lastInputLogAt >= 5000) {
+            m_lastInputLogAt = now;
+            char message[256];
             snprintf(message, sizeof(message),
-                "[Verantyx] %s input: tracked=%d trigger=%u grip=%u joystick=(%.2f,%.2f)",
-                m_bIsLeft ? "left" : "right", tracked ? 1 : 0,
-                (unsigned)triggerValue, (unsigned)gripValue, stickX, stickY);
+                "[Verantyx] %s input: state=%u fresh=%d trigger=%.2f grip=%.2f joystick=(%.2f,%.2f) buttons=0x%x velocity=(%.2f,%.2f,%.2f)",
+                m_bIsLeft ? "left" : "right", (unsigned)state, fresh ? 1 : 0, trigger, grip,
+                stickX, stickY, (unsigned)(buttons >> shift) & 0x1fu,
+                m_motion.velocity[0], m_motion.velocity[1], m_motion.velocity[2]);
             LogDriver(message);
         }
     }
+
+    ULONGLONG m_lastInputLogAt = 0;
 };
 
 class CVerantyxServerProvider : public vr::IServerTrackedDeviceProvider {
@@ -944,6 +1290,10 @@ public:
     CVerantyxDeviceDriver* m_pHmd = nullptr;
     CVerantyxControllerDriver* m_pControllerLeft = nullptr;
     CVerantyxControllerDriver* m_pControllerRight = nullptr;
+    std::thread m_poseThread;
+    std::atomic<bool> m_stopPoseThread{ false };
+    std::atomic<bool> m_poseThreadRunning{ false };
+    double m_lastRunFramePoseTimestamp = -1.0;
 
     virtual vr::EVRInitError Init(vr::IVRDriverContext* pDriverContext) override { 
         VR_INIT_SERVER_DRIVER_CONTEXT(pDriverContext);
@@ -958,47 +1308,110 @@ public:
         m_pControllerRight = new CVerantyxControllerDriver(false);
         vr::VRServerDriverHost()->TrackedDeviceAdded("verantyx_ctrl_r", vr::TrackedDeviceClass_Controller, m_pControllerRight);
 
+        // RunFrame follows the compositor loop, which is irregular under Wine.
+        // Forward each Vision Pro pose to SteamVR as soon as it lands instead.
+        m_stopPoseThread = false;
+        try {
+            m_poseThread = std::thread(&CVerantyxServerProvider::PoseLoop, this);
+            m_poseThreadRunning = true;
+            LogDriver("[Verantyx] Pose thread started; poses are forwarded as soon as they arrive");
+        } catch (...) {
+            m_poseThreadRunning = false;
+            LogDriver("[Verantyx] Could not start the pose thread; updating poses from RunFrame");
+        }
+
         return vr::VRInitError_None; 
     }
     virtual void Cleanup() override {
+        m_stopPoseThread = true;
+        if (m_poseThread.joinable()) m_poseThread.join();
+        m_poseThreadRunning = false;
         if (m_pHmd) { delete m_pHmd; m_pHmd = nullptr; }
         if (m_pControllerLeft) { delete m_pControllerLeft; m_pControllerLeft = nullptr; }
         if (m_pControllerRight) { delete m_pControllerRight; m_pControllerRight = nullptr; }
     }
     virtual const char* const* GetInterfaceVersions() override { return vr::k_InterfaceVersions; }
-    virtual void RunFrame() override {
-        if (m_pHmd && m_pHmd->m_unObjectId != vr::k_unTrackedDeviceIndexInvalid) {
-            vr::DriverPose_t pose;
-#if defined(__GNUC__) && !defined(__clang__)
-            m_pHmd->GetPose(&pose);
-#else
-            pose = m_pHmd->GetPose();
-#endif
-            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(m_pHmd->m_unObjectId, pose, sizeof(vr::DriverPose_t));
-            m_pHmd->UpdatePresence();
-        }
-        
-        if (m_pControllerLeft && m_pControllerLeft->m_unObjectId != vr::k_unTrackedDeviceIndexInvalid) {
-            vr::DriverPose_t pose;
-#if defined(__GNUC__) && !defined(__clang__)
-            m_pControllerLeft->GetPose(&pose);
-#else
-            pose = m_pControllerLeft->GetPose();
-#endif
-            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(m_pControllerLeft->m_unObjectId, pose, sizeof(vr::DriverPose_t));
-            m_pControllerLeft->UpdateInputs();
-        }
 
-        if (m_pControllerRight && m_pControllerRight->m_unObjectId != vr::k_unTrackedDeviceIndexInvalid) {
-            vr::DriverPose_t pose;
-#if defined(__GNUC__) && !defined(__clang__)
-            m_pControllerRight->GetPose(&pose);
-#else
-            pose = m_pControllerRight->GetPose();
-#endif
-            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(m_pControllerRight->m_unObjectId, pose, sizeof(vr::DriverPose_t));
-            m_pControllerRight->UpdateInputs();
+    void PublishTracking(const SharedHands& hands, bool newPose, bool fresh) {
+        if (m_pHmd && m_pHmd->m_ready.load()) {
+            const vr::DriverPose_t pose = m_pHmd->MakePose(hands);
+            // Record before publishing: once SteamVR has the pose, the game can
+            // render with it and look it up in the ring.
+            if (newPose && pose.poseIsValid) RecordPushedHmdPose(hands.visionTimestamp, pose);
+            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(m_pHmd->m_unObjectId, pose, sizeof(vr::DriverPose_t));
         }
+        CVerantyxControllerDriver* controllers[2] = { m_pControllerLeft, m_pControllerRight };
+        for (CVerantyxControllerDriver* controller : controllers) {
+            if (!controller || !controller->m_ready.load()) continue;
+            const vr::DriverPose_t pose = controller->MakePose(hands, fresh, newPose);
+            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(controller->m_unObjectId, pose, sizeof(vr::DriverPose_t));
+            controller->UpdateInputs(hands, fresh);
+        }
+    }
+
+    void PoseLoop() {
+        LONG lastSequence = 0;
+        bool hasSequence = false;
+        double lastTimestamp = -1.0;
+        ULONGLONG lastAdvanceMs = 0;
+        ULONGLONG lastPublishMs = 0;
+        SharedHands latest = {};
+        bool hasLatest = false;
+        uint64_t publishedPoses = 0;
+        while (!m_stopPoseThread.load()) {
+            if (!InitSharedMemoryDriver()) {
+                Sleep(100);
+                continue;
+            }
+            const ULONGLONG nowMs = GetTickCount64();
+            const LONG sequence = InterlockedCompareExchange(&g_doubleBufferHeader->poseSequence, 0, 0);
+            bool newInput = false;
+            bool newPose = false;
+            if ((!hasSequence || sequence != lastSequence) && !(sequence & 1)) {
+                SharedHands snapshot = {};
+                if (ReadSharedHandsSnapshot(&snapshot)) {
+                    hasSequence = true;
+                    lastSequence = sequence;
+                    newInput = true;
+                    if (std::isfinite(snapshot.visionTimestamp) && snapshot.visionTimestamp > 0.0 &&
+                        snapshot.visionTimestamp != lastTimestamp) {
+                        lastTimestamp = snapshot.visionTimestamp;
+                        lastAdvanceMs = nowMs;
+                        newPose = true;
+                    }
+                    latest = snapshot;
+                    hasLatest = true;
+                }
+            }
+            const bool fresh = lastAdvanceMs != 0 && nowMs - lastAdvanceMs < 500;
+            // Republish periodically so SteamVR sees hands drop out once the
+            // headset stops sending, even when no new packet arrives.
+            if (hasLatest && (newInput || nowMs - lastPublishMs >= 20)) {
+                PublishTracking(latest, newPose, fresh);
+                lastPublishMs = nowMs;
+                if (newPose && (++publishedPoses == 1 || publishedPoses % 5400 == 0)) {
+                    char message[128];
+                    snprintf(message, sizeof(message), "[Verantyx] Forwarded Vision Pro pose #%llu to SteamVR",
+                        (unsigned long long)publishedPoses);
+                    LogDriver(message);
+                }
+            }
+            if (m_pHmd && m_pHmd->m_ready.load()) m_pHmd->UpdatePresence(newInput ? &latest : nullptr);
+            if (newPose) PersistLiveTangents(latest);
+            PublishEffectiveTangents();
+            Sleep(1);
+        }
+    }
+
+    virtual void RunFrame() override {
+        if (m_poseThreadRunning.load()) return;
+        if (!InitSharedMemoryDriver()) return;
+        SharedHands hands = {};
+        if (!ReadSharedHandsSnapshot(&hands)) return;
+        const bool newPose = std::isfinite(hands.visionTimestamp) && hands.visionTimestamp != m_lastRunFramePoseTimestamp;
+        m_lastRunFramePoseTimestamp = hands.visionTimestamp;
+        PublishTracking(hands, newPose, true);
+        if (m_pHmd && m_pHmd->m_ready.load()) m_pHmd->UpdatePresence(&hands);
     }
     virtual bool ShouldBlockStandbyMode() override { return true; }
     virtual void EnterStandby() override {}

@@ -1,2 +1,0 @@
-#!/bin/bash
-sed -i '' 's|memcpy(handsMapPtr + 16, headPtr, 64)|memcpy(handsMapPtr + 16, headPtr, 64)\n                            let x = posePkt.headTransform.12\n                            let y = posePkt.headTransform.13\n                            let z = posePkt.headTransform.14\n                            if currentSeq % 300 == 0 { print("Head pos: \(x), \(y), \(z)") }|' /Users/motonishikoudai/verantyx-cli/cli/HardwareEncoder.swift

@@ -35,7 +35,7 @@ if [[ "$current_hash" == "$shim_hash" ]]; then
     exit 0
 fi
 
-if ! file -b "$TARGET" | rg -q '^PE32\+ executable.*x86-64'; then
+if ! file -b "$TARGET" | grep -Eq '^PE32\+ executable.*x86-64'; then
     echo "Refusing to replace a non-x86-64 Steam WebHelper: $TARGET" >&2
     exit 1
 fi

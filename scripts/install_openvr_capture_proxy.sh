@@ -42,11 +42,11 @@ if [[ -f "$VALVE_DLL" ]] && ! cmp -s "$VALVE_DLL" "$SOURCE_DLL" && \
     cp -p "$VALVE_DLL" "$BACKUP_DIR/openvr_api_valve.dll.pre-capture"
 fi
 if ! cmp -s "$VALVE_DLL" "$SOURCE_DLL"; then
-    cp -p "$SOURCE_DLL" "$VALVE_DLL"
+    cp -p "$SOURCE_DLL" "$VALVE_DLL.verantyx-tmp" && mv -f "$VALVE_DLL.verantyx-tmp" "$VALVE_DLL"
     echo "Installed the original SteamVR OpenVR client as openvr_api_valve.dll."
 fi
 if ! cmp -s "$TARGET_DLL" "$PROXY_DLL"; then
-    cp "$PROXY_DLL" "$TARGET_DLL"
+    cp "$PROXY_DLL" "$TARGET_DLL.verantyx-tmp" && mv -f "$TARGET_DLL.verantyx-tmp" "$TARGET_DLL"
     echo "Installed the Submit capture proxy beside Half-Life: Alyx."
 fi
 

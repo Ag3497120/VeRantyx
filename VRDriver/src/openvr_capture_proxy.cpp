@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <math.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -41,6 +42,11 @@ struct SharedHands {
     uint8_t leftGrip;
     uint8_t rightGrip;
     uint8_t headTracked;
+    // Hand velocities in SteamVR space from the headset (hand tracking fused
+    // with Joy-Con inertial sensors). Linear ones use the fields above.
+    float leftAngularVelocity[3];
+    float rightAngularVelocity[3];
+    uint8_t velocityValid;
 };
 #pragma pack(pop)
 
@@ -53,6 +59,23 @@ struct SharedHeader {
     volatile LONG poseSequence;
     LONG padding[10];
 };
+
+// Written by driver_verantyx.cpp each time it hands an HMD pose to SteamVR.
+#pragma pack(push, 1)
+struct PoseHistoryEntry {
+    double visionTimestamp;
+    float position[3];
+    float rotation[4]; // w, x, y, z
+    float reserved;
+};
+
+struct PoseHistory {
+    volatile LONG writeCount;
+    uint32_t magic;
+    uint32_t reserved[2];
+    PoseHistoryEntry entries[16];
+};
+#pragma pack(pop)
 
 static constexpr uint32_t kCaptureSlotCount = 3;
 struct StagedEye {
@@ -80,10 +103,15 @@ static const size_t kMaxPixelBytes = 4096ull * 4096ull * 8ull;
 static const size_t kFrameBlockSize = sizeof(SharedFrame) + kMaxPixelBytes;
 static const size_t kHandsOffset = sizeof(SharedHeader) + 2 * kFrameBlockSize;
 static const size_t kMapSize = kHandsOffset + sizeof(SharedHands) + 1024;
+static const size_t kPoseHistoryOffset = kHandsOffset + 512;
+static const uint32_t kPoseHistoryMagic = 0x53485056; // "VPHS"
 static_assert(sizeof(SharedFrame) == 88, "Shared frame layout mismatch");
-static_assert(sizeof(SharedHands) == 287, "Shared hand layout mismatch");
+static_assert(sizeof(SharedHands) == 312, "Shared hand layout mismatch");
 static_assert(sizeof(SharedHeader) == 64, "Shared header layout mismatch");
 static_assert(offsetof(SharedHeader, poseSequence) == 20, "Pose sequence offset mismatch");
+static_assert(sizeof(PoseHistoryEntry) == 40, "Pose history entry layout mismatch");
+static_assert(sizeof(PoseHistory) == 656, "Pose history layout mismatch");
+static_assert(kPoseHistoryOffset + sizeof(PoseHistory) <= kMapSize, "Pose history must fit in the shared map");
 
 static HMODULE g_realOpenVR = nullptr;
 static HANDLE g_sharedFile = INVALID_HANDLE_VALUE;
@@ -118,6 +146,13 @@ static uint32_t g_captureEveryN = 1;
 static LONG64 g_waitPoseTicks = 0;
 static LONG64 g_waitPoseCalls = 0;
 static LONG g_captureContention = 0;
+// The pose WaitGetPoses gave the game for the frame it is now rendering.
+static SRWLOCK g_renderPoseLock = SRWLOCK_INIT;
+static SharedHands g_renderPose = {};
+static uint64_t g_renderPoseCapturedAt = 0;
+static volatile LONG g_submitThreadId = 0;
+static LONG g_renderPoseMatched = 0;
+static LONG g_renderPoseFallback = 0;
 struct CaptureMetrics {
     uint64_t windowStart = 0;
     uint64_t submitted = 0;
@@ -178,9 +213,11 @@ static void LogCaptureMetrics() {
     const LONG64 waitTicks = InterlockedExchange64(&g_waitPoseTicks, 0);
     const LONG64 waitCalls = InterlockedExchange64(&g_waitPoseCalls, 0);
     const LONG contention = InterlockedExchange(&g_captureContention, 0);
-    char message[512];
+    const LONG poseMatched = InterlockedExchange(&g_renderPoseMatched, 0);
+    const LONG poseFallback = InterlockedExchange(&g_renderPoseFallback, 0);
+    char message[600];
     snprintf(message, sizeof(message),
-        "Capture metrics: submit_fps=%.2f capture_fps=%.2f queue_ms=%.2f map_ms=%.2f copy_ms=%.2f pair_age_ms=%.2f wait_poses_ms=%.2f readback_MBps=%.2f busy=%llu dropped=%llu contention=%ld",
+        "Capture metrics: submit_fps=%.2f capture_fps=%.2f queue_ms=%.2f map_ms=%.2f copy_ms=%.2f pair_age_ms=%.2f wait_poses_ms=%.2f readback_MBps=%.2f busy=%llu dropped=%llu contention=%ld render_pose_exact=%ld render_pose_nearest=%ld",
         g_metrics.submitted * 1000.0 / elapsedMs, g_metrics.published * 1000.0 / elapsedMs,
         g_metrics.queuedEyes ? g_metrics.queueMs / g_metrics.queuedEyes : 0.0,
         g_metrics.mapAttempts ? g_metrics.mapMs / g_metrics.mapAttempts : 0.0,
@@ -188,7 +225,8 @@ static void LogCaptureMetrics() {
         g_metrics.published ? g_metrics.ageMs / g_metrics.published : 0.0,
         waitCalls ? TicksToMilliseconds((uint64_t)waitTicks) / waitCalls : 0.0,
         g_metrics.copiedBytes / (elapsedMs * 1000.0),
-        (unsigned long long)g_metrics.mapBusy, (unsigned long long)g_metrics.dropped, contention);
+        (unsigned long long)g_metrics.mapBusy, (unsigned long long)g_metrics.dropped, contention,
+        poseMatched, poseFallback);
     Log(message);
     g_metrics = {};
     g_metrics.windowStart = now;
@@ -419,6 +457,102 @@ static bool ReadSharedHandsSnapshot(SharedHands* snapshot) {
     return false;
 }
 
+// Copies the driver's recent HMD poses, newest first. Returns how many entries
+// were stable for the whole copy (the driver may be writing one concurrently).
+static uint32_t ReadPoseHistory(PoseHistoryEntry* newestFirst, uint32_t capacity) {
+    if (!g_sharedBytes || !newestFirst || capacity == 0) return 0;
+    const PoseHistory* history = reinterpret_cast<const PoseHistory*>(g_sharedBytes + kPoseHistoryOffset);
+    if (history->magic != kPoseHistoryMagic) return 0;
+    const LONG before = InterlockedCompareExchange(const_cast<volatile LONG*>(&history->writeCount), 0, 0);
+    if (before <= 0) return 0;
+    MemoryBarrier();
+    PoseHistoryEntry copy[16];
+    memcpy(copy, (const void*)history->entries, sizeof(copy));
+    MemoryBarrier();
+    const LONG after = InterlockedCompareExchange(const_cast<volatile LONG*>(&history->writeCount), 0, 0);
+    // The driver writes slot (writeCount % 16) before advancing writeCount, so
+    // entries older than after-15 may have been overwritten during the copy.
+    const LONG oldestSafe = after - 15 > 0 ? after - 15 : 0;
+    uint32_t count = 0;
+    for (LONG index = before - 1; index >= oldestSafe && count < capacity && count < 16; --index) {
+        newestFirst[count++] = copy[(uint32_t)index % 16u];
+    }
+    return count;
+}
+
+static void QuaternionToColumnMajor(const PoseHistoryEntry& entry, float* m) {
+    const float w = entry.rotation[0], x = entry.rotation[1], y = entry.rotation[2], z = entry.rotation[3];
+    m[0] = 1 - 2 * (y * y + z * z); m[1] = 2 * (x * y + w * z);     m[2] = 2 * (x * z - w * y);     m[3] = 0;
+    m[4] = 2 * (x * y - w * z);     m[5] = 1 - 2 * (x * x + z * z); m[6] = 2 * (y * z + w * x);     m[7] = 0;
+    m[8] = 2 * (x * z + w * y);     m[9] = 2 * (y * z - w * x);     m[10] = 1 - 2 * (x * x + y * y); m[11] = 0;
+    m[12] = entry.position[0];      m[13] = entry.position[1];      m[14] = entry.position[2];      m[15] = 1;
+}
+
+// Identify which Vision Pro pose SteamVR returned for this frame. The driver
+// sends HMD poses without velocity, so the render pose equals one pushed pose
+// exactly unless the room-setup universe adds an offset; then use the newest.
+static void CaptureRenderPose(const vr::TrackedDevicePose_t* renderPoses, uint32_t renderPoseCount) {
+    if (!InitSharedMemory()) return;
+    SharedHands hands = {};
+    if (!ReadSharedHandsSnapshot(&hands)) return;
+    PoseHistoryEntry history[16];
+    const uint32_t count = ReadPoseHistory(history, 16);
+    int best = -1;
+    if (count > 0 && renderPoses && renderPoseCount > 0 && renderPoses[0].bPoseIsValid) {
+        const vr::HmdMatrix34_t& pose = renderPoses[0].mDeviceToAbsoluteTracking;
+        double bestError = 1e9;
+        for (uint32_t i = 0; i < count; ++i) {
+            float candidate[16];
+            QuaternionToColumnMajor(history[i], candidate);
+            double positionError = 0.0;
+            double rotationError = 0.0;
+            for (int row = 0; row < 3; ++row) {
+                const double delta = pose.m[row][3] - candidate[12 + row];
+                positionError += delta * delta;
+                for (int column = 0; column < 3; ++column) {
+                    rotationError += fabs(pose.m[row][column] - candidate[column * 4 + row]);
+                }
+            }
+            positionError = sqrt(positionError);
+            if (positionError < 0.002 && rotationError < 0.01 && positionError + rotationError < bestError) {
+                bestError = positionError + rotationError;
+                best = (int)i;
+            }
+        }
+    }
+    const PoseHistoryEntry* chosen = nullptr;
+    if (best >= 0) {
+        chosen = &history[best];
+        InterlockedIncrement(&g_renderPoseMatched);
+    } else if (count > 0) {
+        chosen = &history[0];
+        InterlockedIncrement(&g_renderPoseFallback);
+    }
+    if (chosen) {
+        QuaternionToColumnMajor(*chosen, hands.headTransform);
+        hands.visionTimestamp = chosen->visionTimestamp;
+    }
+    AcquireSRWLockExclusive(&g_renderPoseLock);
+    g_renderPose = hands;
+    g_renderPoseCapturedAt = PerformanceTicks();
+    ReleaseSRWLockExclusive(&g_renderPoseLock);
+}
+
+static void ReadRenderPoseForSubmit(SharedHands* hands) {
+    AcquireSRWLockShared(&g_renderPoseLock);
+    const uint64_t capturedAt = g_renderPoseCapturedAt;
+    const SharedHands pose = g_renderPose;
+    ReleaseSRWLockShared(&g_renderPoseLock);
+    // A stale entry means the game stopped calling WaitGetPoses (or this is the
+    // first frame); the latest headset sample is then the best estimate.
+    if (capturedAt != 0 && TicksToMilliseconds(PerformanceTicks() - capturedAt) < 250.0) {
+        *hands = pose;
+    } else {
+        *hands = {};
+        ReadSharedHandsSnapshot(hands);
+    }
+}
+
 static bool PublishOldestStagedPair() {
     StagedPair* pair = nullptr;
     for (uint32_t index = 0; index < kCaptureSlotCount; ++index) {
@@ -569,6 +703,11 @@ static void CaptureSubmit(vr::EVREye eye, const vr::Texture_t* texture,
         Log(message);
     }
     if (texture->eType != vr::TextureType_DirectX || !texture->handle || !InitSharedMemory()) return;
+    InterlockedExchange(&g_submitThreadId, (LONG)GetCurrentThreadId());
+    // Heartbeat for the driver: while the game submits, the driver leaves
+    // capture to this proxy; when it stops (level load) the driver shows
+    // SteamVR's own compositor output (the loading screen) instead.
+    InterlockedExchange(&g_sharedHeader->padding[9], (LONG)GetTickCount());
     if (!TryLockCapture()) return;
     if (eye == vr::Eye_Left) {
         ++g_metrics.submitted;
@@ -586,8 +725,9 @@ static void CaptureSubmit(vr::EVREye eye, const vr::Texture_t* texture,
         pair.pending = false;
         pair.order = pairNumber;
         pair.queuedAt = PerformanceTicks();
-        pair.renderHands = {};
-        ReadSharedHandsSnapshot(&pair.renderHands);
+        // Tag the pair with the pose WaitGetPoses returned for this frame, not
+        // a newer sample: the headset reprojects from exactly this pose.
+        ReadRenderPoseForSubmit(&pair.renderHands);
         pair.selected = g_capturePair;
         pair.eyes[0].copied = false;
         pair.eyes[1].copied = false;
@@ -665,6 +805,16 @@ static vr::EVRCompositorError VR_CALLTYPE HookedWaitGetPoses(void* self,
         : vr::VRCompositorError_RequestFailed;
     InterlockedExchangeAdd64(&g_waitPoseTicks, (LONG64)(PerformanceTicks() - waitStart));
     InterlockedIncrement64(&g_waitPoseCalls);
+    if (result == vr::VRCompositorError_None) {
+        CaptureRenderPose(renderPoses, renderPoseCount);
+        // The previous frame's GPU copy has usually finished by running start.
+        // Publishing here instead of at the next Submit saves a game frame of
+        // latency. Only the submitting thread may touch the game's context.
+        if (InterlockedCompareExchange(&g_submitThreadId, 0, 0) == (LONG)GetCurrentThreadId() && TryLockCapture()) {
+            PublishOldestStagedPair();
+            UnlockCapture();
+        }
+    }
     if (count <= 24 || count % 600 == 0) {
         void** vtable = self ? *(void***)self : nullptr;
         CompositorHook* hook = FindCompositorHook(self);

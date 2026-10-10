@@ -434,6 +434,11 @@ struct ProxySharedHands {
     uint8_t leftGrip;
     uint8_t rightGrip;
     uint8_t headTracked;
+    // Hand velocities in SteamVR space from the headset (hand tracking fused
+    // with Joy-Con inertial sensors). Linear ones use the fields above.
+    float leftAngularVelocity[3];
+    float rightAngularVelocity[3];
+    uint8_t velocityValid;
 };
 #pragma pack(pop)
 
@@ -467,7 +472,7 @@ static DXGI_FORMAT g_proxyReadbackFormat = DXGI_FORMAT_UNKNOWN;
 static uint32_t g_proxyReadbackIndex = 0;
 static_assert(sizeof(ProxySharedFrame) == 88, "Shared frame format must match the driver and encoder");
 static_assert(sizeof(ProxySharedHeader) == 64, "Shared header format must match the encoder");
-static_assert(sizeof(ProxySharedHands) == 287, "Shared hand format must match the driver and encoder");
+static_assert(sizeof(ProxySharedHands) == 312, "Shared hand format must match the driver and encoder");
 
 static HRESULT STDMETHODCALLTYPE Hooked_GetSharedHandle(IDXGIResource* resource, HANDLE* sharedHandle);
 static HRESULT STDMETHODCALLTYPE Hooked_CreateSharedHandle(IDXGIResource1* resource, const SECURITY_ATTRIBUTES* attributes, DWORD access, LPCWSTR name, HANDLE* sharedHandle);
@@ -845,8 +850,15 @@ static DWORD WINAPI ProxyFrameCaptureThread(LPVOID) {
         }
 
         if (InterlockedCompareExchange(&header->captureSourceMode, 0, 0) == 2) {
-            Sleep(10);
-            continue;
+            // The game's capture proxy owns the stream while it submits
+            // (padding[9] is its last Submit tick). During a level load it
+            // stops for 30 s or more; copy the compositor's loading screen then.
+            const DWORD lastSubmit = (DWORD)InterlockedCompareExchange(
+                reinterpret_cast<volatile LONG*>(&header->padding[9]), 0, 0);
+            if (lastSubmit == 0 || GetTickCount() - lastSubmit < 1500) {
+                Sleep(10);
+                continue;
+            }
         }
 
         const LONG requestSequence = InterlockedCompareExchange(&header->captureRequestSequence, 0, 0);

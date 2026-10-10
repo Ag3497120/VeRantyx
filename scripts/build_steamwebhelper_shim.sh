@@ -14,10 +14,10 @@ if ! command -v "$MINGW_CC" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$(dirname "$OUTPUT")"
-"$MINGW_CC" -municode -O2 -Wall -Wextra -static -mwindows \
+"$MINGW_CC" -municode -O2 -Wall -Wextra -static -mwindows -Wl,--no-insert-timestamp -s \
     -o "$OUTPUT" "$SOURCE" -lshell32
 
-if ! file -b "$OUTPUT" | rg -q '^PE32\+ executable.*x86-64'; then
+if ! file -b "$OUTPUT" | grep -Eq '^PE32\+ executable.*x86-64'; then
     echo "The WebHelper shim is not a Windows x86-64 executable: $OUTPUT" >&2
     exit 1
 fi

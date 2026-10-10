@@ -24,11 +24,11 @@ if [[ ! -f "$SOURCE_DLL" || ! -d "$HLA_GAME_BIN" ]]; then
     echo "Expected target directory: $HLA_GAME_BIN" >&2
     exit 1
 fi
-if ! file "$SOURCE_DLL" | rg -q 'PE32\+ executable.*x86-64'; then
+if ! file "$SOURCE_DLL" | grep -Eq 'PE32\+ executable.*x86-64'; then
     echo "SteamVR OpenVR client DLL is not a Windows x64 DLL: $SOURCE_DLL" >&2
     exit 1
 fi
-if ! x86_64-w64-mingw32-objdump -p "$SOURCE_DLL" | rg 'VR_GetGenericInterface' >/dev/null; then
+if ! x86_64-w64-mingw32-objdump -p "$SOURCE_DLL" | grep -E 'VR_GetGenericInterface' >/dev/null; then
     echo "SteamVR OpenVR client DLL is missing VR_GetGenericInterface: $SOURCE_DLL" >&2
     exit 1
 fi
@@ -40,7 +40,7 @@ if [[ -f "$TARGET_DLL" ]] && ! cmp -s "$TARGET_DLL" "$SOURCE_DLL" && \
     echo "Saved the HLA-local OpenVR DLL at $BACKUP_DIR/openvr_api.dll.user-version"
 fi
 if ! cmp -s "$TARGET_DLL" "$SOURCE_DLL"; then
-    cp -p "$SOURCE_DLL" "$TARGET_DLL"
+    cp -p "$SOURCE_DLL" "$TARGET_DLL.verantyx-tmp" && mv -f "$TARGET_DLL.verantyx-tmp" "$TARGET_DLL"
     echo "Installed SteamVR's Valve OpenVR client DLL beside Half-Life: Alyx."
 else
     echo "Half-Life: Alyx already uses SteamVR's OpenVR client DLL."

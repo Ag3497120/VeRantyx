@@ -13,8 +13,15 @@ if ! command -v "$CXX" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$(dirname "$OUTPUT")"
-temporary_output="${OUTPUT}.tmp.$$"
-trap 'rm -f "$temporary_output"' EXIT
+# Build under the final file name in a fixed staging directory: the linker
+# stores the name in the export table and derives the image base from the
+# full path, so a random path made every build differ. Identical bytes let the
+# installer skip replacing a DLL that SteamVR already has loaded.
+temporary_dir="$(dirname "$OUTPUT")/.build-$(basename "$OUTPUT" .dll)"
+rm -rf "$temporary_dir"
+mkdir -p "$temporary_dir"
+temporary_output="$temporary_dir/$(basename "$OUTPUT")"
+trap 'rm -rf "$temporary_dir"' EXIT
 
 "$CXX" \
     -std=c++17 \
@@ -22,6 +29,8 @@ trap 'rm -f "$temporary_output"' EXIT
     -shared \
     -static \
     -static-libgcc \
+    -Wl,--no-insert-timestamp \
+    -s \
     -static-libstdc++ \
     -I "$REPO_ROOT/VRDriver/include" \
     "$REPO_ROOT/VRDriver/src/driver_verantyx.cpp" \
@@ -35,5 +44,6 @@ if ! file "$temporary_output" | grep -q 'PE32+ executable.*x86-64'; then
 fi
 
 mv "$temporary_output" "$OUTPUT"
+rm -rf "$temporary_dir"
 trap - EXIT
 echo "Built SteamVR driver: $OUTPUT"

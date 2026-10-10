@@ -18,6 +18,8 @@ mkdir -p "$(dirname "$OUTPUT_DLL")"
     -shared \
     -static \
     -static-libgcc \
+    -Wl,--no-insert-timestamp \
+    -s \
     -static-libstdc++ \
     -I"$REPO_ROOT/VRDriver/include" \
     "$REPO_ROOT/VRDriver/src/openvr_capture_proxy.cpp" \
@@ -26,7 +28,7 @@ mkdir -p "$(dirname "$OUTPUT_DLL")"
     -ldxgi \
     -o "$OUTPUT_DLL"
 
-if ! file "$OUTPUT_DLL" | rg -q 'PE32\+ executable.*x86-64'; then
+if ! file "$OUTPUT_DLL" | grep -Eq 'PE32\+ executable.*x86-64'; then
     echo "Built proxy is not a Windows x86_64 DLL: $OUTPUT_DLL" >&2
     exit 1
 fi

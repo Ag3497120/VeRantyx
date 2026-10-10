@@ -19,10 +19,17 @@ final class VRUDPReceiver: ObservableObject {
     @Published private(set) var receivedVideoFPS = 0
     @Published private(set) var trackingPacketsSent = 0
     @Published private(set) var receiveDiagnostics = "映像パケットを待っています。"
+    @Published private(set) var diagnosticsSummary = "packets=0 incomplete=0"
 
     private var browser: NWBrowser?
     private var connection: NWConnection?
-    private let networkQueue = DispatchQueue(label: "com.verantyx.vrudp-receiver", qos: .userInitiated)
+    private let networkQueue = DispatchQueue(label: "com.verantyx.vrudp-receiver", qos: .userInteractive)
+    // Pose packets leave from the render thread. Sending them through
+    // networkQueue made them wait behind keyframe reassembly, which arrived at
+    // SteamVR as head-pose jitter. NWConnection.send is thread-safe.
+    private let trackingLock = NSLock()
+    private var trackingConnection: NWConnection?
+    private var trackingSentCount = 0
     private var shouldRun = false
     private var didReceiveVideo = false
     private var videoWasStale = false
@@ -31,7 +38,6 @@ final class VRUDPReceiver: ObservableObject {
     private var watchdogGeneration: UInt64 = 0
     private var fpsWindowStart = ProcessInfo.processInfo.systemUptime
     private var fpsWindowFrames = 0
-    private var trackingPacketCount = 0
     private var streamGeneration: UInt64 = 0
     private var receivedPacketCount = 0
     private var incompleteFrameCount = 0
@@ -92,7 +98,6 @@ final class VRUDPReceiver: ObservableObject {
         connectionReadyAt = nil
         fpsWindowStart = ProcessInfo.processInfo.systemUptime
         fpsWindowFrames = 0
-        trackingPacketCount = 0
         receivedPacketCount = 0
         incompleteFrameCount = 0
         lastPacketReceivedAt = nil
@@ -154,6 +159,7 @@ final class VRUDPReceiver: ObservableObject {
                 self.fpsWindowFrames = 0
                 // The Mac uses this datagram's source address as the video destination.
                 newConnection.send(content: Data("HELLO_VR".utf8), completion: .idempotent)
+                self.setTrackingConnection(newConnection)
                 DispatchQueue.main.async { [weak self] in
                     self?.connectionStatus = "Macに接続済み。エンコーダーから映像を待っています。"
                 }
@@ -178,6 +184,7 @@ final class VRUDPReceiver: ObservableObject {
             self.connection?.cancel()
             self.connection?.stateUpdateHandler = nil
             self.connection = nil
+            self.setTrackingConnection(nil)
             self.watchdogGeneration &+= 1
             self.frames.removeAll()
             self.lastPlayedFrame = nil
@@ -223,29 +230,30 @@ final class VRUDPReceiver: ObservableObject {
 
     private func requestKeyFrameOnQueue() {
         let now = ProcessInfo.processInfo.systemUptime
-        guard shouldRun, now - lastKeyFrameRequestAt >= 0.75,
+        guard shouldRun, now - lastKeyFrameRequestAt >= 0.2,
               let connection, connection.state == .ready else { return }
         lastKeyFrameRequestAt = now
         connection.send(content: Data("REQUEST_KEYFRAME".utf8), completion: .idempotent)
     }
 
+    private func setTrackingConnection(_ connection: NWConnection?) {
+        trackingLock.lock()
+        trackingConnection = connection
+        if connection == nil { trackingSentCount = 0 }
+        trackingLock.unlock()
+    }
+
     func sendTrackingPacket(_ packet: Data) {
-        networkQueue.async { [weak self] in
-            guard let self, let connection = self.connection, connection.state == .ready else { return }
-            connection.send(content: packet, completion: .contentProcessed { [weak self] error in
-                if let error {
-                    print("Tracking UDP send failed: \(error)")
-                    return
-                }
-                self?.networkQueue.async { [weak self] in
-                    guard let self, self.shouldRun else { return }
-                    self.trackingPacketCount += 1
-                    if self.trackingPacketCount % 30 == 0 {
-                        let sent = self.trackingPacketCount
-                        DispatchQueue.main.async { self.trackingPacketsSent = sent }
-                    }
-                }
-            })
+        trackingLock.lock()
+        let connection = trackingConnection
+        if connection != nil { trackingSentCount += 1 }
+        let sent = trackingSentCount
+        trackingLock.unlock()
+        guard let connection else { return }
+        // A late pose is useless; do not wait for or retry individual sends.
+        connection.send(content: packet, completion: .idempotent)
+        if sent % 30 == 0 {
+            DispatchQueue.main.async { [weak self] in self?.trackingPacketsSent = sent }
         }
     }
 
@@ -273,6 +281,7 @@ final class VRUDPReceiver: ObservableObject {
         failedConnection.stateUpdateHandler = nil
         failedConnection.cancel()
         connection = nil
+        setTrackingConnection(nil)
         frames.removeAll()
         lastPlayedFrame = nil
         didReceiveVideo = false
@@ -304,6 +313,20 @@ final class VRUDPReceiver: ObservableObject {
     }
 
     private func processPacket(_ data: Data) {
+        // "AUDI": game audio from the Mac.
+        if data.count >= 20, readUInt32LE(data, at: 0) == 0x49445541 {
+            VRAudioPlayer.shared.enqueue(data)
+            return
+        }
+        // "VTAN" + 8 floats: the eye frustum SteamVR renders with.
+        if data.count == 36, readUInt32LE(data, at: 0) == 0x4E415456 {
+            let values = (0..<8).map { Float(bitPattern: readUInt32LE(data, at: 4 + $0 * 4)) }
+            VRSourceProjectionStore.shared.update(
+                left: SIMD4<Float>(values[0], values[1], values[2], values[3]),
+                right: SIMD4<Float>(values[4], values[5], values[6], values[7])
+            )
+            return
+        }
         guard data.count >= headerSize else { return }
 
         let magic = readUInt32LE(data, at: 0)
@@ -465,10 +488,14 @@ final class VRUDPReceiver: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 self?.receivedVideoFPS = fps
                 self?.receiveDiagnostics = "受信 \(packets) パケット／欠落 \(lost) フレーム"
+                self?.diagnosticsSummary = "packets=\(packets) incomplete=\(lost)"
             }
             let sinceVideo = now - (self.lastVideoReceivedAt ?? self.connectionReadyAt ?? now)
             if sinceVideo > 0.75 { self.requestKeyFrameOnQueue() }
-            let videoTimedOut = self.lastVideoReceivedAt.map { now - $0 > 3 } ??
+            // Alyx sends nothing while it loads a level (30 s or more). Only
+            // reconnect after a long silence; a 3 s limit caused a reconnect
+            // storm (new flow every few seconds) during every load.
+            let videoTimedOut = self.lastVideoReceivedAt.map { now - $0 > 20 } ??
                 self.connectionReadyAt.map { now - $0 > 5 } ?? false
             if videoTimedOut {
                 if !self.videoWasStale {
@@ -483,6 +510,7 @@ final class VRUDPReceiver: ObservableObject {
                 if let connection = self.connection {
                     print("VR video timed out; reconnecting to the Mac encoder service.")
                     self.connection = nil
+                    self.setTrackingConnection(nil)
                     self.connectionReadyAt = nil
                     self.frames.removeAll()
                     self.lastPlayedFrame = nil

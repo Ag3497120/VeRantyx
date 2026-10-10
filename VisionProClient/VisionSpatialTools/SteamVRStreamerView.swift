@@ -3,6 +3,7 @@ import SwiftUI
 struct SteamVRStreamerView: View {
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
+    @Environment(\.dismissWindow) private var dismissWindow
     @ObservedObject private var receiver: VRUDPReceiver
     @ObservedObject private var tracking: VisionTrackingManager
     @ObservedObject private var decoder: VRVideoDecoder
@@ -34,8 +35,10 @@ struct SteamVRStreamerView: View {
                 statusRow(title: "受信状態", detail: receiver.receiveDiagnostics)
                 statusRow(title: "映像処理", detail: decoder.decodeDiagnostics)
                 statusRow(title: "描画fps", detail: model.rendererStatus)
+                statusRow(title: "遅延", detail: tracking.latencyStatus)
                 statusRow(title: "頭・手のトラッキング", detail: tracking.status)
                 statusRow(title: "手の座標", detail: tracking.handPositionStatus)
+                statusRow(title: "コントローラー", detail: tracking.controllerStatus)
                 statusRow(title: "SteamVR入力", detail: tracking.inputStatus)
                 statusRow(title: "姿勢送信", detail: "\(receiver.trackingPacketsSent) パケット")
                 statusRow(title: "表示", detail: immersiveStatus)
@@ -43,6 +46,9 @@ struct SteamVRStreamerView: View {
             }
             .padding(18)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+
+            Toggle("現実の手も表示する（ゲームの手との位置合わせ確認用）", isOn: $model.showsRealHands)
+                .frame(maxWidth: 560)
 
             HStack(spacing: 14) {
                 Button {
@@ -72,14 +78,23 @@ struct SteamVRStreamerView: View {
                 .buttonStyle(.bordered)
             }
 
-            Text("操作: 親指と人差し指のピンチでトリガー、親指と中指/薬指のピンチでA/B・X/Y、手を握るとグリップになります。握ったまま手を動かすとスティック入力です。起動時の頭の向きと位置を正面・目線高1.65mに合わせて再センターします。初回起動時はローカルネットワークと空間トラッキングを許可してください。MacでSteamVRとAlyxを起動すると、映像を自動で探します。")
+            Text("ジョイコン（推奨）: Vision Proの「設定 > Bluetooth」で左右のジョイコンをペアリングし、左右のL・Rボタンを同時に押して1つのコントローラーにまとめます。手の位置はハンドトラッキング、ボタンはジョイコンです。ZL/ZR＝トリガー、L/R＝グリップ（つかむ）、スティック（押し込みあり）、右のA・B＝A、右のX・Y＝B、左の↓・←＝X、左の↑・→＝Y、−/＋＝メニュー。肩の後ろへ手を伸ばすと、手が見えなくなってもバックパック位置に手を置くので、そこでL/Rを押すと弾を取れます。ジョイコンがないときはジェスチャー操作: 親指と人差し指でトリガー、3本指を握るとグリップ、親指と薬指でA/X、親指と小指でB/Y、親指と中指でつまんだまま手を動かすとスティック。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(28)
         .frame(minWidth: 720, idealWidth: 760, minHeight: 400)
-        .onAppear { model.prepare() }
+        .onAppear {
+            model.prepare()
+            // visionOS reopens this window when the wearer returns to the app
+            // after Home View or Control Center covered the game. The VR space
+            // is still open then, so go straight back to it.
+            if model.isImmersiveSpacePresented {
+                model.recordImmersiveEvent("Window reopened while VR is still open; returning to VR.")
+                dismissWindow(id: VRStreamerApp.mainWindowID)
+            }
+        }
     }
 
     private func startImmersiveVR() async {
@@ -105,7 +120,12 @@ struct SteamVRStreamerView: View {
         case .opened:
             model.recordImmersiveEvent("openImmersiveSpace returned opened.")
             if await model.start() {
-                immersiveStatus = "没入VRを表示中です。映像を待っています。"
+                immersiveStatus = "没入VRを表示中です。映像の状態は「受信fps」「描画fps」で確認できます。"
+                // Pinches meant for the game must not land on this window's
+                // buttons (Stop would end immersion). It comes back when the
+                // Digital Crown closes the immersive space.
+                model.recordImmersiveEvent("Closing the main window during immersion; the Digital Crown brings it back.")
+                dismissWindow(id: VRStreamerApp.mainWindowID)
             } else {
                 let trackingError = tracking.status
                 await dismissImmersiveSpace()

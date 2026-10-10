@@ -1,8 +1,0 @@
-esync: up and running.
-[Verantyx] DXGI Proxy loaded!
-Starting Dummy VR Game...
-0024:fixme:unwind:virtual_unwind calling personality routine in system library not supported yet
-wine: Unhandled page fault on read access to 0000000000000000 at address 0000000000000000 (thread 0024), starting debugger...
-0024:err:seh:start_debugger Couldn't start debugger L"winedbg --auto 32 48" (2)
-Read the Wine Developers Guide on how to set up winedbg or another debugger
-0024:fixme:unwind:virtual_unwind calling personality routine in system library not supported yet

@@ -6,6 +6,7 @@ final class VRStreamerModel: ObservableObject {
     @Published private(set) var immersiveDiagnostic = "Compositorはまだ初期化されていません。"
     @Published private(set) var isImmersiveSpacePresented = false
     @Published private(set) var rendererStatus = "映像待ち"
+    @Published var showsRealHands = false
 
     let receiver = VRUDPReceiver()
     let decoder = VRVideoDecoder()
@@ -32,11 +33,13 @@ final class VRStreamerModel: ObservableObject {
     }
 
     func recordRenderStatistics(_ statistics: VRRenderStatistics) {
-        rendererStatus = "表示 \(statistics.renderFPS) fps／新しい映像 \(statistics.newFrameFPS) fps"
+        rendererStatus = "表示 \(statistics.renderFPS) fps／新しい映像 \(statistics.newFrameFPS) fps／音声 \(VRAudioPlayer.shared.status)"
         receiver.sendClientDiagnostics(
             "receive_fps=\(receiver.receivedVideoFPS) decode_fps=\(decoder.decodedVideoFPS) " +
             "render_fps=\(statistics.renderFPS) new_frame_fps=\(statistics.newFrameFPS) " +
-            "pose_age_ms=\(statistics.frameAgeMilliseconds) anchor=\(statistics.anchored) gpu_errors=\(statistics.gpuErrors)"
+            "pose_age_ms=\(statistics.frameAgeMilliseconds) anchor=\(statistics.anchored) gpu_errors=\(statistics.gpuErrors) " +
+            "\(statistics.eyeGeometry) \(receiver.diagnosticsSummary) \(decoder.diagnosticsSummary) " +
+            "\(tracking.latencyStatus)"
         )
     }
 
@@ -93,5 +96,6 @@ final class VRStreamerModel: ObservableObject {
         tracking.stop()
         receiver.stop()
         decoder.stop()
+        VRAudioPlayer.shared.stop()
     }
 }

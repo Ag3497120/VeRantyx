@@ -15,3 +15,11 @@ VRDriver/dxgi.dll
 VRDriver/bin/
 VRDriver/deps/
 *.E
+
+# Build outputs (rebuilt by scripts/setup.sh and the launch script)
+VRDriver/driver_verantyx.dll
+MacEncoder/HardwareEncoder
+*.dll
+VRDriver/.build-*
+build/steamvr-d3d11-proxy/.build-*
+*.xcuserdatad/

@@ -25,34 +25,39 @@ final class VisionProjectionTangents {
     }
 }
 
+/// Device anchors sent to the Mac, keyed by the pose ID that travels with the
+/// pose through SteamVR and back with the rendered frame. The renderer gives the
+/// compositor exactly this anchor, so late reprojection starts from the pose
+/// the game actually rendered.
 final class DeviceAnchorHistory {
-    private struct Sample {
-        let timestamp: CFTimeInterval
+    struct Sample {
+        let id: CFTimeInterval
+        let sampledAt: CFTimeInterval
         let anchor: DeviceAnchor
     }
 
     private let lock = NSLock()
     private var samples: [Sample] = []
-    private let maximumSamples = 180 // About two seconds at 90 Hz.
+    // A slow game can show a frame long after its pose was sampled.
+    private let maximumSamples = 400
 
-    func append(_ anchor: DeviceAnchor, timestamp: CFTimeInterval) {
+    func append(_ anchor: DeviceAnchor, id: CFTimeInterval, sampledAt: CFTimeInterval) {
         lock.lock()
-        samples.append(Sample(timestamp: timestamp, anchor: anchor))
+        samples.append(Sample(id: id, sampledAt: sampledAt, anchor: anchor))
         if samples.count > maximumSamples {
             samples.removeFirst(samples.count - maximumSamples)
         }
         lock.unlock()
     }
 
-    func anchor(near timestamp: CFTimeInterval) -> DeviceAnchor? {
+    func sample(for id: CFTimeInterval) -> Sample? {
         lock.lock()
         defer { lock.unlock() }
-        guard let nearest = samples.min(by: {
-            abs($0.timestamp - timestamp) < abs($1.timestamp - timestamp)
-        }), abs(nearest.timestamp - timestamp) <= 0.04 else {
-            return nil
+        // IDs are bit-exact through the Mac; recent frames sit near the end.
+        for sample in samples.reversed() where abs(sample.id - id) < 0.0005 {
+            return sample
         }
-        return nearest.anchor
+        return nil
     }
 
     func removeAll() {
@@ -62,381 +67,223 @@ final class DeviceAnchorHistory {
     }
 }
 
-@MainActor
-final class VisionTrackingManager: ObservableObject {
-    @Published private(set) var status = "開始ボタンを押すとトラッキングを開始します。"
-    @Published private(set) var inputStatus = "入力待ち"
-    @Published private(set) var handPositionStatus = "手の位置待ち"
+struct VRTrackingSnapshot {
+    let controllerStatus: String
+    let status: String
+    let inputStatus: String
+    let handPositionStatus: String
+    let latencyStatus: String
+}
 
-    private let session = ARKitSession()
-    let worldTracking = WorldTrackingProvider()
-    private let handTracking = HandTrackingProvider()
-    let deviceAnchorHistory = DeviceAnchorHistory()
-    let projectionTangents = VisionProjectionTangents()
-    private var poseTask: Task<Void, Never>?
-    private var headTransform = matrix_identity_float4x4
-    private var leftHandTransform = matrix_identity_float4x4
-    private var rightHandTransform = matrix_identity_float4x4
+/// Runs on the immersive render thread once per display frame. It samples the
+/// head and hands, turns hand gestures into Oculus Touch input and sends one
+/// pose packet to the Mac. A display-locked cadence keeps SteamVR's head pose
+/// stream even; the old main-actor timer jittered with UI work.
+final class VRPoseSampler: @unchecked Sendable {
+    let history: DeviceAnchorHistory
+    let projectionTangents: VisionProjectionTangents
+    let gameController = VRGameControllerInput()
+
+    private let lock = NSLock()
+    private var worldTracking: WorldTrackingProvider?
+    private var handTracking: HandTrackingProvider?
+    private var send: ((Data) -> Void)?
+    private var onSnapshot: ((VRTrackingSnapshot) -> Void)?
     private var worldToSteamVR: simd_float4x4?
+    private var leftHand = HandState(isLeft: true)
+    private var rightHand = HandState(isLeft: false)
+    private var headTransform = VRPoseSampler.untrackedTransform
+    private var eyeCenterOffset = SIMD3<Float>.zero
     private var headIsTracked = false
-    private var leftHandIsTracked = false
-    private var rightHandIsTracked = false
-    private var leftPinch = false
-    private var rightPinch = false
-    private var leftTriggerValue: UInt8 = 0
-    private var rightTriggerValue: UInt8 = 0
-    private var leftGrip: UInt8 = 0
-    private var rightGrip: UInt8 = 0
-    private var leftPrimaryButton = false
-    private var leftSecondaryButton = false
-    private var rightPrimaryButton = false
-    private var rightSecondaryButton = false
-    private var leftClutchActive = false
-    private var rightClutchActive = false
-    private var leftClutchOrigin = SIMD3<Float>.zero
-    private var rightClutchOrigin = SIMD3<Float>.zero
-    private var leftStick = SIMD2<Float>.zero
-    private var rightStick = SIMD2<Float>.zero
-    private var lastInputStatusUpdate: CFTimeInterval = 0
-    private var lastHandPositionStatusUpdate: CFTimeInterval = 0
-    private var sendPacket: ((Data) -> Void)?
+    private var lastPoseID: CFTimeInterval = 0
+    // How far ahead of the display the Mac's frame arrives, learned from
+    // displayed frames. Predicting the head that far makes reprojection small.
+    private var predictionHorizon: Double = 0.03
+    private var measuredLatency: Double = 0
+    private var lastSnapshotAt: CFTimeInterval = 0
 
-    init() {
-        headTransform = Self.untrackedTransform
-        leftHandTransform = Self.untrackedTransform
-        rightHandTransform = Self.untrackedTransform
+    // The headset measured ~170 ms from pose to display with Alyx at ~20 fps.
+    // The compositor corrects any prediction error from the exact anchor, so
+    // predicting further mostly shrinks the black edge seen while turning;
+    // longer horizons made ARKit's prediction overshoot.
+    private static let maximumHeadPrediction: Double = 0.06
+    // Game hands are drawn ~150 ms after sampling; predict a little further
+    // so they trail the real hands less, without amplifying tracking noise.
+    private static let maximumHandPrediction: Double = 0.045
+
+    init(history: DeviceAnchorHistory, projectionTangents: VisionProjectionTangents) {
+        self.history = history
+        self.projectionTangents = projectionTangents
     }
 
-    func start(send: @escaping (Data) -> Void) async -> Bool {
-        guard poseTask == nil else { return true }
-        sendPacket = send
-
-        guard WorldTrackingProvider.isSupported else {
-            status = "このVision Proではワールドトラッキングを利用できません。"
-            return false
-        }
-
-        do {
-            var providers: [any DataProvider] = [worldTracking]
-            if HandTrackingProvider.isSupported {
-                providers.append(handTracking)
-
-                let requiredAuthorizations = HandTrackingProvider.requiredAuthorizations
-                let authorization = await session.requestAuthorization(for: requiredAuthorizations)
-                let denied = requiredAuthorizations.filter { authorization[$0] != .allowed }
-                guard denied.isEmpty else {
-                    status = "手の追跡が許可されていません。Vision Proの「設定 > プライバシーとセキュリティ > 手のトラッキング」でMBP AVP VRを許可してください。"
-                    sendPacket = nil
-                    return false
-                }
-            } else {
-                status = "このVision Proでは手のトラッキングを利用できません。"
-                sendPacket = nil
-                return false
-            }
-            try await session.run(providers)
-            headIsTracked = false
-            leftHandIsTracked = false
-            rightHandIsTracked = false
-            worldToSteamVR = nil
-            deviceAnchorHistory.removeAll()
-            headTransform = Self.untrackedTransform
-            leftHandTransform = Self.untrackedTransform
-            rightHandTransform = Self.untrackedTransform
-            status = "ARKitを起動しました。頭と手を追跡しています。"
-
-            poseTask = Task { @MainActor [weak self] in
-                guard let self else { return }
-                while !Task.isCancelled {
-                    let timestamp = CACurrentMediaTime()
-                    if let deviceAnchor = self.worldTracking.queryDeviceAnchor(atTimestamp: timestamp),
-                       deviceAnchor.isTracked {
-                        self.deviceAnchorHistory.append(deviceAnchor, timestamp: timestamp)
-                        let wasTracked = self.headIsTracked
-                        let worldHead = deviceAnchor.originFromAnchorTransform
-                        if self.worldToSteamVR == nil {
-                            self.worldToSteamVR = Self.makeWorldToSteamVR(from: worldHead)
-                        }
-                        if let worldToSteamVR = self.worldToSteamVR {
-                            self.headTransform = worldToSteamVR * worldHead
-                            self.headIsTracked = true
-                            if !wasTracked { self.updateTrackingStatus() }
-                        }
-                    } else {
-                        let wasTracked = self.headIsTracked
-                        self.headIsTracked = false
-                        if wasTracked { self.updateTrackingStatus() }
-                    }
-
-                    // Anchor updates can arrive before the first head pose establishes
-                    // the shared SteamVR origin. Poll the latest anchors after the
-                    // recenter transform exists so a stationary hand isn't lost until
-                    // the wearer moves it again.
-                    let latestHands = self.handTracking.latestAnchors
-                    if let leftHand = latestHands.leftHand {
-                        self.updateHand(leftHand)
-                    } else {
-                        self.hideHand(.left)
-                    }
-                    if let rightHand = latestHands.rightHand {
-                        self.updateHand(rightHand)
-                    } else {
-                        self.hideHand(.right)
-                    }
-                    self.updateHandPositionStatus()
-                    self.sendPacket?(self.makePosePacket(timestamp: timestamp))
-                    try? await Task.sleep(nanoseconds: 11_111_111)
-                }
-            }
-            return true
-        } catch {
-            status = "ARKitを開始できませんでした: \(error.localizedDescription)"
-            print("Vision tracking start failed: \(error)")
-            session.stop()
-            sendPacket = nil
-            return false
-        }
-    }
-
-    func stop() {
-        poseTask?.cancel()
-        poseTask = nil
-        sendPacket = nil
-        session.stop()
-        headIsTracked = false
-        leftHandIsTracked = false
-        rightHandIsTracked = false
-        leftPinch = false
-        rightPinch = false
-        leftTriggerValue = 0
-        rightTriggerValue = 0
-        leftGrip = 0
-        rightGrip = 0
-        leftPrimaryButton = false
-        leftSecondaryButton = false
-        rightPrimaryButton = false
-        rightSecondaryButton = false
-        leftClutchActive = false
-        rightClutchActive = false
-        leftStick = .zero
-        rightStick = .zero
+    func activate(
+        worldTracking: WorldTrackingProvider,
+        handTracking: HandTrackingProvider,
+        send: @escaping (Data) -> Void,
+        onSnapshot: @escaping (VRTrackingSnapshot) -> Void
+    ) {
+        lock.lock()
+        self.worldTracking = worldTracking
+        self.handTracking = handTracking
+        self.send = send
+        self.onSnapshot = onSnapshot
         worldToSteamVR = nil
-        deviceAnchorHistory.removeAll()
-        status = "トラッキング停止中"
+        leftHand = HandState(isLeft: true)
+        rightHand = HandState(isLeft: false)
+        headTransform = Self.untrackedTransform
+        headIsTracked = false
+        lastPoseID = 0
+        predictionHorizon = 0.03
+        measuredLatency = 0
+        lock.unlock()
+        history.removeAll()
     }
 
-    private func updateHand(_ anchor: HandAnchor) {
-        guard anchor.isTracked, let skeleton = anchor.handSkeleton else {
-            hideHand(anchor.chirality)
+    func deactivate() {
+        lock.lock()
+        worldTracking = nil
+        handTracking = nil
+        send = nil
+        onSnapshot = nil
+        lock.unlock()
+        history.removeAll()
+    }
+
+    /// Midpoint of the two eye views in the device anchor's frame.
+    func updateEyeCenter(_ offset: SIMD3<Float>) {
+        guard offset.x.isFinite, offset.y.isFinite, offset.z.isFinite, simd_length(offset) < 0.2 else { return }
+        lock.lock()
+        eyeCenterOffset = offset
+        lock.unlock()
+    }
+
+    func queryDeviceAnchor(at timestamp: CFTimeInterval) -> DeviceAnchor? {
+        lock.lock()
+        let provider = worldTracking
+        lock.unlock()
+        guard let anchor = provider?.queryDeviceAnchor(atTimestamp: timestamp), anchor.isTracked else { return nil }
+        return anchor
+    }
+
+    /// The renderer calls this when a streamed frame is first shown.
+    func reportDisplayed(poseID: CFTimeInterval, sampledAt: CFTimeInterval, presentationTime: CFTimeInterval) {
+        lock.lock()
+        let error = presentationTime - poseID
+        predictionHorizon = min(Self.maximumHeadPrediction, max(0, predictionHorizon + error * 0.05))
+        let latency = presentationTime - sampledAt
+        measuredLatency = measuredLatency == 0 ? latency : measuredLatency + (latency - measuredLatency) * 0.1
+        lock.unlock()
+    }
+
+    func sample(presentationTime: CFTimeInterval, now: CFTimeInterval) {
+        lock.lock()
+        guard let worldTracking, let handTracking, let send else {
+            lock.unlock()
             return
         }
 
-        let thumbTip = skeleton.joint(.thumbTip)
-        let indexTip = skeleton.joint(.indexFingerTip)
-        let middleTip = skeleton.joint(.middleFingerTip)
-        let ringTip = skeleton.joint(.ringFingerTip)
-        let littleTip = skeleton.joint(.littleFingerTip)
-        guard let worldToSteamVR else {
-            hideHand(anchor.chirality)
-            return
+        var poseID = presentationTime + predictionHorizon
+        // Pose IDs must keep increasing for SteamVR's driver and the history.
+        if poseID <= lastPoseID { poseID = lastPoseID + 0.000_1 }
+        var deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: poseID)
+        if deviceAnchor?.isTracked != true {
+            poseID = max(presentationTime, lastPoseID + 0.000_1)
+            deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: poseID)
         }
-
-        let metacarpals = [
-            skeleton.joint(.indexFingerMetacarpal),
-            skeleton.joint(.middleFingerMetacarpal),
-            skeleton.joint(.ringFingerMetacarpal),
-            skeleton.joint(.littleFingerMetacarpal)
-        ]
-        // ARKit's hand-anchor origin is at the wrist. Place the virtual controller
-        // between the wrist and knuckles so its grip sits in the palm, not at the
-        // knuckle line where a full metacarpal average would put it.
-        var worldFromPalm = anchor.originFromAnchorTransform
-        let trackedMetacarpals = metacarpals.filter(\.isTracked)
-        if trackedMetacarpals.count >= 2 {
-            let palmPositions = trackedMetacarpals.map {
-                (anchor.originFromAnchorTransform * $0.anchorFromJointTransform).columns.3
+        if let deviceAnchor, deviceAnchor.isTracked {
+            history.append(deviceAnchor, id: poseID, sampledAt: now)
+            let worldHead = deviceAnchor.originFromAnchorTransform
+            if worldToSteamVR == nil {
+                worldToSteamVR = Self.makeWorldToSteamVR(from: worldHead)
             }
-            let palmCenter = palmPositions.reduce(SIMD3<Float>.zero) {
-                $0 + SIMD3<Float>($1.x, $1.y, $1.z)
-            } / Float(palmPositions.count)
-            let wristPosition = SIMD3<Float>(
-                anchor.originFromAnchorTransform.columns.3.x,
-                anchor.originFromAnchorTransform.columns.3.y,
-                anchor.originFromAnchorTransform.columns.3.z
-            )
-            let controllerGripCenter = wristPosition + (palmCenter - wristPosition) * 0.55
-            worldFromPalm.columns.3 = SIMD4<Float>(controllerGripCenter, 1)
+            var eyeCenter = matrix_identity_float4x4
+            eyeCenter.columns.3 = SIMD4<Float>(eyeCenterOffset, 1)
+            headTransform = (worldToSteamVR ?? matrix_identity_float4x4) * worldHead * eyeCenter
+            headIsTracked = true
+        } else {
+            headIsTracked = false
+        }
+        lastPoseID = poseID
+
+        let handTime = now + min(max(poseID - now, 0), Self.maximumHandPrediction)
+        let anchors = handTracking.handAnchors(at: handTime)
+        let pads = gameController.snapshot()
+        if let worldToSteamVR {
+            leftHand.update(anchor: anchors.leftHand, worldToSteamVR: worldToSteamVR,
+                            head: headTransform, headTracked: headIsTracked, now: now, controller: pads.left)
+            rightHand.update(anchor: anchors.rightHand, worldToSteamVR: worldToSteamVR,
+                             head: headTransform, headTracked: headIsTracked, now: now, controller: pads.right)
         }
 
-        let thumbPosition = Self.worldPosition(thumbTip, anchorTransform: anchor.originFromAnchorTransform)
-        let indexPosition = Self.worldPosition(indexTip, anchorTransform: anchor.originFromAnchorTransform)
-        let middlePosition = Self.worldPosition(middleTip, anchorTransform: anchor.originFromAnchorTransform)
-        let ringPosition = Self.worldPosition(ringTip, anchorTransform: anchor.originFromAnchorTransform)
-        let pinchDistance: Float? = if let thumbPosition, let indexPosition {
-            simd_distance(thumbPosition, indexPosition)
-        } else {
-            nil
-        }
-        let middlePinch = Self.isPinching(thumbPosition, middlePosition)
-        let ringPinch = Self.isPinching(thumbPosition, ringPosition)
-        let curledFingers = [
-            Self.fingerCurl(skeleton.joint(.middleFingerMetacarpal), middleTip,
-                            anchorTransform: anchor.originFromAnchorTransform),
-            Self.fingerCurl(skeleton.joint(.ringFingerMetacarpal), ringTip,
-                            anchorTransform: anchor.originFromAnchorTransform),
-            Self.fingerCurl(skeleton.joint(.littleFingerMetacarpal), littleTip,
-                            anchorTransform: anchor.originFromAnchorTransform)
-        ].compactMap { $0 }
-        let grip = curledFingers.isEmpty ? 0 : curledFingers.reduce(0, +) / Float(curledFingers.count)
-        let gripByte = UInt8((min(max(grip, 0), 1) * 255).rounded())
+        let packet = makePosePacket(poseID: poseID)
+        let snapshot = now - lastSnapshotAt >= 0.2 ? makeSnapshot() : nil
+        if snapshot != nil { lastSnapshotAt = now }
+        let onSnapshot = self.onSnapshot
+        lock.unlock()
 
-        if anchor.chirality == .left {
-            let wasTracked = leftHandIsTracked
-            leftHandTransform = worldToSteamVR * worldFromPalm
-            leftHandIsTracked = true
-            leftTriggerValue = Self.triggerValue(
-                for: pinchDistance,
-                active: &leftPinch
-            )
-            leftGrip = gripByte
-            leftPrimaryButton = middlePinch && !leftPinch
-            leftSecondaryButton = ringPinch && !leftPinch && !middlePinch
-            leftStick = Self.clutchStick(
-                palm: leftHandTransform.columns.3,
-                grip: gripByte,
-                isActive: &leftClutchActive,
-                origin: &leftClutchOrigin
-            )
-            if !wasTracked { updateTrackingStatus() }
-        } else {
-            let wasTracked = rightHandIsTracked
-            rightHandTransform = worldToSteamVR * worldFromPalm
-            rightHandIsTracked = true
-            rightTriggerValue = Self.triggerValue(
-                for: pinchDistance,
-                active: &rightPinch
-            )
-            rightGrip = gripByte
-            rightPrimaryButton = middlePinch && !rightPinch
-            rightSecondaryButton = ringPinch && !rightPinch && !middlePinch
-            rightStick = Self.clutchStick(
-                palm: rightHandTransform.columns.3,
-                grip: gripByte,
-                isActive: &rightClutchActive,
-                origin: &rightClutchOrigin
-            )
-            if !wasTracked { updateTrackingStatus() }
-        }
-        updateInputStatus()
+        send(packet)
+        if let snapshot, let onSnapshot { onSnapshot(snapshot) }
     }
 
-    private func hideHand(_ chirality: HandAnchor.Chirality) {
-        if chirality == .left {
-            let wasTracked = leftHandIsTracked
-            leftHandTransform = Self.untrackedTransform
-            leftHandIsTracked = false
-            leftPinch = false
-            leftTriggerValue = 0
-            leftGrip = 0
-            leftPrimaryButton = false
-            leftSecondaryButton = false
-            leftClutchActive = false
-            leftStick = .zero
-            if wasTracked { updateTrackingStatus() }
-        } else {
-            let wasTracked = rightHandIsTracked
-            rightHandTransform = Self.untrackedTransform
-            rightHandIsTracked = false
-            rightPinch = false
-            rightTriggerValue = 0
-            rightGrip = 0
-            rightPrimaryButton = false
-            rightSecondaryButton = false
-            rightClutchActive = false
-            rightStick = .zero
-            if wasTracked { updateTrackingStatus() }
-        }
-        updateInputStatus()
-    }
-
-    private func updateTrackingStatus() {
+    private func makeSnapshot() -> VRTrackingSnapshot {
         let head = headIsTracked ? "追跡中" : "未追跡"
-        let left = leftHandIsTracked ? "追跡中" : "未検出"
-        let right = rightHandIsTracked ? "追跡中" : "未検出"
-        let next = "頭部 \(head) / 左手 \(left) / 右手 \(right)"
-        if status != next { status = next }
+        let status = "頭部 \(head) / 左手 \(leftHand.trackingLabel) / 右手 \(rightHand.trackingLabel)"
+        let input = "左 \(leftHand.inputLabel(primary: "X", secondary: "Y")) / 右 \(rightHand.inputLabel(primary: "A", secondary: "B"))"
+        let positions = "左 \(leftHand.positionLabel) / 右 \(rightHand.positionLabel)"
+        let latency = measuredLatency > 0
+            ? String(format: "姿勢→表示 %.0f ms／頭部予測 %.0f ms", measuredLatency * 1000, predictionHorizon * 1000)
+            : String(format: "映像待ち／頭部予測 %.0f ms", predictionHorizon * 1000)
+        return VRTrackingSnapshot(controllerStatus: gameController.snapshot().status,
+                                  status: status, inputStatus: input,
+                                  handPositionStatus: positions, latencyStatus: latency)
     }
 
-    private func updateInputStatus() {
-        let now = CACurrentMediaTime()
-        guard now - lastInputStatusUpdate >= 0.1 else { return }
-        lastInputStatusUpdate = now
-        let leftPrimary = leftPrimaryButton ? "X" : "–"
-        let leftSecondary = leftSecondaryButton ? "Y" : "–"
-        let rightPrimary = rightPrimaryButton ? "A" : "–"
-        let rightSecondary = rightSecondaryButton ? "B" : "–"
-        inputStatus = String(
-            format: "左 trigger %d%% grip %d%% stick(%+.2f,%+.2f) %@%@ / 右 trigger %d%% grip %d%% stick(%+.2f,%+.2f) %@%@",
-            Int(leftTriggerValue) * 100 / 255,
-            Int(leftGrip) * 100 / 255,
-            leftStick.x,
-            leftStick.y,
-            leftPrimary,
-            leftSecondary,
-            Int(rightTriggerValue) * 100 / 255,
-            Int(rightGrip) * 100 / 255,
-            rightStick.x,
-            rightStick.y,
-            rightPrimary,
-            rightSecondary
-        )
-    }
-
-    private func updateHandPositionStatus() {
-        let now = CACurrentMediaTime()
-        guard now - lastHandPositionStatusUpdate >= 0.25 else { return }
-        lastHandPositionStatusUpdate = now
-
-        func positionText(_ transform: simd_float4x4, tracked: Bool) -> String {
-            guard tracked else { return "未検出" }
-            let position = transform.columns.3
-            return String(format: "(%.2f, %.2f, %.2f)m", position.x, position.y, position.z)
-        }
-        handPositionStatus = "左 \(positionText(leftHandTransform, tracked: leftHandIsTracked)) / 右 \(positionText(rightHandTransform, tracked: rightHandIsTracked))"
-    }
-
-    private func makePosePacket(timestamp: CFTimeInterval) -> Data {
-        var packet = Data(capacity: 271)
+    private func makePosePacket(poseID: CFTimeInterval) -> Data {
+        var packet = Data(capacity: 319)
         appendRaw(UInt32(0x45534F50), to: &packet) // "POSE" in little-endian bytes.
         appendRaw(UInt32(0), to: &packet)
-        appendRaw(Double(timestamp), to: &packet)
+        // The pose ID is also the timestamp the head was predicted to.
+        appendRaw(Double(poseID), to: &packet)
         appendRaw(headTransform, to: &packet)
-        appendRaw(leftHandTransform, to: &packet)
-        appendRaw(rightHandTransform, to: &packet)
-        appendRaw(UInt8(leftHandIsTracked ? 1 : 0), to: &packet)
-        appendRaw(UInt8(rightHandIsTracked ? 1 : 0), to: &packet)
-        appendRaw(leftTriggerValue, to: &packet)
-        appendRaw(rightTriggerValue, to: &packet)
-        let rightButtons = (rightPrimaryButton ? UInt32(1 << 0) : 0) |
-            (rightSecondaryButton ? UInt32(1 << 1) : 0)
-        let leftButtons = (leftPrimaryButton ? UInt32(1 << 8) : 0) |
-            (leftSecondaryButton ? UInt32(1 << 9) : 0)
-        appendRaw(rightButtons, to: &packet)
-        appendRaw(leftButtons, to: &packet)
-        appendRaw(rightStick.x, to: &packet)
-        appendRaw(rightStick.y, to: &packet)
-        appendRaw(leftStick.x, to: &packet)
-        appendRaw(leftStick.y, to: &packet)
+        appendRaw(leftHand.transform, to: &packet)
+        appendRaw(rightHand.transform, to: &packet)
+        appendRaw(leftHand.trackingState, to: &packet)
+        appendRaw(rightHand.trackingState, to: &packet)
+        appendRaw(leftHand.triggerValue, to: &packet)
+        appendRaw(rightHand.triggerValue, to: &packet)
+        appendRaw(rightHand.buttonBits, to: &packet)
+        appendRaw(leftHand.buttonBits << 8, to: &packet)
+        appendRaw(rightHand.stick.x, to: &packet)
+        appendRaw(rightHand.stick.y, to: &packet)
+        appendRaw(leftHand.stick.x, to: &packet)
+        appendRaw(leftHand.stick.y, to: &packet)
         // OpenVR orders its vertical clipping edges in reverse: pfTop is the
         // bottom (-Y) edge, and pfBottom is the top (+Y) edge.
         let tangents = projectionTangents.snapshot()
         appendRaw(tangents.left, to: &packet)
         appendRaw(tangents.right, to: &packet)
-        appendRaw(leftGrip, to: &packet)
-        appendRaw(rightGrip, to: &packet)
+        appendRaw(leftHand.gripValue, to: &packet)
+        appendRaw(rightHand.gripValue, to: &packet)
         appendRaw(UInt8(headIsTracked ? 1 : 0), to: &packet)
-        assert(packet.count == 271, "Vision Pro pose packet must match the Mac receiver layout")
+        // Velocities (m/s, rad/s in SteamVR space) for SteamVR's pose
+        // prediction and Alyx's gravity-glove flick detection.
+        appendRaw(leftHand.velocity, to: &packet)
+        appendRaw(rightHand.velocity, to: &packet)
+        appendRaw(leftHand.angularVelocity, to: &packet)
+        appendRaw(rightHand.angularVelocity, to: &packet)
+        assert(packet.count == 319, "Vision Pro pose packet must match the Mac receiver layout")
         return packet
+    }
+
+    private func appendRaw<T>(_ value: T, to data: inout Data) {
+        var value = value
+        withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
+    }
+
+    private func appendRaw(_ value: SIMD3<Float>, to data: inout Data) {
+        appendRaw(value.x, to: &data)
+        appendRaw(value.y, to: &data)
+        appendRaw(value.z, to: &data)
     }
 
     private static func makeWorldToSteamVR(from initialHead: simd_float4x4) -> simd_float4x4 {
@@ -453,7 +300,7 @@ final class VisionTrackingManager: ObservableObject {
         return standingEyeHeight * recenterYaw * removeInitialPosition
     }
 
-    private static var untrackedTransform: simd_float4x4 {
+    static var untrackedTransform: simd_float4x4 {
         simd_float4x4(columns: (
             SIMD4<Float>.zero,
             SIMD4<Float>.zero,
@@ -461,79 +308,587 @@ final class VisionTrackingManager: ObservableObject {
             SIMD4<Float>.zero
         ))
     }
+}
 
-    private static func worldPosition(
-        _ joint: HandSkeleton.Joint,
-        anchorTransform: simd_float4x4
-    ) -> SIMD3<Float>? {
-        guard joint.isTracked else { return nil }
-        let position = (anchorTransform * joint.anchorFromJointTransform).columns.3
-        return SIMD3<Float>(position.x, position.y, position.z)
+/// One hand's emulated Oculus Touch controller.
+///
+/// Gestures (both hands):
+/// - thumb + index pinch: trigger
+/// - closing middle, ring and little fingers: grip
+/// - thumb + middle pinch held: joystick. Move the hand to push the stick.
+///   Left hand pushes forward by default (teleport); right hand held still
+///   for 0.45 s clicks the stick (weapon select).
+/// - thumb + ring pinch: A / X
+/// - thumb + little pinch: B / Y
+///
+/// With Joy-Con connected, the controller replaces all gestures for that hand
+/// and hand tracking only supplies the pose.
+private struct HandState {
+    enum Finger { case middle, ring, little }
+    enum StickPhase { case idle, pending, deflect, forward, click }
+
+    let isLeft: Bool
+    var trackingState: UInt8 = 0 // 0 untracked, 1 measured, 2 held after loss
+    var transform = VRPoseSampler.untrackedTransform
+    var triggerValue: UInt8 = 0
+    var gripValue: UInt8 = 0
+    var stick = SIMD2<Float>.zero
+    var buttonBits: UInt32 = 0
+    // In SteamVR space. Angular velocity comes from the Joy-Con gyro when
+    // available (sharp and immediate), otherwise from successive poses.
+    var velocity = SIMD3<Float>.zero
+    var angularVelocity = SIMD3<Float>.zero
+    private var lastWorldPosition: SIMD3<Float>?
+    private var lastWorldRotation: simd_quatf?
+    private var lastWorldTime: CFTimeInterval = 0
+
+    private var triggerEngaged = false
+    private var gripEngaged = false
+    private var pinchedFinger: Finger?
+    private var stickPhase = StickPhase.idle
+    private var stickOrigin = SIMD3<Float>.zero
+    private var stickStartedAt: CFTimeInterval = 0
+    private var stickRight = SIMD3<Float>(1, 0, 0)
+    private var stickForward = SIMD3<Float>(0, 0, -1)
+    // Last measured pose relative to the head, and its head-relative velocity.
+    private var lastMeasuredLocal: simd_float4x4?
+    private var lastLocalPosition: SIMD3<Float>?
+    private var lastLocalTime: CFTimeInterval = 0
+    private var localVelocity = SIMD3<Float>.zero
+    // Dead reckoning from the Joy-Con's sensors while the cameras cannot see
+    // the hand: rotation from the gyro, position from acceleration with heavy
+    // damping (it drifts within a second, so it is bounded and decays).
+    private var inertialVelocity = SIMD3<Float>.zero
+    private var inertialOffset = SIMD3<Float>.zero
+    private var inertialLastTime: TimeInterval?
+    private var inertialRotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+    private var lostAt: CFTimeInterval?
+    private(set) var usesController = false
+
+    // Keep a hand that leaves the cameras' view (lowered gun, object carried
+    // to the side) where it was relative to the head instead of dropping it.
+    // With Joy-Con the buttons keep working, so hold the hand longer.
+    private static let holdDuration: CFTimeInterval = 0.8
+
+    init(isLeft: Bool) {
+        self.isLeft = isLeft
     }
 
-    private static func isPinching(_ first: SIMD3<Float>?, _ second: SIMD3<Float>?) -> Bool {
-        guard let first, let second else { return false }
-        return simd_distance(first, second) < 0.035
-    }
-
-    private static func triggerValue(for distance: Float?, active: inout Bool) -> UInt8 {
-        guard let distance else {
-            active = false
-            return 0
+    var trackingLabel: String {
+        switch trackingState {
+        case 1: return "追跡中"
+        case 2: return "保持中"
+        default: return "未検出"
         }
-        let engageDistance: Float = 0.028
-        let releaseDistance: Float = 0.052
-        active = active ? distance < releaseDistance : distance <= engageDistance
-        guard active else { return 0 }
-        let strength = min(max((releaseDistance - distance) / (releaseDistance - engageDistance), 0), 1)
-        return UInt8((strength * 255).rounded())
     }
 
-    private static func fingerCurl(
-        _ metacarpal: HandSkeleton.Joint,
-        _ fingertip: HandSkeleton.Joint,
-        anchorTransform: simd_float4x4
-    ) -> Float? {
-        guard metacarpal.isTracked, fingertip.isTracked else { return nil }
-        let metacarpalPosition = (anchorTransform * metacarpal.anchorFromJointTransform).columns.3
-        let fingertipPosition = (anchorTransform * fingertip.anchorFromJointTransform).columns.3
-        let distance = simd_distance(
-            SIMD3<Float>(metacarpalPosition.x, metacarpalPosition.y, metacarpalPosition.z),
-            SIMD3<Float>(fingertipPosition.x, fingertipPosition.y, fingertipPosition.z)
+    var positionLabel: String {
+        guard trackingState != 0 else { return "未検出" }
+        let position = transform.columns.3
+        return String(format: "(%.2f, %.2f, %.2f)m", position.x, position.y, position.z)
+    }
+
+    func inputLabel(primary: String, secondary: String) -> String {
+        let stickLabel: String
+        if buttonBits & 4 != 0 {
+            stickLabel = "押込"
+        } else if buttonBits & 8 == 0 {
+            stickLabel = "–"
+        } else {
+            stickLabel = String(format: "(%+.2f,%+.2f)", stick.x, stick.y)
+        }
+        return String(
+            format: "trigger %d%% grip %d%% stick %@ %@%@",
+            Int(triggerValue) * 100 / 255, Int(gripValue) * 100 / 255, stickLabel,
+            buttonBits & 1 != 0 ? primary : "–", buttonBits & 2 != 0 ? secondary : "–"
         )
-        return min(max((0.105 - distance) / 0.065, 0), 1)
     }
 
-    private static func clutchStick(
-        palm: SIMD4<Float>,
-        grip: UInt8,
-        isActive: inout Bool,
-        origin: inout SIMD3<Float>
-    ) -> SIMD2<Float> {
-        let position = SIMD3<Float>(palm.x, palm.y, palm.z)
-        let gripping = grip >= 150
-        guard gripping else {
-            isActive = false
-            return .zero
-        }
-        if !isActive {
-            origin = position
-            isActive = true
-            return .zero
+    mutating func update(anchor: HandAnchor?, worldToSteamVR: simd_float4x4,
+                         head: simd_float4x4, headTracked: Bool, now: CFTimeInterval,
+                         controller: VRControllerHand?) {
+        usesController = controller != nil
+        guard let anchor, anchor.isTracked, let skeleton = anchor.handSkeleton,
+              let joints = HandJoints(anchor: anchor, skeleton: skeleton),
+              let worldRaw = Self.touchRawPose(joints: joints, isLeft: isLeft) else {
+            handleLoss(head: head, headTracked: headTracked, now: now, controller: controller)
+            return
         }
 
-        let delta = position - origin
-        let raw = SIMD2<Float>(delta.x, -delta.z)
-        let distance = simd_length(raw)
-        let deadzone: Float = 0.025
-        let fullScale: Float = 0.12
-        guard distance > deadzone else { return .zero }
-        let magnitude = min((distance - deadzone) / (fullScale - deadzone), 1)
-        return raw / distance * magnitude
+        var steamRaw = worldToSteamVR * worldRaw
+        inertialVelocity = .zero
+        inertialOffset = .zero
+        inertialLastTime = nil
+        inertialRotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        let rawPosition = SIMD3<Float>(steamRaw.columns.3.x, steamRaw.columns.3.y, steamRaw.columns.3.z)
+        let rawRotation = simd_quatf(steamRaw)
+        // Velocity from the tracked pose itself (before smoothing).
+        if let lastWorldPosition, let lastWorldRotation, now - lastWorldTime > 0.001, now - lastWorldTime < 0.1 {
+            let dt = Float(now - lastWorldTime)
+            let measured = (rawPosition - lastWorldPosition) / dt
+            velocity += (measured - velocity) * 0.5
+            var delta = rawRotation * lastWorldRotation.inverse
+            if delta.real < 0 { delta = simd_quatf(real: -delta.real, imag: -delta.imag) }
+            let axisLength = simd_length(delta.imag)
+            let measuredAngular = axisLength > 1e-6 ? delta.imag / axisLength * (2 * atan2(axisLength, delta.real)) / dt : .zero
+            angularVelocity += (measuredAngular - angularVelocity) * 0.5
+        } else {
+            velocity = .zero
+            angularVelocity = .zero
+        }
+        lastWorldPosition = rawPosition
+        lastWorldRotation = rawRotation
+        lastWorldTime = now
+        if let motion = controller?.motion {
+            fuseInertialVelocity(motion, rotation: rawRotation)
+        }
+        if controller != nil, trackingState == 1, let previous = Optional(transform) {
+            // A hand wrapped around a Joy-Con is partly hidden, so its tracked
+            // pose jitters. Smooth it while the hand is slow; follow it
+            // directly when it moves fast so a flick is not blunted.
+            let speed = simd_length(velocity)
+            let follow: Float = speed > 0.6 ? 1 : speed > 0.2 ? 0.8 : 0.6
+            steamRaw = Self.blend(previous, steamRaw, follow)
+        }
+        transform = steamRaw
+        trackingState = 1
+        lostAt = nil
+        let local = head.inverse * steamRaw
+        let localPosition = SIMD3<Float>(local.columns.3.x, local.columns.3.y, local.columns.3.z)
+        if let lastLocalPosition, now - lastLocalTime > 0.001, now - lastLocalTime < 0.1 {
+            let velocity = (localPosition - lastLocalPosition) / Float(now - lastLocalTime)
+            localVelocity += (velocity - localVelocity) * 0.4
+        } else {
+            localVelocity = .zero
+        }
+        lastLocalPosition = localPosition
+        lastLocalTime = now
+        lastMeasuredLocal = local
+
+        if let controller {
+            applyController(controller)
+            return
+        }
+
+        // Grip from finger curl, normalized by each finger's own length so it
+        // works for any hand size. 1 = straight finger, ~0.35 = tight fist.
+        let extensions = [joints.middleExtension, joints.ringExtension, joints.littleExtension].compactMap { $0 }
+        if !extensions.isEmpty {
+            let curl = extensions.reduce(0, +) / Float(extensions.count)
+            let gripRaw = Self.clamp((0.88 - curl) / 0.30)
+            if gripEngaged { gripEngaged = gripRaw > 0.55 } else { gripEngaged = gripRaw >= 0.8 }
+            // Alyx clicks at 0.75 and releases at 0.72. Report engaged values
+            // above that band and released ones below it so noise cannot toggle it.
+            gripValue = Self.byte(gripEngaged ? max(gripRaw, 0.85) : min(gripRaw, 0.7))
+        }
+
+        let pinchIndex = joints.thumbDistance(to: joints.indexTip)
+        if let pinchIndex {
+            let triggerRaw = Self.clamp((0.07 - pinchIndex) / 0.045)
+            if triggerEngaged {
+                triggerEngaged = pinchIndex < 0.042
+            } else {
+                // A fist also brings thumb and index together; require an
+                // index finger that is not curled into the palm.
+                triggerEngaged = pinchIndex <= 0.025 && (joints.indexExtension ?? 1) > 0.45
+            }
+            triggerValue = Self.byte(triggerEngaged ? max(triggerRaw, 0.85) : min(triggerRaw, 0.7))
+        }
+
+        updateFingerPinch(middle: joints.thumbDistance(to: joints.middleTip),
+                          ring: joints.thumbDistance(to: joints.ringTip),
+                          little: joints.thumbDistance(to: joints.littleTip),
+                          index: pinchIndex)
+        let palm = SIMD3<Float>(steamRaw.columns.3.x, steamRaw.columns.3.y, steamRaw.columns.3.z)
+        updateStick(palm: palm, head: head, now: now)
+
+        var bits: UInt32 = 0
+        if pinchedFinger == .ring { bits |= 1 }
+        if pinchedFinger == .little { bits |= 2 }
+        if stickPhase == .click { bits |= 4 }
+        if stickPhase != .idle { bits |= 8 }
+        buttonBits = bits
     }
 
-    private func appendRaw<T>(_ value: T, to data: inout Data) {
-        var value = value
-        withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
+    private mutating func handleLoss(head: simd_float4x4, headTracked: Bool, now: CFTimeInterval,
+                                     controller: VRControllerHand?) {
+        // (A shoulder-reach guess here moved the hand behind the shoulder on
+        // ordinary tracking losses, so the hand jumped away. Removed.)
+        let lostSince = lostAt ?? now
+        lostAt = lostSince
+        lastLocalPosition = nil
+        lastWorldPosition = nil
+        lastWorldRotation = nil
+        if controller?.motion == nil {
+            velocity = .zero
+            angularVelocity = .zero
+        }
+        if let controller {
+            applyController(controller)
+        } else {
+            // Trigger, pinches and stick need a visible hand; grip is kept while
+            // held so the game does not drop what the hand was carrying.
+            triggerEngaged = false
+            triggerValue = 0
+            pinchedFinger = nil
+            stickPhase = .idle
+            stick = .zero
+            buttonBits = 0
+        }
+        // With a controller the buttons keep working, so keep the hand where
+        // it last was relative to the head for as long as the hand is away;
+        // dropping it made Alyx fling the hand elsewhere.
+        let holdLimit = controller != nil ? CFTimeInterval.infinity : Self.holdDuration
+        if let lastMeasuredLocal, headTracked, now - lostSince < holdLimit {
+            transform = head * lastMeasuredLocal
+            if let motion = controller?.motion { applyInertial(motion) }
+            trackingState = 2
+            return
+        }
+        trackingState = 0
+        transform = VRPoseSampler.untrackedTransform
+        lastMeasuredLocal = nil
+        if controller == nil {
+            gripEngaged = false
+            gripValue = 0
+        }
+    }
+
+    /// Joy-Con inputs replace the gestures for this hand. Bits: 1 A/X,
+    /// 2 B/Y, 4 stick click, 8 stick touch, 16 menu (left system button).
+    /// Moves the held hand with the Joy-Con while it is out of view. The
+    /// controller's axes are taken as the hand's raw axes: held upright, its
+    /// long axis (+Y) runs along the fist (raw -Z) and its face (+Z) faces
+    /// the player (raw +Y), which the fixed rotation below encodes.
+    /// Replaces the camera-derived angular velocity with the gyro's (rotated
+    /// to SteamVR space) and adds the accelerometer's short-term velocity, so
+    /// a wrist flick reaches the game at full strength.
+    private mutating func fuseInertialVelocity(_ motion: VRControllerMotion, rotation: simd_quatf) {
+        let handFromDevice = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+        let deviceToWorld = simd_float3x3(rotation) * simd_float3x3(handFromDevice)
+        if let rate = motion.rotationRate {
+            angularVelocity = deviceToWorld * rate
+        }
+        if let acceleration = motion.userAcceleration, let last = inertialLastTime {
+            let dt = Float(motion.timestamp - last)
+            if dt > 0, dt < 0.1 {
+                let worldAcceleration = deviceToWorld * acceleration * 9.81
+                // High-passed: decays within ~0.15 s so only sudden motion remains.
+                inertialVelocity = (inertialVelocity + worldAcceleration * dt) * max(0, 1 - 8 * dt)
+                velocity += inertialVelocity
+            }
+        }
+        inertialLastTime = motion.timestamp
+    }
+
+    private mutating func applyInertial(_ motion: VRControllerMotion) {
+        guard let last = inertialLastTime else {
+            inertialLastTime = motion.timestamp
+            return
+        }
+        let dt = Float(motion.timestamp - last)
+        guard dt > 0, dt < 0.1 else { inertialLastTime = motion.timestamp; return }
+        inertialLastTime = motion.timestamp
+        let handFromDevice = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+        let rotation = simd_float3x3(simd_quatf(transform)) * simd_float3x3(handFromDevice)
+
+        if let rate = motion.rotationRate {
+            let worldRate = rotation * rate
+            angularVelocity = worldRate
+            let angle = simd_length(worldRate) * dt
+            if angle > 0.0005 {
+                inertialRotation = simd_normalize(simd_quatf(angle: angle, axis: simd_normalize(worldRate)) * inertialRotation)
+            }
+        } else {
+            angularVelocity = .zero
+        }
+        if let acceleration = motion.userAcceleration {
+            let worldAcceleration = rotation * acceleration * 9.81
+            inertialVelocity = (inertialVelocity + worldAcceleration * dt) * max(0, 1 - 6 * dt)
+            let offset = inertialOffset + inertialVelocity * dt
+            let distance = simd_length(offset)
+            inertialOffset = distance > 0.5 ? offset / distance * 0.5 : offset
+        }
+        velocity = inertialVelocity
+
+        var moved = simd_float4x4(inertialRotation) * simd_float4x4(simd_quatf(transform))
+        let position = SIMD3<Float>(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z) + inertialOffset
+        moved.columns.3 = SIMD4<Float>(position, 1)
+        transform = moved
+    }
+
+    private mutating func applyController(_ controller: VRControllerHand) {
+        triggerEngaged = false
+        gripEngaged = controller.grip >= 0.5
+        pinchedFinger = nil
+        stickPhase = .idle
+        triggerValue = Self.byte(controller.trigger)
+        gripValue = Self.byte(controller.grip)
+        stick = controller.stick
+        var bits: UInt32 = 0
+        if controller.primary { bits |= 1 }
+        if controller.secondary { bits |= 2 }
+        if controller.stickClick { bits |= 4 }
+        if controller.stickClick || simd_length(controller.stick) > 0.1 { bits |= 8 }
+        if controller.menu { bits |= 16 }
+        buttonBits = bits
+    }
+
+    private mutating func updateFingerPinch(middle: Float?, ring: Float?, little: Float?, index: Float?) {
+        let blocked = triggerEngaged || gripEngaged || (index ?? 1) < 0.03
+        if let finger = pinchedFinger {
+            let distance: Float?
+            switch finger {
+            case .middle: distance = middle
+            case .ring: distance = ring
+            case .little: distance = little
+            }
+            // An occluded fingertip keeps the pinch; a visible open one ends it.
+            if blocked || (distance ?? 0) > 0.04 { pinchedFinger = nil }
+            return
+        }
+        guard !blocked else { return }
+        let candidates: [(Finger, Float)] = [(.middle, middle), (.ring, ring), (.little, little)]
+            .compactMap { finger, distance in distance.map { (finger, $0) } }
+        if let nearest = candidates.min(by: { $0.1 < $1.1 }), nearest.1 <= 0.022 {
+            pinchedFinger = nearest.0
+        }
+    }
+
+    private mutating func updateStick(palm: SIMD3<Float>, head: simd_float4x4, now: CFTimeInterval) {
+        guard pinchedFinger == .middle else {
+            stickPhase = .idle
+            stick = .zero
+            return
+        }
+        if stickPhase == .idle {
+            stickPhase = .pending
+            stickOrigin = palm
+            stickStartedAt = now
+            // Measure hand motion in the head's horizontal frame at pinch start.
+            let forward = SIMD3<Float>(-head.columns.2.x, 0, -head.columns.2.z)
+            stickForward = simd_length_squared(forward) > 1e-4 ? simd_normalize(forward) : SIMD3<Float>(0, 0, -1)
+            stickRight = SIMD3<Float>(-stickForward.z, 0, stickForward.x)
+        }
+
+        let delta = palm - stickOrigin
+        let offset = SIMD2<Float>(simd_dot(delta, stickRight), simd_dot(delta, stickForward))
+        let distance = simd_length(offset)
+        let deadzone: Float = 0.015
+        let fullScale: Float = 0.07
+        let moved = distance > deadzone
+
+        switch stickPhase {
+        case .pending:
+            if moved {
+                stickPhase = .deflect
+            } else if isLeft && now - stickStartedAt >= 0.15 {
+                stickPhase = .forward
+            } else if !isLeft && now - stickStartedAt >= 0.45 {
+                stickPhase = .click
+            }
+        case .forward:
+            if moved { stickPhase = .deflect }
+        default:
+            break
+        }
+
+        switch stickPhase {
+        case .deflect where moved:
+            let magnitude = min((distance - deadzone) / (fullScale - deadzone), 1)
+            stick = offset / distance * magnitude
+        case .forward:
+            stick = SIMD2<Float>(0, 1)
+        default:
+            stick = .zero
+        }
+    }
+
+    /// Converts hand joints to the raw pose an Oculus Rift S controller would
+    /// report if this hand held it. The OpenXR grip pose is defined from hand
+    /// anatomy; SteamVR's Rift S render model says where that grip sits
+    /// relative to the controller's raw pose, which Alyx aligns its hands to.
+    private static func touchRawPose(joints: HandJoints, isLeft: Bool) -> simd_float4x4? {
+        let forward = joints.middleKnuckle - joints.wrist
+        let across = joints.indexKnuckle - joints.littleKnuckle
+        guard simd_length(forward) > 0.03, simd_length(across) > 0.02 else { return nil }
+        let towardThumbSide = simd_normalize(across)
+        // +X: out of the right hand's back / out of the left hand's palm.
+        let x = simd_normalize(simd_cross(simd_normalize(forward), towardThumbSide))
+        // -Z: through the closed fist from little finger to index finger.
+        var z = -towardThumbSide
+        z = simd_normalize(z - simd_dot(z, x) * x)
+        let y = simd_cross(z, x)
+        guard x.x.isFinite, y.x.isFinite, z.x.isFinite else { return nil }
+
+        let palmCenter = (joints.middleMetacarpal + joints.middleKnuckle) * 0.5
+        let palmNormal = isLeft ? x : -x
+        let gripOrigin = palmCenter + palmNormal * 0.015
+        let worldGrip = simd_float4x4(columns: (
+            SIMD4<Float>(x, 0), SIMD4<Float>(y, 0), SIMD4<Float>(z, 0), SIMD4<Float>(gripOrigin, 1)
+        ))
+
+        // openxr_grip in oculus_rifts_controller_{left,right}.json.
+        var rawFromGrip = simd_float4x4(simd_quatf(angle: 20.6 * .pi / 180, axis: SIMD3<Float>(1, 0, 0)))
+        rawFromGrip.columns.3 = SIMD4<Float>(isLeft ? 0.007 : -0.007, -0.00182941, 0.1019482, 1)
+        return worldGrip * rawFromGrip.inverse
+    }
+
+    private static func blend(_ a: simd_float4x4, _ b: simd_float4x4, _ t: Float) -> simd_float4x4 {
+        let qa = simd_quatf(a), qb = simd_quatf(b)
+        let q = simd_slerp(qa, qb, t)
+        var m = simd_float4x4(q)
+        m.columns.3 = a.columns.3 + (b.columns.3 - a.columns.3) * t
+        m.columns.3.w = 1
+        return m
+    }
+
+    private static func clamp(_ value: Float) -> Float { min(max(value, 0), 1) }
+    private static func byte(_ value: Float) -> UInt8 { UInt8((clamp(value) * 255).rounded()) }
+}
+
+/// Joint positions in ARKit world space. The wrist and knuckles define the
+/// controller pose; fingertips may be missing when a fist hides them, and the
+/// gestures that need them then keep their previous state.
+private struct HandJoints {
+    let wrist: SIMD3<Float>
+    let indexKnuckle: SIMD3<Float>
+    let middleKnuckle: SIMD3<Float>
+    let littleKnuckle: SIMD3<Float>
+    let middleMetacarpal: SIMD3<Float>
+    let thumbTip: SIMD3<Float>?
+    let indexTip: SIMD3<Float>?
+    let middleTip: SIMD3<Float>?
+    let ringTip: SIMD3<Float>?
+    let littleTip: SIMD3<Float>?
+    // Fingertip-to-knuckle distance over finger length: 1 straight, lower curled.
+    let indexExtension: Float?
+    let middleExtension: Float?
+    let ringExtension: Float?
+    let littleExtension: Float?
+
+    init?(anchor: HandAnchor, skeleton: HandSkeleton) {
+        let origin = anchor.originFromAnchorTransform
+        func position(_ name: HandSkeleton.JointName) -> SIMD3<Float>? {
+            let joint = skeleton.joint(name)
+            guard joint.isTracked else { return nil }
+            let p = (origin * joint.anchorFromJointTransform).columns.3
+            return SIMD3<Float>(p.x, p.y, p.z)
+        }
+        func fingerExtension(_ knuckle: HandSkeleton.JointName, _ base: HandSkeleton.JointName,
+                             _ middle: HandSkeleton.JointName, _ tip: HandSkeleton.JointName) -> Float? {
+            guard let k = position(knuckle), let b = position(base),
+                  let m = position(middle), let t = position(tip) else { return nil }
+            let length = simd_distance(k, b) + simd_distance(b, m) + simd_distance(m, t)
+            guard length > 0.02 else { return nil }
+            return simd_distance(k, t) / length
+        }
+        guard let wrist = position(.wrist),
+              let indexKnuckle = position(.indexFingerKnuckle),
+              let middleKnuckle = position(.middleFingerKnuckle),
+              let littleKnuckle = position(.littleFingerKnuckle),
+              let middleMetacarpal = position(.middleFingerMetacarpal)
+        else { return nil }
+        self.wrist = wrist
+        self.indexKnuckle = indexKnuckle
+        self.middleKnuckle = middleKnuckle
+        self.littleKnuckle = littleKnuckle
+        self.middleMetacarpal = middleMetacarpal
+        thumbTip = position(.thumbTip)
+        indexTip = position(.indexFingerTip)
+        middleTip = position(.middleFingerTip)
+        ringTip = position(.ringFingerTip)
+        littleTip = position(.littleFingerTip)
+        indexExtension = fingerExtension(.indexFingerKnuckle, .indexFingerIntermediateBase,
+                                         .indexFingerIntermediateTip, .indexFingerTip)
+        middleExtension = fingerExtension(.middleFingerKnuckle, .middleFingerIntermediateBase,
+                                          .middleFingerIntermediateTip, .middleFingerTip)
+        ringExtension = fingerExtension(.ringFingerKnuckle, .ringFingerIntermediateBase,
+                                        .ringFingerIntermediateTip, .ringFingerTip)
+        littleExtension = fingerExtension(.littleFingerKnuckle, .littleFingerIntermediateBase,
+                                          .littleFingerIntermediateTip, .littleFingerTip)
+    }
+
+    func thumbDistance(to tip: SIMD3<Float>?) -> Float? {
+        guard let thumbTip, let tip else { return nil }
+        return simd_distance(thumbTip, tip)
+    }
+}
+
+@MainActor
+final class VisionTrackingManager: ObservableObject {
+    @Published private(set) var status = "開始ボタンを押すとトラッキングを開始します。"
+    @Published private(set) var inputStatus = "入力待ち"
+    @Published private(set) var handPositionStatus = "手の位置待ち"
+    @Published private(set) var latencyStatus = "映像待ち"
+    @Published private(set) var controllerStatus = "未接続（ハンドジェスチャーで操作）"
+
+    private var session = ARKitSession()
+    let deviceAnchorHistory = DeviceAnchorHistory()
+    let projectionTangents = VisionProjectionTangents()
+    let sampler: VRPoseSampler
+    private var isRunning = false
+
+    init() {
+        sampler = VRPoseSampler(history: deviceAnchorHistory, projectionTangents: projectionTangents)
+    }
+
+    func start(send: @escaping (Data) -> Void) async -> Bool {
+        guard !isRunning else { return true }
+
+        guard WorldTrackingProvider.isSupported else {
+            status = "このVision Proではワールドトラッキングを利用できません。"
+            return false
+        }
+        guard HandTrackingProvider.isSupported else {
+            status = "このVision Proでは手のトラッキングを利用できません。"
+            return false
+        }
+
+        // ARKit runs a data provider only once, so make new ones for each start.
+        let worldTracking = WorldTrackingProvider()
+        let handTracking = HandTrackingProvider()
+        session = ARKitSession()
+        do {
+            let requiredAuthorizations = HandTrackingProvider.requiredAuthorizations
+            let authorization = await session.requestAuthorization(for: requiredAuthorizations)
+            let denied = requiredAuthorizations.filter { authorization[$0] != .allowed }
+            guard denied.isEmpty else {
+                status = "手の追跡が許可されていません。Vision Proの「設定 > プライバシーとセキュリティ > 手のトラッキング」でMBP AVP VRを許可してください。"
+                return false
+            }
+            try await session.run([worldTracking, handTracking])
+        } catch {
+            status = "ARKitを開始できませんでした: \(error.localizedDescription)"
+            print("Vision tracking start failed: \(error)")
+            session.stop()
+            return false
+        }
+
+        sampler.activate(worldTracking: worldTracking, handTracking: handTracking, send: send) { [weak self] snapshot in
+            Task { @MainActor [weak self] in self?.apply(snapshot) }
+        }
+        isRunning = true
+        status = "ARKitを起動しました。頭と手を追跡しています。"
+        return true
+    }
+
+    func stop() {
+        sampler.deactivate()
+        session.stop()
+        isRunning = false
+        status = "トラッキング停止中"
+        inputStatus = "入力待ち"
+        handPositionStatus = "手の位置待ち"
+        latencyStatus = "映像待ち"
+    }
+
+    private func apply(_ snapshot: VRTrackingSnapshot) {
+        guard isRunning else { return }
+        if status != snapshot.status { status = snapshot.status }
+        if inputStatus != snapshot.inputStatus { inputStatus = snapshot.inputStatus }
+        if handPositionStatus != snapshot.handPositionStatus { handPositionStatus = snapshot.handPositionStatus }
+        if latencyStatus != snapshot.latencyStatus { latencyStatus = snapshot.latencyStatus }
+        if controllerStatus != snapshot.controllerStatus { controllerStatus = snapshot.controllerStatus }
     }
 }
