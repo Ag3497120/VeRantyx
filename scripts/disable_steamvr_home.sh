@@ -25,7 +25,7 @@ fi
 # floor offset; the headset already supplies floor-level poses, so give
 # SteamVR an identity standing transform and a roomy play area instead.
 python3 - "$CHAPERONE_FILE" "$PLAY_AREA_METERS" <<'PY'
-import json, os, shutil, sys
+import json, os, shutil, sys, time
 path, size = sys.argv[1], float(sys.argv[2])
 half = size / 2
 height = 2.43
@@ -35,7 +35,8 @@ for i in range(4):
     (x0, z0), (x1, z1) = corners[i], corners[(i + 1) % 4]
     bounds.append([[x0, 0, z0], [x0, height, z0], [x1, height, z1], [x1, 0, z1]])
 wanted = {"collision_bounds": bounds, "play_area": [size, size],
-          "standing": {"translation": [0, 0, 0], "yaw": 0}, "universeID": "1"}
+          "standing": {"translation": [0, 0, 0], "yaw": 0},
+          "time": time.strftime("%a %b %d %H:%M:%S %Y"), "universeID": "1"}
 data = {"jsonid": "chaperone_info", "universes": [wanted], "version": 5}
 if os.path.exists(path):
     try:

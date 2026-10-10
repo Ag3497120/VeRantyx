@@ -93,22 +93,68 @@ Logs are in `logs/` (`hardware-encoder.log` has the pipeline statistics every
 (`drive_c/vr_shared_frame.log` for the driver, `drive_c/vr_openvr_capture_proxy.log`
 for the game-side capture).
 
-## Tuning
+## Mac profiles and tuning
 
-All of these are environment variables for `launch_vision_pro_vr.sh`:
+`launch_vision_pro_vr.sh` first runs `scripts/mac_profile.sh`, which classes
+the Mac by its performance cores, GPU cores and memory and sets defaults for
+it (`./scripts/mac_profile.sh --describe` prints them):
+
+| Tier | Macs | Render scale | Display | HEVC | Stream budget |
+|---|---|---|---|---|---|
+| high | Max/Ultra: 8+ performance cores, 24+ GPU cores, 32+ GB | 0.55 | 60 Hz | 20 Mbps | 1920x1080 |
+| mid | Pro chips; base M3/M4 with 16+ GB | 0.45 | 60 Hz | 16 Mbps | 1728x972 |
+| low | base M1/M2, under 16 GB | 0.35 | 45 Hz | 12 Mbps | 1440x810, Alyx fidelity level 2 |
+
+Any variable you set yourself overrides the profile. The game is CPU-bound
+under Wine on every tier, so the profile mainly trades resolution and
+display rate for frame rate; the encoder then adapts on its own:
+
+- frame conversion runs on the GPU (Metal) or the CPU (vImage), whichever
+  timed faster on the first frames (`VERANTYX_GPU_CONVERT=auto`);
+- the HEVC bitrate drops by 20 % whenever the link loses packets (the
+  headset reports incomplete frames and gaps, the Mac counts send errors)
+  and climbs back 10 % per clean 30 s up to the ceiling.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `VERANTYX_RENDER_TARGET_SCALE` | 0.55 | SteamVR render resolution (area scale, like SteamVR's custom resolution). Applied at the next SteamVR start |
-| `VERANTYX_DISPLAY_HZ` | 60 | Virtual display refresh; lower is less compositor CPU |
-| `VERANTYX_BITRATE_MBPS` | 20 | HEVC bitrate |
-| `VERANTYX_STREAM_WIDTH` x `VERANTYX_STREAM_HEIGHT` | 1920x1080 | Pixel budget for both eyes; the aspect follows the headset's frustum |
+| `VERANTYX_RENDER_TARGET_SCALE` | profile | SteamVR render resolution (area scale, like SteamVR's custom resolution). Applied at the next SteamVR start |
+| `VERANTYX_DISPLAY_HZ` | profile | Virtual display refresh. The game's frame rate quantizes to whole display frames (60 Hz: 60, 30, 20, 15 fps), and the compositor costs CPU per display frame |
+| `VERANTYX_BITRATE_MBPS` | profile | HEVC bitrate ceiling; `VERANTYX_BITRATE_MIN_MBPS` (40 % of it) is the floor, `VERANTYX_ADAPTIVE_BITRATE=0` fixes it |
+| `VERANTYX_STREAM_WIDTH` x `VERANTYX_STREAM_HEIGHT` | profile | Pixel budget for both eyes; the aspect follows the headset's frustum |
 | `VERANTYX_SEND_PACING_MBPS` | 60 | UDP burst pacing |
 | `VERANTYX_KEYFRAME_INTERVAL` | 3 | Seconds between safety keyframes |
-| `VERANTYX_GPU_CONVERT` | 1 | Scale/convert frames on the GPU (Metal); 0 uses vImage on the CPU |
+| `VERANTYX_GPU_CONVERT` | auto | 1 forces Metal, 0 forces vImage on the CPU |
 | `VERANTYX_AUDIO` | 1 | Stream the Mac's audio to the headset (Mac speakers are muted meanwhile); `VERANTYX_AUDIO_KEEP_MAC_SPEAKERS=1` keeps them on |
 | `VERANTYX_LOW_LATENCY_ENCODER` | 0 | VideoToolbox low-latency rate control (slower on M1 Max) |
-| `HLA_FIDELITY_LEVEL` | unset | Adds Alyx's `vr_fidelity_level` console variables |
+| `HLA_FIDELITY_LEVEL` | profile | Adds Alyx's `vr_fidelity_level` console variables (0–8); unset lets Alyx choose |
+
+### Measuring on your Mac
+
+`scripts/bench_alyx.sh` runs the whole pipeline without a headset (the driver
+publishes a synthetic head that looks around and two hands), loads a map and
+measures the game's submit rate, CPU per process and per game thread, and
+GPU utilization for a minute:
+
+```bash
+./scripts/bench_alyx.sh baseline
+./scripts/bench_alyx.sh hz90 VERANTYX_DISPLAY_HZ=90
+./scripts/bench_alyx.sh scale07 VERANTYX_RENDER_TARGET_SCALE=0.7
+```
+
+Reports land in `logs/bench/`. `VERANTYX_BENCH_MAP` (default `a1_intro_world`),
+`BENCH_SECONDS` (60) and `BENCH_WARMUP_SECONDS` (20) adjust the run. The
+script restarts SteamVR for every run and stops it afterwards, since a
+SteamVR started this way keeps publishing synthetic poses whenever the
+headset pauses; `BENCH_REUSE_STEAMVR=1` and `BENCH_KEEP_STEAMVR=1` keep one
+SteamVR across runs.
+
+Known limits of the bench (2026-10-10): the first scene application after a
+SteamVR start gets no scene focus from SteamVR in this setup (the second one
+does, so reuse SteamVR for a second pass), and without a headset Alyx stays
+in its "paused" state after the map's first frame, so the measurement covers
+startup, loading and the first frame but not sustained gameplay yet. The
+CPU/GPU split, per-process load and the startup path are measured as
+intended; gameplay frame-rate comparisons still need the headset.
 
 ## Floor height and recentering
 
@@ -126,4 +172,5 @@ area, replacing the 1x1 m one that SteamVR's room setup wrote.
 - **Game audio permission**: the first run asks for *System Audio Recording* permission for your terminal. Allow it and run the script again.
 - **The game starts at its highest resolution**: it was started by Steam before the script's launch options applied. The script stores the options in Steam's `localconfig.vdf` (while Steam is not running) and restarts such a game.
 - **The Vision Pro app shows a green screen**: no video has arrived yet; it clears as soon as frames decode.
+- **The game froze on a loading screen and quit a minute later**: SteamVR's compositor never accepts this game's `Submit` (the texture cannot be shared across Wine processes), so during a long level load it decided the game was not responding, took its scene focus away and answered `WaitGetPoses` with `DoNotHaveFocus`; Alyx then waited for focus that only an accepted `Submit` returns. The capture proxy now does two things: it answers those `WaitGetPoses` calls itself with the headset's poses (logged as "SteamVR reports no scene focus" in `drive_c/vr_openvr_capture_proxy.log`) so the game keeps rendering, and it gives SteamVR a stand-in shared handle for each submitted texture (the compositor-side D3D11 proxy turns it into a placeholder texture), so `Submit` is accepted and SteamVR sees the game rendering again. `VERANTYX_FAKE_SHARED_HANDLE=0` disables the second part. The game is also started with `+engine_no_focus_sleep 0` (`HLA_EXTRA_OPTIONS` replaces that).
 - **Hand pose offset**: hand tracking places the virtual Touch controller where a hand holding one would be. If the game's hands are offset, adjust the `openxr_grip` rotation/offset in `VisionTrackingManager.swift` (`touchRawPose`).

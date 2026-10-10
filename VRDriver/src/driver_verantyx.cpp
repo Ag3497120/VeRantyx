@@ -18,7 +18,9 @@
 void LogDriver(const char* msg) {
     FILE* f = fopen("C:\\vr_shared_frame.log", "a");
     if (f) {
-        fprintf(f, "%s\n", msg);
+        SYSTEMTIME now = {};
+        GetLocalTime(&now);
+        fprintf(f, "%02u:%02u:%02u.%03u %s\n", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, msg);
         fclose(f);
     }
 }
@@ -1349,6 +1351,36 @@ public:
         }
     }
 
+    // VERANTYX_BENCH=1: with no headset connected, publish a standing head
+    // that slowly looks around and two hands in front of it, so the game can
+    // be run and measured without anyone wearing the Vision Pro. Real headset
+    // poses take over as soon as they arrive.
+    static void MakeBenchHands(SharedHands* hands, double seconds) {
+        *hands = {};
+        const float yaw = 0.35f * sinf((float)seconds * 0.4f);
+        const float pitch = 0.08f * sinf((float)seconds * 0.9f);
+        const float cy = cosf(yaw), sy = sinf(yaw), cp = cosf(pitch), sp = sinf(pitch);
+        // Column-major yaw*pitch rotation, SteamVR axes (x right, y up, -z forward).
+        float* h = hands->headTransform;
+        h[0] = cy;      h[1] = 0.0f; h[2] = -sy;     h[3] = 0.0f;
+        h[4] = sy * sp; h[5] = cp;   h[6] = cy * sp; h[7] = 0.0f;
+        h[8] = sy * cp; h[9] = -sp;  h[10] = cy * cp; h[11] = 0.0f;
+        h[12] = 0.02f * sinf((float)seconds * 0.7f); h[13] = 1.65f; h[14] = 0.0f; h[15] = 1.0f;
+        const float handOffsets[2][3] = { { -0.22f, 1.25f, -0.38f }, { 0.22f, 1.25f, -0.38f } };
+        float* handTransforms[2] = { hands->leftTransform, hands->rightTransform };
+        for (int hand = 0; hand < 2; ++hand) {
+            float* m = handTransforms[hand];
+            m[0] = 1.0f; m[5] = 1.0f; m[10] = 1.0f; m[15] = 1.0f;
+            m[12] = handOffsets[hand][0] + 0.03f * sinf((float)seconds * 1.3f + hand);
+            m[13] = handOffsets[hand][1] + 0.02f * cosf((float)seconds * 1.1f);
+            m[14] = handOffsets[hand][2];
+        }
+        hands->headTracked = 1;
+        hands->leftTracked = 1;
+        hands->rightTracked = 1;
+        hands->visionTimestamp = seconds;
+    }
+
     void PoseLoop() {
         LONG lastSequence = 0;
         bool hasSequence = false;
@@ -1358,6 +1390,10 @@ public:
         SharedHands latest = {};
         bool hasLatest = false;
         uint64_t publishedPoses = 0;
+        const bool benchMode = ReadEnvironmentNumber("VERANTYX_BENCH", 0.0, 0.0, 1.0) >= 1.0;
+        bool benchActive = false;
+        ULONGLONG lastBenchMs = 0;
+        if (benchMode) LogDriver("[Verantyx] VERANTYX_BENCH=1: synthetic poses will be published while no headset sends any");
         while (!m_stopPoseThread.load()) {
             if (!InitSharedMemoryDriver()) {
                 Sleep(100);
@@ -1383,6 +1419,25 @@ public:
                     hasLatest = true;
                 }
             }
+            if (benchMode) {
+                if (newPose && benchActive) {
+                    benchActive = false;
+                    LogDriver("[Verantyx] Bench mode: headset poses arrived; synthetic poses stopped");
+                } else if (!newPose && (lastAdvanceMs == 0 || nowMs - lastAdvanceMs >= 1000 || benchActive) &&
+                           nowMs - lastBenchMs >= 11) {
+                    if (!benchActive) {
+                        benchActive = true;
+                        LogDriver("[Verantyx] Bench mode: no headset poses; publishing synthetic head and hand poses");
+                    }
+                    MakeBenchHands(&latest, (double)nowMs / 1000.0);
+                    lastBenchMs = nowMs;
+                    lastTimestamp = latest.visionTimestamp;
+                    lastAdvanceMs = nowMs;
+                    hasLatest = true;
+                    newInput = true;
+                    newPose = true;
+                }
+            }
             const bool fresh = lastAdvanceMs != 0 && nowMs - lastAdvanceMs < 500;
             // Republish periodically so SteamVR sees hands drop out once the
             // headset stops sending, even when no new packet arrives.
@@ -1397,7 +1452,7 @@ public:
                 }
             }
             if (m_pHmd && m_pHmd->m_ready.load()) m_pHmd->UpdatePresence(newInput ? &latest : nullptr);
-            if (newPose) PersistLiveTangents(latest);
+            if (newPose && !benchActive) PersistLiveTangents(latest);
             PublishEffectiveTangents();
             Sleep(1);
         }

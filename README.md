@@ -157,10 +157,22 @@ audio, GPU frame conversion and the one-command setup. All of it was built
 from scratch by the author with these models; no code from other projects is
 used apart from Valve's OpenVR headers.
 
+## Other Macs
+
+`scripts/mac_profile.sh` classes the Mac (performance cores, GPU cores,
+memory) into a tier and the launch script takes that tier's defaults for the
+SteamVR render scale, virtual display rate, bitrate and stream size; the
+encoder picks GPU or CPU frame conversion by timing both and lowers the
+bitrate while the Wi-Fi link loses packets. `scripts/bench_alyx.sh` measures
+the game's frame rate and the CPU/GPU load on any Mac without a headset, so
+settings can be compared before playing. See
+[docs/SETUP.md](docs/SETUP.md#mac-profiles-and-tuning).
+
 ## Status and limits
 
 - Verified: SteamVR + Half-Life: Alyx on the Mac above, streaming to a Vision Pro,
-  playing with Joy-Con. Other games and other Macs are untested.
+  playing with Joy-Con. Other games and other Macs are untested; the Mac
+  profiles are derived from this machine's measurements.
 - Gravity gloves: the wrist-flick velocity path is implemented (Joy-Con gyro and
   accelerometer fused into the controller velocity) but not yet verified in
   game.

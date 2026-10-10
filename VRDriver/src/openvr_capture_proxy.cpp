@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <math.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -153,6 +154,20 @@ static uint64_t g_renderPoseCapturedAt = 0;
 static volatile LONG g_submitThreadId = 0;
 static LONG g_renderPoseMatched = 0;
 static LONG g_renderPoseFallback = 0;
+// SteamVR's compositor never accepts this game's Submit (the shared texture
+// cannot be opened across Wine processes), so during a long level load it
+// decides the game is not responding, takes its scene focus away and answers
+// WaitGetPoses with DoNotHaveFocus. Alyx then stops rendering until focus
+// returns, which it never does because focus returns on the next accepted
+// Submit. The game still has to see poses, so the proxy answers those calls
+// itself from the last good set plus the headset's current pose.
+static SRWLOCK g_lastPosesLock = SRWLOCK_INIT;
+static vr::TrackedDevicePose_t g_lastRenderPoses[vr::k_unMaxTrackedDeviceCount] = {};
+static uint32_t g_lastRenderPoseCount = 0;
+static int g_leftHandDeviceIndex = -1;
+static int g_rightHandDeviceIndex = -1;
+static LONG g_focusLossCount = 0;
+static uint64_t g_lastWaitReturnTicks = 0;
 struct CaptureMetrics {
     uint64_t windowStart = 0;
     uint64_t submitted = 0;
@@ -794,6 +809,101 @@ static CompositorHook* FindCompositorHook(void* self) {
     return nullptr;
 }
 
+static void ColumnMajorToHmdMatrix(const float* m, vr::HmdMatrix34_t* out) {
+    for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 3; ++column) out->m[row][column] = m[column * 4 + row];
+        out->m[row][3] = m[12 + row];
+    }
+}
+
+static bool TransformIsFinite(const float* m) {
+    for (int i = 0; i < 16; ++i) {
+        if (!std::isfinite(m[i])) return false;
+    }
+    return true;
+}
+
+static double DisplayPeriodSeconds() {
+    static const double period = []() {
+        char value[32] = {};
+        const DWORD length = GetEnvironmentVariableA("VERANTYX_DISPLAY_HZ", value, sizeof(value));
+        double hz = 60.0;
+        if (length > 0 && length < sizeof(value)) {
+            const double parsed = strtod(value, nullptr);
+            if (std::isfinite(parsed) && parsed >= 30.0 && parsed <= 144.0) hz = parsed;
+        }
+        return 1.0 / hz;
+    }();
+    return period;
+}
+
+// Remembers the last pose set SteamVR returned and which device indices are
+// the two hands (by position, since the game process does not see the driver).
+static void RememberRenderPoses(const vr::TrackedDevicePose_t* renderPoses, uint32_t renderPoseCount) {
+    if (!renderPoses || renderPoseCount == 0) return;
+    const uint32_t count = renderPoseCount < vr::k_unMaxTrackedDeviceCount ? renderPoseCount : vr::k_unMaxTrackedDeviceCount;
+    SharedHands hands = {};
+    const bool haveHands = ReadSharedHandsSnapshot(&hands);
+    AcquireSRWLockExclusive(&g_lastPosesLock);
+    memcpy(g_lastRenderPoses, renderPoses, count * sizeof(vr::TrackedDevicePose_t));
+    g_lastRenderPoseCount = count;
+    if (haveHands) {
+        for (uint32_t i = 1; i < count; ++i) {
+            const vr::TrackedDevicePose_t& pose = renderPoses[i];
+            if (!pose.bDeviceIsConnected || !pose.bPoseIsValid) continue;
+            const float* candidates[2] = { hands.leftTransform, hands.rightTransform };
+            const uint8_t tracked[2] = { hands.leftTracked, hands.rightTracked };
+            for (int hand = 0; hand < 2; ++hand) {
+                if (!tracked[hand] || !TransformIsFinite(candidates[hand])) continue;
+                double error = 0.0;
+                for (int row = 0; row < 3; ++row) {
+                    const double delta = pose.mDeviceToAbsoluteTracking.m[row][3] - candidates[hand][12 + row];
+                    error += delta * delta;
+                }
+                if (sqrt(error) < 0.01) (hand == 0 ? g_leftHandDeviceIndex : g_rightHandDeviceIndex) = (int)i;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_lastPosesLock);
+}
+
+// Answers WaitGetPoses while SteamVR withholds focus: the last good set with
+// the HMD and hands replaced by the headset's current shared-memory poses.
+static void SynthesizePoses(vr::TrackedDevicePose_t* poses, uint32_t poseCount) {
+    if (!poses || poseCount == 0) return;
+    const uint32_t count = poseCount < vr::k_unMaxTrackedDeviceCount ? poseCount : vr::k_unMaxTrackedDeviceCount;
+    AcquireSRWLockShared(&g_lastPosesLock);
+    const uint32_t cached = g_lastRenderPoseCount < count ? g_lastRenderPoseCount : count;
+    memcpy(poses, g_lastRenderPoses, cached * sizeof(vr::TrackedDevicePose_t));
+    const int leftIndex = g_leftHandDeviceIndex;
+    const int rightIndex = g_rightHandDeviceIndex;
+    ReleaseSRWLockShared(&g_lastPosesLock);
+    for (uint32_t i = cached; i < count; ++i) poses[i] = {};
+    SharedHands hands = {};
+    if (!ReadSharedHandsSnapshot(&hands)) return;
+    struct Target { int index; const float* transform; bool tracked; };
+    const Target targets[3] = {
+        { 0, hands.headTransform, hands.headTracked != 0 },
+        { leftIndex, hands.leftTransform, hands.leftTracked != 0 },
+        { rightIndex, hands.rightTransform, hands.rightTracked != 0 },
+    };
+    for (const Target& target : targets) {
+        if (target.index < 0 || (uint32_t)target.index >= count) continue;
+        vr::TrackedDevicePose_t& pose = poses[target.index];
+        pose.bDeviceIsConnected = true;
+        if (!target.tracked || !TransformIsFinite(target.transform)) {
+            pose.bPoseIsValid = false;
+            pose.eTrackingResult = vr::TrackingResult_Running_OutOfRange;
+            continue;
+        }
+        ColumnMajorToHmdMatrix(target.transform, &pose.mDeviceToAbsoluteTracking);
+        memset(pose.vVelocity.v, 0, sizeof(pose.vVelocity.v));
+        memset(pose.vAngularVelocity.v, 0, sizeof(pose.vAngularVelocity.v));
+        pose.eTrackingResult = vr::TrackingResult_Running_OK;
+        pose.bPoseIsValid = true;
+    }
+}
+
 static vr::EVRCompositorError VR_CALLTYPE HookedWaitGetPoses(void* self,
     vr::TrackedDevicePose_t* renderPoses, uint32_t renderPoseCount,
     vr::TrackedDevicePose_t* gamePoses, uint32_t gamePoseCount) {
@@ -805,6 +915,29 @@ static vr::EVRCompositorError VR_CALLTYPE HookedWaitGetPoses(void* self,
         : vr::VRCompositorError_RequestFailed;
     InterlockedExchangeAdd64(&g_waitPoseTicks, (LONG64)(PerformanceTicks() - waitStart));
     InterlockedIncrement64(&g_waitPoseCalls);
+    if (result == vr::VRCompositorError_None) {
+        RememberRenderPoses(renderPoses, renderPoseCount);
+    } else if (result == vr::VRCompositorError_DoNotHaveFocus && InitSharedMemory()) {
+        // The compositor returns at once without focus; keep the game at the
+        // virtual display's rate so it neither spins nor stalls.
+        const double periodMs = DisplayPeriodSeconds() * 1000.0;
+        if (g_lastWaitReturnTicks != 0) {
+            const double sinceLast = TicksToMilliseconds(PerformanceTicks() - g_lastWaitReturnTicks);
+            if (sinceLast < periodMs - 1.0) Sleep((DWORD)(periodMs - sinceLast));
+        }
+        SynthesizePoses(renderPoses, renderPoseCount);
+        SynthesizePoses(gamePoses, gamePoseCount);
+        const LONG lost = InterlockedIncrement(&g_focusLossCount);
+        if (lost <= 8 || lost % 600 == 0) {
+            char message[160];
+            snprintf(message, sizeof(message),
+                "WaitGetPoses: SteamVR reports no scene focus (#%ld); answering with headset poses so the game keeps rendering",
+                lost);
+            Log(message);
+        }
+        result = vr::VRCompositorError_None;
+    }
+    g_lastWaitReturnTicks = PerformanceTicks();
     if (result == vr::VRCompositorError_None) {
         CaptureRenderPose(renderPoses, renderPoseCount);
         // The previous frame's GPU copy has usually finished by running start.
@@ -841,6 +974,121 @@ static void VR_CALLTYPE HookedPostPresentHandoff(void* self) {
     if (hook && hook->postPresentHandoff) hook->postPresentHandoff(self);
 }
 
+// SteamVR's client shares the submitted texture with vrcompositor through
+// its DXGI shared handle. DXVK on macOS cannot export texture memory
+// (VK_KHR_external_memory_win32), so GetSharedHandle fails and every Submit
+// is rejected with TextureUsesUnsupportedFormat; SteamVR then never sees the
+// game render, treats it as not responding during long loads and withholds
+// its scene focus. The compositor-side D3D11 proxy understands a fake handle
+// that encodes the texture's size and format and answers OpenSharedResource
+// with a stand-in texture, so a Submit carrying such a handle succeeds. The
+// compositor's own output is not what the headset shows (this proxy copies
+// the frames in-process), so the stand-in's content does not matter.
+static const uint64_t kFakeSharedTextureTag = 0xBE00000000000000ull;
+static LONG g_nextFakeTextureId = 0;
+typedef HRESULT (STDMETHODCALLTYPE *GetSharedHandleFn)(IDXGIResource*, HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *CreateSharedHandleFn)(IDXGIResource1*, const SECURITY_ATTRIBUTES*, DWORD, LPCWSTR, HANDLE*);
+static GetSharedHandleFn g_originalGetSharedHandle = nullptr;
+static CreateSharedHandleFn g_originalCreateSharedHandle = nullptr;
+static void** g_hookedResourceVtable = nullptr;
+static void** g_hookedResource1Vtable = nullptr;
+static LONG g_fakeHandleLogCount = 0;
+
+static bool FakeSharedHandlesEnabled() {
+    static const bool enabled = []() {
+        char value[8] = {};
+        return !(GetEnvironmentVariableA("VERANTYX_FAKE_SHARED_HANDLE", value, sizeof(value)) > 0 && value[0] == '0');
+    }();
+    return enabled;
+}
+
+static HANDLE MakeFakeSharedTextureHandle(const D3D11_TEXTURE2D_DESC& desc) {
+    uint32_t id = static_cast<uint32_t>(InterlockedIncrement(&g_nextFakeTextureId)) & 0x3FFFFu;
+    if (id == 0) id = static_cast<uint32_t>(InterlockedIncrement(&g_nextFakeTextureId)) & 0x3FFFFu;
+    const uint64_t value = kFakeSharedTextureTag |
+        ((static_cast<uint64_t>(desc.Width - 1) & 0x1FFFu) << 43) |
+        ((static_cast<uint64_t>(desc.Height - 1) & 0x1FFFu) << 30) |
+        ((static_cast<uint64_t>(desc.Format) & 0x00FFu) << 22) |
+        ((static_cast<uint64_t>(desc.SampleDesc.Count) & 0x0Fu) << 18) |
+        id;
+    return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value));
+}
+
+static HRESULT FakeSharedHandleFor(IUnknown* resource, HANDLE* out, const char* api, HRESULT originalResult) {
+    ID3D11Texture2D* texture = nullptr;
+    if (!resource || FAILED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texture)) || !texture) return originalResult;
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    texture->Release();
+    if (desc.Width == 0 || desc.Height == 0 || desc.Format == DXGI_FORMAT_UNKNOWN) return originalResult;
+    *out = MakeFakeSharedTextureHandle(desc);
+    const LONG count = InterlockedIncrement(&g_fakeHandleLogCount);
+    if (count <= 6 || count % 600 == 0) {
+        char message[200];
+        snprintf(message, sizeof(message), "%s failed (0x%08lX); answered with stand-in shared handle %p for %ux%u format=%u (#%ld)",
+            api, (unsigned long)originalResult, *out, desc.Width, desc.Height, (unsigned)desc.Format, count);
+        Log(message);
+    }
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE HookedGetSharedHandle(IDXGIResource* self, HANDLE* out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    const HRESULT result = g_originalGetSharedHandle ? g_originalGetSharedHandle(self, out) : E_NOTIMPL;
+    if (SUCCEEDED(result) && *out) return result;
+    return FakeSharedHandleFor(self, out, "IDXGIResource::GetSharedHandle", result);
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreateSharedHandle(IDXGIResource1* self, const SECURITY_ATTRIBUTES* attributes,
+    DWORD access, LPCWSTR name, HANDLE* out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    const HRESULT result = g_originalCreateSharedHandle ? g_originalCreateSharedHandle(self, attributes, access, name, out) : E_NOTIMPL;
+    if (SUCCEEDED(result) && *out) return result;
+    return FakeSharedHandleFor(self, out, "IDXGIResource1::CreateSharedHandle", result);
+}
+
+static bool PatchVtableEntry(void** vtable, size_t index, void* replacement, void** original) {
+    if (vtable[index] == replacement) return true;
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(&vtable[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
+    if (!*original) *original = vtable[index];
+    vtable[index] = replacement;
+    DWORD ignored = 0;
+    VirtualProtect(&vtable[index], sizeof(void*), oldProtect, &ignored);
+    return true;
+}
+
+// Every DXVK texture shares one IDXGIResource vtable, so patching it once
+// covers each texture the game submits.
+static void InstallSharedHandleHooks(void* textureHandle) {
+    if (!FakeSharedHandlesEnabled() || !textureHandle) return;
+    IUnknown* unknown = static_cast<IUnknown*>(textureHandle);
+    IDXGIResource* resource = nullptr;
+    if (SUCCEEDED(unknown->QueryInterface(__uuidof(IDXGIResource), (void**)&resource)) && resource) {
+        void** vtable = *(void***)resource;
+        if (vtable != g_hookedResourceVtable) {
+            // IUnknown (3) + IDXGIObject (4) + IDXGIDeviceSubObject (1): GetSharedHandle is slot 8.
+            if (PatchVtableEntry(vtable, 8, (void*)&HookedGetSharedHandle, (void**)&g_originalGetSharedHandle)) {
+                g_hookedResourceVtable = vtable;
+                Log("Installed IDXGIResource::GetSharedHandle hook: Submits carry a stand-in handle when DXVK cannot share the texture");
+            }
+        }
+        resource->Release();
+    }
+    IDXGIResource1* resource1 = nullptr;
+    if (SUCCEEDED(unknown->QueryInterface(__uuidof(IDXGIResource1), (void**)&resource1)) && resource1) {
+        void** vtable = *(void***)resource1;
+        if (vtable != g_hookedResource1Vtable) {
+            if (PatchVtableEntry(vtable, 13, (void*)&HookedCreateSharedHandle, (void**)&g_originalCreateSharedHandle)) {
+                g_hookedResource1Vtable = vtable;
+            }
+        }
+        resource1->Release();
+    }
+}
+
 static vr::EVRCompositorError VR_CALLTYPE HookedSubmit(void* self, vr::EVREye eye,
     const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, vr::EVRSubmitFlags flags) {
     LONG hookLogIndex = InterlockedIncrement(&g_submitHookLogCount);
@@ -857,6 +1105,7 @@ static vr::EVRCompositorError VR_CALLTYPE HookedSubmit(void* self, vr::EVREye ey
         Log(message);
     }
     CaptureSubmit(eye, texture, bounds);
+    if (texture && texture->eType == vr::TextureType_DirectX) InstallSharedHandleHooks(texture->handle);
     CompositorHook* hook = FindCompositorHook(self);
     if (hook && hook->submit) {
         vr::Texture_t baseTexture = {};
@@ -941,7 +1190,204 @@ static bool InstallSubmitHook(void* compositor, const char* version) {
     return true;
 }
 
+// IVRSystem hooks. Besides WaitGetPoses, a Source 2 game learns that SteamVR
+// took its focus from IsInputAvailable, ShouldApplicationPause and the focus
+// and dashboard events, and then sleeps instead of rendering. SteamVR never
+// returns focus here (see HookedWaitGetPoses), so those answers are fixed.
+typedef bool (VR_CALLTYPE *PollNextEventFn)(void*, vr::VREvent_t*, uint32_t);
+typedef bool (VR_CALLTYPE *PollNextEventWithPoseFn)(void*, vr::ETrackingUniverseOrigin, vr::VREvent_t*, uint32_t, vr::TrackedDevicePose_t*);
+typedef bool (VR_CALLTYPE *BoolQueryFn)(void*);
+typedef const char* (VR_CALLTYPE *EventNameFn)(void*, vr::EVREventType);
+struct SystemHook {
+    void** vtable;
+    PollNextEventFn pollNextEvent;
+    PollNextEventWithPoseFn pollNextEventWithPose;
+    BoolQueryFn isInputAvailable;
+    BoolQueryFn shouldApplicationPause;
+    BoolQueryFn shouldApplicationReduceRenderingWork;
+};
+static SystemHook g_systemHooks[4] = {};
+static LONG g_systemHookCount = 0;
+static LONG g_suppressedEventCount = 0;
+
+static SystemHook* FindSystemHook(void* self) {
+    if (!self) return nullptr;
+    void** vtable = *(void***)self;
+    const LONG count = InterlockedCompareExchange(&g_systemHookCount, 0, 0);
+    for (LONG i = 0; i < count; ++i) {
+        if (g_systemHooks[i].vtable == vtable) return &g_systemHooks[i];
+    }
+    return nullptr;
+}
+
+static bool IsFocusEvent(uint32_t type) {
+    switch (type) {
+    case vr::VREvent_InputFocusCaptured:            // 400
+    case vr::VREvent_InputFocusChanged:             // 406
+    case vr::VREvent_SceneApplicationStateChanged:  // 412
+    case vr::VREvent_DashboardActivated:            // 502
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void NoteSuppressedEvent(uint32_t type) {
+    const LONG count = InterlockedIncrement(&g_suppressedEventCount);
+    if (count <= 8 || count % 300 == 0) {
+        char message[128];
+        snprintf(message, sizeof(message), "Suppressed SteamVR focus event %u (#%ld); the game keeps running", type, count);
+        Log(message);
+    }
+}
+
+static bool VR_CALLTYPE HookedPollNextEvent(void* self, vr::VREvent_t* event, uint32_t size) {
+    SystemHook* hook = FindSystemHook(self);
+    if (!hook || !hook->pollNextEvent) return false;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        if (!hook->pollNextEvent(self, event, size)) return false;
+        if (!event || !IsFocusEvent(event->eventType)) return true;
+        NoteSuppressedEvent(event->eventType);
+    }
+    return false;
+}
+
+static bool VR_CALLTYPE HookedPollNextEventWithPose(void* self, vr::ETrackingUniverseOrigin origin,
+    vr::VREvent_t* event, uint32_t size, vr::TrackedDevicePose_t* pose) {
+    SystemHook* hook = FindSystemHook(self);
+    if (!hook || !hook->pollNextEventWithPose) return false;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        if (!hook->pollNextEventWithPose(self, origin, event, size, pose)) return false;
+        if (!event || !IsFocusEvent(event->eventType)) return true;
+        NoteSuppressedEvent(event->eventType);
+    }
+    return false;
+}
+
+static bool VR_CALLTYPE HookedIsInputAvailable(void*) { return true; }
+static bool VR_CALLTYPE HookedShouldApplicationPause(void*) { return false; }
+static bool VR_CALLTYPE HookedShouldApplicationReduceRenderingWork(void*) { return false; }
+
 typedef void* (VR_CALLTYPE *GetGenericInterfaceFn)(const char*, vr::EVRInitError*);
+
+// Reads vtable entries without faulting on an unmapped page.
+static bool ReadVtableEntries(void** vtable, void** out, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        MEMORY_BASIC_INFORMATION info = {};
+        if (VirtualQuery(&vtable[i], &info, sizeof(info)) == 0 || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
+        out[i] = vtable[i];
+    }
+    return true;
+}
+
+// The game asks for an IVRSystem version newer than the public SDK, so its
+// slot order is unknown. SteamVR's client builds every version's methods
+// from the same thunks (identical functions are folded), so each slot of a
+// public version with a known layout is matched by pointer against the
+// game's table. Nothing is called until every slot has been found.
+static bool InstallSystemHook(void* system, const char* version) {
+    if (!system || !version) return false;
+    char setting[8] = {};
+    if (GetEnvironmentVariableA("VERANTYX_FOCUS_HOOKS", setting, sizeof(setting)) > 0 && setting[0] == '0') return false;
+    if (FindSystemHook(system)) return true;
+    const LONG count = InterlockedCompareExchange(&g_systemHookCount, 0, 0);
+    if (count >= (LONG)(sizeof(g_systemHooks) / sizeof(g_systemHooks[0]))) return false;
+    HMODULE real = LoadRealOpenVR();
+    GetGenericInterfaceFn getInterface = real ? (GetGenericInterfaceFn)GetProcAddress(real, "VR_GetGenericInterface") : nullptr;
+    if (!getInterface) return false;
+
+    struct KnownLayout { const char* version; size_t pollNextEvent, pollWithPose, isInputAvailable, shouldPause, shouldReduce; };
+    // IVRSystem_021 (this tree's header) and _022 (ResetSeatedZeroPose removed).
+    static const KnownLayout layouts[] = {
+        { "IVRSystem_022", 29, 30, 38, 40, 41 },
+        { "IVRSystem_021", 30, 31, 39, 41, 42 },
+    };
+    const size_t scanCount = 64;
+    void** vtable = *(void***)system;
+    void* entries[scanCount] = {};
+    if (!ReadVtableEntries(vtable, entries, scanCount)) {
+        Log("Not hooking IVRSystem: its vtable could not be read");
+        return false;
+    }
+    auto findSlot = [&](void* pointer) -> int {
+        if (!pointer) return -1;
+        for (size_t i = 0; i < scanCount; ++i) {
+            if (entries[i] == pointer) return (int)i;
+        }
+        return -1;
+    };
+    int poll = -1, pollPose = -1, input = -1, pause = -1, reduce = -1;
+    const char* matchedVersion = nullptr;
+    for (const KnownLayout& layout : layouts) {
+        if (strcmp(layout.version, version) == 0) {
+            poll = (int)layout.pollNextEvent; pollPose = (int)layout.pollWithPose;
+            input = (int)layout.isInputAvailable; pause = (int)layout.shouldPause; reduce = (int)layout.shouldReduce;
+            matchedVersion = layout.version;
+            break;
+        }
+        vr::EVRInitError error = vr::VRInitError_None;
+        void* reference = getInterface(layout.version, &error);
+        if (!reference || error != vr::VRInitError_None) continue;
+        void* referenceEntries[scanCount] = {};
+        if (!ReadVtableEntries(*(void***)reference, referenceEntries, scanCount)) continue;
+        if (*(void***)reference == vtable) {
+            // Same object class: the public layout applies as is.
+            poll = (int)layout.pollNextEvent; pollPose = (int)layout.pollWithPose;
+            input = (int)layout.isInputAvailable; pause = (int)layout.shouldPause; reduce = (int)layout.shouldReduce;
+        } else {
+            poll = findSlot(referenceEntries[layout.pollNextEvent]);
+            pollPose = findSlot(referenceEntries[layout.pollWithPose]);
+            input = findSlot(referenceEntries[layout.isInputAvailable]);
+            pause = findSlot(referenceEntries[layout.shouldPause]);
+            reduce = findSlot(referenceEntries[layout.shouldReduce]);
+        }
+        char message[256];
+        snprintf(message, sizeof(message),
+            "IVRSystem slot map from %s to %s: PollNextEvent=%d PollNextEventWithPose=%d IsInputAvailable=%d ShouldApplicationPause=%d ShouldApplicationReduceRenderingWork=%d",
+            layout.version, version, poll, pollPose, input, pause, reduce);
+        Log(message);
+        if (poll > 0 && pollPose == poll + 1 && input > pollPose && pause == input + 2 && reduce == pause + 1) {
+            matchedVersion = layout.version;
+            break;
+        }
+        poll = pollPose = input = pause = reduce = -1;
+    }
+    if (!matchedVersion) {
+        char message[160];
+        snprintf(message, sizeof(message), "Not hooking %s: no public IVRSystem layout matched its vtable; focus hooks disabled", version);
+        Log(message);
+        return false;
+    }
+    const size_t first = (size_t)poll, last = (size_t)reduce;
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(&vtable[first], sizeof(void*) * (last - first + 1), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        Log("ERROR: VirtualProtect failed for IVRSystem vtable entries");
+        return false;
+    }
+    SystemHook& hook = g_systemHooks[count];
+    hook.vtable = vtable;
+    hook.pollNextEvent = (PollNextEventFn)vtable[poll];
+    hook.pollNextEventWithPose = (PollNextEventWithPoseFn)vtable[pollPose];
+    hook.isInputAvailable = (BoolQueryFn)vtable[input];
+    hook.shouldApplicationPause = (BoolQueryFn)vtable[pause];
+    hook.shouldApplicationReduceRenderingWork = (BoolQueryFn)vtable[reduce];
+    vtable[poll] = (void*)&HookedPollNextEvent;
+    vtable[pollPose] = (void*)&HookedPollNextEventWithPose;
+    vtable[input] = (void*)&HookedIsInputAvailable;
+    vtable[pause] = (void*)&HookedShouldApplicationPause;
+    vtable[reduce] = (void*)&HookedShouldApplicationReduceRenderingWork;
+    DWORD ignored = 0;
+    VirtualProtect(&vtable[first], sizeof(void*) * (last - first + 1), oldProtect, &ignored);
+    MemoryBarrier();
+    InterlockedExchange(&g_systemHookCount, count + 1);
+    char message[200];
+    snprintf(message, sizeof(message), "Installed IVRSystem focus hooks for %s (layout of %s) object=%p vtable=%p",
+        version, matchedVersion, system, vtable);
+    Log(message);
+    return true;
+}
+
 typedef uint32_t (VR_CALLTYPE *InitInternalFn)(vr::EVRInitError*, vr::EVRApplicationType);
 typedef uint32_t (VR_CALLTYPE *InitInternal2Fn)(vr::EVRInitError*, vr::EVRApplicationType, const char*);
 typedef void (VR_CALLTYPE *ShutdownInternalFn)();
@@ -960,6 +1406,7 @@ extern "C" __declspec(dllexport) void* VR_CALLTYPE VR_GetGenericInterface(const 
         Log(message);
     }
     if (version && strstr(version, "IVRCompositor") && result) InstallSubmitHook(result, version);
+    if (version && strncmp(version, "IVRSystem_", 10) == 0 && result) InstallSystemHook(result, version);
     return result;
 }
 

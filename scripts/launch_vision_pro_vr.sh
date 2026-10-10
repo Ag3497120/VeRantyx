@@ -33,6 +33,17 @@ VR_SERVER_LOG="$STEAM_LOG_DIR/vrserver.txt"
 GAME_CAPTURE_LOG="$WINEPREFIX/drive_c/vr_openvr_capture_proxy.log"
 DXVK_LOG_DIR="${DXVK_LOG_DIR:-$LOG_DIR/dxvk}"
 USE_DXVK="${VERANTYX_USE_DXVK:-1}"
+# VERANTYX_BENCH=1 runs the game without a headset: the driver publishes
+# synthetic poses and this script does not wait for the Vision Pro app.
+# VERANTYX_BENCH_MAP loads that map straight away (scripts/bench_alyx.sh).
+VERANTYX_BENCH="${VERANTYX_BENCH:-0}"
+export VERANTYX_BENCH
+# Defaults for this Mac's hardware class (scripts/mac_profile.sh); anything
+# already set in the environment wins. VERANTYX_MAC_PROFILE=0 skips it.
+if [[ "${VERANTYX_MAC_PROFILE:-1}" == "1" ]]; then
+    eval "$("$REPO_ROOT/scripts/mac_profile.sh")"
+    echo "Mac profile: $("$REPO_ROOT/scripts/mac_profile.sh" --describe | sed -n 2p | sed 's/Tier: //') tier (render scale $VERANTYX_RENDER_TARGET_SCALE, display $VERANTYX_DISPLAY_HZ Hz, HEVC $VERANTYX_BITRATE_MBPS Mbps, stream ${VERANTYX_STREAM_WIDTH}x${VERANTYX_STREAM_HEIGHT}${HLA_FIDELITY_LEVEL:+, Alyx fidelity $HLA_FIDELITY_LEVEL})"
+fi
 
 if [[ ! -x "$WINE_BIN" ]]; then
     echo "Project Windows runtime launcher was not found: $WINE_BIN" >&2
@@ -279,6 +290,18 @@ fi
 STEAMVR_ALREADY_RUNNING=0
 driver_ready=0
 compositor_ready=0
+if pgrep -f '[v]rserver\.exe' >/dev/null 2>&1 && [[ "$VERANTYX_BENCH" != "1" ]] && \
+    [[ -f "$DRIVER_LOG" ]] && grep -q 'VERANTYX_BENCH=1' "$DRIVER_LOG"; then
+    # A SteamVR left over from scripts/bench_alyx.sh would keep publishing
+    # synthetic poses whenever the headset pauses. Start a fresh one.
+    echo "Stopping the SteamVR session that scripts/bench_alyx.sh started."
+    pkill -TERM -f '[v]rstartup\.exe|[v]rmonitor\.exe|[v]rserver\.exe|[v]rcompositor\.exe|[v]rwebhelper|[v]rdashboard' 2>/dev/null || true
+    for ((waited = 0; waited < 20; waited++)); do
+        pgrep -f '[v]rserver\.exe|[v]rcompositor\.exe' >/dev/null 2>&1 || break
+        sleep 1
+    done
+    pkill -KILL -f '[v]rserver\.exe|[v]rcompositor\.exe|[v]rmonitor\.exe' 2>/dev/null || true
+fi
 if pgrep -f '[v]rserver\.exe' >/dev/null 2>&1 || pgrep -f '[v]rcompositor\.exe' >/dev/null 2>&1; then
     if steamvr_is_already_ready; then
         STEAMVR_ALREADY_RUNNING=1
@@ -357,7 +380,9 @@ if [[ "${STEAMVR_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
-if [[ "${WAIT_FOR_VISION_PRO_TRACKING:-1}" == "1" ]]; then
+if [[ "$VERANTYX_BENCH" == "1" ]]; then
+    echo "VERANTYX_BENCH=1: not waiting for the Vision Pro app; the driver supplies synthetic poses."
+elif [[ "${WAIT_FOR_VISION_PRO_TRACKING:-1}" == "1" ]]; then
     VISION_TRACKING_TIMEOUT="${VISION_TRACKING_TIMEOUT:-1200}"
     echo "Waiting for the Vision Pro app to send its first tracked pose before launching Half-Life: Alyx."
     pose_ready=0
@@ -525,7 +550,18 @@ if (( ${#HLA_FIDELITY_OPTIONS[@]} > 0 )); then
     echo "Requesting Alyx fidelity level $HLA_FIDELITY_LEVEL with automatic fidelity off."
     fidelity_retry_available=1
 fi
-launch_alyx "${HLA_BASE_OPTIONS[@]}" ${HLA_FIDELITY_OPTIONS[@]+"${HLA_FIDELITY_OPTIONS[@]}"}
+HLA_BENCH_OPTIONS=()
+if [[ "$VERANTYX_BENCH" == "1" && -n "${VERANTYX_BENCH_MAP:-}" ]]; then
+    HLA_BENCH_OPTIONS=(+map "$VERANTYX_BENCH_MAP")
+    echo "Bench: loading map $VERANTYX_BENCH_MAP at startup."
+fi
+# Source stops rendering while its window is unfocused unless told otherwise;
+# nothing focuses the Wine window when the game is started from a script.
+# HLA_EXTRA_OPTIONS appends further launch options (space separated).
+HLA_EXTRA_OPTIONS_ARRAY=()
+read -r -a HLA_EXTRA_OPTIONS_ARRAY <<< "${HLA_EXTRA_OPTIONS:-+engine_no_focus_sleep 0}"
+launch_alyx "${HLA_BASE_OPTIONS[@]}" ${HLA_FIDELITY_OPTIONS[@]+"${HLA_FIDELITY_OPTIONS[@]}"} \
+    ${HLA_BENCH_OPTIONS[@]+"${HLA_BENCH_OPTIONS[@]}"} ${HLA_EXTRA_OPTIONS_ARRAY[@]+"${HLA_EXTRA_OPTIONS_ARRAY[@]}"}
 
 # Alyx can exit with code 1 and have Steam start it again. Follow the new
 # process instead of treating that as a failed launch and stopping the encoder.

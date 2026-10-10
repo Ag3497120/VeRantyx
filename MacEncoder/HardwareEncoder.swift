@@ -451,6 +451,70 @@ func createCompressionSession(width: Int32, height: Int32, lowLatency: Bool) -> 
                                             compressionSessionOut: &compressionSession)
 }
 
+// Lowers the HEVC bitrate while the link loses packets (the headset's
+// incomplete-frame and gap counters, or local send errors) and raises it back
+// slowly once the link has been clean for a while. VERANTYX_BITRATE_MBPS is
+// the ceiling, VERANTYX_BITRATE_MIN_MBPS the floor; VERANTYX_ADAPTIVE_BITRATE=0
+// keeps the ceiling fixed.
+final class AdaptiveBitrate {
+    let maximum: Int32
+    let minimum: Int32
+    private(set) var current: Int32
+    private let enabled = ProcessInfo.processInfo.environment["VERANTYX_ADAPTIVE_BITRATE"] != "0"
+    private let lock = NSLock()
+    private var headsetLossTotal = 0      // incomplete + gaps reported by the headset
+    private var headsetLossAtLastCheck = 0
+    private var cleanSeconds: TimeInterval = 0
+
+    init(maximum: Int32) {
+        self.maximum = maximum
+        let floor = environmentDouble("VERANTYX_BITRATE_MIN_MBPS", default: max(4, Double(maximum) / 1_000_000 * 0.4), range: 1...80)
+        self.minimum = min(maximum, Int32(floor * 1_000_000))
+        self.current = maximum
+    }
+
+    func noteHeadsetStatistics(_ message: String) {
+        var total = 0
+        for key in ["incomplete=", "gaps="] {
+            guard let range = message.range(of: key) else { continue }
+            let digits = message[range.upperBound...].prefix { $0.isNumber }
+            total += Int(digits) ?? 0
+        }
+        lock.lock()
+        headsetLossTotal = total
+        lock.unlock()
+    }
+
+    /// Called every diagnostics period with the local loss counters' deltas.
+    func update(localLossEvents: Int, elapsed: TimeInterval, session: VTCompressionSession?) {
+        guard enabled, let session else { return }
+        lock.lock()
+        let headsetDelta = max(0, headsetLossTotal - headsetLossAtLastCheck)
+        headsetLossAtLastCheck = headsetLossTotal
+        lock.unlock()
+        let lossEvents = localLossEvents + headsetDelta
+        var target = current
+        if lossEvents >= 2 {
+            cleanSeconds = 0
+            target = max(minimum, Int32(Double(current) * 0.8))
+        } else {
+            cleanSeconds += elapsed
+            if cleanSeconds >= 30, current < maximum {
+                cleanSeconds = 0
+                target = min(maximum, Int32(Double(current) * 1.1))
+            }
+        }
+        guard target != current else { return }
+        current = target
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: current))
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
+            value: [NSNumber(value: Double(current) / 8), NSNumber(value: 1)] as CFArray)
+        print(String(format: "HEVC bitrate %@ to %.1f Mbps (%d loss events in the last %.0f s)",
+            lossEvents >= 2 ? "lowered" : "raised", Double(current) / 1_000_000, lossEvents, elapsed))
+    }
+}
+let adaptiveBitrate = AdaptiveBitrate(maximum: videoBitrate)
+
 func setupEncoder(width: Int32, height: Int32) {
     var lowLatency = ProcessInfo.processInfo.environment["VERANTYX_LOW_LATENCY_ENCODER"] == "1"
     var status = createCompressionSession(width: width, height: height, lowLatency: lowLatency)
@@ -474,11 +538,11 @@ func setupEncoder(width: Int32, height: Int32) {
     // Critical settings for ultra-low latency VR streaming
     set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "no B-frames")
     set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue, "speed priority")
-    set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: videoBitrate), "average bitrate")
+    set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: adaptiveBitrate.current), "average bitrate")
     // Hard cap each second at the average: the game runs 15-25 fps and the
     // encoder overshot to 35 Mbps at a 20 Mbps average, which lost packets.
     set(kVTCompressionPropertyKey_DataRateLimits,
-        [NSNumber(value: Double(videoBitrate) / 8), NSNumber(value: 1)] as CFArray, "data-rate limit")
+        [NSNumber(value: Double(adaptiveBitrate.current) / 8), NSNumber(value: 1)] as CFArray, "data-rate limit")
 
     // This is an initial rate-control hint, not the display refresh rate. The
     // main loop updates it from observed capture cadence every five seconds.
@@ -639,15 +703,21 @@ func reportDiagnosticsIfDue() {
     let endpoint = videoPeer.map { String(describing: $0.endpoint) } ?? "none"
     peerLock.unlock()
     let captureFPS = Double(current.capture - lastDiagnostics.capture) / elapsed
-    print(String(format: "Pipeline %.1fs source=%u capture=%.1ffps submit=%.1ffps encoded=%.1ffps sent=%.1ffps UDP=%.2fMbps packets=%d sendErrors=%d networkDrops=%d encoderDrops=%d pose=%.1fHz poseAge=%.2fs peer=%@",
+    print(String(format: "Pipeline %.1fs source=%u capture=%.1ffps submit=%.1ffps encoded=%.1ffps sent=%.1ffps UDP=%.2fMbps bitrate=%.1fMbps packets=%d sendErrors=%d networkDrops=%d encoderDrops=%d pose=%.1fHz poseAge=%.2fs peer=%@",
         elapsed, dbHeaderPtr.pointee.captureSourceMode, captureFPS,
         Double(current.submit - lastDiagnostics.submit) / elapsed,
         Double(current.encode - lastDiagnostics.encode) / elapsed,
         Double(current.sent - lastDiagnostics.sent) / elapsed,
         Double(current.bytes - lastDiagnostics.bytes) * 8 / elapsed / 1_000_000,
+        Double(adaptiveBitrate.current) / 1_000_000,
         current.packets - lastDiagnostics.packets, current.errors - lastDiagnostics.errors,
         current.drops - lastDiagnostics.drops, droppedEncoderFrames,
         Double(current.poses - lastDiagnostics.poses) / elapsed, poseAge, endpoint))
+    if videoPeer != nil {
+        adaptiveBitrate.update(
+            localLossEvents: (current.errors - lastDiagnostics.errors) + (current.drops - lastDiagnostics.drops),
+            elapsed: elapsed, session: compressionSession)
+    }
     if let compressionSession, captureFPS > 0 {
         VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ExpectedFrameRate,
             value: NSNumber(value: min(90, max(1, captureFPS.rounded()))))
@@ -757,8 +827,42 @@ final class GPUFrameConverter {
     }
 }
 
-var gpuConverter: GPUFrameConverter? = ProcessInfo.processInfo.environment["VERANTYX_GPU_CONVERT"] == "0" ? nil : GPUFrameConverter()
+// VERANTYX_GPU_CONVERT: 1 = Metal, 0 = vImage on the CPU, auto (default) =
+// time the first frames on each and keep the faster one for this Mac. The
+// game and SteamVR leave different headroom on different chips: an M1 Max is
+// CPU-bound with an idle GPU, a base M1 has neither to spare.
+let gpuConvertSetting = ProcessInfo.processInfo.environment["VERANTYX_GPU_CONVERT"] ?? "auto"
+var gpuConverter: GPUFrameConverter? = gpuConvertSetting == "0" ? nil : GPUFrameConverter()
 var gpuConverterAnnounced = false
+
+final class FrameConversionSelector {
+    private let probeFrames = 24
+    private var gpuSamples: [Double] = []
+    private var cpuSamples: [Double] = []
+    private(set) var decided = gpuConvertSetting != "auto"
+
+    /// Whether the next frame should use the GPU path.
+    func preferGPU() -> Bool {
+        if decided { return gpuConverter != nil }
+        return gpuSamples.count < probeFrames
+    }
+
+    func record(gpu: Bool, milliseconds: Double) {
+        guard !decided else { return }
+        if gpu { gpuSamples.append(milliseconds) } else { cpuSamples.append(milliseconds) }
+        guard gpuSamples.count >= probeFrames, cpuSamples.count >= probeFrames else { return }
+        let gpuMedian = gpuSamples.sorted()[probeFrames / 2]
+        let cpuMedian = cpuSamples.sorted()[probeFrames / 2]
+        decided = true
+        // The GPU path also frees the encoder thread; prefer it unless the CPU
+        // path is clearly faster (a small chip with a busy GPU).
+        let useGPU = gpuConverter != nil && gpuMedian <= cpuMedian * 1.25
+        if !useGPU { gpuConverter = nil }
+        print(String(format: "Frame conversion: GPU %.2f ms vs CPU %.2f ms per frame; using the %@",
+            gpuMedian, cpuMedian, useGPU ? "GPU (Metal)" : "CPU (vImage)"))
+    }
+}
+let conversionSelector = FrameConversionSelector()
 
 func transferFrameOnGPU(
     source: UnsafeMutableRawPointer, sourceFormat: UInt32, sourceWidth: Int, sourceHeight: Int,
@@ -916,12 +1020,13 @@ func receiveVideoPeerPacket(_ packet: Data, from connection: NWConnection) {
         let shouldLog = videoPeer === connection && now - lastClientDiagnosticsAt >= 4
         if shouldLog { lastClientDiagnosticsAt = now }
         peerLock.unlock()
+        // Lossy decoding keeps a message whose multibyte text was cut off.
+        let message = String(decoding: packet.prefix(1200), as: UTF8.self)
         if shouldLog {
-            // Lossy decoding keeps a message whose multibyte text was cut off.
-            let message = String(decoding: packet.prefix(1200), as: UTF8.self)
             let singleLine = message.components(separatedBy: .controlCharacters).joined(separator: " ")
             print(String(format: "Headset diagnostics uptime=%.3f %@", now, singleLine))
         }
+        adaptiveBitrate.noteHeadsetStatistics(message)
         return
     }
     if packet == Data("HELLO_VR".utf8) {
@@ -1301,9 +1406,14 @@ while isEncoding {
                     return
                 }
                 let sourceFormat = frameHeader.format
-                var didCopy = transferFrameOnGPU(
+                let conversionStart = ProcessInfo.processInfo.systemUptime
+                let tryGPU = conversionSelector.preferGPU()
+                var didCopy = tryGPU && transferFrameOnGPU(
                     source: pixelDatas[Int(readyIndex)], sourceFormat: sourceFormat,
                     sourceWidth: width, sourceHeight: height, destination: pb)
+                if didCopy {
+                    conversionSelector.record(gpu: true, milliseconds: (ProcessInfo.processInfo.systemUptime - conversionStart) * 1000)
+                }
                 if !didCopy {
                     guard CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else {
                         encoderInFlightFrames.signal()
@@ -1321,6 +1431,9 @@ while isEncoding {
                         )
                     }
                     CVPixelBufferUnlockBaseAddress(pb, [])
+                    if didCopy {
+                        conversionSelector.record(gpu: false, milliseconds: (ProcessInfo.processInfo.systemUptime - conversionStart) * 1000)
+                    }
                 }
                 guard didCopy else {
                     encoderInFlightFrames.signal()
