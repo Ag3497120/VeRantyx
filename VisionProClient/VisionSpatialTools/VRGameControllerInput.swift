@@ -21,6 +21,37 @@ struct VRControllerHand {
     var secondary = false // Touch B / Y
     var menu = false
     var motion: VRControllerMotion?
+    /// The hand holds nothing: trigger and grip come from its pinch and
+    /// finger-curl gestures while stick and buttons come from the controller
+    /// held in the other hand (one-handed gamepad mode).
+    var gestureTriggerGrip = false
+    /// While the stick is deflected, the hand's pointing direction follows
+    /// the stick: direction from the stick angle, distance (pitch) from how
+    /// far it is pushed, so Alyx's teleport arc is aimed with the stick.
+    var stickAimsTeleport = false
+}
+
+/// How a one-handed gamepad (Pro Controller or any non-Joy-Con pad) is held;
+/// its stick axes are rotated to match. Stored in UserDefaults "gamepadHold".
+enum VRGamepadHold: Int {
+    case upright = 0
+    case rotatedLeft = 1   // top edge toward the left: turned 90° counterclockwise
+    case rotatedRight = 2  // top edge toward the right: turned 90° clockwise
+
+    static var current: VRGamepadHold {
+        guard UserDefaults.standard.object(forKey: "gamepadHold") != nil else { return .rotatedLeft }
+        return VRGamepadHold(rawValue: UserDefaults.standard.integer(forKey: "gamepadHold")) ?? .rotatedLeft
+    }
+
+    /// Maps a stick read in the pad's own frame (x toward its right edge,
+    /// y toward its top edge) to the player's frame (x right, y forward).
+    func rotate(_ stick: SIMD2<Float>) -> SIMD2<Float> {
+        switch self {
+        case .upright: return stick
+        case .rotatedLeft: return SIMD2<Float>(-stick.y, stick.x)   // top edge left: +x points up
+        case .rotatedRight: return SIMD2<Float>(stick.y, -stick.x)  // top edge right: +y points right
+        }
+    }
 }
 
 /// Reads Joy-Con (or any other extended gamepad) and splits them into the
@@ -48,7 +79,7 @@ final class VRGameControllerInput: @unchecked Sendable {
         var status: String
     }
 
-    private enum Role { case merged, left, right }
+    private enum Role { case merged, left, right, oneHanded }
 
     private struct Source {
         let controller: GCController
@@ -64,6 +95,7 @@ final class VRGameControllerInput: @unchecked Sendable {
     private var mergedMotion: VRControllerMotion?
     private var leftMotion: VRControllerMotion?
     private var rightMotion: VRControllerMotion?
+    private var oneHandedMotion: VRControllerMotion?
 
     init() {
         let center = NotificationCenter.default
@@ -101,14 +133,19 @@ final class VRGameControllerInput: @unchecked Sendable {
     }
 
     private static func motionSample(from motion: GCMotion, role: Role) -> VRControllerMotion {
-        // A single Joy-Con is reported as if held sideways: rotate its axes
-        // (about the face normal, z) back to the upright hold. Left Joy-Con
-        // sideways = upright turned 90° clockwise, right = counterclockwise.
+        // A single Joy-Con is reported as if held sideways with its rail on
+        // top: the left one is the upright Joy-Con turned counterclockwise,
+        // the right one turned clockwise. Rotate the axes (about the face
+        // normal, z) back to the upright hold.
         func upright(_ v: SIMD3<Double>) -> SIMD3<Float> {
             switch role {
             case .merged: return SIMD3<Float>(Float(v.x), Float(v.y), Float(v.z))
-            case .left: return SIMD3<Float>(Float(-v.y), Float(v.x), Float(v.z))
-            case .right: return SIMD3<Float>(Float(v.y), Float(-v.x), Float(v.z))
+            case .left: return SIMD3<Float>(Float(v.y), Float(-v.x), Float(v.z))
+            case .right: return SIMD3<Float>(Float(-v.y), Float(v.x), Float(v.z))
+            case .oneHanded:
+                // Same rotation as the sticks, about the pad's face normal.
+                let rotated = VRGamepadHold.current.rotate(SIMD2<Float>(Float(v.x), Float(v.y)))
+                return SIMD3<Float>(rotated.x, rotated.y, Float(v.z))
             }
         }
         var sample = VRControllerMotion()
@@ -130,13 +167,16 @@ final class VRGameControllerInput: @unchecked Sendable {
         switch role {
         case .merged:
             mergedMotion = sample
-            state.right?.motion = sample
+            if Self.mergedPairOneHanded { state.left?.motion = sample } else { state.right?.motion = sample }
         case .left:
             leftMotion = sample
             state.left?.motion = sample
         case .right:
             rightMotion = sample
             state.right?.motion = sample
+        case .oneHanded:
+            oneHandedMotion = sample
+            state.left?.motion = sample
         }
         lock.unlock()
     }
@@ -153,8 +193,13 @@ final class VRGameControllerInput: @unchecked Sendable {
             // One of each at most; a second controller of the same side is ignored.
             if let left = singles.first(where: { $0.role == .left }) { chosen.append(left) }
             if let right = singles.first(where: { $0.role == .right }) { chosen.append(right) }
-        } else if let merged = controllers.first(where: { Self.joyConRole($0) == .merged }) ?? controllers.first {
+        } else if let merged = controllers.first(where: { Self.joyConRole($0) == .merged }) {
             chosen = [Source(controller: merged, role: .merged)]
+        } else if let pad = controllers.first {
+            // A Pro Controller or any other gamepad: held in the left hand, it
+            // supplies both sticks and all buttons; the right hand stays free
+            // and uses its gestures for trigger and grip.
+            chosen = [Source(controller: pad, role: .oneHanded)]
         }
 
         let previous = sources.map { ObjectIdentifier($0.controller) }
@@ -192,6 +237,7 @@ final class VRGameControllerInput: @unchecked Sendable {
             mergedMotion = nil
             leftMotion = nil
             rightMotion = nil
+            oneHandedMotion = nil
             state = Snapshot(left: nil, right: nil, status: state.status)
             lock.unlock()
         }
@@ -206,9 +252,14 @@ final class VRGameControllerInput: @unchecked Sendable {
             if let gamepad = source.controller.extendedGamepad { update(from: gamepad, role: source.role) }
         }
         let names = chosen.map { Self.name(of: $0.controller) }.joined(separator: " + ")
-        let mode = chosen.first?.role == .merged
-            ? String(localized: "merged pair, sensors on the right hand")
-            : String(localized: "separate Joy-Con, sensors per hand")
+        let mode: String
+        switch chosen.first?.role {
+        case .merged where Self.mergedPairOneHanded:
+            mode = String(localized: "merged pair held in the left hand (ZR/R, both sticks, arrows, A/B/X/Y); the right hand uses gestures")
+        case .merged: mode = String(localized: "merged pair, sensors on the right hand")
+        case .oneHanded: mode = String(localized: "one-handed in the left hand; the right hand uses gestures for trigger and grip")
+        default: mode = String(localized: "separate Joy-Con, sensors per hand")
+        }
         setStatus(String(localized: "Using \(names) (\(mode); position from hand tracking, motion sensors: \(motionDescription))"))
     }
 
@@ -242,7 +293,7 @@ final class VRGameControllerInput: @unchecked Sendable {
         hand.trigger = max(gamepad.leftTrigger.value, gamepad.rightTrigger.value, pressedValue(matching: ["ZL", "ZR"]))
         hand.grip = max(gamepad.leftShoulder.value, gamepad.rightShoulder.value, pressedValue(matching: ["L", "R", "SL", "SR"]))
         let sideways = stick(gamepad.leftThumbstick)
-        hand.stick = role == .left ? SIMD2<Float>(-sideways.y, sideways.x) : SIMD2<Float>(sideways.y, -sideways.x)
+        hand.stick = role == .left ? SIMD2<Float>(sideways.y, -sideways.x) : SIMD2<Float>(-sideways.y, sideways.x)
         hand.stickClick = gamepad.leftThumbstickButton?.isPressed == true || gamepad.rightThumbstickButton?.isPressed == true
         // Sideways, the four face buttons (or the left Joy-Con's arrows) are
         // reported as A/B/X/Y by position: A/B sit toward the right/bottom.
@@ -252,8 +303,78 @@ final class VRGameControllerInput: @unchecked Sendable {
         return hand
     }
 
+    /// One gamepad in the left hand. Its left half (ZL, L, left stick,
+    /// d-pad, −) is the left Touch controller; its right stick and A/B/X/Y
+    /// drive the free right hand, whose trigger and grip are gestures.
+    private func updateOneHanded(from gamepad: GCExtendedGamepad) {
+        let hold = VRGamepadHold.current
+        var left = VRControllerHand()
+        left.trigger = gamepad.leftTrigger.value
+        left.grip = gamepad.leftShoulder.value
+        left.stick = hold.rotate(Self.stick(gamepad.leftThumbstick))
+        left.stickClick = gamepad.leftThumbstickButton?.isPressed == true
+        left.primary = gamepad.dpad.down.isPressed || gamepad.dpad.left.isPressed
+        left.secondary = gamepad.dpad.up.isPressed || gamepad.dpad.right.isPressed
+        left.menu = gamepad.buttonMenu.isPressed || gamepad.buttonOptions?.isPressed == true
+        left.stickAimsTeleport = true
+
+        var right = VRControllerHand()
+        right.stick = hold.rotate(Self.stick(gamepad.rightThumbstick))
+        right.stickClick = gamepad.rightThumbstickButton?.isPressed == true
+        right.primary = gamepad.buttonA.isPressed || gamepad.buttonB.isPressed
+        right.secondary = gamepad.buttonX.isPressed || gamepad.buttonY.isPressed
+        right.gestureTriggerGrip = true
+
+        lock.lock()
+        left.motion = oneHandedMotion
+        state.left = left
+        state.right = right
+        lock.unlock()
+    }
+
+    /// The merged Joy-Con pair held in the left hand (UserDefaults
+    /// "mergedJoyConOneHanded", default on): the right Joy-Con's ZR and R are
+    /// the trigger and grip (the left one's ZL and L are ignored), the right
+    /// Joy-Con's stick moves (teleport: the left Touch stick) and the left
+    /// Joy-Con's stick turns (the right Touch stick). The arrows are X/Y and
+    /// A/B/X/Y are the right Touch buttons; the right hand stays free and its
+    /// trigger and grip are gestures.
+    private func updateOneHandedMergedPair(from gamepad: GCExtendedGamepad) {
+        let hold = VRGamepadHold.current
+        var left = VRControllerHand()
+        left.trigger = gamepad.rightTrigger.value
+        left.grip = gamepad.rightShoulder.value
+        left.stick = hold.rotate(Self.stick(gamepad.rightThumbstick))
+        left.stickClick = gamepad.rightThumbstickButton?.isPressed == true
+        left.primary = gamepad.dpad.down.isPressed || gamepad.dpad.left.isPressed
+        left.secondary = gamepad.dpad.up.isPressed || gamepad.dpad.right.isPressed
+        left.menu = gamepad.buttonMenu.isPressed || gamepad.buttonOptions?.isPressed == true
+        left.stickAimsTeleport = true
+
+        var right = VRControllerHand()
+        right.stick = hold.rotate(Self.stick(gamepad.leftThumbstick))
+        right.stickClick = gamepad.leftThumbstickButton?.isPressed == true
+        right.primary = gamepad.buttonA.isPressed || gamepad.buttonB.isPressed
+        right.secondary = gamepad.buttonX.isPressed || gamepad.buttonY.isPressed
+        right.gestureTriggerGrip = true
+
+        lock.lock()
+        left.motion = mergedMotion
+        state.left = left
+        state.right = right
+        lock.unlock()
+    }
+
+    static var mergedPairOneHanded: Bool {
+        UserDefaults.standard.object(forKey: "mergedJoyConOneHanded") == nil || UserDefaults.standard.bool(forKey: "mergedJoyConOneHanded")
+    }
+
     private func update(from gamepad: GCExtendedGamepad, role: Role) {
         switch role {
+        case .merged where Self.mergedPairOneHanded:
+            updateOneHandedMergedPair(from: gamepad)
+        case .oneHanded:
+            updateOneHanded(from: gamepad)
         case .left:
             var hand = Self.singleJoyCon(gamepad, role: .left)
             lock.lock()

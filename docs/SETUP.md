@@ -81,6 +81,26 @@ but exposes one sensor set (applied to the right hand). The app's
 presents a single Joy-Con as if held sideways; the app rotates its stick and
 sensor axes back to the upright hold.
 
+The merged Joy-Con pair can also be held in the left hand alone (the app's
+"Hold the merged Joy-Con pair in the left hand" switch, on by default, with
+the hold picker set to the way it is turned): the right Joy-Con's ZR and R
+are the trigger and grip (the left one's ZL and L are ignored), the right
+Joy-Con's stick moves/teleports and the left Joy-Con's stick turns, the
+arrows are X/Y and A/B/X/Y are the right Touch buttons. The right hand is
+free: its trigger and grip are gestures and it does the gravity gloves.
+
+A Nintendo Switch Pro Controller (or any other gamepad) works one-handed:
+hold it in the left hand, turned sideways so the thumb reaches the left stick
+and d-pad (pick the hold in the app window: upright, turned left or turned
+right; the stick axes rotate with it). Its left half (ZL, L, left stick,
+d-pad, −) is the left Touch controller; its right stick and A/B/X/Y drive the
+right hand, whose trigger and grip stay gestures (index pinch, finger curl),
+so the right hand is free to grab, shoot and use the gravity gloves. While
+the left stick is pushed, the left hand's aim follows the stick: direction
+from the stick angle (relative to where you face), distance from how far it
+is pushed, so the teleport arc is aimed with the thumb. The arc's pitch
+offset can be tuned with the `teleportAimPitch` default (degrees, 40).
+
 Without Joy-Con, everything is done with the hands (both hands, per hand):
 
 | Gesture | Touch input |

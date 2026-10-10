@@ -9,6 +9,8 @@ struct SteamVRStreamerView: View {
     @ObservedObject private var decoder: VRVideoDecoder
     @ObservedObject private var model: VRStreamerModel
     @State private var immersiveStatus = String(localized: "VR view is stopped.")
+    @AppStorage("gamepadHold") private var gamepadHold = 1
+    @AppStorage("mergedJoyConOneHanded") private var mergedJoyConOneHanded = true
     @State private var isStarting = false
 
     init(model: VRStreamerModel) {
@@ -49,6 +51,17 @@ struct SteamVRStreamerView: View {
 
             Toggle("Show real hands too (to check alignment with the game's hands)", isOn: $model.showsRealHands)
                 .frame(maxWidth: 560)
+
+            Toggle("Hold the merged Joy-Con pair in the left hand (right hand free)", isOn: $mergedJoyConOneHanded)
+                .frame(maxWidth: 560)
+
+            Picker("One-handed gamepad hold", selection: $gamepadHold) {
+                Text("Upright").tag(0)
+                Text("Turned left").tag(1)
+                Text("Turned right").tag(2)
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 560)
 
             HStack(spacing: 14) {
                 Button {

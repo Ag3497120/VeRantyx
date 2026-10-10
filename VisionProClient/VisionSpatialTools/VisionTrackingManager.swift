@@ -530,7 +530,10 @@ private struct HandState {
         lastLocalTime = now
         lastMeasuredLocal = local
 
-        if let controller {
+        if let controller, controller.stickAimsTeleport {
+            transform = Self.aimWithStick(transform, stick: controller.stick, head: head)
+        }
+        if let controller, !controller.gestureTriggerGrip {
             applyController(controller)
             return
         }
@@ -558,6 +561,22 @@ private struct HandState {
                 triggerEngaged = pinchIndex <= 0.025 && (joints.indexExtension ?? 1) > 0.45
             }
             triggerValue = Self.byte(triggerEngaged ? max(triggerRaw, 0.85) : min(triggerRaw, 0.7))
+        }
+
+        if let controller, controller.gestureTriggerGrip {
+            // Stick and buttons come from the gamepad in the other hand; the
+            // pinch buttons and stick gesture would collide with grabbing.
+            pinchedFinger = nil
+            stickPhase = .idle
+            stick = controller.stick
+            var bits: UInt32 = 0
+            if controller.primary { bits |= 1 }
+            if controller.secondary { bits |= 2 }
+            if controller.stickClick { bits |= 4 }
+            if controller.stickClick || simd_length(controller.stick) > 0.1 { bits |= 8 }
+            if controller.menu { bits |= 16 }
+            buttonBits = bits
+            return
         }
 
         updateFingerPinch(middle: joints.thumbDistance(to: joints.middleTip),
@@ -588,7 +607,21 @@ private struct HandState {
             velocity = .zero
             angularVelocity = .zero
         }
-        if let controller {
+        if let controller, controller.gestureTriggerGrip {
+            // Free hand with a gamepad in the other: the gestures need a
+            // visible hand (trigger released, grip kept), the pad still works.
+            triggerEngaged = false
+            triggerValue = 0
+            pinchedFinger = nil
+            stickPhase = .idle
+            stick = controller.stick
+            var bits: UInt32 = 0
+            if controller.primary { bits |= 1 }
+            if controller.secondary { bits |= 2 }
+            if controller.stickClick { bits |= 4 }
+            if controller.stickClick || simd_length(controller.stick) > 0.1 { bits |= 8 }
+            buttonBits = bits
+        } else if let controller {
             applyController(controller)
         } else {
             // Trigger, pinches and stick need a visible hand; grip is kept while
@@ -607,6 +640,9 @@ private struct HandState {
         if let lastMeasuredLocal, headTracked, now - lostSince < holdLimit {
             transform = head * lastMeasuredLocal
             if let motion = controller?.motion { applyInertial(motion) }
+            if let controller, controller.stickAimsTeleport {
+                transform = Self.aimWithStick(transform, stick: controller.stick, head: head)
+            }
             trackingState = 2
             return
         }
@@ -730,6 +766,29 @@ private struct HandState {
         if controller.stickClick || simd_length(controller.stick) > 0.1 { bits |= 8 }
         if controller.menu { bits |= 16 }
         buttonBits = bits
+    }
+
+    /// Teleport aimed with a stick: beyond the dead zone, the hand's pose is
+    /// turned so its aim ray points along the stick's direction (relative to
+    /// where the head faces), pitched from steeply down (short hop) at a
+    /// light push to slightly up (full reach) at full deflection. The raw
+    /// Touch pose's aim ray is tilted down from -Z by UserDefaults
+    /// "teleportAimPitch" degrees (default 40).
+    private static func aimWithStick(_ pose: simd_float4x4, stick: SIMD2<Float>, head: simd_float4x4) -> simd_float4x4 {
+        let magnitude = simd_length(stick)
+        guard magnitude > 0.15 else { return pose }
+        let forward = SIMD3<Float>(-head.columns.2.x, 0, -head.columns.2.z)
+        let headYaw = simd_length_squared(forward) > 1e-4 ? atan2(-forward.x, -forward.z) : 0
+        let yaw = headYaw + atan2(-stick.x, stick.y)
+        let reach = min(1, max(0, (magnitude - 0.15) / 0.85))
+        let pitch = (-65 + 75 * reach) * Float.pi / 180
+        var aimPitch = Float(UserDefaults.standard.double(forKey: "teleportAimPitch"))
+        if aimPitch == 0 { aimPitch = 40 }
+        let aim = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0)) * simd_quatf(angle: pitch, axis: SIMD3<Float>(1, 0, 0))
+        let raw = aim * simd_quatf(angle: aimPitch * Float.pi / 180, axis: SIMD3<Float>(1, 0, 0))
+        var result = simd_float4x4(raw)
+        result.columns.3 = pose.columns.3
+        return result
     }
 
     /// A tracked fist (grip engaged by finger curl, no controller) whose palm

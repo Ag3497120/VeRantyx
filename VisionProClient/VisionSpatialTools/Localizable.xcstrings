@@ -751,6 +751,106 @@
           }
         }
       }
+    },
+    "One-handed gamepad hold": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "片手持ちゲームパッドの向き"
+          }
+        }
+      }
+    },
+    "Upright": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "縦持ち"
+          }
+        }
+      }
+    },
+    "Turned left": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "左に倒す"
+          }
+        }
+      }
+    },
+    "Turned right": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "右に倒す"
+          }
+        }
+      }
+    },
+    "one-handed in the left hand; the right hand uses gestures for trigger and grip": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "左手で片手持ち。右手はジェスチャーでトリガーとグリップ"
+          }
+        }
+      }
+    },
+    "merged pair, sensors on the right hand": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "左右をまとめたペア。センサーは右手"
+          }
+        }
+      }
+    },
+    "separate Joy-Con, sensors per hand": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "左右別々のジョイコン。センサーは両手"
+          }
+        }
+      }
+    },
+    "Using %@ (%@; position from hand tracking, motion sensors: %@)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ を使用中（%2$@。位置はハンドトラッキング、モーションセンサー: %3$@）"
+          }
+        }
+      }
+    },
+    "Hold the merged Joy-Con pair in the left hand (right hand free)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "合体したジョイコンを左手だけで持つ（右手は自由）"
+          }
+        }
+      }
+    },
+    "merged pair held in the left hand (ZR/R, both sticks, arrows, A/B/X/Y); the right hand uses gestures": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "合体ペアを左手で保持（ZR/R・両スティック・矢印・A/B/X/Y）。右手はジェスチャー"
+          }
+        }
+      }
     }
   }
 }
