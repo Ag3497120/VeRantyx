@@ -40,7 +40,7 @@ fi
 xcrun devicectl device install app --timeout 60 --device "$DEVICE_ID" "$APP_PATH"
 echo "Launching the Vision Pro app. Unlock the headset and accept its first-run prompts if they appear."
 if ! xcrun devicectl device process launch --timeout "$LAUNCH_TIMEOUT" --device "$DEVICE_ID" "$BUNDLE_ID"; then
-    echo "The app is installed, but remote launch did not complete. Open MBP AVP VR on Vision Pro and accept its first-run prompts."
+    echo "The app is installed, but remote launch did not complete. Open VeRantyx on Vision Pro and accept its first-run prompts."
     exit 0
 fi
 echo "Installed and launched $BUNDLE_ID on Vision Pro ($DEVICE_ID)."

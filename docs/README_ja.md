@@ -109,7 +109,7 @@ Macのエンコーダーは、macOSのシステム音声タップ（Core Audio p
 ## 起動
 
 0. Vision Proアプリを更新します（姿勢予測・ジェスチャー・深度の修正はアプリ側にあります）: `./scripts/deploy_vision_pro_app.sh`
-1. Vision Proで「MBP AVP VR」を開き、「ステレオVRを開始」をタップします。初回プロンプトが出たらローカルネットワークと手のトラッキングを許可します。
+1. Vision Proで「VeRantyx」を開き、「ステレオVRを開始」をタップします。初回プロンプトが出たらローカルネットワークと手のトラッキングを許可します。
 2. Mac側で起動スクリプトを実行します。SteamVR起動後、Vision Proの姿勢パケットが届くまでAlyxは起動せずに待ちます。Windows Steamに未サインインならクライアントを開き、CEF画面の準備とサインインを待ってから続行します。
 3. Vision Proアプリ画面でMac接続、受信fps、頭・手の追跡状態、左右のtrigger/grip/button値、「遅延」（姿勢を送ってから、その姿勢のフレームが表示されるまで）を確認します。
 
