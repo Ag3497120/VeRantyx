@@ -391,6 +391,17 @@ private struct HandState {
     private var inertialRotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
     private var lostAt: CFTimeInterval?
     private(set) var usesController = false
+    // Orientation fused from the Joy-Con gyro (immediate, drift-free over a
+    // few seconds) and hand tracking (slow but anchored): the gyro turns it
+    // between camera samples, the camera pulls it back over ~0.1 s.
+    private var fusedRotation: simd_quatf?
+    private var fusedAt: CFTimeInterval = 0
+    private var fusedGyroTimestamp: TimeInterval = 0
+    // A sharp wrist rotation marks a gravity-glove flick: for the next 100 ms
+    // the velocity toward the head is kept at the speed Alyx looks for.
+    private var flickBoostUntil: CFTimeInterval = 0
+    private static let flickRotationRate: Float = 6     // rad/s
+    private static let flickSpeed: Float = 2.5          // m/s toward the player
 
     // Keep a hand that leaves the cameras' view (lowered gun, object carried
     // to the side) where it was relative to the head instead of dropping it.
@@ -481,6 +492,20 @@ private struct HandState {
         lastWorldTime = now
         if let motion = controller?.motion {
             fuseInertialVelocity(motion, rotation: rawRotation)
+            steamRaw = fuseOrientation(steamRaw, rawRotation: rawRotation, motion: motion, now: now)
+        } else {
+            fusedRotation = nil
+            if simd_length(angularVelocity) > Self.flickRotationRate * 1.3 { flickBoostUntil = now + 0.1 }
+        }
+        if now < flickBoostUntil {
+            // Alyx reads the controller's linear velocity toward the player.
+            let headPosition = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
+            let towardHead = headPosition - rawPosition
+            if simd_length(towardHead) > 0.05 {
+                let direction = simd_normalize(towardHead)
+                let along = simd_dot(velocity, direction)
+                if along < Self.flickSpeed { velocity += direction * (Self.flickSpeed - along) }
+            }
         }
         if controller != nil, trackingState == 1, let previous = Optional(transform) {
             // A hand wrapped around a Joy-Con is partly hidden, so its tracked
@@ -608,6 +633,7 @@ private struct HandState {
         let deviceToWorld = simd_float3x3(rotation) * simd_float3x3(handFromDevice)
         if let rate = motion.rotationRate {
             angularVelocity = deviceToWorld * rate
+            if simd_length(rate) > Self.flickRotationRate { flickBoostUntil = CACurrentMediaTime() + 0.1 }
         }
         if let acceleration = motion.userAcceleration, let last = inertialLastTime {
             let dt = Float(motion.timestamp - last)
@@ -619,6 +645,38 @@ private struct HandState {
             }
         }
         inertialLastTime = motion.timestamp
+    }
+
+    /// Complementary filter: integrates the gyro since the last sample and
+    /// slerps toward the camera's orientation. Large disagreements (tracking
+    /// re-acquired after a loss) snap to the camera.
+    private mutating func fuseOrientation(_ pose: simd_float4x4, rawRotation: simd_quatf,
+                                          motion: VRControllerMotion, now: CFTimeInterval) -> simd_float4x4 {
+        guard let rate = motion.rotationRate else { return pose }
+        var fused = fusedRotation ?? rawRotation
+        if fusedRotation != nil, motion.timestamp > fusedGyroTimestamp {
+            let dt = Float(min(max(now - fusedAt, 0), 0.05))
+            let handFromDevice = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+            let worldRate = simd_float3x3(fused) * simd_float3x3(handFromDevice) * rate
+            let angle = simd_length(worldRate) * dt
+            if angle > 0.0005 {
+                fused = simd_normalize(simd_quatf(angle: angle, axis: simd_normalize(worldRate)) * fused)
+            }
+            var delta = rawRotation * fused.inverse
+            if delta.real < 0 { delta = simd_quatf(real: -delta.real, imag: -delta.imag) }
+            let disagreement = 2 * acos(min(1, delta.real))
+            if disagreement > 25 * .pi / 180 {
+                fused = rawRotation
+            } else {
+                fused = simd_normalize(simd_slerp(fused, rawRotation, min(1, dt / 0.1)))
+            }
+        }
+        fusedRotation = fused
+        fusedAt = now
+        fusedGyroTimestamp = motion.timestamp
+        var result = simd_float4x4(fused)
+        result.columns.3 = pose.columns.3
+        return result
     }
 
     private mutating func applyInertial(_ motion: VRControllerMotion) {

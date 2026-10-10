@@ -71,10 +71,15 @@ be paired and unlocked):
 
 On first launch, allow local network access and hand tracking.
 
-Optional: pair Joy-Con in visionOS *Settings > Bluetooth*, then press L and R
-on both at the same time to merge them into one controller. The app's
-*Controller* row shows the controller in use and which motion sensors
-visionOS exposes.
+Optional: pair both Joy-Con in visionOS *Settings > Bluetooth* and leave
+them separate: each then brings its own gyro and accelerometer, so both
+hands get inertial sensing (orientation fused with hand tracking, wrist
+flicks for the gravity gloves, dead reckoning while a hand is out of view).
+Pressing L and R on both merges them into one controller, which also works
+but exposes one sensor set (applied to the right hand). The app's
+*Controller* row shows the controllers in use and their sensors. visionOS
+presents a single Joy-Con as if held sideways; the app rotates its stick and
+sensor axes back to the upright hold.
 
 Without Joy-Con, everything is done with the hands (both hands, per hand):
 

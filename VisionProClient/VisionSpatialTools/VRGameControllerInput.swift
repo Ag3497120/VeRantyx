@@ -23,12 +23,20 @@ struct VRControllerHand {
     var motion: VRControllerMotion?
 }
 
-/// Reads a pair of Joy-Con combined into one controller (or any other extended
-/// gamepad) and splits it into the left and right hand. Hand tracking still
-/// supplies where each hand is; the controller supplies buttons, sticks and
-/// triggers, which keep working when a hand leaves the cameras' view.
+/// Reads Joy-Con (or any other extended gamepad) and splits them into the
+/// left and right hand. Hand tracking still supplies where each hand is; the
+/// controller supplies buttons, sticks, triggers and inertial sensors, which
+/// keep working when a hand leaves the cameras' view.
 ///
-/// Joy-Con layout, held one per hand:
+/// Two ways to connect Joy-Con:
+/// - Separately (recommended): each Joy-Con is its own controller with its
+///   own gyro and accelerometer, so both hands get inertial sensing. visionOS
+///   presents a single Joy-Con as if it were held sideways, so its stick and
+///   sensor axes are rotated back to the upright hold here.
+/// - Merged (press L and R on both): one controller, one set of sensors,
+///   applied to the right hand.
+///
+/// Joy-Con layout, held upright one per hand:
 /// - ZL / ZR: trigger, L / R: grip, sticks: joysticks (press: stick click)
 /// - right A / B: Touch A, right X / Y: Touch B
 /// - left ↓ / ←: Touch X, left ↑ / →: Touch Y
@@ -40,32 +48,22 @@ final class VRGameControllerInput: @unchecked Sendable {
         var status: String
     }
 
+    private enum Role { case merged, left, right }
+
+    private struct Source {
+        let controller: GCController
+        let role: Role
+    }
+
     private let lock = NSLock()
     private var state = Snapshot(left: nil, right: nil, status: String(localized: "Not connected (hand gestures control the game)"))
     private let queue = DispatchQueue(label: "com.verantyx.game-controller", qos: .userInteractive)
     private var observers: [NSObjectProtocol] = []
-    private weak var activeController: GCController?
+    private var sources: [Source] = []
     private var motionDescription = String(localized: "none")
-    private var latestMotion: VRControllerMotion?
-
-    /// A merged Joy-Con pair exposes one motion source. It is applied to the
-    /// right hand, which holds the gun in Alyx.
-    private func updateMotion(from motion: GCMotion) {
-        var sample = VRControllerMotion()
-        sample.acceleration = SIMD3<Float>(Float(motion.acceleration.x), Float(motion.acceleration.y), Float(motion.acceleration.z))
-        if motion.hasGravityAndUserAcceleration {
-            sample.userAcceleration = SIMD3<Float>(Float(motion.userAcceleration.x), Float(motion.userAcceleration.y), Float(motion.userAcceleration.z))
-            sample.gravity = SIMD3<Float>(Float(motion.gravity.x), Float(motion.gravity.y), Float(motion.gravity.z))
-        }
-        if motion.hasRotationRate {
-            sample.rotationRate = SIMD3<Float>(Float(motion.rotationRate.x), Float(motion.rotationRate.y), Float(motion.rotationRate.z))
-        }
-        sample.timestamp = ProcessInfo.processInfo.systemUptime
-        lock.lock()
-        latestMotion = sample
-        state.right?.motion = sample
-        lock.unlock()
-    }
+    private var mergedMotion: VRControllerMotion?
+    private var leftMotion: VRControllerMotion?
+    private var rightMotion: VRControllerMotion?
 
     init() {
         let center = NotificationCenter.default
@@ -93,50 +91,125 @@ final class VRGameControllerInput: @unchecked Sendable {
     }
 
     @MainActor
-    private static func isSingleJoyCon(_ controller: GCController) -> Bool {
+    private static func joyConRole(_ controller: GCController) -> Role? {
         let name = name(of: controller) + " " + controller.productCategory
-        return name.contains("Joy-Con") && !name.contains("L/R") && !name.contains("L / R")
+        guard name.contains("Joy-Con") else { return nil }
+        if name.contains("L/R") || name.contains("L / R") { return .merged }
+        if name.contains("(L)") || name.hasSuffix(" L") || name.contains("Left") { return .left }
+        if name.contains("(R)") || name.hasSuffix(" R") || name.contains("Right") { return .right }
+        return nil
+    }
+
+    private static func motionSample(from motion: GCMotion, role: Role) -> VRControllerMotion {
+        // A single Joy-Con is reported as if held sideways: rotate its axes
+        // (about the face normal, z) back to the upright hold. Left Joy-Con
+        // sideways = upright turned 90° clockwise, right = counterclockwise.
+        func upright(_ v: SIMD3<Double>) -> SIMD3<Float> {
+            switch role {
+            case .merged: return SIMD3<Float>(Float(v.x), Float(v.y), Float(v.z))
+            case .left: return SIMD3<Float>(Float(-v.y), Float(v.x), Float(v.z))
+            case .right: return SIMD3<Float>(Float(v.y), Float(-v.x), Float(v.z))
+            }
+        }
+        var sample = VRControllerMotion()
+        sample.acceleration = upright(SIMD3<Double>(motion.acceleration.x, motion.acceleration.y, motion.acceleration.z))
+        if motion.hasGravityAndUserAcceleration {
+            sample.userAcceleration = upright(SIMD3<Double>(motion.userAcceleration.x, motion.userAcceleration.y, motion.userAcceleration.z))
+            sample.gravity = upright(SIMD3<Double>(motion.gravity.x, motion.gravity.y, motion.gravity.z))
+        }
+        if motion.hasRotationRate {
+            sample.rotationRate = upright(SIMD3<Double>(motion.rotationRate.x, motion.rotationRate.y, motion.rotationRate.z))
+        }
+        sample.timestamp = ProcessInfo.processInfo.systemUptime
+        return sample
+    }
+
+    private func updateMotion(from motion: GCMotion, role: Role) {
+        let sample = Self.motionSample(from: motion, role: role)
+        lock.lock()
+        switch role {
+        case .merged:
+            mergedMotion = sample
+            state.right?.motion = sample
+        case .left:
+            leftMotion = sample
+            state.left?.motion = sample
+        case .right:
+            rightMotion = sample
+            state.right?.motion = sample
+        }
+        lock.unlock()
     }
 
     @MainActor
     private func refresh() {
-        let controllers = GCController.controllers()
-        let gamepads = controllers.filter { $0.extendedGamepad != nil && !Self.isSingleJoyCon($0) }
-        let chosen = gamepads.first { Self.name(of: $0).contains("Joy-Con") } ?? gamepads.first
+        let controllers = GCController.controllers().filter { $0.extendedGamepad != nil }
+        let singles = controllers.compactMap { controller -> Source? in
+            guard let role = Self.joyConRole(controller), role != .merged else { return nil }
+            return Source(controller: controller, role: role)
+        }
+        var chosen: [Source] = []
+        if singles.contains(where: { $0.role == .left }) || singles.contains(where: { $0.role == .right }) {
+            // One of each at most; a second controller of the same side is ignored.
+            if let left = singles.first(where: { $0.role == .left }) { chosen.append(left) }
+            if let right = singles.first(where: { $0.role == .right }) { chosen.append(right) }
+        } else if let merged = controllers.first(where: { Self.joyConRole($0) == .merged }) ?? controllers.first {
+            chosen = [Source(controller: merged, role: .merged)]
+        }
 
-        if chosen !== activeController {
-            activeController?.extendedGamepad?.valueChangedHandler = nil
-            activeController = chosen
-            if let chosen, let gamepad = chosen.extendedGamepad {
-                chosen.handlerQueue = queue
-                gamepad.valueChangedHandler = { [weak self] gamepad, _ in
-                    self?.update(from: gamepad)
+        let previous = sources.map { ObjectIdentifier($0.controller) }
+        let next = chosen.map { ObjectIdentifier($0.controller) }
+        if previous != next {
+            for source in sources {
+                source.controller.extendedGamepad?.valueChangedHandler = nil
+                source.controller.motion?.valueChangedHandler = nil
+            }
+            sources = chosen
+            var descriptions: [String] = []
+            for source in chosen {
+                let controller = source.controller
+                let role = source.role
+                controller.handlerQueue = queue
+                controller.extendedGamepad?.valueChangedHandler = { [weak self] gamepad, _ in
+                    self?.update(from: gamepad, role: role)
                 }
-                if let motion = chosen.motion {
+                if let motion = controller.motion {
                     if motion.sensorsRequireManualActivation { motion.sensorsActive = true }
-                    motionDescription = String(localized: "gyro \(motion.hasRotationRate ? "yes" : "no") / accelerometer \(motion.hasGravityAndUserAcceleration ? "separated" : "combined")")
+                    descriptions.append(String(localized: "gyro \(motion.hasRotationRate ? "yes" : "no") / accelerometer \(motion.hasGravityAndUserAcceleration ? "separated" : "combined")"))
                     motion.valueChangedHandler = { [weak self] motion in
-                        self?.updateMotion(from: motion)
+                        self?.updateMotion(from: motion, role: role)
                     }
                 } else {
-                    motionDescription = String(localized: "none")
+                    descriptions.append(String(localized: "none"))
                 }
-                print("Game controller in use: \(Self.name(of: chosen)) (\(chosen.productCategory)), motion: \(motionDescription)")
+                let buttons = controller.extendedGamepad.map { pad in
+                    pad.allButtons.map { $0.localizedName ?? "?" }.sorted().joined(separator: ", ")
+                } ?? ""
+                print("Game controller in use: \(Self.name(of: controller)) (\(controller.productCategory)) as \(role); buttons: \(buttons)")
             }
-        }
-
-        if let chosen, let gamepad = chosen.extendedGamepad {
-            update(from: gamepad)
-            setStatus(String(localized: "Using \(Self.name(of: chosen)) (position from hand tracking, motion sensors: \(motionDescription))"))
-        } else {
-            let singles = controllers.filter { Self.isSingleJoyCon($0) }
-            let status = singles.isEmpty
-                ? String(localized: "Not connected (hand gestures control the game)")
-                : String(localized: "Joy-Con are connected separately. Press L and R on both at the same time to merge them into one controller.")
+            motionDescription = descriptions.joined(separator: " + ")
             lock.lock()
-            state = Snapshot(left: nil, right: nil, status: status)
+            mergedMotion = nil
+            leftMotion = nil
+            rightMotion = nil
+            state = Snapshot(left: nil, right: nil, status: state.status)
             lock.unlock()
         }
+
+        if chosen.isEmpty {
+            lock.lock()
+            state = Snapshot(left: nil, right: nil, status: String(localized: "Not connected (hand gestures control the game)"))
+            lock.unlock()
+            return
+        }
+        for source in chosen {
+            if let gamepad = source.controller.extendedGamepad { update(from: gamepad, role: source.role) }
+        }
+        let names = chosen.map { Self.name(of: $0.controller) }.joined(separator: " + ")
+        let mode = chosen.first?.role == .merged
+            ? String(localized: "merged pair, sensors on the right hand")
+            : String(localized: "separate Joy-Con, sensors per hand")
+        setStatus(String(localized: "Using \(names) (\(mode); position from hand tracking, motion sensors: \(motionDescription))"))
     }
 
     private func setStatus(_ status: String) {
@@ -145,37 +218,81 @@ final class VRGameControllerInput: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func update(from gamepad: GCExtendedGamepad) {
-        func stick(_ pad: GCControllerDirectionPad) -> SIMD2<Float> {
-            let value = SIMD2<Float>(pad.xAxis.value, pad.yAxis.value)
-            return simd_length(value) < 0.08 ? .zero : simd_clamp(value, SIMD2<Float>(-1, -1), SIMD2<Float>(1, 1))
+    private static func stick(_ pad: GCControllerDirectionPad) -> SIMD2<Float> {
+        let value = SIMD2<Float>(pad.xAxis.value, pad.yAxis.value)
+        return simd_length(value) < 0.08 ? .zero : simd_clamp(value, SIMD2<Float>(-1, -1), SIMD2<Float>(1, 1))
+    }
+
+    /// Reads one single Joy-Con, which visionOS reports as a sideways
+    /// controller: the stick axes are rotated back to the upright hold and
+    /// every button that can mean "trigger" or "grip" is accepted, since the
+    /// sideways profile names the physical buttons differently.
+    private static func singleJoyCon(_ gamepad: GCExtendedGamepad, role: Role) -> VRControllerHand {
+        var hand = VRControllerHand()
+        func pressedValue(matching names: [String]) -> Float {
+            var value: Float = 0
+            for button in gamepad.allButtons {
+                let name = (button.localizedName ?? "").uppercased()
+                if names.contains(where: { name == $0 || name.hasPrefix($0 + " ") || name.contains("(" + $0 + ")") }) {
+                    value = max(value, button.value)
+                }
+            }
+            return value
         }
-        let menu = gamepad.buttonMenu.isPressed || gamepad.buttonOptions?.isPressed == true
+        hand.trigger = max(gamepad.leftTrigger.value, gamepad.rightTrigger.value, pressedValue(matching: ["ZL", "ZR"]))
+        hand.grip = max(gamepad.leftShoulder.value, gamepad.rightShoulder.value, pressedValue(matching: ["L", "R", "SL", "SR"]))
+        let sideways = stick(gamepad.leftThumbstick)
+        hand.stick = role == .left ? SIMD2<Float>(-sideways.y, sideways.x) : SIMD2<Float>(sideways.y, -sideways.x)
+        hand.stickClick = gamepad.leftThumbstickButton?.isPressed == true || gamepad.rightThumbstickButton?.isPressed == true
+        // Sideways, the four face buttons (or the left Joy-Con's arrows) are
+        // reported as A/B/X/Y by position: A/B sit toward the right/bottom.
+        hand.primary = gamepad.buttonA.isPressed || gamepad.buttonB.isPressed || gamepad.dpad.down.isPressed || gamepad.dpad.left.isPressed
+        hand.secondary = gamepad.buttonX.isPressed || gamepad.buttonY.isPressed || gamepad.dpad.up.isPressed || gamepad.dpad.right.isPressed
+        hand.menu = gamepad.buttonMenu.isPressed || gamepad.buttonOptions?.isPressed == true
+        return hand
+    }
 
-        var left = VRControllerHand()
-        left.trigger = gamepad.leftTrigger.value
-        left.grip = gamepad.leftShoulder.value
-        left.stick = stick(gamepad.leftThumbstick)
-        left.stickClick = gamepad.leftThumbstickButton?.isPressed == true
-        left.primary = gamepad.dpad.down.isPressed || gamepad.dpad.left.isPressed
-        left.secondary = gamepad.dpad.up.isPressed || gamepad.dpad.right.isPressed
-        left.menu = menu
+    private func update(from gamepad: GCExtendedGamepad, role: Role) {
+        switch role {
+        case .left:
+            var hand = Self.singleJoyCon(gamepad, role: .left)
+            lock.lock()
+            hand.motion = leftMotion
+            state.left = hand
+            lock.unlock()
+        case .right:
+            var hand = Self.singleJoyCon(gamepad, role: .right)
+            lock.lock()
+            hand.motion = rightMotion
+            state.right = hand
+            lock.unlock()
+        case .merged:
+            let menu = gamepad.buttonMenu.isPressed || gamepad.buttonOptions?.isPressed == true
+            var left = VRControllerHand()
+            left.trigger = gamepad.leftTrigger.value
+            left.grip = gamepad.leftShoulder.value
+            left.stick = Self.stick(gamepad.leftThumbstick)
+            left.stickClick = gamepad.leftThumbstickButton?.isPressed == true
+            left.primary = gamepad.dpad.down.isPressed || gamepad.dpad.left.isPressed
+            left.secondary = gamepad.dpad.up.isPressed || gamepad.dpad.right.isPressed
+            left.menu = menu
 
-        // GameController names face buttons by position or by label depending
-        // on the controller; either way A/B are the right and bottom buttons
-        // and X/Y the top and left ones.
-        var right = VRControllerHand()
-        right.trigger = gamepad.rightTrigger.value
-        right.grip = gamepad.rightShoulder.value
-        right.stick = stick(gamepad.rightThumbstick)
-        right.stickClick = gamepad.rightThumbstickButton?.isPressed == true
-        right.primary = gamepad.buttonA.isPressed || gamepad.buttonB.isPressed
-        right.secondary = gamepad.buttonX.isPressed || gamepad.buttonY.isPressed
+            // GameController names face buttons by position or by label depending
+            // on the controller; either way A/B are the right and bottom buttons
+            // and X/Y the top and left ones.
+            var right = VRControllerHand()
+            right.trigger = gamepad.rightTrigger.value
+            right.grip = gamepad.rightShoulder.value
+            right.stick = Self.stick(gamepad.rightThumbstick)
+            right.stickClick = gamepad.rightThumbstickButton?.isPressed == true
+            right.primary = gamepad.buttonA.isPressed || gamepad.buttonB.isPressed
+            right.secondary = gamepad.buttonX.isPressed || gamepad.buttonY.isPressed
 
-        right.motion = latestMotion
-        lock.lock()
-        state.left = left
-        state.right = right
-        lock.unlock()
+            lock.lock()
+            right.motion = mergedMotion
+            state.left = left
+            state.right = right
+            lock.unlock()
+        }
     }
 }
