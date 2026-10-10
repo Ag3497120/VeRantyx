@@ -9,6 +9,7 @@ LOG_DIR="${LOG_DIR:-$REPO_ROOT/logs}"
 VERANTYX_VR_DRIVE="${VERANTYX_VR_DRIVE:-$HOME/Verantyx_VR_Drive}"
 WINEPREFIX="${WINEPREFIX:-$VERANTYX_VR_DRIVE/SteamVR_Prefix_Wine11_Test}"
 WINE_BIN="${WINE_BIN:-$REPO_ROOT/VRDriver/wine_launcher.sh}"
+WINE_RUNTIME_BIN_RESOLVED="${WINE_RUNTIME_BIN:-$VERANTYX_VR_DRIVE/Beer/wine/WineStaging.app/Contents/Resources/wine/bin/wine}"
 DXVK_SOURCE_DIR="${DXVK_SOURCE_DIR:-$VERANTYX_VR_DRIVE/Beer/dxvk/dxvk-macOS-async-v1.10.3-20230507-repack/x64}"
 STEAM_ROOT="${STEAM_ROOT:-$WINEPREFIX/drive_c/Program Files (x86)/Steam}"
 STEAM_EXE="${STEAM_EXE:-$STEAM_ROOT/steam.exe}"
@@ -105,6 +106,38 @@ fi
 "$REPO_ROOT/scripts/build_steamvr_d3d11_proxy.sh"
 WINEPREFIX="$WINEPREFIX" VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" \
     "$REPO_ROOT/scripts/install_steamvr_d3d11_proxy.sh"
+STEAM_WEBHELPER_EXE="$STEAM_ROOT/bin/cef/cef.win64/steamwebhelper.exe"
+if [[ ! -f "$STEAM_WEBHELPER_EXE" ]]; then
+    # SteamSetup.exe only installs the bootstrapper; the client (including
+    # the WebHelper the shim replaces) is downloaded on Steam's first run.
+    echo "Fresh Windows Steam: letting it download its client files once (a few hundred MB)."
+    mkdir -p "$LOG_DIR"
+    "$WINE_BIN" "$STEAM_EXE" -no-cef-sandbox -cef-single-process >"$LOG_DIR/steam-bootstrap.log" 2>&1 &
+    bootstrap_ready=0
+    for ((elapsed = 0; elapsed < 1200; elapsed++)); do
+        if [[ -f "$STEAM_WEBHELPER_EXE" ]]; then
+            # The file appears before the update is complete; wait for it to settle.
+            size_before="$(stat -f %z "$STEAM_WEBHELPER_EXE")"
+            sleep 20
+            if [[ "$(stat -f %z "$STEAM_WEBHELPER_EXE")" == "$size_before" ]] && \
+                [[ -f "$STEAM_ROOT/bin/cef/cef.win64/steamwebhelper.exe" ]]; then
+                bootstrap_ready=1
+                break
+            fi
+        fi
+        if (( elapsed > 0 && elapsed % 30 == 0 )); then
+            echo "Waiting for Steam to finish its first update (${elapsed}s/1200s)…"
+        fi
+        sleep 1
+    done
+    echo "Stopping Steam after its first update so the WebHelper shim can be installed."
+    "$(dirname "$WINE_RUNTIME_BIN_RESOLVED")/wineserver" -k 2>/dev/null || true
+    sleep 5
+    if (( bootstrap_ready == 0 )); then
+        echo "Steam did not finish downloading its client within 1200s. See $LOG_DIR/steam-bootstrap.log" >&2
+        exit 1
+    fi
+fi
 "$REPO_ROOT/scripts/build_steamwebhelper_shim.sh"
 STEAM_ROOT="$STEAM_ROOT" STEAMWEBHELPER_SHIM="$BUILD_DIR/steamwebhelper_shim.exe" \
     "$REPO_ROOT/scripts/install_steamwebhelper_shim.sh"
