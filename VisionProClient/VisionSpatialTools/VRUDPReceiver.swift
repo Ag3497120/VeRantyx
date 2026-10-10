@@ -15,10 +15,10 @@ struct VRCompressedFrame {
 final class VRUDPReceiver: ObservableObject {
     let framePublisher = PassthroughSubject<VRCompressedFrame, Never>()
 
-    @Published private(set) var connectionStatus = "Macのエンコーダーを検索しています…"
+    @Published private(set) var connectionStatus = String(localized: "Searching for the Mac encoder…")
     @Published private(set) var receivedVideoFPS = 0
     @Published private(set) var trackingPacketsSent = 0
-    @Published private(set) var receiveDiagnostics = "映像パケットを待っています。"
+    @Published private(set) var receiveDiagnostics = String(localized: "Waiting for video packets.")
     @Published private(set) var diagnosticsSummary = "packets=0 incomplete=0"
 
     private var browser: NWBrowser?
@@ -103,10 +103,10 @@ final class VRUDPReceiver: ObservableObject {
         lastPacketReceivedAt = nil
         lastKeyFrameRequestAt = 0
         DispatchQueue.main.async { [weak self] in
-            self?.connectionStatus = "Macのエンコーダーを検索しています…"
+            self?.connectionStatus = String(localized: "Searching for the Mac encoder…")
             self?.receivedVideoFPS = 0
             self?.trackingPacketsSent = 0
-            self?.receiveDiagnostics = "映像パケットを待っています。"
+            self?.receiveDiagnostics = String(localized: "Waiting for video packets.")
         }
 
         let descriptor = NWBrowser.Descriptor.bonjour(type: "_verantyxvr._udp", domain: "local.")
@@ -161,7 +161,7 @@ final class VRUDPReceiver: ObservableObject {
                 newConnection.send(content: Data("HELLO_VR".utf8), completion: .idempotent)
                 self.setTrackingConnection(newConnection)
                 DispatchQueue.main.async { [weak self] in
-                    self?.connectionStatus = "Macに接続済み。エンコーダーから映像を待っています。"
+                    self?.connectionStatus = String(localized: "Connected to the Mac. Waiting for video from the encoder.")
                 }
             } else if case .failed(let error) = state {
                 self.connectionFailed(newConnection, error: error)
@@ -194,7 +194,7 @@ final class VRUDPReceiver: ObservableObject {
             self.connectionReadyAt = nil
             self.fpsWindowFrames = 0
             DispatchQueue.main.async {
-                self.connectionStatus = "停止中"
+                self.connectionStatus = String(localized: "Stopped")
             }
         }
     }
@@ -290,7 +290,7 @@ final class VRUDPReceiver: ObservableObject {
         connectionReadyAt = nil
         fpsWindowFrames = 0
         DispatchQueue.main.async { [weak self] in
-            self?.connectionStatus = "Macへの接続に失敗しました: \(error)"
+            self?.connectionStatus = String(localized: "Connection to the Mac failed: \(String(describing: error))")
         }
         networkQueue.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.beginBrowsing()
@@ -305,7 +305,7 @@ final class VRUDPReceiver: ObservableObject {
         browser?.cancel()
         browser = nil
         DispatchQueue.main.async { [weak self] in
-            self?.connectionStatus = "Macの検索に失敗しました: \(error)"
+            self?.connectionStatus = String(localized: "Search for the Mac failed: \(String(describing: error))")
         }
         networkQueue.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.beginBrowsing()
@@ -423,7 +423,7 @@ final class VRUDPReceiver: ObservableObject {
             didReceiveVideo = true
             videoWasStale = false
             DispatchQueue.main.async { [weak self] in
-                self?.connectionStatus = "Macから映像を受信中です。"
+                self?.connectionStatus = String(localized: "Receiving video from the Mac.")
             }
         }
     }
@@ -487,7 +487,7 @@ final class VRUDPReceiver: ObservableObject {
             self.fpsWindowStart = now
             DispatchQueue.main.async { [weak self] in
                 self?.receivedVideoFPS = fps
-                self?.receiveDiagnostics = "受信 \(packets) パケット／欠落 \(lost) フレーム"
+                self?.receiveDiagnostics = String(localized: "\(packets) packets received / \(lost) frames lost")
                 self?.diagnosticsSummary = "packets=\(packets) incomplete=\(lost)"
             }
             let sinceVideo = now - (self.lastVideoReceivedAt ?? self.connectionReadyAt ?? now)
@@ -501,7 +501,7 @@ final class VRUDPReceiver: ObservableObject {
                 if !self.videoWasStale {
                     self.videoWasStale = true
                     DispatchQueue.main.async {
-                        self.connectionStatus = "映像受信が途切れています。Mac側のSteamVRとキャプチャを確認してください。"
+                        self.connectionStatus = String(localized: "Video stopped arriving. Check SteamVR and the capture on the Mac.")
                     }
                 }
 

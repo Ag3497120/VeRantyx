@@ -1,0 +1,756 @@
+{
+  "sourceLanguage": "en",
+  "version": "1.0",
+  "strings": {
+    "received %lld / concealed %lld / underruns %lld / dropped %lld": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "受信 %1$lld／欠落補間 %2$lld／途切れ %3$lld／遅延破棄 %4$lld"
+          }
+        }
+      }
+    },
+    "waiting for audio": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "音声待ち"
+          }
+        }
+      }
+    },
+    "Not connected (hand gestures control the game)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未接続（ハンドジェスチャーで操作）"
+          }
+        }
+      }
+    },
+    "none": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "なし"
+          }
+        }
+      }
+    },
+    "gyro %@ / accelerometer %@": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "回転 %1$@ / 加速度 %2$@"
+          }
+        }
+      }
+    },
+    "Using %@ (position from hand tracking, motion sensors: %@)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ を使用中（位置はハンドトラッキング、モーション: %2$@）"
+          }
+        }
+      }
+    },
+    "Joy-Con are connected separately. Press L and R on both at the same time to merge them into one controller.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ジョイコンが1本ずつ接続されています。左右のL・Rボタンを同時に押して1つのコントローラーにまとめてください。"
+          }
+        }
+      }
+    },
+    "Searching for the Mac encoder…": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Macのエンコーダーを検索しています…"
+          }
+        }
+      }
+    },
+    "Waiting for video packets.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "映像パケットを待っています。"
+          }
+        }
+      }
+    },
+    "Connected to the Mac. Waiting for video from the encoder.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Macに接続済み。エンコーダーから映像を待っています。"
+          }
+        }
+      }
+    },
+    "Stopped": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止中"
+          }
+        }
+      }
+    },
+    "Connection to the Mac failed: %@": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Macへの接続に失敗しました: %@"
+          }
+        }
+      }
+    },
+    "Search for the Mac failed: %@": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Macの検索に失敗しました: %@"
+          }
+        }
+      }
+    },
+    "Receiving video from the Mac.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Macから映像を受信中です。"
+          }
+        }
+      }
+    },
+    "%lld packets received / %lld frames lost": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "受信 %1$lld パケット／欠落 %2$lld フレーム"
+          }
+        }
+      }
+    },
+    "Video stopped arriving. Check SteamVR and the capture on the Mac.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "映像受信が途切れています。Mac側のSteamVRとキャプチャを確認してください。"
+          }
+        }
+      }
+    },
+    "Compositor not initialized yet.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Compositorはまだ初期化されていません。"
+          }
+        }
+      }
+    },
+    "waiting for video": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "映像待ち"
+          }
+        }
+      }
+    },
+    "display %lld fps / new frames %lld fps / audio %@": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "表示 %1$lld fps／新しい映像 %2$lld fps／音声 %3$@"
+          }
+        }
+      }
+    },
+    "Waiting for HEVC video from the Mac.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MacからのHEVC映像を待っています。"
+          }
+        }
+      }
+    },
+    "0 frames decoded": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "デコード済み 0 フレーム"
+          }
+        }
+      }
+    },
+    "Decoding fell behind; old frames dropped. Requesting a keyframe.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "復号が遅れたため古いフレームを捨てました。基準フレームを要求しています。"
+          }
+        }
+      }
+    },
+    "Reconnected to the Mac. Waiting for an HEVC keyframe.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Macに再接続しました。HEVCの基準フレームを待っています。"
+          }
+        }
+      }
+    },
+    "Lost video packets. Requesting a keyframe.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "映像パケットの欠落を検出。基準フレームを要求しています。"
+          }
+        }
+      }
+    },
+    "Waiting for the HEVC keyframe and parameter sets.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "HEVCの基準フレームと映像設定を待っています。"
+          }
+        }
+      }
+    },
+    "Could not initialize the HEVC decoder.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "HEVCデコーダーを初期化できません。"
+          }
+        }
+      }
+    },
+    "Restarting video decoding (%lld).": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "映像の復号を再開しています (%lld)。"
+          }
+        }
+      }
+    },
+    "Decoding HEVC video.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "HEVC映像をデコードしています。"
+          }
+        }
+      }
+    },
+    "%lld decoded / %lld gaps / %lld recoveries / %lld queued / %lld dropped late": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "デコード済み %1$lld／欠落 %2$lld／復旧 %3$lld／待ち %4$lld／遅延破棄 %5$lld"
+          }
+        }
+      }
+    },
+    "Video decoding stalled. Requesting a keyframe.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "映像の復号が途切れています。基準フレームを再取得しています。"
+          }
+        }
+      }
+    },
+    "tracked": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "追跡中"
+          }
+        }
+      }
+    },
+    "not tracked": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未追跡"
+          }
+        }
+      }
+    },
+    "Head %@ / left hand %@ / right hand %@": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "頭部 %1$@ / 左手 %2$@ / 右手 %3$@"
+          }
+        }
+      }
+    },
+    "Left %@ / right %@": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "左 %1$@ / 右 %2$@"
+          }
+        }
+      }
+    },
+    "pose→display %.0f ms / head prediction %.0f ms": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "姿勢→表示 %.0f ms／頭部予測 %.0f ms"
+          }
+        }
+      }
+    },
+    "waiting for video / head prediction %.0f ms": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "映像待ち／頭部予測 %.0f ms"
+          }
+        }
+      }
+    },
+    "held": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保持中"
+          }
+        }
+      }
+    },
+    "not visible": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未検出"
+          }
+        }
+      }
+    },
+    "click": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "押込"
+          }
+        }
+      }
+    },
+    "Tracking starts when you press Start.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "開始ボタンを押すとトラッキングを開始します。"
+          }
+        }
+      }
+    },
+    "waiting for input": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "入力待ち"
+          }
+        }
+      }
+    },
+    "waiting for hand positions": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "手の位置待ち"
+          }
+        }
+      }
+    },
+    "World tracking is not available on this Vision Pro.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このVision Proではワールドトラッキングを利用できません。"
+          }
+        }
+      }
+    },
+    "Hand tracking is not available on this Vision Pro.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このVision Proでは手のトラッキングを利用できません。"
+          }
+        }
+      }
+    },
+    "Hand tracking is not allowed. Enable it for VeRantyx in Settings > Privacy & Security > Hand Tracking.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "手の追跡が許可されていません。Vision Proの「設定 > プライバシーとセキュリティ > 手のトラッキング」でVeRantyxを許可してください。"
+          }
+        }
+      }
+    },
+    "ARKit could not start: %@": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ARKitを開始できませんでした: %@"
+          }
+        }
+      }
+    },
+    "ARKit started. Tracking head and hands.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ARKitを起動しました。頭と手を追跡しています。"
+          }
+        }
+      }
+    },
+    "Tracking stopped": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "トラッキング停止中"
+          }
+        }
+      }
+    },
+    "VR view is stopped.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VR表示は停止中です。"
+          }
+        }
+      }
+    },
+    "Streams SteamVR from your Mac to the Vision Pro in stereo": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MacのSteamVR映像をVision Proへステレオ配信します"
+          }
+        }
+      }
+    },
+    "Mac connection": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mac接続"
+          }
+        }
+      }
+    },
+    "Video decode": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "映像デコード"
+          }
+        }
+      }
+    },
+    "Receive fps": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "受信fps"
+          }
+        }
+      }
+    },
+    "Decode fps": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "デコードfps"
+          }
+        }
+      }
+    },
+    "Receive stats": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "受信状態"
+          }
+        }
+      }
+    },
+    "Decode stats": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "映像処理"
+          }
+        }
+      }
+    },
+    "Render fps": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "描画fps"
+          }
+        }
+      }
+    },
+    "Latency": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "遅延"
+          }
+        }
+      }
+    },
+    "Head and hand tracking": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "頭・手のトラッキング"
+          }
+        }
+      }
+    },
+    "Hand positions": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "手の座標"
+          }
+        }
+      }
+    },
+    "Controller": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "コントローラー"
+          }
+        }
+      }
+    },
+    "SteamVR input": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "SteamVR入力"
+          }
+        }
+      }
+    },
+    "Poses sent": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "姿勢送信"
+          }
+        }
+      }
+    },
+    "Display": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "表示"
+          }
+        }
+      }
+    },
+    "Diagnostics": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "起動診断"
+          }
+        }
+      }
+    },
+    "Show real hands too (to check alignment with the game's hands)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "現実の手も表示する（ゲームの手との位置合わせ確認用）"
+          }
+        }
+      }
+    },
+    "Starting…": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "起動中…"
+          }
+        }
+      }
+    },
+    "Start stereo VR": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ステレオVRを開始"
+          }
+        }
+      }
+    },
+    "Stop": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止"
+          }
+        }
+      }
+    },
+    "The immersive VR view is already open. Press the Digital Crown to close it, then start again.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "没入VRはすでに開いています。Digital Crownで終了してから再度開始してください。"
+          }
+        }
+      }
+    },
+    "Immersive VR is showing. See “Receive fps” and “Render fps” for the video state.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "没入VRを表示中です。映像の状態は「受信fps」「描画fps」で確認できます。"
+          }
+        }
+      }
+    },
+    "The VR view was cancelled.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VR表示がキャンセルされました。"
+          }
+        }
+      }
+    },
+    "The VR view state is unknown.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VR表示の状態を取得できません。"
+          }
+        }
+      }
+    },
+    "visionOS could not open the space. If another immersive app is open, close it with the Digital Crown and try again. The Diagnostics row shows the compositor state.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "visionOSが空間を開けませんでした。別の没入アプリが開いていればDigital Crownで終了してから再試行してください。診断欄にCompositorの状態を表示します。"
+          }
+        }
+      }
+    },
+    "Joy-Con (recommended): pair both Joy-Con in visionOS Settings > Bluetooth, then press L and R on both at the same time to merge them into one controller. Hand tracking supplies the hand positions; the Joy-Con supply the buttons. ZL/ZR = trigger, L/R = grip (grab), sticks (with click), right A/B = A, right X/Y = B, left ↓/← = X, left ↑/→ = Y, −/+ = menu. Without Joy-Con, gestures control the game: thumb+index pinch = trigger, curl three fingers = grip, thumb+ring = A/X, thumb+little = B/Y, thumb+middle pinch and move the hand = stick.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ジョイコン（推奨）: Vision Proの「設定 > Bluetooth」で左右のジョイコンをペアリングし、左右のL・Rボタンを同時に押して1つのコントローラーにまとめます。手の位置はハンドトラッキング、ボタンはジョイコンです。ZL/ZR＝トリガー、L/R＝グリップ（つかむ）、スティック（押し込みあり）、右のA・B＝A、右のX・Y＝B、左の↓・←＝X、左の↑・→＝Y、−/＋＝メニュー。ジョイコンがないときはジェスチャー操作: 親指と人差し指でトリガー、3本指を握るとグリップ、親指と薬指でA/X、親指と小指でB/Y、親指と中指でつまんだまま手を動かすとスティック。"
+          }
+        }
+      }
+    }
+  }
+}

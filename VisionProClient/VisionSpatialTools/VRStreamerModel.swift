@@ -3,9 +3,9 @@ import Foundation
 
 @MainActor
 final class VRStreamerModel: ObservableObject {
-    @Published private(set) var immersiveDiagnostic = "Compositorはまだ初期化されていません。"
+    @Published private(set) var immersiveDiagnostic = String(localized: "Compositor not initialized yet.")
     @Published private(set) var isImmersiveSpacePresented = false
-    @Published private(set) var rendererStatus = "映像待ち"
+    @Published private(set) var rendererStatus = String(localized: "waiting for video")
     @Published var showsRealHands = false
 
     let receiver = VRUDPReceiver()
@@ -33,7 +33,7 @@ final class VRStreamerModel: ObservableObject {
     }
 
     func recordRenderStatistics(_ statistics: VRRenderStatistics) {
-        rendererStatus = "表示 \(statistics.renderFPS) fps／新しい映像 \(statistics.newFrameFPS) fps／音声 \(VRAudioPlayer.shared.status)"
+        rendererStatus = String(localized: "display \(statistics.renderFPS) fps / new frames \(statistics.newFrameFPS) fps / audio \(VRAudioPlayer.shared.status)")
         receiver.sendClientDiagnostics(
             "receive_fps=\(receiver.receivedVideoFPS) decode_fps=\(decoder.decodedVideoFPS) " +
             "render_fps=\(statistics.renderFPS) new_frame_fps=\(statistics.newFrameFPS) " +

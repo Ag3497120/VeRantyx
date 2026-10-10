@@ -73,7 +73,7 @@ On first launch, allow local network access and hand tracking.
 
 Optional: pair Joy-Con in visionOS *Settings > Bluetooth*, then press L and R
 on both at the same time to merge them into one controller. The app's
-*コントローラー* row shows the controller in use and which motion sensors
+*Controller* row shows the controller in use and which motion sensors
 visionOS exposes.
 
 ## 4. Play
@@ -84,7 +84,7 @@ WINEPREFIX="$HOME/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test" ./scripts/launch
 
 The script rebuilds and installs the DLLs when they changed, starts the
 encoder, Steam and SteamVR, waits for the Vision Pro app, then launches the
-game through Steam. On the headset, open **MBP AVP VR** and tap
+game through Steam. On the headset, open **VeRantyx** and tap
 **ステレオVRを開始**. The window closes while the immersive view is open and
 comes back when you press the Digital Crown.
 

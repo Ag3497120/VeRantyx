@@ -88,9 +88,9 @@ private let vrDecompressionOutputCallback: VTDecompressionOutputCallback = {
 
 /// Rebuilds Annex-B HEVC packets as CMSampleBuffers and decodes directly to Metal-compatible pixels.
 final class VRVideoDecoder: ObservableObject {
-    @Published private(set) var status = "MacからのHEVC映像を待っています。"
+    @Published private(set) var status = String(localized: "Waiting for HEVC video from the Mac.")
     @Published private(set) var decodedVideoFPS = 0
-    @Published private(set) var decodeDiagnostics = "デコード済み 0 フレーム"
+    @Published private(set) var decodeDiagnostics = String(localized: "0 frames decoded")
     // ASCII counters for the diagnostics sent to the Mac.
     @Published private(set) var diagnosticsSummary = "decoded=0 recoveries=0 gaps=0 late_drops=0"
 
@@ -179,7 +179,7 @@ final class VRVideoDecoder: ObservableObject {
         pendingFrameLock.unlock()
 
         if isActive {
-            if discontinuity { continueAfterGap("復号が遅れたため古いフレームを捨てました。基準フレームを要求しています。") }
+            if discontinuity { continueAfterGap(String(localized: "Decoding fell behind; old frames dropped. Requesting a keyframe.")) }
             if let pending { decodeFrameOnQueue(pending.frame) }
         }
 
@@ -232,9 +232,9 @@ final class VRVideoDecoder: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             guard let self, currentGeneration >= self.uiGeneration else { return }
             self.uiGeneration = currentGeneration
-            self.status = "MacからのHEVC映像を待っています。"
+            self.status = String(localized: "Waiting for HEVC video from the Mac.")
             self.decodedVideoFPS = 0
-            self.decodeDiagnostics = "デコード済み 0 フレーム"
+            self.decodeDiagnostics = String(localized: "0 frames decoded")
         }
     }
 
@@ -256,12 +256,12 @@ final class VRVideoDecoder: ObservableObject {
                 guard let self else { return }
                 self.uiGeneration = max(self.uiGeneration, currentGeneration)
             }
-            updateStatus("Macに再接続しました。HEVCの基準フレームを待っています。")
+            updateStatus(String(localized: "Reconnected to the Mac. Waiting for an HEVC keyframe."))
         }
         if let lastSequence {
             guard Int32(bitPattern: frame.sequence &- lastSequence) > 0 else { return }
             if frame.sequence != lastSequence &+ 1 {
-                continueAfterGap("映像パケットの欠落を検出。基準フレームを要求しています。")
+                continueAfterGap(String(localized: "Lost video packets. Requesting a keyframe."))
             }
         }
         lastSequence = frame.sequence
@@ -311,7 +311,7 @@ final class VRVideoDecoder: ObservableObject {
             return
         }
         guard vpsData != nil, spsData != nil, ppsData != nil else {
-            updateStatus("HEVCの基準フレームと映像設定を待っています。")
+            updateStatus(String(localized: "Waiting for the HEVC keyframe and parameter sets."))
             requestRecoveryFrame()
             return
         }
@@ -320,7 +320,7 @@ final class VRVideoDecoder: ObservableObject {
             createDecompressionSession()
         }
         guard let decompressionSession else {
-            updateStatus("HEVCデコーダーを初期化できません。")
+            updateStatus(String(localized: "Could not initialize the HEVC decoder."))
             requestRecoveryFrame()
             return
         }
@@ -350,13 +350,13 @@ final class VRVideoDecoder: ObservableObject {
         if decodeStatus != noErr || context.outputStatus != noErr || !context.didDecode {
             let failure = decodeStatus != noErr ? decodeStatus : context.outputStatus
             print("[VRVideoDecoder] Decode failed/dropped: status=\(failure), seq=\(frame.sequence)")
-            requireKeyFrame("映像の復号を再開しています (\(failure))。")
+            requireKeyFrame(String(localized: "Restarting video decoding (\(Int(failure)))."))
         } else {
             needsKeyFrame = false
             decodedFrameCount += 1
             fpsWindowFrames += 1
             lastDecodedAt = ProcessInfo.processInfo.systemUptime
-            updateStatus("HEVC映像をデコードしています。")
+            updateStatus(String(localized: "Decoding HEVC video."))
         }
     }
 
@@ -394,7 +394,7 @@ final class VRVideoDecoder: ObservableObject {
         let dropped = droppedPendingFrames
         let queued = pendingFrames.count
         pendingFrameLock.unlock()
-        let text = "デコード済み \(decodedFrameCount)／欠落 \(gapCount)／復旧 \(recoveryCount)／待ち \(queued)／遅延破棄 \(dropped)"
+        let text = String(localized: "\(decodedFrameCount) decoded / \(gapCount) gaps / \(recoveryCount) recoveries / \(queued) queued / \(dropped) dropped late")
         let summary = "decoded=\(decodedFrameCount) gaps=\(gapCount) recoveries=\(recoveryCount) late_drops=\(dropped)"
         let currentGeneration = generation
         DispatchQueue.main.async { [weak self] in
@@ -405,7 +405,7 @@ final class VRVideoDecoder: ObservableObject {
         }
         if needsKeyFrame { requestRecoveryFrame() }
         if let lastDecodedAt, now - lastDecodedAt > 3 {
-            updateStatus("映像の復号が途切れています。基準フレームを再取得しています。")
+            updateStatus(String(localized: "Video decoding stalled. Requesting a keyframe."))
             requestRecoveryFrame()
         }
     }
@@ -429,7 +429,7 @@ final class VRVideoDecoder: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             guard let self, currentGeneration >= self.uiGeneration else { return }
             self.uiGeneration = currentGeneration
-            self.status = "停止中"
+            self.status = String(localized: "Stopped")
         }
     }
 

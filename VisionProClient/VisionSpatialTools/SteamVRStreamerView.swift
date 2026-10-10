@@ -8,7 +8,7 @@ struct SteamVRStreamerView: View {
     @ObservedObject private var tracking: VisionTrackingManager
     @ObservedObject private var decoder: VRVideoDecoder
     @ObservedObject private var model: VRStreamerModel
-    @State private var immersiveStatus = "VR表示は停止中です。"
+    @State private var immersiveStatus = String(localized: "VR view is stopped.")
     @State private var isStarting = false
 
     init(model: VRStreamerModel) {
@@ -21,33 +21,33 @@ struct SteamVRStreamerView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             VStack(alignment: .leading, spacing: 6) {
-                Text("MBP AVP VR")
+                Text("VeRantyx")
                     .font(.largeTitle.bold())
-                Text("MacのSteamVR映像をVision Proへステレオ配信します")
+                Text("Streams SteamVR from your Mac to the Vision Pro in stereo")
                     .foregroundStyle(.secondary)
             }
 
             VStack(alignment: .leading, spacing: 12) {
-                statusRow(title: "Mac接続", detail: receiver.connectionStatus)
-                statusRow(title: "映像デコード", detail: decoder.status)
-                statusRow(title: "受信fps", detail: "\(receiver.receivedVideoFPS) fps")
-                statusRow(title: "デコードfps", detail: "\(decoder.decodedVideoFPS) fps")
-                statusRow(title: "受信状態", detail: receiver.receiveDiagnostics)
-                statusRow(title: "映像処理", detail: decoder.decodeDiagnostics)
-                statusRow(title: "描画fps", detail: model.rendererStatus)
-                statusRow(title: "遅延", detail: tracking.latencyStatus)
-                statusRow(title: "頭・手のトラッキング", detail: tracking.status)
-                statusRow(title: "手の座標", detail: tracking.handPositionStatus)
-                statusRow(title: "コントローラー", detail: tracking.controllerStatus)
-                statusRow(title: "SteamVR入力", detail: tracking.inputStatus)
-                statusRow(title: "姿勢送信", detail: "\(receiver.trackingPacketsSent) パケット")
-                statusRow(title: "表示", detail: immersiveStatus)
-                statusRow(title: "起動診断", detail: model.immersiveDiagnostic)
+                statusRow(title: "Mac connection", detail: receiver.connectionStatus)
+                statusRow(title: "Video decode", detail: decoder.status)
+                statusRow(title: "Receive fps", detail: "\(receiver.receivedVideoFPS) fps")
+                statusRow(title: "Decode fps", detail: "\(decoder.decodedVideoFPS) fps")
+                statusRow(title: "Receive stats", detail: receiver.receiveDiagnostics)
+                statusRow(title: "Decode stats", detail: decoder.decodeDiagnostics)
+                statusRow(title: "Render fps", detail: model.rendererStatus)
+                statusRow(title: "Latency", detail: tracking.latencyStatus)
+                statusRow(title: "Head and hand tracking", detail: tracking.status)
+                statusRow(title: "Hand positions", detail: tracking.handPositionStatus)
+                statusRow(title: "Controller", detail: tracking.controllerStatus)
+                statusRow(title: "SteamVR input", detail: tracking.inputStatus)
+                statusRow(title: "Poses sent", detail: "\(receiver.trackingPacketsSent) packets")
+                statusRow(title: "Display", detail: immersiveStatus)
+                statusRow(title: "Diagnostics", detail: model.immersiveDiagnostic)
             }
             .padding(18)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
 
-            Toggle("現実の手も表示する（ゲームの手との位置合わせ確認用）", isOn: $model.showsRealHands)
+            Toggle("Show real hands too (to check alignment with the game's hands)", isOn: $model.showsRealHands)
                 .frame(maxWidth: 560)
 
             HStack(spacing: 14) {
@@ -60,25 +60,25 @@ struct SteamVRStreamerView: View {
                 } label: {
                     if isStarting {
                         ProgressView().controlSize(.small)
-                        Text("起動中…")
+                        Text("Starting…")
                     } else {
-                        Text("ステレオVRを開始")
+                        Text("Start stereo VR")
                     }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(isStarting)
 
-                Button("停止") {
+                Button("Stop") {
                     Task {
                         await dismissImmersiveSpace()
                         model.stop()
-                        immersiveStatus = "VR表示は停止中です。"
+                        immersiveStatus = String(localized: "VR view is stopped.")
                     }
                 }
                 .buttonStyle(.bordered)
             }
 
-            Text("ジョイコン（推奨）: Vision Proの「設定 > Bluetooth」で左右のジョイコンをペアリングし、左右のL・Rボタンを同時に押して1つのコントローラーにまとめます。手の位置はハンドトラッキング、ボタンはジョイコンです。ZL/ZR＝トリガー、L/R＝グリップ（つかむ）、スティック（押し込みあり）、右のA・B＝A、右のX・Y＝B、左の↓・←＝X、左の↑・→＝Y、−/＋＝メニュー。肩の後ろへ手を伸ばすと、手が見えなくなってもバックパック位置に手を置くので、そこでL/Rを押すと弾を取れます。ジョイコンがないときはジェスチャー操作: 親指と人差し指でトリガー、3本指を握るとグリップ、親指と薬指でA/X、親指と小指でB/Y、親指と中指でつまんだまま手を動かすとスティック。")
+            Text("Joy-Con (recommended): pair both Joy-Con in visionOS Settings > Bluetooth, then press L and R on both at the same time to merge them into one controller. Hand tracking supplies the hand positions; the Joy-Con supply the buttons. ZL/ZR = trigger, L/R = grip (grab), sticks (with click), right A/B = A, right X/Y = B, left ↓/← = X, left ↑/→ = Y, −/+ = menu. Without Joy-Con, gestures control the game: thumb+index pinch = trigger, curl three fingers = grip, thumb+ring = A/X, thumb+little = B/Y, thumb+middle pinch and move the hand = stick.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -101,7 +101,7 @@ struct SteamVRStreamerView: View {
         defer { isStarting = false }
 
         if model.isImmersiveSpacePresented {
-            immersiveStatus = "没入VRはすでに開いています。Digital Crownで終了してから再度開始してください。"
+            immersiveStatus = String(localized: "The immersive VR view is already open. Press the Digital Crown to close it, then start again.")
             return
         }
 
@@ -120,7 +120,7 @@ struct SteamVRStreamerView: View {
         case .opened:
             model.recordImmersiveEvent("openImmersiveSpace returned opened.")
             if await model.start() {
-                immersiveStatus = "没入VRを表示中です。映像の状態は「受信fps」「描画fps」で確認できます。"
+                immersiveStatus = String(localized: "Immersive VR is showing. See “Receive fps” and “Render fps” for the video state.")
                 // Pinches meant for the game must not land on this window's
                 // buttons (Stop would end immersion). It comes back when the
                 // Digital Crown closes the immersive space.
@@ -133,18 +133,18 @@ struct SteamVRStreamerView: View {
                 immersiveStatus = trackingError
             }
         case .userCancelled:
-            immersiveStatus = "VR表示がキャンセルされました。"
+            immersiveStatus = String(localized: "The VR view was cancelled.")
             model.recordImmersiveEvent("openImmersiveSpace returned userCancelled.")
         case .error:
-            immersiveStatus = "visionOSが空間を開けませんでした。別の没入アプリが開いていればDigital Crownで終了してから再試行してください。診断欄にCompositorの状態を表示します。"
+            immersiveStatus = String(localized: "visionOS could not open the space. If another immersive app is open, close it with the Digital Crown and try again. The Diagnostics row shows the compositor state.")
             model.recordImmersiveEvent("Immersive retry returned error. ImmersiveSpace appeared=\(model.isImmersiveSpacePresented).")
         @unknown default:
-            immersiveStatus = "VR表示の状態を取得できません。"
+            immersiveStatus = String(localized: "The VR view state is unknown.")
             model.recordImmersiveEvent("openImmersiveSpace returned an unknown result.")
         }
     }
 
-    private func statusRow(title: String, detail: String) -> some View {
+    private func statusRow(title: LocalizedStringKey, detail: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 14) {
             Text(title)
                 .font(.headline)

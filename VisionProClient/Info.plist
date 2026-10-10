@@ -14,7 +14,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>MBP AVP VR</string>
+	<string>VeRantyx</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -30,11 +30,11 @@
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Mac上のVRエンコーダーから映像を受信するため、ローカルネットワークを使用します。</string>
+	<string>Receives the VR video stream from the encoder on your Mac over the local network.</string>
 	<key>NSWorldSensingUsageDescription</key>
-	<string>SteamVRへVision Proの頭部位置を送るため、空間トラッキングを使用します。</string>
+	<string>Sends the Vision Pro head pose to SteamVR.</string>
 	<key>NSHandsTrackingUsageDescription</key>
-	<string>SteamVRのコントローラー位置とトリガー入力を再現するため、ハンドトラッキングを使用します。</string>
+	<string>Uses hand tracking to position the SteamVR controllers and read trigger input.</string>
 	<key>GCSupportedGameControllers</key>
 	<array>
 		<dict>

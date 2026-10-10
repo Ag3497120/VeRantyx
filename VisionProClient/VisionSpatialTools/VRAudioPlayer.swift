@@ -109,7 +109,7 @@ final class VRAudioPlayer {
     }
 
     var status: String {
-        queue.sync { started ? "受信 \(receivedPackets)／欠落補間 \(concealedPackets)／途切れ \(underruns)／遅延破棄 \(droppedPackets)" : "音声待ち" }
+        queue.sync { started ? String(localized: "received \(receivedPackets) / concealed \(concealedPackets) / underruns \(underruns) / dropped \(droppedPackets)") : String(localized: "waiting for audio") }
     }
 
     private func ensureEngine(sampleRate: Double, channels: Int) {

@@ -226,13 +226,13 @@ final class VRPoseSampler: @unchecked Sendable {
     }
 
     private func makeSnapshot() -> VRTrackingSnapshot {
-        let head = headIsTracked ? "追跡中" : "未追跡"
-        let status = "頭部 \(head) / 左手 \(leftHand.trackingLabel) / 右手 \(rightHand.trackingLabel)"
-        let input = "左 \(leftHand.inputLabel(primary: "X", secondary: "Y")) / 右 \(rightHand.inputLabel(primary: "A", secondary: "B"))"
-        let positions = "左 \(leftHand.positionLabel) / 右 \(rightHand.positionLabel)"
+        let head = headIsTracked ? String(localized: "tracked") : String(localized: "not tracked")
+        let status = String(localized: "Head \(head) / left hand \(leftHand.trackingLabel) / right hand \(rightHand.trackingLabel)")
+        let input = String(localized: "Left \(leftHand.inputLabel(primary: "X", secondary: "Y")) / right \(rightHand.inputLabel(primary: "A", secondary: "B"))")
+        let positions = String(localized: "Left \(leftHand.positionLabel) / right \(rightHand.positionLabel)")
         let latency = measuredLatency > 0
-            ? String(format: "姿勢→表示 %.0f ms／頭部予測 %.0f ms", measuredLatency * 1000, predictionHorizon * 1000)
-            : String(format: "映像待ち／頭部予測 %.0f ms", predictionHorizon * 1000)
+            ? String(format: String(localized: "pose→display %.0f ms / head prediction %.0f ms"), measuredLatency * 1000, predictionHorizon * 1000)
+            : String(format: String(localized: "waiting for video / head prediction %.0f ms"), predictionHorizon * 1000)
         return VRTrackingSnapshot(controllerStatus: gameController.snapshot().status,
                                   status: status, inputStatus: input,
                                   handPositionStatus: positions, latencyStatus: latency)
@@ -376,14 +376,14 @@ private struct HandState {
 
     var trackingLabel: String {
         switch trackingState {
-        case 1: return "追跡中"
-        case 2: return "保持中"
-        default: return "未検出"
+        case 1: return String(localized: "tracked")
+        case 2: return String(localized: "held")
+        default: return String(localized: "not visible")
         }
     }
 
     var positionLabel: String {
-        guard trackingState != 0 else { return "未検出" }
+        guard trackingState != 0 else { return String(localized: "not visible") }
         let position = transform.columns.3
         return String(format: "(%.2f, %.2f, %.2f)m", position.x, position.y, position.z)
     }
@@ -391,7 +391,7 @@ private struct HandState {
     func inputLabel(primary: String, secondary: String) -> String {
         let stickLabel: String
         if buttonBits & 4 != 0 {
-            stickLabel = "押込"
+            stickLabel = String(localized: "click")
         } else if buttonBits & 8 == 0 {
             stickLabel = "–"
         } else {
@@ -817,11 +817,11 @@ private struct HandJoints {
 
 @MainActor
 final class VisionTrackingManager: ObservableObject {
-    @Published private(set) var status = "開始ボタンを押すとトラッキングを開始します。"
-    @Published private(set) var inputStatus = "入力待ち"
-    @Published private(set) var handPositionStatus = "手の位置待ち"
-    @Published private(set) var latencyStatus = "映像待ち"
-    @Published private(set) var controllerStatus = "未接続（ハンドジェスチャーで操作）"
+    @Published private(set) var status = String(localized: "Tracking starts when you press Start.")
+    @Published private(set) var inputStatus = String(localized: "waiting for input")
+    @Published private(set) var handPositionStatus = String(localized: "waiting for hand positions")
+    @Published private(set) var latencyStatus = String(localized: "waiting for video")
+    @Published private(set) var controllerStatus = String(localized: "Not connected (hand gestures control the game)")
 
     private var session = ARKitSession()
     let deviceAnchorHistory = DeviceAnchorHistory()
@@ -837,11 +837,11 @@ final class VisionTrackingManager: ObservableObject {
         guard !isRunning else { return true }
 
         guard WorldTrackingProvider.isSupported else {
-            status = "このVision Proではワールドトラッキングを利用できません。"
+            status = String(localized: "World tracking is not available on this Vision Pro.")
             return false
         }
         guard HandTrackingProvider.isSupported else {
-            status = "このVision Proでは手のトラッキングを利用できません。"
+            status = String(localized: "Hand tracking is not available on this Vision Pro.")
             return false
         }
 
@@ -854,12 +854,12 @@ final class VisionTrackingManager: ObservableObject {
             let authorization = await session.requestAuthorization(for: requiredAuthorizations)
             let denied = requiredAuthorizations.filter { authorization[$0] != .allowed }
             guard denied.isEmpty else {
-                status = "手の追跡が許可されていません。Vision Proの「設定 > プライバシーとセキュリティ > 手のトラッキング」でMBP AVP VRを許可してください。"
+                status = String(localized: "Hand tracking is not allowed. Enable it for VeRantyx in Settings > Privacy & Security > Hand Tracking.")
                 return false
             }
             try await session.run([worldTracking, handTracking])
         } catch {
-            status = "ARKitを開始できませんでした: \(error.localizedDescription)"
+            status = String(localized: "ARKit could not start: \(error.localizedDescription)")
             print("Vision tracking start failed: \(error)")
             session.stop()
             return false
@@ -869,7 +869,7 @@ final class VisionTrackingManager: ObservableObject {
             Task { @MainActor [weak self] in self?.apply(snapshot) }
         }
         isRunning = true
-        status = "ARKitを起動しました。頭と手を追跡しています。"
+        status = String(localized: "ARKit started. Tracking head and hands.")
         return true
     }
 
@@ -877,10 +877,10 @@ final class VisionTrackingManager: ObservableObject {
         sampler.deactivate()
         session.stop()
         isRunning = false
-        status = "トラッキング停止中"
-        inputStatus = "入力待ち"
-        handPositionStatus = "手の位置待ち"
-        latencyStatus = "映像待ち"
+        status = String(localized: "Tracking stopped")
+        inputStatus = String(localized: "waiting for input")
+        handPositionStatus = String(localized: "waiting for hand positions")
+        latencyStatus = String(localized: "waiting for video")
     }
 
     private func apply(_ snapshot: VRTrackingSnapshot) {

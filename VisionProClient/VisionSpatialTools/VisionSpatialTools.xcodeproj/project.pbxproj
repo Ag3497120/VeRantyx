@@ -14,6 +14,7 @@
 		F44BEF7EF6006A875BA18565 /* VRVideoDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93D5401B9519BB8B33803C45 /* VRVideoDecoder.swift */; };
 		7F92B3861C4B4C28935A112A /* VisionTrackingManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F92B3861C4B4C28935A112B /* VisionTrackingManager.swift */; };
 		91A467D05E174D6E93657D48 /* VRStreamerModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91A467D05E174D6E93657D49 /* VRStreamerModel.swift */; };
+		91A467D05E174D6E93657D54 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 91A467D05E174D6E93657D55 /* Localizable.xcstrings */; };
 		91A467D05E174D6E93657D52 /* VRAudioPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91A467D05E174D6E93657D53 /* VRAudioPlayer.swift */; };
 		91A467D05E174D6E93657D50 /* VRGameControllerInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91A467D05E174D6E93657D51 /* VRGameControllerInput.swift */; };
 		91A467D05E174D6E93657D4A /* VRCompositorRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91A467D05E174D6E93657D4B /* VRCompositorRenderer.swift */; };
@@ -26,6 +27,7 @@
 		93D5401B9519BB8B33803C45 /* VRVideoDecoder.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRVideoDecoder.swift; sourceTree = "<group>"; };
 		7F92B3861C4B4C28935A112B /* VisionTrackingManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VisionTrackingManager.swift; sourceTree = "<group>"; };
 		91A467D05E174D6E93657D49 /* VRStreamerModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRStreamerModel.swift; sourceTree = "<group>"; };
+		91A467D05E174D6E93657D55 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		91A467D05E174D6E93657D53 /* VRAudioPlayer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRAudioPlayer.swift; sourceTree = "<group>"; };
 		91A467D05E174D6E93657D51 /* VRGameControllerInput.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRGameControllerInput.swift; sourceTree = "<group>"; };
 		91A467D05E174D6E93657D4B /* VRCompositorRenderer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRCompositorRenderer.swift; sourceTree = "<group>"; };
@@ -95,6 +97,7 @@
 				93D5401B9519BB8B33803C45 /* VRVideoDecoder.swift */,
 				7F92B3861C4B4C28935A112B /* VisionTrackingManager.swift */,
 				91A467D05E174D6E93657D49 /* VRStreamerModel.swift */,
+				91A467D05E174D6E93657D55 /* Localizable.xcstrings */,
 				91A467D05E174D6E93657D53 /* VRAudioPlayer.swift */,
 				91A467D05E174D6E93657D51 /* VRGameControllerInput.swift */,
 				91A467D05E174D6E93657D4B /* VRCompositorRenderer.swift */,
@@ -146,6 +149,7 @@
 			knownRegions = (
 				en,
 				Base,
+				ja,
 			);
 			mainGroup = B32A53EA2F634C6400A375D2;
 			minimizedProjectReferenceProxies = 1;
@@ -164,6 +168,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				91A467D05E174D6E93657D54 /* Localizable.xcstrings in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

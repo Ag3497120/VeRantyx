@@ -41,11 +41,11 @@ final class VRGameControllerInput: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private var state = Snapshot(left: nil, right: nil, status: "未接続（ハンドジェスチャーで操作）")
+    private var state = Snapshot(left: nil, right: nil, status: String(localized: "Not connected (hand gestures control the game)"))
     private let queue = DispatchQueue(label: "com.verantyx.game-controller", qos: .userInteractive)
     private var observers: [NSObjectProtocol] = []
     private weak var activeController: GCController?
-    private var motionDescription = "なし"
+    private var motionDescription = String(localized: "none")
     private var latestMotion: VRControllerMotion?
 
     /// A merged Joy-Con pair exposes one motion source. It is applied to the
@@ -114,12 +114,12 @@ final class VRGameControllerInput: @unchecked Sendable {
                 }
                 if let motion = chosen.motion {
                     if motion.sensorsRequireManualActivation { motion.sensorsActive = true }
-                    motionDescription = "回転\(motion.hasRotationRate ? "有" : "無")/加速度\(motion.hasGravityAndUserAcceleration ? "分離" : "合算")"
+                    motionDescription = String(localized: "gyro \(motion.hasRotationRate ? "yes" : "no") / accelerometer \(motion.hasGravityAndUserAcceleration ? "separated" : "combined")")
                     motion.valueChangedHandler = { [weak self] motion in
                         self?.updateMotion(from: motion)
                     }
                 } else {
-                    motionDescription = "なし"
+                    motionDescription = String(localized: "none")
                 }
                 print("Game controller in use: \(Self.name(of: chosen)) (\(chosen.productCategory)), motion: \(motionDescription)")
             }
@@ -127,12 +127,12 @@ final class VRGameControllerInput: @unchecked Sendable {
 
         if let chosen, let gamepad = chosen.extendedGamepad {
             update(from: gamepad)
-            setStatus("\(Self.name(of: chosen)) を使用中（位置はハンドトラッキング、モーション: \(motionDescription)）")
+            setStatus(String(localized: "Using \(Self.name(of: chosen)) (position from hand tracking, motion sensors: \(motionDescription))"))
         } else {
             let singles = controllers.filter { Self.isSingleJoyCon($0) }
             let status = singles.isEmpty
-                ? "未接続（ハンドジェスチャーで操作）"
-                : "ジョイコンが1本ずつ接続されています。左右のL・Rボタンを同時に押して1つのコントローラーにまとめてください。"
+                ? String(localized: "Not connected (hand gestures control the game)")
+                : String(localized: "Joy-Con are connected separately. Press L and R on both at the same time to merge them into one controller.")
             lock.lock()
             state = Snapshot(left: nil, right: nil, status: status)
             lock.unlock()
