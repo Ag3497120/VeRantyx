@@ -106,6 +106,26 @@ fi
 "$REPO_ROOT/scripts/build_steamvr_d3d11_proxy.sh"
 WINEPREFIX="$WINEPREFIX" VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" \
     "$REPO_ROOT/scripts/install_steamvr_d3d11_proxy.sh"
+
+# DXVK names an Apple GPU "NVIDIA GeForce 6800" (its fallback for an unknown
+# vendor), so Alyx shows its "below the recommended specification" dialog on
+# every start. A dxvk.conf beside hlvr.exe gives the game a current GPU name
+# instead; the compositor's own DXVK is not affected. Read at game start.
+HLA_DXVK_CONF="$(dirname "$GAME_EXE")/dxvk.conf"
+if [[ "${VERANTYX_DXVK_GPU_SPOOF:-1}" == "1" ]]; then
+    hla_dxvk_conf_content="$(printf '%s\n' \
+        '# Written by VeRantyx (launch_vision_pro_vr.sh); VERANTYX_DXVK_GPU_SPOOF=0 removes it.' \
+        'dxgi.customVendorId = 10de' \
+        'dxgi.customDeviceId = 2206' \
+        "dxgi.customDeviceDesc = \"${VERANTYX_DXVK_GPU_NAME:-NVIDIA GeForce RTX 3080}\"" \
+        'dxvk.enableAsync = True')"
+    if [[ ! -f "$HLA_DXVK_CONF" ]] || [[ "$(cat "$HLA_DXVK_CONF")" != "$hla_dxvk_conf_content" ]]; then
+        printf '%s\n' "$hla_dxvk_conf_content" >"$HLA_DXVK_CONF.verantyx-tmp" && mv -f "$HLA_DXVK_CONF.verantyx-tmp" "$HLA_DXVK_CONF"
+        echo "Wrote $HLA_DXVK_CONF so Alyx sees a current GPU name instead of DXVK's GeForce 6800 placeholder."
+    fi
+elif [[ -f "$HLA_DXVK_CONF" ]] && grep -q 'Written by VeRantyx' "$HLA_DXVK_CONF"; then
+    rm -f "$HLA_DXVK_CONF"
+fi
 STEAM_WEBHELPER_EXE="$STEAM_ROOT/bin/cef/cef.win64/steamwebhelper.exe"
 if [[ ! -f "$STEAM_WEBHELPER_EXE" ]]; then
     # SteamSetup.exe only installs the bootstrapper; the client (including
