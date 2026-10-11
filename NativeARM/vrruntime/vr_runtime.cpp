@@ -154,22 +154,56 @@ static void latch_tangents() {
             fclose(f);
         }
     }
-    // Render target: VERANTYX_EYE_WIDTH/HEIGHT, or VERANTYX_EYE_PIXELS at the eye's aspect.
+    // The frustum the game renders: the union of both eyes (see Config).
+    g_cfg.sharedFrustum = env_number("VERANTYX_SHARED_FRUSTUM", 1, 0, 1) >= 1.0;
+    const float *L = g_cfg.tangentsLeft, *R = g_cfg.tangentsRight;
+    g_cfg.renderTangents[0] = std::min(L[0], R[0]); g_cfg.renderTangents[1] = std::max(L[1], R[1]);
+    g_cfg.renderTangents[2] = std::min(L[2], R[2]); g_cfg.renderTangents[3] = std::max(L[3], R[3]);
+    // Render target: VERANTYX_EYE_WIDTH/HEIGHT, or VERANTYX_EYE_PIXELS of the
+    // eye's own frustum (averaged over both eyes), grown by the union's extra
+    // field so the eye's own part keeps that pixel density.
     uint32_t w = (uint32_t)env_number("VERANTYX_EYE_WIDTH", 0, 0, 8192);
     uint32_t hgt = (uint32_t)env_number("VERANTYX_EYE_HEIGHT", 0, 0, 8192);
     if (!w || !hgt) {
         double pixels = env_number("VERANTYX_EYE_PIXELS", 1000000.0, 50000.0, 16000000.0);
-        float aspect = (g_cfg.tangentsLeft[1] - g_cfg.tangentsLeft[0]) / (g_cfg.tangentsLeft[3] - g_cfg.tangentsLeft[2]);
-        aspect = std::min(2.0f, std::max(0.5f, aspect));
-        double height = sqrt(pixels / aspect);
+        float ew = 0.5f * ((L[1] - L[0]) + (R[1] - R[0])), eh = 0.5f * ((L[3] - L[2]) + (R[3] - R[2]));
+        float aspect = std::min(2.0f, std::max(0.5f, ew / eh));
+        double height = sqrt(pixels / aspect), width = height * aspect;
+        if (g_cfg.sharedFrustum) {
+            const float *U = g_cfg.renderTangents;
+            width *= (U[1] - U[0]) / ew;
+            height *= (U[3] - U[2]) / eh;
+        }
         hgt = (uint32_t)(((uint32_t)lround(height) + 1u) & ~1u);
-        w = (uint32_t)(((uint32_t)lround(height * aspect) + 1u) & ~1u);
+        w = (uint32_t)(((uint32_t)lround(width) + 1u) & ~1u);
     }
     g_cfg.eyeWidth = w; g_cfg.eyeHeight = hgt;
     log("eye frustum: %s; left=(%.3f %.3f %.3f %.3f) right=(%.3f %.3f %.3f %.3f); render target %ux%u per eye; display %.0f Hz",
         source, g_cfg.tangentsLeft[0], g_cfg.tangentsLeft[1], g_cfg.tangentsLeft[2], g_cfg.tangentsLeft[3],
         g_cfg.tangentsRight[0], g_cfg.tangentsRight[1], g_cfg.tangentsRight[2], g_cfg.tangentsRight[3],
         w, hgt, g_cfg.displayHz);
+    if (g_cfg.sharedFrustum) {
+        float a, b, c, d, e, f2, g, h2;
+        eye_crop(0, &a, &b, &c, &d); eye_crop(1, &e, &f2, &g, &h2);
+        log("game renders the union frustum (%.3f %.3f %.3f %.3f) for both eyes; streamed crops left u %.3f-%.3f v %.3f-%.3f, right u %.3f-%.3f v %.3f-%.3f",
+            g_cfg.renderTangents[0], g_cfg.renderTangents[1], g_cfg.renderTangents[2], g_cfg.renderTangents[3], a, b, c, d, e, f2, g, h2);
+    }
+}
+
+const float *render_tangents(int eye) {
+    if (g_cfg.sharedFrustum) return g_cfg.renderTangents;
+    return eye == 0 ? g_cfg.tangentsLeft : g_cfg.tangentsRight;
+}
+
+void eye_crop(int eye, float *u0, float *u1, float *v0, float *v1) {
+    *u0 = 0; *u1 = 1; *v0 = 0; *v1 = 1;
+    if (!g_cfg.sharedFrustum) return;
+    const float *t = eye == 0 ? g_cfg.tangentsLeft : g_cfg.tangentsRight;
+    const float *U = g_cfg.renderTangents;
+    const float uw = U[1] - U[0], vh = U[3] - U[2];
+    if (uw <= 0 || vh <= 0) return;
+    *u0 = (t[0] - U[0]) / uw; *u1 = (t[1] - U[0]) / uw;     // tangent x grows to the right
+    *v0 = (t[2] - U[2]) / vh; *v1 = (t[3] - U[2]) / vh;     // top (negative) is row 0
 }
 
 void init(const char *gameDir) {

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 #include <mutex>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -160,14 +161,24 @@ static inline uint8_t half_to_u8(uint16_t h) {
 
 // Convert one eye from the staging buffer into the encoder's 8-bit layout
 // (DXGI 28 RGBA or 87 BGRA), writing into the shared frame at column x0.
-static void convert_eye(const Readback::Staging &s, uint8_t *dst, uint32_t dstRowBytes, uint32_t x0, bool flipY, uint32_t *outFormat) {
+// The eye is scaled (nearest) to dw x dh: the two eyes' own frusta differ by a
+// few percent, and the encoder expects two equal halves, each spanning its
+// eye's frustum.
+static void convert_eye(const Readback::Staging &s, uint8_t *dst, uint32_t dstRowBytes, uint32_t x0, bool flipY, uint32_t *outFormat,
+                        uint32_t dw, uint32_t dh) {
     const uint32_t w = s.w, h = s.h;
     const uint8_t *src = (const uint8_t *)s.map;
     uint32_t bpp = bytes_per_pixel(s.fmt);
-    for (uint32_t row = 0; row < h; row++) {
+    const bool scale = dw != w || dh != h;
+    std::vector<uint8_t> rowbuf(scale ? (size_t)w * 4 : 0);
+    std::vector<uint32_t> xmap(scale ? dw : 0);
+    for (uint32_t c = 0; scale && c < dw; c++) xmap[c] = std::min(w - 1, (uint32_t)(((uint64_t)c * w + w / 2) / dw));
+    for (uint32_t orow = 0; orow < (scale ? dh : h); orow++) {
+        const uint32_t row = scale ? std::min(h - 1, (uint32_t)(((uint64_t)orow * h + h / 2) / dh)) : orow;
         const uint32_t srow = flipY ? h - 1 - row : row;
         const uint8_t *sp = src + (size_t)srow * w * bpp;
-        uint8_t *dp = dst + (size_t)row * dstRowBytes + (size_t)x0 * 4;
+        uint8_t *const out = dst + (size_t)orow * dstRowBytes + (size_t)x0 * 4;
+        uint8_t *dp = scale ? rowbuf.data() : out;
         switch (s.fmt) {
         case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: memcpy(dp, sp, (size_t)w * 4); *outFormat = 28; break;
         case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: memcpy(dp, sp, (size_t)w * 4); *outFormat = 87; break;
@@ -204,6 +215,11 @@ static void convert_eye(const Readback::Staging &s, uint8_t *dst, uint32_t dstRo
             *outFormat = 28; break;
         }
         default: break;
+        }
+        if (scale) {
+            const uint32_t *in = (const uint32_t *)rowbuf.data();
+            uint32_t *o = (uint32_t *)out;
+            for (uint32_t c = 0; c < dw; c++) o[c] = in[xmap[c]];
         }
     }
 }
@@ -310,6 +326,14 @@ public:
         bool flip = v0 > v1;
         if (flip) std::swap(v0, v1);
         if (u0 > u1) std::swap(u0, u1);
+        {   // the eye's own frustum inside the union the game rendered (vr_runtime eye_crop)
+            float cu0, cu1, cv0, cv1;
+            vrrt::eye_crop(eye == Eye_Left ? 0 : 1, &cu0, &cu1, &cv0, &cv1);
+            if (flip) { float t0 = 1.0f - cv1, t1 = 1.0f - cv0; cv0 = t0; cv1 = t1; }   // row 0 is the bottom
+            const float bu = u1 - u0, bv = v1 - v0;
+            u1 = u0 + cu1 * bu; u0 = u0 + cu0 * bu;
+            v1 = v0 + cv1 * bv; v0 = v0 + cv0 * bv;
+        }
         uint32_t x = (uint32_t)lroundf(u0 * d->m_nWidth), x1 = (uint32_t)lroundf(u1 * d->m_nWidth);
         uint32_t y = (uint32_t)lroundf(v0 * d->m_nHeight), y1 = (uint32_t)lroundf(v1 * d->m_nHeight);
         x1 = std::min(x1, d->m_nWidth); y1 = std::min(y1, d->m_nHeight);
@@ -326,13 +350,13 @@ public:
     }
     void publish() {
         const Readback::Staging &L = m_rb.eye[0], &R = m_rb.eye[1];
-        const uint32_t h = std::min(L.h, R.h), w = L.w + R.w;
+        const uint32_t ew = std::max(L.w, R.w), h = std::max(L.h, R.h), w = ew * 2;
         uint32_t idx;
         uint8_t *dst = vrrt::frame_begin(w, h, &idx);
         if (!dst) { m_skipped++; return; }
         uint32_t fmt = 28;
-        convert_eye(L, dst, w * 4, 0, m_eyeFlip[0], &fmt);
-        convert_eye(R, dst, w * 4, L.w, m_eyeFlip[1], &fmt);
+        convert_eye(L, dst, w * 4, 0, m_eyeFlip[0], &fmt, ew, h);
+        convert_eye(R, dst, w * 4, ew, m_eyeFlip[1], &fmt, ew, h);
         const vrrt::PoseSet &set = vrrt::last_poses();
         vrrt::frame_publish(idx, w, h, fmt, set.headTransform, set.visionTimestamp);
         m_eyeDone[0] = m_eyeDone[1] = false;

@@ -24,6 +24,7 @@ public:
         *w = vrrt::config().eyeWidth; *h = vrrt::config().eyeHeight;
     }
     HmdMatrix44_t GetProjectionMatrix(EVREye eye, float zNear, float zFar) override {
+        { static int n; if (n++ < 12) vrrt::log("GetProjectionMatrix(eye %d, near %.3f, far %.1f)", (int)eye, zNear, zFar); }
         float l, r, t, b; GetProjectionRaw(eye, &l, &r, &t, &b);
         HmdMatrix44_t m; memset(&m, 0, sizeof m);
         // Standard OpenVR off-axis projection from the tangents (right-handed, -Z forward).
@@ -36,7 +37,8 @@ public:
         return m;
     }
     void GetProjectionRaw(EVREye eye, float *l, float *r, float *t, float *b) override {
-        const float *tg = eye == Eye_Left ? vrrt::config().tangentsLeft : vrrt::config().tangentsRight;
+        { static int n; if (n++ < 12) vrrt::log("GetProjectionRaw(eye %d)", (int)eye); }
+        const float *tg = vrrt::render_tangents(eye == Eye_Left ? 0 : 1);
         *l = tg[0]; *r = tg[1]; *t = tg[2]; *b = tg[3];
     }
     bool ComputeDistortion(EVREye, float u, float v, DistortionCoordinates_t *d) override {
@@ -175,10 +177,10 @@ public:
         case Prop_IpdUIRangeMinMeters_Float: return 0.058f;
         case Prop_IpdUIRangeMaxMeters_Float: return 0.072f;
         case Prop_MinimumIpdStepMeters_Float: return 0.0005f;
-        case Prop_FieldOfViewLeftDegrees_Float: return (float)(atan(-vrrt::config().tangentsLeft[0]) * 180.0 / M_PI);
-        case Prop_FieldOfViewRightDegrees_Float: return (float)(atan(vrrt::config().tangentsRight[1]) * 180.0 / M_PI);
-        case Prop_FieldOfViewTopDegrees_Float: return (float)(atan(-vrrt::config().tangentsLeft[2]) * 180.0 / M_PI);
-        case Prop_FieldOfViewBottomDegrees_Float: return (float)(atan(vrrt::config().tangentsLeft[3]) * 180.0 / M_PI);
+        case Prop_FieldOfViewLeftDegrees_Float: return (float)(atan(-vrrt::render_tangents(0)[0]) * 180.0 / M_PI);
+        case Prop_FieldOfViewRightDegrees_Float: return (float)(atan(vrrt::render_tangents(1)[1]) * 180.0 / M_PI);
+        case Prop_FieldOfViewTopDegrees_Float: return (float)(atan(-vrrt::render_tangents(0)[2]) * 180.0 / M_PI);
+        case Prop_FieldOfViewBottomDegrees_Float: return (float)(atan(vrrt::render_tangents(0)[3]) * 180.0 / M_PI);
         case Prop_TrackingRangeMinimumMeters_Float: return 0.f;
         case Prop_TrackingRangeMaximumMeters_Float: return 10.f;
         default: unknown(dev, prop, "float"); if (err) *err = TrackedProp_UnknownProperty; return 0;

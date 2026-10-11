@@ -76,6 +76,14 @@ struct Config {
     double displayHz = 60.0;
     float tangentsLeft[4] = { -8.0f / 9.0f, 8.0f / 9.0f, -1.0f, 1.0f };   // left, right, top, bottom
     float tangentsRight[4] = { -8.0f / 9.0f, 8.0f / 9.0f, -1.0f, 1.0f };
+    // What the game is told. Source 2's Linux ARM (Deckard) path sizes the eye
+    // texture for the union of both eyes' frusta but draws every eye with the
+    // left eye's horizontal range, so a headset whose eyes look in different
+    // directions (Vision Pro: each eye's frustum leans outward) comes out wrong
+    // in the right eye. Both eyes are therefore given the union frustum, and
+    // the compositor cuts each eye's own range back out (eye_crop).
+    float renderTangents[4] = { -8.0f / 9.0f, 8.0f / 9.0f, -1.0f, 1.0f };
+    bool sharedFrustum = true;               // VERANTYX_SHARED_FRUSTUM=0: per-eye frusta
     uint32_t eyeWidth = 0, eyeHeight = 0;   // recommended render target, per eye
     float ipd = 0.063f;
     bool bench = false;                      // synthesize poses when no headset sends any
@@ -83,6 +91,11 @@ struct Config {
     std::string controllerType = "oculus_touch";
 };
 Config &config();
+// The projection handed to the game for `eye` (0 left, 1 right).
+const float *render_tangents(int eye);
+// The part of the rendered eye image (normalised, top-left origin) that is
+// that eye's own frustum: all of it unless sharedFrustum.
+void eye_crop(int eye, float *u0, float *u1, float *v0, float *v1);
 void init(const char *gameDir);              // reads env, opens shared memory, latches tangents
 
 // Shared memory.
