@@ -112,8 +112,23 @@ uint8_t *frame_begin(uint32_t combinedWidth, uint32_t height, uint32_t *writeInd
     return g_pixels[idx];
 }
 
+// The frustum each streamed eye image spans, for the headset (MacEncoder sends
+// it on as a "VTAN" packet): header padding[0..7] = left, right tangents,
+// padding[8] = "VTAN". Same contract as the Windows driver's
+// PublishEffectiveTangents. Rewritten whenever the magic is missing, because
+// the encoder clears the header when it maps the file.
+static void publish_effective_tangents() {
+    static const uint32_t kTangentMagic = 0x4E415456;   // "VTAN"
+    if (!g_hdr) return;
+    if (__atomic_load_n(&g_hdr->padding[8], __ATOMIC_ACQUIRE) == kTangentMagic) return;
+    memcpy(&g_hdr->padding[0], g_cfg.tangentsLeft, sizeof g_cfg.tangentsLeft);
+    memcpy(&g_hdr->padding[4], g_cfg.tangentsRight, sizeof g_cfg.tangentsRight);
+    __atomic_store_n(&g_hdr->padding[8], kTangentMagic, __ATOMIC_RELEASE);
+}
+
 void frame_publish(uint32_t idx, uint32_t combinedWidth, uint32_t height, uint32_t format,
                    const float renderHeadTransform[16], double visionTimestamp) {
+    publish_effective_tangents();
     SharedFrame *f = g_frames[idx & 1];
     uint32_t seq = ++g_frameSequence; if (seq == 0) seq = ++g_frameSequence;
     f->sequenceNumber = seq;
@@ -275,7 +290,8 @@ void sample_poses(PoseSet *out, double predictSeconds) {
     if (fresh) { head = h.headTransform; memcpy(g_heldHead, head, sizeof g_heldHead); g_haveHeldHead = true; }
     else if (g_cfg.bench) {
         // Standing, with a slow yaw sway so the picture visibly moves.
-        double t = now - g_epoch, yaw = 0.25 * sin(t * 0.5);
+        static const bool sway = env_number("VERANTYX_BENCH_SWAY", 1, 0, 1) >= 1.0;   // 0: hold still (image tests)
+        double t = now - g_epoch, yaw = sway ? 0.25 * sin(t * 0.5) : 0.0;
         column_major_identity(synth, 0.f, 1.6f, 0.f);
         synth[0] = (float)cos(yaw); synth[2] = (float)-sin(yaw); synth[8] = (float)sin(yaw); synth[10] = (float)cos(yaw);
         head = synth;
