@@ -795,4 +795,37 @@ patch("runtime/kl_dl.c", [
      "    if (kl_image_loaded_hook) kl_image_loaded_hook(soname, img);\n",
      "after", "if (kl_image_loaded_hook) kl_image_loaded_hook"),
 ])
+# ---- kl_libc.c: CPU topology in the synthetic /sys
+# Source 2's tier0 counts physical cores from cpuN/topology/{core_id,
+# physical_package_id} (and reads cpu_capacity to find big cores, as on the
+# Steam Frame's Snapdragon). Klepton served neither topology node, so Alyx
+# found no cores and ran with "Thread pool has 0 threads": every job on one
+# thread, hitches whenever characters stream in. Now each online core has a
+# core_id, package 0 and sibling lists, and cpu_capacity marks Apple
+# silicon's efficiency cores (hw.perflevel1) as little cores.
+patch("runtime/libc/kl_libc.c", [
+    ("    // Some guests size their core loop from kernel_max (highest possible CPU\n",
+     """    {
+        int perf = 0; size_t sz = sizeof perf;
+        if (sysctlbyname("hw.perflevel0.logicalcpu", &perf, &sz, NULL, 0) != 0 || perf <= 0 || perf > ncpu) perf = (int)ncpu;
+        char sib[64];
+        if (ncpu > 1) snprintf(sib, sizeof sib, "0-%ld\\n", ncpu - 1); else snprintf(sib, sizeof sib, "0\\n");
+        for (long i = 0; i < ncpu; i++) {
+            char rel[256], val[32];
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_id", i);
+            snprintf(val, sizeof val, "%ld\\n", i); proc_put(rel, val);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/physical_package_id", i);
+            proc_put(rel, "0\\n");
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", i);
+            proc_put(rel, val);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_siblings_list", i);
+            proc_put(rel, sib);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/package_cpus_list", i);
+            proc_put(rel, sib);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/cpu_capacity", i);
+            proc_put(rel, i < perf ? "1024\\n" : "400\\n");          // performance cores first
+        }
+    }
+""", "before", "topology/core_id"),
+])
 print("done")

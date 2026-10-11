@@ -145,6 +145,12 @@ int main(int argc, char **argv) {
     // glibc libraries keep string tables beside functions; the loader's
     // "looks like data" test refused a real thread-pointer read in libtier0.
     setenv("KL_TLS_REWRITE_FORCE", "1", 0);
+    // Every new material makes the engine create a pipeline on its render
+    // thread, and MoltenVK compiles it right there (250-500 ms each were
+    // measured: hitches when characters appear). Let Metal spread each
+    // compile over more threads (macOS 13.3+). VERANTYX_MVK_DEFAULTS=0 skips.
+    if (!getenv("VERANTYX_MVK_DEFAULTS") || strcmp(getenv("VERANTYX_MVK_DEFAULTS"), "0") != 0)
+        setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
     kl_glibc_install(argv[0]);
     kl_set_library_path(g_libdir);
     kl_thread_init();
