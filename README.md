@@ -1,5 +1,7 @@
 # VeRantyx
 
+> **This is the `wine` branch**: the Windows build with SteamVR under Wine. The native ARM version is on the [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) branch; `main` has both.
+
 **Play PC VR games from an Apple Silicon Mac in an Apple Vision Pro — with your hands and a pair of Joy-Con, no tracked VR controllers.**
 
 VeRantyx renders Half-Life: Alyx on the Mac, streams every stereo frame to a
@@ -65,7 +67,7 @@ used nor shipped.
 
 | Project | Used for | License | In this repository? |
 |---|---|---|---|
-| [Klepton](https://github.com/shinyquagsire23/Klepton) by ShinyQuagsire | Native version: loading Valve's ARM64 ELF libraries on macOS, its bionic libc and Vulkan-on-MoltenVK runtime; our patch set adds glibc TLS, x18 and loader fixes, CPU topology, asynchronous pipelines (`NativeARM/klepton-patches/`) | MIT | No — fetched by `NativeARM/scripts/fetch_klepton.sh`, patched by `apply.py` |
+| [Klepton](https://github.com/shinyquagsire23/Klepton) by ShinyQuagsire | `native` branch only: loading Valve's ARM64 ELF libraries on macOS, its bionic libc and Vulkan-on-MoltenVK runtime; our patch set adds glibc TLS, x18 and loader fixes, CPU topology, asynchronous pipelines (`NativeARM/klepton-patches/`) | MIT | No — fetched by `NativeARM/scripts/fetch_klepton.sh`, patched by `apply.py` |
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | Vulkan → Metal (both versions; Wine version via DXVK) | Apache-2.0 | No (Klepton's build / DXVK) |
 | Valve's Half-Life: Alyx (Linux ARM64 depot 546564, Windows build) | The game | Valve's terms | No — your own Steam account |
 | Valve's [OpenVR SDK headers](https://github.com/ValveSoftware/openvr) | SteamVR driver, capture proxy, native OpenVR runtime | BSD-3-Clause | Yes (`VRDriver/include/`, `NativeARM/vrruntime/openvr/`) |
@@ -76,36 +78,7 @@ used nor shipped.
 
 Details: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Compared with Glovebox
-
-[Glovebox](https://glovebox.vision/) (Udi Wertheimer, October 2026) also runs
-Valve's Linux ARM64 build of Alyx through Klepton, but on the Vision Pro
-itself. Both are open source and use your own copy of the game.
-
-| | VeRantyx (native branch) | Glovebox |
-|---|---|---|
-| Where the game runs | On the Mac; streamed to the headset | On the Vision Pro (no Mac while playing) |
-| Controllers | Hands + Joy-Con, or hands only | PS VR2 Sense controllers required |
-| Headset | Any Vision Pro (M2 or M5) | Reported on an M5 Vision Pro |
-| Image | Limited by the Mac's GPU and the Wi-Fi stream (1298×1056 per eye at 60 fps on an M1 Max) | ~3K per eye at 60 fps reported, no streaming |
-| VR layer | Our own OpenVR runtime | — |
-
-Not affiliated with Valve, Apple, Nintendo, Sony, Glovebox or Klepton.
-
-## Setup — native version
-
-Step by step in **[docs/NATIVE_SETUP.md](docs/NATIVE_SETUP.md)**: download the
-Linux depot with your own Steam account, fetch Klepton and the Debian
-libraries, build the launcher, sign in to macOS Steam, build the visionOS
-app, then:
-
-```bash
-NativeARM/scripts/launch_native_vr.sh
-```
-
-Internals, findings and status: [NativeARM/README.md](NativeARM/README.md).
-
-## Setup — Wine version
+## Setup
 
 ```bash
 git clone https://github.com/Ag3497120/VeRantyx.git
@@ -124,27 +97,7 @@ The full walkthrough, requirements, tuning variables and troubleshooting are
 in **[docs/SETUP.md](docs/SETUP.md)**. A Japanese write-up of the internals is
 in [docs/README_ja.md](docs/README_ja.md).
 
-## How the native version works
-
-```
- Mac (Apple Silicon)                                         Apple Vision Pro
- ┌───────────────────────────────────────────────┐           ┌────────────────────────┐
- │ alyx_host (NativeARM/host)                    │           │ VeRantyx visionOS app  │
- │  ├─ Klepton loader (patched): Valve's ARM64    │   Wi-Fi   │  (same as the Wine     │
- │  │   libengine2, libclient, … as guest code    │  HEVC UDP │   version)             │
- │  ├─ glibc layer: TLS, locale, sockets, SysV,   │ ────────▶ │                        │
- │  │   epoll/eventfd, CPU topology, …            │           │                        │
- │  ├─ SDL audio → Core Audio, Steam API → macOS  │  poses +  │                        │
- │  │   Steam client                              │  inputs   │                        │
- │  ├─ OpenVR runtime (NativeARM/vrruntime):      │ ◀──────── │                        │
- │  │   poses, input bindings, finger skeleton,   │           │                        │
- │  │   Vulkan readback → shared frame file       │           │                        │
- │  └─ MoltenVK: Vulkan → Metal, async pipelines  │           │                        │
- │ HardwareEncoder: HEVC + game audio → UDP       │           │                        │
- └───────────────────────────────────────────────┘           └────────────────────────┘
-```
-
-## How the Wine version works
+## How it works
 
 ```
  Mac (Apple Silicon)                                        Apple Vision Pro
@@ -201,7 +154,7 @@ visionOS app), Metal Shading Language (frame conversion, eye-image rendering),
 Bash and Python (build, install and launch scripts). The only third-party
 source in the tree is Valve's OpenVR SDK headers.
 
-## Measurements (Wine version)
+## Measurements
 
 MacBook Pro (M1 Max, 64 GB), macOS 26, Vision Pro on the same Wi-Fi 6 network,
 Half-Life: Alyx, 2026-10-10. Numbers come from the pipeline's own logs
@@ -270,22 +223,7 @@ the game's frame rate and the CPU/GPU load on any Mac without a headset, so
 settings can be compared before playing. See
 [docs/SETUP.md](docs/SETUP.md#mac-profiles-and-tuning).
 
-## Native version: measurements and limits
-
-MacBook Pro (M1 Max), 2026-10-11, from the runtime's own logs:
-
-| | Value |
-|---|---|
-| Main menu | 60 fps at the 60 Hz virtual display (game thread ~4.5 ms/frame) |
-| Per-eye image | 1298×1056 (default); `VERANTYX_QUALITY=high` 1982×1536 at ~39 fps |
-| First-time shader compile | 250–500 ms per pipeline, now off the render thread; ~2 ms once cached |
-| Play session | 20+ minutes in the first levels |
-
-Limits: the Mac's GPU caps resolution (`ultra`, ~3K per eye, runs at ~20 fps
-on an M1 Max); level-transition screens are not drawn; the game pauses while
-the headset reports no user.
-
-## Status and limits (Wine version)
+## Status and limits
 
 - Verified: SteamVR + Half-Life: Alyx on the Mac above, streaming to a Vision Pro,
   playing with Joy-Con. Other games and other Macs are untested; the Mac
