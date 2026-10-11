@@ -446,6 +446,9 @@ private struct HandState {
     private var flickBoostUntil: CFTimeInterval = 0
     // One Euro filter for hands-only tracking (pose sent to the game):
     // heavy smoothing when the hand is still, none when it moves fast.
+    // Wrist (hand anchor) to grip pose, learned while the knuckles are visible.
+    private var wristToGrip: simd_float4x4?
+    private(set) var poseFromArm = false
     private var euroPosition: SIMD3<Float>?
     private var euroPositionSpeed: Float = 0
     private var euroRotation: simd_quatf?
@@ -502,9 +505,26 @@ private struct HandState {
             applyBodyLocked(controller, head: head, headTracked: headTracked, now: now)
             return
         }
-        guard let anchor, anchor.isTracked, let skeleton = anchor.handSkeleton,
-              let joints = HandJoints(anchor: anchor, skeleton: skeleton),
-              let worldRaw = Self.touchRawPose(joints: joints, isLeft: isLeft) else {
+        guard let anchor, anchor.isTracked, let skeleton = anchor.handSkeleton else {
+            handleLoss(head: head, headTracked: headTracked, now: now, controller: controller)
+            return
+        }
+        // The palm from the arm: ARKit keeps tracking the wrist (its anchor,
+        // which follows the forearm) when a Joy-Con or a fist hides the
+        // knuckles. While the whole hand is visible, the wrist-to-grip
+        // relation is learned; when the knuckles are hidden, the grip pose
+        // comes from the wrist through it instead of the hand being lost.
+        let jointsOpt = HandJoints(anchor: anchor, skeleton: skeleton)
+        let wristWorld = anchor.originFromAnchorTransform
+        let worldRaw: simd_float4x4
+        if let measured = jointsOpt, let full = Self.touchRawPose(joints: measured, isLeft: isLeft) {
+            worldRaw = full
+            learnWristToGrip(wristWorld.inverse * full)
+            poseFromArm = false
+        } else if let wristToGrip, Self.isFinite(wristWorld) {
+            worldRaw = wristWorld * wristToGrip
+            poseFromArm = true
+        } else {
             handleLoss(head: head, headTracked: headTracked, now: now, controller: controller)
             return
         }
@@ -597,6 +617,8 @@ private struct HandState {
             return
         }
 
+        // Hidden knuckles (pose from the arm): gestures keep their last state.
+        guard let joints = jointsOpt else { return }
         updateGrip(joints: joints, now: now)
 
         let pinchIndex = joints.thumbDistance(to: joints.indexTip)
@@ -1125,6 +1147,17 @@ private struct HandState {
         var out = simd_float4x4(lastRotation)
         out.columns.3 = SIMD4<Float>(filteredPosition, 1)
         return out
+    }
+
+    private mutating func learnWristToGrip(_ relation: simd_float4x4) {
+        guard Self.isFinite(relation) else { return }
+        // Slow average: the relation is rigid, single frames are noisy.
+        if let current = wristToGrip { wristToGrip = Self.blend(current, relation, 0.08) } else { wristToGrip = relation }
+    }
+
+    private static func isFinite(_ m: simd_float4x4) -> Bool {
+        let c = [m.columns.0, m.columns.1, m.columns.2, m.columns.3]
+        return c.allSatisfy { $0.x.isFinite && $0.y.isFinite && $0.z.isFinite && $0.w.isFinite }
     }
 
     private static func blend(_ a: simd_float4x4, _ b: simd_float4x4, _ t: Float) -> simd_float4x4 {
