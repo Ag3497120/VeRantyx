@@ -42,6 +42,8 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <libproc.h>
+#include <malloc/malloc.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
@@ -312,6 +314,25 @@ long klgh_syscall(long nr, kl_va *va) {
     case 278: arc4random_buf((void *)a[0], (size_t)a[1]); return a[1];                     // getrandom
     case 101: { struct timespec ts = { 0, 0 }; const struct timespec *rq = (const struct timespec *)a[0]; if (rq) nanosleep(rq, &ts); return 0; } // nanosleep
     case 172: return getpid();                                                               // getpid
+    // tgkill(pid, tid, sig) / tkill(tid, sig) with sig 0: "is this thread still
+    // alive?". Thread ids here are pthread_threadid_np values (gettid above);
+    // proc_pidinfo answers for them. libvideo's per-thread profiler registry
+    // reclaims entries whose thread answers ESRCH — returning an error for
+    // live threads made it free other decoder threads' objects (crash in the
+    // first level, a1_intro_world_2).
+    case 131: case 130: {
+        long tid = nr == 131 ? a[1] : a[0], sig = nr == 131 ? a[2] : a[1];
+        if (sig == 0) {
+            struct proc_threadinfo ti;
+            if (tid > 0 && proc_pidinfo(getpid(), PROC_PIDTHREADID64INFO, (uint64_t)tid, &ti, sizeof ti) > 0) return 0;
+            errno = ESRCH; return -1;
+        }
+        uint64_t self = 0; pthread_threadid_np(NULL, &self);
+        if ((uint64_t)tid == self) return pthread_kill(pthread_self(), (int)sig) == 0 ? 0 : -1;
+        long (*lower)(long, long, long, long, long, long, long) = (long (*)(long, long, long, long, long, long, long))B("syscall");
+        if (lower) return lower(nr, a[0], a[1], a[2], a[3], a[4], a[5]);   // another thread, real signal
+        errno = ENOSYS; return -1;
+    }
     case 93: exit_trace("syscall(exit)", (int)a[0]); fflush(NULL); _exit((int)a[0]);      // exit
     case 94: exit_trace("syscall(exit_group)", (int)a[0]); fflush(NULL); _exit((int)a[0]); // exit_group
     default: {
@@ -724,6 +745,61 @@ static void *klg_mmap_traced(void *addr, size_t len, int prot, int flags, int fd
     if (trace) fprintf(stderr, "  [glibc] mmap(%p, %zu, prot %d, flags %#x, fd %d, off %lld) -> %p errno %d\n",
                        addr, len, prot, flags, fd, (long long)off, p, p == MAP_FAILED ? errno : 0);
     return p;
+}
+// KL_TRACE_TSD_IMAGE=<lib>: log pthread_setspecific/getspecific made from
+// that image (key, value, thread, caller offset), to follow per-thread objects.
+static const char *tsd_trace_image(void) {
+    static const char *img = (const char *)-1;
+    if (img == (const char *)-1) img = getenv("KL_TRACE_TSD_IMAGE");
+    return img;
+}
+static int tsd_from_traced(void *ra, size_t *off) {
+    const char *want = tsd_trace_image();
+    if (!want) return 0;
+    const char *who = kl_addr_image(ra, off);
+    return who && strstr(who, want);
+}
+// KL_TRACE_FREE_SIZE=<bytes> with KL_TRACE_TSD_IMAGE: frees of blocks of that
+// size made from the traced image, with the caller chain.
+static void klg_free_trace(void *p) {
+    static void (*real)(void *);
+    static long want = -1;
+    if (!real) real = (void (*)(void *))B("free");
+    if (want < 0) { const char *e = getenv("KL_TRACE_FREE_SIZE"); want = e ? atol(e) : 0; }
+    if (p && want > 0) {
+        size_t sz = malloc_size(p), off = 0;
+        static int nlog;
+        if (sz >= (size_t)want && sz <= (size_t)want + 128 && nlog < 200 && tsd_from_traced(__builtin_return_address(0), &off)) {
+            nlog++;
+            uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+            fprintf(stderr, "  [free] %p (%zu bytes) thread %llu from +%#zx\n", p, sz, (unsigned long long)tid, off);
+            kl_fault_print_frames(stderr, __builtin_frame_address(0));
+        }
+    }
+    if (real) real(p);
+}
+static int klg_setspecific_trace(unsigned key, const void *v) {
+    int (*real)(unsigned, const void *) = (int (*)(unsigned, const void *))B("pthread_setspecific");
+    size_t off = 0;
+    if (tsd_from_traced(__builtin_return_address(0), &off)) {
+        uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+        fprintf(stderr, "  [tsd] set key %u = %p (thread %llu, from +%#zx)\n", key, v, (unsigned long long)tid, off);
+    }
+    return real ? real(key, v) : -1;
+}
+static void *klg_getspecific_trace(unsigned key) {
+    void *(*real)(unsigned) = (void *(*)(unsigned))B("pthread_getspecific");
+    void *v = real ? real(key) : NULL;
+    size_t off = 0;
+    if (v && tsd_from_traced(__builtin_return_address(0), &off)) {
+        static int n; if (n++ < 400) {
+            uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+            const uint64_t *o = v;
+            fprintf(stderr, "  [tsd] get key %u -> %p [8]=%#llx [0x18]=%#llx (thread %llu, from +%#zx)\n", key, v,
+                    (unsigned long long)(o[1] & 0xffffffff), (unsigned long long)o[3], (unsigned long long)tid, off);
+        }
+    }
+    return v;
 }
 static int klg_eventfd(unsigned initval, int flags) {
     int sv[2];
@@ -1315,6 +1391,7 @@ static struct { const char *name; void *fn; } g_table[] = {
     E("posix_fadvise", klg_posix_fadvise), E("posix_fadvise64", klg_posix_fadvise), E("mount", klg_mount), E("umount", klg_mount),
     E("execlp", klg_exec_fail), E("execvpe", klg_exec_fail), E("execvp", klg_exec_fail), E("execl", klg_exec_fail),
     E("mkostemps", klg_mkostemps), E("mkostemps64", klg_mkostemps), E("vfscanf", klg_vfscanf), E("vswscanf", klg_vswscanf),
+    E("free", klg_free_trace), E("pthread_setspecific", klg_setspecific_trace), E("pthread_getspecific", klg_getspecific_trace),
     E("mmap", klg_mmap_traced), E("mmap64", klg_mmap_traced),
     E("eventfd", klg_eventfd), E("eventfd_read", klg_eventfd_read), E("eventfd_write", klg_eventfd_write),
     E("read", klg_read), E("write", klg_write), E("close", klg_close),

@@ -3,6 +3,10 @@
 #include "gen_stubs.h"
 #include "vr_runtime.h"
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <deque>
+#include <map>
 #include <unistd.h>
 
 namespace {
@@ -172,24 +176,62 @@ public:
     virtual uint32_t SendMessage_(uint64_t handle, const char *destination, const char *message) = 0;
     virtual uint32_t ReceiveMessage(uint64_t handle, char *buffer, uint32_t bufferSize, uint32_t *needed) = 0;
 };
+// IVRMailbox_001, with a stand-in for SteamVR's "hlvr/interstitials" service
+// (the client's "Mongoose": the web overlay that draws level-transition
+// screens). Half-Life: Alyx registers "hlvr/mailbox", waits for that service's
+// {"type":"ready"}, answers with set_paths, and during loads quits with
+// "Timed out waiting for response from Mongoose" if no "ready" has come within
+// 15 s. The stand-in says ready when the game's mailbox registers, and again
+// for each message the game sends to the service other than set_paths (the
+// game resets its "ready" state when it starts a transition). Nothing is drawn
+// for the interstitials themselves.
 class Mailbox : public IVRMailbox_001 {
 public:
+    std::mutex m_mu;
     uint64_t m_next = 1;
+    std::map<uint64_t, std::string> m_names;
+    std::map<std::string, std::deque<std::string>> m_inbox;   // by mailbox name
+    int m_logged = 0;
+
+    void post(const std::string &to, const std::string &msg) { m_inbox[to].push_back(msg); }
+
     uint32_t RegisterMailbox(const char *name, uint64_t *handle) override {
-        vrrt::log("mailbox registered: %s", name ? name : "");
-        if (handle) *handle = m_next++;
+        std::lock_guard<std::mutex> l(m_mu);
+        std::string n = name ? name : "";
+        vrrt::log("mailbox registered: %s", n.c_str());
+        uint64_t h = m_next++;
+        m_names[h] = n;
+        if (handle) *handle = h;
+        if (n == "hlvr/mailbox") post(n, "{\"type\":\"ready\"}");
         return 0;
     }
-    uint32_t UnregisterMailbox(uint64_t) override { return 0; }
-    uint32_t SendMessage_(uint64_t, const char *dest, const char *msg) override {
-        static int n;
-        if (n++ < 20) vrrt::log("mailbox -> %s: %.300s", dest ? dest : "?", msg ? msg : "");
+    uint32_t UnregisterMailbox(uint64_t h) override {
+        std::lock_guard<std::mutex> l(m_mu);
+        m_names.erase(h);
         return 0;
     }
-    uint32_t ReceiveMessage(uint64_t, char *buf, uint32_t size, uint32_t *needed) override {
-        if (buf && size) buf[0] = 0;
-        if (needed) *needed = 0;
-        return 2;   // nothing pending
+    uint32_t SendMessage_(uint64_t h, const char *dest, const char *msg) override {
+        std::lock_guard<std::mutex> l(m_mu);
+        std::string d = dest ? dest : "", m = msg ? msg : "";
+        if (m_logged++ < 200) vrrt::log("mailbox %s -> %s: %.400s", m_names.count(h) ? m_names[h].c_str() : "?", d.c_str(), m.c_str());
+        if (d == "hlvr/interstitials" && m.find("\"set_paths\"") == std::string::npos && m_names.count(h))
+            post(m_names[h], "{\"type\":\"ready\"}");
+        return 0;
+    }
+    uint32_t ReceiveMessage(uint64_t h, char *buf, uint32_t size, uint32_t *needed) override {
+        std::lock_guard<std::mutex> l(m_mu);
+        auto it = m_names.find(h);
+        if (it == m_names.end()) { if (needed) *needed = 0; return 2; }
+        auto &q = m_inbox[it->second];
+        if (q.empty()) { if (buf && size) buf[0] = 0; if (needed) *needed = 0; return 2; }   // nothing pending
+        const std::string &m = q.front();
+        uint32_t len = (uint32_t)m.size() + 1;
+        if (needed) *needed = len;
+        if (!buf || size < len) return 1;                                                   // buffer too small
+        memcpy(buf, m.c_str(), len);
+        if (m_logged++ < 200) vrrt::log("mailbox %s <- %s", it->second.c_str(), m.c_str());
+        q.pop_front();
+        return 0;
     }
 };
 

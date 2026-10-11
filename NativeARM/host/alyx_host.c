@@ -21,6 +21,7 @@
 #include "kl_sdlshim.h"
 #include "kl_luafix.h"
 #include "kl_sdlaudio.h"
+#include "kl_guestfix.h"
 #include "kl_steambridge.h"
 #include "kl_x18.h"
 #include <sys/stat.h>
@@ -172,6 +173,7 @@ int main(int argc, char **argv) {
 
     kl_enginelog_install();        // the engine's console, to stderr
     kl_sdlshim_install();          // SDL window without X11; Vulkan surface from the shim
+    kl_guestfix_install();         // byte-checked repairs of guest code at load
     kl_sdlaudio_install();         // SDL2 audio -> Core Audio (Linux SDL has no macOS backend)
     kl_luafix_install();           // LuaJIT arena above 4 GB (no low memory on arm64 macOS)
     install_vr_path_registry();

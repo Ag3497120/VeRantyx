@@ -779,4 +779,20 @@ patch("runtime/kl_dl.c", [
      "    if (g_nimgs >= KL_MAX_IMAGES)\n        fprintf(stderr, \"  [klepton] image table full (%d): %s is not visible to dlsym\\n\", KL_MAX_IMAGES, soname);\n",
      "before", "image table full"),
 ])
+# ---- image-loaded hook: lets the host repair a guest image right after load
+patch("runtime/klepton.h", [
+    ("void       kl_interpose(const char *name, void *fn);\n",
+     "// Called once per image right after it is registered (before guest code\n"
+     "// of a later dlopen can run it); the host uses it for byte-checked fixes.\n"
+     "extern void (*kl_image_loaded_hook)(const char *path, kl_image *img);\n",
+     "after", "kl_image_loaded_hook"),
+])
+patch("runtime/kl_dl.c", [
+    ("void kl_register_image(const char *soname, kl_image *img) {\n",
+     "void (*kl_image_loaded_hook)(const char *path, kl_image *img);\n\n",
+     "before", "void (*kl_image_loaded_hook)"),
+    ("    if (!strcmp(base, \"libgl4es.so\")) kl_shim_set_guest_gl(img);\n",
+     "    if (kl_image_loaded_hook) kl_image_loaded_hook(soname, img);\n",
+     "after", "if (kl_image_loaded_hook) kl_image_loaded_hook"),
+])
 print("done")

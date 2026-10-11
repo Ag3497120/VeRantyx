@@ -44,6 +44,15 @@ done
 merge_dir game/bin
 merge_dir game/hlvr
 merge_dir game/hlvr/bin
+# Panorama's videos: an install whose panorama/videos was renamed (videos.bak,
+# an old Wine-path workaround) still gets them here, or the in-game screens
+# start players with an empty URL and libvideo crashes. The install is not
+# touched; only this root sees "videos".
+if [[ ! -d "$INSTALL/game/hlvr/panorama/videos" && -d "$INSTALL/game/hlvr/panorama/videos.bak" ]]; then
+    rm -f "$OUT/game/hlvr/panorama"
+    merge_dir game/hlvr/panorama
+    ln -sfn "$INSTALL/game/hlvr/panorama/videos.bak" "$OUT/game/hlvr/panorama/videos"
+fi
 # The Linux ARM64 binaries, and the depot's own copies of anything else it ships.
 ln -sfn "$DEPOT/game/bin/linuxsteamrtarm64" "$OUT/game/bin/linuxsteamrtarm64"
 ln -sfn "$DEPOT/game/hlvr/bin/linuxsteamrtarm64" "$OUT/game/hlvr/bin/linuxsteamrtarm64"

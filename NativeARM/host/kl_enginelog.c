@@ -9,6 +9,7 @@
 // formatted here and forwarded as ("%s", text) through a plain two-argument
 // call, which both ABIs place in x0/x1.
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -87,8 +88,25 @@ static void klg_Plat_AppendMiniDumpErrorString(const char *fmt, const char *a1, 
     if (fmt && strstr(fmt, "%s") && a1) fprintf(stderr, " | %s", a1);
     fprintf(stderr, "\n");
 }
+static void describe_ptr(const char *what, const void *p) {
+    size_t off = 0; const char *img = kl_addr_image(p, &off);
+    fprintf(stderr, "    %s = %p (%s+%#zx)\n", what, p, img ? img : "host?", off);
+}
 static int klg_Plat_MessageBox(const char *title, const char *text) {
     fprintf(stderr, "[engine messagebox] %s: %s\n", title ? title : "", text ? text : "");
+    if (text && strstr(text, "Mongoose")) {   // which object the client's watchdog asked
+        kl_image *c = kl_find_image("libclient.so");
+        if (c) {
+            void *obj = *(void **)((uint8_t *)kl_base(c) + 0x26b96e8);
+            describe_ptr("watchdog object", obj);
+            if (obj) {
+                void **vt = *(void ***)obj;
+                describe_ptr("  vtable", vt);
+                describe_ptr("  slot 0x70", vt[0x70 / 8]);
+                describe_ptr("  slot 0xd0", vt[0xd0 / 8]);
+            }
+        }
+    }
     return 0;
 }
 
