@@ -68,11 +68,13 @@ swiftc -O "$REPO_ROOT/MacEncoder/HardwareEncoder.swift" -o "$ENCODER"
 ENCODER_PID=$!
 HOST_PID=""
 cleanup() {
-    # The engine installs its own SIGTERM handler and may not leave; give it
-    # five seconds, then end it.
+    # The engine handles SIGTERM itself and writes its Vulkan pipeline cache
+    # (shadercache/vulkan) on the way out, which is what makes the next run
+    # stutter less; give it up to 30 s before ending it.
     if [[ -n "$HOST_PID" ]] && kill -0 "$HOST_PID" 2>/dev/null; then
+        echo "Stopping the game (saving its shader cache)..."
         kill -TERM "$HOST_PID" 2>/dev/null || true
-        for _ in 1 2 3 4 5; do kill -0 "$HOST_PID" 2>/dev/null || break; sleep 1; done
+        for _ in $(seq 1 30); do kill -0 "$HOST_PID" 2>/dev/null || break; sleep 1; done
         kill -KILL "$HOST_PID" 2>/dev/null || true
     fi
     if kill -0 "$ENCODER_PID" 2>/dev/null; then

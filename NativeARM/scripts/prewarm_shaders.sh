@@ -11,6 +11,12 @@
 #   NativeARM/scripts/prewarm_shaders.sh --force
 #
 # Done-marker: <game root>/.shader_prewarm (database size/mtime + MoltenVK).
+#
+# Status (2026-10-11): NOT effective yet, so the launcher does not run it. It
+# replays 2110 graphics + 24 compute pipelines in ~220 s, but the game's own
+# pipelines in a map never played before still compiled at ~410 ms each
+# afterwards: the shipped database's pipeline state and Klepton's SPIR-V
+# rewrites (texel-buffer emulation) make Metal's cache keys differ.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NATIVE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
