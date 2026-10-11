@@ -12,11 +12,18 @@
 #include "kl_guestfix.h"
 #include "kl_fault.h"
 
+// A fix names its image and offset, the FNV-1a hash of the original words it
+// expects there (the game's code itself is not reproduced here), and how to
+// build the replacement: each entry is either an index into the original words
+// (KEEP(i): the game's instruction, moved) or a new instruction of ours (OURS).
+#define KEEP(i) (0x80000000u | (uint32_t)(i))
+#define OURS(w) ((uint32_t)(w) & 0x7fffffffu)
 typedef struct {
     const char *image;          // basename
     uint32_t offset;            // of the first word
     unsigned n;
-    uint32_t expect[8], replace[8];
+    uint64_t expect_fnv1a;      // hash of the n original words
+    uint32_t build[8];          // KEEP(i) or OURS(word); OURS words never set bit 31
     const char *what;
 } fix_t;
 
@@ -26,13 +33,19 @@ static const fix_t g_fixes[] = {
     // came from a wrong tgkill answer (fixed in kl_glibc.c: the profiler
     // registry freed live threads' objects); kept as a guard. The
     // prologue is rebuilt to return when the node is NULL: the frame-pointer
-    // move is dropped to make room (the body never reads x29), and NULL jumps
-    // to the function's own epilogue at +0xcc (returns 0, "not finished").
-    { "libvideo.so", 0x1180a0, 7,
-      { 0xa9be7bfd, 0x910003fd, 0xf9000bf3, 0xaa0003f3, 0xb9404801, 0x7100003f, 0x5400040d },
-      { 0xa9be7bfd, 0xf9000bf3, 0xaa0003f3, 0xb4000600, 0xb9404801, 0x7100003f, 0x5400040d },
+    // move (word 1) is dropped to make room (the body never reads x29), and
+    // NULL jumps to the function's own epilogue at +0xcc
+    // ("cbz x0, +0xc0" = 0xb4000600, our only new instruction).
+    { "libvideo.so", 0x1180a0, 7, 0x4dd69d9ecfed2441ull,
+      { KEEP(0), KEEP(2), KEEP(3), OURS(0x34000600) | 0x80000000u, KEEP(4), KEEP(5), KEEP(6) },
       "video decoder profiling scope exit tolerates a NULL node" },
 };
+
+static uint64_t fnv1a(const void *p, size_t n) {
+    const uint8_t *b = p; uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
+    return h;
+}
 
 static int write_code(uint32_t *at, const uint32_t *words, unsigned n) {
     uintptr_t page = (uintptr_t)at & ~(uintptr_t)0x3fff;
@@ -50,12 +63,18 @@ static void on_image(const char *path, kl_image *img) {
         const fix_t *f = &g_fixes[i];
         if (strcmp(base, f->image)) continue;
         uint32_t *at = (uint32_t *)((uint8_t *)kl_base(img) + f->offset);
-        if (!memcmp(at, f->replace, f->n * 4)) continue;          // already applied
-        if (memcmp(at, f->expect, f->n * 4)) {
+        if (fnv1a(at, f->n * 4) != f->expect_fnv1a) {
             fprintf(stderr, "  [guestfix] %s+%#x: instructions differ (other build?) — not applied: %s\n", f->image, f->offset, f->what);
             continue;
         }
-        if (write_code(at, f->replace, f->n) == 0)
+        uint32_t words[8];
+        for (unsigned k = 0; k < f->n; k++) {
+            uint32_t b = f->build[k];
+            // KEEP(i) has bit 31 and a small index; a new instruction is stored
+            // with bit 31 forced on too, so tell them apart by the index range.
+            words[k] = (b & 0x7fffffffu) < f->n ? at[b & 0x7fffffffu] : (b & 0x7fffffffu) | 0x80000000u;
+        }
+        if (write_code(at, words, f->n) == 0)
             fprintf(stderr, "  [guestfix] %s+%#x: %s\n", f->image, f->offset, f->what);
         else
             fprintf(stderr, "  [guestfix] %s+%#x: could not write code\n", f->image, f->offset);
