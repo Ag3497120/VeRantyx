@@ -175,7 +175,31 @@ display rate for frame rate; the encoder then adapts on its own:
 | `VERANTYX_AUDIO` | 1 | Stream the Mac's audio to the headset (Mac speakers are muted meanwhile); `VERANTYX_AUDIO_KEEP_MAC_SPEAKERS=1` keeps them on |
 | `VERANTYX_LOW_LATENCY_ENCODER` | 0 | VideoToolbox low-latency rate control (slower on M1 Max) |
 | `HLA_FIDELITY_LEVEL` | profile | Adds Alyx's `vr_fidelity_level` console variables (0–8); unset lets Alyx choose |
-| `VERANTYX_D3D_BACKEND` | dxvk | `dxmt` renders the game through [DXMT](https://github.com/3Shain/dxmt) (Direct3D 11 → Metal in one layer) instead of DXVK → MoltenVK; SteamVR's compositor keeps DXVK. Experimental: the script installs DXMT (system32 `d3d11.dll`, with DXVK kept as `d3d11_dxvk.dll` for the compositor) and restarts Steam, and Alyx starts and reaches its first level load with it, but on Wine 11.9 it exits during that load. Left opt-in until that is understood |
+| `VERANTYX_D3D_BACKEND` | dxvk | Direct3D backend. `dxmt`: the game renders through [DXMT](https://github.com/3Shain/dxmt) (Direct3D 11 → Metal in one layer, less CPU than DXVK → MoltenVK) while SteamVR's compositor keeps DXVK; the script downloads DXMT, installs it (system32 `d3d11.dll`, DXVK kept as `d3d11_dxvk.dll` for the compositor, `winemetal` into the Wine runtime) and restarts Steam. `d3dmetal` (with `VERANTYX_USE_DXVK=0`): Apple's D3DMetal for the whole prefix from your own Game Porting Toolkit copy at `GPTK_ROOT` (default `~/Verantyx_VR_Drive/gptk_wine_local`; nothing is downloaded or shipped, Apple's license does not allow redistribution). Alyx loads `d3d11.dll` from system32 explicitly, which is why both go there. Both are experimental; see "D3D backends" below |
+
+### D3D backends
+
+The game is CPU-bound under Wine, and part of that CPU is the Direct3D
+translation itself. Three backends can be compared with the headset on
+(`logs/hardware-encoder.log` shows the game's submit rate every 5 s):
+
+```bash
+./scripts/launch_vision_pro_vr.sh                                   # DXVK → MoltenVK (default)
+VERANTYX_D3D_BACKEND=dxmt ./scripts/launch_vision_pro_vr.sh          # DXMT for the game
+VERANTYX_D3D_BACKEND=d3dmetal VERANTYX_USE_DXVK=0 ./scripts/launch_vision_pro_vr.sh   # your own GPTK's D3DMetal
+```
+
+Switching restarts the Steam client (the game inherits its environment)
+and, for `d3dmetal`, needs SteamVR stopped first since the compositor
+changes backend too. Switching back to `dxvk` restores the DXVK DLLs.
+
+Status (2026-10-11): `dxmt` starts Alyx and renders (confirmed in the
+bench); its frame rate with the headset is still to be compared. `d3dmetal`
+installs GPTK's D3D DLLs as the Wine runtime's builtins (they are Wine
+builtins with a Unix half, not droppable native DLLs); GPTK 1.1's abort on
+Wine 11 with "unimplemented function ntdll.dll.__wine_unix_call" (an ABI
+Wine 8 removed), so only GPTK 2.x can work with this runtime, untested.
+The project's June 2026 setup ran entirely on GPTK 1.1's own Wine 7.7.
 
 ### Measuring on your Mac
 

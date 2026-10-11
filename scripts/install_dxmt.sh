@@ -79,6 +79,17 @@ mkdir -p "$DXMT_UNIX_DIR/x86_64-unix" "$DXMT_UNIX_DIR/x86_64-windows"
 cp -p "$DXMT_ROOT/x86_64-unix/winemetal.so" "$DXMT_UNIX_DIR/x86_64-unix/winemetal.so"
 cp -p "$DXMT_ROOT/x86_64-windows/winemetal.dll" "$DXMT_UNIX_DIR/x86_64-windows/winemetal.dll"
 rm -f "$HLA_GAME_BIN/winemetal.dll"
+# Also put winemetal into the Wine runtime's own builtin directories, so a
+# game started by the Steam client finds it without any environment variable.
+WINE_LIB="${WINE_LIB:-$VERANTYX_VR_DRIVE/Beer/wine/WineStaging.app/Contents/Resources/wine/lib/wine}"
+if [[ -d "$WINE_LIB/x86_64-windows" && -d "$WINE_LIB/x86_64-unix" ]]; then
+    for pair in "x86_64-unix/winemetal.so" "x86_64-windows/winemetal.dll"; do
+        if ! cmp -s "$DXMT_ROOT/$pair" "$WINE_LIB/$pair"; then
+            cp -p "$DXMT_ROOT/$pair" "$WINE_LIB/$pair.verantyx-tmp" && mv -f "$WINE_LIB/$pair.verantyx-tmp" "$WINE_LIB/$pair"
+            echo "Installed $(basename "$pair") into the Wine runtime ($WINE_LIB)."
+        fi
+    done
+fi
 
 changed=0
 for dll in "${DLLS[@]}"; do

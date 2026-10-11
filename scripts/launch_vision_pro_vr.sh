@@ -204,6 +204,20 @@ elif [[ -f "$STEAM_ROOT/steamapps/common/Half-Life Alyx/game/bin/win64/.verantyx
     WINEPREFIX="$WINEPREFIX" VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" STEAM_ROOT="$STEAM_ROOT" \
         DXVK_SOURCE_DIR="$DXVK_SOURCE_DIR" "$REPO_ROOT/scripts/install_dxmt.sh" remove
 fi
+# VERANTYX_D3D_BACKEND=d3dmetal: Apple's D3DMetal from your own Game Porting
+# Toolkit copy (GPTK_ROOT) for the whole prefix, as the project ran in June.
+if [[ "$D3D_BACKEND" == "d3dmetal" ]]; then
+    if [[ "$USE_DXVK" == "1" ]]; then
+        echo "Note: VERANTYX_D3D_BACKEND=d3dmetal replaces the DXVK DLLs installed above for this prefix."
+    fi
+    VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" "$REPO_ROOT/scripts/install_d3dmetal.sh"
+    # Builtin only: the DXVK d3d11.dll still in system32 must not be picked.
+    export WINEDLLOVERRIDES="d3d10,d3d10_1,d3d10core,d3d11,d3d12,d3d12core,dxgi=b;nvapi,nvapi64,nvngx,nvngx-on-metalfx,atidxx64="
+    export D3DM_SUPPORT_DXR="${D3DM_SUPPORT_DXR:-0}"
+elif [[ -f "$VERANTYX_VR_DRIVE/Beer/wine/WineStaging.app/Contents/Resources/wine/lib/wine/.verantyx-d3dmetal" ]] && \
+    ! pgrep -f '[v]rcompositor\.exe|[h]lvr\.exe' >/dev/null 2>&1; then
+    VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" "$REPO_ROOT/scripts/install_d3dmetal.sh" remove
+fi
 STEAM_BACKEND_MARKER="$LOG_DIR/.steam-d3d-backend"
 if pgrep -f '[s]team\.exe' >/dev/null 2>&1 && [[ -f "$STEAM_BACKEND_MARKER" ]] && \
     [[ "$(cat "$STEAM_BACKEND_MARKER")" != "$D3D_BACKEND" ]] && ! pgrep -f '[h]lvr\.exe' >/dev/null 2>&1; then
