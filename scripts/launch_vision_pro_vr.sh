@@ -340,8 +340,24 @@ steam_webhelper_failed() {
 # render target scale instead of Alyx's fidelity flags, which made Alyx exit
 # during startup.
 HLA_BASE_OPTIONS=(-vr -nowindow -novid -console -vconsole -condebug -dx11)
+set_options_status=0
 WINEPREFIX="$WINEPREFIX" STEAM_ROOT="$STEAM_ROOT" \
-    "$REPO_ROOT/scripts/set_alyx_launch_options.sh" "${HLA_BASE_OPTIONS[*]}"
+    "$REPO_ROOT/scripts/set_alyx_launch_options.sh" "${HLA_BASE_OPTIONS[*]}" || set_options_status=$?
+if (( set_options_status == 3 )) && ! pgrep -f '[h]lvr\.exe' >/dev/null 2>&1; then
+    echo "Stopping Windows Steam to store Alyx's launch options and overlay setting."
+    pkill -TERM -f '[v]rstartup\.exe|[v]rmonitor\.exe|[v]rserver\.exe|[v]rcompositor\.exe|[v]rwebhelper|[v]rdashboard' 2>/dev/null || true
+    pkill -TERM -f '[s]teamwebhelper|[s]team\.exe' 2>/dev/null || true
+    for ((waited = 0; waited < 30; waited++)); do
+        pgrep -f '[s]team\.exe|[v]rserver\.exe' >/dev/null 2>&1 || break
+        sleep 1
+    done
+    pkill -KILL -f '[s]teamwebhelper|[s]team\.exe|[v]rserver\.exe|[v]rcompositor\.exe' 2>/dev/null || true
+    sleep 2
+    WINEPREFIX="$WINEPREFIX" STEAM_ROOT="$STEAM_ROOT" \
+        "$REPO_ROOT/scripts/set_alyx_launch_options.sh" "${HLA_BASE_OPTIONS[*]}" || true
+elif (( set_options_status != 0 && set_options_status != 3 )); then
+    exit "$set_options_status"
+fi
 
 if ! steam_is_authenticated; then
     STEAM_START_EPOCH="$(date +%s)"

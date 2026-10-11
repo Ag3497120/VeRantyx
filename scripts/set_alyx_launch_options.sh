@@ -17,10 +17,10 @@ if [[ "$(basename "$WINEPREFIX")" != "SteamVR_Prefix_Wine11_Test" ]]; then
     echo "Refusing to modify Steam settings outside the test prefix: $WINEPREFIX" >&2
     exit 1
 fi
-if pgrep -f 'Steam[/\\]steam\.exe' >/dev/null 2>&1; then
-    echo "Windows Steam is running; Alyx launch options are applied the next time this script starts Steam."
-    exit 0
-fi
+# Exit 3 while Steam runs and the stored values differ, so the caller can stop
+# Steam and call again (Steam rewrites this file while it runs).
+STEAM_RUNNING=0
+if pgrep -f 'Steam[/\\]steam\.exe' >/dev/null 2>&1; then STEAM_RUNNING=1; fi
 
 shopt -s nullglob
 configs=("$STEAM_ROOT"/userdata/*/config/localconfig.vdf)
@@ -30,16 +30,19 @@ if (( ${#configs[@]} == 0 )); then
 fi
 
 for config in "${configs[@]}"; do
-    python3 - "$config" "$OPTIONS" <<'PY'
+    python3 - "$config" "$OPTIONS" "$STEAM_RUNNING" <<'PY'
 import os
 import re
 import shutil
 import sys
 import tempfile
 
-path, options = sys.argv[1], sys.argv[2]
+path, options, steam_running = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 app_path = ["userlocalconfigstore", "software", "valve", "steam", "apps"]
 app_id = "546560"
+# The Steam overlay hooks the game's D3D11/DXGI; it has nothing to show in a
+# VR game here and breaks the DXMT backend, so it stays off for Alyx.
+wanted = {"LaunchOptions": options, "OverlayAppEnable": "0"}
 with open(path, "r", encoding="utf-8") as source:
     lines = source.read().split("\n")
 
@@ -49,7 +52,7 @@ pending_key = None
 apps_close = None        # index of the "apps" block's closing brace
 app_open = None          # index of the 546560 block's opening brace
 app_close = None
-option_line = None
+option_lines = {}
 for index, line in enumerate(lines):
     stripped = line.strip()
     if stripped == "{":
@@ -73,29 +76,44 @@ for index, line in enumerate(lines):
     key, value = match.group(2), match.group(3)
     if value is None:
         pending_key = key
-    elif [k.lower() for k in stack] == app_path + [app_id] and key.lower() == "launchoptions":
-        option_line = index
+    elif [k.lower() for k in stack] == app_path + [app_id]:
+        for name in wanted:
+            if key.lower() == name.lower():
+                option_lines[name] = index
 
-escaped = options.replace("\\", "\\\\").replace('"', '\\"')
-if option_line is not None:
-    indent = re.match(r"^(\s*)", lines[option_line]).group(1)
-    new_line = f'{indent}"LaunchOptions"\t\t"{escaped}"'
-    if lines[option_line] == new_line:
-        print(f"Alyx launch options already stored in {path}")
+def escape(value):
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+changed = False
+new_entries = []
+for name, value in wanted.items():
+    line = f'"{name}"\t\t"{escape(value)}"'
+    if name in option_lines:
+        index = option_lines[name]
+        indent = re.match(r"^(\s*)", lines[index]).group(1)
+        if lines[index] != indent + line:
+            lines[index] = indent + line
+            changed = True
+    else:
+        new_entries.append(line)
+if new_entries:
+    changed = True
+    if app_open is not None:
+        indent = re.match(r"^(\s*)", lines[app_open]).group(1) + "\t"
+        lines[app_open + 1:app_open + 1] = [indent + entry for entry in new_entries]
+    elif apps_close is not None:
+        indent = re.match(r"^(\s*)", lines[apps_close]).group(1) + "\t"
+        lines[apps_close:apps_close] = [f'{indent}"{app_id}"', f"{indent}{{"] + \
+            [f"{indent}\t{entry}" for entry in new_entries] + [f"{indent}}}"]
+    else:
+        print(f"No Steam apps section in {path}; Alyx launch options were not stored.", file=sys.stderr)
         raise SystemExit(0)
-    lines[option_line] = new_line
-elif app_open is not None:
-    indent = re.match(r"^(\s*)", lines[app_open]).group(1) + "\t"
-    lines.insert(app_open + 1, f'{indent}"LaunchOptions"\t\t"{escaped}"')
-elif apps_close is not None:
-    indent = re.match(r"^(\s*)", lines[apps_close]).group(1) + "\t"
-    lines[apps_close:apps_close] = [
-        f'{indent}"{app_id}"', f"{indent}{{",
-        f'{indent}\t"LaunchOptions"\t\t"{escaped}"', f"{indent}}}",
-    ]
-else:
-    print(f"No Steam apps section in {path}; Alyx launch options were not stored.", file=sys.stderr)
+if not changed:
+    print(f"Alyx launch options already stored in {path}")
     raise SystemExit(0)
+if steam_running:
+    print("Windows Steam is running and Alyx's stored launch options or overlay setting need a change; Steam has to be stopped first.")
+    raise SystemExit(3)
 
 backup = path + ".mbp-avp-vr-original"
 if not os.path.exists(backup):
