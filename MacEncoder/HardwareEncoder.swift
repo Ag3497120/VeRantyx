@@ -565,9 +565,12 @@ func setupEncoder(width: Int32, height: Int32) {
 
 let winePrefix = ProcessInfo.processInfo.environment["WINEPREFIX"]
     ?? (NSHomeDirectory() + "/Verantyx_VR_Drive/SteamVR_Prefix")
-let filePath = URL(fileURLWithPath: winePrefix)
-    .appendingPathComponent("drive_c/vr_shared_frame.dat")
-    .path
+// VERANTYX_SHARED_FRAME names the file directly (the native ARM build keeps
+// it beside the game, not in a Wine prefix).
+let filePath = ProcessInfo.processInfo.environment["VERANTYX_SHARED_FRAME"].flatMap { $0.isEmpty ? nil : $0 }
+    ?? URL(fileURLWithPath: winePrefix)
+        .appendingPathComponent("drive_c/vr_shared_frame.dat")
+        .path
 let sharedHandsSize = 312 // Keep in sync with SharedHands in driver_verantyx.cpp.
 let mapSize = MemoryLayout<DoubleBufferHeader>.size + (Int(MemoryLayout<SharedFrame>.size) + 4096 * 4096 * 8) * 2 + sharedHandsSize + 1024
 

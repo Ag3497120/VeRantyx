@@ -572,12 +572,15 @@ r"""        // ---- glibc guest shapes (x18 is a general register on Linux) ----
             unsigned k = 0;
             int ok = 1, served = 0;
             if (word == 0xD63F0240u) {
-                // blr x18: call through the shadow; x18 is caller-saved, so
-                // clobbering it here is within the ABI. Return lands in the
-                // veneer, which branches back behind the site.
-                body[k++] = enc_mrs_tpidrro(18);
-                body[k++] = enc_ldr(18, 18, (unsigned)KLX_TSD_SLOT * 8);
-                body[k++] = word;
+                // blr x18: call through the shadow via x16 (IP0, which every
+                // call may clobber), never through the real x18: the kernel can
+                // zero x18 between loading it and the blr, and the race
+                // recovery then resumed the callee with the wrong return
+                // address (libmpg123's dct36 calls: corrupted state, crash).
+                // Return lands in the veneer, which branches back behind the site.
+                body[k++] = enc_mrs_tpidrro(16);
+                body[k++] = enc_ldr(16, 16, (unsigned)KLX_TSD_SLOT * 8);
+                body[k++] = 0xD63F0200u;                 // blr x16
                 ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
                 served = 1;
             } else if (in.pcrel == KLX_PC_ADR && (word & 0x9F000000u) == 0x10000000u && (word & 31u) == 18) {
