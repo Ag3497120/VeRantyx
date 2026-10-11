@@ -77,6 +77,17 @@ static float sample_at(const uint8_t *p, uint16_t fmt) {
     }
 }
 
+// The game's float mix goes well past full scale (peaks of +9 dBFS were
+// measured in the first level); Core Audio and the encoder's 16-bit stream
+// would clip it hard. Linear up to 0.8, then a tanh knee that approaches 1.
+static inline float soft_limit(float x) {
+    const float knee = 0.8f;
+    float a = fabsf(x);
+    if (a <= knee) return x;
+    float y = knee + (1.0f - knee) * tanhf((a - knee) / (1.0f - knee));
+    return x < 0 ? -y : y;
+}
+
 // Append `len` bytes in the device's format; drops what does not fit.
 static void ring_push(const uint8_t *data, uint32_t len) {
     const unsigned ch = g_spec.channels ? g_spec.channels : 2;
@@ -92,6 +103,7 @@ static void ring_push(const uint8_t *data, uint32_t len) {
         const uint8_t *f = data + (size_t)i * frameBytes;
         for (unsigned c = 0; c < ch && c < 8; c++) in[c] = sample_at(f + c * bps, g_spec.format);
         float l, r; downmix(in, ch > 8 ? 8 : ch, &l, &r);
+        l = soft_limit(l); r = soft_limit(r);
         uint32_t slot = (head + i) & (RING_FRAMES - 1);
         g_ring[slot * 2] = l; g_ring[slot * 2 + 1] = r;
     }

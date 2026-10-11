@@ -44,6 +44,11 @@ done
 merge_dir game/bin
 merge_dir game/hlvr
 merge_dir game/hlvr/bin
+# Files the engine writes are this build's own, not the Windows install's:
+# the Vulkan pipeline cache (MoltenVK's) must not land in the Wine game's
+# shadercache.
+rm -f "$OUT/game/hlvr/shadercache"
+mkdir -p "$OUT/game/hlvr/shadercache/vulkan"
 # Panorama's videos: an install whose panorama/videos was renamed (videos.bak,
 # an old Wine-path workaround) still gets them here, or the in-game screens
 # start players with an empty URL and libvideo crashes. The install is not
