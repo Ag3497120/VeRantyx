@@ -119,12 +119,15 @@ echo "Logs: $LOG_DIR/alyx_host.log, $LOG_DIR/hardware-encoder.log"
 HOST_PID=$!
 
 # Progress: one line every 5 s from the runtime's compositor report.
-# When the frame rate stays below 20 fps for 15 s after the first minute, the
-# game's threads are sampled once (macOS `sample`, 3 s) into
+# When the frame rate stays below 20 fps for 15 s after the first minute while
+# the headset is tracked, the game's threads are sampled once (macOS `sample`, 3 s) into
 # logs/native/slow-<time>.txt together with the runtime's frame timing, so a
 # slowdown can be traced afterwards; guest frames are read against the
 # "[image] <base> <library>" lines of alyx_host.log (slow-<time>.sample.txt). At most one sample per
 # 2 minutes. VERANTYX_SLOW_SAMPLE=0 turns it off.
+# Not counted while the headset is absent: after a level change the game keeps
+# its loading screen (sleeping 100 ms a frame, ~9 fps) until the headset is
+# worn again — Valve's behaviour, measured 2026-10-11, not a slowdown.
 prev_pairs=""; slow=0; last_sample=-1000; started=$SECONDS
 while kill -0 "$HOST_PID" 2>/dev/null; do
     sleep 5
@@ -133,7 +136,7 @@ while kill -0 "$HOST_PID" 2>/dev/null; do
     [[ -n "$line" ]] || continue
     echo "${line#*compositor: }"
     pairs="$(sed -E 's/.* ([0-9]+) eye pairs published.*/\1/' <<<"$line")"
-    if [[ -n "$prev_pairs" && "$pairs" =~ ^[0-9]+$ ]] && (( SECONDS - started > 60 && pairs - prev_pairs < 100 )); then
+    if [[ -n "$prev_pairs" && "$pairs" =~ ^[0-9]+$ ]] && [[ "$line" == *"headset tracking"* ]] && (( SECONDS - started > 60 && pairs - prev_pairs < 100 )); then
         slow=$((slow + 1))
     else
         slow=0
