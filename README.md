@@ -7,7 +7,10 @@ under Wine on the Mac, captures every stereo frame the game submits, encodes it
 in hardware, and streams it over Wi-Fi to a native visionOS app. The headset
 sends its head and hand poses back; the game sees an Oculus Touch headset and
 controllers. Hands are tracked by the Vision Pro; buttons, sticks and triggers
-come from a pair of Nintendo Switch Joy-Con.
+come from a pair of Nintendo Switch Joy-Con, or the whole game is played with
+bare hands. No tracked VR controllers are needed: the PS VR2 Sense controllers
+that the native Vision Pro port of Alyx requires are not sold in every region
+(not in Japan at the time of writing).
 
 <!-- VIDEO: after uploading docs/media/highlight.mp4 through the README editor
      on github.com, replace the poster link below with the generated
