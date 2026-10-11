@@ -29,6 +29,10 @@ struct VRControllerHand {
     /// the stick: direction from the stick angle, distance (pitch) from how
     /// far it is pushed, so Alyx's teleport arc is aimed with the stick.
     var stickAimsTeleport = false
+    /// The hand holding the gamepad is not tracked by the cameras at all: it
+    /// sits at a fixed place relative to the head (a hand wrapped around a
+    /// controller tracks badly and only its buttons matter).
+    var bodyLocked = false
 }
 
 /// How a one-handed gamepad (Pro Controller or any non-Joy-Con pad) is held;
@@ -317,6 +321,7 @@ final class VRGameControllerInput: @unchecked Sendable {
         left.secondary = gamepad.dpad.up.isPressed || gamepad.dpad.right.isPressed
         left.menu = gamepad.buttonMenu.isPressed || gamepad.buttonOptions?.isPressed == true
         left.stickAimsTeleport = true
+        left.bodyLocked = true
 
         var right = VRControllerHand()
         right.stick = hold.rotate(Self.stick(gamepad.rightThumbstick))
@@ -350,6 +355,7 @@ final class VRGameControllerInput: @unchecked Sendable {
         left.secondary = gamepad.dpad.up.isPressed || gamepad.dpad.right.isPressed
         left.menu = gamepad.buttonMenu.isPressed || gamepad.buttonOptions?.isPressed == true
         left.stickAimsTeleport = true
+        left.bodyLocked = true
 
         var right = VRControllerHand()
         right.stick = hold.rotate(Self.stick(gamepad.leftThumbstick))

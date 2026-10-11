@@ -851,6 +851,86 @@
           }
         }
       }
+    },
+    "gamepad": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ゲームパッド"
+          }
+        }
+      }
+    },
+    "fist + pinch": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "グー＋ピンチ"
+          }
+        }
+      }
+    },
+    "fist (grip)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "グー（グリップ）"
+          }
+        }
+      }
+    },
+    "index pinch (trigger)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "人差し指ピンチ（トリガー）"
+          }
+        }
+      }
+    },
+    "middle pinch (stick)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "中指ピンチ（スティック）"
+          }
+        }
+      }
+    },
+    "ring pinch (A/X)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "薬指ピンチ（A/X）"
+          }
+        }
+      }
+    },
+    "little pinch (B/Y)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "小指ピンチ（B/Y）"
+          }
+        }
+      }
+    },
+    "open": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "開いた手"
+          }
+        }
+      }
     }
   }
 }

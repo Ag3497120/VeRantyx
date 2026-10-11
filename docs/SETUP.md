@@ -87,7 +87,12 @@ the hold picker set to the way it is turned): the right Joy-Con's ZR and R
 are the trigger and grip (the left one's ZL and L are ignored), the right
 Joy-Con's stick moves/teleports and the left Joy-Con's stick turns, the
 arrows are X/Y and A/B/X/Y are the right Touch buttons. The right hand is
-free: its trigger and grip are gestures and it does the gravity gloves.
+free: its trigger and grip are gestures and it does the gravity gloves. The
+hand holding the pad is not camera-tracked at all (a hand wrapped around a
+controller tracks badly and only its buttons matter): it sits at a fixed
+place beside and below the eyes, turned with the head, and the stick aims
+its teleport arc. The app window shows what the cameras recognize for the
+free hand (open, fist = grip, index pinch = trigger, other pinches).
 
 A Nintendo Switch Pro Controller (or any other gamepad) works one-handed:
 hold it in the left hand, turned sideways so the thumb reaches the left stick

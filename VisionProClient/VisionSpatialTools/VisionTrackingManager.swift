@@ -474,9 +474,9 @@ private struct HandState {
             stickLabel = String(format: "(%+.2f,%+.2f)", stick.x, stick.y)
         }
         return String(
-            format: "trigger %d%% grip %d%% stick %@ %@%@",
+            format: "trigger %d%% grip %d%% stick %@ %@%@ · %@",
             Int(triggerValue) * 100 / 255, Int(gripValue) * 100 / 255, stickLabel,
-            buttonBits & 1 != 0 ? primary : "–", buttonBits & 2 != 0 ? secondary : "–"
+            buttonBits & 1 != 0 ? primary : "–", buttonBits & 2 != 0 ? secondary : "–", poseLabel
         )
     }
 
@@ -484,6 +484,11 @@ private struct HandState {
                          head: simd_float4x4, headTracked: Bool, now: CFTimeInterval,
                          controller: VRControllerHand?) {
         usesController = controller != nil
+        lastGestureHand = controller == nil || controller?.gestureTriggerGrip == true
+        if let controller, controller.bodyLocked {
+            applyBodyLocked(controller, head: head, headTracked: headTracked, now: now)
+            return
+        }
         guard let anchor, anchor.isTracked, let skeleton = anchor.handSkeleton,
               let joints = HandJoints(anchor: anchor, skeleton: skeleton),
               let worldRaw = Self.touchRawPose(joints: joints, isLeft: isLeft) else {
@@ -805,6 +810,62 @@ private struct HandState {
         if controller.menu { bits |= 16 }
         buttonBits = bits
     }
+
+    /// The gamepad hand: a fixed pose 18 cm to the side, 38 cm below and
+    /// 30 cm in front of the eyes, turned with the head's yaw only, slightly
+    /// rolled inward like a held controller. Buttons and sticks come from the
+    /// gamepad; the stick aims the teleport arc.
+    private mutating func applyBodyLocked(_ controller: VRControllerHand, head: simd_float4x4,
+                                          headTracked: Bool, now: CFTimeInterval) {
+        guard headTracked else {
+            trackingState = 0
+            transform = VRPoseSampler.untrackedTransform
+            applyController(controller)
+            return
+        }
+        let forward = SIMD3<Float>(-head.columns.2.x, 0, -head.columns.2.z)
+        let yaw = simd_length_squared(forward) > 1e-4 ? atan2(-forward.x, -forward.z) : 0
+        let headPosition = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
+        let yawRotation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
+        let offset = SIMD3<Float>(isLeft ? -0.18 : 0.18, -0.38, -0.30)
+        let position = headPosition + yawRotation.act(offset)
+        // Raw Touch pose: +Y up the handle, -Z forward; a resting hand points
+        // ~35° down and rolls ~15° toward the body.
+        let rest = yawRotation
+            * simd_quatf(angle: -35 * Float.pi / 180, axis: SIMD3<Float>(1, 0, 0))
+            * simd_quatf(angle: (isLeft ? -15 : 15) * Float.pi / 180, axis: SIMD3<Float>(0, 0, 1))
+        var pose = simd_float4x4(rest)
+        pose.columns.3 = SIMD4<Float>(position, 1)
+        if controller.stickAimsTeleport { pose = Self.aimWithStick(pose, stick: controller.stick, head: head) }
+        transform = pose
+        trackingState = 1
+        lostAt = nil
+        lastMeasuredLocal = head.inverse * pose
+        velocity = .zero
+        angularVelocity = .zero
+        if let motion = controller.motion, let rate = motion.rotationRate {
+            let handFromDevice = simd_quatf(angle: -.pi / 2, axis: SIMD3<Float>(1, 0, 0))
+            angularVelocity = simd_float3x3(simd_quatf(pose)) * simd_float3x3(handFromDevice) * rate
+        }
+        applyController(controller)
+    }
+
+    /// What the cameras see the free hand doing, for the status display.
+    var poseLabel: String {
+        if usesController && !gestureHand { return String(localized: "gamepad") }
+        guard trackingState != 0 else { return String(localized: "not visible") }
+        if gripEngaged && triggerEngaged { return String(localized: "fist + pinch") }
+        if gripEngaged { return String(localized: "fist (grip)") }
+        if triggerEngaged { return String(localized: "index pinch (trigger)") }
+        switch pinchedFinger {
+        case .middle: return String(localized: "middle pinch (stick)")
+        case .ring: return String(localized: "ring pinch (A/X)")
+        case .little: return String(localized: "little pinch (B/Y)")
+        case nil: return String(localized: "open")
+        }
+    }
+    private var gestureHand: Bool { lastGestureHand }
+    private var lastGestureHand = false
 
     /// Teleport aimed with a stick: beyond the dead zone, the hand's pose is
     /// turned so its aim ray points along the stick's direction (relative to
