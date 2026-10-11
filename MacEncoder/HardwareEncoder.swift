@@ -1176,8 +1176,21 @@ final class GameAudioStreamer {
     private var sampleRate: UInt32 = 48_000
     private var channels: UInt32 = 2
     private var sentPackets = 0
+    private var sentPacketsAtLastLog = 0
     private var lastLogAt: TimeInterval = 0
+    // Loudest sample since the last log line. A global tap delivers silence
+    // at the full packet rate when nothing on the Mac plays sound, so the
+    // packet count alone says nothing about whether the game is audible.
+    private var peakSinceLog = 0
+    private let countersLock = NSLock()
     private let framesPerPacket = 480 // 10 ms at 48 kHz; 1920 bytes of stereo PCM (half the packets of 5 ms)
+
+    /// Packets sent so far (any thread).
+    var packetsSent: Int {
+        countersLock.lock()
+        defer { countersLock.unlock() }
+        return sentPackets
+    }
 
     func start() {
         guard ProcessInfo.processInfo.environment["VERANTYX_AUDIO"] != "0" else {
@@ -1306,15 +1319,28 @@ final class GameAudioStreamer {
                 withUnsafeBytes(of: value.littleEndian) { packet.append(contentsOf: $0) }
             }
             pending[0..<samplesPerPacket].withUnsafeBytes { packet.append(contentsOf: $0) }
+            var peak = 0
+            for sample in pending[0..<samplesPerPacket] { peak = max(peak, abs(Int(sample))) }
+            peakSinceLog = max(peakSinceLog, peak)
             pending.removeFirst(samplesPerPacket)
             sequence &+= 1
             peer.send(content: packet, completion: .idempotent)
+            countersLock.lock()
             sentPackets += 1
+            countersLock.unlock()
         }
         let now = ProcessInfo.processInfo.systemUptime
         if now - lastLogAt >= 30 {
+            let elapsed = lastLogAt > 0 ? now - lastLogAt : 0
             lastLogAt = now
-            print("Game audio: \(sentPackets) packets sent")
+            let total = packetsSent
+            let recent = total - sentPacketsAtLastLog
+            sentPacketsAtLastLog = total
+            let peakDescription = peakSinceLog > 0
+                ? String(format: "peak %.1f dBFS", 20 * log10(Double(peakSinceLog) / 32768))
+                : "SILENT: nothing on the Mac played sound (check the game's audio device and volume)"
+            peakSinceLog = 0
+            print(String(format: "Game audio: %d packets sent (%d in the last %.0f s, %@)", total, recent, elapsed, peakDescription))
         }
     }
 }
@@ -1322,12 +1348,55 @@ final class GameAudioStreamer {
 let gameAudio = GameAudioStreamer()
 gameAudio.start()
 
+// MARK: - Frame-rate statistics for the headset's overlay
+
+// "STAT" once a second: the game's capture rate, the encoded and sent rates,
+// the current HEVC bitrate and the audio packet rate, as little-endian
+// Float32 values after the magic (24 bytes; VRUDPReceiver.swift reads it).
+let streamStatsMagic: UInt32 = 0x54415453 // "STAT"
+var lastStreamStatsAt: TimeInterval = -.infinity
+var lastStreamStatsCounts = (capture: 0, encode: 0, sent: 0, audio: 0)
+
+func sendStreamStatsIfDue() {
+    let now = ProcessInfo.processInfo.systemUptime
+    let elapsed = now - lastStreamStatsAt
+    guard elapsed >= 1 else { return }
+    encoderDiagnosticLock.lock()
+    let counts = (capture: capturedFrameCount, encode: compressedFrameCount,
+                  sent: transmittedFrameCount, audio: gameAudio.packetsSent)
+    encoderDiagnosticLock.unlock()
+    defer {
+        lastStreamStatsCounts = counts
+        lastStreamStatsAt = now
+    }
+    // The first call only seeds the counters.
+    guard lastStreamStatsAt.isFinite else { return }
+    peerLock.lock()
+    let peer = videoPeer
+    peerLock.unlock()
+    guard let peer else { return }
+    let rates: [Float] = [
+        Float(Double(counts.capture - lastStreamStatsCounts.capture) / elapsed),
+        Float(Double(counts.encode - lastStreamStatsCounts.encode) / elapsed),
+        Float(Double(counts.sent - lastStreamStatsCounts.sent) / elapsed),
+        Float(Double(adaptiveBitrate.current) / 1_000_000),
+        Float(Double(counts.audio - lastStreamStatsCounts.audio) / elapsed),
+    ]
+    var packet = Data(capacity: 24)
+    withUnsafeBytes(of: streamStatsMagic.littleEndian) { packet.append(contentsOf: $0) }
+    for value in rates {
+        withUnsafeBytes(of: value.bitPattern.littleEndian) { packet.append(contentsOf: $0) }
+    }
+    peer.send(content: packet, completion: .idempotent)
+}
+
 print("Starting native read loop and UDP transmission on port 9999...")
 
 while isEncoding {
     autoreleasepool {
         reportDiagnosticsIfDue()
         sendSourceProjectionIfDue()
+        sendStreamStatsIfDue()
         let sourceMode = dbHeaderPtr.pointee.captureSourceMode
         if sourceMode != lastCaptureSourceMode {
             print("Capture source changed \(lastCaptureSourceMode)->\(sourceMode); continuing stream sequence \(streamSequence)")

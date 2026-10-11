@@ -321,7 +321,7 @@ final class VRGameControllerInput: @unchecked Sendable {
         left.secondary = gamepad.dpad.up.isPressed || gamepad.dpad.right.isPressed
         left.menu = gamepad.buttonMenu.isPressed || gamepad.buttonOptions?.isPressed == true
         left.stickAimsTeleport = true
-        left.bodyLocked = true
+        left.bodyLocked = !Self.leftHandCameraTracked
 
         var right = VRControllerHand()
         right.stick = hold.rotate(Self.stick(gamepad.rightThumbstick))
@@ -355,7 +355,7 @@ final class VRGameControllerInput: @unchecked Sendable {
         left.secondary = gamepad.dpad.up.isPressed || gamepad.dpad.right.isPressed
         left.menu = gamepad.buttonMenu.isPressed || gamepad.buttonOptions?.isPressed == true
         left.stickAimsTeleport = true
-        left.bodyLocked = true
+        left.bodyLocked = !Self.leftHandCameraTracked
 
         var right = VRControllerHand()
         right.stick = hold.rotate(Self.stick(gamepad.leftThumbstick))
@@ -373,6 +373,15 @@ final class VRGameControllerInput: @unchecked Sendable {
 
     static var mergedPairOneHanded: Bool {
         UserDefaults.standard.object(forKey: "mergedJoyConOneHanded") == nil || UserDefaults.standard.bool(forKey: "mergedJoyConOneHanded")
+    }
+
+    /// UserDefaults "trackLeftHandWithCameras" (default on): the left hand
+    /// holding the gamepad takes its pose from hand tracking while the cameras
+    /// see it and falls back to the fixed body-locked pose when they do not.
+    /// Off: it always sits at the fixed pose. Buttons and sticks come from the
+    /// gamepad either way.
+    static var leftHandCameraTracked: Bool {
+        UserDefaults.standard.object(forKey: "trackLeftHandWithCameras") == nil || UserDefaults.standard.bool(forKey: "trackLeftHandWithCameras")
     }
 
     private func update(from gamepad: GCExtendedGamepad, role: Role) {

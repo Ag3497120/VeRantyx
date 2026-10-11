@@ -2,16 +2,6 @@
   "sourceLanguage": "en",
   "version": "1.0",
   "strings": {
-    "received %lld / concealed %lld / underruns %lld / dropped %lld": {
-      "localizations": {
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "受信 %1$lld／欠落補間 %2$lld／途切れ %3$lld／遅延破棄 %4$lld"
-          }
-        }
-      }
-    },
     "waiting for audio": {
       "localizations": {
         "ja": {
@@ -928,6 +918,116 @@
           "stringUnit": {
             "state": "translated",
             "value": "開いた手"
+          }
+        }
+      }
+    },
+    "Track the left hand with the cameras as well (fixed gamepad pose when it is out of view)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "左手もカメラで認識する（見えないときは固定のゲームパッド位置）"
+          }
+        }
+      }
+    },
+    "waiting for the Mac's frame rate": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Macのフレームレート待ち"
+          }
+        }
+      }
+    },
+    "game %d fps / encoded %d fps / sent %d fps / %.1f Mbps / Mac audio %d pkt/s": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ゲーム %1$d fps／エンコード %2$d fps／送信 %3$d fps／%4$.1f Mbps／Mac音声 %5$d pkt/s"
+          }
+        }
+      }
+    },
+    "received %lld / played %lld / concealed %lld / underruns %lld / dropped %lld / restarts %lld": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "受信 %1$lld／再生 %2$lld／欠落補間 %3$lld／途切れ %4$lld／遅延破棄 %5$lld／再起動 %6$lld"
+          }
+        }
+      }
+    },
+    "audio failed: %@": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "音声エラー: %@"
+          }
+        }
+      }
+    },
+    "game %@ fps / received %d fps / shown %d fps / latency %@": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ゲーム %1$@ fps／受信 %2$d fps／表示 %3$d fps／遅延 %4$@"
+          }
+        }
+      }
+    },
+    "running": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "動作中"
+          }
+        }
+      }
+    },
+    "stopped": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止"
+          }
+        }
+      }
+    },
+    "audio %d pkt/s (Mac %d) / played %d / dropped %d / underruns %d / engine %@": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "音声 %1$d pkt/s（Mac %2$d）／再生 %3$d／破棄 %4$d／途切れ %5$d／エンジン %6$@"
+          }
+        }
+      }
+    },
+    "Game fps": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ゲーム fps"
+          }
+        }
+      }
+    },
+    "Show the fps overlay in VR (game / received / latency / audio)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VR内にfps表示を出す（ゲーム／受信／遅延／音声）"
           }
         }
       }

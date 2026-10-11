@@ -23,3 +23,4 @@ MacEncoder/HardwareEncoder
 VRDriver/.build-*
 build/steamvr-d3d11-proxy/.build-*
 *.xcuserdatad/
+/NativeARM/build/

@@ -141,6 +141,7 @@ final class VRPoseSampler: @unchecked Sendable {
         predictionHorizon = 0.03
         measuredLatency = 0
         lock.unlock()
+        VRStreamStatsStore.shared.update { $0.latencyMilliseconds = -1 }
         history.removeAll()
     }
 
@@ -177,7 +178,9 @@ final class VRPoseSampler: @unchecked Sendable {
         predictionHorizon = min(Self.maximumHeadPrediction, max(0, predictionHorizon + error * 0.05))
         let latency = presentationTime - sampledAt
         measuredLatency = measuredLatency == 0 ? latency : measuredLatency + (latency - measuredLatency) * 0.1
+        let latencyMilliseconds = Int((measuredLatency * 1000).rounded())
         lock.unlock()
+        VRStreamStatsStore.shared.update { $0.latencyMilliseconds = latencyMilliseconds }
     }
 
     func sample(presentationTime: CFTimeInterval, now: CFTimeInterval) {
@@ -387,7 +390,10 @@ final class VRPoseSampler: @unchecked Sendable {
 /// - thumb + little pinch: B / Y
 ///
 /// With Joy-Con connected, the controller replaces all gestures for that hand
-/// and hand tracking only supplies the pose.
+/// and hand tracking only supplies the pose (fingers wrapped around a Joy-Con
+/// would read as a permanent fist, so no gestures are taken from that hand).
+/// When the cameras cannot see the gamepad hand it keeps its last pose for a
+/// second and then settles at the fixed body-locked gamepad pose.
 private struct HandState {
     enum Finger { case middle, ring, little }
     enum StickPhase { case idle, pending, deflect, forward, click }
@@ -581,17 +587,7 @@ private struct HandState {
             return
         }
 
-        // Grip from finger curl, normalized by each finger's own length so it
-        // works for any hand size. 1 = straight finger, ~0.35 = tight fist.
-        let extensions = [joints.middleExtension, joints.ringExtension, joints.littleExtension].compactMap { $0 }
-        if !extensions.isEmpty {
-            let curl = extensions.reduce(0, +) / Float(extensions.count)
-            let gripRaw = Self.clamp((0.88 - curl) / 0.30)
-            if gripEngaged { gripEngaged = gripRaw > 0.55 } else { gripEngaged = gripRaw >= 0.8 }
-            // Alyx clicks at 0.75 and releases at 0.72. Report engaged values
-            // above that band and released ones below it so noise cannot toggle it.
-            gripValue = Self.byte(gripEngaged ? max(gripRaw, 0.85) : min(gripRaw, 0.7))
-        }
+        updateGrip(joints: joints, now: now)
 
         let pinchIndex = joints.thumbDistance(to: joints.indexTip)
         if let pinchIndex {
@@ -637,6 +633,47 @@ private struct HandState {
         buttonBits = bits
     }
 
+    /// Grip from the curl of the middle, ring and little fingers (see
+    /// HandJoints: fingertip extension or knuckle bend, whichever is more
+    /// curled, so a fist that hides its own fingertips still reads closed).
+    /// Engages at a clear fist and releases only after the hand has read
+    /// clearly open for `gripReleaseDelay`; frames with no curl estimate
+    /// (fingers untracked) keep the previous state. A fist used to flicker
+    /// open the moment ARKit lost the fingertips behind the fingers.
+    private mutating func updateGrip(joints: HandJoints, now: CFTimeInterval) {
+        let curls = [joints.middleCurl, joints.ringCurl, joints.littleCurl].compactMap { $0 }
+        guard !curls.isEmpty else {
+            gripReleaseSince = nil
+            return
+        }
+        // Weight toward the most-curled fingers: one straightened or
+        // mis-estimated finger must not open a fist.
+        let sorted = curls.sorted(by: >)
+        let gripRaw = curls.count >= 2 ? (sorted[0] + sorted[1]) * 0.5 : sorted[0]
+        if gripEngaged {
+            if gripRaw < Self.gripReleaseThreshold {
+                if gripReleaseSince == nil { gripReleaseSince = now }
+                if now - (gripReleaseSince ?? now) >= Self.gripReleaseDelay {
+                    gripEngaged = false
+                    gripReleaseSince = nil
+                }
+            } else {
+                gripReleaseSince = nil
+            }
+        } else {
+            gripReleaseSince = nil
+            gripEngaged = gripRaw >= Self.gripEngageThreshold
+        }
+        // Alyx clicks at 0.75 and releases at 0.72. Report engaged values
+        // above that band and released ones below it so noise cannot toggle it.
+        gripValue = Self.byte(gripEngaged ? max(gripRaw, 0.85) : min(gripRaw, 0.7))
+    }
+
+    private static let gripEngageThreshold: Float = 0.75
+    private static let gripReleaseThreshold: Float = 0.4
+    private static let gripReleaseDelay: CFTimeInterval = 0.12
+    private var gripReleaseSince: CFTimeInterval?
+
     private mutating func handleLoss(head: simd_float4x4, headTracked: Bool, now: CFTimeInterval,
                                      controller: VRControllerHand?) {
         // (A shoulder-reach guess here moved the hand behind the shoulder on
@@ -655,6 +692,7 @@ private struct HandState {
             // visible hand (trigger released, grip kept), the pad still works.
             triggerEngaged = false
             triggerValue = 0
+            gripReleaseSince = nil
             pinchedFinger = nil
             stickPhase = .idle
             stick = controller.stick
@@ -680,12 +718,35 @@ private struct HandState {
         // it last was relative to the head for as long as the hand is away;
         // dropping it made Alyx fling the hand elsewhere.
         let holdLimit = controller != nil ? CFTimeInterval.infinity : Self.holdDuration
+        // The hand holding the gamepad (camera-tracked by choice) drifts to
+        // the fixed gamepad pose after a second out of view, so a Joy-Con
+        // lowered to the lap still ends up somewhere sensible.
+        let holdsGamepad = controller != nil && controller?.gestureTriggerGrip != true
         if let lastMeasuredLocal, headTracked, now - lostSince < holdLimit {
             transform = head * lastMeasuredLocal
             if let motion = controller?.motion { applyInertial(motion) }
+            if let controller, holdsGamepad {
+                let settle = Float(min(max((now - lostSince - Self.gamepadHoldDuration) / 0.5, 0), 1))
+                if settle > 0 {
+                    transform = Self.blend(transform, Self.bodyLockedPose(isLeft: isLeft, head: head), settle)
+                    if settle >= 1 {
+                        velocity = .zero
+                        if controller.motion == nil { angularVelocity = .zero }
+                    }
+                }
+            }
             if let controller, controller.stickAimsTeleport {
                 transform = Self.aimWithStick(transform, stick: controller.stick, head: head)
             }
+            trackingState = 2
+            return
+        }
+        if let controller, holdsGamepad, headTracked {
+            // Never seen by the cameras yet (or the head was lost): the gamepad
+            // hand takes its fixed pose until the cameras find it.
+            var pose = Self.bodyLockedPose(isLeft: isLeft, head: head)
+            if controller.stickAimsTeleport { pose = Self.aimWithStick(pose, stick: controller.stick, head: head) }
+            transform = pose
             trackingState = 2
             return
         }
@@ -694,9 +755,12 @@ private struct HandState {
         lastMeasuredLocal = nil
         if controller == nil {
             gripEngaged = false
+            gripReleaseSince = nil
             gripValue = 0
         }
     }
+
+    private static let gamepadHoldDuration: CFTimeInterval = 1.0
 
     /// Joy-Con inputs replace the gestures for this hand. Bits: 1 A/X,
     /// 2 B/Y, 4 stick click, 8 stick touch, 16 menu (left system button).
@@ -811,10 +875,9 @@ private struct HandState {
         buttonBits = bits
     }
 
-    /// The gamepad hand: a fixed pose 18 cm to the side, 38 cm below and
-    /// 30 cm in front of the eyes, turned with the head's yaw only, slightly
-    /// rolled inward like a held controller. Buttons and sticks come from the
-    /// gamepad; the stick aims the teleport arc.
+    /// The gamepad hand when camera tracking is off for it: the fixed pose
+    /// from `bodyLockedPose`. Buttons and sticks come from the gamepad; the
+    /// stick aims the teleport arc.
     private mutating func applyBodyLocked(_ controller: VRControllerHand, head: simd_float4x4,
                                           headTracked: Bool, now: CFTimeInterval) {
         guard headTracked else {
@@ -823,19 +886,7 @@ private struct HandState {
             applyController(controller)
             return
         }
-        let forward = SIMD3<Float>(-head.columns.2.x, 0, -head.columns.2.z)
-        let yaw = simd_length_squared(forward) > 1e-4 ? atan2(-forward.x, -forward.z) : 0
-        let headPosition = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
-        let yawRotation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
-        let offset = SIMD3<Float>(isLeft ? -0.18 : 0.18, -0.38, -0.30)
-        let position = headPosition + yawRotation.act(offset)
-        // Raw Touch pose: +Y up the handle, -Z forward; a resting hand points
-        // ~35° down and rolls ~15° toward the body.
-        let rest = yawRotation
-            * simd_quatf(angle: -35 * Float.pi / 180, axis: SIMD3<Float>(1, 0, 0))
-            * simd_quatf(angle: (isLeft ? -15 : 15) * Float.pi / 180, axis: SIMD3<Float>(0, 0, 1))
-        var pose = simd_float4x4(rest)
-        pose.columns.3 = SIMD4<Float>(position, 1)
+        var pose = Self.bodyLockedPose(isLeft: isLeft, head: head)
         if controller.stickAimsTeleport { pose = Self.aimWithStick(pose, stick: controller.stick, head: head) }
         transform = pose
         trackingState = 1
@@ -848,6 +899,25 @@ private struct HandState {
             angularVelocity = simd_float3x3(simd_quatf(pose)) * simd_float3x3(handFromDevice) * rate
         }
         applyController(controller)
+    }
+
+    /// The fixed gamepad-hand pose: 18 cm to the side, 38 cm below and 30 cm
+    /// in front of the eyes, turned with the head's yaw only. Raw Touch pose:
+    /// +Y up the handle, -Z forward; a resting hand points ~35° down and
+    /// rolls ~15° toward the body.
+    private static func bodyLockedPose(isLeft: Bool, head: simd_float4x4) -> simd_float4x4 {
+        let forward = SIMD3<Float>(-head.columns.2.x, 0, -head.columns.2.z)
+        let yaw = simd_length_squared(forward) > 1e-4 ? atan2(-forward.x, -forward.z) : 0
+        let headPosition = SIMD3<Float>(head.columns.3.x, head.columns.3.y, head.columns.3.z)
+        let yawRotation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
+        let offset = SIMD3<Float>(isLeft ? -0.18 : 0.18, -0.38, -0.30)
+        let position = headPosition + yawRotation.act(offset)
+        let rest = yawRotation
+            * simd_quatf(angle: -35 * Float.pi / 180, axis: SIMD3<Float>(1, 0, 0))
+            * simd_quatf(angle: (isLeft ? -15 : 15) * Float.pi / 180, axis: SIMD3<Float>(0, 0, 1))
+        var pose = simd_float4x4(rest)
+        pose.columns.3 = SIMD4<Float>(position, 1)
+        return pose
     }
 
     /// What the cameras see the free hand doing, for the status display.
@@ -1028,6 +1098,15 @@ private struct HandJoints {
     let middleExtension: Float?
     let ringExtension: Float?
     let littleExtension: Float?
+    // Finger curl for the grip: 0 straight, 1 tight fist. Each finger uses the
+    // most-curled of two estimates: the fingertip-based extension above and
+    // the bend at the knuckle (wrist→knuckle vs knuckle→first phalanx). In a
+    // closed fist the fingertips disappear behind the fingers, which makes
+    // ARKit drop or straighten them; the proximal phalanx stays visible from
+    // the headset and keeps the fist reading closed.
+    let middleCurl: Float?
+    let ringCurl: Float?
+    let littleCurl: Float?
 
     init?(anchor: HandAnchor, skeleton: HandSkeleton) {
         let origin = anchor.originFromAnchorTransform
@@ -1044,6 +1123,26 @@ private struct HandJoints {
             let length = simd_distance(k, b) + simd_distance(b, m) + simd_distance(m, t)
             guard length > 0.02 else { return nil }
             return simd_distance(k, t) / length
+        }
+        func knuckleBend(_ wrist: SIMD3<Float>?, _ knuckle: HandSkeleton.JointName,
+                         _ base: HandSkeleton.JointName) -> Float? {
+            guard let w = wrist, let k = position(knuckle), let b = position(base) else { return nil }
+            let metacarpal = k - w, phalanx = b - k
+            guard simd_length(metacarpal) > 0.02, simd_length(phalanx) > 0.01 else { return nil }
+            let cosine = simd_dot(simd_normalize(metacarpal), simd_normalize(phalanx))
+            return acos(min(1, max(-1, cosine))) // radians; ~0 straight, ~1.5 fist
+        }
+        func curl(fingerExtension: Float?, bend: Float?) -> Float? {
+            // Extension 0.88 → 0 and 0.58 → 1 (the earlier grip mapping);
+            // a knuckle bend of 20° → 0 and 85° → 1.
+            let fromExtension = fingerExtension.map { min(1, max(0, (0.88 - $0) / 0.30)) }
+            let fromBend = bend.map { min(1, max(0, ($0 - 20 * Float.pi / 180) / (65 * Float.pi / 180))) }
+            switch (fromExtension, fromBend) {
+            case let (e?, b?): return max(e, b)
+            case let (e?, nil): return e
+            case let (nil, b?): return b
+            case (nil, nil): return nil
+            }
         }
         guard let wrist = position(.wrist),
               let indexKnuckle = position(.indexFingerKnuckle),
@@ -1069,6 +1168,12 @@ private struct HandJoints {
                                         .ringFingerIntermediateTip, .ringFingerTip)
         littleExtension = fingerExtension(.littleFingerKnuckle, .littleFingerIntermediateBase,
                                           .littleFingerIntermediateTip, .littleFingerTip)
+        middleCurl = curl(fingerExtension: middleExtension,
+                          bend: knuckleBend(wrist, .middleFingerKnuckle, .middleFingerIntermediateBase))
+        ringCurl = curl(fingerExtension: ringExtension,
+                        bend: knuckleBend(wrist, .ringFingerKnuckle, .ringFingerIntermediateBase))
+        littleCurl = curl(fingerExtension: littleExtension,
+                          bend: knuckleBend(wrist, .littleFingerKnuckle, .littleFingerIntermediateBase))
     }
 
     func thumbDistance(to tip: SIMD3<Float>?) -> Float? {

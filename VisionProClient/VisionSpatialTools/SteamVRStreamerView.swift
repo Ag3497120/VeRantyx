@@ -11,6 +11,9 @@ struct SteamVRStreamerView: View {
     @State private var immersiveStatus = String(localized: "VR view is stopped.")
     @AppStorage("gamepadHold") private var gamepadHold = 1
     @AppStorage("mergedJoyConOneHanded") private var mergedJoyConOneHanded = true
+    // Read by VRCompositorRenderer (UserDefaults) once a second.
+    @AppStorage(VRCompositorRenderer.showFpsOverlayKey) private var showFpsOverlay = true
+    @AppStorage("trackLeftHandWithCameras") private var trackLeftHandWithCameras = true
     @State private var isStarting = false
 
     init(model: VRStreamerModel) {
@@ -32,6 +35,7 @@ struct SteamVRStreamerView: View {
             VStack(alignment: .leading, spacing: 12) {
                 statusRow(title: "Mac connection", detail: receiver.connectionStatus)
                 statusRow(title: "Video decode", detail: decoder.status)
+                statusRow(title: "Game fps", detail: receiver.gameFrameStatus)
                 statusRow(title: "Receive fps", detail: "\(receiver.receivedVideoFPS) fps")
                 statusRow(title: "Decode fps", detail: "\(decoder.decodedVideoFPS) fps")
                 statusRow(title: "Receive stats", detail: receiver.receiveDiagnostics)
@@ -53,6 +57,12 @@ struct SteamVRStreamerView: View {
                 .frame(maxWidth: 560)
 
             Toggle("Hold the merged Joy-Con pair in the left hand (right hand free)", isOn: $mergedJoyConOneHanded)
+                .frame(maxWidth: 560)
+
+            Toggle("Show the fps overlay in VR (game / received / latency / audio)", isOn: $showFpsOverlay)
+                .frame(maxWidth: 560)
+
+            Toggle("Track the left hand with the cameras as well (fixed gamepad pose when it is out of view)", isOn: $trackLeftHandWithCameras)
                 .frame(maxWidth: 560)
 
             Picker("One-handed gamepad hold", selection: $gamepadHold) {

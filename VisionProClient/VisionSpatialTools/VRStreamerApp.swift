@@ -60,7 +60,16 @@ struct VRStreamerApp: App {
         // them on to check alignment.
         .upperLimbVisibility(model.showsRealHands ? .visible : .hidden)
         // Keeps the palm-up Home/Control Center indicator from popping up
-        // during hand gestures in the game.
+        // during hand gestures in the game. This is all visionOS offers: with
+        // `.hidden` in a Full Space the Home indicator no longer appears from
+        // a glance at the palm, but a look-and-tap on the palm still reveals
+        // it and a second pinch on it opens Home View (SwiftUI docs for
+        // persistentSystemOverlays(_:) and HIG "Working with system overlays
+        // in visionOS", Apple engineers on forum threads 765091 / 762297 /
+        // 757044). No entitlement or API disables the gesture itself; the
+        // system may also ignore this preference. Home View does not close
+        // this space, and SteamVRStreamerView returns to it when the app
+        // comes back to the front.
         .persistentSystemOverlays(.hidden)
     }
 }

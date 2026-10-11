@@ -23,6 +23,9 @@ final class VRStreamerModel: ObservableObject {
         frameSubscription = receiver.framePublisher.sink { [weak decoder] frame in
             decoder?.decodeFrame(frame)
         }
+        VRAudioPlayer.shared.log = { [weak self] message in
+            Task { @MainActor in self?.appendDiagnosticsLog(message) }
+        }
     }
 
     func prepare() {
@@ -34,18 +37,26 @@ final class VRStreamerModel: ObservableObject {
 
     func recordRenderStatistics(_ statistics: VRRenderStatistics) {
         rendererStatus = String(localized: "display \(statistics.renderFPS) fps / new frames \(statistics.newFrameFPS) fps / audio \(VRAudioPlayer.shared.status)")
-        receiver.sendClientDiagnostics(
-            "receive_fps=\(receiver.receivedVideoFPS) decode_fps=\(decoder.decodedVideoFPS) " +
+        // The same numbers the in-game overlay shows (game, received, decode,
+        // display, latency, audio), every 5 s, for the next session's log.
+        let streamStats = VRStreamStatsStore.shared.summary
+        let line = "decode_fps=\(decoder.decodedVideoFPS) " +
             "render_fps=\(statistics.renderFPS) new_frame_fps=\(statistics.newFrameFPS) " +
             "pose_age_ms=\(statistics.frameAgeMilliseconds) anchor=\(statistics.anchored) gpu_errors=\(statistics.gpuErrors) " +
             "\(statistics.eyeGeometry) \(receiver.diagnosticsSummary) \(decoder.diagnosticsSummary) " +
-            "\(tracking.latencyStatus)"
-        )
+            "\(streamStats) \(tracking.latencyStatus)"
+        appendDiagnosticsLog("Stream stats: \(line)")
+        receiver.sendClientDiagnostics(line)
     }
 
     func recordImmersiveEvent(_ message: String) {
         immersiveDiagnostic = message
+        appendDiagnosticsLog(message)
+    }
 
+    /// Appends one line to Documents/immersive-diagnostics.log without
+    /// changing the Diagnostics row.
+    func appendDiagnosticsLog(_ message: String) {
         let timestamp = ISO8601DateFormatter().string(from: Date())
         let line = "\(timestamp) \(message)\n"
         guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {

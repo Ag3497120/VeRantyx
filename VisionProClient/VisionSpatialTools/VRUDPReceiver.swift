@@ -11,12 +11,72 @@ struct VRCompressedFrame {
     let data: Data
 }
 
+/// Numbers for the in-game fps overlay and the diagnostics log. Written from
+/// the network, audio and tracking threads; read once a second by the render
+/// thread and by the main actor.
+final class VRStreamStatsStore {
+    static let shared = VRStreamStatsStore()
+
+    struct Snapshot {
+        /// From the Mac's "STAT" packet. `gameFPS` is the rate at which the
+        /// game produced new frames (capture); -1 until the first packet.
+        var gameFPS: Float = -1
+        var encodedFPS: Float = -1
+        var sentFPS: Float = -1
+        var bitrateMbps: Float = 0
+        var macAudioPacketsPerSecond: Float = 0
+        var statsReceivedAt: TimeInterval = 0
+        /// Complete video frames received per second (VRUDPReceiver).
+        var receivedFPS = 0
+        /// Pose-to-display latency from VRPoseSampler; -1 before video shows.
+        var latencyMilliseconds = -1
+        /// VRAudioPlayer counters.
+        var audioReceived = 0
+        var audioPlayed = 0
+        var audioDropped = 0
+        var audioConcealed = 0
+        var audioUnderruns = 0
+        var audioRestarts = 0
+        var audioPacketsPerSecond = 0
+        var audioEngineRunning = false
+        var audioLastError = ""
+    }
+
+    private let lock = NSLock()
+    private var current = Snapshot()
+
+    func update(_ change: (inout Snapshot) -> Void) {
+        lock.lock()
+        change(&current)
+        lock.unlock()
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return current
+    }
+
+    /// One line for CLIENT_STATS and the diagnostics log.
+    var summary: String {
+        let s = snapshot()
+        let latency = s.latencyMilliseconds >= 0 ? "\(s.latencyMilliseconds)" : "-1"
+        return String(format: "game_fps=%.1f encoded_fps=%.1f sent_fps=%.1f bitrate_mbps=%.1f receive_fps=%d latency_ms=%@ ",
+                      s.gameFPS, s.encodedFPS, s.sentFPS, s.bitrateMbps, s.receivedFPS, latency) +
+            "audio_rx=\(s.audioReceived) audio_rx_rate=\(s.audioPacketsPerSecond)/s mac_audio_rate=\(Int(s.macAudioPacketsPerSecond))/s " +
+            "audio_played=\(s.audioPlayed) audio_dropped=\(s.audioDropped) audio_concealed=\(s.audioConcealed) " +
+            "audio_underruns=\(s.audioUnderruns) audio_restarts=\(s.audioRestarts) audio_engine=\(s.audioEngineRunning ? "running" : "stopped")" +
+            (s.audioLastError.isEmpty ? "" : " audio_error=\(s.audioLastError)")
+    }
+}
+
 /// Discovers the Mac encoder and reassembles its 96-byte VRAN HEVC fragment packets.
 final class VRUDPReceiver: ObservableObject {
     let framePublisher = PassthroughSubject<VRCompressedFrame, Never>()
 
     @Published private(set) var connectionStatus = String(localized: "Searching for the Mac encoder…")
     @Published private(set) var receivedVideoFPS = 0
+    @Published private(set) var gameFrameStatus = String(localized: "waiting for the Mac's frame rate")
     @Published private(set) var trackingPacketsSent = 0
     @Published private(set) var receiveDiagnostics = String(localized: "Waiting for video packets.")
     @Published private(set) var diagnosticsSummary = "packets=0 incomplete=0"
@@ -105,6 +165,7 @@ final class VRUDPReceiver: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.connectionStatus = String(localized: "Searching for the Mac encoder…")
             self?.receivedVideoFPS = 0
+            self?.gameFrameStatus = String(localized: "waiting for the Mac's frame rate")
             self?.trackingPacketsSent = 0
             self?.receiveDiagnostics = String(localized: "Waiting for video packets.")
         }
@@ -318,6 +379,25 @@ final class VRUDPReceiver: ObservableObject {
             VRAudioPlayer.shared.enqueue(data)
             return
         }
+        // "STAT" + 5 floats, once a second: capture, encoded and sent fps,
+        // the HEVC bitrate and the Mac's audio packet rate.
+        if data.count == 24, readUInt32LE(data, at: 0) == 0x54415453 {
+            let values = (0..<5).map { Float(bitPattern: readUInt32LE(data, at: 4 + $0 * 4)) }
+            guard values.allSatisfy({ $0.isFinite && $0 >= 0 }) else { return }
+            VRStreamStatsStore.shared.update { stats in
+                stats.gameFPS = values[0]
+                stats.encodedFPS = values[1]
+                stats.sentFPS = values[2]
+                stats.bitrateMbps = values[3]
+                stats.macAudioPacketsPerSecond = values[4]
+                stats.statsReceivedAt = ProcessInfo.processInfo.systemUptime
+            }
+            let status = String(format: String(localized: "game %d fps / encoded %d fps / sent %d fps / %.1f Mbps / Mac audio %d pkt/s"),
+                                Int(values[0].rounded()), Int(values[1].rounded()), Int(values[2].rounded()),
+                                values[3], Int(values[4].rounded()))
+            DispatchQueue.main.async { [weak self] in self?.gameFrameStatus = status }
+            return
+        }
         // "VTAN" + 8 floats: the eye frustum SteamVR renders with.
         if data.count == 36, readUInt32LE(data, at: 0) == 0x4E415456 {
             let values = (0..<8).map { Float(bitPattern: readUInt32LE(data, at: 4 + $0 * 4)) }
@@ -485,6 +565,7 @@ final class VRUDPReceiver: ObservableObject {
             let lost = self.incompleteFrameCount
             self.fpsWindowFrames = 0
             self.fpsWindowStart = now
+            VRStreamStatsStore.shared.update { $0.receivedFPS = fps }
             DispatchQueue.main.async { [weak self] in
                 self?.receivedVideoFPS = fps
                 self?.receiveDiagnostics = String(localized: "\(packets) packets received / \(lost) frames lost")
