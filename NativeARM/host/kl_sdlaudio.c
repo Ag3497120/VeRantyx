@@ -133,6 +133,24 @@ static int unit_create(int rate) {
     return AudioUnitInitialize(g_unit) == noErr ? 0 : -1;
 }
 
+// Every 30 s: how much was played, how loud, how much ran dry.
+static void report(const uint8_t *data, uint32_t len) {
+    static float peak; static double last; static int reports;
+    const unsigned bps = bytes_per_sample(g_spec.format);
+    for (uint32_t i = 0; bps && i + bps <= len; i += bps) { float v = fabsf(sample_at(data + i, g_spec.format)); if (v > peak) peak = v; }
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    double now = t.tv_sec + t.tv_nsec * 1e-9;
+    if (last == 0) last = now;
+    if (reports < 1000 && now - last >= 30) {
+        last = now; reports++;
+        char level[32];
+        if (peak > 0) snprintf(level, sizeof level, "%.1f dBFS", 20 * log10f(peak)); else snprintf(level, sizeof level, "silent");
+        fprintf(stderr, "  [audio] played %.1f s, underrun %.2f s, peak %s\n",
+                atomic_load(&g_playedFrames) / (double)g_spec.freq, atomic_load(&g_underrunFrames) / (double)g_spec.freq, level);
+        peak = 0;
+    }
+}
+
 // Callback mode: keep ~3 device buffers queued by calling the game.
 static void *pump(void *arg) {
     (void)arg;
@@ -143,6 +161,7 @@ static void *pump(void *arg) {
             memset(buf, g_spec.silence, g_spec.size);
             g_spec.callback(g_spec.userdata, buf, (int)g_spec.size);
             ring_push(buf, g_spec.size);
+            report(buf, g_spec.size);
             (void)frameBytes;
         } else {
             usleep(2000);
@@ -208,14 +227,7 @@ static void shim_SDL_PauseAudioDevice(uint32_t dev, int pause_on) {
 static int shim_SDL_QueueAudio(uint32_t dev, const void *data, uint32_t len) {
     if (dev != 2 || !g_open || !data) return -1;
     ring_push((const uint8_t *)data, len);
-    static double last; static int reports;
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    double now = t.tv_sec + t.tv_nsec * 1e-9;
-    if (reports < 1000 && now - last > 30) {
-        last = now; reports++;
-        fprintf(stderr, "  [audio] played %.1f s, queued %u frames, underrun %.2f s\n",
-                atomic_load(&g_playedFrames) / (double)g_spec.freq, ring_count(), atomic_load(&g_underrunFrames) / (double)g_spec.freq);
-    }
+    report((const uint8_t *)data, len);
     return 0;
 }
 static uint32_t shim_SDL_GetQueuedAudioSize(uint32_t dev) {

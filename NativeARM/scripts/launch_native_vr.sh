@@ -36,10 +36,24 @@ if pgrep -f '[s]team\.exe|[s]teamwebhelper' >/dev/null 2>&1; then
     echo "Note: the Wine version's Windows Steam is still running (it uses CPU and restarts its windows)."
     echo "      Stop it with: scripts/stop_wine_vr.sh"
 fi
-if pgrep -f "$ENCODER" >/dev/null 2>&1; then
-    die "A HEVC encoder is already running (Wine session?). Quit that session first."
-fi
-pgrep -f "$HOST" >/dev/null 2>&1 && die "alyx_host is already running."
+# A previous native session (this script) is replaced; a Wine session is not touched.
+for pid in $(pgrep -f '[l]aunch_native_vr\.sh' 2>/dev/null); do
+    [[ "$pid" == "$$" ]] && continue
+    echo "Stopping the previous native session ($pid)."
+    kill -TERM "$pid" 2>/dev/null || true
+done
+for _ in $(seq 1 15); do pgrep -f "$HOST" >/dev/null 2>&1 || break; sleep 1; done
+pkill -KILL -f "$HOST" 2>/dev/null || true
+for pid in $(pgrep -f "$ENCODER" 2>/dev/null); do
+    parent="$(ps -o command= -p "$(ps -o ppid= -p "$pid" | tr -d ' ')" 2>/dev/null)"
+    if [[ "$parent" == *launch_vision_pro_vr* ]]; then
+        die "The Wine version's encoder is running. Stop the Wine version first: scripts/stop_wine_vr.sh"
+    fi
+    echo "Stopping a leftover HEVC encoder ($pid)."
+    kill -TERM "$pid" 2>/dev/null || true
+done
+sleep 1
+pkill -KILL -f "$ENCODER" 2>/dev/null || true
 
 if [[ "${VERANTYX_MAC_PROFILE:-1}" == "1" ]]; then
     eval "$("$REPO_ROOT/scripts/mac_profile.sh")"
