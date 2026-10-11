@@ -729,4 +729,51 @@ patch("runtime/libc/kl_shim.c", [
     ("    ((uint64_t *)tp)[TLS_SLOT_STACK_GUARD] = g_canary;\n",
      "    kl_tls_thread_init();\n", "after", "kl_tls_thread_init();"),
 ])
+# ---- kl_image.c: bare `svc #0` in a glibc guest becomes a nop
+# On Darwin `svc` takes its syscall number from x16, not x8, so a Linux inline
+# syscall runs whatever Darwin call x16 happens to name — exit(1) when x16 is 1,
+# which is how libvideo.so's 1703 debugger-break `svc #0` sites (none sets x8)
+# ended the process with status 1 and no trace. A site with no write to x8 in
+# the six words before it is not a syscall the guest means; it becomes a nop.
+# A site that does set x8 is left alone and counted, as before.
+patch("runtime/kl_image.c", [
+    ("static void rewrite_tls(uint8_t *p, size_t n, uint64_t va, const char *path,\n",
+     """// A `svc #0` with no x8 write in the six words before it (any instruction
+// whose destination register is x8/w8).
+static int kl_svc_is_bare(const uint32_t *w, size_t i) {
+    for (size_t k = 1; k <= 6 && k <= i; k++)
+        if ((w[i - k] & 0x1fu) == 8u) return 0;
+    return 1;
+}
+
+""", "before", "kl_svc_is_bare(const uint32_t"),
+    ("        if ((w[i] & 0xffffffe0u) == 0xd53bd040u) {\n",
+     """        if (w[i] == 0xd4000001u && kl_svc_is_bare(w, i)) {
+            static int said;
+            if (!said++) fprintf(stderr, "  [klepton] %s: bare svc #0 (no syscall number) at +0x%llx and "
+                                         "others -> nop (Darwin would run syscall x16)\\n",
+                                 path, (unsigned long long)(va + i * 4));
+            w[i] = 0xd503201fu;
+            st->svc_sites++;
+            continue;
+        }
+""", "before", "kl_svc_is_bare(w, i)"),
+])
+# ---- kl_dl.c: room for a Source 2 game's images
+# Klepton's image table held 64. Half-Life: Alyx loads ~110 (game, hlvr, the
+# Steam Runtime and Debian libraries); every image past the 64th was invisible
+# to dlsym, dladdr, dl_iterate_phdr and the one-image-per-file dedupe — the
+# engine's dlsym(libclient, "CreateInterface") then fell through to the global
+# search and got libvstdlib's, and "Unable to create interface
+# Source2ClientConfig001" ended the run. A full table now says so instead of
+# dropping the image silently.
+_p = os.path.join(ROOT, "runtime/kl_dl.c"); _t = open(_p).read()
+if "#define KL_MAX_IMAGES 64\n" in _t:
+    open(_p, "w").write(_t.replace("#define KL_MAX_IMAGES 64\n",
+        "#define KL_MAX_IMAGES 1024   // VeRantyx: was 64; Alyx loads ~110 images\n"))
+patch("runtime/kl_dl.c", [
+    ("    if (g_nimgs < KL_MAX_IMAGES) {\n        snprintf(g_imgs[g_nimgs].soname",
+     "    if (g_nimgs >= KL_MAX_IMAGES)\n        fprintf(stderr, \"  [klepton] image table full (%d): %s is not visible to dlsym\\n\", KL_MAX_IMAGES, soname);\n",
+     "before", "image table full"),
+])
 print("done")

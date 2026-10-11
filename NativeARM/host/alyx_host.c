@@ -19,6 +19,7 @@
 #include "kl_fault.h"
 #include "kl_enginelog.h"
 #include "kl_sdlshim.h"
+#include "kl_luafix.h"
 #include "kl_steambridge.h"
 #include "kl_x18.h"
 #include <sys/stat.h>
@@ -110,7 +111,17 @@ static int probe(int n, char **libs) {
     return bad ? 1 : 0;
 }
 
+// KL_GLIBC_TRACE_EXIT=1: an exit() that reached Darwin's libc without passing
+// through the guest's exit (host code, or a bound-early import).
+static int g_host_trace_exit;
+static void host_atexit(void) {
+    if (!g_host_trace_exit) return;
+    fprintf(stderr, "  [host] atexit: process is exiting via exit()\n");
+    kl_fault_print_frames(stderr, __builtin_frame_address(0));
+}
 int main(int argc, char **argv) {
+    { const char *e = getenv("KL_GLIBC_TRACE_EXIT"); g_host_trace_exit = e && *e && *e != '0'; }
+    atexit(host_atexit);
     const char *game = NULL;
     int do_probe = 0, first_lib = 0, engine_args = argc;
     for (int i = 1; i < argc; i++) {
@@ -160,6 +171,7 @@ int main(int argc, char **argv) {
 
     kl_enginelog_install();        // the engine's console, to stderr
     kl_sdlshim_install();          // SDL window without X11; Vulkan surface from the shim
+    kl_luafix_install();           // LuaJIT arena above 4 GB (no low memory on arm64 macOS)
     install_vr_path_registry();
     kl_steambridge_install();      // steam_api -> the macOS Steam client
     // fontconfig wants a writable cache; keep it beside the game root.
@@ -194,6 +206,10 @@ int main(int argc, char **argv) {
     if (hook && !getenv("ALYX_NO_SPECIAL_THREAD")) rc = hook(0, source2_tramp, &g_args, 0x80000, "Source2Main", NULL);
     else rc = source2_tramp(&g_args);
     fprintf(stderr, "Source2Main returned %ld\n", rc);
+    // The engine may have redirected fd 2 by then; say it where it is seen.
+    { const char *rf = getenv("ALYX_RESULT_FILE");
+      FILE *f = rf ? fopen(rf, "a") : NULL;
+      if (f) { fprintf(f, "Source2Main returned %ld\n", rc); fclose(f); } }
     kl_x18_report(stderr);
     kl_tls_report(stderr);
     return (int)rc;

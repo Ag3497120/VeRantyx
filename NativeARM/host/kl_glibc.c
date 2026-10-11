@@ -68,6 +68,7 @@
 #include <execinfo.h>
 #include <mach/mach_time.h>
 #include "klepton.h"
+#include "kl_fault.h"
 #include "kl_va.h"
 #include "kl_tls.h"
 #include "kl_glibc.h"
@@ -302,6 +303,7 @@ static int klg___vsyslog_chk(int pri, int flag, const char *fmt, kl_va *va) { KL
 
 // syscall(2): Linux puts the variadic arguments in registers like named ones,
 // so the thunk hands us an AAPCS64 va_list over x1-x6.
+static void exit_trace(const char *what, int code);
 long klgh_syscall(long nr, kl_va *va) {
     long a[6];
     for (int i = 0; i < 6; i++) a[i] = (long)kl_va_gp(va);
@@ -310,8 +312,8 @@ long klgh_syscall(long nr, kl_va *va) {
     case 278: arc4random_buf((void *)a[0], (size_t)a[1]); return a[1];                     // getrandom
     case 101: { struct timespec ts = { 0, 0 }; const struct timespec *rq = (const struct timespec *)a[0]; if (rq) nanosleep(rq, &ts); return 0; } // nanosleep
     case 172: return getpid();                                                               // getpid
-    case 93: _exit((int)a[0]);                                                               // exit
-    case 94: _exit((int)a[0]);                                                               // exit_group
+    case 93: exit_trace("syscall(exit)", (int)a[0]); fflush(NULL); _exit((int)a[0]);      // exit
+    case 94: exit_trace("syscall(exit_group)", (int)a[0]); fflush(NULL); _exit((int)a[0]); // exit_group
     default: {
         // Klepton's raw-syscall shim: futex (which Source 2's thread primitives
         // use directly), getrandom and the rest it knows.
@@ -406,20 +408,71 @@ static int mask_to_darwin(int m) {
     if (m & (1 << 5)) d |= LC_MESSAGES_MASK;
     return d;
 }
-static locale_t loc_in(void *l) { return l == (void *)(intptr_t)-1 ? LC_GLOBAL_LOCALE : (locale_t)l; }
-static void *loc_out(locale_t l) { return l == LC_GLOBAL_LOCALE ? (void *)(intptr_t)-1 : (void *)l; }
+// glibc's locale_t is not opaque to its callers: <ctype.h>'s inline
+// isxxx_l and libc++ (libv8_libcpp's num_put, for one) read
+// locale->__ctype_b at offset 0x68 directly. So the guest gets glibc's
+// struct __locale_struct layout, carrying the Darwin locale_t behind it.
+struct klg_locale {
+    void *locales[13];                               // __locales (unused)
+    const unsigned short *ctype_b;                   // 0x68
+    const int32_t *ctype_tolower, *ctype_toupper;    // 0x70, 0x78
+    const char *names[13];                           // __names
+    uint64_t magic;
+    locale_t darwin;
+};
+#define KLG_LOCALE_MAGIC 0x6c636f6c676c6b31ull     // "1kglocl"
+static struct klg_locale *klg_locale_wrap(locale_t d, const char *name) {
+    struct klg_locale *w = calloc(1, sizeof *w);
+    if (!w) return NULL;
+    w->ctype_b = g_ctype_b + 128;
+    w->ctype_tolower = g_ctype_tolower + 128;
+    w->ctype_toupper = g_ctype_toupper + 128;
+    for (int i = 0; i < 13; i++) w->names[i] = "C";
+    (void)name;
+    w->magic = KLG_LOCALE_MAGIC;
+    w->darwin = d;
+    return w;
+}
+static struct klg_locale *klg_locale_of(void *l) {
+    struct klg_locale *w = l;
+    return (l && l != (void *)(intptr_t)-1 && w->magic == KLG_LOCALE_MAGIC) ? w : NULL;
+}
+static locale_t loc_in(void *l) {
+    if (l == (void *)(intptr_t)-1) return LC_GLOBAL_LOCALE;
+    struct klg_locale *w = klg_locale_of(l);
+    return w ? w->darwin : (locale_t)l;
+}
+static _Thread_local struct klg_locale *t_cur_locale;   // NULL: the global locale
 static void *klg_newlocale(int mask, const char *name, void *base) {
     // The game asks for "C" and "C.UTF-8" / "en_US.UTF-8"; Darwin spells the
     // latter en_US.UTF-8 and has no C.UTF-8.
     const char *n = name;
     if (n && (!strcmp(n, "C.UTF-8") || !strcmp(n, "C.utf8") || !strcmp(n, "POSIX"))) n = "en_US.UTF-8";
-    locale_t r = newlocale(mask_to_darwin(mask), n, base ? loc_in(base) : NULL);
-    if (!r && n != name) r = newlocale(mask_to_darwin(mask), "C", base ? loc_in(base) : NULL);
-    return r;
+    struct klg_locale *bw = klg_locale_of(base);
+    locale_t db = base ? loc_in(base) : NULL;
+    locale_t r = newlocale(mask_to_darwin(mask), n, db);
+    if (!r && n != name) r = newlocale(mask_to_darwin(mask), "C", db);
+    if (!r) return NULL;
+    if (bw) { bw->darwin = r; return bw; }             // glibc: base is modified and returned
+    return klg_locale_wrap(r, name);
 }
-static void *klg_uselocale(void *l) { return loc_out(uselocale(l ? loc_in(l) : NULL)); }
-static void *klg_duplocale(void *l) { return duplocale(loc_in(l)); }
-static void klg_freelocale(void *l) { if (l && l != (void *)(intptr_t)-1) freelocale((locale_t)l); }
+static void *klg_uselocale(void *l) {
+    void *prev = t_cur_locale ? (void *)t_cur_locale : (void *)(intptr_t)-1;
+    if (l) {
+        uselocale(loc_in(l));
+        t_cur_locale = klg_locale_of(l);
+    }
+    return prev;
+}
+static void *klg_duplocale(void *l) {
+    locale_t d = duplocale(loc_in(l));
+    return d ? klg_locale_wrap(d, NULL) : NULL;
+}
+static void klg_freelocale(void *l) {
+    struct klg_locale *w = klg_locale_of(l);
+    if (w) { if (w->darwin) freelocale(w->darwin); if (t_cur_locale == w) t_cur_locale = NULL; w->magic = 0; free(w); return; }
+    if (l && l != (void *)(intptr_t)-1) freelocale((locale_t)l);
+}
 #define LOC1(ret, name, args, call) static ret klg_##name args { return call; }
 LOC1(double, strtod_l, (const char *s, char **e, void *l), strtod_l(s, e, loc_in(l)))
 LOC1(float, strtof_l, (const char *s, char **e, void *l), strtof_l(s, e, loc_in(l)))
@@ -660,6 +713,18 @@ static int evfd_peer(int fd) {
     for (size_t i = 0; i < sizeof g_evfd / sizeof g_evfd[0]; i++) if (g_evfd[i].a == fd && fd > 0) return g_evfd[i].b;
     return -1;
 }
+// mmap through Klepton's flag translation, with KL_GLIBC_TRACE_MMAP=1 logging
+// every call (hint, length, flags, result, errno) for allocator debugging.
+static void *klg_mmap_traced(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    static void *(*lower)(void *, size_t, int, int, int, off_t);
+    static int trace = -1;
+    if (!lower) lower = (void *(*)(void *, size_t, int, int, int, off_t))B("mmap");
+    if (trace < 0) { const char *e = getenv("KL_GLIBC_TRACE_MMAP"); trace = e && *e && *e != '0'; }
+    void *p = lower ? lower(addr, len, prot, flags, fd, off) : MAP_FAILED;
+    if (trace) fprintf(stderr, "  [glibc] mmap(%p, %zu, prot %d, flags %#x, fd %d, off %lld) -> %p errno %d\n",
+                       addr, len, prot, flags, fd, (long long)off, p, p == MAP_FAILED ? errno : 0);
+    return p;
+}
 static int klg_eventfd(unsigned initval, int flags) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
@@ -832,7 +897,16 @@ static int klg_inotify_rm_watch(int fd, int wd) { return 0; }
 // The engine ends with _exit(); flush the host-side FILE buffers first so its
 // console.log (-condebug) and stdout survive.
 static int (*g__exit)(int);
-static void klg__exit(int code) { fflush(NULL); if (g__exit) g__exit(code); _exit(code); }
+// KL_GLIBC_TRACE_EXIT=1: who ends the process (frames from the caller's fp).
+static int g_trace_exit = -1;   // read at install: the engine edits its environment
+static void exit_trace(const char *what, int code) {
+    if (g_trace_exit < 0) { const char *e = getenv("KL_GLIBC_TRACE_EXIT"); g_trace_exit = e && *e && *e != '0'; }
+    if (!g_trace_exit) return;
+    fprintf(stderr, "  [glibc] %s(%d) called:\n", what, code);
+    kl_fault_print_frames(stderr, __builtin_frame_address(0));
+}
+static void klg__exit(int code) { exit_trace("_exit", code); fflush(NULL); if (g__exit) g__exit(code); _exit(code); }
+static void klg_exit(int code) { exit_trace("exit", code); exit(code); }
 
 // dlsym/dlopen with a trace (KL_GLIBC_TRACE_DLSYM=1): what the guest asked, on
 // which handle, and what it got.
@@ -843,7 +917,8 @@ static void *klg_dlsym(void *h, const char *name) {
     // Klepton's answers for the one image. Widen a miss to every loaded image.
     if (!v && h && h != (void *)-1 && name) { v = kl_guest_sym_global(name); if (!v) v = kl_shim_lookup(name); }
     static int on = -1; if (on < 0) on = kl_env_on("KL_GLIBC_TRACE_DLSYM", 0);
-    if (on) { size_t off = 0; const char *img = kl_addr_image(v, &off); fprintf(stderr, "  [dlsym] %p %s -> %p (%s+%#zx)\n", h, name ? name : "?", v, img ? img : "-", off); }
+    if (on) { size_t off = 0; const char *img = kl_addr_image(v, &off);
+              fprintf(stderr, "  [dlsym] %p %s -> %p (%s+%#zx)\n", h, name ? name : "?", v, img ? img : "-", off); }
     return v;
 }
 static void *klg_dlopen(const char *path, int flags) {
@@ -1194,7 +1269,7 @@ static struct { const char *name; void *fn; } g_table[] = {
     E("pthread_rwlock_clockrdlock", klg_pthread_rwlock_clockrdlock), E("pthread_rwlock_clockwrlock", klg_pthread_rwlock_clockwrlock),
     E("sem_clockwait", klg_sem_clockwait), E("pthread_tryjoin_np", klg_pthread_tryjoin_np), E("pthread_timedjoin_np", klg_pthread_timedjoin_np),
     E("pthread_setname_np", klg_pthread_setname_np), E("pthread_getname_np", klg_pthread_getname_np), E("pthread_yield", klg_pthread_yield),
-    E("sysconf", klg_sysconf), E("__sysconf", klg_sysconf), E("_exit", klg__exit), E("_Exit", klg__exit),
+    E("sysconf", klg_sysconf), E("__sysconf", klg_sysconf), E("_exit", klg__exit), E("_Exit", klg__exit), E("exit", klg_exit),
     E("dlsym", klg_dlsym), E("dlopen", klg_dlopen), E("pthread_cancel", pthread_cancel),
     E("semctl", klg_semctl), E("semget", klg_semget), E("semop", klg_semop), E("semtimedop", klg_semtimedop),
     // complex math: float complex travels in s0/s1 on both ABIs
@@ -1240,6 +1315,7 @@ static struct { const char *name; void *fn; } g_table[] = {
     E("posix_fadvise", klg_posix_fadvise), E("posix_fadvise64", klg_posix_fadvise), E("mount", klg_mount), E("umount", klg_mount),
     E("execlp", klg_exec_fail), E("execvpe", klg_exec_fail), E("execvp", klg_exec_fail), E("execl", klg_exec_fail),
     E("mkostemps", klg_mkostemps), E("mkostemps64", klg_mkostemps), E("vfscanf", klg_vfscanf), E("vswscanf", klg_vswscanf),
+    E("mmap", klg_mmap_traced), E("mmap64", klg_mmap_traced),
     E("eventfd", klg_eventfd), E("eventfd_read", klg_eventfd_read), E("eventfd_write", klg_eventfd_write),
     E("read", klg_read), E("write", klg_write), E("close", klg_close),
     E("gettext", klg_gettext), E("dgettext", klg_dgettext), E("dcgettext", klg_dcgettext), E("ngettext", klg_ngettext),
@@ -1316,6 +1392,7 @@ void kl_glibc_install(const char *argv0) {
         snprintf(g_progname, sizeof g_progname, "%s", b ? b + 1 : argv0);
     }
     ctype_init();
+    { const char *e = getenv("KL_GLIBC_TRACE_EXIT"); g_trace_exit = e && *e && *e != '0'; }
     arc4random_buf(&g_stack_chk_guard, sizeof g_stack_chk_guard);
     ((unsigned char *)&g_stack_chk_guard)[0] = 0;     // glibc keeps a zero byte in the canary
     g_libc_stack_end = pthread_get_stackaddr_np(pthread_self());

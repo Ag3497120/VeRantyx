@@ -25,8 +25,21 @@
 static void *g_steamclient;
 static char g_dylib[PATH_MAX];
 
+// The macOS steamclient's Breakpad: Breakpad_SteamMiniDumpInit takes the
+// task's Mach exception port, so every fault in the process (including the
+// ones Klepton's own reporter explains) becomes a minidump, a crash_report_sender
+// launch and a silent _exit(1). Crash reporting is not part of reaching Steam;
+// the Breakpad_* calls are answered with no-ops and faults stay ours.
+static long breakpad_noop(void) { return 0; }
+
 static void *steamclient_sym(const char *name) {
     if (!g_steamclient) return NULL;
+    if (!strncmp(name, "Breakpad_", 9)) {
+        static int said;
+        if (!said++) fprintf(stderr, "  [steam] steamclient.so %s and the other Breakpad_* calls -> no-op "
+                                     "(Steam's crash handler would take the Mach exception port)\n", name);
+        return (void *)breakpad_noop;
+    }
     void *p = dlsym(g_steamclient, name);
     static int n; if (n++ < 8) fprintf(stderr, "  [steam] steamclient.so dlsym(%s) -> %p\n", name, p);
     return p;

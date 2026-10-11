@@ -53,13 +53,41 @@ the Valve-internal IVRMailbox_001 layout from Proton), Vulkan on MoltenVK with a
 device-feature clamp, the sound system (System V semaphores needed an ABI-safe
 `semctl`), and renders its first frames to the synthetic swapchain.
 
-Blocked on: **Steam**. `CNetworkSystem::Init()` requires a working
-`SteamAPI_Init`. The Linux steam_api finds `~/.steam/steam.pid` and dlopens
-`~/.steam/sdkarm64/steamclient.so`; `host/kl_steambridge.c` answers that with
-the macOS Steam client's arm64 `steamclient.dylib` (same C++ ABI, talks to the
-macOS Steam process). This works mechanically (CreateInterface is reached) but
-needs **macOS Steam.app running and signed in** by the owner of the game. Not
-done yet on this Mac.
+Steam: `CNetworkSystem::Init()` requires a working `SteamAPI_Init`. The Linux
+steam_api finds `~/.steam/steam.pid` and dlopens `~/.steam/sdkarm64/steamclient.so`;
+`host/kl_steambridge.c` answers that with the macOS Steam client's arm64
+`steamclient.dylib` (same C++ ABI, talks to the macOS Steam process). Needs
+**macOS Steam.app running and signed in** by the owner of the game.
+
+## Status (2026-10-11, day 1 evening): main menu renders in stereo
+
+With Steam signed in, the engine loads `maps/startup`, starts the server and
+client game systems, attaches both (emulated Rift S) controllers through our
+runtime, brings up Panorama and the main menu, and streams stereo frames
+(1632x1056 per eye, ~30 eye pairs/s on an M1 Max with the synchronous readback)
+into the shared frame file — verified by dumping a frame. It ran 5 minutes
+without a fault. Fixed on the way:
+
+- Steam's own Breakpad (`Breakpad_SteamMiniDumpInit` in the macOS
+  steamclient) took the Mach exception port, so every fault became a minidump
+  and a silent `_exit(1)`; the bridge answers `Breakpad_*` with no-ops.
+- Klepton's image table held 64 images; Alyx loads ~110, so dlsym on later
+  images (libclient's `CreateInterface`) missed — raised to 1024.
+- libvscript's LuaJIT arena insisted on the low 2 GB (`Plat_VirtualAlloc` with
+  a max address); arm64 macOS cannot map below 4 GB at all (a smaller
+  `__PAGEZERO` is SIGKILLed at exec), so `host/kl_luafix.c` drops the limit,
+  nops the hook's range check and commits the arena RW instead of RWX.
+- libvideo's 1703 bare `svc #0` (debug breaks) would run Darwin syscall x16;
+  they become nops at load.
+- glibc `locale_t` is read directly (`->__ctype_b` at 0x68 by libc++); the
+  guest now gets glibc's struct layout wrapping the Darwin locale.
+- 4 KB commits inside reservations (Panorama) failed on 16 KB pages; widened.
+
+Open: each eye shows content only in its left 1289 of 1632 columns (the rest
+is black/magenta) although Submit bounds are 0..1 — the render viewport vs
+texture size needs matching; "Attempting to purge m_fencedResourceList"
+warnings; synchronous readback limits fps; MacEncoder/headset path and input
+not yet exercised with the native build.
 
 Run: `build/host/alyx_host --libdir build/guest/lib --game ~/Verantyx_VR_Drive/alyx_linux -- -vr -steam -noasserts -nopassiveasserts +map startup -vulkan -nowindow`
 (`VERANTYX_BENCH=1` synthesises poses without a headset; `VERANTYX_SHARED_FRAME`

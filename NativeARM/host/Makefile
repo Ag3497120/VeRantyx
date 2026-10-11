@@ -20,7 +20,7 @@ LDLIBS := -lz -lresolv -liconv -framework AudioToolbox -framework CoreAudio \
           -framework CoreFoundation -framework AVFoundation -framework Foundation
 
 RT_OBJS   := $(patsubst %,$(OUT)/kl/%.o,$(RUNTIME))
-HOST_SRCS := alyx_host.c kl_glibc.c kl_glibc_va.S kl_enginelog.c kl_sdlshim.c kl_steambridge.c
+HOST_SRCS := alyx_host.c kl_glibc.c kl_glibc_va.S kl_enginelog.c kl_sdlshim.c kl_steambridge.c kl_luafix.c
 HOST_OBJS := $(patsubst %,$(OUT)/%.o,$(HOST_SRCS))
 # The OpenVR runtime (C++): ../vrruntime.
 VRRT_DIR  := ../vrruntime
@@ -33,6 +33,9 @@ HDRS      := $(wildcard $(KL)/runtime/*.h) $(wildcard $(KL)/runtime/*/*.h) $(wil
 
 all: $(OUT)/alyx_host
 
+# (No -pagezero_size: arm64 macOS SIGKILLs an executable whose __PAGEZERO is
+# under 4 GB, and vm_map_min is 4 GB anyway — see kl_luafix.c for how Valve's
+# low-2 GB LuaJIT arena is handled instead.)
 $(OUT)/alyx_host: $(RT_OBJS) $(HOST_OBJS) $(VRRT_OBJS)
 	clang++ -arch arm64 -g -o $@ $^ $(LDLIBS)
 

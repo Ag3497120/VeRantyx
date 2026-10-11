@@ -78,6 +78,20 @@ static void klg_Plat_DebugPrint(const char *msg) {
     if (g_real_debug_print) g_real_debug_print(msg);
 }
 
+// The fatal-error path collects its explanation into the minidump comment
+// (tier0's Plat_AppendMiniDumpErrorString, called through the PLT) and then
+// crashes on purpose; with no minidump writer that text is the only account
+// of why, so it is printed. The format argument is used as plain text.
+static void klg_Plat_AppendMiniDumpErrorString(const char *fmt, const char *a1, const char *a2) {
+    fprintf(stderr, "[engine minidump] %s", fmt ? fmt : "(null)");
+    if (fmt && strstr(fmt, "%s") && a1) fprintf(stderr, " | %s", a1);
+    fprintf(stderr, "\n");
+}
+static int klg_Plat_MessageBox(const char *title, const char *text) {
+    fprintf(stderr, "[engine messagebox] %s: %s\n", title ? title : "", text ? text : "");
+    return 0;
+}
+
 void kl_enginelog_install(void) {
     const char *e = getenv("ALYX_ENGINE_LOG");
     if (e && !strcmp(e, "0")) g_enabled = 0;
@@ -87,6 +101,8 @@ void kl_enginelog_install(void) {
     kl_interpose("Msg", (void *)klg_Msg);
     kl_interpose("Warning", (void *)klg_Warning);
     kl_interpose("Plat_DebugPrint", (void *)klg_Plat_DebugPrint);
+    kl_interpose("Plat_AppendMiniDumpErrorString", (void *)klg_Plat_AppendMiniDumpErrorString);
+    kl_interpose("Plat_MessageBox", (void *)klg_Plat_MessageBox);
 }
 
 void kl_enginelog_bind(kl_image *tier0) {

@@ -296,6 +296,17 @@ public:
         // Bounds select a rectangle; vMin > vMax means the image is upside down.
         float u0 = 0, u1 = 1, v0 = 0, v1 = 1;
         if (bounds) { u0 = bounds->uMin; u1 = bounds->uMax; v0 = bounds->vMin; v1 = bounds->vMax; }
+        {   // report every change of the submitted rectangle (dynamic resolution)
+            static float last[2][4] = { { -1, -1, -1, -1 }, { -1, -1, -1, -1 } };
+            static int changes;
+            const int ei = eye == Eye_Left ? 0 : 1;
+            if ((last[ei][0] != u0 || last[ei][1] != v0 || last[ei][2] != u1 || last[ei][3] != v1) && changes < 40) {
+                changes++;
+                vrrt::log("Submit eye %d bounds (%.3f %.3f %.3f %.3f) of %ux%u flags %#x", ei, u0, v0, u1, v1,
+                          d->m_nWidth, d->m_nHeight, (unsigned)flags);
+                last[ei][0] = u0; last[ei][1] = v0; last[ei][2] = u1; last[ei][3] = v1;
+            }
+        }
         bool flip = v0 > v1;
         if (flip) std::swap(v0, v1);
         if (u0 > u1) std::swap(u0, u1);
