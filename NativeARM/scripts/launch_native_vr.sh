@@ -84,9 +84,9 @@ for f in alyx_host hardware-encoder; do
     if [[ -s "$LOG_DIR/$f.log" ]]; then
         mv -f "$LOG_DIR/$f.log" "$LOG_DIR/$f.$(stat -f '%Sm' -t '%Y%m%d-%H%M%S' "$LOG_DIR/$f.log").log"
     fi
-    ls -1t "$LOG_DIR/$f".2*.log 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done
+    ls -1t "$LOG_DIR/$f".2*.log 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done || true
 done
-ls -1t "$LOG_DIR"/slow-*.txt 2>/dev/null | tail -n +11 | while read -r old; do rm -f "$old"; done
+ls -1t "$LOG_DIR"/slow-*.txt 2>/dev/null | tail -n +11 | while read -r old; do rm -f "$old"; done || true
 command -v swiftc >/dev/null 2>&1 || die "swiftc is required to build the Mac HEVC encoder."
 swiftc -O "$REPO_ROOT/MacEncoder/HardwareEncoder.swift" -o "$ENCODER"
 
