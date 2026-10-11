@@ -10,7 +10,7 @@ SOURCE_DLL="$STEAMVR_DIR/bin/win64/openvr_api.dll"
 TARGET_DLL="$HLA_GAME_BIN/openvr_api.dll"
 BACKUP_DIR="$HLA_GAME_BIN/.verantyx-originals"
 
-if [[ "$(basename "$WINEPREFIX")" != "SteamVR_Prefix_Wine11_Test" ]]; then
+if [[ "$(basename "$WINEPREFIX")" != SteamVR_Prefix_*_Test ]]; then
     echo "Refusing to modify a non-test prefix: $WINEPREFIX" >&2
     exit 1
 fi

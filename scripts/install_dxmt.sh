@@ -34,7 +34,7 @@ SYSTEM32="$WINEPREFIX/drive_c/windows/system32"
 DXVK_SOURCE_DIR="${DXVK_SOURCE_DIR:-$VERANTYX_VR_DRIVE/Beer/dxvk/dxvk-macOS-async-v1.10.3-20230507-repack/x64}"
 DLLS=(d3d10core.dll dxgi.dll)
 
-if [[ "$(basename "$WINEPREFIX")" != "SteamVR_Prefix_Wine11_Test" ]]; then
+if [[ "$(basename "$WINEPREFIX")" != SteamVR_Prefix_*_Test ]]; then
     echo "Refusing to modify a non-test prefix: $WINEPREFIX" >&2
     exit 1
 fi

@@ -196,10 +196,15 @@ changes backend too. Switching back to `dxvk` restores the DXVK DLLs.
 Status (2026-10-11): `dxmt` starts Alyx and renders (confirmed in the
 bench); its frame rate with the headset is still to be compared. `d3dmetal`
 installs GPTK's D3D DLLs as the Wine runtime's builtins (they are Wine
-builtins with a Unix half, not droppable native DLLs); GPTK 1.1's abort on
-Wine 11 with "unimplemented function ntdll.dll.__wine_unix_call" (an ABI
-Wine 8 removed), so only GPTK 2.x can work with this runtime, untested.
-The project's June 2026 setup ran entirely on GPTK 1.1's own Wine 7.7.
+builtins with a Unix half, not droppable native DLLs), but every GPTK
+version checked (1.1 and 3.0) imports `ntdll.__wine_unix_call`, an entry
+point that only Apple's and CodeWeavers' Wine 7-based builds export; on
+this Wine 11 runtime the DLLs abort with "unimplemented function". Running
+the whole pipeline on GPTK's own Wine 7.7 (how the project ran in June
+2026) no longer works either: the current Steam client crashes at startup
+there (`COMCTL32.dll failed to initialize`). D3DMetal therefore needs a
+CrossOver-class Wine; the option stays in the scripts for anyone who has
+one, and DXMT is the open-source way to a lighter D3D layer.
 
 ### Measuring on your Mac
 

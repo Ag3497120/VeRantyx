@@ -12,7 +12,7 @@ RENDER_TARGET_SCALE="${VERANTYX_RENDER_TARGET_SCALE:-0.55}"
 CHAPERONE_FILE="${CHAPERONE_FILE:-$(dirname "$STEAMVR_SETTINGS")/chaperone_info.vrchap}"
 PLAY_AREA_METERS="${VERANTYX_PLAY_AREA_METERS:-3}"
 
-if [[ "$(basename "$WINEPREFIX")" != "SteamVR_Prefix_Wine11_Test" ]]; then
+if [[ "$(basename "$WINEPREFIX")" != SteamVR_Prefix_*_Test ]]; then
     echo "Refusing to modify SteamVR settings outside the test prefix: $WINEPREFIX" >&2
     exit 1
 fi

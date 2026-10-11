@@ -13,7 +13,7 @@ WINEPREFIX="${WINEPREFIX:-$VERANTYX_VR_DRIVE/SteamVR_Prefix_Wine11_Test}"
 STEAM_ROOT="${STEAM_ROOT:-$WINEPREFIX/drive_c/Program Files (x86)/Steam}"
 OPTIONS="${1:?usage: set_alyx_launch_options.sh \"<options>\"}"
 
-if [[ "$(basename "$WINEPREFIX")" != "SteamVR_Prefix_Wine11_Test" ]]; then
+if [[ "$(basename "$WINEPREFIX")" != SteamVR_Prefix_*_Test ]]; then
     echo "Refusing to modify Steam settings outside the test prefix: $WINEPREFIX" >&2
     exit 1
 fi
