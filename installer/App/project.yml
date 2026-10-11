@@ -14,7 +14,7 @@ packages:
     from: 2.6.4
 settings:
   base:
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "0.1.1"
     CURRENT_PROJECT_VERSION: "1"
     # Where Sparkle looks for new versions, and the public half of the EdDSA key that signs them
     # (scripts/release.sh). Updates stay off until the key is set.

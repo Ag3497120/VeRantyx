@@ -84,11 +84,12 @@ extension InstallerModel {
         guard xcodeReady else { return .waiting }
         guard let r = result(.team) else { return .working }
         if r.code == "apple-account-missing" { return guide.isRunning && guide.job == .signIn ? .working : .attention }
+        if r.code == "apple-team-not-loaded" { return guide.isRunning && guide.job == .refresh ? .working : .attention }
         return .done
     }
 
     var programState: StepState {
-        guard let r = result(.team), r.code != "apple-account-missing" else { return .waiting }
+        guard let r = result(.team), r.code != "apple-account-missing", r.code != "apple-team-not-loaded" else { return .waiting }
         if !r.passes { return .attention }
         return setup.openChoice == nil ? .done : .attention
     }

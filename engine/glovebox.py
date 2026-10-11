@@ -141,20 +141,32 @@ def check_visionos_sdk():
     return "ok", f"visionOS SDK {out.strip()}", None
 
 
-def xcode_teams():
-    """Teams Xcode's account settings know, without loading the account: [(team id, name, paid)]."""
+def xcode_prefs():
+    """Xcode's settings (`defaults export com.apple.dt.Xcode -`), {} when there are none."""
     rc, out, _ = run("defaults", "export", "com.apple.dt.Xcode", "-")
     if rc != 0:
-        return []
+        return {}
     try:
-        prefs = plistlib.loads(out.encode())
+        return plistlib.loads(out.encode())
     except Exception:
-        return []
+        return {}
+
+
+def xcode_account(prefs):
+    """Whether Xcode's account list names someone. None when Xcode keeps no account list at all."""
+    lists = prefs.get("DVTDeveloperAccountManagerAppleIDLists")
+    if not isinstance(lists, dict):
+        return None
+    return any(isinstance(v, list) and any(map(is_account, v)) for v in lists.values())
+
+
+def xcode_teams():
+    """Teams Xcode's account settings know, without loading the account: [(team id, name, paid)]."""
+    prefs = xcode_prefs()
     teams = []
     # Signing out of Xcode empties its account list but leaves the teams cached: no account, no team. An entry with
     # no name in it (Xcode 16 can leave those) is no account either.
-    lists = prefs.get("DVTDeveloperAccountManagerAppleIDLists")
-    if isinstance(lists, dict) and not any(isinstance(v, list) and any(map(is_account, v)) for v in lists.values()):
+    if xcode_account(prefs) is False:
         return teams
     for _account, lst in (prefs.get("IDEProvisioningTeamByIdentifier") or {}).items():
         for t in lst or []:
@@ -184,6 +196,11 @@ def check_team():
     if teams:
         return "missing", "Xcode is signed in, but only with a free team (the game needs the paid program's memory limit)", {
             "kind": "open-url", "label": "Join the Apple Developer Program", "url": "https://developer.apple.com/programs/enroll/"}
+    if xcode_account(xcode_prefs()):
+        # Signed in, but Xcode hasn't saved the account's teams yet: it does once it asks Apple again (clicking the
+        # account, Download Manual Profiles). Signing in again isn't what's needed.
+        return "missing", "Xcode is signed in, but hasn't loaded the account's team yet", {
+            "kind": "open-app", "label": "Load your team in Xcode's Accounts settings", "url": "xcode://"}
     return "missing", "Xcode is not signed in to an Apple account", {
         "kind": "open-app", "label": "Open Xcode's Accounts settings", "url": "xcode://"}
 

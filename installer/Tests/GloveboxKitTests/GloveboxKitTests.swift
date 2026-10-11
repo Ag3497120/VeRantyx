@@ -21,6 +21,8 @@ final class ContractTests: XCTestCase {
         XCTAssertEqual(code(#"{"event": "check", "check": "visionos", "status": "missing", "fix": {"kind": "command", "label": "Install visionOS support", "command": "xcodebuild -downloadPlatform visionOS"}}"#), "visionos-missing")
         XCTAssertEqual(code(#"{"event": "check", "check": "team", "status": "missing", "fix": {"kind": "open-url", "label": "Join the Apple Developer Program", "url": "https://developer.apple.com/programs/enroll/"}}"#), "team-free-only")
         XCTAssertEqual(code(#"{"event": "check", "check": "team", "status": "missing", "fix": {"kind": "open-app", "label": "Open Xcode's Accounts settings", "url": "xcode://"}}"#), "apple-account-missing")
+        // Signed in, but Xcode hasn't saved the account's team yet (a tester, 2026-10-10): not a sign-in.
+        XCTAssertEqual(code(#"{"event": "check", "check": "team", "status": "missing", "fix": {"kind": "open-app", "label": "Load your team in Xcode's Accounts settings", "url": "xcode://"}}"#), "apple-team-not-loaded")
         XCTAssertEqual(code(#"{"event": "check", "check": "disk", "status": "missing", "detail": "9 GB free, 15 GB needed", "fix": {"kind": "open-url", "label": "Free up space", "url": "x-apple.systempreferences:com.apple.settings.Storage"}}"#), "disk-low")
     }
 

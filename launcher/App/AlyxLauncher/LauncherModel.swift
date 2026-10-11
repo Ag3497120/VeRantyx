@@ -98,9 +98,26 @@ final class LauncherModel: ObservableObject {
             .appendingPathComponent("alyx/assets", isDirectory: true)
     }
 
+    /// What of Documents stays in the device's iCloud backup: the saves (in Steam Cloud too) and the
+    /// sync's records of them. The rest, the game (about 60 GB) and its shader cache, downloads or
+    /// builds again; a tester's backup was 68.7 GB with it.
+    nonisolated static let backupKeeps = ["alyx/assets/hlvr/save", "alyx/assets/.launcher-cloud.json", "alyx/assets/.cloud-backups"]
+
+    /// Marks everything else in Documents excluded from backup: on every start (the game and its
+    /// shader cache add files beside the saves), after each download, and when a download goes to
+    /// the system (the headset backs up overnight, maybe halfway through a first download).
+    @discardableResult
+    nonisolated static func keepOutOfBackup() -> Task<Void, Never> {
+        Task.detached(priority: .utility) {
+            _ = BackupExclusion.apply(under: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0],
+                                      keeping: LauncherModel.backupKeeps)
+        }
+    }
+
     // MARK: Start
 
     func start() async {
+        Self.keepOutOfBackup()
         if let creds = Keychain.load() {
             accountName = creds.accountName
             await finishSignIn(creds)
@@ -231,6 +248,7 @@ final class LauncherModel: ObservableObject {
         installTask = Task {
             do {
                 try await runInstall(plan)
+                Self.keepOutOfBackup()
                 wasDownloading = false
                 install = .installed(updateAvailable: false)
                 syncSavesInBackground()
@@ -310,6 +328,7 @@ final class LauncherModel: ObservableObject {
             await running?.value  // the journal is flushed when the in-app download stops
             let remaining = await Task.detached { launcher.remainingChunks(plan) }.value
             await Self.backgroundFetcher.plan(remaining, servers: CDNClient(servers: plan.servers).baseURLs)
+            await Self.keepOutOfBackup().value  // the game so far and the system's chunk folder
             assertion.end()
         }
     }

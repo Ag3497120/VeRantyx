@@ -311,6 +311,12 @@ final class InstallerModel: ObservableObject {
             headsetFailing = nil
         }
         if headsetSettling { fresh.removeAll { headsetIDs.contains($0.id) } }
+        #if DEBUG
+        if Tour.teamNotLoaded, let i = fresh.firstIndex(where: { $0.id == .team }) {
+            fresh[i] = CheckResult(id: .team, status: .fail, code: "apple-team-not-loaded",
+                                   fix: Fix(kind: .openApp, label: "Load your team in Xcode's Accounts settings", url: "xcode://"))
+        }
+        #endif
         withAnimation(.spring(duration: 0.35)) {
             for r in fresh { setup.record(r) }
             // A check the engine didn't get to (it stops after a missing Xcode) is unknown again.

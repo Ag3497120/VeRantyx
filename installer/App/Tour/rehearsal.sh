@@ -121,7 +121,7 @@ run_for() { # run_for <seconds> <command...>: stops it if it hangs (a keychain p
 
 # Xcode's account settings, as a player's Mac has them. Signing out of Xcode empties its account
 # lists and leaves the teams cached; Xcode 16 can leave an entry with no name in them.
-xprefs() { # xprefs none|signed-out|nameless|cached-no-list|signed-in-paid|signed-in-free
+xprefs() { # xprefs none|signed-out|nameless|cached-no-list|signed-in-paid|signed-in-free|signed-in-noteams
   python3 - "$1" <<'PY'
 import plistlib, subprocess, sys
 mode = sys.argv[1]
@@ -134,7 +134,7 @@ for k in ("IDEProvisioningTeamByIdentifier", "DVTDeveloperAccountManagerAppleIDL
     prefs.pop(k, None)
 paid = mode != "signed-in-free"
 teams = [{"teamID": "A1B2C3D4E5", "teamName": "Jane Appleseed", "teamType": "Individual", "isFreeProvisioningTeam": not paid}]
-if mode != "none":
+if mode not in ("none", "signed-in-noteams"):
     prefs["IDEProvisioningTeamByIdentifier"] = {"8F2C0D6E-0000-4000-8000-000000000001": teams}
 if mode.startswith("signed-in"):
     prefs["DVTDeveloperAccountManagerAppleIDLists"] = {"IDE.Prod": [{"identifier": "jane@example.com", "username": "jane@example.com"}],
@@ -459,6 +459,65 @@ sleep 20
 st=$(field stage)
 if [ "$st" != off ] && [ "$st" != done ]; then pass "C2: the sign-in guide stays up (stage $st)"; else fail "C2: the sign-in guide closed by itself"; fi
 escape; cmd guide stop
+quitapp com.apple.dt.Xcode "/Contents/MacOS/Xcode"
+
+# ---------------------------------------------------------------------------------------------
+section "T. Signed in to Xcode, its team not loaded yet (a tester, 2026-10-10): load the team, not sign in"
+xprefs signed-in-noteams
+launch T || exit 1
+cmd start
+settle T
+expect T "team check" "$(check team)" "fail\(apple-team-not-loaded\)"
+expect T "Apple Account step" "$(stepstate account)" "attention"
+doctor T
+expect T "engine's team check" "$(engine_team T)" "missing"
+cmd go account; sleep 2; winshot T-account
+has T "the Apple Account card" "$(texts)" "Load your team in Xcode"
+cmd guide refresh
+sleep 8
+if [ "$(field stage)" = open ]; then
+  shot T-guide-open
+  osascript -e 'tell application id "com.apple.dt.Xcode" to activate' >/dev/null 2>&1; sleep 1
+  key "," "command down"
+fi
+if waitfor "stage=click ring=[0-9]" 20; then
+  sleep 1; shot T-guide-click
+  t=$(texts); log "  bubble: $t"
+  has T "the bubble at Settings" "$t" "Click your Apple Account"
+  clickring
+  # This Xcode isn't really signed in: the click on the account opens Apple's sign-in over Settings, where a real
+  # account opens its page. What Xcode's windows do meanwhile (on run 38098348919 the guide lost Settings here).
+  for i in 1 2 3 4 5 6 7 8; do
+    log "  +${i}: $(field stage) ring=$(field ring) | $("$T/windows" Xcode | sed -E 's/^window owner=Xcode //' | tr '\n' ';')"
+    sleep 0.5
+  done
+  # Xcode 27: the account's page lists its teams; the team's page has Download Manual Profiles (rings on both).
+  if waitfor "stage=team ring=[0-9]" 8; then
+    sleep 1; shot T-guide-team
+    t=$(texts); log "  bubble: $t"
+    has T "the bubble on the account's page" "$t" "Click your team"
+    clickring
+    if waitfor "stage=finish ring=[0-9]" 8; then
+      sleep 1; shot T-guide-button
+      t=$(texts); log "  bubble: $t"
+      has T "the bubble on the team's page" "$t" "Click Download Manual Profiles"
+    else
+      fail "T: a click on the team didn't ring Download Manual Profiles ($(status))"
+    fi
+  else
+    fail "T: a click on the account didn't ring its team ($(status))"
+  fi
+else
+  fail "T: the guide didn't ring the account in Xcode's Settings ($(status))"
+fi
+st=$(field stage)
+if [ "$st" != off ] && [ "$st" != done ]; then pass "T: the guide stays up while the team isn't loaded (stage $st)"; else fail "T: the guide closed by itself before the team loaded"; fi
+# Xcode saving the team (what Download Manual Profiles does): the guide sees it, closes, and the step is done.
+xprefs signed-in-paid
+if waitfor "stage=off" 60; then pass "T: the team loading closes the guide by itself"; else fail "T: the guide didn't notice the team ($(status))"; fi
+settle T 60
+expect T "Apple Account step once the team loads" "$(stepstate account)" "done"
+expect T "team check once the team loads" "$(check team)" "ok"
 quitapp com.apple.dt.Xcode "/Contents/MacOS/Xcode"
 
 # ---------------------------------------------------------------------------------------------

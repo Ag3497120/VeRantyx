@@ -166,6 +166,16 @@ struct AccountPage: View {
         let teams = model.setup.usableTeams
         if !model.xcodeReady {
             WaitingCard(title: "Sign in to Xcode")
+        } else if model.signInState == .attention, model.setup.results[.team]?.code == "apple-team-not-loaded" {
+            // Xcode has the account but hasn't saved its team: one more look at the account in Xcode loads it.
+            StepCard(title: "Load your team in Xcode", subtitle: "You're signed in. Xcode just hasn't loaded your team yet.") {
+                EmptyView()
+            } footer: {
+                Spacer()
+                Button("Show Me") { guide.start(.refresh) }
+                    .primaryButton()
+                    .keyboardShortcut(.defaultAction)
+            }
         } else if model.signInState == .attention {
             StepCard(title: "Sign in to Xcode", subtitle: "We'll show you how.") {
                 EmptyView()

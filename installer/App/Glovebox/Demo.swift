@@ -15,12 +15,12 @@ enum Demo {
 
     static let all = ["welcome", "xcode-get", "xcode-downloading", "xcode-setup", "xcode-visionos",
                       "steam-signin", "steam-scanned", "steam-password", "steam-approve", "steam-code", "steam-owned", "steam-notowned",
-                      "account-signin", "account-program", "account-team", "account-free",
+                      "account-signin", "account-teamload", "account-program", "account-team", "account-free",
                       "headset-pair", "headset-pair26", "headset-devmode",
                       "install-ready", "install-running", "install-consent", "install-news", "install-signing", "install-signing-once", "install-signing-denied",
                       "install-error", "install-signin-expired", "install-signin-guiding", "install-agreement",
                       "install-headsetwait", "install-done", "install-done-news", "install-done-free",
-                      "home", "home-allset", "home-news", "home-renew-free", "guide-signin", "guide-pair", "guide-keychain", "guide-signinagain"]
+                      "home", "home-allset", "home-news", "home-renew-free", "guide-signin", "guide-pair", "guide-keychain", "guide-signinagain", "guide-loadteam", "guide-loadteam2", "guide-loadteam3"]
 
     static func value(after flag: String) -> String? {
         let args = CommandLine.arguments
@@ -45,6 +45,9 @@ enum Demo {
                 case "guide-pair": model.guide.showForDemo(.pair, stage: .finish, xcodeMajor: 27)
                 case "guide-keychain": model.guide.showForDemo(.keychain, stage: .click, xcodeMajor: 27)
                 case "guide-signinagain": model.guide.showForDemo(.signInAgain, stage: .click, xcodeMajor: 27)
+                case "guide-loadteam": model.guide.showForDemo(.refresh, stage: .click, xcodeMajor: 27, loadingTeam: true)
+                case "guide-loadteam2": model.guide.showForDemo(.refresh, stage: .team, xcodeMajor: 27, loadingTeam: true)
+                case "guide-loadteam3": model.guide.showForDemo(.refresh, stage: .finish, xcodeMajor: 27, loadingTeam: true)
                 default: model.guide.showForDemo(.signIn, stage: .open, xcodeMajor: 27)
                 }
             }
@@ -188,6 +191,9 @@ extension InstallerModel {
             step = .steam
         case "account-signin":
             blocked(.team, "apple-account-missing", fix: Fix(kind: .openApp, label: "Sign in", url: "xcode://"))
+            step = .account
+        case "account-teamload", "guide-loadteam", "guide-loadteam2", "guide-loadteam3":
+            blocked(.team, "apple-team-not-loaded", fix: Fix(kind: .openApp, label: "Load your team in Xcode's Accounts settings", url: "xcode://"))
             step = .account
         case "account-program":
             blocked(.team, "team-free-only", fix: Fix(kind: .openURL, label: "Join", url: "https://developer.apple.com/programs/enroll/"),

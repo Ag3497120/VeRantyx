@@ -15,7 +15,8 @@ final class XcodeGuide: ObservableObject {
     enum Job: Equatable {
         /// Sign in to Xcode with an Apple Account.
         case signIn
-        /// Show Xcode the account again so it sees a new Developer Program membership.
+        /// Show Xcode the account again so it sees a new Developer Program membership, or loads the team it
+        /// hasn't saved yet (signed in, no team: Download Manual Profiles makes Xcode ask Apple).
         case refresh
         /// Sign in to Xcode again: its saved sign-in for the account expired, though Xcode still lists the
         /// account (a build then says "Unable to log in with account"). The install's error card starts it,
@@ -49,6 +50,8 @@ final class XcodeGuide: ObservableObject {
         case open
         /// Click the button (Sign In…, or Pair Nearby Device in Device Hub's menu).
         case click
+        /// An Apple Account's page in Xcode 27's Settings: click its team, whose page has Download Manual Profiles.
+        case team
         /// Device Hub's pairing window: pick Vision Pro, so it shows the headset's steps.
         case device
         /// The App Store's Install (where Get was); the Mac's password for Xcode's components.
@@ -132,12 +135,19 @@ final class XcodeGuide: ObservableObject {
     /// Signing in again: Apple's sign-in over Settings came up, and whether it's up now.
     private var signInSeen = false
     @Published private(set) var signingIn = false
+    /// The refresh is for a team Xcode hasn't loaded, not for a new membership.
+    @Published private(set) var loadingTeam = false
+    /// Download Manual Profiles was clicked: no ring on it again while Xcode loads the team.
+    private var profilesClicked = false
+    /// When Xcode's Settings window was last on screen.
+    private var settingsSeen: Date?
 
     func start(_ job: Job = .signIn) {
         stop()
         self.job = job
         xcodeMajor = model?.xcodeMajor ?? 26
         updating = model?.setup.results[.xcode]?.code == "xcode-too-old"
+        loadingTeam = job == .refresh && model?.setup.results[.team]?.code == "apple-team-not-loaded"
         stage = .open
         isRunning = true
         model?.objectWillChange.send()
@@ -207,6 +217,8 @@ final class XcodeGuide: ObservableObject {
         promptUp = false
         signInSeen = false
         signingIn = false
+        profilesClicked = false
+        settingsSeen = nil
         pretendTouchID = nil
         if isRunning {
             isRunning = false
@@ -260,7 +272,9 @@ final class XcodeGuide: ObservableObject {
         guard let m = model else { return false }
         switch job {
         case .signIn: return m.setup.results[.team].map { $0.code != "apple-account-missing" } ?? false
-        case .refresh: return m.programState == .done
+        case .refresh:
+            if loadingTeam { return m.setup.results[.team].map { !["apple-account-missing", "apple-team-not-loaded"].contains($0.code ?? "") } ?? false }
+            return m.programState == .done
         case .signInAgain:
             // Xcode's lists said signed in all along: Apple's sign-in coming and going is all there is to see.
             return signInSeen && !signingIn
@@ -325,9 +339,14 @@ final class XcodeGuide: ObservableObject {
             return
         }
         guard let settings = windows.first(where: { $0.layer == 0 && Self.isSettings($0.frame) }) else {
+            // On the account's or the team's page, Settings missing for a moment (Xcode changing it, as the rehearsal's
+            // Xcode did after the account click) isn't Settings closing: the ring and the bubble stay where they are.
+            if job == .refresh, loadingTeam, stage >= .team, stage < .done, let seen = settingsSeen,
+               Date().timeIntervalSince(seen) < 2 { return }
             set(stage == .welcome ? .open : min(stage, .open), beside: windows.first(where: { $0.layer == 0 })?.frame)
             return
         }
+        settingsSeen = Date()
         // A sheet over Settings is Apple's sign-in. On Xcode 27.0 it's 480 × 600 points, and the
         // bubble points at its Apple Account field.
         let sheet = windows.first { $0.layer == 0 && $0.frame != settings.frame && settings.frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.minY + 2)) }
@@ -349,6 +368,19 @@ final class XcodeGuide: ObservableObject {
                 set(.finish, pointAt: Self.accountField(in: sheet.frame), from: .trailing, beside: sheet.frame, ring: false)
             } else {
                 set(.finish, beside: sheet.frame)
+            }
+        } else if job == .refresh, loadingTeam {
+            // The account (the ring on it), then in Xcode 27 its team, then Download Manual Profiles on that page,
+            // which makes Xcode ask Apple for the team. Where Xcode doesn't have that button measured (26, where it's
+            // on the account's page), the bubble shows a picture of it instead.
+            if stage == .finish, let button = Self.downloadProfilesButton(in: settings.frame, xcodeMajor: xcodeMajor) {
+                set(.finish, pointAt: button, from: .trailing, beside: settings.frame, ring: !profilesClicked)
+            } else if stage == .finish {
+                set(.finish, beside: settings.frame)
+            } else if stage == .team, let team = Self.teamRow(in: settings.frame, xcodeMajor: xcodeMajor) {
+                set(.team, pointAt: team, from: .trailing, beside: settings.frame)
+            } else {
+                set(.click, pointAt: Self.accountRow(in: settings.frame, xcodeMajor: xcodeMajor), from: .trailing, beside: settings.frame)
             }
         } else if stage == .finish || job == .refresh {
             set(job == .refresh ? .click : .finish, beside: settings.frame)
@@ -588,6 +620,17 @@ final class XcodeGuide: ObservableObject {
             }
         } else if job == .setup {
             hideRing()
+        } else if job == .refresh, loadingTeam, stage == .finish {
+            // Download Manual Profiles: Xcode asks Apple for the team now, and the checks see it saved.
+            profilesClicked = true
+            hideRing()
+            #if DEBUG
+            Tour.teamNotLoaded = false
+            #endif
+        } else if job == .refresh, loadingTeam, stage == .click, xcodeMajor >= 27 {
+            // The account's page: its team next.
+            go(.team)
+            hideRing()
         } else if job == .pair, stage == .open {
             plusClicked = Date()
             go(.click)
@@ -717,12 +760,29 @@ final class XcodeGuide: ObservableObject {
         return CGRect(x: w.maxX - 20 - size.width, y: w.minY + top, width: size.width, height: size.height).insetBy(dx: -7, dy: -7)
     }
 
-    /// The first account in the Apple Accounts pane: where its "Sign in to your Apple Account" box is
-    /// with no account, 200 points in and 72 down, 490 × 66, on Xcode 27 ("Sign-in to an Apple Account",
-    /// 208 in, 52 down, 482 × 52, on Xcode 26), measured on both.
+    /// The first account in the Apple Accounts pane: 200 points in and 72 down, 490 × 52, on Xcode 27 (measured on
+    /// a signed-in Xcode 27.0, 2026-10-11; with no account its "Sign in to your Apple Account" box is 66 high there);
+    /// "Sign-in to an Apple Account", 208 in, 52 down, 482 × 52, on Xcode 26.
     static func accountRow(in w: CGRect, xcodeMajor: Int) -> CGRect {
-        let r = xcodeMajor >= 27 ? CGRect(x: 200, y: 72, width: 490, height: 66) : CGRect(x: 208, y: 52, width: 482, height: 52)
+        let r = xcodeMajor >= 27 ? CGRect(x: 200, y: 72, width: 490, height: 52) : CGRect(x: 208, y: 52, width: 482, height: 52)
         return r.offsetBy(dx: w.minX, dy: w.minY).insetBy(dx: -4, dy: -4)
+    }
+
+    /// The first team on an account's page in Xcode 27's Settings › Apple Accounts, under "Teams": 200 in, 229 down,
+    /// 490 × 52 (measured on a signed-in Xcode 27.0, 2026-10-11). Nil on Xcode 26, whose account page has the
+    /// buttons itself.
+    static func teamRow(in w: CGRect, xcodeMajor: Int) -> CGRect? {
+        guard xcodeMajor >= 27 else { return nil }
+        return CGRect(x: w.minX + 200, y: w.minY + 229, width: 490, height: 52).insetBy(dx: -4, dy: -4)
+    }
+
+    /// Download Manual Profiles on a team's page in Xcode 27's Settings › Apple Accounts, left of Manage
+    /// Certificates… under On Device Testing: 325 in, 362 down, 181 × 25 (measured on a signed-in Xcode 27.0,
+    /// 2026-10-11). Nil on Xcode 26, not measured off a real account there (CI can't sign in): the guide shows a
+    /// picture of it instead.
+    static func downloadProfilesButton(in w: CGRect, xcodeMajor: Int) -> CGRect? {
+        guard xcodeMajor >= 27 else { return nil }
+        return CGRect(x: w.minX + 325, y: w.minY + 362, width: 181, height: 25).insetBy(dx: -7, dy: -7)
     }
 
     /// Device Hub's +, at the top of its sidebar (measured on Xcode 27.0).
@@ -1035,6 +1095,9 @@ private struct GuideBubble: View {
             if guide.showsPicture, guide.job == .appStore {
                 AppStoreButtonMock(title: guide.updating ? "Update" : "Get")
             }
+            if guide.job == .refresh, guide.loadingTeam, guide.stage == .finish, guide.arrow == nil {
+                XcodeButtonMock(title: "Download Manual Profiles")
+            }
             if guide.showsPicture, guide.job == .keychain {
                 KeychainPromptArt()
                     .scaleEffect(0.8, anchor: .topLeading)
@@ -1076,7 +1139,7 @@ private struct GuideBubble: View {
     private var stages: [XcodeGuide.Stage] {
         switch guide.job {
         case .signIn: return [.open, .click, .finish]
-        case .refresh: return [.open, .click]
+        case .refresh: return guide.loadingTeam ? (x27 ? [.open, .click, .team, .finish] : [.open, .click, .finish]) : [.open, .click]
         case .signInAgain: return [.open, .click, .finish]
         case .pair: return x27 ? [.open, .click, .device, .finish] : [.open, .click, .finish]
         case .appStore: return guide.updating ? [.click, .finish] : [.click, .confirm, .finish]
@@ -1130,6 +1193,9 @@ private struct GuideBubble: View {
         case (.signIn, .open), (.refresh, .open), (.signInAgain, .open): return "Press these keys"
         case (.signIn, .click): return x27 ? "Click Sign In…" : "Click Add Apple Account…"
         case (.signIn, .finish): return "Sign in with your Apple Account"
+        case (.refresh, .click) where guide.loadingTeam: return "Click your Apple Account"
+        case (.refresh, .team): return "Click your team"
+        case (.refresh, .finish) where guide.loadingTeam: return "Click Download Manual Profiles"
         case (.refresh, _): return "Click your account"
         case (.signInAgain, .click): return "Click your Apple Account"
         case (.signInAgain, .finish): return guide.signingIn ? "Type your Apple Account password" : "Sign in again"
@@ -1155,6 +1221,11 @@ private struct GuideBubble: View {
         case (.signInAgain, .click): return "Then sign in again."
         case (.signInAgain, .finish): return guide.signingIn ? "Same as on your iPhone." : "Xcode asks for your Apple Account password."
         case (.signIn, .finish): return "Same as on your iPhone."
+        case (.refresh, .click) where guide.loadingTeam: return "Xcode opens your account's page."
+        case (.refresh, .team): return "Under Teams. Xcode opens its page."
+        case (.refresh, .finish) where guide.loadingTeam:
+            return x27 ? "Xcode then loads your team, and Glovebox carries on by itself."
+                : "It's on your account's page. Xcode then loads your team, and Glovebox carries on by itself."
         case (.refresh, _): return "Xcode checks your membership again."
         case (.pair, .open): return x27 ? nil : "First, on your Vision Pro, open Settings › General › Remote Devices."
         case (.pair, .finish) where guide.pairCode || !x27: return "It's on your Vision Pro. Type it here, on this Mac."
@@ -1188,12 +1259,33 @@ private struct GuideBubble: View {
     private var doneText: String {
         switch guide.job {
         case .signIn, .signInAgain: return "Signed in"
-        case .refresh: return "Membership found"
+        case .refresh: return guide.loadingTeam ? "Team found" : "Membership found"
         case .pair: return "Paired"
         case .appStore: return guide.updating ? "Updating" : "Downloading"
         case .setup: return "Xcode is ready"
         case .keychain: return "Allowed"
         }
+    }
+}
+
+/// A button in Xcode's settings as it looks there, for the one Glovebox can't point at.
+private struct XcodeButtonMock: View {
+    var title: String
+    @State private var on = false
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 13))
+            .foregroundStyle(Color(white: 0.1))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(.white)
+                .shadow(color: .black.opacity(0.25), radius: 0.5, y: 0.5))
+            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).inset(by: -4).stroke(Theme.accent, lineWidth: 2.5).opacity(on ? 1 : 0.45))
+            .padding(6)
+            .environment(\.colorScheme, .light)
+            .onAppear { withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { on = true } }
+            .accessibilityLabel("Xcode's \(title) button")
     }
 }
 
@@ -1390,10 +1482,11 @@ enum AppStoreLayout {
 #if DEBUG
 extension XcodeGuide {
     /// The bubble alone, at one stage, for screenshots.
-    func showForDemo(_ job: Job, stage: Stage, xcodeMajor: Int) {
+    func showForDemo(_ job: Job, stage: Stage, xcodeMajor: Int, loadingTeam: Bool = false) {
         self.job = job
         self.stage = stage
         self.xcodeMajor = xcodeMajor
+        self.loadingTeam = loadingTeam
         // Pointing up at Always Allow, as under macOS's window.
         if job == .keychain { arrowUpX = 94 + 51 }
         showPanel()

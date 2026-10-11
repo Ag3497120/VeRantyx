@@ -86,6 +86,7 @@ enum Tour {
                 // Apple's sign-in came and went (CI has no account to sign in to again).
                 model.guide.pretendSignedInAgain()
             case "setup": model.guide.start(.setup)
+            case "refresh": model.guide.start(.refresh)
             default: model.guide.start(.signIn)
             }
         case "start":
@@ -121,6 +122,10 @@ enum Tour {
             model.useAnotherSteamAccount()
         case "answer":
             model.setShareStutters(arg == "share")
+        case "teamload":
+            // The checks say Xcode hasn't loaded the team (on a Mac whose Xcode has), until "off" or a click on
+            // the guide's Download Manual Profiles ring: for recording that guide on a real signed-in Xcode.
+            teamNotLoaded = arg != "off"
         case "news":
             // The news card's No Thanks, for when accessibility can't press it.
             model.answerNews(signedUp: false)
@@ -159,6 +164,9 @@ enum Tour {
 
     /// The made-up answer to whether the game ran on the headset before (`ran`), nil for devicectl's.
     static var ran: Bool?
+
+    /// The team check reads "not loaded yet" whatever Xcode says (`teamload`).
+    static var teamNotLoaded = false
 
     /// Install's card as last drawn, and how many times SwiftUI asked for it (with allowingSigning then).
     static var card = "-"

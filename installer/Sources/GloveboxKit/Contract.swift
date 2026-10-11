@@ -309,7 +309,7 @@ extension EngineEvent {
         case (.xcode, .openApp?): return "xcode-first-launch"
         case (.visionOS, _): return "visionos-missing"
         case (.team, .openURL?): return "team-free-only"
-        case (.team, .openApp?): return "apple-account-missing"
+        case (.team, .openApp?): return label.contains("team") ? "apple-team-not-loaded" : "apple-account-missing"
         default: return "\(id.rawValue)-missing"
         }
     }
