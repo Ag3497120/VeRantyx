@@ -23,15 +23,30 @@ There are **two versions**, on their own branches:
 Both versions share the Mac HEVC encoder (`MacEncoder/`) and the Vision Pro
 app (`VisionProClient/`).
 
+### Native version (Linux ARM64 build, no Wine) — recorded 2026-10-11
+
+![Native version: Half-Life: Alyx (Linux ARM64 build) running natively on a MacBook Pro, played in Apple Vision Pro — hands, gravity gloves, a pistol, and the Joy-Con at the end](docs/media/native-highlight.gif)
+
+<!-- NATIVE YOUTUBE: replace docs/media/native-highlight.mp4 in the link below
+     with the YouTube URL once the full recording is uploaded. -->
+[![Native version — watch the recording](docs/media/native-poster.jpg)](docs/media/native-highlight.mp4)
+
+*Native version, 50-second highlight: [docs/media/native-highlight.mp4](docs/media/native-highlight.mp4).
+The room and the VeRantyx app through the passthrough, hands in Russell's lab,
+gravity gloves (pulling and catching), then the pistol and the Joy-Con on the
+desk at the end. 60 fps on an M1 Max. Full recording: YouTube link coming soon.*
+
+### Wine version (Windows build + SteamVR under Wine) — recorded 2026-10-10
+
 <!-- VIDEO: after uploading docs/media/highlight.mp4 through the README editor
      on github.com, replace the poster link below with the generated
      https://github.com/user-attachments/... URL on its own line; GitHub then
      renders a player. -->
-![Half-Life: Alyx in Apple Vision Pro, rendered on a MacBook Pro (54-second highlight; the last seconds show the room through the headset's passthrough)](docs/media/highlight.gif)
+![Wine version: Half-Life: Alyx in Apple Vision Pro, rendered on a MacBook Pro (54-second highlight; the last seconds show the room through the headset's passthrough)](docs/media/highlight.gif)
 
-[![Watch the full recording on YouTube](docs/media/poster.jpg)](https://youtu.be/6xVGgdChDes)
+[![Wine version — watch the full recording on YouTube](docs/media/poster.jpg)](https://youtu.be/6xVGgdChDes)
 
-*54-second highlight: [docs/media/highlight.mp4](docs/media/highlight.mp4) — the last seconds show the room through the Vision Pro's passthrough, where it was recorded. Full 6-minute unedited recording: https://youtu.be/6xVGgdChDes.*
+*Wine version, 54-second highlight: [docs/media/highlight.mp4](docs/media/highlight.mp4) — the last seconds show the room through the Vision Pro's passthrough, where it was recorded. Full 6-minute unedited recording of the Wine version: https://youtu.be/6xVGgdChDes.*
 
 MIT licensed. No proprietary code is included (see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)): Wine, DXVK and Steam are
