@@ -218,7 +218,11 @@ void eye_crop(int eye, float *u0, float *u1, float *v0, float *v1) {
     const float uw = U[1] - U[0], vh = U[3] - U[2];
     if (uw <= 0 || vh <= 0) return;
     *u0 = (t[0] - U[0]) / uw; *u1 = (t[1] - U[0]) / uw;     // tangent x grows to the right
-    *v0 = (t[2] - U[2]) / vh; *v1 = (t[3] - U[2]) / vh;     // top (negative) is row 0
+    // Rows: OpenVR names the tangents from the clipped plane, so image row 0
+    // is the t[3] ("bottom") edge — measured: a frame rendered with an
+    // asymmetric frustum matches the wide one cropped this way (NCC 0.95 vs
+    // 0.74 the other way round).
+    *v0 = (U[3] - t[3]) / vh; *v1 = (U[3] - t[2]) / vh;
 }
 
 void init(const char *gameDir) {
