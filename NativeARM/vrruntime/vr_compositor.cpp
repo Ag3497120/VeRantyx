@@ -8,6 +8,10 @@
 #include <vector>
 #include <algorithm>
 #include <mutex>
+#include <pthread.h>
+#include <deque>
+#include <condition_variable>
+#include <thread>
 #include <dlfcn.h>
 #include <unistd.h>
 #define VK_NO_PROTOTYPES
@@ -45,6 +49,19 @@ struct Readback {
     VkCommandPool pool = VK_NULL_HANDLE; VkCommandBuffer cmd = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE;
     struct Staging { VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; void *map = nullptr; size_t cap = 0; uint32_t w = 0, h = 0; VkFormat fmt = VK_FORMAT_UNDEFINED; bool ready = false; bool coherent = true; };
     Staging eye[2];
+    // Asynchronous readback: two slots used in turn. The game thread records
+    // and submits the copies; a worker waits for the slot's fence, converts
+    // and publishes, then frees the slot. The game never waits for its GPU.
+    struct Slot {
+        Staging eye[2];
+        VkCommandBuffer cmd[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        VkFence fence = VK_NULL_HANDLE;
+        bool flip[2] = { false, false };
+        float head[16] = {};
+        double visionTimestamp = 0;
+        int state = 0;                       // 0 free, 1 eye 0 submitted, 2 in flight (worker's)
+    };
+    Slot slot[2];
     bool ok = false;
     unsigned failures = 0;
 
@@ -79,6 +96,11 @@ struct Readback {
         if (pAllocateCommandBuffers(dev, &cai, &cmd) != VK_SUCCESS) { vrrt::log("readback: command buffer failed"); return false; }
         VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, 0 };
         if (pCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS) { vrrt::log("readback: fence failed"); return false; }
+        for (Slot &sl : slot) {
+            VkCommandBufferAllocateInfo c2 = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2 };
+            if (pAllocateCommandBuffers(dev, &c2, sl.cmd) != VK_SUCCESS) { vrrt::log("readback: slot command buffers failed"); return false; }
+            if (pCreateFence(dev, &fci, nullptr, &sl.fence) != VK_SUCCESS) { vrrt::log("readback: slot fence failed"); return false; }
+        }
         ok = true;
         vrrt::log("readback: Vulkan device %p queue %p (family %u) ready", (void *)dev, (void *)queue, qfi);
         return true;
@@ -106,6 +128,47 @@ struct Readback {
         if (pBindBufferMemory(dev, s.buf, s.mem, 0) != VK_SUCCESS) return false;
         if (pMapMemory(dev, s.mem, 0, VK_WHOLE_SIZE, 0, &s.map) != VK_SUCCESS) return false;
         s.cap = bytes; s.w = w; s.h = h; s.fmt = fmt; s.ready = true; s.coherent = coherent;
+        return true;
+    }
+
+    // Record and submit the copy of one eye into a slot; eye 1 signals the
+    // slot's fence (which also covers eye 0, submitted earlier on the queue).
+    bool record(Slot &sl, int eyeIndex, VkImage image, uint32_t x, uint32_t y, uint32_t w, uint32_t h, VkFormat fmt, uint32_t bpp, uint32_t layer) {
+        Staging &s = sl.eye[eyeIndex];
+        if (!ensure_staging(s, (size_t)w * h * bpp, w, h, fmt)) return false;
+        VkCommandBuffer c = sl.cmd[eyeIndex];
+        VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr };
+        pResetCommandBuffer(c, 0);
+        if (pBeginCommandBuffer(c, &bi) != VK_SUCCESS) return false;
+        VkImageMemoryBarrier bar = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1 } };
+        pCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
+        VkBufferImageCopy region = {};
+        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1 };
+        region.imageOffset = { (int32_t)x, (int32_t)y, 0 };
+        region.imageExtent = { w, h, 1 };
+        pCmdCopyImageToBuffer(c, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.buf, 1, &region);
+        // The game's next frame renders into this image: it must wait for the
+        // read (write-after-read), and the copy must be visible to the host.
+        VkImageMemoryBarrier after = bar;
+        after.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        after.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        VkMemoryBarrier host = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
+        pCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                            0, 1, &host, 0, nullptr, 1, &after);
+        if (pEndCommandBuffer(c) != VK_SUCCESS) return false;
+        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &c, 0, nullptr };
+        VkFence f = VK_NULL_HANDLE;
+        if (eyeIndex == 1) { f = sl.fence; pResetFences(dev, 1, &f); }
+        return pQueueSubmit(queue, 1, &si, f) == VK_SUCCESS;
+    }
+    // Worker side: wait for a slot's copies.
+    bool wait(Slot &sl) {
+        if (pWaitForFences(dev, 1, &sl.fence, VK_TRUE, 2000000000ull) != VK_SUCCESS) return false;
+        for (Staging &s : sl.eye)
+            if (!s.coherent) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, s.mem, 0, VK_WHOLE_SIZE }; pInvalidateMappedMemoryRanges(dev, 1, &r); }
         return true;
     }
 
@@ -230,6 +293,14 @@ public:
     EVRCompositorTimingMode m_timing = VRCompositorTimingMode_Implicit;
     HmdColor_t m_fade = { 0, 0, 0, 0 };
     Readback m_rb;
+    // Asynchronous publishing (Readback::Slot): VERANTYX_SYNC_READBACK=1 restores
+    // the old copy-and-wait path.
+    int m_slot = 0;
+    std::mutex m_wmu;
+    std::condition_variable m_wcv;
+    std::thread m_worker;
+    std::deque<int> m_pending;               // slots in flight, in order
+    bool m_async = getenv("VERANTYX_SYNC_READBACK") == nullptr || strcmp(getenv("VERANTYX_SYNC_READBACK"), "1") != 0;
     bool m_eyeDone[2] = { false, false };
     bool m_eyeFlip[2] = { false, false };
     unsigned m_submits = 0, m_published = 0, m_skipped = 0;
@@ -246,8 +317,18 @@ public:
             else { memset(&arr[i], 0, sizeof arr[i]); arr[i].eTrackingResult = TrackingResult_Uninitialized; }
         }
     }
+    // Frame timing, reported with the 5 s compositor line: how long the game
+    // works between WaitGetPoses calls, how long it waits for the virtual
+    // vsync, and what the readback and conversion cost.
+    double m_tWaitEnd = 0, m_sumWork = 0, m_sumWait = 0, m_sumReadback = 0, m_sumConvert = 0, m_maxWork = 0;
+    uint32_t m_nFrames = 0, m_nReadback = 0, m_nConvert = 0;
+
     EVRCompositorError WaitGetPoses(TrackedDevicePose_t *render, uint32_t nr, TrackedDevicePose_t *game, uint32_t ng) override {
+        const double t0 = vrrt::now_seconds();
+        if (m_tWaitEnd > 0) { double wk = t0 - m_tWaitEnd; m_sumWork += wk; if (wk > m_maxWork) m_maxWork = wk; m_nFrames++; }
         vrrt::wait_next_vsync();
+        m_tWaitEnd = vrrt::now_seconds();
+        m_sumWait += m_tWaitEnd - t0;
         vrrt::PoseSet set;
         vrrt::sample_poses(&set, 0.0);
         vrrt::set_last_poses(set);
@@ -339,7 +420,11 @@ public:
         x1 = std::min(x1, d->m_nWidth); y1 = std::min(y1, d->m_nHeight);
         if (x1 <= x || y1 <= y) return VRCompositorError_InvalidBounds;
         const int e = eye == Eye_Left ? 0 : 1;
-        if (!m_rb.copy(e, (VkImage)d->m_nImage, x, y, x1 - x, y1 - y, (VkFormat)d->m_nFormat, bpp, layer)) {
+        if (m_async) return submit_async(e, d, x, y, x1 - x, y1 - y, bpp, layer, flip);
+        const double tr0 = vrrt::now_seconds();
+        const bool copied = m_rb.copy(e, (VkImage)d->m_nImage, x, y, x1 - x, y1 - y, (VkFormat)d->m_nFormat, bpp, layer);
+        m_sumReadback += vrrt::now_seconds() - tr0; m_nReadback++;
+        if (!copied) {
             m_rb.failures++; m_skipped++;
             if (m_rb.failures <= 3) vrrt::log("Submit: readback of eye %d failed", e);
             return VRCompositorError_None;
@@ -348,24 +433,83 @@ public:
         if (e == 1 && m_eyeDone[0]) publish();
         return VRCompositorError_None;
     }
+    EVRCompositorError submit_async(int e, const VRVulkanTextureData_t *d, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                    uint32_t bpp, uint32_t layer, bool flip) {
+        Readback::Slot &sl = m_rb.slot[m_slot];
+        const double tr0 = vrrt::now_seconds();
+        if (e == 0) {
+            int st; { std::lock_guard<std::mutex> l(m_wmu); st = sl.state; }
+            if (st == 2) { m_skipped++; return VRCompositorError_None; }   // worker still busy with it: drop this frame
+            sl.state = 0;
+        } else if (sl.state != 1) {
+            return VRCompositorError_None;   // eye 0 was dropped or failed
+        }
+        if (!m_rb.record(sl, e, (VkImage)d->m_nImage, x, y, w, h, (VkFormat)d->m_nFormat, bpp, layer)) {
+            m_rb.failures++; m_skipped++; sl.state = 0;
+            if (m_rb.failures <= 3) vrrt::log("Submit: readback of eye %d failed", e);
+            return VRCompositorError_None;
+        }
+        m_sumReadback += vrrt::now_seconds() - tr0; m_nReadback++;
+        sl.flip[e] = flip;
+        if (e == 0) { sl.state = 1; return VRCompositorError_None; }
+        const vrrt::PoseSet &set = vrrt::last_poses();
+        memcpy(sl.head, set.headTransform, sizeof sl.head);
+        sl.visionTimestamp = set.visionTimestamp;
+        {
+            std::lock_guard<std::mutex> l(m_wmu);
+            sl.state = 2;
+            m_pending.push_back(m_slot);
+            if (!m_worker.joinable()) m_worker = std::thread([this] { worker(); });
+        }
+        m_wcv.notify_one();
+        m_slot ^= 1;
+        return VRCompositorError_None;
+    }
+    void worker() {
+        pthread_setname_np("vrrt-readback");
+        for (;;) {
+            int idx;
+            {
+                std::unique_lock<std::mutex> l(m_wmu);
+                m_wcv.wait(l, [this] { return !m_pending.empty(); });
+                idx = m_pending.front(); m_pending.pop_front();
+            }
+            Readback::Slot &sl = m_rb.slot[idx];
+            if (m_rb.wait(sl)) publish_from(sl.eye[0], sl.eye[1], sl.flip, sl.head, sl.visionTimestamp, true);
+            else { m_skipped++; vrrt::log("readback: copy did not finish in 2 s"); }
+            std::lock_guard<std::mutex> l(m_wmu);
+            sl.state = 0;
+        }
+    }
     void publish() {
-        const Readback::Staging &L = m_rb.eye[0], &R = m_rb.eye[1];
+        const vrrt::PoseSet &set = vrrt::last_poses();
+        publish_from(m_rb.eye[0], m_rb.eye[1], m_eyeFlip, set.headTransform, set.visionTimestamp, set.fresh);
+        m_eyeDone[0] = m_eyeDone[1] = false;
+    }
+    void publish_from(const Readback::Staging &L, const Readback::Staging &R, const bool *flips, const float *head, double visionTs, bool) {
         const uint32_t ew = std::max(L.w, R.w), h = std::max(L.h, R.h), w = ew * 2;
         uint32_t idx;
         uint8_t *dst = vrrt::frame_begin(w, h, &idx);
         if (!dst) { m_skipped++; return; }
         uint32_t fmt = 28;
-        convert_eye(L, dst, w * 4, 0, m_eyeFlip[0], &fmt, ew, h);
-        convert_eye(R, dst, w * 4, ew, m_eyeFlip[1], &fmt, ew, h);
-        const vrrt::PoseSet &set = vrrt::last_poses();
-        vrrt::frame_publish(idx, w, h, fmt, set.headTransform, set.visionTimestamp);
-        m_eyeDone[0] = m_eyeDone[1] = false;
+        const double tc0 = vrrt::now_seconds();
+        convert_eye(L, dst, w * 4, 0, flips[0], &fmt, ew, h);
+        convert_eye(R, dst, w * 4, ew, flips[1], &fmt, ew, h);
+        m_sumConvert += vrrt::now_seconds() - tc0; m_nConvert++;
+        vrrt::frame_publish(idx, w, h, fmt, head, visionTs);
         m_published++;
+        const vrrt::PoseSet &set = vrrt::last_poses();
         double now = vrrt::now_seconds();
         if (now - m_lastReport > 5.0) {
             m_lastReport = now;
-            vrrt::log("compositor: %u submits, %u eye pairs published (%ux%u, format %u), %u skipped, headset %s",
-                      m_submits, m_published, w, h, fmt, m_skipped, set.fresh ? "tracking" : "absent");
+            vrrt::log("compositor: %u submits, %u eye pairs published (%ux%u, format %u), %u skipped, headset %s%s",
+                      m_submits, m_published, w, h, fmt, m_skipped, set.fresh ? "tracking" : "absent", m_async ? ", async readback" : "");
+            if (m_nFrames) {
+                vrrt::log("frame timing: game work %.1f ms avg (max %.1f), vsync wait %.1f ms, readback %.2f ms/eye (game thread), convert %.2f ms/pair",
+                          1000.0 * m_sumWork / m_nFrames, 1000.0 * m_maxWork, 1000.0 * m_sumWait / m_nFrames,
+                          m_nReadback ? 1000.0 * m_sumReadback / m_nReadback : 0.0, m_nConvert ? 1000.0 * m_sumConvert / m_nConvert : 0.0);
+                m_sumWork = m_sumWait = m_sumReadback = m_sumConvert = m_maxWork = 0; m_nFrames = m_nReadback = m_nConvert = 0;
+            }
         }
     }
     void ClearLastSubmittedFrame() override {}

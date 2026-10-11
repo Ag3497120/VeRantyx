@@ -83,11 +83,24 @@ without a fault. Fixed on the way:
   guest now gets glibc's struct layout wrapping the Darwin locale.
 - 4 KB commits inside reservations (Panorama) failed on 16 KB pages; widened.
 
-Open: each eye shows content only in its left 1289 of 1632 columns (the rest
-is black/magenta) although Submit bounds are 0..1 — the render viewport vs
-texture size needs matching; "Attempting to purge m_fencedResourceList"
-warnings; synchronous readback limits fps; MacEncoder/headset path and input
-not yet exercised with the native build.
+Later the same day:
+
+- Right eye: Source 2's ARM (Deckard) path sizes the eye texture for the union
+  of both frusta but draws every eye with the left eye's range at the left of
+  it. The runtime now gives both eyes the union frustum and cuts each eye's
+  own range back out (`VERANTYX_SHARED_FRUSTUM=0` to disable). Both eyes full,
+  1298x1056 each, right eye correct.
+- Readback is asynchronous (two slots, worker thread; `VERANTYX_SYNC_READBACK=1`
+  for the old path): the game thread went from 26 ms to 4.5 ms per frame.
+  Menu: steady 60 fps at the 60 Hz virtual display; ~69 fps at
+  `VERANTYX_DISPLAY_HZ=90` (Wine path on the same Mac: ~30 fps).
+- `blr x18` veneer no longer uses the real x18 (kernel race crashed libmpg123).
+- `scripts/launch_native_vr.sh` runs MacEncoder + the game; the encoder takes
+  `VERANTYX_SHARED_FRAME`. Encoder verified at the game's rate (no headset).
+
+Open: playing with the headset (poses, Joy-Con/hand input through the
+bindings) not yet tried; "Attempting to purge m_fencedResourceList" warnings;
+in-level performance unmeasured.
 
 Run: `build/host/alyx_host --libdir build/guest/lib --game ~/Verantyx_VR_Drive/alyx_linux -- -vr -steam -noasserts -nopassiveasserts +map startup -vulkan -nowindow`
 (`VERANTYX_BENCH=1` synthesises poses without a headset; `VERANTYX_SHARED_FRAME`
