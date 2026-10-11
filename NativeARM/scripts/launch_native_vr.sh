@@ -55,6 +55,23 @@ done
 sleep 1
 pkill -KILL -f "$ENCODER" 2>/dev/null || true
 
+# Picture quality: VERANTYX_QUALITY=standard (default) | high | ultra.
+#   standard  ~1.0 MP rendered per eye, 1920x1080 HEVC stream, 20 Mbps
+#   high      ~2.2 MP per eye,          2880x1620 stream,      40 Mbps
+#   ultra     ~4.0 MP per eye (≈3K),    3840x2160 stream,      70 Mbps
+# Measured on an M1 Max (menu, no headset): standard 60 fps; high ~39 fps
+# (1982x1536 per eye); ultra ~20 fps and the encoder produced no frames at
+# that size — ultra is for faster Macs and is unverified.
+# The engine's auto-fidelity still lowers its own render scale when the GPU
+# cannot keep up; the stream size and bitrate are what the headset receives.
+# Any of the variables set explicitly wins over the preset.
+case "${VERANTYX_QUALITY:-standard}" in
+    high)  : "${VERANTYX_EYE_PIXELS:=2200000}" "${VERANTYX_STREAM_WIDTH:=2880}" "${VERANTYX_STREAM_HEIGHT:=1620}" "${VERANTYX_BITRATE_MBPS:=40}" ;;
+    ultra) : "${VERANTYX_EYE_PIXELS:=4000000}" "${VERANTYX_STREAM_WIDTH:=3840}" "${VERANTYX_STREAM_HEIGHT:=2160}" "${VERANTYX_BITRATE_MBPS:=70}" ;;
+    *) ;;
+esac
+export VERANTYX_EYE_PIXELS VERANTYX_STREAM_WIDTH VERANTYX_STREAM_HEIGHT VERANTYX_BITRATE_MBPS 2>/dev/null || true
+
 if [[ "${VERANTYX_MAC_PROFILE:-1}" == "1" ]]; then
     eval "$("$REPO_ROOT/scripts/mac_profile.sh")"
 fi

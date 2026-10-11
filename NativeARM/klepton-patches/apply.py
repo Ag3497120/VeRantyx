@@ -36,8 +36,8 @@ def patch(relpath, edits):
         print(f"already  {relpath}")
 
 
-for name in ("kl_tls.h", "kl_tls.c", "kl_tls.S"):
-    src = os.path.join(HERE, "runtime", name)
+for name in ("kl_tls.h", "kl_tls.c", "kl_tls.S", "gfx/kl_vk_async.inc"):
+    src = os.path.join(HERE, "runtime", os.path.basename(name))
     dst = os.path.join(ROOT, "runtime", name)
     if not os.path.exists(dst) or open(src, "rb").read() != open(dst, "rb").read():
         shutil.copyfile(src, dst)
@@ -827,5 +827,32 @@ patch("runtime/libc/kl_libc.c", [
         }
     }
 """, "before", "topology/core_id"),
+])
+# ---- kl_vulkan.c: asynchronous graphics pipelines (runtime/gfx/kl_vk_async.inc)
+patch("runtime/gfx/kl_vulkan.c", [
+    ("static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,\n",
+     "#include \"kl_vk_async.inc\"\n\n", "before", '#include "kl_vk_async.inc"'),
+    ("    double t0 = kl_pipe_ms();\n    VkResult r = real ? real(dev, cache, n, use, alloc, out)\n",
+     "    if (kva_create(dev, n, use, out, real)) { free(mod); free(ias); g_pipe_gfx += n; return VK_SUCCESS; }\n",
+     "before", "if (kva_create(dev, n, use, out, real))"),
+    ("        real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, \"vkCmdBindPipeline\");\n",
+     "    {   // async pipelines: a placeholder still compiling binds nothing (draws skipped)\n"
+     "        uint64_t b = kva_bind(cb, bindPoint, pipeline);\n"
+     "        if (!b && pipeline && kva_of(pipeline)) return;\n"
+     "        pipeline = b;\n"
+     "    }\n",
+     "after", "uint64_t b = kva_bind(cb, bindPoint, pipeline);"),
+    ("        real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, \"vkCmdDrawIndexed\");\n",
+     "    if (kva_skip(cb)) return;\n", "after", "    if (kva_skip(cb)) return;\n    // KL_VK_DRAW_GUARD"),
+    ("    klvk_cb_set_idx(cb, 0);\n    return real ? real(cb, bi) : VK_ERROR_INITIALIZATION_FAILED;\n",
+     "    kva_set_skip(cb, 0);\n", "before", "    kva_set_skip(cb, 0);\n    klvk_cb_set_idx"),
+    ("    E(CreateGraphicsPipelines), E(CreateComputePipelines),\n",
+     "    E(CmdDraw), E(CmdDrawIndirect), E(CmdDrawIndexedIndirect),\n"
+     "    E(CmdDrawIndirectCount), E(CmdDrawIndexedIndirectCount),\n"
+     "    { \"vkCmdDrawIndirectCountKHR\", (PFN_vkVoidFunction)klvk_CmdDrawIndirectCount },\n"
+     "    { \"vkCmdDrawIndexedIndirectCountKHR\", (PFN_vkVoidFunction)klvk_CmdDrawIndexedIndirectCount },\n"
+     "    E(DestroyPipeline), E(DestroyShaderModule), E(DestroyPipelineLayout),\n"
+     "    E(DestroyRenderPass), E(DestroyDescriptorSetLayout),\n",
+     "after", "E(DestroyPipeline), E(DestroyShaderModule)"),
 ])
 print("done")

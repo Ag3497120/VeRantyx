@@ -151,6 +151,11 @@ int main(int argc, char **argv) {
     // compile over more threads (macOS 13.3+). VERANTYX_MVK_DEFAULTS=0 skips.
     if (!getenv("VERANTYX_MVK_DEFAULTS") || strcmp(getenv("VERANTYX_MVK_DEFAULTS"), "0") != 0)
         setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+    // ...and take those compiles off the render thread: an object whose
+    // pipeline is still compiling is drawn a few frames late instead of the
+    // frame freezing (Klepton kl_vk_async.inc). VERANTYX_ASYNC_PIPELINES=0 off.
+    if (!getenv("VERANTYX_ASYNC_PIPELINES") || strcmp(getenv("VERANTYX_ASYNC_PIPELINES"), "0") != 0)
+        setenv("KL_VK_ASYNC_PIPELINES", "1", 0);
     kl_glibc_install(argv[0]);
     kl_set_library_path(g_libdir);
     kl_thread_init();
