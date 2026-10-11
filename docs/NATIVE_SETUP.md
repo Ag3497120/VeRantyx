@@ -103,6 +103,13 @@ Logs: `logs/native/alyx_host.log`, `logs/native/hardware-encoder.log`.
 - A short stall the first time a new material appears: the shader is being
   compiled (in the background since the async pipelines); the second time it
   is cached by macOS.
+- The frame rate falls to about 9 fps and stays there: check whether the
+  headset was taken off during a level change. After loading the next map the
+  game holds its loading screen, sleeping 100 ms a frame, until the headset is
+  worn again; it returns to normal a few seconds after you put it back on.
+- The frame rate stays below 20 fps while you wear the headset: the launcher
+  records what the game is doing to `logs/native/slow-<time>.txt` (and a
+  `.sample.txt` beside it); include those and `alyx_host.log` in a report.
 - The game exits with "Timed out waiting for response from Mongoose": update
   to the current runtime (the stand-in for SteamVR's level-transition service
   answers it).
