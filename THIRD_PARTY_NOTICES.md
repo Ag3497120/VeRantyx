@@ -2,8 +2,8 @@
 
 All code in this repository was written for VeRantyx, with these exceptions:
 
-- `VRDriver/include/openvr.h`, `VRDriver/include/openvr_driver.h` and
-  `NativeARM/vrruntime/openvr/` are the OpenVR SDK headers, Copyright (c)
+- `NativeARM/vrruntime/openvr/` (and, on the `wine` branch,
+  `VRDriver/include/openvr.h` / `openvr_driver.h`) are the OpenVR SDK headers, Copyright (c)
   Valve Corporation, used under the BSD-3-Clause license
   (https://github.com/ValveSoftware/openvr). They are needed to compile the
   SteamVR driver, the OpenVR capture proxy and the native OpenVR runtime.

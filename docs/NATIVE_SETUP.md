@@ -99,7 +99,7 @@ Logs: `logs/native/alyx_host.log`, `logs/native/hardware-encoder.log`.
 
 - *"macOS Steam is not running"*: start Steam.app and sign in first.
 - *"The Wine version's encoder is running"*: stop the Wine version with
-  `scripts/stop_wine_vr.sh` (on `main` / `wine`).
+  `scripts/stop_wine_vr.sh` on the `main` or `wine` branch.
 - A short stall the first time a new material appears: the shader is being
   compiled (in the background since the async pipelines); the second time it
   is cached by macOS.
