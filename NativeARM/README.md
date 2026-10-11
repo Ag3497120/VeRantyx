@@ -128,3 +128,15 @@ picks the frame file the Mac encoder reads; `--probe lib.so` reports imports).
   CoreAudio link fix, build `klepton-ld`
 - `scripts/translate_alyx.sh` — run `klepton-ld` over every ARM64 library
 - `tools/census.py` — dependency / symbol / relocation census
+
+## Third-party code
+
+- `vrruntime/hand_skeleton_alvr.inc`: OpenVR hand-skeleton bone poses for a
+  Touch-style grip, taken unchanged from ALVR
+  (`alvr/server_openvr/cpp/alvr_server/Controller.cpp`,
+  https://github.com/alvr-org/ALVR), MIT license (text in the file). Used by
+  `vrruntime/vr_skeleton.cpp` to give the game finger data (SteamVR does this
+  for Touch controllers in the Wine path; there is no SteamVR here).
+- Klepton (https://github.com/shinyquagsire23/Klepton), MIT, fetched and
+  patched by `scripts/fetch_klepton.sh` / `klepton-patches/apply.py`.
+- OpenVR headers (`vrruntime/openvr/`), BSD-3-Clause (Valve), see LICENSE there.

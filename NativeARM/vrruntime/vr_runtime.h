@@ -115,6 +115,10 @@ struct PoseSet {
     double visionTimestamp;
     SharedHands hands;                       // the inputs that came with it
     bool fresh;                              // headset data newer than 500 ms
+    // Packets still arriving (newer than 500 ms) whether or not the head is
+    // tracked this instant: Joy-Con buttons/sticks and hand poses follow this,
+    // so a head-tracking blink no longer zeroes every input.
+    bool inputsFresh;
 };
 void sample_poses(PoseSet *out, double predictSeconds);
 const PoseSet &last_poses();                 // as handed out by the last WaitGetPoses

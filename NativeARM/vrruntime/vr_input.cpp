@@ -3,6 +3,7 @@
 // Joy-Con/hand data the Vision Pro app sends.
 #include "gen_stubs.h"
 #include "vr_runtime.h"
+#include "vr_skeleton.h"
 #include "json_mini.h"
 #include <cstring>
 #include <cmath>
@@ -179,8 +180,8 @@ public:
         HandState s = {};
         const vrrt::SharedHands &h = m_snapshot.hands;
         const bool left = hand == 0;
-        s.present = m_snapshot.fresh && (left ? h.leftTracked : h.rightTracked);
-        if (!m_snapshot.fresh) return s;
+        s.present = m_snapshot.inputsFresh && (left ? h.leftTracked : h.rightTracked);
+        if (!m_snapshot.inputsFresh) return s;
         s.trigger = (left ? h.leftTrigger : h.rightTrigger) / 255.f;
         s.grip = (left ? h.leftGrip : h.rightGrip) / 255.f;
         s.stickX = left ? h.leftStickX : h.rightStickX; s.stickY = left ? h.leftStickY : h.rightStickY;
@@ -263,6 +264,37 @@ public:
             if (a.type != AT_Boolean) a.state = a.x != 0 || a.y != 0;
             if (a.state != a.prevState || a.x != a.px || a.y != a.py) a.updateTime = now;
         }
+        report_inputs(now);
+    }
+
+    // Every 5 s: what the headset sends per hand, which sets the game has
+    // active, and the grab-related actions — enough to tell a missing input
+    // from a binding that does not fire.
+    double m_lastInputReport = 0;
+    void report_inputs(double now) {
+        if (now - m_lastInputReport < 5.0) return;
+        m_lastInputReport = now;
+        std::string sets;
+        for (auto &s : m_sets) if (s.active) { if (!sets.empty()) sets += ","; sets += s.name.substr(s.name.rfind('/') + 1); }
+        for (int hand = 0; hand < 2; hand++) {
+            HandState h = hand_state(hand);
+            vrrt::log("input %s: fresh %d tracked %d trigger %.2f grip %.2f stick (%.2f,%.2f) A/X %d B/Y %d click %d touch %d menu %d",
+                      hand ? "right" : "left", (int)m_snapshot.inputsFresh, (int)h.present, h.trigger, h.grip, h.stickX, h.stickY,
+                      h.primary, h.secondary, h.stickClick, h.stickTouch, h.menu);
+        }
+        std::string acts;
+        for (auto &a : m_actions) {
+            const std::string &n = a.name;
+            if (n.find("/use") != std::string::npos || n.find("handcurl") != std::string::npos || n.find("gglock") != std::string::npos ||
+                n.find("teleport") != std::string::npos || n.find("continuousturn") != std::string::npos || n.find("walk") != std::string::npos) {
+                char buf[160];
+                snprintf(buf, sizeof buf, " %s=%s%s", n.substr(n.find("/in/") + 4).c_str(),
+                         a.active ? (a.type == AT_Boolean ? (a.state ? "on" : "off") : "") : "inactive",
+                         a.active && a.type != AT_Boolean ? (std::to_string(a.x).substr(0, 4) + "," + std::to_string(a.y).substr(0, 4)).c_str() : "");
+                acts += buf;
+            }
+        }
+        vrrt::log("input sets [%s]%s", sets.c_str(), acts.c_str());
     }
 
     // ---- IVRInput ----
@@ -347,23 +379,86 @@ public:
     }
     EVRInputError GetPoseActionDataRelativeToNow(VRActionHandle_t h, ETrackingUniverseOrigin, float, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t r) override { return pose_data(h, d, size, r); }
     EVRInputError GetPoseActionDataForNextFrame(VRActionHandle_t h, ETrackingUniverseOrigin, InputPoseActionData_t *d, uint32_t size, VRInputValueHandle_t r) override { return pose_data(h, d, size, r); }
+    // ---- skeletal input: fingers from pinch/fist/thumb (vr_skeleton.cpp) ----
+    vrrt::SkeletonState m_skel[2];
+    int skeleton_hand(VRActionHandle_t h) {
+        Action *a = action_from_handle(h);
+        if (!a || a->type != AT_Skeleton) return -1;
+        for (auto &b : a->bindings) if (b.hand >= 0) return b.hand;
+        return a->name.find("left") != std::string::npos || a->name.find("Left") != std::string::npos ? 0 : 1;
+    }
+    vrrt::FingerInputs finger_inputs(int hand) const {
+        HandState st = hand_state(hand);
+        vrrt::FingerInputs in;
+        in.trigger = st.trigger;
+        in.grip = st.grip;
+        in.indexTouch = st.trigger > 0.05f;
+        in.thumbTouch = st.primary || st.secondary || st.stickTouch || st.grip > 0.6f;
+        return in;
+    }
     EVRInputError GetSkeletalActionData(VRActionHandle_t h, InputSkeletalActionData_t *d, uint32_t size) override {
         std::lock_guard<std::mutex> l(m_mu);
         Action *a = action_from_handle(h);
         if (!a) return VRInputError_InvalidHandle;
-        InputSkeletalActionData_t out = {}; out.bActive = false; out.activeOrigin = k_ulInvalidInputValueHandle;
+        InputSkeletalActionData_t out = {};
+        int hand = skeleton_hand(h);
+        out.bActive = a->active && hand >= 0;
+        out.activeOrigin = out.bActive ? origin_for(hand) : k_ulInvalidInputValueHandle;
         memcpy(d, &out, std::min<uint32_t>(size, sizeof out));
         return VRInputError_None;
     }
     EVRInputError GetDominantHand(ETrackedControllerRole *r) override { *r = m_dominant; return VRInputError_None; }
     EVRInputError SetDominantHand(ETrackedControllerRole r) override { m_dominant = r; return VRInputError_None; }
-    EVRInputError GetBoneCount(VRActionHandle_t, uint32_t *n) override { *n = 0; return VRInputError_NoData; }
-    EVRInputError GetBoneHierarchy(VRActionHandle_t, BoneIndex_t *, uint32_t) override { return VRInputError_NoData; }
-    EVRInputError GetBoneName(VRActionHandle_t, BoneIndex_t, char *b, uint32_t n) override { if (b && n) b[0] = 0; return VRInputError_NoData; }
-    EVRInputError GetSkeletalReferenceTransforms(VRActionHandle_t, EVRSkeletalTransformSpace, EVRSkeletalReferencePose, VRBoneTransform_t *, uint32_t) override { return VRInputError_NoData; }
-    EVRInputError GetSkeletalTrackingLevel(VRActionHandle_t, EVRSkeletalTrackingLevel *lvl) override { *lvl = VRSkeletalTracking_Estimated; return VRInputError_NoData; }
-    EVRInputError GetSkeletalBoneData(VRActionHandle_t, EVRSkeletalTransformSpace, EVRSkeletalMotionRange, VRBoneTransform_t *, uint32_t) override { return VRInputError_NoData; }
-    EVRInputError GetSkeletalSummaryData(VRActionHandle_t, EVRSummaryType, VRSkeletalSummaryData_t *) override { return VRInputError_NoData; }
+    EVRInputError GetBoneCount(VRActionHandle_t, uint32_t *n) override { if (n) *n = vrrt::kSkeletonBones; return VRInputError_None; }
+    EVRInputError GetBoneHierarchy(VRActionHandle_t, BoneIndex_t *parents, uint32_t n) override {
+        if (!parents || n < vrrt::kSkeletonBones) return VRInputError_BufferTooSmall;
+        for (uint32_t i = 0; i < vrrt::kSkeletonBones; i++) parents[i] = (BoneIndex_t)vrrt::skeleton_parent(i);
+        return VRInputError_None;
+    }
+    EVRInputError GetBoneName(VRActionHandle_t, BoneIndex_t i, char *b, uint32_t n) override {
+        if (!b || !n || i < 0 || (uint32_t)i >= vrrt::kSkeletonBones) return VRInputError_InvalidParam;
+        snprintf(b, n, "%s", vrrt::skeleton_bone_name((uint32_t)i));
+        return VRInputError_None;
+    }
+    EVRInputError GetSkeletalReferenceTransforms(VRActionHandle_t h, EVRSkeletalTransformSpace space, EVRSkeletalReferencePose pose,
+                                                 VRBoneTransform_t *out, uint32_t n) override {
+        if (!out || n < vrrt::kSkeletonBones) return VRInputError_BufferTooSmall;
+        int hand;
+        { std::lock_guard<std::mutex> l(m_mu); hand = skeleton_hand(h); }
+        vrrt::skeleton_reference(hand == 0, pose, out);
+        if (space == VRSkeletalTransformSpace_Model) vrrt::skeleton_to_model(out);
+        return VRInputError_None;
+    }
+    EVRInputError GetSkeletalTrackingLevel(VRActionHandle_t, EVRSkeletalTrackingLevel *lvl) override {
+        if (lvl) *lvl = VRSkeletalTracking_Estimated;   // from controller-style values, like SteamVR's Touch skeleton
+        return VRInputError_None;
+    }
+    EVRInputError GetSkeletalBoneData(VRActionHandle_t h, EVRSkeletalTransformSpace space, EVRSkeletalMotionRange range,
+                                      VRBoneTransform_t *out, uint32_t n) override {
+        if (!out || n < vrrt::kSkeletonBones) return VRInputError_BufferTooSmall;
+        std::lock_guard<std::mutex> l(m_mu);
+        int hand = skeleton_hand(h);
+        if (hand < 0) return VRInputError_WrongType;
+        vrrt::skeleton_bones(hand == 0, range == VRSkeletalMotionRange_WithController, finger_inputs(hand), m_skel[hand],
+                             vrrt::now_seconds(), out);
+        if (space == VRSkeletalTransformSpace_Model) vrrt::skeleton_to_model(out);
+        static int said; if (!said++) vrrt::log("skeleton: bone data served (hand %d, %s, %s space)", hand,
+                                                 range == VRSkeletalMotionRange_WithController ? "with controller" : "without controller",
+                                                 space == VRSkeletalTransformSpace_Model ? "model" : "parent");
+        return VRInputError_None;
+    }
+    EVRInputError GetSkeletalSummaryData(VRActionHandle_t h, EVRSummaryType, VRSkeletalSummaryData_t *d) override {
+        if (!d) return VRInputError_InvalidParam;
+        std::lock_guard<std::mutex> l(m_mu);
+        int hand = skeleton_hand(h);
+        if (hand < 0) return VRInputError_WrongType;
+        vrrt::FingerInputs in = finger_inputs(hand);
+        d->flFingerCurl[0] = in.thumbTouch ? 0.6f : 0.f;
+        d->flFingerCurl[1] = in.trigger;
+        d->flFingerCurl[2] = d->flFingerCurl[3] = d->flFingerCurl[4] = in.grip;
+        for (int i = 0; i < 4; i++) d->flFingerSplay[i] = 0.2f;
+        return VRInputError_None;
+    }
     EVRInputError GetSkeletalBoneDataCompressed(VRActionHandle_t, EVRSkeletalMotionRange, void *, uint32_t, uint32_t *req) override { if (req) *req = 0; return VRInputError_NoData; }
     EVRInputError DecompressSkeletalBoneData(const void *, uint32_t, EVRSkeletalTransformSpace, VRBoneTransform_t *, uint32_t) override { return VRInputError_NoData; }
     EVRInputError TriggerHapticVibrationAction(VRActionHandle_t, float, float, float, float, VRInputValueHandle_t) override { return VRInputError_None; }

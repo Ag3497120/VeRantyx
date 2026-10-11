@@ -284,8 +284,14 @@ void sample_poses(PoseSet *out, double predictSeconds) {
     bool have = read_hands(&h);
     double now = now_seconds();
     bool fresh = have && g_presence.update(h.visionTimestamp, h.headTracked != 0 && finite16(h.headTransform), now);
+    static double lastInputTs, lastInputAdvance;
+    if (have && std::isfinite(h.visionTimestamp) && h.visionTimestamp > 0) {
+        if (h.visionTimestamp != lastInputTs) { lastInputTs = h.visionTimestamp; lastInputAdvance = now; }
+    }
+    const bool inputsFresh = have && lastInputAdvance > 0 && now - lastInputAdvance < 0.5;
     out->hands = h;
     out->fresh = fresh;
+    out->inputsFresh = inputsFresh;
     out->visionTimestamp = have ? h.visionTimestamp : 0.0;
 
     // Head.
@@ -315,7 +321,7 @@ void sample_poses(PoseSet *out, double predictSeconds) {
         const float *t = hand == 0 ? h.leftTransform : h.rightTransform;
         p.bDeviceIsConnected = true;
         identity34(&p.mDeviceToAbsoluteTracking);
-        if (fresh && tracked && finite16(t)) {
+        if (inputsFresh && tracked && finite16(t)) {
             p.mDeviceToAbsoluteTracking = matrix34_from_column_major(t);
             p.eTrackingResult = vr::TrackingResult_Running_OK;
             p.bPoseIsValid = true;

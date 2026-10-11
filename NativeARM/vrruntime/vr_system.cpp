@@ -305,9 +305,9 @@ public:
         const vrrt::SharedHands &h = p.hands;
         const bool left = dev == 1;
         const uint32_t shift = left ? 8u : 0u;
-        const uint32_t buttons = p.fresh ? (left ? h.leftButtons : h.rightButtons) >> shift : 0;
-        const float trig = p.fresh ? (left ? h.leftTrigger : h.rightTrigger) / 255.f : 0.f;
-        const float grip = p.fresh ? (left ? h.leftGrip : h.rightGrip) / 255.f : 0.f;
+        const uint32_t buttons = p.inputsFresh ? (left ? h.leftButtons : h.rightButtons) >> shift : 0;
+        const float trig = p.inputsFresh ? (left ? h.leftTrigger : h.rightTrigger) / 255.f : 0.f;
+        const float grip = p.inputsFresh ? (left ? h.leftGrip : h.rightGrip) / 255.f : 0.f;
         s.unPacketNum = (uint32_t)vrrt::frame_counter();
         if (buttons & vrrt::kBtnPrimary) s.ulButtonPressed |= ButtonMaskFromId(k_EButton_A);
         if (buttons & vrrt::kBtnSecondary) s.ulButtonPressed |= ButtonMaskFromId(k_EButton_ApplicationMenu);
@@ -317,8 +317,8 @@ public:
         if (trig >= 0.75f) s.ulButtonPressed |= ButtonMaskFromId(k_EButton_SteamVR_Trigger);
         if (trig > 0.05f) s.ulButtonTouched |= ButtonMaskFromId(k_EButton_SteamVR_Trigger);
         if (grip >= 0.75f) s.ulButtonPressed |= ButtonMaskFromId(k_EButton_Grip);
-        s.rAxis[0].x = p.fresh ? (left ? h.leftStickX : h.rightStickX) : 0.f;
-        s.rAxis[0].y = p.fresh ? (left ? h.leftStickY : h.rightStickY) : 0.f;
+        s.rAxis[0].x = p.inputsFresh ? (left ? h.leftStickX : h.rightStickX) : 0.f;
+        s.rAxis[0].y = p.inputsFresh ? (left ? h.leftStickY : h.rightStickY) : 0.f;
         s.rAxis[1].x = trig;
         s.rAxis[2].x = grip;
         memcpy(st, &s, std::min<uint32_t>(size, sizeof s));
