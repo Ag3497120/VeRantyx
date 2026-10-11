@@ -77,6 +77,16 @@ if [[ "${VERANTYX_MAC_PROFILE:-1}" == "1" ]]; then
 fi
 
 mkdir -p "$LOG_DIR" "$REPO_ROOT/build"
+# Keep the previous sessions' logs (a problem is often noticed only after the
+# next start): alyx_host.log -> alyx_host.<time it was last written>.log, the
+# newest 5 sessions of each kept.
+for f in alyx_host hardware-encoder; do
+    if [[ -s "$LOG_DIR/$f.log" ]]; then
+        mv -f "$LOG_DIR/$f.log" "$LOG_DIR/$f.$(stat -f '%Sm' -t '%Y%m%d-%H%M%S' "$LOG_DIR/$f.log").log"
+    fi
+    ls -1t "$LOG_DIR/$f".2*.log 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done
+done
+ls -1t "$LOG_DIR"/slow-*.txt 2>/dev/null | tail -n +11 | while read -r old; do rm -f "$old"; done
 command -v swiftc >/dev/null 2>&1 || die "swiftc is required to build the Mac HEVC encoder."
 swiftc -O "$REPO_ROOT/MacEncoder/HardwareEncoder.swift" -o "$ENCODER"
 
@@ -109,11 +119,33 @@ echo "Logs: $LOG_DIR/alyx_host.log, $LOG_DIR/hardware-encoder.log"
 HOST_PID=$!
 
 # Progress: one line every 5 s from the runtime's compositor report.
+# When the frame rate stays below 20 fps for 15 s after the first minute, the
+# game's threads are sampled once (macOS `sample`, 3 s) into
+# logs/native/slow-<time>.txt together with the runtime's frame timing, so a
+# slowdown can be traced afterwards; guest frames are read against the
+# "[image] <base> <library>" lines of alyx_host.log (slow-<time>.sample.txt). At most one sample per
+# 2 minutes. VERANTYX_SLOW_SAMPLE=0 turns it off.
+prev_pairs=""; slow=0; last_sample=-1000; started=$SECONDS
 while kill -0 "$HOST_PID" 2>/dev/null; do
     sleep 5
     line="$(grep -a 'eye pairs published' "$LOG_DIR/alyx_host.log" 2>/dev/null | tail -1 || true)"
-    [[ -n "$line" ]] && echo "${line#*compositor: }"
     kill -0 "$ENCODER_PID" 2>/dev/null || { echo "The HEVC encoder stopped. See $LOG_DIR/hardware-encoder.log" >&2; break; }
+    [[ -n "$line" ]] || continue
+    echo "${line#*compositor: }"
+    pairs="$(sed -E 's/.* ([0-9]+) eye pairs published.*/\1/' <<<"$line")"
+    if [[ -n "$prev_pairs" && "$pairs" =~ ^[0-9]+$ ]] && (( SECONDS - started > 60 && pairs - prev_pairs < 100 )); then
+        slow=$((slow + 1))
+    else
+        slow=0
+    fi
+    prev_pairs="$pairs"
+    if (( slow >= 3 && SECONDS - last_sample > 120 )) && [[ "${VERANTYX_SLOW_SAMPLE:-1}" != "0" ]]; then
+        last_sample=$SECONDS
+        out="$LOG_DIR/slow-$(date +%Y%m%d-%H%M%S).txt"
+        { echo "Frame rate below 20 fps for 15 s at $(date)"; grep -a 'frame timing' "$LOG_DIR/alyx_host.log" | tail -4; echo; } >"$out"
+        sample "$HOST_PID" 3 -mayDie -file "${out%.txt}.sample.txt" >/dev/null 2>&1 &
+        echo "Frame rate stayed low; recording what the game is doing to $out"
+    fi
 done
 wait "$HOST_PID" 2>/dev/null; rc=$?
 HOST_PID=""

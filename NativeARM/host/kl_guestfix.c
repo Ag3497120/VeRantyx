@@ -59,6 +59,9 @@ static int write_code(uint32_t *at, const uint32_t *words, unsigned n) {
 
 static void on_image(const char *path, kl_image *img) {
     const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
+    // Where each guest library sits: lets a `sample` of a stalled game (the
+    // launcher takes one when the frame rate stays low) be read as image+offset.
+    fprintf(stderr, "  [image] %p %s\n", kl_base(img), base);
     for (size_t i = 0; i < sizeof g_fixes / sizeof g_fixes[0]; i++) {
         const fix_t *f = &g_fixes[i];
         if (strcmp(base, f->image)) continue;
