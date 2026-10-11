@@ -140,3 +140,8 @@ picks the frame file the Mac encoder reads; `--probe lib.so` reports imports).
 - Klepton (https://github.com/shinyquagsire23/Klepton), MIT, fetched and
   patched by `scripts/fetch_klepton.sh` / `klepton-patches/apply.py`.
 - OpenVR headers (`vrruntime/openvr/`), BSD-3-Clause (Valve), see LICENSE there.
+- Fossilize (https://github.com/ValveSoftware/Fossilize), MIT, built by
+  `scripts/build_fossilize.sh`; `scripts/prewarm_shaders.sh` replays the
+  game's shipped `vulkan_shader_cache.foz` through MoltenVK once so Metal's
+  per-user shader cache is warm (first-time pipeline compiles were 250-500 ms
+  each on the render thread; cached ones 2 ms).
