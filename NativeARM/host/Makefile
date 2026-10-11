@@ -20,7 +20,7 @@ LDLIBS := -lz -lresolv -liconv -framework AudioToolbox -framework CoreAudio \
           -framework CoreFoundation -framework AVFoundation -framework Foundation
 
 RT_OBJS   := $(patsubst %,$(OUT)/kl/%.o,$(RUNTIME))
-HOST_SRCS := alyx_host.c kl_glibc.c kl_glibc_va.S kl_enginelog.c kl_sdlshim.c kl_steambridge.c kl_luafix.c
+HOST_SRCS := alyx_host.c kl_glibc.c kl_glibc_va.S kl_enginelog.c kl_sdlshim.c kl_steambridge.c kl_luafix.c kl_sdlaudio.c
 HOST_OBJS := $(patsubst %,$(OUT)/%.o,$(HOST_SRCS))
 # The OpenVR runtime (C++): ../vrruntime.
 VRRT_DIR  := ../vrruntime

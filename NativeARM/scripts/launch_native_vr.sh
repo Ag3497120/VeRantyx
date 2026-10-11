@@ -32,6 +32,10 @@ pgrep -x steam_osx >/dev/null 2>&1 || die "macOS Steam is not running. Start Ste
 if pgrep -f '[h]lvr\.exe' >/dev/null 2>&1; then
     die "The Wine version of Half-Life: Alyx is running; quit it first (it uses the same encoder port)."
 fi
+if pgrep -f '[s]team\.exe|[s]teamwebhelper' >/dev/null 2>&1; then
+    echo "Note: the Wine version's Windows Steam is still running (it uses CPU and restarts its windows)."
+    echo "      Stop it with: scripts/stop_wine_vr.sh"
+fi
 if pgrep -f "$ENCODER" >/dev/null 2>&1; then
     die "A HEVC encoder is already running (Wine session?). Quit that session first."
 fi

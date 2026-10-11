@@ -444,6 +444,13 @@ private struct HandState {
     // A sharp wrist rotation marks a gravity-glove flick: for the next 100 ms
     // the velocity toward the head is kept at the speed Alyx looks for.
     private var flickBoostUntil: CFTimeInterval = 0
+    // One Euro filter for hands-only tracking (pose sent to the game):
+    // heavy smoothing when the hand is still, none when it moves fast.
+    private var euroPosition: SIMD3<Float>?
+    private var euroPositionSpeed: Float = 0
+    private var euroRotation: simd_quatf?
+    private var euroRotationSpeed: Float = 0
+    private var euroTime: CFTimeInterval = 0
     private static let flickRotationRate: Float = 6     // rad/s
     private static let flickSpeed: Float = 2.5          // m/s toward the player
 
@@ -564,6 +571,9 @@ private struct HandState {
             let follow: Float = speed > 0.6 ? 1 : speed > 0.2 ? 0.8 : 0.6
             steamRaw = Self.blend(previous, steamRaw, follow)
         }
+        if controller == nil {
+            steamRaw = oneEuro(steamRaw, now: now)
+        }
         transform = steamRaw
         trackingState = 1
         lostAt = nil
@@ -683,6 +693,8 @@ private struct HandState {
         lastLocalPosition = nil
         lastWorldPosition = nil
         lastWorldRotation = nil
+        euroPosition = nil
+        euroRotation = nil
         if controller?.motion == nil {
             velocity = .zero
             angularVelocity = .zero
@@ -1041,7 +1053,11 @@ private struct HandState {
     /// anatomy; SteamVR's Rift S render model says where that grip sits
     /// relative to the controller's raw pose, which Alyx aligns its hands to.
     private static func touchRawPose(joints: HandJoints, isLeft: Bool) -> simd_float4x4? {
-        let forward = joints.middleKnuckle - joints.wrist
+        // Forward from the wrist to the middle of the knuckle row (index,
+        // middle, ring): one joint's noise moves the aim a third as much.
+        let knuckleRow = joints.ringKnuckle.map { (joints.indexKnuckle + joints.middleKnuckle + $0) / 3 }
+            ?? (joints.indexKnuckle + joints.middleKnuckle) * 0.5
+        let forward = knuckleRow - joints.wrist
         let across = joints.indexKnuckle - joints.littleKnuckle
         guard simd_length(forward) > 0.03, simd_length(across) > 0.02 else { return nil }
         let towardThumbSide = simd_normalize(across)
@@ -1066,6 +1082,51 @@ private struct HandState {
         return worldGrip * rawFromGrip.inverse
     }
 
+    // One Euro filter (Casiez et al. 2012) on position and orientation.
+    // Cutoff = minCutoff + beta * speed: at rest ~3 Hz (tremor and ARKit
+    // joint noise removed), at 0.5 m/s ~6 Hz, fast swings pass unfiltered in
+    // effect. Speeds are themselves low-passed at 1 Hz-ish (dCutoff).
+    private static let euroMinCutoff: Float = 3.0
+    private static let euroBeta: Float = 6.0          // per m/s
+    private static let euroRotMinCutoff: Float = 3.0
+    private static let euroRotBeta: Float = 1.5       // per rad/s
+    private static let euroDCutoff: Float = 1.2
+
+    private static func euroAlpha(_ cutoff: Float, _ dt: Float) -> Float {
+        let tau = 1 / (2 * Float.pi * cutoff)
+        return 1 / (1 + tau / dt)
+    }
+
+    private mutating func oneEuro(_ m: simd_float4x4, now: CFTimeInterval) -> simd_float4x4 {
+        let position = SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z)
+        var rotation = simd_quatf(m)
+        let dt = Float(now - euroTime)
+        guard let lastPosition = euroPosition, var lastRotation = euroRotation, dt > 0.0005, dt < 0.1 else {
+            euroPosition = position; euroRotation = rotation; euroTime = now
+            euroPositionSpeed = 0; euroRotationSpeed = 0
+            return m
+        }
+        euroTime = now
+        // Position.
+        let rawSpeed = simd_length(position - lastPosition) / dt
+        euroPositionSpeed += (rawSpeed - euroPositionSpeed) * Self.euroAlpha(Self.euroDCutoff, dt)
+        let a = Self.euroAlpha(Self.euroMinCutoff + Self.euroBeta * euroPositionSpeed, dt)
+        let filteredPosition = lastPosition + (position - lastPosition) * a
+        // Orientation (same hemisphere first).
+        if simd_dot(rotation.vector, lastRotation.vector) < 0 { rotation = simd_quatf(vector: -rotation.vector) }
+        var delta = rotation * lastRotation.inverse
+        if delta.real < 0 { delta = simd_quatf(vector: -delta.vector) }
+        let angle = 2 * atan2(simd_length(delta.imag), delta.real)
+        euroRotationSpeed += (angle / dt - euroRotationSpeed) * Self.euroAlpha(Self.euroDCutoff, dt)
+        let ar = Self.euroAlpha(Self.euroRotMinCutoff + Self.euroRotBeta * euroRotationSpeed, dt)
+        lastRotation = simd_slerp(lastRotation, rotation, ar)
+        euroPosition = filteredPosition
+        euroRotation = lastRotation
+        var out = simd_float4x4(lastRotation)
+        out.columns.3 = SIMD4<Float>(filteredPosition, 1)
+        return out
+    }
+
     private static func blend(_ a: simd_float4x4, _ b: simd_float4x4, _ t: Float) -> simd_float4x4 {
         let qa = simd_quatf(a), qb = simd_quatf(b)
         let q = simd_slerp(qa, qb, t)
@@ -1086,6 +1147,7 @@ private struct HandJoints {
     let wrist: SIMD3<Float>
     let indexKnuckle: SIMD3<Float>
     let middleKnuckle: SIMD3<Float>
+    let ringKnuckle: SIMD3<Float>?
     let littleKnuckle: SIMD3<Float>
     let middleMetacarpal: SIMD3<Float>
     let thumbTip: SIMD3<Float>?
@@ -1153,6 +1215,7 @@ private struct HandJoints {
         self.wrist = wrist
         self.indexKnuckle = indexKnuckle
         self.middleKnuckle = middleKnuckle
+        self.ringKnuckle = position(.ringFingerKnuckle)
         self.littleKnuckle = littleKnuckle
         self.middleMetacarpal = middleMetacarpal
         thumbTip = position(.thumbTip)
