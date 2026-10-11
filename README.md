@@ -25,14 +25,12 @@ app (`VisionProClient/`).
 
 ![Native version: Half-Life: Alyx (Linux ARM64 build) running natively on a MacBook Pro, played in Apple Vision Pro — hands, gravity gloves, a pistol, and the Joy-Con at the end](docs/media/native-highlight.gif)
 
-<!-- NATIVE YOUTUBE: replace docs/media/native-highlight.mp4 in the link below
-     with the YouTube URL once the full recording is uploaded. -->
-[![Native version — watch the recording](docs/media/native-poster.jpg)](docs/media/native-highlight.mp4)
+[![Native version — watch the full recording on YouTube](docs/media/native-poster.jpg)](https://youtu.be/2z-GyAqAtpA)
 
 *Native version, 50-second highlight: [docs/media/native-highlight.mp4](docs/media/native-highlight.mp4).
 The room and the VeRantyx app through the passthrough, hands in Russell's lab,
 gravity gloves (pulling and catching), then the pistol and the Joy-Con on the
-desk at the end. 60 fps on an M1 Max. Full recording: YouTube link coming soon.*
+desk at the end. 60 fps on an M1 Max. Full 6-minute unedited recording of the native version: https://youtu.be/2z-GyAqAtpA.*
 
 ### Wine version (Windows build + SteamVR under Wine) — recorded 2026-10-10
 
