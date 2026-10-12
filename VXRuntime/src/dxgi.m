@@ -52,8 +52,9 @@ static d3d_object *factory_new(void) {
     return d3d_alloc(sizeof(d3d_object), K_FACTORY, g_factory_vtbl, NULL);
 }
 static WINAPI HRESULT factory_qi(void *this, const GUID *iid, void **out) {
-    static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIFactory, &IID_IDXGIFactory1, &IID_IDXGIFactory2 };
-    return query(this, iid, out, known, 5);
+    static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIFactory, &IID_IDXGIFactory1, &IID_IDXGIFactory2,
+                                         &IID_IDXGIFactory3, &IID_IDXGIFactory4 };
+    return query(this, iid, out, known, 7);
 }
 static WINAPI HRESULT factory_get_parent(void *this, const GUID *iid, void **out) { (void)this; (void)iid; *out = NULL; return E_NOINTERFACE; }
 static d3d_object *adapter_new(d3d_object *factory);
@@ -63,6 +64,18 @@ static WINAPI HRESULT factory_enum_adapters(void *this, uint32_t i, void **out) 
     *out = adapter_new(this);
     return S_OK;
 }
+// IDXGIFactory4: the adapter by LUID (there is one), no WARP adapter; IDXGIFactory3: creation flags.
+static WINAPI HRESULT factory_enum_by_luid(void *this, uint64_t luid, const GUID *iid, void **out) {
+    (void)luid;
+    void *a = NULL;
+    HRESULT hr = factory_enum_adapters(this, 0, &a);
+    if (hr) return hr;
+    hr = ((HRESULT (WINAPI *)(void *, const GUID *, void **))(*(void ***)a)[0])(a, iid, out);
+    ((uint32_t (WINAPI *)(void *))(*(void ***)a)[2])(a);
+    return hr;
+}
+static WINAPI HRESULT factory_enum_warp(void *this, const GUID *iid, void **out) { (void)this; (void)iid; *out = NULL; return DXGI_ERROR_NOT_FOUND; }
+static WINAPI uint32_t factory_creation_flags(void *this) { (void)this; return 0; }
 static WINAPI HRESULT factory_make_window_association(void *this, HANDLE w, uint32_t flags) { (void)this; (void)w; (void)flags; return S_OK; }
 static WINAPI HRESULT factory_get_window_association(void *this, HANDLE *w) { (void)this; *w = NULL; return S_OK; }
 static WINAPI int factory_is_current(void *this) { (void)this; return 1; }
@@ -75,8 +88,8 @@ HRESULT dxgi_create_factory(const GUID *iid, void **out) {
     d3d_release(f);
     return hr;
 }
-static WINAPI HRESULT CreateDXGIFactory(const GUID *iid, void **out) { return dxgi_create_factory(iid, out); }
-static WINAPI HRESULT CreateDXGIFactory1(const GUID *iid, void **out) { return dxgi_create_factory(iid, out); }
+static WINAPI HRESULT CreateDXGIFactory(const GUID *iid, void **out) { if (vx_trace) vx_log("CreateDXGIFactory"); return dxgi_create_factory(iid, out); }
+static WINAPI HRESULT CreateDXGIFactory1(const GUID *iid, void **out) { if (vx_trace) vx_log("CreateDXGIFactory1"); return dxgi_create_factory(iid, out); }
 static WINAPI HRESULT CreateDXGIFactory2(uint32_t flags, const GUID *iid, void **out) { (void)flags; return dxgi_create_factory(iid, out); }
 
 // ---- the adapter -----------------------------------------------------------------------------------------------------------
@@ -90,9 +103,25 @@ static d3d_object *adapter_new(d3d_object *factory) {
 }
 d3d_object *dxgi_adapter_create(void) { return adapter_new(NULL); }
 static WINAPI HRESULT adapter_qi(void *this, const GUID *iid, void **out) {
-    static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIAdapter, &IID_IDXGIAdapter1 };
-    return query(this, iid, out, known, 4);
+    static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIAdapter, &IID_IDXGIAdapter1, &IID_IDXGIAdapter2, &IID_IDXGIAdapter3 };
+    return query(this, iid, out, known, 6);
 }
+// DXGI_QUERY_VIDEO_MEMORY_INFO: budget, current usage, available for reservation, current reservation. The local
+// segment is the unified memory Metal lets the GPU use.
+static WINAPI HRESULT adapter_query_video_memory(void *this, uint32_t node, uint32_t group, uint64_t *info) {
+    (void)this; (void)node;
+    memset(info, 0, 32);
+    if (group == 0) {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        info[0] = dev.recommendedMaxWorkingSetSize;
+        info[1] = dev.currentAllocatedSize;
+        info[2] = info[0] / 2;
+    }
+    return S_OK;
+}
+static WINAPI HRESULT adapter_set_reservation(void *this, uint32_t node, uint32_t group, uint64_t bytes) { (void)this; (void)node; (void)group; (void)bytes; return S_OK; }
+static WINAPI HRESULT adapter_register_budget_event(void *this, HANDLE event, DWORD *cookie) { (void)this; (void)event; *cookie = 1; return S_OK; }
+static WINAPI void adapter_unregister_budget_event(void *this, DWORD cookie) { (void)this; (void)cookie; }
 // DXGI_ADAPTER_DESC(1): description[128], vendor, device, subsystem, revision, dedicated video memory, dedicated
 // system memory, shared system memory, LUID (, flags).
 static void adapter_desc(uint8_t *d, int with_flags) {
@@ -110,6 +139,8 @@ static void adapter_desc(uint8_t *d, int with_flags) {
 }
 static WINAPI HRESULT adapter_get_desc(void *this, uint8_t *d) { (void)this; adapter_desc(d, 0); return S_OK; }
 static WINAPI HRESULT adapter_get_desc1(void *this, uint8_t *d) { (void)this; adapter_desc(d, 1); return S_OK; }
+// DXGI_ADAPTER_DESC2: DESC1, then graphics and compute preemption granularities (DMA buffer, dispatch).
+static WINAPI HRESULT adapter_get_desc2(void *this, uint8_t *d) { (void)this; adapter_desc(d, 1); *(uint32_t *)(d + 312) = 0; *(uint32_t *)(d + 316) = 1; return S_OK; }
 static d3d_object *output_new(d3d_object *adapter);
 static WINAPI HRESULT adapter_enum_outputs(void *this, uint32_t i, void **out) {
     if (i) { *out = NULL; return DXGI_ERROR_NOT_FOUND; }
@@ -280,9 +311,24 @@ static WINAPI HRESULT factory_create_swapchain_hwnd(void *this, void *device, HA
 }
 
 static WINAPI HRESULT swapchain_qi(void *this, const GUID *iid, void **out) {
-    static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIDeviceSubObject, &IID_IDXGISwapChain, &IID_IDXGISwapChain1 };
-    return query(this, iid, out, known, 5);
+    static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIDeviceSubObject, &IID_IDXGISwapChain, &IID_IDXGISwapChain1,
+                                         &IID_IDXGISwapChain2, &IID_IDXGISwapChain3 };
+    return query(this, iid, out, known, 7);
 }
+// IDXGISwapChain2/3: frame latency (presents do not queue up here, so the waitable object is always signalled),
+// source size, color spaces (sRGB only), the current back buffer (there is one).
+static WINAPI HRESULT swapchain_set_latency(void *this, uint32_t n) { (void)this; (void)n; return S_OK; }
+static WINAPI HRESULT swapchain_get_latency(void *this, uint32_t *n) { (void)this; *n = 1; return S_OK; }
+static WINAPI HANDLE swapchain_latency_object(void *this) {
+    (void)this;
+    HANDLE (WINAPI *create)(void *, BOOL, BOOL, const WCHAR *) = (HANDLE (WINAPI *)(void *, BOOL, BOOL, const WCHAR *))vx_find_export("kernel32.dll", "CreateEventW");
+    return create(NULL, 1, 1, NULL);                            // manual reset, signalled
+}
+static WINAPI HRESULT swapchain_set_source_size(void *this, uint32_t w, uint32_t h) { (void)this; (void)w; (void)h; return S_OK; }
+static WINAPI HRESULT swapchain_get_source_size(void *this, uint32_t *w, uint32_t *h) { swapchain *sc = this; *w = sc->width; *h = sc->height; return S_OK; }
+static WINAPI uint32_t swapchain_back_buffer_index(void *this) { (void)this; return 0; }
+static WINAPI HRESULT swapchain_check_color_space(void *this, uint32_t cs, uint32_t *support) { (void)this; *support = cs == 0 ? 1 : 0; return S_OK; }
+static WINAPI HRESULT swapchain_set_color_space(void *this, uint32_t cs) { (void)this; return cs == 0 ? S_OK : E_INVALIDARG; }
 static WINAPI HRESULT swapchain_get_device(void *this, const GUID *iid, void **out) { return call_qi(((swapchain *)this)->dev, iid, out); }
 static WINAPI HRESULT swapchain_get_buffer(void *this, uint32_t index, const GUID *iid, void **out) {
     swapchain *sc = this;
@@ -375,10 +421,14 @@ static void make_tables(void) {
         { "EnumAdapters", (void *)factory_enum_adapters }, { "EnumAdapters1", (void *)factory_enum_adapters },
         { "MakeWindowAssociation", (void *)factory_make_window_association }, { "GetWindowAssociation", (void *)factory_get_window_association },
         { "CreateSwapChain", (void *)factory_create_swapchain }, { "CreateSwapChainForHwnd", (void *)factory_create_swapchain_hwnd },
-        { "IsCurrent", (void *)factory_is_current }, { "IsWindowedStereoEnabled", (void *)factory_stereo }, { NULL, NULL } };
+        { "IsCurrent", (void *)factory_is_current }, { "EnumAdapterByLuid", (void *)factory_enum_by_luid },
+        { "EnumWarpAdapter", (void *)factory_enum_warp }, { "GetCreationFlags", (void *)factory_creation_flags }, { "IsWindowedStereoEnabled", (void *)factory_stereo }, { NULL, NULL } };
     static const d3d_method adapter[] = { { "QueryInterface", (void *)adapter_qi }, OBJECT_METHODS, { "GetParent", (void *)child_get_parent },
         { "EnumOutputs", (void *)adapter_enum_outputs }, { "GetDesc", (void *)adapter_get_desc }, { "GetDesc1", (void *)adapter_get_desc1 },
-        { "CheckInterfaceSupport", (void *)adapter_check_interface }, { NULL, NULL } };
+        { "CheckInterfaceSupport", (void *)adapter_check_interface }, { "GetDesc2", (void *)adapter_get_desc2 },
+        { "QueryVideoMemoryInfo", (void *)adapter_query_video_memory }, { "SetVideoMemoryReservation", (void *)adapter_set_reservation },
+        { "RegisterVideoMemoryBudgetChangeNotificationEvent", (void *)adapter_register_budget_event },
+        { "UnregisterVideoMemoryBudgetChangeNotification", (void *)adapter_unregister_budget_event }, { NULL, NULL } };
     static const d3d_method output[] = { { "QueryInterface", (void *)output_qi }, OBJECT_METHODS, { "GetParent", (void *)child_get_parent },
         { "GetDesc", (void *)output_get_desc }, { "GetDisplayModeList", (void *)output_get_modes },
         { "FindClosestMatchingMode", (void *)output_find_mode }, { "WaitForVBlank", (void *)output_wait_vblank },
@@ -390,11 +440,15 @@ static void make_tables(void) {
         { "GetDesc1", (void *)swapchain_get_desc1 }, { "ResizeBuffers", (void *)swapchain_resize_buffers },
         { "ResizeTarget", (void *)swapchain_resize_target }, { "GetContainingOutput", (void *)swapchain_get_output },
         { "GetFrameStatistics", (void *)swapchain_frame_statistics }, { "GetLastPresentCount", (void *)swapchain_last_present_count },
-        { "GetHwnd", (void *)swapchain_get_hwnd }, { "IsTemporaryMonoSupported", (void *)swapchain_mono }, { NULL, NULL } };
-    g_factory_vtbl = D3D_VTABLE(IDXGIFactory2, factory);
-    g_adapter_vtbl = D3D_VTABLE(IDXGIAdapter1, adapter);
+        { "GetHwnd", (void *)swapchain_get_hwnd }, { "IsTemporaryMonoSupported", (void *)swapchain_mono },
+        { "SetMaximumFrameLatency", (void *)swapchain_set_latency }, { "GetMaximumFrameLatency", (void *)swapchain_get_latency },
+        { "GetFrameLatencyWaitableObject", (void *)swapchain_latency_object }, { "SetSourceSize", (void *)swapchain_set_source_size },
+        { "GetSourceSize", (void *)swapchain_get_source_size }, { "GetCurrentBackBufferIndex", (void *)swapchain_back_buffer_index },
+        { "CheckColorSpaceSupport", (void *)swapchain_check_color_space }, { "SetColorSpace1", (void *)swapchain_set_color_space }, { NULL, NULL } };
+    g_factory_vtbl = D3D_VTABLE(IDXGIFactory4, factory);
+    g_adapter_vtbl = D3D_VTABLE(IDXGIAdapter3, adapter);
     g_output_vtbl = D3D_VTABLE(IDXGIOutput, output);
-    g_swapchain_vtbl = D3D_VTABLE(IDXGISwapChain1, sc);
+    g_swapchain_vtbl = D3D_VTABLE(IDXGISwapChain3, sc);
 }
 
 static const vx_export dxgi[] = { VX_EXPORT(CreateDXGIFactory), VX_EXPORT(CreateDXGIFactory1), VX_EXPORT(CreateDXGIFactory2) };

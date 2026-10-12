@@ -814,12 +814,90 @@ static WINAPI void ctx_clear_uav_uint(void *this, d3d_view *v, const uint32_t *v
 static WINAPI void ctx_clear_uav_float(void *this, d3d_view *v, const float *values) { uint32_t bits; memcpy(&bits, &values[0], 4); clear_uav(this, v, bits); }
 
 // ---- tables -------------------------------------------------------------------------------------------------------------------------
+// ---- queries and predicates -------------------------------------------------------------------------------------------------
+// D3D11_QUERY_DESC: type, flags. Results are ready once the GPU has finished the command buffer that was being
+// recorded when the query ended. Occlusion counts report everything visible (nothing is culled wrongly);
+// timestamps are the CPU's nanosecond clock at the end, with a 1 GHz frequency.
+typedef struct { d3d_object base; uint32_t desc[2]; uint64_t target, stamp; int ended; } d3d_query;
+static void **g_query_vtbl, **g_predicate_vtbl;
+static WINAPI HRESULT query_qi(void *this, const GUID *iid, void **out) {
+    d3d_query *q = this;
+    if (out && (d3d_same_guid(iid, &IID_ID3D11Asynchronous) || d3d_same_guid(iid, &IID_ID3D11Query) ||
+                (q->desc[0] == 5 && d3d_same_guid(iid, &IID_ID3D11Predicate)))) { d3d_addref(&q->base); *out = this; return S_OK; }
+    return query(this, iid, out, &IID_ID3D11Query);
+}
+static uint32_t query_size(uint32_t type) {
+    switch (type) {
+    case 0: case 5: case 7: return 4;                     // event, occlusion predicate, SO overflow predicate: BOOL
+    case 1: case 2: return 8;                             // occlusion samples, timestamp
+    case 3: case 6: return 16;                            // timestamp disjoint, SO statistics
+    case 4: return 88;                                    // pipeline statistics
+    default: return 4;
+    }
+}
+static WINAPI uint32_t query_data_size(void *this) { return query_size(((d3d_query *)this)->desc[0]); }
+static WINAPI void query_get_desc(void *this, uint32_t *desc) { memcpy(desc, ((d3d_query *)this)->desc, 8); }
+static HRESULT make_query(void *this, const uint32_t *desc, void **out, int predicate) {
+    if (!desc) return E_INVALIDARG;
+    if (!out) return S_FALSE;
+    d3d_query *q = d3d_alloc(sizeof *q, K_STATE, predicate ? g_predicate_vtbl : g_query_vtbl, (d3d_device *)this);
+    q->desc[0] = desc[0]; q->desc[1] = desc[1];
+    *out = q;
+    return S_OK;
+}
+static WINAPI HRESULT device_create_query(void *this, const uint32_t *desc, void **out) { return make_query(this, desc, out, 0); }
+static WINAPI HRESULT device_create_predicate(void *this, const uint32_t *desc, void **out) { return make_query(this, desc, out, 1); }
+static WINAPI HRESULT device_create_counter(void *this, const void *desc, void **out) { (void)this; (void)desc; if (out) *out = NULL; return E_INVALIDARG; }
+static WINAPI void device_check_counter_info(void *this, uint32_t *info) { (void)this; memset(info, 0, 12); }
+static WINAPI void ctx_begin(void *this, d3d_query *q) { (void)this; if (q) q->ended = 0; }
+static WINAPI void ctx_end(void *this, d3d_query *q) {
+    d3d_context *c = this;
+    if (!q) return;
+    q->target = c->base.dev->submitted + 1;                  // the command buffer being recorded
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    q->stamp = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    q->ended = 1;
+}
+#define D3D11_ASYNC_GETDATA_DONOTFLUSH 1
+static WINAPI HRESULT ctx_get_data(void *this, d3d_query *q, void *data, uint32_t size, uint32_t flags) {
+    d3d_context *c = this;
+    if (!q) return E_INVALIDARG;
+    if (q->desc[0] == 3) {                                    // disjoint: always ready
+        if (data && size >= 16) { uint64_t f = 1000000000ull; memcpy(data, &f, 8); memset((uint8_t *)data + 8, 0, 8); }
+        return S_OK;
+    }
+    if (!q->ended) return S_FALSE;
+    d3d_device *dev = c->base.dev;
+    if (__atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE) < q->target) {
+        if (!(flags & D3D11_ASYNC_GETDATA_DONOTFLUSH) && dev->submitted < q->target) d3d_flush(dev, 0);
+        if (__atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE) < q->target) return S_FALSE;
+    }
+    if (!data || !size) return S_OK;
+    uint8_t out[88] = { 0 };
+    switch (q->desc[0]) {
+    case 0: case 5: *(uint32_t *)out = 1; break;
+    case 1: *(uint64_t *)out = 1000000; break;
+    case 2: *(uint64_t *)out = q->stamp; break;
+    }
+    memcpy(data, out, MIN(size, query_size(q->desc[0])));
+    return S_OK;
+}
+static WINAPI void ctx_set_predication(void *this, void *p, int value) { (void)this; (void)p; (void)value; }   // draws are never skipped
+static WINAPI void ctx_get_predication(void *this, void **p, int *value) { (void)this; if (p) *p = NULL; if (value) *value = 0; }
+// Geometry, hull and domain shaders are not translated yet: unbinding them is fine; binding one is reported.
+static WINAPI void ctx_set_unsupported_stage(void *this, void *shader, void *const *ci, uint32_t n) {
+    (void)this; (void)ci; (void)n;
+    if (shader) d3d_not_implemented("geometry/tessellation shader stages (bound)");
+}
+
 const d3d_method d3d_draw_device_methods[] = {
     { "CreateVertexShader", (void *)device_create_vs }, { "CreatePixelShader", (void *)device_create_ps },
     { "CreateInputLayout", (void *)device_create_layout }, { "CreateBlendState", (void *)device_create_blend },
     { "CreateDepthStencilState", (void *)device_create_depth }, { "CreateRasterizerState", (void *)device_create_raster },
     { "CreateSamplerState", (void *)device_create_sampler }, { "CreateComputeShader", (void *)device_create_cs },
-    { "CreateUnorderedAccessView", (void *)device_create_uav }, { NULL, NULL },
+    { "CreateUnorderedAccessView", (void *)device_create_uav }, { "CreateQuery", (void *)device_create_query },
+    { "CreatePredicate", (void *)device_create_predicate }, { "CreateCounter", (void *)device_create_counter },
+    { "CheckCounterInfo", (void *)device_check_counter_info }, { NULL, NULL },
 };
 const d3d_method d3d_draw_context_methods[] = {
     { "IASetInputLayout", (void *)ia_set_layout }, { "IASetVertexBuffers", (void *)ia_set_vertex_buffers },
@@ -835,6 +913,10 @@ const d3d_method d3d_draw_context_methods[] = {
     { "CSSetShader", (void *)cs_set_shader }, { "CSSetConstantBuffers", (void *)cs_set_cbs }, { "CSSetShaderResources", (void *)cs_set_srvs },
     { "CSSetSamplers", (void *)cs_set_samplers }, { "CSSetUnorderedAccessViews", (void *)cs_set_uavs }, { "Dispatch", (void *)ctx_dispatch },
     { "OMSetRenderTargetsAndUnorderedAccessViews", (void *)om_set_targets_and_uavs },
+    { "Begin", (void *)ctx_begin }, { "End", (void *)ctx_end }, { "GetData", (void *)ctx_get_data },
+    { "SetPredication", (void *)ctx_set_predication }, { "GetPredication", (void *)ctx_get_predication },
+    { "GSSetShader", (void *)ctx_set_unsupported_stage }, { "HSSetShader", (void *)ctx_set_unsupported_stage },
+    { "DSSetShader", (void *)ctx_set_unsupported_stage },
     { "CopyStructureCount", (void *)ctx_copy_structure_count }, { "ClearUnorderedAccessViewUint", (void *)ctx_clear_uav_uint }, { "ClearUnorderedAccessViewFloat", (void *)ctx_clear_uav_float },
     { NULL, NULL },
 };
@@ -857,4 +939,8 @@ void d3d_draw_init(void) {
     g_depth_vtbl = D3D_VTABLE(ID3D11DepthStencilState, depth);
     g_raster_vtbl = D3D_VTABLE(ID3D11RasterizerState, raster);
     g_sampler_vtbl = D3D_VTABLE(ID3D11SamplerState, sampler);
+    static const d3d_method q[] = { { "QueryInterface", (void *)query_qi }, CHILD_METHODS, { "GetDataSize", (void *)query_data_size },
+                                    { "GetDesc", (void *)query_get_desc }, { NULL, NULL } };
+    g_query_vtbl = D3D_VTABLE(ID3D11Query, q);
+    g_predicate_vtbl = D3D_VTABLE(ID3D11Predicate, q);
 }

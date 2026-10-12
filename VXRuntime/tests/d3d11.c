@@ -115,12 +115,41 @@ int main(int argc, char **argv) {
     CHECK(bd.Width == 400 && bd.Height == 300);
     ID3D11Texture2D_Release(back);
 
+    // Queries: an event completes once the GPU has done the work before it; timestamps come with a disjoint query.
+    D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+    ID3D11Query *event = NULL, *disjoint = NULL, *stamp = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateQuery(dev, &qd, &event)));
+    qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+    CHECK(SUCCEEDED(ID3D11Device_CreateQuery(dev, &qd, &disjoint)));
+    qd.Query = D3D11_QUERY_TIMESTAMP;
+    CHECK(SUCCEEDED(ID3D11Device_CreateQuery(dev, &qd, &stamp)));
+    CHECK(ID3D11Query_GetDataSize(event) == sizeof(BOOL) && ID3D11Query_GetDataSize(disjoint) == 16);
+    ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)disjoint);
+    float grey[4] = { 0.5f, 0.5f, 0.5f, 1 };
+    D3D11_TEXTURE2D_DESC od = { 4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0 };
+    ID3D11Texture2D *offtex = NULL; ID3D11RenderTargetView *off = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &od, NULL, &offtex)));
+    CHECK(SUCCEEDED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)offtex, NULL, &off)));
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, off, grey);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)stamp);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)event);
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)disjoint);
+    BOOL done = FALSE; HRESULT qr; int polls = 0;
+    while ((qr = ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)event, &done, sizeof done, 0)) == S_FALSE && polls < 100000) polls++;
+    CHECK(qr == S_OK && done);
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = { 0, TRUE };
+    CHECK(ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)disjoint, &dj, sizeof dj, 0) == S_OK && dj.Frequency && !dj.Disjoint);
+    UINT64 ts = 0;
+    CHECK(ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)stamp, &ts, sizeof ts, 0) == S_OK && ts);
+    ID3D11Query_Release(event); ID3D11Query_Release(disjoint); ID3D11Query_Release(stamp);
+    ID3D11RenderTargetView_Release(off); ID3D11Texture2D_Release(offtex);
+
     IDXGISwapChain_Release(sc);
     ID3D11DeviceContext_Release(ctx);
     IDXGIDevice_Release(dxdev);
     ULONG left = ID3D11Device_Release(dev);
     DestroyWindow(hwnd);
-    printf("d3d11: %s, clear %#x, copies, %u presents, resize: %d failed checks -> %s\n", gpu, px, presents, failures, failures ? "FAILED" : "ok");
+    printf("d3d11: %s, clear %#x, copies, %u presents, resize, queries: %d failed checks -> %s\n", gpu, px, presents, failures, failures ? "FAILED" : "ok");
     (void)left;
     return failures;
 }

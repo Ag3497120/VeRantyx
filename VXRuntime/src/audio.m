@@ -121,7 +121,10 @@ static OSStatus render_callback(void *ctx, AudioUnitRenderActionFlags *flags, co
         i += run;
     }
     memset(out + (size_t)n * c->frame_bytes, 0, (size_t)(nframes - n) * c->frame_bytes);
-    if (c->mute || c->volume != 1.0f) {
+    static int muted = -1;                                      // VXRT_MUTE=1: silence (for unattended runs)
+    if (muted < 0) muted = getenv("VXRT_MUTE") && atoi(getenv("VXRT_MUTE"));
+    if (muted) memset(out, 0, (size_t)nframes * c->frame_bytes);
+    else if (c->mute || c->volume != 1.0f) {
         if (format_kind(&c->fmt) == 3) {
             float *f = (float *)out, v = c->mute ? 0 : c->volume;
             for (size_t i = 0; i < (size_t)n * c->fmt.channels; i++) f[i] *= v;

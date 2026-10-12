@@ -86,6 +86,9 @@ extern int vx_trace;
 
 // Module registration entry points (one per source file).
 void vx_kernel32_init(void);
+void vx_desktop_init(void);            // the rest of the Win32 surface games link (desktop.c)
+void vx_services_init(void);           // resources, command lines, random numbers, psapi, C runtime extras (services.c)
+void vx_system_init(void);             // processor topology, thread pool, tokens, shell folders (system.c)
 void vx_ucrt_init(void);
 void vx_sync_init(void);               // threads and kernel objects (sync.c)
 void vx_seh_init(void);                // exceptions (seh.c)
@@ -98,6 +101,7 @@ void vx_gdi_init(void);                // drawing (gdi.c)
 void vx_net_init(void);                // ws2_32 (net.c)
 void vx_mm_init(void);                 // winmm, imm32 (mm.c)
 void vx_d3d11_init(void);              // Direct3D 11 on Metal (d3d11.m)
+void vx_d3d9_init(void);               // IDirect3D9: adapters and display modes (d3d9.m)
 void vx_dxgi_init(void);               // DXGI (dxgi.m)
 void vx_input_init(void);              // XInput (input.m)
 void vx_audio_init(void);              // WASAPI on Core Audio (audio.m; after COM)
@@ -118,6 +122,7 @@ DWORD  vx_return_string_w(const char *s, WCHAR *buf, DWORD cap);
 const char *vx_root(void);
 int   vx_full_path(const char *win, char *out, size_t cap);     // canonical absolute Windows path
 int   vx_unix_path(const char *win, char *out, size_t cap);     // 0 (last error set) if unmapped
+int   vx_unix_path_write(const char *win, char *out, size_t cap, int keep_contents);   // writes: through VXRT_OVERLAY
 void  vx_windows_path(const char *unix_path, char *out, size_t cap);
 void  vx_get_cwd(char *out, size_t cap);
 int   vx_set_cwd(const char *win);

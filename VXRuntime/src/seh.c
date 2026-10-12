@@ -304,6 +304,10 @@ static void __attribute__((noreturn)) dispatch(EXCEPTION_RECORD *rec, CONTEXT *c
 void __attribute__((noreturn)) vx_raise(DWORD code, DWORD flags, DWORD n, const uint64_t *args, CONTEXT *ctx) {
     EXCEPTION_RECORD rec = { code, flags & EXCEPTION_NONCONTINUABLE, NULL, (void *)ctx->rip, n > 15 ? 15 : n, 0, {0} };
     if (args) memcpy(rec.info, args, rec.nparams * 8);
+    if (vx_trace && code != 0xe06d7363 && code != 0x406d1388) {   // not C++ exceptions or thread names
+        const vx_image *m = vx_image_at(ctx->rip);
+        vx_log("RaiseException %#x from %s+%#llx", code, m ? m->name : "?", m ? (unsigned long long)(ctx->rip - (uint64_t)m->base) : (unsigned long long)ctx->rip);
+    }
     dispatch(&rec, ctx);
 }
 
@@ -400,7 +404,13 @@ static void signal_dispatch(EXCEPTION_RECORD *rec, CONTEXT *ctx) { dispatch(rec,
 static void on_signal(int sig, siginfo_t *si, void *ucv) {
     ucontext_t *uc = ucv;
     _STRUCT_X86_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
-    if (!pc_in_image(ss->__rip)) {
+    // The program calling a bad address (a null function pointer): the fault is the program's, at the call. Its
+    // caller is the frame to unwind from, as Windows treats the unknown address as a leaf function.
+    uint64_t ret = 0;
+    int bad_call = !pc_in_image(ss->__rip) && (sig == SIGSEGV || sig == SIGBUS) && (ss->__rip < 4096 || (uint64_t)si->si_addr == ss->__rip) &&
+                   ss->__rsp && pc_in_image(ret = *(uint64_t *)ss->__rsp);
+    if (bad_call) vx_log("the program called %#llx from %#llx", (unsigned long long)ss->__rip, (unsigned long long)ret);
+    if (!pc_in_image(ss->__rip) && !bad_call) {
         // A fault in this runtime or in macOS code is a bug here, not the program's exception.
         // Print where (this runtime's frames) and exit at once rather than waiting for a macOS crash report.
         vx_log("signal %d at %#llx (address %p) outside the program; native backtrace:", sig, (unsigned long long)ss->__rip, si->si_addr);
@@ -426,6 +436,7 @@ static void on_signal(int sig, siginfo_t *si, void *ucv) {
                           ss->__r8, ss->__r9, ss->__r10, ss->__r11, ss->__r12, ss->__r13, ss->__r14, ss->__r15 };
     memcpy(c->gpr, regs, sizeof regs);
     c->rip = ss->__rip;
+    if (bad_call) { c->rip = ret; c->gpr[4] += 8; }             // unwound past the leaf "function" at the bad address
     c->eflags = (DWORD)ss->__rflags;
     c->mxcsr = uc->uc_mcontext->__fs.__fpu_mxcsr;
     memcpy(c->xmm, &uc->uc_mcontext->__fs.__fpu_xmm0, 16 * 16);

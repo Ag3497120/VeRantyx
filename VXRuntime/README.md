@@ -10,6 +10,10 @@ build/vxrt program.exe [args...]
 VXRT_TRACE=1 build/vxrt program.exe     # also lists imports that are not implemented yet
 VXRT_DUMP_SHADERS=dir build/vxrt game.exe   # writes every translated shader (Metal source) to dir
 build/vxrt build/dllprobe.exe 'Z:\path\to\some.dll' [export ...]   # how far a real DLL gets
+build/dxbcscan [-s N] [-t N] files...      # translates (and Metal-compiles) every DXBC shader found in the files
+VXRT_OVERLAY=/game/dir:/scratch/dir build/vxrt game.exe   # the game's own folder stays unchanged: writes go to /scratch/dir
+VXRT_MUTE=1 ...                            # sound output is silent
+VXRT_TRACE=1 VXRT_DEBUGGER=1 ...           # programs that log to a debugger (OutputDebugString) show their logs
 ```
 
 `C:\` is `$VXRT_ROOT/drive_c` (default `~/.vxrt/drive_c`, created on first run with `C:\windows\system32` and
@@ -50,6 +54,7 @@ Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the 
 | 8a. XAudio2 2.8/2.9 on Core Audio: mastering, submix and source voices, an engine thread mixing 10 ms passes (8/16/24/32-bit and float PCM, resampling by frequency ratio, loops, output matrices, volumes), voice and engine callbacks; effects and filters accepted but not applied | `tests/xaudio2.c` (`--tone` plays a quiet tone) | Works (2026-10-12) |
 | 8b. Translator robustness against real shaders (`tools/dxbcscan`: the DXBC in DLLs and in Half-Life: Alyx's shader archives, translated and compiled by Metal): gathers, LOD, sample info and positions, attribute evaluation, subroutine calls, doubles (as floats), carry/borrow/swap, msad; append/consume buffers and UAV counters, typed UAV atomics; texture views (format, mips, slices, type) and typed buffer views | `tests/compute.c`, `tests/shaders/features_*.hlsl`, a sample of Alyx's 507,000 shader permutations all translate and compile | Works (2026-10-12) |
 | 8c. Texture formats and dimensions: block-compressed BC1–BC7 (uploads, partial updates, copies and Map in 4x4 blocks), integer/snorm/16-bit/32-bit variants, typeless depth buffers and stencil views, 1D and 3D textures (and 3D render target slices) | `tests/compute.c` | Works (2026-10-12) |
+| 8d. Half-Life: Alyx (`hlvr.exe -novr -dx11`) starts: its ~40 DLLs load and initialize, the DX11 render system creates a device on Metal, settings are written (through the overlay), up to the point where the game needs the Steam client's networking. On the way: address-space walks (VirtualQuery coalesces macOS's regions), calls through null pointers become the program's exceptions, the thread pool, timer queues and waitable timers, PE resources, processor topology, Direct3D 9 adapter queries, D3D11 queries, DXGI 1.4 interfaces, and a few hundred more Win32 functions (`system.c`, `desktop.c`, `services.c`) | running the game (not committed: it is the user's copy) | Works up to Steam (2026-10-12) |
 | 8. Geometry and tessellation shaders (Metal has neither: emulation with compute), audio capture, FH4 C++ exceptions (needs MSVC-built test programs), Direct3D 11 at game scale | — | Next |
 | 9. Direct3D 12 (Metal Shader Converter), OpenGL | — | |
 | 10. Cryptography, processes, Chromium-class programs (the Steam client) | — | |

@@ -30,11 +30,12 @@ void vx_log(const char *fmt, ...) {
 
 // ---- built-in module registry ------------------------------------------------------------------------------------
 typedef struct { const char *dll; const vx_export *exports; size_t count; } vx_module;
-static vx_module g_modules[128];
+static vx_module g_modules[512];
 static size_t g_module_count;
 
 void vx_register_module(const char *dll, const vx_export *exports, size_t count) {
-    if (g_module_count < 128) g_modules[g_module_count++] = (vx_module){ dll, exports, count };
+    if (g_module_count < sizeof g_modules / sizeof g_modules[0]) g_modules[g_module_count++] = (vx_module){ dll, exports, count };
+    else vx_log("too many export tables: %s is left out", dll);
 }
 
 // API sets resolve to the DLL that implements them.
@@ -70,14 +71,14 @@ void *vx_find_export(const char *dll, const char *name) {
 }
 
 // A module handle for a built-in DLL is a pointer to a stored copy of its name.
-static char g_builtin_names[64][64];
+static char g_builtin_names[256][64];
 static int g_builtin_count;
 static void *builtin_handle(const char *name) {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&lock);
     void *h = NULL;
     for (int i = 0; i < g_builtin_count && !h; i++) if (same_dll(g_builtin_names[i], name)) h = g_builtin_names[i];
-    if (!h && g_builtin_count < 64) { snprintf(g_builtin_names[g_builtin_count], 64, "%s", name); h = g_builtin_names[g_builtin_count++]; }
+    if (!h && g_builtin_count < 256) { snprintf(g_builtin_names[g_builtin_count], 64, "%s", name); h = g_builtin_names[g_builtin_count++]; }
     pthread_mutex_unlock(&lock);
     return h;
 }
@@ -551,6 +552,7 @@ static WINAPI void *GetProcAddress(void *module, const char *name) {
     void *fn = m ? pe_export(m, ordinal ? NULL : name, ordinal, 0) : builtin ? vx_find_export((const char *)module, ordinal ? by_number : name) : NULL;
     pthread_mutex_unlock(&g_loader_lock);
     if (!fn) vx_set_last_error(m || builtin ? 127 /* ERROR_PROC_NOT_FOUND */ : 6 /* ERROR_INVALID_HANDLE */);
+    if (!fn && vx_trace) vx_log("GetProcAddress(%s, %s) failed", m ? m->name : builtin ? (const char *)module : "?", ordinal ? by_number : name);
     return fn;
 }
 
@@ -610,6 +612,9 @@ int main(int argc, char **argv, char **envp) {
     if (argc < 2) { fprintf(stderr, "usage: vxrt program.exe [args...]\n"); return 2; }
     vx_trace = getenv("VXRT_TRACE") && *getenv("VXRT_TRACE") == '1';
     vx_kernel32_init();
+    vx_system_init();
+    vx_desktop_init();
+    vx_services_init();
     vx_register_module("kernel32.dll", loader_k32, sizeof loader_k32 / sizeof loader_k32[0]);
     vx_register_module("kernelbase.dll", loader_k32, sizeof loader_k32 / sizeof loader_k32[0]);
     vx_ucrt_init();
@@ -628,6 +633,7 @@ int main(int argc, char **argv, char **envp) {
     vx_xaudio2_init();
     vx_d3d11_init();
     vx_dxgi_init();
+    vx_d3d9_init();
     vx_vcruntime_init();
 
     vx_proc.argc = argc - 1;

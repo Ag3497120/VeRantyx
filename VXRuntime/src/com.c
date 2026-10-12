@@ -368,6 +368,20 @@ static WINAPI HRESULT PropVariantClear(VARIANT *v) {
     if (v->vt == VT_LPSTR || v->vt == VT_LPWSTR || v->vt == VT_CLSID) { CoTaskMemFree(v->v.ptr); v->vt = VT_EMPTY; v->v.u8 = 0; return S_OK; }
     return VariantClear(v);
 }
+// PropVariantCopy: strings and GUIDs the PROPVARIANT points to are copied with CoTaskMemAlloc.
+static WINAPI HRESULT PropVariantCopy(VARIANT *dst, const VARIANT *src) {
+    if (src->vt == VT_LPSTR || src->vt == VT_LPWSTR || src->vt == VT_CLSID) {
+        size_t n = src->vt == VT_CLSID ? 16 : src->vt == VT_LPSTR ? strlen(src->v.ptr) + 1 : (vx_wcslen(src->v.ptr) + 1) * 2;
+        void *copy = CoTaskMemAlloc(n);
+        if (!copy) return E_OUTOFMEMORY;
+        memcpy(copy, src->v.ptr, n);
+        *dst = *src;
+        dst->v.ptr = copy;
+        return S_OK;
+    }
+    VariantInit(dst);
+    return VariantCopy(dst, src);
+}
 
 // ---- SAFEARRAY -------------------------------------------------------------------------------------------------------------------
 #define FADF_HAVEVARTYPE 0x80
@@ -500,7 +514,10 @@ static const vx_export ole32[] = {
     E(CoCreateInstance), E(CoCreateInstanceEx), E(CoGetClassObject), E(CoRegisterClassObject), E(CoRevokeClassObject),
     E(CoTaskMemAlloc), E(CoTaskMemRealloc), E(CoTaskMemFree), E(CoGetMalloc), E(CoCreateGuid),
     E(StringFromGUID2), E(StringFromCLSID), { "StringFromIID", (void *)StringFromCLSID }, E(CLSIDFromString), E(IIDFromString),
-    E(PropVariantClear),
+    E(PropVariantClear), E(PropVariantCopy),
+    // Some programs look these up in ole32 too.
+    E(SysAllocString), E(SysAllocStringLen), E(SysAllocStringByteLen), E(SysFreeString), E(SysStringLen), E(SysStringByteLen),
+    E(SysReAllocString), E(SysReAllocStringLen), E(VariantInit), E(VariantClear), E(VariantCopy),
 };
 static const vx_export oleaut32[] = {
     E(SysAllocString), E(SysAllocStringLen), E(SysAllocStringByteLen), E(SysFreeString), E(SysStringLen), E(SysStringByteLen),

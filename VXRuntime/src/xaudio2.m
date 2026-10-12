@@ -94,6 +94,9 @@ static OSStatus output_callback(void *ctx, AudioUnitRenderActionFlags *flags, co
     uint32_t take = (uint32_t)(avail < n ? avail : n);
     for (uint32_t i = 0; i < take; i++) memcpy(out + (size_t)i * ch, e->ring + (size_t)((e->read + i) % e->ring_frames) * ch, ch * sizeof(float));
     memset(out + (size_t)take * ch, 0, (size_t)(n - take) * ch * sizeof(float));
+    static int muted = -1;                                      // VXRT_MUTE=1: silence (for unattended runs)
+    if (muted < 0) muted = getenv("VXRT_MUTE") && atoi(getenv("VXRT_MUTE"));
+    if (muted) memset(out, 0, (size_t)n * ch * sizeof(float));
     __atomic_add_fetch(&e->read, take, __ATOMIC_RELEASE);
     dispatch_semaphore_signal(ROOM(e));
     return noErr;

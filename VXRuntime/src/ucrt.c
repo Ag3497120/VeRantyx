@@ -176,7 +176,8 @@ static vx_file *open_file(const char *path, const char *mode) {
     for (const char *p = mode; *p && *p != ',' && k < sizeof m - 1; p++)
         if (strchr("rwa+bx", *p)) m[k++] = *p;
     m[k] = 0;
-    if (!vx_unix_path(path, unix_path, sizeof unix_path)) { set_errno(2); return NULL; }
+    int writes = strpbrk(m, "wa+") != NULL;
+    if (!(writes ? vx_unix_path_write(path, unix_path, sizeof unix_path, m[0] != 'w') : vx_unix_path(path, unix_path, sizeof unix_path))) { set_errno(2); return NULL; }
     FILE *f = fopen(unix_path, m);
     if (!f) { set_errno(errno == ENOENT ? 2 : errno == EACCES ? 13 : errno == EEXIST ? 17 : errno == EISDIR ? 13 : 22); return NULL; }
     vx_file *v = malloc(sizeof *v);
@@ -216,7 +217,7 @@ static WINAPI void vx_rewind(vx_file *f) { if (f->f) rewind(f->f); }
 // Path functions of the C runtime: Windows paths, errno values that Windows shares with macOS (2, 13, 17, ...).
 static int path_call(const char *path, int (*op)(const char *)) {
     char unix_path[4096];
-    if (!vx_unix_path(path, unix_path, sizeof unix_path)) { set_errno(2); return -1; }
+    if (!vx_unix_path_write(path, unix_path, sizeof unix_path, 0)) { set_errno(2); return -1; }   // changes: through any overlay
     if (op(unix_path)) { set_errno(errno); return -1; }
     return 0;
 }
@@ -226,7 +227,7 @@ static WINAPI int vx_rmdir(const char *p) { return path_call(p, rmdir); }
 static WINAPI int vx_mkdir(const char *p) { return path_call(p, mkdir_default); }
 static WINAPI int vx_rename(const char *from, const char *to) {
     char a[4096], b[4096];
-    if (!vx_unix_path(from, a, sizeof a) || !vx_unix_path(to, b, sizeof b)) { set_errno(2); return -1; }
+    if (!vx_unix_path(from, a, sizeof a) || !vx_unix_path_write(to, b, sizeof b, 0)) { set_errno(2); return -1; }
     if (rename(a, b)) { set_errno(errno); return -1; }
     return 0;
 }

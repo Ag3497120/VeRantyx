@@ -282,3 +282,8 @@ _vx_longjmp:
     movdqu 0xf0(%rcx), %xmm15
     movq 0x10(%rcx), %rsp
     jmpq *0x50(%rcx)
+
+// __chkstk (see desktop.c): stacks are mapped whole, so the probe only returns; every register is kept.
+    .globl _vx_chkstk
+_vx_chkstk:
+    ret

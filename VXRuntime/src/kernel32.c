@@ -76,7 +76,10 @@ static WINAPI BOOL TerminateProcess(HANDLE h, DWORD code) { (void)h; ExitProcess
 // ---- errors, debugging, process info -------------------------------------------------------------------------------
 static WINAPI DWORD GetLastError(void) { return vx_get_last_error(); }
 static WINAPI void SetLastError(DWORD e) { vx_set_last_error(e); }
-static WINAPI BOOL IsDebuggerPresent(void) { return 0; }
+// VXRT_DEBUGGER=1 says a debugger is attached: programs then send their logs to OutputDebugString (shown with
+// VXRT_TRACE=1). Breakpoints still go to the program's handlers.
+static WINAPI BOOL IsDebuggerPresent(void) { static int on = -1; if (on < 0) on = getenv("VXRT_DEBUGGER") && atoi(getenv("VXRT_DEBUGGER")); return on; }
+static WINAPI BOOL CheckRemoteDebuggerPresent(HANDLE p, BOOL *present) { (void)p; *present = 0; return 1; }
 static WINAPI DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 static WINAPI DWORD GetCurrentThreadId(void) { return vx_current_tid(); }
 static WINAPI HANDLE GetCurrentProcess(void) { return (HANDLE)(intptr_t)-1; }
@@ -484,6 +487,8 @@ typedef struct { void *base, *alloc_base; DWORD alloc_protect; uint16_t partitio
 static WINAPI size_t VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mbi, size_t len) {
     if (len < sizeof *mbi) { vx_set_last_error(24 /* ERROR_BAD_LENGTH */); return 0; }
     uintptr_t page = (uintptr_t)addr & ~(uintptr_t)0xfff;
+    const uintptr_t top = 0x7ffffffeffffull + 1;               // past the highest application address
+    if (page >= top) { vx_set_last_error(87); return 0; }
     memset(mbi, 0, sizeof *mbi);
     mbi->base = (void *)page;
     const vx_image *img = vx_image_at(page);
@@ -505,11 +510,25 @@ static WINAPI size_t VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mb
     vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
     kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj);
     if (kr == KERN_SUCCESS && a <= page) {
+        // Mapped by macOS (the system's libraries, malloc, Rosetta): adjacent mappings are reported as one region,
+        // as programs walking the address space expect Windows' few hundred regions, not macOS's tens of thousands.
+        mach_vm_address_t end = a + sz;
+        for (int i = 0; i < 100000 && end < top && !vx_image_at(end); i++) {
+            mach_vm_address_t n = end; mach_vm_size_t nsz = 0;
+            count = VM_REGION_BASIC_INFO_COUNT_64;
+            if (mach_vm_region(mach_task_self(), &n, &nsz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS || n != end) break;
+            pthread_mutex_lock(&g_vm_lock);
+            reservation *next = find_reservation(n);
+            pthread_mutex_unlock(&g_vm_lock);
+            if (next) break;
+            end = n + nsz;
+        }
+        if (end > top) end = top;
         mbi->alloc_base = (void *)a; mbi->alloc_protect = mbi->protect = PAGE_EXECUTE_READWRITE;
-        mbi->region = a + sz - page; mbi->state = MEM_COMMIT; mbi->type = MEM_PRIVATE;
+        mbi->region = end - page; mbi->state = MEM_COMMIT; mbi->type = MEM_PRIVATE;
     } else {
         mbi->state = MEM_FREE; mbi->protect = 0x01;      // PAGE_NOACCESS
-        mbi->region = (kr == KERN_SUCCESS ? a : 0x7fffffff0000ull) - page;
+        mbi->region = (kr == KERN_SUCCESS && a < top ? a : top) - page;
     }
     return sizeof *mbi;
 }
@@ -527,7 +546,14 @@ static WINAPI void *HeapReAlloc(HANDLE h, DWORD flags, void *p, size_t n) {
     if (q && (flags & HEAP_ZERO_MEMORY) && n > old) memset((char *)q + old, 0, n - old);
     return q;
 }
-static WINAPI BOOL HeapFree(HANDLE h, DWORD f, void *p) { (void)h; (void)f; free(p); return 1; }
+// A pointer no heap gave out is reported (with the caller) and left alone, rather than crashing in free().
+static int heap_pointer(const void *p, const char *what, void *caller) {
+    if (!p || malloc_zone_from_ptr(p)) return 1;
+    vx_log("%s of %p, which no heap allocated (called from %p)", what, p, caller);
+    vx_set_last_error(87);
+    return 0;
+}
+static WINAPI BOOL HeapFree(HANDLE h, DWORD f, void *p) { (void)h; (void)f; if (!heap_pointer(p, "HeapFree", __builtin_return_address(0))) return 0; free(p); return 1; }
 static WINAPI size_t HeapSize(HANDLE h, DWORD f, const void *p) { (void)h; (void)f; return malloc_size(p); }
 
 // ---- messages and debugging output ----------------------------------------------------------------------------------------
@@ -542,7 +568,7 @@ static WINAPI DWORD FormatMessageA(DWORD flags, const void *src, DWORD id, DWORD
     return (DWORD)n;
 }
 static WINAPI void *LocalAlloc(DWORD flags, size_t n) { return flags & 0x40 /* LMEM_ZEROINIT */ ? calloc(1, n ? n : 1) : malloc(n ? n : 1); }
-static WINAPI void *LocalFree(void *p) { free(p); return NULL; }
+static WINAPI void *LocalFree(void *p) { if (!heap_pointer(p, "LocalFree", __builtin_return_address(0))) return p; free(p); return NULL; }
 static WINAPI void OutputDebugStringA(const char *s) { if (vx_trace) vx_log("debug: %s", s); }
 
 // ---- system info -----------------------------------------------------------------------------------------------------------
@@ -561,7 +587,7 @@ static WINAPI void GetNativeSystemInfo(SYSTEM_INFO *si) { GetSystemInfo(si); }
 static const vx_export k32[] = {
     VX_EXPORT(GetStdHandle), VX_EXPORT(WriteFile), VX_EXPORT(WriteConsoleA), VX_EXPORT(WriteConsoleW),
     VX_EXPORT(ExitProcess), VX_EXPORT(TerminateProcess),
-    VX_EXPORT(GetLastError), VX_EXPORT(SetLastError), VX_EXPORT(IsDebuggerPresent),
+    VX_EXPORT(GetLastError), VX_EXPORT(SetLastError), VX_EXPORT(IsDebuggerPresent), VX_EXPORT(CheckRemoteDebuggerPresent),
     VX_EXPORT(GetCurrentProcessId), VX_EXPORT(GetCurrentThreadId), VX_EXPORT(GetCurrentProcess), VX_EXPORT(GetCurrentThread),
     VX_EXPORT(GetCommandLineA), VX_EXPORT(GetCommandLineW), VX_EXPORT(GetStartupInfoA), VX_EXPORT(GetStartupInfoW),
     VX_EXPORT(Sleep), VX_EXPORT(QueryPerformanceFrequency), VX_EXPORT(QueryPerformanceCounter),

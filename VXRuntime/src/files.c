@@ -95,6 +95,39 @@ int vx_full_path(const char *in, char *out, size_t cap) {
     return 1;
 }
 
+// An overlay keeps a directory tree as it is: with VXRT_OVERLAY=<tree>:<overlay>, files written under <tree> go to
+// the same place under <overlay> (and are read from there afterwards). Directory listings show the original.
+static char g_ov_tree[MAX_PATH_LEN], g_ov_shadow[MAX_PATH_LEN];
+static size_t g_ov_len;
+// (Paths compare without case, as on the Mac's file systems.)
+static int overlay_shadow(const char *path, char *out, size_t cap) {
+    if (!g_ov_len || strncasecmp(path, g_ov_tree, g_ov_len) || (path[g_ov_len] && path[g_ov_len] != '/')) return 0;
+    int n = snprintf(out, cap, "%s%s", g_ov_shadow, path + g_ov_len);
+    return n > 0 && (size_t)n < cap;
+}
+static void make_parent_dirs(const char *path) {
+    char p[MAX_PATH_LEN];
+    snprintf(p, sizeof p, "%s", path);
+    for (char *c = p + 1; *c; c++) if (*c == '/') { *c = 0; mkdir(p, 0777); *c = '/'; }
+}
+static void copy_file(const char *from, const char *to) {
+    int in = open(from, O_RDONLY | O_CLOEXEC), out = in < 0 ? -1 : open(to, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    char buf[65536]; ssize_t n;
+    if (out >= 0) while ((n = read(in, buf, sizeof buf)) > 0) if (write(out, buf, (size_t)n) != n) break;
+    if (in >= 0) close(in);
+    if (out >= 0) close(out);
+}
+static void overlay_init(void) {
+    const char *ov = getenv("VXRT_OVERLAY");
+    const char *colon = ov ? strchr(ov, ':') : NULL;
+    if (!colon || colon == ov || !colon[1]) return;
+    snprintf(g_ov_tree, sizeof g_ov_tree, "%.*s", (int)(colon - ov), ov);
+    snprintf(g_ov_shadow, sizeof g_ov_shadow, "%s", colon + 1);
+    while (strlen(g_ov_tree) > 1 && g_ov_tree[strlen(g_ov_tree) - 1] == '/') g_ov_tree[strlen(g_ov_tree) - 1] = 0;
+    g_ov_len = strlen(g_ov_tree);
+    mkdir(g_ov_shadow, 0777);
+}
+
 // Windows path -> Mac path. Returns 0 (with the last error set) for paths outside the mapped drives.
 int vx_unix_path(const char *win, char *out, size_t cap) {
     char full[MAX_PATH_LEN];
@@ -107,6 +140,23 @@ int vx_unix_path(const char *win, char *out, size_t cap) {
     else { vx_set_last_error(3 /* ERROR_PATH_NOT_FOUND */); return 0; }
     if (n < 0 || (size_t)n >= cap) { vx_set_last_error(206); return 0; }
     for (char *c = out; *c; c++) if (*c == '\\') *c = '/';
+    char shadow[MAX_PATH_LEN];
+    struct stat ss, os;
+    if (overlay_shadow(out, shadow, sizeof shadow) && !stat(shadow, &ss) && (!S_ISDIR(ss.st_mode) || stat(out, &os)))
+        snprintf(out, cap, "%s", shadow);             // written before: the overlay's copy (directories stay the original)
+    return 1;
+}
+
+// For writing: under an overlaid tree, the path in the overlay, its directories made and (keep_contents) the
+// original's contents copied there first.
+int vx_unix_path_write(const char *win, char *out, size_t cap, int keep_contents) {
+    if (!vx_unix_path(win, out, cap)) return 0;
+    char shadow[MAX_PATH_LEN];
+    if (!overlay_shadow(out, shadow, sizeof shadow)) return 1;
+    make_parent_dirs(shadow);
+    struct stat st;
+    if (keep_contents && !stat(out, &st) && S_ISREG(st.st_mode)) copy_file(out, shadow);
+    snprintf(out, cap, "%s", shadow);
     return 1;
 }
 
@@ -188,9 +238,11 @@ static HANDLE create_file(const char *name, DWORD access, DWORD disposition) {
     if (!strcasecmp(name, "CONOUT$")) return (HANDLE)(intptr_t)-11;
     if (!strcasecmp(name, "CONIN$")) return (HANDLE)(intptr_t)-10;
     char path[MAX_PATH_LEN];
-    if (!vx_unix_path(name, path, sizeof path)) return INVALID_HANDLE;
     int rd = (access & (GENERIC_READ | GENERIC_ALL | FILE_READ_DATA)) != 0;
     int wr = (access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+    int writes = wr || disposition == 1 || disposition == 2 || disposition == 4 || disposition == 5;
+    if (!(writes ? vx_unix_path_write(name, path, sizeof path, disposition != 2 && disposition != 5) : vx_unix_path(name, path, sizeof path)))
+        return INVALID_HANDLE;
     int flags = wr ? (rd ? O_RDWR : O_WRONLY) : O_RDONLY;
     switch (disposition) {
     case 1: flags |= O_CREAT | O_EXCL; break;    // CREATE_NEW
@@ -384,8 +436,13 @@ static WINAPI BOOL PeekNamedPipe(HANDLE h, void *buf, DWORD n, DWORD *got, DWORD
 // ---- directories, deleting, moving, copying ---------------------------------------------------------------------------------
 // Runs op on the Mac path of a Windows path; returns the Windows BOOL.
 static BOOL path_op(const char *name, int (*op)(const char *)) {
-    char path[MAX_PATH_LEN];
+    char path[MAX_PATH_LEN], shadow[MAX_PATH_LEN];
     if (!vx_unix_path(name, path, sizeof path)) return 0;
+    if (overlay_shadow(path, shadow, sizeof shadow)) {      // the original tree stays: act on the overlay only
+        if (op == rmdir || op == unlink) return 1;
+        make_parent_dirs(shadow);
+        snprintf(path, sizeof path, "%s", shadow);
+    }
     if (op(path)) { set_error_from_errno(); return 0; }
     return 1;
 }
@@ -404,10 +461,12 @@ static WINAPI BOOL DeleteFileW(const WCHAR *name) { WIDE_PATH(name, a); BOOL r =
 
 #define MOVEFILE_REPLACE_EXISTING 1
 static WINAPI BOOL MoveFileExA(const char *from, const char *to, DWORD flags) {
-    char a[MAX_PATH_LEN], b[MAX_PATH_LEN];
+    char a[MAX_PATH_LEN], b[MAX_PATH_LEN], shadow[MAX_PATH_LEN];
     if (!vx_unix_path(from, a, sizeof a) || !vx_unix_path(to, b, sizeof b)) return 0;
     struct stat st;
     if (!(flags & MOVEFILE_REPLACE_EXISTING) && !stat(b, &st) && strcasecmp(a, b)) { vx_set_last_error(183); return 0; }
+    if (!vx_unix_path_write(to, b, sizeof b, 0)) return 0;
+    if (overlay_shadow(a, shadow, sizeof shadow)) { unlink(b); copy_file(a, b); return 1; }   // the original stays
     if (rename(a, b)) { set_error_from_errno(); return 0; }
     return 1;
 }
@@ -422,7 +481,7 @@ static WINAPI BOOL MoveFileW(const WCHAR *from, const WCHAR *to) { return MoveFi
 
 static WINAPI BOOL CopyFileA(const char *from, const char *to, BOOL fail_if_exists) {
     char a[MAX_PATH_LEN], b[MAX_PATH_LEN];
-    if (!vx_unix_path(from, a, sizeof a) || !vx_unix_path(to, b, sizeof b)) return 0;
+    if (!vx_unix_path(from, a, sizeof a) || !vx_unix_path_write(to, b, sizeof b, 0)) return 0;
     int in = open(a, O_RDONLY | O_CLOEXEC);
     if (in < 0) { set_error_from_errno(); return 0; }
     int out = open(b, O_WRONLY | O_CREAT | O_CLOEXEC | (fail_if_exists ? O_EXCL : O_TRUNC), 0666);
@@ -670,6 +729,7 @@ static void make_dirs(const char *rel) {
 }
 
 void vx_files_init(void) {
+    overlay_init();
     const char *root = getenv("VXRT_ROOT");
     if (root && *root) {
         if (root[0] == '/') snprintf(g_root, sizeof g_root, "%s", root);

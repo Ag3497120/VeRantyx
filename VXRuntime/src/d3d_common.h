@@ -69,6 +69,7 @@ struct d3d_device {
     d3d_object *context;             // the immediate context
     d3d_object *adapter;             // IDXGIAdapter1, made on demand
     uint32_t flags, feature_level, max_latency;
+    volatile uint64_t submitted, completed;   // command buffers committed, and the last one the GPU finished
 };
 typedef struct {
     d3d_object base;                 // ID3D11Texture2D (or 1D, 3D)

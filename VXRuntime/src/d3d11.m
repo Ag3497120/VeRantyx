@@ -360,6 +360,12 @@ void d3d_flush(d3d_device *dev, int wait) {
     }
     id<MTLCommandBuffer> cmd = CFBridgingRelease(c->cmd);
     c->cmd = NULL;
+    uint64_t seq = __atomic_add_fetch(&dev->submitted, 1, __ATOMIC_ACQ_REL);
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        uint64_t prev = __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE);
+        while (prev < seq && !__atomic_compare_exchange_n(&dev->completed, &prev, seq, 1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+    }];
     [cmd commit];
     if (wait) [cmd waitUntilCompleted];
 }
@@ -813,6 +819,7 @@ static void make_tables(void) {
 static WINAPI HRESULT D3D11CreateDevice(void *adapter, uint32_t driver, HANDLE software, uint32_t flags, const uint32_t *levels,
                                         uint32_t nlevels, uint32_t sdk, void **out_device, uint32_t *out_level, void **out_context) {
     (void)adapter; (void)driver; (void)software; (void)sdk;
+    if (vx_trace) vx_log("D3D11CreateDevice(driver %u, flags %#x, %u levels)", driver, flags, nlevels);
     pthread_once(&g_tables_once, make_tables);
     // Metal offers what feature level 11_0 needs; a program asking only for higher levels is refused.
     uint32_t level = 0;
