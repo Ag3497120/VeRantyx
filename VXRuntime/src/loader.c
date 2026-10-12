@@ -151,6 +151,8 @@ static uint8_t *load_image(const char *path, uint32_t *entry_rva, pe_dir *dirs) 
     if (missing) vx_log("%d imported functions are not implemented yet (stubs stop the program if called)", missing);
     vx_proc.image_base = base;
     vx_proc.image_size = image_size;
+    vx_proc.pdata_rva = dirs[3].va;
+    vx_proc.pdata_size = dirs[3].size;
     free(file);
     return base;
 }
@@ -199,7 +201,7 @@ void vx_thread_attach(void) {
     *(void **)(teb + TEB_SELF) = teb;
     *(uint64_t *)(teb + TEB_CLIENT_ID) = (uint64_t)getpid();
     uint64_t tid; pthread_threadid_np(NULL, &tid);
-    *(uint64_t *)(teb + TEB_CLIENT_ID + 8) = tid;
+    *(uint64_t *)(teb + TEB_CLIENT_ID + 8) = (DWORD)tid;
     *(void **)(teb + TEB_PEB) = g_peb;
     init_thread_tls(teb);
     pthread_setspecific(g_teb_key, teb);
@@ -209,7 +211,7 @@ void vx_thread_attach(void) {
 void vx_set_last_error(DWORD e) { *(DWORD *)(vx_teb() + TEB_LAST_ERROR) = e; }
 DWORD vx_get_last_error(void) { return *(DWORD *)(vx_teb() + TEB_LAST_ERROR); }
 
-static void call_tls_callbacks(DWORD reason) {
+void vx_call_tls_callbacks(DWORD reason) {
     if (!g_tls_dir.size) return;
     const uint8_t *td = vx_proc.image_base + g_tls_dir.va;
     uint64_t callbacks = rd64(td + 24);
@@ -223,6 +225,8 @@ int main(int argc, char **argv, char **envp) {
     vx_trace = getenv("VXRT_TRACE") && *getenv("VXRT_TRACE") == '1';
     vx_kernel32_init();
     vx_ucrt_init();
+    vx_sync_init();
+    vx_seh_init();
 
     vx_proc.argc = argc - 1;
     vx_proc.argv = argv + 1;
@@ -249,7 +253,8 @@ int main(int argc, char **argv, char **envp) {
     vx_thread_attach();
     if (vx_trace) vx_log("%s mapped at %p, entry %#x", argv[1], vx_proc.image_base, entry_rva);
 
-    call_tls_callbacks(1 /* DLL_PROCESS_ATTACH */);
+    vx_seh_install_signals();
+    vx_call_tls_callbacks(1 /* DLL_PROCESS_ATTACH */);
     typedef DWORD (WINAPI *entry_fn)(void);
     DWORD rc = ((entry_fn)(vx_proc.image_base + entry_rva))();
     fflush(stdout);

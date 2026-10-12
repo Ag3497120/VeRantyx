@@ -178,8 +178,10 @@ static WINAPI void vx_exit(int code) { run_atexit(); _exit(code); }
 static WINAPI void vx__exit(int code) { _exit(code); }
 static WINAPI void vx_abort(void) { vx_log("the program called abort()"); _exit(3); }
 
-// Structured exception handling is not implemented yet: handlers never claim an exception.
-static WINAPI int __C_specific_handler(void *rec, void *frame, void *ctx, void *disp) { (void)rec; (void)frame; (void)ctx; (void)disp; return 1; }
+
+// errno is per thread on Windows too.
+static __thread int t_errno;
+static int *g_errno_ptr(void) { return &t_errno; }
 
 // ---- heap, memory, strings ---------------------------------------------------------------------------------------------------
 static WINAPI void *vx_malloc(size_t n) { return malloc(n); }
@@ -215,8 +217,7 @@ static WINAPI int vx_rand(void) { return rand() & 0x7fff; }   // RAND_MAX is 0x7
 static WINAPI void vx_srand(unsigned s) { srand(s); }
 static WINAPI int64_t vx_time64(int64_t *t) { int64_t v = (int64_t)time(NULL); if (t) *t = v; return v; }
 static WINAPI long vx_clock(void) { return (long)(clock() * 1000 / CLOCKS_PER_SEC); }   // CLOCKS_PER_SEC is 1000 on Windows
-static int g_errno;
-static WINAPI int *vx__errno(void) { return &g_errno; }
+static WINAPI int *vx__errno(void) { return g_errno_ptr(); }
 
 // qsort with a Windows-convention comparator.
 typedef int (WINAPI *cmpfn)(const void *, const void *);
@@ -226,6 +227,51 @@ static WINAPI void vx_qsort(void *base, size_t n, size_t sz, cmpfn cmp) {
     cmpfn saved = g_qsort_cmp; g_qsort_cmp = cmp;
     qsort(base, n, sz, qsort_tramp);
     g_qsort_cmp = saved;
+}
+
+// ---- more of the C library (what MinGW's C++ runtime and winpthread import) -----------------------------------------------
+static WINAPI void vx_assert(const char *msg, const char *file, unsigned line) { vx_log("assertion failed: %s (%s:%u)", msg, file, line); _exit(3); }
+static WINAPI int vx_fileno(vx_file *f) { return f->fd; }
+static WINAPI void vx_lock_file(vx_file *f) { (void)f; }
+static WINAPI int vx_read(int fd, void *buf, unsigned n) { return (int)read(fd, buf, n); }
+static WINAPI int vx_setmode(int fd, int mode) { (void)fd; (void)mode; return 0x8000; /* _O_BINARY: no newline translation here */ }
+static WINAPI void *vx_memchr(const void *p, int c, size_t n) { return memchr(p, c, n); }
+static WINAPI size_t vx_strnlen(const char *s, size_t n) { return strnlen(s, n); }
+static WINAPI char *vx_strerror(int e) { return strerror(e); }
+static WINAPI size_t vx_wcslen(const WCHAR *s) { size_t n = 0; while (s[n]) n++; return n; }
+static WINAPI size_t vx_wcsnlen(const WCHAR *s, size_t max) { size_t n = 0; while (n < max && s[n]) n++; return n; }
+static WINAPI int vx_rand_s(unsigned *v) { arc4random_buf(v, sizeof *v); return 0; }
+
+// Windows struct lconv: the char* members first (decimal_point, thousands_sep, grouping, ...), all "C" locale.
+static char *g_lconv[32] = { ".", "", "" };
+static WINAPI void *vx_localeconv(void) {
+    for (int i = 3; i < 10; i++) if (!g_lconv[i]) g_lconv[i] = "";
+    return g_lconv;
+}
+// Multibyte conversions in the "C" locale: bytes map to the first 256 code points.
+static WINAPI size_t vx_mbrtowc(WCHAR *wc, const char *s, size_t n, void *state) {
+    (void)state;
+    if (!s) return 0;
+    if (!n) return (size_t)-2;
+    if (wc) *wc = (uint8_t)*s;
+    return *s ? 1 : 0;
+}
+static WINAPI size_t vx_mbsrtowcs(WCHAR *dst, const char **src, size_t n, void *state) {
+    (void)state;
+    const char *s = *src; size_t i = 0;
+    for (; !dst || i < n; i++) {
+        if (dst) dst[i] = (uint8_t)s[i];
+        if (!s[i]) { if (dst) *src = NULL; return i; }
+    }
+    *src = s + i;
+    return i;
+}
+static WINAPI size_t vx_wcrtomb(char *s, WCHAR wc, void *state) {
+    (void)state;
+    if (!s) return 1;
+    if (wc > 0xff) { g_errno_ptr()[0] = 42 /* EILSEQ */; return (size_t)-1; }
+    *s = (char)wc;
+    return 1;
 }
 
 static const vx_export ucrt[] = {
@@ -240,7 +286,6 @@ static const vx_export ucrt[] = {
     VX_EXPORT(_set_new_mode), { "signal", (void *)vx_signal },
     VX_EXPORT(_initterm), VX_EXPORT(_initterm_e), VX_EXPORT(_crt_atexit), { "atexit", (void *)vx_atexit },
     VX_EXPORT(_cexit), { "exit", (void *)vx_exit }, { "_exit", (void *)vx__exit }, { "abort", (void *)vx_abort },
-    VX_EXPORT(__C_specific_handler),
     { "malloc", (void *)vx_malloc }, { "calloc", (void *)vx_calloc }, { "realloc", (void *)vx_realloc }, { "free", (void *)vx_free },
     { "memcpy", (void *)vx_memcpy }, { "memmove", (void *)vx_memmove }, { "memset", (void *)vx_memset }, { "memcmp", (void *)vx_memcmp },
     { "strlen", (void *)vx_strlen }, { "strcmp", (void *)vx_strcmp }, { "strncmp", (void *)vx_strncmp },
@@ -253,6 +298,12 @@ static const vx_export ucrt[] = {
     { "isdigit", (void *)vx_isdigit }, { "isalpha", (void *)vx_isalpha },
     { "rand", (void *)vx_rand }, { "srand", (void *)vx_srand }, { "_time64", (void *)vx_time64 }, { "clock", (void *)vx_clock },
     { "_errno", (void *)vx__errno }, { "qsort", (void *)vx_qsort },
+    { "_assert", (void *)vx_assert }, { "_fileno", (void *)vx_fileno }, { "_lock_file", (void *)vx_lock_file },
+    { "_unlock_file", (void *)vx_lock_file }, { "_read", (void *)vx_read }, { "_setmode", (void *)vx_setmode },
+    { "memchr", (void *)vx_memchr }, { "strnlen", (void *)vx_strnlen }, { "strerror", (void *)vx_strerror },
+    { "wcslen", (void *)vx_wcslen }, { "wcsnlen", (void *)vx_wcsnlen }, { "rand_s", (void *)vx_rand_s },
+    { "localeconv", (void *)vx_localeconv }, { "mbrtowc", (void *)vx_mbrtowc }, { "mbsrtowcs", (void *)vx_mbsrtowcs },
+    { "wcrtomb", (void *)vx_wcrtomb },
 };
 
 void vx_ucrt_init(void) {

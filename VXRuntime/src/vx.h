@@ -33,6 +33,7 @@ typedef struct {
     char    **envp;
     char     *command_line;
     WCHAR    *command_line_w;
+    uint32_t  pdata_rva, pdata_size;   // the exception directory (.pdata RUNTIME_FUNCTIONs)
 } vx_process;
 extern vx_process vx_proc;
 
@@ -45,6 +46,8 @@ enum {
 enum { PEB_IMAGE_BASE = 0x10, PEB_PROCESS_HEAP = 0x30, PEB_SIZE = 0x1000 };
 uint8_t *vx_teb(void);                 // this thread's TEB (creates it on first use)
 void     vx_thread_attach(void);       // TEB + gs slots + TLS for the calling thread
+void     vx_call_tls_callbacks(DWORD reason);   // the image's TLS callbacks (1 process attach, 2/3 thread attach/detach)
+DWORD    vx_current_tid(void);
 
 // Last error lives in the TEB like on Windows.
 void  vx_set_last_error(DWORD e);
@@ -60,6 +63,9 @@ extern int vx_trace;
 // Module registration entry points (one per source file).
 void vx_kernel32_init(void);
 void vx_ucrt_init(void);
+void vx_sync_init(void);               // threads and kernel objects (sync.c)
+void vx_seh_init(void);                // exceptions (seh.c)
+void vx_seh_install_signals(void);     // CPU faults become Windows exceptions
 
 // Formatting with a Windows va_list (a pointer to 8-byte argument slots).
 int vx_format(char *out, size_t cap, const char *fmt, const char *ap);

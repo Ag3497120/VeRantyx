@@ -66,11 +66,9 @@ static WINAPI BOOL TerminateProcess(HANDLE h, DWORD code) { (void)h; ExitProcess
 // ---- errors, debugging, process info -------------------------------------------------------------------------------
 static WINAPI DWORD GetLastError(void) { return vx_get_last_error(); }
 static WINAPI void SetLastError(DWORD e) { vx_set_last_error(e); }
-static void *g_unhandled_filter;
-static WINAPI void *SetUnhandledExceptionFilter(void *f) { void *old = g_unhandled_filter; g_unhandled_filter = f; return old; }
 static WINAPI BOOL IsDebuggerPresent(void) { return 0; }
 static WINAPI DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
-static WINAPI DWORD GetCurrentThreadId(void) { uint64_t t; pthread_threadid_np(NULL, &t); return (DWORD)t; }
+static WINAPI DWORD GetCurrentThreadId(void) { return vx_current_tid(); }
 static WINAPI HANDLE GetCurrentProcess(void) { return (HANDLE)(intptr_t)-1; }
 static WINAPI HANDLE GetCurrentThread(void) { return (HANDLE)(intptr_t)-2; }
 static WINAPI char *GetCommandLineA(void) { return vx_proc.command_line; }
@@ -99,43 +97,6 @@ static WINAPI void GetSystemTimeAsFileTime(uint64_t *ft) {
     *ft = ((uint64_t)tv.tv_sec + 11644473600ull) * 10000000ull + (uint64_t)tv.tv_usec * 10;   // 100 ns since 1601
 }
 static WINAPI void GetSystemTimePreciseAsFileTime(uint64_t *ft) { GetSystemTimeAsFileTime(ft); }
-
-// ---- critical sections and SRW locks ----------------------------------------------------------------------------------
-// A CRITICAL_SECTION (40 bytes, in the program's memory) holds a pointer to a recursive pthread mutex.
-static pthread_mutex_t *cs_mutex(void *cs) {
-    pthread_mutex_t **slot = (pthread_mutex_t **)cs;
-    if (!*slot) {
-        pthread_mutex_t *m = malloc(sizeof *m);
-        pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-        pthread_mutex_init(m, &a); pthread_mutexattr_destroy(&a);
-        if (!__sync_bool_compare_and_swap(slot, NULL, m)) { pthread_mutex_destroy(m); free(m); }
-    }
-    return *slot;
-}
-static WINAPI void InitializeCriticalSection(void *cs) { memset(cs, 0, 40); cs_mutex(cs); }
-static WINAPI BOOL InitializeCriticalSectionAndSpinCount(void *cs, DWORD spin) { (void)spin; InitializeCriticalSection(cs); return 1; }
-static WINAPI BOOL InitializeCriticalSectionEx(void *cs, DWORD spin, DWORD flags) { (void)spin; (void)flags; InitializeCriticalSection(cs); return 1; }
-static WINAPI void EnterCriticalSection(void *cs) { pthread_mutex_lock(cs_mutex(cs)); }
-static WINAPI BOOL TryEnterCriticalSection(void *cs) { return pthread_mutex_trylock(cs_mutex(cs)) == 0; }
-static WINAPI void LeaveCriticalSection(void *cs) { pthread_mutex_unlock(cs_mutex(cs)); }
-static WINAPI void DeleteCriticalSection(void *cs) {
-    pthread_mutex_t **slot = (pthread_mutex_t **)cs;
-    if (*slot) { pthread_mutex_destroy(*slot); free(*slot); *slot = NULL; }
-}
-// SRW lock: one pointer, holding a pthread rwlock.
-static pthread_rwlock_t *srw(void *l) {
-    pthread_rwlock_t **slot = (pthread_rwlock_t **)l;
-    if (!*slot) {
-        pthread_rwlock_t *r = malloc(sizeof *r); pthread_rwlock_init(r, NULL);
-        if (!__sync_bool_compare_and_swap(slot, NULL, r)) { pthread_rwlock_destroy(r); free(r); }
-    }
-    return *slot;
-}
-static WINAPI void InitializeSRWLock(void *l) { *(void **)l = NULL; }
-static WINAPI void AcquireSRWLockExclusive(void *l) { pthread_rwlock_wrlock(srw(l)); }
-static WINAPI void ReleaseSRWLockExclusive(void *l) { pthread_rwlock_unlock(srw(l)); }
-static WINAPI void AcquireSRWLockShared(void *l) { pthread_rwlock_rdlock(srw(l)); }
-static WINAPI void ReleaseSRWLockShared(void *l) { pthread_rwlock_unlock(srw(l)); }
 
 // ---- TLS slots (TEB + 0x1480, 64 of them) --------------------------------------------------------------------------------
 static uint64_t g_tls_used;
@@ -248,6 +209,21 @@ static WINAPI DWORD GetModuleFileNameA(void *m, char *buf, DWORD size) {
     return n;
 }
 
+// ---- messages and debugging output ----------------------------------------------------------------------------------------
+#define FORMAT_MESSAGE_ALLOCATE_BUFFER 0x100
+static WINAPI DWORD FormatMessageA(DWORD flags, const void *src, DWORD id, DWORD lang, char *buf, DWORD size, void *args) {
+    (void)src; (void)lang; (void)args;
+    char text[64];
+    int n = snprintf(text, sizeof text, "Windows error %u", id);
+    if (flags & FORMAT_MESSAGE_ALLOCATE_BUFFER) { *(char **)buf = strdup(text); return (DWORD)n; }
+    if (!buf || size <= (DWORD)n) { vx_set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */); return 0; }
+    memcpy(buf, text, (size_t)n + 1);
+    return (DWORD)n;
+}
+static WINAPI void *LocalAlloc(DWORD flags, size_t n) { return flags & 0x40 /* LMEM_ZEROINIT */ ? calloc(1, n ? n : 1) : malloc(n ? n : 1); }
+static WINAPI void *LocalFree(void *p) { free(p); return NULL; }
+static WINAPI void OutputDebugStringA(const char *s) { if (vx_trace) vx_log("debug: %s", s); }
+
 // ---- system info -----------------------------------------------------------------------------------------------------------
 typedef struct { uint16_t arch, reserved; DWORD page; void *min_addr, *max_addr; uint64_t mask; DWORD ncpu, type, gran; uint16_t level, rev; } SYSTEM_INFO;
 static WINAPI void GetSystemInfo(SYSTEM_INFO *si) {
@@ -264,15 +240,11 @@ static WINAPI void GetNativeSystemInfo(SYSTEM_INFO *si) { GetSystemInfo(si); }
 static const vx_export k32[] = {
     VX_EXPORT(GetStdHandle), VX_EXPORT(WriteFile), VX_EXPORT(WriteConsoleA), VX_EXPORT(WriteConsoleW),
     VX_EXPORT(ExitProcess), VX_EXPORT(TerminateProcess),
-    VX_EXPORT(GetLastError), VX_EXPORT(SetLastError), VX_EXPORT(SetUnhandledExceptionFilter), VX_EXPORT(IsDebuggerPresent),
+    VX_EXPORT(GetLastError), VX_EXPORT(SetLastError), VX_EXPORT(IsDebuggerPresent),
     VX_EXPORT(GetCurrentProcessId), VX_EXPORT(GetCurrentThreadId), VX_EXPORT(GetCurrentProcess), VX_EXPORT(GetCurrentThread),
     VX_EXPORT(GetCommandLineA), VX_EXPORT(GetCommandLineW), VX_EXPORT(GetStartupInfoA), VX_EXPORT(GetStartupInfoW),
     VX_EXPORT(Sleep), VX_EXPORT(QueryPerformanceFrequency), VX_EXPORT(QueryPerformanceCounter),
     VX_EXPORT(GetTickCount), VX_EXPORT(GetTickCount64), VX_EXPORT(GetSystemTimeAsFileTime), VX_EXPORT(GetSystemTimePreciseAsFileTime),
-    VX_EXPORT(InitializeCriticalSection), VX_EXPORT(InitializeCriticalSectionAndSpinCount), VX_EXPORT(InitializeCriticalSectionEx),
-    VX_EXPORT(EnterCriticalSection), VX_EXPORT(TryEnterCriticalSection), VX_EXPORT(LeaveCriticalSection), VX_EXPORT(DeleteCriticalSection),
-    VX_EXPORT(InitializeSRWLock), VX_EXPORT(AcquireSRWLockExclusive), VX_EXPORT(ReleaseSRWLockExclusive),
-    VX_EXPORT(AcquireSRWLockShared), VX_EXPORT(ReleaseSRWLockShared),
     VX_EXPORT(TlsAlloc), VX_EXPORT(TlsFree), VX_EXPORT(TlsGetValue), VX_EXPORT(TlsSetValue),
     VX_EXPORT(VirtualAlloc), VX_EXPORT(VirtualFree), VX_EXPORT(VirtualProtect), VX_EXPORT(VirtualQuery),
     VX_EXPORT(GetProcessHeap), VX_EXPORT(HeapCreate), VX_EXPORT(HeapDestroy), VX_EXPORT(HeapAlloc), VX_EXPORT(HeapReAlloc),
@@ -280,6 +252,7 @@ static const vx_export k32[] = {
     VX_EXPORT(GetModuleHandleA), VX_EXPORT(GetModuleHandleW), VX_EXPORT(LoadLibraryA), VX_EXPORT(LoadLibraryW),
     VX_EXPORT(FreeLibrary), VX_EXPORT(GetProcAddress), VX_EXPORT(GetModuleFileNameA),
     VX_EXPORT(GetSystemInfo), VX_EXPORT(GetNativeSystemInfo),
+    VX_EXPORT(FormatMessageA), VX_EXPORT(LocalAlloc), VX_EXPORT(LocalFree), VX_EXPORT(OutputDebugStringA),
 };
 
 void vx_kernel32_init(void) {

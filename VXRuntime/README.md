@@ -27,8 +27,8 @@ Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the 
 | Milestone | Program | State |
 |---|---|---|
 | 1. PE loader, kernel32 core, UCRT startup and printf | `tests/hello_k32.c`, `tests/hello_crt.c` | Works (2026-10-12) |
-| 2. Threads, waits, events, interlocked ops; structured exception handling (.pdata/.xdata unwinding) | — | Next |
-| 3. Files and paths (C:\ mapping), registry, loading real PE DLLs (the game's own: steam_api64, openvr_api) | — | |
+| 2. Threads, waits, events, mutexes, semaphores, condition variables; structured exception handling (.pdata/.xdata unwinding), C++ exceptions, CPU faults as exceptions | `tests/threads.c`, `tests/cxx_exceptions.cpp`, `tests/hw_exceptions.c` | Works (2026-10-12) |
+| 3. Files and paths (C:\ mapping), registry, loading real PE DLLs (the game's own: steam_api64, openvr_api) | — | Next |
 | 4. user32/gdi windows on AppKit, a message loop; Direct3D 11 on Metal (`tools/d3dprobe`) | — | |
 | 5. Direct3D 11 at game scale, Direct3D 12 (Metal Shader Converter), audio | — | |
 | 6. Networking, cryptography, Chromium-class programs (the Steam client) | — | |
@@ -39,6 +39,13 @@ Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the 
   systems). Wine relied on this layout for years, but it needs checking against setjmp/longjmp and libdispatch.
 - **`gs:[0x10]` and other TEB fields read through `gs` directly** (MSVC's `__chkstk` reads the stack limit at
   `gs:0x10`, which is macOS's MIG reply slot). Such code will need patching at load time.
-- **Exceptions.** Windows programs rely on SEH and C++ exceptions unwinding through `.pdata`; macOS signals have
-  to be turned into Windows exception dispatch.
+- **Exceptions (milestone 2).** Exceptions are dispatched and unwound with the program's own `.pdata`/`.xdata`,
+  as on Windows. This runtime's functions are native code without Windows unwind data, so every entry into the
+  runtime that can call back into the program (RaiseException, RtlUnwindEx, a CPU fault) records the program's
+  context, and stack walks jump over the native part to it; an unwind meeting another unwind in progress
+  continues from the frame that one was processing (Windows' "collided unwind"). MinGW's C++ runtime depends on
+  this: its cleanup handlers raise a new exception from inside an unwind. CPU faults (SIGSEGV/SIGBUS/SIGFPE/
+  SIGILL/SIGTRAP) inside the program are redirected to a dispatch on the faulting thread's own stack. Not done
+  yet: SuspendThread/GetThreadContext on running threads, MSVC's `__CxxFrameHandler` (untested), stack overflow
+  (needs a guard page and an alternate signal stack), and longjmp does not run `__finally` blocks.
 - **Scale.** The Windows API is thousands of functions; the order of work follows what real programs import.
