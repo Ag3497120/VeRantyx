@@ -408,7 +408,7 @@ static WINAPI size_t vx_wcrtomb(char *s, WCHAR wc, void *state) {
 #define MATH2(name) static WINAPI double m_##name(double x, double y) { return name(x, y); } \
                     static WINAPI float m_##name##f(float x, float y) { return name##f(x, y); }
 MATH1(sqrt) MATH1(sin) MATH1(cos) MATH1(tan) MATH1(asin) MATH1(acos) MATH1(atan) MATH1(exp) MATH1(log) MATH1(log10)
-MATH1(log2) MATH1(floor) MATH1(ceil) MATH1(round) MATH1(trunc) MATH1(fabs) MATH1(sinh) MATH1(cosh) MATH1(tanh) MATH1(cbrt)
+MATH1(log2) MATH1(exp2) MATH1(floor) MATH1(ceil) MATH1(round) MATH1(trunc) MATH1(fabs) MATH1(sinh) MATH1(cosh) MATH1(tanh) MATH1(cbrt)
 MATH2(atan2) MATH2(pow) MATH2(fmod) MATH2(hypot) MATH2(fmin) MATH2(fmax)
 static WINAPI double vx_ldexp(double x, int e) { return ldexp(x, e); }
 static WINAPI double vx_frexp(double x, int *e) { return frexp(x, e); }
@@ -506,14 +506,74 @@ static WINAPI void *vx_aligned_realloc(void *p, size_t n, size_t align) {
     return q;
 }
 
+// More of the old msvcrt.dll, as Microsoft's own DLLs of the DirectX SDK era import it.
+static WINAPI vfn vx_onexit(vfn f) { return _crt_atexit(f) ? NULL : f; }
+static WINAPI void vx_amsg_exit(int n) { vx_log("runtime error %d", n); _exit(255); }
+static WINAPI int vx_XcptFilter(DWORD code, void *ep) { (void)code; (void)ep; return 0; }   // EXCEPTION_CONTINUE_SEARCH
+static WINAPI uint64_t vx_strtoui64(const char *s, char **e, int b) { return strtoull(s, e, b); }
+static WINAPI int64_t vx_strtoi64(const char *s, char **e, int b) { return strtoll(s, e, b); }
+static WINAPI int vx_isxdigit(int c) { return isxdigit(c); }
+static WINAPI int vx_isalnum(int c) { return isalnum(c); }
+static WINAPI int vx_isupper(int c) { return isupper(c); }
+static WINAPI int vx_islower(int c) { return islower(c); }
+static WINAPI int vx_isprint(int c) { return isprint(c); }
+static WINAPI int vx_ispunct(int c) { return ispunct(c); }
+static WINAPI double vx_atof(const char *s) { return atof(s); }
+static WINAPI char *vx_setlocale(int category, const char *locale) { (void)category; (void)locale; return "C"; }   // only the C locale
+static WINAPI size_t vx_mbstrlen(const char *s) { return strlen(s); }
+static WINAPI int vx_isnan(double d) { return isnan(d); }
+static WINAPI int vx_finite(double d) { return isfinite(d); }
+static WINAPI uint32_t vx_clearfp(void) { return 0; }
+static WINAPI uint32_t vx_statusfp(void) { return 0; }
+static WINAPI uint32_t vx_controlfp(uint32_t value, uint32_t mask) { (void)value; (void)mask; return 0x0009001F; }   // the default control word
+static WINAPI int vx_controlfp_s(uint32_t *cur, uint32_t value, uint32_t mask) { (void)value; (void)mask; if (cur) *cur = 0x0009001F; return 0; }
+static WINAPI int vx_fpclass(double d) {
+    switch (fpclassify(d)) {
+    case FP_NAN: return 2;                                     // _FPCLASS_QNAN
+    case FP_INFINITE: return signbit(d) ? 4 : 0x200;
+    case FP_ZERO: return signbit(d) ? 0x20 : 0x40;
+    case FP_SUBNORMAL: return signbit(d) ? 0x10 : 0x80;
+    default: return signbit(d) ? 8 : 0x100;
+    }
+}
+static WINAPI int vx_stricmp(const char *a, const char *b) { return strcasecmp(a, b); }
+static WINAPI int vx_strnicmp(const char *a, const char *b, size_t n) { return strncasecmp(a, b, n); }
+static WINAPI int vx_vsnprintf(char *buf, size_t n, const char *fmt, const char *ap) {
+    int len = vx_format(buf, n, fmt, ap);
+    return (size_t)len >= n ? -1 : len;                         // the old _vsnprintf: -1 when it did not fit
+}
+static WINAPI int vx_snprintf(char *buf, size_t n, const char *fmt, ...) {
+    __builtin_ms_va_list ap;
+    __builtin_ms_va_start(ap, fmt);
+    int r = vx_vsnprintf(buf, n, fmt, ap);
+    __builtin_ms_va_end(ap);
+    return r;
+}
+static WINAPI int vx_sprintf(char *buf, const char *fmt, ...) {
+    __builtin_ms_va_list ap;
+    __builtin_ms_va_start(ap, fmt);
+    int r = vx_format(buf, (size_t)1 << 30, fmt, ap);
+    __builtin_ms_va_end(ap);
+    return r;
+}
+
 static const vx_export ucrt[] = {
+    { "_onexit", (void *)vx_onexit }, { "_amsg_exit", (void *)vx_amsg_exit }, { "_XcptFilter", (void *)vx_XcptFilter },
+    { "_strtoui64", (void *)vx_strtoui64 }, { "_strtoi64", (void *)vx_strtoi64 }, { "isxdigit", (void *)vx_isxdigit },
+    { "isalnum", (void *)vx_isalnum }, { "isupper", (void *)vx_isupper }, { "islower", (void *)vx_islower },
+    { "isprint", (void *)vx_isprint }, { "ispunct", (void *)vx_ispunct }, { "atof", (void *)vx_atof },
+    { "setlocale", (void *)vx_setlocale }, { "_mbstrlen", (void *)vx_mbstrlen }, { "_isnan", (void *)vx_isnan },
+    { "_finite", (void *)vx_finite }, { "_clearfp", (void *)vx_clearfp }, { "_statusfp", (void *)vx_statusfp },
+    { "_controlfp", (void *)vx_controlfp }, { "_controlfp_s", (void *)vx_controlfp_s }, { "_fpclass", (void *)vx_fpclass },
+    { "_stricmp", (void *)vx_stricmp }, { "_strnicmp", (void *)vx_strnicmp }, { "_vsnprintf", (void *)vx_vsnprintf },
+    { "_snprintf", (void *)vx_snprintf }, { "sprintf", (void *)vx_sprintf },
     { "_aligned_malloc", (void *)vx_aligned_malloc }, { "_aligned_free", (void *)vx_aligned_free },
     { "_aligned_realloc", (void *)vx_aligned_realloc }, { "_aligned_msize", (void *)vx_aligned_msize },
     { "_lock", (void *)vx_lock }, { "_unlock", (void *)vx_unlock }, { "__dllonexit", (void *)vx_dllonexit },
     { "??2@YAPEAX_K@Z", (void *)vx_new }, { "??_U@YAPEAX_K@Z", (void *)vx_new },
     { "??3@YAXPEAX@Z", (void *)vx_delete }, { "??_V@YAXPEAX@Z", (void *)vx_delete },
     MATH_EXPORTS(sqrt), MATH_EXPORTS(sin), MATH_EXPORTS(cos), MATH_EXPORTS(tan), MATH_EXPORTS(asin), MATH_EXPORTS(acos),
-    MATH_EXPORTS(atan), MATH_EXPORTS(exp), MATH_EXPORTS(log), MATH_EXPORTS(log10), MATH_EXPORTS(log2), MATH_EXPORTS(floor),
+    MATH_EXPORTS(atan), MATH_EXPORTS(exp), MATH_EXPORTS(log), MATH_EXPORTS(log10), MATH_EXPORTS(log2), MATH_EXPORTS(exp2), MATH_EXPORTS(floor),
     MATH_EXPORTS(ceil), MATH_EXPORTS(round), MATH_EXPORTS(trunc), MATH_EXPORTS(fabs), MATH_EXPORTS(sinh), MATH_EXPORTS(cosh),
     MATH_EXPORTS(tanh), MATH_EXPORTS(cbrt), MATH_EXPORTS(atan2), MATH_EXPORTS(pow), MATH_EXPORTS(fmod), MATH_EXPORTS(hypot),
     MATH_EXPORTS(fmin), MATH_EXPORTS(fmax),

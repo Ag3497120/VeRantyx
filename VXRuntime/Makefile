@@ -1,20 +1,20 @@
 # vxrt: the VeRantyx Windows runtime. An x86-64 macOS binary; Rosetta 2 runs it and the Windows program together.
 CC      = clang
-CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=13.0
+CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
 SRC     = src/loader.c src/kernel32.c src/ucrt.c src/sync.c src/seh.c src/context.S src/text.c src/files.c src/registry.c \
-          src/user32.c src/gdi.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/dxgi.m
+          src/user32.c src/gdi.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/dxgi.m src/dxbc.c
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
 
-build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h
+build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/dxbc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/hlslc.exe build/dxbc2msl build/draw.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -73,6 +73,18 @@ build/d3d11.exe: tests/d3d11.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxgi -ldxguid -luuid
 
+build/dxbc2msl: tools/dxbc2msl.m src/dxbc.c src/dxbc.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tools/dxbc2msl.m src/dxbc.c -framework Metal
+
+build/draw.exe: tests/draw.c tests/shaders/*.h
+	@mkdir -p build
+	$(MINGW) -O1 -Itests -o $@ $< -ld3d11 -ldxgi -ldxguid -luuid -lm
+
+build/hlslc.exe: tools/hlslc.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
 build/dllprobe.exe: tools/dllprobe.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
@@ -93,6 +105,14 @@ build/vxplugin.dll: tests/vxplugin.c tests/vxplugin.def
 	@mkdir -p build
 	$(MINGW) -O1 -shared -o $@ tests/vxplugin.c tests/vxplugin.def
 
+# Test shaders: HLSL compiled to DXBC by a d3dcompiler DLL (Microsoft's, as games ship it) running on vxrt.
+# The generated tests/shaders/*.h are kept in the repository; regenerate with
+#   make shaders D3DCOMPILER='Z:\path\to\d3dcompiler_43.dll'
+SHADERS = color_vs:vs_4_0 color_ps:ps_4_0 tex_vs:vs_4_0 tex_ps:ps_4_0 fullscreen_vs:vs_4_0 math_ps:ps_4_0
+shaders: build/vxrt build/hlslc.exe
+	@for s in $(SHADERS); do n=$${s%%:*}; p=$${s##*:}; \
+	  VXRT_ROOT=build/root build/vxrt build/hlslc.exe '$(D3DCOMPILER)' tests/shaders/$$n.hlsl main $$p tests/shaders/$$n.h $$n || exit 1; done
+
 # The tests' C: drive and registry live in build/root, not in ~/.vxrt.
 check: export VXRT_ROOT = build/root
 check: export VXRT_NO_ACTIVATE = 1
@@ -110,8 +130,9 @@ check: all
 	build/vxrt build/iocp.exe
 	build/vxrt build/window.exe
 	build/vxrt build/d3d11.exe
+	build/vxrt build/draw.exe
 
 clean:
 	rm -rf build
 
-.PHONY: all tests check clean
+.PHONY: all tests check clean shaders

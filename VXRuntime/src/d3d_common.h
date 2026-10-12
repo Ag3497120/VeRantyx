@@ -25,7 +25,8 @@ HRESULT d3d_not_implemented(const char *what);    // reports a method once, retu
 #define DXGI_ERROR_UNSUPPORTED ((HRESULT)0x887A0004)
 #define DXGI_ERROR_FRAME_STATISTICS_DISJOINT ((HRESULT)0x887A000B)
 
-enum { K_DEVICE, K_CONTEXT, K_TEXTURE, K_BUFFER, K_RTV, K_DSV, K_SRV, K_SWAPCHAIN, K_FACTORY, K_ADAPTER, K_OUTPUT };
+enum { K_DEVICE, K_CONTEXT, K_TEXTURE, K_BUFFER, K_RTV, K_DSV, K_SRV, K_SWAPCHAIN, K_FACTORY, K_ADAPTER, K_OUTPUT,
+       K_SHADER, K_LAYOUT, K_STATE };
 
 typedef struct pdata { GUID guid; uint32_t size; void *data; struct pdata *next; } pdata;
 typedef struct d3d_device d3d_device;
@@ -76,6 +77,28 @@ typedef struct {
     uint8_t *cpu;                    // staging textures: the CPU copy Map hands out
     size_t cpu_pitch, cpu_size;
 } d3d_texture;
+
+// D3D11_BUFFER_DESC as six fields: byte width, usage, bind flags, CPU access, misc flags, structure stride.
+typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; } d3d_buffer;
+typedef struct { d3d_object base; d3d_object *resource; uint32_t format, mip, first_slice, slices; } d3d_view;
+struct d3d_draw_state;
+typedef struct {
+    d3d_object base;                 // ID3D11DeviceContext
+    void *cmd;                       // the command buffer being recorded (retained), or NULL
+    void *render;                    // the open render command encoder (retained), or NULL
+    d3d_view *render_rtv[8], *render_dsv;   // what that encoder renders to
+    d3d_view *rtv[8], *dsv;
+    float viewport[6];
+    struct d3d_draw_state *draw;     // shaders, buffers, states (d3d11_draw.m)
+} d3d_context;
+
+void d3d_vtable_override(void **vt, const char *const *names, int count, const d3d_method *impl);
+#define D3D_VTABLE_OVERRIDE(vt, iface, impl) d3d_vtable_override(vt, vt_##iface, VT_COUNT_##iface, impl)
+void d3d_end_render(d3d_context *c);                                     // closes the open render encoder
+void *d3d_context_cmd(d3d_context *c);                                   // id<MTLCommandBuffer>, created on demand
+extern const d3d_method d3d_draw_device_methods[], d3d_draw_context_methods[];   // d3d11_draw.m
+void d3d_draw_init(void);
+void d3d_draw_release(d3d_context *c);
 
 d3d_texture *d3d_texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], HRESULT *hr);
 void         d3d_texture_replace(d3d_texture *t, void *mtl_texture);     // a swap chain's buffer after a resize

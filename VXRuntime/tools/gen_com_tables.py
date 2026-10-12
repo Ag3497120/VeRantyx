@@ -7,7 +7,9 @@ import re, sys
 
 INTERFACES = {
     "d3d11.h": ["ID3D11Device", "ID3D11DeviceContext", "ID3D11Texture2D", "ID3D11Buffer", "ID3D11RenderTargetView",
-                "ID3D11DepthStencilView", "ID3D11ShaderResourceView", "ID3D11Resource", "ID3D11DeviceChild"],
+                "ID3D11DepthStencilView", "ID3D11ShaderResourceView", "ID3D11Resource", "ID3D11DeviceChild",
+                "ID3D11VertexShader", "ID3D11PixelShader", "ID3D11InputLayout", "ID3D11BlendState",
+                "ID3D11DepthStencilState", "ID3D11RasterizerState", "ID3D11SamplerState"],
     "dxgi.h": ["IDXGIFactory", "IDXGIFactory1", "IDXGIAdapter", "IDXGIAdapter1", "IDXGIOutput", "IDXGISwapChain",
                "IDXGIDevice", "IDXGIDevice1", "IDXGIObject", "IDXGIDeviceSubObject", "IDXGISurface", "IDXGIResource"],
     "dxgi1_2.h": ["IDXGIFactory2", "IDXGISwapChain1"],

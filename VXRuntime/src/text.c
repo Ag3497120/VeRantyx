@@ -267,7 +267,13 @@ static WINAPI WCHAR *GetEnvironmentStringsW(void) {
 static WINAPI BOOL FreeEnvironmentStringsA(char *b) { free(b); return 1; }
 static WINAPI BOOL FreeEnvironmentStringsW(WCHAR *b) { free(b); return 1; }
 
+static WINAPI int lstrcmpiA(const char *a, const char *b) { return strcasecmp(a, b); }
+static WINAPI int lstrcmpA(const char *a, const char *b) { return strcmp(a, b); }
+static WINAPI int lstrlenA(const char *s) { return s ? (int)strlen(s) : 0; }
+static WINAPI int lstrlenW(const WCHAR *s) { return s ? (int)vx_wcslen(s) : 0; }
+
 static const vx_export text_k32[] = {
+    VX_EXPORT(lstrcmpiA), VX_EXPORT(lstrcmpA), VX_EXPORT(lstrlenA), VX_EXPORT(lstrlenW),
     VX_EXPORT(CompareStringW), VX_EXPORT(CompareStringEx), VX_EXPORT(CompareStringOrdinal), VX_EXPORT(CompareStringA),
     VX_EXPORT(ExpandEnvironmentStringsA), VX_EXPORT(ExpandEnvironmentStringsW),
     VX_EXPORT(LCMapStringW), VX_EXPORT(LCMapStringEx), VX_EXPORT(GetStringTypeW), VX_EXPORT(GetCPInfo),

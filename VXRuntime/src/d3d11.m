@@ -193,8 +193,6 @@ void d3d_texture_replace(d3d_texture *t, void *mtl_texture) {
 }
 
 // ---- buffers -----------------------------------------------------------------------------------------------------------------------
-// D3D11_BUFFER_DESC: byte width, usage, bind flags, CPU access, misc flags, structure stride.
-typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; } d3d_buffer;
 static WINAPI HRESULT buffer_qi(void *this, const GUID *iid, void **out) {
     static const GUID *const known[] = { &IID_IUnknown_, &IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Buffer };
     return query(this, iid, out, known, 4);
@@ -204,7 +202,6 @@ static WINAPI void buffer_get_desc(void *this, uint32_t *desc) { memcpy(desc, ((
 static void buffer_destroy(d3d_object *o) { d3d_buffer *b = (d3d_buffer *)o; if (b->mtl) CFBridgingRelease(b->mtl); }
 
 // ---- views -------------------------------------------------------------------------------------------------------------------------
-typedef struct { d3d_object base; d3d_object *resource; uint32_t format, mip, first_slice, slices; } d3d_view;
 static WINAPI HRESULT rtv_qi(void *this, const GUID *iid, void **out) {
     static const GUID *const known[] = { &IID_IUnknown_, &IID_ID3D11DeviceChild, &IID_ID3D11RenderTargetView };
     return query(this, iid, out, known, 3);
@@ -241,20 +238,27 @@ static d3d_view *make_view(d3d_device *dev, int kind, void **vtbl, d3d_object *r
 }
 
 // ---- the immediate context ----------------------------------------------------------------------------------------------------------
-typedef struct {
-    d3d_object base;
-    void *cmd;                        // the command buffer being recorded (retained), or NULL
-    d3d_view *rtv[8], *dsv;
-    float viewport[6];
-    int draw_reported;
-} d3d_context;
-
 static id<MTLCommandBuffer> context_cmd(d3d_context *c) {
     if (!c->cmd) c->cmd = (void *)CFBridgingRetain([(__bridge id<MTLCommandQueue>)c->base.dev->queue commandBuffer]);
     return (__bridge id<MTLCommandBuffer>)c->cmd;
 }
+void *d3d_context_cmd(d3d_context *c) { return (__bridge void *)context_cmd(c); }
+// Clears, copies and uploads are separate passes: the render pass in progress ends first.
+void d3d_end_render(d3d_context *c) {
+    if (!c->render) return;
+    id<MTLRenderCommandEncoder> enc = CFBridgingRelease(c->render);
+    c->render = NULL;
+    [enc endEncoding];
+    for (int i = 0; i < 8; i++) if (c->render_rtv[i]) { d3d_release(&c->render_rtv[i]->base); c->render_rtv[i] = NULL; }
+    if (c->render_dsv) { d3d_release(&c->render_dsv->base); c->render_dsv = NULL; }
+}
+void d3d_vtable_override(void **vt, const char *const *names, int count, const d3d_method *impl) {
+    for (int i = 0; i < count; i++)
+        for (const d3d_method *m = impl; m->name; m++) if (!strcmp(m->name, names[i])) { vt[i] = m->fn; break; }
+}
 void d3d_flush(d3d_device *dev, int wait) {
     d3d_context *c = (d3d_context *)dev->context;
+    d3d_end_render(c);
     if (!c->cmd) {
         if (wait) {                                             // still wait for work committed earlier
             id<MTLCommandBuffer> fence = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
@@ -299,6 +303,7 @@ static void clear_pass(d3d_context *c, d3d_view *v, const float *color, int dept
             rp.stencilAttachment.clearStencil = stencil_value;
         }
     }
+    d3d_end_render(c);
     [[context_cmd(c) renderCommandEncoderWithDescriptor:rp] endEncoding];
 }
 static WINAPI void ctx_clear_rtv(void *this, d3d_view *v, const float color[4]) {
@@ -338,6 +343,7 @@ static uint32_t mip_size(uint32_t size, uint32_t mip) { size >>= mip; return siz
 static WINAPI void ctx_copy_resource(void *this, d3d_object *dst, d3d_object *src) {
     d3d_context *c = this;
     if (!dst || !src || dst->kind != src->kind) return;
+    d3d_end_render(c);
     id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
     if (dst->kind == K_TEXTURE) {
         id<MTLTexture> s = (__bridge id<MTLTexture>)((d3d_texture *)src)->mtl, d = (__bridge id<MTLTexture>)((d3d_texture *)dst)->mtl;
@@ -355,6 +361,7 @@ static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint
     (void)z;
     d3d_context *c = this;
     if (!dst || !src || dst->kind != src->kind) return;
+    d3d_end_render(c);
     id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
     if (dst->kind == K_TEXTURE) {
         d3d_texture *ds = (d3d_texture *)dst, *ss = (d3d_texture *)src;
@@ -386,6 +393,7 @@ static void upload_texture(d3d_context *c, d3d_texture *t, uint32_t sub, const u
     id<MTLDevice> dev = (__bridge id<MTLDevice>)c->base.dev->mtl;
     id<MTLBuffer> staging = [dev newBufferWithLength:(NSUInteger)pitch * h options:MTLResourceStorageModeShared];
     for (uint32_t r = 0; r < h; r++) memcpy((uint8_t *)staging.contents + (size_t)r * pitch, (const uint8_t *)data + (size_t)r * row_pitch, pitch);
+    d3d_end_render(c);
     id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
     [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:pitch sourceBytesPerImage:(NSUInteger)pitch * h sourceSize:MTLSizeMake(w, h, 1)
                toTexture:(__bridge id<MTLTexture>)t->mtl destinationSlice:slice destinationLevel:mip destinationOrigin:MTLOriginMake(x, y, 0)];
@@ -396,14 +404,16 @@ static WINAPI void ctx_update_subresource(void *this, d3d_object *dst, uint32_t 
     d3d_context *c = this;
     if (!dst || !data) return;
     if (dst->kind == K_TEXTURE) { upload_texture(c, (d3d_texture *)dst, sub, box, data, row_pitch); return; }
+    // Buffers are renamed: the new contents go into a fresh Metal buffer (a copy of the old one), so draws
+    // already recorded keep reading what they were given.
     d3d_buffer *b = (d3d_buffer *)dst;
-    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)b->mtl;
-    uint32_t from = box ? box[0] : 0, size = box ? box[3] - box[0] : (uint32_t)buf.length;
-    if (from + size > buf.length) return;
-    id<MTLBuffer> staging = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
-    id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
-    [blit copyFromBuffer:staging sourceOffset:0 toBuffer:buf destinationOffset:from size:size];
-    [blit endEncoding];
+    id<MTLBuffer> old = (__bridge id<MTLBuffer>)b->mtl;
+    uint32_t from = box ? box[0] : 0, size = box ? box[3] - box[0] : (uint32_t)old.length;
+    if (from + size > old.length) return;
+    id<MTLBuffer> fresh = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithBytes:old.contents length:old.length options:MTLResourceStorageModeShared];
+    memcpy((uint8_t *)fresh.contents + from, data, size);
+    CFBridgingRelease(b->mtl);
+    b->mtl = (void *)CFBridgingRetain(fresh);
 }
 
 // Map waits for the GPU to finish what was recorded so far, then hands out memory the CPU can use. Staging
@@ -414,13 +424,21 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
     (void)flags;
     d3d_context *c = this;
     if (!res || !out) return E_INVALIDARG;
-    d3d_flush(c->base.dev, 1);
     if (res->kind == K_BUFFER) {
-        id<MTLBuffer> b = (__bridge id<MTLBuffer>)((d3d_buffer *)res)->mtl;
-        if (b.storageMode != MTLStorageModeShared) return E_INVALIDARG;
+        d3d_buffer *buf = (d3d_buffer *)res;
+        if (type == 4) {                                        // WRITE_DISCARD: a fresh buffer, nothing to wait for
+            id<MTLBuffer> old = (__bridge id<MTLBuffer>)buf->mtl;
+            id<MTLBuffer> fresh = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:old.length options:MTLResourceStorageModeShared];
+            CFBridgingRelease(buf->mtl);
+            buf->mtl = (void *)CFBridgingRetain(fresh);
+        } else if (type != 5) {                                  // READ/WRITE: what the GPU did must be finished
+            d3d_flush(c->base.dev, 1);
+        }
+        id<MTLBuffer> b = (__bridge id<MTLBuffer>)buf->mtl;
         out->data = b.contents; out->row_pitch = out->depth_pitch = (uint32_t)b.length;
         return S_OK;
     }
+    d3d_flush(c->base.dev, 1);
     d3d_texture *t = (d3d_texture *)res;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)t->mtl;
     if (tex.storageMode != MTLStorageModeShared) { vx_log("Direct3D: Map of a texture without CPU access"); return E_INVALIDARG; }
@@ -451,13 +469,10 @@ static WINAPI void ctx_flush(void *this) { d3d_flush(((d3d_object *)this)->dev, 
 static WINAPI void ctx_clear_state(void *this) { ctx_om_set_render_targets(this, 0, NULL, NULL); }
 static WINAPI uint32_t ctx_get_type(void *this) { (void)this; return 0; }       // D3D11_DEVICE_CONTEXT_IMMEDIATE
 static WINAPI uint32_t ctx_get_flags(void *this) { (void)this; return 0; }
-// Draws and dispatches need shaders translated to Metal (the next milestone): reported once, then ignored.
-static WINAPI void ctx_draw(void *this) {
-    d3d_context *c = this;
-    if (!c->draw_reported) { c->draw_reported = 1; vx_log("Direct3D: draw calls need shader translation (next milestone); ignored"); }
-}
 static void context_destroy(d3d_object *o) {
     d3d_context *c = (d3d_context *)o;
+    d3d_end_render(c);
+    d3d_draw_release(c);
     ctx_om_set_render_targets(c, 0, NULL, NULL);
     if (c->cmd) CFBridgingRelease(c->cmd);
 }
@@ -620,8 +635,6 @@ static void make_tables(void) {
         { "UpdateSubresource", (void *)ctx_update_subresource }, { "Map", (void *)ctx_map }, { "Unmap", (void *)ctx_unmap },
         { "Flush", (void *)ctx_flush }, { "ClearState", (void *)ctx_clear_state }, { "GetType", (void *)ctx_get_type },
         { "GetContextFlags", (void *)ctx_get_flags },
-        { "Draw", (void *)ctx_draw }, { "DrawIndexed", (void *)ctx_draw }, { "DrawInstanced", (void *)ctx_draw },
-        { "DrawIndexedInstanced", (void *)ctx_draw }, { "DrawAuto", (void *)ctx_draw }, { "Dispatch", (void *)ctx_draw },
         { NULL, NULL } };
     static const d3d_method device[] = { { "QueryInterface", (void *)device_qi }, { "AddRef", (void *)device_addref },
         { "Release", (void *)device_release }, { "CreateTexture2D", (void *)device_create_texture2d },
@@ -648,6 +661,9 @@ static void make_tables(void) {
     g_context_vtbl = D3D_VTABLE(ID3D11DeviceContext, context);
     g_device_vtbl = D3D_VTABLE(ID3D11Device, device);
     g_dxgidev_vtbl = D3D_VTABLE(IDXGIDevice1, dxgidev);
+    d3d_draw_init();
+    D3D_VTABLE_OVERRIDE(g_device_vtbl, ID3D11Device, d3d_draw_device_methods);
+    D3D_VTABLE_OVERRIDE(g_context_vtbl, ID3D11DeviceContext, d3d_draw_context_methods);
 }
 
 // ---- entry points ------------------------------------------------------------------------------------------------------------------

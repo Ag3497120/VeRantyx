@@ -8,6 +8,7 @@ each milestone is a small Windows program that has to run unchanged.
 make check          # builds build/vxrt and the test programs, runs them
 build/vxrt program.exe [args...]
 VXRT_TRACE=1 build/vxrt program.exe     # also lists imports that are not implemented yet
+VXRT_DUMP_SHADERS=dir build/vxrt game.exe   # writes every translated shader (Metal source) to dir
 build/vxrt build/dllprobe.exe 'Z:\path\to\some.dll' [export ...]   # how far a real DLL gets
 ```
 
@@ -42,9 +43,10 @@ Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the 
 | 4. user32 windows on AppKit (classes, message queues with cross-thread SendMessage, timers, WM_PAINT, keyboard with virtual keys and scan codes, mouse, system metrics, displays, message boxes), gdi32 on Core Graphics (DCs, brushes, pens, fonts via Core Text, DIB sections, StretchDIBits, BitBlt), ws2_32 on BSD sockets, winmm timers | `tests/window.c`, `tests/net.c` | Works (2026-10-12). 104 of Alyx's 109 `bin/win64` DLLs load and initialize |
 | 5a. COM (ole32: CoCreateInstance with built-in classes, registered factories and in-process servers from the registry), OLE automation (BSTR, VARIANT, SAFEARRAY), I/O completion ports and overlapped file I/O, vcruntime140 with MSVC C++ exceptions (FH3 tables, catch funclets via STATUS_UNWIND_CONSOLIDATE, rethrow) | `tests/com.c` (+ `vxcom.dll`), `tests/iocp.c`, `tests/msvc_eh.cpp` (built for the MSVC ABI by clang) | Works (2026-10-12). Every 64-bit DLL in Alyx's `bin/win64` (108 of 109) loads and initializes |
 | 5b. Direct3D 11 and DXGI on Metal: device and immediate context (textures, buffers, views, clears, copies, uploads, Map/Unmap), DXGI factory/adapter/output, swap chains presenting into the window's CAMetalLayer, resizing. Method tables generated from MinGW's headers (`tools/gen_com_tables.py`) | `tests/d3d11.c` (`--interactive` shows 600 frames) | Works (2026-10-12). Draws need shader translation |
-| 6. Shader translation (DXBC to Metal) and the rest of the Direct3D 11 pipeline (states, input layouts, draws), raw input, audio | — | Next |
-| 7. Direct3D 11 at game scale, Direct3D 12 (Metal Shader Converter), OpenGL | — | |
-| 8. Cryptography, processes, Chromium-class programs (the Steam client) | — | |
+| 6. Shader translation DXBC → Metal Shading Language (`src/dxbc.c`: SM4/5 arithmetic, integer and bit operations, comparisons, control flow, sampling, loads, immediate constant buffers), input layouts, blend/depth-stencil/rasterizer/sampler states, pipeline-state cache, Draw/DrawIndexed(Instanced). Test shaders are compiled by Microsoft's d3dcompiler_43.dll running on vxrt (`tools/hlslc.c`); `build/dxbc2msl` shows a translation | `tests/draw.c` (`--interactive`: a spinning triangle) | Works (2026-10-12) |
+| 7. Geometry/hull/domain/compute shaders and UAVs, raw input, audio (XAudio2/WASAPI on Core Audio), FH4 C++ exceptions | — | Next |
+| 8. Direct3D 11 at game scale, Direct3D 12 (Metal Shader Converter), OpenGL | — | |
+| 9. Cryptography, processes, Chromium-class programs (the Steam client) | — | |
 
 ## Known risks (research items)
 

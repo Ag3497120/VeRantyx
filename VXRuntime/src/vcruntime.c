@@ -337,6 +337,8 @@ static WINAPI WCHAR *m_wcsstr(const WCHAR *h, const WCHAR *n) {
 void vx_CxxThrowException(void *, const void *);
 static vx_export g_vcruntime[] = {
     { "_CxxThrowException", (void *)vx_CxxThrowException }, { "__CxxFrameHandler3", (void *)CxxFrameHandler3 },
+    { "__CxxFrameHandler", (void *)CxxFrameHandler3 },              // msvcrt.dll's name for the same tables
+    { "??1type_info@@UEAA@XZ", (void *)type_info_destructor }, { "?terminate@@YAXXZ", (void *)std_terminate },
     { "__CxxFrameHandler4", (void *)CxxFrameHandler4 }, { "__GSHandlerCheck_EH", (void *)GSHandlerCheck_EH },
     { "__GSHandlerCheck", (void *)GSHandlerCheck },
     { "__std_terminate", (void *)std_terminate }, { "_purecall", (void *)purecall },
@@ -363,4 +365,5 @@ void vx_vcruntime_init(void) {
         if (!g_vcruntime[i].fn) g_vcruntime[i].fn = vx_find_export("ucrtbase.dll", g_vcruntime[i].name);
     vx_register_module("vcruntime140.dll", g_vcruntime, n);
     vx_register_module("vcruntime140_1.dll", g_vcruntime, n);
+    vx_register_module("msvcrt.dll", g_vcruntime, n);                // msvcrt.dll carried the C++ support itself
 }

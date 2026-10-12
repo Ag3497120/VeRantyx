@@ -261,6 +261,87 @@ static WINAPI HRESULT stub_ID3D11DeviceChild_SetPrivateDataInterface(void *self)
 static void *const vtstub_ID3D11DeviceChild[] = { (void *)stub_ID3D11DeviceChild_QueryInterface, (void *)stub_ID3D11DeviceChild_AddRef, (void *)stub_ID3D11DeviceChild_Release, (void *)stub_ID3D11DeviceChild_GetDevice, (void *)stub_ID3D11DeviceChild_GetPrivateData, (void *)stub_ID3D11DeviceChild_SetPrivateData, (void *)stub_ID3D11DeviceChild_SetPrivateDataInterface };
 #define VT_COUNT_ID3D11DeviceChild 7
 static const GUID IID_ID3D11DeviceChild = { 0x1841e5c8, 0x16b0, 0x489b, { 0xbc, 0xc8, 0x44, 0xcf, 0xb0, 0xd5, 0xde, 0xae } };
+static const char *const vt_ID3D11VertexShader[] = { "QueryInterface", "AddRef", "Release", "GetDevice", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface" };
+static WINAPI HRESULT stub_ID3D11VertexShader_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11VertexShader::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D11VertexShader_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D11VertexShader::AddRef"); }
+static WINAPI HRESULT stub_ID3D11VertexShader_Release(void *self) { (void)self; return d3d_not_implemented("ID3D11VertexShader::Release"); }
+static WINAPI HRESULT stub_ID3D11VertexShader_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D11VertexShader::GetDevice"); }
+static WINAPI HRESULT stub_ID3D11VertexShader_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11VertexShader::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11VertexShader_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11VertexShader::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11VertexShader_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11VertexShader::SetPrivateDataInterface"); }
+static void *const vtstub_ID3D11VertexShader[] = { (void *)stub_ID3D11VertexShader_QueryInterface, (void *)stub_ID3D11VertexShader_AddRef, (void *)stub_ID3D11VertexShader_Release, (void *)stub_ID3D11VertexShader_GetDevice, (void *)stub_ID3D11VertexShader_GetPrivateData, (void *)stub_ID3D11VertexShader_SetPrivateData, (void *)stub_ID3D11VertexShader_SetPrivateDataInterface };
+#define VT_COUNT_ID3D11VertexShader 7
+static const GUID IID_ID3D11VertexShader = { 0x3b301d64, 0xd678, 0x4289, { 0x88, 0x97, 0x22, 0xf8, 0x92, 0x8b, 0x72, 0xf3 } };
+static const char *const vt_ID3D11PixelShader[] = { "QueryInterface", "AddRef", "Release", "GetDevice", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface" };
+static WINAPI HRESULT stub_ID3D11PixelShader_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11PixelShader::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D11PixelShader_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D11PixelShader::AddRef"); }
+static WINAPI HRESULT stub_ID3D11PixelShader_Release(void *self) { (void)self; return d3d_not_implemented("ID3D11PixelShader::Release"); }
+static WINAPI HRESULT stub_ID3D11PixelShader_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D11PixelShader::GetDevice"); }
+static WINAPI HRESULT stub_ID3D11PixelShader_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11PixelShader::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11PixelShader_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11PixelShader::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11PixelShader_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11PixelShader::SetPrivateDataInterface"); }
+static void *const vtstub_ID3D11PixelShader[] = { (void *)stub_ID3D11PixelShader_QueryInterface, (void *)stub_ID3D11PixelShader_AddRef, (void *)stub_ID3D11PixelShader_Release, (void *)stub_ID3D11PixelShader_GetDevice, (void *)stub_ID3D11PixelShader_GetPrivateData, (void *)stub_ID3D11PixelShader_SetPrivateData, (void *)stub_ID3D11PixelShader_SetPrivateDataInterface };
+#define VT_COUNT_ID3D11PixelShader 7
+static const GUID IID_ID3D11PixelShader = { 0xea82e40d, 0x51dc, 0x4f33, { 0x93, 0xd4, 0xdb, 0x7c, 0x91, 0x25, 0xae, 0x8c } };
+static const char *const vt_ID3D11InputLayout[] = { "QueryInterface", "AddRef", "Release", "GetDevice", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface" };
+static WINAPI HRESULT stub_ID3D11InputLayout_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11InputLayout::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D11InputLayout_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D11InputLayout::AddRef"); }
+static WINAPI HRESULT stub_ID3D11InputLayout_Release(void *self) { (void)self; return d3d_not_implemented("ID3D11InputLayout::Release"); }
+static WINAPI HRESULT stub_ID3D11InputLayout_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D11InputLayout::GetDevice"); }
+static WINAPI HRESULT stub_ID3D11InputLayout_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11InputLayout::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11InputLayout_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11InputLayout::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11InputLayout_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11InputLayout::SetPrivateDataInterface"); }
+static void *const vtstub_ID3D11InputLayout[] = { (void *)stub_ID3D11InputLayout_QueryInterface, (void *)stub_ID3D11InputLayout_AddRef, (void *)stub_ID3D11InputLayout_Release, (void *)stub_ID3D11InputLayout_GetDevice, (void *)stub_ID3D11InputLayout_GetPrivateData, (void *)stub_ID3D11InputLayout_SetPrivateData, (void *)stub_ID3D11InputLayout_SetPrivateDataInterface };
+#define VT_COUNT_ID3D11InputLayout 7
+static const GUID IID_ID3D11InputLayout = { 0xe4819ddc, 0x4cf0, 0x4025, { 0xbd, 0x26, 0x5d, 0xe8, 0x2a, 0x3e, 0x07, 0xb7 } };
+static const char *const vt_ID3D11BlendState[] = { "QueryInterface", "AddRef", "Release", "GetDevice", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "GetDesc" };
+static WINAPI HRESULT stub_ID3D11BlendState_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11BlendState::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D11BlendState_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D11BlendState::AddRef"); }
+static WINAPI HRESULT stub_ID3D11BlendState_Release(void *self) { (void)self; return d3d_not_implemented("ID3D11BlendState::Release"); }
+static WINAPI HRESULT stub_ID3D11BlendState_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D11BlendState::GetDevice"); }
+static WINAPI HRESULT stub_ID3D11BlendState_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11BlendState::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11BlendState_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11BlendState::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11BlendState_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11BlendState::SetPrivateDataInterface"); }
+static WINAPI HRESULT stub_ID3D11BlendState_GetDesc(void *self) { (void)self; return d3d_not_implemented("ID3D11BlendState::GetDesc"); }
+static void *const vtstub_ID3D11BlendState[] = { (void *)stub_ID3D11BlendState_QueryInterface, (void *)stub_ID3D11BlendState_AddRef, (void *)stub_ID3D11BlendState_Release, (void *)stub_ID3D11BlendState_GetDevice, (void *)stub_ID3D11BlendState_GetPrivateData, (void *)stub_ID3D11BlendState_SetPrivateData, (void *)stub_ID3D11BlendState_SetPrivateDataInterface, (void *)stub_ID3D11BlendState_GetDesc };
+#define VT_COUNT_ID3D11BlendState 8
+static const GUID IID_ID3D11BlendState = { 0x75b68faa, 0x347d, 0x4159, { 0x8f, 0x45, 0xa0, 0x64, 0x0f, 0x01, 0xcd, 0x9a } };
+static const char *const vt_ID3D11DepthStencilState[] = { "QueryInterface", "AddRef", "Release", "GetDevice", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "GetDesc" };
+static WINAPI HRESULT stub_ID3D11DepthStencilState_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11DepthStencilState::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D11DepthStencilState_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D11DepthStencilState::AddRef"); }
+static WINAPI HRESULT stub_ID3D11DepthStencilState_Release(void *self) { (void)self; return d3d_not_implemented("ID3D11DepthStencilState::Release"); }
+static WINAPI HRESULT stub_ID3D11DepthStencilState_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D11DepthStencilState::GetDevice"); }
+static WINAPI HRESULT stub_ID3D11DepthStencilState_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11DepthStencilState::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11DepthStencilState_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11DepthStencilState::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11DepthStencilState_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11DepthStencilState::SetPrivateDataInterface"); }
+static WINAPI HRESULT stub_ID3D11DepthStencilState_GetDesc(void *self) { (void)self; return d3d_not_implemented("ID3D11DepthStencilState::GetDesc"); }
+static void *const vtstub_ID3D11DepthStencilState[] = { (void *)stub_ID3D11DepthStencilState_QueryInterface, (void *)stub_ID3D11DepthStencilState_AddRef, (void *)stub_ID3D11DepthStencilState_Release, (void *)stub_ID3D11DepthStencilState_GetDevice, (void *)stub_ID3D11DepthStencilState_GetPrivateData, (void *)stub_ID3D11DepthStencilState_SetPrivateData, (void *)stub_ID3D11DepthStencilState_SetPrivateDataInterface, (void *)stub_ID3D11DepthStencilState_GetDesc };
+#define VT_COUNT_ID3D11DepthStencilState 8
+static const GUID IID_ID3D11DepthStencilState = { 0x03823efb, 0x8d8f, 0x4e1c, { 0x9a, 0xa2, 0xf6, 0x4b, 0xb2, 0xcb, 0xfd, 0xf1 } };
+static const char *const vt_ID3D11RasterizerState[] = { "QueryInterface", "AddRef", "Release", "GetDevice", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "GetDesc" };
+static WINAPI HRESULT stub_ID3D11RasterizerState_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11RasterizerState::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D11RasterizerState_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D11RasterizerState::AddRef"); }
+static WINAPI HRESULT stub_ID3D11RasterizerState_Release(void *self) { (void)self; return d3d_not_implemented("ID3D11RasterizerState::Release"); }
+static WINAPI HRESULT stub_ID3D11RasterizerState_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D11RasterizerState::GetDevice"); }
+static WINAPI HRESULT stub_ID3D11RasterizerState_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11RasterizerState::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11RasterizerState_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11RasterizerState::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11RasterizerState_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11RasterizerState::SetPrivateDataInterface"); }
+static WINAPI HRESULT stub_ID3D11RasterizerState_GetDesc(void *self) { (void)self; return d3d_not_implemented("ID3D11RasterizerState::GetDesc"); }
+static void *const vtstub_ID3D11RasterizerState[] = { (void *)stub_ID3D11RasterizerState_QueryInterface, (void *)stub_ID3D11RasterizerState_AddRef, (void *)stub_ID3D11RasterizerState_Release, (void *)stub_ID3D11RasterizerState_GetDevice, (void *)stub_ID3D11RasterizerState_GetPrivateData, (void *)stub_ID3D11RasterizerState_SetPrivateData, (void *)stub_ID3D11RasterizerState_SetPrivateDataInterface, (void *)stub_ID3D11RasterizerState_GetDesc };
+#define VT_COUNT_ID3D11RasterizerState 8
+static const GUID IID_ID3D11RasterizerState = { 0x9bb4ab81, 0xab1a, 0x4d8f, { 0xb5, 0x06, 0xfc, 0x04, 0x20, 0x0b, 0x6e, 0xe7 } };
+static const char *const vt_ID3D11SamplerState[] = { "QueryInterface", "AddRef", "Release", "GetDevice", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "GetDesc" };
+static WINAPI HRESULT stub_ID3D11SamplerState_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11SamplerState::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D11SamplerState_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D11SamplerState::AddRef"); }
+static WINAPI HRESULT stub_ID3D11SamplerState_Release(void *self) { (void)self; return d3d_not_implemented("ID3D11SamplerState::Release"); }
+static WINAPI HRESULT stub_ID3D11SamplerState_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D11SamplerState::GetDevice"); }
+static WINAPI HRESULT stub_ID3D11SamplerState_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11SamplerState::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11SamplerState_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11SamplerState::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11SamplerState_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11SamplerState::SetPrivateDataInterface"); }
+static WINAPI HRESULT stub_ID3D11SamplerState_GetDesc(void *self) { (void)self; return d3d_not_implemented("ID3D11SamplerState::GetDesc"); }
+static void *const vtstub_ID3D11SamplerState[] = { (void *)stub_ID3D11SamplerState_QueryInterface, (void *)stub_ID3D11SamplerState_AddRef, (void *)stub_ID3D11SamplerState_Release, (void *)stub_ID3D11SamplerState_GetDevice, (void *)stub_ID3D11SamplerState_GetPrivateData, (void *)stub_ID3D11SamplerState_SetPrivateData, (void *)stub_ID3D11SamplerState_SetPrivateDataInterface, (void *)stub_ID3D11SamplerState_GetDesc };
+#define VT_COUNT_ID3D11SamplerState 8
+static const GUID IID_ID3D11SamplerState = { 0xda6fea51, 0x564c, 0x4487, { 0x98, 0x10, 0xf0, 0xd0, 0xf9, 0xb4, 0xe3, 0xa5 } };
 static const char *const vt_IDXGIFactory[] = { "QueryInterface", "AddRef", "Release", "SetPrivateData", "SetPrivateDataInterface", "GetPrivateData", "GetParent", "EnumAdapters", "MakeWindowAssociation", "GetWindowAssociation", "CreateSwapChain", "CreateSoftwareAdapter" };
 static WINAPI HRESULT stub_IDXGIFactory_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDXGIFactory::QueryInterface"); }
 static WINAPI HRESULT stub_IDXGIFactory_AddRef(void *self) { (void)self; return d3d_not_implemented("IDXGIFactory::AddRef"); }
