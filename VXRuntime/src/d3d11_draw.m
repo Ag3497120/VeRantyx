@@ -1228,7 +1228,26 @@ static WINAPI void ctx_set_unsupported_stage(void *this, void *shader, void *con
     if (shader) d3d_not_implemented("geometry/tessellation shader stages (bound)");
 }
 
+// Geometry shaders are not supported (Metal has no such stage). With VXRT_DUMP_SHADERS their DXBC is written out
+// (gs_<hash>.dxbc), to see what programs use them for.
+static WINAPI HRESULT device_create_gs(void *this, const void *code, size_t size, void *linkage, void **out) {
+    (void)this; (void)linkage;
+    const char *dir = getenv("VXRT_DUMP_SHADERS");
+    if (dir && *dir && code) {
+        unsigned char md[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256(code, (CC_LONG)size, md);
+        char path[1024];
+        snprintf(path, sizeof path, "%s/gs_%02x%02x%02x%02x.dxbc", dir, md[0], md[1], md[2], md[3]);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(code, 1, size, f); fclose(f); }
+    }
+    static int told;
+    if (!told++) vx_log("Direct3D: geometry shaders are not supported yet");
+    if (out) *out = NULL;
+    return E_NOTIMPL;
+}
 const d3d_method d3d_draw_device_methods[] = {
+    { "CreateGeometryShader", (void *)device_create_gs },
     { "CreateVertexShader", (void *)device_create_vs }, { "CreatePixelShader", (void *)device_create_ps },
     { "CreateInputLayout", (void *)device_create_layout }, { "CreateBlendState", (void *)device_create_blend },
     { "CreateDepthStencilState", (void *)device_create_depth }, { "CreateRasterizerState", (void *)device_create_raster },

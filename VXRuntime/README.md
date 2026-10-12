@@ -30,6 +30,10 @@ VXRT_LOG_TIME=1 ...                        # log lines carry the time of day (th
 VXRT_TRACE_KEYED=1 VXRT_TRACE_MAPS=1 ...   # every AcquireSync/ReleaseSync (and waits made while holding one); staging Maps
 ```
 
+Half-Life: Alyx without Wine: `scripts/launch_vxrt_alyx.sh` (repository root; Steam running on the Mac and signed
+in) starts SteamVR on vxrt, the encoder and the web UI stand-in, then the game with the Steam bridge; extra
+arguments go to the game. The first start compiles the game's shaders (a few minutes).
+
 SteamVR without Wine: `scripts/launch_vxrt_steamvr.sh` (repository root) runs vrserver, vrcompositor and the VeRantyx
 driver on vxrt next to the HEVC encoder, using the Wine prefix's SteamVR read-only. Measured on 2026-10-12 without a
 headset: the driver captures and the encoder encodes 59-60 frames a second (the Vision Pro side is untested).
