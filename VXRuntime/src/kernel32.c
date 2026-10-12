@@ -535,11 +535,57 @@ static reservation *find_reservation(uintptr_t addr) {      // with g_vm_lock he
     return NULL;
 }
 
+// Protection set on page ranges (VirtualAlloc commits, VirtualProtect), as Windows reports it back: macOS keeps
+// every page readable, writable and executable (programs here only read the protection back, they do not rely on
+// faults). Sorted, non-overlapping ranges; with g_vm_lock held.
+typedef struct { uintptr_t start, end; DWORD protect; } prot_range;
+static prot_range *g_prot;
+static size_t g_nprot, g_cprot;
+static void prot_set(uintptr_t start, uintptr_t end, DWORD protect) {   // protect 0: forget the range
+    size_t i = 0;
+    while (i < g_nprot && g_prot[i].end <= start) i++;
+    prot_range left = { 0, 0, 0 }, right = { 0, 0, 0 };
+    size_t j = i;
+    while (j < g_nprot && g_prot[j].start < end) {               // overlapping ranges: keep their parts outside
+        if (g_prot[j].start < start) left = (prot_range){ g_prot[j].start, start, g_prot[j].protect };
+        if (g_prot[j].end > end) right = (prot_range){ end, g_prot[j].end, g_prot[j].protect };
+        j++;
+    }
+    prot_range add[3]; size_t n = 0;
+    if (left.end) add[n++] = left;
+    if (protect) add[n++] = (prot_range){ start, end, protect };
+    if (right.end) add[n++] = right;
+    if (g_nprot - (j - i) + n > g_cprot) { g_cprot = (g_nprot + n) * 2 + 64; g_prot = realloc(g_prot, g_cprot * sizeof *g_prot); }
+    memmove(g_prot + i + n, g_prot + j, (g_nprot - j) * sizeof *g_prot);
+    memcpy(g_prot + i, add, n * sizeof *add);
+    g_nprot = g_nprot - (j - i) + n;
+}
+static DWORD prot_get(uintptr_t a) {
+    size_t lo = 0, hi = g_nprot;
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (g_prot[mid].end <= a) lo = mid + 1; else hi = mid; }
+    return lo < g_nprot && g_prot[lo].start <= a ? g_prot[lo].protect : 0;
+}
+// A loaded image's page as Windows maps it: code execute-read, writable data copy-on-write, the rest read-only.
+static DWORD image_protect(const vx_image *m, uintptr_t a) {
+    const uint8_t *b = m->base, *nt = b + *(const uint32_t *)(b + 0x3c);
+    uint16_t nsec = *(const uint16_t *)(nt + 6), opt = *(const uint16_t *)(nt + 20);
+    const uint8_t *sec = nt + 24 + opt;
+    uintptr_t rva = a - (uintptr_t)b;
+    for (uint16_t i = 0; i < nsec; i++, sec += 40) {
+        uint32_t va = *(const uint32_t *)(sec + 12), size = *(const uint32_t *)(sec + 8), flags = *(const uint32_t *)(sec + 36);
+        if (rva < va || rva >= va + ((size + 0xfff) & ~0xfffu)) continue;
+        int x = (flags & 0x20000000u) != 0, w = (flags & 0x80000000u) != 0;
+        return x ? (w ? 0x80 /* PAGE_EXECUTE_WRITECOPY */ : 0x20 /* PAGE_EXECUTE_READ */) : w ? 0x08 /* PAGE_WRITECOPY */ : 0x02 /* PAGE_READONLY */;
+    }
+    return 0x02;
+}
 static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD protect) {
     if (!size) { vx_set_last_error(87); return NULL; }
     pthread_mutex_lock(&g_vm_lock);
     reservation *r = addr ? find_reservation((uintptr_t)addr) : NULL;
     if (r && !(type & MEM_RESERVE)) {                       // committing inside an existing reservation
+        uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;
+        prot_set(start, ((uintptr_t)addr + size + 0xfff) & ~(uintptr_t)0xfff, protect);
         pthread_mutex_unlock(&g_vm_lock);
         return (void *)((uintptr_t)addr & ~(uintptr_t)0xfff);
     }
@@ -599,6 +645,7 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
     BOOL ok = 0;
     if (r && (type & MEM_RELEASE) && !size && r->base == (uintptr_t)addr) {
         mach_vm_deallocate(mach_task_self(), r->base, r->size);
+        prot_set(r->base, r->base + r->size, 0);
         *r = g_res[--g_res_count];
         ok = 1;
     } else if (r && (type & MEM_DECOMMIT)) {
@@ -606,6 +653,7 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
         size_t len = size ? (((uintptr_t)addr + size + 0xfff) & ~(uintptr_t)0xfff) - start : r->base + r->size - start;
         mach_vm_address_t a = start;                       // fresh zero pages over the range
         ok = mach_vm_allocate(mach_task_self(), &a, len, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
+        prot_set(start, start + len, 0);
         if (ok) mach_vm_protect(mach_task_self(), a, len, 0, VM_PROT_ALL);
     }
     pthread_mutex_unlock(&g_vm_lock);
@@ -613,11 +661,14 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
     return ok;
 }
 static WINAPI BOOL VirtualProtect(void *addr, size_t size, DWORD prot, DWORD *old) {
-    (void)size;
+    uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff, end = ((uintptr_t)addr + (size ? size : 1) + 0xfff) & ~(uintptr_t)0xfff;
+    const vx_image *img = vx_image_at(start);
     pthread_mutex_lock(&g_vm_lock);
-    reservation *r = find_reservation((uintptr_t)addr);
-    if (old) *old = r ? r->protect : PAGE_EXECUTE_READWRITE;
-    if (r) r->protect = prot;
+    reservation *r = find_reservation(start);
+    DWORD was = prot_get(start);
+    if (!was) was = r ? r->protect : img ? image_protect(img, start) : PAGE_EXECUTE_READWRITE;
+    if (old) *old = was;
+    prot_set(start, end, prot);
     pthread_mutex_unlock(&g_vm_lock);
     return 1;
 }
@@ -632,14 +683,17 @@ static WINAPI size_t VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mb
     const vx_image *img = vx_image_at(page);
     pthread_mutex_lock(&g_vm_lock);
     reservation *r = find_reservation(page);
+    DWORD tracked = prot_get(page);
     if (r) {
         mbi->alloc_base = (void *)r->base; mbi->alloc_protect = mbi->protect = r->protect;
+        if (tracked) mbi->protect = tracked;
         mbi->region = r->base + r->size - page; mbi->state = MEM_COMMIT; mbi->type = MEM_PRIVATE;
     }
     pthread_mutex_unlock(&g_vm_lock);
     if (r) return sizeof *mbi;
     if (img) {
-        mbi->alloc_base = img->base; mbi->alloc_protect = mbi->protect = PAGE_EXECUTE_READWRITE;
+        mbi->alloc_base = img->base; mbi->alloc_protect = 0x80;   // PAGE_EXECUTE_WRITECOPY, as for every image
+        mbi->protect = tracked ? tracked : image_protect(img, page);
         mbi->region = (uintptr_t)img->base + img->size - page; mbi->state = MEM_COMMIT; mbi->type = MEM_IMAGE;
         return sizeof *mbi;
     }

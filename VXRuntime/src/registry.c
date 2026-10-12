@@ -139,6 +139,14 @@ static void defaults(void) {
     set_value(nt, "CurrentMinorVersionNumber", REG_DWORD, &minor, 4);
 }
 
+void vx_steam_registry(void);   // steambridge.c
+// A value set while the registry loads (the lock is held): the path starts with a root's full name.
+void vx_reg_put(const char *path, const char *name, DWORD type, const void *data, DWORD size) {
+    for (int i = 0; i < NROOTS; i++) {
+        size_t n = strlen(g_root_names[i]);
+        if (!strncmp(path, g_root_names[i], n) && path[n] == '\\') { set_value(walk(&g_roots[i], path + n + 1, 1), name, type, data, size); return; }
+    }
+}
 static void load(void) {
     if (g_loaded) return;
     g_loaded = 1;
@@ -146,7 +154,7 @@ static void load(void) {
     char file[4200];
     snprintf(file, sizeof file, "%s/registry.txt", vx_root());
     FILE *f = fopen(file, "r");
-    if (!f) { defaults(); save(); return; }
+    if (!f) { defaults(); vx_steam_registry(); save(); return; }
     size_t cap = 1 << 16;
     char *line = malloc(cap);
     uint8_t *buf = malloc(cap);
@@ -174,6 +182,7 @@ static void load(void) {
     }
     free(line); free(buf);
     fclose(f);
+    vx_steam_registry();
 }
 
 static void set_value(reg_key *k, const char *name, DWORD type, const void *data, DWORD size) {

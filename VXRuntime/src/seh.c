@@ -10,11 +10,13 @@
 // context in the program's code: RaiseException and RtlUnwindEx record their caller's state on entry
 // (context.S), and an unwind started from inside a handler restarts from the context of the exception being
 // dispatched.
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/ucontext.h>
 #include <execinfo.h>
 #include "vx.h"
@@ -62,12 +64,101 @@ enum { UNW_FLAG_EHANDLER = 1, UNW_FLAG_UHANDLER = 2, UNW_FLAG_CHAININFO = 4 };
 void vx_restore_context(const CONTEXT *ctx) __attribute__((noreturn));
 
 // ---- function lookup ------------------------------------------------------------------------------------------------
-static int pc_in_image(uint64_t pc) { return vx_image_at(pc) != NULL; }
+// Code generated at run time (JIT compilers such as V8) registers its unwind data in tables of its own:
+// RtlAddFunctionTable, the growable tables of Windows 8, or a callback for a range.
+typedef WINAPI RUNTIME_FUNCTION *(*table_callback)(uint64_t pc, void *context);
+typedef struct dyn_table {
+    RUNTIME_FUNCTION *entries; DWORD count, max; uint64_t base, lo, hi;   // code between lo and hi
+    table_callback callback; void *context;
+    struct dyn_table *next;
+} dyn_table;
+static dyn_table *g_tables;
+static pthread_rwlock_t g_tables_lock = PTHREAD_RWLOCK_INITIALIZER;
+static dyn_table *table_at(uint64_t pc) {           // with g_tables_lock held
+    for (dyn_table *t = g_tables; t; t = t->next) if (pc >= t->lo && pc < t->hi) return t;
+    return NULL;
+}
+static int pc_in_image(uint64_t pc) {
+    if (vx_image_at(pc)) return 1;
+    pthread_rwlock_rdlock(&g_tables_lock);
+    int in = table_at(pc) != NULL;
+    pthread_rwlock_unlock(&g_tables_lock);
+    return in;
+}
+static RUNTIME_FUNCTION *search(RUNTIME_FUNCTION *table, size_t n, DWORD rva) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (rva < table[mid].begin) hi = mid;
+        else if (rva >= table[mid].end) lo = mid + 1;
+        else return &table[mid];
+    }
+    return NULL;
+}
+static dyn_table *add_table(RUNTIME_FUNCTION *entries, DWORD count, DWORD max, uint64_t base, uint64_t lo, uint64_t hi) {
+    dyn_table *t = calloc(1, sizeof *t);
+    t->entries = entries; t->count = count; t->max = max; t->base = base; t->lo = lo; t->hi = hi;
+    pthread_rwlock_wrlock(&g_tables_lock);
+    t->next = g_tables; g_tables = t;
+    pthread_rwlock_unlock(&g_tables_lock);
+    return t;
+}
+static void remove_table(dyn_table *gone) {
+    pthread_rwlock_wrlock(&g_tables_lock);
+    for (dyn_table **pp = &g_tables; *pp; pp = &(*pp)->next) if (*pp == gone) { *pp = gone->next; free(gone); break; }
+    pthread_rwlock_unlock(&g_tables_lock);
+}
+static WINAPI BOOL RtlAddFunctionTable(RUNTIME_FUNCTION *entries, DWORD count, uint64_t base) {
+    DWORD lo = ~0u, hi = 0;
+    for (DWORD i = 0; i < count; i++) { if (entries[i].begin < lo) lo = entries[i].begin; if (entries[i].end > hi) hi = entries[i].end; }
+    if (count) add_table(entries, count, count, base, base + lo, base + hi);
+    return 1;
+}
+static WINAPI BOOL RtlDeleteFunctionTable(RUNTIME_FUNCTION *entries) {
+    pthread_rwlock_rdlock(&g_tables_lock);
+    dyn_table *t = g_tables;
+    while (t && t->entries != entries) t = t->next;
+    pthread_rwlock_unlock(&g_tables_lock);
+    if (t) remove_table(t);
+    return t != NULL;
+}
+static WINAPI DWORD RtlAddGrowableFunctionTable(void **handle, RUNTIME_FUNCTION *entries, DWORD count, DWORD max, uint64_t lo, uint64_t hi) {
+    *handle = add_table(entries, count, max, lo, lo, hi);
+    return 0;
+}
+static WINAPI void RtlGrowFunctionTable(void *handle, DWORD count) {
+    pthread_rwlock_wrlock(&g_tables_lock);
+    dyn_table *t = handle;
+    if (count <= t->max) t->count = count;
+    pthread_rwlock_unlock(&g_tables_lock);
+}
+static WINAPI void RtlDeleteGrowableFunctionTable(void *handle) { remove_table(handle); }
+// The identifier's low two bits are 3 for a callback table (Windows' convention); base..base+length is its code.
+static WINAPI BOOL RtlInstallFunctionTableCallback(uint64_t id, uint64_t base, DWORD length, table_callback cb, void *context, const WCHAR *dll) {
+    (void)dll;
+    if ((id & 3) != 3) return 0;
+    dyn_table *t = add_table(NULL, 0, 0, base, base, base + length);
+    t->callback = cb; t->context = context;
+    return 1;
+}
 
 static WINAPI RUNTIME_FUNCTION *RtlLookupFunctionEntry(uint64_t pc, uint64_t *base, void *history) {
     (void)history;
     const vx_image *m = vx_image_at(pc);
-    if (!m || !m->pdata_size) return NULL;
+    if (!m) {
+        pthread_rwlock_rdlock(&g_tables_lock);
+        dyn_table *t = table_at(pc);
+        RUNTIME_FUNCTION *fn = NULL;
+        table_callback cb = NULL; void *ctx = NULL;
+        if (t) {
+            *base = t->base;
+            if (t->callback) { cb = t->callback; ctx = t->context; }
+            else fn = search(t->entries, t->count, (DWORD)(pc - t->base));
+        }
+        pthread_rwlock_unlock(&g_tables_lock);
+        return cb ? cb(pc, ctx) : fn;
+    }
+    if (!m->pdata_size) return NULL;
     *base = (uint64_t)m->base;
     RUNTIME_FUNCTION *table = (RUNTIME_FUNCTION *)(m->base + m->pdata_rva);
     size_t lo = 0, hi = m->pdata_size / sizeof(RUNTIME_FUNCTION);
@@ -401,9 +492,29 @@ static WINAPI int __C_specific_handler(EXCEPTION_RECORD *rec, uint64_t frame, CO
 // ---- CPU faults: macOS signals become Windows exceptions -------------------------------------------------------------------
 static void signal_dispatch(EXCEPTION_RECORD *rec, CONTEXT *ctx) { dispatch(rec, ctx); }
 
+// Signals are handled on a stack of their own, so that a thread that ran out of stack can still be reported.
+void vx_signal_stack(void) {
+    stack_t st = { .ss_size = 128 << 10, .ss_flags = 0 };
+    st.ss_sp = mmap(NULL, st.ss_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (st.ss_sp != MAP_FAILED) sigaltstack(&st, NULL);
+}
+
 static void on_signal(int sig, siginfo_t *si, void *ucv) {
     ucontext_t *uc = ucv;
     _STRUCT_X86_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
+    // Out of stack: the fault is just below the thread's stack (its guard page). Windows would raise
+    // STATUS_STACK_OVERFLOW on what is left of the stack; here it is reported, with where it happened.
+    uint8_t *teb;
+    __asm__ volatile("movq %%gs:0x30, %0" : "=r"(teb));          // the TEB's own slot (none on macOS's threads)
+    if (teb && (sig == SIGSEGV || sig == SIGBUS)) {
+        uint64_t limit = *(uint64_t *)(teb + TEB_STACK_LIMIT), a = (uint64_t)si->si_addr;
+        if (a < limit && a + (64 << 10) >= limit) {
+            const vx_image *m = vx_image_at(ss->__rip);
+            vx_log("stack overflow on thread %u (stack %#llx-%#llx) at %s+%#llx", (unsigned)vx_current_tid(), (unsigned long long)limit,
+                   *(unsigned long long *)(teb + TEB_STACK_BASE), m ? m->name : "?", m ? (unsigned long long)(ss->__rip - (uint64_t)m->base) : (unsigned long long)ss->__rip);
+            _exit(128 + sig);
+        }
+    }
     // The program calling a bad address (a null function pointer): the fault is the program's, at the call. Its
     // caller is the frame to unwind from, as Windows treats the unknown address as a leaf function.
     uint64_t ret = 0;
@@ -413,7 +524,11 @@ static void on_signal(int sig, siginfo_t *si, void *ucv) {
     if (!pc_in_image(ss->__rip) && !bad_call) {
         // A fault in this runtime or in macOS code is a bug here, not the program's exception.
         // Print where (this runtime's frames) and exit at once rather than waiting for a macOS crash report.
-        vx_log("signal %d at %#llx (address %p) outside the program; native backtrace:", sig, (unsigned long long)ss->__rip, si->si_addr);
+        char tname[64] = "";
+        pthread_getname_np(pthread_self(), tname, sizeof tname);
+        uint8_t *top = pthread_get_stackaddr_np(pthread_self());
+        vx_log("signal %d at %#llx (address %p) outside the program, thread %u '%s' (stack %p-%p, TEB %p); native backtrace:", sig,
+               (unsigned long long)ss->__rip, si->si_addr, (unsigned)vx_current_tid(), tname, (void *)(top - pthread_get_stacksize_np(pthread_self())), (void *)top, (void *)teb);
         void *frames[32];
         frames[0] = (void *)ss->__rip;
         int n = 1;
@@ -467,7 +582,7 @@ void vx_seh_install_signals(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = on_signal;
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP };
     for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
@@ -485,6 +600,8 @@ static const vx_export seh_k32[] = {
     { "RtlCaptureContext", (void *)vx_RtlCaptureContext }, { "RaiseException", (void *)vx_RaiseException },
     { "RtlUnwindEx", (void *)vx_RtlUnwindEx }, { "RtlUnwind", (void *)vx_RtlUnwind },
     VX_EXPORT(RtlLookupFunctionEntry), VX_EXPORT(RtlVirtualUnwind), VX_EXPORT(RtlPcToFileHeader),
+    VX_EXPORT(RtlAddFunctionTable), VX_EXPORT(RtlDeleteFunctionTable), VX_EXPORT(RtlAddGrowableFunctionTable),
+    VX_EXPORT(RtlGrowFunctionTable), VX_EXPORT(RtlDeleteGrowableFunctionTable), VX_EXPORT(RtlInstallFunctionTableCallback),
     VX_EXPORT(AddVectoredExceptionHandler), VX_EXPORT(RemoveVectoredExceptionHandler),
     VX_EXPORT(SetUnhandledExceptionFilter), VX_EXPORT(UnhandledExceptionFilter),
 };

@@ -931,6 +931,11 @@ static HRESULT create_texture(void *this, const uint32_t *desc, uint32_t dim, ui
     d3d_device *d = dev_of(this);
     HRESULT hr;
     d3d_texture *t = texture_create(d, desc, dim, depth, &hr);
+    static int trace = -1;                             // VXRT_TRACE_TEXTURES: every texture made, and failures
+    if (trace < 0) trace = getenv("VXRT_TRACE_TEXTURES") != NULL;
+    if (trace || (!t && vx_trace))
+        vx_log("Direct3D: texture %ux%u (%ud) x%u mips %u format %u samples %u usage %u bind %#x cpu %#x misc %#x -> %#x", desc[TD_WIDTH], desc[TD_HEIGHT],
+               dim, desc[TD_ARRAY], desc[TD_MIPS], desc[TD_FORMAT], desc[TD_SAMPLES], desc[TD_USAGE], desc[TD_BIND], desc[TD_CPU], desc[TD_MISC], (unsigned)hr);
     if (!t) { if (out) *out = NULL; return hr; }
     if (init) {
         uint32_t subs = t->desc[TD_MIPS] * t->desc[TD_ARRAY];
@@ -990,13 +995,22 @@ static WINAPI HRESULT device_create_srv(void *this, d3d_object *res, const uint3
     *out = make_view(dev_of(this), K_SRV, g_srv_vtbl, res, desc, 0);
     return S_OK;
 }
-// D3D11_FORMAT_SUPPORT bits for the formats Metal has.
+// D3D11_FORMAT_SUPPORT bits for the formats Metal has: textures of every dimension, buffers, mips (also made by
+// GenerateMips), loads, sampling and gathers; render targets, blending and multisampling (rendering, loads and
+// resolves) for the uncompressed colour formats; depth formats for depth/stencil and comparison sampling.
+static uint32_t format_support(uint32_t format) {
+    MTLPixelFormat f = d3d_mtl_format(format, NULL);
+    if (f == MTLPixelFormatInvalid) return 0;
+    uint32_t s = 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x1000 | 0x100000 | 0x800000;   // 1D 2D 3D cube, load, sample, mip, cast, gather
+    int compressed = (format >= 70 && format <= 84) || (format >= 94 && format <= 99);
+    if (is_depth(f)) return s | 0x400 | 0x10000 | 0x200000 | 0x400000 | 0x4000000;          // comparison, depth, MSAA target and load
+    if (compressed) return s | 0x20000;
+    return s | 0x1 | 0x2000 | 0x4000 | 0x8000 | 0x20000 | 0x40000 | 0x200000 | 0x400000 | 0x2000000 | (format == 28 || format == 87 || format == 29 || format == 91 || format == 24 || format == 10 ? 0x80000 : 0);
+}
 static WINAPI HRESULT device_check_format_support(void *this, uint32_t format, uint32_t *support) {
     (void)this;
-    MTLPixelFormat f = d3d_mtl_format(format, NULL);
-    if (f == MTLPixelFormatInvalid) { *support = 0; return E_FAIL; }
-    *support = 0x20 | 0x80 | 0x100 | 0x200 | 0x4000 | 0x40000 | 0x100000 | (is_depth(f) ? 0x10000 : 0x8000 | 0x20000);
-    return S_OK;
+    *support = format_support(format);
+    return *support ? S_OK : E_FAIL;
 }
 static WINAPI HRESULT device_check_msaa(void *this, uint32_t format, uint32_t count, uint32_t *levels) {
     (void)format;
@@ -1005,6 +1019,11 @@ static WINAPI HRESULT device_check_msaa(void *this, uint32_t format, uint32_t co
 }
 static WINAPI HRESULT device_check_feature_support(void *this, uint32_t feature, void *data, uint32_t size) {
     (void)this;
+    if ((feature == 2 || feature == 3) && size >= 8) {                                          // FORMAT_SUPPORT(2): the format, then the bits
+        uint32_t format = ((uint32_t *)data)[0];
+        ((uint32_t *)data)[1] = feature == 2 ? format_support(format) : format_support(format) ? 0x1 | 0x2 | 0x4 | 0x8 | 0x40 | 0x80 : 0;   // atomics, typed UAV load/store
+        return S_OK;
+    }
     memset(data, 0, size);
     if (feature == 0 && size >= 8) { ((uint32_t *)data)[0] = 1; ((uint32_t *)data)[1] = 0; }   // THREADING: concurrent creates, no command lists
     else if (feature == 4 && size >= 4) ((uint32_t *)data)[0] = 1;                              // D3D10_X_HARDWARE_OPTIONS

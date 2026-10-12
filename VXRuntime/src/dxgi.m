@@ -215,6 +215,7 @@ typedef struct {
     MTLPixelFormat layer_format;
     uint32_t presents;
     int fullscreen;
+    void *resolved;                   // a multisampled back buffer is resolved into this (id<MTLTexture>, retained)
 } swapchain;
 
 // The present shader: a full-screen triangle sampling the back buffer.
@@ -245,7 +246,8 @@ static void *present_pipeline(id<MTLDevice> dev, MTLPixelFormat format) {
 }
 
 static HRESULT make_buffer(swapchain *sc) {
-    uint32_t desc[TD_COUNT] = { sc->width, sc->height, 1, 1, sc->format, 1, 0, 0, 0x20 | 0x8, 0, 0 };   // render target, shader resource
+    uint32_t desc[TD_COUNT] = { sc->width, sc->height, 1, 1, sc->format, sc->sample_count, 0, 0, 0x20 | 0x8, 0, 0 };   // render target, shader resource
+    if (sc->resolved) { CFRelease(sc->resolved); sc->resolved = NULL; }
     HRESULT hr;
     d3d_texture *t = d3d_texture_create(sc->dev, desc, &hr);
     if (!t) return hr;
@@ -293,6 +295,7 @@ static void swapchain_destroy(d3d_object *o) {
     swapchain *sc = (swapchain *)o;
     if (sc->buffer) d3d_release(&sc->buffer->base);
     if (sc->pipeline) CFBridgingRelease(sc->pipeline);
+    if (sc->resolved) CFRelease(sc->resolved);
     d3d_release(&sc->dev->base);
     child_destroy(o);
 }
@@ -367,10 +370,38 @@ void d3d_texture_png(d3d_device *dev, void *texture, const char *path) {
 }
 // VXRT_PRESENT_SNAPSHOT=file.png (with VXRT_PRESENT_SNAPSHOT_AT=n, default 300): the back buffer of the n-th
 // present is written to that file, to check what a program draws.
+static id<MTLTexture> resolve_back_buffer(swapchain *sc, id<MTLCommandBuffer> cmd, id<MTLTexture> back);
 static void snapshot(swapchain *sc) {
     const char *path = getenv("VXRT_PRESENT_SNAPSHOT");
     const char *at = getenv("VXRT_PRESENT_SNAPSHOT_AT");
-    if (path && sc->presents + 1 == (uint64_t)(at ? atoll(at) : 300)) d3d_texture_png(sc->dev, sc->buffer->mtl, path);
+    if (!path || sc->presents + 1 != (uint64_t)(at ? atoll(at) : 300)) return;
+    id<MTLTexture> back = (__bridge id<MTLTexture>)sc->buffer->mtl;
+    if (back.sampleCount > 1) {                     // multisampled: the resolved picture
+        id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)sc->dev->queue commandBuffer];
+        back = resolve_back_buffer(sc, cmd, back);
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+    d3d_texture_png(sc->dev, (__bridge void *)back, path);
+}
+// A multisampled back buffer (as the program asked for) is shown through a plain texture it is resolved into.
+static id<MTLTexture> resolve_back_buffer(swapchain *sc, id<MTLCommandBuffer> cmd, id<MTLTexture> back) {
+    id<MTLTexture> plain = (__bridge id<MTLTexture>)sc->resolved;
+    if (!plain || plain.width != back.width || plain.height != back.height || plain.pixelFormat != back.pixelFormat) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:back.pixelFormat width:back.width height:back.height mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        plain = [back.device newTextureWithDescriptor:td];
+        if (sc->resolved) CFRelease(sc->resolved);
+        sc->resolved = (void *)CFBridgingRetain(plain);
+    }
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = back;
+    rp.colorAttachments[0].resolveTexture = plain;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+    [[cmd renderCommandEncoderWithDescriptor:rp] endEncoding];
+    return plain;
 }
 #define DXGI_PRESENT_TEST 1
 static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flags) {
@@ -384,13 +415,15 @@ static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flag
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         if (!drawable) return S_OK;                 // hidden or minimized: nothing to show
         id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)sc->dev->queue commandBuffer];
+        id<MTLTexture> back = (__bridge id<MTLTexture>)sc->buffer->mtl;
+        if (back.sampleCount > 1) back = resolve_back_buffer(sc, cmd, back);
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = drawable.texture;
         rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
         [enc setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)sc->pipeline];
-        [enc setFragmentTexture:(__bridge id<MTLTexture>)sc->buffer->mtl atIndex:0];
+        [enc setFragmentTexture:back atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         [enc endEncoding];
         [cmd presentDrawable:drawable];

@@ -369,3 +369,19 @@ _vx_trace_return:
     movdqu 0x30(%rsp), %xmm0
     addq $0x40, %rsp
     jmpq *%r11
+
+// uint64_t vx_call_on_stack(uint64_t (*fn)(void *), void *arg, void *stack_top): calls fn(arg) (System V) on
+// another stack and returns its result on this one. Used to run Windows callbacks that macOS code makes on its own
+// small-stacked threads (the Steam bridge).
+    .globl _vx_call_on_stack
+_vx_call_on_stack:
+    pushq %rbp
+    movq %rsp, %rbp
+    movq %rdx, %rsp
+    andq $-16, %rsp
+    movq %rdi, %rax
+    movq %rsi, %rdi
+    callq *%rax
+    movq %rbp, %rsp
+    popq %rbp
+    retq

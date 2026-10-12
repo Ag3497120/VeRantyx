@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "vx.h"
+#include <fcntl.h>
 
 // ---- formatting -----------------------------------------------------------------------------------------------------
 static size_t utf16_to_utf8(const WCHAR *w, long max, char *out, size_t cap) {
@@ -1070,7 +1071,167 @@ static const vx_export ucrt[] = {
     VX_EXPORT(_initialize_onexit_table), VX_EXPORT(_register_onexit_function), VX_EXPORT(_execute_onexit_table),
 };
 
+// ---- msvcrt.dll's own: what older DLLs (built against msvcrt, e.g. by MinGW) import beyond the UCRT --------------
+// Descriptors are macOS descriptors (as _read already uses), a file handle is 0x10000 + descriptor (kernel32.c).
+static int unix_oflags(int w) {
+    int f = (w & 3) == 1 ? O_WRONLY : (w & 3) == 2 ? O_RDWR : O_RDONLY;
+    if (w & 0x8) f |= O_APPEND;
+    if (w & 0x100) f |= O_CREAT;
+    if (w & 0x200) f |= O_TRUNC;
+    if (w & 0x400) f |= O_EXCL;
+    return f;
+}
+static int open_path(const char *path, int oflag, int mode) {
+    char unix_path[4096];
+    int f = unix_oflags(oflag), writes = (f & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)) != 0;
+    if (!(writes ? vx_unix_path_write(path, unix_path, sizeof unix_path, !(f & O_TRUNC)) : vx_unix_path(path, unix_path, sizeof unix_path))) { set_errno(2); return -1; }
+    int fd = open(unix_path, f, mode ? 0644 : 0644);
+    if (fd < 0) set_errno(errno == ENOENT ? 2 : errno == EEXIST ? 17 : 13);
+    return fd;
+}
+static WINAPI int ms_open(const char *path, int oflag, int mode) { return open_path(path, oflag, mode); }
+static WINAPI int ms_wopen(const WCHAR *path, int oflag, int mode) { char *p = vx_utf8_dup(path); int fd = open_path(p, oflag, mode); free(p); return fd; }
+static WINAPI int ms_wsopen(const WCHAR *path, int oflag, int share, int mode) { (void)share; return ms_wopen(path, oflag, mode); }
+static WINAPI int ms_close(int fd) { return fd > 2 ? close(fd) : 0; }
+static WINAPI int ms_write(int fd, const void *p, unsigned n) { return write_all(fd, p, n) ? -1 : (int)n; }
+static WINAPI int64_t ms_lseeki64(int fd, int64_t off, int whence) { return lseek(fd, off, whence); }
+static WINAPI int ms_isatty(int fd) { return isatty(fd); }
+static WINAPI int ms_chsize(int fd, long size) { return ftruncate(fd, size); }
+static WINAPI intptr_t ms_get_osfhandle(int fd) { return fd < 3 ? -10 - fd : 0x10000 + fd; }
+static WINAPI int ms_open_osfhandle(intptr_t h, int flags) { (void)flags; return vx_handle_fd((HANDLE)h); }
+static WINAPI vx_file *ms_fdopen(int fd, const char *mode) {
+    char m[8]; size_t k = 0;
+    for (const char *p = mode; *p && k < sizeof m - 1; p++) if (strchr("rwa+", *p)) m[k++] = *p;
+    m[k] = 0;
+    FILE *f = fdopen(fd, m);
+    if (!f) return NULL;
+    vx_file *v = calloc(1, sizeof *v);
+    v->fd = fd; v->f = f;
+    return v;
+}
+static WINAPI WCHAR *ms_wgetenv(const WCHAR *name) {             // the wide copies are kept (callers keep the pointers)
+    char *n = vx_utf8_dup(name);
+    const char *v = getenv(n);
+    free(n);
+    return v ? vx_utf16_dup(v) : NULL;
+}
+static WINAPI int ms_wcsncmp(const WCHAR *a, const WCHAR *b, size_t n) {
+    for (size_t i = 0; i < n; i++) { if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1; if (!a[i]) break; }
+    return 0;
+}
+static WINAPI long ms_wcstol(const WCHAR *s, WCHAR **end, int base) {
+    char buf[64]; size_t i = 0;
+    while (i < sizeof buf - 1 && s[i] && s[i] < 128) { buf[i] = (char)s[i]; i++; }
+    buf[i] = 0;
+    char *e;
+    long v = (long)(int32_t)strtol(buf, &e, base);
+    if (end) *end = (WCHAR *)s + (e - buf);
+    return v;
+}
+static WINAPI long ms_atol(const char *s) { return (long)(int32_t)atol(s); }
+static WINAPI char *ms_strlwr(char *s) { for (char *p = s; *p; p++) *p = (char)tolower((unsigned char)*p); return s; }
+static WINAPI WCHAR *ms_wcslwr(WCHAR *s) { for (WCHAR *p = s; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32; return s; }
+static char *to_radix(uint64_t v, int neg, char *buf, int radix) {
+    char tmp[72]; int n = 0;
+    if (radix < 2 || radix > 36) radix = 10;
+    do { int d = (int)(v % (unsigned)radix); tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v /= (unsigned)radix; } while (v);
+    char *p = buf;
+    if (neg) *p++ = '-';
+    while (n) *p++ = tmp[--n];
+    *p = 0;
+    return buf;
+}
+static WINAPI char *ms_itoa(int v, char *buf, int radix) { return radix == 10 && v < 0 ? to_radix((uint64_t)-(int64_t)v, 1, buf, 10) : to_radix((uint32_t)v, 0, buf, radix); }
+static WINAPI char *ms_ultoa(uint32_t v, char *buf, int radix) { return to_radix(v, 0, buf, radix); }
+static WINAPI int ms_memicmp(const void *a, const void *b, size_t n) {
+    for (size_t i = 0; i < n; i++) { int x = tolower(((const uint8_t *)a)[i]), y = tolower(((const uint8_t *)b)[i]); if (x != y) return x - y; }
+    return 0;
+}
+static WINAPI int ms_mbtowc(WCHAR *w, const char *s, size_t n) { if (!s) return 0; if (!n) return -1; if (w) *w = (uint8_t)*s; return *s ? 1 : 0; }
+static WINAPI int ms_wctomb(char *s, WCHAR w) { if (!s) return 0; if (w > 0x7f) return -1; *s = (char)w; return 1; }
+static WINAPI int ms_isleadbyte(int c) { (void)c; return 0; }
+static WINAPI int ms_ismbblead(unsigned c) { (void)c; return 0; }
+static WINAPI int ms_mbscmp(const unsigned char *a, const unsigned char *b) { return strcmp((const char *)a, (const char *)b); }
+static WINAPI int64_t ms_time(int64_t *t) { return vx_time64(t); }
+static WINAPI char *ms_ctime(const int64_t *t) { static __thread char buf[32]; time_t v = (time_t)*t; return ctime_r(&v, buf); }
+static WINAPI WCHAR *ms_wctime(const int64_t *t) {
+    static __thread WCHAR w[32];
+    char *c = ms_ctime(t);
+    for (int i = 0; i < 31 && (w[i] = (WCHAR)(uint8_t)c[i]); i++) {}
+    return w;
+}
+static WINAPI char *ms_strdate(char *buf) { time_t v = time(NULL); struct tm r; localtime_r(&v, &r); strftime(buf, 9, "%m/%d/%y", &r); return buf; }
+static WINAPI char *ms_strtime(char *buf) { time_t v = time(NULL); struct tm r; localtime_r(&v, &r); strftime(buf, 9, "%H:%M:%S", &r); return buf; }
+static WINAPI char *ms_tempnam(const char *dir, const char *prefix) {
+    (void)dir;
+    char *s = malloc(64);
+    snprintf(s, 64, "C:\\windows\\temp\\%s%08x", prefix ? prefix : "", arc4random());
+    return s;
+}
+static WINAPI WCHAR *ms_wfullpath(WCHAR *buf, const WCHAR *path, size_t size) {
+    typedef DWORD (WINAPI *full_fn)(const WCHAR *, DWORD, WCHAR *, WCHAR **);
+    full_fn full = (full_fn)vx_find_export("kernel32.dll", "GetFullPathNameW");
+    WCHAR *out = buf ? buf : malloc((size ? size : 4096) * 2);
+    DWORD n = full ? full(path, (DWORD)(buf ? size : 4096), out, NULL) : 0;
+    if (!n || n >= (buf ? size : 4096)) { if (!buf) free(out); return NULL; }
+    return out;
+}
+typedef int (WINAPI *compare_fn)(const void *, const void *);
+static WINAPI void *ms_bsearch(const void *key, const void *base, size_t n, size_t size, compare_fn cmp) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        const void *e = (const char *)base + mid * size;
+        int c = cmp(key, e);
+        if (!c) return (void *)e;
+        if (c < 0) hi = mid; else lo = mid + 1;
+    }
+    return NULL;
+}
+static WINAPI int ms_vfprintf(vx_file *f, const char *fmt, const char *ap) { return __stdio_common_vfprintf(0, f, fmt, NULL, ap); }
+static WINAPI int ms_fprintf(vx_file *f, const char *fmt, ...) {
+    __builtin_ms_va_list ap;
+    __builtin_ms_va_start(ap, fmt);
+    int r = __stdio_common_vfprintf(0, f, fmt, NULL, ap);
+    __builtin_ms_va_end(ap);
+    return r;
+}
+static WINAPI int ms_sscanf(const char *buf, const char *fmt, ...) {
+    __builtin_ms_va_list ap;
+    __builtin_ms_va_start(ap, fmt);
+    int r = __stdio_common_vsscanf(0, buf, (size_t)-1, fmt, NULL, ap);
+    __builtin_ms_va_end(ap);
+    return r;
+}
+static WINAPI char *ms_unDName(char *out, const char *name, int len, void *alloc, void *dealloc, unsigned short flags) {
+    (void)out; (void)name; (void)len; (void)alloc; (void)dealloc; (void)flags;
+    return NULL;                                                     // names stay decorated
+}
+// Data: msvcrt's FILE is 48 bytes, so _iob[1] is 48 bytes on; each entry starts with this runtime's FILE.
+static struct { vx_file f; char pad[48 - sizeof(vx_file)]; } g_msvcrt_iob[3] = { { { 0, NULL, NULL, NULL, 0 }, { 0 } },
+    { { 1, NULL, NULL, NULL, 0 }, { 0 } }, { { 2, NULL, NULL, NULL, 0 }, { 0 } } };
+static WINAPI void *ms_iob_func(void) { return g_msvcrt_iob; }
+static int g_mb_cur_max = 1;
+static uint8_t g_ioinfo[64 * 64];
+static void *g_pioinfo[64] = { g_ioinfo };
+static const vx_export msvcrt_extra[] = {
+    { "_open", (void *)ms_open }, { "_wopen", (void *)ms_wopen }, { "_wsopen", (void *)ms_wsopen }, { "_close", (void *)ms_close },
+    { "_write", (void *)ms_write }, { "_lseeki64", (void *)ms_lseeki64 }, { "_isatty", (void *)ms_isatty }, { "_chsize", (void *)ms_chsize },
+    { "_get_osfhandle", (void *)ms_get_osfhandle }, { "_open_osfhandle", (void *)ms_open_osfhandle }, { "_fdopen", (void *)ms_fdopen },
+    { "_wgetenv", (void *)ms_wgetenv }, { "wcsncmp", (void *)ms_wcsncmp }, { "wcstol", (void *)ms_wcstol }, { "atol", (void *)ms_atol },
+    { "_strlwr", (void *)ms_strlwr }, { "_wcslwr", (void *)ms_wcslwr }, { "_itoa", (void *)ms_itoa }, { "_ltoa", (void *)ms_itoa },
+    { "_ultoa", (void *)ms_ultoa }, { "_memicmp", (void *)ms_memicmp }, { "mbtowc", (void *)ms_mbtowc }, { "wctomb", (void *)ms_wctomb },
+    { "isleadbyte", (void *)ms_isleadbyte }, { "_ismbblead", (void *)ms_ismbblead }, { "_mbscmp", (void *)ms_mbscmp },
+    { "time", (void *)ms_time }, { "ctime", (void *)ms_ctime }, { "_wctime", (void *)ms_wctime }, { "_strdate", (void *)ms_strdate },
+    { "_strtime", (void *)ms_strtime }, { "_tempnam", (void *)ms_tempnam }, { "_wfullpath", (void *)ms_wfullpath },
+    { "bsearch", (void *)ms_bsearch }, { "vfprintf", (void *)ms_vfprintf }, { "fprintf", (void *)ms_fprintf }, { "sscanf", (void *)ms_sscanf },
+    { "__unDName", (void *)ms_unDName }, { "__iob_func", (void *)ms_iob_func }, { "_iob", (void *)g_msvcrt_iob },
+    { "__mb_cur_max", (void *)&g_mb_cur_max }, { "__pioinfo", (void *)g_pioinfo }, { "__badioinfo", (void *)g_ioinfo },
+};
+
 void vx_ucrt_init(void) {
     vx_register_module("ucrtbase.dll", ucrt, sizeof ucrt / sizeof ucrt[0]);
     vx_register_module("msvcrt.dll", ucrt, sizeof ucrt / sizeof ucrt[0]);
+    vx_register_module("msvcrt.dll", msvcrt_extra, sizeof msvcrt_extra / sizeof msvcrt_extra[0]);
+    vx_register_module("ucrtbase.dll", msvcrt_extra, sizeof msvcrt_extra / sizeof msvcrt_extra[0]);
 }

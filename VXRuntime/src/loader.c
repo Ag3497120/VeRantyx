@@ -217,7 +217,9 @@ uint8_t *vx_teb(void) {
     return teb;
 }
 
+void vx_signal_stack(void);   // seh.c
 void vx_thread_attach(void) {
+    vx_signal_stack();
     uint8_t *teb = calloc(1, TEB_SIZE);
     pthread_t self = pthread_self();
     uint8_t *stack_top = pthread_get_stackaddr_np(self);
@@ -525,6 +527,12 @@ static void *load_library(const char *name, DWORD flags) {
                 if (slash) *slash = 0;
             }
             struct stat st;
+            const char *base = strrchr(name, '\\') ? strrchr(name, '\\') + 1 : strrchr(name, '/') ? strrchr(name, '/') + 1 : name;
+            if (!m && stat(path, &st) && is_builtin(base)) {          // a system DLL this runtime provides, by its full path
+                snprintf(g_altered_dir, sizeof g_altered_dir, "%s", saved);
+                pthread_mutex_unlock(&g_loader_lock);
+                return builtin_handle(base);
+            }
             if (!m && stat(path, &st)) vx_set_last_error(126 /* ERROR_MOD_NOT_FOUND */);   // quietly, like Windows
             else if (!m) m = load_pe(path, 0);
             if (m) { m->refs++; if (!init_dll(m)) m = NULL; else h = m->base; }
@@ -715,6 +723,7 @@ int main(int argc, char **argv, char **envp) {
     vx_desktop_init();
     vx_services_init();
     vx_client_init();
+    vx_steambridge_init();
     vx_pipes_init();
     vx_register_module("kernel32.dll", loader_k32, sizeof loader_k32 / sizeof loader_k32[0]);
     vx_register_module("kernelbase.dll", loader_k32, sizeof loader_k32 / sizeof loader_k32[0]);
