@@ -620,6 +620,7 @@ static void shm_name(const char *name, char *out, size_t cap) {
 #define PAGE_WRITECOPY 0x08
 #define PAGE_EXECUTE_READ 0x20
 static HANDLE create_mapping(HANDLE file, DWORD protect, uint64_t size, const char *name) {
+    if (vx_trace && name) vx_log("CreateFileMapping %s (%llu bytes)", name, (unsigned long long)size);
     int writable = !(protect & (PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_WRITECOPY));
     int fd;
     int existed = 0;
@@ -666,6 +667,7 @@ static WINAPI HANDLE CreateFileMappingW(HANDLE file, void *sa, DWORD protect, DW
     (void)sa; char *a = vx_utf8_dup(name); HANDLE h = create_mapping(file, protect, (uint64_t)high << 32 | low, a); free(a); return h;
 }
 static HANDLE open_mapping(const char *name) {
+    if (vx_trace) vx_log("OpenFileMapping %s", name);
     char shm[40];
     shm_name(name, shm, sizeof shm);
     if (!vx_name_join(shm)) { vx_name_leave(shm); vx_set_last_error(2); return NULL; }   // nobody holds it

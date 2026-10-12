@@ -363,7 +363,7 @@ static BOOL create_process(const char *app, const char *cmd, const void *env_blo
     for (int i = 0; i < argc; i++) free(args[i]);
     free(args);
     if (r) { vx_set_last_error(vx_error_from_errno(r)); return 0; }
-    if (vx_trace) vx_log("CreateProcess: %s as process %d", exe, (int)pid);
+    if (vx_trace) vx_log("CreateProcess: %s as process %d (command line: %s)", exe, (int)pid, cmd ? cmd : "");
     HANDLE thread;
     HANDLE process = vx_process_handle(pid, 1, &thread);
     if (pi) { pi[0] = process; pi[1] = thread; ((DWORD *)pi)[4] = (DWORD)pid; ((DWORD *)pi)[5] = (DWORD)pid; }

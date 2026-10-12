@@ -5,6 +5,7 @@
 // are). A texture lives in a global IOSurface (its ID is in the slot), so OpenSharedResource in another process
 // makes a Metal texture of the same surface; a buffer lives in POSIX shared memory. A keyed mutex is a key and an
 // owner in the slot; ReleaseSync waits for the GPU work so far, so the other process reads finished pixels.
+#include <os/os_sync_wait_on_address.h>
 #import <IOSurface/IOSurface.h>
 #include "d3d_common.h"
 #include <fcntl.h>
@@ -31,7 +32,7 @@ typedef struct {
     uint64_t size;
     volatile int64_t key;            // keyed mutex: the key it was released with
     volatile int32_t owner;          // and who holds it (0: nobody)
-    int32_t pad;
+    volatile uint32_t released;      // counts releases: waiters in other processes sleep on it
 } shared_slot;
 typedef struct { volatile uint32_t spin; shared_slot s[SLOTS]; } shared_table;
 static shared_table *g_table;
@@ -217,7 +218,12 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         uint64_t elapsed = (uint64_t)(now.tv_sec - start.tv_sec) * 1000 + (uint64_t)((now.tv_nsec - start.tv_nsec) / 1000000);
         if (ms != 0xffffffffu && elapsed >= ms) return (HRESULT)0x102;   // WAIT_TIMEOUT
-        usleep(200);
+        // Sleep until a release (any process) or 2 ms, then look again.
+        uint32_t seen = __atomic_load_n(&e->released, __ATOMIC_ACQUIRE);
+        if ((uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && !__atomic_load_n(&e->owner, __ATOMIC_ACQUIRE)) continue;
+        if (__builtin_available(macOS 14.4, *))
+            os_sync_wait_on_address_with_timeout((void *)&e->released, seen, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED, OS_CLOCK_MACH_ABSOLUTE_TIME, 2000000);
+        else usleep(200);
     }
 }
 static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
@@ -227,6 +233,8 @@ static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
     shared_slot *e = &table()->s[t->shared - 1];
     __atomic_store_n(&e->key, (int64_t)key, __ATOMIC_RELEASE);
     __atomic_store_n(&e->owner, 0, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&e->released, 1, __ATOMIC_RELEASE);
+    if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&e->released, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
     return S_OK;
 }
 static WINAPI HRESULT keyed_get_device(void *this, const GUID *iid, void **out) {
