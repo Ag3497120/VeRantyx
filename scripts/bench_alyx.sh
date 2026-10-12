@@ -118,7 +118,7 @@ LAUNCH_PID=$!
 
 game_started=0
 for ((elapsed = 0; elapsed < LAUNCH_TIMEOUT; elapsed++)); do
-    if tail -c "+$((proxy_offset + 1))" "$PROXY_LOG" 2>/dev/null | grep -q 'Captured Alyx eye pair'; then
+    if tail -c "+$((proxy_offset + 1))" "$PROXY_LOG" 2>/dev/null | grep -Eq 'Captured (Alyx|game) eye pair'; then
         game_started=1
         break
     fi

@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
+#include <GL/gl.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <math.h>
@@ -694,11 +695,175 @@ static bool PublishOldestStagedPair() {
     if (!firstCaptureLogged || frame->sequenceNumber % 90 == 0) {
         firstCaptureLogged = true;
         char message[160];
-        snprintf(message, sizeof(message), "Captured Alyx eye pair %u (%ux%u format=%u) using deferred readback",
+        snprintf(message, sizeof(message), "Captured game eye pair %u (%ux%u format=%u) using deferred readback",
             frame->sequenceNumber, frame->width, frame->height, frame->format);
         Log(message);
     }
     return true;
+}
+
+// ---- OpenGL games (Google Earth VR) ----------------------------------------
+//
+// An OpenGL game submits a GL texture name. SteamVR on Windows hands such a
+// texture to its D3D11 compositor through WGL_NV_DX_interop, which Wine on
+// macOS does not have, so the proxy reads the texture itself: Submit runs on
+// the game's render thread with its GL context current, so glGetTexImage on
+// that context returns the eye image. Synchronous (the GL path has no staging
+// ring), which costs a few milliseconds a frame; good enough to bring an
+// OpenGL title up. Rows are flipped unless the game's bounds already flip v
+// (vMin > vMax), because OpenVR treats a GL texture as bottom-up.
+#ifndef GL_PIXEL_PACK_BUFFER_BINDING
+#define GL_PIXEL_PACK_BUFFER_BINDING 0x88ED
+#endif
+#ifndef GL_PIXEL_PACK_BUFFER
+#define GL_PIXEL_PACK_BUFFER 0x88EB
+#endif
+#ifndef GL_PACK_ROW_LENGTH
+#define GL_PACK_ROW_LENGTH 0x0D02
+#endif
+typedef void (APIENTRY *GlBindBufferFn)(GLenum, GLuint);
+struct GlEye {
+    uint8_t* pixels = nullptr;   // RGBA8, top row first, cropped to the bounds
+    size_t capacity = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool ready = false;
+};
+static GlEye g_glEyes[2];
+static uint8_t* g_glTexture = nullptr;
+static size_t g_glTextureCapacity = 0;
+static SharedHands g_glPairHands = {};
+static LONG g_glLogCount = 0;
+
+static bool ReadGlEye(vr::EVREye eye, const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds) {
+    if (!wglGetCurrentContext()) return false;
+    const GLuint name = (GLuint)(uintptr_t)texture->handle;
+    GLint previous = 0, packBuffer = 0, packAlignment = 4, packRowLength = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &packAlignment);
+    glGetIntegerv(GL_PACK_ROW_LENGTH, &packRowLength);
+    static GlBindBufferFn bindBuffer = (GlBindBufferFn)wglGetProcAddress("glBindBuffer");
+    if (packBuffer && bindBuffer) bindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, name);
+    GLint width = 0, height = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+    bool ok = width > 0 && height > 0 && width <= 8192 && height <= 8192;
+    if (ok) {
+        const size_t bytes = (size_t)width * height * 4;
+        if (g_glTextureCapacity < bytes) {
+            free(g_glTexture);
+            g_glTexture = (uint8_t*)malloc(bytes);
+            g_glTextureCapacity = g_glTexture ? bytes : 0;
+        }
+        ok = g_glTexture != nullptr;
+        if (ok) {
+            glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_glTexture);
+            ok = glGetError() == GL_NO_ERROR;
+        }
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT, packAlignment);
+    glPixelStorei(GL_PACK_ROW_LENGTH, packRowLength);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)previous);
+    if (packBuffer && bindBuffer) bindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)packBuffer);
+    if (!ok) {
+        LONG n = InterlockedIncrement(&g_glLogCount);
+        if (n <= 8 || n % 300 == 0) {
+            char message[160];
+            snprintf(message, sizeof(message), "OpenGL Submit texture %u could not be read (eye=%d size=%dx%d)",
+                name, (int)eye, width, height);
+            Log(message);
+        }
+        return false;
+    }
+    float u0 = 0, u1 = 1, v0 = 0, v1 = 1;
+    if (bounds) { u0 = bounds->uMin; u1 = bounds->uMax; v0 = bounds->vMin; v1 = bounds->vMax; }
+    const bool flipped = v0 > v1;  // the game already turned it top-down
+    const float ulo = u0 < u1 ? u0 : u1, uhi = u0 < u1 ? u1 : u0;
+    const float vlo = v0 < v1 ? v0 : v1, vhi = v0 < v1 ? v1 : v0;
+    const uint32_t x0 = (uint32_t)(ulo * width + 0.5f), x1 = (uint32_t)(uhi * width + 0.5f);
+    const uint32_t y0 = (uint32_t)(vlo * height + 0.5f), y1 = (uint32_t)(vhi * height + 0.5f);
+    if (x1 <= x0 || y1 <= y0 || x1 > (uint32_t)width || y1 > (uint32_t)height) return false;
+    GlEye& out = g_glEyes[eye == vr::Eye_Right ? 1 : 0];
+    out.width = x1 - x0;
+    out.height = y1 - y0;
+    const size_t need = (size_t)out.width * out.height * 4;
+    if (out.capacity < need) {
+        free(out.pixels);
+        out.pixels = (uint8_t*)malloc(need);
+        out.capacity = out.pixels ? need : 0;
+        if (!out.pixels) return false;
+    }
+    for (uint32_t row = 0; row < out.height; ++row) {
+        // glGetTexImage's row 0 is the bottom of the texture.
+        const uint32_t sourceRow = flipped ? (y0 + row) : (y1 - 1 - row);
+        memcpy(out.pixels + (size_t)row * out.width * 4,
+            g_glTexture + ((size_t)sourceRow * width + x0) * 4, (size_t)out.width * 4);
+    }
+    out.ready = true;
+    return true;
+}
+
+static void PublishGlPair() {
+    const GlEye& left = g_glEyes[0];
+    const GlEye& right = g_glEyes[1];
+    if (!left.ready || !right.ready || left.width != right.width || left.height != right.height) return;
+    const uint32_t eyeWidth = left.width, eyeHeight = left.height;
+    const size_t combinedRowBytes = (size_t)eyeWidth * 2 * 4;
+    if (combinedRowBytes * eyeHeight > kMaxPixelBytes) return;
+    const uint32_t writeIndex = static_cast<uint32_t>(InterlockedCompareExchange(
+        &g_sharedHeader->latestReadyIndex, 0, 0)) ^ 1u;
+    uint8_t* destination = g_pixels[writeIndex];
+    for (uint32_t row = 0; row < eyeHeight; ++row) {
+        memcpy(destination + row * combinedRowBytes, left.pixels + (size_t)row * eyeWidth * 4, (size_t)eyeWidth * 4);
+        memcpy(destination + row * combinedRowBytes + (size_t)eyeWidth * 4,
+            right.pixels + (size_t)row * eyeWidth * 4, (size_t)eyeWidth * 4);
+    }
+    SharedFrame* frame = g_frames[writeIndex];
+    frame->sequenceNumber = ++g_sequence;
+    if (frame->sequenceNumber == 0) frame->sequenceNumber = ++g_sequence;
+    frame->width = eyeWidth * 2;
+    frame->height = eyeHeight;
+    frame->format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    memcpy(frame->renderHeadTransform, g_glPairHands.headTransform, sizeof(frame->renderHeadTransform));
+    if (frame->renderHeadTransform[0] == 0.0f && frame->renderHeadTransform[5] == 0.0f &&
+        frame->renderHeadTransform[10] == 0.0f) {
+        memset(frame->renderHeadTransform, 0, sizeof(frame->renderHeadTransform));
+        frame->renderHeadTransform[0] = frame->renderHeadTransform[5] = 1.0f;
+        frame->renderHeadTransform[10] = frame->renderHeadTransform[15] = 1.0f;
+    }
+    frame->visionTimestamp = g_glPairHands.visionTimestamp;
+    MemoryBarrier();
+    InterlockedExchange(&g_sharedHeader->latestReadyIndex, (LONG)writeIndex);
+    MemoryBarrier();
+    InterlockedExchange(&g_sharedHeader->captureSourceMode, 2);
+    ++g_metrics.published;
+    static bool firstLogged = false;
+    if (!firstLogged || frame->sequenceNumber % 90 == 0) {
+        firstLogged = true;
+        char message[160];
+        snprintf(message, sizeof(message), "Captured game eye pair %u (%ux%u format=%u) using OpenGL readback",
+            frame->sequenceNumber, frame->width, frame->height, frame->format);
+        Log(message);
+    }
+}
+
+static void CaptureSubmitGl(vr::EVREye eye, const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds) {
+    InterlockedExchange(&g_submitThreadId, (LONG)GetCurrentThreadId());
+    InterlockedExchange(&g_sharedHeader->padding[9], (LONG)GetTickCount());
+    if (!TryLockCapture()) return;
+    if (eye == vr::Eye_Left) {
+        ++g_metrics.submitted;
+        g_glEyes[0].ready = g_glEyes[1].ready = false;
+        ReadRenderPoseForSubmit(&g_glPairHands);
+    }
+    const bool read = ReadGlEye(eye, texture, bounds);
+    if (read && eye == vr::Eye_Right) PublishGlPair();
+    LogCaptureMetrics();
+    UnlockCapture();
 }
 
 static void CaptureSubmit(vr::EVREye eye, const vr::Texture_t* texture,
@@ -716,6 +881,10 @@ static void CaptureSubmit(vr::EVREye eye, const vr::Texture_t* texture,
         snprintf(message, sizeof(message), "Submit texture details type=%d handle=%p colorSpace=%d",
             (int)texture->eType, texture->handle, (int)texture->eColorSpace);
         Log(message);
+    }
+    if (texture->eType == vr::TextureType_OpenGL && texture->handle && InitSharedMemory()) {
+        CaptureSubmitGl(eye, texture, bounds);
+        return;
     }
     if (texture->eType != vr::TextureType_DirectX || !texture->handle || !InitSharedMemory()) return;
     InterlockedExchange(&g_submitThreadId, (LONG)GetCurrentThreadId());
@@ -1106,6 +1275,18 @@ static vr::EVRCompositorError VR_CALLTYPE HookedSubmit(void* self, vr::EVREye ey
     }
     CaptureSubmit(eye, texture, bounds);
     if (texture && texture->eType == vr::TextureType_DirectX) InstallSharedHandleHooks(texture->handle);
+    // An OpenGL texture is not forwarded: SteamVR's client would hand it to its
+    // D3D11 compositor through WGL_NV_DX_interop, which Wine on macOS lacks. The
+    // frame has been captured above, and WaitGetPoses already answers the game
+    // itself when SteamVR withholds focus (see g_lastRenderPoses).
+    // VERANTYX_GL_FORWARD=1 forwards it anyway.
+    if (texture && texture->eType == vr::TextureType_OpenGL) {
+        static const bool forwardGl = []() {
+            char value[8] = {};
+            return GetEnvironmentVariableA("VERANTYX_GL_FORWARD", value, sizeof(value)) > 0 && value[0] == '1';
+        }();
+        if (!forwardGl) return vr::VRCompositorError_None;
+    }
     CompositorHook* hook = FindCompositorHook(self);
     if (hook && hook->submit) {
         vr::Texture_t baseTexture = {};
