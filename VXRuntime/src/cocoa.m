@@ -117,6 +117,7 @@ int vx_cocoa_title_height(void) {
     vx_window *w;
     NSTrackingArea *tracking;
     CGFloat wheel;                         // accumulated precise scrolling, in WHEEL_DELTA units
+    CGFloat raw_x, raw_y;                  // fractions of raw movement not reported yet
 }
 @end
 
@@ -169,6 +170,9 @@ static WPARAM mouse_keys(NSEvent *e) {
 }
 - (void)button:(NSEvent *)e message:(uint32_t)msg vk:(int)vk down:(int)down {
     vx_mouse_button(vk, down);
+    // RI_MOUSE_*_BUTTON_DOWN/UP: left 0x1/0x2, right 0x4/0x8, middle 0x10/0x20.
+    int shift = vk == 1 ? 0 : vk == 2 ? 2 : 4;
+    vx_raw_mouse(0, 0, (uint16_t)((down ? 1 : 2) << shift), 0);
     if (down && e.clickCount == 2 && msg == WM_LBUTTONDOWN) msg = WM_LBUTTONDBLCLK;
     vx_window_post(w->hwnd, msg, mouse_keys(e), [self pos:e]);
 }
@@ -178,7 +182,14 @@ static WPARAM mouse_keys(NSEvent *e) {
 - (void)rightMouseUp:(NSEvent *)e     { [self button:e message:WM_RBUTTONUP vk:2 down:0]; }
 - (void)otherMouseDown:(NSEvent *)e   { if (e.buttonNumber == 2) [self button:e message:WM_MBUTTONDOWN vk:4 down:1]; }
 - (void)otherMouseUp:(NSEvent *)e     { if (e.buttonNumber == 2) [self button:e message:WM_MBUTTONUP vk:4 down:0]; }
-- (void)mouseMoved:(NSEvent *)e       { vx_window_post(w->hwnd, WM_MOUSEMOVE, mouse_keys(e), [self pos:e]); }
+- (void)mouseMoved:(NSEvent *)e {
+    // Raw movement: whole-pixel deltas, the remainder carried to the next event.
+    raw_x += e.deltaX; raw_y += e.deltaY;
+    int dx = (int)raw_x, dy = (int)raw_y;
+    raw_x -= dx; raw_y -= dy;
+    vx_raw_mouse(dx, dy, 0, 0);
+    vx_window_post(w->hwnd, WM_MOUSEMOVE, mouse_keys(e), [self pos:e]);
+}
 - (void)mouseDragged:(NSEvent *)e     { [self mouseMoved:e]; }
 - (void)rightMouseDragged:(NSEvent *)e { [self mouseMoved:e]; }
 - (void)otherMouseDragged:(NSEvent *)e { [self mouseMoved:e]; }
@@ -188,6 +199,7 @@ static WPARAM mouse_keys(NSEvent *e) {
     int delta = (int)wheel;
     if (!delta) return;
     wheel -= delta;
+    vx_raw_mouse(0, 0, 0x400 /* RI_MOUSE_WHEEL */, (int16_t)delta);
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
     NSRect screen = [self.window convertRectToScreen:[self convertRect:NSMakeRect(p.x, p.y, 0, 0) toView:nil]];
     vx_window_post(w->hwnd, WM_MOUSEWHEEL, (WPARAM)(uint16_t)mouse_keys(e) | ((WPARAM)(uint16_t)(int16_t)delta << 16),

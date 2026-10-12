@@ -640,6 +640,7 @@ static const struct { uint8_t vk; uint16_t scan; } g_keymap[128] = {
     [0x7A] = { 0x70, 0x3B }, [0x7B] = { 0x25, 0x14B }, [0x7C] = { 0x27, 0x14D }, [0x7D] = { 0x28, 0x150 }, [0x7E] = { 0x26, 0x148 },
 };
 static uint8_t g_keys[256];         // 0x80 down, 0x01 toggled
+static void raw_key(int scan, int vk, int down);
 static void set_key(int vk, int down) {
     if (down && !(g_keys[vk] & 0x80)) g_keys[vk] ^= 0x01;
     g_keys[vk] = (uint8_t)((g_keys[vk] & 0x01) | (down ? 0x80 : 0));
@@ -657,6 +658,7 @@ void vx_key_event(vx_window *w, int code, int down, int repeat, int alt) {
     else if (repeat) lp |= (LPARAM)1 << 30;
     int sys = alt || vk == 0x12;
     vx_window_post(w->hwnd, down ? (sys ? WM_SYSKEYDOWN : WM_KEYDOWN) : (sys ? WM_SYSKEYUP : WM_KEYUP), (WPARAM)vk, lp);
+    raw_key(scan, vk, down);
 }
 void vx_char_event(vx_window *w, const uint16_t *chars, int n) {
     for (int i = 0; i < n; i++) vx_window_post(w->hwnd, WM_CHAR, chars[i], 1);
@@ -693,11 +695,14 @@ static WINAPI int GetKeyNameTextA(LONG lp, char *buf, int n) {
 static WINAPI BOOL GetCursorPos(POINT *p) { cursor_pos(p); return 1; }
 static WINAPI BOOL SetCursorPos(int x, int y) { CGWarpMouseCursorPosition(CGPointMake(x, y)); CGAssociateMouseAndMouseCursorPosition(1); return 1; }
 static int g_cursor_count;
+static RECT g_clip; static int g_clipped;
+static void update_mouse_mode(void);
 static WINAPI int ShowCursor(BOOL show) {
     int before = g_cursor_count;
     g_cursor_count += show ? 1 : -1;
     if (before >= 0 && g_cursor_count < 0) CGDisplayHideCursor(kCGDirectMainDisplay);
     if (before < 0 && g_cursor_count >= 0) CGDisplayShowCursor(kCGDirectMainDisplay);
+    update_mouse_mode();
     return g_cursor_count;
 }
 static HANDLE g_cursor = (HANDLE)(intptr_t)0x10003;
@@ -715,16 +720,185 @@ static WINAPI HANDLE LoadImageW(HANDLE inst, const WCHAR *name, uint32_t type, i
 static WINAPI BOOL DestroyCursor(HANDLE c) { (void)c; return 1; }
 static WINAPI BOOL DestroyIcon(HANDLE c) { (void)c; return 1; }
 static RECT g_clip; static int g_clipped;
-static WINAPI BOOL ClipCursor(const RECT *r) { g_clipped = r != NULL; if (r) g_clip = *r; return 1; }   // recorded, not enforced yet
+// A hidden cursor confined to a rectangle is how games ask for mouse-look: the cursor then stays put while the
+// mouse keeps sending movement (raw input and WM_MOUSEMOVE deltas through SetCursorPos re-centering both work).
+static void update_mouse_mode(void) { CGAssociateMouseAndMouseCursorPosition(!(g_clipped && g_cursor_count < 0)); }
+static WINAPI BOOL ClipCursor(const RECT *r) { g_clipped = r != NULL; if (r) g_clip = *r; update_mouse_mode(); return 1; }
 static WINAPI BOOL GetClipCursor(RECT *r) { if (g_clipped) *r = g_clip; else vx_virtual_screen(r); return 1; }
 static WINAPI HANDLE SetCapture(HANDLE h) { HANDLE o = g_capture; g_capture = h; return o; }
 static WINAPI BOOL ReleaseCapture(void) { g_capture = NULL; return 1; }
 static WINAPI HANDLE GetCapture(void) { return g_capture; }
 static WINAPI BOOL TrackMouseEvent(void *t) { (void)t; return 1; }
 static WINAPI uint32_t GetDoubleClickTime(void) { return 500; }
-// Raw input is not delivered yet: registration succeeds, reads find nothing.
-static WINAPI BOOL RegisterRawInputDevices(const void *d, uint32_t n, uint32_t size) { (void)d; (void)n; (void)size; return 1; }
-static WINAPI uint32_t GetRawInputData(HANDLE h, uint32_t cmd, void *data, uint32_t *size, uint32_t hsize) { (void)h; (void)cmd; (void)data; (void)hsize; if (size) *size = 0; return 0; }
+
+
+// ---- raw input ---------------------------------------------------------------------------------------------------------------------
+// Programs that register for raw input get WM_INPUT for every mouse movement (unaccelerated deltas, buttons, wheel)
+// and key, as RAWINPUT records: a header (type, size, device, wParam) and RAWMOUSE (flags, button flags and data,
+// raw buttons, x, y, extra) or RAWKEYBOARD (make code, flags, reserved, virtual key, message, extra).
+typedef struct { uint16_t page, usage; DWORD flags; HANDLE target; } RAWINPUTDEVICE;
+static WINAPI BOOL ScreenToClient(HANDLE h, POINT *p);
+#define RIDEV_REMOVE 0x1
+#define RAW_MOUSE_DEVICE ((HANDLE)(intptr_t)0x50001)
+#define RAW_KEYBOARD_DEVICE ((HANDLE)(intptr_t)0x50002)
+#define RAW_RING 1024
+static RAWINPUTDEVICE g_raw_mouse, g_raw_keyboard;
+static int g_raw_has_mouse, g_raw_has_keyboard;
+static struct { uint8_t data[48]; uint32_t size; } g_raw[RAW_RING];
+static uint32_t g_raw_next;
+static pthread_mutex_t g_raw_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static WINAPI BOOL RegisterRawInputDevices(const RAWINPUTDEVICE *d, uint32_t n, uint32_t size) {
+    if (size != sizeof(RAWINPUTDEVICE)) { vx_set_last_error(87); return 0; }
+    for (uint32_t i = 0; i < n; i++) {
+        if (d[i].page != 1) continue;                               // generic desktop controls
+        int remove = (d[i].flags & RIDEV_REMOVE) != 0;
+        if (d[i].usage == 2) { g_raw_mouse = d[i]; g_raw_has_mouse = !remove; }
+        if (d[i].usage == 6) { g_raw_keyboard = d[i]; g_raw_has_keyboard = !remove; }
+    }
+    return 1;
+}
+static WINAPI uint32_t GetRegisteredRawInputDevices(RAWINPUTDEVICE *d, uint32_t *n, uint32_t size) {
+    uint32_t count = (uint32_t)(g_raw_has_mouse + g_raw_has_keyboard);
+    if (!d || *n < count) { *n = count; vx_set_last_error(122); return d ? (uint32_t)-1 : 0; }
+    uint32_t k = 0;
+    if (g_raw_has_mouse) d[k++] = g_raw_mouse;
+    if (g_raw_has_keyboard) d[k++] = g_raw_keyboard;
+    (void)size;
+    return k;
+}
+// Where WM_INPUT goes: the registered window, else the focused one, else the program's first window.
+static HANDLE raw_target(const RAWINPUTDEVICE *reg) {
+    if (reg->target && vx_window_get(reg->target)) return reg->target;
+    if (g_focus && vx_window_get(g_focus)) return g_focus;
+    for (int i = 0; i < g_window_next; i++) if (g_windows[i] && !g_windows[i]->destroyed && !(g_windows[i]->style & WS_CHILD)) return g_windows[i]->hwnd;
+    return NULL;
+}
+static void post_raw(const RAWINPUTDEVICE *reg, const uint8_t *record, uint32_t size) {
+    HANDLE target = raw_target(reg);
+    if (!target) return;
+    pthread_mutex_lock(&g_raw_lock);
+    uint32_t i = g_raw_next++ % RAW_RING;
+    memcpy(g_raw[i].data, record, size);
+    g_raw[i].size = size;
+    pthread_mutex_unlock(&g_raw_lock);
+    vx_window_post(target, 0x00FF /* WM_INPUT */, 0 /* RIM_INPUT */, (LPARAM)(0x60000 + i));
+}
+void vx_raw_mouse(int dx, int dy, uint16_t button_flags, int16_t wheel) {
+    if (!g_raw_has_mouse || (!dx && !dy && !button_flags)) return;
+    uint8_t r[48] = { 0 };
+    *(DWORD *)r = 0; *(DWORD *)(r + 4) = 48; *(HANDLE *)(r + 8) = RAW_MOUSE_DEVICE;
+    *(uint16_t *)(r + 28) = button_flags; *(int16_t *)(r + 30) = wheel;     // RAWMOUSE at 24: flags, padding, button flags and data
+    *(LONG *)(r + 36) = dx; *(LONG *)(r + 40) = dy;                          // lLastX, lLastY
+    post_raw(&g_raw_mouse, r, 48);
+}
+static void raw_key(int scan, int vk, int down) {
+    if (!g_raw_has_keyboard) return;
+    uint8_t r[40] = { 0 };
+    *(DWORD *)r = 1; *(DWORD *)(r + 4) = 40; *(HANDLE *)(r + 8) = RAW_KEYBOARD_DEVICE;
+    *(uint16_t *)(r + 24) = (uint16_t)(scan & 0xff);
+    *(uint16_t *)(r + 26) = (uint16_t)((down ? 0 : 1) | (scan & 0x100 ? 2 : 0));   // RI_KEY_BREAK, RI_KEY_E0
+    *(uint16_t *)(r + 30) = (uint16_t)vk;
+    *(uint32_t *)(r + 32) = down ? WM_KEYDOWN : WM_KEYUP;
+    post_raw(&g_raw_keyboard, r, 40);
+}
+#define RID_INPUT 0x10000003
+#define RID_HEADER 0x10000005
+static WINAPI uint32_t GetRawInputData(HANDLE h, uint32_t cmd, void *data, uint32_t *size, uint32_t header_size) {
+    uint32_t i = (uint32_t)((uintptr_t)h - 0x60000);
+    if (i >= RAW_RING || header_size != 24) { vx_set_last_error(6); return (uint32_t)-1; }
+    pthread_mutex_lock(&g_raw_lock);
+    uint32_t need = cmd == RID_HEADER ? 24 : g_raw[i].size;
+    uint32_t r;
+    if (!data) { *size = need; r = 0; }
+    else if (*size < need) { vx_set_last_error(122); r = (uint32_t)-1; }
+    else { memcpy(data, g_raw[i].data, need); r = need; }
+    pthread_mutex_unlock(&g_raw_lock);
+    return r;
+}
+static WINAPI uint32_t GetRawInputBuffer(void *data, uint32_t *size, uint32_t header_size) { (void)data; (void)header_size; *size = 0; return 0; }
+static WINAPI LRESULT DefRawInputProc(void *const *raw, int n, uint32_t header_size) { (void)raw; (void)n; (void)header_size; return 0; }
+// RAWINPUTDEVICELIST: device, type.
+static WINAPI uint32_t GetRawInputDeviceList(uint8_t *list, uint32_t *n, uint32_t size) {
+    if (!list) { *n = 2; return 0; }
+    if (*n < 2 || size != 16) { *n = 2; vx_set_last_error(122); return (uint32_t)-1; }
+    *(HANDLE *)list = RAW_MOUSE_DEVICE; *(DWORD *)(list + 8) = 0;
+    *(HANDLE *)(list + 16) = RAW_KEYBOARD_DEVICE; *(DWORD *)(list + 24) = 1;
+    return 2;
+}
+#define RIDI_DEVICENAME 0x20000007
+#define RIDI_DEVICEINFO 0x2000000b
+static uint32_t device_info(HANDLE dev, uint32_t cmd, void *data, uint32_t *size, int wide) {
+    int mouse = dev == RAW_MOUSE_DEVICE;
+    if (cmd == RIDI_DEVICENAME) {
+        const char *name = mouse ? "\\\\?\\HID#VID_05AC&PID_0001#vxrt-mouse" : "\\\\?\\HID#VID_05AC&PID_0002#vxrt-keyboard";
+        uint32_t need = (uint32_t)strlen(name) + 1;
+        if (!data || *size < need) { *size = need; return data ? (uint32_t)-1 : 0; }
+        if (wide) vx_utf8_to_utf16(name, need, data, need); else memcpy(data, name, need);
+        return need;
+    }
+    if (cmd == RIDI_DEVICEINFO) {
+        if (!data || *size < 32) { *size = 32; return data ? (uint32_t)-1 : 0; }
+        uint8_t *d = data;
+        memset(d, 0, 32);
+        *(DWORD *)d = 32; *(DWORD *)(d + 4) = mouse ? 0 : 1;
+        if (mouse) { *(DWORD *)(d + 8) = 1; *(DWORD *)(d + 12) = 5; *(DWORD *)(d + 16) = 1000; *(DWORD *)(d + 20) = 1; }
+        else { *(DWORD *)(d + 8) = 4; *(DWORD *)(d + 16) = 1; *(DWORD *)(d + 20) = 12; *(DWORD *)(d + 24) = 3; *(DWORD *)(d + 28) = 104; }
+        return 32;
+    }
+    vx_set_last_error(87);
+    return (uint32_t)-1;
+}
+static WINAPI uint32_t GetRawInputDeviceInfoA(HANDLE dev, uint32_t cmd, void *data, uint32_t *size) { return device_info(dev, cmd, data, size, 0); }
+static WINAPI uint32_t GetRawInputDeviceInfoW(HANDLE dev, uint32_t cmd, void *data, uint32_t *size) { return device_info(dev, cmd, data, size, 1); }
+
+// SendInput: input as if it came from the devices: raw input, key and button messages to the focused window.
+// INPUT: type (0 mouse, 1 keyboard), then MOUSEINPUT (dx, dy, data, flags, time, extra) or KEYBDINPUT
+// (virtual key, scan code, flags, time, extra).
+static WINAPI uint32_t SendInput(uint32_t n, const uint8_t *inputs, int size) {
+    if (size != 40) { vx_set_last_error(87); return 0; }
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *in = inputs + (size_t)i * 40;
+        HANDLE target = raw_target(&g_raw_keyboard);
+        vx_window *w = vx_window_get(target);
+        if (*(const DWORD *)in == 0) {
+            LONG dx = *(const LONG *)(in + 8), dy = *(const LONG *)(in + 12);
+            DWORD data = *(const DWORD *)(in + 16), flags = *(const DWORD *)(in + 20);
+            uint16_t bf = 0;
+            static const struct { DWORD in; uint16_t raw; uint32_t msg; int vk, down; } buttons[] = {
+                { 0x2, 0x1, WM_LBUTTONDOWN, 1, 1 }, { 0x4, 0x2, WM_LBUTTONUP, 1, 0 }, { 0x8, 0x4, WM_RBUTTONDOWN, 2, 1 },
+                { 0x10, 0x8, WM_RBUTTONUP, 2, 0 }, { 0x20, 0x10, WM_MBUTTONDOWN, 4, 1 }, { 0x40, 0x20, WM_MBUTTONUP, 4, 0 } };
+            POINT p; cursor_pos(&p);
+            if (w) ScreenToClient(w->hwnd, &p);
+            for (size_t k = 0; k < sizeof buttons / sizeof buttons[0]; k++) {
+                if (!(flags & buttons[k].in)) continue;
+                bf |= buttons[k].raw;
+                set_key(buttons[k].vk, buttons[k].down);
+                if (w) vx_window_post(w->hwnd, buttons[k].msg, 0, MAKELPARAM(p.x, p.y));
+            }
+            int16_t wheel = 0;
+            if (flags & 0x800) { bf |= 0x400; wheel = (int16_t)data; if (w) vx_window_post(w->hwnd, WM_MOUSEWHEEL, (WPARAM)(uint16_t)wheel << 16, 0); }
+            if ((flags & 0x1) && !(flags & 0x8000)) {
+                vx_raw_mouse(dx, dy, bf, wheel);
+                if (w) vx_window_post(w->hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(p.x, p.y));
+            } else if (bf) vx_raw_mouse(0, 0, bf, wheel);
+        } else if (*(const DWORD *)in == 1) {
+            uint16_t vk = *(const uint16_t *)(in + 8);
+            DWORD flags = *(const DWORD *)(in + 12);
+            int down = !(flags & 0x2);                                         // KEYEVENTF_KEYUP
+            int code = -1;
+            for (int k = 0; k < 128 && code < 0; k++) if (g_keymap[k].vk == vk) code = k;
+            if (code >= 0 && w) {
+                vx_key_event(w, code, down, 0, 0);
+                if (down && ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9') || vk == ' ')) {
+                    uint16_t ch = (uint16_t)(vk >= 'A' && vk <= 'Z' && !(g_keys[0x10] & 0x80) ? vk + 32 : vk);
+                    vx_char_event(w, &ch, 1);
+                }
+            }
+        }
+    }
+    return n;
+}
 
 // ---- window state ------------------------------------------------------------------------------------------------------------------
 static WINAPI BOOL IsWindow(HANDLE h) { return vx_window_get(h) != NULL; }
@@ -1271,7 +1445,9 @@ static const vx_export user32[] = {
     VX_EXPORT(LoadCursorA), VX_EXPORT(LoadCursorW), VX_EXPORT(LoadIconA), VX_EXPORT(LoadIconW), VX_EXPORT(LoadImageA), VX_EXPORT(LoadImageW),
     VX_EXPORT(DestroyCursor), VX_EXPORT(DestroyIcon), VX_EXPORT(ClipCursor), VX_EXPORT(GetClipCursor),
     VX_EXPORT(SetCapture), VX_EXPORT(ReleaseCapture), VX_EXPORT(GetCapture), VX_EXPORT(TrackMouseEvent), VX_EXPORT(GetDoubleClickTime),
-    VX_EXPORT(RegisterRawInputDevices), VX_EXPORT(GetRawInputData),
+    VX_EXPORT(RegisterRawInputDevices), VX_EXPORT(GetRawInputData), VX_EXPORT(GetRegisteredRawInputDevices),
+    VX_EXPORT(GetRawInputBuffer), VX_EXPORT(DefRawInputProc), VX_EXPORT(GetRawInputDeviceList), VX_EXPORT(GetRawInputDeviceInfoA),
+    VX_EXPORT(GetRawInputDeviceInfoW), VX_EXPORT(SendInput),
     VX_EXPORT(GetSystemMetrics), VX_EXPORT(GetSystemMetricsForDpi), VX_EXPORT(SystemParametersInfoA), VX_EXPORT(SystemParametersInfoW),
     VX_EXPORT(EnumDisplaySettingsA), VX_EXPORT(EnumDisplaySettingsW), VX_EXPORT(EnumDisplaySettingsExA), VX_EXPORT(EnumDisplaySettingsExW),
     VX_EXPORT(ChangeDisplaySettingsA), VX_EXPORT(ChangeDisplaySettingsW), VX_EXPORT(ChangeDisplaySettingsExA), VX_EXPORT(ChangeDisplaySettingsExW),

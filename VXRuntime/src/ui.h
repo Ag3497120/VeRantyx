@@ -57,6 +57,7 @@ void vx_window_minimized(vx_window *w, int minimized);
 void vx_key_event(vx_window *w, int mac_keycode, int down, int repeat, int alt);
 void vx_char_event(vx_window *w, const uint16_t *chars, int n);
 void vx_mouse_button(int vk, int down);                   // VK_LBUTTON etc. state for GetKeyState
+void vx_raw_mouse(int dx, int dy, uint16_t button_flags, int16_t wheel);   // WM_INPUT for raw-input programs
 void vx_request_redraw(vx_window *w);                     // after drawing into the client area
 LRESULT vx_send_message(HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp);
 int vx_virtual_screen(RECT *r);                           // main display, Windows coordinates
