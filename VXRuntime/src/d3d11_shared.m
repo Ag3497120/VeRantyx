@@ -231,16 +231,44 @@ static d3d_texture *keyed_of(void *this) { return (d3d_texture *)((char *)this -
 static WINAPI HRESULT keyed_qi(void *this, const GUID *iid, void **out) { d3d_texture *t = keyed_of(this); return ((HRESULT (WINAPI *)(void *, const GUID *, void **))t->base.vtbl[0])(t, iid, out); }
 static WINAPI uint32_t keyed_addref(void *this) { return d3d_addref(&keyed_of(this)->base); }
 static WINAPI uint32_t keyed_release(void *this) { return d3d_release(&keyed_of(this)->base); }
+// VXRT_STATS=1: every 600 AcquireSyncs, how long they waited and for what.
+extern __thread int vx_keyed_held;   // sync.c (VXRT_TRACE_KEYED: waits while holding are logged)
+static int g_keyed_stats = -1;
+static uint64_t g_acquired[SLOTS];                   // when this process last took each slot's mutex
+static void hold_stats(int slot) {                   // and how long it kept it, every 600 releases
+    static uint64_t n, ns;
+    if (!g_acquired[slot]) return;
+    ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - g_acquired[slot];
+    g_acquired[slot] = 0;
+    if (++n % 600 == 0) vx_log("keyed mutex: held %.2f ms on average over %llu releases", ns / 1e6 / n, (unsigned long long)n);
+}
+static void keyed_stats(int why, const struct timespec *start) {
+    static uint64_t n, ns[4], waits[4];
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t d = (uint64_t)(now.tv_sec - start->tv_sec) * 1000000000ull + (uint64_t)(now.tv_nsec - start->tv_nsec);
+    __atomic_add_fetch(&ns[why], d, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&waits[why], 1, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&n, 1, __ATOMIC_RELAXED) % 600) return;
+    vx_log("keyed mutex: %llu acquires; waited for the other GPU %llu times (%llu ms), for the key %llu times (%llu ms), for the owner %llu times (%llu ms)",
+           (unsigned long long)n, (unsigned long long)waits[1], (unsigned long long)(ns[1] / 1000000), (unsigned long long)waits[2],
+           (unsigned long long)(ns[2] / 1000000), (unsigned long long)waits[3], (unsigned long long)(ns[3] / 1000000));
+}
 static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
+    if (g_keyed_stats < 0) g_keyed_stats = getenv("VXRT_STATS") != NULL;
     d3d_texture *t = keyed_of(this);
     if (!t->shared) return S_OK;
     shared_slot *e = &table()->s[t->shared - 1];
     struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
+    int why = 0;                                       // what the first look found missing: 1 the GPU, 2 the key, 3 the owner
     for (;;) {
         int32_t free_owner = 0;
         int gpu_ready = !__atomic_load_n(&e->gpu_pending, __ATOMIC_ACQUIRE) || e->gpu_pid == (int32_t)getpid();   // the releaser's own queue keeps the order
-        if (gpu_ready && (uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && __atomic_compare_exchange_n(&e->owner, &free_owner, (int32_t)getpid(), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        if (gpu_ready && (uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && __atomic_compare_exchange_n(&e->owner, &free_owner, (int32_t)getpid(), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            if (g_keyed_stats) { keyed_stats(why, &start); g_acquired[t->shared - 1] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+            if (getenv("VXRT_TRACE_KEYED")) { vx_log("keyed mutex slot %d: AcquireSync(%llu) by %d", t->shared - 1, (unsigned long long)key, (int)getpid()); vx_keyed_held++; }
             return S_OK;
+        }
+        if (!why) why = !gpu_ready ? 1 : (uint64_t)e->key != key ? 2 : 3;
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         uint64_t elapsed = (uint64_t)(now.tv_sec - start.tv_sec) * 1000 + (uint64_t)((now.tv_nsec - start.tv_nsec) / 1000000);
         if (ms != 0xffffffffu && elapsed >= ms) {
@@ -274,6 +302,8 @@ static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
     static int sync_release = -1;
     if (sync_release < 0) sync_release = getenv("VXRT_SYNC_RELEASE") && atoi(getenv("VXRT_SYNC_RELEASE"));
     shared_slot *slot_e = &table()->s[t->shared - 1];
+    if (g_keyed_stats > 0) hold_stats(t->shared - 1);
+    if (vx_keyed_held) vx_keyed_held--;
     if (!sync_release && !getenv("VXRT_SHARED_SNAPSHOT")) {
         if (getenv("VXRT_TRACE_KEYED")) vx_log("keyed mutex slot %d: ReleaseSync(%llu) by %d, published when the GPU is done", t->shared - 1, (unsigned long long)key, (int)getpid());
         __atomic_store_n(&slot_e->gpu_pid, (int32_t)getpid(), __ATOMIC_RELEASE);

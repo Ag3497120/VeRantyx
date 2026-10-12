@@ -31,6 +31,13 @@ void vx_log(const char *fmt, ...) {
         for (const char *c = b; *c; c++) if (*c == '\\' || *c == '/') b = c + 1;
         n = snprintf(line, sizeof line, "[vxrt %.40s:%d] ", b, (int)getpid());
     } else n = snprintf(line, sizeof line, "[vxrt] ");
+    static int timed = -1;                       // VXRT_LOG_TIME=1: the time of day (the same clock in every process)
+    if (timed < 0) timed = getenv("VXRT_LOG_TIME") != NULL;
+    if (timed) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        long day = (long)(ts.tv_sec % 86400);
+        n += snprintf(line + n, sizeof line - (size_t)n, "%02ld:%02ld:%02ld.%03ld ", day / 3600, day / 60 % 60, day % 60, ts.tv_nsec / 1000000);
+    }
     va_list ap; va_start(ap, fmt);
     n += vsnprintf(line + n, sizeof line - (size_t)n - 1, fmt, ap);
     va_end(ap);

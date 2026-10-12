@@ -38,6 +38,7 @@ typedef struct d3d_object {
     d3d_device *dev;                 // the device a resource or view belongs to
     pdata *pdata;                    // SetPrivateData
     void (*destroy)(struct d3d_object *);
+    uint64_t gpu_seq;                // resources: the command buffer (device sequence number) that last copied to or from it
 } d3d_object;
 
 // `this` of a method called through the second table.
@@ -71,6 +72,7 @@ struct d3d_device {
     uint32_t flags, feature_level, max_latency;
     volatile uint64_t submitted, completed;   // command buffers committed, and the last one the GPU finished
     int apple_family;                // Metal's Apple GPU family: 7 = M1, 8 = M2, 9 = M3/M4, 10 = M5 and later (0: other)
+    void *slices;                    // chunks small renamed buffers are carved from (d3d11.m)
 };
 int d3d_apple_family(void *mtl_device);   // d3d11.m
 typedef struct {
@@ -86,7 +88,9 @@ typedef struct {
 
 // D3D11_BUFFER_DESC as six fields: byte width, usage, bind flags, CPU access, misc flags, structure stride.
 // shared: a buffer in shared memory, between processes (its slot + 1): updated in place, never renamed.
-typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; int shared; void *shm; size_t shm_size; } d3d_buffer;
+// mtl: the Metal buffer holding the contents (retained), from byte off on: a small buffer renamed by Map(DISCARD)
+// or UpdateSubresource is a slice of a larger chunk (then chunk is set; its size is desc[0], not mtl's length).
+typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; int shared; void *shm; size_t shm_size; size_t off; void *chunk; } d3d_buffer;
 // A view: of a texture (mip, slices), or of a buffer (first element and count; flags: raw).
 // A view: of a texture (dimension, first mip and mip count, slices), or of a buffer (first element and count;
 // flags: raw, append, counter). counter: a UAV's hidden counter (id<MTLBuffer> of 4 bytes, retained); mtl_view:
@@ -136,6 +140,7 @@ d3d_texture *d3d_texture_wrap(d3d_device *dev, const uint32_t desc[TD_COUNT], vo
 d3d_buffer  *d3d_buffer_wrap(d3d_device *dev, const uint32_t desc[6], void *mtl, int shared, void *shm, size_t shm_size);
 void         d3d_texture_replace(d3d_texture *t, void *mtl_texture);     // a swap chain's buffer after a resize
 void         d3d_flush(d3d_device *dev, int wait);                       // commits the immediate context's work
+void         d3d_mark_gpu(d3d_context *c, d3d_object *o);                // a copy recorded now reads or writes o
 d3d_device  *d3d_device_from(void *unknown);                             // an ID3D11Device / IDXGIDevice pointer
 d3d_object  *dxgi_adapter_create(void);                                  // dxgi.m
 #endif

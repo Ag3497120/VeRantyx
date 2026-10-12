@@ -681,7 +681,30 @@ static int try_acquire(vx_object *o, DWORD tid) {
     if (ok) shared_changed(o->sh);
     return ok;
 }
+static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms);
+// VXRT_TRACE_KEYED: waits longer than 0.3 ms by a thread holding a shared texture's keyed mutex (other processes
+// wait for that mutex meanwhile), with what was waited for and from where.
+__thread int vx_keyed_held;
 static WINAPI DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
+    if (!vx_keyed_held) return wait_objects(n, hs, all, ms);
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    DWORD r = wait_objects(n, hs, all, ms);
+    uint64_t d = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    if (d > 300000) {
+        pthread_mutex_lock(&g_lock);
+        vx_object *o = n ? lookup(hs[0]) : NULL;
+        int type = o ? o->type : 0;
+        char name[96];
+        snprintf(name, sizeof name, "%s", o && o->name ? o->name : "");
+        pthread_mutex_unlock(&g_lock);
+        void *ret = __builtin_return_address(0);
+        const vx_image *m = vx_image_at((uint64_t)(uintptr_t)ret);
+        vx_log("holding a keyed mutex, waited %.2f ms for %u object(s), first of type %d '%s' (timeout %d), result %u, from %s+%#llx",
+               d / 1e6, (unsigned)n, type, name, (int)ms, (unsigned)r, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)ret - m->base) : 0ull);
+    }
+    return r;
+}
+static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
     if (!n || n > 64) { vx_set_last_error(87); return WAIT_FAILED; }
     DWORD tid = vx_current_tid();
     struct timespec deadline;

@@ -273,6 +273,32 @@ static void interactive(void) {
     }
 }
 
+// GenerateMips: a 4x4 texture whose top mip is half black, half white (red channel) averages to grey at 1x1.
+static void test_generate_mips(void) {
+    D3D11_TEXTURE2D_DESC d = { 4, 4, 3, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT,
+                               D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_GENERATE_MIPS };
+    ID3D11Texture2D *t = NULL; ID3D11ShaderResourceView *srv = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &d, NULL, &t)));
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)t, NULL, &srv)));
+    UINT top[16];
+    for (int i = 0; i < 16; i++) top[i] = i % 4 < 2 ? 0xff000000u : 0xff0000ffu;
+    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)t, 0, NULL, top, 16, 0);
+    ID3D11DeviceContext_GenerateMips(ctx, srv);
+    D3D11_TEXTURE2D_DESC sd = { 1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0 };
+    ID3D11Texture2D *s = NULL;
+    ID3D11Device_CreateTexture2D(dev, &sd, NULL, &s);
+    ID3D11DeviceContext_CopySubresourceRegion(ctx, (ID3D11Resource *)s, 0, 0, 0, 0, (ID3D11Resource *)t, 2, NULL);
+    D3D11_MAPPED_SUBRESOURCE m;
+    UINT px = 0, polls = 0;
+    HRESULT hr;                                             // polled as games read back without stalling
+    while ((hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)s, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m)) == DXGI_ERROR_WAS_STILL_DRAWING && polls < 100000) { polls++; Sleep(0); }
+    CHECK(hr == S_OK);
+    if (SUCCEEDED(hr)) { px = *(UINT *)m.pData; ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)s, 0); }
+    CHECK(R(px) >= 120 && R(px) <= 135);
+    printf("  generated mips: 1x1 level %08x (read back without waiting after %u polls)\n", px, polls);
+    ID3D11Texture2D_Release(s); ID3D11ShaderResourceView_Release(srv); ID3D11Texture2D_Release(t);
+}
+
 int main(int argc, char **argv) {
     D3D_FEATURE_LEVEL level;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) { printf("draw: no device -> FAILED\n"); return 1; }
@@ -282,6 +308,7 @@ int main(int argc, char **argv) {
     test_textured();
     test_math();
     test_depth_and_blend();
-    printf("draw: triangle, textured quad, shader math, depth, blending, per-draw constants: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    test_generate_mips();
+    printf("draw: triangle, textured quad, shader math, depth, blending, per-draw constants, mips: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }

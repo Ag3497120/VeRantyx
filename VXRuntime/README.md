@@ -6,6 +6,7 @@ each milestone is a small Windows program that has to run unchanged.
 
 ```bash
 make check          # builds build/vxrt and the test programs, runs them
+make bench          # CPU cost of a Direct3D 11 draw (tests/drawbench.c), in microseconds
 build/vxrt program.exe [args...]
 VXRT_TRACE=1 build/vxrt program.exe     # also lists imports that are not implemented yet
 VXRT_DUMP_SHADERS=dir build/vxrt game.exe   # writes every translated shader (Metal source) to dir
@@ -21,6 +22,9 @@ VXRT_TRACE_CALLS=200 ...                   # every call into the runtime (argume
 VXRT_PRESENT_SNAPSHOT=f.png VXRT_PRESENT_SNAPSHOT_AT=300 ...   # the 300th present's back buffer as a PNG
 VXRT_TRACE_KEYED=1 VXRT_SHARED_SNAPSHOT=f.png ...              # keyed mutex traffic; shared textures as PNGs at a ReleaseSync
 VXRT_TRACE_DRAWS=trigger VXRT_DRAW_SNAPSHOT=<ps hash>:prefix ... # 300 draws after the trigger file appears; a pixel shader's inputs as PNGs
+VXRT_STATS=1 ...                           # keyed mutex waits and hold times, Map waits, GPU busy time, every few seconds
+VXRT_LOG_TIME=1 ...                        # log lines carry the time of day (the same clock in every process)
+VXRT_TRACE_KEYED=1 VXRT_TRACE_MAPS=1 ...   # every AcquireSync/ReleaseSync (and waits made while holding one); staging Maps
 ```
 
 SteamVR without Wine: `scripts/launch_vxrt_steamvr.sh` (repository root) runs vrserver, vrcompositor and the VeRantyx
@@ -71,6 +75,7 @@ Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the 
 | 9c. Fibers (stack switching in `context.S`), non-blocking (PIPE_NOWAIT) pipes as SteamVR polls them, a race-free registry of name holders, overlapped socket receives, ConnectEx/DisconnectEx, the system's control window classes, the native registry calls (NtOpenKeyEx and kin), token information, known folders, hidden `=C:` environment variables, certificate stores (empty), and a call tracer (`VXRT_TRACE_CALLS`) | `tests/threads.c` (fibers), `tests/pipes.c` (PIPE_NOWAIT), `tests/ipc.c`; SteamVR runs a minute without its watchdogs firing; the Windows Steam client starts its bootstrapper, steamui and vgui; Chromium (steamwebhelper) is far off (DirectWrite, sandbox, Mojo), but `tools/steam_fake_webhelper.c` answers Steam's shared-memory connection in its place — Steam then sits idle in its message loop without loading steamclient64 yet | Partly (2026-10-12) |
 | 9d. Source 2 without Steam: the low 2 GB for LuaJIT (a 64 KB `__PAGEZERO`, NtAllocateVirtualMemory's ZeroBits), AcceptEx, WSAEventSelect, socket buffers as macOS allows, API sets for advapi32/user32, event queries that do not wait for work never submitted, avifil32/usp10/mixer stand-ins, and `VXRT_PRESENT_SNAPSHOT` (a present's back buffer to PNG) | SteamVR Home (`steamtours.exe -novr -dx11`, Source 2, from SteamVR's tools) loads its map, runs its Lua scripts and its in-process Steam game server, and renders the room correctly through the DXBC→MSL translator | Works (2026-10-12) |
 | 9e. SteamVR Home in VR on SteamVR on vxrt: viewport and scissor arrays, SV_ViewportArrayIndex / SV_RenderTargetArrayIndex / SV_ClipDistance from vertex shaders, desktop and window-station names, draw tracing (`VXRT_TRACE_DRAWS`, `VXRT_DRAW_SNAPSHOT`) | `steamtours.exe -vr -retail -dx11` next to `scripts/launch_vxrt_steamvr.sh` (with a valid head pose): both eyes go through vrcompositor to the VeRantyx driver. SteamVR needs `allowDisplayLockedMode` (the launch script sets it in its copy of the settings): without Windows' DisplayManager it otherwise believes the display is locked and shows plain green | Works (2026-10-12) |
+| 9f. Apple silicon tuning (any M1-M6: nothing is tied to one chip; core counts, P/E cores and GPU family are read from the system): wake-ups aimed at the threads waiting on an object, thread priorities as QoS classes (P or E cores), ReleaseSync that does not wait for the GPU, small renamed buffers (constant buffers, dynamic vertex data) as slices of 4 MB chunks, pipeline states in a hash table with the last one remembered, draws that only send Metal the state that changed, Map of staging resources that waits only for the copies into them (and `DO_NOT_WAIT` → `DXGI_ERROR_WAS_STILL_DRAWING`) while still flushing recorded work as drivers do, GenerateMips | `make bench`: 17.4 µs per draw before, 1.7 µs after (M1 Max, under Rosetta); SteamVR Home in VR: 12-27 frames a second through the compositor before, 58.8 on average over 6 minutes after (the virtual display runs at 60 Hz); the room is ready about 15 s after start | Works (2026-10-13) |
 | 8. Geometry and tessellation shaders (Metal has neither: emulation with compute), audio capture, FH4 C++ exceptions (needs MSVC-built test programs), Direct3D 11 at game scale | — | Next |
 | 9. Direct3D 12 (Metal Shader Converter), OpenGL | — | |
 | 10. Cryptography, processes, Chromium-class programs (the Steam client) | — | |

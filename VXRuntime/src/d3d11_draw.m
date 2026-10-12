@@ -80,9 +80,19 @@ static void dump(const dxbc_shader *s, const void *code, size_t size) {
     FILE *f = fopen(path, "w");
     if (f) { fputs(s->msl, f); fclose(f); }
 }
+// With VXRT_TRACE, every 500 shaders: how long translating and compiling them took (on the threads that made them).
+static void shader_stats(uint64_t translate_ns, uint64_t compile_ns) {
+    static uint64_t n, t, k;
+    uint64_t count = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&t, translate_ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&k, compile_ns, __ATOMIC_RELAXED);
+    if (count % 500 == 0) vx_log("Direct3D: %llu shaders: %llu ms translating, %llu ms compiling", (unsigned long long)count,
+                                 (unsigned long long)(t / 1000000), (unsigned long long)(k / 1000000));
+}
 static HRESULT create_shader(d3d_device *dev, const void *code, size_t size, int want, void **vtbl, void **out) {
     d3d_shader *s = d3d_alloc(sizeof *s, K_SHADER, vtbl, dev);
     s->base.destroy = shader_destroy;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (dxbc_translate(code, size, &s->info) || s->info.type != want) {
         vx_log("Direct3D: shader not translated: %s", s->info.error[0] ? s->info.error : "wrong shader type");
         d3d_release(&s->base);
@@ -93,8 +103,10 @@ static HRESULT create_shader(d3d_device *dev, const void *code, size_t size, int
     CC_SHA256(code, (CC_LONG)size, digest);
     s->hash = (uint32_t)digest[0] << 24 | (uint32_t)digest[1] << 16 | (uint32_t)digest[2] << 8 | digest[3];
     NSError *err = nil;
+    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     id<MTLLibrary> lib = [(__bridge id<MTLDevice>)dev->mtl newLibraryWithSource:@(s->info.msl) options:nil error:&err];
     id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+    if (vx_trace) shader_stats(t1 - t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t1);
     if (!fn) {
         vx_log("Direct3D: translated shader did not compile: %s", err.localizedDescription.UTF8String);
         if (vx_trace) vx_log("%s", s->info.msl);
@@ -316,6 +328,15 @@ typedef struct d3d_draw_state {
     d3d_raster *raster;
     RECT scissor[16];
     uint32_t nscissors;
+    struct pso_key { uint32_t vs, ps, layout, blend, color[8], depth, stride[16]; } last_key;   // the last pipeline state used
+    void *last_pso;
+    // What is set on the open render encoder (cleared when one is made), so a draw sends Metal only what
+    // changed: every Metal call costs under Rosetta, and games rebind much the same state draw after draw.
+    struct {
+        void *pso, *dss; uint32_t stencil_ref; float blend[4]; uint32_t raster[7];
+        uint32_t nvp; MTLViewport vp[16]; MTLScissorRect sc[16];
+        void *buf[2][64]; NSUInteger off[2][64]; void *tex[2][80]; void *smp[2][16];
+    } bound;
 } d3d_draw_state;
 
 static d3d_draw_state *state_of(d3d_context *c) {
@@ -439,19 +460,57 @@ static MTLBlendOperation blend_op(uint32_t op) {
     }
 }
 
+// Pipeline states are cached by everything that goes into them, in a hash table keyed by plain numbers (a
+// string key cost more per draw than the draw itself); the context also remembers the last one, which most
+// draws reuse. Shader, layout and blend ids are never reused, so entries never go stale.
+typedef struct pso_key pso_key;
+typedef struct { pso_key key; void *pso; } pso_entry;
+static pso_entry *g_psos;
+static size_t g_pso_cap, g_pso_count;
+static pthread_mutex_t g_pso_lock = PTHREAD_MUTEX_INITIALIZER;
+static size_t pso_hash(const pso_key *k) {
+    const uint32_t *w = (const uint32_t *)k;
+    uint64_t h = 0x9e3779b97f4a7c15ull;
+    for (size_t i = 0; i < sizeof *k / 4; i++) h = (h ^ w[i]) * 0xff51afd7ed558ccdull;
+    return (size_t)(h ^ h >> 32);
+}
+static void *pso_find(const pso_key *k) {           // with g_pso_lock held
+    if (!g_pso_cap) return NULL;
+    for (size_t i = pso_hash(k) & (g_pso_cap - 1); g_psos[i].pso; i = (i + 1) & (g_pso_cap - 1))
+        if (!memcmp(&g_psos[i].key, k, sizeof *k)) return g_psos[i].pso;
+    return NULL;
+}
+static void pso_add(const pso_key *k, void *pso) {  // with g_pso_lock held; pso retained
+    if (2 * (g_pso_count + 1) > g_pso_cap) {
+        size_t cap = g_pso_cap ? 2 * g_pso_cap : 256;
+        pso_entry *old = g_psos, *grown = calloc(cap, sizeof *grown);
+        for (size_t j = 0; j < g_pso_cap; j++) if (old[j].pso) {
+            size_t i = pso_hash(&old[j].key) & (cap - 1);
+            while (grown[i].pso) i = (i + 1) & (cap - 1);
+            grown[i] = old[j];
+        }
+        g_psos = grown; g_pso_cap = cap;
+        free(old);
+    }
+    size_t i = pso_hash(k) & (g_pso_cap - 1);
+    while (g_psos[i].pso) i = (i + 1) & (g_pso_cap - 1);
+    g_psos[i] = (pso_entry){ *k, pso };
+    g_pso_count++;
+}
 static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id<MTLTexture> const *colors, int ncolors, id<MTLTexture> depth) {
-    static NSMutableDictionary *cache;
-    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     d3d_shader *vs = s->shader[STAGE_VS], *ps = s->shader[STAGE_PS];
-    NSMutableString *key = [NSMutableString stringWithFormat:@"%u/%u/%u/%u/", vs->id, ps ? ps->id : 0, s->layout ? s->layout->id : 0, s->blend ? s->blend->id : 0];
-    for (int i = 0; i < ncolors; i++) [key appendFormat:@"c%lu,%lu/", (unsigned long)(colors[i] ? colors[i].pixelFormat : 0), (unsigned long)(colors[i] ? colors[i].sampleCount : 0)];
-    [key appendFormat:@"d%lu/", (unsigned long)(depth ? depth.pixelFormat : 0)];
-    if (s->layout) for (uint32_t i = 0; i < s->layout->n; i++) [key appendFormat:@"%u,", s->stride[s->layout->attr[i].slot]];
-    pthread_mutex_lock(&lock);
-    if (!cache) cache = [NSMutableDictionary new];
-    id<MTLRenderPipelineState> ps_state = cache[key];
-    pthread_mutex_unlock(&lock);
-    if (ps_state) return ps_state;
+    pso_key key;
+    memset(&key, 0, sizeof key);
+    key.vs = vs->id; key.ps = ps ? ps->id : 0; key.layout = s->layout ? s->layout->id : 0; key.blend = s->blend ? s->blend->id : 0;
+    for (int i = 0; i < ncolors; i++) if (colors[i]) key.color[i] = (uint32_t)colors[i].pixelFormat | (uint32_t)colors[i].sampleCount << 16;
+    if (depth) key.depth = (uint32_t)depth.pixelFormat | (uint32_t)depth.sampleCount << 16;
+    if (s->layout) for (uint32_t i = 0; i < s->layout->n; i++) key.stride[s->layout->attr[i].slot & 15] = s->stride[s->layout->attr[i].slot & 15] | 0x80000000u;
+    if (s->last_pso && !memcmp(&key, &s->last_key, sizeof key)) return (__bridge id<MTLRenderPipelineState>)s->last_pso;
+    pthread_mutex_lock(&g_pso_lock);
+    void *found = pso_find(&key);
+    pthread_mutex_unlock(&g_pso_lock);
+    if (found) { s->last_key = key; s->last_pso = found; return (__bridge id<MTLRenderPipelineState>)found; }
+    id<MTLRenderPipelineState> ps_state;
 
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     pd.vertexFunction = (__bridge id<MTLFunction>)vs->function;
@@ -495,12 +554,20 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
         if (!ncolors) pd.rasterSampleCount = depth.sampleCount;
     }
     NSError *err = nil;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     ps_state = [(__bridge id<MTLDevice>)c->base.dev->mtl newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (vx_trace) {                                    // VXRT_TRACE: every 200 pipeline states, the time spent making them
+        static uint64_t n, ns;
+        __atomic_add_fetch(&ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, __ATOMIC_RELAXED);
+        if (__atomic_add_fetch(&n, 1, __ATOMIC_RELAXED) % 200 == 0) vx_log("Direct3D: %llu pipeline states: %llu ms", (unsigned long long)n, (unsigned long long)(ns / 1000000));
+    }
     if (!ps_state) { vx_log("Direct3D: pipeline state failed: %s", err.localizedDescription.UTF8String); return nil; }
-    pthread_mutex_lock(&lock);
-    cache[key] = ps_state;
-    pthread_mutex_unlock(&lock);
-    return ps_state;
+    pthread_mutex_lock(&g_pso_lock);
+    void *kept = pso_find(&key);                       // another thread may have made the same one meanwhile
+    if (!kept) pso_add(&key, kept = (void *)CFBridgingRetain(ps_state));
+    pthread_mutex_unlock(&g_pso_lock);
+    s->last_key = key; s->last_pso = kept;
+    return (__bridge id<MTLRenderPipelineState>)kept;
 }
 
 // ---- drawing ----------------------------------------------------------------------------------------------------------------------
@@ -563,7 +630,8 @@ static id<MTLTexture> shader_texture(d3d_view *v) {
     if (type == MTLTextureType2D || type == MTLTextureType1D || type == MTLTextureType2DMultisample || type == MTLTextureType3D) scount = 1;
     if (type == MTLTextureTypeCube) scount = 6;
     if (v->base.kind == K_UAV && v->dim == 0) { sfirst = 0; scount = total; }
-    if (fmt == base.pixelFormat && type == base.textureType && first == 0 && count == levels && sfirst == 0 && scount == total) return base;
+    if (fmt == base.pixelFormat && type == base.textureType && first == 0 && count == levels && sfirst == 0 && scount == total)
+        return cache_view(v, base, tex->mtl);                   // the texture itself (remembered: this runs every draw)
     id<MTLTexture> view = [base newTextureViewWithPixelFormat:fmt textureType:type levels:NSMakeRange(first, count) slices:NSMakeRange(sfirst, scount)];
     if (!view) return base;
     return cache_view(v, view, tex->mtl);
@@ -601,6 +669,7 @@ static id<MTLRenderCommandEncoder> render_pass(d3d_context *c) {
     if (!any) return nil;
     id<MTLRenderCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) renderCommandEncoderWithDescriptor:rp];
     c->render = (void *)CFBridgingRetain(enc);
+    memset(&state_of(c)->bound, 0, sizeof state_of(c)->bound);
     for (int i = 0; i < 8; i++) { c->render_rtv[i] = c->rtv[i]; if (c->rtv[i]) d3d_addref(&c->rtv[i]->base); }
     c->render_dsv = c->dsv;
     if (c->dsv) d3d_addref(&c->dsv->base);
@@ -631,21 +700,40 @@ static id<MTLSamplerState> default_sampler(d3d_context *c) {
 static id<MTLTexture> view_texture(d3d_view *v);
 static id<MTLTexture> shader_texture(d3d_view *v);
 static id<MTLSamplerState> default_sampler(d3d_context *c);
+typedef __typeof__(((d3d_draw_state *)0)->bound) bound_state;
+static void bind_buffer(id<MTLRenderCommandEncoder> enc, bound_state *b, int st, id<MTLBuffer> buf, NSUInteger off, unsigned idx) {
+    void *p = (__bridge void *)buf;
+    if (idx < 64 && b->buf[st][idx] == p) {
+        if (!p || b->off[st][idx] == off) return;
+        if (st == STAGE_VS) [enc setVertexBufferOffset:off atIndex:idx]; else [enc setFragmentBufferOffset:off atIndex:idx];
+    } else if (st == STAGE_VS) [enc setVertexBuffer:buf offset:off atIndex:idx];
+    else [enc setFragmentBuffer:buf offset:off atIndex:idx];
+    if (idx < 64) { b->buf[st][idx] = p; b->off[st][idx] = off; }
+}
+static void bind_texture(id<MTLRenderCommandEncoder> enc, bound_state *b, int st, id<MTLTexture> t, unsigned idx) {
+    void *p = (__bridge void *)t;
+    if (idx < 80 && b->tex[st][idx] == p) return;
+    if (st == STAGE_VS) [enc setVertexTexture:t atIndex:idx]; else [enc setFragmentTexture:t atIndex:idx];
+    if (idx < 80) b->tex[st][idx] = p;
+}
+static void bind_sampler(id<MTLRenderCommandEncoder> enc, bound_state *b, int st, id<MTLSamplerState> sm, unsigned idx) {
+    void *p = (__bridge void *)sm;
+    if (idx < 16 && b->smp[st][idx] == p) return;
+    if (st == STAGE_VS) [enc setVertexSamplerState:sm atIndex:idx]; else [enc setFragmentSamplerState:sm atIndex:idx];
+    if (idx < 16) b->smp[st][idx] = p;
+}
 static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCommandEncoder> renc, id<MTLComputeCommandEncoder> cenc) {
     d3d_shader *sh = s->shader[st];
     if (!sh) return;
-#define SET_BUFFER(b, off, idx) do { if (cenc) [cenc setBuffer:b offset:off atIndex:idx]; \
-    else if (st == STAGE_VS) [renc setVertexBuffer:b offset:off atIndex:idx]; else [renc setFragmentBuffer:b offset:off atIndex:idx]; } while (0)
-#define SET_TEXTURE(t, idx) do { if (cenc) [cenc setTexture:t atIndex:idx]; \
-    else if (st == STAGE_VS) [renc setVertexTexture:t atIndex:idx]; else [renc setFragmentTexture:t atIndex:idx]; } while (0)
-#define SET_SAMPLER(sm, idx) do { if (cenc) [cenc setSamplerState:sm atIndex:idx]; \
-    else if (st == STAGE_VS) [renc setVertexSamplerState:sm atIndex:idx]; else [renc setFragmentSamplerState:sm atIndex:idx]; } while (0)
+#define SET_BUFFER(b, off, idx) do { if (cenc) [cenc setBuffer:b offset:off atIndex:idx]; else bind_buffer(renc, &s->bound, st, b, off, idx); } while (0)
+#define SET_TEXTURE(t, idx) do { if (cenc) [cenc setTexture:t atIndex:idx]; else bind_texture(renc, &s->bound, st, t, idx); } while (0)
+#define SET_SAMPLER(sm, idx) do { if (cenc) [cenc setSamplerState:sm atIndex:idx]; else bind_sampler(renc, &s->bound, st, sm, idx); } while (0)
     dxbc_aux aux = { { 0 }, { 0 } };                             // buffer sizes (for bufinfo), UAV counters
     uint32_t *sizes = aux.sizes;
     for (int i = 0; i < 14; i++) {
         if (!(sh->info.cbuffers & (1u << i))) continue;
-        id<MTLBuffer> b = s->cb[st][i] ? (__bridge id<MTLBuffer>)s->cb[st][i]->mtl : nil;
-        SET_BUFFER(b, 0, i);
+        d3d_buffer *cb = s->cb[st][i];
+        SET_BUFFER(cb ? (__bridge id<MTLBuffer>)cb->mtl : nil, cb ? cb->off + s->cb_offset[st][i] : 0, i);
     }
     for (int i = 0; i < 32; i++) {
         if (!(sh->info.textures[0] & (1ull << i))) continue;
@@ -686,6 +774,7 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
         if (cenc) [cenc setBytes:&aux length:sizeof aux atIndex:DXBC_SIZES_BUFFER];
         else if (st == STAGE_VS) [renc setVertexBytes:&aux length:sizeof aux atIndex:DXBC_SIZES_BUFFER];
         else [renc setFragmentBytes:&aux length:sizeof aux atIndex:DXBC_SIZES_BUFFER];
+        if (!cenc) s->bound.buf[st][DXBC_SIZES_BUFFER] = (void *)-1;   // no longer a buffer of ours
     }
 #undef SET_BUFFER
 #undef SET_TEXTURE
@@ -723,8 +812,8 @@ static void trace_draw(d3d_context *c, d3d_draw_state *s) {
         for (int b = 0; b < 4; b++) if (s->cb[STAGE_PS][b]) {
             id<MTLBuffer> mb = (__bridge id<MTLBuffer>)s->cb[STAGE_PS][b]->mtl;
             if (mb.storageMode != MTLStorageModeShared) continue;
-            const float *f = (const float *)((const uint8_t *)mb.contents + s->cb_offset[STAGE_PS][b]);
-            for (NSUInteger r = 0; r < MIN(mb.length / 16, 16u); r++)
+            const float *f = (const float *)((const uint8_t *)mb.contents + s->cb[STAGE_PS][b]->off + s->cb_offset[STAGE_PS][b]);
+            for (NSUInteger r = 0; r < MIN(s->cb[STAGE_PS][b]->desc[0] / 16, 16u); r++)
                 vx_log("ps cb%d[%lu] = %g %g %g %g", b, (unsigned long)r, f[4 * r], f[4 * r + 1], f[4 * r + 2], f[4 * r + 3]);
         }
         for (int i = 0; i < 16; i++) if (s->srv[STAGE_PS][i] && s->srv[STAGE_PS][i]->resource->kind == K_TEXTURE) {
@@ -754,17 +843,32 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
     if (!pso) return nil;
     id<MTLRenderCommandEncoder> enc = render_pass(c);
     if (!enc) return nil;
-    [enc setRenderPipelineState:pso];
-    [enc setDepthStencilState:s->depth ? (__bridge id<MTLDepthStencilState>)s->depth->mtl : default_depth_state(c)];
-    [enc setStencilReferenceValue:s->stencil_ref];
-    [enc setBlendColorRed:s->blend_factor[0] green:s->blend_factor[1] blue:s->blend_factor[2] alpha:s->blend_factor[3]];
+    bound_state *bs = &s->bound;
+    if (bs->pso != (__bridge void *)pso) { [enc setRenderPipelineState:pso]; bs->pso = (__bridge void *)pso; }
+    id<MTLDepthStencilState> dss = s->depth ? (__bridge id<MTLDepthStencilState>)s->depth->mtl : default_depth_state(c);
+    if (bs->dss != (__bridge void *)dss) { [enc setDepthStencilState:dss]; bs->dss = (__bridge void *)dss; }
+    if (bs->stencil_ref != s->stencil_ref) { [enc setStencilReferenceValue:s->stencil_ref]; bs->stencil_ref = s->stencil_ref; }
+    if (memcmp(bs->blend, s->blend_factor, sizeof bs->blend)) {
+        [enc setBlendColorRed:s->blend_factor[0] green:s->blend_factor[1] blue:s->blend_factor[2] alpha:s->blend_factor[3]];
+        memcpy(bs->blend, s->blend_factor, sizeof bs->blend);
+    }
     // Rasterizer: fill, cull, winding, depth bias and clipping (defaults: solid, back faces culled, clockwise front).
+    // A new encoder starts with fill, no culling, clockwise, no bias and clipping: raster[] 0 means "not set yet".
     const uint32_t *rd = s->raster ? s->raster->desc : NULL;
-    [enc setTriangleFillMode:rd && rd[0] == 2 ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
-    [enc setCullMode:!rd || rd[1] == 3 ? MTLCullModeBack : rd[1] == 2 ? MTLCullModeFront : MTLCullModeNone];
-    [enc setFrontFacingWinding:rd && rd[2] ? MTLWindingCounterClockwise : MTLWindingClockwise];
-    if (rd) [enc setDepthBias:(float)(int32_t)rd[3] / 16777216.0f slopeScale:*(const float *)&rd[5] clamp:*(const float *)&rd[4]];
-    [enc setDepthClipMode:!rd || rd[6] ? MTLDepthClipModeClip : MTLDepthClipModeClamp];
+    uint32_t r[7] = { rd && rd[0] == 2 ? 2 : 1, !rd || rd[1] == 3 ? 3 : rd[1] == 2 ? 2 : 1, rd && rd[2] ? 2 : 1,
+                      rd ? rd[3] : 0, rd ? rd[4] : 0, rd ? rd[5] : 0, !rd || rd[6] ? 2 : 1 };
+    if (memcmp(bs->raster, r, sizeof r)) {
+        if (bs->raster[0] != r[0]) [enc setTriangleFillMode:r[0] == 2 ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+        if (bs->raster[1] != r[1]) [enc setCullMode:r[1] == 3 ? MTLCullModeBack : r[1] == 2 ? MTLCullModeFront : MTLCullModeNone];
+        if (bs->raster[2] != r[2]) [enc setFrontFacingWinding:r[2] == 2 ? MTLWindingCounterClockwise : MTLWindingClockwise];
+        if (bs->raster[3] != r[3] || bs->raster[4] != r[4] || bs->raster[5] != r[5] || !bs->raster[0]) {
+            float clamp, slope;
+            memcpy(&clamp, &r[4], 4); memcpy(&slope, &r[5], 4);
+            [enc setDepthBias:(float)(int32_t)r[3] / 16777216.0f slopeScale:slope clamp:clamp];
+        }
+        if (bs->raster[6] != r[6]) [enc setDepthClipMode:r[6] == 2 ? MTLDepthClipModeClip : MTLDepthClipModeClamp];
+        memcpy(bs->raster, r, sizeof r);
+    }
     id<MTLTexture> target = colors[0] ? colors[0] : depth;
     NSUInteger tw = target ? target.width >> (c->rtv[0] ? c->rtv[0]->mip : 0) : 1, th = target ? target.height >> (c->rtv[0] ? c->rtv[0]->mip : 0) : 1;
     if (!tw) tw = 1;
@@ -785,10 +889,13 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
             scs[i] = (MTLScissorRect){ (NSUInteger)MIN(l, (LONG)tw), (NSUInteger)MIN(t, (LONG)th), (NSUInteger)MAX(r - l, 0), (NSUInteger)MAX(b - t, 0) };
         }
     }
-    if (nvp == 1) { [enc setViewport:vps[0]]; [enc setScissorRect:scs[0]]; }
-    else { [enc setViewports:vps count:nvp]; [enc setScissorRects:scs count:nvp]; }
+    if (bs->nvp != nvp || memcmp(bs->vp, vps, nvp * sizeof *vps) || memcmp(bs->sc, scs, nvp * sizeof *scs)) {
+        if (nvp == 1) { [enc setViewport:vps[0]]; [enc setScissorRect:scs[0]]; }
+        else { [enc setViewports:vps count:nvp]; [enc setScissorRects:scs count:nvp]; }
+        bs->nvp = nvp; memcpy(bs->vp, vps, nvp * sizeof *vps); memcpy(bs->sc, scs, nvp * sizeof *scs);
+    }
     for (int i = 0; i < 16; i++)
-        if (s->vb[i]) [enc setVertexBuffer:(__bridge id<MTLBuffer>)s->vb[i]->mtl offset:s->offset[i] atIndex:VB_BASE + i];
+        if (s->vb[i]) bind_buffer(enc, bs, STAGE_VS, (__bridge id<MTLBuffer>)s->vb[i]->mtl, s->vb[i]->off + s->offset[i], VB_BASE + i);
     bind_stage(c, s, STAGE_VS, enc, nil);
     bind_stage(c, s, STAGE_PS, enc, nil);
     return enc;
@@ -812,7 +919,7 @@ static void draw_indexed(d3d_context *c, uint32_t count, uint32_t instances, uin
     if (!enc) return;
     int wide = s->ib_format == 42;                             // R32_UINT, else R16_UINT
     [enc drawIndexedPrimitives:type indexCount:count indexType:wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
-                   indexBuffer:(__bridge id<MTLBuffer>)s->ib->mtl indexBufferOffset:s->ib_offset + start * (wide ? 4 : 2)
+                   indexBuffer:(__bridge id<MTLBuffer>)s->ib->mtl indexBufferOffset:s->ib->off + s->ib_offset + start * (wide ? 4 : 2)
                  instanceCount:instances baseVertex:base_vertex baseInstance:start_instance];
 }
 static WINAPI void ctx_draw_indexed(void *this, uint32_t count, uint32_t start, int32_t base_vertex) { draw_indexed(this, count, 1, start, base_vertex, 0); }
@@ -866,8 +973,9 @@ static WINAPI void ctx_copy_structure_count(void *this, d3d_buffer *dst, uint32_
     if (!dst || !v) return;
     d3d_end_render(c);
     id<MTLBlitCommandEncoder> blit = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) blitCommandEncoder];
-    [blit copyFromBuffer:counter_of(v) sourceOffset:0 toBuffer:(__bridge id<MTLBuffer>)dst->mtl destinationOffset:offset size:4];
+    [blit copyFromBuffer:counter_of(v) sourceOffset:0 toBuffer:(__bridge id<MTLBuffer>)dst->mtl destinationOffset:dst->off + offset size:4];
     [blit endEncoding];
+    d3d_mark_gpu(c, &dst->base);
 }
 static WINAPI void ctx_clear_uav_uint(void *this, d3d_view *v, const uint32_t *values) { clear_uav(this, v, values[0]); }
 static WINAPI void ctx_clear_uav_float(void *this, d3d_view *v, const float *values) { uint32_t bits; memcpy(&bits, &values[0], 4); clear_uav(this, v, bits); }
@@ -941,6 +1049,7 @@ static WINAPI void ctx_resolve(void *this, d3d_object *dst, uint32_t dst_sub, d3
         id<MTLBlitCommandEncoder> blit = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) blitCommandEncoder];
         [blit copyFromTexture:st toTexture:dt];
         [blit endEncoding];
+        d3d_mark_gpu(c, dst);
         d3d_shared_written(c->base.dev, ds);
         return;
     }
@@ -954,6 +1063,7 @@ static WINAPI void ctx_resolve(void *this, d3d_object *dst, uint32_t dst_sub, d3
     d3d_end_render(c);
     id<MTLRenderCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) renderCommandEncoderWithDescriptor:rp];
     [enc endEncoding];
+    d3d_mark_gpu(c, dst);
     d3d_shared_written(c->base.dev, ds);
 }
 
@@ -1045,7 +1155,19 @@ const d3d_method d3d_draw_device_methods[] = {
     { "CreatePredicate", (void *)device_create_predicate }, { "CreateCounter", (void *)device_create_counter },
     { "CheckCounterInfo", (void *)device_check_counter_info }, { NULL, NULL },
 };
+// GenerateMips: the view's first mip filtered down into the rest of its mips (a blit; Metal picks the filter).
+static WINAPI void ctx_generate_mips(void *this, d3d_view *v) {
+    d3d_context *c = this;
+    if (!v || v->resource->kind != K_TEXTURE) return;
+    id<MTLTexture> t = shader_texture(v);
+    if (!t || t.mipmapLevelCount < 2) return;
+    d3d_end_render(c);
+    id<MTLBlitCommandEncoder> blit = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) blitCommandEncoder];
+    [blit generateMipmapsForTexture:t];
+    [blit endEncoding];
+}
 const d3d_method d3d_draw_context_methods[] = {
+    { "GenerateMips", (void *)ctx_generate_mips },
     { "IASetInputLayout", (void *)ia_set_layout }, { "IASetVertexBuffers", (void *)ia_set_vertex_buffers },
     { "IASetIndexBuffer", (void *)ia_set_index_buffer }, { "IASetPrimitiveTopology", (void *)ia_set_topology },
     { "VSSetShader", (void *)vs_set_shader }, { "PSSetShader", (void *)ps_set_shader },

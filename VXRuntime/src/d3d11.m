@@ -4,6 +4,7 @@
 // buffer that is committed on Flush, Map and Present, so the GPU sees them in the order the program issued them.
 // Draws need shader translation (DXBC to Metal) and are the next step; until then they are reported once.
 #include "d3d_common.h"
+#include <os/os_sync_wait_on_address.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -316,8 +317,10 @@ static WINAPI HRESULT buffer_qi(void *this, const GUID *iid, void **out) {
 }
 static WINAPI void buffer_get_type(void *this, uint32_t *dim) { (void)this; *dim = 1; }   // D3D11_RESOURCE_DIMENSION_BUFFER
 static WINAPI void buffer_get_desc(void *this, uint32_t *desc) { memcpy(desc, ((d3d_buffer *)this)->desc, sizeof(uint32_t) * 6); }
+static void drop_slice(d3d_device *dev, d3d_buffer *b);
 static void buffer_destroy(d3d_object *o) {
     d3d_buffer *b = (d3d_buffer *)o;
+    drop_slice(o->dev, b);
     if (b->mtl) CFBridgingRelease(b->mtl);
     if (b->shm) munmap(b->shm, b->shm_size);
     if (b->shared) d3d_shared_release(b->shared - 1);
@@ -444,6 +447,57 @@ void d3d_vtable_override(void **vt, const char *const *names, int count, const d
     for (int i = 0; i < count; i++)
         for (const d3d_method *m = impl; m->name; m++) if (!strcmp(m->name, names[i])) { vt[i] = m->fn; break; }
 }
+// VXRT_STATS=1: every 2 seconds, how busy the GPU was with this process's command buffers.
+static void gpu_stats(double start, double end) {
+    static int on = -1;
+    static double busy, since, last_end;
+    if (on < 0) on = getenv("VXRT_STATS") != NULL;
+    if (!on || end <= start) return;
+    double from = start > last_end ? start : last_end;     // command buffers can overlap
+    if (end > from) busy += end - from;
+    if (end > last_end) last_end = end;
+    if (!since) since = start;
+    if (end - since >= 2.0) {
+        vx_log("GPU: busy %.0f%% of the last %.1f s with this process's work", 100 * busy / (end - since), end - since);
+        busy = 0; since = end;
+    }
+}
+void d3d_mark_gpu(d3d_context *c, d3d_object *o) { o->gpu_seq = __atomic_load_n(&c->base.dev->submitted, __ATOMIC_ACQUIRE) + 1; }
+// Waits until the GPU is done with what was recorded for a resource (Map of a staging resource): only up to the
+// command buffer that last copied to or from it, not everything. DO_NOT_WAIT: DXGI_ERROR_WAS_STILL_DRAWING instead.
+#define MAP_FLAG_DO_NOT_WAIT 0x100000
+#define DXGI_ERROR_WAS_STILL_DRAWING ((HRESULT)0x887A000A)
+#define RECENT 16                                  // the last command buffers committed, by sequence number
+static void *g_recent[RECENT];
+static uint64_t g_recent_seq[RECENT];
+static d3d_device *g_recent_dev[RECENT];
+static pthread_mutex_t g_recent_lock = PTHREAD_MUTEX_INITIALIZER;
+static HRESULT wait_gpu(d3d_context *c, d3d_object *o, uint32_t flags) {
+    d3d_device *dev = c->base.dev;
+    uint64_t seq = o->gpu_seq;
+    static int trace = -1;
+    if (trace < 0) trace = getenv("VXRT_TRACE_MAPS") != NULL;
+    if (trace) vx_log("Map of a staging resource: copied by command buffer %llu; %llu submitted, %llu done, recording %d",
+                      (unsigned long long)seq, (unsigned long long)dev->submitted, (unsigned long long)dev->completed, ((d3d_context *)dev->context)->cmd != NULL);
+    // Work recorded so far goes to the GPU now, as drivers flush on Map: programs that read back frames late
+    // (copy to one staging resource, Map another copied earlier) otherwise find their copies never started.
+    if (((d3d_context *)dev->context)->cmd) d3d_flush(dev, 0);
+    if (!seq || __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE) >= seq) return S_OK;
+    // The command buffer itself says first when the GPU is done (completion handlers run a little later).
+    id<MTLCommandBuffer> cmd = nil;
+    pthread_mutex_lock(&g_recent_lock);
+    if (g_recent_seq[seq % RECENT] == seq && g_recent_dev[seq % RECENT] == dev && g_recent[seq % RECENT]) cmd = (__bridge id<MTLCommandBuffer>)g_recent[seq % RECENT];
+    pthread_mutex_unlock(&g_recent_lock);
+    if (flags & MAP_FLAG_DO_NOT_WAIT)
+        return __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE) >= seq || (cmd && cmd.status >= MTLCommandBufferStatusCompleted) ? S_OK : DXGI_ERROR_WAS_STILL_DRAWING;
+    if (cmd) { [cmd waitUntilCompleted]; return S_OK; }
+    for (uint64_t now; (now = __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE)) < seq; ) {
+        if (__builtin_available(macOS 14.4, *))
+            os_sync_wait_on_address_with_timeout((void *)&dev->completed, now, 8, OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME, 2000000);
+        else usleep(100);
+    }
+    return S_OK;
+}
 void d3d_flush(d3d_device *dev, int wait) {
     d3d_context *c = (d3d_context *)dev->context;
     d3d_end_render(c);
@@ -459,11 +513,17 @@ void d3d_flush(d3d_device *dev, int wait) {
     c->cmd = NULL;
     uint64_t seq = __atomic_add_fetch(&dev->submitted, 1, __ATOMIC_ACQ_REL);
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
-        (void)done;
+        gpu_stats(done.GPUStartTime, done.GPUEndTime);
         uint64_t prev = __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE);
         while (prev < seq && !__atomic_compare_exchange_n(&dev->completed, &prev, seq, 1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+        if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&dev->completed, 8, OS_SYNC_WAKE_BY_ADDRESS_NONE);
     }];
     [cmd commit];
+    pthread_mutex_lock(&g_recent_lock);
+    void *old = g_recent[seq % RECENT];
+    g_recent[seq % RECENT] = (void *)CFBridgingRetain(cmd); g_recent_seq[seq % RECENT] = seq; g_recent_dev[seq % RECENT] = dev;
+    pthread_mutex_unlock(&g_recent_lock);
+    if (old) CFRelease(old);
     if (wait) [cmd waitUntilCompleted];
 }
 
@@ -564,10 +624,12 @@ static WINAPI void ctx_copy_resource(void *this, d3d_object *dst, d3d_object *sr
         else if (vx_trace) vx_log("CopyResource between textures that differ: %lux%lu x%lu -> %lux%lu x%lu", (unsigned long)s.width, (unsigned long)s.height,
                                   (unsigned long)s.sampleCount, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.sampleCount);
     } else {
-        id<MTLBuffer> s = (__bridge id<MTLBuffer>)((d3d_buffer *)src)->mtl, d = (__bridge id<MTLBuffer>)((d3d_buffer *)dst)->mtl;
-        [blit copyFromBuffer:s sourceOffset:0 toBuffer:d destinationOffset:0 size:MIN(s.length, d.length)];
+        d3d_buffer *sb = (d3d_buffer *)src, *db = (d3d_buffer *)dst;
+        [blit copyFromBuffer:(__bridge id<MTLBuffer>)sb->mtl sourceOffset:sb->off toBuffer:(__bridge id<MTLBuffer>)db->mtl destinationOffset:db->off
+                        size:MIN(sb->desc[0], db->desc[0])];
     }
     [blit endEncoding];
+    d3d_mark_gpu(c, dst); d3d_mark_gpu(c, src);
     if (dst->kind == K_TEXTURE) d3d_shared_written(c->base.dev, (d3d_texture *)dst);
 }
 // D3D11_BOX: left, top, front, right, bottom, back.
@@ -593,11 +655,13 @@ static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint
                         toTexture:(__bridge id<MTLTexture>)ds->mtl destinationSlice:dslice destinationLevel:dmip
                 destinationOrigin:MTLOriginMake(x, ds->dim == 1 ? 0 : y, ds->dim == 3 ? z : 0)];
     } else {
-        id<MTLBuffer> s = (__bridge id<MTLBuffer>)((d3d_buffer *)src)->mtl, d = (__bridge id<MTLBuffer>)((d3d_buffer *)dst)->mtl;
-        uint32_t from = box ? box[0] : 0, size = box ? box[3] - box[0] : (uint32_t)s.length;
-        if (from + size <= s.length && x + size <= d.length) [blit copyFromBuffer:s sourceOffset:from toBuffer:d destinationOffset:x size:size];
+        d3d_buffer *sb = (d3d_buffer *)src, *db = (d3d_buffer *)dst;
+        uint32_t from = box ? box[0] : 0, size = box ? box[3] - box[0] : sb->desc[0];
+        if (from + size <= sb->desc[0] && x + size <= db->desc[0])
+            [blit copyFromBuffer:(__bridge id<MTLBuffer>)sb->mtl sourceOffset:sb->off + from toBuffer:(__bridge id<MTLBuffer>)db->mtl destinationOffset:db->off + x size:size];
     }
     [blit endEncoding];
+    d3d_mark_gpu(c, dst); d3d_mark_gpu(c, src);
     if (dst->kind == K_TEXTURE) d3d_shared_written(c->base.dev, (d3d_texture *)dst);
 }
 
@@ -619,7 +683,7 @@ static void upload_texture(d3d_context *c, d3d_texture *t, uint32_t sub, const u
         for (uint32_t r = 0; r < rows; r++)
             memcpy((uint8_t *)staging.contents + z * image + (size_t)r * pitch, (const uint8_t *)data + z * depth_pitch + (size_t)r * row_pitch, pitch);
     id<MTLCommandBuffer> own = nil;
-    if (c) d3d_end_render(c);
+    if (c) { d3d_end_render(c); d3d_mark_gpu(c, &t->base); }
     else own = [(__bridge id<MTLCommandQueue>)t->base.dev->queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [(c ? context_cmd(c) : own) blitCommandEncoder];
     [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:pitch sourceBytesPerImage:image sourceSize:sz
@@ -673,6 +737,73 @@ static void retire_buffer(d3d_device *dev, void *ref) {         // takes over th
     pthread_mutex_unlock(&g_pool_lock);
     if (drop) CFRelease(drop);
 }
+// Small buffers that are renamed (constant buffers, dynamic vertex and index data) get slices of 4 MB chunks
+// instead of a Metal buffer each: making a Metal buffer costs microseconds under Rosetta, a slice a few
+// instructions. A chunk is filled front to back; a full one is filled again once no buffer holds a slice of it
+// and the GPU has finished every command buffer that may read it (seq).
+#define SLICE_LIMIT 65536
+#define CHUNK_BYTES ((size_t)4 << 20)
+typedef struct slice_chunk { void *mtl; uint8_t *base; size_t used; int live; uint64_t seq; struct slice_chunk *next; } slice_chunk;
+typedef struct { slice_chunk *cur, *full; } slice_ring;
+static slice_chunk *take_slice(d3d_device *dev, size_t len, size_t *off) {
+    size_t need = (len + 255) & ~(size_t)255;
+    uint64_t done = __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE);
+    pthread_mutex_lock(&g_pool_lock);
+    slice_ring *r = dev->slices;
+    if (!r) r = dev->slices = calloc(1, sizeof *r);
+    slice_chunk *k = r->cur;
+    if (!k || k->used + need > CHUNK_BYTES) {
+        if (k) { k->next = r->full; r->full = k; }
+        k = NULL;
+        for (slice_chunk **pp = &r->full; *pp; pp = &(*pp)->next)
+            if (!(*pp)->live && (*pp)->seq <= done) { k = *pp; *pp = k->next; break; }
+        if (!k) {
+            id<MTLBuffer> m = [(__bridge id<MTLDevice>)dev->mtl newBufferWithLength:CHUNK_BYTES options:MTLResourceStorageModeShared];
+            k = calloc(1, sizeof *k);
+            k->mtl = (void *)CFBridgingRetain(m);
+            k->base = m.contents;
+        }
+        k->used = 0; k->next = NULL;
+        r->cur = k;
+    }
+    *off = k->used;
+    k->used += need;
+    k->live++;
+    pthread_mutex_unlock(&g_pool_lock);
+    return k;
+}
+static void drop_slice(d3d_device *dev, d3d_buffer *b) {    // the buffer stops using its slice
+    slice_chunk *k = b->chunk;
+    if (!k) return;
+    uint64_t last = __atomic_load_n(&dev->submitted, __ATOMIC_ACQUIRE) + 1;   // draws recorded so far may read it
+    pthread_mutex_lock(&g_pool_lock);
+    k->live--;
+    if (k->seq < last) k->seq = last;
+    pthread_mutex_unlock(&g_pool_lock);
+    b->chunk = NULL; b->off = 0;
+}
+// New storage for a buffer whose contents are replaced (Map(DISCARD), UpdateSubresource), so draws already
+// recorded keep reading the old contents; keep: copy them over (a partial update). Returns the new contents.
+// Buffers bound as shader resources get a Metal buffer of their own (views hold the old one).
+static uint8_t *rename_buffer(d3d_device *dev, d3d_buffer *b, int keep) {
+    size_t len = b->desc[0], off = 0;
+    id<MTLBuffer> old = (__bridge id<MTLBuffer>)b->mtl;
+    const uint8_t *before = (const uint8_t *)old.contents + b->off;
+    int view = (b->desc[2] & 8) != 0;                            // BIND_SHADER_RESOURCE
+    slice_chunk *k = NULL;
+    id<MTLBuffer> fresh;
+    if (!view && len <= SLICE_LIMIT) { k = take_slice(dev, len, &off); fresh = (__bridge id<MTLBuffer>)k->mtl; }
+    else if (!view) fresh = take_buffer(dev, old.length);
+    else fresh = [(__bridge id<MTLDevice>)dev->mtl newBufferWithLength:old.length options:MTLResourceStorageModeShared];
+    uint8_t *p = (uint8_t *)fresh.contents + off;
+    if (keep) memcpy(p, before, len);
+    if (b->chunk) { drop_slice(dev, b); CFRelease(b->mtl); }    // command buffers hold what they use
+    else if (!view && !k) retire_buffer(dev, b->mtl);
+    else CFRelease(b->mtl);
+    b->mtl = (void *)CFBridgingRetain(fresh);
+    b->off = off; b->chunk = k;
+    return p;
+}
 static WINAPI void ctx_update_subresource(void *this, d3d_object *dst, uint32_t sub, const uint32_t *box, const void *data, uint32_t row_pitch, uint32_t depth_pitch) {
     d3d_context *c = this;
     if (!dst || !data) return;
@@ -682,53 +813,61 @@ static WINAPI void ctx_update_subresource(void *this, d3d_object *dst, uint32_t 
     // instead, in order, since their CPU-side contents may be out of date.
     d3d_buffer *b = (d3d_buffer *)dst;
     id<MTLBuffer> old = (__bridge id<MTLBuffer>)b->mtl;
-    uint32_t from = box ? box[0] : 0, size = box ? box[3] - box[0] : (uint32_t)old.length;
-    if (from + size > old.length) return;
-    if (b->shared) { memcpy((uint8_t *)old.contents + from, data, size); return; }   // shared: in place
+    uint32_t from = box ? box[0] : 0, size = box ? box[3] - box[0] : b->desc[0];
+    if (from + size > b->desc[0]) return;
+    if (b->shared) { memcpy((uint8_t *)old.contents + b->off + from, data, size); return; }   // shared: in place
     if (b->desc[2] & BIND_UNORDERED_ACCESS) {
         id<MTLBuffer> staging = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
         d3d_end_render(c);
         id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
-        [blit copyFromBuffer:staging sourceOffset:0 toBuffer:old destinationOffset:from size:size];
+        [blit copyFromBuffer:staging sourceOffset:0 toBuffer:old destinationOffset:b->off + from size:size];
         [blit endEncoding];
         return;
     }
-    int pooled = !(b->desc[2] & 8 /* BIND_SHADER_RESOURCE: views may hold the old buffer */);
-    id<MTLBuffer> fresh = pooled ? take_buffer(c->base.dev, old.length)
-                                 : [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:old.length options:MTLResourceStorageModeShared];
-    if (from || size < old.length) memcpy(fresh.contents, old.contents, old.length);   // a partial update keeps the rest
-    memcpy((uint8_t *)fresh.contents + from, data, size);
-    if (pooled) retire_buffer(c->base.dev, b->mtl); else CFRelease(b->mtl);
-    b->mtl = (void *)CFBridgingRetain(fresh);
+    uint8_t *p = rename_buffer(c->base.dev, b, from || size < b->desc[0]);   // a partial update keeps the rest
+    memcpy(p + from, data, size);
 }
 
 // Map waits for the GPU to finish what was recorded so far, then hands out memory the CPU can use. Staging
 // textures are copied into a CPU buffer (and back on Unmap when written).
 typedef struct { void *data; uint32_t row_pitch, depth_pitch; } MAPPED;
 #define MAP_READ 1
+// VXRT_STATS=1: every 300 Maps that wait for the GPU, the time they waited, by map type and usage.
+static void map_stats(uint32_t type, uint32_t usage, uint64_t ns) {
+    static int on = -1;
+    static uint64_t n, total, by[6][4];
+    if (on < 0) on = getenv("VXRT_STATS") != NULL;
+    if (!on) return;
+    total += ns; by[type % 6][usage % 4]++;
+    if (++n % 300) return;
+    vx_log("Map: %llu waits for the GPU, %llu ms; read %llu/%llu/%llu/%llu write %llu/%llu/%llu/%llu read-write %llu/%llu/%llu/%llu (default/immutable/dynamic/staging)",
+           (unsigned long long)n, (unsigned long long)(total / 1000000), (unsigned long long)by[1][0], (unsigned long long)by[1][1], (unsigned long long)by[1][2], (unsigned long long)by[1][3],
+           (unsigned long long)by[2][0], (unsigned long long)by[2][1], (unsigned long long)by[2][2], (unsigned long long)by[2][3],
+           (unsigned long long)by[3][0], (unsigned long long)by[3][1], (unsigned long long)by[3][2], (unsigned long long)by[3][3]);
+}
 static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_t type, uint32_t flags, MAPPED *out) {
-    (void)flags;
     d3d_context *c = this;
     if (!res || !out) return E_INVALIDARG;
     if (res->kind == K_BUFFER) {
         d3d_buffer *buf = (d3d_buffer *)res;
         if (type == 4 && buf->shared) {                          // shared: written in place (other processes hold it)
-        } else if (type == 4) {                                 // WRITE_DISCARD: a fresh buffer, nothing to wait for
-            id<MTLBuffer> old = (__bridge id<MTLBuffer>)buf->mtl;
-            int pooled = !(buf->desc[2] & 8);                   // views may hold a buffer bound as a shader resource
-            id<MTLBuffer> fresh = pooled ? take_buffer(c->base.dev, old.length)
-                                         : [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:old.length options:MTLResourceStorageModeShared];
-            if (pooled) retire_buffer(c->base.dev, buf->mtl); else CFRelease(buf->mtl);
-            buf->mtl = (void *)CFBridgingRetain(fresh);
-        } else if (type != 5) {                                  // READ/WRITE: what the GPU did must be finished
-            d3d_flush(c->base.dev, 1);
+        } else if (type == 4) {                                 // WRITE_DISCARD: fresh storage, nothing to wait for
+            rename_buffer(c->base.dev, buf, 0);
+        } else if (type != 5) {                                  // READ/WRITE: the GPU must be done with it
+            uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            HRESULT hr = buf->desc[1] == 3 ? wait_gpu(c, res, flags) : (d3d_flush(c->base.dev, 1), S_OK);   // staging: copies only
+            map_stats(type, buf->desc[1], clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+            if (hr) return hr;
         }
         id<MTLBuffer> b = (__bridge id<MTLBuffer>)buf->mtl;
-        out->data = b.contents; out->row_pitch = out->depth_pitch = (uint32_t)b.length;
+        out->data = (uint8_t *)b.contents + buf->off; out->row_pitch = out->depth_pitch = buf->desc[0];
         return S_OK;
     }
-    d3d_flush(c->base.dev, 1);
     d3d_texture *t = (d3d_texture *)res;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    HRESULT hr = t->desc[TD_USAGE] == 3 ? wait_gpu(c, res, flags) : (d3d_flush(c->base.dev, 1), S_OK);   // staging: copies only
+    map_stats(type, t->desc[TD_USAGE] & 3, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+    if (hr) return hr;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)t->mtl;
     if (tex.storageMode != MTLStorageModeShared) { vx_log("Direct3D: Map of a texture without CPU access"); return E_INVALIDARG; }
     uint32_t mip, slice;

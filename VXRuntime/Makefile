@@ -73,6 +73,10 @@ build/d3d11.exe: tests/d3d11.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxgi -ldxguid -luuid
 
+build/drawbench.exe: tests/drawbench.c tests/shaders/*.h
+	@mkdir -p build
+	$(MINGW) -O2 -Itests -o $@ $<  -ld3d11 -ldxgi -ldxguid -luuid
+
 build/dxbcscan: tools/dxbcscan.m src/dxbc.c src/dxbc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ tools/dxbcscan.m src/dxbc.c -framework Metal -framework Foundation
@@ -173,7 +177,13 @@ check: all
 	build/vxrt build/ipc.exe second & build/vxrt build/ipc.exe first; wait
 	build/vxrt build/shared.exe make & build/vxrt build/shared.exe open; wait
 
+# CPU cost per Direct3D 11 draw (numbers only, not a test).
+bench: export VXRT_ROOT = build/root
+bench: export VXRT_NO_ACTIVATE = 1
+bench: build/vxrt build/drawbench.exe
+	build/vxrt build/drawbench.exe
+
 clean:
 	rm -rf build
 
-.PHONY: all tests check clean shaders
+.PHONY: all tests check bench clean shaders
