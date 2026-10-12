@@ -70,6 +70,32 @@ static void in_process(void) {
     CHECK(CreateFileA(NAME, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL) == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND);
 }
 
+// A non-blocking (PIPE_NOWAIT) server, polled the way SteamVR does: listening, then connected; reads with
+// nothing there say ERROR_NO_DATA.
+static void nowait(void) {
+    const char *name = "\\\\.\\pipe\\vxrt_test_nowait";
+    HANDLE server = CreateNamedPipeA(name, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT, 4, 4096, 4096, 0, NULL);
+    CHECK(server != INVALID_HANDLE_VALUE);
+    CHECK(!ConnectNamedPipe(server, NULL) && GetLastError() == ERROR_PIPE_LISTENING);
+    HANDLE c = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    CHECK(c != INVALID_HANDLE_VALUE);
+    DWORD err = 0;
+    for (int i = 0; i < 200; i++) { ConnectNamedPipe(server, NULL); err = GetLastError(); if (err != ERROR_PIPE_LISTENING) break; Sleep(5); }
+    CHECK(err == ERROR_PIPE_CONNECTED);
+    char buf[16]; DWORD n = 1;
+    CHECK(!ReadFile(server, buf, sizeof buf, &n, NULL) && GetLastError() == ERROR_NO_DATA && n == 0);
+    CHECK(WriteFile(c, "abc", 3, &n, NULL));
+    BOOL got = FALSE;
+    for (int i = 0; i < 200 && !got; i++) { got = ReadFile(server, buf, sizeof buf, &n, NULL); if (!got) Sleep(5); }
+    CHECK(got && n == 3 && !memcmp(buf, "abc", 3));
+    DWORD state = 0;
+    CHECK(GetNamedPipeHandleStateA(server, &state, NULL, NULL, NULL, NULL, 0) && (state & PIPE_NOWAIT));
+    CloseHandle(c);
+    for (int i = 0; i < 200; i++) { if (!ReadFile(server, buf, sizeof buf, &n, NULL) && GetLastError() == ERROR_BROKEN_PIPE) break; Sleep(5); }
+    CHECK(GetLastError() == ERROR_BROKEN_PIPE);
+    CloseHandle(server);
+}
+
 // Between processes: the server answers "ping" with "pong" once.
 #define XNAME "\\\\.\\pipe\\vxrt_test_cross"
 static int serve(void) {
@@ -98,6 +124,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "serve")) return serve();
     if (argc > 1 && !strcmp(argv[1], "ask")) return ask();
     in_process();
-    printf("pipes: overlapped connect and reads, messages, ERROR_MORE_DATA, peek, broken pipe: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    nowait();
+    printf("pipes: overlapped connect and reads, messages, ERROR_MORE_DATA, peek, broken pipe, PIPE_NOWAIT: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }

@@ -16,6 +16,7 @@ VXRT_MUTE=1 ...                            # sound output is silent
 VXRT_TRACE=1 VXRT_DEBUGGER=1 ...           # programs that log to a debugger (OutputDebugString) show their logs
 VXRT_DLL_PATH=/prefix/drive_c/windows/system32 ...   # also loads DLLs (the VC++ runtime) from a Windows installation
 VXRT_TRACE_PIPES=1 ...                     # every named-pipe message, with its first bytes
+VXRT_TRACE_NAMES=1 ...                     # processes joining and leaving named objects and mappings
 ```
 
 `C:\` is `$VXRT_ROOT/drive_c` (default `~/.vxrt/drive_c`, created on first run with `C:\windows\system32` and

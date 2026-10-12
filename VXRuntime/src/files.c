@@ -603,7 +603,7 @@ int vx_name_join(const char *object_shm);
 int vx_name_leave(const char *object_shm);
 static void mapping_destroy(void *p) {
     mapping *m = p;
-    if (m->shm[0] && vx_name_leave(m->shm)) shm_unlink(m->shm);   // like Windows, the name goes with its last holder
+    if (m->shm[0]) vx_name_leave(m->shm);                          // like Windows, the name goes with its last holder
     close(m->fd);
     free(m);
 }
@@ -628,7 +628,7 @@ static HANDLE create_mapping(HANDLE file, DWORD protect, uint64_t size, const ch
         char shm[40];
         if (name) {
             shm_name(name, shm, sizeof shm);
-            if (!vx_name_join(shm)) shm_unlink(shm);               // left behind by processes that ended
+            vx_name_join(shm);                                     // (removes what processes that ended left)
         } else {                                                   // unnamed: a private name, so a duplicate can share it
             static int counter;
             snprintf(shm, sizeof shm, "/vx.%d.%d", getpid(), __sync_fetch_and_add(&counter, 1));
@@ -641,6 +641,7 @@ static HANDLE create_mapping(HANDLE file, DWORD protect, uint64_t size, const ch
         struct stat st;
         if (!existed || (!fstat(fd, &st) && (uint64_t)st.st_size < size)) ftruncate(fd, (off_t)size);
         if (existed && !fstat(fd, &st)) size = (uint64_t)st.st_size;
+        if (getenv("VXRT_TRACE_NAMES") && !fstat(fd, &st)) vx_log("[%d] mapping %s: existed %d, inode %llu, size %llu", getpid(), shm, existed, (unsigned long long)st.st_ino, (unsigned long long)st.st_size);
     } else {
         int ffd = vx_handle_fd(file);
         if (ffd < 0 || (fd = dup(ffd)) < 0) { vx_set_last_error(6); return NULL; }
@@ -667,7 +668,7 @@ static WINAPI HANDLE CreateFileMappingW(HANDLE file, void *sa, DWORD protect, DW
 static HANDLE open_mapping(const char *name) {
     char shm[40];
     shm_name(name, shm, sizeof shm);
-    if (!vx_name_join(shm)) { vx_name_leave(shm); shm_unlink(shm); vx_set_last_error(2); return NULL; }   // nobody holds it
+    if (!vx_name_join(shm)) { vx_name_leave(shm); vx_set_last_error(2); return NULL; }   // nobody holds it
     int fd = shm_open(shm, O_RDWR, 0600);
     if (fd < 0) { vx_name_leave(shm); vx_set_last_error(2); return NULL; }
     struct stat st; fstat(fd, &st);

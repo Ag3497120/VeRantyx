@@ -651,7 +651,7 @@ static WINAPI DWORD EventWriteString(uint64_t reg, uint8_t level, uint64_t keywo
     (void)reg; (void)level; (void)keyword;
     static int on = -1;
     if (on < 0) on = getenv("VXRT_TRACE_EVENTS") && atoi(getenv("VXRT_TRACE_EVENTS"));
-    if (on && s) { char *a = vx_utf8_dup(s); vx_log("event: %s", a); free(a); }
+    if (on && s) vx_log("event: %s", (const char *)s);           // SteamVR passes narrow text here
     return 0;
 }
 

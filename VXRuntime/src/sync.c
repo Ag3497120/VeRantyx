@@ -89,49 +89,82 @@ static void shared_name(const char *name, int type, char *out, size_t cap) {
     for (const char *c = name; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
     snprintf(out, cap, "/vxo.%016llx", (unsigned long long)h);
 }
-// Who holds a name: a registry of process IDs beside each named object or mapping ("/vxr.<hash>"). A name whose
+// Who holds a name: a registry of process IDs beside each named object or mapping ("/vxq.<hash>"). A name whose
 // holders have all ended (killed, crashed) is gone, as on Windows, even though its shared memory is still there.
-typedef struct { volatile uint32_t spin; int32_t pids[1000]; } name_registry;
-static name_registry *registry_open(const char *object_shm) {
-    char reg[40];
-    snprintf(reg, sizeof reg, "/vxr.%s", object_shm + 1);
-    int fd = shm_open(reg, O_RDWR | O_CREAT, 0600);
-    if (fd < 0) return NULL;
-    struct stat st;
-    if (!fstat(fd, &st) && st.st_size < (off_t)sizeof(name_registry)) ftruncate(fd, sizeof(name_registry));
-    name_registry *r = mmap(NULL, sizeof(name_registry), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    return r == MAP_FAILED ? NULL : r;
+// The object's shared memory is created and removed only under the registry's lock, so two processes never end up
+// with different memory under one name. A registry removed by its last holder is marked dead first: a process that
+// opened it just before waits for the lock, sees the mark, and opens the new one.
+typedef struct { volatile uint32_t spin, dead; int32_t pids[1000]; } name_registry;
+// Maps shared memory that another process may have just created: a new object is empty until its creator sizes it
+// (whoever sizes it first wins; macOS sizes shared memory once), and mapping an empty one fails.
+static void *map_sized(int fd, size_t size) {
+    for (int i = 0; i < 5000; i++) {
+        struct stat st;
+        if (fstat(fd, &st)) break;
+        if ((size_t)st.st_size >= size) return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (!st.st_size) ftruncate(fd, (off_t)size);
+        else break;                                                // sized smaller by someone else
+        if (i) usleep(200);
+    }
+    return MAP_FAILED;
 }
+static name_registry *registry_lock(const char *object_shm) {
+    char reg[40];
+    snprintf(reg, sizeof reg, "/vxq.%s", object_shm + 1);
+    for (int tries = 0; tries < 100; tries++) {
+        int fd = shm_open(reg, O_RDWR | O_CREAT, 0600);
+        if (fd < 0) { vx_log("name registry %s: shm_open failed (%s)", reg, strerror(errno)); return NULL; }
+        name_registry *r = map_sized(fd, sizeof(name_registry));
+        int e = errno;
+        close(fd);
+        if (r == MAP_FAILED) { vx_log("name registry %s: mmap failed (%s)", reg, strerror(e)); return NULL; }
+        while (__atomic_exchange_n(&r->spin, 1, __ATOMIC_ACQUIRE)) sched_yield();
+        if (!r->dead) return r;
+        __atomic_store_n(&r->spin, 0, __ATOMIC_RELEASE);
+        munmap(r, sizeof *r);
+    }
+    vx_log("name registry %s: stays dead", reg);
+    return NULL;
+}
+static void registry_unlock(name_registry *r) {
+    __atomic_store_n(&r->spin, 0, __ATOMIC_RELEASE);
+    munmap(r, sizeof *r);
+}
+static int holder_alive(int32_t pid, int me) { return pid == me || !kill(pid, 0) || errno != ESRCH; }
 // Joins a name; returns how many holds of it there were (this process's earlier ones included) by live processes.
+// With none, memory left under the name by processes that ended is removed.
 int vx_name_join(const char *object_shm) {
-    name_registry *r = registry_open(object_shm);
+    name_registry *r = registry_lock(object_shm);
     if (!r) return 0;
-    while (__atomic_exchange_n(&r->spin, 1, __ATOMIC_ACQUIRE)) sched_yield();
     int others = 0, me = getpid(), free_slot = -1;
     for (int i = 0; i < 1000; i++) {
-        if (r->pids[i] && r->pids[i] != me && kill(r->pids[i], 0) && errno == ESRCH) r->pids[i] = 0;   // ended
+        if (r->pids[i] && !holder_alive(r->pids[i], me)) r->pids[i] = 0;   // ended
         if (!r->pids[i]) { if (free_slot < 0) free_slot = i; }
         else others++;
     }
     if (free_slot >= 0) r->pids[free_slot] = me;
-    __atomic_store_n(&r->spin, 0, __ATOMIC_RELEASE);
-    munmap(r, sizeof *r);
+    if (!others) shm_unlink(object_shm);
+    if (getenv("VXRT_TRACE_NAMES")) vx_log("[%d] join %s: %d holds before", me, object_shm, others);
+    registry_unlock(r);
     return others;
 }
-// Leaves a name; returns 1 when no process holds it any more (the caller removes the object).
+// Leaves a name; returns 1 when no process holds it any more (then the object's memory and the registry are gone).
 int vx_name_leave(const char *object_shm) {
-    name_registry *r = registry_open(object_shm);
+    name_registry *r = registry_lock(object_shm);
     if (!r) return 1;
-    while (__atomic_exchange_n(&r->spin, 1, __ATOMIC_ACQUIRE)) sched_yield();
     int me = getpid(), left = 0, removed = 0;
     for (int i = 0; i < 1000; i++) {
         if (r->pids[i] == me && !removed) { r->pids[i] = 0; removed = 1; continue; }
-        if (r->pids[i] && (r->pids[i] == me || !kill(r->pids[i], 0) || errno != ESRCH)) left++;
+        if (r->pids[i] && holder_alive(r->pids[i], me)) left++;
     }
-    __atomic_store_n(&r->spin, 0, __ATOMIC_RELEASE);
-    munmap(r, sizeof *r);
-    if (!left) { char reg[40]; snprintf(reg, sizeof reg, "/vxr.%s", object_shm + 1); shm_unlink(reg); }
+    if (!left) {
+        char reg[40]; snprintf(reg, sizeof reg, "/vxq.%s", object_shm + 1);
+        r->dead = 1;
+        shm_unlink(object_shm);
+        shm_unlink(reg);
+    }
+    if (getenv("VXRT_TRACE_NAMES")) vx_log("[%d] leave %s: %d left", me, object_shm, left);
+    registry_unlock(r);
     return !left;
 }
 // Attaches to the state of a name: created if `create` (and *existed says whether a live process holds it), else
@@ -140,14 +173,12 @@ static shared_state *shared_attach(const char *name, int type, int create, int *
     char shm[40];
     shared_name(name, type, shm, sizeof shm);
     *existed = 0;
-    int others = vx_name_join(shm);
-    if (!others) shm_unlink(shm);                                  // left behind by processes that ended
+    int others = vx_name_join(shm);                                // (removes what processes that ended left)
     if (!others && !create) { vx_name_leave(shm); return NULL; }
     int fd = shm_open(shm, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0) { fd = shm_open(shm, O_RDWR, 0600); if (fd >= 0) *existed = 1; }
     if (fd < 0) { vx_name_leave(shm); return NULL; }
-    if (!*existed) ftruncate(fd, 4096);
-    shared_state *sh = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    shared_state *sh = map_sized(fd, 4096);
     close(fd);
     if (sh == MAP_FAILED) { vx_name_leave(shm); return NULL; }
     if (*existed) for (int i = 0; i < 100000 && __atomic_load_n(&sh->magic, __ATOMIC_ACQUIRE) != SHARED_MAGIC; i++) sched_yield();
@@ -156,7 +187,7 @@ static shared_state *shared_attach(const char *name, int type, int create, int *
 static void shared_detach(shared_state *sh, const char *name, int type) {
     char shm[40];
     shared_name(name, type, shm, sizeof shm);
-    if (vx_name_leave(shm)) shm_unlink(shm);
+    vx_name_leave(shm);
     munmap(sh, 4096);
 }
 static void spin_lock(shared_state *sh) { while (__atomic_exchange_n(&sh->spin, 1, __ATOMIC_ACQUIRE)) sched_yield(); }

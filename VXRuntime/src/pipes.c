@@ -8,6 +8,7 @@
 // ReadFile complete in the background (the OVERLAPPED's event is set, a completion port gets its packet).
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +37,7 @@
 #define STATUS_PENDING 0x103
 #define PIPE_TYPE_MESSAGE 4
 #define PIPE_READMODE_MESSAGE 2
+#define PIPE_NOWAIT 1
 #define FILE_FLAG_OVERLAPPED 0x40000000u
 
 typedef struct listener { char path[128]; int fd, refs; struct listener *next; } listener;
@@ -43,7 +45,7 @@ typedef struct {
     int server;
     listener *ls;                    // server: the shared listening socket
     int fd;                          // the connection, -1 while there is none
-    DWORD mode;                      // PIPE_TYPE_* | PIPE_READMODE_*
+    DWORD mode;                      // PIPE_TYPE_* | PIPE_READMODE_* | PIPE_NOWAIT
     int overlapped;
     uint8_t *rest; size_t rest_len, rest_off;   // the unread part of a message
     pthread_mutex_t lock;            // reads
@@ -51,10 +53,13 @@ typedef struct {
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static listener *g_listeners;
 // VXRT_TRACE_PIPES=1: every frame written and every read, with its first bytes.
-static void trace_bytes(const char *what, vx_pipe *p, const void *buf, size_t n, DWORD err) {
+static int trace_on(void) {
     static int on = -1;
     if (on < 0) on = getenv("VXRT_TRACE_PIPES") && atoi(getenv("VXRT_TRACE_PIPES"));
-    if (!on) return;
+    return on;
+}
+static void trace_bytes(const char *what, vx_pipe *p, const void *buf, size_t n, DWORD err) {
+    if (!trace_on()) return;
     char hex[3 * 16 + 1] = "";
     for (size_t i = 0; i < n && i < 16; i++) snprintf(hex + 3 * i, 4, "%02x ", ((const uint8_t *)buf)[i]);
     vx_log("pipe %s fd %d %s: %zu bytes, error %u: %s", p->server ? "server" : "client", p->fd, what, n, err, hex);
@@ -128,7 +133,7 @@ static HANDLE create_named_pipe(const char *name, DWORD open_mode, DWORD pipe_mo
     pthread_mutex_unlock(&g_lock);
     vx_pipe *p = new_pipe(1, pipe_mode, (open_mode & FILE_FLAG_OVERLAPPED) != 0);
     p->ls = ls;
-    if (vx_trace) vx_log("CreateNamedPipe %s", name);
+    if (vx_trace || trace_on()) vx_log("CreateNamedPipe %s open %#x mode %#x", name, (unsigned)open_mode, (unsigned)pipe_mode);
     return vx_handle_new(VX_HANDLE_PIPE, p, pipe_destroy);
 }
 static WINAPI HANDLE CreateNamedPipeA(const char *name, DWORD open_mode, DWORD pipe_mode, DWORD max, DWORD out, DWORD in, DWORD ms, void *sa) {
@@ -144,6 +149,10 @@ static WINAPI HANDLE CreateNamedPipeW(const WCHAR *name, DWORD open_mode, DWORD 
 }
 static int accept_client(vx_pipe *p) {
     int fd;
+    if (p->mode & PIPE_NOWAIT) {                                   // only a client that is already waiting
+        struct pollfd w = { p->ls->fd, POLLIN, 0 };
+        if (poll(&w, 1, 0) != 1) return 0;
+    }
     do fd = accept(p->ls->fd, NULL, NULL); while (fd < 0 && errno == EINTR);
     if (fd < 0) return 0;
     fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -175,6 +184,7 @@ static void start_background(void *(*fn)(void *), async_op *op) {
 }
 static WINAPI BOOL ConnectNamedPipe(HANDLE h, void *ov) {
     vx_pipe *p = pipe_of(h);
+    if (trace_on()) vx_log("ConnectNamedPipe %p ov %p (overlapped %d, fd %d)", h, ov, p ? p->overlapped : -1, p ? p->fd : -1);
     if (!p || !p->server) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
     if (p->fd >= 0) { vx_set_last_error(ERROR_PIPE_CONNECTED); return 0; }
     if (p->overlapped && ov) {
@@ -184,6 +194,9 @@ static WINAPI BOOL ConnectNamedPipe(HANDLE h, void *ov) {
         vx_set_last_error(ERROR_IO_PENDING);
         return 0;
     }
+    // A non-blocking instance (PIPE_NOWAIT, as SteamVR's are) is polled: "listening" until a client comes, then
+    // "connected".
+    if (p->mode & PIPE_NOWAIT) { vx_set_last_error(accept_client(p) ? ERROR_PIPE_CONNECTED : ERROR_PIPE_LISTENING); return 0; }
     if (!accept_client(p)) { vx_set_last_error(ERROR_BROKEN_PIPE); return 0; }
     return 1;
 }
@@ -254,6 +267,11 @@ static DWORD pipe_read(vx_pipe *p, void *buf, DWORD n, DWORD *err) {
     if (p->fd < 0) { pthread_mutex_unlock(&p->lock); *err = p->server ? ERROR_PIPE_LISTENING : ERROR_PIPE_NOT_CONNECTED; return 0; }
     if (!p->rest || p->rest_off == p->rest_len) {
         uint32_t len;
+        if (p->mode & PIPE_NOWAIT) {                               // nothing there: no data now (or the other end went)
+            ssize_t r;
+            do r = recv(p->fd, &len, 4, MSG_PEEK | MSG_DONTWAIT); while (r < 0 && errno == EINTR);
+            if (r <= 0) { pthread_mutex_unlock(&p->lock); *err = r == 0 || errno != EAGAIN ? ERROR_BROKEN_PIPE : ERROR_NO_DATA; return 0; }
+        }
         free(p->rest); p->rest = NULL; p->rest_len = p->rest_off = 0;
         if (!read_all(p->fd, &len, 4)) { pthread_mutex_unlock(&p->lock); *err = ERROR_BROKEN_PIPE; return 0; }
         p->rest = malloc(len ? len : 1);
@@ -346,14 +364,14 @@ static WINAPI BOOL SetNamedPipeHandleState(HANDLE h, DWORD *mode, DWORD *max, DW
     (void)max; (void)timeout;
     vx_pipe *p = pipe_of(h);
     if (!p) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
-    if (mode) p->mode = (p->mode & ~(DWORD)PIPE_READMODE_MESSAGE) | (*mode & PIPE_READMODE_MESSAGE);
+    if (mode) p->mode = (p->mode & ~(DWORD)(PIPE_READMODE_MESSAGE | PIPE_NOWAIT)) | (*mode & (PIPE_READMODE_MESSAGE | PIPE_NOWAIT));
     return 1;
 }
 static WINAPI BOOL GetNamedPipeHandleStateA(HANDLE h, DWORD *state, DWORD *instances, DWORD *max, DWORD *timeout, char *user, DWORD n) {
     (void)max; (void)timeout; (void)user; (void)n;
     vx_pipe *p = pipe_of(h);
     if (!p) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
-    if (state) *state = p->mode & PIPE_READMODE_MESSAGE;
+    if (state) *state = p->mode & (PIPE_READMODE_MESSAGE | PIPE_NOWAIT);
     if (instances) *instances = 1;
     return 1;
 }
