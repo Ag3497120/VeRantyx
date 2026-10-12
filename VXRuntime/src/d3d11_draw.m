@@ -35,7 +35,7 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface)
 }
 
 // ---- shaders ------------------------------------------------------------------------------------------------------------
-typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id; } d3d_shader;
+typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id, hash; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
 static uint32_t g_next_id = 1;
 static void shader_destroy(d3d_object *o) {
     d3d_shader *s = (d3d_shader *)o;
@@ -89,6 +89,9 @@ static HRESULT create_shader(d3d_device *dev, const void *code, size_t size, int
         return E_INVALIDARG;
     }
     dump(&s->info, code, size);
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(code, (CC_LONG)size, digest);
+    s->hash = (uint32_t)digest[0] << 24 | (uint32_t)digest[1] << 16 | (uint32_t)digest[2] << 8 | digest[3];
     NSError *err = nil;
     id<MTLLibrary> lib = [(__bridge id<MTLDevice>)dev->mtl newLibraryWithSource:@(s->info.msl) options:nil error:&err];
     id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
@@ -311,7 +314,8 @@ typedef struct d3d_draw_state {
     d3d_blend *blend; float blend_factor[4];
     d3d_depth *depth; uint32_t stencil_ref;
     d3d_raster *raster;
-    RECT scissor;
+    RECT scissor[16];
+    uint32_t nscissors;
 } d3d_draw_state;
 
 static d3d_draw_state *state_of(d3d_context *c) {
@@ -406,7 +410,11 @@ static WINAPI void om_set_blend(void *this, d3d_blend *b, const float *factor, u
 }
 static WINAPI void om_set_depth(void *this, d3d_depth *d, uint32_t ref) { d3d_draw_state *s = state_of(this); bind(&s->depth, d); s->stencil_ref = ref; }
 static WINAPI void rs_set_state(void *this, d3d_raster *r) { bind(&state_of(this)->raster, r); }
-static WINAPI void rs_set_scissors(void *this, uint32_t n, const RECT *r) { if (n && r) state_of(this)->scissor = r[0]; }
+static WINAPI void rs_set_scissors(void *this, uint32_t n, const RECT *r) {
+    if (n > 16) n = 16;
+    if (n && r) memcpy(state_of(this)->scissor, r, sizeof *r * n);
+    state_of(this)->nscissors = n;
+}
 
 // ---- pipeline states ---------------------------------------------------------------------------------------------------------------
 static MTLBlendFactor blend_factor(uint32_t f) {
@@ -685,9 +693,51 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
 }
 
 // Sets everything a draw needs; returns the encoder, or nil when the draw cannot happen.
+// VXRT_TRACE_DRAWS=file: once that file exists, the next 300 draws are logged (shaders, targets, textures bound).
+static void trace_draw(d3d_context *c, d3d_draw_state *s) {
+    static int left = -1;
+    static const char *path;
+    if (left < 0) { path = getenv("VXRT_TRACE_DRAWS"); left = path ? 0 : -2; }
+    if (left == -2) return;
+    if (!left) { static int polls; if (++polls % 64 || access(path, F_OK)) return; left = 300; }
+    left--;
+    char line[1024]; size_t k = 0;
+    d3d_shader *vs = s->shader[STAGE_VS], *ps = s->shader[STAGE_PS];
+    k += (size_t)snprintf(line + k, sizeof line - k, "draw vs %08x ps %08x", vs ? vs->hash : 0, ps ? ps->hash : 0);
+    for (int i = 0; i < 8; i++) if (c->rtv[i]) {
+        d3d_texture *t = (d3d_texture *)c->rtv[i]->resource;
+        k += (size_t)snprintf(line + k, sizeof line - k, " rt%d %ux%u f%u%s", i, t->desc[TD_WIDTH], t->desc[TD_HEIGHT], c->rtv[i]->format, t->shared ? "S" : "");
+    }
+    for (int i = 0; i < 16 && k < sizeof line - 64; i++) if (s->srv[STAGE_PS][i] && s->srv[STAGE_PS][i]->resource->kind == K_TEXTURE) {
+        d3d_view *v = s->srv[STAGE_PS][i]; d3d_texture *t = (d3d_texture *)v->resource;
+        k += (size_t)snprintf(line + k, sizeof line - k, " t%d %ux%u f%u d%u%s", i, t->desc[TD_WIDTH], t->desc[TD_HEIGHT], v->format, v->dim, t->shared ? "S" : "");
+    }
+    vx_log("%s", line);
+    // VXRT_DRAW_SNAPSHOT=<ps hash>:<file prefix>: the textures that pixel shader reads, as PNGs, once.
+    static int done;
+    const char *ds = getenv("VXRT_DRAW_SNAPSHOT");
+    char want[16];
+    if (!done && ds && ps && sscanf(ds, "%8[0-9a-f]", want) == 1 && strtoul(want, NULL, 16) == ps->hash && strchr(ds, ':')) {
+        done = 1;
+        d3d_flush(c->base.dev, 1);
+        for (int b = 0; b < 4; b++) if (s->cb[STAGE_PS][b]) {
+            id<MTLBuffer> mb = (__bridge id<MTLBuffer>)s->cb[STAGE_PS][b]->mtl;
+            if (mb.storageMode != MTLStorageModeShared) continue;
+            const float *f = (const float *)((const uint8_t *)mb.contents + s->cb_offset[STAGE_PS][b]);
+            for (NSUInteger r = 0; r < MIN(mb.length / 16, 16u); r++)
+                vx_log("ps cb%d[%lu] = %g %g %g %g", b, (unsigned long)r, f[4 * r], f[4 * r + 1], f[4 * r + 2], f[4 * r + 3]);
+        }
+        for (int i = 0; i < 16; i++) if (s->srv[STAGE_PS][i] && s->srv[STAGE_PS][i]->resource->kind == K_TEXTURE) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s.t%d.png", strchr(ds, ':') + 1, i);
+            d3d_texture_png(c->base.dev, ((d3d_texture *)s->srv[STAGE_PS][i]->resource)->mtl, path);
+        }
+    }
+}
 static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *type) {
     d3d_draw_state *s = state_of(c);
     if (!s->shader[STAGE_VS]) return nil;
+    trace_draw(c, s);
     switch (s->topology) {
     case 1: *type = MTLPrimitiveTypePoint; break;
     case 2: *type = MTLPrimitiveTypeLine; break;
@@ -719,16 +769,24 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
     NSUInteger tw = target ? target.width >> (c->rtv[0] ? c->rtv[0]->mip : 0) : 1, th = target ? target.height >> (c->rtv[0] ? c->rtv[0]->mip : 0) : 1;
     if (!tw) tw = 1;
     if (!th) th = 1;
-    MTLViewport vp = { c->viewport[0], c->viewport[1], c->viewport[2], c->viewport[3], c->viewport[4], c->viewport[5] };
-    if (vp.width <= 0 || vp.height <= 0) vp = (MTLViewport){ 0, 0, (double)tw, (double)th, 0, 1 };
-    [enc setViewport:vp];
-    MTLScissorRect sc = { 0, 0, tw, th };
-    if (rd && rd[7]) {                                          // scissor enabled
-        LONG l = MAX(s->scissor.left, 0), t = MAX(s->scissor.top, 0);
-        LONG r = MIN(s->scissor.right, (LONG)tw), b = MIN(s->scissor.bottom, (LONG)th);
-        sc = (MTLScissorRect){ (NSUInteger)l, (NSUInteger)t, (NSUInteger)MAX(r - l, 0), (NSUInteger)MAX(b - t, 0) };
+    // Viewports and scissor rectangles, as many as were set (SV_ViewportArrayIndex picks one per primitive).
+    uint32_t nvp = MAX(c->nviewports, 1);
+    MTLViewport vps[16];
+    MTLScissorRect scs[16];
+    for (uint32_t i = 0; i < nvp; i++) {
+        const float *v = c->viewport + 6 * i;
+        vps[i] = (MTLViewport){ v[0], v[1], v[2], v[3], v[4], v[5] };
+        if (vps[i].width <= 0 || vps[i].height <= 0) vps[i] = (MTLViewport){ 0, 0, (double)tw, (double)th, 0, 1 };
+        scs[i] = (MTLScissorRect){ 0, 0, tw, th };
+        if (rd && rd[7]) {                                      // scissor enabled
+            RECT q = s->scissor[i < MAX(s->nscissors, 1) ? i : 0];
+            LONG l = MAX(q.left, 0), t = MAX(q.top, 0);
+            LONG r = MIN(q.right, (LONG)tw), b = MIN(q.bottom, (LONG)th);
+            scs[i] = (MTLScissorRect){ (NSUInteger)MIN(l, (LONG)tw), (NSUInteger)MIN(t, (LONG)th), (NSUInteger)MAX(r - l, 0), (NSUInteger)MAX(b - t, 0) };
+        }
     }
-    [enc setScissorRect:sc];
+    if (nvp == 1) { [enc setViewport:vps[0]]; [enc setScissorRect:scs[0]]; }
+    else { [enc setViewports:vps count:nvp]; [enc setScissorRects:scs count:nvp]; }
     for (int i = 0; i < 16; i++)
         if (s->vb[i]) [enc setVertexBuffer:(__bridge id<MTLBuffer>)s->vb[i]->mtl offset:s->offset[i] atIndex:VB_BASE + i];
     bind_stage(c, s, STAGE_VS, enc, nil);
@@ -862,8 +920,8 @@ static WINAPI void ia_get_vertex_buffers(void *this, uint32_t start, uint32_t n,
     }
 }
 static WINAPI void rs_get_scissors(void *this, uint32_t *n, RECT *r) {
-    if (r && *n) r[0] = state_of(this)->scissor;
-    *n = 1;
+    if (r && *n) memcpy(r, state_of(this)->scissor, sizeof *r * MIN(*n, MAX(state_of(this)->nscissors, 1)));
+    *n = MAX(state_of(this)->nscissors, 1);
 }
 static WINAPI void rs_get_state(void *this, void **r) { *r = held(state_of(this)->raster); }
 static WINAPI void so_get_targets(void *this, uint32_t n, void **out) { (void)this; for (uint32_t i = 0; i < n; i++) out[i] = NULL; }

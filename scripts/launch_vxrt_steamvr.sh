@@ -12,9 +12,12 @@
 # $VXRT_VR_ROOT/drive_c (the driver's shared frame file is there). The VC++
 # runtime DLLs come from the prefix's system32.
 #
-# VXRT_VR_NO_STANDBY=1 (default) keeps the compositor running when the headset
-# looks idle (SteamVR otherwise drops to a few frames a second after ~5 s);
-# it is set in the overlay's copy of steamvr.vrsettings only.
+# The overlay's copy of steamvr.vrsettings (never the original) sets
+# steamvr/allowDisplayLockedMode: without Windows' DisplayManager (WinRT) the
+# compositor believes the display is locked and covers everything in a green
+# colour otherwise. VXRT_VR_NO_STANDBY=1 (default) also keeps the compositor
+# running when the headset looks idle (SteamVR otherwise drops to a few frames
+# a second after ~5 s).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,14 +56,14 @@ cat >"$OPENVR_DIR/openvrpaths.vrpath" <<EOF
 }
 EOF
 
-if [[ "$VXRT_VR_NO_STANDBY" == "1" ]]; then
-    python3 - "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" <<'EOF'
+python3 - "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" "$VXRT_VR_NO_STANDBY" <<'EOF'
 import json, sys
 settings = json.load(open(sys.argv[1]))
-settings.setdefault("power", {}).update({"pauseCompositorOnStandby": False, "turnOffScreensTimeout": 3600.0})
+settings.setdefault("steamvr", {})["allowDisplayLockedMode"] = True
+if sys.argv[3] == "1":
+    settings.setdefault("power", {}).update({"pauseCompositorOnStandby": False, "turnOffScreensTimeout": 3600.0})
 json.dump(settings, open(sys.argv[2], "w"), indent=3)
 EOF
-fi
 
 export VXRT_ROOT="$VXRT_VR_ROOT"
 export VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY"

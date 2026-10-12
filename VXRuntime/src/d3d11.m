@@ -502,6 +502,9 @@ static void clear_pass(d3d_context *c, d3d_view *v, const float *color, int dept
     [[context_cmd(c) renderCommandEncoderWithDescriptor:rp] endEncoding];
 }
 static WINAPI void ctx_clear_rtv(void *this, d3d_view *v, const float color[4]) {
+    static int traced;
+    if (getenv("VXRT_TRACE_DRAWS") && v && v->resource->kind == K_TEXTURE && ((d3d_texture *)v->resource)->desc[TD_WIDTH] != 2048 && traced++ < 40)
+        vx_log("ClearRenderTargetView %ux%u to (%g, %g, %g, %g)", ((d3d_texture *)v->resource)->desc[TD_WIDTH], ((d3d_texture *)v->resource)->desc[TD_HEIGHT], color[0], color[1], color[2], color[3]);
     if (v && v->resource->kind == K_TEXTURE) clear_pass(this, v, color, 0, 0, 0, 0);
 }
 static WINAPI void ctx_clear_dsv(void *this, d3d_view *v, uint32_t flags, float depth, uint8_t stencil) {
@@ -522,10 +525,16 @@ static WINAPI void ctx_om_get_render_targets(void *this, uint32_t n, d3d_view **
     for (uint32_t i = 0; i < n && rtvs; i++) { rtvs[i] = i < 8 ? c->rtv[i] : NULL; if (rtvs[i]) d3d_addref(&rtvs[i]->base); }
     if (dsv) { *dsv = c->dsv; if (*dsv) d3d_addref(&(*dsv)->base); }
 }
-static WINAPI void ctx_rs_set_viewports(void *this, uint32_t n, const float *vp) { if (n && vp) memcpy(((d3d_context *)this)->viewport, vp, sizeof(float) * 6); }
+static WINAPI void ctx_rs_set_viewports(void *this, uint32_t n, const float *vp) {
+    d3d_context *c = this;
+    if (n > 16) n = 16;
+    if (n && vp) memcpy(c->viewport, vp, sizeof(float) * 6 * n);
+    c->nviewports = n;
+}
 static WINAPI void ctx_rs_get_viewports(void *this, uint32_t *n, float *vp) {
-    if (vp && *n) memcpy(vp, ((d3d_context *)this)->viewport, sizeof(float) * 6);
-    *n = 1;
+    d3d_context *c = this;
+    if (vp && *n) memcpy(vp, c->viewport, sizeof(float) * 6 * MIN(*n, MAX(c->nviewports, 1)));
+    *n = MAX(c->nviewports, 1);
 }
 
 // Subresource index -> mip level and array slice.

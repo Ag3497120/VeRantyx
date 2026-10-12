@@ -163,6 +163,7 @@ HRESULT d3d_open_shared(d3d_device *dev, HANDLE h, const GUID *iid, void **out) 
         if (!tex) return E_INVALIDARG;
         o = &d3d_texture_wrap(dev, e->desc, (void *)CFBridgingRetain(tex), s + 1)->base;
         d3d_shared_note((d3d_texture *)o);
+        if (getenv("VXRT_TRACE_KEYED")) vx_log("opened shared texture slot %d: %ux%u DXGI format %u, IOSurface %u", s, e->desc[TD_WIDTH], e->desc[TD_HEIGHT], e->desc[TD_FORMAT], e->surface);
     } else if (e->kind == 2) {
         void *shm = NULL;
         void *b = map_shared_buffer(dev, e->shm, (size_t)e->size, 0, &shm);
@@ -203,7 +204,7 @@ static WINAPI HRESULT res_get_private(void *this, const GUID *g, uint32_t *n, vo
 static WINAPI HRESULT res_set_private_interface(void *this, const GUID *g, void *unk) { (void)unk; return d3d_set_private(res_of(this), g, 0, NULL); }
 
 // With VXRT_SHARED_SNAPSHOT set, every shared texture this process makes or opens is remembered (its Metal texture
-// retained), and the snapshot writes them all: file.png.<slot>.png.
+// retained), and the snapshot writes them all: file.png.<pid>.<slot>.png.
 static void *g_noted[64]; static int g_noted_slot[64], g_noted_count;
 void d3d_shared_note(d3d_texture *t) {
     if (!getenv("VXRT_SHARED_SNAPSHOT") || !t->shared || g_noted_count >= 64) return;
@@ -257,14 +258,22 @@ static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
     if (!t->shared) return S_OK;
     d3d_flush(t->base.dev, 1);                                    // the other process sees what was drawn
     // VXRT_SHARED_SNAPSHOT=file.png (VXRT_SHARED_SNAPSHOT_AT=n, default 600): the n-th texture this process releases.
+    // Or, with VXRT_SHARED_SNAPSHOT_AT=now, while the file <file.png>.now exists (every 30 releases; remove it after).
     static int releases;
     const char *snap = getenv("VXRT_SHARED_SNAPSHOT"), *at = getenv("VXRT_SHARED_SNAPSHOT_AT");
-    if (snap && __sync_add_and_fetch(&releases, 1) == (at ? atoi(at) : 600)) {
+    int fire = 0;
+    if (snap && at && !strcmp(at, "now")) {
+        char trigger[1024]; snprintf(trigger, sizeof trigger, "%s.now", snap);
+        static int last;
+        int n = __sync_add_and_fetch(&releases, 1);
+        if (n - last >= 30 && !access(trigger, F_OK)) { last = n; fire = 1; }
+    } else if (snap) fire = __sync_add_and_fetch(&releases, 1) == (at ? atoi(at) : 600);
+    if (fire) {
         vx_log("shared snapshot: slot %d, DXGI format %u", t->shared - 1, t->desc[TD_FORMAT]);
         d3d_texture_png(t->base.dev, t->mtl, snap);
         for (int i = 0; i < g_noted_count && i < 64; i++) {
             char path[1024];
-            snprintf(path, sizeof path, "%s.%d.png", snap, g_noted_slot[i]);
+            snprintf(path, sizeof path, "%s.%d.%d.png", snap, (int)getpid(), g_noted_slot[i]);
             d3d_texture_png(t->base.dev, g_noted[i], path);
         }
     }

@@ -188,6 +188,7 @@ typedef struct {
     const uint32_t *labels[64], *prog_end;    // subroutine bodies, the program's end
     int sub_depth, nesting;                   // subroutines being inlined; loops and switches open in this one
     int out_depth, in_primid, in_coverage, out_coverage;
+    int vp_reg, vp_comp, rt_reg, rt_comp, clip_reg; uint8_t clip_mask;   // vertex outputs: viewport/layer index, clip distances
     uint8_t tex_dim[128], tex_ret[128], tex_cmp[128];
     uint32_t cb_size[16];
     uint32_t *icb, icb_n;
@@ -220,6 +221,7 @@ static const char *type_name(int kind, int n) {
     return names[kind][n < 1 ? 1 : n > 4 ? 4 : n];
 }
 static const char CH[] = "xyzw";
+static int first_comp(uint8_t mask);
 
 // A destination's enabled components.
 static int dest_comps(const operand *d, int *comps) {
@@ -1039,7 +1041,13 @@ static void declare(gen *g, uint32_t op, uint32_t token, reader *r, pool *pl) {
         read_operand(r, pl, &o);
         if (o.type == OPD_OUTPUT && o.index[0] < 32) {
             g->out_decl[o.index[0]] = 1;
-            if (op != OP_DCL_OUTPUT) g->out_sv[o.index[0]] = next(r);
+            if (op != OP_DCL_OUTPUT) {
+                uint32_t sv = next(r);
+                if (sv == 5) { g->vp_reg = (int)o.index[0]; g->vp_comp = first_comp(o.mask); }        // SV_ViewportArrayIndex
+                else if (sv == 4) { g->rt_reg = (int)o.index[0]; g->rt_comp = first_comp(o.mask); }   // SV_RenderTargetArrayIndex
+                else if (sv == 2 && g->clip_reg < 0) { g->clip_reg = (int)o.index[0]; g->clip_mask = o.mask; }   // SV_ClipDistance
+                else g->out_sv[o.index[0]] = sv;
+            }
         } else if (o.type == OPD_OUTPUT_DEPTH || o.type == OPD_OUTPUT_DEPTH_GE || o.type == OPD_OUTPUT_DEPTH_LE) g->out_depth = 1;
         else if (o.type == OPD_OUTPUT_COVERAGE) g->out_coverage = 1;
         break;
@@ -1214,6 +1222,14 @@ static char *compose(gen *g) {
         put(&t, "    float4 vx_position [[position]];\n");
         fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%sfloat4(0)", fk ? ", " : "");
     }
+    if (vs && g->vp_reg >= 0) { put(&t, "    uint vx_viewport [[viewport_array_index]];\n"); fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%sas_type<uint>(o%d.%c)", fk ? ", " : "", g->vp_reg, CH[g->vp_comp]); }
+    if (vs && g->rt_reg >= 0) { put(&t, "    uint vx_layer [[render_target_array_index]];\n"); fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%sas_type<uint>(o%d.%c)", fk ? ", " : "", g->rt_reg, CH[g->rt_comp]); }
+    if (vs && g->clip_reg >= 0) {                              // the first register of clip distances (up to four)
+        int n = 0; char list[128] = ""; size_t lk = 0;
+        for (int c = 0; c < 4; c++) if (g->clip_mask & (1 << c)) { lk += (size_t)snprintf(list + lk, sizeof list - lk, "%so%d.%c", n ? ", " : "", g->clip_reg, CH[c]); n++; }
+        put(&t, "    float vx_clip [[clip_distance]] [%d];\n", n);
+        fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%s{%s}", fk ? ", " : "", list);
+    }
     if (g->out_depth) { put(&t, "    float oDepth [[depth(any)]];\n"); fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%soDepth", fk ? ", " : ""); }
     if (g->out_coverage) { put(&t, "    uint oMask [[sample_mask]];\n"); fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%soMask", fk ? ", " : ""); }
     if (!fk) put(&t, "    float4 vx_unused [[user(unused)]];\n");
@@ -1335,6 +1351,7 @@ int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
     if (count * 4 > len) count = len / 4;
     gen g;
     memset(&g, 0, sizeof g);
+    g.vp_reg = g.rt_reg = g.clip_reg = -1;
     g.sh = out;
     // First pass: textures sampled or gathered with a comparison are depth textures in Metal.
     for (reader q = { tok + 2, tok + count, 0 }; q.p < q.end && !q.bad;) {

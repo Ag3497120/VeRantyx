@@ -351,6 +351,8 @@ void d3d_texture_png(d3d_device *dev, void *texture, const char *path) {
     [blit endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
+    const uint8_t *mid = (const uint8_t *)buf.contents + (h / 2) * row + (w / 2) * 4;
+    vx_log("snapshot: centre texel bytes %02x %02x %02x %02x", mid[0], mid[1], mid[2], mid[3]);
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGBitmapInfo info = bgra ? (kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst) : (kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast);
     CGContextRef ctx = CGBitmapContextCreate(buf.contents, w, h, 8, row, cs, info);

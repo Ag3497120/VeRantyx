@@ -104,7 +104,8 @@ typedef struct {
     void *render;                    // the open render command encoder (retained), or NULL
     d3d_view *render_rtv[8], *render_dsv;   // what that encoder renders to
     d3d_view *rtv[8], *dsv;
-    float viewport[6];
+    float viewport[16 * 6];          // RSSetViewports: up to 16 (x, y, width, height, min depth, max depth)
+    uint32_t nviewports;
     struct d3d_draw_state *draw;     // shaders, buffers, states (d3d11_draw.m)
 } d3d_context;
 
