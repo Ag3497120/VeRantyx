@@ -20,6 +20,10 @@ VXRT_TRACE_NAMES=1 ...                     # processes joining and leaving named
 VXRT_TRACE_CALLS=200 ...                   # every call into the runtime (arguments, result, last error), 200 per function
 ```
 
+SteamVR without Wine: `scripts/launch_vxrt_steamvr.sh` (repository root) runs vrserver, vrcompositor and the VeRantyx
+driver on vxrt next to the HEVC encoder, using the Wine prefix's SteamVR read-only. Measured on 2026-10-12 without a
+headset: the driver captures and the encoder encodes 59-60 frames a second (the Vision Pro side is untested).
+
 `C:\` is `$VXRT_ROOT/drive_c` (default `~/.vxrt/drive_c`, created on first run with `C:\windows\system32` and
 `C:\windows\temp`); `Z:\` is the whole Mac file system. The registry lives in `$VXRT_ROOT/registry.txt`.
 `make check` uses `build/root` so the tests never touch `~/.vxrt`.
