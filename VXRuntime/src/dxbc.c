@@ -105,12 +105,15 @@ enum {
     OP_IMM_ATOMIC_CONSUME = 179, OP_IMM_ATOMIC_IADD = 180, OP_IMM_ATOMIC_AND = 181, OP_IMM_ATOMIC_OR = 182, OP_IMM_ATOMIC_XOR = 183,
     OP_IMM_ATOMIC_EXCH = 184, OP_IMM_ATOMIC_CMP_EXCH = 185, OP_IMM_ATOMIC_IMAX = 186, OP_IMM_ATOMIC_IMIN = 187,
     OP_IMM_ATOMIC_UMAX = 188, OP_IMM_ATOMIC_UMIN = 189, OP_SYNC = 190,
+    OP_CUT = 9, OP_EMIT = 19, OP_EMITTHENCUT = 20, OP_EMIT_STREAM = 117, OP_CUT_STREAM = 118, OP_EMITTHENCUT_STREAM = 119,
+    OP_DCL_GS_OUTPUT_TOPOLOGY = 92, OP_DCL_GS_INPUT_PRIMITIVE = 93, OP_DCL_MAX_OUTPUT_VERTEX_COUNT = 94, OP_DCL_GS_INSTANCE_COUNT = 206,
 };
 enum {
     OPD_TEMP = 0, OPD_INPUT = 1, OPD_OUTPUT = 2, OPD_INDEXABLE_TEMP = 3, OPD_IMM32 = 4, OPD_IMM64 = 5, OPD_SAMPLER = 6,
     OPD_RESOURCE = 7, OPD_CB = 8, OPD_ICB = 9, OPD_INPUT_PRIMITIVEID = 11, OPD_OUTPUT_DEPTH = 12, OPD_NULL = 13,
     OPD_RASTERIZER = 14, OPD_OUTPUT_COVERAGE = 15, OPD_UAV = 30, OPD_TGSM = 31, OPD_THREAD_ID = 32, OPD_THREAD_GROUP_ID = 33,
-    OPD_THREAD_ID_IN_GROUP = 34, OPD_INPUT_COVERAGE = 35, OPD_THREAD_INDEX_IN_GROUP = 36, OPD_OUTPUT_DEPTH_GE = 38, OPD_OUTPUT_DEPTH_LE = 39,
+    OPD_THREAD_ID_IN_GROUP = 34, OPD_INPUT_COVERAGE = 35, OPD_THREAD_INDEX_IN_GROUP = 36, OPD_GS_INSTANCE_ID = 37, OPD_OUTPUT_DEPTH_GE = 38,
+    OPD_OUTPUT_DEPTH_LE = 39,
 };
 
 typedef struct operand {
@@ -195,6 +198,8 @@ typedef struct {
     struct { uint32_t reg, words, stride; } tgsm[16];
     int ntgsm;
     uint8_t uav_dim[8], uav_ret[8];
+    int gs;                                   // a geometry shader
+    uint32_t gs_inprim, gs_topology, gs_maxout, gs_instances;
     char why[200];
 } gen;
 
@@ -233,7 +238,7 @@ static int dest_comps(const operand *d, int *comps) {
 static int scalar_register(const operand *o) {
     return o->type == OPD_OUTPUT_DEPTH || o->type == OPD_OUTPUT_DEPTH_GE || o->type == OPD_OUTPUT_DEPTH_LE ||
            o->type == OPD_OUTPUT_COVERAGE || o->type == OPD_INPUT_COVERAGE || o->type == OPD_INPUT_PRIMITIVEID ||
-           o->type == OPD_THREAD_INDEX_IN_GROUP;
+           o->type == OPD_THREAD_INDEX_IN_GROUP || o->type == OPD_GS_INSTANCE_ID;
 }
 
 static void src(gen *g, const operand *o, const int *comps, int n, int kind, char *out, size_t cap);
@@ -253,7 +258,11 @@ static void reg_text(gen *g, const operand *o, char *out, size_t cap) {
     char i0[300], i1[300];
     switch (o->type) {
     case OPD_TEMP: snprintf(out, cap, "r%u", o->index[0]); break;
-    case OPD_INPUT: snprintf(out, cap, "v%u", o->index[o->dims - 1]); break;
+    case OPD_INPUT:
+        if (g->gs && o->dims == 2) { index_text(g, o, 0, i0, sizeof i0); snprintf(out, cap, "VXV(%s, %u)", i0, o->index[1]); }   // v[vertex][register]
+        else snprintf(out, cap, "v%u", o->index[o->dims - 1]);
+        break;
+    case OPD_GS_INSTANCE_ID: snprintf(out, cap, "vInstance"); break;
     case OPD_OUTPUT: snprintf(out, cap, "o%u", o->index[0]); break;
     case OPD_INDEXABLE_TEMP: index_text(g, o, 1, i1, sizeof i1); snprintf(out, cap, "x%u[%s]", o->index[0], i1); break;
     case OPD_CB: index_text(g, o, 1, i1, sizeof i1); snprintf(out, cap, "cb%u[%s]", o->index[0], i1); break;
@@ -994,6 +1003,9 @@ static void translate(gen *g, const instr *in) {
     case OP_CASE: line(g, "case %d:", (int)in->ops[0].value[0]); break;
     case OP_DEFAULT: line(g, "default:"); break;
     case OP_RET: line(g, "VX_RETURN;"); break;
+    case OP_EMIT: case OP_EMIT_STREAM: line(g, "VX_EMIT;"); break;                     // (stream 0: Metal rasterizes only one)
+    case OP_CUT: case OP_CUT_STREAM: line(g, "VX_CUT;"); break;
+    case OP_EMITTHENCUT: case OP_EMITTHENCUT_STREAM: line(g, "VX_EMIT; VX_CUT;"); break;
     case OP_RETC: { char c[800]; condition(g, in, &in->ops[0], c, sizeof c); line(g, "if (%s) VX_RETURN;", c); break; }
     case OP_DISCARD: { char c[800]; condition(g, in, &in->ops[0], c, sizeof c); line(g, "if (%s) discard_fragment();", c); break; }
     case OP_NOP: break;
@@ -1018,6 +1030,9 @@ static void declare(gen *g, uint32_t op, uint32_t token, reader *r, pool *pl) {
     operand o;
     switch (op) {
     case OP_DCL_TEMPS: g->temps = (int)next(r); break;
+    case OP_DCL_GS_INPUT_PRIMITIVE: g->gs_inprim = (token >> 11) & 0x3f; break;
+    case OP_DCL_GS_OUTPUT_TOPOLOGY: g->gs_topology = (token >> 11) & 0x3f; break;
+    case OP_DCL_MAX_OUTPUT_VERTEX_COUNT: g->gs_maxout = next(r); break;
     case OP_DCL_INDEXABLE_TEMP: {
         uint32_t reg = next(r), size = next(r);
         next(r);                                              // components
@@ -1159,23 +1174,122 @@ static void locals(gen *g, text *t) {
     for (int i = 0; i < g->nxt; i++) put(t, "    float4 x%u[%u];\n", g->xt[i].reg, g->xt[i].size);
 }
 
+static void preamble(gen *g, text *t) {
+    put(t, "#include <metal_stdlib>\nusing namespace metal;\n\n");
+    if (g->sh->uav_counters)
+        put(t, "struct VxCounters { device atomic_uint *c[8]; };\n#define vx_counter(u) ((*reinterpret_cast<constant VxCounters *>(vx_sizes + 32)).c[u])\n\n");
+    if (g->uses_msad)
+        put(t, "template <typename T> T vx_msad(T r, T s, T a) {\n"
+               "    for (uint i = 0; i < 32; i += 8) { T rb = (r >> i) & 0xffu, sb = (s >> i) & 0xffu; a += select(T(0u), absdiff(rb, sb), rb != 0u); }\n"
+               "    return a;\n}\n\n");
+    if (g->icb_n) {
+        put(t, "constant uint4 icb_bits[%u] = {", g->icb_n / 4);
+        for (uint32_t i = 0; i + 3 < g->icb_n; i += 4)
+            put(t, "%s\n    uint4(0x%xu, 0x%xu, 0x%xu, 0x%xu)", i ? "," : "", g->icb[i], g->icb[i + 1], g->icb[i + 2], g->icb[i + 3]);
+        put(t, "\n};\n#define icb reinterpret_cast<constant float4 *>(icb_bits)\n\n");
+    }
+}
+static int out_regs(const gen *g) { int n = 0; for (int r = 0; r < 32; r++) if (g->out_decl[r]) n = r + 1; return n; }
+
+// The vertex shader as a kernel, for draws with a geometry shader: thread (x, y) is vertex x of instance y; its
+// outputs go to vx_vs_out, out_regs float4s per vertex. vx_vp[0]: vertices, first vertex, base instance;
+// vx_vp[1]: indices (0 none, 1 16-bit, 2 32-bit), first index, base vertex (the index buffer at DXBC_GS_INDEX).
+static char *compose_vs_kernel(gen *g) {
+    dxbc_shader *sh = g->sh;
+    text t = { 0 };
+    int n = out_regs(g), has_in = 0;
+    preamble(g, &t);
+    put(&t, "struct VxIn {\n");
+    for (int r = 0; r < 32; r++)
+        if (g->in_decl[r] && !g->in_sv[r]) { put(&t, "    %s v%d [[attribute(%d)]];\n", vec_type(component_type(sh->inputs, sh->ninputs, (uint32_t)r)), r, r); has_in = 1; }
+    put(&t, "};\n#define VX_RETURN do { device float4 *vx_o = vx_vs_out + (vx_tid.y * vx_vp[0].x + vx_tid.x) * %d;", n ? n : 1);
+    for (int r = 0; r < n; r++) put(&t, g->out_decl[r] ? " vx_o[%d] = o%d;" : " vx_o[%d] = 0;", r, r);
+    put(&t, " return; } while (0)\n\n");
+    put(&t, "kernel void vx_main(%suint2 vx_tid [[thread_position_in_grid]], device float4 *vx_vs_out [[buffer(%d)]], constant uint4 *vx_vp [[buffer(%d)]], "
+            "const device uchar *vx_ib [[buffer(%d)]]", has_in ? "VxIn vin [[stage_in]], " : "", DXBC_GS_OUT, DXBC_VS_PARAMS, DXBC_GS_INDEX);
+    resource_params(g, &t);
+    put(&t, ") {\n    if (vx_tid.x >= vx_vp[0].x) return;\n");
+    put(&t, "    uint vx_vertex_id = vx_vp[1].x == 2 ? reinterpret_cast<const device uint *>(vx_ib)[vx_vp[1].y + vx_tid.x] + vx_vp[1].z :\n"
+            "                        vx_vp[1].x == 1 ? uint(reinterpret_cast<const device ushort *>(vx_ib)[vx_vp[1].y + vx_tid.x]) + vx_vp[1].z : vx_vp[0].y + vx_tid.x;\n");
+    put(&t, "    uint vx_base_instance = vx_vp[0].z, vx_instance_id = vx_base_instance + vx_tid.y;\n");
+    locals(g, &t);
+    for (int r = 0; r < 32; r++) {
+        if (g->out_decl[r]) put(&t, "    float4 o%d = 0;\n", r);
+        if (!g->in_decl[r]) continue;
+        uint32_t sv = g->in_sv[r];
+        int c = first_comp(g->in_mask[r]);
+        if (sv == 6) put(&t, "    float4 v%d = 0; v%d.%c = as_type<float>(vx_vertex_id);\n", r, r, CH[c]);
+        else if (sv == 8) put(&t, "    float4 v%d = 0; v%d.%c = as_type<float>(vx_instance_id - vx_base_instance);\n", r, r, CH[c]);
+        else if (sv) put(&t, "    float4 v%d = 0;\n", r);
+        else put(&t, "    float4 v%d = as_type<float4>(vin.v%d);\n", r, r);
+    }
+    put(&t, "%s    VX_RETURN;\n}\n", g->body.s ? g->body.s : "");
+    return t.s;
+}
+
+// A geometry shader as a kernel: thread (x, y) is input primitive x of instance y. Its vertices come from the
+// vertex kernel's outputs (VXV(vertex, register)); the triangle strips it emits become triangles, gs_max_tris per
+// primitive (the rest degenerate) of out_regs float4s per vertex. vx_gp[0]: primitives per instance, vertices
+// between primitives (a list's size, or 1 for strips), vertices per instance, the vertex kernel's out_regs.
+static char *compose_gs(gen *g, int maxtri) {
+    text t = { 0 };
+    int n = out_regs(g);
+    preamble(g, &t);
+    put(&t, "#define NOUT %d\n#define MAXTRI %d\n", n, maxtri);
+    put(&t, "#define VXV(k, r) vx_gs_in[(vx_first + (k)) * vx_gp[0].w + (r)]\n");
+    put(&t, "#define VX_EMIT do { float4 vx_c[NOUT] = {");
+    for (int r = 0; r < n; r++) put(&t, g->out_decl[r] ? "%s o%d" : "%s float4(0)", r ? "," : "", r);
+    put(&t, " }; \\\n    if (vx_n >= 2 && vx_tri < MAXTRI) { device float4 *vx_t = vx_dst + vx_tri * 3 * NOUT; bool vx_odd = (vx_n & 1) != 0; \\\n"
+            "        for (int vx_k = 0; vx_k < NOUT; vx_k++) { vx_t[vx_k] = vx_odd ? vx_s2[vx_k] : vx_s1[vx_k]; vx_t[NOUT + vx_k] = vx_odd ? vx_s1[vx_k] : vx_s2[vx_k]; vx_t[2 * NOUT + vx_k] = vx_c[vx_k]; } \\\n"
+            "        vx_tri++; } \\\n"
+            "    for (int vx_k = 0; vx_k < NOUT; vx_k++) { vx_s1[vx_k] = vx_s2[vx_k]; vx_s2[vx_k] = vx_c[vx_k]; } \\\n"
+            "    vx_n++; } while (0)\n");
+    put(&t, "#define VX_CUT vx_n = 0\n");
+    put(&t, "#define VX_RETURN do { for (uint vx_k = vx_tri * 3 * NOUT; vx_k < MAXTRI * 3 * NOUT; vx_k++) vx_dst[vx_k] = 0; return; } while (0)\n\n");
+    put(&t, "kernel void vx_main(uint2 vx_tid [[thread_position_in_grid]], const device float4 *vx_gs_in [[buffer(%d)]], device float4 *vx_gs_out [[buffer(%d)]], "
+            "constant uint4 *vx_gp [[buffer(%d)]]", DXBC_GS_IN, DXBC_GS_OUT, DXBC_GS_PARAMS);
+    resource_params(g, &t);
+    put(&t, ") {\n    if (vx_tid.x >= vx_gp[0].x) return;\n");
+    put(&t, "    uint vx_first = vx_tid.x * vx_gp[0].y + vx_tid.y * vx_gp[0].z;\n");
+    put(&t, "    device float4 *vx_dst = vx_gs_out + (vx_tid.y * vx_gp[0].x + vx_tid.x) * (MAXTRI * 3 * NOUT);\n");
+    put(&t, "    float4 vx_s1[NOUT], vx_s2[NOUT];\n    uint vx_n = 0, vx_tri = 0;\n");
+    put(&t, "    float vPrim = as_type<float>(vx_tid.x), vInstance = 0;\n");
+    locals(g, &t);
+    for (int r = 0; r < 32; r++) if (g->out_decl[r]) put(&t, "    float4 o%d = 0;\n", r);
+    put(&t, "%s    VX_RETURN;\n}\n", g->body.s ? g->body.s : "");
+    return t.s;
+}
+
+// The vertex function drawing a geometry kernel's triangles: vertex v is out_regs float4s at buffer(0).
+static char *compose_passthrough(gen *g) {
+    text t = { 0 };
+    int n = out_regs(g);
+    char finish[2048] = "";
+    size_t fk = 0;
+    put(&t, "#include <metal_stdlib>\nusing namespace metal;\n\nstruct VxOut {\n");
+    for (int r = 0; r < n; r++) {
+        if (!g->out_decl[r]) continue;
+        put(&t, g->out_sv[r] == 1 ? "    float4 o%d [[position]];\n" : "    float4 o%d [[user(r%d)]];\n", r, r);
+        fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%svx_p[%d]", fk ? ", " : "", r);
+    }
+    if (g->vp_reg >= 0) { put(&t, "    uint vx_viewport [[viewport_array_index]];\n"); fk += (size_t)snprintf(finish + fk, sizeof finish - fk, ", as_type<uint>(vx_p[%d].%c)", g->vp_reg, CH[g->vp_comp]); }
+    if (g->rt_reg >= 0) { put(&t, "    uint vx_layer [[render_target_array_index]];\n"); fk += (size_t)snprintf(finish + fk, sizeof finish - fk, ", as_type<uint>(vx_p[%d].%c)", g->rt_reg, CH[g->rt_comp]); }
+    if (g->clip_reg >= 0) {
+        int k = 0; char list[128] = ""; size_t lk = 0;
+        for (int c = 0; c < 4; c++) if (g->clip_mask & (1 << c)) { lk += (size_t)snprintf(list + lk, sizeof list - lk, "%svx_p[%d].%c", k ? ", " : "", g->clip_reg, CH[c]); k++; }
+        put(&t, "    float vx_clip [[clip_distance]] [%d];\n", k);
+        fk += (size_t)snprintf(finish + fk, sizeof finish - fk, ", {%s}", list);
+    }
+    put(&t, "};\n\nvertex VxOut vx_main(uint vx_vid [[vertex_id]], const device float4 *vx_v [[buffer(0)]]) {\n");
+    put(&t, "    const device float4 *vx_p = vx_v + vx_vid * %d;\n    return VxOut{%s};\n}\n", n ? n : 1, finish);
+    return t.s;
+}
+
 static char *compose(gen *g) {
     dxbc_shader *sh = g->sh;
     text t = { 0 };
     int vs = sh->type == DXBC_VERTEX, ps = sh->type == DXBC_PIXEL, cs = sh->type == DXBC_COMPUTE;
-    put(&t, "#include <metal_stdlib>\nusing namespace metal;\n\n");
-    if (g->sh->uav_counters)
-        put(&t, "struct VxCounters { device atomic_uint *c[8]; };\n#define vx_counter(u) ((*reinterpret_cast<constant VxCounters *>(vx_sizes + 32)).c[u])\n\n");
-    if (g->uses_msad)
-        put(&t, "template <typename T> T vx_msad(T r, T s, T a) {\n"
-                "    for (uint i = 0; i < 32; i += 8) { T rb = (r >> i) & 0xffu, sb = (s >> i) & 0xffu; a += select(T(0u), absdiff(rb, sb), rb != 0u); }\n"
-                "    return a;\n}\n\n");
-    if (g->icb_n) {
-        put(&t, "constant uint4 icb_bits[%u] = {", g->icb_n / 4);
-        for (uint32_t i = 0; i + 3 < g->icb_n; i += 4)
-            put(&t, "%s\n    uint4(0x%xu, 0x%xu, 0x%xu, 0x%xu)", i ? "," : "", g->icb[i], g->icb[i + 1], g->icb[i + 2], g->icb[i + 3]);
-        put(&t, "\n};\n#define icb reinterpret_cast<constant float4 *>(icb_bits)\n\n");
-    }
+    preamble(g, &t);
     if (cs) {
         put(&t, "#define VX_RETURN return\n\n");
         put(&t, "kernel void vx_main(uint3 vx_tid [[thread_position_in_grid]], uint3 vx_gid [[threadgroup_position_in_grid]], "
@@ -1304,6 +1418,7 @@ static int run(gen *g, const uint32_t *p) {
         }
         if ((op >= OP_DCL_RESOURCE && op <= OP_DCL_GLOBAL_FLAGS) || (op >= OP_DCL_THREAD_GROUP && op <= OP_DCL_RESOURCE_STRUCTURED))
             declare(g, op, token, &r, &pl);
+        else if (op == OP_DCL_GS_INSTANCE_COUNT) g->gs_instances = next(&r);
         else if (op >= 143 && op <= 154) { /* streams, interfaces, tessellation: later */ }
         else if (op == OP_CALL || op == OP_CALLC) {
             while (r.p < end && in.nops < 8) read_operand(&r, &pl, &in.ops[in.nops++]);
@@ -1346,13 +1461,14 @@ int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
     const uint32_t *tok = (const uint32_t *)prog;
     out->type = (int)(tok[0] >> 16); out->major = (int)((tok[0] >> 4) & 0xf); out->minor = (int)(tok[0] & 0xf);
     out->entry = "vx_main";
-    if (out->type != DXBC_VERTEX && out->type != DXBC_PIXEL && out->type != DXBC_COMPUTE) { snprintf(out->error, sizeof out->error, "shader type %d is not supported yet", out->type); return -1; }
+    if (out->type != DXBC_VERTEX && out->type != DXBC_PIXEL && out->type != DXBC_COMPUTE && out->type != DXBC_GEOMETRY) { snprintf(out->error, sizeof out->error, "shader type %d is not supported yet", out->type); return -1; }
     uint32_t count = tok[1];
     if (count * 4 > len) count = len / 4;
     gen g;
     memset(&g, 0, sizeof g);
     g.vp_reg = g.rt_reg = g.clip_reg = -1;
     g.sh = out;
+    g.gs = out->type == DXBC_GEOMETRY;
     // First pass: textures sampled or gathered with a comparison are depth textures in Metal.
     for (reader q = { tok + 2, tok + count, 0 }; q.p < q.end && !q.bad;) {
         const uint32_t *start = q.p;
@@ -1391,8 +1507,26 @@ int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
         free(g.body.s); free(g.icb);
         return -1;
     }
-    out->msl = compose(&g);
+    out->out_regs = out_regs(&g);
+    if (g.gs) {
+        // Input primitives: point, line, triangle, and with adjacency (6, 7); output: triangle strips (5).
+        out->gs_in_verts = g.gs_inprim == 1 ? 1 : g.gs_inprim == 2 ? 2 : g.gs_inprim == 3 ? 3 : g.gs_inprim == 6 ? 4 : g.gs_inprim == 7 ? 6 : 0;
+        out->gs_max_tris = g.gs_maxout > 2 ? (int)g.gs_maxout - 2 : 0;
+        out->gs_instances = g.gs_instances ? (int)g.gs_instances : 1;
+        const char *why = !out->gs_in_verts ? "its input primitive" : g.gs_topology != 5 ? "an output other than triangle strips" :
+                          !out->gs_max_tris ? "no triangles" : out->gs_instances > 1 ? "instancing" :
+                          (out->srv_buffers >> (DXBC_GS_PARAMS - DXBC_SRV_BUFFER_BASE)) ? "buffers at the slots the geometry path uses" : NULL;
+        if (why) { snprintf(out->error, sizeof out->error, "geometry shader with %s is not supported yet", why); free(g.body.s); free(g.icb); return -1; }
+        out->msl = compose_gs(&g, out->gs_max_tris);
+        out->msl_passthrough = compose_passthrough(&g);
+    } else {
+        out->msl = compose(&g);
+        if (out->type == DXBC_VERTEX) out->msl_kernel = compose_vs_kernel(&g);
+    }
     free(g.body.s); free(g.icb);
     return 0;
 }
-void dxbc_free(dxbc_shader *s) { free(s->msl); s->msl = NULL; }
+void dxbc_free(dxbc_shader *s) {
+    free(s->msl); free(s->msl_kernel); free(s->msl_passthrough);
+    s->msl = s->msl_kernel = s->msl_passthrough = NULL;
+}

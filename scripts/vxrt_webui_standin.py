@@ -9,7 +9,8 @@ that origin), where it opens its own mailbox and tells the game's mailbox it is
 
 This script does what the page does at start: opens the page's mailbox, waits until the game's mailbox is
 registered, and sends {"type": "ready"}; then it waits for the next registration (the game restarting) and does it
-again. The loading screens themselves are not shown.
+again (once per game: a second "ready" during a level load can leave the game paused). The loading screens
+themselves are not shown.
 
     vxrt_webui_standin.py [page mailbox] [game mailbox]      (default: hlvr/interstitials hlvr/mailbox)
 """
@@ -92,25 +93,32 @@ def recv_text(s):
             return data.decode(errors="replace")
 
 
+def wait_for(s, request, mailbox, message_id):
+    """Asks vrserver to tell when `mailbox` is registered (or gone) and waits for that answer; other messages
+    (the game's to the page: paths, loading screens) are logged and otherwise ignored, as the page shows nothing."""
+    message = {"type": request, "mailbox_name": mailbox, "returnAddress": PAGE, "message_id": message_id}
+    send_text(s, "mailbox_send web_server_mailbox " + json.dumps(message))
+    while True:
+        try:
+            reply = json.loads(recv_text(s))
+        except ValueError:
+            continue
+        if reply.get("message_id") == message_id:
+            return reply
+        log(f"message for the page: {json.dumps(reply)[:300]}")
+
+
 def serve(s):
     send_text(s, f"mailbox_open {PAGE}")
     message_id = 1
     while True:
-        request = {"type": "request_mailbox_registration_notification", "mailbox_name": GAME,
-                   "returnAddress": PAGE, "message_id": message_id}
-        send_text(s, "mailbox_send web_server_mailbox " + json.dumps(request))
-        while True:
-            try:
-                message = json.loads(recv_text(s))
-            except ValueError:
-                continue
-            if message.get("type") == "mailbox_registered" and message.get("message_id") == message_id:
-                break
+        wait_for(s, "request_mailbox_registration_notification", GAME, message_id)
         send_text(s, f"mailbox_send {GAME} " + json.dumps({"type": "ready"}))
         log(f"{GAME} is registered: told it {PAGE} is ready")
-        message_id += 1
-        time.sleep(30)                                     # the same game stays registered: a restarted one gets
-                                                           # its "ready" well within its minute
+        # Once per game: the next "ready" waits until this game's mailbox is gone (the game quit).
+        wait_for(s, "request_mailbox_unavailable_notification", GAME, message_id + 1)
+        log(f"{GAME} is gone")
+        message_id += 2
 
 
 def main():

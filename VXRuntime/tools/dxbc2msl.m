@@ -17,6 +17,15 @@ int main(int argc, char **argv) {
     NSError *err = nil;
     id<MTLLibrary> lib = [MTLCreateSystemDefaultDevice() newLibraryWithSource:@(sh.msl) options:nil error:&err];
     if (!lib) { fprintf(stderr, "%s: Metal: %s\n", argv[1], err.localizedDescription.UTF8String); return 1; }
+    // The variants of the geometry path: a vertex shader as a kernel, a geometry shader's pass-through.
+    const char *extra[2] = { sh.msl_kernel, sh.msl_passthrough };
+    for (int i = 0; i < 2; i++) {
+        if (!extra[i]) continue;
+        if (![MTLCreateSystemDefaultDevice() newLibraryWithSource:@(extra[i]) options:nil error:&err]) {
+            fprintf(stderr, "%s: Metal (%s): %s\n%s", argv[1], i ? "pass-through" : "kernel", err.localizedDescription.UTF8String, extra[i]);
+            return 1;
+        }
+    }
     fprintf(stderr, "%s: translated and compiled\n", argv[1]);
     return 0;
 }

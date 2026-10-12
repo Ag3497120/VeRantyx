@@ -13,6 +13,7 @@
 #include "shaders/tex_ps.h"
 #include "shaders/fullscreen_vs.h"
 #include "shaders/math_ps.h"
+#include "shaders/quad_gs.h"
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("check failed (line %d): %s\n", __LINE__, #c); failures++; } } while (0)
 static ID3D11Device *dev;
@@ -299,6 +300,41 @@ static void test_generate_mips(void) {
     ID3D11Texture2D_Release(s); ID3D11ShaderResourceView_Release(srv); ID3D11Texture2D_Release(t);
 }
 
+// A geometry shader: one point becomes a square (a strip of four), and after a cut a small triangle in the corner.
+static void test_geometry_shader(void) {
+    ID3D11RenderTargetView *rtv; ID3D11Texture2D *t = target(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, &rtv);
+    ID3D11GeometryShader *gs = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateGeometryShader(dev, quad_gs, sizeof quad_gs, NULL, &gs)));
+    float size[4] = { 0.25f, 0, 0, 0 };
+    ID3D11Buffer *cb = buffer(D3D11_BIND_CONSTANT_BUFFER, size, sizeof size);
+    float black[4] = { 0, 0, 0, 1 };
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, black);
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtv, NULL);
+    color_vertex v[1] = { { 0, 0, 0, 1, 0, 0, 1 } };
+    ID3D11Buffer *vb = buffer(D3D11_BIND_VERTEX_BUFFER, v, sizeof v);
+    UINT stride = sizeof v[0], offset = 0;
+    ID3D11DeviceContext_IASetInputLayout(ctx, color_layout);
+    ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &vb, &stride, &offset);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+    ID3D11DeviceContext_VSSetShader(ctx, color_vs_obj, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(ctx, gs, NULL, 0);
+    ID3D11DeviceContext_GSSetConstantBuffers(ctx, 0, 1, &cb);
+    ID3D11DeviceContext_PSSetShader(ctx, color_ps_obj, NULL, 0);
+    ID3D11DeviceContext_Draw(ctx, 1, 0);
+    ID3D11DeviceContext_GSSetShader(ctx, NULL, NULL, 0);
+    static UINT px[64 * 64];
+    readback(t, px, 4);
+    UINT centre = px[32 * 64 + 32], inside = px[26 * 64 + 26], outside = px[16 * 64 + 48], corner = px[1 * 64 + 1];
+    CHECK(R(centre) > 200 && G(centre) < 60 && B(centre) < 60);     // the square (red)
+    CHECK(R(inside) > 200);
+    CHECK(outside == 0xff000000u);                                   // beyond it: the clear colour
+    CHECK(B(corner) > 200 && R(corner) < 60);                        // the second strip (blue)
+    printf("  geometry shader: centre %06x, inside %06x, outside %06x, corner %06x\n", centre & 0xffffff, inside & 0xffffff, outside & 0xffffff, corner & 0xffffff);
+    ID3D11Buffer_Release(vb); ID3D11Buffer_Release(cb);
+    if (gs) ID3D11GeometryShader_Release(gs);
+    ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
+}
+
 int main(int argc, char **argv) {
     D3D_FEATURE_LEVEL level;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) { printf("draw: no device -> FAILED\n"); return 1; }
@@ -309,6 +345,7 @@ int main(int argc, char **argv) {
     test_math();
     test_depth_and_blend();
     test_generate_mips();
-    printf("draw: triangle, textured quad, shader math, depth, blending, per-draw constants, mips: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    test_geometry_shader();
+    printf("draw: triangle, textured quad, shader math, depth, blending, per-draw constants, mips, geometry shader: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }

@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { DXBC_PIXEL = 0, DXBC_VERTEX = 1, DXBC_COMPUTE = 5 };
+enum { DXBC_PIXEL = 0, DXBC_VERTEX = 1, DXBC_GEOMETRY = 2, DXBC_COMPUTE = 5 };
 
 // One element of an input or output signature.
 typedef struct {
@@ -34,6 +34,13 @@ typedef struct {
     int uses_sizes;                 // reads buffer sizes (bufinfo) or UAV counters from buffer(DXBC_SIZES_BUFFER)
     uint8_t uav_counters;           // u# with a hidden counter (append, consume, IncrementCounter)
     int writes_depth;               // a pixel shader writing oDepth
+    // Geometry shaders run as compute kernels (Metal has no such stage): the vertex shader before one runs as a
+    // kernel too (msl_kernel: its outputs to a buffer, out_regs float4s per vertex), then the geometry kernel turns
+    // each input primitive (gs_in_verts vertices) into up to gs_max_tris triangles of out_regs float4s per vertex,
+    // which msl_passthrough (a vertex function) hands to the pixel shader.
+    int out_regs;                   // output registers o0..o(n-1) (vertex and geometry shaders)
+    int gs_in_verts, gs_max_tris, gs_instances;
+    char *msl_kernel, *msl_passthrough;
     char error[256];
 } dxbc_shader;
 
@@ -44,6 +51,13 @@ enum { DXBC_UAV_TYPED = 1, DXBC_UAV_RAW, DXBC_UAV_STRUCTURED };
 #define DXBC_SRV_BUFFER_BASE 22
 #define DXBC_UAV_TEXTURE_BASE 64
 #define DXBC_SIZES_BUFFER 30
+// The geometry path's buffers (vertex kernel: its parameters, outputs, index buffer; geometry kernel: its
+// parameters, inputs, outputs).
+#define DXBC_GS_INDEX 27
+#define DXBC_GS_PARAMS 27
+#define DXBC_VS_PARAMS 28
+#define DXBC_GS_IN 28
+#define DXBC_GS_OUT 29
 typedef struct { uint32_t sizes[32]; uint64_t counters[8]; } dxbc_aux;   // bytes of u0..u7 then t0..t21; GPU addresses
 
 // Translates a DXBC container. Returns 0 and fills *out, or -1 with out->error set.
