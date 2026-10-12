@@ -70,7 +70,9 @@ struct d3d_device {
     d3d_object *adapter;             // IDXGIAdapter1, made on demand
     uint32_t flags, feature_level, max_latency;
     volatile uint64_t submitted, completed;   // command buffers committed, and the last one the GPU finished
+    int apple_family;                // Metal's Apple GPU family: 7 = M1, 8 = M2, 9 = M3/M4, 10 = M5 and later (0: other)
 };
+int d3d_apple_family(void *mtl_device);   // d3d11.m
 typedef struct {
     d3d_object base;                 // ID3D11Texture2D (or 1D, 3D)
     uint32_t desc[TD_COUNT];         // in the 2D layout, whatever the dimension

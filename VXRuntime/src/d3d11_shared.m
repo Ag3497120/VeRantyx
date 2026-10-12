@@ -253,9 +253,30 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
         else usleep(200);
     }
 }
+// The release itself: the key and owner are published and other processes waiting in AcquireSync are woken.
+static void publish_release(shared_slot *e, uint64_t key) {
+    __atomic_store_n(&e->key, (int64_t)key, __ATOMIC_RELEASE);
+    __atomic_store_n(&e->owner, 0, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&e->released, 1, __ATOMIC_RELEASE);
+    if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&e->released, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+}
+// ReleaseSync commits the work drawn so far and returns at once: the release is published when the GPU has
+// finished it (a completion handler on a command buffer queued behind it), so the CPU and GPU keep working in
+// parallel instead of stopping at every frame handed over. VXRT_SYNC_RELEASE=1 waits for the GPU instead.
 static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
     d3d_texture *t = keyed_of(this);
     if (!t->shared) return S_OK;
+    static int sync_release = -1;
+    if (sync_release < 0) sync_release = getenv("VXRT_SYNC_RELEASE") && atoi(getenv("VXRT_SYNC_RELEASE"));
+    shared_slot *slot_e = &table()->s[t->shared - 1];
+    if (!sync_release && !getenv("VXRT_SHARED_SNAPSHOT")) {
+        if (getenv("VXRT_TRACE_KEYED")) vx_log("keyed mutex slot %d: ReleaseSync(%llu) by %d, published when the GPU is done", t->shared - 1, (unsigned long long)key, (int)getpid());
+        d3d_flush(t->base.dev, 0);
+        id<MTLCommandBuffer> fence = [(__bridge id<MTLCommandQueue>)t->base.dev->queue commandBuffer];
+        [fence addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; publish_release(slot_e, key); }];
+        [fence commit];
+        return S_OK;
+    }
     d3d_flush(t->base.dev, 1);                                    // the other process sees what was drawn
     // VXRT_SHARED_SNAPSHOT=file.png (VXRT_SHARED_SNAPSHOT_AT=n, default 600): the n-th texture this process releases.
     // Or, with VXRT_SHARED_SNAPSHOT_AT=now, while the file <file.png>.now exists (every 30 releases; remove it after).
@@ -279,10 +300,7 @@ static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
     }
     shared_slot *e = &table()->s[t->shared - 1];
     if (getenv("VXRT_TRACE_KEYED")) vx_log("keyed mutex slot %d: ReleaseSync(%llu) by %d (owner was %d)", t->shared - 1, (unsigned long long)key, (int)getpid(), (int)e->owner);
-    __atomic_store_n(&e->key, (int64_t)key, __ATOMIC_RELEASE);
-    __atomic_store_n(&e->owner, 0, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&e->released, 1, __ATOMIC_RELEASE);
-    if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&e->released, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+    publish_release(e, key);
     return S_OK;
 }
 static WINAPI HRESULT keyed_get_device(void *this, const GUID *iid, void **out) {

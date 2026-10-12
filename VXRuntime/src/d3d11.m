@@ -627,6 +627,52 @@ static void upload_texture(d3d_context *c, d3d_texture *t, uint32_t sub, const u
     [blit endEncoding];
     if (own) [own commit];
 }
+// The newest Apple GPU family the device supports (MTLGPUFamilyApple7 = 1007 ... Apple10 = 1010; later ones are
+// probed too, so a newer chip reports its own number).
+int d3d_apple_family(void *mtl_device) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)mtl_device;
+    for (int f = 14; f >= 1; f--) if ([dev supportsFamily:(MTLGPUFamily)(1000 + f)]) return f;
+    return 0;
+}
+// Renamed buffers are recycled: a buffer replaced by UpdateSubresource or Map(DISCARD) goes into a queue for its
+// size, tagged with the command buffer that may still read it, and is handed out again once the GPU has finished
+// that command buffer (instead of a new Metal buffer for every update of a constant buffer).
+typedef struct { void *buf; uint64_t seq; } retired_buf;
+typedef struct { d3d_device *dev; size_t len; retired_buf q[256]; int head, count; } buf_bucket;
+static buf_bucket g_buckets[64];
+static int g_nbuckets;
+static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static buf_bucket *bucket_for(d3d_device *dev, size_t len, int create) {
+    for (int i = 0; i < g_nbuckets; i++) if (g_buckets[i].dev == dev && g_buckets[i].len == len) return &g_buckets[i];
+    if (!create || g_nbuckets == 64) return NULL;
+    buf_bucket *b = &g_buckets[g_nbuckets++];
+    b->dev = dev; b->len = len; b->head = b->count = 0;
+    return b;
+}
+static id<MTLBuffer> take_buffer(d3d_device *dev, size_t len) {
+    uint64_t done = __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE);
+    pthread_mutex_lock(&g_pool_lock);
+    buf_bucket *b = bucket_for(dev, len, 0);
+    void *ref = NULL;
+    if (b && b->count && b->q[b->head].seq <= done) { ref = b->q[b->head].buf; b->head = (b->head + 1) % 256; b->count--; }
+    pthread_mutex_unlock(&g_pool_lock);
+    if (ref) return CFBridgingRelease(ref);
+    return [(__bridge id<MTLDevice>)dev->mtl newBufferWithLength:len options:MTLResourceStorageModeShared];
+}
+static void retire_buffer(d3d_device *dev, void *ref) {         // takes over the reference
+    size_t len = ((__bridge id<MTLBuffer>)ref).length;
+    pthread_mutex_lock(&g_pool_lock);
+    buf_bucket *b = bucket_for(dev, len, 1);
+    void *drop = NULL;
+    if (!b) drop = ref;
+    else {
+        if (b->count == 256) { drop = b->q[b->head].buf; b->head = (b->head + 1) % 256; b->count--; }
+        b->q[(b->head + b->count) % 256] = (retired_buf){ ref, __atomic_load_n(&dev->submitted, __ATOMIC_ACQUIRE) + 1 };
+        b->count++;
+    }
+    pthread_mutex_unlock(&g_pool_lock);
+    if (drop) CFRelease(drop);
+}
 static WINAPI void ctx_update_subresource(void *this, d3d_object *dst, uint32_t sub, const uint32_t *box, const void *data, uint32_t row_pitch, uint32_t depth_pitch) {
     d3d_context *c = this;
     if (!dst || !data) return;
@@ -647,9 +693,12 @@ static WINAPI void ctx_update_subresource(void *this, d3d_object *dst, uint32_t 
         [blit endEncoding];
         return;
     }
-    id<MTLBuffer> fresh = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithBytes:old.contents length:old.length options:MTLResourceStorageModeShared];
+    int pooled = !(b->desc[2] & 8 /* BIND_SHADER_RESOURCE: views may hold the old buffer */);
+    id<MTLBuffer> fresh = pooled ? take_buffer(c->base.dev, old.length)
+                                 : [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:old.length options:MTLResourceStorageModeShared];
+    if (from || size < old.length) memcpy(fresh.contents, old.contents, old.length);   // a partial update keeps the rest
     memcpy((uint8_t *)fresh.contents + from, data, size);
-    CFBridgingRelease(b->mtl);
+    if (pooled) retire_buffer(c->base.dev, b->mtl); else CFRelease(b->mtl);
     b->mtl = (void *)CFBridgingRetain(fresh);
 }
 
@@ -666,8 +715,10 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
         if (type == 4 && buf->shared) {                          // shared: written in place (other processes hold it)
         } else if (type == 4) {                                 // WRITE_DISCARD: a fresh buffer, nothing to wait for
             id<MTLBuffer> old = (__bridge id<MTLBuffer>)buf->mtl;
-            id<MTLBuffer> fresh = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:old.length options:MTLResourceStorageModeShared];
-            CFBridgingRelease(buf->mtl);
+            int pooled = !(buf->desc[2] & 8);                   // views may hold a buffer bound as a shader resource
+            id<MTLBuffer> fresh = pooled ? take_buffer(c->base.dev, old.length)
+                                         : [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:old.length options:MTLResourceStorageModeShared];
+            if (pooled) retire_buffer(c->base.dev, buf->mtl); else CFRelease(buf->mtl);
             buf->mtl = (void *)CFBridgingRetain(fresh);
         } else if (type != 5) {                                  // READ/WRITE: what the GPU did must be finished
             d3d_flush(c->base.dev, 1);
@@ -963,6 +1014,11 @@ static WINAPI HRESULT D3D11CreateDevice(void *adapter, uint32_t driver, HANDLE s
     d->mtl = (void *)CFBridgingRetain(mtl);
     d->queue = (void *)CFBridgingRetain([mtl newCommandQueue]);
     d->flags = flags; d->feature_level = level; d->max_latency = 3;
+    d->apple_family = d3d_apple_family((__bridge void *)mtl);
+    static int told;
+    if (!told++) vx_log("Direct3D: %s, Apple GPU family %d%s", mtl.name.UTF8String, d->apple_family,
+                        d->apple_family >= 10 ? " (M5 generation or later)" : d->apple_family == 9 ? " (M3/M4 generation)" :
+                        d->apple_family == 8 ? " (M2 generation)" : d->apple_family == 7 ? " (M1 generation)" : "");
     d3d_context *c = d3d_alloc(sizeof *c, K_CONTEXT, g_context_vtbl, d);
     c->base.destroy = context_destroy;
     d->context = &c->base;

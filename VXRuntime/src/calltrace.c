@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "vx.h"
 
 #define MAX_TRACED 8192
@@ -17,7 +18,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 extern uint8_t vx_trace_stubs[];
 void vx_trace_return(void);
 
-typedef struct { uint64_t ret; int index; } frame;
+typedef struct { uint64_t ret; int index; uint64_t start; } frame;
 static __thread frame t_frames[1024];
 static __thread int t_depth;
 
@@ -63,7 +64,7 @@ WINAPI void *vx_trace_called(int index, uint64_t *ret) {
         vx_log("[%u] %s!%s(%#llx, %#llx, %#llx, %#llx) from %p", vx_current_tid(), t->dll, t->name,
                (unsigned long long)ret[-1], (unsigned long long)ret[-2], (unsigned long long)ret[-3], (unsigned long long)ret[-4], (void *)*ret);
         if (t_depth < 1024) {
-            t_frames[t_depth++] = (frame){ *ret, index };
+            t_frames[t_depth++] = (frame){ *ret, index, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) };
             *ret = (uint64_t)(uintptr_t)vx_trace_return;
         }
     }
@@ -72,6 +73,7 @@ WINAPI void *vx_trace_called(int index, uint64_t *ret) {
 WINAPI uint64_t vx_trace_returned(uint64_t result) {
     frame f = t_frames[--t_depth];
     DWORD err = vx_get_last_error();
-    vx_log("[%u]   %s = %#llx (last error %u)", vx_current_tid(), g_traced[f.index].name, (unsigned long long)result, err);
+    vx_log("[%u]   %s = %#llx (last error %u) %llu us", vx_current_tid(), g_traced[f.index].name, (unsigned long long)result, err,
+           (unsigned long long)((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - f.start) / 1000));
     return f.ret;
 }
