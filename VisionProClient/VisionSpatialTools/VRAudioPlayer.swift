@@ -100,12 +100,17 @@ final class VRAudioPlayer {
               let floatData = buffer.floatChannelData else { return }
         buffer.frameLength = AVAudioFrameCount(frames)
         if let data {
+            // enqueue() checked data.count == 20 + frames * channels * 2.
+            // Unaligned loads: the samples start 20 bytes into a buffer whose
+            // own alignment is not guaranteed.
             data.withUnsafeBytes { raw in
-                let samples = raw.baseAddress!.advanced(by: 20).assumingMemoryBound(to: Int16.self)
+                guard raw.count >= 20 + frames * channels * 2 else { return }
                 for channel in 0..<channels {
                     let out = floatData[channel]
                     for frame in 0..<frames {
-                        out[frame] = Float(Int16(littleEndian: samples[frame * channels + channel])) / 32768
+                        let offset = 20 + (frame * channels + channel) * 2
+                        let sample = Int16(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int16.self))
+                        out[frame] = Float(sample) / 32768
                     }
                 }
             }
@@ -270,8 +275,13 @@ final class VRAudioPlayer {
         }
     }
 
+    /// Little-endian read relative to the packet's own start (a Data slice
+    /// does not start at index 0), and 0 for a read past its end rather than
+    /// a crash on a short or malformed packet.
     private func readUInt32LE(_ data: Data, at offset: Int) -> UInt32 {
-        UInt32(data[offset]) | (UInt32(data[offset + 1]) << 8)
-            | (UInt32(data[offset + 2]) << 16) | (UInt32(data[offset + 3]) << 24)
+        guard offset >= 0, offset + 4 <= data.count else { return 0 }
+        let i = data.startIndex + offset
+        return UInt32(data[i]) | (UInt32(data[i + 1]) << 8)
+            | (UInt32(data[i + 2]) << 16) | (UInt32(data[i + 3]) << 24)
     }
 }

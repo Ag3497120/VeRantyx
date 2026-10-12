@@ -1031,6 +1031,196 @@
           }
         }
       }
+    },
+    "Play PC VR games from your Mac in Vision Pro": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MacのPC VRゲームをVision Proで遊べます"
+          }
+        }
+      }
+    },
+    "Receiving from your Mac": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Macから受信中"
+          }
+        }
+      }
+    },
+    "Waiting for your Mac": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Macを待っています"
+          }
+        }
+      }
+    },
+    "Received": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "受信"
+          }
+        }
+      }
+    },
+    "%lld fps": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld fps"
+          }
+        }
+      }
+    },
+    "%lld packets": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld パケット"
+          }
+        }
+      }
+    },
+    "How to start": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "始め方"
+          }
+        }
+      }
+    },
+    "Controls": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "操作方法"
+          }
+        }
+      }
+    },
+    "Settings": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "設定"
+          }
+        }
+      }
+    },
+    "Details": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "詳細"
+          }
+        }
+      }
+    },
+    "On your Mac, start VeRantyx (see the setup guide on GitHub: github.com/Ag3497120/VeRantyx).": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "MacでVeRantyxを起動します（手順はGitHubのセットアップガイドを参照：github.com/Ag3497120/VeRantyx）。"
+          }
+        }
+      }
+    },
+    "Keep this Vision Pro on the same Wi-Fi network as the Mac.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このVision ProをMacと同じWi-Fiにつないでおきます。"
+          }
+        }
+      }
+    },
+    "Press Start stereo VR. The game appears as soon as the Mac starts streaming.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "「ステレオVRを開始」を押します。Macが配信を始めるとゲームが表示されます。"
+          }
+        }
+      }
+    },
+    "To leave VR, press the Digital Crown. This window comes back.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VRを終えるにはDigital Crownを押します。この画面に戻ります。"
+          }
+        }
+      }
+    },
+    "Joy-Con": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Joy-Con"
+          }
+        }
+      }
+    },
+    "Hands only": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "手だけで遊ぶ"
+          }
+        }
+      }
+    },
+    "Pair each Joy-Con in Settings > Bluetooth. Use them separately (one per hand, each with its own motion sensors), or press L and R on both to join them into one controller. Hand tracking supplies where your hands are; the Joy-Con supply the buttons.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "「設定 > Bluetooth」でJoy-Conを1本ずつペアリングします。左右別々に使う（各手のモーションセンサーも使えます）か、両方のLとRを同時に押して1台にまとめます。手の位置はハンドトラッキングから、ボタンはJoy-Conから取ります。"
+          }
+        }
+      }
+    },
+    "ZL/ZR = trigger, L/R = grip (grab), sticks (with click), right A/B = A, right X/Y = B, left ↓/← = X, left ↑/→ = Y, −/+ = menu.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ZL/ZR＝トリガー、L/R＝グリップ（つかむ）、スティック（押し込み可）、右のA/B＝A、右のX/Y＝B、左の↓/←＝X、左の↑/→＝Y、−/＋＝メニュー。"
+          }
+        }
+      }
+    },
+    "Thumb+index pinch = trigger, curl three fingers = grip, thumb+ring = A/X, thumb+little = B/Y, thumb+middle pinch and move the hand = stick.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "親指と人差し指でつまむ＝トリガー、3本の指を曲げる＝グリップ、親指と薬指＝A/X、親指と小指＝B/Y、親指と中指でつまんで手を動かす＝スティック。"
+          }
+        }
+      }
     }
   }
 }
