@@ -4,6 +4,8 @@
 // programs fall back to WASAPI or XAudio2), WinINet (no connections), IME. Each does what it can honestly do
 // here, or fails the way Windows does when the thing is absent.
 #include "vx.h"
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -115,14 +117,26 @@ static WINAPI BOOL DosDateTimeToFileTime(uint16_t date, uint16_t tm, DWORD *ft) 
     return 1;
 }
 static WINAPI BOOL SetFileTime(HANDLE h, const void *c, const void *a, const void *w) { (void)c; (void)a; (void)w; return vx_handle_fd(h) >= 0; }
+// Another process's memory cannot be reached (crash reporters read it, and cope with a refusal); this process's is
+// copied with the kernel's checked copy, so an unmapped address fails instead of faulting.
+static int is_this_process(HANDLE p) {
+    if (p == (HANDLE)(intptr_t)-1) return 1;
+    DWORD (WINAPI *pid_of)(HANDLE) = (DWORD (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "GetProcessId");
+    return pid_of && pid_of(p) == (DWORD)getpid();
+}
 static WINAPI BOOL ReadProcessMemory(HANDLE p, const void *from, void *to, size_t n, size_t *got) {
-    (void)p;                                                    // this process only
-    memcpy(to, from, n);
-    if (got) *got = n;
+    if (got) *got = 0;
+    if (!is_this_process(p)) { vx_set_last_error(299 /* ERROR_PARTIAL_COPY */); return 0; }
+    mach_vm_size_t copied = 0;
+    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)(uintptr_t)from, n, (mach_vm_address_t)(uintptr_t)to, &copied) != KERN_SUCCESS) {
+        vx_set_last_error(299);
+        return 0;
+    }
+    if (got) *got = (size_t)copied;
     return 1;
 }
 static WINAPI size_t VirtualQueryEx(HANDLE p, const void *addr, void *mbi, size_t len) {
-    (void)p;
+    if (!is_this_process(p)) { vx_set_last_error(5); return 0; }
     size_t (WINAPI *query)(const void *, void *, size_t) = (size_t (WINAPI *)(const void *, void *, size_t))vx_find_export("kernel32.dll", "VirtualQuery");
     return query ? query(addr, mbi, len) : 0;
 }

@@ -111,6 +111,13 @@ int main(void) {
     char product[64]; cb = sizeof product;
     CHECK(RegGetValueA(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows NT\\CurrentVersion", "ProductName", RRF_RT_REG_SZ, NULL, product, &cb) == ERROR_SUCCESS);
 
+    // ReadProcessMemory: this process's memory is copied; an unmapped address fails instead of crashing.
+    {
+        static const char src[] = "process memory";
+        char dst[16] = { 0 }; SIZE_T got = 0;
+        CHECK(ReadProcessMemory(GetCurrentProcess(), src, dst, sizeof src, &got) && got == sizeof src && !strcmp(dst, src));
+        CHECK(!ReadProcessMemory(GetCurrentProcess(), (void *)0x10, dst, 4, &got) && GetLastError() == ERROR_PARTIAL_COPY);
+    }
     printf("files and registry: %d failed checks, windows reports \"%s\" -> %s\n", failures, product, failures ? "FAILED" : "ok");
     return failures;
 }
