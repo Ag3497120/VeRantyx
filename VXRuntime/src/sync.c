@@ -432,7 +432,9 @@ static WINAPI HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid) {
 
 // ---- events, mutexes, semaphores ----------------------------------------------------------------------------------
 // Makes a handle for a new object, or for the existing object of that name (ERROR_ALREADY_EXISTS).
+static const char *type_name(int t) { return t == OBJ_EVENT ? "event" : t == OBJ_MUTEX ? "mutex" : t == OBJ_SEMAPHORE ? "semaphore" : "object"; }
 static HANDLE create_named(vx_object *o, const char *name) {
+    if (vx_trace && name && *name) vx_log("create %s %s", type_name(o->type), name);
     pthread_mutex_lock(&g_lock);
     vx_object *existing = name && *name ? find_named(name, o->type) : NULL;
     int shared_existed = 0;
@@ -454,6 +456,7 @@ static HANDLE create_named(vx_object *o, const char *name) {
     return h;
 }
 static HANDLE open_named(const char *name, int type) {
+    if (vx_trace && name) vx_log("open %s %s", type_name(type), name);
     pthread_mutex_lock(&g_lock);
     vx_object *o = name ? find_named(name, type) : NULL;
     if (!o && name && *name && g_named_count < 1024) {             // another process's

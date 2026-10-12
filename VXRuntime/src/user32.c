@@ -472,6 +472,7 @@ static void set_title(vx_window *w, const char *t) { free(w->title); w->title = 
 static HANDLE create_window(DWORD exstyle, const char *class_name, const char *title, DWORD style, int x, int y, int cx, int cy,
                             HANDLE parent, HANDLE menu, HANDLE instance, void *params, const void *raw_title, const void *raw_class) {
     vx_class *c = find_class(class_name);
+    if (vx_trace) vx_log("CreateWindow \"%s\" class %s style %#x %dx%d", title ? title : "", (uintptr_t)class_name < 0x10000 ? "(atom)" : class_name, (unsigned)style, cx, cy);
     if (!c) { vx_set_last_error(1407 /* ERROR_CANNOT_FIND_WND_CLASS */); return NULL; }
     vx_window *w = calloc(1, sizeof *w);
     pthread_mutex_init(&w->lock, NULL);

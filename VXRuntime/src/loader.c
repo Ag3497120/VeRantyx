@@ -501,6 +501,7 @@ static vx_image *load_pe(const char *path, int is_main) {
 // ---- module API (kernel32) -----------------------------------------------------------------------------------------------
 #define LOAD_WITH_ALTERED_SEARCH_PATH 0x8
 static void *load_library(const char *name, DWORD flags) {
+    if (vx_trace) vx_log("LoadLibrary %s", name);
     pthread_mutex_lock(&g_loader_lock);
     vx_image *m = NULL;
     void *h = NULL;

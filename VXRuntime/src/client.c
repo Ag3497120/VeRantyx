@@ -435,7 +435,26 @@ static WINAPI BOOL inet_ok(void) { return 1; }
 static WINAPI BOOL AcceptEx(void) { vx_set_last_error(10045); return 0; }
 
 // ---- what the Steam client's own UI toolkit (vgui) and its child programs reach for --------------------------------------------
-static WINAPI int EnumFontFamiliesExA(HANDLE dc, void *lf, void *fn, intptr_t param, DWORD flags) { (void)dc; (void)lf; (void)fn; (void)param; (void)flags; return 1; }
+// Every face asked for "exists" (text is drawn with the system's fonts): the callback sees the request back once, as a
+// TrueType font. An empty face name lists one family.
+static int enum_fonts(void *lf, int wide, void *fn, intptr_t param) {
+    uint8_t font[92] = { 0 }, metrics[96] = { 0 };                 // LOGFONTW is the larger; TEXTMETRICW and more
+    size_t lf_size = wide ? 92 : 60, face = 28;
+    memcpy(font, lf, lf_size);
+    if (wide ? !((WCHAR *)(font + face))[0] : !font[face]) {
+        const char *def = "Arial";
+        if (wide) for (int i = 0; def[i]; i++) ((WCHAR *)(font + face))[i] = (WCHAR)def[i];
+        else memcpy(font + face, def, strlen(def) + 1);
+    }
+    int32_t *tm = (int32_t *)metrics;
+    int32_t h = *(int32_t *)font; if (h < 0) h = -h; if (!h) h = 16;
+    tm[0] = h; tm[1] = h * 4 / 5; tm[2] = h - tm[1]; tm[5] = h / 2; tm[6] = h;   // height, ascent, descent, avg, max width
+    tm[7] = 400;                                                   // weight
+    int (WINAPI *cb)(const void *, const void *, DWORD, intptr_t) = (int (WINAPI *)(const void *, const void *, DWORD, intptr_t))fn;
+    return cb(font, metrics, 4 /* TRUETYPE_FONTTYPE */, param);
+}
+static WINAPI int EnumFontFamiliesExA(HANDLE dc, void *lf, void *fn, intptr_t param, DWORD flags) { (void)dc; (void)flags; return enum_fonts(lf, 0, fn, param); }
+static WINAPI int EnumFontFamiliesExW(HANDLE dc, void *lf, void *fn, intptr_t param, DWORD flags) { (void)dc; (void)flags; return enum_fonts(lf, 1, fn, param); }
 static WINAPI int AddFontResourceExA(const char *name, DWORD fl, void *res) { (void)name; (void)fl; (void)res; return 1; }
 static WINAPI int AddFontResourceA(const char *name) { (void)name; return 1; }
 static WINAPI BOOL RemoveFontResourceA(const char *name) { (void)name; return 1; }
@@ -529,7 +548,7 @@ static const vx_export iphlpapi[] = {
 static const vx_export gdi32[] = {
     VX_EXPORT(AddFontMemResourceEx), VX_EXPORT(RemoveFontMemResourceEx), VX_EXPORT(CreateICW), VX_EXPORT(CreateICA),
     VX_EXPORT(GetBitmapBits), VX_EXPORT(GetICMProfileW), VX_EXPORT(SetBrushOrgEx), VX_EXPORT(EnumFontFamiliesExA),
-    { "EnumFontFamiliesExW", (void *)EnumFontFamiliesExA }, VX_EXPORT(AddFontResourceExA), VX_EXPORT(AddFontResourceA),
+    VX_EXPORT(EnumFontFamiliesExW), VX_EXPORT(AddFontResourceExA), VX_EXPORT(AddFontResourceA),
     { "AddFontResourceExW", (void *)AddFontResourceExA }, { "AddFontResourceW", (void *)AddFontResourceA }, VX_EXPORT(RemoveFontResourceA),
     { "RemoveFontResourceW", (void *)RemoveFontResourceA }, { "RemoveFontResourceExA", (void *)RemoveFontResourceA },
     VX_EXPORT(GetCharABCWidthsW), VX_EXPORT(Polyline), VX_EXPORT(SetRectRgn),
