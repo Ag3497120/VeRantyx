@@ -22,10 +22,22 @@
 vx_process vx_proc;
 int vx_trace;
 
+// One write per line (processes share the terminal). A process started by another vxrt process names itself.
 void vx_log(const char *fmt, ...) {
+    char line[2048];
+    int n;
+    if (getenv("VXRT_CHILD") && vx_proc.argv && vx_proc.argv[0]) {
+        const char *b = vx_proc.argv[0];
+        for (const char *c = b; *c; c++) if (*c == '\\' || *c == '/') b = c + 1;
+        n = snprintf(line, sizeof line, "[vxrt %.40s:%d] ", b, (int)getpid());
+    } else n = snprintf(line, sizeof line, "[vxrt] ");
     va_list ap; va_start(ap, fmt);
-    fputs("[vxrt] ", stderr); vfprintf(stderr, fmt, ap); fputc('\n', stderr);
+    n += vsnprintf(line + n, sizeof line - (size_t)n - 1, fmt, ap);
     va_end(ap);
+    if (n > (int)sizeof line - 2) n = (int)sizeof line - 2;
+    line[n++] = '\n';
+    fflush(stderr);
+    write(2, line, (size_t)n);
 }
 
 // ---- built-in module registry ------------------------------------------------------------------------------------
@@ -140,6 +152,12 @@ const vx_image *vx_image_at(uint64_t pc) {
         if (pc >= (uint64_t)m->base && pc < (uint64_t)m->base + m->size) return m;
     }
     return NULL;
+}
+// The loaded images, in load order (psapi's EnumProcessModules).
+int vx_image_list(const vx_image **out, int cap) {
+    int n = __atomic_load_n(&g_image_count, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n && i < cap; i++) out[i] = g_images[i];
+    return n;
 }
 static vx_image *image_by_base(const void *base) {
     for (int i = 0; i < g_image_count; i++) if (g_images[i]->base == base) return g_images[i];
@@ -470,6 +488,7 @@ static vx_image *load_pe(const char *path, int is_main) {
                 if (lookup[i] >> 63) { ordinal = (int)(lookup[i] & 0xffff); snprintf(label, sizeof label, "#%d", ordinal); }
                 else name = (const char *)base + (lookup[i] & 0x7fffffff) + 2;
                 void *fn = resolve(dll, name, ordinal, 0);
+                if (fn && !image_by_name(dll)) fn = vx_trace_wrap(dll, name ? name : label, fn);   // VXRT_TRACE_CALLS
                 if (!fn) { fn = make_stub(dll, name ? name : label); missing++; if (vx_trace) vx_log("missing %s!%s", dll, name ? name : label); }
                 iat[i] = (uint64_t)fn;
             }
@@ -577,6 +596,7 @@ static WINAPI void *GetProcAddress(void *module, const char *name) {
     snprintf(by_number, sizeof by_number, "#%d", ordinal);
     void *fn = m ? pe_export(m, ordinal ? NULL : name, ordinal, 0) : builtin ? vx_find_export((const char *)module, ordinal ? by_number : name) : NULL;
     pthread_mutex_unlock(&g_loader_lock);
+    if (fn && builtin) fn = vx_trace_wrap((const char *)module, ordinal ? by_number : name, fn);
     if (!fn) vx_set_last_error(m || builtin ? 127 /* ERROR_PROC_NOT_FOUND */ : 6 /* ERROR_INVALID_HANDLE */);
     if (!fn && vx_trace) vx_log("GetProcAddress(%s, %s) failed", m ? m->name : builtin ? (const char *)module : "?", ordinal ? by_number : name);
     return fn;
@@ -684,6 +704,7 @@ int main(int argc, char **argv, char **envp) {
     vx_system_init();
     vx_desktop_init();
     vx_services_init();
+    vx_client_init();
     vx_pipes_init();
     vx_register_module("kernel32.dll", loader_k32, sizeof loader_k32 / sizeof loader_k32[0]);
     vx_register_module("kernelbase.dll", loader_k32, sizeof loader_k32 / sizeof loader_k32[0]);

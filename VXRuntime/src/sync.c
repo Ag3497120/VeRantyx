@@ -972,6 +972,97 @@ static WINAPI BOOL SleepConditionVariableSRW(uint64_t *cv, void *l, DWORD ms, DW
     return woken;
 }
 
+// ---- fibers ---------------------------------------------------------------------------------------------------------------------
+// A fiber is a stack and the registers to resume it; SwitchToFiber swaps stacks on the same thread (context.S).
+// The fiber running on a thread is in its TEB (FiberData, TEB+0x20), but Windows code that reads it directly
+// (GetCurrentFiber, gs:0x20) would find macOS's QoS slot there instead; so ConvertThreadToFiber on a thread that
+// is a fiber already returns that fiber instead of failing (the programs seen read gs:0x20 only after such a
+// failure), and conversions are counted. Fiber-local storage stays per thread.
+typedef struct vx_fiber {
+    void *param;                     // first, as GetFiberData reads it
+    void *sp;                        // saved stack pointer while not running
+    uint8_t *stack, *stack_top;      // NULL for a converted thread
+    size_t stack_size;
+    void (WINAPI *start)(void *);
+    int converted;                   // ConvertThreadToFiber calls not undone yet
+} vx_fiber;
+#define TEB_FIBER_DATA 0x20
+void vx_fiber_switch(void **save_sp, void *new_sp);
+static vx_fiber **current_fiber_slot(void) { return (vx_fiber **)(vx_teb() + TEB_FIBER_DATA); }
+static WINAPI void *ConvertThreadToFiberEx(void *param, DWORD flags) {
+    (void)flags;
+    vx_fiber **cur = current_fiber_slot();
+    if (*cur) { (*cur)->converted++; return *cur; }
+    vx_fiber *f = calloc(1, sizeof *f);
+    f->param = param; f->converted = 1;
+    *cur = f;
+    return f;
+}
+static WINAPI void *ConvertThreadToFiber(void *param) { return ConvertThreadToFiberEx(param, 0); }
+static WINAPI BOOL ConvertFiberToThread(void) {
+    vx_fiber **cur = current_fiber_slot();
+    if (!*cur) { vx_set_last_error(1280 /* ERROR_ALREADY_THREAD */); return 0; }
+    if (--(*cur)->converted <= 0 && !(*cur)->stack) { free(*cur); *cur = NULL; }
+    return 1;
+}
+static WINAPI BOOL IsThreadAFiber(void) { return *current_fiber_slot() != NULL; }
+// Where a new fiber begins (returned into from vx_fiber_switch). A fiber whose start routine returns ends its
+// thread, as on Windows.
+static void fiber_begin(void) {
+    vx_fiber *f = *current_fiber_slot();
+    f->start(f->param);
+    ExitThread(0);
+}
+static WINAPI void *CreateFiberEx(uint64_t commit, uint64_t reserve, DWORD flags, void (WINAPI *start)(void *), void *param) {
+    (void)flags;
+    size_t page = (size_t)getpagesize(), size = reserve > commit ? reserve : commit;
+    if (size < 256 << 10) size = 256 << 10;                        // Windows rounds up to the image's stack reserve
+    size = (size + page - 1) / page * page;
+    uint8_t *stack = mmap(NULL, size + page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (stack == MAP_FAILED) { vx_set_last_error(8); return NULL; }
+    mprotect(stack, page, PROT_NONE);                              // a guard page below the stack
+    vx_fiber *f = calloc(1, sizeof *f);
+    f->param = param; f->start = start;
+    f->stack = stack; f->stack_size = size + page; f->stack_top = stack + size + page;
+    // The frame vx_fiber_switch pops: MXCSR and x87 control word, r15 r14 r13 r12 rbx rbp, then the return
+    // address (16-byte aligned, so fiber_begin starts with the alignment of a called function).
+    uint64_t *sp = (uint64_t *)(f->stack_top - 16);
+    *sp = (uint64_t)(uintptr_t)fiber_begin;
+    sp -= 7;
+    memset(sp, 0, 7 * sizeof *sp);
+    ((uint32_t *)sp)[0] = 0x1f80;                                  // MXCSR: all exceptions masked
+    ((uint32_t *)sp)[1] = 0x027f;                                  // x87: 53-bit precision, exceptions masked
+    f->sp = sp;
+    return f;
+}
+static WINAPI void *CreateFiber(uint64_t size, void (WINAPI *start)(void *), void *param) { return CreateFiberEx(size, 0, 0, start, param); }
+static WINAPI void SwitchToFiber(void *to) {
+    vx_fiber **cur = current_fiber_slot(), *from = *cur, *f = to;
+    if (!f || f == from) return;
+    if (!from) { vx_log("SwitchToFiber from a thread that is not a fiber"); abort(); }
+    uint8_t *teb = vx_teb();
+    if (f->stack) {
+        *(void **)(teb + 8) = f->stack_top;                        // NT_TIB StackBase, StackLimit
+        *(void **)(teb + 0x10) = f->stack;
+    }
+    *cur = f;
+    vx_fiber_switch(&from->sp, f->sp);
+    // Back on this fiber.
+    if (from->stack) { *(void **)(teb + 8) = from->stack_top; *(void **)(teb + 0x10) = from->stack; }
+    else {
+        pthread_t self = pthread_self();
+        uint8_t *top = pthread_get_stackaddr_np(self);
+        *(void **)(teb + 8) = top; *(void **)(teb + 0x10) = top - pthread_get_stacksize_np(self);
+    }
+}
+static WINAPI void DeleteFiber(void *fiber) {
+    vx_fiber *f = fiber;
+    if (!f) return;
+    if (f == *current_fiber_slot()) ExitThread(0);                 // deleting the running fiber ends the thread
+    if (f->stack) munmap(f->stack, f->stack_size);
+    free(f);
+}
+
 // ---- fiber-local storage --------------------------------------------------------------------------------------------------------
 // Without fibers, FLS is thread-local storage whose callbacks run when a thread ends (MSVC's C runtime keeps its
 // per-thread data here).
@@ -1243,6 +1334,8 @@ static const vx_export sync_k32[] = {
     VX_EXPORT(InitializeConditionVariable), VX_EXPORT(WakeConditionVariable), VX_EXPORT(WakeAllConditionVariable),
     VX_EXPORT(SleepConditionVariableCS), VX_EXPORT(SleepConditionVariableSRW),
     VX_EXPORT(InitOnceInitialize), VX_EXPORT(InitOnceExecuteOnce),
+    VX_EXPORT(ConvertThreadToFiber), VX_EXPORT(ConvertThreadToFiberEx), VX_EXPORT(ConvertFiberToThread), VX_EXPORT(IsThreadAFiber),
+    VX_EXPORT(CreateFiber), VX_EXPORT(CreateFiberEx), VX_EXPORT(SwitchToFiber), VX_EXPORT(DeleteFiber),
     VX_EXPORT(FlsAlloc), VX_EXPORT(FlsGetValue), VX_EXPORT(FlsSetValue), VX_EXPORT(FlsFree),
     VX_EXPORT(InitializeSListHead), VX_EXPORT(InterlockedPushEntrySList), VX_EXPORT(InterlockedPopEntrySList),
     VX_EXPORT(InterlockedFlushSList), VX_EXPORT(QueryDepthSList),

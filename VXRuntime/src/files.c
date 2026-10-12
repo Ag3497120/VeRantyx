@@ -178,9 +178,9 @@ void vx_windows_path(const char *unix_path, char *out, size_t cap) {
 // ---- current directory, special directories --------------------------------------------------------------------
 int vx_set_cwd(const char *win) {
     char full[MAX_PATH_LEN], unix_path[MAX_PATH_LEN];
-    if (!vx_full_path(win, full, sizeof full) || !vx_unix_path(full, unix_path, sizeof unix_path)) return 0;
+    if (!vx_full_path(win, full, sizeof full) || !vx_unix_path(full, unix_path, sizeof unix_path)) { if (vx_trace) vx_log("SetCurrentDirectory %s: bad path", win); return 0; }
     struct stat st;
-    if (stat(unix_path, &st)) { set_error_from_errno(); return 0; }
+    if (stat(unix_path, &st)) { if (vx_trace) vx_log("SetCurrentDirectory %s (%s): %s", win, unix_path, strerror(errno)); set_error_from_errno(); return 0; }
     if (!S_ISDIR(st.st_mode)) { vx_set_last_error(267 /* ERROR_DIRECTORY */); return 0; }
     size_t n = strlen(full);
     if (n > 3 && full[n - 1] == '\\') full[n - 1] = 0;

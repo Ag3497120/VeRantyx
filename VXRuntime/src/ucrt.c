@@ -270,6 +270,22 @@ static WINAPI WCHAR **_get_initial_wide_environment(void) {
     return wide;
 }
 static WINAPI WCHAR ***__p__wenviron(void) { static WCHAR **w; if (!w) w = _get_initial_wide_environment(); return &w; }
+// The wide argv, made once from the narrow one (wmain programs: _configure_wide_argv, then __p___wargv).
+static WCHAR **g_wargv;
+static WINAPI int _configure_wide_argv(int mode) {
+    (void)mode;
+    if (!g_wargv) {
+        WCHAR **w = calloc((size_t)vx_proc.argc + 1, sizeof *w);
+        for (int i = 0; i < vx_proc.argc; i++) w[i] = vx_utf16_dup(vx_proc.argv[i]);
+        g_wargv = w;
+    }
+    return 0;
+}
+static WINAPI WCHAR ***__p___wargv(void) { _configure_wide_argv(0); return &g_wargv; }
+static WINAPI int _initialize_wide_environment(void) { _get_initial_wide_environment(); return 0; }
+static WINAPI WCHAR *vx_wcscpy(WCHAR *d, const WCHAR *s) { WCHAR *r = d; while ((*d++ = *s++)) {} return r; }
+static WINAPI WCHAR *vx_wcscat(WCHAR *d, const WCHAR *s) { WCHAR *r = d; while (*d) d++; while ((*d++ = *s++)) {} return r; }
+static WINAPI WCHAR *vx_wcsrchr(const WCHAR *s, WCHAR c) { const WCHAR *last = NULL; do if (*s == c) last = s; while (*s++); return (WCHAR *)last; }
 static WINAPI unsigned char *vx_mbsstr(const unsigned char *h, const unsigned char *n) { return (unsigned char *)strstr((const char *)h, (const char *)n); }
 static WINAPI void _set_app_type(int t) { (void)t; }
 static WINAPI void *_set_invalid_parameter_handler(void *h) { (void)h; return NULL; }
@@ -1025,7 +1041,8 @@ static const vx_export ucrt[] = {
     { "_getcwd", (void *)vx_getcwd }, { "_chdir", (void *)vx_chdir },
     VX_EXPORT(__p__fmode), VX_EXPORT(__p__commode), VX_EXPORT(__p___argc), VX_EXPORT(__p___argv), VX_EXPORT(__p__environ),
     VX_EXPORT(_configure_narrow_argv), VX_EXPORT(_initialize_narrow_environment), VX_EXPORT(_get_initial_narrow_environment),
-    VX_EXPORT(_get_initial_wide_environment), VX_EXPORT(__p__wenviron), { "_mbsstr", (void *)vx_mbsstr }, VX_EXPORT(_set_app_type),
+    VX_EXPORT(_get_initial_wide_environment), VX_EXPORT(__p__wenviron), VX_EXPORT(_configure_wide_argv), VX_EXPORT(__p___wargv),
+    VX_EXPORT(_initialize_wide_environment), { "wcscpy", (void *)vx_wcscpy }, { "wcscat", (void *)vx_wcscat }, { "wcsrchr", (void *)vx_wcsrchr }, { "_mbsstr", (void *)vx_mbsstr }, VX_EXPORT(_set_app_type),
     VX_EXPORT(_set_invalid_parameter_handler), VX_EXPORT(__setusermatherr), VX_EXPORT(_configthreadlocale),
     VX_EXPORT(_set_new_mode), { "signal", (void *)vx_signal },
     VX_EXPORT(_initterm), VX_EXPORT(_initterm_e), VX_EXPORT(_crt_atexit), { "atexit", (void *)vx_atexit },

@@ -10,6 +10,8 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,30 +152,104 @@ static WINAPI int ws_getpeername(SOCKET s, void *addr, int *len) {
     return addr_out((struct sockaddr *)&a, l, addr, len) ? SOCKET_ERROR : 0;
 }
 
-// WSABUF arrays (length, pointer); overlapped I/O is not supported yet.
+// WSABUF arrays (length, pointer). Sends complete at once; an overlapped receive with nothing to read yet waits in
+// a background thread and completes the OVERLAPPED (its event, the socket's completion port) when data comes.
+// Completion routines are not supported.
 typedef struct { uint32_t len; char *buf; } WSABUF;
-static WINAPI int WSASend(SOCKET s, WSABUF *bufs, DWORD n, DWORD *sent, DWORD flags, void *ov, void *cr) {
-    if (ov || cr) { vx_set_last_error(10045); return SOCKET_ERROR; }
-    struct iovec iov[64];
+#define WSA_IO_PENDING 997
+static int load_iov(struct iovec *iov, const WSABUF *bufs, DWORD n) {
     if (n > 64) n = 64;
     for (DWORD i = 0; i < n; i++) iov[i] = (struct iovec){ bufs[i].buf, bufs[i].len };
-    struct msghdr m = { NULL, 0, iov, (int)n, NULL, 0, 0 };
+    return (int)n;
+}
+static int send_msg(SOCKET s, const WSABUF *bufs, DWORD n, DWORD *sent, DWORD flags, const void *to, int tolen, void *ov, void *cr) {
+    if (cr) { vx_set_last_error(10045); return SOCKET_ERROR; }
+    struct iovec iov[64];
+    struct sockaddr_storage a; socklen_t l = to ? addr_in(to, tolen, &a) : 0;
+    struct msghdr m = { to ? &a : NULL, l, iov, load_iov(iov, bufs, n), NULL, 0, 0 };
     ssize_t r = sendmsg(to_fd(s), &m, flags_in((int)flags));
-    if (r < 0) return fail();
+    if (r < 0) { int e = fail(); if (ov) vx_io_completed((HANDLE)s, ov, 0, vx_get_last_error()); return e; }
     if (sent) *sent = (DWORD)r;
+    if (ov) vx_io_completed((HANDLE)s, ov, (DWORD)r, 0);
     return 0;
 }
-static WINAPI int WSARecv(SOCKET s, WSABUF *bufs, DWORD n, DWORD *got, DWORD *flags, void *ov, void *cr) {
-    if (ov || cr) { vx_set_last_error(10045); return SOCKET_ERROR; }
+typedef struct { SOCKET s; struct iovec iov[64]; int n; void *ov; void *from; int *fromlen; int flags; } pending_recv;
+static ssize_t recv_now(SOCKET s, struct iovec *iov, int n, int flags, void *from, int *fromlen) {
+    struct sockaddr_storage a; socklen_t l = sizeof a;
+    struct msghdr m = { from ? &a : NULL, from ? l : 0, iov, n, NULL, 0, 0 };
+    ssize_t r = recvmsg(to_fd(s), &m, flags);
+    if (r >= 0 && from && fromlen) addr_out((struct sockaddr *)&a, m.msg_namelen, from, fromlen);
+    return r;
+}
+static void *recv_in_background(void *arg) {
+    pending_recv *p = arg;
+    struct pollfd w = { to_fd(p->s), POLLIN, 0 };
+    ssize_t r = -1;
+    DWORD err = 995;                                               // ERROR_OPERATION_ABORTED: the socket was closed
+    for (;;) {
+        int k = poll(&w, 1, 1000);
+        if (k < 0 && errno == EINTR) continue;
+        if (k < 0 || (w.revents & POLLNVAL)) break;
+        if (k == 0) { if (fcntl(w.fd, F_GETFD) < 0) break; continue; }
+        r = recv_now(p->s, p->iov, p->n, p->flags | MSG_DONTWAIT, p->from, p->fromlen);
+        if (r < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+        err = r < 0 ? (DWORD)wsa_error(errno) : 0;
+        break;
+    }
+    vx_io_completed((HANDLE)p->s, p->ov, r > 0 ? (DWORD)r : 0, err);
+    free(p);
+    return NULL;
+}
+static int recv_msg(SOCKET s, WSABUF *bufs, DWORD n, DWORD *got, DWORD *flags, void *from, int *fromlen, void *ov, void *cr) {
+    if (cr) { vx_set_last_error(10045); return SOCKET_ERROR; }
     struct iovec iov[64];
-    if (n > 64) n = 64;
-    for (DWORD i = 0; i < n; i++) iov[i] = (struct iovec){ bufs[i].buf, bufs[i].len };
-    struct msghdr m = { NULL, 0, iov, (int)n, NULL, 0, 0 };
-    ssize_t r = recvmsg(to_fd(s), &m, flags ? flags_in((int)*flags) : 0);
-    if (r < 0) return fail();
-    if (got) *got = (DWORD)r;
-    if (flags) *flags = 0;
-    return 0;
+    int count = load_iov(iov, bufs, n), f = flags ? flags_in((int)*flags) : 0;
+    if (!ov) {
+        ssize_t r = recv_now(s, iov, count, f, from, fromlen);
+        if (r < 0) return fail();
+        if (got) *got = (DWORD)r;
+        if (flags) *flags = 0;
+        return 0;
+    }
+    ssize_t r = recv_now(s, iov, count, f | MSG_DONTWAIT, from, fromlen);
+    if (r >= 0) {
+        if (got) *got = (DWORD)r;
+        if (flags) *flags = 0;
+        vx_io_completed((HANDLE)s, ov, (DWORD)r, 0);
+        return 0;
+    }
+    if (errno != EAGAIN) { int e = fail(); vx_io_completed((HANDLE)s, ov, 0, vx_get_last_error()); return e; }
+    pending_recv *p = calloc(1, sizeof *p);
+    p->s = s; memcpy(p->iov, iov, sizeof iov); p->n = count; p->ov = ov; p->from = from; p->fromlen = fromlen; p->flags = f;
+    *(uint64_t *)ov = 0x103;                                       // STATUS_PENDING; the event is reset as the I/O starts
+    HANDLE event = (HANDLE)((uintptr_t)*(HANDLE *)((uint8_t *)ov + 24) & ~(uintptr_t)1);
+    if (event) {
+        BOOL (WINAPI *reset)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "ResetEvent");
+        reset(event);
+    }
+    pthread_t t; pthread_attr_t at;
+    pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED); pthread_attr_setstacksize(&at, 128 << 10);
+    pthread_create(&t, &at, recv_in_background, p);
+    pthread_attr_destroy(&at);
+    vx_set_last_error(WSA_IO_PENDING);
+    return SOCKET_ERROR;
+}
+static WINAPI int WSASend(SOCKET s, WSABUF *bufs, DWORD n, DWORD *sent, DWORD flags, void *ov, void *cr) {
+    return send_msg(s, bufs, n, sent, flags, NULL, 0, ov, cr);
+}
+static WINAPI int WSASendTo(SOCKET s, WSABUF *bufs, DWORD n, DWORD *sent, DWORD flags, const void *to, int tolen, void *ov, void *cr) {
+    return send_msg(s, bufs, n, sent, flags, to, tolen, ov, cr);
+}
+static WINAPI int WSARecv(SOCKET s, WSABUF *bufs, DWORD n, DWORD *got, DWORD *flags, void *ov, void *cr) {
+    return recv_msg(s, bufs, n, got, flags, NULL, NULL, ov, cr);
+}
+static WINAPI int WSARecvFrom(SOCKET s, WSABUF *bufs, DWORD n, DWORD *got, DWORD *flags, void *from, int *fromlen, void *ov, void *cr) {
+    return recv_msg(s, bufs, n, got, flags, from, fromlen, ov, cr);
+}
+// GetAcceptExSockaddrs (wsock32 #1142): AcceptEx is not offered, so there is never anything to take apart.
+static WINAPI void GetAcceptExSockaddrs(void *buf, DWORD data, DWORD local_len, DWORD remote_len, void **local, int *llen, void **remote, int *rlen) {
+    (void)buf; (void)data; (void)local_len; (void)remote_len;
+    if (local) *local = NULL; if (llen) *llen = 0; if (remote) *remote = NULL; if (rlen) *rlen = 0;
 }
 
 // ---- options and modes -------------------------------------------------------------------------------------------------------
@@ -230,6 +306,83 @@ static WINAPI int ioctlsocket(SOCKET s, LONG cmd, uint32_t *arg) {
     }
     vx_set_last_error(10045);
     return SOCKET_ERROR;
+}
+// Extension functions, by GUID: ConnectEx (a connection that completes like overlapped I/O) and DisconnectEx.
+typedef struct { SOCKET s; struct sockaddr_storage a; socklen_t l; const char *send; DWORD send_len; void *ov; } pending_connect;
+static void *connect_in_background(void *arg) {
+    pending_connect *p = arg;
+    int fd = to_fd(p->s), r, err = 0;
+    do r = connect(fd, (struct sockaddr *)&p->a, p->l); while (r < 0 && errno == EINTR);
+    if (r < 0 && (errno == EINPROGRESS || errno == EALREADY)) {    // a non-blocking socket: wait until it is writable
+        struct pollfd w = { fd, POLLOUT, 0 };
+        while (poll(&w, 1, -1) < 0 && errno == EINTR) {}
+        socklen_t el = sizeof err;
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+    } else if (r < 0) err = errno;
+    DWORD sent = 0;
+    if (!err && p->send && p->send_len) {
+        ssize_t n = send(fd, p->send, p->send_len, 0);
+        if (n < 0) err = errno; else sent = (DWORD)n;
+    }
+    vx_io_completed((HANDLE)p->s, p->ov, sent, err ? (DWORD)wsa_error(err) : 0);
+    free(p);
+    return NULL;
+}
+static WINAPI BOOL ConnectEx(SOCKET s, const void *name, int len, const char *send, DWORD send_len, DWORD *sent, void *ov) {
+    if (!ov) { vx_set_last_error(87); return 0; }
+    pending_connect *p = calloc(1, sizeof *p);
+    p->s = s; p->l = addr_in(name, len, &p->a); p->send = send; p->send_len = send_len; p->ov = ov;
+    if (sent) *sent = 0;
+    *(uint64_t *)ov = 0x103;
+    HANDLE event = (HANDLE)((uintptr_t)*(HANDLE *)((uint8_t *)ov + 24) & ~(uintptr_t)1);
+    if (event) {
+        BOOL (WINAPI *reset)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "ResetEvent");
+        reset(event);
+    }
+    pthread_t t; pthread_attr_t at;
+    pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED); pthread_attr_setstacksize(&at, 128 << 10);
+    pthread_create(&t, &at, connect_in_background, p);
+    pthread_attr_destroy(&at);
+    vx_set_last_error(WSA_IO_PENDING);
+    return 0;
+}
+static WINAPI BOOL DisconnectEx(SOCKET s, void *ov, DWORD flags, DWORD reserved) {
+    (void)flags; (void)reserved;
+    shutdown(to_fd(s), SHUT_RDWR);
+    if (ov) vx_io_completed((HANDLE)s, ov, 0, 0);
+    return 1;
+}
+static void *extension_function(const uint8_t *guid) {
+    uint32_t d1; memcpy(&d1, guid, 4);
+    if (d1 == 0x25a207b9) return (void *)ConnectEx;
+    if (d1 == 0x7fda2e11) return (void *)DisconnectEx;
+    if (d1 == 0xb5367df2) return (void *)GetAcceptExSockaddrs;
+    return NULL;
+}
+#define SIO_GET_EXTENSION_FUNCTION_POINTER 0xC8000006u
+#define SIO_UDP_CONNRESET 0x9800000Cu
+#define SIO_KEEPALIVE_VALS 0x98000004u
+static WINAPI int WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_len, void *out, DWORD out_len, DWORD *got, void *ov, void *cr) {
+    (void)in_len; (void)out_len; (void)cr;
+    if (got) *got = 0;
+    int r = SOCKET_ERROR;
+    if (code == 0x8004667eu || code == 0x4004667fu) {                // FIONBIO, FIONREAD
+        r = ioctlsocket(s, (LONG)code, code == 0x8004667eu ? (uint32_t *)in : (uint32_t *)out);
+        if (!r && code == 0x4004667fu && got) *got = 4;
+    } else if (code == SIO_GET_EXTENSION_FUNCTION_POINTER && in && in_len >= 16 && out && out_len >= 8 && extension_function(in)) {
+        *(void **)out = extension_function(in);
+        if (got) *got = 8;
+        r = 0;
+    } else if (code == SIO_UDP_CONNRESET) r = 0;                       // macOS does not report ICMP resets on UDP reads
+    else if (code == SIO_KEEPALIVE_VALS) {
+        int on = in ? *(uint32_t *)in != 0 : 1;
+        r = setsockopt(to_fd(s), SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on) ? fail() : 0;
+    } else {
+        if (vx_trace) vx_log("WSAIoctl %#x is not supported (in %08x)", (unsigned)code, in && in_len >= 4 ? *(uint32_t *)in : 0);
+        vx_set_last_error(10045);                                      // WSAEOPNOTSUPP
+    }
+    if (!r && ov) vx_io_completed((HANDLE)s, ov, 0, 0);
+    return r;
 }
 
 // fd_set: a count, then up to 64 sockets.
@@ -346,7 +499,8 @@ static const vx_export ws2[] = {
     NET("socket", ws_socket), VX_EXPORT(WSASocketA), VX_EXPORT(WSASocketW), VX_EXPORT(closesocket), NET("bind", ws_bind),
     NET("connect", ws_connect), NET("listen", ws_listen), NET("accept", ws_accept), NET("send", ws_send), NET("recv", ws_recv),
     NET("sendto", ws_sendto), NET("recvfrom", ws_recvfrom), NET("shutdown", ws_shutdown), NET("getsockname", ws_getsockname),
-    NET("getpeername", ws_getpeername), VX_EXPORT(WSASend), VX_EXPORT(WSARecv), NET("setsockopt", ws_setsockopt),
+    NET("getpeername", ws_getpeername), VX_EXPORT(WSASend), VX_EXPORT(WSARecv), VX_EXPORT(WSASendTo), VX_EXPORT(WSARecvFrom),
+    VX_EXPORT(WSAIoctl), VX_EXPORT(GetAcceptExSockaddrs), NET("#1142", GetAcceptExSockaddrs), NET("setsockopt", ws_setsockopt),
     NET("getsockopt", ws_getsockopt), VX_EXPORT(ioctlsocket), NET("select", ws_select), VX_EXPORT(__WSAFDIsSet),
     NET("htons", ws_htons), NET("ntohs", ws_ntohs), NET("htonl", ws_htonl), NET("ntohl", ws_ntohl),
     NET("inet_addr", ws_inet_addr), NET("inet_ntoa", ws_inet_ntoa), NET("inet_pton", ws_inet_pton), NET("inet_ntop", ws_inet_ntop),

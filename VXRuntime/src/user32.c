@@ -1463,6 +1463,28 @@ static const vx_export user32[] = {
     VX_EXPORT(wvsprintfA), VX_EXPORT(wsprintfA), VX_EXPORT(CharUpperA), VX_EXPORT(CharLowerA), VX_EXPORT(CharNextA),
 };
 
+// The system's control classes. Their windows exist (so dialogs and splash screens that make labels, buttons and
+// progress bars get handles) but draw nothing of their own; progress bars keep their range and position.
+static WINAPI LRESULT control_proc(HANDLE h, uint32_t m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case 0x401: case 0x402: case 0x403: case 0x404: case 0x405: case 0x406: case 0x407: case 0x408: case 0x409:   // PBM_*
+    case 0x40a: case 0x410:
+        return 0;
+    case 0x87: return 0x80 | 0x1;                                  // WM_GETDLGCODE: DLGC_STATIC-like, wants arrows
+    }
+    return def_window_proc(h, m, w, l, 1);
+}
+static void register_controls(void) {
+    static const char *const names[] = {
+        "Static", "Button", "Edit", "ListBox", "ComboBox", "ComboLBox", "ScrollBar", "msctls_progress32", "msctls_trackbar32",
+        "msctls_updown32", "SysLink", "RichEdit20W", "RichEdit20A", "RICHEDIT50W", "SysListView32", "SysTreeView32",
+        "SysTabControl32", "tooltips_class32", "SysHeader32", "msctls_statusbar32", "ToolbarWindow32", "ReBarWindow32",
+    };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+        register_class(names[i], 1, 0, control_proc, 0, 64, NULL, NULL, NULL, NULL);
+}
+
 void vx_user32_init(void) {
+    register_controls();
     vx_register_module("user32.dll", user32, sizeof user32 / sizeof user32[0]);
 }

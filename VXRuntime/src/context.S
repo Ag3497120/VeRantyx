@@ -287,3 +287,85 @@ _vx_longjmp:
     .globl _vx_chkstk
 _vx_chkstk:
     ret
+
+// vx_fiber_switch(void **save_sp, void *new_sp) (System V): keeps this side's callee-saved registers, MXCSR and
+// the x87 control word on its stack, saves the stack pointer in *save_sp, and resumes the other side. The
+// Windows-only callee-saved registers (rsi, rdi, xmm6-15) are kept by SwitchToFiber's own frame, which calls
+// this. A new fiber's stack is laid out as if it had called this, returning into its start routine.
+    .globl _vx_fiber_switch
+_vx_fiber_switch:
+    pushq %rbp
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    subq $8, %rsp
+    stmxcsr (%rsp)
+    fnstcw 4(%rsp)
+    movq %rsp, (%rdi)
+    movq %rsi, %rsp
+    ldmxcsr (%rsp)
+    fldcw 4(%rsp)
+    addq $8, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbx
+    popq %rbp
+    ret
+
+// ---- VXRT_TRACE_CALLS: a trampoline in front of each traced built-in function (calltrace.c) --------------------------------------
+// Stub i (16 bytes apart) puts i in r11 and jumps to vx_trace_enter, which keeps the argument registers, has
+// vx_trace_called log the call (and swap the return address for vx_trace_return), then jumps to the function.
+    .globl _vx_trace_stubs
+    .p2align 4
+_vx_trace_stubs:
+    .set stub_index, 0
+    .rept 8192
+    .p2align 4
+    .byte 0x41, 0xbb
+    .long stub_index
+    .byte 0xe9
+    .long _vx_trace_enter - (. + 4)
+    .set stub_index, stub_index + 1
+    .endr
+
+_vx_trace_enter:
+    pushq %rcx
+    pushq %rdx
+    pushq %r8
+    pushq %r9
+    subq $0x68, %rsp
+    movdqu %xmm0, 0x20(%rsp)
+    movdqu %xmm1, 0x30(%rsp)
+    movdqu %xmm2, 0x40(%rsp)
+    movdqu %xmm3, 0x50(%rsp)
+    movl %r11d, %ecx
+    leaq 0x88(%rsp), %rdx
+    callq _vx_trace_called
+    movq %rax, %r11
+    movdqu 0x20(%rsp), %xmm0
+    movdqu 0x30(%rsp), %xmm1
+    movdqu 0x40(%rsp), %xmm2
+    movdqu 0x50(%rsp), %xmm3
+    addq $0x68, %rsp
+    popq %r9
+    popq %r8
+    popq %rdx
+    popq %rcx
+    jmpq *%r11
+
+    .globl _vx_trace_return
+_vx_trace_return:
+    subq $0x40, %rsp
+    movq %rax, 0x20(%rsp)
+    movdqu %xmm0, 0x30(%rsp)
+    movq %rax, %rcx
+    callq _vx_trace_returned
+    movq %rax, %r11
+    movq 0x20(%rsp), %rax
+    movdqu 0x30(%rsp), %xmm0
+    addq $0x40, %rsp
+    jmpq *%r11

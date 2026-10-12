@@ -331,6 +331,7 @@ static char **environment_from_block(const void *block, int wide) {
         if (n + 2 >= cap) env = realloc(env, (size_t)(cap *= 2) * sizeof *env);
         env[n++] = strdup(*e);
     }
+    if (!getenv("VXRT_CHILD")) env[n++] = strdup("VXRT_CHILD=1");   // its log lines say which process they are from
     env[n] = NULL;
     return env;
 }

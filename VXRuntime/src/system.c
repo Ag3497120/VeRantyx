@@ -438,12 +438,52 @@ static WINAPI BOOL toolhelp_none(HANDLE h, void *entry) { (void)h; (void)entry; 
 // ---- security: the process token can be opened; its information is not available ----------------------------------------
 static WINAPI BOOL OpenProcessToken(HANDLE p, DWORD access, HANDLE *out) { (void)p; (void)access; *out = (HANDLE)(intptr_t)-4; return 1; }
 static WINAPI BOOL OpenThreadToken(HANDLE t, DWORD access, BOOL self, HANDLE *out) { (void)t; (void)access; (void)self; *out = NULL; vx_set_last_error(1008); return 0; }
+// The token describes one ordinary user: S-1-5-21-1000-1000-1000-1001, in Everyone, medium integrity, not elevated.
+// Each answer is laid out as Windows does (pointers into the same buffer); a buffer too small says how much is needed.
+static size_t put_sid(uint8_t *p, const uint32_t *sub, int n, uint8_t authority) {
+    p[0] = 1; p[1] = (uint8_t)n; memset(p + 2, 0, 5); p[7] = authority;
+    memcpy(p + 8, sub, 4 * (size_t)n);
+    return 8 + 4 * (size_t)n;
+}
+static const uint32_t user_sub[] = { 21, 1000, 1000, 1000, 1001 }, everyone_sub[] = { 0 }, medium_sub[] = { 8192 };
 static WINAPI BOOL GetTokenInformation(HANDLE t, int cls, void *out, DWORD size, DWORD *ret) {
     (void)t;
-    if (cls == 20 && size >= 4) { *(DWORD *)out = 0; if (ret) *ret = 4; return 1; }   // TokenElevation: not elevated
-    if (ret) *ret = 0;
-    vx_set_last_error(87);
-    return 0;
+    uint8_t buf[256] = { 0 };
+    size_t n;
+    switch (cls) {
+    case 1: case 4: case 5:                                        // TokenUser (SID_AND_ATTRIBUTES), TokenOwner, TokenPrimaryGroup (PSID)
+        n = (cls == 1 ? 16 : 8);
+        n += put_sid(buf + n, user_sub, 5, 5);
+        break;
+    case 2:                                                        // TokenGroups: Everyone
+        *(DWORD *)buf = 1;
+        *(DWORD *)(buf + 16) = 7;                                  // SE_GROUP_MANDATORY | ENABLED_BY_DEFAULT | ENABLED
+        n = 24 + put_sid(buf + 24, everyone_sub, 1, 1);
+        *(void **)(buf + 8) = NULL;                                // patched below, once the destination is known
+        break;
+    case 6: case 31: n = 8; break;                                 // TokenDefaultDacl (no DACL), TokenAppContainerSid (none)
+    case 8: *(DWORD *)buf = 1; n = 4; break;                       // TokenType: TokenPrimary
+    case 10: n = 56; break;                                        // TokenStatistics
+    case 12: *(DWORD *)buf = 1; n = 4; break;                      // TokenSessionId
+    case 18: *(DWORD *)buf = 1; n = 4; break;                      // TokenElevationType: TokenElevationTypeDefault
+    case 20: case 29: case 9: n = 4; break;                        // TokenElevation, TokenIsAppContainer, TokenImpersonationLevel: 0
+    case 25:                                                       // TokenIntegrityLevel: TOKEN_MANDATORY_LABEL, medium
+        *(DWORD *)(buf + 8) = 0x20;                                // SE_GROUP_INTEGRITY
+        n = 16 + put_sid(buf + 16, medium_sub, 1, 16);
+        break;
+    default:
+        if (ret) *ret = 0;
+        vx_set_last_error(87);
+        return 0;
+    }
+    if (ret) *ret = (DWORD)n;
+    if (!out || size < n) { vx_set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */); return 0; }
+    memcpy(out, buf, n);
+    uint8_t *o = out;
+    if (cls == 1 || cls == 4 || cls == 5) *(void **)o = o + (cls == 1 ? 16 : 8);
+    if (cls == 2) *(void **)(o + 8) = o + 24;
+    if (cls == 25) *(void **)o = o + 16;
+    return 1;
 }
 static WINAPI DWORD *GetSidSubAuthority(void *sid, DWORD i) { return (DWORD *)((uint8_t *)sid + 8 + 4 * i); }
 static WINAPI uint8_t *GetSidSubAuthorityCount(void *sid) { return (uint8_t *)sid + 1; }
@@ -506,6 +546,29 @@ static WINAPI LONG SHGetFolderPathA(void *wnd, int csidl, HANDLE token, DWORD fl
     vx_return_string_a(p, out, 260);
     return 0;
 }
+// Known folders (Vista's GUIDs for the same places); the path is CoTaskMemAlloc'd (malloc, as com.c's).
+static WINAPI LONG SHGetKnownFolderPath(const uint8_t *id, DWORD flags, HANDLE token, WCHAR **out) {
+    (void)flags; (void)token;
+    static const struct { uint32_t d1; uint16_t d2, d3; int csidl; } known[] = {
+        { 0x3eb685db, 0x65f9, 0x4cf6, 0x1a }, { 0xf1b32785, 0x6fba, 0x4fcf, 0x1c }, { 0xfdd39ad0, 0x238f, 0x46af, 0x05 },
+        { 0x62ab5d82, 0xfdc1, 0x4dc3, 0x23 }, { 0x5e6c858f, 0x0e22, 0x4760, 0x28 }, { 0xf38bf404, 0x1d43, 0x42f2, 0x24 },
+        { 0x1ac14e77, 0x02e7, 0x4e5d, 0x25 }, { 0x905e63b6, 0xc1bf, 0x494e, 0x26 }, { 0x7c5a40ef, 0xa0fb, 0x4bfc, 0x2a },
+        { 0xb4bfcc3a, 0xdb2c, 0x424c, 0x10 }, { 0xed4824af, 0xdce4, 0x45a8, 0x2e },
+    };
+    uint32_t d1; uint16_t d2, d3;
+    memcpy(&d1, id, 4); memcpy(&d2, id + 4, 2); memcpy(&d3, id + 6, 2);
+    const char *p = NULL;
+    for (size_t i = 0; i < sizeof known / sizeof known[0] && !p; i++)
+        if (known[i].d1 == d1 && known[i].d2 == d2 && known[i].d3 == d3) p = folder_path(known[i].csidl);
+    if (d1 == 0xa520a1a4 && d2 == 0x1780) p = "C:\\users\\vxrt\\AppData\\LocalLow";
+    if (d1 == 0x4c5c32ff && d2 == 0xbb9d) p = "C:\\users\\vxrt\\Saved Games";
+    if (out) *out = NULL;
+    if (!p) return (LONG)0x80070002;                               // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+    make_folder(p);
+    WCHAR *w = vx_utf16_dup(p);
+    if (out) *out = w; else free(w);
+    return 0;
+}
 static WINAPI BOOL SHGetSpecialFolderPathW(void *wnd, WCHAR *out, int csidl, BOOL create) { (void)create; return SHGetFolderPathW(wnd, csidl, NULL, 0, out) == 0; }
 static WINAPI BOOL SHGetSpecialFolderPathA(void *wnd, char *out, int csidl, BOOL create) { (void)create; return SHGetFolderPathA(wnd, csidl, NULL, 0, out) == 0; }
 
@@ -513,10 +576,18 @@ static WINAPI BOOL SHGetSpecialFolderPathA(void *wnd, char *out, int csidl, BOOL
 static WINAPI DWORD NtQuerySystemInformation(int cls, void *out, DWORD size, DWORD *ret) { (void)cls; (void)out; (void)size; if (ret) *ret = 0; return STATUS_NOT_IMPLEMENTED; }
 static WINAPI DWORD NtQueryInformationProcess(HANDLE p, int cls, void *out, DWORD size, DWORD *ret) { (void)p; (void)cls; (void)out; (void)size; if (ret) *ret = 0; return STATUS_NOT_IMPLEMENTED; }
 static WINAPI DWORD NtQueryInformationThread(HANDLE t, int cls, void *out, DWORD size, DWORD *ret) { (void)t; (void)cls; (void)out; (void)size; if (ret) *ret = 0; return STATUS_NOT_IMPLEMENTED; }
+int vx_reg_close(void *hkey);
 static WINAPI DWORD NtClose(HANDLE h) {
+    if (vx_reg_close(h)) return 0;
     BOOL (WINAPI *close_handle)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "CloseHandle");
     return close_handle && close_handle(h) ? 0 : 0xC0000008u;      // STATUS_INVALID_HANDLE
 }
+typedef struct { uint16_t length, max; WCHAR *buffer; } UNICODE_STRING;
+static WINAPI void RtlInitUnicodeString(UNICODE_STRING *u, const WCHAR *s) {
+    size_t n = s ? vx_wcslen(s) * 2 : 0;
+    u->length = (uint16_t)n; u->max = (uint16_t)(s ? n + 2 : 0); u->buffer = (WCHAR *)s;
+}
+static WINAPI void RtlFreeUnicodeString(UNICODE_STRING *u) { if (u) { free(u->buffer); u->buffer = NULL; u->length = u->max = 0; } }
 static WINAPI BOOL RtlFreeHeap(HANDLE heap, DWORD flags, void *p) {
     BOOL (WINAPI *heap_free)(HANDLE, DWORD, void *) = (BOOL (WINAPI *)(HANDLE, DWORD, void *))vx_find_export("kernel32.dll", "HeapFree");
     return heap_free ? heap_free(heap, flags, p) : 0;
@@ -581,11 +652,11 @@ static const vx_export advapi[] = {
     VX_EXPORT(GetSidSubAuthority), VX_EXPORT(GetSidSubAuthorityCount),
 };
 static const vx_export shell[] = {
-    VX_EXPORT(SHGetFolderPathW), VX_EXPORT(SHGetFolderPathA), VX_EXPORT(SHGetSpecialFolderPathW), VX_EXPORT(SHGetSpecialFolderPathA),
+    VX_EXPORT(SHGetFolderPathW), VX_EXPORT(SHGetFolderPathA), VX_EXPORT(SHGetKnownFolderPath), VX_EXPORT(SHGetSpecialFolderPathW), VX_EXPORT(SHGetSpecialFolderPathA),
 };
 static const vx_export ntdll[] = {
     VX_EXPORT(NtQuerySystemInformation), VX_EXPORT(NtQueryInformationProcess), VX_EXPORT(NtQueryInformationThread),
-    VX_EXPORT(NtClose), VX_EXPORT(RtlFreeHeap), VX_EXPORT(RtlAllocateHeap), VX_EXPORT(LdrLockLoaderLock),
+    VX_EXPORT(NtClose), VX_EXPORT(RtlInitUnicodeString), VX_EXPORT(RtlFreeUnicodeString), VX_EXPORT(RtlFreeHeap), VX_EXPORT(RtlAllocateHeap), VX_EXPORT(LdrLockLoaderLock),
     VX_EXPORT(LdrUnlockLoaderLock), VX_EXPORT(NtAllocateVirtualMemory), VX_EXPORT(NtQueryVirtualMemory),
 };
 void vx_system_init(void) {

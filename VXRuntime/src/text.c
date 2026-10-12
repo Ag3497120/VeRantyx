@@ -3,6 +3,7 @@
 // The "ANSI" code page is UTF-8 here (as with Windows' "use Unicode UTF-8 for worldwide language support"
 // setting): every A function takes and returns UTF-8, which is also what macOS uses, so paths and names pass
 // through unchanged.
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wctype.h>
@@ -123,20 +124,48 @@ static WINAPI int WideCharToMultiByte(DWORD cp, DWORD flags, const WCHAR *w, int
 
 // ---- environment ------------------------------------------------------------------------------------------------------
 #define ERROR_ENVVAR_NOT_FOUND 203
+// Names that start with '=' ("=C:", the C runtime's current directory of each drive) cannot go in the Unix
+// environment: they are kept here.
+static struct { char *name, *value; } g_hidden[32];
+static pthread_mutex_t g_hidden_lock = PTHREAD_MUTEX_INITIALIZER;
+static const char *env_get(const char *name) {
+    if (name[0] != '=') return getenv(name);
+    const char *v = NULL;
+    pthread_mutex_lock(&g_hidden_lock);
+    for (int i = 0; i < 32 && !v; i++) if (g_hidden[i].name && !strcasecmp(g_hidden[i].name, name)) v = g_hidden[i].value;
+    pthread_mutex_unlock(&g_hidden_lock);
+    return v;                                                      // (values are replaced, never freed)
+}
+static int env_set(const char *name, const char *value) {
+    if (name[0] != '=') return (value ? setenv(name, value, 1) : unsetenv(name)) == 0;
+    pthread_mutex_lock(&g_hidden_lock);
+    int slot = -1;
+    for (int i = 0; i < 32; i++) {
+        if (g_hidden[i].name && !strcasecmp(g_hidden[i].name, name)) { slot = i; break; }
+        if (!g_hidden[i].name && slot < 0) slot = i;
+    }
+    if (slot >= 0) {
+        if (!g_hidden[slot].name) g_hidden[slot].name = strdup(name);
+        g_hidden[slot].value = value ? strdup(value) : NULL;
+    }
+    pthread_mutex_unlock(&g_hidden_lock);
+    return slot >= 0;
+}
 static WINAPI DWORD GetEnvironmentVariableA(const char *name, char *buf, DWORD cap) {
-    const char *v = getenv(name);
+    const char *v = env_get(name);
     if (!v) { vx_set_last_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
     return vx_return_string_a(v, buf, cap);
 }
 static WINAPI DWORD GetEnvironmentVariableW(const WCHAR *name, WCHAR *buf, DWORD cap) {
     char *n = vx_utf8_dup(name);
-    const char *v = getenv(n);
+    const char *v = env_get(n);
     free(n);
     if (!v) { vx_set_last_error(ERROR_ENVVAR_NOT_FOUND); return 0; }
     return vx_return_string_w(v, buf, cap);
 }
 static WINAPI BOOL SetEnvironmentVariableA(const char *name, const char *value) {
-    return (value ? setenv(name, value, 1) : unsetenv(name)) == 0;
+    if (!name || !*name) { vx_set_last_error(87); return 0; }
+    return env_set(name, value);
 }
 static WINAPI BOOL SetEnvironmentVariableW(const WCHAR *name, const WCHAR *value) {
     char *n = vx_utf8_dup(name), *v = vx_utf8_dup(value);

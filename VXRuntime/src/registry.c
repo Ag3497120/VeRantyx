@@ -427,6 +427,118 @@ static WINAPI LONG RegQueryInfoKeyW(void *hkey, WCHAR *cls, DWORD *ccls, DWORD *
     return query_info(hkey, subkeys, max_subkey, values, max_name, max_data);
 }
 
+// ---- the native registry calls (ntdll), as Chromium's early startup code makes them -------------------------------------------
+// Paths are "\Registry\Machine\...", "\Registry\User\<sid>\..." (the current user), or relative to an open key.
+typedef struct { uint16_t length, max; WCHAR *buffer; } UNICODE_STRING;
+typedef struct { uint32_t length; void *root; UNICODE_STRING *name; uint32_t attributes; void *sd, *qos; } OBJECT_ATTRIBUTES;
+#define STATUS_SUCCESS 0
+#define STATUS_BUFFER_OVERFLOW 0x80000005u
+#define STATUS_BUFFER_TOO_SMALL 0xC0000023u
+#define STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034u
+#define STATUS_INVALID_HANDLE 0xC0000008u
+#define STATUS_INVALID_PARAMETER 0xC000000Du
+static const char g_user_key_path[] = "\\Registry\\User\\S-1-5-21-1000-1000-1000-1001";
+static char *us_utf8(const UNICODE_STRING *u) {
+    if (!u || !u->buffer) return strdup("");
+    size_t n = u->length / 2;
+    char *out = malloc(n * 3 + 1);
+    size_t w = vx_utf16_to_utf8(u->buffer, n, out, n * 3);
+    out[w] = 0;
+    return out;
+}
+static DWORD status_of(LONG r) { return r == ERROR_SUCCESS ? STATUS_SUCCESS : r == ERROR_FILE_NOT_FOUND ? STATUS_OBJECT_NAME_NOT_FOUND : r == ERROR_INVALID_HANDLE ? STATUS_INVALID_HANDLE : STATUS_INVALID_PARAMETER; }
+static DWORD nt_open(void **out, const OBJECT_ATTRIBUTES *oa, int create, DWORD *disposition) {
+    if (!out || !oa) return STATUS_INVALID_PARAMETER;
+    char *path = us_utf8(oa->name), *sub = path;
+    void *parent = oa->root;
+    if (!parent) {
+        size_t un = strlen(g_user_key_path);
+        if (!strncasecmp(path, g_user_key_path, un)) { parent = (void *)(intptr_t)(int32_t)0x80000001; sub = path + un; }
+        else if (!strncasecmp(path, "\\Registry\\Machine", 17)) { parent = (void *)(intptr_t)(int32_t)0x80000002; sub = path + 17; }
+        else if (!strncasecmp(path, "\\Registry\\User", 14)) { parent = (void *)(intptr_t)(int32_t)0x80000003; sub = path + 14; }
+        else { free(path); return STATUS_OBJECT_NAME_NOT_FOUND; }
+        while (*sub == '\\') sub++;
+    }
+    LONG r = open_key(parent, sub, out, create, disposition);
+    free(path);
+    return status_of(r);
+}
+static WINAPI DWORD NtOpenKeyEx(void **out, DWORD access, const OBJECT_ATTRIBUTES *oa, DWORD options) { (void)access; (void)options; return nt_open(out, oa, 0, NULL); }
+static WINAPI DWORD NtOpenKey(void **out, DWORD access, const OBJECT_ATTRIBUTES *oa) { (void)access; return nt_open(out, oa, 0, NULL); }
+static WINAPI DWORD NtCreateKey(void **out, DWORD access, const OBJECT_ATTRIBUTES *oa, DWORD title, const UNICODE_STRING *cls, DWORD options, DWORD *disposition) {
+    (void)access; (void)title; (void)cls; (void)options;
+    return nt_open(out, oa, 1, disposition);
+}
+static WINAPI DWORD NtDeleteKey(void *hkey) {
+    pthread_mutex_lock(&g_reg_lock);
+    reg_key *k = key_of(hkey);
+    DWORD st = STATUS_INVALID_HANDLE;
+    if (k && k->parent) {                                          // unlinked, as delete_key does
+        for (reg_key **c = &k->parent->children; *c; c = &(*c)->next) if (*c == k) { *c = k->next; break; }
+        save();
+        st = STATUS_SUCCESS;
+    }
+    pthread_mutex_unlock(&g_reg_lock);
+    return st;
+}
+static WINAPI DWORD NtSetValueKey(void *hkey, const UNICODE_STRING *name, DWORD title, DWORD type, const void *data, DWORD size) {
+    (void)title;
+    char *n = us_utf8(name);
+    LONG r = set(hkey, n, type, data, size, 0);
+    free(n);
+    return status_of(r);
+}
+static WINAPI DWORD NtDeleteValueKey(void *hkey, const UNICODE_STRING *name) { char *n = us_utf8(name); LONG r = delete_value(hkey, n); free(n); return status_of(r); }
+// KeyValueBasicInformation (0), KeyValueFullInformation (1), KeyValuePartialInformation (2).
+static WINAPI DWORD NtQueryValueKey(void *hkey, const UNICODE_STRING *name, int cls, void *info, DWORD len, DWORD *result) {
+    char *n = us_utf8(name);
+    DWORD type = 0, size = 0;
+    LONG r = query(hkey, n, &type, NULL, &size, 0);
+    if (r != ERROR_SUCCESS) { free(n); return status_of(r); }
+    uint8_t *data = malloc(size ? size : 1);
+    query(hkey, n, &type, data, &size, 0);
+    free(n);
+    DWORD name_bytes = name ? name->length : 0, need, header;
+    switch (cls) {
+    case 0: header = 12; need = header + name_bytes; break;
+    case 1: header = 20; need = header + name_bytes + size; break;
+    case 2: header = 12; need = header + size; break;
+    default: free(data); return STATUS_INVALID_PARAMETER;
+    }
+    if (result) *result = need;
+    if (len < header) { free(data); return STATUS_BUFFER_TOO_SMALL; }
+    uint32_t *h = info;
+    h[0] = 0; h[1] = type;
+    DWORD st = len < need ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+    if (cls == 0) { h[2] = name_bytes; if (!st) memcpy((uint8_t *)info + 12, name->buffer, name_bytes); }
+    if (cls == 1) {
+        h[2] = 20 + name_bytes; h[3] = size; h[4] = name_bytes;
+        if (!st) { memcpy((uint8_t *)info + 20, name->buffer, name_bytes); memcpy((uint8_t *)info + 20 + name_bytes, data, size); }
+    }
+    if (cls == 2) { h[2] = size; if (!st) memcpy((uint8_t *)info + 12, data, size); }
+    free(data);
+    return st;
+}
+static WINAPI DWORD RtlFormatCurrentUserKeyPath(UNICODE_STRING *out) {
+    WCHAR *w = vx_utf16_dup(g_user_key_path);
+    out->buffer = w;
+    out->length = (uint16_t)(vx_wcslen(w) * 2);
+    out->max = (uint16_t)(out->length + 2);
+    return STATUS_SUCCESS;
+}
+// NtClose of a registry key (heap pointers, unlike kernel handles, are above 4 GB).
+int vx_reg_close(void *hkey) {
+    if ((uint64_t)hkey < 0x100000000ull || !key_of(hkey)) return 0;
+    RegCloseKey(hkey);
+    return 1;
+}
+static const vx_export ntdll[] = {
+    VX_EXPORT(NtOpenKeyEx), VX_EXPORT(NtOpenKey), VX_EXPORT(NtCreateKey), VX_EXPORT(NtDeleteKey), VX_EXPORT(NtSetValueKey),
+    VX_EXPORT(NtDeleteValueKey), VX_EXPORT(NtQueryValueKey), VX_EXPORT(RtlFormatCurrentUserKeyPath),
+    { "ZwOpenKeyEx", (void *)NtOpenKeyEx }, { "ZwOpenKey", (void *)NtOpenKey }, { "ZwCreateKey", (void *)NtCreateKey },
+    { "ZwQueryValueKey", (void *)NtQueryValueKey }, { "ZwSetValueKey", (void *)NtSetValueKey },
+};
+
 static const vx_export advapi[] = {
     VX_EXPORT(RegOpenKeyExA), VX_EXPORT(RegOpenKeyExW), VX_EXPORT(RegOpenKeyA), VX_EXPORT(RegOpenKeyW),
     VX_EXPORT(RegCreateKeyExA), VX_EXPORT(RegCreateKeyExW), VX_EXPORT(RegCreateKeyA), VX_EXPORT(RegCreateKeyW),
@@ -441,4 +553,5 @@ void vx_registry_init(void) {
     vx_register_module("advapi32.dll", advapi, sizeof advapi / sizeof advapi[0]);
     vx_register_module("kernelbase.dll", advapi, sizeof advapi / sizeof advapi[0]);
     vx_register_module("kernel32.dll", advapi, sizeof advapi / sizeof advapi[0]);
+    vx_register_module("ntdll.dll", ntdll, sizeof ntdll / sizeof ntdll[0]);
 }

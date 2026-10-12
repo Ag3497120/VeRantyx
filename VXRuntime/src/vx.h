@@ -51,6 +51,7 @@ typedef struct {
     int       is_dll, refs, initialized, no_thread_calls;
 } vx_image;
 const vx_image *vx_image_at(uint64_t pc);    // the image containing an address, or NULL
+int vx_image_list(const vx_image **out, int cap);   // the loaded images (all of them is the return value)
 
 // TEB layout (the fields Windows code reads directly). Allocated per thread, 8 KB.
 enum {
@@ -88,6 +89,8 @@ extern int vx_trace;
 void vx_kernel32_init(void);
 void vx_desktop_init(void);            // the rest of the Win32 surface games link (desktop.c)
 void vx_pipes_init(void);              // named pipes on Unix domain sockets (pipes.c)
+void *vx_trace_wrap(const char *dll, const char *name, void *fn);   // VXRT_TRACE_CALLS (calltrace.c)
+void vx_client_init(void);             // what desktop clients use: certificate stores, bcrypt random, comctl32 (client.c)
 void vx_services_init(void);           // resources, command lines, random numbers, psapi, C runtime extras (services.c)
 void vx_system_init(void);             // processor topology, thread pool, tokens, shell folders (system.c)
 void vx_ucrt_init(void);
