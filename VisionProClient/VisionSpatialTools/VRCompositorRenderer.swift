@@ -343,7 +343,10 @@ final class VRCompositorRenderer {
                 textureCache,
                 videoFrame.pixelBuffer,
                 nil,
-                .bgra8Unorm,
+                // The frames carry sRGB-encoded colour (SteamVR's display output). Read as sRGB, they come out
+                // linear and the sRGB drawable encodes them once; read as plain UNORM they were encoded a second
+                // time, which washed the picture out (pale, low-contrast colours).
+                .bgra8Unorm_srgb,
                 width,
                 height,
                 0,

@@ -536,6 +536,11 @@ func setupEncoder(width: Int32, height: Int32) {
     }
 
     set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, "real-time mode")
+    // Colour: BT.709 primaries and matrix in the stream (the headset's decoder otherwise guesses, and a guess of
+    // BT.601 shifts hues: reds and greens).
+    set(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2, "colour primaries")
+    set(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_sRGB, "transfer function")   // as the frames: no conversion
+    set(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2, "YCbCr matrix")
     set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel, "profile")
     // Critical settings for ultra-low latency VR streaming
     set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "no B-frames")
@@ -1554,6 +1559,11 @@ while isEncoding {
                     lastForcedKeyFrameAt = now
                 }
 
+                // The frames are sRGB-encoded RGB (BT.709 primaries): say so, so VideoToolbox converts them to
+                // YCbCr with the same matrix the headset's decoder uses to convert back.
+                CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+                CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
+                CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
                 let status = VTCompressionSessionEncodeFrame(compressionSession!,
                                                              imageBuffer: pb,
                                                              presentationTimeStamp: presentationTime,

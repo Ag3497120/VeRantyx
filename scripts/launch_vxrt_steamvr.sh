@@ -56,15 +56,20 @@ cat >"$OPENVR_DIR/openvrpaths.vrpath" <<EOF
 }
 EOF
 
-python3 - "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" "$VXRT_VR_NO_STANDBY" <<'EOF'
+python3 - "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" "$VXRT_VR_NO_STANDBY" "${VXRT_VR_RENDER_SCALE:-}" <<'EOF'
 import json, sys
 settings = json.load(open(sys.argv[1]))
 settings.setdefault("steamvr", {})["allowDisplayLockedMode"] = True
+if sys.argv[4]:   # the driver's render size as given (SteamVR's automatic resolution would scale it back down)
+    settings["steamvr"].update({"supersampleManualOverride": True, "supersampleScale": 1.0})
 if sys.argv[3] == "1":
     settings.setdefault("power", {}).update({"pauseCompositorOnStandby": False, "turnOffScreensTimeout": 3600.0})
 json.dump(settings, open(sys.argv[2], "w"), indent=3)
 EOF
 
+# VXRT_VR_RENDER_SCALE=1.25: the game renders 1.25 x 1.25 times the driver's default pixels per eye (needs a
+# driver with VERANTYX_RENDER_SCALE), and SteamVR's own resolution scaling is set to 100% so it keeps them.
+[[ -n "${VXRT_VR_RENDER_SCALE:-}" ]] && export VERANTYX_RENDER_SCALE="$VXRT_VR_RENDER_SCALE"
 export VXRT_ROOT="$VXRT_VR_ROOT"
 export VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY"
 export VXRT_DLL_PATH="$WINEPREFIX/drive_c/windows/system32"

@@ -1014,6 +1014,18 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
 // The vertex shader runs as a kernel over the draw's vertices (fetched by Metal through a stage-input
 // descriptor made from the input layout, indices included), the geometry kernel over its primitives, and the
 // triangles it made are drawn with its pass-through vertex function and the pixel shader.
+// What a vertex format delivers to a shader: 0 floats (also normalized integers), 1 signed integers, 2 unsigned.
+static int format_kind(MTLVertexFormat f) {
+    switch (f) {
+    case MTLVertexFormatChar: case MTLVertexFormatChar2: case MTLVertexFormatChar3: case MTLVertexFormatChar4:
+    case MTLVertexFormatShort: case MTLVertexFormatShort2: case MTLVertexFormatShort3: case MTLVertexFormatShort4:
+    case MTLVertexFormatInt: case MTLVertexFormatInt2: case MTLVertexFormatInt3: case MTLVertexFormatInt4: return 1;
+    case MTLVertexFormatUChar: case MTLVertexFormatUChar2: case MTLVertexFormatUChar3: case MTLVertexFormatUChar4:
+    case MTLVertexFormatUShort: case MTLVertexFormatUShort2: case MTLVertexFormatUShort3: case MTLVertexFormatUShort4:
+    case MTLVertexFormatUInt: case MTLVertexFormatUInt2: case MTLVertexFormatUInt3: case MTLVertexFormatUInt4: return 2;
+    default: return 0;
+    }
+}
 static id<MTLComputePipelineState> vs_kernel_pipeline(d3d_context *c, d3d_draw_state *s, d3d_shader *vs, int index_type) {
     static NSMutableDictionary *cache;
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1021,11 +1033,32 @@ static id<MTLComputePipelineState> vs_kernel_pipeline(d3d_context *c, d3d_draw_s
     if (s->layout) for (uint32_t i = 0; i < s->layout->n; i++) [key appendFormat:@"%u,", s->stride[s->layout->attr[i].slot & 15]];
     pthread_mutex_lock(&lock);
     if (!cache) cache = [NSMutableDictionary new];
-    id<MTLComputePipelineState> pso = cache[key];
+    id cached = cache[key];
     pthread_mutex_unlock(&lock);
-    if (pso) return pso;
-    id<MTLFunction> fn = shader_variant(c->base.dev, vs, vs->info.msl_kernel, "kernel version");
-    if (!fn) return nil;
+    if (cached) return cached == [NSNull null] ? nil : cached;   // (failures are remembered too: no retry per draw)
+    // Compute stage input converts formats only within a kind: the kernel's inputs are declared as the layout's
+    // formats deliver them (signed or unsigned integers, or floats), as the IA would hand their bits over.
+    NSMutableString *source = [NSMutableString stringWithUTF8String:vs->info.msl_kernel ? vs->info.msl_kernel : ""];
+    if (s->layout) for (uint32_t i = 0; i < s->layout->n; i++) {
+        const layout_attr *a = &s->layout->attr[i];
+        int kind = format_kind(vertex_format(a->format, NULL));
+        const char *want = kind == 1 ? "int4" : kind == 2 ? "uint4" : "float4";
+        for (int k = 0; k < 3; k++) {
+            static const char *const types[3] = { "float4", "int4", "uint4" };
+            NSString *from = [NSString stringWithFormat:@"    %s v%u [[attribute(%u)]];", types[k], a->reg, a->reg];
+            NSString *to = [NSString stringWithFormat:@"    %s v%u [[attribute(%u)]];", want, a->reg, a->reg];
+            [source replaceOccurrencesOfString:from withString:to options:0 range:NSMakeRange(0, source.length)];
+        }
+    }
+    NSError *err = nil;
+    id<MTLLibrary> lib = source.length ? [(__bridge id<MTLDevice>)c->base.dev->mtl newLibraryWithSource:source options:nil error:&err] : nil;
+    id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+    id<MTLComputePipelineState> pso = nil;
+    if (!fn) {
+        vx_log("Direct3D: kernel version of vertex shader %08x did not compile: %s", vs->hash, err.localizedDescription.UTF8String);
+        pthread_mutex_lock(&lock); cache[key] = [NSNull null]; pthread_mutex_unlock(&lock);
+        return nil;
+    }
     MTLStageInputOutputDescriptor *sd = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
     if (s->layout) for (uint32_t i = 0; i < s->layout->n; i++) {
         const layout_attr *a = &s->layout->attr[i];
@@ -1045,11 +1078,10 @@ static id<MTLComputePipelineState> vs_kernel_pipeline(d3d_context *c, d3d_draw_s
     MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
     cd.computeFunction = fn;
     cd.stageInputDescriptor = sd;
-    NSError *err = nil;
     pso = [(__bridge id<MTLDevice>)c->base.dev->mtl newComputePipelineStateWithDescriptor:cd options:0 reflection:nil error:&err];
-    if (!pso) { vx_log("Direct3D: vertex kernel pipeline failed: %s", err.localizedDescription.UTF8String); return nil; }
+    if (!pso) vx_log("Direct3D: vertex kernel pipeline failed: %s", err.localizedDescription.UTF8String);
     pthread_mutex_lock(&lock);
-    cache[key] = pso;
+    cache[key] = pso ? (id)pso : (id)[NSNull null];
     pthread_mutex_unlock(&lock);
     return pso;
 }

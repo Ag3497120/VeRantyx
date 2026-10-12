@@ -814,8 +814,12 @@ static void PersistLiveTangents(const SharedHands& hands) {
     LogDriver("[Verantyx] Saved the Vision Pro eye frustum; SteamVR uses it from its next start");
 }
 
+// Pixels per eye the game renders: 800x900 by default (Wine left the game CPU-bound, so more pixels only cost
+// frames). VERANTYX_RENDER_SCALE multiplies each side: 1.5 renders 2.25 times the pixels, for a sharper
+// picture where the GPU has room (VXRuntime: about 40% busy at 1.0 on an M1 Max).
 static EyeRenderSize GetEyeRenderSize() {
-    constexpr double kTargetPixelsPerEye = 800.0 * 900.0;
+    static const double scale = ReadEnvironmentNumber("VERANTYX_RENDER_SCALE", 1.0, 0.5, 3.0);
+    const double kTargetPixelsPerEye = 800.0 * 900.0 * scale * scale;
     const EyeTangents tangents = LatchedTangents();
     float eyeAspect = (tangents.left[1] - tangents.left[0]) / (tangents.left[3] - tangents.left[2]);
     eyeAspect = std::min(2.0f, std::max(0.5f, eyeAspect));
@@ -999,8 +1003,8 @@ public:
         if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
             char message[160];
             snprintf(message, sizeof(message),
-                "[Verantyx] Stereo target initialized: %ux%u per eye at 90Hz",
-                eye.width, eye.height);
+                "[Verantyx] Stereo target initialized: %ux%u per eye at %.0f Hz",
+                eye.width, eye.height, DisplayFrequency());
             LogDriver(message);
         }
         *pnX = 0; *pnY = 0; *pnWidth = eye.width * 2; *pnHeight = eye.height;
