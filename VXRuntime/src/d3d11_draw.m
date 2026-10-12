@@ -38,9 +38,28 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface)
 // function: the Metal function, once compiled (ready). Shaders compile in the background: Metal's compiler service
 // works on many at once, and a game creating thousands while it loads would otherwise wait for each in turn; the
 // first draw (or dispatch) that needs one waits for it.
-typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id, hash; volatile int ready; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
+typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id, hash; volatile int ready; void *dual; int dual_tried; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
 static pthread_mutex_t g_compile_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_compiled = PTHREAD_COND_INITIALIZER;
+// Dual-source blending (SRC1 factors) reads the pixel shader's second output as Metal's color(0) index(1): a
+// variant of the shader with o1 declared so, made the first time a blend state asks for it.
+static id<MTLFunction> dual_source_function(d3d_device *dev, d3d_shader *s) {
+    pthread_mutex_lock(&g_compile_lock);
+    if (!s->dual_tried) {
+        s->dual_tried = 1;
+        const char *msl = s->info.msl, *at = msl ? strstr(msl, " o1 [[color(1)]];") : NULL;
+        if (at) {
+            NSString *source = [NSString stringWithFormat:@"%.*s o1 [[color(0), index(1)]];%s", (int)(at - msl), msl, at + strlen(" o1 [[color(1)]];")];
+            NSError *err = nil;
+            id<MTLLibrary> lib = [(__bridge id<MTLDevice>)dev->mtl newLibraryWithSource:source options:nil error:&err];
+            id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+            if (fn) s->dual = (void *)CFBridgingRetain(fn);
+            else vx_log("Direct3D: dual-source variant of shader %08x did not compile: %s", s->hash, err.localizedDescription.UTF8String);
+        }
+    }
+    pthread_mutex_unlock(&g_compile_lock);
+    return (__bridge id<MTLFunction>)s->dual;
+}
 static id<MTLFunction> shader_function(d3d_shader *s) {
     if (!s) return nil;
     if (!__atomic_load_n(&s->ready, __ATOMIC_ACQUIRE)) {
@@ -54,6 +73,7 @@ static uint32_t g_next_id = 1;
 static void shader_destroy(d3d_object *o) {
     d3d_shader *s = (d3d_shader *)o;
     if (s->function) CFBridgingRelease(s->function);
+    if (s->dual) CFBridgingRelease(s->dual);
     if (s->compute) CFBridgingRelease(s->compute);
     dxbc_free(&s->info);
 }
@@ -543,6 +563,14 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
     pd.vertexFunction = shader_function(vs);
     pd.fragmentFunction = shader_function(ps);
     if (!pd.vertexFunction || (ps && !pd.fragmentFunction)) return nil;   // a shader that did not compile
+    // SRC1 blend factors on target 0: the shader's second output feeds them (or, with none, Direct3D leaves the
+    // result undefined: the first output stands in).
+    int dual = 0;
+    if (s->blend && ncolors > 0) for (int k = 1; k <= 6 && !dual; k++) if (k != 3) dual = s->blend->desc[2 + k] >= 16 && s->blend->desc[2 + k] <= 19;
+    if (dual && ps && shader_function(ps)) {
+        id<MTLFunction> f = dual_source_function(c->base.dev, ps);
+        if (f) pd.fragmentFunction = f; else dual = 2;
+    }
     if (s->layout && s->layout->n) {
         MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
         for (uint32_t i = 0; i < s->layout->n; i++) {
@@ -569,8 +597,11 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
         if (s->blend) {
             const uint32_t *rt = s->blend->desc + 2 + 8 * (s->blend->desc[1] ? i : 0);   // independent blend, or target 0's
             ca.blendingEnabled = rt[0] != 0;
-            ca.sourceRGBBlendFactor = blend_factor(rt[1]); ca.destinationRGBBlendFactor = blend_factor(rt[2]); ca.rgbBlendOperation = blend_op(rt[3]);
-            ca.sourceAlphaBlendFactor = blend_factor(rt[4]); ca.destinationAlphaBlendFactor = blend_factor(rt[5]); ca.alphaBlendOperation = blend_op(rt[6]);
+            uint32_t f[7];
+            memcpy(f, rt, sizeof f);
+            if (dual == 2) for (int k = 1; k <= 5; k++) if (k != 3 && f[k] >= 16 && f[k] <= 19) f[k] -= 13;   // SRC1_* -> SRC_*
+            ca.sourceRGBBlendFactor = blend_factor(f[1]); ca.destinationRGBBlendFactor = blend_factor(f[2]); ca.rgbBlendOperation = blend_op(f[3]);
+            ca.sourceAlphaBlendFactor = blend_factor(f[4]); ca.destinationAlphaBlendFactor = blend_factor(f[5]); ca.alphaBlendOperation = blend_op(f[6]);
             uint8_t m = (uint8_t)rt[7];
             ca.writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) | (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
             pd.alphaToCoverageEnabled = s->blend->desc[0] != 0;

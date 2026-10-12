@@ -73,6 +73,7 @@ export VXRT_NO_ACTIVATE=1
 VXRT_PATTERN="VXRuntime/build/vxrt .*steamvr/bin/win64/vr"   # no regex characters (the path has "(x86)")
 cleanup() {
     [[ -n "${ENCODER_PID:-}" ]] && kill -TERM "$ENCODER_PID" 2>/dev/null || true
+    [[ -n "${WEBUI_PID:-}" ]] && kill -TERM "$WEBUI_PID" 2>/dev/null || true
     [[ -n "${VR_PID:-}" ]] && kill -TERM "$VR_PID" 2>/dev/null || true
     pkill -TERM -f "$VXRT_PATTERN" 2>/dev/null || true   # vrserver and vrcompositor outlive vrcmd, as on Windows
     sleep 1
@@ -87,6 +88,11 @@ echo "SteamVR on VXRuntime started (log: $LOG_DIR/vxrt-steamvr.log)"
 
 VERANTYX_SHARED_FRAME="$VXRT_VR_ROOT/drive_c/vr_shared_frame.dat" "$ENCODER" >"$LOG_DIR/hardware-encoder.log" 2>&1 &
 ENCODER_PID=$!
+
+# Games' SteamVR web UIs need vrwebhelper (Chromium), which does not run on VXRuntime: this answers for
+# Half-Life: Alyx's (it gives up after a minute without the page's "ready").
+python3 "$SCRIPT_DIR/vxrt_webui_standin.py" >"$LOG_DIR/webui-standin.log" 2>&1 &
+WEBUI_PID=$!
 echo "Encoder started (log: $LOG_DIR/hardware-encoder.log); open the Vision Pro app to connect"
 
 if [[ -n "${VXRT_VR_SECONDS:-}" ]]; then

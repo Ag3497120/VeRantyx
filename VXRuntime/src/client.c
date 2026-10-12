@@ -677,7 +677,28 @@ static const vx_export shell32[] = {
     VX_EXPORT(SHGetMalloc), VX_EXPORT(ILFree), { "#155", (void *)ILFree }, VX_EXPORT(ILCreateFromPathW), { "#190", (void *)ILCreateFromPathW },
     VX_EXPORT(SHOpenFolderAndSelectItems), VX_EXPORT(SHAppBarMessage),
 };
-static const vx_export comctl32[] = { VX_EXPORT(InitCommonControlsEx), VX_EXPORT(InitCommonControls), { "#17", (void *)InitCommonControls } };
+// TaskDialogIndirect: programs show fatal errors this way. The text goes to the log, and the first button is
+// pressed. TASKDIALOGCONFIG is packed to 1 byte: title at 28, main instruction at 44, content at 52 (strings, or
+// resource ids below 0x10000).
+static void log_dialog_text(const char *what, const uint8_t *field) {
+    const void *p;
+    memcpy(&p, field, sizeof p);
+    if ((uintptr_t)p < 0x10000) return;
+    char *t = vx_utf8_dup(p);
+    vx_log("task dialog %s: %s", what, t);
+    free(t);
+}
+static WINAPI LONG TaskDialogIndirect(const uint8_t *config, int *button, int *radio, BOOL *checked) {
+    log_dialog_text("title", config + 28);
+    log_dialog_text("instruction", config + 44);
+    log_dialog_text("content", config + 52);
+    if (button) *button = 1;                           // IDOK
+    if (radio) *radio = 0;
+    if (checked) *checked = 0;
+    return 0;
+}
+static const vx_export comctl32[] = { VX_EXPORT(InitCommonControlsEx), VX_EXPORT(InitCommonControls), { "#17", (void *)InitCommonControls },
+                                      VX_EXPORT(TaskDialogIndirect) };
 static const vx_export psapi[] = {
     VX_EXPORT(GetModuleFileNameExW), VX_EXPORT(GetModuleFileNameExA), VX_EXPORT(EnumProcessModules), VX_EXPORT(EnumProcessModulesEx),
     VX_EXPORT(GetModuleBaseNameW), VX_EXPORT(GetModuleBaseNameA),
