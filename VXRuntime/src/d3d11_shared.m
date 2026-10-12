@@ -162,6 +162,7 @@ HRESULT d3d_open_shared(d3d_device *dev, HANDLE h, const GUID *iid, void **out) 
         CFRelease(surface);
         if (!tex) return E_INVALIDARG;
         o = &d3d_texture_wrap(dev, e->desc, (void *)CFBridgingRetain(tex), s + 1)->base;
+        d3d_shared_note((d3d_texture *)o);
     } else if (e->kind == 2) {
         void *shm = NULL;
         void *b = map_shared_buffer(dev, e->shm, (size_t)e->size, 0, &shm);
@@ -201,6 +202,27 @@ static WINAPI HRESULT res_set_private(void *this, const GUID *g, uint32_t n, con
 static WINAPI HRESULT res_get_private(void *this, const GUID *g, uint32_t *n, void *data) { return d3d_get_private(res_of(this), g, n, data); }
 static WINAPI HRESULT res_set_private_interface(void *this, const GUID *g, void *unk) { (void)unk; return d3d_set_private(res_of(this), g, 0, NULL); }
 
+// With VXRT_SHARED_SNAPSHOT set, every shared texture this process makes or opens is remembered (its Metal texture
+// retained), and the snapshot writes them all: file.png.<slot>.png.
+static void *g_noted[64]; static int g_noted_slot[64], g_noted_count;
+void d3d_shared_note(d3d_texture *t) {
+    if (!getenv("VXRT_SHARED_SNAPSHOT") || !t->shared || g_noted_count >= 64) return;
+    int i = __sync_fetch_and_add(&g_noted_count, 1);
+    if (i >= 64) return;
+    g_noted[i] = (void *)CFBridgingRetain((__bridge id)t->mtl); g_noted_slot[i] = t->shared - 1;
+}
+
+// VXRT_SHARED_COPY_SNAPSHOT=file.png (VXRT_SHARED_COPY_SNAPSHOT_AT=n, default 600): the n-th time this process
+// copies or resolves into a shared texture, that texture after the copy (debugging what crosses processes).
+void d3d_shared_written(d3d_device *dev, d3d_texture *t) {
+    static int count;
+    const char *snap = getenv("VXRT_SHARED_COPY_SNAPSHOT"), *at = getenv("VXRT_SHARED_COPY_SNAPSHOT_AT");
+    if (!snap || !t->shared || __sync_add_and_fetch(&count, 1) != (at ? atoi(at) : 600)) return;
+    d3d_flush(dev, 1);
+    vx_log("shared copy snapshot: slot %d, %ux%u, DXGI format %u", t->shared - 1, t->desc[TD_WIDTH], t->desc[TD_HEIGHT], t->desc[TD_FORMAT]);
+    d3d_texture_png(dev, t->mtl, snap);
+}
+
 // ---- IDXGIKeyedMutex (shared textures' third table) ----------------------------------------------------------------------------
 static d3d_texture *keyed_of(void *this) { return (d3d_texture *)((char *)this - offsetof(d3d_texture, keyed_vtbl)); }
 static WINAPI HRESULT keyed_qi(void *this, const GUID *iid, void **out) { d3d_texture *t = keyed_of(this); return ((HRESULT (WINAPI *)(void *, const GUID *, void **))t->base.vtbl[0])(t, iid, out); }
@@ -217,7 +239,11 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
             return S_OK;
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         uint64_t elapsed = (uint64_t)(now.tv_sec - start.tv_sec) * 1000 + (uint64_t)((now.tv_nsec - start.tv_nsec) / 1000000);
-        if (ms != 0xffffffffu && elapsed >= ms) return (HRESULT)0x102;   // WAIT_TIMEOUT
+        if (ms != 0xffffffffu && elapsed >= ms) {
+            if (getenv("VXRT_TRACE_KEYED")) vx_log("keyed mutex slot %d: AcquireSync(%llu, %u ms) timed out: released with key %lld, owner %d",
+                                                   t->shared - 1, (unsigned long long)key, (unsigned)ms, (long long)e->key, (int)e->owner);
+            return (HRESULT)0x102;   // WAIT_TIMEOUT
+        }
         // Sleep until a release (any process) or 2 ms, then look again.
         uint32_t seen = __atomic_load_n(&e->released, __ATOMIC_ACQUIRE);
         if ((uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && !__atomic_load_n(&e->owner, __ATOMIC_ACQUIRE)) continue;
@@ -230,7 +256,20 @@ static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
     d3d_texture *t = keyed_of(this);
     if (!t->shared) return S_OK;
     d3d_flush(t->base.dev, 1);                                    // the other process sees what was drawn
+    // VXRT_SHARED_SNAPSHOT=file.png (VXRT_SHARED_SNAPSHOT_AT=n, default 600): the n-th texture this process releases.
+    static int releases;
+    const char *snap = getenv("VXRT_SHARED_SNAPSHOT"), *at = getenv("VXRT_SHARED_SNAPSHOT_AT");
+    if (snap && __sync_add_and_fetch(&releases, 1) == (at ? atoi(at) : 600)) {
+        vx_log("shared snapshot: slot %d, DXGI format %u", t->shared - 1, t->desc[TD_FORMAT]);
+        d3d_texture_png(t->base.dev, t->mtl, snap);
+        for (int i = 0; i < g_noted_count && i < 64; i++) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s.%d.png", snap, g_noted_slot[i]);
+            d3d_texture_png(t->base.dev, g_noted[i], path);
+        }
+    }
     shared_slot *e = &table()->s[t->shared - 1];
+    if (getenv("VXRT_TRACE_KEYED")) vx_log("keyed mutex slot %d: ReleaseSync(%llu) by %d (owner was %d)", t->shared - 1, (unsigned long long)key, (int)getpid(), (int)e->owner);
     __atomic_store_n(&e->key, (int64_t)key, __ATOMIC_RELEASE);
     __atomic_store_n(&e->owner, 0, __ATOMIC_RELEASE);
     __atomic_add_fetch(&e->released, 1, __ATOMIC_RELEASE);

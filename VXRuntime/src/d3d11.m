@@ -284,6 +284,7 @@ static d3d_texture *texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT
     t->base.vtbl2 = d3d_dxgi_resource_vtbl();
     t->shared = slot + 1;
     if (t->shared && (desc[TD_MISC] & 0x100)) t->keyed_vtbl = d3d_keyed_mutex_vtbl();
+    d3d_shared_note(t);
     return t;
 }
 // A texture object for a Metal texture made elsewhere (a shared texture another process made).
@@ -551,11 +552,14 @@ static WINAPI void ctx_copy_resource(void *this, d3d_object *dst, d3d_object *sr
         id<MTLTexture> s = (__bridge id<MTLTexture>)((d3d_texture *)src)->mtl, d = (__bridge id<MTLTexture>)((d3d_texture *)dst)->mtl;
         if (s.width == d.width && s.height == d.height && s.depth == d.depth && s.mipmapLevelCount == d.mipmapLevelCount && s.arrayLength == d.arrayLength && s.sampleCount == d.sampleCount)
             [blit copyFromTexture:s toTexture:d];
+        else if (vx_trace) vx_log("CopyResource between textures that differ: %lux%lu x%lu -> %lux%lu x%lu", (unsigned long)s.width, (unsigned long)s.height,
+                                  (unsigned long)s.sampleCount, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.sampleCount);
     } else {
         id<MTLBuffer> s = (__bridge id<MTLBuffer>)((d3d_buffer *)src)->mtl, d = (__bridge id<MTLBuffer>)((d3d_buffer *)dst)->mtl;
         [blit copyFromBuffer:s sourceOffset:0 toBuffer:d destinationOffset:0 size:MIN(s.length, d.length)];
     }
     [blit endEncoding];
+    if (dst->kind == K_TEXTURE) d3d_shared_written(c->base.dev, (d3d_texture *)dst);
 }
 // D3D11_BOX: left, top, front, right, bottom, back.
 static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint32_t dst_sub, uint32_t x, uint32_t y, uint32_t z,
@@ -585,6 +589,7 @@ static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint
         if (from + size <= s.length && x + size <= d.length) [blit copyFromBuffer:s sourceOffset:from toBuffer:d destinationOffset:x size:size];
     }
     [blit endEncoding];
+    if (dst->kind == K_TEXTURE) d3d_shared_written(c->base.dev, (d3d_texture *)dst);
 }
 
 // Uploads go through a temporary buffer and a blit, so they land in order with the other recorded work. Rows

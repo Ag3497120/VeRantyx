@@ -964,7 +964,9 @@ static WINAPI void *vx_bsearch_s(const void *key, const void *base, size_t n, si
     return NULL;
 }
 
+static WINAPI int vx_getpid(void) { return (int)getpid(); }
 static const vx_export ucrt[] = {
+    { "_getpid", (void *)vx_getpid },
     { "lround", (void *)m_lround }, { "lroundf", (void *)m_lroundf }, { "llround", (void *)m_llround }, { "llroundf", (void *)m_llroundf },
     { "lrint", (void *)m_lrint }, { "llrint", (void *)m_llrint }, { "llrintf", (void *)m_llrintf }, { "nearbyint", (void *)m_nearbyint },
     { "nearbyintf", (void *)m_nearbyintf }, { "expm1", (void *)m_expm1 }, { "expm1f", (void *)m_expm1f }, { "log1p", (void *)m_log1p },

@@ -336,19 +336,15 @@ static WINAPI HRESULT swapchain_get_buffer(void *this, uint32_t index, const GUI
     (void)index;                                    // one buffer stands for all of them
     return call_qi(sc->buffer, iid, out);
 }
-// VXRT_PRESENT_SNAPSHOT=file.png (with VXRT_PRESENT_SNAPSHOT_AT=n, default 300): the back buffer of the n-th
-// present is written to that file (8-bit RGBA/BGRA buffers), to check what a program draws.
-static void snapshot(swapchain *sc) {
-    const char *path = getenv("VXRT_PRESENT_SNAPSHOT");
-    const char *at = getenv("VXRT_PRESENT_SNAPSHOT_AT");
-    if (!path || sc->presents + 1 != (uint64_t)(at ? atoll(at) : 300)) return;
-    id<MTLTexture> tex = (__bridge id<MTLTexture>)sc->buffer->mtl;
+// A texture's first level as a PNG (8-bit RGBA/BGRA textures), for VXRT_PRESENT_SNAPSHOT and VXRT_SHARED_SNAPSHOT.
+void d3d_texture_png(d3d_device *dev, void *texture, const char *path) {
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)texture;
     MTLPixelFormat f = tex.pixelFormat;
     int bgra = f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB;
-    if (!bgra && f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) { vx_log("snapshot: back buffer format %d is not 8-bit", (int)f); return; }
+    if (!bgra && f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) { vx_log("snapshot: format %d is not 8-bit", (int)f); return; }
     NSUInteger w = tex.width, h = tex.height, row = w * 4;
     id<MTLBuffer> buf = [tex.device newBufferWithLength:row * h options:MTLResourceStorageModeShared];
-    id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)sc->dev->queue commandBuffer];
+    id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
     [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
                  toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
@@ -365,7 +361,14 @@ static void snapshot(swapchain *sc) {
     if (img) CGImageRelease(img);
     if (ctx) CGContextRelease(ctx);
     CGColorSpaceRelease(cs);
-    vx_log("snapshot of present %llu (%lux%lu) written to %s", (unsigned long long)sc->presents + 1, (unsigned long)w, (unsigned long)h, path);
+    vx_log("snapshot (%lux%lu, format %d) written to %s", (unsigned long)w, (unsigned long)h, (int)f, path);
+}
+// VXRT_PRESENT_SNAPSHOT=file.png (with VXRT_PRESENT_SNAPSHOT_AT=n, default 300): the back buffer of the n-th
+// present is written to that file, to check what a program draws.
+static void snapshot(swapchain *sc) {
+    const char *path = getenv("VXRT_PRESENT_SNAPSHOT");
+    const char *at = getenv("VXRT_PRESENT_SNAPSHOT_AT");
+    if (path && sc->presents + 1 == (uint64_t)(at ? atoll(at) : 300)) d3d_texture_png(sc->dev, sc->buffer->mtl, path);
 }
 #define DXGI_PRESENT_TEST 1
 static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flags) {

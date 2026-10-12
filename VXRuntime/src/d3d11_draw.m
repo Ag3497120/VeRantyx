@@ -883,6 +883,7 @@ static WINAPI void ctx_resolve(void *this, d3d_object *dst, uint32_t dst_sub, d3
         id<MTLBlitCommandEncoder> blit = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) blitCommandEncoder];
         [blit copyFromTexture:st toTexture:dt];
         [blit endEncoding];
+        d3d_shared_written(c->base.dev, ds);
         return;
     }
     uint32_t dmips = ds->desc[TD_MIPS] ? ds->desc[TD_MIPS] : 1, smips = ss->desc[TD_MIPS] ? ss->desc[TD_MIPS] : 1;
@@ -895,6 +896,7 @@ static WINAPI void ctx_resolve(void *this, d3d_object *dst, uint32_t dst_sub, d3
     d3d_end_render(c);
     id<MTLRenderCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) renderCommandEncoderWithDescriptor:rp];
     [enc endEncoding];
+    d3d_shared_written(c->base.dev, ds);
 }
 
 // ---- queries and predicates -------------------------------------------------------------------------------------------------

@@ -395,7 +395,13 @@ static WINAPI const void *rt_typeid(void *in) {
 }
 
 void vx_CxxThrowException(void *, const void *);
+// vcruntime140's own critical-section helper (VC++ 2015-2019 builds of the CRT startup call it).
+static WINAPI BOOL __vcrt_InitializeCriticalSectionEx(void *cs, DWORD spin, DWORD flags) {
+    BOOL (WINAPI *init)(void *, DWORD, DWORD) = (BOOL (WINAPI *)(void *, DWORD, DWORD))vx_find_export("kernel32.dll", "InitializeCriticalSectionEx");
+    return init(cs, spin, flags);
+}
 static vx_export g_vcruntime[] = {
+    VX_EXPORT(__vcrt_InitializeCriticalSectionEx),
     { "__AdjustPointer", (void *)adjust_pointer }, { "__uncaught_exception", (void *)uncaught_exceptions },
     { "__uncaught_exceptions", (void *)uncaught_exceptions }, { "__RTDynamicCast", (void *)rt_dynamic_cast },
     { "__RTCastToVoid", (void *)rt_cast_to_void }, { "__RTtypeid", (void *)rt_typeid },

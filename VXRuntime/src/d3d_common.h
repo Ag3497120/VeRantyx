@@ -126,6 +126,9 @@ void    d3d_shared_release(int slot);
 HRESULT d3d_open_shared(d3d_device *dev, HANDLE h, const GUID *iid, void **out);
 void  **d3d_dxgi_resource_vtbl(void);        // IDXGIResource1 on resources' second table
 void  **d3d_keyed_mutex_vtbl(void);
+void d3d_shared_note(d3d_texture *t);   // d3d11_shared.m (debugging)
+void d3d_shared_written(d3d_device *dev, d3d_texture *t);   // d3d11_shared.m (debugging)
+void d3d_texture_png(d3d_device *dev, void *texture, const char *path);   // dxgi.m (debugging)
 d3d_texture *d3d_texture_wrap(d3d_device *dev, const uint32_t desc[TD_COUNT], void *mtl, int shared);   // mtl retained
 d3d_buffer  *d3d_buffer_wrap(d3d_device *dev, const uint32_t desc[6], void *mtl, int shared, void *shm, size_t shm_size);
 void         d3d_texture_replace(d3d_texture *t, void *mtl_texture);     // a swap chain's buffer after a resize
