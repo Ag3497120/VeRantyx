@@ -48,7 +48,25 @@ static WINAPI HRESULT ps_qi(void *this, const GUID *iid, void **out) { return qu
 static WINAPI HRESULT cs_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11ComputeShader); }
 static WINAPI HRESULT uav_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11UnorderedAccessView); }
 static WINAPI void uav_get_resource(void *this, void **out) { d3d_view *v = this; d3d_addref(v->resource); *out = v->resource; }
-static void uav_destroy(d3d_object *o) { d3d_release(((d3d_view *)o)->resource); }
+static void uav_destroy(d3d_object *o) {
+    d3d_view *v = (d3d_view *)o;
+    d3d_view_release_mtl(v);
+    d3d_release(v->resource);
+}
+// Sets a UAV's hidden counter (D3D11_BUFFER_UAV_FLAG_APPEND or _COUNTER): a fresh 4-byte buffer holding the value,
+// so work already encoded keeps the old one (as with a discarded buffer).
+static void set_counter(d3d_view *v, uint32_t value) {
+    if (!v || v->resource->kind != K_BUFFER || !(v->flags & 6) || value == 0xffffffffu) return;
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)v->base.dev->mtl;
+    id<MTLBuffer> b = [dev newBufferWithBytes:&value length:4 options:MTLResourceStorageModeShared];
+    if (v->counter) CFRelease(v->counter);
+    v->counter = (void *)CFBridgingRetain(b);
+}
+static id<MTLBuffer> counter_of(d3d_view *v) {
+    if (!v) return nil;
+    if (!v->counter) set_counter(v, 0);
+    return (__bridge id<MTLBuffer>)v->counter;
+}
 
 // VXRT_DUMP_SHADERS=directory: every translated shader is written there (for looking at the translation).
 static void dump(const dxbc_shader *s, const void *code, size_t size) {
@@ -106,9 +124,11 @@ static WINAPI HRESULT device_create_uav(void *this, d3d_object *res, const uint3
     if (res->kind == K_TEXTURE) v->format = ((d3d_texture *)res)->desc[TD_FORMAT];
     if (desc) {
         if (desc[0]) v->format = desc[0];
+        v->dim = desc[1];
         if (res->kind == K_BUFFER) { v->first = desc[2]; v->count = desc[3]; v->flags = desc[4]; }
-        else if (desc[1] == 4) v->mip = desc[2];
-        else if (desc[1] == 5) { v->mip = desc[2]; v->first_slice = desc[3]; v->slices = desc[4]; }
+        else if (desc[1] == 2 || desc[1] == 4) v->mip = desc[2];                                   // 1D, 2D
+        else if (desc[1] == 3 || desc[1] == 5 || desc[1] == 8) { v->mip = desc[2]; v->first_slice = desc[3]; v->slices = desc[4]; }
+        if (desc[1] == 8) { v->first_slice = 0; v->slices = 1; }                                  // 3D: depth slices stay whole
     }
     if (!out) { d3d_release(&v->base); return S_FALSE; }
     *out = v;
@@ -359,13 +379,14 @@ static WINAPI void cs_set_cbs(void *this, uint32_t start, uint32_t n, d3d_buffer
 static WINAPI void cs_set_srvs(void *this, uint32_t start, uint32_t n, d3d_view *const *v) { set_srvs(this, STAGE_CS, start, n, v); }
 static WINAPI void cs_set_samplers(void *this, uint32_t start, uint32_t n, d3d_sampler *const *v) { set_samplers(this, STAGE_CS, start, n, v); }
 static WINAPI void cs_set_uavs(void *this, uint32_t start, uint32_t n, d3d_view *const *v, const uint32_t *counts) {
-    (void)counts;
     d3d_draw_state *s = state_of(this);
-    for (uint32_t i = 0; i < n && start + i < 8; i++) bind(&s->uav[STAGE_CS][start + i], v ? v[i] : NULL);
+    for (uint32_t i = 0; i < n && start + i < 8; i++) {
+        bind(&s->uav[STAGE_CS][start + i], v ? v[i] : NULL);
+        if (v && counts) set_counter(v[i], counts[i]);
+    }
 }
 typedef void (WINAPI *set_targets_fn)(void *, uint32_t, void *const *, void *);
 static WINAPI void om_set_targets_and_uavs(void *this, uint32_t nrtv, void *const *rtvs, void *dsv, uint32_t start, uint32_t nuav, d3d_view *const *uavs, const uint32_t *counts) {
-    (void)counts;
     if (nrtv != 0xffffffffu) {                                // D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL
         set_targets_fn set = (set_targets_fn)self_of(this)->vtbl[33];   // OMSetRenderTargets
         set(this, nrtv, rtvs, dsv);
@@ -373,6 +394,7 @@ static WINAPI void om_set_targets_and_uavs(void *this, uint32_t nrtv, void *cons
     if (nuav != 0xffffffffu) {                                // D3D11_KEEP_UNORDERED_ACCESS_VIEWS
         d3d_draw_state *s = state_of(this);
         for (uint32_t i = 0; i < 8; i++) bind(&s->uav[STAGE_PS][i], i >= start && i < start + nuav && uavs ? uavs[i - start] : NULL);
+        for (uint32_t i = 0; uavs && counts && i < nuav; i++) set_counter(uavs[i], counts[i]);
     }
 }
 static WINAPI void om_set_blend(void *this, d3d_blend *b, const float *factor, uint32_t mask) {
@@ -475,6 +497,68 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
 // ---- drawing ----------------------------------------------------------------------------------------------------------------------
 static id<MTLTexture> view_texture(d3d_view *v) { return v && v->resource->kind == K_TEXTURE ? (__bridge id<MTLTexture>)((d3d_texture *)v->resource)->mtl : nil; }
 
+// What a shader reads or writes through a view: the texture itself, or a Metal texture view of it when the view
+// changes the format (typeless resources, sRGB), the mips or slices, or the type (an array slice as 2D, cube
+// faces); a typed view of a buffer is a texture buffer over it. Views are cached while the resource's Metal object
+// stays the same (buffers are replaced when discarded).
+static MTLTextureType view_type(uint32_t dim, MTLTextureType base) {
+    switch (dim) {
+    case 2: return MTLTextureType1D;           case 3: return MTLTextureType1DArray;
+    case 4: return MTLTextureType2D;           case 5: return MTLTextureType2DArray;
+    case 6: return MTLTextureType2DMultisample; case 7: return MTLTextureType2DMultisampleArray;
+    case 8: return MTLTextureType3D;           case 9: return MTLTextureTypeCube;
+    case 10: return MTLTextureTypeCubeArray;   default: return base;
+    }
+}
+static id<MTLTexture> cache_view(d3d_view *v, id<MTLTexture> t, void *src) {
+    if (v->mtl_view) CFRelease(v->mtl_view);
+    v->mtl_view = (void *)CFBridgingRetain(t);
+    v->mtl_src = src;
+    return t;
+}
+static id<MTLTexture> buffer_texture(d3d_view *v) {
+    d3d_buffer *b = (d3d_buffer *)v->resource;
+    if (v->mtl_view && v->mtl_src == b->mtl) return (__bridge id<MTLTexture>)v->mtl_view;
+    id<MTLBuffer> mb = (__bridge id<MTLBuffer>)b->mtl;
+    uint32_t bpp = 0;
+    MTLPixelFormat f = d3d_mtl_format(v->format, &bpp);
+    if (f == MTLPixelFormatInvalid || !bpp || !mb) return nil;
+    NSUInteger off = (NSUInteger)v->first * bpp, n = v->count ? v->count : (mb.length - MIN(off, mb.length)) / bpp;
+    if (!n || off + n * bpp > mb.length) return nil;
+    NSUInteger align = [mb.device minimumTextureBufferAlignmentForPixelFormat:f];
+    if (align && off % align) { vx_log("Direct3D: a buffer view at byte %lu is not aligned for Metal (%lu)", (unsigned long)off, (unsigned long)align); return nil; }
+    MTLTextureUsage usage = MTLTextureUsageShaderRead | (v->base.kind == K_UAV ? MTLTextureUsageShaderWrite : 0);
+    if (v->base.kind == K_UAV && (v->format == 42 || v->format == 43)) usage |= MTLTextureUsageShaderAtomic;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:f width:n resourceOptions:mb.resourceOptions usage:usage];
+    NSUInteger row = align ? (n * bpp + align - 1) / align * align : n * bpp;
+    id<MTLTexture> t = [mb newTextureWithDescriptor:td offset:off bytesPerRow:row];
+    return t ? cache_view(v, t, b->mtl) : nil;
+}
+static id<MTLTexture> shader_texture(d3d_view *v) {
+    if (!v) return nil;
+    if (v->resource->kind == K_BUFFER) return buffer_texture(v);
+    d3d_texture *tex = (d3d_texture *)v->resource;
+    id<MTLTexture> base = (__bridge id<MTLTexture>)tex->mtl;
+    if (!base) return nil;
+    if (v->mtl_view && v->mtl_src == tex->mtl) return (__bridge id<MTLTexture>)v->mtl_view;
+    MTLPixelFormat fmt = base.pixelFormat;
+    int depth = fmt == MTLPixelFormatDepth32Float || fmt == MTLPixelFormatDepth16Unorm || fmt == MTLPixelFormatDepth32Float_Stencil8;
+    MTLPixelFormat f = depth ? MTLPixelFormatInvalid : d3d_mtl_format(v->format, NULL);
+    if (f != MTLPixelFormatInvalid) fmt = f;
+    MTLTextureType type = view_type(v->dim, base.textureType);
+    NSUInteger levels = base.mipmapLevelCount, first = MIN((NSUInteger)v->mip, levels - 1);
+    NSUInteger count = v->base.kind == K_UAV ? 1 : v->mips == 0 || v->mips == 0xffffffffu ? levels - first : MIN((NSUInteger)v->mips, levels - first);
+    NSUInteger total = base.textureType == MTLTextureType3D ? 1 : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1);
+    NSUInteger sfirst = MIN((NSUInteger)v->first_slice, total - 1), scount = v->dim ? MIN((NSUInteger)v->slices, total - sfirst) : total;
+    if (type == MTLTextureType2D || type == MTLTextureType1D || type == MTLTextureType2DMultisample || type == MTLTextureType3D) scount = 1;
+    if (type == MTLTextureTypeCube) scount = 6;
+    if (v->base.kind == K_UAV && v->dim == 0) { sfirst = 0; scount = total; }
+    if (fmt == base.pixelFormat && type == base.textureType && first == 0 && count == levels && sfirst == 0 && scount == total) return base;
+    id<MTLTexture> view = [base newTextureViewWithPixelFormat:fmt textureType:type levels:NSMakeRange(first, count) slices:NSMakeRange(sfirst, scount)];
+    if (!view) return base;
+    return cache_view(v, view, tex->mtl);
+}
+
 // The render pass for the bound targets: kept open while they stay the same; contents are loaded.
 static id<MTLRenderCommandEncoder> render_pass(d3d_context *c) {
     int same = c->render != NULL && c->render_dsv == c->dsv;
@@ -534,6 +618,7 @@ static id<MTLSamplerState> default_sampler(d3d_context *c) {
 
 // Binds a stage's constant buffers, textures, samplers, buffer views and UAVs on a render or compute encoder.
 static id<MTLTexture> view_texture(d3d_view *v);
+static id<MTLTexture> shader_texture(d3d_view *v);
 static id<MTLSamplerState> default_sampler(d3d_context *c);
 static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCommandEncoder> renc, id<MTLComputeCommandEncoder> cenc) {
     d3d_shader *sh = s->shader[st];
@@ -544,7 +629,8 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
     else if (st == STAGE_VS) [renc setVertexTexture:t atIndex:idx]; else [renc setFragmentTexture:t atIndex:idx]; } while (0)
 #define SET_SAMPLER(sm, idx) do { if (cenc) [cenc setSamplerState:sm atIndex:idx]; \
     else if (st == STAGE_VS) [renc setVertexSamplerState:sm atIndex:idx]; else [renc setFragmentSamplerState:sm atIndex:idx]; } while (0)
-    uint32_t sizes[32] = { 0 };                                  // bytes of u0..u7, then t0..t21 (for bufinfo)
+    dxbc_aux aux = { { 0 }, { 0 } };                             // buffer sizes (for bufinfo), UAV counters
+    uint32_t *sizes = aux.sizes;
     for (int i = 0; i < 14; i++) {
         if (!(sh->info.cbuffers & (1u << i))) continue;
         id<MTLBuffer> b = s->cb[st][i] ? (__bridge id<MTLBuffer>)s->cb[st][i]->mtl : nil;
@@ -552,7 +638,7 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
     }
     for (int i = 0; i < 32; i++) {
         if (!(sh->info.textures[0] & (1ull << i))) continue;
-        SET_TEXTURE(view_texture(s->srv[st][i]), i);
+        SET_TEXTURE(shader_texture(s->srv[st][i]), i);
     }
     for (int i = 0; i < 16; i++) {
         if (!(sh->info.samplers & (1u << i))) continue;
@@ -571,18 +657,24 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
     for (int i = 0; i < 8; i++) {                                // UAVs
         if (!(sh->info.uavs & (1u << i))) continue;
         d3d_view *v = s->uav[st][i];
-        if (sh->info.uav_kind[i] == DXBC_UAV_TYPED) { SET_TEXTURE(view_texture(v), DXBC_UAV_TEXTURE_BASE + i); continue; }
+        if (sh->info.uav_kind[i] == DXBC_UAV_TYPED) { SET_TEXTURE(shader_texture(v), DXBC_UAV_TEXTURE_BASE + i); continue; }
         if (!v || v->resource->kind != K_BUFFER) { SET_BUFFER(nil, 0, DXBC_UAV_BUFFER_BASE + i); continue; }
         id<MTLBuffer> b = (__bridge id<MTLBuffer>)((d3d_buffer *)v->resource)->mtl;
         uint32_t stride = sh->info.uav_stride[i] ? sh->info.uav_stride[i] : 4;
         NSUInteger off = (NSUInteger)v->first * stride;
         SET_BUFFER(b, off, DXBC_UAV_BUFFER_BASE + i);
         sizes[i] = v->count ? v->count * stride : (uint32_t)(b.length - MIN(off, b.length));
+        if (sh->info.uav_counters & (1u << i)) {                 // the counter, by address
+            id<MTLBuffer> cb = counter_of(v);
+            aux.counters[i] = cb.gpuAddress;
+            if (cenc) [cenc useResource:cb usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+            else [renc useResource:cb usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:st == STAGE_VS ? MTLRenderStageVertex : MTLRenderStageFragment];
+        }
     }
     if (sh->info.uses_sizes) {
-        if (cenc) [cenc setBytes:sizes length:sizeof sizes atIndex:DXBC_SIZES_BUFFER];
-        else if (st == STAGE_VS) [renc setVertexBytes:sizes length:sizeof sizes atIndex:DXBC_SIZES_BUFFER];
-        else [renc setFragmentBytes:sizes length:sizeof sizes atIndex:DXBC_SIZES_BUFFER];
+        if (cenc) [cenc setBytes:&aux length:sizeof aux atIndex:DXBC_SIZES_BUFFER];
+        else if (st == STAGE_VS) [renc setVertexBytes:&aux length:sizeof aux atIndex:DXBC_SIZES_BUFFER];
+        else [renc setFragmentBytes:&aux length:sizeof aux atIndex:DXBC_SIZES_BUFFER];
     }
 #undef SET_BUFFER
 #undef SET_TEXTURE
@@ -707,6 +799,15 @@ static void clear_uav(d3d_context *c, d3d_view *v, uint32_t value) {
     uint32_t *w = (uint32_t *)((uint8_t *)b.contents + off);
     for (NSUInteger i = 0; i < len / 4; i++) w[i] = value;
 }
+// CopyStructureCount: a UAV's counter into a buffer, on the GPU in order with the other work.
+static WINAPI void ctx_copy_structure_count(void *this, d3d_buffer *dst, uint32_t offset, d3d_view *v) {
+    d3d_context *c = this;
+    if (!dst || !v) return;
+    d3d_end_render(c);
+    id<MTLBlitCommandEncoder> blit = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) blitCommandEncoder];
+    [blit copyFromBuffer:counter_of(v) sourceOffset:0 toBuffer:(__bridge id<MTLBuffer>)dst->mtl destinationOffset:offset size:4];
+    [blit endEncoding];
+}
 static WINAPI void ctx_clear_uav_uint(void *this, d3d_view *v, const uint32_t *values) { clear_uav(this, v, values[0]); }
 static WINAPI void ctx_clear_uav_float(void *this, d3d_view *v, const float *values) { uint32_t bits; memcpy(&bits, &values[0], 4); clear_uav(this, v, bits); }
 
@@ -732,7 +833,7 @@ const d3d_method d3d_draw_context_methods[] = {
     { "CSSetShader", (void *)cs_set_shader }, { "CSSetConstantBuffers", (void *)cs_set_cbs }, { "CSSetShaderResources", (void *)cs_set_srvs },
     { "CSSetSamplers", (void *)cs_set_samplers }, { "CSSetUnorderedAccessViews", (void *)cs_set_uavs }, { "Dispatch", (void *)ctx_dispatch },
     { "OMSetRenderTargetsAndUnorderedAccessViews", (void *)om_set_targets_and_uavs },
-    { "ClearUnorderedAccessViewUint", (void *)ctx_clear_uav_uint }, { "ClearUnorderedAccessViewFloat", (void *)ctx_clear_uav_float },
+    { "CopyStructureCount", (void *)ctx_copy_structure_count }, { "ClearUnorderedAccessViewUint", (void *)ctx_clear_uav_uint }, { "ClearUnorderedAccessViewFloat", (void *)ctx_clear_uav_float },
     { NULL, NULL },
 };
 void d3d_draw_init(void) {

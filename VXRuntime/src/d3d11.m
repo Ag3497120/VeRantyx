@@ -162,6 +162,7 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, HRESULT *hr
     MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     if (desc[TD_BIND] & (BIND_RENDER_TARGET | BIND_DEPTH_STENCIL)) usage |= MTLTextureUsageRenderTarget;
     if (desc[TD_BIND] & BIND_UNORDERED_ACCESS) usage |= MTLTextureUsageShaderWrite;
+    if ((desc[TD_BIND] & BIND_UNORDERED_ACCESS) && (desc[TD_FORMAT] == 39 || desc[TD_FORMAT] == 42 || desc[TD_FORMAT] == 43)) usage |= MTLTextureUsageShaderAtomic;   // R32 (typeless, uint, sint): atomics
     td.usage = usage;
     int cpu = desc[TD_USAGE] == USAGE_STAGING || desc[TD_USAGE] == USAGE_DYNAMIC;
     td.storageMode = cpu && !is_depth(f) && samples == 1 ? MTLStorageModeShared : MTLStorageModePrivate;
@@ -215,26 +216,41 @@ static WINAPI HRESULT srv_qi(void *this, const GUID *iid, void **out) {
     return query(this, iid, out, known, 3);
 }
 static WINAPI void view_get_resource(void *this, void **out) { d3d_view *v = this; d3d_addref(v->resource); *out = v->resource; }
-static void view_destroy(d3d_object *o) { d3d_release(((d3d_view *)o)->resource); }
+void d3d_view_release_mtl(d3d_view *v) {
+    if (v->counter) CFRelease(v->counter);
+    if (v->mtl_view) CFRelease(v->mtl_view);
+    v->counter = v->mtl_view = v->mtl_src = NULL;
+}
+static void view_destroy(d3d_object *o) { d3d_view_release_mtl((d3d_view *)o); d3d_release(((d3d_view *)o)->resource); }
 
-// The views' descriptions: format, dimension, then per dimension the mip and slice fields. Only 2D and 2D-array
-// views are distinguished; others use the whole resource.
+// The views' descriptions: format, dimension, then per dimension the mip and slice fields (their layouts differ
+// between shader resource, render target and depth views).
 static d3d_view *make_view(d3d_device *dev, int kind, void **vtbl, d3d_object *res, const uint32_t *desc, int dsv) {
     d3d_view *v = d3d_alloc(sizeof *v, kind, vtbl, dev);
     v->resource = res;
     d3d_addref(res);
     v->base.destroy = view_destroy;
-    v->slices = 1;
     if (res->kind == K_TEXTURE) v->format = ((d3d_texture *)res)->desc[TD_FORMAT];
     if (desc) {
         if (desc[0]) v->format = desc[0];
-        uint32_t dim = desc[1];
+        uint32_t dim = v->dim = desc[1];
         const uint32_t *u = desc + (dsv ? 3 : 2);              // a DSV has a Flags field before its union
-        uint32_t tex2d = dsv ? 3 : 4, tex2d_array = dsv ? 4 : 5;   // the dimension values differ between RTVs and DSVs
         if (res->kind == K_BUFFER) { v->first = u[0]; v->count = u[1]; v->flags = dim == 11 ? u[2] : 0; }   // BUFFER / BUFFEREX
-        else if (dim == tex2d) v->mip = u[0];
-        else if (dim == tex2d_array) { v->mip = u[0]; v->first_slice = u[1]; v->slices = u[2]; }
+        else if (kind == K_SRV) {
+            switch (dim) {
+            case 2: case 4: case 8: case 9: v->mip = u[0]; v->mips = u[1]; break;                       // 1D, 2D, 3D, cube
+            case 3: case 5: v->mip = u[0]; v->mips = u[1]; v->first_slice = u[2]; v->slices = u[3]; break;   // arrays
+            case 10: v->mip = u[0]; v->mips = u[1]; v->first_slice = u[2]; v->slices = u[3] * 6; break;      // cube array
+            case 7: v->first_slice = u[0]; v->slices = u[1]; break;                                     // 2D MS array
+            }
+        } else {
+            uint32_t tex1d_array = dsv ? 2 : 3, tex2d = dsv ? 3 : 4, tex2d_array = dsv ? 4 : 5, ms_array = dsv ? 6 : 7;
+            if (dim == tex2d || dim == (dsv ? 1u : 2u)) v->mip = u[0];
+            else if (dim == tex2d_array || dim == tex1d_array || (!dsv && dim == 8)) { v->mip = u[0]; v->first_slice = u[1]; v->slices = u[2]; }
+            else if (dim == ms_array) { v->first_slice = u[0]; v->slices = u[1]; }
+        }
     }
+    if (!v->slices) v->slices = 1;
     return v;
 }
 

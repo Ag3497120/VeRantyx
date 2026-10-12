@@ -81,7 +81,16 @@ typedef struct {
 // D3D11_BUFFER_DESC as six fields: byte width, usage, bind flags, CPU access, misc flags, structure stride.
 typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; } d3d_buffer;
 // A view: of a texture (mip, slices), or of a buffer (first element and count; flags: raw).
-typedef struct { d3d_object base; d3d_object *resource; uint32_t format, mip, first_slice, slices, first, count, flags; } d3d_view;
+// A view: of a texture (dimension, first mip and mip count, slices), or of a buffer (first element and count;
+// flags: raw, append, counter). counter: a UAV's hidden counter (id<MTLBuffer> of 4 bytes, retained); mtl_view:
+// the Metal texture view shaders get (retained), made from mtl_src (the resource's Metal object at the time).
+typedef struct {
+    d3d_object base;
+    d3d_object *resource;
+    uint32_t format, dim, mip, mips, first_slice, slices, first, count, flags;
+    void *counter, *mtl_view, *mtl_src;
+} d3d_view;
+void d3d_view_release_mtl(d3d_view *v);
 struct d3d_draw_state;
 typedef struct {
     d3d_object base;                 // ID3D11DeviceContext

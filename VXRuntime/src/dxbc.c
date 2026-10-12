@@ -76,11 +76,11 @@ int dxbc_input_signature(const void *code, size_t size, dxbc_element *elements, 
 
 // ---- tokens --------------------------------------------------------------------------------------------------------------------
 enum {
-    OP_ADD = 0, OP_AND = 1, OP_BREAK = 2, OP_BREAKC = 3, OP_CASE = 6, OP_CONTINUE = 7, OP_CONTINUEC = 8, OP_DEFAULT = 10,
+    OP_ADD = 0, OP_AND = 1, OP_BREAK = 2, OP_BREAKC = 3, OP_CALL = 4, OP_CALLC = 5, OP_CASE = 6, OP_CONTINUE = 7, OP_CONTINUEC = 8, OP_DEFAULT = 10,
     OP_DERIV_RTX = 11, OP_DERIV_RTY = 12, OP_DISCARD = 13, OP_DIV = 14, OP_DP2 = 15, OP_DP3 = 16, OP_DP4 = 17, OP_ELSE = 18,
     OP_ENDIF = 21, OP_ENDLOOP = 22, OP_ENDSWITCH = 23, OP_EQ = 24, OP_EXP = 25, OP_FRC = 26, OP_FTOI = 27, OP_FTOU = 28,
     OP_GE = 29, OP_IADD = 30, OP_IF = 31, OP_IEQ = 32, OP_IGE = 33, OP_ILT = 34, OP_IMAD = 35, OP_IMAX = 36, OP_IMIN = 37,
-    OP_IMUL = 38, OP_INE = 39, OP_INEG = 40, OP_ISHL = 41, OP_ISHR = 42, OP_ITOF = 43, OP_LD = 45, OP_LD_MS = 46, OP_LOG = 47,
+    OP_IMUL = 38, OP_INE = 39, OP_INEG = 40, OP_ISHL = 41, OP_ISHR = 42, OP_ITOF = 43, OP_LABEL = 44, OP_LD = 45, OP_LD_MS = 46, OP_LOG = 47,
     OP_LOOP = 48, OP_LT = 49, OP_MAD = 50, OP_MIN = 51, OP_MAX = 52, OP_CUSTOMDATA = 53, OP_MOV = 54, OP_MOVC = 55, OP_MUL = 56,
     OP_NE = 57, OP_NOP = 58, OP_NOT = 59, OP_OR = 60, OP_RESINFO = 61, OP_RET = 62, OP_RETC = 63, OP_ROUND_NE = 64,
     OP_ROUND_NI = 65, OP_ROUND_PI = 66, OP_ROUND_Z = 67, OP_RSQ = 68, OP_SAMPLE = 69, OP_SAMPLE_C = 70, OP_SAMPLE_C_LZ = 71,
@@ -89,7 +89,12 @@ enum {
     OP_DCL_RESOURCE = 88, OP_DCL_CONSTANT_BUFFER = 89, OP_DCL_SAMPLER = 90, OP_DCL_INDEX_RANGE = 91, OP_DCL_INPUT = 95,
     OP_DCL_INPUT_SGV = 96, OP_DCL_INPUT_SIV = 97, OP_DCL_INPUT_PS = 98, OP_DCL_INPUT_PS_SGV = 99, OP_DCL_INPUT_PS_SIV = 100,
     OP_DCL_OUTPUT = 101, OP_DCL_OUTPUT_SGV = 102, OP_DCL_OUTPUT_SIV = 103, OP_DCL_TEMPS = 104, OP_DCL_INDEXABLE_TEMP = 105,
-    OP_DCL_GLOBAL_FLAGS = 106, OP_LOD = 108, OP_GATHER4 = 109, OP_DERIV_RTX_COARSE = 122, OP_DERIV_RTX_FINE = 123,
+    OP_DCL_GLOBAL_FLAGS = 106, OP_LOD = 108, OP_GATHER4 = 109, OP_SAMPLE_POS = 110, OP_SAMPLE_INFO = 111,
+    OP_GATHER4_C = 126, OP_GATHER4_PO = 127, OP_GATHER4_PO_C = 128, OP_UADDC = 132, OP_USUBB = 133, OP_SWAPC = 142,
+    OP_EVAL_SNAPPED = 203, OP_EVAL_SAMPLE_INDEX = 204, OP_EVAL_CENTROID = 205, OP_MSAD = 213,
+    OP_DADD = 191, OP_DMAX = 192, OP_DMIN = 193, OP_DMUL = 194, OP_DEQ = 195, OP_DGE = 196, OP_DLT = 197, OP_DNE = 198,
+    OP_DMOV = 199, OP_DMOVC = 200, OP_DTOF = 201, OP_FTOD = 202, OP_DDIV = 210, OP_DFMA = 211, OP_DRCP = 212,
+    OP_DTOI = 214, OP_DTOU = 215, OP_ITOD = 216, OP_UTOD = 217, OP_DERIV_RTX_COARSE = 122, OP_DERIV_RTX_FINE = 123,
     OP_BUFINFO = 121, OP_DERIV_RTY_COARSE = 124, OP_DERIV_RTY_FINE = 125, OP_RCP = 129, OP_F32TOF16 = 130, OP_F16TOF32 = 131, OP_COUNTBITS = 134,
     OP_FIRSTBIT_HI = 135, OP_FIRSTBIT_LO = 136, OP_FIRSTBIT_SHI = 137, OP_UBFE = 138, OP_IBFE = 139, OP_BFI = 140, OP_BFREV = 141,
     OP_DCL_THREAD_GROUP = 155, OP_DCL_UAV_TYPED = 156, OP_DCL_UAV_RAW = 157, OP_DCL_UAV_STRUCTURED = 158, OP_DCL_TGSM_RAW = 159,
@@ -104,7 +109,7 @@ enum {
 enum {
     OPD_TEMP = 0, OPD_INPUT = 1, OPD_OUTPUT = 2, OPD_INDEXABLE_TEMP = 3, OPD_IMM32 = 4, OPD_IMM64 = 5, OPD_SAMPLER = 6,
     OPD_RESOURCE = 7, OPD_CB = 8, OPD_ICB = 9, OPD_INPUT_PRIMITIVEID = 11, OPD_OUTPUT_DEPTH = 12, OPD_NULL = 13,
-    OPD_OUTPUT_COVERAGE = 15, OPD_UAV = 30, OPD_TGSM = 31, OPD_THREAD_ID = 32, OPD_THREAD_GROUP_ID = 33,
+    OPD_RASTERIZER = 14, OPD_OUTPUT_COVERAGE = 15, OPD_UAV = 30, OPD_TGSM = 31, OPD_THREAD_ID = 32, OPD_THREAD_GROUP_ID = 33,
     OPD_THREAD_ID_IN_GROUP = 34, OPD_INPUT_COVERAGE = 35, OPD_THREAD_INDEX_IN_GROUP = 36, OPD_OUTPUT_DEPTH_GE = 38, OPD_OUTPUT_DEPTH_LE = 39,
 };
 
@@ -149,8 +154,16 @@ static void read_operand(reader *r, pool *pl, operand *o) {
         for (int i = 0; i < n; i++) o->value[i] = next(r);
         if (n == 1) o->value[1] = o->value[2] = o->value[3] = o->value[0];
     } else if (o->type == OPD_IMM64) {
-        int n = o->ncomp == 2 ? 4 : 1;
-        for (int i = 0; i < n * 2; i++) next(r);                // doubles are not supported
+        // One or two doubles. Metal has no doubles: a double is kept as a float in its low word (high word 0).
+        int n = o->ncomp == 2 ? 2 : 1;
+        for (int i = 0; i < n; i++) {
+            uint64_t bits = next(r); bits |= (uint64_t)next(r) << 32;
+            double d; memcpy(&d, &bits, 8);
+            float f = (float)d; memcpy(&o->value[2 * i], &f, 4);
+            o->value[2 * i + 1] = 0;
+        }
+        if (n == 1) { o->value[2] = o->value[0]; o->value[3] = 0; }
+        o->type = OPD_IMM32;
     }
     for (int d = 0; d < o->dims; d++) {
         uint32_t rep = (t >> (22 + 3 * d)) & 7;
@@ -170,7 +183,10 @@ typedef struct {
     int nxt;
     uint8_t in_decl[32], out_decl[32];
     uint32_t in_sv[32], out_sv[32], in_interp[32];
-    uint8_t in_mask[32];
+    uint8_t in_mask[32], in_eval[32];      // in_eval: read through an interpolant (eval_* instructions)
+    int uses_msad;
+    const uint32_t *labels[64], *prog_end;    // subroutine bodies, the program's end
+    int sub_depth, nesting;                   // subroutines being inlined; loops and switches open in this one
     int out_depth, in_primid, in_coverage, out_coverage;
     uint8_t tex_dim[128], tex_ret[128], tex_cmp[128];
     uint32_t cb_size[16];
@@ -375,7 +391,6 @@ static void sample(gen *g, const instr *in) {
         break;
     case OP_SAMPLE_C: case OP_SAMPLE_C_LZ:
         compare = 1;
-        g->tex_cmp[t] = 1;
         src(g, &in->ops[4], &c0, 1, K_FLOAT, a, sizeof a);
         snprintf(extra, sizeof extra, ", %s%s", a, in->op == OP_SAMPLE_C_LZ ? ", level(0)" : "");
         break;
@@ -387,6 +402,7 @@ static void sample(gen *g, const instr *in) {
     }
     char call[4200];
     if (compare) snprintf(call, sizeof call, "float4(t%u.sample_compare(%s%s))", t, args, extra);
+    else if (g->tex_cmp[t]) snprintf(call, sizeof call, "float4(t%u.sample(%s%s), 0, 0, 1)", t, args, extra);   // a depth texture
     else snprintf(call, sizeof call, "t%u.sample(%s%s)", t, args, extra);
     // The resource operand's swizzle picks from the result; the destination takes its components.
     int comps[4], n = dest_comps(dst, comps);
@@ -427,17 +443,21 @@ static void load(gen *g, const instr *in) {
 static void resinfo(gen *g, const instr *in) {
     const operand *dst = &in->ops[0], *res = &in->ops[2];
     uint32_t t = res->index[0];
-    int dim = t < 128 ? g->tex_dim[t] : DIM_2D;
+    int uav = res->type == OPD_UAV;                          // a UAV texture: one mip level (the view's)
+    int dim = uav ? g->uav_dim[t & 7] : t < 128 ? g->tex_dim[t] : DIM_2D;
+    char name[16];
+    snprintf(name, sizeof name, "%c%u", uav ? 'u' : 't', uav ? t & 7 : t);
     char mip[700]; int c0 = 0;
     src(g, &in->ops[1], &c0, 1, K_UINT, mip, sizeof mip);
     char v[4][300];
-    snprintf(v[0], 300, "t%u.get_width(%s)", t, dim == DIM_BUFFER ? "" : mip);
-    snprintf(v[1], 300, dim == DIM_1D || dim == DIM_1DARRAY || dim == DIM_BUFFER ? "0u" : "t%u.get_height(%s)", t, mip);
-    if (dim == DIM_3D) snprintf(v[2], 300, "t%u.get_depth(%s)", t, mip);
-    else if (dim == DIM_1DARRAY || dim == DIM_2DARRAY || dim == DIM_CUBEARRAY || dim == DIM_2DMSARRAY) snprintf(v[2], 300, "t%u.get_array_size()", t);
+    const char *lod = dim == DIM_BUFFER || dim == DIM_2DMS || dim == DIM_2DMSARRAY || uav ? "" : mip;   // multisampled textures have one level
+    snprintf(v[0], 300, "%s.get_width(%s)", name, lod);
+    snprintf(v[1], 300, dim == DIM_1D || dim == DIM_1DARRAY || dim == DIM_BUFFER ? "0u" : "%s.get_height(%s)", name, lod);
+    if (dim == DIM_3D) snprintf(v[2], 300, "%s.get_depth(%s)", name, lod);
+    else if (dim == DIM_1DARRAY || dim == DIM_2DARRAY || dim == DIM_CUBEARRAY || dim == DIM_2DMSARRAY) snprintf(v[2], 300, "%s.get_array_size()", name);
     else snprintf(v[2], 300, "0u");
-    snprintf(v[3], 300, dim == DIM_BUFFER || dim == DIM_2DMS || dim == DIM_2DMSARRAY ? "1u" : "t%u.get_num_mip_levels()", t);
-    if (dim == DIM_BUFFER) snprintf(v[0], 300, "t%u.get_width()", t);
+    snprintf(v[3], 300, dim == DIM_BUFFER || dim == DIM_2DMS || dim == DIM_2DMSARRAY || uav ? "1u" : "%s.get_num_mip_levels()", name);
+    if (dim == DIM_BUFFER) snprintf(v[0], 300, "%s.get_width()", name);
     line(g, "{ uint4 vx_info = uint4(%s, %s, %s, %s);", v[0], v[1], v[2], v[3]);
     int comps[4], n = dest_comps(dst, comps);
     char sw[5];
@@ -574,20 +594,57 @@ static void bufinfo(gen *g, const instr *in) {
 }
 static void atomic(gen *g, const instr *in) {
     int imm = in->op >= OP_IMM_ATOMIC_ALLOC;
-    if (in->op == OP_IMM_ATOMIC_ALLOC || in->op == OP_IMM_ATOMIC_CONSUME) { fail(g, "append/consume buffers are not supported yet"); return; }
+    if (in->op == OP_IMM_ATOMIC_ALLOC || in->op == OP_IMM_ATOMIC_CONSUME) {   // a UAV's hidden counter: dst, u#
+        uint32_t u = in->ops[1].index[0] & 7;
+        g->sh->uav_counters |= (uint8_t)(1u << u);
+        g->sh->uses_sizes = 1;
+        char call[300];
+        snprintf(call, sizeof call, in->op == OP_IMM_ATOMIC_ALLOC ? "atomic_fetch_add_explicit(vx_counter(%u), 1u, memory_order_relaxed)"
+                                                                  : "(atomic_fetch_sub_explicit(vx_counter(%u), 1u, memory_order_relaxed) - 1u)", u);
+        assign(g, &in->ops[0], call, K_UINT, 1, 0);
+        return;
+    }
     const operand *res = &in->ops[imm ? 1 : 0], *addr = &in->ops[imm ? 2 : 1];
     const operand *v1 = &in->ops[imm ? 3 : 2], *v2 = in->nops > (imm ? 4 : 3) ? &in->ops[imm ? 4 : 3] : NULL;
-    if (res->type == OPD_UAV && g->sh->uav_kind[res->index[0] & 7] == DXBC_UAV_TYPED) { fail(g, "atomics on typed UAVs are not supported yet"); return; }
-    char m[64], a[1600];
-    uint32_t stride; int shared;
-    if (!memory(g, res, m, sizeof m, &stride, &shared)) return;
-    word_address(g, addr, 0, stride ? addr : NULL, 1, stride, a, sizeof a);
     uint32_t op = imm ? in->op - (OP_IMM_ATOMIC_IADD - OP_ATOMIC_IADD) : in->op;
     if (in->op == OP_IMM_ATOMIC_EXCH) op = 0;
     if (in->op == OP_IMM_ATOMIC_CMP_EXCH) op = OP_ATOMIC_CMP_STORE;
     if (in->op == OP_IMM_ATOMIC_AND) op = OP_ATOMIC_AND;
     if (in->op == OP_IMM_ATOMIC_OR) op = OP_ATOMIC_OR;
     if (in->op == OP_IMM_ATOMIC_XOR) op = OP_ATOMIC_XOR;
+    if (res->type == OPD_UAV && g->sh->uav_kind[res->index[0] & 7] == DXBC_UAV_TYPED) {   // a texture's atomics (Metal 3.1)
+        uint32_t i = res->index[0] & 7;
+        int dim = g->uav_dim[i], tk = g->uav_ret[i] == 3 ? K_INT : K_UINT;
+        if (g->uav_ret[i] != 3 && g->uav_ret[i] != 4) { fail(g, "atomics on a float typed UAV"); return; }
+        g->sh->uav_read[i] = 1;
+        char xy[700], slice[720], at[1500], v[700], w[700];
+        coords(g, addr, dim, K_UINT, xy, sizeof xy, slice, sizeof slice);
+        const char *ut = dim == DIM_1D || dim == DIM_1DARRAY || dim == DIM_BUFFER ? "uint" : dim == DIM_3D ? "uint3" : "uint2";
+        snprintf(at, sizeof at, "%s(%s)%s%s", ut, xy, slice[0] ? ", " : "", slice);
+        int c0 = 0;
+        src(g, v1, &c0, 1, tk, v, sizeof v);
+        const char *vec = type_name(tk, 4);
+        if (op == OP_ATOMIC_CMP_STORE) {
+            src(g, v2, &c0, 1, tk, w, sizeof w);
+            line(g, "{ %s vx_e = %s(%s);", vec, vec, v);
+            line(g, "  while (!u%u.atomic_compare_exchange_weak(%s, &vx_e, %s(%s)) && vx_e.x == %s) {}", i, at, vec, w, v);
+            if (imm) { g->indent++; assign(g, &in->ops[0], "vx_e.x", tk, 1, 0); g->indent--; }
+            line(g, "}");
+            return;
+        }
+        const char *fn = op == 0 ? "atomic_exchange" : op == OP_ATOMIC_AND ? "atomic_fetch_and" : op == OP_ATOMIC_OR ? "atomic_fetch_or" :
+                         op == OP_ATOMIC_XOR ? "atomic_fetch_xor" : op == OP_ATOMIC_IADD ? "atomic_fetch_add" :
+                         op == OP_ATOMIC_IMAX || op == OP_ATOMIC_UMAX ? "atomic_fetch_max" : "atomic_fetch_min";
+        char call[2600];
+        snprintf(call, sizeof call, "u%u.%s(%s, %s(%s)).x", i, fn, at, op == 0 ? vec : "", v);
+        if (imm) assign(g, &in->ops[0], call, tk, 1, 0);
+        else line(g, "%s;", call);
+        return;
+    }
+    char m[64], a[1600];
+    uint32_t stride; int shared;
+    if (!memory(g, res, m, sizeof m, &stride, &shared)) return;
+    word_address(g, addr, 0, stride ? addr : NULL, 1, stride, a, sizeof a);
     int is_signed = op == OP_ATOMIC_IMAX || op == OP_ATOMIC_IMIN;
     int kind = is_signed ? K_INT : K_UINT, c0 = 0;
     char ptr[1800], v[700], w[700];
@@ -609,6 +666,202 @@ static void atomic(gen *g, const instr *in) {
     snprintf(call, sizeof call, "%s(%s, %s, memory_order_relaxed)", fn, ptr, v);
     if (imm) assign(g, &in->ops[0], call, kind, 1, 0);
     else line(g, "%s;", call);
+}
+
+// gather4 (dst, addr, res, smp), gather4_c (+ ref), gather4_po (dst, addr, offset, res, smp), gather4_po_c (+ ref).
+// The sampler operand's swizzle picks the channel; programmable offsets move the coordinate by whole texels.
+static void gather(gen *g, const instr *in) {
+    int po = in->op == OP_GATHER4_PO || in->op == OP_GATHER4_PO_C, cmp = in->op == OP_GATHER4_C || in->op == OP_GATHER4_PO_C;
+    const operand *dst = &in->ops[0], *addr = &in->ops[1], *res = &in->ops[2 + po], *smp = &in->ops[3 + po];
+    uint32_t t = res->index[0];
+    int dim = t < 128 ? g->tex_dim[t] : DIM_2D;
+    int cube = dim == DIM_CUBE || dim == DIM_CUBEARRAY;
+    char xy[700], slice[720], args[2400], extra[800] = "", ref[700] = "";
+    int c0 = 0, c4[4] = { 0, 1, 2, 3 };
+    coords(g, addr, dim, K_FLOAT, xy, sizeof xy, slice, sizeof slice);
+    if (po && !cube) {
+        char off[700], moved[1600];
+        src(g, &in->ops[2], c4, 2, K_INT, off, sizeof off);
+        snprintf(moved, sizeof moved, "(%s + float2(%s) / float2(t%u.get_width(), t%u.get_height()))", xy, off, t, t);
+        snprintf(xy, sizeof xy, "%s", moved);
+    } else if ((in->offset[0] || in->offset[1]) && !cube) snprintf(extra, sizeof extra, ", int2(%d, %d)", in->offset[0], in->offset[1]);
+    snprintf(args, sizeof args, "s%u, %s%s%s", smp->index[0], xy, slice[0] ? ", " : "", slice);
+    char call[4000];
+    if (cmp) {
+        src(g, &in->ops[4 + po], &c0, 1, K_FLOAT, ref, sizeof ref);
+        snprintf(call, sizeof call, "t%u.gather_compare(%s, %s%s)", t, args, ref, extra);
+    } else if (g->tex_cmp[t]) snprintf(call, sizeof call, "t%u.gather(%s%s)", t, args, extra);
+    else {
+        static const char *comp[4] = { "component::x", "component::y", "component::z", "component::w" };
+        if (cube) snprintf(call, sizeof call, "t%u.gather(%s, %s)", t, args, comp[smp->swz[0] & 3]);
+        else snprintf(call, sizeof call, "t%u.gather(%s%s, %s)", t, args, extra[0] ? extra : ", int2(0)", comp[smp->swz[0] & 3]);
+    }
+    int comps[4], n = dest_comps(dst, comps);
+    char sw[5];
+    for (int i = 0; i < n; i++) sw[i] = CH[res->swz[comps[i]]];
+    sw[n] = 0;
+    char expr[4200];
+    int kind = g->tex_ret[t] == 3 && !g->tex_cmp[t] ? K_INT : g->tex_ret[t] == 4 && !g->tex_cmp[t] ? K_UINT : K_FLOAT;
+    snprintf(expr, sizeof expr, "%s.%s", call, sw);
+    assign(g, dst, expr, kind, n, in->saturate);
+}
+// lod: (clamped, unclamped, 0, 0) levels of detail, in fragment functions.
+static void lod(gen *g, const instr *in) {
+    const operand *dst = &in->ops[0], *addr = &in->ops[1], *res = &in->ops[2], *smp = &in->ops[3];
+    uint32_t t = res->index[0];
+    int dim = t < 128 ? g->tex_dim[t] : DIM_2D;
+    char v[1800] = "float4(0)";
+    if (g->sh->type == DXBC_PIXEL && dim != DIM_1D && dim != DIM_1DARRAY && dim != DIM_BUFFER) {
+        int c4[4] = { 0, 1, 2, 3 }, nc = dim == DIM_3D || dim == DIM_CUBE || dim == DIM_CUBEARRAY ? 3 : 2;
+        char xy[700];
+        src(g, addr, c4, nc, K_FLOAT, xy, sizeof xy);
+        snprintf(v, sizeof v, "float4(t%u.calculate_clamped_lod(s%u, %s), t%u.calculate_unclamped_lod(s%u, %s), 0, 0)", t, smp->index[0], xy, t, smp->index[0], xy);
+    }
+    int comps[4], n = dest_comps(dst, comps);
+    char sw[5], expr[1900];
+    for (int i = 0; i < n; i++) sw[i] = CH[res->swz[comps[i]]];
+    sw[n] = 0;
+    snprintf(expr, sizeof expr, "%s.%s", v, sw);
+    assign(g, dst, expr, K_FLOAT, n, in->saturate);
+}
+// sample_info (the sample count of the rasterizer or a texture) and samplepos (a sample's position from the pixel's
+// center), as floats or (sample_info_uint) uints.
+static void sample_query(gen *g, const instr *in) {
+    const operand *dst = &in->ops[0], *res = &in->ops[1];
+    int frag = g->sh->type == DXBC_PIXEL;
+    char count[300], v[1200];
+    if (res->type == OPD_RASTERIZER) snprintf(count, sizeof count, frag ? "get_num_samples()" : "1u");
+    else {
+        uint32_t t = res->index[0];
+        int dim = t < 128 ? g->tex_dim[t] : DIM_2D;
+        if (dim == DIM_2DMS || dim == DIM_2DMSARRAY) snprintf(count, sizeof count, "t%u.get_num_samples()", t);
+        else snprintf(count, sizeof count, "1u");
+    }
+    int as_uint = in->op == OP_SAMPLE_INFO && (in->token >> 11 & 1);
+    if (in->op == OP_SAMPLE_INFO) snprintf(v, sizeof v, as_uint ? "uint4(%s, 0u, 0u, 0u)" : "float4(float(%s), 0, 0, 0)", count);
+    else {
+        char i[700]; int c0 = 0;
+        src(g, &in->ops[2], &c0, 1, K_UINT, i, sizeof i);
+        if (frag) snprintf(v, sizeof v, "float4(get_sample_position(%s) - 0.5, 0, 0)", i);
+        else snprintf(v, sizeof v, "float4(0)");
+    }
+    int comps[4], n = dest_comps(dst, comps);
+    char sw[5], expr[1300];
+    for (int k = 0; k < n; k++) sw[k] = CH[res->swz[comps[k]]];
+    sw[n] = 0;
+    snprintf(expr, sizeof expr, "%s.%s", v, sw);
+    assign(g, dst, expr, as_uint ? K_UINT : K_FLOAT, n, in->saturate);
+}
+// eval_sample_index, eval_centroid, eval_snapped: an input interpolated at a sample, the centroid, or an offset
+// from the pixel's center in sixteenths of a pixel (the input becomes a Metal interpolant).
+static void evaluate(gen *g, const instr *in) {
+    const operand *dst = &in->ops[0], *v = &in->ops[1];
+    if (v->type != OPD_INPUT || g->sh->type != DXBC_PIXEL) { fail(g, "eval of operand type %d", v->type); return; }
+    uint32_t reg = v->index[v->dims - 1] & 31;
+    g->in_eval[reg] = 1;
+    char call[1200], a[700];
+    int c0 = 0, c2[2] = { 0, 1 };
+    if (in->op == OP_EVAL_CENTROID) snprintf(call, sizeof call, "vin.v%u.interpolate_at_centroid()", reg);
+    else if (in->op == OP_EVAL_SAMPLE_INDEX) { src(g, &in->ops[2], &c0, 1, K_UINT, a, sizeof a); snprintf(call, sizeof call, "vin.v%u.interpolate_at_sample(%s)", reg, a); }
+    else { src(g, &in->ops[2], c2, 2, K_INT, a, sizeof a); snprintf(call, sizeof call, "vin.v%u.interpolate_at_offset(float2(0.5) + float2(clamp(%s, -8, 7)) / 16.0)", reg, a); }
+    int comps[4], n = dest_comps(dst, comps);
+    char sw[5], expr[1300];
+    for (int k = 0; k < n; k++) sw[k] = CH[v->mode == 0 ? comps[k] : v->swz[comps[k]]];
+    sw[n] = 0;
+    snprintf(expr, sizeof expr, "%s.%s", call, sw);
+    char t[1400];
+    if (v->neg || v->abs) { snprintf(t, sizeof t, "%s%s%s%s", v->neg ? "-" : "", v->abs ? "abs(" : "", expr, v->abs ? ")" : ""); snprintf(expr, sizeof expr, "%s", t); }
+    assign(g, dst, expr, K_FLOAT, n, in->saturate);
+}
+// Two results from the same sources (uaddc, usubb: result and carry or borrow; swapc: both selections): the
+// sources are read into temporaries first, as a destination may be one of them.
+static void two_results(gen *g, const instr *in) {
+    int c4[4] = { 0, 1, 2, 3 };
+    char a[700], b[700], c[700];
+    src(g, &in->ops[2], c4, 4, K_UINT, a, sizeof a);
+    src(g, &in->ops[3], c4, 4, K_UINT, b, sizeof b);
+    if (in->op == OP_SWAPC) { src(g, &in->ops[4], c4, 4, K_UINT, c, sizeof c); line(g, "{ uint4 vx_c = %s, vx_a = %s, vx_b = %s;", a, b, c); }
+    else line(g, "{ uint4 vx_a = %s, vx_b = %s;", a, b);
+    static const char *fmt[3][2] = {
+        { "(vx_a + vx_b)", "select(uint4(0u), uint4(1u), vx_a + vx_b < vx_a)" },         // uaddc
+        { "(vx_a - vx_b)", "select(uint4(0u), uint4(1u), vx_a < vx_b)" },                // usubb
+        { "select(vx_a, vx_b, vx_c != 0u)", "select(vx_b, vx_a, vx_c != 0u)" },          // swapc
+    };
+    int which = in->op == OP_UADDC ? 0 : in->op == OP_USUBB ? 1 : 2;
+    g->indent++;
+    for (int k = 0; k < 2; k++) {
+        if (in->ops[k].type == OPD_NULL) continue;
+        int comps[4], n = dest_comps(&in->ops[k], comps);
+        char sw[5], expr[300];
+        for (int i = 0; i < n; i++) sw[i] = CH[comps[i]];
+        sw[n] = 0;
+        snprintf(expr, sizeof expr, "%s.%s", fmt[which][k], sw);
+        assign(g, &in->ops[k], expr, K_UINT, n, 0);
+    }
+    g->indent--;
+    line(g, "}");
+}
+
+// Double-precision instructions, approximated in single precision (Metal has no doubles): a double register
+// pair holds a float in its low word and zero in its high word. Results that are doubles fill destination
+// pairs (.xy, .zw); 32-bit results take a component per double.
+static void double_op(gen *g, const instr *in) {
+    const operand *dst = &in->ops[0];
+    if (dst->type == OPD_NULL) return;
+    int op = (int)in->op;
+    int to_double = op == OP_DADD || op == OP_DMAX || op == OP_DMIN || op == OP_DMUL || op == OP_DMOV || op == OP_DMOVC ||
+                    op == OP_FTOD || op == OP_DDIV || op == OP_DFMA || op == OP_DRCP || op == OP_ITOD || op == OP_UTOD;
+    // The destination slots: the low component of each pair (doubles) or each component (32-bit results).
+    int slot[4], n = 0;
+    for (int c = 0; c < 4 && n < 2; c++) {
+        if (dst->ncomp != 2) { slot[n++] = 0; break; }
+        if (to_double ? !(c & 1) && (dst->mask & (3 << c)) : (dst->mask & (1 << c))) slot[n++] = c;
+    }
+    char vals[2][1800];
+    for (int k = 0; k < n; k++) {
+        // The source component that holds this double's value (or this 32-bit input).
+        int from32 = op == OP_FTOD || op == OP_ITOD || op == OP_UTOD;
+        int pos = to_double ? (from32 ? k : slot[k]) : 2 * k;
+        char a[700] = "", b[700] = "", c[700] = "";
+        int kin = op == OP_ITOD ? K_INT : op == OP_UTOD ? K_UINT : K_FLOAT;
+        int first = op == OP_DMOVC ? 2 : 1;
+        if (op == OP_DMOVC) src(g, &in->ops[1], &pos, 1, K_UINT, c, sizeof c);
+        src(g, &in->ops[first], &pos, 1, kin, a, sizeof a);
+        if (in->nops > first + 1) src(g, &in->ops[first + 1], &pos, 1, K_FLOAT, b, sizeof b);
+        char d3[700] = "";
+        if (op == OP_DFMA) src(g, &in->ops[3], &pos, 1, K_FLOAT, d3, sizeof d3);
+        switch (op) {
+        case OP_DADD: snprintf(vals[k], sizeof vals[k], "(%s + %s)", a, b); break;
+        case OP_DMUL: snprintf(vals[k], sizeof vals[k], "(%s * %s)", a, b); break;
+        case OP_DDIV: snprintf(vals[k], sizeof vals[k], "(%s / %s)", a, b); break;
+        case OP_DMAX: snprintf(vals[k], sizeof vals[k], "fmax(%s, %s)", a, b); break;
+        case OP_DMIN: snprintf(vals[k], sizeof vals[k], "fmin(%s, %s)", a, b); break;
+        case OP_DFMA: snprintf(vals[k], sizeof vals[k], "fma(%s, %s, %s)", a, b, d3); break;
+        case OP_DRCP: snprintf(vals[k], sizeof vals[k], "(1.0 / %s)", a); break;
+        case OP_DMOVC: snprintf(vals[k], sizeof vals[k], "select(%s, %s, %s != 0u)", b, a, c); break;
+        case OP_DEQ: snprintf(vals[k], sizeof vals[k], "as_type<float>(select(0u, 0xffffffffu, %s == %s))", a, b); break;
+        case OP_DNE: snprintf(vals[k], sizeof vals[k], "as_type<float>(select(0u, 0xffffffffu, %s != %s))", a, b); break;
+        case OP_DLT: snprintf(vals[k], sizeof vals[k], "as_type<float>(select(0u, 0xffffffffu, %s < %s))", a, b); break;
+        case OP_DGE: snprintf(vals[k], sizeof vals[k], "as_type<float>(select(0u, 0xffffffffu, %s >= %s))", a, b); break;
+        case OP_DTOI: snprintf(vals[k], sizeof vals[k], "as_type<float>(int(%s))", a); break;
+        case OP_DTOU: snprintf(vals[k], sizeof vals[k], "as_type<float>(uint(%s))", a); break;
+        case OP_ITOD: case OP_UTOD: snprintf(vals[k], sizeof vals[k], "float(%s)", a); break;
+        default: snprintf(vals[k], sizeof vals[k], "%s", a); break;      // dmov, dtof, ftod
+        }
+    }
+    line(g, "{");
+    g->indent++;
+    for (int k = 0; k < n; k++) line(g, "float vx_d%d = %s;", k, vals[k]);
+    for (int k = 0; k < n; k++) {
+        operand d = *dst;
+        char e[32];
+        snprintf(e, sizeof e, "vx_d%d", k);
+        d.mask = (uint8_t)(1 << slot[k]);
+        assign(g, &d, e, K_FLOAT, 1, to_double ? 0 : in->saturate);
+        if (to_double && dst->ncomp == 2) { d.mask = (uint8_t)(1 << (slot[k] + 1)); assign(g, &d, "0u", K_UINT, 1, 0); }
+    }
+    g->indent--;
+    line(g, "}");
 }
 
 static void translate(gen *g, const instr *in) {
@@ -721,6 +974,12 @@ static void translate(gen *g, const instr *in) {
     case OP_SAMPLE: case OP_SAMPLE_L: case OP_SAMPLE_B: case OP_SAMPLE_D: case OP_SAMPLE_C: case OP_SAMPLE_C_LZ: sample(g, in); break;
     case OP_LD: case OP_LD_MS: load(g, in); break;
     case OP_RESINFO: resinfo(g, in); break;
+    case OP_GATHER4: case OP_GATHER4_C: case OP_GATHER4_PO: case OP_GATHER4_PO_C: gather(g, in); break;
+    case OP_LOD: lod(g, in); break;
+    case OP_SAMPLE_INFO: case OP_SAMPLE_POS: sample_query(g, in); break;
+    case OP_EVAL_SNAPPED: case OP_EVAL_SAMPLE_INDEX: case OP_EVAL_CENTROID: evaluate(g, in); break;
+    case OP_UADDC: case OP_USUBB: case OP_SWAPC: two_results(g, in); break;
+    case OP_MSAD: g->uses_msad = 1; componentwise(g, in, K_UINT, K_UINT, "vx_msad(%1$s, %2$s, %3$s)"); break;
     case OP_IF: { char c[800]; condition(g, in, &in->ops[0], c, sizeof c); line(g, "if (%s) {", c); g->indent++; break; }
     case OP_ELSE: g->indent--; line(g, "} else {"); g->indent++; break;
     case OP_ENDIF: case OP_ENDLOOP: case OP_ENDSWITCH: g->indent--; line(g, "}"); break;
@@ -746,6 +1005,7 @@ static void translate(gen *g, const instr *in) {
         break;
     default:
         if (in->op >= OP_ATOMIC_AND && in->op <= OP_IMM_ATOMIC_UMIN) { atomic(g, in); break; }
+        if ((in->op >= OP_DADD && in->op <= OP_FTOD) || (in->op >= OP_DDIV && in->op <= OP_DRCP) || (in->op >= OP_DTOI && in->op <= OP_UTOD)) { double_op(g, in); break; }
         fail(g, "instruction %u is not supported yet", in->op);
         break;
     }
@@ -896,11 +1156,17 @@ static char *compose(gen *g) {
     text t = { 0 };
     int vs = sh->type == DXBC_VERTEX, ps = sh->type == DXBC_PIXEL, cs = sh->type == DXBC_COMPUTE;
     put(&t, "#include <metal_stdlib>\nusing namespace metal;\n\n");
+    if (g->sh->uav_counters)
+        put(&t, "struct VxCounters { device atomic_uint *c[8]; };\n#define vx_counter(u) ((*reinterpret_cast<constant VxCounters *>(vx_sizes + 32)).c[u])\n\n");
+    if (g->uses_msad)
+        put(&t, "template <typename T> T vx_msad(T r, T s, T a) {\n"
+                "    for (uint i = 0; i < 32; i += 8) { T rb = (r >> i) & 0xffu, sb = (s >> i) & 0xffu; a += select(T(0u), absdiff(rb, sb), rb != 0u); }\n"
+                "    return a;\n}\n\n");
     if (g->icb_n) {
         put(&t, "constant uint4 icb_bits[%u] = {", g->icb_n / 4);
         for (uint32_t i = 0; i + 3 < g->icb_n; i += 4)
             put(&t, "%s\n    uint4(0x%xu, 0x%xu, 0x%xu, 0x%xu)", i ? "," : "", g->icb[i], g->icb[i + 1], g->icb[i + 2], g->icb[i + 3]);
-        put(&t, "\n};\n#define icb as_type<constant float4 *>(icb_bits)\n\n");
+        put(&t, "\n};\n#define icb reinterpret_cast<constant float4 *>(icb_bits)\n\n");
     }
     if (cs) {
         put(&t, "#define VX_RETURN return\n\n");
@@ -924,7 +1190,11 @@ static char *compose(gen *g) {
         if (!g->in_decl[r]) continue;
         if (vs && !g->in_sv[r]) { put(&t, "    %s v%d [[attribute(%d)]];\n", vec_type(component_type(sh->inputs, sh->ninputs, (uint32_t)r)), r, r); has_in = 1; }
         if (ps && g->in_sv[r] == 1) { put(&t, "    float4 v%d [[position]];\n", r); has_in = 1; }
-        if (ps && !g->in_sv[r]) { put(&t, "    float4 v%d [[user(r%d)]]%s;\n", r, r, interp_qualifier(g->in_interp[r])); has_in = 1; }
+        if (ps && !g->in_sv[r] && g->in_eval[r]) {
+            uint32_t m = g->in_interp[r];
+            put(&t, "    interpolant<float4, interpolation::%s> v%d [[user(r%d)]];\n", m == 4 || m == 5 || m == 7 ? "no_perspective" : "perspective", r, r);
+            has_in = 1;
+        } else if (ps && !g->in_sv[r]) { put(&t, "    float4 v%d [[user(r%d)]]%s;\n", r, r, interp_qualifier(g->in_interp[r])); has_in = 1; }
     }
     put(&t, "};\n");
     // Stage outputs.
@@ -937,6 +1207,12 @@ static char *compose(gen *g) {
         if (ps) put(&t, "    %s o%d [[color(%d)]];\n", vec_type(component_type(sh->outputs, sh->noutputs, (uint32_t)r)), r, r);
         fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%sas_type<%s>(o%d)", fk ? ", " : "",
                                ps ? vec_type(component_type(sh->outputs, sh->noutputs, (uint32_t)r)) : "float4", r);
+    }
+    int has_position = 0;
+    for (int r = 0; r < 32; r++) if (g->out_decl[r] && g->out_sv[r] == 1) has_position = 1;
+    if (vs && !has_position) {                                  // a vertex shader for stream output only: Metal wants a position
+        put(&t, "    float4 vx_position [[position]];\n");
+        fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%sfloat4(0)", fk ? ", " : "");
     }
     if (g->out_depth) { put(&t, "    float oDepth [[depth(any)]];\n"); fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%soDepth", fk ? ", " : ""); }
     if (g->out_coverage) { put(&t, "    uint oMask [[sample_mask]];\n"); fk += (size_t)snprintf(finish + fk, sizeof finish - fk, "%soMask", fk ? ", " : ""); }
@@ -960,6 +1236,10 @@ static char *compose(gen *g) {
         else if (ps && sv == 10) put(&t, "    float4 v%d = 0; v%d.%c = as_type<float>(vx_sample_id);\n", r, r, CH[c]);
         else if (ps && sv == 7) put(&t, "    float4 v%d = 0; v%d.%c = as_type<float>(vx_primitive);\n", r, r, CH[c]);
         else if (sv && sv != 1) put(&t, "    float4 v%d = 0;\n", r);
+        else if (ps && g->in_eval[r]) {
+            uint32_t m = g->in_interp[r];
+            put(&t, "    float4 v%d = vin.v%d.%s;\n", r, r, m == 3 || m == 5 ? "interpolate_at_centroid()" : m == 6 || m == 7 ? "interpolate_at_sample(vx_sample_id)" : "interpolate_at_center()");
+        }
         else put(&t, "    float4 v%d = as_type<float4>(vin.v%d);\n", r, r);
     }
     if (g->out_depth) put(&t, "    float oDepth = 0;\n");
@@ -968,6 +1248,75 @@ static char *compose(gen *g) {
     if (g->in_coverage) put(&t, "    float vCoverage = as_type<float>(vx_coverage);\n");
     put(&t, "%s    VX_RETURN;\n}\n", g->body.s ? g->body.s : "");
     return t.s;
+}
+
+// Translates instructions from `p` to the end of the function they belong to (the program's end, or the next
+// label). A call inlines the subroutine's body (Direct3D has no recursion) in a one-pass loop, its returns
+// becoming breaks. Returns nonzero for a truncated program.
+static int run(gen *g, const uint32_t *p) {
+    reader r = { p, g->prog_end, 0 };
+    while (r.p < r.end && !g->why[0]) {
+        const uint32_t *start = r.p;
+        uint32_t token = next(&r), op = token & 0x7ff;
+        uint32_t length = (token >> 24) & 0x7f;
+        if (op == OP_CUSTOMDATA) {
+            uint32_t total = next(&r), cls = token >> 11;
+            if (cls == 3 && total >= 2 && !g->icb) {            // the immediate constant buffer
+                g->icb_n = total - 2;
+                g->icb = malloc(sizeof(uint32_t) * (g->icb_n ? g->icb_n : 1));
+                memcpy(g->icb, r.p, sizeof(uint32_t) * g->icb_n);
+            }
+            r.p = start + (total ? total : 2);
+            continue;
+        }
+        if (!length) { fail(g, "bad instruction length"); return 1; }
+        if (op == OP_LABEL) break;
+        const uint32_t *end = start + length;
+        pool pl = { .used = 0 };
+        instr in;
+        memset(&in, 0, sizeof in);
+        in.op = op; in.token = token;
+        in.saturate = (token >> 13) & 1;
+        in.test_nonzero = (token >> 18) & 1;
+        in.ret_type = (token >> 11) & 3;
+        uint32_t ext = token;
+        while (ext & 0x80000000u) {                              // extended opcode tokens: texel offsets
+            ext = next(&r);
+            if ((ext & 0x3f) == 1) {
+                for (int k = 0; k < 3; k++) { int v = (int)((ext >> (9 + 4 * k)) & 0xf); in.offset[k] = v >= 8 ? v - 16 : v; }
+            }
+        }
+        if ((op >= OP_DCL_RESOURCE && op <= OP_DCL_GLOBAL_FLAGS) || (op >= OP_DCL_THREAD_GROUP && op <= OP_DCL_RESOURCE_STRUCTURED))
+            declare(g, op, token, &r, &pl);
+        else if (op >= 143 && op <= 154) { /* streams, interfaces, tessellation: later */ }
+        else if (op == OP_CALL || op == OP_CALLC) {
+            while (r.p < end && in.nops < 8) read_operand(&r, &pl, &in.ops[in.nops++]);
+            const operand *label = &in.ops[op == OP_CALLC ? 1 : 0];
+            const uint32_t *body = label->index[0] < 64 ? g->labels[label->index[0]] : NULL;
+            if (!body || g->sub_depth >= 8) { fail(g, "call to an unknown or too deeply nested subroutine"); return 0; }
+            if (op == OP_CALLC) { char c[800]; condition(g, &in, &in.ops[0], c, sizeof c); line(g, "if (%s) {", c); g->indent++; }
+            line(g, "for (int vx_sub%d = 0; vx_sub%d < 1; vx_sub%d++) {", g->sub_depth, g->sub_depth, g->sub_depth);
+            g->indent++;
+            int saved = g->nesting;
+            g->nesting = 0; g->sub_depth++;
+            if (run(g, body)) return 1;
+            g->sub_depth--; g->nesting = saved;
+            g->indent--;
+            line(g, "}");
+            if (op == OP_CALLC) { g->indent--; line(g, "}"); }
+        } else {
+            while (r.p < end && in.nops < 8) read_operand(&r, &pl, &in.ops[in.nops++]);
+            if (op == OP_LOOP || op == OP_SWITCH) g->nesting++;
+            if (op == OP_ENDLOOP || op == OP_ENDSWITCH) g->nesting--;
+            if (g->sub_depth && (op == OP_RET || op == OP_RETC)) {
+                if (g->nesting) { fail(g, "a return inside a loop or switch of a subroutine"); return 0; }
+                if (op == OP_RET) line(g, "break;");
+                else { char c[800]; condition(g, &in, &in.ops[0], c, sizeof c); line(g, "if (%s) break;", c); }
+            } else translate(g, &in);
+        }
+        r.p = end;
+    }
+    return r.bad;
 }
 
 int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
@@ -987,47 +1336,40 @@ int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
     gen g;
     memset(&g, 0, sizeof g);
     g.sh = out;
-    reader r = { tok + 2, tok + count, 0 };
-    while (r.p < r.end && !g.why[0]) {
-        const uint32_t *start = r.p;
-        uint32_t token = next(&r), op = token & 0x7ff;
-        uint32_t length = (token >> 24) & 0x7f;
-        if (op == OP_CUSTOMDATA) {
-            uint32_t total = next(&r), cls = token >> 11;
-            if (cls == 3 && total >= 2) {                       // the immediate constant buffer
-                g.icb_n = total - 2;
-                g.icb = malloc(sizeof(uint32_t) * (g.icb_n ? g.icb_n : 1));
-                memcpy(g.icb, r.p, sizeof(uint32_t) * g.icb_n);
-            }
-            r.p = start + (total ? total : 2);
-            continue;
+    // First pass: textures sampled or gathered with a comparison are depth textures in Metal.
+    for (reader q = { tok + 2, tok + count, 0 }; q.p < q.end && !q.bad;) {
+        const uint32_t *start = q.p;
+        uint32_t token = next(&q), op = token & 0x7ff, length = (token >> 24) & 0x7f;
+        if (op == OP_CUSTOMDATA) { uint32_t total = next(&q); q.p = start + (total ? total : 2); continue; }
+        if (!length) break;
+        if (op == OP_SAMPLE_C || op == OP_SAMPLE_C_LZ || op == OP_GATHER4_C || op == OP_GATHER4_PO_C) {
+            pool pl = { .used = 0 };
+            operand ops[4];
+            uint32_t ext = token;
+            while (ext & 0x80000000u) ext = next(&q);
+            int want = op == OP_GATHER4_PO_C ? 4 : 3;
+            for (int k = 0; k < want && q.p < start + length; k++) read_operand(&q, &pl, &ops[k]);
+            if (ops[want - 1].type == OPD_RESOURCE && ops[want - 1].index[0] < 128) g.tex_cmp[ops[want - 1].index[0]] = 1;
         }
-        if (!length) { snprintf(out->error, sizeof out->error, "bad instruction length"); free(g.icb); return -1; }
-        const uint32_t *end = start + length;
-        pool pl = { .used = 0 };
-        instr in;
-        memset(&in, 0, sizeof in);
-        in.op = op; in.token = token;
-        in.saturate = (token >> 13) & 1;
-        in.test_nonzero = (token >> 18) & 1;
-        in.ret_type = (token >> 11) & 3;
-        uint32_t ext = token;
-        while (ext & 0x80000000u) {                              // extended opcode tokens: texel offsets
-            ext = next(&r);
-            if ((ext & 0x3f) == 1) {
-                for (int k = 0; k < 3; k++) { int v = (int)((ext >> (9 + 4 * k)) & 0xf); in.offset[k] = v >= 8 ? v - 16 : v; }
-            }
-        }
-        if ((op >= OP_DCL_RESOURCE && op <= OP_DCL_GLOBAL_FLAGS) || (op >= OP_DCL_THREAD_GROUP && op <= OP_DCL_RESOURCE_STRUCTURED))
-            declare(&g, op, token, &r, &pl);
-        else if (op >= 143 && op <= 154) { /* streams, interfaces, tessellation: later */ }
-        else {
-            while (r.p < end && in.nops < 8) read_operand(&r, &pl, &in.ops[in.nops++]);
-            translate(&g, &in);
-        }
-        r.p = end;
+        q.p = start + length;
     }
-    if (g.why[0] || r.bad) {
+    // Subroutines: where each label's body starts (the main program ends at the first label).
+    for (reader q = { tok + 2, tok + count, 0 }; q.p < q.end && !q.bad;) {
+        const uint32_t *start = q.p;
+        uint32_t token = next(&q), op = token & 0x7ff, length = (token >> 24) & 0x7f;
+        if (op == OP_CUSTOMDATA) { uint32_t total = next(&q); q.p = start + (total ? total : 2); continue; }
+        if (!length) break;
+        if (op == OP_LABEL) {
+            pool pl = { .used = 0 };
+            operand o;
+            read_operand(&q, &pl, &o);
+            if (o.index[0] < 64) g.labels[o.index[0]] = start + length;
+        }
+        q.p = start + length;
+    }
+    g.prog_end = tok + count;
+    int bad = run(&g, tok + 2);
+    if (g.why[0] || bad) {
         snprintf(out->error, sizeof out->error, "%s", g.why[0] ? g.why : "truncated program");
         free(g.body.s); free(g.icb);
         return -1;
