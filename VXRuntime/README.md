@@ -47,7 +47,8 @@ Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the 
 | 7a. Compute shaders and UAVs: raw/structured buffers, typed UAV textures, thread-group shared memory, barriers, atomics, Dispatch, UAV clears | `tests/compute.c` | Works (2026-10-12) |
 | 7b. Raw input (WM_INPUT mouse deltas, buttons, wheel, keys), SendInput, mouse-look (hidden cursor + ClipCursor), XInput on the Game Controller framework | `tests/input.c` | Works (2026-10-12) |
 | 7c. WASAPI on Core Audio: MMDevice enumerator/endpoint/properties, shared event-driven IAudioClient, render client, clock, volume (Core Audio converts formats and rates) | `tests/audio.c` (`--tone` plays a quiet tone) | Works (2026-10-12) |
-| 8. Geometry and tessellation shaders (Metal has neither: emulation with compute), XAudio2 on top of WASAPI, audio capture, FH4 C++ exceptions (needs MSVC-built test programs), Direct3D 11 at game scale | — | Next |
+| 8a. XAudio2 2.8/2.9 on Core Audio: mastering, submix and source voices, an engine thread mixing 10 ms passes (8/16/24/32-bit and float PCM, resampling by frequency ratio, loops, output matrices, volumes), voice and engine callbacks; effects and filters accepted but not applied | `tests/xaudio2.c` (`--tone` plays a quiet tone) | Works (2026-10-12) |
+| 8. Geometry and tessellation shaders (Metal has neither: emulation with compute), audio capture, FH4 C++ exceptions (needs MSVC-built test programs), Direct3D 11 at game scale | — | Next |
 | 9. Direct3D 12 (Metal Shader Converter), OpenGL | — | |
 | 10. Cryptography, processes, Chromium-class programs (the Steam client) | — | |
 

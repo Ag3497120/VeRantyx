@@ -625,6 +625,7 @@ int main(int argc, char **argv, char **envp) {
     vx_com_init();
     vx_input_init();
     vx_audio_init();
+    vx_xaudio2_init();
     vx_d3d11_init();
     vx_dxgi_init();
     vx_vcruntime_init();
