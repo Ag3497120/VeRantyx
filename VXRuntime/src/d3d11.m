@@ -1016,7 +1016,7 @@ static WINAPI HRESULT D3D11CreateDevice(void *adapter, uint32_t driver, HANDLE s
     d->flags = flags; d->feature_level = level; d->max_latency = 3;
     d->apple_family = d3d_apple_family((__bridge void *)mtl);
     static int told;
-    if (!told++) vx_log("Direct3D: %s, Apple GPU family %d%s", mtl.name.UTF8String, d->apple_family,
+    if (vx_trace && !told++) vx_log("Direct3D: %s, Apple GPU family %d%s", mtl.name.UTF8String, d->apple_family,
                         d->apple_family >= 10 ? " (M5 generation or later)" : d->apple_family == 9 ? " (M3/M4 generation)" :
                         d->apple_family == 8 ? " (M2 generation)" : d->apple_family == 7 ? " (M1 generation)" : "");
     d3d_context *c = d3d_alloc(sizeof *c, K_CONTEXT, g_context_vtbl, d);

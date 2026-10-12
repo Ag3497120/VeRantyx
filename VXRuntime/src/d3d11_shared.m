@@ -33,6 +33,8 @@ typedef struct {
     volatile int64_t key;            // keyed mutex: the key it was released with
     volatile int32_t owner;          // and who holds it (0: nobody)
     volatile uint32_t released;      // counts releases: waiters in other processes sleep on it
+    volatile int32_t gpu_pending;    // releases whose GPU work has not finished yet (by gpu_pid; others wait for 0)
+    volatile int32_t gpu_pid;
 } shared_slot;
 typedef struct { volatile uint32_t spin; shared_slot s[SLOTS]; } shared_table;
 static shared_table *g_table;
@@ -42,7 +44,7 @@ static shared_table *table(void) {
     uint64_t h = 1469598103934665603ull;
     for (const char *c = vx_root(); *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
     char name[32];
-    snprintf(name, sizeof name, "/vxsh.%08llx", (unsigned long long)(h & 0xffffffffull));
+    snprintf(name, sizeof name, "/vxsh2.%08llx", (unsigned long long)(h & 0xffffffffull));   // (2: the slot layout)
     int fd = shm_open(name, O_RDWR | O_CREAT, 0600);
     if (fd < 0) return NULL;
     struct stat st;
@@ -236,7 +238,8 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
     struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
     for (;;) {
         int32_t free_owner = 0;
-        if ((uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && __atomic_compare_exchange_n(&e->owner, &free_owner, (int32_t)getpid(), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        int gpu_ready = !__atomic_load_n(&e->gpu_pending, __ATOMIC_ACQUIRE) || e->gpu_pid == (int32_t)getpid();   // the releaser's own queue keeps the order
+        if (gpu_ready && (uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && __atomic_compare_exchange_n(&e->owner, &free_owner, (int32_t)getpid(), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             return S_OK;
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         uint64_t elapsed = (uint64_t)(now.tv_sec - start.tv_sec) * 1000 + (uint64_t)((now.tv_nsec - start.tv_nsec) / 1000000);
@@ -247,7 +250,8 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
         }
         // Sleep until a release (any process) or 2 ms, then look again.
         uint32_t seen = __atomic_load_n(&e->released, __ATOMIC_ACQUIRE);
-        if ((uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && !__atomic_load_n(&e->owner, __ATOMIC_ACQUIRE)) continue;
+        if ((uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && !__atomic_load_n(&e->owner, __ATOMIC_ACQUIRE) &&
+            (!__atomic_load_n(&e->gpu_pending, __ATOMIC_ACQUIRE) || e->gpu_pid == (int32_t)getpid())) continue;
         if (__builtin_available(macOS 14.4, *))
             os_sync_wait_on_address_with_timeout((void *)&e->released, seen, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED, OS_CLOCK_MACH_ABSOLUTE_TIME, 2000000);
         else usleep(200);
@@ -260,8 +264,9 @@ static void publish_release(shared_slot *e, uint64_t key) {
     __atomic_add_fetch(&e->released, 1, __ATOMIC_RELEASE);
     if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&e->released, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
 }
-// ReleaseSync commits the work drawn so far and returns at once: the release is published when the GPU has
-// finished it (a completion handler on a command buffer queued behind it), so the CPU and GPU keep working in
+// ReleaseSync commits the work drawn so far and returns at once, giving up ownership at once as Windows does; the
+// slot counts the release as pending on the GPU until a completion handler queued behind the work clears it, and
+// only another process waits for that (this process's queue keeps the order). The CPU and GPU so keep working in
 // parallel instead of stopping at every frame handed over. VXRT_SYNC_RELEASE=1 waits for the GPU instead.
 static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
     d3d_texture *t = keyed_of(this);
@@ -271,9 +276,17 @@ static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
     shared_slot *slot_e = &table()->s[t->shared - 1];
     if (!sync_release && !getenv("VXRT_SHARED_SNAPSHOT")) {
         if (getenv("VXRT_TRACE_KEYED")) vx_log("keyed mutex slot %d: ReleaseSync(%llu) by %d, published when the GPU is done", t->shared - 1, (unsigned long long)key, (int)getpid());
+        __atomic_store_n(&slot_e->gpu_pid, (int32_t)getpid(), __ATOMIC_RELEASE);
+        __atomic_add_fetch(&slot_e->gpu_pending, 1, __ATOMIC_ACQ_REL);
+        publish_release(slot_e, key);
         d3d_flush(t->base.dev, 0);
         id<MTLCommandBuffer> fence = [(__bridge id<MTLCommandQueue>)t->base.dev->queue commandBuffer];
-        [fence addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; publish_release(slot_e, key); }];
+        [fence addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)done;
+            __atomic_sub_fetch(&slot_e->gpu_pending, 1, __ATOMIC_ACQ_REL);
+            __atomic_add_fetch(&slot_e->released, 1, __ATOMIC_RELEASE);
+            if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&slot_e->released, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+        }];
         [fence commit];
         return S_OK;
     }
