@@ -606,8 +606,18 @@ static WINAPI DWORD NtQueryVirtualMemory(HANDLE p, const void *addr, int cls, vo
 }
 static WINAPI DWORD LdrLockLoaderLock(DWORD flags, DWORD *state, uintptr_t *cookie) { (void)flags; if (state) *state = 1; if (cookie) *cookie = 1; return 0; }
 static WINAPI DWORD LdrUnlockLoaderLock(DWORD flags, uintptr_t cookie) { (void)flags; (void)cookie; return 0; }
+void *vx_virtual_alloc_below(size_t size, uintptr_t limit, DWORD protect);   // kernel32.c
+// ZeroBits asks for an address with that many high zero bits counted from bit 31 (1: below 2 GB), or, when it is
+// larger than 32, is a mask the address must fit in.
 static WINAPI DWORD NtAllocateVirtualMemory(HANDLE p, void **addr, uintptr_t zero, size_t *size, DWORD type, DWORD protect) {
-    (void)p; (void)zero;
+    (void)p;
+    if (zero && !*addr && (type & 0x2000 /* MEM_RESERVE */)) {
+        uintptr_t limit = zero < 32 ? (uintptr_t)1 << (32 - zero) : zero + 1;
+        void *r = vx_virtual_alloc_below(*size, limit, protect);
+        if (!r) return 0xC0000017u;
+        *addr = r;
+        return 0;
+    }
     void *(WINAPI *valloc)(void *, size_t, DWORD, DWORD) = (void *(WINAPI *)(void *, size_t, DWORD, DWORD))vx_find_export("kernel32.dll", "VirtualAlloc");
     void *r = valloc ? valloc(*addr, *size, type, protect) : NULL;
     if (!r) return 0xC0000017u;                                       // STATUS_NO_MEMORY

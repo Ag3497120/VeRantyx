@@ -561,6 +561,38 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
     pthread_mutex_unlock(&g_vm_lock);
     return (void *)a;
 }
+// A reservation below `limit` (NtAllocateVirtualMemory's ZeroBits: LuaJIT asks for the low 2 GB). vxrt is linked
+// with a 64 KB __PAGEZERO so the low 4 GB can be mapped; free gaps are found with mach_vm_region.
+void *vx_virtual_alloc_below(size_t size, uintptr_t limit, DWORD protect) {
+    static uintptr_t cursor = 0x1000000;
+    mach_vm_size_t len = (size + GRANULARITY - 1) & ~(mach_vm_size_t)(GRANULARITY - 1);
+    pthread_mutex_lock(&g_vm_lock);
+    for (int pass = 0; pass < 2; pass++) {
+        mach_vm_address_t a = pass ? 0x1000000 : cursor;
+        while (a + len <= limit) {
+            mach_vm_address_t region = a; mach_vm_size_t region_size = 0;
+            vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t object;
+            kern_return_t kr = mach_vm_region(mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
+            if (kr != KERN_SUCCESS || region >= a + len) {          // a gap big enough at a
+                mach_vm_address_t got = a;
+                if (mach_vm_allocate(mach_task_self(), &got, len, VM_FLAGS_FIXED) == KERN_SUCCESS) {
+                    mach_vm_protect(mach_task_self(), got, len, 0, VM_PROT_ALL);
+                    if (g_res_count == g_res_cap) { g_res_cap = g_res_cap ? g_res_cap * 2 : 256; g_res = realloc(g_res, g_res_cap * sizeof *g_res); }
+                    g_res[g_res_count++] = (reservation){ (uintptr_t)got, (size_t)len, protect };
+                    cursor = (uintptr_t)(got + len);
+                    pthread_mutex_unlock(&g_vm_lock);
+                    return (void *)got;
+                }
+                a += GRANULARITY;
+                continue;
+            }
+            a = (region + region_size + GRANULARITY - 1) & ~(mach_vm_address_t)(GRANULARITY - 1);
+        }
+    }
+    pthread_mutex_unlock(&g_vm_lock);
+    vx_set_last_error(8);
+    return NULL;
+}
 static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
     pthread_mutex_lock(&g_vm_lock);
     reservation *r = find_reservation((uintptr_t)addr);

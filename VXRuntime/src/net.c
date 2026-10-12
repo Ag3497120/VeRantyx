@@ -246,10 +246,63 @@ static WINAPI int WSARecv(SOCKET s, WSABUF *bufs, DWORD n, DWORD *got, DWORD *fl
 static WINAPI int WSARecvFrom(SOCKET s, WSABUF *bufs, DWORD n, DWORD *got, DWORD *flags, void *from, int *fromlen, void *ov, void *cr) {
     return recv_msg(s, bufs, n, got, flags, from, fromlen, ov, cr);
 }
-// GetAcceptExSockaddrs (wsock32 #1142): AcceptEx is not offered, so there is never anything to take apart.
+// AcceptEx: a background thread accepts the next connection and puts it under the accept socket's number (dup2);
+// the local and remote addresses go into the buffer after the first data bytes, one slot each (local_len,
+// remote_len), where GetAcceptExSockaddrs (wsock32 #1142) finds them.
+typedef struct { SOCKET listen, accept; uint8_t *buf; DWORD data, local_len, remote_len; void *ov; } pending_accept;
+static void *accept_in_background(void *arg) {
+    pending_accept *p = arg;
+    int fd;
+    for (;;) {                                                     // a non-blocking listener: wait until a client comes
+        fd = accept(to_fd(p->listen), NULL, NULL);
+        if (fd >= 0 || (errno != EINTR && errno != EAGAIN)) break;
+        struct pollfd w = { to_fd(p->listen), POLLIN, 0 };
+        if (poll(&w, 1, 1000) < 0 && errno != EINTR) break;
+        if (w.revents & POLLNVAL) { errno = EBADF; break; }
+    }
+    DWORD got = 0, err = 0;
+    if (fd < 0) err = (DWORD)wsa_error(errno);
+    else {
+        dup2(fd, to_fd(p->accept));
+        close(fd);
+        fd = to_fd(p->accept);
+        int fl = fcntl(fd, F_GETFL); fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+        if (p->data) { ssize_t n = recv(fd, p->buf, p->data, 0); got = n > 0 ? (DWORD)n : 0; }
+        struct sockaddr_storage a; socklen_t l = sizeof a; int len;
+        if (!getsockname(fd, (struct sockaddr *)&a, &l)) { len = (int)p->local_len; addr_out((struct sockaddr *)&a, l, p->buf + p->data, &len); }
+        l = sizeof a;
+        if (!getpeername(fd, (struct sockaddr *)&a, &l)) { len = (int)p->remote_len; addr_out((struct sockaddr *)&a, l, p->buf + p->data + p->local_len, &len); }
+    }
+    vx_io_completed((HANDLE)p->listen, p->ov, got, err);
+    free(p);
+    return NULL;
+}
+static WINAPI BOOL AcceptEx(SOCKET listen_s, SOCKET accept_s, void *buf, DWORD data, DWORD local_len, DWORD remote_len, DWORD *received, void *ov) {
+    if (!ov) { vx_set_last_error(87); return 0; }
+    pending_accept *p = calloc(1, sizeof *p);
+    *p = (pending_accept){ listen_s, accept_s, buf, data, local_len, remote_len, ov };
+    if (received) *received = 0;
+    *(uint64_t *)ov = 0x103;
+    HANDLE event = (HANDLE)((uintptr_t)*(HANDLE *)((uint8_t *)ov + 24) & ~(uintptr_t)1);
+    if (event) {
+        BOOL (WINAPI *reset)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "ResetEvent");
+        reset(event);
+    }
+    pthread_t t; pthread_attr_t at;
+    pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED); pthread_attr_setstacksize(&at, 128 << 10);
+    pthread_create(&t, &at, accept_in_background, p);
+    pthread_attr_destroy(&at);
+    vx_set_last_error(WSA_IO_PENDING);
+    return 0;
+}
 static WINAPI void GetAcceptExSockaddrs(void *buf, DWORD data, DWORD local_len, DWORD remote_len, void **local, int *llen, void **remote, int *rlen) {
-    (void)buf; (void)data; (void)local_len; (void)remote_len;
-    if (local) *local = NULL; if (llen) *llen = 0; if (remote) *remote = NULL; if (rlen) *rlen = 0;
+    uint8_t *b = buf;
+    int lf = ((uint16_t *)(b + data))[0], rf = ((uint16_t *)(b + data + local_len))[0];
+    if (local) *local = b + data;
+    if (llen) *llen = lf == WIN_AF_INET6 ? 28 : 16;
+    if (remote) *remote = b + data + local_len;
+    if (rlen) *rlen = rf == WIN_AF_INET6 ? 28 : 16;
+    (void)remote_len;
 }
 
 // ---- options and modes -------------------------------------------------------------------------------------------------------
@@ -269,6 +322,16 @@ static WINAPI int ws_setsockopt(SOCKET s, int level, int opt, const char *val, i
         if (opt == (int)~0x4u) return 0;                          // SO_EXCLUSIVEADDRUSE: the default on macOS
         if (opt == 0x7010) return 0;                              // SO_UPDATE_ACCEPT_CONTEXT
         int v = len >= 4 ? *(const int *)val : len >= 1 ? *(const uint8_t *)val : 0;
+        if (opt == SO_SNDBUF || opt == SO_RCVBUF) {               // macOS caps buffers (kern.ipc.maxsockbuf): take the largest it allows
+            if (v <= 0) return 0;                                 // 0 on Windows: send from the program's buffers; macOS keeps its own
+            int asked = v;
+            while (setsockopt(fd, SOL_SOCKET, opt, &v, sizeof v)) {
+                if (errno != ENOBUFS && errno != EINVAL) return fail();
+                if ((v /= 2) < 4096) return fail();
+            }
+            if (vx_trace && v != asked) vx_log("socket buffer %d asked, %d given", asked, v);
+            return 0;
+        }
         return setsockopt(fd, SOL_SOCKET, opt, &v, sizeof v) ? fail() : 0;   // the other numbers match
     }
     int v = len >= 4 ? *(const int *)val : len >= 1 ? *(const uint8_t *)val : 0;
@@ -357,6 +420,7 @@ static void *extension_function(const uint8_t *guid) {
     if (d1 == 0x25a207b9) return (void *)ConnectEx;
     if (d1 == 0x7fda2e11) return (void *)DisconnectEx;
     if (d1 == 0xb5367df2) return (void *)GetAcceptExSockaddrs;
+    if (d1 == 0xb5367df1) return (void *)AcceptEx;
     return NULL;
 }
 #define SIO_GET_EXTENSION_FUNCTION_POINTER 0xC8000006u
@@ -376,13 +440,105 @@ static WINAPI int WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_len, void *o
     } else if (code == SIO_UDP_CONNRESET) r = 0;                       // macOS does not report ICMP resets on UDP reads
     else if (code == SIO_KEEPALIVE_VALS) {
         int on = in ? *(uint32_t *)in != 0 : 1;
-        r = setsockopt(to_fd(s), SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on) ? fail() : 0;
+        setsockopt(to_fd(s), SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);   // best effort (not for every socket type)
+        r = 0;
     } else {
         if (vx_trace) vx_log("WSAIoctl %#x is not supported (in %08x)", (unsigned)code, in && in_len >= 4 ? *(uint32_t *)in : 0);
         vx_set_last_error(10045);                                      // WSAEOPNOTSUPP
     }
     if (!r && ov) vx_io_completed((HANDLE)s, ov, 0, 0);
     return r;
+}
+
+// ---- WSAEventSelect: network events as event objects ---------------------------------------------------------------------
+// One thread polls the registered sockets every few milliseconds and sets their events; FD_WRITE is reported when a
+// socket becomes writable (not while it stays so), the others while their condition holds.
+#define FD_READ_BIT 1
+#define FD_WRITE_BIT 2
+#define FD_ACCEPT_BIT 8
+#define FD_CONNECT_BIT 16
+#define FD_CLOSE_BIT 32
+typedef struct { SOCKET s; HANDLE event; LONG mask, pending; int writable, closed; } event_select;
+static event_select g_selects[256];
+static int g_select_count;
+static pthread_mutex_t g_select_lock = PTHREAD_MUTEX_INITIALIZER;
+static BOOL (WINAPI *g_set_event)(HANDLE), (WINAPI *g_reset_event)(HANDLE);
+static void *select_poller(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct pollfd fds[256]; int n;
+        pthread_mutex_lock(&g_select_lock);
+        n = g_select_count;
+        for (int i = 0; i < n; i++) {
+            fds[i].fd = to_fd(g_selects[i].s);
+            fds[i].events = (short)(((g_selects[i].mask & (FD_READ_BIT | FD_ACCEPT_BIT | FD_CLOSE_BIT)) ? POLLIN : 0) |
+                                    ((g_selects[i].mask & (FD_WRITE_BIT | FD_CONNECT_BIT)) ? POLLOUT : 0));
+            fds[i].revents = 0;
+        }
+        pthread_mutex_unlock(&g_select_lock);
+        if (n) poll(fds, (nfds_t)n, 0);
+        pthread_mutex_lock(&g_select_lock);
+        for (int i = 0; i < n && i < g_select_count; i++) {
+            event_select *e = &g_selects[i];
+            if (to_fd(e->s) != fds[i].fd) continue;
+            LONG add = 0;
+            if (fds[i].revents & (POLLIN | POLLHUP)) {
+                char c;
+                ssize_t r = (e->mask & FD_ACCEPT_BIT) ? 1 : recv(fds[i].fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+                if (r == 0 || (fds[i].revents & POLLHUP)) { if (!e->closed) add |= FD_CLOSE_BIT; e->closed = 1; }
+                else if (r > 0) add |= e->mask & (FD_READ_BIT | FD_ACCEPT_BIT);
+            }
+            int w = (fds[i].revents & POLLOUT) != 0;
+            if (w && !e->writable) add |= FD_WRITE_BIT | FD_CONNECT_BIT;
+            e->writable = w;
+            add &= e->mask;
+            if (add & ~e->pending) { e->pending |= add; g_set_event(e->event); }
+        }
+        pthread_mutex_unlock(&g_select_lock);
+        usleep(2000);
+    }
+    return NULL;
+}
+static WINAPI int WSAEventSelect(SOCKET s, HANDLE event, LONG mask) {
+    if (!g_set_event) {
+        g_set_event = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "SetEvent");
+        g_reset_event = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "ResetEvent");
+    }
+    int fd = to_fd(s);
+    int fl = fcntl(fd, F_GETFL); fcntl(fd, F_SETFL, fl | O_NONBLOCK);      // as on Windows
+    pthread_mutex_lock(&g_select_lock);
+    int i = 0;
+    while (i < g_select_count && g_selects[i].s != s) i++;
+    if (!event || !mask) { if (i < g_select_count) g_selects[i] = g_selects[--g_select_count]; }
+    else if (i < 256) {
+        if (i == g_select_count) g_select_count++;
+        g_selects[i] = (event_select){ s, event, mask, 0, 0, 0 };
+    }
+    pthread_mutex_unlock(&g_select_lock);
+    static int started;
+    if (!__sync_lock_test_and_set(&started, 1)) { pthread_t t; pthread_create(&t, NULL, select_poller, NULL); pthread_detach(t); }
+    return 0;
+}
+typedef struct { LONG events; int errors[10]; } WSANETWORKEVENTS;
+static WINAPI int WSAEnumNetworkEvents(SOCKET s, HANDLE event, WSANETWORKEVENTS *out) {
+    memset(out, 0, sizeof *out);
+    pthread_mutex_lock(&g_select_lock);
+    for (int i = 0; i < g_select_count; i++) if (g_selects[i].s == s) { out->events = g_selects[i].pending; g_selects[i].pending = 0; break; }
+    pthread_mutex_unlock(&g_select_lock);
+    if (event && g_reset_event) g_reset_event(event);
+    return 0;
+}
+static WINAPI HANDLE WSACreateEvent(void) {
+    HANDLE (WINAPI *create)(void *, BOOL, BOOL, const char *) = (HANDLE (WINAPI *)(void *, BOOL, BOOL, const char *))vx_find_export("kernel32.dll", "CreateEventA");
+    return create(NULL, 1, 0, NULL);                              // manual reset, as WSA events are
+}
+static WINAPI BOOL WSACloseEvent(HANDLE e) { BOOL (WINAPI *f)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "CloseHandle"); return f(e); }
+static WINAPI BOOL WSASetEvent(HANDLE e) { BOOL (WINAPI *f)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "SetEvent"); return f(e); }
+static WINAPI BOOL WSAResetEvent(HANDLE e) { BOOL (WINAPI *f)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "ResetEvent"); return f(e); }
+static WINAPI DWORD WSAWaitForMultipleEvents(DWORD n, const HANDLE *events, BOOL all, DWORD ms, BOOL alertable) {
+    (void)alertable;
+    DWORD (WINAPI *wait)(DWORD, const HANDLE *, BOOL, DWORD) = (DWORD (WINAPI *)(DWORD, const HANDLE *, BOOL, DWORD))vx_find_export("kernel32.dll", "WaitForMultipleObjects");
+    return wait(n, events, all, ms);                              // WSA_WAIT_EVENT_0 / WSA_WAIT_TIMEOUT match
 }
 
 // fd_set: a count, then up to 64 sockets.
@@ -500,7 +656,9 @@ static const vx_export ws2[] = {
     NET("connect", ws_connect), NET("listen", ws_listen), NET("accept", ws_accept), NET("send", ws_send), NET("recv", ws_recv),
     NET("sendto", ws_sendto), NET("recvfrom", ws_recvfrom), NET("shutdown", ws_shutdown), NET("getsockname", ws_getsockname),
     NET("getpeername", ws_getpeername), VX_EXPORT(WSASend), VX_EXPORT(WSARecv), VX_EXPORT(WSASendTo), VX_EXPORT(WSARecvFrom),
-    VX_EXPORT(WSAIoctl), VX_EXPORT(GetAcceptExSockaddrs), NET("#1142", GetAcceptExSockaddrs), NET("setsockopt", ws_setsockopt),
+    VX_EXPORT(WSAIoctl), VX_EXPORT(GetAcceptExSockaddrs), NET("#1142", GetAcceptExSockaddrs), VX_EXPORT(AcceptEx), NET("#1141", AcceptEx),
+    VX_EXPORT(WSAEventSelect), VX_EXPORT(WSAEnumNetworkEvents), VX_EXPORT(WSACreateEvent), VX_EXPORT(WSACloseEvent), VX_EXPORT(WSASetEvent),
+    VX_EXPORT(WSAResetEvent), VX_EXPORT(WSAWaitForMultipleEvents), NET("setsockopt", ws_setsockopt),
     NET("getsockopt", ws_getsockopt), VX_EXPORT(ioctlsocket), NET("select", ws_select), VX_EXPORT(__WSAFDIsSet),
     NET("htons", ws_htons), NET("ntohs", ws_ntohs), NET("htonl", ws_htonl), NET("ntohl", ws_ntohl),
     NET("inet_addr", ws_inet_addr), NET("inet_ntoa", ws_inet_ntoa), NET("inet_pton", ws_inet_pton), NET("inet_ntop", ws_inet_ntop),
@@ -520,4 +678,5 @@ static const vx_export ws2[] = {
 void vx_net_init(void) {
     vx_register_module("ws2_32.dll", ws2, sizeof ws2 / sizeof ws2[0]);
     vx_register_module("wsock32.dll", ws2, sizeof ws2 / sizeof ws2[0]);
+    vx_register_module("mswsock.dll", ws2, sizeof ws2 / sizeof ws2[0]);
 }

@@ -135,7 +135,7 @@ int main(int argc, char **argv) {
     ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)event);
     ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)disjoint);
     BOOL done = FALSE; HRESULT qr; int polls = 0;
-    while ((qr = ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)event, &done, sizeof done, 0)) == S_FALSE && polls < 100000) polls++;
+    while ((qr = ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)event, &done, sizeof done, 0)) == S_FALSE && polls < 2000) { polls++; Sleep(1); }
     CHECK(qr == S_OK && done);
     D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = { 0, TRUE };
     CHECK(ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)disjoint, &dj, sizeof dj, 0) == S_OK && dj.Frequency && !dj.Disjoint);

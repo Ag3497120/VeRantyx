@@ -431,8 +431,12 @@ static WINAPI void *inet_none(void) { vx_set_last_error(12029); return NULL; }  
 static WINAPI BOOL inet_fails(void) { vx_set_last_error(12029); return 0; }
 static WINAPI BOOL inet_ok(void) { return 1; }
 
-// AcceptEx (wsock32 #1141): not offered.
-static WINAPI BOOL AcceptEx(void) { vx_set_last_error(10045); return 0; }
+// ---- avifil32: AVI files are not read or written (video capture features report a failure) --------------------------------
+static WINAPI void AVIFileInit(void) {}
+static WINAPI LONG avi_fails(void) { return (LONG)0x80044067; }            // AVIERR_FILEOPEN
+static WINAPI DWORD avi_zero(void) { return 0; }
+static WINAPI void *avi_null(void) { return NULL; }
+
 
 // ---- what the Steam client's own UI toolkit (vgui) and its child programs reach for --------------------------------------------
 // Every face asked for "exists" (text is drawn with the system's fonts): the callback sees the request back once, as a
@@ -484,6 +488,101 @@ static WINAPI DWORD CommDlgExtendedError(void) { return 0; }
 static WINAPI LONG DoDragDrop(void *data, void *source, DWORD ok, DWORD *effect) { (void)data; (void)source; (void)ok; if (effect) *effect = 0; return 0x40101; }   // DRAGDROP_S_CANCEL
 static WINAPI void gl_ignored(void) {}
 
+// ---- what SteamVR Home (Source 2) and its in-process Steam game server reach for ------------------------------------------
+static WINAPI BOOL SetupDiClassGuidsFromNameA(const char *name, void *guids, DWORD n, DWORD *need) { (void)name; (void)guids; (void)n; if (need) *need = 0; return 1; }
+static WINAPI HANDLE SetupDiOpenDevRegKey(HANDLE set, void *data, DWORD scope, DWORD profile, DWORD type, DWORD access) {
+    (void)set; (void)data; (void)scope; (void)profile; (void)type; (void)access;
+    vx_set_last_error(0xE0000209u);                                // ERROR_KEY_DOES_NOT_EXIST (setupapi)
+    return (HANDLE)(intptr_t)-1;
+}
+static WINAPI DWORD CM_Locate_DevNodeA(DWORD *node, const char *id, DWORD flags) { (void)id; (void)flags; if (node) *node = 0; return 0x0D; }
+static WINAPI DWORD iphlp_not_found(void) { return 2; }          // ERROR_FILE_NOT_FOUND: no such interface
+static WINAPI DWORD mixer_none(void) { return 2; }               // MMSYSERR_BADDEVICEID: no mixer devices
+static WINAPI LONG usp_fails(void) { return (LONG)0x80004005; }  // E_FAIL: callers fall back to plain GDI text
+static WINAPI LONG ScriptFreeCache(void **cache) { if (cache) *cache = NULL; return 0; }
+static WINAPI DWORD gdi_none(void) { return 0; }                 // GetCharacterPlacement, GetFontLanguageInfo, GetOutlineTextMetrics
+static WINAPI DWORD GetGlyphOutline(void) { return 0xffffffffu; } // GDI_ERROR
+static WINAPI BOOL TranslateCharsetInfo(DWORD *src, DWORD *cs, DWORD flags) { (void)src; (void)flags; if (cs) memset(cs, 0, 24); return 0; }
+static WINAPI BOOL GetVolumeInformationW(const WCHAR *root, WCHAR *name, DWORD name_cap, DWORD *serial, DWORD *max_len, DWORD *flags, WCHAR *fs, DWORD fs_cap) {
+    (void)root;
+    if (name && name_cap) vx_return_string_w("", name, name_cap);
+    if (serial) *serial = 0x56585254;
+    if (max_len) *max_len = 255;
+    if (flags) *flags = 0x3;
+    if (fs && fs_cap) vx_return_string_w("NTFS", fs, fs_cap);
+    return 1;
+}
+static WINAPI DWORD GetPrivateProfileStringW(const WCHAR *app, const WCHAR *key, const WCHAR *def, WCHAR *out, DWORD cap, const WCHAR *file) {
+    (void)app; (void)key; (void)file;
+    if (!out || !cap) return 0;
+    size_t n = def ? vx_wcslen(def) : 0;
+    if (n >= cap) n = cap - 1;
+    if (n) memcpy(out, def, n * 2);
+    out[n] = 0;
+    return (DWORD)n;
+}
+// QueueUserWorkItem: on the thread pool's one-off callbacks (system.c), which pass (instance, context).
+typedef struct { DWORD (WINAPI *fn)(void *); void *ctx; } work_item;
+static WINAPI void run_work_item(void *instance, void *arg) { (void)instance; work_item w = *(work_item *)arg; free(arg); w.fn(w.ctx); }
+static WINAPI BOOL QueueUserWorkItem(DWORD (WINAPI *fn)(void *), void *ctx, DWORD flags) {
+    (void)flags;
+    BOOL (WINAPI *submit)(void *, void *, void *) = (BOOL (WINAPI *)(void *, void *, void *))vx_find_export("kernel32.dll", "TrySubmitThreadpoolCallback");
+    work_item *w = malloc(sizeof *w);
+    w->fn = fn; w->ctx = ctx;
+    return submit((void *)run_work_item, w, NULL);
+}
+static WINAPI BOOL io_ex_fails(void) { vx_set_last_error(50); return 0; }   // ReadFileEx/WriteFileEx (completion routines): not supported
+static WINAPI BOOL CancelSynchronousIo(HANDLE t) { (void)t; vx_set_last_error(1168 /* ERROR_NOT_FOUND */); return 0; }
+static WINAPI BOOL SetSystemPowerState(BOOL suspend, BOOL force) { (void)suspend; (void)force; vx_set_last_error(5); return 0; }
+static WINAPI BOOL WriteConsoleOutputAttribute(HANDLE h, const uint16_t *a, DWORD n, DWORD pos, DWORD *written) { (void)h; (void)a; (void)pos; if (written) *written = n; return 1; }
+static int this_process(HANDLE p) {
+    DWORD (WINAPI *pid_of)(HANDLE) = (DWORD (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "GetProcessId");
+    return p == (HANDLE)(intptr_t)-1 || (pid_of && pid_of(p) == (DWORD)getpid());
+}
+static WINAPI void *VirtualAllocEx(HANDLE p, void *addr, size_t size, DWORD type, DWORD protect) {
+    if (!this_process(p)) { vx_set_last_error(5); return NULL; }
+    void *(WINAPI *va)(void *, size_t, DWORD, DWORD) = (void *(WINAPI *)(void *, size_t, DWORD, DWORD))vx_find_export("kernel32.dll", "VirtualAlloc");
+    return va(addr, size, type, protect);
+}
+static WINAPI BOOL VirtualProtectEx(HANDLE p, void *addr, size_t size, DWORD prot, DWORD *old) {
+    if (!this_process(p)) { vx_set_last_error(5); return 0; }
+    BOOL (WINAPI *vp)(void *, size_t, DWORD, DWORD *) = (BOOL (WINAPI *)(void *, size_t, DWORD, DWORD *))vx_find_export("kernel32.dll", "VirtualProtect");
+    return vp(addr, size, prot, old);
+}
+static WINAPI BOOL WriteProcessMemory(HANDLE p, void *to, const void *from, size_t n, size_t *written) {
+    if (written) *written = 0;
+    if (!this_process(p)) { vx_set_last_error(5); return 0; }
+    memcpy(to, from, n);
+    if (written) *written = n;
+    return 1;
+}
+static WINAPI HANDLE FindWindowExW(HANDLE parent, HANDLE after, const WCHAR *cls, const WCHAR *title) {
+    if (parent || after) return NULL;                              // top-level windows only
+    HANDLE (WINAPI *find)(const WCHAR *, const WCHAR *) = (HANDLE (WINAPI *)(const WCHAR *, const WCHAR *))vx_find_export("user32.dll", "FindWindowW");
+    return find(cls, title);
+}
+static WINAPI int16_t VkKeyScanExA(char c, void *layout) {
+    (void)layout;
+    if (c >= 'a' && c <= 'z') return (int16_t)(c - 32);
+    if (c >= 'A' && c <= 'Z') return (int16_t)(0x100 | c);       // shift + the key
+    if (c >= '0' && c <= '9') return c;
+    return c == ' ' ? 0x20 : -1;
+}
+static WINAPI void keybd_event(uint8_t vk, uint8_t scan, DWORD flags, uintptr_t extra) { (void)vk; (void)scan; (void)flags; (void)extra; }
+static WINAPI BOOL PathFileExistsW(const WCHAR *path) {
+    DWORD (WINAPI *attrs)(const WCHAR *) = (DWORD (WINAPI *)(const WCHAR *))vx_find_export("kernel32.dll", "GetFileAttributesW");
+    return path && attrs(path) != 0xffffffffu;
+}
+static WINAPI BOOL PathRemoveFileSpecW(WCHAR *path) {
+    if (!path) return 0;
+    WCHAR *last = NULL;
+    for (WCHAR *c = path; *c; c++) if (*c == '\\' || *c == '/') last = c;
+    if (!last) { BOOL had = path[0] != 0; path[0] = 0; return had; }
+    if (last == path || (last == path + 2 && path[1] == ':')) last[1] = 0;   // keep the root ("\\", "C:\\")
+    else *last = 0;
+    return 1;
+}
+
 static const vx_export k32[] = {
     VX_EXPORT(GetProductInfo), VX_EXPORT(ProcessIdToSessionId), VX_EXPORT(WTSGetActiveConsoleSessionId), VX_EXPORT(ReadConsoleA),
     { "K32GetModuleFileNameExW", (void *)GetModuleFileNameExW }, { "K32GetModuleFileNameExA", (void *)GetModuleFileNameExA },
@@ -493,8 +592,16 @@ static const vx_export k32[] = {
     { "DebugActiveProcess", (void *)no_debugging }, { "DebugActiveProcessStop", (void *)no_debugging }, VX_EXPORT(GenerateConsoleCtrlEvent),
     { "K32EnumProcessModules", (void *)EnumProcessModules }, { "K32EnumProcessModulesEx", (void *)EnumProcessModulesEx },
     { "K32GetModuleBaseNameW", (void *)GetModuleBaseNameW }, { "K32GetModuleBaseNameA", (void *)GetModuleBaseNameA },
-    VX_EXPORT(GetVolumePathNamesForVolumeNameW),
+    VX_EXPORT(GetVolumePathNamesForVolumeNameW), VX_EXPORT(GetVolumeInformationW), VX_EXPORT(GetPrivateProfileStringW),
+    VX_EXPORT(QueueUserWorkItem), { "ReadFileEx", (void *)io_ex_fails }, { "WriteFileEx", (void *)io_ex_fails }, VX_EXPORT(CancelSynchronousIo),
+    VX_EXPORT(SetSystemPowerState), VX_EXPORT(WriteConsoleOutputAttribute), VX_EXPORT(VirtualAllocEx), VX_EXPORT(VirtualProtectEx),
+    VX_EXPORT(WriteProcessMemory),
 };
+static const vx_export usp10[] = {
+    { "ScriptItemize", (void *)usp_fails }, { "ScriptShape", (void *)usp_fails }, { "ScriptPlace", (void *)usp_fails },
+    { "ScriptTextOut", (void *)usp_fails }, { "ScriptBreak", (void *)usp_fails }, VX_EXPORT(ScriptFreeCache),
+};
+static const vx_export shlwapi[] = { VX_EXPORT(PathFileExistsW), VX_EXPORT(PathRemoveFileSpecW) };
 static const vx_export msimg32[] = { { "AlphaBlend", (void *)msimg_ok }, { "GradientFill", (void *)msimg_ok }, { "TransparentBlt", (void *)msimg_ok } };
 static const vx_export comdlg32[] = {
     VX_EXPORT(GetOpenFileNameW), { "GetSaveFileNameW", (void *)GetOpenFileNameW }, { "GetOpenFileNameA", (void *)GetOpenFileNameW },
@@ -522,14 +629,22 @@ static const vx_export user32[] = {
     VX_EXPORT(UnhookWinEvent), VX_EXPORT(InsertMenuW), VX_EXPORT(DeleteMenu), VX_EXPORT(GetMenuItemInfoW),
     VX_EXPORT(CreateDialogIndirectParamA), VX_EXPORT(DialogBoxIndirectParamA), VX_EXPORT(CopyImage), { "CreateCaret", (void *)caret_ok },
     { "DestroyCaret", (void *)caret_ok }, { "SetCaretPos", (void *)caret_ok }, { "ShowCaret", (void *)caret_ok }, { "HideCaret", (void *)caret_ok },
-    VX_EXPORT(GetClassWord), VX_EXPORT(OffsetRect),
+    VX_EXPORT(GetClassWord), VX_EXPORT(OffsetRect), VX_EXPORT(FindWindowExW), VX_EXPORT(VkKeyScanExA), VX_EXPORT(keybd_event),
     { "GetDisplayConfigBufferSizes", (void *)display_config_unsupported }, { "QueryDisplayConfig", (void *)display_config_unsupported },
     { "DisplayConfigGetDeviceInfo", (void *)display_config_unsupported }, { "DisplayConfigSetDeviceInfo", (void *)display_config_unsupported },
 };
 static const vx_export imm32[] = { VX_EXPORT(ImmGetCompositionFontW), VX_EXPORT(ImmCreateContext), VX_EXPORT(ImmDestroyContext) };
-static const vx_export winmm[] = { VX_EXPORT(waveOutMessage) };
+static const vx_export winmm[] = {
+    VX_EXPORT(waveOutMessage), { "waveInMessage", (void *)waveOutMessage }, { "mixerOpen", (void *)mixer_none }, { "mixerClose", (void *)mixer_none },
+    { "mixerGetID", (void *)mixer_none }, { "mixerGetDevCapsA", (void *)mixer_none }, { "mixerGetLineInfoA", (void *)mixer_none },
+    { "mixerGetLineControlsA", (void *)mixer_none }, { "mixerGetControlDetailsA", (void *)mixer_none }, { "mixerSetControlDetails", (void *)mixer_none },
+    { "mixerGetNumDevs", (void *)gdi_none },
+};
 static const vx_export ole32[] = { VX_EXPORT(ReleaseStgMedium), VX_EXPORT(DoDragDrop) };
-static const vx_export setupapi[] = { VX_EXPORT(CM_Get_DevNode_Status), VX_EXPORT(SetupDiGetDevicePropertyW) };
+static const vx_export setupapi[] = {
+    VX_EXPORT(CM_Get_DevNode_Status), VX_EXPORT(SetupDiGetDevicePropertyW), VX_EXPORT(SetupDiClassGuidsFromNameA),
+    VX_EXPORT(SetupDiOpenDevRegKey), VX_EXPORT(CM_Locate_DevNodeA),
+};
 static const vx_export hid[] = {
     VX_EXPORT(HidD_GetHidGuid), { "HidD_GetAttributes", (void *)hid_fails }, { "HidD_GetPreparsedData", (void *)hid_fails },
     { "HidD_FreePreparsedData", (void *)hid_fails }, { "HidD_GetProductString", (void *)hid_fails }, { "HidD_GetManufacturerString", (void *)hid_fails },
@@ -544,6 +659,7 @@ static const vx_export iphlpapi[] = {
     { "GetAdaptersAddresses", (void *)iphlp_unsupported }, { "GetAdaptersInfo", (void *)iphlp_unsupported },
     { "GetBestInterface", (void *)iphlp_unsupported }, { "GetIfTable", (void *)iphlp_unsupported }, { "GetIpAddrTable", (void *)iphlp_unsupported },
     { "NotifyAddrChange", (void *)iphlp_unsupported }, { "GetNetworkParams", (void *)iphlp_unsupported },
+    { "ConvertInterfaceGuidToLuid", (void *)iphlp_not_found }, { "GetIfEntry2", (void *)iphlp_not_found },
 };
 static const vx_export gdi32[] = {
     VX_EXPORT(AddFontMemResourceEx), VX_EXPORT(RemoveFontMemResourceEx), VX_EXPORT(CreateICW), VX_EXPORT(CreateICA),
@@ -551,7 +667,10 @@ static const vx_export gdi32[] = {
     VX_EXPORT(EnumFontFamiliesExW), VX_EXPORT(AddFontResourceExA), VX_EXPORT(AddFontResourceA),
     { "AddFontResourceExW", (void *)AddFontResourceExA }, { "AddFontResourceW", (void *)AddFontResourceA }, VX_EXPORT(RemoveFontResourceA),
     { "RemoveFontResourceW", (void *)RemoveFontResourceA }, { "RemoveFontResourceExA", (void *)RemoveFontResourceA },
-    VX_EXPORT(GetCharABCWidthsW), VX_EXPORT(Polyline), VX_EXPORT(SetRectRgn),
+    VX_EXPORT(GetCharABCWidthsW), VX_EXPORT(Polyline), VX_EXPORT(SetRectRgn), { "GetCharacterPlacementA", (void *)gdi_none },
+    { "GetCharacterPlacementW", (void *)gdi_none }, { "GetFontLanguageInfo", (void *)gdi_none }, { "GetOutlineTextMetricsA", (void *)gdi_none },
+    { "GetOutlineTextMetricsW", (void *)gdi_none }, { "GetGlyphOutlineA", (void *)GetGlyphOutline }, { "GetGlyphOutlineW", (void *)GetGlyphOutline },
+    VX_EXPORT(TranslateCharsetInfo),
 };
 static const vx_export shell32[] = {
     VX_EXPORT(IsUserAnAdmin), { "#680", (void *)IsUserAnAdmin }, VX_EXPORT(SHGetFileInfoW), { "SHGetFileInfoA", (void *)SHGetFileInfoW },
@@ -600,7 +719,14 @@ static const vx_export wininet[] = {
     { "InternetQueryDataAvailable", (void *)inet_fails }, { "InternetSetOptionW", (void *)inet_ok }, { "InternetSetOptionA", (void *)inet_ok },
     { "InternetOpenUrlW", (void *)inet_none },
 };
-static const vx_export wsock32[] = { { "#1141", (void *)AcceptEx }, VX_EXPORT(AcceptEx) };
+static const vx_export avifil32[] = {
+    VX_EXPORT(AVIFileInit), { "AVIFileExit", (void *)AVIFileInit }, { "AVIFileOpenA", (void *)avi_fails }, { "AVIFileOpenW", (void *)avi_fails },
+    { "AVIFileCreateStreamA", (void *)avi_fails }, { "AVIFileGetStream", (void *)avi_fails }, { "AVIFileInfoA", (void *)avi_fails },
+    { "AVIMakeCompressedStream", (void *)avi_fails }, { "AVISaveOptions", (void *)avi_zero }, { "AVIStreamSetFormat", (void *)avi_fails },
+    { "AVIStreamWrite", (void *)avi_fails }, { "AVIStreamStart", (void *)avi_zero }, { "AVIStreamLength", (void *)avi_zero },
+    { "AVIStreamGetFrameOpen", (void *)avi_null }, { "AVIStreamGetFrame", (void *)avi_null }, { "AVIStreamGetFrameClose", (void *)avi_zero },
+    { "AVIStreamRelease", (void *)avi_zero }, { "AVIFileRelease", (void *)avi_zero },
+};
 void vx_client_init(void) {
     vx_register_module("kernel32.dll", k32, sizeof k32 / sizeof k32[0]);
     vx_register_module("user32.dll", user32, sizeof user32 / sizeof user32[0]);
@@ -621,7 +747,9 @@ void vx_client_init(void) {
     vx_register_module("ncrypt.dll", ncrypt, sizeof ncrypt / sizeof ncrypt[0]);
     vx_register_module("secur32.dll", secur32, sizeof secur32 / sizeof secur32[0]);
     vx_register_module("wininet.dll", wininet, sizeof wininet / sizeof wininet[0]);
-    vx_register_module("wsock32.dll", wsock32, sizeof wsock32 / sizeof wsock32[0]);
+    vx_register_module("usp10.dll", usp10, sizeof usp10 / sizeof usp10[0]);
+    vx_register_module("shlwapi.dll", shlwapi, sizeof shlwapi / sizeof shlwapi[0]);
+    vx_register_module("avifil32.dll", avifil32, sizeof avifil32 / sizeof avifil32[0]);
     vx_register_module("msimg32.dll", msimg32, sizeof msimg32 / sizeof msimg32[0]);
     vx_register_module("comdlg32.dll", comdlg32, sizeof comdlg32 / sizeof comdlg32[0]);
     vx_register_module("opengl32.dll", opengl32, sizeof opengl32 / sizeof opengl32[0]);

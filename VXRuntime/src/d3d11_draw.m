@@ -936,7 +936,10 @@ static WINAPI void ctx_begin(void *this, d3d_query *q) { (void)this; if (q) q->e
 static WINAPI void ctx_end(void *this, d3d_query *q) {
     d3d_context *c = this;
     if (!q) return;
-    q->target = c->base.dev->submitted + 1;                  // the command buffer being recorded
+    d3d_context *imm = (d3d_context *)c->base.dev->context;
+    // The command buffer being recorded, or (none open) the work already committed: an event query after a
+    // flush must not wait for work that may never come.
+    q->target = __atomic_load_n(&c->base.dev->submitted, __ATOMIC_ACQUIRE) + (imm->cmd ? 1 : 0);
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     q->stamp = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
     q->ended = 1;

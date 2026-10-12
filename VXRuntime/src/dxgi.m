@@ -3,6 +3,7 @@
 // A swap chain owns one back buffer texture. Present draws it into the window's CAMetalLayer with a small
 // shader, which also converts its format (layers take BGRA, Direct3D programs usually render RGBA) and scales
 // it to the layer's pixel size.
+#import <ImageIO/ImageIO.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include "d3d_common.h"
@@ -335,11 +336,43 @@ static WINAPI HRESULT swapchain_get_buffer(void *this, uint32_t index, const GUI
     (void)index;                                    // one buffer stands for all of them
     return call_qi(sc->buffer, iid, out);
 }
+// VXRT_PRESENT_SNAPSHOT=file.png (with VXRT_PRESENT_SNAPSHOT_AT=n, default 300): the back buffer of the n-th
+// present is written to that file (8-bit RGBA/BGRA buffers), to check what a program draws.
+static void snapshot(swapchain *sc) {
+    const char *path = getenv("VXRT_PRESENT_SNAPSHOT");
+    const char *at = getenv("VXRT_PRESENT_SNAPSHOT_AT");
+    if (!path || sc->presents + 1 != (uint64_t)(at ? atoll(at) : 300)) return;
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)sc->buffer->mtl;
+    MTLPixelFormat f = tex.pixelFormat;
+    int bgra = f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB;
+    if (!bgra && f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) { vx_log("snapshot: back buffer format %d is not 8-bit", (int)f); return; }
+    NSUInteger w = tex.width, h = tex.height, row = w * 4;
+    id<MTLBuffer> buf = [tex.device newBufferWithLength:row * h options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cmd = [(__bridge id<MTLCommandQueue>)sc->dev->queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                 toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
+    [blit endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGBitmapInfo info = bgra ? (kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst) : (kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast);
+    CGContextRef ctx = CGBitmapContextCreate(buf.contents, w, h, 8, row, cs, info);
+    CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+    CGImageDestinationRef dst = img ? CGImageDestinationCreateWithURL((__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL) : NULL;
+    if (dst) { CGImageDestinationAddImage(dst, img, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); }
+    if (img) CGImageRelease(img);
+    if (ctx) CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    vx_log("snapshot of present %llu (%lux%lu) written to %s", (unsigned long long)sc->presents + 1, (unsigned long)w, (unsigned long)h, path);
+}
 #define DXGI_PRESENT_TEST 1
 static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flags) {
     swapchain *sc = this;
     if (flags & DXGI_PRESENT_TEST) return S_OK;
     d3d_flush(sc->dev, 0);                          // the frame's work goes first, on the same queue
+    snapshot(sc);
     CAMetalLayer *layer = (__bridge CAMetalLayer *)sc->layer;
     layer.displaySyncEnabled = sync != 0;
     @autoreleasepool {

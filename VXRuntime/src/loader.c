@@ -54,6 +54,8 @@ void vx_register_module(const char *dll, const vx_export *exports, size_t count)
 static const char *canonical_dll(const char *dll) {
     if (!strncasecmp(dll, "api-ms-win-crt-", 15)) return "ucrtbase.dll";
     if (!strncasecmp(dll, "api-ms-win-core-", 16)) return "kernel32.dll";
+    if (!strncasecmp(dll, "api-ms-win-security-", 20) || !strncasecmp(dll, "api-ms-win-eventing-", 20)) return "advapi32.dll";
+    if (!strncasecmp(dll, "api-ms-win-ntuser-", 18) || !strncasecmp(dll, "ext-ms-win-ntuser-", 18)) return "user32.dll";
     if (!strncasecmp(dll, "api-ms-win-", 11)) return "kernelbase.dll";
     return dll;
 }

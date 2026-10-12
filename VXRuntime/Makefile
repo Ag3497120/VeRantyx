@@ -10,7 +10,7 @@ all: build/vxrt tests
 
 build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -Wl,-pagezero_size,0x10000
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
