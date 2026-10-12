@@ -18,6 +18,8 @@
 		91A467D05E174D6E93657D52 /* VRAudioPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91A467D05E174D6E93657D53 /* VRAudioPlayer.swift */; };
 		91A467D05E174D6E93657D50 /* VRGameControllerInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91A467D05E174D6E93657D51 /* VRGameControllerInput.swift */; };
 		91A467D05E174D6E93657D4A /* VRCompositorRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91A467D05E174D6E93657D4B /* VRCompositorRenderer.swift */; };
+		A1C0FFEE0000000000000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1C0FFEE0000000000000002 /* Assets.xcassets */; };
+		A1C0FFEE0000000000000003 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A1C0FFEE0000000000000004 /* PrivacyInfo.xcprivacy */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -33,6 +35,8 @@
 		91A467D05E174D6E93657D4B /* VRCompositorRenderer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VRCompositorRenderer.swift; sourceTree = "<group>"; };
 		B32A53F32F634C6400A375D2 /* VisionSpatialTools.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VisionSpatialTools.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B32A53F72F634C6400A375D2 /* RealityKitContent */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = RealityKitContent; sourceTree = "<group>"; };
+		A1C0FFEE0000000000000002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A1C0FFEE0000000000000004 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -51,6 +55,8 @@
 			isa = PBXGroup;
 			children = (
 				5FC0DD760001000100000002 /* VRStreamerApp.swift */,
+				A1C0FFEE0000000000000002 /* Assets.xcassets */,
+				A1C0FFEE0000000000000004 /* PrivacyInfo.xcprivacy */,
 				EE504848AF3837B17A4CA272 /* Services */,
 				2CC411A1F11B6D4B810F2DE2 /* Views */,
 			);
@@ -169,6 +175,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				91A467D05E174D6E93657D54 /* Localizable.xcstrings in Resources */,
+				A1C0FFEE0000000000000001 /* Assets.xcassets in Resources */,
+				A1C0FFEE0000000000000003 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -508,11 +508,14 @@ final class VRUDPReceiver: ObservableObject {
         }
     }
 
+    /// Little-endian read relative to the packet's own start (a Data slice
+    /// does not start at index 0), and 0 for a read past its end rather than
+    /// a crash on a short or malformed packet.
     private func readUInt32LE(_ data: Data, at offset: Int) -> UInt32 {
-        UInt32(data[offset])
-            | (UInt32(data[offset + 1]) << 8)
-            | (UInt32(data[offset + 2]) << 16)
-            | (UInt32(data[offset + 3]) << 24)
+        guard offset >= 0, offset + 4 <= data.count else { return 0 }
+        let i = data.startIndex + offset
+        return UInt32(data[i]) | (UInt32(data[i + 1]) << 8)
+            | (UInt32(data[i + 2]) << 16) | (UInt32(data[i + 3]) << 24)
     }
 
     private func readDoubleLE(_ data: Data, at offset: Int) -> Double {

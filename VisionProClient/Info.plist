@@ -2,15 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>UIApplicationSceneManifest</key>
-	<dict>
-		<key>UIApplicationSupportsMultipleScenes</key>
-		<true/>
-		<key>UISceneConfigurations</key>
-		<dict/>
-		<key>UIApplicationPreferredDefaultSceneSessionRole</key>
-		<string>UIWindowSceneSessionRoleApplication</string>
-	</dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -29,12 +20,6 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Receives the VR video stream from the encoder on your Mac over the local network.</string>
-	<key>NSWorldSensingUsageDescription</key>
-	<string>Sends the Vision Pro head pose to SteamVR.</string>
-	<key>NSHandsTrackingUsageDescription</key>
-	<string>Uses hand tracking to position the SteamVR controllers and read trigger input.</string>
 	<key>GCSupportedGameControllers</key>
 	<array>
 		<dict>
@@ -42,9 +27,26 @@
 			<string>ExtendedGamepad</string>
 		</dict>
 	</array>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_verantyxvr._udp</string>
 	</array>
+	<key>NSHandsTrackingUsageDescription</key>
+	<string>Your hands move the game's hands and controllers, and hand gestures press its buttons.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Receives the game's picture and sound from your Mac on the same Wi-Fi network.</string>
+	<key>NSWorldSensingUsageDescription</key>
+	<string>Your head position is sent to the game on your Mac so the picture follows your head.</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationPreferredDefaultSceneSessionRole</key>
+		<string>UIWindowSceneSessionRoleApplication</string>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+		<key>UISceneConfigurations</key>
+		<dict/>
+	</dict>
 </dict>
 </plist>
