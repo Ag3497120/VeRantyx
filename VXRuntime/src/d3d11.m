@@ -73,23 +73,63 @@ HRESULT d3d_set_private(d3d_object *o, const GUID *g, uint32_t size, const void 
 }
 
 // ---- formats -----------------------------------------------------------------------------------------------------------------
-static const struct { uint32_t dxgi; MTLPixelFormat mtl; uint32_t bytes; } g_formats[] = {
-    { 2, MTLPixelFormatRGBA32Float, 16 }, { 10, MTLPixelFormatRGBA16Float, 8 }, { 11, MTLPixelFormatRGBA16Unorm, 8 },
-    { 20, MTLPixelFormatDepth32Float_Stencil8, 8 }, { 24, MTLPixelFormatRGB10A2Unorm, 4 }, { 26, MTLPixelFormatRG11B10Float, 4 },
-    { 27, MTLPixelFormatRGBA8Unorm, 4 }, { 28, MTLPixelFormatRGBA8Unorm, 4 }, { 29, MTLPixelFormatRGBA8Unorm_sRGB, 4 },
-    { 30, MTLPixelFormatRGBA8Uint, 4 }, { 34, MTLPixelFormatRG16Float, 4 }, { 39, MTLPixelFormatR32Float, 4 },
-    { 40, MTLPixelFormatDepth32Float, 4 }, { 41, MTLPixelFormatR32Float, 4 }, { 42, MTLPixelFormatR32Uint, 4 },
-    { 44, MTLPixelFormatDepth32Float_Stencil8, 8 }, { 45, MTLPixelFormatDepth32Float_Stencil8, 8 },   // no D24S8 on Apple GPUs
-    { 49, MTLPixelFormatRG8Unorm, 2 }, { 54, MTLPixelFormatR16Float, 2 }, { 55, MTLPixelFormatDepth16Unorm, 2 },
-    { 56, MTLPixelFormatR16Unorm, 2 }, { 61, MTLPixelFormatR8Unorm, 1 }, { 62, MTLPixelFormatR8Uint, 1 },
-    { 65, MTLPixelFormatA8Unorm, 1 }, { 87, MTLPixelFormatBGRA8Unorm, 4 }, { 88, MTLPixelFormatBGRA8Unorm, 4 },
-    { 90, MTLPixelFormatBGRA8Unorm, 4 }, { 91, MTLPixelFormatBGRA8Unorm_sRGB, 4 }, { 93, MTLPixelFormatBGRA8Unorm_sRGB, 4 },
+// DXGI formats Metal has: bytes per texel, or per 4x4 block for the block-compressed formats (block 4).
+static const struct { uint32_t dxgi; MTLPixelFormat mtl; uint32_t bytes, block; } g_formats[] = {
+    { 1, MTLPixelFormatRGBA32Float, 16, 1 }, { 2, MTLPixelFormatRGBA32Float, 16, 1 }, { 3, MTLPixelFormatRGBA32Uint, 16, 1 },
+    { 4, MTLPixelFormatRGBA32Sint, 16, 1 }, { 9, MTLPixelFormatRGBA16Float, 8, 1 }, { 10, MTLPixelFormatRGBA16Float, 8, 1 },
+    { 11, MTLPixelFormatRGBA16Unorm, 8, 1 }, { 12, MTLPixelFormatRGBA16Uint, 8, 1 }, { 13, MTLPixelFormatRGBA16Snorm, 8, 1 },
+    { 14, MTLPixelFormatRGBA16Sint, 8, 1 }, { 15, MTLPixelFormatRG32Float, 8, 1 }, { 16, MTLPixelFormatRG32Float, 8, 1 },
+    { 17, MTLPixelFormatRG32Uint, 8, 1 }, { 18, MTLPixelFormatRG32Sint, 8, 1 },
+    { 19, MTLPixelFormatDepth32Float_Stencil8, 8, 1 }, { 20, MTLPixelFormatDepth32Float_Stencil8, 8, 1 },
+    { 21, MTLPixelFormatDepth32Float_Stencil8, 8, 1 }, { 22, MTLPixelFormatX32_Stencil8, 8, 1 },
+    { 23, MTLPixelFormatRGB10A2Unorm, 4, 1 }, { 24, MTLPixelFormatRGB10A2Unorm, 4, 1 }, { 25, MTLPixelFormatRGB10A2Uint, 4, 1 },
+    { 26, MTLPixelFormatRG11B10Float, 4, 1 },
+    { 27, MTLPixelFormatRGBA8Unorm, 4, 1 }, { 28, MTLPixelFormatRGBA8Unorm, 4, 1 }, { 29, MTLPixelFormatRGBA8Unorm_sRGB, 4, 1 },
+    { 30, MTLPixelFormatRGBA8Uint, 4, 1 }, { 31, MTLPixelFormatRGBA8Snorm, 4, 1 }, { 32, MTLPixelFormatRGBA8Sint, 4, 1 },
+    { 33, MTLPixelFormatRG16Float, 4, 1 }, { 34, MTLPixelFormatRG16Float, 4, 1 }, { 35, MTLPixelFormatRG16Unorm, 4, 1 },
+    { 36, MTLPixelFormatRG16Uint, 4, 1 }, { 37, MTLPixelFormatRG16Snorm, 4, 1 }, { 38, MTLPixelFormatRG16Sint, 4, 1 },
+    { 39, MTLPixelFormatR32Float, 4, 1 }, { 40, MTLPixelFormatDepth32Float, 4, 1 }, { 41, MTLPixelFormatR32Float, 4, 1 },
+    { 42, MTLPixelFormatR32Uint, 4, 1 }, { 43, MTLPixelFormatR32Sint, 4, 1 },
+    { 44, MTLPixelFormatDepth32Float_Stencil8, 8, 1 }, { 45, MTLPixelFormatDepth32Float_Stencil8, 8, 1 },   // no D24S8 on Apple GPUs
+    { 46, MTLPixelFormatDepth32Float_Stencil8, 8, 1 }, { 47, MTLPixelFormatX32_Stencil8, 8, 1 },
+    { 48, MTLPixelFormatRG8Unorm, 2, 1 }, { 49, MTLPixelFormatRG8Unorm, 2, 1 }, { 50, MTLPixelFormatRG8Uint, 2, 1 },
+    { 51, MTLPixelFormatRG8Snorm, 2, 1 }, { 52, MTLPixelFormatRG8Sint, 2, 1 },
+    { 53, MTLPixelFormatR16Float, 2, 1 }, { 54, MTLPixelFormatR16Float, 2, 1 }, { 55, MTLPixelFormatDepth16Unorm, 2, 1 },
+    { 56, MTLPixelFormatR16Unorm, 2, 1 }, { 57, MTLPixelFormatR16Uint, 2, 1 }, { 58, MTLPixelFormatR16Snorm, 2, 1 },
+    { 59, MTLPixelFormatR16Sint, 2, 1 }, { 60, MTLPixelFormatR8Unorm, 1, 1 }, { 61, MTLPixelFormatR8Unorm, 1, 1 },
+    { 62, MTLPixelFormatR8Uint, 1, 1 }, { 63, MTLPixelFormatR8Snorm, 1, 1 }, { 64, MTLPixelFormatR8Sint, 1, 1 },
+    { 65, MTLPixelFormatA8Unorm, 1, 1 }, { 67, MTLPixelFormatRGB9E5Float, 4, 1 },
+    { 70, MTLPixelFormatBC1_RGBA, 8, 4 }, { 71, MTLPixelFormatBC1_RGBA, 8, 4 }, { 72, MTLPixelFormatBC1_RGBA_sRGB, 8, 4 },
+    { 73, MTLPixelFormatBC2_RGBA, 16, 4 }, { 74, MTLPixelFormatBC2_RGBA, 16, 4 }, { 75, MTLPixelFormatBC2_RGBA_sRGB, 16, 4 },
+    { 76, MTLPixelFormatBC3_RGBA, 16, 4 }, { 77, MTLPixelFormatBC3_RGBA, 16, 4 }, { 78, MTLPixelFormatBC3_RGBA_sRGB, 16, 4 },
+    { 79, MTLPixelFormatBC4_RUnorm, 8, 4 }, { 80, MTLPixelFormatBC4_RUnorm, 8, 4 }, { 81, MTLPixelFormatBC4_RSnorm, 8, 4 },
+    { 82, MTLPixelFormatBC5_RGUnorm, 16, 4 }, { 83, MTLPixelFormatBC5_RGUnorm, 16, 4 }, { 84, MTLPixelFormatBC5_RGSnorm, 16, 4 },
+    { 85, MTLPixelFormatB5G6R5Unorm, 2, 1 }, { 86, MTLPixelFormatBGR5A1Unorm, 2, 1 },
+    { 87, MTLPixelFormatBGRA8Unorm, 4, 1 }, { 88, MTLPixelFormatBGRA8Unorm, 4, 1 },
+    { 90, MTLPixelFormatBGRA8Unorm, 4, 1 }, { 91, MTLPixelFormatBGRA8Unorm_sRGB, 4, 1 }, { 92, MTLPixelFormatBGRA8Unorm, 4, 1 },
+    { 93, MTLPixelFormatBGRA8Unorm_sRGB, 4, 1 },
+    { 94, MTLPixelFormatBC6H_RGBUfloat, 16, 4 }, { 95, MTLPixelFormatBC6H_RGBUfloat, 16, 4 }, { 96, MTLPixelFormatBC6H_RGBFloat, 16, 4 },
+    { 97, MTLPixelFormatBC7_RGBAUnorm, 16, 4 }, { 98, MTLPixelFormatBC7_RGBAUnorm, 16, 4 }, { 99, MTLPixelFormatBC7_RGBAUnorm_sRGB, 16, 4 },
+    { 115, MTLPixelFormatABGR4Unorm, 2, 1 },
 };
 MTLPixelFormat d3d_mtl_format(uint32_t dxgi, uint32_t *bytes) {
     for (size_t i = 0; i < sizeof g_formats / sizeof g_formats[0]; i++)
-        if (g_formats[i].dxgi == dxgi) { if (bytes) *bytes = g_formats[i].bytes; return g_formats[i].mtl; }
+        if (g_formats[i].dxgi == dxgi) { if (bytes) *bytes = g_formats[i].block == 1 ? g_formats[i].bytes : 0; return g_formats[i].mtl; }
     if (bytes) *bytes = 0;
     return MTLPixelFormatInvalid;
+}
+// The layout of a format's data: bytes per row of `width` texels and the number of rows for `height` (rows of
+// 4x4 blocks for the block-compressed formats).
+static int format_layout(uint32_t dxgi, uint32_t width, uint32_t height, uint32_t *row_bytes, uint32_t *rows) {
+    for (size_t i = 0; i < sizeof g_formats / sizeof g_formats[0]; i++) {
+        if (g_formats[i].dxgi != dxgi) continue;
+        uint32_t b = g_formats[i].block;
+        *row_bytes = (width + b - 1) / b * g_formats[i].bytes;
+        *rows = (height + b - 1) / b;
+        return 1;
+    }
+    *row_bytes = *rows = 0;
+    return 0;
 }
 int d3d_is_srgb(uint32_t dxgi) { return dxgi == 29 || dxgi == 91 || dxgi == 93; }
 static int is_depth(MTLPixelFormat f) {
@@ -124,10 +164,31 @@ static WINAPI HRESULT texture_qi(void *this, const GUID *iid, void **out) {
     static const GUID *const known[] = { &IID_IUnknown_, &IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture2D };
     return query(this, iid, out, known, 4);
 }
-static WINAPI void texture_get_type(void *this, uint32_t *dim) { (void)this; *dim = 3; }   // D3D11_RESOURCE_DIMENSION_TEXTURE2D
+static WINAPI void texture_get_type(void *this, uint32_t *dim) { *dim = ((d3d_texture *)this)->dim + 1; }   // D3D11_RESOURCE_DIMENSION_TEXTURE1D..3D
 static WINAPI void texture_set_eviction(void *this, uint32_t p) { (void)this; (void)p; }
 static WINAPI uint32_t texture_get_eviction(void *this) { (void)this; return 0; }
 static WINAPI void texture_get_desc(void *this, uint32_t *desc) { memcpy(desc, ((d3d_texture *)this)->desc, sizeof(uint32_t) * TD_COUNT); }
+// D3D11_TEXTURE1D_DESC: width, mips, array size, format, usage, bind, CPU access, misc.
+static WINAPI void texture1d_get_desc(void *this, uint32_t *desc) {
+    const uint32_t *d = ((d3d_texture *)this)->desc;
+    uint32_t v[8] = { d[TD_WIDTH], d[TD_MIPS], d[TD_ARRAY], d[TD_FORMAT], d[TD_USAGE], d[TD_BIND], d[TD_CPU], d[TD_MISC] };
+    memcpy(desc, v, sizeof v);
+}
+// D3D11_TEXTURE3D_DESC: width, height, depth, mips, format, usage, bind, CPU access, misc.
+static WINAPI void texture3d_get_desc(void *this, uint32_t *desc) {
+    const d3d_texture *t = this;
+    const uint32_t *d = t->desc;
+    uint32_t v[9] = { d[TD_WIDTH], d[TD_HEIGHT], t->depth, d[TD_MIPS], d[TD_FORMAT], d[TD_USAGE], d[TD_BIND], d[TD_CPU], d[TD_MISC] };
+    memcpy(desc, v, sizeof v);
+}
+static WINAPI HRESULT texture1d_qi(void *this, const GUID *iid, void **out) {
+    static const GUID *const known[] = { &IID_IUnknown_, &IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture1D };
+    return query(this, iid, out, known, 4);
+}
+static WINAPI HRESULT texture3d_qi(void *this, const GUID *iid, void **out) {
+    static const GUID *const known[] = { &IID_IUnknown_, &IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture3D };
+    return query(this, iid, out, known, 4);
+}
 static void texture_destroy(d3d_object *o) {
     d3d_texture *t = (d3d_texture *)o;
     if (t->mtl) CFBridgingRelease(t->mtl);
@@ -144,19 +205,29 @@ static void texture_destroy(d3d_object *o) {
 #define BIND_UNORDERED_ACCESS 0x80
 #define MISC_TEXTURECUBE 0x4
 
-static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, HRESULT *hr) {
+static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t dim, uint32_t depth, HRESULT *hr) {
     uint32_t bytes;
     MTLPixelFormat f = d3d_mtl_format(desc[TD_FORMAT], &bytes);
     if (f == MTLPixelFormatInvalid) { vx_log("Direct3D: texture format %u is not supported yet", desc[TD_FORMAT]); *hr = E_INVALIDARG; return NULL; }
+    if (desc[TD_BIND] & BIND_DEPTH_STENCIL) {                  // typeless formats that are depth buffers
+        if (desc[TD_FORMAT] == 39) f = MTLPixelFormatDepth32Float;
+        else if (desc[TD_FORMAT] == 53) f = MTLPixelFormatDepth16Unorm;
+    }
     MTLTextureDescriptor *td = [MTLTextureDescriptor new];
     td.pixelFormat = f;
     td.width = desc[TD_WIDTH] ? desc[TD_WIDTH] : 1;
     td.height = desc[TD_HEIGHT] ? desc[TD_HEIGHT] : 1;
     uint32_t full = 1;
-    for (uint32_t m = td.width > td.height ? (uint32_t)td.width : (uint32_t)td.height; m > 1; m >>= 1) full++;
+    for (uint32_t m = MAX(MAX((uint32_t)td.width, (uint32_t)td.height), depth); m > 1; m >>= 1) full++;
     td.mipmapLevelCount = desc[TD_MIPS] ? desc[TD_MIPS] : full;
     uint32_t array = desc[TD_ARRAY] ? desc[TD_ARRAY] : 1, samples = desc[TD_SAMPLES] ? desc[TD_SAMPLES] : 1;
-    if (samples > 1) { td.textureType = array > 1 ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample; td.sampleCount = samples; td.mipmapLevelCount = 1; }
+    if (dim == 3) { td.textureType = MTLTextureType3D; td.depth = depth ? depth : 1; }
+    else if (dim == 1) {                                       // Metal's 1D textures have one mip level
+        td.textureType = array > 1 ? MTLTextureType1DArray : MTLTextureType1D;
+        if (array > 1) td.arrayLength = array;
+        td.height = 1;
+        td.mipmapLevelCount = 1;
+    } else if (samples > 1) { td.textureType = array > 1 ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample; td.sampleCount = samples; td.mipmapLevelCount = 1; }
     else if ((desc[TD_MISC] & MISC_TEXTURECUBE) && array % 6 == 0) { td.textureType = array > 6 ? MTLTextureTypeCubeArray : MTLTextureTypeCube; if (array > 6) td.arrayLength = array / 6; }
     else if (array > 1) { td.textureType = MTLTextureType2DArray; td.arrayLength = array; }
     MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
@@ -172,10 +243,12 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, HRESULT *hr
     return (void *)CFBridgingRetain(tex);
 }
 
-d3d_texture *d3d_texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], HRESULT *hr) {
-    void *mtl = make_mtl_texture(dev, desc, hr);
+static void **g_texture1d_vtbl, **g_texture3d_vtbl;
+static d3d_texture *texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], uint32_t dim, uint32_t depth, HRESULT *hr) {
+    void *mtl = make_mtl_texture(dev, desc, dim, depth, hr);
     if (!mtl) return NULL;
-    d3d_texture *t = d3d_alloc(sizeof *t, K_TEXTURE, g_texture_vtbl, dev);
+    d3d_texture *t = d3d_alloc(sizeof *t, K_TEXTURE, dim == 1 ? g_texture1d_vtbl : dim == 3 ? g_texture3d_vtbl : g_texture_vtbl, dev);
+    t->dim = dim; t->depth = dim == 3 ? depth : 1;
     memcpy(t->desc, desc, sizeof t->desc);
     id<MTLTexture> tex = (__bridge id<MTLTexture>)mtl;
     t->desc[TD_MIPS] = (uint32_t)tex.mipmapLevelCount;
@@ -185,6 +258,7 @@ d3d_texture *d3d_texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], 
     t->base.destroy = texture_destroy;
     return t;
 }
+d3d_texture *d3d_texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], HRESULT *hr) { return texture_create(dev, desc, 2, 1, hr); }
 void d3d_texture_replace(d3d_texture *t, void *mtl_texture) {
     if (t->mtl) CFBridgingRelease(t->mtl);
     t->mtl = mtl_texture;
@@ -303,7 +377,8 @@ static void clear_pass(d3d_context *c, d3d_view *v, const float *color, int dept
     if (color) {
         rp.colorAttachments[0].texture = tex;
         rp.colorAttachments[0].level = v->mip;
-        rp.colorAttachments[0].slice = v->first_slice;
+        if (rp.colorAttachments[0].texture.textureType == MTLTextureType3D) rp.colorAttachments[0].depthPlane = v->first_slice;
+        else rp.colorAttachments[0].slice = v->first_slice;
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(color[0], color[1], color[2], color[3]);
@@ -356,6 +431,14 @@ static void subresource(const d3d_texture *t, uint32_t sub, uint32_t *mip, uint3
     *mip = sub % mips; *slice = sub / mips;
 }
 static uint32_t mip_size(uint32_t size, uint32_t mip) { size >>= mip; return size ? size : 1; }
+// The region of a subresource a box covers (all of it without one): origin and size in texels.
+static void region(const d3d_texture *t, uint32_t mip, const uint32_t *box, MTLOrigin *o, MTLSize *sz) {
+    uint32_t w = mip_size(t->desc[TD_WIDTH], mip), h = mip_size(t->desc[TD_HEIGHT], mip), d = mip_size(t->depth, mip);
+    if (t->dim == 1) h = 1;
+    if (!box) { *o = MTLOriginMake(0, 0, 0); *sz = MTLSizeMake(w, h, d); return; }
+    *o = MTLOriginMake(box[0], box[1], t->dim == 3 ? box[2] : 0);
+    *sz = MTLSizeMake(MIN(box[3], w) - MIN(box[0], w), MIN(box[4], h) - MIN(box[1], h), t->dim == 3 ? MIN(box[5], d) - MIN(box[2], d) : 1);
+}
 
 static WINAPI void ctx_copy_resource(void *this, d3d_object *dst, d3d_object *src) {
     d3d_context *c = this;
@@ -364,7 +447,7 @@ static WINAPI void ctx_copy_resource(void *this, d3d_object *dst, d3d_object *sr
     id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
     if (dst->kind == K_TEXTURE) {
         id<MTLTexture> s = (__bridge id<MTLTexture>)((d3d_texture *)src)->mtl, d = (__bridge id<MTLTexture>)((d3d_texture *)dst)->mtl;
-        if (s.width == d.width && s.height == d.height && s.mipmapLevelCount == d.mipmapLevelCount && s.arrayLength == d.arrayLength && s.sampleCount == d.sampleCount)
+        if (s.width == d.width && s.height == d.height && s.depth == d.depth && s.mipmapLevelCount == d.mipmapLevelCount && s.arrayLength == d.arrayLength && s.sampleCount == d.sampleCount)
             [blit copyFromTexture:s toTexture:d];
     } else {
         id<MTLBuffer> s = (__bridge id<MTLBuffer>)((d3d_buffer *)src)->mtl, d = (__bridge id<MTLBuffer>)((d3d_buffer *)dst)->mtl;
@@ -375,7 +458,6 @@ static WINAPI void ctx_copy_resource(void *this, d3d_object *dst, d3d_object *sr
 // D3D11_BOX: left, top, front, right, bottom, back.
 static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint32_t dst_sub, uint32_t x, uint32_t y, uint32_t z,
                                                d3d_object *src, uint32_t src_sub, const uint32_t *box) {
-    (void)z;
     d3d_context *c = this;
     if (!dst || !src || dst->kind != src->kind) return;
     d3d_end_render(c);
@@ -385,11 +467,16 @@ static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint
         uint32_t smip, sslice, dmip, dslice;
         subresource(ss, src_sub, &smip, &sslice);
         subresource(ds, dst_sub, &dmip, &dslice);
-        uint32_t w = box ? box[3] - box[0] : mip_size(ss->desc[TD_WIDTH], smip), h = box ? box[4] - box[1] : mip_size(ss->desc[TD_HEIGHT], smip);
-        [blit copyFromTexture:(__bridge id<MTLTexture>)ss->mtl sourceSlice:sslice sourceLevel:smip
-                 sourceOrigin:MTLOriginMake(box ? box[0] : 0, box ? box[1] : 0, 0) sourceSize:MTLSizeMake(w, h, 1)
-                    toTexture:(__bridge id<MTLTexture>)ds->mtl destinationSlice:dslice destinationLevel:dmip
-            destinationOrigin:MTLOriginMake(x, y, 0)];
+        MTLOrigin o; MTLSize sz;
+        region(ss, smip, box, &o, &sz);
+        // The destination must hold the region (compressed regions at mip edges may be partial blocks).
+        sz.width = MIN(sz.width, mip_size(ds->desc[TD_WIDTH], dmip) - MIN(x, mip_size(ds->desc[TD_WIDTH], dmip)));
+        sz.height = MIN(sz.height, (ds->dim == 1 ? 1 : mip_size(ds->desc[TD_HEIGHT], dmip)) - MIN(y, mip_size(ds->desc[TD_HEIGHT], dmip)));
+        sz.depth = MIN(sz.depth, mip_size(ds->depth, dmip) - MIN(z, mip_size(ds->depth, dmip)));
+        if (sz.width && sz.height && sz.depth)
+            [blit copyFromTexture:(__bridge id<MTLTexture>)ss->mtl sourceSlice:sslice sourceLevel:smip sourceOrigin:o sourceSize:sz
+                        toTexture:(__bridge id<MTLTexture>)ds->mtl destinationSlice:dslice destinationLevel:dmip
+                destinationOrigin:MTLOriginMake(x, ds->dim == 1 ? 0 : y, ds->dim == 3 ? z : 0)];
     } else {
         id<MTLBuffer> s = (__bridge id<MTLBuffer>)((d3d_buffer *)src)->mtl, d = (__bridge id<MTLBuffer>)((d3d_buffer *)dst)->mtl;
         uint32_t from = box ? box[0] : 0, size = box ? box[3] - box[0] : (uint32_t)s.length;
@@ -398,29 +485,31 @@ static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint
     [blit endEncoding];
 }
 
-// Uploads go through a temporary buffer and a blit, so they land in order with the other recorded work.
-static void upload_texture(d3d_context *c, d3d_texture *t, uint32_t sub, const uint32_t *box, const void *data, uint32_t row_pitch) {
-    uint32_t mip, slice, bytes;
+// Uploads go through a temporary buffer and a blit, so they land in order with the other recorded work. Rows
+// are rows of texels, or of 4x4 blocks for the compressed formats.
+static void upload_texture(d3d_context *c, d3d_texture *t, uint32_t sub, const uint32_t *box, const void *data, uint32_t row_pitch, uint32_t depth_pitch) {
+    uint32_t mip, slice;
     subresource(t, sub, &mip, &slice);
-    d3d_mtl_format(t->desc[TD_FORMAT], &bytes);
-    uint32_t x = box ? box[0] : 0, y = box ? box[1] : 0;
-    uint32_t w = box ? box[3] - box[0] : mip_size(t->desc[TD_WIDTH], mip), h = box ? box[4] - box[1] : mip_size(t->desc[TD_HEIGHT], mip);
-    if (!w || !h || !bytes) return;
-    uint32_t pitch = w * bytes;
+    MTLOrigin o; MTLSize sz;
+    region(t, mip, box, &o, &sz);
+    uint32_t pitch, rows;
+    if (!sz.width || !sz.height || !sz.depth || !format_layout(t->desc[TD_FORMAT], (uint32_t)sz.width, (uint32_t)sz.height, &pitch, &rows)) return;
     id<MTLDevice> dev = (__bridge id<MTLDevice>)c->base.dev->mtl;
-    id<MTLBuffer> staging = [dev newBufferWithLength:(NSUInteger)pitch * h options:MTLResourceStorageModeShared];
-    for (uint32_t r = 0; r < h; r++) memcpy((uint8_t *)staging.contents + (size_t)r * pitch, (const uint8_t *)data + (size_t)r * row_pitch, pitch);
+    NSUInteger image = (NSUInteger)pitch * rows;
+    id<MTLBuffer> staging = [dev newBufferWithLength:image * sz.depth options:MTLResourceStorageModeShared];
+    for (NSUInteger z = 0; z < sz.depth; z++)
+        for (uint32_t r = 0; r < rows; r++)
+            memcpy((uint8_t *)staging.contents + z * image + (size_t)r * pitch, (const uint8_t *)data + z * depth_pitch + (size_t)r * row_pitch, pitch);
     d3d_end_render(c);
     id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
-    [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:pitch sourceBytesPerImage:(NSUInteger)pitch * h sourceSize:MTLSizeMake(w, h, 1)
-               toTexture:(__bridge id<MTLTexture>)t->mtl destinationSlice:slice destinationLevel:mip destinationOrigin:MTLOriginMake(x, y, 0)];
+    [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:pitch sourceBytesPerImage:image sourceSize:sz
+               toTexture:(__bridge id<MTLTexture>)t->mtl destinationSlice:slice destinationLevel:mip destinationOrigin:o];
     [blit endEncoding];
 }
 static WINAPI void ctx_update_subresource(void *this, d3d_object *dst, uint32_t sub, const uint32_t *box, const void *data, uint32_t row_pitch, uint32_t depth_pitch) {
-    (void)depth_pitch;
     d3d_context *c = this;
     if (!dst || !data) return;
-    if (dst->kind == K_TEXTURE) { upload_texture(c, (d3d_texture *)dst, sub, box, data, row_pitch); return; }
+    if (dst->kind == K_TEXTURE) { upload_texture(c, (d3d_texture *)dst, sub, box, data, row_pitch, depth_pitch); return; }
     // Buffers are renamed: the new contents go into a fresh Metal buffer (a copy of the old one), so draws
     // already recorded keep reading what they were given. Buffers the GPU writes (UAVs) are updated by the GPU
     // instead, in order, since their CPU-side contents may be out of date.
@@ -468,16 +557,18 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
     d3d_texture *t = (d3d_texture *)res;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)t->mtl;
     if (tex.storageMode != MTLStorageModeShared) { vx_log("Direct3D: Map of a texture without CPU access"); return E_INVALIDARG; }
-    uint32_t mip, slice, bytes;
+    uint32_t mip, slice;
     subresource(t, sub, &mip, &slice);
-    d3d_mtl_format(t->desc[TD_FORMAT], &bytes);
-    uint32_t w = mip_size(t->desc[TD_WIDTH], mip), h = mip_size(t->desc[TD_HEIGHT], mip);
-    size_t pitch = (size_t)w * bytes;
-    if (t->cpu_size < pitch * h) { free(t->cpu); t->cpu = malloc(pitch * h); t->cpu_size = pitch * h; }
+    MTLOrigin o; MTLSize sz;
+    region(t, mip, NULL, &o, &sz);
+    uint32_t pitch, rows;
+    format_layout(t->desc[TD_FORMAT], (uint32_t)sz.width, (uint32_t)sz.height, &pitch, &rows);
+    size_t image = (size_t)pitch * rows, size = image * sz.depth;
+    if (t->cpu_size < size) { free(t->cpu); t->cpu = malloc(size ? size : 1); t->cpu_size = size; }
     t->cpu_pitch = pitch;
     if (type & MAP_READ || type == 3)
-        [tex getBytes:t->cpu bytesPerRow:pitch bytesPerImage:pitch * h fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:mip slice:slice];
-    out->data = t->cpu; out->row_pitch = (uint32_t)pitch; out->depth_pitch = (uint32_t)(pitch * h);
+        [tex getBytes:t->cpu bytesPerRow:pitch bytesPerImage:image fromRegion:MTLRegionMake3D(0, 0, 0, sz.width, sz.height, sz.depth) mipmapLevel:mip slice:slice];
+    out->data = t->cpu; out->row_pitch = pitch; out->depth_pitch = (uint32_t)image;
     return S_OK;
 }
 static WINAPI void ctx_unmap(void *this, d3d_object *res, uint32_t sub) {
@@ -487,9 +578,12 @@ static WINAPI void ctx_unmap(void *this, d3d_object *res, uint32_t sub) {
     if (!(t->desc[TD_CPU] & 0x10000) || !t->cpu) return;            // D3D11_CPU_ACCESS_WRITE
     uint32_t mip, slice;
     subresource(t, sub, &mip, &slice);
-    uint32_t w = mip_size(t->desc[TD_WIDTH], mip), h = mip_size(t->desc[TD_HEIGHT], mip);
-    [(__bridge id<MTLTexture>)t->mtl replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:mip slice:slice withBytes:t->cpu
-                                       bytesPerRow:t->cpu_pitch bytesPerImage:t->cpu_pitch * h];
+    MTLOrigin o; MTLSize sz;
+    region(t, mip, NULL, &o, &sz);
+    uint32_t pitch, rows;
+    format_layout(t->desc[TD_FORMAT], (uint32_t)sz.width, (uint32_t)sz.height, &pitch, &rows);
+    [(__bridge id<MTLTexture>)t->mtl replaceRegion:MTLRegionMake3D(0, 0, 0, sz.width, sz.height, sz.depth) mipmapLevel:mip slice:slice withBytes:t->cpu
+                                       bytesPerRow:pitch bytesPerImage:(NSUInteger)pitch * rows];
 }
 static WINAPI void ctx_flush(void *this) { d3d_flush(((d3d_object *)this)->dev, 0); }
 static WINAPI void ctx_clear_state(void *this) { ctx_om_set_render_targets(this, 0, NULL, NULL); }
@@ -520,18 +614,31 @@ static WINAPI uint32_t device_release(void *this) { return d3d_release(this); }
 
 // D3D11_SUBRESOURCE_DATA: pointer, row pitch, slice pitch.
 typedef struct { const void *data; uint32_t pitch, slice_pitch; } SUBRESOURCE_DATA;
-static WINAPI HRESULT device_create_texture2d(void *this, const uint32_t *desc, const SUBRESOURCE_DATA *init, void **out) {
+static HRESULT create_texture(void *this, const uint32_t *desc, uint32_t dim, uint32_t depth, const SUBRESOURCE_DATA *init, void **out) {
     d3d_device *d = dev_of(this);
     HRESULT hr;
-    d3d_texture *t = d3d_texture_create(d, desc, &hr);
+    d3d_texture *t = texture_create(d, desc, dim, depth, &hr);
     if (!t) { if (out) *out = NULL; return hr; }
     if (init) {
         uint32_t subs = t->desc[TD_MIPS] * t->desc[TD_ARRAY];
-        for (uint32_t s = 0; s < subs; s++) if (init[s].data) upload_texture((d3d_context *)d->context, t, s, NULL, init[s].data, init[s].pitch);
+        for (uint32_t s = 0; s < subs; s++)
+            if (init[s].data) upload_texture((d3d_context *)d->context, t, s, NULL, init[s].data, init[s].pitch, init[s].slice_pitch);
     }
     if (!out) { d3d_release(&t->base); return S_FALSE; }   // a validation-only call
     *out = t;
     return S_OK;
+}
+static WINAPI HRESULT device_create_texture2d(void *this, const uint32_t *desc, const SUBRESOURCE_DATA *init, void **out) {
+    return create_texture(this, desc, 2, 1, init, out);
+}
+// D3D11_TEXTURE1D_DESC and D3D11_TEXTURE3D_DESC, kept in the 2D layout.
+static WINAPI HRESULT device_create_texture1d(void *this, const uint32_t *d, const SUBRESOURCE_DATA *init, void **out) {
+    uint32_t desc[TD_COUNT] = { d[0], 1, d[1], d[2], d[3], 1, 0, d[4], d[5], d[6], d[7] };
+    return create_texture(this, desc, 1, 1, init, out);
+}
+static WINAPI HRESULT device_create_texture3d(void *this, const uint32_t *d, const SUBRESOURCE_DATA *init, void **out) {
+    uint32_t desc[TD_COUNT] = { d[0], d[1], d[3], 1, d[4], 1, 0, d[5], d[6], d[7], d[8] };
+    return create_texture(this, desc, 3, d[2] ? d[2] : 1, init, out);
 }
 static WINAPI HRESULT device_create_buffer(void *this, const uint32_t *desc, const SUBRESOURCE_DATA *init, void **out) {
     d3d_device *d = dev_of(this);
@@ -647,6 +754,12 @@ static void make_tables(void) {
     static const d3d_method texture[] = { { "QueryInterface", (void *)texture_qi }, CHILD_METHODS, { "GetType", (void *)texture_get_type },
         { "SetEvictionPriority", (void *)texture_set_eviction }, { "GetEvictionPriority", (void *)texture_get_eviction },
         { "GetDesc", (void *)texture_get_desc }, { NULL, NULL } };
+    static const d3d_method texture1d[] = { { "QueryInterface", (void *)texture1d_qi }, CHILD_METHODS, { "GetType", (void *)texture_get_type },
+        { "SetEvictionPriority", (void *)texture_set_eviction }, { "GetEvictionPriority", (void *)texture_get_eviction },
+        { "GetDesc", (void *)texture1d_get_desc }, { NULL, NULL } };
+    static const d3d_method texture3d[] = { { "QueryInterface", (void *)texture3d_qi }, CHILD_METHODS, { "GetType", (void *)texture_get_type },
+        { "SetEvictionPriority", (void *)texture_set_eviction }, { "GetEvictionPriority", (void *)texture_get_eviction },
+        { "GetDesc", (void *)texture3d_get_desc }, { NULL, NULL } };
     static const d3d_method buffer[] = { { "QueryInterface", (void *)buffer_qi }, CHILD_METHODS, { "GetType", (void *)buffer_get_type },
         { "SetEvictionPriority", (void *)texture_set_eviction }, { "GetEvictionPriority", (void *)texture_get_eviction },
         { "GetDesc", (void *)buffer_get_desc }, { NULL, NULL } };
@@ -664,6 +777,7 @@ static void make_tables(void) {
         { NULL, NULL } };
     static const d3d_method device[] = { { "QueryInterface", (void *)device_qi }, { "AddRef", (void *)device_addref },
         { "Release", (void *)device_release }, { "CreateTexture2D", (void *)device_create_texture2d },
+        { "CreateTexture1D", (void *)device_create_texture1d }, { "CreateTexture3D", (void *)device_create_texture3d },
         { "CreateBuffer", (void *)device_create_buffer }, { "CreateRenderTargetView", (void *)device_create_rtv },
         { "CreateDepthStencilView", (void *)device_create_dsv }, { "CreateShaderResourceView", (void *)device_create_srv },
         { "CheckFormatSupport", (void *)device_check_format_support }, { "CheckMultisampleQualityLevels", (void *)device_check_msaa },
@@ -680,6 +794,8 @@ static void make_tables(void) {
         { "QueryResourceResidency", (void *)dxgidev_residency }, { "GetPrivateData", (void *)dxgidev_get_private },
         { "SetPrivateData", (void *)dxgidev_set_private }, { NULL, NULL } };
     g_texture_vtbl = D3D_VTABLE(ID3D11Texture2D, texture);
+    g_texture1d_vtbl = D3D_VTABLE(ID3D11Texture1D, texture1d);
+    g_texture3d_vtbl = D3D_VTABLE(ID3D11Texture3D, texture3d);
     g_buffer_vtbl = D3D_VTABLE(ID3D11Buffer, buffer);
     g_rtv_vtbl = D3D_VTABLE(ID3D11RenderTargetView, rtv);
     g_dsv_vtbl = D3D_VTABLE(ID3D11DepthStencilView, dsv);

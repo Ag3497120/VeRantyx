@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Generates src/d3d_tables.h: the method order (vtable layout) and IID of each COM interface this runtime
-# implements, read from MinGW-w64's widl-generated headers (d3d11.h, dxgi.h, dxgi1_2.h), and for every method a
+# implements, read from MinGW-w64's widl-generated headers (d3d11.h, d3d11_1.h, dxgi.h, dxgi1_2.h), and for every method a
 # stub that reports itself as not implemented (d3d_not_implemented, defined by the includer).
 #   tools/gen_com_tables.py <mingw include dir> > src/d3d_tables.h
 #   tools/gen_com_tables.py <mingw include dir> audio > src/audio_tables.h
@@ -16,7 +16,11 @@ INTERFACES = {
                 "ID3D11DepthStencilView", "ID3D11ShaderResourceView", "ID3D11Resource", "ID3D11DeviceChild",
                 "ID3D11VertexShader", "ID3D11PixelShader", "ID3D11InputLayout", "ID3D11BlendState",
                 "ID3D11DepthStencilState", "ID3D11RasterizerState", "ID3D11SamplerState", "ID3D11ComputeShader",
-                "ID3D11UnorderedAccessView"],
+                "ID3D11UnorderedAccessView", "ID3D11Texture1D", "ID3D11Texture3D", "ID3D11GeometryShader",
+                "ID3D11HullShader", "ID3D11DomainShader", "ID3D11Query", "ID3D11Predicate", "ID3D11Asynchronous",
+                "ID3D11Counter", "ID3D11ClassLinkage", "ID3D11CommandList"],
+    "d3d11_1.h": ["ID3D11Device1", "ID3D11DeviceContext1", "ID3D11BlendState1", "ID3D11RasterizerState1",
+                  "ID3DUserDefinedAnnotation"],
     "dxgi.h": ["IDXGIFactory", "IDXGIFactory1", "IDXGIAdapter", "IDXGIAdapter1", "IDXGIOutput", "IDXGISwapChain",
                "IDXGIDevice", "IDXGIDevice1", "IDXGIObject", "IDXGIDeviceSubObject", "IDXGISurface", "IDXGIResource"],
     "dxgi1_2.h": ["IDXGIFactory2", "IDXGISwapChain1"],

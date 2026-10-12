@@ -543,7 +543,8 @@ static id<MTLTexture> shader_texture(d3d_view *v) {
     if (v->mtl_view && v->mtl_src == tex->mtl) return (__bridge id<MTLTexture>)v->mtl_view;
     MTLPixelFormat fmt = base.pixelFormat;
     int depth = fmt == MTLPixelFormatDepth32Float || fmt == MTLPixelFormatDepth16Unorm || fmt == MTLPixelFormatDepth32Float_Stencil8;
-    MTLPixelFormat f = depth ? MTLPixelFormatInvalid : d3d_mtl_format(v->format, NULL);
+    MTLPixelFormat f = d3d_mtl_format(v->format, NULL);
+    if (depth && f != MTLPixelFormatX32_Stencil8) f = MTLPixelFormatInvalid;   // depth reads as depth; stencil views read stencil
     if (f != MTLPixelFormatInvalid) fmt = f;
     MTLTextureType type = view_type(v->dim, base.textureType);
     NSUInteger levels = base.mipmapLevelCount, first = MIN((NSUInteger)v->mip, levels - 1);
@@ -572,7 +573,8 @@ static id<MTLRenderCommandEncoder> render_pass(d3d_context *c) {
         if (!v) continue;
         rp.colorAttachments[i].texture = view_texture(v);
         rp.colorAttachments[i].level = v->mip;
-        rp.colorAttachments[i].slice = v->first_slice;
+        if (rp.colorAttachments[i].texture.textureType == MTLTextureType3D) rp.colorAttachments[i].depthPlane = v->first_slice;
+        else rp.colorAttachments[i].slice = v->first_slice;
         rp.colorAttachments[i].loadAction = MTLLoadActionLoad;
         rp.colorAttachments[i].storeAction = MTLStoreActionStore;
         any = 1;

@@ -71,8 +71,9 @@ struct d3d_device {
     uint32_t flags, feature_level, max_latency;
 };
 typedef struct {
-    d3d_object base;                 // ID3D11Texture2D
-    uint32_t desc[TD_COUNT];
+    d3d_object base;                 // ID3D11Texture2D (or 1D, 3D)
+    uint32_t desc[TD_COUNT];         // in the 2D layout, whatever the dimension
+    uint32_t dim, depth;             // 1, 2 or 3 dimensions; the depth of a 3D texture (else 1)
     void *mtl;                       // id<MTLTexture> (retained)
     uint8_t *cpu;                    // staging textures: the CPU copy Map hands out
     size_t cpu_pitch, cpu_size;

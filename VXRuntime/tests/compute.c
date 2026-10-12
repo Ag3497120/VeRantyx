@@ -11,6 +11,7 @@
 #include "shaders/atomic_cs.h"
 #include "shaders/append_cs.h"
 #include "shaders/views_cs.h"
+#include "shaders/formats_cs.h"
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("check failed (line %d): %s\n", __LINE__, #c); failures++; } } while (0)
 static ID3D11Device *dev;
@@ -228,6 +229,81 @@ static void test_views(void) {
     ID3D11Buffer_Release(results); ID3D11Buffer_Release(fb); ID3D11ComputeShader_Release(cs);
 }
 
+// Block-compressed textures (BC1, and BC3 updated in part), a 3D and a 1D texture.
+static void test_formats(void) {
+    ID3D11ComputeShader *cs;
+    CHECK(SUCCEEDED(ID3D11Device_CreateComputeShader(dev, formats_cs, sizeof formats_cs, NULL, &cs)));
+    // BC1: one 4x4 block, colour 0 red (565), colour 1 blue, every index 0: all red.
+    unsigned char bc1[8] = { 0x00, 0xf8, 0x1f, 0x00, 0, 0, 0, 0 };
+    D3D11_SUBRESOURCE_DATA init = { bc1, 8, 8 };
+    D3D11_TEXTURE2D_DESC td = { 4, 4, 1, 1, DXGI_FORMAT_BC1_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+    ID3D11Texture2D *t1, *t3;
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, &init, &t1)));
+    // BC3: 8x8 (2x2 blocks), the bottom-right block set afterwards: alpha 255, colour green.
+    td.Width = td.Height = 8; td.Format = DXGI_FORMAT_BC3_UNORM;
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &t3)));
+    unsigned char bc3[16] = { 0xff, 0x00, 0, 0, 0, 0, 0, 0, 0xe0, 0x07, 0xe0, 0x07, 0, 0, 0, 0 };
+    D3D11_BOX box = { 4, 4, 0, 8, 8, 1 };
+    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)t3, 0, &box, bc3, 16, 16);
+    // A 4x4x4 volume of x + 10y + 100z, a row of 8 texels of 30i.
+    float vol[64];
+    for (int i = 0; i < 64; i++) vol[i] = (float)(i % 4 + 10 * (i / 4 % 4) + 100 * (i / 16));
+    D3D11_SUBRESOURCE_DATA vinit = { vol, 16, 64 };
+    D3D11_TEXTURE3D_DESC vd = { 4, 4, 4, 1, DXGI_FORMAT_R32_FLOAT, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+    ID3D11Texture3D *t3d;
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture3D(dev, &vd, &vinit, &t3d)));
+    unsigned char line[8];
+    for (int i = 0; i < 8; i++) line[i] = (unsigned char)(30 * i);
+    D3D11_SUBRESOURCE_DATA linit = { line, 8, 8 };
+    D3D11_TEXTURE1D_DESC ld = { 8, 1, 1, DXGI_FORMAT_R8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+    ID3D11Texture1D *t1d;
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture1D(dev, &ld, &linit, &t1d)));
+    D3D11_TEXTURE3D_DESC vback;
+    ID3D11Texture3D_GetDesc(t3d, &vback);
+    CHECK(vback.Depth == 4 && vback.Format == DXGI_FORMAT_R32_FLOAT);
+    D3D11_RESOURCE_DIMENSION rdim;
+    ID3D11Texture1D_GetType(t1d, &rdim);
+    CHECK(rdim == D3D11_RESOURCE_DIMENSION_TEXTURE1D);
+    ID3D11ShaderResourceView *srvs[4];
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)t1, NULL, &srvs[0])));
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)t3, NULL, &srvs[1])));
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)t3d, NULL, &srvs[2])));
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)t1d, NULL, &srvs[3])));
+    ID3D11Buffer *results = make_buffer(64, D3D11_BIND_UNORDERED_ACCESS, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 16, NULL, D3D11_USAGE_DEFAULT, 0);
+    ID3D11UnorderedAccessView *uav;
+    CHECK(SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)results, NULL, &uav)));
+    ID3D11DeviceContext_CSSetShader(ctx, cs, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(ctx, 0, 4, srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1, &uav, NULL);
+    ID3D11DeviceContext_Dispatch(ctx, 1, 1, 1);
+    float r[16];
+    read_buffer(results, r, sizeof r);
+    CHECK(r[0] == 1 && r[1] == 0 && r[2] == 0 && r[3] == 1);
+    CHECK(r[4] == 0 && r[5] == 1 && r[6] == 0 && r[7] == 1);
+    CHECK(r[8] == 321 && fabsf(r[9] - 150.0f / 255) < 0.002f);
+    CHECK(r[12] == 4 && r[13] == 4 && r[14] == 4);
+    // A staging copy of the BC1 texture maps with a row pitch of one block row.
+    td.Width = td.Height = 4; td.Format = DXGI_FORMAT_BC1_UNORM; td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D *staging;
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &staging)));
+    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)t1);
+    D3D11_MAPPED_SUBRESOURCE m = { 0 };
+    int same = 0;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m))) {
+        same = !memcmp(m.pData, bc1, 8);
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+    }
+    CHECK(m.RowPitch == 8 && same);
+    printf("  formats: BC1 (%g %g %g %g), BC3 (%g %g %g %g), 3D %g, 1D %g, volume %gx%gx%g, BC1 row pitch %u\n",
+           r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[12], r[13], r[14], m.RowPitch);
+    ID3D11ShaderResourceView *no_srv[4] = { NULL, NULL, NULL, NULL };
+    ID3D11DeviceContext_CSSetShaderResources(ctx, 0, 4, no_srv);
+    for (int i = 0; i < 4; i++) ID3D11ShaderResourceView_Release(srvs[i]);
+    ID3D11UnorderedAccessView_Release(uav); ID3D11Buffer_Release(results);
+    ID3D11Texture2D_Release(staging); ID3D11Texture2D_Release(t1); ID3D11Texture2D_Release(t3);
+    ID3D11Texture3D_Release(t3d); ID3D11Texture1D_Release(t1d); ID3D11ComputeShader_Release(cs);
+}
+
 int main(void) {
     D3D_FEATURE_LEVEL level;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) { printf("compute: no device -> FAILED\n"); return 1; }
@@ -235,6 +311,7 @@ int main(void) {
     test_atomics_and_texture();
     test_append_consume();
     test_views();
-    printf("compute: shared-memory sums, atomics, writable texture, UAV clear, append/consume, texture atomics, views: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    test_formats();
+    printf("compute: shared-memory sums, atomics, writable texture, UAV clear, append/consume, texture atomics, views, formats: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }
