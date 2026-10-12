@@ -26,6 +26,7 @@ mkdir -p "$(dirname "$OUTPUT_DLL")"
     "$REPO_ROOT/VRDriver/openvr_capture_proxy.def" \
     -ld3d11 \
     -ldxgi \
+    -lopengl32 \
     -o "$OUTPUT_DLL"
 
 if ! file "$OUTPUT_DLL" | grep -Eq 'PE32\+ executable.*x86-64'; then

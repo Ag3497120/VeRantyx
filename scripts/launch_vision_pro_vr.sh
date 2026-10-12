@@ -15,7 +15,30 @@ STEAM_ROOT="${STEAM_ROOT:-$WINEPREFIX/drive_c/Program Files (x86)/Steam}"
 STEAM_EXE="${STEAM_EXE:-$STEAM_ROOT/steam.exe}"
 STEAMVR_DIR="${STEAMVR_DIR:-$STEAM_ROOT/steamapps/common/SteamVR}"
 VRSTARTUP_EXE="${VRSTARTUP_EXE:-$STEAMVR_DIR/bin/win64/vrstartup.exe}"
-GAME_EXE="${HLA_EXE:-$STEAM_ROOT/steamapps/common/half-life alyx/game/bin/win64/hlvr.exe}"
+# VERANTYX_APP picks the SteamVR title: alyx (default), earth (Google Earth VR),
+# or a Steam app ID with VERANTYX_APP_EXE set to its .exe inside the prefix.
+# Only Alyx gets the Alyx-specific steps (launch options, fidelity, dxvk.conf).
+VERANTYX_APP="${VERANTYX_APP:-alyx}"
+case "$VERANTYX_APP" in
+    alyx)
+        APP_ID=546560; APP_NAME="Half-Life: Alyx"
+        GAME_EXE="${HLA_EXE:-$STEAM_ROOT/steamapps/common/half-life alyx/game/bin/win64/hlvr.exe}" ;;
+    earth)
+        APP_ID=348250; APP_NAME="Google Earth VR"
+        GAME_EXE="${VERANTYX_APP_EXE:-$STEAM_ROOT/steamapps/common/EarthVR/Earth.exe}" ;;
+    *)
+        if [[ ! "$VERANTYX_APP" =~ ^[0-9]+$ || -z "${VERANTYX_APP_EXE:-}" ]]; then
+            echo "VERANTYX_APP must be alyx, earth, or a Steam app ID together with VERANTYX_APP_EXE (its .exe in the prefix)." >&2
+            exit 1
+        fi
+        APP_ID="$VERANTYX_APP"; APP_NAME="${VERANTYX_APP_NAME:-Steam app $APP_ID}"
+        GAME_EXE="$VERANTYX_APP_EXE" ;;
+esac
+IS_ALYX=0; [[ "$VERANTYX_APP" == "alyx" ]] && IS_ALYX=1
+GAME_BIN_DIR="$(dirname "$GAME_EXE")"
+# pgrep -f pattern for the game's process; the bracket keeps pgrep from matching itself.
+GAME_EXE_BASE="$(basename "$GAME_EXE")"
+GAME_PROC="[${GAME_EXE_BASE:0:1}]$(printf '%s' "${GAME_EXE_BASE:1}" | sed 's/[.]/\\./g')"
 VR_DRIVER_DIR="${VR_DRIVER_DIR:-$WINEPREFIX/drive_c/vr_driver/verantyx/bin/win64}"
 STEAMVR_DRIVER_DIR="${STEAMVR_DRIVER_DIR:-$STEAMVR_DIR/drivers/verantyx/bin/win64}"
 DRIVER_LOG="$WINEPREFIX/drive_c/vr_shared_frame.log"
@@ -64,7 +87,7 @@ if [[ ! -f "$VRSTARTUP_EXE" ]]; then
     exit 1
 fi
 if [[ ! -f "$GAME_EXE" ]]; then
-    echo "Half-Life: Alyx executable was not found: $GAME_EXE" >&2
+    echo "$APP_NAME executable was not found: $GAME_EXE" >&2
     echo "The transferred installation should be in the Steam library above." >&2
     exit 1
 fi
@@ -92,15 +115,15 @@ WINEPREFIX="$WINEPREFIX" VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" \
 VR_DRIVER_DIR="$VR_DRIVER_DIR" STEAMVR_DRIVER_DIR="$STEAMVR_DRIVER_DIR" \
     "$REPO_ROOT/scripts/install_openvr_driver.sh"
 "$REPO_ROOT/scripts/build_openvr_capture_proxy.sh"
-if pgrep -f '[h]lvr\.exe' >/dev/null 2>&1; then
+if pgrep -f "$GAME_PROC" >/dev/null 2>&1; then
     # Windows locks a loaded DLL, and the running game already has the proxy.
-    echo "Half-Life: Alyx is running; keeping its loaded OpenVR capture proxy (a rebuilt proxy is installed on the next game launch)."
+    echo "$APP_NAME is running; keeping its loaded OpenVR capture proxy (a rebuilt proxy is installed on the next game launch)."
 else
     WINEPREFIX="$WINEPREFIX" VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" \
-        STEAM_ROOT="$STEAM_ROOT" STEAMVR_DIR="$STEAMVR_DIR" \
+        STEAM_ROOT="$STEAM_ROOT" STEAMVR_DIR="$STEAMVR_DIR" HLA_GAME_BIN="$GAME_BIN_DIR" \
         "$REPO_ROOT/scripts/install_steamvr_openvr_api.sh"
     WINEPREFIX="$WINEPREFIX" VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" \
-        STEAM_ROOT="$STEAM_ROOT" STEAMVR_DIR="$STEAMVR_DIR" \
+        STEAM_ROOT="$STEAM_ROOT" STEAMVR_DIR="$STEAMVR_DIR" HLA_GAME_BIN="$GAME_BIN_DIR" \
         "$REPO_ROOT/scripts/install_openvr_capture_proxy.sh"
 fi
 "$REPO_ROOT/scripts/build_steamvr_d3d11_proxy.sh"
@@ -112,7 +135,9 @@ WINEPREFIX="$WINEPREFIX" VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" \
 # every start. A dxvk.conf beside hlvr.exe gives the game a current GPU name
 # instead; the compositor's own DXVK is not affected. Read at game start.
 HLA_DXVK_CONF="$(dirname "$GAME_EXE")/dxvk.conf"
-if [[ "${VERANTYX_DXVK_GPU_SPOOF:-1}" == "1" ]]; then
+if (( IS_ALYX == 0 )); then
+    :   # the GPU-name dxvk.conf is Alyx's
+elif [[ "${VERANTYX_DXVK_GPU_SPOOF:-1}" == "1" ]]; then
     hla_dxvk_conf_content="$(printf '%s\n' \
         '# Written by VeRantyx (launch_vision_pro_vr.sh); VERANTYX_DXVK_GPU_SPOOF=0 removes it.' \
         'dxgi.customVendorId = 10de' \
@@ -200,7 +225,7 @@ if [[ "$D3D_BACKEND" == "dxmt" ]]; then
     export WINEDLLOVERRIDES="dxgi=n,b;${WINEDLLOVERRIDES:-}"
     export DXMT_LOG_LEVEL="${DXMT_LOG_LEVEL:-error}"
     export DXMT_LOG_PATH="${DXMT_LOG_PATH:-$LOG_DIR}"
-elif [[ -f "$STEAM_ROOT/steamapps/common/Half-Life Alyx/game/bin/win64/.verantyx-dxmt" ]] && ! pgrep -f '[h]lvr\.exe' >/dev/null 2>&1; then
+elif [[ -f "$STEAM_ROOT/steamapps/common/Half-Life Alyx/game/bin/win64/.verantyx-dxmt" ]] && ! pgrep -f "$GAME_PROC" >/dev/null 2>&1; then
     WINEPREFIX="$WINEPREFIX" VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" STEAM_ROOT="$STEAM_ROOT" \
         DXVK_SOURCE_DIR="$DXVK_SOURCE_DIR" "$REPO_ROOT/scripts/install_dxmt.sh" remove
 fi
@@ -215,12 +240,12 @@ if [[ "$D3D_BACKEND" == "d3dmetal" ]]; then
     export WINEDLLOVERRIDES="d3d10,d3d10_1,d3d10core,d3d11,d3d12,d3d12core,dxgi=b;nvapi,nvapi64,nvngx,nvngx-on-metalfx,atidxx64="
     export D3DM_SUPPORT_DXR="${D3DM_SUPPORT_DXR:-0}"
 elif [[ -f "$VERANTYX_VR_DRIVE/Beer/wine/WineStaging.app/Contents/Resources/wine/lib/wine/.verantyx-d3dmetal" ]] && \
-    ! pgrep -f '[v]rcompositor\.exe|[h]lvr\.exe' >/dev/null 2>&1; then
+    ! pgrep -f "[v]rcompositor\.exe|$GAME_PROC" >/dev/null 2>&1; then
     VERANTYX_VR_DRIVE="$VERANTYX_VR_DRIVE" "$REPO_ROOT/scripts/install_d3dmetal.sh" remove
 fi
 STEAM_BACKEND_MARKER="$LOG_DIR/.steam-d3d-backend"
 if pgrep -f '[s]team\.exe' >/dev/null 2>&1 && [[ -f "$STEAM_BACKEND_MARKER" ]] && \
-    [[ "$(cat "$STEAM_BACKEND_MARKER")" != "$D3D_BACKEND" ]] && ! pgrep -f '[h]lvr\.exe' >/dev/null 2>&1; then
+    [[ "$(cat "$STEAM_BACKEND_MARKER")" != "$D3D_BACKEND" ]] && ! pgrep -f "$GAME_PROC" >/dev/null 2>&1; then
     echo "Windows Steam was started for the $(cat "$STEAM_BACKEND_MARKER") backend; restarting it for $D3D_BACKEND."
     pkill -TERM -f '[v]rstartup\.exe|[v]rmonitor\.exe|[v]rserver\.exe|[v]rcompositor\.exe|[v]rwebhelper|[v]rdashboard' 2>/dev/null || true
     pkill -TERM -f '[s]teamwebhelper|[s]team\.exe' 2>/dev/null || true
@@ -341,9 +366,11 @@ steam_webhelper_failed() {
 # during startup.
 HLA_BASE_OPTIONS=(-vr -nowindow -novid -console -vconsole -condebug -dx11)
 set_options_status=0
+if (( IS_ALYX == 1 )); then
 WINEPREFIX="$WINEPREFIX" STEAM_ROOT="$STEAM_ROOT" \
     "$REPO_ROOT/scripts/set_alyx_launch_options.sh" "${HLA_BASE_OPTIONS[*]}" || set_options_status=$?
-if (( set_options_status == 3 )) && ! pgrep -f '[h]lvr\.exe' >/dev/null 2>&1; then
+fi
+if (( set_options_status == 3 )) && ! pgrep -f "$GAME_PROC" >/dev/null 2>&1; then
     echo "Stopping Windows Steam to store Alyx's launch options and overlay setting."
     pkill -TERM -f '[v]rstartup\.exe|[v]rmonitor\.exe|[v]rserver\.exe|[v]rcompositor\.exe|[v]rwebhelper|[v]rdashboard' 2>/dev/null || true
     pkill -TERM -f '[s]teamwebhelper|[s]team\.exe' 2>/dev/null || true
@@ -411,7 +438,7 @@ if ! steam_is_authenticated; then
         exit 1
     fi
 else
-    echo "A signed-in Windows Steam session is available for SteamVR and Half-Life: Alyx."
+    echo "A signed-in Windows Steam session is available for SteamVR and $APP_NAME."
 fi
 
 STEAMVR_ALREADY_RUNNING=0
@@ -511,7 +538,7 @@ if [[ "$VERANTYX_BENCH" == "1" ]]; then
     echo "VERANTYX_BENCH=1: not waiting for the Vision Pro app; the driver supplies synthetic poses."
 elif [[ "${WAIT_FOR_VISION_PRO_TRACKING:-1}" == "1" ]]; then
     VISION_TRACKING_TIMEOUT="${VISION_TRACKING_TIMEOUT:-1200}"
-    echo "Waiting for the Vision Pro app to send its first tracked pose before launching Half-Life: Alyx."
+    echo "Waiting for the Vision Pro app to send its first tracked pose before launching $APP_NAME."
     pose_ready=0
     steamvr_restart_started=0
     for ((elapsed = 0; elapsed < VISION_TRACKING_TIMEOUT; elapsed++)); do
@@ -547,12 +574,12 @@ elif [[ "${WAIT_FOR_VISION_PRO_TRACKING:-1}" == "1" ]]; then
         echo "No Vision Pro pose packet arrived within ${VISION_TRACKING_TIMEOUT}s. Open VeRantyx and start stereo VR, then rerun this script." >&2
         exit 1
     fi
-    echo "Vision Pro pose packets are arriving. Starting Half-Life: Alyx."
+    echo "Vision Pro pose packets are arriving. Starting $APP_NAME."
 fi
 
 steamvr_home_pid="$(pgrep -f '[s]teamvr_environments[/\\]game[/\\]bin[/\\]win64[/\\]steamtours\.exe' || true)"
 if [[ -n "$steamvr_home_pid" ]]; then
-    echo "Stopping SteamVR Home before launching Half-Life: Alyx."
+    echo "Stopping SteamVR Home before launching $APP_NAME."
     while IFS= read -r pid; do
         [[ -z "$pid" ]] || kill -TERM "$pid" 2>/dev/null || true
     done <<< "$steamvr_home_pid"
@@ -561,7 +588,7 @@ fi
 
 steamvr_room_setup_pid="$(pgrep -f '[s]teamvr_room_setup\.exe' || true)"
 if [[ -n "$steamvr_room_setup_pid" ]]; then
-    echo "Stopping SteamVR Room Setup before launching Half-Life: Alyx."
+    echo "Stopping SteamVR Room Setup before launching $APP_NAME."
     while IFS= read -r pid; do
         [[ -z "$pid" ]] || kill -TERM "$pid" 2>/dev/null || true
     done <<< "$steamvr_room_setup_pid"
@@ -586,8 +613,12 @@ log_since_checkpoint() {
 }
 
 current_game_windows_pid() {
-    log_since_checkpoint "$VR_SERVER_LOG" "$GAME_SERVER_CHECKPOINT" | awk '
-        /SetApplicationPid appkey=steam[.]app[.]546560 pid=/ {
+    # Started by Steam the app key is steam.app.<id>; started any other way
+    # SteamVR names it system.generated.<exe in lower case>.
+    log_since_checkpoint "$VR_SERVER_LOG" "$GAME_SERVER_CHECKPOINT" | awk \
+        -v k1="appkey=steam.app.$APP_ID pid=" \
+        -v k2="appkey=system.generated.$(printf '%s' "$GAME_EXE_BASE" | tr '[:upper:]' '[:lower:]') pid=" '
+        /SetApplicationPid / && (index($0, k1) || index($0, k2)) {
             value = $0; sub(/^.* pid=/, "", value); sub(/[^0-9].*$/, "", value)
             pid = value
         }
@@ -604,7 +635,7 @@ game_stereo_capture_ready() {
     [[ -n "${GAME_MAC_PID:-}" ]] && kill -0 "$GAME_MAC_PID" 2>/dev/null || return 1
     windows_pid="$(current_game_windows_pid)" || return 1
     log_since_checkpoint "$GAME_CAPTURE_LOG" "$GAME_CAPTURE_CHECKPOINT" | awk -v pid="$windows_pid" '
-        $3 == "pid=" pid && $4 == "Captured" && $5 == "Alyx" &&
+        $3 == "pid=" pid && $4 == "Captured" && ($5 == "Alyx" || $5 == "game") &&
         $6 == "eye" && $7 == "pair" && $8 ~ /^[1-9][0-9]*$/ &&
         $9 ~ /^\([1-9][0-9]*x[1-9][0-9]*$/ { ready = 1 }
         END { exit !ready }
@@ -618,6 +649,8 @@ GAME_CAPTURE_CHECKPOINT="$(log_checkpoint "$GAME_CAPTURE_LOG")"
 GAME_MAC_PID=""
 # Steam can take two minutes to start Alyx, and a fallback relaunch adds more.
 HLA_STARTUP_TIMEOUT="${HLA_STARTUP_TIMEOUT:-480}"
+GAME_LOG_NAME="half-life-alyx.log"
+(( IS_ALYX == 1 )) || GAME_LOG_NAME="steamvr-app-$APP_ID.log"
 # Optional: HLA_FIDELITY_LEVEL=0..8 adds Alyx's fidelity console variables.
 HLA_FIDELITY_LEVEL_REQUESTED="${HLA_FIDELITY_LEVEL:-}"
 HLA_FIDELITY_LEVEL="${HLA_FIDELITY_LEVEL:-0}"
@@ -635,13 +668,15 @@ if [[ -n "${HLA_FIDELITY_LEVEL_REQUESTED:-}" ]]; then
     HLA_FIDELITY_OPTIONS=(+vr_fidelity_level_auto 0 +vr_fidelity_level "$HLA_FIDELITY_LEVEL")
 fi
 game_has_script_options() {
+    # Only Alyx gets options from this script; any other title runs as Steam starts it.
+    (( IS_ALYX == 0 )) && return 0
     ps -o args= -p "$1" 2>/dev/null | grep -q -- '-condebug'
 }
 launch_alyx() {
     # Steam starts here when it is not running, with this script's environment.
     pgrep -f '[s]team\.exe' >/dev/null 2>&1 || echo "$D3D_BACKEND" >"$STEAM_BACKEND_MARKER"
     "$WINE_BIN" "$STEAM_EXE" -no-cef-sandbox -cef-single-process -noverifyfiles \
-        -applaunch 546560 "$@" >>"$LOG_DIR/half-life-alyx.log" 2>&1 &
+        -applaunch "$APP_ID" "$@" >>"$LOG_DIR/$GAME_LOG_NAME" 2>&1 &
 }
 stop_game_process() {
     local pid="$1" waited
@@ -657,23 +692,23 @@ stop_game_process() {
 # again after Alyx exits) without this script's options, so it renders at its
 # highest resolution. Steam then ignores our launch request. Quit such a copy
 # while it is still at the menu and launch it again with the options.
-existing_game_pid="$(pgrep -f '[h]lvr\.exe' | head -1 || true)"
+existing_game_pid="$(pgrep -f "$GAME_PROC" | head -1 || true)"
 if [[ -n "$existing_game_pid" ]]; then
     if game_has_script_options "$existing_game_pid"; then
-        echo "Half-Life: Alyx is already running with this script's options; following that process."
+        echo "$APP_NAME is already running with this script's options; following that process."
         GAME_SERVER_CHECKPOINT="0:0"
     else
-        echo "Steam started Half-Life: Alyx without this script's options; restarting it with the fixed fidelity level."
+        echo "Steam started $APP_NAME without this script's options; restarting it with the fixed fidelity level."
         stop_game_process "$existing_game_pid"
         sleep 3
-        if pgrep -f '[h]lvr\.exe' >/dev/null 2>&1; then
+        if pgrep -f "$GAME_PROC" >/dev/null 2>&1; then
             echo "Steam started Alyx again immediately; this script will follow that process."
             GAME_SERVER_CHECKPOINT="0:0"
         fi
     fi
 fi
-echo "Launching Half-Life: Alyx through Windows Steam App ID 546560. Waiting for completed stereo frames."
-: >"$LOG_DIR/half-life-alyx.log"
+echo "Launching $APP_NAME through Windows Steam App ID $APP_ID. Waiting for completed stereo frames."
+: >"$LOG_DIR/$GAME_LOG_NAME"
 fidelity_retry_available=0
 if (( ${#HLA_FIDELITY_OPTIONS[@]} > 0 )); then
     echo "Requesting Alyx fidelity level $HLA_FIDELITY_LEVEL with automatic fidelity off."
@@ -689,23 +724,28 @@ fi
 # HLA_EXTRA_OPTIONS appends further launch options (space separated).
 HLA_EXTRA_OPTIONS_ARRAY=()
 read -r -a HLA_EXTRA_OPTIONS_ARRAY <<< "${HLA_EXTRA_OPTIONS:-+engine_no_focus_sleep 0}"
+if (( IS_ALYX == 1 )); then
 launch_alyx "${HLA_BASE_OPTIONS[@]}" ${HLA_FIDELITY_OPTIONS[@]+"${HLA_FIDELITY_OPTIONS[@]}"} \
     ${HLA_BENCH_OPTIONS[@]+"${HLA_BENCH_OPTIONS[@]}"} ${HLA_EXTRA_OPTIONS_ARRAY[@]+"${HLA_EXTRA_OPTIONS_ARRAY[@]}"}
+else
+    fidelity_retry_available=0
+    launch_alyx
+fi
 
 # Alyx can exit with code 1 and have Steam start it again. Follow the new
 # process instead of treating that as a failed launch and stopping the encoder.
 HLA_RELAUNCH_GRACE="${HLA_RELAUNCH_GRACE:-60}"
 adopt_relaunched_game() {
     local waited pid
-    echo "Half-Life: Alyx process exited; waiting up to ${HLA_RELAUNCH_GRACE}s in case Steam is restarting it."
+    echo "$APP_NAME process exited; waiting up to ${HLA_RELAUNCH_GRACE}s in case Steam is restarting it."
     for ((waited = 0; waited < HLA_RELAUNCH_GRACE; waited++)); do
-        pid="$(pgrep -f '[h]lvr\.exe' | head -1 || true)"
+        pid="$(pgrep -f "$GAME_PROC" | head -1 || true)"
         if [[ -n "$pid" ]]; then
             GAME_MAC_PID="$pid"
             # The restarted process is not in the checkpointed log tail yet
             # when Steam started it before our checkpoint; read the whole log.
             GAME_SERVER_CHECKPOINT="0:0"
-            echo "Half-Life: Alyx was restarted by Steam; following the new process."
+            echo "$APP_NAME was restarted by Steam; following the new process."
             warn_if_game_lacks_options
             return 0
         fi
@@ -728,25 +768,25 @@ warn_if_game_lacks_options() {
 game_frames_ready=0
 for ((elapsed = 0; elapsed < HLA_STARTUP_TIMEOUT; elapsed++)); do
     if [[ -z "$GAME_MAC_PID" ]]; then
-        GAME_MAC_PID="$(pgrep -f '[h]lvr\.exe' | head -1 || true)"
+        GAME_MAC_PID="$(pgrep -f "$GAME_PROC" | head -1 || true)"
         if [[ -n "$GAME_MAC_PID" ]]; then
-            echo "Half-Life: Alyx process started; graphics are still initializing (no completed stereo frame confirmed)."
+            echo "$APP_NAME process started; graphics are still initializing (no completed stereo frame confirmed)."
             warn_if_game_lacks_options
         fi
     elif ! kill -0 "$GAME_MAC_PID" 2>/dev/null; then
         if (( fidelity_retry_available == 1 )); then
             fidelity_retry_available=0
-            echo "Half-Life: Alyx exited during startup with the fidelity settings; relaunching it with the options that worked before (Alyx picks its own resolution)." >&2
+            echo "$APP_NAME exited during startup with the fidelity settings; relaunching it with the options that worked before (Alyx picks its own resolution)." >&2
             # Steam relaunches Alyx without options shortly after such an exit.
             sleep 5
-            relaunched_pid="$(pgrep -f '[h]lvr\.exe' | head -1 || true)"
+            relaunched_pid="$(pgrep -f "$GAME_PROC" | head -1 || true)"
             [[ -z "$relaunched_pid" ]] || stop_game_process "$relaunched_pid"
             launch_alyx "${HLA_BASE_OPTIONS[@]}"
             GAME_MAC_PID=""
             continue
         fi
         adopt_relaunched_game && continue
-        echo "Half-Life: Alyx exited during graphics initialization." >&2
+        echo "$APP_NAME exited during graphics initialization." >&2
         break
     fi
     if ! kill -0 "$ENCODER_PID" 2>/dev/null || ! pgrep -f '[v]rcompositor\.exe' >/dev/null 2>&1; then
@@ -758,24 +798,24 @@ for ((elapsed = 0; elapsed < HLA_STARTUP_TIMEOUT; elapsed++)); do
         break
     fi
     if (( elapsed > 0 && elapsed % 15 == 0 )); then
-        echo "Waiting for Half-Life: Alyx to complete stereo rendering (${elapsed}s/${HLA_STARTUP_TIMEOUT}s)."
+        echo "Waiting for $APP_NAME to complete stereo rendering (${elapsed}s/${HLA_STARTUP_TIMEOUT}s)."
     fi
     sleep 1
 done
 
 if (( game_frames_ready == 0 )); then
-    echo "Half-Life: Alyx startup was not verified: no completed stereo eye pair from this launch was captured." >&2
-    echo "Check $LOG_DIR/half-life-alyx.log, $GAME_CAPTURE_LOG, and the game's game/hlvr/console.log for graphics or content errors." >&2
+    echo "$APP_NAME startup was not verified: no completed stereo eye pair from this launch was captured." >&2
+    echo "Check $LOG_DIR/$GAME_LOG_NAME and $GAME_CAPTURE_LOG (for Alyx also game/hlvr/console.log) for graphics or content errors." >&2
     echo "Current-launch capture diagnostics (historical entries excluded):" >&2
     log_since_checkpoint "$GAME_CAPTURE_LOG" "$GAME_CAPTURE_CHECKPOINT" | tail -30 >&2 || true
-    tail -30 "$LOG_DIR/half-life-alyx.log" >&2 || true
+    tail -30 "$LOG_DIR/$GAME_LOG_NAME" >&2 || true
     if [[ -z "$GAME_MAC_PID" ]] || ! kill -0 "$GAME_MAC_PID" 2>/dev/null || \
         ! kill -0 "$ENCODER_PID" 2>/dev/null || ! pgrep -f '[v]rcompositor\.exe' >/dev/null 2>&1; then
         exit 1
     fi
     echo "Startup timed out. Keeping the encoder supervised for headset diagnostics until this game exits or Ctrl+C is pressed."
 else
-    echo "Half-Life: Alyx completed stereo eye-pair capture. The encoder will stay active until the game exits or this script is stopped."
+    echo "$APP_NAME completed stereo eye-pair capture. The encoder will stay active until the game exits or this script is stopped."
 fi
 
 while true; do
@@ -783,18 +823,18 @@ while true; do
         adopt_relaunched_game || break
     fi
     if ! kill -0 "$ENCODER_PID" 2>/dev/null; then
-        echo "The HEVC encoder exited while Half-Life: Alyx was active." >&2
+        echo "The HEVC encoder exited while $APP_NAME was active." >&2
         exit 1
     fi
     if ! pgrep -f '[v]rcompositor\.exe' >/dev/null 2>&1; then
-        echo "SteamVR's compositor exited while Half-Life: Alyx was running." >&2
+        echo "SteamVR's compositor exited while $APP_NAME was running." >&2
         exit 1
     fi
     if (( game_frames_ready == 0 )) && game_stereo_capture_ready; then
         game_frames_ready=1
-        echo "Half-Life: Alyx completed stereo eye-pair capture after the startup timeout."
+        echo "$APP_NAME completed stereo eye-pair capture after the startup timeout."
     fi
     sleep 2
 done
-echo "Half-Life: Alyx exited."
+echo "$APP_NAME exited."
 (( game_frames_ready == 1 ))
