@@ -314,6 +314,13 @@ static BOOL modify(HANDLE h, int type, int (*change)(vx_object *, intptr_t), int
 }
 static int set_event(vx_object *o, intptr_t v) { o->signaled = (int)v; return 0; }
 static WINAPI BOOL SetEvent(HANDLE h) { return modify(h, OBJ_EVENT, set_event, 1); }
+// For threads that are not Windows threads (Core Audio's): signals an event without touching a TEB.
+void vx_set_event(HANDLE h) {
+    pthread_mutex_lock(&g_lock);
+    vx_object *o = lookup(h);
+    if (o && o->type == OBJ_EVENT) { o->signaled = 1; pthread_cond_broadcast(&g_changed); }
+    pthread_mutex_unlock(&g_lock);
+}
 static WINAPI BOOL ResetEvent(HANDLE h) { return modify(h, OBJ_EVENT, set_event, 0); }
 static int release_mutex(vx_object *o, intptr_t tid) {
     if (o->owner != (DWORD)tid) return 288;     // ERROR_NOT_OWNER

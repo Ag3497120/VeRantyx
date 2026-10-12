@@ -44,9 +44,12 @@ Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the 
 | 5a. COM (ole32: CoCreateInstance with built-in classes, registered factories and in-process servers from the registry), OLE automation (BSTR, VARIANT, SAFEARRAY), I/O completion ports and overlapped file I/O, vcruntime140 with MSVC C++ exceptions (FH3 tables, catch funclets via STATUS_UNWIND_CONSOLIDATE, rethrow) | `tests/com.c` (+ `vxcom.dll`), `tests/iocp.c`, `tests/msvc_eh.cpp` (built for the MSVC ABI by clang) | Works (2026-10-12). Every 64-bit DLL in Alyx's `bin/win64` (108 of 109) loads and initializes |
 | 5b. Direct3D 11 and DXGI on Metal: device and immediate context (textures, buffers, views, clears, copies, uploads, Map/Unmap), DXGI factory/adapter/output, swap chains presenting into the window's CAMetalLayer, resizing. Method tables generated from MinGW's headers (`tools/gen_com_tables.py`) | `tests/d3d11.c` (`--interactive` shows 600 frames) | Works (2026-10-12). Draws need shader translation |
 | 6. Shader translation DXBC → Metal Shading Language (`src/dxbc.c`: SM4/5 arithmetic, integer and bit operations, comparisons, control flow, sampling, loads, immediate constant buffers), input layouts, blend/depth-stencil/rasterizer/sampler states, pipeline-state cache, Draw/DrawIndexed(Instanced). Test shaders are compiled by Microsoft's d3dcompiler_43.dll running on vxrt (`tools/hlslc.c`); `build/dxbc2msl` shows a translation | `tests/draw.c` (`--interactive`: a spinning triangle) | Works (2026-10-12) |
-| 7. Geometry/hull/domain/compute shaders and UAVs, raw input, audio (XAudio2/WASAPI on Core Audio), FH4 C++ exceptions | — | Next |
-| 8. Direct3D 11 at game scale, Direct3D 12 (Metal Shader Converter), OpenGL | — | |
-| 9. Cryptography, processes, Chromium-class programs (the Steam client) | — | |
+| 7a. Compute shaders and UAVs: raw/structured buffers, typed UAV textures, thread-group shared memory, barriers, atomics, Dispatch, UAV clears | `tests/compute.c` | Works (2026-10-12) |
+| 7b. Raw input (WM_INPUT mouse deltas, buttons, wheel, keys), SendInput, mouse-look (hidden cursor + ClipCursor), XInput on the Game Controller framework | `tests/input.c` | Works (2026-10-12) |
+| 7c. WASAPI on Core Audio: MMDevice enumerator/endpoint/properties, shared event-driven IAudioClient, render client, clock, volume (Core Audio converts formats and rates) | `tests/audio.c` (`--tone` plays a quiet tone) | Works (2026-10-12) |
+| 8. Geometry and tessellation shaders (Metal has neither: emulation with compute), XAudio2 on top of WASAPI, audio capture, FH4 C++ exceptions (needs MSVC-built test programs), Direct3D 11 at game scale | — | Next |
+| 9. Direct3D 12 (Metal Shader Converter), OpenGL | — | |
+| 10. Cryptography, processes, Chromium-class programs (the Steam client) | — | |
 
 ## Known risks (research items)
 

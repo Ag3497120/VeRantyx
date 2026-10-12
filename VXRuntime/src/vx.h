@@ -78,6 +78,7 @@ void  *vx_handle_data(HANDLE h, int kind);    // NULL unless h is a handle of th
 BOOL   vx_handle_close(HANDLE h);
 // An overlapped operation on `file` finished: fills the OVERLAPPED, signals its event, queues the completion packet.
 void   vx_io_completed(HANDLE file, void *overlapped, DWORD bytes, DWORD status);
+void   vx_set_event(HANDLE event);          // SetEvent for threads that are not Windows threads
 
 // Diagnostics (stderr); VXRT_TRACE=1 also logs every implemented call that opts in.
 void vx_log(const char *fmt, ...);
@@ -99,6 +100,7 @@ void vx_mm_init(void);                 // winmm, imm32 (mm.c)
 void vx_d3d11_init(void);              // Direct3D 11 on Metal (d3d11.m)
 void vx_dxgi_init(void);               // DXGI (dxgi.m)
 void vx_input_init(void);              // XInput (input.m)
+void vx_audio_init(void);              // WASAPI on Core Audio (audio.m; after COM)
 void vx_com_init(void);                // ole32, oleaut32 (com.c)
 void vx_vcruntime_init(void);          // vcruntime140, MSVC C++ exceptions (vcruntime.c; after seh and ucrt)
 
