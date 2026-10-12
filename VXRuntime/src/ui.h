@@ -80,6 +80,7 @@ void vx_cocoa_activate(vx_window *w);
 int  vx_cocoa_message_box(const char *text, const char *caption, unsigned type);
 void vx_cocoa_beep(void);
 int  vx_cocoa_title_height(void);
+void *vx_cocoa_metal_layer(vx_window *w, void *mtl_device, int mtl_pixel_format);   // the view's CAMetalLayer
 // Runs program(arg) on a thread of its own with the given stack size and AppKit on the calling (main) thread
 // once the program asks for it. The process ends when program returns.
 int  vx_ui_run_main(int (*program)(void *), void *arg, size_t stack);

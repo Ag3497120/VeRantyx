@@ -1,0 +1,85 @@
+// Direct3D 11 and DXGI on Metal: what d3d11.m and dxgi.m share.
+//
+// Every Direct3D object is a COM object: a pointer to a method table laid out like its interface (see
+// d3d_tables.h), then the object's state. An object may expose a second interface through a second table
+// pointer (the device is also an IDXGIDevice1). Methods are called with `this` pointing at the table pointer.
+#ifndef VX_D3D_COMMON_H
+#define VX_D3D_COMMON_H
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#include "ui.h"
+
+typedef int32_t HRESULT;
+typedef struct { DWORD d1; uint16_t d2, d3; uint8_t d4[8]; } GUID;
+HRESULT d3d_not_implemented(const char *what);    // reports a method once, returns E_NOTIMPL
+
+#define S_OK 0
+#define S_FALSE 1
+#define E_NOTIMPL ((HRESULT)0x80004001)
+#define E_NOINTERFACE ((HRESULT)0x80004002)
+#define E_POINTER ((HRESULT)0x80004003)
+#define E_FAIL ((HRESULT)0x80004005)
+#define E_OUTOFMEMORY ((HRESULT)0x8007000E)
+#define E_INVALIDARG ((HRESULT)0x80070057)
+#define DXGI_ERROR_NOT_FOUND ((HRESULT)0x887A0002)
+#define DXGI_ERROR_UNSUPPORTED ((HRESULT)0x887A0004)
+#define DXGI_ERROR_FRAME_STATISTICS_DISJOINT ((HRESULT)0x887A000B)
+
+enum { K_DEVICE, K_CONTEXT, K_TEXTURE, K_BUFFER, K_RTV, K_DSV, K_SRV, K_SWAPCHAIN, K_FACTORY, K_ADAPTER, K_OUTPUT };
+
+typedef struct pdata { GUID guid; uint32_t size; void *data; struct pdata *next; } pdata;
+typedef struct d3d_device d3d_device;
+typedef struct d3d_object {
+    void **vtbl;                     // the main interface
+    void **vtbl2;                    // a second interface, or NULL
+    volatile LONG refs;
+    int kind;
+    d3d_device *dev;                 // the device a resource or view belongs to
+    pdata *pdata;                    // SetPrivateData
+    void (*destroy)(struct d3d_object *);
+} d3d_object;
+
+// `this` of a method called through the second table.
+#define FROM_VTBL2(p) ((d3d_object *)((char *)(p) - offsetof(d3d_object, vtbl2)))
+
+// Builds a method table: the implemented methods by name, stubs for the rest.
+typedef struct { const char *name; void *fn; } d3d_method;
+void **d3d_vtable(const char *const *names, void *const *stubs, int count, const d3d_method *impl);
+#define D3D_VTABLE(iface, impl) d3d_vtable(vt_##iface, vtstub_##iface, VT_COUNT_##iface, impl)
+
+void    *d3d_alloc(size_t size, int kind, void **vtbl, d3d_device *dev);   // refs = 1
+uint32_t d3d_addref(d3d_object *o);
+uint32_t d3d_release(d3d_object *o);
+HRESULT  d3d_get_private(d3d_object *o, const GUID *g, uint32_t *size, void *data);
+HRESULT  d3d_set_private(d3d_object *o, const GUID *g, uint32_t size, const void *data);
+int      d3d_same_guid(const GUID *a, const GUID *b);
+
+// Formats: the Metal pixel format and bytes per pixel of a DXGI_FORMAT (MTLPixelFormatInvalid if unsupported).
+MTLPixelFormat d3d_mtl_format(uint32_t dxgi, uint32_t *bytes_per_pixel);
+int            d3d_is_srgb(uint32_t dxgi);
+
+// D3D11_TEXTURE2D_DESC as eleven 32-bit fields.
+enum { TD_WIDTH, TD_HEIGHT, TD_MIPS, TD_ARRAY, TD_FORMAT, TD_SAMPLES, TD_QUALITY, TD_USAGE, TD_BIND, TD_CPU, TD_MISC, TD_COUNT };
+
+struct d3d_device {
+    d3d_object base;                 // ID3D11Device, and IDXGIDevice1 through vtbl2
+    void *mtl;                       // id<MTLDevice> (retained)
+    void *queue;                     // id<MTLCommandQueue> (retained)
+    d3d_object *context;             // the immediate context
+    d3d_object *adapter;             // IDXGIAdapter1, made on demand
+    uint32_t flags, feature_level, max_latency;
+};
+typedef struct {
+    d3d_object base;                 // ID3D11Texture2D
+    uint32_t desc[TD_COUNT];
+    void *mtl;                       // id<MTLTexture> (retained)
+    uint8_t *cpu;                    // staging textures: the CPU copy Map hands out
+    size_t cpu_pitch, cpu_size;
+} d3d_texture;
+
+d3d_texture *d3d_texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], HRESULT *hr);
+void         d3d_texture_replace(d3d_texture *t, void *mtl_texture);     // a swap chain's buffer after a resize
+void         d3d_flush(d3d_device *dev, int wait);                       // commits the immediate context's work
+d3d_device  *d3d_device_from(void *unknown);                             // an ID3D11Device / IDXGIDevice pointer
+d3d_object  *dxgi_adapter_create(void);                                  // dxgi.m
+#endif

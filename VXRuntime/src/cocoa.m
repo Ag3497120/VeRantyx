@@ -2,6 +2,7 @@
 // content view shows the window's client-area bitmap and turns keyboard and mouse events into Windows messages.
 //
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/CAMetalLayer.h>
 #include "ui.h"
 
 // ---- the main thread ----------------------------------------------------------------------------------------------
@@ -235,6 +236,12 @@ static WPARAM mouse_keys(NSEvent *e) {
 - (BOOL)windowShouldClose:(NSWindow *)sender { vx_window_post(w->hwnd, WM_CLOSE, 0, 0); return NO; }
 - (void)windowDidResize:(NSNotification *)n {
     NSWindow *win = n.object;
+    if ([win.contentView.layer isKindOfClass:[CAMetalLayer class]]) {
+        CAMetalLayer *ml = (CAMetalLayer *)win.contentView.layer;
+        CGFloat scale = win.backingScaleFactor;
+        ml.contentsScale = scale;
+        ml.drawableSize = CGSizeMake(win.contentView.bounds.size.width * scale, win.contentView.bounds.size.height * scale);
+    }
     vx_window_moved(w, windows_rect(win.frame));
     NSSize s = win.contentView.frame.size;
     vx_window_resized(w, (int)s.width, (int)s.height);
@@ -380,4 +387,25 @@ int vx_cocoa_message_box(const char *text, const char *caption, unsigned type) {
     return result;
 }
 
-void vx_cocoa_beep(void) { dispatch_async(dispatch_get_main_queue(), ^{ NSBeep(); }); }
+// A CAMetalLayer as the content of the window's view (Direct3D swap chains present into it); the view keeps
+// delivering input. Returns the layer (owned by the view).
+void *vx_cocoa_metal_layer(vx_window *w, void *device, int pixel_format) {
+    if (!w->native) return NULL;
+    __block void *result = NULL;
+    on_main(^{
+        NSWindow *win = native(w);
+        NSView *v = win.contentView;
+        CAMetalLayer *ml = [v.layer isKindOfClass:[CAMetalLayer class]] ? (CAMetalLayer *)v.layer : [CAMetalLayer layer];
+        ml.device = (__bridge id<MTLDevice>)device;
+        ml.pixelFormat = (MTLPixelFormat)pixel_format;
+        ml.framebufferOnly = YES;
+        CGFloat scale = win.backingScaleFactor;
+        ml.contentsScale = scale;
+        ml.drawableSize = CGSizeMake(v.bounds.size.width * scale, v.bounds.size.height * scale);
+        if (v.layer != ml) { v.layer = ml; v.wantsLayer = YES; }
+        result = (__bridge void *)ml;
+    });
+    return result;
+}
+
+void vx_cocoa_beep(void) { ui_ensure(); dispatch_async(dispatch_get_main_queue(), ^{ NSBeep(); }); }

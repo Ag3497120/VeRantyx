@@ -623,6 +623,8 @@ int main(int argc, char **argv, char **envp) {
     vx_net_init();
     vx_mm_init();
     vx_com_init();
+    vx_d3d11_init();
+    vx_dxgi_init();
     vx_vcruntime_init();
 
     vx_proc.argc = argc - 1;

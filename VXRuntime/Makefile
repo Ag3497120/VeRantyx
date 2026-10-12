@@ -2,19 +2,19 @@
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=13.0
 SRC     = src/loader.c src/kernel32.c src/ucrt.c src/sync.c src/seh.c src/context.S src/text.c src/files.c src/registry.c \
-          src/user32.c src/gdi.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m
+          src/user32.c src/gdi.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/dxgi.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
 
-build/vxrt: $(SRC) src/vx.h src/ui.h
+build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -69,6 +69,10 @@ build/iocp.exe: tests/iocp.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
+build/d3d11.exe: tests/d3d11.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxgi -ldxguid -luuid
+
 build/dllprobe.exe: tools/dllprobe.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
@@ -105,6 +109,7 @@ check: all
 	build/vxrt build/com.exe
 	build/vxrt build/iocp.exe
 	build/vxrt build/window.exe
+	build/vxrt build/d3d11.exe
 
 clean:
 	rm -rf build

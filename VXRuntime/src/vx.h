@@ -96,6 +96,8 @@ void vx_user32_init(void);             // windows and messages (user32.c, cocoa.
 void vx_gdi_init(void);                // drawing (gdi.c)
 void vx_net_init(void);                // ws2_32 (net.c)
 void vx_mm_init(void);                 // winmm, imm32 (mm.c)
+void vx_d3d11_init(void);              // Direct3D 11 on Metal (d3d11.m)
+void vx_dxgi_init(void);               // DXGI (dxgi.m)
 void vx_com_init(void);                // ole32, oleaut32 (com.c)
 void vx_vcruntime_init(void);          // vcruntime140, MSVC C++ exceptions (vcruntime.c; after seh and ucrt)
 
