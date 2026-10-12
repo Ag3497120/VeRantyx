@@ -646,9 +646,12 @@ static WINAPI BOOL ConvertStringSecurityDescriptorToSecurityDescriptorW(const WC
     if (size) *size = 40;
     return 1;
 }
+// EventWriteString: shown with VXRT_TRACE_EVENTS=1 (programs such as SteamVR write thousands per second).
 static WINAPI DWORD EventWriteString(uint64_t reg, uint8_t level, uint64_t keyword, const WCHAR *s) {
     (void)reg; (void)level; (void)keyword;
-    if (vx_trace && s) { char *a = vx_utf8_dup(s); vx_log("event: %s", a); free(a); }
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_TRACE_EVENTS") && atoi(getenv("VXRT_TRACE_EVENTS"));
+    if (on && s) { char *a = vx_utf8_dup(s); vx_log("event: %s", a); free(a); }
     return 0;
 }
 

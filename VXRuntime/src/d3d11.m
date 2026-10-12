@@ -589,6 +589,8 @@ static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint
 
 // Uploads go through a temporary buffer and a blit, so they land in order with the other recorded work. Rows
 // are rows of texels, or of 4x4 blocks for the compressed formats.
+// c: the context recording the upload; NULL for a texture's initial data, which may come from any thread (device
+// methods are free-threaded): a command buffer of its own, committed at once (the queue keeps it before later work).
 static void upload_texture(d3d_context *c, d3d_texture *t, uint32_t sub, const uint32_t *box, const void *data, uint32_t row_pitch, uint32_t depth_pitch) {
     uint32_t mip, slice;
     subresource(t, sub, &mip, &slice);
@@ -596,17 +598,20 @@ static void upload_texture(d3d_context *c, d3d_texture *t, uint32_t sub, const u
     region(t, mip, box, &o, &sz);
     uint32_t pitch, rows;
     if (!sz.width || !sz.height || !sz.depth || !format_layout(t->desc[TD_FORMAT], (uint32_t)sz.width, (uint32_t)sz.height, &pitch, &rows)) return;
-    id<MTLDevice> dev = (__bridge id<MTLDevice>)c->base.dev->mtl;
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)t->base.dev->mtl;
     NSUInteger image = (NSUInteger)pitch * rows;
     id<MTLBuffer> staging = [dev newBufferWithLength:image * sz.depth options:MTLResourceStorageModeShared];
     for (NSUInteger z = 0; z < sz.depth; z++)
         for (uint32_t r = 0; r < rows; r++)
             memcpy((uint8_t *)staging.contents + z * image + (size_t)r * pitch, (const uint8_t *)data + z * depth_pitch + (size_t)r * row_pitch, pitch);
-    d3d_end_render(c);
-    id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
+    id<MTLCommandBuffer> own = nil;
+    if (c) d3d_end_render(c);
+    else own = [(__bridge id<MTLCommandQueue>)t->base.dev->queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [(c ? context_cmd(c) : own) blitCommandEncoder];
     [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:pitch sourceBytesPerImage:image sourceSize:sz
                toTexture:(__bridge id<MTLTexture>)t->mtl destinationSlice:slice destinationLevel:mip destinationOrigin:o];
     [blit endEncoding];
+    if (own) [own commit];
 }
 static WINAPI void ctx_update_subresource(void *this, d3d_object *dst, uint32_t sub, const uint32_t *box, const void *data, uint32_t row_pitch, uint32_t depth_pitch) {
     d3d_context *c = this;
@@ -726,7 +731,7 @@ static HRESULT create_texture(void *this, const uint32_t *desc, uint32_t dim, ui
     if (init) {
         uint32_t subs = t->desc[TD_MIPS] * t->desc[TD_ARRAY];
         for (uint32_t s = 0; s < subs; s++)
-            if (init[s].data) upload_texture((d3d_context *)d->context, t, s, NULL, init[s].data, init[s].pitch, init[s].slice_pitch);
+            if (init[s].data) upload_texture(NULL, t, s, NULL, init[s].data, init[s].pitch, init[s].slice_pitch);
     }
     if (!out) { d3d_release(&t->base); return S_FALSE; }   // a validation-only call
     *out = t;
