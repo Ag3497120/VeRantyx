@@ -82,7 +82,6 @@ _vx_RaiseException:
     pushfq
     popq %rax
     movq %rax, 0x44(%r11)
-    movq 0x78(%r11), %rax
     leaq FRAME+8(%rsp), %rax
     movq %rax, 0x98(%r11)
     movq FRAME(%rsp), %rax
@@ -94,6 +93,28 @@ _vx_RaiseException:
     movq %r9, %rcx
     movq %r11, %r8
     call _vx_raise
+    ud2
+
+// void _CxxThrowException(void *object, const ThrowInfo *info)   (rcx, rdx)
+//   -> vx_cxx_throw(object, info, ctx)   (never returns)
+    .globl _vx_CxxThrowException
+    .p2align 4
+_vx_CxxThrowException:
+    subq $FRAME, %rsp
+    leaq 0x10(%rsp), %r11
+    SAVE_GPRS %r11
+    pushfq
+    popq %rax
+    movq %rax, 0x44(%r11)
+    leaq FRAME+8(%rsp), %rax
+    movq %rax, 0x98(%r11)
+    movq FRAME(%rsp), %rax
+    movq %rax, 0xf8(%r11)
+    SAVE_FP %r11
+    movq %rcx, %rdi
+    movq %rdx, %rsi
+    movq %r11, %rdx
+    call _vx_cxx_throw
     ud2
 
 // void RtlUnwindEx(void *frame, void *target_ip, EXCEPTION_RECORD *rec, void *retval, CONTEXT *ctx, void *history)

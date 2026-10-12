@@ -239,7 +239,10 @@ static WINAPI BOOL ReadFile(HANDLE h, void *buf, DWORD n, DWORD *got, OVERLAPPED
     ssize_t r = ov ? pread(fd, buf, n, (off_t)ov->offset | (off_t)ov->offset_high << 32) : read(fd, buf, n);
     if (r < 0) { set_error_from_errno(); if (got) *got = 0; return 0; }
     if (got) *got = (DWORD)r;
-    if (ov) ov->internal_high = (uint64_t)r;
+    if (ov) {
+        if (!r && n) { vx_io_completed(h, ov, 0, 38 /* ERROR_HANDLE_EOF */); vx_set_last_error(38); return 0; }
+        vx_io_completed(h, ov, (DWORD)r, 0);
+    }
     return 1;
 }
 

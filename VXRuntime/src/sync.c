@@ -21,7 +21,7 @@
 #define STILL_ACTIVE  259u
 #define CREATE_SUSPENDED 4u
 
-enum { OBJ_THREAD = 1, OBJ_EVENT, OBJ_MUTEX, OBJ_SEMAPHORE, OBJ_OTHER };
+enum { OBJ_THREAD = 1, OBJ_EVENT, OBJ_MUTEX, OBJ_SEMAPHORE, OBJ_OTHER, OBJ_PORT };
 typedef struct {
     int type, refs;
     int done, started; DWORD suspended, exit_code, tid; pthread_t pthread;     // thread
@@ -31,7 +31,9 @@ typedef struct {
     LONG count, max;                                                          // semaphore
     int kind; void *data; void (*destroy)(void *);                            // other modules' objects
     char *name;                                                               // named events, mutexes, semaphores
+    struct packet *packets, **packets_tail; int closed;                       // I/O completion port
 } vx_object;
+typedef struct packet { DWORD bytes, status; uint64_t key; void *overlapped; struct packet *next; } packet;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_changed = PTHREAD_COND_INITIALIZER;
@@ -62,7 +64,9 @@ static vx_object *find_named(const char *name, int type) {
 }
 
 static void unref(vx_object *o) {
+    if (o->type == OBJ_PORT && o->refs == 1) { o->closed = 1; pthread_cond_broadcast(&g_changed); }
     if (--o->refs) return;
+    while (o->packets) { packet *p = o->packets; o->packets = p->next; free(p); }
     if (o->destroy) o->destroy(o->data);
     if (o->name) {
         for (int i = 0; i < g_named_count; i++) if (g_named[i] == o) { g_named[i] = g_named[--g_named_count]; break; }
@@ -592,6 +596,134 @@ static WINAPI slist_entry *InterlockedFlushSList(slist_header *h) {
 }
 static WINAPI uint16_t QueryDepthSList(slist_header *h) { return (uint16_t)h->depth; }
 
+// ---- I/O completion ports ---------------------------------------------------------------------------------------------------------
+// A port is a queue of completion packets. I/O here completes at once, so a read or write with an OVERLAPPED on
+// a handle associated with a port posts its packet right away; waiters take packets in order.
+typedef struct { HANDLE handle, port; uint64_t key; int skip_on_success; } association;
+static association g_assoc[1024];
+static int g_assoc_count;
+
+static void post_packet(vx_object *port, DWORD bytes, uint64_t key, void *ov, DWORD status) {   // g_lock held
+    packet *p = calloc(1, sizeof *p);
+    p->bytes = bytes; p->key = key; p->overlapped = ov; p->status = status;
+    if (!port->packets) port->packets_tail = &port->packets;
+    *port->packets_tail = p;
+    port->packets_tail = &p->next;
+    pthread_cond_broadcast(&g_changed);
+}
+
+static WINAPI HANDLE CreateIoCompletionPort(HANDLE file, HANDLE existing, uint64_t key, DWORD threads) {
+    (void)threads;
+    pthread_mutex_lock(&g_lock);
+    HANDLE port = existing;
+    if (!existing) {
+        vx_object *o = new_object(OBJ_PORT);
+        port = new_handle(o);
+        if (!port) { free(o); pthread_mutex_unlock(&g_lock); vx_set_last_error(4); return NULL; }
+    } else if (!lookup(existing) || lookup(existing)->type != OBJ_PORT) {
+        pthread_mutex_unlock(&g_lock); vx_set_last_error(87); return NULL;
+    }
+    if (file != (HANDLE)(intptr_t)-1) {
+        int i = 0;
+        while (i < g_assoc_count && g_assoc[i].handle != file) i++;
+        if (i == g_assoc_count && g_assoc_count < 1024) g_assoc_count++;
+        if (i < 1024) g_assoc[i] = (association){ file, port, key, 0 };
+    }
+    pthread_mutex_unlock(&g_lock);
+    return port;
+}
+#define FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 1
+static WINAPI BOOL SetFileCompletionNotificationModes(HANDLE file, uint8_t flags) {
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_assoc_count; i++) if (g_assoc[i].handle == file) g_assoc[i].skip_on_success = flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+}
+// Called by the file and socket functions when an overlapped operation completes. OVERLAPPED: Internal (status),
+// InternalHigh (bytes), offsets, hEvent; an event with its low bit set asks for no completion packet.
+void vx_io_completed(HANDLE file, void *ov, DWORD bytes, DWORD status) {
+    if (!ov) return;
+    uint64_t *o = ov;
+    o[0] = status; o[1] = bytes;
+    HANDLE event = *(HANDLE *)((uint8_t *)ov + 24);
+    pthread_mutex_lock(&g_lock);
+    vx_object *e = lookup((HANDLE)((uintptr_t)event & ~(uintptr_t)1));
+    if (e && e->type == OBJ_EVENT) e->signaled = 1;
+    if (!((uintptr_t)event & 1)) {
+        for (int i = 0; i < g_assoc_count; i++) {
+            if (g_assoc[i].handle != file) continue;
+            vx_object *port = lookup(g_assoc[i].port);
+            if (port && port->type == OBJ_PORT && !(status == 0 && g_assoc[i].skip_on_success)) post_packet(port, bytes, g_assoc[i].key, ov, status);
+            break;
+        }
+    }
+    pthread_cond_broadcast(&g_changed);
+    pthread_mutex_unlock(&g_lock);
+}
+static WINAPI BOOL PostQueuedCompletionStatus(HANDLE port, DWORD bytes, uint64_t key, void *ov) {
+    pthread_mutex_lock(&g_lock);
+    vx_object *o = lookup(port);
+    if (o && o->type == OBJ_PORT) post_packet(o, bytes, key, ov, 0);
+    pthread_mutex_unlock(&g_lock);
+    if (!o || o->type != OBJ_PORT) { vx_set_last_error(6); return 0; }
+    return 1;
+}
+// Waits for up to `max` packets. Returns how many were taken; *err is set when none were.
+static int take_packets(HANDLE port, packet *out, int max, DWORD ms, DWORD *err) {
+    struct timespec deadline;
+    if (ms != INFINITE) deadline_after(&deadline, ms);
+    int n = 0;
+    *err = 0;
+    pthread_mutex_lock(&g_lock);
+    vx_object *o = lookup(port);
+    if (!o || o->type != OBJ_PORT) { pthread_mutex_unlock(&g_lock); *err = 6; return 0; }
+    o->refs++;                                               // the port stays alive while waited on
+    for (;;) {
+        while (n < max && o->packets) {
+            packet *p = o->packets;
+            o->packets = p->next;
+            out[n++] = *p;
+            free(p);
+        }
+        if (n) break;
+        if (o->closed) { *err = 735; break; }               // ERROR_ABANDONED_WAIT_0
+        if (ms == 0) { *err = 258; break; }                  // WAIT_TIMEOUT
+        if (ms == INFINITE) pthread_cond_wait(&g_changed, &g_lock);
+        else if (pthread_cond_timedwait(&g_changed, &g_lock, &deadline) == ETIMEDOUT) { *err = 258; break; }
+    }
+    unref(o);
+    pthread_mutex_unlock(&g_lock);
+    return n;
+}
+static WINAPI BOOL GetQueuedCompletionStatus(HANDLE port, DWORD *bytes, uint64_t *key, void **ov, DWORD ms) {
+    packet p; DWORD err;
+    if (!take_packets(port, &p, 1, ms, &err)) { *ov = NULL; vx_set_last_error(err); return 0; }
+    *bytes = p.bytes; *key = p.key; *ov = p.overlapped;
+    if (p.status) { vx_set_last_error(p.status); return 0; }
+    return 1;
+}
+// OVERLAPPED_ENTRY: completion key, OVERLAPPED, internal, bytes transferred.
+typedef struct { uint64_t key; void *overlapped; uint64_t internal; DWORD bytes; } OVERLAPPED_ENTRY;
+static WINAPI BOOL GetQueuedCompletionStatusEx(HANDLE port, OVERLAPPED_ENTRY *entries, uint32_t count, uint32_t *removed, DWORD ms, BOOL alertable) {
+    (void)alertable;
+    packet ps[64]; DWORD err;
+    int n = take_packets(port, ps, count < 64 ? (int)count : 64, ms, &err);
+    for (int i = 0; i < n; i++) entries[i] = (OVERLAPPED_ENTRY){ ps[i].key, ps[i].overlapped, ps[i].status, ps[i].bytes };
+    *removed = (uint32_t)n;
+    if (!n) { vx_set_last_error(err); return 0; }
+    return 1;
+}
+// Overlapped operations complete at once here, so their results are always ready.
+static WINAPI BOOL GetOverlappedResult(HANDLE file, const uint64_t *ov, DWORD *bytes, BOOL wait) {
+    (void)file; (void)wait;
+    *bytes = (DWORD)ov[1];
+    if (ov[0]) { vx_set_last_error((DWORD)ov[0]); return 0; }
+    return 1;
+}
+static WINAPI BOOL GetOverlappedResultEx(HANDLE file, const uint64_t *ov, DWORD *bytes, DWORD ms, BOOL alertable) { (void)ms; (void)alertable; return GetOverlappedResult(file, ov, bytes, 1); }
+static WINAPI BOOL CancelIo(HANDLE file) { (void)file; return 1; }
+static WINAPI BOOL CancelIoEx(HANDLE file, void *ov) { (void)file; (void)ov; vx_set_last_error(1168 /* ERROR_NOT_FOUND */); return 0; }
+
 // ---- WaitOnAddress -----------------------------------------------------------------------------------------------------------------
 // Waiters sleep while the value at the address still equals the compare value; every wake wakes all waiters
 // (spurious wakeups are allowed), which then re-check.
@@ -646,6 +778,9 @@ static const vx_export sync_k32[] = {
     VX_EXPORT(CreateSemaphoreA), VX_EXPORT(CreateSemaphoreW), VX_EXPORT(CreateSemaphoreExW), VX_EXPORT(OpenSemaphoreA),
     VX_EXPORT(OpenSemaphoreW), VX_EXPORT(ReleaseSemaphore),
     VX_EXPORT(OpenThread), VX_EXPORT(TerminateThread),
+    VX_EXPORT(CreateIoCompletionPort), VX_EXPORT(SetFileCompletionNotificationModes), VX_EXPORT(PostQueuedCompletionStatus),
+    VX_EXPORT(GetQueuedCompletionStatus), VX_EXPORT(GetQueuedCompletionStatusEx), VX_EXPORT(GetOverlappedResult),
+    VX_EXPORT(GetOverlappedResultEx), VX_EXPORT(CancelIo), VX_EXPORT(CancelIoEx),
     VX_EXPORT(WaitOnAddress), VX_EXPORT(WakeByAddressAll), VX_EXPORT(WakeByAddressSingle),
     VX_EXPORT(WaitForSingleObject), VX_EXPORT(WaitForSingleObjectEx), VX_EXPORT(WaitForMultipleObjects),
     VX_EXPORT(WaitForMultipleObjectsEx), VX_EXPORT(SleepEx), VX_EXPORT(CloseHandle), VX_EXPORT(DuplicateHandle),

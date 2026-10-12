@@ -76,6 +76,8 @@ enum { VX_HANDLE_FIND = 1, VX_HANDLE_MAPPING };
 HANDLE vx_handle_new(int kind, void *data, void (*destroy)(void *));
 void  *vx_handle_data(HANDLE h, int kind);    // NULL unless h is a handle of that kind
 BOOL   vx_handle_close(HANDLE h);
+// An overlapped operation on `file` finished: fills the OVERLAPPED, signals its event, queues the completion packet.
+void   vx_io_completed(HANDLE file, void *overlapped, DWORD bytes, DWORD status);
 
 // Diagnostics (stderr); VXRT_TRACE=1 also logs every implemented call that opts in.
 void vx_log(const char *fmt, ...);
@@ -94,6 +96,8 @@ void vx_user32_init(void);             // windows and messages (user32.c, cocoa.
 void vx_gdi_init(void);                // drawing (gdi.c)
 void vx_net_init(void);                // ws2_32 (net.c)
 void vx_mm_init(void);                 // winmm, imm32 (mm.c)
+void vx_com_init(void);                // ole32, oleaut32 (com.c)
+void vx_vcruntime_init(void);          // vcruntime140, MSVC C++ exceptions (vcruntime.c; after seh and ucrt)
 
 // Text (text.c). Counts are in code units; the converters return the length needed and write at most cap units.
 size_t vx_utf8_to_utf16(const char *s, size_t n, WCHAR *out, size_t cap);

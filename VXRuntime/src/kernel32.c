@@ -41,11 +41,13 @@ static WINAPI HANDLE GetStdHandle(DWORD which) {
 }
 
 static WINAPI BOOL WriteFile(HANDLE h, const void *buf, DWORD n, DWORD *written, void *overlapped) {
-    (void)overlapped;
     int fd = vx_handle_fd(h);
     if (fd < 0) { vx_set_last_error(6 /* ERROR_INVALID_HANDLE */); return 0; }
-    ssize_t r = write(fd, buf, n);
+    // OVERLAPPED: the transfer happens at its offset, at once, and completes like asynchronous I/O would.
+    const DWORD *o = overlapped;
+    ssize_t r = o && fd > 2 ? pwrite(fd, buf, n, (off_t)o[4] | (off_t)o[5] << 32) : write(fd, buf, n);
     if (written) *written = r > 0 ? (DWORD)r : 0;
+    if (r >= 0 && overlapped) vx_io_completed(h, overlapped, (DWORD)r, 0);
     return r >= 0;
 }
 

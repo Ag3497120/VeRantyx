@@ -4,6 +4,7 @@
 // printf and friends arrive as __stdio_common_v*printf with a Windows va_list: a pointer to consecutive 8-byte
 // argument slots (doubles included), which vx_format walks itself.
 #include <ctype.h>
+#include <malloc/malloc.h>
 #include <math.h>
 #include <pthread.h>
 #include <errno.h>
@@ -489,7 +490,25 @@ static WINAPI vfn vx_dllonexit(vfn f, vfn **begin, vfn **end) {
 static WINAPI void *vx_new(size_t n) { return malloc(n ? n : 1); }
 static WINAPI void vx_delete(void *p) { free(p); }
 
+// Aligned allocations: posix_memalign memory is released with free(), so _aligned_free is free().
+static WINAPI void *vx_aligned_malloc(size_t n, size_t align) {
+    void *p = NULL;
+    if (align < sizeof(void *)) align = sizeof(void *);
+    return posix_memalign(&p, align, n ? n : 1) ? NULL : p;
+}
+static WINAPI void vx_aligned_free(void *p) { free(p); }
+static WINAPI size_t vx_aligned_msize(void *p, size_t align, size_t offset) { (void)align; (void)offset; return p ? malloc_size(p) : 0; }
+static WINAPI void *vx_aligned_realloc(void *p, size_t n, size_t align) {
+    if (!p) return vx_aligned_malloc(n, align);
+    if (!n) { free(p); return NULL; }
+    void *q = vx_aligned_malloc(n, align);
+    if (q) { size_t old = malloc_size(p); memcpy(q, p, old < n ? old : n); free(p); }
+    return q;
+}
+
 static const vx_export ucrt[] = {
+    { "_aligned_malloc", (void *)vx_aligned_malloc }, { "_aligned_free", (void *)vx_aligned_free },
+    { "_aligned_realloc", (void *)vx_aligned_realloc }, { "_aligned_msize", (void *)vx_aligned_msize },
     { "_lock", (void *)vx_lock }, { "_unlock", (void *)vx_unlock }, { "__dllonexit", (void *)vx_dllonexit },
     { "??2@YAPEAX_K@Z", (void *)vx_new }, { "??_U@YAPEAX_K@Z", (void *)vx_new },
     { "??3@YAXPEAX@Z", (void *)vx_delete }, { "??_V@YAXPEAX@Z", (void *)vx_delete },

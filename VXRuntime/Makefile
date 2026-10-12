@@ -2,7 +2,7 @@
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=13.0
 SRC     = src/loader.c src/kernel32.c src/ucrt.c src/sync.c src/seh.c src/context.S src/text.c src/files.c src/registry.c \
-          src/user32.c src/gdi.c src/net.c src/mm.c src/cocoa.m
+          src/user32.c src/gdi.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
@@ -14,7 +14,7 @@ build/vxrt: $(SRC) src/vx.h src/ui.h
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -44,6 +44,30 @@ build/window.exe: tests/window.c
 build/net.exe: tests/net.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lws2_32
+
+# MSVC-ABI test programs: compiled by clang for x86_64-pc-windows-msvc, linked by MinGW's linker against import
+# libraries of this runtime's DLLs, without any C runtime.
+MSVCCC = clang -target x86_64-pc-windows-msvc -O1 -fexceptions -fcxx-exceptions
+build/libvcruntime140.a: tests/msvc/vcruntime140.def
+	@mkdir -p build
+	x86_64-w64-mingw32-dlltool -d $< -l $@ -m i386:x86-64
+
+build/msvc_eh.exe: tests/msvc_eh.cpp tests/msvc/start.c build/libvcruntime140.a
+	$(MSVCCC) -c tests/msvc_eh.cpp -o build/msvc_eh.obj
+	$(MSVCCC) -c tests/msvc/start.c -o build/msvc_start.obj
+	$(MINGW) -nostdlib -e mainCRTStartup -o $@ build/msvc_eh.obj build/msvc_start.obj -Lbuild -lvcruntime140 -lkernel32 -lucrtbase
+
+build/com.exe: tests/com.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lole32 -loleaut32 -luuid
+
+build/vxcom.dll: tests/vxcom.c
+	@mkdir -p build
+	$(MINGW) -O1 -shared -o $@ $< -luuid
+
+build/iocp.exe: tests/iocp.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
 
 build/dllprobe.exe: tools/dllprobe.c
 	@mkdir -p build
@@ -77,6 +101,9 @@ check: all
 	build/vxrt build/files.exe
 	build/vxrt build/dll_test.exe
 	build/vxrt build/net.exe
+	build/vxrt build/msvc_eh.exe
+	build/vxrt build/com.exe
+	build/vxrt build/iocp.exe
 	build/vxrt build/window.exe
 
 clean:

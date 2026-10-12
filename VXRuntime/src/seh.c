@@ -56,6 +56,7 @@ typedef int (WINAPI *language_handler)(EXCEPTION_RECORD *, uint64_t frame, CONTE
 
 enum { EXCEPTION_NONCONTINUABLE = 1, EXCEPTION_UNWINDING = 2, EXCEPTION_EXIT_UNWIND = 4, EXCEPTION_TARGET_UNWIND = 0x20 };
 enum { ExceptionContinueExecution = 0, ExceptionContinueSearch = 1 };
+#define STATUS_UNWIND_CONSOLIDATE 0x80000029u
 enum { UNW_FLAG_EHANDLER = 1, UNW_FLAG_UHANDLER = 2, UNW_FLAG_CHAININFO = 4 };
 
 void vx_restore_context(const CONTEXT *ctx) __attribute__((noreturn));
@@ -255,8 +256,12 @@ static RUNTIME_FUNCTION *next_function(CONTEXT *c, vx_entry **cursor, int unwind
         }
         vx_entry *e = *cursor;                     // native code: skip to where the program entered it
         if (!e) return NULL;
-        *cursor = e->next;
         *c = unwinding && e->unwinding_frame ? *e->unwinding_frame : *e->ctx;
+        // Entries deeper on the stack than where the walk now is belong to frames already unwound (a catch
+        // block runs on top of them): they are not part of this walk.
+        e = e->next;
+        while (e && (uint64_t)e < c->gpr[RSP]) e = e->next;
+        *cursor = e;
     }
     return NULL;
 }
@@ -337,6 +342,15 @@ void __attribute__((noreturn)) vx_unwind(uint64_t target_frame, uint64_t target_
         if (at_target) {
             out.rip = target_ip;
             out.gpr[RAX] = retval;
+            if (rec->code == STATUS_UNWIND_CONSOLIDATE && rec->nparams >= 1) {
+                // The frames below the target are unwound but their stack is still intact: run the callback
+                // (MSVC's runtime calls a catch block here) on it, as if called from the target frame, and
+                // continue the target where the callback says.
+                vx_entry consolidate = { t_entries, &out, NULL };
+                t_entries = &consolidate;
+                out.rip = (uint64_t)((void *(WINAPI *)(EXCEPTION_RECORD *))rec->info[0])(rec);
+                t_entries = consolidate.next;
+            }
             resume(&out);
         }
     }
