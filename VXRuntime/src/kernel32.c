@@ -15,6 +15,10 @@
 #include <sys/sysctl.h>
 #include <time.h>
 #include <ctype.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <mach-o/dyld.h>
 #include "vx.h"
 
 #define STD_INPUT_HANDLE  ((DWORD)-10)
@@ -40,7 +44,10 @@ static WINAPI HANDLE GetStdHandle(DWORD which) {
     return (HANDLE)(intptr_t)-1;
 }
 
+int vx_pipe_write(HANDLE h, const void *buf, DWORD n, DWORD *written, void *ov, BOOL *ok);
 static WINAPI BOOL WriteFile(HANDLE h, const void *buf, DWORD n, DWORD *written, void *overlapped) {
+    BOOL piped;
+    if (vx_pipe_write(h, buf, n, written, overlapped, &piped)) return piped;
     int fd = vx_handle_fd(h);
     if (fd < 0) { vx_set_last_error(6 /* ERROR_INVALID_HANDLE */); return 0; }
     // OVERLAPPED: the transfer happens at its offset, at once, and completes like asynchronous I/O would.
@@ -70,8 +77,22 @@ static WINAPI BOOL WriteConsoleW(HANDLE h, const WCHAR *buf, DWORD n, DWORD *wri
     return ok;
 }
 
-static WINAPI void ExitProcess(DWORD code) { fflush(stdout); fflush(stderr); _exit((int)code); }
-static WINAPI BOOL TerminateProcess(HANDLE h, DWORD code) { (void)h; ExitProcess(code); return 1; }
+static WINAPI void ExitProcess(DWORD code) {
+    if (vx_trace) {
+        const vx_image *m = vx_image_at((uint64_t)(uintptr_t)__builtin_return_address(0));
+        vx_log("ExitProcess(%u) from %s+%#llx", code, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)__builtin_return_address(0) - m->base) : 0ull);
+    }
+    fflush(stdout); fflush(stderr); _exit((int)code);
+}
+int vx_process_info(HANDLE h, DWORD *code);
+HANDLE vx_process_handle(int pid, int child, HANDLE *second);
+static WINAPI BOOL TerminateProcess(HANDLE h, DWORD code) {
+    if ((intptr_t)h == -1) { ExitProcess(code); return 1; }
+    int pid = vx_process_info(h, NULL);
+    if (pid <= 0) { vx_set_last_error(6); return 0; }
+    kill(pid, SIGKILL);
+    return 1;
+}
 
 // ---- errors, debugging, process info -------------------------------------------------------------------------------
 static WINAPI DWORD GetLastError(void) { return vx_get_last_error(); }
@@ -135,10 +156,11 @@ static WINAPI BOOL SetConsoleCtrlHandler(void *handler, BOOL add) { (void)handle
 static WINAPI DWORD GetConsoleCP(void) { return 65001; }
 
 static WINAPI BOOL GetExitCodeProcess(HANDLE h, DWORD *code) {
-    if ((intptr_t)h != -1) { vx_set_last_error(6); return 0; }
-    *code = 259;                              // STILL_ACTIVE: only this process is known so far
+    if ((intptr_t)h == -1) { *code = 259; return 1; }          // STILL_ACTIVE
+    if (vx_process_info(h, code) < 0) { vx_set_last_error(6); return 0; }
     return 1;
 }
+static WINAPI DWORD GetProcessId(HANDLE h) { return (intptr_t)h == -1 ? (DWORD)getpid() : (DWORD)vx_process_info(h, NULL); }
 
 // Pointer encoding is an exploit mitigation on Windows; the identity keeps every encode/decode pair correct.
 static WINAPI void *EncodePointer(void *p) { return p; }
@@ -262,17 +284,100 @@ static WINAPI uint16_t RtlCaptureStackBackTrace(DWORD skip, DWORD n, void **fram
 
 // Starting other processes comes with a later milestone; programs see the failure Windows reports for a
 // missing executable.
-static WINAPI BOOL CreateProcessA(const char *app, char *cmd, void *pa, void *ta, BOOL inherit, DWORD flags, void *env, const char *dir, void *si, void *pi) {
-    (void)pa; (void)ta; (void)inherit; (void)flags; (void)env; (void)dir; (void)si; (void)pi;
-    vx_log("CreateProcess(%s) is not supported yet", app ? app : cmd ? cmd : "");
-    vx_set_last_error(50);
+// CreateProcess: the program runs in another vxrt process (this runtime's own executable), with the Windows command
+// line split into arguments, the environment block given (plus this runtime's VXRT_ settings), and the working
+// directory. PROCESS_INFORMATION: process and thread handles (both wait for the process), process and thread IDs.
+static char **split_command_line(const char *cmd, int *argc) {
+    WCHAR *w = vx_utf16_dup(cmd);
+    WCHAR **(WINAPI *split)(const WCHAR *, int *) = (WCHAR **(WINAPI *)(const WCHAR *, int *))vx_find_export("shell32.dll", "CommandLineToArgvW");
+    WCHAR **wargv = split(w, argc);
+    char **argv = calloc((size_t)*argc + 1, sizeof *argv);
+    for (int i = 0; i < *argc; i++) argv[i] = vx_utf8_dup(wargv[i]);
+    free(wargv); free(w);
+    return argv;
+}
+static int find_program(const char *name, char *unix_path, size_t cap) {
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s", name);
+    size_t n = strlen(tmp);
+    if (n < 4 || (strcasecmp(tmp + n - 4, ".exe") && strcasecmp(tmp + n - 4, ".com") && strcasecmp(tmp + n - 4, ".bat")))
+        snprintf(tmp + n, sizeof tmp - n, ".exe");
+    struct stat st;
+    if (strchr(tmp, '\\') || strchr(tmp, '/') || strchr(tmp, ':'))
+        return vx_unix_path(tmp, unix_path, cap) && !stat(unix_path, &st);
+    // A bare name: the program's directory, the current directory, then system32.
+    char exe[1024], dir[1024];
+    const vx_image *m = vx_image_at((uint64_t)(uintptr_t)vx_proc.image_base);
+    snprintf(dir, sizeof dir, "%s", m && m->windows_path ? m->windows_path : "C:\\");
+    char *slash = strrchr(dir, '\\'); if (slash) slash[1] = 0;
+    const char *dirs[3] = { dir, NULL, "C:\\windows\\system32\\" };
+    char cwd[1024]; vx_get_cwd(cwd, sizeof cwd); strcat(cwd, "\\"); dirs[1] = cwd;
+    for (int i = 0; i < 3; i++) {
+        snprintf(exe, sizeof exe, "%s%s", dirs[i], tmp);
+        if (vx_unix_path(exe, unix_path, cap) && !stat(unix_path, &st)) return 1;
+    }
     return 0;
 }
+static char **environment_from_block(const void *block, int wide) {
+    extern char **environ;
+    int n = 0, cap = 64;
+    char **env = malloc((size_t)cap * sizeof *env);
+    if (block) {
+        if (wide) for (const WCHAR *p = block; *p; p += vx_wcslen(p) + 1) { if (n + 2 >= cap) env = realloc(env, (size_t)(cap *= 2) * sizeof *env); env[n++] = vx_utf8_dup(p); }
+        else for (const char *p = block; *p; p += strlen(p) + 1) { if (n + 2 >= cap) env = realloc(env, (size_t)(cap *= 2) * sizeof *env); env[n++] = strdup(p); }
+    }
+    for (char **e = environ; *e; e++) {                           // the runtime's settings, and everything when no block
+        if (block && strncmp(*e, "VXRT_", 5) && strncmp(*e, "HOME=", 5) && strncmp(*e, "TMPDIR=", 7)) continue;
+        if (n + 2 >= cap) env = realloc(env, (size_t)(cap *= 2) * sizeof *env);
+        env[n++] = strdup(*e);
+    }
+    env[n] = NULL;
+    return env;
+}
+static BOOL create_process(const char *app, const char *cmd, const void *env_block, int wide_env, const char *dir, void **pi) {
+    int argc = 0;
+    char **args = split_command_line(cmd && *cmd ? cmd : app, &argc);
+    char exe[1024];
+    if (!find_program(app && *app ? app : argc ? args[0] : "", exe, sizeof exe)) {
+        vx_log("CreateProcess: %s not found", app && *app ? app : cmd);
+        vx_set_last_error(2);
+        return 0;
+    }
+    char self[1024]; uint32_t len = sizeof self;
+    if (_NSGetExecutablePath(self, &len)) { vx_set_last_error(8); return 0; }
+    char **argv = calloc((size_t)argc + 3, sizeof *argv);
+    argv[0] = self; argv[1] = exe;
+    for (int i = 1; i < argc; i++) argv[i + 1] = args[i];
+    char **envp = environment_from_block(env_block, wide_env);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    char cwd_win[1024], cwd_unix[1024];
+    if (dir && *dir) snprintf(cwd_win, sizeof cwd_win, "%s", dir); else vx_get_cwd(cwd_win, sizeof cwd_win);
+    if (vx_unix_path(cwd_win, cwd_unix, sizeof cwd_unix)) posix_spawn_file_actions_addchdir_np(&fa, cwd_unix);
+    pid_t pid;
+    int r = posix_spawn(&pid, self, &fa, NULL, argv, envp);
+    posix_spawn_file_actions_destroy(&fa);
+    for (int i = 0; envp[i]; i++) free(envp[i]);
+    free(envp); free(argv);
+    for (int i = 0; i < argc; i++) free(args[i]);
+    free(args);
+    if (r) { vx_set_last_error(vx_error_from_errno(r)); return 0; }
+    if (vx_trace) vx_log("CreateProcess: %s as process %d", exe, (int)pid);
+    HANDLE thread;
+    HANDLE process = vx_process_handle(pid, 1, &thread);
+    if (pi) { pi[0] = process; pi[1] = thread; ((DWORD *)pi)[4] = (DWORD)pid; ((DWORD *)pi)[5] = (DWORD)pid; }
+    return 1;
+}
+#define CREATE_UNICODE_ENVIRONMENT 0x400
+static WINAPI BOOL CreateProcessA(const char *app, char *cmd, void *pa, void *ta, BOOL inherit, DWORD flags, void *env, const char *dir, void *si, void *pi) {
+    (void)pa; (void)ta; (void)inherit; (void)si;
+    return create_process(app, cmd, env, (flags & CREATE_UNICODE_ENVIRONMENT) != 0, dir, pi);
+}
 static WINAPI BOOL CreateProcessW(const WCHAR *app, WCHAR *cmd, void *pa, void *ta, BOOL inherit, DWORD flags, void *env, const WCHAR *dir, void *si, void *pi) {
-    char *a = vx_utf8_dup(app), *c = vx_utf8_dup(cmd);
-    BOOL r = CreateProcessA(a, c, pa, ta, inherit, flags, env, NULL, si, pi);
-    free(a); free(c);
-    (void)dir;
+    (void)pa; (void)ta; (void)inherit; (void)si;
+    char *a = vx_utf8_dup(app), *c = vx_utf8_dup(cmd), *d = vx_utf8_dup(dir);
+    BOOL r = create_process(a, c, env, (flags & CREATE_UNICODE_ENVIRONMENT) != 0, d, pi);
+    free(a); free(c); free(d);
     return r;
 }
 static WINAPI DWORD WinExec(const char *cmd, DWORD show) { (void)show; vx_log("WinExec(%s) is not supported yet", cmd); return 2; }
@@ -599,7 +704,7 @@ static const vx_export k32[] = {
     VX_EXPORT(GetSystemInfo), VX_EXPORT(GetNativeSystemInfo),
     VX_EXPORT(FormatMessageA), VX_EXPORT(LocalAlloc), VX_EXPORT(LocalFree), VX_EXPORT(OutputDebugStringA),
     VX_EXPORT(SetStdHandle), VX_EXPORT(GetConsoleMode), VX_EXPORT(SetConsoleMode), VX_EXPORT(ReadConsoleW),
-    VX_EXPORT(GetExitCodeProcess), VX_EXPORT(EncodePointer), VX_EXPORT(DecodePointer),
+    VX_EXPORT(GetExitCodeProcess), VX_EXPORT(GetProcessId), VX_EXPORT(EncodePointer), VX_EXPORT(DecodePointer),
     { "EncodeSystemPointer", (void *)EncodePointer }, { "DecodeSystemPointer", (void *)DecodePointer },
     VX_EXPORT(IsProcessorFeaturePresent), VX_EXPORT(GetLocalTime), VX_EXPORT(GetSystemTime),
     VX_EXPORT(GetVersion), VX_EXPORT(GetVersionExA), VX_EXPORT(GetVersionExW),

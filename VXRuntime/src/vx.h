@@ -72,7 +72,7 @@ DWORD vx_get_last_error(void);
 // Handles: small table; stdio handles are the pseudo values Windows uses.
 int vx_handle_fd(HANDLE h);            // -1 if not a file handle
 // Other kernel objects owned by a module (find handles, ...): `destroy` runs when the last handle closes.
-enum { VX_HANDLE_FIND = 1, VX_HANDLE_MAPPING };
+enum { VX_HANDLE_FIND = 1, VX_HANDLE_MAPPING, VX_HANDLE_PIPE = 7 };
 HANDLE vx_handle_new(int kind, void *data, void (*destroy)(void *));
 void  *vx_handle_data(HANDLE h, int kind);    // NULL unless h is a handle of that kind
 BOOL   vx_handle_close(HANDLE h);
@@ -87,6 +87,7 @@ extern int vx_trace;
 // Module registration entry points (one per source file).
 void vx_kernel32_init(void);
 void vx_desktop_init(void);            // the rest of the Win32 surface games link (desktop.c)
+void vx_pipes_init(void);              // named pipes on Unix domain sockets (pipes.c)
 void vx_services_init(void);           // resources, command lines, random numbers, psapi, C runtime extras (services.c)
 void vx_system_init(void);             // processor topology, thread pool, tokens, shell folders (system.c)
 void vx_ucrt_init(void);

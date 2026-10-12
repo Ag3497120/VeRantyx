@@ -334,8 +334,71 @@ static WINAPI WCHAR *m_wcsstr(const WCHAR *h, const WCHAR *n) {
     return NULL;
 }
 
+// __AdjustPointer: a base class's address from a derived object's, by a PMD (member displacement; then, for a
+// virtual base, the displacement of the virtual base table pointer and the entry in it).
+typedef struct { int32_t mdisp, pdisp, vdisp; } pmd;
+static WINAPI void *adjust_pointer(void *p, const pmd *d) {
+    char *r = (char *)p + d->mdisp;
+    if (d->pdisp >= 0) {
+        const char *vbtable = *(const char *const *)((char *)p + d->pdisp);
+        r += *(const int32_t *)(vbtable + d->vdisp) + d->pdisp;
+    }
+    return r;
+}
+static WINAPI int uncaught_exceptions(void) { return 0; }   // exceptions are not in flight between throw and catch here
+
+// dynamic_cast through MSVC's RTTI: the vftable's slot -1 is the complete object locator (signature 1 on x64:
+// image-relative fields: offset, constructor displacement offset, type descriptor, class hierarchy, itself). The
+// hierarchy lists base class descriptors (type descriptor, contained bases, PMD, attributes, hierarchy); a type
+// descriptor is a vftable pointer, a spare pointer and the decorated name. Types compare by name (each module
+// has its own descriptors). A failed cast gives NULL (a failed reference cast is reported).
+static const char *rtti_name(const uint8_t *td) { return (const char *)td + 16; }
+static WINAPI void *rt_dynamic_cast(void *in, int32_t vfdelta, const uint8_t *src_type, const uint8_t *target_type, int is_reference) {
+    (void)src_type;
+    if (!in) return NULL;
+    const uint8_t *col = ((const uint8_t *const *)*(void **)((uint8_t *)in + vfdelta))[-1];
+    if (!col || *(const uint32_t *)col != 1) { vx_log("dynamic_cast: no x64 RTTI locator"); return NULL; }
+    const uint8_t *base = col - *(const uint32_t *)(col + 20);       // pSelf is the locator's own RVA
+    uint8_t *complete = (uint8_t *)in + vfdelta - *(const int32_t *)(col + 4);
+    int32_t cd = *(const int32_t *)(col + 8);
+    if (cd) complete -= *(const int32_t *)((uint8_t *)in + vfdelta - cd);
+    const uint8_t *chd = base + *(const uint32_t *)(col + 16);
+    uint32_t count = *(const uint32_t *)(chd + 8);
+    const uint32_t *bases = (const uint32_t *)(base + *(const uint32_t *)(chd + 12));
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *bcd = base + bases[i];
+        const uint8_t *td = base + *(const uint32_t *)bcd;
+        if (strcmp(rtti_name(td), rtti_name(target_type))) continue;
+        int32_t mdisp = *(const int32_t *)(bcd + 8), pdisp = *(const int32_t *)(bcd + 12), vdisp = *(const int32_t *)(bcd + 16);
+        uint8_t *r = complete + mdisp;
+        if (pdisp >= 0) r += *(const int32_t *)(*(const uint8_t *const *)(complete + pdisp) + vdisp) + pdisp;
+        return r;
+    }
+    if (is_reference) vx_log("dynamic_cast to %s failed (a bad_cast would be thrown)", rtti_name(target_type));
+    return NULL;
+}
+// __RTCastToVoid: the complete object.
+static WINAPI void *rt_cast_to_void(void *in) {
+    if (!in) return NULL;
+    const uint8_t *col = ((const uint8_t *const *)*(void **)in)[-1];
+    uint8_t *complete = (uint8_t *)in - *(const int32_t *)(col + 4);
+    int32_t cd = *(const int32_t *)(col + 8);
+    if (cd) complete -= *(const int32_t *)((uint8_t *)in - cd);
+    return complete;
+}
+// __RTtypeid: the type descriptor of the complete object.
+static WINAPI const void *rt_typeid(void *in) {
+    if (!in) { vx_log("typeid of a null pointer (a bad_typeid would be thrown)"); return NULL; }
+    const uint8_t *col = ((const uint8_t *const *)*(void **)in)[-1];
+    const uint8_t *base = col - *(const uint32_t *)(col + 20);
+    return base + *(const uint32_t *)(col + 12);
+}
+
 void vx_CxxThrowException(void *, const void *);
 static vx_export g_vcruntime[] = {
+    { "__AdjustPointer", (void *)adjust_pointer }, { "__uncaught_exception", (void *)uncaught_exceptions },
+    { "__uncaught_exceptions", (void *)uncaught_exceptions }, { "__RTDynamicCast", (void *)rt_dynamic_cast },
+    { "__RTCastToVoid", (void *)rt_cast_to_void }, { "__RTtypeid", (void *)rt_typeid },
     { "_CxxThrowException", (void *)vx_CxxThrowException }, { "__CxxFrameHandler3", (void *)CxxFrameHandler3 },
     { "__CxxFrameHandler", (void *)CxxFrameHandler3 },              // msvcrt.dll's name for the same tables
     { "??1type_info@@UEAA@XZ", (void *)type_info_destructor }, { "?terminate@@YAXXZ", (void *)std_terminate },

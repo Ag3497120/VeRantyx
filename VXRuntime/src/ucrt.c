@@ -113,8 +113,10 @@ int vx_format(char *out, size_t cap, const char *fmt, const char *ap) {
 // A FILE is this runtime's own object. The standard streams write straight to their descriptors (unbuffered, so
 // output from the program and from this runtime interleave correctly); files from fopen wrap a macOS FILE.
 // Files are always binary: no "\r\n" translation in text mode.
-typedef struct { int fd; FILE *f; } vx_file;
-static vx_file g_iob[3] = { { 0, NULL }, { 1, NULL }, { 2, NULL } };
+// base/ptr/cnt: what _get_stream_buffer_pointers hands out (the C++ library's file buffers look at them; they stay
+// empty, so it reads and writes through the functions).
+typedef struct { int fd; FILE *f; char *base, *ptr; int cnt; } vx_file;
+static vx_file g_iob[3] = { { 0, NULL, NULL, NULL, 0 }, { 1, NULL, NULL, NULL, 0 }, { 2, NULL, NULL, NULL, 0 } };
 
 static WINAPI vx_file *__acrt_iob_func(unsigned i) { return i < 3 ? &g_iob[i] : NULL; }
 
@@ -180,7 +182,7 @@ static vx_file *open_file(const char *path, const char *mode) {
     if (!(writes ? vx_unix_path_write(path, unix_path, sizeof unix_path, m[0] != 'w') : vx_unix_path(path, unix_path, sizeof unix_path))) { set_errno(2); return NULL; }
     FILE *f = fopen(unix_path, m);
     if (!f) { set_errno(errno == ENOENT ? 2 : errno == EACCES ? 13 : errno == EEXIST ? 17 : errno == EISDIR ? 13 : 22); return NULL; }
-    vx_file *v = malloc(sizeof *v);
+    vx_file *v = calloc(1, sizeof *v);
     v->fd = fileno(f); v->f = f;
     return v;
 }
@@ -255,6 +257,20 @@ static WINAPI char ***__p___argv(void) { return &vx_proc.argv; }
 static WINAPI char ***__p__environ(void) { return &vx_proc.envp; }
 static WINAPI int _configure_narrow_argv(int mode) { (void)mode; return 0; }
 static WINAPI int _initialize_narrow_environment(void) { return 0; }
+static WINAPI char **_get_initial_narrow_environment(void) { return vx_proc.envp; }
+// The wide environment, made once from the narrow one.
+static WINAPI WCHAR **_get_initial_wide_environment(void) {
+    static WCHAR **wide;
+    if (!wide) {
+        int n = 0;
+        while (vx_proc.envp && vx_proc.envp[n]) n++;
+        wide = calloc((size_t)n + 1, sizeof *wide);
+        for (int i = 0; i < n; i++) wide[i] = vx_utf16_dup(vx_proc.envp[i]);
+    }
+    return wide;
+}
+static WINAPI WCHAR ***__p__wenviron(void) { static WCHAR **w; if (!w) w = _get_initial_wide_environment(); return &w; }
+static WINAPI unsigned char *vx_mbsstr(const unsigned char *h, const unsigned char *n) { return (unsigned char *)strstr((const char *)h, (const char *)n); }
 static WINAPI void _set_app_type(int t) { (void)t; }
 static WINAPI void *_set_invalid_parameter_handler(void *h) { (void)h; return NULL; }
 static WINAPI void __setusermatherr(void *f) { (void)f; }
@@ -300,8 +316,13 @@ static WINAPI int _execute_onexit_table(onexit_table *t) {
     return 0;
 }
 static WINAPI void _cexit(void) { run_atexit(); }
-static WINAPI void vx_exit(int code) { run_atexit(); _exit(code); }
-static WINAPI void vx__exit(int code) { _exit(code); }
+static void trace_exit(const char *what, int code, void *ret) {
+    if (!vx_trace) return;
+    const vx_image *m = vx_image_at((uint64_t)(uintptr_t)ret);
+    vx_log("%s(%d) from %s+%#llx", what, code, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)ret - m->base) : 0ull);
+}
+static WINAPI void vx_exit(int code) { trace_exit("exit", code, __builtin_return_address(0)); run_atexit(); _exit(code); }
+static WINAPI void vx__exit(int code) { trace_exit("_exit", code, __builtin_return_address(0)); _exit(code); }
 static WINAPI void vx_abort(void) { vx_log("the program called abort()"); _exit(3); }
 
 
@@ -371,10 +392,19 @@ static WINAPI int vx_wcscmp(const WCHAR *a, const WCHAR *b) { while (*a && *a ==
 static WINAPI size_t vx_wcsnlen(const WCHAR *s, size_t max) { size_t n = 0; while (n < max && s[n]) n++; return n; }
 static WINAPI int vx_rand_s(unsigned *v) { arc4random_buf(v, sizeof *v); return 0; }
 
-// Windows struct lconv: the char* members first (decimal_point, thousands_sep, grouping, ...), all "C" locale.
-static char *g_lconv[32] = { ".", "", "" };
+// Windows struct lconv, "C" locale: ten char* members (decimal point, thousands separator, grouping, currency
+// strings, signs), eight chars (int_frac_digits ... n_sign_posn, CHAR_MAX), then the same eight strings as
+// wchar_t* (from 88).
+static uint8_t g_lconv[88 + 8 * 8];
 static WINAPI void *vx_localeconv(void) {
-    for (int i = 3; i < 10; i++) if (!g_lconv[i]) g_lconv[i] = "";
+    static WCHAR wdot[] = { '.', 0 }, wempty[] = { 0 };
+    char **c = (char **)g_lconv;
+    if (!c[0]) {
+        c[0] = "."; for (int i = 1; i < 10; i++) c[i] = "";
+        memset(g_lconv + 80, 127, 8);
+        WCHAR **w = (WCHAR **)(g_lconv + 88);
+        w[0] = wdot; for (int i = 1; i < 8; i++) w[i] = wempty;
+    }
     return g_lconv;
 }
 // Multibyte conversions in the "C" locale: bytes map to the first 256 code points.
@@ -558,7 +588,386 @@ static WINAPI int vx_sprintf(char *buf, const char *fmt, ...) {
     return r;
 }
 
+// ---- what the C++ standard library (msvcp140) needs from the C runtime ----------------------------------------------------
+// Locales: only "C", with UTF-8 as its code page; the classification table of <ctype.h> (_UPPER 1, _LOWER 2,
+// _DIGIT 4, _SPACE 8, _PUNCT 0x10, _CONTROL 0x20, _BLANK 0x40, _HEX 0x80, _ALPHA 0x100 | 0x103 for letters).
+static uint16_t g_ctype[257];
+static void init_ctype(void) {
+    if (g_ctype[1 + 'A']) return;
+    for (int c = 0; c < 256; c++) {
+        uint16_t m = 0;
+        if (c < 128) {
+            if (isupper(c)) m |= 0x1 | 0x100; if (islower(c)) m |= 0x2 | 0x100; if (isdigit(c)) m |= 0x4;
+            if (isspace(c)) m |= 0x8; if (ispunct(c)) m |= 0x10; if (iscntrl(c)) m |= 0x20; if (c == ' ' || c == '\t') m |= 0x40;
+            if (isxdigit(c)) m |= 0x80;
+        }
+        g_ctype[1 + c] = m;
+    }
+}
+static WINAPI const uint16_t *vx_pctype_func(void) { init_ctype(); return g_ctype + 1; }
+static WINAPI unsigned vx_lc_codepage_func(void) { return 65001; }
+static WINAPI WCHAR **vx_lc_locale_name_func(void) { static WCHAR *names[6]; return names; }   // the C locale has no names
+static WINAPI void vx_lock_locales(void) {}
+static WINAPI WCHAR *vx_wsetlocale(int category, const WCHAR *locale) { (void)category; (void)locale; static WCHAR c[] = { 'C', 0 }; return c; }
+typedef int (WINAPI *new_handler)(size_t);
+static new_handler g_new_handler;
+static WINAPI new_handler vx_set_new_handler(new_handler h) { new_handler old = g_new_handler; g_new_handler = h; return old; }
+static WINAPI void vx_terminate(void) { vx_log("terminate() called"); abort(); }
+// Wide path functions: through the narrow ones.
+#define WIDE_CALL(name, narrow) static WINAPI int name(const WCHAR *p) { char *a = vx_utf8_dup(p); int r = narrow(a); free(a); return r; }
+WIDE_CALL(vx_wremove, vx_remove)
+WIDE_CALL(vx_wrmdir, vx_rmdir)
+static WINAPI int vx_wrename(const WCHAR *a, const WCHAR *b) { char *x = vx_utf8_dup(a), *y = vx_utf8_dup(b); int r = vx_rename(x, y); free(x); free(y); return r; }
+static WINAPI int vx_wchdir(const WCHAR *p) { char *a = vx_utf8_dup(p); int r = vx_set_cwd(a) ? 0 : -1; free(a); return r; }
+static WINAPI WCHAR *vx_wgetcwd(WCHAR *buf, int n) {
+    char c[1024]; vx_get_cwd(c, sizeof c);
+    if (!buf) { n = (int)strlen(c) + 1; buf = malloc((size_t)n * 2); }
+    vx_utf8_to_utf16(c, strlen(c) + 1, buf, (size_t)n);
+    return buf;
+}
+// Floating point classification (Windows' FP_ values: infinite 1, NaN 2, normal -1, subnormal -2, zero 0).
+static short fp_class(int c) { return c == FP_INFINITE ? 1 : c == FP_NAN ? 2 : c == FP_NORMAL ? -1 : c == FP_SUBNORMAL ? -2 : 0; }
+static WINAPI short vx_dclass(double x) { return fp_class(fpclassify(x)); }
+static WINAPI short vx_fdclass(float x) { return fp_class(fpclassify(x)); }
+static WINAPI int vx_dsign(double x) { return signbit(x) ? 0x8000 : 0; }
+static WINAPI int vx_fdsign(float x) { return signbit(x) ? 0x8000 : 0; }
+static WINAPI double vx_copysign(double a, double b) { return copysign(a, b); }
+static WINAPI double vx_lgamma(double x) { return lgamma(x); }
+static WINAPI float vx_lgammaf(float x) { return lgammaf(x); }
+static WINAPI size_t vx_strncnt(const char *s, size_t n) { return strnlen(s, n); }
+static WINAPI WCHAR *vx_wcsdup(const WCHAR *s) { size_t n = (vx_wcslen(s) + 1) * 2; WCHAR *d = malloc(n); memcpy(d, s, n); return d; }
+static WINAPI size_t vx_strcspn(const char *a, const char *b) { return strcspn(a, b); }
+static WINAPI float vx_strtof(const char *s, char **end) { return strtof(s, end); }
+static WINAPI double vx_wcstod(const WCHAR *s, WCHAR **end) {
+    char a[128]; size_t i = 0;
+    for (; s[i] && s[i] < 128 && i < sizeof a - 1; i++) a[i] = (char)s[i];
+    a[i] = 0;
+    char *e; double v = strtod(a, &e);
+    if (end) *end = (WCHAR *)(s + (e - a));
+    return v;
+}
+static WINAPI float vx_wcstof(const WCHAR *s, WCHAR **end) { return (float)vx_wcstod(s, end); }
+// Streams: shared-access opening (sharing is not enforced), buffer pointers, positions, wide characters (UTF-8).
+static WINAPI vx_file *vx_fsopen(const char *path, const char *mode, int share) { (void)share; return open_file(path, mode); }
+static WINAPI vx_file *vx_wfsopen(const WCHAR *path, const WCHAR *mode, int share) { (void)share; return vx_wfopen(path, mode); }
+static WINAPI int vx_get_stream_buffer_pointers(vx_file *f, char ***base, char ***ptr, int **cnt) {
+    if (base) *base = &f->base;
+    if (ptr) *ptr = &f->ptr;
+    if (cnt) *cnt = &f->cnt;
+    return 0;
+}
+static WINAPI int vx_fgetpos(vx_file *f, int64_t *pos) { *pos = f->f ? ftello(f->f) : lseek(f->fd, 0, SEEK_CUR); return *pos < 0 ? -1 : 0; }
+static WINAPI int vx_fsetpos(vx_file *f, const int64_t *pos) { return f->f ? fseeko(f->f, *pos, SEEK_SET) : (lseek(f->fd, *pos, SEEK_SET) < 0 ? -1 : 0); }
+static WINAPI unsigned vx_fgetwc(vx_file *f) {
+    FILE *s = read_stream(f);
+    int c = s ? fgetc(s) : -1;
+    if (c < 0) return 0xffff;
+    if (c < 0x80) return (unsigned)c;
+    int extra = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : 1;                // UTF-8
+    unsigned v = (unsigned)c & (0x3f >> extra);
+    for (int i = 0; i < extra; i++) { int d = fgetc(s); if (d < 0) break; v = v << 6 | ((unsigned)d & 0x3f); }
+    return v > 0xffff ? 0xfffd : v;
+}
+static WINAPI unsigned vx_fputwc(WCHAR c, vx_file *f) {
+    char b[4]; size_t n = vx_utf16_to_utf8(&c, 1, b, sizeof b);
+    return file_write(f, b, n) ? 0xffff : c;
+}
+static WINAPI unsigned vx_ungetwc(unsigned c, vx_file *f) { FILE *s = read_stream(f); return s && c < 0x80 && ungetc((int)c, s) >= 0 ? c : 0xffff; }
+// Time names for the C++ library's time facets: ":Sun:Sunday:Mon:Monday:..." strings, and __lc_time_data.
+static const char *g_days[] = { "Sun", "Sunday", "Mon", "Monday", "Tue", "Tuesday", "Wed", "Wednesday", "Thu", "Thursday", "Fri", "Friday", "Sat", "Saturday" };
+static const char *g_months[] = { "Jan", "January", "Feb", "February", "Mar", "March", "Apr", "April", "May", "May", "Jun", "June",
+                                  "Jul", "July", "Aug", "August", "Sep", "September", "Oct", "October", "Nov", "November", "Dec", "December" };
+static char *join_names(const char **names, int n) {
+    size_t len = 1;
+    for (int i = 0; i < n; i++) len += strlen(names[i]) + 1;
+    char *s = malloc(len), *p = s;
+    for (int i = 0; i < n; i++) p += sprintf(p, ":%s", names[i]);
+    return s;
+}
+static WINAPI char *vx_Getdays(void) { return join_names(g_days, 14); }
+static WINAPI char *vx_Getmonths(void) { return join_names(g_months, 24); }
+static WINAPI WCHAR *vx_W_Getdays(void) { char *a = vx_Getdays(); WCHAR *w = vx_utf16_dup(a); free(a); return w; }
+static WINAPI WCHAR *vx_W_Getmonths(void) { char *a = vx_Getmonths(); WCHAR *w = vx_utf16_dup(a); free(a); return w; }
+// __lc_time_data: abbreviated and full day and month names, AM/PM, date and time formats (narrow then wide), the
+// calendar type and a reference count, the locale name.
+static void *time_names(void) {
+    static void *data[7 + 7 + 12 + 12 + 2 + 3 + 2 + 7 + 7 + 12 + 12 + 2 + 3 + 1];
+    static int done;
+    if (done) return data;
+    int k = 0;
+    for (int i = 0; i < 7; i++) data[k++] = (void *)g_days[2 * i];
+    for (int i = 0; i < 7; i++) data[k++] = (void *)g_days[2 * i + 1];
+    for (int i = 0; i < 12; i++) data[k++] = (void *)g_months[2 * i];
+    for (int i = 0; i < 12; i++) data[k++] = (void *)g_months[2 * i + 1];
+    data[k++] = "AM"; data[k++] = "PM";
+    data[k++] = "MM/dd/yy"; data[k++] = "dddd, MMMM dd, yyyy"; data[k++] = "HH:mm:ss";
+    data[k++] = (void *)(uintptr_t)1; data[k++] = (void *)(uintptr_t)1;   // ww_caltype, refcount (as two 4-byte fields: close enough)
+    for (int i = 0; i < 7; i++) data[k++] = vx_utf16_dup(g_days[2 * i]);
+    for (int i = 0; i < 7; i++) data[k++] = vx_utf16_dup(g_days[2 * i + 1]);
+    for (int i = 0; i < 12; i++) data[k++] = vx_utf16_dup(g_months[2 * i]);
+    for (int i = 0; i < 12; i++) data[k++] = vx_utf16_dup(g_months[2 * i + 1]);
+    data[k++] = vx_utf16_dup("AM"); data[k++] = vx_utf16_dup("PM");
+    data[k++] = vx_utf16_dup("MM/dd/yy"); data[k++] = vx_utf16_dup("dddd, MMMM dd, yyyy"); data[k++] = vx_utf16_dup("HH:mm:ss");
+    data[k++] = vx_utf16_dup("en-US");
+    done = 1;
+    return data;
+}
+static WINAPI void *vx_Gettnames(void) { return time_names(); }
+static WINAPI size_t vx_Strftime(char *out, size_t cap, const char *fmt, const struct tm *t, void *names) { (void)names; return strftime(out, cap, fmt, t); }
+static WINAPI size_t vx_Wcsftime(WCHAR *out, size_t cap, const WCHAR *fmt, const struct tm *t, void *names) {
+    (void)names;
+    char *f = vx_utf8_dup(fmt), buf[1024];
+    size_t n = strftime(buf, sizeof buf, f, t);
+    free(f);
+    if (!n || n >= cap) return 0;
+    return vx_utf8_to_utf16(buf, n + 1, out, cap) - 1;
+}
+// Wide formatting: the format turned into the narrow one (%s and %c take wide arguments in wide functions).
+int vx_format_w(WCHAR *out, size_t cap, const WCHAR *fmt, const char *ap) {
+    size_t n = vx_wcslen(fmt);
+    char *nf = malloc(n * 4 + 8), *q = nf;
+    for (size_t i = 0; i < n; i++) {
+        WCHAR c = fmt[i];
+        if (c != '%') { char b[4]; size_t k = vx_utf16_to_utf8(&c, 1, b, sizeof b); memcpy(q, b, k); q += k; continue; }
+        *q++ = '%';
+        size_t j = i + 1;
+        while (j < n && fmt[j] && strchr("-+ #0123456789.*", (int)fmt[j])) *q++ = (char)fmt[j++];
+        int has_len = j < n && (fmt[j] == 'l' || fmt[j] == 'w' || fmt[j] == 'h');
+        if (j < n && (fmt[j] == 's' || fmt[j] == 'c')) *q++ = 'l';          // wide by default here
+        else if (j < n && (fmt[j] == 'S' || fmt[j] == 'C')) { *q++ = 'h'; *q++ = (char)(fmt[j] == 'S' ? 's' : 'c'); i = j; continue; }
+        (void)has_len;
+        i = j - 1;
+    }
+    *q = 0;
+    char *tmp = malloc(cap * 4 + 16);
+    int r = vx_format(tmp, cap * 4 + 16, nf, ap);
+    size_t w = vx_utf8_to_utf16(tmp, strlen(tmp) + 1, out, cap);
+    free(nf); free(tmp);
+    return r < 0 ? r : (int)(w ? w - 1 : 0);
+}
+static WINAPI int vx_vsnwprintf(WCHAR *buf, size_t n, const WCHAR *fmt, const char *ap) { return vx_format_w(buf, n, fmt, ap); }
+static WINAPI int vx_snwprintf(WCHAR *buf, size_t n, const WCHAR *fmt, ...) {
+    __builtin_ms_va_list ap; __builtin_ms_va_start(ap, fmt);
+    int r = vx_format_w(buf, n, fmt, ap);
+    __builtin_ms_va_end(ap);
+    return r;
+}
+static WINAPI int __stdio_common_vswprintf(uint64_t options, WCHAR *buf, size_t count, const WCHAR *fmt, void *locale, const char *ap) {
+    (void)options; (void)locale;
+    if (!buf || !count) { WCHAR tmp[4096]; return vx_format_w(tmp, 4096, fmt, ap); }
+    return vx_format_w(buf, count, fmt, ap);
+}
+static WINAPI int __stdio_common_vswprintf_s(uint64_t options, WCHAR *buf, size_t count, const WCHAR *fmt, void *locale, const char *ap) {
+    return __stdio_common_vswprintf(options, buf, count, fmt, locale, ap);
+}
+
+// ---- stat, time conversion, scanf, strings, process start-up odds and ends -------------------------------------------------
+// struct _stat64 (56 bytes): dev, ino, mode, nlink, uid, gid, rdev, size, atime, mtime, ctime; _stat64i32 has a
+// 32-bit size (48 bytes).
+static void windows_stat(const struct stat *st, uint8_t *out, int wide_size) {
+    memset(out, 0, wide_size ? 56 : 48);
+    uint16_t mode = S_ISDIR(st->st_mode) ? 0x4000 : 0x8000;
+    mode |= 0x100 | 0x20 | 0x4;                                     // readable
+    if (st->st_mode & S_IWUSR) mode |= 0x80 | 0x10 | 0x2;
+    if (S_ISDIR(st->st_mode) || (st->st_mode & S_IXUSR)) mode |= 0x40 | 0x8 | 0x1;
+    *(uint32_t *)out = 2;                                           // drive C:
+    *(uint16_t *)(out + 6) = mode; *(int16_t *)(out + 8) = (int16_t)st->st_nlink;
+    *(uint32_t *)(out + 16) = 2;
+    if (wide_size) {
+        *(int64_t *)(out + 24) = st->st_size;
+        *(int64_t *)(out + 32) = st->st_atime; *(int64_t *)(out + 40) = st->st_mtime; *(int64_t *)(out + 48) = st->st_ctime;
+    } else {
+        *(int32_t *)(out + 20) = (int32_t)st->st_size;
+        *(int64_t *)(out + 24) = st->st_atime; *(int64_t *)(out + 32) = st->st_mtime; *(int64_t *)(out + 40) = st->st_ctime;
+    }
+}
+static int stat_path(const char *path, uint8_t *out, int wide_size) {
+    char unix_path[4096];
+    struct stat st;
+    if (!vx_unix_path(path, unix_path, sizeof unix_path) || stat(unix_path, &st)) { set_errno(2); return -1; }
+    windows_stat(&st, out, wide_size);
+    return 0;
+}
+static WINAPI int vx_stat64(const char *p, uint8_t *out) { return stat_path(p, out, 1); }
+static WINAPI int vx_stat64i32(const char *p, uint8_t *out) { return stat_path(p, out, 0); }
+static WINAPI int vx_wstat64(const WCHAR *p, uint8_t *out) { char *a = vx_utf8_dup(p); int r = stat_path(a, out, 1); free(a); return r; }
+static WINAPI int vx_wstat64i32(const WCHAR *p, uint8_t *out) { char *a = vx_utf8_dup(p); int r = stat_path(a, out, 0); free(a); return r; }
+static WINAPI int vx_fstat64(int fd, uint8_t *out) {
+    struct stat st;
+    if (fstat(fd, &st)) { set_errno(9); return -1; }
+    windows_stat(&st, out, 1);
+    return 0;
+}
+// Time conversion: Windows' struct tm is the nine ints (the Mac's has more after them).
+static __thread int t_tm[9];
+static int *windows_tm(const struct tm *t) { memcpy(t_tm, t, sizeof t_tm); return t_tm; }
+static WINAPI int *vx_gmtime64(const int64_t *t) { time_t v = (time_t)*t; struct tm r; return gmtime_r(&v, &r) ? windows_tm(&r) : NULL; }
+static WINAPI int *vx_localtime64(const int64_t *t) { time_t v = (time_t)*t; struct tm r; return localtime_r(&v, &r) ? windows_tm(&r) : NULL; }
+static WINAPI int vx_gmtime64_s(int *out, const int64_t *t) { time_t v = (time_t)*t; struct tm r; if (!gmtime_r(&v, &r)) return 22; memcpy(out, &r, 36); return 0; }
+static WINAPI int vx_localtime64_s(int *out, const int64_t *t) { time_t v = (time_t)*t; struct tm r; if (!localtime_r(&v, &r)) return 22; memcpy(out, &r, 36); return 0; }
+// sscanf with a Windows va_list: the format's size modifiers turned into the Mac's, its pointers passed on.
+static WINAPI int __stdio_common_vsscanf(uint64_t options, const char *buf, size_t count, const char *fmt, void *locale, const char *ap) {
+    (void)options; (void)locale; (void)count;
+    char nf[1024]; size_t k = 0; int nargs = 0;
+    for (const char *p = fmt; *p && k < sizeof nf - 8; p++) {
+        nf[k++] = *p;
+        if (*p != '%') continue;
+        if (p[1] == '%') { nf[k++] = *++p; continue; }
+        int skip = p[1] == '*';
+        while (p[1] && strchr("*0123456789", p[1])) nf[k++] = *++p;
+        if (!strncmp(p + 1, "I64", 3)) { nf[k++] = 'l'; nf[k++] = 'l'; p += 3; }
+        else if (p[1] == 'l' && strchr("dioux", p[2])) p++;          // Windows long is 32-bit
+        else if (p[1] == 'l' && strchr("efg", p[2])) nf[k++] = *++p;  // double
+        else if (p[1] == 'z' || p[1] == 'I') { nf[k++] = 'l'; p++; }
+        else if (p[1] == 'h' || (p[1] == 'l' && p[2] == 'l')) { nf[k++] = *++p; if (*p == 'l') nf[k++] = *++p; }
+        if (p[1] == '[') { while (p[1] && p[1] != ']') nf[k++] = *++p; }
+        if (p[1]) nf[k++] = *++p;
+        if (!skip) nargs++;
+    }
+    nf[k] = 0;
+    void *a[16] = { 0 };
+    for (int i = 0; i < nargs && i < 16; i++) memcpy(&a[i], ap + 8 * i, 8);
+    return sscanf(buf, nf, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]);
+}
+static WINAPI int vx_wcsicmp(const WCHAR *a, const WCHAR *b) {
+    for (;; a++, b++) { WCHAR x = *a >= 'A' && *a <= 'Z' ? *a + 32 : *a, y = *b >= 'A' && *b <= 'Z' ? *b + 32 : *b; if (x != y || !x) return x - y; }
+}
+static WINAPI int vx_wcsnicmp(const WCHAR *a, const WCHAR *b, size_t n) {
+    for (; n--; a++, b++) { WCHAR x = *a >= 'A' && *a <= 'Z' ? *a + 32 : *a, y = *b >= 'A' && *b <= 'Z' ? *b + 32 : *b; if (x != y || !x) return x - y; }
+    return 0;
+}
+static WINAPI char *vx_strncat(char *d, const char *s, size_t n) { return strncat(d, s, n); }
+static WINAPI char *vx_strpbrk(const char *s, const char *set) { return strpbrk(s, set); }
+static WINAPI size_t vx_strspn(const char *s, const char *set) { return strspn(s, set); }
+static WINAPI uint64_t vx_strtoull(const char *s, char **e, int b) { return strtoull(s, e, b); }
+typedef struct { int32_t quot, rem; } win_ldiv;
+static WINAPI win_ldiv vx_ldiv(int32_t a, int32_t b) { win_ldiv r = { a / b, a % b }; return r; }
+static WINAPI short vx_dtest(double *x) { return fp_class(fpclassify(*x)); }
+static WINAPI short vx_fdtest(float *x) { return fp_class(fpclassify(*x)); }
+static WINAPI int32_t vx_lrintf(float x) { return (int32_t)lrintf(x); }
+static int g_fmode;
+static WINAPI int vx_set_fmode(int m) { g_fmode = m; return 0; }
+static WINAPI int vx_get_fmode(int *m) { *m = g_fmode; return 0; }
+static WINAPI void vx_c_exit(void) {}
+static WINAPI void vx_invalid_parameter_noinfo(void) { if (vx_trace) vx_log("the program reported an invalid parameter to the C runtime"); }
+static WINAPI void vx_register_thread_local_exe_atexit_callback(void *cb) { (void)cb; }
+// The command line after the program's name, for WinMain.
+static WINAPI char *vx_get_narrow_winmain_command_line(void) {
+    char *p = vx_proc.command_line;
+    if (*p == '"') { p++; while (*p && *p != '"') p++; if (*p) p++; }
+    else while (*p && *p != ' ' && *p != '\t') p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return p;
+}
+static WINAPI WCHAR *vx_get_wide_winmain_command_line(void) {
+    WCHAR *p = vx_proc.command_line_w;
+    if (*p == '"') { p++; while (*p && *p != '"') p++; if (*p) p++; }
+    else while (*p && *p != ' ' && *p != '\t') p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return p;
+}
+
+// ---- more of <math.h> (Windows long is 32 bits), mbrlen, _mktime64, bsearch_s ---------------------------------------------
+static WINAPI int32_t m_lround(double x) { return (int32_t)lround(x); }
+static WINAPI int32_t m_lroundf(float x) { return (int32_t)lroundf(x); }
+static WINAPI int64_t m_llround(double x) { return llround(x); }
+static WINAPI int64_t m_llroundf(float x) { return llroundf(x); }
+static WINAPI int32_t m_lrint(double x) { return (int32_t)lrint(x); }
+static WINAPI int64_t m_llrint(double x) { return llrint(x); }
+static WINAPI int64_t m_llrintf(float x) { return llrintf(x); }
+static WINAPI double m_nearbyint(double x) { return nearbyint(x); }
+static WINAPI float m_nearbyintf(float x) { return nearbyintf(x); }
+static WINAPI double m_expm1(double x) { return expm1(x); }
+static WINAPI float m_expm1f(float x) { return expm1f(x); }
+static WINAPI double m_log1p(double x) { return log1p(x); }
+static WINAPI float m_log1pf(float x) { return log1pf(x); }
+static WINAPI double m_remainder(double x, double y) { return remainder(x, y); }
+static WINAPI double m_fma(double a, double b, double c) { return fma(a, b, c); }
+static WINAPI float m_fmaf(float a, float b, float c) { return fmaf(a, b, c); }
+static WINAPI double m_nextafter(double a, double b) { return nextafter(a, b); }
+static WINAPI float m_nextafterf(float a, float b) { return nextafterf(a, b); }
+static WINAPI double m_erf(double x) { return erf(x); }
+static WINAPI double m_erfc(double x) { return erfc(x); }
+static WINAPI double m_tgamma(double x) { return tgamma(x); }
+static WINAPI double m_asinh(double x) { return asinh(x); }
+static WINAPI double m_acosh(double x) { return acosh(x); }
+static WINAPI double m_atanh(double x) { return atanh(x); }
+static WINAPI float m_asinhf(float x) { return asinhf(x); }
+static WINAPI float m_acoshf(float x) { return acoshf(x); }
+static WINAPI float m_atanhf(float x) { return atanhf(x); }
+static WINAPI double m_fdim(double x, double y) { return fdim(x, y); }
+static WINAPI double m_logb(double x) { return logb(x); }
+static WINAPI int m_ilogb(double x) { return ilogb(x); }
+static WINAPI double m_scalbn(double x, int n) { return scalbn(x, n); }
+static WINAPI float m_scalbnf(float x, int n) { return scalbnf(x, n); }
+static WINAPI float m_modff(float x, float *i) { return modff(x, i); }
+static WINAPI double m_remquo(double x, double y, int *q) { return remquo(x, y, q); }
+static WINAPI size_t vx_mbrlen(const char *s, size_t n, void *state) {
+    (void)state;
+    if (!s || !n) return 0;
+    uint8_t c = (uint8_t)*s;
+    size_t need = c < 0x80 ? 1 : c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : 2;   // UTF-8
+    return !c ? 0 : need > n ? (size_t)-2 : need;
+}
+static WINAPI int64_t vx_mktime64(int *t) {
+    struct tm tm = { 0 };
+    memcpy(&tm, t, 36);
+    time_t r = mktime(&tm);
+    memcpy(t, &tm, 36);
+    return (int64_t)r;
+}
+typedef int (WINAPI *compare_s)(void *, const void *, const void *);
+static WINAPI void *vx_bsearch_s(const void *key, const void *base, size_t n, size_t size, compare_s cmp, void *ctx) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const void *e = (const uint8_t *)base + mid * size;
+        int c = cmp(ctx, key, e);
+        if (!c) return (void *)e;
+        if (c < 0) hi = mid; else lo = mid + 1;
+    }
+    return NULL;
+}
+
 static const vx_export ucrt[] = {
+    { "lround", (void *)m_lround }, { "lroundf", (void *)m_lroundf }, { "llround", (void *)m_llround }, { "llroundf", (void *)m_llroundf },
+    { "lrint", (void *)m_lrint }, { "llrint", (void *)m_llrint }, { "llrintf", (void *)m_llrintf }, { "nearbyint", (void *)m_nearbyint },
+    { "nearbyintf", (void *)m_nearbyintf }, { "expm1", (void *)m_expm1 }, { "expm1f", (void *)m_expm1f }, { "log1p", (void *)m_log1p },
+    { "log1pf", (void *)m_log1pf }, { "remainder", (void *)m_remainder }, { "fma", (void *)m_fma }, { "fmaf", (void *)m_fmaf },
+    { "nextafter", (void *)m_nextafter }, { "nextafterf", (void *)m_nextafterf }, { "_nextafter", (void *)m_nextafter },
+    { "erf", (void *)m_erf }, { "erfc", (void *)m_erfc }, { "tgamma", (void *)m_tgamma }, { "asinh", (void *)m_asinh },
+    { "acosh", (void *)m_acosh }, { "atanh", (void *)m_atanh }, { "asinhf", (void *)m_asinhf }, { "acoshf", (void *)m_acoshf },
+    { "atanhf", (void *)m_atanhf }, { "fdim", (void *)m_fdim }, { "logb", (void *)m_logb }, { "_logb", (void *)m_logb },
+    { "ilogb", (void *)m_ilogb }, { "scalbn", (void *)m_scalbn }, { "scalbnf", (void *)m_scalbnf }, { "modff", (void *)m_modff },
+    { "remquo", (void *)m_remquo }, { "mbrlen", (void *)vx_mbrlen }, { "_mktime64", (void *)vx_mktime64 },
+    { "bsearch_s", (void *)vx_bsearch_s },
+    { "_stat64", (void *)vx_stat64 }, { "_stat64i32", (void *)vx_stat64i32 }, { "_wstat64", (void *)vx_wstat64 },
+    { "_wstat64i32", (void *)vx_wstat64i32 }, { "_fstat64", (void *)vx_fstat64 }, { "_gmtime64", (void *)vx_gmtime64 },
+    { "_localtime64", (void *)vx_localtime64 }, { "_gmtime64_s", (void *)vx_gmtime64_s }, { "_localtime64_s", (void *)vx_localtime64_s },
+    VX_EXPORT(__stdio_common_vsscanf), { "_wcsicmp", (void *)vx_wcsicmp }, { "_wcsnicmp", (void *)vx_wcsnicmp },
+    { "strncat", (void *)vx_strncat }, { "strpbrk", (void *)vx_strpbrk }, { "strspn", (void *)vx_strspn }, { "strtoull", (void *)vx_strtoull },
+    { "ldiv", (void *)vx_ldiv }, { "_dtest", (void *)vx_dtest }, { "_fdtest", (void *)vx_fdtest }, { "lrintf", (void *)vx_lrintf },
+    { "_set_fmode", (void *)vx_set_fmode }, { "_get_fmode", (void *)vx_get_fmode }, { "_c_exit", (void *)vx_c_exit },
+    { "_invalid_parameter_noinfo", (void *)vx_invalid_parameter_noinfo },
+    { "_register_thread_local_exe_atexit_callback", (void *)vx_register_thread_local_exe_atexit_callback },
+    { "_get_narrow_winmain_command_line", (void *)vx_get_narrow_winmain_command_line },
+    { "_get_wide_winmain_command_line", (void *)vx_get_wide_winmain_command_line },
+    { "__pctype_func", (void *)vx_pctype_func }, { "___lc_codepage_func", (void *)vx_lc_codepage_func },
+    { "___lc_collate_cp_func", (void *)vx_lc_codepage_func }, { "___lc_locale_name_func", (void *)vx_lc_locale_name_func },
+    { "_lock_locales", (void *)vx_lock_locales }, { "_unlock_locales", (void *)vx_lock_locales }, { "_wsetlocale", (void *)vx_wsetlocale },
+    { "_set_new_handler", (void *)vx_set_new_handler }, { "terminate", (void *)vx_terminate },
+    { "_wremove", (void *)vx_wremove }, { "_wrmdir", (void *)vx_wrmdir }, { "_wrename", (void *)vx_wrename }, { "_wchdir", (void *)vx_wchdir },
+    { "_wgetcwd", (void *)vx_wgetcwd }, { "_dclass", (void *)vx_dclass }, { "_fdclass", (void *)vx_fdclass }, { "_dsign", (void *)vx_dsign },
+    { "_fdsign", (void *)vx_fdsign }, { "copysign", (void *)vx_copysign }, { "_copysign", (void *)vx_copysign }, { "lgamma", (void *)vx_lgamma },
+    { "lgammal", (void *)vx_lgamma }, { "lgammaf", (void *)vx_lgammaf }, { "__strncnt", (void *)vx_strncnt }, { "_wcsdup", (void *)vx_wcsdup },
+    { "strcspn", (void *)vx_strcspn }, { "strtof", (void *)vx_strtof }, { "wcstod", (void *)vx_wcstod }, { "wcstof", (void *)vx_wcstof },
+    { "_fsopen", (void *)vx_fsopen }, { "_wfsopen", (void *)vx_wfsopen }, { "_get_stream_buffer_pointers", (void *)vx_get_stream_buffer_pointers },
+    { "fgetpos", (void *)vx_fgetpos }, { "fsetpos", (void *)vx_fsetpos }, { "fgetwc", (void *)vx_fgetwc }, { "fputwc", (void *)vx_fputwc },
+    { "ungetwc", (void *)vx_ungetwc }, { "_Getdays", (void *)vx_Getdays }, { "_Getmonths", (void *)vx_Getmonths },
+    { "_W_Getdays", (void *)vx_W_Getdays }, { "_W_Getmonths", (void *)vx_W_Getmonths }, { "_Gettnames", (void *)vx_Gettnames },
+    { "_W_Gettnames", (void *)vx_Gettnames }, { "_Strftime", (void *)vx_Strftime }, { "_Wcsftime", (void *)vx_Wcsftime },
+    { "_vsnwprintf", (void *)vx_vsnwprintf }, { "_snwprintf", (void *)vx_snwprintf }, VX_EXPORT(__stdio_common_vswprintf),
+    VX_EXPORT(__stdio_common_vswprintf_s),
     { "_onexit", (void *)vx_onexit }, { "_amsg_exit", (void *)vx_amsg_exit }, { "_XcptFilter", (void *)vx_XcptFilter },
     { "_strtoui64", (void *)vx_strtoui64 }, { "_strtoi64", (void *)vx_strtoi64 }, { "isxdigit", (void *)vx_isxdigit },
     { "isalnum", (void *)vx_isalnum }, { "isupper", (void *)vx_isupper }, { "islower", (void *)vx_islower },
@@ -596,7 +1005,8 @@ static const vx_export ucrt[] = {
     { "_mkdir", (void *)vx_mkdir }, { "_rmdir", (void *)vx_rmdir }, { "_access", (void *)vx_access },
     { "_getcwd", (void *)vx_getcwd }, { "_chdir", (void *)vx_chdir },
     VX_EXPORT(__p__fmode), VX_EXPORT(__p__commode), VX_EXPORT(__p___argc), VX_EXPORT(__p___argv), VX_EXPORT(__p__environ),
-    VX_EXPORT(_configure_narrow_argv), VX_EXPORT(_initialize_narrow_environment), VX_EXPORT(_set_app_type),
+    VX_EXPORT(_configure_narrow_argv), VX_EXPORT(_initialize_narrow_environment), VX_EXPORT(_get_initial_narrow_environment),
+    VX_EXPORT(_get_initial_wide_environment), VX_EXPORT(__p__wenviron), { "_mbsstr", (void *)vx_mbsstr }, VX_EXPORT(_set_app_type),
     VX_EXPORT(_set_invalid_parameter_handler), VX_EXPORT(__setusermatherr), VX_EXPORT(_configthreadlocale),
     VX_EXPORT(_set_new_mode), { "signal", (void *)vx_signal },
     VX_EXPORT(_initterm), VX_EXPORT(_initterm_e), VX_EXPORT(_crt_atexit), { "atexit", (void *)vx_atexit },

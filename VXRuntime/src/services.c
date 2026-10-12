@@ -530,15 +530,6 @@ static WINAPI BOOL ReadDirectoryChangesW(HANDLE dir, void *buf, DWORD n, BOOL su
     vx_set_last_error(50);                                        // not supported: programs poll instead
     return 0;
 }
-static WINAPI HANDLE CreateNamedPipeA(const char *name, DWORD mode, DWORD pmode, DWORD max, DWORD out, DWORD in, DWORD ms, void *sa) {
-    (void)name; (void)mode; (void)pmode; (void)max; (void)out; (void)in; (void)ms; (void)sa;
-    vx_set_last_error(50);
-    return INVALID_HANDLE;
-}
-static WINAPI HANDLE CreateNamedPipeW(const WCHAR *name, DWORD mode, DWORD pmode, DWORD max, DWORD out, DWORD in, DWORD ms, void *sa) {
-    (void)name; return CreateNamedPipeA(NULL, mode, pmode, max, out, in, ms, sa);
-}
-static WINAPI BOOL ConnectNamedPipe(HANDLE h, void *ov) { (void)h; (void)ov; vx_set_last_error(6); return 0; }
 static WINAPI BOOL CopyFileExW(const WCHAR *from, const WCHAR *to, void *progress, void *data, BOOL *cancel, DWORD flags) {
     (void)progress; (void)data; (void)cancel;
     BOOL (WINAPI *copy)(const WCHAR *, const WCHAR *, BOOL) = (BOOL (WINAPI *)(const WCHAR *, const WCHAR *, BOOL))vx_find_export("kernel32.dll", "CopyFileW");
@@ -583,6 +574,102 @@ static WINAPI BOOL InitOnceComplete(uint64_t *once, DWORD flags, void *ctx) {
 void vx_restore_context(const void *ctx) __attribute__((noreturn));
 static WINAPI void RtlRestoreContext(const void *ctx, void *rec) { (void)rec; vx_restore_context(ctx); }
 
+// ---- files (the Windows 8 forms) ------------------------------------------------------------------------------------------
+// CREATEFILE2_EXTENDED_PARAMETERS: size, attributes, flags, security QoS, security attributes, template.
+static WINAPI HANDLE CreateFile2(const WCHAR *name, DWORD access, DWORD share, DWORD disposition, const DWORD *params) {
+    HANDLE (WINAPI *create)(const WCHAR *, DWORD, DWORD, void *, DWORD, DWORD, HANDLE) = (HANDLE (WINAPI *)(const WCHAR *, DWORD, DWORD, void *, DWORD, DWORD, HANDLE))vx_find_export("kernel32.dll", "CreateFileW");
+    return create(name, access, share, NULL, disposition, params ? params[1] | params[2] : 0, NULL);
+}
+static WINAPI LONG CopyFile2(const WCHAR *from, const WCHAR *to, const DWORD *params) {
+    BOOL (WINAPI *copy)(const WCHAR *, const WCHAR *, BOOL) = (BOOL (WINAPI *)(const WCHAR *, const WCHAR *, BOOL))vx_find_export("kernel32.dll", "CopyFileW");
+    BOOL fail_if_exists = params && (params[1] & 1);                  // COPY_FILE_FAIL_IF_EXISTS
+    return copy(from, to, fail_if_exists) ? 0 : (LONG)(0x80070000u | vx_get_last_error());
+}
+static WINAPI BOOL CreateHardLinkW(const WCHAR *link_name, const WCHAR *existing, void *sa) {
+    (void)sa;
+    char *a = vx_utf8_dup(existing), *b = vx_utf8_dup(link_name), pa[1024], pb[1024];
+    BOOL ok = vx_unix_path(a, pa, sizeof pa) && vx_unix_path_write(b, pb, sizeof pb, 0) && link(pa, pb) == 0;
+    if (!ok) vx_set_last_error(5);
+    free(a); free(b);
+    return ok;
+}
+// wsprintfW (user32): the C runtime's wide formatting.
+int vx_format_w(WCHAR *out, size_t cap, const WCHAR *fmt, const char *ap);
+static WINAPI int wsprintfW(WCHAR *buf, const WCHAR *fmt, ...) {
+    __builtin_ms_va_list ap; __builtin_ms_va_start(ap, fmt);
+    int n = vx_format_w(buf, 1025, fmt, ap);
+    __builtin_ms_va_end(ap);
+    return n;
+}
+static WINAPI int wvsprintfW(WCHAR *buf, const WCHAR *fmt, const char *ap) { return vx_format_w(buf, 1025, fmt, ap); }
+// ---- services and security (advapi32): no service manager; SIDs and ACLs as plain memory -----------------------------------
+static WINAPI HANDLE OpenSCManagerA(const char *machine, const char *db, DWORD access) { (void)machine; (void)db; (void)access; vx_set_last_error(5); return NULL; }
+static WINAPI HANDLE OpenSCManagerW(const WCHAR *machine, const WCHAR *db, DWORD access) { (void)machine; (void)db; (void)access; vx_set_last_error(5); return NULL; }
+static WINAPI HANDLE OpenServiceA(HANDLE scm, const char *name, DWORD access) { (void)scm; (void)name; (void)access; vx_set_last_error(1060); return NULL; }
+static WINAPI BOOL service_none(void) { vx_set_last_error(6); return 0; }
+static WINAPI BOOL CloseServiceHandle(HANDLE h) { (void)h; return 1; }
+// A SID: revision, sub-authority count, 6-byte identifier authority, sub-authorities.
+static WINAPI DWORD GetLengthSid(const uint8_t *sid) { return 8 + 4 * (DWORD)sid[1]; }
+static WINAPI BOOL IsValidSid(const uint8_t *sid) { return sid && sid[0] == 1 && sid[1] <= 15; }
+static WINAPI BOOL CopySid(DWORD n, uint8_t *dst, const uint8_t *src) { DWORD len = GetLengthSid(src); if (n < len) { vx_set_last_error(122); return 0; } memcpy(dst, src, len); return 1; }
+static WINAPI BOOL CreateWellKnownSid(int type, const void *domain, uint8_t *sid, DWORD *size) {
+    (void)domain;
+    if (!size || *size < 16) { if (size) *size = 16; vx_set_last_error(122); return 0; }
+    memset(sid, 0, 16);
+    sid[0] = 1; sid[1] = 1; sid[7] = type == 1 ? 1 : 5;               // World (S-1-1-0) or NT authority
+    *(DWORD *)(sid + 8) = type == 1 ? 0 : type == 26 ? 18 : 11;       // ...: LocalSystem 18, else Authenticated Users 11
+    *size = 12;
+    return 1;
+}
+static WINAPI BOOL ConvertStringSidToSidA(const char *s, void **sid) {
+    (void)s;
+    uint8_t *p = calloc(1, 16);
+    p[0] = 1; p[1] = 1; p[7] = 1;                                      // S-1-1-0
+    *sid = p;
+    return 1;
+}
+static WINAPI BOOL InitializeAcl(uint8_t *acl, DWORD n, DWORD rev) { if (n < 8) return 0; memset(acl, 0, 8); acl[0] = (uint8_t)rev; *(uint16_t *)(acl + 2) = (uint16_t)n; return 1; }
+static WINAPI BOOL AddAccessAllowedAce(uint8_t *acl, DWORD rev, DWORD mask, void *sid) { (void)acl; (void)rev; (void)mask; (void)sid; return 1; }
+static WINAPI BOOL ConvertStringSecurityDescriptorToSecurityDescriptorW(const WCHAR *s, DWORD rev, void **sd, DWORD *size) {
+    (void)s; (void)rev;
+    *sd = calloc(1, 40);
+    ((uint8_t *)*sd)[0] = 1;                                           // an empty self-relative descriptor
+    if (size) *size = 40;
+    return 1;
+}
+static WINAPI DWORD EventWriteString(uint64_t reg, uint8_t level, uint64_t keyword, const WCHAR *s) {
+    (void)reg; (void)level; (void)keyword;
+    if (vx_trace && s) { char *a = vx_utf8_dup(s); vx_log("event: %s", a); free(a); }
+    return 0;
+}
+
+// ---- this process, as the only one -------------------------------------------------------------------------------------
+static WINAPI BOOL K32EnumProcesses(DWORD *ids, DWORD size, DWORD *got) { if (size >= 4) ids[0] = (DWORD)getpid(); *got = size >= 4 ? 4 : 0; return 1; }
+static DWORD image_name_a(char *out, DWORD cap) {
+    const vx_image *m = vx_image_at((uint64_t)(uintptr_t)vx_proc.image_base);
+    const char *w = m && m->windows_path ? m->windows_path : "C:\\program.exe";
+    DWORD n = (DWORD)strlen(w);
+    if (!out || cap <= n) { vx_set_last_error(122); return 0; }
+    memcpy(out, w, n + 1);
+    return n;
+}
+static WINAPI DWORD K32GetProcessImageFileNameA(HANDLE p, char *out, DWORD cap) { (void)p; return image_name_a(out, cap); }
+static WINAPI BOOL QueryFullProcessImageNameA(HANDLE p, DWORD flags, char *out, DWORD *size) { (void)p; (void)flags; DWORD n = image_name_a(out, *size); if (!n) return 0; *size = n; return 1; }
+static WINAPI BOOL QueryFullProcessImageNameW(HANDLE p, DWORD flags, WCHAR *out, DWORD *size) {
+    (void)p; (void)flags;
+    char a[1024];
+    if (!image_name_a(a, sizeof a)) return 0;
+    size_t n = vx_utf8_to_utf16(a, strlen(a) + 1, out, *size);
+    if (!n || n > *size) { vx_set_last_error(122); return 0; }
+    *size = (DWORD)n - 1;
+    return 1;
+}
+static WINAPI BOOL ReplaceFileW(const WCHAR *replaced, const WCHAR *replacement, const WCHAR *backup, DWORD flags, void *a, void *b) {
+    (void)backup; (void)flags; (void)a; (void)b;
+    BOOL (WINAPI *move)(const WCHAR *, const WCHAR *, DWORD) = (BOOL (WINAPI *)(const WCHAR *, const WCHAR *, DWORD))vx_find_export("kernel32.dll", "MoveFileExW");
+    return move(replacement, replaced, 1);
+}
+
 static const vx_export k32[] = {
     VX_EXPORT(FindResourceW), VX_EXPORT(FindResourceA), VX_EXPORT(FindResourceExW), VX_EXPORT(FindResourceExA), VX_EXPORT(LoadResource),
     VX_EXPORT(LockResource), VX_EXPORT(SizeofResource), VX_EXPORT(FreeResource), VX_EXPORT(IsBadReadPtr), VX_EXPORT(IsBadWritePtr),
@@ -598,20 +685,30 @@ static const vx_export k32[] = {
     VX_EXPORT(LocalReAlloc), VX_EXPORT(QueryThreadCycleTime), VX_EXPORT(DebugBreak), VX_EXPORT(FatalAppExitA),
     VX_EXPORT(FlushInstructionCache), VX_EXPORT(RtlAddFunctionTable), VX_EXPORT(RtlDeleteFunctionTable),
     VX_EXPORT(RtlInstallFunctionTableCallback), VX_EXPORT(SetHandleInformation), VX_EXPORT(GetHandleInformation),
-    VX_EXPORT(SetSystemTime), VX_EXPORT(SignalObjectAndWait), VX_EXPORT(ReadDirectoryChangesW), VX_EXPORT(CreateNamedPipeA),
-    VX_EXPORT(CreateNamedPipeW), VX_EXPORT(ConnectNamedPipe), VX_EXPORT(CopyFileExW), VX_EXPORT(GetPrivateProfileIntW),
+    VX_EXPORT(SetSystemTime), VX_EXPORT(SignalObjectAndWait), VX_EXPORT(ReadDirectoryChangesW),
+    VX_EXPORT(CopyFileExW), VX_EXPORT(GetPrivateProfileIntW),
     VX_EXPORT(GetPrivateProfileIntA), VX_EXPORT(GetPrivateProfileSectionW), VX_EXPORT(PeekConsoleInputA), VX_EXPORT(ReadConsoleInputW),
     VX_EXPORT(FlushConsoleInputBuffer), VX_EXPORT(GetNumaHighestNodeNumber), VX_EXPORT(GetLargePageMinimum),
     VX_EXPORT(InitOnceBeginInitialize), VX_EXPORT(InitOnceComplete), VX_EXPORT(RtlRestoreContext),
+    VX_EXPORT(CreateFile2), VX_EXPORT(CopyFile2), VX_EXPORT(CreateHardLinkW), VX_EXPORT(K32EnumProcesses),
+    VX_EXPORT(K32GetProcessImageFileNameA), VX_EXPORT(QueryFullProcessImageNameA), VX_EXPORT(QueryFullProcessImageNameW),
+    VX_EXPORT(ReplaceFileW),
     { "K32GetProcessMemoryInfo", (void *)GetProcessMemoryInfo }, { "K32GetModuleInformation", (void *)GetModuleInformation },
 };
-static const vx_export psapi[] = { VX_EXPORT(GetProcessMemoryInfo), VX_EXPORT(GetModuleInformation) };
+static const vx_export psapi[] = { VX_EXPORT(GetProcessMemoryInfo), VX_EXPORT(GetModuleInformation), { "EnumProcesses", (void *)K32EnumProcesses },
+                                   { "GetProcessImageFileNameA", (void *)K32GetProcessImageFileNameA } };
 static const vx_export advapi[] = {
     VX_EXPORT(SystemFunction036), VX_EXPORT(CryptAcquireContextA), VX_EXPORT(CryptAcquireContextW), VX_EXPORT(CryptGenRandom),
     VX_EXPORT(CryptReleaseContext), VX_EXPORT(RegisterEventSourceW), VX_EXPORT(RegisterEventSourceA), VX_EXPORT(DeregisterEventSource),
     VX_EXPORT(ReportEventW), VX_EXPORT(EventSetInformation), VX_EXPORT(AdjustTokenPrivileges), VX_EXPORT(LookupPrivilegeValueW),
     VX_EXPORT(LookupPrivilegeValueA), VX_EXPORT(EqualSid), VX_EXPORT(LookupAccountSidA), VX_EXPORT(GetNamedSecurityInfoA),
-    VX_EXPORT(RegConnectRegistryA),
+    VX_EXPORT(RegConnectRegistryA), VX_EXPORT(OpenSCManagerA), VX_EXPORT(OpenSCManagerW), VX_EXPORT(OpenServiceA),
+    VX_EXPORT(CloseServiceHandle), { "OpenServiceW", (void *)OpenServiceA }, { "StartServiceA", (void *)service_none },
+    { "StartServiceW", (void *)service_none }, { "ControlService", (void *)service_none }, { "QueryServiceStatusEx", (void *)service_none },
+    { "QueryServiceConfigA", (void *)service_none }, { "QueryServiceConfigW", (void *)service_none },
+    VX_EXPORT(GetLengthSid), VX_EXPORT(IsValidSid), VX_EXPORT(CopySid), VX_EXPORT(CreateWellKnownSid), VX_EXPORT(ConvertStringSidToSidA),
+    VX_EXPORT(InitializeAcl), VX_EXPORT(AddAccessAllowedAce), VX_EXPORT(ConvertStringSecurityDescriptorToSecurityDescriptorW),
+    VX_EXPORT(EventWriteString),
 };
 static const vx_export rpcrt4[] = { VX_EXPORT(UuidCreate), VX_EXPORT(UuidToStringA), VX_EXPORT(UuidFromStringA), VX_EXPORT(RpcStringFreeA) };
 static const vx_export shell32[] = {
@@ -628,7 +725,7 @@ static const vx_export crt[] = {
 };
 static const vx_export user32[] = {
     VX_EXPORT(GetKeyboardLayoutList), VX_EXPORT(LoadKeyboardLayoutA), VX_EXPORT(LoadKeyboardLayoutW), VX_EXPORT(ActivateKeyboardLayout),
-    VX_EXPORT(ToUnicodeEx), VX_EXPORT(SetRect), VX_EXPORT(GetWindowInfo), VX_EXPORT(EnumChildWindows), VX_EXPORT(GetGUIThreadInfo),
+    VX_EXPORT(ToUnicodeEx), VX_EXPORT(SetRect), VX_EXPORT(wsprintfW), VX_EXPORT(wvsprintfW), VX_EXPORT(GetWindowInfo), VX_EXPORT(EnumChildWindows), VX_EXPORT(GetGUIThreadInfo),
     VX_EXPORT(GetProcessWindowStation), VX_EXPORT(GetUserObjectInformationW), VX_EXPORT(CopyIcon), VX_EXPORT(DrawIconEx), VX_EXPORT(GetIconInfo),
 };
 static const vx_export imm32[] = {

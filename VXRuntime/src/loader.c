@@ -163,10 +163,14 @@ static pthread_mutex_t g_tebs_lock = PTHREAD_MUTEX_INITIALIZER;
 // gs:0x30 and the TLS array at gs:0x58, so those two TSD slots are set to the TEB's values on every thread, as
 // Wine did on macOS before version 8. Native code (this runtime, macOS, Metal, D3DMetal) keeps working on the
 // same thread with no switching.
+// gs:0x60 (the PEB, which compilers read directly as NtCurrentPeb()) is macOS's TSD slot 12, where libc keeps
+// the buffer of the non-reentrant localtime(). Program threads point it at the PEB; nothing here calls
+// localtime() (only localtime_r), so the slot is never used as a buffer while the PEB is in it.
 static void set_gs_slots(uint8_t *teb) {
-    uint64_t self = (uint64_t)teb, tls = *(uint64_t *)(teb + TEB_TLS_POINTER);
+    uint64_t self = (uint64_t)teb, tls = *(uint64_t *)(teb + TEB_TLS_POINTER), peb = (uint64_t)g_peb;
     __asm__ volatile("movq %0, %%gs:0x30" :: "r"(self));
     __asm__ volatile("movq %0, %%gs:0x58" :: "r"(tls));
+    __asm__ volatile("movq %0, %%gs:0x60" :: "r"(peb));
 }
 
 // A fresh copy of an image's TLS template (static __declspec(thread) data).
@@ -220,6 +224,8 @@ void vx_thread_detach(void) {
     for (int i = 0; i < MAX_TLS_MODULES; i++) free(tls[i]);
     free(tls);
     pthread_setspecific(g_teb_key, NULL);
+    // The PEB leaves TSD slot 12 before the thread ends: libc frees whatever localtime's slot holds.
+    __asm__ volatile("movq $0, %%gs:0x60" ::: "memory");
     free(teb);
 }
 
@@ -287,6 +293,15 @@ static char g_altered_dir[4096];   // LoadLibraryEx(LOAD_WITH_ALTERED_SEARCH_PAT
 
 // Finds a DLL file: (the altered search directory,) the program's directory, C:\windows\system32, the current
 // directory.
+// Wine's own DLLs (marked "Wine builtin DLL" after the DOS header) need Wine underneath: they are passed over.
+static int wine_builtin(const char *path) {
+    char head[0x60] = { 0 };
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    size_t n = fread(head, 1, sizeof head, f);
+    fclose(f);
+    return n == sizeof head && !memcmp(head + 0x40, "Wine builtin DLL", 16);
+}
 static int search_dll(const char *name, char *out, size_t cap) {
     char file[256];
     snprintf(file, sizeof file, "%s%s", name, strchr(name, '.') ? "" : ".dll");
@@ -302,6 +317,17 @@ static int search_dll(const char *name, char *out, size_t cap) {
         snprintf(out, cap, "%s/%s", dirs[i], file);
         struct stat st;
         if (!stat(out, &st) && S_ISREG(st.st_mode)) return 1;
+    }
+    // VXRT_DLL_PATH: more Mac directories (colon-separated) holding the user's own Windows DLLs, for example the
+    // Visual C++ runtime a Windows installation already has.
+    const char *extra = getenv("VXRT_DLL_PATH");
+    while (extra && *extra) {
+        const char *colon = strchr(extra, ':');
+        size_t n = colon ? (size_t)(colon - extra) : strlen(extra);
+        snprintf(out, cap, "%.*s/%s", (int)n, extra, file);
+        struct stat st;
+        if (n && !stat(out, &st) && S_ISREG(st.st_mode) && !wine_builtin(out)) return 1;
+        extra = colon ? colon + 1 : NULL;
     }
     return 0;
 }
@@ -608,6 +634,49 @@ static int run_program(void *arg) {
     fflush(stdout);
     return (int)rc;
 }
+// The PEB's process parameters (RTL_USER_PROCESS_PARAMETERS), which statically linked C runtimes read directly:
+// flags, standard handles, the current directory, image path, command line and environment as UNICODE_STRINGs
+// (length, maximum length, buffer), and the window-show flags; and the PEB's Windows version (10.0.19045) and
+// processor count.
+typedef struct { uint16_t len, max; uint32_t pad; WCHAR *buf; } unicode_string;
+static void set_unicode(uint8_t *at, const char *s) {
+    unicode_string *u = (unicode_string *)at;
+    u->buf = vx_utf16_dup(s);
+    u->len = (uint16_t)(vx_wcslen(u->buf) * 2); u->max = (uint16_t)(u->len + 2);
+}
+static void make_process_parameters(const char *exe) {
+    uint8_t *pp = calloc(1, 0x440);
+    *(DWORD *)pp = *(DWORD *)(pp + 4) = 0x440;                 // MaximumLength, Length
+    *(DWORD *)(pp + 8) = 1;                                     // RTL_USER_PROC_PARAMS_NORMALIZED
+    *(HANDLE *)(pp + 0x20) = (HANDLE)(intptr_t)-10;             // standard input, output, error
+    *(HANDLE *)(pp + 0x28) = (HANDLE)(intptr_t)-11;
+    *(HANDLE *)(pp + 0x30) = (HANDLE)(intptr_t)-12;
+    char cwd[1024], win[1024];
+    vx_get_cwd(cwd, sizeof cwd);
+    size_t n = strlen(cwd);
+    if (n && cwd[n - 1] != '\\' && n + 1 < sizeof cwd) { cwd[n] = '\\'; cwd[n + 1] = 0; }
+    set_unicode(pp + 0x38, cwd);                                // CurrentDirectory.DosPath
+    vx_windows_path(exe, win, sizeof win);
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s", win);
+    char *slash = strrchr(dir, '\\');
+    if (slash) slash[1] = 0;
+    set_unicode(pp + 0x50, dir);                                // DllPath
+    set_unicode(pp + 0x60, win);                                // ImagePathName
+    unicode_string *cmd = (unicode_string *)(pp + 0x70);       // CommandLine
+    cmd->buf = vx_proc.command_line_w;
+    size_t cl = vx_wcslen(cmd->buf) * 2; cmd->len = (uint16_t)(cl > 0xfffc ? 0xfffc : cl); cmd->max = (uint16_t)(cmd->len + 2);
+    WCHAR *(WINAPI *env)(void) = (WCHAR *(WINAPI *)(void))vx_find_export("kernel32.dll", "GetEnvironmentStringsW");
+    *(WCHAR **)(pp + 0x80) = env ? env() : NULL;                // Environment
+    *(DWORD *)(pp + 0xa4) = 1;                                  // WindowFlags... ShowWindowFlags: SW_SHOWNORMAL
+    set_unicode(pp + 0xb0, win);                                // WindowTitle
+    set_unicode(pp + 0xc0, "WinSta0\\Default");                // DesktopInfo
+    *(void **)(g_peb + 0x20) = pp;
+    *(DWORD *)(g_peb + 0xb8) = (DWORD)sysconf(_SC_NPROCESSORS_ONLN);   // NumberOfProcessors
+    *(DWORD *)(g_peb + 0x118) = 10; *(DWORD *)(g_peb + 0x11c) = 0;     // OSMajorVersion, OSMinorVersion
+    *(uint16_t *)(g_peb + 0x120) = 19045; *(DWORD *)(g_peb + 0x124) = 0; *(DWORD *)(g_peb + 0x128) = 2;   // build, CSD, VER_PLATFORM_WIN32_NT
+}
+
 int main(int argc, char **argv, char **envp) {
     if (argc < 2) { fprintf(stderr, "usage: vxrt program.exe [args...]\n"); return 2; }
     vx_trace = getenv("VXRT_TRACE") && *getenv("VXRT_TRACE") == '1';
@@ -615,6 +684,7 @@ int main(int argc, char **argv, char **envp) {
     vx_system_init();
     vx_desktop_init();
     vx_services_init();
+    vx_pipes_init();
     vx_register_module("kernel32.dll", loader_k32, sizeof loader_k32 / sizeof loader_k32[0]);
     vx_register_module("kernelbase.dll", loader_k32, sizeof loader_k32 / sizeof loader_k32[0]);
     vx_ucrt_init();
@@ -657,6 +727,7 @@ int main(int argc, char **argv, char **envp) {
     static char *exe;
     exe = realpath(argv[1], NULL);
     if (!exe) { vx_log("cannot open %s: %s", argv[1], strerror(errno)); return 1; }
+    make_process_parameters(exe);
     snprintf(g_exe_dir, sizeof g_exe_dir, "%s", exe);
     *strrchr(g_exe_dir, '/') = 0;
     // The program runs on a thread of its own with the stack its header asks for (8 MB at least); the macOS

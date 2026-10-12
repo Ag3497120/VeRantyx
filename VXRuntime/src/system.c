@@ -525,6 +525,14 @@ static WINAPI void *RtlAllocateHeap(HANDLE heap, DWORD flags, size_t n) {
     void *(WINAPI *heap_alloc)(HANDLE, DWORD, size_t) = (void *(WINAPI *)(HANDLE, DWORD, size_t))vx_find_export("kernel32.dll", "HeapAlloc");
     return heap_alloc ? heap_alloc(heap, flags, n) : NULL;
 }
+static WINAPI DWORD NtQueryVirtualMemory(HANDLE p, const void *addr, int cls, void *out, size_t n, size_t *ret) {
+    (void)p;
+    if (cls != 0) { if (ret) *ret = 0; return STATUS_NOT_IMPLEMENTED; }    // MemoryBasicInformation only
+    size_t (WINAPI *query)(const void *, void *, size_t) = (size_t (WINAPI *)(const void *, void *, size_t))vx_find_export("kernel32.dll", "VirtualQuery");
+    size_t r = query(addr, out, n);
+    if (ret) *ret = r;
+    return r ? 0 : 0xC000000Du;                                       // STATUS_INVALID_PARAMETER
+}
 static WINAPI DWORD LdrLockLoaderLock(DWORD flags, DWORD *state, uintptr_t *cookie) { (void)flags; if (state) *state = 1; if (cookie) *cookie = 1; return 0; }
 static WINAPI DWORD LdrUnlockLoaderLock(DWORD flags, uintptr_t cookie) { (void)flags; (void)cookie; return 0; }
 static WINAPI DWORD NtAllocateVirtualMemory(HANDLE p, void **addr, uintptr_t zero, size_t *size, DWORD type, DWORD protect) {
@@ -578,7 +586,7 @@ static const vx_export shell[] = {
 static const vx_export ntdll[] = {
     VX_EXPORT(NtQuerySystemInformation), VX_EXPORT(NtQueryInformationProcess), VX_EXPORT(NtQueryInformationThread),
     VX_EXPORT(NtClose), VX_EXPORT(RtlFreeHeap), VX_EXPORT(RtlAllocateHeap), VX_EXPORT(LdrLockLoaderLock),
-    VX_EXPORT(LdrUnlockLoaderLock), VX_EXPORT(NtAllocateVirtualMemory),
+    VX_EXPORT(LdrUnlockLoaderLock), VX_EXPORT(NtAllocateVirtualMemory), VX_EXPORT(NtQueryVirtualMemory),
 };
 void vx_system_init(void) {
     vx_register_module("kernel32.dll", k32, sizeof k32 / sizeof k32[0]);

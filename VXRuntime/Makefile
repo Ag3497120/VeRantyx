@@ -1,7 +1,7 @@
 # vxrt: the VeRantyx Windows runtime. An x86-64 macOS binary; Rosetta 2 runs it and the Windows program together.
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
-SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/ucrt.c src/sync.c src/seh.c src/context.S src/text.c src/files.c src/registry.c \
+SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/context.S src/text.c src/files.c src/registry.c \
           src/user32.c src/gdi.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/dxgi.m src/d3d9.m src/dxbc.c src/input.m src/audio.m src/xaudio2.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
@@ -14,7 +14,7 @@ build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -101,6 +101,14 @@ build/xaudio2.exe: tests/xaudio2.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lxaudio2_9 -lm
 
+build/ipc.exe: tests/ipc.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+build/pipes.exe: tests/pipes.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
 build/hlslc.exe: tools/hlslc.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
@@ -156,6 +164,9 @@ check: all
 	build/vxrt build/input.exe
 	build/vxrt build/audio.exe
 	build/vxrt build/xaudio2.exe
+	build/vxrt build/pipes.exe
+	build/vxrt build/pipes.exe serve & build/vxrt build/pipes.exe ask; wait
+	build/vxrt build/ipc.exe second & build/vxrt build/ipc.exe first; wait
 
 clean:
 	rm -rf build

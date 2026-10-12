@@ -5,7 +5,13 @@
 // objects, and every state change wakes all waiters through one condition variable; each waiter then re-checks
 // what it waits for. Simple and correct; per-object wait queues are a later optimisation.
 #include <errno.h>
+#include <fcntl.h>
+#include <os/os_sync_wait_on_address.h>
 #include <pthread.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <stdio.h>
@@ -21,7 +27,7 @@
 #define STILL_ACTIVE  259u
 #define CREATE_SUSPENDED 4u
 
-enum { OBJ_THREAD = 1, OBJ_EVENT, OBJ_MUTEX, OBJ_SEMAPHORE, OBJ_OTHER, OBJ_PORT };
+enum { OBJ_THREAD = 1, OBJ_EVENT, OBJ_MUTEX, OBJ_SEMAPHORE, OBJ_OTHER, OBJ_PORT, OBJ_PROCESS };
 typedef struct {
     int type, refs;
     int done, started; DWORD suspended, exit_code, tid; pthread_t pthread;     // thread
@@ -31,6 +37,7 @@ typedef struct {
     LONG count, max;                                                          // semaphore
     int kind; void *data; void (*destroy)(void *);                            // other modules' objects
     char *name;                                                               // named events, mutexes, semaphores
+    struct shared_state *sh;                                                  // a named object's state, shared between processes
     struct packet *packets, **packets_tail; int closed;                       // I/O completion port
 } vx_object;
 typedef struct packet { DWORD bytes, status; uint64_t key; void *overlapped; struct packet *next; } packet;
@@ -54,7 +61,111 @@ static int handle_index(HANDLE h) {
     intptr_t v = (intptr_t)h - HANDLE_BASE;
     return v >= 0 && v % 4 == 0 && v / 4 < MAX_HANDLES ? (int)(v / 4) : -1;
 }
-static vx_object *lookup(HANDLE h) { int i = handle_index(h); return i >= 0 ? g_handles[i] : NULL; }
+#define INJECT_BASE 0x20000
+#define INJECT_COUNT 4096
+static vx_object *g_injected[INJECT_COUNT];    // handles other processes gave this one (see DuplicateHandle)
+static vx_object *injected(HANDLE h);
+static vx_object *lookup(HANDLE h) {
+    int i = handle_index(h);
+    if (i >= 0) return g_handles[i];
+    return injected(h);
+}
+// ---- named objects between processes -----------------------------------------------------------------------------
+// A named event, mutex or semaphore keeps its state in POSIX shared memory named after the object's type and name
+// ("Local\\" and "Global\\" dropped), so every vxrt process opening the name shares it. A spin lock guards the
+// state; `seq` changes with every change, and waiters in other processes sleep on it (os_sync_wait_on_address,
+// shared) or poll it. `refs` counts the processes' objects; the last one removes the name.
+typedef struct shared_state {
+    volatile uint32_t magic, spin, seq;
+    int32_t type, manual, signaled, count, max;
+    volatile int32_t refs;
+    uint32_t owner, recursion;
+} shared_state;
+#define SHARED_MAGIC 0x56584f42u
+static void shared_name(const char *name, int type, char *out, size_t cap) {
+    if (!strncasecmp(name, "Local\\", 6)) name += 6;
+    else if (!strncasecmp(name, "Global\\", 7)) name += 7;
+    uint64_t h = 1469598103934665603ull ^ (uint64_t)type;
+    for (const char *c = name; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+    snprintf(out, cap, "/vxo.%016llx", (unsigned long long)h);
+}
+// Who holds a name: a registry of process IDs beside each named object or mapping ("/vxr.<hash>"). A name whose
+// holders have all ended (killed, crashed) is gone, as on Windows, even though its shared memory is still there.
+typedef struct { volatile uint32_t spin; int32_t pids[1000]; } name_registry;
+static name_registry *registry_open(const char *object_shm) {
+    char reg[40];
+    snprintf(reg, sizeof reg, "/vxr.%s", object_shm + 1);
+    int fd = shm_open(reg, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (!fstat(fd, &st) && st.st_size < (off_t)sizeof(name_registry)) ftruncate(fd, sizeof(name_registry));
+    name_registry *r = mmap(NULL, sizeof(name_registry), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    return r == MAP_FAILED ? NULL : r;
+}
+// Joins a name; returns how many holds of it there were (this process's earlier ones included) by live processes.
+int vx_name_join(const char *object_shm) {
+    name_registry *r = registry_open(object_shm);
+    if (!r) return 0;
+    while (__atomic_exchange_n(&r->spin, 1, __ATOMIC_ACQUIRE)) sched_yield();
+    int others = 0, me = getpid(), free_slot = -1;
+    for (int i = 0; i < 1000; i++) {
+        if (r->pids[i] && r->pids[i] != me && kill(r->pids[i], 0) && errno == ESRCH) r->pids[i] = 0;   // ended
+        if (!r->pids[i]) { if (free_slot < 0) free_slot = i; }
+        else others++;
+    }
+    if (free_slot >= 0) r->pids[free_slot] = me;
+    __atomic_store_n(&r->spin, 0, __ATOMIC_RELEASE);
+    munmap(r, sizeof *r);
+    return others;
+}
+// Leaves a name; returns 1 when no process holds it any more (the caller removes the object).
+int vx_name_leave(const char *object_shm) {
+    name_registry *r = registry_open(object_shm);
+    if (!r) return 1;
+    while (__atomic_exchange_n(&r->spin, 1, __ATOMIC_ACQUIRE)) sched_yield();
+    int me = getpid(), left = 0, removed = 0;
+    for (int i = 0; i < 1000; i++) {
+        if (r->pids[i] == me && !removed) { r->pids[i] = 0; removed = 1; continue; }
+        if (r->pids[i] && (r->pids[i] == me || !kill(r->pids[i], 0) || errno != ESRCH)) left++;
+    }
+    __atomic_store_n(&r->spin, 0, __ATOMIC_RELEASE);
+    munmap(r, sizeof *r);
+    if (!left) { char reg[40]; snprintf(reg, sizeof reg, "/vxr.%s", object_shm + 1); shm_unlink(reg); }
+    return !left;
+}
+// Attaches to the state of a name: created if `create` (and *existed says whether a live process holds it), else
+// only opened.
+static shared_state *shared_attach(const char *name, int type, int create, int *existed) {
+    char shm[40];
+    shared_name(name, type, shm, sizeof shm);
+    *existed = 0;
+    int others = vx_name_join(shm);
+    if (!others) shm_unlink(shm);                                  // left behind by processes that ended
+    if (!others && !create) { vx_name_leave(shm); return NULL; }
+    int fd = shm_open(shm, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) { fd = shm_open(shm, O_RDWR, 0600); if (fd >= 0) *existed = 1; }
+    if (fd < 0) { vx_name_leave(shm); return NULL; }
+    if (!*existed) ftruncate(fd, 4096);
+    shared_state *sh = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (sh == MAP_FAILED) { vx_name_leave(shm); return NULL; }
+    if (*existed) for (int i = 0; i < 100000 && __atomic_load_n(&sh->magic, __ATOMIC_ACQUIRE) != SHARED_MAGIC; i++) sched_yield();
+    return sh;
+}
+static void shared_detach(shared_state *sh, const char *name, int type) {
+    char shm[40];
+    shared_name(name, type, shm, sizeof shm);
+    if (vx_name_leave(shm)) shm_unlink(shm);
+    munmap(sh, 4096);
+}
+static void spin_lock(shared_state *sh) { while (__atomic_exchange_n(&sh->spin, 1, __ATOMIC_ACQUIRE)) sched_yield(); }
+static void spin_unlock(shared_state *sh) { __atomic_store_n(&sh->spin, 0, __ATOMIC_RELEASE); }
+static void shared_changed(shared_state *sh) {
+    __atomic_add_fetch(&sh->seq, 1, __ATOMIC_ACQ_REL);
+    if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&sh->seq, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+}
+
 // Named objects of this process, so a second Create/Open with the same name finds the first.
 static vx_object *g_named[1024];
 static int g_named_count;
@@ -70,6 +181,7 @@ static void unref(vx_object *o) {
     if (o->destroy) o->destroy(o->data);
     if (o->name) {
         for (int i = 0; i < g_named_count; i++) if (g_named[i] == o) { g_named[i] = g_named[--g_named_count]; break; }
+        if (o->sh) shared_detach(o->sh, o->name, o->type);
         free(o->name);
     }
     free(o);
@@ -150,6 +262,7 @@ static WINAPI HANDLE CreateThread(void *sa, size_t stack, DWORD (WINAPI *start)(
 static WINAPI void ExitThread(DWORD code) {
     if (t_exit_jump) { t_exit_code = code; longjmp(*t_exit_jump, 1); }
     fflush(stdout);
+    __asm__ volatile("movq $0, %%gs:0x60" ::: "memory");     // the PEB out of libc's localtime slot (see loader.c)
     pthread_exit(NULL);                        // the main thread: the process lives on while other threads run
 }
 
@@ -230,11 +343,60 @@ static WINAPI HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid) {
 // libraries); programs see the call fail.
 static WINAPI BOOL TerminateThread(HANDLE h, DWORD code) { (void)h; (void)code; vx_log("TerminateThread is not supported"); vx_set_last_error(5); return 0; }
 
+// ---- processes ------------------------------------------------------------------------------------------------------
+// Another process (a child this process started, or any running one opened by its ID): the object is signalled
+// when it ends. A thread waits for a child (its exit code), or polls for another process every 100 ms.
+typedef struct { vx_object *o; pid_t pid; int child; } process_watch;
+static void *watch_process(void *arg) {
+    process_watch *w = arg;
+    int status = 0;
+    DWORD code = 0;
+    if (w->child) {
+        while (waitpid(w->pid, &status, 0) < 0 && errno == EINTR) {}
+        code = WIFEXITED(status) ? (DWORD)WEXITSTATUS(status) : WIFSIGNALED(status) ? 0xC0000005u : 1;
+        if (vx_trace) vx_log("process %d ended: %s %d", (int)w->pid, WIFSIGNALED(status) ? "signal" : "exit code", WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
+    } else {
+        while (!kill(w->pid, 0) || errno != ESRCH) usleep(100000);
+    }
+    pthread_mutex_lock(&g_lock);
+    w->o->done = 1; w->o->exit_code = code;
+    unref(w->o);
+    pthread_cond_broadcast(&g_changed);
+    pthread_mutex_unlock(&g_lock);
+    free(w);
+    return NULL;
+}
+// A handle to a process (two, when `second` is asked for: the "thread" of a new process waits the same way).
+HANDLE vx_process_handle(int pid, int child, HANDLE *second) {
+    vx_object *o = new_object(OBJ_PROCESS);
+    o->tid = (DWORD)pid;
+    pthread_mutex_lock(&g_lock);
+    HANDLE h = new_handle(o);
+    if (second) *second = new_handle(o);
+    o->refs++;                                                    // the watcher's
+    pthread_mutex_unlock(&g_lock);
+    process_watch *w = malloc(sizeof *w);
+    w->o = o; w->pid = pid; w->child = child;
+    pthread_t t; pthread_attr_t a;
+    pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_attr_setstacksize(&a, 128 << 10);
+    pthread_create(&t, &a, watch_process, w);
+    pthread_attr_destroy(&a);
+    return h;
+}
+// The process ID and exit code behind a process handle (-1 for none).
+int vx_process_info(HANDLE h, DWORD *code) {
+    pthread_mutex_lock(&g_lock);
+    vx_object *o = lookup(h);
+    int pid = o && o->type == OBJ_PROCESS ? (int)o->tid : -1;
+    if (pid >= 0 && code) *code = o->done ? o->exit_code : STILL_ACTIVE;
+    pthread_mutex_unlock(&g_lock);
+    return pid;
+}
 static WINAPI HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid) {
     (void)access; (void)inherit;
     if (pid == (DWORD)getpid()) return (HANDLE)(intptr_t)-1;
-    vx_set_last_error(87 /* ERROR_INVALID_PARAMETER */);
-    return NULL;
+    if (!pid || kill((pid_t)pid, 0)) { vx_set_last_error(87 /* ERROR_INVALID_PARAMETER */); return NULL; }
+    return vx_process_handle((int)pid, 0, NULL);
 }
 
 // ---- events, mutexes, semaphores ----------------------------------------------------------------------------------
@@ -242,17 +404,36 @@ static WINAPI HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid) {
 static HANDLE create_named(vx_object *o, const char *name) {
     pthread_mutex_lock(&g_lock);
     vx_object *existing = name && *name ? find_named(name, o->type) : NULL;
+    int shared_existed = 0;
     if (existing) { free(o); o = existing; }
-    else if (name && *name && g_named_count < 1024) { o->name = strdup(name); g_named[g_named_count++] = o; }
+    else if (name && *name && g_named_count < 1024) {
+        o->name = strdup(name);
+        o->sh = shared_attach(name, o->type, 1, &shared_existed);
+        if (o->sh && !shared_existed) {                             // the first: this object's state goes in
+            o->sh->type = o->type; o->sh->manual = o->manual; o->sh->signaled = o->signaled;
+            o->sh->count = o->count; o->sh->max = o->max; o->sh->owner = o->owner; o->sh->recursion = o->recursion;
+            __atomic_store_n(&o->sh->magic, SHARED_MAGIC, __ATOMIC_RELEASE);
+        }
+        g_named[g_named_count++] = o;
+    }
     HANDLE h = new_handle(o);
     pthread_mutex_unlock(&g_lock);
     if (!h) { if (!existing) free(o); vx_set_last_error(4 /* ERROR_TOO_MANY_OPEN_FILES */); return NULL; }
-    vx_set_last_error(existing ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
+    vx_set_last_error(existing || shared_existed ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
     return h;
 }
 static HANDLE open_named(const char *name, int type) {
     pthread_mutex_lock(&g_lock);
     vx_object *o = name ? find_named(name, type) : NULL;
+    if (!o && name && *name && g_named_count < 1024) {             // another process's
+        int existed;
+        shared_state *sh = shared_attach(name, type, 0, &existed);
+        if (sh) {
+            o = new_object(type);
+            o->name = strdup(name); o->sh = sh; o->manual = sh->manual;
+            g_named[g_named_count++] = o;
+        }
+    }
     HANDLE h = o ? new_handle(o) : NULL;
     pthread_mutex_unlock(&g_lock);
     if (!o) vx_set_last_error(2 /* ERROR_FILE_NOT_FOUND */);
@@ -312,17 +493,29 @@ static BOOL modify(HANDLE h, int type, int (*change)(vx_object *, intptr_t), int
     if (r) vx_set_last_error((DWORD)r);
     return r == 0;
 }
-static int set_event(vx_object *o, intptr_t v) { o->signaled = (int)v; return 0; }
+static int set_event(vx_object *o, intptr_t v) {
+    if (o->sh) { spin_lock(o->sh); o->sh->signaled = (int)v; spin_unlock(o->sh); shared_changed(o->sh); return 0; }
+    o->signaled = (int)v;
+    return 0;
+}
 static WINAPI BOOL SetEvent(HANDLE h) { return modify(h, OBJ_EVENT, set_event, 1); }
 // For threads that are not Windows threads (Core Audio's): signals an event without touching a TEB.
 void vx_set_event(HANDLE h) {
     pthread_mutex_lock(&g_lock);
     vx_object *o = lookup(h);
-    if (o && o->type == OBJ_EVENT) { o->signaled = 1; pthread_cond_broadcast(&g_changed); }
+    if (o && o->type == OBJ_EVENT) { set_event(o, 1); pthread_cond_broadcast(&g_changed); }
     pthread_mutex_unlock(&g_lock);
 }
 static WINAPI BOOL ResetEvent(HANDLE h) { return modify(h, OBJ_EVENT, set_event, 0); }
 static int release_mutex(vx_object *o, intptr_t tid) {
+    if (o->sh) {
+        spin_lock(o->sh);
+        int err = o->sh->owner != (DWORD)tid ? 288 : 0;
+        if (!err && --o->sh->recursion == 0) o->sh->owner = 0;
+        spin_unlock(o->sh);
+        if (!err) shared_changed(o->sh);
+        return err;
+    }
     if (o->owner != (DWORD)tid) return 288;     // ERROR_NOT_OWNER
     if (--o->recursion == 0) o->owner = 0;
     return 0;
@@ -332,11 +525,20 @@ static WINAPI BOOL ReleaseMutex(HANDLE h) { return modify(h, OBJ_MUTEX, release_
 static WINAPI BOOL ReleaseSemaphore(HANDLE h, LONG n, LONG *previous) {
     pthread_mutex_lock(&g_lock);
     vx_object *o = lookup(h);
-    DWORD err = !o || o->type != OBJ_SEMAPHORE ? 6 : n <= 0 || o->count + n > o->max ? 298 /* ERROR_TOO_MANY_POSTS */ : 0;
-    if (!err) {
-        if (previous) *previous = o->count;
-        o->count += n;
-        pthread_cond_broadcast(&g_changed);
+    DWORD err = !o || o->type != OBJ_SEMAPHORE ? 6 : 0;
+    if (!err && o->sh) {
+        spin_lock(o->sh);
+        err = n <= 0 || o->sh->count + n > o->sh->max ? 298 : 0;
+        if (!err) { if (previous) *previous = o->sh->count; o->sh->count += n; }
+        spin_unlock(o->sh);
+        if (!err) { shared_changed(o->sh); pthread_cond_broadcast(&g_changed); }
+    } else if (!err) {
+        err = n <= 0 || o->count + n > o->max ? 298 /* ERROR_TOO_MANY_POSTS */ : 0;
+        if (!err) {
+            if (previous) *previous = o->count;
+            o->count += n;
+            pthread_cond_broadcast(&g_changed);
+        }
     }
     pthread_mutex_unlock(&g_lock);
     if (err) vx_set_last_error(err);
@@ -344,16 +546,33 @@ static WINAPI BOOL ReleaseSemaphore(HANDLE h, LONG n, LONG *previous) {
 }
 
 // ---- waiting ---------------------------------------------------------------------------------------------------------------
+static int shared_signaled(const shared_state *sh, int type, DWORD tid) {
+    switch (type) {
+    case OBJ_EVENT:     return sh->signaled;
+    case OBJ_MUTEX:     return !sh->owner || sh->owner == tid;
+    case OBJ_SEMAPHORE: return sh->count > 0;
+    }
+    return 0;
+}
+static void shared_take(shared_state *sh, int type, DWORD tid) {
+    if (type == OBJ_EVENT && !sh->manual) sh->signaled = 0;
+    else if (type == OBJ_MUTEX) { sh->owner = tid; sh->recursion++; }
+    else if (type == OBJ_SEMAPHORE) sh->count--;
+}
 static int is_signaled(const vx_object *o, DWORD tid) {
+    if (o->sh) return shared_signaled(o->sh, o->type, tid);         // a hint: try_acquire decides
     switch (o->type) {
-    case OBJ_THREAD:    return o->done;
+    case OBJ_THREAD: case OBJ_PROCESS: return o->done;
     case OBJ_EVENT:     return o->signaled;
     case OBJ_MUTEX:     return !o->owner || o->owner == tid;
     case OBJ_SEMAPHORE: return o->count > 0;
     }
     return 0;
 }
+// Takes the object if it is signalled (atomically for a shared object, which another process may take first).
+static int try_acquire(vx_object *o, DWORD tid);
 static void acquire(vx_object *o, DWORD tid) {
+    if (o->sh) { try_acquire(o, tid); return; }
     if (o->type == OBJ_EVENT && !o->manual) o->signaled = 0;
     else if (o->type == OBJ_MUTEX) { o->owner = tid; o->recursion++; }
     else if (o->type == OBJ_SEMAPHORE) o->count--;
@@ -366,6 +585,15 @@ static void deadline_after(struct timespec *ts, DWORD ms) {
     if (ts->tv_nsec >= 1000000000) { ts->tv_sec++; ts->tv_nsec -= 1000000000; }
 }
 
+static int try_acquire(vx_object *o, DWORD tid) {
+    if (!o->sh) { if (!is_signaled(o, tid)) return 0; acquire(o, tid); return 1; }
+    spin_lock(o->sh);
+    int ok = shared_signaled(o->sh, o->type, tid);
+    if (ok) shared_take(o->sh, o->type, tid);
+    spin_unlock(o->sh);
+    if (ok) shared_changed(o->sh);
+    return ok;
+}
 static WINAPI DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
     if (!n || n > 64) { vx_set_last_error(87); return WAIT_FAILED; }
     DWORD tid = vx_current_tid();
@@ -373,25 +601,67 @@ static WINAPI DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, 
     if (ms != INFINITE) deadline_after(&deadline, ms);
     vx_object *objs[64];
     pthread_mutex_lock(&g_lock);
+    int shared = 0;
     for (DWORD i = 0; i < n; i++) {
         objs[i] = lookup(hs[i]);
         if (!objs[i] && ((intptr_t)hs[i] == -1 || (intptr_t)hs[i] == -2)) objs[i] = &g_never;
         if (!objs[i]) { pthread_mutex_unlock(&g_lock); vx_set_last_error(6); return WAIT_FAILED; }
+        if (objs[i]->sh) shared = 1;
     }
     DWORD result;
     for (;;) {
+        uint32_t seen = n == 1 && objs[0]->sh ? __atomic_load_n(&objs[0]->sh->seq, __ATOMIC_ACQUIRE) : 0;
         if (all) {
             DWORD i = 0;
             while (i < n && is_signaled(objs[i], tid)) i++;
-            if (i == n) { for (i = 0; i < n; i++) acquire(objs[i], tid); result = 0; break; }
+            if (i == n) {
+                for (i = 0; i < n && try_acquire(objs[i], tid); i++) {}
+                if (i == n) { result = 0; break; }
+                // Another process took one first: put back what was taken (events and semaphores), wait again.
+                while (i--) {
+                    vx_object *o = objs[i];
+                    if (o->type == OBJ_SEMAPHORE) { if (o->sh) { spin_lock(o->sh); o->sh->count++; spin_unlock(o->sh); } else o->count++; }
+                    else if (o->type == OBJ_EVENT) set_event(o, 1);
+                    else if (o->type == OBJ_MUTEX) release_mutex(o, tid);
+                }
+            }
         } else {
             DWORD i = 0;
-            while (i < n && !is_signaled(objs[i], tid)) i++;
-            if (i < n) { acquire(objs[i], tid); result = i; break; }
+            while (i < n && !(is_signaled(objs[i], tid) && try_acquire(objs[i], tid))) i++;
+            if (i < n) { result = i; break; }
         }
         if (ms == 0) { result = WAIT_TIMEOUT; break; }
-        if (ms == INFINITE) pthread_cond_wait(&g_changed, &g_lock);
-        else if (pthread_cond_timedwait(&g_changed, &g_lock, &deadline) == ETIMEDOUT) { result = WAIT_TIMEOUT; break; }
+        struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+        if (ms != INFINITE && (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))) { result = WAIT_TIMEOUT; break; }
+        for (DWORD k = 0; k < n && !shared; k++) if (objs[k]->sh) shared = 1;   // made shareable while waiting
+        if (!shared) {
+            if (ms == INFINITE) pthread_cond_wait(&g_changed, &g_lock);
+            else if (pthread_cond_timedwait(&g_changed, &g_lock, &deadline) == ETIMEDOUT) { result = WAIT_TIMEOUT; break; }
+            continue;
+        }
+        // Another process may change a shared object: one shared object is waited on directly (up to 50 ms at a
+        // time); several, or a mix, are looked at again every millisecond.
+        int slept = 0;
+        if (n == 1) {
+            if (__builtin_available(macOS 14.4, *)) {
+                uint64_t left_ns = 50000000ull;
+                if (ms != INFINITE) {
+                    int64_t d = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000ll + (deadline.tv_nsec - now.tv_nsec);
+                    if (d < (int64_t)left_ns) left_ns = d > 0 ? (uint64_t)d : 1;
+                }
+                pthread_mutex_unlock(&g_lock);
+                os_sync_wait_on_address_with_timeout((void *)&objs[0]->sh->seq, seen, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+                                                     OS_CLOCK_MACH_ABSOLUTE_TIME, left_ns);
+                pthread_mutex_lock(&g_lock);
+                slept = 1;
+            }
+        }
+        if (!slept) {
+            struct timespec slice = now;
+            slice.tv_nsec += 1000000;
+            if (slice.tv_nsec >= 1000000000) { slice.tv_sec++; slice.tv_nsec -= 1000000000; }
+            pthread_cond_timedwait(&g_changed, &g_lock, &slice);
+        }
     }
     pthread_mutex_unlock(&g_lock);
     return result;
@@ -415,6 +685,10 @@ static WINAPI BOOL CloseHandle(HANDLE h) {
     int i = handle_index(h);
     vx_object *o = i >= 0 ? g_handles[i] : NULL;
     if (o) { g_handles[i] = NULL; unref(o); }
+    intptr_t k = ((intptr_t)h - INJECT_BASE) / 4;
+    if (!o && (intptr_t)h >= INJECT_BASE && k < INJECT_COUNT && !(((intptr_t)h - INJECT_BASE) % 4) && g_injected[k]) {
+        o = g_injected[k]; g_injected[k] = NULL; unref(o);
+    }
     pthread_mutex_unlock(&g_lock);
     if (o) return 1;
     int fd = vx_handle_fd(h);
@@ -443,8 +717,131 @@ void *vx_handle_data(HANDLE h, int kind) {
     return d;
 }
 
+// ---- handles given to other processes ------------------------------------------------------------------------------------
+// DuplicateHandle into another process: the object becomes shareable (an unnamed event, mutex or semaphore gets a
+// hidden name and moves its state to shared memory; a mapping is shared memory already), and an entry goes into
+// the other process's inbox ("/vxi.<pid>"): the handle value given back (0x20000 + 4 * entry) means that entry
+// there, and the other process makes it its object when it first uses the value.
+typedef struct { int32_t kind; int32_t type; uint64_t size; char name[48]; } inbox_entry;   // kind: 1 named object, 2 mapping, 3 process
+typedef struct { volatile uint32_t spin, next; inbox_entry e[INJECT_COUNT]; } inbox;
+static inbox *inbox_open(int pid) {
+    char name[40];
+    snprintf(name, sizeof name, "/vxi.%d", pid);
+    int fd = shm_open(name, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (!fstat(fd, &st) && st.st_size < (off_t)sizeof(inbox)) ftruncate(fd, sizeof(inbox));
+    inbox *b = mmap(NULL, sizeof(inbox), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    return b == MAP_FAILED ? NULL : b;
+}
+static inbox *g_my_inbox;
+void *vx_mapping_from_shm(const char *shm, uint64_t size, void (**destroy)(void *));   // files.c
+int vx_mapping_shm(HANDLE h, char *shm, size_t cap, uint64_t *size);                  // files.c
+static vx_object *injected(HANDLE h) {                           // with g_lock held
+    intptr_t v = (intptr_t)h - INJECT_BASE;
+    if (v < 0 || v % 4 || v / 4 >= INJECT_COUNT) return NULL;
+    int k = (int)(v / 4);
+    if (g_injected[k]) return g_injected[k];
+    if (!g_my_inbox) g_my_inbox = inbox_open(getpid());
+    if (!g_my_inbox) return NULL;
+    inbox_entry e = g_my_inbox->e[k];
+    vx_object *o = NULL;
+    if (e.kind == 1) {
+        o = find_named(e.name, e.type);
+        if (!o) {
+            int existed;
+            shared_state *sh = shared_attach(e.name, e.type, 0, &existed);
+            if (!sh) return NULL;
+            o = new_object(e.type);
+            o->name = strdup(e.name); o->sh = sh; o->manual = sh->manual;
+            if (g_named_count < 1024) g_named[g_named_count++] = o;
+        }
+    } else if (e.kind == 2) {
+        void (*destroy)(void *) = NULL;
+        void *data = vx_mapping_from_shm(e.name, e.size, &destroy);
+        if (!data) return NULL;
+        o = new_object(OBJ_OTHER);
+        o->kind = VX_HANDLE_MAPPING; o->data = data; o->destroy = destroy;
+    } else if (e.kind == 3) {
+        pthread_mutex_unlock(&g_lock);
+        HANDLE ph = vx_process_handle((int)e.size, 0, NULL);
+        pthread_mutex_lock(&g_lock);
+        int i = handle_index(ph);
+        o = i >= 0 ? g_handles[i] : NULL;
+        if (o) { o->refs++; g_handles[i] = NULL; unref(o); }      // keep the object, drop the extra handle
+    }
+    if (!o) return NULL;
+    o->refs++;
+    g_injected[k] = o;
+    if (vx_trace) vx_log("handle %#lx from another process: %s", (long)(intptr_t)h, e.kind == 2 ? "a mapping" : e.kind == 3 ? "a process" : e.name);
+    return o;
+}
+static unsigned g_hidden_names;
+// Makes a local event, mutex or semaphore shareable (with g_lock held).
+static int make_shareable(vx_object *o) {
+    if (o->sh) return 1;
+    if (o->type != OBJ_EVENT && o->type != OBJ_MUTEX && o->type != OBJ_SEMAPHORE) return 0;
+    char name[48];
+    snprintf(name, sizeof name, "__vxdup.%d.%u", (int)getpid(), ++g_hidden_names);
+    int existed;
+    shared_state *sh = shared_attach(name, o->type, 1, &existed);
+    if (!sh) return 0;
+    sh->type = o->type; sh->manual = o->manual; sh->signaled = o->signaled; sh->count = o->count; sh->max = o->max;
+    sh->owner = o->owner; sh->recursion = o->recursion;
+    __atomic_store_n(&sh->magic, SHARED_MAGIC, __ATOMIC_RELEASE);
+    free(o->name);
+    o->name = strdup(name); o->sh = sh;
+    if (g_named_count < 1024) g_named[g_named_count++] = o;
+    pthread_cond_broadcast(&g_changed);                           // waiters look at the shared state from now on
+    return 1;
+}
+static HANDLE give_to_process(int pid, HANDLE src) {
+    inbox_entry e = { 0 };
+    pthread_mutex_lock(&g_lock);
+    vx_object *o = lookup(src);
+    if (o && (o->type == OBJ_EVENT || o->type == OBJ_MUTEX || o->type == OBJ_SEMAPHORE) && make_shareable(o)) {
+        e.kind = 1; e.type = o->type; snprintf(e.name, sizeof e.name, "%s", o->name);
+    } else if (o && o->type == OBJ_PROCESS) {
+        e.kind = 3; e.size = o->tid;
+    } else if (o && o->type == OBJ_OTHER && o->kind == VX_HANDLE_MAPPING) {
+        pthread_mutex_unlock(&g_lock);
+        if (!vx_mapping_shm(src, e.name, sizeof e.name, &e.size)) { vx_set_last_error(50); return NULL; }
+        e.kind = 2;
+        pthread_mutex_lock(&g_lock);
+    } else if ((intptr_t)src == -1) {
+        e.kind = 3; e.size = (uint64_t)getpid();
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (!e.kind) { vx_log("DuplicateHandle: handle %p cannot go to another process yet", src); vx_set_last_error(50); return NULL; }
+    if (e.kind == 1) {                                             // held for the other process until it takes it
+        char shm[40];
+        shared_name(e.name, e.type, shm, sizeof shm);
+        vx_name_join(shm);
+    }
+    inbox *b = inbox_open(pid);
+    if (!b) { vx_set_last_error(8); return NULL; }
+    while (__atomic_exchange_n(&b->spin, 1, __ATOMIC_ACQUIRE)) sched_yield();
+    uint32_t k = b->next++ % INJECT_COUNT;
+    b->e[k] = e;
+    __atomic_store_n(&b->spin, 0, __ATOMIC_RELEASE);
+    munmap(b, sizeof *b);
+    if (vx_trace) vx_log("DuplicateHandle: %p to process %d as %#x", src, pid, INJECT_BASE + 4 * k);
+    return (HANDLE)(intptr_t)(INJECT_BASE + 4 * k);
+}
+int vx_process_info(HANDLE h, DWORD *code);
 static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_process, HANDLE *dst, DWORD access, BOOL inherit, DWORD options) {
-    (void)src_process; (void)dst_process; (void)access; (void)inherit;
+    (void)access; (void)inherit;
+    int src_pid = (intptr_t)src_process == -1 ? getpid() : vx_process_info(src_process, NULL);
+    int dst_pid = (intptr_t)dst_process == -1 ? getpid() : vx_process_info(dst_process, NULL);
+    if (src_pid != getpid()) { vx_log("DuplicateHandle from another process is not supported yet"); vx_set_last_error(50); return 0; }
+    if (dst_pid > 0 && dst_pid != getpid()) {
+        HANDLE h = give_to_process(dst_pid, src);
+        if (!h) return 0;
+        *dst = h;
+        if (options & 1 /* DUPLICATE_CLOSE_SOURCE */) CloseHandle(src);
+        return 1;
+    }
     if ((intptr_t)src == -1) { *dst = src; return 1; }
     pthread_mutex_lock(&g_lock);
     vx_object *o = (intptr_t)src == -2 ? self_object() : lookup(src);
@@ -720,14 +1117,29 @@ static WINAPI BOOL GetQueuedCompletionStatusEx(HANDLE port, OVERLAPPED_ENTRY *en
     if (!n) { vx_set_last_error(err); return 0; }
     return 1;
 }
-// Overlapped operations complete at once here, so their results are always ready.
-static WINAPI BOOL GetOverlappedResult(HANDLE file, const uint64_t *ov, DWORD *bytes, BOOL wait) {
-    (void)file; (void)wait;
+// Most overlapped operations complete at once here; those still running (pipes) hold STATUS_PENDING in Internal
+// until vx_io_completed fills it in.
+#define STATUS_PENDING 0x103
+static WINAPI DWORD WaitForSingleObject(HANDLE h, DWORD ms);
+static BOOL overlapped_result(HANDLE file, const volatile uint64_t *ov, DWORD *bytes, DWORD ms) {
+    (void)file;
+    if (__atomic_load_n(&ov[0], __ATOMIC_ACQUIRE) == STATUS_PENDING) {
+        if (!ms) { vx_set_last_error(996 /* ERROR_IO_INCOMPLETE */); return 0; }
+        HANDLE event = (HANDLE)((uintptr_t)*(HANDLE *)((uint8_t *)ov + 24) & ~(uintptr_t)1);
+        struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
+        while (__atomic_load_n(&ov[0], __ATOMIC_ACQUIRE) == STATUS_PENDING) {
+            if (event) WaitForSingleObject(event, 10); else usleep(500);
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            uint64_t elapsed = (uint64_t)(now.tv_sec - start.tv_sec) * 1000 + (uint64_t)((now.tv_nsec - start.tv_nsec) / 1000000);
+            if (ms != INFINITE && elapsed >= ms) { vx_set_last_error(WAIT_TIMEOUT); return 0; }
+        }
+    }
     *bytes = (DWORD)ov[1];
     if (ov[0]) { vx_set_last_error((DWORD)ov[0]); return 0; }
     return 1;
 }
-static WINAPI BOOL GetOverlappedResultEx(HANDLE file, const uint64_t *ov, DWORD *bytes, DWORD ms, BOOL alertable) { (void)ms; (void)alertable; return GetOverlappedResult(file, ov, bytes, 1); }
+static WINAPI BOOL GetOverlappedResult(HANDLE file, const uint64_t *ov, DWORD *bytes, BOOL wait) { return overlapped_result(file, ov, bytes, wait ? INFINITE : 0); }
+static WINAPI BOOL GetOverlappedResultEx(HANDLE file, const uint64_t *ov, DWORD *bytes, DWORD ms, BOOL alertable) { (void)alertable; return overlapped_result(file, ov, bytes, ms); }
 static WINAPI BOOL CancelIo(HANDLE file) { (void)file; return 1; }
 static WINAPI BOOL CancelIoEx(HANDLE file, void *ov) { (void)file; (void)ov; vx_set_last_error(1168 /* ERROR_NOT_FOUND */); return 0; }
 

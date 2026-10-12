@@ -234,7 +234,13 @@ static WINAPI DWORD GetSystemDirectoryW(WCHAR *buf, DWORD cap) { return vx_retur
 #define FILE_APPEND_DATA 0x4u
 #define INVALID_HANDLE   ((HANDLE)(intptr_t)-1)
 
-static HANDLE create_file(const char *name, DWORD access, DWORD disposition) {
+HANDLE vx_pipe_open(const char *name, DWORD flags);
+int vx_is_pipe_name(const char *name);
+int vx_pipe_read(HANDLE h, void *buf, DWORD n, DWORD *got, void *ov, BOOL *ok);
+int vx_pipe_peek(HANDLE h, void *buf, DWORD n, DWORD *got, DWORD *avail, DWORD *left);
+int vx_is_pipe(HANDLE h);
+static HANDLE create_file(const char *name, DWORD access, DWORD disposition, DWORD attrs) {
+    if (vx_is_pipe_name(name)) return vx_pipe_open(name, attrs);   // the client end of a named pipe (pipes.c)
     if (!strcasecmp(name, "CONOUT$")) return (HANDLE)(intptr_t)-11;
     if (!strcasecmp(name, "CONIN$")) return (HANDLE)(intptr_t)-10;
     char path[MAX_PATH_LEN];
@@ -270,13 +276,13 @@ static HANDLE create_file(const char *name, DWORD access, DWORD disposition) {
     return (HANDLE)(intptr_t)(0x10000 + fd);
 }
 static WINAPI HANDLE CreateFileA(const char *name, DWORD access, DWORD share, void *sa, DWORD disposition, DWORD flags, HANDLE tmpl) {
-    (void)share; (void)sa; (void)flags; (void)tmpl;
-    return create_file(name, access, disposition);
+    (void)share; (void)sa; (void)tmpl;
+    return create_file(name, access, disposition, flags);
 }
 static WINAPI HANDLE CreateFileW(const WCHAR *name, DWORD access, DWORD share, void *sa, DWORD disposition, DWORD flags, HANDLE tmpl) {
-    (void)share; (void)sa; (void)flags; (void)tmpl;
+    (void)share; (void)sa; (void)tmpl;
     WIDE_PATH(name, a);
-    HANDLE h = create_file(a, access, disposition);
+    HANDLE h = create_file(a, access, disposition, flags);
     free(a);
     return h;
 }
@@ -286,6 +292,8 @@ static WINAPI HANDLE CreateFileW(const WCHAR *name, DWORD access, DWORD share, v
 typedef struct { uint64_t internal, internal_high; DWORD offset, offset_high; HANDLE event; } OVERLAPPED;
 
 static WINAPI BOOL ReadFile(HANDLE h, void *buf, DWORD n, DWORD *got, OVERLAPPED *ov) {
+    BOOL piped;
+    if (vx_pipe_read(h, buf, n, got, ov, &piped)) return piped;
     int fd = vx_handle_fd(h);
     if (fd < 0) { vx_set_last_error(6); return 0; }
     ssize_t r = ov ? pread(fd, buf, n, (off_t)ov->offset | (off_t)ov->offset_high << 32) : read(fd, buf, n);
@@ -334,8 +342,9 @@ static WINAPI BOOL SetEndOfFile(HANDLE h) {
     if (pos < 0 || ftruncate(fd, pos)) { set_error_from_errno(); return 0; }
     return 1;
 }
-static WINAPI BOOL FlushFileBuffers(HANDLE h) { int fd = vx_handle_fd(h); return fd >= 0 && (fd <= 2 || fsync(fd) == 0); }
+static WINAPI BOOL FlushFileBuffers(HANDLE h) { if (vx_is_pipe(h)) return 1; int fd = vx_handle_fd(h); return fd >= 0 && (fd <= 2 || fsync(fd) == 0); }
 static WINAPI DWORD GetFileType(HANDLE h) {
+    if (vx_is_pipe(h)) return 3;                             // FILE_TYPE_PIPE
     struct stat st; int fd = vx_handle_fd(h);
     if (fd < 0 || fstat(fd, &st)) return 0;                  // FILE_TYPE_UNKNOWN
     if (S_ISCHR(st.st_mode)) return 2;                       // FILE_TYPE_CHAR
@@ -424,6 +433,7 @@ static WINAPI DWORD GetDriveTypeA(const char *root) {
 static WINAPI DWORD GetDriveTypeW(const WCHAR *root) { char r[4] = { root ? (char)root[0] : 0, root ? (char)root[1] : 0, 0, 0 }; return GetDriveTypeA(root ? r : NULL); }
 static WINAPI DWORD GetLogicalDrives(void) { return (1u << 2) | (1u << 25); }   // C: and Z:
 static WINAPI BOOL PeekNamedPipe(HANDLE h, void *buf, DWORD n, DWORD *got, DWORD *avail, DWORD *left) {
+    if (vx_pipe_peek(h, buf, n, got, avail, left)) return 1;
     int fd = vx_handle_fd(h), pending = 0;
     if (fd < 0 || ioctl(fd, FIONREAD, &pending) < 0) { vx_set_last_error(6); return 0; }
     if (got) *got = 0;
@@ -589,9 +599,11 @@ static WINAPI BOOL FindClose(HANDLE h) {
 // memory, named after a hash of the Windows name ("Local\\" and "Global\\" dropped) so that other processes
 // opening the same name share it.
 typedef struct { int fd; uint64_t size; int writable; char shm[40]; } mapping;   // shm: a name this process created
+int vx_name_join(const char *object_shm);
+int vx_name_leave(const char *object_shm);
 static void mapping_destroy(void *p) {
     mapping *m = p;
-    if (m->shm[0]) shm_unlink(m->shm);    // like Windows, the name goes away with its creator's last handle
+    if (m->shm[0] && vx_name_leave(m->shm)) shm_unlink(m->shm);   // like Windows, the name goes with its last holder
     close(m->fd);
     free(m);
 }
@@ -614,13 +626,18 @@ static HANDLE create_mapping(HANDLE file, DWORD protect, uint64_t size, const ch
     char created[40] = "";
     if (file == INVALID_HANDLE) {
         char shm[40];
-        if (name) shm_name(name, shm, sizeof shm);
-        else { static int counter; snprintf(shm, sizeof shm, "/vx.%d.%d", getpid(), __sync_fetch_and_add(&counter, 1)); }
+        if (name) {
+            shm_name(name, shm, sizeof shm);
+            if (!vx_name_join(shm)) shm_unlink(shm);               // left behind by processes that ended
+        } else {                                                   // unnamed: a private name, so a duplicate can share it
+            static int counter;
+            snprintf(shm, sizeof shm, "/vx.%d.%d", getpid(), __sync_fetch_and_add(&counter, 1));
+            vx_name_join(shm);
+        }
         fd = shm_open(shm, O_RDWR | O_CREAT | O_EXCL, 0600);
         if (fd < 0 && errno == EEXIST && name) { fd = shm_open(shm, O_RDWR, 0600); existed = 1; }
         if (fd < 0) { set_error_from_errno(); return NULL; }
-        if (!name) shm_unlink(shm);
-        else if (!existed) snprintf(created, sizeof created, "%s", shm);
+        snprintf(created, sizeof created, "%s", shm);              // every holder leaves the name when done
         struct stat st;
         if (!existed || (!fstat(fd, &st) && (uint64_t)st.st_size < size)) ftruncate(fd, (off_t)size);
         if (existed && !fstat(fd, &st)) size = (uint64_t)st.st_size;
@@ -650,14 +667,36 @@ static WINAPI HANDLE CreateFileMappingW(HANDLE file, void *sa, DWORD protect, DW
 static HANDLE open_mapping(const char *name) {
     char shm[40];
     shm_name(name, shm, sizeof shm);
+    if (!vx_name_join(shm)) { vx_name_leave(shm); shm_unlink(shm); vx_set_last_error(2); return NULL; }   // nobody holds it
     int fd = shm_open(shm, O_RDWR, 0600);
-    if (fd < 0) { vx_set_last_error(2); return NULL; }
+    if (fd < 0) { vx_name_leave(shm); vx_set_last_error(2); return NULL; }
     struct stat st; fstat(fd, &st);
     mapping *m = malloc(sizeof *m);
-    m->fd = fd; m->size = (uint64_t)st.st_size; m->writable = 1; m->shm[0] = 0;
+    m->fd = fd; m->size = (uint64_t)st.st_size; m->writable = 1;
+    snprintf(m->shm, sizeof m->shm, "%s", shm);                // this holder leaves the name when done
     HANDLE h = vx_handle_new(VX_HANDLE_MAPPING, m, mapping_destroy);
     if (!h) mapping_destroy(m);
     return h;
+}
+// For DuplicateHandle into another process (sync.c): the shared memory name of a mapping, and a mapping object
+// from such a name.
+int vx_mapping_shm(HANDLE h, char *shm, size_t cap, uint64_t *size) {
+    mapping *m = vx_handle_data(h, VX_HANDLE_MAPPING);
+    if (!m || !m->shm[0]) return 0;
+    snprintf(shm, cap, "%s", m->shm);
+    *size = m->size;
+    vx_name_join(m->shm);                                          // held for the other process until it closes it
+    return 1;
+}
+void *vx_mapping_from_shm(const char *shm, uint64_t size, void (**destroy)(void *)) {
+    int fd = shm_open(shm, O_RDWR, 0600);
+    if (fd < 0) return NULL;
+    mapping *m = malloc(sizeof *m);
+    m->fd = fd; m->size = size; m->writable = 1;
+    snprintf(m->shm, sizeof m->shm, "%s", shm);
+    vx_name_join(shm);
+    *destroy = mapping_destroy;
+    return m;
 }
 static WINAPI HANDLE OpenFileMappingA(DWORD access, BOOL inherit, const char *name) { (void)access; (void)inherit; return open_mapping(name); }
 static WINAPI HANDLE OpenFileMappingW(DWORD access, BOOL inherit, const WCHAR *name) {

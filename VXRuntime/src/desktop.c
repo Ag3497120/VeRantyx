@@ -316,6 +316,64 @@ static WINAPI BOOL HttpQueryInfoA(HANDLE h, DWORD level, void *buf, DWORD *n, DW
 // __chkstk: the stack probe compilers call before large frames. Program threads' stacks are mapped whole, so
 // there is nothing to touch (context.S: a bare return, keeping every register).
 void vx_chkstk(void);
+// ---- multimedia timers (winmm): a thread per timer, calling the program's callback (uID, msg, user, dw1, dw2) --------------
+typedef struct mm_timer { unsigned id, delay, periodic; void *cb; uintptr_t user; volatile int stop; struct mm_timer *next; } mm_timer;
+static pthread_mutex_t g_mm_lock = PTHREAD_MUTEX_INITIALIZER;
+static mm_timer *g_mm_timers;
+static unsigned g_mm_next = 1;
+static void *mm_thread(void *arg) {
+    mm_timer *t = arg;
+    vx_thread_attach();
+    do {
+        usleep((useconds_t)t->delay * 1000);
+        if (t->stop) break;
+        if (t->periodic & 0x100) {                               // TIME_CALLBACK_EVENT_SET / PULSE: an event handle
+            void (WINAPI *set)(HANDLE) = (void (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "SetEvent");
+            set(t->cb);
+        } else ((void (WINAPI *)(unsigned, unsigned, uintptr_t, uintptr_t, uintptr_t))t->cb)(t->id, 0, t->user, 0, 0);
+    } while ((t->periodic & 1) && !t->stop);
+    vx_thread_detach();
+    return NULL;
+}
+static WINAPI unsigned timeSetEvent(unsigned delay, unsigned resolution, void *cb, uintptr_t user, unsigned flags) {
+    (void)resolution;
+    mm_timer *t = calloc(1, sizeof *t);
+    t->delay = delay ? delay : 1; t->periodic = (flags & 1) | (flags & 0x30 ? 0x100 : 0); t->cb = cb; t->user = user;
+    pthread_mutex_lock(&g_mm_lock);
+    t->id = g_mm_next++; t->next = g_mm_timers; g_mm_timers = t;
+    pthread_mutex_unlock(&g_mm_lock);
+    pthread_t th; pthread_attr_t a;
+    pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_attr_setstacksize(&a, 1 << 20);
+    pthread_create(&th, &a, mm_thread, t);
+    pthread_attr_destroy(&a);
+    return t->id;
+}
+static WINAPI unsigned timeKillEvent(unsigned id) {
+    pthread_mutex_lock(&g_mm_lock);
+    mm_timer *t = g_mm_timers;
+    while (t && t->id != id) t = t->next;
+    if (t) t->stop = 1;                                         // the thread ends at its next wake-up (the record stays)
+    pthread_mutex_unlock(&g_mm_lock);
+    return t ? 0 : 97;                                          // MMSYSERR_INVALPARAM
+}
+// ---- Remote Desktop sessions (wtsapi32): there are none ---------------------------------------------------------------------
+static WINAPI BOOL WTSQuerySessionInformationA(HANDLE server, DWORD session, int cls, char **out, DWORD *n) { (void)server; (void)session; (void)cls; *out = NULL; *n = 0; vx_set_last_error(50); return 0; }
+static WINAPI BOOL WTSQuerySessionInformationW(HANDLE server, DWORD session, int cls, WCHAR **out, DWORD *n) { (void)server; (void)session; (void)cls; *out = NULL; *n = 0; vx_set_last_error(50); return 0; }
+static WINAPI void WTSFreeMemory(void *p) { free(p); }
+static WINAPI BOOL WTSRegisterSessionNotification(void *wnd, DWORD flags) { (void)wnd; (void)flags; return 1; }
+static WINAPI BOOL WTSUnRegisterSessionNotification(void *wnd) { (void)wnd; return 1; }
+static WINAPI BOOL AllowSetForegroundWindow(DWORD pid) { (void)pid; return 1; }
+// ---- OpenGL (opengl32): no contexts; programs that probe for GL interop find none ---------------------------------------
+static WINAPI void *wglGetCurrentContext(void) { return NULL; }
+static WINAPI void *wglGetCurrentDC(void) { return NULL; }
+static WINAPI void *wglCreateContext(void *dc) { (void)dc; vx_set_last_error(2000); return NULL; }
+static WINAPI BOOL wglMakeCurrent(void *dc, void *rc) { (void)dc; (void)rc; return rc == NULL; }
+static WINAPI BOOL wglDeleteContext(void *rc) { (void)rc; return 1; }
+static WINAPI BOOL wglShareLists(void *a, void *b) { (void)a; (void)b; return 0; }
+static WINAPI void *wglGetProcAddress(const char *name) { (void)name; return NULL; }
+static WINAPI unsigned glGetError(void) { return 0x502; }      // GL_INVALID_OPERATION: there is no context
+static WINAPI void gl_nothing(void) {}
+
 static const vx_export k32[] = {
     { "__chkstk", (void *)vx_chkstk }, VX_EXPORT(MulDiv), VX_EXPORT(IsDBCSLeadByte), VX_EXPORT(OutputDebugStringW), VX_EXPORT(FormatMessageW),
     VX_EXPORT(GetUserDefaultLCID), VX_EXPORT(GetSystemDefaultLCID), VX_EXPORT(GetUserDefaultLangID), VX_EXPORT(GetSystemDefaultLangID),
@@ -340,9 +398,14 @@ static const vx_export setupapi[] = {
     { "SetupDiEnumDeviceInfo", (void *)setupdi_none }, { "SetupDiEnumDeviceInterfaces", (void *)setupdi_none },
     { "SetupDiGetDeviceInterfaceDetailA", (void *)setupdi_none }, { "SetupDiGetDeviceInterfaceDetailW", (void *)setupdi_none },
     { "SetupDiGetDeviceRegistryPropertyA", (void *)setupdi_none }, { "SetupDiGetDeviceRegistryPropertyW", (void *)setupdi_none },
+    { "SetupDiBuildDriverInfoList", (void *)setupdi_none }, { "SetupDiClassGuidsFromNameW", (void *)setupdi_none },
+    { "SetupDiCreateDeviceInfoListExA", (void *)SetupDiGetClassDevsA }, { "SetupDiEnumDriverInfoA", (void *)setupdi_none },
+    { "SetupDiGetDeviceInstallParamsA", (void *)setupdi_none }, { "SetupDiGetDeviceInstanceIdA", (void *)setupdi_none },
+    { "SetupDiGetDriverInstallParamsA", (void *)setupdi_none }, { "SetupDiOpenDeviceInfoA", (void *)setupdi_none },
+    { "SetupDiSetDeviceInstallParamsA", (void *)setupdi_none },
 };
 static const vx_export user32[] = {
-    VX_EXPORT(SetPropW), VX_EXPORT(GetPropW), VX_EXPORT(RemovePropW), VX_EXPORT(SetPropA), VX_EXPORT(GetPropA), VX_EXPORT(RemovePropA),
+    VX_EXPORT(AllowSetForegroundWindow), VX_EXPORT(SetPropW), VX_EXPORT(GetPropW), VX_EXPORT(RemovePropW), VX_EXPORT(SetPropA), VX_EXPORT(GetPropA), VX_EXPORT(RemovePropA),
     VX_EXPORT(IsRectEmpty), VX_EXPORT(GetMessageExtraInfo), VX_EXPORT(WindowFromPoint), VX_EXPORT(GetTopWindow), VX_EXPORT(FlashWindow),
     VX_EXPORT(FlashWindowEx), VX_EXPORT(SetLayeredWindowAttributes), VX_EXPORT(SetWindowRgn), VX_EXPORT(WaitForInputIdle),
     VX_EXPORT(ToUnicode), VX_EXPORT(RegisterDeviceNotificationW), VX_EXPORT(RegisterDeviceNotificationA),
@@ -359,7 +422,7 @@ static const vx_export shell32[] = {
     VX_EXPORT(ExtractIconExW), VX_EXPORT(ExtractIconExA), VX_EXPORT(DragAcceptFiles), VX_EXPORT(DragFinish), VX_EXPORT(DragQueryFileW),
 };
 static const vx_export winmm[] = {
-    VX_EXPORT(waveOutGetErrorTextW),
+    VX_EXPORT(waveOutGetErrorTextW), VX_EXPORT(timeSetEvent), VX_EXPORT(timeKillEvent),
     { "waveOutGetDevCapsW", (void *)wave_caps }, { "waveOutGetDevCapsA", (void *)wave_caps }, { "waveInGetDevCapsW", (void *)wave_caps },
     { "waveInGetDevCapsA", (void *)wave_caps }, { "waveOutClose", (void *)wave_none },
     { "waveOutPrepareHeader", (void *)wave_none }, { "waveOutUnprepareHeader", (void *)wave_none }, { "waveOutWrite", (void *)wave_none },
@@ -375,7 +438,23 @@ static const vx_export wininet[] = {
     VX_EXPORT(InternetOpenA), VX_EXPORT(InternetOpenW), VX_EXPORT(InternetOpenUrlA), VX_EXPORT(InternetReadFile),
     VX_EXPORT(InternetCloseHandle), VX_EXPORT(InternetSetStatusCallback), VX_EXPORT(InternetCrackUrlA), VX_EXPORT(HttpQueryInfoA),
 };
+static const vx_export wtsapi32[] = {
+    VX_EXPORT(WTSQuerySessionInformationA), VX_EXPORT(WTSQuerySessionInformationW), VX_EXPORT(WTSFreeMemory),
+    VX_EXPORT(WTSRegisterSessionNotification), VX_EXPORT(WTSUnRegisterSessionNotification),
+};
+static const vx_export opengl32[] = {
+    VX_EXPORT(wglGetCurrentContext), VX_EXPORT(wglGetCurrentDC), VX_EXPORT(wglCreateContext), VX_EXPORT(wglMakeCurrent),
+    VX_EXPORT(wglDeleteContext), VX_EXPORT(wglShareLists), VX_EXPORT(wglGetProcAddress), VX_EXPORT(glGetError),
+    { "glBindTexture", (void *)gl_nothing }, { "glDeleteTextures", (void *)gl_nothing }, { "glDisable", (void *)gl_nothing },
+    { "glEnable", (void *)gl_nothing }, { "glFlush", (void *)gl_nothing }, { "glFinish", (void *)gl_nothing },
+    { "glGenTextures", (void *)gl_nothing }, { "glGetTexLevelParameteriv", (void *)gl_nothing }, { "glTexImage2D", (void *)gl_nothing },
+    { "glTexParameteri", (void *)gl_nothing }, { "glGetIntegerv", (void *)gl_nothing }, { "glGetTexImage", (void *)gl_nothing },
+    { "glPixelStorei", (void *)gl_nothing }, { "glGetString", (void *)wglGetCurrentContext }, { "glViewport", (void *)gl_nothing },
+    { "glClear", (void *)gl_nothing }, { "glClearColor", (void *)gl_nothing },
+};
 void vx_desktop_init(void) {
+    vx_register_module("wtsapi32.dll", wtsapi32, sizeof wtsapi32 / sizeof wtsapi32[0]);
+    vx_register_module("opengl32.dll", opengl32, sizeof opengl32 / sizeof opengl32[0]);
     vx_register_module("kernel32.dll", k32, sizeof k32 / sizeof k32[0]);
     vx_register_module("version.dll", version, sizeof version / sizeof version[0]);
     vx_register_module("setupapi.dll", setupapi, sizeof setupapi / sizeof setupapi[0]);
