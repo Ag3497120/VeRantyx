@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import CoreImage.CIFilterBuiltins
 import GloveboxKit
+import SteamLauncherKit
 
 /// Steam: scan a QR code with the Steam app on the phone, then Approve, the way the Steam app
 /// itself signs in. Account and password (then Approve) is the other way. It proves the player
@@ -11,6 +12,8 @@ struct SteamPage: View {
     @EnvironmentObject var steam: SteamAccount
     @State private var account = ""
     @State private var password = ""
+    /// Show Password: off until the player asks, and off again whenever Glovebox leaves the front.
+    @State private var reveal = false
     @FocusState private var focus: Field?
     enum Field { case account, password }
 
@@ -18,6 +21,12 @@ struct SteamPage: View {
         CardScreen { card }
             .onAppear {
                 if account.isEmpty { account = steam.accountName }
+                // The demo screens for the too-long note: a paste far longer than any password, hidden and shown.
+                if Demo.current == "steam-password-toolong" || Demo.current == "steam-password-revealed" {
+                    account = "gordon_freeman"
+                    password = String(repeating: "x", count: 300)
+                    reveal = Demo.current == "steam-password-revealed"
+                }
                 focus = account.isEmpty ? .account : .password
             }
             .task(id: steam.method == .qr && steam.step == .form) { steam.startQR() }
@@ -69,20 +78,32 @@ struct SteamPage: View {
 
     private var form: some View {
         StepCard(title: "Sign in to Steam", subtitle: "Steam may email you a code, or ask you to approve in the Steam app.") {
-            VStack(spacing: 10) {
-                TextField("Account name", text: $account)
-                    .textContentType(.username)
-                    .focused($focus, equals: .account)
-                    .onSubmit { focus = .password }
-                SecureField("Password", text: $password)
-                    .textContentType(.password)
-                    .focused($focus, equals: .password)
-                    .onSubmit(submit)
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(spacing: 10) {
+                    TextField("Account name", text: $account)
+                        .textContentType(.username)
+                        .focused($focus, equals: .account)
+                        .onSubmit { focus = .password }
+                    passwordField
+                }
+                .textFieldStyle(.roundedBorder)
+                .controlSize(.large)
+                // The Mac's own way to show a password (Wi-Fi's join sheet): a checkbox under the field. An eye
+                // inside the field sat on top of the text, which a rounded field can't keep clear of.
+                Toggle("Show password", isOn: Binding(get: { reveal }, set: { on in
+                    // Typing goes on in the field that takes its place.
+                    let typing = focus == .password
+                    reveal = on
+                    if typing { DispatchQueue.main.async { focus = .password } }
+                }))
+                .toggleStyle(.checkbox)
             }
-            .textFieldStyle(.roundedBorder)
-            .controlSize(.large)
             .disabled(steam.step == .working)
-            if let e = steam.error { CardError(text: e) }
+            if tooLong {
+                CardError(text: "The password is too long. Please make sure you entered it correctly.")
+            } else if let e = steam.error {
+                CardError(text: e)
+            }
         } footer: {
             Button("Use the QR code instead") { steam.useQR() }.textLink().disabled(steam.step == .working)
             Spacer()
@@ -91,14 +112,35 @@ struct SteamPage: View {
             }
             .primaryButton()
             .keyboardShortcut(.defaultAction)
-            .disabled(account.isEmpty || password.isEmpty || steam.step == .working)
+            .disabled(account.isEmpty || password.isEmpty || tooLong || steam.step == .working)
         }
     }
 
+    /// The password: dots unless the player asks to see it (Show password, under it). Shown, it's still a password
+    /// to the system: no autocorrect, and AutoFill knows it.
+    private var passwordField: some View {
+        Group {
+            if reveal {
+                TextField("Password", text: $password)
+                    .autocorrectionDisabled()
+            } else {
+                SecureField("Password", text: $password)
+            }
+        }
+        .textContentType(.password)
+        .focused($focus, equals: .password)
+        .onSubmit(submit)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in reveal = false }
+    }
+
+    /// More in the password field than any Steam password: shown as it happens, and Sign In waits.
+    private var tooLong: Bool { SteamAuth.passwordTooLong(password) }
+
     private func submit() {
-        guard !account.isEmpty, !password.isEmpty, steam.step != .working else { return }
+        guard !account.isEmpty, !password.isEmpty, !tooLong, steam.step != .working else { return }
         steam.signIn(account: account.trimmingCharacters(in: .whitespaces), password: password)
         password = ""
+        reveal = false
     }
 
     // MARK: Steam Guard

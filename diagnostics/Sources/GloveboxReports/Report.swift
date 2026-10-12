@@ -16,6 +16,13 @@ public struct Report: Codable {
     /// One "Preparing graphics" before Play (Documents/klfz/prewarm.log): when it began (unix time), how long it took,
     /// pipelines compiled, how many took over 100 ms, and its result (0, or -1/-2: it could not run).
     public struct Prep: Codable { public var at: Double; public var s: Double; public var n: Int; public var slow: Int; public var rc: Int }
+    /// How smoothly one minute of play ran (Documents/klfz/perf.txt, Klepton's heartbeat), and nothing else: seconds
+    /// since the game's first frame, game frames per second, display rate, thermal state (0 nominal .. 3 critical, -1
+    /// not known), MB left before the memory limit, footprint MB.
+    public struct Perf: Codable {
+        public var s: Double; public var fps: Double; public var hz: Double; public var heat: Int
+        public var avail: Int; public var foot: Int
+    }
     /// Any entry but a shader module: its 40-character name and its JSON (Vulkan state, no code).
     public struct Entry: Codable { public var n: String; public var j: String }
     /// A shader module: its JSON header and a fingerprint of its SPIR-V instead of the code.
@@ -29,7 +36,8 @@ public struct Report: Codable {
     public var entries: [Entry] = []
     public var modules: [Module] = []
     public var prep: [Prep] = []
-    public var isEmpty: Bool { hitches.isEmpty && entries.isEmpty && modules.isEmpty && prep.isEmpty }
+    public var perf: [Perf] = []
+    public var isEmpty: Bool { hitches.isEmpty && entries.isEmpty && modules.isEmpty && prep.isEmpty && perf.isEmpty }
 }
 
 /// Remembered between uploads: an anonymous install id, the next batch number, which recorded entries were sent,
@@ -40,8 +48,9 @@ public struct ReportState: Codable {
     public var sent: Set<String> = []
     public var slowOffset = 0
     public var prepOffset = 0
+    public var perfOffset = 0
 
-    enum CodingKeys: String, CodingKey { case install, seq, sent, slowOffset, prepOffset }
+    enum CodingKeys: String, CodingKey { case install, seq, sent, slowOffset, prepOffset, perfOffset }
     public init() {}
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -50,6 +59,7 @@ public struct ReportState: Codable {
         sent = try c.decode(Set<String>.self, forKey: .sent)
         slowOffset = try c.decode(Int.self, forKey: .slowOffset)
         prepOffset = try c.decodeIfPresent(Int.self, forKey: .prepOffset) ?? 0  // older state files have none
+        perfOffset = try c.decodeIfPresent(Int.self, forKey: .perfOffset) ?? 0
     }
 
     public static func load(_ url: URL) -> ReportState {
@@ -64,8 +74,8 @@ public struct ReportState: Codable {
 public enum ReportBuilder {
     /// The next report: every recorded entry not sent yet (up to `maxEntries`) and the hitch-log lines after the
     /// saved offset. Returns the report and the state to save once the upload succeeds.
-    public static func next(recording: URL, slowLog: URL, prewarmLog: URL? = nil, state: ReportState, app: Report.App,
-                            device: Report.Device, maxEntries: Int = 4000) throws -> (Report, ReportState) {
+    public static func next(recording: URL, slowLog: URL, prewarmLog: URL? = nil, perfLog: URL? = nil, state: ReportState,
+                            app: Report.App, device: Report.Device, maxEntries: Int = 4000) throws -> (Report, ReportState) {
         var st = state
         var r = Report(install: st.install, seq: st.seq, app: app, device: device)
         if let data = try? Data(contentsOf: recording, options: .mappedIfSafe) {
@@ -107,6 +117,19 @@ public enum ReportBuilder {
                     }
                 }
                 st.prepOffset += tail.distance(from: tail.startIndex, to: end) + 1
+            }
+        }
+        if let url = perfLog, let log = try? Data(contentsOf: url), log.count > st.perfOffset {
+            let tail = log[(log.startIndex + st.perfOffset)...]
+            if let end = tail.lastIndex(of: 0x0a), let text = String(data: tail[tail.startIndex ... end], encoding: .utf8) {
+                for line in text.split(separator: "\n") {
+                    let f = line.split(separator: " ")
+                    if f.count == 6, let s = Double(f[0]), let fps = Double(f[1]), let hz = Double(f[2]), let heat = Int(f[3]),
+                       let avail = Int(f[4]), let foot = Int(f[5]) {
+                        r.perf.append(.init(s: s, fps: fps, hz: hz, heat: heat, avail: avail, foot: foot))
+                    }
+                }
+                st.perfOffset += tail.distance(from: tail.startIndex, to: end) + 1
             }
         }
         st.seq += 1

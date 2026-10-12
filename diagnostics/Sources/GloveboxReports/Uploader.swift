@@ -123,7 +123,8 @@ public final class ReportUploader {
             guard let (report, next) = try? ReportBuilder.next(
                 recording: documents.appendingPathComponent("klfz/recorded.foz"),
                 slowLog: documents.appendingPathComponent("klfz/slow.txt"),
-                prewarmLog: documents.appendingPathComponent("klfz/prewarm.log"), state: state,
+                prewarmLog: documents.appendingPathComponent("klfz/prewarm.log"),
+                perfLog: documents.appendingPathComponent("klfz/perf.txt"), state: state,
                 app: .init(glovebox: info.glovebox ?? "dev", kit: info.kit ?? "dev"),
                 device: .init(model: Self.model, os: Self.osVersion)),
                 !report.isEmpty, let body = try? ReportBuilder.body(report)

@@ -1195,6 +1195,117 @@ void *kl_glibc_lookup(const char *name) {
     return resolve_plain(name);
 }
 
+// KL_GUEST_BIGALLOC_MMAP=<bytes> (test knob, memory): the guest's malloc family serves requests of <bytes> or more from
+// their own mmap and gives them back with munmap at free, so a freed big buffer (e.g. a texture streaming read) leaves
+// the footprint at once instead of staying in libmalloc's large-block cache (vmmap "Malloc Large (empty)"). Blocks are
+// page-aligned and tracked in a table; frees of anything else go to the host as before. Unset: nothing changes (the
+// names are not bound here).
+#include <sys/mman.h>
+#include <malloc/malloc.h>
+static size_t g_bm_th; static int g_bm_init;
+static size_t bm_th(void) {
+    if (!g_bm_init) { const char *e = getenv("KL_GUEST_BIGALLOC_MMAP"); g_bm_th = e ? (size_t)strtoull(e, NULL, 0) : 0; g_bm_init = 1;
+                      if (g_bm_th) fprintf(stderr, "[bigmm] guest allocations of %zu bytes or more come from mmap\n", g_bm_th); }
+    return g_bm_th;
+}
+enum { kBmSlots = 1 << 15 };
+static struct { void *p; size_t len; } g_bm[kBmSlots];
+static pthread_mutex_t g_bm_mu = PTHREAD_MUTEX_INITIALIZER;
+static size_t g_bm_live, g_bm_count, g_bm_total;
+static unsigned bm_h(void *p) { return (unsigned)(((uintptr_t)p >> 14) * 2654435761u) & (kBmSlots - 1); }
+static int bm_paged(void *p) { return !((uintptr_t)p & ((uintptr_t)getpagesize() - 1)); }
+static void *bm_alloc(size_t n) {
+    size_t pg = (size_t)getpagesize(), len = (n + pg - 1) & ~(pg - 1);
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    int ok = 0;
+    pthread_mutex_lock(&g_bm_mu);
+    unsigned h = bm_h(p);
+    for (unsigned k = 0; k < kBmSlots; k++, h = (h + 1) & (kBmSlots - 1))
+        if (!g_bm[h].p) { g_bm[h].p = p; g_bm[h].len = len; g_bm_live += len; g_bm_count++; g_bm_total++; ok = 1; break; }
+    size_t total = g_bm_total, live = g_bm_live;
+    pthread_mutex_unlock(&g_bm_mu);
+    if (!ok) { munmap(p, len); return NULL; }   // table full: the caller falls back to the host malloc
+    if (total <= 5 || (total & (total - 1)) == 0) fprintf(stderr, "[bigmm] #%zu: %zu KB (live %.0f MB)\n", total, n >> 10, live / 1048576.0);
+    return p;
+}
+static size_t bm_find(void *p) {
+    size_t len = 0;
+    pthread_mutex_lock(&g_bm_mu);
+    unsigned h = bm_h(p);
+    for (unsigned k = 0; k < kBmSlots && g_bm[h].p; k++, h = (h + 1) & (kBmSlots - 1)) if (g_bm[h].p == p) { len = g_bm[h].len; break; }
+    pthread_mutex_unlock(&g_bm_mu);
+    return len;
+}
+static size_t bm_take(void *p) {   // removes p from the table; returns its mapped length (0: not ours)
+    size_t len = 0;
+    pthread_mutex_lock(&g_bm_mu);
+    unsigned h = bm_h(p);
+    for (unsigned k = 0; k < kBmSlots && g_bm[h].p; k++, h = (h + 1) & (kBmSlots - 1))
+        if (g_bm[h].p == p) {
+            len = g_bm[h].len; g_bm_live -= len; g_bm_count--;
+            unsigned i = h;
+            for (;;) {   // backward-shift delete keeps the probe chains intact
+                unsigned j = (i + 1) & (kBmSlots - 1);
+                if (!g_bm[j].p) break;
+                unsigned want = bm_h(g_bm[j].p);
+                if (((j - want) & (kBmSlots - 1)) >= ((j - i) & (kBmSlots - 1))) { g_bm[i] = g_bm[j]; i = j; } else break;
+            }
+            g_bm[i].p = NULL; g_bm[i].len = 0;
+            break;
+        }
+    pthread_mutex_unlock(&g_bm_mu);
+    return len;
+}
+static void *bmw_malloc(size_t n) { if (n >= g_bm_th) { void *p = bm_alloc(n); if (p) return p; } return malloc(n); }
+static void bmw_free(void *p) {
+    if (!p) return;
+    if (bm_paged(p)) { size_t len = bm_take(p); if (len) { munmap(p, len); return; } }
+    free(p);
+}
+static void *bmw_calloc(size_t c, size_t n) {
+    if (n && c > SIZE_MAX / n) return NULL;
+    if (c * n >= g_bm_th) { void *p = bm_alloc(c * n); if (p) return p; }   // fresh anonymous pages are zero
+    return calloc(c, n);
+}
+static void *bmw_realloc(void *p, size_t n) {
+    if (!p) return bmw_malloc(n);
+    if (!n) { bmw_free(p); return NULL; }
+    size_t old = bm_paged(p) ? bm_find(p) : 0;
+    if (old) {
+        if (n <= old && n >= g_bm_th) return p;
+        void *q = bmw_malloc(n); if (!q) return NULL;
+        memcpy(q, p, n < old ? n : old); bmw_free(p); return q;
+    }
+    if (n >= g_bm_th) {
+        size_t os = malloc_size(p); void *q = bm_alloc(n);
+        if (q) { memcpy(q, p, n < os ? n : os); free(p); return q; }
+    }
+    return realloc(p, n);
+}
+static int bmw_posix_memalign(void **pp, size_t a, size_t n) {
+    if (n >= g_bm_th && a <= (size_t)getpagesize()) { void *p = bm_alloc(n); if (p) { *pp = p; return 0; } }
+    return posix_memalign(pp, a, n);
+}
+static void *bmw_memalign(size_t a, size_t n) { void *p = NULL; if (a < sizeof(void *)) a = sizeof(void *); return bmw_posix_memalign(&p, a, n) == 0 ? p : NULL; }
+static void *bmw_aligned_alloc(size_t a, size_t n) { return bmw_memalign(a, n); }
+static size_t bmw_usable(void *p) { if (!p) return 0; if (bm_paged(p)) { size_t l = bm_find(p); if (l) return l; } return malloc_size(p); }
+// C23 sized frees: the plain ones (g_free_sized) call the host free() directly, which would abort on a mapped block
+static void bmw_free_sized(void *p, size_t n) { (void)n; bmw_free(p); }
+static void bmw_free_aligned_sized(void *p, size_t a, size_t n) { (void)a; (void)n; bmw_free(p); }
+static void *bm_lookup(const char *name) {
+    static const struct { const char *n; void *f; } t[] = {
+        { "malloc", (void *)bmw_malloc }, { "free", (void *)bmw_free }, { "calloc", (void *)bmw_calloc },
+        { "realloc", (void *)bmw_realloc }, { "posix_memalign", (void *)bmw_posix_memalign },
+        { "memalign", (void *)bmw_memalign }, { "aligned_alloc", (void *)bmw_aligned_alloc },
+        { "malloc_usable_size", (void *)bmw_usable }, { "cfree", (void *)bmw_free },
+        { "free_sized", (void *)bmw_free_sized }, { "free_aligned_sized", (void *)bmw_free_aligned_sized },
+    };
+    if (!bm_th()) return NULL;
+    for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) if (!strcmp(t[i].n, name)) return t[i].f;
+    return NULL;
+}
+
 static void *resolve_plain(const char *name) {
     static int init;
     if (!init) { ctype_init(); locale_init(); tz_refresh(); init = 1;
@@ -1212,6 +1323,7 @@ static void *resolve_plain(const char *name) {
         if (p) return p;
     }
     if (!strncmp(name, "SDL_", 4)) { void *p = sdl_sym(name); if (p) return p; }
+    { void *bm = bm_lookup(name); if (bm) return bm; }
     if (getenv("KL_SPEW") && (!strcmp(name, "_Z10DevWarningPKcz") || !strcmp(name, "_Z6DevMsgPKcz") ||
                               !strcmp(name, "Warning") || !strcmp(name, "_Z7WarningPKcz")))
         return (void *)klg_devwarning;

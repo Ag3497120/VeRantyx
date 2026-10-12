@@ -206,12 +206,13 @@ static void alyx_msgbox(const char *title, const char *msg) {
     FILE *f = fopen(p, "w");
     if (f) { fprintf(f, "%s\n%s\n", title, msg); fclose(f); }
 }
-// Documents/alyx-env.txt and alyx-convars.lua when a test script pushed them, else the defaults bundled in the
-// app (alyx-demo/: the locked DEMO settings), plus the game folder's fidelity table, video settings and soname
-// placeholders when missing (runtime/linux/kl_alyx_app.c, shared with the Mac's m_alyx). What was applied and
-// where each file came from go into the boot log.
+// Documents/alyx-env.txt and alyx-convars.lua when a test script pushed them for this install (with GLOVEBOX_TEST=1;
+// kl_alyx_app_test_run), else the defaults bundled in the app (alyx-demo/: the locked DEMO settings), plus the game
+// folder's fidelity table, video settings and soname placeholders when missing (runtime/linux/kl_alyx_app.c, shared
+// with the Mac's m_alyx). What was applied and where each file came from go into the boot log.
 #include "linux/kl_alyx_app.h"
-static char g_envline[2048], g_filesline[384];
+static char g_envline[2048], g_filesline[512];
+int kl_app_test_run(const char *resources, const char *container) { return kl_alyx_app_test_run(resources, container); }
 #endif   // configure runs before the log opens; boot prints it
 int kl_app_configure(const char *resources, const char *container) {
     // Once per process: the launcher's "Preparing graphics" (kl_app_prewarm) configures before boot does, and a
@@ -222,6 +223,11 @@ int kl_app_configure(const char *resources, const char *container) {
 
 #ifdef KL_APP_ALYX
     snprintf(g_container, sizeof g_container, "%s", container);
+    // MoltenVK's folder (as below) before the app files, which read the GPU's ids through it for the video settings.
+    char mvkdir[1100];
+    snprintf(mvkdir, sizeof mvkdir, "%s/Frameworks", resources);
+    setenv("KL_MVK_DIR", mvkdir, 0);
+    kl_alyx_app_test_marker_required(1);   // a pushed file counts only for a test run (kl_app_test_run)
     kl_alyx_app_files(resources, container, g_envline, sizeof g_envline, g_filesline, sizeof g_filesline);
     // KL_VK_OUT (eye captures) relative to Documents, e.g. "captures".
     const char *vo = getenv("KL_VK_OUT");
@@ -573,6 +579,11 @@ static int open_log(void) {
         setvbuf(stderr, NULL, _IOLBF, 0);
         return 0;
     }
+    // The last run's log is kept beside it, once: a player who froze and relaunched has just started a new log,
+    // and the freeze's [stall] dump is in the one before it.
+    char prev[1100];
+    snprintf(prev, sizeof prev, "%.*s.prev.log", (int)strlen(g_log) - 4, g_log);
+    (void)rename(g_log, prev);
     if (!freopen(g_log, "w", stdout)) return 1;
     setvbuf(stdout, NULL, _IOLBF, 0);
     dup2(fileno(stdout), STDERR_FILENO);   // the guest's own writes(2) land here too
@@ -631,6 +642,53 @@ static long long kl_phys_footprint(void) {
     return (long long)info.phys_footprint;
 }
 
+// How smoothly the game ran, once a minute while it draws: a line in Documents/klfz/perf.txt that the opt-in stutter
+// reports carry (diagnostics/). No test session here runs past a few minutes, and a player saw the game, the hands
+// most, slow down after 15-20 (Oct 2026). Only how the game ran, as the opt-in card promises: seconds since the game's
+// first frame, game frames per second, display rate (poses offered per second), thermal state (0 nominal .. 3
+// critical, -1 not known), MB left before the memory limit, footprint MB. A minute with no poses offered (the
+// immersive space was down) is not written. The file stops at 1 MB, over 600 hours of play.
+static _Atomic int g_thermal = -1;
+void kl_app_note_thermal(int state) { g_thermal = state; }
+#ifdef KL_APP_ALYX
+unsigned long long kl_vulkan_frame_serial(void);   // kl_vulkan.c: guest frames so far (0 before the first)
+static uint64_t guest_published(void);             // below, beside g_guest
+
+static void perf_tick(void) {
+    static double t_first, last_t;
+    static unsigned long long last_serial;
+    static uint64_t last_pub;
+    static int full;
+    unsigned long long serial = kl_vulkan_frame_serial();
+    if (full || !serial) return;
+    struct timespec m;
+    clock_gettime(CLOCK_MONOTONIC, &m);
+    double t = m.tv_sec + m.tv_nsec * 1e-9;
+    uint64_t pub = guest_published();
+    if (!t_first) t_first = t;
+    else if (t - last_t < 60) return;
+    else if (pub != last_pub) {
+        char path[1100];
+        snprintf(path, sizeof path, "%s/klfz", g_container);
+        mkdir(path, 0755);
+        snprintf(path, sizeof path, "%s/klfz/perf.txt", g_container);
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > (1 << 20)) { full = 1; return; }
+        FILE *f = fopen(path, "a");
+        if (f) {
+            double dt = t - last_t;
+            fprintf(f, "%.0f %.1f %.1f %d %lld %lld\n", t - t_first,
+                    (double)(serial - last_serial) / dt, (double)(pub - last_pub) / dt, (int)g_thermal,
+                    kl_avail_memory() >> 20, kl_phys_footprint() >> 20);
+            fclose(f);
+        }
+    }
+    last_t = t; last_serial = serial; last_pub = pub;
+}
+#else
+static void perf_tick(void) {}
+#endif
+
 static void *heartbeat(void *arg) {
     (void)arg;
     // Polled faster than it prints, so a phase change is reported when it
@@ -668,6 +726,7 @@ static void *heartbeat(void *arg) {
             }
             last_phase = phase;
         }
+        perf_tick();
         ticks++;
         struct timespec iv = { 0, 250000000 };  // nanosleep: usleep is EINVAL at >= 1e6
         nanosleep(&iv, NULL);
@@ -1097,6 +1156,15 @@ static struct {
     int             finished;     // has it left its loop and written the report?
     pthread_t       thread;
 } g_guest = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+#ifdef KL_APP_ALYX
+static uint64_t guest_published(void) {
+    pthread_mutex_lock(&g_guest.mu);
+    uint64_t p = g_guest.published;
+    pthread_mutex_unlock(&g_guest.mu);
+    return p;
+}
+#endif
 
 int kl_app_guest_state(void) {
     pthread_mutex_lock(&g_guest.mu);

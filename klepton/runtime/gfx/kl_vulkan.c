@@ -60,6 +60,7 @@ void *kl_vulkan_lookup(const char *n) { (void)n; return NULL; }
 int   kl_vulkan_available(void) { return 0; }
 void  kl_vulkan_stats(unsigned *p, unsigned *c) { if (p) *p = 0; if (c) *c = 0; }
 int   kl_vulkan_guest_active(void) { return 0; }
+int   kl_vulkan_gpu_ids(unsigned *v, unsigned *d) { (void)v; (void)d; return 0; }
 unsigned long long kl_vulkan_eye_image(int s, int e, unsigned w, unsigned h, int srgb) {
     (void)s; (void)e; (void)w; (void)h; (void)srgb; return 0;
 }
@@ -1477,6 +1478,47 @@ int kl_vulkan_display_luid(uint8_t out[8]) {
     if (!g_display_luid_valid) return 0;
     memcpy(out, g_display_luid, 8);
     return 1;
+}
+
+// The GPU's Vulkan vendor and device ids, read before the guest has an instance (a throwaway one of our own): for
+// Alyx's video settings (kl_alyx_app.c), which the game throws away for its automatic setup unless the file's
+// VendorID/DeviceID equal the GPU's. MoltenVK's device id for an Apple GPU combines the OS version with the GPU
+// family (seen: 0x1B00020A on a Mac, 0x1B00000A on an M5 Vision Pro, both at OS 27.0), so it can change with an OS
+// update as well as differ between M2 and M5. Returns 1 and fills both, or 0 without MoltenVK.
+// Safe to call before the app has pointed KL_MVK_DIR at MoltenVK: a failed load here is forgotten, so the guest's
+// own first Vulkan call loads it again.
+int kl_vulkan_gpu_ids(unsigned *vendor, unsigned *device) {
+    int first = !g_init_done;
+    vk_init();
+    if (!g_avail) { if (first) g_init_done = 0; return 0; }
+    if (!vendor || !device) return 0;
+    PFN_vkCreateInstance ci = (PFN_vkCreateInstance)real_gipa(NULL, "vkCreateInstance");
+    if (!ci) return 0;
+    VkApplicationInfo app;
+    memset(&app, 0, sizeof app);
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.apiVersion = VK_API_VERSION_1_0;
+    VkInstanceCreateInfo info;
+    memset(&info, 0, sizeof info);
+    info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    info.pApplicationInfo = &app;
+    VkInstance inst = VK_NULL_HANDLE;
+    if (ci(&info, NULL, &inst) != VK_SUCCESS || !inst) return 0;
+    PFN_vkEnumeratePhysicalDevices en = (PFN_vkEnumeratePhysicalDevices)real_gipa(inst, "vkEnumeratePhysicalDevices");
+    PFN_vkGetPhysicalDeviceProperties gp = (PFN_vkGetPhysicalDeviceProperties)real_gipa(inst, "vkGetPhysicalDeviceProperties");
+    PFN_vkDestroyInstance di = (PFN_vkDestroyInstance)real_gipa(inst, "vkDestroyInstance");
+    uint32_t n = 1;
+    VkPhysicalDevice pd = VK_NULL_HANDLE;
+    int ok = 0;
+    if (en && gp && en(inst, &n, &pd) >= 0 && pd) {
+        VkPhysicalDeviceProperties pr;
+        gp(pd, &pr);
+        *vendor = pr.vendorID;
+        *device = pr.deviceID;
+        ok = 1;
+    }
+    if (di) di(inst, NULL);
+    return ok;
 }
 
 // The live instance's first physical device — the substitute for a guest that

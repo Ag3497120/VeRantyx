@@ -79,6 +79,9 @@ int kl_vulkan_guest_active(void);
 // instance exists and reports a valid LUID; returns 0 (out untouched) otherwise —
 // a GLES guest, where the adapter id must stay empty.
 int kl_vulkan_display_luid(uint8_t out[8]);
+// The GPU's Vulkan vendor and device ids, from a throwaway instance (usable before the guest makes its own): 1 and
+// both filled, or 0 without MoltenVK. For Alyx's video settings file (kl_alyx_app.c).
+int kl_vulkan_gpu_ids(unsigned *vendor, unsigned *device);
 
 // Create (or return) the eye image for a swapchain stage and eye. The returned
 // value is the VkImage handle widened to 64 bits, which is exactly what

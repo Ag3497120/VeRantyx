@@ -15,6 +15,9 @@ The headset side of the opt-in stutter reports. A Swift package the headset laun
     fingerprint and its size;
   - the hitch-log lines (`Documents/klfz/slow.txt`) not sent yet;
   - the "Preparing graphics" runs not sent yet (`Documents/klfz/prewarm.log`: when, how long, pipelines, over 100 ms);
+  - how smoothly each minute of play ran, not sent yet (`Documents/klfz/perf.txt`, written by Klepton: seconds into
+    the session, game frame rate, display rate, thermal state, memory left and used), to see how long sessions hold
+    up. Only how the game ran, as the opt-in card promises;
   - the headset model, visionOS version, Glovebox and kit versions;
   - an anonymous install id.
 - Uploads go to `https://glovebox-reports.vercel.app/api/report` (`reports/`).

@@ -9,16 +9,17 @@ let out = URL(fileURLWithPath: a[3])
 let stateURL = out.appendingPathComponent("state.json")
 var state = ReportState.load(stateURL)
 while true {
-    // prewarm.log beside the hitch log, as on the headset
+    // prewarm.log and perf.txt beside the hitch log, as on the headset
     let prewarm = URL(fileURLWithPath: a[2]).deletingLastPathComponent().appendingPathComponent("prewarm.log")
+    let perf = URL(fileURLWithPath: a[2]).deletingLastPathComponent().appendingPathComponent("perf.txt")
     let (r, next) = try ReportBuilder.next(recording: URL(fileURLWithPath: a[1]), slowLog: URL(fileURLWithPath: a[2]),
-                                           prewarmLog: prewarm, state: state, app: .init(glovebox: "reportctl", kit: "dev"),
+                                           prewarmLog: prewarm, perfLog: perf, state: state, app: .init(glovebox: "reportctl", kit: "dev"),
                                            device: .init(model: ReportUploader.model, os: ReportUploader.osVersion))
     if r.isEmpty { break }
     let body = try ReportBuilder.body(r)
     let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
     try enc.encode(r).write(to: out.appendingPathComponent("report-\(r.seq).json"))
-    print("report \(r.seq): \(r.entries.count) entries, \(r.modules.count) modules, \(r.hitches.count) hitches, \(r.prep.count) prep, \(body.count) bytes")
+    print("report \(r.seq): \(r.entries.count) entries, \(r.modules.count) modules, \(r.hitches.count) hitches, \(r.prep.count) prep, \(r.perf.count) perf, \(body.count) bytes")
     if a.contains("--upload") {
         var req = URLRequest(url: URL(string: "https://glovebox-reports.vercel.app/api/report")!)
         req.httpMethod = "POST"; req.httpBody = body

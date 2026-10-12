@@ -91,7 +91,7 @@ RUNTIME_HDRS := $(RUNTIME_ALL_HDRS) $(wildcard tests/*.h) \
                 runtime/data/phonon_hrtf_cipic_124.sofa \
                 runtime/data/kl_menu_font.ttf
 
-.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest
+.PHONY: all test clean check load vatest il2cpp boot jnislots x18 guest alyx-app
 all: build/t_opus
 
 build/t_opus: tests/t_opus.c $(RUNTIME) $(RUNTIME_HDRS)
@@ -455,6 +455,15 @@ build/t_ctr: tests/t_ctr.c runtime/kl_x18.c runtime/kl_x18.h runtime/kl_env.c
 ctr: build/t_ctr
 	./build/t_ctr
 
+# The Alyx app's settings files (fidelity table, video settings): written once per bundled version, the old file
+# kept, the player's later changes left alone. Plain files in a temporary folder; runs anywhere.
+build/t_alyx_app: tests/t_alyx_app.c runtime/linux/kl_alyx_app.c runtime/linux/kl_alyx_app.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/t_alyx_app.c runtime/linux/kl_alyx_app.c
+
+alyx-app: build/t_alyx_app
+	./build/t_alyx_app
+
 # The broadcast fan-out, driven through the shim's own sendto and aimed
 # at loopback, so it exercises the discovery path without putting 254 datagrams
 # on anyone's network. The path is otherwise reachable only from a live Qt
@@ -546,7 +555,8 @@ il2cpp: build/t_il2cpp
 # Each test writes to a log and is checked BEFORE the log is filtered. Piping a
 # test straight into tail/grep would hand make the filter's exit status instead
 # of the test's, so a failing test would leave the sweep green.
-check: build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+check: build/t_alyx_app build/t_opus build/t_variadic build/t_load build/t_il2cpp build/m_boot build/t_haptics build/t_hevc build/t_xrspace build/t_xrinput build/t_softinput build/t_ctr build/t_bcast build/t_fault build/t_glcaps
+	@echo "=== alyx app files ===" && ./build/t_alyx_app
 	@echo "=== variadic ABI ===" && ./build/t_variadic
 	@echo "=== crash reporter ===" && ./build/t_fault
 	@echo "=== GL limits vs ANGLE ===" && ./build/t_glcaps vendor/out/Debug

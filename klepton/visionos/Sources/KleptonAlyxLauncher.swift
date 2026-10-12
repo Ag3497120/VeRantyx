@@ -8,16 +8,18 @@ import SteamLauncherKit
 // Play hands over to BootView, which starts the game exactly as an icon launch of the plain app does — configure,
 // boot, the .mixed immersive space, and this window closed behind it.
 //
-// Straight to the game, no launcher, when a test script pushed Documents/alyx-env.txt (tools/alyx-test/morning.sh,
-// device-batch.sh) or with the launch argument -klgame (KL_GAME=1); -launcher (KL_LAUNCHER=1) shows the launcher
-// even then.
+// Straight to the game, no launcher, for a test run: a test script's Documents/alyx-env.txt with the line
+// GLOVEBOX_TEST=1, pushed for this install (tools/alyx-test/morning.sh, device-batch.sh; kl_app_test_run),
+// or the launch argument -klgame (KL_GAME=1); -launcher (KL_LAUNCHER=1) shows the launcher even then. Any other pushed
+// file is an old test's: it never skips the launcher (one left a headset without cloud sync, 2026-10-12), and
+// kl_alyx_app.c sets it aside at boot.
 
 enum AlyxLauncherGate {
     static let skip: Bool = {
         let args = ProcessInfo.processInfo.arguments
         if args.contains("-launcher") || klEnvOn("KL_LAUNCHER", default: false) { return false }
         if args.contains("-klgame") || klEnvOn("KL_GAME", default: false) { return true }
-        return FileManager.default.fileExists(atPath: Paths.container + "/alyx-env.txt")
+        return kl_app_test_run(Paths.resources, Paths.container) != 0
     }()
 }
 
@@ -100,7 +102,8 @@ struct AlyxLauncherScreens: View {
         }
     }
 
-    /// LibraryView's Play button runs model.play(onPlay) itself: saves sync first (at most ~15 s), then this.
+    /// LibraryView's Play button runs model.play(onPlay) itself: the latest saves first (usually a quick look at the
+    /// cloud; a stalled sync is cut off after 10 s), then this.
     private func play() {
         NSLog("[launcher] Play: saves synced, starting the game")
         Lifecycle.gameStarted = true

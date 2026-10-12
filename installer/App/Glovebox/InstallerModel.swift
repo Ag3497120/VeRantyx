@@ -612,7 +612,7 @@ final class InstallerModel: ObservableObject {
             }
             if Task.isCancelled { return }
         }
-        if needsBuild, let team = setup.team?.id, !(await readyToSign(team)) { return }
+        if needsBuild, let team = setup.team?.id, !(await readyToSign(team, logs: engine.logs)) { return }
         // The headset asleep, locked or out of range: wait for it, then go on from the same step.
         while true {
             if needsBuild {
@@ -669,8 +669,20 @@ final class InstallerModel: ObservableObject {
     /// Mac's password and Always Allow. The build signs ~94 files at once and each of them would ask, so that
     /// one question comes first, alone, and the build starts only once codesign may use the key. A key
     /// xcodebuild made, or one already allowed, asks nothing and shows nothing here (SigningKeyAccess).
-    private func readyToSign(_ team: String) async -> Bool {
-        let key = SigningKey.check(team: team)
+    private func readyToSign(_ team: String, logs: URL) async -> Bool {
+        var key = SigningKey.check(team: team)
+        // Apple's intermediate certificate isn't on this Mac: codesign can't use the key at all and macOS never asks
+        // (glovebox-vr/glovebox#4). Put it there first; only if that fails is there something to tell the player.
+        if let identity = key.identity, let generation = SigningKey.missingIssuer(identity: identity) {
+            let added = await SigningKey.addIssuer(generation, identity: identity)
+            let log = Self.signingLog(in: logs, lines: ["certificate \(identity) has no chain: Apple's \(generation) intermediate is missing",
+                                                        added.note, SigningKey.describe(identity: identity)])
+            guard added.ok else {
+                await failed(EngineError(code: "signing-certificate-missing", stage: .build, message: added.note, log: log?.path))
+                return false
+            }
+            key = SigningKey.check(team: team)
+        }
         guard key.access == .willAsk, let identity = key.identity else { return true }
         signingAsked = signingExplained
         appear { allowingSigning = true }
@@ -682,15 +694,38 @@ final class InstallerModel: ObservableObject {
         // The card shows the click first; then the guide points at Always Allow in macOS's window.
         try? await Task.sleep(nanoseconds: 300_000_000)
         if !Task.isCancelled { guide.start(.keychain) }
-        let code = Task.isCancelled ? 1 : await SigningKey.signOnce(with: identity)
+        let signed = Task.isCancelled ? (status: Int32(1), output: "") : await SigningKey.signOnce(with: identity)
         let allowed = !Task.isCancelled && SigningKey.check(team: team).access != .willAsk
         guide.keychainAnswered(allowed: allowed)
         withAnimation { allowingSigning = false; signingAsked = false }
         if Task.isCancelled { return false }
         if allowed { return true }
-        // Allow (not Always Allow) signs the one file and leaves the key as it was.
-        await failed(EngineError(code: code == 0 ? "signing-allowed-once" : "signing-not-allowed", stage: .build))
+        // Allow (not Always Allow) signs the one file and leaves the key as it was. Anything else, the player
+        // said no or codesign couldn't use the key at all (then macOS never asked): its own words go in a log
+        // that Copy Diagnostics shows.
+        let log = Self.signingLog(in: logs, identity: identity, signed: signed)
+        await failed(EngineError(code: signed.status == 0 ? "signing-allowed-once" : "signing-not-allowed", stage: .build,
+                                 message: signed.status == 0 ? nil : signed.output.split(separator: "\n").last.map(String.init),
+                                 log: log?.path))
         return false
+    }
+
+    /// What the one signature tried and what codesign said, for Copy Diagnostics.
+    private static func signingLog(in folder: URL, identity: String, signed: (status: Int32, output: String)) -> URL? {
+        signingLog(in: folder, lines: ["$ /usr/bin/codesign --force --sign \(identity) --timestamp=none <scratch file>",
+                                       signed.output, "exit \(signed.status)", SigningKey.describe(identity: identity)])
+    }
+
+    private static func signingLog(in folder: URL, lines: [String]) -> URL? {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        let url = folder.appendingPathComponent("signing-\(f.string(from: Date())).log")
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try (lines + [""]).joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        } catch { return nil }
+        return url
     }
 
     private func follow(_ run: EngineRun?) async -> Outcome {

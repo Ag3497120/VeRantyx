@@ -212,6 +212,7 @@ final class SteamAccount: ObservableObject {
             if r == .expired { return "The request expired. Try again." }
             if r == .rateLimitExceeded { return "Too many tries. Wait a few minutes." }
         }
+        if (error as? SteamError) == .passwordTooLong { return SteamError.passwordTooLong.description }
         if (error as? URLError) != nil || (error as? SteamError) == .disconnected || (error as? SteamError) == .notConnected {
             return "Can't reach Steam. Check your internet connection."
         }

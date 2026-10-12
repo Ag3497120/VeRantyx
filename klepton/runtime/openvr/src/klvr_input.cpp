@@ -127,6 +127,8 @@ struct Action {
     std::vector<Binding> bindings;
     State state[3];              // [0] any hand, [1] left only, [2] right only
     bool read_logged = false;    // KLVR_TRACE_ACTIONS: this press was read by the game
+    bool pressed_said = false;   // always logged, once: the first press, and the first time the game read one, which
+    bool read_said = false;      // Share Diagnostics carries, so a dead button shows where its press stopped
     bool analog_polled = false;  // KLVR_TRACE_ACTIONS: the game has polled this analog action
     bool analog_on = false;      // ...and has read it deflected since it was last at rest
     int callers_shown = 0;       // KLVR_TRACE_CALLERS
@@ -139,6 +141,16 @@ std::vector<Action> g_actions;
 std::vector<ActionSet> g_sets;
 std::vector<std::string> g_sources = { "", "/user/hand/left", "/user/hand/right", "/user/head" };
 vr::ETrackedControllerRole g_dominant = vr::TrackedControllerRole_RightHand;
+// The dominant hand as of the last UpdateActionState (openvr.h: "The dominant hand will only change after a call to
+// UpdateActionState"). Alyx ships only right-handed binding files (Fire on the right trigger in every variant), enables
+// every set for both hands, and with its Weapon Hand set to left calls SetDominantHand(LeftHand) and fires on Fire
+// from whichever hand reports it (traced on the Mac, 2026-10-11). So SteamVR must drive the bindings written for one
+// hand's controls from the other controller, and so does this: buttons, triggers, sticks and haptics. Poses and
+// skeletons stay with their own controllers, as do the hands a query names (restrict_to) and the origins reported:
+// the game moves the gun to the left hand itself and keeps its per-hand state by controller.
+bool g_mirror = false;
+// The controller that drives a component or haptic binding.
+int driven_by(const Binding &b) { return g_mirror ? b.hand ^ 1 : b.hand; }
 std::string g_manifest_dir;
 std::atomic<bool> g_uses_input{false};  // an action manifest is set: no legacy input (legacy_controller_state)
 double g_last_update = 0;
@@ -413,23 +425,24 @@ void update_locked(const uint8_t set_hands[]) {
             nw.update_time = st.update_time;
             for (auto &b : a.bindings) {
                 if (!set_on) break;
-                if (slot && b.hand != slot - 1) continue;
-                if (!(hands & (1u << b.hand))) continue;
-                if (!ctl[b.hand].connected) continue;
+                int hand = driven_by(b);
+                if (slot && hand != slot - 1) continue;
+                if (!(hands & (1u << hand))) continue;
+                if (!ctl[hand].connected) continue;
                 nw.active = true;
                 if (a.type == A_Boolean) {
-                    if (eval_digital(b, ctl[b.hand]) && !nw.bstate) {
+                    if (eval_digital(b, ctl[hand]) && !nw.bstate) {
                         nw.bstate = true;
-                        nw.origin = b.hand ? kRight : kLeft;
+                        nw.origin = hand ? kRight : kLeft;
                     }
                 } else {
                     float v[3];
-                    eval_analog(b, ctl[b.hand], v);
+                    eval_analog(b, ctl[hand], v);
                     float mag = std::fabs(v[0]) + std::fabs(v[1]) + std::fabs(v[2]);
                     float cur = std::fabs(nw.v[0]) + std::fabs(nw.v[1]) + std::fabs(nw.v[2]);
                     if (mag > cur || !nw.origin) {
                         memcpy(nw.v, v, sizeof v);
-                        nw.origin = b.hand ? kRight : kLeft;
+                        nw.origin = hand ? kRight : kLeft;
                     }
                 }
             }
@@ -441,6 +454,11 @@ void update_locked(const uint8_t set_hands[]) {
             }
             if (nw.changed) nw.update_time = now;
             if (!nw.origin) nw.origin = st.origin;
+            if (slot == 0 && a.type == A_Boolean && nw.bstate && !a.pressed_said) {
+                a.pressed_said = true;
+                logf("action %s pressed for the first time (%s controller)", a.name.c_str(),
+                     nw.origin == kRight ? "right" : "left");
+            }
             if (slot == 0 && trace_actions()) {
                 if (a.type == A_Boolean && nw.changed)
                     logf("action %s = %d (%s)", a.name.c_str(), nw.bstate, nw.origin == kRight ? "right" : "left");
@@ -675,6 +693,13 @@ vr::EVRInputError IVRInput__UpdateActionState(void *, vr::VRActiveActionSet_t *s
         }
         logf("active action sets:%s", line.empty() ? " none" : line.c_str());
     }
+    bool mirror = g_dominant == vr::TrackedControllerRole_LeftHand;
+    if (mirror != g_mirror) {
+        g_mirror = mirror;
+        logf("dominant hand: %s", mirror ? "left: each hand's buttons, triggers, sticks and haptics are driven by the "
+                                           "other controller; poses stay with their controllers"
+                                         : "right: bindings as written");
+    }
     update_locked(hands.data());
     return vr::VRInputError_None;
 }
@@ -696,6 +721,10 @@ vr::EVRInputError IVRInput__GetDigitalActionData(void *, vr::VRActionHandle_t h,
     out->bState = s.bstate;
     out->bChanged = s.changed;
     out->fUpdateTime = s.update_time ? (float)(s.update_time - klvr_plat_now()) : 0.0f;
+    if (s.bstate && !a->read_said) {
+        a->read_said = true;
+        logf("game read %s as pressed for the first time (restrict %llu)", a->name.c_str(), (unsigned long long)restrict_to);
+    }
     if (s.bstate && !a->read_logged && trace_actions()) {
         a->read_logged = true;
         logf("game read %s = 1 (restrict %llu)", a->name.c_str(), (unsigned long long)restrict_to);
@@ -966,9 +995,10 @@ vr::EVRInputError IVRInput__TriggerHapticVibrationAction(void *, vr::VRActionHan
         if (!a) return vr::VRInputError_InvalidHandle;
         if (a->type != A_Vibration && a->type != A_Unknown) return vr::VRInputError_WrongType;
         for (auto &b : a->bindings) {
-            if (restrict_to == kLeft && b.hand != 0) continue;
-            if (restrict_to == kRight && b.hand != 1) continue;
-            if (std::find(hands.begin(), hands.end(), b.hand) == hands.end()) hands.push_back(b.hand);
+            int hand = driven_by(b);
+            if (restrict_to == kLeft && hand != 0) continue;
+            if (restrict_to == kRight && hand != 1) continue;
+            if (std::find(hands.begin(), hands.end(), hand) == hands.end()) hands.push_back(hand);
         }
     }
     if (start > 0.001f) {
@@ -989,7 +1019,7 @@ vr::EVRInputError IVRInput__GetActionOrigins(void *, vr::VRActionSetHandle_t, vr
     uint32_t n = 0;
     for (int hand = 0; hand < 2; hand++)
         for (auto &b : a->bindings)
-            if (b.hand == hand) { if (out && n < count) out[n] = hand ? kRight : kLeft; n++; break; }
+            if (driven_by(b) == hand) { if (out && n < count) out[n] = hand ? kRight : kLeft; n++; break; }
     return vr::VRInputError_None;
 }
 

@@ -43,3 +43,27 @@ public enum SigningKeyAccess: String, Equatable, Sendable {
         return plist["Partitions"] as? [String]
     }
 }
+
+/// Apple's developer intermediate certificate ("Apple Worldwide Developer Relations Certification Authority", one per
+/// generation, G2 to G6), which Xcode normally puts on the Mac. Without the one that issued the team's certificate,
+/// codesign can't build the chain and fails before macOS ever asks for the password ("unable to build chain to
+/// self-signed root", errSecInternalComponent), and `security find-identity -v` lists no valid identity
+/// (glovebox-vr/glovebox#4). Apple publishes each at apple.com/certificateauthority.
+public enum AppleIntermediate {
+    public static let issuerName = "Apple Worldwide Developer Relations Certification Authority"
+
+    /// The generation ("G3") from a certificate's issuer, when Apple's developer intermediate issued it.
+    public static func generation(issuerCommonName cn: String?, unit ou: String?) -> String? {
+        guard cn == issuerName, let ou, isGeneration(ou) else { return nil }
+        return ou
+    }
+
+    /// Where Apple publishes that generation.
+    public static func url(generation g: String) -> URL? {
+        isGeneration(g) ? URL(string: "https://www.apple.com/certificateauthority/AppleWWDRCA\(g).cer") : nil
+    }
+
+    private static func isGeneration(_ s: String) -> Bool {
+        s.range(of: #"^G[0-9]{1,2}$"#, options: .regularExpression) != nil
+    }
+}

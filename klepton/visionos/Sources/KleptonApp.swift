@@ -159,14 +159,15 @@ enum Lifecycle {
             return
         }
         NSLog("[app] backgrounded — exiting (KL_EXIT_ON_BACKGROUND)")
-        // Flush before exit rather than relying on it. The guest's log is a
-        // file in the container (kl_app.c redirects stdout/stderr there) and it
-        // is the only account of the run that survives; `exit` does flush
-        // stdio, but it also runs atexit handlers and static destructors inside
-        // a guest whose threads are still live, and one of those blocking would
-        // turn a clean exit into a watchdog kill with a truncated log.
+        // Flush, then `_exit`: the guest's log is a file in the container
+        // (kl_app.c redirects stdout/stderr there) and it is the only account
+        // of the run that survives. `exit` would also run atexit handlers and
+        // static destructors while the guest's threads are still live, and a
+        // render thread submitting a frame into a destroyed object faults (seen
+        // in klvr's eye copy) or aborts on a destroyed mutex. The game's own
+        // Quit ends the same way, with `_exit(0)`; the system reclaims the rest.
         fflush(nil)
-        exit(0)
+        _exit(0)
     }
 }
 

@@ -129,7 +129,7 @@ case "$cmd" in
     step runtime 4 "41 runtime libraries" "curl failed"
     step game 1 "$WORK/linux/game" ""
     step pipelines 4 "56 MB pipeline list" "python3 failed (1)"
-    step defaults 1 "settings (texture cap 1024)" ""
+    step defaults 1 "settings (texture cap 2048, texture pool 2560 MB, floor 1.0)" ""
     # The player's answer to sharing stutter reports, where the real build puts it (gb/build.py).
     mkdir -p "$WORK/KleptonAlyx.app/alyx-demo"
     case "${GLOVEBOX_SHARE_STUTTERS:-}" in

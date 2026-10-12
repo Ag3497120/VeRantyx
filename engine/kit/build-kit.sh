@@ -1,8 +1,8 @@
 #!/bin/zsh
 # build-kit.sh [out dir]: the Glovebox runtime kit, everything a player's Mac links into the game app that is the
 # same for every player and is all open source: Klepton's runtime (Klepton.xcframework), its game add-on with LuaJIT
-# (KleptonAlyx.xcframework), MoltenVK, SDL3, sdl2-compat (as SDL2.framework) and klepton-ld. Players download it
-# from a release, so their Mac needs only Xcode: it translates their game and signs, and builds nothing else.
+# (KleptonAlyx.xcframework), MoltenVK, SDL3, sdl2-compat (as SDL2.framework) and klepton-ld. The Glovebox app carries
+# it, so a player's Mac needs only Xcode: it translates their game and signs, and builds nothing else.
 # Maintainers and CI run this; it needs cmake (Homebrew) on top of Xcode.
 #   GLOVEBOX_DEPS  where the dependency sources and builds live (default <repo>/src, gitignored); cloned at the
 #                  pinned versions below when missing

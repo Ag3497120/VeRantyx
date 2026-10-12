@@ -188,6 +188,17 @@ static void *stackdump(void *a) {
     return NULL;
 }
 
+// Klepton finds MoltenVK relative to the working directory by default, and the launcher changes it: pin it to this
+// build's vendored copy. Before the app files too, which read the GPU's ids through it.
+static void pin_mvk(void) {
+    if (getenv("KL_MVK_DIR")) return;
+    char mvk[1024], cwd[1024];
+    if (getcwd(cwd, sizeof cwd)) {
+        snprintf(mvk, sizeof mvk, "%s/vendor-moltenvk/out/macos", cwd);
+        setenv("KL_MVK_DIR", mvk, 1);
+    }
+}
+
 // Run mode: Valve's own launcher (bin/linuxsteamrtarm64/hlvr) through the
 // loader. Its _start calls __libc_start_main (served by the glibc layer),
 // which calls main(); main finds its bin dir via /proc/self/exe, dlopens
@@ -207,15 +218,7 @@ static int run_launcher(const char *game, const char *sysroot, int gargc, char *
         g_main_thread = mach_thread_self();
         pthread_t t; pthread_create(&t, NULL, stackdump, (void *)(intptr_t)atoi(getenv("KL_STACKDUMP")));
     }
-    // Klepton finds MoltenVK relative to the working directory by default,
-    // and the launcher changes it: pin it to this build's vendored copy.
-    if (!getenv("KL_MVK_DIR")) {
-        char mvk[1024], cwd[1024];
-        if (getcwd(cwd, sizeof cwd)) {
-            snprintf(mvk, sizeof mvk, "%s/vendor-moltenvk/out/macos", cwd);
-            setenv("KL_MVK_DIR", mvk, 1);
-        }
-    }
+    pin_mvk();
     return kl_alyx_run(game, sysroot, gargc, gargv);
 }
 
@@ -228,9 +231,10 @@ static int run_launcher(const char *game, const char *sysroot, int gargc, char *
 static int run_as_app(const char *sysroot) {
     const char *docs = getenv("KL_APP_DOCS"), *bundle = getenv("KL_APP_BUNDLE");
     if (!docs || !*docs || !bundle || !*bundle) { fprintf(stderr, "--app needs KL_APP_DOCS and KL_APP_BUNDLE\n"); return 2; }
-    static char envline[4096], files[384], game[1200], fozdir[1200];
+    static char envline[4096], files[512], game[1200], fozdir[1200];
     snprintf(fozdir, sizeof fozdir, "%s/klfz", docs);
     setenv("KL_VK_FOZ_DIR", fozdir, 0);
+    pin_mvk();
     kl_alyx_app_files(bundle, docs, envline, sizeof envline, files, sizeof files);
     fprintf(stderr, "=== as the app: %s, %s ===\n%s%s", bundle, docs, envline, files);
     // KL_PREWARM_ONLY=<device-info.json>: warm the shader cache as the launcher does before Play (kl_foz_prewarm), with

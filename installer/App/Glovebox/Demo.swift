@@ -14,10 +14,10 @@ enum Demo {
     static let isTour = value(after: "-tour") != nil
 
     static let all = ["welcome", "xcode-get", "xcode-downloading", "xcode-setup", "xcode-visionos",
-                      "steam-signin", "steam-scanned", "steam-password", "steam-approve", "steam-code", "steam-owned", "steam-notowned",
+                      "steam-signin", "steam-scanned", "steam-password", "steam-password-toolong", "steam-password-revealed", "steam-approve", "steam-code", "steam-owned", "steam-notowned",
                       "account-signin", "account-teamload", "account-program", "account-team", "account-free",
                       "headset-pair", "headset-pair26", "headset-devmode",
-                      "install-ready", "install-running", "install-consent", "install-news", "install-signing", "install-signing-once", "install-signing-denied",
+                      "install-ready", "install-running", "install-consent", "install-news", "install-signing", "install-signing-once", "install-signing-denied", "install-signing-certificate",
                       "install-error", "install-signin-expired", "install-signin-guiding", "install-agreement",
                       "install-headsetwait", "install-done", "install-done-news", "install-done-free",
                       "home", "home-allset", "home-news", "home-renew-free", "guide-signin", "guide-pair", "guide-keychain", "guide-signinagain", "guide-loadteam", "guide-loadteam2", "guide-loadteam3"]
@@ -173,7 +173,7 @@ extension InstallerModel {
         case "steam-scanned":
             steam.step = .approve(canEnterCode: false)
             step = .steam
-        case "steam-password":
+        case "steam-password", "steam-password-toolong", "steam-password-revealed":
             steam.method = .password
             step = .steam
         case "steam-approve":
@@ -251,9 +251,11 @@ extension InstallerModel {
             allowingSigning = true
             signingAsked = name == "install-signing-asked"
             step = .install
-        case "install-signing-once", "install-signing-denied":
+        case "install-signing-once", "install-signing-denied", "install-signing-certificate":
             progress.finish(.download)
-            installError = EngineError(code: name == "install-signing-once" ? "signing-allowed-once" : "signing-not-allowed", stage: .build)
+            installError = EngineError(code: name == "install-signing-once" ? "signing-allowed-once"
+                                       : name == "install-signing-certificate" ? "signing-certificate-missing" : "signing-not-allowed",
+                                       stage: .build)
             step = .install
         case "install-headsetwait":
             installing = true

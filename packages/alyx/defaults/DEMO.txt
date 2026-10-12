@@ -13,3 +13,12 @@ KL_VK_MERGE_VIS=1
 KLVR_PACE_FALLBACK=0
 KL_CP_QUALITY=0.40
 KL_VRR=0
+# Textures give their memory back: MoltenVK by default makes every Vulkan memory block a full-size Metal heap, so the
+# gaps a streamed-out texture leaves inside the engine's 8 MB texture blocks stay allocated (500-780 MB once the
+# texture pool is full). Without heaps each texture is its own Metal texture, freed when the streamer drops it (Mac and
+# headset 2026-10-11: no MoltenVK errors, same frame pacing).
+MVK_CONFIG_USE_MTLHEAP=0
+# Big game allocations give their memory back: Klepton hands the game's allocations of 1 MB or more their own mapped
+# pages, unmapped on free, instead of the Mac allocator's large-block cache, which kept freed pages resident (Mac
+# 2026-10-12: 389-422 MB less at the Chapter 1 street with the bigger texture cap, same frame pacing).
+KL_GUEST_BIGALLOC_MMAP=1048576

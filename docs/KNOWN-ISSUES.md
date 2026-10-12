@@ -15,4 +15,4 @@
 | The game downloads again | After switching to another Apple Account or team | Each team gets its own copy of the app on the headset, so stay with one. |
 | The download slows down | With the headset off | It carries on in the background, more slowly. Open Glovebox: HLA again to finish. |
 
-Something not listed? Press **Copy diagnostics** in the Mac app and [open an issue](https://github.com/glovebox-vr/glovebox/issues/new).
+Something not listed? Press **Copy diagnostics** in the Mac app (or, for a problem in the game, **Share Diagnostics** in the headset app's menu under your name) and [open an issue](https://github.com/glovebox-vr/glovebox/issues/new).

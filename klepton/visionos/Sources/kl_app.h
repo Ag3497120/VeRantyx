@@ -32,6 +32,11 @@
 // missing asset tree otherwise presents as a shim bug deep inside Unity.
 int kl_app_configure(const char *resources, const char *container);
 
+// Half-Life: Alyx only (KL_APP_ALYX): 1 when Documents holds a test script's files for this install, the line
+// GLOVEBOX_TEST=1 in an alyx-env.txt pushed for this install (runtime/linux/kl_alyx_app.c). The launcher
+// goes straight to the game then; a test's files left over from an earlier install never count.
+int kl_app_test_run(const char *resources, const char *container);
+
 // Run the boot sequence. Returns 0 if initJni completed with no unimplemented
 // JNI call. Everything printed goes to the log file below as well as stdout,
 // because an unimplemented JNI slot aborts the process by design and the
@@ -109,6 +114,10 @@ void kl_app_guest_stop(void);
 // yet), 1 = running frames, -1 = _begin failed or the loop has ended; in the
 // last case kl_app_status() says why.
 int  kl_app_guest_state(void);
+
+// The thermal state (ProcessInfo.ThermalState's raw value: 0 nominal .. 3 critical), from the compositor at start and
+// on each change, for the once-a-minute line in Documents/klfz/perf.txt.
+void kl_app_note_thermal(int state);
 
 // Which guest this app was built for, and whether it is the Steam Link one.
 //

@@ -3,7 +3,10 @@ import Foundation
 import FoundationNetworking
 #endif
 
-/// Steam's content delivery network (SteamPipe): plain HTTPS GETs for manifests and chunks.
+/// Steam's content delivery network (SteamPipe): plain GETs for manifests and chunks, over HTTPS where the server
+/// has it. Some have none (Steam's list for China, say): those are fetched over HTTP, which both apps allow
+/// (NSAppTransportSecurity), as Steam's own client does. A chunk is encrypted with the depot key and checked
+/// after decrypting, so a changed one fails its check instead of landing on disk.
 public final class CDNClient: @unchecked Sendable {
     public let servers: [ContentServer]
     private let session: URLSession
@@ -22,12 +25,16 @@ public final class CDNClient: @unchecked Sendable {
 
     private func host(_ s: ContentServer) -> String { s.vhost.isEmpty ? s.host : s.vhost }
 
-    /// Servers in order of preference, pushing ones that recently failed to the back.
+    private static func scheme(_ s: ContentServer) -> String { s.https == "unavailable" ? "http" : "https" }
+
+    /// Servers in order of preference: ones that recently failed to the back, and HTTPS ones ahead of those
+    /// without it.
     private func ranked() -> [ContentServer] {
         lock.lock(); defer { lock.unlock() }
-        return servers.enumerated().sorted {
-            (penalty[host($0.element)] ?? 0, $0.offset) < (penalty[host($1.element)] ?? 0, $1.offset)
-        }.map(\.element)
+        func key(_ e: (offset: Int, element: ContentServer)) -> (Int, Int, Int) {
+            (penalty[host(e.element)] ?? 0, Self.scheme(e.element) == "https" ? 0 : 1, e.offset)
+        }
+        return servers.enumerated().sorted { key($0) < key($1) }.map(\.element)
     }
 
     private func mark(_ s: ContentServer, ok: Bool) {
@@ -42,8 +49,7 @@ public final class CDNClient: @unchecked Sendable {
         guard !list.isEmpty else { throw SteamError.noServers }
         for n in 0..<attempts {
             let s = list[n % list.count]
-            let scheme = s.https == "unavailable" ? "http" : "https"
-            guard let url = URL(string: "\(scheme)://\(host(s))/\(path)") else { continue }
+            guard let url = URL(string: "\(Self.scheme(s))://\(host(s))/\(path)") else { continue }
             do {
                 let (data, resp) = try await session.data(from: url)
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -104,6 +110,6 @@ public final class CDNClient: @unchecked Sendable {
     /// Server base URLs, best first, for downloads made outside this client (the system's
     /// background downloader).
     public var baseURLs: [URL] {
-        ranked().compactMap { s in URL(string: "\(s.https == "unavailable" ? "http" : "https")://\(host(s))/") }
+        ranked().compactMap { s in URL(string: "\(Self.scheme(s))://\(host(s))/") }
     }
 }

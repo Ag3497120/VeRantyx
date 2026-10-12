@@ -1722,6 +1722,28 @@ final class KleptonControllers {
     }
     private var loggedNoChirality = false
 
+    /// The [throw] line: per hand, whether the grip was held last frame and the speeds published over the last
+    /// 300 ms. Render thread only.
+    private var gripHeld = [false, false]
+    private var recentSpeed: [[(t: Double, v: Float)]] = [[], []]
+
+    /// One line in the headset's own log (never in a stutter report) each time a grip opens, which is when the game
+    /// throws what the hand held: the speed handed to the game at that moment, the fastest in the 300 ms before it
+    /// and how long before, and where the pose came from. A thrown object that drops straight then reads as either
+    /// "no speed reached the game" or "the grip opened after the hand had stopped" (GitHub #3).
+    private func noteGripRelease(hand: Int, _ st: KleptonHandState, sense: Bool, at t: Double) {
+        let v = simd_length(st.linearVelocity)
+        recentSpeed[hand].append((t, v))
+        recentSpeed[hand].removeAll { t - $0.t > 0.3 }
+        let held = st.handTrigger > 0.5
+        defer { gripHeld[hand] = held }
+        guard gripHeld[hand], !held else { return }
+        let peak = recentSpeed[hand].max { $0.v < $1.v } ?? (t: t, v: v)
+        NSLog(String(format: "[throw] %@ grip opened: speed %.2f m/s (fastest %.2f m/s, %.0f ms before), spin %.1f rad/s, pose from %@",
+                     hand == 0 ? "L" : "R", v, peak.v, (t - peak.t) * 1000, simd_length(st.angularVelocity),
+                     sense ? "the controller" : "the hand"))
+    }
+
     /// Merge every source and push the result across to kl_ovrp.
     ///
     /// The hand anchors are the fallback: used for a hand's *pose* and its
@@ -1810,6 +1832,7 @@ final class KleptonControllers {
                 continue
             }
 
+            noteGripRelease(hand: hand, st, sense: accPose != nil, at: presentationTime)
             if let p = st.position, let q = st.orientation {
                 kl_ovrp_set_hand_motion(Int32(hand), p.x, p.y, p.z,
                                         q.imag.x, q.imag.y, q.imag.z, q.real,

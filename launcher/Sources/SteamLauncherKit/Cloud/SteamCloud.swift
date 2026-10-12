@@ -53,6 +53,15 @@ public protocol CloudRemote {
     func download(_ file: CloudFile) async throws -> Data
     /// Uploads files as one batch; either every file is committed or the batch is failed.
     func upload(_ files: [(name: String, data: Data, time: Date)]) async throws
+    /// The same, telling `progress` how many files are in after each one.
+    func upload(_ files: [(name: String, data: Data, time: Date)], progress: @escaping @Sendable (Int) async -> Void) async throws
+}
+
+extension CloudRemote {
+    public func upload(_ files: [(name: String, data: Data, time: Date)], progress: @escaping @Sendable (Int) async -> Void) async throws {
+        try await upload(files)
+        await progress(files.count)
+    }
 }
 
 /// Steam Cloud over the CM connection.
@@ -96,6 +105,10 @@ public struct SteamCloud: CloudRemote {
     }
 
     public func upload(_ files: [(name: String, data: Data, time: Date)]) async throws {
+        try await upload(files, progress: { _ in })
+    }
+
+    public func upload(_ files: [(name: String, data: Data, time: Date)], progress: @escaping @Sendable (Int) async -> Void) async throws {
         guard !files.isEmpty else { return }
         let batchData = try await cm.call("Cloud.BeginAppUploadBatch#1",
                                           CloudBeginAppUploadBatchRequest(appID: appID, machineName: SteamAuth.deviceName(),
@@ -103,7 +116,10 @@ public struct SteamCloud: CloudRemote {
         let batch = try CloudBeginAppUploadBatchResponse(proto: batchData).batchID
         var result = EResult.ok
         do {
-            for f in files { try await uploadOne(f, batch: batch) }
+            for (i, f) in files.enumerated() {
+                try await uploadOne(f, batch: batch)
+                await progress(i + 1)
+            }
         } catch {
             result = .fail
             _ = try? await cm.call("Cloud.CompleteAppUploadBatchBlocking#1",
@@ -158,7 +174,7 @@ public struct SteamCloud: CloudRemote {
 /// - Every file is written to a temp file, hash-checked, then moved into place; a save is never
 ///   half-written.
 /// - Deletions are never propagated in either direction.
-/// - Files in `neverUpload` (the game's own settings, scratch files) only ever come down.
+/// - Files in `neverUpload` (scratch files the game leaves behind) only ever come down.
 /// - It only runs while the game is not running, so files never change under it.
 public struct CloudSync {
     public struct Report: Sendable, Equatable {
@@ -171,6 +187,19 @@ public struct CloudSync {
         public var wouldUpload: [String] = []
         public var unchanged = 0
         public init() {}
+    }
+
+    /// How far a run is, for the launcher's page. Downloads come before uploads, so once a run reaches
+    /// `uploading` every save from the cloud is in place and the game may start; the uploads only read copies
+    /// taken before.
+    public struct Progress: Sendable, Equatable {
+        public enum Stage: Sendable, Equatable { case checking, downloading, uploading }
+        public var stage: Stage
+        /// Files done, of those this stage has (none while checking).
+        public var done: Int
+        public var total: Int
+        public init(stage: Stage, done: Int = 0, total: Int = 0) { self.stage = stage; self.done = done; self.total = total }
+        public var savesInPlace: Bool { stage == .uploading }
     }
 
     public let remote: CloudRemote
@@ -187,8 +216,8 @@ public struct CloudSync {
     /// Off: download-only. Nothing is sent to the cloud; the report lists what would have gone up,
     /// and the sync history isn't advanced for it, so it goes up once uploads are turned on.
     public var uploads = true
-    /// File names (globs, any case) that never go up, e.g. the game's own settings. They still come
-    /// down from the cloud like any other save.
+    /// File names (globs, any case) that never go up, e.g. scratch files the game leaves behind. They
+    /// still come down from the cloud like any other save.
     public var neverUpload: [String] = []
 
     public init(remote: CloudRemote, rules: [CloudSaveRule], rootFolder: @escaping (String) -> URL?,
@@ -479,22 +508,47 @@ public struct CloudSync {
         try? fm.setAttributes([.modificationDate: time], ofItemAtPath: url.path)
     }
 
-    public func run() async throws -> Report {
-        var state = (try? JSONDecoder().decode([String: String].self, from: Data(contentsOf: stateURL))) ?? [:]
-        func saveState() throws { try JSONEncoder().encode(state).write(to: stateURL, options: .atomic) }
-        var report = Report()
-        let stamp = ISO8601DateFormatter().string(from: now()).replacingOccurrences(of: ":", with: "-")
+    private func loadState() -> [String: String] {
+        (try? JSONDecoder().decode([String: String].self, from: Data(contentsOf: stateURL))) ?? [:]
+    }
 
-        // One entry per name, however the cloud spells it; if it has two spellings, the newer one.
+    /// The cloud's files, one entry per name however the cloud spells it; if it has two spellings, the newer one.
+    private func listRemote() async throws -> [String: CloudFile] {
         var remoteByKey: [String: CloudFile] = [:]
         for f in try await remote.list() {
             let k = f.filename.lowercased()
             if let seen = remoteByKey[k], seen.timestamp >= f.timestamp { continue }
             remoteByKey[k] = f
         }
+        return remoteByKey
+    }
+
+    /// Whether the cloud has a save that the last run didn't leave in place here: a new file, or another version of
+    /// one. One listing; nothing is read, written or sent. False means a run now would bring nothing down. (Saves
+    /// made here wait for the next run either way: only the game makes them, and it starts after this.)
+    public func cloudChangedSinceLastSync() async throws -> Bool {
+        let state = loadState()
+        return try await listRemote().contains { key, r in
+            url(forCloudName: r.filename) != nil && state[key] != r.sha1Hex.lowercased()
+        }
+    }
+
+    /// One sync: every decision first (from the listing and the files here), then the downloads, then the uploads.
+    /// Cancelling it stops before the next file; a file is never half-written, and what's done is recorded.
+    public func run(progress: @escaping @Sendable (Progress) async -> Void = { _ in }) async throws -> Report {
+        var state = loadState()
+        func saveState() throws { try JSONEncoder().encode(state).write(to: stateURL, options: .atomic) }
+        var report = Report()
+        let stamp = ISO8601DateFormatter().string(from: now()).replacingOccurrences(of: ":", with: "-")
+
+        await progress(Progress(stage: .checking))
+        let remoteByKey = try await listRemote()
         try prepareLocal(remote: remoteByKey, state: &state, stamp: stamp, report: &report)
         let localByKey = scanLocal()
-        var uploads: [(key: String, name: String, data: Data, time: Date, sha: String)] = []
+        // `setAside`: the headset's copy, kept in the backups before the cloud's replaces it.
+        var downloads: [(key: String, file: CloudFile, dest: URL, setAside: Local?)] = []
+        // `over`: the cloud version the headset's copy came from, kept in the backups before it's replaced.
+        var uploads: [(key: String, name: String, local: Local, over: CloudFile?)] = []
 
         for key in Set(remoteByKey.keys).union(localByKey.keys).sorted() {
             let r = remoteByKey[key]
@@ -512,11 +566,7 @@ public struct CloudSync {
                 // Leave the cloud copy alone rather than bring it back.
                 if let last, last == rSHA { continue }
                 guard let dest = url(forCloudName: r.filename) else { continue }
-                let data = try await remote.download(r)
-                try writeSafely(data, sha: Codec.sha1(data).hex, to: dest, time: Date(timeIntervalSince1970: TimeInterval(r.timestamp)))
-                state[key] = Codec.sha1(data).hex
-                report.downloaded.append(r.filename)
-                try saveState()
+                downloads.append((key, r, dest, nil))
                 continue
             }
             guard let l else { continue }
@@ -525,33 +575,51 @@ public struct CloudSync {
                 if last == l.sha { continue }  // deleted from the cloud elsewhere; don't resurrect it
                 if staysHere { continue }
                 if !self.uploads { report.wouldUpload.append(localByKey[key]!.name); continue }
-                uploads.append((key, localByKey[key]!.name, l.data, l.time, l.sha))
+                uploads.append((key, localByKey[key]!.name, l, nil))
                 continue
             }
-            let remoteTime = Date(timeIntervalSince1970: TimeInterval(r.timestamp))
             if let last, rSHA == last {
                 // Only the headset changed since the last sync: it goes up under the cloud's own name,
                 // over the very version it came from, and that version is kept first.
                 if staysHere { continue }
                 if !self.uploads { report.wouldUpload.append(r.filename); continue }
-                let old = try await remote.download(r)
-                report.backedUp.append(try backup(old, as: "cloud/" + Self.backupPath(key), stamp: stamp))
-                uploads.append((key, r.filename, l.data, l.time, l.sha))
+                uploads.append((key, r.filename, l, r))
             } else {
                 // The cloud changed (alone or as well), or there's no history: the cloud's copy wins,
                 // and the headset's is set aside.
-                let data = try await remote.download(r)
-                report.backedUp.append(try backup(l.data, as: "headset/" + Self.backupPath(key), stamp: stamp))
-                try writeSafely(data, sha: Codec.sha1(data).hex, to: l.url, time: remoteTime)
-                state[key] = Codec.sha1(data).hex
-                report.downloaded.append(r.filename)
-                try saveState()
+                downloads.append((key, r, l.url, l))
             }
         }
 
+        if !downloads.isEmpty { await progress(Progress(stage: .downloading, total: downloads.count)) }
+        for (i, d) in downloads.enumerated() {
+            try Task.checkCancellation()
+            let data = try await remote.download(d.file)
+            try Task.checkCancellation()
+            if let l = d.setAside {
+                report.backedUp.append(try backup(l.data, as: "headset/" + Self.backupPath(d.key), stamp: stamp))
+            }
+            let sha = Codec.sha1(data).hex
+            try writeSafely(data, sha: sha, to: d.dest, time: Date(timeIntervalSince1970: TimeInterval(d.file.timestamp)))
+            state[d.key] = sha
+            report.downloaded.append(d.file.filename)
+            try saveState()
+            await progress(Progress(stage: .downloading, done: i + 1, total: downloads.count))
+        }
+
         if !uploads.isEmpty {
-            try await remote.upload(uploads.map { ($0.name, $0.data, $0.time) })
-            for u in uploads { state[u.key] = u.sha; report.uploaded.append(u.name) }
+            try saveState()
+            await progress(Progress(stage: .uploading, total: uploads.count))
+            for u in uploads {
+                guard let over = u.over else { continue }
+                let old = try await remote.download(over)
+                report.backedUp.append(try backup(old, as: "cloud/" + Self.backupPath(u.key), stamp: stamp))
+            }
+            let count = uploads.count
+            try await remote.upload(uploads.map { ($0.name, $0.local.data, $0.local.time) }) { done in
+                await progress(Progress(stage: .uploading, done: done, total: count))
+            }
+            for u in uploads { state[u.key] = u.local.sha; report.uploaded.append(u.name) }
         }
         try saveState()
         pruneCloudBackups()

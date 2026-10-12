@@ -4176,6 +4176,7 @@ final class KleptonCompositor {
     private func logPowerState(_ why: String) {
         let pi = ProcessInfo.processInfo
         NSLog("[cp] power (\(why)): thermal \(Self.thermalName(pi.thermalState)), low power \(pi.isLowPowerModeEnabled)")
+        kl_app_note_thermal(Int32(pi.thermalState.rawValue))
         if powerObservers.isEmpty {
             let nc = NotificationCenter.default
             powerObservers.append(nc.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification,

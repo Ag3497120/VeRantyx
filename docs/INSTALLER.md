@@ -51,7 +51,7 @@ filtered by `packages/alyx/package.json` → `steam.mac_download`.
 ## Bundling
 
 - The app carries the source of its release tag (this repository without `.git`, about 12 MB) and that release's
-  runtime kit (`glovebox-kit.zip` from the GitHub release, about 20 MB, all open source).
+  runtime kit (`glovebox-kit.zip`, made by `engine/kit/build-kit.sh` or the `kit` workflow, about 20 MB, all open source).
 - Before running anything it copies both to `~/Library/Application Support/Glovebox/source/<version>/`. The kit goes
   in as `glovebox-kit.zip` at the source root. The build writes into the Klepton tree, which must never happen
   inside the signed app bundle.
@@ -65,10 +65,12 @@ filtered by `packages/alyx/package.json` → `steam.mac_download`.
 
 ## Feedback
 
-A "Send feedback" item in the menu bar runs `glovebox collect --json`. It copies the headset app's pipeline
-recording, its hitch log (`slow.txt`: every pipeline the game compiled for 20 ms or more, with the time) and the game
-console to `GLOVEBOX_WORK/feedback/<time>/`, and turns the recording into a recipe with no shader code. The recipe
-and hitch log are what we merge into the next release's pipeline list. The console log is the bug report.
+`glovebox collect --json` copies the headset app's pipeline recording, its hitch log (`slow.txt`: every pipeline
+the game compiled for 20 ms or more, with the time), the game console and the runtime's logs (`klepton-boot.log` for
+the last run, `klepton-boot.prev.log` for the one before it, `klepton-crash.log`) to `GLOVEBOX_WORK/feedback/<time>/`,
+and turns the recording into a recipe with no shader code. The recipe and hitch log are what we merge into the next
+release's pipeline list. The logs are the bug report: after a freeze, the runtime dumps every thread into the log
+(`[stall]` lines), and relaunching keeps that log as `klepton-boot.prev.log`.
 
 ## Sharing stutter reports
 

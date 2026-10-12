@@ -26,6 +26,10 @@ The app keeps itself and the game up to date.
 <details>
 <summary>From Terminal</summary>
 
+`build` needs the runtime kit and your game files. From a checkout, build the kit once with
+`brew install cmake && zsh engine/kit/build-kit.sh glovebox-kit` (it lands where `build` looks). The game files come
+from the Mac app's download, or from `GLOVEBOX_GAME` pointing at a copy of the game's `game/` folder.
+
 ```sh
 xcrun python3 engine/glovebox.py doctor    # what this Mac and headset still need
 xcrun python3 engine/glovebox.py build     # the game app, from your own game files, signed for your team

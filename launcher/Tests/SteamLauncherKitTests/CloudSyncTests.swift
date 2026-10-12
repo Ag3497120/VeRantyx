@@ -17,7 +17,14 @@ final class FakeCloud: CloudRemote {
             return f
         }
     }
-    func download(_ file: CloudFile) async throws -> Data { files[file.filename]!.data }
+    var downloads = 0
+    /// Runs before each download, e.g. to change the cloud or cancel the sync mid-run.
+    var beforeDownload: ((CloudFile) -> Void)?
+    func download(_ file: CloudFile) async throws -> Data {
+        beforeDownload?(file)
+        downloads += 1
+        return files[file.filename]!.data
+    }
     func upload(_ batch: [(name: String, data: Data, time: Date)]) async throws {
         if failUploads { throw SteamError.badData("network down") }
         uploads += 1
@@ -39,14 +46,23 @@ final class CloudSyncTests: XCTestCase {
     override func tearDown() { try? FileManager.default.removeItem(at: root) }
 
     /// Same mapping as the Alyx profile: depot `game/` is the install folder.
-    func sync(uploads: Bool = true) async throws -> CloudSync.Report {
+    func makeSync(uploads: Bool = true) -> CloudSync {
         var s = CloudSync(remote: cloud, rules: rules, rootFolder: { _ in self.root },
                           localPath: GameProfile.halfLifeAlyx.localPath,
                           stateURL: root.appendingPathComponent(".state.json"),
                           backupRoot: root.appendingPathComponent(".backups"))
         s.uploads = uploads
         s.neverUpload = GameProfile.halfLifeAlyx.cloudNeverUpload
-        return try await s.run()
+        return s
+    }
+
+    func sync(uploads: Bool = true) async throws -> CloudSync.Report { try await makeSync(uploads: uploads).run() }
+    /// The quick check, which never downloads anything.
+    func cloudChanged(file: StaticString = #filePath, line: UInt = #line) async throws -> Bool {
+        let before = cloud.downloads
+        let changed = try await makeSync().cloudChangedSinceLastSync()
+        XCTAssertEqual(cloud.downloads, before, "a quick check downloads nothing", file: file, line: line)
+        return changed
     }
 
     func name(_ f: String) -> String { "%GameInstall%game/hlvr/save/\(f)" }
@@ -164,7 +180,8 @@ final class CloudSyncTests: XCTestCase {
         XCTAssertEqual(readLocal("s1/autosave.sav"), "today")
         XCTAssertEqual(readLocal("s1/personal.cfg"), "cfg")
         XCTAssertEqual(cloud.files[cloudS0]?.data, Data("pc-2020".utf8))
-        XCTAssertEqual(r.uploaded, [name("s1/autosave.sav")], "its settings stay on the headset")
+        XCTAssertEqual(r.uploaded, [name("s1/autosave.sav"), name("s1/personal.cfg")], "with its settings, as a PC's slots")
+        XCTAssertEqual(cloud.files[name("s1/personal.cfg")]?.data, Data("cfg".utf8))
         XCTAssertNil(cloud.files[name("s0/autosave.sav")])
     }
 
@@ -219,11 +236,11 @@ final class CloudSyncTests: XCTestCase {
         XCTAssertEqual(readLocal("s2/autosave.sav"), "today")
         XCTAssertEqual(readLocal("s2/personal.cfg"), "cfg")
         XCTAssertEqual(cloud.files[s0]?.data, Data("pc0".utf8), "the 2020 save is untouched")
-        XCTAssertEqual(r.uploaded, [name("s2/autosave.sav")])
+        XCTAssertEqual(r.uploaded, [name("s2/autosave.sav"), name("s2/personal.cfg")])
         XCTAssertEqual(r.unchanged, 3)
         XCTAssertTrue(r.downloaded.isEmpty)
         let again = try await sync()
-        XCTAssertEqual(again.unchanged, 4)
+        XCTAssertEqual(again.unchanged, 5)
         XCTAssertTrue(again.uploaded.isEmpty && again.downloaded.isEmpty && again.relocated.isEmpty)
     }
 
@@ -245,8 +262,8 @@ final class CloudSyncTests: XCTestCase {
         XCTAssertEqual(cloud.files[name("a.sav")]?.data, Data("headset".utf8))
     }
 
-    /// The game's settings and the level files it leaves behind never go up; settings still come down.
-    func testSettingsAndLevelFilesStayOnTheHeadset() async throws {
+    /// The game's settings sync like any save, as on a PC; the level files it leaves behind never go up.
+    func testSettingsSyncAndLevelFilesStayOnTheHeadset() async throws {
         cloud.files[name("s0/personal.cfg")] = (Data("pc".utf8), t0)
         _ = try await sync()
         XCTAssertEqual(readLocal("s0/personal.cfg"), "pc")
@@ -255,21 +272,43 @@ final class CloudSyncTests: XCTestCase {
         try writeLocal("s5/autosave.sav", "save", t0)
         try writeLocal("s5/personal.cfg", "headset", t0)
         var r = try await sync(uploads: false)
-        XCTAssertEqual(r.wouldUpload, [name("s5/autosave.sav")])
+        XCTAssertEqual(r.wouldUpload, [name("s0/personal.cfg"), name("s5/autosave.sav"), name("s5/personal.cfg")])
         r = try await sync()
-        XCTAssertEqual(r.uploaded, [name("s5/autosave.sav")])
-        XCTAssertEqual(Set(cloud.files.keys), [name("s0/personal.cfg"), name("s5/autosave.sav")])
-        XCTAssertEqual(cloud.files[name("s0/personal.cfg")]?.data, Data("pc".utf8))
+        XCTAssertEqual(r.uploaded, [name("s0/personal.cfg"), name("s5/autosave.sav"), name("s5/personal.cfg")])
+        XCTAssertEqual(Set(cloud.files.keys), [name("s0/personal.cfg"), name("s5/autosave.sav"), name("s5/personal.cfg")])
+        XCTAssertEqual(cloud.files[name("s0/personal.cfg")]?.data, Data("headset".utf8))
+        XCTAssertEqual(r.backedUp.filter { $0.hasSuffix("/cloud/game/hlvr/save/s0/personal.cfg") }.map(backup), ["pc"],
+                       "the cloud's copy is kept before it's replaced")
         XCTAssertEqual(readLocal("s0/personal.cfg"), "headset")
         XCTAssertEqual(readLocal("a1_intro_world.hl1"), "level")
     }
 
-    /// A slot started here goes up without its settings. When a PC carries on in it, the PC's copy
-    /// comes down into the same slot: the settings file alone doesn't make it someone else's slot.
+    /// A reinstall starts with nothing on the headset: a slot started here comes back with its own settings,
+    /// so the game never falls back to the global ones (a PC's, from 2020, set to teleport).
+    func testReinstallBringsBackAHeadsetSlotWithItsSettings() async throws {
+        cloud.files[name("personal.cfg")] = (Data("teleport, 2020".utf8), t0)
+        try writeLocal("s5/autosave.sav", "van", t0.addingTimeInterval(100))
+        try writeLocal("s5/personal.cfg", "continuous", t0.addingTimeInterval(100))
+        var r = try await sync()
+        XCTAssertEqual(r.uploaded, [name("s5/autosave.sav"), name("s5/personal.cfg")])
+
+        try FileManager.default.removeItem(at: root)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        r = try await sync()
+        XCTAssertEqual(Set(r.downloaded), [name("personal.cfg"), name("s5/autosave.sav"), name("s5/personal.cfg")])
+        XCTAssertEqual(readLocal("s5/personal.cfg"), "continuous")
+        XCTAssertEqual(readLocal("s5/autosave.sav"), "van")
+        XCTAssertEqual(readLocal("personal.cfg"), "teleport, 2020")
+        XCTAssertTrue(r.uploaded.isEmpty && r.relocated.isEmpty)
+    }
+
+    /// A slot started here goes up with its settings. When a PC carries on in it, the PC's copies
+    /// come down into the same slot.
     func testSlotContinuedOnThePCStaysInPlace() async throws {
         try writeLocal("s5/autosave.sav", "headset", t0)
         try writeLocal("s5/personal.cfg", "headset-cfg", t0)
         _ = try await sync()
+        XCTAssertEqual(cloud.files[name("s5/personal.cfg")]?.data, Data("headset-cfg".utf8))
         cloud.files[name("s5/autosave.sav")] = (Data("pc".utf8), t0.addingTimeInterval(600))
         cloud.files[name("s5/personal.cfg")] = (Data("pc-cfg".utf8), t0.addingTimeInterval(600))
         let r = try await sync()
@@ -319,5 +358,69 @@ final class CloudSyncTests: XCTestCase {
         XCTAssertEqual(readLocal("profiles/p1/a.sav"), "deep")
         let all = FileManager.default.enumerator(atPath: root.path)?.allObjects as? [String] ?? []
         XCTAssertFalse(all.contains { $0.contains("cloud-tmp") })
+    }
+
+    // MARK: Play right after a sync
+
+    func testCloudSavesAreInPlaceBeforeAnythingGoesUp() async throws {
+        cloud.files[name("s1/a.sav")] = (Data("pc-a".utf8), t0)
+        cloud.files[name("s1/b.sav")] = (Data("pc-b".utf8), t0)
+        try writeLocal("s0/mine.sav", "vp", t0)
+        final class Seen: @unchecked Sendable { var steps: [CloudSync.Progress] = []; var inPlace: [Bool] = [] }
+        let seen = Seen()
+        let r = try await makeSync().run { p in
+            seen.steps.append(p)
+            if p.stage == .uploading && p.done == 0 { seen.inPlace.append(self.readLocal("s1/a.sav") != nil && self.readLocal("s1/b.sav") != nil) }
+        }
+        XCTAssertEqual(seen.steps, [
+            .init(stage: .checking),
+            .init(stage: .downloading, done: 0, total: 2), .init(stage: .downloading, done: 1, total: 2),
+            .init(stage: .downloading, done: 2, total: 2),
+            .init(stage: .uploading, done: 0, total: 1), .init(stage: .uploading, done: 1, total: 1),
+        ])
+        XCTAssertEqual(seen.inPlace, [true], "every download is in place once uploading starts")
+        XCTAssertEqual(r.downloaded.count, 2)
+        XCTAssertEqual(r.uploaded, [name("s0/mine.sav")])
+    }
+
+    func testQuickCheckSeesOnlyWhatTheCloudChanged() async throws {
+        cloud.files[name("s0/a.sav")] = (Data("pc".utf8), t0)
+        cloud.files[name("gone.sav")] = (Data("old".utf8), t0)
+        cloud.files["%GameInstall%game/hlvr/cfg/other.cfg"] = (Data("not a save".utf8), t0)
+        try writeLocal("s1/mine.sav", "vp", t0)
+        let first = try await cloudChanged()
+        XCTAssertTrue(first, "nothing synced yet")
+        _ = try await sync()
+        let afterSync = try await cloudChanged()
+        XCTAssertFalse(afterSync, "the sync just ran, its upload included")
+        try FileManager.default.removeItem(at: local("gone.sav"))   // the game deleted it
+        try writeLocal("s1/mine.sav", "vp2", t0)                     // and saved again
+        let headsetOnly = try await cloudChanged()
+        XCTAssertFalse(headsetOnly, "the headset's own changes wait for the next sync")
+        cloud.files[name("s0/a.sav")] = (Data("pc2".utf8), t0.addingTimeInterval(60))
+        let changed = try await cloudChanged()
+        XCTAssertTrue(changed, "a newer PC save")
+        _ = try await sync()
+        cloud.files[name("s2/new.sav")] = (Data("pc".utf8), t0)
+        let added = try await cloudChanged()
+        XCTAssertTrue(added, "a new PC save")
+    }
+
+    func testCancelledSyncStopsBetweenFilesAndFinishesNextTime() async throws {
+        for f in ["s0/a.sav", "s0/b.sav", "s0/c.sav"] { cloud.files[name(f)] = (Data(f.utf8), t0) }
+        try writeLocal("s1/mine.sav", "vp", t0)
+        cloud.beforeDownload = { f in if f.filename == self.name("s0/b.sav") { withUnsafeCurrentTask { $0?.cancel() } } }
+        // Its own task, as the launcher's: cancelling it leaves the test's own task running.
+        let cancelled = Task { try await self.sync() }
+        do { _ = try await cancelled.value; XCTFail("should stop") } catch is CancellationError {}
+        XCTAssertEqual(readLocal("s0/a.sav"), "s0/a.sav")
+        XCTAssertNil(readLocal("s0/c.sav"), "stopped before the next file")
+        XCTAssertNil(cloud.files[name("s1/mine.sav")], "nothing went up")
+        let all = FileManager.default.enumerator(atPath: root.path)?.allObjects as? [String] ?? []
+        XCTAssertFalse(all.contains { $0.contains("cloud-tmp") })
+        cloud.beforeDownload = nil
+        let r = try await sync()
+        XCTAssertEqual(r.downloaded, [name("s0/b.sav"), name("s0/c.sav")], "a.sav was recorded")
+        XCTAssertEqual(r.uploaded, [name("s1/mine.sav")])
     }
 }

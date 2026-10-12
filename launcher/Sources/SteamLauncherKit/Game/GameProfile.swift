@@ -60,9 +60,11 @@ public extension GameProfile {
             return .download
         },
         cloudRoots: ["gameinstall": ""],
-        // personal.cfg is this device's settings (a PC would get the headset's). The .hl1/.hl2/.hl3 files
-        // hold the level the game was in, left behind because it exits the app (a PC's cloud saves have none).
-        cloudNeverUpload: ["personal.cfg", "*.hl1", "*.hl2", "*.hl3"],
+        // The .hl1/.hl2/.hl3 files hold the level the game was in, left behind because it exits the app (a PC's
+        // cloud saves have none). personal.cfg goes up like any save, as Steam does on a PC: each slot keeps its own
+        // options (movement, weapon hand), and a slot without one falls back to the global personal.cfg, which may
+        // be a PC's from years ago.
+        cloudNeverUpload: ["*.hl1", "*.hl2", "*.hl3"],
         storeURL: URL(string: "https://store.steampowered.com/app/546560/HalfLife_Alyx/")!,
         heroImageURL: URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/546560/library_hero.jpg")!,
         logoURL: URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/546560/logo.png")!,

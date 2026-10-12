@@ -12,6 +12,8 @@ public enum SteamError: Error, CustomStringConvertible, Equatable {
     case noServers
     case badData(String)
     case unsupported(String)
+    /// More than the password key can carry: longer than any Steam password, so something else is in the field.
+    case passwordTooLong
 
     public var description: String {
         switch self {
@@ -22,6 +24,7 @@ public enum SteamError: Error, CustomStringConvertible, Equatable {
         case .noServers: return "No Steam servers are reachable."
         case .badData(let s): return "Unexpected data from Steam: \(s)"
         case .unsupported(let s): return s
+        case .passwordTooLong: return "The password is too long. Please make sure you entered it correctly."
         }
     }
 }
@@ -101,7 +104,7 @@ public actor CMClient {
         throw lastError
     }
 
-    private func open(endpoint: String) async throws {
+    func open(endpoint: String) async throws {
         let t = makeTransport()
         try await t.connect(url: URL(string: "wss://\(endpoint)/cmsocket/")!)
         transport = t
@@ -220,22 +223,29 @@ public actor CMClient {
 
     // MARK: Requests
 
-    /// Sends a message that Steam answers with a job reply, and waits for the reply.
+    /// Sends a message that Steam answers with a job reply, and waits for the reply. Cancelling the calling task
+    /// stops the wait at once (a late reply is dropped), so a caller's deadline holds.
     func request(_ emsg: EMsg, header: CMsgProtoBufHeader? = nil, body: ProtoEncodable, timeout: Double = 30) async throws -> Packet {
+        try Task.checkCancellation()
         guard let transport else { throw SteamError.notConnected }
         let job = nextJobID; nextJobID += 1
         var h = header ?? baseHeader()
         h.jobIDSource = job
         let bytes = frame(emsg.rawValue, header: h, body: body.encoded())
-        return try await withCheckedThrowingContinuation { (c: CheckedContinuation<Packet, Error>) in
-            jobs[job] = c
-            Task {
-                do { try await transport.send(bytes) } catch { self.failJob(job, error) }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Packet, Error>) in
+                jobs[job] = c
+                Task {
+                    do { try await transport.send(bytes) } catch { self.failJob(job, error) }
+                }
+                Task {
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1e9))
+                    self.failJob(job, SteamError.timeout("\(emsg)"))
+                }
             }
-            Task {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1e9))
-                self.failJob(job, SteamError.timeout("\(emsg)"))
-            }
+        } onCancel: {
+            // Runs on the actor after the job is registered: the continuation above is stored synchronously.
+            Task { await self.failJob(job, CancellationError()) }
         }
     }
 

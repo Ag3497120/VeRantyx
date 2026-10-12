@@ -131,7 +131,7 @@ public final class SteamLauncher: @unchecked Sendable {
     /// manifest request code, so this is also Steam's own ownership check.
     public func plan() async throws -> InstallPlan {
         let apps = SteamApps(cm: cm)
-        let info = try await apps.appInfo(profile.appID)
+        let info = try await appInfo(fresh: true)
         let servers = try await apps.contentServers(cellID: logon?.cellID ?? 0)
         let cdn = CDNClient(servers: servers)
         var depots: [DepotPlan] = []
@@ -214,13 +214,30 @@ public final class SteamLauncher: @unchecked Sendable {
 
     // MARK: Cloud
 
-    /// Two-way Steam Cloud sync, the way the Steam client does it around a game session.
-    /// Call before the game starts and again after it exits (or at the next launch). With `uploads`
-    /// off it only downloads, and the report lists what would have gone up.
-    public func syncSaves(uploads: Bool) async throws -> CloudSync.Report {
-        let apps = SteamApps(cm: cm)
-        let info = try await apps.appInfo(profile.appID)
-        guard !info.cloudRules.isEmpty else { return CloudSync.Report() }
+    private let lock = NSLock()
+    private var keptAppInfo: AppInfo?
+    private var fetchingAppInfo: Task<AppInfo, Error>?
+
+    /// The game's product info. `fresh` asks Steam, joining a request already on its way (the launcher's first sync
+    /// and its build check start together); otherwise the answer from earlier this session does, since the cloud
+    /// rules and build number change only with a game update.
+    private func appInfo(fresh: Bool) async throws -> AppInfo {
+        let apps = SteamApps(cm: cm), appID = profile.appID
+        let (kept, task): (AppInfo?, Task<AppInfo, Error>?) = lock.withLock {
+            if !fresh, let kept = keptAppInfo { return (kept, nil) }
+            if fetchingAppInfo == nil { fetchingAppInfo = Task { try await apps.appInfo(appID) } }
+            return (nil, fetchingAppInfo)
+        }
+        if let kept { return kept }
+        defer { lock.withLock { if fetchingAppInfo == task { fetchingAppInfo = nil } } }
+        let info = try await task!.value
+        lock.withLock { keptAppInfo = info }
+        return info
+    }
+
+    private func cloudSync(uploads: Bool) async throws -> CloudSync? {
+        let info = try await appInfo(fresh: false)
+        guard !info.cloudRules.isEmpty else { return nil }
         let root = installRoot, profile = self.profile
         var sync = CloudSync(remote: SteamCloud(cm: cm, appID: profile.appID, buildID: info.buildID),
                              rules: info.cloudRules,
@@ -230,6 +247,22 @@ public final class SteamLauncher: @unchecked Sendable {
                              backupRoot: root.appendingPathComponent(".cloud-backups"))
         sync.uploads = uploads
         sync.neverUpload = profile.cloudNeverUpload
-        return try await sync.run()
+        return sync
+    }
+
+    /// Two-way Steam Cloud sync, the way the Steam client does it around a game session.
+    /// Call before the game starts and again after it exits (or at the next launch). With `uploads`
+    /// off it only downloads, and the report lists what would have gone up.
+    public func syncSaves(uploads: Bool,
+                          progress: @escaping @Sendable (CloudSync.Progress) async -> Void = { _ in }) async throws -> CloudSync.Report {
+        guard let sync = try await cloudSync(uploads: uploads) else { return CloudSync.Report() }
+        return try await sync.run(progress: progress)
+    }
+
+    /// Whether Steam Cloud has a save the last sync didn't bring here (CloudSync.cloudChangedSinceLastSync): one
+    /// quick listing, for Play right after a sync.
+    public func cloudChangedSinceLastSync() async throws -> Bool {
+        guard let sync = try await cloudSync(uploads: false) else { return false }
+        return try await sync.cloudChangedSinceLastSync()
     }
 }

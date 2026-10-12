@@ -108,6 +108,13 @@ public final class SteamAuthSession {
 }
 
 public enum SteamAuth {
+    /// The most a password field can hold and still be sent: Steam's 2048-bit password key carries 245 bytes.
+    /// Steam passwords are far shorter (its desktop client stops at 64 characters), so more than this is a paste
+    /// or AutoFill of something else; the sign-in forms say so as soon as it happens.
+    public static let maxPasswordBytes = 245
+
+    public static func passwordTooLong(_ password: String) -> Bool { password.utf8.count > maxPasswordBytes }
+
     public static func deviceName() -> String {
         #if os(visionOS)
         return "Apple Vision Pro"
@@ -150,6 +157,11 @@ public enum SteamAuth {
 enum RSA {
     static func encryptPKCS1(_ message: Data, modulusHex: String, exponentHex: String) throws -> Data {
         guard let mod = Data(hex: modulusHex), let exp = Data(hex: exponentHex) else { throw SteamError.badData("RSA key") }
+        let size = mod.drop { $0 == 0 }.count
+        guard size >= 64 else { throw SteamError.badData("RSA key") }
+        // PKCS#1 v1.5 carries at most the key's size less 11 bytes: 245 with Steam's 2048-bit keys, far more than a
+        // Steam password. Past that, Security refuses with "RSAencrypt wrong input size" (a player saw it, Oct 2026).
+        guard message.count <= size - 11 else { throw SteamError.passwordTooLong }
         #if canImport(Security)
         let der = derRSAPublicKey(modulus: mod, exponent: exp)
         let attrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeRSA,

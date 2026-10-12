@@ -426,6 +426,7 @@ static void test_input() {
     vr::InputDigitalActionData_t d;
     CHECK(in->GetDigitalActionData(trig, &d, sizeof d, vr::k_ulInvalidInputValueHandle) == vr::VRInputError_None);
     CHECK(d.bActive && d.bState && d.bChanged && d.activeOrigin == rh);
+    CHECK(log_has("game read /actions/default/in/trigger as pressed for the first time"));   // always, once
     CHECK(in->GetDigitalActionData(trig, &d, sizeof d, lh) == vr::VRInputError_None);
     CHECK(!d.bActive && !d.bState);                        // nothing bound on the left
     vr::InputAnalogActionData_t a;
@@ -553,6 +554,52 @@ static void test_input() {
     NEAR(klvr_null.haptic_freq[0], 160.0f);
     in->TriggerHapticVibrationAction(hap, 0, 0.1f, 160, 0.7f, rh);
     CHECK(klvr_null.haptic_count[0] == hl + 1 && klvr_null.haptic_count[1] == hr + 2);
+
+    // Weapon Hand set to left: Alyx calls SetDominantHand(LeftHand) and keeps its right-handed bindings. From the
+    // next UpdateActionState each controller drives the buttons, triggers and sticks bound to the other hand, and
+    // reports itself as the origin; poses stay with their own controllers.
+    connect_controllers();
+    klvr_null.ctl[0].trigger = 1.0f;
+    klvr_null.ctl[0].buttons = KLVR_BTN_TRIGGER;
+    klvr_null.ctl[1].stick[0] = 0.25f;
+    klvr_null.ctl[1].stick[1] = -0.5f;
+    CHECK(in->SetDominantHand(vr::TrackedControllerRole_LeftHand) == vr::VRInputError_None);
+    vr::ETrackedControllerRole dom = vr::TrackedControllerRole_Invalid;
+    CHECK(in->GetDominantHand(&dom) == vr::VRInputError_None && dom == vr::TrackedControllerRole_LeftHand);
+    vr::VRInputValueHandle_t org[2] = {};
+    CHECK(in->GetActionOrigins(set, trig, org, 2) == vr::VRInputError_None && org[0] == rh);   // not before the update
+    in->UpdateActionState(&active, sizeof active, 1);
+    CHECK(log_has("dominant hand: left"));
+    in->GetDigitalActionData(trig, &d, sizeof d, 0);
+    CHECK(d.bActive && d.bState && d.activeOrigin == lh);
+    in->GetDigitalActionData(trig, &d, sizeof d, lh);
+    CHECK(d.bActive && d.bState && d.activeOrigin == lh);
+    in->GetDigitalActionData(trig, &d, sizeof d, rh);
+    CHECK(!d.bActive && !d.bState);
+    in->GetAnalogActionData(pull, &a, sizeof a, lh);
+    NEAR(a.x, 1.0f);
+    in->GetAnalogActionData(move, &a, sizeof a, 0);
+    NEAR(a.x, 0.25f); NEAR(a.y, -0.5f);
+    CHECK(a.activeOrigin == rh);
+    org[0] = org[1] = 0;
+    CHECK(in->GetActionOrigins(set, trig, org, 2) == vr::VRInputError_None && org[0] == lh && org[1] == 0);
+    in->GetPoseActionDataForNextFrame(pose, vr::TrackingUniverseStanding, &pd, sizeof pd, rh);
+    CHECK(pd.bActive && pd.activeOrigin == rh);
+    NEAR(pd.pose.mDeviceToAbsoluteTracking.m[0][3], 0.2f - 0.007f);
+    CHECK(in->GetSkeletalActionData(skl, &sd, sizeof sd) == vr::VRInputError_None && sd.activeOrigin == lh);
+    // The right trigger no longer fires.
+    connect_controllers();
+    klvr_null.ctl[1].trigger = 1.0f;
+    klvr_null.ctl[1].buttons = KLVR_BTN_TRIGGER;
+    in->UpdateActionState(&active, sizeof active, 1);
+    in->GetDigitalActionData(trig, &d, sizeof d, 0);
+    CHECK(!d.bState);
+    // Back to the right hand: bindings as written.
+    in->SetDominantHand(vr::TrackedControllerRole_RightHand);
+    in->UpdateActionState(&active, sizeof active, 1);
+    CHECK(log_has("dominant hand: right"));
+    in->GetDigitalActionData(trig, &d, sizeof d, 0);
+    CHECK(d.bState && d.activeOrigin == rh);
 
     klvr_null.ctl[0] = klvr_null.ctl[1] = {};
     CHECK(!log_has("NOT IMPLEMENTED"));

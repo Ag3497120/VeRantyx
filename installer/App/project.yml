@@ -14,7 +14,7 @@ packages:
     from: 2.6.4
 settings:
   base:
-    MARKETING_VERSION: "0.1.1"
+    MARKETING_VERSION: "0.1.5"
     CURRENT_PROJECT_VERSION: "1"
     # Where Sparkle looks for new versions, and the public half of the EdDSA key that signs them
     # (scripts/release.sh). Updates stay off until the key is set.
@@ -50,6 +50,10 @@ targets:
         SUEnableAutomaticChecks: true
         # The keychain item for the Steam session: only release.sh sets it (empty: the "(dev)" one, SteamKeychain)
         GloveboxKeychainService: $(GLOVEBOX_KEYCHAIN_SERVICE)
+        # Steam's content servers without HTTPS (its list for China has some) are fetched over HTTP, as Steam's own
+        # client does. Each chunk is encrypted with the depot key and checked after decrypting (CDNClient).
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
     entitlements:
       path: Glovebox/Glovebox.entitlements
       properties: {}

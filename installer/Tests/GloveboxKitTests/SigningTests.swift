@@ -34,4 +34,19 @@ final class SigningTests: XCTestCase {
         XCTAssertNil(SigningKeyAccess.partitions(fromDescription: "not hex"))
         XCTAssertNil(SigningKeyAccess.partitions(fromDescription: "414243"))
     }
+
+    func testApplesIntermediateIsNamedByItsIssuer() {
+        // What an Apple Development certificate's issuer says (#4: the G3 one was missing from the Mac).
+        XCTAssertEqual(AppleIntermediate.generation(issuerCommonName: AppleIntermediate.issuerName, unit: "G3"), "G3")
+        XCTAssertEqual(AppleIntermediate.url(generation: "G3")?.absoluteString,
+                       "https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer")
+        XCTAssertEqual(AppleIntermediate.url(generation: "G6")?.absoluteString,
+                       "https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer")
+        // Anyone else's issuer, or a unit that isn't a generation, is left alone.
+        XCTAssertNil(AppleIntermediate.generation(issuerCommonName: "Developer ID Certification Authority", unit: "G2"))
+        XCTAssertNil(AppleIntermediate.generation(issuerCommonName: "Glovebox CI", unit: "G3"))
+        XCTAssertNil(AppleIntermediate.generation(issuerCommonName: AppleIntermediate.issuerName, unit: nil))
+        XCTAssertNil(AppleIntermediate.generation(issuerCommonName: AppleIntermediate.issuerName, unit: "G3/../x"))
+        XCTAssertNil(AppleIntermediate.url(generation: "G3.cer?x"))
+    }
 }

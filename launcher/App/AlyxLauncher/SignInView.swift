@@ -1,3 +1,4 @@
+import SteamLauncherKit
 import SwiftUI
 
 /// The sign-in card's contents: account name and password (Password AutoFill fills both from
@@ -10,6 +11,9 @@ struct SignInCard: View {
     @EnvironmentObject var model: LauncherModel
     @State private var account = ""
     @State private var password = ""
+    /// Show Password: off until the player asks, and off again whenever the app leaves the front.
+    @State private var reveal = false
+    @Environment(\.scenePhase) private var scenePhase
     @State private var slowApproval = false
     @FocusState private var focus: Field?
     enum Field { case account, password }
@@ -57,13 +61,39 @@ struct SignInCard: View {
                     .focused($focus, equals: .account)
                     .submitLabel(.next)
                     .onSubmit { focus = .password }
-                SecureField("Password", text: $password)
-                    .textContentType(.password)
-                    .focused($focus, equals: .password)
-                    .submitLabel(.go)
-                    .onSubmit(submit)
+                passwordField
             }
             .textFieldStyle(.roundedBorder)
+
+            // Under the field: the length check as it's typed or pasted, the full width of the field (Apple:
+            // give feedback as soon as a problem shows, next to it), then Show Password.
+            if tooLong {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                    Text("The password is too long. Please make sure you entered it correctly.")
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 12)
+                .transition(.opacity)
+            }
+            HStack {
+                Spacer(minLength: 0)
+                Button {
+                    // Typing goes on in the field that takes its place.
+                    let typing = focus == .password
+                    reveal.toggle()
+                    if typing { DispatchQueue.main.async { focus = .password } }
+                } label: {
+                    Label(reveal ? "Hide Password" : "Show Password", systemImage: reveal ? "eye.slash" : "eye")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.borderless)
+            }
+            .font(.callout)
+            .padding(.top, 12)
 
             Button(action: submit) {
                 Group {
@@ -73,7 +103,7 @@ struct SignInCard: View {
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(PillButtonStyle())
-            .disabled(account.isEmpty || password.isEmpty || model.signInStep == .working)
+            .disabled(account.isEmpty || password.isEmpty || tooLong || model.signInStep == .working)
             .padding(.top, 20)
 
             // What comes next, so the phone step isn't a surprise.
@@ -93,6 +123,36 @@ struct SignInCard: View {
             }
             .font(.footnote)
         }
+        .animation(.easeOut(duration: 0.2), value: tooLong)
+        .onChange(of: scenePhase) { _, phase in if phase != .active { reveal = false } }
+        .onAppear {
+            // The demo screens for the length check: a paste far longer than any password, hidden and shown.
+            if DemoState.current == .toolong || DemoState.current == .revealed, password.isEmpty {
+                account = "gordon_freeman"
+                password = String(repeating: "x", count: 300)
+                reveal = DemoState.current == .revealed
+            }
+        }
+    }
+
+    /// The password: dots unless the player asks to see it. Shown, it's still a password to the system
+    /// (no autocorrect or capitals, nothing learned by the keyboard, AutoFill) and is redacted wherever
+    /// visionOS hides private content.
+    private var passwordField: some View {
+        Group {
+            if reveal {
+                TextField("Password", text: $password)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .privacySensitive()
+            } else {
+                SecureField("Password", text: $password)
+            }
+        }
+        .textContentType(.password)
+        .focused($focus, equals: .password)
+        .submitLabel(.go)
+        .onSubmit(submit)
     }
 
     // MARK: Steam Guard
@@ -136,10 +196,14 @@ struct SignInCard: View {
         return "Open the Steam app and tap Steam Guard."
     }
 
+    /// More in the password field than any Steam password: shown as it happens, and Sign In waits.
+    private var tooLong: Bool { SteamAuth.passwordTooLong(password) }
+
     private func submit() {
-        guard !account.isEmpty, !password.isEmpty else { return }
+        guard !account.isEmpty, !password.isEmpty, !tooLong else { return }
         model.signIn(account: account, password: password)
         password = ""
+        reveal = false
     }
 }
 

@@ -23,5 +23,13 @@
 	<string></string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Half-Life: Alyx uses the microphone only when you turn on its Microphone setting.</string>
+	<!-- Not a permission text: the game download. Steam's content servers without HTTPS (its list for China has some)
+	     are fetched over HTTP, as Steam's own client does; each chunk is encrypted with the depot key and checked after
+	     decrypting (SteamLauncherKit's CDNClient). Without this, visionOS refuses every one of them. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

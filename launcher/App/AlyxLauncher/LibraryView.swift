@@ -13,6 +13,7 @@ struct LibraryView: View {
     @State private var firstTime = false
     @State private var showShareAsk = false
     @State private var showLicenses = false
+    @State private var showDiagnostics = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 36) {
@@ -26,7 +27,7 @@ struct LibraryView: View {
                     .id(stage)
                 status
                     .transition(.opacity)
-                    .id(stage)
+                    .id(statusStage)
             }
             .frame(height: 84)
             .animation(.spring(duration: 0.5), value: stage)
@@ -45,6 +46,9 @@ struct LibraryView: View {
         .overlay(alignment: .topLeading) {
             HStack(spacing: 16) {
                 GloveboxChip()
+                if let version = model.gloveboxUpdate {
+                    GloveboxUpdateButton(version: version).transition(.opacity)
+                }
                 if firstTime {
                     JourneySteps(current: journeyStep)
                         .frame(width: 400)
@@ -69,10 +73,17 @@ struct LibraryView: View {
             }
         }
         .sheet(isPresented: $showLicenses) { LicensesSheet() }
+        .sheet(isPresented: $showDiagnostics) { DiagnosticsSheet() }
+        .task {
+            // The design-review screen with the sheet open (DemoState).
+            guard DemoState.current == .diagnostics else { return }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            showDiagnostics = true
+        }
         .clipped()
         .onAppear {
             drift = true
-            firstTime = model.launcher.installed == nil
+            firstTime = model.launcher.installed == nil && DemoState.current?.returningPlayer != true
         }
     }
 
@@ -83,6 +94,16 @@ struct LibraryView: View {
         switch model.install {
         case .downloading, .paused: return true
         default: return false
+        }
+    }
+
+    /// Which status is showing: the button's stage, and while it reads Play, where the saves are (not every file).
+    private var statusStage: String {
+        guard stage == "play" || stage == "launching" else { return stage }
+        switch model.saves {
+        case .syncing: return stage + "-saves"
+        case .failed: return stage + "-offline"
+        default: return stage
         }
     }
 
@@ -179,14 +200,29 @@ struct LibraryView: View {
             if let preparing = model.preparing {
                 PreparingStatus(preparing: preparing)
             } else if model.launching {
-                Label("Getting your latest saves", systemImage: "icloud.and.arrow.down").font(.title3).foregroundStyle(.secondary)
+                if case .syncing(let p) = model.saves {
+                    SavesStatus(progress: p, launching: true)
+                } else {
+                    SavesStatus(progress: CloudSync.Progress(stage: .checking), launching: true)
+                }
             } else if let issue = model.controllerIssue {
                 ControllerStatus(issue: issue, connected: model.controllers.connected)
             } else {
-                // With LauncherModel.cloudUploads off, saves only come from Steam.
-                Label(LauncherModel.cloudUploads ? "Saves in sync with Steam" : "Saves from Steam",
-                      systemImage: LauncherModel.cloudUploads ? "checkmark.icloud" : "icloud.and.arrow.down")
-                    .font(.title3).foregroundStyle(.secondary)
+                switch model.saves {
+                case .syncing(let p):
+                    SavesStatus(progress: p, launching: false)
+                case .failed:
+                    // Play tries again before the game starts.
+                    Label("Couldn't reach Steam Cloud", systemImage: "exclamationmark.icloud")
+                        .font(.title3).foregroundStyle(.secondary)
+                case .synced:
+                    // With LauncherModel.cloudUploads off, saves only come from Steam.
+                    Label(LauncherModel.cloudUploads ? "Saves in sync with Steam" : "Saves from Steam",
+                          systemImage: LauncherModel.cloudUploads ? "checkmark.icloud" : "icloud.and.arrow.down")
+                        .font(.title3).foregroundStyle(.secondary)
+                case nil:
+                    EmptyView()
+                }
             }
         case .installed(updateAvailable: true):
             Text("A new version is ready").font(.title3).foregroundStyle(.secondary)
@@ -201,6 +237,7 @@ struct LibraryView: View {
         Menu {
             Toggle("Help Improve Glovebox", isOn: Binding(get: { model.shareStutters ?? false },
                                                           set: { model.setShareStutters($0) }))
+            Button("Share Diagnostics") { showDiagnostics = true }
             Button("Licenses") { showLicenses = true }
             Button("Sign out", role: .destructive) { model.signOut() }
         } label: {
@@ -341,6 +378,86 @@ private struct PreparingStatus: View {
     private var howLong: String {
         guard let left = preparing.secondsLeft else { return "\(Int(preparing.fraction * 100))%" }
         return left < 60 ? "Almost done" : timeLeftText(left)
+    }
+}
+
+/// Saves on their way to or from Steam Cloud: what's happening, how far along, and always moving, so it's plain the
+/// launcher is at work. After Play it's what the game waits for, which is usually only the quick look at the cloud:
+/// the sync that started with the launcher has brought the saves by then.
+private struct SavesStatus: View {
+    let progress: CloudSync.Progress
+    let launching: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Image(systemName: symbol)
+                    .foregroundStyle(Brand.orange)
+                    .symbolEffect(.pulse, options: .repeating)
+                    .accessibilityHidden(true)
+                Text(headline).font(.title3.weight(.semibold))
+                Spacer()
+                if progress.total > 0 {
+                    Text("\(progress.done) of \(progress.total)")
+                        .font(.title3.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .contentTransition(.numericText())
+                }
+            }
+            if progress.total > 0 {
+                ProgressView(value: Double(progress.done), total: Double(progress.total))
+            } else {
+                SweepingBar()
+            }
+            Text(caption)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: 420)
+        .animation(.easeOut(duration: 0.35), value: progress)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var headline: String {
+        switch progress.stage {
+        case .checking: return launching ? "Checking Steam Cloud" : "Syncing saves"
+        case .downloading: return "Downloading saves"
+        case .uploading: return "Uploading saves"
+        }
+    }
+
+    private var symbol: String {
+        switch progress.stage {
+        case .checking: return "arrow.triangle.2.circlepath.icloud"
+        case .downloading: return "icloud.and.arrow.down"
+        case .uploading: return "icloud.and.arrow.up"
+        }
+    }
+
+    private var caption: String {
+        launching ? "Your latest saves, then the game" : "Steam Cloud · Play anytime"
+    }
+}
+
+/// A progress bar for work with no count yet: a glow sweeping along the track, so it never sits still.
+private struct SweepingBar: View {
+    @State private var sweep = false
+
+    var body: some View {
+        ProgressView(value: 0)
+            .overlay {
+                GeometryReader { g in
+                    Capsule()
+                        .fill(.tint)
+                        .frame(width: g.size.width * 0.3)
+                        .offset(x: sweep ? g.size.width : -g.size.width * 0.3)
+                }
+                .clipShape(.capsule)
+            }
+            .onAppear {
+                withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: false)) { sweep = true }
+            }
+            .accessibilityLabel("In progress")
     }
 }
 

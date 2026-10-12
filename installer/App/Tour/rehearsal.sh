@@ -1125,6 +1125,10 @@ if [ -n "$FAKE" ] && [ -x "$FAKE/Contents/MacOS/Glovebox" ]; then
     has S1 "the card after Deny" "$(texts)" "Glovebox can't install without this"
     expect S1 "the guide after Deny" "$(field stage)" "off"
     expect S1 "builds started after Deny" "$(builds "$T/s1")" "0"
+    # What codesign said goes in a signing log that Copy Diagnostics shows (glovebox#4).
+    slog=$(find "$HOME/Library/Logs/Glovebox" -name 'signing-*.log' -newer "$T/s1" 2>/dev/null | head -1)
+    expect S1 "a signing log after Deny" "$([ -n "$slog" ] && grep -q '^exit [1-9]' "$slog" && grep -q '^certificate ' "$slog" && echo yes || echo no)" "yes"
+    [ -n "$slog" ] && { log "  signing log after Deny: $(tr '\n' '|' < "$slog")"; cp "$slog" "$OUT/S1-signing-deny.log"; }
     # Allow (just once): that one file signs, the key stays as it was, so still no build. Try Again goes
     # straight to macOS's window: the card's why was read already.
     cmd install
@@ -1168,6 +1172,38 @@ if [ -n "$FAKE" ] && [ -x "$FAKE/Contents/MacOS/Glovebox" ]; then
   quitall
   security delete-keychain "$SKC" >/dev/null 2>&1
   cp "$T/fake-S1.log" "$OUT/fake-S1.txt" 2>/dev/null
+  rm -rf "$HOME/Library/Application Support/Glovebox/alyx"
+  security delete-generic-password -s "Glovebox Steam session (dev)" -a current >/dev/null 2>&1
+
+  # S1b. Apple's developer intermediate certificate isn't on the Mac (glovebox#4): codesign can't build the chain and
+  # macOS never asks, so "click Always Allow" can't help. Glovebox looks for the identity's issuer and fetches it from
+  # Apple. This stand-in's issuer is a generation Apple doesn't publish (G9), so the fetch fails and the card says
+  # what's missing; no prompt, no build.
+  echo "S1b. Apple's intermediate certificate missing" > "$T/phase"
+  security delete-keychain "$SKC" >/dev/null 2>&1
+  security create-keychain -p "$SPW" "$SKC" && security unlock-keychain -p "$SPW" "$SKC" && security set-keychain-settings "$SKC"
+  security list-keychains -d user -s $(security list-keychains -d user | tr -d '"' | grep -v gbsign) "$SKC"
+  printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=Apple Worldwide Developer Relations Certification Authority\nOU=G9\nO=Apple Inc.\nC=US\n[ext]\nbasicConstraints=critical,CA:true\nkeyUsage=critical,keyCertSign,cRLSign\n' > "$T/S1b-ca.cnf"
+  /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout "$T/S1b-ca.key" -out "$T/S1b-ca.pem" -days 30 -config "$T/S1b-ca.cnf" -extensions ext 2>/dev/null
+  printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=Apple Development: Jane Appleseed (S0S0S0S0S0)\nOU=A1B2C3D4E5\nO=Jane Appleseed\n[ext]\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\nbasicConstraints=critical,CA:false\n' > "$T/S1b.cnf"
+  /usr/bin/openssl req -new -newkey rsa:2048 -nodes -keyout "$T/S1b.key" -out "$T/S1b.csr" -config "$T/S1b.cnf" 2>/dev/null
+  /usr/bin/openssl x509 -req -in "$T/S1b.csr" -CA "$T/S1b-ca.pem" -CAkey "$T/S1b-ca.key" -CAcreateserial -out "$T/S1b.pem" -days 30 -extfile "$T/S1b.cnf" -extensions ext 2>/dev/null
+  /usr/bin/openssl pkcs12 -export -inkey "$T/S1b.key" -in "$T/S1b.pem" -out "$T/S1b.p12" -passout pass:p12 2>/dev/null
+  log "  S1b identity (issuer not on this Mac): $(security import "$T/S1b.p12" -k "$SKC" -P p12 -T /usr/bin/codesign 2>&1 | tr '\n' ' ')"
+  toinstall S1b
+  touch "$T/s1b"
+  cmd install
+  waitfor "install=error(signing-certificate-missing)" 90
+  expect S1b "install, its issuer missing" "$(field install)" "error\(signing-certificate-missing\)"
+  sleep 1; winshot S1b-card
+  has S1b "the card" "$(texts)" "This Mac is missing an Apple certificate"
+  expect S1b "a keychain prompt" "$([ -n "$(sa)" ] && echo yes || echo no)" "no"
+  expect S1b "builds started" "$(builds "$T/s1b")" "0"
+  slog=$(find "$HOME/Library/Logs/Glovebox" -name 'signing-*.log' -newer "$T/s1b" 2>/dev/null | head -1)
+  expect S1b "the signing log names the missing intermediate and the fetch" "$([ -n "$slog" ] && grep -q 'G9 intermediate is missing' "$slog" && grep -q 'AppleWWDRCAG9.cer answered 404' "$slog" && echo yes || echo no)" "yes"
+  [ -n "$slog" ] && { log "  signing log: $(tr '\n' '|' < "$slog")"; cp "$slog" "$OUT/S1b-signing.log"; }
+  quitall
+  security delete-keychain "$SKC" >/dev/null 2>&1
   rm -rf "$HOME/Library/Application Support/Glovebox/alyx"
   security delete-generic-password -s "Glovebox Steam session (dev)" -a current >/dev/null 2>&1
 

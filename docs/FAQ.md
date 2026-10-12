@@ -59,3 +59,5 @@ Not yet. It's built so that more can be added later.
 ### Something went wrong. How do I report it?
 
 In the Mac app, press **Copy diagnostics**, then [open an issue](https://github.com/glovebox-vr/glovebox/issues/new) and paste it in. The diagnostics contain logs and your setup, but no passwords or game files.
+
+If the problem is in the game, open Glovebox: HLA on the headset, tap your name at the top right and choose **Share Diagnostics**. Send the file to yourself (AirDrop or Mail) and attach it to the issue. It holds the game's logs and your setup, but not your Steam sign-in or your saves.

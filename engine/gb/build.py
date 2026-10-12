@@ -221,10 +221,24 @@ def defaults(package, work, foz_path, emit):
     pd = package_dir(package)
     man = json.load(open(os.path.join(pd, "package.json")))["defaults"]
     tex = str(man["texture_max"])
+    # the game's texture streaming pool, fixed (MB), optional: without it the pool is gameinfo's 2816 MB (Steam Frame),
+    # which cap 1024 never fills. Above 1024 the pool stays full in chapter 1, which is fine as long as the streamer
+    # only drops what is least needed (the floor below) and what is in view fits: cap 2048 does in 2560 MB, cap 4096
+    # needs ~3.3 GB, more than the headset has (Mac, 2026-10-12)
+    pool = int(man["texture_pool_mb"]) if man.get("texture_pool_mb") else 0
+    # the lowest the streamer may scale every texture request when the pool is full: the game's own 0.8 (the Frame's,
+    # and PC's Low/Medium) softens every texture and sharpens it again each time the pool fills, which reads as
+    # pop-in; 1.0 (PC High/Ultra) leaves it to drop the least needed mips (Mac, chapter 1 crawl at cap 4096 and
+    # 3328 MB: 16.4 pop-ins a minute against 22.9 at 0.8; cap 1024: 15.7)
+    bias_min = float(man["texture_bias_min"]) if man.get("texture_bias_min") else 0.0
     demo = os.path.join(work, "alyx-demo")
     shutil.rmtree(demo, ignore_errors=True)
     os.makedirs(demo)
     args_extra = f" +r_texture_stream_max_resolution {tex}"
+    if pool:
+        args_extra += f" +r_texture_pool_size {pool} +r_texture_budget_dynamic 0"
+    if bias_min:
+        args_extra += f" +r_texture_stream_resolution_bias_min {bias_min:.1f}"
     with open(os.path.join(demo, "alyx-env.txt"), "w") as f:
         f.write("# The app's bundled defaults (Glovebox). @demo/ = this folder, @docs/ = Documents.\n")
         for line in open(os.path.join(pd, man["env"])):
@@ -262,9 +276,21 @@ ListenToGameEvent("player_activate", function()
   end
 end, nil)
 ''')
+        if bias_min:
+            f.write(f'''
+-- Texture request floor ({bias_min:.1f}): the menu's Textures Low/Medium set 0.5/0.8, which brings back the pop-in.
+ListenToGameEvent("player_activate", function()
+  if (tonumber(Convars:GetStr("r_texture_stream_resolution_bias_min")) or 0) < {bias_min:.1f} then
+    SendToConsole("r_texture_stream_resolution_bias_min {bias_min:.1f}"); Msg("KLTEXBIAS set {bias_min:.1f}\\n")
+  end
+end, nil)
+''')
     shutil.copyfile(os.path.join(pd, man["fidelity"]), os.path.join(demo, "vr_fidelity_levels_override.csv"))
     video = open(os.path.join(pd, man["video"])).read()
     video = re.sub(r'("setting.r_texture_stream_max_resolution"\s+")\d+"', r'\g<1>' + tex + '"', video)
+    if bias_min:
+        video = re.sub(r'("setting.r_texture_stream_resolution_bias_min"\s+")[\d.]+"', r'\g<1>' + f"{bias_min:.6f}" + '"',
+                       video)
     open(os.path.join(demo, "video2.txt"), "w").write(video)
     shutil.copyfile(foz_path, os.path.join(demo, "demo.foz"))
     # how the game makes its Vulkan device, for "Preparing graphics" before Play (kl_app_prewarm) on a first launch;
@@ -279,7 +305,9 @@ end, nil)
             "endpoint": "https://glovebox-reports.vercel.app/api/report"}
     json.dump(info, open(os.path.join(demo, "glovebox.json"), "w"), indent=1)
     share = {"1": "yes", "0": "no"}.get(os.environ.get("GLOVEBOX_SHARE_STUTTERS", ""), "ask on the headset")
-    emit("step", step="defaults", status="ok", detail=f"settings (texture cap {tex}, stutter reports: {share})")
+    tex_txt = (f"texture cap {tex}" + (f", texture pool {pool} MB" if pool else "")
+               + (f", floor {bias_min:.1f}" if bias_min else ""))
+    emit("step", step="defaults", status="ok", detail=f"settings ({tex_txt}, stutter reports: {share})")
     return demo
 
 
@@ -420,11 +448,14 @@ def install(app_path, device_id, emit, pause=5):
 
 # ---- collect ----
 
-COLLECT = ["Documents/klfz/recorded.foz", "Documents/klfz/slow.txt", "Documents/alyx/assets/hlvr/console.log"]
+# The runtime's log of this run and of the one before (a freeze's [stall] dump survives the relaunch there), and
+# its crash report, beside the game's own console.
+COLLECT = ["Documents/klfz/recorded.foz", "Documents/klfz/slow.txt", "Documents/alyx/assets/hlvr/console.log",
+           "Documents/klepton-boot.log", "Documents/klepton-boot.prev.log", "Documents/klepton-crash.log"]
 
 
 def collect(package, work, device_id, team, game_dir, emit):
-    """Copy the headset app's pipeline recording, hitch log and game console to <work>/feedback/<time>/, and turn the
+    """Copy the headset app's pipeline recording, hitch log, game console and runtime logs to <work>/feedback/<time>/, and turn the
     recording into a recipe (no shader code) that can be shared."""
     import time
     out = os.path.join(work, "feedback", time.strftime("%Y%m%d-%H%M%S"))
