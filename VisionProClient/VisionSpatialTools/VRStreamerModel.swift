@@ -57,12 +57,20 @@ final class VRStreamerModel: ObservableObject {
     /// Appends one line to Documents/immersive-diagnostics.log without
     /// changing the Diagnostics row.
     func appendDiagnosticsLog(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let timestamp = Self.logTimestamp.string(from: Date())
         let line = "\(timestamp) \(message)\n"
         guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
             return
         }
         let logURL = documents.appendingPathComponent("immersive-diagnostics.log")
+        // A stats line every 5 s would otherwise grow without end: past 4 MB
+        // the log moves to immersive-diagnostics.previous.log (one kept).
+        if let size = (try? logURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+           size > Self.maxLogBytes {
+            let previous = documents.appendingPathComponent("immersive-diagnostics.previous.log")
+            try? FileManager.default.removeItem(at: previous)
+            try? FileManager.default.moveItem(at: logURL, to: previous)
+        }
         let data = Data(line.utf8)
         if FileManager.default.fileExists(atPath: logURL.path),
            let handle = try? FileHandle(forWritingTo: logURL) {
@@ -73,6 +81,9 @@ final class VRStreamerModel: ObservableObject {
             try? data.write(to: logURL, options: .atomic)
         }
     }
+
+    private static let logTimestamp = ISO8601DateFormatter()
+    private static let maxLogBytes = 4 * 1024 * 1024
 
     func immersiveSpaceDidAppear() {
         isImmersiveSpacePresented = true
