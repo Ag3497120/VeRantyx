@@ -35,7 +35,21 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface)
 }
 
 // ---- shaders ------------------------------------------------------------------------------------------------------------
-typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id, hash; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
+// function: the Metal function, once compiled (ready). Shaders compile in the background: Metal's compiler service
+// works on many at once, and a game creating thousands while it loads would otherwise wait for each in turn; the
+// first draw (or dispatch) that needs one waits for it.
+typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id, hash; volatile int ready; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
+static pthread_mutex_t g_compile_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_compiled = PTHREAD_COND_INITIALIZER;
+static id<MTLFunction> shader_function(d3d_shader *s) {
+    if (!s) return nil;
+    if (!__atomic_load_n(&s->ready, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_lock(&g_compile_lock);
+        while (!s->ready) pthread_cond_wait(&g_compiled, &g_compile_lock);
+        pthread_mutex_unlock(&g_compile_lock);
+    }
+    return (__bridge id<MTLFunction>)s->function;
+}
 static uint32_t g_next_id = 1;
 static void shader_destroy(d3d_object *o) {
     d3d_shader *s = (d3d_shader *)o;
@@ -102,20 +116,31 @@ static HRESULT create_shader(d3d_device *dev, const void *code, size_t size, int
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256(code, (CC_LONG)size, digest);
     s->hash = (uint32_t)digest[0] << 24 | (uint32_t)digest[1] << 16 | (uint32_t)digest[2] << 8 | digest[3];
-    NSError *err = nil;
-    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    id<MTLLibrary> lib = [(__bridge id<MTLDevice>)dev->mtl newLibraryWithSource:@(s->info.msl) options:nil error:&err];
-    id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
-    if (vx_trace) shader_stats(t1 - t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t1);
-    if (!fn) {
-        vx_log("Direct3D: translated shader did not compile: %s", err.localizedDescription.UTF8String);
-        if (vx_trace) vx_log("%s", s->info.msl);
-        d3d_release(&s->base);
-        return E_INVALIDARG;
-    }
-    s->function = (void *)CFBridgingRetain(fn);
+    if (!out) { d3d_release(&s->base); return S_FALSE; }   // only checking: translated is enough
     s->id = __sync_fetch_and_add(&g_next_id, 1);
-    if (!out) { d3d_release(&s->base); return S_FALSE; }
+    uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    NSString *source = @(s->info.msl);
+    static int sync = -1;                              // VXRT_SYNC_SHADERS=1: compile before returning, as before
+    if (sync < 0) sync = getenv("VXRT_SYNC_SHADERS") != NULL;
+    d3d_addref(&s->base);                              // kept until its compile is done
+    void (^done)(id<MTLLibrary>, NSError *) = ^(id<MTLLibrary> lib, NSError *err) {
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+        if (vx_trace) shader_stats(t1 - t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t1);
+        if (!fn) {
+            vx_log("Direct3D: translated shader %08x did not compile: %s", s->hash, err.localizedDescription.UTF8String);
+            if (vx_trace) vx_log("%s", s->info.msl);
+        }
+        pthread_mutex_lock(&g_compile_lock);
+        s->function = fn ? (void *)CFBridgingRetain(fn) : NULL;
+        __atomic_store_n(&s->ready, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&g_compiled);
+        pthread_mutex_unlock(&g_compile_lock);
+        d3d_release(&s->base);
+    };
+    if (sync) {
+        NSError *err = nil;
+        done([(__bridge id<MTLDevice>)dev->mtl newLibraryWithSource:source options:nil error:&err], err);
+    } else [(__bridge id<MTLDevice>)dev->mtl newLibraryWithSource:source options:nil completionHandler:done];
     *out = s;
     return S_OK;
 }
@@ -328,6 +353,8 @@ typedef struct d3d_draw_state {
     d3d_raster *raster;
     RECT scissor[16];
     uint32_t nscissors;
+    void *dummy_depth;                         // id<MTLTexture>: for shaders writing depth with no depth target bound
+    void *pass_depth;                          // the dummy depth the open render encoder has (or NULL)
     struct pso_key { uint32_t vs, ps, layout, blend, color[8], depth, stride[16]; } last_key;   // the last pipeline state used
     void *last_pso;
     // What is set on the open render encoder (cleared when one is made), so a draw sends Metal only what
@@ -513,8 +540,9 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
     id<MTLRenderPipelineState> ps_state;
 
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction = (__bridge id<MTLFunction>)vs->function;
-    pd.fragmentFunction = ps ? (__bridge id<MTLFunction>)ps->function : nil;
+    pd.vertexFunction = shader_function(vs);
+    pd.fragmentFunction = shader_function(ps);
+    if (!pd.vertexFunction || (ps && !pd.fragmentFunction)) return nil;   // a shader that did not compile
     if (s->layout && s->layout->n) {
         MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
         for (uint32_t i = 0; i < s->layout->n; i++) {
@@ -638,8 +666,8 @@ static id<MTLTexture> shader_texture(d3d_view *v) {
 }
 
 // The render pass for the bound targets: kept open while they stay the same; contents are loaded.
-static id<MTLRenderCommandEncoder> render_pass(d3d_context *c) {
-    int same = c->render != NULL && c->render_dsv == c->dsv;
+static id<MTLRenderCommandEncoder> render_pass(d3d_context *c, id<MTLTexture> extra_depth) {
+    int same = c->render != NULL && c->render_dsv == c->dsv && state_of(c)->pass_depth == (__bridge void *)extra_depth;
     for (int i = 0; i < 8 && same; i++) same = c->render_rtv[i] == c->rtv[i];
     if (same) return (__bridge id<MTLRenderCommandEncoder>)c->render;
     d3d_end_render(c);
@@ -666,6 +694,11 @@ static id<MTLRenderCommandEncoder> render_pass(d3d_context *c) {
         }
         any = 1;
     }
+    if (!c->dsv && extra_depth) {                  // Direct3D drops depth written with no depth target; Metal needs one
+        rp.depthAttachment.texture = extra_depth;
+        rp.depthAttachment.loadAction = MTLLoadActionDontCare; rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+    }
+    state_of(c)->pass_depth = (__bridge void *)extra_depth;
     if (!any) return nil;
     id<MTLRenderCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) renderCommandEncoderWithDescriptor:rp];
     c->render = (void *)CFBridgingRetain(enc);
@@ -838,14 +871,31 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
     id<MTLTexture> colors[8] = { nil };
     int ncolors = 0;
     for (int i = 0; i < 8; i++) if (c->rtv[i]) { colors[i] = view_texture(c->rtv[i]); ncolors = i + 1; }
-    id<MTLTexture> depth = c->dsv ? view_texture(c->dsv) : nil;
+    id<MTLTexture> depth = c->dsv ? view_texture(c->dsv) : nil, extra = nil;
+    if (!depth && s->shader[STAGE_PS] && s->shader[STAGE_PS]->info.writes_depth && colors[0]) {
+        id<MTLTexture> d = (__bridge id<MTLTexture>)s->dummy_depth;
+        if (!d || d.width != colors[0].width || d.height != colors[0].height || d.sampleCount != colors[0].sampleCount) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:colors[0].width height:colors[0].height mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModePrivate;
+            if (colors[0].sampleCount > 1) { td.textureType = MTLTextureType2DMultisample; td.sampleCount = colors[0].sampleCount; }
+            d = [colors[0].device newTextureWithDescriptor:td];
+            if (s->dummy_depth) CFRelease(s->dummy_depth);
+            s->dummy_depth = (void *)CFBridgingRetain(d);
+        }
+        depth = extra = d;
+    }
     id<MTLRenderPipelineState> pso = pipeline(c, s, colors, ncolors, depth);
     if (!pso) return nil;
-    id<MTLRenderCommandEncoder> enc = render_pass(c);
+    id<MTLRenderCommandEncoder> enc = render_pass(c, extra);
     if (!enc) return nil;
     bound_state *bs = &s->bound;
     if (bs->pso != (__bridge void *)pso) { [enc setRenderPipelineState:pso]; bs->pso = (__bridge void *)pso; }
     id<MTLDepthStencilState> dss = s->depth ? (__bridge id<MTLDepthStencilState>)s->depth->mtl : default_depth_state(c);
+    if (extra) {                                       // no depth target in Direct3D terms: no depth test
+        static void *off;
+        if (!off) { uint32_t d[13] = { 0, 0, 8 /* ALWAYS */ }; off = make_depth_state((__bridge id<MTLDevice>)c->base.dev->mtl, d); }
+        dss = (__bridge id<MTLDepthStencilState>)off;
+    }
     if (bs->dss != (__bridge void *)dss) { [enc setDepthStencilState:dss]; bs->dss = (__bridge void *)dss; }
     if (bs->stencil_ref != s->stencil_ref) { [enc setStencilReferenceValue:s->stencil_ref]; bs->stencil_ref = s->stencil_ref; }
     if (memcmp(bs->blend, s->blend_factor, sizeof bs->blend)) {
@@ -935,8 +985,9 @@ static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) 
     d3d_shader *cs = s->shader[STAGE_CS];
     if (!cs || !x || !y || !z) return;
     if (!cs->compute) {
+        if (!shader_function(cs)) return;              // did not compile
         NSError *err = nil;
-        id<MTLComputePipelineState> pso = [(__bridge id<MTLDevice>)c->base.dev->mtl newComputePipelineStateWithFunction:(__bridge id<MTLFunction>)cs->function error:&err];
+        id<MTLComputePipelineState> pso = [(__bridge id<MTLDevice>)c->base.dev->mtl newComputePipelineStateWithFunction:shader_function(cs) error:&err];
         if (!pso) { vx_log("Direct3D: compute pipeline failed: %s", err.localizedDescription.UTF8String); return; }
         cs->compute = (void *)CFBridgingRetain(pso);
     }

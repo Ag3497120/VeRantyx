@@ -33,6 +33,7 @@ typedef struct {
     uint32_t threads[3];            // [numthreads(x, y, z)]
     int uses_sizes;                 // reads buffer sizes (bufinfo) or UAV counters from buffer(DXBC_SIZES_BUFFER)
     uint8_t uav_counters;           // u# with a hidden counter (append, consume, IncrementCounter)
+    int writes_depth;               // a pixel shader writing oDepth
     char error[256];
 } dxbc_shader;
 

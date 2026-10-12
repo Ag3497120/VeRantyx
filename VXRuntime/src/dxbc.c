@@ -1048,7 +1048,7 @@ static void declare(gen *g, uint32_t op, uint32_t token, reader *r, pool *pl) {
                 else if (sv == 2 && g->clip_reg < 0) { g->clip_reg = (int)o.index[0]; g->clip_mask = o.mask; }   // SV_ClipDistance
                 else g->out_sv[o.index[0]] = sv;
             }
-        } else if (o.type == OPD_OUTPUT_DEPTH || o.type == OPD_OUTPUT_DEPTH_GE || o.type == OPD_OUTPUT_DEPTH_LE) g->out_depth = 1;
+        } else if (o.type == OPD_OUTPUT_DEPTH || o.type == OPD_OUTPUT_DEPTH_GE || o.type == OPD_OUTPUT_DEPTH_LE) g->out_depth = g->sh->writes_depth = 1;
         else if (o.type == OPD_OUTPUT_COVERAGE) g->out_coverage = 1;
         break;
     case OP_DCL_CONSTANT_BUFFER:
