@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/ucontext.h>
+#include <execinfo.h>
 #include "vx.h"
 
 // ---- structures --------------------------------------------------------------------------------------------------
@@ -60,16 +61,15 @@ enum { UNW_FLAG_EHANDLER = 1, UNW_FLAG_UHANDLER = 2, UNW_FLAG_CHAININFO = 4 };
 void vx_restore_context(const CONTEXT *ctx) __attribute__((noreturn));
 
 // ---- function lookup ------------------------------------------------------------------------------------------------
-static int pc_in_image(uint64_t pc) {
-    return pc >= (uint64_t)vx_proc.image_base && pc < (uint64_t)vx_proc.image_base + vx_proc.image_size;
-}
+static int pc_in_image(uint64_t pc) { return vx_image_at(pc) != NULL; }
 
 static WINAPI RUNTIME_FUNCTION *RtlLookupFunctionEntry(uint64_t pc, uint64_t *base, void *history) {
     (void)history;
-    if (!pc_in_image(pc) || !vx_proc.pdata_size) return NULL;
-    *base = (uint64_t)vx_proc.image_base;
-    RUNTIME_FUNCTION *table = (RUNTIME_FUNCTION *)(vx_proc.image_base + vx_proc.pdata_rva);
-    size_t lo = 0, hi = vx_proc.pdata_size / sizeof(RUNTIME_FUNCTION);
+    const vx_image *m = vx_image_at(pc);
+    if (!m || !m->pdata_size) return NULL;
+    *base = (uint64_t)m->base;
+    RUNTIME_FUNCTION *table = (RUNTIME_FUNCTION *)(m->base + m->pdata_rva);
+    size_t lo = 0, hi = m->pdata_size / sizeof(RUNTIME_FUNCTION);
     DWORD rva = (DWORD)(pc - *base);
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
@@ -81,7 +81,8 @@ static WINAPI RUNTIME_FUNCTION *RtlLookupFunctionEntry(uint64_t pc, uint64_t *ba
 }
 
 static WINAPI void *RtlPcToFileHeader(uint64_t pc, void **base) {
-    *base = pc_in_image(pc) ? vx_proc.image_base : NULL;
+    const vx_image *m = vx_image_at(pc);
+    *base = m ? m->base : NULL;
     return *base;
 }
 
@@ -387,9 +388,18 @@ static void on_signal(int sig, siginfo_t *si, void *ucv) {
     _STRUCT_X86_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
     if (!pc_in_image(ss->__rip)) {
         // A fault in this runtime or in macOS code is a bug here, not the program's exception.
-        vx_log("signal %d at %#llx (address %p) outside the program", sig, (unsigned long long)ss->__rip, si->si_addr);
-        signal(sig, SIG_DFL);
-        return;
+        // Print where (this runtime's frames) and exit at once rather than waiting for a macOS crash report.
+        vx_log("signal %d at %#llx (address %p) outside the program; native backtrace:", sig, (unsigned long long)ss->__rip, si->si_addr);
+        void *frames[32];
+        frames[0] = (void *)ss->__rip;
+        int n = 1;
+        for (uint64_t *fp = (uint64_t *)ss->__rbp; fp && n < 32 && ((uint64_t)fp & 7) == 0; fp = (uint64_t *)fp[0]) {
+            if (fp[1] < 4096) break;
+            frames[n++] = (void *)fp[1];
+            if (fp[0] <= (uint64_t)fp) break;
+        }
+        backtrace_symbols_fd(frames, n, 2);
+        _exit(128 + sig);
     }
     // Build the record and context in a frame on the faulting thread's own stack, below its red zone, and make
     // the signal return into signal_dispatch there.

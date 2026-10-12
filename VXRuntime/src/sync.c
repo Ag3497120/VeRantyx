@@ -21,7 +21,7 @@
 #define STILL_ACTIVE  259u
 #define CREATE_SUSPENDED 4u
 
-enum { OBJ_THREAD = 1, OBJ_EVENT, OBJ_MUTEX, OBJ_SEMAPHORE };
+enum { OBJ_THREAD = 1, OBJ_EVENT, OBJ_MUTEX, OBJ_SEMAPHORE, OBJ_OTHER };
 typedef struct {
     int type, refs;
     int done, started; DWORD suspended, exit_code, tid; pthread_t pthread;     // thread
@@ -29,6 +29,8 @@ typedef struct {
     int manual, signaled;                                                     // event
     DWORD owner, recursion;                                                   // mutex
     LONG count, max;                                                          // semaphore
+    int kind; void *data; void (*destroy)(void *);                            // other modules' objects
+    char *name;                                                               // named events, mutexes, semaphores
 } vx_object;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -51,10 +53,27 @@ static int handle_index(HANDLE h) {
     return v >= 0 && v % 4 == 0 && v / 4 < MAX_HANDLES ? (int)(v / 4) : -1;
 }
 static vx_object *lookup(HANDLE h) { int i = handle_index(h); return i >= 0 ? g_handles[i] : NULL; }
-static void unref(vx_object *o) { if (--o->refs == 0) free(o); }
+// Named objects of this process, so a second Create/Open with the same name finds the first.
+static vx_object *g_named[1024];
+static int g_named_count;
+static vx_object *find_named(const char *name, int type) {
+    for (int i = 0; i < g_named_count; i++) if (g_named[i]->type == type && !strcmp(g_named[i]->name, name)) return g_named[i];
+    return NULL;
+}
+
+static void unref(vx_object *o) {
+    if (--o->refs) return;
+    if (o->destroy) o->destroy(o->data);
+    if (o->name) {
+        for (int i = 0; i < g_named_count; i++) if (g_named[i] == o) { g_named[i] = g_named[--g_named_count]; break; }
+        free(o->name);
+    }
+    free(o);
+}
 static vx_object *new_object(int type) { vx_object *o = calloc(1, sizeof *o); o->type = type; return o; }
 
 // ---- threads -----------------------------------------------------------------------------------------------------
+static void fls_thread_exit(void);
 static __thread vx_object *t_self;          // this thread's object (created on demand for threads not made here)
 static __thread jmp_buf *t_exit_jump;       // where ExitThread leaves the thread's start routine
 static __thread DWORD t_exit_code;
@@ -75,14 +94,16 @@ static void *thread_main(void *p) {
     while (t->suspended) pthread_cond_wait(&g_changed, &g_lock);
     t->started = 1;
     pthread_mutex_unlock(&g_lock);
-    vx_call_tls_callbacks(2 /* DLL_THREAD_ATTACH */);
+    vx_notify_thread(2 /* DLL_THREAD_ATTACH */);
     jmp_buf exit_jump;
     t_exit_jump = &exit_jump;
     DWORD code;
     if (!setjmp(exit_jump)) code = t->start(t->arg);
     else code = t_exit_code;
     t_exit_jump = NULL;
-    vx_call_tls_callbacks(3 /* DLL_THREAD_DETACH */);
+    vx_notify_thread(3 /* DLL_THREAD_DETACH */);
+    fls_thread_exit();
+    vx_thread_detach();
     pthread_mutex_lock(&g_lock);
     t->done = 1; t->exit_code = code;
     t_self = NULL;
@@ -189,6 +210,22 @@ static WINAPI BOOL GetProcessAffinityMask(HANDLE p, uint64_t *pm, uint64_t *sm) 
 static WINAPI BOOL SetProcessAffinityMask(HANDLE p, uint64_t m) { (void)p; (void)m; return 1; }
 static WINAPI uint64_t SetThreadAffinityMask(HANDLE h, uint64_t m) { (void)h; (void)m; return cpu_mask(); }
 
+static WINAPI HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid) {
+    (void)access; (void)inherit;
+    pthread_mutex_lock(&g_lock);
+    vx_object *t = NULL;
+    for (int i = 0; i < MAX_HANDLES && !t; i++)
+        if (g_handles[i] && g_handles[i]->type == OBJ_THREAD && g_handles[i]->tid == tid) t = g_handles[i];
+    if (!t && tid == vx_current_tid()) t = self_object();
+    HANDLE h = t ? new_handle(t) : NULL;
+    pthread_mutex_unlock(&g_lock);
+    if (!t) vx_set_last_error(87);
+    return h;
+}
+// Killing a thread at an arbitrary point cannot be done safely on macOS (it may hold locks of the system's
+// libraries); programs see the call fail.
+static WINAPI BOOL TerminateThread(HANDLE h, DWORD code) { (void)h; (void)code; vx_log("TerminateThread is not supported"); vx_set_last_error(5); return 0; }
+
 static WINAPI HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid) {
     (void)access; (void)inherit;
     if (pid == (DWORD)getpid()) return (HANDLE)(intptr_t)-1;
@@ -197,39 +234,69 @@ static WINAPI HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid) {
 }
 
 // ---- events, mutexes, semaphores ----------------------------------------------------------------------------------
-static HANDLE create(vx_object *o) {
+// Makes a handle for a new object, or for the existing object of that name (ERROR_ALREADY_EXISTS).
+static HANDLE create_named(vx_object *o, const char *name) {
     pthread_mutex_lock(&g_lock);
+    vx_object *existing = name && *name ? find_named(name, o->type) : NULL;
+    if (existing) { free(o); o = existing; }
+    else if (name && *name && g_named_count < 1024) { o->name = strdup(name); g_named[g_named_count++] = o; }
     HANDLE h = new_handle(o);
     pthread_mutex_unlock(&g_lock);
-    if (!h) { free(o); vx_set_last_error(4 /* ERROR_TOO_MANY_OPEN_FILES */); return NULL; }
-    vx_set_last_error(0);                       // names are ignored: every object is new
+    if (!h) { if (!existing) free(o); vx_set_last_error(4 /* ERROR_TOO_MANY_OPEN_FILES */); return NULL; }
+    vx_set_last_error(existing ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
     return h;
 }
-static HANDLE create_event(BOOL manual, BOOL initial) {
-    vx_object *o = new_object(OBJ_EVENT); o->manual = manual; o->signaled = initial; return create(o);
+static HANDLE open_named(const char *name, int type) {
+    pthread_mutex_lock(&g_lock);
+    vx_object *o = name ? find_named(name, type) : NULL;
+    HANDLE h = o ? new_handle(o) : NULL;
+    pthread_mutex_unlock(&g_lock);
+    if (!o) vx_set_last_error(2 /* ERROR_FILE_NOT_FOUND */);
+    return h;
 }
-static WINAPI HANDLE CreateEventA(void *sa, BOOL manual, BOOL initial, const char *name) { (void)sa; (void)name; return create_event(manual, initial); }
-static WINAPI HANDLE CreateEventW(void *sa, BOOL manual, BOOL initial, const WCHAR *name) { (void)sa; (void)name; return create_event(manual, initial); }
+static HANDLE open_named_w(const WCHAR *name, int type) { char *a = vx_utf8_dup(name); HANDLE h = open_named(a, type); free(a); return h; }
+static HANDLE create_event(BOOL manual, BOOL initial, const char *name) {
+    vx_object *o = new_object(OBJ_EVENT); o->manual = manual; o->signaled = initial; return create_named(o, name);
+}
+static HANDLE create_event_w(BOOL manual, BOOL initial, const WCHAR *name) { char *a = vx_utf8_dup(name); HANDLE h = create_event(manual, initial, a); free(a); return h; }
+static WINAPI HANDLE CreateEventA(void *sa, BOOL manual, BOOL initial, const char *name) { (void)sa; return create_event(manual, initial, name); }
+static WINAPI HANDLE CreateEventW(void *sa, BOOL manual, BOOL initial, const WCHAR *name) { (void)sa; return create_event_w(manual, initial, name); }
+static WINAPI HANDLE CreateEventExA(void *sa, const char *name, DWORD flags, DWORD access) {
+    (void)sa; (void)access; return create_event(flags & 1, (flags & 2) != 0, name);
+}
 static WINAPI HANDLE CreateEventExW(void *sa, const WCHAR *name, DWORD flags, DWORD access) {
-    (void)sa; (void)name; (void)access;
-    return create_event(flags & 1 /* CREATE_EVENT_MANUAL_RESET */, (flags & 2) != 0 /* CREATE_EVENT_INITIAL_SET */);
+    (void)sa; (void)access;
+    return create_event_w(flags & 1 /* CREATE_EVENT_MANUAL_RESET */, (flags & 2) != 0 /* CREATE_EVENT_INITIAL_SET */, name);
 }
-static HANDLE create_mutex(BOOL owned) {
+static WINAPI HANDLE OpenEventA(DWORD access, BOOL inherit, const char *name) { (void)access; (void)inherit; return open_named(name, OBJ_EVENT); }
+static WINAPI HANDLE OpenEventW(DWORD access, BOOL inherit, const WCHAR *name) { (void)access; (void)inherit; return open_named_w(name, OBJ_EVENT); }
+static HANDLE create_mutex(BOOL owned, const char *name) {
     vx_object *o = new_object(OBJ_MUTEX);
     if (owned) { o->owner = vx_current_tid(); o->recursion = 1; }
-    return create(o);
+    HANDLE h = create_named(o, name);
+    // Opening an existing mutex never takes ownership of it.
+    return h;
 }
-static WINAPI HANDLE CreateMutexA(void *sa, BOOL owned, const char *name) { (void)sa; (void)name; return create_mutex(owned); }
-static WINAPI HANDLE CreateMutexW(void *sa, BOOL owned, const WCHAR *name) { (void)sa; (void)name; return create_mutex(owned); }
-static HANDLE create_semaphore(LONG initial, LONG max) {
+static WINAPI HANDLE CreateMutexA(void *sa, BOOL owned, const char *name) { (void)sa; return create_mutex(owned, name); }
+static WINAPI HANDLE CreateMutexW(void *sa, BOOL owned, const WCHAR *name) { (void)sa; char *a = vx_utf8_dup(name); HANDLE h = create_mutex(owned, a); free(a); return h; }
+static WINAPI HANDLE CreateMutexExW(void *sa, const WCHAR *name, DWORD flags, DWORD access) {
+    (void)sa; (void)access; char *a = vx_utf8_dup(name); HANDLE h = create_mutex(flags & 1 /* CREATE_MUTEX_INITIAL_OWNER */, a); free(a); return h;
+}
+static WINAPI HANDLE OpenMutexA(DWORD access, BOOL inherit, const char *name) { (void)access; (void)inherit; return open_named(name, OBJ_MUTEX); }
+static WINAPI HANDLE OpenMutexW(DWORD access, BOOL inherit, const WCHAR *name) { (void)access; (void)inherit; return open_named_w(name, OBJ_MUTEX); }
+static HANDLE create_semaphore(LONG initial, LONG max, const char *name) {
     if (max <= 0 || initial < 0 || initial > max) { vx_set_last_error(87); return NULL; }
-    vx_object *o = new_object(OBJ_SEMAPHORE); o->count = initial; o->max = max; return create(o);
+    vx_object *o = new_object(OBJ_SEMAPHORE); o->count = initial; o->max = max; return create_named(o, name);
 }
-static WINAPI HANDLE CreateSemaphoreA(void *sa, LONG initial, LONG max, const char *name) { (void)sa; (void)name; return create_semaphore(initial, max); }
-static WINAPI HANDLE CreateSemaphoreW(void *sa, LONG initial, LONG max, const WCHAR *name) { (void)sa; (void)name; return create_semaphore(initial, max); }
+static WINAPI HANDLE CreateSemaphoreA(void *sa, LONG initial, LONG max, const char *name) { (void)sa; return create_semaphore(initial, max, name); }
+static WINAPI HANDLE CreateSemaphoreW(void *sa, LONG initial, LONG max, const WCHAR *name) {
+    (void)sa; char *a = vx_utf8_dup(name); HANDLE h = create_semaphore(initial, max, a); free(a); return h;
+}
 static WINAPI HANDLE CreateSemaphoreExW(void *sa, LONG initial, LONG max, const WCHAR *name, DWORD flags, DWORD access) {
-    (void)sa; (void)name; (void)flags; (void)access; return create_semaphore(initial, max);
+    (void)flags; (void)access; return CreateSemaphoreW(sa, initial, max, name);
 }
+static WINAPI HANDLE OpenSemaphoreA(DWORD access, BOOL inherit, const char *name) { (void)access; (void)inherit; return open_named(name, OBJ_SEMAPHORE); }
+static WINAPI HANDLE OpenSemaphoreW(DWORD access, BOOL inherit, const WCHAR *name) { (void)access; (void)inherit; return open_named_w(name, OBJ_SEMAPHORE); }
 
 // Runs `change` on the object of type `type` behind h, with the lock held, and wakes the waiters.
 static BOOL modify(HANDLE h, int type, int (*change)(vx_object *, intptr_t), intptr_t arg) {
@@ -346,6 +413,25 @@ static WINAPI BOOL CloseHandle(HANDLE h) {
     return 0;
 }
 
+BOOL vx_handle_close(HANDLE h) { return CloseHandle(h); }
+
+HANDLE vx_handle_new(int kind, void *data, void (*destroy)(void *)) {
+    vx_object *o = new_object(OBJ_OTHER);
+    o->kind = kind; o->data = data; o->destroy = destroy;
+    pthread_mutex_lock(&g_lock);
+    HANDLE h = new_handle(o);
+    pthread_mutex_unlock(&g_lock);
+    if (!h) free(o);
+    return h;
+}
+void *vx_handle_data(HANDLE h, int kind) {
+    pthread_mutex_lock(&g_lock);
+    vx_object *o = lookup(h);
+    void *d = o && o->type == OBJ_OTHER && o->kind == kind ? o->data : NULL;
+    pthread_mutex_unlock(&g_lock);
+    return d;
+}
+
 static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_process, HANDLE *dst, DWORD access, BOOL inherit, DWORD options) {
     (void)src_process; (void)dst_process; (void)access; (void)inherit;
     if ((intptr_t)src == -1) { *dst = src; return 1; }
@@ -446,6 +532,92 @@ static WINAPI BOOL SleepConditionVariableSRW(uint64_t *cv, void *l, DWORD ms, DW
     return woken;
 }
 
+// ---- fiber-local storage --------------------------------------------------------------------------------------------------------
+// Without fibers, FLS is thread-local storage whose callbacks run when a thread ends (MSVC's C runtime keeps its
+// per-thread data here).
+#define MAX_FLS 128
+typedef void (WINAPI *fls_callback)(void *);
+static fls_callback g_fls_callbacks[MAX_FLS];
+static uint8_t g_fls_used[MAX_FLS];
+static __thread void *t_fls[MAX_FLS];
+static WINAPI DWORD FlsAlloc(fls_callback cb) {
+    pthread_mutex_lock(&g_lock);
+    DWORD i = 0;
+    while (i < MAX_FLS && g_fls_used[i]) i++;
+    if (i < MAX_FLS) { g_fls_used[i] = 1; g_fls_callbacks[i] = cb; }
+    pthread_mutex_unlock(&g_lock);
+    if (i == MAX_FLS) { vx_set_last_error(8); return 0xffffffffu; }   // FLS_OUT_OF_INDEXES
+    return i;
+}
+static WINAPI void *FlsGetValue(DWORD i) { if (i >= MAX_FLS) { vx_set_last_error(87); return NULL; } vx_set_last_error(0); return t_fls[i]; }
+static WINAPI BOOL FlsSetValue(DWORD i, void *v) { if (i >= MAX_FLS || !g_fls_used[i]) { vx_set_last_error(87); return 0; } t_fls[i] = v; return 1; }
+static WINAPI BOOL FlsFree(DWORD i) {
+    if (i >= MAX_FLS || !g_fls_used[i]) { vx_set_last_error(87); return 0; }
+    if (t_fls[i] && g_fls_callbacks[i]) g_fls_callbacks[i](t_fls[i]);     // this thread's value only
+    t_fls[i] = NULL;
+    g_fls_used[i] = 0;
+    return 1;
+}
+static void fls_thread_exit(void) {
+    for (int i = 0; i < MAX_FLS; i++)
+        if (t_fls[i] && g_fls_used[i] && g_fls_callbacks[i]) { void *v = t_fls[i]; t_fls[i] = NULL; g_fls_callbacks[i](v); }
+}
+
+// ---- interlocked singly linked lists -----------------------------------------------------------------------------------------------
+// SLIST_HEADER (16 bytes): the first entry, then the depth. A lock keeps it simple; the lists are short-lived.
+typedef struct slist_entry { struct slist_entry *next; } slist_entry;
+typedef struct { slist_entry *first; uint64_t depth; } slist_header;
+static pthread_mutex_t g_slist_lock = PTHREAD_MUTEX_INITIALIZER;
+static WINAPI void InitializeSListHead(slist_header *h) { h->first = NULL; h->depth = 0; }
+static WINAPI slist_entry *InterlockedPushEntrySList(slist_header *h, slist_entry *e) {
+    pthread_mutex_lock(&g_slist_lock);
+    slist_entry *old = h->first;
+    e->next = old; h->first = e; h->depth++;
+    pthread_mutex_unlock(&g_slist_lock);
+    return old;
+}
+static WINAPI slist_entry *InterlockedPopEntrySList(slist_header *h) {
+    pthread_mutex_lock(&g_slist_lock);
+    slist_entry *e = h->first;
+    if (e) { h->first = e->next; h->depth--; }
+    pthread_mutex_unlock(&g_slist_lock);
+    return e;
+}
+static WINAPI slist_entry *InterlockedFlushSList(slist_header *h) {
+    pthread_mutex_lock(&g_slist_lock);
+    slist_entry *e = h->first;
+    h->first = NULL; h->depth = 0;
+    pthread_mutex_unlock(&g_slist_lock);
+    return e;
+}
+static WINAPI uint16_t QueryDepthSList(slist_header *h) { return (uint16_t)h->depth; }
+
+// ---- WaitOnAddress -----------------------------------------------------------------------------------------------------------------
+// Waiters sleep while the value at the address still equals the compare value; every wake wakes all waiters
+// (spurious wakeups are allowed), which then re-check.
+static pthread_mutex_t g_addr_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_addr_changed = PTHREAD_COND_INITIALIZER;
+static WINAPI BOOL WaitOnAddress(volatile void *addr, const void *cmp, size_t size, DWORD ms) {
+    struct timespec deadline;
+    if (ms != INFINITE) deadline_after(&deadline, ms);
+    BOOL ok = 1;
+    pthread_mutex_lock(&g_addr_lock);
+    while (!memcmp((const void *)addr, cmp, size)) {
+        if (ms == INFINITE) pthread_cond_wait(&g_addr_changed, &g_addr_lock);
+        else if (ms == 0 || pthread_cond_timedwait(&g_addr_changed, &g_addr_lock, &deadline) == ETIMEDOUT) { ok = 0; break; }
+    }
+    pthread_mutex_unlock(&g_addr_lock);
+    if (!ok) vx_set_last_error(1460);
+    return ok;
+}
+static WINAPI void WakeByAddressAll(void *addr) {
+    (void)addr;
+    pthread_mutex_lock(&g_addr_lock);
+    pthread_cond_broadcast(&g_addr_changed);
+    pthread_mutex_unlock(&g_addr_lock);
+}
+static WINAPI void WakeByAddressSingle(void *addr) { WakeByAddressAll(addr); }
+
 // ---- one-time initialization ----------------------------------------------------------------------------------------------------
 static pthread_mutex_t g_once_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 typedef BOOL (WINAPI *init_once_fn)(void *once, void *param, void **context);
@@ -467,9 +639,14 @@ static const vx_export sync_k32[] = {
     VX_EXPORT(ResumeThread), VX_EXPORT(SuspendThread), VX_EXPORT(GetThreadContext), VX_EXPORT(SetThreadContext),
     VX_EXPORT(GetThreadPriority), VX_EXPORT(SetThreadPriority), VX_EXPORT(SetThreadDescription), VX_EXPORT(SwitchToThread),
     VX_EXPORT(GetProcessAffinityMask), VX_EXPORT(SetProcessAffinityMask), VX_EXPORT(SetThreadAffinityMask), VX_EXPORT(OpenProcess),
-    VX_EXPORT(CreateEventA), VX_EXPORT(CreateEventW), VX_EXPORT(CreateEventExW), VX_EXPORT(SetEvent), VX_EXPORT(ResetEvent),
-    VX_EXPORT(CreateMutexA), VX_EXPORT(CreateMutexW), VX_EXPORT(ReleaseMutex),
-    VX_EXPORT(CreateSemaphoreA), VX_EXPORT(CreateSemaphoreW), VX_EXPORT(CreateSemaphoreExW), VX_EXPORT(ReleaseSemaphore),
+    VX_EXPORT(CreateEventA), VX_EXPORT(CreateEventW), VX_EXPORT(CreateEventExA), VX_EXPORT(CreateEventExW),
+    VX_EXPORT(OpenEventA), VX_EXPORT(OpenEventW), VX_EXPORT(SetEvent), VX_EXPORT(ResetEvent),
+    VX_EXPORT(CreateMutexA), VX_EXPORT(CreateMutexW), VX_EXPORT(CreateMutexExW), VX_EXPORT(OpenMutexA), VX_EXPORT(OpenMutexW),
+    VX_EXPORT(ReleaseMutex),
+    VX_EXPORT(CreateSemaphoreA), VX_EXPORT(CreateSemaphoreW), VX_EXPORT(CreateSemaphoreExW), VX_EXPORT(OpenSemaphoreA),
+    VX_EXPORT(OpenSemaphoreW), VX_EXPORT(ReleaseSemaphore),
+    VX_EXPORT(OpenThread), VX_EXPORT(TerminateThread),
+    VX_EXPORT(WaitOnAddress), VX_EXPORT(WakeByAddressAll), VX_EXPORT(WakeByAddressSingle),
     VX_EXPORT(WaitForSingleObject), VX_EXPORT(WaitForSingleObjectEx), VX_EXPORT(WaitForMultipleObjects),
     VX_EXPORT(WaitForMultipleObjectsEx), VX_EXPORT(SleepEx), VX_EXPORT(CloseHandle), VX_EXPORT(DuplicateHandle),
     VX_EXPORT(InitializeCriticalSection), VX_EXPORT(InitializeCriticalSectionAndSpinCount), VX_EXPORT(InitializeCriticalSectionEx),
@@ -480,6 +657,9 @@ static const vx_export sync_k32[] = {
     VX_EXPORT(InitializeConditionVariable), VX_EXPORT(WakeConditionVariable), VX_EXPORT(WakeAllConditionVariable),
     VX_EXPORT(SleepConditionVariableCS), VX_EXPORT(SleepConditionVariableSRW),
     VX_EXPORT(InitOnceInitialize), VX_EXPORT(InitOnceExecuteOnce),
+    VX_EXPORT(FlsAlloc), VX_EXPORT(FlsGetValue), VX_EXPORT(FlsSetValue), VX_EXPORT(FlsFree),
+    VX_EXPORT(InitializeSListHead), VX_EXPORT(InterlockedPushEntrySList), VX_EXPORT(InterlockedPopEntrySList),
+    VX_EXPORT(InterlockedFlushSList), VX_EXPORT(QueryDepthSList),
 };
 static const vx_export sync_crt[] = { VX_EXPORT(_beginthreadex), VX_EXPORT(_endthreadex) };
 

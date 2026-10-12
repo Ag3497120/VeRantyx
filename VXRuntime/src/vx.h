@@ -33,9 +33,22 @@ typedef struct {
     char    **envp;
     char     *command_line;
     WCHAR    *command_line_w;
-    uint32_t  pdata_rva, pdata_size;   // the exception directory (.pdata RUNTIME_FUNCTIONs)
 } vx_process;
 extern vx_process vx_proc;
+
+// A loaded PE image: the program or one of its DLLs.
+typedef struct {
+    char      name[64];                // file name, e.g. "steam_api64.dll"
+    char     *unix_path, *windows_path;
+    uint8_t  *base;
+    size_t    size;
+    uint32_t  entry_rva, export_rva, export_size;
+    uint32_t  pdata_rva, pdata_size;   // the exception directory (.pdata RUNTIME_FUNCTIONs)
+    uint32_t  tls_rva;                 // the TLS directory, 0 if none
+    DWORD     tls_index;               // ~0u if none
+    int       is_dll, refs, initialized, no_thread_calls;
+} vx_image;
+const vx_image *vx_image_at(uint64_t pc);    // the image containing an address, or NULL
 
 // TEB layout (the fields Windows code reads directly). Allocated per thread, 8 KB.
 enum {
@@ -46,7 +59,8 @@ enum {
 enum { PEB_IMAGE_BASE = 0x10, PEB_PROCESS_HEAP = 0x30, PEB_SIZE = 0x1000 };
 uint8_t *vx_teb(void);                 // this thread's TEB (creates it on first use)
 void     vx_thread_attach(void);       // TEB + gs slots + TLS for the calling thread
-void     vx_call_tls_callbacks(DWORD reason);   // the image's TLS callbacks (1 process attach, 2/3 thread attach/detach)
+void     vx_thread_detach(void);       // frees the calling thread's TEB and TLS (after its detach notifications)
+void     vx_notify_thread(DWORD reason);   // TLS callbacks and DllMain for thread attach (2) / detach (3)
 DWORD    vx_current_tid(void);
 
 // Last error lives in the TEB like on Windows.
@@ -55,6 +69,11 @@ DWORD vx_get_last_error(void);
 
 // Handles: small table; stdio handles are the pseudo values Windows uses.
 int vx_handle_fd(HANDLE h);            // -1 if not a file handle
+// Other kernel objects owned by a module (find handles, ...): `destroy` runs when the last handle closes.
+enum { VX_HANDLE_FIND = 1, VX_HANDLE_MAPPING };
+HANDLE vx_handle_new(int kind, void *data, void (*destroy)(void *));
+void  *vx_handle_data(HANDLE h, int kind);    // NULL unless h is a handle of that kind
+BOOL   vx_handle_close(HANDLE h);
 
 // Diagnostics (stderr); VXRT_TRACE=1 also logs every implemented call that opts in.
 void vx_log(const char *fmt, ...);
@@ -66,6 +85,27 @@ void vx_ucrt_init(void);
 void vx_sync_init(void);               // threads and kernel objects (sync.c)
 void vx_seh_init(void);                // exceptions (seh.c)
 void vx_seh_install_signals(void);     // CPU faults become Windows exceptions
+void vx_text_init(void);               // code pages, environment (text.c)
+void vx_files_init(void);              // files and paths (files.c)
+void vx_registry_init(void);           // advapi32 registry (registry.c)
+
+// Text (text.c). Counts are in code units; the converters return the length needed and write at most cap units.
+size_t vx_utf8_to_utf16(const char *s, size_t n, WCHAR *out, size_t cap);
+size_t vx_utf16_to_utf8(const WCHAR *w, size_t n, char *out, size_t cap);
+size_t vx_wcslen(const WCHAR *w);
+char  *vx_utf8_dup(const WCHAR *w);    // malloc'd, NULL for NULL
+WCHAR *vx_utf16_dup(const char *s);
+DWORD  vx_return_string_a(const char *s, char *buf, DWORD cap);    // Windows' "copy out or report the size"
+DWORD  vx_return_string_w(const char *s, WCHAR *buf, DWORD cap);
+
+// Paths (files.c): C:\ is $VXRT_ROOT/drive_c, Z:\ is the Mac's root.
+const char *vx_root(void);
+int   vx_full_path(const char *win, char *out, size_t cap);     // canonical absolute Windows path
+int   vx_unix_path(const char *win, char *out, size_t cap);     // 0 (last error set) if unmapped
+void  vx_windows_path(const char *unix_path, char *out, size_t cap);
+void  vx_get_cwd(char *out, size_t cap);
+int   vx_set_cwd(const char *win);
+DWORD vx_error_from_errno(int e);
 
 // Formatting with a Windows va_list (a pointer to 8-byte argument slots).
 int vx_format(char *out, size_t cap, const char *fmt, const char *ap);

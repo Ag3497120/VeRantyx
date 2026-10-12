@@ -1,0 +1,4 @@
+LIBRARY vxplugin.dll
+EXPORTS
+    plugin_value @7
+    forwarded = vxdll.vxdll_add

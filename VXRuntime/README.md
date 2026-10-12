@@ -8,7 +8,12 @@ each milestone is a small Windows program that has to run unchanged.
 make check          # builds build/vxrt and the test programs, runs them
 build/vxrt program.exe [args...]
 VXRT_TRACE=1 build/vxrt program.exe     # also lists imports that are not implemented yet
+build/vxrt build/dllprobe.exe 'Z:\path\to\some.dll' [export ...]   # how far a real DLL gets
 ```
+
+`C:\` is `$VXRT_ROOT/drive_c` (default `~/.vxrt/drive_c`, created on first run with `C:\windows\system32` and
+`C:\windows\temp`); `Z:\` is the whole Mac file system. The registry lives in `$VXRT_ROOT/registry.txt`.
+`make check` uses `build/root` so the tests never touch `~/.vxrt`.
 
 Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the test programs.
 
@@ -28,8 +33,8 @@ Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the 
 |---|---|---|
 | 1. PE loader, kernel32 core, UCRT startup and printf | `tests/hello_k32.c`, `tests/hello_crt.c` | Works (2026-10-12) |
 | 2. Threads, waits, events, mutexes, semaphores, condition variables; structured exception handling (.pdata/.xdata unwinding), C++ exceptions, CPU faults as exceptions | `tests/threads.c`, `tests/cxx_exceptions.cpp`, `tests/hw_exceptions.c` | Works (2026-10-12) |
-| 3. Files and paths (C:\ mapping), registry, loading real PE DLLs (the game's own: steam_api64, openvr_api) | — | Next |
-| 4. user32/gdi windows on AppKit, a message loop; Direct3D 11 on Metal (`tools/d3dprobe`) | — | |
+| 3. Files and paths (C:\ mapping), registry, file mappings and shared memory, loading real PE DLLs (imports, exports by name/ordinal, forwarders, DllMain, per-DLL TLS) | `tests/files.c`, `tests/dll_test.cpp` (+ `vxdll.dll`, `vxplugin.dll`); `tools/dllprobe.c` | Works (2026-10-12). Of the 109 DLLs in Half-Life: Alyx's `game/bin/win64` (tier0, steam_api64, openvr_api, Qt, ...), 103 load and run their initialization; the rest need user32, ws2_32, I/O completion ports or MSVC's vcruntime140 |
+| 4. user32/gdi windows on AppKit, a message loop, winmm, ws2_32 (the next most imported system DLLs); Direct3D 11 on Metal (`tools/d3dprobe`) | — | Next |
 | 5. Direct3D 11 at game scale, Direct3D 12 (Metal Shader Converter), audio | — | |
 | 6. Networking, cryptography, Chromium-class programs (the Steam client) | — | |
 
