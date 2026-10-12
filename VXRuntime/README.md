@@ -15,6 +15,11 @@ build/vxrt build/dllprobe.exe 'Z:\path\to\some.dll' [export ...]   # how far a r
 `C:\windows\temp`); `Z:\` is the whole Mac file system. The registry lives in `$VXRT_ROOT/registry.txt`.
 `make check` uses `build/root` so the tests never touch `~/.vxrt`.
 
+Windows run on AppKit: the program runs on a thread of its own and the macOS main thread runs AppKit, so a
+program's message loop and window procedures work from any thread. `VXRT_NO_ACTIVATE=1` keeps windows from
+taking focus (used by `make check`); `VXRT_SNAPSHOT=file.png` saves a window's view as it is closed.
+`build/vxrt build/window.exe --interactive` opens the test window and prints the keyboard and mouse messages it gets.
+
 Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the test programs.
 
 ## Design
@@ -34,9 +39,10 @@ Needs Xcode's clang and `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`) for the 
 | 1. PE loader, kernel32 core, UCRT startup and printf | `tests/hello_k32.c`, `tests/hello_crt.c` | Works (2026-10-12) |
 | 2. Threads, waits, events, mutexes, semaphores, condition variables; structured exception handling (.pdata/.xdata unwinding), C++ exceptions, CPU faults as exceptions | `tests/threads.c`, `tests/cxx_exceptions.cpp`, `tests/hw_exceptions.c` | Works (2026-10-12) |
 | 3. Files and paths (C:\ mapping), registry, file mappings and shared memory, loading real PE DLLs (imports, exports by name/ordinal, forwarders, DllMain, per-DLL TLS) | `tests/files.c`, `tests/dll_test.cpp` (+ `vxdll.dll`, `vxplugin.dll`); `tools/dllprobe.c` | Works (2026-10-12). Of the 109 DLLs in Half-Life: Alyx's `game/bin/win64` (tier0, steam_api64, openvr_api, Qt, ...), 103 load and run their initialization; the rest need user32, ws2_32, I/O completion ports or MSVC's vcruntime140 |
-| 4. user32/gdi windows on AppKit, a message loop, winmm, ws2_32 (the next most imported system DLLs); Direct3D 11 on Metal (`tools/d3dprobe`) | — | Next |
-| 5. Direct3D 11 at game scale, Direct3D 12 (Metal Shader Converter), audio | — | |
-| 6. Networking, cryptography, Chromium-class programs (the Steam client) | — | |
+| 4. user32 windows on AppKit (classes, message queues with cross-thread SendMessage, timers, WM_PAINT, keyboard with virtual keys and scan codes, mouse, system metrics, displays, message boxes), gdi32 on Core Graphics (DCs, brushes, pens, fonts via Core Text, DIB sections, StretchDIBits, BitBlt), ws2_32 on BSD sockets, winmm timers | `tests/window.c`, `tests/net.c` | Works (2026-10-12). 104 of Alyx's 109 `bin/win64` DLLs load and initialize |
+| 5. COM (ole32/oleaut32: 44 of the remaining Alyx imports), I/O completion ports, MSVC C++ exceptions (vcruntime140), Direct3D 11 on Metal (`tools/d3dprobe`), audio | — | Next |
+| 6. Direct3D 11 at game scale, Direct3D 12 (Metal Shader Converter), raw input, OpenGL | — | |
+| 7. Cryptography, processes, Chromium-class programs (the Steam client) | — | |
 
 ## Known risks (research items)
 

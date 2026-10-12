@@ -13,7 +13,9 @@
 
 typedef uint32_t DWORD;
 typedef int32_t  LONG;
-typedef int      BOOL;
+#ifndef __OBJC__
+typedef int      BOOL;              // Objective-C (cocoa.m) has its own BOOL and calls none of the functions using this one
+#endif
 typedef void    *HANDLE;
 typedef uint16_t WCHAR;
 
@@ -88,6 +90,10 @@ void vx_seh_install_signals(void);     // CPU faults become Windows exceptions
 void vx_text_init(void);               // code pages, environment (text.c)
 void vx_files_init(void);              // files and paths (files.c)
 void vx_registry_init(void);           // advapi32 registry (registry.c)
+void vx_user32_init(void);             // windows and messages (user32.c, cocoa.m)
+void vx_gdi_init(void);                // drawing (gdi.c)
+void vx_net_init(void);                // ws2_32 (net.c)
+void vx_mm_init(void);                 // winmm, imm32 (mm.c)
 
 // Text (text.c). Counts are in code units; the converters return the length needed and write at most cap units.
 size_t vx_utf8_to_utf16(const char *s, size_t n, WCHAR *out, size_t cap);

@@ -1,18 +1,20 @@
 # vxrt: the VeRantyx Windows runtime. An x86-64 macOS binary; Rosetta 2 runs it and the Windows program together.
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=13.0
-SRC     = src/loader.c src/kernel32.c src/ucrt.c src/sync.c src/seh.c src/context.S src/text.c src/files.c src/registry.c
+SRC     = src/loader.c src/kernel32.c src/ucrt.c src/sync.c src/seh.c src/context.S src/text.c src/files.c src/registry.c \
+          src/user32.c src/gdi.c src/net.c src/mm.c src/cocoa.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
 
-build/vxrt: $(SRC) src/vx.h
+build/vxrt: $(SRC) src/vx.h src/ui.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ $(SRC)
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
-       build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe
+       build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
+       build/window.exe build/net.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -34,6 +36,14 @@ build/hw_exceptions.exe: tests/hw_exceptions.c
 build/cxx_exceptions.exe: tests/cxx_exceptions.cpp
 	@mkdir -p build
 	$(MINGWXX) -O1 -static -o $@ $<
+
+build/window.exe: tests/window.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lgdi32 -lwinmm
+
+build/net.exe: tests/net.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lws2_32
 
 build/dllprobe.exe: tools/dllprobe.c
 	@mkdir -p build
@@ -57,6 +67,7 @@ build/vxplugin.dll: tests/vxplugin.c tests/vxplugin.def
 
 # The tests' C: drive and registry live in build/root, not in ~/.vxrt.
 check: export VXRT_ROOT = build/root
+check: export VXRT_NO_ACTIVATE = 1
 check: all
 	build/vxrt build/hello_k32.exe
 	build/vxrt build/hello_crt.exe one "two words"
@@ -65,6 +76,8 @@ check: all
 	build/vxrt build/hw_exceptions.exe
 	build/vxrt build/files.exe
 	build/vxrt build/dll_test.exe
+	build/vxrt build/net.exe
+	build/vxrt build/window.exe
 
 clean:
 	rm -rf build

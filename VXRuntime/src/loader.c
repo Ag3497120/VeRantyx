@@ -321,7 +321,12 @@ static vx_image *load_dll(const char *name) {
 static void *resolve(const char *dll, const char *name, int ordinal, int depth) {
     vx_image *m = image_by_name(dll);
     if (m) return pe_export(m, name, ordinal, depth);
-    if (is_builtin(dll)) return name ? vx_find_export(dll, name) : NULL;
+    if (is_builtin(dll)) {
+        if (name) return vx_find_export(dll, name);
+        char by_number[16];                                       // built-ins list ordinals as "#n"
+        snprintf(by_number, sizeof by_number, "#%d", ordinal);
+        return vx_find_export(dll, by_number);
+    }
     m = load_dll(dll);
     return m && init_dll(m) ? pe_export(m, name, ordinal, depth) : NULL;
 }
@@ -541,7 +546,9 @@ static WINAPI void *GetProcAddress(void *module, const char *name) {
     pthread_mutex_lock(&g_loader_lock);
     vx_image *m = image_by_base(module);
     int builtin = !m && is_builtin_handle(module);
-    void *fn = m ? pe_export(m, ordinal ? NULL : name, ordinal, 0) : builtin && !ordinal ? vx_find_export((const char *)module, name) : NULL;
+    char by_number[16];
+    snprintf(by_number, sizeof by_number, "#%d", ordinal);
+    void *fn = m ? pe_export(m, ordinal ? NULL : name, ordinal, 0) : builtin ? vx_find_export((const char *)module, ordinal ? by_number : name) : NULL;
     pthread_mutex_unlock(&g_loader_lock);
     if (!fn) vx_set_last_error(m || builtin ? 127 /* ERROR_PROC_NOT_FOUND */ : 6 /* ERROR_INVALID_HANDLE */);
     return fn;
@@ -582,6 +589,23 @@ static const vx_export loader_k32[] = {
 };
 
 // ---- main ------------------------------------------------------------------------------------------------------
+int vx_ui_run_main(int (*program)(void *), void *arg, size_t stack);
+
+// The program's main thread: loads it (DLL initializers run here, on a Windows thread) and calls its entry.
+static int run_program(void *arg) {
+    const char *exe = arg;
+    vx_thread_attach();
+    pthread_mutex_lock(&g_loader_lock);
+    vx_image *m = load_pe(exe, 1);
+    pthread_mutex_unlock(&g_loader_lock);
+    if (!m) return 1;
+    if (vx_trace) vx_log("%s: entry %#x", m->name, m->entry_rva);
+    tls_callbacks(m, 1 /* DLL_PROCESS_ATTACH */);
+    typedef DWORD (WINAPI *entry_fn)(void);
+    DWORD rc = ((entry_fn)(m->base + m->entry_rva))();
+    fflush(stdout);
+    return (int)rc;
+}
 int main(int argc, char **argv, char **envp) {
     if (argc < 2) { fprintf(stderr, "usage: vxrt program.exe [args...]\n"); return 2; }
     vx_trace = getenv("VXRT_TRACE") && *getenv("VXRT_TRACE") == '1';
@@ -594,6 +618,10 @@ int main(int argc, char **argv, char **envp) {
     vx_text_init();
     vx_files_init();
     vx_registry_init();
+    vx_user32_init();
+    vx_gdi_init();
+    vx_net_init();
+    vx_mm_init();
 
     vx_proc.argc = argc - 1;
     vx_proc.argv = argv + 1;
@@ -610,25 +638,24 @@ int main(int argc, char **argv, char **envp) {
     }
     vx_proc.command_line_w = vx_utf16_dup(vx_proc.command_line);
 
-    // The main thread is attached before anything loads: DLL initializers run during loading.
     g_peb = calloc(1, PEB_SIZE);
     pthread_key_create(&g_teb_key, NULL);
-    vx_thread_attach();
     vx_seh_install_signals();
-
-    char *exe = realpath(argv[1], NULL);
+    static char *exe;
+    exe = realpath(argv[1], NULL);
     if (!exe) { vx_log("cannot open %s: %s", argv[1], strerror(errno)); return 1; }
     snprintf(g_exe_dir, sizeof g_exe_dir, "%s", exe);
     *strrchr(g_exe_dir, '/') = 0;
-    pthread_mutex_lock(&g_loader_lock);
-    vx_image *m = load_pe(exe, 1);
-    pthread_mutex_unlock(&g_loader_lock);
-    if (!m) return 1;
-    if (vx_trace) vx_log("%s: entry %#x", m->name, m->entry_rva);
-
-    tls_callbacks(m, 1 /* DLL_PROCESS_ATTACH */);
-    typedef DWORD (WINAPI *entry_fn)(void);
-    DWORD rc = ((entry_fn)(m->base + m->entry_rva))();
-    fflush(stdout);
-    return (int)rc;
+    // The program runs on a thread of its own with the stack its header asks for (8 MB at least); the macOS
+    // main thread stays free for AppKit (see cocoa.m).
+    uint64_t reserve = 0;
+    FILE *f = fopen(exe, "rb");
+    if (f) {
+        uint8_t hdr[0x400];
+        size_t n = fread(hdr, 1, sizeof hdr, f);
+        fclose(f);
+        uint32_t nt = n >= 0x40 ? rd32(hdr + 0x3c) : 0;
+        if (nt && nt + 24 + 80 <= n) reserve = rd64(hdr + nt + 24 + 72);   // SizeOfStackReserve
+    }
+    return vx_ui_run_main(run_program, exe, reserve > (8u << 20) ? (size_t)reserve : (8u << 20));
 }
