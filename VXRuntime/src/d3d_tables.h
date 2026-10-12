@@ -930,6 +930,20 @@ static WINAPI HRESULT stub_IDXGIResource_GetEvictionPriority(void *self) { (void
 static void *const vtstub_IDXGIResource[] = { (void *)stub_IDXGIResource_QueryInterface, (void *)stub_IDXGIResource_AddRef, (void *)stub_IDXGIResource_Release, (void *)stub_IDXGIResource_SetPrivateData, (void *)stub_IDXGIResource_SetPrivateDataInterface, (void *)stub_IDXGIResource_GetPrivateData, (void *)stub_IDXGIResource_GetParent, (void *)stub_IDXGIResource_GetDevice, (void *)stub_IDXGIResource_GetSharedHandle, (void *)stub_IDXGIResource_GetUsage, (void *)stub_IDXGIResource_SetEvictionPriority, (void *)stub_IDXGIResource_GetEvictionPriority };
 #define VT_COUNT_IDXGIResource 12
 static const GUID IID_IDXGIResource = { 0x035f3ab4, 0x482e, 0x4e50, { 0xb4, 0x1f, 0x8a, 0x7f, 0x8b, 0xd8, 0x96, 0x0b } };
+static const char *const vt_IDXGIKeyedMutex[] = { "QueryInterface", "AddRef", "Release", "SetPrivateData", "SetPrivateDataInterface", "GetPrivateData", "GetParent", "GetDevice", "AcquireSync", "ReleaseSync" };
+static WINAPI HRESULT stub_IDXGIKeyedMutex_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDXGIKeyedMutex::QueryInterface"); }
+static WINAPI HRESULT stub_IDXGIKeyedMutex_AddRef(void *self) { (void)self; return d3d_not_implemented("IDXGIKeyedMutex::AddRef"); }
+static WINAPI HRESULT stub_IDXGIKeyedMutex_Release(void *self) { (void)self; return d3d_not_implemented("IDXGIKeyedMutex::Release"); }
+static WINAPI HRESULT stub_IDXGIKeyedMutex_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("IDXGIKeyedMutex::SetPrivateData"); }
+static WINAPI HRESULT stub_IDXGIKeyedMutex_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("IDXGIKeyedMutex::SetPrivateDataInterface"); }
+static WINAPI HRESULT stub_IDXGIKeyedMutex_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("IDXGIKeyedMutex::GetPrivateData"); }
+static WINAPI HRESULT stub_IDXGIKeyedMutex_GetParent(void *self) { (void)self; return d3d_not_implemented("IDXGIKeyedMutex::GetParent"); }
+static WINAPI HRESULT stub_IDXGIKeyedMutex_GetDevice(void *self) { (void)self; return d3d_not_implemented("IDXGIKeyedMutex::GetDevice"); }
+static WINAPI HRESULT stub_IDXGIKeyedMutex_AcquireSync(void *self) { (void)self; return d3d_not_implemented("IDXGIKeyedMutex::AcquireSync"); }
+static WINAPI HRESULT stub_IDXGIKeyedMutex_ReleaseSync(void *self) { (void)self; return d3d_not_implemented("IDXGIKeyedMutex::ReleaseSync"); }
+static void *const vtstub_IDXGIKeyedMutex[] = { (void *)stub_IDXGIKeyedMutex_QueryInterface, (void *)stub_IDXGIKeyedMutex_AddRef, (void *)stub_IDXGIKeyedMutex_Release, (void *)stub_IDXGIKeyedMutex_SetPrivateData, (void *)stub_IDXGIKeyedMutex_SetPrivateDataInterface, (void *)stub_IDXGIKeyedMutex_GetPrivateData, (void *)stub_IDXGIKeyedMutex_GetParent, (void *)stub_IDXGIKeyedMutex_GetDevice, (void *)stub_IDXGIKeyedMutex_AcquireSync, (void *)stub_IDXGIKeyedMutex_ReleaseSync };
+#define VT_COUNT_IDXGIKeyedMutex 10
+static const GUID IID_IDXGIKeyedMutex = { 0x9d8e1289, 0xd7b3, 0x465f, { 0x81, 0x26, 0x25, 0x0e, 0x34, 0x9a, 0xf8, 0x5d } };
 static const char *const vt_IDXGIFactory2[] = { "QueryInterface", "AddRef", "Release", "SetPrivateData", "SetPrivateDataInterface", "GetPrivateData", "GetParent", "EnumAdapters", "MakeWindowAssociation", "GetWindowAssociation", "CreateSwapChain", "CreateSoftwareAdapter", "EnumAdapters1", "IsCurrent", "IsWindowedStereoEnabled", "CreateSwapChainForHwnd", "CreateSwapChainForCoreWindow", "GetSharedResourceAdapterLuid", "RegisterStereoStatusWindow", "RegisterStereoStatusEvent", "UnregisterStereoStatus", "RegisterOcclusionStatusWindow", "RegisterOcclusionStatusEvent", "UnregisterOcclusionStatus", "CreateSwapChainForComposition" };
 static WINAPI HRESULT stub_IDXGIFactory2_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDXGIFactory2::QueryInterface"); }
 static WINAPI HRESULT stub_IDXGIFactory2_AddRef(void *self) { (void)self; return d3d_not_implemented("IDXGIFactory2::AddRef"); }
@@ -1008,6 +1022,24 @@ static WINAPI HRESULT stub_IDXGIAdapter2_GetDesc2(void *self) { (void)self; retu
 static void *const vtstub_IDXGIAdapter2[] = { (void *)stub_IDXGIAdapter2_QueryInterface, (void *)stub_IDXGIAdapter2_AddRef, (void *)stub_IDXGIAdapter2_Release, (void *)stub_IDXGIAdapter2_SetPrivateData, (void *)stub_IDXGIAdapter2_SetPrivateDataInterface, (void *)stub_IDXGIAdapter2_GetPrivateData, (void *)stub_IDXGIAdapter2_GetParent, (void *)stub_IDXGIAdapter2_EnumOutputs, (void *)stub_IDXGIAdapter2_GetDesc, (void *)stub_IDXGIAdapter2_CheckInterfaceSupport, (void *)stub_IDXGIAdapter2_GetDesc1, (void *)stub_IDXGIAdapter2_GetDesc2 };
 #define VT_COUNT_IDXGIAdapter2 12
 static const GUID IID_IDXGIAdapter2 = { 0x0aa1ae0a, 0xfa0e, 0x4b84, { 0x86, 0x44, 0xe0, 0x5f, 0xf8, 0xe5, 0xac, 0xb5 } };
+static const char *const vt_IDXGIResource1[] = { "QueryInterface", "AddRef", "Release", "SetPrivateData", "SetPrivateDataInterface", "GetPrivateData", "GetParent", "GetDevice", "GetSharedHandle", "GetUsage", "SetEvictionPriority", "GetEvictionPriority", "CreateSubresourceSurface", "CreateSharedHandle" };
+static WINAPI HRESULT stub_IDXGIResource1_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::QueryInterface"); }
+static WINAPI HRESULT stub_IDXGIResource1_AddRef(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::AddRef"); }
+static WINAPI HRESULT stub_IDXGIResource1_Release(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::Release"); }
+static WINAPI HRESULT stub_IDXGIResource1_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::SetPrivateData"); }
+static WINAPI HRESULT stub_IDXGIResource1_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::SetPrivateDataInterface"); }
+static WINAPI HRESULT stub_IDXGIResource1_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::GetPrivateData"); }
+static WINAPI HRESULT stub_IDXGIResource1_GetParent(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::GetParent"); }
+static WINAPI HRESULT stub_IDXGIResource1_GetDevice(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::GetDevice"); }
+static WINAPI HRESULT stub_IDXGIResource1_GetSharedHandle(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::GetSharedHandle"); }
+static WINAPI HRESULT stub_IDXGIResource1_GetUsage(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::GetUsage"); }
+static WINAPI HRESULT stub_IDXGIResource1_SetEvictionPriority(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::SetEvictionPriority"); }
+static WINAPI HRESULT stub_IDXGIResource1_GetEvictionPriority(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::GetEvictionPriority"); }
+static WINAPI HRESULT stub_IDXGIResource1_CreateSubresourceSurface(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::CreateSubresourceSurface"); }
+static WINAPI HRESULT stub_IDXGIResource1_CreateSharedHandle(void *self) { (void)self; return d3d_not_implemented("IDXGIResource1::CreateSharedHandle"); }
+static void *const vtstub_IDXGIResource1[] = { (void *)stub_IDXGIResource1_QueryInterface, (void *)stub_IDXGIResource1_AddRef, (void *)stub_IDXGIResource1_Release, (void *)stub_IDXGIResource1_SetPrivateData, (void *)stub_IDXGIResource1_SetPrivateDataInterface, (void *)stub_IDXGIResource1_GetPrivateData, (void *)stub_IDXGIResource1_GetParent, (void *)stub_IDXGIResource1_GetDevice, (void *)stub_IDXGIResource1_GetSharedHandle, (void *)stub_IDXGIResource1_GetUsage, (void *)stub_IDXGIResource1_SetEvictionPriority, (void *)stub_IDXGIResource1_GetEvictionPriority, (void *)stub_IDXGIResource1_CreateSubresourceSurface, (void *)stub_IDXGIResource1_CreateSharedHandle };
+#define VT_COUNT_IDXGIResource1 14
+static const GUID IID_IDXGIResource1 = { 0x30961379, 0x4609, 0x4a41, { 0x99, 0x8e, 0x54, 0xfe, 0x56, 0x7e, 0xe0, 0xc1 } };
 static const char *const vt_IDXGIFactory3[] = { "QueryInterface", "AddRef", "Release", "SetPrivateData", "SetPrivateDataInterface", "GetPrivateData", "GetParent", "EnumAdapters", "MakeWindowAssociation", "GetWindowAssociation", "CreateSwapChain", "CreateSoftwareAdapter", "EnumAdapters1", "IsCurrent", "IsWindowedStereoEnabled", "CreateSwapChainForHwnd", "CreateSwapChainForCoreWindow", "GetSharedResourceAdapterLuid", "RegisterStereoStatusWindow", "RegisterStereoStatusEvent", "UnregisterStereoStatus", "RegisterOcclusionStatusWindow", "RegisterOcclusionStatusEvent", "UnregisterOcclusionStatus", "CreateSwapChainForComposition", "GetCreationFlags" };
 static WINAPI HRESULT stub_IDXGIFactory3_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDXGIFactory3::QueryInterface"); }
 static WINAPI HRESULT stub_IDXGIFactory3_AddRef(void *self) { (void)self; return d3d_not_implemented("IDXGIFactory3::AddRef"); }

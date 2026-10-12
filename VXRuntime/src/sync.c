@@ -835,6 +835,7 @@ static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_pr
     int src_pid = (intptr_t)src_process == -1 ? getpid() : vx_process_info(src_process, NULL);
     int dst_pid = (intptr_t)dst_process == -1 ? getpid() : vx_process_info(dst_process, NULL);
     if (src_pid != getpid()) { vx_log("DuplicateHandle from another process is not supported yet"); vx_set_last_error(50); return 0; }
+    if ((uintptr_t)src >= 0x40000000u && (uintptr_t)src < 0x40004000u) { *dst = src; return 1; }   // a shared resource: the same everywhere
     if (dst_pid > 0 && dst_pid != getpid()) {
         HANDLE h = give_to_process(dst_pid, src);
         if (!h) return 0;

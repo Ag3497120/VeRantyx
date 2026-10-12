@@ -78,10 +78,13 @@ typedef struct {
     void *mtl;                       // id<MTLTexture> (retained)
     uint8_t *cpu;                    // staging textures: the CPU copy Map hands out
     size_t cpu_pitch, cpu_size;
+    int shared;                      // shared between processes: its slot in the shared-resource table + 1
+    void **keyed_vtbl;               // IDXGIKeyedMutex (shared textures)
 } d3d_texture;
 
 // D3D11_BUFFER_DESC as six fields: byte width, usage, bind flags, CPU access, misc flags, structure stride.
-typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; } d3d_buffer;
+// shared: a buffer in shared memory, between processes (its slot + 1): updated in place, never renamed.
+typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; int shared; void *shm; size_t shm_size; } d3d_buffer;
 // A view: of a texture (mip, slices), or of a buffer (first element and count; flags: raw).
 // A view: of a texture (dimension, first mip and mip count, slices), or of a buffer (first element and count;
 // flags: raw, append, counter). counter: a UAV's hidden counter (id<MTLBuffer> of 4 bytes, retained); mtl_view:
@@ -93,6 +96,7 @@ typedef struct {
     void *counter, *mtl_view, *mtl_src;
 } d3d_view;
 void d3d_view_release_mtl(d3d_view *v);
+void d3d_view_get_desc(const d3d_view *v, int which, uint32_t *out);   // 0 SRV, 1 RTV, 2 DSV, 3 UAV
 struct d3d_draw_state;
 typedef struct {
     d3d_object base;                 // ID3D11DeviceContext
@@ -113,6 +117,17 @@ void d3d_draw_init(void);
 void d3d_draw_release(d3d_context *c);
 
 d3d_texture *d3d_texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], HRESULT *hr);
+// Resources shared between processes (d3d11_shared.m): IOSurface textures and shared-memory buffers in a table
+// every vxrt process sees; a shared handle is 0x40000000 + 4 * slot.
+#define D3D_SHARED_HANDLE_BASE 0x40000000u
+void   *d3d_shared_texture(d3d_device *dev, MTLTextureDescriptor *td, const uint32_t desc[TD_COUNT], uint32_t bytes_per_pixel, int *slot);
+void   *d3d_shared_buffer(d3d_device *dev, const uint32_t desc[6], void **shm, size_t *shm_size, int *slot);
+void    d3d_shared_release(int slot);
+HRESULT d3d_open_shared(d3d_device *dev, HANDLE h, const GUID *iid, void **out);
+void  **d3d_dxgi_resource_vtbl(void);        // IDXGIResource1 on resources' second table
+void  **d3d_keyed_mutex_vtbl(void);
+d3d_texture *d3d_texture_wrap(d3d_device *dev, const uint32_t desc[TD_COUNT], void *mtl, int shared);   // mtl retained
+d3d_buffer  *d3d_buffer_wrap(d3d_device *dev, const uint32_t desc[6], void *mtl, int shared, void *shm, size_t shm_size);
 void         d3d_texture_replace(d3d_texture *t, void *mtl_texture);     // a swap chain's buffer after a resize
 void         d3d_flush(d3d_device *dev, int wait);                       // commits the immediate context's work
 d3d_device  *d3d_device_from(void *unknown);                             // an ID3D11Device / IDXGIDevice pointer

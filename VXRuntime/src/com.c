@@ -506,6 +506,69 @@ static WINAPI HRESULT SafeArrayCopy(SAFEARRAY *sa, SAFEARRAY **out) {
     return S_OK;
 }
 
+// ---- WinRT basics: strings (HSTRING), no activatable classes -------------------------------------------------------------
+// An HSTRING: flags (1: a reference to the caller's buffer, in its HSTRING_HEADER), length, characters. NULL is "".
+typedef struct { uint32_t flags, len; const WCHAR *buf; } hstring;
+#define REGDB_E_CLASSNOTREG ((HRESULT)0x80040154)
+static WINAPI HRESULT WindowsCreateString(const WCHAR *src, uint32_t len, hstring **out) {
+    if (!len) { *out = NULL; return S_OK; }
+    hstring *h = malloc(sizeof *h + ((size_t)len + 1) * sizeof(WCHAR));
+    WCHAR *data = (WCHAR *)(h + 1);
+    memcpy(data, src, (size_t)len * sizeof(WCHAR)); data[len] = 0;
+    h->flags = 0; h->len = len; h->buf = data;
+    *out = h;
+    return S_OK;
+}
+static WINAPI HRESULT WindowsCreateStringReference(const WCHAR *src, uint32_t len, void *header, hstring **out) {
+    if (!len) { *out = NULL; return S_OK; }
+    hstring *h = header;                                     // HSTRING_HEADER is 24 bytes: room for this
+    h->flags = 1; h->len = len; h->buf = src;
+    *out = h;
+    return S_OK;
+}
+static WINAPI HRESULT WindowsDeleteString(hstring *h) { if (h && !(h->flags & 1)) free(h); return S_OK; }
+static WINAPI HRESULT WindowsDuplicateString(hstring *h, hstring **out) { return h ? WindowsCreateString(h->buf, h->len, out) : (*out = NULL, S_OK); }
+static WINAPI const WCHAR *WindowsGetStringRawBuffer(hstring *h, uint32_t *len) {
+    static const WCHAR empty[1] = { 0 };
+    if (len) *len = h ? h->len : 0;
+    return h ? h->buf : empty;
+}
+static WINAPI uint32_t WindowsGetStringLen(hstring *h) { return h ? h->len : 0; }
+static WINAPI BOOL WindowsIsStringEmpty(hstring *h) { return !h || !h->len; }
+// A buffer to fill, then turned into a string.
+static WINAPI HRESULT WindowsPreallocateStringBuffer(uint32_t len, WCHAR **chars, hstring **buffer) {
+    hstring *h = calloc(1, sizeof *h + ((size_t)len + 1) * sizeof(WCHAR));
+    h->len = len; h->buf = (WCHAR *)(h + 1);
+    *chars = (WCHAR *)(h + 1);
+    *buffer = h;
+    return S_OK;
+}
+static WINAPI HRESULT WindowsPromoteStringBuffer(hstring *buffer, hstring **out) { *out = buffer; return S_OK; }
+static WINAPI HRESULT WindowsDeleteStringBuffer(hstring *buffer) { free(buffer); return S_OK; }
+static WINAPI HRESULT RoInitialize(int type) { (void)type; return CoInitializeEx(NULL, 0); }
+static WINAPI void RoUninitialize(void) {}
+static WINAPI HRESULT RoGetActivationFactory(hstring *cls, const GUID *iid, void **out) {
+    (void)iid;
+    if (vx_trace && cls) { char name[256] = ""; for (uint32_t i = 0; i < cls->len && i < 255; i++) name[i] = (char)cls->buf[i]; vx_log("WinRT class %s is not available", name); }
+    *out = NULL;
+    return REGDB_E_CLASSNOTREG;
+}
+static WINAPI HRESULT RoActivateInstance(hstring *cls, void **out) { return RoGetActivationFactory(cls, NULL, out); }
+static WINAPI HRESULT GetRestrictedErrorInfo(void **info) { *info = NULL; return S_FALSE; }
+static WINAPI HRESULT SetRestrictedErrorInfo(void *info) { (void)info; return S_OK; }
+static WINAPI BOOL RoOriginateLanguageException(HRESULT hr, hstring *msg, void *unk) { (void)hr; (void)msg; (void)unk; return 1; }
+static WINAPI BOOL RoOriginateError(HRESULT hr, hstring *msg) { (void)hr; (void)msg; return 1; }
+static WINAPI HRESULT CoIncrementMTAUsage(void **cookie) { *cookie = (void *)1; return S_OK; }
+static WINAPI HRESULT CoDecrementMTAUsage(void *cookie) { (void)cookie; return S_OK; }
+static const vx_export winrt[] = {
+    VX_EXPORT(WindowsCreateString), VX_EXPORT(WindowsCreateStringReference), VX_EXPORT(WindowsDeleteString), VX_EXPORT(WindowsDuplicateString),
+    VX_EXPORT(WindowsGetStringRawBuffer), VX_EXPORT(WindowsGetStringLen), VX_EXPORT(WindowsIsStringEmpty),
+    VX_EXPORT(WindowsPreallocateStringBuffer), VX_EXPORT(WindowsPromoteStringBuffer), VX_EXPORT(WindowsDeleteStringBuffer),
+    VX_EXPORT(RoInitialize), VX_EXPORT(RoUninitialize), VX_EXPORT(RoGetActivationFactory), VX_EXPORT(RoActivateInstance),
+    VX_EXPORT(GetRestrictedErrorInfo), VX_EXPORT(SetRestrictedErrorInfo), VX_EXPORT(RoOriginateLanguageException), VX_EXPORT(RoOriginateError),
+    VX_EXPORT(CoIncrementMTAUsage), VX_EXPORT(CoDecrementMTAUsage),
+};
+
 #define E(name) VX_EXPORT(name)
 static const vx_export ole32[] = {
     E(CoInitialize), E(CoInitializeEx), E(CoUninitialize), E(OleInitialize), E(OleUninitialize), E(CoInitializeSecurity),
@@ -540,6 +603,9 @@ static const vx_export oleaut32[] = {
 
 void vx_com_init(void) {
     vx_register_module("ole32.dll", ole32, sizeof ole32 / sizeof ole32[0]);
+    vx_register_module("kernel32.dll", winrt, sizeof winrt / sizeof winrt[0]);   // api-ms-win-core-winrt-* resolve to kernel32
+    vx_register_module("combase.dll", winrt, sizeof winrt / sizeof winrt[0]);
+    vx_register_module("ole32.dll", winrt, sizeof winrt / sizeof winrt[0]);
     vx_register_module("combase.dll", ole32, sizeof ole32 / sizeof ole32[0]);
     vx_register_module("oleaut32.dll", oleaut32, sizeof oleaut32 / sizeof oleaut32[0]);
 }

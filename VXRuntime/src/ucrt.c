@@ -902,6 +902,21 @@ static WINAPI double m_scalbn(double x, int n) { return scalbn(x, n); }
 static WINAPI float m_scalbnf(float x, int n) { return scalbnf(x, n); }
 static WINAPI float m_modff(float x, float *i) { return modff(x, i); }
 static WINAPI double m_remquo(double x, double y, int *q) { return remquo(x, y, q); }
+// wcstombs/mbstowcs: UTF-8 (the code page of the "C" locale here).
+static WINAPI size_t vx_wcstombs(char *out, const WCHAR *in, size_t n) {
+    size_t need = vx_utf16_to_utf8(in, vx_wcslen(in), NULL, 0);
+    if (!out) return need;
+    size_t w = vx_utf16_to_utf8(in, vx_wcslen(in), out, n);
+    if (w < n) out[w] = 0;
+    return w < n ? w : n;
+}
+static WINAPI size_t vx_mbstowcs(WCHAR *out, const char *in, size_t n) {
+    size_t need = vx_utf8_to_utf16(in, strlen(in), NULL, 0);
+    if (!out) return need;
+    size_t w = vx_utf8_to_utf16(in, strlen(in), out, n);
+    if (w < n) out[w] = 0;
+    return w < n ? w : n;
+}
 static WINAPI size_t vx_mbrlen(const char *s, size_t n, void *state) {
     (void)state;
     if (!s || !n) return 0;
@@ -939,7 +954,7 @@ static const vx_export ucrt[] = {
     { "acosh", (void *)m_acosh }, { "atanh", (void *)m_atanh }, { "asinhf", (void *)m_asinhf }, { "acoshf", (void *)m_acoshf },
     { "atanhf", (void *)m_atanhf }, { "fdim", (void *)m_fdim }, { "logb", (void *)m_logb }, { "_logb", (void *)m_logb },
     { "ilogb", (void *)m_ilogb }, { "scalbn", (void *)m_scalbn }, { "scalbnf", (void *)m_scalbnf }, { "modff", (void *)m_modff },
-    { "remquo", (void *)m_remquo }, { "mbrlen", (void *)vx_mbrlen }, { "_mktime64", (void *)vx_mktime64 },
+    { "remquo", (void *)m_remquo }, { "mbrlen", (void *)vx_mbrlen }, { "wcstombs", (void *)vx_wcstombs }, { "mbstowcs", (void *)vx_mbstowcs }, { "_mktime64", (void *)vx_mktime64 },
     { "bsearch_s", (void *)vx_bsearch_s },
     { "_stat64", (void *)vx_stat64 }, { "_stat64i32", (void *)vx_stat64i32 }, { "_wstat64", (void *)vx_wstat64 },
     { "_wstat64i32", (void *)vx_wstat64i32 }, { "_fstat64", (void *)vx_fstat64 }, { "_gmtime64", (void *)vx_gmtime64 },

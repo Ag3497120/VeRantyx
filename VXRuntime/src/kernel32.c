@@ -720,19 +720,52 @@ static const vx_export k32[] = {
     VX_EXPORT(HeapSetInformation), VX_EXPORT(SetHandleCount), VX_EXPORT(GetThreadTimes), VX_EXPORT(GetProcessTimes),
 };
 
-// shell32: opening documents and URLs is not available yet; programs see the "no association" failure.
+// shell32: programs (.exe) start through CreateProcess; documents and URLs are not opened (that would reach outside
+// the program on the Mac): programs see the "no association" failure.
+static BOOL shell_run(const char *file, const char *params, const char *dir, void **pi) {
+    size_t n = file ? strlen(file) : 0;
+    if (n < 4 || strcasecmp(file + n - 4, ".exe")) return 0;
+    char *cmd = malloc(n + (params ? strlen(params) : 0) + 8);
+    sprintf(cmd, "\"%s\"%s%s", file, params && *params ? " " : "", params && *params ? params : "");
+    BOOL ok = create_process(file, cmd, NULL, 0, dir, pi);
+    free(cmd);
+    return ok;
+}
 static WINAPI void *ShellExecuteA(void *w, const char *op, const char *file, const char *params, const char *dir, int show) {
-    (void)w; (void)op; (void)params; (void)dir; (void)show;
+    (void)w; (void)op; (void)show;
+    void *pi[3] = { 0 };
+    if (shell_run(file, params, dir, pi)) { vx_handle_close(pi[0]); vx_handle_close(pi[1]); return (void *)42; }
     vx_log("ShellExecute(%s) is not supported yet", file ? file : "");
     return (void *)31;                        // SE_ERR_NOASSOC
 }
 static WINAPI void *ShellExecuteW(void *w, const WCHAR *op, const WCHAR *file, const WCHAR *params, const WCHAR *dir, int show) {
-    (void)op; (void)params; (void)dir;
-    char *f = vx_utf8_dup(file);
-    void *r = ShellExecuteA(w, NULL, f, NULL, NULL, show);
-    free(f);
+    (void)op;
+    char *f = vx_utf8_dup(file), *p = vx_utf8_dup(params), *d = vx_utf8_dup(dir);
+    void *r = ShellExecuteA(w, NULL, f, p, d, show);
+    free(f); free(p); free(d);
     return r;
 }
+// SHELLEXECUTEINFO: size, mask, window, verb, file, parameters, directory, show, instance, ..., process (at 104).
+static BOOL shell_execute_ex(uint8_t *info, int wide) {
+    char *file = wide ? vx_utf8_dup(*(WCHAR **)(info + 24)) : *(char **)(info + 24);
+    char *params = wide ? vx_utf8_dup(*(WCHAR **)(info + 32)) : *(char **)(info + 32);
+    char *dir = wide ? vx_utf8_dup(*(WCHAR **)(info + 40)) : *(char **)(info + 40);
+    void *pi[3] = { 0 };
+    BOOL ok = shell_run(file, params, dir, pi);
+    if (ok) {
+        if (*(DWORD *)(info + 4) & 0x40) *(HANDLE *)(info + 104) = pi[0]; else vx_handle_close(pi[0]);   // SEE_MASK_NOCLOSEPROCESS
+        vx_handle_close(pi[1]);
+        *(void **)(info + 56) = (void *)42;
+    } else {
+        vx_log("ShellExecuteEx(%s) is not supported yet", file ? file : "");
+        *(void **)(info + 56) = (void *)31;
+        vx_set_last_error(1155);                                      // ERROR_NO_ASSOCIATION
+    }
+    if (wide) { free(file); free(params); free(dir); }
+    return ok;
+}
+static WINAPI BOOL ShellExecuteExA(uint8_t *info) { return shell_execute_ex(info, 0); }
+static WINAPI BOOL ShellExecuteExW(uint8_t *info) { return shell_execute_ex(info, 1); }
 // advapi32: security objects exist but grant nothing special (the user is not an administrator); event tracing
 // accepts and drops events.
 static WINAPI BOOL InitializeSecurityDescriptor(void *sd, DWORD rev) { (void)rev; memset(sd, 0, 40); return 1; }
@@ -757,7 +790,7 @@ static const vx_export advapi_misc[] = {
     VX_EXPORT(EventWrite), VX_EXPORT(EventWriteTransfer), VX_EXPORT(EventEnabled), VX_EXPORT(GetUserNameA), VX_EXPORT(GetUserNameW),
 };
 
-static const vx_export shell32[] = { VX_EXPORT(ShellExecuteA), VX_EXPORT(ShellExecuteW) };
+static const vx_export shell32[] = { VX_EXPORT(ShellExecuteA), VX_EXPORT(ShellExecuteW), VX_EXPORT(ShellExecuteExA), VX_EXPORT(ShellExecuteExW) };
 
 void vx_kernel32_init(void) {
     vx_register_module("advapi32.dll", advapi_misc, sizeof advapi_misc / sizeof advapi_misc[0]);

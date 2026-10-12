@@ -160,8 +160,18 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *const 
 
 // ---- textures -------------------------------------------------------------------------------------------------------------------
 static void **g_texture_vtbl, **g_buffer_vtbl, **g_rtv_vtbl, **g_dsv_vtbl, **g_srv_vtbl;
+// The DXGI side of a resource (IDXGIResource1, through its second table) and a shared texture's keyed mutex.
+static int dxgi_resource_qi(d3d_object *o, const GUID *iid, void **out) {
+    if (d3d_same_guid(iid, &IID_IDXGIResource) || d3d_same_guid(iid, &IID_IDXGIResource1) || d3d_same_guid(iid, &IID_IDXGIObject) ||
+        d3d_same_guid(iid, &IID_IDXGIDeviceSubObject)) { d3d_addref(o); *out = &o->vtbl2; return 1; }
+    if (o->kind == K_TEXTURE && ((d3d_texture *)o)->keyed_vtbl && d3d_same_guid(iid, &IID_IDXGIKeyedMutex)) {
+        d3d_addref(o); *out = &((d3d_texture *)o)->keyed_vtbl; return 1;
+    }
+    return 0;
+}
 static WINAPI HRESULT texture_qi(void *this, const GUID *iid, void **out) {
     static const GUID *const known[] = { &IID_IUnknown_, &IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Texture2D };
+    if (out && dxgi_resource_qi(self_of(this), iid, out)) return S_OK;
     return query(this, iid, out, known, 4);
 }
 static WINAPI void texture_get_type(void *this, uint32_t *dim) { *dim = ((d3d_texture *)this)->dim + 1; }   // D3D11_RESOURCE_DIMENSION_TEXTURE1D..3D
@@ -192,6 +202,7 @@ static WINAPI HRESULT texture3d_qi(void *this, const GUID *iid, void **out) {
 static void texture_destroy(d3d_object *o) {
     d3d_texture *t = (d3d_texture *)o;
     if (t->mtl) CFBridgingRelease(t->mtl);
+    if (t->shared) d3d_shared_release(t->shared - 1);            // only its creator's release frees the slot
     free(t->cpu);
 }
 
@@ -205,7 +216,8 @@ static void texture_destroy(d3d_object *o) {
 #define BIND_UNORDERED_ACCESS 0x80
 #define MISC_TEXTURECUBE 0x4
 
-static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t dim, uint32_t depth, HRESULT *hr) {
+#define MISC_SHARED_ANY (0x2 | 0x100 | 0x800)          // D3D11_RESOURCE_MISC_SHARED, _SHARED_KEYEDMUTEX, _SHARED_NTHANDLE
+static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t dim, uint32_t depth, HRESULT *hr, int *shared_slot) {
     uint32_t bytes;
     MTLPixelFormat f = d3d_mtl_format(desc[TD_FORMAT], &bytes);
     if (f == MTLPixelFormatInvalid) { vx_log("Direct3D: texture format %u is not supported yet", desc[TD_FORMAT]); *hr = E_INVALIDARG; return NULL; }
@@ -221,6 +233,13 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
     for (uint32_t m = MAX(MAX((uint32_t)td.width, (uint32_t)td.height), depth); m > 1; m >>= 1) full++;
     td.mipmapLevelCount = desc[TD_MIPS] ? desc[TD_MIPS] : full;
     uint32_t array = desc[TD_ARRAY] ? desc[TD_ARRAY] : 1, samples = desc[TD_SAMPLES] ? desc[TD_SAMPLES] : 1;
+    // A sample count the GPU does not have becomes the highest it has (Apple GPUs: up to 4; 8 is common on PCs).
+    id<MTLDevice> mdev = (__bridge id<MTLDevice>)dev->mtl;
+    while (samples > 1 && ![mdev supportsTextureSampleCount:samples]) samples >>= 1;
+    if (samples != (desc[TD_SAMPLES] ? desc[TD_SAMPLES] : 1)) {
+        static int told;
+        if (!told++) vx_log("Direct3D: %u samples per pixel are not available on this GPU: %u are used", desc[TD_SAMPLES], samples);
+    }
     if (dim == 3) { td.textureType = MTLTextureType3D; td.depth = depth ? depth : 1; }
     else if (dim == 1) {                                       // Metal's 1D textures have one mip level
         td.textureType = array > 1 ? MTLTextureType1DArray : MTLTextureType1D;
@@ -237,6 +256,11 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
     td.usage = usage;
     int cpu = desc[TD_USAGE] == USAGE_STAGING || desc[TD_USAGE] == USAGE_DYNAMIC;
     td.storageMode = cpu && !is_depth(f) && samples == 1 ? MTLStorageModeShared : MTLStorageModePrivate;
+    *shared_slot = -1;
+    if (desc[TD_MISC] & MISC_SHARED_ANY) {                     // shared with other processes: an IOSurface
+        void *shared = d3d_shared_texture(dev, td, desc, bytes, shared_slot);
+        if (shared) { *hr = S_OK; return shared; }
+    }
     id<MTLTexture> tex = [(__bridge id<MTLDevice>)dev->mtl newTextureWithDescriptor:td];
     if (!tex) { *hr = E_OUTOFMEMORY; return NULL; }
     *hr = S_OK;
@@ -245,7 +269,8 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
 
 static void **g_texture1d_vtbl, **g_texture3d_vtbl;
 static d3d_texture *texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], uint32_t dim, uint32_t depth, HRESULT *hr) {
-    void *mtl = make_mtl_texture(dev, desc, dim, depth, hr);
+    int slot;
+    void *mtl = make_mtl_texture(dev, desc, dim, depth, hr, &slot);
     if (!mtl) return NULL;
     d3d_texture *t = d3d_alloc(sizeof *t, K_TEXTURE, dim == 1 ? g_texture1d_vtbl : dim == 3 ? g_texture3d_vtbl : g_texture_vtbl, dev);
     t->dim = dim; t->depth = dim == 3 ? depth : 1;
@@ -256,6 +281,21 @@ static d3d_texture *texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT
     if (!t->desc[TD_SAMPLES]) t->desc[TD_SAMPLES] = 1;
     t->mtl = mtl;
     t->base.destroy = texture_destroy;
+    t->base.vtbl2 = d3d_dxgi_resource_vtbl();
+    t->shared = slot + 1;
+    if (t->shared && (desc[TD_MISC] & 0x100)) t->keyed_vtbl = d3d_keyed_mutex_vtbl();
+    return t;
+}
+// A texture object for a Metal texture made elsewhere (a shared texture another process made).
+d3d_texture *d3d_texture_wrap(d3d_device *dev, const uint32_t desc[TD_COUNT], void *mtl, int shared) {
+    d3d_texture *t = d3d_alloc(sizeof *t, K_TEXTURE, g_texture_vtbl, dev);
+    t->dim = 2; t->depth = 1;
+    memcpy(t->desc, desc, sizeof t->desc);
+    t->mtl = mtl;
+    t->base.destroy = texture_destroy;
+    t->base.vtbl2 = d3d_dxgi_resource_vtbl();
+    t->shared = shared;
+    if (desc[TD_MISC] & 0x100) t->keyed_vtbl = d3d_keyed_mutex_vtbl();
     return t;
 }
 d3d_texture *d3d_texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], HRESULT *hr) { return texture_create(dev, desc, 2, 1, hr); }
@@ -270,11 +310,25 @@ void d3d_texture_replace(d3d_texture *t, void *mtl_texture) {
 // ---- buffers -----------------------------------------------------------------------------------------------------------------------
 static WINAPI HRESULT buffer_qi(void *this, const GUID *iid, void **out) {
     static const GUID *const known[] = { &IID_IUnknown_, &IID_ID3D11DeviceChild, &IID_ID3D11Resource, &IID_ID3D11Buffer };
+    if (out && dxgi_resource_qi(self_of(this), iid, out)) return S_OK;
     return query(this, iid, out, known, 4);
 }
 static WINAPI void buffer_get_type(void *this, uint32_t *dim) { (void)this; *dim = 1; }   // D3D11_RESOURCE_DIMENSION_BUFFER
 static WINAPI void buffer_get_desc(void *this, uint32_t *desc) { memcpy(desc, ((d3d_buffer *)this)->desc, sizeof(uint32_t) * 6); }
-static void buffer_destroy(d3d_object *o) { d3d_buffer *b = (d3d_buffer *)o; if (b->mtl) CFBridgingRelease(b->mtl); }
+static void buffer_destroy(d3d_object *o) {
+    d3d_buffer *b = (d3d_buffer *)o;
+    if (b->mtl) CFBridgingRelease(b->mtl);
+    if (b->shm) munmap(b->shm, b->shm_size);
+    if (b->shared) d3d_shared_release(b->shared - 1);
+}
+d3d_buffer *d3d_buffer_wrap(d3d_device *dev, const uint32_t desc[6], void *mtl, int shared, void *shm, size_t shm_size) {
+    d3d_buffer *b = d3d_alloc(sizeof *b, K_BUFFER, g_buffer_vtbl, dev);
+    memcpy(b->desc, desc, sizeof b->desc);
+    b->mtl = mtl; b->shared = shared; b->shm = shm; b->shm_size = shm_size;
+    b->base.destroy = buffer_destroy;
+    b->base.vtbl2 = d3d_dxgi_resource_vtbl();
+    return b;
+}
 
 // ---- views -------------------------------------------------------------------------------------------------------------------------
 static WINAPI HRESULT rtv_qi(void *this, const GUID *iid, void **out) {
@@ -290,6 +344,48 @@ static WINAPI HRESULT srv_qi(void *this, const GUID *iid, void **out) {
     return query(this, iid, out, known, 3);
 }
 static WINAPI void view_get_resource(void *this, void **out) { d3d_view *v = this; d3d_addref(v->resource); *out = v->resource; }
+// GetDesc of a view: the D3D11_*_VIEW_DESC it was made with (format, dimension, then the dimension's fields), the
+// dimension worked out from the resource for a view made without a description. which: 0 SRV, 1 RTV, 2 DSV, 3 UAV.
+void d3d_view_get_desc(const d3d_view *v, int which, uint32_t *out) {
+    memset(out, 0, which == 0 ? 24 : which == 2 ? 24 : 20);
+    uint32_t dim = v->dim;
+    const d3d_object *r = v->resource;
+    if (!dim) {
+        if (r->kind == K_BUFFER) dim = which == 2 ? 0 : 1;
+        else {
+            const d3d_texture *t = (const d3d_texture *)r;
+            int ms = t->desc[TD_SAMPLES] > 1, array = t->desc[TD_ARRAY] > 1, cube = which == 0 && (t->desc[TD_MISC] & 0x4);
+            if (t->dim == 1) dim = which == 2 ? (array ? 2 : 1) : (array ? 3 : 2);
+            else if (t->dim == 3) dim = 8;
+            else if (cube) dim = t->desc[TD_ARRAY] > 6 ? 10 : 9;
+            else if (which == 2) dim = ms ? (array ? 6 : 5) : (array ? 4 : 3);
+            else dim = ms ? (array ? 7 : 6) : (array ? 5 : 4);
+        }
+    }
+    out[0] = v->format; out[1] = dim;
+    uint32_t *u = out + (which == 2 ? 3 : 2);                  // a DSV has its flags first
+    if (r->kind == K_BUFFER) { u[0] = v->first; u[1] = v->count; if (which == 3 || dim == 11) u[2] = v->flags; return; }
+    const d3d_texture *t = (const d3d_texture *)r;
+    uint32_t mips = v->mips ? v->mips : t->desc[TD_MIPS] - v->mip, slices = v->slices ? v->slices : 1;
+    if (which == 0) {                                          // shader resource view
+        switch (dim) {
+        case 2: case 4: case 8: case 9: u[0] = v->mip; u[1] = mips; break;
+        case 3: case 5: u[0] = v->mip; u[1] = mips; u[2] = v->first_slice; u[3] = v->dim ? slices : t->desc[TD_ARRAY]; break;
+        case 10: u[0] = v->mip; u[1] = mips; u[2] = v->first_slice; u[3] = (v->dim ? slices : t->desc[TD_ARRAY]) / 6; break;
+        case 7: u[0] = v->first_slice; u[1] = v->dim ? slices : t->desc[TD_ARRAY]; break;
+        }
+    } else {                                                   // render target, depth stencil, unordered access views
+        int array = which == 2 ? (dim == 2 || dim == 4) : (dim == 3 || dim == 5);
+        int ms_array = which == 2 ? dim == 6 : dim == 7;
+        u[0] = ms_array ? v->first_slice : v->mip;
+        if (array) { u[1] = v->first_slice; u[2] = v->dim ? slices : t->desc[TD_ARRAY]; }
+        else if (ms_array) u[1] = v->dim ? slices : t->desc[TD_ARRAY];
+        else if (dim == 8) { u[1] = 0; u[2] = t->depth; }       // 3D: first W slice, W size
+    }
+}
+static WINAPI void srv_get_desc(void *this, uint32_t *out) { d3d_view_get_desc(this, 0, out); }
+static WINAPI void rtv_get_desc(void *this, uint32_t *out) { d3d_view_get_desc(this, 1, out); }
+static WINAPI void dsv_get_desc(void *this, uint32_t *out) { d3d_view_get_desc(this, 2, out); }
 void d3d_view_release_mtl(d3d_view *v) {
     if (v->counter) CFRelease(v->counter);
     if (v->mtl_view) CFRelease(v->mtl_view);
@@ -371,8 +467,8 @@ void d3d_flush(d3d_device *dev, int wait) {
 }
 
 static WINAPI HRESULT context_qi(void *this, const GUID *iid, void **out) {
-    static const GUID *const known[] = { &IID_IUnknown_, &IID_ID3D11DeviceChild, &IID_ID3D11DeviceContext };
-    return query(this, iid, out, known, 3);
+    static const GUID *const known[] = { &IID_IUnknown_, &IID_ID3D11DeviceChild, &IID_ID3D11DeviceContext, &IID_ID3D11DeviceContext1 };
+    return query(this, iid, out, known, 4);
 }
 
 // A render pass that only clears: color attachment 0, or depth/stencil.
@@ -523,6 +619,7 @@ static WINAPI void ctx_update_subresource(void *this, d3d_object *dst, uint32_t 
     id<MTLBuffer> old = (__bridge id<MTLBuffer>)b->mtl;
     uint32_t from = box ? box[0] : 0, size = box ? box[3] - box[0] : (uint32_t)old.length;
     if (from + size > old.length) return;
+    if (b->shared) { memcpy((uint8_t *)old.contents + from, data, size); return; }   // shared: in place
     if (b->desc[2] & BIND_UNORDERED_ACCESS) {
         id<MTLBuffer> staging = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
         d3d_end_render(c);
@@ -547,7 +644,8 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
     if (!res || !out) return E_INVALIDARG;
     if (res->kind == K_BUFFER) {
         d3d_buffer *buf = (d3d_buffer *)res;
-        if (type == 4) {                                        // WRITE_DISCARD: a fresh buffer, nothing to wait for
+        if (type == 4 && buf->shared) {                          // shared: written in place (other processes hold it)
+        } else if (type == 4) {                                 // WRITE_DISCARD: a fresh buffer, nothing to wait for
             id<MTLBuffer> old = (__bridge id<MTLBuffer>)buf->mtl;
             id<MTLBuffer> fresh = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithLength:old.length options:MTLResourceStorageModeShared];
             CFBridgingRelease(buf->mtl);
@@ -608,7 +706,7 @@ static d3d_device *dev_of(void *this) { return (d3d_device *)this; }
 static WINAPI HRESULT device_qi(void *this, const GUID *iid, void **out) {
     d3d_device *d = dev_of(this);
     if (!out) return E_POINTER;
-    if (d3d_same_guid(iid, &IID_IUnknown_) || d3d_same_guid(iid, &IID_ID3D11Device)) { d3d_addref(&d->base); *out = &d->base.vtbl; return S_OK; }
+    if (d3d_same_guid(iid, &IID_IUnknown_) || d3d_same_guid(iid, &IID_ID3D11Device) || d3d_same_guid(iid, &IID_ID3D11Device1)) { d3d_addref(&d->base); *out = &d->base.vtbl; return S_OK; }
     if (d3d_same_guid(iid, &IID_IDXGIObject) || d3d_same_guid(iid, &IID_IDXGIDevice) || d3d_same_guid(iid, &IID_IDXGIDevice1)) {
         d3d_addref(&d->base); *out = &d->base.vtbl2; return S_OK;
     }
@@ -649,15 +747,20 @@ static WINAPI HRESULT device_create_texture3d(void *this, const uint32_t *d, con
 static WINAPI HRESULT device_create_buffer(void *this, const uint32_t *desc, const SUBRESOURCE_DATA *init, void **out) {
     d3d_device *d = dev_of(this);
     if (!desc || !desc[0]) return E_INVALIDARG;
+    if (!out) return S_FALSE;
+    if (desc[4] & MISC_SHARED_ANY) {                             // shared with other processes: shared memory
+        void *shm = NULL; size_t size = 0; int slot;
+        void *mtl = d3d_shared_buffer(d, desc, &shm, &size, &slot);
+        if (mtl) {
+            if (init && init->data) memcpy(shm, init->data, desc[0]);
+            *out = d3d_buffer_wrap(d, desc, mtl, slot + 1, shm, size);
+            return S_OK;
+        }
+    }
     id<MTLBuffer> b = [(__bridge id<MTLDevice>)d->mtl newBufferWithLength:desc[0] options:MTLResourceStorageModeShared];
     if (!b) return E_OUTOFMEMORY;
     if (init && init->data) memcpy(b.contents, init->data, desc[0]);
-    if (!out) return S_FALSE;
-    d3d_buffer *buf = d3d_alloc(sizeof *buf, K_BUFFER, g_buffer_vtbl, d);
-    memcpy(buf->desc, desc, sizeof buf->desc);
-    buf->mtl = (void *)CFBridgingRetain(b);
-    buf->base.destroy = buffer_destroy;
-    *out = buf;
+    *out = d3d_buffer_wrap(d, desc, (void *)CFBridgingRetain(b), 0, NULL, 0);
     return S_OK;
 }
 static WINAPI HRESULT device_create_rtv(void *this, d3d_object *res, const uint32_t *desc, void **out) {
@@ -700,6 +803,8 @@ static WINAPI HRESULT device_check_feature_support(void *this, uint32_t feature,
 }
 static WINAPI uint32_t device_get_feature_level(void *this) { return dev_of(this)->feature_level; }
 static WINAPI uint32_t device_get_creation_flags(void *this) { return dev_of(this)->flags; }
+static WINAPI HRESULT device_open_shared(void *this, HANDLE h, const GUID *iid, void **out) { return d3d_open_shared(dev_of(this), h, iid, out); }
+static WINAPI HRESULT device_open_shared1(void *this, HANDLE h, const GUID *iid, void **out) { return d3d_open_shared(dev_of(this), h, iid, out); }
 static WINAPI HRESULT device_get_removed_reason(void *this) { (void)this; return S_OK; }
 static WINAPI void device_get_immediate_context(void *this, void **out) { d3d_device *d = dev_of(this); d3d_addref(d->context); *out = d->context; }
 static WINAPI HRESULT device_set_exception_mode(void *this, uint32_t m) { (void)this; (void)m; return S_OK; }
@@ -769,9 +874,9 @@ static void make_tables(void) {
     static const d3d_method buffer[] = { { "QueryInterface", (void *)buffer_qi }, CHILD_METHODS, { "GetType", (void *)buffer_get_type },
         { "SetEvictionPriority", (void *)texture_set_eviction }, { "GetEvictionPriority", (void *)texture_get_eviction },
         { "GetDesc", (void *)buffer_get_desc }, { NULL, NULL } };
-    static const d3d_method rtv[] = { { "QueryInterface", (void *)rtv_qi }, CHILD_METHODS, { "GetResource", (void *)view_get_resource }, { NULL, NULL } };
-    static const d3d_method dsv[] = { { "QueryInterface", (void *)dsv_qi }, CHILD_METHODS, { "GetResource", (void *)view_get_resource }, { NULL, NULL } };
-    static const d3d_method srv[] = { { "QueryInterface", (void *)srv_qi }, CHILD_METHODS, { "GetResource", (void *)view_get_resource }, { NULL, NULL } };
+    static const d3d_method rtv[] = { { "QueryInterface", (void *)rtv_qi }, CHILD_METHODS, { "GetResource", (void *)view_get_resource }, { "GetDesc", (void *)rtv_get_desc }, { NULL, NULL } };
+    static const d3d_method dsv[] = { { "QueryInterface", (void *)dsv_qi }, CHILD_METHODS, { "GetResource", (void *)view_get_resource }, { "GetDesc", (void *)dsv_get_desc }, { NULL, NULL } };
+    static const d3d_method srv[] = { { "QueryInterface", (void *)srv_qi }, CHILD_METHODS, { "GetResource", (void *)view_get_resource }, { "GetDesc", (void *)srv_get_desc }, { NULL, NULL } };
     static const d3d_method context[] = { { "QueryInterface", (void *)context_qi }, CHILD_METHODS,
         { "ClearRenderTargetView", (void *)ctx_clear_rtv }, { "ClearDepthStencilView", (void *)ctx_clear_dsv },
         { "OMSetRenderTargets", (void *)ctx_om_set_render_targets }, { "OMGetRenderTargets", (void *)ctx_om_get_render_targets },
@@ -792,6 +897,8 @@ static void make_tables(void) {
         { "GetImmediateContext", (void *)device_get_immediate_context }, { "SetExceptionMode", (void *)device_set_exception_mode },
         { "GetExceptionMode", (void *)device_get_exception_mode }, { "GetPrivateData", (void *)device_get_private },
         { "SetPrivateData", (void *)device_set_private }, { "SetPrivateDataInterface", (void *)device_set_private_interface },
+        { "OpenSharedResource", (void *)device_open_shared }, { "OpenSharedResource1", (void *)device_open_shared1 },
+        { "GetImmediateContext1", (void *)device_get_immediate_context },
         { NULL, NULL } };
     static const d3d_method dxgidev[] = { { "QueryInterface", (void *)dxgidev_qi }, { "AddRef", (void *)dxgidev_addref },
         { "Release", (void *)dxgidev_release }, { "GetParent", (void *)dxgidev_get_parent }, { "GetAdapter", (void *)dxgidev_get_adapter },
@@ -806,8 +913,8 @@ static void make_tables(void) {
     g_rtv_vtbl = D3D_VTABLE(ID3D11RenderTargetView, rtv);
     g_dsv_vtbl = D3D_VTABLE(ID3D11DepthStencilView, dsv);
     g_srv_vtbl = D3D_VTABLE(ID3D11ShaderResourceView, srv);
-    g_context_vtbl = D3D_VTABLE(ID3D11DeviceContext, context);
-    g_device_vtbl = D3D_VTABLE(ID3D11Device, device);
+    g_context_vtbl = D3D_VTABLE(ID3D11DeviceContext1, context);   // the 11.1 interfaces: their new methods report themselves
+    g_device_vtbl = D3D_VTABLE(ID3D11Device1, device);
     g_dxgidev_vtbl = D3D_VTABLE(IDXGIDevice1, dxgidev);
     d3d_draw_init();
     D3D_VTABLE_OVERRIDE(g_device_vtbl, ID3D11Device, d3d_draw_device_methods);

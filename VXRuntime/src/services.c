@@ -251,6 +251,15 @@ static WINAPI uint16_t vx_wctype(const char *name) {
     return 0;
 }
 static WINAPI WCHAR vx_towlower(WCHAR c) { return (WCHAR)towlower(c); }
+static WINAPI int vx_iswspace(WCHAR c) { return iswspace(c); }
+static WINAPI int vx_iswdigit(WCHAR c) { return iswdigit(c); }
+static WINAPI int vx_iswalpha(WCHAR c) { return iswalpha(c); }
+static WINAPI int vx_iswalnum(WCHAR c) { return iswalnum(c); }
+static WINAPI int vx_iswupper(WCHAR c) { return iswupper(c); }
+static WINAPI int vx_iswlower(WCHAR c) { return iswlower(c); }
+static WINAPI int vx_iswxdigit(WCHAR c) { return iswxdigit(c); }
+static WINAPI int vx_iswpunct(WCHAR c) { return iswpunct(c); }
+static WINAPI int vx_iswprint(WCHAR c) { return iswprint(c); }
 static WINAPI WCHAR vx_towupper(WCHAR c) { return (WCHAR)towupper(c); }
 static WINAPI int vx_strcoll(const char *a, const char *b) { return strcmp(a, b); }
 static WINAPI size_t vx_strxfrm(char *d, const char *s, size_t n) { size_t l = strlen(s); if (n) { strncpy(d, s, n); if (l >= n) d[n - 1] = 0; } return l; }
@@ -717,7 +726,10 @@ static const vx_export shell32[] = {
 };
 static const vx_export shlwapi[] = { VX_EXPORT(PathIsRelativeW), VX_EXPORT(PathIsRelativeA), VX_EXPORT(PathIsUNCW), VX_EXPORT(PathCombineW), VX_EXPORT(SHDeleteKeyA) };
 static const vx_export crt[] = {
-    { "iswctype", (void *)vx_iswctype }, { "wctype", (void *)vx_wctype }, { "towlower", (void *)vx_towlower }, { "towupper", (void *)vx_towupper },
+    { "iswctype", (void *)vx_iswctype }, { "iswspace", (void *)vx_iswspace }, { "iswdigit", (void *)vx_iswdigit },
+    { "iswalpha", (void *)vx_iswalpha }, { "iswalnum", (void *)vx_iswalnum }, { "iswupper", (void *)vx_iswupper },
+    { "iswlower", (void *)vx_iswlower }, { "iswxdigit", (void *)vx_iswxdigit }, { "iswpunct", (void *)vx_iswpunct },
+    { "iswprint", (void *)vx_iswprint }, { "wctype", (void *)vx_wctype }, { "towlower", (void *)vx_towlower }, { "towupper", (void *)vx_towupper },
     { "strcoll", (void *)vx_strcoll }, { "strxfrm", (void *)vx_strxfrm }, { "wcscoll", (void *)vx_wcscoll }, { "wcsxfrm", (void *)vx_wcsxfrm },
     { "strftime", (void *)vx_strftime }, { "wcsftime", (void *)vx_wcsftime }, { "___mb_cur_max_func", (void *)vx_mb_cur_max_func },
     { "_set_errno", (void *)vx_set_errno }, { "_invalid_parameter_noinfo_noreturn", (void *)vx_invalid_parameter_noinfo_noreturn },

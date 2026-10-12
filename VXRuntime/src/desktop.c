@@ -374,8 +374,37 @@ static WINAPI void *wglGetProcAddress(const char *name) { (void)name; return NUL
 static WINAPI unsigned glGetError(void) { return 0x502; }      // GL_INVALID_OPERATION: there is no context
 static WINAPI void gl_nothing(void) {}
 
+// ---- menus (user32): kept as objects with their items; windows here show no menu bar -----------------------------------------
+typedef struct { int magic, n; } vx_menu;
+static WINAPI void *CreateMenu(void) { vx_menu *m = calloc(1, sizeof *m); m->magic = 0x4d454e55; return m; }
+static WINAPI void *CreatePopupMenu(void) { return CreateMenu(); }
+static WINAPI BOOL DestroyMenu(void *m) { free(m); return 1; }
+static WINAPI BOOL InsertMenuItemA(void *m, unsigned item, BOOL by_pos, const void *info) { (void)item; (void)by_pos; (void)info; if (m) ((vx_menu *)m)->n++; return m != NULL; }
+static WINAPI BOOL InsertMenuItemW(void *m, unsigned item, BOOL by_pos, const void *info) { return InsertMenuItemA(m, item, by_pos, info); }
+static WINAPI BOOL AppendMenuA(void *m, unsigned flags, uintptr_t id, const char *s) { (void)flags; (void)id; (void)s; if (m) ((vx_menu *)m)->n++; return m != NULL; }
+static WINAPI BOOL AppendMenuW(void *m, unsigned flags, uintptr_t id, const WCHAR *s) { (void)flags; (void)id; (void)s; if (m) ((vx_menu *)m)->n++; return m != NULL; }
+static WINAPI DWORD CheckMenuItem(void *m, unsigned item, unsigned flags) { (void)m; (void)item; (void)flags; return 0; }   // MF_UNCHECKED before
+static WINAPI BOOL EnableMenuItem(void *m, unsigned item, unsigned flags) { (void)m; (void)item; (void)flags; return 0; }
+static WINAPI BOOL SetMenuItemInfoA(void *m, unsigned item, BOOL by_pos, const void *info) { (void)m; (void)item; (void)by_pos; (void)info; return 1; }
+static WINAPI BOOL SetMenuItemInfoW(void *m, unsigned item, BOOL by_pos, const void *info) { (void)m; (void)item; (void)by_pos; (void)info; return 1; }
+static WINAPI int GetMenuItemCount(void *m) { return m ? ((vx_menu *)m)->n : -1; }
+static WINAPI BOOL TrackPopupMenu(void *m, unsigned flags, int x, int y, int r, void *wnd, const void *rect) { (void)m; (void)flags; (void)x; (void)y; (void)r; (void)wnd; (void)rect; return 0; }
+// ---- power requests (kernel32): the Mac stays awake while VR runs anyway; requests are accepted ------------------------------
+static int g_power_request;
+static WINAPI HANDLE PowerCreateRequest(void *ctx) { (void)ctx; return &g_power_request; }
+static WINAPI BOOL PowerSetRequest(HANDLE h, int type) { (void)h; (void)type; return 1; }
+static WINAPI BOOL PowerClearRequest(HANDLE h, int type) { (void)h; (void)type; return 1; }
+// ---- event tracing sessions (advapi32): none can be started ------------------------------------------------------------------
+static WINAPI DWORD StartTraceA(uint64_t *h, const char *name, void *props) { (void)name; (void)props; if (h) *h = 0; return 5; }   // ERROR_ACCESS_DENIED
+static WINAPI DWORD ControlTraceA(uint64_t h, const char *name, void *props, DWORD code) { (void)h; (void)name; (void)props; (void)code; return 4201; }   // ERROR_WMI_INSTANCE_NOT_FOUND
+static WINAPI DWORD EnableTraceEx2(uint64_t h, const void *guid, DWORD code, uint8_t level, uint64_t any, uint64_t all, DWORD timeout, void *params) {
+    (void)h; (void)guid; (void)code; (void)level; (void)any; (void)all; (void)timeout; (void)params; return 5;
+}
+static WINAPI DWORD FlushTraceA(uint64_t h, const char *name, void *props) { (void)h; (void)name; (void)props; return 4201; }
+
 static const vx_export k32[] = {
-    { "__chkstk", (void *)vx_chkstk }, VX_EXPORT(MulDiv), VX_EXPORT(IsDBCSLeadByte), VX_EXPORT(OutputDebugStringW), VX_EXPORT(FormatMessageW),
+    { "__chkstk", (void *)vx_chkstk }, VX_EXPORT(PowerCreateRequest), VX_EXPORT(PowerSetRequest), VX_EXPORT(PowerClearRequest),
+    VX_EXPORT(MulDiv), VX_EXPORT(IsDBCSLeadByte), VX_EXPORT(OutputDebugStringW), VX_EXPORT(FormatMessageW),
     VX_EXPORT(GetUserDefaultLCID), VX_EXPORT(GetSystemDefaultLCID), VX_EXPORT(GetUserDefaultLangID), VX_EXPORT(GetSystemDefaultLangID),
     VX_EXPORT(GetUserDefaultUILanguage), VX_EXPORT(GetLocaleInfoW), VX_EXPORT(GetLocaleInfoA), VX_EXPORT(GetDateFormatW),
     VX_EXPORT(GetTimeFormatW), VX_EXPORT(GetDateFormatA), VX_EXPORT(GetTimeFormatA), VX_EXPORT(lstrcatW), VX_EXPORT(lstrcpyW),
@@ -405,7 +434,10 @@ static const vx_export setupapi[] = {
     { "SetupDiSetDeviceInstallParamsA", (void *)setupdi_none },
 };
 static const vx_export user32[] = {
-    VX_EXPORT(AllowSetForegroundWindow), VX_EXPORT(SetPropW), VX_EXPORT(GetPropW), VX_EXPORT(RemovePropW), VX_EXPORT(SetPropA), VX_EXPORT(GetPropA), VX_EXPORT(RemovePropA),
+    VX_EXPORT(AllowSetForegroundWindow), VX_EXPORT(CreateMenu), VX_EXPORT(CreatePopupMenu), VX_EXPORT(DestroyMenu),
+    VX_EXPORT(InsertMenuItemA), VX_EXPORT(InsertMenuItemW), VX_EXPORT(AppendMenuA), VX_EXPORT(AppendMenuW), VX_EXPORT(CheckMenuItem),
+    VX_EXPORT(EnableMenuItem), VX_EXPORT(SetMenuItemInfoA), VX_EXPORT(SetMenuItemInfoW), VX_EXPORT(GetMenuItemCount),
+    VX_EXPORT(TrackPopupMenu), VX_EXPORT(SetPropW), VX_EXPORT(GetPropW), VX_EXPORT(RemovePropW), VX_EXPORT(SetPropA), VX_EXPORT(GetPropA), VX_EXPORT(RemovePropA),
     VX_EXPORT(IsRectEmpty), VX_EXPORT(GetMessageExtraInfo), VX_EXPORT(WindowFromPoint), VX_EXPORT(GetTopWindow), VX_EXPORT(FlashWindow),
     VX_EXPORT(FlashWindowEx), VX_EXPORT(SetLayeredWindowAttributes), VX_EXPORT(SetWindowRgn), VX_EXPORT(WaitForInputIdle),
     VX_EXPORT(ToUnicode), VX_EXPORT(RegisterDeviceNotificationW), VX_EXPORT(RegisterDeviceNotificationA),
@@ -452,7 +484,9 @@ static const vx_export opengl32[] = {
     { "glPixelStorei", (void *)gl_nothing }, { "glGetString", (void *)wglGetCurrentContext }, { "glViewport", (void *)gl_nothing },
     { "glClear", (void *)gl_nothing }, { "glClearColor", (void *)gl_nothing },
 };
+static const vx_export advapi32[] = { VX_EXPORT(StartTraceA), VX_EXPORT(ControlTraceA), VX_EXPORT(EnableTraceEx2), VX_EXPORT(FlushTraceA) };
 void vx_desktop_init(void) {
+    vx_register_module("advapi32.dll", advapi32, sizeof advapi32 / sizeof advapi32[0]);
     vx_register_module("wtsapi32.dll", wtsapi32, sizeof wtsapi32 / sizeof wtsapi32[0]);
     vx_register_module("opengl32.dll", opengl32, sizeof opengl32 / sizeof opengl32[0]);
     vx_register_module("kernel32.dll", k32, sizeof k32 / sizeof k32[0]);

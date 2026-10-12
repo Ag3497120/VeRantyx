@@ -48,6 +48,7 @@ static WINAPI HRESULT ps_qi(void *this, const GUID *iid, void **out) { return qu
 static WINAPI HRESULT cs_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11ComputeShader); }
 static WINAPI HRESULT uav_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11UnorderedAccessView); }
 static WINAPI void uav_get_resource(void *this, void **out) { d3d_view *v = this; d3d_addref(v->resource); *out = v->resource; }
+static WINAPI void uav_get_desc(void *this, uint32_t *out) { d3d_view_get_desc(this, 3, out); }
 static void uav_destroy(d3d_object *o) {
     d3d_view *v = (d3d_view *)o;
     d3d_view_release_mtl(v);
@@ -814,6 +815,88 @@ static WINAPI void ctx_clear_uav_uint(void *this, d3d_view *v, const uint32_t *v
 static WINAPI void ctx_clear_uav_float(void *this, d3d_view *v, const float *values) { uint32_t bits; memcpy(&bits, &values[0], 4); clear_uav(this, v, bits); }
 
 // ---- tables -------------------------------------------------------------------------------------------------------------------------
+// ---- getting the bindings back (each with a reference, as Direct3D gives them) ---------------------------------------------
+static void *held(void *o) { if (o) d3d_addref(o); return o; }
+static void get_list(void *const *from, uint32_t start, uint32_t n, uint32_t limit, void **out) {
+    for (uint32_t i = 0; i < n; i++) out[i] = start + i < limit ? held(from[start + i]) : NULL;
+}
+#define STAGE_GETTERS(P, st) \
+    static WINAPI void P##_get_shader(void *this, void **sh, void **ci, uint32_t *n) { (void)ci; *sh = held(state_of(this)->shader[st]); if (n) *n = 0; } \
+    static WINAPI void P##_get_cbs(void *this, uint32_t start, uint32_t n, void **out) { get_list((void *const *)state_of(this)->cb[st], start, n, 14, out); } \
+    static WINAPI void P##_get_srvs(void *this, uint32_t start, uint32_t n, void **out) { get_list((void *const *)state_of(this)->srv[st], start, n, 32, out); } \
+    static WINAPI void P##_get_samplers(void *this, uint32_t start, uint32_t n, void **out) { get_list((void *const *)state_of(this)->smp[st], start, n, 16, out); }
+STAGE_GETTERS(vs, STAGE_VS)
+STAGE_GETTERS(ps, STAGE_PS)
+STAGE_GETTERS(cs, STAGE_CS)
+// The stages not translated yet (geometry, hull, domain) have nothing bound.
+static WINAPI void none_get_shader(void *this, void **sh, void **ci, uint32_t *n) { (void)this; (void)ci; *sh = NULL; if (n) *n = 0; }
+static WINAPI void none_get_list(void *this, uint32_t start, uint32_t n, void **out) { (void)this; (void)start; for (uint32_t i = 0; i < n; i++) out[i] = NULL; }
+static WINAPI void none_set_list(void *this, uint32_t start, uint32_t n, void *const *in) { (void)this; (void)start; (void)n; (void)in; }
+static WINAPI void cs_get_uavs(void *this, uint32_t start, uint32_t n, void **out) { get_list((void *const *)state_of(this)->uav[STAGE_CS], start, n, 8, out); }
+static WINAPI void om_get_blend(void *this, void **b, float *factor, uint32_t *mask) {
+    d3d_draw_state *s = state_of(this);
+    if (b) *b = held(s->blend);
+    if (factor) memcpy(factor, s->blend_factor, sizeof s->blend_factor);
+    if (mask) *mask = 0xffffffffu;
+}
+static WINAPI void om_get_depth(void *this, void **d, uint32_t *ref) { d3d_draw_state *s = state_of(this); if (d) *d = held(s->depth); if (ref) *ref = s->stencil_ref; }
+typedef void (WINAPI *get_targets_fn)(void *, uint32_t, void **, void **);
+static WINAPI void om_get_targets_and_uavs(void *this, uint32_t nrtv, void **rtvs, void **dsv, uint32_t start, uint32_t nuav, void **uavs) {
+    get_targets_fn get = (get_targets_fn)self_of(this)->vtbl[89];   // OMGetRenderTargets
+    if (rtvs || dsv) get(this, nrtv, rtvs, dsv);
+    if (uavs) get_list((void *const *)state_of(this)->uav[STAGE_PS], start, nuav, 8, uavs);
+}
+static WINAPI void ia_get_index_buffer(void *this, void **b, uint32_t *format, uint32_t *offset) {
+    d3d_draw_state *s = state_of(this);
+    if (b) *b = held(s->ib); if (format) *format = s->ib_format; if (offset) *offset = s->ib_offset;
+}
+static WINAPI void ia_get_layout(void *this, void **l) { *l = held(state_of(this)->layout); }
+static WINAPI void ia_get_topology(void *this, uint32_t *t) { *t = state_of(this)->topology; }
+static WINAPI void ia_get_vertex_buffers(void *this, uint32_t start, uint32_t n, void **b, uint32_t *strides, uint32_t *offsets) {
+    d3d_draw_state *s = state_of(this);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t k = start + i;
+        if (b) b[i] = k < 16 ? held(s->vb[k]) : NULL;
+        if (strides) strides[i] = k < 16 ? s->stride[k] : 0;
+        if (offsets) offsets[i] = k < 16 ? s->offset[k] : 0;
+    }
+}
+static WINAPI void rs_get_scissors(void *this, uint32_t *n, RECT *r) {
+    if (r && *n) r[0] = state_of(this)->scissor;
+    *n = 1;
+}
+static WINAPI void rs_get_state(void *this, void **r) { *r = held(state_of(this)->raster); }
+static WINAPI void so_get_targets(void *this, uint32_t n, void **out) { (void)this; for (uint32_t i = 0; i < n; i++) out[i] = NULL; }
+static WINAPI void so_set_targets(void *this, uint32_t n, void *const *targets, const uint32_t *offsets) {
+    (void)this; (void)offsets;
+    for (uint32_t i = 0; i < n; i++) if (targets && targets[i]) { d3d_not_implemented("stream output (bound)"); break; }
+}
+// ResolveSubresource: a render pass that resolves the multisampled texture into the other.
+static WINAPI void ctx_resolve(void *this, d3d_object *dst, uint32_t dst_sub, d3d_object *src, uint32_t src_sub, uint32_t format) {
+    (void)format;
+    d3d_context *c = this;
+    if (!dst || !src || dst->kind != K_TEXTURE || src->kind != K_TEXTURE) return;
+    d3d_texture *ds = (d3d_texture *)dst, *ss = (d3d_texture *)src;
+    id<MTLTexture> st = (__bridge id<MTLTexture>)ss->mtl, dt = (__bridge id<MTLTexture>)ds->mtl;
+    if (st.sampleCount <= 1) {                                   // nothing to resolve: a copy
+        d3d_end_render(c);
+        id<MTLBlitCommandEncoder> blit = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) blitCommandEncoder];
+        [blit copyFromTexture:st toTexture:dt];
+        [blit endEncoding];
+        return;
+    }
+    uint32_t dmips = ds->desc[TD_MIPS] ? ds->desc[TD_MIPS] : 1, smips = ss->desc[TD_MIPS] ? ss->desc[TD_MIPS] : 1;
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    int depth = st.pixelFormat == MTLPixelFormatDepth32Float || st.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || st.pixelFormat == MTLPixelFormatDepth16Unorm;
+    MTLRenderPassAttachmentDescriptor *a = depth ? (MTLRenderPassAttachmentDescriptor *)rp.depthAttachment : rp.colorAttachments[0];
+    a.texture = st; a.slice = src_sub / smips;
+    a.resolveTexture = dt; a.resolveLevel = dst_sub % dmips; a.resolveSlice = dst_sub / dmips;
+    a.loadAction = MTLLoadActionLoad; a.storeAction = MTLStoreActionMultisampleResolve;
+    d3d_end_render(c);
+    id<MTLRenderCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) renderCommandEncoderWithDescriptor:rp];
+    [enc endEncoding];
+}
+
 // ---- queries and predicates -------------------------------------------------------------------------------------------------
 // D3D11_QUERY_DESC: type, flags. Results are ready once the GPU has finished the command buffer that was being
 // recorded when the query ended. Occlusion counts report everything visible (nothing is culled wrongly);
@@ -914,6 +997,23 @@ const d3d_method d3d_draw_context_methods[] = {
     { "CSSetSamplers", (void *)cs_set_samplers }, { "CSSetUnorderedAccessViews", (void *)cs_set_uavs }, { "Dispatch", (void *)ctx_dispatch },
     { "OMSetRenderTargetsAndUnorderedAccessViews", (void *)om_set_targets_and_uavs },
     { "Begin", (void *)ctx_begin }, { "End", (void *)ctx_end }, { "GetData", (void *)ctx_get_data },
+    { "VSGetShader", (void *)vs_get_shader }, { "VSGetConstantBuffers", (void *)vs_get_cbs }, { "VSGetShaderResources", (void *)vs_get_srvs },
+    { "VSGetSamplers", (void *)vs_get_samplers }, { "PSGetShader", (void *)ps_get_shader }, { "PSGetConstantBuffers", (void *)ps_get_cbs },
+    { "PSGetShaderResources", (void *)ps_get_srvs }, { "PSGetSamplers", (void *)ps_get_samplers }, { "CSGetShader", (void *)cs_get_shader },
+    { "CSGetConstantBuffers", (void *)cs_get_cbs }, { "CSGetShaderResources", (void *)cs_get_srvs }, { "CSGetSamplers", (void *)cs_get_samplers },
+    { "CSGetUnorderedAccessViews", (void *)cs_get_uavs },
+    { "GSGetShader", (void *)none_get_shader }, { "HSGetShader", (void *)none_get_shader }, { "DSGetShader", (void *)none_get_shader },
+    { "GSGetConstantBuffers", (void *)none_get_list }, { "GSGetShaderResources", (void *)none_get_list }, { "GSGetSamplers", (void *)none_get_list },
+    { "HSGetConstantBuffers", (void *)none_get_list }, { "HSGetShaderResources", (void *)none_get_list }, { "HSGetSamplers", (void *)none_get_list },
+    { "DSGetConstantBuffers", (void *)none_get_list }, { "DSGetShaderResources", (void *)none_get_list }, { "DSGetSamplers", (void *)none_get_list },
+    { "GSSetConstantBuffers", (void *)none_set_list }, { "GSSetShaderResources", (void *)none_set_list }, { "GSSetSamplers", (void *)none_set_list },
+    { "HSSetConstantBuffers", (void *)none_set_list }, { "HSSetShaderResources", (void *)none_set_list }, { "HSSetSamplers", (void *)none_set_list },
+    { "DSSetConstantBuffers", (void *)none_set_list }, { "DSSetShaderResources", (void *)none_set_list }, { "DSSetSamplers", (void *)none_set_list },
+    { "OMGetBlendState", (void *)om_get_blend }, { "OMGetDepthStencilState", (void *)om_get_depth },
+    { "OMGetRenderTargetsAndUnorderedAccessViews", (void *)om_get_targets_and_uavs }, { "IAGetIndexBuffer", (void *)ia_get_index_buffer },
+    { "IAGetInputLayout", (void *)ia_get_layout }, { "IAGetPrimitiveTopology", (void *)ia_get_topology },
+    { "IAGetVertexBuffers", (void *)ia_get_vertex_buffers }, { "RSGetScissorRects", (void *)rs_get_scissors }, { "RSGetState", (void *)rs_get_state },
+    { "SOGetTargets", (void *)so_get_targets }, { "SOSetTargets", (void *)so_set_targets }, { "ResolveSubresource", (void *)ctx_resolve },
     { "SetPredication", (void *)ctx_set_predication }, { "GetPredication", (void *)ctx_get_predication },
     { "GSSetShader", (void *)ctx_set_unsupported_stage }, { "HSSetShader", (void *)ctx_set_unsupported_stage },
     { "DSSetShader", (void *)ctx_set_unsupported_stage },
@@ -924,7 +1024,7 @@ void d3d_draw_init(void) {
     static const d3d_method vs[] = { { "QueryInterface", (void *)vs_qi }, CHILD_METHODS, { NULL, NULL } };
     static const d3d_method ps[] = { { "QueryInterface", (void *)ps_qi }, CHILD_METHODS, { NULL, NULL } };
     static const d3d_method cs[] = { { "QueryInterface", (void *)cs_qi }, CHILD_METHODS, { NULL, NULL } };
-    static const d3d_method uav[] = { { "QueryInterface", (void *)uav_qi }, CHILD_METHODS, { "GetResource", (void *)uav_get_resource }, { NULL, NULL } };
+    static const d3d_method uav[] = { { "QueryInterface", (void *)uav_qi }, CHILD_METHODS, { "GetResource", (void *)uav_get_resource }, { "GetDesc", (void *)uav_get_desc }, { NULL, NULL } };
     static const d3d_method layout[] = { { "QueryInterface", (void *)layout_qi }, CHILD_METHODS, { NULL, NULL } };
     static const d3d_method blend[] = { { "QueryInterface", (void *)blend_qi }, CHILD_METHODS, { "GetDesc", (void *)blend_get_desc }, { NULL, NULL } };
     static const d3d_method depth[] = { { "QueryInterface", (void *)depth_qi }, CHILD_METHODS, { "GetDesc", (void *)depth_get_desc }, { NULL, NULL } };

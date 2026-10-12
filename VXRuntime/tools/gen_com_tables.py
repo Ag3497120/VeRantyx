@@ -22,8 +22,9 @@ INTERFACES = {
     "d3d11_1.h": ["ID3D11Device1", "ID3D11DeviceContext1", "ID3D11BlendState1", "ID3D11RasterizerState1",
                   "ID3DUserDefinedAnnotation"],
     "dxgi.h": ["IDXGIFactory", "IDXGIFactory1", "IDXGIAdapter", "IDXGIAdapter1", "IDXGIOutput", "IDXGISwapChain",
-               "IDXGIDevice", "IDXGIDevice1", "IDXGIObject", "IDXGIDeviceSubObject", "IDXGISurface", "IDXGIResource"],
-    "dxgi1_2.h": ["IDXGIFactory2", "IDXGISwapChain1", "IDXGIAdapter2"],
+               "IDXGIDevice", "IDXGIDevice1", "IDXGIObject", "IDXGIDeviceSubObject", "IDXGISurface", "IDXGIResource",
+               "IDXGIKeyedMutex"],
+    "dxgi1_2.h": ["IDXGIFactory2", "IDXGISwapChain1", "IDXGIAdapter2", "IDXGIResource1"],
     "dxgi1_3.h": ["IDXGIFactory3", "IDXGISwapChain2"],
     "dxgi1_4.h": ["IDXGIAdapter3", "IDXGIFactory4", "IDXGISwapChain3"],
 }

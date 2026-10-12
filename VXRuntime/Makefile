@@ -2,7 +2,7 @@
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
 SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/context.S src/text.c src/files.c src/registry.c \
-          src/user32.c src/gdi.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/dxgi.m src/d3d9.m src/dxbc.c src/input.m src/audio.m src/xaudio2.m
+          src/user32.c src/gdi.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/input.m src/audio.m src/xaudio2.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
@@ -10,11 +10,11 @@ all: build/vxrt tests
 
 build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework AudioToolbox -framework CoreAudio
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -101,6 +101,10 @@ build/xaudio2.exe: tests/xaudio2.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lxaudio2_9 -lm
 
+build/shared.exe: tests/shared.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxgi -ldxguid -luuid
+
 build/ipc.exe: tests/ipc.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
@@ -167,6 +171,7 @@ check: all
 	build/vxrt build/pipes.exe
 	build/vxrt build/pipes.exe serve & build/vxrt build/pipes.exe ask; wait
 	build/vxrt build/ipc.exe second & build/vxrt build/ipc.exe first; wait
+	build/vxrt build/shared.exe make & build/vxrt build/shared.exe open; wait
 
 clean:
 	rm -rf build
