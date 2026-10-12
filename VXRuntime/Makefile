@@ -14,7 +14,7 @@ build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/dxbc.
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/hlslc.exe build/dxbc2msl build/draw.exe
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -81,6 +81,10 @@ build/draw.exe: tests/draw.c tests/shaders/*.h
 	@mkdir -p build
 	$(MINGW) -O1 -Itests -o $@ $< -ld3d11 -ldxgi -ldxguid -luuid -lm
 
+build/compute.exe: tests/compute.c tests/shaders/*.h
+	@mkdir -p build
+	$(MINGW) -O1 -Itests -o $@ $< -ld3d11 -ldxguid -luuid -lm
+
 build/hlslc.exe: tools/hlslc.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
@@ -108,7 +112,7 @@ build/vxplugin.dll: tests/vxplugin.c tests/vxplugin.def
 # Test shaders: HLSL compiled to DXBC by a d3dcompiler DLL (Microsoft's, as games ship it) running on vxrt.
 # The generated tests/shaders/*.h are kept in the repository; regenerate with
 #   make shaders D3DCOMPILER='Z:\path\to\d3dcompiler_43.dll'
-SHADERS = color_vs:vs_4_0 color_ps:ps_4_0 tex_vs:vs_4_0 tex_ps:ps_4_0 fullscreen_vs:vs_4_0 math_ps:ps_4_0
+SHADERS = color_vs:vs_4_0 color_ps:ps_4_0 tex_vs:vs_4_0 tex_ps:ps_4_0 fullscreen_vs:vs_4_0 math_ps:ps_4_0 sum_cs:cs_5_0 atomic_cs:cs_5_0
 shaders: build/vxrt build/hlslc.exe
 	@for s in $(SHADERS); do n=$${s%%:*}; p=$${s##*:}; \
 	  VXRT_ROOT=build/root build/vxrt build/hlslc.exe '$(D3DCOMPILER)' tests/shaders/$$n.hlsl main $$p tests/shaders/$$n.h $$n || exit 1; done
@@ -131,6 +135,7 @@ check: all
 	build/vxrt build/window.exe
 	build/vxrt build/d3d11.exe
 	build/vxrt build/draw.exe
+	build/vxrt build/compute.exe
 
 clean:
 	rm -rf build

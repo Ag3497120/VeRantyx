@@ -26,7 +26,7 @@ HRESULT d3d_not_implemented(const char *what);    // reports a method once, retu
 #define DXGI_ERROR_FRAME_STATISTICS_DISJOINT ((HRESULT)0x887A000B)
 
 enum { K_DEVICE, K_CONTEXT, K_TEXTURE, K_BUFFER, K_RTV, K_DSV, K_SRV, K_SWAPCHAIN, K_FACTORY, K_ADAPTER, K_OUTPUT,
-       K_SHADER, K_LAYOUT, K_STATE };
+       K_SHADER, K_LAYOUT, K_STATE, K_UAV };
 
 typedef struct pdata { GUID guid; uint32_t size; void *data; struct pdata *next; } pdata;
 typedef struct d3d_device d3d_device;
@@ -80,7 +80,8 @@ typedef struct {
 
 // D3D11_BUFFER_DESC as six fields: byte width, usage, bind flags, CPU access, misc flags, structure stride.
 typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; } d3d_buffer;
-typedef struct { d3d_object base; d3d_object *resource; uint32_t format, mip, first_slice, slices; } d3d_view;
+// A view: of a texture (mip, slices), or of a buffer (first element and count; flags: raw).
+typedef struct { d3d_object base; d3d_object *resource; uint32_t format, mip, first_slice, slices, first, count, flags; } d3d_view;
 struct d3d_draw_state;
 typedef struct {
     d3d_object base;                 // ID3D11DeviceContext

@@ -342,6 +342,30 @@ static WINAPI HRESULT stub_ID3D11SamplerState_GetDesc(void *self) { (void)self; 
 static void *const vtstub_ID3D11SamplerState[] = { (void *)stub_ID3D11SamplerState_QueryInterface, (void *)stub_ID3D11SamplerState_AddRef, (void *)stub_ID3D11SamplerState_Release, (void *)stub_ID3D11SamplerState_GetDevice, (void *)stub_ID3D11SamplerState_GetPrivateData, (void *)stub_ID3D11SamplerState_SetPrivateData, (void *)stub_ID3D11SamplerState_SetPrivateDataInterface, (void *)stub_ID3D11SamplerState_GetDesc };
 #define VT_COUNT_ID3D11SamplerState 8
 static const GUID IID_ID3D11SamplerState = { 0xda6fea51, 0x564c, 0x4487, { 0x98, 0x10, 0xf0, 0xd0, 0xf9, 0xb4, 0xe3, 0xa5 } };
+static const char *const vt_ID3D11ComputeShader[] = { "QueryInterface", "AddRef", "Release", "GetDevice", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface" };
+static WINAPI HRESULT stub_ID3D11ComputeShader_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11ComputeShader::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D11ComputeShader_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D11ComputeShader::AddRef"); }
+static WINAPI HRESULT stub_ID3D11ComputeShader_Release(void *self) { (void)self; return d3d_not_implemented("ID3D11ComputeShader::Release"); }
+static WINAPI HRESULT stub_ID3D11ComputeShader_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D11ComputeShader::GetDevice"); }
+static WINAPI HRESULT stub_ID3D11ComputeShader_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11ComputeShader::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11ComputeShader_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11ComputeShader::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11ComputeShader_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11ComputeShader::SetPrivateDataInterface"); }
+static void *const vtstub_ID3D11ComputeShader[] = { (void *)stub_ID3D11ComputeShader_QueryInterface, (void *)stub_ID3D11ComputeShader_AddRef, (void *)stub_ID3D11ComputeShader_Release, (void *)stub_ID3D11ComputeShader_GetDevice, (void *)stub_ID3D11ComputeShader_GetPrivateData, (void *)stub_ID3D11ComputeShader_SetPrivateData, (void *)stub_ID3D11ComputeShader_SetPrivateDataInterface };
+#define VT_COUNT_ID3D11ComputeShader 7
+static const GUID IID_ID3D11ComputeShader = { 0x4f5b196e, 0xc2bd, 0x495e, { 0xbd, 0x01, 0x1f, 0xde, 0xd3, 0x8e, 0x49, 0x69 } };
+static const char *const vt_ID3D11UnorderedAccessView[] = { "QueryInterface", "AddRef", "Release", "GetDevice", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "GetResource", "GetDesc" };
+static WINAPI HRESULT stub_ID3D11UnorderedAccessView_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11UnorderedAccessView::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D11UnorderedAccessView_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D11UnorderedAccessView::AddRef"); }
+static WINAPI HRESULT stub_ID3D11UnorderedAccessView_Release(void *self) { (void)self; return d3d_not_implemented("ID3D11UnorderedAccessView::Release"); }
+static WINAPI HRESULT stub_ID3D11UnorderedAccessView_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D11UnorderedAccessView::GetDevice"); }
+static WINAPI HRESULT stub_ID3D11UnorderedAccessView_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11UnorderedAccessView::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11UnorderedAccessView_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D11UnorderedAccessView::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D11UnorderedAccessView_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D11UnorderedAccessView::SetPrivateDataInterface"); }
+static WINAPI HRESULT stub_ID3D11UnorderedAccessView_GetResource(void *self) { (void)self; return d3d_not_implemented("ID3D11UnorderedAccessView::GetResource"); }
+static WINAPI HRESULT stub_ID3D11UnorderedAccessView_GetDesc(void *self) { (void)self; return d3d_not_implemented("ID3D11UnorderedAccessView::GetDesc"); }
+static void *const vtstub_ID3D11UnorderedAccessView[] = { (void *)stub_ID3D11UnorderedAccessView_QueryInterface, (void *)stub_ID3D11UnorderedAccessView_AddRef, (void *)stub_ID3D11UnorderedAccessView_Release, (void *)stub_ID3D11UnorderedAccessView_GetDevice, (void *)stub_ID3D11UnorderedAccessView_GetPrivateData, (void *)stub_ID3D11UnorderedAccessView_SetPrivateData, (void *)stub_ID3D11UnorderedAccessView_SetPrivateDataInterface, (void *)stub_ID3D11UnorderedAccessView_GetResource, (void *)stub_ID3D11UnorderedAccessView_GetDesc };
+#define VT_COUNT_ID3D11UnorderedAccessView 9
+static const GUID IID_ID3D11UnorderedAccessView = { 0x28acf509, 0x7f5c, 0x48f6, { 0x86, 0x11, 0xf3, 0x16, 0x01, 0x0a, 0x63, 0x80 } };
 static const char *const vt_IDXGIFactory[] = { "QueryInterface", "AddRef", "Release", "SetPrivateData", "SetPrivateDataInterface", "GetPrivateData", "GetParent", "EnumAdapters", "MakeWindowAssociation", "GetWindowAssociation", "CreateSwapChain", "CreateSoftwareAdapter" };
 static WINAPI HRESULT stub_IDXGIFactory_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDXGIFactory::QueryInterface"); }
 static WINAPI HRESULT stub_IDXGIFactory_AddRef(void *self) { (void)self; return d3d_not_implemented("IDXGIFactory::AddRef"); }

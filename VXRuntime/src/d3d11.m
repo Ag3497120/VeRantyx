@@ -231,7 +231,8 @@ static d3d_view *make_view(d3d_device *dev, int kind, void **vtbl, d3d_object *r
         uint32_t dim = desc[1];
         const uint32_t *u = desc + (dsv ? 3 : 2);              // a DSV has a Flags field before its union
         uint32_t tex2d = dsv ? 3 : 4, tex2d_array = dsv ? 4 : 5;   // the dimension values differ between RTVs and DSVs
-        if (dim == tex2d) v->mip = u[0];
+        if (res->kind == K_BUFFER) { v->first = u[0]; v->count = u[1]; v->flags = dim == 11 ? u[2] : 0; }   // BUFFER / BUFFEREX
+        else if (dim == tex2d) v->mip = u[0];
         else if (dim == tex2d_array) { v->mip = u[0]; v->first_slice = u[1]; v->slices = u[2]; }
     }
     return v;
@@ -405,11 +406,20 @@ static WINAPI void ctx_update_subresource(void *this, d3d_object *dst, uint32_t 
     if (!dst || !data) return;
     if (dst->kind == K_TEXTURE) { upload_texture(c, (d3d_texture *)dst, sub, box, data, row_pitch); return; }
     // Buffers are renamed: the new contents go into a fresh Metal buffer (a copy of the old one), so draws
-    // already recorded keep reading what they were given.
+    // already recorded keep reading what they were given. Buffers the GPU writes (UAVs) are updated by the GPU
+    // instead, in order, since their CPU-side contents may be out of date.
     d3d_buffer *b = (d3d_buffer *)dst;
     id<MTLBuffer> old = (__bridge id<MTLBuffer>)b->mtl;
     uint32_t from = box ? box[0] : 0, size = box ? box[3] - box[0] : (uint32_t)old.length;
     if (from + size > old.length) return;
+    if (b->desc[2] & BIND_UNORDERED_ACCESS) {
+        id<MTLBuffer> staging = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
+        d3d_end_render(c);
+        id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
+        [blit copyFromBuffer:staging sourceOffset:0 toBuffer:old destinationOffset:from size:size];
+        [blit endEncoding];
+        return;
+    }
     id<MTLBuffer> fresh = [(__bridge id<MTLDevice>)c->base.dev->mtl newBufferWithBytes:old.contents length:old.length options:MTLResourceStorageModeShared];
     memcpy((uint8_t *)fresh.contents + from, data, size);
     CFBridgingRelease(b->mtl);

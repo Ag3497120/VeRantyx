@@ -14,7 +14,7 @@
 #pragma clang diagnostic pop
 
 static const GUID IID_IUnknown_ = { 0, 0, 0, { 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
-static void **g_vs_vtbl, **g_ps_vtbl, **g_layout_vtbl, **g_blend_vtbl, **g_depth_vtbl, **g_raster_vtbl, **g_sampler_vtbl;
+static void **g_vs_vtbl, **g_ps_vtbl, **g_cs_vtbl, **g_uav_vtbl, **g_layout_vtbl, **g_blend_vtbl, **g_depth_vtbl, **g_raster_vtbl, **g_sampler_vtbl;
 
 static d3d_object *self_of(void *this) { return (d3d_object *)this; }
 static WINAPI uint32_t child_addref(void *this) { return d3d_addref(self_of(this)); }
@@ -35,11 +35,20 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface)
 }
 
 // ---- shaders ------------------------------------------------------------------------------------------------------------
-typedef struct { d3d_object base; dxbc_shader info; void *function; uint32_t id; } d3d_shader;
+typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id; } d3d_shader;
 static uint32_t g_next_id = 1;
-static void shader_destroy(d3d_object *o) { d3d_shader *s = (d3d_shader *)o; if (s->function) CFBridgingRelease(s->function); dxbc_free(&s->info); }
+static void shader_destroy(d3d_object *o) {
+    d3d_shader *s = (d3d_shader *)o;
+    if (s->function) CFBridgingRelease(s->function);
+    if (s->compute) CFBridgingRelease(s->compute);
+    dxbc_free(&s->info);
+}
 static WINAPI HRESULT vs_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11VertexShader); }
 static WINAPI HRESULT ps_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11PixelShader); }
+static WINAPI HRESULT cs_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11ComputeShader); }
+static WINAPI HRESULT uav_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11UnorderedAccessView); }
+static WINAPI void uav_get_resource(void *this, void **out) { d3d_view *v = this; d3d_addref(v->resource); *out = v->resource; }
+static void uav_destroy(d3d_object *o) { d3d_release(((d3d_view *)o)->resource); }
 
 // VXRT_DUMP_SHADERS=directory: every translated shader is written there (for looking at the translation).
 static void dump(const dxbc_shader *s, const void *code, size_t size) {
@@ -48,7 +57,7 @@ static void dump(const dxbc_shader *s, const void *code, size_t size) {
     unsigned char md5[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256(code, (CC_LONG)size, md5);
     char path[1024];
-    snprintf(path, sizeof path, "%s/%s_%02x%02x%02x%02x.metal", dir, s->type == 1 ? "vs" : "ps", md5[0], md5[1], md5[2], md5[3]);
+    snprintf(path, sizeof path, "%s/%s_%02x%02x%02x%02x.metal", dir, s->type == 1 ? "vs" : s->type == 5 ? "cs" : "ps", md5[0], md5[1], md5[2], md5[3]);
     FILE *f = fopen(path, "w");
     if (f) { fputs(s->msl, f); fclose(f); }
 }
@@ -81,6 +90,29 @@ static WINAPI HRESULT device_create_vs(void *this, const void *code, size_t size
 }
 static WINAPI HRESULT device_create_ps(void *this, const void *code, size_t size, void *linkage, void **out) {
     (void)linkage; return create_shader(this, code, size, DXBC_PIXEL, g_ps_vtbl, out);
+}
+static WINAPI HRESULT device_create_cs(void *this, const void *code, size_t size, void *linkage, void **out) {
+    (void)linkage; return create_shader(this, code, size, DXBC_COMPUTE, g_cs_vtbl, out);
+}
+// D3D11_UNORDERED_ACCESS_VIEW_DESC: format, dimension (1 buffer, 4 2D, 5 2D array, ...), then the buffer range
+// (first element, count, flags: 1 raw) or the mip level and slices.
+static WINAPI HRESULT device_create_uav(void *this, d3d_object *res, const uint32_t *desc, void **out) {
+    if (!res || (res->kind != K_TEXTURE && res->kind != K_BUFFER)) return E_INVALIDARG;
+    d3d_view *v = d3d_alloc(sizeof *v, K_UAV, g_uav_vtbl, this);
+    v->resource = res;
+    d3d_addref(res);
+    v->base.destroy = uav_destroy;
+    v->slices = 1;
+    if (res->kind == K_TEXTURE) v->format = ((d3d_texture *)res)->desc[TD_FORMAT];
+    if (desc) {
+        if (desc[0]) v->format = desc[0];
+        if (res->kind == K_BUFFER) { v->first = desc[2]; v->count = desc[3]; v->flags = desc[4]; }
+        else if (desc[1] == 4) v->mip = desc[2];
+        else if (desc[1] == 5) { v->mip = desc[2]; v->first_slice = desc[3]; v->slices = desc[4]; }
+    }
+    if (!out) { d3d_release(&v->base); return S_FALSE; }
+    *out = v;
+    return S_OK;
 }
 
 // ---- input layouts -------------------------------------------------------------------------------------------------------
@@ -244,16 +276,17 @@ static WINAPI HRESULT device_create_sampler(void *this, const uint32_t *desc, vo
 }
 
 // ---- the context's bindings -------------------------------------------------------------------------------------------------
-enum { STAGE_VS, STAGE_PS };
+enum { STAGE_VS, STAGE_PS, STAGE_CS, STAGES };
 #define VB_BASE 14                    // vertex buffer slot s is Metal buffer 14 + s (constant buffers take 0..13)
 typedef struct d3d_draw_state {
     d3d_layout *layout;
     d3d_buffer *vb[16]; uint32_t stride[16], offset[16];
     d3d_buffer *ib; uint32_t ib_format, ib_offset, topology;
-    d3d_shader *shader[2];
-    d3d_buffer *cb[2][14]; uint32_t cb_offset[2][14];
-    d3d_view *srv[2][32];
-    d3d_sampler *smp[2][16];
+    d3d_shader *shader[STAGES];
+    d3d_buffer *cb[STAGES][14]; uint32_t cb_offset[STAGES][14];
+    d3d_view *srv[STAGES][32];
+    d3d_sampler *smp[STAGES][16];
+    d3d_view *uav[STAGES][8];                  // pixel shaders (with render targets) and compute shaders
     d3d_blend *blend; float blend_factor[4];
     d3d_depth *depth; uint32_t stencil_ref;
     d3d_raster *raster;
@@ -276,11 +309,12 @@ void d3d_draw_release(d3d_context *c) {
     if (!s) return;
     bind(&s->layout, NULL); bind(&s->ib, NULL); bind(&s->blend, NULL); bind(&s->depth, NULL); bind(&s->raster, NULL);
     for (int i = 0; i < 16; i++) bind(&s->vb[i], NULL);
-    for (int st = 0; st < 2; st++) {
+    for (int st = 0; st < STAGES; st++) {
         bind(&s->shader[st], NULL);
         for (int i = 0; i < 14; i++) bind(&s->cb[st][i], NULL);
         for (int i = 0; i < 32; i++) bind(&s->srv[st][i], NULL);
         for (int i = 0; i < 16; i++) bind(&s->smp[st][i], NULL);
+        for (int i = 0; i < 8; i++) bind(&s->uav[st][i], NULL);
     }
     free(s);
     c->draw = NULL;
@@ -320,6 +354,27 @@ static void set_samplers(d3d_context *c, int st, uint32_t start, uint32_t n, d3d
 }
 static WINAPI void vs_set_samplers(void *this, uint32_t start, uint32_t n, d3d_sampler *const *v) { set_samplers(this, STAGE_VS, start, n, v); }
 static WINAPI void ps_set_samplers(void *this, uint32_t start, uint32_t n, d3d_sampler *const *v) { set_samplers(this, STAGE_PS, start, n, v); }
+static WINAPI void cs_set_shader(void *this, d3d_shader *sh, void *const *ci, uint32_t n) { (void)ci; (void)n; bind(&state_of(this)->shader[STAGE_CS], sh); }
+static WINAPI void cs_set_cbs(void *this, uint32_t start, uint32_t n, d3d_buffer *const *b) { set_cbs(this, STAGE_CS, start, n, b); }
+static WINAPI void cs_set_srvs(void *this, uint32_t start, uint32_t n, d3d_view *const *v) { set_srvs(this, STAGE_CS, start, n, v); }
+static WINAPI void cs_set_samplers(void *this, uint32_t start, uint32_t n, d3d_sampler *const *v) { set_samplers(this, STAGE_CS, start, n, v); }
+static WINAPI void cs_set_uavs(void *this, uint32_t start, uint32_t n, d3d_view *const *v, const uint32_t *counts) {
+    (void)counts;
+    d3d_draw_state *s = state_of(this);
+    for (uint32_t i = 0; i < n && start + i < 8; i++) bind(&s->uav[STAGE_CS][start + i], v ? v[i] : NULL);
+}
+typedef void (WINAPI *set_targets_fn)(void *, uint32_t, void *const *, void *);
+static WINAPI void om_set_targets_and_uavs(void *this, uint32_t nrtv, void *const *rtvs, void *dsv, uint32_t start, uint32_t nuav, d3d_view *const *uavs, const uint32_t *counts) {
+    (void)counts;
+    if (nrtv != 0xffffffffu) {                                // D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL
+        set_targets_fn set = (set_targets_fn)self_of(this)->vtbl[33];   // OMSetRenderTargets
+        set(this, nrtv, rtvs, dsv);
+    }
+    if (nuav != 0xffffffffu) {                                // D3D11_KEEP_UNORDERED_ACCESS_VIEWS
+        d3d_draw_state *s = state_of(this);
+        for (uint32_t i = 0; i < 8; i++) bind(&s->uav[STAGE_PS][i], i >= start && i < start + nuav && uavs ? uavs[i - start] : NULL);
+    }
+}
 static WINAPI void om_set_blend(void *this, d3d_blend *b, const float *factor, uint32_t mask) {
     (void)mask;
     d3d_draw_state *s = state_of(this);
@@ -476,6 +531,64 @@ static id<MTLSamplerState> default_sampler(d3d_context *c) {
     return (__bridge id<MTLSamplerState>)state;
 }
 
+
+// Binds a stage's constant buffers, textures, samplers, buffer views and UAVs on a render or compute encoder.
+static id<MTLTexture> view_texture(d3d_view *v);
+static id<MTLSamplerState> default_sampler(d3d_context *c);
+static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCommandEncoder> renc, id<MTLComputeCommandEncoder> cenc) {
+    d3d_shader *sh = s->shader[st];
+    if (!sh) return;
+#define SET_BUFFER(b, off, idx) do { if (cenc) [cenc setBuffer:b offset:off atIndex:idx]; \
+    else if (st == STAGE_VS) [renc setVertexBuffer:b offset:off atIndex:idx]; else [renc setFragmentBuffer:b offset:off atIndex:idx]; } while (0)
+#define SET_TEXTURE(t, idx) do { if (cenc) [cenc setTexture:t atIndex:idx]; \
+    else if (st == STAGE_VS) [renc setVertexTexture:t atIndex:idx]; else [renc setFragmentTexture:t atIndex:idx]; } while (0)
+#define SET_SAMPLER(sm, idx) do { if (cenc) [cenc setSamplerState:sm atIndex:idx]; \
+    else if (st == STAGE_VS) [renc setVertexSamplerState:sm atIndex:idx]; else [renc setFragmentSamplerState:sm atIndex:idx]; } while (0)
+    uint32_t sizes[32] = { 0 };                                  // bytes of u0..u7, then t0..t21 (for bufinfo)
+    for (int i = 0; i < 14; i++) {
+        if (!(sh->info.cbuffers & (1u << i))) continue;
+        id<MTLBuffer> b = s->cb[st][i] ? (__bridge id<MTLBuffer>)s->cb[st][i]->mtl : nil;
+        SET_BUFFER(b, 0, i);
+    }
+    for (int i = 0; i < 32; i++) {
+        if (!(sh->info.textures[0] & (1ull << i))) continue;
+        SET_TEXTURE(view_texture(s->srv[st][i]), i);
+    }
+    for (int i = 0; i < 16; i++) {
+        if (!(sh->info.samplers & (1u << i))) continue;
+        SET_SAMPLER(s->smp[st][i] ? (__bridge id<MTLSamplerState>)s->smp[st][i]->mtl : default_sampler(c), i);
+    }
+    for (int i = 0; i < 22; i++) {                              // raw and structured buffer SRVs
+        if (!(sh->info.srv_buffers & (1ull << i))) continue;
+        d3d_view *v = s->srv[st][i];
+        if (!v || v->resource->kind != K_BUFFER) { SET_BUFFER(nil, 0, DXBC_SRV_BUFFER_BASE + i); continue; }
+        id<MTLBuffer> b = (__bridge id<MTLBuffer>)((d3d_buffer *)v->resource)->mtl;
+        uint32_t stride = sh->info.srv_stride[i] ? sh->info.srv_stride[i] : 4;
+        NSUInteger off = (NSUInteger)v->first * stride;
+        SET_BUFFER(b, off, DXBC_SRV_BUFFER_BASE + i);
+        sizes[8 + i] = v->count ? v->count * stride : (uint32_t)(b.length - MIN(off, b.length));
+    }
+    for (int i = 0; i < 8; i++) {                                // UAVs
+        if (!(sh->info.uavs & (1u << i))) continue;
+        d3d_view *v = s->uav[st][i];
+        if (sh->info.uav_kind[i] == DXBC_UAV_TYPED) { SET_TEXTURE(view_texture(v), DXBC_UAV_TEXTURE_BASE + i); continue; }
+        if (!v || v->resource->kind != K_BUFFER) { SET_BUFFER(nil, 0, DXBC_UAV_BUFFER_BASE + i); continue; }
+        id<MTLBuffer> b = (__bridge id<MTLBuffer>)((d3d_buffer *)v->resource)->mtl;
+        uint32_t stride = sh->info.uav_stride[i] ? sh->info.uav_stride[i] : 4;
+        NSUInteger off = (NSUInteger)v->first * stride;
+        SET_BUFFER(b, off, DXBC_UAV_BUFFER_BASE + i);
+        sizes[i] = v->count ? v->count * stride : (uint32_t)(b.length - MIN(off, b.length));
+    }
+    if (sh->info.uses_sizes) {
+        if (cenc) [cenc setBytes:sizes length:sizeof sizes atIndex:DXBC_SIZES_BUFFER];
+        else if (st == STAGE_VS) [renc setVertexBytes:sizes length:sizeof sizes atIndex:DXBC_SIZES_BUFFER];
+        else [renc setFragmentBytes:sizes length:sizeof sizes atIndex:DXBC_SIZES_BUFFER];
+    }
+#undef SET_BUFFER
+#undef SET_TEXTURE
+#undef SET_SAMPLER
+}
+
 // Sets everything a draw needs; returns the encoder, or nil when the draw cannot happen.
 static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *type) {
     d3d_draw_state *s = state_of(c);
@@ -523,25 +636,8 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
     [enc setScissorRect:sc];
     for (int i = 0; i < 16; i++)
         if (s->vb[i]) [enc setVertexBuffer:(__bridge id<MTLBuffer>)s->vb[i]->mtl offset:s->offset[i] atIndex:VB_BASE + i];
-    for (int st = 0; st < 2; st++) {
-        d3d_shader *sh = s->shader[st];
-        if (!sh) continue;
-        for (int i = 0; i < 14; i++) {
-            if (!(sh->info.cbuffers & (1u << i))) continue;
-            id<MTLBuffer> b = s->cb[st][i] ? (__bridge id<MTLBuffer>)s->cb[st][i]->mtl : nil;
-            if (st == STAGE_VS) [enc setVertexBuffer:b offset:0 atIndex:i]; else [enc setFragmentBuffer:b offset:0 atIndex:i];
-        }
-        for (int i = 0; i < 32; i++) {
-            if (!(sh->info.textures[0] & (1ull << i))) continue;
-            id<MTLTexture> t = view_texture(s->srv[st][i]);
-            if (st == STAGE_VS) [enc setVertexTexture:t atIndex:i]; else [enc setFragmentTexture:t atIndex:i];
-        }
-        for (int i = 0; i < 16; i++) {
-            if (!(sh->info.samplers & (1u << i))) continue;
-            id<MTLSamplerState> sm = s->smp[st][i] ? (__bridge id<MTLSamplerState>)s->smp[st][i]->mtl : default_sampler(c);
-            if (st == STAGE_VS) [enc setVertexSamplerState:sm atIndex:i]; else [enc setFragmentSamplerState:sm atIndex:i];
-        }
-    }
+    bind_stage(c, s, STAGE_VS, enc, nil);
+    bind_stage(c, s, STAGE_PS, enc, nil);
     return enc;
 }
 
@@ -571,12 +667,56 @@ static WINAPI void ctx_draw_indexed_instanced(void *this, uint32_t count, uint32
     draw_indexed(this, count, instances, start, base_vertex, start_instance);
 }
 
+
+// ---- compute ---------------------------------------------------------------------------------------------------------------------
+static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) {
+    d3d_context *c = this;
+    d3d_draw_state *s = state_of(c);
+    d3d_shader *cs = s->shader[STAGE_CS];
+    if (!cs || !x || !y || !z) return;
+    if (!cs->compute) {
+        NSError *err = nil;
+        id<MTLComputePipelineState> pso = [(__bridge id<MTLDevice>)c->base.dev->mtl newComputePipelineStateWithFunction:(__bridge id<MTLFunction>)cs->function error:&err];
+        if (!pso) { vx_log("Direct3D: compute pipeline failed: %s", err.localizedDescription.UTF8String); return; }
+        cs->compute = (void *)CFBridgingRetain(pso);
+    }
+    d3d_end_render(c);
+    id<MTLComputeCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoder];
+    [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)cs->compute];
+    bind_stage(c, s, STAGE_CS, nil, enc);
+    const uint32_t *t = cs->info.threads;
+    [enc dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(t[0] ? t[0] : 1, t[1] ? t[1] : 1, t[2] ? t[2] : 1)];
+    [enc endEncoding];
+}
+// ClearUnorderedAccessView: buffers are filled on the GPU (in order with the other work); a value whose four bytes
+// differ is written as words after the GPU work so far has finished.
+static void clear_uav(d3d_context *c, d3d_view *v, uint32_t value) {
+    if (!v || v->resource->kind != K_BUFFER) { d3d_not_implemented("ID3D11DeviceContext::ClearUnorderedAccessView (textures)"); return; }
+    id<MTLBuffer> b = (__bridge id<MTLBuffer>)((d3d_buffer *)v->resource)->mtl;
+    NSUInteger off = (NSUInteger)v->first * 4, len = v->count ? (NSUInteger)v->count * 4 : b.length - MIN(off, b.length);
+    if (off + len > b.length) len = b.length - MIN(off, b.length);
+    uint8_t byte = (uint8_t)value;
+    if (value == byte * 0x01010101u) {
+        d3d_end_render(c);
+        id<MTLBlitCommandEncoder> blit = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) blitCommandEncoder];
+        [blit fillBuffer:b range:NSMakeRange(off, len) value:byte];
+        [blit endEncoding];
+        return;
+    }
+    d3d_flush(c->base.dev, 1);
+    uint32_t *w = (uint32_t *)((uint8_t *)b.contents + off);
+    for (NSUInteger i = 0; i < len / 4; i++) w[i] = value;
+}
+static WINAPI void ctx_clear_uav_uint(void *this, d3d_view *v, const uint32_t *values) { clear_uav(this, v, values[0]); }
+static WINAPI void ctx_clear_uav_float(void *this, d3d_view *v, const float *values) { uint32_t bits; memcpy(&bits, &values[0], 4); clear_uav(this, v, bits); }
+
 // ---- tables -------------------------------------------------------------------------------------------------------------------------
 const d3d_method d3d_draw_device_methods[] = {
     { "CreateVertexShader", (void *)device_create_vs }, { "CreatePixelShader", (void *)device_create_ps },
     { "CreateInputLayout", (void *)device_create_layout }, { "CreateBlendState", (void *)device_create_blend },
     { "CreateDepthStencilState", (void *)device_create_depth }, { "CreateRasterizerState", (void *)device_create_raster },
-    { "CreateSamplerState", (void *)device_create_sampler }, { NULL, NULL },
+    { "CreateSamplerState", (void *)device_create_sampler }, { "CreateComputeShader", (void *)device_create_cs },
+    { "CreateUnorderedAccessView", (void *)device_create_uav }, { NULL, NULL },
 };
 const d3d_method d3d_draw_context_methods[] = {
     { "IASetInputLayout", (void *)ia_set_layout }, { "IASetVertexBuffers", (void *)ia_set_vertex_buffers },
@@ -589,11 +729,17 @@ const d3d_method d3d_draw_context_methods[] = {
     { "RSSetState", (void *)rs_set_state }, { "RSSetScissorRects", (void *)rs_set_scissors },
     { "Draw", (void *)ctx_draw }, { "DrawInstanced", (void *)ctx_draw_instanced },
     { "DrawIndexed", (void *)ctx_draw_indexed }, { "DrawIndexedInstanced", (void *)ctx_draw_indexed_instanced },
+    { "CSSetShader", (void *)cs_set_shader }, { "CSSetConstantBuffers", (void *)cs_set_cbs }, { "CSSetShaderResources", (void *)cs_set_srvs },
+    { "CSSetSamplers", (void *)cs_set_samplers }, { "CSSetUnorderedAccessViews", (void *)cs_set_uavs }, { "Dispatch", (void *)ctx_dispatch },
+    { "OMSetRenderTargetsAndUnorderedAccessViews", (void *)om_set_targets_and_uavs },
+    { "ClearUnorderedAccessViewUint", (void *)ctx_clear_uav_uint }, { "ClearUnorderedAccessViewFloat", (void *)ctx_clear_uav_float },
     { NULL, NULL },
 };
 void d3d_draw_init(void) {
     static const d3d_method vs[] = { { "QueryInterface", (void *)vs_qi }, CHILD_METHODS, { NULL, NULL } };
     static const d3d_method ps[] = { { "QueryInterface", (void *)ps_qi }, CHILD_METHODS, { NULL, NULL } };
+    static const d3d_method cs[] = { { "QueryInterface", (void *)cs_qi }, CHILD_METHODS, { NULL, NULL } };
+    static const d3d_method uav[] = { { "QueryInterface", (void *)uav_qi }, CHILD_METHODS, { "GetResource", (void *)uav_get_resource }, { NULL, NULL } };
     static const d3d_method layout[] = { { "QueryInterface", (void *)layout_qi }, CHILD_METHODS, { NULL, NULL } };
     static const d3d_method blend[] = { { "QueryInterface", (void *)blend_qi }, CHILD_METHODS, { "GetDesc", (void *)blend_get_desc }, { NULL, NULL } };
     static const d3d_method depth[] = { { "QueryInterface", (void *)depth_qi }, CHILD_METHODS, { "GetDesc", (void *)depth_get_desc }, { NULL, NULL } };
@@ -601,6 +747,8 @@ void d3d_draw_init(void) {
     static const d3d_method sampler[] = { { "QueryInterface", (void *)sampler_qi }, CHILD_METHODS, { "GetDesc", (void *)sampler_get_desc }, { NULL, NULL } };
     g_vs_vtbl = D3D_VTABLE(ID3D11VertexShader, vs);
     g_ps_vtbl = D3D_VTABLE(ID3D11PixelShader, ps);
+    g_cs_vtbl = D3D_VTABLE(ID3D11ComputeShader, cs);
+    g_uav_vtbl = D3D_VTABLE(ID3D11UnorderedAccessView, uav);
     g_layout_vtbl = D3D_VTABLE(ID3D11InputLayout, layout);
     g_blend_vtbl = D3D_VTABLE(ID3D11BlendState, blend);
     g_depth_vtbl = D3D_VTABLE(ID3D11DepthStencilState, depth);
