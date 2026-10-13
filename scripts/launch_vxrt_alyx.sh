@@ -7,6 +7,8 @@
 #   scripts/launch_vxrt_alyx.sh +map a1_intro_world_2 +hlvr_pause_after_realmap 0   # extra game arguments
 #   VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh  # 1440x1620 per eye, 2880x1620 stream at 40 Mbps, 60 Hz
 #                                                   # (60 fps on an M1 Max)
+#   VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh  # 2560x2880 per eye, 2x multisampling, the 3k stream
+#                                                   # (50-55 fps on an M1 Max)
 #
 # The game and SteamVR come from the Wine prefix's Steam library and stay read-only (writes go to the overlay
 # folder, as for scripts/launch_vxrt_steamvr.sh). The first start compiles thousands of shaders and takes a few
@@ -49,7 +51,15 @@ echo "SteamVR on VXRuntime is up; starting Half-Life: Alyx (log: $LOG_DIR/vxrt-a
 # The game's capture proxy (openvr_api.dll beside the game, from this repository) streams the game's frames straight
 # from its Submit and paces poses by the virtual display, as the driver does (3k: 60 Hz). It goes into the overlay
 # folder (read before the game's own folder), so the Steam library stays as it is.
-[[ "${VXRT_VR_QUALITY:-}" == 3k ]] && export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-60}"
+[[ "${VXRT_VR_QUALITY:-}" == 3k || "${VXRT_VR_QUALITY:-}" == 2.5k ]] && export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-60}"
+# 2.5k: 2x multisampling (4x stores and reloads about 1.5 GB of samples a frame at this size: 45 fps falling to 35 within
+# minutes; 2x holds 50-55), and the game's fidelity level fixed (its automatic choice raises the resolution
+# past what the GPU can draw).
+GAME_ARGS=()
+if [[ "${VXRT_VR_QUALITY:-}" == 2.5k ]]; then
+    export VXRT_MSAA_MAX="${VXRT_MSAA_MAX:-2}"
+    GAME_ARGS=(-noautofidelity +vr_fidelity_level 3)
+fi
 PROXY_DLL="$REPO_ROOT/build/openvr_api_capture_proxy.dll"
 if [[ ! -f "$PROXY_DLL" || "$REPO_ROOT/VRDriver/src/openvr_capture_proxy.cpp" -nt "$PROXY_DLL" ]]; then
     "$SCRIPT_DIR/build_openvr_capture_proxy.sh" >/dev/null
@@ -64,7 +74,7 @@ export VERANTYX_DECOUPLED_POSES="${VERANTYX_DECOUPLED_POSES:-1}"
 cd "$ALYX_BIN"
 VXRT_ROOT="$VXRT_VR_ROOT" VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY" VXRT_DLL_PATH="$WINEPREFIX/drive_c/windows/system32" \
 VXRT_STEAM_BRIDGE=1 VXRT_NO_ACTIVATE=1 \
-    "$VXRT" hlvr.exe -vr -steam -dx11 -noasserts -nopassiveasserts +map startup "$@" >"$LOG_DIR/vxrt-alyx.log" 2>&1 &
+    "$VXRT" hlvr.exe -vr -steam -dx11 -noasserts -nopassiveasserts ${GAME_ARGS[@]+"${GAME_ARGS[@]}"} +map startup "$@" >"$LOG_DIR/vxrt-alyx.log" 2>&1 &
 GAME_PID=$!
 wait "$GAME_PID" || true
 GAME_PID=

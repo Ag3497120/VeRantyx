@@ -797,13 +797,18 @@ void d3d_gpu_profile_submit(d3d_device *dev, void *cmd_ptr) {
     [(__bridge id<MTLCommandBuffer>)cmd_ptr addCompletedHandler:^(id<MTLCommandBuffer> done) {
         (void)done;
         pthread_mutex_lock(&g_prof_lock);
+        // A pass's time: how far it moved the end of the command buffer's work (the GPU starts a pass's vertices
+        // while earlier passes still shade, so its own start-to-end span counts their time too).
+        uint64_t last_end = 0;
         for (uint32_t k = 0; k < count; k += 2) {
             uint32_t s = (first + k) % PROF_SAMPLES;
             NSData *data = [g_prof_buf resolveCounterRange:NSMakeRange(s, 2)];
             if (data.length < 2 * sizeof(MTLCounterResultTimestamp)) continue;
             const MTLCounterResultTimestamp *t = data.bytes;
             if (t[0].timestamp == MTLCounterErrorValue || t[1].timestamp == MTLCounterErrorValue || t[1].timestamp < t[0].timestamp) continue;
-            prof_add(names[k / 2].sig, (double)(t[1].timestamp - t[0].timestamp));
+            uint64_t from = MAX(t[0].timestamp, last_end);
+            prof_add(names[k / 2].sig, t[1].timestamp > from ? (double)(t[1].timestamp - from) : 0);
+            last_end = MAX(last_end, t[1].timestamp);
         }
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if (!g_prof_since) g_prof_since = now;
@@ -1534,6 +1539,15 @@ static WINAPI void ctx_resolve(void *this, d3d_object *dst, uint32_t dst_sub, d3
     a.resolveTexture = dt; a.resolveLevel = dst_sub % dmips; a.resolveSlice = dst_sub / dmips;
     a.loadAction = MTLLoadActionLoad; a.storeAction = MTLStoreActionMultisampleResolve;
     d3d_end_render(c);
+    if (prof_on(c->base.dev)) {                         // VXRT_GPU_PROFILE: the resolve timed
+        char sig[120]; snprintf(sig, sizeof sig, "resolve %lux%lu f%lu x%lu", (unsigned long)st.width, (unsigned long)st.height, (unsigned long)st.pixelFormat, (unsigned long)st.sampleCount);
+        uint32_t smp = prof_take(sig);
+        rp.sampleBufferAttachments[0].sampleBuffer = g_prof_buf;
+        rp.sampleBufferAttachments[0].startOfVertexSampleIndex = smp;
+        rp.sampleBufferAttachments[0].endOfVertexSampleIndex = MTLCounterDontSample;
+        rp.sampleBufferAttachments[0].startOfFragmentSampleIndex = MTLCounterDontSample;
+        rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = smp + 1;
+    }
     id<MTLRenderCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) renderCommandEncoderWithDescriptor:rp];
     [enc endEncoding];
     d3d_mark_gpu(c, dst);

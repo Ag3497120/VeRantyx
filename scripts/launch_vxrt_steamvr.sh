@@ -61,6 +61,14 @@ EOF
 # 800x900 per eye (the stream keeps its own size, VERANTYX_STREAM_WIDTH/HEIGHT). Either way SteamVR's own
 # resolution scaling is set to 100% (the copied settings may lower it), and the repository's driver, which
 # takes VERANTYX_RENDER_SCALE, is used from the overlay (the Wine prefix keeps its own).
+# VXRT_VR_QUALITY=2.5k: the game renders 2560x2880 per eye (Half-Life: Alyx: 50-55 fps on an M1 Max with 2x
+# multisampling, scripts/launch_vxrt_alyx.sh); SteamVR's compositor and the stream stay at the 3k preset's 2880x1620
+# (one HEVC session encodes about 60 frames a second of that).
+if [[ "${VXRT_VR_QUALITY:-}" == 2.5k ]]; then
+    VXRT_VR_RENDER_SCALE="${VXRT_VR_RENDER_SCALE:-3.2}"
+    export VERANTYX_DISPLAY_SCALE="${VERANTYX_DISPLAY_SCALE:-1.8}"
+    VXRT_VR_QUALITY=3k
+fi
 if [[ "${VXRT_VR_QUALITY:-}" == 3k ]]; then
     VXRT_VR_RENDER_SCALE="${VXRT_VR_RENDER_SCALE:-1.8}"
     export VERANTYX_STREAM_WIDTH="${VERANTYX_STREAM_WIDTH:-2880}" VERANTYX_STREAM_HEIGHT="${VERANTYX_STREAM_HEIGHT:-1620}"
