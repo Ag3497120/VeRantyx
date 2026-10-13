@@ -55,10 +55,14 @@ echo "SteamVR on VXRuntime is up; starting Half-Life: Alyx (log: $LOG_DIR/vxrt-a
 # 2.5k: 2x multisampling (4x stores and reloads about 1.5 GB of samples a frame at this size: 45 fps falling to 35 within
 # minutes; 2x holds 50-55), and the game's fidelity level fixed (its automatic choice raises the resolution
 # past what the GPU can draw).
+# 3k: fidelity level 4 fixed as well (left automatic, the game raised its own size to 2407x1942 per eye in the
+# headset, 32-36 fps).
 GAME_ARGS=()
 if [[ "${VXRT_VR_QUALITY:-}" == 2.5k ]]; then
     export VXRT_MSAA_MAX="${VXRT_MSAA_MAX:-2}"
     GAME_ARGS=(-noautofidelity +vr_fidelity_level 3)
+elif [[ "${VXRT_VR_QUALITY:-}" == 3k ]]; then
+    GAME_ARGS=(-noautofidelity +vr_fidelity_level 4)
 fi
 PROXY_DLL="$REPO_ROOT/build/openvr_api_capture_proxy.dll"
 if [[ ! -f "$PROXY_DLL" || "$REPO_ROOT/VRDriver/src/openvr_capture_proxy.cpp" -nt "$PROXY_DLL" ]]; then
