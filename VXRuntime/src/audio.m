@@ -121,6 +121,17 @@ static OSStatus render_callback(void *ctx, AudioUnitRenderActionFlags *flags, co
         i += run;
     }
     memset(out + (size_t)n * c->frame_bytes, 0, (size_t)(nframes - n) * c->frame_bytes);
+    if (n < nframes && c->written) {                            // ran dry: a gap of silence (heard as crackle)
+        static uint64_t gaps, gap_frames, since;
+        gaps++; gap_frames += nframes - n;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (!since) since = now;
+        if (now - since >= 10000000000ull) {
+            vx_log("audio: %llu gaps of silence in the last 10 s (%llu ms missing): the program wrote too late",
+                   (unsigned long long)gaps, (unsigned long long)(gap_frames * 1000 / (c->fmt.rate ? c->fmt.rate : 48000)));
+            gaps = gap_frames = 0; since = now;
+        }
+    }
     static int muted = -1;                                      // VXRT_MUTE=1: silence (for unattended runs)
     if (muted < 0) muted = getenv("VXRT_MUTE") && atoi(getenv("VXRT_MUTE"));
     if (muted) memset(out, 0, (size_t)nframes * c->frame_bytes);
@@ -149,7 +160,9 @@ static WINAPI HRESULT client_initialize(void *this, uint32_t share, DWORD flags,
     if (!kind || !fmt->channels || !fmt->rate) return AUDCLNT_E_UNSUPPORTED_FORMAT;
     c->fmt = *fmt;
     c->frame_bytes = fmt->block ? fmt->block : (uint32_t)fmt->channels * fmt->bits / 8;
-    int64_t min = 200000;                                       // at least 20 ms
+    // At least 60 ms: Core Audio takes ~11 ms a time, and with 20 ms a program woken a little late (Rosetta, a
+    // busy Mac) left it short every few callbacks: gaps of silence, heard as crackle in Half-Life: Alyx.
+    int64_t min = 600000;
     c->frames = (uint32_t)(((duration > min ? duration : min) * (int64_t)fmt->rate + 9999999) / 10000000);
     c->ring = calloc(c->frames, c->frame_bytes);
     c->scratch = calloc(c->frames, c->frame_bytes);
