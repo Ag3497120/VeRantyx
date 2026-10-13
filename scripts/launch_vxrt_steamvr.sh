@@ -56,6 +56,27 @@ cat >"$OPENVR_DIR/openvrpaths.vrpath" <<EOF
 }
 EOF
 
+# Picture size. VXRT_VR_QUALITY=3k: 1440x1620 per eye (2880x1620 for both, about 4.7 megapixels) rendered,
+# composited and streamed, at 40 Mbps HEVC; VXRT_VR_RENDER_SCALE=1.25 instead scales the driver's default
+# 800x900 per eye (the stream keeps its own size, VERANTYX_STREAM_WIDTH/HEIGHT). Either way SteamVR's own
+# resolution scaling is set to 100% (the copied settings may lower it), and the repository's driver, which
+# takes VERANTYX_RENDER_SCALE, is used from the overlay (the Wine prefix keeps its own).
+if [[ "${VXRT_VR_QUALITY:-}" == 3k ]]; then
+    VXRT_VR_RENDER_SCALE="${VXRT_VR_RENDER_SCALE:-1.8}"
+    export VERANTYX_STREAM_WIDTH="${VERANTYX_STREAM_WIDTH:-2880}" VERANTYX_STREAM_HEIGHT="${VERANTYX_STREAM_HEIGHT:-1620}"
+    export VERANTYX_BITRATE_MBPS="${VERANTYX_BITRATE_MBPS:-40}"
+fi
+if [[ -n "${VXRT_VR_RENDER_SCALE:-}" ]]; then
+    export VERANTYX_RENDER_SCALE="$VXRT_VR_RENDER_SCALE"
+    DRIVER_DLL="$REPO_ROOT/VRDriver/driver_verantyx.dll"
+    if [[ ! -f "$DRIVER_DLL" || "$REPO_ROOT/VRDriver/src/driver_verantyx.cpp" -nt "$DRIVER_DLL" ]]; then
+        "$SCRIPT_DIR/build_openvr_driver.sh" >/dev/null
+    fi
+    OVERLAY_DRIVER="$VXRT_VR_OVERLAY/steamapps/common/SteamVR/drivers/verantyx/bin/win64"
+    mkdir -p "$OVERLAY_DRIVER"
+    cp -p "$DRIVER_DLL" "$OVERLAY_DRIVER/driver_verantyx.dll"
+fi
+
 python3 - "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" "$VXRT_VR_NO_STANDBY" "${VXRT_VR_RENDER_SCALE:-}" <<'EOF'
 import json, sys
 settings = json.load(open(sys.argv[1]))
@@ -67,9 +88,6 @@ if sys.argv[3] == "1":
 json.dump(settings, open(sys.argv[2], "w"), indent=3)
 EOF
 
-# VXRT_VR_RENDER_SCALE=1.25: the game renders 1.25 x 1.25 times the driver's default pixels per eye (needs a
-# driver with VERANTYX_RENDER_SCALE), and SteamVR's own resolution scaling is set to 100% so it keeps them.
-[[ -n "${VXRT_VR_RENDER_SCALE:-}" ]] && export VERANTYX_RENDER_SCALE="$VXRT_VR_RENDER_SCALE"
 export VXRT_ROOT="$VXRT_VR_ROOT"
 export VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY"
 export VXRT_DLL_PATH="$WINEPREFIX/drive_c/windows/system32"

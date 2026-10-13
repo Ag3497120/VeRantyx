@@ -398,6 +398,7 @@ func environmentDouble(_ name: String, default fallback: Double, range: ClosedRa
 // made a visible hitch twice a second; lost frames already request an IDR.
 let keyFrameIntervalSeconds = environmentDouble("VERANTYX_KEYFRAME_INTERVAL", default: 3.0, range: 0.5...30)
 let videoBitrate = Int32(environmentDouble("VERANTYX_BITRATE_MBPS", default: 20, range: 2...80) * 1_000_000)
+let hevcTenBit = ProcessInfo.processInfo.environment["VERANTYX_HEVC_10BIT"] != "0"
 // Pace UDP bursts so AWDL does not drop them, but fast enough that a frame
 // does not spend most of its interval queued behind the previous one.
 let sendPacingBytesPerSecond = environmentDouble("VERANTYX_SEND_PACING_MBPS", default: 60, range: 8...400) * 1_000_000 / 8
@@ -541,7 +542,10 @@ func setupEncoder(width: Int32, height: Int32) {
     set(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2, "colour primaries")
     set(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_sRGB, "transfer function")   // as the frames: no conversion
     set(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2, "YCbCr matrix")
-    set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel, "profile")
+    // HEVC Main10 (VERANTYX_HEVC_10BIT=0: Main): even from 8-bit frames, the 10-bit YCbCr and quantization keep
+    // dark gradients smooth (4x the steps of Main on a dark ramp, measured on an M1 Max) at fewer bits. The
+    // headset app decodes it to half floats.
+    set(kVTCompressionPropertyKey_ProfileLevel, hevcTenBit ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel, "profile")
     // Critical settings for ultra-low latency VR streaming
     set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "no B-frames")
     set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue, "speed priority")
@@ -560,8 +564,8 @@ func setupEncoder(width: Int32, height: Int32) {
     set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: keyFrameIntervalSeconds), "keyframe duration")
 
     VTCompressionSessionPrepareToEncodeFrames(session)
-    print(String(format: "HEVC encoder ready: %dx%d %.1f Mbps keyframe=%.1fs pacing=%.0f Mbps lowLatency=%@",
-        width, height, Double(videoBitrate) / 1_000_000, keyFrameIntervalSeconds,
+    print(String(format: "HEVC encoder ready: %dx%d %@ %.1f Mbps keyframe=%.1fs pacing=%.0f Mbps lowLatency=%@",
+        width, height, hevcTenBit ? "Main10" : "Main", Double(videoBitrate) / 1_000_000, keyFrameIntervalSeconds,
         sendPacingBytesPerSecond * 8 / 1_000_000, lowLatency ? "yes" : "no"))
     requestKeyFrame()
 }

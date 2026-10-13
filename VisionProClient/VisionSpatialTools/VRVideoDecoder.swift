@@ -125,6 +125,9 @@ final class VRVideoDecoder: ObservableObject {
     private var diagnosticsTimer: DispatchSourceTimer?
     private var lastStatus = ""
     private var formatDescription: CMVideoFormatDescription?
+    /// The stream is HEVC Main10: frames are decoded to half floats, keeping the precision that removes banding
+    /// in dark gradients (8-bit BGRA output would throw it away again).
+    private var isTenBit = false
     private var decompressionSession: VTDecompressionSession?
     private var vpsData: [UInt8]?
     private var spsData: [UInt8]?
@@ -488,6 +491,9 @@ final class VRVideoDecoder: ObservableObject {
     private func createFormatDescription() {
         guard let vps = vpsData, let sps = spsData, let pps = ppsData else { return }
         formatDescription = nil
+        // general_profile_idc: the low five bits of the SPS's fourth byte (after the two-byte NAL header and the
+        // VPS id / sub-layer byte); 2 is Main10.
+        isTenBit = sps.count > 3 && (sps[3] & 0x1f) == 2
 
         vps.withUnsafeBufferPointer { vpsBuffer in
             sps.withUnsafeBufferPointer { spsBuffer in
@@ -517,7 +523,7 @@ final class VRVideoDecoder: ObservableObject {
     private func createDecompressionSession() {
         guard let formatDescription else { return }
         let attributes: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey: isTenBit ? kCVPixelFormatType_64RGBAHalf : kCVPixelFormatType_32BGRA,
             kCVPixelBufferMetalCompatibilityKey: true,
             kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
         ]

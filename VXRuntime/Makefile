@@ -182,6 +182,7 @@ check: all
 	build/vxrt build/pipes.exe serve & build/vxrt build/pipes.exe ask; wait
 	build/vxrt build/ipc.exe second & build/vxrt build/ipc.exe first; wait
 	build/vxrt build/shared.exe make & build/vxrt build/shared.exe open; wait
+	build/vxrt build/shared.exe pingpong 1 & build/vxrt build/shared.exe pingpong 2; wait
 
 # CPU cost per Direct3D 11 draw (numbers only, not a test).
 bench: export VXRT_ROOT = build/root

@@ -338,6 +338,8 @@ final class VRCompositorRenderer {
         if cvMetalTexture == nil, let videoFrame {
             let width = CVPixelBufferGetWidth(videoFrame.pixelBuffer)
             let height = CVPixelBufferGetHeight(videoFrame.pixelBuffer)
+            // 10-bit streams arrive as half floats holding sRGB-encoded values: the shader linearizes them.
+            let halfFloat = CVPixelBufferGetPixelFormatType(videoFrame.pixelBuffer) == kCVPixelFormatType_64RGBAHalf
             let status = CVMetalTextureCacheCreateTextureFromImage(
                 kCFAllocatorDefault,
                 textureCache,
@@ -346,7 +348,7 @@ final class VRCompositorRenderer {
                 // The frames carry sRGB-encoded colour (SteamVR's display output). Read as sRGB, they come out
                 // linear and the sRGB drawable encodes them once; read as plain UNORM they were encoded a second
                 // time, which washed the picture out (pale, low-contrast colours).
-                .bgra8Unorm_srgb,
+                halfFloat ? .rgba16Float : .bgra8Unorm_srgb,
                 width,
                 height,
                 0,
@@ -401,6 +403,8 @@ final class VRCompositorRenderer {
         if let videoTexture {
             encoder.setFragmentTexture(videoTexture, index: 0)
             encoder.setFragmentSamplerState(samplerState, index: 0)
+            var linearize: UInt32 = videoTexture.pixelFormat == .rgba16Float ? 1 : 0
+            encoder.setFragmentBytes(&linearize, length: MemoryLayout<UInt32>.size, index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
         if overlayEnabled, let overlayPipelineState, let overlayTexture {
@@ -638,10 +642,16 @@ final class VRCompositorRenderer {
         fragment float4 vrFragmentShader(
             VertexOut in [[stage_in]],
             texture2d<float, access::sample> videoTexture [[texture(0)]],
-            sampler videoSampler [[sampler(0)]]) {
+            sampler videoSampler [[sampler(0)]],
+            constant uint &linearize [[buffer(0)]]) {
             float2 uv = in.uv;
             uv.x = uv.x * 0.5 + (in.eyeIndex == 0 ? 0.0 : 0.5);
-            return videoTexture.sample(videoSampler, uv);
+            float4 c = videoTexture.sample(videoSampler, uv);
+            if (linearize != 0) {        // sRGB-encoded half floats (10-bit streams): to linear, as an sRGB texture would
+                float3 e = saturate(c.rgb);
+                c.rgb = select(pow((e + 0.055) / 1.055, 2.4), e / 12.92, e <= 0.04045);
+            }
+            return c;
         }
         """
 

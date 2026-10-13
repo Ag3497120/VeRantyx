@@ -912,6 +912,7 @@ static void trace_draw(d3d_context *c, d3d_draw_state *s) {
     }
 }
 static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *type) {
+    HELD_OP(0);
     d3d_draw_state *s = state_of(c);
     if (!s->shader[STAGE_VS]) return nil;
     trace_draw(c, s);
@@ -1181,6 +1182,7 @@ static WINAPI void ctx_draw_indexed_instanced(void *this, uint32_t count, uint32
 // ---- compute ---------------------------------------------------------------------------------------------------------------------
 static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) {
     d3d_context *c = this;
+    HELD_OP(1);
     d3d_draw_state *s = state_of(c);
     d3d_shader *cs = s->shader[STAGE_CS];
     if (!cs || !x || !y || !z) return;
@@ -1293,6 +1295,7 @@ static WINAPI void so_set_targets(void *this, uint32_t n, void *const *targets, 
 static WINAPI void ctx_resolve(void *this, d3d_object *dst, uint32_t dst_sub, d3d_object *src, uint32_t src_sub, uint32_t format) {
     (void)format;
     d3d_context *c = this;
+    HELD_OP(4);
     if (!dst || !src || dst->kind != K_TEXTURE || src->kind != K_TEXTURE) return;
     d3d_texture *ds = (d3d_texture *)dst, *ss = (d3d_texture *)src;
     id<MTLTexture> st = (__bridge id<MTLTexture>)ss->mtl, dt = (__bridge id<MTLTexture>)ds->mtl;

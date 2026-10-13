@@ -118,6 +118,34 @@ int main(void) {
         CHECK(ReadProcessMemory(GetCurrentProcess(), src, dst, sizeof src, &got) && got == sizeof src && !strcmp(dst, src));
         CHECK(!ReadProcessMemory(GetCurrentProcess(), (void *)0x10, dst, 4, &got) && GetLastError() == ERROR_PARTIAL_COPY);
     }
+
+    // Virtual memory: an aligned reservation the way allocators make one (reserve more, release, reserve at the
+    // aligned address inside), many small blocks, commits inside a reservation.
+    {
+        SIZE_T size = 8 << 20, align = 4 << 20;
+        for (int i = 0; i < 3; i++) {
+            char *big = VirtualAlloc(NULL, size + align, MEM_RESERVE, PAGE_READWRITE);
+            CHECK(big != NULL);
+            char *aligned = (char *)(((ULONG_PTR)big + align - 1) & ~(ULONG_PTR)(align - 1));
+            CHECK(VirtualFree(big, 0, MEM_RELEASE));
+            char *p = VirtualAlloc(aligned, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            CHECK(p == aligned);
+            if (p) { p[size - 1] = 1; CHECK(VirtualFree(p, 0, MEM_RELEASE)); }
+        }
+        static char *small[2000];
+        for (int i = 0; i < 2000; i++) {
+            small[i] = VirtualAlloc(NULL, 0x1000 * (1 + i % 7), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            CHECK(small[i] && !((ULONG_PTR)small[i] & 0xffff));
+            if (small[i]) small[i][0] = (char)i;
+        }
+        CHECK(VirtualAlloc(small[5] + 0x2000, 0x1000, MEM_RESERVE, PAGE_READWRITE) == NULL);   // inside another one
+        for (int i = 0; i < 2000; i++) if (small[i]) { CHECK(small[i][0] == (char)i); VirtualFree(small[i], 0, MEM_RELEASE); }
+        char *r = VirtualAlloc(NULL, 0x30000, MEM_RESERVE, PAGE_NOACCESS);
+        CHECK(r && VirtualAlloc(r + 0x11000, 0x1000, MEM_COMMIT, PAGE_READWRITE) == r + 0x11000);
+        MEMORY_BASIC_INFORMATION mbi;
+        CHECK(VirtualQuery(r + 0x11000, &mbi, sizeof mbi) && mbi.AllocationBase == r && mbi.Protect == PAGE_READWRITE);
+        CHECK(VirtualFree(r, 0, MEM_RELEASE));
+    }
     printf("files and registry: %d failed checks, windows reports \"%s\" -> %s\n", failures, product, failures ? "FAILED" : "ok");
     return failures;
 }

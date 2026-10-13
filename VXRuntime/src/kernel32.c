@@ -526,13 +526,61 @@ static WINAPI BOOL TlsSetValue(DWORD i, void *v) {
 #define GRANULARITY  0x10000
 
 typedef struct { uintptr_t base; size_t size; DWORD protect; } reservation;
+// A reservation maps whole 64 KB units, as Windows uses them up: with only its pages mapped, every small one leaves
+// a gap no aligned reservation fits in, and the kernel's search for room walks all of those (2 ms per call with
+// Half-Life: Alyx's 60000 small blocks).
+static size_t mapped_size(size_t n) { return (n + GRANULARITY - 1) & ~(size_t)(GRANULARITY - 1); }
 static reservation *g_res; static int g_res_count, g_res_cap;
 static pthread_mutex_t g_vm_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// Reservations are kept sorted by address (games make thousands; Half-Life: Alyx allocates and frees large
+// blocks every frame at high resolutions, and a linear search took a core).
 static reservation *find_reservation(uintptr_t addr) {      // with g_vm_lock held
-    for (int i = 0; i < g_res_count; i++)
-        if (addr >= g_res[i].base && addr < g_res[i].base + g_res[i].size) return &g_res[i];
-    return NULL;
+    int lo = 0, hi = g_res_count;
+    while (lo < hi) { int mid = (lo + hi) / 2; if (g_res[mid].base + g_res[mid].size <= addr) lo = mid + 1; else hi = mid; }
+    return lo < g_res_count && g_res[lo].base <= addr ? &g_res[lo] : NULL;
+}
+static void res_insert(uintptr_t base, size_t size, DWORD protect) {
+    if (g_res_count == g_res_cap) { g_res_cap = g_res_cap ? g_res_cap * 2 : 256; g_res = realloc(g_res, g_res_cap * sizeof *g_res); }
+    int lo = 0, hi = g_res_count;
+    while (lo < hi) { int mid = (lo + hi) / 2; if (g_res[mid].base < base) lo = mid + 1; else hi = mid; }
+    memmove(g_res + lo + 1, g_res + lo, (size_t)(g_res_count - lo) * sizeof *g_res);
+    g_res[lo] = (reservation){ base, size, protect };
+    g_res_count++;
+}
+static void res_remove(reservation *r) {
+    memmove(r, r + 1, (size_t)(g_res + g_res_count - r - 1) * sizeof *r);
+    g_res_count--;
+}
+// Released blocks of 1 MB and more are kept a while for the next allocation of the same size: it gets fresh zero
+// pages at the same place (one call), instead of the kernel looking for room in a crowded address space. For the
+// program the range is free: a reservation at an address there drops the kept block first (allocators align this
+// way: reserve more, release, reserve again at the aligned address inside; tier0 retries that forever otherwise).
+typedef struct { uintptr_t base; size_t size; } spare_block;
+static spare_block g_spare[32];
+static int g_nspare;
+static size_t g_spare_bytes;
+static uint64_t g_va_kind[4];                     // commits in reservations, failed at an address, new, failed
+// VXRT_TRACE_VALLOC: failed reservations (the first 20, with the program's return addresses on the stack) and slow or
+// every 1024th new one, with the caller.
+static void valloc_trace(void *caller, uint64_t *stack, const char *fmt, ...) {
+    char text[200];
+    va_list ap; va_start(ap, fmt); vsnprintf(text, sizeof text, fmt, ap); va_end(ap);
+    const vx_image *m = vx_image_at((uint64_t)(uintptr_t)caller);
+    vx_log("VirtualAlloc%s, from %s+%#llx", text, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)caller - m->base) : 0ull);
+    for (int i = 0; stack && i < 160; i++) {
+        const vx_image *c = vx_image_at(stack[i]);
+        if (c) vx_log("   [%d] %s+%#llx", i, c->name, (unsigned long long)(stack[i] - (uint64_t)(uintptr_t)c->base));
+    }
+}
+static void valloc_stats(uint64_t ns) {               // VXRT_STATS: VirtualAlloc calls and time, every 2000
+    static int on = -1;
+    static uint64_t n, total;
+    if (on < 0) on = getenv("VXRT_STATS") != NULL;
+    if (!on) return;
+    total += ns;
+    if (++n % 2000 == 0) vx_log("VirtualAlloc: %llu calls, %.1f ms, %d reservations, %d spare; commits %llu, failed at an address %llu, failed %llu, new %llu",
+                               (unsigned long long)n, total / 1e6, g_res_count, g_nspare, (unsigned long long)g_va_kind[0], (unsigned long long)g_va_kind[1], (unsigned long long)g_va_kind[3], (unsigned long long)g_va_kind[2]);
 }
 
 // Protection set on page ranges (VirtualAlloc commits, VirtualProtect), as Windows reports it back: macOS keeps
@@ -586,24 +634,53 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
     if (r && !(type & MEM_RESERVE)) {                       // committing inside an existing reservation
         uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;
         prot_set(start, ((uintptr_t)addr + size + 0xfff) & ~(uintptr_t)0xfff, protect);
+        g_va_kind[0]++; valloc_stats(0);
         pthread_mutex_unlock(&g_vm_lock);
         return (void *)((uintptr_t)addr & ~(uintptr_t)0xfff);
     }
     if (addr && !(type & MEM_RESERVE)) { pthread_mutex_unlock(&g_vm_lock); vx_set_last_error(487 /* ERROR_INVALID_ADDRESS */); return NULL; }
     mach_vm_address_t a = (mach_vm_address_t)addr & ~(mach_vm_address_t)(GRANULARITY - 1);
     mach_vm_size_t len = ((mach_vm_address_t)addr + size - a + 0xfff) & ~(mach_vm_size_t)0xfff;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!addr) for (int i = g_nspare - 1; i >= 0; i--) {
+        if (g_spare[i].size != mapped_size(len)) continue;
+        mach_vm_address_t got = g_spare[i].base;
+        g_spare_bytes -= g_spare[i].size;
+        g_spare[i] = g_spare[--g_nspare];
+        if (mach_vm_allocate(mach_task_self(), &got, mapped_size(len), VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS) break;
+        mach_vm_protect(mach_task_self(), got, mapped_size(len), 0, VM_PROT_ALL);
+        res_insert((uintptr_t)got, (size_t)len, protect);
+        valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+        pthread_mutex_unlock(&g_vm_lock);
+        return (void *)got;
+    }
+    if (addr) for (int i = g_nspare - 1; i >= 0; i--) {            // the range is free for the program: kept blocks there go
+        if (g_spare[i].base >= a + mapped_size(len) || g_spare[i].base + g_spare[i].size <= a) continue;
+        mach_vm_deallocate(mach_task_self(), g_spare[i].base, g_spare[i].size);
+        g_spare_bytes -= g_spare[i].size;
+        g_spare[i] = g_spare[--g_nspare];
+    }
     kern_return_t kr = addr
-        ? mach_vm_allocate(mach_task_self(), &a, len, VM_FLAGS_FIXED)
-        : mach_vm_map(mach_task_self(), &a, len, GRANULARITY - 1, VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, 0,
+        ? mach_vm_allocate(mach_task_self(), &a, mapped_size(len), VM_FLAGS_FIXED)
+        : mach_vm_map(mach_task_self(), &a, mapped_size(len), GRANULARITY - 1, VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, 0,
                       VM_PROT_ALL, VM_PROT_ALL, VM_INHERIT_COPY);
     if (kr != KERN_SUCCESS) {
+        g_va_kind[addr ? 1 : 3]++; valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+        static uint64_t failed;
+        if (getenv("VXRT_TRACE_VALLOC") && failed++ < 20)
+            valloc_trace(__builtin_return_address(0), __builtin_frame_address(0), "(%p, %#zx, %#x) failed", addr, size, type);
         pthread_mutex_unlock(&g_vm_lock);
         vx_set_last_error(addr ? 487 : 8 /* ERROR_NOT_ENOUGH_MEMORY */);
         return NULL;
     }
-    mach_vm_protect(mach_task_self(), a, len, 0, VM_PROT_ALL);
-    if (g_res_count == g_res_cap) { g_res_cap = g_res_cap ? g_res_cap * 2 : 256; g_res = realloc(g_res, g_res_cap * sizeof *g_res); }
-    g_res[g_res_count++] = (reservation){ (uintptr_t)a, (size_t)len, protect };
+    mach_vm_protect(mach_task_self(), a, mapped_size(len), 0, VM_PROT_ALL);
+    res_insert((uintptr_t)a, (size_t)len, protect);
+    g_va_kind[2]++;
+    static uint64_t made;
+    uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    if (getenv("VXRT_TRACE_VALLOC") && (dt > 2000000 || (++made & 0x3ff) == 0))
+        valloc_trace(__builtin_return_address(0), NULL, "(%p, %#zx, %#x) = %#llx in %.2f ms", addr, size, type, (unsigned long long)a, dt / 1e6);
+    valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
     pthread_mutex_unlock(&g_vm_lock);
     return (void *)a;
 }
@@ -623,8 +700,7 @@ void *vx_virtual_alloc_below(size_t size, uintptr_t limit, DWORD protect) {
                 mach_vm_address_t got = a;
                 if (mach_vm_allocate(mach_task_self(), &got, len, VM_FLAGS_FIXED) == KERN_SUCCESS) {
                     mach_vm_protect(mach_task_self(), got, len, 0, VM_PROT_ALL);
-                    if (g_res_count == g_res_cap) { g_res_cap = g_res_cap ? g_res_cap * 2 : 256; g_res = realloc(g_res, g_res_cap * sizeof *g_res); }
-                    g_res[g_res_count++] = (reservation){ (uintptr_t)got, (size_t)len, protect };
+                    res_insert((uintptr_t)got, (size_t)len, protect);
                     cursor = (uintptr_t)(got + len);
                     pthread_mutex_unlock(&g_vm_lock);
                     return (void *)got;
@@ -644,9 +720,14 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
     reservation *r = find_reservation((uintptr_t)addr);
     BOOL ok = 0;
     if (r && (type & MEM_RELEASE) && !size && r->base == (uintptr_t)addr) {
-        mach_vm_deallocate(mach_task_self(), r->base, r->size);
         prot_set(r->base, r->base + r->size, 0);
-        *r = g_res[--g_res_count];
+        size_t n = mapped_size(r->size);
+        if (n >= (1u << 20) && g_nspare < 32 && g_spare_bytes + n <= (512u << 20) && r->base >= (1ull << 32)) {
+            g_spare[g_nspare++] = (spare_block){ r->base, n };              // (low-memory blocks are not reused)
+            g_spare_bytes += n;
+            mach_vm_behavior_set(mach_task_self(), r->base, n, VM_BEHAVIOR_REUSABLE);   // its pages can go meanwhile
+        } else mach_vm_deallocate(mach_task_self(), r->base, n);
+        res_remove(r);
         ok = 1;
     } else if (r && (type & MEM_DECOMMIT)) {
         uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;

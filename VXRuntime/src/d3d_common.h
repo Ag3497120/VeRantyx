@@ -135,6 +135,11 @@ void  **d3d_dxgi_resource_vtbl(void);        // IDXGIResource1 on resources' sec
 void  **d3d_keyed_mutex_vtbl(void);
 void d3d_shared_note(d3d_texture *t);   // d3d11_shared.m (debugging)
 void d3d_shared_written(d3d_device *dev, d3d_texture *t);   // d3d11_shared.m (debugging)
+// VXRT_TRACE_KEYED: what a thread does while it holds a keyed mutex (draws, dispatches, copies, region copies,
+// resolves, maps, flushes), logged at the release.
+extern __thread int vx_keyed_held;
+extern __thread uint32_t vx_held_ops[7];
+#define HELD_OP(i) do { if (vx_keyed_held) vx_held_ops[i]++; } while (0)
 void d3d_texture_png(d3d_device *dev, void *texture, const char *path);   // dxgi.m (debugging)
 d3d_texture *d3d_texture_wrap(d3d_device *dev, const uint32_t desc[TD_COUNT], void *mtl, int shared);   // mtl retained
 d3d_buffer  *d3d_buffer_wrap(d3d_device *dev, const uint32_t desc[6], void *mtl, int shared, void *shm, size_t shm_size);

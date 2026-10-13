@@ -5,6 +5,9 @@
 #
 #   scripts/launch_vxrt_alyx.sh                     # main menu, until the game exits or Ctrl-C
 #   scripts/launch_vxrt_alyx.sh +map a1_intro_world_2 +hlvr_pause_after_realmap 0   # extra game arguments
+#   VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh  # 1440x1620 per eye, 2880x1620 stream at 40 Mbps (about 35 fps
+#                                                   # on an M1 Max; add -noautofidelity +vr_fidelity_level 4 for
+#                                                   # the game's full detail at that size)
 #
 # The game and SteamVR come from the Wine prefix's Steam library and stay read-only (writes go to the overlay
 # folder, as for scripts/launch_vxrt_steamvr.sh). The first start compiles thousands of shaders and takes a few

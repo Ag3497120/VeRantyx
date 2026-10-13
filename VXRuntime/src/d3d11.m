@@ -262,6 +262,17 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
         void *shared = d3d_shared_texture(dev, td, desc, bytes, shared_slot);
         if (shared) { *hr = S_OK; return shared; }
     }
+    // A staging texture of one plain 2D image lies in a buffer, row after row: Map hands out its memory instead of
+    // copying the image out (Metal keeps other textures in the GPU's tiled order, and reading one back took 4 ms
+    // for a 1500x1700 eye in VR, every frame).
+    uint32_t row_bytes, rows;
+    if (desc[TD_USAGE] == USAGE_STAGING && dim == 2 && td.textureType == MTLTextureType2D && td.mipmapLevelCount == 1 && !is_depth(f) &&
+        format_layout(desc[TD_FORMAT], (uint32_t)td.width, (uint32_t)td.height, &row_bytes, &rows) && rows == td.height && !getenv("VXRT_TILED_STAGING")) {
+        NSUInteger align = [mdev minimumLinearTextureAlignmentForPixelFormat:f], pitch = (row_bytes + align - 1) / align * align;
+        id<MTLBuffer> buf = [mdev newBufferWithLength:pitch * td.height options:MTLResourceStorageModeShared];
+        id<MTLTexture> tex = buf ? [buf newTextureWithDescriptor:td offset:0 bytesPerRow:pitch] : nil;
+        if (tex) { *hr = S_OK; return (void *)CFBridgingRetain(tex); }
+    }
     id<MTLTexture> tex = [(__bridge id<MTLDevice>)dev->mtl newTextureWithDescriptor:td];
     if (!tex) { *hr = E_OUTOFMEMORY; return NULL; }
     *hr = S_OK;
@@ -614,6 +625,7 @@ static void region(const d3d_texture *t, uint32_t mip, const uint32_t *box, MTLO
 
 static WINAPI void ctx_copy_resource(void *this, d3d_object *dst, d3d_object *src) {
     d3d_context *c = this;
+    HELD_OP(2);
     if (!dst || !src || dst->kind != src->kind) return;
     d3d_end_render(c);
     id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
@@ -636,6 +648,7 @@ static WINAPI void ctx_copy_resource(void *this, d3d_object *dst, d3d_object *sr
 static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint32_t dst_sub, uint32_t x, uint32_t y, uint32_t z,
                                                d3d_object *src, uint32_t src_sub, const uint32_t *box) {
     d3d_context *c = this;
+    HELD_OP(3);
     if (!dst || !src || dst->kind != src->kind) return;
     d3d_end_render(c);
     id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
@@ -847,6 +860,7 @@ static void map_stats(uint32_t type, uint32_t usage, uint64_t ns) {
 }
 static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_t type, uint32_t flags, MAPPED *out) {
     d3d_context *c = this;
+    HELD_OP(5);
     if (!res || !out) return E_INVALIDARG;
     if (res->kind == K_BUFFER) {
         d3d_buffer *buf = (d3d_buffer *)res;
@@ -869,6 +883,11 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
     map_stats(type, t->desc[TD_USAGE] & 3, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
     if (hr) return hr;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)t->mtl;
+    if (tex.buffer) {                                            // a staging image in a buffer: its own memory
+        out->data = (uint8_t *)tex.buffer.contents + tex.bufferOffset;
+        out->row_pitch = (uint32_t)tex.bufferBytesPerRow; out->depth_pitch = (uint32_t)(tex.bufferBytesPerRow * tex.height);
+        return S_OK;
+    }
     if (tex.storageMode != MTLStorageModeShared) { vx_log("Direct3D: Map of a texture without CPU access"); return E_INVALIDARG; }
     uint32_t mip, slice;
     subresource(t, sub, &mip, &slice);
@@ -888,7 +907,7 @@ static WINAPI void ctx_unmap(void *this, d3d_object *res, uint32_t sub) {
     (void)this;
     if (!res || res->kind != K_TEXTURE) return;
     d3d_texture *t = (d3d_texture *)res;
-    if (!(t->desc[TD_CPU] & 0x10000) || !t->cpu) return;            // D3D11_CPU_ACCESS_WRITE
+    if (!(t->desc[TD_CPU] & 0x10000) || !t->cpu || ((__bridge id<MTLTexture>)t->mtl).buffer) return;   // D3D11_CPU_ACCESS_WRITE
     uint32_t mip, slice;
     subresource(t, sub, &mip, &slice);
     MTLOrigin o; MTLSize sz;
@@ -898,7 +917,7 @@ static WINAPI void ctx_unmap(void *this, d3d_object *res, uint32_t sub) {
     [(__bridge id<MTLTexture>)t->mtl replaceRegion:MTLRegionMake3D(0, 0, 0, sz.width, sz.height, sz.depth) mipmapLevel:mip slice:slice withBytes:t->cpu
                                        bytesPerRow:pitch bytesPerImage:(NSUInteger)pitch * rows];
 }
-static WINAPI void ctx_flush(void *this) { d3d_flush(((d3d_object *)this)->dev, 0); }
+static WINAPI void ctx_flush(void *this) { HELD_OP(6); d3d_flush(((d3d_object *)this)->dev, 0); }
 static WINAPI void ctx_clear_state(void *this) { ctx_om_set_render_targets(this, 0, NULL, NULL); }
 static WINAPI uint32_t ctx_get_type(void *this) { (void)this; return 0; }       // D3D11_DEVICE_CONTEXT_IMMEDIATE
 static WINAPI uint32_t ctx_get_flags(void *this) { (void)this; return 0; }
