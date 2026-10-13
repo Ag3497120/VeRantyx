@@ -105,6 +105,7 @@ typedef struct {
     void *counter, *mtl_view, *mtl_src;
 } d3d_view;
 void d3d_view_release_mtl(d3d_view *v);
+void *d3d_rtv_texture(d3d_view *v);           // d3d11.m: what a render target view draws to (id<MTLTexture>)
 void d3d_view_get_desc(const d3d_view *v, int which, uint32_t *out);   // 0 SRV, 1 RTV, 2 DSV, 3 UAV
 struct d3d_draw_state;
 // A clear not done yet (see d3d11.m): the view (held), and what to clear it to; or a discard (DiscardView, or

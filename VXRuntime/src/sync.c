@@ -449,6 +449,11 @@ static WINAPI BOOL TerminateThread(HANDLE h, DWORD code) { (void)h; (void)code; 
 // Another process (a child this process started, or any running one opened by its ID): the object is signalled
 // when it ends. A thread waits for a child (its exit code), or polls for another process every 100 ms.
 typedef struct { vx_object *o; pid_t pid; int child; } process_watch;
+// Other processes opened by ID share one object (and one polling thread) per process: SteamVR's vrserver opens
+// its clients again and again, and a thread per OpenProcess (each living until that process ended) reached 16,000
+// threads in five minutes, waking 160,000 times a second (the game and audio starved).
+static struct { pid_t pid; vx_object *o; } g_watched[256];
+static int g_nwatched;
 static void *watch_process(void *arg) {
     process_watch *w = arg;
     int status = 0;
@@ -461,6 +466,7 @@ static void *watch_process(void *arg) {
         while (!kill(w->pid, 0) || errno != ESRCH) usleep(100000);
     }
     pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_nwatched; i++) if (g_watched[i].o == w->o) { g_watched[i] = g_watched[--g_nwatched]; break; }
     w->o->done = 1; w->o->exit_code = code;
     notify(w->o);
     unref(w->o);
@@ -470,12 +476,20 @@ static void *watch_process(void *arg) {
 }
 // A handle to a process (two, when `second` is asked for: the "thread" of a new process waits the same way).
 HANDLE vx_process_handle(int pid, int child, HANDLE *second) {
+    if (!child && !second) {                                     // already watched: another handle to that object
+        pthread_mutex_lock(&g_lock);
+        HANDLE h = NULL;
+        for (int i = 0; i < g_nwatched && !h; i++) if (g_watched[i].pid == pid && !g_watched[i].o->done) h = new_handle(g_watched[i].o);
+        pthread_mutex_unlock(&g_lock);
+        if (h) return h;
+    }
     vx_object *o = new_object(OBJ_PROCESS);
     o->tid = (DWORD)pid;
     pthread_mutex_lock(&g_lock);
     HANDLE h = new_handle(o);
     if (second) *second = new_handle(o);
     o->refs++;                                                    // the watcher's
+    if (!child && g_nwatched < 256) g_watched[g_nwatched++] = (typeof(g_watched[0])){ pid, o };
     pthread_mutex_unlock(&g_lock);
     process_watch *w = malloc(sizeof *w);
     w->o = o; w->pid = pid; w->child = child;

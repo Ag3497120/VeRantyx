@@ -625,13 +625,39 @@ static WINAPI HRESULT context_qi(void *this, const GUID *iid, void **out) {
     return query(this, iid, out, known, 4);
 }
 
+// A render target view's texture: the resource's, or (kept in the view) a view of it in the render target view's
+// format when the two differ only in sRGB: a UNORM or typeless texture drawn to through an sRGB view, which
+// Direct3D gamma-encodes on write. Drawing to the texture itself stored linear values (menus came out darker and
+// redder, and dark scenes banded: 8 bits of linear values have few steps in the dark).
+static int srgb_pair(MTLPixelFormat a, MTLPixelFormat b) {
+    static const MTLPixelFormat pairs[][2] = { { MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA8Unorm_sRGB }, { MTLPixelFormatBGRA8Unorm, MTLPixelFormatBGRA8Unorm_sRGB } };
+    for (size_t i = 0; i < sizeof pairs / sizeof pairs[0]; i++)
+        if ((a == pairs[i][0] && b == pairs[i][1]) || (a == pairs[i][1] && b == pairs[i][0])) return 1;
+    return 0;
+}
+void *d3d_rtv_texture(d3d_view *v) {
+    if (!v || v->resource->kind != K_TEXTURE) return NULL;
+    d3d_texture *t = (d3d_texture *)v->resource;
+    if (!t->mtl) return NULL;
+    if (v->mtl_view && v->mtl_src == t->mtl) return v->mtl_view;
+    id<MTLTexture> base = (__bridge id<MTLTexture>)t->mtl, use = base;
+    MTLPixelFormat want = d3d_mtl_format(v->format, NULL);
+    if (want != base.pixelFormat && srgb_pair(want, base.pixelFormat)) {
+        id<MTLTexture> view = [base newTextureViewWithPixelFormat:want];
+        if (view) use = view;
+    }
+    if (v->mtl_view) CFRelease(v->mtl_view);
+    v->mtl_view = (void *)CFBridgingRetain(use); v->mtl_src = t->mtl;
+    return v->mtl_view;
+}
+
 // A render pass that only clears: color attachment 0, or depth/stencil.
 static void clear_pass(d3d_context *c, d3d_view *v, const float *color, int depth, float depth_value, int stencil, uint8_t stencil_value) {
     d3d_texture *t = (d3d_texture *)v->resource;
     id<MTLTexture> tex = (__bridge id<MTLTexture>)t->mtl;
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     if (color) {
-        rp.colorAttachments[0].texture = tex;
+        rp.colorAttachments[0].texture = v->base.kind == K_RTV ? (__bridge id<MTLTexture>)d3d_rtv_texture(v) : tex;
         rp.colorAttachments[0].level = v->mip;
         if (rp.colorAttachments[0].texture.textureType == MTLTextureType3D) rp.colorAttachments[0].depthPlane = v->first_slice;
         else rp.colorAttachments[0].slice = v->first_slice;

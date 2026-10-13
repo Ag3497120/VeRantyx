@@ -595,6 +595,13 @@ static MTLVertexFormat vertex_format_for(MTLVertexFormat f, const char *msl, uin
         if (wants_uint && f == pairs[i][0]) return pairs[i][1];
         if (wants_int && f == pairs[i][1]) return pairs[i][0];
     }
+    // 32-bit floats read as integers: their bits, as Direct3D hands them over
+    static const MTLVertexFormat floats[][3] = {    // float, uint, int
+        { MTLVertexFormatFloat, MTLVertexFormatUInt, MTLVertexFormatInt }, { MTLVertexFormatFloat2, MTLVertexFormatUInt2, MTLVertexFormatInt2 },
+        { MTLVertexFormatFloat3, MTLVertexFormatUInt3, MTLVertexFormatInt3 }, { MTLVertexFormatFloat4, MTLVertexFormatUInt4, MTLVertexFormatInt4 },
+    };
+    for (size_t i = 0; i < sizeof floats / sizeof floats[0]; i++)
+        if (f == floats[i][0] && (wants_uint || wants_int)) return floats[i][wants_uint ? 1 : 2];
     return f;
 }
 
@@ -694,7 +701,10 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
 }
 
 // ---- drawing ----------------------------------------------------------------------------------------------------------------------
-static id<MTLTexture> view_texture(d3d_view *v) { return v && v->resource->kind == K_TEXTURE ? (__bridge id<MTLTexture>)((d3d_texture *)v->resource)->mtl : nil; }
+static id<MTLTexture> view_texture(d3d_view *v) {
+    if (!v || v->resource->kind != K_TEXTURE) return nil;
+    return v->base.kind == K_RTV ? (__bridge id<MTLTexture>)d3d_rtv_texture(v) : (__bridge id<MTLTexture>)((d3d_texture *)v->resource)->mtl;
+}
 
 // What a shader reads or writes through a view: the texture itself, or a Metal texture view of it when the view
 // changes the format (typeless resources, sRGB), the mips or slices, or the type (an array slice as 2D, cube
