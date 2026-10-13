@@ -57,7 +57,7 @@ cat >"$OPENVR_DIR/openvrpaths.vrpath" <<EOF
 EOF
 
 # Picture size. VXRT_VR_QUALITY=3k: 1440x1620 per eye (2880x1620 for both, about 4.7 megapixels) rendered,
-# composited and streamed, at 40 Mbps HEVC; VXRT_VR_RENDER_SCALE=1.25 instead scales the driver's default
+# composited and streamed, at 40 Mbps HEVC and 72 Hz; VXRT_VR_RENDER_SCALE=1.25 instead scales the driver's default
 # 800x900 per eye (the stream keeps its own size, VERANTYX_STREAM_WIDTH/HEIGHT). Either way SteamVR's own
 # resolution scaling is set to 100% (the copied settings may lower it), and the repository's driver, which
 # takes VERANTYX_RENDER_SCALE, is used from the overlay (the Wine prefix keeps its own).
@@ -65,6 +65,9 @@ if [[ "${VXRT_VR_QUALITY:-}" == 3k ]]; then
     VXRT_VR_RENDER_SCALE="${VXRT_VR_RENDER_SCALE:-1.8}"
     export VERANTYX_STREAM_WIDTH="${VERANTYX_STREAM_WIDTH:-2880}" VERANTYX_STREAM_HEIGHT="${VERANTYX_STREAM_HEIGHT:-1620}"
     export VERANTYX_BITRATE_MBPS="${VERANTYX_BITRATE_MBPS:-40}"
+    # A 72 Hz virtual display: frames this size miss 60 Hz, and SteamVR then halves the game's rate to 30;
+    # at 72 Hz it holds 36 (measured 35-38 fps on an M1 Max, against 30-33 at 60 Hz and 31-35 at 90 Hz).
+    export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-72}"
 fi
 if [[ -n "${VXRT_VR_RENDER_SCALE:-}" ]]; then
     export VERANTYX_RENDER_SCALE="$VXRT_VR_RENDER_SCALE"

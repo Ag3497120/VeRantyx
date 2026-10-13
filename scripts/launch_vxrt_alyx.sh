@@ -5,9 +5,8 @@
 #
 #   scripts/launch_vxrt_alyx.sh                     # main menu, until the game exits or Ctrl-C
 #   scripts/launch_vxrt_alyx.sh +map a1_intro_world_2 +hlvr_pause_after_realmap 0   # extra game arguments
-#   VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh  # 1440x1620 per eye, 2880x1620 stream at 40 Mbps (about 35 fps
-#                                                   # on an M1 Max; add -noautofidelity +vr_fidelity_level 4 for
-#                                                   # the game's full detail at that size)
+#   VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh  # 1440x1620 per eye, 2880x1620 stream at 40 Mbps, 72 Hz
+#                                                   # (about 36 fps on an M1 Max)
 #
 # The game and SteamVR come from the Wine prefix's Steam library and stay read-only (writes go to the overlay
 # folder, as for scripts/launch_vxrt_steamvr.sh). The first start compiles thousands of shaders and takes a few
@@ -47,6 +46,8 @@ for _ in $(seq 1 30); do                               # vrserver's web server i
 done
 echo "SteamVR on VXRuntime is up; starting Half-Life: Alyx (log: $LOG_DIR/vxrt-alyx.log)"
 
+# The game's capture proxy paces poses by the virtual display, as the driver does (3k: 72 Hz).
+[[ "${VXRT_VR_QUALITY:-}" == 3k ]] && export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-72}"
 cd "$ALYX_BIN"
 VXRT_ROOT="$VXRT_VR_ROOT" VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY" VXRT_DLL_PATH="$WINEPREFIX/drive_c/windows/system32" \
 VXRT_STEAM_BRIDGE=1 VXRT_NO_ACTIVATE=1 \
