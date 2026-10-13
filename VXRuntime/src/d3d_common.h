@@ -107,8 +107,9 @@ typedef struct {
 void d3d_view_release_mtl(d3d_view *v);
 void d3d_view_get_desc(const d3d_view *v, int which, uint32_t *out);   // 0 SRV, 1 RTV, 2 DSV, 3 UAV
 struct d3d_draw_state;
-// A clear not done yet (see d3d11.m): the view (held), and what to clear it to.
-typedef struct { d3d_view *v; float color[4]; float depth; uint8_t stencil; uint8_t is_color, clear_depth, clear_stencil; } d3d_pending_clear;
+// A clear not done yet (see d3d11.m): the view (held), and what to clear it to; or a discard (DiscardView, or
+// DiscardResource: res held, v NULL): the next render pass need not load the contents.
+typedef struct { d3d_view *v; d3d_object *res; float color[4]; float depth; uint8_t stencil; uint8_t is_color, clear_depth, clear_stencil, discard; } d3d_pending_clear;
 typedef struct {
     d3d_object base;                 // ID3D11DeviceContext
     void *cmd;                       // the command buffer being recorded (retained), or NULL
@@ -123,6 +124,8 @@ typedef struct {
     int nclears;
 } d3d_context;
 void d3d_clears_flush(d3d_context *c);                                   // does the pending clears as passes of their own
+int d3d_same_target(const d3d_view *a, const d3d_view *b);              // d3d11.m: the same subresource, as the same format
+void d3d_end_reasons_log(void);                                          // VXRT_STATS: what ended render passes with multisampled targets
 // The pending clears the render pass being made can do as its load actions (d3d11.m): marks those attachments
 // MTLLoadActionClear with the values and forgets the clears.
 void d3d_clears_into_pass(d3d_context *c, void *render_pass_descriptor, d3d_view *const *rtvs, d3d_view *dsv);

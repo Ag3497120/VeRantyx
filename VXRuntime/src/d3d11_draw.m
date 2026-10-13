@@ -568,12 +568,14 @@ static id<MTLFunction> shader_variant(d3d_device *dev, d3d_shader *s, const char
 }
 static id<MTLFunction> gs_passthrough(d3d_device *dev, d3d_shader *gs) { return shader_variant(dev, gs, gs->info.msl_passthrough, "pass-through"); }
 
-static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id<MTLTexture> const *colors, int ncolors, id<MTLTexture> depth) {
+// unbound: targets of the open render pass that this draw has no render target view for (it keeps the pass, which
+// has them: their writes are masked off).
+static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id<MTLTexture> const *colors, int ncolors, id<MTLTexture> depth, uint32_t unbound) {
     d3d_shader *vs = s->shader[STAGE_VS], *ps = s->shader[STAGE_PS], *gs = s->gs_vertices ? s->shader[STAGE_GS] : NULL;
     pso_key key;
     memset(&key, 0, sizeof key);
     key.vs = gs ? gs->id | 0x80000000u : vs->id; key.ps = ps ? ps->id : 0; key.layout = s->layout && !gs ? s->layout->id : 0; key.blend = s->blend ? s->blend->id : 0;
-    for (int i = 0; i < ncolors; i++) if (colors[i]) key.color[i] = (uint32_t)colors[i].pixelFormat | (uint32_t)colors[i].sampleCount << 16;
+    for (int i = 0; i < ncolors; i++) if (colors[i]) key.color[i] = (uint32_t)colors[i].pixelFormat | (uint32_t)colors[i].sampleCount << 16 | (unbound >> i & 1u) << 31;
     if (depth) key.depth = (uint32_t)depth.pixelFormat | (uint32_t)depth.sampleCount << 16;
     if (s->layout && !gs) for (uint32_t i = 0; i < s->layout->n; i++) key.stride[s->layout->attr[i].slot & 15] = s->stride[s->layout->attr[i].slot & 15] | 0x80000000u;
     if (s->last_pso && !memcmp(&key, &s->last_key, sizeof key)) return (__bridge id<MTLRenderPipelineState>)s->last_pso;
@@ -630,6 +632,7 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
             ca.writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) | (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
             pd.alphaToCoverageEnabled = s->blend->desc[0] != 0;
         }
+        if (unbound >> i & 1u) { ca.writeMask = MTLColorWriteMaskNone; ca.blendingEnabled = NO; }
     }
     if (depth) {
         pd.depthAttachmentPixelFormat = depth.pixelFormat;
@@ -716,15 +719,80 @@ static id<MTLTexture> shader_texture(d3d_view *v) {
     if (fmt == base.pixelFormat && type == base.textureType && first == 0 && count == levels && sfirst == 0 && scount == total)
         return cache_view(v, base, tex->mtl);                   // the texture itself (remembered: this runs every draw)
     id<MTLTexture> view = [base newTextureViewWithPixelFormat:fmt textureType:type levels:NSMakeRange(first, count) slices:NSMakeRange(sfirst, scount)];
-    if (!view) return base;
+    if (!view) {
+        static int told;
+        if (told++ < 20) vx_log("Direct3D: no %lu view of a %lu texture (usage %#lx): the texture itself is used", (unsigned long)fmt, (unsigned long)base.pixelFormat, (unsigned long)base.usage);
+        return base;
+    }
     return cache_view(v, view, tex->mtl);
 }
 
-// The render pass for the bound targets: kept open while they stay the same; contents are loaded.
+// VXRT_STATS: render passes and the memory traffic of their attachments (loaded at the start, stored at the end), every
+// 2 seconds; at high resolutions this is much of a tile-based GPU's time.
+static void pass_stats(MTLRenderPassDescriptor *rp) {
+    static int on = -1;
+    static uint64_t passes, msaa, loaded, stored, cleared, since;
+    if (on < 0) on = getenv("VXRT_STATS") != NULL;
+    if (!on) return;
+    MTLRenderPassAttachmentDescriptor *all[10];
+    int n = 0;
+    for (int i = 0; i < 8; i++) if (rp.colorAttachments[i].texture) all[n++] = rp.colorAttachments[i];
+    if (rp.depthAttachment.texture) all[n++] = rp.depthAttachment;
+    if (rp.stencilAttachment.texture && rp.stencilAttachment.texture != rp.depthAttachment.texture) all[n++] = rp.stencilAttachment;
+    int multi = 0;
+    for (int i = 0; i < n; i++) {
+        id<MTLTexture> t = all[i].texture;
+        uint64_t bytes = (uint64_t)MAX(t.width >> all[i].level, 1u) * MAX(t.height >> all[i].level, 1u) * t.sampleCount *
+                         (t.pixelFormat == MTLPixelFormatRGBA16Float || t.pixelFormat == MTLPixelFormatRG32Float || t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? 8 :
+                          t.pixelFormat == MTLPixelFormatRGBA32Float ? 16 : t.pixelFormat == MTLPixelFormatR8Unorm ? 1 : 4);
+        if (all[i].loadAction == MTLLoadActionLoad) loaded += bytes; else if (all[i].loadAction == MTLLoadActionClear) cleared += bytes;
+        if (all[i].storeAction == MTLStoreActionStore || all[i].storeAction == MTLStoreActionStoreAndMultisampleResolve) stored += bytes;
+        if (t.sampleCount > 1) multi = 1;
+    }
+    passes++; msaa += multi;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!since) since = now;
+    if (now - since < 2000000000ull) return;
+    double s = (now - since) / 1e9;
+    vx_log("render passes: %.0f/s (%.0f with multisampled targets); attachments loaded %.1f GB/s, stored %.1f GB/s, cleared on load %.1f GB/s",
+           passes / s, msaa / s, loaded / s / 1e9, stored / s / 1e9, cleared / s / 1e9);
+    d3d_end_reasons_log();
+    passes = msaa = loaded = stored = cleared = 0; since = now;
+}
+
+// Whether the open render pass can take a draw to the bound targets: the same depth target, and each bound render
+// target one of the pass's (a pass may have more: a game that switches between drawing color and depth and drawing
+// depth alone keeps one pass, instead of writing its multisampled targets out and reading them back each time).
+static int pass_covers(d3d_context *c, id<MTLTexture> extra_depth) {
+    if (!c->render || state_of(c)->pass_depth != (__bridge void *)extra_depth || !d3d_same_target(c->render_dsv, c->dsv)) return 0;
+    int any = c->dsv != NULL;
+    for (int i = 0; i < 8; i++) {
+        if (!c->rtv[i]) continue;
+        if (!d3d_same_target(c->render_rtv[i], c->rtv[i])) return 0;
+        any = 1;
+    }
+    return any;
+}
+// The render pass for the bound targets: kept open while it covers them (pass_covers); contents are loaded.
 static id<MTLRenderCommandEncoder> render_pass(d3d_context *c, id<MTLTexture> extra_depth) {
-    int same = c->render != NULL && c->render_dsv == c->dsv && state_of(c)->pass_depth == (__bridge void *)extra_depth;
-    for (int i = 0; i < 8 && same; i++) same = c->render_rtv[i] == c->rtv[i];
-    if (same) return (__bridge id<MTLRenderCommandEncoder>)c->render;
+    if (pass_covers(c, extra_depth)) return (__bridge id<MTLRenderCommandEncoder>)c->render;
+    static int show = -1;                                    // VXRT_TRACE_PASSES: a multisampled pass ended by new targets
+    if (show < 0) show = getenv("VXRT_TRACE_PASSES") != NULL;
+    if (show && c->render) {
+        static int told;
+        int multi = c->render_dsv && ((d3d_texture *)c->render_dsv->resource)->desc[TD_SAMPLES] > 1;
+        for (int i = 0; i < 8 && !multi; i++) multi = c->render_rtv[i] && ((d3d_texture *)c->render_rtv[i]->resource)->desc[TD_SAMPLES] > 1;
+        if (multi && told++ < 60) {
+            char was[300] = "", now[300] = ""; size_t a = 0, b = 0;
+            for (int i = 0; i < 8; i++) {
+                if (c->render_rtv[i]) { d3d_texture *t = (d3d_texture *)c->render_rtv[i]->resource; a += (size_t)snprintf(was + a, sizeof was - a, " c%d:%p/%ux%u/f%u/s%u", i, (void *)t, t->desc[TD_WIDTH], t->desc[TD_HEIGHT], t->desc[TD_FORMAT], t->desc[TD_SAMPLES]); }
+                if (c->rtv[i]) { d3d_texture *t = (d3d_texture *)c->rtv[i]->resource; b += (size_t)snprintf(now + b, sizeof now - b, " c%d:%p/%ux%u/f%u/s%u", i, (void *)t, t->desc[TD_WIDTH], t->desc[TD_HEIGHT], t->desc[TD_FORMAT], t->desc[TD_SAMPLES]); }
+            }
+            if (c->render_dsv) a += (size_t)snprintf(was + a, sizeof was - a, " d:%p", (void *)c->render_dsv->resource);
+            if (c->dsv) b += (size_t)snprintf(now + b, sizeof now - b, " d:%p", (void *)c->dsv->resource);
+            vx_log("pass ends for new targets:%s ->%s", was, now);
+        }
+    }
     d3d_end_render(c);
     // Work recorded so far goes to the GPU every so many draws, between render passes, as Windows drivers send it
     // while the program records: the GPU otherwise idled until the frame's end (ReleaseSync, Present) and then ran
@@ -762,6 +830,7 @@ static id<MTLRenderCommandEncoder> render_pass(d3d_context *c, id<MTLTexture> ex
     state_of(c)->pass_depth = (__bridge void *)extra_depth;
     if (!any) return nil;
     if (c->nclears) d3d_clears_into_pass(c, (__bridge void *)rp, c->rtv, c->dsv);
+    pass_stats(rp);
     id<MTLRenderCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) renderCommandEncoderWithDescriptor:rp];
     c->render = (void *)CFBridgingRetain(enc);
     memset(&state_of(c)->bound, 0, sizeof state_of(c)->bound);
@@ -933,6 +1002,17 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
     case 4: *type = MTLPrimitiveTypeTriangle; break;
     default: return nil;                                       // undefined or patch lists
     }
+    if (c->nclears && c->render) {                     // a target cleared meanwhile, read by this draw: the clear first
+        int reads = 0;
+        for (int k = 0; k < c->nclears && !reads; k++) {
+            d3d_object *res = c->clears[k].v ? c->clears[k].v->resource : c->clears[k].res;
+            for (int st = 0; st < STAGES && !reads; st++) {
+                for (int i = 0; i < 32 && !reads; i++) reads = s->srv[st][i] && s->srv[st][i]->resource == res;
+                for (int i = 0; i < 8 && !reads; i++) reads = s->uav[st][i] && s->uav[st][i]->resource == res;
+            }
+        }
+        if (reads) { d3d_end_render(c); d3d_clears_flush(c); }
+    }
     id<MTLTexture> colors[8] = { nil };
     int ncolors = 0;
     for (int i = 0; i < 8; i++) if (c->rtv[i]) { colors[i] = view_texture(c->rtv[i]); ncolors = i + 1; }
@@ -949,7 +1029,14 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
         }
         depth = extra = d;
     }
-    id<MTLRenderPipelineState> pso = pipeline(c, s, colors, ncolors, depth);
+    uint32_t unbound = 0;
+    if (pass_covers(c, extra)) {                       // the open pass's targets, those not bound here masked off
+        for (int i = 0; i < 8; i++) {
+            if (!c->render_rtv[i] || c->rtv[i]) continue;
+            colors[i] = view_texture(c->render_rtv[i]); unbound |= 1u << i; ncolors = MAX(ncolors, i + 1);
+        }
+    }
+    id<MTLRenderPipelineState> pso = pipeline(c, s, colors, ncolors, depth, unbound);
     if (!pso) return nil;
     id<MTLRenderCommandEncoder> enc = render_pass(c, extra);
     if (!enc) return nil;

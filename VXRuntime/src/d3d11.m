@@ -4,6 +4,7 @@
 // buffer that is committed on Flush, Map and Present, so the GPU sees them in the order the program issued them.
 // Draws need shader translation (DXBC to Metal) and are the next step; until then they are reported once.
 #include "d3d_common.h"
+#include <dlfcn.h>
 #include <os/os_sync_wait_on_address.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -254,6 +255,11 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
     if (desc[TD_BIND] & (BIND_RENDER_TARGET | BIND_DEPTH_STENCIL)) usage |= MTLTextureUsageRenderTarget;
     if (desc[TD_BIND] & BIND_UNORDERED_ACCESS) usage |= MTLTextureUsageShaderWrite;
     if ((desc[TD_BIND] & BIND_UNORDERED_ACCESS) && (desc[TD_FORMAT] == 39 || desc[TD_FORMAT] == 42 || desc[TD_FORMAT] == 43)) usage |= MTLTextureUsageShaderAtomic;   // R32 (typeless, uint, sint): atomics
+    // (Experiment, VXRT_COMPRESSIBLE=1: multisampled and depth targets without pixel-format views, which Apple GPUs
+    // need to keep a render target losslessly compressed.)
+    static int compressible = -1;
+    if (compressible < 0) compressible = getenv("VXRT_COMPRESSIBLE") != NULL;
+    if (compressible && (samples > 1 || is_depth(f)) && (desc[TD_BIND] & (BIND_RENDER_TARGET | BIND_DEPTH_STENCIL))) usage &= ~MTLTextureUsagePixelFormatView;
     td.usage = usage;
     int cpu = desc[TD_USAGE] == USAGE_STAGING || desc[TD_USAGE] == USAGE_DYNAMIC;
     td.storageMode = cpu && !is_depth(f) && samples == 1 ? MTLStorageModeShared : MTLStorageModePrivate;
@@ -451,8 +457,34 @@ static id<MTLCommandBuffer> context_cmd(d3d_context *c) {
 }
 void *d3d_context_cmd(d3d_context *c) { return (__bridge void *)context_cmd(c); }
 // Clears, copies and uploads are separate passes: the render pass in progress ends first.
+// VXRT_STATS: what ends render passes that have multisampled targets (their samples are written out and read back
+// in by the next pass: at 2.5K per eye, half a gigabyte per target).
+static struct { void *fn; uint64_t n; } g_end_reasons[32];
+static int g_end_stats = -1;
+void d3d_end_reasons_log(void) {
+    char text[600] = ""; size_t len = 0;
+    for (int i = 0; i < 32 && g_end_reasons[i].fn; i++) {
+        Dl_info info;
+        const char *name = dladdr(g_end_reasons[i].fn, &info) && info.dli_sname ? info.dli_sname : "?";
+        len += (size_t)snprintf(text + len, sizeof text - len, " %s %llu,", name, (unsigned long long)g_end_reasons[i].n);
+        if (len >= sizeof text - 64) break;
+        g_end_reasons[i].n = 0;
+    }
+    if (len) vx_log("multisampled passes ended by:%s", text);
+}
 void d3d_end_render(d3d_context *c) {
     if (!c->render) return;
+    if (g_end_stats < 0) g_end_stats = getenv("VXRT_STATS") != NULL;
+    if (g_end_stats) {
+        int multi = c->render_dsv && ((d3d_texture *)c->render_dsv->resource)->desc[TD_SAMPLES] > 1;
+        for (int i = 0; i < 8 && !multi; i++) multi = c->render_rtv[i] && c->render_rtv[i]->resource->kind == K_TEXTURE && ((d3d_texture *)c->render_rtv[i]->resource)->desc[TD_SAMPLES] > 1;
+        if (multi) {
+            Dl_info info;
+            void *caller = __builtin_return_address(0);
+            void *fn = dladdr(caller, &info) && info.dli_saddr ? info.dli_saddr : caller;
+            for (int i = 0; i < 32; i++) if (!g_end_reasons[i].fn || g_end_reasons[i].fn == fn) { g_end_reasons[i].fn = fn; g_end_reasons[i].n++; break; }
+        }
+    }
     id<MTLRenderCommandEncoder> enc = CFBridgingRelease(c->render);
     c->render = NULL;
     [enc endEncoding];
@@ -589,6 +621,7 @@ static void clear_pass(d3d_context *c, d3d_view *v, const float *color, int dept
     d3d_end_render(c);
     [[raw_cmd(c) renderCommandEncoderWithDescriptor:rp] endEncoding];
 }
+static uint64_t g_discards, g_discards_used;   // (VXRT_STATS)
 // Clears wait for the render pass that draws to their target, which then starts from the clear values (its load
 // action) instead of loading what a pass of its own wrote: on Apple's tile-based GPUs that saves writing the whole
 // target out and reading it back in, per clear (at 3K, tens of megabytes each). Anything else that goes to the GPU
@@ -597,20 +630,33 @@ void d3d_clears_flush(d3d_context *c) {
     while (c->nclears) {
         d3d_pending_clear p = c->clears[0];
         memmove(c->clears, c->clears + 1, (size_t)--c->nclears * sizeof *c->clears);
-        clear_pass(c, p.v, p.is_color ? p.color : NULL, p.clear_depth, p.depth, p.clear_stencil, p.stencil);
-        d3d_release(&p.v->base);
+        if (!p.discard) clear_pass(c, p.v, p.is_color ? p.color : NULL, p.clear_depth, p.depth, p.clear_stencil, p.stencil);
+        d3d_release(p.v ? &p.v->base : p.res);           // (a discard needs nothing done)
     }
 }
 static int same_target(const d3d_view *a, const d3d_view *b) {
     return a && b && a->resource == b->resource && a->mip == b->mip && a->first_slice == b->first_slice && a->format == b->format &&
            a->slices <= 1 && b->slices <= 1;
 }
+int d3d_same_target(const d3d_view *a, const d3d_view *b) {
+    return a == b || (a && b && a->resource == b->resource && a->mip == b->mip && a->first_slice == b->first_slice && a->format == b->format && a->slices == b->slices);
+}
 void d3d_clears_into_pass(d3d_context *c, void *descriptor, d3d_view *const *rtvs, d3d_view *dsv) {
     MTLRenderPassDescriptor *rp = (__bridge MTLRenderPassDescriptor *)descriptor;
     for (int i = 0; i < c->nclears; ) {
         d3d_pending_clear *p = &c->clears[i];
         int used = 0;
-        if (p->is_color) {
+        if (p->discard) {                                  // targets it covers start undefined instead of loaded
+            d3d_object *res = p->v ? p->v->resource : p->res;
+            for (int k = 0; k < 8; k++)
+                if (rtvs[k] && rtvs[k]->resource == res && (!p->v || same_target(p->v, rtvs[k])) && rp.colorAttachments[k].loadAction == MTLLoadActionLoad)
+                    { rp.colorAttachments[k].loadAction = MTLLoadActionDontCare; used = 1; }
+            if (dsv && dsv->resource == res && (!p->v || same_target(p->v, dsv))) {
+                if (rp.depthAttachment.texture && rp.depthAttachment.loadAction == MTLLoadActionLoad) { rp.depthAttachment.loadAction = MTLLoadActionDontCare; used = 1; }
+                if (rp.stencilAttachment.texture && rp.stencilAttachment.loadAction == MTLLoadActionLoad) { rp.stencilAttachment.loadAction = MTLLoadActionDontCare; used = 1; }
+            }
+            if (used) g_discards_used++;
+        } else if (p->is_color) {
             for (int k = 0; k < 8 && !used; k++)
                 if (same_target(p->v, rtvs[k]) && rp.colorAttachments[k].texture) {
                     rp.colorAttachments[k].loadAction = MTLLoadActionClear;
@@ -623,7 +669,7 @@ void d3d_clears_into_pass(d3d_context *c, void *descriptor, d3d_view *const *rtv
             used = (!p->clear_depth || rp.depthAttachment.texture) && (!p->clear_stencil || rp.stencilAttachment.texture);
         }
         if (!used) { i++; continue; }
-        d3d_release(&p->v->base);
+        d3d_release(p->v ? &p->v->base : p->res);
         memmove(p, p + 1, (size_t)(--c->nclears - i) * sizeof *p);
     }
 }
@@ -637,9 +683,22 @@ static void clear_later(d3d_context *c, d3d_view *v, const float *color, int dep
     }
     if (((__bridge id<MTLTexture>)((d3d_texture *)v->resource)->mtl).pixelFormat != MTLPixelFormatDepth32Float_Stencil8) stencil = 0;   // (none to clear)
     if (!color && !depth && !stencil) return;
-    d3d_end_render(c);                                     // (a pass drawing to it now would not see the clear)
+    if (g_end_stats > 0 && c->render) {                    // VXRT_STATS: is the target one the open pass draws to?
+        static uint64_t attached, other;
+        int hit = c->render_dsv && c->render_dsv->resource == v->resource;
+        for (int i = 0; i < 8 && !hit; i++) hit = c->render_rtv[i] && c->render_rtv[i]->resource == v->resource;
+        if (hit) attached++; else other++;
+        if ((attached + other) % 500 == 0) vx_log("clears while a pass is open: %llu of its own targets, %llu of others", (unsigned long long)attached, (unsigned long long)other);
+    }
+    // A pass drawing to it now would not see the clear: it ends. A clear of another target leaves the open pass alone
+    // (ending it wrote its targets out and read them back in: at 2.5K per eye, 4x multisampled, half a gigabyte
+    // each); a draw of that pass reading the cleared target ends it first (prepare, d3d11_draw.m).
+    int attached = c->render_dsv && c->render_dsv->resource == v->resource;
+    for (int i = 0; i < 8 && !attached; i++) attached = c->render_rtv[i] && c->render_rtv[i]->resource == v->resource;
+    if (attached) d3d_end_render(c);
     for (int i = 0; i < c->nclears; i++) {                 // a later clear of the same target replaces (or adds to) the earlier
         d3d_pending_clear *p = &c->clears[i];
+        if (p->discard) continue;
         if (p->v->resource != v->resource || p->v->mip != v->mip || p->v->first_slice != v->first_slice || p->v->format != v->format || p->is_color != (color != NULL)) continue;
         if (color) memcpy(p->color, color, sizeof p->color);
         if (depth) { p->clear_depth = 1; p->depth = depth_value; }
@@ -660,6 +719,26 @@ static WINAPI void ctx_clear_rtv(void *this, d3d_view *v, const float color[4]) 
         vx_log("ClearRenderTargetView %ux%u to (%g, %g, %g, %g)", ((d3d_texture *)v->resource)->desc[TD_WIDTH], ((d3d_texture *)v->resource)->desc[TD_HEIGHT], color[0], color[1], color[2], color[3]);
     if (v && v->resource->kind == K_TEXTURE) clear_later(this, v, color, 0, 0, 0, 0);
 }
+// DiscardView / DiscardResource (D3D11.1): the contents are no longer needed; the next render pass on them, if it
+// comes before other GPU work, does not load them (a discard otherwise needs nothing).
+static void discard_later(d3d_context *c, d3d_view *v, d3d_object *res) {
+    if (g_eager_clears < 0) g_eager_clears = getenv("VXRT_EAGER_CLEARS") != NULL;
+    static int stats = -1;
+    if (stats < 0) stats = getenv("VXRT_STATS") != NULL;
+    if (stats && ++g_discards % 2000 == 0) vx_log("discards: %llu, %llu of them saved a load", (unsigned long long)g_discards, (unsigned long long)g_discards_used);
+    if (g_eager_clears || c != (d3d_context *)c->base.dev->context) return;
+    if (v && (v->base.kind != K_RTV && v->base.kind != K_DSV)) return;
+    if ((v ? v->resource : res)->kind != K_TEXTURE) return;
+    if (c->nclears == 9) d3d_clears_flush(c);
+    d3d_end_render(c);
+    d3d_pending_clear *p = &c->clears[c->nclears++];
+    memset(p, 0, sizeof *p);
+    p->discard = 1; p->v = v; p->res = v ? NULL : res;
+    d3d_addref(v ? &v->base : res);
+}
+static WINAPI void ctx_discard_view(void *this, d3d_view *v) { if (v) discard_later(this, v, NULL); }
+static WINAPI void ctx_discard_resource(void *this, d3d_object *res) { if (res) discard_later(this, NULL, res); }
+static WINAPI void ctx_discard_view1(void *this, d3d_view *v, const void *rects, uint32_t n) { if (v && !n) discard_later(this, v, NULL); }
 static WINAPI void ctx_clear_dsv(void *this, d3d_view *v, uint32_t flags, float depth, uint8_t stencil) {
     if (v && v->resource->kind == K_TEXTURE && (flags & 3)) clear_later(this, v, NULL, flags & 1, depth, flags & 2, stencil);
 }
@@ -1006,7 +1085,7 @@ static WINAPI uint32_t ctx_get_flags(void *this) { (void)this; return 0; }
 static void context_destroy(d3d_object *o) {
     d3d_context *c = (d3d_context *)o;
     d3d_end_render(c);
-    while (c->nclears) d3d_release(&c->clears[--c->nclears].v->base);
+    while (c->nclears) { d3d_pending_clear *p = &c->clears[--c->nclears]; d3d_release(p->v ? &p->v->base : p->res); }
     d3d_draw_release(c);
     ctx_om_set_render_targets(c, 0, NULL, NULL);
     if (c->cmd) CFBridgingRelease(c->cmd);
@@ -1209,6 +1288,7 @@ static void make_tables(void) {
     static const d3d_method srv[] = { { "QueryInterface", (void *)srv_qi }, CHILD_METHODS, { "GetResource", (void *)view_get_resource }, { "GetDesc", (void *)srv_get_desc }, { NULL, NULL } };
     static const d3d_method context[] = { { "QueryInterface", (void *)context_qi }, CHILD_METHODS,
         { "ClearRenderTargetView", (void *)ctx_clear_rtv }, { "ClearDepthStencilView", (void *)ctx_clear_dsv },
+        { "DiscardView", (void *)ctx_discard_view }, { "DiscardResource", (void *)ctx_discard_resource }, { "DiscardView1", (void *)ctx_discard_view1 },
         { "OMSetRenderTargets", (void *)ctx_om_set_render_targets }, { "OMGetRenderTargets", (void *)ctx_om_get_render_targets },
         { "RSSetViewports", (void *)ctx_rs_set_viewports }, { "RSGetViewports", (void *)ctx_rs_get_viewports },
         { "CopyResource", (void *)ctx_copy_resource }, { "CopySubresourceRegion", (void *)ctx_copy_subresource_region },
