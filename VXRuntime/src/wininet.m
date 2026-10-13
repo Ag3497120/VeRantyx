@@ -185,6 +185,22 @@ static WINAPI BOOL HttpQueryInfoA(HANDLE req, DWORD level, void *buf, DWORD *n, 
     DWORD what = level & 0xffff, number = level & 0x20000000u;   // HTTP_QUERY_FLAG_NUMBER
     char value[1024];
     const char *text = NULL;
+    if (what == 21 && !number) {                       // HTTP_QUERY_RAW_HEADERS: the lines, each ended by a NUL, then a NUL
+        size_t len = 0;
+        char *raw = malloc(strlen(r->response_headers) + 2);
+        for (const char *line = r->response_headers; *line; ) {
+            const char *end = strstr(line, "\r\n");
+            size_t l = end ? (size_t)(end - line) : strlen(line);
+            if (l) { memcpy(raw + len, line, l); len += l; raw[len++] = 0; }
+            line += l + (end ? 2 : 0);
+        }
+        raw[len++] = 0;
+        BOOL ok = buf && n && *n >= len;
+        if (ok) { memcpy(buf, raw, len); *n = (DWORD)len - 1; }
+        else { if (n) *n = (DWORD)len; vx_set_last_error(ERROR_INSUFFICIENT_BUFFER); }
+        free(raw);
+        return ok;
+    }
     switch (what) {
     case 19: snprintf(value, sizeof value, "%d", r->status); text = value; break;          // HTTP_QUERY_STATUS_CODE
     case 22: text = r->response_headers; break;                                             // HTTP_QUERY_RAW_HEADERS_CRLF
