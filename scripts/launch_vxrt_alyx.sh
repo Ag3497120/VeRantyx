@@ -74,10 +74,11 @@ cp -p "$PROXY_DLL" "$OVERLAY_ALYX_BIN/openvr_api.dll"
 # Poses at the display's rate from the headset instead of SteamVR's compositor, which handed out the next ones only
 # once the GPU had finished the last frame (a frame took the CPU's time plus the GPU's: 45 fps at 3K, now 60).
 # VERANTYX_DECOUPLED_POSES=0: SteamVR's.
+# The game's own console log (VXRT_DEBUGGER, VXRT_DEBUG_OUTPUT) goes to the log with the time: why it quit, if it does.
 export VERANTYX_DECOUPLED_POSES="${VERANTYX_DECOUPLED_POSES:-1}"
 cd "$ALYX_BIN"
 VXRT_ROOT="$VXRT_VR_ROOT" VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY" VXRT_DLL_PATH="$WINEPREFIX/drive_c/windows/system32" \
-VXRT_STEAM_BRIDGE=1 VXRT_NO_ACTIVATE=1 \
+VXRT_STEAM_BRIDGE=1 VXRT_NO_ACTIVATE=1 VXRT_DEBUGGER=1 VXRT_DEBUG_OUTPUT=1 VXRT_LOG_TIME=1 \
     "$VXRT" hlvr.exe -vr -steam -dx11 -noasserts -nopassiveasserts ${GAME_ARGS[@]+"${GAME_ARGS[@]}"} +map startup "$@" >"$LOG_DIR/vxrt-alyx.log" 2>&1 &
 GAME_PID=$!
 wait "$GAME_PID" || true

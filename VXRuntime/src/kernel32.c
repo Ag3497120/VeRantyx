@@ -78,7 +78,7 @@ static WINAPI BOOL WriteConsoleW(HANDLE h, const WCHAR *buf, DWORD n, DWORD *wri
 }
 
 static WINAPI void ExitProcess(DWORD code) {
-    if (vx_trace) {
+    {                                                              // (always: why a program ended is worth a line)
         const vx_image *m = vx_image_at((uint64_t)(uintptr_t)__builtin_return_address(0));
         vx_log("ExitProcess(%u) from %s+%#llx", code, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)__builtin_return_address(0) - m->base) : 0ull);
     }
@@ -843,7 +843,10 @@ static WINAPI DWORD FormatMessageA(DWORD flags, const void *src, DWORD id, DWORD
 }
 static WINAPI void *LocalAlloc(DWORD flags, size_t n) { return flags & 0x40 /* LMEM_ZEROINIT */ ? calloc(1, n ? n : 1) : malloc(n ? n : 1); }
 static WINAPI void *LocalFree(void *p) { if (!heap_pointer(p, "LocalFree", __builtin_return_address(0))) return p; free(p); return NULL; }
-static WINAPI void OutputDebugStringA(const char *s) { if (vx_trace) vx_log("debug: %s", s); }
+// VXRT_DEBUG_OUTPUT=1: what programs send to OutputDebugString, without the rest of VXRT_TRACE (with VXRT_DEBUGGER=1,
+// a game's own console log: why it quit, for one).
+int vx_debug_output(void) { static int on = -1; if (on < 0) on = vx_trace || (getenv("VXRT_DEBUG_OUTPUT") && atoi(getenv("VXRT_DEBUG_OUTPUT"))); return on; }
+static WINAPI void OutputDebugStringA(const char *s) { if (vx_debug_output()) vx_log("debug: %s", s); }
 
 // ---- system info -----------------------------------------------------------------------------------------------------------
 typedef struct { uint16_t arch, reserved; DWORD page; void *min_addr, *max_addr; uint64_t mask; DWORD ncpu, type, gran; uint16_t level, rev; } SYSTEM_INFO;

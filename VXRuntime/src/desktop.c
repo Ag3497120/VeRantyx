@@ -25,8 +25,9 @@ static WINAPI int MulDiv(int a, int b, int c) {
     return r > INT32_MAX || r < INT32_MIN ? -1 : (int)r;
 }
 static WINAPI BOOL IsDBCSLeadByte(uint8_t c) { (void)c; return 0; }          // the ANSI code page is UTF-8
+int vx_debug_output(void);                     // kernel32.c
 static WINAPI void OutputDebugStringW(const WCHAR *s) {
-    if (!vx_trace || !s) return;
+    if (!vx_debug_output() || !s) return;
     char *a = vx_utf8_dup(s);
     vx_log("debug: %s", a);
     free(a);
