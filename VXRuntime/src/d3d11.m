@@ -255,10 +255,12 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
     if (desc[TD_BIND] & (BIND_RENDER_TARGET | BIND_DEPTH_STENCIL)) usage |= MTLTextureUsageRenderTarget;
     if (desc[TD_BIND] & BIND_UNORDERED_ACCESS) usage |= MTLTextureUsageShaderWrite;
     if ((desc[TD_BIND] & BIND_UNORDERED_ACCESS) && (desc[TD_FORMAT] == 39 || desc[TD_FORMAT] == 42 || desc[TD_FORMAT] == 43)) usage |= MTLTextureUsageShaderAtomic;   // R32 (typeless, uint, sint): atomics
-    // (Experiment, VXRT_COMPRESSIBLE=1: multisampled and depth targets without pixel-format views, which Apple GPUs
-    // need to keep a render target losslessly compressed.)
+    // Multisampled and depth targets are made without pixel-format views, which Apple GPUs need to keep a render
+    // target losslessly compressed (at 2.5K per eye Half-Life: Alyx's 4x-multisampled targets are written out and read
+    // back several times a frame; alternating runs: 27-31 -> 31-35 fps). Their views keep the texture's own format
+    // (depth, or its stencil). VXRT_FORMAT_VIEWS=1: with them.
     static int compressible = -1;
-    if (compressible < 0) compressible = getenv("VXRT_COMPRESSIBLE") != NULL;
+    if (compressible < 0) compressible = getenv("VXRT_FORMAT_VIEWS") == NULL;
     if (compressible && (samples > 1 || is_depth(f)) && (desc[TD_BIND] & (BIND_RENDER_TARGET | BIND_DEPTH_STENCIL))) usage &= ~MTLTextureUsagePixelFormatView;
     td.usage = usage;
     int cpu = desc[TD_USAGE] == USAGE_STAGING || desc[TD_USAGE] == USAGE_DYNAMIC;

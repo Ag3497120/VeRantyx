@@ -1,7 +1,7 @@
 # vxrt: the VeRantyx Windows runtime. An x86-64 macOS binary; Rosetta 2 runs it and the Windows program together.
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
-SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/context.S src/text.c src/files.c src/registry.c \
+SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/extras.c src/context.S src/text.c src/files.c src/registry.c \
           src/user32.c src/gdi.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/input.m src/audio.m src/xaudio2.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
@@ -10,11 +10,11 @@ all: build/vxrt tests
 
 build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -Wl,-pagezero_size,0x10000
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -Wl,-pagezero_size,0x10000
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -68,6 +68,10 @@ build/vxcom.dll: tests/vxcom.c
 build/iocp.exe: tests/iocp.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
+
+build/gl.exe: tests/gl.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lopengl32 -lgdi32
 
 build/d3d11.exe: tests/d3d11.c
 	@mkdir -p build
@@ -172,6 +176,7 @@ check: all
 	build/vxrt build/iocp.exe
 	build/vxrt build/window.exe
 	build/vxrt build/d3d11.exe
+	build/vxrt build/gl.exe
 	build/dxbcscan tests/shaders/*.dxbc
 	build/vxrt build/draw.exe
 	build/vxrt build/compute.exe

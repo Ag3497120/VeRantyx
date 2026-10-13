@@ -390,14 +390,10 @@ static WINAPI long vx_clock(void) { return (long)(clock() * 1000 / CLOCKS_PER_SE
 static WINAPI int *vx__errno(void) { return g_errno_ptr(); }
 
 // qsort with a Windows-convention comparator.
+// The program's comparison function goes along as qsort_r's context (several threads sort at once).
 typedef int (WINAPI *cmpfn)(const void *, const void *);
-static cmpfn g_qsort_cmp;
-static int qsort_tramp(const void *a, const void *b) { return g_qsort_cmp(a, b); }
-static WINAPI void vx_qsort(void *base, size_t n, size_t sz, cmpfn cmp) {
-    cmpfn saved = g_qsort_cmp; g_qsort_cmp = cmp;
-    qsort(base, n, sz, qsort_tramp);
-    g_qsort_cmp = saved;
-}
+static int qsort_tramp(void *cmp, const void *a, const void *b) { return ((cmpfn)cmp)(a, b); }
+static WINAPI void vx_qsort(void *base, size_t n, size_t sz, cmpfn cmp) { qsort_r(base, n, sz, (void *)cmp, qsort_tramp); }
 
 // ---- more of the C library (what MinGW's C++ runtime and winpthread import) -----------------------------------------------
 static WINAPI void vx_assert(const char *msg, const char *file, unsigned line) { vx_log("assertion failed: %s (%s:%u)", msg, file, line); _exit(3); }

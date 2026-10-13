@@ -66,22 +66,40 @@ static void unwatch(vx_object *o, waiter *w) {                  // g_lock held
 static void notify(vx_object *o) {                              // g_lock held: o's state changed
     for (int i = 0; i < o->nwl; i++) pthread_cond_signal(&o->wl[i]->cv);
 }
+// Handles 0x100..0x80fc, then 0x1000000 on (file handles start at 0x10000, other processes' at 0x20000, windows
+// at 0x30000, GDI objects at 0x40000): a million in all (Google Earth VR keeps 8000 semaphores).
 #define HANDLE_BASE 0x100
-#define MAX_HANDLES 8192             // handles 0x100..0x80fc; file handles start at 0x10000
+#define LOW_HANDLES 8192
+#define HIGH_HANDLE_BASE 0x1000000
+#define MAX_HANDLES (LOW_HANDLES + (1 << 20))
 static vx_object *g_handles[MAX_HANDLES];
+static int g_free_hint;              // no free slot below it
 static vx_object g_never;            // what the pseudo handles of the current process/thread wait on
 
 DWORD vx_current_tid(void) { uint64_t t; pthread_threadid_np(NULL, &t); return (DWORD)t; }
 
 // All of the following run with g_lock held.
 static HANDLE new_handle(vx_object *o) {
-    for (int i = 0; i < MAX_HANDLES; i++)
-        if (!g_handles[i]) { g_handles[i] = o; o->refs++; return (HANDLE)(intptr_t)(HANDLE_BASE + i * 4); }
+    for (int i = g_free_hint; i < MAX_HANDLES; i++)
+        if (!g_handles[i]) {
+            g_handles[i] = o; o->refs++; g_free_hint = i + 1;
+            return (HANDLE)(intptr_t)(i < LOW_HANDLES ? HANDLE_BASE + i * 4 : HIGH_HANDLE_BASE + (i - LOW_HANDLES) * 4);
+        }
+    static int told;                              // what fills the table (a leak shows as one kind)
+    if (!told++) {
+        int n[8] = { 0 }, kinds[32] = { 0 };
+        for (int i = 0; i < MAX_HANDLES; i++) if (g_handles[i]) { n[g_handles[i]->type & 7]++; if (g_handles[i]->type == OBJ_OTHER) kinds[g_handles[i]->kind & 31]++; }
+        vx_log("out of handles (%d): %d threads, %d events, %d mutexes, %d semaphores, %d others (kinds 1-8: %d %d %d %d %d %d %d %d), %d ports, %d processes",
+               MAX_HANDLES, n[OBJ_THREAD], n[OBJ_EVENT], n[OBJ_MUTEX], n[OBJ_SEMAPHORE], n[OBJ_OTHER],
+               kinds[1], kinds[2], kinds[3], kinds[4], kinds[5], kinds[6], kinds[7], kinds[8], n[OBJ_PORT], n[OBJ_PROCESS]);
+    }
     return NULL;
 }
 static int handle_index(HANDLE h) {
     intptr_t v = (intptr_t)h - HANDLE_BASE;
-    return v >= 0 && v % 4 == 0 && v / 4 < MAX_HANDLES ? (int)(v / 4) : -1;
+    if (v >= 0 && v % 4 == 0 && v / 4 < LOW_HANDLES) return (int)(v / 4);
+    v = (intptr_t)h - HIGH_HANDLE_BASE;
+    return v >= 0 && v % 4 == 0 && v / 4 < MAX_HANDLES - LOW_HANDLES ? LOW_HANDLES + (int)(v / 4) : -1;
 }
 #define INJECT_BASE 0x20000
 #define INJECT_COUNT 4096
@@ -302,7 +320,7 @@ static WINAPI HANDLE CreateThread(void *sa, size_t stack, DWORD (WINAPI *start)(
     pthread_mutex_lock(&g_lock);
     HANDLE h = new_handle(t);
     if (!h || pthread_create(&t->pthread, &a, thread_main, t)) {
-        if (h) g_handles[handle_index(h)] = NULL;
+        if (h) { int k = handle_index(h); g_handles[k] = NULL; if (k < g_free_hint) g_free_hint = k; }
         pthread_mutex_unlock(&g_lock);
         free(t); pthread_attr_destroy(&a);
         vx_set_last_error(8 /* ERROR_NOT_ENOUGH_MEMORY */);
@@ -807,7 +825,7 @@ static WINAPI BOOL CloseHandle(HANDLE h) {
     pthread_mutex_lock(&g_lock);
     int i = handle_index(h);
     vx_object *o = i >= 0 ? g_handles[i] : NULL;
-    if (o) { g_handles[i] = NULL; unref(o); }
+    if (o) { g_handles[i] = NULL; if (i < g_free_hint) g_free_hint = i; unref(o); }
     intptr_t k = ((intptr_t)h - INJECT_BASE) / 4;
     if (!o && (intptr_t)h >= INJECT_BASE && k < INJECT_COUNT && !(((intptr_t)h - INJECT_BASE) % 4) && g_injected[k]) {
         o = g_injected[k]; g_injected[k] = NULL; unref(o);
@@ -892,7 +910,7 @@ static vx_object *injected(HANDLE h) {                           // with g_lock 
         pthread_mutex_lock(&g_lock);
         int i = handle_index(ph);
         o = i >= 0 ? g_handles[i] : NULL;
-        if (o) { o->refs++; g_handles[i] = NULL; unref(o); }      // keep the object, drop the extra handle
+        if (o) { o->refs++; g_handles[i] = NULL; if (i < g_free_hint) g_free_hint = i; unref(o); }      // keep the object, drop the extra handle
     }
     if (!o) return NULL;
     o->refs++;

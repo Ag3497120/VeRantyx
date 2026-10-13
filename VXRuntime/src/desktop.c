@@ -502,7 +502,7 @@ static const vx_export advapi32[] = { VX_EXPORT(StartTraceA), VX_EXPORT(ControlT
 void vx_desktop_init(void) {
     vx_register_module("advapi32.dll", advapi32, sizeof advapi32 / sizeof advapi32[0]);
     vx_register_module("wtsapi32.dll", wtsapi32, sizeof wtsapi32 / sizeof wtsapi32[0]);
-    vx_register_module("opengl32.dll", opengl32, sizeof opengl32 / sizeof opengl32[0]);
+    if (getenv("VXRT_OPENGL") && !strcmp(getenv("VXRT_OPENGL"), "0")) vx_register_module("opengl32.dll", opengl32, sizeof opengl32 / sizeof opengl32[0]);   // (no OpenGL: opengl.c otherwise)
     vx_register_module("kernel32.dll", k32, sizeof k32 / sizeof k32[0]);
     vx_register_module("version.dll", version, sizeof version / sizeof version[0]);
     vx_register_module("setupapi.dll", setupapi, sizeof setupapi / sizeof setupapi[0]);

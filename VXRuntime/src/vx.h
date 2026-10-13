@@ -53,6 +53,11 @@ typedef struct {
 const vx_image *vx_image_at(uint64_t pc);    // the image containing an address, or NULL
 int vx_image_list(const vx_image **out, int cap);   // the loaded images (all of them is the return value)
 int vx_overlay_file(const char *unix_path, char *out, size_t cap);   // files.c: VXRT_OVERLAY's copy of a file, if any
+void vx_wininet_init(void);                  // wininet.m: HTTP and HTTPS on NSURLSession
+void vx_extras_init(void);                   // extras.c: smaller functions more programs need
+void vx_opengl_init(void);                   // opengl.c: opengl32.dll on macOS's OpenGL
+int vx_gl_describe_pixel_format(void *pfd, uint32_t size);   // (gdi32's pixel-format calls and SwapBuffers)
+int vx_gl_swap(void);
 void vx_profile_start(void);                 // profile.c: VXRT_PROFILE=file, a sampling profiler
 void vx_profile_held(int delta);             // a keyed mutex taken (+1) or released (-1) by this thread
 void vx_profile_finish(void);                // writes the report now (ExitProcess)

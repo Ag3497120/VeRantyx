@@ -557,8 +557,12 @@ static HANDLE find_first(const char *spec, FIND_DATA_A *d) {
     snprintf(f->pattern, sizeof f->pattern, "%s", sep + 1);
     sep[sep == full + 2 ? 1 : 0] = 0;           // keep "C:\" for the root
     if (!vx_unix_path(full, f->path, sizeof f->path)) { free(f); return INVALID_HANDLE; }
-    if (!(f->dir = opendir(f->path))) { DWORD e = vx_error_from_errno(errno); free(f); vx_set_last_error(e == 2 ? 3 : e); return INVALID_HANDLE; }
-    if (!find_next(f, d)) { find_destroy(f); vx_set_last_error(2 /* ERROR_FILE_NOT_FOUND */); return INVALID_HANDLE; }
+    if (!(f->dir = opendir(f->path))) { if (vx_trace) vx_log("FindFirstFile(%s): no directory %s", spec, f->path); DWORD e = vx_error_from_errno(errno); free(f); vx_set_last_error(e == 2 ? 3 : e); return INVALID_HANDLE; }
+    if (!find_next(f, d)) {
+        if (vx_trace) vx_log("FindFirstFile(%s): nothing in %s matches %s", spec, f->path, f->pattern);
+        find_destroy(f); vx_set_last_error(2 /* ERROR_FILE_NOT_FOUND */); return INVALID_HANDLE;
+    }
+    if (vx_trace) vx_log("FindFirstFile(%s): %s", spec, d->name);
     HANDLE h = vx_handle_new(VX_HANDLE_FIND, f, find_destroy);
     if (!h) { find_destroy(f); vx_set_last_error(4); return INVALID_HANDLE; }
     return h;

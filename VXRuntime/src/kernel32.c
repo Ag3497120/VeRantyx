@@ -31,7 +31,7 @@ int vx_handle_fd(HANDLE h) {
     if (v == -10) return 0;
     if (v == -11) return 1;
     if (v == -12) return 2;
-    if (v >= 0x10000 && v < 0x10000 + 1024) return (int)(v - 0x10000);   // file handles: 0x10000 + fd
+    if (v >= 0x10000 && v < 0x20000) return (int)(v - 0x10000);   // file handles: 0x10000 + fd (descriptors below 65536)
     return -1;
 }
 

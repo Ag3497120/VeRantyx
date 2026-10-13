@@ -698,10 +698,12 @@ static WINAPI int DrawTextW(HANDLE h, const uint16_t *s, int n, RECT *r, uint32_
 static WINAPI int DrawTextA(HANDLE h, const char *s, int n, RECT *r, uint32_t fmt) { int l; uint16_t *w = wide_from(s, n, &l); int res = DrawTextW(h, w, l, r, fmt); free(w); return res; }
 
 // Pixel formats and OpenGL buffers arrive with opengl32; until then nothing matches.
-static WINAPI int ChoosePixelFormat(HANDLE dc, const void *pfd) { (void)dc; (void)pfd; return 0; }
-static WINAPI BOOL SetPixelFormat(HANDLE dc, int f, const void *pfd) { (void)dc; (void)f; (void)pfd; return 0; }
-static WINAPI int DescribePixelFormat(HANDLE dc, int f, uint32_t n, void *pfd) { (void)dc; (void)f; (void)n; (void)pfd; return 0; }
-static WINAPI BOOL SwapBuffers(HANDLE dc) { (void)dc; return 0; }
+// Pixel formats for OpenGL (opengl.c): there is one (RGBA8, depth 24, stencil 8, double-buffered).
+static WINAPI int ChoosePixelFormat(HANDLE dc, const void *pfd) { (void)dc; (void)pfd; return 1; }
+static WINAPI BOOL SetPixelFormat(HANDLE dc, int f, const void *pfd) { (void)dc; (void)pfd; return f == 1; }
+static WINAPI int DescribePixelFormat(HANDLE dc, int f, uint32_t n, void *pfd) { (void)dc; (void)f; return vx_gl_describe_pixel_format(pfd, n); }
+static WINAPI int GetPixelFormat(HANDLE dc) { (void)dc; return 1; }
+static WINAPI BOOL SwapBuffers(HANDLE dc) { (void)dc; return vx_gl_swap(); }
 
 static const vx_export gdi32[] = {
     VX_EXPORT(CreateCompatibleDC), VX_EXPORT(CreateDCA), VX_EXPORT(CreateDCW), VX_EXPORT(DeleteDC), VX_EXPORT(GetDeviceCaps),
@@ -717,7 +719,7 @@ static const vx_export gdi32[] = {
     VX_EXPORT(StretchDIBits), VX_EXPORT(SetDIBitsToDevice), VX_EXPORT(StretchBlt), VX_EXPORT(BitBlt),
     VX_EXPORT(TextOutA), VX_EXPORT(TextOutW), VX_EXPORT(ExtTextOutA), VX_EXPORT(ExtTextOutW),
     VX_EXPORT(GetTextExtentPoint32A), VX_EXPORT(GetTextExtentPoint32W), VX_EXPORT(GetTextMetricsA), VX_EXPORT(GetTextMetricsW),
-    VX_EXPORT(ChoosePixelFormat), VX_EXPORT(SetPixelFormat), VX_EXPORT(DescribePixelFormat), VX_EXPORT(SwapBuffers),
+    VX_EXPORT(ChoosePixelFormat), VX_EXPORT(SetPixelFormat), VX_EXPORT(DescribePixelFormat), VX_EXPORT(GetPixelFormat), VX_EXPORT(SwapBuffers),
 };
 static const vx_export user32_gdi[] = {
     VX_EXPORT(GetDC), VX_EXPORT(GetWindowDC), VX_EXPORT(GetDCEx), VX_EXPORT(ReleaseDC), VX_EXPORT(WindowFromDC),

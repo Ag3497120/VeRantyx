@@ -387,6 +387,18 @@ static void __attribute__((noreturn)) dispatch(EXCEPTION_RECORD *rec, CONTEXT *c
     }
     if (g_unhandled_filter && g_unhandled_filter(&ep) == -1) resume(ctx);
     vx_log("unhandled exception %#x at %p", rec->code, rec->address);
+    CONTEXT walk = *ctx;                          // the program's frames, unwound
+    vx_entry *at = self.next;
+    for (int depth = 0; depth < 20; depth++) {
+        const vx_image *m = vx_image_at(walk.rip);
+        vx_log("   #%d %s+%#llx", depth, m ? m->name : "?", m ? (unsigned long long)(walk.rip - (uint64_t)(uintptr_t)m->base) : (unsigned long long)walk.rip);
+        uint64_t base;
+        RUNTIME_FUNCTION *fn = next_function(&walk, &at, 0, &base);
+        if (!fn) break;
+        void *data = NULL; uint64_t frame = 0;
+        RtlVirtualUnwind(0, base, walk.rip, fn, &walk, &data, &frame, NULL);
+        if (!walk.rip) break;
+    }
     fflush(stdout);
     _exit((int)rec->code);
 }

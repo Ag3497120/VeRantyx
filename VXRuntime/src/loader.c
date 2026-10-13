@@ -18,6 +18,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "vx.h"
+#include <sys/resource.h>
+#include <limits.h>
 
 vx_process vx_proc;
 int vx_trace;
@@ -720,7 +722,15 @@ static void make_process_parameters(const char *exe) {
 int main(int argc, char **argv, char **envp) {
     if (argc < 2) { fprintf(stderr, "usage: vxrt program.exe [args...]\n"); return 2; }
     vx_trace = getenv("VXRT_TRACE") && *getenv("VXRT_TRACE") == '1';
+    // Windows programs keep thousands of handles open; macOS gives a process 256 descriptors (Google Earth VR ran
+    // out while reading its tours): as many as the system allows.
+    struct rlimit files;
+    if (!getrlimit(RLIMIT_NOFILE, &files) && files.rlim_cur < 65536) {
+        files.rlim_cur = files.rlim_max < OPEN_MAX ? files.rlim_max : OPEN_MAX;
+        setrlimit(RLIMIT_NOFILE, &files);
+    }
     vx_profile_start();
+    vx_wininet_init();                           // (before desktop.c's stand-ins for the same functions)
     vx_kernel32_init();
     vx_system_init();
     vx_desktop_init();
@@ -738,6 +748,7 @@ int main(int argc, char **argv, char **envp) {
     vx_registry_init();
     vx_user32_init();
     vx_gdi_init();
+    vx_opengl_init();
     vx_net_init();
     vx_mm_init();
     vx_com_init();
@@ -748,6 +759,7 @@ int main(int argc, char **argv, char **envp) {
     vx_dxgi_init();
     vx_d3d9_init();
     vx_vcruntime_init();
+    vx_extras_init();                            // (last: the tables above come first)
 
     vx_proc.argc = argc - 1;
     vx_proc.argv = argv + 1;
