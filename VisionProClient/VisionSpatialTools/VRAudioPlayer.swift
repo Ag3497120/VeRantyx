@@ -31,6 +31,9 @@ final class VRAudioPlayer {
     private var rateWindowStart = ProcessInfo.processInfo.systemUptime
     private var rateWindowPackets = 0
     private var lastFailureLogAt: TimeInterval = -.infinity
+    // When the player last finished a buffer: a full backlog with no completions for a second means the node
+    // stopped pulling audio while it was "playing" (seen in play: every later packet was dropped as backlog).
+    private var lastCompletionAt = ProcessInfo.processInfo.systemUptime
     private var observers: [NSObjectProtocol] = []
     // Wi-Fi delivers the 5 ms packets in bursts around the video frames.
     // Hold this much before (re)starting playback so bursts do not empty the
@@ -75,6 +78,11 @@ final class VRAudioPlayer {
             if scheduledFrames > Int(sampleRate * maximumBacklogSeconds) {
                 droppedPackets += 1
                 expectedSequence = sequence &+ 1
+                if ProcessInfo.processInfo.systemUptime - lastCompletionAt > 1 {
+                    log?("VR audio: the player stopped taking audio; restarting the engine.")
+                    lastCompletionAt = ProcessInfo.processInfo.systemUptime
+                    restartEngine(reason: "player stalled")
+                }
                 return
             }
             // A lost packet leaves a hole; fill it with silence so the rest
@@ -123,6 +131,7 @@ final class VRAudioPlayer {
         player.scheduleBuffer(buffer) { [weak self] in
             self?.queue.async { [weak self] in
                 guard let self, generation == sessionGeneration else { return }
+                lastCompletionAt = ProcessInfo.processInfo.systemUptime
                 scheduledFrames -= frames
                 if carriesSound { playedPackets += 1 }
                 if scheduledFrames <= 0, playing {
