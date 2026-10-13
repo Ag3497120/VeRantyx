@@ -10,15 +10,16 @@ played with bare hands. No tracked VR controllers are needed: the PS VR2 Sense
 controllers that other Vision Pro ports of Alyx require are not sold in every
 region (not in Japan at the time of writing).
 
-There are **two versions**, on their own branches:
+There are **three versions**, on their own branches:
 
 | Branch | How the game runs on the Mac | Status |
 |---|---|---|
 | [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) | Valve's **Linux ARM64** build of Half-Life: Alyx (made for the Steam Frame) runs natively on macOS — no Wine, no Rosetta, no SteamVR — through a patched [Klepton](https://github.com/shinyquagsire23/Klepton) loader, a glibc compatibility layer and an OpenVR runtime of our own | New (2026-10-11). Menu at 60 fps, levels played for 20+ minutes on an M1 Max |
 | [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine) | The Windows build with the real Windows SteamVR under Wine 11, DXVK → MoltenVK, and a SteamVR driver of our own | Stable since 2026-10-10; ~30 fps in game on an M1 Max |
-| `main` | Both of the above | Development |
+| [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) | The Windows build and the real Windows SteamVR on **[VXRuntime](#the-vxrt-version-vxruntime)** (vxrt), a Windows runtime written from scratch for Apple silicon in this repository — no Wine: Direct3D 11 on Metal, Steam through the Mac Steam client | New (2026-10-13). First chapter at 45–57 fps; 3K preset (1440×1620 per eye) at 36–38 fps on an M1 Max; not yet played in the headset |
+| `main` | All of the above | Development |
 
-Both versions share the Mac HEVC encoder (`MacEncoder/`) and the Vision Pro
+All versions share the Mac HEVC encoder (`MacEncoder/`) and the Vision Pro
 app (`VisionProClient/`).
 
 ### Native version (Linux ARM64 build, no Wine) — recorded 2026-10-11
@@ -88,6 +89,112 @@ used nor shipped.
 | Wine Staging (Gcenx build), DXVK for macOS (Gcenx) | Wine version | LGPL-2.1, zlib | No — fetched by `scripts/setup.sh` |
 
 Details: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## The vxrt version: VXRuntime
+
+### What vxrt is
+
+VXRuntime ("vxrt", in [`VXRuntime/`](VXRuntime/)) is a Windows compatibility
+layer written from scratch for Apple silicon Macs. It loads Windows programs
+(PE files) and gives them the Windows API they call, implemented directly on
+macOS: files, the registry, threads and synchronization, exceptions, windows
+and input on AppKit, sockets, COM, audio on Core Audio, and Direct3D 11 / DXGI
+on Metal. With it, the Windows build of Half-Life: Alyx and the real Windows
+SteamVR (vrserver, vrcompositor and the VeRantyx driver) run on the Mac without
+Wine, and the game reaches the Steam client you already run on macOS.
+
+It was started on 2026-10-12 because Wine was the bottleneck of the Wine
+version (the Mac was CPU-bound at ~30 fps, with wineserver, Steam's Chromium
+and two layers of graphics translation all on the CPU) and because Wine's own
+design blocked Apple's D3DMetal. vxrt runs the Windows build, so it is not
+tied to a game having a Linux ARM64 build (Alyx is the only SteamVR title with
+one, made for the Steam Frame).
+
+### How it is built
+
+```
+ One macOS x86-64 process per Windows process (Rosetta 2 translates both together)
+ ┌────────────────────────────────────────────────────────────────────────────┐
+ │ hlvr.exe, vrcompositor.exe, ... (unchanged Windows PE code)                │
+ │   │ calls Windows functions directly (ms_abi), no Unix/PE boundary         │
+ │   ▼                                                                        │
+ │ vxrt: PE loader · kernel32/ntdll · SEH and C++ exceptions · files/registry │
+ │       user32/gdi on AppKit and Core Graphics · ws2_32 · COM · winmm/WASAPI │
+ │       Direct3D 11/DXGI on Metal (DXBC → Metal Shading Language)            │
+ │       shared textures (IOSurface + keyed mutex) across processes           │
+ │       Steam bridge → the Mac Steam client's steamclient.dylib              │
+ └────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **No Unix half.** In Wine a Windows API call crosses from PE DLLs into a
+  separate Unix side, and kernel objects shared between processes go through
+  wineserver. In vxrt the Windows API is native Mach-O code with the Windows
+  calling convention, called by the program directly; kernel objects live in
+  the process, and only named objects other processes need are put in shared
+  memory.
+- **Thread state as macOS has it.** `gs` stays macOS's thread-specific data;
+  the TEB pointer and TLS array are written into two of its slots, so Windows
+  code, the runtime and Metal share a thread without switching anything.
+- **Graphics straight to Metal.** Direct3D 11 calls become Metal calls, and
+  shaders are translated from DXBC to Metal Shading Language once (in the
+  background, cached by Metal). The Wine version went D3D11 → Vulkan (DXVK) →
+  Metal (MoltenVK). Geometry shaders run as compute kernels; textures shared
+  between the game, the compositor and the driver are IOSurfaces with keyed
+  mutexes, so SteamVR's compositor accepts the game's frames directly (under
+  Wine it could not open them).
+- **Steam without Windows Steam.** The game's `steamclient64.dll` is a
+  built-in that forwards every Steam interface to the Mac Steam client you are
+  signed in to (static ms_abi → System V stubs per interface method), so no
+  Windows Steam and no Chromium run.
+- **No code made at run time.** Method tables and call stubs are generated
+  ahead of time or written in assembly; Valve's and Microsoft's files are used
+  from your own installation and never shipped.
+- **Built milestone by milestone**, each a small Windows program that has to
+  run unchanged (`make check`, 20 test programs): PE loader and kernel32 →
+  threads and exceptions → files and DLLs → windows on AppKit → COM, I/O
+  completion ports, MSVC C++ exceptions → Direct3D 11 on Metal → compute,
+  input, audio → processes and shared textures (SteamVR) → the Steam bridge
+  (Alyx) → geometry shaders → the 3K/10-bit work. About 21,600 lines of C and
+  Objective-C, written in two days (2026-10-12 and 13) with Claude Opus 5.5 in
+  Claude Code. Design notes, every milestone and its test:
+  [VXRuntime/README.md](VXRuntime/README.md).
+
+### Compared with the Wine and native versions
+
+Half-Life: Alyx, MacBook Pro M1 Max, measured with each version's own logs.
+
+| | Wine version | Native version | vxrt version |
+|---|---|---|---|
+| Game build | Windows (x86-64) | Linux ARM64 (Steam Frame build) | Windows (x86-64) |
+| CPU code | Rosetta 2 + Wine | Native ARM64 (no translation) | Rosetta 2, no Wine |
+| VR runtime | Real SteamVR under Wine | Our own OpenVR runtime | Real SteamVR on vxrt |
+| Graphics | D3D11 → DXVK → Vulkan → MoltenVK → Metal | Vulkan → MoltenVK → Metal | D3D11 → Metal (own translator) |
+| Steam | Windows Steam + Chromium under Wine | Mac Steam client | Mac Steam client (bridge) |
+| In game, default size | ~30 fps (CPU-bound, SteamVR scale 0.7) | 60 fps, 1298×1056 per eye | 45–57 fps, ~840×940 per eye |
+| Larger sizes | — | 1982×1536 per eye ~39 fps; ~3K per eye ~20 fps | 1440×1620 per eye 36–38 fps (72 Hz); stream 2880×1620 HEVC Main10 |
+| Other Windows VR games | Possible (Wine) | No: needs a Linux ARM64 build | Possible in principle; only Alyx and SteamVR Home tested |
+| Played in the headset | Yes | Yes (20+ min sessions) | Not yet |
+
+In short: the native version is the fastest (no CPU translation) but exists
+only because Valve made an ARM64 Alyx; the Wine version runs any Windows game
+but pays for Wine and double graphics translation; vxrt keeps the Windows build
+and the real SteamVR while removing Wine, and is the one we can optimize down
+to every call. It is a research project: Direct3D 12, tessellation and stream
+output are not there yet, and it has only been tested with Alyx and SteamVR.
+
+### Running the vxrt version
+
+Steam running on the Mac and signed in, SteamVR and the game installed in a
+Windows Steam library (the Wine version's prefix is read, never written):
+
+```bash
+make -C VXRuntime check                          # builds vxrt and runs its tests
+scripts/launch_vxrt_alyx.sh                      # SteamVR on vxrt + encoder + Half-Life: Alyx
+VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 1440×1620 per eye, 2880×1620 10-bit HEVC at 40 Mbps, 72 Hz
+```
+
+The first start compiles the game's shaders (a few minutes). The 10-bit stream
+needs the current Vision Pro app (`scripts/deploy_vision_pro_app.sh`).
 
 ## Compared with Glovebox
 
@@ -270,7 +377,9 @@ audio, GPU frame conversion and the one-command setup. All of it was built
 from scratch by the author with these models. On 2026-10-11 the native ARM
 version was started and brought to playable levels the same day; it builds
 on Klepton (fetched and patched, not included) and includes ALVR's hand
-skeleton data, both MIT (see "Built on").
+skeleton data, both MIT (see "Built on"). On 2026-10-12 and 13 VXRuntime was
+written from scratch with Opus 5.5 in Claude Code, and the Windows build of
+Alyx with the real SteamVR ran on it without Wine (the `vxrt` branch).
 
 ## Other Macs
 

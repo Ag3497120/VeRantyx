@@ -2,6 +2,97 @@
 
 Windows Steam runs through the transferred Wine 11.9 runtime. SteamVR uses the Verantyx virtual HMD driver. Half-Life: Alyx submits stereo textures through OpenVR; the Mac capture proxy reads each eye before SteamVR's compositor rejects the texture format, then the Mac encodes a fixed 1440×810 HEVC stream for Apple Vision Pro. The Vision Pro sends head and hand poses back to SteamVR.
 
+## vxrt版（VXRuntime）
+
+### vxrtとは
+
+VXRuntime（略称vxrt、[`VXRuntime/`](../VXRuntime/)）は、Apple シリコンの Mac 向けにゼロから書いた
+Windows 互換レイヤーです。Windows のプログラム（PE ファイル）を読み込み、そのプログラムが呼ぶ Windows API を
+macOS の上に直接実装して渡します。ファイル、レジストリ、スレッドと同期、例外、AppKit 上のウィンドウと入力、
+ソケット、COM、Core Audio 上の音声、そして Metal 上の Direct3D 11 / DXGI です。これにより、Half-Life: Alyx の
+Windows 版と本物の Windows 版 SteamVR（vrserver、vrcompositor、VeRantyx ドライバー）が Wine なしで Mac 上で動き、
+ゲームは macOS でサインイン済みの Steam クライアントにつながります。
+
+2026-10-12 に始めました。理由は2つです。Wine 版では Wine 自体がボトルネックで（wineserver、Steam の Chromium、
+二重のグラフィックス変換がすべて CPU に載り、約30fps で CPU 律速）、また Wine の設計が Apple の D3DMetal を
+使えなくしていたためです。vxrt は Windows 版をそのまま動かすので、Linux ARM64 版があるゲーム（SteamVR タイトルでは
+Steam Frame 向けに作られた Alyx だけ）に縛られません。
+
+### どのように組まれているか
+
+```
+ Windows のプロセス1つ = macOS の x86-64 プロセス1つ（Rosetta 2 がプログラムとランタイムをまとめて変換）
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │ hlvr.exe、vrcompositor.exe など（無改造の Windows PE コード）         │
+ │   │ Windows の関数を直接呼ぶ（ms_abi）。Unix 側との境界はない         │
+ │   ▼                                                                  │
+ │ vxrt: PE ローダー・kernel32/ntdll・SEH と C++ 例外・ファイル/レジストリ │
+ │       AppKit/Core Graphics 上の user32/gdi・ws2_32・COM・WASAPI       │
+ │       Metal 上の Direct3D 11/DXGI（DXBC → Metal Shading Language）    │
+ │       プロセス間の共有テクスチャ（IOSurface + keyed mutex）          │
+ │       Steam ブリッジ → Mac の Steam クライアントの steamclient.dylib   │
+ └──────────────────────────────────────────────────────────────────────┘
+```
+
+- **Unix 側がない**: Wine では Windows API の呼び出しが PE の DLL から別の Unix 側へ渡り、プロセス間で共有する
+  カーネルオブジェクトは wineserver を通ります。vxrt では Windows API は Windows の呼び出し規約を持つネイティブの
+  Mach-O コードで、プログラムが直接呼びます。カーネルオブジェクトはプロセス内にあり、他のプロセスが必要とする
+  名前付きのものだけを共有メモリーに置きます。
+- **スレッド状態は macOS のまま**: `gs` は macOS のスレッド固有データのままにし、TEB と TLS 配列をその2つの
+  スロットに書きます。Windows のコード、ランタイム、Metal が何も切り替えずに同じスレッドを使えます。
+- **グラフィックスは Metal へ直接**: Direct3D 11 の呼び出しは Metal の呼び出しになり、シェーダーは DXBC から
+  Metal Shading Language へ一度だけ翻訳します（バックグラウンドで、Metal がキャッシュ）。Wine 版は
+  D3D11 → Vulkan（DXVK）→ Metal（MoltenVK）でした。ジオメトリシェーダーはコンピュートカーネルで実行し、
+  ゲーム・コンポジタ・ドライバー間の共有テクスチャは keyed mutex 付きの IOSurface なので、SteamVR のコンポジタが
+  ゲームのフレームをそのまま受け取れます（Wine では開けませんでした）。
+- **Windows 版 Steam なし**: ゲームの `steamclient64.dll` は組み込みで、すべての Steam インターフェースを
+  サインイン済みの Mac の Steam クライアントへ転送します（インターフェースのメソッドごとの ms_abi → System V
+  スタブ）。Windows の Steam も Chromium も動かしません。
+- **実行時にコードを作らない**: メソッド表と呼び出しスタブは事前生成かアセンブリです。Valve と Microsoft の
+  ファイルは利用者自身のインストールから使い、配布しません。
+- **マイルストーン単位で構築**: 各段階が「無改造で動くべき小さな Windows プログラム」です（`make check`、
+  20本のテスト）。PE ローダーと kernel32 → スレッドと例外 → ファイルと DLL → AppKit 上のウィンドウ →
+  COM・I/O 完了ポート・MSVC の C++ 例外 → Metal 上の Direct3D 11 → コンピュート・入力・音声 → プロセスと
+  共有テクスチャ（SteamVR）→ Steam ブリッジ（Alyx）→ ジオメトリシェーダー → 3K/10ビット対応。C と
+  Objective-C で約21,600行、2日間（2026-10-12〜13）で Claude Code の Claude Opus 5.5 と書きました。設計と
+  各マイルストーンの詳細は [VXRuntime/README.md](../VXRuntime/README.md) にあります。
+
+### Wine版・ネイティブ版との比較
+
+Half-Life: Alyx、MacBook Pro M1 Max、各版のログでの計測です。
+
+| | Wine版 | ネイティブ版 | vxrt版 |
+|---|---|---|---|
+| ゲームのビルド | Windows（x86-64） | Linux ARM64（Steam Frame 向け） | Windows（x86-64） |
+| CPU のコード | Rosetta 2 + Wine | ネイティブ ARM64（変換なし） | Rosetta 2、Wine なし |
+| VR ランタイム | Wine 上の本物の SteamVR | 自作の OpenVR ランタイム | vxrt 上の本物の SteamVR |
+| グラフィックス | D3D11 → DXVK → Vulkan → MoltenVK → Metal | Vulkan → MoltenVK → Metal | D3D11 → Metal（自作の翻訳） |
+| Steam | Wine 上の Windows 版 Steam + Chromium | Mac の Steam | Mac の Steam（ブリッジ） |
+| ゲーム中・標準サイズ | 約30fps（CPU 律速、SteamVR 倍率0.7） | 60fps、片目1298×1056 | 45〜57fps、片目約840×940 |
+| 大きいサイズ | — | 片目1982×1536で約39fps、片目約3Kで約20fps | 片目1440×1620で36〜38fps（72Hz）、配信2880×1620 HEVC Main10 |
+| 他の Windows VR ゲーム | 可能（Wine） | 不可（Linux ARM64 版が必要） | 原理的には可能。試したのは Alyx と SteamVR Home のみ |
+| ヘッドセットでのプレイ | 済み | 済み（20分以上） | まだ |
+
+まとめると、ネイティブ版は CPU 変換がないので最速ですが、Valve が ARM64 版の Alyx を作ったから成り立つ方法です。
+Wine 版はどの Windows ゲームも動かせますが、Wine と二重のグラフィックス変換のコストを払います。vxrt は
+Windows 版と本物の SteamVR を保ったまま Wine を取り除き、すべての呼び出しまで自分たちで最適化できる版です。
+研究段階のプロジェクトで、Direct3D 12、テッセレーション、ストリーム出力はまだなく、試したのは Alyx と
+SteamVR だけです。
+
+### vxrt版の起動
+
+Mac で Steam を起動してサインインし、SteamVR とゲームが Windows の Steam ライブラリに入っている状態で
+（Wine 版の prefix は読むだけで書き込みません）:
+
+```bash
+make -C VXRuntime check                          # vxrt をビルドしてテストを実行
+scripts/launch_vxrt_alyx.sh                      # vxrt 上の SteamVR + エンコーダー + Half-Life: Alyx
+VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 片目1440×1620、2880×1620の10ビットHEVC・40Mbps、72Hz
+```
+
+初回はゲームのシェーダーのコンパイルに数分かかります。10ビット配信には最新の Vision Pro アプリが必要です
+（`scripts/deploy_vision_pro_app.sh`）。
+
 ## このMacで確認した状態
 
 - Half-Life: AlyxのWindows版`hlvr.exe`と約73GBのゲームデータが`~/Verantyx_VR_Drive/SteamVR_Prefix`内にあります。再ダウンロードは不要です。
