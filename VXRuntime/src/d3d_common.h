@@ -120,12 +120,14 @@ typedef struct {
     uint32_t nviewports;
     struct d3d_draw_state *draw;     // shaders, buffers, states (d3d11_draw.m)
     uint32_t unsent;                 // draws and dispatches recorded since the command buffer last went to the GPU
+    int prof_sample;                 // VXRT_GPU_PROFILE: the open render pass's first sample, until its shader is noted
     d3d_pending_clear clears[9];     // clears waiting for the next render pass (its load action) or other GPU work
     int nclears;
 } d3d_context;
 void d3d_clears_flush(d3d_context *c);                                   // does the pending clears as passes of their own
 int d3d_same_target(const d3d_view *a, const d3d_view *b);              // d3d11.m: the same subresource, as the same format
 void d3d_end_reasons_log(void);                                          // VXRT_STATS: what ended render passes with multisampled targets
+void d3d_gpu_profile_submit(d3d_device *dev, void *cmd);                 // d3d11_draw.m: VXRT_GPU_PROFILE, the passes of a command buffer
 // The pending clears the render pass being made can do as its load actions (d3d11.m): marks those attachments
 // MTLLoadActionClear with the values and forgets the clears.
 void d3d_clears_into_pass(d3d_context *c, void *render_pass_descriptor, d3d_view *const *rtvs, d3d_view *dsv);

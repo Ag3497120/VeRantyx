@@ -41,10 +41,13 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface)
 typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id, hash; volatile int ready; void *dual; int dual_tried; void *variant; int variant_tried; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
 static pthread_mutex_t g_compile_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_compiled = PTHREAD_COND_INITIALIZER;
+// Variants compile synchronously under their own lock: the compile needs Metal's compiler queue, whose completion
+// handlers take g_compile_lock (holding that one here deadlocked when many shaders were compiling).
+static pthread_mutex_t g_variant_lock = PTHREAD_MUTEX_INITIALIZER;
 // Dual-source blending (SRC1 factors) reads the pixel shader's second output as Metal's color(0) index(1): a
 // variant of the shader with o1 declared so, made the first time a blend state asks for it.
 static id<MTLFunction> dual_source_function(d3d_device *dev, d3d_shader *s) {
-    pthread_mutex_lock(&g_compile_lock);
+    pthread_mutex_lock(&g_variant_lock);
     if (!s->dual_tried) {
         s->dual_tried = 1;
         const char *msl = s->info.msl, *at = msl ? strstr(msl, " o1 [[color(1)]];") : NULL;
@@ -57,7 +60,7 @@ static id<MTLFunction> dual_source_function(d3d_device *dev, d3d_shader *s) {
             else vx_log("Direct3D: dual-source variant of shader %08x did not compile: %s", s->hash, err.localizedDescription.UTF8String);
         }
     }
-    pthread_mutex_unlock(&g_compile_lock);
+    pthread_mutex_unlock(&g_variant_lock);
     return (__bridge id<MTLFunction>)s->dual;
 }
 static id<MTLFunction> shader_function(d3d_shader *s) {
@@ -338,7 +341,9 @@ static void *make_sampler(id<MTLDevice> dev, const uint32_t *d) {
     sd.mipFilter = filter & 0x1 ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
     sd.magFilter = filter & 0x4 ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
     sd.minFilter = filter & 0x10 ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-    if ((filter & 0x7f) == 0x55) sd.maxAnisotropy = d[5] ? MIN(d[5], 16u) : 1;
+    static int aniso_max = -1;                         // VXRT_MAX_ANISOTROPY=4: a cap (a quality setting)
+    if (aniso_max < 0) aniso_max = getenv("VXRT_MAX_ANISOTROPY") ? MAX(atoi(getenv("VXRT_MAX_ANISOTROPY")), 1) : 16;
+    if ((filter & 0x7f) == 0x55) sd.maxAnisotropy = d[5] ? MIN(d[5], (uint32_t)aniso_max) : 1;
     sd.sAddressMode = address_mode(d[1]); sd.tAddressMode = address_mode(d[2]); sd.rAddressMode = address_mode(d[3]);
     if (filter & 0x80) sd.compareFunction = compare_function(d[6]);
     const float *border = (const float *)&d[7];
@@ -554,7 +559,7 @@ static void pso_add(const pso_key *k, void *pso) {  // with g_pso_lock held; pso
 // The geometry path's other functions, compiled the first time a draw needs them: a geometry shader's
 // pass-through vertex function, a vertex shader as a kernel (both kept in `variant`).
 static id<MTLFunction> shader_variant(d3d_device *dev, d3d_shader *s, const char *msl, const char *what) {
-    pthread_mutex_lock(&g_compile_lock);
+    pthread_mutex_lock(&g_variant_lock);
     if (!s->variant_tried && msl) {
         s->variant_tried = 1;
         NSError *err = nil;
@@ -563,7 +568,7 @@ static id<MTLFunction> shader_variant(d3d_device *dev, d3d_shader *s, const char
         if (fn) s->variant = (void *)CFBridgingRetain(fn);
         else vx_log("Direct3D: %s of shader %08x did not compile: %s", what, s->hash, err.localizedDescription.UTF8String);
     }
-    pthread_mutex_unlock(&g_compile_lock);
+    pthread_mutex_unlock(&g_variant_lock);
     return (__bridge id<MTLFunction>)s->variant;
 }
 static id<MTLFunction> gs_passthrough(d3d_device *dev, d3d_shader *gs) { return shader_variant(dev, gs, gs->info.msl_passthrough, "pass-through"); }
@@ -727,6 +732,95 @@ static id<MTLTexture> shader_texture(d3d_view *v) {
     return cache_view(v, view, tex->mtl);
 }
 
+// VXRT_GPU_PROFILE=1: the GPU time of each render pass and compute dispatch (Metal's timestamp counters at the start
+// of a pass's vertex stage and the end of its fragment stage), summed by what the pass draws to and the first pixel
+// (or compute) shader it runs (the hash VXRT_DUMP_SHADERS names its files by), the costliest every 4 seconds.
+#define PROF_SAMPLES 4096                    // (Metal allows 32 KB of timestamps)
+typedef struct { char sig[120]; } prof_pass;
+static id<MTLCounterSampleBuffer> g_prof_buf;
+static prof_pass g_prof_pass[PROF_SAMPLES / 2];
+static uint32_t g_prof_next, g_prof_submitted;      // samples taken (mod PROF_SAMPLES), and handed to a command buffer
+static int g_prof_on = -1;
+static pthread_mutex_t g_prof_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct { char sig[120]; double ns; uint32_t n; } prof_sum;
+static prof_sum g_prof_sums[512];
+static int g_prof_nsums;
+static uint64_t g_prof_since;
+static int prof_on(d3d_device *dev) {
+    if (g_prof_on >= 0) return g_prof_on;
+    g_prof_on = 0;
+    if (!getenv("VXRT_GPU_PROFILE")) return 0;
+    id<MTLDevice> d = (__bridge id<MTLDevice>)dev->mtl;
+    if (![d supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { vx_log("GPU profile: no stage-boundary counters"); return 0; }
+    id<MTLCounterSet> ts = nil;
+    for (id<MTLCounterSet> set in d.counterSets) if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = set;
+    if (!ts) { vx_log("GPU profile: no timestamp counters"); return 0; }
+    MTLCounterSampleBufferDescriptor *bd = [MTLCounterSampleBufferDescriptor new];
+    bd.counterSet = ts; bd.storageMode = MTLStorageModeShared; bd.sampleCount = PROF_SAMPLES;
+    NSError *err = nil;
+    g_prof_buf = [d newCounterSampleBufferWithDescriptor:bd error:&err];
+    if (!g_prof_buf) { vx_log("GPU profile: %s", err.localizedDescription.UTF8String); return 0; }
+    g_prof_on = 1;
+    return 1;
+}
+static uint32_t prof_take(const char *sig) {          // two samples for a pass
+    uint32_t i = g_prof_next;
+    g_prof_next = (g_prof_next + 2) % PROF_SAMPLES;
+    snprintf(g_prof_pass[i / 2].sig, sizeof g_prof_pass[i / 2].sig, "%s", sig);
+    return i;
+}
+static int prof_note_shader(uint32_t sample, uint32_t hash) {    // the pass's first three pixel shaders: 0 when full
+    char *s = g_prof_pass[sample / 2].sig, h[16];
+    snprintf(h, sizeof h, " %08x", hash);
+    if (strstr(s, h)) return 1;
+    size_t l = strlen(s);
+    snprintf(s + l, sizeof g_prof_pass[0].sig - l, "%s%s", strstr(s, " ps ") ? "" : " ps", h);
+    int n = 0;                                         // (the shaders noted: the spaces after " ps")
+    for (const char *p = strstr(s, " ps ") + 3; p; p = strchr(p + 1, ' ')) n++;
+    return n < 3 && strlen(s) + 10 < sizeof g_prof_pass[0].sig;
+}
+static void prof_add(const char *sig, double ns) {
+    for (int i = 0; i < g_prof_nsums; i++) if (!strcmp(g_prof_sums[i].sig, sig)) { g_prof_sums[i].ns += ns; g_prof_sums[i].n++; return; }
+    if (g_prof_nsums < 512) { snprintf(g_prof_sums[g_prof_nsums].sig, sizeof g_prof_sums[0].sig, "%s", sig); g_prof_sums[g_prof_nsums].ns = ns; g_prof_sums[g_prof_nsums].n = 1; g_prof_nsums++; }
+}
+static int prof_by_ns(const void *a, const void *b) { double x = ((const prof_sum *)a)->ns, y = ((const prof_sum *)b)->ns; return x < y ? 1 : x > y ? -1 : 0; }
+void d3d_gpu_profile_submit(d3d_device *dev, void *cmd_ptr) {
+    if (g_prof_on <= 0 || !cmd_ptr) return;
+    (void)dev;
+    uint32_t first = g_prof_submitted, end = g_prof_next;
+    g_prof_submitted = end;
+    if (first == end) return;
+    // (copies of the passes' names: the ring may be reused before the command buffer is done)
+    uint32_t count = (end - first + PROF_SAMPLES) % PROF_SAMPLES;
+    prof_pass *names = malloc((count / 2 + 1) * sizeof *names);
+    for (uint32_t k = 0; k < count; k += 2) names[k / 2] = g_prof_pass[((first + k) % PROF_SAMPLES) / 2];
+    [(__bridge id<MTLCommandBuffer>)cmd_ptr addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        pthread_mutex_lock(&g_prof_lock);
+        for (uint32_t k = 0; k < count; k += 2) {
+            uint32_t s = (first + k) % PROF_SAMPLES;
+            NSData *data = [g_prof_buf resolveCounterRange:NSMakeRange(s, 2)];
+            if (data.length < 2 * sizeof(MTLCounterResultTimestamp)) continue;
+            const MTLCounterResultTimestamp *t = data.bytes;
+            if (t[0].timestamp == MTLCounterErrorValue || t[1].timestamp == MTLCounterErrorValue || t[1].timestamp < t[0].timestamp) continue;
+            prof_add(names[k / 2].sig, (double)(t[1].timestamp - t[0].timestamp));
+        }
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (!g_prof_since) g_prof_since = now;
+        if (now - g_prof_since >= 4000000000ull) {
+            double secs = (now - g_prof_since) / 1e9, total = 0;
+            qsort(g_prof_sums, (size_t)g_prof_nsums, sizeof *g_prof_sums, prof_by_ns);
+            for (int i = 0; i < g_prof_nsums; i++) total += g_prof_sums[i].ns;
+            vx_log("GPU profile: %.1f ms of passes per second (timestamps assumed ns)", total / 1e6 / secs);
+            for (int i = 0; i < g_prof_nsums && i < 16; i++)
+                vx_log("   %6.1f ms/s %5.0f/s  %s", g_prof_sums[i].ns / 1e6 / secs, g_prof_sums[i].n / secs, g_prof_sums[i].sig);
+            g_prof_nsums = 0; g_prof_since = now;
+        }
+        pthread_mutex_unlock(&g_prof_lock);
+        free(names);
+    }];
+}
+
 // VXRT_STATS: render passes and the memory traffic of their attachments (loaded at the start, stored at the end), every
 // 2 seconds; at high resolutions this is much of a tile-based GPU's time.
 static void pass_stats(MTLRenderPassDescriptor *rp) {
@@ -831,6 +925,24 @@ static id<MTLRenderCommandEncoder> render_pass(d3d_context *c, id<MTLTexture> ex
     if (!any) return nil;
     if (c->nclears) d3d_clears_into_pass(c, (__bridge void *)rp, c->rtv, c->dsv);
     pass_stats(rp);
+    c->prof_sample = -1;
+    if (prof_on(c->base.dev)) {
+        char sig[120]; size_t l = 0;
+        for (int i = 0; i < 8; i++) if (rp.colorAttachments[i].texture) {
+            id<MTLTexture> t = rp.colorAttachments[i].texture;
+            l += (size_t)snprintf(sig + l, sizeof sig - l, "c%d %lux%lu f%lu x%lu ", i, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, (unsigned long)t.sampleCount);
+            if (l > 80) break;
+        }
+        if (rp.depthAttachment.texture) l += (size_t)snprintf(sig + l, sizeof sig - l, "d %lux%lu x%lu", (unsigned long)rp.depthAttachment.texture.width, (unsigned long)rp.depthAttachment.texture.height, (unsigned long)rp.depthAttachment.texture.sampleCount);
+        if (!l) snprintf(sig, sizeof sig, "(no targets)");
+        uint32_t s = prof_take(sig);
+        rp.sampleBufferAttachments[0].sampleBuffer = g_prof_buf;
+        rp.sampleBufferAttachments[0].startOfVertexSampleIndex = s;
+        rp.sampleBufferAttachments[0].endOfVertexSampleIndex = MTLCounterDontSample;
+        rp.sampleBufferAttachments[0].startOfFragmentSampleIndex = MTLCounterDontSample;
+        rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = s + 1;
+        c->prof_sample = (int)s;
+    }
     id<MTLRenderCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) renderCommandEncoderWithDescriptor:rp];
     c->render = (void *)CFBridgingRetain(enc);
     memset(&state_of(c)->bound, 0, sizeof state_of(c)->bound);
@@ -1040,6 +1152,7 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
     if (!pso) return nil;
     id<MTLRenderCommandEncoder> enc = render_pass(c, extra);
     if (!enc) return nil;
+    if (c->prof_sample >= 0 && s->shader[STAGE_PS] && !prof_note_shader((uint32_t)c->prof_sample, s->shader[STAGE_PS]->hash)) c->prof_sample = -1;
     bound_state *bs = &s->bound;
     if (bs->pso != (__bridge void *)pso) { [enc setRenderPipelineState:pso]; bs->pso = (__bridge void *)pso; }
     id<MTLDepthStencilState> dss = s->depth ? (__bridge id<MTLDepthStencilState>)s->depth->mtl : default_depth_state(c);
@@ -1290,7 +1403,16 @@ static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) 
         cs->compute = (void *)CFBridgingRetain(pso);
     }
     d3d_end_render(c);
-    id<MTLComputeCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc;
+    if (prof_on(c->base.dev)) {                         // VXRT_GPU_PROFILE: the dispatch timed
+        char sig[120]; snprintf(sig, sizeof sig, "compute cs %08x", cs->hash);
+        uint32_t smp = prof_take(sig);
+        MTLComputePassDescriptor *cd = [MTLComputePassDescriptor computePassDescriptor];
+        cd.sampleBufferAttachments[0].sampleBuffer = g_prof_buf;
+        cd.sampleBufferAttachments[0].startOfEncoderSampleIndex = smp;
+        cd.sampleBufferAttachments[0].endOfEncoderSampleIndex = smp + 1;
+        enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoderWithDescriptor:cd];
+    } else enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoder];
     [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)cs->compute];
     bind_stage(c, s, STAGE_CS, nil, enc);
     const uint32_t *t = cs->info.threads;

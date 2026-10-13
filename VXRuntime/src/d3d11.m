@@ -238,6 +238,11 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
     // A sample count the GPU does not have becomes the highest it has (Apple GPUs: up to 4; 8 is common on PCs).
     id<MTLDevice> mdev = (__bridge id<MTLDevice>)dev->mtl;
     while (samples > 1 && ![mdev supportsTextureSampleCount:samples]) samples >>= 1;
+    // VXRT_MSAA_MAX=2: no more samples per pixel than that (a quality setting: at high resolutions the multisampled
+    // targets' memory traffic is much of the GPU's time; 1 turns multisampling off).
+    static int msaa_max = -1;
+    if (msaa_max < 0) msaa_max = getenv("VXRT_MSAA_MAX") ? MAX(atoi(getenv("VXRT_MSAA_MAX")), 1) : 64;
+    while (samples > (uint32_t)msaa_max) samples >>= 1;
     if (samples != (desc[TD_SAMPLES] ? desc[TD_SAMPLES] : 1)) {
         static int told;
         if (!told++) vx_log("Direct3D: %u samples per pixel are not available on this GPU: %u are used", desc[TD_SAMPLES], samples);
@@ -580,6 +585,7 @@ void d3d_flush(d3d_device *dev, int wait) {
         while (prev < seq && !__atomic_compare_exchange_n(&dev->completed, &prev, seq, 1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
         if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&dev->completed, 8, OS_SYNC_WAKE_BY_ADDRESS_NONE);
     }];
+    d3d_gpu_profile_submit(dev, (__bridge void *)cmd);
     [cmd commit];
     pthread_mutex_lock(&g_recent_lock);
     void *old = g_recent[seq % RECENT];

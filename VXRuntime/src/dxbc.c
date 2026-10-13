@@ -1349,9 +1349,29 @@ static char *compose(gen *g) {
     if (!fk) put(&t, "    float4 vx_unused [[user(unused)]];\n");
     put(&t, "};\n#define VX_RETURN return (VxOut{%s})\n\n", fk ? finish : "float4(0)");
     // The function.
-    put(&t, "%s VxOut vx_main(%s", vs ? "vertex" : "fragment", has_in ? "VxIn vin [[stage_in]], " : "");
-    if (vs) put(&t, "uint vx_vertex_id [[vertex_id]], uint vx_instance_id [[instance_id]], uint vx_base_instance [[base_instance]]");
-    if (ps) put(&t, "bool vx_front_facing [[front_facing]], uint vx_sample_id [[sample_id]], uint vx_coverage [[sample_mask]], uint vx_primitive [[primitive_id]]");
+    put(&t, "%s VxOut vx_main(%s", vs ? "vertex" : "fragment", has_in ? "VxIn vin [[stage_in]]" : "");
+    if (vs) put(&t, "%suint vx_vertex_id [[vertex_id]], uint vx_instance_id [[instance_id]], uint vx_base_instance [[base_instance]]", has_in ? ", " : "");
+    if (ps) {
+        // Only the built-in inputs the shader reads: declaring [[sample_id]] makes Metal run a fragment shader once per
+        // sample on multisampled targets (four times the work at 4x, for every shader), and the others cost too.
+        const char *body = g->body.s ? g->body.s : "";
+        int ff = strstr(body, "vx_front_facing") != NULL, sid = strstr(body, "vx_sample_id") != NULL;
+        int cov = g->in_coverage || strstr(body, "vx_coverage") != NULL, prim = g->in_primid || strstr(body, "vx_primitive") != NULL;
+        for (int r = 0; r < 32; r++) {
+            if (!g->in_decl[r]) continue;
+            if (g->in_sv[r] == 9) ff = 1;
+            if (g->in_sv[r] == 10) sid = 1;
+            if (g->in_sv[r] == 7) prim = 1;
+            if (g->in_eval[r] && (g->in_interp[r] == 6 || g->in_interp[r] == 7)) sid = 1;
+        }
+        const char *sep = has_in ? ", " : "";
+        int n = 0;
+        if (ff) { put(&t, "%sbool vx_front_facing [[front_facing]]", n++ ? ", " : sep); }
+        if (sid) { put(&t, "%suint vx_sample_id [[sample_id]]", n++ ? ", " : sep); }
+        if (cov) { put(&t, "%suint vx_coverage [[sample_mask]]", n++ ? ", " : sep); }
+        if (prim) { put(&t, "%suint vx_primitive [[primitive_id]]", n++ ? ", " : sep); }
+        if (!n && !has_in) put(&t, "bool vx_front_facing [[front_facing]]");   // (something before the resources' \", \"")
+    }
     resource_params(g, &t);
     put(&t, ") {\n");
     locals(g, &t);
