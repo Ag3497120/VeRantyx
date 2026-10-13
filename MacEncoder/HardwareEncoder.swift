@@ -657,8 +657,9 @@ var lastDiagnostics = (capture: 0, submit: 0, encode: 0, sent: 0, packets: 0, by
 // 30 Mbps lost packets on Wi-Fi often enough to stall decoding.
 let configuredOutputWidth = Int(ProcessInfo.processInfo.environment["VERANTYX_STREAM_WIDTH"] ?? "1920") ?? 1920
 let configuredOutputHeight = Int(ProcessInfo.processInfo.environment["VERANTYX_STREAM_HEIGHT"] ?? "1080") ?? 1080
-let hasExplicitOutputSize = ProcessInfo.processInfo.environment["VERANTYX_STREAM_WIDTH"] != nil ||
-    ProcessInfo.processInfo.environment["VERANTYX_STREAM_HEIGHT"] != nil
+// VERANTYX_STREAM_WIDTH/HEIGHT set the pixel budget; the stream keeps the eyes' aspect within it (a 2.5:1 frame
+// squeezed into 16:9 lost twice the detail across as down). VERANTYX_STREAM_FIXED_SIZE=1: exactly that size.
+let hasExplicitOutputSize = ProcessInfo.processInfo.environment["VERANTYX_STREAM_FIXED_SIZE"] == "1"
 var outputWidth = min(4096, max(2, configuredOutputWidth & ~1))
 var outputHeight = min(4096, max(2, configuredOutputHeight & ~1))
 var outputSourceAspect: Double?
@@ -784,13 +785,29 @@ final class GPUFrameConverter {
         let shader = """
         #include <metal_stdlib>
         using namespace metal;
+        // Each output pixel averages its whole footprint in the source (up to 4x4 bilinear taps), in linear
+        // light (the source is read through an sRGB view), then is sRGB-encoded with a little ordered dither
+        // before the 8-bit store: one tap per pixel aliased thin edges (which 4:2:0 chroma turned magenta and
+        // green in dark areas) and dark gradients banded.
         kernel void scaleFrame(texture2d<float, access::sample> src [[texture(0)]],
                                texture2d<float, access::write> dst [[texture(1)]],
                                uint2 gid [[thread_position_in_grid]]) {
             if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
             constexpr sampler s(filter::linear, address::clamp_to_edge, coord::normalized);
-            float2 uv = (float2(gid) + 0.5) / float2(dst.get_width(), dst.get_height());
-            dst.write(src.sample(s, uv), gid);
+            float2 dsize = float2(dst.get_width(), dst.get_height()), ssize = float2(src.get_width(), src.get_height());
+            float2 scale = ssize / dsize;                        // source pixels per output pixel
+            int2 taps = clamp(int2(ceil(scale * 0.5)), 1, 4);    // bilinear taps cover 2 source pixels each
+            float4 sum = 0;
+            for (int y = 0; y < taps.y; y++)
+                for (int x = 0; x < taps.x; x++) {
+                    float2 at = (float2(gid) + (float2(x, y) + 0.5) / float2(taps)) / dsize;
+                    sum += src.sample(s, at);
+                }
+            float4 c = sum / float(taps.x * taps.y);
+            float3 e = select(1.055 * pow(max(c.rgb, 0.0), 1.0 / 2.4) - 0.055, c.rgb * 12.92, c.rgb <= 0.0031308);
+            const float bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+            float d = (bayer[(gid.y & 3) * 4 + (gid.x & 3)] + 0.5) / 16.0 - 0.5;
+            dst.write(float4(saturate(e + d / 255.0), c.a), gid);
         }
         """
         var cache: CVMetalTextureCache?
@@ -807,7 +824,8 @@ final class GPUFrameConverter {
 
     func convert(source bytes: UnsafeMutableRawPointer, dxgiFormat: UInt32, width: Int, height: Int,
                  destination: CVPixelBuffer) -> Bool {
-        let format: MTLPixelFormat = (dxgiFormat == 28 || dxgiFormat == 29) ? .rgba8Unorm : .bgra8Unorm
+        // (sRGB views: the kernel averages in linear light and encodes the result itself)
+        let format: MTLPixelFormat = (dxgiFormat == 28 || dxgiFormat == 29) ? .rgba8Unorm_srgb : .bgra8Unorm_srgb
         if source == nil || source?.width != width || source?.height != height || sourceFormat != format {
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
             descriptor.usage = .shaderRead
