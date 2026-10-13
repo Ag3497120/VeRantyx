@@ -344,6 +344,8 @@ static int search_dll(const char *name, char *out, size_t cap) {
     for (int i = 0; i < 4; i++) {
         if (!dirs[i][0]) continue;
         snprintf(out, cap, "%s/%s", dirs[i], file);
+        char shadow[4096];
+        if (vx_overlay_file(out, shadow, sizeof shadow)) { snprintf(out, cap, "%s", shadow); return 1; }   // (VXRT_OVERLAY's copy first)
         struct stat st;
         if (!stat(out, &st) && S_ISREG(st.st_mode)) return 1;
     }

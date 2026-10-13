@@ -309,7 +309,7 @@ static void CapturePresentedTexture(const vr::PresentInfo_t* presentInfo) {
     D3D11_TEXTURE2D_DESC sourceDesc = {};
     sourceTexture->GetDesc(&sourceDesc);
     if (sourceDesc.Width == 0 || sourceDesc.Height == 0 ||
-        sourceDesc.Width > 4096 || sourceDesc.Height > 4096 ||
+        sourceDesc.Width > 8192 || sourceDesc.Height > 4096 ||
         sourceDesc.ArraySize != 1 || sourceDesc.SampleDesc.Count != 1 ||
         !IsFourByteColorFormat(sourceDesc.Format)) {
         static uint32_t unsupported = 0;
@@ -817,8 +817,20 @@ static void PersistLiveTangents(const SharedHands& hands) {
 // Pixels per eye the game renders: 800x900 by default (Wine left the game CPU-bound, so more pixels only cost
 // frames). VERANTYX_RENDER_SCALE multiplies each side: 1.5 renders 2.25 times the pixels, for a sharper
 // picture where the GPU has room (VXRuntime: about 40% busy at 1.0 on an M1 Max).
+static EyeRenderSize EyeSizeAtScale(double scale);
 static EyeRenderSize GetEyeRenderSize() {
-    static const double scale = ReadEnvironmentNumber("VERANTYX_RENDER_SCALE", 1.0, 0.5, 3.0);
+    static const double scale = ReadEnvironmentNumber("VERANTYX_RENDER_SCALE", 1.0, 0.5, 4.0);   // (3.2: about 2.5K per eye)
+    return EyeSizeAtScale(scale);
+}
+// The compositor's own output (the virtual display), VERANTYX_DISPLAY_SCALE (default: the render scale). The stream
+// takes the game's frames straight from its Submit, so the compositor's output is only streamed while the game
+// shows none (loading); at 2.5K per eye composing it every vsync held the game back (15 ms per frame).
+static EyeRenderSize GetEyeDisplaySize() {
+    static const double render = ReadEnvironmentNumber("VERANTYX_RENDER_SCALE", 1.0, 0.5, 4.0);
+    static const double scale = ReadEnvironmentNumber("VERANTYX_DISPLAY_SCALE", render, 0.5, 4.0);
+    return EyeSizeAtScale(scale);
+}
+static EyeRenderSize EyeSizeAtScale(double scale) {
     const double kTargetPixelsPerEye = 800.0 * 900.0 * scale * scale;
     const EyeTangents tangents = LatchedTangents();
     float eyeAspect = (tangents.left[1] - tangents.left[0]) / (tangents.left[3] - tangents.left[2]);
@@ -998,13 +1010,14 @@ public:
     }
 #endif
     virtual void GetWindowBounds(int32_t* pnX, int32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight) override {
-        const EyeRenderSize eye = GetEyeRenderSize();
+        const EyeRenderSize eye = GetEyeDisplaySize();
         static LONG logged = 0;
         if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
-            char message[160];
+            const EyeRenderSize render = GetEyeRenderSize();
+            char message[200];
             snprintf(message, sizeof(message),
-                "[Verantyx] Stereo target initialized: %ux%u per eye at %.0f Hz",
-                eye.width, eye.height, DisplayFrequency());
+                "[Verantyx] Stereo target initialized: %ux%u per eye rendered, %ux%u per eye composited, at %.0f Hz",
+                render.width, render.height, eye.width, eye.height, DisplayFrequency());
             LogDriver(message);
         }
         *pnX = 0; *pnY = 0; *pnWidth = eye.width * 2; *pnHeight = eye.height;
@@ -1016,7 +1029,7 @@ public:
         *pnWidth = eye.width; *pnHeight = eye.height;
     }
     virtual void GetEyeOutputViewport(vr::EVREye eEye, uint32_t* pnX, uint32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight) override {
-        const EyeRenderSize eye = GetEyeRenderSize();
+        const EyeRenderSize eye = GetEyeDisplaySize();
         *pnY = 0; *pnWidth = eye.width; *pnHeight = eye.height;
         if (eEye == vr::Eye_Left) *pnX = 0; else *pnX = eye.width;
     }

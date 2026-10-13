@@ -105,6 +105,14 @@ static int overlay_shadow(const char *path, char *out, size_t cap) {
     int n = snprintf(out, cap, "%s%s", g_ov_shadow, path + g_ov_len);
     return n > 0 && (size_t)n < cap;
 }
+// A file under the overlaid tree that the overlay has a copy of: that copy (DLLs found by their Mac path).
+int vx_overlay_file(const char *unix_path, char *out, size_t cap) {
+    char shadow[MAX_PATH_LEN];
+    struct stat st;
+    if (!overlay_shadow(unix_path, shadow, sizeof shadow) || stat(shadow, &st) || !S_ISREG(st.st_mode)) return 0;
+    snprintf(out, cap, "%s", shadow);
+    return 1;
+}
 static void make_parent_dirs(const char *path) {
     char p[MAX_PATH_LEN];
     snprintf(p, sizeof p, "%s", path);

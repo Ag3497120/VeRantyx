@@ -16,7 +16,7 @@ There are **three versions**, on their own branches:
 |---|---|---|
 | [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) | Valve's **Linux ARM64** build of Half-Life: Alyx (made for the Steam Frame) runs natively on macOS — no Wine, no Rosetta, no SteamVR — through a patched [Klepton](https://github.com/shinyquagsire23/Klepton) loader, a glibc compatibility layer and an OpenVR runtime of our own | New (2026-10-11). Menu at 60 fps, levels played for 20+ minutes on an M1 Max |
 | [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine) | The Windows build with the real Windows SteamVR under Wine 11, DXVK → MoltenVK, and a SteamVR driver of our own | Stable since 2026-10-10; ~30 fps in game on an M1 Max |
-| [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) | The Windows build and the real Windows SteamVR on **[VXRuntime](#the-vxrt-version-vxruntime)** (vxrt), a Windows runtime written from scratch for Apple silicon in this repository — no Wine: Direct3D 11 on Metal, Steam through the Mac Steam client | New (2026-10-13). First chapter at 45–57 fps; 3K preset (1440×1620 per eye) at 36–38 fps on an M1 Max; not yet played in the headset |
+| [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) | The Windows build and the real Windows SteamVR on **[VXRuntime](#the-vxrt-version-vxruntime)** (vxrt), a Windows runtime written from scratch for Apple silicon in this repository — no Wine: Direct3D 11 on Metal, Steam through the Mac Steam client | New (2026-10-13). First chapter at 45–57 fps; 3K preset (1440×1620 per eye) at 60 fps on an M1 Max; not yet played in the headset |
 | `main` | All of the above | Development |
 
 All versions share the Mac HEVC encoder (`MacEncoder/`) and the Vision Pro
@@ -171,7 +171,7 @@ Half-Life: Alyx, MacBook Pro M1 Max, measured with each version's own logs.
 | Graphics | D3D11 → DXVK → Vulkan → MoltenVK → Metal | Vulkan → MoltenVK → Metal | D3D11 → Metal (own translator) |
 | Steam | Windows Steam + Chromium under Wine | Mac Steam client | Mac Steam client (bridge) |
 | In game, default size | ~30 fps (CPU-bound, SteamVR scale 0.7) | 60 fps, 1298×1056 per eye | 45–57 fps, ~840×940 per eye |
-| Larger sizes | — | 1982×1536 per eye ~39 fps; ~3K per eye ~20 fps | 1440×1620 per eye 36–38 fps (72 Hz); stream 2880×1620 HEVC Main10 |
+| Larger sizes | — | 1982×1536 per eye ~39 fps; ~3K per eye ~20 fps | 1440×1620 per eye at 60 fps, streamed at 60 fps (2880×1620 HEVC Main10) |
 | Other Windows VR games | Possible (Wine) | No: needs a Linux ARM64 build | Possible in principle; only Alyx and SteamVR Home tested |
 | Played in the headset | Yes | Yes (20+ min sessions) | Not yet |
 
@@ -190,7 +190,7 @@ Windows Steam library (the Wine version's prefix is read, never written):
 ```bash
 make -C VXRuntime check                          # builds vxrt and runs its tests
 scripts/launch_vxrt_alyx.sh                      # SteamVR on vxrt + encoder + Half-Life: Alyx
-VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 1440×1620 per eye, 2880×1620 10-bit HEVC at 40 Mbps, 72 Hz
+VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 1440×1620 per eye, 2880×1620 10-bit HEVC at 40 Mbps, 60 fps
 ```
 
 The first start compiles the game's shaders (a few minutes). The 10-bit stream

@@ -69,7 +69,7 @@ Half-Life: Alyx、MacBook Pro M1 Max、各版のログでの計測です。
 | グラフィックス | D3D11 → DXVK → Vulkan → MoltenVK → Metal | Vulkan → MoltenVK → Metal | D3D11 → Metal（自作の翻訳） |
 | Steam | Wine 上の Windows 版 Steam + Chromium | Mac の Steam | Mac の Steam（ブリッジ） |
 | ゲーム中・標準サイズ | 約30fps（CPU 律速、SteamVR 倍率0.7） | 60fps、片目1298×1056 | 45〜57fps、片目約840×940 |
-| 大きいサイズ | — | 片目1982×1536で約39fps、片目約3Kで約20fps | 片目1440×1620で36〜38fps（72Hz）、配信2880×1620 HEVC Main10 |
+| 大きいサイズ | — | 片目1982×1536で約39fps、片目約3Kで約20fps | 片目1440×1620で60fps、配信も60fps（2880×1620 HEVC Main10 |
 | 他の Windows VR ゲーム | 可能（Wine） | 不可（Linux ARM64 版が必要） | 原理的には可能。試したのは Alyx と SteamVR Home のみ |
 | ヘッドセットでのプレイ | 済み | 済み（20分以上） | まだ |
 
@@ -87,7 +87,7 @@ Mac で Steam を起動してサインインし、SteamVR とゲームが Window
 ```bash
 make -C VXRuntime check                          # vxrt をビルドしてテストを実行
 scripts/launch_vxrt_alyx.sh                      # vxrt 上の SteamVR + エンコーダー + Half-Life: Alyx
-VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 片目1440×1620、2880×1620の10ビットHEVC・40Mbps、72Hz
+VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 片目1440×1620、2880×1620の10ビットHEVC・40Mbps、60fps
 ```
 
 初回はゲームのシェーダーのコンパイルに数分かかります。10ビット配信には最新の Vision Pro アプリが必要です

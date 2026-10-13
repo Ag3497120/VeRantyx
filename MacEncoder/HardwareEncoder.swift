@@ -905,7 +905,7 @@ func copyFrameToBGRA(
     destinationBytesPerRow: Int
 ) -> Bool {
     guard sourceWidth > 0, sourceHeight > 0,
-          sourceWidth <= 4096, sourceHeight <= 4096,
+          sourceWidth <= 8192, sourceHeight <= 4096,
           sourceFormat == 87 || sourceFormat == 91 || sourceFormat == 28 || sourceFormat == 29
     else { return false }
 
@@ -1430,7 +1430,8 @@ while isEncoding {
                 capturedFrameCount += 1
                 encoderDiagnosticLock.unlock()
 
-                guard width > 0, height > 0, width <= 4096, height <= 4096 else {
+                // (Wider than 4096 for 2.5K per eye side by side; a frame block holds 4096 x 4096 x 8 bytes.)
+                guard width > 0, height > 0, width <= 8192, height <= 4096, width * height * 4 <= 4096 * 4096 * 8 else {
                     lastSeq = currentSeq
                     return
                 }

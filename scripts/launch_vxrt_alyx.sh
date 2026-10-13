@@ -5,8 +5,8 @@
 #
 #   scripts/launch_vxrt_alyx.sh                     # main menu, until the game exits or Ctrl-C
 #   scripts/launch_vxrt_alyx.sh +map a1_intro_world_2 +hlvr_pause_after_realmap 0   # extra game arguments
-#   VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh  # 1440x1620 per eye, 2880x1620 stream at 40 Mbps, 72 Hz
-#                                                   # (about 36 fps on an M1 Max)
+#   VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh  # 1440x1620 per eye, 2880x1620 stream at 40 Mbps, 60 Hz
+#                                                   # (60 fps on an M1 Max)
 #
 # The game and SteamVR come from the Wine prefix's Steam library and stay read-only (writes go to the overlay
 # folder, as for scripts/launch_vxrt_steamvr.sh). The first start compiles thousands of shaders and takes a few
@@ -46,8 +46,21 @@ for _ in $(seq 1 30); do                               # vrserver's web server i
 done
 echo "SteamVR on VXRuntime is up; starting Half-Life: Alyx (log: $LOG_DIR/vxrt-alyx.log)"
 
-# The game's capture proxy paces poses by the virtual display, as the driver does (3k: 72 Hz).
-[[ "${VXRT_VR_QUALITY:-}" == 3k ]] && export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-72}"
+# The game's capture proxy (openvr_api.dll beside the game, from this repository) streams the game's frames straight
+# from its Submit and paces poses by the virtual display, as the driver does (3k: 60 Hz). It goes into the overlay
+# folder (read before the game's own folder), so the Steam library stays as it is.
+[[ "${VXRT_VR_QUALITY:-}" == 3k ]] && export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-60}"
+PROXY_DLL="$REPO_ROOT/build/openvr_api_capture_proxy.dll"
+if [[ ! -f "$PROXY_DLL" || "$REPO_ROOT/VRDriver/src/openvr_capture_proxy.cpp" -nt "$PROXY_DLL" ]]; then
+    "$SCRIPT_DIR/build_openvr_capture_proxy.sh" >/dev/null
+fi
+OVERLAY_ALYX_BIN="$VXRT_VR_OVERLAY/steamapps/common/Half-Life Alyx/game/bin/win64"
+mkdir -p "$OVERLAY_ALYX_BIN"
+cp -p "$PROXY_DLL" "$OVERLAY_ALYX_BIN/openvr_api.dll"
+# Poses at the display's rate from the headset instead of SteamVR's compositor, which handed out the next ones only
+# once the GPU had finished the last frame (a frame took the CPU's time plus the GPU's: 45 fps at 3K, now 60).
+# VERANTYX_DECOUPLED_POSES=0: SteamVR's.
+export VERANTYX_DECOUPLED_POSES="${VERANTYX_DECOUPLED_POSES:-1}"
 cd "$ALYX_BIN"
 VXRT_ROOT="$VXRT_VR_ROOT" VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY" VXRT_DLL_PATH="$WINEPREFIX/drive_c/windows/system32" \
 VXRT_STEAM_BRIDGE=1 VXRT_NO_ACTIVATE=1 \

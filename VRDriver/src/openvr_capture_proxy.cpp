@@ -191,6 +191,12 @@ static uint64_t PerformanceTicks() {
     return (uint64_t)ticks.QuadPart;
 }
 
+static uint64_t PerformanceFrequency() {
+    LARGE_INTEGER value;
+    QueryPerformanceFrequency(&value);
+    return (uint64_t)value.QuadPart;
+}
+
 static double TicksToMilliseconds(uint64_t ticks) {
     static const double frequency = []() {
         LARGE_INTEGER value;
@@ -405,7 +411,7 @@ static bool QueueEyeTexture(vr::EVREye eye, const vr::Texture_t* texture,
     const uint32_t sourceY = bounds ? (uint32_t)(bounds->vMin * (float)desc.Height) : 0;
     const uint32_t sourceRight = bounds ? (uint32_t)(bounds->uMax * (float)desc.Width + 0.5f) : desc.Width;
     const uint32_t sourceBottom = bounds ? (uint32_t)(bounds->vMax * (float)desc.Height + 0.5f) : desc.Height;
-    if (desc.Width == 0 || desc.Height == 0 || desc.Width > 4096 || desc.Height > 4096 ||
+    if (desc.Width == 0 || desc.Height == 0 || desc.Width > 8192 || desc.Height > 4096 ||
         desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1 ||
         sourceRight <= sourceX || sourceBottom <= sourceY || sourceRight > desc.Width ||
         sourceBottom > desc.Height || !IsSupportedFormat(desc.Format)) {
@@ -422,7 +428,7 @@ static bool QueueEyeTexture(vr::EVREye eye, const vr::Texture_t* texture,
     }
     const uint32_t eyeWidth = sourceRight - sourceX;
     const uint32_t eyeHeight = sourceBottom - sourceY;
-    if (eyeWidth > 2048 || eyeHeight > 4096) return false;
+    if (eyeWidth > 4096 || eyeHeight > 4096) return false;   // (both eyes side by side must fit a frame block)
 
     const uint32_t eyeIndex = eye == vr::Eye_Right ? 1u : 0u;
     StagedEye* stagedEye = &pair->eyes[eyeIndex];
@@ -1050,11 +1056,13 @@ static void SynthesizePoses(vr::TrackedDevicePose_t* poses, uint32_t poseCount) 
     for (uint32_t i = cached; i < count; ++i) poses[i] = {};
     SharedHands hands = {};
     if (!ReadSharedHandsSnapshot(&hands)) return;
-    struct Target { int index; const float* transform; bool tracked; };
+    // Hand velocities come with the poses when the headset measured them (throws, the gravity gloves' flick).
+    struct Target { int index; const float* transform; bool tracked; const float* velocity; const float* angular; };
+    const bool velocities = hands.velocityValid != 0;
     const Target targets[3] = {
-        { 0, hands.headTransform, hands.headTracked != 0 },
-        { leftIndex, hands.leftTransform, hands.leftTracked != 0 },
-        { rightIndex, hands.rightTransform, hands.rightTracked != 0 },
+        { 0, hands.headTransform, hands.headTracked != 0, nullptr, nullptr },
+        { leftIndex, hands.leftTransform, hands.leftTracked != 0, velocities ? hands.leftVelocity : nullptr, velocities ? hands.leftAngularVelocity : nullptr },
+        { rightIndex, hands.rightTransform, hands.rightTracked != 0, velocities ? hands.rightVelocity : nullptr, velocities ? hands.rightAngularVelocity : nullptr },
     };
     for (const Target& target : targets) {
         if (target.index < 0 || (uint32_t)target.index >= count) continue;
@@ -1066,11 +1074,63 @@ static void SynthesizePoses(vr::TrackedDevicePose_t* poses, uint32_t poseCount) 
             continue;
         }
         ColumnMajorToHmdMatrix(target.transform, &pose.mDeviceToAbsoluteTracking);
-        memset(pose.vVelocity.v, 0, sizeof(pose.vVelocity.v));
-        memset(pose.vAngularVelocity.v, 0, sizeof(pose.vAngularVelocity.v));
+        for (int axis = 0; axis < 3; ++axis) {
+            pose.vVelocity.v[axis] = target.velocity && std::isfinite(target.velocity[axis]) ? target.velocity[axis] : 0.0f;
+            pose.vAngularVelocity.v[axis] = target.angular && std::isfinite(target.angular[axis]) ? target.angular[axis] : 0.0f;
+        }
         pose.eTrackingResult = vr::TrackingResult_Running_OK;
         pose.bPoseIsValid = true;
     }
+}
+
+// VERANTYX_DECOUPLED_POSES=1: once SteamVR has given enough real pose sets to learn which devices are the hands,
+// WaitGetPoses answers from the headset's poses at the virtual display's rate and Submit is no longer forwarded.
+// SteamVR's compositor hands out the next poses only after the GPU has finished the game's last frame, so a frame
+// took the game's CPU time plus its GPU time; the stream is taken from Submit here, so the game can record the next
+// frame while the GPU draws this one (at most two frames in flight, see below).
+static bool DecoupledPoses() {
+    static const bool enabled = []() {
+        char value[8] = {};
+        return GetEnvironmentVariableA("VERANTYX_DECOUPLED_POSES", value, sizeof(value)) > 0 && value[0] == '1';
+    }();
+    return enabled;
+}
+static LONG g_realPoseSets = 0;
+static volatile LONG g_decoupled = 0;
+static uint64_t g_nextPoseTicks = 0;
+static uint32_t PendingStagedPairs() {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < kCaptureSlotCount; ++i) n += g_stagedPairs[i].pending ? 1u : 0u;
+    return n;
+}
+static bool DecoupledWait(vr::TrackedDevicePose_t* renderPoses, uint32_t renderPoseCount,
+    vr::TrackedDevicePose_t* gamePoses, uint32_t gamePoseCount) {
+    if (!DecoupledPoses() || InterlockedCompareExchange(&g_realPoseSets, 0, 0) < 90 || !InitSharedMemory()) return false;
+    AcquireSRWLockShared(&g_lastPosesLock);
+    const bool known = g_lastRenderPoseCount > 0;
+    ReleaseSRWLockShared(&g_lastPosesLock);
+    if (!known) return false;
+    if (InterlockedExchange(&g_decoupled, 1) == 0) Log("WaitGetPoses: decoupled from SteamVR's compositor (VERANTYX_DECOUPLED_POSES=1)");
+    // Two frames in flight at most: wait (up to 50 ms) while the GPU still has more of the game's frames to finish.
+    const bool submitThread = InterlockedCompareExchange(&g_submitThreadId, 0, 0) == (LONG)GetCurrentThreadId();
+    for (int waited = 0; waited < 50; ++waited) {
+        if (submitThread && TryLockCapture()) {
+            while (PublishOldestStagedPair()) {}
+            UnlockCapture();
+        }
+        if (PendingStagedPairs() < 2) break;
+        Sleep(1);
+    }
+    // The virtual display's rate, on a fixed schedule (a late frame does not push the next ones back).
+    const uint64_t now = PerformanceTicks();
+    const uint64_t period = (uint64_t)(DisplayPeriodSeconds() * (double)PerformanceFrequency());
+    if (g_nextPoseTicks == 0 || now > g_nextPoseTicks + period) g_nextPoseTicks = now;
+    while (PerformanceTicks() + PerformanceFrequency() / 1000 < g_nextPoseTicks) Sleep(1);
+    while (PerformanceTicks() < g_nextPoseTicks) SwitchToThread();
+    g_nextPoseTicks += period;
+    SynthesizePoses(renderPoses, renderPoseCount);
+    SynthesizePoses(gamePoses, gamePoseCount);
+    return true;
 }
 
 static vr::EVRCompositorError VR_CALLTYPE HookedWaitGetPoses(void* self,
@@ -1079,12 +1139,15 @@ static vr::EVRCompositorError VR_CALLTYPE HookedWaitGetPoses(void* self,
     LONG count = InterlockedIncrement(&g_waitLogCount);
     CompositorHook* hook = FindCompositorHook(self);
     const uint64_t waitStart = PerformanceTicks();
-    vr::EVRCompositorError result = hook && hook->waitGetPoses
+    const bool decoupled = DecoupledWait(renderPoses, renderPoseCount, gamePoses, gamePoseCount);
+    vr::EVRCompositorError result = decoupled ? vr::VRCompositorError_None
+        : hook && hook->waitGetPoses
         ? hook->waitGetPoses(self, renderPoses, renderPoseCount, gamePoses, gamePoseCount)
         : vr::VRCompositorError_RequestFailed;
+    if (!decoupled && result == vr::VRCompositorError_None) InterlockedIncrement(&g_realPoseSets);
     InterlockedExchangeAdd64(&g_waitPoseTicks, (LONG64)(PerformanceTicks() - waitStart));
     InterlockedIncrement64(&g_waitPoseCalls);
-    if (result == vr::VRCompositorError_None) {
+    if (result == vr::VRCompositorError_None && !decoupled) {
         RememberRenderPoses(renderPoses, renderPoseCount);
     } else if (result == vr::VRCompositorError_DoNotHaveFocus && InitSharedMemory()) {
         // The compositor returns at once without focus; keep the game at the
@@ -1140,6 +1203,7 @@ static void VR_CALLTYPE HookedPostPresentHandoff(void* self) {
         Log(message);
     }
     CompositorHook* hook = FindCompositorHook(self);
+    if (InterlockedCompareExchange(&g_decoupled, 0, 0)) return;   // (SteamVR gets no frames, see DecoupledPoses)
     if (hook && hook->postPresentHandoff) hook->postPresentHandoff(self);
 }
 
@@ -1274,6 +1338,7 @@ static vr::EVRCompositorError VR_CALLTYPE HookedSubmit(void* self, vr::EVREye ey
         Log(message);
     }
     CaptureSubmit(eye, texture, bounds);
+    if (InterlockedCompareExchange(&g_decoupled, 0, 0)) return vr::VRCompositorError_None;   // (see DecoupledPoses)
     if (texture && texture->eType == vr::TextureType_DirectX) InstallSharedHandleHooks(texture->handle);
     // An OpenGL texture is not forwarded: SteamVR's client would hand it to its
     // D3D11 compositor through WGL_NV_DX_interop, which Wine on macOS lacks. The
