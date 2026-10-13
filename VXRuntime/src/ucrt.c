@@ -338,8 +338,8 @@ static void trace_exit(const char *what, int code, void *ret) {
     const vx_image *m = vx_image_at((uint64_t)(uintptr_t)ret);
     vx_log("%s(%d) from %s+%#llx", what, code, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)ret - m->base) : 0ull);
 }
-static WINAPI void vx_exit(int code) { trace_exit("exit", code, __builtin_return_address(0)); run_atexit(); _exit(code); }
-static WINAPI void vx__exit(int code) { trace_exit("_exit", code, __builtin_return_address(0)); _exit(code); }
+static WINAPI void vx_exit(int code) { trace_exit("exit", code, __builtin_return_address(0)); run_atexit(); vx_profile_finish(); _exit(code); }
+static WINAPI void vx__exit(int code) { trace_exit("_exit", code, __builtin_return_address(0)); vx_profile_finish(); _exit(code); }
 static WINAPI void vx_abort(void) {
     const vx_image *m = vx_image_at((uint64_t)(uintptr_t)__builtin_return_address(0));
     vx_log("the program called abort() from %s+%#llx", m ? m->name : "?", m ? (unsigned long long)((uint8_t *)__builtin_return_address(0) - m->base) : 0ull);

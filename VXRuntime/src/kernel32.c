@@ -82,6 +82,7 @@ static WINAPI void ExitProcess(DWORD code) {
         const vx_image *m = vx_image_at((uint64_t)(uintptr_t)__builtin_return_address(0));
         vx_log("ExitProcess(%u) from %s+%#llx", code, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)__builtin_return_address(0) - m->base) : 0ull);
     }
+    vx_profile_finish();
     fflush(stdout); fflush(stderr); _exit((int)code);
 }
 int vx_process_info(HANDLE h, DWORD *code);

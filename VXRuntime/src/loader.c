@@ -718,6 +718,7 @@ static void make_process_parameters(const char *exe) {
 int main(int argc, char **argv, char **envp) {
     if (argc < 2) { fprintf(stderr, "usage: vxrt program.exe [args...]\n"); return 2; }
     vx_trace = getenv("VXRT_TRACE") && *getenv("VXRT_TRACE") == '1';
+    vx_profile_start();
     vx_kernel32_init();
     vx_system_init();
     vx_desktop_init();

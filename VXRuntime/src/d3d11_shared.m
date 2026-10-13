@@ -276,8 +276,18 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
             owned = 1;
         int gpu_ready = !__atomic_load_n(&e->gpu_pending, __ATOMIC_ACQUIRE) || e->gpu_pid == (int32_t)getpid();   // the releaser's own queue keeps the order
         if (owned && gpu_ready) {
+            vx_profile_held(1);
             if (g_keyed_stats) { keyed_stats(why, &start); g_acquired[t->shared - 1] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
-            if (getenv("VXRT_TRACE_KEYED")) { vx_log("keyed mutex slot %d: AcquireSync(%llu) by %d", t->shared - 1, (unsigned long long)key, (int)getpid()); vx_keyed_held++; g_held_since = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+            if (getenv("VXRT_TRACE_KEYED")) {
+                char from[160] = ""; size_t len = 0;           // the program's return addresses on the stack
+                uint64_t *sp = __builtin_frame_address(0);
+                for (int i = 0, found = 0; i < 400 && found < 4; i++) {
+                    const vx_image *m = vx_image_at(sp[i]);
+                    if (m) { len += (size_t)snprintf(from + len, sizeof from - len, " %s+%#llx", m->name, (unsigned long long)(sp[i] - (uint64_t)(uintptr_t)m->base)); found++; }
+                }
+                vx_log("keyed mutex slot %d: AcquireSync(%llu) by %d, from%s", t->shared - 1, (unsigned long long)key, (int)getpid(), from);
+                vx_keyed_held++; g_held_since = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            }
             return S_OK;
         }
         if (!why) why = owned || !gpu_ready ? 1 : (uint64_t)e->key != key ? 2 : 3;
@@ -319,6 +329,7 @@ static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
     static int sync_release = -1;
     if (sync_release < 0) sync_release = getenv("VXRT_SYNC_RELEASE") && atoi(getenv("VXRT_SYNC_RELEASE"));
     shared_slot *slot_e = &table()->s[t->shared - 1];
+    vx_profile_held(-1);
     if (g_keyed_stats > 0) hold_stats(t->shared - 1);
     if (vx_keyed_held) vx_keyed_held--;
     if (!sync_release && !getenv("VXRT_SHARED_SNAPSHOT")) {

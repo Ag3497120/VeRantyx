@@ -726,6 +726,12 @@ static id<MTLRenderCommandEncoder> render_pass(d3d_context *c, id<MTLTexture> ex
     for (int i = 0; i < 8 && same; i++) same = c->render_rtv[i] == c->rtv[i];
     if (same) return (__bridge id<MTLRenderCommandEncoder>)c->render;
     d3d_end_render(c);
+    // Work recorded so far goes to the GPU every so many draws, between render passes, as Windows drivers send it
+    // while the program records: the GPU otherwise idled until the frame's end (ReleaseSync, Present) and then ran
+    // the whole frame, after the CPU (VXRT_FLUSH_DRAWS: how many; 0: only when the program flushes).
+    static int every = -1;
+    if (every < 0) every = getenv("VXRT_FLUSH_DRAWS") ? atoi(getenv("VXRT_FLUSH_DRAWS")) : 0;   // (being measured: off by default)
+    if (every > 0 && c->unsent >= (uint32_t)every && c == (d3d_context *)c->base.dev->context && c->cmd) d3d_flush(c->base.dev, 0);
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     int any = 0;
     for (int i = 0; i < 8; i++) {
@@ -755,6 +761,7 @@ static id<MTLRenderCommandEncoder> render_pass(d3d_context *c, id<MTLTexture> ex
     }
     state_of(c)->pass_depth = (__bridge void *)extra_depth;
     if (!any) return nil;
+    if (c->nclears) d3d_clears_into_pass(c, (__bridge void *)rp, c->rtv, c->dsv);
     id<MTLRenderCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) renderCommandEncoderWithDescriptor:rp];
     c->render = (void *)CFBridgingRetain(enc);
     memset(&state_of(c)->bound, 0, sizeof state_of(c)->bound);
@@ -913,6 +920,7 @@ static void trace_draw(d3d_context *c, d3d_draw_state *s) {
 }
 static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *type) {
     HELD_OP(0);
+    c->unsent++;
     d3d_draw_state *s = state_of(c);
     if (!s->shader[STAGE_VS]) return nil;
     trace_draw(c, s);
@@ -1183,6 +1191,7 @@ static WINAPI void ctx_draw_indexed_instanced(void *this, uint32_t count, uint32
 static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) {
     d3d_context *c = this;
     HELD_OP(1);
+    c->unsent++;
     d3d_draw_state *s = state_of(c);
     d3d_shader *cs = s->shader[STAGE_CS];
     if (!cs || !x || !y || !z) return;
@@ -1325,8 +1334,10 @@ static WINAPI void ctx_resolve(void *this, d3d_object *dst, uint32_t dst_sub, d3
 // ---- queries and predicates -------------------------------------------------------------------------------------------------
 // D3D11_QUERY_DESC: type, flags. Results are ready once the GPU has finished the command buffer that was being
 // recorded when the query ended. Occlusion counts report everything visible (nothing is culled wrongly);
-// timestamps are the CPU's nanosecond clock at the end, with a 1 GHz frequency.
-typedef struct { d3d_object base; uint32_t desc[2]; uint64_t target, stamp; int ended; } d3d_query;
+// timestamps are when the GPU finished the work recorded before them (the command buffer is sent at the query, and
+// its end time taken; the host clock in ns, as QueryPerformanceCounter, at a 1 GHz frequency): SteamVR's compositor
+// and Alyx time their GPU work with them (CPU times made the compositor misjudge when to start composing).
+typedef struct { d3d_object base; uint32_t desc[2]; uint64_t target, stamp, issued; int ended; } d3d_query;
 static void **g_query_vtbl, **g_predicate_vtbl;
 static WINAPI HRESULT query_qi(void *this, const GUID *iid, void **out) {
     d3d_query *q = this;
@@ -1365,8 +1376,22 @@ static WINAPI void ctx_end(void *this, d3d_query *q) {
     // The command buffer being recorded, or (none open) the work already committed: an event query after a
     // flush must not wait for work that may never come.
     q->target = __atomic_load_n(&c->base.dev->submitted, __ATOMIC_ACQUIRE) + (imm->cmd ? 1 : 0);
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    q->stamp = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    static int stats = -1;                               // VXRT_STATS: queries ended, by type, every 2000
+    static uint64_t ends[8], all;
+    if (stats < 0) stats = getenv("VXRT_STATS") != NULL;
+    if (stats) {
+        ends[q->desc[0] & 7]++;
+        if (++all % 2000 == 0) vx_log("queries ended: %llu event, %llu occlusion, %llu timestamp, %llu disjoint, %llu other",
+                                      (unsigned long long)ends[0], (unsigned long long)ends[1], (unsigned long long)ends[2], (unsigned long long)ends[3],
+                                      (unsigned long long)(all - ends[0] - ends[1] - ends[2] - ends[3]));
+    }
+    q->stamp = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);     // (the host clock, as QueryPerformanceCounter)
+    if (q->desc[0] == 2 && c == imm && getenv("VXRT_GPU_TIMESTAMPS")) {   // (being measured: CPU times by default)
+        if (imm->cmd) d3d_flush(c->base.dev, 0);             // the work so far, in a command buffer of its own
+        q->target = __atomic_load_n(&c->base.dev->submitted, __ATOMIC_ACQUIRE);
+        q->issued = q->stamp;                                 // (the GPU cannot reach it earlier)
+        q->stamp = 0;                                         // (taken from that buffer's end when it is done)
+    }
     q->ended = 1;
 }
 #define D3D11_ASYNC_GETDATA_DONOTFLUSH 1
@@ -1388,7 +1413,13 @@ static WINAPI HRESULT ctx_get_data(void *this, d3d_query *q, void *data, uint32_
     switch (q->desc[0]) {
     case 0: case 5: *(uint32_t *)out = 1; break;
     case 1: *(uint64_t *)out = 1000000; break;
-    case 2: *(uint64_t *)out = q->stamp; break;
+    case 2:
+        if (!q->stamp) {
+            q->stamp = q->target ? d3d_gpu_end_ns(dev, q->target) : 0;
+            if (!q->stamp) q->stamp = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);   // (long gone from the ring, or nothing ran yet)
+            if (q->stamp < q->issued) q->stamp = q->issued;   // the GPU was idle: it got there when it was issued
+        }
+        *(uint64_t *)out = q->stamp; break;
     }
     memcpy(data, out, MIN(size, query_size(q->desc[0])));
     return S_OK;

@@ -440,9 +440,14 @@ static d3d_view *make_view(d3d_device *dev, int kind, void **vtbl, d3d_object *r
 }
 
 // ---- the immediate context ----------------------------------------------------------------------------------------------------------
-static id<MTLCommandBuffer> context_cmd(d3d_context *c) {
+static id<MTLCommandBuffer> raw_cmd(d3d_context *c) {
     if (!c->cmd) c->cmd = (void *)CFBridgingRetain([(__bridge id<MTLCommandQueue>)c->base.dev->queue commandBuffer]);
     return (__bridge id<MTLCommandBuffer>)c->cmd;
+}
+// The command buffer to encode into; clears still pending go first (whatever comes may read their targets).
+static id<MTLCommandBuffer> context_cmd(d3d_context *c) {
+    if (c->nclears) d3d_clears_flush(c);
+    return raw_cmd(c);
 }
 void *d3d_context_cmd(d3d_context *c) { return (__bridge void *)context_cmd(c); }
 // Clears, copies and uploads are separate passes: the render pass in progress ends first.
@@ -509,9 +514,14 @@ static HRESULT wait_gpu(d3d_context *c, d3d_object *o, uint32_t flags) {
     }
     return S_OK;
 }
+uint64_t d3d_gpu_end_ns(d3d_device *dev, uint64_t seq) {
+    uint64_t ns = dev->gpu_end_ns[seq % 64];
+    return __atomic_load_n(&dev->gpu_end_seq[seq % 64], __ATOMIC_ACQUIRE) == seq ? ns : 0;
+}
 void d3d_flush(d3d_device *dev, int wait) {
     d3d_context *c = (d3d_context *)dev->context;
     d3d_end_render(c);
+    if (c->nclears) d3d_clears_flush(c);
     if (!c->cmd) {
         if (wait) {                                             // still wait for work committed earlier
             id<MTLCommandBuffer> fence = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
@@ -522,9 +532,16 @@ void d3d_flush(d3d_device *dev, int wait) {
     }
     id<MTLCommandBuffer> cmd = CFBridgingRelease(c->cmd);
     c->cmd = NULL;
+    c->unsent = 0;
     uint64_t seq = __atomic_add_fetch(&dev->submitted, 1, __ATOMIC_ACQ_REL);
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
         gpu_stats(done.GPUStartTime, done.GPUEndTime);
+        // GPUEndTime is host time in seconds (mach_absolute_time, as QueryPerformanceCounter); an empty command
+        // buffer reports 0: then the time it was found done.
+        double end = done.GPUEndTime;
+        uint64_t ns = end > 0 ? (uint64_t)(end * 1e9) : clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        dev->gpu_end_ns[seq % 64] = ns;
+        __atomic_store_n(&dev->gpu_end_seq[seq % 64], seq, __ATOMIC_RELEASE);
         uint64_t prev = __atomic_load_n(&dev->completed, __ATOMIC_ACQUIRE);
         while (prev < seq && !__atomic_compare_exchange_n(&dev->completed, &prev, seq, 1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
         if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&dev->completed, 8, OS_SYNC_WAKE_BY_ADDRESS_NONE);
@@ -570,16 +587,81 @@ static void clear_pass(d3d_context *c, d3d_view *v, const float *color, int dept
         }
     }
     d3d_end_render(c);
-    [[context_cmd(c) renderCommandEncoderWithDescriptor:rp] endEncoding];
+    [[raw_cmd(c) renderCommandEncoderWithDescriptor:rp] endEncoding];
+}
+// Clears wait for the render pass that draws to their target, which then starts from the clear values (its load
+// action) instead of loading what a pass of its own wrote: on Apple's tile-based GPUs that saves writing the whole
+// target out and reading it back in, per clear (at 3K, tens of megabytes each). Anything else that goes to the GPU
+// first does them as passes of their own. VXRT_EAGER_CLEARS=1: always passes of their own.
+void d3d_clears_flush(d3d_context *c) {
+    while (c->nclears) {
+        d3d_pending_clear p = c->clears[0];
+        memmove(c->clears, c->clears + 1, (size_t)--c->nclears * sizeof *c->clears);
+        clear_pass(c, p.v, p.is_color ? p.color : NULL, p.clear_depth, p.depth, p.clear_stencil, p.stencil);
+        d3d_release(&p.v->base);
+    }
+}
+static int same_target(const d3d_view *a, const d3d_view *b) {
+    return a && b && a->resource == b->resource && a->mip == b->mip && a->first_slice == b->first_slice && a->format == b->format &&
+           a->slices <= 1 && b->slices <= 1;
+}
+void d3d_clears_into_pass(d3d_context *c, void *descriptor, d3d_view *const *rtvs, d3d_view *dsv) {
+    MTLRenderPassDescriptor *rp = (__bridge MTLRenderPassDescriptor *)descriptor;
+    for (int i = 0; i < c->nclears; ) {
+        d3d_pending_clear *p = &c->clears[i];
+        int used = 0;
+        if (p->is_color) {
+            for (int k = 0; k < 8 && !used; k++)
+                if (same_target(p->v, rtvs[k]) && rp.colorAttachments[k].texture) {
+                    rp.colorAttachments[k].loadAction = MTLLoadActionClear;
+                    rp.colorAttachments[k].clearColor = MTLClearColorMake(p->color[0], p->color[1], p->color[2], p->color[3]);
+                    used = 1;
+                }
+        } else if (same_target(p->v, dsv)) {
+            if (p->clear_depth && rp.depthAttachment.texture) { rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.clearDepth = p->depth; }
+            if (p->clear_stencil && rp.stencilAttachment.texture) { rp.stencilAttachment.loadAction = MTLLoadActionClear; rp.stencilAttachment.clearStencil = p->stencil; }
+            used = (!p->clear_depth || rp.depthAttachment.texture) && (!p->clear_stencil || rp.stencilAttachment.texture);
+        }
+        if (!used) { i++; continue; }
+        d3d_release(&p->v->base);
+        memmove(p, p + 1, (size_t)(--c->nclears - i) * sizeof *p);
+    }
+}
+static int g_eager_clears = -1;
+static void clear_later(d3d_context *c, d3d_view *v, const float *color, int depth, float depth_value, int stencil, uint8_t stencil_value) {
+    if (g_eager_clears < 0) g_eager_clears = getenv("VXRT_EAGER_CLEARS") != NULL;
+    if (g_eager_clears || c != (d3d_context *)c->base.dev->context || v->slices > 1) {
+        if (c->nclears) d3d_clears_flush(c);               // (in order)
+        clear_pass(c, v, color, depth, depth_value, stencil, stencil_value);
+        return;
+    }
+    if (((__bridge id<MTLTexture>)((d3d_texture *)v->resource)->mtl).pixelFormat != MTLPixelFormatDepth32Float_Stencil8) stencil = 0;   // (none to clear)
+    if (!color && !depth && !stencil) return;
+    d3d_end_render(c);                                     // (a pass drawing to it now would not see the clear)
+    for (int i = 0; i < c->nclears; i++) {                 // a later clear of the same target replaces (or adds to) the earlier
+        d3d_pending_clear *p = &c->clears[i];
+        if (p->v->resource != v->resource || p->v->mip != v->mip || p->v->first_slice != v->first_slice || p->v->format != v->format || p->is_color != (color != NULL)) continue;
+        if (color) memcpy(p->color, color, sizeof p->color);
+        if (depth) { p->clear_depth = 1; p->depth = depth_value; }
+        if (stencil) { p->clear_stencil = 1; p->stencil = stencil_value; }
+        return;
+    }
+    if (c->nclears == 9) d3d_clears_flush(c);
+    d3d_pending_clear *p = &c->clears[c->nclears++];
+    memset(p, 0, sizeof *p);
+    p->v = v; d3d_addref(&v->base);
+    if (color) { p->is_color = 1; memcpy(p->color, color, sizeof p->color); }
+    p->clear_depth = (uint8_t)(depth != 0); p->depth = depth_value;
+    p->clear_stencil = (uint8_t)(stencil != 0); p->stencil = stencil_value;
 }
 static WINAPI void ctx_clear_rtv(void *this, d3d_view *v, const float color[4]) {
     static int traced;
     if (getenv("VXRT_TRACE_DRAWS") && v && v->resource->kind == K_TEXTURE && ((d3d_texture *)v->resource)->desc[TD_WIDTH] != 2048 && traced++ < 40)
         vx_log("ClearRenderTargetView %ux%u to (%g, %g, %g, %g)", ((d3d_texture *)v->resource)->desc[TD_WIDTH], ((d3d_texture *)v->resource)->desc[TD_HEIGHT], color[0], color[1], color[2], color[3]);
-    if (v && v->resource->kind == K_TEXTURE) clear_pass(this, v, color, 0, 0, 0, 0);
+    if (v && v->resource->kind == K_TEXTURE) clear_later(this, v, color, 0, 0, 0, 0);
 }
 static WINAPI void ctx_clear_dsv(void *this, d3d_view *v, uint32_t flags, float depth, uint8_t stencil) {
-    if (v && v->resource->kind == K_TEXTURE) clear_pass(this, v, NULL, flags & 1, depth, flags & 2, stencil);
+    if (v && v->resource->kind == K_TEXTURE && (flags & 3)) clear_later(this, v, NULL, flags & 1, depth, flags & 2, stencil);
 }
 static void hold(d3d_view **slot, d3d_view *v) {
     if (v) d3d_addref(&v->base);
@@ -924,6 +1006,7 @@ static WINAPI uint32_t ctx_get_flags(void *this) { (void)this; return 0; }
 static void context_destroy(d3d_object *o) {
     d3d_context *c = (d3d_context *)o;
     d3d_end_render(c);
+    while (c->nclears) d3d_release(&c->clears[--c->nclears].v->base);
     d3d_draw_release(c);
     ctx_om_set_render_targets(c, 0, NULL, NULL);
     if (c->cmd) CFBridgingRelease(c->cmd);

@@ -141,6 +141,35 @@ int main(int argc, char **argv) {
     CHECK(ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)disjoint, &dj, sizeof dj, 0) == S_OK && dj.Frequency && !dj.Disjoint);
     UINT64 ts = 0;
     CHECK(ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)stamp, &ts, sizeof ts, 0) == S_OK && ts);
+    // Timestamps are on QueryPerformanceCounter's clock; with VXRT_GPU_TIMESTAMPS=1 they are the GPU's, apart by the
+    // GPU time of the work between them (copies: clears of one target may be folded into one).
+    {
+        ID3D11Query *before = NULL, *after = NULL;
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        CHECK(SUCCEEDED(ID3D11Device_CreateQuery(dev, &qd, &before)) && SUCCEEDED(ID3D11Device_CreateQuery(dev, &qd, &after)));
+        D3D11_TEXTURE2D_DESC bigd = { 4096, 4096, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0 };
+        ID3D11Texture2D *big = NULL, *big2 = NULL; ID3D11RenderTargetView *bigv = NULL;
+        CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &bigd, NULL, &big)) && SUCCEEDED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)big, NULL, &bigv)));
+        CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &bigd, NULL, &big2)));
+        ID3D11DeviceContext_ClearRenderTargetView(ctx, bigv, grey);
+        LARGE_INTEGER q0, q1, freq;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&q0);
+        ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)before);
+        for (int i = 0; i < 20; i++) ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)(i & 1 ? big : big2), (ID3D11Resource *)(i & 1 ? big2 : big));
+        ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)after);
+        UINT64 t0 = 0, t1 = 0;
+        for (polls = 0; ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)after, &t1, sizeof t1, 0) == S_FALSE && polls < 2000; polls++) Sleep(1);
+        QueryPerformanceCounter(&q1);
+        CHECK(ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)before, &t0, sizeof t0, 0) == S_OK);
+        double gpu_ms = (double)(t1 - t0) / dj.Frequency * 1000.0;
+        double q0s = (double)q0.QuadPart / freq.QuadPart, q1s = (double)q1.QuadPart / freq.QuadPart;
+        CHECK(t1 >= t0 && (!getenv("VXRT_GPU_TIMESTAMPS") || gpu_ms > 0.05));
+        CHECK((double)t0 / dj.Frequency >= q0s - 0.001 && (double)t1 / dj.Frequency <= q1s + 0.001);
+        printf("  20 copies of 4096x4096 took %.2f ms on the GPU (%.6f .. %.6f, QPC %.6f .. %.6f)\n", gpu_ms, (double)t0 / dj.Frequency, (double)t1 / dj.Frequency, q0s, q1s);
+        ID3D11RenderTargetView_Release(bigv); ID3D11Texture2D_Release(big); ID3D11Texture2D_Release(big2);
+        ID3D11Query_Release(before); ID3D11Query_Release(after);
+    }
     ID3D11Query_Release(event); ID3D11Query_Release(disjoint); ID3D11Query_Release(stamp);
     ID3D11RenderTargetView_Release(off); ID3D11Texture2D_Release(offtex);
 

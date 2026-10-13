@@ -73,7 +73,10 @@ struct d3d_device {
     volatile uint64_t submitted, completed;   // command buffers committed, and the last one the GPU finished
     int apple_family;                // Metal's Apple GPU family: 7 = M1, 8 = M2, 9 = M3/M4, 10 = M5 and later (0: other)
     void *slices;                    // chunks small renamed buffers are carved from (d3d11.m)
+    volatile uint64_t gpu_end_seq[64], gpu_end_ns[64];   // when the GPU finished recent command buffers (by sequence
+                                                         // number, host clock ns): timestamp queries (d3d11_draw.m)
 };
+uint64_t d3d_gpu_end_ns(d3d_device *dev, uint64_t seq);  // that time, or 0 if not known (d3d11.m)
 int d3d_apple_family(void *mtl_device);   // d3d11.m
 typedef struct {
     d3d_object base;                 // ID3D11Texture2D (or 1D, 3D)
@@ -104,6 +107,8 @@ typedef struct {
 void d3d_view_release_mtl(d3d_view *v);
 void d3d_view_get_desc(const d3d_view *v, int which, uint32_t *out);   // 0 SRV, 1 RTV, 2 DSV, 3 UAV
 struct d3d_draw_state;
+// A clear not done yet (see d3d11.m): the view (held), and what to clear it to.
+typedef struct { d3d_view *v; float color[4]; float depth; uint8_t stencil; uint8_t is_color, clear_depth, clear_stencil; } d3d_pending_clear;
 typedef struct {
     d3d_object base;                 // ID3D11DeviceContext
     void *cmd;                       // the command buffer being recorded (retained), or NULL
@@ -113,7 +118,14 @@ typedef struct {
     float viewport[16 * 6];          // RSSetViewports: up to 16 (x, y, width, height, min depth, max depth)
     uint32_t nviewports;
     struct d3d_draw_state *draw;     // shaders, buffers, states (d3d11_draw.m)
+    uint32_t unsent;                 // draws and dispatches recorded since the command buffer last went to the GPU
+    d3d_pending_clear clears[9];     // clears waiting for the next render pass (its load action) or other GPU work
+    int nclears;
 } d3d_context;
+void d3d_clears_flush(d3d_context *c);                                   // does the pending clears as passes of their own
+// The pending clears the render pass being made can do as its load actions (d3d11.m): marks those attachments
+// MTLLoadActionClear with the values and forgets the clears.
+void d3d_clears_into_pass(d3d_context *c, void *render_pass_descriptor, d3d_view *const *rtvs, d3d_view *dsv);
 
 void d3d_vtable_override(void **vt, const char *const *names, int count, const d3d_method *impl);
 #define D3D_VTABLE_OVERRIDE(vt, iface, impl) d3d_vtable_override(vt, vt_##iface, VT_COUNT_##iface, impl)

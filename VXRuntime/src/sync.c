@@ -697,10 +697,16 @@ static WINAPI DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, 
         char name[96];
         snprintf(name, sizeof name, "%s", o && o->name ? o->name : "");
         pthread_mutex_unlock(&g_lock);
-        void *ret = __builtin_return_address(0);
-        const vx_image *m = vx_image_at((uint64_t)(uintptr_t)ret);
-        vx_log("holding a keyed mutex, waited %.2f ms for %u object(s), first of type %d '%s' (timeout %d), result %u, from %s+%#llx",
-               d / 1e6, (unsigned)n, type, name, (int)ms, (unsigned)r, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)ret - m->base) : 0ull);
+        char from[160] = ""; size_t len = 0;                 // the program's return addresses on the stack
+        uint64_t *sp = __builtin_frame_address(0);
+        for (int i = 0, found = 0; i < 400 && found < 4; i++) {
+            const vx_image *m = vx_image_at(sp[i]);
+            if (!m) continue;
+            len += (size_t)snprintf(from + len, sizeof from - len, " %s+%#llx", m->name, (unsigned long long)(sp[i] - (uint64_t)(uintptr_t)m->base));
+            found++;
+        }
+        vx_log("holding a keyed mutex, waited %.2f ms for %u object(s), first of type %d '%s' (timeout %d), result %u, from%s",
+               d / 1e6, (unsigned)n, type, name, (int)ms, (unsigned)r, from);
     }
     return r;
 }
@@ -1016,30 +1022,47 @@ static WINAPI BOOL TryAcquireSRWLockShared(void *l) { return pthread_rwlock_tryr
 
 // ---- condition variables ------------------------------------------------------------------------------------------------------
 // A CONDITION_VARIABLE (one pointer) holds a wake counter. A sleeper reads it while still holding its lock, so a
-// wake that comes after the caller checked its predicate always changes the counter and is never missed. Every
-// wake wakes all sleepers (Windows allows spurious wakeups).
-static pthread_mutex_t g_cv_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_cv_changed = PTHREAD_COND_INITIALIZER;
+// wake that comes after the caller checked its predicate always changes the counter and is never missed. Sleepers
+// wait in one of 256 queues chosen by the variable's address, and a wake wakes that queue (Windows allows spurious
+// wakeups): with one queue for the process, every wake of a job system's condition variable woke every sleeping
+// thread, and they fought over its lock (a quarter of a game's CPU time in Half-Life: Alyx).
+typedef struct { pthread_mutex_t lock; pthread_cond_t changed; } wait_queue;
+static wait_queue g_cv_queues[256];
+static pthread_once_t g_queues_once = PTHREAD_ONCE_INIT;
+static wait_queue g_addr_queues[256];
+static void queues_init(void) {
+    for (int i = 0; i < 256; i++) {
+        pthread_mutex_init(&g_cv_queues[i].lock, NULL); pthread_cond_init(&g_cv_queues[i].changed, NULL);
+        pthread_mutex_init(&g_addr_queues[i].lock, NULL); pthread_cond_init(&g_addr_queues[i].changed, NULL);
+    }
+}
+static wait_queue *queue_of(wait_queue *queues, const volatile void *addr) {
+    pthread_once(&g_queues_once, queues_init);
+    uintptr_t a = (uintptr_t)addr >> 3;
+    return &queues[(a ^ (a >> 8) ^ (a >> 16)) & 255];
+}
 
 static int cv_sleep(uint64_t *cv, uint64_t seen, DWORD ms) {
     struct timespec deadline;
     if (ms != INFINITE) deadline_after(&deadline, ms);
     int woken = 1;
-    pthread_mutex_lock(&g_cv_lock);
+    wait_queue *q = queue_of(g_cv_queues, cv);
+    pthread_mutex_lock(&q->lock);
     while (__atomic_load_n(cv, __ATOMIC_ACQUIRE) == seen) {
-        if (ms == INFINITE) pthread_cond_wait(&g_cv_changed, &g_cv_lock);
-        else if (ms == 0 || pthread_cond_timedwait(&g_cv_changed, &g_cv_lock, &deadline) == ETIMEDOUT) { woken = 0; break; }
+        if (ms == INFINITE) pthread_cond_wait(&q->changed, &q->lock);
+        else if (ms == 0 || pthread_cond_timedwait(&q->changed, &q->lock, &deadline) == ETIMEDOUT) { woken = 0; break; }
     }
-    pthread_mutex_unlock(&g_cv_lock);
+    pthread_mutex_unlock(&q->lock);
     if (!woken) vx_set_last_error(1460 /* ERROR_TIMEOUT */);
     return woken;
 }
 static WINAPI void InitializeConditionVariable(uint64_t *cv) { *cv = 0; }
 static WINAPI void WakeAllConditionVariable(uint64_t *cv) {
-    pthread_mutex_lock(&g_cv_lock);
+    wait_queue *q = queue_of(g_cv_queues, cv);
+    pthread_mutex_lock(&q->lock);
     __atomic_add_fetch(cv, 1, __ATOMIC_RELEASE);
-    pthread_cond_broadcast(&g_cv_changed);
-    pthread_mutex_unlock(&g_cv_lock);
+    pthread_cond_broadcast(&q->changed);
+    pthread_mutex_unlock(&q->lock);
 }
 static WINAPI void WakeConditionVariable(uint64_t *cv) { WakeAllConditionVariable(cv); }
 static WINAPI BOOL SleepConditionVariableCS(uint64_t *cv, void *cs, DWORD ms) {
@@ -1353,28 +1376,27 @@ static WINAPI BOOL CancelIo(HANDLE file) { (void)file; return 1; }
 static WINAPI BOOL CancelIoEx(HANDLE file, void *ov) { (void)file; (void)ov; vx_set_last_error(1168 /* ERROR_NOT_FOUND */); return 0; }
 
 // ---- WaitOnAddress -----------------------------------------------------------------------------------------------------------------
-// Waiters sleep while the value at the address still equals the compare value; every wake wakes all waiters
-// (spurious wakeups are allowed), which then re-check.
-static pthread_mutex_t g_addr_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_addr_changed = PTHREAD_COND_INITIALIZER;
+// Waiters sleep while the value at the address still equals the compare value, in the queue of the address (as
+// condition variables); a wake wakes that queue (spurious wakeups are allowed), whose waiters then re-check.
 static WINAPI BOOL WaitOnAddress(volatile void *addr, const void *cmp, size_t size, DWORD ms) {
     struct timespec deadline;
     if (ms != INFINITE) deadline_after(&deadline, ms);
     BOOL ok = 1;
-    pthread_mutex_lock(&g_addr_lock);
+    wait_queue *q = queue_of(g_addr_queues, addr);
+    pthread_mutex_lock(&q->lock);
     while (!memcmp((const void *)addr, cmp, size)) {
-        if (ms == INFINITE) pthread_cond_wait(&g_addr_changed, &g_addr_lock);
-        else if (ms == 0 || pthread_cond_timedwait(&g_addr_changed, &g_addr_lock, &deadline) == ETIMEDOUT) { ok = 0; break; }
+        if (ms == INFINITE) pthread_cond_wait(&q->changed, &q->lock);
+        else if (ms == 0 || pthread_cond_timedwait(&q->changed, &q->lock, &deadline) == ETIMEDOUT) { ok = 0; break; }
     }
-    pthread_mutex_unlock(&g_addr_lock);
+    pthread_mutex_unlock(&q->lock);
     if (!ok) vx_set_last_error(1460);
     return ok;
 }
 static WINAPI void WakeByAddressAll(void *addr) {
-    (void)addr;
-    pthread_mutex_lock(&g_addr_lock);
-    pthread_cond_broadcast(&g_addr_changed);
-    pthread_mutex_unlock(&g_addr_lock);
+    wait_queue *q = queue_of(g_addr_queues, addr);
+    pthread_mutex_lock(&q->lock);
+    pthread_cond_broadcast(&q->changed);
+    pthread_mutex_unlock(&q->lock);
 }
 static WINAPI void WakeByAddressSingle(void *addr) { WakeByAddressAll(addr); }
 

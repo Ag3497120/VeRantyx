@@ -68,6 +68,9 @@ if [[ "${VXRT_VR_QUALITY:-}" == 3k ]]; then
     # A 72 Hz virtual display: frames this size miss 60 Hz, and SteamVR then halves the game's rate to 30;
     # at 72 Hz it holds 36 (measured 35-38 fps on an M1 Max, against 30-33 at 60 Hz and 31-35 at 90 Hz).
     export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-72}"
+    # SteamVR does not hold the game back by whole frames when it misses one (it switched into that mode now and
+    # then: 45 fps fell to 30 for the rest of the run).
+    VXRT_VR_SETTINGS="${VXRT_VR_SETTINGS:-{\"steamvr\": {\"framesToThrottle\": 0, \"additionalFramesToPredict\": 0}}}"
 fi
 if [[ -n "${VXRT_VR_RENDER_SCALE:-}" ]]; then
     export VERANTYX_RENDER_SCALE="$VXRT_VR_RENDER_SCALE"
@@ -80,7 +83,8 @@ if [[ -n "${VXRT_VR_RENDER_SCALE:-}" ]]; then
     cp -p "$DRIVER_DLL" "$OVERLAY_DRIVER/driver_verantyx.dll"
 fi
 
-python3 - "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" "$VXRT_VR_NO_STANDBY" "${VXRT_VR_RENDER_SCALE:-}" <<'EOF'
+# VXRT_VR_SETTINGS='{"steamvr": {"framesToThrottle": 0}}': settings merged in, section by section (experiments).
+python3 - "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" "$VXRT_VR_NO_STANDBY" "${VXRT_VR_RENDER_SCALE:-}" "${VXRT_VR_SETTINGS:-}" <<'EOF'
 import json, sys
 settings = json.load(open(sys.argv[1]))
 settings.setdefault("steamvr", {})["allowDisplayLockedMode"] = True
@@ -88,6 +92,8 @@ if sys.argv[4]:   # the driver's render size as given (SteamVR's automatic resol
     settings["steamvr"].update({"supersampleManualOverride": True, "supersampleScale": 1.0})
 if sys.argv[3] == "1":
     settings.setdefault("power", {}).update({"pauseCompositorOnStandby": False, "turnOffScreensTimeout": 3600.0})
+for section, values in (json.loads(sys.argv[5]) if sys.argv[5] else {}).items():
+    settings.setdefault(section, {}).update(values)
 json.dump(settings, open(sys.argv[2], "w"), indent=3)
 EOF
 

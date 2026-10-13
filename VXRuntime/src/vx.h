@@ -52,6 +52,9 @@ typedef struct {
 } vx_image;
 const vx_image *vx_image_at(uint64_t pc);    // the image containing an address, or NULL
 int vx_image_list(const vx_image **out, int cap);   // the loaded images (all of them is the return value)
+void vx_profile_start(void);                 // profile.c: VXRT_PROFILE=file, a sampling profiler
+void vx_profile_held(int delta);             // a keyed mutex taken (+1) or released (-1) by this thread
+void vx_profile_finish(void);                // writes the report now (ExitProcess)
 
 // TEB layout (the fields Windows code reads directly). Allocated per thread, 8 KB.
 enum {
