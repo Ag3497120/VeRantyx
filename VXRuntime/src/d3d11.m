@@ -35,15 +35,19 @@ void **d3d_vtable(const char *const *names, void *const *stubs, int count, const
     }
     return vt;
 }
+static int64_t g_live[16];                         // (VXRT_STATS: live objects by kind)
+static int64_t g_chunks, g_pooled_bytes, g_fresh_bytes;   // (VXRT_STATS: buffer memory, below)
 void *d3d_alloc(size_t size, int kind, void **vtbl, d3d_device *dev) {
     d3d_object *o = calloc(1, size);
     o->vtbl = vtbl; o->refs = 1; o->kind = kind; o->dev = dev;
+    __atomic_add_fetch(&g_live[kind & 15], 1, __ATOMIC_RELAXED);
     return o;
 }
 uint32_t d3d_addref(d3d_object *o) { return (uint32_t)__sync_add_and_fetch(&o->refs, 1); }
 uint32_t d3d_release(d3d_object *o) {
     LONG r = __sync_sub_and_fetch(&o->refs, 1);
     if (r == 0) {
+        __atomic_sub_fetch(&g_live[o->kind & 15], 1, __ATOMIC_RELAXED);
         if (o->destroy) o->destroy(o);
         while (o->pdata) { pdata *p = o->pdata; o->pdata = p->next; free(p->data); free(p); }
         free(o);
@@ -514,6 +518,14 @@ static void gpu_stats(double start, double end) {
     if (!since) since = start;
     if (end - since >= 2.0) {
         vx_log("GPU: busy %.0f%% of the last %.1f s with this process's work", 100 * busy / (end - since), end - since);
+        static double objects_at;
+        if (end - objects_at >= 10) {                          // every 10 s: what is alive
+            objects_at = end;
+            vx_log("buffer memory: %lld chunks of 4 MB, %lld MB pooled, %lld MB made by renames", (long long)g_chunks, (long long)(g_pooled_bytes >> 20), (long long)(g_fresh_bytes >> 20));
+            vx_log("objects: textures %lld buffers %lld rtv %lld dsv %lld srv %lld uav %lld shaders %lld layouts %lld states %lld",
+                   (long long)g_live[K_TEXTURE], (long long)g_live[K_BUFFER], (long long)g_live[K_RTV], (long long)g_live[K_DSV],
+                   (long long)g_live[K_SRV], (long long)g_live[K_UAV], (long long)g_live[K_SHADER], (long long)g_live[K_LAYOUT], (long long)g_live[K_STATE]);
+        }
         busy = 0; since = end;
     }
 }
@@ -557,7 +569,20 @@ uint64_t d3d_gpu_end_ns(d3d_device *dev, uint64_t seq) {
     uint64_t ns = dev->gpu_end_ns[seq % 64];
     return __atomic_load_n(&dev->gpu_end_seq[seq % 64], __ATOMIC_ACQUIRE) == seq ? ns : 0;
 }
+// Program threads have no autorelease pool of their own (they never go back to a run loop), so Metal's autoreleased
+// objects (command buffers with their memory, encoders, pass descriptors) stayed for the thread's life: about one
+// GPU allocation a frame, 4 MB/s at 2.5K. A thread that submits work gets a pool, emptied after each submission
+// (d3d_flush is never called inside an @autoreleasepool block, which a pop here would end too).
+void *objc_autoreleasePoolPush(void);
+void objc_autoreleasePoolPop(void *pool);
+static __thread void *t_pool;
+static void flush_work(d3d_device *dev, int wait);
 void d3d_flush(d3d_device *dev, int wait) {
+    flush_work(dev, wait);
+    if (t_pool) objc_autoreleasePoolPop(t_pool);
+    t_pool = objc_autoreleasePoolPush();
+}
+static void flush_work(d3d_device *dev, int wait) {
     d3d_context *c = (d3d_context *)dev->context;
     d3d_end_render(c);
     if (c->nclears) d3d_clears_flush(c);
@@ -902,7 +927,8 @@ static id<MTLBuffer> take_buffer(d3d_device *dev, size_t len) {
     void *ref = NULL;
     if (b && b->count && b->q[b->head].seq <= done) { ref = b->q[b->head].buf; b->head = (b->head + 1) % 256; b->count--; }
     pthread_mutex_unlock(&g_pool_lock);
-    if (ref) return CFBridgingRelease(ref);
+    if (ref) { __atomic_sub_fetch(&g_pooled_bytes, (int64_t)len, __ATOMIC_RELAXED); return CFBridgingRelease(ref); }
+    __atomic_add_fetch(&g_fresh_bytes, (int64_t)len, __ATOMIC_RELAXED);
     return [(__bridge id<MTLDevice>)dev->mtl newBufferWithLength:len options:MTLResourceStorageModeShared];
 }
 static void retire_buffer(d3d_device *dev, void *ref) {         // takes over the reference
@@ -915,7 +941,9 @@ static void retire_buffer(d3d_device *dev, void *ref) {         // takes over th
         if (b->count == 256) { drop = b->q[b->head].buf; b->head = (b->head + 1) % 256; b->count--; }
         b->q[(b->head + b->count) % 256] = (retired_buf){ ref, __atomic_load_n(&dev->submitted, __ATOMIC_ACQUIRE) + 1 };
         b->count++;
+        g_pooled_bytes += (int64_t)len;
     }
+    if (drop && b) g_pooled_bytes -= (int64_t)len;
     pthread_mutex_unlock(&g_pool_lock);
     if (drop) CFRelease(drop);
 }
@@ -941,6 +969,7 @@ static slice_chunk *take_slice(d3d_device *dev, size_t len, size_t *off) {
             if (!(*pp)->live && (*pp)->seq <= done) { k = *pp; *pp = k->next; break; }
         if (!k) {
             id<MTLBuffer> m = [(__bridge id<MTLDevice>)dev->mtl newBufferWithLength:CHUNK_BYTES options:MTLResourceStorageModeShared];
+            g_chunks++;
             k = calloc(1, sizeof *k);
             k->mtl = (void *)CFBridgingRetain(m);
             k->base = m.contents;
