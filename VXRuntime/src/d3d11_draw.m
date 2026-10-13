@@ -573,6 +573,31 @@ static id<MTLFunction> shader_variant(d3d_device *dev, d3d_shader *s, const char
 }
 static id<MTLFunction> gs_passthrough(d3d_device *dev, d3d_shader *gs) { return shader_variant(dev, gs, gs->info.msl_passthrough, "pass-through"); }
 
+static char g_pso_failed;
+#define PSO_FAILED ((void *)&g_pso_failed)
+// Metal converts vertex data only within a kind (floats, signed or unsigned integers); Direct3D hands an integer
+// format's bits to whichever integer type the shader declares. A signed format read as uint (or the reverse) is
+// fetched as its counterpart (the same bits, but for negative values' sign extension).
+static MTLVertexFormat vertex_format_for(MTLVertexFormat f, const char *msl, uint32_t reg) {
+    static const MTLVertexFormat pairs[][2] = {       // signed, unsigned
+        { MTLVertexFormatChar, MTLVertexFormatUChar }, { MTLVertexFormatChar2, MTLVertexFormatUChar2 }, { MTLVertexFormatChar4, MTLVertexFormatUChar4 },
+        { MTLVertexFormatShort, MTLVertexFormatUShort }, { MTLVertexFormatShort2, MTLVertexFormatUShort2 }, { MTLVertexFormatShort4, MTLVertexFormatUShort4 },
+        { MTLVertexFormatInt, MTLVertexFormatUInt }, { MTLVertexFormatInt2, MTLVertexFormatUInt2 }, { MTLVertexFormatInt3, MTLVertexFormatUInt3 },
+        { MTLVertexFormatInt4, MTLVertexFormatUInt4 },
+    };
+    if (!msl) return f;
+    char pattern[64];
+    snprintf(pattern, sizeof pattern, " v%u [[attribute(%u)]];", reg, reg);
+    const char *at = strstr(msl, pattern);
+    if (!at || at - msl < 5) return f;
+    int wants_uint = !strncmp(at - 5, "uint", 4), wants_int = !wants_uint && !strncmp(at - 4, "int", 3);
+    for (size_t i = 0; i < sizeof pairs / sizeof pairs[0]; i++) {
+        if (wants_uint && f == pairs[i][0]) return pairs[i][1];
+        if (wants_int && f == pairs[i][1]) return pairs[i][0];
+    }
+    return f;
+}
+
 // unbound: targets of the open render pass that this draw has no render target view for (it keeps the pass, which
 // has them: their writes are masked off).
 static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id<MTLTexture> const *colors, int ncolors, id<MTLTexture> depth, uint32_t unbound) {
@@ -587,6 +612,7 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
     pthread_mutex_lock(&g_pso_lock);
     void *found = pso_find(&key);
     pthread_mutex_unlock(&g_pso_lock);
+    if (found == PSO_FAILED) return nil;               // (Metal refused it before: not tried again every draw)
     if (found) { s->last_key = key; s->last_pso = found; return (__bridge id<MTLRenderPipelineState>)found; }
     id<MTLRenderPipelineState> ps_state;
 
@@ -606,7 +632,7 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
         MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
         for (uint32_t i = 0; i < s->layout->n; i++) {
             const layout_attr *a = &s->layout->attr[i];
-            vd.attributes[a->reg].format = vertex_format(a->format, NULL);
+            vd.attributes[a->reg].format = vertex_format_for(vertex_format(a->format, NULL), vs->info.msl, a->reg);
             vd.attributes[a->reg].offset = a->offset;
             vd.attributes[a->reg].bufferIndex = VB_BASE + a->slot;
             MTLVertexBufferLayoutDescriptor *bl = vd.layouts[VB_BASE + a->slot];
@@ -652,7 +678,13 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
         __atomic_add_fetch(&ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, __ATOMIC_RELAXED);
         if (__atomic_add_fetch(&n, 1, __ATOMIC_RELAXED) % 200 == 0) vx_log("Direct3D: %llu pipeline states: %llu ms", (unsigned long long)n, (unsigned long long)(ns / 1000000));
     }
-    if (!ps_state) { vx_log("Direct3D: pipeline state failed: %s", err.localizedDescription.UTF8String); return nil; }
+    if (!ps_state) {
+        vx_log("Direct3D: pipeline state failed: %s", err.localizedDescription.UTF8String);
+        pthread_mutex_lock(&g_pso_lock);
+        if (!pso_find(&key)) pso_add(&key, PSO_FAILED);
+        pthread_mutex_unlock(&g_pso_lock);
+        return nil;
+    }
     pthread_mutex_lock(&g_pso_lock);
     void *kept = pso_find(&key);                       // another thread may have made the same one meanwhile
     if (!kept) pso_add(&key, kept = (void *)CFBridgingRetain(ps_state));
