@@ -255,8 +255,12 @@ static HANDLE create_file(const char *name, DWORD access, DWORD disposition, DWO
     int rd = (access & (GENERIC_READ | GENERIC_ALL | FILE_READ_DATA)) != 0;
     int wr = (access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
     int writes = wr || disposition == 1 || disposition == 2 || disposition == 4 || disposition == 5;
-    if (!(writes ? vx_unix_path_write(name, path, sizeof path, disposition != 2 && disposition != 5) : vx_unix_path(name, path, sizeof path)))
+    static int trace = -1;                                    // VXRT_TRACE_FILES=1: opens that fail, with the path
+    if (trace < 0) trace = getenv("VXRT_TRACE_FILES") != NULL;
+    if (!(writes ? vx_unix_path_write(name, path, sizeof path, disposition != 2 && disposition != 5) : vx_unix_path(name, path, sizeof path))) {
+        if (trace) vx_log("CreateFile(%s): no path", name);
         return INVALID_HANDLE;
+    }
     int flags = wr ? (rd ? O_RDWR : O_WRONLY) : O_RDONLY;
     switch (disposition) {
     case 1: flags |= O_CREAT | O_EXCL; break;    // CREATE_NEW
@@ -277,9 +281,10 @@ static HANDLE create_file(const char *name, DWORD access, DWORD disposition, DWO
             if (slash) { *slash = 0; if (stat(path, &st)) e = 3; }
         }
         vx_set_last_error(e);
+        if (trace) vx_log("CreateFile(%s, access %#x, disposition %u): error %u", name, access, disposition, e);
         return INVALID_HANDLE;
     }
-    if (fd >= 1024) { close(fd); vx_set_last_error(4); return INVALID_HANDLE; }
+    if (fd >= 0x10000) { close(fd); vx_set_last_error(4); return INVALID_HANDLE; }   // (handles 0x10000 + fd)
     vx_set_last_error(existed && (disposition == 2 || disposition == 4) ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
     return (HANDLE)(intptr_t)(0x10000 + fd);
 }
