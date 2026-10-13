@@ -547,6 +547,11 @@ func setupEncoder(width: Int32, height: Int32) {
     // headset app decodes it to half floats.
     set(kVTCompressionPropertyKey_ProfileLevel, hevcTenBit ? kVTProfileLevel_HEVC_Main10_AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel, "profile")
     // Critical settings for ultra-low latency VR streaming
+    // A quality target as well as the bitrate: rate control alone gave dark frames a fraction of their share
+    // (Half-Life: Alyx's Valve logo, a dark red scene: a 22 KB keyframe where 40 Mbps allows 80; the shadows
+    // came out in blocks). The data-rate limit below still caps each second. VERANTYX_HEVC_QUALITY: 0-1.
+    let quality = Double(ProcessInfo.processInfo.environment["VERANTYX_HEVC_QUALITY"] ?? "0.9") ?? 0.9
+    if quality > 0 { set(kVTCompressionPropertyKey_Quality, NSNumber(value: min(quality, 1)), "quality") }
     set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "no B-frames")
     set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue, "speed priority")
     set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: adaptiveBitrate.current), "average bitrate")
