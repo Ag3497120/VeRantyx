@@ -1,8 +1,9 @@
 # Working on VeRantyx with an AI coding tool
 
 This file is for AI coding agents (Claude Code, Codex, Gemini CLI, Cursor and others) asked to tune a Windows VR game
-for a Mac, or to make one run on VXRuntime. A prompt for such a task usually comes from `tools/vxrt_doctor.py`,
-which collects the facts about the game, the Mac and the last run. Read this file before you change anything.
+for a Mac, or to make one run on VXRuntime. A prompt for such a task usually comes from `tools/vxrt_doctor.py` (or
+from VXRT Studio, `tools/vxrt_studio.py`, which uses it), which collects the facts about the game, the Mac and the last
+run. Read this file before you change anything.
 
 ## What this repository is
 

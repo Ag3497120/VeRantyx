@@ -197,8 +197,8 @@ VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 2560×2880 per eye rendered (
 The first start compiles the game's shaders (a few minutes). The 10-bit stream
 needs the current Vision Pro app (`scripts/deploy_vision_pro_app.sh`).
 
-Other SteamVR games: `scripts/launch_vxrt_game.sh "<game .exe>"` (Google Earth VR
-runs; most games still need some Windows functions VXRuntime lacks).
+Other SteamVR games: `scripts/launch_vxrt_game.sh "<game .exe>"` (The Lab and
+Google Earth VR run; most games still need some Windows functions VXRuntime lacks).
 
 ### Tuning a game or making one run, with an AI coding tool
 
@@ -216,6 +216,12 @@ tools/vxrt_doctor.py "<game folder or .exe>" --goal support --copy   # make it r
 
 Prompts are in Japanese by default (`--lang en` for English). Games with
 anti-cheat are flagged and not worked around.
+
+The same in a page: `python3 tools/vxrt_studio.py` opens VXRT Studio in the
+browser, a list of the games installed for VXRuntime (Steam libraries in the
+prefix and `~/Verantyx_VR_Drive/vxrt_library`) with what is known to work, the
+last run's problems, and buttons that copy a prompt (tune or make it run) and
+the launch command. It is served on 127.0.0.1 only and starts nothing itself.
 
 ## Compared with Glovebox
 

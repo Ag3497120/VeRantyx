@@ -91,6 +91,13 @@ def pe_imports(path):
         o += 32
     return dict(out), machine
 
+def wine_builtin(path):
+    """Wine's own DLLs (marked after the DOS header) need Wine: VXRuntime passes over them (loader.c wine_builtin)."""
+    try:
+        with open(path, "rb") as f: return f.read(0x60)[0x40:0x50] == b"Wine builtin DLL"
+    except OSError:
+        return False
+
 def canonical(dll):
     """API sets resolve as VXRuntime's loader does (loader.c canonical_dll)."""
     if dll.startswith("api-ms-win-crt-"): return "ucrtbase.dll"
@@ -139,7 +146,8 @@ def scan_game(root):
     return exes, dlls, markers
 
 HELPERS = ("crashhandler", "crashpad", "crash_handler", "unitycrashhandler", "setup", "redist", "vcredist", "dxsetup",
-           "uninst", "launcher_helper", "webhelper", "easyanticheat", "beservice", "prereq")
+           "uninst", "launcher_helper", "webhelper", "easyanticheat", "beservice", "prereq",
+           "tb_streamer", "vconsole", "resourcecompiler", "injector")   # (Source 2's tools; VeRantyx's injector)
 
 def steam_name(root):
     """The game's name from a Steam app manifest next to it (steamcmd installs) or above it (a Steam library)."""
@@ -202,12 +210,17 @@ LOG_PATTERNS = [
     ("not supported", r"(\S+ is not supported.{0,80}|not implemented: .{0,120})"),
 ]
 
-def read_log(path):
+def read_log(path, exe_name=None):
+    """What went wrong in a log, by kind. Lines of other processes the game started (SteamVR's vrmonitor and
+    vrwebhelper, crash handlers: "[vxrt <name>:<pid>]") are left out when exe_name is given."""
     if not path or not os.path.exists(path):
         return {}
     found = defaultdict(lambda: defaultdict(int))
     with open(path, errors="replace") as f:
         for line in f:
+            other = re.match(r"\[vxrt ([^\]:]+):\d+\]", line)
+            if other and exe_name and other.group(1).lower() != exe_name.lower():
+                continue
             for label, pat in LOG_PATTERNS:
                 m = re.search(pat, line)
                 if m:
@@ -235,7 +248,7 @@ TEXT = {
         "task_tune": "## お願いしたいこと\n1. AGENTS.md の計測方法で、今の設定の fps と GPU 使用率を測る。\n2. 変えてよい項目（AGENTS.md の「調整できる設定」）だけを使い、目標（表示 Hz に張り付く fps、なるべく高い解像度）に近づける。\n3. 試した設定と結果を表にし、一番良い組み合わせを scripts の起動方法（環境変数・ゲームの引数）として示す。",
         "task_support": "## お願いしたいこと\n1. 上の「ない関数」「ログの問題」のうち、ゲームの起動や描画を止めているものから順に、原因を調べる。\n2. VXRuntime/src に実装・修正を加え、テストを足して make -C VXRuntime check を通す。\n3. ゲームを起動して確かめ、何が動いて何が残っているかを数値・ログで報告する。コミットは動作を確かめたものだけ。",
         "anticheat": "注意：このゲームにはアンチチート（{}）があります。回避は行わず、オフラインで遊べる部分があるかの確認にとどめてください。",
-        "none": "なし", "others": "ほかの実行ファイル",
+        "none": "なし", "others": "ほかの実行ファイル", "launch": "起動コマンド（SteamVR と一緒に起動する）",
     },
     "en": {
         "intro_tune": "In this repository (VeRantyx / VXRuntime), tune the following Windows VR game for this Mac. Settings only: do not change the runtime's code.",
@@ -249,7 +262,7 @@ TEXT = {
         "task_tune": "## What to do\n1. Measure fps and GPU use with the current settings, as AGENTS.md describes.\n2. Using only the settings AGENTS.md lists as tunable, get as close as you can to the goal (fps at the display rate, as high a resolution as possible).\n3. Report the settings tried and their results as a table, and give the best combination as a launch command (environment variables, game arguments).",
         "task_support": "## What to do\n1. Starting with what stops the game from starting or drawing, find the cause of the missing functions and log problems above.\n2. Implement or fix it in VXRuntime/src, add tests, and get make -C VXRuntime check to pass.\n3. Launch the game to check, and report what works and what is left with numbers and logs. Commit only what you have verified.",
         "anticheat": "Note: this game has anti-cheat ({}). Do not circumvent it; only check whether parts of it can be played offline.",
-        "none": "none", "others": "other executables",
+        "none": "none", "others": "other executables", "launch": "Launch command (starts SteamVR too)",
     },
 }
 
@@ -258,29 +271,40 @@ GRAPHICS = {"d3d11.dll": "Direct3D 11", "d3d12.dll": "Direct3D 12 (VXRuntime: no
             "xinput1_3.dll": "XInput", "xinput1_4.dll": "XInput", "xaudio2_9.dll": "XAudio2", "openvr_api.dll": "OpenVR",
             "wininet.dll": "WinINet", "winhttp.dll": "WinHTTP", "ws2_32.dll": "Winsock"}
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("game", help="the game's folder or its .exe")
-    ap.add_argument("--goal", choices=["tune", "support"], default="support")
-    ap.add_argument("--lang", choices=["ja", "en"], default="ja")
-    ap.add_argument("--log", help="a VXRuntime log of the game (default: the newest logs/vxrt-*.log)")
-    ap.add_argument("--root", default=os.path.expanduser("~/Verantyx_VR_Drive/vxrt_root/drive_c"), help="VXRT_ROOT/drive_c of the last run")
-    ap.add_argument("--dll-path", default=os.path.expanduser("~/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test/drive_c/windows/system32"),
-                    help="where Windows DLLs the runtime loads from disk live (VXRT_DLL_PATH)")
-    ap.add_argument("--out"); ap.add_argument("--copy", action="store_true")
-    a = ap.parse_args()
-    T = TEXT[a.lang]
+DEFAULT_ROOT = os.path.expanduser("~/Verantyx_VR_Drive/vxrt_root/drive_c")
+DEFAULT_DLL_PATH = os.path.expanduser("~/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test/drive_c/windows/system32")
+_exports = None
 
-    root = a.game if os.path.isdir(a.game) else os.path.dirname(a.game)
+def find_log(exe_name):
+    """The newest logs/vxrt-*.log that mentions the game's executable."""
+    d = os.path.join(REPO, "logs")
+    logs = sorted((os.path.join(d, f) for f in os.listdir(d) if f.startswith("vxrt-") and f.endswith(".log")), key=os.path.getmtime, reverse=True) if os.path.isdir(d) else []
+    stem = re.escape(os.path.splitext(exe_name.lower())[0])
+    return next((p for p in logs if re.search(r"\b%s\b" % stem, open(p, errors="replace").read(400000).lower())), None)
+
+def launch_command(exe, quality=""):
+    """How the game is started on VXRuntime (scripts/), from the repository; quality: a VXRT_VR_QUALITY preset."""
+    env = f"VXRT_VR_QUALITY={quality} " if quality else ""
+    if os.path.basename(exe).lower() == "hlvr.exe":            # Half-Life: Alyx has a launcher of its own
+        return f'cd "{REPO}" && {env}scripts/launch_vxrt_alyx.sh'
+    return f'cd "{REPO}" && {env}scripts/launch_vxrt_game.sh "{os.path.abspath(exe)}"'
+
+def build_prompt(game, goal="support", lang="ja", log=None, root_c=DEFAULT_ROOT, dll_path=DEFAULT_DLL_PATH):
+    """The prompt for a game (its folder or .exe), as main() prints it. vxrt_studio.py calls this too."""
+    global _exports
+    T = TEXT[lang]
+    root = game if os.path.isdir(game) else os.path.dirname(game)
     exes, game_dlls, markers = scan_game(root)
     name = steam_name(root)
     if not name and "/common/" in os.path.abspath(root):    # a Steam library: steamapps/common/<game>/...
         name = os.path.abspath(root).split("/common/", 1)[1].split("/")[0]
-    main_exe = a.game if a.game.lower().endswith(".exe") else pick_exe(exes, name or os.path.basename(os.path.normpath(root)))
+    main_exe = game if game.lower().endswith(".exe") else pick_exe(exes, name or os.path.basename(os.path.normpath(root)))
     if not main_exe:
-        sys.exit("No .exe found in %s" % root)
-    disk_dlls = {f.lower() for f in os.listdir(a.dll_path)} if os.path.isdir(a.dll_path) else set()
-    exports = runtime_exports()
+        raise ValueError("No .exe found in %s" % root)
+    disk_dlls = {f.lower() for f in os.listdir(dll_path) if not wine_builtin(os.path.join(dll_path, f))} if os.path.isdir(dll_path) else set()
+    if _exports is None:
+        _exports = runtime_exports()
+    exports = _exports
 
     missing, nodll, apis = defaultdict(set), set(), set()
     files = closure(main_exe, game_dlls)
@@ -302,21 +326,16 @@ def main():
             else:
                 nodll.add(dll)
 
-    log = a.log
-    exe_name = os.path.basename(main_exe).lower()
-    if not log:                                          # the newest log that mentions this game's executable
-        d = os.path.join(REPO, "logs")
-        logs = sorted((os.path.join(d, f) for f in os.listdir(d) if f.startswith("vxrt-") and f.endswith(".log")), key=os.path.getmtime, reverse=True) if os.path.isdir(d) else []
-        stem = re.escape(os.path.splitext(exe_name)[0])
-        log = next((p for p in logs if re.search(r"\b%s\b" % stem, open(p, errors="replace").read(400000).lower())), None)
-    found = read_log(log)
-    fps = proxy_fps(a.root) if log and abs(os.path.getmtime(log) - os.path.getmtime(os.path.join(a.root, "vr_openvr_capture_proxy.log")) if os.path.exists(os.path.join(a.root, "vr_openvr_capture_proxy.log")) else 1e9) < 600 else None
+    log = log or find_log(os.path.basename(main_exe))
+    found = read_log(log, os.path.basename(main_exe))
+    proxy = os.path.join(root_c, "vr_openvr_capture_proxy.log")
+    fps = proxy_fps(root_c) if log and os.path.exists(proxy) and abs(os.path.getmtime(log) - os.path.getmtime(proxy)) < 600 else None
     mi = machine_info()
     if any(m.startswith("engine:Unity") for m in markers) and not any(x.startswith("Direct3D") for x in apis):
         apis.add("Direct3D 11 (Unity's default on Windows, loaded at run time)")
 
     L = []
-    L.append(T["intro_" + a.goal])
+    L.append(T["intro_" + goal])
     L.append(T["rules"])
     ac = [m.split(":", 1)[1] for m in markers if m.startswith("anticheat:")]
     if ac: L.append("\n" + T["anticheat"].format(", ".join(sorted(set(ac)))))
@@ -328,8 +347,9 @@ def main():
     L.append(f"- {T['engine']}: {', '.join(eng) or T['none']}")
     L.append(f"- {T['apis']}: {', '.join(sorted(apis)) or T['none']}")
     total = sum(len(v) for v in missing.values())
+    L.append(f"- {T['launch']}: {launch_command(main_exe)}")
     L.append(f"- {T['missing']}: {total}")
-    for dll in sorted(missing, key=lambda k: -len(missing[k])):
+    for dll in sorted(missing, key=lambda k: -len(missing[k])) if goal == "support" else ():
         names = sorted(missing[dll])
         L.append(f"  - {dll} ({len(names)}): {', '.join(names[:40])}{' …' if len(names) > 40 else ''}")
     L.append(f"- {T['nodll']}: {', '.join(sorted(nodll)) or T['none']}")
@@ -341,9 +361,23 @@ def main():
             L.append(f"  - {label}: " + "; ".join(f"{k} ×{n}" for k, n in top))
     if fps:
         L.append(f"- {T['fps']}: {', '.join(f'{x:.0f}' for x in fps[-12:])}")
-    L.append("\n" + T["task_" + a.goal])
-    prompt = "\n".join(L) + "\n"
+    L.append("\n" + T["task_" + goal])
+    return "\n".join(L) + "\n"
 
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("game", help="the game's folder or its .exe")
+    ap.add_argument("--goal", choices=["tune", "support"], default="support")
+    ap.add_argument("--lang", choices=["ja", "en"], default="ja")
+    ap.add_argument("--log", help="a VXRuntime log of the game (default: the newest logs/vxrt-*.log)")
+    ap.add_argument("--root", default=DEFAULT_ROOT, help="VXRT_ROOT/drive_c of the last run")
+    ap.add_argument("--dll-path", default=DEFAULT_DLL_PATH, help="where Windows DLLs the runtime loads from disk live (VXRT_DLL_PATH)")
+    ap.add_argument("--out"); ap.add_argument("--copy", action="store_true")
+    a = ap.parse_args()
+    try:
+        prompt = build_prompt(a.game, a.goal, a.lang, a.log, a.root, a.dll_path)
+    except ValueError as e:
+        sys.exit(str(e))
     if a.out:
         open(a.out, "w").write(prompt)
     if a.copy:

@@ -91,7 +91,7 @@ VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 片目1440×1620、2880×1620
 VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 片目2560×2880で描画（2× MSAA）、配信は同じ、50〜60fps
 ```
 
-ほかの SteamVR ゲーム: `scripts/launch_vxrt_game.sh "<ゲームの .exe>"`（Google Earth VR は動作。多くのゲームはまだ VXRuntime にない Windows の関数が必要です）。
+ほかの SteamVR ゲーム: `scripts/launch_vxrt_game.sh "<ゲームの .exe>"`（The Lab と Google Earth VR は動作。多くのゲームはまだ VXRuntime にない Windows の関数が必要です）。
 
 ### AI コーディングツールでの最適化・ゲーム対応
 
@@ -103,6 +103,8 @@ tools/vxrt_doctor.py "<ゲームのフォルダか .exe>" --goal support --copy 
 ```
 
 アンチチートのあるゲームは検出して注意を出し、回避はしません。
+
+同じことを画面で: `python3 tools/vxrt_studio.py` でブラウザに VXRT Studio が開きます。VXRuntime 用に入っているゲーム（prefix 内の Steam ライブラリと `~/Verantyx_VR_Drive/vxrt_library`）の一覧、動作状況、前回の実行で見つかった問題を表示し、プロンプト（調整／動くようにする）と起動コマンドをボタンでコピーできます。127.0.0.1 だけで動き、画面からは何も起動しません。
 
 初回はゲームのシェーダーのコンパイルに数分かかります。10ビット配信には最新の Vision Pro アプリが必要です
 （`scripts/deploy_vision_pro_app.sh`）。
