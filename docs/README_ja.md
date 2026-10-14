@@ -1,6 +1,24 @@
-# MBP-AVP-VR
+# VeRantyx（日本語）
 
-Windows Steam runs through the transferred Wine 11.9 runtime. SteamVR uses the Verantyx virtual HMD driver. Half-Life: Alyx submits stereo textures through OpenVR; the Mac capture proxy reads each eye before SteamVR's compositor rejects the texture format, then the Mac encodes a fixed 1440×810 HEVC stream for Apple Vision Pro. The Vision Pro sends head and hand poses back to SteamVR.
+Apple シリコンの Mac で PC VR ゲームを描画し、Apple Vision Pro へ HEVC で配信して遊ぶためのプロジェクトです。
+手の位置は Vision Pro のハンドトラッキング、ボタン・スティック・トリガーはジョイコンから取り、トラッキング付きの
+VR コントローラーは要りません。ゲームの動かし方が違う3つの版があります。
+
+| 版 | ゲームの動かし方 | 状態 |
+|---|---|---|
+| vxrt版 | Windows 版のゲームと本物の Windows 版 SteamVR を、このリポジトリで一から書いた Windows ランタイム VXRuntime で動かす（Wine なし、Direct3D 11 → Metal） | 最新（2026-10-12〜14）。ヘッドセットでレベルをまたいでプレイ済み。M1 Max で 3K プリセット60fps。The Lab と Google Earth VR も動作 |
+| ネイティブ版 | Valve の Linux ARM64 版 Alyx を、改造した Klepton と自作の glibc 層・OpenVR ランタイムで macOS 上でそのまま動かす | 2026-10-11。60fps、20分以上プレイ |
+| Wine版 | Windows 版のゲームと SteamVR を Wine 11 + DXVK → MoltenVK で動かす | 2026-10-10 から安定。約30fps |
+
+![vxrt版: Windows 版の Half-Life: Alyx と SteamVR を VXRuntime（Wine なし）で MacBook Pro 上で動かし、Apple Vision Pro で遊んでいるところ](media/vxrt-highlight.gif)
+
+[![vxrt版の52秒のハイライト](media/vxrt-poster.jpg)](media/vxrt-highlight.mp4)
+
+*vxrt版、2026-10-14 の録画から52秒: メインメニュー、隔離区域（a2_quarantine_entrance）、レベル切り替え後の
+a2_pistol でのピストル、手と指、リストポケット、リロード。3K プリセット（片目1440×1620）、3404×1372 の HEVC Main10・
+40Mbps、M1 Max。既知の問題は下の「vxrt版の状態と制約」にあります。*
+
+以下の「このMacで確認した状態」より後の節は、主に Wine 版を作っていた時期（2026-09〜10-10）の記録です。
 
 ## vxrt版（VXRuntime）
 
@@ -43,7 +61,7 @@ Steam Frame 向けに作られた Alyx だけ）に縛られません。
 - **グラフィックスは Metal へ直接**: Direct3D 11 の呼び出しは Metal の呼び出しになり、シェーダーは DXBC から
   Metal Shading Language へ一度だけ翻訳します（バックグラウンドで、Metal がキャッシュ）。Wine 版は
   D3D11 → Vulkan（DXVK）→ Metal（MoltenVK）でした。ジオメトリシェーダーはコンピュートカーネルで実行し、
-  ゲーム・コンポジタ・ドライバー間の共有テクスチャは keyed mutex 付きの IOSurface なので、SteamVR のコンポジタが
+  ストリーム出力（Unity のスキニング）も同様です。ゲーム・コンポジタ・ドライバー間の共有テクスチャは keyed mutex 付きの IOSurface なので、SteamVR のコンポジタが
   ゲームのフレームをそのまま受け取れます（Wine では開けませんでした）。
 - **Windows 版 Steam なし**: ゲームの `steamclient64.dll` は組み込みで、すべての Steam インターフェースを
   サインイン済みの Mac の Steam クライアントへ転送します（インターフェースのメソッドごとの ms_abi → System V
@@ -51,10 +69,11 @@ Steam Frame 向けに作られた Alyx だけ）に縛られません。
 - **実行時にコードを作らない**: メソッド表と呼び出しスタブは事前生成かアセンブリです。Valve と Microsoft の
   ファイルは利用者自身のインストールから使い、配布しません。
 - **マイルストーン単位で構築**: 各段階が「無改造で動くべき小さな Windows プログラム」です（`make check`、
-  20本のテスト）。PE ローダーと kernel32 → スレッドと例外 → ファイルと DLL → AppKit 上のウィンドウ →
+  約25本のテスト）。PE ローダーと kernel32 → スレッドと例外 → ファイルと DLL → AppKit 上のウィンドウ →
   COM・I/O 完了ポート・MSVC の C++ 例外 → Metal 上の Direct3D 11 → コンピュート・入力・音声 → プロセスと
-  共有テクスチャ（SteamVR）→ Steam ブリッジ（Alyx）→ ジオメトリシェーダー → 3K/10ビット対応。C と
-  Objective-C で約21,600行、2日間（2026-10-12〜13）で Claude Code の Claude Opus 5.5 と書きました。設計と
+  共有テクスチャ（SteamVR）→ Steam ブリッジ（Alyx）→ ジオメトリシェーダー → 3K/10ビット対応 → Unity の
+  ゲーム（The Lab）→ ヘッドセットでのプレイ（セーブ、レベル切り替え、マルチサンプリング）。C と Objective-C で
+  約31,000行、3日間（2026-10-12〜14）で Claude Code の Claude Opus 5.5 と書きました。設計と
   各マイルストーンの詳細は [VXRuntime/README.md](../VXRuntime/README.md) にあります。
 
 ### Wine版・ネイティブ版との比較
@@ -69,29 +88,44 @@ Half-Life: Alyx、MacBook Pro M1 Max、各版のログでの計測です。
 | グラフィックス | D3D11 → DXVK → Vulkan → MoltenVK → Metal | Vulkan → MoltenVK → Metal | D3D11 → Metal（自作の翻訳） |
 | Steam | Wine 上の Windows 版 Steam + Chromium | Mac の Steam | Mac の Steam（ブリッジ） |
 | ゲーム中・標準サイズ | 約30fps（CPU 律速、SteamVR 倍率0.7） | 60fps、片目1298×1056 | 45〜57fps、片目約840×940 |
-| 大きいサイズ | — | 片目1982×1536で約39fps、片目約3Kで約20fps | 片目1440×1620で60fps、配信も60fps（2880×1620 HEVC Main10）。片目2560×2880（2× MSAA）で50〜60fps |
-| 他の Windows VR ゲーム | 可能（Wine） | 不可（Linux ARM64 版が必要） | 原理的には可能。試したのは Alyx と SteamVR Home のみ |
-| ヘッドセットでのプレイ | 済み | 済み（20分以上） | まだ |
+| 大きいサイズ | — | 片目1982×1536で約39fps、片目約3Kで約20fps | 3K: 片目1440×1620で60fps、配信も60fps（HEVC Main10、約470万画素）。2.5K: 片目2560×2880（2× MSAA）で50〜60fps。max: 片目3200×3600で16〜21fps |
+| 他の Windows VR ゲーム | 可能（Wine） | 不可（Linux ARM64 版が必要） | The Lab（タイトル画面で53〜58fps）と Google Earth VR（空が白い）が動作。Bigscreen はまだ起動しない |
+| ヘッドセットでのプレイ | 済み | 済み（20分以上） | 済み（2026-10-14、3K、レベル切り替えを含む） |
 
 まとめると、ネイティブ版は CPU 変換がないので最速ですが、Valve が ARM64 版の Alyx を作ったから成り立つ方法です。
 Wine 版はどの Windows ゲームも動かせますが、Wine と二重のグラフィックス変換のコストを払います。vxrt は
 Windows 版と本物の SteamVR を保ったまま Wine を取り除き、すべての呼び出しまで自分たちで最適化できる版です。
-研究段階のプロジェクトで、Direct3D 12、テッセレーション、ストリーム出力はまだなく、試したのは Alyx と
-SteamVR だけです。
+研究段階のプロジェクトで、Direct3D 12、Vulkan、テッセレーションはまだなく、試したのは1台の Mac で4本のゲームです。
 
 ### vxrt版の起動
 
-Mac で Steam を起動してサインインし、SteamVR とゲームが Windows の Steam ライブラリに入っている状態で
-（Wine 版の prefix は読むだけで書き込みません）:
+Mac で Steam を起動してサインインし、SteamVR とゲームが Windows の Steam ライブラリに入っている状態で使います。
+現在そのライブラリは Wine 版のセットアップ（`scripts/setup.sh`）が作るものです。vxrt は Wine を起動しませんが、
+ゲーム・SteamVR・Microsoft のランタイム DLL をその prefix から読みます（書き込みはしません）。Wine なしで
+インストールできるようにするのが次の作業です。
 
 ```bash
 make -C VXRuntime check                          # vxrt をビルドしてテストを実行
 scripts/launch_vxrt_alyx.sh                      # vxrt 上の SteamVR + エンコーダー + Half-Life: Alyx
 VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 片目1440×1620、2880×1620の10ビットHEVC・40Mbps、60fps
 VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 片目2560×2880で描画（2× MSAA）、配信は同じ、50〜60fps
+VXRT_VR_QUALITY=max scripts/launch_vxrt_alyx.sh  # 片目3200×3600（Vision Pro の片目の画素数）、3840×2160配信、16〜21fps
 ```
 
-ほかの SteamVR ゲーム: `scripts/launch_vxrt_game.sh "<ゲームの .exe>"`（The Lab と Google Earth VR は動作。多くのゲームはまだ VXRuntime にない Windows の関数が必要です）。
+ほかの SteamVR ゲーム: `scripts/launch_vxrt_game.sh "<ゲームの .exe>"`（The Lab と Google Earth VR は動作。多くのゲームはまだ VXRuntime にない Windows の関数が必要です）。ゲームごとの状態は [games/](../games/) にあります。
+
+### vxrt版の状態と制約
+
+MacBook Pro（M1 Max）、2026-10-14 時点:
+
+- **Half-Life: Alyx**: ハンドトラッキングとジョイコンでヘッドセットでプレイでき、レベル切り替えとセーブも動きます（2026-10-14 の録画は a2_quarantine_entrance から a2_pistol へ進んでいます）。ハーネスでの計測は、3K プリセットでチャプター1が60.0fps、メニューが54〜59fps。
+- **緑色に光る問題**: 奥の柵、植物の影、ペットボトルなど一部の表面が、ヘッドセットで緑色に光ったりにじんだりします。原因はまだ分かっていません（配信のパケット落ちで次のキーフレームまで緑になるのか、シェーダーの翻訳の問題か）。切り分け中です。
+- **Wi-Fi**: 速い回線が必要です。2.4GHz ではカクつきと崩れが出ます。5GHz・80MHz 幅でかなり改善します。
+- **max プリセット**: 16〜21fps で、ハンドトラッキングの手が認識されません（ジョイコンは使えます）。
+- **初回起動**: 数千のシェーダーのコンパイルに数分かかります。2回目からは Metal のキャッシュを使います。
+- **セーブ**: 2026-10-14（コミット 8d10cfb）より前のセーブにはレベルの状態が入っていません。チャプターを最初から始めてください。
+- **セットアップ**: 上のとおり Wine 版の prefix からゲームを読みます。vxrt 用の1コマンドのセットアップはまだありません。
+- 試した Mac は1台です。Direct3D 12、Vulkan、テッセレーションは未対応で、アンチチートは回避しません。
 
 ### AI コーディングツールでの最適化・ゲーム対応
 

@@ -26,8 +26,8 @@
   "status": {
     "state": "works",
     "summary": {
-      "ja": "VR で動作。3k プリセットで 60 fps（M1 Max）",
-      "en": "Works in VR. 60 fps with the 3k preset (M1 Max)"
+      "ja": "VR で動作。3k プリセットで 60 fps（M1 Max）。ヘッドセットでレベルをまたいでプレイ済み",
+      "en": "Works in VR. 60 fps with the 3k preset (M1 Max); played in the headset across level changes"
     },
     "checked": "2026-10-14",
     "machine": "Apple M1 Max, 32-core GPU"
@@ -54,7 +54,11 @@
   },
   "known_issues": [
     {
-      "summary": "VXRT_VR_QUALITY=max: 16-21 fps, and the hands/controllers were not seen in one session",
+      "summary": "Some surfaces (distant fences, foliage shadows, bottles) glow or smear green in the headset; cause not known yet (stream packet loss or the shader translator)",
+      "since": "2026-10-14"
+    },
+    {
+      "summary": "VXRT_VR_QUALITY=max: 16-21 fps; the Joy-Con work but tracked hands were not seen",
       "since": "2026-10-14"
     },
     {
@@ -63,6 +67,7 @@
     }
   ],
   "notes": [
-    "Needs -vr (scripts/launch_vxrt_alyx.sh passes it); without it the game starts in desktop mode."
+    "Needs -vr (scripts/launch_vxrt_alyx.sh passes it); without it the game starts in desktop mode.",
+    "2026-10-14: played in the headset at 3k through a2_quarantine_entrance -> a2_pistol (the level change that crashed before 8d10cfb); saves 2.5-6.2 MB."
   ]
 }

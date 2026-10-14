@@ -13,8 +13,7 @@
 #
 # The game and SteamVR come from the Wine prefix's Steam library and stay read-only (writes go to the overlay
 # folder, as for scripts/launch_vxrt_steamvr.sh). The first start compiles thousands of shaders and takes a few
-# minutes; later starts use Metal's cache. Geometry shaders are not supported yet (some cables and effects are
-# missing).
+# minutes; later starts use Metal's cache.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
