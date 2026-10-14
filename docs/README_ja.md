@@ -104,7 +104,9 @@ tools/vxrt_doctor.py "<ゲームのフォルダか .exe>" --goal support --copy 
 
 アンチチートのあるゲームは検出して注意を出し、回避はしません。
 
-同じことを画面で: `python3 tools/vxrt_studio.py` でブラウザに VXRT Studio が開きます。VXRuntime 用に入っているゲーム（prefix 内の Steam ライブラリと `~/Verantyx_VR_Drive/vxrt_library`）の一覧、動作状況、前回の実行で見つかった問題を表示し、プロンプト（調整／動くようにする）と起動コマンドをボタンでコピーできます。127.0.0.1 だけで動き、画面からは何も起動しません。
+同じことを画面で: `python3 tools/vxrt_studio.py` でブラウザに VXRT Studio が開きます。VXRuntime 用に入っているゲーム（prefix 内の Steam ライブラリと `~/Verantyx_VR_Drive/vxrt_library`）の一覧、動作状況、前回の実行で見つかった問題を表示し、プロンプト（調整／動くようにする）と起動コマンドをボタンでコピーできます。「AIに任せる」を押すと、ターミナルで Claude Code か Codex（あなたのログインのまま）がこのリポジトリで起動し、プロンプトと vxrt の MCP サーバーを受け取って、ゲームの起動・計測から修正まで自分で進めます。127.0.0.1 だけで動き、AI の起動にはページ固有の合言葉が必要です（他のサイトからは起動できません）。
+
+AI はハーネス `tools/vxrt_run.py`（MCP サーバー `tools/vxrt_mcp.py` としても使え、Claude Code には `.mcp.json` で登録）で計測します。ゲームを専用のフォルダで、仮想のヘッドセットで動かし、公平に測れない実行（プレイ中、SteamVR が起動中、VR がオフなど）は理由付きで拒否します。見たことは証拠として `runs/` に書きます（観測値とその元ファイルのハッシュ、凍結した基準値から導いた結論、推測、不明点）。記録はハッシュでつないだ台帳に残ります。`make -C VXRuntime vr-check` で基準値のあるゲームをすべて確かめます。AI 向けの手順書は `.agents/skills/` にあります。
 
 初回はゲームのシェーダーのコンパイルに数分かかります。10ビット配信には最新の Vision Pro アプリが必要です
 （`scripts/deploy_vision_pro_app.sh`）。

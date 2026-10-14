@@ -159,6 +159,11 @@ shaders: build/vxrt build/hlslc.exe
 	@for s in $(SHADERS); do n=$${s%%:*}; p=$${s##*:}; \
 	  VXRT_ROOT=build/root build/vxrt build/hlslc.exe '$(D3DCOMPILER)' tests/shaders/$$n.hlsl main $$p tests/shaders/$$n.h $$n || exit 1; done
 
+# Games in VR against tools/baselines.json (tools/vxrt_run.py: own roots, simulated headset, evidence in runs/):
+# minutes per scenario; Mac Steam must be signed in and nothing else running. GAME=alyx|thelab|earth: only that one.
+vr-check: build/vxrt
+	python3 ../tools/vxrt_run.py --baselines $(GAME)
+
 # The tests' C: drive and registry live in build/root, not in ~/.vxrt.
 check: export VXRT_ROOT = build/root
 check: export VXRT_NO_ACTIVATE = 1
@@ -198,4 +203,4 @@ bench: build/vxrt build/drawbench.exe
 clean:
 	rm -rf build
 
-.PHONY: all tests check bench clean shaders
+.PHONY: vr-check all tests check bench clean shaders

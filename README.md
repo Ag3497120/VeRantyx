@@ -221,7 +221,19 @@ The same in a page: `python3 tools/vxrt_studio.py` opens VXRT Studio in the
 browser, a list of the games installed for VXRuntime (Steam libraries in the
 prefix and `~/Verantyx_VR_Drive/vxrt_library`) with what is known to work, the
 last run's problems, and buttons that copy a prompt (tune or make it run) and
-the launch command. It is served on 127.0.0.1 only and starts nothing itself.
+the launch command, or hand the job to an agent: "Let the AI do it" opens Terminal
+with Claude Code or Codex (your own login) in this repository, given the prompt
+and the vxrt MCP server, and the agent runs and measures the game itself. The
+page is served on 127.0.0.1 only; starting an agent needs the page's own token.
+
+The agents measure with a harness, `tools/vxrt_run.py` (also an MCP server,
+`tools/vxrt_mcp.py`, registered for Claude Code in `.mcp.json`): it runs a game
+in roots of its own with a simulated headset, refuses runs that would not be
+fair (you are playing, SteamVR is up, VR is off...), and writes what it saw as
+evidence (observed values with their files' hashes, claims derived against
+frozen baselines, suspicions, unknowns) into `runs/`, sealed in a hash-chained
+ledger. `make -C VXRuntime vr-check` runs every game with a baseline. Workflows
+for agents are in `.agents/skills/`.
 
 ## Compared with Glovebox
 

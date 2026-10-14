@@ -6,10 +6,12 @@ run, and the command that starts it.
     python3 tools/vxrt_studio.py [--port 8765] [--no-open]
 
 The prompts are the ones tools/vxrt_doctor.py writes; paste one into your AI tool started in this repository (the
-rules it follows are in AGENTS.md). The page is served on 127.0.0.1 only and only reads: nothing is sent anywhere,
-nothing is started from it.
+rules it follows are in AGENTS.md), or let the page start it: "AIに任せる" opens Terminal with Claude Code or Codex
+(your own login) in this repository, given the prompt and the vxrt MCP server (tools/vxrt_mcp.py), with which the
+agent runs and measures the game itself. The page is served on 127.0.0.1 only; starting an agent needs the page's
+own token (other sites cannot), and the agent asks you before it runs anything.
 """
-import argparse, glob, json, os, re, subprocess, sys, threading, time
+import argparse, glob, json, os, re, secrets, shlex, shutil, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -17,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vxrt_doctor as doctor                                    # noqa: E402
 
 REPO = doctor.REPO
+TOKEN = secrets.token_urlsafe(18)                               # in the page: a request starting an agent must carry it
 DRIVE = os.path.expanduser(os.environ.get("VERANTYX_VR_DRIVE", "~/Verantyx_VR_Drive"))
 PREFIX = os.environ.get("WINEPREFIX", os.path.join(DRIVE, "SteamVR_Prefix_Wine11_Test"))
 STEAM_ROOT = os.path.join(PREFIX, "drive_c", "Program Files (x86)", "steam")
@@ -96,6 +99,32 @@ def game_info(g, lang):
             "size_gb": round(g["size"] / 2**30, 1), "engine": engine, "anticheat": sorted(set(anticheat)),
             "status": status, "note": ja if lang == "ja" else en, "last_run": last_run(g["exe"])}
 
+def agents():
+    return {"claude": bool(shutil.which("claude")), "codex": bool(shutil.which("codex"))}
+
+def delegate(game, goal, lang, tool):
+    """Writes the prompt and a Terminal command file under runs/prompts/ and opens it: the agent starts in the
+    repository with the prompt as its first message and the vxrt MCP server, in its normal (asking) mode."""
+    prompt = doctor.build_prompt(game["exe"], goal, lang)
+    d = os.path.join(REPO, "runs", "prompts")
+    os.makedirs(d, exist_ok=True)
+    stem = os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + f"-{game['appid']}-{goal}-{tool}")
+    open(stem + ".md", "w").write(prompt)
+    q = shlex.quote
+    if tool == "claude":
+        # (run_game takes minutes: Claude Code's MCP tool timeout raised to 15 min)
+        line = f'MCP_TOOL_TIMEOUT=900000 claude --mcp-config .mcp.json "$(cat {q(stem + ".md")})"'
+    else:
+        server = os.path.join(REPO, "tools", "vxrt_mcp.py")
+        line = ("codex -c 'mcp_servers.vxrt.command=\"python3\"' -c " + q(f'mcp_servers.vxrt.args=["{server}"]') +
+                f" -c 'mcp_servers.vxrt.tool_timeout_sec=900' \"$(cat {q(stem + '.md')})\"")
+    with open(stem + ".command", "w") as f:
+        f.write(f"#!/bin/bash\n# VXRT Studio: {game['name']} ({goal}) with {tool}\ncd {q(REPO)} || exit 1\n{line}\n")
+    os.chmod(stem + ".command", 0o755)
+    if not os.environ.get("VXRT_STUDIO_NO_OPEN"):               # (tests: write the files, do not start anything)
+        subprocess.run(["open", "-a", "Terminal", stem + ".command"], check=True)
+    return os.path.relpath(stem + ".md", REPO)
+
 # ---- the page -----------------------------------------------------------------------------------------------------------
 PAGE = r"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -150,7 +179,9 @@ const S = {
         tune: "この Mac 向けに調整", tunehint: "設定だけを変えて fps と解像度を詰める", support: "動くようにする", supporthint: "足りない Windows API などを VXRuntime に実装する",
         make: "プロンプトを作る", making: "調べています…", copy: "コピー", copied: "コピーしました",
         run: "起動", quality: "画質", qdef: "標準", runhint: "ターミナルで実行します。SteamVR と一緒に起動し、Vision Pro アプリから接続します。Mac 版 Steam にサインインしておいてください。",
-        copycmd: "コマンドをコピー", last: "前回の実行", nolog: "まだ実行記録がありません", problems: "ログで見つかったこと", none: "問題なし" },
+        copycmd: "コマンドをコピー", last: "前回の実行", nolog: "まだ実行記録がありません", problems: "ログで見つかったこと", none: "問題なし",
+        delegate: "AIに任せる", delhint: "ターミナルが開き、選んだ AI がこのリポジトリで作業を始めます（あなたのログインのまま）。AI は vxrt のツールでゲームを自分で起動・計測します。コマンドの実行やファイルの変更は、AI ツールの確認画面で承認してください。プレイ中は計測を拒否します。",
+        started: "ターミナルで開始しました", notool: "（未インストール）" },
   en: { sub: "Prompts for running and tuning Windows VR games on VXRuntime",
         empty: "No installed games found (scripts/fetch_windows_vr_app.sh installs them)",
         pick: "Pick a game on the left", size: "GB", exe: "Executable", folder: "Folder", ac: "Has anti-cheat (it will not be circumvented): ",
@@ -158,9 +189,12 @@ const S = {
         tune: "Tune for this Mac", tunehint: "settings only: fps and resolution", support: "Make it run", supporthint: "implement missing Windows APIs and such in VXRuntime",
         make: "Make the prompt", making: "Looking at the game…", copy: "Copy", copied: "Copied",
         run: "Start", quality: "Quality", qdef: "default", runhint: "Run it in Terminal. It starts SteamVR too; connect from the Vision Pro app. Mac Steam must be signed in.",
-        copycmd: "Copy the command", last: "Last run", nolog: "Not run yet", problems: "Found in the log", none: "nothing" },
+        copycmd: "Copy the command", last: "Last run", nolog: "Not run yet", problems: "Found in the log", none: "nothing",
+        delegate: "Let the AI do it", delhint: "Opens Terminal with the chosen agent in this repository (your own login). It runs and measures the game itself with the vxrt tools; approve its commands and edits in the agent as usual. Runs are refused while you are playing.",
+        started: "Started in Terminal", notool: "(not installed)" },
 };
-let lang = localStorageGet("lang") || "ja", games = [], sel = null, goal = "support";
+const TOKEN = "__TOKEN__";
+let lang = localStorageGet("lang") || "ja", games = [], sel = null, goal = "support", tools = {};
 function localStorageGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 const $ = id => document.getElementById(id);
@@ -179,6 +213,7 @@ async function copy(text) {
 async function load() {
   $("lang").value = lang; $("sub").textContent = S[lang].sub; document.documentElement.lang = lang;
   games = await (await fetch("/api/games?lang=" + lang)).json();
+  tools = await (await fetch("/api/agents")).json();
   renderList();
   if (sel) renderDetail(games.find(g => g.appid === sel.appid)); else $("detail").replaceChildren(el("p", { class: "muted" }, games.length ? S[lang].pick : S[lang].empty));
 }
@@ -205,6 +240,17 @@ function renderDetail(g) {
     const r = await fetch(`/api/prompt?appid=${g.appid}&goal=${goal}&lang=${lang}`);
     out.value = await r.text(); makeBtn.disabled = false; copyBtn.disabled = !r.ok;
   };
+  const delegateRow = el("div", { class: "row", style: "margin-top:12px" }, el("strong", { class: "small" }, T.delegate),
+    ...[["claude", "Claude Code"], ["codex", "Codex"]].map(([k, label]) => {
+      const b = el("button", tools[k] ? {} : { disabled: "" }, label + (tools[k] ? "" : " " + T.notool));
+      b.onclick = async () => {
+        b.disabled = true;
+        const r = await fetch("/api/delegate", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: TOKEN, appid: g.appid, goal, lang, tool: k }) });
+        toast(r.ok ? T.started : await r.text()); b.disabled = false;
+      };
+      return b;
+    }));
   const q = el("select", {}, el("option", { value: "" }, T.qdef), el("option", { value: "2.5k" }, "2.5k"), el("option", { value: "3k" }, "3k"));
   const cmd = el("code", { class: "cmd" });
   const refresh = async () => { cmd.textContent = await (await fetch(`/api/command?appid=${g.appid}&quality=${q.value}`)).text(); };
@@ -222,7 +268,8 @@ function renderDetail(g) {
     g.anticheat.length ? el("div", { class: "warn small" }, T.ac + g.anticheat.join(", ")) : null,
     el("div", { class: "small muted" }, `${T.exe}: ${g.exe}`), el("div", { class: "small muted path" }, `${T.folder}: ${g.folder}`),
     el("div", { class: "box" }, el("h3", {}, T.ai), el("p", { class: "small muted" }, T.aihint), goalSel,
-       el("div", { class: "row", style: "margin:10px 0" }, makeBtn, copyBtn), out),
+       el("div", { class: "row", style: "margin:10px 0" }, makeBtn, copyBtn), out,
+       delegateRow, el("p", { class: "small muted" }, T.delhint)),
     el("div", { class: "box" }, el("h3", {}, T.run), el("p", { class: "small muted" }, T.runhint),
        el("div", { class: "row", style: "margin-bottom:8px" }, el("span", { class: "small" }, T.quality), q, el("button", { onclick: () => copy(cmd.textContent) }, T.copycmd)), cmd),
     last].filter(Boolean));
@@ -250,7 +297,9 @@ class Handler(BaseHTTPRequestHandler):
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         lang = q.get("lang", "ja") if q.get("lang") in ("ja", "en") else "ja"
         if u.path == "/":
-            return self.send(200, PAGE, "text/html; charset=utf-8")
+            return self.send(200, PAGE.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
+        if u.path == "/api/agents":
+            return self.send(200, json.dumps(agents()), "application/json")
         if u.path == "/api/games":
             return self.send(200, json.dumps([game_info(g, lang) for g in find_games()], ensure_ascii=False), "application/json")
         game = next((g for g in find_games() if g["appid"] == q.get("appid")), None)
@@ -266,6 +315,29 @@ class Handler(BaseHTTPRequestHandler):
             quality = q.get("quality") if q.get("quality") in ("2.5k", "3k") else ""
             return self.send(200, doctor.launch_command(game["exe"], quality))
         self.send(404, "not found")
+
+    def do_POST(self):
+        # Starting an agent: only from this page (its token, its origin, JSON so other sites' forms cannot post).
+        host = self.headers.get("Host", "")
+        origin = self.headers.get("Origin", "")
+        if host.split(":")[0] not in ("127.0.0.1", "localhost") or origin not in ("http://" + host,) or \
+           not self.headers.get("Content-Type", "").startswith("application/json") or urlparse(self.path).path != "/api/delegate":
+            return self.send(403, "forbidden")
+        try:
+            body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 10000)))
+        except ValueError:
+            return self.send(400, "bad request")
+        if not secrets.compare_digest(str(body.get("token", "")), TOKEN):
+            return self.send(403, "forbidden")
+        tool, goal = body.get("tool"), body.get("goal") if body.get("goal") in ("tune", "support") else "support"
+        lang = body.get("lang") if body.get("lang") in ("ja", "en") else "ja"
+        game = next((g for g in find_games() if g["appid"] == body.get("appid")), None)
+        if tool not in ("claude", "codex") or not agents().get(tool) or not game:
+            return self.send(400, "no such game or agent")
+        try:
+            return self.send(200, json.dumps({"prompt": delegate(game, goal, lang, tool)}), "application/json")
+        except Exception as e:
+            return self.send(500, "could not start: %s" % e)
 
     def log_message(self, fmt, *args):
         pass

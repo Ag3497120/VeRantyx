@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "vxrt": {
+      "command": "python3",
+      "args": ["tools/vxrt_mcp.py"]
+    }
+  }
+}
