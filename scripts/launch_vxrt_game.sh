@@ -43,14 +43,22 @@ esac
 # The Steam app ID, for the Steam bridge.
 APP_ID="${VXRT_APP_ID:-}"
 [[ -z "$APP_ID" && -f "$GAME_DIR/steam_appid.txt" ]] && APP_ID="$(tr -dc 0-9 < "$GAME_DIR/steam_appid.txt")"
+# A Steam library holds several manifests: the game's is the one whose install folder holds the executable
+# (steamapps/common/<installdir>; taking the first one gave Google Earth VR SteamVR's id). A steamcmd install
+# (force_install_dir) has the game's manifest beside it.
 if [[ -z "$APP_ID" ]]; then
     d="$GAME_DIR"
     while [[ "$d" != "/" && -z "$APP_ID" ]]; do
+        only=""
         for m in "$d"/steamapps/appmanifest_*.acf; do
             [[ -f "$m" ]] || continue
             id="$(basename "$m" | tr -dc 0-9)"
-            [[ "$id" != 228980 ]] && APP_ID="$id" && break   # (not Steamworks Common Redistributables)
+            [[ "$id" == 228980 ]] && continue                 # (Steamworks Common Redistributables)
+            inst="$(sed -n 's/.*"installdir"[[:space:]]*"\(.*\)".*/\1/p' "$m" | head -1)"
+            if [[ -n "$inst" && "$EXE" == "$d/steamapps/common/$inst/"* ]]; then APP_ID="$id"; break; fi
+            only="${only:+many}${only:-$id}"
         done
+        [[ -z "$APP_ID" && -n "$only" && "$only" != many* && "$EXE" != "$d/steamapps/common/"* ]] && APP_ID="$only"
         d="$(dirname "$d")"
     done
 fi
