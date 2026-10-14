@@ -94,13 +94,15 @@ def game_info(g, lang):
             "status": status, "note": ja if lang == "ja" else en, "last_run": last_run(g["exe"]),
             "known_issues": [k["summary"] for k in prof["known_issues"]]}
 
+CLIS = {"claude": "claude", "codex": "codex", "gemini": "gemini", "cursor": "cursor-agent"}   # agent -> its command
+
 def agents():
-    return {"claude": bool(shutil.which("claude")), "codex": bool(shutil.which("codex"))}
+    return {k: bool(shutil.which(c)) for k, c in CLIS.items()}
 
 def delegate(game, goal, lang, tool):
     """Writes the prompt and a Terminal command file under runs/prompts/ and opens it: the agent starts in the
     repository with the prompt as its first message and the vxrt MCP server, in its normal (asking) mode."""
-    prompt = doctor.build_prompt(game["exe"], goal, lang)
+    prompt = doctor.build_prompt(game["exe"], goal, lang, agent=tool)       # (worded for that agent's tools)
     d = os.path.join(REPO, "runs", "prompts")
     os.makedirs(d, exist_ok=True)
     stem = os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + f"-{game['appid']}-{goal}-{tool}")
@@ -109,7 +111,14 @@ def delegate(game, goal, lang, tool):
     if tool == "claude":
         # (run_game takes minutes: Claude Code's MCP tool timeout raised to 15 min)
         line = f'MCP_TOOL_TIMEOUT=900000 claude --mcp-config .mcp.json "$(cat {q(stem + ".md")})"'
+    elif tool == "gemini":
+        # (the vxrt server and its 15-minute timeout come from .gemini/settings.json; GEMINI.md brings AGENTS.md)
+        line = f'gemini --prompt-interactive "$(cat {q(stem + ".md")})"'
+    elif tool == "cursor":
+        # (Cursor's agent reads .cursor/mcp.json, .cursor/rules and AGENTS.md)
+        line = f'cursor-agent "$(cat {q(stem + ".md")})"'
     else:
+        # (passed on the command line: Codex reads .codex/config.toml only once the user trusts the project)
         server = os.path.join(REPO, "tools", "vxrt_mcp.py")
         line = ("codex -c 'mcp_servers.vxrt.command=\"python3\"' -c " + q(f'mcp_servers.vxrt.args=["{server}"]') +
                 f" -c 'mcp_servers.vxrt.tool_timeout_sec=900' \"$(cat {q(stem + '.md')})\"")
@@ -236,7 +245,8 @@ function renderDetail(g) {
     out.value = await r.text(); makeBtn.disabled = false; copyBtn.disabled = !r.ok;
   };
   const delegateRow = el("div", { class: "row", style: "margin-top:12px" }, el("strong", { class: "small" }, T.delegate),
-    ...[["claude", "Claude Code"], ["codex", "Codex"]].map(([k, label]) => {
+    ...[["claude", "Claude Code"], ["codex", "Codex"], ["gemini", "Gemini CLI"], ["cursor", "Cursor"]]
+      .filter(([k]) => tools[k] || k === "claude" || k === "codex").map(([k, label]) => {   // (the others only when installed)
       const b = el("button", tools[k] ? {} : { disabled: "" }, label + (tools[k] ? "" : " " + T.notool));
       b.onclick = async () => {
         b.disabled = true;
@@ -327,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
         tool, goal = body.get("tool"), body.get("goal") if body.get("goal") in ("tune", "support") else "support"
         lang = body.get("lang") if body.get("lang") in ("ja", "en") else "ja"
         game = next((g for g in find_games() if g["appid"] == body.get("appid")), None)
-        if tool not in ("claude", "codex") or not agents().get(tool) or not game:
+        if tool not in CLIS or not agents().get(tool) or not game:
             return self.send(400, "no such game or agent")
         try:
             return self.send(200, json.dumps({"prompt": delegate(game, goal, lang, tool)}), "application/json")

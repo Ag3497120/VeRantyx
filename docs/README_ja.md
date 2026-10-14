@@ -129,16 +129,28 @@ MacBook Pro（M1 Max）、2026-10-14 時点:
 
 ### AI コーディングツールでの最適化・ゲーム対応
 
-`tools/vxrt_doctor.py` は、ゲームを実行せずに中身（実行ファイルと DLL、エンジン、グラフィックス API、アンチチート、VXRuntime にまだない Windows の関数）と前回のログを調べ、AI コーディングツール（Claude Code、Codex、Gemini CLI、Cursor など）に貼るプロンプトを出力します。このリポジトリで起動したツールに貼ると、ツールは [AGENTS.md](../AGENTS.md)（規則、ビルド、計測方法、変えてよい設定）に従って作業します。スクリプトは何も外部に送信しません。
+このリポジトリを AI コーディングツールで開き、コマンドを使います。Claude Code、Codex、Gemini CLI、Cursor で同じコマンドです。
+
+```
+/vxrt-games              # 入っているゲーム、動作状況、最新の計測
+/vxrt-support thelab     # 動くようにする: 計測 → VXRuntime を直す → 実行で確かめる
+/vxrt-tune alyx          # 設定だけでこの Mac 向けに調整: 交互の計測 → 起動コマンド
+/vxrt-issue earth        # それでも動かない: 証拠から issue の下書き（投稿はあなただけ）
+```
+
+ゲームはプロファイルのキー、Steam のアプリ ID、フォルダか .exe で指定します。各ツールには、コマンド・vxrt の MCP サーバー・規則（[AGENTS.md](../AGENTS.md)）が、そのツールが読む形（`.claude/`、`.codex/config.toml`、`.gemini/` と `GEMINI.md`、`.cursor/`）で入っています。どれも `tools/vxrt_agents.py` が1つの元（`.agents/commands/`、`.mcp.json`、AGENTS.md）から書き出したものです。手順書は `.agents/skills/` にあります。Codex はプロジェクトを信頼済みにすると `.codex/config.toml` を読みます。
+
+コマンドは `tools/vxrt_doctor.py` が書く「課題の説明」から始まります。doctor はゲームを実行せずに中身（実行ファイルと DLL、エンジン、グラフィックス API、アンチチート、VXRuntime にまだない Windows の関数）と前回のログを調べ、目標、完了の条件（ハーネスで確かめられること）、JSON の事実、先に使うツール（ツールごとの呼び方: `--agent claude|codex|gemini|cursor`）、規則、止まるとき、報告の形を書きます。スクリプトは何も外部に送信しません。自分で貼る場合:
 
 ```bash
-tools/vxrt_doctor.py "<ゲームのフォルダか .exe>" --goal tune --copy      # 設定だけでこの Mac 向けに最適化
-tools/vxrt_doctor.py "<ゲームのフォルダか .exe>" --goal support --copy   # 動くようにする（VXRuntime を変更）
+tools/vxrt_doctor.py thelab --goal support --agent codex --copy   # 動くようにする（VXRuntime を変更）
+tools/vxrt_doctor.py alyx --goal tune --copy                      # 設定だけでこの Mac 向けに調整
+tools/vxrt_doctor.py earth --facts                                # 事実だけを JSON で
 ```
 
 アンチチートのあるゲームは検出して注意を出し、回避はしません。
 
-同じことを画面で: `python3 tools/vxrt_studio.py` でブラウザに VXRT Studio が開きます。VXRuntime 用に入っているゲーム（prefix 内の Steam ライブラリと `~/Verantyx_VR_Drive/vxrt_library`）の一覧、動作状況、前回の実行で見つかった問題を表示し、プロンプト（調整／動くようにする）と起動コマンドをボタンでコピーできます。「AIに任せる」を押すと、ターミナルで Claude Code か Codex（あなたのログインのまま）がこのリポジトリで起動し、プロンプトと vxrt の MCP サーバーを受け取って、ゲームの起動・計測から修正まで自分で進めます。127.0.0.1 だけで動き、AI の起動にはページ固有の合言葉が必要です（他のサイトからは起動できません）。
+同じことを画面で: `python3 tools/vxrt_studio.py` でブラウザに VXRT Studio が開きます。VXRuntime 用に入っているゲーム（prefix 内の Steam ライブラリと `~/Verantyx_VR_Drive/vxrt_library`）の一覧、動作状況、前回の実行で見つかった問題を表示し、プロンプト（調整／動くようにする）と起動コマンドをボタンでコピーできます。「AIに任せる」を押すと、ターミナルで Claude Code か Codex（入っていれば Gemini CLI と Cursor のエージェントも。あなたのログインのまま）がこのリポジトリで起動し、プロンプトと vxrt の MCP サーバーを受け取って、ゲームの起動・計測から修正まで自分で進めます。127.0.0.1 だけで動き、AI の起動にはページ固有の合言葉が必要です（他のサイトからは起動できません）。
 
 AI はハーネス `tools/vxrt_run.py`（MCP サーバー `tools/vxrt_mcp.py` としても使え、Claude Code には `.mcp.json` で登録）で計測します。ゲームを専用のフォルダで、仮想のヘッドセットで動かし、公平に測れない実行（プレイ中、SteamVR が起動中、VR がオフなど）は理由付きで拒否します。見たことは証拠として `runs/` に書きます（観測値とその元ファイルのハッシュ、凍結した基準値から導いた結論、推測、不明点）。記録はハッシュでつないだ台帳に残ります。`make -C VXRuntime vr-check` で基準値のあるゲームをすべて確かめます。AI 向けの手順書は `.agents/skills/` にあります。
 

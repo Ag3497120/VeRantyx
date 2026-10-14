@@ -159,7 +159,7 @@ shaders: build/vxrt build/hlslc.exe
 	@for s in $(SHADERS); do n=$${s%%:*}; p=$${s##*:}; \
 	  VXRT_ROOT=build/root build/vxrt build/hlslc.exe '$(D3DCOMPILER)' tests/shaders/$$n.hlsl main $$p tests/shaders/$$n.h $$n || exit 1; done
 
-# Games in VR against tools/baselines.json (tools/vxrt_run.py: own roots, simulated headset, evidence in runs/):
+# Games in VR against their profiles' baselines, games/*.json (tools/vxrt_run.py: own roots, simulated headset, evidence in runs/):
 # minutes per scenario; Mac Steam must be signed in and nothing else running. GAME=alyx|thelab|earth: only that one.
 vr-check: build/vxrt
 	python3 ../tools/vxrt_run.py --baselines $(GAME)
@@ -169,6 +169,7 @@ check: export VXRT_ROOT = build/root
 check: export VXRT_NO_ACTIVATE = 1
 check: all
 	python3 ../tools/vxrt_games.py check
+	python3 ../tools/vxrt_agents.py check
 	build/vxrt build/hello_k32.exe
 	build/vxrt build/hello_crt.exe one "two words"
 	build/vxrt build/threads.exe

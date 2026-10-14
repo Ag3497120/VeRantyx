@@ -260,19 +260,38 @@ MacBook Pro (M1 Max), 2026-10-14:
 
 ### Tuning a game or making one run, with an AI coding tool
 
-`tools/vxrt_doctor.py` looks at a game without running it (its executables and
-DLLs, engine, graphics API, anti-cheat, and the Windows functions VXRuntime does
-not have yet) and at its last log, and prints a prompt for your AI coding tool
-(Claude Code, Codex, Gemini CLI, Cursor...). Paste it into the tool, started in
-this repository: the tool follows [AGENTS.md](AGENTS.md) (rules, build, how to
-measure, which settings it may change). Nothing is sent anywhere by the script.
+Open the repository in your AI coding tool and use its commands; they are the
+same in Claude Code, Codex, Gemini CLI and Cursor:
 
-```bash
-tools/vxrt_doctor.py "<game folder or .exe>" --goal tune --copy      # settings only, for this Mac
-tools/vxrt_doctor.py "<game folder or .exe>" --goal support --copy   # make it run: changes VXRuntime
+```
+/vxrt-games              # what is installed, what is known to work, the latest runs
+/vxrt-support thelab     # make a game run: measure, fix VXRuntime, prove it with a run
+/vxrt-tune alyx          # settings only, for this Mac: alternating runs, a launch command
+/vxrt-issue earth        # still failing: an issue draft from the evidence (only you post it)
 ```
 
-Prompts are in Japanese by default (`--lang en` for English). Games with
+A game is named by its profile key, Steam app id, or folder/.exe. Each tool
+gets the commands, the vxrt MCP server and the rules ([AGENTS.md](AGENTS.md))
+in the form it reads (`.claude/`, `.codex/config.toml`, `.gemini/` + `GEMINI.md`,
+`.cursor/`), all written by `tools/vxrt_agents.py` from one source
+(`.agents/commands/`, `.mcp.json`, AGENTS.md); workflows are in `.agents/skills/`.
+Codex reads `.codex/config.toml` once you trust the project.
+
+The commands start from a brief written by `tools/vxrt_doctor.py`, which looks
+at the game without running it (executables and DLLs, engine, graphics API,
+anti-cheat, the Windows functions VXRuntime does not have yet) and at its last
+log. The brief says the goal, when the task is done (checkable with the
+harness), the facts as JSON, the tools to use first (worded for the tool:
+`--agent claude|codex|gemini|cursor`), the rules, when to stop and what to
+report. Nothing is sent anywhere by the script. To paste it yourself:
+
+```bash
+tools/vxrt_doctor.py thelab --goal support --agent codex --copy   # make it run: changes VXRuntime
+tools/vxrt_doctor.py alyx --goal tune --copy                      # settings only, for this Mac
+tools/vxrt_doctor.py earth --facts                                # only the facts, as JSON
+```
+
+Briefs are in Japanese by default (`--lang en` for English). Games with
 anti-cheat are flagged and not worked around.
 
 The same in a page: `python3 tools/vxrt_studio.py` opens VXRT Studio in the
@@ -280,7 +299,7 @@ browser, a list of the games installed for VXRuntime (Steam libraries in the
 prefix and `~/Verantyx_VR_Drive/vxrt_library`) with what is known to work, the
 last run's problems, and buttons that copy a prompt (tune or make it run) and
 the launch command, or hand the job to an agent: "Let the AI do it" opens Terminal
-with Claude Code or Codex (your own login) in this repository, given the prompt
+with Claude Code or Codex (Gemini CLI and Cursor's agent too, when installed; your own login) in this repository, given the prompt
 and the vxrt MCP server, and the agent runs and measures the game itself. The
 page is served on 127.0.0.1 only; starting an agent needs the page's own token.
 

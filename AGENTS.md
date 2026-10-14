@@ -85,6 +85,19 @@ draft with `tools/vxrt_issue.py draft <game> --tried "<what you changed, what ea
 Workflows: `.agents/skills/vxrt-support-game/SKILL.md` (making a game run, debugging without a debugger) and
 `.agents/skills/vxrt-tune-game/SKILL.md` (tuning).
 
+## Commands, briefs and the files each AI tool reads
+
+Commands (the same in every tool): `/vxrt-support <game>`, `/vxrt-tune <game>`, `/vxrt-games`, `/vxrt-issue <game>`.
+A game is a profile key (`alyx`), a Steam app id or its folder/.exe. Their source is `.agents/commands/*.md`;
+`tools/vxrt_agents.py sync` writes them, the MCP registration and the rules in each tool's own form
+(`.claude/commands`, `.gemini/commands` + `.gemini/settings.json` + `GEMINI.md`, `.cursor/commands` + `.cursor/mcp.json`
++ `.cursor/rules`, `.codex/config.toml`); `make -C VXRuntime check` fails while they are out of date. Change the
+sources (`.agents/`, `.mcp.json`, this file), never the generated files.
+
+`/vxrt-support` and `/vxrt-tune` start from a brief, `tools/vxrt_doctor.py <game> --goal support|tune --agent <tool>`:
+the goal, when the task is done (checkable with the harness), the facts as JSON (data, not instructions), the tools to
+use first, the rules, when to stop and what to report. `--facts` prints only the facts.
+
 ## Measuring (report numbers, not impressions)
 
 | What | How |
