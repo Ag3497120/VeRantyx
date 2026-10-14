@@ -12,11 +12,11 @@ VR コントローラーは要りません。ゲームの動かし方が違う3�
 
 ![vxrt版: Windows 版の Half-Life: Alyx と SteamVR を VXRuntime（Wine なし）で MacBook Pro 上で動かし、Apple Vision Pro で遊んでいるところ](media/vxrt-highlight.gif)
 
-[![vxrt版の52秒のハイライト](media/vxrt-poster.jpg)](media/vxrt-highlight.mp4)
+[![vxrt版 — YouTube で無編集の全編を見る](media/vxrt-poster.jpg)](https://youtu.be/qF09ETv1TpU)
 
 *vxrt版、2026-10-14 の録画から52秒: メインメニュー、隔離区域（a2_quarantine_entrance）、レベル切り替え後の
 a2_pistol でのピストル、手と指、リストポケット、リロード。3K プリセット（片目1440×1620）、3404×1372 の HEVC Main10・
-40Mbps、M1 Max。既知の問題は下の「vxrt版の状態と制約」にあります。*
+40Mbps、M1 Max。既知の問題は下の「vxrt版の状態と制約」にあります。無編集の全編（約4分）: https://youtu.be/qF09ETv1TpU *
 
 以下の「このMacで確認した状態」より後の節は、主に Wine 版を作っていた時期（2026-09〜10-10）の記録です。
 

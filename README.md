@@ -26,8 +26,7 @@ app (`VisionProClient/`).
 
 ![vxrt version: the Windows build of Half-Life: Alyx and the Windows SteamVR running on VXRuntime (no Wine) on a MacBook Pro, played in Apple Vision Pro — main menu, the quarantine zone, then after a level change the pistol, hands and fingers, the wrist pocket and reloading](docs/media/vxrt-highlight.gif)
 
-<!-- When the full recording is on YouTube, point this poster at it (https://youtu.be/...). -->
-[![vxrt version — 52-second highlight](docs/media/vxrt-poster.jpg)](docs/media/vxrt-highlight.mp4)
+[![vxrt version — watch the full recording on YouTube](docs/media/vxrt-poster.jpg)](https://youtu.be/qF09ETv1TpU)
 
 *vxrt version, 52-second highlight: [docs/media/vxrt-highlight.mp4](docs/media/vxrt-highlight.mp4).
 The main menu, the quarantine zone (a2_quarantine_entrance), then, after the
@@ -36,7 +35,8 @@ wrist pocket and reloading. The Windows build of the game and the Windows
 SteamVR, on VXRuntime instead of Wine; 3K preset (1440×1620 per eye), streamed
 at 3404×1372 HEVC Main10, 40 Mbps, on an M1 Max. Hands are Vision Pro hand
 tracking, buttons and sticks are Joy-Con. Known problems, such as green
-artefacts on some surfaces, are listed under [its status](#status-and-limits-vxrt-version).*
+artefacts on some surfaces, are listed under [its status](#status-and-limits-vxrt-version).
+Full 4-minute unedited recording of the vxrt version: https://youtu.be/qF09ETv1TpU.*
 
 ### Native version (Linux ARM64 build, no Wine) — recorded 2026-10-11
 
