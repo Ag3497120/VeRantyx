@@ -1341,6 +1341,29 @@ static id<MTLComputePipelineState> vs_kernel_pipeline(d3d_context *c, d3d_draw_s
     pthread_mutex_unlock(&lock);
     return pso;
 }
+// Whether a geometry draw's kernels can run ahead of the command buffer being recorded: everything they read
+// (vertex, index and constant buffers, the vertex and geometry stages' resources) holds what the CPU put there,
+// not what GPU work recorded since the last submission writes (render targets, depth, UAVs, stream output, copies).
+static int gpu_may_write(const d3d_object *o, uint64_t submitted) {
+    if (!o) return 0;
+    if (o->gpu_seq > submitted) return 1;
+    uint32_t bind = o->kind == K_BUFFER ? ((const d3d_buffer *)o)->desc[2] : o->kind == K_TEXTURE ? ((const d3d_texture *)o)->desc[TD_BIND] : 0;
+    return (bind & (0x10 | 0x20 | 0x40 | 0x80)) != 0;     // stream output, render target, depth stencil, unordered access
+}
+static int gs_inputs_from_cpu(d3d_context *c, d3d_draw_state *s) {
+    uint64_t sub = __atomic_load_n(&c->base.dev->submitted, __ATOMIC_ACQUIRE);
+    static int told;
+    #define GS_NOT_EARLY(what, i, o) do { if (vx_trace && told++ < 10) vx_log("Direct3D: geometry draw in pass order: %s %d (kind %d, gpu_seq %llu)", what, i, (o)->kind, (unsigned long long)(o)->gpu_seq); return 0; } while (0)
+    for (int i = 0; i < 16; i++) if (s->vb[i] && gpu_may_write(&s->vb[i]->base, sub)) GS_NOT_EARLY("vertex buffer", i, &s->vb[i]->base);
+    if (s->ib && gpu_may_write(&s->ib->base, sub)) GS_NOT_EARLY("index buffer", 0, &s->ib->base);
+    static const int stages[2] = { STAGE_VS, STAGE_GS };
+    for (int k = 0; k < 2; k++) {
+        for (int i = 0; i < 14; i++) if (s->cb[stages[k]][i] && gpu_may_write(&s->cb[stages[k]][i]->base, sub)) GS_NOT_EARLY(k ? "GS constants" : "VS constants", i, &s->cb[stages[k]][i]->base);
+        for (int i = 0; i < 32; i++) if (s->srv[stages[k]][i] && gpu_may_write(s->srv[stages[k]][i]->resource, sub)) GS_NOT_EARLY(k ? "GS resource" : "VS resource", i, s->srv[stages[k]][i]->resource);
+    }
+    #undef GS_NOT_EARLY
+    return 1;
+}
 static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t start, int32_t base_vertex, uint32_t start_instance, int indexed) {
     d3d_draw_state *s = state_of(c);
     d3d_shader *vs = s->shader[STAGE_VS], *gs = s->shader[STAGE_GS];
@@ -1366,8 +1389,24 @@ static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t
     id<MTLBuffer> vs_out = [dev newBufferWithLength:(NSUInteger)count * instances * vsn * 16 options:MTLResourceStorageModePrivate];
     id<MTLBuffer> gs_out = [dev newBufferWithLength:(NSUInteger)prims * instances * tris * 3 * gsn * 16 options:MTLResourceStorageModePrivate];
     if (!vs_out || !gs_out) return;
-    d3d_end_render(c);
-    id<MTLComputeCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoder];
+    // Inputs only the CPU wrote: the kernels go to the command buffer that runs first, and the render pass in
+    // progress stays open (Half-Life: Alyx's menu has 30 geometry draws a frame on the eye targets: each one wrote
+    // out and reloaded them, 60 GB/s, 22 fps).
+    static int early_ok = -1;
+    if (early_ok < 0) early_ok = getenv("VXRT_GS_EARLY") != NULL;    // (being measured: off by default)
+    int early = early_ok && gs_inputs_from_cpu(c, s);
+    id<MTLComputeCommandEncoder> enc;
+    if (early) {
+        if (!c->pre) {
+            id<MTLCommandBuffer> pre = [(__bridge id<MTLCommandQueue>)c->base.dev->queue commandBuffer];
+            c->pre = (void *)CFBridgingRetain(pre);
+            c->pre_enc = (void *)CFBridgingRetain([pre computeCommandEncoder]);
+        }
+        enc = (__bridge id<MTLComputeCommandEncoder>)c->pre_enc;
+    } else {
+        d3d_end_render(c);
+        enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoder];
+    }
     // The vertex kernel: vertex buffers moved to the first vertex (or the base vertex of indexed draws).
     [enc setComputePipelineState:vk];
     for (int i = 0; i < 16; i++) {
@@ -1394,7 +1433,7 @@ static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t
     [enc setBuffer:vs_out offset:0 atIndex:DXBC_GS_IN];
     [enc setBuffer:gs_out offset:0 atIndex:DXBC_GS_OUT];
     [enc dispatchThreads:MTLSizeMake(prims, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, gk.maxTotalThreadsPerThreadgroup), 1, 1)];
-    [enc endEncoding];
+    if (!early) [enc endEncoding];
     // The triangles.
     s->gs_vertices = (__bridge void *)gs_out;
     MTLPrimitiveType type;

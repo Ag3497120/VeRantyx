@@ -124,6 +124,9 @@ typedef struct {
     int prof_sample;                 // VXRT_GPU_PROFILE: the open render pass's first sample, until its shader is noted
     d3d_pending_clear clears[9];     // clears waiting for the next render pass (its load action) or other GPU work
     int nclears;
+    // Geometry-shader kernels whose inputs the CPU wrote run in a command buffer of their own (pre, with one open
+    // compute encoder pre_enc), committed before cmd: the render pass in progress need not end for them.
+    void *pre, *pre_enc;
 } d3d_context;
 void d3d_clears_flush(d3d_context *c);                                   // does the pending clears as passes of their own
 int d3d_same_target(const d3d_view *a, const d3d_view *b);              // d3d11.m: the same subresource, as the same format

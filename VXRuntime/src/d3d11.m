@@ -489,6 +489,8 @@ void d3d_end_render(d3d_context *c) {
     if (g_end_stats) {
         int multi = c->render_dsv && ((d3d_texture *)c->render_dsv->resource)->desc[TD_SAMPLES] > 1;
         for (int i = 0; i < 8 && !multi; i++) multi = c->render_rtv[i] && c->render_rtv[i]->resource->kind == K_TEXTURE && ((d3d_texture *)c->render_rtv[i]->resource)->desc[TD_SAMPLES] > 1;
+        // (and passes on large targets: the eyes' own, 2048 wide or more)
+        if (!multi && c->render_rtv[0] && c->render_rtv[0]->resource->kind == K_TEXTURE) multi = ((d3d_texture *)c->render_rtv[0]->resource)->desc[TD_WIDTH] >= 2048;
         if (multi) {
             Dl_info info;
             void *caller = __builtin_return_address(0);
@@ -586,6 +588,13 @@ static void flush_work(d3d_device *dev, int wait) {
     d3d_context *c = (d3d_context *)dev->context;
     d3d_end_render(c);
     if (c->nclears) d3d_clears_flush(c);
+    if (c->pre) {                                               // (before the work that reads what it made)
+        [(__bridge id<MTLComputeCommandEncoder>)c->pre_enc endEncoding];
+        CFRelease(c->pre_enc); c->pre_enc = NULL;
+        id<MTLCommandBuffer> pre = CFBridgingRelease(c->pre);
+        c->pre = NULL;
+        [pre commit];
+    }
     if (!c->cmd) {
         if (wait) {                                             // still wait for work committed earlier
             id<MTLCommandBuffer> fence = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
