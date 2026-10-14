@@ -444,7 +444,10 @@ static void load(gen *g, const instr *in) {
     else if (dim == DIM_2DMS || dim == DIM_2DMSARRAY) {
         char s[700]; int c0 = 0;
         src(g, &in->ops[3], &c0, 1, K_INT, s, sizeof s);
-        snprintf(call, sizeof call, "t%u.read(%s(%s)%s%s, uint(%s))", t, ut, xy, slice[0] ? ", " : "", slice, s);
+        // The sample index wraps at the texture's sample count: with VXRT_MSAA_MAX lowering a game's 4x targets to 2x,
+        // a shader resolving 4 samples itself (Half-Life: Alyx) read samples 2 and 3 that do not exist (undefined:
+        // the menu's title came out red instead of yellow); wrapped it reads 0 1 0 1, the same average.
+        snprintf(call, sizeof call, "t%u.read(%s(%s)%s%s, uint(%s) %% t%u.get_num_samples())", t, ut, xy, slice[0] ? ", " : "", slice, s, t);
     } else snprintf(call, sizeof call, "t%u.read(%s(%s)%s%s, uint(%s))", t, ut, xy, slice[0] ? ", " : "", slice, mip);
     if (g->tex_cmp[t]) { char c[2500]; snprintf(c, sizeof c, "float4(%s)", call); snprintf(call, sizeof call, "%s", c); }
     int comps[4], n = dest_comps(dst, comps);
