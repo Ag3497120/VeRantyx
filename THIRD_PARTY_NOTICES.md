@@ -34,4 +34,8 @@ own Steam account:
   the game in memory at load (byte-checked by hash, see
   `NativeARM/host/kl_guestfix.c`) and never writes to the game's files.
 
-Apple's Game Porting Toolkit (D3DMetal) is not used, distributed or required.
+Apple's Game Porting Toolkit (D3DMetal) is not distributed or required, and the
+normal setup does not use it. An optional, experimental Wine-version backend
+(`VERANTYX_D3D_BACKEND=d3dmetal`, `scripts/install_d3dmetal.sh`) uses D3DMetal
+only from a copy you obtained from Apple yourself (`GPTK_ROOT`); nothing of it
+is downloaded or copied into this repository.

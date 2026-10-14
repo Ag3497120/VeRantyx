@@ -65,7 +65,10 @@ MIT licensed. No proprietary code is included (see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)): Wine, DXVK and Steam are
 downloaded from their publishers by the setup script, SteamVR and the game
 come from your own Steam account, and Apple's Game Porting Toolkit is neither
-used nor shipped. The vxrt version uses no Wine, DXVK or MoltenVK at all: its
+shipped nor needed: the normal setup does not use it, and an optional,
+experimental Wine-version backend (`VERANTYX_D3D_BACKEND=d3dmetal`, see
+[docs/SETUP.md](docs/SETUP.md)) uses D3DMetal only from a copy you obtained from
+Apple yourself. The vxrt version uses no Wine, DXVK or MoltenVK at all: its
 Windows runtime and Direct3D 11 → Metal translator are written in this
 repository.
 
