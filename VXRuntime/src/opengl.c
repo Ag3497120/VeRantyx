@@ -10,6 +10,7 @@
 #include <OpenGL/gltypes.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "gl_thunks.h"
@@ -111,7 +112,91 @@ static const vx_export g_wgl[] = {
     VX_EXPORT(wglSwapIntervalEXT), VX_EXPORT(wglGetSwapIntervalEXT), VX_EXPORT(wglChoosePixelFormatARB),
     VX_EXPORT(wglGetPixelFormatAttribivARB),
 };
+// VXRT_TRACE_GL=1: shaders that do not compile and programs that do not link, with the driver's log and the source's
+// first line (a program asking for a newer GLSL than its context has).
+#define GL_COMPILE_STATUS 0x8B81
+#define GL_LINK_STATUS 0x8B82
+static int g_trace_gl = -1;
+static WINAPI void checked_glCompileShader(GLuint shader) {
+    if (!CGLGetCurrentContext()) return;
+    r_glCompileShader(shader);
+    GLint ok = 1;
+    r_glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (ok) return;
+    char log[1024] = "", src[160] = "";
+    r_glGetShaderInfoLog(shader, sizeof log, NULL, log);
+    r_glGetShaderSource(shader, sizeof src, NULL, src);
+    char *nl = strchr(src, '\n'); if (nl) *nl = 0;
+    static int told;
+    if (told++ < 50) vx_log("OpenGL: shader %u did not compile (%s): %s", shader, src, log);
+    const char *dir = getenv("VXRT_TRACE_GL_DIR");
+    GLint len = 0;
+    r_glGetShaderiv(shader, 0x8B88 /* GL_SHADER_SOURCE_LENGTH */, &len);
+    if (dir && len > 0) {
+        char *all = malloc((size_t)len + 1), path[1024];
+        r_glGetShaderSource(shader, len + 1, NULL, all);
+        snprintf(path, sizeof path, "%s/shader%03u.glsl", dir, shader);
+        FILE *f = fopen(path, "w"); if (f) { fputs(all, f); fprintf(f, "\n/* %s */\n", log); fclose(f); }
+        free(all);
+    }
+}
+static WINAPI void checked_glLinkProgram(GLuint program) {
+    if (!CGLGetCurrentContext()) return;
+    r_glLinkProgram(program);
+    GLint ok = 1;
+    r_glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (ok) return;
+    char log[1024] = "";
+    r_glGetProgramInfoLog(program, sizeof log, NULL, log);
+    static int told;
+    if (told++ < 50) vx_log("OpenGL: program %u did not link: %s", program, log);
+}
+// GLSL that macOS's legacy (2.1) context does not take: OpenGL ES's "#version 100" becomes desktop 1.20 (the
+// precision qualifiers defined away, precision statements dropped). VXRT_TRACE_GL also dumps each source that still
+// fails to $VXRT_TRACE_GL_DIR.
+static char *glsl_for_mac(const char *src) {
+    const char *v = strstr(src, "#version 100");
+    if (!v) return NULL;
+    size_t len = strlen(src);
+    char *out = malloc(len + 128), *o = out;
+    memcpy(o, src, (size_t)(v - src)); o += v - src;
+    o += sprintf(o, "#version 120\n#define lowp\n#define mediump\n#define highp\n");
+    const char *p = v + strlen("#version 100");
+    while (*p && *p != '\n') p++;
+    while (*p) {                                    // line by line, without "precision ...;" statements
+        const char *e = strchr(p, '\n'); size_t l = e ? (size_t)(e - p + 1) : strlen(p);
+        const char *q = p; while (q < p + l && (*q == ' ' || *q == '\t' || *q == '\n')) q++;
+        if (strncmp(q, "precision ", 10)) { memcpy(o, p, l); o += l; }
+        p += l;
+    }
+    *o = 0;
+    return out;
+}
+static WINAPI void mac_glShaderSource(GLuint shader, GLsizei count, const GLchar *const *strings, const GLint *lengths) {
+    if (!CGLGetCurrentContext()) return;
+    size_t total = 0;
+    for (GLsizei i = 0; i < count; i++) total += lengths && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]);
+    char *all = malloc(total + 1), *a = all;
+    for (GLsizei i = 0; i < count; i++) {
+        size_t l = lengths && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]);
+        memcpy(a, strings[i], l); a += l;
+    }
+    *a = 0;
+    char *fixed = glsl_for_mac(all);
+    const GLchar *one = fixed ? fixed : all;
+    r_glShaderSource(shader, 1, &one, NULL);
+    free(fixed); free(all);
+}
+static const vx_export g_checked[] = { { "glCompileShader", (void *)checked_glCompileShader }, { "glLinkProgram", (void *)checked_glLinkProgram } };
+static void *checked(const char *name) {
+    if (!strcmp(name, "glShaderSource")) return (void *)mac_glShaderSource;
+    if (g_trace_gl < 0) g_trace_gl = getenv("VXRT_TRACE_GL") != NULL;
+    if (g_trace_gl) for (size_t i = 0; i < sizeof g_checked / sizeof g_checked[0]; i++) if (!strcmp(g_checked[i].name, name)) return g_checked[i].fn;
+    return NULL;
+}
 static void *gl_function(const char *name) {        // g_gl_functions is sorted by name
+    void *c = checked(name);
+    if (c) return c;
     size_t lo = 0, hi = NFUNCS;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
@@ -163,7 +248,10 @@ void vx_opengl_init(void) {
     g_exports[n++] = (vx_export)VX_EXPORT(wglGetProcAddress);
     for (size_t i = 0; i < NFUNCS; i++) {
         *g_gl_functions[i].real = gl ? dlsym(gl, g_gl_functions[i].name) : NULL;
-        if (*g_gl_functions[i].real) g_exports[n++] = (vx_export){ g_gl_functions[i].name, g_gl_functions[i].thunk };
+        if (*g_gl_functions[i].real) {
+            void *c = checked(g_gl_functions[i].name);
+            g_exports[n++] = (vx_export){ g_gl_functions[i].name, c ? c : g_gl_functions[i].thunk };
+        }
     }
     vx_register_module("opengl32.dll", g_exports, n);
 }
