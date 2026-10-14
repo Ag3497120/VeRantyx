@@ -263,7 +263,7 @@ TEXT = {
         "task_tune": "## お願いしたいこと\n1. 計測は tools/vxrt_run.py {harness}（または MCP ツール vxrt の run_game）で行う。ヘッドセットなしで別フォルダに起動し、観測・導出・推測・不明に分けた結果（runs/<run_id>/result.json）を返す。前提条件を満たさず拒否されたら、その理由を報告して止まる（ユーザーのゲームを止めない）。\n2. 変えてよい項目（AGENTS.md の「調整できる設定」）だけを使い、目標（表示 Hz に張り付く fps、なるべく高い解像度）に近づける。設定の比較は交互に複数回（A B B A）。\n3. 試した設定と結果を表にし、各数値に run_id と観測 ID（o#）を付ける。一番良い組み合わせを起動コマンド（環境変数・ゲームの引数）として示す。推測（i#）は推測として書く。",
         "task_support": "## お願いしたいこと\n1. まず tools/vxrt_run.py {harness}（または MCP ツール vxrt の run_game）で今の状態を測る。結果の first_problem・unimplemented_calls・例外数から、ゲームの起動や描画を止めているものを特定する（上の「ない関数」は静的な一覧で、呼ばれるとは限らない）。\n2. VXRuntime/src に実装・修正を加え、テストを足して make -C VXRuntime check を通す。\n3. もう一度 vxrt_run.py で測り、何が動いて何が残っているかを run_id と観測 ID（o#）・導出（d#）を付けて報告する。make -C VXRuntime vr-check で既存のゲームが壊れていないことも確かめる。コミットは確かめたものだけ。",
         "anticheat": "注意：このゲームにはアンチチート（{}）があります。回避は行わず、オフラインで遊べる部分があるかの確認にとどめてください。",
-        "none": "なし", "others": "ほかの実行ファイル", "launch": "起動コマンド（SteamVR と一緒に起動する）",
+        "none": "なし", "others": "ほかの実行ファイル", "launch": "起動コマンド（SteamVR と一緒に起動する）", "profile": "ゲームプロファイル",
     },
     "en": {
         "intro_tune": "In this repository (VeRantyx / VXRuntime), tune the following Windows VR game for this Mac. Settings only: do not change the runtime's code.",
@@ -277,7 +277,7 @@ TEXT = {
         "task_tune": "## What to do\n1. Measure with tools/vxrt_run.py {harness} (or the vxrt MCP tool run_game): it starts the game without a headset in roots of its own and returns evidence split into observed / derived / inferred / unknown (runs/<run_id>/result.json). If it refuses, report the reason and stop (never stop the user's game).\n2. Using only the settings AGENTS.md lists as tunable, get as close as you can to the goal (fps at the display rate, as high a resolution as possible). Compare settings in alternating runs (A B B A).\n3. Report the settings tried as a table, each number with its run_id and observation id (o#), and give the best combination as a launch command. Mark inferences (i#) as such.",
         "task_support": "## What to do\n1. First measure the current state with tools/vxrt_run.py {harness} (or the vxrt MCP tool run_game). Use its first_problem, unimplemented_calls and exception counts to find what stops the game (the missing functions above are a static list: not all are called).\n2. Implement or fix it in VXRuntime/src, add tests, and get make -C VXRuntime check to pass.\n3. Measure again with vxrt_run.py and report what works and what is left, citing run_ids, observation ids (o#) and derived claims (d#). Check with make -C VXRuntime vr-check that the games that ran still do. Commit only what you have verified.",
         "anticheat": "Note: this game has anti-cheat ({}). Do not circumvent it; only check whether parts of it can be played offline.",
-        "none": "none", "others": "other executables", "launch": "Launch command (starts SteamVR too)",
+        "none": "none", "others": "other executables", "launch": "Launch command (starts SteamVR too)", "profile": "Game profile",
     },
 }
 
@@ -359,7 +359,17 @@ def analyze(game, log=None, root_c=DEFAULT_ROOT, dll_path=DEFAULT_DLL_PATH):
         "missing_dlls": sorted(nodll),
         "log": log, "log_problems": {k: dict(sorted(v.items(), key=lambda kv: -kv[1])[:8]) for k, v in found.items()},
         "recent_submit_fps": fps[-12:] if fps else None,
+        "profile": _profile(appid),
     }
+
+def _profile(appid):
+    """What games/<appid>.json says (status, known issues, notes), or None."""
+    try:
+        import vxrt_games
+        p = vxrt_games.load_all().get(appid or "")
+    except Exception:
+        return None
+    return {"file": f"games/{appid}.json", "status": p["status"], "known_issues": p["known_issues"], "notes": p["notes"]} if p else None
 
 def build_prompt(game, goal="support", lang="ja", log=None, root_c=DEFAULT_ROOT, dll_path=DEFAULT_DLL_PATH):
     """The prompt for a game (its folder or .exe), as main() prints it. vxrt_studio.py calls this too."""
@@ -378,6 +388,11 @@ def build_prompt(game, goal="support", lang="ja", log=None, root_c=DEFAULT_ROOT,
     for dll, names in f["missing_functions"].items() if goal == "support" else ():
         L.append(f"  - {dll} ({len(names)}): {', '.join(names[:40])}{' …' if len(names) > 40 else ''}")
     L.append(f"- {T['nodll']}: {', '.join(f['missing_dlls']) or T['none']}")
+    prof = f.get("profile")
+    if prof:
+        L.append(f"- {T['profile']} ({prof['file']}): {prof['status']['state']} — {prof['status']['summary'][lang]}")
+        for k in prof["known_issues"]: L.append(f"  - {k['summary']}")
+        for n in prof["notes"]: L.append(f"  - {n}")
     log = f["log"]
     if log:
         L.append(f"- {T['log']} ({os.path.relpath(log, REPO) if log.startswith(REPO) else log}):")

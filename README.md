@@ -235,6 +235,14 @@ frozen baselines, suspicions, unknowns) into `runs/`, sealed in a hash-chained
 ledger. `make -C VXRuntime vr-check` runs every game with a baseline. Workflows
 for agents are in `.agents/skills/`.
 
+What is known about each game is in `games/<Steam app id>.json` (how it starts,
+the scenarios measured, baselines, known issues; see [games/README.md](games/README.md)):
+anyone can add or update one in a pull request with harness runs as evidence.
+When a game still does not run, `tools/vxrt_issue.py draft <game>` (MCP:
+`prepare_issue`) writes an issue for this repository from the evidence, with
+personal details taken out; `tools/vxrt_issue.py submit` shows it and asks
+before posting it.
+
 ## Compared with Glovebox
 
 [Glovebox](https://glovebox.vision/) (Udi Wertheimer, October 2026) also runs

@@ -26,14 +26,6 @@ STEAM_ROOT = os.path.join(PREFIX, "drive_c", "Program Files (x86)", "steam")
 LIBRARY = os.path.join(DRIVE, "vxrt_library")                  # scripts/fetch_windows_vr_app.sh installs here
 NOT_GAMES = {"228980", "250820"}                                # Steamworks Common Redistributables, SteamVR
 
-# What has been seen to work (VXRuntime/README.md has the details). A game not listed here is untested.
-KNOWN = {
-    "546560": ("works", "VR で動作。3k プリセットで 60 fps（M1 Max）", "Works in VR. 60 fps with the 3k preset (M1 Max)"),
-    "450390": ("works", "VR で動作（タイトル画面まで確認、53–58 fps）", "Works in VR (title scene checked, 53–58 fps)"),
-    "348250": ("partial", "VR で地形とラベルが出る。空が白い", "Terrain and labels in VR; the sky is white"),
-    "457550": ("untested", "未確認（足りない関数あり）", "Not tried yet (functions missing)"),
-}
-
 def windows_to_mac(path):
     """A Steam library path as Windows Steam in the prefix writes it."""
     p = path.replace("\\\\", "\\")
@@ -92,12 +84,15 @@ def last_run(exe):
     return {"log": os.path.relpath(log, REPO), "when": time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(log))), "problems": problems[:8]}
 
 def game_info(g, lang):
-    status, ja, en = KNOWN.get(g["appid"], ("untested", "未確認", "Not tried yet"))
+    import vxrt_games
+    prof = vxrt_games.load_all().get(g["appid"]) or vxrt_games.default_profile(g["appid"], g["name"])
+    status, ja, en = prof["status"]["state"], prof["status"]["summary"]["ja"], prof["status"]["summary"]["en"]
     engine = [m.split(":", 1)[1] for m in g["markers"] if m.startswith(("engine:", "vr:"))]
     anticheat = [m.split(":", 1)[1] for m in g["markers"] if m.startswith("anticheat:")]
     return {"appid": g["appid"], "name": g["name"], "exe": os.path.relpath(g["exe"], g["folder"]), "folder": g["folder"],
             "size_gb": round(g["size"] / 2**30, 1), "engine": engine, "anticheat": sorted(set(anticheat)),
-            "status": status, "note": ja if lang == "ja" else en, "last_run": last_run(g["exe"])}
+            "status": status, "note": ja if lang == "ja" else en, "last_run": last_run(g["exe"]),
+            "known_issues": [k["summary"] for k in prof["known_issues"]]}
 
 def agents():
     return {"claude": bool(shutil.which("claude")), "codex": bool(shutil.which("codex"))}

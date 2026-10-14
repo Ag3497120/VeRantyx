@@ -10,7 +10,7 @@ runs/ledger.jsonl.
     tools/vxrt_run.py --list | --check alyx | --validate runs/<id> | --verify-ledger
 
 The result keeps apart what was observed (each value with the file it comes from and that file's SHA-256), what is
-derived from observations (only by rule, against tools/baselines.json), what is inferred (marked as a suspicion,
+derived from observations (only by rule, against the game profile, games/<app id>.json), what is inferred (marked as a suspicion,
 with the observations it rests on) and what is not known. A run that cannot be a fair measurement is refused before
 it starts, with a typed reason (the user is playing, SteamVR is up, the roots are the user's, ...).
 
@@ -22,25 +22,21 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vxrt_doctor as doctor                                    # noqa: E402
 import vxrt_ledger as ledger                                    # noqa: E402
+import vxrt_games as profiles_db                                # noqa: E402
 
 REPO = doctor.REPO
 DRIVE = os.path.expanduser(os.environ.get("VERANTYX_VR_DRIVE", "~/Verantyx_VR_Drive"))
 USER_ROOTS = {os.path.join(DRIVE, "vxrt_root"), os.path.join(DRIVE, "vxrt_steam_overlay")}   # the player's: never used
 HARNESS = os.path.join(DRIVE, "vxrt_harness")                  # this tool's roots (kept between runs: game settings, caches)
-BASELINES = os.path.join(REPO, "tools", "baselines.json")
 # Settings a run may set (AGENTS.md, "Settings you may tune"); recorded in the result. Anything else is refused.
 TUNABLES = {"VXRT_VR_RENDER_SCALE", "VERANTYX_DISPLAY_SCALE", "VERANTYX_DISPLAY_HZ", "VERANTYX_STREAM_WIDTH", "VERANTYX_STREAM_HEIGHT",
             "VERANTYX_BITRATE_MBPS", "VERANTYX_HEVC_QUALITY", "VXRT_MSAA_MAX", "VXRT_MAX_ANISOTROPY", "VXRT_VR_SETTINGS",
             "VERANTYX_DECOUPLED_POSES", "VXRT_GPU_PROFILE", "VXRT_STATS", "VXRT_TRACE_CALLS"}
 
-# Games the harness knows: how they start and what to look at. Others installed are run by app id ("start").
-GAMES = {
-    "alyx":   {"appid": "546560", "launcher": "alyx", "default": "menu",
-               "scenarios": {"menu": {"args": [], "seconds": 150},
-                             "chapter": {"args": ["+map", "a1_intro_world_2", "+hlvr_pause_after_realmap", "0"], "seconds": 240}}},
-    "thelab": {"appid": "450390", "launcher": "game", "default": "title", "scenarios": {"title": {"args": [], "seconds": 150}}},
-    "earth":  {"appid": "348250", "launcher": "game", "default": "start", "scenarios": {"start": {"args": [], "seconds": 150}}},
-}
+# Games the harness knows (games/<app id>.json, by key): how they start, the scenarios, the baselines. Other installed
+# games are run with a default profile (the generic launcher, scenario "start").
+def profiles():
+    return {p["key"]: p for p in profiles_db.load_all().values()}
 
 # ---- what is installed ------------------------------------------------------------------------------------------------
 def installed():
@@ -48,15 +44,13 @@ def installed():
     return {g["appid"]: g for g in vxrt_studio.find_games()}
 
 def resolve(game):
-    """(key, spec, installed game) for a name in GAMES or a Steam app id."""
+    """(key, profile, installed game) for a profile's key or a Steam app id."""
     inst = installed()
-    if game in GAMES:
-        return game, GAMES[game], inst.get(GAMES[game]["appid"])
-    for key, spec in GAMES.items():
-        if spec["appid"] == game:
-            return key, spec, inst.get(game)
+    p = profiles_db.by_key(str(game))
+    if p:
+        return p["key"], p, inst.get(p["appid"])
     if game in inst:
-        return game, {"appid": game, "launcher": "game", "default": "start", "scenarios": {"start": {"args": [], "seconds": 150}}}, inst[game]
+        return game, profiles_db.default_profile(game, inst[game]["name"]), inst[game]
     return game, None, None
 
 # ---- preconditions ----------------------------------------------------------------------------------------------------
@@ -272,17 +266,17 @@ class Evidence:
         return next((o["value"] for o in self.observed if o["metric"] == metric), None)
 
 def baseline_for(key, scenario, quality):
-    if not os.path.exists(BASELINES):
-        return None, None
-    table = json.load(open(BASELINES)).get(key, {})
+    """(name, baseline, its place) from the game's profile, or (None, None, None)."""
+    p = profiles_db.by_key(str(key))
+    table = p["baselines"] if p else {}
     name = f"{scenario}@{quality}" if quality else scenario
-    return (name, table[name]) if name in table else (None, None)
+    return (name, table[name], f"games/{p['appid']}.json#{name}") if name in table else (None, None, None)
 
-def derive(ev, base_name, base):
-    """Claims that follow from observations by rule, each naming the observations and the baseline it used."""
-    if not base:
-        return
-    src = f"tools/baselines.json#{base_name}"
+def derive(ev, base_name, base, src=None):
+    """Claims that follow from observations by rule, each naming the observations and the baseline it used. Reaching
+    SteamVR and running the whole scenario are asked of every game, with a baseline or not."""
+    base = base or {}
+    src = src or "tools/vxrt_run.py (every game)"
     fps = ev.value("fps_median")
     if "min_fps" in base:
         ev.derived.append({"id": "d1", "claim": "fps_meets_baseline", "holds": fps is not None and fps >= base["min_fps"],
@@ -290,7 +284,7 @@ def derive(ev, base_name, base):
     if base.get("non_black"):
         ev.derived.append({"id": "d2", "claim": "frame_not_black", "holds": bool(ev.value("frame_bright_fraction") and ev.value("frame_bright_fraction") > 0.05),
                            "rule": "frame_bright_fraction > 0.05", "from": [ev.ref("frame_bright_fraction")], "baseline": src})
-    if base.get("connected"):
+    if base.get("connected", True):
         ev.derived.append({"id": "d3", "claim": "game_connected_to_steamvr", "holds": ev.value("connected_after_s") is not None,
                            "rule": "connected_after_s is not null", "from": [ev.ref("connected_after_s")], "baseline": src})
     ev.derived.append({"id": "d4", "claim": "ran_for_the_whole_scenario", "holds": not ev.value("exited_early"),
@@ -345,11 +339,11 @@ def validate(result):
             if missing:
                 problems.append(f"observation {o['id']} (fps_median): samples not in {o.get('artifact')}: {missing[:5]}")
     # Re-derive: the same rules over the recorded values must give the same answers.
-    if result.get("baseline"):
+    if result.get("observed"):
         ev = Evidence(); ev.observed = list(obs.values())
-        name, base = baseline_for(result["game"], result["scenario"], result.get("quality"))
-        if base:
-            derive(ev, name, base)
+        name, base, src = baseline_for(result["game"], result["scenario"], result.get("quality"))
+        if base or not result.get("baseline"):
+            derive(ev, name, base, src)
             again = {d["claim"]: d["holds"] for d in ev.derived}
             for d in result.get("derived", []):
                 if d["claim"] in again and again[d["claim"]] != d["holds"]:
@@ -365,7 +359,7 @@ def git_state():
 def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_every=15.0, root=None, overlay=None,
         trace=False, need_steam=True, quiet=False, settings=None, stream=False):
     key, spec, inst = resolve(game)
-    scenario = scenario or (spec or {}).get("default", "start")
+    scenario = scenario or (spec or {}).get("default_scenario", "start")
     sc = (spec or {}).get("scenarios", {}).get(scenario)
     args = list((sc or {}).get("args", [])) + list(extra_args)
     seconds = seconds or (sc or {}).get("seconds", 150)
@@ -385,7 +379,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
                               "inherited": {k: v for k, v in os.environ.items() if k.startswith(("VXRT_", "VERANTYX_"))}}}
     say = (lambda *a: None) if quiet else (lambda *a: print(*a, file=sys.stderr))
 
-    settings = dict(settings or {})
+    settings = dict((spec or {}).get("settings", {}), **(settings or {}))      # (the profile's defaults, then the run's)
     result["settings"] = settings
     checks = preconditions(spec, inst, args, root, overlay, need_steam)
     bad = sorted(set(settings) - TUNABLES)
@@ -505,9 +499,9 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     ev.observe("first_problem", facts["first_problem"], game_log)
     ev.observe("exit", facts["exit"], game_log)
 
-    base_name, base = baseline_for(key, scenario, quality)
-    result["baseline"] = f"tools/baselines.json#{base_name}" if base else None
-    derive(ev, base_name, base)
+    base_name, base, base_src = baseline_for(key, scenario, quality)
+    result["baseline"] = base_src
+    derive(ev, base_name, base, base_src)
     infer(ev)
     ev.unknown += [
         {"item": "which of the functions VXRuntime lacks the game would call later", "reason": "only the calls made in this run are seen (unimplemented_calls)"},
@@ -521,7 +515,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
                   "other programs on the Mac change GPU numbers (check uptime/top)"]
     result.update({"observed": ev.observed, "derived": ev.derived, "inferred": ev.inferred, "unknown": ev.unknown,
                    "limits": ev.limits, "duration_s": round(ended - started, 1)})
-    result["status"] = "no_baseline" if not ev.derived else "pass" if all(d["holds"] for d in ev.derived) else "fail"
+    result["status"] = "fail" if not all(d["holds"] for d in ev.derived) else "pass" if base else "no_baseline"
     return finish(result, run_dir, say)
 
 def finish(result, run_dir, say):
@@ -566,7 +560,7 @@ def main():
     ap.add_argument("--stream", action="store_true", help="also receive the video stream as a stand-in headset and measure it")
     ap.add_argument("--json", action="store_true", help="the result on stdout")
     ap.add_argument("--list", action="store_true"); ap.add_argument("--check", action="store_true", help="preconditions only")
-    ap.add_argument("--baselines", action="store_true", help="every scenario tools/baselines.json has (of the given game, or all installed)")
+    ap.add_argument("--baselines", action="store_true", help="every scenario with a baseline in the game profiles (of the given game, or all installed)")
     ap.add_argument("--validate", metavar="RUN_DIR"); ap.add_argument("--verify-ledger", action="store_true")
     a = ap.parse_args()
     if a.verify_ledger:
@@ -576,19 +570,18 @@ def main():
         print(json.dumps({"valid": not problems, "problems": problems}, ensure_ascii=False, indent=2)); sys.exit(0 if not problems else 1)
     if a.list:
         inst = installed()
-        for key, spec in GAMES.items():
-            print(f"{key:8} {spec['appid']:7} {'installed' if spec['appid'] in inst else 'not installed':14} scenarios: {', '.join(spec['scenarios'])}")
+        for key, spec in profiles().items():
+            print(f"{key:10} {spec['appid']:7} {'installed' if spec['appid'] in inst else 'not installed':14} {spec['status']['state']:9} scenarios: {', '.join(spec['scenarios'])}")
         for appid, g in inst.items():
-            if appid not in {s['appid'] for s in GAMES.values()}:
-                print(f"{appid:8} {appid:7} installed      scenarios: start ({g['name']})")
+            if appid not in {s['appid'] for s in profiles().values()}:
+                print(f"{appid:10} {appid:7} installed      no profile scenarios: start ({g['name']})")
         return
     if a.baselines:                                            # (make -C VXRuntime vr-check)
-        table = {k: v for k, v in json.load(open(BASELINES)).items() if not k.startswith("_")}
         inst, worst = installed(), 0
-        for key, entries in table.items():
-            if (a.game and key != a.game) or key not in GAMES or GAMES[key]["appid"] not in inst:
+        for key, spec in profiles().items():
+            if (a.game and a.game not in (key, spec["appid"])) or spec["appid"] not in inst:
                 continue
-            for name in entries:
+            for name in spec["baselines"]:
                 scenario, _, quality = name.partition("@")
                 r = run(key, scenario, quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam,
                         settings=dict(kv.split("=", 1) for kv in a.set))

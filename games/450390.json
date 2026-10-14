@@ -1,0 +1,44 @@
+{
+  "$schema": "./profile.schema.json",
+  "appid": "450390",
+  "key": "thelab",
+  "name": "The Lab",
+  "launcher": "game",
+  "engine": "vxrt",
+  "default_scenario": "title",
+  "scenarios": {
+    "title": {
+      "args": [],
+      "seconds": 150,
+      "note": "the title scene (Start pedestal)"
+    }
+  },
+  "status": {
+    "state": "works",
+    "summary": {
+      "ja": "VR で動作（タイトル画面まで確認、53–58 fps）",
+      "en": "Works in VR (title scene checked, 53–58 fps)"
+    },
+    "checked": "2026-10-14",
+    "machine": "Apple M1 Max, 32-core GPU"
+  },
+  "baselines": {
+    "title": {
+      "min_fps": 50,
+      "non_black": true,
+      "connected": true,
+      "source": "2026-10-14, title scene 56.3 fps (run 20261014T063812Z)"
+    }
+  },
+  "known_issues": [
+    {
+      "summary": "Hull and domain shaders are not translated (Unity goes on without them)",
+      "since": "2026-10-14"
+    },
+    {
+      "summary": "Not played past the title scene yet",
+      "since": "2026-10-14"
+    }
+  ],
+  "notes": []
+}

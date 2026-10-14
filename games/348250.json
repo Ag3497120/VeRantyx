@@ -1,0 +1,46 @@
+{
+  "$schema": "./profile.schema.json",
+  "appid": "348250",
+  "key": "earth",
+  "name": "Google Earth VR",
+  "launcher": "game",
+  "engine": "vxrt",
+  "default_scenario": "start",
+  "scenarios": {
+    "start": {
+      "args": [],
+      "seconds": 150,
+      "note": "the starting globe/terrain"
+    }
+  },
+  "status": {
+    "state": "partial",
+    "summary": {
+      "ja": "VR で地形とラベルが出る。空が白い",
+      "en": "Terrain and labels in VR; the sky is white"
+    },
+    "checked": "2026-10-13",
+    "machine": "Apple M1 Max, 32-core GPU"
+  },
+  "baselines": {
+    "start": {
+      "min_fps": 50,
+      "non_black": true,
+      "connected": true,
+      "source": "2026-10-13, terrain in both eyes, ~59 fps captured"
+    }
+  },
+  "known_issues": [
+    {
+      "summary": "Sky renders white (some #version 150 GLSL shaders)",
+      "since": "2026-10-13"
+    },
+    {
+      "summary": "3k: 42-49 fps; the default quality is smoother",
+      "since": "2026-10-14"
+    }
+  ],
+  "notes": [
+    "OpenGL (to macOS's OpenGL); needs network access for map tiles."
+  ]
+}

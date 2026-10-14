@@ -108,6 +108,8 @@ tools/vxrt_doctor.py "<ゲームのフォルダか .exe>" --goal support --copy 
 
 AI はハーネス `tools/vxrt_run.py`（MCP サーバー `tools/vxrt_mcp.py` としても使え、Claude Code には `.mcp.json` で登録）で計測します。ゲームを専用のフォルダで、仮想のヘッドセットで動かし、公平に測れない実行（プレイ中、SteamVR が起動中、VR がオフなど）は理由付きで拒否します。見たことは証拠として `runs/` に書きます（観測値とその元ファイルのハッシュ、凍結した基準値から導いた結論、推測、不明点）。記録はハッシュでつないだ台帳に残ります。`make -C VXRuntime vr-check` で基準値のあるゲームをすべて確かめます。AI 向けの手順書は `.agents/skills/` にあります。
 
+ゲームごとの知識は `games/<Steam のアプリ ID>.json` にあります（起動方法、計測する場面、基準値、既知の問題。[games/README.md](../games/README.md)）。誰でも、ハーネスの結果を証拠にして、プルリクエストで追加・更新できます。それでも動かないゲームは、`tools/vxrt_issue.py draft <ゲーム>`（MCP では `prepare_issue`）で、証拠から個人情報を除いた issue の下書きを作れます。投稿は `tools/vxrt_issue.py submit` が内容を見せて確認してから行います。
+
 初回はゲームのシェーダーのコンパイルに数分かかります。10ビット配信には最新の Vision Pro アプリが必要です
 （`scripts/deploy_vision_pro_app.sh`）。
 

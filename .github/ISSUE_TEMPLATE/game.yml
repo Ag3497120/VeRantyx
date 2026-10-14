@@ -1,0 +1,33 @@
+name: A game does not run, crashes, runs slowly or draws wrongly
+description: Best written with `tools/vxrt_issue.py draft <game>` (or the MCP tool prepare_issue), which fills this in from a harness run.
+title: "[support] <game> (<Steam app id>) "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Easiest: run `tools/vxrt_run.py <game>`, then `tools/vxrt_issue.py draft <game> --tried "..."` and
+        `tools/vxrt_issue.py submit runs/issues/<draft>.md` (it takes personal details out and asks before posting).
+        Games with anti-cheat are out of scope; no game files, please.
+  - type: input
+    id: game
+    attributes: {label: "Game and Steam app id", placeholder: "Bigscreen Beta (457550)"}
+    validations: {required: true}
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What happens
+      options: [does not start or stops, crashes, runs slowly, draws wrongly]
+    validations: {required: true}
+  - type: input
+    id: machine
+    attributes: {label: "Mac, macOS, VXRuntime commit", placeholder: "M1 Max 32-core GPU, macOS 26.5, 22cc10e"}
+    validations: {required: true}
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Harness result
+      description: The run id, status, first_problem and the observations (o#) from runs/<id>/result.json.
+      render: markdown
+  - type: textarea
+    id: tried
+    attributes: {label: What was tried (by you or your AI tool), description: "Changes, and what each attempt showed (run ids)."}

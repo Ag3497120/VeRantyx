@@ -1,0 +1,30 @@
+{
+  "$schema": "./profile.schema.json",
+  "appid": "457550",
+  "key": "bigscreen",
+  "name": "Bigscreen Beta",
+  "launcher": "game",
+  "engine": "vxrt",
+  "default_scenario": "start",
+  "scenarios": {
+    "start": {
+      "args": [],
+      "seconds": 150,
+      "note": "the first scene"
+    }
+  },
+  "status": {
+    "state": "untested",
+    "summary": {
+      "ja": "未確認（足りない関数あり）",
+      "en": "Not tried yet (functions missing)"
+    },
+    "checked": null,
+    "machine": null
+  },
+  "baselines": {},
+  "known_issues": [],
+  "notes": [
+    "Unity IL2CPP: no Mono; the doctor lists ucrtbase _malloc_base & co., WSAPoll, K32GetProcessImageFileNameW as missing."
+  ]
+}

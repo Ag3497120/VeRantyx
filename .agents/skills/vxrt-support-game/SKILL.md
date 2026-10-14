@@ -24,6 +24,10 @@ run shows).
 4. **Measure again** and compare (`compare_runs`). Then `make -C VXRuntime vr-check` (or at least the games that
    worked) so nothing else broke. Report with run ids and observation ids; say what is still unknown.
 
+5. **Record it** in the game's profile (`games/<appid>.json`): scenarios, status, a baseline from your runs, known
+   issues. **Stuck?** After three attempts without progress, `tools/vxrt_issue.py draft` (MCP `prepare_issue`) with what
+   you tried; show the user the draft and stop (only they post it).
+
 `vxrt_doctor` / `analyze_game` lists functions the game imports that vxrt lacks: a static list. Most are never
 called; implement what a run shows being called.
 

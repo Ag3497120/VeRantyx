@@ -1,0 +1,68 @@
+{
+  "$schema": "./profile.schema.json",
+  "appid": "546560",
+  "key": "alyx",
+  "name": "Half-Life: Alyx",
+  "launcher": "alyx",
+  "engine": "vxrt",
+  "default_scenario": "menu",
+  "scenarios": {
+    "menu": {
+      "args": [],
+      "seconds": 150,
+      "note": "the main menu (+map startup)"
+    },
+    "chapter": {
+      "args": [
+        "+map",
+        "a1_intro_world_2",
+        "+hlvr_pause_after_realmap",
+        "0"
+      ],
+      "seconds": 240,
+      "note": "chapter 1, on the train"
+    }
+  },
+  "status": {
+    "state": "works",
+    "summary": {
+      "ja": "VR で動作。3k プリセットで 60 fps（M1 Max）",
+      "en": "Works in VR. 60 fps with the 3k preset (M1 Max)"
+    },
+    "checked": "2026-10-14",
+    "machine": "Apple M1 Max, 32-core GPU"
+  },
+  "baselines": {
+    "menu": {
+      "min_fps": 18,
+      "non_black": true,
+      "connected": true,
+      "source": "2026-10-14, menu 20-22 fps (reg5)"
+    },
+    "menu@3k": {
+      "min_fps": 45,
+      "non_black": true,
+      "connected": true,
+      "source": "2026-10-14, 58.8 and 54.1 fps after the geometry path fix (runs 20261014T074457Z, 20261014T074703Z); 18-21 before"
+    },
+    "chapter@3k": {
+      "min_fps": 55,
+      "non_black": true,
+      "connected": true,
+      "source": "2026-10-14, a1_intro_world_2 at 3k, 60.0 fps (run 20261014T074923Z)"
+    }
+  },
+  "known_issues": [
+    {
+      "summary": "VXRT_VR_QUALITY=max: 16-21 fps, and the hands/controllers were not seen in one session",
+      "since": "2026-10-14"
+    },
+    {
+      "summary": "Saves made before 2026-10-14 (commit 8d10cfb) hold no level state: start the chapter again",
+      "since": "2026-10-14"
+    }
+  ],
+  "notes": [
+    "Needs -vr (scripts/launch_vxrt_alyx.sh passes it); without it the game starts in desktop mode."
+  ]
+}

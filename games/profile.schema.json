@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VeRantyx game profile",
+  "description": "What VXRuntime knows about one Windows VR game: how it starts, the scenarios the harness measures, frozen baselines, and its state. One file per game, games/<Steam app id>.json; tools/vxrt_games.py checks them (make -C VXRuntime check).",
+  "type": "object",
+  "required": ["appid", "key", "name", "launcher", "engine", "default_scenario", "scenarios", "status", "baselines", "known_issues", "notes"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {"type": "string"},
+    "appid": {"type": "string", "pattern": "^[0-9]+$", "description": "Steam app id (also the file name)"},
+    "key": {"type": "string", "pattern": "^[a-z0-9_-]+$", "description": "short name for tools/vxrt_run.py"},
+    "name": {"type": "string"},
+    "launcher": {"enum": ["alyx", "game"], "description": "alyx: scripts/launch_vxrt_alyx.sh; game: scripts/launch_vxrt_game.sh <exe>"},
+    "engine": {"enum": ["vxrt"], "description": "the runtime it runs on (more may come: a native build, another translation layer)"},
+    "exe": {"type": "string", "description": "the executable, relative to the install folder, when tools cannot pick it"},
+    "default_scenario": {"type": "string"},
+    "scenarios": {
+      "type": "object", "minProperties": 1,
+      "additionalProperties": {
+        "type": "object", "required": ["args", "seconds"], "additionalProperties": false,
+        "properties": {
+          "args": {"type": "array", "items": {"type": "string"}, "description": "game arguments after the launcher's own"},
+          "seconds": {"type": "number", "minimum": 30, "maximum": 900},
+          "note": {"type": "string"}
+        }
+      }
+    },
+    "settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "tunable settings (AGENTS.md) this game needs by default"},
+    "status": {
+      "type": "object", "required": ["state", "summary", "checked", "machine"], "additionalProperties": false,
+      "properties": {
+        "state": {"enum": ["works", "partial", "broken", "untested"]},
+        "summary": {"type": "object", "required": ["ja", "en"], "additionalProperties": false,
+                    "properties": {"ja": {"type": "string"}, "en": {"type": "string"}}},
+        "checked": {"type": ["string", "null"], "description": "date of the last check (YYYY-MM-DD)"},
+        "machine": {"type": ["string", "null"]}
+      }
+    },
+    "baselines": {
+      "type": "object", "description": "scenario or scenario@quality -> what a run must show; change only with a run that shows the new value (its run id in source)",
+      "propertyNames": {"pattern": "^[a-z0-9_-]+(@(2\\.5k|3k|max))?$"},
+      "additionalProperties": {
+        "type": "object", "required": ["source"], "additionalProperties": false,
+        "properties": {
+          "min_fps": {"type": "number", "minimum": 1},
+          "non_black": {"type": "boolean"},
+          "connected": {"type": "boolean"},
+          "source": {"type": "string"}
+        }
+      }
+    },
+    "known_issues": {
+      "type": "array",
+      "items": {"type": "object", "required": ["summary"], "additionalProperties": false,
+                "properties": {"summary": {"type": "string"}, "since": {"type": "string"}, "issue": {"type": "string", "description": "the GitHub issue's URL"}}}
+    },
+    "notes": {"type": "array", "items": {"type": "string"}}
+  }
+}
