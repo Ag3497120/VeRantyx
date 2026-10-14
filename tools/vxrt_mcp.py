@@ -127,7 +127,7 @@ TOOLS = [
     ("check_preconditions", "Whether a run would be a fair measurement now (the user is not playing, SteamVR is not up, Mac Steam is running, the roots are the harness's, VR is on).",
      {"game": S, "args": {"type": "array", "items": S}}, ["game"], t_check_preconditions, True),
     ("run_game", "Runs a game in VR on VXRuntime in the harness's own roots with a simulated headset for a scenario (minutes), and returns the evidence: observed values with their files and SHA-256, derived claims against tools/baselines.json, inferences, unknowns. Sealed into runs/ledger.jsonl. Refuses (status 'refused', typed reasons) when a fair run is not possible.",
-     {"game": S, "scenario": S, "quality": {"type": "string", "enum": ["", "2.5k", "3k"]}, "seconds": {"type": "number"},
+     {"game": S, "scenario": S, "quality": {"type": "string", "enum": ["", "2.5k", "3k", "max"]}, "seconds": {"type": "number"},
       "args": {"type": "array", "items": S, "description": "more game arguments"}, "trace": {"type": "boolean", "description": "VXRT_TRACE=1 (slower, more in the log)"},
       "press_every": {"type": "number", "description": "pull the right trigger every N seconds (default 15; 0 never)"},
       "settings": {"type": "object", "additionalProperties": S, "description": "tunable settings (AGENTS.md), e.g. {\"VXRT_MSAA_MAX\": \"2\"}; others are refused"}}, ["game"], t_run_game, False),

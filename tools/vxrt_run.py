@@ -146,6 +146,43 @@ def grab_frame(path, out):
         lum += l; bright += l > 16; n += 1
     return w, h, lum / max(n, 1), bright / max(n, 1)
 
+def stream_client(stop, frames, dump=None, dump_cap=300 << 20):
+    """Stands in for the Vision Pro app: says HELLO_VR to the encoder (UDP 9999 on this Mac) and records when each
+    frame's last fragment arrives (frames: (time, sequence)). Over loopback, not Wi-Fi: it shows what the Mac sends,
+    and how evenly, not what the radio does."""
+    import socket
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    sock.settimeout(0.5)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
+    parts, last_hello, got = {}, 0.0, False
+    chunks, out, written = {}, open(dump, "wb") if dump else None, 0    # (dump: the HEVC stream as received, Annex B)
+    while not stop.is_set():
+        if time.time() - last_hello > (5 if got else 1):
+            try: sock.sendto(b"HELLO_VR", ("::1", 9999))
+            except OSError: pass
+            last_hello = time.time()
+        try:
+            data, _ = sock.recvfrom(65536)
+        except (socket.timeout, OSError):
+            continue
+        if len(data) < 24 or data[:4] != b"NARV":                  # (magic "VRAN", little-endian)
+            continue
+        got = True
+        seq, idx, total, offset, size = struct.unpack_from("<IIIII", data, 4)
+        seen = parts.setdefault(seq, set())
+        seen.add(idx)
+        if out: chunks.setdefault(seq, {})[offset] = data[96:96 + size]
+        if len(seen) == total:
+            frames.append((time.time(), seq))
+            del parts[seq]
+            if out:
+                frame = b"".join(v for _, v in sorted(chunks.pop(seq).items()))
+                if written + len(frame) <= dump_cap: out.write(frame); written += len(frame)
+            for old in [k for k in parts if k < seq - 120]: del parts[old]
+            for old in [k for k in chunks if k < seq - 120]: del chunks[old]
+    sock.close()
+    if out: out.close()
+
 def sample_gpu(stop, samples):
     while not stop.is_set():
         out = subprocess.run(["ioreg", "-r", "-d1", "-c", "IOAccelerator"], capture_output=True, text=True).stdout
@@ -326,7 +363,7 @@ def git_state():
     return head, dirty
 
 def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_every=15.0, root=None, overlay=None,
-        trace=False, need_steam=True, quiet=False, settings=None):
+        trace=False, need_steam=True, quiet=False, settings=None, stream=False):
     key, spec, inst = resolve(game)
     scenario = scenario or (spec or {}).get("default", "start")
     sc = (spec or {}).get("scenarios", {}).get(scenario)
@@ -382,9 +419,11 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     result["command"] = " ".join(cmd)
     result["exe"] = exe
     shared = os.path.join(root, "drive_c", "vr_shared_frame.dat")
-    stop, gpu = threading.Event(), []
+    stop, gpu, streamed = threading.Event(), [], []
     threads = [threading.Thread(target=feed_pose, args=(shared, stop, press_every), daemon=True),
                threading.Thread(target=sample_gpu, args=(stop, gpu), daemon=True)]
+    if stream:
+        threads.append(threading.Thread(target=stream_client, args=(stop, streamed, os.path.join(run_dir, "stream.hevc")), daemon=True))
     say(f"vxrt run {run_id}: {result['command']} for {seconds} s")
     with open(os.path.join(logs, "launcher.log"), "w") as out:
         p = subprocess.Popen(cmd, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
@@ -434,6 +473,21 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         ev.observe("fps_median", median(recent_capture), os.path.join(logs, "hardware-encoder.log"),
                    source="frames the encoder took from SteamVR's compositor, 5 s averages", samples=recent_capture, window_s=window)
     ev.observe("capture_fps_series", fps_capture, os.path.join(logs, "hardware-encoder.log"))
+    if stream:                                               # what reached the stand-in headset, in the measured window
+        frames_csv = os.path.join(run_dir, "streamed_frames.csv")
+        open(frames_csv, "w").write("".join(f"{t - started:.4f},{q}\n" for t, q in streamed))
+        recent = [(t, q) for t, q in streamed if t >= ended - window - 5 and t <= ended - 5]
+        gaps = [round((b[0] - a[0]) * 1000, 1) for a, b in zip(recent, recent[1:])]
+        span = recent[-1][0] - recent[0][0] if len(recent) > 1 else 0
+        ev.observe("streamed_fps", round((len(recent) - 1) / span, 1) if span else None, frames_csv, window_s=window,
+                   source="complete frames at a stand-in headset over loopback")
+        ev.observe("streamed_interval_p95_ms", sorted(gaps)[int(len(gaps) * 0.95)] if gaps else None, frames_csv,
+                   note="95th percentile of the time between frames: steady 60 fps is 16.7 ms")
+        ev.observe("streamed_sequence_skips", sum(1 for a, b in zip(recent, recent[1:]) if b[1] != a[1] + 1), frames_csv,
+                   note="frames the encoder numbered but the stand-in did not get complete")
+        drops = [int(x) for x in re.findall(r"encoderDrops=(\d+)", open(os.path.join(logs, "hardware-encoder.log"), errors="replace").read())]
+        ev.observe("encoder_drops_in_window", drops[-1] - drops[-max(2, int(window / 5))] if len(drops) > 1 else None,
+                   os.path.join(logs, "hardware-encoder.log"), note="captured frames the encoder had no room for")
     ev.observe("gpu_utilization_median", median([v for t, v in gpu if t >= ended - window - 5]), gpu_csv, window_s=window)
     if frame:
         w, h, lum, bright = frame
@@ -501,7 +555,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("game", nargs="?", help="alyx, thelab, earth, or a Steam app id")
     ap.add_argument("scenario", nargs="?")
-    ap.add_argument("--quality", choices=["", "2.5k", "3k"], default="")
+    ap.add_argument("--quality", choices=["", "2.5k", "3k", "max"], default="")
     ap.add_argument("--seconds", type=float)
     ap.add_argument("--args", nargs=argparse.REMAINDER, default=[], help="more game arguments (last)")
     ap.add_argument("--press-every", type=float, default=15.0, help="pull the right trigger every N seconds (0: never)")
@@ -509,6 +563,7 @@ def main():
     ap.add_argument("--trace", action="store_true", help="VXRT_TRACE=1 (slower: more in the log)")
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help="a tunable setting (AGENTS.md), repeatable")
     ap.add_argument("--no-steam", action="store_true", help="do not require Mac Steam (games that do not use it)")
+    ap.add_argument("--stream", action="store_true", help="also receive the video stream as a stand-in headset and measure it")
     ap.add_argument("--json", action="store_true", help="the result on stdout")
     ap.add_argument("--list", action="store_true"); ap.add_argument("--check", action="store_true", help="preconditions only")
     ap.add_argument("--baselines", action="store_true", help="every scenario tools/baselines.json has (of the given game, or all installed)")
@@ -550,7 +605,7 @@ def main():
         print(json.dumps(checks, ensure_ascii=False, indent=2)); sys.exit(0 if all(c["ok"] for c in checks) else 3)
     try:
         r = run(a.game, a.scenario, a.quality, a.seconds, a.args, a.press_every, a.root, a.overlay, a.trace, not a.no_steam, quiet=a.json,
-                settings=dict(kv.split("=", 1) for kv in a.set))
+                settings=dict(kv.split("=", 1) for kv in a.set), stream=a.stream)
     except Exception as e:                                    # (an error in the harness itself, not a game's)
         print(f"vxrt run: error: {e}", file=sys.stderr); sys.exit(4)
     if a.json:

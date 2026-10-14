@@ -9,6 +9,7 @@
 #                                                   # (60 fps on an M1 Max)
 #   VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh  # 2560x2880 per eye, 2x multisampling, the 3k stream
 #                                                   # (50-55 fps on an M1 Max)
+#   VXRT_VR_QUALITY=max scripts/launch_vxrt_alyx.sh   # 3200x3600 per eye (a Vision Pro eye's pixels), 3840x2160 stream
 #
 # The game and SteamVR come from the Wine prefix's Steam library and stay read-only (writes go to the overlay
 # folder, as for scripts/launch_vxrt_steamvr.sh). The first start compiles thousands of shaders and takes a few
@@ -51,14 +52,14 @@ echo "SteamVR on VXRuntime is up; starting Half-Life: Alyx (log: $LOG_DIR/vxrt-a
 # The game's capture proxy (openvr_api.dll beside the game, from this repository) streams the game's frames straight
 # from its Submit and paces poses by the virtual display, as the driver does (3k: 60 Hz). It goes into the overlay
 # folder (read before the game's own folder), so the Steam library stays as it is.
-[[ "${VXRT_VR_QUALITY:-}" == 3k || "${VXRT_VR_QUALITY:-}" == 2.5k ]] && export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-60}"
+[[ "${VXRT_VR_QUALITY:-}" == 3k || "${VXRT_VR_QUALITY:-}" == 2.5k || "${VXRT_VR_QUALITY:-}" == max ]] && export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-60}"
 # 2.5k: 2x multisampling (4x stores and reloads about 1.5 GB of samples a frame at this size: 45 fps falling to 35 within
 # minutes; 2x holds 50-55), and the game's fidelity level fixed (its automatic choice raises the resolution
 # past what the GPU can draw).
 # 3k: fidelity level 4 fixed as well (left automatic, the game raised its own size to 2407x1942 per eye in the
 # headset, 32-36 fps).
 GAME_ARGS=()
-if [[ "${VXRT_VR_QUALITY:-}" == 2.5k ]]; then
+if [[ "${VXRT_VR_QUALITY:-}" == 2.5k || "${VXRT_VR_QUALITY:-}" == max ]]; then
     export VXRT_MSAA_MAX="${VXRT_MSAA_MAX:-2}"
     GAME_ARGS=(-noautofidelity +vr_fidelity_level 3)
 elif [[ "${VXRT_VR_QUALITY:-}" == 3k ]]; then

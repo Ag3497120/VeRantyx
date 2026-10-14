@@ -64,6 +64,15 @@ EOF
 # VXRT_VR_QUALITY=2.5k: the game renders 2560x2880 per eye (Half-Life: Alyx: 50-55 fps on an M1 Max with 2x
 # multisampling, scripts/launch_vxrt_alyx.sh); SteamVR's compositor and the stream stay at the 3k preset's 2880x1620
 # (one HEVC session encodes about 60 frames a second of that).
+# VXRT_VR_QUALITY=max: the game renders 3200x3600 per eye (as many pixels as a Vision Pro eye's display, about 11.5
+# megapixels) and the stream is 3840x2160 (1920x2160 per eye: what one HEVC session and Wi-Fi can carry at 60 fps);
+# otherwise as 3k. Expect a much lower frame rate than 2.5k (1.6 times its pixels).
+if [[ "${VXRT_VR_QUALITY:-}" == max ]]; then
+    VXRT_VR_RENDER_SCALE="${VXRT_VR_RENDER_SCALE:-4.0}"
+    export VERANTYX_DISPLAY_SCALE="${VERANTYX_DISPLAY_SCALE:-2.4}"
+    export VERANTYX_STREAM_WIDTH="${VERANTYX_STREAM_WIDTH:-3840}" VERANTYX_STREAM_HEIGHT="${VERANTYX_STREAM_HEIGHT:-2160}"
+    VXRT_VR_QUALITY=3k
+fi
 if [[ "${VXRT_VR_QUALITY:-}" == 2.5k ]]; then
     VXRT_VR_RENDER_SCALE="${VXRT_VR_RENDER_SCALE:-3.2}"
     export VERANTYX_DISPLAY_SCALE="${VERANTYX_DISPLAY_SCALE:-1.8}"
