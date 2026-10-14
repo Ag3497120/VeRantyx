@@ -5,7 +5,50 @@
 static int failures;
 #define CHECK(cond) do { if (!(cond)) { printf("check failed (line %d): %s\n", __LINE__, #cond); failures++; } } while (0)
 
-int main(void) {
+// "files.exe overlay <tree>": run with VXRT_OVERLAY=<tree>:<overlay>, the tree holding save\old.sav and save\same.hl1.
+// Files written go to the overlay; listings show both (Half-Life: Alyx gathers save\*.hl? into each save).
+static int names(const char *pattern, char *out, size_t cap) {
+    WIN32_FIND_DATAA d;
+    HANDLE h = FindFirstFileA(pattern, &d);
+    int count = 0;
+    out[0] = 0;
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!strcmp(d.cFileName, ".") || !strcmp(d.cFileName, "..")) continue;
+        count++;
+        strncat(out, d.cFileName, cap - strlen(out) - 2); strcat(out, " ");
+    } while (FindNextFileA(h, &d));
+    FindClose(h);
+    return count;
+}
+static int overlay_test(const char *tree) {
+    char path[MAX_PATH], pat[MAX_PATH], list[1024];
+    DWORD n;
+    snprintf(path, sizeof path, "%s\\save\\a.hl1", tree);
+    HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    CHECK(f != INVALID_HANDLE_VALUE && WriteFile(f, "new", 3, &n, NULL)); CloseHandle(f);
+    snprintf(path, sizeof path, "%s\\save\\same.hl1", tree);
+    f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    CHECK(f != INVALID_HANDLE_VALUE && WriteFile(f, "changed", 7, &n, NULL)); CloseHandle(f);
+    snprintf(pat, sizeof pat, "%s\\save\\*.hl?", tree);
+    int k = names(pat, list, sizeof list);
+    CHECK(k == 2 && strstr(list, "a.hl1") && strstr(list, "same.hl1"));         // each once
+    WIN32_FIND_DATAA d;
+    HANDLE h = FindFirstFileA(path, &d);
+    CHECK(h != INVALID_HANDLE_VALUE && d.nFileSizeLow == 7);                    // the overlay's copy
+    FindClose(h);
+    snprintf(pat, sizeof pat, "%s\\save\\*", tree);
+    CHECK(names(pat, list, sizeof list) == 3 && strstr(list, "old.sav"));        // the original's too
+    snprintf(path, sizeof path, "%s\\save\\a.hl1", tree);
+    CHECK(DeleteFileA(path));
+    snprintf(pat, sizeof pat, "%s\\save\\*.hl?", tree);
+    CHECK(names(pat, list, sizeof list) == 1 && strstr(list, "same.hl1"));
+    printf("files through an overlay: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    return failures;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 2 && !strcmp(argv[1], "overlay")) return overlay_test(argv[2]);
     char buf[MAX_PATH];
     DWORD n;
     CreateDirectoryA("C:\\vxtest", NULL);

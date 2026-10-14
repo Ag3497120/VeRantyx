@@ -174,6 +174,9 @@ check: all
 	build/vxrt build/cxx_exceptions.exe
 	build/vxrt build/hw_exceptions.exe
 	build/vxrt build/files.exe
+	rm -rf build/ovtree build/ovshadow && mkdir -p build/ovtree/save && echo old > build/ovtree/save/old.sav && echo orig > build/ovtree/save/same.hl1
+	VXRT_OVERLAY=$(CURDIR)/build/ovtree:$(CURDIR)/build/ovshadow build/vxrt build/files.exe overlay 'Z:$(subst /,\,$(CURDIR))\build\ovtree'
+	test "$$(cat build/ovtree/save/same.hl1)" = orig && test ! -e build/ovtree/save/a.hl1
 	build/vxrt build/dll_test.exe
 	build/vxrt build/net.exe
 	build/vxrt build/msvc_eh.exe

@@ -96,7 +96,8 @@ int vx_full_path(const char *in, char *out, size_t cap) {
 }
 
 // An overlay keeps a directory tree as it is: with VXRT_OVERLAY=<tree>:<overlay>, files written under <tree> go to
-// the same place under <overlay> (and are read from there afterwards). Directory listings show the original.
+// the same place under <overlay> (and are read from there afterwards). Directory listings show both, the overlay's
+// entries in place of the original's of the same name.
 static char g_ov_tree[MAX_PATH_LEN], g_ov_shadow[MAX_PATH_LEN];
 static size_t g_ov_len;
 // (Paths compare without case, as on the Mac's file systems.)
@@ -530,19 +531,27 @@ typedef struct { DWORD attrs, created[2], accessed[2], written[2], size_high, si
 _Static_assert(sizeof(FIND_DATA_A) == 320, "WIN32_FIND_DATAA");
 _Static_assert(sizeof(FIND_DATA_W) == 592, "WIN32_FIND_DATAW");
 
-typedef struct { DIR *dir; char path[MAX_PATH_LEN]; char pattern[256]; } find_state;
-static void find_destroy(void *p) { find_state *f = p; closedir(f->dir); free(f); }
+// A listing reads the overlay's copy of the directory first (when there is one), then the original, leaving out names
+// the overlay has. (Half-Life: Alyx gathers save/*.hl? into each save: listing only the original, where the save folder
+// of an earlier Windows installation was, its saves came out empty, and loading one left another game's level state
+// in place: the next level change crashed.)
+typedef struct { DIR *dirs[2]; char paths[2][MAX_PATH_LEN]; int ndirs, at; char pattern[256]; } find_state;
+static void find_destroy(void *p) { find_state *f = p; for (int i = 0; i < f->ndirs; i++) if (f->dirs[i]) closedir(f->dirs[i]); free(f); }
 
 // Fills *d with the next entry matching the pattern (Windows wildcards: '*' and '?', case-insensitive; "*.*"
 // matches every name). Returns 0 at the end.
 static int find_next(find_state *f, FIND_DATA_A *d) {
     struct dirent *e;
-    while ((e = readdir(f->dir))) {
+    for (; f->at < f->ndirs; f->at++) while ((e = readdir(f->dirs[f->at]))) {
         const char *pat = !strcmp(f->pattern, "*.*") ? "*" : f->pattern;
         if (fnmatch(pat, e->d_name, FNM_CASEFOLD | FNM_NOESCAPE)) continue;
         char full[MAX_PATH_LEN * 2];
-        snprintf(full, sizeof full, "%s/%s", f->path, e->d_name);
         struct stat st;
+        if (f->at > 0) {                                           // (the original: unless the overlay has the name)
+            snprintf(full, sizeof full, "%s/%s", f->paths[0], e->d_name);
+            if (!lstat(full, &st)) continue;
+        }
+        snprintf(full, sizeof full, "%s/%s", f->paths[f->at], e->d_name);
         if (stat(full, &st)) continue;
         memset(d, 0, sizeof *d);
         d->attrs = attributes(&st, e->d_name);
@@ -561,10 +570,15 @@ static HANDLE find_first(const char *spec, FIND_DATA_A *d) {
     find_state *f = calloc(1, sizeof *f);
     snprintf(f->pattern, sizeof f->pattern, "%s", sep + 1);
     sep[sep == full + 2 ? 1 : 0] = 0;           // keep "C:\" for the root
-    if (!vx_unix_path(full, f->path, sizeof f->path)) { free(f); return INVALID_HANDLE; }
-    if (!(f->dir = opendir(f->path))) { if (vx_trace) vx_log("FindFirstFile(%s): no directory %s", spec, f->path); DWORD e = vx_error_from_errno(errno); free(f); vx_set_last_error(e == 2 ? 3 : e); return INVALID_HANDLE; }
+    char dir[MAX_PATH_LEN], shadow[MAX_PATH_LEN];
+    if (!vx_unix_path(full, dir, sizeof dir)) { free(f); return INVALID_HANDLE; }
+    struct stat st;
+    if (overlay_shadow(dir, shadow, sizeof shadow) && !stat(shadow, &st) && S_ISDIR(st.st_mode) && (f->dirs[f->ndirs] = opendir(shadow)))
+        snprintf(f->paths[f->ndirs++], MAX_PATH_LEN, "%s", shadow);
+    if (strcmp(dir, f->ndirs ? f->paths[0] : "") && (f->dirs[f->ndirs] = opendir(dir))) snprintf(f->paths[f->ndirs++], MAX_PATH_LEN, "%s", dir);
+    if (!f->ndirs) { if (vx_trace) vx_log("FindFirstFile(%s): no directory %s", spec, dir); DWORD e = vx_error_from_errno(errno); free(f); vx_set_last_error(e == 2 ? 3 : e); return INVALID_HANDLE; }
     if (!find_next(f, d)) {
-        if (vx_trace) vx_log("FindFirstFile(%s): nothing in %s matches %s", spec, f->path, f->pattern);
+        if (vx_trace) vx_log("FindFirstFile(%s): nothing in %s%s%s matches %s", spec, f->paths[0], f->ndirs > 1 ? " or " : "", f->ndirs > 1 ? f->paths[1] : "", f->pattern);
         find_destroy(f); vx_set_last_error(2 /* ERROR_FILE_NOT_FOUND */); return INVALID_HANDLE;
     }
     if (vx_trace) vx_log("FindFirstFile(%s): %s", spec, d->name);
