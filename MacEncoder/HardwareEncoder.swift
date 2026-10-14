@@ -103,13 +103,6 @@ var peerGeneration: UInt64 = 0
 var lastClientDiagnosticsAt: TimeInterval = -.infinity
 let videoDatagramsInFlight = DispatchSemaphore(value: 8)
 let outputLock = NSLock()
-// Encoded frames are sent from a queue of their own, in order: sending (paced, then waiting for the network) used to
-// run in VideoToolbox's output callback, which holds one of the encoder's three in-flight frames until it returns.
-// With the headset connected that left captures no slot: 6-8 frames a second dropped unevenly at 3K (stutter in
-// the headset) while the game made 57-60. A frame waits for at most videoSendBacklog frames before it.
-let videoSendQueue = DispatchQueue(label: "com.verantyx.encoder.send", qos: .userInteractive)
-let videoSendBacklog = 3
-var videoSendsPending = 0
 
 func requestKeyFrame() {
     peerLock.lock()
@@ -295,34 +288,7 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
         offset += 4 + Int(nalLength)
     }
     
-    // 3. UDP fragmentation and transmission, on the send queue. A frame that would wait behind a full backlog is not
-    // sent: the headset gets a key frame next (it cannot decode past a missing frame).
-    encoderDiagnosticLock.lock()
-    let backlogged = videoSendsPending >= videoSendBacklog
-    if !backlogged { videoSendsPending += 1 }
-    encoderDiagnosticLock.unlock()
-    if backlogged {
-        peerLock.lock()
-        if videoPeer === peer && peerGeneration == generation { peerNeedsKeyFrame = true; keyFrameRequested = true }
-        peerLock.unlock()
-        encoderDiagnosticLock.lock()
-        droppedTransportFrames += 1
-        encoderDiagnosticLock.unlock()
-        return
-    }
-    videoSendQueue.async {
-        transmitFrame(frameData, isKeyFrame: isKeyFrame, frameSequence: frameSequence, visionTimestamp: visionTimestamp,
-                      transform: transform, peer: peer, generation: generation, outputFrameNumber: outputFrameNumber,
-                      waitingForKeyFrame: waitingForKeyFrame)
-        encoderDiagnosticLock.lock()
-        videoSendsPending -= 1
-        encoderDiagnosticLock.unlock()
-    }
-}
-
-func transmitFrame(_ frameData: Data, isKeyFrame: Bool, frameSequence: UInt32, visionTimestamp: Double,
-                   transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float),
-                   peer: NWConnection, generation: UInt64, outputFrameNumber: Int, waitingForKeyFrame: Bool) {
+    // 3. UDP Fragmentation and Transmission
     // 1100 + 96-byte VR header + 48-byte IPv6/UDP header fits even a 1280 MTU.
     let mtu = 1100
     let totalBytes = frameData.count
@@ -373,29 +339,20 @@ func transmitFrame(_ frameData: Data, isKeyFrame: Bool, frameSequence: UInt32, v
             if pause > 0 { usleep(useconds_t(min(pause, 0.01) * 1_000_000)) }
         }
     }
-    // The outcome is recorded when the network has taken every datagram, without holding up the next frame here
-    // (waiting delayed each frame behind the last one's delivery: frames reached the headset in bursts, and it showed
-    // about 30 new ones a second of the 55 it decoded, 170-260 ms after the head pose).
-    let record = { (finished: Bool) in
-        let succeeded = finished && !batch.hasFailed
-        peerLock.lock()
-        if videoPeer === peer && peerGeneration == generation {
-            if succeeded && isKeyFrame { peerNeedsKeyFrame = false }
-            if !succeeded {
-                peerNeedsKeyFrame = true
-                keyFrameRequested = true
-            }
+    let finished = batch.completion.wait(timeout: deadline) == .success
+    let succeeded = finished && !batch.hasFailed
+    peerLock.lock()
+    if videoPeer === peer && peerGeneration == generation {
+        if succeeded && isKeyFrame { peerNeedsKeyFrame = false }
+        if !succeeded {
+            peerNeedsKeyFrame = true
+            keyFrameRequested = true
         }
-        peerLock.unlock()
-        encoderDiagnosticLock.lock()
-        if succeeded { transmittedFrameCount += 1 } else { droppedTransportFrames += 1 }
-        encoderDiagnosticLock.unlock()
     }
-    let outcome = DispatchWorkItem { record(true) }
-    batch.completion.notify(queue: transportQueue, work: outcome)
-    transportQueue.asyncAfter(deadline: deadline) {               // (not all taken by then: failed)
-        if !outcome.isCancelled && batch.completion.wait(timeout: .now()) != .success { outcome.cancel(); record(false) }
-    }
+    peerLock.unlock()
+    encoderDiagnosticLock.lock()
+    if succeeded { transmittedFrameCount += 1 } else { droppedTransportFrames += 1 }
+    encoderDiagnosticLock.unlock()
 }
 
 // MARK: - VideoToolbox Setup
