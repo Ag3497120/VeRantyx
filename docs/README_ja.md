@@ -91,6 +91,19 @@ VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 片目1440×1620、2880×1620
 VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 片目2560×2880で描画（2× MSAA）、配信は同じ、50〜60fps
 ```
 
+ほかの SteamVR ゲーム: `scripts/launch_vxrt_game.sh "<ゲームの .exe>"`（Google Earth VR は動作。多くのゲームはまだ VXRuntime にない Windows の関数が必要です）。
+
+### AI コーディングツールでの最適化・ゲーム対応
+
+`tools/vxrt_doctor.py` は、ゲームを実行せずに中身（実行ファイルと DLL、エンジン、グラフィックス API、アンチチート、VXRuntime にまだない Windows の関数）と前回のログを調べ、AI コーディングツール（Claude Code、Codex、Gemini CLI、Cursor など）に貼るプロンプトを出力します。このリポジトリで起動したツールに貼ると、ツールは [AGENTS.md](../AGENTS.md)（規則、ビルド、計測方法、変えてよい設定）に従って作業します。スクリプトは何も外部に送信しません。
+
+```bash
+tools/vxrt_doctor.py "<ゲームのフォルダか .exe>" --goal tune --copy      # 設定だけでこの Mac 向けに最適化
+tools/vxrt_doctor.py "<ゲームのフォルダか .exe>" --goal support --copy   # 動くようにする（VXRuntime を変更）
+```
+
+アンチチートのあるゲームは検出して注意を出し、回避はしません。
+
 初回はゲームのシェーダーのコンパイルに数分かかります。10ビット配信には最新の Vision Pro アプリが必要です
 （`scripts/deploy_vision_pro_app.sh`）。
 

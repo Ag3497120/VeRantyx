@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""vxrt doctor: looks at a Windows game (without running it) and at the last VXRuntime logs, and writes a prompt
+for an AI coding tool (Claude Code, Codex, Gemini CLI, Cursor...) to tune the game for this Mac or to make it run.
+
+    tools/vxrt_doctor.py "<game folder or .exe>" [--goal tune|support] [--lang ja|en] [--log logs/vxrt-alyx.log]
+                         [--out prompt.md] [--copy]
+
+The prompt is printed (or written to --out, or copied to the clipboard with --copy); paste it into your AI tool,
+started in this repository. Nothing is sent anywhere by this script. The rules the AI follows are in AGENTS.md.
+"""
+import argparse, os, re, struct, subprocess, sys
+from collections import defaultdict
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VXRT = os.path.join(REPO, "VXRuntime", "build", "vxrt")
+
+# ---- PE imports -----------------------------------------------------------------------------------------------------
+def pe_imports(path):
+    """{dll: [function or #ordinal]} and the machine type of a PE file, or (None, None) if it is not one."""
+    try:
+        d = open(path, "rb").read()
+    except OSError:
+        return None, None
+    if d[:2] != b"MZ" or len(d) < 0x40:
+        return None, None
+    pe = struct.unpack_from("<I", d, 0x3C)[0]
+    if d[pe:pe + 4] != b"PE\0\0":
+        return None, None
+    machine, nsec = struct.unpack_from("<HH", d, pe + 4)
+    opt_size = struct.unpack_from("<H", d, pe + 20)[0]
+    opt = pe + 24
+    magic = struct.unpack_from("<H", d, opt)[0]
+    dirs = opt + (112 if magic == 0x20B else 96)
+    imp_rva, _ = struct.unpack_from("<II", d, dirs + 8)
+    secs = []
+    for i in range(nsec):
+        o = opt + opt_size + 40 * i
+        vs, va, rs, ro = struct.unpack_from("<IIII", d, o + 8)
+        secs.append((va, max(vs, rs), ro))
+    def off(rva):
+        for va, size, ro in secs:
+            if va <= rva < va + size:
+                return rva - va + ro
+        return None
+    def cstr(o):
+        e = d.find(b"\0", o)
+        return d[o:e].decode("latin-1")
+    out = defaultdict(list)
+    o = off(imp_rva) if imp_rva else None
+    wide = magic == 0x20B
+    while o is not None and o + 20 <= len(d):
+        ilt, _, _, name, iat = struct.unpack_from("<IIIII", d, o)
+        if not name:
+            break
+        dll = cstr(off(name)).lower()
+        t = off(ilt or iat)
+        while t is not None:
+            v = struct.unpack_from("<Q" if wide else "<I", d, t)[0]
+            if not v:
+                break
+            if v >> (63 if wide else 31):
+                out[dll].append("#%d" % (v & 0xFFFF))
+            else:
+                h = off(v & 0x7FFFFFFF)
+                out[dll].append(cstr(h + 2) if h is not None else "?")
+            t += 8 if wide else 4
+        o += 20
+    # Delay-loaded imports (Unity takes Direct3D this way): descriptors of 8 dwords, names as above.
+    dl_rva = struct.unpack_from("<I", d, dirs + 13 * 8)[0] if dirs + 13 * 8 + 4 <= len(d) else 0
+    o = off(dl_rva) if dl_rva else None
+    while o is not None and o + 32 <= len(d):
+        attrs, name, _, _, int_rva = struct.unpack_from("<IIIII", d, o)
+        if not name:
+            break
+        base = 0 if attrs & 1 else struct.unpack_from("<Q" if wide else "<I", d, opt + 24)[0]   # (old descriptors hold VAs)
+        nm = off(name - base)
+        if nm is None:
+            break
+        dll = cstr(nm).lower()
+        t = off(int_rva - base)
+        while t is not None:
+            v = struct.unpack_from("<Q" if wide else "<I", d, t)[0]
+            if not v:
+                break
+            if v >> (63 if wide else 31):
+                out[dll].append("#%d" % (v & 0xFFFF))
+            else:
+                h = off((v & 0x7FFFFFFF) - base)
+                out[dll].append(cstr(h + 2) if h is not None else "?")
+            t += 8 if wide else 4
+        o += 32
+    return dict(out), machine
+
+def canonical(dll):
+    """API sets resolve as VXRuntime's loader does (loader.c canonical_dll)."""
+    if dll.startswith("api-ms-win-crt-"): return "ucrtbase.dll"
+    if dll.startswith("api-ms-win-core-"): return "kernel32.dll"
+    if dll.startswith(("api-ms-win-security-", "api-ms-win-eventing-")): return "advapi32.dll"
+    if dll.startswith(("api-ms-win-ntuser-", "ext-ms-win-ntuser-")): return "user32.dll"
+    if dll.startswith("api-ms-win-"): return "kernelbase.dll"
+    return dll
+
+def runtime_exports():
+    if not os.path.exists(VXRT):
+        subprocess.run(["make", "-C", os.path.join(REPO, "VXRuntime"), "build/vxrt"], stdout=subprocess.DEVNULL)
+    r = subprocess.run([VXRT, "--list-exports"], capture_output=True, text=True)
+    ex = defaultdict(set)
+    for line in r.stdout.splitlines():
+        if "\t" in line:
+            dll, name = line.split("\t", 1)
+            ex[dll.lower()].add(name)
+    return ex
+
+# ---- what the game is -----------------------------------------------------------------------------------------------
+ANTI_CHEAT = {"easyanticheat": "Easy Anti-Cheat", "battleye": "BattlEye", "beservice": "BattlEye", "vgk": "Vanguard",
+              "xigncode": "XIGNCODE3", "nprotect": "nProtect GameGuard", "gameguard": "nProtect GameGuard",
+              "equ8": "EQU8", "anticheatexpert": "ACE", "denuvo": "Denuvo Anti-Cheat"}
+
+def scan_game(root):
+    exes, dlls, markers = [], {}, set()
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [x for x in dirnames if not x.startswith(".")]
+        for f in files:
+            low = f.lower()
+            full = os.path.join(dirpath, f)
+            for key, name in ANTI_CHEAT.items():
+                if key in low or key in dirpath.lower():
+                    markers.add("anticheat:" + name)
+            if low == "unityplayer.dll": markers.add("engine:Unity")
+            if low == "gameassembly.dll": markers.add("engine:Unity (IL2CPP)")
+            if low.endswith("-win64-shipping.exe") or low == "ue4prereqsetup_x64.exe": markers.add("engine:Unreal Engine")
+            if low == "engine2.dll": markers.add("engine:Source 2")
+            if low == "openvr_api.dll": markers.add("vr:OpenVR")
+            if low == "openxr_loader.dll": markers.add("vr:OpenXR")
+            if low.endswith(".exe"):
+                exes.append(full)
+            elif low.endswith(".dll"):
+                dlls.setdefault(low, full)
+    return exes, dlls, markers
+
+HELPERS = ("crashhandler", "crashpad", "crash_handler", "unitycrashhandler", "setup", "redist", "vcredist", "dxsetup",
+           "uninst", "launcher_helper", "webhelper", "easyanticheat", "beservice", "prereq")
+
+def steam_name(root):
+    """The game's name from a Steam app manifest next to it (steamcmd installs) or above it (a Steam library)."""
+    for d in (root, os.path.dirname(os.path.dirname(os.path.normpath(root)))):
+        sa = os.path.join(d, "steamapps")
+        if os.path.isdir(sa):
+            folder_id = os.path.basename(os.path.normpath(root))
+            names = {}
+            for f in os.listdir(sa):
+                m = re.match(r"appmanifest_(\d+)\.acf$", f)
+                if m and m.group(1) != "228980":             # (Steamworks Common Redistributables)
+                    n = re.search(r'"name"\s+"([^"]+)"', open(os.path.join(sa, f), errors="replace").read())
+                    if n: names[m.group(1)] = n.group(1)
+            if names: return names.get(folder_id) or next(iter(names.values()))
+    return None
+
+def pick_exe(exes, name):
+    """The game's own executable: not a helper, the one named like the game if there is one, else the largest."""
+    games = [e for e in exes if not any(h in os.path.basename(e).lower() for h in HELPERS)] or exes
+    key = re.sub(r"[^a-z0-9]", "", name.lower())
+    named = [e for e in games if re.sub(r"[^a-z0-9]", "", os.path.splitext(os.path.basename(e))[0].lower()) in (key, key + "64", key + "win64")]
+    pool = named or games
+    return max(pool, key=os.path.getsize) if pool else None
+
+def closure(main_exe, game_dlls):
+    """The main executable, the DLLs beside it and those it imports (recursively) from the game's folder: what the
+    game loads, as far as static imports and its own folder tell (DLLs loaded later by path are not seen)."""
+    todo = [main_exe] + [os.path.join(os.path.dirname(main_exe), f) for f in os.listdir(os.path.dirname(main_exe)) if f.lower().endswith(".dll")]
+    seen, out = set(), []
+    while todo:
+        p = todo.pop()
+        if p.lower() in seen: continue
+        seen.add(p.lower()); out.append(p)
+        imports, _ = pe_imports(p)
+        for dll in (imports or {}):
+            if dll in game_dlls: todo.append(game_dlls[dll])
+    return out
+
+def machine_info():
+    def sh(*a):
+        try: return subprocess.run(a, capture_output=True, text=True).stdout.strip()
+        except OSError: return ""
+    chip = sh("sysctl", "-n", "machdep.cpu.brand_string")
+    mem = sh("sysctl", "-n", "hw.memsize")
+    gpu = re.search(r"Total Number of Cores: (\d+)", sh("system_profiler", "SPDisplaysDataType"))
+    os_ver = sh("sw_vers", "-productVersion")
+    return {"chip": chip, "memory_gb": int(mem) // 2**30 if mem.isdigit() else "?",
+            "gpu_cores": gpu.group(1) if gpu else "?", "macos": os_ver}
+
+# ---- the last run's log -----------------------------------------------------------------------------------------------
+LOG_PATTERNS = [
+    ("unimplemented call", r"called an unimplemented function: (\S+)"),
+    ("missing DLL", r"DLL (\S+) not found"),
+    ("pipeline state failed", r"pipeline state failed: (.*)"),
+    ("shader did not compile", r"(?:shader|variant).* did not compile: (.{0,160})"),
+    ("unhandled exception", r"(unhandled exception.{0,160}|unwind did not reach.{0,80})"),
+    ("message box", r"MessageBox: (.{0,200})"),
+    ("exit", r"(ExitProcess\(\d+\) from \S+)"),
+    ("audio gaps", r"audio: (\d+ gaps of silence.{0,60})"),
+    ("not supported", r"(\S+ is not supported.{0,80}|not implemented: .{0,120})"),
+]
+
+def read_log(path):
+    if not path or not os.path.exists(path):
+        return {}
+    found = defaultdict(lambda: defaultdict(int))
+    with open(path, errors="replace") as f:
+        for line in f:
+            for label, pat in LOG_PATTERNS:
+                m = re.search(pat, line)
+                if m:
+                    found[label][m.group(1).strip()[:200]] += 1
+    return found
+
+def proxy_fps(root_c):
+    path = os.path.join(root_c, "vr_openvr_capture_proxy.log")
+    if not os.path.exists(path):
+        return None
+    fps = [float(m.group(1)) for m in re.finditer(r"submit_fps=([\d.]+)", open(path, errors="replace").read()[-200000:])]
+    return fps[-24:] if fps else None
+
+# ---- the prompt ---------------------------------------------------------------------------------------------------------
+TEXT = {
+    "ja": {
+        "intro_tune": "このリポジトリ（VeRantyx / VXRuntime）で、次の Windows VR ゲームをこの Mac 向けに最適化してください。設定の調整だけで、ランタイムのコードは変えません。",
+        "intro_support": "このリポジトリ（VeRantyx / VXRuntime）で、次の Windows ゲームが VXRuntime で動くようにしてください。足りない Windows API の実装や Direct3D の変換の修正など、VXRuntime 側（VXRuntime/src）の変更が対象です。",
+        "rules": "まず AGENTS.md を読み、その規則と手順に従ってください（DRM・アンチチートの回避、ゲームファイルの改変や再配布はしない／変更後は make -C VXRuntime check を通す／計測は AGENTS.md の方法で行い、数値で報告する）。",
+        "facts": "## 調べた事実（vxrt doctor が自動で集めたもの）",
+        "machine": "マシン", "game": "ゲーム", "engine": "エンジン・VR", "apis": "グラフィックスなど",
+        "missing": "VXRuntime にまだない関数（ゲームの EXE/DLL が使うもの。呼ばれたときだけ止まるので、ログの「unimplemented call」が優先）",
+        "nodll": "見つからない DLL（ゲームフォルダにもランタイムにもない）",
+        "log": "前回の実行ログ", "fps": "直近の fps（ゲームの Submit 回数/秒）",
+        "task_tune": "## お願いしたいこと\n1. AGENTS.md の計測方法で、今の設定の fps と GPU 使用率を測る。\n2. 変えてよい項目（AGENTS.md の「調整できる設定」）だけを使い、目標（表示 Hz に張り付く fps、なるべく高い解像度）に近づける。\n3. 試した設定と結果を表にし、一番良い組み合わせを scripts の起動方法（環境変数・ゲームの引数）として示す。",
+        "task_support": "## お願いしたいこと\n1. 上の「ない関数」「ログの問題」のうち、ゲームの起動や描画を止めているものから順に、原因を調べる。\n2. VXRuntime/src に実装・修正を加え、テストを足して make -C VXRuntime check を通す。\n3. ゲームを起動して確かめ、何が動いて何が残っているかを数値・ログで報告する。コミットは動作を確かめたものだけ。",
+        "anticheat": "注意：このゲームにはアンチチート（{}）があります。回避は行わず、オフラインで遊べる部分があるかの確認にとどめてください。",
+        "none": "なし", "others": "ほかの実行ファイル",
+    },
+    "en": {
+        "intro_tune": "In this repository (VeRantyx / VXRuntime), tune the following Windows VR game for this Mac. Settings only: do not change the runtime's code.",
+        "intro_support": "In this repository (VeRantyx / VXRuntime), make the following Windows game run on VXRuntime: implementing missing Windows APIs, fixing the Direct3D translation and so on, in VXRuntime/src.",
+        "rules": "Read AGENTS.md first and follow its rules and procedures (no DRM or anti-cheat circumvention, no modifying or redistributing game files; make -C VXRuntime check must pass after changes; measure as AGENTS.md describes and report numbers).",
+        "facts": "## Facts (collected by vxrt doctor)",
+        "machine": "Machine", "game": "Game", "engine": "Engine / VR", "apis": "Graphics and others",
+        "missing": "Functions VXRuntime does not have yet (used by the game's EXE/DLLs; they only stop a program when called, so the log's 'unimplemented call' entries come first)",
+        "nodll": "DLLs not found (neither in the game folder nor in the runtime)",
+        "log": "Last run's log", "fps": "Recent fps (the game's Submits per second)",
+        "task_tune": "## What to do\n1. Measure fps and GPU use with the current settings, as AGENTS.md describes.\n2. Using only the settings AGENTS.md lists as tunable, get as close as you can to the goal (fps at the display rate, as high a resolution as possible).\n3. Report the settings tried and their results as a table, and give the best combination as a launch command (environment variables, game arguments).",
+        "task_support": "## What to do\n1. Starting with what stops the game from starting or drawing, find the cause of the missing functions and log problems above.\n2. Implement or fix it in VXRuntime/src, add tests, and get make -C VXRuntime check to pass.\n3. Launch the game to check, and report what works and what is left with numbers and logs. Commit only what you have verified.",
+        "anticheat": "Note: this game has anti-cheat ({}). Do not circumvent it; only check whether parts of it can be played offline.",
+        "none": "none", "others": "other executables",
+    },
+}
+
+GRAPHICS = {"d3d11.dll": "Direct3D 11", "d3d12.dll": "Direct3D 12 (VXRuntime: not supported)", "d3d9.dll": "Direct3D 9",
+            "dxgi.dll": "DXGI", "opengl32.dll": "OpenGL", "vulkan-1.dll": "Vulkan (VXRuntime: not supported)",
+            "xinput1_3.dll": "XInput", "xinput1_4.dll": "XInput", "xaudio2_9.dll": "XAudio2", "openvr_api.dll": "OpenVR",
+            "wininet.dll": "WinINet", "winhttp.dll": "WinHTTP", "ws2_32.dll": "Winsock"}
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("game", help="the game's folder or its .exe")
+    ap.add_argument("--goal", choices=["tune", "support"], default="support")
+    ap.add_argument("--lang", choices=["ja", "en"], default="ja")
+    ap.add_argument("--log", help="a VXRuntime log of the game (default: the newest logs/vxrt-*.log)")
+    ap.add_argument("--root", default=os.path.expanduser("~/Verantyx_VR_Drive/vxrt_root/drive_c"), help="VXRT_ROOT/drive_c of the last run")
+    ap.add_argument("--dll-path", default=os.path.expanduser("~/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test/drive_c/windows/system32"),
+                    help="where Windows DLLs the runtime loads from disk live (VXRT_DLL_PATH)")
+    ap.add_argument("--out"); ap.add_argument("--copy", action="store_true")
+    a = ap.parse_args()
+    T = TEXT[a.lang]
+
+    root = a.game if os.path.isdir(a.game) else os.path.dirname(a.game)
+    exes, game_dlls, markers = scan_game(root)
+    name = steam_name(root)
+    if not name and "/common/" in os.path.abspath(root):    # a Steam library: steamapps/common/<game>/...
+        name = os.path.abspath(root).split("/common/", 1)[1].split("/")[0]
+    main_exe = a.game if a.game.lower().endswith(".exe") else pick_exe(exes, name or os.path.basename(os.path.normpath(root)))
+    if not main_exe:
+        sys.exit("No .exe found in %s" % root)
+    disk_dlls = {f.lower() for f in os.listdir(a.dll_path)} if os.path.isdir(a.dll_path) else set()
+    exports = runtime_exports()
+
+    missing, nodll, apis = defaultdict(set), set(), set()
+    files = closure(main_exe, game_dlls)
+    for path in files:
+        imports, machine = pe_imports(path)
+        if not imports or machine != 0x8664:          # (x86-64 only: 32-bit helpers and other files are left out)
+            continue
+        for dll, funcs in imports.items():
+            if dll in GRAPHICS: apis.add(GRAPHICS[dll])
+            c = canonical(dll)
+            if dll in game_dlls:                         # shipped with the game: looked at as a file of its own
+                continue
+            if c in exports:
+                for fn in funcs:
+                    if fn not in exports[c] and not fn.startswith("#"):
+                        missing[c].add(fn)
+            elif dll in disk_dlls:                       # a real Windows DLL loaded from the DLL path
+                continue
+            else:
+                nodll.add(dll)
+
+    log = a.log
+    exe_name = os.path.basename(main_exe).lower()
+    if not log:                                          # the newest log that mentions this game's executable
+        d = os.path.join(REPO, "logs")
+        logs = sorted((os.path.join(d, f) for f in os.listdir(d) if f.startswith("vxrt-") and f.endswith(".log")), key=os.path.getmtime, reverse=True) if os.path.isdir(d) else []
+        stem = re.escape(os.path.splitext(exe_name)[0])
+        log = next((p for p in logs if re.search(r"\b%s\b" % stem, open(p, errors="replace").read(400000).lower())), None)
+    found = read_log(log)
+    fps = proxy_fps(a.root) if log and abs(os.path.getmtime(log) - os.path.getmtime(os.path.join(a.root, "vr_openvr_capture_proxy.log")) if os.path.exists(os.path.join(a.root, "vr_openvr_capture_proxy.log")) else 1e9) < 600 else None
+    mi = machine_info()
+    if any(m.startswith("engine:Unity") for m in markers) and not any(x.startswith("Direct3D") for x in apis):
+        apis.add("Direct3D 11 (Unity's default on Windows, loaded at run time)")
+
+    L = []
+    L.append(T["intro_" + a.goal])
+    L.append(T["rules"])
+    ac = [m.split(":", 1)[1] for m in markers if m.startswith("anticheat:")]
+    if ac: L.append("\n" + T["anticheat"].format(", ".join(sorted(set(ac)))))
+    L.append("\n" + T["facts"])
+    L.append(f"- {T['machine']}: {mi['chip']}, GPU {mi['gpu_cores']} cores, {mi['memory_gb']} GB, macOS {mi['macos']}")
+    others = [os.path.relpath(e, root) for e in exes if e != main_exe and not any(h in os.path.basename(e).lower() for h in HELPERS)]
+    L.append(f"- {T['game']}: {name or os.path.basename(os.path.normpath(root))} — {os.path.relpath(main_exe, root)}" + (f" ({T['others']}: {', '.join(others[:6])})" if others else ""))
+    eng = sorted(m.split(":", 1)[1] for m in markers if m.startswith(("engine:", "vr:")))
+    L.append(f"- {T['engine']}: {', '.join(eng) or T['none']}")
+    L.append(f"- {T['apis']}: {', '.join(sorted(apis)) or T['none']}")
+    total = sum(len(v) for v in missing.values())
+    L.append(f"- {T['missing']}: {total}")
+    for dll in sorted(missing, key=lambda k: -len(missing[k])):
+        names = sorted(missing[dll])
+        L.append(f"  - {dll} ({len(names)}): {', '.join(names[:40])}{' …' if len(names) > 40 else ''}")
+    L.append(f"- {T['nodll']}: {', '.join(sorted(nodll)) or T['none']}")
+    if log:
+        L.append(f"- {T['log']} ({os.path.relpath(log, REPO) if log.startswith(REPO) else log}):")
+        if not found: L.append(f"  - {T['none']}")
+        for label, items in found.items():
+            top = sorted(items.items(), key=lambda kv: -kv[1])[:8]
+            L.append(f"  - {label}: " + "; ".join(f"{k} ×{n}" for k, n in top))
+    if fps:
+        L.append(f"- {T['fps']}: {', '.join(f'{x:.0f}' for x in fps[-12:])}")
+    L.append("\n" + T["task_" + a.goal])
+    prompt = "\n".join(L) + "\n"
+
+    if a.out:
+        open(a.out, "w").write(prompt)
+    if a.copy:
+        subprocess.run(["pbcopy"], input=prompt.encode())
+    if not a.out:
+        sys.stdout.write(prompt)
+    if a.copy:
+        print("\n(copied to the clipboard)", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()

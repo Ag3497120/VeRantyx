@@ -761,6 +761,15 @@ int main(int argc, char **argv, char **envp) {
     vx_vcruntime_init();
     vx_extras_init();                            // (last: the tables above come first)
 
+    // vxrt --list-exports: every function the runtime implements, "dll<TAB>name" per line (tools/vxrt_doctor.py
+    // compares a game's imports with it, without running the game).
+    if (!strcmp(argv[1], "--list-exports")) {
+        for (size_t m = 0; m < g_module_count; m++)
+            for (size_t i = 0; i < g_modules[m].count; i++)
+                if (g_modules[m].exports[i].name) printf("%s\t%s\n", g_modules[m].dll, g_modules[m].exports[i].name);
+        return 0;
+    }
+
     vx_proc.argc = argc - 1;
     vx_proc.argv = argv + 1;
     vx_proc.envp = envp;

@@ -197,6 +197,26 @@ VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 2560×2880 per eye rendered (
 The first start compiles the game's shaders (a few minutes). The 10-bit stream
 needs the current Vision Pro app (`scripts/deploy_vision_pro_app.sh`).
 
+Other SteamVR games: `scripts/launch_vxrt_game.sh "<game .exe>"` (Google Earth VR
+runs; most games still need some Windows functions VXRuntime lacks).
+
+### Tuning a game or making one run, with an AI coding tool
+
+`tools/vxrt_doctor.py` looks at a game without running it (its executables and
+DLLs, engine, graphics API, anti-cheat, and the Windows functions VXRuntime does
+not have yet) and at its last log, and prints a prompt for your AI coding tool
+(Claude Code, Codex, Gemini CLI, Cursor...). Paste it into the tool, started in
+this repository: the tool follows [AGENTS.md](AGENTS.md) (rules, build, how to
+measure, which settings it may change). Nothing is sent anywhere by the script.
+
+```bash
+tools/vxrt_doctor.py "<game folder or .exe>" --goal tune --copy      # settings only, for this Mac
+tools/vxrt_doctor.py "<game folder or .exe>" --goal support --copy   # make it run: changes VXRuntime
+```
+
+Prompts are in Japanese by default (`--lang en` for English). Games with
+anti-cheat are flagged and not worked around.
+
 ## Compared with Glovebox
 
 [Glovebox](https://glovebox.vision/) (Udi Wertheimer, October 2026) also runs
