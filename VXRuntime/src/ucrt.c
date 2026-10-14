@@ -378,6 +378,17 @@ static WINAPI unsigned long vx_strtoul(const char *s, char **e, int b) { return 
 static WINAPI long long vx_strtoll(const char *s, char **e, int b) { return strtoll(s, e, b); }
 static WINAPI double vx_strtod(const char *s, char **e) { return strtod(s, e); }
 static WINAPI char *vx_getenv(const char *n) { return getenv(n); }
+// *len: the size with the terminator, 0 when the variable is not set; 34 (ERANGE) when it does not fit.
+static WINAPI int vx_getenv_s(size_t *len, char *buf, size_t cap, const char *n) {
+    const char *v = n ? getenv(n) : NULL;
+    size_t need = v ? strlen(v) + 1 : 0;
+    if (len) *len = need;
+    if (buf && cap) buf[0] = 0;
+    if (!v) return 0;
+    if (!buf || cap < need) return 34;
+    memcpy(buf, v, need);
+    return 0;
+}
 static WINAPI int vx_toupper(int c) { return toupper(c); }
 static WINAPI int vx_tolower(int c) { return tolower(c); }
 static WINAPI int vx_isspace(int c) { return isspace(c); }
@@ -708,7 +719,7 @@ static WINAPI WCHAR *vx_W_Getmonths(void) { char *a = vx_Getmonths(); WCHAR *w =
 // __lc_time_data: abbreviated and full day and month names, AM/PM, date and time formats (narrow then wide), the
 // calendar type and a reference count, the locale name.
 static void *time_names(void) {
-    static void *data[7 + 7 + 12 + 12 + 2 + 3 + 2 + 7 + 7 + 12 + 12 + 2 + 3 + 1];
+    static void *data[7 + 7 + 12 + 12 + 2 + 3 + 2 + 7 + 7 + 12 + 12 + 2 + 3 + 1];   // (size: vx_Gettnames)
     static int done;
     if (done) return data;
     int k = 0;
@@ -729,7 +740,13 @@ static void *time_names(void) {
     done = 1;
     return data;
 }
-static WINAPI void *vx_Gettnames(void) { return time_names(); }
+// The caller (the C++ library's time facets) frees the block: each call gets its own copy of the table.
+static WINAPI void *vx_Gettnames(void) {
+    static const size_t size = (7 + 7 + 12 + 12 + 2 + 3 + 2 + 7 + 7 + 12 + 12 + 2 + 3 + 1) * sizeof(void *);
+    void *copy = malloc(size);
+    if (copy) memcpy(copy, time_names(), size);
+    return copy;
+}
 static WINAPI size_t vx_Strftime(char *out, size_t cap, const char *fmt, const struct tm *t, void *names) { (void)names; return strftime(out, cap, fmt, t); }
 static WINAPI size_t vx_Wcsftime(WCHAR *out, size_t cap, const WCHAR *fmt, const struct tm *t, void *names) {
     (void)names;
@@ -1053,7 +1070,7 @@ static const vx_export ucrt[] = {
     { "strchr", (void *)vx_strchr }, { "strrchr", (void *)vx_strrchr }, { "strstr", (void *)vx_strstr },
     { "_strdup", (void *)vx_strdup }, { "strdup", (void *)vx_strdup },
     { "atoi", (void *)vx_atoi }, { "strtol", (void *)vx_strtol }, { "strtoul", (void *)vx_strtoul },
-    { "strtoll", (void *)vx_strtoll }, { "strtod", (void *)vx_strtod }, { "getenv", (void *)vx_getenv },
+    { "strtoll", (void *)vx_strtoll }, { "strtod", (void *)vx_strtod }, { "getenv", (void *)vx_getenv }, { "getenv_s", (void *)vx_getenv_s },
     { "toupper", (void *)vx_toupper }, { "tolower", (void *)vx_tolower }, { "isspace", (void *)vx_isspace },
     { "isdigit", (void *)vx_isdigit }, { "isalpha", (void *)vx_isalpha },
     { "rand", (void *)vx_rand }, { "srand", (void *)vx_srand }, { "_time64", (void *)vx_time64 }, { "clock", (void *)vx_clock },

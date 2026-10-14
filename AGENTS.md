@@ -99,5 +99,5 @@ that keeps it. A render size larger than the stream's budget only supersamples.
 4. Add a test under `VXRuntime/tests` when the behaviour is not trivial; `make -C VXRuntime check` must pass.
 5. Run the game again; repeat until it reaches the headset. Report what works, what is left, with logs and numbers.
 
-Known limits: no Direct3D 12, no Vulkan, no tessellation or stream output; geometry shaders run as compute
-(and split render passes). Each is a larger project; say so rather than starting it unasked.
+Known limits: no Direct3D 12, no Vulkan, no tessellation; stream output only with a vertex shader's code (not from a
+geometry shader); geometry shaders run as compute (and split render passes). Each is a larger project; say so rather than starting it unasked.

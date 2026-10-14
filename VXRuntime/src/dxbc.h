@@ -65,4 +65,6 @@ int  dxbc_translate(const void *code, size_t size, dxbc_shader *out);
 void dxbc_free(dxbc_shader *s);
 // The input signature of a container (for input layouts), without translating it.
 int  dxbc_input_signature(const void *code, size_t size, dxbc_element *elements, int max);
+// The program type of a container (DXBC_VERTEX, ...), or -1.
+int  dxbc_program_type(const void *code, size_t size);
 #endif

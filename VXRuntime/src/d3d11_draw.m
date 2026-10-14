@@ -38,7 +38,12 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface)
 // function: the Metal function, once compiled (ready). Shaders compile in the background: Metal's compiler service
 // works on many at once, and a game creating thousands while it loads would otherwise wait for each in turn; the
 // first draw (or dispatch) that needs one waits for it.
-typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id, hash; volatile int ready; void *dual; int dual_tried; void *variant; int variant_tried; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
+// so: a geometry shader made with stream output (so_layout), else NULL.
+typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id, hash; volatile int ready; void *dual; int dual_tried; void *variant; int variant_tried; void *so; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
+// Stream output (stream 0): which output register components go where in the target buffers. An entry copies
+// count components from register reg, component comp on, to dword dword of each vertex's record in buffer slot.
+typedef struct { uint32_t reg, comp, count, slot_dword; } so_entry;   // slot_dword: slot << 24 | dword
+typedef struct { uint32_t n, stride[4]; int rasterized; so_entry e[64]; } so_layout;
 static pthread_mutex_t g_compile_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_compiled = PTHREAD_COND_INITIALIZER;
 // Variants compile synchronously under their own lock: the compile needs Metal's compiler queue, whose completion
@@ -79,6 +84,7 @@ static void shader_destroy(d3d_object *o) {
     if (s->dual) CFBridgingRelease(s->dual);
     if (s->variant) CFBridgingRelease(s->variant);
     if (s->compute) CFBridgingRelease(s->compute);
+    free(s->so);
     dxbc_free(&s->info);
 }
 static WINAPI HRESULT vs_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_ID3D11VertexShader); }
@@ -381,6 +387,7 @@ typedef struct d3d_draw_state {
     RECT scissor[16];
     uint32_t nscissors;
     void *gs_vertices;                         // drawing a geometry kernel's triangles: its output (id<MTLBuffer>), else NULL
+    d3d_buffer *so[4];                         // stream output targets
     void *dummy_depth;                         // id<MTLTexture>: for shaders writing depth with no depth target bound
     void *pass_depth;                          // the dummy depth the open render encoder has (or NULL)
     struct pso_key { uint32_t vs, ps, layout, blend, color[8], depth, stride[16]; } last_key;   // the last pipeline state used
@@ -417,6 +424,7 @@ void d3d_draw_release(d3d_context *c) {
         for (int i = 0; i < 16; i++) bind(&s->smp[st][i], NULL);
         for (int i = 0; i < 8; i++) bind(&s->uav[st][i], NULL);
     }
+    for (int i = 0; i < 4; i++) bind(&s->so[i], NULL);
     free(s);
     c->draw = NULL;
 }
@@ -1364,9 +1372,119 @@ static int gs_inputs_from_cpu(d3d_context *c, d3d_draw_state *s) {
     #undef GS_NOT_EARLY
     return 1;
 }
+// The vertex kernel over a draw's vertices (thread (x, y): vertex x of instance y), its outputs to vs_out (vsn float4s
+// a vertex): vertex buffers moved to the first vertex (or the base vertex of indexed draws).
+static void run_vs_kernel(d3d_context *c, d3d_draw_state *s, id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineState> vk, id<MTLBuffer> vs_out, uint32_t vsn,
+                          uint32_t count, uint32_t instances, uint32_t start, int32_t base_vertex, uint32_t start_instance, int index_type) {
+    int indexed = index_type != 0;
+    [enc setComputePipelineState:vk];
+    for (int i = 0; i < 16; i++) {
+        if (!s->vb[i]) continue;
+        int instanced = 0, step_rate = 1;
+        if (s->layout) for (uint32_t k = 0; k < s->layout->n; k++) if (s->layout->attr[k].slot == (uint32_t)i && s->layout->attr[k].instanced) { instanced = 1; step_rate = s->layout->attr[k].step ? (int)s->layout->attr[k].step : 1; }
+        int64_t off = (int64_t)s->vb[i]->off + s->offset[i] + (int64_t)s->stride[i] * (instanced ? (int64_t)(start_instance / (uint32_t)step_rate) : indexed ? base_vertex : (int64_t)start);
+        if (off < 0) off = 0;
+        [enc setBuffer:(__bridge id<MTLBuffer>)s->vb[i]->mtl offset:(NSUInteger)off atIndex:VB_BASE + i];
+    }
+    if (indexed) [enc setBuffer:(__bridge id<MTLBuffer>)s->ib->mtl offset:s->ib->off + s->ib_offset + (NSUInteger)start * (index_type == 2 ? 4 : 2) atIndex:DXBC_GS_INDEX];
+    else [enc setBuffer:vs_out offset:0 atIndex:DXBC_GS_INDEX];          // (not read)
+    bind_stage(c, s, STAGE_VS, nil, enc);
+    uint32_t vp[8] = { count, indexed ? 0 : start, start_instance, vsn, (uint32_t)index_type, 0, (uint32_t)base_vertex, 0 };
+    [enc setBytes:vp length:sizeof vp atIndex:DXBC_VS_PARAMS];
+    [enc setBuffer:vs_out offset:0 atIndex:DXBC_GS_OUT];
+    [enc dispatchThreads:MTLSizeMake(count, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, vk.maxTotalThreadsPerThreadgroup), 1, 1)];
+}
+
+// Stream output with a vertex shader's code: the vertex kernel, then a kernel copying the declared components of each
+// vertex's outputs to the targets, from where each one's earlier stream output ended (as Direct3D: in draw order,
+// whole primitives of a list; writes past a buffer's end are dropped). Strips are not expanded yet.
+static const char g_so_source[] =
+    "#include <metal_stdlib>\nusing namespace metal;\n"
+    "struct SoEntry { uint reg, comp, count, slot_dword; };\n"
+    "struct SoParams { uint nverts, nentries, vsn, pad; uint base[4], stride[4], cap[4]; SoEntry e[64]; };\n"
+    "kernel void vx_so(uint v [[thread_position_in_grid]], const device float4 *src [[buffer(0)]], constant SoParams &p [[buffer(1)]],\n"
+    "                  device uint *d0 [[buffer(2)]], device uint *d1 [[buffer(3)]], device uint *d2 [[buffer(4)]], device uint *d3 [[buffer(5)]]) {\n"
+    "    if (v >= p.nverts) return;\n"
+    "    for (uint i = 0; i < p.nentries; i++) {\n"
+    "        SoEntry e = p.e[i];\n"
+    "        uint slot = e.slot_dword >> 24, at = p.base[slot] + v * p.stride[slot] + (e.slot_dword & 0xffffff);\n"
+    "        if (at + e.count > p.cap[slot]) continue;\n"
+    "        device uint *d = slot == 0 ? d0 : slot == 1 ? d1 : slot == 2 ? d2 : d3;\n"
+    "        uint4 x = as_type<uint4>(src[v * p.vsn + e.reg]);\n"
+    "        for (uint k = 0; k < e.count && e.comp + k < 4; k++) d[at + k] = x[e.comp + k];\n"
+    "    }\n"
+    "}\n";
+static void so_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t start, int32_t base_vertex, uint32_t start_instance, int indexed) {
+    d3d_draw_state *s = state_of(c);
+    d3d_shader *vs = s->shader[STAGE_VS], *gs = s->shader[STAGE_GS];
+    const so_layout *so = gs->so;
+    if (!vs || !count || !instances || (indexed && !s->ib)) return;
+    uint32_t per = s->topology == 1 ? 1 : s->topology == 2 ? 2 : s->topology == 4 ? 3 : 0;   // point, line, triangle lists
+    if (!per) { d3d_not_implemented("stream output from strips"); return; }
+    count -= count % per;
+    int any = 0;
+    for (int i = 0; i < 4; i++) any |= s->so[i] != NULL;
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)c->base.dev->mtl;
+    if (any && count && gs->info.type == DXBC_VERTEX) {
+        static id<MTLComputePipelineState> pack;
+        static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&lock);
+        if (!pack) {
+            NSError *err = nil;
+            id<MTLLibrary> lib = [dev newLibraryWithSource:@(g_so_source) options:nil error:&err];
+            id<MTLFunction> fn = [lib newFunctionWithName:@"vx_so"];
+            pack = fn ? [dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+            if (!pack) vx_log("Direct3D: stream output kernel failed: %s", err.localizedDescription.UTF8String);
+        }
+        pthread_mutex_unlock(&lock);
+        int index_type = indexed ? (s->ib_format == 42 ? 2 : 1) : 0;
+        id<MTLComputePipelineState> vk = vs_kernel_pipeline(c, s, vs, index_type);
+        uint32_t vsn = (uint32_t)(vs->info.out_regs ? vs->info.out_regs : 1), nverts = count * instances;
+        id<MTLBuffer> vs_out = vk && pack ? [dev newBufferWithLength:(NSUInteger)nverts * vsn * 16 options:MTLResourceStorageModePrivate] : nil;
+        if (vs_out) {
+            d3d_end_render(c);
+            id<MTLComputeCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoder];
+            run_vs_kernel(c, s, enc, vk, vs_out, vsn, count, instances, start, base_vertex, start_instance, index_type);
+            struct { uint32_t nverts, nentries, vsn, pad, base[4], stride[4], cap[4]; so_entry e[64]; } p;
+            memset(&p, 0, sizeof p);
+            p.nverts = nverts; p.nentries = so->n; p.vsn = vsn;
+            memcpy(p.e, so->e, sizeof(so_entry) * so->n);
+            [enc setComputePipelineState:pack];
+            [enc setBuffer:vs_out offset:0 atIndex:0];
+            for (int i = 0; i < 4; i++) {
+                d3d_buffer *b = s->so[i];
+                if (b) {
+                    p.base[i] = b->so_filled / 4; p.stride[i] = so->stride[i]; p.cap[i] = b->desc[0] / 4;
+                    [enc setBuffer:(__bridge id<MTLBuffer>)b->mtl offset:b->off atIndex:2 + i];
+                    uint32_t end = b->so_filled + nverts * so->stride[i] * 4;
+                    b->so_filled = MIN(end, b->desc[0]);
+                    d3d_mark_gpu(c, &b->base);
+                } else [enc setBuffer:vs_out offset:0 atIndex:2 + i];           // (not written: no entries for it)
+            }
+            [enc setBytes:&p length:sizeof p atIndex:1];
+            [enc dispatchThreads:MTLSizeMake(nverts, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, pack.maxTotalThreadsPerThreadgroup), 1, 1)];
+            [enc endEncoding];
+        }
+    }
+    if (!so->rasterized) return;
+    // Stream 0 is also drawn: a vertex shader's code draws as without the geometry stage, a geometry shader as one.
+    if (gs->info.type == DXBC_VERTEX) {
+        s->shader[STAGE_GS] = NULL;
+        MTLPrimitiveType type;
+        id<MTLRenderCommandEncoder> renc = prepare(c, &type);
+        if (renc && !indexed) [renc drawPrimitives:type vertexStart:start vertexCount:count instanceCount:instances baseInstance:start_instance];
+        else if (renc) [renc drawIndexedPrimitives:type indexCount:count indexType:s->ib_format == 42 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                                       indexBuffer:(__bridge id<MTLBuffer>)s->ib->mtl indexBufferOffset:s->ib->off + s->ib_offset + start * (s->ib_format == 42 ? 4 : 2)
+                                     instanceCount:instances baseVertex:base_vertex baseInstance:start_instance];
+        s->shader[STAGE_GS] = gs;
+    }
+}
+
 static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t start, int32_t base_vertex, uint32_t start_instance, int indexed) {
     d3d_draw_state *s = state_of(c);
     d3d_shader *vs = s->shader[STAGE_VS], *gs = s->shader[STAGE_GS];
+    if (gs->so && gs->info.type == DXBC_VERTEX) { so_draw(c, count, instances, start, base_vertex, start_instance, indexed); return; }
+    if (gs->so && !((so_layout *)gs->so)->rasterized) return;     // (stream output from a geometry shader: not yet)
     if (!vs || !count || !instances || (indexed && !s->ib)) return;
     uint32_t n = (uint32_t)gs->info.gs_in_verts, step, prims;
     switch (s->topology) {                               // primitives from the input assembler's topology
@@ -1407,23 +1525,7 @@ static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t
         d3d_end_render(c);
         enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoder];
     }
-    // The vertex kernel: vertex buffers moved to the first vertex (or the base vertex of indexed draws).
-    [enc setComputePipelineState:vk];
-    for (int i = 0; i < 16; i++) {
-        if (!s->vb[i]) continue;
-        int instanced = 0, step_rate = 1;
-        if (s->layout) for (uint32_t k = 0; k < s->layout->n; k++) if (s->layout->attr[k].slot == (uint32_t)i && s->layout->attr[k].instanced) { instanced = 1; step_rate = s->layout->attr[k].step ? (int)s->layout->attr[k].step : 1; }
-        int64_t off = (int64_t)s->vb[i]->off + s->offset[i] + (int64_t)s->stride[i] * (instanced ? (int64_t)(start_instance / (uint32_t)step_rate) : indexed ? base_vertex : (int64_t)start);
-        if (off < 0) off = 0;
-        [enc setBuffer:(__bridge id<MTLBuffer>)s->vb[i]->mtl offset:(NSUInteger)off atIndex:VB_BASE + i];
-    }
-    if (indexed) [enc setBuffer:(__bridge id<MTLBuffer>)s->ib->mtl offset:s->ib->off + s->ib_offset + (NSUInteger)start * (index_type == 2 ? 4 : 2) atIndex:DXBC_GS_INDEX];
-    else [enc setBuffer:vs_out offset:0 atIndex:DXBC_GS_INDEX];          // (not read)
-    bind_stage(c, s, STAGE_VS, nil, enc);
-    uint32_t vp[8] = { count, indexed ? 0 : start, start_instance, vsn, (uint32_t)index_type, 0, (uint32_t)base_vertex, 0 };
-    [enc setBytes:vp length:sizeof vp atIndex:DXBC_VS_PARAMS];
-    [enc setBuffer:vs_out offset:0 atIndex:DXBC_GS_OUT];
-    [enc dispatchThreads:MTLSizeMake(count, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, vk.maxTotalThreadsPerThreadgroup), 1, 1)];
+    run_vs_kernel(c, s, enc, vk, vs_out, vsn, count, instances, start, base_vertex, start_instance, index_type);
     // The geometry kernel.
     id<MTLComputePipelineState> gk = (__bridge id<MTLComputePipelineState>)gs->compute;
     [enc setComputePipelineState:gk];
@@ -1590,10 +1692,15 @@ static WINAPI void rs_get_scissors(void *this, uint32_t *n, RECT *r) {
     *n = MAX(state_of(this)->nscissors, 1);
 }
 static WINAPI void rs_get_state(void *this, void **r) { *r = held(state_of(this)->raster); }
-static WINAPI void so_get_targets(void *this, uint32_t n, void **out) { (void)this; for (uint32_t i = 0; i < n; i++) out[i] = NULL; }
-static WINAPI void so_set_targets(void *this, uint32_t n, void *const *targets, const uint32_t *offsets) {
-    (void)this; (void)offsets;
-    for (uint32_t i = 0; i < n; i++) if (targets && targets[i]) { d3d_not_implemented("stream output (bound)"); break; }
+static WINAPI void so_get_targets(void *this, uint32_t n, void **out) { for (uint32_t i = 0; i < n; i++) out[i] = i < 4 ? held(state_of(this)->so[i]) : NULL; }
+// An offset of -1 appends to what earlier stream output wrote to the buffer.
+static WINAPI void so_set_targets(void *this, uint32_t n, d3d_buffer *const *targets, const uint32_t *offsets) {
+    d3d_draw_state *s = state_of(this);
+    for (uint32_t i = 0; i < 4; i++) {
+        d3d_buffer *b = targets && i < n ? targets[i] : NULL;
+        bind(&s->so[i], b);
+        if (b && offsets && offsets[i] != ~0u) b->so_filled = offsets[i];
+    }
 }
 // ResolveSubresource: a render pass that resolves the multisampled texture into the other.
 static WINAPI void ctx_resolve(void *this, d3d_object *dst, uint32_t dst_sub, d3d_object *src, uint32_t src_sub, uint32_t format) {
@@ -1752,8 +1859,45 @@ static WINAPI HRESULT device_create_gs(void *this, const void *code, size_t size
     if (getenv("VXRT_NO_GEOMETRY_SHADERS")) { if (out) *out = NULL; return E_NOTIMPL; }   // (for comparisons)
     return create_shader(this, code, size, DXBC_GEOMETRY, g_gs_vtbl, out);
 }
+// A geometry shader with stream output. Games use it mostly with a vertex shader's code (no geometry stage: the
+// vertex shader's outputs go to the buffers, as Unity skins meshes); stream output from a real geometry shader is
+// not implemented (its triangles are still drawn when stream 0 is rasterized).
+typedef struct { uint32_t stream; const char *semantic; uint32_t index; uint8_t start, count, slot; } so_decl;   // D3D11_SO_DECLARATION_ENTRY
+static WINAPI HRESULT device_create_gs_so(void *this, const void *code, size_t size, const so_decl *decl, uint32_t ndecl,
+                                          const uint32_t *strides, uint32_t nstrides, uint32_t rasterized, void *linkage, void **out) {
+    (void)linkage;
+    int type = code ? dxbc_program_type(code, size) : -1;
+    if (type != DXBC_VERTEX && type != DXBC_GEOMETRY) return E_INVALIDARG;
+    if (type == DXBC_GEOMETRY) d3d_not_implemented("stream output from a geometry shader");
+    HRESULT hr = create_shader(this, code, size, type, g_gs_vtbl, out);
+    if (hr != S_OK || !out) return hr;
+    d3d_shader *sh = *out;
+    so_layout *so = calloc(1, sizeof *so);
+    so->rasterized = rasterized == 0;
+    uint32_t dwords[4] = { 0 };
+    for (uint32_t i = 0; i < ndecl; i++) {
+        const so_decl *d = &decl[i];
+        if (d->stream || d->slot >= 4) continue;
+        if (d->semantic && so->n < 64) {                             // (no name: a gap of count components)
+            const dxbc_element *el = NULL;
+            for (int k = 0; k < sh->info.noutputs && !el; k++)
+                if (!strcasecmp(sh->info.outputs[k].semantic, d->semantic) && sh->info.outputs[k].index == d->index) el = &sh->info.outputs[k];
+            if (el) {
+                int first = 0;
+                while (first < 4 && !(el->mask & (1 << first))) first++;
+                so->e[so->n++] = (so_entry){ el->reg, (uint32_t)(first + d->start), d->count, (uint32_t)d->slot << 24 | dwords[d->slot] };
+            } else if (vx_trace) vx_log("Direct3D: stream output of %s%u, which the shader does not write", d->semantic, d->index);
+        }
+        dwords[d->slot] += d->count;
+    }
+    for (int k = 0; k < 4; k++) so->stride[k] = (k < (int)nstrides && strides[k] ? strides[k] : dwords[k] * 4) / 4;   // (in dwords)
+    if (vx_trace) vx_log("Direct3D: stream output shader %08x (%s): %u entries, strides %u %u, rasterized stream %d", sh->hash,
+                         type == DXBC_VERTEX ? "vertex" : "geometry", so->n, so->stride[0] * 4, so->stride[1] * 4, (int)rasterized);
+    sh->so = so;
+    return S_OK;
+}
 const d3d_method d3d_draw_device_methods[] = {
-    { "CreateGeometryShader", (void *)device_create_gs },
+    { "CreateGeometryShader", (void *)device_create_gs }, { "CreateGeometryShaderWithStreamOutput", (void *)device_create_gs_so },
     { "CreateVertexShader", (void *)device_create_vs }, { "CreatePixelShader", (void *)device_create_ps },
     { "CreateInputLayout", (void *)device_create_layout }, { "CreateBlendState", (void *)device_create_blend },
     { "CreateDepthStencilState", (void *)device_create_depth }, { "CreateRasterizerState", (void *)device_create_raster },

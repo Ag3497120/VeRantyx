@@ -10,6 +10,8 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"   // (MD5, for programs that ask for it; nothing secure here)
+#include <CommonCrypto/CommonDigest.h>
 
 // ---- kernel32 -------------------------------------------------------------------------------------------------------
 static WINAPI BOOL GetDiskFreeSpaceW(const WCHAR *root, DWORD *sectors_per_cluster, DWORD *bytes_per_sector, DWORD *free_clusters, DWORD *clusters) {
@@ -40,6 +42,7 @@ static WINAPI BOOL GetUserPreferredUILanguages(DWORD flags, DWORD *count, WCHAR 
     *len = 7;
     return 1;
 }
+static WINAPI BOOL GetThreadPreferredUILanguages(DWORD flags, DWORD *count, WCHAR *buf, DWORD *len) { return GetUserPreferredUILanguages(flags, count, buf, len); }
 static WINAPI int GetGeoInfoA(int32_t geo, DWORD type, char *data, int size, uint16_t lang) {
     (void)geo; (void)type; (void)data; (void)size; (void)lang;
     vx_set_last_error(87);
@@ -139,9 +142,142 @@ static WINAPI int GdipCreateFromHDC(HANDLE dc, void **graphics) { (void)dc; if (
 static WINAPI int GdipDeleteGraphics(void *graphics) { (void)graphics; return Ok; }
 static WINAPI int GdipDrawImageRectI(void *g, void *image, int x, int y, int w, int h) { (void)g; (void)image; (void)x; (void)y; (void)w; (void)h; return InvalidParameter; }
 
+// ---- more of the same (first: The Lab and Bigscreen, Unity) -----------------------------------------------------------
+typedef struct { int left, top, right, bottom; } RECT_;
+static WINAPI BOOL CopyRect(RECT_ *dst, const RECT_ *src) { if (!dst || !src) return 0; *dst = *src; return 1; }
+static WINAPI uint32_t GetCaretBlinkTime(void) { return 530; }                     // Windows' default
+static WINAPI BOOL DragDetect(HANDLE w, int64_t pt) { (void)w; (void)pt; return 0; }
+static WINAPI intptr_t SendDlgItemMessageW(HANDLE dlg, int id, uint32_t msg, uintptr_t wp, intptr_t lp) { (void)dlg; (void)id; (void)msg; (void)wp; (void)lp; return 0; }
+// The US keyboard layout ("00000409"), and key names as Windows gives them for it.
+static WINAPI BOOL GetKeyboardLayoutNameW(WCHAR *name) { if (!name) return 0; vx_return_string_w("00000409", name, 9); return 1; }
+static WINAPI int GetKeyNameTextW(int32_t lparam, WCHAR *buf, int cap) {
+    static const char *const names[0x60] = {
+        [0x01] = "Esc", [0x0e] = "Backspace", [0x0f] = "Tab", [0x1c] = "Enter", [0x1d] = "Ctrl", [0x2a] = "Shift", [0x36] = "Right Shift",
+        [0x38] = "Alt", [0x39] = "Space", [0x3a] = "Caps Lock", [0x3b] = "F1", [0x3c] = "F2", [0x3d] = "F3", [0x3e] = "F4", [0x3f] = "F5",
+        [0x40] = "F6", [0x41] = "F7", [0x42] = "F8", [0x43] = "F9", [0x44] = "F10", [0x57] = "F11", [0x58] = "F12",
+    };
+    static const char row[] = "\0\0" "1234567890-=\0\0" "QWERTYUIOP[]\0\0" "ASDFGHJKL;'`\0\\" "ZXCVBNM,./";
+    int scan = (lparam >> 16) & 0xff;
+    char one[2] = { 0, 0 };
+    const char *name = scan < 0x60 ? names[scan] : NULL;
+    if (!name && scan < (int)sizeof row - 1 && row[scan]) { one[0] = row[scan]; name = one; }
+    if (!name || !buf || cap <= 0) return 0;
+    return (int)vx_return_string_w(name, buf, (DWORD)cap);
+}
+// System times: idle, kernel, user (100 ns units); a Mac has no cheap equivalent for a program to compare, so all
+// zero (programs use them to show CPU load).
+static WINAPI BOOL GetSystemTimes(uint64_t *idle, uint64_t *kernel, uint64_t *user) { if (idle) *idle = 0; if (kernel) *kernel = 0; if (user) *user = 0; return 1; }
+// Process creation attribute lists: kept as opaque blocks (CreateProcess here ignores them).
+static WINAPI BOOL InitializeProcThreadAttributeList(void *list, DWORD count, DWORD flags, size_t *size) {
+    (void)flags;
+    size_t need = 48 + (size_t)count * 24;
+    if (!list) { if (size) *size = need; vx_set_last_error(122); return 0; }
+    if (size && *size < need) { *size = need; vx_set_last_error(122); return 0; }
+    memset(list, 0, need);
+    return 1;
+}
+static WINAPI BOOL UpdateProcThreadAttribute(void *list, DWORD flags, uintptr_t attr, void *value, size_t size, void *prev, size_t *ret) {
+    (void)list; (void)flags; (void)attr; (void)value; (void)size; (void)prev; (void)ret; return 1;
+}
+static WINAPI void DeleteProcThreadAttributeList(void *list) { (void)list; }
+// Hashes (CryptCreateHash on any provider): MD5, SHA-1, SHA-256 through CommonCrypto. Keys and encryption are not
+// available (NTE_BAD_KEY): programs fall back or skip what needs them.
+typedef struct { unsigned alg; union { CC_MD5_CTX md5; CC_SHA1_CTX sha1; CC_SHA256_CTX sha256; } c; } crypt_hash;
+#define CALG_MD5 0x8003u
+#define CALG_SHA1 0x8004u
+#define CALG_SHA_256 0x800cu
+static WINAPI BOOL CryptCreateHash(uintptr_t prov, unsigned alg, uintptr_t key, DWORD flags, crypt_hash **out) {
+    (void)prov; (void)key; (void)flags;
+    if (!out || (alg != CALG_MD5 && alg != CALG_SHA1 && alg != CALG_SHA_256)) { vx_set_last_error(0x80090008u); return 0; }   // NTE_BAD_ALGID
+    crypt_hash *h = calloc(1, sizeof *h);
+    h->alg = alg;
+    if (alg == CALG_MD5) CC_MD5_Init(&h->c.md5); else if (alg == CALG_SHA1) CC_SHA1_Init(&h->c.sha1); else CC_SHA256_Init(&h->c.sha256);
+    *out = h;
+    return 1;
+}
+static WINAPI BOOL CryptHashData(crypt_hash *h, const uint8_t *data, DWORD len, DWORD flags) {
+    (void)flags;
+    if (!h) { vx_set_last_error(6); return 0; }
+    if (h->alg == CALG_MD5) CC_MD5_Update(&h->c.md5, data, len); else if (h->alg == CALG_SHA1) CC_SHA1_Update(&h->c.sha1, data, len); else CC_SHA256_Update(&h->c.sha256, data, len);
+    return 1;
+}
+static WINAPI BOOL CryptGetHashParam(crypt_hash *h, DWORD param, uint8_t *out, DWORD *len, DWORD flags) {
+    (void)flags;
+    if (!h || !len) { vx_set_last_error(87); return 0; }
+    DWORD size = h->alg == CALG_MD5 ? 16 : h->alg == CALG_SHA1 ? 20 : 32;
+    if (param == 1 || param == 4) {                                    // HP_ALGID, HP_HASHSIZE
+        if (!out) { *len = 4; return 1; }
+        if (*len < 4) { *len = 4; vx_set_last_error(234); return 0; }
+        *(DWORD *)out = param == 1 ? h->alg : size; *len = 4;
+        return 1;
+    }
+    if (param != 2) { vx_set_last_error(0x80090009u); return 0; }      // NTE_BAD_FLAGS; HP_HASHVAL below
+    if (!out) { *len = size; return 1; }
+    if (*len < size) { *len = size; vx_set_last_error(234); return 0; }   // ERROR_MORE_DATA
+    if (h->alg == CALG_MD5) CC_MD5_Final(out, &h->c.md5); else if (h->alg == CALG_SHA1) CC_SHA1_Final(out, &h->c.sha1); else CC_SHA256_Final(out, &h->c.sha256);
+    *len = size;
+    return 1;
+}
+static WINAPI BOOL CryptDestroyHash(crypt_hash *h) { free(h); return 1; }
+static WINAPI BOOL CryptImportKey(uintptr_t prov, const void *data, DWORD len, uintptr_t pub, DWORD flags, uintptr_t *key) {
+    (void)prov; (void)data; (void)len; (void)pub; (void)flags; if (key) *key = 0; vx_set_last_error(0x80090003u); return 0;   // NTE_BAD_KEY
+}
+static WINAPI BOOL CryptEncrypt(uintptr_t key, uintptr_t hash, BOOL final, DWORD flags, void *data, DWORD *len, DWORD cap) {
+    (void)key; (void)hash; (void)final; (void)flags; (void)data; (void)len; (void)cap; vx_set_last_error(0x80090003u); return 0;
+}
+static WINAPI BOOL CryptDestroyKey(uintptr_t key) { (void)key; return 1; }
+// Paths: "." and ".." removed, as PathCanonicalize does.
+static WINAPI BOOL PathCanonicalizeW(WCHAR *out, const WCHAR *in) {
+    if (!out || !in) return 0;
+    WCHAR tmp[1024]; size_t n = 0;
+    for (const WCHAR *p = in; *p && n < 1023; ) {
+        if (p[0] == '.' && (p[1] == '\\' || !p[1]) && (n == 0 || tmp[n - 1] == '\\')) { p += p[1] ? 2 : 1; continue; }
+        if (p[0] == '.' && p[1] == '.' && (p[2] == '\\' || !p[2]) && n > 0 && tmp[n - 1] == '\\') {
+            size_t back = n - 1;
+            while (back > 0 && tmp[back - 1] != '\\') back--;
+            if (back > 0 && !(back >= 2 && tmp[back - 2] == ':')) n = back; else if (back > 0) n = back;
+            p += p[2] ? 3 : 2; continue;
+        }
+        tmp[n++] = *p++;
+    }
+    if (n > 1 && tmp[n - 1] == '\\' && !(n == 3 && tmp[1] == ':')) n--;
+    tmp[n] = 0;
+    memcpy(out, tmp, (n + 1) * sizeof(WCHAR));
+    return 1;
+}
+static WINAPI LONG SHDeleteKeyW(HANDLE key, const WCHAR *sub) { (void)key; (void)sub; return 2; }   // ERROR_FILE_NOT_FOUND
+static WINAPI int SHFileOperationW(void *op) { (void)op; return 0x7c; }                          // DE_INVALIDFILES: nothing done
+static WINAPI uint32_t waveOutGetPosition(HANDLE wo, void *time, uint32_t size) { (void)wo; (void)time; (void)size; return 8; }   // MMSYSERR_NOTSUPPORTED
+static WINAPI int WSASendDisconnect(uintptr_t s, void *data) { (void)s; (void)data; return 0; }
+#define HIDP_STATUS_NOT_IMPLEMENTED ((LONG)0xC0110020)
+static WINAPI LONG HidP_SetUsageValue(int type, uint16_t page, uint16_t coll, uint16_t usage, uint32_t value, void *pre, char *report, uint32_t len) {
+    (void)type; (void)page; (void)coll; (void)usage; (void)value; (void)pre; (void)report; (void)len; return HIDP_STATUS_NOT_IMPLEMENTED;
+}
+static WINAPI LONG HidP_SetUsages(int type, uint16_t page, uint16_t coll, uint16_t *list, uint32_t *n, void *pre, char *report, uint32_t len) {
+    (void)type; (void)page; (void)coll; (void)list; (void)n; (void)pre; (void)report; (void)len; return HIDP_STATUS_NOT_IMPLEMENTED;
+}
+
+static const vx_export kernel32_more[] = {
+    VX_EXPORT(GetSystemTimes), VX_EXPORT(InitializeProcThreadAttributeList),
+    VX_EXPORT(UpdateProcThreadAttribute), VX_EXPORT(DeleteProcThreadAttributeList),
+};
+static const vx_export user32_more[] = {
+    VX_EXPORT(CopyRect), VX_EXPORT(GetCaretBlinkTime), VX_EXPORT(DragDetect), VX_EXPORT(SendDlgItemMessageW),
+    VX_EXPORT(GetKeyboardLayoutNameW), VX_EXPORT(GetKeyNameTextW),
+};
+static const vx_export advapi32_more[] = {
+    VX_EXPORT(CryptCreateHash), VX_EXPORT(CryptHashData), VX_EXPORT(CryptGetHashParam), VX_EXPORT(CryptDestroyHash),
+    VX_EXPORT(CryptImportKey), VX_EXPORT(CryptEncrypt), VX_EXPORT(CryptDestroyKey),
+};
+static const vx_export shlwapi_more[] = { VX_EXPORT(PathCanonicalizeW), VX_EXPORT(SHDeleteKeyW) };
+static const vx_export shell32_more[] = { VX_EXPORT(SHFileOperationW) };
+static const vx_export winmm_more[] = { VX_EXPORT(waveOutGetPosition) };
+static const vx_export ws2_32_more[] = { VX_EXPORT(WSASendDisconnect) };
+static const vx_export hid_more[] = { VX_EXPORT(HidP_SetUsageValue), VX_EXPORT(HidP_SetUsages) };
+
 static const vx_export kernel32[] = {
     VX_EXPORT(GetDiskFreeSpaceW), VX_EXPORT(LockFile), VX_EXPORT(UnlockFile), VX_EXPORT(LockFileEx), VX_EXPORT(UnlockFileEx),
-    VX_EXPORT(HeapCompact), VX_EXPORT(GetUserPreferredUILanguages), VX_EXPORT(GetGeoInfoA),
+    VX_EXPORT(HeapCompact), VX_EXPORT(GetUserPreferredUILanguages), VX_EXPORT(GetThreadPreferredUILanguages), VX_EXPORT(GetGeoInfoA),
 };
 static const vx_export ucrtbase[] = {
     { "_beginthread", (void *)ms_beginthread }, { "_endthread", (void *)ms_endthread }, { "_resetstkoflw", (void *)ms_resetstkoflw },
@@ -173,4 +309,9 @@ void vx_extras_init(void) {
     vx_register_module("advapi32.dll", advapi32, sizeof advapi32 / sizeof advapi32[0]);
     vx_register_module("ws2_32.dll", ws2_32, sizeof ws2_32 / sizeof ws2_32[0]);
     vx_register_module("gdiplus.dll", gdiplus, sizeof gdiplus / sizeof gdiplus[0]);
+#define MORE(dll, t) vx_register_module(dll, t, sizeof t / sizeof t[0])
+    MORE("kernel32.dll", kernel32_more); MORE("kernelbase.dll", kernel32_more); MORE("user32.dll", user32_more);
+    MORE("advapi32.dll", advapi32_more); MORE("shlwapi.dll", shlwapi_more); MORE("shell32.dll", shell32_more);
+    MORE("winmm.dll", winmm_more); MORE("ws2_32.dll", ws2_32_more); MORE("hid.dll", hid_more);
+#undef MORE
 }

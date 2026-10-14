@@ -34,7 +34,22 @@ int main() {
     CHECK(std::strstr(path, "\\vxplugin.dll") != nullptr);
     CHECK(GetModuleHandleA("kernel32.dll") != nullptr);
     CHECK(LoadLibraryA("no_such.dll") == nullptr && GetLastError() == ERROR_MOD_NOT_FOUND);
+    // Loaded twice, freed once: still loaded. Freed again: unloaded, and the next load starts fresh (OpenVR's
+    // VR_Shutdown / VR_Init).
+    auto calls = (int (*)(void))GetProcAddress(plugin, "plugin_calls");
+    CHECK(calls && calls() == 1 && calls() == 2);
+    CHECK(LoadLibraryA("vxplugin.dll") == plugin);
     FreeLibrary(plugin);
+    CHECK(GetModuleHandleA("vxplugin.dll") == plugin && calls() == 3);
+    FreeLibrary(plugin);
+    CHECK(GetModuleHandleA("vxplugin.dll") == nullptr);
+    plugin = LoadLibraryA("vxplugin.dll");
+    calls = (int (*)(void))GetProcAddress(plugin, "plugin_calls");
+    CHECK(plugin && calls && calls() == 1);
+    FreeLibrary(plugin);
+    CHECK(GetModuleHandleA("vxdll.dll") == dll);                   // (imported: never unloaded)
+    FreeLibrary(dll);
+    CHECK(GetModuleHandleA("vxdll.dll") == dll);
     std::printf("dlls: %d failed checks, plugin at %s -> %s\n", failures, path, failures ? "FAILED" : "ok");
     return failures;
 }

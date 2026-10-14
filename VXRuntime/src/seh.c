@@ -20,6 +20,7 @@
 #include <sys/ucontext.h>
 #include <execinfo.h>
 #include "vx.h"
+#include <dlfcn.h>
 
 // ---- structures --------------------------------------------------------------------------------------------------
 typedef struct { uint64_t lo, hi; } M128A;
@@ -522,8 +523,20 @@ static void on_signal(int sig, siginfo_t *si, void *ucv) {
         uint64_t limit = *(uint64_t *)(teb + TEB_STACK_LIMIT), a = (uint64_t)si->si_addr;
         if (a < limit && a + (64 << 10) >= limit) {
             const vx_image *m = vx_image_at(ss->__rip);
-            vx_log("stack overflow on thread %u (stack %#llx-%#llx) at %s+%#llx", (unsigned)vx_current_tid(), (unsigned long long)limit,
-                   *(unsigned long long *)(teb + TEB_STACK_BASE), m ? m->name : "?", m ? (unsigned long long)(ss->__rip - (uint64_t)m->base) : (unsigned long long)ss->__rip);
+            Dl_info info;
+            const char *sym = !m && dladdr((void *)ss->__rip, &info) && info.dli_sname ? info.dli_sname : NULL;
+            vx_log("stack overflow on thread %u (stack %#llx-%#llx) at %s+%#llx%s%s, fault address %#llx", (unsigned)vx_current_tid(), (unsigned long long)limit,
+                   *(unsigned long long *)(teb + TEB_STACK_BASE), m ? m->name : "?", m ? (unsigned long long)(ss->__rip - (uint64_t)m->base) : (unsigned long long)ss->__rip,
+                   sym ? " in " : "", sym ? sym : "", (unsigned long long)a);
+            // The program's frames nearest the fault: return addresses on the stack inside its images.
+            const uint64_t *sp = (const uint64_t *)ss->__rsp;
+            for (int i = 0, shown = 0; i < 16384 && shown < 40 && (uint64_t)(sp + i) < *(uint64_t *)(teb + TEB_STACK_BASE); i++) {
+                const vx_image *f = vx_image_at(sp[i]);
+                const uint8_t *r = (const uint8_t *)sp[i];         // (a return address follows a call instruction)
+                int call = f && sp[i] - 6 > (uint64_t)f->base && (r[-5] == 0xe8 || (r[-6] == 0xff && (r[-5] & 0x38) == 0x10) ||
+                                                                  (r[-2] == 0xff && (r[-1] & 0x38) == 0x10) || (r[-3] == 0xff && (r[-2] & 0x38) == 0x10));
+                if (call) { vx_log("  stack: %s+%#llx", f->name, (unsigned long long)(sp[i] - (uint64_t)f->base)); shown++; }
+            }
             _exit(128 + sig);
         }
     }
@@ -590,6 +603,38 @@ static void on_signal(int sig, siginfo_t *si, void *ucv) {
     ss->__rip = (uint64_t)signal_dispatch;
 }
 
+// A Windows CONTEXT (all of it) from a signal's machine context: GetThreadContext of a thread SuspendThread stopped.
+void vx_context_from_signal(void *out, const void *ucv) {
+    const ucontext_t *uc = ucv;
+    const _STRUCT_X86_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
+    CONTEXT *c = out;
+    DWORD flags = c->flags;
+    memset(c, 0, sizeof *c);
+    c->flags = flags ? flags : 0x10001f;
+    uint64_t regs[16] = { ss->__rax, ss->__rcx, ss->__rdx, ss->__rbx, ss->__rsp, ss->__rbp, ss->__rsi, ss->__rdi,
+                          ss->__r8, ss->__r9, ss->__r10, ss->__r11, ss->__r12, ss->__r13, ss->__r14, ss->__r15 };
+    memcpy(c->gpr, regs, sizeof regs);
+    c->rip = ss->__rip;
+    c->eflags = (DWORD)ss->__rflags;
+    c->cs = 0x33; c->ss = 0x2b; c->ds = c->es = 0x2b; c->fs = 0x53; c->gs = 0x2b;
+    c->mxcsr = uc->uc_mcontext->__fs.__fpu_mxcsr;
+    memcpy(c->xmm, &uc->uc_mcontext->__fs.__fpu_xmm0, 16 * 16);
+}
+
+// abort() from macOS code (malloc's checks, libc++): where from, with the program's frames named (VXRT_TRACE).
+static void on_abort(int sig) {
+    void *frames[48];
+    int n = backtrace(frames, 48);
+    vx_log("abort: backtrace");
+    backtrace_symbols_fd(frames, n, 2);
+    for (int i = 0; i < n; i++) {
+        const vx_image *m = vx_image_at((uint64_t)frames[i]);
+        if (m) vx_log("   %s+%#llx", m->name, (unsigned long long)((uint8_t *)frames[i] - m->base));
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 void vx_seh_install_signals(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -598,6 +643,7 @@ void vx_seh_install_signals(void) {
     sigemptyset(&sa.sa_mask);
     int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP };
     for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
+    if (vx_trace) signal(SIGABRT, on_abort);
 }
 
 // ---- exports -----------------------------------------------------------------------------------------------------------------

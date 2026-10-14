@@ -20,10 +20,12 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <mach/mach.h>
 #include "vx.h"
 
 #define INFINITE      0xffffffffu
 #define WAIT_TIMEOUT  0x102u
+#define WAIT_IO_COMPLETION 0xc0u
 #define WAIT_FAILED   0xffffffffu
 #define STILL_ACTIVE  259u
 #define CREATE_SUSPENDED 4u
@@ -32,6 +34,8 @@ enum { OBJ_THREAD = 1, OBJ_EVENT, OBJ_MUTEX, OBJ_SEMAPHORE, OBJ_OTHER, OBJ_PORT,
 typedef struct {
     int type, refs;
     int done, started, priority; DWORD suspended, exit_code, tid; pthread_t pthread;   // thread
+    semaphore_t parked_sem, resume_sem; volatile int parked; uint8_t *context;              // (SuspendThread: see below)
+    struct apc *apcs; struct waiter *alert_waiter;                                          // (QueueUserAPC: see below)
     DWORD (WINAPI *start)(void *); void *arg;
     int manual, signaled;                                                     // event
     DWORD owner, recursion;                                                   // mutex
@@ -370,27 +374,82 @@ static WINAPI DWORD GetThreadId(HANDLE h) {
     pthread_mutex_unlock(&g_lock);
     return id;
 }
+// Suspending a running thread (garbage collectors stop the world this way: Unity's Mono): SIGUSR2 makes it save its
+// registers as a Windows CONTEXT and wait in the signal handler until resumed. Mach semaphores are safe there.
+// GetThreadContext reads what it saved; it takes no lock, as the stopped thread may hold one of the runtime's.
+#define CONTEXT_SIZE 0x4d0
+void vx_context_from_signal(void *out, const void *uc);                 // seh.c
+static void on_suspend_signal(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)si;
+    vx_object *t = t_self;
+    if (!t || !t->context) return;
+    int saved = errno;
+    vx_context_from_signal(t->context, uc);
+    __atomic_store_n(&t->parked, 1, __ATOMIC_RELEASE);
+    semaphore_signal(t->parked_sem);
+    while (__atomic_load_n(&t->suspended, __ATOMIC_ACQUIRE)) semaphore_wait(t->resume_sem);
+    __atomic_store_n(&t->parked, 0, __ATOMIC_RELEASE);
+    errno = saved;
+}
+static void suspend_signal_setup(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_suspend_signal;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+    sigfillset(&sa.sa_mask);
+    sigaction(SIGUSR2, &sa, NULL);
+}
+static void suspend_signal_install(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, suspend_signal_setup);
+}
 static WINAPI DWORD ResumeThread(HANDLE h) {
     pthread_mutex_lock(&g_lock);
     vx_object *t = thread_object(h);
     DWORD prev = t ? t->suspended : (DWORD)-1;
-    if (t && t->suspended) t->suspended--;
+    if (t && t->suspended && !__atomic_sub_fetch(&t->suspended, 1, __ATOMIC_ACQ_REL) && t->started && t->resume_sem)
+        semaphore_signal(t->resume_sem);
     pthread_cond_broadcast(&g_changed);
     pthread_mutex_unlock(&g_lock);
     return prev;
 }
-// Only a thread that has not started yet can be suspended for now (macOS can suspend a Mach thread, but its
-// state while stopped in this runtime's code is not a Windows context yet).
 static WINAPI DWORD SuspendThread(HANDLE h) {
     pthread_mutex_lock(&g_lock);
     vx_object *t = thread_object(h);
     DWORD prev = (DWORD)-1;
-    if (t && !t->started) prev = t->suspended++;
+    int stop = 0;
+    if (t && !t->done) {
+        prev = __atomic_fetch_add(&t->suspended, 1, __ATOMIC_ACQ_REL);
+        if (t->started && prev == 0) {
+            if (!t->context) {                         // (first time: what the handler needs)
+                t->context = calloc(1, CONTEXT_SIZE);
+                semaphore_create(mach_task_self(), &t->parked_sem, SYNC_POLICY_FIFO, 0);
+                semaphore_create(mach_task_self(), &t->resume_sem, SYNC_POLICY_FIFO, 0);
+            }
+            stop = 1;
+        }
+    }
     pthread_mutex_unlock(&g_lock);
-    if (prev == (DWORD)-1) vx_set_last_error(50 /* ERROR_NOT_SUPPORTED */);
+    if (prev == (DWORD)-1) { vx_set_last_error(6); return prev; }
+    if (stop) {
+        suspend_signal_install();
+        if (t == t_self) {                             // suspending oneself: wait here until resumed
+            while (__atomic_load_n(&t->suspended, __ATOMIC_ACQUIRE)) semaphore_wait(t->resume_sem);
+        } else if (!pthread_kill(t->pthread, SIGUSR2)) {
+            semaphore_wait(t->parked_sem);            // (the context is saved once it is parked)
+        }
+    }
     return prev;
 }
-static WINAPI BOOL GetThreadContext(HANDLE h, void *ctx) { (void)h; (void)ctx; vx_set_last_error(50); return 0; }
+static WINAPI BOOL GetThreadContext(HANDLE h, void *ctx) {
+    vx_object *t = (intptr_t)h == -2 ? t_self : lookup(h);
+    if (!t || t->type != OBJ_THREAD || !ctx) { vx_set_last_error(6); return 0; }
+    if (t == t_self || !__atomic_load_n(&t->parked, __ATOMIC_ACQUIRE) || !t->context) { vx_set_last_error(5); return 0; }
+    DWORD flags = *(DWORD *)((uint8_t *)ctx + 0x30);   // (ContextFlags: what is asked for; all of it is there)
+    memcpy(ctx, t->context, CONTEXT_SIZE);
+    *(DWORD *)((uint8_t *)ctx + 0x30) = flags;
+    return 1;
+}
 static WINAPI BOOL SetThreadContext(HANDLE h, const void *ctx) { (void)h; (void)ctx; vx_set_last_error(50); return 0; }
 // Priorities become quality-of-service classes, which on Apple silicon also choose between performance and
 // efficiency cores: time-critical and highest (render, audio and compositor threads) run as user-interactive,
@@ -714,6 +773,7 @@ static int try_acquire(vx_object *o, DWORD tid) {
     return ok;
 }
 static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms);
+static __thread int t_alertable;                    // (set for the length of an alertable wait)
 // VXRT_TRACE_KEYED: waits longer than 0.3 ms by a thread holding a shared texture's keyed mutex (other processes
 // wait for that mutex meanwhile), with what was waited for and from where.
 __thread int vx_keyed_held;
@@ -757,7 +817,9 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
         if (objs[i]->sh) shared = 1;
     }
     DWORD result;
+    vx_object *alert = t_alertable ? self_object() : NULL;   // an alertable wait ends for queued APCs
     for (;;) {
+        if (alert && alert->apcs) { result = WAIT_IO_COMPLETION; break; }
         uint32_t seen = n == 1 && objs[0]->sh ? __atomic_load_n(&objs[0]->sh->seq, __ATOMIC_ACQUIRE) : 0;
         if (all) {
             DWORD i = 0;
@@ -785,10 +847,12 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
         for (DWORD k = 0; k < n && !shared; k++) if (objs[k]->sh) shared = 1;   // made shareable while waiting
         waiter *w = my_waiter();
         for (DWORD k = 0; k < n; k++) watch(objs[k], w);
+        if (alert) alert->alert_waiter = w;
         if (!shared) {
             int timed_out = 0;
             if (ms == INFINITE) pthread_cond_wait(&w->cv, &g_lock);
             else timed_out = pthread_cond_timedwait(&w->cv, &g_lock, &deadline) == ETIMEDOUT;
+            if (alert) alert->alert_waiter = NULL;
             for (DWORD k = 0; k < n; k++) unwatch(objs[k], w);
             if (timed_out) { result = WAIT_TIMEOUT; break; }
             continue;
@@ -816,18 +880,58 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
             if (slice.tv_nsec >= 1000000000) { slice.tv_sec++; slice.tv_nsec -= 1000000000; }
             pthread_cond_timedwait(&w->cv, &g_lock, &slice);
         }
+        if (alert) alert->alert_waiter = NULL;
         for (DWORD k = 0; k < n; k++) unwatch(objs[k], w);
     }
     pthread_mutex_unlock(&g_lock);
     return result;
 }
+
+// APCs: QueueUserAPC queues a call for a thread, which makes it in its next alertable wait (SleepEx,
+// WaitFor*Ex with alertable set); the wait then returns WAIT_IO_COMPLETION. Mono interrupts threads this way.
+typedef struct apc { void (WINAPI *fn)(uintptr_t); uintptr_t data; struct apc *next; } apc;
+static WINAPI DWORD QueueUserAPC(void (WINAPI *fn)(uintptr_t), HANDLE h, uintptr_t data) {
+    if (!fn) { vx_set_last_error(87); return 0; }
+    apc *a = malloc(sizeof *a);
+    a->fn = fn; a->data = data; a->next = NULL;
+    pthread_mutex_lock(&g_lock);
+    vx_object *t = thread_object(h);
+    if (!t || t->done) { pthread_mutex_unlock(&g_lock); free(a); vx_set_last_error(6); return 0; }
+    apc **tail = &t->apcs;
+    while (*tail) tail = &(*tail)->next;
+    *tail = a;
+    if (t->alert_waiter) pthread_cond_broadcast(&t->alert_waiter->cv);
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+}
+static void run_apcs(void) {                        // (on the thread whose APCs they are, outside the lock)
+    pthread_mutex_lock(&g_lock);
+    vx_object *t = self_object();
+    apc *list = t->apcs;
+    t->apcs = NULL;
+    pthread_mutex_unlock(&g_lock);
+    while (list) { apc *next = list->next; list->fn(list->data); free(list); list = next; }
+}
+static DWORD alertable_wait(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
+    t_alertable = 1;
+    DWORD r = WaitForMultipleObjects(n, hs, all, ms);
+    t_alertable = 0;
+    if (r == WAIT_IO_COMPLETION) run_apcs();
+    return r;
+}
 static WINAPI DWORD WaitForMultipleObjectsEx(DWORD n, const HANDLE *hs, BOOL all, DWORD ms, BOOL alertable) {
-    (void)alertable; return WaitForMultipleObjects(n, hs, all, ms);
+    return alertable ? alertable_wait(n, hs, all, ms) : WaitForMultipleObjects(n, hs, all, ms);
 }
 static WINAPI DWORD WaitForSingleObject(HANDLE h, DWORD ms) { return WaitForMultipleObjects(1, &h, 0, ms); }
-static WINAPI DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable) { (void)alertable; return WaitForMultipleObjects(1, &h, 0, ms); }
+static WINAPI DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable) {
+    return alertable ? alertable_wait(1, &h, 0, ms) : WaitForMultipleObjects(1, &h, 0, ms);
+}
 static WINAPI DWORD SleepEx(DWORD ms, BOOL alertable) {
-    (void)alertable;
+    if (alertable) {                                // a wait on nothing that APCs end
+        HANDLE never = (HANDLE)(intptr_t)-1;        // (the current process: never signalled while it runs)
+        DWORD r = alertable_wait(1, &never, 0, ms);
+        return r == WAIT_IO_COMPLETION ? r : 0;
+    }
     if (ms) usleep((useconds_t)ms * 1000); else sched_yield();
     return 0;
 }
@@ -1465,7 +1569,7 @@ static const vx_export sync_k32[] = {
     VX_EXPORT(GetOverlappedResultEx), VX_EXPORT(CancelIo), VX_EXPORT(CancelIoEx),
     VX_EXPORT(WaitOnAddress), VX_EXPORT(WakeByAddressAll), VX_EXPORT(WakeByAddressSingle),
     VX_EXPORT(WaitForSingleObject), VX_EXPORT(WaitForSingleObjectEx), VX_EXPORT(WaitForMultipleObjects),
-    VX_EXPORT(WaitForMultipleObjectsEx), VX_EXPORT(SleepEx), VX_EXPORT(CloseHandle), VX_EXPORT(DuplicateHandle),
+    VX_EXPORT(WaitForMultipleObjectsEx), VX_EXPORT(SleepEx), VX_EXPORT(QueueUserAPC), VX_EXPORT(CloseHandle), VX_EXPORT(DuplicateHandle),
     VX_EXPORT(InitializeCriticalSection), VX_EXPORT(InitializeCriticalSectionAndSpinCount), VX_EXPORT(InitializeCriticalSectionEx),
     VX_EXPORT(EnterCriticalSection), VX_EXPORT(TryEnterCriticalSection), VX_EXPORT(LeaveCriticalSection), VX_EXPORT(DeleteCriticalSection),
     VX_EXPORT(InitializeSRWLock), VX_EXPORT(AcquireSRWLockExclusive), VX_EXPORT(ReleaseSRWLockExclusive),

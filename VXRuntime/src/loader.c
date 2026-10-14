@@ -155,7 +155,8 @@ static pthread_mutex_t g_loader_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;   //
 static DWORD g_next_tls_index;
 #define MAX_TLS_MODULES 128
 
-// Lock-free: images are only ever appended (and never unmapped), so a reader sees a consistent prefix.
+// Lock-free: images are only ever appended (and never unmapped), so a reader sees a consistent prefix. An unloaded
+// image is still found by address: a thread or a function pointer may still be in it.
 const vx_image *vx_image_at(uint64_t pc) {
     int n = __atomic_load_n(&g_image_count, __ATOMIC_ACQUIRE);
     for (int i = 0; i < n; i++) {
@@ -166,18 +167,18 @@ const vx_image *vx_image_at(uint64_t pc) {
 }
 // The loaded images, in load order (psapi's EnumProcessModules).
 int vx_image_list(const vx_image **out, int cap) {
-    int n = __atomic_load_n(&g_image_count, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < n && i < cap; i++) out[i] = g_images[i];
-    return n;
+    int n = __atomic_load_n(&g_image_count, __ATOMIC_ACQUIRE), k = 0;
+    for (int i = 0; i < n; i++) if (!g_images[i]->unloaded) { if (k < cap) out[k] = g_images[i]; k++; }
+    return k;
 }
 static vx_image *image_by_base(const void *base) {
-    for (int i = 0; i < g_image_count; i++) if (g_images[i]->base == base) return g_images[i];
+    for (int i = 0; i < g_image_count; i++) if (g_images[i]->base == base && !g_images[i]->unloaded) return g_images[i];
     return NULL;
 }
 static vx_image *image_by_name(const char *name) {
     const char *b = strrchr(name, '\\'); b = b ? b + 1 : name;
     const char *s = strrchr(b, '/'); b = s ? s + 1 : b;
-    for (int i = 0; i < g_image_count; i++) if (same_dll(g_images[i]->name, b)) return g_images[i];
+    for (int i = 0; i < g_image_count; i++) if (same_dll(g_images[i]->name, b) && !g_images[i]->unloaded) return g_images[i];
     return NULL;
 }
 
@@ -235,7 +236,7 @@ void vx_thread_attach(void) {
     *(void ***)(teb + TEB_TLS_POINTER) = tls;
     pthread_mutex_lock(&g_loader_lock);
     for (int i = 0; i < g_image_count; i++)
-        if (g_images[i]->tls_index != ~0u) tls[g_images[i]->tls_index] = tls_block(g_images[i]);
+        if (g_images[i]->tls_index != ~0u && !g_images[i]->unloaded) tls[g_images[i]->tls_index] = tls_block(g_images[i]);
     pthread_mutex_unlock(&g_loader_lock);
     pthread_mutex_lock(&g_tebs_lock);
     if (g_teb_count == g_teb_cap) { g_teb_cap = g_teb_cap ? g_teb_cap * 2 : 64; g_tebs = realloc(g_tebs, g_teb_cap * sizeof *g_tebs); }
@@ -276,6 +277,7 @@ void vx_notify_thread(DWORD reason) {
     pthread_mutex_lock(&g_loader_lock);
     for (int k = 0; k < g_image_count; k++) {
         vx_image *m = g_images[reason == 3 ? g_image_count - 1 - k : k];
+        if (m->unloaded) continue;
         tls_callbacks(m, reason);
         if (m->is_dll && m->initialized && !m->no_thread_calls && m->entry_rva)
             ((dll_entry)(m->base + m->entry_rva))(m->base, reason, NULL);
@@ -321,9 +323,10 @@ static void *pe_export(const vx_image *m, const char *name, int ordinal, int dep
 // ---- loading ------------------------------------------------------------------------------------------------------------
 static char g_exe_dir[4096];
 static char g_altered_dir[4096];   // LoadLibraryEx(LOAD_WITH_ALTERED_SEARCH_PATH): the DLL's own directory, searched first
+static char g_dll_dir[4096];       // SetDllDirectory: searched after the program's directory (Unity's Plugins folder)
 
-// Finds a DLL file: (the altered search directory,) the program's directory, C:\windows\system32, the current
-// directory.
+// Finds a DLL file: (the altered search directory,) the program's directory, (the SetDllDirectory directory,)
+// C:\windows\system32, the current directory.
 // Wine's own DLLs (marked "Wine builtin DLL" after the DOS header) need Wine underneath: they are passed over.
 static int wine_builtin(const char *path) {
     char head[0x60] = { 0 };
@@ -336,14 +339,15 @@ static int wine_builtin(const char *path) {
 static int search_dll(const char *name, char *out, size_t cap) {
     char file[256];
     snprintf(file, sizeof file, "%s%s", name, strchr(name, '.') ? "" : ".dll");
-    char dirs[4][4096];
+    char dirs[5][4096];
     snprintf(dirs[0], sizeof dirs[0], "%s", g_altered_dir);
     snprintf(dirs[1], sizeof dirs[1], "%s", g_exe_dir);
-    snprintf(dirs[2], sizeof dirs[2], "%s/drive_c/windows/system32", vx_root());
+    snprintf(dirs[2], sizeof dirs[2], "%s", g_dll_dir);
+    snprintf(dirs[3], sizeof dirs[3], "%s/drive_c/windows/system32", vx_root());
     char cwd[4096];
     vx_get_cwd(cwd, sizeof cwd);
-    if (!vx_unix_path(cwd, dirs[3], sizeof dirs[3])) dirs[3][0] = 0;
-    for (int i = 0; i < 4; i++) {
+    if (!vx_unix_path(cwd, dirs[4], sizeof dirs[4])) dirs[4][0] = 0;
+    for (int i = 0; i < 5; i++) {
         if (!dirs[i][0]) continue;
         snprintf(out, cap, "%s/%s", dirs[i], file);
         char shadow[4096];
@@ -388,6 +392,7 @@ static void *resolve(const char *dll, const char *name, int ordinal, int depth) 
         return vx_find_export(dll, by_number);
     }
     m = load_dll(dll);
+    if (m) m->pinned = 1;                                         // (a forwarder's target)
     return m && init_dll(m) ? pe_export(m, name, ordinal, depth) : NULL;
 }
 
@@ -495,6 +500,7 @@ static vx_image *load_pe(const char *path, int is_main) {
             uint64_t *iat = (uint64_t *)(base + rd32(d + 16));
             if (!is_builtin(dll) && !image_by_name(dll) && !load_dll(dll)) vx_log("%s: DLL %s not found", m->name, dll);
             vx_image *dep = image_by_name(dll);
+            if (dep) dep->pinned = 1;
             if (dep && dep != m && !init_dll(dep)) return NULL;
             for (size_t i = 0; lookup[i]; i++) {
                 const char *name = NULL;
@@ -564,11 +570,31 @@ static WINAPI void *LoadLibraryExA(const char *name, HANDLE file, DWORD flags) {
 static WINAPI void *LoadLibraryExW(const WCHAR *name, HANDLE file, DWORD flags) {
     (void)file; char *a = vx_utf8_dup(name); void *h = load_library(a, flags); free(a); return h;
 }
-// Images stay mapped: code from them may still be running on other threads, and unloading is rarely needed.
+static BOOL set_dll_directory(const char *dir) {
+    char path[4096] = { 0 };
+    if (dir && *dir && !vx_unix_path(dir, path, sizeof path)) return 0;
+    pthread_mutex_lock(&g_loader_lock);
+    snprintf(g_dll_dir, sizeof g_dll_dir, "%s", path);
+    pthread_mutex_unlock(&g_loader_lock);
+    return 1;
+}
+static WINAPI BOOL SetDllDirectoryA(const char *dir) { return set_dll_directory(dir); }
+static WINAPI BOOL SetDllDirectoryW(const WCHAR *dir) {
+    char *a = dir ? vx_utf8_dup(dir) : NULL; BOOL ok = set_dll_directory(a); free(a); return ok;
+}
+// The last FreeLibrary of a DLL only LoadLibrary brought in detaches it (DLL_PROCESS_DETACH) and forgets it, so the
+// next LoadLibrary maps and initializes a fresh copy, as on Windows: openvr_api.dll unloads vrclient_x64.dll in
+// VR_Shutdown, and vrclient asserts if its statics survive into the next VR_Init (Unity initializes OpenVR twice).
+// The image stays mapped: code from it may still be running on other threads.
 static WINAPI BOOL FreeLibrary(void *h) {
     pthread_mutex_lock(&g_loader_lock);
     vx_image *m = image_by_base(h);
-    if (m && m->refs > 1) m->refs--;
+    if (m && m->refs > 1 && --m->refs == 1 && m->is_dll && !m->pinned) {
+        if (vx_trace) vx_log("FreeLibrary: %s unloaded", m->name);
+        if (m->initialized && m->entry_rva) ((dll_entry)(m->base + m->entry_rva))(m->base, 0 /* DLL_PROCESS_DETACH */, NULL);
+        tls_callbacks(m, 0);
+        m->unloaded = 1;
+    }
     pthread_mutex_unlock(&g_loader_lock);
     return 1;
 }
@@ -589,16 +615,24 @@ static void *module_handle(const char *name) {
 }
 static WINAPI void *GetModuleHandleA(const char *name) { return module_handle(name); }
 static WINAPI void *GetModuleHandleW(const WCHAR *name) { char *a = vx_utf8_dup(name); void *h = module_handle(a); free(a); return h; }
+#define GET_MODULE_HANDLE_EX_FLAG_PIN 1
+#define GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT 2
 #define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 4
+// Like LoadLibrary, it holds a reference unless asked not to (DLLs pin themselves this way: the CRT, vrclient).
 static WINAPI BOOL GetModuleHandleExA(DWORD flags, const char *name, void **out) {
     if (flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
         const vx_image *m = vx_image_at((uint64_t)name);
-        *out = m ? m->base : NULL;
+        *out = m && !m->unloaded ? m->base : NULL;
     } else {
         *out = module_handle(name);
     }
-    if (!*out) vx_set_last_error(126);
-    return *out != NULL;
+    if (!*out) { vx_set_last_error(126); return 0; }
+    pthread_mutex_lock(&g_loader_lock);
+    vx_image *m = image_by_base(*out);
+    if (m && (flags & GET_MODULE_HANDLE_EX_FLAG_PIN)) m->pinned = 1;
+    else if (m && !(flags & GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT)) m->refs++;
+    pthread_mutex_unlock(&g_loader_lock);
+    return 1;
 }
 static WINAPI BOOL GetModuleHandleExW(DWORD flags, const WCHAR *name, void **out) {
     if (flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) return GetModuleHandleExA(flags, (const char *)name, out);
@@ -653,7 +687,7 @@ static WINAPI DWORD GetModuleFileNameW(void *module, WCHAR *buf, DWORD size) {
 
 static const vx_export loader_k32[] = {
     VX_EXPORT(LoadLibraryA), VX_EXPORT(LoadLibraryW), VX_EXPORT(LoadLibraryExA), VX_EXPORT(LoadLibraryExW),
-    VX_EXPORT(FreeLibrary), VX_EXPORT(DisableThreadLibraryCalls),
+    VX_EXPORT(FreeLibrary), VX_EXPORT(DisableThreadLibraryCalls), VX_EXPORT(SetDllDirectoryA), VX_EXPORT(SetDllDirectoryW),
     VX_EXPORT(GetModuleHandleA), VX_EXPORT(GetModuleHandleW), VX_EXPORT(GetModuleHandleExA), VX_EXPORT(GetModuleHandleExW),
     VX_EXPORT(GetProcAddress), VX_EXPORT(GetModuleFileNameA), VX_EXPORT(GetModuleFileNameW),
 };

@@ -328,6 +328,8 @@ static WINAPI BOOL EnumChildWindows(void *parent, void *fn, intptr_t param) { (v
 static WINAPI BOOL GetGUIThreadInfo(DWORD tid, uint8_t *info) { (void)tid; DWORD size = *(DWORD *)info; memset(info + 4, 0, size > 4 ? size - 4 : 0); return 1; }
 static int g_station;
 static WINAPI HANDLE GetProcessWindowStation(void) { return &g_station; }
+static int g_desktop;
+static WINAPI HANDLE GetThreadDesktop(DWORD tid) { (void)tid; return &g_desktop; }   // (the Default desktop: see below)
 // The window station is WinSta0 and every desktop handle is its Default desktop, the input desktop of an unlocked
 // session (SteamVR's compositor checks the input desktop's name, and shows a "display locked" colour otherwise).
 static BOOL user_object_info(HANDLE obj, int index, void *out, DWORD n, DWORD *need, int wide) {
@@ -755,7 +757,7 @@ static const vx_export crt[] = {
 static const vx_export user32[] = {
     VX_EXPORT(GetKeyboardLayoutList), VX_EXPORT(LoadKeyboardLayoutA), VX_EXPORT(LoadKeyboardLayoutW), VX_EXPORT(ActivateKeyboardLayout),
     VX_EXPORT(ToUnicodeEx), VX_EXPORT(SetRect), VX_EXPORT(wsprintfW), VX_EXPORT(wvsprintfW), VX_EXPORT(GetWindowInfo), VX_EXPORT(EnumChildWindows), VX_EXPORT(GetGUIThreadInfo),
-    VX_EXPORT(GetProcessWindowStation), VX_EXPORT(GetUserObjectInformationW), VX_EXPORT(GetUserObjectInformationA), VX_EXPORT(CopyIcon), VX_EXPORT(DrawIconEx), VX_EXPORT(GetIconInfo),
+    VX_EXPORT(GetProcessWindowStation), VX_EXPORT(GetThreadDesktop), VX_EXPORT(GetUserObjectInformationW), VX_EXPORT(GetUserObjectInformationA), VX_EXPORT(CopyIcon), VX_EXPORT(DrawIconEx), VX_EXPORT(GetIconInfo),
 };
 static const vx_export imm32[] = {
     VX_EXPORT(ImmGetConversionStatus), VX_EXPORT(ImmSetConversionStatus), VX_EXPORT(ImmGetProperty), VX_EXPORT(ImmGetVirtualKey),

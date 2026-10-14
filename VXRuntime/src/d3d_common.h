@@ -93,7 +93,8 @@ typedef struct {
 // shared: a buffer in shared memory, between processes (its slot + 1): updated in place, never renamed.
 // mtl: the Metal buffer holding the contents (retained), from byte off on: a small buffer renamed by Map(DISCARD)
 // or UpdateSubresource is a slice of a larger chunk (then chunk is set; its size is desc[0], not mtl's length).
-typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; int shared; void *shm; size_t shm_size; size_t off; void *chunk; } d3d_buffer;
+// so_filled: bytes stream output has written (where an append, offset -1, continues).
+typedef struct { d3d_object base; uint32_t desc[6]; void *mtl; int shared; void *shm; size_t shm_size; size_t off; void *chunk; uint32_t so_filled; } d3d_buffer;
 // A view: of a texture (mip, slices), or of a buffer (first element and count; flags: raw).
 // A view: of a texture (dimension, first mip and mip count, slices), or of a buffer (first element and count;
 // flags: raw, append, counter). counter: a UAV's hidden counter (id<MTLBuffer> of 4 bytes, retained); mtl_view:

@@ -504,9 +504,13 @@ static WINAPI void *TlsGetValue(DWORD i) {
     vx_set_last_error(0);
     return ((void **)(vx_teb() + TEB_TLS_SLOTS))[i];
 }
+// The value is also put at gs:0x1480 + 8i, where the slot is on Windows: code compiled for Windows reads it there
+// directly (Mono's JIT does: Unity games read a garbage slot and recursed on NullReferenceExceptions until the stack
+// ran out). On macOS that is a TSD slot pthread keys reach only after some 400 of them exist.
 static WINAPI BOOL TlsSetValue(DWORD i, void *v) {
     if (i >= 64) { vx_set_last_error(87); return 0; }
     ((void **)(vx_teb() + TEB_TLS_SLOTS))[i] = v;
+    __asm__ volatile("movq %0, %%gs:(%1)" :: "r"(v), "r"((uint64_t)TEB_TLS_SLOTS + 8ull * i) : "memory");
     return 1;
 }
 
@@ -755,6 +759,11 @@ static WINAPI BOOL VirtualProtect(void *addr, size_t size, DWORD prot, DWORD *ol
     return 1;
 }
 typedef struct { void *base, *alloc_base; DWORD alloc_protect; uint16_t partition, pad; size_t region; DWORD state, protect, type, pad2; } MEMORY_BASIC_INFORMATION;
+static DWORD mach_protect(vm_prot_t p) {
+    int r = p & VM_PROT_READ, w = p & VM_PROT_WRITE, x = p & VM_PROT_EXECUTE;
+    if (x) return w ? PAGE_EXECUTE_READWRITE : r ? 0x20 /* PAGE_EXECUTE_READ */ : 0x10 /* PAGE_EXECUTE */;
+    return w ? 0x04 /* PAGE_READWRITE */ : r ? 0x02 /* PAGE_READONLY */ : 0x01 /* PAGE_NOACCESS */;
+}
 static WINAPI size_t VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mbi, size_t len) {
     if (len < sizeof *mbi) { vx_set_last_error(24 /* ERROR_BAD_LENGTH */); return 0; }
     uintptr_t page = (uintptr_t)addr & ~(uintptr_t)0xfff;
@@ -784,13 +793,18 @@ static WINAPI size_t VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mb
     vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
     kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj);
     if (kr == KERN_SUCCESS && a <= page) {
-        // Mapped by macOS (the system's libraries, malloc, Rosetta): adjacent mappings are reported as one region,
-        // as programs walking the address space expect Windows' few hundred regions, not macOS's tens of thousands.
+        // Mapped by macOS (the system's libraries, malloc, Rosetta, thread stacks): adjacent mappings with the same
+        // protection are reported as one region, as programs walking the address space expect Windows' few hundred
+        // regions, not macOS's tens of thousands. The protection is the real one: the Boehm GC (Unity's Mono) finds
+        // the end of a thread's stack by walking down while pages are PAGE_READWRITE, and with every page
+        // PAGE_EXECUTE_READWRITE it scanned no stack at all and freed live objects.
+        vm_prot_t prot = info.protection;
         mach_vm_address_t end = a + sz;
         for (int i = 0; i < 100000 && end < top && !vx_image_at(end); i++) {
             mach_vm_address_t n = end; mach_vm_size_t nsz = 0;
             count = VM_REGION_BASIC_INFO_COUNT_64;
             if (mach_vm_region(mach_task_self(), &n, &nsz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS || n != end) break;
+            if (info.protection != prot) break;
             pthread_mutex_lock(&g_vm_lock);
             reservation *next = find_reservation(n);
             pthread_mutex_unlock(&g_vm_lock);
@@ -798,7 +812,8 @@ static WINAPI size_t VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mb
             end = n + nsz;
         }
         if (end > top) end = top;
-        mbi->alloc_base = (void *)a; mbi->alloc_protect = mbi->protect = PAGE_EXECUTE_READWRITE;
+        mbi->alloc_base = (void *)a;
+        mbi->alloc_protect = mbi->protect = mach_protect(prot);
         mbi->region = end - page; mbi->state = MEM_COMMIT; mbi->type = MEM_PRIVATE;
     } else {
         mbi->state = MEM_FREE; mbi->protect = 0x01;      // PAGE_NOACCESS

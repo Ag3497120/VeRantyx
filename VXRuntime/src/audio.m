@@ -271,7 +271,19 @@ static WINAPI HRESULT volume_get_mute(void *this, int *m) { *m = owner(this)->mu
 
 // ---- devices, the enumerator, the property store ----------------------------------------------------------------------------
 static d3d_object *g_device;                                   // the one render endpoint
-static WINAPI HRESULT device_qi(void *this, const GUID *iid, void **out) { return query(this, iid, out, &IID_IMMDevice); }
+// IMMEndpoint (the device's direction): Unity asks the device for it and uses the result unchecked.
+static const GUID IID_IMMEndpoint = { 0x1be09788, 0x6894, 0x4089, { 0x85, 0x86, 0x9a, 0x2a, 0x6c, 0x26, 0x5a, 0xc5 } };
+static d3d_object *g_endpoint;
+static WINAPI HRESULT endpoint_qi(void *this, const GUID *iid, void **out) {
+    if (out && d3d_same_guid(iid, &IID_IMMDevice)) { d3d_addref(g_device); *out = g_device; return S_OK; }
+    return query(this, iid, out, &IID_IMMEndpoint);
+}
+static WINAPI HRESULT endpoint_get_data_flow(void *this, int *flow) { (void)this; if (!flow) return E_POINTER; *flow = 0; return S_OK; }   // eRender
+static void *g_endpoint_vtbl[] = { (void *)endpoint_qi, (void *)obj_addref, (void *)obj_release, (void *)endpoint_get_data_flow };
+static WINAPI HRESULT device_qi(void *this, const GUID *iid, void **out) {
+    if (out && d3d_same_guid(iid, &IID_IMMEndpoint)) { d3d_addref(g_endpoint); *out = g_endpoint; return S_OK; }
+    return query(this, iid, out, &IID_IMMDevice);
+}
 static WINAPI HRESULT device_activate(void *this, const GUID *iid, DWORD ctx, void *params, void **out) {
     (void)this; (void)ctx; (void)params;
     if (!d3d_same_guid(iid, &IID_IAudioClient) && !d3d_same_guid(iid, &IID_IUnknown_)) { *out = NULL; return E_NOINTERFACE; }
@@ -386,5 +398,6 @@ void vx_audio_init(void) {
     g_volume_vtbl = D3D_VTABLE(ISimpleAudioVolume, volume);
     g_props_vtbl = D3D_VTABLE(IPropertyStore, props);
     g_device = d3d_alloc(sizeof(d3d_object), K_STATE, g_device_vtbl, NULL);
+    g_endpoint = d3d_alloc(sizeof(d3d_object), K_STATE, g_endpoint_vtbl, NULL);
     vx_com_register_class(&CLSID_MMDeviceEnumerator, create_enumerator);
 }

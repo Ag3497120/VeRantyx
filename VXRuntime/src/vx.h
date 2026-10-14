@@ -49,6 +49,8 @@ typedef struct {
     uint32_t  tls_rva;                 // the TLS directory, 0 if none
     DWORD     tls_index;               // ~0u if none
     int       is_dll, refs, initialized, no_thread_calls;
+    int       pinned;                  // imported by another image (or the program): never unloaded
+    int       unloaded;                // FreeLibrary'd: detached and forgotten by name, still mapped
 } vx_image;
 const vx_image *vx_image_at(uint64_t pc);    // the image containing an address, or NULL
 int vx_image_list(const vx_image **out, int cap);   // the loaded images (all of them is the return value)

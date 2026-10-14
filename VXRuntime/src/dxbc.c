@@ -73,6 +73,12 @@ static int find_signature(const uint8_t *c, size_t size, int output, dxbc_elemen
 int dxbc_input_signature(const void *code, size_t size, dxbc_element *elements, int max) {
     return find_signature(code, size, 0, elements, max);
 }
+int dxbc_program_type(const void *code, size_t size) {
+    uint32_t len;
+    const uint8_t *prog = chunk(code, size, "SHEX", &len);
+    if (!prog) prog = chunk(code, size, "SHDR", &len);
+    return prog && len >= 8 ? (int)(*(const uint32_t *)prog >> 16) : -1;
+}
 
 // ---- tokens --------------------------------------------------------------------------------------------------------------------
 enum {

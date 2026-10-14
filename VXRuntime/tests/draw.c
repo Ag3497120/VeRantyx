@@ -335,6 +335,52 @@ static void test_geometry_shader(void) {
     ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);
 }
 
+// Stream output with a vertex shader's code (as Unity skins meshes): each vertex's color and the x and y of its
+// position go to a buffer, a second draw appending after the first.
+static void test_stream_output(void) {
+    D3D11_SO_DECLARATION_ENTRY decl[] = { { 0, "COLOR", 0, 0, 4, 0 }, { 0, "SV_Position", 0, 0, 2, 0 } };
+    UINT stride = 24;
+    ID3D11GeometryShader *gs = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateGeometryShaderWithStreamOutput(dev, color_vs, sizeof color_vs, decl, 2, &stride, 1, D3D11_SO_NO_RASTERIZED_STREAM, NULL, &gs)));
+    color_vertex v[3] = { { 1, 2, 0, 0.5f, 0.25f, 0, 1 }, { 3, 4, 0, 1, 1, 1, 1 }, { 5, 6, 0, 0, 0, 0, 0 } };
+    ID3D11Buffer *vb = buffer(D3D11_BIND_VERTEX_BUFFER, v, sizeof v), *so = buffer(D3D11_BIND_STREAM_OUTPUT, NULL, 6 * 24);
+    UINT vstride = sizeof v[0], offset = 0;
+    ID3D11DeviceContext_IASetInputLayout(ctx, color_layout);
+    ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &vb, &vstride, &offset);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+    ID3D11DeviceContext_VSSetShader(ctx, color_vs_obj, NULL, 0);
+    ID3D11DeviceContext_GSSetShader(ctx, gs, NULL, 0);
+    ID3D11DeviceContext_SOSetTargets(ctx, 1, &so, &offset);
+    ID3D11DeviceContext_Draw(ctx, 2, 0);                  // vertices 0 and 1
+    UINT append = (UINT)-1;
+    ID3D11DeviceContext_SOSetTargets(ctx, 1, &so, &append);
+    ID3D11DeviceContext_Draw(ctx, 1, 2);                  // vertex 2, after them
+    ID3D11Buffer *bound = NULL;
+    ID3D11DeviceContext_SOGetTargets(ctx, 1, &bound);
+    CHECK(bound == so);
+    if (bound) ID3D11Buffer_Release(bound);
+    ID3D11DeviceContext_SOSetTargets(ctx, 0, NULL, NULL);
+    ID3D11DeviceContext_GSSetShader(ctx, NULL, NULL, 0);
+    D3D11_BUFFER_DESC sd = { 6 * 24, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+    ID3D11Buffer *staging = NULL;
+    ID3D11Device_CreateBuffer(dev, &sd, NULL, &staging);
+    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)so);
+    float out[6 * 6] = { 0 };
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m))) {
+        memcpy(out, m.pData, sizeof out);
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+    }
+    for (int i = 0; i < 3; i++) {
+        const float *o = &out[i * 6], *want = &v[i].r;
+        CHECK(o[0] == want[0] && o[1] == want[1] && o[2] == want[2] && o[3] == want[3] && o[4] == v[i].x && o[5] == v[i].y);
+    }
+    CHECK(out[18] == 0 && out[35] == 0);                  // nothing past the three vertices
+    printf("  stream output: (%g %g %g %g, %g %g) (%g ... %g) (%g ... %g)\n", out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[11], out[12], out[17]);
+    ID3D11Buffer_Release(staging); ID3D11Buffer_Release(so); ID3D11Buffer_Release(vb);
+    if (gs) ID3D11GeometryShader_Release(gs);
+}
+
 int main(int argc, char **argv) {
     D3D_FEATURE_LEVEL level;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) { printf("draw: no device -> FAILED\n"); return 1; }
@@ -346,6 +392,7 @@ int main(int argc, char **argv) {
     test_depth_and_blend();
     test_generate_mips();
     test_geometry_shader();
-    printf("draw: triangle, textured quad, shader math, depth, blending, per-draw constants, mips, geometry shader: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    test_stream_output();
+    printf("draw: triangle, textured quad, shader math, depth, blending, per-draw constants, mips, geometry shader, stream output: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }
