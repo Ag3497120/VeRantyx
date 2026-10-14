@@ -58,6 +58,7 @@ enum { DXBC_UAV_TYPED = 1, DXBC_UAV_RAW, DXBC_UAV_STRUCTURED };
 #define DXBC_VS_PARAMS 28
 #define DXBC_GS_IN 28
 #define DXBC_GS_OUT 29
+#define DXBC_GS_COUNTS 26           // (the geometry kernel: triangles made per primitive)
 typedef struct { uint32_t sizes[32]; uint64_t counters[8]; } dxbc_aux;   // bytes of u0..u7 then t0..t21; GPU addresses
 
 // Translates a DXBC container. Returns 0 and fills *out, or -1 with out->error set.

@@ -330,6 +330,27 @@ static void test_geometry_shader(void) {
     CHECK(outside == 0xff000000u);                                   // beyond it: the clear colour
     CHECK(B(corner) > 200 && R(corner) < 60);                        // the second strip (blue)
     printf("  geometry shader: centre %06x, inside %06x, outside %06x, corner %06x\n", centre & 0xffffff, inside & 0xffffff, outside & 0xffffff, corner & 0xffffff);
+    // Indexed, with a base vertex: of four points, indices { 1, 0 } with base vertex 1 draw points 2 (green, right)
+    // and 1 (white, top); points 0 (left) and 3 (bottom) stay undrawn.
+    color_vertex pts[4] = { { -0.5f, 0, 0, 1, 0, 0, 1 }, { 0, 0.6f, 0, 1, 1, 1, 1 }, { 0.5f, 0, 0, 0, 1, 0, 1 }, { 0, -0.6f, 0, 1, 1, 0, 1 } };
+    WORD idx[2] = { 1, 0 };
+    ID3D11Buffer *vb2 = buffer(D3D11_BIND_VERTEX_BUFFER, pts, sizeof pts), *ib = buffer(D3D11_BIND_INDEX_BUFFER, idx, sizeof idx);
+    float small[4] = { 0.1f, 0, 0, 0 };
+    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)cb, 0, NULL, small, 0, 0);
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, black);
+    ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &vb2, &stride, &offset);
+    ID3D11DeviceContext_IASetIndexBuffer(ctx, ib, DXGI_FORMAT_R16_UINT, 0);
+    ID3D11DeviceContext_GSSetShader(ctx, gs, NULL, 0);
+    ID3D11DeviceContext_DrawIndexed(ctx, 2, 0, 1);
+    ID3D11DeviceContext_GSSetShader(ctx, NULL, NULL, 0);
+    readback(t, px, 4);
+    UINT left = px[32 * 64 + 16], mid = px[(32 - 19) * 64 + 32], right = px[32 * 64 + 48], low = px[(32 + 19) * 64 + 32];
+    CHECK(left == 0xff000000u);                                      // vertex 0: not drawn
+    CHECK(R(mid) > 200 && G(mid) > 200 && B(mid) > 200);             // index 0 + base 1: the white point
+    CHECK(G(right) > 200 && R(right) < 60);                          // index 1 + base 1: the green point
+    CHECK(low == 0xff000000u);                                       // vertex 3: not drawn
+    printf("  geometry shader, indexed: left %06x, top %06x, right %06x, bottom %06x\n", left & 0xffffff, mid & 0xffffff, right & 0xffffff, low & 0xffffff);
+    ID3D11Buffer_Release(vb2); ID3D11Buffer_Release(ib);
     ID3D11Buffer_Release(vb); ID3D11Buffer_Release(cb);
     if (gs) ID3D11GeometryShader_Release(gs);
     ID3D11RenderTargetView_Release(rtv); ID3D11Texture2D_Release(t);

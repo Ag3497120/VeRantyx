@@ -387,6 +387,8 @@ typedef struct d3d_draw_state {
     RECT scissor[16];
     uint32_t nscissors;
     void *gs_vertices;                         // drawing a geometry kernel's triangles: its output (id<MTLBuffer>), else NULL
+    void *gs_counts;                           // ... and how many triangles each primitive made (id<MTLBuffer>)
+    void *gs_scratch[3];                       // the geometry path's buffers, kept from draw to draw (id<MTLBuffer>)
     d3d_buffer *so[4];                         // stream output targets
     void *dummy_depth;                         // id<MTLTexture>: for shaders writing depth with no depth target bound
     void *pass_depth;                          // the dummy depth the open render encoder has (or NULL)
@@ -425,6 +427,7 @@ void d3d_draw_release(d3d_context *c) {
         for (int i = 0; i < 8; i++) bind(&s->uav[st][i], NULL);
     }
     for (int i = 0; i < 4; i++) bind(&s->so[i], NULL);
+    for (int i = 0; i < 3; i++) if (s->gs_scratch[i]) CFRelease(s->gs_scratch[i]);
     free(s);
     c->draw = NULL;
 }
@@ -1264,7 +1267,10 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
         else { [enc setViewports:vps count:nvp]; [enc setScissorRects:scs count:nvp]; }
         bs->nvp = nvp; memcpy(bs->vp, vps, nvp * sizeof *vps); memcpy(bs->sc, scs, nvp * sizeof *scs);
     }
-    if (s->gs_vertices) bind_buffer(enc, bs, STAGE_VS, (__bridge id<MTLBuffer>)s->gs_vertices, 0, 0);
+    if (s->gs_vertices) {
+        bind_buffer(enc, bs, STAGE_VS, (__bridge id<MTLBuffer>)s->gs_vertices, 0, 0);
+        bind_buffer(enc, bs, STAGE_VS, (__bridge id<MTLBuffer>)s->gs_counts, 0, 1);
+    }
     else {
         for (int i = 0; i < 16; i++)
             if (s->vb[i]) bind_buffer(enc, bs, STAGE_VS, (__bridge id<MTLBuffer>)s->vb[i]->mtl, s->vb[i]->off + s->offset[i], VB_BASE + i);
@@ -1493,6 +1499,16 @@ static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t
     default: return;
     }
     if (!prims || !shader_function(gs) || !gs_passthrough(c->base.dev, gs)) return;
+    if (vx_trace) {                                      // (VXRT_TRACE: each geometry shader's shape, once, and how it is drawn)
+        static uint32_t seen[64]; static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen && !known; i++) known = seen[i] == gs->hash;
+        if (!known && nseen < 64) {
+            seen[nseen++] = gs->hash;
+            vx_log("Direct3D: geometry shader %08x: %d vertices in, up to %d triangles of %d registers out; draw of %u vertices (%u primitives) x %u%s",
+                   gs->hash, gs->info.gs_in_verts, gs->info.gs_max_tris, gs->info.out_regs, count, prims, instances, indexed ? ", indexed" : "");
+        }
+    }
     int index_type = indexed ? (s->ib_format == 42 ? 2 : 1) : 0;
     id<MTLComputePipelineState> vk = vs_kernel_pipeline(c, s, vs, index_type);
     if (!vk) return;
@@ -1502,17 +1518,29 @@ static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t
         if (!p) { vx_log("Direct3D: geometry kernel pipeline failed: %s", err.localizedDescription.UTF8String); return; }
         gs->compute = (void *)CFBridgingRetain(p);
     }
-    id<MTLDevice> dev = (__bridge id<MTLDevice>)c->base.dev->mtl;
     uint32_t vsn = (uint32_t)(vs->info.out_regs ? vs->info.out_regs : 1), gsn = (uint32_t)gs->info.out_regs, tris = (uint32_t)gs->info.gs_max_tris;
-    id<MTLBuffer> vs_out = [dev newBufferWithLength:(NSUInteger)count * instances * vsn * 16 options:MTLResourceStorageModePrivate];
-    id<MTLBuffer> gs_out = [dev newBufferWithLength:(NSUInteger)prims * instances * tris * 3 * gsn * 16 options:MTLResourceStorageModePrivate];
-    if (!vs_out || !gs_out) return;
     // Inputs only the CPU wrote: the kernels go to the command buffer that runs first, and the render pass in
     // progress stays open (Half-Life: Alyx's menu has 30 geometry draws a frame on the eye targets: each one wrote
     // out and reloaded them, 60 GB/s, 22 fps).
     static int early_ok = -1;
     if (early_ok < 0) early_ok = getenv("VXRT_GS_EARLY") != NULL;    // (being measured: off by default)
     int early = early_ok && gs_inputs_from_cpu(c, s);
+    // The buffers are kept from one geometry draw to the next (Metal orders this draw's writes after the last one's
+    // reads): a new one each time cost an allocation of up to 66 MB per draw (Alyx's menu: 31 a frame). Kernels run
+    // early all go before any of their draws, so those get their own.
+    NSUInteger lens[3] = { (NSUInteger)count * instances * vsn * 16, (NSUInteger)prims * instances * tris * 3 * gsn * 16, (NSUInteger)prims * instances * 4 };
+    id<MTLBuffer> bufs[3];
+    for (int k = 0; k < 3; k++) {
+        id<MTLDevice> dev = (__bridge id<MTLDevice>)c->base.dev->mtl;
+        id<MTLBuffer> b = early ? nil : (__bridge id<MTLBuffer>)s->gs_scratch[k];
+        if (!b || b.length < lens[k]) {
+            b = [dev newBufferWithLength:MAX(lens[k], (NSUInteger)4096) options:MTLResourceStorageModePrivate];
+            if (!b) return;
+            if (!early) { if (s->gs_scratch[k]) CFRelease(s->gs_scratch[k]); s->gs_scratch[k] = (void *)CFBridgingRetain(b); }
+        }
+        bufs[k] = b;
+    }
+    id<MTLBuffer> vs_out = bufs[0], gs_out = bufs[1], counts = bufs[2];
     id<MTLComputeCommandEncoder> enc;
     if (early) {
         if (!c->pre) {
@@ -1534,10 +1562,12 @@ static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t
     [enc setBytes:gp length:sizeof gp atIndex:DXBC_GS_PARAMS];
     [enc setBuffer:vs_out offset:0 atIndex:DXBC_GS_IN];
     [enc setBuffer:gs_out offset:0 atIndex:DXBC_GS_OUT];
+    [enc setBuffer:counts offset:0 atIndex:DXBC_GS_COUNTS];
     [enc dispatchThreads:MTLSizeMake(prims, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, gk.maxTotalThreadsPerThreadgroup), 1, 1)];
     if (!early) [enc endEncoding];
     // The triangles.
     s->gs_vertices = (__bridge void *)gs_out;
+    s->gs_counts = (__bridge void *)counts;
     MTLPrimitiveType type;
     id<MTLRenderCommandEncoder> renc = prepare(c, &type);
     if (renc) [renc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)prims * instances * tris * 3];

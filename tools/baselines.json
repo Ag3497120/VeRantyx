@@ -2,8 +2,8 @@
   "_comment": "Frozen baselines for tools/vxrt_run.py, per game and scenario (scenario@quality when a preset is used). Measured on an M1 Max (32-core GPU), 60 Hz virtual display, without a headset (simulated head pose). Change a value only with a run that shows the new one (its run id in 'source').",
   "alyx": {
     "menu":        {"min_fps": 18, "non_black": true, "connected": true, "source": "2026-10-14, menu 20-22 fps (reg5)"},
-    "menu@3k":     {"min_fps": 18, "non_black": true, "connected": true, "source": "2026-10-13, menu 20-22 fps at 3k"},
-    "chapter@3k":  {"min_fps": 55, "non_black": true, "connected": true, "source": "2026-10-13, a1_intro_world_2 at 3k, 60 fps held"}
+    "menu@3k":     {"min_fps": 45, "non_black": true, "connected": true, "source": "2026-10-14, 58.8 and 54.1 fps after the geometry path fix (runs 20261014T074457Z, 20261014T074703Z); 18-21 before"},
+    "chapter@3k":  {"min_fps": 55, "non_black": true, "connected": true, "source": "2026-10-14, a1_intro_world_2 at 3k, 60.0 fps (run 20261014T074923Z)"}
   },
   "thelab": {
     "title":       {"min_fps": 50, "non_black": true, "connected": true, "source": "2026-10-14, title scene 53-58 fps captured (lab5)"}

@@ -1235,8 +1235,9 @@ static char *compose_vs_kernel(gen *g) {
 
 // A geometry shader as a kernel: thread (x, y) is input primitive x of instance y. Its vertices come from the
 // vertex kernel's outputs (VXV(vertex, register)); the triangle strips it emits become triangles, gs_max_tris per
-// primitive (the rest degenerate) of out_regs float4s per vertex. vx_gp[0]: primitives per instance, vertices
-// between primitives (a list's size, or 1 for strips), vertices per instance, the vertex kernel's out_regs.
+// primitive of out_regs float4s per vertex, and how many it made to vx_counts (the slots past them are left as they
+// are: the pass-through function skips them). vx_gp[0]: primitives per instance, vertices between primitives (a list's
+// size, or 1 for strips), vertices per instance, the vertex kernel's out_regs.
 static char *compose_gs(gen *g, int maxtri) {
     text t = { 0 };
     int n = out_regs(g);
@@ -1251,9 +1252,9 @@ static char *compose_gs(gen *g, int maxtri) {
             "    for (int vx_k = 0; vx_k < NOUT; vx_k++) { vx_s1[vx_k] = vx_s2[vx_k]; vx_s2[vx_k] = vx_c[vx_k]; } \\\n"
             "    vx_n++; } while (0)\n");
     put(&t, "#define VX_CUT vx_n = 0\n");
-    put(&t, "#define VX_RETURN do { for (uint vx_k = vx_tri * 3 * NOUT; vx_k < MAXTRI * 3 * NOUT; vx_k++) vx_dst[vx_k] = 0; return; } while (0)\n\n");
+    put(&t, "#define VX_RETURN do { vx_counts[vx_tid.y * vx_gp[0].x + vx_tid.x] = vx_tri; return; } while (0)\n\n");
     put(&t, "kernel void vx_main(uint2 vx_tid [[thread_position_in_grid]], const device float4 *vx_gs_in [[buffer(%d)]], device float4 *vx_gs_out [[buffer(%d)]], "
-            "constant uint4 *vx_gp [[buffer(%d)]]", DXBC_GS_IN, DXBC_GS_OUT, DXBC_GS_PARAMS);
+            "constant uint4 *vx_gp [[buffer(%d)]], device uint *vx_counts [[buffer(%d)]]", DXBC_GS_IN, DXBC_GS_OUT, DXBC_GS_PARAMS, DXBC_GS_COUNTS);
     resource_params(g, &t);
     put(&t, ") {\n    if (vx_tid.x >= vx_gp[0].x) return;\n");
     put(&t, "    uint vx_first = vx_tid.x * vx_gp[0].y + vx_tid.y * vx_gp[0].z;\n");
@@ -1266,8 +1267,9 @@ static char *compose_gs(gen *g, int maxtri) {
     return t.s;
 }
 
-// The vertex function drawing a geometry kernel's triangles: vertex v is out_regs float4s at buffer(0).
-static char *compose_passthrough(gen *g) {
+// The vertex function drawing a geometry kernel's triangles: vertex v is out_regs float4s at buffer(0); a triangle
+// past the count its primitive made (buffer(1)) is degenerate (all zero: clipped), its slot not read.
+static char *compose_passthrough(gen *g, int maxtri) {
     text t = { 0 };
     int n = out_regs(g);
     char finish[2048] = "";
@@ -1286,8 +1288,10 @@ static char *compose_passthrough(gen *g) {
         put(&t, "    float vx_clip [[clip_distance]] [%d];\n", k);
         fk += (size_t)snprintf(finish + fk, sizeof finish - fk, ", {%s}", list);
     }
-    put(&t, "};\n\nvertex VxOut vx_main(uint vx_vid [[vertex_id]], const device float4 *vx_v [[buffer(0)]]) {\n");
-    put(&t, "    const device float4 *vx_p = vx_v + vx_vid * %d;\n    return VxOut{%s};\n}\n", n ? n : 1, finish);
+    put(&t, "};\n\nvertex VxOut vx_main(uint vx_vid [[vertex_id]], const device float4 *vx_v [[buffer(0)]], const device uint *vx_counts [[buffer(1)]]) {\n");
+    put(&t, "    float4 vx_p[%d];\n    if ((vx_vid / 3) %% %d < vx_counts[vx_vid / %d]) { for (int k = 0; k < %d; k++) vx_p[k] = vx_v[vx_vid * %d + k]; }\n"
+            "    else { for (int k = 0; k < %d; k++) vx_p[k] = float4(0); }\n    return VxOut{%s};\n}\n",
+        n ? n : 1, maxtri, 3 * maxtri, n ? n : 1, n ? n : 1, n ? n : 1, finish);
     return t.s;
 }
 
@@ -1541,10 +1545,10 @@ int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
         out->gs_instances = g.gs_instances ? (int)g.gs_instances : 1;
         const char *why = !out->gs_in_verts ? "its input primitive" : g.gs_topology != 5 ? "an output other than triangle strips" :
                           !out->gs_max_tris ? "no triangles" : out->gs_instances > 1 ? "instancing" :
-                          (out->srv_buffers >> (DXBC_GS_PARAMS - DXBC_SRV_BUFFER_BASE)) ? "buffers at the slots the geometry path uses" : NULL;
+                          (out->srv_buffers >> (DXBC_GS_COUNTS - DXBC_SRV_BUFFER_BASE)) ? "buffers at the slots the geometry path uses" : NULL;
         if (why) { snprintf(out->error, sizeof out->error, "geometry shader with %s is not supported yet", why); free(g.body.s); free(g.icb); return -1; }
         out->msl = compose_gs(&g, out->gs_max_tris);
-        out->msl_passthrough = compose_passthrough(&g);
+        out->msl_passthrough = compose_passthrough(&g, out->gs_max_tris);
     } else {
         out->msl = compose(&g);
         if (out->type == DXBC_VERTEX) out->msl_kernel = compose_vs_kernel(&g);

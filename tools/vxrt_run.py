@@ -343,7 +343,9 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     result = {"run_id": run_id, "game": key, "appid": (spec or {}).get("appid"), "scenario": scenario, "quality": quality or None,
               "arguments": args, "seconds": seconds, "started": datetime.fromtimestamp(started, timezone.utc).isoformat(),
               "environment": {"commit": head, "uncommitted_changes": dirty, "root": root, "overlay": overlay,
-                              "machine": doctor.machine_info(), "python": sys.version.split()[0]}}
+                              "machine": doctor.machine_info(), "python": sys.version.split()[0],
+                              # (settings already in the environment reach the game too: recorded, so a result says what ran)
+                              "inherited": {k: v for k, v in os.environ.items() if k.startswith(("VXRT_", "VERANTYX_"))}}}
     say = (lambda *a: None) if quiet else (lambda *a: print(*a, file=sys.stderr))
 
     settings = dict(settings or {})
