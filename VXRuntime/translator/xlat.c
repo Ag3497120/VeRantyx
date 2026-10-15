@@ -44,6 +44,7 @@ static void mov_imm(xlat_buf *b, int d, uint64_t v) {
 
 // ---- operands ---------------------------------------------------------------------------------------------------------------
 static int bits(int size) { return size * 8; }
+static int log2s_(int size) { return size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0; }
 static void zext(xlat_buf *b, int d, int n, int size) { E(b, size == 8 ? a64_mov(d, n) : a64_ubfx(d, n, 0, bits(size))); }
 static void sext(xlat_buf *b, int d, int n, int size) { E(b, size == 8 ? a64_mov(d, n) : a64_sbfx(d, n, 0, bits(size))); }
 static int high8(const x86_insn *d, int reg, int size) { return size == 1 && !d->rex && reg >= 4 && reg <= 7; }
@@ -87,8 +88,40 @@ static void rd_rm(xlat_buf *b, const x86_insn *d, int t, int size, uint64_t next
     if (d->mod == 3) rd_reg(b, d, t, d->rm, size);
     else { ea(b, d, next, 0); E(b, a64_ldr(size, t, T_ADDR, 0)); }
 }
+// Locked accesses to memory that is not naturally aligned (x86 allows them; ARM atomics fault on them) go through one
+// lock shared by all translated code: taken with SWPAL, released with STLR. x25 holds its address meanwhile.
+static uint64_t xlat_split_lock;
+enum { X_LOCK = 25 };
+static void split_lock_take(xlat_buf *b) {
+    mov_imm(b, X_LOCK, (uint64_t)(uintptr_t)&xlat_split_lock);
+    E(b, a64_movz(S1, 1, 0)); E(b, a64_swpal(8, S1, S1, X_LOCK)); E(b, a64_cbnz(S1, -2));
+}
+static void split_lock_give(xlat_buf *b) { E(b, a64_stlr(XZR, X_LOCK)); }
+// A forward branch taken when T_ADDR is not aligned to size (S0 used); returns its position for patch_cbz.
+static size_t if_misaligned(xlat_buf *b, int size) {
+    E(b, a64_ubfx(S0, T_ADDR, 0, log2s_(size)));
+    size_t at = here(b); E(b, 0);
+    return at;
+}
+
 static void wr_rm(xlat_buf *b, const x86_insn *d, int t, int size) {
     if (d->mod == 3) wr_reg(b, d, d->rm, t, size);
+    else if (b->lock) {                                  // LOCK: compare-and-swap with the value read, else start over
+        size_t slow = size > 1 ? if_misaligned(b, size) : 0;
+        E(b, a64_mov(S1, b->lock_expect));
+        E(b, a64_casal(size, S1, t, T_ADDR));
+        E(b, a64_cmp(S1, b->lock_expect));
+        E(b, a64_bcond(NE, (int32_t)b->lock_head - (int32_t)b->n));
+        if (size > 1) {
+            size_t done = here(b); E(b, 0);
+            patch_cbz(b, slow, 1, S0);                   // misaligned: the same, under the split lock
+            split_lock_take(b);
+            E(b, a64_ldr(size, S1, T_ADDR, 0)); E(b, a64_cmp(S1, b->lock_expect));
+            E(b, a64_bcond(EQ, 3)); split_lock_give(b); E(b, a64_b((int32_t)b->lock_head - (int32_t)b->n));
+            E(b, a64_str(size, t, T_ADDR, 0)); split_lock_give(b);
+            patch_b(b, done);
+        }
+    }
     else E(b, a64_str(size, t, T_ADDR, 0));
 }
 
@@ -153,17 +186,20 @@ static void cond(xlat_buf *b, int cc) {
 
 // ---- helpers (C) -------------------------------------------------------------------------------------------------------------
 // Calls xlat_helper(ctx) with op and the value in `val`: the x86 registers and flags go through the context.
-static void call_helper(xlat_buf *b, uint32_t op, int val) {
+// (op_reg >= 0: the op is in that register, computed at run time)
+static void call_helper_r(xlat_buf *b, uint32_t op, int op_reg, int val) {
     E(b, a64_str(8, val, XC, CTX_HELPER_VAL));
+    if (op_reg >= 0) E(b, a64_str(8, op_reg, XC, CTX_HELPER_OP));
     for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
-    mov_imm(b, S0, op); E(b, a64_str(8, S0, XC, CTX_HELPER_OP));
+    if (op_reg < 0) { mov_imm(b, S0, op); E(b, a64_str(8, S0, XC, CTX_HELPER_OP)); }
     E(b, a64_mov(0, XC));
     mov_imm(b, S0, (uint64_t)(uintptr_t)xlat_helper);
     E(b, a64_blr(S0));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
     E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
 }
+static void call_helper(xlat_buf *b, uint32_t op, int val) { call_helper_r(b, op, -1, val); }
 enum { H_MUL = 1, H_IMUL, H_DIV, H_IDIV, H_RCL, H_RCR };       // op = kind | size << 8 | count << 16
 void xlat_helper(x86_ctx *c) {
     int kind = (int)(c->helper_op & 0xFF), size = (int)(c->helper_op >> 8 & 0xFF), n = size * 8;
@@ -220,6 +256,22 @@ void xlat_helper(x86_ctx *c) {
             if (q >= lim || q < -lim) { c->fault = X86_FAULT_DE; return; }
             SET(ax, (uint64_t)q); SET(dx, (uint64_t)r);
         }
+        return;
+    }
+    if (kind == H_RCL || kind == H_RCR) {                // through CF; count already masked to 5 or 6 bits
+        int cnt = (int)(c->helper_op >> 16 & 0xFF);
+        if (size == 1) cnt %= 9; else if (size == 2) cnt %= 17;
+        if (!cnt) { c->helper_val = v; return; }
+        uint64_t x = v, cf = c->flags & 1, of;
+        if (kind == H_RCL) {
+            for (int i = 0; i < cnt; i++) { uint64_t out = x >> (n - 1) & 1; x = ((x << 1) | cf) & mask; cf = out; }
+            of = (x >> (n - 1) & 1) ^ cf;
+        } else {
+            of = (x >> (n - 1) & 1) ^ cf;
+            for (int i = 0; i < cnt; i++) { uint64_t out = x & 1; x = (x >> 1) | (cf << (n - 1)); cf = out; }
+        }
+        c->helper_val = x;
+        c->flags = (c->flags & ~(uint64_t)(F_CF | F_OF)) | cf | (of ? F_OF : 0);
         return;
     }
     #undef SET
@@ -300,8 +352,84 @@ static void shift(xlat_buf *b, const x86_insn *d, int op, int size, int count_fr
     patch_b(b, end);
 }
 
+static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip);
 int xlat_insn(xlat_buf *b, const x86_insn *d, const uint8_t *code, uint64_t rip) {
     (void)code;
+    b->lock = (d->prefixes & X86_P_LOCK) && d->has_modrm && d->mod != 3;
+    b->lock_head = b->n;
+    b->lock_expect = T_A;
+    int r = xlat_one(b, d, rip);
+    b->lock = 0;
+    return r;
+}
+
+// String instructions (MOVS CMPS STOS LODS SCAS), with REP / REPE / REPNE: RSI, RDI, RCX, the direction flag.
+static void string_op(xlat_buf *b, const x86_insn *d, int op) {
+    int size = (op & 1) ? d->opsize : 1, kind = (op - 0xA4) >> 1;   // 0 MOVS, 1 CMPS, 3 STOS, 4 LODS, 5 SCAS
+    int rep = (d->prefixes & (X86_P_REP | X86_P_REPNE)) != 0, cmp = kind == 1 || kind == 5;
+    int repne = (d->prefixes & X86_P_REPNE) && cmp;
+    enum { STEP = 25 };
+    mov_imm(b, STEP, (uint64_t)size);                                    // step: +size, or -size with DF set
+    flag_bit(b, S0, XF, 10); E(b, a64_sub(S1, XZR, STEP)); E(b, a64_cmp(S0, XZR)); E(b, a64_csel(STEP, S1, STEP, NE));
+    size_t top = here(b), done = 0;
+    if (rep) { done = here(b); E(b, 0); }                                // CBZ RCX -> end
+    switch (kind) {
+    case 0: E(b, a64_ldr(size, T_A, 6, 0)); E(b, a64_str(size, T_A, 7, 0)); break;
+    case 1: E(b, a64_ldr(size, T_A, 6, 0)); E(b, a64_ldr(size, T_B, 7, 0)); break;
+    case 3: E(b, a64_str(size, 0, 7, 0)); break;
+    case 4: E(b, a64_ldr(size, T_A, 6, 0)); wr_reg(b, d, 0, T_A, size); break;
+    case 5: rd_reg(b, d, T_A, 0, size); E(b, a64_ldr(size, T_B, 7, 0)); break;
+    }
+    if (kind == 0 || kind == 1 || kind == 4) E(b, a64_add(6, 6, STEP));
+    if (kind != 4) E(b, a64_add(7, 7, STEP));
+    if (cmp) { E(b, a64_sub(T_R, T_A, T_B)); flags_arith(b, K_SUB, size, 0); }
+    if (rep) {
+        E(b, a64_subi(1, 1, 1));
+        if (cmp) {                                                       // REPE: on while ZF; REPNE: while not ZF
+            flag_bit(b, S0, XF, 6);
+            E(b, repne ? a64_cbnz(S0, 2) : a64_cbz(S0, 2));
+            E(b, a64_b((int32_t)top - (int32_t)b->n));
+        } else E(b, a64_b((int32_t)top - (int32_t)b->n));
+        patch_cbz(b, done, 0, 1);
+    }
+}
+
+// SHLD / SHRD: the destination shifted, filled from the source.
+static void shld(xlat_buf *b, const x86_insn *d, int right, int count_from_cl, int count_imm, uint64_t next) {
+    int size = d->opsize, n = bits(size), msb = n - 1;
+    rd_rm(b, d, T_A, size, next); rd_reg(b, d, T_B, d->reg, size);
+    if (count_from_cl) E(b, a64_ubfx(T_T, 1, 0, size == 8 ? 6 : 5));
+    else {
+        int c = count_imm & (size == 8 ? 63 : 31);
+        if (!c) { if (size == 4 && d->mod == 3) wr_reg(b, d, d->rm, T_A, 4); return; }
+        mov_imm(b, T_T, (uint64_t)c);
+    }
+    size_t zero = here(b); E(b, 0);                                      // CBZ count
+    if (size == 8) {
+        mov_imm(b, S0, 64); E(b, a64_sub(S0, S0, T_T));
+        if (!right) { E(b, a64_lslv(T_R, T_A, T_T)); E(b, a64_lsrv(S1, T_B, S0)); }
+        else { E(b, a64_lsrv(T_R, T_A, T_T)); E(b, a64_lslv(S1, T_B, S0)); }
+        E(b, a64_orr(T_R, T_R, S1));
+    } else if (!right) {                                                 // ((dest:src) << count) >> n
+        E(b, a64_lsli(S1, T_A, n)); E(b, a64_orr(S1, S1, T_B)); E(b, a64_lslv(S1, S1, T_T)); E(b, a64_lsri(T_R, S1, n));
+    } else {                                                             // (src:dest) >> count
+        E(b, a64_lsli(S1, T_B, n)); E(b, a64_orr(S1, S1, T_A)); E(b, a64_lsrv(T_R, S1, T_T));
+    }
+    E(b, a64_movz(ACC, 0, 0));
+    if (!right) { mov_imm(b, S0, (uint64_t)n); E(b, a64_sub(S0, S0, T_T)); E(b, a64_lsrv(S0, T_A, S0)); }
+    else { E(b, a64_subi(S0, T_T, 1)); E(b, a64_lsrv(S0, T_A, S0)); }
+    flag_bit(b, ACC, S0, 0);                                             // CF: the last bit out of the destination
+    E(b, a64_eor(S0, T_R, T_A)); flag_bit(b, S0, S0, msb); put_flag(b, S0, 11);   // OF: the sign changed
+    wr_rm(b, d, T_R, size);
+    flags_zsp(b, size);
+    merge_flags(b, F_ARITH);
+    size_t end = here(b); E(b, 0);
+    patch_cbz(b, zero, 0, T_T);
+    if (size == 4 && d->mod == 3) wr_reg(b, d, d->rm, T_A, 4);
+    patch_b(b, end);
+}
+
+static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
     uint64_t next = rip + d->len;
     int op = d->opcode, size = d->opsize, reg = d->reg;
     if (d->prefixes & (X86_P_VEX | X86_P_EVEX)) return -1;
@@ -355,6 +483,20 @@ int xlat_insn(xlat_buf *b, const x86_insn *d, const uint8_t *code, uint64_t rip)
             sext(b, T_A, T_A, 4); wr_reg(b, d, reg, T_A, 8);
             return 0;
         }
+        if ((op == 0x86 || op == 0x87) && d->mod != 3) {                 // XCHG with memory: always atomic
+            int sz = op == 0x86 ? 1 : size;
+            rd_reg(b, d, T_B, reg, sz); ea(b, d, next, 0);
+            size_t slow = sz > 1 ? if_misaligned(b, sz) : 0;
+            E(b, a64_swpal(sz, T_B, T_A, T_ADDR));
+            if (sz > 1) {
+                size_t done = here(b); E(b, 0);
+                patch_cbz(b, slow, 1, S0);
+                split_lock_take(b); E(b, a64_ldr(sz, T_A, T_ADDR, 0)); E(b, a64_str(sz, T_B, T_ADDR, 0)); split_lock_give(b);
+                patch_b(b, done);
+            }
+            wr_reg(b, d, reg, T_A, sz);
+            return 0;
+        }
         if (op == 0x86 || op == 0x87) {                                  // XCHG r/m, reg
             int sz = op == 0x86 ? 1 : size;
             rd_rm(b, d, T_A, sz, next); rd_reg(b, d, T_B, reg, sz);
@@ -385,6 +527,7 @@ int xlat_insn(xlat_buf *b, const x86_insn *d, const uint8_t *code, uint64_t rip)
             } else if (g == 2) {                                         // NOT
                 rd_rm(b, d, T_A, sz, next); E(b, a64_orn(T_R, XZR, T_A)); wr_rm(b, d, T_R, sz);
             } else if (g == 3) {                                         // NEG
+                b->lock_expect = T_B;
                 rd_rm(b, d, T_B, sz, next); E(b, a64_movz(T_A, 0, 0)); E(b, a64_sub(T_R, T_A, T_B));
                 wr_rm(b, d, T_R, sz); flags_arith(b, K_SUB, sz, 0);
             } else {                                                     // MUL IMUL DIV IDIV (in C)
@@ -393,7 +536,39 @@ int xlat_insn(xlat_buf *b, const x86_insn *d, const uint8_t *code, uint64_t rip)
             }
             return 0;
         }
-        if (op == 0xFE || op == 0xFF) {                                  // INC DEC (PUSH etc. below)
+        if (op == 0xFF && (reg & 7) == 6) {                              // PUSH r/m
+            rd_rm(b, d, T_A, 8, next); E(b, a64_subi(4, 4, 8)); E(b, a64_str(8, T_A, 4, 0));
+            return 0;
+        }
+        if (op == 0x8F && (reg & 7) == 0) {                              // POP r/m (the address after RSP moved)
+            E(b, a64_ldr(8, T_A, 4, 0)); E(b, a64_addi(4, 4, 8));
+            if (d->mod != 3) ea(b, d, next, 0);
+            wr_rm(b, d, T_A, 8);
+            return 0;
+        }
+        if (op == 0xC9) {                                                // LEAVE
+            E(b, a64_mov(4, 5)); E(b, a64_ldr(8, 5, 4, 0)); E(b, a64_addi(4, 4, 8));
+            return 0;
+        }
+        if (op >= 0xA0 && op <= 0xA3) {                                  // MOV AL/rAX <-> [moffs64]
+            int sz = (op & 1) ? size : 1;
+            mov_imm(b, T_ADDR, (uint64_t)d->imm);
+            if (d->prefixes & (X86_P_SEG_FS | X86_P_SEG_GS)) { E(b, a64_ldr(8, S0, XC, (d->prefixes & X86_P_SEG_FS) ? CTX_FS : CTX_GS)); E(b, a64_add(T_ADDR, T_ADDR, S0)); }
+            if (op <= 0xA1) { E(b, a64_ldr(sz, T_A, T_ADDR, 0)); wr_reg(b, d, 0, T_A, sz); }
+            else E(b, a64_str(sz, 0, T_ADDR, 0));
+            return 0;
+        }
+        if (op == 0xD7) {                                                // XLAT: AL = [RBX + AL]
+            E(b, a64_ubfx(S0, 0, 0, 8)); E(b, a64_add(T_ADDR, 3, S0));
+            E(b, a64_ldr(1, T_A, T_ADDR, 0)); E(b, a64_bfi(0, T_A, 0, 8));
+            return 0;
+        }
+        if (op >= 0xA4 && op <= 0xAF && op != 0xA8 && op != 0xA9) {    // MOVS CMPS STOS LODS SCAS
+            if (d->prefixes & (X86_P_ADDRSIZE | X86_P_SEG_FS | X86_P_SEG_GS)) return -1;
+            string_op(b, d, op);
+            return 0;
+        }
+        if (op == 0xFE || op == 0xFF) {                                  // INC DEC
             int sz = op == 0xFE ? 1 : size, g = reg & 7;
             if (g > 1) return -1;
             rd_rm(b, d, T_A, sz, next); E(b, a64_movz(T_B, 1, 0));
@@ -403,7 +578,17 @@ int xlat_insn(xlat_buf *b, const x86_insn *d, const uint8_t *code, uint64_t rip)
         }
         if (op == 0xC0 || op == 0xC1 || (op >= 0xD0 && op <= 0xD3)) {    // shifts and rotates
             int sz = (op & 1) ? size : 1, g = reg & 7;
-            if (g == 2 || g == 3) return -1;                             // (RCL, RCR: later)
+            if (g == 2 || g == 3) {                                      // RCL RCR (in C)
+                rd_rm(b, d, T_A, sz, next);
+                if (op >= 0xD2) E(b, a64_ubfx(T_B, 1, 0, sz == 8 ? 6 : 5));
+                else mov_imm(b, T_B, (uint64_t)((op >= 0xD0 ? 1 : (int)d->imm) & (sz == 8 ? 63 : 31)));
+                mov_imm(b, S1, (uint32_t)(g == 2 ? H_RCL : H_RCR) | (uint32_t)sz << 8);
+                E(b, a64_orr_lsl(S1, S1, T_B, 16));
+                call_helper_r(b, 0, S1, T_A);
+                E(b, a64_ldr(8, T_R, XC, CTX_HELPER_VAL));
+                wr_rm(b, d, T_R, sz);
+                return 0;
+            }
             shift(b, d, g, sz, op >= 0xD2, op >= 0xD0 ? 1 : (int)d->imm, next);
             return 0;
         }
@@ -528,8 +713,34 @@ int xlat_insn(xlat_buf *b, const x86_insn *d, const uint8_t *code, uint64_t rip)
             int sz = op == 0xC0 ? 1 : size;
             rd_rm(b, d, T_A, sz, next); rd_reg(b, d, T_B, reg, sz);
             E(b, a64_add(T_R, T_A, T_B));
-            wr_reg(b, d, reg, T_A, sz); wr_rm(b, d, T_R, sz);
+            if (b->lock) { wr_rm(b, d, T_R, sz); wr_reg(b, d, reg, T_A, sz); }   // (memory first: a retry rereads the source)
+            else { wr_reg(b, d, reg, T_A, sz); wr_rm(b, d, T_R, sz); }
             flags_arith(b, K_ADD, sz, 0);
+            return 0;
+        }
+        if ((op == 0xB0 || op == 0xB1) && b->lock) {                    // LOCK CMPXCHG: CASAL
+            int sz = op == 0xB0 ? 1 : size;
+            b->lock = 0;
+            rd_reg(b, d, T_B, 0, sz); rd_reg(b, d, T_R, reg, sz); ea(b, d, next, 0);
+            size_t slow = sz > 1 ? if_misaligned(b, sz) : 0;
+            E(b, a64_mov(T_A, T_B)); E(b, a64_casal(sz, T_A, T_R, T_ADDR));    // T_A: the destination's old value
+            if (sz > 1) {
+                size_t done = here(b); E(b, 0);
+                patch_cbz(b, slow, 1, S0);
+                split_lock_take(b);
+                E(b, a64_ldr(sz, T_A, T_ADDR, 0)); E(b, a64_cmp(T_A, T_B));
+                E(b, a64_bcond(NE, 2)); E(b, a64_str(sz, T_R, T_ADDR, 0));
+                split_lock_give(b);
+                patch_b(b, done);
+            }
+            E(b, a64_sub(T_R, T_A, T_B)); flags_arith(b, K_SUB, sz, 0);        // (flags: destination - accumulator)
+            flag_bit(b, S0, XF, 6);
+            size_t ne = here(b); E(b, 0);
+            if (sz == 4) wr_reg(b, d, 0, T_B, 4);                           // equal: (32-bit accumulator: upper half cleared)
+            size_t end = here(b); E(b, 0);
+            patch_cbz(b, ne, 0, S0);
+            wr_reg(b, d, 0, T_A, sz);                                    // not equal: accumulator = destination
+            patch_b(b, end);
             return 0;
         }
         if (op == 0xB0 || op == 0xB1) {                                 // CMPXCHG
@@ -550,6 +761,8 @@ int xlat_insn(xlat_buf *b, const x86_insn *d, const uint8_t *code, uint64_t rip)
             patch_b(b, end);
             return 0;
         }
+        if (op == 0xA4 || op == 0xA5) { shld(b, d, 0, op == 0xA5, (int)d->imm, next); return 0; }   // SHLD
+        if (op == 0xAC || op == 0xAD) { shld(b, d, 1, op == 0xAD, (int)d->imm, next); return 0; }   // SHRD
         if (op == 0x1F || op == 0x0D || op == 0x18) return 0;            // NOP r/m, PREFETCH
         return -1;
     }

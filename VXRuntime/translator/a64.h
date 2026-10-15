@@ -68,6 +68,13 @@ static inline uint32_t a64_ldrb_reg(int t, int n, int m) { return 0x38606800u | 
 static inline uint32_t a64_stp_pre(int t1, int t2, int n, int imm) { return 0xA9800000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
 static inline uint32_t a64_ldp_post(int t1, int t2, int n, int imm) { return 0xA8C00000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
 
+// Atomics (LSE), acquire + release: CASAL s(expected; returns the old value), t(new), [n]; SWPAL s(new), t(old), [n]
+static inline uint32_t a64_lse_size(int size) { return (uint32_t)(size == 8 ? 3 : size == 4 ? 2 : size == 2 ? 1 : 0) << 30; }
+static inline uint32_t a64_casal(int size, int s, int t, int n) { return a64_lse_size(size) | 0x08E0FC00u | (uint32_t)s << 16 | (uint32_t)n << 5 | (uint32_t)t; }
+static inline uint32_t a64_swpal(int size, int s, int t, int n) { return a64_lse_size(size) | 0x38E08000u | (uint32_t)s << 16 | (uint32_t)n << 5 | (uint32_t)t; }
+
+static inline uint32_t a64_stlr(int t, int n) { return 0xC89FFC00u | (uint32_t)n << 5 | (uint32_t)t; }   // store-release, 64-bit
+
 // SIMD helpers for population count: FMOV d, x / CNT v.8b / ADDV b / UMOV w, v.b[0]
 static inline uint32_t a64_fmov_dx(int d, int n) { return 0x9E670000u | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_cnt8b(int d, int n) { return 0x0E205800u | (uint32_t)n << 5 | (uint32_t)d; }

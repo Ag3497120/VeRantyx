@@ -23,11 +23,17 @@ typedef struct {
 } x86_ctx;
 enum { CTX_FLAGS = 128, CTX_RIP = 136, CTX_FS = 144, CTX_GS = 152, CTX_FAULT = 160, CTX_HELPER_OP = 168, CTX_HELPER_VAL = 176 };
 enum { X86_FAULT_DE = 1 };
+// Registers of translated code that hold more than scratch values: x25 is the string instructions' step.
 
 typedef struct {
     uint32_t *code;
     size_t n, cap;
     int unsupported;             // set when an instruction cannot be translated (yet)
+    // LOCK on a read-modify-write of memory: the store becomes a compare-and-swap that starts the instruction over
+    // (from lock_head) if memory changed since it was read; lock_expect holds the value read.
+    int lock;
+    size_t lock_head;
+    int lock_expect;
 } xlat_buf;
 
 extern const uint8_t xlat_parity[256];

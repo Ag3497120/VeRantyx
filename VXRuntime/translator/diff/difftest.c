@@ -30,7 +30,8 @@ static uint64_t rnd_value(void) {                   // edge values half the time
 }
 
 // ---- the forms ------------------------------------------------------------------------------------------------------------------
-typedef struct { const char *name; int map; uint8_t op; int group; int imm; int no_mem; int no_byte_ops; } form;
+typedef struct { const char *name; int map; uint8_t op; int group; int imm; int no_mem; int no_byte_ops; int special; int prefix; } form;
+enum { SP_MOFFS = 1, SP_XLAT, SP_LEAVE, SP_STRING, SP_LOCK };   // special: how the case is set up; prefix: F3 / F2
 // imm: 0 none, 1 imm8, 2 imm16/32 (operand size), 4 imm for MOV r, imm (64 with REX.W); group: ModRM.reg fixed (-1: any)
 static const form forms[] = {
 #define ALU(nm, base) { nm " r/m8, r8", 0, base, -1, 0, 0, 0 }, { nm " r/m, r", 0, base + 1, -1, 0, 0, 0 }, \
@@ -69,6 +70,35 @@ static const form forms[] = {
     { "bt r/m, imm8", 1, 0xBA, 4, 1, 0, 0 }, { "bts r/m, imm8", 1, 0xBA, 5, 1, 0, 0 }, { "btr r/m, imm8", 1, 0xBA, 6, 1, 0, 0 }, { "btc r/m, imm8", 1, 0xBA, 7, 1, 0, 0 },
     { "xadd r/m8, r8", 1, 0xC0, -1, 0, 0, 0 }, { "xadd r/m, r", 1, 0xC1, -1, 0, 0, 0 },
     { "cmpxchg r/m8, r8", 1, 0xB0, -1, 0, 0, 0 }, { "cmpxchg r/m, r", 1, 0xB1, -1, 0, 0, 0 },
+    // phase 2b
+#define SH(g, nm) { nm " r/m8, imm8", 0, 0xC0, g, 1, 0, 0 }, { nm " r/m, imm8", 0, 0xC1, g, 1, 0, 0 }, { nm " r/m8, 1", 0, 0xD0, g, 0, 0, 0 }, \
+                  { nm " r/m, 1", 0, 0xD1, g, 0, 0, 0 }, { nm " r/m8, cl", 0, 0xD2, g, 0, 0, 0 }, { nm " r/m, cl", 0, 0xD3, g, 0, 0, 0 }
+    SH(2, "rcl"), SH(3, "rcr"),
+#undef SH
+    { "shld r/m, r, imm8", 1, 0xA4, -1, 1, 0, 1 }, { "shld r/m, r, cl", 1, 0xA5, -1, 0, 0, 1 },
+    { "shrd r/m, r, imm8", 1, 0xAC, -1, 1, 0, 1 }, { "shrd r/m, r, cl", 1, 0xAD, -1, 0, 0, 1 },
+    { "push r/m", 0, 0xFF, 6, 0, 0, 1 }, { "pop r/m", 0, 0x8F, 0, 0, 0, 1 },
+    { "leave", 0, 0xC9, -2, 0, 0, 1, SP_LEAVE },
+    { "mov al, moffs", 0, 0xA0, -2, 0, 0, 0, SP_MOFFS }, { "mov rax, moffs", 0, 0xA1, -2, 0, 0, 0, SP_MOFFS },
+    { "mov moffs, al", 0, 0xA2, -2, 0, 0, 0, SP_MOFFS }, { "mov moffs, rax", 0, 0xA3, -2, 0, 0, 0, SP_MOFFS },
+    { "xlat", 0, 0xD7, -2, 0, 0, 0, SP_XLAT },
+#define STR(nm, o, pfx) { nm, 0, o, -2, 0, 0, 0, SP_STRING, pfx }
+    STR("movsb", 0xA4, 0), STR("movs", 0xA5, 0), STR("rep movsb", 0xA4, 0xF3), STR("rep movs", 0xA5, 0xF3),
+    STR("cmpsb", 0xA6, 0), STR("cmps", 0xA7, 0), STR("repe cmpsb", 0xA6, 0xF3), STR("repe cmps", 0xA7, 0xF3),
+    STR("repne cmpsb", 0xA6, 0xF2), STR("repne cmps", 0xA7, 0xF2),
+    STR("stosb", 0xAA, 0), STR("stos", 0xAB, 0), STR("rep stosb", 0xAA, 0xF3), STR("rep stos", 0xAB, 0xF3),
+    STR("lodsb", 0xAC, 0), STR("lods", 0xAD, 0), STR("rep lodsb", 0xAC, 0xF3), STR("rep lods", 0xAD, 0xF3),
+    STR("scasb", 0xAE, 0), STR("scas", 0xAF, 0), STR("repe scasb", 0xAE, 0xF3), STR("repe scas", 0xAF, 0xF3),
+    STR("repne scasb", 0xAE, 0xF2), STR("repne scas", 0xAF, 0xF2),
+#undef STR
+#define LK(nm, map, o, g, imm, byteonly) { "lock " nm, map, o, g, imm, 0, 0, SP_LOCK }
+    LK("add m, r", 0, 0x01, -1, 0, 0), LK("or m, r", 0, 0x09, -1, 0, 0), LK("adc m, r", 0, 0x11, -1, 0, 0), LK("sbb m, r", 0, 0x19, -1, 0, 0),
+    LK("and m, r", 0, 0x21, -1, 0, 0), LK("sub m, r", 0, 0x29, -1, 0, 0), LK("xor m, r", 0, 0x31, -1, 0, 0), LK("add m8, r8", 0, 0x00, -1, 0, 0),
+    LK("add m, imm", 0, 0x81, 0, 2, 0), LK("sub m, imm8", 0, 0x83, 5, 1, 0), LK("and m, imm8", 0, 0x83, 4, 1, 0),
+    LK("not m", 0, 0xF7, 2, 0, 0), LK("neg m", 0, 0xF7, 3, 0, 0), LK("inc m", 0, 0xFF, 0, 0, 0), LK("dec m", 0, 0xFF, 1, 0, 0),
+    LK("bts m, r", 1, 0xAB, -1, 0, 0), LK("btr m, r", 1, 0xB3, -1, 0, 0), LK("btc m, r", 1, 0xBB, -1, 0, 0), LK("bts m, imm8", 1, 0xBA, 5, 1, 0),
+    LK("xadd m, r", 1, 0xC1, -1, 0, 0), LK("cmpxchg m, r", 1, 0xB1, -1, 0, 0), LK("cmpxchg m8, r8", 1, 0xB0, -1, 0, 0),
+#undef LK
 };
 // group: -1 any ModRM, -2 no ModRM, -3 register in the opcode, -4 cc in the opcode (ModRM), -5 cc (ModRM, r/m8),
 // -6 F3 prefix (ModRM)
@@ -77,15 +107,18 @@ static int is_byte_op(const form *f) {
     if (f->map == 0) {
         uint8_t o = f->op;
         if (o < 0x40) return !(o & 1);
+        if (f->special == SP_STRING) return !(o & 1);
         return o == 0x80 || o == 0x84 || o == 0x86 || o == 0x88 || o == 0x8A || o == 0xC6 || o == 0xB0 || o == 0xA8 ||
-               o == 0xF6 || o == 0xFE || o == 0xC0 || o == 0xD0 || o == 0xD2;
+               o == 0xF6 || o == 0xFE || o == 0xC0 || o == 0xD0 || o == 0xD2 || o == 0xA0 || o == 0xA2 || o == 0xD7;
     }
     return f->op == 0xC0 || f->op == 0xB0 || f->group == -5;
 }
 
+static uint64_t last_addr;                           // the memory operand's address of the last case (0: none)
 // Builds one instance of a form into c (bytes and a state whose memory operand points into the test memory).
 static void make_case(const form *f, dt_case *c, int *size_out) {
     memset(c, 0, sizeof *c);
+    last_addr = 0;
     for (int i = 0; i < 16; i++) c->in.gpr[i] = rnd_value();
     for (int i = 0; i < DT_BUF_SIZE; i++) c->mem[i] = (uint8_t)rnd();
     c->in.gpr[4] = DT_STACK;
@@ -95,6 +128,10 @@ static void make_case(const form *f, dt_case *c, int *size_out) {
     int sizesel = (int)(rnd() % 3);                         // 0: 32-bit, 1: 16-bit (66), 2: 64-bit (REX.W)
     if (byteop || f->no_byte_ops) sizesel = sizesel == 1 ? 0 : sizesel;
     if (f->op == 0x68 || f->op == 0x6A || f->op == 0x50 || f->op == 0x58) sizesel = 0;   // (64-bit stack operations)
+    if (f->special == SP_LOCK) *p++ = 0xF0;
+    if (f->prefix) *p++ = (uint8_t)f->prefix;
+    if (f->op == 0xFF && f->group == 6) sizesel = 0;                 // (PUSH/POP r/m: 64-bit)
+    if (f->op == 0x8F || f->special == SP_LEAVE || f->special == SP_XLAT) sizesel = 0;
     if (f->group == -6) *p++ = 0xF3;
     if (sizesel == 1) *p++ = 0x66;
     int rex = 0x40 | (sizesel == 2 ? 8 : 0);
@@ -103,7 +140,7 @@ static void make_case(const form *f, dt_case *c, int *size_out) {
     while (rm == 4) rm = (int)(rnd() % 16);
     int use_rex = (rex != 0x40) || (rnd() & 1);              // (without REX, byte registers 4-7 are AH CH DH BH)
     int has_modrm = f->group >= -1 || f->group == -4 || f->group == -5 || f->group == -6;
-    int mem = has_modrm && !f->no_mem && (f->no_mem == -1 || (rnd() % 3 == 0));
+    int mem = has_modrm && !f->no_mem && (f->no_mem == -1 || f->special == SP_LOCK || (rnd() % 3 == 0));
     if (f->no_mem == -1) mem = 1;                            // (LEA needs a memory operand)
     int base = 0, index = -1, mod = 3, scale = 0;
     if (mem) {
@@ -134,7 +171,8 @@ static void make_case(const form *f, dt_case *c, int *size_out) {
             if (mod == 2) { memcpy(p, &disp, 4); p += 4; }
             // The address lands in the middle of the test memory, below the stack.
             int64_t idx_v = index >= 0 ? (int64_t)(rnd() % 32) : 0;
-            c->in.gpr[base] = DT_BUF + 1024 + (rnd() % 512) - (uint64_t)((int64_t)disp + (idx_v << scale));
+            last_addr = DT_BUF + 1024 + (rnd() % 512);
+            c->in.gpr[base] = last_addr - (uint64_t)((int64_t)disp + (idx_v << scale));
             if (index >= 0) c->in.gpr[index] = (uint64_t)idx_v;
             // BT with a register bit offset reaches offset/8 bytes away: keep it small.
             if (f->map == 1 && (f->op == 0xA3 || f->op == 0xAB || f->op == 0xB3 || f->op == 0xBB)) c->in.gpr[reg] = (rnd() % 2048) - 1024;
@@ -142,7 +180,10 @@ static void make_case(const form *f, dt_case *c, int *size_out) {
     }
     int size = byteop ? 1 : sizesel == 1 ? 2 : sizesel == 2 ? 8 : 4;
     if (f->op == 0x68 || f->op == 0x6A || f->op == 0x50 || f->op == 0x58) size = 8;
-    if (f->imm == 1) *p++ = (uint8_t)rnd_value();
+    int shld16 = f->map == 1 && (f->op == 0xA4 || f->op == 0xA5 || f->op == 0xAC || f->op == 0xAD) && size == 2;
+    if (shld16 && (f->op == 0xA5 || f->op == 0xAD)) c->in.gpr[1] = (c->in.gpr[1] & ~0xFFull) | (rnd() % 17);   // (16-bit: count <= 16)
+    if (shld16 && f->imm == 1) *p++ = (uint8_t)(rnd() % 17);
+    else if (f->imm == 1) *p++ = (uint8_t)rnd_value();
     else if (f->imm == 2) { int n = size == 2 ? 2 : 4; uint32_t v = (uint32_t)rnd_value(); memcpy(p, &v, (size_t)n); p += n; }
     else if (f->imm == 4) { int n = size == 2 ? 2 : size == 8 ? 8 : 4; uint64_t v = rnd_value(); memcpy(p, &v, (size_t)n); p += n; }
     // Division: half the time a divisor and dividend that do not fault.
@@ -150,6 +191,17 @@ static void make_case(const form *f, dt_case *c, int *size_out) {
         c->in.gpr[2] = 0;
         if (!mem) c->in.gpr[rm] |= 1; else c->mem[1024] |= 1;
     }
+    if (f->special == SP_MOFFS) { uint64_t a = DT_BUF + 1024 + rnd() % 1024; memcpy(p, &a, 8); p += 8; }
+    if (f->special == SP_XLAT) c->in.gpr[3] = DT_BUF + 1024 + rnd() % 1024;
+    if (f->special == SP_LEAVE) c->in.gpr[5] = DT_STACK - 8 * (rnd() % 32);
+    if (f->special == SP_STRING) {
+        c->in.gpr[6] = DT_BUF + 512 + rnd() % 256; c->in.gpr[7] = DT_BUF + 1536 + rnd() % 256;
+        if (f->prefix) c->in.gpr[1] = rnd() % 20;
+        if (rnd() & 1) c->in.flags |= 0x400;                               // DF
+        if (f->op == 0xA6 || f->op == 0xA7) memcpy(c->mem + 1536, c->mem + 512, 512);   // (equal runs for REPE)
+        if ((f->op == 0xAE || f->op == 0xAF) && (rnd() & 1)) c->in.gpr[0] = c->mem[1600];
+    }
+    if (f->op == 0xA0 || f->op == 0xA1 || f->op == 0xA2 || f->op == 0xA3) size = byteop ? 1 : size;
     c->len = (uint32_t)(p - c->code);
     *size_out = size;
 }
@@ -164,6 +216,10 @@ static uint64_t undefined_flags(const x86_insn *d, const dt_state *in, int size)
         if ((op == 0xF6 || op == 0xF7) && (g == 4 || g == 5)) return SF | ZF | AF | PF;
         if ((op == 0xF6 || op == 0xF7) && (g == 6 || g == 7)) return CF | OF | SF | ZF | AF | PF;
         if (op == 0x69 || op == 0x6B) return SF | ZF | AF | PF;
+        if ((op == 0xC0 || op == 0xC1 || (op >= 0xD0 && op <= 0xD3)) && (g == 2 || g == 3)) {   // RCL RCR: OF for 1 only
+            int count = (op >= 0xD2 ? (int)(in->gpr[1] & 0xFF) : op >= 0xD0 ? 1 : (int)(uint8_t)d->imm) & (size == 8 ? 63 : 31);
+            return count == 1 ? 0 : OF;
+        }
         if (op == 0xC0 || op == 0xC1 || (op >= 0xD0 && op <= 0xD3)) {
             int count = op >= 0xD2 ? (int)(in->gpr[1] & 0xFF) : op >= 0xD0 ? 1 : (int)(uint8_t)d->imm;
             count &= size == 8 ? 63 : 31;
@@ -175,6 +231,10 @@ static uint64_t undefined_flags(const x86_insn *d, const dt_state *in, int size)
         }
     } else if (d->map == X86_MAP_0F) {
         if (op == 0xAF) return SF | ZF | AF | PF;
+        if (op == 0xA4 || op == 0xA5 || op == 0xAC || op == 0xAD) {
+            int count = (op == 0xA5 || op == 0xAD ? (int)(in->gpr[1] & 0xFF) : (int)(uint8_t)d->imm) & (size == 8 ? 63 : 31);
+            return count == 0 ? 0 : count == 1 ? AF : AF | OF;
+        }
         if ((op == 0xBC || op == 0xBD) && d->mandatory != 0xF3) return CF | OF | SF | AF | PF;
         if ((op == 0xBC || op == 0xBD) && d->mandatory == 0xF3) return OF | SF | AF | PF;
         if (op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB || op == 0xBA) return OF | SF | AF | PF;
@@ -241,7 +301,7 @@ int main(int argc, char **argv) {
 
     static dt_case c;
     static dt_result want, got;
-    long total = 0, bad_total = 0, forms_ok = 0, forms_bad = 0, unsupported = 0;
+    long total = 0, bad_total = 0, forms_ok = 0, forms_bad = 0, unsupported = 0, rosetta_deviations = 0;
     int nforms = (int)(sizeof forms / sizeof forms[0]);
     for (int fi = 0; fi < nforms; fi++) {
         const form *f = &forms[fi];
@@ -256,6 +316,9 @@ int main(int argc, char **argv) {
             if (run_translated(&c, &d, &got) < 0) { unsupported++; snprintf(first, sizeof first, "not translated"); bad++; break; }
             if (fwrite(&c, sizeof c, 1, out) != 1 || fflush(out) || fread(&want, sizeof want, 1, in) != 1) { fprintf(stderr, "ref_x86 stopped\n"); return 1; }
             ran++;
+            // Rosetta 2 deviates from x86 here (the translator does what x86 does): a 16-bit LOCK NEG across a 16-byte
+            // boundary updates the flags but does not store the result.
+            if (f->special == SP_LOCK && f->op == 0xF7 && f->group == 3 && size == 2 && (last_addr & 15) == 15) { rosetta_deviations++; continue; }
             uint64_t mask = ~undefined_flags(&d, &c.in, size) & 0x8D5;
             int diff = want.out.fault != got.out.fault;
             if (!diff && !want.out.fault) {
@@ -278,6 +341,8 @@ int main(int argc, char **argv) {
                                           (unsigned long long)want.out.gpr[i], (unsigned long long)got.out.gpr[i], (unsigned long long)c.in.gpr[i]);
                     if (memcmp(want.mem, got.mem, DT_BUF_SIZE)) snprintf(first + n, sizeof first - (size_t)n, "; memory differs");
                     if (getenv("DT_VERBOSE"))
+                        for (int i = 0; i < DT_BUF_SIZE; i++) if (want.mem[i] != got.mem[i]) fprintf(stderr, "    mem[%d] in %02x want %02x got %02x\n", i, c.mem[i], want.mem[i], got.mem[i]);
+                    if (getenv("DT_VERBOSE"))
                         for (int i = 0; i < 16; i++) fprintf(stderr, "    r%-2d in %016llx want %016llx got %016llx\n", i, (unsigned long long)c.in.gpr[i],
                                                              (unsigned long long)want.out.gpr[i], (unsigned long long)got.out.gpr[i]);
                 }
@@ -289,7 +354,7 @@ int main(int argc, char **argv) {
         else forms_ok++;
     }
     fclose(out); fclose(in);
-    printf("x86 -> ARM64 vs Rosetta: %d forms, %ld cases: %ld forms match, %ld differ (%ld cases)%s\n", nforms, total, forms_ok, forms_bad, bad_total,
-           unsupported ? " (some not translated)" : "");
+    printf("x86 -> ARM64 vs Rosetta: %d forms, %ld cases: %ld forms match, %ld differ (%ld cases)%s; %ld cases skipped where Rosetta deviates from x86\n",
+           nforms, total, forms_ok, forms_bad, bad_total, unsupported ? " (some not translated)" : "", rosetta_deviations);
     return forms_bad ? 1 : 0;
 }
