@@ -66,6 +66,9 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
 - **Where translated code runs: decided by measurement (phase 4).**
   - *In-process*: ordinary threads, 16 KB pages, no TSO: memory ordering comes from LRCPC (LDAPR) / STLR on accesses
     that can be shared, with analysis to leave stack and thread-local accesses plain.
+    Measured (M1 Max, 2026-10-15): a loop of two loads and a store costs 1.5-1.7x with LDAPR/STLR as with plain
+    LDR/STR (0.92-1.04 ns vs. 1.55-1.57 ns per iteration); what that means for whole programs depends on how many
+    accesses can stay plain (stack, thread-local) and is measured on game code next.
   - *In a virtual CPU* (Hypervisor.framework, one vCPU per game thread): hardware TSO and 4 KB guest pages, as
     Rosetta has them; leaving the guest costs 856 ns, so calls that need no answer (Direct3D 11 immediate-context
     calls, audio submits) go into rings the native side drains, and small functions (memory and string routines,
