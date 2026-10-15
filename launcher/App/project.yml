@@ -2,7 +2,7 @@
 # The full app embeds the same views and SteamLauncherKit through the Klepton project.
 name: AlyxLauncher
 options:
-  bundleIdPrefix: io.github.glovebox-vr
+  bundleIdPrefix: io.github.ag3497120.verantyx-standalone
   deploymentTarget:
     visionOS: "2.0"
 packages:
@@ -22,7 +22,7 @@ targets:
         product: GloveboxReports
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: io.github.glovebox-vr.launcher
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.ag3497120.verantyx-standalone.launcher
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: "Alyx"
         # Asked at Play (Controllers.swift); the same text as the game app's.

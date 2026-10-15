@@ -3,6 +3,11 @@ import SwiftUI
 /// Glovebox's look, as on glovebox.vision and the Mac installer: the orange of the logo's port for
 /// progress and done, white pill buttons, and the game's name set in type.
 enum Brand {
+    /// The name the launcher shows: this branch is VeRantyx Standalone, an unofficial build based on Glovebox.
+    static let name = "VeRantyx Standalone"
+    /// Glovebox's own services: stutter reports to its server and "a newer Glovebox is out" (GloveboxUpdate.swift).
+    /// They belong to official Glovebox, so this unofficial build neither asks for them nor contacts them.
+    static let upstreamServices = false
     static let orange = Color(red: 1, green: 0.624, blue: 0.18)        // #ff9f2e
     static let link = Color(red: 1, green: 0.765, blue: 0.478)
 }
@@ -12,7 +17,7 @@ struct GloveboxChip: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(uiImage: GloveboxArt.mark).resizable().frame(width: 32, height: 32)
-            Text("Glovebox").font(.title3.weight(.bold))
+            Text(Brand.name).font(.title3.weight(.bold))
         }
         .padding(.leading, 6).padding(.trailing, 18).padding(.vertical, 6)
         .glassBackgroundEffect()

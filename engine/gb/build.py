@@ -26,6 +26,15 @@ K = os.path.join(ROOT, "klepton")
 V = os.path.join(K, "visionos")
 GUEST_DIR = "build/glovebox-guest"  # relative to klepton/visionos, where gen_xcodeproj.py resolves it
 
+# This branch builds VeRantyx Standalone, an unofficial build based on Glovebox. Its name (the default work folder,
+# beside the Mac app's own) and the headset app's bundle id prefix are its own, so it never shares a work folder with,
+# or installs over, official Glovebox's app and data. The headset bundle id is still per team (bundle_id_for).
+PRODUCT = "VeRantyx Standalone"
+BUNDLE_ID_PREFIX = "io.github.ag3497120.verantyx-standalone.alyx"
+# Stutter reports: Glovebox's server belongs to official Glovebox and its data to official builds, so this build
+# sends none (empty endpoint: the headset's uploader has nowhere to send, and the build carries the answer "no").
+REPORTS_ENDPOINT = ""
+
 
 class StepError(Exception):
     pass
@@ -44,7 +53,7 @@ def glovebox_version():
 
 
 def default_work(package):
-    return os.environ.get("GLOVEBOX_WORK") or os.path.expanduser(f"~/Library/Application Support/Glovebox/{package}")
+    return os.environ.get("GLOVEBOX_WORK") or os.path.expanduser(f"~/Library/Application Support/{PRODUCT}/{package}")
 
 
 def _sha256(path):
@@ -260,7 +269,7 @@ def defaults(package, work, foz_path, emit):
                 # before the game starts
                 "KL_VK_DEVICE_INFO=auto\n")
         # the player's answer to "share stutter reports?" from the Mac app (unset: the headset launcher asks)
-        share = os.environ.get("GLOVEBOX_SHARE_STUTTERS", "")
+        share = os.environ.get("GLOVEBOX_SHARE_STUTTERS", "") if REPORTS_ENDPOINT else "0"
         if share in ("0", "1"):
             # when it was answered (the Mac app passes it; else the build time): a newer answer given on the headset
             # wins over it, and this one wins over an older headset answer
@@ -303,9 +312,10 @@ end, nil)
     kit_meta = os.path.join(work, "kit.json")
     info = {"glovebox": glovebox_version(),
             "kit": json.load(open(kit_meta))["kit"] if os.path.exists(kit_meta) else "dev",
-            "endpoint": "https://glovebox-reports.vercel.app/api/report"}
+            "endpoint": REPORTS_ENDPOINT}
     json.dump(info, open(os.path.join(demo, "glovebox.json"), "w"), indent=1)
-    share = {"1": "yes", "0": "no"}.get(os.environ.get("GLOVEBOX_SHARE_STUTTERS", ""), "ask on the headset")
+    share = {"1": "yes", "0": "no"}.get(os.environ.get("GLOVEBOX_SHARE_STUTTERS", "") if REPORTS_ENDPOINT else "0",
+                                        "ask on the headset")
     tex_txt = (f"texture cap {tex}" + (f", texture pool {pool} MB" if pool else "")
                + (f", floor {bias_min:.1f}" if bias_min else ""))
     emit("step", step="defaults", status="ok", detail=f"settings ({tex_txt}, stutter reports: {share})")
@@ -325,7 +335,7 @@ def translate(work, emit):
 # ---- app ----
 
 def bundle_id_for(team):
-    return f"com.glovebox.alyx.t{team.lower()}"
+    return f"{BUNDLE_ID_PREFIX}.t{team.lower()}"
 
 
 def signing_identities(team, find_certs=None, valid_ids=None):

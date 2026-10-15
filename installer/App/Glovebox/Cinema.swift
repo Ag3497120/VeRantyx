@@ -85,7 +85,7 @@ struct GloveboxChip: View {
     var body: some View {
         HStack(spacing: 7) {
             Image("GloveboxMark").resizable().frame(width: 22, height: 22)
-            Text("Glovebox").font(.system(size: 14, weight: .bold))
+            Text(AppName.shown).font(.system(size: 14, weight: .bold))
         }
         .foregroundStyle(.white)
         .padding(.leading, 4)

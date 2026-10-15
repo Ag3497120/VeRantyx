@@ -23,6 +23,9 @@
 # It publishes nothing itself: it ends by listing the files to upload.
 
 set -euo pipefail
+# VeRantyx Standalone (this branch) is an unofficial build: it is not signed, notarized or published as a Glovebox
+# release, and must never be attached to glovebox-vr/glovebox's releases or signed with its update key.
+echo "This branch (VeRantyx Standalone) has no release flow: build it locally (README.md)."; exit 1
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 PROFILE="${GLOVEBOX_NOTARY_PROFILE:-glovebox-notary}"

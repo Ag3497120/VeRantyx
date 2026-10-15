@@ -1,7 +1,7 @@
 {
   "id": "alyx",
   "game": "Half-Life: Alyx",
-  "app_name": "Glovebox: HLA",
+  "app_name": "VeRantyx: HLA",
   "icon": "icon/",
   "steam": {
     "app": 546560,
@@ -31,7 +31,7 @@
   "pipelines": "pipelines/",
   "requires": {
     "headset": "Apple Vision Pro (tested on M5 and M2)",
-    "controllers": "PlayStation VR2 Sense controllers",
+    "controllers": "PlayStation VR2 Sense controllers, Joy-Con (pose from hand tracking) or hand tracking alone",
     "developer_program": "a free Apple Account or the paid program (free teams get the Increased Memory Limit the game needs; a free install lasts 7 days, a paid one a year)"
   }
 }

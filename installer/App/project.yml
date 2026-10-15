@@ -1,7 +1,9 @@
 # XcodeGen spec for the Glovebox Mac installer (`brew install xcodegen && xcodegen`).
+# This branch builds it as VeRantyx Standalone, an unofficial build based on Glovebox: the name the app shows is
+# PRODUCT_DISPLAY_NAME below, and its identifiers are VeRantyx's, so it never replaces or updates as official Glovebox.
 name: Glovebox
 options:
-  bundleIdPrefix: io.github.glovebox-vr
+  bundleIdPrefix: io.github.ag3497120.verantyx-standalone
   deploymentTarget:
     macOS: "15.0"
 packages:
@@ -16,10 +18,16 @@ settings:
   base:
     MARKETING_VERSION: "0.1.5"
     CURRENT_PROJECT_VERSION: "1"
+    # The app's name everywhere it shows (menu bar, Finder, the window, the app's own folders), kept in this one place.
+    PRODUCT_DISPLAY_NAME: "VeRantyx Standalone"
     # Where Sparkle looks for new versions, and the public half of the EdDSA key that signs them
     # (scripts/release.sh). Updates stay off until the key is set.
-    GLOVEBOX_APPCAST_URL: "https://github.com/glovebox-vr/glovebox/releases/latest/download/appcast.xml"
-    GLOVEBOX_SPARKLE_KEY: "TZcIH8qsRTrYYIG6eWvrZaVLZUxh0yp4zyuEpX7Or2M="
+    # VeRantyx Standalone: both empty, so Sparkle never starts (GloveboxApp.swift's Updater) and "Check for Updates…"
+    # stays disabled. Upstream's feed and key were official Glovebox's: an update signed with that key would have
+    # installed official Glovebox over this build, dropping the Joy-Con and hand-tracking input. There is no feed of
+    # this build's own (it isn't distributed as a signed app); update it by building a newer checkout of this branch.
+    GLOVEBOX_APPCAST_URL: ""
+    GLOVEBOX_SPARKLE_KEY: ""
     # The Steam session's keychain item; empty is the "(dev)" one. release.sh sets the real name.
     GLOVEBOX_KEYCHAIN_SERVICE: ""
 targets:
@@ -38,16 +46,16 @@ targets:
     info:
       path: Glovebox/Info.plist
       properties:
-        CFBundleDisplayName: Glovebox
-        CFBundleName: Glovebox
+        CFBundleDisplayName: $(PRODUCT_DISPLAY_NAME)
+        CFBundleName: $(PRODUCT_DISPLAY_NAME)
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSApplicationCategoryType: public.app-category.utilities
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
-        NSHumanReadableCopyright: "Open source. Not affiliated with Valve or Apple."
+        NSHumanReadableCopyright: "Unofficial build based on Glovebox (MIT, the Glovebox contributors). Not affiliated with Glovebox, Valve or Apple."
         SUFeedURL: $(GLOVEBOX_APPCAST_URL)
         SUPublicEDKey: $(GLOVEBOX_SPARKLE_KEY)
-        SUEnableAutomaticChecks: true
+        SUEnableAutomaticChecks: false
         # The keychain item for the Steam session: only release.sh sets it (empty: the "(dev)" one, SteamKeychain)
         GloveboxKeychainService: $(GLOVEBOX_KEYCHAIN_SERVICE)
         # Steam's content servers without HTTPS (its list for China has some) are fetched over HTTP, as Steam's own
@@ -59,8 +67,11 @@ targets:
       properties: {}
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: io.github.glovebox-vr.installer
-        PRODUCT_NAME: Glovebox
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.ag3497120.verantyx-standalone.installer
+        # The .app and its executable carry the display name, so it can't land on (or be mistaken for) an official
+        # Glovebox.app in /Applications; the Swift module keeps upstream's name.
+        PRODUCT_NAME: $(PRODUCT_DISPLAY_NAME)
+        PRODUCT_MODULE_NAME: Glovebox
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_STYLE: Automatic
         SWIFT_VERSION: "5.0"
@@ -89,7 +100,7 @@ targets:
           elif [ "$CONFIGURATION" = "Debug" ]; then
             mkdir -p "$res/engine" && cp "$SRCROOT/../FakeEngine/glovebox" "$res/engine/glovebox"
           else
-            echo "error: no Glovebox source (set GLOVEBOX_SRC to a glovebox-vr/glovebox checkout)"; exit 1
+            echo "error: no Glovebox source (set GLOVEBOX_SRC to a checkout of this branch)"; exit 1
           fi
           # Notarization needs every binary signed: sign the engine's with the app's identity.
           if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "$EXPANDED_CODE_SIGN_IDENTITY" != "-" ]; then

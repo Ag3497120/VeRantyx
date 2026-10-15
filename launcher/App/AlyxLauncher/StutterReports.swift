@@ -11,7 +11,7 @@ enum StutterReports {
 
     /// Sends this launch's report, once per app run.
     @MainActor static func start() {
-        guard !started else { return }
+        guard Brand.upstreamServices, !started else { return }
         started = true
         let docs = StutterSharing.consentFile.deletingLastPathComponent().deletingLastPathComponent()
         // off the main thread: a pass reads the pipeline recording and hashes its shaders

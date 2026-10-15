@@ -10,12 +10,13 @@ build options (environment):
   GLOVEBOX_GAME   the depot's game/ folder if it is already on disk (else the Steam download step provides it)
   GLOVEBOX_KIT    the runtime kit, a folder or .zip (else kit/ or glovebox-kit.zip beside the engine, as the app
                   bundles it)
-  GLOVEBOX_WORK   where everything for this package goes (default ~/Library/Application Support/Glovebox/alyx)
+  GLOVEBOX_WORK   where everything for this package goes (default ~/Library/Application Support/VeRantyx Standalone/alyx)
   GLOVEBOX_TEAM   the team to sign for (default: the paid team in Xcode's account settings, else the free one)
   GLOVEBOX_FREE_TEAM  0: refuse a free Personal Team. Default: allowed. Its build keeps the memory limit (Apple gives
                   free teams Increased Memory Limit) and drops Extended Virtual Addressing (paid teams only, and
                   not needed: a free build can reserve 64 GB at once on the headset); its profile lasts 7 days
-  GLOVEBOX_SHARE_STUTTERS  1 / 0: the player's answer to sharing stutter reports (unset: the headset asks)
+  GLOVEBOX_SHARE_STUTTERS  1 / 0: the player's answer to sharing stutter reports (unset: the headset asks; ignored,
+                  always 0, while gb/build.py's REPORTS_ENDPOINT is empty, as on this unofficial branch)
   GLOVEBOX_APP_PID  the Glovebox app that started this run: when it's gone, the run stops with everything it started
   --unsigned      build without signing (CI, and checking a build without touching an Apple account)
 

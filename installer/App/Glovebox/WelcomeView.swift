@@ -18,6 +18,8 @@ struct WelcomePage: View {
                     NeedRow(symbol: "visionpro.fill", text: "Apple Vision Pro (M2 or M5)")
                     if model.recipe.needsSenseControllers {
                         NeedRow(symbol: "gamecontroller.fill", text: "PSVR2 controllers")
+                    } else {
+                        NeedRow(symbol: "gamecontroller.fill", text: "PSVR2 controllers, Joy-Con or just your hands")
                     }
                     NeedRow(symbol: "checkmark.seal.fill", text: "\(model.recipe.title) in your Steam library")
                 }
@@ -29,7 +31,7 @@ struct WelcomePage: View {
             }
         }
         .overlay(alignment: .bottomTrailing) {
-            Text("Open source. Not affiliated with Valve or Apple.")
+            Text("Unofficial build based on Glovebox. Not affiliated with Glovebox, Valve or Apple.")
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(.white.opacity(0.5))
                 .padding(.bottom, 4)

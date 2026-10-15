@@ -52,7 +52,7 @@ enum Diagnostics {
         var lines: [String] = []
         lines.append("Glovebox diagnostics, \(ISO8601DateFormatter().string(from: Date()))")
         lines.append("")
-        lines.append("Glovebox \(info.glovebox ?? "?") (kit \(info.kit ?? "?")), app \(version) (\(build))")
+        lines.append("\(Brand.name), unofficial, based on Glovebox \(info.glovebox ?? "?") (kit \(info.kit ?? "?")), app \(version) (\(build))")
         lines.append("Headset: \(model), \(ProcessInfo.processInfo.operatingSystemVersionString)")
         lines.append("Memory: \(memory) GB, \(left) MB left for Glovebox now; heat \(heat) of 3; \(free) free")
         lines.append("Apple team: \(signing)")

@@ -19,7 +19,7 @@ struct GloveboxApp: App {
     }
 
     var body: some Scene {
-        Window("Glovebox", id: "main") {
+        Window(AppName.shown, id: "main") {
             RootView()
                 .environmentObject(model)
                 .environmentObject(model.steam)
@@ -41,7 +41,11 @@ struct GloveboxApp: App {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(replacing: .help) {
                 Button("Copy Diagnostics") { model.copyDiagnostics() }
-                Button("Glovebox Website") { NSWorkspace.shared.open(URL(string: "https://glovebox.vision")!) }
+                Button("\(AppName.shown) on GitHub") {
+                    NSWorkspace.shared.open(URL(string: "https://github.com/Ag3497120/VeRantyx/tree/standalone")!)
+                }
+                // Credit where this build comes from: upstream's site, which is official Glovebox's, not this build's.
+                Button("Glovebox (Upstream) Website") { NSWorkspace.shared.open(URL(string: "https://glovebox.vision")!) }
             }
         }
         Window("Licenses", id: "licenses") {
@@ -84,6 +88,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 /// Sparkle 2: checks the appcast on the latest GitHub release daily, and installs an update only if it's
 /// signed with our EdDSA key and by the same Developer ID. Off until a key is configured.
+/// VeRantyx Standalone: no key and no feed (project.yml), so this stays off and official Glovebox updates can never
+/// replace this build.
 @MainActor
 final class Updater: ObservableObject {
     @Published var canCheck = false

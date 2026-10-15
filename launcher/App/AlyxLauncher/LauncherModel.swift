@@ -52,9 +52,11 @@ final class LauncherModel: ObservableObject {
     @Published var preparing: Preparing?
     /// May the headset send stutter reports (StutterSharing.swift): nil until someone answers, on
     /// the Mac or here.
-    @Published var shareStutters: Bool? = StutterSharing.choice
-    /// A newer Glovebox release than this app was built from (GloveboxUpdate.swift), or nil.
-    @Published var gloveboxUpdate: String? = GloveboxUpdateCheck.known
+    /// Always no, never asked, without Glovebox's services (Brand.upstreamServices).
+    @Published var shareStutters: Bool? = Brand.upstreamServices ? StutterSharing.choice : false
+    /// A newer Glovebox release than this app was built from (GloveboxUpdate.swift), or nil. Never set without
+    /// Glovebox's services: an official release is not an update for this unofficial build.
+    @Published var gloveboxUpdate: String? = Brand.upstreamServices ? GloveboxUpdateCheck.known : nil
 
     enum Saves: Equatable {
         case syncing(CloudSync.Progress)
@@ -93,7 +95,7 @@ final class LauncherModel: ObservableObject {
     /// before any window (and model) exists, when the system wakes the app for finished downloads.
     /// Named after the app, so each player's own build (its bundle id carries their team) has its own.
     nonisolated static let backgroundFetcher = BackgroundChunkFetcher(
-        identifier: (Bundle.main.bundleIdentifier ?? "io.github.glovebox-vr.launcher") + ".chunks",
+        identifier: (Bundle.main.bundleIdentifier ?? "io.github.ag3497120.verantyx-standalone.launcher") + ".chunks",
         installRoot: defaultInstallRoot)
 
     init(profile: GameProfile = .halfLifeAlyx, installRoot: URL = LauncherModel.defaultInstallRoot) {
@@ -330,7 +332,7 @@ final class LauncherModel: ObservableObject {
 
     /// Asks whether a newer Glovebox is out (GloveboxUpdateCheck), when the last answer is a few hours old.
     func checkForGloveboxUpdate() {
-        guard !checkingForGloveboxUpdate else { return }
+        guard Brand.upstreamServices, !checkingForGloveboxUpdate else { return }
         checkingForGloveboxUpdate = true
         Task {
             let newer = await GloveboxUpdateCheck.refresh()

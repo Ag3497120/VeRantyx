@@ -235,8 +235,10 @@ struct LibraryView: View {
 
     private var accountMenu: some View {
         Menu {
-            Toggle("Help Improve Glovebox", isOn: Binding(get: { model.shareStutters ?? false },
-                                                          set: { model.setShareStutters($0) }))
+            if Brand.upstreamServices {
+                Toggle("Help Improve Glovebox", isOn: Binding(get: { model.shareStutters ?? false },
+                                                              set: { model.setShareStutters($0) }))
+            }
             Button("Share Diagnostics") { showDiagnostics = true }
             Button("Licenses") { showLicenses = true }
             Button("Sign out", role: .destructive) { model.signOut() }

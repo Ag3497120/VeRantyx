@@ -34,9 +34,13 @@ public struct Engine: Sendable {
                               developerDir: String? = nil) -> Engine? {
         let fm = FileManager.default
         let library = fm.urls(for: .libraryDirectory, in: .userDomainMask).first ?? fm.temporaryDirectory
+        // Named after the app (CFBundleName), so an unofficial build such as VeRantyx Standalone never shares its
+        // source copy (source/<version>, the same version as the official app's), work folder or logs with an
+        // official Glovebox on the same Mac.
+        let folder = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Glovebox"
         let home = environment["GLOVEBOX_HOME"].map { URL(fileURLWithPath: $0) }
-            ?? library.appendingPathComponent("Application Support/Glovebox", isDirectory: true)
-        let logs = library.appendingPathComponent("Logs/Glovebox", isDirectory: true)
+            ?? library.appendingPathComponent("Application Support/\(folder)", isDirectory: true)
+        let logs = library.appendingPathComponent("Logs/\(folder)", isDirectory: true)
         var env: [String: String] = [:]
         if let d = developerDir { env["DEVELOPER_DIR"] = d }
         // The engine finds the kit the app bundles (glovebox-kit.zip at the source root) by itself.

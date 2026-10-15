@@ -306,11 +306,13 @@ struct HomePage: View {
 
     private var card: some View {
         StepCard(title: title, subtitle: subtitle) {
-            Toggle("Help improve Glovebox", isOn: Binding(get: { model.shareStutters ?? false }, set: { model.setShareStutters($0) }))
-                .toggleStyle(.switch)
+            if InstallerModel.upstreamServices {
+                Toggle("Help improve Glovebox", isOn: Binding(get: { model.shareStutters ?? false }, set: { model.setShareStutters($0) }))
+                    .toggleStyle(.switch)
+            }
         } footer: {
             Button("Copy Diagnostics") { model.copyDiagnostics() }.textLink()
-            if !model.newsSignedUp && !model.askingForNews {
+            if InstallerModel.upstreamServices && !model.newsSignedUp && !model.askingForNews {
                 Button("Get News by Email") { model.askForNews() }.textLink()
             }
             Spacer()
