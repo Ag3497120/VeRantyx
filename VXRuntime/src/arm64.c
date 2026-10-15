@@ -268,6 +268,25 @@ int vx_arm64_state_at(const void *ucv, void *outv) {
     return 1;
 }
 
+// vCPU: a thread SuspendThread stopped in the guest (translator/vcpu.c), from the guest's registers as above; in
+// guest.c's code (a call it answers), as just returned from that call (the call stored the state first).
+void vx_thread_park_state(const void *state);                 // sync.c
+static void vcpu_interrupted(x86_ctx *c, const xv_regs *r) {
+    static __thread x86_ctx *s;
+    if (!s) s = calloc(1, sizeof *s);
+    *s = *c;
+    if (xe_owns(g_engine, r->pc) && !xe_in_guest(g_engine, r->pc)) {
+        uint64_t rip = xe_rip_at(g_engine, r->pc);
+        for (int i = 0; i < 16; i++) { s->gpr[i] = r->x[i]; memcpy(s->xmm[i], r->q[i], 16); }
+        s->flags = r->x[27]; s->ras = r->x[29];
+        s->rip = rip ? rip : r->x[17];
+    } else if (s->gpr[4]) {
+        s->rip = *(const uint64_t *)(uintptr_t)s->gpr[4]; s->gpr[4] += 8;
+    }
+    vx_thread_park_state(s);
+}
+int vx_arm64_interrupt(void) { return xv_interrupt(); }
+
 // ---- faults -----------------------------------------------------------------------------------------------------
 static __thread uint64_t t_fault[2];                          // the access fault being dispatched: write?, address
 static void __attribute__((noreturn)) fault_entry(void) { vx_seh_fault(0xC0000005, 2, t_fault); }
@@ -348,6 +367,7 @@ void vx_arm64_init(void) {
         g_engine = xe_new_vcpu();
         void vxvm_set_hook(void (*)(uint64_t, uint64_t));             // (src/vm_hooks.c: memory going away leaves the guest)
         vxvm_set_hook(xv_unmap);
+        xv_set_interrupt_hook(vcpu_interrupted);
         if (!getenv("VXRT_VCPU_NO_GUEST")) xe_set_guest(g_engine, guest_find);
     }
     else g_engine = xe_new(!getenv("VXRT_ORDERED") || atoi(getenv("VXRT_ORDERED")) != 0);

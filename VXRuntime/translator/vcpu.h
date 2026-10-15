@@ -38,6 +38,12 @@ void xv_set_depth(int depth);
 void xv_unmap(uint64_t va, uint64_t len);                   // host memory going away: out of the guest
 void xv_refresh(uint64_t va, uint64_t len);                 // ... or replaced unseen: out if its VM object changed
 void xv_protect(uint64_t page, int read_only);             // a host page's guest mappings read-only (SMC) or not
+// SuspendThread (src/sync.c's signal, on the thread itself): a thread in the guest leaves it, and the hook gets the
+// guest's registers (between runs: r NULL, the context holds the state); xv_interrupt from the signal handler: 1 if
+// the thread was in the guest (the hook runs as it leaves), 0 (stop it where it is).
+typedef struct { uint64_t x[31], pc; uint8_t q[16][16]; } xv_regs;
+void xv_set_interrupt_hook(void (*hook)(x86_ctx *c, const xv_regs *r));
+int xv_interrupt(void);
 void xv_set_write_hook(int (*hook)(uint64_t pc, uint64_t addr));   // a write fault the program did not make: 1 handled
 void xv_set_tlbi(uint64_t stub);                            // guest code: TLBI, DSB, ISB, HVC #XV_HVC_TLBI
 // Makes host memory [va, va + len) the guest's at the same address (else it is mapped when first touched).

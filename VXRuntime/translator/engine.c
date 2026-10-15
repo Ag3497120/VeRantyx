@@ -474,4 +474,5 @@ uint64_t xe_rip_at(const xe *e, uint64_t pc) {
     while (lo < hi) { size_t mid = (lo + hi) / 2; if (e->imap[mid].host <= pc) lo = mid + 1; else hi = mid; }
     return lo ? e->imap[lo - 1].rip : 0;
 }
+int xe_in_guest(const xe *e, uint64_t pc) { return e && pc >= e->guest_base && pc < e->guest_end; }
 int xe_owns(const xe *e, uint64_t pc) { return e && pc >= (uint64_t)(uintptr_t)e->code && pc < (uint64_t)(uintptr_t)(e->code + e->cap); }

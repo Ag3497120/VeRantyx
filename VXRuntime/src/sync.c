@@ -381,16 +381,33 @@ static WINAPI DWORD GetThreadId(HANDLE h) {
 // GetThreadContext reads what it saved; it takes no lock, as the stopped thread may hold one of the runtime's.
 #define CONTEXT_SIZE 0x4d0
 void vx_context_from_signal(void *out, const void *uc);                 // seh.c
-static void on_suspend_signal(int sig, siginfo_t *si, void *uc) {
-    (void)sig; (void)si;
-    vx_object *t = t_self;
-    if (!t || !t->context) return;
-    int saved = errno;
-    vx_context_from_signal(t->context, uc);
+static void park(vx_object *t) {                                        // (t->context saved: stopped till resumed)
     __atomic_store_n(&t->parked, 1, __ATOMIC_RELEASE);
     semaphore_signal(t->parked_sem);
     while (__atomic_load_n(&t->suspended, __ATOMIC_ACQUIRE)) semaphore_wait(t->resume_sem);
     __atomic_store_n(&t->parked, 0, __ATOMIC_RELEASE);
+}
+#ifdef __aarch64__
+int vx_arm64_interrupt(void);                                           // arm64.c
+void vx_context_from_state(void *out, const void *state);               // seh.c
+// A thread SuspendThread stopped in the vCPU guest, as it left it (src/arm64.c): its x86 state.
+void vx_thread_park_state(const void *state) {
+    vx_object *t = t_self;
+    if (!t || !t->context) return;
+    vx_context_from_state(t->context, state);
+    park(t);
+}
+#endif
+static void on_suspend_signal(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)si;
+    vx_object *t = t_self;
+    if (!t || !t->context) return;
+#ifdef __aarch64__
+    if (vx_arm64_interrupt()) return;                                   // (in the vCPU guest: it stops as it leaves)
+#endif
+    int saved = errno;
+    vx_context_from_signal(t->context, uc);
+    park(t);
     errno = saved;
 }
 static void suspend_signal_setup(void) {

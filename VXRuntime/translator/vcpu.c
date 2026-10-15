@@ -204,6 +204,8 @@ int xv_map(uint64_t va, uint64_t len) {
 static __thread hv_vcpu_t t_vcpu;
 static __thread hv_vcpu_exit_t *t_exit;
 static __thread int t_have, t_depth;
+static __thread volatile int t_in_run, t_interrupt;                 // (xv_interrupt)
+static void (*g_interrupt_hook)(x86_ctx *, const xv_regs *);
 static __thread uint64_t t_gen, t_resume;
 static __thread uint64_t t_fault_pc, t_fault_addr;
 static __thread int t_fault_write;
@@ -281,6 +283,24 @@ static void print_stats(void) {
 }
 static int g_stats = -1;
 #define DBG(...) do { if (getenv("XV_DEBUG")) { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+void xv_set_interrupt_hook(void (*hook)(x86_ctx *, const xv_regs *)) { g_interrupt_hook = hook; }
+int xv_interrupt(void) {
+    if (!t_have || !t_in_run || !g_interrupt_hook) return 0;
+    t_interrupt = 1;
+    hv_vcpus_exit(&t_vcpu, 1);                                             // (hv_vcpu_run returns: canceled)
+    return 1;
+}
+static void interrupted(x86_ctx *c) {                                     // (after a run: the guest's registers)
+    xv_regs r;
+    for (int i = 0; i < 31; i++) hv_vcpu_get_reg(t_vcpu, (hv_reg_t)(HV_REG_X0 + i), &r.x[i]);
+    hv_vcpu_get_reg(t_vcpu, HV_REG_PC, &r.pc);
+    if (t_resume) r.pc = t_resume;                                         // (in the TLB flush on the way back)
+    for (int i = 0; i < 16; i++) {
+        hv_simd_fp_uchar16_t v; hv_vcpu_get_simd_fp_reg(t_vcpu, (hv_simd_fp_reg_t)(HV_SIMD_FP_REG_Q0 + i), &v);
+        memcpy(r.q[i], &v, 16);
+    }
+    g_interrupt_hook(c, &r);
+}
 int xv_enter(x86_ctx *c, uint64_t enter, uint64_t vectors) {
     DBG("xv_enter ctx %p enter %#llx vectors %#llx", (void *)c, (unsigned long long)enter, (unsigned long long)vectors);
     if (!t_have && !vcpu_setup(vectors)) { fprintf(stderr, "[vxrt] vcpu: cannot make a vCPU\n"); return -1; }
@@ -305,7 +325,11 @@ int xv_enter(x86_ctx *c, uint64_t enter, uint64_t vectors) {
             hv_vcpu_get_reg(t_vcpu, HV_REG_PC, &t_resume);
             hv_vcpu_set_reg(t_vcpu, HV_REG_PC, g_tlbi);
         }
-        if (hv_vcpu_run(t_vcpu) != HV_SUCCESS) { fprintf(stderr, "[vxrt] vcpu: run failed\n"); break; }
+        t_in_run = 1;
+        hv_return_t ran = hv_vcpu_run(t_vcpu);
+        t_in_run = 0;
+        if (t_interrupt) { t_interrupt = 0; interrupted(c); }               // (SuspendThread: stopped there till resumed)
+        if (ran != HV_SUCCESS) { fprintf(stderr, "[vxrt] vcpu: run failed\n"); break; }
         DBG("exit reason %d", (int)t_exit->reason);
         if (t_exit->reason != HV_EXIT_REASON_EXCEPTION) continue;            // (canceled, timer: on)
         uint64_t syndrome = t_exit->exception.syndrome, ec = syndrome >> 26;

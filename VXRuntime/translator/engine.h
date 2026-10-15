@@ -38,6 +38,7 @@ void xe_forget(xe *e, uint64_t addr, uint64_t len);
 int xe_fix_split(xe *e, void *uc);
 // Whether pc is in the engine's translated code.
 int xe_owns(const xe *e, uint64_t pc);
+int xe_in_guest(const xe *e, uint64_t pc);   // vCPU: pc in guest.c's code (a call the guest answers)
 // Forgets every translation (the code it came from changed). Not while another thread runs translated code.
 void xe_flush(xe *e);
 // Runs from ctx->rip until the code reaches stop (0), an x86 exception (ctx->fault, RIP at the instruction), or an

@@ -78,6 +78,10 @@ static int suspend_ok(void) {
     LONG a = spins; Sleep(30); LONG b = spins;             // stopped: no progress
     CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_FULL;
     ok = ok && GetThreadContext(t, &c) && c.Rsp && c.Rip && a == b;
+    // (stopped in its loop: the program's own registers, not the runtime's)
+    int in_loop = c.Rip >= (DWORD64)(uintptr_t)spinner && c.Rip < (DWORD64)(uintptr_t)spinner + 64;
+    if (!in_loop) printf("suspended thread: rip %#llx, spinner at %p\n", (unsigned long long)c.Rip, (void *)spinner);
+    ok = ok && in_loop;
     ok = ok && ResumeThread(t) == 1;
     Sleep(30);
     ok = ok && spins > b;                                    // running again

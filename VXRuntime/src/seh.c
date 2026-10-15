@@ -653,6 +653,14 @@ void vx_context_from_signal(void *out, const void *ucv) {
     context_from(c, x, x->rip, x->gpr[RSP]);
     if (flags) c->flags = flags;
 }
+// ... from an x86 state (a thread SuspendThread stopped in the vCPU guest: src/arm64.c).
+void vx_context_from_state(void *out, const void *state) {
+    const x86_ctx *x = state;
+    CONTEXT *c = out;
+    DWORD flags = c->flags;
+    context_from(c, x, x->rip, x->gpr[RSP]);
+    if (flags) c->flags = flags;
+}
 #endif
 
 // abort() from macOS code (malloc's checks, libc++): where from, with the program's frames named (VXRT_TRACE).
