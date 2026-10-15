@@ -92,7 +92,15 @@ def game_info(g, lang):
     return {"appid": g["appid"], "name": g["name"], "exe": os.path.relpath(g["exe"], g["folder"]), "folder": g["folder"],
             "size_gb": round(g["size"] / 2**30, 1), "engine": engine, "anticheat": sorted(set(anticheat)),
             "status": status, "note": ja if lang == "ja" else en, "last_run": last_run(g["exe"]),
-            "known_issues": [k["summary"] for k in prof["known_issues"]]}
+            "known_issues": [k["summary"] for k in prof["known_issues"]], "tuned": tuned_here(prof)}
+
+_machine = None
+def tuned_here(prof):
+    """What tools/vxrt_tune.py confirmed for this Mac (the profile's "tuned"), or None."""
+    global _machine
+    import vxrt_tune
+    _machine = _machine or vxrt_tune.machine_key()
+    return prof.get("tuned", {}).get(_machine)
 
 CLIS = {"claude": "claude", "codex": "codex", "gemini": "gemini", "cursor": "cursor-agent"}   # agent -> its command
 
@@ -182,7 +190,7 @@ const S = {
         ai: "AI に頼む", aihint: "Claude Code・Codex などをこのリポジトリで開き、コピーしたプロンプトを貼り付けてください。AI は AGENTS.md の規則（DRM を回避しない、ゲームファイルを変えない、確かめたものだけコミット）に従います。",
         tune: "この Mac 向けに調整", tunehint: "設定だけを変えて fps と解像度を詰める", support: "動くようにする", supporthint: "足りない Windows API などを VXRuntime に実装する",
         make: "プロンプトを作る", making: "調べています…", copy: "コピー", copied: "コピーしました",
-        run: "起動", quality: "画質", qdef: "標準", runhint: "ターミナルで実行します。SteamVR と一緒に起動し、Vision Pro アプリから接続します。Mac 版 Steam にサインインしておいてください。",
+        run: "起動", quality: "画質", qdef: "標準", tuned: "この Mac に調整済み", runhint: "ターミナルで実行します。SteamVR と一緒に起動し、Vision Pro アプリから接続します。Mac 版 Steam にサインインしておいてください。",
         copycmd: "コマンドをコピー", last: "前回の実行", nolog: "まだ実行記録がありません", problems: "ログで見つかったこと", none: "問題なし",
         delegate: "AIに任せる", delhint: "ターミナルが開き、選んだ AI がこのリポジトリで作業を始めます（あなたのログインのまま）。AI は vxrt のツールでゲームを自分で起動・計測します。コマンドの実行やファイルの変更は、AI ツールの確認画面で承認してください。プレイ中は計測を拒否します。",
         started: "ターミナルで開始しました", notool: "（未インストール）" },
@@ -192,7 +200,7 @@ const S = {
         ai: "Ask an AI coding tool", aihint: "Open Claude Code, Codex or another tool in this repository and paste the prompt. The AI follows AGENTS.md (no DRM circumvention, game files untouched, commits only what it verified).",
         tune: "Tune for this Mac", tunehint: "settings only: fps and resolution", support: "Make it run", supporthint: "implement missing Windows APIs and such in VXRuntime",
         make: "Make the prompt", making: "Looking at the game…", copy: "Copy", copied: "Copied",
-        run: "Start", quality: "Quality", qdef: "default", runhint: "Run it in Terminal. It starts SteamVR too; connect from the Vision Pro app. Mac Steam must be signed in.",
+        run: "Start", quality: "Quality", qdef: "default", tuned: "tuned for this Mac", runhint: "Run it in Terminal. It starts SteamVR too; connect from the Vision Pro app. Mac Steam must be signed in.",
         copycmd: "Copy the command", last: "Last run", nolog: "Not run yet", problems: "Found in the log", none: "nothing",
         delegate: "Let the AI do it", delhint: "Opens Terminal with the chosen agent in this repository (your own login). It runs and measures the game itself with the vxrt tools; approve its commands and edits in the agent as usual. Runs are refused while you are playing.",
         started: "Started in Terminal", notool: "(not installed)" },
@@ -256,7 +264,9 @@ function renderDetail(g) {
       };
       return b;
     }));
-  const q = el("select", {}, el("option", { value: "" }, T.qdef), el("option", { value: "2.5k" }, "2.5k"), el("option", { value: "3k" }, "3k"));
+  const tq = g.tuned ? el("option", { value: "tuned" }, `${T.tuned} (${g.tuned.quality || T.qdef}, ${g.tuned.median_fps} fps)`) : null;
+  const q = el("select", {}, ...[tq, el("option", { value: "" }, T.qdef), el("option", { value: "3k" }, "3k"),
+                                 el("option", { value: "2.5k" }, "2.5k"), el("option", { value: "max" }, "max")].filter(Boolean));
   const cmd = el("code", { class: "cmd" });
   const refresh = async () => { cmd.textContent = await (await fetch(`/api/command?appid=${g.appid}&quality=${q.value}`)).text(); };
   q.onchange = refresh; refresh();
@@ -317,7 +327,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:                          # (shown in the page instead of a prompt)
                 return self.send(500, "vxrt doctor: %s" % e)
         if u.path == "/api/command":
-            quality = q.get("quality") if q.get("quality") in ("2.5k", "3k") else ""
+            if q.get("quality") == "tuned":                  # (tools/vxrt_tune.py's confirmed choice for this Mac)
+                import vxrt_tune, vxrt_games
+                prof = vxrt_games.load_all().get(game["appid"])
+                t = tuned_here(prof) if prof else None
+                if t:
+                    return self.send(200, vxrt_tune.command_for(prof["key"], t))
+            quality = q.get("quality") if q.get("quality") in ("2.5k", "3k", "max") else ""
             return self.send(200, doctor.launch_command(game["exe"], quality))
         self.send(404, "not found")
 

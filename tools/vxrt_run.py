@@ -490,7 +490,8 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         ev.observe("frame_mean_luminance", round(lum, 1), png)
         ev.observe("frame_bright_fraction", round(bright, 3), png)
     else:
-        ev.observe("frame_bright_fraction", None, shared, note="no frame in the shared file")
+        # (the shared file is the driver's, rewritten by every run: named, not hashed as this run's artifact)
+        ev.observe("frame_bright_fraction", None, note="no frame in the shared file", looked_at=rel(shared))
     facts = game_log_facts(game_log, exe)
     ev.observe("unhandled_exceptions", facts["unhandled"], game_log)
     ev.observe("native_signals_outside_program", facts["signals"], game_log)

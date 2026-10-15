@@ -6,6 +6,9 @@
   "launcher": "game",
   "engine": "vxrt",
   "default_scenario": "start",
+  "tune": {
+    "scenario": "start"
+  },
   "scenarios": {
     "start": {
       "args": [],

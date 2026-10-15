@@ -6,6 +6,23 @@
   "launcher": "alyx",
   "engine": "vxrt",
   "default_scenario": "menu",
+  "tune": {
+    "scenario": "chapter",
+    "ladder": [
+      {
+        "quality": "3k",
+        "note": "fidelity level 4 fixed; left to itself (no preset) the game picks its own size, so the default is not on the ladder"
+      },
+      {
+        "quality": "2.5k",
+        "note": "2x MSAA, fidelity level 3"
+      },
+      {
+        "quality": "max",
+        "note": "2x MSAA, fidelity level 3"
+      }
+    ]
+  },
   "scenarios": {
     "menu": {
       "args": [],
@@ -69,5 +86,20 @@
   "notes": [
     "Needs -vr (scripts/launch_vxrt_alyx.sh passes it); without it the game starts in desktop mode.",
     "2026-10-14: played in the headset at 3k through a2_quarantine_entrance -> a2_pistol (the level change that crashed before 8d10cfb); saves 2.5-6.2 MB."
-  ]
+  ],
+  "tuned": {
+    "Apple M1 Max, 32-core GPU": {
+      "quality": "3k",
+      "settings": {},
+      "scenario": "chapter",
+      "median_fps": 60.0,
+      "per_eye": [
+        1440,
+        1620
+      ],
+      "display_hz": 60.0,
+      "checked": "2026-10-15",
+      "source": "tools/vxrt_tune.py 20261015-tune-alyx-verify (runs 20261015T001413Z-alyx-chapter-3k, 20261015T002231Z-alyx-chapter-3k)"
+    }
+  }
 }

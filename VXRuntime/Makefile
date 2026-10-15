@@ -170,6 +170,7 @@ check: export VXRT_NO_ACTIVATE = 1
 check: all
 	python3 ../tools/vxrt_games.py check
 	python3 ../tools/vxrt_agents.py check
+	python3 ../tools/vxrt_tune.py --selftest
 	build/vxrt build/hello_k32.exe
 	build/vxrt build/hello_crt.exe one "two words"
 	build/vxrt build/threads.exe

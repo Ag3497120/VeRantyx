@@ -7,7 +7,16 @@ description: Tune a Windows VR game on VXRuntime (vxrt) for this Mac — setting
 
 Read AGENTS.md first. A tune changes settings, never the runtime's code.
 
-## Measure
+## Start with the auto-tuner
+
+`tools/vxrt_tune.py <game>` (MCP: `tune_game`, then `read_tune` now and then; `--plan` shows the ladder and the time
+first). It runs the harness up a ladder (default, 3k, 3k at render scale 2.4, 2.5k, max: fewest pixels per eye
+first), stops climbing where a candidate no longer holds 95 % of the display rate with healthy runs, and confirms the
+highest one that holds in alternating runs. A confirmed choice goes into the profile's `tuned` entry for this Mac
+with `--apply`. It stops on a refusal (the user started playing): report that and do not restart it while they play.
+A game whose own size choice matters gets a ladder in its profile (`"tune": {"scenario": ..., "ladder": [...]}`).
+
+## Measure by hand (settings outside the ladder)
 
 - `tools/vxrt_run.py <game> [scenario] --quality 3k --set NAME=VALUE ...` (MCP: `run_game` with `quality` and
   `settings`). Only the settings AGENTS.md lists are accepted; others are refused (`settings_allowed`).

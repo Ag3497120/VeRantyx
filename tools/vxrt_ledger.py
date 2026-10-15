@@ -73,6 +73,8 @@ def verify(path=LEDGER, check_files=True):
             problems.append(f"row {k}: {b.get('result')} changed"); continue
         for item in json.load(open(result)).get("observed", []):
             art = item.get("artifact")
+            if art and art.startswith(".." + os.sep):
+                continue                      # (a live file outside the repository, which runs before 2026-10-15 hashed; not kept)
             if art and item.get("sha256") and (not os.path.exists(os.path.join(REPO, art)) or sha256_file(os.path.join(REPO, art)) != item["sha256"]):
                 problems.append(f"row {k}: artifact {art} changed or gone")
     return {"ok": not problems, "rows": len(rs), "head": prev if rs else None, "problems": problems}

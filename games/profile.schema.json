@@ -26,6 +26,30 @@
       }
     },
     "settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "tunable settings (AGENTS.md) this game needs by default"},
+    "tune": {
+      "type": "object", "additionalProperties": false,
+      "description": "how tools/vxrt_tune.py tunes the game: the scenario it measures, and a ladder of its own (default: the tuner's)",
+      "properties": {
+        "scenario": {"type": "string"},
+        "ladder": {"type": "array", "items": {"type": "object", "required": ["quality"], "additionalProperties": false,
+                   "properties": {"quality": {"enum": ["", "2.5k", "3k", "max"]},
+                                  "settings": {"type": "object", "additionalProperties": {"type": "string"}},
+                                  "note": {"type": "string"}}}}
+      }
+    },
+    "tuned": {
+      "type": "object", "description": "per machine (\"<chip>, <n>-core GPU\"): the setting tools/vxrt_tune.py confirmed there (its --apply writes it)",
+      "additionalProperties": {
+        "type": "object", "required": ["quality", "settings", "median_fps", "source"], "additionalProperties": false,
+        "properties": {
+          "quality": {"enum": ["", "2.5k", "3k", "max"]},
+          "settings": {"type": "object", "additionalProperties": {"type": "string"}},
+          "scenario": {"type": "string"}, "median_fps": {"type": "number"},
+          "per_eye": {"type": "array", "items": {"type": "number"}}, "display_hz": {"type": "number"},
+          "checked": {"type": "string"}, "source": {"type": "string"}
+        }
+      }
+    },
     "status": {
       "type": "object", "required": ["state", "summary", "checked", "machine"], "additionalProperties": false,
       "properties": {

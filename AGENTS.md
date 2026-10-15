@@ -131,6 +131,13 @@ compare settings in alternating runs (A B B A), not one after another.
 Goal of a tune: frames at the display rate (`submit_fps` ≈ `VERANTYX_DISPLAY_HZ`), then the highest resolution
 that keeps it. A render size larger than the stream's budget only supersamples.
 
+The auto-tuner does this with the harness: `tools/vxrt_tune.py <game>` (MCP `tune_game` / `read_tune`; `--plan` first
+shows the ladder and how long it may take). It climbs a ladder from the fewest pixels per eye, stops where a
+candidate no longer holds 95 % of the display rate with healthy runs, confirms the highest one that holds in
+alternating runs, and records every run in `runs/<tune id>/tune.json` (sealed in the ledger). `--apply` writes a
+confirmed choice into the profile's `tuned` entry for this Mac; `tools/vxrt_tune.py --show <game>` prints its launch
+command. A tune is many runs (half an hour or more): the user cannot play meanwhile, and a refusal stops it.
+
 ## Making a game run (a "support" task)
 
 1. Run `tools/vxrt_doctor.py "<game>" --goal support` and measure the game with `tools/vxrt_run.py <game>`.

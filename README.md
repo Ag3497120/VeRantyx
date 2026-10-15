@@ -294,6 +294,18 @@ tools/vxrt_doctor.py earth --facts                                # only the fac
 Briefs are in Japanese by default (`--lang en` for English). Games with
 anti-cheat are flagged and not worked around.
 
+**Auto-tuning.** `tools/vxrt_tune.py <game>` finds the best picture a game
+holds at the display rate on your Mac, without a headset: it runs the harness
+up a ladder of settings from the fewest pixels per eye to the most (default,
+3K, 3K at render scale 2.4, 2.5K, max; a game's profile can have its own), stops
+where a setting no longer holds 95 % of the display rate, and confirms the
+highest one that does in alternating runs. `--plan` shows the ladder and the
+time first (half an hour or more: you cannot play meanwhile); `--apply` writes
+the confirmed choice into the game's profile for your Mac, and
+`tools/vxrt_tune.py --show <game>` (or VXRT Studio's quality menu, "tuned for
+this Mac") gives its launch command. `/vxrt-tune <game>` has your AI tool run
+it (MCP `tune_game` / `read_tune`) and report it with the run ids.
+
 The same in a page: `python3 tools/vxrt_studio.py` opens VXRT Studio in the
 browser, a list of the games installed for VXRuntime (Steam libraries in the
 prefix and `~/Verantyx_VR_Drive/vxrt_library`) with what is known to work, the
