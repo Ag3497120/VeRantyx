@@ -105,6 +105,12 @@ build/ref_x86: translator/diff/ref_x86.c translator/diff/difftest.h
 build/difftest: translator/diff/difftest.c translator/diff/difftest.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h translator/x87.c translator/x87.h
 	@mkdir -p build
 	$(HOSTCC) -Wno-missing-field-initializers translator/x86dec.c translator/xlat.c translator/x87.c translator/diff/difftest.c -o $@
+# translator coverage over the installed games' PEs (every function in .pdata): `make coverage`
+build/coverage: translator/coverage.c translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h translator/x87.c translator/x87.h
+	@mkdir -p build
+	$(HOSTCC) -Wno-missing-field-initializers -Itranslator translator/coverage.c translator/x86dec.c translator/xlat.c translator/x87.c -o $@
+coverage: build/coverage
+	python3 translator/coverage.py build/coverage $(HOME)/Verantyx_VR_Drive/vxrt_steam/steamapps/common
 # x87 transcendentals against exact values (slow: decimal arithmetic): `make x87-exact`
 build/x87_ref: translator/diff/x87_ref.c
 	@mkdir -p build

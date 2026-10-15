@@ -2,6 +2,7 @@
 #include "xlat.h"
 #include "a64.h"
 #include "x87.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -203,12 +204,107 @@ static void call_helper_r(xlat_buf *b, uint32_t op, int op_reg, int val) {
     E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
 }
 static void call_helper(xlat_buf *b, uint32_t op, int val) { call_helper_r(b, op, -1, val); }
-enum { H_MUL = 1, H_IMUL, H_DIV, H_IDIV, H_RCL, H_RCR, H_X87, H_FXSAVE, H_FXRSTOR };   // op = kind | size << 8 | count << 16 (x87: opcode, ModRM)
+enum { H_MUL = 1, H_IMUL, H_DIV, H_IDIV, H_RCL, H_RCR, H_X87, H_FXSAVE, H_FXRSTOR, H_PDEP, H_PEXT, H_GATHER, H_PCMPSTR, H_RAND };   // op = kind | size << 8 | count << 16 (x87: opcode, ModRM)
+// AVX2 gathers (VPGATHERDD/DQ/QD/QQ, VGATHERDPS/DPD/QPS/QPD): op = opcode | W << 8 | L << 9 | dst << 10 | mask << 14 |
+// index << 18 | log2 scale << 22; base: the base register plus displacement. Each element whose mask has its sign bit set
+// is loaded from base + index * scale; the mask ends all zero, and what the instruction does not gather in the
+// destination is zero (VEX: the upper half too when 128 bits).
+static void gather(x86_ctx *c, uint32_t op, uint64_t base) {
+    int opc = (int)(op & 0xFF), w = (int)(op >> 8 & 1), L = (int)(op >> 9 & 1), dst = (int)(op >> 10 & 15), mk = (int)(op >> 14 & 15);
+    int idx = (int)(op >> 18 & 15), sc = (int)(op >> 22 & 3), qidx = opc & 1, es = w ? 8 : 4;
+    int n = (qidx || w) ? (L ? 4 : 2) : (L ? 8 : 4);
+    uint8_t d[32], m[32], ix[32];
+    #define LOAD32(v, r) do { memcpy(v, c->xmm[r], 16); memcpy(v + 16, c->ymm_hi[r], 16); } while (0)
+    LOAD32(d, dst); LOAD32(m, mk); LOAD32(ix, idx);
+    #undef LOAD32
+    for (int i = 0; i < n; i++) {
+        uint64_t mv = 0; memcpy(&mv, m + es * i, (size_t)es);
+        if (!(mv >> (es * 8 - 1))) continue;
+        int64_t iv;
+        if (qidx) { int64_t q; memcpy(&q, ix + 8 * i, 8); iv = q; } else { int32_t dd; memcpy(&dd, ix + 4 * i, 4); iv = dd; }
+        memcpy(d + es * i, (const void *)(uintptr_t)(base + (uint64_t)(iv << sc)), (size_t)es);
+    }
+    int keep = n * es;                                                    // (bytes gathered: the rest of the destination is 0)
+    memset(d + keep, 0, (size_t)(32 - keep));
+    if (!L) memset(d + 16, 0, 16);
+    memcpy(c->xmm[dst], d, 16); memcpy(c->ymm_hi[dst], d + 16, 16);
+    memset(c->xmm[mk], 0, 16); memset(c->ymm_hi[mk], 0, 16);
+}
+// PCMPESTRI/ESTRM/ISTRI/ISTRM (SSE4.2): op = opcode & 3 | memory << 2 | REX.W << 3 | imm << 4 | reg << 12 | rm << 16 (24 bits:
+// the helper call has them); a: the memory operand's address. The SDM's algorithm: element format, aggregation,
+// polarity, index or mask out.
+static void pcmpstr(x86_ctx *c, uint32_t op, uint64_t a) {
+    int opc = 0x60 | (int)(op & 3), mem = (int)(op >> 2 & 1), w = (int)(op >> 3 & 1), imm = (int)(op >> 4 & 0xFF), reg = (int)(op >> 12 & 15);
+    int rm = (int)(op >> 16 & 15), words = imm & 1, sgn = imm >> 1 & 1, agg = imm >> 2 & 3, pol = imm >> 4 & 3, n = words ? 8 : 16;
+    uint8_t A[16], B[16];
+    memcpy(A, c->xmm[reg], 16);
+    if (mem) memcpy(B, (const void *)(uintptr_t)a, 16); else memcpy(B, c->xmm[rm], 16);
+    int64_t ea_[16], eb[16];
+    for (int i = 0; i < n; i++) {
+        if (words) { uint16_t x, y; memcpy(&x, A + 2 * i, 2); memcpy(&y, B + 2 * i, 2); ea_[i] = sgn ? (int16_t)x : x; eb[i] = sgn ? (int16_t)y : y; }
+        else { ea_[i] = sgn ? (int8_t)A[i] : A[i]; eb[i] = sgn ? (int8_t)B[i] : B[i]; }
+    }
+    int la = n, lb = n;
+    if (opc <= 0x61) {                                                    // explicit lengths: |EAX|, |EDX| (RAX, RDX with REX.W)
+        int64_t x = w ? (int64_t)c->gpr[0] : (int32_t)c->gpr[0], y = w ? (int64_t)c->gpr[2] : (int32_t)c->gpr[2];
+        uint64_t ax = x < 0 ? 0 - (uint64_t)x : (uint64_t)x, ay = y < 0 ? 0 - (uint64_t)y : (uint64_t)y;
+        la = ax < (uint64_t)n ? (int)ax : n; lb = ay < (uint64_t)n ? (int)ay : n;
+    } else {                                                              // implicit: up to the first null element
+        for (la = 0; la < n && ea_[la]; la++) {}
+        for (lb = 0; lb < n && eb[lb]; lb++) {}
+    }
+    unsigned res = 0;
+    for (int j = 0; j < n; j++) {
+        int r = 0;
+        if (agg == 0) { if (j < lb) for (int i = 0; i < la; i++) r |= ea_[i] == eb[j]; }                       // equal any
+        else if (agg == 1) { if (j < lb) for (int i = 0; i + 1 < la; i += 2) r |= ea_[i] <= eb[j] && eb[j] <= ea_[i + 1]; }   // ranges
+        else if (agg == 2) r = j >= la && j >= lb ? 1 : j >= la || j >= lb ? 0 : ea_[j] == eb[j];               // equal each
+        else {                                                            // equal ordered
+            r = 1;
+            for (int i = 0; i < n - j && r; i++) {
+                if (i >= la) break;
+                if (j + i >= lb) { r = 0; break; }
+                r = ea_[i] == eb[j + i];
+            }
+        }
+        res |= (unsigned)r << j;
+    }
+    unsigned all = (1u << n) - 1;
+    if (pol == 1) res ^= all; else if (pol == 3) res ^= (1u << lb) - 1;
+    res &= all;
+    if (!(opc & 1)) {                                                     // ...STRM (60, 62): XMM0, bits or whole elements
+        uint8_t m[16] = { 0 };
+        if (imm & 0x40) for (int j = 0; j < n; j++) { if (res >> j & 1) memset(m + (words ? 2 * j : j), 0xFF, words ? 2 : 1); }
+        else { m[0] = (uint8_t)res; m[1] = (uint8_t)(res >> 8); }
+        memcpy(c->xmm[0], m, 16);
+    } else {                                                              // ...STRI (61, 63): ECX, the least or most significant bit
+        int idx = n;
+        if (res) idx = (imm & 0x40) ? 31 - __builtin_clz(res) : __builtin_ctz(res);
+        c->gpr[1] = (uint32_t)idx;
+    }
+    uint64_t fl = (res ? 1u : 0) | (lb < n ? 0x40u : 0) | (la < n ? 0x80u : 0) | (res & 1 ? 0x800u : 0);
+    c->flags = (c->flags & ~0x8D5ull) | fl;
+}
 void xlat_helper(x86_ctx *c) {
     int kind = (int)(c->helper_op & 0xFF), size = (int)(c->helper_op >> 8 & 0xFF), n = size * 8;
     uint64_t mask = n == 64 ? ~0ull : (1ull << n) - 1, v = c->helper_val & mask;
     uint64_t *ax = &c->gpr[0], *dx = &c->gpr[2];
     #define SET(reg, val) do { if (size == 4) *(reg) = (uint32_t)(val); else *(reg) = (*(reg) & ~mask) | ((val) & mask); } while (0)
+    if (kind == H_PDEP || kind == H_PEXT) {                             // (source in helper_val, mask in pad; result in helper_val)
+        uint64_t src = c->helper_val, mask = c->pad, r = 0;
+        if (size == 4) { src = (uint32_t)src; mask = (uint32_t)mask; }
+        for (uint64_t bit = 1, k = 0; mask; mask &= mask - 1) {
+            uint64_t m = mask & -mask;
+            if (kind == H_PDEP) { if (src >> k & 1) r |= m; }
+            else if (src & m) r |= bit << k;
+            k++;
+        }
+        c->helper_val = r;
+        return;
+    }
+    if (kind == H_GATHER) { gather(c, (uint32_t)(c->helper_op >> 8), c->helper_val); return; }
+    if (kind == H_PCMPSTR) { pcmpstr(c, (uint32_t)(c->helper_op >> 8), c->helper_val); return; }
+    if (kind == H_RAND) { arc4random_buf(&c->helper_val, 8); return; }   // RDRAND / RDSEED: the system's random numbers
     if (kind == H_X87) { xlat_x87(c, (uint32_t)(c->helper_op >> 8 & 0xFF), (uint32_t)(c->helper_op >> 16 & 0xFF), c->helper_val); return; }
     if (kind == H_FXSAVE || kind == H_FXRSTOR) { xlat_fxsave(c, c->helper_val, kind == H_FXRSTOR); return; }
     if (kind == H_MUL || kind == H_IMUL) {
@@ -434,6 +530,113 @@ static void shld(xlat_buf *b, const x86_insn *d, int right, int count_from_cl, i
     patch_b(b, end);
 }
 
+// BMI1 / BMI2 (VEX-encoded general-purpose instructions): ANDN BEXTR BLSR BLSMSK BLSI BZHI PDEP PEXT MULX SHLX SHRX SARX
+// RORX. 1: not one of them.
+static int xlat_bmi(xlat_buf *b, const x86_insn *d, uint64_t next) {
+    int op = d->opcode, pf = d->mandatory, sz = d->vex_w ? 8 : 4, bits_ = sz * 8, v = d->vex_vvvv;
+    if (d->map == X86_MAP_0F3A) {
+        if (op != 0xF0 || pf != 0xF2) return 1;
+        rd_rm(b, d, T_A, sz, next);                                       // RORX: no flags
+        E(b, a64_extr(sz == 8, T_R, T_A, T_A, (int)(d->imm & (bits_ - 1))));
+        wr_reg(b, d, d->reg, T_R, sz);
+        return 0;
+    }
+    if (d->map != X86_MAP_0F38 || op < 0xF2 || op > 0xF7 || op == 0xF4) return 1;
+    if (d->vex_l) return -1;
+    #define ZS_CF(cf_reg) do { E(b, a64_movz(ACC, 0, 0)); flags_zsp(b, sz); if ((cf_reg) >= 0) put_flag(b, cf_reg, 0); merge_flags(b, F_ARITH); } while (0)
+    if (op == 0xF2 && pf == 0) {                                          // ANDN: ~vvvv & r/m; ZF SF, CF OF 0
+        rd_rm(b, d, T_A, sz, next); rd_reg(b, d, T_B, v, sz);
+        E(b, a64_bic(T_R, T_A, T_B)); ZS_CF(-1); wr_reg(b, d, d->reg, T_R, sz);
+        return 0;
+    }
+    if (op == 0xF3 && pf == 0) {                                          // BLSR BLSMSK BLSI: into VEX.vvvv
+        int g = d->reg & 7;
+        if (g < 1 || g > 3) return -1;
+        rd_rm(b, d, T_A, sz, next);
+        if (g == 3) E(b, a64_sub(T_B, XZR, T_A)); else E(b, a64_subi(T_B, T_A, 1));
+        E(b, g == 1 ? a64_and(T_R, T_A, T_B) : g == 2 ? a64_eor(T_R, T_A, T_B) : a64_and(T_R, T_A, T_B));
+        if (sz == 4) E(b, a64_movw(T_R, T_R));
+        E(b, a64_cmp(T_A, XZR)); E(b, a64_cset(T_T, g == 3 ? NE : EQ));    // CF: source zero (BLSI: not zero)
+        ZS_CF(T_T);
+        wr_reg(b, d, v, T_R, sz);
+        return 0;
+    }
+    if (op == 0xF5 && pf == 0) {                                          // BZHI: bits from the index (vvvv[7:0]) up cleared
+        rd_rm(b, d, T_A, sz, next); rd_reg(b, d, T_B, v, sz);
+        E(b, a64_ubfx(T_B, T_B, 0, 8));
+        mov_imm(b, S0, ~0ull); E(b, a64_lslv(S0, S0, T_B)); E(b, a64_bic(T_R, T_A, S0));
+        mov_imm(b, S1, (uint64_t)bits_); E(b, a64_cmp(T_B, S1));
+        E(b, a64_csel(T_R, T_A, T_R, CS)); E(b, a64_cset(T_T, CS));       // (index past the size: the source, CF 1)
+        ZS_CF(T_T); wr_reg(b, d, d->reg, T_R, sz);
+        return 0;
+    }
+    if (op == 0xF5 && (pf == 0xF2 || pf == 0xF3)) {                       // PDEP PEXT (in C)
+        rd_reg(b, d, T_A, v, sz); rd_rm(b, d, T_B, sz, next);
+        E(b, a64_str(8, T_B, XC, CTX_HELPER_VAL + 8));
+        call_helper(b, (pf == 0xF2 ? H_PDEP : H_PEXT) | (uint32_t)sz << 8, T_A);
+        E(b, a64_ldr(8, T_R, XC, CTX_HELPER_VAL)); wr_reg(b, d, d->reg, T_R, sz);
+        return 0;
+    }
+    if (op == 0xF6 && pf == 0xF2) {                                       // MULX: rdx * r/m; low into vvvv, then high into reg
+        rd_rm(b, d, T_A, sz, next); rd_reg(b, d, T_B, 2, sz);
+        if (sz == 8) { E(b, a64_mul(T_R, T_A, T_B)); E(b, a64_umulh(T_T, T_A, T_B)); }
+        else { E(b, a64_mul(T_R, T_A, T_B)); E(b, a64_lsri(T_T, T_R, 32)); }
+        wr_reg(b, d, v, T_R, sz); wr_reg(b, d, d->reg, T_T, sz);
+        return 0;
+    }
+    if (op == 0xF7) {                                                     // BEXTR SHLX SARX SHRX
+        rd_rm(b, d, T_A, sz, next); rd_reg(b, d, T_B, v, sz);
+        if (pf == 0) {                                                    // BEXTR: start = vvvv[7:0], length = vvvv[15:8]
+            E(b, a64_ubfx(S0, T_B, 0, 8)); E(b, a64_ubfx(S1, T_B, 8, 8));
+            E(b, a64_lsrv(T_R, T_A, S0)); mov_imm(b, T_T, (uint64_t)bits_); E(b, a64_cmp(S0, T_T)); E(b, a64_csel(T_R, XZR, T_R, CS));
+            mov_imm(b, S0, ~0ull); E(b, a64_lslv(S0, S0, S1)); E(b, a64_cmp(S1, T_T)); E(b, a64_csel(S0, XZR, S0, CS));
+            E(b, a64_bic(T_R, T_R, S0));
+            ZS_CF(-1); wr_reg(b, d, d->reg, T_R, sz);
+            return 0;
+        }
+        int kind = pf == 0x66 ? 0 : pf == 0xF2 ? 1 : 2;                   // SHLX SHRX SARX: no flags
+        if (sz == 8) E(b, kind == 0 ? a64_lslv(T_R, T_A, T_B) : kind == 1 ? a64_lsrv(T_R, T_A, T_B) : a64_asrv(T_R, T_A, T_B));
+        else E(b, a64_shiftw(kind, T_R, T_A, T_B));
+        wr_reg(b, d, d->reg, T_R, sz);
+        return 0;
+    }
+    #undef ZS_CF
+    return -1;
+}
+
+// CMPXCHG8B / CMPXCHG16B m: EDX:EAX (RDX:RAX) against memory; equal: ECX:EBX (RCX:RBX) stored, ZF 1; else the memory
+// into EDX:EAX (RDX:RAX), ZF 0. Atomic either way (CASAL / CASPAL; 8 bytes across 16: the split lock). 16 bytes must
+// be aligned (x86: #GP; here the alignment fault).
+static void cmpxchg8_16(xlat_buf *b, const x86_insn *d, uint64_t next) {
+    b->lock = 0;
+    ea(b, d, next, 0);
+    if (d->opsize == 8) {
+        E(b, a64_mov(S0, 0)); E(b, a64_mov(S1, 2)); E(b, a64_mov(T_B, 3)); E(b, a64_mov(T_R, 1));
+        E(b, a64_mov(T_A, S0)); E(b, a64_mov(T_T, S1));
+        E(b, a64_caspal(S0, T_B, T_ADDR));                                // (S0, S1: what memory held)
+        E(b, a64_eor(T_A, T_A, S0)); E(b, a64_eor(T_T, T_T, S1)); E(b, a64_orr(T_A, T_A, T_T));
+        E(b, a64_cmp(T_A, XZR)); E(b, a64_cset(T_T, EQ)); E(b, a64_bfi(XF, T_T, 6, 1));
+        E(b, a64_csel(0, 0, S0, EQ)); E(b, a64_csel(2, 2, S1, EQ));
+        return;
+    }
+    // 8 bytes: (edx << 32 | eax) and (ecx << 32 | ebx)
+    E(b, a64_movw(T_B, 0)); E(b, a64_orr_lsl(T_B, T_B, 2, 32));
+    E(b, a64_movw(T_R, 3)); E(b, a64_orr_lsl(T_R, T_R, 1, 32));
+    size_t slow = if_misaligned(b, 8);
+    E(b, a64_mov(T_A, T_B)); E(b, a64_casal(8, T_A, T_R, T_ADDR));       // T_A: what memory held
+    size_t done = here(b); E(b, 0);
+    patch_cbz(b, slow, 1, S0);
+    split_lock_take(b);
+    E(b, a64_ldr(8, T_A, T_ADDR, 0)); E(b, a64_cmp(T_A, T_B));
+    E(b, a64_bcond(NE, 2)); E(b, a64_str(8, T_R, T_ADDR, 0));
+    split_lock_give(b);
+    patch_b(b, done);
+    E(b, a64_cmp(T_A, T_B)); E(b, a64_cset(T_T, EQ)); E(b, a64_bfi(XF, T_T, 6, 1));
+    size_t eq = here(b); E(b, 0);
+    E(b, a64_movw(0, T_A)); E(b, a64_lsri(2, T_A, 32));                 // not equal: EDX:EAX (upper halves cleared)
+    b->code[eq] = a64_bcond(EQ, (int32_t)(b->n - eq));
+}
+
 // MXCSR on ARM: its rounding control and FTZ/DAZ are FPCR's RMode and FZ (FZ flushes inputs and results alike, so
 // one of FTZ and DAZ alone is taken as both: TRANSLATOR.md); its exception flags are FPSR's cumulative bits, read
 // back when the program reads MXCSR (STMXCSR) and when translated code is left.
@@ -634,6 +837,15 @@ static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
             mov_imm(b, T_A, (uint64_t)d->imm); E(b, a64_subi(4, 4, 8)); E(b, a64_str(8, T_A, 4, 0));
             return 0;
         }
+        if (op == 0x9C || op == 0x9D) {                                  // PUSHFQ POPFQ (no 16-bit forms)
+            if (size == 2) return -1;
+            if (op == 0x9C) { mov_imm(b, S0, 0x202); E(b, a64_orr(T_A, XF, S0)); E(b, a64_subi(4, 4, 8)); E(b, a64_str(8, T_A, 4, 0)); }
+            else {                                                       // (what a program may change: the arithmetic flags,
+                E(b, a64_ldr(8, T_A, 4, 0)); E(b, a64_addi(4, 4, 8));    //   TF DF NT AC ID; TF does not trap here)
+                mov_imm(b, S0, 0x8D5 | 0x100 | 0x400 | 0x4000 | 0x40000 | 0x200000); E(b, a64_and(XF, T_A, S0));
+            }
+            return 0;
+        }
         if (op == 0xF8 || op == 0xF9 || op == 0xF5) {                    // CLC STC CMC
             E(b, a64_movz(S0, 1, 0));
             E(b, op == 0xF8 ? a64_bic(XF, XF, S0) : op == 0xF9 ? a64_orr(XF, XF, S0) : a64_eor(XF, XF, S0));
@@ -665,6 +877,36 @@ static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
     if (d->map == X86_MAP_0F || d->map == X86_MAP_0F38 || d->map == X86_MAP_0F3A) {
         int r = xlat_sse(b, d, next);                                    // SSE / SSE2 (xlat_sse.inc); 1: not one
         if (r != 1) return r;
+    }
+    if (d->map == X86_MAP_0F38 && op >= 0xF0) {                          // CRC32 MOVBE ADCX ADOX
+        int pf = d->mandatory;
+        if ((op == 0xF0 || op == 0xF1) && pf == 0xF2) {                   // CRC32 r32/r64, r/m8/16/32/64 (Castagnoli: ARM's CRC32C)
+            int sz = op == 0xF0 ? 1 : size;
+            rd_rm(b, d, T_A, sz, next); rd_reg(b, d, T_B, reg, 4);
+            E(b, a64_crc32c(sz, T_R, T_B, T_A)); wr_reg(b, d, reg, T_R, 4);
+            return 0;
+        }
+        if ((op == 0xF0 || op == 0xF1) && d->mod != 3 && pf != 0xF3) {  // MOVBE: loads and stores byte-swapped
+            if (op == 0xF0) { rd_rm(b, d, T_A, size, next); }
+            else { rd_reg(b, d, T_A, reg, size); ea(b, d, next, 0); }
+            E(b, size == 8 ? a64_rev(T_A, T_A) : a64_revw(T_A, T_A));
+            if (size == 2) E(b, a64_lsri(T_A, T_A, 16));
+            if (op == 0xF0) wr_reg(b, d, reg, T_A, size); else wr_rm(b, d, T_A, size);
+            return 0;
+        }
+        if (op == 0xF6 && (pf == 0x66 || pf == 0xF3) && !(d->prefixes & X86_P_VEX)) {   // ADCX (CF) ADOX (OF): that flag only
+            int bit = pf == 0x66 ? 0 : 11;
+            size = d->rex & 8 ? 8 : 4;                                    // (ADCX's 66 is part of the opcode, not a size)
+            rd_rm(b, d, T_B, size, next); rd_reg(b, d, T_A, reg, size);
+            E(b, a64_ubfx(S0, XF, bit, 1)); E(b, a64_add(T_R, T_A, T_B)); E(b, a64_add(T_R, T_R, S0));
+            if (size == 8) {                                              // carry out: T_R < T_A, or equal with a carry in
+                E(b, a64_cmp(T_R, T_A)); E(b, a64_cset(T_T, CC)); E(b, a64_csel(T_T, S0, T_T, EQ));
+            } else E(b, a64_lsri(T_T, T_R, 32));
+            E(b, a64_bfi(XF, T_T, bit, 1));
+            wr_reg(b, d, reg, T_R, size);
+            return 0;
+        }
+        return -1;
     }
     if (d->map == X86_MAP_0F) {
         if (op >= 0x40 && op <= 0x4F) {                                 // CMOVcc
@@ -802,6 +1044,14 @@ static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
         }
         if (op == 0xA4 || op == 0xA5) { shld(b, d, 0, op == 0xA5, (int)d->imm, next); return 0; }   // SHLD
         if (op == 0xAC || op == 0xAD) { shld(b, d, 1, op == 0xAD, (int)d->imm, next); return 0; }   // SHRD
+        if (op == 0xC7 && (reg & 7) == 1 && d->mod != 3) { cmpxchg8_16(b, d, next); return 0; }   // CMPXCHG8B / 16B
+        if (op == 0xC7 && d->mod == 3 && ((reg & 7) == 6 || (reg & 7) == 7)) {   // RDRAND RDSEED: always a value (CF 1)
+            call_helper(b, H_RAND, XZR);
+            E(b, a64_ldr(8, T_A, XC, CTX_HELPER_VAL)); wr_reg(b, d, d->rm, T_A, size);
+            mov_imm(b, S0, 0x8D5); E(b, a64_bic(XF, XF, S0)); E(b, a64_movz(S0, 1, 0)); E(b, a64_orr(XF, XF, S0));   // (OF SF ZF AF PF 0)
+            return 0;
+        }
+        if (op == 0xC3 && d->mod != 3) { rd_reg(b, d, T_A, reg, size); ea(b, d, next, 0); wr_rm(b, d, T_A, size); return 0; }   // MOVNTI
         if (op == 0x1F || op == 0x0D || op == 0x18) return 0;            // NOP r/m, PREFETCH
         return -1;
     }

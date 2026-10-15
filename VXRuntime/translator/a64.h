@@ -227,6 +227,13 @@ static inline uint32_t a64_fcsel(int dbl, int d, int n, int m, int cond) { retur
 static inline uint32_t a64_frintx_s(int d, int n) { return 0x1E274000u | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_frintx_d(int d, int n) { return 0x1E674000u | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_fmadd_sc(int dbl, int d, int n, int m, int a) { return (dbl ? 0x1F400000u : 0x1F000000u) | (uint32_t)m << 16 | (uint32_t)a << 10 | (uint32_t)n << 5 | (uint32_t)d; }   // a + n*m
+static inline uint32_t a64_caspal(int s, int t, int n) { return 0x4860FC00u | (uint32_t)s << 16 | (uint32_t)n << 5 | (uint32_t)t; }   // 128 bits: (s, s+1) vs [n], (t, t+1) stored
+static inline uint32_t a64_shiftw(int kind, int d, int n, int m) { return (0x1AC02000u | (uint32_t)kind << 10) | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)d; }   // LSLV LSRV ASRV RORV (kind 0-3), 32 bits
+static inline uint32_t a64_extr(int sf, int d, int n, int m, int lsb) { return (sf ? 0x93C00000u : 0x13800000u) | (uint32_t)m << 16 | (uint32_t)lsb << 10 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvt_h(int op, int d, int n) {             // 0 FCVTL 4S<-4H, 1 FCVTL2, 2 FCVTN 4H<-4S, 3 FCVTN2
+    static const uint32_t c[4] = { 0x0E217800u, 0x4E217800u, 0x0E216800u, 0x4E216800u };
+    return c[op] | (uint32_t)n << 5 | (uint32_t)d;
+}
 static inline uint32_t a64_crc32c(int size, int d, int n, int m) {     // CRC32CB/H/W/X
     return (size == 8 ? 0x9AC05C00u : 0x1AC05000u | (uint32_t)(size == 1 ? 0 : size == 2 ? 1 : 2) << 10) | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)d;
 }

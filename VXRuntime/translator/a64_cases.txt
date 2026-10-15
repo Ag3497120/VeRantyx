@@ -240,3 +240,13 @@ a64_fmadd_sc(1,1,2,3,4)|fmadd d1, d2, d3, d4
 a64_vorn(1,2,3)|orn v1.16b, v2.16b, v3.16b
 a64_fcsel(0,1,2,3,10)|fcsel s1, s2, s3, ge
 a64_fcsel(1,1,2,3,11)|fcsel d1, d2, d3, lt
+a64_caspal(16,20,24)|caspal x16, x17, x20, x21, [x24]
+a64_shiftw(0,1,2,3)|lsl w1, w2, w3
+a64_shiftw(1,1,2,3)|lsr w1, w2, w3
+a64_shiftw(2,1,2,3)|asr w1, w2, w3
+a64_extr(1,1,2,2,13)|ror x1, x2, #13
+a64_extr(0,1,2,2,7)|ror w1, w2, #7
+a64_fcvt_h(0,1,2)|fcvtl v1.4s, v2.4h
+a64_fcvt_h(1,1,2)|fcvtl2 v1.4s, v2.8h
+a64_fcvt_h(2,1,2)|fcvtn v1.4h, v2.4s
+a64_fcvt_h(3,1,2)|fcvtn2 v1.8h, v2.4s

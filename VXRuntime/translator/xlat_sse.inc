@@ -558,6 +558,7 @@ static void pmov(xlat_buf *b, int dst, int s, int k, int zx) {           // the 
 static int xlat_sse4(xlat_buf *b, const x86_insn *d, uint64_t next) {
     int op = d->opcode, x = d->reg, imm = (int)(uint8_t)d->imm;
     if (d->mandatory != 0x66) return d->prefixes & X86_P_VEX ? -1 : 1;
+    if (d->map == X86_MAP_0F38 && op >= 0xF0) return 1;                  // (ADCX, MOVBE m16: general instructions)
     if (d->map == X86_MAP_0F38) {
         int pm = (op >= 0x20 && op <= 0x25) || (op >= 0x30 && op <= 0x35);
         if (op == 0x2A && d->mod == 3 && !(d->prefixes & X86_P_VEX)) return -1;
@@ -662,6 +663,30 @@ static int xlat_sse4(xlat_buf *b, const x86_insn *d, uint64_t next) {
     case 0x44: {                                                          // PCLMULQDQ: the quadwords imm picks, carry-less
         int s = xmm_rm(b, d, 16, next);
         E(b, a64_dup_d(V_T, x, imm & 1)); E(b, a64_dup_d(V_U, s, imm >> 4 & 1)); E(b, a64_pmull1q(x, V_T, V_U));
+        return 0;
+    }
+    case 0x60: case 0x61: case 0x62: case 0x63: {                         // PCMPESTRI/M PCMPISTRI/M (in C: xlat.c's pcmpstr())
+        if (d->mod != 3) ea(b, d, next, 0);
+        call_helper(b, H_PCMPSTR | ((uint32_t)(op & 3) | (uint32_t)(d->mod != 3) << 2 | (uint32_t)((d->rex & 8) || ((d->prefixes & X86_P_VEX) && d->vex_w)) << 3 |
+                                    (uint32_t)imm << 4 | (uint32_t)(x & 15) << 12 | (uint32_t)(d->mod == 3 ? d->rm & 15 : 0) << 16) << 8,
+                    d->mod != 3 ? T_ADDR : XZR);
+        return 0;
+    }
+    case 0xDF: {                                                          // AESKEYGENASSIST: SubWord, RotWord, round constant
+        // AESE with a zero key gives ShiftRows(SubBytes(s)); a table picks the bytes SubWord / RotWord want from it
+        int s = xmm_rm(b, d, 16, next);
+        E(b, a64_movi0(V_T)); E(b, a64_vmov(V_U, s)); E(b, a64_aes(0, V_U, V_T));
+        uint8_t want[16], at[16];                                         // want: source byte per result byte; at: where
+        static const int src_dw[4] = { 1, 1, 3, 3 };                      //   ShiftRows put SubBytes(s[i])
+        for (int lane = 0; lane < 4; lane++)
+            for (int k = 0; k < 4; k++) want[4 * lane + k] = (uint8_t)(4 * src_dw[lane] + (lane & 1 ? (k + 1) & 3 : k));
+        for (int i = 0; i < 16; i++) { int r = i & 3, cc = i >> 2; at[i] = (uint8_t)(r + 4 * ((cc - r) & 3)); }
+        uint64_t lo = 0, hi = 0;
+        for (int k = 0; k < 8; k++) { lo |= (uint64_t)at[want[k]] << (8 * k); hi |= (uint64_t)at[want[8 + k]] << (8 * k); }
+        mov_imm(b, S0, lo); mov_imm(b, S1, hi); E(b, a64_fmov_dx(V_W, S0)); E(b, a64_ins_gd(V_W, 1, S1));
+        E(b, a64_tbl(V_R, V_U, V_W));
+        uint64_t rc = (uint64_t)imm << 32;                                // (round constant in lanes 1 and 3)
+        mov_imm(b, S0, rc); E(b, a64_dup2d(V_X, S0)); E(b, a64_veor(x, V_R, V_X));
         return 0;
     }
     case 0x40: case 0x41: {                                               // DPPS DPPD: (p0 + p1) + (p2 + p3), as x86 adds them
@@ -769,6 +794,39 @@ static int vex_avx(xlat_buf *b, const x86_insn *d, uint64_t next) {
     if (m38 && op == 0x5A) op = 0x1A;                                     // VBROADCASTI128
     if (!m38 && (op == 0x38 || op == 0x39 || op == 0x46)) op -= op == 0x46 ? 0x40 : 0x20;   // VINSERTI128 VEXTRACTI128 VPERM2I128
     if (m38 && (op == 0x8C || op == 0x8E)) op = op == 0x8C ? 0x2C + w : 0x2E + w, w = 0;    // VPMASKMOVD/Q
+    if (m38 && op >= 0x90 && op <= 0x93) {                                // gathers (in C: xlat.c's gather())
+        if (d->mod == 3 || !d->has_sib) return -1;
+        int vidx = d->index == 0xFF ? 4 : d->index;                       // (VSIB: index 4 is XMM4, not "none")
+        if (x == a || x == vidx || a == vidx) return -1;                  // (x86: #UD)
+        x86_insn e = *d; e.index = 0xFF;
+        ea(b, &e, next, 0);                                               // base + displacement (+ segment)
+        uint32_t sc = d->scale == 8 ? 3 : d->scale == 4 ? 2 : d->scale == 2 ? 1 : 0;
+        call_helper(b, H_GATHER | ((uint32_t)op | (uint32_t)w << 8 | (uint32_t)L << 9 | (uint32_t)x << 10 | (uint32_t)a << 14 |
+                                  (uint32_t)vidx << 18 | sc << 22) << 8, T_ADDR);
+        return 0;
+    }
+    if (m38 && op == 0x13) {                                              // VCVTPH2PS (F16C)
+        if (w) return -1;
+        int s = xmm_rm(b, d, L ? 16 : 8, next);
+        if (L) E(b, a64_fcvt_h(1, V_HS, s));
+        E(b, a64_fcvt_h(0, x, s));
+        if (L) hi_st(b, V_HS, x); else hi_zero(b, x);
+        return 0;
+    }
+    if (!m38 && op == 0x1D) {                                             // VCVTPS2PH (F16C): rounded as imm says, or MXCSR
+        if (w) return -1;
+        if (!(imm & 4)) {                                                 // (another mode: FPCR's RMode for this instruction)
+            static const int arm_rm[4] = { 0, 2, 1, 3 };
+            E(b, a64_mrs_fpcr(T_T)); mov_imm(b, S0, 3ull << 22); E(b, a64_bic(T_B, T_T, S0));
+            mov_imm(b, S0, (uint64_t)arm_rm[imm & 3] << 22); E(b, a64_orr(T_B, T_B, S0)); E(b, a64_msr_fpcr(T_B));
+        }
+        E(b, a64_fcvt_h(2, V_R, x));
+        if (L) { hi_ld(b, V_HS, x); E(b, a64_fcvt_h(3, V_R, V_HS)); }
+        if (!(imm & 4)) E(b, a64_msr_fpcr(T_T));
+        if (d->mod == 3) { E(b, a64_vmov(d->rm, V_R)); hi_zero(b, d->rm); }
+        else { ea(b, d, next, 0); E(b, L ? a64_strq(V_R, T_ADDR, 0) : a64_strd(V_R, T_ADDR, 0)); }
+        return 0;
+    }
     if (m38 && (op == 0x18 || op == 0x19)) {                              // VBROADCASTSS / SD
         if (w) return -1;
         int s = xmm_rm(b, d, op == 0x18 ? 4 : 8, next);
@@ -930,8 +988,13 @@ static int vex_avx(xlat_buf *b, const x86_insn *d, uint64_t next) {
     x86_insn e = *d;
     e.opsize = w ? 8 : 4;
     if (!m38 && op >= 0x14 && op <= 0x17) return L ? -1 : (xlat_sse(b, &e, next) ? -1 : 0);   // to general registers or memory
-    int one = m38 ? ((op >= 0x1C && op <= 0x1E) || op == 0x2A || op == 0xDB || pm) : (op == 0x08 || op == 0x09);
-    int only128 = m38 ? op >= 0xDB : (op == 0x0A || op == 0x0B || op == 0x20 || op == 0x21 || op == 0x22 || op == 0x41 || op == 0x44);
+    if (!m38 && op >= 0x60 && op <= 0x63) {                              // (flags, ECX or XMM0: its upper half cleared)
+        if (L || xlat_sse(b, &e, next)) return -1;
+        if (!(op & 1)) hi_zero(b, 0);
+        return 0;
+    }
+    int one = m38 ? ((op >= 0x1C && op <= 0x1E) || op == 0x2A || op == 0xDB || pm) : (op == 0x08 || op == 0x09 || op == 0xDF);
+    int only128 = m38 ? op >= 0xDB : (op == 0x0A || op == 0x0B || op == 0x20 || op == 0x21 || op == 0x22 || op == 0x41 || op == 0x44 || op == 0xDF);
     if (only128 && L && op != 0x0A && op != 0x0B) return -1;            // (VROUNDSS/SD: L is ignored)
     return vex_sse(b, d, e, x, one ? -1 : a, only128 ? 0 : L, 0, next);
 }
@@ -939,6 +1002,8 @@ static int vex_avx(xlat_buf *b, const x86_insn *d, uint64_t next) {
 // A VEX instruction (AVX). 0: translated; -1: not supported (yet).
 static int xlat_vex(xlat_buf *b, const x86_insn *d, uint64_t next) {
     if (d->vex_vvvv > 15) return -1;
+    int bmi = xlat_bmi(b, d, next);                                       // (general-purpose: BMI1 / BMI2)
+    if (bmi != 1) return bmi;
     if (d->map == X86_MAP_0F38 || d->map == X86_MAP_0F3A) return vex_avx(b, d, next);
     if (d->map != X86_MAP_0F) return -1;
     int op = d->opcode, pf = d->mandatory, L = d->vex_l, a = d->vex_vvvv, m = d->mod == 3;

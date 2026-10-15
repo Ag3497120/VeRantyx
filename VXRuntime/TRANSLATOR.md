@@ -182,6 +182,23 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   down) with C1 left out; everything else is exact, and F2XM1 outside [-1, 1] (undefined on x86) is not compared.
   More Rosetta 2 deviations found there: F2XM1 and FPATAN raise no PE (nor UE) for small arguments, though the
   results are inexact.
+- **Remaining instructions and coverage (2026-10-15).** Added: CMPXCHG8B/16B (CASAL / CASPAL; 8 bytes across 16
+  under the split lock; 16 bytes must be aligned), BMI1/BMI2 (ANDN BEXTR BLSR BLSMSK BLSI BZHI PDEP PEXT MULX SHLX SHRX
+  SARX RORX), AVX2 gathers (8 forms, in C: elements in order, the mask cleared), F16C (VCVTPH2PS, VCVTPS2PH with its
+  own rounding mode), SSE4.2's PCMPESTRI/ESTRM/ISTRI/ISTRM (in C, as the SDM's algorithm; an independent model of it
+  in Python agreed with Rosetta on every case where ours first did not), CRC32, MOVBE, AESKEYGENASSIST, PUSHFQ/POPFQ,
+  MOVNTI, RDRAND/RDSEED (the system's random numbers), ADCX/ADOX: 978 forms in all, 3 seeds x 2,943,000 cases,
+  identical (one F2XM1 case where Rosetta 2 also omits UE: counted with its other F2XM1 flag deviations, and that form
+  rerun). Rosetta 2 lacks ADCX/ADOX and RDSEED (SIGILL; its
+  CPUID does not report them either): those are checked against a model of x86 instead. Rosetta 2 deviation found:
+  VCVTPS2PH swaps rounding up and down when imm bits 7-3 (to be ignored) are set. `make coverage`
+  (`translator/coverage.c`, `.py`) translates every function the games' PEs list in .pdata, instruction by
+  instruction: of 221,978,344 instructions in 765 files (Half-Life: Alyx, SteamVR, Google Earth VR), 99.22 % translate;
+  of the rest, 214,847 do not decode (data inside functions), 673,466 are AVX-512 (EVEX and opmask instructions:
+  Rosetta 2 has none and reports none, so programs never choose those paths), 780,366 are INT3, UD2, INT n and port
+  I/O (exceptions: phase 4), and the other 69,061 are mostly data decoded as code (IN/OUT, CLI, IRET, segment moves,
+  16,491 LLVM cannot name either), with CPUID, RDTSC, XGETBV (what to report is the runtime's: phase 4) and SHA
+  (not reported by Rosetta's CPUID, nor will be by ours) as the real ones.
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.
