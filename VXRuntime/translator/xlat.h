@@ -36,10 +36,13 @@ typedef struct x86_ctx_s {
     uint64_t ras;                // engine.c: the return-address ring's next entry (in X29 while translated code runs)
     uint64_t jump;               // set by a native function called from translated code (xlat_block_native): go on at
                                  //   rip (or stop at fault) instead of returning to the caller
+    uint64_t stale;              // set by a checked block (xlat_buf.check_bytes) whose code changed: translate it again
+    uint64_t single;             // engine.c: run the instruction at rip alone, translated just for this once (it writes
+                                 //   code that comes after it: what follows is translated after the write)
 } x86_ctx;
 enum { CTX_FLAGS = 128, CTX_RIP = 136, CTX_FS = 144, CTX_GS = 152, CTX_FAULT = 160, CTX_HELPER_OP = 168, CTX_HELPER_VAL = 176,
        CTX_XMM = 192, CTX_YMMH = 448, CTX_MXCSR = 704, CTX_FCW = 712,
-       CTX_LINK = 848, CTX_ENTRY = 856, CTX_FAULT_INFO = 864, CTX_RAS = 872, CTX_JUMP = 880 };
+       CTX_LINK = 848, CTX_ENTRY = 856, CTX_FAULT_INFO = 864, CTX_RAS = 872, CTX_JUMP = 880, CTX_STALE = 888, CTX_SINGLE = 896 };
 // The return-address ring (xlat_block_linked, engine.c): 2^XLAT_RAS_BITS bytes aligned to that, entries of 16 bytes: the x86
 // return address and the translated code to go back to. CALL adds one, RET takes one and returns there when it matches.
 enum { XLAT_RAS_BITS = 12 };
@@ -60,6 +63,7 @@ typedef struct {
     uint32_t dead_flags;         // this instruction's flags (EFLAGS bits) that are written again before any read: not computed
     uint64_t stop;               // xlat_block_linked: where the engine returns to C (the flags are live there)
     int fuse_kind, fuse_size, fuse_in_reg, keep_operands;
+    int check_bytes;             // xlat_block_linked: compare the block's x86 bytes first (code on a page written often)
     // xlat_block_linked: rarely taken code (the NaN fixes) goes after the block, out of the straight path
     int defer_cold;
     struct cold { size_t at; int kind; uint32_t *words; size_t n; } *cold;

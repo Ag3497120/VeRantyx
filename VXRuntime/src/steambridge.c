@@ -110,6 +110,9 @@ uint64_t vx_call_on_stack(uint64_t (*fn)(void *), void *arg, void *stack_top);  
 typedef struct { ms_fn fn; u64 a, b, c, d; } windows_call;
 static uint64_t run_call(void *p) { windows_call *w = p; return w->fn(w->a, w->b, w->c, w->d); }
 static u64 call_windows(ms_fn fn, u64 a, u64 b, u64 c, u64 d) {
+#ifdef __aarch64__
+    return fn(a, b, c, d);                             // (ARM64: any thread gets an x86 stack and TEB, src/arm64.c)
+#endif
     uint8_t *teb = NULL;
 #ifndef __aarch64__
     __asm__ volatile("movq %%gs:0x30, %0" : "=r"(teb));

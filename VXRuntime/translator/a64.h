@@ -97,6 +97,10 @@ static inline uint32_t a64_stv_off(int size, int t, int n, int32_t off) {
 }
 static inline uint32_t a64_str8_pre(int t, int n, int imm9) { return 0xF8000C00u | ((uint32_t)imm9 & 0x1FF) << 12 | (uint32_t)n << 5 | (uint32_t)t; }   // [n, #imm]!
 static inline uint32_t a64_ldr8_post(int t, int n, int imm9) { return 0xF8400400u | ((uint32_t)imm9 & 0x1FF) << 12 | (uint32_t)n << 5 | (uint32_t)t; }  // [n], #imm
+static inline uint32_t a64_ld_post(int size, int t, int n, int imm9) {     // [n], #imm (zero-extending)
+    static const uint32_t op[9] = { 0, 0x38400400u, 0x78400400u, 0, 0xB8400400u, 0, 0, 0, 0xF8400400u };
+    return op[size] | ((uint32_t)imm9 & 0x1FF) << 12 | (uint32_t)n << 5 | (uint32_t)t;
+}
 static inline uint32_t a64_ldrb_reg(int t, int n, int m) { return 0x38606800u | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)t; }
 static inline uint32_t a64_stp_pre(int t1, int t2, int n, int imm) { return 0xA9800000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
 static inline uint32_t a64_ldp_post(int t1, int t2, int n, int imm) { return 0xA8C00000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }

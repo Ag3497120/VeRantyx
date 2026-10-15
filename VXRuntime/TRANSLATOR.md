@@ -265,6 +265,18 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
     the TEB. The engine is shared by the threads (translation and linking under a lock, table entries written with
     one STP). Found on the way: the loader read the entry point from the file's copy after freeing it (it worked by
     luck under Rosetta; fixed for both builds).
+  - *Code that changes* (JIT compilers: V8 in Alyx's UI, Mono, LuaJIT). The host pages (16 KB) translated code came
+    from are made read-only; a write there forgets every block made from the page (their entries, and the branches
+    linked to them go back to their stubs) and gives the page back; a write from translated code goes on at the
+    writing instruction, run alone in a block made for that once, so the code after it is translated as written (a
+    store changing the next instruction of its own block works). A page written 16 times after its code ran (code
+    and data together) stays writable, and its blocks compare their x86 bytes on entry instead. VirtualFree drops
+    the translations of what it frees. `tests/smc.c` (in place, data on the code's page, self-modifying, freed and
+    allocated again) passes on both builds.
+  - *Measured against the x86 build under Rosetta* (M1 Max): a Direct3D 11 draw costs 0.72 µs of CPU instead of 1.92
+    (`build/drawbench.exe`; the runtime's own work is ARM64 code now), an event round trip between processes 7.0 µs
+    instead of 8.8. Games: `VXRT_ARM64=1` makes the launch scripts use `build/vxrt-arm64` (not tried on SteamVR or a
+    game yet). The Steam bridge works there too, with the Mac client's ARM64 slice (`build/steam.exe`).
   **A limit of this in-process design, measured:** an ARM64 process on macOS cannot map anything below 4 GB (the
   kernel kills an ARM64 binary with a __PAGEZERO under 4 GB, and with the default one the VM map starts there; the
   x86 build gets its low 4 GB with `-pagezero_size 0x10000`). Programs that ask for low memory (LuaJIT 2.0's

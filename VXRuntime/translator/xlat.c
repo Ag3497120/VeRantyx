@@ -1612,7 +1612,28 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
     uint64_t lo = rip & ~0x3FFFull, hi = n ? ((last + ins[n - 1].len - 1) | 0x3FFF) + 1 : 0;
     uint16_t out = F_ARITH;
     int fuse_p = -1, fuse_k = 0, fuse_sz = 0, fuse_cc = 0;
-    if (n) {
+    if (n && b->check_bytes) {                                            // (code that may change under us: its bytes
+        uint64_t len = last + ins[n - 1].len - rip, at = 0;               //  first, and nothing read past them)
+        size_t mismatch[160]; int nm = 0;
+        mov_imm(b, T_ADDR, rip);
+        while (at < len) {
+            int sz = len - at >= 8 ? 8 : len - at >= 4 ? 4 : len - at >= 2 ? 2 : 1;
+            uint64_t want = 0;
+            memcpy(&want, (const uint8_t *)(uintptr_t)(rip + at), (size_t)sz);
+            E(b, a64_ld_post(sz, S0, T_ADDR, sz));
+            mov_imm(b, S1, want);
+            E(b, a64_cmp(S0, S1));
+            if (nm < 160) mismatch[nm++] = here(b);
+            E(b, 0);
+            at += (uint64_t)sz;
+        }
+        size_t over = here(b); E(b, 0);
+        for (int k = 0; k < nm; k++) b->code[mismatch[k]] = a64_bcond(NE, (int32_t)(b->n - mismatch[k]));
+        E(b, a64_movz(S0, 1, 0)); E(b, a64_str(8, S0, XC, CTX_STALE));
+        mov_imm(b, S1, rip); site_exit(b);
+        patch_b(b, over);
+    }
+    if (n && !b->check_bytes) {
         const x86_insn *l = &ins[n - 1];
         uint64_t next = last + l->len, target = next + (uint64_t)l->imm;
         xlat_buf probe = { 0 };

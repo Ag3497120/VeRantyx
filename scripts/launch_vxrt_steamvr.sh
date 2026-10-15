@@ -30,11 +30,12 @@ VXRT_VR_ROOT="${VXRT_VR_ROOT:-$VERANTYX_VR_DRIVE/vxrt_root}"
 VXRT_VR_OVERLAY="${VXRT_VR_OVERLAY:-$VERANTYX_VR_DRIVE/vxrt_steam_overlay}"
 VXRT_VR_NO_STANDBY="${VXRT_VR_NO_STANDBY:-1}"
 VXRT="$REPO_ROOT/VXRuntime/build/vxrt"
+[[ "${VXRT_ARM64:-0}" == 1 ]] && VXRT="$VXRT-arm64"   # (the ARM64 runtime, the program translated: experimental)
 ENCODER="$REPO_ROOT/build/HardwareEncoder"
 LOG_DIR="${VXRT_VR_LOG_DIR:-$REPO_ROOT/logs}"
 
 [[ -d "$STEAMVR_BIN" ]] || { echo "SteamVR not found at $STEAMVR_BIN" >&2; exit 1; }
-make -C "$REPO_ROOT/VXRuntime" build/vxrt >/dev/null
+make -C "$REPO_ROOT/VXRuntime" "${VXRT#$REPO_ROOT/VXRuntime/}" >/dev/null
 if [[ ! -x "$ENCODER" || "$REPO_ROOT/MacEncoder/HardwareEncoder.swift" -nt "$ENCODER" ]]; then
     mkdir -p "$(dirname "$ENCODER")"
     swiftc -O "$REPO_ROOT/MacEncoder/HardwareEncoder.swift" -o "$ENCODER"
@@ -136,7 +137,7 @@ export VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY"
 export VXRT_DLL_PATH="$VXRT_DLL_DIRS"
 export VXRT_NO_ACTIVATE=1
 
-VXRT_PATTERN="VXRuntime/build/vxrt .*[Ss]team[Vv][Rr]/bin/win64/vr"   # (either library's spelling; the path may have "(x86)")
+VXRT_PATTERN="VXRuntime/build/vxrt(-arm64)? .*[Ss]team[Vv][Rr]/bin/win64/vr"   # (either library's spelling; the path may have "(x86)")
 cleanup() {
     [[ -n "${ENCODER_PID:-}" ]] && kill -TERM "$ENCODER_PID" 2>/dev/null || true
     [[ -n "${WEBUI_PID:-}" ]] && kill -TERM "$WEBUI_PID" 2>/dev/null || true

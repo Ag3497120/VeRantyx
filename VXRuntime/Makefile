@@ -24,7 +24,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp src/arm64.h src/vx.h src/ui.h 
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -46,6 +46,10 @@ build/hw_exceptions.exe: tests/hw_exceptions.c
 build/cxx_exceptions.exe: tests/cxx_exceptions.cpp
 	@mkdir -p build
 	$(MINGWXX) -O1 -static -o $@ $<
+
+build/smc.exe: tests/smc.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
 
 build/window.exe: tests/window.c
 	@mkdir -p build
@@ -254,6 +258,7 @@ runtime-tests: export VXRT_ROOT = build/root
 runtime-tests: export VXRT_NO_ACTIVATE = 1
 runtime-tests: $(VXRT) tests
 	$(VXRT) build/hello_k32.exe
+	$(VXRT) build/smc.exe
 	$(VXRT) build/hello_crt.exe one "two words"
 	$(VXRT) build/threads.exe
 	$(VXRT) build/cxx_exceptions.exe

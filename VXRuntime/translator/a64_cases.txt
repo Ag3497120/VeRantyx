@@ -310,3 +310,7 @@ a64_w32(a64_cmpi(3,4095))|cmp w3, #4095
 a64_cmni(3,2)|cmn x3, #2
 a64_w32(a64_cmni(3,1))|cmn w3, #1
 a64_w32(a64_ands(31,3,5))|tst w3, w5
+a64_ld_post(4,1,2,4)|ldr w1, [x2], #4
+a64_ld_post(2,1,2,2)|ldrh w1, [x2], #2
+a64_ld_post(1,1,2,1)|ldrb w1, [x2], #1
+a64_ld_post(8,1,2,8)|ldr x1, [x2], #8

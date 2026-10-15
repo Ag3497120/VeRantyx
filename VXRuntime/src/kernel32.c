@@ -518,8 +518,11 @@ static WINAPI BOOL TlsSetValue(DWORD i, void *v) {
 
 #ifdef __aarch64__
 #define VX_PROT_RWX (VM_PROT_READ | VM_PROT_WRITE)    // (the program's code is read by the translator, never run)
+void vx_code_freed(void *addr, size_t len);            // (its translations go: src/arm64.c)
+#define VX_CODE_FREED(a, n) vx_code_freed(a, n)
 #else
 #define VX_PROT_RWX VM_PROT_ALL
+#define VX_CODE_FREED(a, n) ((void)0)
 #endif
 // ---- memory -----------------------------------------------------------------------------------------------------------
 // Virtual memory with Windows semantics on Mach VM: a reservation at a requested address either lands exactly
@@ -733,6 +736,7 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
     BOOL ok = 0;
     if (r && (type & MEM_RELEASE) && !size && r->base == (uintptr_t)addr) {
         prot_set(r->base, r->base + r->size, 0);
+        VX_CODE_FREED((void *)r->base, r->size);
         size_t n = mapped_size(r->size);
         if (n >= (1u << 20) && g_nspare < 32 && g_spare_bytes + n <= (512u << 20) && r->base >= (1ull << 32)) {
             g_spare[g_nspare++] = (spare_block){ r->base, n };              // (low-memory blocks are not reused)
@@ -744,6 +748,7 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
     } else if (r && (type & MEM_DECOMMIT)) {
         uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;
         size_t len = size ? (((uintptr_t)addr + size + 0xfff) & ~(uintptr_t)0xfff) - start : r->base + r->size - start;
+        VX_CODE_FREED((void *)start, len);
         mach_vm_address_t a = start;                       // fresh zero pages over the range
         ok = mach_vm_allocate(mach_task_self(), &a, len, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
         prot_set(start, start + len, 0);

@@ -224,10 +224,32 @@ int vx_arm64_state_at(const void *ucv, void *outv) {
 // ---- faults -----------------------------------------------------------------------------------------------------
 static __thread uint64_t t_fault[2];                          // the access fault being dispatched: write?, address
 static void __attribute__((noreturn)) fault_entry(void) { vx_seh_fault(0xC0000005, 2, t_fault); }
+// The program wrote code it had run (SMC): its translations are gone; it goes on at the writing instruction, so
+// that the rest of a block it may have changed is translated again too.
+static void __attribute__((noreturn)) smc_restart(void) {
+    x86_ctx *c = t_ctx;
+    c->single = 1;                                            // (the write first, alone: then what follows, as written)
+    level *l = t_level;
+    while (l && c->gpr[4] >= l->top) l = l->outer;
+    if (!l) { vx_log("arm64: no call of the program's code holds stack %#llx", (unsigned long long)c->gpr[4]); _exit(3); }
+    longjmp(l->jb, 1);
+}
+// From the program's registers in a signal's machine context into its x86 state, at rip.
+static void state_from_signal(x86_ctx *c, const ucontext_t *uc, uint64_t rip) {
+    const _STRUCT_ARM_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
+    for (int i = 0; i < 16; i++) { c->gpr[i] = ss->__x[i]; memcpy(c->xmm[i], &uc->uc_mcontext->__ns.__v[i], 16); }
+    c->flags = ss->__x[27]; c->ras = ss->__fp; c->rip = rip;
+}
+void vx_code_freed(void *addr, size_t len) { xe_forget(g_engine, (uint64_t)(uintptr_t)addr, len); }
 static void on_fault(int sig, siginfo_t *si, void *ucv) {
     ucontext_t *uc = ucv;
     _STRUCT_ARM_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
     uint64_t pc = ss->__pc;
+    if ((sig == SIGSEGV || sig == SIGBUS) && ((uc->uc_mcontext->__es.__esr >> 6) & 1) && xe_smc_write(g_engine, (uint64_t)(uintptr_t)si->si_addr)) {
+        uint64_t at = xe_owns(g_engine, pc) ? xe_rip_at(g_engine, pc) : 0;
+        if (at && t_ctx) { state_from_signal(t_ctx, uc, at); ss->__pc = (uint64_t)(uintptr_t)smc_restart; ss->__lr = 0; }
+        return;                                               // (native code: the write again, now allowed)
+    }
     Dl_info info;
     int native = dladdr((void *)(uintptr_t)pc, &info) != 0;
     if ((sig == SIGSEGV || sig == SIGBUS) && (uint64_t)(uintptr_t)si->si_addr == pc && !native && !xe_owns(g_engine, pc)) {
@@ -239,9 +261,7 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
     if (rip && t_ctx && (sig == SIGSEGV || sig == SIGBUS)) {
         // The program's access fault: its state from the registers the translation keeps it in, then on (out of
         // the signal) to the dispatch on this thread's stack, below the translated code's frame.
-        x86_ctx *c = t_ctx;
-        for (int i = 0; i < 16; i++) { c->gpr[i] = ss->__x[i]; memcpy(c->xmm[i], &uc->uc_mcontext->__ns.__v[i], 16); }
-        c->flags = ss->__x[27]; c->ras = ss->__fp; c->rip = rip;
+        state_from_signal(t_ctx, uc, rip);
         t_fault[0] = (uc->uc_mcontext->__es.__esr >> 6) & 1;             // (WnR: a write)
         t_fault[1] = (uint64_t)(uintptr_t)si->si_addr;
         ss->__pc = (uint64_t)(uintptr_t)fault_entry;
@@ -268,6 +288,7 @@ void vx_arm64_init(void) {
     g_engine = xe_new(0);
     if (!g_engine) { fprintf(stderr, "vxrt: cannot map the translation cache\n"); exit(1); }
     xe_set_native(g_engine, vx_thunk_find);
+    xe_set_smc(g_engine, 1);
     vx_thunks_override(g_special, sizeof g_special / sizeof *g_special);
     void vx_sync_arm64_init(void);
     vx_sync_arm64_init();

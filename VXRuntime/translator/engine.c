@@ -18,6 +18,12 @@ enum { S0 = 16, S1 = 17, T_T = 22, XC = 28, LR = 30 };
 enum { CODE_BYTES = 64 << 20, TABLE_BITS = 16, MAP_BITS = 20 };
 
 typedef struct { uint64_t rip, host; } entry;
+typedef struct { uint64_t rip, host; uint32_t id; } mentry;      // (map: host 0 with the rip kept, a block gone)
+// A translated block: its x86 range, its code, and the branches patched to go to it (code index << 1 | call).
+typedef struct { uint64_t rip, end, host; uint32_t *sites; uint32_t nsites, csites; int dead; } blk;
+// A host page (16 KB) translated code came from, and the blocks made from it (SMC: code that changes).
+enum { PAGE = 16384, PAGE_BITS = 14, PAGES = 1 << 14 };
+typedef struct { uint64_t page; uint32_t *ids; uint32_t n, c; uint32_t faults; int protected, unprotected; } page_rec;
 struct xe {
     uint32_t *code;                 // MAP_JIT: stubs first, then blocks
     size_t used, cap;               // (in instructions)
@@ -30,7 +36,10 @@ struct xe {
     struct { uint64_t host, rip; } *imap;   // every translated instruction's code, in order (then rip 0: a block's end)
     size_t nimap, cimap;
     entry *table;                   // read by the lookup stub: direct-mapped
-    entry *map;                     // every block: open addressing (rip 0: empty)
+    mentry *map;                    // every block: open addressing (rip 0: empty)
+    blk *blocks; size_t nblocks, cblocks;
+    page_rec *pages;                // open addressing (page 0: empty)
+    int smc;                        // xe_set_smc: write-protect the pages translated code came from
     int ordered;
     xe_stats stats;
 };
@@ -148,6 +157,7 @@ xe *xe_new(int ordered) {
     e->cap = CODE_BYTES / 4;
     e->table = calloc(1u << TABLE_BITS, sizeof *e->table);
     e->map = calloc(1u << MAP_BITS, sizeof *e->map);
+    e->pages = calloc(PAGES, sizeof *e->pages);
     e->ordered = ordered;
     pthread_mutex_init(&e->lock, NULL);
     e->cimap = CODE_BYTES / 8;                                            // (reserved: read without the lock by fault handlers)
@@ -168,6 +178,13 @@ xe *xe_new(int ordered) {
 
 void xe_flush(xe *e) {
     e->nimap = 0;
+    for (size_t i = 0; i < e->nblocks; i++) free(e->blocks[i].sites);
+    e->nblocks = 0;
+    for (uint32_t i = 0; i < PAGES; i++) {
+        if (e->pages[i].protected) mprotect((void *)(uintptr_t)e->pages[i].page, PAGE, PROT_READ | PROT_WRITE);
+        free(e->pages[i].ids);
+    }
+    memset(e->pages, 0, PAGES * sizeof *e->pages);
     for (int i = 0; i < e->nrings; i++) ring_clear(e->rings[i]);
     memset(e->table, 0, (sizeof *e->table) << TABLE_BITS);
     memset(e->map, 0, (sizeof *e->map) << MAP_BITS);
@@ -175,22 +192,105 @@ void xe_flush(xe *e) {
     sys_icache_invalidate(e->code, e->used * 4);
 }
 
-static uint64_t find(xe *e, uint64_t rip) {
+static mentry *find_entry(xe *e, uint64_t rip) {
     for (uint32_t i = idx(rip, MAP_BITS); e->map[i].rip; i = (i + 1) & ((1u << MAP_BITS) - 1))
-        if (e->map[i].rip == rip) return e->map[i].host;
-    return 0;
+        if (e->map[i].rip == rip && e->map[i].host) return &e->map[i];
+    return NULL;
+}
+static uint64_t find(xe *e, uint64_t rip) { mentry *m = find_entry(e, rip); return m ? m->host : 0; }
+// A branch at p now goes to block id: remembered, to be put back to its stub if the block goes.
+static void add_site(xe *e, uint32_t id, uint32_t *p, int call) {
+    blk *b = &e->blocks[id];
+    if (b->nsites == b->csites) { b->csites = b->csites ? 2 * b->csites : 4; b->sites = realloc(b->sites, b->csites * sizeof *b->sites); }
+    b->sites[b->nsites++] = (uint32_t)(p - e->code) << 1 | (uint32_t)call;
 }
 
-// The block at rip, translated now if it is not yet. 0: it cannot be.
-static uint64_t block(xe *e, uint64_t rip, uint64_t stop) {
-    uint64_t host = find(e, rip);
-    if (host) return host;
+// ---- code that changes (SMC) ------------------------------------------------------------------------------------
+// The pages translated code came from are made read-only; a write there (xe_smc_write, from the fault handler)
+// forgets every block made from the page and gives the page back. A page written again and again (data next to
+// code) is left writable after a while, its translations no longer watched.
+static page_rec *page_at(xe *e, uint64_t page, int make) {
+    for (uint32_t i = (uint32_t)((page >> PAGE_BITS) * 0x9E3779B1u) & (PAGES - 1), n = 0; n < PAGES; i = (i + 1) & (PAGES - 1), n++) {
+        if (e->pages[i].page == page) return &e->pages[i];
+        if (!e->pages[i].page) { if (!make) return NULL; e->pages[i].page = page; return &e->pages[i]; }
+    }
+    return NULL;
+}
+static void forget_block(xe *e, uint32_t id) {
+    blk *b = &e->blocks[id];
+    if (b->dead) return;
+    b->dead = 1;
+    mentry *m = find_entry(e, b->rip);
+    if (m && m->host == b->host) m->host = 0;
+    entry *t = &e->table[idx(b->rip, TABLE_BITS)];
+    if (t->rip == b->rip && t->host == b->host) put_entry(t, 0, 0);
+    writable(1);
+    for (uint32_t k = 0; k < b->nsites; k++) {                            // (branches to it: to their stubs again)
+        uint32_t *p = e->code + (b->sites[k] >> 1);
+        *p = (b->sites[k] & 1) ? a64_bl((int32_t)(e->link_call - p)) : a64_bl((int32_t)(e->link - p));
+        sys_icache_invalidate(p, 4);
+    }
+    writable(0);
+    b->nsites = 0;
+}
+static void watch_block(xe *e, uint32_t id) {
+    blk *b = &e->blocks[id];
+    for (uint64_t pg = b->rip & ~(uint64_t)(PAGE - 1); pg < b->end; pg += PAGE) {
+        page_rec *r = page_at(e, pg, 1);
+        if (!r) return;
+        if (r->n == r->c) { r->c = r->c ? 2 * r->c : 8; r->ids = realloc(r->ids, r->c * sizeof *r->ids); }
+        r->ids[r->n++] = id;
+        if (!r->protected && !r->unprotected && !mprotect((void *)(uintptr_t)pg, PAGE, PROT_READ)) r->protected = 1;
+    }
+}
+int xe_smc_write(xe *e, uint64_t addr) {
+    if (!e || !e->smc) return 0;
+    uint64_t pg = addr & ~(uint64_t)(PAGE - 1);
+    pthread_mutex_lock(&e->lock);
+    page_rec *r = page_at(e, pg, 0);
+    if (!r || !r->protected) { pthread_mutex_unlock(&e->lock); return 0; }
+    for (uint32_t k = 0; k < r->n; k++) forget_block(e, r->ids[k]);
+    r->n = 0;
+    r->protected = 0;
+    if (++r->faults == 16) r->unprotected = 1;                          // (written often: its blocks check their bytes)
+    for (int i = 0; i < e->nrings; i++) ring_clear(e->rings[i]);
+    mprotect((void *)(uintptr_t)pg, PAGE, PROT_READ | PROT_WRITE);
+    e->stats.smc_pages++;
+    pthread_mutex_unlock(&e->lock);
+    return 1;
+}
+void xe_forget(xe *e, uint64_t addr, uint64_t len) {
+    if (!e || !e->smc || !len) return;
+    pthread_mutex_lock(&e->lock);
+    for (uint64_t pg = addr & ~(uint64_t)(PAGE - 1); pg < addr + len; pg += PAGE) {
+        page_rec *r = page_at(e, pg, 0);
+        if (!r) continue;
+        for (uint32_t k = 0; k < r->n; k++) forget_block(e, r->ids[k]);
+        r->n = 0;
+        if (r->protected) mprotect((void *)(uintptr_t)pg, PAGE, PROT_READ | PROT_WRITE);
+        r->protected = 0;
+    }
+    pthread_mutex_unlock(&e->lock);
+}
+void xe_set_smc(xe *e, int on) { e->smc = on; }
+
+// The block at rip, translated now if it is not yet: its id (-1: it cannot be). once: the instruction at rip
+// alone, not kept (not found by others, no page watched).
+static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
+    mentry *found = once ? NULL : find_entry(e, rip);
+    if (found) return found->id;
     xlat_buf b = { 0 };
     b.ordered = e->ordered; b.stop = stop;
     uint64_t end = rip + 1;
     void (*thunk)(x86_ctx *) = e->native ? e->native(rip) : NULL;
     if (thunk) xlat_block_native(&b, thunk);
-    else if (xlat_block_linked(&b, rip, 64, &end) < 0) { free(b.code); free(b.relocs); free(b.imap); return 0; }
+    else {
+        if (e->smc) {                                                     // (a page written often: a checked block)
+            page_rec *r = page_at(e, rip & ~(uint64_t)(PAGE - 1), 0), *r2 = page_at(e, (rip + 1024) & ~(uint64_t)(PAGE - 1), 0);
+            b.check_bytes = (r && r->unprotected) || (r2 && r2->unprotected);
+        }
+        if (xlat_block_linked(&b, rip, once ? 1 : 64, &end) < 0) { free(b.code); free(b.relocs); free(b.imap); return -1; }
+    }
     if (e->used + b.n > e->cap || e->stats.blocks + 1 >= (1u << (MAP_BITS - 1))) {   // (full: start over)
         xe_flush(e);
         e->stats.flushes++;
@@ -204,13 +304,13 @@ static uint64_t block(xe *e, uint64_t rip, uint64_t stop) {
         else if (b.relocs[i].kind == XR_EXIT) *p = a64_b((int32_t)(e->exit - p));
         else if (b.relocs[i].kind == XR_LOOKUP_CALL) *p = a64_bl((int32_t)(e->lookup - p));
         else if (b.relocs[i].kind == XR_CALL) {                          // (the return's site, 3 words, then the target)
-            uint64_t target = (uint64_t)p[4] | (uint64_t)p[5] << 32, t = find(e, target);
-            *p = a64_bl(t ? (int32_t)((uint32_t *)(uintptr_t)t - p) : (int32_t)(e->link_call - p));
-            if (t) e->stats.linked++;
+            mentry *t = find_entry(e, (uint64_t)p[4] | (uint64_t)p[5] << 32);
+            *p = a64_bl(t ? (int32_t)((uint32_t *)(uintptr_t)t->host - p) : (int32_t)(e->link_call - p));
+            if (t) { e->stats.linked++; add_site(e, t->id, p, 1); }
         } else {
-            uint64_t target = (uint64_t)p[1] | (uint64_t)p[2] << 32, t = find(e, target);
-            *p = t ? a64_b((int32_t)((uint32_t *)(uintptr_t)t - p)) : a64_bl((int32_t)(e->link - p));
-            if (t) e->stats.linked++;
+            mentry *t = find_entry(e, (uint64_t)p[1] | (uint64_t)p[2] << 32);
+            *p = t ? a64_b((int32_t)((uint32_t *)(uintptr_t)t->host - p)) : a64_bl((int32_t)(e->link - p));
+            if (t) { e->stats.linked++; add_site(e, t->id, p, 0); }
         }
     }
     writable(0);
@@ -223,20 +323,27 @@ static uint64_t block(xe *e, uint64_t rip, uint64_t stop) {
         fprintf(dump, "\n"); fflush(dump);
     }
     e->used += b.n;
-    host = (uint64_t)(uintptr_t)at;
-    uint32_t i = idx(rip, MAP_BITS);
-    while (e->map[i].rip) i = (i + 1) & ((1u << MAP_BITS) - 1);
-    e->map[i].rip = rip; e->map[i].host = host;
-    put_entry(&e->table[idx(rip, TABLE_BITS)], rip, host);
+    uint64_t host = (uint64_t)(uintptr_t)at;
+    if (e->nblocks == e->cblocks) { e->cblocks = e->cblocks ? 2 * e->cblocks : 1024; e->blocks = realloc(e->blocks, e->cblocks * sizeof *e->blocks); }
+    uint32_t id = (uint32_t)e->nblocks++;
+    e->blocks[id] = (blk){ rip, end, host, NULL, 0, 0, 0 };
+    if (!once) {
+        uint32_t i = idx(rip, MAP_BITS);
+        while (e->map[i].rip) i = (i + 1) & ((1u << MAP_BITS) - 1);
+        e->map[i].rip = rip; e->map[i].host = host; e->map[i].id = id;
+        if (e->smc && !thunk) watch_block(e, id);
+    }
+    if (!once) put_entry(&e->table[idx(rip, TABLE_BITS)], rip, host);
     for (size_t k = 0; k < b.nimap && e->nimap + 1 < e->cimap; k++) { e->imap[e->nimap].host = host + 4 * b.imap[k].at; e->imap[e->nimap++].rip = b.imap[k].rip; }
     if (e->nimap < e->cimap) { e->imap[e->nimap].host = host + 4 * b.n; e->imap[e->nimap].rip = 0; __atomic_store_n(&e->nimap, e->nimap + 1, __ATOMIC_RELEASE); }
     free(b.imap);
     e->stats.blocks++; e->stats.x86_bytes += end - rip; e->stats.arm_insns += b.n;
     e->stats.flags_skipped += (uint64_t)b.nskipped; e->stats.fused += (uint64_t)b.nfused;
     free(b.code); free(b.relocs);
-    return host;
+    return id;
 }
 
+static int64_t block(xe *e, uint64_t rip, uint64_t stop) { return block_ex(e, rip, stop, 0); }
 static int run(xe *e, x86_ctx *c, uint64_t stop);
 int xe_run(xe *e, x86_ctx *c, uint64_t stop) {
     c->link = 0;
@@ -252,13 +359,18 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
         if (c->fault) return (int)c->fault;
         if (c->rip == stop) return 0;
         pthread_mutex_lock(&e->lock);
-        uint64_t host = block(e, c->rip, stop);
-        if (!host) { pthread_mutex_unlock(&e->lock); return -1; }
+        int once = c->single != 0;
+        c->single = 0;
+        int64_t id = block_ex(e, c->rip, stop, once);
+        if (once) c->link = 0;                                            // (nothing is linked to a one-off block)
+        if (id < 0) { pthread_mutex_unlock(&e->lock); return -1; }
+        uint64_t host = e->blocks[id].host;
         if (c->link) {                                                    // (patch the site that came here: a call's stays BL)
             uint32_t *p = (uint32_t *)(uintptr_t)c->link;
             int call = (*p & 0xFC000000u) == 0x94000000u && p + ((int32_t)(*p << 6) >> 6) == e->link_call;
             int32_t words = (int32_t)((uint32_t *)(uintptr_t)host - p);
             writable(1); *p = call ? a64_bl(words) : a64_b(words); writable(0);
+            add_site(e, (uint32_t)id, p, call);
             sys_icache_invalidate(p, 4);
             e->stats.linked++;
             c->link = 0;
@@ -267,6 +379,13 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
         e->stats.entries++;
         c->entry = host;
         ((void (*)(x86_ctx *))(void *)e->enter)(c);
+        if (c->stale) {                                                   // (a checked block found its code changed)
+            c->stale = 0;
+            pthread_mutex_lock(&e->lock);
+            mentry *m = find_entry(e, c->rip);
+            if (m) forget_block(e, m->id);
+            pthread_mutex_unlock(&e->lock);
+        }
     }
 }
 

@@ -8,6 +8,7 @@ typedef struct {
     uint64_t x86_bytes, arm_insns;                  // code translated
     uint64_t split_patches;                         // ordered accesses across 16 bytes patched (engine.c)
     uint64_t flags_skipped, fused;                  // instructions whose flags nobody reads, Jccs fused with a CMP / TEST
+    uint64_t smc_pages;                             // pages whose translations went because the code was written
 } xe_stats;
 
 // ordered: memory accesses that may be shared as LDAPR / STLR (in-process, without TSO); installs a SIGBUS / SIGSEGV
@@ -20,6 +21,12 @@ void xe_set_native(xe *e, void (*(*find)(uint64_t rip))(x86_ctx *));
 uint64_t xe_ring_new(xe *e);
 // The x86 instruction whose translation holds host address pc (0: none, or not an x86 instruction's code).
 uint64_t xe_rip_at(const xe *e, uint64_t pc);
+// Code that changes: with smc on, the pages translations come from are write-protected; the program's fault
+// handler calls xe_smc_write for a write fault (1: it was such a page, its translations are gone and it is
+// writable again: retry the write). xe_forget: memory freed or replaced (VirtualFree), its translations go.
+void xe_set_smc(xe *e, int on);
+int xe_smc_write(xe *e, uint64_t addr);
+void xe_forget(xe *e, uint64_t addr, uint64_t len);
 // Whether pc is in the engine's translated code.
 int xe_owns(const xe *e, uint64_t pc);
 // Forgets every translation (the code it came from changed). Not while another thread runs translated code.

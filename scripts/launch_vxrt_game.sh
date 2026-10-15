@@ -19,6 +19,7 @@ export VXRT_VR_OVERLAY="${VXRT_VR_OVERLAY:-$VERANTYX_VR_DRIVE/vxrt_steam_overlay
 LOG_DIR="${VXRT_VR_LOG_DIR:-$REPO_ROOT/logs}"
 export VXRT_VR_LOG_DIR="$LOG_DIR"
 VXRT="$REPO_ROOT/VXRuntime/build/vxrt"
+[[ "${VXRT_ARM64:-0}" == 1 ]] && VXRT="$VXRT-arm64"   # (the ARM64 runtime, the program translated: experimental)
 
 [[ $# -ge 1 && -f "$1" ]] || { echo "usage: launch_vxrt_game.sh <game .exe> [arguments...]" >&2; exit 2; }
 EXE="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"

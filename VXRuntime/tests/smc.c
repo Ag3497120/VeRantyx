@@ -1,0 +1,55 @@
+// Code that changes after it ran (what JIT compilers do; the ARM64 build's translations must notice): an immediate
+// rewritten in place many times, a function rewritten while data next to it on the same page keeps being written,
+// code that rewrites the instruction right after its own store (one translated block), and memory freed and
+// allocated again at the same address with other code in it.
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef int (*fn)(void);
+static int failed;
+#define CHECK(c) do { if (!(c)) { failed++; printf("  failed: %s (line %d)\n", #c, __LINE__); } } while (0)
+
+static void put_mov_ret(unsigned char *p, int v) { p[0] = 0xB8; memcpy(p + 1, &v, 4); p[5] = 0xC3; }
+
+int main(void) {
+    unsigned char *p = VirtualAlloc(NULL, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    CHECK(p != NULL);
+    // 1. mov eax, i; ret -- rewritten and called 200 times
+    int ok1 = 0;
+    for (int i = 0; i < 200; i++) { put_mov_ret(p, i * 7); if (((fn)p)() == i * 7) ok1++; }
+    CHECK(ok1 == 200);
+
+    // 2. data on the code's page, written between calls; the code itself rewritten now and then
+    volatile int *data = (volatile int *)(p + 2048);
+    int ok2 = 0;
+    for (int i = 0; i < 2000; i++) {
+        data[i & 63] = i;
+        if (i % 100 == 0) put_mov_ret(p + 64, i);
+        if (((fn)(p + 64))() == i / 100 * 100) ok2++;
+    }
+    CHECK(ok2 == 2000);
+
+    // 3. self-modifying: the store patches the immediate of the instruction that follows it
+    //    mov byte [rip + 1], 0x42 ; mov eax, 0x11 ; ret   ->  returns 0x42
+    unsigned char sm[] = { 0xC6, 0x05, 0x01, 0x00, 0x00, 0x00, 0x42, 0xB8, 0x11, 0x00, 0x00, 0x00, 0xC3 };
+    // (the displacement is from the next instruction (p+7) to the immediate (p+8): 1)
+    int ok3 = 0;
+    unsigned char *s3 = VirtualAlloc(NULL, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    for (int i = 0; i < 3; i++) { memcpy(s3, sm, sizeof sm); if (((fn)s3)() == 0x42) ok3++; }
+    CHECK(ok3 == 3);
+
+    // 4. freed, then allocated again (often at the same address) with other code
+    int ok4 = 0;
+    for (int i = 0; i < 20; i++) {
+        unsigned char *q = VirtualAlloc(NULL, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        put_mov_ret(q, 1000 + i);
+        if (((fn)q)() == 1000 + i) ok4++;
+        VirtualFree(q, 0, MEM_RELEASE);
+    }
+    CHECK(ok4 == 20);
+
+    printf("smc: in place %d/200, with data on the page %d/2000, self-modifying %d/3, reallocated %d/20: %d failed checks -> %s\n",
+           ok1, ok2, ok3, ok4, failed, failed ? "FAILED" : "ok");
+    return failed != 0;
+}

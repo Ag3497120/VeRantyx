@@ -28,6 +28,7 @@ export VXRT_VR_OVERLAY="${VXRT_VR_OVERLAY:-$VERANTYX_VR_DRIVE/vxrt_steam_overlay
 LOG_DIR="${VXRT_VR_LOG_DIR:-$REPO_ROOT/logs}"
 export VXRT_VR_LOG_DIR="$LOG_DIR"
 VXRT="$REPO_ROOT/VXRuntime/build/vxrt"
+[[ "${VXRT_ARM64:-0}" == 1 ]] && VXRT="$VXRT-arm64"   # (the ARM64 runtime, the program translated: experimental)
 
 [[ -d "$ALYX_BIN" ]] || { echo "Half-Life: Alyx not found at $ALYX_BIN" >&2; exit 1; }
 pgrep -f "Steam.AppBundle/Steam/Contents/MacOS/steam_osx" >/dev/null || { echo "Start Steam on the Mac and sign in first" >&2; exit 1; }
