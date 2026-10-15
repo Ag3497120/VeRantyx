@@ -2012,3 +2012,7 @@ void d3d_draw_init(void) {
     g_query_vtbl = D3D_VTABLE(ID3D11Query, q);
     g_predicate_vtbl = D3D_VTABLE(ID3D11Predicate, q);
 }
+
+#ifdef __aarch64__
+#include "thunks/d3d11_draw.m.inc"
+#endif

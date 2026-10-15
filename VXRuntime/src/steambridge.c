@@ -110,8 +110,10 @@ uint64_t vx_call_on_stack(uint64_t (*fn)(void *), void *arg, void *stack_top);  
 typedef struct { ms_fn fn; u64 a, b, c, d; } windows_call;
 static uint64_t run_call(void *p) { windows_call *w = p; return w->fn(w->a, w->b, w->c, w->d); }
 static u64 call_windows(ms_fn fn, u64 a, u64 b, u64 c, u64 d) {
-    uint8_t *teb;
+    uint8_t *teb = NULL;
+#ifndef __aarch64__
     __asm__ volatile("movq %%gs:0x30, %0" : "=r"(teb));
+#endif
     if (teb) return fn(a, b, c, d);                    // a thread of the program
     static __thread uint8_t *stack;
     if (!stack) {
@@ -392,3 +394,7 @@ void vx_steambridge_init(void) {
     g_trace = getenv("VXRT_TRACE_STEAM") ? atoi(getenv("VXRT_TRACE_STEAM")) : 0;   // 2: every call
     if (vx_steambridge_enabled()) vx_register_module("steamclient64.dll", g_exports, sizeof g_exports / sizeof g_exports[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/steambridge.c.inc"
+#endif

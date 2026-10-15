@@ -341,7 +341,9 @@ static WINAPI HANDLE CreateThread(void *sa, size_t stack, DWORD (WINAPI *start)(
 static WINAPI void ExitThread(DWORD code) {
     if (t_exit_jump) { t_exit_code = code; longjmp(*t_exit_jump, 1); }
     fflush(stdout);
+#ifndef __aarch64__
     __asm__ volatile("movq $0, %%gs:0x60" ::: "memory");     // the PEB out of libc's localtime slot (see loader.c)
+#endif
     pthread_exit(NULL);                        // the main thread: the process lives on while other threads run
 }
 
@@ -1230,6 +1232,9 @@ typedef struct vx_fiber {
     size_t stack_size;
     void (WINAPI *start)(void *);
     int converted;                   // ConvertThreadToFiber calls not undone yet
+#ifdef __aarch64__
+    struct { uint64_t gpr[16], rip, flags; uint8_t xmm[16][16]; uint32_t mxcsr; uint16_t fcw; uint8_t *tib_base, *tib_limit; } x86;   // (while not running)
+#endif
 } vx_fiber;
 #define TEB_FIBER_DATA 0x20
 void vx_fiber_switch(void **save_sp, void *new_sp);
@@ -1258,6 +1263,9 @@ static void fiber_begin(void) {
     f->start(f->param);
     ExitThread(0);
 }
+#ifdef __aarch64__
+static void fiber_x86_init(vx_fiber *f);
+#endif
 static WINAPI void *CreateFiberEx(uint64_t commit, uint64_t reserve, DWORD flags, void (WINAPI *start)(void *), void *param) {
     (void)flags;
     size_t page = (size_t)getpagesize(), size = reserve > commit ? reserve : commit;
@@ -1278,9 +1286,52 @@ static WINAPI void *CreateFiberEx(uint64_t commit, uint64_t reserve, DWORD flags
     ((uint32_t *)sp)[0] = 0x1f80;                                  // MXCSR: all exceptions masked
     ((uint32_t *)sp)[1] = 0x027f;                                  // x87: 53-bit precision, exceptions masked
     f->sp = sp;
+#ifdef __aarch64__
+    fiber_x86_init(f);
+#endif
     return f;
 }
 static WINAPI void *CreateFiber(uint64_t size, void (WINAPI *start)(void *), void *param) { return CreateFiberEx(size, 0, 0, start, param); }
+#ifdef __aarch64__
+// ARM64: a fiber is the program's registers (src/arm64.c), switched by a thunk of its own. A new fiber starts in its
+// start routine as if called, returning to fiber_returned (which ends the thread, as on Windows).
+#include "arm64.h"
+static WINAPI void SwitchToFiber(void *to);
+void fiber_returned(void) { ExitThread(0); }
+static void th_fiber_returned(x86_ctx *c) { (void)c; ExitThread(0); }
+static void fiber_x86_init(vx_fiber *f) {
+    memset(&f->x86, 0, sizeof f->x86);
+    uint64_t sp = ((uint64_t)(uintptr_t)f->stack_top - 64) & ~15ull;
+    sp -= 8;
+    *(uint64_t *)(uintptr_t)sp = (uint64_t)(uintptr_t)fiber_returned;
+    f->x86.gpr[4] = sp; f->x86.gpr[1] = (uint64_t)(uintptr_t)f->param;
+    f->x86.rip = (uint64_t)(uintptr_t)f->start;
+    f->x86.flags = 0x202; f->x86.mxcsr = 0x1f80; f->x86.fcw = 0x027f;
+}
+static void th_SwitchToFiber(x86_ctx *c) {
+    vx_fiber **cur = current_fiber_slot(), *from = *cur, *f = (vx_fiber *)(uintptr_t)c->gpr[1];
+    if (!f || f == from) return;
+    if (!from) { vx_log("SwitchToFiber from a thread that is not a fiber"); abort(); }
+    uint64_t rsp = c->gpr[4];
+    memcpy(from->x86.gpr, c->gpr, sizeof c->gpr);
+    from->x86.gpr[4] = rsp + 8; from->x86.rip = *(uint64_t *)(uintptr_t)rsp;     // (as returned from the call)
+    from->x86.flags = c->flags; from->x86.mxcsr = c->mxcsr; from->x86.fcw = c->fcw;
+    memcpy(from->x86.xmm, c->xmm, sizeof c->xmm);
+    uint8_t *teb = vx_teb();
+    from->x86.tib_base = *(uint8_t **)(teb + 8); from->x86.tib_limit = *(uint8_t **)(teb + 0x10);   // NT_TIB StackBase, StackLimit
+    *(void **)(teb + 8) = f->stack ? f->stack_top : f->x86.tib_base;
+    *(void **)(teb + 0x10) = f->stack ? f->stack : f->x86.tib_limit;
+    *cur = f;
+    memcpy(c->gpr, f->x86.gpr, sizeof c->gpr);
+    c->rip = f->x86.rip; c->flags = f->x86.flags; c->mxcsr = f->x86.mxcsr; c->fcw = f->x86.fcw;
+    memcpy(c->xmm, f->x86.xmm, sizeof c->xmm);
+    c->jump = 1;
+}
+void vx_sync_arm64_init(void) {
+    static const vx_thunk t[] = { { (const void *)SwitchToFiber, th_SwitchToFiber }, { (const void *)fiber_returned, th_fiber_returned } };
+    vx_thunks_override(t, 2);
+}
+#endif
 static WINAPI void SwitchToFiber(void *to) {
     vx_fiber **cur = current_fiber_slot(), *from = *cur, *f = to;
     if (!f || f == from) return;
@@ -1592,3 +1643,7 @@ void vx_sync_init(void) {
     vx_register_module("ucrtbase.dll", sync_crt, sizeof sync_crt / sizeof sync_crt[0]);
     vx_register_module("msvcrt.dll", sync_crt, sizeof sync_crt / sizeof sync_crt[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/sync.c.inc"
+#endif

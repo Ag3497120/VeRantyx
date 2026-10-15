@@ -516,3 +516,7 @@ void vx_desktop_init(void) {
     static const vx_export ntdll[] = { { "__chkstk", (void *)vx_chkstk } };
     vx_register_module("ntdll.dll", ntdll, 1);
 }
+
+#ifdef __aarch64__
+#include "thunks/desktop.c.inc"
+#endif

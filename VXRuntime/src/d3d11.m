@@ -493,7 +493,7 @@ void d3d_end_render(d3d_context *c) {
         if (!multi && c->render_rtv[0] && c->render_rtv[0]->resource->kind == K_TEXTURE) multi = ((d3d_texture *)c->render_rtv[0]->resource)->desc[TD_WIDTH] >= 2048;
         if (multi) {
             Dl_info info;
-            void *caller = __builtin_return_address(0);
+            void *caller = VX_RETURN_ADDRESS();
             void *fn = dladdr(caller, &info) && info.dli_saddr ? info.dli_saddr : caller;
             for (int i = 0; i < 32; i++) if (!g_end_reasons[i].fn || g_end_reasons[i].fn == fn) { g_end_reasons[i].fn = fn; g_end_reasons[i].n++; break; }
         }
@@ -1466,3 +1466,7 @@ void vx_d3d11_init(void) {
     pthread_once(&g_tables_once, make_tables);
     vx_register_module("d3d11.dll", d3d11, sizeof d3d11 / sizeof d3d11[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/d3d11.m.inc"
+#endif

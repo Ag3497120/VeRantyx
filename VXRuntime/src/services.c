@@ -621,9 +621,9 @@ static WINAPI BOOL CreateHardLinkW(const WCHAR *link_name, const WCHAR *existing
 // wsprintfW (user32): the C runtime's wide formatting.
 int vx_format_w(WCHAR *out, size_t cap, const WCHAR *fmt, const char *ap);
 static WINAPI int wsprintfW(WCHAR *buf, const WCHAR *fmt, ...) {
-    __builtin_ms_va_list ap; __builtin_ms_va_start(ap, fmt);
+    vx_va_list ap; vx_va_start(ap, fmt);
     int n = vx_format_w(buf, 1025, fmt, ap);
-    __builtin_ms_va_end(ap);
+    vx_va_end(ap);
     return n;
 }
 static WINAPI int wvsprintfW(WCHAR *buf, const WCHAR *fmt, const char *ap) { return vx_format_w(buf, 1025, fmt, ap); }
@@ -779,3 +779,7 @@ void vx_services_init(void) {
     vx_register_module("imm32.dll", imm32, sizeof imm32 / sizeof imm32[0]);
     vx_register_module("d3d9.dll", d3d9, sizeof d3d9 / sizeof d3d9[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/services.c.inc"
+#endif

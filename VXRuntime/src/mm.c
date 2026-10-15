@@ -48,3 +48,7 @@ void vx_mm_init(void) {
     vx_register_module("winmm.dll", winmm, sizeof winmm / sizeof winmm[0]);
     vx_register_module("imm32.dll", imm32, sizeof imm32 / sizeof imm32[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/mm.c.inc"
+#endif

@@ -48,6 +48,9 @@ static int left_alone(const char *name) {
 }
 // The trampoline for a function (the function itself when it is left alone or the table is full).
 void *vx_trace_wrap(const char *dll, const char *name, void *fn) {
+#ifdef __aarch64__
+    (void)dll; (void)name; return fn;          // (ARM64: not yet)
+#endif
     if (!fn || !name || !vx_trace_calls_on() || left_alone(name)) return fn;
     pthread_mutex_lock(&g_lock);
     int i = 0;
@@ -77,3 +80,7 @@ WINAPI uint64_t vx_trace_returned(uint64_t result) {
            (unsigned long long)((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - f.start) / 1000));
     return f.ret;
 }
+
+#ifdef __aarch64__
+#include "thunks/calltrace.c.inc"
+#endif

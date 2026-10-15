@@ -401,3 +401,7 @@ void vx_audio_init(void) {
     g_endpoint = d3d_alloc(sizeof(d3d_object), K_STATE, g_endpoint_vtbl, NULL);
     vx_com_register_class(&CLSID_MMDeviceEnumerator, create_enumerator);
 }
+
+#ifdef __aarch64__
+#include "thunks/audio.m.inc"
+#endif

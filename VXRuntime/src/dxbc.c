@@ -1563,3 +1563,7 @@ void dxbc_free(dxbc_shader *s) {
     free(s->msl); free(s->msl_kernel); free(s->msl_passthrough);
     s->msl = s->msl_kernel = s->msl_passthrough = NULL;
 }
+
+#ifdef __aarch64__
+#include "thunks/dxbc.c.inc"
+#endif

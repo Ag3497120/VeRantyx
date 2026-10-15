@@ -110,6 +110,12 @@ static int is_builtin_handle(const void *h) {
            ((const char *)h - g_builtin_names[0]) % 64 == 0;
 }
 
+#ifdef __aarch64__
+#define VX_PROT_CODE (PROT_READ | PROT_WRITE)      // (x86 code: read by the translator, never run as it is)
+__thread size_t vx_x86_stack_size;
+#else
+#define VX_PROT_CODE (PROT_READ | PROT_WRITE | PROT_EXEC)
+#endif
 // ---- unimplemented imports ------------------------------------------------------------------------------------
 // Each missing import gets a small stub that names itself when called:
 //   mov rcx, "dll!function" ; mov rax, vx_unimplemented ; jmp rax
@@ -122,7 +128,7 @@ static WINAPI void vx_unimplemented(const char *what) {
 static void *make_stub(const char *dll, const char *name) {
     static uint8_t *page; static size_t used;
     if (!page || used + 32 > 16384) {
-        page = mmap(NULL, 16384, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+        page = mmap(NULL, 16384, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON, -1, 0);
         used = 0;
     }
     char *label = malloc(strlen(dll) + strlen(name) + 2);
@@ -197,10 +203,14 @@ static pthread_mutex_t g_tebs_lock = PTHREAD_MUTEX_INITIALIZER;
 // the buffer of the non-reentrant localtime(). Program threads point it at the PEB; nothing here calls
 // localtime() (only localtime_r), so the slot is never used as a buffer while the PEB is in it.
 static void set_gs_slots(uint8_t *teb) {
+#ifdef __aarch64__
+    (void)teb;                                     // (ARM64: translated code's gs is the TEB, x86_ctx.gs_base)
+#else
     uint64_t self = (uint64_t)teb, tls = *(uint64_t *)(teb + TEB_TLS_POINTER), peb = (uint64_t)g_peb;
     __asm__ volatile("movq %0, %%gs:0x30" :: "r"(self));
     __asm__ volatile("movq %0, %%gs:0x58" :: "r"(tls));
     __asm__ volatile("movq %0, %%gs:0x60" :: "r"(peb));
+#endif
 }
 
 // A fresh copy of an image's TLS template (static __declspec(thread) data).
@@ -224,10 +234,19 @@ void vx_signal_stack(void);   // seh.c
 void vx_thread_attach(void) {
     vx_signal_stack();
     uint8_t *teb = calloc(1, TEB_SIZE);
+#ifdef __aarch64__
+    // The program's code runs on a stack of its own (this thread's stays the runtime's), below a guard page.
+    size_t size = vx_x86_stack_size ? vx_x86_stack_size : (1u << 20);
+    uint8_t *lo = mmap(NULL, size + 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    mprotect(lo, 16384, PROT_NONE);
+    *(void **)(teb + TEB_STACK_BASE) = lo + 16384 + size;
+    *(void **)(teb + TEB_STACK_LIMIT) = lo + 16384;
+#else
     pthread_t self = pthread_self();
     uint8_t *stack_top = pthread_get_stackaddr_np(self);
     *(void **)(teb + TEB_STACK_BASE) = stack_top;
     *(void **)(teb + TEB_STACK_LIMIT) = stack_top - pthread_get_stacksize_np(self);
+#endif
     *(void **)(teb + TEB_SELF) = teb;
     *(uint64_t *)(teb + TEB_CLIENT_ID) = (uint64_t)getpid();
     *(uint64_t *)(teb + TEB_CLIENT_ID + 8) = vx_current_tid();
@@ -256,8 +275,15 @@ void vx_thread_detach(void) {
     for (int i = 0; i < MAX_TLS_MODULES; i++) free(tls[i]);
     free(tls);
     pthread_setspecific(g_teb_key, NULL);
+#ifdef __aarch64__
+    void vx_arm64_thread_exit(void);
+    vx_arm64_thread_exit();
+    uint8_t *lo = *(uint8_t **)(teb + TEB_STACK_LIMIT), *hi = *(uint8_t **)(teb + TEB_STACK_BASE);
+    munmap(lo - 16384, (size_t)(hi - lo) + 16384);
+#else
     // The PEB leaves TSD slot 12 before the thread ends: libc frees whatever localtime's slot holds.
     __asm__ volatile("movq $0, %%gs:0x60" ::: "memory");
+#endif
     free(teb);
 }
 
@@ -423,13 +449,13 @@ static vx_image *load_pe(const char *path, int is_main) {
     uint16_t nsections = rd16(nt + 6), characteristics = rd16(nt + 22), opt_size = rd16(nt + 20);
     const uint8_t *opt = nt + 24;
     uint64_t pref_base = rd64(opt + 24);
-    uint32_t image_size = rd32(opt + 56), headers_size = rd32(opt + 60);
+    uint32_t image_size = rd32(opt + 56), headers_size = rd32(opt + 60), entry_rva = rd32(opt + 16);
     uint32_t ndirs = rd32(opt + 108);
     pe_dir dirs[16];
     for (uint32_t i = 0; i < 16; i++) dirs[i] = i < ndirs ? *(const pe_dir *)(opt + 112 + i * 8) : (pe_dir){0, 0};
 
     // Map at the preferred base when free, anywhere otherwise (then relocate).
-    uint8_t *base = mmap((void *)pref_base, image_size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+    uint8_t *base = mmap((void *)pref_base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (base == MAP_FAILED) { vx_log("cannot map %u bytes", image_size); free(file); return NULL; }
     memcpy(base, file, headers_size);
     const pe_section *sec = (const pe_section *)(opt + opt_size);
@@ -465,7 +491,7 @@ static vx_image *load_pe(const char *path, int is_main) {
     m->windows_path = strdup(win);
     m->base = base;
     m->size = image_size;
-    m->entry_rva = rd32(opt + 16);
+    m->entry_rva = entry_rva;                     // (read before the file's copy was freed)
     m->export_rva = dirs[0].va; m->export_size = dirs[0].size;
     m->pdata_rva = dirs[3].va; m->pdata_size = dirs[3].size;
     m->tls_rva = dirs[9].size ? dirs[9].va : 0;
@@ -696,8 +722,12 @@ static const vx_export loader_k32[] = {
 int vx_ui_run_main(int (*program)(void *), void *arg, size_t stack);
 
 // The program's main thread: loads it (DLL initializers run here, on a Windows thread) and calls its entry.
+static size_t g_main_stack;
 static int run_program(void *arg) {
     const char *exe = arg;
+#ifdef __aarch64__
+    vx_x86_stack_size = g_main_stack;
+#endif
     vx_thread_attach();
     pthread_mutex_lock(&g_loader_lock);
     vx_image *m = load_pe(exe, 1);
@@ -763,6 +793,9 @@ int main(int argc, char **argv, char **envp) {
         files.rlim_cur = files.rlim_max < OPEN_MAX ? files.rlim_max : OPEN_MAX;
         setrlimit(RLIMIT_NOFILE, &files);
     }
+#ifdef __aarch64__
+    vx_arm64_init();                             // (the engine, before any x86 code)
+#endif
     vx_profile_start();
     vx_wininet_init();                           // (before desktop.c's stand-ins for the same functions)
     vx_kernel32_init();
@@ -839,5 +872,10 @@ int main(int argc, char **argv, char **envp) {
         uint32_t nt = n >= 0x40 ? rd32(hdr + 0x3c) : 0;
         if (nt && nt + 24 + 80 <= n) reserve = rd64(hdr + nt + 24 + 72);   // SizeOfStackReserve
     }
-    return vx_ui_run_main(run_program, exe, reserve > (8u << 20) ? (size_t)reserve : (8u << 20));
+    g_main_stack = reserve > (8u << 20) ? (size_t)reserve : (8u << 20);
+    return vx_ui_run_main(run_program, exe, g_main_stack);
 }
+
+#ifdef __aarch64__
+#include "thunks/loader.c.inc"
+#endif

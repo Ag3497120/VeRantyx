@@ -34,7 +34,11 @@ static void on_prof(int sig, siginfo_t *si, void *ucv) {
     uint64_t i = __atomic_fetch_add(&g_head, 1, __ATOMIC_RELAXED);
     if (i - g_tail >= RING) return;                // (the counting thread fell behind: dropped)
     prof_sample *s = &g_ring[i & (RING - 1)];
+#ifdef __aarch64__
+    s->pc = uc ? uc->uc_mcontext->__ss.__pc : 0;
+#else
     s->pc = uc ? uc->uc_mcontext->__ss.__rip : 0;
+#endif
     s->thread = (uint64_t)pthread_self();
     s->held = pthread_getspecific(g_held_key) != NULL;
 }
@@ -185,3 +189,7 @@ void vx_profile_start(void) {
     setitimer(ITIMER_PROF, &it, NULL);
     vx_log("profiling to %s", g_path);
 }
+
+#ifdef __aarch64__
+#include "thunks/profile.c.inc"
+#endif

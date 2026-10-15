@@ -234,3 +234,7 @@ static const vx_export g_wininet[] = {
     VX_EXPORT(HttpQueryInfoA), VX_EXPORT(InternetSetOptionA), VX_EXPORT(InternetCloseHandle), VX_EXPORT(InternetSetStatusCallback),
 };
 void vx_wininet_init(void) { vx_register_module("wininet.dll", g_wininet, sizeof g_wininet / sizeof g_wininet[0]); }
+
+#ifdef __aarch64__
+#include "thunks/wininet.m.inc"
+#endif

@@ -179,3 +179,7 @@ static WINAPI HRESULT Direct3DCreate9Ex(unsigned version, void **out) { (void)ve
 
 static const vx_export d3d9_exports[] = { VX_EXPORT(Direct3DCreate9), VX_EXPORT(Direct3DCreate9Ex) };
 void vx_d3d9_init(void) { vx_register_module("d3d9.dll", d3d9_exports, sizeof d3d9_exports / sizeof d3d9_exports[0]); }
+
+#ifdef __aarch64__
+#include "thunks/d3d9.m.inc"
+#endif

@@ -527,3 +527,7 @@ void vx_dxgi_init(void) {
     pthread_once(&g_tables_once, make_tables);
     vx_register_module("dxgi.dll", dxgi, sizeof dxgi / sizeof dxgi[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/dxgi.m.inc"
+#endif

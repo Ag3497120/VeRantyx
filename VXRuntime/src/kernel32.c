@@ -79,8 +79,8 @@ static WINAPI BOOL WriteConsoleW(HANDLE h, const WCHAR *buf, DWORD n, DWORD *wri
 
 static WINAPI void ExitProcess(DWORD code) {
     {                                                              // (always: why a program ended is worth a line)
-        const vx_image *m = vx_image_at((uint64_t)(uintptr_t)__builtin_return_address(0));
-        vx_log("ExitProcess(%u) from %s+%#llx", code, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)__builtin_return_address(0) - m->base) : 0ull);
+        const vx_image *m = vx_image_at((uint64_t)(uintptr_t)VX_RETURN_ADDRESS());
+        vx_log("ExitProcess(%u) from %s+%#llx", code, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)VX_RETURN_ADDRESS() - m->base) : 0ull);
     }
     vx_profile_finish();
     fflush(stdout); fflush(stderr); _exit((int)code);
@@ -510,10 +510,17 @@ static WINAPI void *TlsGetValue(DWORD i) {
 static WINAPI BOOL TlsSetValue(DWORD i, void *v) {
     if (i >= 64) { vx_set_last_error(87); return 0; }
     ((void **)(vx_teb() + TEB_TLS_SLOTS))[i] = v;
+#ifndef __aarch64__
     __asm__ volatile("movq %0, %%gs:(%1)" :: "r"(v), "r"((uint64_t)TEB_TLS_SLOTS + 8ull * i) : "memory");
+#endif
     return 1;
 }
 
+#ifdef __aarch64__
+#define VX_PROT_RWX (VM_PROT_READ | VM_PROT_WRITE)    // (the program's code is read by the translator, never run)
+#else
+#define VX_PROT_RWX VM_PROT_ALL
+#endif
 // ---- memory -----------------------------------------------------------------------------------------------------------
 // Virtual memory with Windows semantics on Mach VM: a reservation at a requested address either lands exactly
 // there or fails (programs probe for free address ranges this way); reservations are 64 KB aligned (Windows'
@@ -653,7 +660,7 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         g_spare_bytes -= g_spare[i].size;
         g_spare[i] = g_spare[--g_nspare];
         if (mach_vm_allocate(mach_task_self(), &got, mapped_size(len), VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS) break;
-        mach_vm_protect(mach_task_self(), got, mapped_size(len), 0, VM_PROT_ALL);
+        mach_vm_protect(mach_task_self(), got, mapped_size(len), 0, VX_PROT_RWX);
         res_insert((uintptr_t)got, (size_t)len, protect);
         valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
         pthread_mutex_unlock(&g_vm_lock);
@@ -668,23 +675,23 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
     kern_return_t kr = addr
         ? mach_vm_allocate(mach_task_self(), &a, mapped_size(len), VM_FLAGS_FIXED)
         : mach_vm_map(mach_task_self(), &a, mapped_size(len), GRANULARITY - 1, VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, 0,
-                      VM_PROT_ALL, VM_PROT_ALL, VM_INHERIT_COPY);
+                      VX_PROT_RWX, VX_PROT_RWX, VM_INHERIT_COPY);
     if (kr != KERN_SUCCESS) {
         g_va_kind[addr ? 1 : 3]++; valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
         static uint64_t failed;
         if (getenv("VXRT_TRACE_VALLOC") && failed++ < 20)
-            valloc_trace(__builtin_return_address(0), __builtin_frame_address(0), "(%p, %#zx, %#x) failed", addr, size, type);
+            valloc_trace(VX_RETURN_ADDRESS(), __builtin_frame_address(0), "(%p, %#zx, %#x) failed", addr, size, type);
         pthread_mutex_unlock(&g_vm_lock);
         vx_set_last_error(addr ? 487 : 8 /* ERROR_NOT_ENOUGH_MEMORY */);
         return NULL;
     }
-    mach_vm_protect(mach_task_self(), a, mapped_size(len), 0, VM_PROT_ALL);
+    mach_vm_protect(mach_task_self(), a, mapped_size(len), 0, VX_PROT_RWX);
     res_insert((uintptr_t)a, (size_t)len, protect);
     g_va_kind[2]++;
     static uint64_t made;
     uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     if (getenv("VXRT_TRACE_VALLOC") && (dt > 2000000 || (++made & 0x3ff) == 0))
-        valloc_trace(__builtin_return_address(0), NULL, "(%p, %#zx, %#x) = %#llx in %.2f ms", addr, size, type, (unsigned long long)a, dt / 1e6);
+        valloc_trace(VX_RETURN_ADDRESS(), NULL, "(%p, %#zx, %#x) = %#llx in %.2f ms", addr, size, type, (unsigned long long)a, dt / 1e6);
     valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
     pthread_mutex_unlock(&g_vm_lock);
     return (void *)a;
@@ -704,7 +711,7 @@ void *vx_virtual_alloc_below(size_t size, uintptr_t limit, DWORD protect) {
             if (kr != KERN_SUCCESS || region >= a + len) {          // a gap big enough at a
                 mach_vm_address_t got = a;
                 if (mach_vm_allocate(mach_task_self(), &got, len, VM_FLAGS_FIXED) == KERN_SUCCESS) {
-                    mach_vm_protect(mach_task_self(), got, len, 0, VM_PROT_ALL);
+                    mach_vm_protect(mach_task_self(), got, len, 0, VX_PROT_RWX);
                     res_insert((uintptr_t)got, (size_t)len, protect);
                     cursor = (uintptr_t)(got + len);
                     pthread_mutex_unlock(&g_vm_lock);
@@ -740,7 +747,7 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
         mach_vm_address_t a = start;                       // fresh zero pages over the range
         ok = mach_vm_allocate(mach_task_self(), &a, len, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
         prot_set(start, start + len, 0);
-        if (ok) mach_vm_protect(mach_task_self(), a, len, 0, VM_PROT_ALL);
+        if (ok) mach_vm_protect(mach_task_self(), a, len, 0, VX_PROT_RWX);
     }
     pthread_mutex_unlock(&g_vm_lock);
     if (!ok) vx_set_last_error(487);
@@ -842,7 +849,7 @@ static int heap_pointer(const void *p, const char *what, void *caller) {
     vx_set_last_error(87);
     return 0;
 }
-static WINAPI BOOL HeapFree(HANDLE h, DWORD f, void *p) { (void)h; (void)f; if (!heap_pointer(p, "HeapFree", __builtin_return_address(0))) return 0; free(p); return 1; }
+static WINAPI BOOL HeapFree(HANDLE h, DWORD f, void *p) { (void)h; (void)f; if (!heap_pointer(p, "HeapFree", VX_RETURN_ADDRESS())) return 0; free(p); return 1; }
 static WINAPI size_t HeapSize(HANDLE h, DWORD f, const void *p) { (void)h; (void)f; return malloc_size(p); }
 
 // ---- messages and debugging output ----------------------------------------------------------------------------------------
@@ -857,7 +864,7 @@ static WINAPI DWORD FormatMessageA(DWORD flags, const void *src, DWORD id, DWORD
     return (DWORD)n;
 }
 static WINAPI void *LocalAlloc(DWORD flags, size_t n) { return flags & 0x40 /* LMEM_ZEROINIT */ ? calloc(1, n ? n : 1) : malloc(n ? n : 1); }
-static WINAPI void *LocalFree(void *p) { if (!heap_pointer(p, "LocalFree", __builtin_return_address(0))) return p; free(p); return NULL; }
+static WINAPI void *LocalFree(void *p) { if (!heap_pointer(p, "LocalFree", VX_RETURN_ADDRESS())) return p; free(p); return NULL; }
 // VXRT_DEBUG_OUTPUT=1: what programs send to OutputDebugString, without the rest of VXRT_TRACE (with VXRT_DEBUGGER=1,
 // a game's own console log: why it quit, for one).
 int vx_debug_output(void) { static int on = -1; if (on < 0) on = vx_trace || (getenv("VXRT_DEBUG_OUTPUT") && atoi(getenv("VXRT_DEBUG_OUTPUT"))); return on; }
@@ -986,3 +993,7 @@ void vx_kernel32_init(void) {
     vx_register_module("kernel32.dll", k32, sizeof k32 / sizeof k32[0]);
     vx_register_module("kernelbase.dll", k32, sizeof k32 / sizeof k32[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/kernel32.c.inc"
+#endif

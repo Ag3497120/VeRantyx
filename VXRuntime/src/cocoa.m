@@ -421,3 +421,7 @@ void *vx_cocoa_metal_layer(vx_window *w, void *device, int pixel_format) {
 }
 
 void vx_cocoa_beep(void) { ui_ensure(); dispatch_async(dispatch_get_main_queue(), ^{ NSBeep(); }); }
+
+#ifdef __aarch64__
+#include "thunks/cocoa.m.inc"
+#endif

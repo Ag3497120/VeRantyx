@@ -402,3 +402,7 @@ static void make_tables(void) {
 }
 void **d3d_dxgi_resource_vtbl(void) { pthread_once(&g_once, make_tables); return g_res_vtbl; }
 void **d3d_keyed_mutex_vtbl(void) { pthread_once(&g_once, make_tables); return g_keyed_vtbl; }
+
+#ifdef __aarch64__
+#include "thunks/d3d11_shared.m.inc"
+#endif

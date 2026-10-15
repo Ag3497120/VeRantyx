@@ -315,3 +315,7 @@ void vx_extras_init(void) {
     MORE("winmm.dll", winmm_more); MORE("ws2_32.dll", ws2_32_more); MORE("hid.dll", hid_more);
 #undef MORE
 }
+
+#ifdef __aarch64__
+#include "thunks/extras.c.inc"
+#endif

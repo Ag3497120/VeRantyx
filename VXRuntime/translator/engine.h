@@ -13,7 +13,16 @@ typedef struct {
 // ordered: memory accesses that may be shared as LDAPR / STLR (in-process, without TSO); installs a SIGBUS / SIGSEGV
 // handler for those across 16 bytes (call it after the program's own handlers: others go to them).
 xe *xe_new(int ordered);
-// Forgets every translation (the code it came from changed).
+// Addresses that are native functions translated code may call (the ARM64 runtime's thunks, src/arm64.c): find
+// returns the thunk for one, else NULL; the engine then makes that address's block a call of the thunk.
+void xe_set_native(xe *e, void (*(*find)(uint64_t rip))(x86_ctx *));
+// A return-address ring for a thread's context (x86_ctx.ras); without one, contexts share the engine's.
+uint64_t xe_ring_new(xe *e);
+// The x86 instruction whose translation holds host address pc (0: none, or not an x86 instruction's code).
+uint64_t xe_rip_at(const xe *e, uint64_t pc);
+// Whether pc is in the engine's translated code.
+int xe_owns(const xe *e, uint64_t pc);
+// Forgets every translation (the code it came from changed). Not while another thread runs translated code.
 void xe_flush(xe *e);
 // Runs from ctx->rip until the code reaches stop (0), an x86 exception (ctx->fault, RIP at the instruction), or an
 // instruction that cannot be translated (-1).

@@ -824,3 +824,7 @@ void vx_files_init(void) {
     vx_register_module("kernel32.dll", files_k32, sizeof files_k32 / sizeof files_k32[0]);
     vx_register_module("kernelbase.dll", files_k32, sizeof files_k32 / sizeof files_k32[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/files.c.inc"
+#endif

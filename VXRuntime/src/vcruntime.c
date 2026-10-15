@@ -436,3 +436,7 @@ void vx_vcruntime_init(void) {
     vx_register_module("vcruntime140_1.dll", g_vcruntime, n);
     vx_register_module("msvcrt.dll", g_vcruntime, n);                // msvcrt.dll carried the C++ support itself
 }
+
+#ifdef __aarch64__
+#include "thunks/vcruntime.c.inc"
+#endif

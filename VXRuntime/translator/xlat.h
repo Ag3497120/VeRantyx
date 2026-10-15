@@ -13,7 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef struct {
+typedef struct x86_ctx_s {
     uint64_t gpr[16];
     uint64_t flags;
     uint64_t rip;
@@ -34,10 +34,12 @@ typedef struct {
     uint64_t entry;              // engine.c: where translated code is entered
     uint64_t fault_info;         // with fault: the INT n vector, or RCX for __fastfail (INT 29h)
     uint64_t ras;                // engine.c: the return-address ring's next entry (in X29 while translated code runs)
+    uint64_t jump;               // set by a native function called from translated code (xlat_block_native): go on at
+                                 //   rip (or stop at fault) instead of returning to the caller
 } x86_ctx;
 enum { CTX_FLAGS = 128, CTX_RIP = 136, CTX_FS = 144, CTX_GS = 152, CTX_FAULT = 160, CTX_HELPER_OP = 168, CTX_HELPER_VAL = 176,
        CTX_XMM = 192, CTX_YMMH = 448, CTX_MXCSR = 704, CTX_FCW = 712,
-       CTX_LINK = 848, CTX_ENTRY = 856, CTX_FAULT_INFO = 864, CTX_RAS = 872 };
+       CTX_LINK = 848, CTX_ENTRY = 856, CTX_FAULT_INFO = 864, CTX_RAS = 872, CTX_JUMP = 880 };
 // The return-address ring (xlat_block_linked, engine.c): 2^XLAT_RAS_BITS bytes aligned to that, entries of 16 bytes: the x86
 // return address and the translated code to go back to. CALL adds one, RET takes one and returns there when it matches.
 enum { XLAT_RAS_BITS = 12 };
@@ -62,7 +64,10 @@ typedef struct {
     int defer_cold;
     struct cold { size_t at; int kind; uint32_t *words; size_t n; } *cold;
     size_t ncold, ccold;
-    uint16_t zhi[2];             // XMM registers whose bits above 32 [0] / 64 [1] are known zero (xlat_block_linked)
+    uint16_t zhi[2];
+    // xlat_block_linked: where each x86 instruction's code starts (for faults: the host pc's x86 RIP)
+    struct { uint32_t at; uint64_t rip; } *imap;
+    size_t nimap, cimap;             // XMM registers whose bits above 32 [0] / 64 [1] are known zero (xlat_block_linked)
     int nfused, nskipped;        // (counts: Jccs fused, instructions whose flags were not computed)    // the Jcc after a CMP / TEST / SUB / ... whose flags are dead after it: its condition
                                  // from the operands left in the scratch registers (1: subtraction, 2: logic; 0: none)
     struct { uint32_t at, kind; } *relocs;   // xlat_block_linked's sites
@@ -84,6 +89,10 @@ int xlat_block(xlat_buf *b, uint64_t rip, int max_insns);
 enum { XR_LINK = 1, XR_LOOKUP, XR_EXIT,        // sites: BL link stub (then the target as 8 bytes), B lookup stub, B exit stub,
        XR_CALL, XR_LOOKUP_CALL };               //   BL call-link stub (the return's site, then the target), BL lookup stub
 int xlat_block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end);
+// The "block" at a native function's address (engine.c, the ARM64 runtime): the x86 state into the context, fn(ctx)
+// (a thunk: it reads the call's arguments there and writes the result), the state back, then RET, or on at
+// ctx->rip when the function set ctx->jump.
+void xlat_block_native(xlat_buf *b, void (*fn)(x86_ctx *));
 // Helpers translated code calls for rare or intricate instructions (one-operand MUL/IMUL/DIV/IDIV, RCL/RCR).
 void xlat_helper(x86_ctx *ctx);
 // A test harness's entry and exit: loads x86_ctx (pointer in x0) into the registers above, and stores it back.

@@ -22,8 +22,13 @@ struct xe {
     uint32_t *code;                 // MAP_JIT: stubs first, then blocks
     size_t used, cap;               // (in instructions)
     uint32_t *enter, *exit, *link, *lookup, *link_call;
-    uint64_t *ring;                 // the return-address ring (x86_ctx.ras points into it)
+    uint64_t *ring;                 // the shared return-address ring (contexts without one of their own)
     uint64_t ring_at;               //   where it was when xe_run last returned
+    uint64_t **rings; int nrings;   // every ring, cleared when the code goes
+    void (*(*native)(uint64_t))(x86_ctx *);
+    pthread_mutex_t lock;           // translating, linking, flushing (threads share the code)
+    struct { uint64_t host, rip; } *imap;   // every translated instruction's code, in order (then rip 0: a block's end)
+    size_t nimap, cimap;
     entry *table;                   // read by the lookup stub: direct-mapped
     entry *map;                     // every block: open addressing (rip 0: empty)
     int ordered;
@@ -82,8 +87,26 @@ static void stubs(xe *e) {
     n = emit(c, n, a64_b((int32_t)(body - (c + n))));
     e->used = n;
 }
-// Forgets the ring's entries (their code is gone): x86 address ~0, which no return matches.
-static void ring_clear(xe *e) { for (size_t i = 0; i < (1u << XLAT_RAS_BITS) / 8; i += 2) { e->ring[i] = ~0ull; e->ring[i + 1] = 0; } }
+// Forgets the rings' entries (their code is gone): x86 address ~0, which no return matches.
+static void ring_clear(uint64_t *ring) { for (size_t i = 0; i < (1u << XLAT_RAS_BITS) / 8; i += 2) { ring[i] = ~0ull; ring[i + 1] = 0; } }
+static uint64_t *ring_alloc(xe *e) {
+    uint64_t *r;
+    if (posix_memalign((void **)&r, 1u << XLAT_RAS_BITS, 1u << XLAT_RAS_BITS)) return NULL;
+    ring_clear(r);
+    e->rings = realloc(e->rings, (size_t)(e->nrings + 1) * sizeof *e->rings);
+    e->rings[e->nrings++] = r;
+    return r;
+}
+uint64_t xe_ring_new(xe *e) {
+    pthread_mutex_lock(&e->lock);
+    uint64_t *r = ring_alloc(e);
+    pthread_mutex_unlock(&e->lock);
+    return (uint64_t)(uintptr_t)r;
+}
+void xe_set_native(xe *e, void (*(*find)(uint64_t))(x86_ctx *)) { e->native = find; }
+// A table entry, both words at once (with LSE2 an aligned STP is single-copy atomic): another thread's lookup stub
+// sees the old entry or the new one.
+static void put_entry(entry *t, uint64_t rip, uint64_t host) { __asm__ volatile("stp %1, %2, [%0]" :: "r"(t), "r"(rip), "r"(host) : "memory"); }
 
 // Ordered accesses across 16 bytes: LDAPR / STLR fault there (LSE2 allows other misaligned ones). The first such
 // fault patches the instruction into a branch to a few instructions of its own: DMB ISH, the plain access, DMB ISH,
@@ -126,8 +149,10 @@ xe *xe_new(int ordered) {
     e->table = calloc(1u << TABLE_BITS, sizeof *e->table);
     e->map = calloc(1u << MAP_BITS, sizeof *e->map);
     e->ordered = ordered;
-    if (posix_memalign((void **)&e->ring, 1u << XLAT_RAS_BITS, 1u << XLAT_RAS_BITS)) { free(e); return NULL; }
-    ring_clear(e);
+    pthread_mutex_init(&e->lock, NULL);
+    e->cimap = CODE_BYTES / 8;                                            // (reserved: read without the lock by fault handlers)
+    e->imap = mmap(NULL, e->cimap * sizeof *e->imap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (!(e->ring = ring_alloc(e))) { free(e); return NULL; }
     e->ring_at = (uint64_t)(uintptr_t)e->ring;
     writable(1); stubs(e); writable(0);
     sys_icache_invalidate(e->code, e->used * 4);
@@ -142,7 +167,8 @@ xe *xe_new(int ordered) {
 }
 
 void xe_flush(xe *e) {
-    ring_clear(e);
+    e->nimap = 0;
+    for (int i = 0; i < e->nrings; i++) ring_clear(e->rings[i]);
     memset(e->table, 0, (sizeof *e->table) << TABLE_BITS);
     memset(e->map, 0, (sizeof *e->map) << MAP_BITS);
     writable(1); stubs(e); writable(0);
@@ -161,8 +187,10 @@ static uint64_t block(xe *e, uint64_t rip, uint64_t stop) {
     if (host) return host;
     xlat_buf b = { 0 };
     b.ordered = e->ordered; b.stop = stop;
-    uint64_t end;
-    if (xlat_block_linked(&b, rip, 64, &end) < 0) { free(b.code); free(b.relocs); return 0; }
+    uint64_t end = rip + 1;
+    void (*thunk)(x86_ctx *) = e->native ? e->native(rip) : NULL;
+    if (thunk) xlat_block_native(&b, thunk);
+    else if (xlat_block_linked(&b, rip, 64, &end) < 0) { free(b.code); free(b.relocs); free(b.imap); return 0; }
     if (e->used + b.n > e->cap || e->stats.blocks + 1 >= (1u << (MAP_BITS - 1))) {   // (full: start over)
         xe_flush(e);
         e->stats.flushes++;
@@ -199,7 +227,10 @@ static uint64_t block(xe *e, uint64_t rip, uint64_t stop) {
     uint32_t i = idx(rip, MAP_BITS);
     while (e->map[i].rip) i = (i + 1) & ((1u << MAP_BITS) - 1);
     e->map[i].rip = rip; e->map[i].host = host;
-    e->table[idx(rip, TABLE_BITS)] = (entry){ rip, host };
+    put_entry(&e->table[idx(rip, TABLE_BITS)], rip, host);
+    for (size_t k = 0; k < b.nimap && e->nimap + 1 < e->cimap; k++) { e->imap[e->nimap].host = host + 4 * b.imap[k].at; e->imap[e->nimap++].rip = b.imap[k].rip; }
+    if (e->nimap < e->cimap) { e->imap[e->nimap].host = host + 4 * b.n; e->imap[e->nimap].rip = 0; __atomic_store_n(&e->nimap, e->nimap + 1, __ATOMIC_RELEASE); }
+    free(b.imap);
     e->stats.blocks++; e->stats.x86_bytes += end - rip; e->stats.arm_insns += b.n;
     e->stats.flags_skipped += (uint64_t)b.nskipped; e->stats.fused += (uint64_t)b.nfused;
     free(b.code); free(b.relocs);
@@ -209,17 +240,20 @@ static uint64_t block(xe *e, uint64_t rip, uint64_t stop) {
 static int run(xe *e, x86_ctx *c, uint64_t stop);
 int xe_run(xe *e, x86_ctx *c, uint64_t stop) {
     c->link = 0;
+    if (c->ras) return run(e, c, stop);                                   // (a ring of its own)
     c->ras = e->ring_at;
     int r = run(e, c, stop);
     e->ring_at = c->ras;
+    c->ras = 0;
     return r;
 }
 static int run(xe *e, x86_ctx *c, uint64_t stop) {
     for (;;) {
         if (c->fault) return (int)c->fault;
         if (c->rip == stop) return 0;
+        pthread_mutex_lock(&e->lock);
         uint64_t host = block(e, c->rip, stop);
-        if (!host) return -1;
+        if (!host) { pthread_mutex_unlock(&e->lock); return -1; }
         if (c->link) {                                                    // (patch the site that came here: a call's stays BL)
             uint32_t *p = (uint32_t *)(uintptr_t)c->link;
             int call = (*p & 0xFC000000u) == 0x94000000u && p + ((int32_t)(*p << 6) >> 6) == e->link_call;
@@ -229,6 +263,7 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
             e->stats.linked++;
             c->link = 0;
         }
+        pthread_mutex_unlock(&e->lock);
         e->stats.entries++;
         c->entry = host;
         ((void (*)(x86_ctx *))(void *)e->enter)(c);
@@ -236,3 +271,9 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
 }
 
 xe_stats xe_get_stats(const xe *e) { return e->stats; }
+uint64_t xe_rip_at(const xe *e, uint64_t pc) {
+    size_t n = __atomic_load_n(&e->nimap, __ATOMIC_ACQUIRE), lo = 0, hi = n;
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (e->imap[mid].host <= pc) lo = mid + 1; else hi = mid; }
+    return lo ? e->imap[lo - 1].rip : 0;
+}
+int xe_owns(const xe *e, uint64_t pc) { return e && pc >= (uint64_t)(uintptr_t)e->code && pc < (uint64_t)(uintptr_t)(e->code + e->cap); }

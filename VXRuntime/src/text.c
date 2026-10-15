@@ -318,3 +318,7 @@ void vx_text_init(void) {
     vx_register_module("kernel32.dll", text_k32, sizeof text_k32 / sizeof text_k32[0]);
     vx_register_module("kernelbase.dll", text_k32, sizeof text_k32 / sizeof text_k32[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/text.c.inc"
+#endif

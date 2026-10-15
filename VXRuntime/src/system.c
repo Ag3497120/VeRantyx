@@ -675,3 +675,7 @@ void vx_system_init(void) {
     vx_register_module("shell32.dll", shell, sizeof shell / sizeof shell[0]);
     vx_register_module("ntdll.dll", ntdll, sizeof ntdll / sizeof ntdll[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/system.c.inc"
+#endif

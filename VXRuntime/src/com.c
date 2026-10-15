@@ -609,3 +609,7 @@ void vx_com_init(void) {
     vx_register_module("combase.dll", ole32, sizeof ole32 / sizeof ole32[0]);
     vx_register_module("oleaut32.dll", oleaut32, sizeof oleaut32 / sizeof oleaut32[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/com.c.inc"
+#endif

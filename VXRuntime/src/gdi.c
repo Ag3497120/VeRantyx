@@ -739,3 +739,7 @@ void vx_gdi_init(void) {
     vx_register_module("gdi32.dll", gdi32, sizeof gdi32 / sizeof gdi32[0]);
     vx_register_module("user32.dll", user32_gdi, sizeof user32_gdi / sizeof user32_gdi[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/gdi.c.inc"
+#endif

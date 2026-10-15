@@ -564,3 +564,7 @@ void vx_registry_init(void) {
     vx_register_module("kernel32.dll", advapi, sizeof advapi / sizeof advapi[0]);
     vx_register_module("ntdll.dll", ntdll, sizeof ntdll / sizeof ntdll[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/registry.c.inc"
+#endif

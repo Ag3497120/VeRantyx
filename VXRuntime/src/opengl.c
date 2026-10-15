@@ -255,3 +255,7 @@ void vx_opengl_init(void) {
     }
     vx_register_module("opengl32.dll", g_exports, n);
 }
+
+#ifdef __aarch64__
+#include "thunks/opengl.c.inc"
+#endif

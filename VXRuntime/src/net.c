@@ -680,3 +680,7 @@ void vx_net_init(void) {
     vx_register_module("wsock32.dll", ws2, sizeof ws2 / sizeof ws2[0]);
     vx_register_module("mswsock.dll", ws2, sizeof ws2 / sizeof ws2[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/net.c.inc"
+#endif

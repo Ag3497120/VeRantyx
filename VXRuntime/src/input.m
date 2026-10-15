@@ -86,3 +86,7 @@ void vx_input_init(void) {
     vx_register_module("xinput1_2.dll", xinput, sizeof xinput / sizeof xinput[0]);
     vx_register_module("xinput1_1.dll", xinput, sizeof xinput / sizeof xinput[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/input.m.inc"
+#endif

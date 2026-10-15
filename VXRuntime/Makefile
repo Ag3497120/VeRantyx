@@ -12,6 +12,16 @@ build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -Wl,-pagezero_size,0x10000
 
+# The ARM64 build (phase 4, TRANSLATOR.md): the same runtime as ARM64 code, the program run by the translator's
+# engine in the process. Thunks for every ms_abi function come from the sources' C signatures (tools/vx_thunks.py).
+ARM64_SRC = $(filter-out src/context.S,$(SRC)) src/arm64.c src/context_arm64.S translator/xlat.c translator/x87.c translator/x86dec.c translator/engine.c
+build/thunks/stamp: $(filter %.c %.m,$(SRC)) src/vx.h tools/vx_thunks.py tools/vx_abi_scan.py
+	@mkdir -p build/thunks
+	python3 tools/vx_thunks.py build/thunks $(filter %.c %.m,$(SRC))
+	@touch $@
+build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp src/arm64.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
+	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL
+
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
        build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe
@@ -235,34 +245,45 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest
 	build/x86dec_test
 	python3 translator/a64_check.py
 	build/difftest build/ref_x86 200
-	build/vxrt build/hello_k32.exe
-	build/vxrt build/hello_crt.exe one "two words"
-	build/vxrt build/threads.exe
-	build/vxrt build/cxx_exceptions.exe
-	build/vxrt build/hw_exceptions.exe
-	build/vxrt build/files.exe
+	$(MAKE) runtime-tests VXRT=build/vxrt
+
+# The runtime's own tests, run by $(VXRT): the x86 build under Rosetta (make check) or the ARM64 build with the
+# translator (make check-arm64).
+VXRT ?= build/vxrt
+runtime-tests: export VXRT_ROOT = build/root
+runtime-tests: export VXRT_NO_ACTIVATE = 1
+runtime-tests: $(VXRT) tests
+	$(VXRT) build/hello_k32.exe
+	$(VXRT) build/hello_crt.exe one "two words"
+	$(VXRT) build/threads.exe
+	$(VXRT) build/cxx_exceptions.exe
+	$(VXRT) build/hw_exceptions.exe
+	$(VXRT) build/files.exe
 	rm -rf build/ovtree build/ovshadow && mkdir -p build/ovtree/save && echo old > build/ovtree/save/old.sav && echo orig > build/ovtree/save/same.hl1
-	VXRT_OVERLAY=$(CURDIR)/build/ovtree:$(CURDIR)/build/ovshadow build/vxrt build/files.exe overlay 'Z:$(subst /,\,$(CURDIR))\build\ovtree'
+	VXRT_OVERLAY=$(CURDIR)/build/ovtree:$(CURDIR)/build/ovshadow $(VXRT) build/files.exe overlay 'Z:$(subst /,\,$(CURDIR))\build\ovtree'
 	test "$$(cat build/ovtree/save/same.hl1)" = orig && test ! -e build/ovtree/save/a.hl1
-	build/vxrt build/dll_test.exe
-	build/vxrt build/net.exe
-	build/vxrt build/msvc_eh.exe
-	build/vxrt build/com.exe
-	build/vxrt build/iocp.exe
-	build/vxrt build/window.exe
-	build/vxrt build/d3d11.exe
-	build/vxrt build/gl.exe
+	$(VXRT) build/dll_test.exe
+	$(VXRT) build/net.exe
+	$(VXRT) build/msvc_eh.exe
+	$(VXRT) build/com.exe
+	$(VXRT) build/iocp.exe
+	$(VXRT) build/window.exe
+	$(VXRT) build/d3d11.exe
+	$(VXRT) build/gl.exe
 	build/dxbcscan tests/shaders/*.dxbc
-	build/vxrt build/draw.exe
-	build/vxrt build/compute.exe
-	build/vxrt build/input.exe
-	build/vxrt build/audio.exe
-	build/vxrt build/xaudio2.exe
-	build/vxrt build/pipes.exe
-	build/vxrt build/pipes.exe serve & build/vxrt build/pipes.exe ask; wait
-	build/vxrt build/ipc.exe second & build/vxrt build/ipc.exe first; wait
-	build/vxrt build/shared.exe make & build/vxrt build/shared.exe open; wait
-	build/vxrt build/shared.exe pingpong 1 & build/vxrt build/shared.exe pingpong 2; wait
+	$(VXRT) build/draw.exe
+	$(VXRT) build/compute.exe
+	$(VXRT) build/input.exe
+	$(VXRT) build/audio.exe
+	$(VXRT) build/xaudio2.exe
+	$(VXRT) build/pipes.exe
+	$(VXRT) build/pipes.exe serve & $(VXRT) build/pipes.exe ask; wait
+	$(VXRT) build/ipc.exe second & $(VXRT) build/ipc.exe first; wait
+	$(VXRT) build/shared.exe make & $(VXRT) build/shared.exe open; wait
+	$(VXRT) build/shared.exe pingpong 1 & $(VXRT) build/shared.exe pingpong 2; wait
+
+check-arm64: build/vxrt-arm64 tests
+	$(MAKE) runtime-tests VXRT=build/vxrt-arm64
 
 # CPU cost per Direct3D 11 draw (numbers only, not a test).
 bench: export VXRT_ROOT = build/root

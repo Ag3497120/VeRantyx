@@ -426,3 +426,7 @@ static const vx_export k32[] = {
     VX_EXPORT(CallNamedPipeA), VX_EXPORT(GetNamedPipeClientProcessId), VX_EXPORT(GetNamedPipeServerProcessId),
 };
 void vx_pipes_init(void) { vx_register_module("kernel32.dll", k32, sizeof k32 / sizeof k32[0]); }
+
+#ifdef __aarch64__
+#include "thunks/pipes.c.inc"
+#endif

@@ -9,7 +9,23 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __aarch64__
+// The ARM64 build (src/arm64.c): the program is x86-64 code the translator runs; it calls these functions through
+// thunks generated from their C signatures (tools/vx_thunks.py), so they are ordinary ARM64 functions.
+#define WINAPI
+void *vx_x86_return_address(void);          // the program's return address while it calls this runtime
+#define VX_RETURN_ADDRESS() vx_x86_return_address()
+typedef const char *vx_va_list;              // the program's variadic arguments: 8-byte slots on its stack
+extern __thread const char *vx_va_slots;     //   (set by the thunk)
+#define vx_va_start(ap, last) ((ap) = vx_va_slots)
+#define vx_va_end(ap) ((void)(ap))
+#else
 #define WINAPI __attribute__((ms_abi))
+#define VX_RETURN_ADDRESS() __builtin_return_address(0)
+typedef __builtin_ms_va_list vx_va_list;
+#define vx_va_start(ap, last) __builtin_ms_va_start(ap, last)
+#define vx_va_end(ap) __builtin_ms_va_end(ap)
+#endif
 
 typedef uint32_t DWORD;
 typedef int32_t  LONG;
@@ -73,6 +89,10 @@ enum {
 enum { PEB_IMAGE_BASE = 0x10, PEB_PROCESS_HEAP = 0x30, PEB_SIZE = 0x1000 };
 uint8_t *vx_teb(void);                 // this thread's TEB (creates it on first use)
 void     vx_thread_attach(void);       // TEB + gs slots + TLS for the calling thread
+#ifdef __aarch64__
+extern __thread size_t vx_x86_stack_size;   // the x86 stack vx_thread_attach makes (0: 1 MB)
+void vx_arm64_init(void);
+#endif
 void     vx_thread_detach(void);       // frees the calling thread's TEB and TLS (after its detach notifications)
 void     vx_notify_thread(DWORD reason);   // TLS callbacks and DllMain for thread attach (2) / detach (3)
 DWORD    vx_current_tid(void);

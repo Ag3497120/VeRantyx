@@ -1396,10 +1396,10 @@ static WINAPI BOOL IsClipboardFormatAvailable(uint32_t f) { (void)f; return 0; }
 // wsprintf: a Windows varargs function; the arguments sit in 8-byte slots, as vx_format expects.
 static WINAPI int wvsprintfA(char *buf, const char *fmt, const char *ap) { return vx_format(buf, 1025, fmt, ap); }
 static WINAPI int wsprintfA(char *buf, const char *fmt, ...) {
-    __builtin_ms_va_list ap;
-    __builtin_ms_va_start(ap, fmt);
+    vx_va_list ap;
+    vx_va_start(ap, fmt);
     int n = vx_format(buf, 1025, fmt, ap);
-    __builtin_ms_va_end(ap);
+    vx_va_end(ap);
     return n;
 }
 static WINAPI char *CharUpperA(char *s) { if ((uintptr_t)s < 0x10000) return (char *)(uintptr_t)toupper((int)(uintptr_t)s); for (char *p = s; *p; p++) *p = (char)toupper((unsigned char)*p); return s; }
@@ -1489,3 +1489,7 @@ void vx_user32_init(void) {
     register_controls();
     vx_register_module("user32.dll", user32, sizeof user32 / sizeof user32[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/user32.c.inc"
+#endif

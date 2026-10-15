@@ -21,6 +21,9 @@
 #include <execinfo.h>
 #include "vx.h"
 #include <dlfcn.h>
+#ifdef __aarch64__
+#include "arm64.h"
+#endif
 
 // ---- structures --------------------------------------------------------------------------------------------------
 typedef struct { uint64_t lo, hi; } M128A;
@@ -333,8 +336,18 @@ typedef struct vx_entry {
     struct vx_entry *next;      // the next older entry on this thread
     CONTEXT *ctx;               // where the program called into the runtime (or faulted)
     CONTEXT *unwinding_frame;   // for an unwind: the frame whose handler is running, else NULL
+    uint64_t at;                // where it sits on the program's stack (deeper entries: lower)
 } vx_entry;
 static __thread vx_entry *t_entries;
+// x86 build: the entry itself is on the program's stack (the runtime runs on it too). ARM64: the runtime has a
+// stack of its own, so just below the program's stack pointer at the entry.
+#ifdef __aarch64__
+#define ENTRY(next, ctx) { (next), (ctx), NULL, (ctx)->gpr[RSP] - 8 }
+#define ENTRY_SET_AT(e)
+#else
+#define ENTRY(next, ctx) { (next), (ctx), NULL, 0 }
+#define ENTRY_SET_AT(e) ((e).at = (uint64_t)&(e))
+#endif
 
 // Moves c to the next frame that has unwind data and returns its function entry; NULL at the bottom of the stack.
 static RUNTIME_FUNCTION *next_function(CONTEXT *c, vx_entry **cursor, int unwinding, uint64_t *base) {
@@ -352,7 +365,7 @@ static RUNTIME_FUNCTION *next_function(CONTEXT *c, vx_entry **cursor, int unwind
         // Entries deeper on the stack than where the walk now is belong to frames already unwound (a catch
         // block runs on top of them): they are not part of this walk.
         e = e->next;
-        while (e && (uint64_t)e < c->gpr[RSP]) e = e->next;
+        while (e && e->at < c->gpr[RSP]) e = e->next;
         *cursor = e;
     }
     return NULL;
@@ -360,12 +373,13 @@ static RUNTIME_FUNCTION *next_function(CONTEXT *c, vx_entry **cursor, int unwind
 
 // Resumes the program at ctx. Runtime entries deeper than the target stack are finished.
 static void __attribute__((noreturn)) resume(CONTEXT *ctx) {
-    while (t_entries && (uint64_t)t_entries < ctx->gpr[RSP]) t_entries = t_entries->next;
+    while (t_entries && t_entries->at < ctx->gpr[RSP]) t_entries = t_entries->next;
     vx_restore_context(ctx);
 }
 
 static void __attribute__((noreturn)) dispatch(EXCEPTION_RECORD *rec, CONTEXT *ctx) {
-    vx_entry self = { t_entries, ctx, NULL };
+    vx_entry self = ENTRY(t_entries, ctx);
+    ENTRY_SET_AT(self);
     t_entries = &self;
     EXCEPTION_POINTERS ep = { rec, ctx };
     for (int i = 0; i < g_vectored_n; i++)
@@ -422,7 +436,8 @@ void __attribute__((noreturn)) vx_raise(DWORD code, DWORD flags, DWORD n, const 
 void __attribute__((noreturn)) vx_unwind(uint64_t target_frame, uint64_t target_ip, EXCEPTION_RECORD *rec,
                                          uint64_t retval, CONTEXT *unused, CONTEXT *captured) {
     (void)unused;
-    vx_entry self = { t_entries, captured, NULL };
+    vx_entry self = ENTRY(t_entries, captured);
+    ENTRY_SET_AT(self);
     t_entries = &self;
     EXCEPTION_RECORD local = { 0xC0000027 /* STATUS_UNWIND */, 0, NULL, NULL, 0, 0, {0} };
     if (!rec) rec = &local;
@@ -454,7 +469,8 @@ void __attribute__((noreturn)) vx_unwind(uint64_t target_frame, uint64_t target_
                 // The frames below the target are unwound but their stack is still intact: run the callback
                 // (MSVC's runtime calls a catch block here) on it, as if called from the target frame, and
                 // continue the target where the callback says.
-                vx_entry consolidate = { t_entries, &out, NULL };
+                vx_entry consolidate = ENTRY(t_entries, &out);
+                ENTRY_SET_AT(consolidate);
                 t_entries = &consolidate;
                 out.rip = (uint64_t)((void *(WINAPI *)(EXCEPTION_RECORD *))rec->info[0])(rec);
                 t_entries = consolidate.next;
@@ -512,6 +528,7 @@ void vx_signal_stack(void) {
     if (st.ss_sp != MAP_FAILED) sigaltstack(&st, NULL);
 }
 
+#ifndef __aarch64__
 static void on_signal(int sig, siginfo_t *si, void *ucv) {
     ucontext_t *uc = ucv;
     _STRUCT_X86_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
@@ -621,6 +638,21 @@ void vx_context_from_signal(void *out, const void *ucv) {
     memcpy(c->xmm, &uc->uc_mcontext->__fs.__fpu_xmm0, 16 * 16);
 }
 
+#else
+// ARM64: the thread's x86 state where it stopped (src/arm64.c), as a Windows CONTEXT.
+int vx_arm64_state_at(const void *uc, void *x86_state);
+static void context_from(CONTEXT *c, const x86_ctx *x, uint64_t rip, uint64_t rsp);
+void vx_context_from_signal(void *out, const void *ucv) {
+    static __thread x86_ctx *x;
+    if (!x) x = calloc(1, sizeof *x);
+    CONTEXT *c = out;
+    DWORD flags = c->flags;
+    if (!vx_arm64_state_at(ucv, x)) { memset(c, 0, sizeof *c); c->flags = flags ? flags : 0x10001f; return; }
+    context_from(c, x, x->rip, x->gpr[RSP]);
+    if (flags) c->flags = flags;
+}
+#endif
+
 // abort() from macOS code (malloc's checks, libc++): where from, with the program's frames named (VXRT_TRACE).
 static void on_abort(int sig) {
     void *frames[48];
@@ -636,6 +668,7 @@ static void on_abort(int sig) {
 }
 
 void vx_seh_install_signals(void) {
+#ifndef __aarch64__                             // (ARM64: src/arm64.c's handler)
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = on_signal;
@@ -643,14 +676,20 @@ void vx_seh_install_signals(void) {
     sigemptyset(&sa.sa_mask);
     int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP };
     for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
+#endif
     if (vx_trace) signal(SIGABRT, on_abort);
 }
 
 // ---- exports -----------------------------------------------------------------------------------------------------------------
 void vx_RtlCaptureContext(CONTEXT *);
 void vx_RaiseException(DWORD, DWORD, DWORD, const uint64_t *);
+#ifdef __aarch64__
+void vx_RtlUnwindEx(uint64_t, uint64_t, EXCEPTION_RECORD *, uint64_t, CONTEXT *, void *);
+void vx_RtlUnwind(uint64_t, uint64_t, EXCEPTION_RECORD *, uint64_t);
+#else
 void vx_RtlUnwindEx(void);
 void vx_RtlUnwind(void);
+#endif
 int  vx_setjmp(void *, void *);
 void vx_longjmp(void *, int);
 
@@ -674,3 +713,97 @@ void vx_seh_init(void) {
     vx_register_module("ucrtbase.dll", seh_crt, sizeof seh_crt / sizeof seh_crt[0]);
     vx_register_module("msvcrt.dll", seh_crt, sizeof seh_crt / sizeof seh_crt[0]);
 }
+
+#ifdef __aarch64__
+// ---- ARM64: the program's state is the translator's (src/arm64.c) --------------------------------------------------
+// A CONTEXT from the x86 registers, at rip / rsp.
+static void context_from(CONTEXT *c, const x86_ctx *x, uint64_t rip, uint64_t rsp) {
+    memset(c, 0, sizeof *c);
+    c->flags = 0x10001f;
+    c->mxcsr = x->mxcsr;
+    c->cs = 0x33; c->ss = 0x2b; c->ds = c->es = 0x2b; c->fs = 0x53; c->gs = 0x2b;
+    c->eflags = (DWORD)x->flags;
+    memcpy(c->gpr, x->gpr, sizeof c->gpr);
+    c->gpr[RSP] = rsp;
+    c->rip = rip;
+    memcpy(c->fltsave_head, &x->fcw, 2);                          // XSAVE_FORMAT: ControlWord, then MxCsr at 24
+    memcpy(c->fltsave_head + 24, &x->mxcsr, 4);
+    memcpy(c->xmm, x->xmm, sizeof c->xmm);
+}
+// As the program's caller of the runtime function now running sees it: just returned from the call.
+static void context_at_return(CONTEXT *c, const x86_ctx *x) {
+    uint64_t rsp = x->gpr[4];
+    context_from(c, x, *(uint64_t *)(uintptr_t)rsp, rsp + 8);
+}
+void vx_arm64_resume(const uint64_t *gpr, uint64_t rip, uint64_t eflags, uint32_t mxcsr, const void *xmm) __attribute__((noreturn));
+void vx_restore_context(const CONTEXT *c) {
+    vx_arm64_resume(c->gpr, c->rip, c->eflags, c->mxcsr, c->xmm);
+}
+
+// The program's calls (thunks reading the x86 state) and this runtime's own (a context starting in native code:
+// the walk goes on at the entries).
+static void th_RtlCaptureContext(x86_ctx *x) { context_at_return((CONTEXT *)(uintptr_t)x->gpr[1], x); }
+static void th_RaiseException(x86_ctx *x) {
+    CONTEXT c; context_at_return(&c, x);
+    vx_raise((DWORD)x->gpr[1], (DWORD)x->gpr[2], (DWORD)x->gpr[8], (const uint64_t *)(uintptr_t)x->gpr[9], &c);
+}
+void __attribute__((noreturn)) vx_cxx_throw(void *obj, const void *ti, void *ctx);
+static void th_CxxThrowException(x86_ctx *x) {
+    CONTEXT c; context_at_return(&c, x);
+    vx_cxx_throw((void *)(uintptr_t)x->gpr[1], (const void *)(uintptr_t)x->gpr[2], &c);
+}
+static void th_RtlUnwindEx(x86_ctx *x) {
+    CONTEXT c; context_at_return(&c, x);
+    uint64_t *stack = (uint64_t *)(uintptr_t)x->gpr[4];
+    vx_unwind(x->gpr[1], x->gpr[2], (EXCEPTION_RECORD *)(uintptr_t)x->gpr[8], x->gpr[9], (CONTEXT *)(uintptr_t)stack[5], &c);
+}
+static void th_RtlUnwind(x86_ctx *x) {
+    CONTEXT c; context_at_return(&c, x);
+    vx_unwind(x->gpr[1], x->gpr[2], (EXCEPTION_RECORD *)(uintptr_t)x->gpr[8], x->gpr[9], NULL, &c);
+}
+static void native_context(CONTEXT *c) {                          // (rip 0: no unwind data, so the entries)
+    memset(c, 0, sizeof *c);
+    c->gpr[RSP] = vx_x86_ctx()->gpr[4] - 8;
+}
+void vx_RtlCaptureContext(CONTEXT *c) { native_context(c); }
+void vx_RaiseException(DWORD code, DWORD flags, DWORD n, const uint64_t *args) { CONTEXT c; native_context(&c); vx_raise(code, flags, n, args, &c); }
+void vx_RtlUnwindEx(uint64_t frame, uint64_t ip, EXCEPTION_RECORD *rec, uint64_t ret, CONTEXT *ctx, void *history) {
+    (void)history; CONTEXT c; native_context(&c); vx_unwind(frame, ip, rec, ret, ctx, &c);
+}
+void vx_RtlUnwind(uint64_t frame, uint64_t ip, EXCEPTION_RECORD *rec, uint64_t ret) { CONTEXT c; native_context(&c); vx_unwind(frame, ip, rec, ret, NULL, &c); }
+void vx_CxxThrowException(void *obj, const void *ti) { CONTEXT c; native_context(&c); vx_cxx_throw(obj, ti, &c); }
+static const vx_thunk seh_special[] = {
+    { (const void *)vx_RtlCaptureContext, th_RtlCaptureContext }, { (const void *)vx_RaiseException, th_RaiseException },
+    { (const void *)vx_RtlUnwindEx, th_RtlUnwindEx }, { (const void *)vx_RtlUnwind, th_RtlUnwind },
+    { (const void *)vx_CxxThrowException, th_CxxThrowException },
+};
+__attribute__((constructor)) static void seh_special_add(void) { vx_thunks_add(seh_special, sizeof seh_special / sizeof *seh_special); }
+
+// An exception of the program's code where translated code stopped (src/arm64.c): RIP at the instruction.
+void __attribute__((noreturn)) vx_seh_fault(DWORD code, DWORD n, const uint64_t *params) {
+    x86_ctx *x = vx_x86_ctx();
+    CONTEXT c; context_from(&c, x, x->rip, x->gpr[4]);
+    EXCEPTION_RECORD rec = { code, 0, NULL, (void *)(uintptr_t)x->rip, n, 0, {0} };
+    if (params) memcpy(rec.info, params, n * 8);
+    dispatch(&rec, &c);
+}
+
+// A call from this runtime into the program's code while the program is in a call into the runtime: the walk over
+// the runtime's frames goes on where the program called it (as just returned from that call).
+void *vx_seh_level_begin(const x86_ctx *outer) {
+    struct { vx_entry e; CONTEXT c; } *l = malloc(sizeof *l);
+    context_at_return(&l->c, outer);
+    l->e = (vx_entry)ENTRY(t_entries, &l->c);
+    t_entries = &l->e;
+    return l;
+}
+void vx_seh_level_end(void *level) {
+    vx_entry *e = level;
+    if (t_entries == e) t_entries = e->next;
+    free(level);
+}
+#endif
+
+#ifdef __aarch64__
+#include "thunks/seh.c.inc"
+#endif

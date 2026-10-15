@@ -520,3 +520,7 @@ void vx_xaudio2_init(void) {
     vx_register_module("xaudio2_9redist.dll", xaudio2, sizeof xaudio2 / sizeof xaudio2[0]);
     vx_register_module("xaudio2_8.dll", xaudio2, sizeof xaudio2 / sizeof xaudio2[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/xaudio2.m.inc"
+#endif

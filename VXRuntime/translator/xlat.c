@@ -1558,6 +1558,27 @@ static uint16_t flags_read_at(uint64_t r, uint64_t lo, uint64_t hi, uint64_t sto
     return read | want;
 }
 
+void xlat_block_native(xlat_buf *b, void (*fn)(x86_ctx *)) {
+    E(b, a64_str(8, XS, XC, CTX_RAS));                                    // (calls back into x86 code go on in the ring)
+    for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
+    for (int r = 0; r < 16; r += 2) E(b, a64_stpq(r, r + 1, XC, CTX_XMM + r * 16));
+    E(b, a64_str(8, XF, XC, CTX_FLAGS));
+    E(b, a64_mov(0, XC));
+    mov_imm(b, S0, (uint64_t)(uintptr_t)fn);
+    E(b, a64_blr(S0));
+    for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
+    for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
+    E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
+    E(b, a64_ldr(8, S0, XC, CTX_JUMP));
+    size_t ret = here(b); E(b, 0);                                         // CBZ jump -> return
+    E(b, a64_str(8, XZR, XC, CTX_JUMP));
+    E(b, a64_ldr(8, S1, XC, CTX_RIP));
+    site_exit(b);                                                         // (through C: a fault stops there)
+    patch_cbz(b, ret, 0, S0);
+    E(b, a64_ldr8_post(S1, 4, 8));
+    site_ret(b);
+}
+
 static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end);
 int xlat_block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end) {
     b->defer_cold = 1;
@@ -1632,6 +1653,8 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         if (!x86_decode((const uint8_t *)(uintptr_t)rip, 15, &d)) return -1;
         b->dead_flags = i < n ? dead[i] : 0;
         b->keep_operands = fuse_k && i == fuse_p;
+        if (b->nimap == b->cimap) { b->cimap = b->cimap ? 2 * b->cimap : 64; b->imap = realloc(b->imap, b->cimap * sizeof *b->imap); }
+        b->imap[b->nimap].at = (uint32_t)b->n; b->imap[b->nimap++].rip = rip;
         b->nskipped += b->dead_flags != 0;
         if (trap(b, &d, rip)) { b->dead_flags = 0; site_exit(b); *end = rip + d.len; return 0; }
         int c = control_linked(b, &d, rip);

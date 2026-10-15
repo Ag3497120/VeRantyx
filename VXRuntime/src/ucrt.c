@@ -338,11 +338,11 @@ static void trace_exit(const char *what, int code, void *ret) {
     const vx_image *m = vx_image_at((uint64_t)(uintptr_t)ret);
     vx_log("%s(%d) from %s+%#llx", what, code, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)ret - m->base) : 0ull);
 }
-static WINAPI void vx_exit(int code) { trace_exit("exit", code, __builtin_return_address(0)); run_atexit(); vx_profile_finish(); _exit(code); }
-static WINAPI void vx__exit(int code) { trace_exit("_exit", code, __builtin_return_address(0)); vx_profile_finish(); _exit(code); }
+static WINAPI void vx_exit(int code) { trace_exit("exit", code, VX_RETURN_ADDRESS()); run_atexit(); vx_profile_finish(); _exit(code); }
+static WINAPI void vx__exit(int code) { trace_exit("_exit", code, VX_RETURN_ADDRESS()); vx_profile_finish(); _exit(code); }
 static WINAPI void vx_abort(void) {
-    const vx_image *m = vx_image_at((uint64_t)(uintptr_t)__builtin_return_address(0));
-    vx_log("the program called abort() from %s+%#llx", m ? m->name : "?", m ? (unsigned long long)((uint8_t *)__builtin_return_address(0) - m->base) : 0ull);
+    const vx_image *m = vx_image_at((uint64_t)(uintptr_t)VX_RETURN_ADDRESS());
+    vx_log("the program called abort() from %s+%#llx", m ? m->name : "?", m ? (unsigned long long)((uint8_t *)VX_RETURN_ADDRESS() - m->base) : 0ull);
     _exit(3);
 }
 
@@ -602,17 +602,17 @@ static WINAPI int vx_vsnprintf(char *buf, size_t n, const char *fmt, const char 
     return (size_t)len >= n ? -1 : len;                         // the old _vsnprintf: -1 when it did not fit
 }
 static WINAPI int vx_snprintf(char *buf, size_t n, const char *fmt, ...) {
-    __builtin_ms_va_list ap;
-    __builtin_ms_va_start(ap, fmt);
+    vx_va_list ap;
+    vx_va_start(ap, fmt);
     int r = vx_vsnprintf(buf, n, fmt, ap);
-    __builtin_ms_va_end(ap);
+    vx_va_end(ap);
     return r;
 }
 static WINAPI int vx_sprintf(char *buf, const char *fmt, ...) {
-    __builtin_ms_va_list ap;
-    __builtin_ms_va_start(ap, fmt);
+    vx_va_list ap;
+    vx_va_start(ap, fmt);
     int r = vx_format(buf, (size_t)1 << 30, fmt, ap);
-    __builtin_ms_va_end(ap);
+    vx_va_end(ap);
     return r;
 }
 
@@ -783,9 +783,9 @@ int vx_format_w(WCHAR *out, size_t cap, const WCHAR *fmt, const char *ap) {
 }
 static WINAPI int vx_vsnwprintf(WCHAR *buf, size_t n, const WCHAR *fmt, const char *ap) { return vx_format_w(buf, n, fmt, ap); }
 static WINAPI int vx_snwprintf(WCHAR *buf, size_t n, const WCHAR *fmt, ...) {
-    __builtin_ms_va_list ap; __builtin_ms_va_start(ap, fmt);
+    vx_va_list ap; vx_va_start(ap, fmt);
     int r = vx_format_w(buf, n, fmt, ap);
-    __builtin_ms_va_end(ap);
+    vx_va_end(ap);
     return r;
 }
 static WINAPI int __stdio_common_vswprintf(uint64_t options, WCHAR *buf, size_t count, const WCHAR *fmt, void *locale, const char *ap) {
@@ -1213,17 +1213,17 @@ static WINAPI void *ms_bsearch(const void *key, const void *base, size_t n, size
 }
 static WINAPI int ms_vfprintf(vx_file *f, const char *fmt, const char *ap) { return __stdio_common_vfprintf(0, f, fmt, NULL, ap); }
 static WINAPI int ms_fprintf(vx_file *f, const char *fmt, ...) {
-    __builtin_ms_va_list ap;
-    __builtin_ms_va_start(ap, fmt);
+    vx_va_list ap;
+    vx_va_start(ap, fmt);
     int r = __stdio_common_vfprintf(0, f, fmt, NULL, ap);
-    __builtin_ms_va_end(ap);
+    vx_va_end(ap);
     return r;
 }
 static WINAPI int ms_sscanf(const char *buf, const char *fmt, ...) {
-    __builtin_ms_va_list ap;
-    __builtin_ms_va_start(ap, fmt);
+    vx_va_list ap;
+    vx_va_start(ap, fmt);
     int r = __stdio_common_vsscanf(0, buf, (size_t)-1, fmt, NULL, ap);
-    __builtin_ms_va_end(ap);
+    vx_va_end(ap);
     return r;
 }
 static WINAPI char *ms_unDName(char *out, const char *name, int len, void *alloc, void *dealloc, unsigned short flags) {
@@ -1258,3 +1258,7 @@ void vx_ucrt_init(void) {
     vx_register_module("msvcrt.dll", msvcrt_extra, sizeof msvcrt_extra / sizeof msvcrt_extra[0]);
     vx_register_module("ucrtbase.dll", msvcrt_extra, sizeof msvcrt_extra / sizeof msvcrt_extra[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/ucrt.c.inc"
+#endif

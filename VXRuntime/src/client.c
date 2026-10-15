@@ -775,3 +775,7 @@ void vx_client_init(void) {
     vx_register_module("comdlg32.dll", comdlg32, sizeof comdlg32 / sizeof comdlg32[0]);
     if (getenv("VXRT_OPENGL") && !strcmp(getenv("VXRT_OPENGL"), "0")) vx_register_module("opengl32.dll", opengl32, sizeof opengl32 / sizeof opengl32[0]);   // (stubs instead of opengl.c)
 }
+
+#ifdef __aarch64__
+#include "thunks/client.c.inc"
+#endif

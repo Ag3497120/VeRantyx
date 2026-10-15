@@ -236,6 +236,40 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   6,000 programs each, plus 2 x 8,000 programs in ordered mode (1,800 split accesses patched): identical (one more
   classification: a VFMSUBADD case where Rosetta raises its other operation's IE in one lane and ours a before-rounding
   UE in another, both known). `make coverage`: 99.58 % of the 221,978,344 instructions translate (traps now do).
+- **Phase 4b, the runtime as ARM64 code (2026-10-15).** `make build/vxrt-arm64`: the same sources built for ARM64,
+  the program's x86-64 code run by the engine in the process (`src/arm64.c`), and `make check-arm64` runs all the
+  runtime's tests that way: every one passes (threads, fibers, SuspendThread/GetThreadContext, MinGW and MSVC C++
+  exceptions, access violations and divide errors in the program's code, DLLs, files and the overlay, sockets, COM,
+  IOCP, windows, Direct3D 11 draws and compute, OpenGL, input, WASAPI, XAudio2, pipes and the four tests between
+  processes). The boundary, both ways:
+  - *The program calling the runtime.* `tools/vx_abi_scan.py` reads the sources with libclang as the x86 build sees
+    them and lists every function with the Windows calling convention (7,982: exports, COM methods, OpenGL
+    wrappers); `tools/vx_thunks.py` writes a C thunk for each (generated C, no machine code), included at the end of
+    its file: it reads the arguments where x86 code left them (RCX RDX R8 R9 / XMM0-3, then above the home area),
+    cut to their C type's width (x64 leaves the bits above a narrow argument undefined), calls the function and puts
+    the result in RAX or XMM0; variadic ones get the argument slots as their va_list (the format code already took
+    "a pointer to 8-byte slots"). The engine makes a native function's address a block that stores the x86 state,
+    calls the thunk and returns like RET. Eight functions that work on the x86 state itself (RtlCaptureContext,
+    RaiseException, RtlUnwind(Ex), _CxxThrowException, setjmp/longjmp, __chkstk, SwitchToFiber) have thunks written
+    by hand.
+  - *The runtime calling the program* (entry points, DllMain, window procedures, thread start routines, callbacks:
+    176 calls through ms_abi pointers): x86 code is never mapped executable, so such a call faults on its first
+    instruction; the handler sends it to `vx_cb_tramp` (`src/context_arm64.S`), which runs it on the engine with
+    x0-x7 as RCX RDX R8 R9 and the stack. No call site changes: every one passes integers or pointers only, and
+    `tools/vx_thunks.py` fails the build if one does not. Each such call is a level with a jmp_buf: an exception
+    handled in a frame of level L resumes L's engine loop, leaving the native frames above it as the x86 build leaves
+    them by moving RSP; the SEH walk (seh.c, unchanged otherwise) goes on over the runtime's frames where the program
+    called into it. A fault in translated code finds its x86 instruction from a map of host addresses (recorded per
+    instruction) and the state in the registers the translation keeps it in.
+  - Each thread has its own x86 stack (the PE's reserve for the main thread) and context; translated code's gs is
+    the TEB. The engine is shared by the threads (translation and linking under a lock, table entries written with
+    one STP). Found on the way: the loader read the entry point from the file's copy after freeing it (it worked by
+    luck under Rosetta; fixed for both builds).
+  **A limit of this in-process design, measured:** an ARM64 process on macOS cannot map anything below 4 GB (the
+  kernel kills an ARM64 binary with a __PAGEZERO under 4 GB, and with the default one the VM map starts there; the
+  x86 build gets its low 4 GB with `-pagezero_size 0x10000`). Programs that ask for low memory (LuaJIT 2.0's
+  allocator, through NtAllocateVirtualMemory ZeroBits: SteamVR Home's vscript.dll; Half-Life: Alyx's does not import
+  it) cannot run this way; under a virtual CPU the guest's address space is ours, so that is where they would go.
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.
