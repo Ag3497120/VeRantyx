@@ -191,12 +191,14 @@ static void call_helper_r(xlat_buf *b, uint32_t op, int op_reg, int val) {
     E(b, a64_str(8, val, XC, CTX_HELPER_VAL));
     if (op_reg >= 0) E(b, a64_str(8, op_reg, XC, CTX_HELPER_OP));
     for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
+    for (int r = 0; r < 16; r += 2) E(b, a64_stpq(r, r + 1, XC, CTX_XMM + r * 16));
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
     if (op_reg < 0) { mov_imm(b, S0, op); E(b, a64_str(8, S0, XC, CTX_HELPER_OP)); }
     E(b, a64_mov(0, XC));
     mov_imm(b, S0, (uint64_t)(uintptr_t)xlat_helper);
     E(b, a64_blr(S0));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
+    for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
     E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
 }
 static void call_helper(xlat_buf *b, uint32_t op, int val) { call_helper_r(b, op, -1, val); }
@@ -429,6 +431,8 @@ static void shld(xlat_buf *b, const x86_insn *d, int right, int count_from_cl, i
     patch_b(b, end);
 }
 
+#include "xlat_sse.inc"
+
 static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
     uint64_t next = rip + d->len;
     int op = d->opcode, size = d->opsize, reg = d->reg;
@@ -626,6 +630,10 @@ static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
             return 0;
         }
         return -1;
+    }
+    if (d->map == X86_MAP_0F || d->map == X86_MAP_0F38 || d->map == X86_MAP_0F3A) {
+        int r = xlat_sse(b, d, next);                                    // SSE / SSE2 (xlat_sse.inc); 1: not one
+        if (r != 1) return r;
     }
     if (d->map == X86_MAP_0F) {
         if (op >= 0x40 && op <= 0x4F) {                                 // CMOVcc
@@ -859,19 +867,23 @@ int xlat_block(xlat_buf *b, uint64_t rip, int max_insns) {
 }
 
 void xlat_prologue(xlat_buf *b) {
-    E(b, a64_stp_pre(29, 30, SP, -96));
+    E(b, a64_stp_pre(29, 30, SP, -160));
     E(b, a64_stp(19, 20, SP, 16)); E(b, a64_stp(21, 22, SP, 32)); E(b, a64_stp(23, 24, SP, 48));
     E(b, a64_stp(25, 26, SP, 64)); E(b, a64_stp(27, 28, SP, 80));
+    E(b, a64_stpd(8, 9, SP, 96)); E(b, a64_stpd(10, 11, SP, 112)); E(b, a64_stpd(12, 13, SP, 128)); E(b, a64_stpd(14, 15, SP, 144));
     E(b, a64_mov(XC, 0));
     mov_imm(b, XP, (uint64_t)(uintptr_t)xlat_parity);
     E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
+    for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
 }
 void xlat_epilogue(xlat_buf *b) {
     for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
+    for (int r = 0; r < 16; r += 2) E(b, a64_stpq(r, r + 1, XC, CTX_XMM + r * 16));
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
     E(b, a64_ldp(19, 20, SP, 16)); E(b, a64_ldp(21, 22, SP, 32)); E(b, a64_ldp(23, 24, SP, 48));
     E(b, a64_ldp(25, 26, SP, 64)); E(b, a64_ldp(27, 28, SP, 80));
-    E(b, a64_ldp_post(29, 30, SP, 96));
+    E(b, a64_ldpd(8, 9, SP, 96)); E(b, a64_ldpd(10, 11, SP, 112)); E(b, a64_ldpd(12, 13, SP, 128)); E(b, a64_ldpd(14, 15, SP, 144));
+    E(b, a64_ldp_post(29, 30, SP, 160));
     E(b, a64_ret());
 }

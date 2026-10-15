@@ -102,7 +102,7 @@ build/x86dec_check: translator/x86dec.c translator/x86dec.h translator/x86dec_ch
 build/ref_x86: translator/diff/ref_x86.c translator/diff/difftest.h
 	@mkdir -p build
 	$(CC) -arch x86_64 -O1 -Wall -o $@ translator/diff/ref_x86.c
-build/difftest: translator/diff/difftest.c translator/diff/difftest.h translator/xlat.c translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h
+build/difftest: translator/diff/difftest.c translator/diff/difftest.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h
 	@mkdir -p build
 	$(HOSTCC) -Wno-missing-field-initializers translator/x86dec.c translator/xlat.c translator/diff/difftest.c -o $@
 translator-check: build/ref_x86 build/difftest build/x86dec_test

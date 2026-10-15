@@ -88,3 +88,84 @@ static inline uint32_t a64_b(int32_t words) { return 0x14000000u | ((uint32_t)wo
 static inline uint32_t a64_bcond(int cond, int32_t words) { return 0x54000000u | ((uint32_t)words & 0x7FFFF) << 5 | (uint32_t)cond; }
 static inline uint32_t a64_cbz(int t, int32_t words) { return 0xB4000000u | ((uint32_t)words & 0x7FFFF) << 5 | (uint32_t)t; }
 static inline uint32_t a64_cbnz(int t, int32_t words) { return 0xB5000000u | ((uint32_t)words & 0x7FFFF) << 5 | (uint32_t)t; }
+
+// ---- SIMD and floating point (phase 3) -------------------------------------------------------------------------------
+#define A64_V3(name, op) static inline uint32_t a64_##name(int d, int n, int m) { return (op) | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)d; }
+// vector, 4S / 2D / 16B / 8H
+A64_V3(fadd4s, 0x4E20D400u) A64_V3(fadd2d, 0x4E60D400u) A64_V3(fsub4s, 0x4EA0D400u) A64_V3(fsub2d, 0x4EE0D400u)
+A64_V3(fmul4s, 0x6E20DC00u) A64_V3(fmul2d, 0x6E60DC00u) A64_V3(fdiv4s, 0x6E20FC00u) A64_V3(fdiv2d, 0x6E60FC00u)
+A64_V3(fcmeq4s, 0x4E20E400u) A64_V3(fcmeq2d, 0x4E60E400u) A64_V3(fcmgt4s, 0x6EA0E400u) A64_V3(fcmgt2d, 0x6EE0E400u)
+A64_V3(fcmge4s, 0x6E20E400u) A64_V3(fcmge2d, 0x6E60E400u)
+A64_V3(vand, 0x4E201C00u) A64_V3(vorr, 0x4EA01C00u) A64_V3(veor, 0x6E201C00u) A64_V3(vbic, 0x4E601C00u)
+A64_V3(vbsl, 0x6E601C00u)                                         // d = (d & n) | (~d & m)
+A64_V3(add16b, 0x4E208400u) A64_V3(add8h, 0x4E608400u) A64_V3(add4s, 0x4EA08400u) A64_V3(add2d, 0x4EE08400u)
+A64_V3(sub16b, 0x6E208400u) A64_V3(sub8h, 0x6E608400u) A64_V3(sub4s, 0x6EA08400u) A64_V3(sub2d, 0x6EE08400u)
+A64_V3(cmeq16b, 0x6E208C00u) A64_V3(cmeq8h, 0x6E608C00u) A64_V3(cmeq4s, 0x6EA08C00u)
+A64_V3(cmgt16b, 0x4E203400u) A64_V3(cmgt8h, 0x4E603400u) A64_V3(cmgt4s, 0x4EA03400u)
+A64_V3(zip1_4s, 0x4E803800u) A64_V3(zip2_4s, 0x4E807800u) A64_V3(zip1_2d, 0x4EC03800u) A64_V3(zip2_2d, 0x4EC07800u)
+A64_V3(zip1_16b, 0x4E003800u) A64_V3(zip2_16b, 0x4E007800u) A64_V3(zip1_8h, 0x4E403800u) A64_V3(zip2_8h, 0x4E407800u)
+A64_V3(smull4s, 0x0E60C000u) A64_V3(smull2_4s, 0x4E60C000u) A64_V3(addp4s, 0x4EA0BC00u)
+A64_V3(mul8h, 0x4E609C00u) A64_V3(mul4s, 0x4EA09C00u)
+// scalar s / d
+A64_V3(fadds, 0x1E202800u) A64_V3(faddd, 0x1E602800u) A64_V3(fsubs, 0x1E203800u) A64_V3(fsubd, 0x1E603800u)
+A64_V3(fmuls, 0x1E200800u) A64_V3(fmuld, 0x1E600800u) A64_V3(fdivs, 0x1E201800u) A64_V3(fdivd, 0x1E601800u)
+#undef A64_V3
+static inline uint32_t a64_vmov(int d, int n) { return a64_vorr(d, n, n); }
+static inline uint32_t a64_vmvn(int d, int n) { return 0x6E205800u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_movi0(int d) { return 0x6F00E400u | (uint32_t)d; }                   // MOVI Vd.2D, #0
+static inline uint32_t a64_fsqrt4s(int d, int n) { return 0x6EA1F800u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fsqrt2d(int d, int n) { return 0x6EE1F800u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fsqrts(int d, int n) { return 0x1E21C000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fsqrtd(int d, int n) { return 0x1E61C000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcmps(int n, int m) { return 0x1E202000u | (uint32_t)m << 16 | (uint32_t)n << 5; }
+static inline uint32_t a64_fcmpd(int n, int m) { return 0x1E602000u | (uint32_t)m << 16 | (uint32_t)n << 5; }
+// lanes: INS Vd.S[i], Vn.S[j] / Vd.D[i], Vn.D[j]; to and from general registers
+static inline uint32_t a64_ins_s(int d, int i, int n, int j) { return 0x6E000400u | (uint32_t)((i << 3) | 4) << 16 | (uint32_t)(j << 2) << 11 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_ins_d(int d, int i, int n, int j) { return 0x6E000400u | (uint32_t)((i << 4) | 8) << 16 | (uint32_t)(j << 3) << 11 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fmov_sw(int d, int n) { return 0x1E270000u | (uint32_t)n << 5 | (uint32_t)d; }   // S <- W (zeroes the rest)
+static inline uint32_t a64_fmov_ws(int d, int n) { return 0x1E260000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fmov_xd(int d, int n) { return 0x9E660000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_umov_s(int d, int n, int i) { return 0x0E003C00u | (uint32_t)((i << 3) | 4) << 16 | (uint32_t)n << 5 | (uint32_t)d; }   // W <- Vn.S[i]
+static inline uint32_t a64_umov_d(int d, int n, int i) { return 0x4E003C00u | (uint32_t)((i << 4) | 8) << 16 | (uint32_t)n << 5 | (uint32_t)d; }   // X <- Vn.D[i]
+static inline uint32_t a64_ins_gs(int d, int i, int n) { return 0x4E001C00u | (uint32_t)((i << 3) | 4) << 16 | (uint32_t)n << 5 | (uint32_t)d; }  // Vd.S[i] <- W
+static inline uint32_t a64_ins_gd(int d, int i, int n) { return 0x4E001C00u | (uint32_t)((i << 4) | 8) << 16 | (uint32_t)n << 5 | (uint32_t)d; }  // Vd.D[i] <- X
+static inline uint32_t a64_dup4s(int d, int n) { return 0x4E040C00u | (uint32_t)n << 5 | (uint32_t)d; }                                          // Vd.4S <- W
+static inline uint32_t a64_ext(int d, int n, int m, int imm) { return 0x6E000000u | (uint32_t)m << 16 | (uint32_t)imm << 11 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_uminv4s(int d, int n) { return 0x6EB1A800u | (uint32_t)n << 5 | (uint32_t)d; }
+// shifts by immediate: 4S (n 1..32 right, 0..31 left), 8H, 2D
+static inline uint32_t a64_ushr(int esize, int d, int n, int sh) { return 0x6F000400u | (uint32_t)(2 * esize - sh) << 16 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_sshr(int esize, int d, int n, int sh) { return 0x4F000400u | (uint32_t)(2 * esize - sh) << 16 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_shl(int esize, int d, int n, int sh) { return 0x4F005400u | (uint32_t)(esize + sh) << 16 | (uint32_t)n << 5 | (uint32_t)d; }
+// conversions
+static inline uint32_t a64_scvtf_sw(int d, int n) { return 0x1E220000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_scvtf_sx(int d, int n) { return 0x9E220000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_scvtf_dw(int d, int n) { return 0x1E620000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_scvtf_dx(int d, int n) { return 0x9E620000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtzs_ws(int d, int n) { return 0x1E380000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtzs_xs(int d, int n) { return 0x9E380000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtzs_wd(int d, int n) { return 0x1E780000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtzs_xd(int d, int n) { return 0x9E780000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtns_ws(int d, int n) { return 0x1E200000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtns_xs(int d, int n) { return 0x9E200000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtns_wd(int d, int n) { return 0x1E600000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtns_xd(int d, int n) { return 0x9E600000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvt_ds(int d, int n) { return 0x1E22C000u | (uint32_t)n << 5 | (uint32_t)d; }       // D <- S
+static inline uint32_t a64_fcvt_sd(int d, int n) { return 0x1E624000u | (uint32_t)n << 5 | (uint32_t)d; }       // S <- D
+static inline uint32_t a64_scvtf4s(int d, int n) { return 0x4E21D800u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtzs4s(int d, int n) { return 0x4EA1B800u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtns4s(int d, int n) { return 0x4E21A800u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fcvtl2d(int d, int n) { return 0x0E617800u | (uint32_t)n << 5 | (uint32_t)d; }       // 2D <- low 2S
+static inline uint32_t a64_fcvtn2s(int d, int n) { return 0x0E616800u | (uint32_t)n << 5 | (uint32_t)d; }       // low 2S <- 2D (upper zeroed)
+static inline uint32_t a64_sxtl2d(int d, int n) { return 0x0F20A400u | (uint32_t)n << 5 | (uint32_t)d; }        // 2D <- low 2S, signed
+static inline uint32_t a64_scvtf2d(int d, int n) { return 0x4E61D800u | (uint32_t)n << 5 | (uint32_t)d; }
+// SIMD memory: [n + imm], scaled
+static inline uint32_t a64_ldrq(int t, int n, uint32_t off) { return 0x3DC00000u | (off / 16 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t; }
+static inline uint32_t a64_strq(int t, int n, uint32_t off) { return 0x3D800000u | (off / 16 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t; }
+static inline uint32_t a64_ldrd(int t, int n, uint32_t off) { return 0xFD400000u | (off / 8 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t; }
+static inline uint32_t a64_strd(int t, int n, uint32_t off) { return 0xFD000000u | (off / 8 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t; }
+static inline uint32_t a64_ldrs(int t, int n, uint32_t off) { return 0xBD400000u | (off / 4 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t; }
+static inline uint32_t a64_strs(int t, int n, uint32_t off) { return 0xBD000000u | (off / 4 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t; }
+static inline uint32_t a64_ldpq(int t1, int t2, int n, int imm) { return 0xAD400000u | ((uint32_t)(imm / 16) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
+static inline uint32_t a64_stpq(int t1, int t2, int n, int imm) { return 0xAD000000u | ((uint32_t)(imm / 16) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
+static inline uint32_t a64_stpd(int t1, int t2, int n, int imm) { return 0x6D000000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
+static inline uint32_t a64_ldpd(int t1, int t2, int n, int imm) { return 0x6D400000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }

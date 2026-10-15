@@ -45,6 +45,10 @@ int main(void) {
     static dt_case c;
     static dt_result r;
     while (fread(&c, sizeof c, 1, stdin) == 1) {
+        // Rosetta 2 keeps translations of code it has run: the pages are made writable (and executable again
+        // afterwards), so it sees the new instruction instead of reusing the last one's translation.
+        mprotect(stub, 4096, PROT_READ | PROT_WRITE);
+        mprotect(prog, DT_PROG_MAX + 4096, PROT_READ | PROT_WRITE);
         // The loading stub: host registers saved, the state loaded, then the instruction (and the storing stub after
         // it), or a jump to the program at DT_PROG (and the storing stub at DT_END, where the program ends).
         code = stub; at = 0;
@@ -53,6 +57,10 @@ int main(void) {
         mov_rax_imm((uint64_t)&st_in);
         b(0xFF); b(0xB0); d32(128); b(0x9D);                                                      // push [rax+128]; popfq
         for (int reg = 1; reg < 16; reg++) ld(reg, reg * 8);
+        for (int x = 0; x < 16; x++) {                                                            // movdqu xmmN, [rax+off]
+            b(0xF3); if (x >= 8) b(0x44); b(0x0F); b(0x6F); b(0x80 | (x & 7) << 3); d32((uint32_t)(DT_XMM + 16 * x));
+        }
+        b(0x0F); b(0xAE); b(0x90); d32(DT_MXCSR);                                                 // ldmxcsr [rax+off]
         b(0x48); b(0x8B); b(0x00);                                                                // mov rax, [rax]
         if (c.kind == 1) {
             memcpy(prog, c.prog, c.prog_len);
@@ -66,8 +74,14 @@ int main(void) {
         mov_rax_imm((uint64_t)&st_out);
         b(0x8F); b(0x80); d32(128);                                                               // pop [rax+128]
         for (int reg = 1; reg < 16; reg++) st(reg, reg * 8);
+        for (int x = 0; x < 16; x++) {                                                            // movdqu [rax+off], xmmN
+            b(0xF3); if (x >= 8) b(0x44); b(0x0F); b(0x7F); b(0x80 | (x & 7) << 3); d32((uint32_t)(DT_XMM + 16 * x));
+        }
+        b(0x0F); b(0xAE); b(0x98); d32(DT_MXCSR);                                                 // stmxcsr [rax+off]
         mov_rax_imm((uint64_t)&host_rsp); b(0x48); b(0x8B); b(0x20);                              // mov rsp, [rax]
         b(0x41); b(0x5F); b(0x41); b(0x5E); b(0x41); b(0x5D); b(0x41); b(0x5C); b(0x5D); b(0x5B); b(0xC3);
+        mprotect(stub, 4096, PROT_READ | PROT_EXEC);
+        mprotect(prog, DT_PROG_MAX + 4096, PROT_READ | PROT_EXEC);
         st_in = c.in;
         memset(&st_out, 0, sizeof st_out);
         memcpy(buf, c.mem, DT_BUF_SIZE);

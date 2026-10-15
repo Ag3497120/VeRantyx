@@ -29,6 +29,37 @@ static uint64_t rnd_value(void) {                   // edge values half the time
     return rnd();
 }
 
+// Floating-point lanes with the values that differ between x86 and ARM: zeros, infinities, quiet and signalling
+// NaNs (both signs, payloads), denormals, values at the integer conversion limits.
+static uint32_t rnd_f32(void) {
+    static const uint32_t edge[] = { 0, 0x80000000, 0x3F800000, 0xBF800000, 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000,
+                                     0x7FA00001, 0xFF812345, 0x7FC12345, 0x00000001, 0x807FFFFF, 0x00400000, 0x4F000000, 0xCF000000,
+                                     0x4EFFFFFF, 0xCF000001, 0x5F000000, 0x3F000000, 0x3FC00000, 0x40200000, 0x7F7FFFFF, 0x00800000 };
+    uint64_t r = rnd();
+    if (r & 1) return edge[(r >> 1) % (sizeof edge / sizeof edge[0])];
+    if (r & 2) { float f = (float)((int64_t)(rnd() % 2000000) - 1000000) / (float)(1 + rnd() % 1000); uint32_t u; memcpy(&u, &f, 4); return u; }
+    return (uint32_t)rnd();
+}
+static uint64_t rnd_f64(void) {
+    static const uint64_t edge[] = { 0, 0x8000000000000000ull, 0x3FF0000000000000ull, 0xBFF0000000000000ull, 0x7FF0000000000000ull,
+                                     0xFFF0000000000000ull, 0x7FF8000000000000ull, 0xFFF8000000000000ull, 0x7FF4000000000001ull,
+                                     0xFFF0000000012345ull, 0x7FF8000000012345ull, 1, 0x800FFFFFFFFFFFFFull, 0x41E0000000000000ull,
+                                     0xC1E0000000000000ull, 0x41DFFFFFFFC00000ull, 0x41DFFFFFFFE00000ull, 0xC1E0000000200000ull,
+                                     0x43E0000000000000ull, 0xC3E0000000000000ull, 0x3FE0000000000000ull, 0x7FEFFFFFFFFFFFFFull };
+    uint64_t r = rnd();
+    if (r & 1) return edge[(r >> 1) % (sizeof edge / sizeof edge[0])];
+    if (r & 2) { double f = (double)((int64_t)(rnd() % 2000000000) - 1000000000) / (double)(1 + rnd() % 100000); uint64_t u; memcpy(&u, &f, 8); return u; }
+    return rnd();
+}
+static void rnd_xmm(uint8_t *x) {                     // 16 bytes: floats, doubles or bits
+    int k = (int)(rnd() % 3);
+    for (int i = 0; i < 16; i += k == 1 ? 8 : 4) {
+        if (k == 0) { uint32_t v = rnd_f32(); memcpy(x + i, &v, 4); }
+        else if (k == 1) { uint64_t v = rnd_f64(); memcpy(x + i, &v, 8); }
+        else { uint32_t v = (uint32_t)rnd(); memcpy(x + i, &v, 4); }
+    }
+}
+
 // ---- the forms ------------------------------------------------------------------------------------------------------------------
 typedef struct { const char *name; int map; uint8_t op; int group; int imm; int no_mem; int no_byte_ops; int special; int prefix; } form;
 enum { SP_MOFFS = 1, SP_XLAT, SP_LEAVE, SP_STRING, SP_LOCK };   // special: how the case is set up; prefix: F3 / F2
@@ -119,6 +150,8 @@ static uint64_t last_addr;                           // the memory operand's add
 static void make_case(const form *f, dt_case *c, int *size_out) {
     memset(c, 0, sizeof *c);
     last_addr = 0;
+    for (int i = 0; i < 16; i++) rnd_xmm(c->in.xmm[i]);
+    c->in.mxcsr = 0x1F80;
     for (int i = 0; i < 16; i++) c->in.gpr[i] = rnd_value();
     for (int i = 0; i < DT_BUF_SIZE; i++) c->mem[i] = (uint8_t)rnd();
     c->in.gpr[4] = DT_STACK;
@@ -283,6 +316,8 @@ typedef struct { uint8_t *at; int target; } fixup;      // a rel32 at `at` to bl
 static void make_program(dt_case *c) {
     memset(c, 0, sizeof *c);
     c->kind = 1;
+    for (int i = 0; i < 16; i++) rnd_xmm(c->in.xmm[i]);
+    c->in.mxcsr = 0x1F80;
     for (int i = 0; i < 16; i++) c->in.gpr[i] = rnd_value();
     for (int i = 0; i < DT_BUF_SIZE; i++) c->mem[i] = (uint8_t)rnd();
     c->in.gpr[4] = DT_STACK; c->in.gpr[3] = DT_BUF + 1024;
@@ -352,16 +387,93 @@ static int run_translated(const dt_case *c, const x86_insn *d, dt_result *r) {
     static x86_ctx ctx;
     memset(&ctx, 0, sizeof ctx);
     memcpy(ctx.gpr, c->in.gpr, sizeof ctx.gpr);
+    memcpy(ctx.xmm, c->in.xmm, sizeof ctx.xmm);
     ctx.flags = c->in.flags;
     memcpy((void *)DT_BUF, c->mem, DT_BUF_SIZE);
     signaled = 0;
     if (!sigsetjmp(jb, 1)) ((void (*)(x86_ctx *))jit)(&ctx);
     memcpy(r->out.gpr, ctx.gpr, sizeof ctx.gpr);
+    memcpy(r->out.xmm, ctx.xmm, sizeof ctx.xmm);
+    r->out.mxcsr = c->in.mxcsr;
     r->out.flags = ctx.flags;
     r->out.fault = signaled ? 2 : ctx.fault == X86_FAULT_DE ? 1 : 0;
     if (r->out.fault) { memcpy(r->out.gpr, c->in.gpr, sizeof ctx.gpr); r->out.flags = c->in.flags; }
     memcpy(r->mem, (void *)DT_BUF, DT_BUF_SIZE);
     return 0;
+}
+
+// ---- SSE forms -----------------------------------------------------------------------------------------------------------
+typedef struct { const char *name; uint8_t pf, op; int kind; int group; int mem; } sse_form;
+// kind bits: reg / rm are general registers, an imm8, register-only, REX.W variants, 16-byte aligned memory
+enum { K_GREG = 1, K_GRM = 2, K_IMM = 4, K_REGONLY = 8, K_W = 16, K_ALIGN = 32 };
+static const sse_form sse_forms[] = {
+    { "movups", 0, 0x10, 0, -1, 16 }, { "movupd", 0x66, 0x10, 0, -1, 16 }, { "movss", 0xF3, 0x10, 0, -1, 4 }, { "movsd", 0xF2, 0x10, 0, -1, 8 },
+    { "movups st", 0, 0x11, 0, -1, 16 }, { "movss st", 0xF3, 0x11, 0, -1, 4 }, { "movsd st", 0xF2, 0x11, 0, -1, 8 },
+    { "movaps", 0, 0x28, K_ALIGN, -1, 16 }, { "movapd", 0x66, 0x28, K_ALIGN, -1, 16 }, { "movaps st", 0, 0x29, K_ALIGN, -1, 16 },
+    { "movdqa", 0x66, 0x6F, K_ALIGN, -1, 16 }, { "movdqu", 0xF3, 0x6F, 0, -1, 16 }, { "movdqa st", 0x66, 0x7F, K_ALIGN, -1, 16 }, { "movdqu st", 0xF3, 0x7F, 0, -1, 16 },
+    { "movlps/movhlps", 0, 0x12, 0, -1, 8 }, { "movhps/movlhps", 0, 0x16, 0, -1, 8 }, { "movlpd", 0x66, 0x12, 0, -2, 8 }, { "movhpd", 0x66, 0x16, 0, -2, 8 },
+    { "movlps st", 0, 0x13, 0, -2, 8 }, { "movhps st", 0, 0x17, 0, -2, 8 },
+    { "unpcklps", 0, 0x14, K_ALIGN, -1, 16 }, { "unpckhps", 0, 0x15, K_ALIGN, -1, 16 }, { "unpcklpd", 0x66, 0x14, K_ALIGN, -1, 16 }, { "unpckhpd", 0x66, 0x15, K_ALIGN, -1, 16 },
+    { "shufps", 0, 0xC6, K_IMM | K_ALIGN, -1, 16 }, { "shufpd", 0x66, 0xC6, K_IMM | K_ALIGN, -1, 16 },
+    { "andps", 0, 0x54, K_ALIGN, -1, 16 }, { "andnps", 0, 0x55, K_ALIGN, -1, 16 }, { "orps", 0, 0x56, K_ALIGN, -1, 16 }, { "xorps", 0, 0x57, K_ALIGN, -1, 16 },
+    { "andpd", 0x66, 0x54, K_ALIGN, -1, 16 }, { "xorpd", 0x66, 0x57, K_ALIGN, -1, 16 },
+#define FP(nm, o) { nm "ps", 0, o, K_ALIGN, -1, 16 }, { nm "pd", 0x66, o, K_ALIGN, -1, 16 }, { nm "ss", 0xF3, o, 0, -1, 4 }, { nm "sd", 0xF2, o, 0, -1, 8 }
+    FP("add", 0x58), FP("mul", 0x59), FP("sub", 0x5C), FP("div", 0x5E), FP("min", 0x5D), FP("max", 0x5F), FP("sqrt", 0x51),
+#undef FP
+    { "cmpps", 0, 0xC2, K_IMM | K_ALIGN, -1, 16 }, { "cmppd", 0x66, 0xC2, K_IMM | K_ALIGN, -1, 16 }, { "cmpss", 0xF3, 0xC2, K_IMM, -1, 4 }, { "cmpsd", 0xF2, 0xC2, K_IMM, -1, 8 },
+    { "ucomiss", 0, 0x2E, 0, -1, 4 }, { "comiss", 0, 0x2F, 0, -1, 4 }, { "ucomisd", 0x66, 0x2E, 0, -1, 8 }, { "comisd", 0x66, 0x2F, 0, -1, 8 },
+    { "cvtsi2ss", 0xF3, 0x2A, K_GRM | K_W, -1, 4 }, { "cvtsi2sd", 0xF2, 0x2A, K_GRM | K_W, -1, 4 },
+    { "cvttss2si", 0xF3, 0x2C, K_GREG | K_W, -1, 4 }, { "cvtss2si", 0xF3, 0x2D, K_GREG | K_W, -1, 4 },
+    { "cvttsd2si", 0xF2, 0x2C, K_GREG | K_W, -1, 8 }, { "cvtsd2si", 0xF2, 0x2D, K_GREG | K_W, -1, 8 },
+    { "cvtps2pd", 0, 0x5A, 0, -1, 8 }, { "cvtpd2ps", 0x66, 0x5A, K_ALIGN, -1, 16 }, { "cvtss2sd", 0xF3, 0x5A, 0, -1, 4 }, { "cvtsd2ss", 0xF2, 0x5A, 0, -1, 8 },
+    { "cvtdq2ps", 0, 0x5B, K_ALIGN, -1, 16 }, { "cvtps2dq", 0x66, 0x5B, K_ALIGN, -1, 16 }, { "cvttps2dq", 0xF3, 0x5B, K_ALIGN, -1, 16 }, { "cvtdq2pd", 0xF3, 0xE6, 0, -1, 8 },
+    { "movmskps", 0, 0x50, K_GREG | K_REGONLY, -1, 0 }, { "movmskpd", 0x66, 0x50, K_GREG | K_REGONLY, -1, 0 },
+    { "movd/q xmm, r/m", 0x66, 0x6E, K_GRM | K_W, -1, 4 }, { "movd/q r/m, xmm", 0x66, 0x7E, K_GRM | K_W, -1, 4 },
+    { "movq xmm, xmm/m64", 0xF3, 0x7E, 0, -1, 8 }, { "movq xmm/m64, xmm", 0x66, 0xD6, 0, -1, 8 },
+    { "pshufd", 0x66, 0x70, K_IMM | K_ALIGN, -1, 16 }, { "pshuflw", 0xF2, 0x70, K_IMM | K_ALIGN, -1, 16 }, { "pshufhw", 0xF3, 0x70, K_IMM | K_ALIGN, -1, 16 },
+    { "psrlw imm", 0x66, 0x71, K_IMM | K_REGONLY, 2, 0 }, { "psraw imm", 0x66, 0x71, K_IMM | K_REGONLY, 4, 0 }, { "psllw imm", 0x66, 0x71, K_IMM | K_REGONLY, 6, 0 },
+    { "psrld imm", 0x66, 0x72, K_IMM | K_REGONLY, 2, 0 }, { "psrad imm", 0x66, 0x72, K_IMM | K_REGONLY, 4, 0 }, { "pslld imm", 0x66, 0x72, K_IMM | K_REGONLY, 6, 0 },
+    { "psrlq imm", 0x66, 0x73, K_IMM | K_REGONLY, 2, 0 }, { "psllq imm", 0x66, 0x73, K_IMM | K_REGONLY, 6, 0 },
+    { "psrldq", 0x66, 0x73, K_IMM | K_REGONLY, 3, 0 }, { "pslldq", 0x66, 0x73, K_IMM | K_REGONLY, 7, 0 },
+#define PI(nm, o) { nm, 0x66, o, K_ALIGN, -1, 16 }
+    PI("paddb", 0xFC), PI("paddw", 0xFD), PI("paddd", 0xFE), PI("paddq", 0xD4), PI("psubb", 0xF8), PI("psubw", 0xF9), PI("psubd", 0xFA), PI("psubq", 0xFB),
+    PI("pand", 0xDB), PI("pandn", 0xDF), PI("por", 0xEB), PI("pxor", 0xEF), PI("pcmpeqb", 0x74), PI("pcmpeqw", 0x75), PI("pcmpeqd", 0x76),
+    PI("pcmpgtb", 0x64), PI("pcmpgtw", 0x65), PI("pcmpgtd", 0x66), PI("punpcklbw", 0x60), PI("punpcklwd", 0x61), PI("punpckldq", 0x62),
+    PI("punpcklqdq", 0x6C), PI("punpckhbw", 0x68), PI("punpckhwd", 0x69), PI("punpckhdq", 0x6A), PI("punpckhqdq", 0x6D), PI("pmaddwd", 0xF5), PI("pmullw", 0xD5),
+#undef PI
+};
+
+static void make_sse_case(const sse_form *f, dt_case *c) {
+    memset(c, 0, sizeof *c);
+    for (int i = 0; i < 16; i++) { c->in.gpr[i] = rnd_value(); rnd_xmm(c->in.xmm[i]); }
+    for (int i = 0; i < DT_BUF_SIZE; i += 16) rnd_xmm(c->mem + i);
+    c->in.gpr[4] = DT_STACK;
+    c->in.flags = (rnd() & 0x8D5) | 0x202;
+    c->in.mxcsr = 0x1F80;
+    uint8_t *p = c->code;
+    if (f->pf) *p++ = f->pf;
+    int w = (f->kind & K_W) && (rnd() & 1);
+    int reg = (int)(rnd() % 16), rm = (int)(rnd() % 16);
+    if (f->kind & K_GREG) while (reg == 4) reg = (int)(rnd() % 16);
+    if (f->group >= 0) reg = f->group;
+    int mem = !(f->kind & K_REGONLY) && (f->group == -2 || rnd() % 3 == 0);
+    if (mem && f->op == 0x12 && !f->pf) mem = rnd() & 1;                      // (MOVLPS or MOVHLPS)
+    if (!mem && (f->kind & K_GRM)) while (rm == 4) rm = (int)(rnd() % 16);
+    int base = 0;
+    if (mem) { do base = (int)(rnd() % 16); while (base == 4 || base == 5 || base == 12 || base == 13 || ((f->kind & K_GREG) && base == reg)); rm = base; }
+    int rex = 0x40 | w << 3 | (reg >> 3 & 1) << 2 | (rm >> 3);
+    if (rex != 0x40 || (rnd() & 1)) *p++ = (uint8_t)rex;
+    *p++ = 0x0F; *p++ = f->op;
+    if (!mem) *p++ = (uint8_t)(0xC0 | (reg & 7) << 3 | (rm & 7));
+    else {
+        int disp = (int)(rnd() % 64) - 32;
+        *p++ = (uint8_t)(0x40 | (reg & 7) << 3 | (rm & 7)); *p++ = (uint8_t)disp;
+        uint64_t a = DT_BUF + 1024 + rnd() % 1024;
+        if (f->kind & K_ALIGN) a &= ~15ull;
+        c->in.gpr[base] = a - (uint64_t)(int64_t)disp;
+    }
+    if (f->kind & K_IMM) *p++ = (uint8_t)(f->group >= 0 && (rnd() & 1) ? rnd() % 20 : rnd());   // (shifts: counts near the width)
+    c->len = (uint32_t)(p - c->code);
 }
 
 static uint32_t *jit_prog;
@@ -372,6 +484,7 @@ static int run_program(const dt_case *c, dt_result *r) {
     static x86_ctx ctx;
     memset(&ctx, 0, sizeof ctx);
     memcpy(ctx.gpr, c->in.gpr, sizeof ctx.gpr);
+    memcpy(ctx.xmm, c->in.xmm, sizeof ctx.xmm);
     ctx.flags = c->in.flags;
     ctx.rip = DT_PROG;
     memcpy((void *)DT_BUF, c->mem, DT_BUF_SIZE);
@@ -396,6 +509,8 @@ static int run_program(const dt_case *c, dt_result *r) {
         }
     }
     memcpy(r->out.gpr, ctx.gpr, sizeof ctx.gpr);
+    memcpy(r->out.xmm, ctx.xmm, sizeof ctx.xmm);
+    r->out.mxcsr = c->in.mxcsr;
     r->out.flags = ctx.flags;
     r->out.fault = signaled ? 2 : ctx.fault == X86_FAULT_DE ? 1 : ctx.rip != DT_END ? 4 : 0;
     if (r->out.fault) { memcpy(r->out.gpr, c->in.gpr, sizeof ctx.gpr); r->out.flags = c->in.flags; }
@@ -440,7 +555,7 @@ int main(int argc, char **argv) {
         const form *f = &forms[fi];
         if (only && !strstr(f->name, only)) continue;
         long bad = 0, ran = 0;
-        char first[400] = "";
+        char first[900] = "";
         for (int k = 0; k < per; k++) {
             int size;
             make_case(f, &c, &size);
@@ -458,7 +573,8 @@ int main(int argc, char **argv) {
                 // (the reference stores EFLAGS just below the final RSP: those 8 bytes are its own)
                 uint64_t sp = want.out.gpr[4] - 8 - DT_BUF;
                 if (sp + 8 <= DT_BUF_SIZE) memcpy(want.mem + sp, got.mem + sp, 8);
-                diff = (want.out.flags & mask) != (got.out.flags & mask) || memcmp(want.mem, got.mem, DT_BUF_SIZE);
+                diff = (want.out.flags & mask) != (got.out.flags & mask) || memcmp(want.mem, got.mem, DT_BUF_SIZE) ||
+                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm) || (want.out.mxcsr & ~0x3Fu) != (got.out.mxcsr & ~0x3Fu);
                 for (int i = 0; i < 16; i++) diff |= want.out.gpr[i] != got.out.gpr[i];
             }
             if (diff) {
@@ -468,11 +584,20 @@ int main(int argc, char **argv) {
                     n += snprintf(first + n, sizeof first - (size_t)n, "; fault %llu/%llu flags %03llx/%03llx (in %03llx)",
                                   (unsigned long long)want.out.fault, (unsigned long long)got.out.fault,
                                   (unsigned long long)(want.out.flags & mask), (unsigned long long)(got.out.flags & mask), (unsigned long long)(c.in.flags & 0x8D5));
-                    for (int i = 0; i < 16 && n < 360; i++)
+                    for (int i = 0; i < 16 && n < 760; i++)
                         if (want.out.gpr[i] != got.out.gpr[i])
                             n += snprintf(first + n, sizeof first - (size_t)n, "; r%d %llx/%llx (in %llx)", i,
                                           (unsigned long long)want.out.gpr[i], (unsigned long long)got.out.gpr[i], (unsigned long long)c.in.gpr[i]);
-                    if (memcmp(want.mem, got.mem, DT_BUF_SIZE)) snprintf(first + n, sizeof first - (size_t)n, "; memory differs");
+                    for (int i = 0; i < 16 && n < 760; i++)
+                        if (memcmp(want.out.xmm[i], got.out.xmm[i], 16)) {
+                            uint64_t w0, w1, g0, g1, i0, i1;
+                            memcpy(&w0, want.out.xmm[i], 8); memcpy(&w1, want.out.xmm[i] + 8, 8); memcpy(&g0, got.out.xmm[i], 8); memcpy(&g1, got.out.xmm[i] + 8, 8);
+                            memcpy(&i0, c.in.xmm[i], 8); memcpy(&i1, c.in.xmm[i] + 8, 8);
+                            n += snprintf(first + n, sizeof first - (size_t)n, "; xmm%d %016llx%016llx/%016llx%016llx (in %016llx%016llx)", i,
+                                          (unsigned long long)w1, (unsigned long long)w0, (unsigned long long)g1, (unsigned long long)g0, (unsigned long long)i1, (unsigned long long)i0);
+                        }
+                    if (memcmp(want.mem, got.mem, DT_BUF_SIZE)) n += snprintf(first + n, sizeof first - (size_t)n, "; memory differs");
+                    if ((want.out.mxcsr & ~0x3Fu) != (got.out.mxcsr & ~0x3Fu)) snprintf(first + n, sizeof first - (size_t)n, "; mxcsr %x/%x", want.out.mxcsr, got.out.mxcsr);
                     if (getenv("DT_VERBOSE"))
                         for (int i = 0; i < DT_BUF_SIZE; i++) if (want.mem[i] != got.mem[i]) fprintf(stderr, "    mem[%d] in %02x want %02x got %02x\n", i, c.mem[i], want.mem[i], got.mem[i]);
                     if (getenv("DT_VERBOSE"))
@@ -486,9 +611,63 @@ int main(int argc, char **argv) {
         if (bad) { forms_bad++; printf("  FAIL %-22s %ld/%ld  %s\n", f->name, bad, ran, first); }
         else forms_ok++;
     }
+    // SSE / SSE2 forms
+    int nsse = (int)(sizeof sse_forms / sizeof sse_forms[0]);
+    for (int fi = 0; fi < nsse && (!only || 1); fi++) {
+        const sse_form *f = &sse_forms[fi];
+        if (only && !strstr(f->name, only)) continue;
+        long bad = 0, ran = 0; char first[900] = "";
+        for (int k = 0; k < per; k++) {
+            make_sse_case(f, &c);
+            x86_insn d;
+            if (x86_decode(c.code, c.len, &d) != (int)c.len) { snprintf(first, sizeof first, "decoder: length %d, want %u", d.len, c.len); bad++; break; }
+            if (run_translated(&c, &d, &got) < 0) { unsupported++; snprintf(first, sizeof first, "not translated (bytes %02x %02x %02x %02x %02x)", c.code[0], c.code[1], c.code[2], c.code[3], c.code[4]); bad++; break; }
+            if (fwrite(&c, sizeof c, 1, out) != 1 || fflush(out) || fread(&want, sizeof want, 1, in) != 1) { fprintf(stderr, "ref_x86 stopped\n"); return 1; }
+            ran++;
+            int diff = want.out.fault != got.out.fault;
+            if (!diff && !want.out.fault) {
+                uint64_t sp = want.out.gpr[4] - 8 - DT_BUF;
+                if (sp + 8 <= DT_BUF_SIZE) memcpy(want.mem + sp, got.mem + sp, 8);
+                diff = (want.out.flags & 0x8D5) != (got.out.flags & 0x8D5) || memcmp(want.mem, got.mem, DT_BUF_SIZE) ||
+                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm);
+                for (int i = 0; i < 16; i++) diff |= want.out.gpr[i] != got.out.gpr[i];
+            }
+            if (diff) {
+                if (!bad) {
+                    int n = snprintf(first, sizeof first, "bytes");
+                    for (uint32_t i = 0; i < c.len; i++) n += snprintf(first + n, sizeof first - (size_t)n, " %02x", c.code[i]);
+                    n += snprintf(first + n, sizeof first - (size_t)n, "; fault %llu/%llu flags %03llx/%03llx", (unsigned long long)want.out.fault,
+                                  (unsigned long long)got.out.fault, (unsigned long long)(want.out.flags & 0x8D5), (unsigned long long)(got.out.flags & 0x8D5));
+                    for (int i = 0; i < 16 && n < 760; i++)
+                        if (want.out.gpr[i] != got.out.gpr[i]) n += snprintf(first + n, sizeof first - (size_t)n, "; r%d %llx/%llx", i, (unsigned long long)want.out.gpr[i], (unsigned long long)got.out.gpr[i]);
+                    for (int i = 0; i < 16 && n < 760; i++)
+                        if (memcmp(want.out.xmm[i], got.out.xmm[i], 16)) {
+                            uint64_t w0, w1, g0, g1, i0, i1;
+                            memcpy(&w0, want.out.xmm[i], 8); memcpy(&w1, want.out.xmm[i] + 8, 8); memcpy(&g0, got.out.xmm[i], 8); memcpy(&g1, got.out.xmm[i] + 8, 8);
+                            memcpy(&i0, c.in.xmm[i], 8); memcpy(&i1, c.in.xmm[i] + 8, 8);
+                            n += snprintf(first + n, sizeof first - (size_t)n, "; xmm%d %016llx%016llx/%016llx%016llx (in %016llx%016llx)", i,
+                                          (unsigned long long)w1, (unsigned long long)w0, (unsigned long long)g1, (unsigned long long)g0, (unsigned long long)i1, (unsigned long long)i0);
+                        }
+                    if (memcmp(want.mem, got.mem, DT_BUF_SIZE)) snprintf(first + n, sizeof first - (size_t)n, "; memory differs");
+                    if (getenv("DT_DUMP")) { FILE *df = fopen(getenv("DT_DUMP"), "wb"); if (df) { fwrite(&c, sizeof c, 1, df); fclose(df); } }
+                    if (getenv("DT_RECHECK")) {
+                        static dt_result again; run_translated(&c, &d, &again);
+                        fprintf(stderr, "    recheck: translated again %s; the reference's memory at the operand %s ours\n",
+                                memcmp(again.out.xmm, got.out.xmm, sizeof got.out.xmm) ? "DIFFERS" : "the same", memcmp(want.mem, got.mem, DT_BUF_SIZE) ? "differs from" : "equals");
+                        uint64_t a[2]; memcpy(a, c.mem + 0x700, 16);
+                        fprintf(stderr, "    case mem[0x700] %016llx %016llx\n", (unsigned long long)a[1], (unsigned long long)a[0]);
+                    }
+                }
+                bad++;
+            }
+        }
+        total += ran; bad_total += bad; nforms++;
+        if (bad) { forms_bad++; printf("  FAIL %-22s %ld/%ld  %s\n", f->name, bad, ran, first); } else forms_ok++;
+    }
+
     // Programs: blocks, branches, calls, loops.
     if (!only || strstr("programs", only)) {
-        long pbad = 0, pran = 0; char first[400] = "";
+        long pbad = 0, pran = 0; char first[900] = "";
         int nprog = per * 4;
         for (int k = 0; k < nprog; k++) {
             make_program(&c);
@@ -499,7 +678,8 @@ int main(int argc, char **argv) {
             if (!diff && !want.out.fault) {
                 uint64_t sp = want.out.gpr[4] - 8 - DT_BUF;
                 if (sp + 8 <= DT_BUF_SIZE) memcpy(want.mem + sp, got.mem + sp, 8);
-                diff = (want.out.flags & 0x8D5) != (got.out.flags & 0x8D5) || memcmp(want.mem, got.mem, DT_BUF_SIZE);
+                diff = (want.out.flags & 0x8D5) != (got.out.flags & 0x8D5) || memcmp(want.mem, got.mem, DT_BUF_SIZE) ||
+                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm);
                 for (int i = 0; i < 16; i++) diff |= want.out.gpr[i] != got.out.gpr[i];
             }
             if (diff) {
@@ -507,7 +687,7 @@ int main(int argc, char **argv) {
                     int n = snprintf(first, sizeof first, "program %d (%u bytes): fault %llu/%llu flags %03llx/%03llx", k, c.prog_len,
                                      (unsigned long long)want.out.fault, (unsigned long long)got.out.fault,
                                      (unsigned long long)(want.out.flags & 0x8D5), (unsigned long long)(got.out.flags & 0x8D5));
-                    for (int i = 0; i < 16 && n < 360; i++)
+                    for (int i = 0; i < 16 && n < 760; i++)
                         if (want.out.gpr[i] != got.out.gpr[i])
                             n += snprintf(first + n, sizeof first - (size_t)n, "; r%d %llx/%llx", i, (unsigned long long)want.out.gpr[i], (unsigned long long)got.out.gpr[i]);
                     if (getenv("DT_VERBOSE")) { FILE *pf = fopen("/tmp/difftest_prog.bin", "wb"); if (pf) { fwrite(c.prog, 1, c.prog_len, pf); fclose(pf); } }

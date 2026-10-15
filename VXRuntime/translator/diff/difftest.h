@@ -10,7 +10,11 @@ typedef struct {
     uint64_t gpr[16];
     uint64_t flags;
     uint64_t fault;                         // 0, or 1 (#DE), 2 (other signal), 4 (did not end in time)
+    uint8_t xmm[16][16];
+    uint32_t mxcsr;
+    uint32_t pad;
 } dt_state;
+enum { DT_XMM = 144, DT_MXCSR = 400 };      // offsets in dt_state
 
 // Programs (several blocks, branches, calls) run from this address in both processes and end by jumping to DT_END.
 #define DT_PROG ((uint64_t)0x310000000ull)

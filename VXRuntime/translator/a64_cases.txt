@@ -1,0 +1,124 @@
+a64_fadd4s(1,2,3)|fadd v1.4s, v2.4s, v3.4s
+a64_fadd2d(1,2,3)|fadd v1.2d, v2.2d, v3.2d
+a64_fsub4s(1,2,3)|fsub v1.4s, v2.4s, v3.4s
+a64_fsub2d(1,2,3)|fsub v1.2d, v2.2d, v3.2d
+a64_fmul4s(1,2,3)|fmul v1.4s, v2.4s, v3.4s
+a64_fmul2d(1,2,3)|fmul v1.2d, v2.2d, v3.2d
+a64_fdiv4s(1,2,3)|fdiv v1.4s, v2.4s, v3.4s
+a64_fdiv2d(1,2,3)|fdiv v1.2d, v2.2d, v3.2d
+a64_fcmeq4s(1,2,3)|fcmeq v1.4s, v2.4s, v3.4s
+a64_fcmeq2d(1,2,3)|fcmeq v1.2d, v2.2d, v3.2d
+a64_fcmgt4s(1,2,3)|fcmgt v1.4s, v2.4s, v3.4s
+a64_fcmgt2d(1,2,3)|fcmgt v1.2d, v2.2d, v3.2d
+a64_fcmge4s(1,2,3)|fcmge v1.4s, v2.4s, v3.4s
+a64_fcmge2d(1,2,3)|fcmge v1.2d, v2.2d, v3.2d
+a64_vand(1,2,3)|and v1.16b, v2.16b, v3.16b
+a64_vorr(1,2,3)|orr v1.16b, v2.16b, v3.16b
+a64_veor(1,2,3)|eor v1.16b, v2.16b, v3.16b
+a64_vbic(1,2,3)|bic v1.16b, v2.16b, v3.16b
+a64_vbsl(1,2,3)|bsl v1.16b, v2.16b, v3.16b
+a64_add16b(1,2,3)|add v1.16b, v2.16b, v3.16b
+a64_add8h(1,2,3)|add v1.8h, v2.8h, v3.8h
+a64_add4s(1,2,3)|add v1.4s, v2.4s, v3.4s
+a64_add2d(1,2,3)|add v1.2d, v2.2d, v3.2d
+a64_sub16b(1,2,3)|sub v1.16b, v2.16b, v3.16b
+a64_sub8h(1,2,3)|sub v1.8h, v2.8h, v3.8h
+a64_sub4s(1,2,3)|sub v1.4s, v2.4s, v3.4s
+a64_sub2d(1,2,3)|sub v1.2d, v2.2d, v3.2d
+a64_cmeq16b(1,2,3)|cmeq v1.16b, v2.16b, v3.16b
+a64_cmeq8h(1,2,3)|cmeq v1.8h, v2.8h, v3.8h
+a64_cmeq4s(1,2,3)|cmeq v1.4s, v2.4s, v3.4s
+a64_cmgt16b(1,2,3)|cmgt v1.16b, v2.16b, v3.16b
+a64_cmgt8h(1,2,3)|cmgt v1.8h, v2.8h, v3.8h
+a64_cmgt4s(1,2,3)|cmgt v1.4s, v2.4s, v3.4s
+a64_zip1_4s(1,2,3)|zip1 v1.4s, v2.4s, v3.4s
+a64_zip2_4s(1,2,3)|zip2 v1.4s, v2.4s, v3.4s
+a64_zip1_2d(1,2,3)|zip1 v1.2d, v2.2d, v3.2d
+a64_zip2_2d(1,2,3)|zip2 v1.2d, v2.2d, v3.2d
+a64_zip1_16b(1,2,3)|zip1 v1.16b, v2.16b, v3.16b
+a64_zip2_16b(1,2,3)|zip2 v1.16b, v2.16b, v3.16b
+a64_zip1_8h(1,2,3)|zip1 v1.8h, v2.8h, v3.8h
+a64_zip2_8h(1,2,3)|zip2 v1.8h, v2.8h, v3.8h
+a64_smull4s(1,2,3)|smull v1.4s, v2.4h, v3.4h
+a64_smull2_4s(1,2,3)|smull2 v1.4s, v2.8h, v3.8h
+a64_addp4s(1,2,3)|addp v1.4s, v2.4s, v3.4s
+a64_mul8h(1,2,3)|mul v1.8h, v2.8h, v3.8h
+a64_mul4s(1,2,3)|mul v1.4s, v2.4s, v3.4s
+a64_fadds(1,2,3)|fadd s1, s2, s3
+a64_faddd(1,2,3)|fadd d1, d2, d3
+a64_fsubs(1,2,3)|fsub s1, s2, s3
+a64_fsubd(1,2,3)|fsub d1, d2, d3
+a64_fmuls(1,2,3)|fmul s1, s2, s3
+a64_fmuld(1,2,3)|fmul d1, d2, d3
+a64_fdivs(1,2,3)|fdiv s1, s2, s3
+a64_fdivd(1,2,3)|fdiv d1, d2, d3
+a64_vmov(1,2)|mov v1.16b, v2.16b
+a64_vmvn(1,2)|mvn v1.16b, v2.16b
+a64_movi0(5)|movi v5.2d, #0
+a64_fsqrt4s(1,2)|fsqrt v1.4s, v2.4s
+a64_fsqrt2d(1,2)|fsqrt v1.2d, v2.2d
+a64_fsqrts(1,2)|fsqrt s1, s2
+a64_fsqrtd(1,2)|fsqrt d1, d2
+a64_fcmps(2,3)|fcmp s2, s3
+a64_fcmpd(2,3)|fcmp d2, d3
+a64_ins_s(1,2,3,1)|mov v1.s[2], v3.s[1]
+a64_ins_s(1,0,3,3)|mov v1.s[0], v3.s[3]
+a64_ins_d(1,1,3,0)|mov v1.d[1], v3.d[0]
+a64_ins_d(1,0,3,1)|mov v1.d[0], v3.d[1]
+a64_fmov_sw(1,2)|fmov s1, w2
+a64_fmov_ws(1,2)|fmov w1, s2
+a64_fmov_dx(1,2)|fmov d1, x2
+a64_fmov_xd(1,2)|fmov x1, d2
+a64_umov_s(1,2,3)|mov w1, v2.s[3]
+a64_umov_d(1,2,1)|mov x1, v2.d[1]
+a64_ins_gs(1,2,3)|mov v1.s[2], w3
+a64_ins_gd(1,1,3)|mov v1.d[1], x3
+a64_dup4s(1,2)|dup v1.4s, w2
+a64_ext(1,2,3,5)|ext v1.16b, v2.16b, v3.16b, #5
+a64_uminv4s(1,2)|uminv s1, v2.4s
+a64_ushr(32,1,2,5)|ushr v1.4s, v2.4s, #5
+a64_ushr(32,1,2,32)|ushr v1.4s, v2.4s, #32
+a64_sshr(32,1,2,31)|sshr v1.4s, v2.4s, #31
+a64_shl(32,1,2,7)|shl v1.4s, v2.4s, #7
+a64_ushr(16,1,2,3)|ushr v1.8h, v2.8h, #3
+a64_sshr(16,1,2,16)|sshr v1.8h, v2.8h, #16
+a64_shl(16,1,2,15)|shl v1.8h, v2.8h, #15
+a64_ushr(64,1,2,33)|ushr v1.2d, v2.2d, #33
+a64_shl(64,1,2,63)|shl v1.2d, v2.2d, #63
+a64_scvtf_sw(1,2)|scvtf s1, w2
+a64_scvtf_sx(1,2)|scvtf s1, x2
+a64_scvtf_dw(1,2)|scvtf d1, w2
+a64_scvtf_dx(1,2)|scvtf d1, x2
+a64_fcvtzs_ws(1,2)|fcvtzs w1, s2
+a64_fcvtzs_xs(1,2)|fcvtzs x1, s2
+a64_fcvtzs_wd(1,2)|fcvtzs w1, d2
+a64_fcvtzs_xd(1,2)|fcvtzs x1, d2
+a64_fcvtns_ws(1,2)|fcvtns w1, s2
+a64_fcvtns_xs(1,2)|fcvtns x1, s2
+a64_fcvtns_wd(1,2)|fcvtns w1, d2
+a64_fcvtns_xd(1,2)|fcvtns x1, d2
+a64_fcvt_ds(1,2)|fcvt d1, s2
+a64_fcvt_sd(1,2)|fcvt s1, d2
+a64_scvtf4s(1,2)|scvtf v1.4s, v2.4s
+a64_fcvtzs4s(1,2)|fcvtzs v1.4s, v2.4s
+a64_fcvtns4s(1,2)|fcvtns v1.4s, v2.4s
+a64_fcvtl2d(1,2)|fcvtl v1.2d, v2.2s
+a64_fcvtn2s(1,2)|fcvtn v1.2s, v2.2d
+a64_sxtl2d(1,2)|sxtl v1.2d, v2.2s
+a64_scvtf2d(1,2)|scvtf v1.2d, v2.2d
+a64_ldrq(1,2,32)|ldr q1, [x2, #32]
+a64_strq(1,2,32)|str q1, [x2, #32]
+a64_ldrd(1,2,16)|ldr d1, [x2, #16]
+a64_strd(1,2,16)|str d1, [x2, #16]
+a64_ldrs(1,2,8)|ldr s1, [x2, #8]
+a64_strs(1,2,8)|str s1, [x2, #8]
+a64_ldpq(1,2,3,64)|ldp q1, q2, [x3, #64]
+a64_stpq(1,2,3,64)|stp q1, q2, [x3, #64]
+a64_stpd(8,9,31,32)|stp d8, d9, [sp, #32]
+a64_ldpd(8,9,31,32)|ldp d8, d9, [sp, #32]
+a64_casal(4,1,2,3)|casal w1, w2, [x3]
+a64_casal(8,1,2,3)|casal x1, x2, [x3]
+a64_casal(1,1,2,3)|casalb w1, w2, [x3]
+a64_casal(2,1,2,3)|casalh w1, w2, [x3]
+a64_swpal(8,1,2,3)|swpal x1, x2, [x3]
+a64_stlr(31,25)|stlr xzr, [x25]

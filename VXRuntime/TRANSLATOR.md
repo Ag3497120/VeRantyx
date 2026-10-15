@@ -98,6 +98,18 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   through a dispatcher). 5 seeds x (224 forms x 3000 + 12,000 programs): 3,420,000 cases, 60,000 programs, all
   identical. Rosetta 2 deviates from x86 once: a 16-bit LOCK NEG across a 16-byte boundary sets the flags but does
   not store; those cases are skipped and the translator stores.
+- **Phase 3a result (2026-10-15).** XMM0-15 live in V0-V15. 128 SSE/SSE2 forms: moves (aligned, unaligned,
+  scalar, low/high halves, MOVD/MOVQ), ADD/SUB/MUL/DIV/SQRT/MIN/MAX in ps/pd/ss/sd, logic, shuffles and unpacks,
+  CMPxx predicates, (U)COMISS/SD, conversions (CVTSI2SS/SD, CVT(T)SS/SD2SI, CVTPS2PD, CVTPD2PS, CVTSS2SD,
+  CVTSD2SS, CVTDQ2PS, CVT(T)PS2DQ, CVTDQ2PD), MOVMSKPS/PD, PSHUFD/LW/HW, integer adds, subtracts, logic,
+  compares, unpacks, PMADDWD, PMULLW, shifts by immediate. Inputs mix zeros, infinities, quiet and signalling NaNs
+  with payloads, denormals and the integer conversion limits. x86 floating-point semantics kept on ARM: NaN
+  propagation and the negative "indefinite" NaN (one compare on the result; the lanes are rebuilt only when a NaN
+  appears), MIN/MAX as compare-and-select, 0x80000000 for invalid conversions. 5 seeds x (354 forms x 3000 + 12,000
+  programs): 5,355,000 cases, all identical. Rosetta 2 detail matched: without VEX, CMPSS/CMPSD take imm & 15 and
+  CMPPS/CMPPD imm & 7 (the SDM reserves everything above 7). Not yet: MXCSR exception flags and rounding modes
+  (LDMXCSR is not translated). `translator/a64_check.py` (make check) checks every ARM64 encoder against the
+  assembler (124).
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.
@@ -111,7 +123,7 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
 | 0 Measure | census, CPU features, TSO and exit cost (above) — done |
 | 1 Decoder | lengths of every instruction in the four apps match LLVM (except data LLVM reads as APX) — done |
 | 2 Integer translator + differential tests | integer and flag instructions match Rosetta on random inputs (2a, done: 154 forms); control flow, blocks, string instructions, RCL/RCR, SHLD/SHRD, atomics with LSE (2b, done: 224 forms and random programs); small PE tests run translated in-process (with phase 4) |
-| 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs) |
+| 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs): 3a SSE/SSE2 done (128 forms); 3b AVX/FMA/SSE3-4; 3c x87, MXCSR modes and flags |
 | 4 Runtime on ARM64 + execution environment | `make check` passes translated; in-process vs. vCPU measured on SteamVR and a game |
 | 5 Games | SteamVR, The Lab (Mono JIT), Earth, Alyx at level `controls` with fps at least Rosetta's |
 

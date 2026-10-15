@@ -6,6 +6,7 @@
 //   x26      the parity table (256 bytes, 1 where a byte has an even number of set bits)
 //   x28      the thread's x86_ctx (helpers, FS/GS bases, faults)
 //   x16-x17, x19-x24  scratch
+//   v0-v15   XMM0-XMM15; v16-v23 scratch (v31 too)
 // Flags are computed in full after every instruction that sets them (correct first; flag liveness comes later).
 #pragma once
 #include "x86dec.h"
@@ -20,8 +21,14 @@ typedef struct {
     uint64_t fault;              // 0, or the x86 exception the instruction raised (X86_FAULT_*)
     uint64_t helper_op;          // for helpers (xlat_helpers.c): what to do
     uint64_t helper_val;         //   and the operand they need
+    uint64_t pad;
+    uint8_t xmm[16][16];         // XMM0-15 (in V0-V15 while translated code runs)
+    uint8_t ymm_hi[16][16];      // the upper halves of YMM0-15 (AVX, phase 3b)
+    uint32_t mxcsr;
+    uint32_t pad2;
 } x86_ctx;
-enum { CTX_FLAGS = 128, CTX_RIP = 136, CTX_FS = 144, CTX_GS = 152, CTX_FAULT = 160, CTX_HELPER_OP = 168, CTX_HELPER_VAL = 176 };
+enum { CTX_FLAGS = 128, CTX_RIP = 136, CTX_FS = 144, CTX_GS = 152, CTX_FAULT = 160, CTX_HELPER_OP = 168, CTX_HELPER_VAL = 176,
+       CTX_XMM = 192, CTX_YMMH = 448, CTX_MXCSR = 704 };
 enum { X86_FAULT_DE = 1 };
 // Registers of translated code that hold more than scratch values: x25 is the string instructions' step.
 
