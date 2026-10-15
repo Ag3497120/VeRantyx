@@ -315,6 +315,22 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   make the vCPU unusable as it is: it needs the calls that return nothing (the immediate context's setters and
   draws) queued in the guest and run by the host in batches, or the program stays in-process. In-process stays the
   way games run; the vCPU is for what in-process cannot do (the low 4 GB, x86's order without LDAPR/STLR).
+  **Calls answered in the guest (2026-10-15).** `translator/guest.c` (built freestanding into its own section and
+  copied into the guest's code) answers the runtime's most frequent calls without an exit: recorded Direct3D 11
+  calls (run by the host at the next exit), TLS slots, last error, the performance counter and tick count, memcpy,
+  memmove, memset, memcmp, strlen, wcslen, the heap (malloc, calloc, realloc, free, new/delete, HeapAlloc and the
+  rest, LocalAlloc, _msize: `translator/xvheap.h`, size classes up to 2 KB with lock-free lists in one reserved
+  range that `libvxrt_vm.dylib` owns, so every image's free, realloc and malloc_size take its blocks), critical
+  sections and SRW locks (lock words in the program's memory, `src/sync.c`: a free lock is taken in the guest,
+  a held one waits in the host on `__ulock_wait`). Two kinds of memory the guest could not see as the host does:
+  the pages a Map hands out (a Metal buffer the kernel unmapped and replaced at the same address: the page leaves
+  the guest when its VM object changed, `xv_refresh`), and an image's `__TEXT` constants (an executable page never
+  goes into the VM: a read-only copy does, as for a file view's page past the file's end). A guest handler's write
+  to a page the SMC watch protects is handled as the program's own write.
+  Per call, MacBook Air M5, in-process / vCPU before / vCPU now (`tests/callbench.c`): Enter+LeaveCriticalSection
+  15 / 1418 / 10.6 ns, TlsGetValue 6.4 / 720 / 5.8, QueryPerformanceCounter 13 / 720 / 5.2, malloc+free 12.7 /
+  1454 / 12.8, HeapAlloc+HeapFree 27 / 2898 / 22, memcpy 256 B 10 / 720 / 9.4, strlen 255 B 8.5 / 724 / 11.6.
+  Every runtime test passes in the vCPU (`steam` needs a Steam client the Air does not have).
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.

@@ -66,7 +66,7 @@ static WINAPI int StringFromGUID2(const GUID *g, WCHAR *out, int cch) {
     for (int i = 0; i < 39; i++) out[i] = (WCHAR)(uint8_t)text[i];
     return 39;
 }
-static WINAPI void *CoTaskMemAlloc(size_t n) { return malloc(n ? n : 1); }
+static WINAPI void *CoTaskMemAlloc(size_t n) { return vx_heap_alloc(n); }
 static WINAPI void *CoTaskMemRealloc(void *p, size_t n) { return realloc(p, n ? n : 1); }
 static WINAPI void CoTaskMemFree(void *p) { free(p); }
 static WINAPI HRESULT StringFromCLSID(const GUID *g, WCHAR **out) {

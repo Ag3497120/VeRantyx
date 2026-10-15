@@ -100,7 +100,7 @@ static WINAPI int lstrcmpiW(const WCHAR *a, const WCHAR *b) {
 }
 static WINAPI int lstrcmpW(const WCHAR *a, const WCHAR *b) { for (; *a == *b && *a; a++, b++) {} return *a < *b ? -1 : *a > *b; }
 // GlobalAlloc: fixed memory (GMEM_MOVEABLE handles are the memory too; locking returns them).
-static WINAPI void *GlobalAlloc(DWORD flags, size_t n) { return flags & 0x40 ? calloc(1, n ? n : 1) : malloc(n ? n : 1); }
+static WINAPI void *GlobalAlloc(DWORD flags, size_t n) { return flags & 0x40 ? vx_heap_zalloc(n) : vx_heap_alloc(n); }
 static WINAPI void *GlobalFree(void *p) { free(p); return NULL; }
 static WINAPI void *GlobalLock(void *p) { return p; }
 static WINAPI BOOL GlobalUnlock(void *p) { (void)p; return 1; }

@@ -1108,6 +1108,7 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
         }
         id<MTLBuffer> b = (__bridge id<MTLBuffer>)buf->mtl;
         out->data = (uint8_t *)b.contents + buf->off; out->row_pitch = out->depth_pitch = buf->desc[0];
+        vx_guest_refresh(out->data, buf->desc[0]);
         return S_OK;
     }
     d3d_texture *t = (d3d_texture *)res;
@@ -1119,6 +1120,7 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
     if (tex.buffer) {                                            // a staging image in a buffer: its own memory
         out->data = (uint8_t *)tex.buffer.contents + tex.bufferOffset;
         out->row_pitch = (uint32_t)tex.bufferBytesPerRow; out->depth_pitch = (uint32_t)(tex.bufferBytesPerRow * tex.height);
+        vx_guest_refresh(out->data, tex.buffer.length - tex.bufferOffset);
         return S_OK;
     }
     if (tex.storageMode != MTLStorageModeShared) { vx_log("Direct3D: Map of a texture without CPU access"); return E_INVALIDARG; }

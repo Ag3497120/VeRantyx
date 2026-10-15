@@ -8,6 +8,21 @@ enum { XV_DEFER_ARGS = 12 };
 typedef struct { int8_t arg, count_arg; uint16_t elem; uint32_t count, max; } xv_copy;
 typedef struct { uint64_t thunk; uint32_t nargs, ncopy; xv_copy copy[4]; } xv_defer;
 int xv_guest_defer(x86_ctx *c, const xv_defer *d);          // (guest.c: runs in the guest)
+typedef int (*xv_guest_fn)(x86_ctx *c, const void *desc);   // guest.c's answers: 0 done (RAX), 1 the host's instead
+int xv_g_tls_get(x86_ctx *, const void *); int xv_g_tls_set(x86_ctx *, const void *);
+int xv_g_get_last_error(x86_ctx *, const void *); int xv_g_set_last_error(x86_ctx *, const void *);
+int xv_g_qpc(x86_ctx *, const void *); int xv_g_qpf(x86_ctx *, const void *);
+int xv_g_tick64(x86_ctx *, const void *); int xv_g_tick(x86_ctx *, const void *);
+int xv_g_memcpy(x86_ctx *, const void *); int xv_g_memmove(x86_ctx *, const void *); int xv_g_memset(x86_ctx *, const void *);
+int xv_g_memcmp(x86_ctx *, const void *); int xv_g_strlen(x86_ctx *, const void *); int xv_g_wcslen(x86_ctx *, const void *);
+int xv_g_malloc(x86_ctx *, const void *); int xv_g_calloc(x86_ctx *, const void *); int xv_g_free(x86_ctx *, const void *);
+int xv_g_realloc(x86_ctx *, const void *); int xv_g_msize(x86_ctx *, const void *); int xv_g_heap_alloc(x86_ctx *, const void *);
+int xv_g_heap_free(x86_ctx *, const void *); int xv_g_heap_size(x86_ctx *, const void *); int xv_g_heap_realloc(x86_ctx *, const void *);
+int xv_g_cs_enter(x86_ctx *, const void *); int xv_g_cs_try(x86_ctx *, const void *); int xv_g_cs_leave(x86_ctx *, const void *);
+int xv_g_srw_acquire_exclusive(x86_ctx *, const void *); int xv_g_srw_acquire_shared(x86_ctx *, const void *);
+int xv_g_srw_try_exclusive(x86_ctx *, const void *); int xv_g_srw_try_shared(x86_ctx *, const void *);
+int xv_g_srw_release_exclusive(x86_ctx *, const void *); int xv_g_srw_release_shared(x86_ctx *, const void *);
+int xv_g_const(x86_ctx *, const void *); int xv_g_local_alloc(x86_ctx *, const void *); int xv_g_local_free(x86_ctx *, const void *);
 void xv_guest_code(const uint8_t **code, size_t *size);     // guest.c's code, to copy into the guest
 int xv_init(void);                                         // the VM (once per process); 0: none
 // Runs the guest on the calling thread (its own vCPU) from `enter` with x0 = c until the exit (HVC #1); helpers
@@ -21,7 +36,9 @@ void xv_fault(uint64_t *pc, uint64_t *addr, int *write);
 int xv_depth(void);
 void xv_set_depth(int depth);
 void xv_unmap(uint64_t va, uint64_t len);                   // host memory going away: out of the guest
+void xv_refresh(uint64_t va, uint64_t len);                 // ... or replaced unseen: out if its VM object changed
 void xv_protect(uint64_t page, int read_only);             // a host page's guest mappings read-only (SMC) or not
+void xv_set_write_hook(int (*hook)(uint64_t pc, uint64_t addr));   // a write fault the program did not make: 1 handled
 void xv_set_tlbi(uint64_t stub);                            // guest code: TLBI, DSB, ISB, HVC #XV_HVC_TLBI
 // Makes host memory [va, va + len) the guest's at the same address (else it is mapped when first touched).
 int xv_map(uint64_t va, uint64_t len);

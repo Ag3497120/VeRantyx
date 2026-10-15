@@ -438,5 +438,13 @@ void vx_vcruntime_init(void) {
 }
 
 #ifdef __aarch64__
+#include "arm64.h"
+__attribute__((constructor)) static void vcrt_guest_add(void) {   // (vCPU: answered in the guest)
+    vx_guest_add(m_memcpy, xv_g_memcpy, NULL, 0); vx_guest_add(m_memmove, xv_g_memmove, NULL, 0);
+    vx_guest_add(m_memset, xv_g_memset, NULL, 0); vx_guest_add(m_memcmp, xv_g_memcmp, NULL, 0);
+}
+#endif
+
+#ifdef __aarch64__
 #include "thunks/vcruntime.c.inc"
 #endif

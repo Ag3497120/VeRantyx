@@ -21,12 +21,12 @@ build/thunks/stamp: $(filter %.c %.m,$(SRC)) src/vx.h tools/vx_thunks.py tools/v
 	@touch $@
 # Code that runs inside the vCPU guest (translator/guest.c): no calls, no globals, no stack protector.
 GUEST_CFLAGS = -arch arm64 -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-stack-check -mmacosx-version-min=14.0 -Itranslator
-build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h
+build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator/xvheap.h
 	@mkdir -p build
 	$(CC) $(GUEST_CFLAGS) -c $< -o $@
-build/libvxrt_vm.dylib: src/vm_hooks.c
+build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
-	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -o $@ $<
+	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
 build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
 	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework Hypervisor build/libvxrt_vm.dylib build/guest.o
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
@@ -55,6 +55,10 @@ build/hw_exceptions.exe: tests/hw_exceptions.c
 build/cxx_exceptions.exe: tests/cxx_exceptions.cpp
 	@mkdir -p build
 	$(MINGWXX) -O1 -static -o $@ $<
+
+build/callbench.exe: tests/callbench.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
 
 build/smc.exe: tests/smc.c
 	@mkdir -p build

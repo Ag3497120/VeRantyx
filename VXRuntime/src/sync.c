@@ -1120,6 +1120,82 @@ static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_pr
 }
 
 // ---- critical sections and SRW locks -------------------------------------------------------------------------------------
+#ifdef __aarch64__
+// Lock words in the program's memory, so that the vCPU guest takes and releases a free lock itself (translator/
+// guest.c, the same protocol): only a lock that is held makes a call that waits here, on the word's low 32 bits.
+// CRITICAL_SECTION (40 bytes): RecursionCount (+12) and OwningThread (+16) as Windows has them (the owner alone
+// changes them); the word at +24 (LockSemaphore): owner's thread id << 32 | 0 free, 1 held, 2 held with sleepers.
+// SRW lock (one pointer, 0 = free as SRWLOCK_INIT): bit 0 held exclusively, bit 1 sleepers, readers in 4s.
+extern int __ulock_wait(uint32_t op, void *addr, uint64_t value, uint32_t timeout_us);
+extern int __ulock_wake(uint32_t op, void *addr, uint64_t wake_value);
+enum { UL_COMPARE_AND_WAIT = 1, ULF_WAKE_ALL = 0x100 };
+enum { CS_RECURSION = 12, CS_OWNER = 16, CS_WORD = 24 };
+#define CS_FIELD(cs, off, type) (*(type *)((uint8_t *)(cs) + (off)))
+static WINAPI void InitializeCriticalSection(void *cs) { memset(cs, 0, 40); }
+static WINAPI BOOL InitializeCriticalSectionAndSpinCount(void *cs, DWORD spin) { (void)spin; InitializeCriticalSection(cs); return 1; }
+static WINAPI BOOL InitializeCriticalSectionEx(void *cs, DWORD spin, DWORD flags) { (void)spin; (void)flags; InitializeCriticalSection(cs); return 1; }
+static int cs_try(void *cs, uint64_t tid) {
+    uint64_t *w = &CS_FIELD(cs, CS_WORD, uint64_t), cur = __atomic_load_n(w, __ATOMIC_RELAXED);
+    if ((cur & 3) && cur >> 32 == tid) { CS_FIELD(cs, CS_RECURSION, int32_t)++; return 1; }
+    uint64_t free_ = 0;
+    if (!__atomic_compare_exchange_n(w, &free_, tid << 32 | 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
+    CS_FIELD(cs, CS_RECURSION, int32_t) = 1; CS_FIELD(cs, CS_OWNER, uint64_t) = tid;
+    return 1;
+}
+static WINAPI BOOL TryEnterCriticalSection(void *cs) { return cs_try(cs, vx_current_tid()); }
+static WINAPI void EnterCriticalSection(void *cs) {
+    uint64_t tid = vx_current_tid(), *w = &CS_FIELD(cs, CS_WORD, uint64_t);
+    for (int spin = 0; spin < 64; spin++) { if (cs_try(cs, tid)) return; __builtin_arm_yield(); }
+    for (;;) {                                                        // (taken as 2: others may sleep on it still)
+        uint64_t cur = __atomic_load_n(w, __ATOMIC_RELAXED);
+        if (!(cur & 3)) {
+            if (__atomic_compare_exchange_n(w, &cur, tid << 32 | 2, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
+            continue;
+        }
+        if ((cur & 3) == 1 && !__atomic_compare_exchange_n(w, &cur, (cur & ~3ull) | 2, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) continue;
+        __ulock_wait(UL_COMPARE_AND_WAIT, w, 2, 0);
+    }
+    CS_FIELD(cs, CS_RECURSION, int32_t) = 1; CS_FIELD(cs, CS_OWNER, uint64_t) = tid;
+}
+static WINAPI void LeaveCriticalSection(void *cs) {
+    if (--CS_FIELD(cs, CS_RECURSION, int32_t) > 0) return;
+    CS_FIELD(cs, CS_OWNER, uint64_t) = 0;
+    uint64_t *w = &CS_FIELD(cs, CS_WORD, uint64_t);
+    if ((__atomic_exchange_n(w, 0, __ATOMIC_RELEASE) & 3) == 2) __ulock_wake(UL_COMPARE_AND_WAIT, w, 0);
+}
+static WINAPI void DeleteCriticalSection(void *cs) { memset(cs, 0, 40); }
+static WINAPI void InitializeSRWLock(void *l) { *(uint64_t *)l = 0; }
+static int srw_try(uint64_t *w, int shared) {
+    uint64_t cur = __atomic_load_n(w, __ATOMIC_RELAXED);
+    if (cur & 1) return 0;
+    if (!shared && cur >> 2) return 0;
+    return __atomic_compare_exchange_n(w, &cur, shared ? cur + 4 : cur | 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+static void srw_acquire(uint64_t *w, int shared) {
+    for (int spin = 0; spin < 64; spin++) { if (srw_try(w, shared)) return; __builtin_arm_yield(); }
+    for (;;) {
+        if (srw_try(w, shared)) return;
+        uint64_t cur = __atomic_load_n(w, __ATOMIC_RELAXED);
+        if (!(cur & 1) && (shared || !(cur >> 2))) continue;
+        if (!(cur & 2) && !__atomic_compare_exchange_n(w, &cur, cur | 2, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) continue;
+        __ulock_wait(UL_COMPARE_AND_WAIT, w, (uint32_t)(cur | 2), 0);
+    }
+}
+static void srw_release(uint64_t *w, int shared) {
+    uint64_t cur = __atomic_load_n(w, __ATOMIC_RELAXED), neu;
+    do {
+        neu = shared ? cur - 4 : cur & ~1ull;
+        if (!(neu >> 2) && !(neu & 1)) neu = 0;                        // (free: the sleepers all wake to try again)
+    } while (!__atomic_compare_exchange_n(w, &cur, neu, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+    if ((cur & 2) && !neu) __ulock_wake(UL_COMPARE_AND_WAIT | ULF_WAKE_ALL, w, 0);
+}
+static WINAPI void AcquireSRWLockExclusive(void *l) { srw_acquire(l, 0); }
+static WINAPI void ReleaseSRWLockExclusive(void *l) { srw_release(l, 0); }
+static WINAPI void AcquireSRWLockShared(void *l) { srw_acquire(l, 1); }
+static WINAPI void ReleaseSRWLockShared(void *l) { srw_release(l, 1); }
+static WINAPI BOOL TryAcquireSRWLockExclusive(void *l) { return srw_try(l, 0); }
+static WINAPI BOOL TryAcquireSRWLockShared(void *l) { return srw_try(l, 1); }
+#else
 // A CRITICAL_SECTION (40 bytes, in the program's memory) holds a pointer to a recursive pthread mutex.
 static pthread_mutex_t *cs_mutex(void *cs) {
     pthread_mutex_t **slot = (pthread_mutex_t **)cs;
@@ -1157,6 +1233,7 @@ static WINAPI void AcquireSRWLockShared(void *l) { pthread_rwlock_rdlock(srw(l))
 static WINAPI void ReleaseSRWLockShared(void *l) { pthread_rwlock_unlock(srw(l)); }
 static WINAPI BOOL TryAcquireSRWLockExclusive(void *l) { return pthread_rwlock_trywrlock(srw(l)) == 0; }
 static WINAPI BOOL TryAcquireSRWLockShared(void *l) { return pthread_rwlock_tryrdlock(srw(l)) == 0; }
+#endif
 
 // ---- condition variables ------------------------------------------------------------------------------------------------------
 // A CONDITION_VARIABLE (one pointer) holds a wake counter. A sleeper reads it while still holding its lock, so a
@@ -1213,7 +1290,11 @@ static WINAPI BOOL SleepConditionVariableCS(uint64_t *cv, void *cs, DWORD ms) {
 static WINAPI BOOL SleepConditionVariableSRW(uint64_t *cv, void *l, DWORD ms, DWORD flags) {
     int shared = flags & 1;                    // CONDITION_VARIABLE_LOCKMODE_SHARED
     uint64_t seen = __atomic_load_n(cv, __ATOMIC_ACQUIRE);
+#ifdef __aarch64__
+    if (shared) ReleaseSRWLockShared(l); else ReleaseSRWLockExclusive(l);
+#else
     pthread_rwlock_unlock(srw(l));
+#endif
     int woken = cv_sleep(cv, seen, ms);
     if (shared) AcquireSRWLockShared(l); else AcquireSRWLockExclusive(l);
     return woken;
@@ -1646,4 +1727,14 @@ void vx_sync_init(void) {
 
 #ifdef __aarch64__
 #include "thunks/sync.c.inc"
+#endif
+
+#ifdef __aarch64__
+__attribute__((constructor)) static void sync_guest_add(void) {   // (vCPU: a free lock taken in the guest)
+    vx_guest_add(EnterCriticalSection, xv_g_cs_enter, NULL, 0); vx_guest_add(LeaveCriticalSection, xv_g_cs_leave, NULL, 0);
+    vx_guest_add(TryEnterCriticalSection, xv_g_cs_try, NULL, 0);
+    vx_guest_add(AcquireSRWLockExclusive, xv_g_srw_acquire_exclusive, NULL, 0); vx_guest_add(AcquireSRWLockShared, xv_g_srw_acquire_shared, NULL, 0);
+    vx_guest_add(ReleaseSRWLockExclusive, xv_g_srw_release_exclusive, NULL, 0); vx_guest_add(ReleaseSRWLockShared, xv_g_srw_release_shared, NULL, 0);
+    vx_guest_add(TryAcquireSRWLockExclusive, xv_g_srw_try_exclusive, NULL, 0); vx_guest_add(TryAcquireSRWLockShared, xv_g_srw_try_shared, NULL, 0);
+}
 #endif

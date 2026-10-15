@@ -16,6 +16,8 @@ void (*vx_thunk_find(uint64_t fn))(x86_ctx *);       // NULL: not a function tra
 #include "../translator/vcpu.h"
 typedef struct { const void *fn; uint32_t nargs, ncopy; xv_copy copy[4]; } vx_defer;
 void vx_defer_add(const vx_defer *d, size_t n);
+void vx_guest_add(const void *fn, xv_guest_fn handler, const void *desc, size_t size);   // answered by guest.c
+void *vxvm_heap(void);                       // the heap the guest allocates from (src/vm_hooks.c; desc: its address)
 #define VX_COPY(arg, count_arg, elem, max) { arg, count_arg, elem, 0, max }
 #define VX_COPY_N(arg, n, elem) { arg, -1, elem, n, n }
 

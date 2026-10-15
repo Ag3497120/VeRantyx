@@ -33,8 +33,9 @@ struct xe {
     uint64_t ring_at;               //   where it was when xe_run last returned
     uint64_t **rings; int nrings;   // every ring, cleared when the code goes
     void (*(*native)(uint64_t))(x86_ctx *);
-    const void *(*defer)(uint64_t);  // vCPU: the xv_defer of a native function whose calls the guest may record
-    uint64_t guest_defer;            //   guest.c's xv_guest_defer, copied into the guest's code
+    int (*guest)(uint64_t, uint64_t *, const void **);   // vCPU: a native function guest.c answers (xe_set_guest)
+    uint64_t guest_base, guest_end;  //   guest.c's code: where the guest has it, and where it came from
+    const uint8_t *guest_from;
     pthread_mutex_t lock;           // translating, linking, flushing (threads share the code)
     struct { uint64_t host, rip; } *imap;   // every translated instruction's code, in order (then rip 0: a block's end)
     size_t nimap, cimap;
@@ -58,6 +59,13 @@ static size_t mov64(uint32_t *buf, size_t n, int d, uint64_t v) {
 static void writable(int w) { pthread_jit_write_protect_np(!w); }
 static uint32_t idx(uint64_t rip, int bits) { return (uint32_t)((rip ^ rip >> 14 ^ rip >> 29) & ((1u << bits) - 1)); }
 
+// vCPU: guest.c's code wrote to a page the SMC watch protects (memcpy into data beside the program's code): the page's
+// code is forgotten as for the program's own write, and the write goes again (1).
+static xe *g_vcpu_engine;
+static int guest_write(uint64_t pc, uint64_t addr) {
+    xe *e = g_vcpu_engine;
+    return pc >= e->guest_base && pc < e->guest_end && xe_smc_write(e, addr);
+}
 static void stubs(xe *e) {
     xlat_buf b = { 0 };
     uint32_t *c = e->code;
@@ -117,8 +125,11 @@ static void stubs(xe *e) {
         if (gc && gsize) {
             n = (n + 3) & ~(size_t)3;
             memcpy(c + n, gc, gsize);
-            e->guest_defer = (uint64_t)(uintptr_t)((uint8_t *)(c + n) + ((const uint8_t *)(uintptr_t)xv_guest_defer - gc));
+            e->guest_base = (uint64_t)(uintptr_t)(c + n); e->guest_from = gc;
             n += (gsize + 3) / 4;
+            e->guest_end = (uint64_t)(uintptr_t)(c + n);
+            g_vcpu_engine = e;
+            xv_set_write_hook(guest_write);
         }
     }
     e->used = n;
@@ -140,7 +151,7 @@ uint64_t xe_ring_new(xe *e) {
     return (uint64_t)(uintptr_t)r;
 }
 void xe_set_native(xe *e, void (*(*find)(uint64_t))(x86_ctx *)) { e->native = find; }
-void xe_set_defer(xe *e, const void *(*find)(uint64_t)) { e->defer = find; }
+void xe_set_guest(xe *e, int (*find)(uint64_t, uint64_t *, const void **)) { e->guest = find; }
 // A table entry, both words at once (with LSE2 an aligned STP is single-copy atomic): another thread's lookup stub
 // sees the old entry or the new one.
 static void put_entry(entry *t, uint64_t rip, uint64_t host) { __asm__ volatile("stp %1, %2, [%0]" :: "r"(t), "r"(rip), "r"(host) : "memory"); }
@@ -333,8 +344,9 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
     b.ordered = e->ordered; b.stop = stop; b.vcpu = e->vcpu;
     uint64_t end = rip + 1;
     void (*thunk)(x86_ctx *) = e->native ? e->native(rip) : NULL;
-    const void *defer = thunk && e->vcpu && e->defer && e->guest_defer ? e->defer(rip) : NULL;
-    if (defer) xlat_block_native_defer(&b, thunk, (uint64_t)(uintptr_t)defer, e->guest_defer);
+    uint64_t handler = 0; const void *desc = NULL;
+    if (thunk && e->vcpu && e->guest && e->guest_base && e->guest(rip, &handler, &desc))
+        xlat_block_native_defer(&b, thunk, (uint64_t)(uintptr_t)desc, e->guest_base + (handler - (uint64_t)(uintptr_t)e->guest_from));
     else if (thunk) xlat_block_native(&b, thunk);
     else {
         if (e->smc) {                                                     // (a page written often: a checked block)
@@ -435,7 +447,7 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
                 uint64_t pc, addr; int write;
                 xv_fault(&pc, &addr, &write);
                 uint64_t rip = xe_rip_at(e, pc);
-                if (!rip) { fprintf(stderr, "[vxrt] engine: a fault at %#llx in no x86 instruction's code\n", (unsigned long long)pc); return -2; }
+                if (!rip) { fprintf(stderr, "[vxrt] engine: a fault at %#llx in no x86 instruction's code (address %#llx%s)\n", (unsigned long long)pc, (unsigned long long)addr, write ? ", a write" : ""); return -2; }
                 c->rip = rip;
                 if (write && xe_smc_write(e, addr)) c->single = 1;            // (code it had run: on at the write, alone)
                 else { c->fault = X86_FAULT_PF; c->fault_info = addr | (uint64_t)write << 63; }

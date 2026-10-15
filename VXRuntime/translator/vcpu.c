@@ -28,6 +28,7 @@ static size_t g_pool_used;
 static uint64_t *g_l0, g_l0_ipa;
 static uint64_t g_next_ipa = DATA_IPA, g_max_ipa;
 static uint64_t *g_mapped, *g_ipa;                          // host pages in the guest (0: empty, page | 1: gone) and where
+static uint64_t *g_obj;                                     // the VM object behind each when it was put in (xv_refresh)
 static volatile uint64_t g_gen;                             // page tables changed for the worse: TLBs to flush
 static uint64_t g_tlbi;                                     // guest code: TLBI VMALLE1; DSB; ISB; HVC #4 (xv_set_tlbi)
 static int g_ok;
@@ -56,6 +57,7 @@ int xv_init(void) {
     g_pool = mmap(NULL, POOL_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     g_mapped = mmap(NULL, sizeof(uint64_t) << SET_BITS, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     g_ipa = mmap(NULL, sizeof(uint64_t) << SET_BITS, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    g_obj = mmap(NULL, sizeof(uint64_t) << SET_BITS, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_pool == MAP_FAILED || g_mapped == MAP_FAILED || hv_vm_map(g_pool, POOL_IPA, POOL_BYTES, HV_MEMORY_READ | HV_MEMORY_WRITE) != HV_SUCCESS) {
         pthread_mutex_unlock(&g_lock); return 0;
     }
@@ -93,19 +95,39 @@ static uint64_t *pte(uint64_t va) {                          // the last-level e
     }
     return &t[va >> 12 & 511];
 }
+static int (*g_write_hook)(uint64_t pc, uint64_t addr);
+void xv_set_write_hook(int (*hook)(uint64_t, uint64_t)) { g_write_hook = hook; }
 void xv_set_tlbi(uint64_t stub) { g_tlbi = stub; }
 // Host memory going away (src/vm_hooks.c): out of the guest. Its guest physical addresses are never used again, so
 // a translation a TLB still holds faults (stage 2) instead of reaching other memory; the TLBs are flushed after.
+static void unmap_slot(uint64_t page, int64_t s) {         // (with g_lock)
+    for (int k = 0; k < HOST_PAGE / 4096; k++) { uint64_t *p = pte(page + 4096 * (uint64_t)k); if (p) *p = 0; }
+    hv_vm_unmap(g_ipa[s], HOST_PAGE);
+    g_mapped[s] = page | 1;
+    g_gen++;
+}
 void xv_unmap(uint64_t va, uint64_t len) {
     if (!g_ok) return;
     pthread_mutex_lock(&g_lock);
     for (uint64_t page = va & ~(uint64_t)(HOST_PAGE - 1); page < va + len; page += HOST_PAGE) {
         int64_t s = set_find(page);
-        if (s < 0) continue;
-        for (int k = 0; k < HOST_PAGE / 4096; k++) { uint64_t *p = pte(page + 4096 * (uint64_t)k); if (p) *p = 0; }
-        hv_vm_unmap(g_ipa[s], HOST_PAGE);
-        g_mapped[s] = page | 1;
-        g_gen++;
+        if (s >= 0) unmap_slot(page, s);
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+static uint64_t page_object(uint64_t page) {
+    vm_page_info_basic_data_t info; mach_msg_type_number_t count = VM_PAGE_INFO_BASIC_COUNT;
+    if (mach_vm_page_info(mach_task_self(), page, VM_PAGE_INFO_BASIC, (vm_page_info_t)&info, &count) != KERN_SUCCESS) return 0;
+    return (uint64_t)info.object_id;
+}
+// Memory the host may have replaced without the release hook seeing it (a Metal buffer's: the kernel unmaps those),
+// about to be handed to the program (Map): pages whose VM object is no longer the one put in leave the guest.
+void xv_refresh(uint64_t va, uint64_t len) {
+    if (!g_ok) return;
+    pthread_mutex_lock(&g_lock);
+    for (uint64_t page = va & ~(uint64_t)(HOST_PAGE - 1); page < va + len; page += HOST_PAGE) {
+        int64_t s = set_find(page);
+        if (s >= 0 && page_object(page) != g_obj[s]) unmap_slot(page, s);
     }
     pthread_mutex_unlock(&g_lock);
 }
@@ -124,6 +146,19 @@ void xv_protect(uint64_t page, int read_only) {
 }
 
 // The host page holding va into the guest, if this process has it mapped. 1: in the guest (now or already).
+// A copy of a host page the guest may only read, of its 4 KB parts that can be read (bit k of *parts: part k).
+static void *snapshot(uint64_t page, uint32_t *parts) {
+    uint8_t *copy = mmap(NULL, HOST_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (copy == MAP_FAILED) return NULL;
+    *parts = 0;
+    for (int k = 0; k < HOST_PAGE / 4096; k++) {
+        mach_vm_size_t got = 0;                                           // (no SIGBUS: a file's page past its end fails)
+        if (mach_vm_read_overwrite(mach_task_self(), page + 4096 * (uint64_t)k, 4096, (mach_vm_address_t)(uintptr_t)(copy + 4096 * k), &got) == KERN_SUCCESS && got == 4096)
+            *parts |= 1u << k;
+    }
+    if (!*parts) { munmap(copy, HOST_PAGE); return NULL; }
+    return copy;
+}
 static int map_host_page(uint64_t va) {
     uint64_t page = va & ~(uint64_t)(HOST_PAGE - 1);
     pthread_mutex_lock(&g_lock);
@@ -133,20 +168,30 @@ static int map_host_page(uint64_t va) {
     mach_vm_address_t a = page; mach_vm_size_t size = 0;
     vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
     if (mach_vm_region(mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS ||
-        a > page || !(info.protection & VM_PROT_READ) || (info.protection & VM_PROT_EXECUTE) || g_next_ipa + HOST_PAGE > g_max_ipa) {
-        // (never an executable host page: macOS panics, SPTM)
+        a > page || !(info.protection & VM_PROT_READ) || g_next_ipa + HOST_PAGE > g_max_ipa) {
         pthread_mutex_unlock(&g_lock); return 0;
     }
     // (writable by its maximum protection: the SMC watch makes code pages read-only for a while, and the guest's own
     //  page tables say what it may do)
     int writable = (info.max_protection & VM_PROT_WRITE) != 0;
     uint64_t ipa = g_next_ipa;
-    hv_memory_flags_t f = HV_MEMORY_READ | (writable ? HV_MEMORY_WRITE : 0);
-    if (hv_vm_map((void *)(uintptr_t)page, ipa, HOST_PAGE, f | HV_MEMORY_EXEC) != HV_SUCCESS) { pthread_mutex_unlock(&g_lock); return 0; }
+    uint32_t parts = (1u << (HOST_PAGE / 4096)) - 1;
+    void *copy = NULL;
+    // An executable host page never goes into the VM (macOS panics, SPTM): one that can never be written (an image's
+    // __TEXT: constants guest.c's memcpy or the program may read) goes in as a copy, read-only. So does a read-only
+    // page the VM refuses (a file's view whose last page passes the file's end).
+    int ok = 0;
+    if (!(info.protection & VM_PROT_EXECUTE))
+        ok = hv_vm_map((void *)(uintptr_t)page, ipa, HOST_PAGE, HV_MEMORY_READ | (writable ? HV_MEMORY_WRITE : 0) | HV_MEMORY_EXEC) == HV_SUCCESS;
+    if (!ok && !(info.protection & VM_PROT_WRITE) && (!(info.protection & VM_PROT_EXECUTE) || !writable) && (copy = snapshot(page, &parts))) {
+        writable = 0;
+        ok = hv_vm_map(copy, ipa, HOST_PAGE, HV_MEMORY_READ | HV_MEMORY_EXEC) == HV_SUCCESS;
+    }
+    if (!ok) { if (copy) munmap(copy, HOST_PAGE); pthread_mutex_unlock(&g_lock); return 0; }
     g_next_ipa += HOST_PAGE;
-    for (int k = 0; k < HOST_PAGE / 4096; k++) map4k(page + 4096 * (uint64_t)k, ipa + 4096 * (uint64_t)k, writable);
+    for (int k = 0; k < HOST_PAGE / 4096; k++) if (parts >> k & 1) map4k(page + 4096 * (uint64_t)k, ipa + 4096 * (uint64_t)k, writable);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    g_mapped[s] = page; g_ipa[s] = ipa;
+    g_mapped[s] = page; g_ipa[s] = ipa; g_obj[s] = page_object(page);
     pthread_mutex_unlock(&g_lock);
     return 1;
 }
@@ -181,6 +226,7 @@ static int vcpu_setup(uint64_t vectors) {
         hv_vcpu_set_sys_reg(t_vcpu, HV_SYS_REG_ACTLR_EL1, actlr | 2);
     }
     hv_vcpu_set_vtimer_mask(t_vcpu, true);
+    hv_vcpu_set_vtimer_offset(t_vcpu, 0);                                   // (CNTVCT = mach_absolute_time: guest.c's time)
     uint8_t *stack = mmap(NULL, 256 << 10, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);   // (guest.c's calls)
     hv_vcpu_set_sys_reg(t_vcpu, HV_SYS_REG_SP_EL1, (uint64_t)(uintptr_t)(stack + (256 << 10) - 64));
     t_have = 1;
@@ -305,6 +351,11 @@ int xv_enter(x86_ctx *c, uint64_t enter, uint64_t vectors) {
                     pthread_mutex_unlock(&g_lock);
                     if (allowed) { t_gen = g_gen - 1; hv_vcpu_set_reg(t_vcpu, HV_REG_PC, elr); hv_vcpu_set_reg(t_vcpu, HV_REG_CPSR, spsr); continue; }
                 }
+                int write = ((esr >> 6) & 1) || (fsc & 0x3C) == 0x0C;
+                if (abort_ && write && g_write_hook && g_write_hook(elr, far)) {   // (guest.c's write to a watched page)
+                    t_gen = g_gen - 1; hv_vcpu_set_reg(t_vcpu, HV_REG_PC, elr); hv_vcpu_set_reg(t_vcpu, HV_REG_CPSR, spsr);
+                    continue;
+                }
                 if (abort_ && (eec == 0x24 || eec == 0x25)) {                  // the program's access fault: its state
                     for (int r = 0; r < 16; r++) {
                         hv_vcpu_get_reg(t_vcpu, (hv_reg_t)(HV_REG_X0 + r), &c->gpr[r]);
@@ -313,7 +364,7 @@ int xv_enter(x86_ctx *c, uint64_t enter, uint64_t vectors) {
                     }
                     hv_vcpu_get_reg(t_vcpu, HV_REG_X27, &c->flags);
                     hv_vcpu_get_reg(t_vcpu, HV_REG_X29, &c->ras);
-                    t_fault_pc = elr; t_fault_addr = far; t_fault_write = ((esr >> 6) & 1) || (fsc & 0x3C) == 0x0C;
+                    t_fault_pc = elr; t_fault_addr = far; t_fault_write = write;
                     result = XV_FAULT;
                     break;
                 }

@@ -319,3 +319,11 @@ void vx_extras_init(void) {
 #ifdef __aarch64__
 #include "thunks/extras.c.inc"
 #endif
+
+#ifdef __aarch64__
+#include "arm64.h"
+__attribute__((constructor)) static void extras_guest_add(void) {   // (vCPU: answered in the guest)
+    void *h = vxvm_heap();
+    if (h) vx_guest_add(ms_msize, xv_g_msize, &h, sizeof h);
+}
+#endif

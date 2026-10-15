@@ -839,7 +839,7 @@ static WINAPI size_t VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mb
 static WINAPI HANDLE GetProcessHeap(void) { return (HANDLE)(intptr_t)0x48454150; }
 static WINAPI HANDLE HeapCreate(DWORD f, size_t a, size_t b) { (void)f; (void)a; (void)b; return GetProcessHeap(); }
 static WINAPI BOOL HeapDestroy(HANDLE h) { (void)h; return 1; }
-static WINAPI void *HeapAlloc(HANDLE h, DWORD flags, size_t n) { (void)h; return flags & HEAP_ZERO_MEMORY ? calloc(1, n ? n : 1) : malloc(n ? n : 1); }
+static WINAPI void *HeapAlloc(HANDLE h, DWORD flags, size_t n) { (void)h; return flags & HEAP_ZERO_MEMORY ? vx_heap_zalloc(n) : vx_heap_alloc(n); }
 static WINAPI void *HeapReAlloc(HANDLE h, DWORD flags, void *p, size_t n) {
     (void)h;
     size_t old = p ? malloc_size(p) : 0;
@@ -849,7 +849,7 @@ static WINAPI void *HeapReAlloc(HANDLE h, DWORD flags, void *p, size_t n) {
 }
 // A pointer no heap gave out is reported (with the caller) and left alone, rather than crashing in free().
 static int heap_pointer(const void *p, const char *what, void *caller) {
-    if (!p || malloc_zone_from_ptr(p)) return 1;
+    if (!p || malloc_zone_from_ptr(p) || vx_heap_owns(p)) return 1;
     vx_log("%s of %p, which no heap allocated (called from %p)", what, p, caller);
     vx_set_last_error(87);
     return 0;
@@ -868,7 +868,7 @@ static WINAPI DWORD FormatMessageA(DWORD flags, const void *src, DWORD id, DWORD
     memcpy(buf, text, (size_t)n + 1);
     return (DWORD)n;
 }
-static WINAPI void *LocalAlloc(DWORD flags, size_t n) { return flags & 0x40 /* LMEM_ZEROINIT */ ? calloc(1, n ? n : 1) : malloc(n ? n : 1); }
+static WINAPI void *LocalAlloc(DWORD flags, size_t n) { return flags & 0x40 /* LMEM_ZEROINIT */ ? vx_heap_zalloc(n) : vx_heap_alloc(n); }
 static WINAPI void *LocalFree(void *p) { if (!heap_pointer(p, "LocalFree", VX_RETURN_ADDRESS())) return p; free(p); return NULL; }
 // VXRT_DEBUG_OUTPUT=1: what programs send to OutputDebugString, without the rest of VXRT_TRACE (with VXRT_DEBUGGER=1,
 // a game's own console log: why it quit, for one).
@@ -998,6 +998,26 @@ void vx_kernel32_init(void) {
     vx_register_module("kernel32.dll", k32, sizeof k32 / sizeof k32[0]);
     vx_register_module("kernelbase.dll", k32, sizeof k32 / sizeof k32[0]);
 }
+
+#ifdef __aarch64__
+// vCPU: answered in the guest (translator/guest.c), as these do: the TEB's slots and last error, the counter.
+#include "arm64.h"
+__attribute__((constructor)) static void k32_guest_add(void) {
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    uint32_t t[2] = { tb.numer, tb.denom };
+    vx_guest_add(TlsGetValue, xv_g_tls_get, NULL, 0); vx_guest_add(TlsSetValue, xv_g_tls_set, NULL, 0);
+    vx_guest_add(GetLastError, xv_g_get_last_error, NULL, 0); vx_guest_add(SetLastError, xv_g_set_last_error, NULL, 0);
+    vx_guest_add(QueryPerformanceCounter, xv_g_qpc, t, sizeof t); vx_guest_add(QueryPerformanceFrequency, xv_g_qpf, NULL, 0);
+    vx_guest_add(GetTickCount64, xv_g_tick64, t, sizeof t); vx_guest_add(GetTickCount, xv_g_tick, t, sizeof t);
+    uint64_t heap = (uint64_t)(uintptr_t)GetProcessHeap();
+    vx_guest_add(GetProcessHeap, xv_g_const, &heap, sizeof heap);
+    void *h = vxvm_heap();
+    if (!h) return;
+    vx_guest_add(HeapAlloc, xv_g_heap_alloc, &h, sizeof h); vx_guest_add(HeapFree, xv_g_heap_free, &h, sizeof h);
+    vx_guest_add(HeapSize, xv_g_heap_size, &h, sizeof h); vx_guest_add(HeapReAlloc, xv_g_heap_realloc, &h, sizeof h);
+    vx_guest_add(LocalAlloc, xv_g_local_alloc, &h, sizeof h); vx_guest_add(LocalFree, xv_g_local_free, &h, sizeof h);
+}
+#endif
 
 #ifdef __aarch64__
 #include "thunks/kernel32.c.inc"

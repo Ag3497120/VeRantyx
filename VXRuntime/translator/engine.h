@@ -20,8 +20,9 @@ xe *xe_new_vcpu(void);
 // Addresses that are native functions translated code may call (the ARM64 runtime's thunks, src/arm64.c): find
 // returns the thunk for one, else NULL; the engine then makes that address's block a call of the thunk.
 void xe_set_native(xe *e, void (*(*find)(uint64_t rip))(x86_ctx *));
-// vCPU: find gives the xv_defer (vcpu.h) of a native function whose calls the guest may record, else NULL.
-void xe_set_defer(xe *e, const void *(*find)(uint64_t fn));
+// vCPU: native functions guest.c answers in the guest: find(fn) gives the handler (its address in this process, in
+// guest.c's section) and its argument; 0: none, the call leaves the guest.
+void xe_set_guest(xe *e, int (*find)(uint64_t fn, uint64_t *handler, const void **desc));
 // A return-address ring for a thread's context (x86_ctx.ras); without one, contexts share the engine's.
 uint64_t xe_ring_new(xe *e);
 // The x86 instruction whose translation holds host address pc (0: none, or not an x86 instruction's code).

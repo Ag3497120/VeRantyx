@@ -101,8 +101,8 @@ int xlat_block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end);
 // (a thunk: it reads the call's arguments there and writes the result), the state back, then RET, or on at
 // ctx->rip when the function set ctx->jump.
 void xlat_block_native(xlat_buf *b, void (*fn)(x86_ctx *));
-// The same in the vCPU for a function that returns nothing: guest_defer(ctx, desc) records the call (vcpu.h's
-// xv_guest_defer); only when that cannot, the call leaves the guest.
+// The same in the vCPU, first guest_fn(ctx, desc) in the guest (guest.c: an answer, or the call recorded); only
+// when that returns 1 does the call leave the guest.
 void xlat_block_native_defer(xlat_buf *b, void (*fn)(x86_ctx *), uint64_t desc, uint64_t guest_defer);
 // The guest's entry and exit (vcpu.c): x0 = the context on entry, then on at ctx->entry; the exit (S1: the next
 // RIP) stores the state and leaves with HVC #1.

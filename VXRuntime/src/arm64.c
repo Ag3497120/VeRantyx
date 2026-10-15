@@ -54,7 +54,18 @@ void (*vx_thunk_find(uint64_t fn))(x86_ctx *) {
 
 // ---- calls the vCPU guest may record (vx_defer_add) -------------------------------------------------------------
 enum { DEFER_BITS = 10 };
-static struct { const void *fn; xv_defer *d; } g_defer[1u << DEFER_BITS];
+static struct { const void *fn; xv_guest_fn handler; void *d; } g_defer[1u << DEFER_BITS];
+static void guest_add(const void *fn, xv_guest_fn handler, void *d) {
+    uint32_t s = thunk_slot((uint64_t)(uintptr_t)fn) & ((1u << DEFER_BITS) - 1);
+    while (g_defer[s].fn) s = (s + 1) & ((1u << DEFER_BITS) - 1);
+    g_defer[s].fn = fn; g_defer[s].handler = handler; g_defer[s].d = d;
+}
+// A native function guest.c answers itself (desc: its argument, copied to the heap the guest may have).
+void vx_guest_add(const void *fn, xv_guest_fn handler, const void *desc, size_t size) {
+    void *d = NULL;
+    if (size) { d = calloc(1, size); memcpy(d, desc, size); }
+    guest_add(fn, handler, d);
+}
 void vx_defer_add(const vx_defer *d, size_t n) {
     for (size_t i = 0; i < n; i++) {
         uint32_t s = thunk_slot((uint64_t)(uintptr_t)d[i].fn) & ((1u << DEFER_BITS) - 1);
@@ -62,16 +73,21 @@ void vx_defer_add(const vx_defer *d, size_t n) {
         xv_defer *x = calloc(1, sizeof *x);                     // (heap: memory the guest may have)
         x->nargs = d[i].nargs; x->ncopy = d[i].ncopy;
         memcpy(x->copy, d[i].copy, sizeof x->copy);
-        g_defer[s].fn = d[i].fn; g_defer[s].d = x;
+        g_defer[s].fn = d[i].fn; g_defer[s].handler = (xv_guest_fn)xv_guest_defer; g_defer[s].d = x;
     }
 }
-static const void *defer_find(uint64_t fn) {
+static int guest_find(uint64_t fn, uint64_t *handler, const void **desc) {
     for (uint32_t s = thunk_slot(fn) & ((1u << DEFER_BITS) - 1); g_defer[s].fn; s = (s + 1) & ((1u << DEFER_BITS) - 1))
         if ((uint64_t)(uintptr_t)g_defer[s].fn == fn) {
-            if (!g_defer[s].d->thunk) g_defer[s].d->thunk = (uint64_t)(uintptr_t)vx_thunk_find(fn);
-            return g_defer[s].d->thunk ? g_defer[s].d : NULL;
+            if (g_defer[s].handler == (xv_guest_fn)xv_guest_defer) {   // (a recorded call: its thunk, run later)
+                xv_defer *x = g_defer[s].d;
+                if (!x->thunk) x->thunk = (uint64_t)(uintptr_t)vx_thunk_find(fn);
+                if (!x->thunk) return 0;
+            }
+            *handler = (uint64_t)(uintptr_t)g_defer[s].handler; *desc = g_defer[s].d;
+            return 1;
         }
-    return NULL;
+    return 0;
 }
 
 // ---- the threads' x86 state -------------------------------------------------------------------------------------
@@ -332,7 +348,7 @@ void vx_arm64_init(void) {
         g_engine = xe_new_vcpu();
         void vxvm_set_hook(void (*)(uint64_t, uint64_t));             // (src/vm_hooks.c: memory going away leaves the guest)
         vxvm_set_hook(xv_unmap);
-        if (!getenv("VXRT_VCPU_NO_DEFER")) xe_set_defer(g_engine, defer_find);
+        if (!getenv("VXRT_VCPU_NO_GUEST")) xe_set_guest(g_engine, guest_find);
     }
     else g_engine = xe_new(!getenv("VXRT_ORDERED") || atoi(getenv("VXRT_ORDERED")) != 0);
     if (!g_engine) { fprintf(stderr, "vxrt: cannot map the translation cache\n"); exit(1); }

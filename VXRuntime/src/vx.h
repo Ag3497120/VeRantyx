@@ -93,6 +93,27 @@ void     vx_thread_attach(void);       // TEB + gs slots + TLS for the calling t
 extern __thread size_t vx_x86_stack_size;   // the x86 stack vx_thread_attach makes (0: 1 MB)
 void vx_arm64_init(void);
 #endif
+// The program's heap blocks: in the ARM64 build its small ones come from the range the vCPU guest allocates from too
+// (src/vm_hooks.c, whose free/realloc/malloc_size take them).
+#ifdef __aarch64__
+void *vxvm_alloc(size_t n);
+void *vxvm_zalloc(size_t n);
+int vxvm_owns(const void *p);
+#define vx_heap_alloc(n) vxvm_alloc(n)
+#define vx_heap_zalloc(n) vxvm_zalloc(n)
+#define vx_heap_owns(p) vxvm_owns(p)
+#else
+#define vx_heap_alloc(n) malloc((n) ? (n) : 1)
+#define vx_heap_zalloc(n) calloc(1, (n) ? (n) : 1)
+#define vx_heap_owns(p) 0
+#endif
+// Memory a Map hands the program (a Metal buffer's): the vCPU guest must not keep an older page at that address.
+#ifdef __aarch64__
+void xv_refresh(uint64_t va, uint64_t len);
+#define vx_guest_refresh(p, n) xv_refresh((uint64_t)(uintptr_t)(p), (n))
+#else
+#define vx_guest_refresh(p, n) ((void)0)
+#endif
 void     vx_thread_detach(void);       // frees the calling thread's TEB and TLS (after its detach notifications)
 void     vx_notify_thread(DWORD reason);   // TLS callbacks and DllMain for thread attach (2) / detach (3)
 DWORD    vx_current_tid(void);

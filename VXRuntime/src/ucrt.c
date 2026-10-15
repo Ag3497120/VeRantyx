@@ -354,8 +354,8 @@ static int g_errno_value(void) { return t_errno; }
 static void set_errno(int e) { t_errno = e; }
 
 // ---- heap, memory, strings ---------------------------------------------------------------------------------------------------
-static WINAPI void *vx_malloc(size_t n) { return malloc(n); }
-static WINAPI void *vx_calloc(size_t a, size_t b) { return calloc(a, b); }
+static WINAPI void *vx_malloc(size_t n) { return vx_heap_alloc(n); }
+static WINAPI void *vx_calloc(size_t a, size_t b) { return b && a > SIZE_MAX / b ? NULL : vx_heap_zalloc(a * b); }
 static WINAPI void *vx_realloc(void *p, size_t n) { return realloc(p, n); }
 static WINAPI void vx_free(void *p) { free(p); }
 static WINAPI void *vx_memcpy(void *d, const void *s, size_t n) { return memcpy(d, s, n); }
@@ -546,7 +546,7 @@ static WINAPI vfn vx_dllonexit(vfn f, vfn **begin, vfn **end) {
     return f;
 }
 // msvcrt's C++ operators new and delete (mangled names), for programs built against msvcrt.dll.
-static WINAPI void *vx_new(size_t n) { return malloc(n ? n : 1); }
+static WINAPI void *vx_new(size_t n) { return vx_heap_alloc(n); }
 static WINAPI void vx_delete(void *p) { free(p); }
 
 // Aligned allocations: posix_memalign memory is released with free(), so _aligned_free is free().
@@ -1258,6 +1258,20 @@ void vx_ucrt_init(void) {
     vx_register_module("msvcrt.dll", msvcrt_extra, sizeof msvcrt_extra / sizeof msvcrt_extra[0]);
     vx_register_module("ucrtbase.dll", msvcrt_extra, sizeof msvcrt_extra / sizeof msvcrt_extra[0]);
 }
+
+#ifdef __aarch64__
+#include "arm64.h"
+__attribute__((constructor)) static void ucrt_guest_add(void) {   // (vCPU: answered in the guest)
+    vx_guest_add(vx_memcpy, xv_g_memcpy, NULL, 0); vx_guest_add(vx_memmove, xv_g_memmove, NULL, 0);
+    vx_guest_add(vx_memset, xv_g_memset, NULL, 0); vx_guest_add(vx_memcmp, xv_g_memcmp, NULL, 0);
+    vx_guest_add(vx_strlen, xv_g_strlen, NULL, 0); vx_guest_add(crt_wcslen, xv_g_wcslen, NULL, 0);
+    void *h = vxvm_heap();
+    if (!h) return;
+    vx_guest_add(vx_malloc, xv_g_malloc, &h, sizeof h); vx_guest_add(vx_calloc, xv_g_calloc, &h, sizeof h);
+    vx_guest_add(vx_realloc, xv_g_realloc, &h, sizeof h); vx_guest_add(vx_free, xv_g_free, &h, sizeof h);
+    vx_guest_add(vx_new, xv_g_malloc, &h, sizeof h); vx_guest_add(vx_delete, xv_g_free, &h, sizeof h);
+}
+#endif
 
 #ifdef __aarch64__
 #include "thunks/ucrt.c.inc"
