@@ -168,6 +168,8 @@ int xe_fix_split(xe *e, void *uc_) {
     if (!e || pc < e->code || pc >= e->code + e->used) return 0;
     uint32_t insn = *pc, sz = insn >> 30, t = insn & 31, n = insn >> 5 & 31;
     int load = (insn & 0x3FFFFC00u) == 0x38BFC000u, store = (insn & 0x3FFFFC00u) == 0x089FFC00u;
+    // (an alignment fault where a branch is now: another thread faulting on the same access patched it first)
+    if ((insn & 0xFC000000u) == 0x14000000u && (uc->uc_mcontext->__es.__esr & 0x3F) == 0x21) return 1;
     if (!load && !store) return 0;
     pthread_mutex_lock(&e->lock);                                         // (other threads translate meanwhile)
     if (*pc != insn) { pthread_mutex_unlock(&e->lock); return 1; }       // (patched by another thread already)

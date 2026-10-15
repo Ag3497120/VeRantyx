@@ -82,5 +82,34 @@ WINAPI uint64_t vx_trace_returned(uint64_t result) {
 }
 
 #ifdef __aarch64__
+// ARM64: the thunks call these (src/arm64.h), the same lines as above. Functions counted by name.
+#include "arm64.h"
+int vx_tracing;
+__attribute__((constructor)) static void trace_init(void) { vx_tracing = vx_trace_calls_on(); }
+static __thread int t_skip[64], t_level;                             // (calls past the limit: their results unlogged)
+static int count_call(const char *name) {
+    enum { SLOTS = 8192 };
+    static struct { const char *name; int calls; } slots[SLOTS];
+    uint32_t h = (uint32_t)(((uintptr_t)name >> 3) * 0x9E3779B1u) & (SLOTS - 1);
+    for (int n = 0; n < SLOTS; n++, h = (h + 1) & (SLOTS - 1)) {
+        const char *s = __atomic_load_n(&slots[h].name, __ATOMIC_ACQUIRE);
+        if (!s) { const char *none = NULL; if (!__atomic_compare_exchange_n(&slots[h].name, &none, name, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && none != name) continue; s = name; }
+        if (s == name) return __atomic_fetch_add(&slots[h].calls, 1, __ATOMIC_RELAXED);
+    }
+    return g_limit;
+}
+void vx_trace_in(const char *name, const x86_ctx *c) {
+    int skip = left_alone(name) || count_call(name) >= g_limit;
+    if (t_level < 64) t_skip[t_level] = skip;
+    t_level++;
+    if (skip) return;
+    vx_log("[%u] %s(%#llx, %#llx, %#llx, %#llx) from %#llx", vx_current_tid(), name, (unsigned long long)c->gpr[1], (unsigned long long)c->gpr[2],
+           (unsigned long long)c->gpr[8], (unsigned long long)c->gpr[9], (unsigned long long)*(const uint64_t *)(uintptr_t)c->gpr[4]);
+}
+void vx_trace_out(const char *name, const x86_ctx *c) {
+    if (t_level > 0) t_level--;
+    if (t_level < 64 && t_skip[t_level]) return;
+    vx_log("[%u]   %s = %#llx (last error %u)", vx_current_tid(), name, (unsigned long long)c->gpr[0], vx_get_last_error());
+}
 #include "thunks/calltrace.c.inc"
 #endif

@@ -36,7 +36,7 @@ typedef struct {
     int done, started, priority; DWORD suspended, exit_code, tid; pthread_t pthread;   // thread
     semaphore_t parked_sem, resume_sem; volatile int parked; uint8_t *context;              // (SuspendThread: see below)
     struct apc *apcs; struct waiter *alert_waiter;                                          // (QueueUserAPC: see below)
-    DWORD (WINAPI *start)(void *); void *arg;
+    DWORD (WINAPI *start)(void *); void *arg; size_t stack;
     int manual, signaled;                                                     // event
     DWORD owner, recursion;                                                   // mutex
     LONG count, max;                                                          // semaphore
@@ -283,6 +283,9 @@ static vx_object *self_object(void) {
 static void *thread_main(void *p) {
     vx_object *t = p;
     t_self = t;
+#ifdef __aarch64__
+    vx_x86_stack_size = t->stack;                 // (the program's stack: as large as the thread's own, see CreateThread)
+#endif
     vx_thread_attach();
     pthread_mutex_lock(&g_lock);              // also waits until CreateThread has filled in the object
     while (t->suspended) pthread_cond_wait(&g_changed, &g_lock);
@@ -316,6 +319,7 @@ static WINAPI HANDLE CreateThread(void *sa, size_t stack, DWORD (WINAPI *start)(
     // The thread's stack also carries this runtime's frames (exception dispatch keeps CONTEXTs on it): 2 MB at least.
     size_t size = stack > (2u << 20) ? stack : (2u << 20);
     size = (size + 16383) & ~(size_t)16383;
+    t->stack = size;
     pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setstacksize(&a, size);

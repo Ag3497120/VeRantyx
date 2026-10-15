@@ -21,6 +21,13 @@ void *vxvm_heap(void);                       // the heap the guest allocates fro
 #define VX_COPY(arg, count_arg, elem, max) { arg, count_arg, elem, 0, max }
 #define VX_COPY_N(arg, n, elem) { arg, -1, elem, n, n }
 
+// VXRT_TRACE_CALLS=N (src/calltrace.c): each thunk logs its call and result, N times per function.
+extern int vx_tracing;
+void vx_trace_in(const char *name, const x86_ctx *c);
+void vx_trace_out(const char *name, const x86_ctx *c);
+#define VX_TRACE_IN(n) do { if (__builtin_expect(vx_tracing, 0)) vx_trace_in(n, c); } while (0)
+#define VX_TRACE_OUT(n) do { if (__builtin_expect(vx_tracing, 0)) vx_trace_out(n, c); } while (0)
+
 // Argument i of the call the program just made (RSP at its return address): RCX RDX R8 R9, then the stack above the
 // 32-byte home area. Floating-point arguments 0-3 are in XMM0-3 instead.
 static inline uint64_t vx_arg(const x86_ctx *c, int i) {

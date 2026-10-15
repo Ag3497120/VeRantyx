@@ -336,8 +336,13 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
         return;
     }
     uint64_t rip = xe_owns(g_engine, pc) ? xe_rip_at(g_engine, pc) : 0;
-    if (rip && t_ctx && (sig == SIGSEGV || sig == SIGBUS) && getenv("VXRT_TRACE_FAULTS"))
-        vx_log("arm64: fault at x86 %#llx (host %#llx), address %p, ESR %#llx", (unsigned long long)rip, (unsigned long long)pc, si->si_addr, (unsigned long long)esr);
+    if (rip && t_ctx && (sig == SIGSEGV || sig == SIGBUS) && getenv("VXRT_TRACE_FAULTS")) {   // (with the module, RSP and the thread's stack: a stack overflow shows as an address just below its limit)
+        const vx_image *m = vx_image_at(rip); uint8_t *teb = vx_teb();
+        vx_log("arm64: fault at x86 %#llx (%s+%#llx, host %#llx), address %p, ESR %#llx, rsp %#llx, stack %p-%p",
+               (unsigned long long)rip, m ? m->name : "?", m ? (unsigned long long)(rip - (uint64_t)(uintptr_t)m->base) : 0ull,
+               (unsigned long long)pc, si->si_addr, (unsigned long long)esr, (unsigned long long)ss->__x[4],
+               *(void **)(teb + TEB_STACK_LIMIT), *(void **)(teb + TEB_STACK_BASE));
+    }
     if (rip && t_ctx && (sig == SIGSEGV || sig == SIGBUS)) {
         // The program's access fault: its state from the registers the translation keeps it in, then on (out of
         // the signal) to the dispatch on this thread's stack, below the translated code's frame.

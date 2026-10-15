@@ -236,7 +236,7 @@ void vx_thread_attach(void) {
     uint8_t *teb = calloc(1, TEB_SIZE);
 #ifdef __aarch64__
     // The program's code runs on a stack of its own (this thread's stays the runtime's), below a guard page.
-    size_t size = vx_x86_stack_size ? vx_x86_stack_size : (1u << 20);
+    size_t size = vx_x86_stack_size ? vx_x86_stack_size : (2u << 20);   // (as CreateThread's least: 2 MB)
     uint8_t *lo = mmap(NULL, size + 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     mprotect(lo, 16384, PROT_NONE);
     *(void **)(teb + TEB_STACK_BASE) = lo + 16384 + size;

@@ -55,7 +55,7 @@ def thunk(f):
     elif rc == "int" and f["ret_kind"] == 101: body = f"c->gpr[0] = vx_unlow((uint64_t)(uintptr_t)({call}));"
     elif rc == "int": body = f"c->gpr[0] = (uint64_t)({width(f['ret_kind'], f['ret_size'])})({call});"
     else: raise SystemExit(f"cannot return {f}")
-    return f"static void vxt_{f['name']}(x86_ctx *c) {{ {pre}{body}{post} }}"
+    return f"static void vxt_{f['name']}(x86_ctx *c) {{ VX_TRACE_IN(\"{f['name']}\"); {pre}{body}{post} VX_TRACE_OUT(\"{f['name']}\"); }}"
 
 def main():
     out, srcs = sys.argv[1], sys.argv[2:]
