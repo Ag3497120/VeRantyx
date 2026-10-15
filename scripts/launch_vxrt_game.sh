@@ -13,9 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-VERANTYX_VR_DRIVE="${VERANTYX_VR_DRIVE:-$HOME/Verantyx_VR_Drive}"
-WINEPREFIX="${WINEPREFIX:-$VERANTYX_VR_DRIVE/SteamVR_Prefix_Wine11_Test}"
-STEAM_ROOT="$WINEPREFIX/drive_c/Program Files (x86)/steam"
+source "$SCRIPT_DIR/vxrt_paths.sh"                  # STEAM_ROOT, WINE_STEAM, VXRT_DLL_DIRS (no Wine prefix needed)
 export VXRT_VR_ROOT="${VXRT_VR_ROOT:-$VERANTYX_VR_DRIVE/vxrt_root}"
 export VXRT_VR_OVERLAY="${VXRT_VR_OVERLAY:-$VERANTYX_VR_DRIVE/vxrt_steam_overlay}"
 LOG_DIR="${VXRT_VR_LOG_DIR:-$REPO_ROOT/logs}"
@@ -32,8 +30,9 @@ if pgrep -f "build/vxrt.*(vrserver|vrcompositor)" >/dev/null; then echo "SteamVR
 mkdir -p "$LOG_DIR"
 
 # Where the game's writes go: the Steam library's overlay, or one of the game's own.
-case "$EXE" in
-    "$STEAM_ROOT"/*) OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY" ;;
+LIB="$(steam_library_of "$EXE")"
+case "$LIB" in
+    ?*) OVERLAY="$LIB:$VXRT_VR_OVERLAY" ;;
     *)  top="$GAME_DIR"                                   # the install's top folder: where steamapps/ is, else the exe's
         d="$GAME_DIR"
         while [[ "$d" != "/" && "$d" != "$HOME" ]]; do [[ -d "$d/steamapps" ]] && { top="$d"; break; }; d="$(dirname "$d")"; done
@@ -81,7 +80,7 @@ echo "SteamVR on VXRuntime is up; starting $EXE_NAME${APP_ID:+ (Steam app $APP_I
 
 cd "$GAME_DIR"
 # The game's own debug output (VXRT_DEBUGGER, VXRT_DEBUG_OUTPUT) goes to the log with the time: why it quit, if it does.
-env VXRT_ROOT="$VXRT_VR_ROOT" VXRT_OVERLAY="$OVERLAY" VXRT_DLL_PATH="$WINEPREFIX/drive_c/windows/system32" \
+env VXRT_ROOT="$VXRT_VR_ROOT" VXRT_OVERLAY="$OVERLAY" VXRT_DLL_PATH="$VXRT_DLL_DIRS" \
     VXRT_STEAM_BRIDGE=1 VXRT_NO_ACTIVATE=1 VXRT_DEBUGGER=1 VXRT_DEBUG_OUTPUT=1 VXRT_LOG_TIME=1 \
     ${APP_ID:+SteamAppId=$APP_ID SteamGameId=$APP_ID} \
     "$VXRT" "$EXE_NAME" "$@" >"$LOG" 2>&1 &

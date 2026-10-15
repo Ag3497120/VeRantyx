@@ -17,10 +17,10 @@
     }
   },
   "status": {
-    "state": "partial",
+    "state": "works",
     "summary": {
-      "ja": "VR で地形とラベルが出る。空が白い",
-      "en": "Terrain and labels in VR; the sky is white"
+      "ja": "VR で動作（地形とラベル）",
+      "en": "Works in VR (terrain and labels)"
     },
     "checked": "2026-10-13",
     "machine": "Apple M1 Max, 32-core GPU"
@@ -34,10 +34,6 @@
     }
   },
   "known_issues": [
-    {
-      "summary": "Sky renders white (some #version 150 GLSL shaders)",
-      "since": "2026-10-13"
-    },
     {
       "summary": "3k: 42-49 fps; the default quality is smoother",
       "since": "2026-10-14"

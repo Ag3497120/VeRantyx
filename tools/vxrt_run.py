@@ -66,7 +66,7 @@ def preconditions(spec, game, args, root, overlay, need_steam=True):
     checks = []
     def check(code, ok, detail):
         checks.append({"code": code, "ok": bool(ok), "detail": detail})
-    check("game_installed", spec and game, "found in a Steam library" if game else "not installed (scripts/fetch_windows_vr_app.sh) or unknown")
+    check("game_installed", spec and game, "found in a Steam library" if game else "not installed (tools/vxrt_steam.py fetch or import) or unknown")
     busy = pgrep("[b]uild/vxrt") + pgrep("[w]ine.*(vrserver|hlvr)")
     check("user_not_playing", not busy, "no VXRuntime or Wine game/SteamVR running" if not busy else "running: " + "; ".join(b[:120] for b in busy[:3]))
     check("steamvr_not_running", not listening(27062), "port 27062 free" if not listening(27062) else "a SteamVR is listening on 27062")

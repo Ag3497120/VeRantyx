@@ -11,17 +11,18 @@
 #                                                   # (50-55 fps on an M1 Max)
 #   VXRT_VR_QUALITY=max scripts/launch_vxrt_alyx.sh   # 3200x3600 per eye (a Vision Pro eye's pixels), 3840x2160 stream
 #
-# The game and SteamVR come from the Wine prefix's Steam library and stay read-only (writes go to the overlay
-# folder, as for scripts/launch_vxrt_steamvr.sh). The first start compiles thousands of shaders and takes a few
+# The game and SteamVR come from ~/Verantyx_VR_Drive/vxrt_steam (tools/vxrt_steam.py; the Wine version's Steam
+# library while they are not there, scripts/vxrt_paths.sh) and stay read-only (writes go to the overlay folder, as
+# for scripts/launch_vxrt_steamvr.sh). The first start compiles thousands of shaders and takes a few
 # minutes; later starts use Metal's cache.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-VERANTYX_VR_DRIVE="${VERANTYX_VR_DRIVE:-$HOME/Verantyx_VR_Drive}"
-WINEPREFIX="${WINEPREFIX:-$VERANTYX_VR_DRIVE/SteamVR_Prefix_Wine11_Test}"
-STEAM_ROOT="$WINEPREFIX/drive_c/Program Files (x86)/steam"
-ALYX_BIN="$STEAM_ROOT/steamapps/common/Half-Life Alyx/game/bin/win64"
+source "$SCRIPT_DIR/vxrt_paths.sh"                  # STEAM_ROOT, WINE_STEAM, VXRT_DLL_DIRS (no Wine prefix needed)
+ALYX_STEAM="$STEAM_ROOT"                              # the library the game is in (SteamVR's, else the Wine version's)
+[[ ! -d "$ALYX_STEAM/steamapps/common/Half-Life Alyx" && -n "$WINE_STEAM" ]] && ALYX_STEAM="$WINE_STEAM"
+ALYX_BIN="$ALYX_STEAM/steamapps/common/Half-Life Alyx/game/bin/win64"
 export VXRT_VR_ROOT="${VXRT_VR_ROOT:-$VERANTYX_VR_DRIVE/vxrt_root}"
 export VXRT_VR_OVERLAY="${VXRT_VR_OVERLAY:-$VERANTYX_VR_DRIVE/vxrt_steam_overlay}"
 LOG_DIR="${VXRT_VR_LOG_DIR:-$REPO_ROOT/logs}"
@@ -77,7 +78,7 @@ cp -p "$PROXY_DLL" "$OVERLAY_ALYX_BIN/openvr_api.dll"
 # The game's own console log (VXRT_DEBUGGER, VXRT_DEBUG_OUTPUT) goes to the log with the time: why it quit, if it does.
 export VERANTYX_DECOUPLED_POSES="${VERANTYX_DECOUPLED_POSES:-1}"
 cd "$ALYX_BIN"
-VXRT_ROOT="$VXRT_VR_ROOT" VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY" VXRT_DLL_PATH="$WINEPREFIX/drive_c/windows/system32" \
+VXRT_ROOT="$VXRT_VR_ROOT" VXRT_OVERLAY="$ALYX_STEAM:$VXRT_VR_OVERLAY" VXRT_DLL_PATH="$VXRT_DLL_DIRS" \
 VXRT_STEAM_BRIDGE=1 VXRT_NO_ACTIVATE=1 VXRT_DEBUGGER=1 VXRT_DEBUG_OUTPUT=1 VXRT_LOG_TIME=1 \
     "$VXRT" hlvr.exe -vr -steam -dx11 -noasserts -nopassiveasserts ${GAME_ARGS[@]+"${GAME_ARGS[@]}"} +map startup "$@" >"$LOG_DIR/vxrt-alyx.log" 2>&1 &
 GAME_PID=$!

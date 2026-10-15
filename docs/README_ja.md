@@ -89,7 +89,7 @@ Half-Life: Alyx、MacBook Pro M1 Max、各版のログでの計測です。
 | Steam | Wine 上の Windows 版 Steam + Chromium | Mac の Steam | Mac の Steam（ブリッジ） |
 | ゲーム中・標準サイズ | 約30fps（CPU 律速、SteamVR 倍率0.7） | 60fps、片目1298×1056 | 45〜57fps、片目約840×940 |
 | 大きいサイズ | — | 片目1982×1536で約39fps、片目約3Kで約20fps | 3K: 片目1440×1620で60fps、配信も60fps（HEVC Main10、約470万画素）。2.5K: 片目2560×2880（2× MSAA）で50〜60fps。max: 片目3200×3600で16〜21fps |
-| 他の Windows VR ゲーム | 可能（Wine） | 不可（Linux ARM64 版が必要） | The Lab（タイトル画面で53〜58fps）と Google Earth VR（空が白い）が動作。Bigscreen はまだ起動しない |
+| 他の Windows VR ゲーム | 可能（Wine） | 不可（Linux ARM64 版が必要） | The Lab（タイトル画面で53〜58fps）と Google Earth VR が動作。Bigscreen はまだ起動しない |
 | ヘッドセットでのプレイ | 済み | 済み（20分以上） | 済み（2026-10-14、3K、レベル切り替えを含む） |
 
 まとめると、ネイティブ版は CPU 変換がないので最速ですが、Valve が ARM64 版の Alyx を作ったから成り立つ方法です。
@@ -99,13 +99,16 @@ Windows 版と本物の SteamVR を保ったまま Wine を取り除き、すべ
 
 ### vxrt版の起動
 
-Mac で Steam を起動してサインインし、SteamVR とゲームが Windows の Steam ライブラリに入っている状態で使います。
-現在そのライブラリは Wine 版のセットアップ（`scripts/setup.sh`）が作るものです。vxrt は Wine を起動しませんが、
-ゲーム・SteamVR・Microsoft のランタイム DLL をその prefix から読みます（書き込みはしません）。Wine なしで
-インストールできるようにするのが次の作業です。
+Wine も Windows 版 Steam も要りません。自分の Steam アカウントで1回セットアップします:
 
 ```bash
-make -C VXRuntime check                          # vxrt をビルドしてテストを実行
+scripts/setup_vxrt.sh <Steamのログイン名> 546560 348250   # ビルド、SteamVR・Half-Life: Alyx・Google Earth VR（steamcmd）
+scripts/setup_vxrt.sh --import "<既存の Steam ライブラリ>"  # または手元のアプリを APFS のクローンで取り込む（ダウンロードなし）
+```
+
+SteamVR とゲームは専用の Steam ライブラリ `~/Verantyx_VR_Drive/vxrt_steam` に入ります（`tools/vxrt_steam.py fetch|import|status`）。Microsoft のランタイム DLL（msvcp140、vcruntime140、msvcp100 など）は、あなたの SteamVR やゲームに同梱された再頒布パッケージ（`_CommonRedist/vcredist/*/VC_redist.x64.exe`、DirectX の cab）を実行せずに開いて取り出し、`~/Verantyx_VR_Drive/vxrt_redist` に置きます（`tools/vxrt_redist.py`）。Valve と Microsoft のファイルはリポジトリにも含まず、リポジトリからダウンロードもしません。Wine 版をセットアップした Mac もそのまま動きます: `vxrt_steam` に SteamVR がない間だけ Wine 版の prefix を読みます（書き込みはしません）。`VXRT_NO_WINE=1` で prefix を一切使わないようにできます。そのうえで、Mac の Steam にサインインして:
+
+```bash
 scripts/launch_vxrt_alyx.sh                      # vxrt 上の SteamVR + エンコーダー + Half-Life: Alyx
 VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 片目1440×1620、2880×1620の10ビットHEVC・40Mbps、60fps
 VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 片目2560×2880で描画（2× MSAA）、配信は同じ、50〜60fps
@@ -121,10 +124,10 @@ MacBook Pro（M1 Max）、2026-10-14 時点:
 - **Half-Life: Alyx**: ハンドトラッキングとジョイコンでヘッドセットでプレイでき、レベル切り替えとセーブも動きます（2026-10-14 の録画は a2_quarantine_entrance から a2_pistol へ進んでいます）。ハーネスでの計測は、3K プリセットでチャプター1が60.0fps、メニューが54〜59fps。
 - **緑色に光る問題**: 奥の柵、植物の影、ペットボトルなど一部の表面が、ヘッドセットで緑色に光ったりにじんだりします。原因はまだ分かっていません（配信のパケット落ちで次のキーフレームまで緑になるのか、シェーダーの翻訳の問題か）。切り分け中です。
 - **Wi-Fi**: 速い回線が必要です。2.4GHz ではカクつきと崩れが出ます。5GHz・80MHz 幅でかなり改善します。
-- **max プリセット**: 16〜21fps で、ハンドトラッキングの手が認識されません（ジョイコンは使えます）。
+- **max プリセット**: 16〜21fps（3K は60fpsを保ちます）。
 - **初回起動**: 数千のシェーダーのコンパイルに数分かかります。2回目からは Metal のキャッシュを使います。
 - **セーブ**: 2026-10-14（コミット 8d10cfb）より前のセーブにはレベルの状態が入っていません。チャプターを最初から始めてください。
-- **セットアップ**: 上のとおり Wine 版の prefix からゲームを読みます。vxrt 用の1コマンドのセットアップはまだありません。
+- **セットアップ**（Wine なし、`scripts/setup_vxrt.sh`）: 2026-10-15 に `VXRT_NO_WINE=1`（prefix を一切使わない）でハーネスで確認。Alyx チャプター1 3K 60.0fps（20261015T005456Z-alyx-chapter-3k）、Google Earth VR 57.4fps（20261015T005918Z-earth-start）、The Lab 54.8fps（20261015T010214Z-thelab-title）。SteamVR とゲームは取り込み、DLL は SteamVR の再頒布パッケージから。steamcmd でのダウンロード経路そのものは、サインインが必要なのでここでは実行していません。
 - 試した Mac は1台です。Direct3D 12、Vulkan、テッセレーションは未対応で、アンチチートは回避しません。
 
 ### AI コーディングツールでの最適化・ゲーム対応
@@ -152,7 +155,7 @@ tools/vxrt_doctor.py earth --facts                                # 事実だけ
 
 **自動調整**: `tools/vxrt_tune.py <ゲーム>` は、ヘッドセットなしで、その Mac で表示 Hz を保てる一番よい画質を探します。ハーネスで、片目の画素数の少ない設定から多い設定へ順に試し（標準、3K、描画倍率2.4の3K、2.5K、max。ゲームのプロファイルに専用の段を書くこともできます）、表示 Hz の95%を保てなくなったところで止まり、保てた一番高い設定を交互の実行でもう一度確かめます。`--plan` で段と時間の見込みを先に表示します（30分以上かかり、その間は遊べません）。`--apply` で確かめた設定をその Mac 用としてプロファイルに書き、`tools/vxrt_tune.py --show <ゲーム>`（または VXRT Studio の画質の「この Mac に調整済み」）で起動コマンドが出ます。`/vxrt-tune <ゲーム>` なら、AI ツールがこれを実行し（MCP の `tune_game` / `read_tune`）、run ID 付きで報告します。
 
-同じことを画面で: `python3 tools/vxrt_studio.py` でブラウザに VXRT Studio が開きます。VXRuntime 用に入っているゲーム（prefix 内の Steam ライブラリと `~/Verantyx_VR_Drive/vxrt_library`）の一覧、動作状況、前回の実行で見つかった問題を表示し、プロンプト（調整／動くようにする）と起動コマンドをボタンでコピーできます。「AIに任せる」を押すと、ターミナルで Claude Code か Codex（入っていれば Gemini CLI と Cursor のエージェントも。あなたのログインのまま）がこのリポジトリで起動し、プロンプトと vxrt の MCP サーバーを受け取って、ゲームの起動・計測から修正まで自分で進めます。127.0.0.1 だけで動き、AI の起動にはページ固有の合言葉が必要です（他のサイトからは起動できません）。
+同じことを画面で: `python3 tools/vxrt_studio.py` でブラウザに VXRT Studio が開きます。VXRuntime 用に入っているゲーム（`~/Verantyx_VR_Drive/vxrt_steam`、`vxrt_library`、あれば Wine 版のライブラリ）の一覧、動作状況、前回の実行で見つかった問題を表示し、プロンプト（調整／動くようにする）と起動コマンドをボタンでコピーできます。「AIに任せる」を押すと、ターミナルで Claude Code か Codex（入っていれば Gemini CLI と Cursor のエージェントも。あなたのログインのまま）がこのリポジトリで起動し、プロンプトと vxrt の MCP サーバーを受け取って、ゲームの起動・計測から修正まで自分で進めます。127.0.0.1 だけで動き、AI の起動にはページ固有の合言葉が必要です（他のサイトからは起動できません）。
 
 AI はハーネス `tools/vxrt_run.py`（MCP サーバー `tools/vxrt_mcp.py` としても使え、Claude Code には `.mcp.json` で登録）で計測します。ゲームを専用のフォルダで、仮想のヘッドセットで動かし、公平に測れない実行（プレイ中、SteamVR が起動中、VR がオフなど）は理由付きで拒否します。見たことは証拠として `runs/` に書きます（観測値とその元ファイルのハッシュ、凍結した基準値から導いた結論、推測、不明点）。記録はハッシュでつないだ台帳に残ります。`make -C VXRuntime vr-check` で基準値のあるゲームをすべて確かめます。AI 向けの手順書は `.agents/skills/` にあります。
 

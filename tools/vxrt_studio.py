@@ -24,6 +24,7 @@ DRIVE = os.path.expanduser(os.environ.get("VERANTYX_VR_DRIVE", "~/Verantyx_VR_Dr
 PREFIX = os.environ.get("WINEPREFIX", os.path.join(DRIVE, "SteamVR_Prefix_Wine11_Test"))
 STEAM_ROOT = os.path.join(PREFIX, "drive_c", "Program Files (x86)", "steam")
 LIBRARY = os.path.join(DRIVE, "vxrt_library")                  # scripts/fetch_windows_vr_app.sh installs here
+VXRT_STEAM = os.environ.get("VXRT_STEAM", os.path.join(DRIVE, "vxrt_steam"))   # tools/vxrt_steam.py: no Wine
 NOT_GAMES = {"228980", "250820"}                                # Steamworks Common Redistributables, SteamVR
 
 def windows_to_mac(path):
@@ -36,7 +37,7 @@ def windows_to_mac(path):
     return None
 
 def libraries():
-    libs = [STEAM_ROOT]
+    libs = [VXRT_STEAM] + ([STEAM_ROOT] if os.environ.get("VXRT_NO_WINE") != "1" and os.path.isdir(STEAM_ROOT) else [])
     vdf = os.path.join(STEAM_ROOT, "steamapps", "libraryfolders.vdf")
     if os.path.exists(vdf):
         for m in re.finditer(r'"path"\s+"([^"]+)"', open(vdf, errors="replace").read()):
@@ -53,11 +54,13 @@ def manifest(path):
 
 _scan_cache = {}
 def find_games():
-    games = []
+    games, seen = [], set()
     for lib in libraries():
         for acf in sorted(glob.glob(os.path.join(lib, "steamapps", "appmanifest_*.acf"))):
             m = manifest(acf)
             if not m["appid"] or m["appid"] in NOT_GAMES:
+                continue
+            if m["appid"] in seen:                             # (the same app in two libraries: the first, vxrt_steam)
                 continue
             folder = os.path.join(lib, "steamapps", "common", m["installdir"])
             if not os.path.isdir(folder):
@@ -71,6 +74,7 @@ def find_games():
             exe, markers = _scan_cache[key]
             if not exe:
                 continue
+            seen.add(m["appid"])
             games.append(dict(m, folder=folder, exe=exe, markers=markers, library=lib))
     return games
 

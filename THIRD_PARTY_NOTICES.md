@@ -34,6 +34,12 @@ own Steam account:
   the game in memory at load (byte-checked by hash, see
   `NativeARM/host/kl_guestfix.c`) and never writes to the game's files.
 
+The vxrt version (`scripts/setup_vxrt.sh`) installs SteamVR and games with
+steamcmd through your own Steam account, and takes the Microsoft Visual C++
+and DirectX runtime DLLs out of the redistributable installers your own SteamVR
+and games carry (`_CommonRedist`), on your Mac only (`tools/vxrt_redist.py`):
+they are neither in this repository nor downloaded by it.
+
 Apple's Game Porting Toolkit (D3DMetal) is not distributed or required, and the
 normal setup does not use it. An optional, experimental Wine-version backend
 (`VERANTYX_D3D_BACKEND=d3dmetal`, `scripts/install_d3dmetal.sh`) uses D3DMetal

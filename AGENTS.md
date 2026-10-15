@@ -16,6 +16,9 @@ run. Read this file before you change anything.
   (`VisionProClient/`).
 - **Steam**: games reach the Mac Steam client through VXRuntime's Steam bridge (`VXRT_STEAM_BRIDGE=1`), signed in with
   the user's own account.
+- **No Wine**: SteamVR and games live in `~/Verantyx_VR_Drive/vxrt_steam` (`tools/vxrt_steam.py`), the Microsoft
+  runtime DLLs in `~/Verantyx_VR_Drive/vxrt_redist` (`tools/vxrt_redist.py`), both found by `scripts/vxrt_paths.sh`;
+  a Wine version's prefix is only a read-only fallback (`VXRT_NO_WINE=1` forbids it). Setup: `scripts/setup_vxrt.sh`.
 
 ## Rules (always)
 

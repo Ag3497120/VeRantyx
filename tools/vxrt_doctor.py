@@ -370,7 +370,11 @@ GRAPHICS = {"d3d11.dll": "Direct3D 11", "d3d12.dll": "Direct3D 12 (VXRuntime: no
             "wininet.dll": "WinINet", "winhttp.dll": "WinHTTP", "ws2_32.dll": "Winsock"}
 
 DEFAULT_ROOT = os.path.expanduser("~/Verantyx_VR_Drive/vxrt_root/drive_c")
-DEFAULT_DLL_PATH = os.path.expanduser("~/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test/drive_c/windows/system32")
+# The Microsoft runtime DLLs the launchers give VXRuntime (scripts/vxrt_paths.sh): tools/vxrt_redist.py's folder, else
+# the Wine version's system32.
+DEFAULT_DLL_PATH = next((p for p in (os.path.expanduser(os.environ.get("VXRT_REDIST", "~/Verantyx_VR_Drive/vxrt_redist")),)
+                         if os.path.exists(os.path.join(p, "manifest.json"))),
+                        os.path.expanduser("~/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test/drive_c/windows/system32"))
 _exports = None
 
 def find_log(exe_name):

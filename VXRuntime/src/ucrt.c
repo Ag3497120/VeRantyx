@@ -657,6 +657,8 @@ static WINAPI WCHAR *vx_wgetcwd(WCHAR *buf, int n) {
 static short fp_class(int c) { return c == FP_INFINITE ? 1 : c == FP_NAN ? 2 : c == FP_NORMAL ? -1 : c == FP_SUBNORMAL ? -2 : 0; }
 static WINAPI short vx_dclass(double x) { return fp_class(fpclassify(x)); }
 static WINAPI short vx_fdclass(float x) { return fp_class(fpclassify(x)); }
+// (MSVC's long double is a double: the argument comes in xmm0 as one, not as an x87 80-bit value)
+static WINAPI short vx_ldclass(double x) { return fp_class(fpclassify(x)); }
 static WINAPI int vx_dsign(double x) { return signbit(x) ? 0x8000 : 0; }
 static WINAPI int vx_fdsign(float x) { return signbit(x) ? 0x8000 : 0; }
 static WINAPI double vx_copysign(double a, double b) { return copysign(a, b); }
@@ -884,6 +886,13 @@ static WINAPI int vx_set_fmode(int m) { g_fmode = m; return 0; }
 static WINAPI int vx_get_fmode(int *m) { *m = g_fmode; return 0; }
 static WINAPI void vx_c_exit(void) {}
 static WINAPI void vx_invalid_parameter_noinfo(void) { if (vx_trace) vx_log("the program reported an invalid parameter to the C runtime"); }
+// What the C runtime calls when a checked function got an invalid parameter and no handler took it: Windows ends the
+// process (__fastfail, STATUS_INVALID_CRUNTIME_PARAMETER).
+static WINAPI void vx_invoke_watson(const WCHAR *expr, const WCHAR *func, const WCHAR *file, unsigned line, uintptr_t reserved) {
+    (void)expr; (void)func; (void)file; (void)line; (void)reserved;
+    vx_log("the C runtime ended the program: invalid parameter (_invoke_watson)");
+    _exit((int)0xC0000417);
+}
 static WINAPI void vx_register_thread_local_exe_atexit_callback(void *cb) { (void)cb; }
 // The command line after the program's name, for WinMain.
 static WINAPI char *vx_get_narrow_winmain_command_line(void) {
@@ -999,7 +1008,7 @@ static const vx_export ucrt[] = {
     { "strncat", (void *)vx_strncat }, { "strpbrk", (void *)vx_strpbrk }, { "strspn", (void *)vx_strspn }, { "strtoull", (void *)vx_strtoull },
     { "ldiv", (void *)vx_ldiv }, { "_dtest", (void *)vx_dtest }, { "_fdtest", (void *)vx_fdtest }, { "lrintf", (void *)vx_lrintf },
     { "_set_fmode", (void *)vx_set_fmode }, { "_get_fmode", (void *)vx_get_fmode }, { "_c_exit", (void *)vx_c_exit },
-    { "_invalid_parameter_noinfo", (void *)vx_invalid_parameter_noinfo },
+    { "_invalid_parameter_noinfo", (void *)vx_invalid_parameter_noinfo }, { "_invoke_watson", (void *)vx_invoke_watson },
     { "_register_thread_local_exe_atexit_callback", (void *)vx_register_thread_local_exe_atexit_callback },
     { "_get_narrow_winmain_command_line", (void *)vx_get_narrow_winmain_command_line },
     { "_get_wide_winmain_command_line", (void *)vx_get_wide_winmain_command_line },
@@ -1008,7 +1017,7 @@ static const vx_export ucrt[] = {
     { "_lock_locales", (void *)vx_lock_locales }, { "_unlock_locales", (void *)vx_lock_locales }, { "_wsetlocale", (void *)vx_wsetlocale },
     { "_set_new_handler", (void *)vx_set_new_handler }, { "terminate", (void *)vx_terminate },
     { "_wremove", (void *)vx_wremove }, { "_wrmdir", (void *)vx_wrmdir }, { "_wrename", (void *)vx_wrename }, { "_wchdir", (void *)vx_wchdir },
-    { "_wgetcwd", (void *)vx_wgetcwd }, { "_dclass", (void *)vx_dclass }, { "_fdclass", (void *)vx_fdclass }, { "_dsign", (void *)vx_dsign },
+    { "_wgetcwd", (void *)vx_wgetcwd }, { "_dclass", (void *)vx_dclass }, { "_fdclass", (void *)vx_fdclass }, { "_ldclass", (void *)vx_ldclass }, { "_dsign", (void *)vx_dsign },
     { "_fdsign", (void *)vx_fdsign }, { "copysign", (void *)vx_copysign }, { "_copysign", (void *)vx_copysign }, { "lgamma", (void *)vx_lgamma },
     { "lgammal", (void *)vx_lgamma }, { "lgammaf", (void *)vx_lgammaf }, { "__strncnt", (void *)vx_strncnt }, { "_wcsdup", (void *)vx_wcsdup },
     { "strcspn", (void *)vx_strcspn }, { "strtof", (void *)vx_strtof }, { "wcstod", (void *)vx_wcstod }, { "wcstof", (void *)vx_wcstof },
@@ -1161,6 +1170,7 @@ static WINAPI int ms_memicmp(const void *a, const void *b, size_t n) {
     return 0;
 }
 static WINAPI int ms_mbtowc(WCHAR *w, const char *s, size_t n) { if (!s) return 0; if (!n) return -1; if (w) *w = (uint8_t)*s; return *s ? 1 : 0; }
+static WINAPI unsigned short ms_btowc(int c) { return c == -1 ? 0xFFFF : (uint8_t)c; }   // (as mbtowc: one byte, one character; EOF: WEOF)
 static WINAPI int ms_wctomb(char *s, WCHAR w) { if (!s) return 0; if (w > 0x7f) return -1; *s = (char)w; return 1; }
 static WINAPI int ms_isleadbyte(int c) { (void)c; return 0; }
 static WINAPI int ms_ismbblead(unsigned c) { (void)c; return 0; }
@@ -1233,7 +1243,7 @@ static const vx_export msvcrt_extra[] = {
     { "_get_osfhandle", (void *)ms_get_osfhandle }, { "_open_osfhandle", (void *)ms_open_osfhandle }, { "_fdopen", (void *)ms_fdopen },
     { "_wgetenv", (void *)ms_wgetenv }, { "wcsncmp", (void *)ms_wcsncmp }, { "wcstol", (void *)ms_wcstol }, { "atol", (void *)ms_atol },
     { "_strlwr", (void *)ms_strlwr }, { "_wcslwr", (void *)ms_wcslwr }, { "_itoa", (void *)ms_itoa }, { "_ltoa", (void *)ms_itoa },
-    { "_ultoa", (void *)ms_ultoa }, { "_memicmp", (void *)ms_memicmp }, { "mbtowc", (void *)ms_mbtowc }, { "wctomb", (void *)ms_wctomb },
+    { "_ultoa", (void *)ms_ultoa }, { "_memicmp", (void *)ms_memicmp }, { "mbtowc", (void *)ms_mbtowc }, { "btowc", (void *)ms_btowc }, { "wctomb", (void *)ms_wctomb },
     { "isleadbyte", (void *)ms_isleadbyte }, { "_ismbblead", (void *)ms_ismbblead }, { "_mbscmp", (void *)ms_mbscmp },
     { "time", (void *)ms_time }, { "ctime", (void *)ms_ctime }, { "_wctime", (void *)ms_wctime }, { "_strdate", (void *)ms_strdate },
     { "_strtime", (void *)ms_strtime }, { "_tempnam", (void *)ms_tempnam }, { "_wfullpath", (void *)ms_wfullpath },

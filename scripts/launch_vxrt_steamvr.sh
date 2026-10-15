@@ -7,10 +7,12 @@
 #   scripts/launch_vxrt_steamvr.sh            # until Ctrl-C
 #   VXRT_VR_SECONDS=60 scripts/launch_vxrt_steamvr.sh
 #
-# The SteamVR install in the Wine prefix is used read-only: everything SteamVR
+# SteamVR comes from ~/Verantyx_VR_Drive/vxrt_steam (tools/vxrt_steam.py) and the
+# VC++ runtime DLLs from ~/Verantyx_VR_Drive/vxrt_redist (tools/vxrt_redist.py):
+# no Wine prefix (scripts/vxrt_paths.sh; the Wine version's is still used, read
+# only, until those exist). The install is used read-only: everything SteamVR
 # writes under the Steam folder goes to $VXRT_VR_OVERLAY instead, and C:\ is
-# $VXRT_VR_ROOT/drive_c (the driver's shared frame file is there). The VC++
-# runtime DLLs come from the prefix's system32.
+# $VXRT_VR_ROOT/drive_c (the driver's shared frame file is there).
 #
 # The overlay's copy of steamvr.vrsettings (never the original) sets
 # steamvr/allowDisplayLockedMode: without Windows' DisplayManager (WinRT) the
@@ -22,10 +24,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-VERANTYX_VR_DRIVE="${VERANTYX_VR_DRIVE:-$HOME/Verantyx_VR_Drive}"
-WINEPREFIX="${WINEPREFIX:-$VERANTYX_VR_DRIVE/SteamVR_Prefix_Wine11_Test}"
-STEAM_ROOT="$WINEPREFIX/drive_c/Program Files (x86)/steam"
-STEAMVR_BIN="$STEAM_ROOT/steamapps/common/steamvr/bin/win64"
+source "$SCRIPT_DIR/vxrt_paths.sh"                  # STEAM_ROOT, VXRT_DLL_DIRS (no Wine prefix needed)
+STEAMVR_BIN="$STEAM_ROOT/steamapps/common/SteamVR/bin/win64"
 VXRT_VR_ROOT="${VXRT_VR_ROOT:-$VERANTYX_VR_DRIVE/vxrt_root}"
 VXRT_VR_OVERLAY="${VXRT_VR_OVERLAY:-$VERANTYX_VR_DRIVE/vxrt_steam_overlay}"
 VXRT_VR_NO_STANDBY="${VXRT_VR_NO_STANDBY:-1}"
@@ -90,22 +90,35 @@ if [[ "${VXRT_VR_QUALITY:-}" == 3k ]]; then
     # then: 45 fps fell to 30 for the rest of the run).
     VXRT_VR_SETTINGS="${VXRT_VR_SETTINGS:-{\"steamvr\": {\"framesToThrottle\": 0, \"additionalFramesToPredict\": 0}}}"
 fi
-if [[ -n "${VXRT_VR_RENDER_SCALE:-}" ]]; then
-    export VERANTYX_RENDER_SCALE="$VXRT_VR_RENDER_SCALE"
-    DRIVER_DLL="$REPO_ROOT/VRDriver/driver_verantyx.dll"
-    if [[ ! -f "$DRIVER_DLL" || "$REPO_ROOT/VRDriver/src/driver_verantyx.cpp" -nt "$DRIVER_DLL" ]]; then
-        "$SCRIPT_DIR/build_openvr_driver.sh" >/dev/null
-    fi
-    OVERLAY_DRIVER="$VXRT_VR_OVERLAY/steamapps/common/SteamVR/drivers/verantyx/bin/win64"
-    mkdir -p "$OVERLAY_DRIVER"
-    cp -p "$DRIVER_DLL" "$OVERLAY_DRIVER/driver_verantyx.dll"
+[[ -n "${VXRT_VR_RENDER_SCALE:-}" ]] && export VERANTYX_RENDER_SCALE="$VXRT_VR_RENDER_SCALE"
+# The repository's driver, in the overlay's copy of SteamVR's drivers folder (SteamVR as downloaded has no
+# drivers/verantyx; the overlay's entries show in its listing).
+DRIVER_DLL="$REPO_ROOT/VRDriver/driver_verantyx.dll"
+if [[ ! -f "$DRIVER_DLL" || "$REPO_ROOT/VRDriver/src/driver_verantyx.cpp" -nt "$DRIVER_DLL" ]]; then
+    "$SCRIPT_DIR/build_openvr_driver.sh" >/dev/null
 fi
+OVERLAY_DRIVER="$VXRT_VR_OVERLAY/steamapps/common/SteamVR/drivers/verantyx/bin/win64"
+mkdir -p "$OVERLAY_DRIVER"
+cmp -s "$DRIVER_DLL" "$OVERLAY_DRIVER/driver_verantyx.dll" || cp -p "$DRIVER_DLL" "$OVERLAY_DRIVER/driver_verantyx.dll"
 
 # VXRT_VR_SETTINGS='{"steamvr": {"framesToThrottle": 0}}': settings merged in, section by section (experiments).
 python3 - "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" "$VXRT_VR_NO_STANDBY" "${VXRT_VR_RENDER_SCALE:-}" "${VXRT_VR_SETTINGS:-}" <<'EOF'
-import json, sys
-settings = json.load(open(sys.argv[1]))
-settings.setdefault("steamvr", {})["allowDisplayLockedMode"] = True
+import json, os, sys
+settings = json.load(open(sys.argv[1])) if os.path.exists(sys.argv[1]) else {}   # (a new library has none yet)
+# The VeRantyx headset only: no other driver is started (SteamVR's own, vrlink, calls Windows networking functions
+# VXRuntime lacks and stops vrserver), no SteamVR Home or dashboard, no safe mode. The Wine version's setup wrote
+# these into its Steam config; here they are set every start.
+for section, values in {"steamvr": {"forcedDriver": "verantyx", "activateMultipleDrivers": False, "requireHmd": False,
+                                    "enableHomeApp": False, "enableSafeMode": False, "showMirrorView": False,
+                                    "startDashboardFromAppLaunch": False, "motionSmoothing": False},
+                        "dashboard": {"enableDashboard": False}, "verantyx": {"enable": True},
+                        "driver_verantyx": {"blocked_by_safe_mode": False}, "driver_vrlink": {"enable": False},
+                        "lighthouse": {"enable": False}, "oculus": {"enable": False}}.items():
+    settings.setdefault(section, {}).update(values)
+# The default picture size the measurements without a preset were made with (the Wine version's setting).
+settings["steamvr"].setdefault("supersampleManualOverride", True)
+settings["steamvr"].setdefault("supersampleScale", 0.55)
+settings["steamvr"]["allowDisplayLockedMode"] = True
 if sys.argv[4]:   # the driver's render size as given (SteamVR's automatic resolution would scale it back down)
     settings["steamvr"].update({"supersampleManualOverride": True, "supersampleScale": 1.0})
 if sys.argv[3] == "1":
@@ -120,10 +133,10 @@ EOF
 export VERANTYX_GPU_CONVERT="${VERANTYX_GPU_CONVERT:-1}"
 export VXRT_ROOT="$VXRT_VR_ROOT"
 export VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY"
-export VXRT_DLL_PATH="$WINEPREFIX/drive_c/windows/system32"
+export VXRT_DLL_PATH="$VXRT_DLL_DIRS"
 export VXRT_NO_ACTIVATE=1
 
-VXRT_PATTERN="VXRuntime/build/vxrt .*steamvr/bin/win64/vr"   # no regex characters (the path has "(x86)")
+VXRT_PATTERN="VXRuntime/build/vxrt .*[Ss]team[Vv][Rr]/bin/win64/vr"   # (either library's spelling; the path may have "(x86)")
 cleanup() {
     [[ -n "${ENCODER_PID:-}" ]] && kill -TERM "$ENCODER_PID" 2>/dev/null || true
     [[ -n "${WEBUI_PID:-}" ]] && kill -TERM "$WEBUI_PID" 2>/dev/null || true

@@ -75,7 +75,7 @@
       "since": "2026-10-14"
     },
     {
-      "summary": "VXRT_VR_QUALITY=max: 16-21 fps; the Joy-Con work but tracked hands were not seen",
+      "summary": "VXRT_VR_QUALITY=max: 16-21 fps (the 3k preset holds 60)",
       "since": "2026-10-14"
     },
     {

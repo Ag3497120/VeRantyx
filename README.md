@@ -16,7 +16,7 @@ There are **three versions**, on their own branches:
 |---|---|---|
 | [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) | Valve's **Linux ARM64** build of Half-Life: Alyx (made for the Steam Frame) runs natively on macOS — no Wine, no Rosetta, no SteamVR — through a patched [Klepton](https://github.com/shinyquagsire23/Klepton) loader, a glibc compatibility layer and an OpenVR runtime of our own | New (2026-10-11). Menu at 60 fps, levels played for 20+ minutes on an M1 Max |
 | [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine) | The Windows build with the real Windows SteamVR under Wine 11, DXVK → MoltenVK, and a SteamVR driver of our own | Stable since 2026-10-10; ~30 fps in game on an M1 Max |
-| [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) | The Windows build and the real Windows SteamVR on **[VXRuntime](#the-vxrt-version-vxruntime)** (vxrt), a Windows runtime written from scratch for Apple silicon in this repository — no Wine: Direct3D 11 on Metal, Steam through the Mac Steam client | Newest (2026-10-12 to 14). Played in the headset across level changes; 3K preset (1440×1620 per eye) at 60 fps, 2.5K preset (2560×2880 per eye, 2× MSAA) at 50–60 fps on an M1 Max. The Lab and Google Earth VR run too |
+| [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) | The Windows build and the real Windows SteamVR on **[VXRuntime](#the-vxrt-version-vxruntime)** (vxrt), a Windows runtime written from scratch for Apple silicon in this repository — no Wine: Direct3D 11 on Metal, Steam through the Mac Steam client | Newest (2026-10-12 to 15). No Wine at all, setup included (`scripts/setup_vxrt.sh`). Played in the headset across level changes; 3K preset (1440×1620 per eye) at 60 fps, 2.5K preset (2560×2880 per eye, 2× MSAA) at 50–60 fps on an M1 Max. The Lab and Google Earth VR run too |
 | `main` | All of the above | Development |
 
 All versions share the Mac HEVC encoder (`MacEncoder/`) and the Vision Pro
@@ -114,7 +114,7 @@ repository.
 | [Fossilize](https://github.com/ValveSoftware/Fossilize) | Optional shader-prewarm experiment (not used by the launcher) | MIT | No — fetched by `NativeARM/scripts/build_fossilize.sh` |
 | Debian trixie arm64 packages | glib, libstdc++, ssl, png … the Linux libraries the game expects from the Steam Linux Runtime | various (DFSG) | No — fetched by `NativeARM/scripts/fetch_debian_libs.sh` |
 | Wine Staging (Gcenx build), DXVK for macOS (Gcenx) | Wine version | LGPL-2.1, zlib | No — fetched by `scripts/setup.sh` |
-| Windows SteamVR, Microsoft Visual C++ runtime DLLs | vxrt version: loaded unchanged from your own Steam installation (today the one the Wine version's setup made) | Valve's and Microsoft's terms | No |
+| Windows SteamVR, Microsoft Visual C++ / DirectX runtime DLLs | vxrt version: SteamVR from your own Steam account (steamcmd); the DLLs taken from the redistributable installers your SteamVR and games carry, on your Mac only | Valve's and Microsoft's terms | No |
 
 Details: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -202,7 +202,7 @@ Half-Life: Alyx, MacBook Pro M1 Max, measured with each version's own logs.
 | Steam | Windows Steam + Chromium under Wine | Mac Steam client | Mac Steam client (bridge) |
 | In game, default size | ~30 fps (CPU-bound, SteamVR scale 0.7) | 60 fps, 1298×1056 per eye | 45–57 fps, ~840×940 per eye |
 | Larger sizes | — | 1982×1536 per eye ~39 fps; ~3K per eye ~20 fps | 3K preset: 1440×1620 per eye at 60 fps, streamed at 60 fps (HEVC Main10, ~4.7 megapixels); 2.5K preset: 2560×2880 per eye (2× MSAA) at 50–60 fps; max preset: 3200×3600 per eye at 16–21 fps |
-| Other Windows VR games | Possible (Wine) | No: needs a Linux ARM64 build | The Lab (title scene 53–58 fps) and Google Earth VR (sky drawn white) run; Bigscreen does not start yet |
+| Other Windows VR games | Possible (Wine) | No: needs a Linux ARM64 build | The Lab (title scene 53–58 fps) and Google Earth VR run; Bigscreen does not start yet |
 | Played in the headset | Yes | Yes (20+ min sessions) | Yes (2026-10-14, across level changes, 3K) |
 
 In short: the native version is the fastest (no CPU translation) but exists
@@ -214,14 +214,25 @@ are not there yet, and it has been tested with four games on one Mac.
 
 ### Running the vxrt version
 
-Steam running on the Mac and signed in, SteamVR and the game installed in a
-Windows Steam library. Today that library is the one the Wine version's setup
-makes (`scripts/setup.sh`): vxrt never starts Wine, but it reads the game,
-SteamVR and the Microsoft runtime DLLs from that prefix, never writing to it.
-Installing them without Wine is the next step.
+No Wine, no Windows Steam. One setup, with your own Steam account:
 
 ```bash
-make -C VXRuntime check                          # builds vxrt and runs its tests
+scripts/setup_vxrt.sh <steam-login> 546560 348250    # builds; SteamVR, Half-Life: Alyx, Google Earth VR (steamcmd)
+scripts/setup_vxrt.sh --import "<a Steam library>"   # or: apps you already have, as APFS clones (no download)
+```
+
+SteamVR and the games go to `~/Verantyx_VR_Drive/vxrt_steam`, a Steam library
+of its own (`tools/vxrt_steam.py fetch|import|status`). The Microsoft runtime
+DLLs (msvcp140, vcruntime140, msvcp100, ...) are taken out of the
+redistributable installers your own SteamVR and games carry
+(`_CommonRedist/vcredist/*/VC_redist.x64.exe`, DirectX cabinets), opened without
+running them, into `~/Verantyx_VR_Drive/vxrt_redist` (`tools/vxrt_redist.py`).
+Nothing of Valve's or Microsoft's is in this repository or downloaded by it.
+A Mac set up for the Wine version keeps working: its prefix is read (never
+written) only while `vxrt_steam` has no SteamVR; `VXRT_NO_WINE=1` forbids it.
+Then, with Steam running on the Mac and signed in:
+
+```bash
 scripts/launch_vxrt_alyx.sh                      # SteamVR on vxrt + encoder + Half-Life: Alyx
 VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 1440×1620 per eye, 2880×1620 10-bit HEVC at 40 Mbps, 60 fps
 VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 2560×2880 per eye rendered (2× MSAA), same stream, 50–60 fps
@@ -249,12 +260,16 @@ MacBook Pro (M1 Max), 2026-10-14:
   translator; it is being separated.
 - **Wi-Fi:** the stream needs a fast link. On 2.4 GHz it stutters and smears;
   5 GHz with an 80 MHz channel is much better.
-- **max preset:** 16–21 fps, and tracked hands are not seen (the Joy-Con work).
+- **max preset:** 16–21 fps (3K holds 60).
 - **First start** compiles thousands of shaders (a few minutes); Metal caches them.
 - **Saves** made before 2026-10-14 (commit 8d10cfb) have no level state; start
   the chapter again.
-- **Setup** reads the game from the Wine version's prefix (above); there is no
-  one-command setup for vxrt yet.
+- **Setup** without Wine (`scripts/setup_vxrt.sh`): checked on 2026-10-15 with
+  `VXRT_NO_WINE=1` (the prefix never used) in harness runs: Alyx chapter 1 at
+  3K 60.0 fps (20261015T005456Z-alyx-chapter-3k), Google Earth VR 57.4 fps
+  (20261015T005918Z-earth-start), The Lab 54.8 fps (20261015T010214Z-thelab-title),
+  with SteamVR and the games imported and the DLLs from SteamVR's redistributables.
+  The steamcmd download path itself has not been run here (it needs your sign-in).
 - Tested on one Mac. Not there: Direct3D 12, Vulkan, tessellation, anti-cheat
   (never worked around).
 
@@ -307,8 +322,8 @@ this Mac") gives its launch command. `/vxrt-tune <game>` has your AI tool run
 it (MCP `tune_game` / `read_tune`) and report it with the run ids.
 
 The same in a page: `python3 tools/vxrt_studio.py` opens VXRT Studio in the
-browser, a list of the games installed for VXRuntime (Steam libraries in the
-prefix and `~/Verantyx_VR_Drive/vxrt_library`) with what is known to work, the
+browser, a list of the games installed for VXRuntime (`~/Verantyx_VR_Drive/vxrt_steam`,
+`vxrt_library`, and the Wine version's libraries if there are any) with what is known to work, the
 last run's problems, and buttons that copy a prompt (tune or make it run) and
 the launch command, or hand the job to an agent: "Let the AI do it" opens Terminal
 with Claude Code or Codex (Gemini CLI and Cursor's agent too, when installed; your own login) in this repository, given the prompt
