@@ -217,6 +217,41 @@ def connected_at(vrserver_log, appid, since):
                 return round(t - since, 1) if t else 0.0
     return None
 
+def input_bindings(vrserver_log, appid, since):
+    """What SteamVR set up for the game's controllers in this run: the binding files it loaded for steam.app.<appid>
+    (per controller type) and whether the game declared SteamVR Input actions. None without the log."""
+    if not os.path.exists(vrserver_log):
+        return None
+    app, files, manifest = f"steam.app.{appid}", [], False
+    for line in open(vrserver_log, errors="replace"):
+        m = re.match(r"\w{3} (\w{3} \d+ \d{4} \d\d:\d\d:\d\d)", line)
+        if not m or time.mktime(time.strptime(m.group(1), "%b %d %Y %H:%M:%S")) < since - 1:
+            continue
+        b = re.search(r"Successfully loaded binding file '([^']+)' for app '([^']+)'", line)
+        if b and b.group(2) == app:
+            files.append(b.group(1).replace("\\", "/").rsplit("/", 1)[-1])
+        if "SetActionManifestPath" in line and app in line:
+            manifest = True
+    return {"binding_files": sorted(set(files)), "uses_steamvr_input_actions": manifest}
+
+# How far a game got, lowest to highest. "playable" is never derived from a run: only a person in the headset says so
+# (tools/vxrt_playtest.py).
+LEVELS = ["starts", "connects", "draws", "runs", "controls", "playable"]
+
+def level(ev):
+    """The highest level the run's observations show (None: it did not even start)."""
+    reached = None
+    checks = [("starts", not ev.value("exited_early") or ev.value("connected_after_s") is not None),
+              ("connects", ev.value("connected_after_s") is not None),
+              ("draws", (ev.value("frame_bright_fraction") or 0) > 0.05),
+              ("runs", not ev.value("exited_early") and ev.value("fps_median") not in (None, 0) and not ev.value("unhandled_exceptions")),
+              ("controls", bool((ev.value("controller_bindings") or {}).get("binding_files")))]
+    for name, ok in checks:
+        if not ok:
+            break
+        reached = name
+    return reached
+
 def game_log_facts(path, exe):
     """Counts from the game's own lines of its log (not SteamVR's processes it started)."""
     facts = {"unhandled": 0, "signals": 0, "unimplemented": {}, "managed_exceptions": 0, "first_problem": None, "exit": None}
@@ -289,6 +324,9 @@ def derive(ev, base_name, base, src=None):
                            "rule": "connected_after_s is not null", "from": [ev.ref("connected_after_s")], "baseline": src})
     ev.derived.append({"id": "d4", "claim": "ran_for_the_whole_scenario", "holds": not ev.value("exited_early"),
                        "rule": "exited_early is false", "from": [ev.ref("exited_early")], "baseline": src})
+    if ev.ref("controller_bindings") and ev.value("connected_after_s") is not None:
+        ev.derived.append({"id": "d5", "claim": "controller_bindings_loaded", "holds": bool((ev.value("controller_bindings") or {}).get("binding_files")),
+                           "rule": "SteamVR loaded a binding file for the game's controllers", "from": [ev.ref("controller_bindings")], "baseline": src})
 
 def infer(ev):
     """Suspicions, never facts: each says what it rests on and how sure it is."""
@@ -348,6 +386,8 @@ def validate(result):
             for d in result.get("derived", []):
                 if d["claim"] in again and again[d["claim"]] != d["holds"]:
                     problems.append(f"derived {d['id']} ({d['claim']}) says {d['holds']}, the recorded values give {again[d['claim']]}")
+        if "level" in result and level(ev) != result["level"]:
+            problems.append(f"level says {result['level']}, the recorded values give {level(ev)}")
     return problems
 
 # ---- a run ----------------------------------------------------------------------------------------------------------------------
@@ -460,6 +500,8 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     ev.observe("exited_early", exited_at is not None, os.path.join(logs, "launcher.log"),
                **({"exited_after_s": round(exited_at - started, 1)} if exited_at else {}))
     ev.observe("connected_after_s", connected_at(os.path.join(logs, "vrserver.txt"), spec["appid"], started), os.path.join(logs, "vrserver.txt"))
+    ev.observe("controller_bindings", input_bindings(os.path.join(logs, "vrserver.txt"), spec["appid"], started), os.path.join(logs, "vrserver.txt"),
+               note="binding files SteamVR loaded for the game's controllers in this run (the VeRantyx controllers are Touch controllers)")
     if recent_submit:
         ev.observe("fps_median", median(recent_submit), proxy_log, source="the game's Submit calls (capture proxy), 5 s averages",
                    samples=recent_submit, window_s=window)
@@ -510,6 +552,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
         {"item": "whether the picture is right", "reason": "only checked for not being black; look at frame_end.png"},
         {"item": "audio", "reason": "the game is muted (VXRT_MUTE=1)"},
         {"item": "behaviour with a real headset and hands", "reason": "the head pose and the hands are simulated; the right trigger is pulled every %g s" % press_every},
+        {"item": "whether the game reacts to the controllers and can be played", "reason": "bindings loading is all a run sees: a person decides 'playable' (tools/vxrt_playtest.py)"},
         {"item": "run-to-run variation", "reason": "one run; compare settings in alternating runs (A B B A)"},
     ]
     ev.limits += ["no debugger under Rosetta (lldb does not attach): use VXRT_TRACE_CALLS and the logs",
@@ -517,6 +560,7 @@ def run(game, scenario=None, quality="", seconds=None, extra_args=(), press_ever
     result.update({"observed": ev.observed, "derived": ev.derived, "inferred": ev.inferred, "unknown": ev.unknown,
                    "limits": ev.limits, "duration_s": round(ended - started, 1)})
     result["status"] = "fail" if not all(d["holds"] for d in ev.derived) else "pass" if base else "no_baseline"
+    result["level"] = level(ev)
     return finish(result, run_dir, say)
 
 def finish(result, run_dir, say):
@@ -532,7 +576,8 @@ def finish(result, run_dir, say):
     return result
 
 def summary(r):
-    lines = [f"{r['run_id']}: {r['status']}" + (f" (refused: {', '.join(r['refused'])})" if r.get("refused") else "")]
+    lines = [f"{r['run_id']}: {r['status']}" + (f" (refused: {', '.join(r['refused'])})" if r.get("refused") else "") +
+             (f", level {r['level']}" if r.get("level") else "")]
     for c in r.get("preconditions", []):
         if not c["ok"]: lines.append(f"  precondition {c['code']}: {c['detail']}")
     for o in r.get("observed", []):

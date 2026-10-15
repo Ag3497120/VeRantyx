@@ -78,7 +78,7 @@ def outputs():
         "Read AGENTS.md in the repository root before changing anything and follow it: its rules (no DRM or anti-cheat "
         "circumvention, game files untouched, verified work only), the build and test commands, and the harness "
         "(tools/vxrt_run.py, the vxrt MCP server in .cursor/mcp.json) for every claim about a game. Workflows: "
-        ".agents/skills/*/SKILL.md. Commands: /vxrt-support, /vxrt-tune, /vxrt-games, /vxrt-issue.\n")
+        ".agents/skills/*/SKILL.md. Commands: /vxrt-support, /vxrt-tune, /vxrt-playtest, /vxrt-games, /vxrt-issue.\n")
     return out
 
 def stale():

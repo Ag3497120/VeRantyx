@@ -88,9 +88,28 @@ draft with `tools/vxrt_issue.py draft <game> --tried "<what you changed, what ea
 Workflows: `.agents/skills/vxrt-support-game/SKILL.md` (making a game run, debugging without a debugger) and
 `.agents/skills/vxrt-tune-game/SKILL.md` (tuning).
 
+## When a game counts as working: levels
+
+| Level | Shown by | How |
+| --- | --- | --- |
+| `starts` | the process runs (does not exit at once) | harness |
+| `connects` | it reaches SteamVR (`game_connected_to_steamvr`) | harness |
+| `draws` | its frames are not black (`frame_bright_fraction` > 0.05) | harness |
+| `runs` | the whole scenario, frames counted, no unhandled exception (`ran_for_the_whole_scenario`) | harness |
+| `controls` | SteamVR loaded bindings for its controllers (`controller_bindings_loaded`) | harness |
+| `playable` | a person played it in the headset with controllers: picture, head, hands, buttons and movement all yes, input seen, no crash, 10+ minutes | `tools/vxrt_playtest.py` (only the user) |
+
+Each run's result has its `level`. A game's profile is `works` only at `playable` (a playtest, applied with
+`tools/vxrt_playtest.py --apply`), `partial` at `runs` or `controls`, `broken` below. An agent never claims
+`playable`: when a game reaches `controls`, ask the user for a playtest (`tools/vxrt_playtest.py <game>`; they mark
+problems by clicking both sticks, then answer a checklist) and read it back (MCP `read_playtests`): its problems
+(marks with the frame and the game's log at that moment, "no" answers, crashes, slow stretches, lost tracking) are
+the next things to fix.
+
 ## Commands, briefs and the files each AI tool reads
 
-Commands (the same in every tool): `/vxrt-support <game>`, `/vxrt-tune <game>`, `/vxrt-games`, `/vxrt-issue <game>`.
+Commands (the same in every tool): `/vxrt-support <game>`, `/vxrt-tune <game>`, `/vxrt-playtest <game>`, `/vxrt-games`,
+`/vxrt-issue <game>`.
 A game is a profile key (`alyx`), a Steam app id or its folder/.exe. Their source is `.agents/commands/*.md`;
 `tools/vxrt_agents.py sync` writes them, the MCP registration and the rules in each tool's own form
 (`.claude/commands`, `.gemini/commands` + `.gemini/settings.json` + `GEMINI.md`, `.cursor/commands` + `.cursor/mcp.json`

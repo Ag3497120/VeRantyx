@@ -47,7 +47,8 @@
       "en": "Works in VR. 60 fps with the 3k preset (M1 Max); played in the headset across level changes"
     },
     "checked": "2026-10-14",
-    "machine": "Apple M1 Max, 32-core GPU"
+    "machine": "Apple M1 Max, 32-core GPU",
+    "level": "playable"
   },
   "baselines": {
     "menu": {
@@ -101,5 +102,15 @@
       "checked": "2026-10-15",
       "source": "tools/vxrt_tune.py 20261015-tune-alyx-verify (runs 20261015T001413Z-alyx-chapter-3k, 20261015T002231Z-alyx-chapter-3k)"
     }
-  }
+  },
+  "playtests": [
+    {
+      "date": "2026-10-14",
+      "machine": "Apple M1 Max, 32-core GPU",
+      "quality": "3k",
+      "playable": true,
+      "reached": "a2_quarantine_entrance -> a2_pistol (level change, saves)",
+      "source": "the user's play in the headset with Joy-Con and hands, recorded on video (2026-10-14 22:46), before tools/vxrt_playtest.py existed; harness 20261015T012038Z-alyx-chapter-3k: level controls"
+    }
+  ]
 }

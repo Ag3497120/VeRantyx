@@ -283,6 +283,7 @@ TEXT = {
             "`make -C VXRuntime check` が通る（挙動が自明でない変更にはテストを足す）",
             "`make -C VXRuntime vr-check` で、基準値のあるほかのゲームが前と同じく通る",
             "`{profile}` を同じ変更で更新する（状態、場面、既知の問題。基準値は実行結果の run_id を source に書いたときだけ）",
+            "結果の `level` が `controls`（導出 `controller_bindings_loaded` も true）になったら、ユーザーにプレイテストを頼む: `tools/vxrt_playtest.py {key}`（ヘッドセットとコントローラーで遊び、問題の場面で両スティック押し込み、最後にチェックリスト）。{read_playtests} で読んだ問題を次に直す。「動く（works）」と言えるのはプレイテストが playable のときだけ",
         ],
         "done_tune": [
             "自動調整（`tools/vxrt_tune.py {key}`、MCP では {tune} と {read_tune}）の結果が `confirmed`: 低い解像度から順に試し、表示 Hz（プリセットでは 60）の 95% 以上を保つ最も高い設定を、交互の実行でもう一度確かめたもの",
@@ -328,6 +329,7 @@ TEXT = {
             "`make -C VXRuntime check` passes (add a test for behaviour that is not trivial)",
             "`make -C VXRuntime vr-check` still passes for the other games with baselines",
             "`{profile}` is updated in the same change (status, scenarios, known issues; a baseline only with a run id in its source)",
+            "When the result's `level` is `controls` (`controller_bindings_loaded` true too), ask the user for a playtest: `tools/vxrt_playtest.py {key}` (they play in the headset with controllers, click both sticks where something goes wrong, then answer a checklist). Fix the problems {read_playtests} shows next. The game \"works\" only when a playtest says playable",
         ],
         "done_tune": [
             "The auto-tuner (`tools/vxrt_tune.py {key}`, MCP {tune} then {read_tune}) ends `confirmed`: it climbs from the fewest pixels per eye and confirms, in alternating runs, the highest setting that holds 95 % of the display rate (60 for the presets)",
@@ -496,7 +498,7 @@ def build_prompt(game, goal="support", lang="ja", log=None, root_c=DEFAULT_ROOT,
     facts = prompt_facts(f, goal)
     key = facts["game"]["harness_key"] or "<game>"
     tool = lambda name: "`" + A["mcp"].format(name) + "`"
-    fill = {"harness": f"tools/vxrt_run.py {key}", "key": key, "run_game": tool("run_game"), "tune": tool("tune_game"), "read_tune": tool("read_tune"), "check": tool("check_preconditions"),
+    fill = {"harness": f"tools/vxrt_run.py {key}", "key": key, "run_game": tool("run_game"), "tune": tool("tune_game"), "read_tune": tool("read_tune"), "read_playtests": tool("read_playtests"), "check": tool("check_preconditions"),
             "read_log": tool("read_log"), "compare": tool("compare_runs"), "build": tool("build_and_check"),
             "issue": tool("prepare_issue"), "where": A["where"], "profile": (facts["profile"] or {}).get("file") or f"games/{f['appid'] or '<appid>'}.json",
             "skill": A["skill"].format("vxrt-support-game" if goal == "support" else "vxrt-tune-game")}

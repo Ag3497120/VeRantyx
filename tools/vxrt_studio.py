@@ -96,7 +96,9 @@ def game_info(g, lang):
     return {"appid": g["appid"], "name": g["name"], "exe": os.path.relpath(g["exe"], g["folder"]), "folder": g["folder"],
             "size_gb": round(g["size"] / 2**30, 1), "engine": engine, "anticheat": sorted(set(anticheat)),
             "status": status, "note": ja if lang == "ja" else en, "last_run": last_run(g["exe"]),
-            "known_issues": [k["summary"] for k in prof["known_issues"]], "tuned": tuned_here(prof)}
+            "known_issues": [k["summary"] for k in prof["known_issues"]], "tuned": tuned_here(prof),
+            "level": prof["status"].get("level"),
+            "playtest": f'cd "{REPO}" && python3 tools/vxrt_playtest.py {g["appid"]}'}
 
 _machine = None
 def tuned_here(prof):
@@ -194,7 +196,8 @@ const S = {
         ai: "AI に頼む", aihint: "Claude Code・Codex などをこのリポジトリで開き、コピーしたプロンプトを貼り付けてください。AI は AGENTS.md の規則（DRM を回避しない、ゲームファイルを変えない、確かめたものだけコミット）に従います。",
         tune: "この Mac 向けに調整", tunehint: "設定だけを変えて fps と解像度を詰める", support: "動くようにする", supporthint: "足りない Windows API などを VXRuntime に実装する",
         make: "プロンプトを作る", making: "調べています…", copy: "コピー", copied: "コピーしました",
-        run: "起動", quality: "画質", qdef: "標準", tuned: "この Mac に調整済み", runhint: "ターミナルで実行します。SteamVR と一緒に起動し、Vision Pro アプリから接続します。Mac 版 Steam にサインインしておいてください。",
+        run: "起動", quality: "画質", qdef: "標準", tuned: "この Mac に調整済み", pt: "プレイテスト", level: "到達段階",
+        pthint: "ヘッドセットとコントローラーで遊び、うまくいかない場所を記録します。問題の場面で両スティックを1秒押し込み、終わったらターミナルのチェックリストに答えてください。「遊べる」と判定されるのはこれだけです。", runhint: "ターミナルで実行します。SteamVR と一緒に起動し、Vision Pro アプリから接続します。Mac 版 Steam にサインインしておいてください。",
         copycmd: "コマンドをコピー", last: "前回の実行", nolog: "まだ実行記録がありません", problems: "ログで見つかったこと", none: "問題なし",
         delegate: "AIに任せる", delhint: "ターミナルが開き、選んだ AI がこのリポジトリで作業を始めます（あなたのログインのまま）。AI は vxrt のツールでゲームを自分で起動・計測します。コマンドの実行やファイルの変更は、AI ツールの確認画面で承認してください。プレイ中は計測を拒否します。",
         started: "ターミナルで開始しました", notool: "（未インストール）" },
@@ -204,7 +207,8 @@ const S = {
         ai: "Ask an AI coding tool", aihint: "Open Claude Code, Codex or another tool in this repository and paste the prompt. The AI follows AGENTS.md (no DRM circumvention, game files untouched, commits only what it verified).",
         tune: "Tune for this Mac", tunehint: "settings only: fps and resolution", support: "Make it run", supporthint: "implement missing Windows APIs and such in VXRuntime",
         make: "Make the prompt", making: "Looking at the game…", copy: "Copy", copied: "Copied",
-        run: "Start", quality: "Quality", qdef: "default", tuned: "tuned for this Mac", runhint: "Run it in Terminal. It starts SteamVR too; connect from the Vision Pro app. Mac Steam must be signed in.",
+        run: "Start", quality: "Quality", qdef: "default", tuned: "tuned for this Mac", pt: "Playtest", level: "Level reached",
+        pthint: "Play it in the headset with your controllers; it records where it goes wrong. Click both sticks for a second where something is wrong, then answer the checklist in Terminal. Only this makes a game playable.", runhint: "Run it in Terminal. It starts SteamVR too; connect from the Vision Pro app. Mac Steam must be signed in.",
         copycmd: "Copy the command", last: "Last run", nolog: "Not run yet", problems: "Found in the log", none: "nothing",
         delegate: "Let the AI do it", delhint: "Opens Terminal with the chosen agent in this repository (your own login). It runs and measures the game itself with the vxrt tools; approve its commands and edits in the agent as usual. Runs are refused while you are playing.",
         started: "Started in Terminal", notool: "(not installed)" },
@@ -289,6 +293,9 @@ function renderDetail(g) {
     el("div", { class: "box" }, el("h3", {}, T.ai), el("p", { class: "small muted" }, T.aihint), goalSel,
        el("div", { class: "row", style: "margin:10px 0" }, makeBtn, copyBtn), out,
        delegateRow, el("p", { class: "small muted" }, T.delhint)),
+    el("div", { class: "box" }, el("h3", {}, T.pt), el("p", { class: "small muted" }, T.pthint),
+       el("div", { class: "row", style: "margin-bottom:8px" }, g.level ? el("span", { class: "small" }, `${T.level}: ${g.level}`) : null,
+          el("button", { onclick: () => copy(g.playtest) }, T.copycmd)), el("code", { class: "cmd" }, g.playtest)),
     el("div", { class: "box" }, el("h3", {}, T.run), el("p", { class: "small muted" }, T.runhint),
        el("div", { class: "row", style: "margin-bottom:8px" }, el("span", { class: "small" }, T.quality), q, el("button", { onclick: () => copy(cmd.textContent) }, T.copycmd)), cmd),
     last].filter(Boolean));

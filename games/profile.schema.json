@@ -26,6 +26,13 @@
       }
     },
     "settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "tunable settings (AGENTS.md) this game needs by default"},
+    "playtests": {
+      "type": "array", "description": "people's play sessions in the headset (tools/vxrt_playtest.py --apply)",
+      "items": {"type": "object", "required": ["date", "machine", "playable", "source"], "additionalProperties": false,
+                "properties": {"date": {"type": "string"}, "machine": {"type": "string"}, "quality": {"type": "string"},
+                               "minutes": {"type": "number"}, "playable": {"type": "boolean"}, "reached": {"type": "string"},
+                               "problems": {"type": "number"}, "source": {"type": "string"}}}
+    },
     "tune": {
       "type": "object", "additionalProperties": false,
       "description": "how tools/vxrt_tune.py tunes the game: the scenario it measures, and a ladder of its own (default: the tuner's)",
@@ -53,7 +60,8 @@
     "status": {
       "type": "object", "required": ["state", "summary", "checked", "machine"], "additionalProperties": false,
       "properties": {
-        "state": {"enum": ["works", "partial", "broken", "untested"]},
+        "state": {"enum": ["works", "partial", "broken", "untested"], "description": "works: a playtest found it playable; partial: it runs (level runs or controls); broken: below that"},
+        "level": {"enum": ["starts", "connects", "draws", "runs", "controls", "playable"], "description": "the highest level reached (AGENTS.md): harness runs give up to controls, a playtest gives playable"},
         "summary": {"type": "object", "required": ["ja", "en"], "additionalProperties": false,
                     "properties": {"ja": {"type": "string"}, "en": {"type": "string"}}},
         "checked": {"type": ["string", "null"], "description": "date of the last check (YYYY-MM-DD)"},

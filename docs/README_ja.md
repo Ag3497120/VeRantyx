@@ -138,8 +138,11 @@ MacBook Pro（M1 Max）、2026-10-14 時点:
 /vxrt-games              # 入っているゲーム、動作状況、最新の計測
 /vxrt-support thelab     # 動くようにする: 計測 → VXRuntime を直す → 実行で確かめる
 /vxrt-tune alyx          # 設定だけでこの Mac 向けに調整: 交互の計測 → 起動コマンド
+/vxrt-playtest alyx      # ヘッドセットで遊んでもらい、うまくいかない場所を記録して読み返す
 /vxrt-issue earth        # それでも動かない: 証拠から issue の下書き（投稿はあなただけ）
 ```
+
+**「動く」の基準**: ハーネスの各実行は到達した段階を報告します。`starts`（起動）→ `connects`（SteamVR につながる）→ `draws`（真っ黒でない映像）→ `runs`（場面の最後まで動く）→ `controls`（SteamVR がコントローラーの割り当てを読み込んだ）。最後の段階 `playable`（遊べる）は人だけが決めます。プレイテスト `tools/vxrt_playtest.py <ゲーム>` は、いつもどおりゲームを起動し、遊んでいる間、頭と手の追跡、トリガー・グリップ・ボタン・スティック、fps を毎秒記録します。うまくいかない場面で両スティックを1秒押し込む（またはターミナルで Enter）と、そのときの画面とゲームのログを残します。最後に短いチェックリスト（映像、頭、手、ボタン、移動、メニュー、音）に答えます。映像・頭・手・ボタン・移動がすべて「はい」、コントローラーの入力あり、クラッシュなし、10分以上で playable です。プロファイルが `works` になるのはこのプレイテストの後（`--apply`）だけで、見つかった問題が `/vxrt-support` の次の作業になります。
 
 ゲームはプロファイルのキー、Steam のアプリ ID、フォルダか .exe で指定します。各ツールには、コマンド・vxrt の MCP サーバー・規則（[AGENTS.md](../AGENTS.md)）が、そのツールが読む形（`.claude/`、`.codex/config.toml`、`.gemini/` と `GEMINI.md`、`.cursor/`）で入っています。どれも `tools/vxrt_agents.py` が1つの元（`.agents/commands/`、`.mcp.json`、AGENTS.md）から書き出したものです。手順書は `.agents/skills/` にあります。Codex はプロジェクトを信頼済みにすると `.codex/config.toml` を読みます。
 

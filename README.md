@@ -282,8 +282,23 @@ same in Claude Code, Codex, Gemini CLI and Cursor:
 /vxrt-games              # what is installed, what is known to work, the latest runs
 /vxrt-support thelab     # make a game run: measure, fix VXRuntime, prove it with a run
 /vxrt-tune alyx          # settings only, for this Mac: alternating runs, a launch command
+/vxrt-playtest alyx      # you play it in the headset; it records where it goes wrong, then reads it back
 /vxrt-issue earth        # still failing: an issue draft from the evidence (only you post it)
 ```
+
+**When does a game "work"?** Every harness run reports the level it reached:
+`starts` → `connects` (reaches SteamVR) → `draws` (frames not black) → `runs`
+(the whole scenario) → `controls` (SteamVR loaded bindings for its
+controllers). The last level, `playable`, only a person gives: a playtest,
+`tools/vxrt_playtest.py <game>`, starts the game as you would and records head
+and hand tracking, triggers, grips, buttons, sticks and the frame rate every
+second while you play with your controllers; click both sticks for a second
+(or press Enter in its Terminal) where something goes wrong, and it keeps the
+frame and the game's log at that moment. At the end it asks a short checklist
+(picture, head, hands, buttons, movement, menus, sound). Playable: those five
+yes, controller input seen, no crash, ten minutes or more. A game's profile
+says `works` only after such a playtest (`--apply`); its problems are what
+`/vxrt-support` fixes next.
 
 A game is named by its profile key, Steam app id, or folder/.exe. Each tool
 gets the commands, the vxrt MCP server and the rules ([AGENTS.md](AGENTS.md))

@@ -17,13 +17,14 @@
     }
   },
   "status": {
-    "state": "works",
+    "state": "partial",
     "summary": {
-      "ja": "VR で動作（タイトル画面まで確認、53–58 fps）",
-      "en": "Works in VR (title scene checked, 53–58 fps)"
+      "ja": "VR で動作（タイトル場面 54.1 fps）。プレイテスト待ち",
+      "en": "Runs in VR (title scene, 54.1 fps); playtest pending"
     },
-    "checked": "2026-10-14",
-    "machine": "Apple M1 Max, 32-core GPU"
+    "checked": "2026-10-15",
+    "machine": "Apple M1 Max, 32-core GPU",
+    "level": "controls"
   },
   "baselines": {
     "title": {
@@ -43,5 +44,7 @@
       "since": "2026-10-14"
     }
   ],
-  "notes": []
+  "notes": [
+    "2026-10-15: level controls (20261015T011747Z-thelab-title, VXRT_NO_WINE=1); playable needs a playtest (tools/vxrt_playtest.py 450390)."
+  ]
 }

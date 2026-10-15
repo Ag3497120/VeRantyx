@@ -17,13 +17,14 @@
     }
   },
   "status": {
-    "state": "works",
+    "state": "partial",
     "summary": {
-      "ja": "VR で動作（地形とラベル）",
-      "en": "Works in VR (terrain and labels)"
+      "ja": "VR で動作（地形とラベル、56.7 fps）。プレイテスト待ち",
+      "en": "Runs in VR (terrain and labels, 56.7 fps); playtest pending"
     },
-    "checked": "2026-10-13",
-    "machine": "Apple M1 Max, 32-core GPU"
+    "checked": "2026-10-15",
+    "machine": "Apple M1 Max, 32-core GPU",
+    "level": "controls"
   },
   "baselines": {
     "start": {
@@ -40,6 +41,7 @@
     }
   ],
   "notes": [
-    "OpenGL (to macOS's OpenGL); needs network access for map tiles."
+    "OpenGL (to macOS's OpenGL); needs network access for map tiles.",
+    "2026-10-15: level controls (20261015T011513Z-earth-start, VXRT_NO_WINE=1); playable needs a playtest (tools/vxrt_playtest.py 348250)."
   ]
 }

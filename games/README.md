@@ -6,7 +6,9 @@ by `tools/vxrt_games.py check` (part of `make -C VXRuntime check`). The harness 
 
 A profile says how the game starts (`launcher`, `scenarios` with their arguments and length), the settings it needs
 (`settings`, only AGENTS.md's tunables), what a run must show (`baselines`, per scenario or `scenario@quality`), its
-state (`status`), and what is known (`known_issues` with their GitHub issues, `notes`).
+state (`status`, with the `level` reached: starts, connects, draws, runs, controls from harness runs; playable only
+from a person's playtest, `tools/vxrt_playtest.py`, recorded in `playtests`), and what is known (`known_issues` with
+their GitHub issues, `notes`). `works` means a playtest found it playable.
 
 Adding a game or changing what is known about one is a pull request anyone can make, usually with an AI coding tool:
 
