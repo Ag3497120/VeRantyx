@@ -6,6 +6,7 @@
 #include "../x86dec.h"
 #include "../xlat.h"
 #include "difftest.h"
+#include "../engine.h"
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -291,7 +292,36 @@ static void rex_rr(int w, int reg, int rm, int force) {
     if (rex != 0x40 || force) *pp++ = (uint8_t)rex;
 }
 static int flags_clean;                              // the flags conditions read are all defined
+// Scalar SSE: MOVSS / MOVSD loads, arithmetic on registers and memory, XORPS x, x, register moves, and forms that
+// write the whole register (MOVAPS, ADDPS, CVTSS2SD): the engine tracks which registers are zero above lane 0.
+static void sse_insn(void) {
+    static const int xr[] = { 0, 1, 2, 9 };              // (few registers: loads, arithmetic and moves meet often)
+    int x = xr[rnd() % 4], y = xr[rnd() % 4], pf = (rnd() & 1) ? 0xF3 : 0xF2;
+    static const uint8_t arith[] = { 0x58, 0x59, 0x5C, 0x5E, 0x51, 0x5D, 0x5F };
+    if (rnd() % 3 == 0) {                                // a chain on one register: a load, then arithmetic on it
+        *pp++ = (uint8_t)pf; rex_rr(0, x, 3, 0); *pp++ = 0x0F; *pp++ = 0x10; *pp++ = (uint8_t)(0x43 | (x & 7) << 3); *pp++ = (uint8_t)(rnd() % 120);
+        for (int m = 1 + (int)(rnd() % 3); m > 0; m--) {
+            int p2 = (rnd() % 4) ? pf : pf ^ 0xF3 ^ 0xF2, o = arith[rnd() % 7];
+            if (rnd() % 5 == 0) { rex_rr(0, x, y, 0); *pp++ = 0x0F; *pp++ = 0x28; *pp++ = (uint8_t)(0xC0 | (x & 7) << 3 | (y & 7)); }   // (MOVAPS: unknown again)
+            *pp++ = (uint8_t)p2;
+            if (rnd() & 1) { rex_rr(0, x, y, 0); *pp++ = 0x0F; *pp++ = (uint8_t)o; *pp++ = (uint8_t)(0xC0 | (x & 7) << 3 | (y & 7)); }
+            else { rex_rr(0, x, 3, 0); *pp++ = 0x0F; *pp++ = (uint8_t)o; *pp++ = (uint8_t)(0x43 | (x & 7) << 3); *pp++ = (uint8_t)(rnd() % 120); }
+        }
+        return;
+    }
+    switch (rnd() % 8) {
+    case 0: case 1: *pp++ = (uint8_t)pf; rex_rr(0, x, 3, 0); *pp++ = 0x0F; *pp++ = 0x10; *pp++ = (uint8_t)(0x43 | (x & 7) << 3); *pp++ = (uint8_t)(rnd() % 120); break;
+    case 2: case 3: *pp++ = (uint8_t)pf; rex_rr(0, x, y, 0); *pp++ = 0x0F; *pp++ = arith[rnd() % 7]; *pp++ = (uint8_t)(0xC0 | (x & 7) << 3 | (y & 7)); break;
+    case 4: *pp++ = (uint8_t)pf; rex_rr(0, x, 3, 0); *pp++ = 0x0F; *pp++ = arith[rnd() % 7]; *pp++ = (uint8_t)(0x43 | (x & 7) << 3); *pp++ = (uint8_t)(rnd() % 120); break;
+    case 5: rex_rr(0, x, x, 0); *pp++ = 0x0F; *pp++ = 0x57; *pp++ = (uint8_t)(0xC0 | (x & 7) << 3 | (x & 7)); break;
+    case 6: *pp++ = (uint8_t)pf; rex_rr(0, x, y, 0); *pp++ = 0x0F; *pp++ = (rnd() & 1) ? 0x10 : 0x11; *pp++ = (uint8_t)(0xC0 | (x & 7) << 3 | (y & 7)); break;
+    case 7: { static const uint8_t whole[] = { 0x28, 0x58, 0x5A }; int o = whole[rnd() % 3];
+              if (o == 0x5A) *pp++ = (uint8_t)pf;
+              rex_rr(0, x, y, 0); *pp++ = 0x0F; *pp++ = (uint8_t)o; *pp++ = (uint8_t)(0xC0 | (x & 7) << 3 | (y & 7)); break; }
+    }
+}
 static void body_insn(int no_rcx) {
+    if (rnd() % 4 == 0) { sse_insn(); return; }
     int k = (int)(rnd() % 13), w = (int)(rnd() & 1), a = preg(no_rcx), c = preg(no_rcx);
     static const uint8_t alu[] = { 0x01, 0x09, 0x11, 0x19, 0x21, 0x29, 0x31, 0x39, 0x85 };
     switch (k) {
@@ -317,6 +347,50 @@ static void clean_flags(void) {                      // CMP r, r: every flag def
     int a = preg(0), c = preg(0);
     rex_rr(1, c, a, 0); *pp++ = 0x39; *pp++ = (uint8_t)(0xC0 | (c & 7) << 3 | (a & 7)); flags_clean = 1;
 }
+// A CMP / TEST / SUB / AND / OR / XOR of 8 to 64 bits (registers, AH-BH, an immediate, RBX-based memory) for a Jcc right
+// after it: the engine takes such a Jcc's condition from the operands when nothing else reads the flags.
+static void fusable(void) {
+    int a = preg(0), c = preg(0), k = (int)(rnd() % 6), sz = (int)(rnd() % 4);   // (k: CMP TEST SUB AND OR XOR; sz: 8 16 32 64)
+    static const uint8_t rr[] = { 0x38, 0x84, 0x28, 0x20, 0x08, 0x30 }, grp[] = { 7, 0, 5, 4, 1, 6 }, acc[] = { 0x3C, 0xA8, 0x2C, 0x24, 0x0C, 0x34 };
+    int imm = sz == 0 ? 1 : sz == 1 ? 2 : 4;
+    if (sz == 1) *pp++ = 0x66;
+    switch (rnd() % 4) {
+    case 0:                                                          // r/m, r
+        if (sz == 0 && k < 2 && (rnd() & 1)) { *pp++ = rr[k]; *pp++ = (uint8_t)(0xC0 | (rnd() % 8) << 3 | (rnd() % 8)); break; }   // (AH-BH)
+        rex_rr(sz == 3, c, a, sz == 0); *pp++ = (uint8_t)(rr[k] | (sz ? 1 : 0)); *pp++ = (uint8_t)(0xC0 | (c & 7) << 3 | (a & 7)); break;
+    case 1: {                                                        // r/m, imm (group 1, F6/F7 TEST)
+        int op = k == 1 ? (sz ? 0xF7 : 0xF6) : sz == 0 ? 0x80 : (rnd() & 1) ? 0x83 : 0x81;
+        rex_rr(sz == 3, 0, a, sz == 0); *pp++ = (uint8_t)op; *pp++ = (uint8_t)(0xC0 | grp[k] << 3 | (a & 7));
+        int n = op == 0x83 || op == 0x80 || op == 0xF6 ? 1 : imm;
+        for (int i = 0; i < n; i++) *pp++ = (uint8_t)rnd();
+        break; }
+    case 2:                                                          // AL / AX / EAX / RAX, imm
+        if (sz == 3) *pp++ = 0x48;
+        *pp++ = (uint8_t)(acc[k] | (sz ? 1 : 0));
+        for (int i = 0; i < imm; i++) *pp++ = (uint8_t)rnd();
+        break;
+    case 3:                                                          // CMP / TEST with memory (either side for CMP)
+        rex_rr(sz == 3, c, 3, sz == 0);
+        *pp++ = (uint8_t)((k == 1 ? 0x84 : (rnd() & 1) ? 0x3A : 0x38) | (sz ? 1 : 0));
+        *pp++ = (uint8_t)(0x43 | (c & 7) << 3); *pp++ = (uint8_t)(rnd() % 120);
+        break;
+    }
+    flags_clean = 1;
+}
+// 0-2 instructions without flags between such a CMP and its Jcc: LEA, MOV, MOVZX (fused across), a load (not fused)
+static void between(void) {
+    for (int m = (int)(rnd() % 3); m > 0; m--) {
+        int a = preg(0), c = preg(0), w = (int)(rnd() & 1);
+        switch (rnd() % 5) {
+        case 0: { int x = preg(0); *pp++ = (uint8_t)(0x40 | w << 3 | (a >> 3) << 2 | (x >> 3) << 1 | (c >> 3)); *pp++ = 0x8D;
+                  *pp++ = (uint8_t)(0x44 | (a & 7) << 3); *pp++ = (uint8_t)((rnd() % 4) << 6 | (x & 7) << 3 | (c & 7)); *pp++ = (uint8_t)rnd(); break; }
+        case 1: rex_rr(w, c, a, 0); *pp++ = 0x89; *pp++ = (uint8_t)(0xC0 | (c & 7) << 3 | (a & 7)); break;
+        case 2: rex_rr(0, 0, a, 0); *pp++ = (uint8_t)(0xB8 | (a & 7)); { uint32_t v = (uint32_t)rnd(); memcpy(pp, &v, 4); pp += 4; } break;
+        case 3: rex_rr(w, a, c, 1); *pp++ = 0x0F; *pp++ = (uint8_t)(0xB6 | (rnd() & 1) << 3 | (rnd() & 1)); *pp++ = (uint8_t)(0xC0 | (a & 7) << 3 | (c & 7)); break;
+        case 4: rex_rr(w, a, 3, 0); *pp++ = 0x8B; *pp++ = (uint8_t)(0x43 | (a & 7) << 3); *pp++ = (uint8_t)(rnd() % 120); break;
+        }
+    }
+}
 typedef struct { uint8_t *at; int target; } fixup;      // a rel32 at `at` to block `target` (-1: the function, -2: the end)
 static void make_program(dt_case *c) {
     memset(c, 0, sizeof *c);
@@ -325,6 +399,12 @@ static void make_program(dt_case *c) {
     c->in.mxcsr = 0x1F80;
     for (int i = 0; i < 16; i++) c->in.gpr[i] = rnd_value();
     for (int i = 0; i < DT_BUF_SIZE; i++) c->mem[i] = (uint8_t)rnd();
+    for (int k = 0; k < 24; k++) {                       // (special floats where the loads read: [RBX + 0..127])
+        static const uint32_t f32[] = { 0, 0x80000000u, 0x7F800000u, 0xFF800000u, 0x7FC00001u, 0x7F800003u, 0x3F800000u, 0x00000005u, 0xFFC00000u };
+        static const uint64_t f64[] = { 0, 0x8000000000000000ull, 0x7FF0000000000000ull, 0xFFF0000000000000ull, 0x7FF8000000000001ull, 0x7FF0000000000007ull, 0x3FF0000000000000ull, 5 };
+        int at = 1024 + (int)(rnd() % 120);
+        if (rnd() & 1) memcpy(c->mem + at, &f32[rnd() % 9], 4); else memcpy(c->mem + at, &f64[rnd() % 8], 8);
+    }
     c->in.gpr[4] = DT_STACK; c->in.gpr[3] = DT_BUF + 1024;
     c->in.flags = (rnd() & 0x8D5) | 0x202;
     flags_clean = 1;
@@ -333,9 +413,10 @@ static void make_program(dt_case *c) {
     uint8_t *start[8]; fixup fx[64]; int nfx = 0;
     for (int i = 0; i < nb; i++) {
         start[i] = pp;
+        if (rnd() & 1) { int a = preg(0), c = preg(0); rex_rr(1, c, a, 0); *pp++ = 0x29 | (rnd() & 1) << 4; *pp++ = (uint8_t)(0xC0 | (c & 7) << 3 | (a & 7)); }   // (SUB / CMP first: flags dead on the way in)
         int n = 1 + (int)(rnd() % 4);
         for (int k = 0; k < n; k++) body_insn(0);
-        int kind = (int)(rnd() % 9);
+        int kind = (int)(rnd() % 11);
         if (i == nb - 1) kind = 0;
         clean_flags();                                       // (every block ends with defined flags: any path may jump on)
         switch (kind) {
@@ -353,6 +434,7 @@ static void make_program(dt_case *c) {
                   *pp++ = 0xE2; *pp = (uint8_t)(int8_t)(top - (pp + 1)); pp++; break; }
         case 7: { clean_flags(); *pp++ = (uint8_t)(0x70 | (rnd() % 16)); uint8_t *rel = pp++; uint8_t *from = pp;   // Jcc rel8 over one
                   body_insn(0); *rel = (uint8_t)(pp - from); flags_clean = 0; clean_flags(); break; }
+        case 9: case 10: fusable(); between(); *pp++ = 0x0F; *pp++ = (uint8_t)(0x80 | (rnd() % 16)); fx[nfx++] = (fixup){ pp, i + 1 + (int)(rnd() % (unsigned)(nb - i)) }; pp += 4; break;
         case 8: { clean_flags(); *pp++ = (uint8_t)(0xE0 + rnd() % 4); uint8_t *rel = pp++; uint8_t *from = pp;   // LOOPcc/JRCXZ over one
                   body_insn(0); *rel = (uint8_t)(pp - from); flags_clean = 0; clean_flags(); break; }
         }
@@ -405,7 +487,7 @@ static int run_translated(const dt_case *c, const x86_insn *d, dt_result *r) {
     r->out.fcw = ctx.fcw; r->out.fsw = ctx.fsw; r->out.ftag = ctx.ftag;
     for (int i = 0; i < 8; i++) memcpy(r->out.st[i], ctx.st[(ctx.fsw >> 11 & 7) + i & 7], 10);
     r->out.flags = ctx.flags;
-    r->out.fault = signaled ? 2 : ctx.fault == X86_FAULT_DE ? 1 : 0;
+    r->out.fault = signaled ? 2 : ctx.fault == X86_FAULT_DE ? 1 : ctx.fault ? 2 : 0;   // (other x86 exceptions: signals in the reference)
     if (r->out.fault) { memcpy(r->out.gpr, c->in.gpr, sizeof ctx.gpr); r->out.flags = c->in.flags; }
     memcpy(r->mem, (void *)DT_BUF, DT_BUF_SIZE);
     return 0;
@@ -415,6 +497,9 @@ static int run_translated(const dt_case *c, const x86_insn *d, dt_result *r) {
 typedef struct { const char *name; uint8_t pf, op; uint64_t kind; int group; int mem; int map; } sse_form;
 #define K_MODEL (1ull << 32)   // Rosetta 2 lacks it (SIGILL): checked against model() instead
 #define K_RAND (1ull << 33)    // a random value (RDRAND, RDSEED): its register is not compared
+#define K_RAW (1ull << 34)     // fixed bytes: group = length, map = the bytes (little-endian)
+#define K_TSC (1ull << 35)     // RDTSC(P): RAX, RDX (and RCX) are the time, not compared
+#define K_CPUID (1ull << 36)   // CPUID: EAX a leaf Rosetta 2 knows (or one past), ECX a subleaf
 // kind bits: reg / rm are general registers, an imm8, register-only, REX.W variants, 16-byte aligned memory;
 // VEX: encoded with VEX, VEX.vvvv not used (1111), used only between registers, 256 bits allowed, only 256 bits,
 // no ModRM, imm8[7:4] a register
@@ -581,6 +666,9 @@ static const sse_form sse_forms[] = {
     S4("aeskeygenassist", 0xDF, 3, K_ALIGN | K_IMM, VN | K_IMM, 16),
     { "crc32 r, r/m8", 0xF2, 0xF0, K_GREG | K_GRM | K_W, -1, 1, 2 }, { "crc32 r, r/m", 0xF2, 0xF1, K_GREG | K_GRM | K_W, -1, 4, 2 },
     { "movbe r, m", 0, 0xF0, K_GREG | K_GRM | K_MEMONLY | K_W, -1, 4, 2 }, { "movbe m, r", 0, 0xF1, K_GREG | K_GRM | K_MEMONLY | K_W, -1, 4, 2 },
+    { "int3", 0, 0, K_RAW, 1, 0, 0xCC }, { "int 29h", 0, 0, K_RAW, 2, 0, 0x29CD }, { "ud2", 0, 0, K_RAW, 2, 0, 0x0B0F },
+    { "cpuid", 0, 0, K_RAW | K_CPUID, 2, 0, 0xA20F }, { "xgetbv", 0, 0, K_RAW, 3, 0, 0xD0010F },
+    { "rdtsc", 0, 0, K_RAW | K_TSC, 2, 0, 0x310F }, { "rdtscp", 0, 0, K_RAW | K_TSC, 3, 0, 0xF9010F },
     { "rdrand", 0, 0xC7, K_GRM | K_REGONLY | K_W | K_RAND, 6, 0 }, { "rdseed", 0, 0xC7, K_GRM | K_REGONLY | K_W | K_RAND, 7, 0 },
     { "adcx", 0x66, 0xF6, K_GREG | K_GRM | K_W | K_MODEL, -1, 4, 2 }, { "adox", 0xF3, 0xF6, K_GREG | K_GRM | K_W | K_MODEL, -1, 4, 2 },
     S4("aesimc", 0xDB, 2, K_ALIGN, VN, 16), S4("aesenc", 0xDC, 2, K_ALIGN, V, 16), S4("aesenclast", 0xDD, 2, K_ALIGN, V, 16),
@@ -1002,6 +1090,17 @@ static void make_sse_case(const sse_form *f, dt_case *c) {
     c->in.mxcsr = modes[rnd() % 10] | (rnd() % 4 == 0 ? (uint32_t)(rnd() & 0x3F) : 0);
     if (getenv("DT_MXCSR")) c->in.mxcsr = (uint32_t)strtoul(getenv("DT_MXCSR"), NULL, 0);   // (one mode only)
     rnd_x87(&c->in);
+    if (f->kind & K_RAW) {                                                  // (fixed bytes)
+        for (int i = 0; i < f->group; i++) c->code[i] = (uint8_t)(f->map >> (8 * i));
+        c->len = (uint32_t)f->group;
+        if (f->kind & K_CPUID) {
+            static const uint32_t leaves[] = { 0, 1, 2, 4, 6, 7, 0xB, 0xD, 0x80000000u, 0x80000001u, 0x80000002u, 0x80000003u, 0x80000004u, 0x80000006u, 0x80000008u };
+            c->in.gpr[0] = rnd() % 8 ? leaves[rnd() % 15] : (uint32_t)rnd() % 0x20;
+            c->in.gpr[1] = rnd() % 4;
+        }
+        if (c->code[1] == 0x01 && c->code[2] == 0xD0 && rnd() % 4) c->in.gpr[1] = 0;   // (XGETBV: mostly XCR0)
+        return;
+    }
     if (f->kind & K_STR) {                                                  // (strings: a few letters, zeros, small lengths)
         static const uint8_t letters[8] = { 0, 'a', 'b', 'c', 'd', 0x80, 0xFF, 'a' };
         for (int i = 0; i < 16; i++) for (int k = 0; k < 16; k++) c->in.xmm[i][k] = rnd() % 4 ? letters[1 + rnd() % 4] : letters[rnd() % 8];
@@ -1115,10 +1214,9 @@ static void make_sse_case(const sse_form *f, dt_case *c) {
 }
 
 static uint32_t *jit_prog;
+static xe *engine;                                                         // (programs run on the engine: engine.c)
 static int run_program(const dt_case *c, dt_result *r) {
     memcpy((void *)DT_PROG, c->prog, c->prog_len);
-    struct { uint64_t rip; uint32_t *fn; } cache[256]; int ncache = 0;
-    size_t used = 0;
     static x86_ctx ctx;
     memset(&ctx, 0, sizeof ctx);
     memcpy(ctx.gpr, c->in.gpr, sizeof ctx.gpr);
@@ -1129,25 +1227,9 @@ static int run_program(const dt_case *c, dt_result *r) {
     ctx.rip = DT_PROG;
     memcpy((void *)DT_BUF, c->mem, DT_BUF_SIZE);
     signaled = 0;
-    int steps = 0;
-    if (!sigsetjmp(jb, 1)) {
-        while (ctx.rip != DT_END && !ctx.fault && steps++ < 10000) {
-            if (ctx.rip < DT_PROG || ctx.rip >= DT_END) { signaled = SIGSEGV; break; }
-            uint32_t *fn = NULL;
-            for (int i = 0; i < ncache; i++) if (cache[i].rip == ctx.rip) fn = cache[i].fn;
-            if (!fn) {
-                xlat_buf b = { 0 };
-                if (xlat_block(&b, ctx.rip, 64) < 0) { free(b.code); return -1; }
-                if (ncache == 256 || used + b.n > (4u << 20) / 4) { free(b.code); return -1; }
-                fn = jit_prog + used;
-                pthread_jit_write_protect_np(0); memcpy(fn, b.code, b.n * 4); pthread_jit_write_protect_np(1);
-                sys_icache_invalidate(fn, b.n * 4);
-                used += b.n; free(b.code);
-                cache[ncache].rip = ctx.rip; cache[ncache++].fn = fn;
-            }
-            ((void (*)(x86_ctx *))fn)(&ctx);
-        }
-    }
+    xe_flush(engine);                                                      // (each program is new code at DT_PROG)
+    if (!sigsetjmp(jb, 1)) { if (xe_run(engine, &ctx, DT_END) < 0) return -1; }
+    else __asm__ volatile("msr fpcr, xzr");                               // (left translated code by a signal)
     memcpy(r->out.gpr, ctx.gpr, sizeof ctx.gpr);
     memcpy(r->out.xmm, ctx.xmm, sizeof ctx.xmm); memcpy(r->out.ymm_hi, ctx.ymm_hi, sizeof ctx.ymm_hi);
     r->out.mxcsr = ctx.mxcsr;
@@ -1175,6 +1257,7 @@ int main(int argc, char **argv) {
     struct sigaction sa = { .sa_handler = on_signal };
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL);
+    engine = xe_new(getenv("DT_ORDERED") != NULL);                         // (after: its handler passes the rest on)
 
     int to_ref[2], from_ref[2];
     if (pipe(to_ref) || pipe(from_ref)) return 1;
@@ -1185,7 +1268,7 @@ int main(int argc, char **argv) {
     posix_spawn_file_actions_addclose(&fa, to_ref[1]);
     posix_spawn_file_actions_addclose(&fa, from_ref[0]);
     pid_t pid;
-    char *args[] = { "/usr/bin/arch", "-x86_64", argv[1], NULL };
+    char *args[] = { "/usr/bin/arch", "-x86_64", "-e", "ROSETTA_ADVERTISE_AVX=1", argv[1], NULL };   // (its CPUID: ours)
     if (posix_spawn(&pid, "/usr/bin/arch", &fa, NULL, args, environ)) { perror("spawn"); return 1; }
     close(to_ref[0]); close(from_ref[1]);
     FILE *out = fdopen(to_ref[1], "wb"), *in = fdopen(from_ref[0], "rb");
@@ -1279,8 +1362,11 @@ int main(int argc, char **argv) {
             if ((f->kind & K_FMA) && !want.out.fault && (got.out.mxcsr & ~(want.out.mxcsr | 2u)) == 1) {
                 fma_ie++; want.out.mxcsr |= 1;                            // (IE: ours alone)
             }
-            if ((f->kind & K_BOTHF) && !want.out.fault && want.out.mxcsr != got.out.mxcsr && (want.out.mxcsr & got.out.mxcsr) == got.out.mxcsr) {
-                rosetta_deviations++; dv[DV_BOTHF]++; want.out.mxcsr = got.out.mxcsr;   // (Rosetta's flags: ours and more)
+            if ((f->kind & K_BOTHF) && !want.out.fault && want.out.mxcsr != got.out.mxcsr) {
+                uint32_t ours = got.out.mxcsr, tiny = (ours & ~want.out.mxcsr) == 0x10 ? 0x10 : 0;   // (with ours' UE as well:
+                if ((want.out.mxcsr & (ours & ~tiny)) == (ours & ~tiny)) {                         //  both known, in two lanes)
+                    rosetta_deviations++; dv[DV_BOTHF]++; if (tiny) ue_tiny++; want.out.mxcsr = got.out.mxcsr;   // (Rosetta's flags:
+                }                                                                                  //  ours and more)
             }
             if ((f->kind & K_MODEL) && want.out.fault == 2) { model(f, &c, &d, &want); modeled++; }
             if ((f->kind & K_RAND) && want.out.fault == 2) {                // (RDSEED: Rosetta 2 has none: x86's result, the value aside)
@@ -1289,6 +1375,7 @@ int main(int argc, char **argv) {
                 if (!(d.rex & 8)) want.out.gpr[d.rm] = (uint32_t)got.out.gpr[d.rm];
             }
             if ((f->kind & K_RAND) && !want.out.fault) want.out.gpr[d.rm] = got.out.gpr[d.rm];
+            if ((f->kind & K_TSC) && !want.out.fault) { want.out.gpr[0] = got.out.gpr[0]; want.out.gpr[2] = got.out.gpr[2]; if (c.len == 3) want.out.gpr[1] = got.out.gpr[1]; }
             int excusable = !want.out.fault && !got.out.fault && fz_single_case(&c, &d, &want, &got);
             if ((f->kind & K_ALIAS) && want.out.fault == 2 && !got.out.fault) { rosetta_deviations++; dv[DV_ALIAS]++; continue; }
             if ((f->kind & K_X87) && f->op == 0xDF && f->group == 4 && (c.in.ftag >> (((c.in.fsw >> 11) - 1) & 7) & 1)) { rosetta_deviations++; dv[DV_FBLD]++; continue; }   // (FBLD: Rosetta 2 does not check for a stack overflow)
@@ -1451,6 +1538,14 @@ int main(int argc, char **argv) {
         nforms++;
     }
     fclose(out); fclose(in);
+    if (getenv("DT_ENGINE")) {
+        xe_stats st = xe_get_stats(engine);
+        printf("  engine: %llu blocks, %llu branches linked, %llu entries from C, %llu flushes, %llu x86 bytes -> %llu ARM instructions, %llu split accesses patched, "
+               "flags not computed for %llu instructions, %llu Jccs fused\n",
+               (unsigned long long)st.blocks, (unsigned long long)st.linked, (unsigned long long)st.entries, (unsigned long long)st.flushes,
+               (unsigned long long)st.x86_bytes, (unsigned long long)st.arm_insns, (unsigned long long)st.split_patches,
+               (unsigned long long)st.flags_skipped, (unsigned long long)st.fused);
+    }
     if (getenv("DT_DEVIATIONS")) for (int k = 0; k < DV_N; k++) if (dv[k]) printf("  Rosetta 2 deviation: %-45s %ld\n", dv_name[k], dv[k]);
     printf("x86 -> ARM64 vs Rosetta: %d forms, %ld cases: %ld forms match, %ld differ (%ld cases)%s; %ld cases skipped where Rosetta deviates from x86; ours known to: %ld (FTZ at 2^-126), %ld (UE, tiny before rounding), %ld (FMA's invalid for 0 * inf + QNaN), %ld (FTZ or DAZ alone, with denormals); x87 transcendentals 1 ulp from Rosetta's (or C1): %ld, undefined inputs: %ld; checked against a model (Rosetta lacks them): %ld\n",
            nforms, total, forms_ok, forms_bad, bad_total, unsupported ? " (some not translated)" : "", rosetta_deviations, ftz_boundary, ue_tiny, fma_ie, fz_single, trans_ulp, trans_undef, modeled);

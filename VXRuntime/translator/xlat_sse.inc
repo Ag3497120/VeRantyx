@@ -16,10 +16,25 @@ enum { V_B = 16, V_R = 17, V_T = 18, V_U = 19, V_W = 20, V_X = 21 };
 static uint32_t a64_dup2d(int d, int n) { return 0x4E080C00u | (uint32_t)n << 5 | (uint32_t)d; }
 static uint32_t a64_ins_h(int d, int i, int n, int j) { return 0x6E000400u | (uint32_t)((i << 2) | 2) << 16 | (uint32_t)(j << 1) << 11 | (uint32_t)n << 5 | (uint32_t)d; }
 static void patch_bcond(xlat_buf *b, size_t at, int cond) { b->code[at] = a64_bcond(cond, (int32_t)(b->n - at)); }
+// The code after the branch at `at` (kind 0: taken on V, 1: on S0 zero), to here, moves after the block (xlat_cold_flush):
+// it must not branch nor hold a site.
+static void cold_from(xlat_buf *b, size_t at, int kind) {
+    if (b->ncold == b->ccold) { b->ccold = b->ccold ? b->ccold * 2 : 16; b->cold = realloc(b->cold, b->ccold * sizeof *b->cold); }
+    size_t n = b->n - (at + 1);
+    uint32_t *w = malloc(n * 4 + 4);
+    memcpy(w, b->code + at + 1, n * 4);
+    b->cold[b->ncold++] = (struct cold){ at, kind, w, n };
+    b->n = at + 1;
+}
 
 // The r/m operand as an XMM register number: the register itself, or V_B loaded from memory (size bytes: 2, 4, 8, 16).
 static int xmm_rm(xlat_buf *b, const x86_insn *d, int size, uint64_t next) {
     if (d->mod == 3) return d->rm;
+    if (size >= 4 && !(d->prefixes & X86_P_VEX)) {                       // (VEX code may count on T_ADDR after)
+        int32_t off; int n = ea_fold(b, d, next, size, &off);
+        E(b, a64_ldv_off(size, V_B, n, off));
+        return V_B;
+    }
     ea(b, d, next, 0);
     E(b, size == 16 ? a64_ldrq(V_B, T_ADDR, 0) : size == 8 ? a64_ldrd(V_B, T_ADDR, 0) : size == 2 ? a64_ldrh_v(V_B, T_ADDR, 0) : a64_ldrs(V_B, T_ADDR, 0));
     return V_B;
@@ -43,7 +58,9 @@ static void nan_fixn(xlat_buf *b, int dbl, int scalar, const int *ops, int n, in
         ISNAN(V_T, ops[i]); E(b, a64_vorr(V_U, ops[i], V_W)); E(b, a64_vbsl(V_T, V_U, V_X)); E(b, a64_vmov(V_X, V_T));
     }
     #undef ISNAN
-    E(b, a64_vmov(r, V_X));
+    if (scalar) E(b, dbl ? a64_fmov_dd(r, V_X) : a64_fmov_ss(r, V_X));   // (lane 0; the rest zero, as known when r is the
+    else E(b, a64_vmov(r, V_X));                                          //  destination itself: xlat_buf's zhi)
+    if (b->defer_cold) { cold_from(b, skip, scalar ? 0 : 1); return; }
     if (scalar) patch_bcond(b, skip, VC); else patch_cbz(b, skip, 1, S0);
 }
 // r = a op src (src < 0: unary)
@@ -184,15 +201,20 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
         if (op == 0x10) {
             if (!scalar) { int s = xmm_rm(b, d, 16, next); E(b, a64_vmov(x, s)); }
             else if (d->mod == 3) E(b, pf == 0xF2 ? a64_ins_d(x, 0, d->rm, 0) : a64_ins_s(x, 0, d->rm, 0));
-            else { int s = xmm_rm(b, d, esz, next); E(b, a64_vmov(x, s)); }   // (from memory: upper lanes zeroed)
+            else if (!(d->prefixes & X86_P_VEX)) { int32_t off; int n = ea_fold(b, d, next, esz, &off); E(b, a64_ldv_off(esz, x, n, off)); }   // (from memory:
+            else { ea(b, d, next, 0); E(b, esz == 8 ? a64_ldrd(x, T_ADDR, 0) : a64_ldrs(x, T_ADDR, 0)); }                                 //  the rest zeroed)
         } else if (d->mod == 3) {
             if (!scalar) E(b, a64_vmov(d->rm, x));
             else E(b, pf == 0xF2 ? a64_ins_d(d->rm, 0, x, 0) : a64_ins_s(d->rm, 0, x, 0));
-        } else { ea(b, d, next, 0); E(b, esz == 16 ? a64_strq(x, T_ADDR, 0) : esz == 8 ? a64_strd(x, T_ADDR, 0) : a64_strs(x, T_ADDR, 0)); }
+        } else if (!(d->prefixes & X86_P_VEX)) { int32_t off; int n = ea_fold(b, d, next, esz, &off); E(b, a64_stv_off(esz, x, n, off)); }
+        else { ea(b, d, next, 0); E(b, esz == 16 ? a64_strq(x, T_ADDR, 0) : esz == 8 ? a64_strd(x, T_ADDR, 0) : a64_strs(x, T_ADDR, 0)); }
         return 0;
     }
     case 0x28: { int s = xmm_rm(b, d, 16, next); E(b, a64_vmov(x, s)); return 0; }                 // MOVAPS/PD
-    case 0x29: if (d->mod == 3) E(b, a64_vmov(d->rm, x)); else { ea(b, d, next, 0); E(b, a64_strq(x, T_ADDR, 0)); } return 0;
+    case 0x29: if (d->mod == 3) E(b, a64_vmov(d->rm, x));
+        else if (!(d->prefixes & X86_P_VEX)) { int32_t off; int n = ea_fold(b, d, next, 16, &off); E(b, a64_stv_off(16, x, n, off)); }
+        else { ea(b, d, next, 0); E(b, a64_strq(x, T_ADDR, 0)); }
+        return 0;
     case 0x2B: case 0xE7:                                                 // MOVNTPS/PD MOVNTDQ (the hint is dropped)
         if (d->mod == 3 || scalar || (op == 0xE7 && pf != 0x66)) return -1;
         ea(b, d, next, 0); E(b, a64_strq(x, T_ADDR, 0)); return 0;
@@ -243,6 +265,16 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
             else E(b, dbl ? a64_fsqrt2d(V_R, s) : a64_fsqrt4s(V_R, s));
             E(b, a64_vmov(22, s));                                        // (nan_fix uses V_T to V_X)
             nan_fix(b, dbl, scalar, 22, -1, V_R);
+        } else if (scalar && (b->zhi[dbl] >> x & 1)) {                 // (the rest of x known zero: the result straight into
+            E(b, a64_vmov(V_R, x));                                       //  it, a copy of x for NaNs off the dependency chain)
+            switch (op) {
+            case 0x58: E(b, dbl ? a64_faddd(x, x, s) : a64_fadds(x, x, s)); break;
+            case 0x59: E(b, dbl ? a64_fmuld(x, x, s) : a64_fmuls(x, x, s)); break;
+            case 0x5C: E(b, dbl ? a64_fsubd(x, x, s) : a64_fsubs(x, x, s)); break;
+            case 0x5E: E(b, dbl ? a64_fdivd(x, x, s) : a64_fdivs(x, x, s)); break;
+            }
+            nan_fix(b, dbl, scalar, V_R, s == x ? V_R : s, x);
+            return 0;
         } else if (scalar) {
             switch (op) {
             case 0x58: E(b, dbl ? a64_faddd(V_R, x, s) : a64_fadds(V_R, x, s)); break;

@@ -102,15 +102,33 @@ build/x86dec_check: translator/x86dec.c translator/x86dec.h translator/x86dec_ch
 build/ref_x86: translator/diff/ref_x86.c translator/diff/difftest.h
 	@mkdir -p build
 	$(CC) -arch x86_64 -O1 -Wall -o $@ translator/diff/ref_x86.c
-build/difftest: translator/diff/difftest.c translator/diff/difftest.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h translator/x87.c translator/x87.h
+build/difftest: translator/diff/difftest.c translator/diff/difftest.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h translator/x87.c translator/x87.h translator/engine.c translator/engine.h translator/cpuid_table.h
 	@mkdir -p build
-	$(HOSTCC) -Wno-missing-field-initializers translator/x86dec.c translator/xlat.c translator/x87.c translator/diff/difftest.c -o $@
+	$(HOSTCC) -Wno-missing-field-initializers translator/x86dec.c translator/xlat.c translator/x87.c translator/engine.c translator/diff/difftest.c -o $@
 # translator coverage over the installed games' PEs (every function in .pdata): `make coverage`
-build/coverage: translator/coverage.c translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h translator/x87.c translator/x87.h
+build/coverage: translator/cpuid_table.h translator/coverage.c translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h translator/x87.c translator/x87.h
 	@mkdir -p build
 	$(HOSTCC) -Wno-missing-field-initializers -Itranslator translator/coverage.c translator/x86dec.c translator/xlat.c translator/x87.c -o $@
 coverage: build/coverage
 	python3 translator/coverage.py build/coverage $(HOME)/Verantyx_VR_Drive/vxrt_steam/steamapps/common
+# the engine against Rosetta 2 and native ARM64 on the same kernels: `make xlat-bench`
+BENCH_X86 = -arch x86_64 -O2 -fno-stack-protector -ffreestanding -fno-builtin -fno-vectorize
+build/bench_kernels_x86.o: translator/bench/kernels.c
+	@mkdir -p build
+	$(CC) $(BENCH_X86) -c $< -o $@
+build/bench_image: build/bench_kernels_x86.o
+	ld -arch x86_64 -preload -e _start -segaddr __TEXT 0x500000000 $< -o $@
+build/bench_rosetta: build/bench_kernels_x86.o translator/bench/rosetta_main.c
+	$(CC) -arch x86_64 -O2 translator/bench/rosetta_main.c build/bench_kernels_x86.o -o $@
+build/bench_native: translator/bench/kernels.c translator/bench/rosetta_main.c
+	$(CC) -arch arm64 -O2 -fno-stack-protector -fno-builtin -fno-vectorize translator/bench/rosetta_main.c translator/bench/kernels.c -o $@
+build/bench: translator/bench/bench.c translator/engine.c translator/engine.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x87.c translator/cpuid_table.h
+	$(HOSTCC) -Wno-missing-field-initializers -Itranslator translator/bench/bench.c translator/engine.c translator/xlat.c translator/x87.c translator/x86dec.c -o $@
+xlat-bench: build/bench build/bench_image build/bench_rosetta build/bench_native
+	@echo "== Rosetta 2"; build/bench_rosetta 5
+	@echo "== VXRuntime engine"; build/bench build/bench_image 5 0
+	@echo "== VXRuntime engine, ordered accesses (in-process, no TSO)"; build/bench build/bench_image 5 1
+	@echo "== native ARM64"; build/bench_native 5
 # x87 transcendentals against exact values (slow: decimal arithmetic): `make x87-exact`
 build/x87_ref: translator/diff/x87_ref.c
 	@mkdir -p build

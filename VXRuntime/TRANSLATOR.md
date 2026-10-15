@@ -202,6 +202,40 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   I/O (exceptions: phase 4), and the other 69,061 are mostly data decoded as code (IN/OUT, CLI, IRET, segment moves,
   16,491 LLVM cannot name either), with CPUID, RDTSC, XGETBV (what to report is the runtime's: phase 4) and SHA
   (not reported by Rosetta's CPUID, nor will be by ours) as the real ones.
+- **Phase 4a, the execution engine (2026-10-15).** `translator/engine.c` runs x86-64 code block by block from a
+  translation cache (64 MB MAP_JIT), with the x86 state in ARM registers from block to block: one stub enters
+  (prologue, then the block), one leaves (epilogue). A direct branch is first a BL to a link stub that leaves to C
+  with the site; C translates the target and patches the site into a B to it. Indirect branches (JMP/CALL r/m, RET on a
+  miss) read a direct-mapped table (2^16 entries) in the lookup stub. CALL keeps the x86 return address and the
+  translated code after it in a ring of 256 entries (X29) and reaches its target with BL; RET returns with ARM's RET
+  when the ring's last entry is its address, so the host's return prediction works for x86 calls. Traps (INT3, INT n,
+  UD2, #DE, #GP, INT 29h's RCX) leave with `ctx->fault` and RIP at the instruction. CPUID reports what Rosetta 2
+  reports with AVX advertised (`cpuid_table.h`, made by `translator/tools/cpuid_dump.c` under Rosetta); RDTSC/RDTSCP count at 1 GHz
+  (CNTVCT scaled); XGETBV(0) = 7. In-process memory ordering (`xe_new(1)`): accesses that may be shared (not RSP- or
+  RBP-based) are LDAPR/STLR; one across 16 bytes faults (LSE2 allows the others) and its instruction is patched into
+  a branch to DMB, plain access, DMB (FEX-Emu does the same).
+  What makes the code fast, each checked by mutation (a deliberate bug in each must make the tests fail):
+  flags per flag (CF PF AF ZF SF OF) only where read, across the block and into its successors (looked at where they
+  are mapped, through JMP and CALL; the engine's return address counts as reading all); a CMP / TEST / SUB / AND ...
+  and its Jcc as one ARM compare and B.cond (also with flag-free, memory-free instructions between: the condition
+  waits in X25); register operations, LEA, MOV/MOVZX/MOVSX, PUSH/POP (pre/post-index), shifts and INC/DEC on the
+  registers themselves when their flags are dead; displacements in the loads and stores; the NaN fix of SSE
+  arithmetic after the block; scalar SSE straight into the destination when its upper lanes are known zero (tracked
+  through the block from MOVSS/MOVSD loads). Not done: flags in NZCV (Rosetta's way), RET treating flags as dead (the
+  ABI allows it, hand-written code may not), register allocation across blocks.
+  Benchmark (`make xlat-bench`: eight C kernels built once for x86-64; best of 10, ms, M1 Max): engine (ordered) /
+  Rosetta 2 / native ARM64: crc 2.52 (2.50) / 1.40 / 1.33; matmul 10.1 (10.0) / 4.49 / 5.51; sort 30.2 (32.6) / 20.5 /
+  19.8; tree 40.8 (44.6) / 25.6 / 21.6; fib 0.305 (0.304) / 0.124 / 0.138; physics 8.37 (8.97) / 3.00 / 2.12; interp
+  36.1 (36.0) / 26.8 / 17.0; string 35.9 (37.4) / 11.5 / 11.0, from 7.67, 35.6, 103.5, 77.5, 0.889, 14.3, 95.5, 99.8 for
+  the first working engine: 1.3-3.1x Rosetta's time now; 1.08 ARM instructions per x86 byte (from 3.09). Ordered
+  accesses cost 0-9 %. The scalar SSE kernels stay furthest behind: Rosetta runs them at native speed on the M1, which
+  has no FEAT_AFP, so it presumably uses a mode of Apple's that x86's NaN and upper-lane rules need.
+  Checks: the random programs run on the engine (in both modes) and now also hold CMP/TEST/SUB ... + Jcc with
+  instructions between, blocks that start by overwriting the flags, scalar SSE chains on few registers, and special
+  floats (zeros, infinities, QNaN, SNaN, denormals) where the loads read. 3 seeds x 988,000 cases (985 forms) and
+  6,000 programs each, plus 2 x 8,000 programs in ordered mode (1,800 split accesses patched): identical (one more
+  classification: a VFMSUBADD case where Rosetta raises its other operation's IE in one lane and ours a before-rounding
+  UE in another, both known). `make coverage`: 99.58 % of the 221,978,344 instructions translate (traps now do).
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.
@@ -216,7 +250,7 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
 | 1 Decoder | lengths of every instruction in the four apps match LLVM (except data LLVM reads as APX) — done |
 | 2 Integer translator + differential tests | integer and flag instructions match Rosetta on random inputs (2a, done: 154 forms); control flow, blocks, string instructions, RCL/RCR, SHLD/SHRD, atomics with LSE (2b, done: 224 forms and random programs); small PE tests run translated in-process (with phase 4) |
 | 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs): 3a SSE/SSE2 done (128 forms); 3b AVX/AVX2/FMA/SSE3-4.1/AES done (785 forms with 3a's); 3c MXCSR modes and flags, x87 (with the transcendentals) done |
-| 4 Runtime on ARM64 + execution environment | `make check` passes translated; in-process vs. vCPU measured on SteamVR and a game |
+| 4 Runtime on ARM64 + execution environment | 4a engine (cache, linking, indirect lookup, return ring, traps, CPUID/RDTSC/XGETBV, ordered mode) done, 1.3-3.1x Rosetta's time on the kernels; then `make check` passes translated; in-process vs. vCPU measured on SteamVR and a game |
 | 5 Games | SteamVR, The Lab (Mono JIT), Earth, Alyx at level `controls` with fps at least Rosetta's |
 
 Machine code written at run time is allowed here, and only here: the translator's code emitter (AOT cache and JIT).

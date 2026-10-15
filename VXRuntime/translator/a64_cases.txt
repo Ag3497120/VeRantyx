@@ -250,3 +250,63 @@ a64_fcvt_h(0,1,2)|fcvtl v1.4s, v2.4h
 a64_fcvt_h(1,1,2)|fcvtl2 v1.4s, v2.8h
 a64_fcvt_h(2,1,2)|fcvtn v1.4h, v2.4s
 a64_fcvt_h(3,1,2)|fcvtn2 v1.8h, v2.4s
+a64_ldapr(8,1,2)|ldapr x1, [x2]
+a64_ldapr(4,1,2)|ldapr w1, [x2]
+a64_ldapr(2,1,2)|ldaprh w1, [x2]
+a64_ldapr(1,1,2)|ldaprb w1, [x2]
+a64_stlr_sz(8,1,2)|stlr x1, [x2]
+a64_stlr_sz(4,1,2)|stlr w1, [x2]
+a64_stlr_sz(2,1,2)|stlrh w1, [x2]
+a64_stlr_sz(1,1,2)|stlrb w1, [x2]
+a64_eor_lsr(16,17,17,14)|eor x16, x17, x17, lsr #14
+a64_br(30)|br x30
+a64_ubfm_w(1,2,3,31)|lsr w1, w2, #3
+a64_ubfm_w(1,2,29,28)|lsl w1, w2, #3
+a64_sbfm_w(1,2,5,31)|asr w1, w2, #5
+a64_sbfm_w(1,2,0,7)|sxtb w1, w2
+a64_sbfm_w(1,2,8,15)|sbfx w1, w2, #8, #8
+a64_w32(a64_add(1,2,3))|add w1, w2, w3
+a64_w32(a64_sub(1,2,3))|sub w1, w2, w3
+a64_w32(a64_and(1,2,3))|and w1, w2, w3
+a64_w32(a64_orr(1,2,3))|orr w1, w2, w3
+a64_w32(a64_eor(1,2,3))|eor w1, w2, w3
+a64_w32(a64_addi(1,2,4095))|add w1, w2, #4095
+a64_w32(a64_subi(1,2,7))|sub w1, w2, #7
+a64_add_lsl(1,2,3,3)|add x1, x2, x3, lsl #3
+a64_fmov_ss(1,2)|fmov s1, s2
+a64_fmov_dd(1,2)|fmov d1, d2
+a64_ld_off(4,1,2,-4)|ldur w1, [x2, #-4]
+a64_ld_off(8,1,2,-256)|ldur x1, [x2, #-256]
+a64_ld_off(8,1,2,16)|ldr x1, [x2, #16]
+a64_ld_off(4,1,2,6)|ldur w1, [x2, #6]
+a64_ld_off(1,1,2,-1)|ldurb w1, [x2, #-1]
+a64_ld_off(2,1,2,4094)|ldrh w1, [x2, #4094]
+a64_st_off(4,1,2,-8)|stur w1, [x2, #-8]
+a64_st_off(8,1,2,32760)|str x1, [x2, #32760]
+a64_st_off(1,1,2,255)|strb w1, [x2, #255]
+a64_ldsx_off(1,1,1,2,3)|ldrsb x1, [x2, #3]
+a64_ldsx_off(1,0,1,2,-3)|ldursb w1, [x2, #-3]
+a64_ldsx_off(2,1,1,2,-2)|ldursh x1, [x2, #-2]
+a64_ldsx_off(2,0,1,2,8)|ldrsh w1, [x2, #8]
+a64_ldsx_off(4,1,1,2,12)|ldrsw x1, [x2, #12]
+a64_ldsx_off(4,1,1,2,-12)|ldursw x1, [x2, #-12]
+a64_ldv_off(4,1,2,-4)|ldur s1, [x2, #-4]
+a64_ldv_off(8,1,2,24)|ldr d1, [x2, #24]
+a64_ldv_off(16,1,2,-16)|ldur q1, [x2, #-16]
+a64_ldv_off(16,1,2,32)|ldr q1, [x2, #32]
+a64_stv_off(4,1,2,-20)|stur s1, [x2, #-20]
+a64_stv_off(8,1,2,-8)|stur d1, [x2, #-8]
+a64_stv_off(16,1,2,48)|str q1, [x2, #48]
+a64_stv_off(4,1,2,8)|str s1, [x2, #8]
+a64_str8_pre(5,4,-8)|str x5, [x4, #-8]!
+a64_ldr8_post(3,4,8)|ldr x3, [x4], #8
+a64_ret_r(30)|ret
+a64_ret_r(17)|ret x17
+a64_adr(16,20)|adr x16, #20
+a64_adr(16,-8)|adr x16, #-8
+a64_bfxil(29,22,0,12)|bfxil x29, x22, #0, #12
+a64_cmpi(3,64)|cmp x3, #64
+a64_w32(a64_cmpi(3,4095))|cmp w3, #4095
+a64_cmni(3,2)|cmn x3, #2
+a64_w32(a64_cmni(3,1))|cmn w3, #1
+a64_w32(a64_ands(31,3,5))|tst w3, w5

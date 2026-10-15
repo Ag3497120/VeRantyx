@@ -32,11 +32,16 @@ static inline uint32_t a64_add_lsl(int d, int n, int m, int sh) { return 0x8B000
 static inline uint32_t a64_addi(int d, int n, uint32_t imm12) { return 0x91000000u | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_subi(int d, int n, uint32_t imm12) { return 0xD1000000u | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_cmp(int n, int m) { return a64_subs(XZR, n, m); }
+static inline uint32_t a64_cmpi(int n, uint32_t imm12) { return 0xF100001Fu | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5; }
+static inline uint32_t a64_cmni(int n, uint32_t imm12) { return 0xB100001Fu | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5; }
 
 // Bitfields: UBFM / SBFM / BFM (64-bit, N = 1)
 static inline uint32_t a64_ubfm(int d, int n, int immr, int imms) { return 0xD3400000u | (uint32_t)immr << 16 | (uint32_t)imms << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_sbfm(int d, int n, int immr, int imms) { return 0x93400000u | (uint32_t)immr << 16 | (uint32_t)imms << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_bfm(int d, int n, int immr, int imms) { return 0xB3400000u | (uint32_t)immr << 16 | (uint32_t)imms << 10 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_ubfm_w(int d, int n, int immr, int imms) { return 0x53000000u | (uint32_t)immr << 16 | (uint32_t)imms << 10 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_sbfm_w(int d, int n, int immr, int imms) { return 0x13000000u | (uint32_t)immr << 16 | (uint32_t)imms << 10 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_w32(uint32_t insn) { return insn & 0x7FFFFFFFu; }   // (the 32-bit form: ADD SUB AND ORR EOR, register or immediate)
 static inline uint32_t a64_ubfx(int d, int n, int lsb, int width) { return a64_ubfm(d, n, lsb, lsb + width - 1); }
 static inline uint32_t a64_sbfx(int d, int n, int lsb, int width) { return a64_sbfm(d, n, lsb, lsb + width - 1); }
 static inline uint32_t a64_bfi(int d, int n, int lsb, int width) { return a64_bfm(d, n, (64 - lsb) & 63, width - 1); }
@@ -64,6 +69,34 @@ static inline uint32_t a64_str(int size, int t, int n, uint32_t off) {
     static const uint32_t op[9] = { 0, 0x39000000u, 0x79000000u, 0, 0xB9000000u, 0, 0, 0, 0xF9000000u };
     return op[size] | (off / (uint32_t)size & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t;
 }
+// Loads and stores at [n + off]: LDR / STR's scaled unsigned offset when it fits, else LDUR / STUR's signed 9 bits (the
+// caller checks off is one of the two). sx: sign-extending load (LDRSB LDRSH LDRSW) to 64 bits (wide) or 32.
+static inline int a64_off_scaled(int32_t off, int size) { return off >= 0 && off % size == 0 && off / size < 4096; }
+static inline uint32_t a64_ld_off(int size, int t, int n, int32_t off) {
+    static const uint32_t lg[9] = { 0, 0, 1, 0, 2, 0, 0, 0, 3 };
+    if (a64_off_scaled(off, size)) return a64_ldr(size, t, n, (uint32_t)off);
+    return 0x38400000u | lg[size] << 30 | ((uint32_t)off & 0x1FF) << 12 | (uint32_t)n << 5 | (uint32_t)t;
+}
+static inline uint32_t a64_st_off(int size, int t, int n, int32_t off) {
+    static const uint32_t lg[9] = { 0, 0, 1, 0, 2, 0, 0, 0, 3 };
+    if (a64_off_scaled(off, size)) return a64_str(size, t, n, (uint32_t)off);
+    return 0x38000000u | lg[size] << 30 | ((uint32_t)off & 0x1FF) << 12 | (uint32_t)n << 5 | (uint32_t)t;
+}
+static inline uint32_t a64_ldsx_off(int size, int wide, int t, int n, int32_t off) {   // size 1 2 4 (4: wide only)
+    uint32_t lg = size == 4 ? 2 : size == 2 ? 1 : 0, opc = wide ? 0x00800000u : 0x00C00000u;
+    if (a64_off_scaled(off, size)) return 0x39000000u | lg << 30 | opc | ((uint32_t)off / (uint32_t)size & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t;
+    return 0x38000000u | lg << 30 | opc | ((uint32_t)off & 0x1FF) << 12 | (uint32_t)n << 5 | (uint32_t)t;
+}
+static inline uint32_t a64_ldv_off(int size, int t, int n, int32_t off) {   // S D Q
+    if (a64_off_scaled(off, size)) return (size == 4 ? 0xBD400000u : size == 8 ? 0xFD400000u : 0x3DC00000u) | ((uint32_t)off / (uint32_t)size & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t;
+    return (size == 4 ? 0xBC400000u : size == 8 ? 0xFC400000u : 0x3CC00000u) | ((uint32_t)off & 0x1FF) << 12 | (uint32_t)n << 5 | (uint32_t)t;
+}
+static inline uint32_t a64_stv_off(int size, int t, int n, int32_t off) {
+    if (a64_off_scaled(off, size)) return (size == 4 ? 0xBD000000u : size == 8 ? 0xFD000000u : 0x3D800000u) | ((uint32_t)off / (uint32_t)size & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t;
+    return (size == 4 ? 0xBC000000u : size == 8 ? 0xFC000000u : 0x3C800000u) | ((uint32_t)off & 0x1FF) << 12 | (uint32_t)n << 5 | (uint32_t)t;
+}
+static inline uint32_t a64_str8_pre(int t, int n, int imm9) { return 0xF8000C00u | ((uint32_t)imm9 & 0x1FF) << 12 | (uint32_t)n << 5 | (uint32_t)t; }   // [n, #imm]!
+static inline uint32_t a64_ldr8_post(int t, int n, int imm9) { return 0xF8400400u | ((uint32_t)imm9 & 0x1FF) << 12 | (uint32_t)n << 5 | (uint32_t)t; }  // [n], #imm
 static inline uint32_t a64_ldrb_reg(int t, int n, int m) { return 0x38606800u | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)t; }
 static inline uint32_t a64_stp_pre(int t1, int t2, int n, int imm) { return 0xA9800000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
 static inline uint32_t a64_ldp_post(int t1, int t2, int n, int imm) { return 0xA8C00000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
@@ -83,6 +116,9 @@ static inline uint32_t a64_umov_b0(int d, int n) { return 0x0E013C00u | (uint32_
 
 // Control flow
 static inline uint32_t a64_ret(void) { return 0xD65F03C0u; }
+static inline uint32_t a64_ret_r(int n) { return 0xD65F0000u | (uint32_t)n << 5; }
+static inline uint32_t a64_adr(int d, int32_t bytes) { return 0x10000000u | ((uint32_t)bytes & 3) << 29 | ((uint32_t)bytes >> 2 & 0x7FFFF) << 5 | (uint32_t)d; }
+static inline uint32_t a64_bfxil(int d, int n, int lsb, int width) { return a64_bfm(d, n, lsb, lsb + width - 1); }
 static inline uint32_t a64_blr(int n) { return 0xD63F0000u | (uint32_t)n << 5; }
 static inline uint32_t a64_b(int32_t words) { return 0x14000000u | ((uint32_t)words & 0x3FFFFFF); }
 static inline uint32_t a64_bcond(int cond, int32_t words) { return 0x54000000u | ((uint32_t)words & 0x7FFFF) << 5 | (uint32_t)cond; }
@@ -122,6 +158,8 @@ static inline uint32_t a64_fcmpd(int n, int m) { return 0x1E602000u | (uint32_t)
 // lanes: INS Vd.S[i], Vn.S[j] / Vd.D[i], Vn.D[j]; to and from general registers
 static inline uint32_t a64_ins_s(int d, int i, int n, int j) { return 0x6E000400u | (uint32_t)((i << 3) | 4) << 16 | (uint32_t)(j << 2) << 11 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_ins_d(int d, int i, int n, int j) { return 0x6E000400u | (uint32_t)((i << 4) | 8) << 16 | (uint32_t)(j << 3) << 11 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fmov_ss(int d, int n) { return 0x1E204000u | (uint32_t)n << 5 | (uint32_t)d; }   // (zeroes the rest)
+static inline uint32_t a64_fmov_dd(int d, int n) { return 0x1E604000u | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_fmov_sw(int d, int n) { return 0x1E270000u | (uint32_t)n << 5 | (uint32_t)d; }   // S <- W (zeroes the rest)
 static inline uint32_t a64_fmov_ws(int d, int n) { return 0x1E260000u | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_fmov_xd(int d, int n) { return 0x9E660000u | (uint32_t)n << 5 | (uint32_t)d; }
@@ -234,6 +272,11 @@ static inline uint32_t a64_fcvt_h(int op, int d, int n) {             // 0 FCVTL
     static const uint32_t c[4] = { 0x0E217800u, 0x4E217800u, 0x0E216800u, 0x4E216800u };
     return c[op] | (uint32_t)n << 5 | (uint32_t)d;
 }
+static inline uint32_t a64_ldapr(int size, int t, int n) { return (size == 8 ? 0xF8BFC000u : size == 4 ? 0xB8BFC000u : size == 2 ? 0x78BFC000u : 0x38BFC000u) | (uint32_t)n << 5 | (uint32_t)t; }
+static inline uint32_t a64_stlr_sz(int size, int t, int n) { return (size == 8 ? 0xC89FFC00u : size == 4 ? 0x889FFC00u : size == 2 ? 0x489FFC00u : 0x089FFC00u) | (uint32_t)n << 5 | (uint32_t)t; }
+static inline uint32_t a64_eor_lsr(int d, int n, int m, int sh) { return 0xCA400000u | (uint32_t)m << 16 | (uint32_t)sh << 10 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_bl(int32_t words) { return 0x94000000u | ((uint32_t)words & 0x3FFFFFF); }
+static inline uint32_t a64_br(int n) { return 0xD61F0000u | (uint32_t)n << 5; }
 static inline uint32_t a64_crc32c(int size, int d, int n, int m) {     // CRC32CB/H/W/X
     return (size == 8 ? 0x9AC05C00u : 0x1AC05000u | (uint32_t)(size == 1 ? 0 : size == 2 ? 1 : 2) << 10) | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)d;
 }

@@ -42,6 +42,7 @@ int main(void) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_NODEFER | SA_ONSTACK;
     sigaction(SIGFPE, &sa, NULL); sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
     sigaction(SIGALRM, &sa, NULL);
     static dt_case c;
     static dt_result r;
