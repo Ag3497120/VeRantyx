@@ -87,6 +87,21 @@ build/drawbench.exe: tests/drawbench.c tests/shaders/*.h
 	@mkdir -p build
 	$(MINGW) -O2 -Itests -o $@ $<  -ld3d11 -ldxgi -ldxguid -luuid
 
+# The translator (TRANSLATOR.md) is native ARM64 code: its tools build for this Mac, not for Rosetta.
+HOSTCC = clang -O2 -Wall -Wextra
+build/x86dec_test: translator/x86dec.c translator/x86dec.h translator/x86dec_test.c
+	@mkdir -p build
+	$(HOSTCC) translator/x86dec.c translator/x86dec_test.c -o $@
+# llvm-objdump -d --no-show-raw-insn <pe> | build/x86dec_check <pe>: the decoder against LLVM on a real binary.
+build/x86dec_check: translator/x86dec.c translator/x86dec.h translator/x86dec_check.c
+	@mkdir -p build
+	$(HOSTCC) translator/x86dec.c translator/x86dec_check.c -o $@
+
+build/hvprobe: translator/hvprobe.c translator/hypervisor.entitlements
+	@mkdir -p build
+	$(HOSTCC) translator/hvprobe.c -framework Hypervisor -o $@
+	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
+
 build/dxbcscan: tools/dxbcscan.m src/dxbc.c src/dxbc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ tools/dxbcscan.m src/dxbc.c -framework Metal -framework Foundation
@@ -167,11 +182,12 @@ vr-check: build/vxrt
 # The tests' C: drive and registry live in build/root, not in ~/.vxrt.
 check: export VXRT_ROOT = build/root
 check: export VXRT_NO_ACTIVATE = 1
-check: all
+check: all build/x86dec_test build/x86dec_check
 	python3 ../tools/vxrt_games.py check
 	python3 ../tools/vxrt_agents.py check
 	python3 ../tools/vxrt_tune.py --selftest
 	python3 ../tools/vxrt_playtest.py --selftest
+	build/x86dec_test
 	build/vxrt build/hello_k32.exe
 	build/vxrt build/hello_crt.exe one "two words"
 	build/vxrt build/threads.exe

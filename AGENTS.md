@@ -26,7 +26,8 @@ run. Read this file before you change anything.
   (Easy Anti-Cheat, BattlEye, ...), say so and stop; do not try to make it run.
 - Never modify, patch or redistribute game files, Valve's or Microsoft's files. Writes go to overlays
   (`VXRT_OVERLAY`), never into the game folder or the Wine prefix.
-- No machine code generated at run time: write C / Objective-C / generated C stubs.
+- No machine code generated at run time: write C / Objective-C / generated C stubs. The one exception is the x86-64 →
+  ARM64 translator's code emitter (`VXRuntime/translator/`, VXRuntime/TRANSLATOR.md), whose job it is.
 - Ask the user before downloading anything, posting anything, or any action outside this repository.
 - Do not run a game while the user is playing (check `pgrep -fl "build/vxrt"` first); never run two SteamVR
   instances at once.
