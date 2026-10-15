@@ -212,6 +212,10 @@ and the real SteamVR while removing Wine, and is the one we can optimize down
 to every call. It is a research project: Direct3D 12, Vulkan and tessellation
 are not there yet, and it has been tested with four games on one Mac.
 
+Where it is going: [docs/VISION.md](docs/VISION.md): Windows apps on a Mac without Rosetta or Wine, x86-64 and
+ARM64 code mixed in one process, and AI agents that observe and operate the apps through structure (with the
+user's permission).
+
 ### Running the vxrt version
 
 No Wine, no Windows Steam. One setup, with your own Steam account:
