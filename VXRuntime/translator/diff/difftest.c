@@ -242,6 +242,97 @@ static uint64_t undefined_flags(const x86_insn *d, const dt_state *in, int size)
     return 0;
 }
 
+// ---- programs: blocks, branches, calls, loops -------------------------------------------------------------------------------
+// Random programs that always end: branches go forward, loops count down from at most 4, the one function does not
+// call. Registers used: RAX RCX RDX RSI RDI R8-R11; RBX points at test memory (never written), RSP at the stack.
+static uint8_t *pp; static uint8_t *pp0;
+static const int pool[] = { 0, 1, 2, 6, 7, 8, 9, 10, 11 };
+static int preg(int no_rcx) { int r; do r = pool[rnd() % 9]; while (no_rcx && r == 1); return r; }
+static void rex_rr(int w, int reg, int rm, int force) {
+    int rex = 0x40 | w << 3 | (reg >> 3) << 2 | (rm >> 3);
+    if (rex != 0x40 || force) *pp++ = (uint8_t)rex;
+}
+static int flags_clean;                              // the flags conditions read are all defined
+static void body_insn(int no_rcx) {
+    int k = (int)(rnd() % 13), w = (int)(rnd() & 1), a = preg(no_rcx), c = preg(no_rcx);
+    static const uint8_t alu[] = { 0x01, 0x09, 0x11, 0x19, 0x21, 0x29, 0x31, 0x39, 0x85 };
+    switch (k) {
+    case 0: case 1: rex_rr(w, c, a, 0); *pp++ = alu[rnd() % 9]; *pp++ = (uint8_t)(0xC0 | (c & 7) << 3 | (a & 7)); flags_clean = 1; break;
+    case 2: rex_rr(w, 0, a, 0); *pp++ = 0x83; *pp++ = (uint8_t)(0xC0 | (rnd() % 8) << 3 | (a & 7)); *pp++ = (uint8_t)rnd(); flags_clean = 1; break;
+    case 3: rex_rr(w, 0, a, 0); *pp++ = (uint8_t)(0xB8 | (a & 7)); { uint64_t v = rnd_value(); memcpy(pp, &v, w ? 8 : 4); pp += w ? 8 : 4; } break;
+    case 4: rex_rr(w, a, 3, 0); *pp++ = (rnd() & 1) ? 0x8B : 0x89; *pp++ = (uint8_t)(0x43 | (a & 7) << 3); *pp++ = (uint8_t)(rnd() % 120); break;
+    case 5: rex_rr(w, 0, a, 0); *pp++ = 0xC1; *pp++ = (uint8_t)(0xC0 | (int[]){ 0, 1, 4, 5, 7 }[rnd() % 5] << 3 | (a & 7));
+            *pp++ = (uint8_t)(1 + rnd() % 30); flags_clean = 0; break;
+    case 6: rex_rr(w, a, c, 0); *pp++ = 0x0F; *pp++ = 0xAF; *pp++ = (uint8_t)(0xC0 | (a & 7) << 3 | (c & 7)); flags_clean = 0; break;
+    case 7: rex_rr(w, 0, a, 0); { int g = (int)(rnd() % 4); *pp++ = g < 2 ? 0xFF : 0xF7; *pp++ = (uint8_t)(0xC0 | g << 3 | (a & 7)); if (g != 2) flags_clean = 1; } break;
+    case 8: if (!flags_clean) break; rex_rr(0, 0, a, 1); *pp++ = 0x0F; *pp++ = (uint8_t)(0x90 | (rnd() % 16)); *pp++ = (uint8_t)(0xC0 | (a & 7)); break;
+    case 9: if (!flags_clean) break; rex_rr(w, a, c, 0); *pp++ = 0x0F; *pp++ = (uint8_t)(0x40 | (rnd() % 16)); *pp++ = (uint8_t)(0xC0 | (a & 7) << 3 | (c & 7)); break;
+    case 10: { int x = preg(no_rcx);                                 // LEA a, [c + x*s + disp8]
+             *pp++ = (uint8_t)(0x40 | w << 3 | (a >> 3) << 2 | (x >> 3) << 1 | (c >> 3)); *pp++ = 0x8D; *pp++ = (uint8_t)(0x44 | (a & 7) << 3);
+             *pp++ = (uint8_t)((rnd() % 4) << 6 | (x & 7) << 3 | (c & 7)); *pp++ = (uint8_t)rnd(); break; }
+    case 11: rex_rr(0, 0, a, 0); *pp++ = (uint8_t)(0x50 | (a & 7)); if (rnd() & 1) body_insn(no_rcx); rex_rr(0, 0, c, 0); *pp++ = (uint8_t)(0x58 | (c & 7)); break;
+    case 12: rex_rr(w, a, c, 0); *pp++ = 0x87; *pp++ = (uint8_t)(0xC0 | (a & 7) << 3 | (c & 7)); break;
+    }
+}
+static void clean_flags(void) {                      // CMP r, r: every flag defined
+    if (flags_clean) return;
+    int a = preg(0), c = preg(0);
+    rex_rr(1, c, a, 0); *pp++ = 0x39; *pp++ = (uint8_t)(0xC0 | (c & 7) << 3 | (a & 7)); flags_clean = 1;
+}
+typedef struct { uint8_t *at; int target; } fixup;      // a rel32 at `at` to block `target` (-1: the function, -2: the end)
+static void make_program(dt_case *c) {
+    memset(c, 0, sizeof *c);
+    c->kind = 1;
+    for (int i = 0; i < 16; i++) c->in.gpr[i] = rnd_value();
+    for (int i = 0; i < DT_BUF_SIZE; i++) c->mem[i] = (uint8_t)rnd();
+    c->in.gpr[4] = DT_STACK; c->in.gpr[3] = DT_BUF + 1024;
+    c->in.flags = (rnd() & 0x8D5) | 0x202;
+    flags_clean = 1;
+    pp = pp0 = c->prog;
+    int nb = 2 + (int)(rnd() % 6);
+    uint8_t *start[8]; fixup fx[64]; int nfx = 0;
+    for (int i = 0; i < nb; i++) {
+        start[i] = pp;
+        int n = 1 + (int)(rnd() % 4);
+        for (int k = 0; k < n; k++) body_insn(0);
+        int kind = (int)(rnd() % 9);
+        if (i == nb - 1) kind = 0;
+        clean_flags();                                       // (every block ends with defined flags: any path may jump on)
+        switch (kind) {
+        case 1: clean_flags(); *pp++ = 0x0F; *pp++ = (uint8_t)(0x80 | (rnd() % 16)); fx[nfx++] = (fixup){ pp, i + 1 + (int)(rnd() % (unsigned)(nb - i)) }; pp += 4; break;
+        case 2: *pp++ = 0xE9; fx[nfx++] = (fixup){ pp, i + 1 + (int)(rnd() % (unsigned)(nb - i)) }; pp += 4; break;
+        case 3: *pp++ = 0xE8; fx[nfx++] = (fixup){ pp, -1 }; pp += 4; flags_clean = 0; break;
+        case 4: { int t = i + 1 + (int)(rnd() % (unsigned)(nb - i));                     // LEA R11, [RIP+x]; JMP R11
+                  *pp++ = 0x4C; *pp++ = 0x8D; *pp++ = 0x1D; fx[nfx++] = (fixup){ pp, t }; pp += 4; *pp++ = 0x41; *pp++ = 0xFF; *pp++ = 0xE3; break; }
+        case 5: *pp++ = 0x4C; *pp++ = 0x8D; *pp++ = 0x1D; fx[nfx++] = (fixup){ pp, -1 }; pp += 4;  // LEA R11, [RIP+f]; CALL R11
+                *pp++ = 0x41; *pp++ = 0xFF; *pp++ = 0xD3; flags_clean = 0; break;
+        case 6: { *pp++ = 0xB9; uint32_t k = 1 + (uint32_t)(rnd() % 4); memcpy(pp, &k, 4); pp += 4;   // MOV ECX, k; L: ...; LOOP L
+                  uint8_t *top = pp; int m = 1 + (int)(rnd() % 2);
+                  for (int j = 0; j < m; j++) body_insn(1);
+                  clean_flags();                         // (the back edge too: the next round may read them)
+                  *pp++ = 0xE2; *pp = (uint8_t)(int8_t)(top - (pp + 1)); pp++; break; }
+        case 7: { clean_flags(); *pp++ = (uint8_t)(0x70 | (rnd() % 16)); uint8_t *rel = pp++; uint8_t *from = pp;   // Jcc rel8 over one
+                  body_insn(0); *rel = (uint8_t)(pp - from); flags_clean = 0; clean_flags(); break; }
+        case 8: { clean_flags(); *pp++ = (uint8_t)(0xE0 + rnd() % 4); uint8_t *rel = pp++; uint8_t *from = pp;   // LOOPcc/JRCXZ over one
+                  body_insn(0); *rel = (uint8_t)(pp - from); flags_clean = 0; clean_flags(); break; }
+        }
+    }
+    clean_flags();
+    uint8_t *end_jmp = pp; *pp++ = 0xE9; fx[nfx++] = (fixup){ pp, -2 }; pp += 4;
+    (void)end_jmp;
+    uint8_t *func = pp;                                  // the function: a few instructions, RET
+    int n = 1 + (int)(rnd() % 3);
+    for (int k = 0; k < n; k++) body_insn(0);
+    *pp++ = 0xC3;
+    for (int i = 0; i < nfx; i++) {
+        uint8_t *to = fx[i].target == -1 ? func : fx[i].target == -2 ? (uint8_t *)(uintptr_t)0 : fx[i].target >= nb ? end_jmp : start[fx[i].target];
+        int64_t rel = fx[i].target == -2 ? (int64_t)(DT_END - (DT_PROG + (uint64_t)(fx[i].at + 4 - pp0)))
+                                         : (int64_t)(to - (fx[i].at + 4));
+        int32_t r32 = (int32_t)rel; memcpy(fx[i].at, &r32, 4);
+    }
+    c->prog_len = (uint32_t)(pp - pp0);
+}
+
 // ---- running the translation ----------------------------------------------------------------------------------------------
 static uint32_t *jit;
 static sigjmp_buf jb;
@@ -273,6 +364,45 @@ static int run_translated(const dt_case *c, const x86_insn *d, dt_result *r) {
     return 0;
 }
 
+static uint32_t *jit_prog;
+static int run_program(const dt_case *c, dt_result *r) {
+    memcpy((void *)DT_PROG, c->prog, c->prog_len);
+    struct { uint64_t rip; uint32_t *fn; } cache[256]; int ncache = 0;
+    size_t used = 0;
+    static x86_ctx ctx;
+    memset(&ctx, 0, sizeof ctx);
+    memcpy(ctx.gpr, c->in.gpr, sizeof ctx.gpr);
+    ctx.flags = c->in.flags;
+    ctx.rip = DT_PROG;
+    memcpy((void *)DT_BUF, c->mem, DT_BUF_SIZE);
+    signaled = 0;
+    int steps = 0;
+    if (!sigsetjmp(jb, 1)) {
+        while (ctx.rip != DT_END && !ctx.fault && steps++ < 10000) {
+            if (ctx.rip < DT_PROG || ctx.rip >= DT_END) { signaled = SIGSEGV; break; }
+            uint32_t *fn = NULL;
+            for (int i = 0; i < ncache; i++) if (cache[i].rip == ctx.rip) fn = cache[i].fn;
+            if (!fn) {
+                xlat_buf b = { 0 };
+                if (xlat_block(&b, ctx.rip, 64) < 0) { free(b.code); return -1; }
+                if (ncache == 256 || used + b.n > (4u << 20) / 4) { free(b.code); return -1; }
+                fn = jit_prog + used;
+                pthread_jit_write_protect_np(0); memcpy(fn, b.code, b.n * 4); pthread_jit_write_protect_np(1);
+                sys_icache_invalidate(fn, b.n * 4);
+                used += b.n; free(b.code);
+                cache[ncache].rip = ctx.rip; cache[ncache++].fn = fn;
+            }
+            ((void (*)(x86_ctx *))fn)(&ctx);
+        }
+    }
+    memcpy(r->out.gpr, ctx.gpr, sizeof ctx.gpr);
+    r->out.flags = ctx.flags;
+    r->out.fault = signaled ? 2 : ctx.fault == X86_FAULT_DE ? 1 : ctx.rip != DT_END ? 4 : 0;
+    if (r->out.fault) { memcpy(r->out.gpr, c->in.gpr, sizeof ctx.gpr); r->out.flags = c->in.flags; }
+    memcpy(r->mem, (void *)DT_BUF, DT_BUF_SIZE);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: difftest <ref_x86> [cases per form] [seed]\n"); return 2; }
     int per = argc > 2 ? atoi(argv[2]) : 2000;
@@ -280,6 +410,9 @@ int main(int argc, char **argv) {
     rng_state = argc > 3 ? strtoull(argv[3], NULL, 0) : 0x9E3779B97F4A7C15ull;
     jit = mmap(NULL, 1 << 16, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
     void *buf = mmap((void *)DT_BUF, DT_BUF_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    void *progmem = mmap((void *)DT_PROG, DT_PROG_MAX + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    jit_prog = mmap(NULL, 4u << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    if (progmem != (void *)DT_PROG || jit_prog == MAP_FAILED) { fprintf(stderr, "difftest: mmap failed\n"); return 1; }
     if (jit == MAP_FAILED || buf != (void *)DT_BUF) { fprintf(stderr, "difftest: mmap failed\n"); return 1; }
     struct sigaction sa = { .sa_handler = on_signal };
     sigemptyset(&sa.sa_mask);
@@ -352,6 +485,39 @@ int main(int argc, char **argv) {
         total += ran; bad_total += bad;
         if (bad) { forms_bad++; printf("  FAIL %-22s %ld/%ld  %s\n", f->name, bad, ran, first); }
         else forms_ok++;
+    }
+    // Programs: blocks, branches, calls, loops.
+    if (!only || strstr("programs", only)) {
+        long pbad = 0, pran = 0; char first[400] = "";
+        int nprog = per * 4;
+        for (int k = 0; k < nprog; k++) {
+            make_program(&c);
+            if (run_program(&c, &got) < 0) { snprintf(first, sizeof first, "not translated"); pbad++; break; }
+            if (fwrite(&c, sizeof c, 1, out) != 1 || fflush(out) || fread(&want, sizeof want, 1, in) != 1) { fprintf(stderr, "ref_x86 stopped\n"); return 1; }
+            pran++;
+            int diff = want.out.fault != got.out.fault;
+            if (!diff && !want.out.fault) {
+                uint64_t sp = want.out.gpr[4] - 8 - DT_BUF;
+                if (sp + 8 <= DT_BUF_SIZE) memcpy(want.mem + sp, got.mem + sp, 8);
+                diff = (want.out.flags & 0x8D5) != (got.out.flags & 0x8D5) || memcmp(want.mem, got.mem, DT_BUF_SIZE);
+                for (int i = 0; i < 16; i++) diff |= want.out.gpr[i] != got.out.gpr[i];
+            }
+            if (diff) {
+                if (!pbad) {
+                    int n = snprintf(first, sizeof first, "program %d (%u bytes): fault %llu/%llu flags %03llx/%03llx", k, c.prog_len,
+                                     (unsigned long long)want.out.fault, (unsigned long long)got.out.fault,
+                                     (unsigned long long)(want.out.flags & 0x8D5), (unsigned long long)(got.out.flags & 0x8D5));
+                    for (int i = 0; i < 16 && n < 360; i++)
+                        if (want.out.gpr[i] != got.out.gpr[i])
+                            n += snprintf(first + n, sizeof first - (size_t)n, "; r%d %llx/%llx", i, (unsigned long long)want.out.gpr[i], (unsigned long long)got.out.gpr[i]);
+                    if (getenv("DT_VERBOSE")) { FILE *pf = fopen("/tmp/difftest_prog.bin", "wb"); if (pf) { fwrite(c.prog, 1, c.prog_len, pf); fclose(pf); } }
+                }
+                pbad++;
+            }
+        }
+        total += pran; bad_total += pbad;
+        if (pbad) { forms_bad++; printf("  FAIL %-22s %ld/%ld  %s\n", "programs", pbad, pran, first); } else forms_ok++;
+        nforms++;
     }
     fclose(out); fclose(in);
     printf("x86 -> ARM64 vs Rosetta: %d forms, %ld cases: %ld forms match, %ld differ (%ld cases)%s; %ld cases skipped where Rosetta deviates from x86\n",

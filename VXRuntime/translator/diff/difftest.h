@@ -9,15 +9,22 @@
 typedef struct {
     uint64_t gpr[16];
     uint64_t flags;
-    uint64_t fault;                         // 0, or 1 (#DE), 2 (other signal)
+    uint64_t fault;                         // 0, or 1 (#DE), 2 (other signal), 4 (did not end in time)
 } dt_state;
 
+// Programs (several blocks, branches, calls) run from this address in both processes and end by jumping to DT_END.
+#define DT_PROG ((uint64_t)0x310000000ull)
+#define DT_PROG_MAX 3072
+#define DT_END (DT_PROG + DT_PROG_MAX)
+
 typedef struct {
-    uint8_t code[16];
+    uint8_t code[16];                       // kind 0: one instruction
     uint32_t len;
-    uint32_t pad;
+    uint32_t kind;                          // 0: one instruction; 1: a program in prog
     dt_state in;
     uint8_t mem[DT_BUF_SIZE];
+    uint32_t prog_len;
+    uint8_t prog[DT_PROG_MAX];
 } dt_case;
 
 typedef struct {

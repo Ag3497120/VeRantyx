@@ -786,6 +786,78 @@ imul: {
     }
 }
 
+// ---- blocks and control flow ---------------------------------------------------------------------------------------
+// The next RIP into S1 for a control transfer; returns 1 if d is one, 0 if not, -1 if unsupported.
+static int control(xlat_buf *b, const x86_insn *d, uint64_t rip) {
+    uint64_t next = rip + d->len, target = next + (uint64_t)d->imm;
+    int op = d->opcode;
+    if (d->map == X86_MAP_1) {
+        if (op >= 0x70 && op <= 0x7F) goto jcc;
+        if (op == 0xEB || op == 0xE9) { mov_imm(b, S1, target); return 1; }        // JMP rel
+        if (op == 0xE8) {                                                          // CALL rel32
+            mov_imm(b, T_A, next); E(b, a64_subi(4, 4, 8)); E(b, a64_str(8, T_A, 4, 0));
+            mov_imm(b, S1, target); return 1;
+        }
+        if (op == 0xC3 || op == 0xC2) {                                            // RET [imm16]
+            E(b, a64_ldr(8, S1, 4, 0));
+            uint64_t pop = 8 + (op == 0xC2 ? (uint64_t)(uint16_t)d->imm : 0);
+            if (pop < 4096) E(b, a64_addi(4, 4, (uint32_t)pop)); else { mov_imm(b, S0, pop); E(b, a64_add(4, 4, S0)); }
+            return 1;
+        }
+        if (op == 0xFF && ((d->reg & 7) == 2 || (d->reg & 7) == 4)) {              // CALL / JMP r/m64
+            rd_rm(b, d, T_A, 8, next);
+            if ((d->reg & 7) == 2) { mov_imm(b, T_B, next); E(b, a64_subi(4, 4, 8)); E(b, a64_str(8, T_B, 4, 0)); }
+            E(b, a64_mov(S1, T_A)); return 1;
+        }
+        if (op >= 0xE0 && op <= 0xE3) {                                            // LOOPNE LOOPE LOOP JRCXZ
+            if (d->prefixes & X86_P_ADDRSIZE) return -1;
+            if (op != 0xE3) E(b, a64_subi(1, 1, 1));
+            E(b, a64_cmp(1, XZR)); E(b, a64_cset(S0, op == 0xE3 ? EQ : NE));
+            if (op != 0xE2 && op != 0xE3) {                                        // (and ZF, or not ZF)
+                flag_bit(b, S1, XF, 6);
+                if (op == 0xE0) { E(b, a64_movz(T_T, 1, 0)); E(b, a64_sub(S1, T_T, S1)); }
+                E(b, a64_and(S0, S0, S1));
+            }
+            goto select;
+        }
+        return 0;
+    }
+    if (d->map == X86_MAP_0F && op >= 0x80 && op <= 0x8F) goto jcc;
+    return 0;
+jcc:
+    cond(b, op & 15);
+select:
+    mov_imm(b, S1, target); mov_imm(b, T_T, next);
+    E(b, a64_cmp(S0, XZR)); E(b, a64_csel(S1, S1, T_T, NE));
+    return 1;
+}
+
+int xlat_block(xlat_buf *b, uint64_t rip, int max_insns) {
+    size_t exits[64]; int nexits = 0;                    // branches to the common exit (after a fault)
+    xlat_prologue(b);
+    for (int i = 0; i < max_insns; i++) {
+        x86_insn d;
+        if (!x86_decode((const uint8_t *)(uintptr_t)rip, 15, &d)) return -1;
+        int c = control(b, &d, rip);
+        if (c < 0) return -1;
+        if (c) { E(b, a64_str(8, S1, XC, CTX_RIP)); break; }
+        if (xlat_insn(b, &d, (const uint8_t *)(uintptr_t)rip, rip) < 0) return -1;
+        if (d.map == X86_MAP_1 && (d.opcode == 0xF6 || d.opcode == 0xF7) && (d.reg & 7) >= 6 && nexits < 64) {
+            // DIV / IDIV may raise #DE: then the block ends here, RIP at the instruction.
+            E(b, a64_ldr(8, S0, XC, CTX_FAULT));
+            size_t ok = here(b); E(b, 0);
+            mov_imm(b, S1, rip); E(b, a64_str(8, S1, XC, CTX_RIP));
+            exits[nexits++] = here(b); E(b, 0);
+            patch_cbz(b, ok, 0, S0);
+        }
+        rip += d.len;
+        if (i + 1 == max_insns) { mov_imm(b, S1, rip); E(b, a64_str(8, S1, XC, CTX_RIP)); }
+    }
+    for (int i = 0; i < nexits; i++) patch_b(b, exits[i]);
+    xlat_epilogue(b);
+    return 0;
+}
+
 void xlat_prologue(xlat_buf *b) {
     E(b, a64_stp_pre(29, 30, SP, -96));
     E(b, a64_stp(19, 20, SP, 16)); E(b, a64_stp(21, 22, SP, 32)); E(b, a64_stp(23, 24, SP, 48));

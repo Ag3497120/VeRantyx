@@ -11,7 +11,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-static uint8_t *code;
+static uint8_t *code, *stub;
 static size_t at;
 static uint64_t host_rsp;
 static dt_state st_in, st_out;
@@ -29,9 +29,10 @@ static void st(int reg, int32_t disp) { b(0x48 | (reg >= 8 ? 4 : 0)); b(0x89); b
 static void on_signal(int sig) { signaled = sig; siglongjmp(jb, 1); }
 
 int main(void) {
-    code = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+    code = stub = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
     uint8_t *buf = mmap((void *)DT_BUF, DT_BUF_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-    if (code == MAP_FAILED || buf != (uint8_t *)DT_BUF) { fprintf(stderr, "ref_x86: mmap failed\n"); return 1; }
+    uint8_t *prog = mmap((void *)DT_PROG, DT_PROG_MAX + 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    if (code == MAP_FAILED || buf != (uint8_t *)DT_BUF || prog != (uint8_t *)DT_PROG) { fprintf(stderr, "ref_x86: mmap failed\n"); return 1; }
     // (signals run on a stack of their own: the test's RSP points into the test memory)
     static uint8_t altstack[65536];
     stack_t ss = { .ss_sp = altstack, .ss_size = sizeof altstack };
@@ -40,17 +41,26 @@ int main(void) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_NODEFER | SA_ONSTACK;
     sigaction(SIGFPE, &sa, NULL); sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGALRM, &sa, NULL);
     static dt_case c;
     static dt_result r;
     while (fread(&c, sizeof c, 1, stdin) == 1) {
-        at = 0;
+        // The loading stub: host registers saved, the state loaded, then the instruction (and the storing stub after
+        // it), or a jump to the program at DT_PROG (and the storing stub at DT_END, where the program ends).
+        code = stub; at = 0;
         b(0x53); b(0x55); b(0x41); b(0x54); b(0x41); b(0x55); b(0x41); b(0x56); b(0x41); b(0x57);   // push rbx rbp r12-r15
         mov_rax_imm((uint64_t)&host_rsp); b(0x48); b(0x89); b(0x20);                              // mov [rax], rsp
         mov_rax_imm((uint64_t)&st_in);
         b(0xFF); b(0xB0); d32(128); b(0x9D);                                                      // push [rax+128]; popfq
         for (int reg = 1; reg < 16; reg++) ld(reg, reg * 8);
         b(0x48); b(0x8B); b(0x00);                                                                // mov rax, [rax]
-        memcpy(code + at, c.code, c.len); at += c.len;                                            // the instruction
+        if (c.kind == 1) {
+            memcpy(prog, c.prog, c.prog_len);
+            b(0xFF); b(0x25); d32(0); q(DT_PROG);                                                 // jmp [rip+0] -> DT_PROG
+            code = prog; at = DT_PROG_MAX;
+        } else {
+            memcpy(code + at, c.code, c.len); at += c.len;                                        // the instruction
+        }
         b(0x48); b(0xA3); q((uint64_t)&st_out.gpr[0]);                                            // mov [moffs], rax
         b(0x9C);                                                                                  // pushfq (test stack)
         mov_rax_imm((uint64_t)&st_out);
@@ -62,9 +72,11 @@ int main(void) {
         memset(&st_out, 0, sizeof st_out);
         memcpy(buf, c.mem, DT_BUF_SIZE);
         signaled = 0;
-        if (!sigsetjmp(jb, 1)) ((void (*)(void))code)();
+        alarm(2);                                              // (a program that does not end)
+        if (!sigsetjmp(jb, 1)) ((void (*)(void))stub)();
+        alarm(0);
         r.out = signaled ? st_in : st_out;
-        r.out.fault = signaled == SIGFPE ? 1 : signaled ? 2 : 0;
+        r.out.fault = signaled == SIGFPE ? 1 : signaled == SIGALRM ? 4 : signaled ? 2 : 0;
         memcpy(r.mem, buf, DT_BUF_SIZE);
         if (fwrite(&r, sizeof r, 1, stdout) != 1) return 1;
         fflush(stdout);
