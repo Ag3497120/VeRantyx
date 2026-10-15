@@ -5,6 +5,10 @@ translated x86 code left them (RCX RDX R8 R9 / XMM0-3, then the stack), calls th
 RAX or XMM0; and a table of them, registered by address (src/arm64.c), so that the engine turns a call to the
 function into a call of its thunk. Written to <out>/<file>.inc, included at the end of the file in the ARM64 build.
 
+Pointers cross through vx_low / vx_unlow (src/arm64.h): in the vCPU the program's memory below 4 GB is the host's
+at an offset, so a pointer argument into it goes to the function as the host's address, a pointer it returns goes
+back as the program's, and so does one it stored through a pointer-to-pointer argument (strtol's end, an output).
+
 It also checks the other direction: every call through an ms_abi function pointer (the runtime calling what may be
 x86 code) must pass and return integers or pointers only, as the ARM64 build's callback bridge moves x0-x7 to
 RCX RDX R8 R9 and the stack; one that does not is an error here.
@@ -30,8 +34,9 @@ def arg(p, i):
     if p["cls"] == "float": return f"vx_arg_f(c, {i})"
     if p["cls"] == "double": return f"vx_arg_d(c, {i})"
     if p["cls"] == "rec8": return f"({{ {p['type']} v_; uint64_t s_ = vx_arg(c, {i}); memcpy(&v_, &s_, sizeof v_); v_; }})"
-    if p["kind"] in (112, 114): return f"(void *)(uintptr_t)vx_arg(c, {i})"
+    if p["kind"] in (112, 114): return f"(void *)(uintptr_t)vx_low(vx_arg(c, {i}))"
     if p["cls"] != "int": raise SystemExit(f"cannot pass {p}")
+    if p["kind"] == 101: return f"({p['type']})(uintptr_t)vx_low(vx_arg(c, {i}))"
     return f"({p['type']})({width(p['kind'], p['size'])})vx_arg(c, {i})"
 
 def thunk(f):
@@ -39,14 +44,18 @@ def thunk(f):
     args = ", ".join(arg(p, i) for i, p in enumerate(f["params"]))
     call = f"{f['name']}({args})"
     pre = f"vx_va_begin(c, {n}); " if f["variadic"] else ""
+    outs = [i for i, p in enumerate(f["params"]) if p.get("pp")]
+    if outs: pre += "".join(f"uint64_t o{i}_ = vx_low(vx_arg(c, {i})); " for i in outs)
+    post = "".join(f" vx_unlow_at(o{i}_);" for i in outs)
     rc = f["ret_cls"]
     if rc == "void": body = f"{call};"
     elif rc == "float": body = f"vx_ret_f(c, {call});"
     elif rc == "double": body = f"vx_ret_d(c, {call});"
     elif rc == "rec8": body = f"{f['ret']} r_ = {call}; c->gpr[0] = 0; memcpy(&c->gpr[0], &r_, sizeof r_);"
+    elif rc == "int" and f["ret_kind"] == 101: body = f"c->gpr[0] = vx_unlow((uint64_t)(uintptr_t)({call}));"
     elif rc == "int": body = f"c->gpr[0] = (uint64_t)({width(f['ret_kind'], f['ret_size'])})({call});"
     else: raise SystemExit(f"cannot return {f}")
-    return f"static void vxt_{f['name']}(x86_ctx *c) {{ {pre}{body} }}"
+    return f"static void vxt_{f['name']}(x86_ctx *c) {{ {pre}{body}{post} }}"
 
 def main():
     out, srcs = sys.argv[1], sys.argv[2:]

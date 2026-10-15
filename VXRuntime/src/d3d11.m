@@ -35,6 +35,12 @@ void **d3d_vtable(const char *const *names, void *const *stubs, int count, const
     }
     return vt;
 }
+// A Metal buffer whose memory Map hands the program (vx.h: the vCPU guest forgets older pages at its address).
+static id<MTLBuffer> cpu_buffer(id<MTLDevice> dev, NSUInteger len) {
+    id<MTLBuffer> b = [dev newBufferWithLength:len options:MTLResourceStorageModeShared];
+    if (b) vx_guest_forget(b.contents, b.length);
+    return b;
+}
 static int64_t g_live[16];                         // (VXRT_STATS: live objects by kind)
 static int64_t g_chunks, g_pooled_bytes, g_fresh_bytes;   // (VXRT_STATS: buffer memory, below)
 void *d3d_alloc(size_t size, int kind, void **vtbl, d3d_device *dev) {
@@ -286,7 +292,7 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
     if (desc[TD_USAGE] == USAGE_STAGING && dim == 2 && td.textureType == MTLTextureType2D && td.mipmapLevelCount == 1 && !is_depth(f) &&
         format_layout(desc[TD_FORMAT], (uint32_t)td.width, (uint32_t)td.height, &row_bytes, &rows) && rows == td.height && !getenv("VXRT_TILED_STAGING")) {
         NSUInteger align = [mdev minimumLinearTextureAlignmentForPixelFormat:f], pitch = (row_bytes + align - 1) / align * align;
-        id<MTLBuffer> buf = [mdev newBufferWithLength:pitch * td.height options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf = cpu_buffer(mdev, pitch * td.height);
         id<MTLTexture> tex = buf ? [buf newTextureWithDescriptor:td offset:0 bytesPerRow:pitch] : nil;
         if (tex) { *hr = S_OK; return (void *)CFBridgingRetain(tex); }
     }
@@ -964,7 +970,7 @@ static id<MTLBuffer> take_buffer(d3d_device *dev, size_t len) {
     pthread_mutex_unlock(&g_pool_lock);
     if (ref) { __atomic_sub_fetch(&g_pooled_bytes, (int64_t)len, __ATOMIC_RELAXED); return CFBridgingRelease(ref); }
     __atomic_add_fetch(&g_fresh_bytes, (int64_t)len, __ATOMIC_RELAXED);
-    return [(__bridge id<MTLDevice>)dev->mtl newBufferWithLength:len options:MTLResourceStorageModeShared];
+    return cpu_buffer((__bridge id<MTLDevice>)dev->mtl, len);
 }
 static void retire_buffer(d3d_device *dev, void *ref) {         // takes over the reference
     size_t len = ((__bridge id<MTLBuffer>)ref).length;
@@ -1003,7 +1009,7 @@ static slice_chunk *take_slice(d3d_device *dev, size_t len, size_t *off) {
         for (slice_chunk **pp = &r->full; *pp; pp = &(*pp)->next)
             if (!(*pp)->live && (*pp)->seq <= done) { k = *pp; *pp = k->next; break; }
         if (!k) {
-            id<MTLBuffer> m = [(__bridge id<MTLDevice>)dev->mtl newBufferWithLength:CHUNK_BYTES options:MTLResourceStorageModeShared];
+            id<MTLBuffer> m = cpu_buffer((__bridge id<MTLDevice>)dev->mtl, CHUNK_BYTES);
             g_chunks++;
             k = calloc(1, sizeof *k);
             k->mtl = (void *)CFBridgingRetain(m);
@@ -1040,7 +1046,7 @@ static uint8_t *rename_buffer(d3d_device *dev, d3d_buffer *b, int keep) {
     id<MTLBuffer> fresh;
     if (!view && len <= SLICE_LIMIT) { k = take_slice(dev, len, &off); fresh = (__bridge id<MTLBuffer>)k->mtl; }
     else if (!view) fresh = take_buffer(dev, old.length);
-    else fresh = [(__bridge id<MTLDevice>)dev->mtl newBufferWithLength:old.length options:MTLResourceStorageModeShared];
+    else fresh = cpu_buffer((__bridge id<MTLDevice>)dev->mtl, old.length);
     uint8_t *p = (uint8_t *)fresh.contents + off;
     if (keep) memcpy(p, before, len);
     if (b->chunk) { drop_slice(dev, b); CFRelease(b->mtl); }    // command buffers hold what they use
@@ -1108,7 +1114,6 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
         }
         id<MTLBuffer> b = (__bridge id<MTLBuffer>)buf->mtl;
         out->data = (uint8_t *)b.contents + buf->off; out->row_pitch = out->depth_pitch = buf->desc[0];
-        vx_guest_refresh(out->data, buf->desc[0]);
         return S_OK;
     }
     d3d_texture *t = (d3d_texture *)res;
@@ -1120,7 +1125,6 @@ static WINAPI HRESULT ctx_map(void *this, d3d_object *res, uint32_t sub, uint32_
     if (tex.buffer) {                                            // a staging image in a buffer: its own memory
         out->data = (uint8_t *)tex.buffer.contents + tex.bufferOffset;
         out->row_pitch = (uint32_t)tex.bufferBytesPerRow; out->depth_pitch = (uint32_t)(tex.bufferBytesPerRow * tex.height);
-        vx_guest_refresh(out->data, tex.buffer.length - tex.bufferOffset);
         return S_OK;
     }
     if (tex.storageMode != MTLStorageModeShared) { vx_log("Direct3D: Map of a texture without CPU access"); return E_INVALIDARG; }
@@ -1226,7 +1230,7 @@ static WINAPI HRESULT device_create_buffer(void *this, const uint32_t *desc, con
             return S_OK;
         }
     }
-    id<MTLBuffer> b = [(__bridge id<MTLDevice>)d->mtl newBufferWithLength:desc[0] options:MTLResourceStorageModeShared];
+    id<MTLBuffer> b = cpu_buffer((__bridge id<MTLDevice>)d->mtl, desc[0]);
     if (!b) return E_OUTOFMEMORY;
     if (init && init->data) memcpy(b.contents, init->data, desc[0]);
     *out = d3d_buffer_wrap(d, desc, (void *)CFBridgingRetain(b), 0, NULL, 0);

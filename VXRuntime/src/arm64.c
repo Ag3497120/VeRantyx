@@ -16,6 +16,8 @@
 #include "../translator/engine.h"
 #include "../translator/vcpu.h"
 #include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <execinfo.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -29,6 +31,8 @@
 
 __thread const char *vx_va_slots;
 static xe *g_engine;
+uint64_t vx_low_base;                                         // (vx.h: the vCPU's memory below 4 GB)
+uint8_t vx_low_map[1 << 16] __attribute__((aligned(64))) = { 0 };
 enum { X86_RETURN = 0xFFFFFFFFFFFF0000ull };                // where x86 code called from here returns to (never code)
 
 // ---- thunks, by function address ------------------------------------------------------------------------------
@@ -368,6 +372,15 @@ void vx_arm64_init(void) {
         void vxvm_set_hook(void (*)(uint64_t, uint64_t));             // (src/vm_hooks.c: memory going away leaves the guest)
         vxvm_set_hook(xv_unmap);
         xv_set_interrupt_hook(vcpu_interrupted);
+        // The guest's low 4 GB (LuaJIT 2.0 asks for memory below 2 GB): a reservation of the host's, no access until
+        // handed out (kernel32.c's vx_virtual_alloc_below)
+        mach_vm_address_t low = 0;
+        if (mach_vm_allocate(mach_task_self(), &low, 1ull << 32, VM_FLAGS_ANYWHERE) == KERN_SUCCESS) {
+            mach_vm_protect(mach_task_self(), low, 1ull << 32, 1, VM_PROT_NONE);
+            mach_vm_protect(mach_task_self(), low, 1ull << 32, 0, VM_PROT_NONE);
+            vx_low_base = low;
+            xv_set_low(low);
+        }
         if (!getenv("VXRT_VCPU_NO_GUEST")) xe_set_guest(g_engine, guest_find);
     }
     else g_engine = xe_new(!getenv("VXRT_ORDERED") || atoi(getenv("VXRT_ORDERED")) != 0);

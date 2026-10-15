@@ -421,6 +421,10 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
     for (;;) {
         if (c->fault) return (int)c->fault;
         if (c->rip == stop) return 0;
+        if (e->vcpu && !(c->rip >> 32)) {                                 // (the guest's low memory is the host's elsewhere)
+            fprintf(stderr, "[vxrt] engine: code below 4 GB (%#llx) is not run in the vCPU yet\n", (unsigned long long)c->rip);
+            return -2;
+        }
         pthread_mutex_lock(&e->lock);
         int once = c->single != 0;
         c->single = 0;

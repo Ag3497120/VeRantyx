@@ -107,12 +107,31 @@ int vxvm_owns(const void *p);
 #define vx_heap_zalloc(n) calloc(1, (n) ? (n) : 1)
 #define vx_heap_owns(p) 0
 #endif
-// Memory a Map hands the program (a Metal buffer's): the vCPU guest must not keep an older page at that address.
 #ifdef __aarch64__
-void xv_refresh(uint64_t va, uint64_t len);
-#define vx_guest_refresh(p, n) xv_refresh((uint64_t)(uintptr_t)(p), (n))
+// The program's memory below 4 GB (vCPU only: the host cannot map there): the host has it at vx_low_base + its
+// address, and vx_low_map marks the 64 KB granules handed out (vx_virtual_alloc_below), so that only a pointer into
+// them is moved (small handles and resource ids are not). In-process, vx_low_base is 0 and nothing moves.
+extern uint64_t vx_low_base;
+extern uint8_t vx_low_map[1 << 16];
+static inline uint64_t vx_low(uint64_t v) { return !(v >> 32) && vx_low_map[v >> 16] ? v + vx_low_base : v; }
+static inline uint64_t vx_unlow(uint64_t v) { return vx_low_base && v - vx_low_base < (1ull << 32) ? v - vx_low_base : v; }
+static inline void vx_unlow_at(uint64_t p) {                  // (an output the function stored a pointer through)
+    if (!vx_low_base || !p) return;
+    uint64_t v = *(const uint64_t *)(uintptr_t)p;
+    if (v - vx_low_base < (1ull << 32)) *(uint64_t *)(uintptr_t)p = v - vx_low_base;
+}
+
+#define VX_LOW(p) ((void *)(uintptr_t)vx_low((uint64_t)(uintptr_t)(p)))
 #else
-#define vx_guest_refresh(p, n) ((void)0)
+#define VX_LOW(p) ((void *)(p))
+#endif
+// A new Metal buffer whose memory a Map will hand the program: the vCPU guest must not keep an older page at that
+// address (the kernel unmapped a freed buffer's memory, unseen by src/vm_hooks.c, and a new one can come there).
+#ifdef __aarch64__
+void xv_unmap(uint64_t va, uint64_t len);
+#define vx_guest_forget(p, n) xv_unmap((uint64_t)(uintptr_t)(p), (n))
+#else
+#define vx_guest_forget(p, n) ((void)0)
 #endif
 void     vx_thread_detach(void);       // frees the calling thread's TEB and TLS (after its detach notifications)
 void     vx_notify_thread(DWORD reason);   // TLS callbacks and DllMain for thread attach (2) / detach (3)

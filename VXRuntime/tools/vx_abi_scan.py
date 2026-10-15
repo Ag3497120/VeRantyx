@@ -74,7 +74,8 @@ def classify(t):                                         # how a value of type t
 
 def desc(t):                                             # spelling, ABI class, canonical kind and size of a type
     c = canon(t)
-    return {"type": s(typeSpell(t)), "cls": classify(t), "kind": c.kind, "size": sizeOf(c) if c.kind != K_VOID else 0}
+    return {"type": s(typeSpell(t)), "cls": classify(t), "kind": c.kind, "size": sizeOf(c) if c.kind != K_VOID else 0,
+            "pp": c.kind == K_POINTER and canon(pointee(c)).kind == K_POINTER}   # (a pointer to a pointer: an output)
 
 def where(cur):
     line, col, off = C.c_uint(), C.c_uint(), C.c_uint()

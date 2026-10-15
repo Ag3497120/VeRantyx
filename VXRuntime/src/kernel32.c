@@ -701,7 +701,41 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
 }
 // A reservation below `limit` (NtAllocateVirtualMemory's ZeroBits: LuaJIT asks for the low 2 GB). vxrt is linked
 // with a 64 KB __PAGEZERO so the low 4 GB can be mapped; free gaps are found with mach_vm_region.
+#ifdef __aarch64__
+// The vCPU's low memory (vx.h): the host's at vx_low_base + the address, granules marked in vx_low_map; the host
+// address is returned (the thunk hands the program its own). Not 0x40000000-0x4000ffff: shared resources' handles.
+static int in_low(uintptr_t a) { return vx_low_base && a - vx_low_base < (1ull << 32); }
+static void *low_alloc(size_t size, uintptr_t limit, DWORD protect) {
+    static uintptr_t cursor = 0x1000000;
+    size_t n = (size + GRANULARITY - 1) / GRANULARITY;
+    pthread_mutex_lock(&g_vm_lock);
+    for (int pass = 0; pass < 2; pass++)
+        for (uintptr_t g = (pass ? 0x1000000 : cursor) / GRANULARITY, run = 0; (g + 1) * GRANULARITY <= limit; g++) {
+            int usable = !vx_low_map[g] && (g < 0x4000 || g > 0x4000);
+            run = usable ? run + 1 : 0;
+            if (run < n) continue;
+            uintptr_t a = (g + 1 - n) * GRANULARITY;
+            mach_vm_address_t host = vx_low_base + a;
+            if (mach_vm_allocate(mach_task_self(), &host, n * GRANULARITY, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) != KERN_SUCCESS) break;
+            mach_vm_protect(mach_task_self(), host, n * GRANULARITY, 0, VX_PROT_RWX);
+            memset(vx_low_map + a / GRANULARITY, 1, n);
+            res_insert((uintptr_t)host, n * GRANULARITY, protect);
+            cursor = a + n * GRANULARITY;
+            pthread_mutex_unlock(&g_vm_lock);
+            return (void *)(uintptr_t)host;
+        }
+    pthread_mutex_unlock(&g_vm_lock);
+    vx_set_last_error(8);
+    return NULL;
+}
+#else
+static const uint64_t vx_low_base = 0;
+static int in_low(uintptr_t a) { (void)a; return 0; }
+#endif
 void *vx_virtual_alloc_below(size_t size, uintptr_t limit, DWORD protect) {
+#ifdef __aarch64__
+    if (vx_low_base) return low_alloc(size, limit, protect);
+#endif
     static uintptr_t cursor = 0x1000000;
     mach_vm_size_t len = (size + GRANULARITY - 1) & ~(mach_vm_size_t)(GRANULARITY - 1);
     pthread_mutex_lock(&g_vm_lock);
@@ -738,7 +772,14 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
         prot_set(r->base, r->base + r->size, 0);
         VX_CODE_FREED((void *)r->base, r->size);
         size_t n = mapped_size(r->size);
-        if (n >= (1u << 20) && g_nspare < 32 && g_spare_bytes + n <= (512u << 20) && r->base >= (1ull << 32)) {
+        if (in_low(r->base)) {                                            // (back to the low reservation, no access)
+            mach_vm_address_t a = r->base;
+            mach_vm_allocate(mach_task_self(), &a, n, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE);
+            mach_vm_protect(mach_task_self(), a, n, 0, VM_PROT_NONE);
+#ifdef __aarch64__
+            memset(vx_low_map + (r->base - vx_low_base) / GRANULARITY, 0, n / GRANULARITY);
+#endif
+        } else if (n >= (1u << 20) && g_nspare < 32 && g_spare_bytes + n <= (512u << 20) && r->base >= (1ull << 32)) {
             g_spare[g_nspare++] = (spare_block){ r->base, n };              // (low-memory blocks are not reused)
             g_spare_bytes += n;
             mach_vm_behavior_set(mach_task_self(), r->base, n, VM_BEHAVIOR_REUSABLE);   // its pages can go meanwhile
@@ -776,7 +817,17 @@ static DWORD mach_protect(vm_prot_t p) {
     if (x) return w ? PAGE_EXECUTE_READWRITE : r ? 0x20 /* PAGE_EXECUTE_READ */ : 0x10 /* PAGE_EXECUTE */;
     return w ? 0x04 /* PAGE_READWRITE */ : r ? 0x02 /* PAGE_READONLY */ : 0x01 /* PAGE_NOACCESS */;
 }
+static size_t virtual_query(const void *addr, MEMORY_BASIC_INFORMATION *mbi, size_t len);
+// (the vCPU's low memory: its addresses as the program has them)
 static WINAPI size_t VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mbi, size_t len) {
+    size_t r = virtual_query(addr, mbi, len);
+    if (r && in_low((uintptr_t)mbi->base)) {
+        mbi->base = (uint8_t *)mbi->base - vx_low_base;
+        if (in_low((uintptr_t)mbi->alloc_base)) mbi->alloc_base = (uint8_t *)mbi->alloc_base - vx_low_base;
+    }
+    return r;
+}
+static size_t virtual_query(const void *addr, MEMORY_BASIC_INFORMATION *mbi, size_t len) {
     if (len < sizeof *mbi) { vx_set_last_error(24 /* ERROR_BAD_LENGTH */); return 0; }
     uintptr_t page = (uintptr_t)addr & ~(uintptr_t)0xfff;
     const uintptr_t top = 0x7ffffffeffffull + 1;               // past the highest application address

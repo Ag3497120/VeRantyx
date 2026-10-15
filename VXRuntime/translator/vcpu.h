@@ -35,8 +35,8 @@ void xv_fault(uint64_t *pc, uint64_t *addr, int *write);
 // After a longjmp out of nested runs (an exception resumed further out): the nesting depth as it is again.
 int xv_depth(void);
 void xv_set_depth(int depth);
+void xv_set_low(uint64_t base);                              // guest addresses below 4 GB: the host's at base + them
 void xv_unmap(uint64_t va, uint64_t len);                   // host memory going away: out of the guest
-void xv_refresh(uint64_t va, uint64_t len);                 // ... or replaced unseen: out if its VM object changed
 void xv_protect(uint64_t page, int read_only);             // a host page's guest mappings read-only (SMC) or not
 // SuspendThread (src/sync.c's signal, on the thread itself): a thread in the guest leaves it, and the hook gets the
 // guest's registers (between runs: r NULL, the context holds the state); xv_interrupt from the signal handler: 1 if

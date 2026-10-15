@@ -84,7 +84,7 @@ int vx_format(char *out, size_t cap, const char *fmt, const char *ap) {
             break;
         }
         case 's': case 'S': {
-            const void *s = (const void *)NEXT64();
+            const void *s = VX_LOW(NEXT64());                   // (the vCPU's memory below 4 GB: vx.h)
             char conv_buf[4096];
             const char *text = s ? (const char *)s : "(null)";
             if (s && (wide || conv == 'S')) { utf16_to_utf8((const WCHAR *)s, -1, conv_buf, sizeof conv_buf); text = conv_buf; }

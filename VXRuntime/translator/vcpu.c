@@ -28,7 +28,7 @@ static size_t g_pool_used;
 static uint64_t *g_l0, g_l0_ipa;
 static uint64_t g_next_ipa = DATA_IPA, g_max_ipa;
 static uint64_t *g_mapped, *g_ipa;                          // host pages in the guest (0: empty, page | 1: gone) and where
-static uint64_t *g_obj;                                     // the VM object behind each when it was put in (xv_refresh)
+static uint64_t g_low_base;                                 // the guest's low 4 GB: the host's at this offset (xv_set_low)
 static volatile uint64_t g_gen;                             // page tables changed for the worse: TLBs to flush
 static uint64_t g_tlbi;                                     // guest code: TLBI VMALLE1; DSB; ISB; HVC #4 (xv_set_tlbi)
 static int g_ok;
@@ -57,7 +57,6 @@ int xv_init(void) {
     g_pool = mmap(NULL, POOL_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     g_mapped = mmap(NULL, sizeof(uint64_t) << SET_BITS, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     g_ipa = mmap(NULL, sizeof(uint64_t) << SET_BITS, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    g_obj = mmap(NULL, sizeof(uint64_t) << SET_BITS, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_pool == MAP_FAILED || g_mapped == MAP_FAILED || hv_vm_map(g_pool, POOL_IPA, POOL_BYTES, HV_MEMORY_READ | HV_MEMORY_WRITE) != HV_SUCCESS) {
         pthread_mutex_unlock(&g_lock); return 0;
     }
@@ -112,25 +111,11 @@ void xv_unmap(uint64_t va, uint64_t len) {
     for (uint64_t page = va & ~(uint64_t)(HOST_PAGE - 1); page < va + len; page += HOST_PAGE) {
         int64_t s = set_find(page);
         if (s >= 0) unmap_slot(page, s);
+        if (g_low_base && page - g_low_base < (1ull << 32) && (s = set_find(page - g_low_base)) >= 0) unmap_slot(page - g_low_base, s);
     }
     pthread_mutex_unlock(&g_lock);
 }
-static uint64_t page_object(uint64_t page) {
-    vm_page_info_basic_data_t info; mach_msg_type_number_t count = VM_PAGE_INFO_BASIC_COUNT;
-    if (mach_vm_page_info(mach_task_self(), page, VM_PAGE_INFO_BASIC, (vm_page_info_t)&info, &count) != KERN_SUCCESS) return 0;
-    return (uint64_t)info.object_id;
-}
-// Memory the host may have replaced without the release hook seeing it (a Metal buffer's: the kernel unmaps those),
-// about to be handed to the program (Map): pages whose VM object is no longer the one put in leave the guest.
-void xv_refresh(uint64_t va, uint64_t len) {
-    if (!g_ok) return;
-    pthread_mutex_lock(&g_lock);
-    for (uint64_t page = va & ~(uint64_t)(HOST_PAGE - 1); page < va + len; page += HOST_PAGE) {
-        int64_t s = set_find(page);
-        if (s >= 0 && page_object(page) != g_obj[s]) unmap_slot(page, s);
-    }
-    pthread_mutex_unlock(&g_lock);
-}
+void xv_set_low(uint64_t base) { g_low_base = base; }
 // Write-protects (or not) a host page's guest mappings (SMC: the engine's pages translated code came from).
 void xv_protect(uint64_t page, int read_only) {
     pthread_mutex_lock(&g_lock);
@@ -159,16 +144,19 @@ static void *snapshot(uint64_t page, uint32_t *parts) {
     if (!*parts) { munmap(copy, HOST_PAGE); return NULL; }
     return copy;
 }
+// A guest page below 4 GB is the host's page at g_low_base + its address (the guest's page tables say so; the host
+// cannot map there).
 static int map_host_page(uint64_t va) {
-    uint64_t page = va & ~(uint64_t)(HOST_PAGE - 1);
+    uint64_t page = va & ~(uint64_t)(HOST_PAGE - 1), host = page;
+    if (!(page >> 32)) { if (!g_low_base) return 0; host = g_low_base + page; }
     pthread_mutex_lock(&g_lock);
     if (set_find(page) >= 0) { pthread_mutex_unlock(&g_lock); return 1; }
     uint32_t s = set_slot(page);
     while (g_mapped[s] && !(g_mapped[s] & 1)) s = (s + 1) & ((1u << SET_BITS) - 1);   // (an empty slot or a gone one)
-    mach_vm_address_t a = page; mach_vm_size_t size = 0;
+    mach_vm_address_t a = host; mach_vm_size_t size = 0;
     vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
     if (mach_vm_region(mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS ||
-        a > page || !(info.protection & VM_PROT_READ) || g_next_ipa + HOST_PAGE > g_max_ipa) {
+        a > host || !(info.protection & VM_PROT_READ) || g_next_ipa + HOST_PAGE > g_max_ipa) {
         pthread_mutex_unlock(&g_lock); return 0;
     }
     // (writable by its maximum protection: the SMC watch makes code pages read-only for a while, and the guest's own
@@ -182,8 +170,8 @@ static int map_host_page(uint64_t va) {
     // page the VM refuses (a file's view whose last page passes the file's end).
     int ok = 0;
     if (!(info.protection & VM_PROT_EXECUTE))
-        ok = hv_vm_map((void *)(uintptr_t)page, ipa, HOST_PAGE, HV_MEMORY_READ | (writable ? HV_MEMORY_WRITE : 0) | HV_MEMORY_EXEC) == HV_SUCCESS;
-    if (!ok && !(info.protection & VM_PROT_WRITE) && (!(info.protection & VM_PROT_EXECUTE) || !writable) && (copy = snapshot(page, &parts))) {
+        ok = hv_vm_map((void *)(uintptr_t)host, ipa, HOST_PAGE, HV_MEMORY_READ | (writable ? HV_MEMORY_WRITE : 0) | HV_MEMORY_EXEC) == HV_SUCCESS;
+    if (!ok && !(info.protection & VM_PROT_WRITE) && (!(info.protection & VM_PROT_EXECUTE) || !writable) && (copy = snapshot(host, &parts))) {
         writable = 0;
         ok = hv_vm_map(copy, ipa, HOST_PAGE, HV_MEMORY_READ | HV_MEMORY_EXEC) == HV_SUCCESS;
     }
@@ -191,7 +179,7 @@ static int map_host_page(uint64_t va) {
     g_next_ipa += HOST_PAGE;
     for (int k = 0; k < HOST_PAGE / 4096; k++) if (parts >> k & 1) map4k(page + 4096 * (uint64_t)k, ipa + 4096 * (uint64_t)k, writable);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    g_mapped[s] = page; g_ipa[s] = ipa; g_obj[s] = page_object(page);
+    g_mapped[s] = page; g_ipa[s] = ipa;
     pthread_mutex_unlock(&g_lock);
     return 1;
 }
