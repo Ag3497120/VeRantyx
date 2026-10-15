@@ -280,6 +280,7 @@ static inline uint32_t a64_ldapr(int size, int t, int n) { return (size == 8 ? 0
 static inline uint32_t a64_stlr_sz(int size, int t, int n) { return (size == 8 ? 0xC89FFC00u : size == 4 ? 0x889FFC00u : size == 2 ? 0x489FFC00u : 0x089FFC00u) | (uint32_t)n << 5 | (uint32_t)t; }
 static inline uint32_t a64_eor_lsr(int d, int n, int m, int sh) { return 0xCA400000u | (uint32_t)m << 16 | (uint32_t)sh << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_bl(int32_t words) { return 0x94000000u | ((uint32_t)words & 0x3FFFFFF); }
+static inline uint32_t a64_hvc(int imm16) { return 0xD4000002u | ((uint32_t)imm16 & 0xFFFF) << 5; }
 static inline uint32_t a64_br(int n) { return 0xD61F0000u | (uint32_t)n << 5; }
 static inline uint32_t a64_crc32c(int size, int d, int n, int m) {     // CRC32CB/H/W/X
     return (size == 8 ? 0x9AC05C00u : 0x1AC05000u | (uint32_t)(size == 1 ? 0 : size == 2 ? 1 : 2) << 10) | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)d;

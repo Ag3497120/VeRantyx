@@ -14,13 +14,14 @@ build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio
 
 # The ARM64 build (phase 4, TRANSLATOR.md): the same runtime as ARM64 code, the program run by the translator's
 # engine in the process. Thunks for every ms_abi function come from the sources' C signatures (tools/vx_thunks.py).
-ARM64_SRC = $(filter-out src/context.S,$(SRC)) src/arm64.c src/context_arm64.S translator/xlat.c translator/x87.c translator/x86dec.c translator/engine.c
+ARM64_SRC = $(filter-out src/context.S,$(SRC)) src/arm64.c src/context_arm64.S translator/xlat.c translator/x87.c translator/x86dec.c translator/engine.c translator/vcpu.c
 build/thunks/stamp: $(filter %.c %.m,$(SRC)) src/vx.h tools/vx_thunks.py tools/vx_abi_scan.py
 	@mkdir -p build/thunks
 	python3 tools/vx_thunks.py build/thunks $(filter %.c %.m,$(SRC))
 	@touch $@
 build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp src/arm64.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
-	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL
+	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework Hypervisor
+	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
@@ -116,9 +117,10 @@ build/x86dec_check: translator/x86dec.c translator/x86dec.h translator/x86dec_ch
 build/ref_x86: translator/diff/ref_x86.c translator/diff/difftest.h
 	@mkdir -p build
 	$(CC) -arch x86_64 -O1 -Wall -o $@ translator/diff/ref_x86.c
-build/difftest: translator/diff/difftest.c translator/diff/difftest.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h translator/x87.c translator/x87.h translator/engine.c translator/engine.h translator/cpuid_table.h
+build/difftest: translator/vcpu.c translator/vcpu.h translator/diff/difftest.c translator/diff/difftest.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h translator/x87.c translator/x87.h translator/engine.c translator/engine.h translator/cpuid_table.h
 	@mkdir -p build
-	$(HOSTCC) -Wno-missing-field-initializers translator/x86dec.c translator/xlat.c translator/x87.c translator/engine.c translator/diff/difftest.c -o $@
+	$(HOSTCC) -Wno-missing-field-initializers translator/x86dec.c translator/xlat.c translator/x87.c translator/engine.c translator/vcpu.c translator/diff/difftest.c -framework Hypervisor -o $@
+	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 # translator coverage over the installed games' PEs (every function in .pdata): `make coverage`
 build/coverage: translator/cpuid_table.h translator/coverage.c translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h translator/x87.c translator/x87.h
 	@mkdir -p build
@@ -136,8 +138,9 @@ build/bench_rosetta: build/bench_kernels_x86.o translator/bench/rosetta_main.c
 	$(CC) -arch x86_64 -O2 translator/bench/rosetta_main.c build/bench_kernels_x86.o -o $@
 build/bench_native: translator/bench/kernels.c translator/bench/rosetta_main.c
 	$(CC) -arch arm64 -O2 -fno-stack-protector -fno-builtin -fno-vectorize translator/bench/rosetta_main.c translator/bench/kernels.c -o $@
-build/bench: translator/bench/bench.c translator/engine.c translator/engine.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x87.c translator/cpuid_table.h
-	$(HOSTCC) -Wno-missing-field-initializers -Itranslator translator/bench/bench.c translator/engine.c translator/xlat.c translator/x87.c translator/x86dec.c -o $@
+build/bench: translator/bench/bench.c translator/vcpu.c translator/vcpu.h translator/engine.c translator/engine.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x87.c translator/cpuid_table.h
+	$(HOSTCC) -Wno-missing-field-initializers -Itranslator translator/bench/bench.c translator/engine.c translator/vcpu.c translator/xlat.c translator/x87.c translator/x86dec.c -framework Hypervisor -o $@
+	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 xlat-bench: build/bench build/bench_image build/bench_rosetta build/bench_native
 	@echo "== Rosetta 2"; build/bench_rosetta 5
 	@echo "== VXRuntime engine"; build/bench build/bench_image 5 0

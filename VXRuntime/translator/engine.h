@@ -14,6 +14,9 @@ typedef struct {
 // ordered: memory accesses that may be shared as LDAPR / STLR (in-process, without TSO); installs a SIGBUS / SIGSEGV
 // handler for those across 16 bytes (call it after the program's own handlers: others go to them).
 xe *xe_new(int ordered);
+// The same, the translated code running in a Hypervisor.framework guest with x86's memory order in hardware (TSO):
+// vcpu.c. NULL: no hypervisor (the process needs the com.apple.security.hypervisor entitlement).
+xe *xe_new_vcpu(void);
 // Addresses that are native functions translated code may call (the ARM64 runtime's thunks, src/arm64.c): find
 // returns the thunk for one, else NULL; the engine then makes that address's block a call of the thunk.
 void xe_set_native(xe *e, void (*(*find)(uint64_t rip))(x86_ctx *));

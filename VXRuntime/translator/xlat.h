@@ -63,7 +63,9 @@ typedef struct {
     uint32_t dead_flags;         // this instruction's flags (EFLAGS bits) that are written again before any read: not computed
     uint64_t stop;               // xlat_block_linked: where the engine returns to C (the flags are live there)
     int fuse_kind, fuse_size, fuse_in_reg, keep_operands;
-    int check_bytes;             // xlat_block_linked: compare the block's x86 bytes first (code on a page written often)
+    int check_bytes;
+    int vcpu;                    // the code runs in a Hypervisor.framework guest (vcpu.c): calls of host code are HVC #2
+                                 //   (xlat_helper) and #3 (a native function: its thunk in S0)             // xlat_block_linked: compare the block's x86 bytes first (code on a page written often)
     // xlat_block_linked: rarely taken code (the NaN fixes) goes after the block, out of the straight path
     int defer_cold;
     struct cold { size_t at; int kind; uint32_t *words; size_t n; } *cold;
@@ -97,6 +99,12 @@ int xlat_block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end);
 // (a thunk: it reads the call's arguments there and writes the result), the state back, then RET, or on at
 // ctx->rip when the function set ctx->jump.
 void xlat_block_native(xlat_buf *b, void (*fn)(x86_ctx *));
+// The guest's entry and exit (vcpu.c): x0 = the context on entry, then on at ctx->entry; the exit (S1: the next
+// RIP) stores the state and leaves with HVC #1.
+void xlat_guest_enter(xlat_buf *b);
+extern const uint8_t *xlat_guest_parity;
+void xlat_guest_exit(xlat_buf *b);
+enum { XV_HVC_EXIT = 1, XV_HVC_HELPER, XV_HVC_NATIVE, XV_HVC_VECTOR = 0x10 };
 // Helpers translated code calls for rare or intricate instructions (one-operand MUL/IMUL/DIV/IDIV, RCL/RCR).
 void xlat_helper(x86_ctx *ctx);
 // A test harness's entry and exit: loads x86_ctx (pointer in x0) into the registers above, and stores it back.

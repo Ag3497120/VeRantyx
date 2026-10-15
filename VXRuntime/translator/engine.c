@@ -4,6 +4,7 @@
 // through the link stub (to C when its target is not translated yet), and is then patched into a branch to the
 // target's code; an indirect one (RET, JMP/CALL r/m) looks its target up in a table the generated code reads.
 #include "engine.h"
+#include "vcpu.h"
 #include "a64.h"
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
@@ -40,6 +41,8 @@ struct xe {
     blk *blocks; size_t nblocks, cblocks;
     page_rec *pages;                // open addressing (page 0: empty)
     int smc;                        // xe_set_smc: write-protect the pages translated code came from
+    int vcpu;                       // xe_new_vcpu: the code runs in a Hypervisor.framework guest (vcpu.c)
+    uint32_t *vectors;              //   its exception vectors (each HVC #0x10 + n)
     int ordered;
     xe_stats stats;
 };
@@ -57,17 +60,23 @@ static void stubs(xe *e) {
     xlat_buf b = { 0 };
     uint32_t *c = e->code;
     size_t n = 0;
-    // enter(ctx): save the host's registers, load the x86 state, go to ctx->entry
-    e->enter = c + n;
-    xlat_prologue(&b);
-    memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
-    n = emit(c, n, a64_ldr(8, S0, XC, CTX_ENTRY));
-    n = emit(c, n, a64_br(S0));
-    // exit: S1 is the next RIP; store the state, back to the host
-    e->exit = c + n;
-    n = emit(c, n, a64_str(8, S1, XC, CTX_RIP));
-    xlat_epilogue(&b);
-    memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
+    if (e->vcpu) {
+        // In the guest (vcpu.c): enter with x0 = the context, exit with HVC #1 (the state stored)
+        e->enter = c + n; xlat_guest_enter(&b); memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
+        e->exit = c + n; xlat_guest_exit(&b); memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
+    } else {
+        // enter(ctx): save the host's registers, load the x86 state, go to ctx->entry
+        e->enter = c + n;
+        xlat_prologue(&b);
+        memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
+        n = emit(c, n, a64_ldr(8, S0, XC, CTX_ENTRY));
+        n = emit(c, n, a64_br(S0));
+        // exit: S1 is the next RIP; store the state, back to the host
+        e->exit = c + n;
+        n = emit(c, n, a64_str(8, S1, XC, CTX_RIP));
+        xlat_epilogue(&b);
+        memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
+    }
     free(b.code);
     // lookup: S1 is the target; its code from the table, else exit (ctx->link 0: nothing to patch)
     e->lookup = c + n;
@@ -94,6 +103,12 @@ static void stubs(xe *e) {
     n = emit(c, n, a64_subi(T_T, LR, 4));
     n = emit(c, n, a64_str(8, T_T, XC, CTX_LINK));
     n = emit(c, n, a64_b((int32_t)(body - (c + n))));
+    if (e->vcpu) {                                                        // the guest's exception vectors: HVC #0x10 + n
+        n = (n + 511) & ~(size_t)511;                                     // (2 KB aligned, 16 entries of 128 bytes)
+        e->vectors = c + n;
+        for (int i = 0; i < 16; i++) { c[n + 32 * (size_t)i] = a64_hvc(XV_HVC_VECTOR + i); c[n + 32 * (size_t)i + 1] = a64_b(-1); }
+        n += 512;
+    }
     e->used = n;
 }
 // Forgets the rings' entries (their code is gone): x86 address ~0, which no return matches.
@@ -161,9 +176,16 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
     else { signal(sig, SIG_DFL); raise(sig); }
 }
 
-xe *xe_new(int ordered) {
+static xe *make(int ordered, int vcpu);
+xe *xe_new(int ordered) { return make(ordered, 0); }
+xe *xe_new_vcpu(void) { return xv_init() ? make(0, 1) : NULL; }   // (the guest is TSO: plain accesses)
+static xe *make(int ordered, int vcpu) {
     xe *e = calloc(1, sizeof *e);
-    e->code = mmap(NULL, CODE_BYTES, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    e->vcpu = vcpu;
+    // (vcpu: plain memory the guest runs; the host never runs it, and an executable host page must not go into a VM:
+    //  macOS panics, SPTM)
+    e->code = vcpu ? mmap(NULL, CODE_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+                   : mmap(NULL, CODE_BYTES, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
     if (e->code == MAP_FAILED) { free(e); return NULL; }
     e->cap = CODE_BYTES / 4;
     e->table = calloc(1u << TABLE_BITS, sizeof *e->table);
@@ -282,7 +304,7 @@ void xe_forget(xe *e, uint64_t addr, uint64_t len) {
     }
     pthread_mutex_unlock(&e->lock);
 }
-void xe_set_smc(xe *e, int on) { e->smc = on; }
+void xe_set_smc(xe *e, int on) { e->smc = on && !e->vcpu; }   // (vcpu: not yet)
 
 // The block at rip, translated now if it is not yet: its id (-1: it cannot be). once: the instruction at rip
 // alone, not kept (not found by others, no page watched).
@@ -290,7 +312,7 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
     mentry *found = once ? NULL : find_entry(e, rip);
     if (found) return found->id;
     xlat_buf b = { 0 };
-    b.ordered = e->ordered; b.stop = stop;
+    b.ordered = e->ordered; b.stop = stop; b.vcpu = e->vcpu;
     uint64_t end = rip + 1;
     void (*thunk)(x86_ctx *) = e->native ? e->native(rip) : NULL;
     if (thunk) xlat_block_native(&b, thunk);
@@ -387,7 +409,8 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
         pthread_mutex_unlock(&e->lock);
         e->stats.entries++;
         c->entry = host;
-        ((void (*)(x86_ctx *))(void *)e->enter)(c);
+        if (e->vcpu) { if (xv_enter(c, (uint64_t)(uintptr_t)e->enter, (uint64_t)(uintptr_t)e->vectors)) return -2; }
+        else ((void (*)(x86_ctx *))(void *)e->enter)(c);
         if (c->stale) {                                                   // (a checked block found its code changed)
             c->stale = 0;
             pthread_mutex_lock(&e->lock);

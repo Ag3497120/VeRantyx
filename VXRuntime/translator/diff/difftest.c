@@ -1257,7 +1257,8 @@ int main(int argc, char **argv) {
     struct sigaction sa = { .sa_handler = on_signal };
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL);
-    engine = xe_new(getenv("DT_ORDERED") != NULL);                         // (after: its handler passes the rest on)
+    engine = getenv("DT_VCPU") ? xe_new_vcpu() : xe_new(getenv("DT_ORDERED") != NULL);   // (after: its handler passes the rest on)
+    if (!engine) { fprintf(stderr, "difftest: no engine (DT_VCPU: the hypervisor entitlement?)\n"); return 1; }
 
     int to_ref[2], from_ref[2];
     if (pipe(to_ref) || pipe(from_ref)) return 1;

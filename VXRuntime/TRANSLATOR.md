@@ -286,6 +286,21 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   x86 build gets its low 4 GB with `-pagezero_size 0x10000`). Programs that ask for low memory (LuaJIT 2.0's
   allocator, through NtAllocateVirtualMemory ZeroBits: SteamVR Home's vscript.dll; Half-Life: Alyx's does not import
   it) cannot run this way; under a virtual CPU the guest's address space is ours, so that is where they would go.
+- **Phase 4c, translated code in a vCPU: first part (2026-10-15).** `translator/vcpu.c`, `xe_new_vcpu()`: the
+  engine's code runs on a Hypervisor.framework vCPU of the process (one per thread) at EL1 with ACTLR_EL1.EnTSO (x86's
+  memory order in hardware, so plain loads and stores), page tables of our own (4 KB granule, 48-bit VA; the guest
+  sees host memory at the same addresses), and leaves with HVC: #1 the engine's exit, #2 a helper, #3 a native
+  function, #0x10+n an exception, which brings a host page in (16 KB, at a guest physical address of its own, up to
+  the M5's and M1's 40-bit IPA) when the address is mapped in the process. **Found the hard way:** putting an
+  executable host page (the engine's MAP_JIT code) into the VM with hv_vm_map panics macOS 26 ("[SPTM]
+  VIOLATION_ILLEGAL_MAPPING_TYPE") instead of failing; the guest's code is now plain read-write memory the host never
+  runs, the parity table a copy, and executable host pages are never mapped. Experiments run on a second Mac (a
+  MacBook Air, M5) over SSH. Results there (best of 10, ms): in-process / in-process ordered (LDAPR/STLR) / vCPU (TSO)
+  / Rosetta / native: sort 20.1 / 22.0 / 20.4 / 15.4 / 15.0, tree 27.5 / 31.1 / 28.0 / 18.1 / 15.6, physics 4.57 /
+  4.94 / 4.91 / 1.84 / 1.19, interp 16.1 / 17.2 / 17.5 / 10.6 / 5.37, matmul 6.53 / 6.49 / 6.65 / 2.72 / 4.94: the
+  vCPU costs what unordered in-process code does and gives x86's order exactly; same checksums. Random programs in
+  the vCPU (`DT_VCPU=1`): 4 seeds, 20,000 programs, identical to Rosetta. Next: the runtime on it (native calls by HVC,
+  callbacks, exceptions, the low 4 GB), and how much the exits cost a game.
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.

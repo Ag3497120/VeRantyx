@@ -1,5 +1,5 @@
 // The kernels (kernels.c, built for x86-64 into a static image at a fixed address) run on the engine: each called as
-// rosetta_main.c calls it, timed the same way. usage: bench <image> [reps] [ordered 0/1]
+// rosetta_main.c calls it, timed the same way. usage: bench <image> [reps] [mode: 0 in-process, 1 ordered, 2 vCPU]
 #include "../engine.h"
 #include <fcntl.h>
 #include <mach-o/loader.h>
@@ -17,7 +17,7 @@ enum { STOP = 0x7FF000 };                                       // (a return add
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: bench <image> [reps] [ordered]\n"); return 2; }
-    int reps = argc > 2 ? atoi(argv[2]) : 3, ordered = argc > 3 && atoi(argv[3]);
+    int reps = argc > 2 ? atoi(argv[2]) : 3, mode = argc > 3 ? atoi(argv[3]) : 0, ordered = mode == 1;   // (2: in a vCPU)
     int fd = open(argv[1], O_RDONLY); struct stat st; fstat(fd, &st);
     uint8_t *f = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     const struct mach_header_64 *mh = (const void *)f;
@@ -50,8 +50,12 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < sym->nsyms; i++)
         for (int k = 0; k < 8; k++) if (!strcmp(strs + nl[i].n_un.n_strx, K[k].name)) addr[k] = nl[i].n_value;
     uint8_t *stack = mmap(NULL, 8 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    xe *e = xe_new(ordered);
-    static x86_ctx c;
+    if (getenv("XV_DEBUG")) fprintf(stderr, "making the engine\n");
+    xe *e = mode == 2 ? xe_new_vcpu() : xe_new(ordered);
+    if (getenv("XV_DEBUG")) fprintf(stderr, "engine %p\n", (void *)e);
+    if (!e) { fprintf(stderr, "bench: no engine (vCPU: the hypervisor entitlement?)\n"); return 1; }
+    x86_ctx *cp = calloc(1, sizeof *cp);                         // (heap: memory a vCPU guest may have)
+#define c (*cp)
     for (int k = 0; k < 8; k++) {
         if (!addr[k]) { fprintf(stderr, "bench: no %s\n", K[k].name); return 1; }
         uint64_t r = 0; double best = 1e9;

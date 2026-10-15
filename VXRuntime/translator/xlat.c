@@ -226,7 +226,7 @@ static void call_helper_r(xlat_buf *b, uint32_t op, int op_reg, int val) {
     if (op_reg < 0) { mov_imm(b, S0, op); E(b, a64_str(8, S0, XC, CTX_HELPER_OP)); }
     E(b, a64_mov(0, XC));
     mov_imm(b, S0, (uint64_t)(uintptr_t)xlat_helper);
-    E(b, a64_blr(S0));
+    E(b, b->vcpu ? a64_hvc(XV_HVC_HELPER) : a64_blr(S0));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
     E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
@@ -1565,7 +1565,7 @@ void xlat_block_native(xlat_buf *b, void (*fn)(x86_ctx *)) {
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
     E(b, a64_mov(0, XC));
     mov_imm(b, S0, (uint64_t)(uintptr_t)fn);
-    E(b, a64_blr(S0));
+    E(b, b->vcpu ? a64_hvc(XV_HVC_NATIVE) : a64_blr(S0));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
     E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
@@ -1750,6 +1750,28 @@ void xlat_prologue(xlat_buf *b) {
     E(b, a64_ldr(8, XS, XC, CTX_RAS));
     E(b, a64_mrs_fpcr(T_A)); E(b, a64_str(8, T_A, SP, 160));             // (the host's FPCR, back in the epilogue)
     E(b, a64_ldr(4, T_A, XC, CTX_MXCSR)); mxcsr_to_fpcr(b, T_B, T_A); E(b, a64_msr_fpcr(T_B)); E(b, a64_msr_fpsr(XZR));
+}
+const uint8_t *xlat_guest_parity = xlat_parity;   // (vcpu.c: a copy in memory the guest may have)
+void xlat_guest_enter(xlat_buf *b) {
+    E(b, a64_mov(XC, 0));
+    mov_imm(b, XP, (uint64_t)(uintptr_t)xlat_guest_parity);
+    E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
+    for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
+    for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
+    E(b, a64_ldr(8, XS, XC, CTX_RAS));
+    E(b, a64_ldr(4, T_A, XC, CTX_MXCSR)); mxcsr_to_fpcr(b, T_B, T_A); E(b, a64_msr_fpcr(T_B)); E(b, a64_msr_fpsr(XZR));
+    E(b, a64_ldr(8, S0, XC, CTX_ENTRY));
+    E(b, a64_br(S0));
+}
+void xlat_guest_exit(xlat_buf *b) {
+    E(b, a64_str(8, S1, XC, CTX_RIP));
+    for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
+    for (int r = 0; r < 16; r += 2) E(b, a64_stpq(r, r + 1, XC, CTX_XMM + r * 16));
+    E(b, a64_str(8, XF, XC, CTX_FLAGS));
+    E(b, a64_str(8, XS, XC, CTX_RAS));
+    mxcsr_sync(b);
+    E(b, a64_hvc(XV_HVC_EXIT));
+    E(b, a64_b(-1));                                                      // (never: the host enters again at the entry)
 }
 void xlat_epilogue(xlat_buf *b) {
     for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
