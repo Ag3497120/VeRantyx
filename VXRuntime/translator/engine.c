@@ -429,13 +429,17 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
         if (id < 0) { pthread_mutex_unlock(&e->lock); return -1; }
         uint64_t host = e->blocks[id].host;
         if (c->link) {                                                    // (patch the site that came here: a call's stays BL)
-            uint32_t *p = (uint32_t *)(uintptr_t)c->link;
-            int call = (*p & 0xFC000000u) == 0x94000000u && p + ((int32_t)(*p << 6) >> 6) == e->link_call;
-            int32_t words = (int32_t)((uint32_t *)(uintptr_t)host - p);
-            writable(1); *p = call ? a64_bl(words) : a64_b(words); writable(0);
-            add_site(e, (uint32_t)id, p, call);
-            sys_icache_invalidate(p, 4);
-            e->stats.linked++;
+            // (only while it still goes to a link stub: two threads can leave through one site, and the second
+            //  would take the first one's BL to the block for a jump's site)
+            uint32_t *p = (uint32_t *)(uintptr_t)c->link, *to = p + ((int32_t)(*p << 6) >> 6);
+            if ((*p & 0xFC000000u) == 0x94000000u && (to == e->link_call || to == e->link)) {
+                int call = to == e->link_call;
+                int32_t words = (int32_t)((uint32_t *)(uintptr_t)host - p);
+                writable(1); *p = call ? a64_bl(words) : a64_b(words); writable(0);
+                add_site(e, (uint32_t)id, p, call);
+                sys_icache_invalidate(p, 4);
+                e->stats.linked++;
+            }
             c->link = 0;
         }
         pthread_mutex_unlock(&e->lock);
