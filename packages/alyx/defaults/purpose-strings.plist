@@ -5,10 +5,9 @@
      visionOS when the app first asks for each permission. -->
 <plist version="1.0">
 <dict>
-	<!-- Removed (empty): the tester build has no hand tracking compiled in (KLEPTON_NO_HANDS); Alyx plays on the PSVR2
-	     Sense controllers. -->
+	<!-- Hand tracking is compiled in: hands alone, or Joy-Con held in each hand, play without Sense controllers. -->
 	<key>NSHandsTrackingUsageDescription</key>
-	<string></string>
+	<string>Half-Life: Alyx uses your hands as the game's hands, with or without Joy-Con.</string>
 	<key>NSAccessoryTrackingUsageDescription</key>
 	<string>Half-Life: Alyx tracks PlayStation VR2 Sense controllers to use them as the game's controllers.</string>
 	<key>NSWorldSensingUsageDescription</key>

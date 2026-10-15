@@ -64,10 +64,13 @@ struct KleptonHandState {
     /// a number that looks physical and is mostly tracker noise.
     var linearVelocity: SIMD3<Float> = .zero
     var angularVelocity: SIMD3<Float> = .zero
-    /// Whether a Sense controller supplied this, as opposed to a hand anchor.
-    /// Only a Sense controller can press anything, so this is also "are the
+    /// Whether a controller supplied this, as opposed to a hand anchor.
+    /// Only a controller can press anything, so this is also "are the
     /// buttons meaningful".
     var fromController = false
+    /// The controller is a Joy-Con: it has buttons but no tracked pose, so the
+    /// hand anchor still supplies where this hand is (see `update`).
+    var fromJoyCon = false
 }
 
 /// `ovrpButton` **raw** bits.
@@ -454,6 +457,69 @@ final class KleptonControllers {
             $0.productCategory == GCProductCategorySpatialController
         }
     }
+
+    /// Nintendo Switch Joy-Con, one per hand.
+    ///
+    /// The other way to play without PS VR2 Sense controllers: a Joy-Con has
+    /// buttons, a stick and two shoulder buttons per hand but no tracked pose,
+    /// so the hand tracker says where the hand is and the Joy-Con says what it
+    /// presses. visionOS names a single Joy-Con "Joy-Con (L)" / "Joy-Con (R)";
+    /// a pair joined into one controller ("Joy-Con (L/R)") is not matched here
+    /// but by `isJoyConPair`, which reads each half for its own hand.
+    /// `KL_JOYCON=0` ignores them.
+    static func joyConHand(_ c: GCController) -> Int? {
+        guard joyConEnabled, c.extendedGamepad != nil, !isJoyConPair(c) else { return nil }
+        let n = joyConName(c)
+        guard n.contains("JOY-CON") || n.contains("JOYCON") else { return nil }
+        if n.contains("(L)") || n.hasSuffix(" L") || n.contains("LEFT") { return 0 }
+        if n.contains("(R)") || n.hasSuffix(" R") || n.contains("RIGHT") { return 1 }
+        return nil
+    }
+    /// A pair joined into one controller ("Joy-Con (L/R)"): read too, its left
+    /// half as the left hand and its right half as the right hand, since both
+    /// halves report under one gamepad with their own sticks and shoulders.
+    static func isJoyConPair(_ c: GCController) -> Bool {
+        guard joyConEnabled, c.extendedGamepad != nil else { return false }
+        let n = joyConName(c)
+        return (n.contains("JOY-CON") || n.contains("JOYCON")) && (n.contains("L/R") || n.contains("L / R"))
+    }
+    private static func joyConName(_ c: GCController) -> String {
+        ((c.vendorName ?? "") + " " + c.productCategory).uppercased()
+    }
+    static let joyConEnabled = ProcessInfo.processInfo.environment["KL_JOYCON"] != "0"
+
+    /// The Joy-Con to read, at most one per hand, for the hands no Sense
+    /// controller holds: a Sense controller wins its hand, as it has a pose.
+    /// The flag is true for a joined pair (each half read for its own hand).
+    static func joyCons(excluding senseHands: [Bool]) -> [(GCController, Int, Bool)] {
+        var out: [(GCController, Int, Bool)] = []
+        let all = GCController.controllers()
+        for c in all {
+            guard let h = joyConHand(c), !senseHands[h], !out.contains(where: { $0.1 == h }) else { continue }
+            out.append((c, h, false))
+        }
+        for c in all where isJoyConPair(c) {
+            for h in 0...1 where !senseHands[h] && !out.contains(where: { $0.1 == h }) { out.append((c, h, true)) }
+        }
+        return out
+    }
+
+    /// Every controller the system lists, once per change: what GameController
+    /// calls it and which profiles it has. A Joy-Con that is connected but not
+    /// recognised shows up here under the name it actually reports.
+    static func noteControllers() {
+        let all = GCController.controllers()
+        let line = all.map {
+            "\($0.vendorName ?? "nil") [\($0.productCategory)]"
+            + ($0.extendedGamepad != nil ? " extended" : "")
+            + ($0.microGamepad != nil ? " micro" : "")
+            + ($0.motion != nil ? " motion" : "")
+        }.joined(separator: ", ")
+        guard line != lastControllerLine else { return }
+        lastControllerLine = line
+        NSLog("[ctrl] controllers: \(all.isEmpty ? "none" : line)")
+    }
+    private static var lastControllerLine: String?
 
     /// Has the paired set changed since the last time this was asked?
     ///
@@ -982,8 +1048,21 @@ final class KleptonControllers {
             Self.lastAttached = attached; Self.lastSpatialCount = spatial.count
         }
 
+        // Joy-Con for the hands no Sense controller holds. They count as
+        // attached for the clear below, for the same reason a Sense controller
+        // does: no new input state means "unchanged", not "released".
+        Self.noteControllers()
+        let joy = Self.joyCons(excluding: attached)
+        var joyHands = [false, false]
+        for (_, h, _) in joy { joyHands[h] = true }
+        if joyHands != Self.lastJoyHands {
+            NSLog("[ctrl] Joy-Con L=\(joyHands[0]) R=\(joyHands[1]) "
+                  + "(\(joy.map { $0.0.vendorName ?? "?" })) — pose from hand tracking")
+            Self.lastJoyHands = joyHands
+        }
+
         lock.lock()
-        for i in 0...1 where !attached[i] {
+        for i in 0...1 where !attached[i] && !joyHands[i] {
             state[i].buttons = 0; state[i].touches = 0
             state[i].indexTrigger = 0; state[i].handTrigger = 0
             state[i].stick = .zero; state[i].fromController = false
@@ -1242,6 +1321,169 @@ final class KleptonControllers {
             state[hand] = st
             lock.unlock()
         }
+
+        for (c, hand, pair) in joy { pollJoyCon(c, hand: hand, pair: pair) }
+    }
+
+    private static var lastJoyHands = [false, false]
+
+    /// One Joy-Con's buttons, in the same raw words a Sense controller's become.
+    ///
+    /// visionOS reports a single Joy-Con as a small gamepad held SIDEWAYS (rail
+    /// up), so its stick is rotated back to the upright, one-per-hand hold, and
+    /// every element that can mean trigger or grip is accepted by name as well,
+    /// since the sideways profile files the physical buttons under different
+    /// slots. Layout, held upright:
+    ///
+    ///   ZL / ZR -> index trigger      L / R (and SL / SR) -> grip
+    ///   stick   -> thumbstick, click -> stick click
+    ///   right A / B -> A, right X / Y -> B
+    ///   left  down / left -> X, left up / right -> Y
+    ///   - / +   -> menu, as the Sense Create / Options buttons
+    ///
+    /// The same mapping VeRantyx (the Mac-streaming port) has played Alyx with.
+    private func pollJoyCon(_ c: GCController, hand: Int, pair: Bool = false) {
+        guard let g = c.extendedGamepad else { return }
+        if pair { pollJoyConHalf(g, hand: hand); return }
+        func named(_ names: [String]) -> Float {
+            var v: Float = 0
+            for b in g.allButtons {
+                let n = (b.localizedName ?? "").uppercased()
+                if names.contains(where: { n == $0 || n.hasPrefix($0 + " ") || n.contains("(" + $0 + ")") }) {
+                    v = max(v, b.value)
+                }
+            }
+            return v
+        }
+        func stick(_ p: GCControllerDirectionPad) -> SIMD2<Float> {
+            let v = SIMD2<Float>(p.xAxis.value, p.yAxis.value)
+            return simd_length(v) < 0.08 ? .zero : simd_clamp(v, SIMD2<Float>(-1, -1), SIMD2<Float>(1, 1))
+        }
+
+        var st = KleptonHandState()
+        st.fromController = true
+        st.fromJoyCon = true
+        st.indexTrigger = max(g.leftTrigger.value, g.rightTrigger.value, named(["ZL", "ZR"]))
+        st.handTrigger = max(g.leftShoulder.value, g.rightShoulder.value,
+                             named(["L", "R", "SL", "SR"])) > 0.5 ? 1 : 0
+        let l = stick(g.leftThumbstick), r = stick(g.rightThumbstick)
+        let sideways = simd_length(l) >= simd_length(r) ? l : r
+        st.stick = hand == 0 ? SIMD2<Float>(sideways.y, -sideways.x) : SIMD2<Float>(-sideways.y, sideways.x)
+
+        let stickClick = g.leftThumbstickButton?.isPressed == true || g.rightThumbstickButton?.isPressed == true
+        let primary = g.buttonA.isPressed || g.buttonB.isPressed || g.dpad.down.isPressed || g.dpad.left.isPressed
+        let secondary = g.buttonX.isPressed || g.buttonY.isPressed || g.dpad.up.isPressed || g.dpad.right.isPressed
+        let menu = g.buttonMenu.isPressed || g.buttonOptions?.isPressed == true
+        let home = g.buttonHome?.isPressed == true
+
+        var bits: UInt32 = 0
+        if hand == 0 {
+            if primary { bits |= OVRPRawButton.x }
+            if secondary { bits |= OVRPRawButton.y }
+            if stickClick { bits |= OVRPRawButton.lThumbstick }
+            if st.indexTrigger > 0 { bits |= OVRPRawButton.lIndexTrigger }
+            if st.handTrigger > 0 { bits |= OVRPRawButton.lHandTrigger }
+            // As the left Sense Create button: menu and system together.
+            if menu { bits |= OVRPRawButton.start | OVRPRawButton.back }
+            if home { bits |= OVRPRawButton.back }
+        } else {
+            if primary { bits |= OVRPRawButton.a }
+            if secondary { bits |= OVRPRawButton.b }
+            if stickClick { bits |= OVRPRawButton.rThumbstick }
+            if st.indexTrigger > 0 { bits |= OVRPRawButton.rIndexTrigger }
+            if st.handTrigger > 0 { bits |= OVRPRawButton.rHandTrigger }
+            if menu || home { bits |= OVRPRawButton.back }
+        }
+        bits |= Self.stickDirectionBits(hand: hand, stick: st.stick)
+        st.buttons = bits
+        st.touches = bits
+        if Self.ctrlTrace && bits != Self.lastBits[hand] {
+            NSLog(String(format: "[ctrl] %@ Joy-Con buttons %#x trigger %.2f grip %.0f stick (%.2f %.2f)",
+                         hand == 0 ? "L" : "R", bits, st.indexTrigger, st.handTrigger, st.stick.x, st.stick.y))
+            Self.lastBits[hand] = bits; Self.lastTouch[hand] = bits
+        }
+        lock.lock()
+        state[hand] = st
+        lock.unlock()
+    }
+
+    /// One half of a joined Joy-Con pair, held upright in its own hand: the
+    /// standard gamepad layout, split down the middle. Left: ZL trigger, L grip,
+    /// left stick, the arrows as X (down / left) and Y (up / right), - as menu.
+    /// Right: ZR trigger, R grip, right stick, A / B as A, X / Y as B, + and
+    /// Home as the system button. The same buttons do the same things as with
+    /// two separate Joy-Con.
+    private func pollJoyConHalf(_ g: GCExtendedGamepad, hand: Int) {
+        func stick(_ p: GCControllerDirectionPad) -> SIMD2<Float> {
+            let v = SIMD2<Float>(p.xAxis.value, p.yAxis.value)
+            return simd_length(v) < 0.08 ? .zero : simd_clamp(v, SIMD2<Float>(-1, -1), SIMD2<Float>(1, 1))
+        }
+        var st = KleptonHandState()
+        st.fromController = true
+        st.fromJoyCon = true
+        var bits: UInt32 = 0
+        if hand == 0 {
+            st.indexTrigger = g.leftTrigger.value
+            st.handTrigger = g.leftShoulder.value > 0.5 ? 1 : 0
+            st.stick = stick(g.leftThumbstick)
+            if g.dpad.down.isPressed || g.dpad.left.isPressed { bits |= OVRPRawButton.x }
+            if g.dpad.up.isPressed || g.dpad.right.isPressed { bits |= OVRPRawButton.y }
+            if g.leftThumbstickButton?.isPressed == true { bits |= OVRPRawButton.lThumbstick }
+            if st.indexTrigger > 0 { bits |= OVRPRawButton.lIndexTrigger }
+            if st.handTrigger > 0 { bits |= OVRPRawButton.lHandTrigger }
+            if g.buttonOptions?.isPressed == true { bits |= OVRPRawButton.start | OVRPRawButton.back }
+        } else {
+            st.indexTrigger = g.rightTrigger.value
+            st.handTrigger = g.rightShoulder.value > 0.5 ? 1 : 0
+            st.stick = stick(g.rightThumbstick)
+            if g.buttonA.isPressed || g.buttonB.isPressed { bits |= OVRPRawButton.a }
+            if g.buttonX.isPressed || g.buttonY.isPressed { bits |= OVRPRawButton.b }
+            if g.rightThumbstickButton?.isPressed == true { bits |= OVRPRawButton.rThumbstick }
+            if st.indexTrigger > 0 { bits |= OVRPRawButton.rIndexTrigger }
+            if st.handTrigger > 0 { bits |= OVRPRawButton.rHandTrigger }
+            if g.buttonMenu.isPressed || g.buttonHome?.isPressed == true { bits |= OVRPRawButton.back }
+        }
+        bits |= Self.stickDirectionBits(hand: hand, stick: st.stick)
+        st.buttons = bits
+        st.touches = bits
+        if Self.ctrlTrace && bits != Self.lastBits[hand] {
+            NSLog(String(format: "[ctrl] %@ Joy-Con (pair) buttons %#x trigger %.2f grip %.0f stick (%.2f %.2f)",
+                         hand == 0 ? "L" : "R", bits, st.indexTrigger, st.handTrigger, st.stick.x, st.stick.y))
+            Self.lastBits[hand] = bits; Self.lastTouch[hand] = bits
+        }
+        lock.lock()
+        state[hand] = st
+        lock.unlock()
+    }
+
+    /// The thumbstick direction bits the guest reads for snap turn, derived from
+    /// the analog stick with hysteresis (see the Sense path in `pollButtons`,
+    /// which this mirrors). Shares that path's latches, which is safe because a
+    /// hand is read from one controller per frame.
+    private static func stickDirectionBits(hand: Int, stick: SIMD2<Float>) -> UInt32 {
+        let onT: Float = 0.5, offT: Float = 0.4
+        func dirBit(_ v: Float, _ prev: Bool) -> Bool { v >= (prev ? offT : onT) }
+        let latch = hand == 0 ? lStickDir : rStickDir
+        var nd = (up: false, down: false, left: false, right: false)
+        nd.right = dirBit( stick.x, latch.right)
+        nd.left  = dirBit(-stick.x, latch.left)
+        nd.up    = dirBit( stick.y, latch.up)
+        nd.down  = dirBit(-stick.y, latch.down)
+        var bits: UInt32 = 0
+        if hand == 0 {
+            lStickDir = nd
+            if nd.up    { bits |= OVRPRawButton.lThumbstickUp }
+            if nd.down  { bits |= OVRPRawButton.lThumbstickDown }
+            if nd.left  { bits |= OVRPRawButton.lThumbstickLeft }
+            if nd.right { bits |= OVRPRawButton.lThumbstickRight }
+        } else {
+            rStickDir = nd
+            if nd.up    { bits |= OVRPRawButton.rThumbstickUp }
+            if nd.down  { bits |= OVRPRawButton.rThumbstickDown }
+            if nd.left  { bits |= OVRPRawButton.rThumbstickLeft }
+            if nd.right { bits |= OVRPRawButton.rThumbstickRight }
+        }
+        return bits
     }
 
     // MARK: - Haptics
@@ -1459,7 +1701,9 @@ final class KleptonControllers {
         lock.lock(); let existing = hapticEngine[hand]; lock.unlock()
         if let existing { return existing }
         guard #available(visionOS 26.0, *) else { return nil }
+        // A Sense controller for this hand, else its Joy-Con.
         guard let device = Self.spatialControllers().first(where: { Self.hand(of: $0) == hand })
+                ?? Self.joyCons(excluding: [false, false]).first(where: { $0.1 == hand })?.0
         else { return nil }
         guard let haptics = device.haptics else {
             noteHaptics("[cp] haptics: \(device.vendorName ?? "controller") reports none")
@@ -1744,6 +1988,133 @@ final class KleptonControllers {
                      sense ? "the controller" : "the hand"))
     }
 
+    // MARK: - The fist grip
+
+    /// Whether a bare hand is closed into a fist: the grip, which a hand has no
+    /// button for. Without it a hand-tracked run could point and click but not
+    /// pick anything up.
+    ///
+    /// From the curl of the middle, ring and little fingers, each the more
+    /// curled of two estimates: fingertip extension (knuckle-to-tip distance
+    /// over finger length) and the bend at the knuckle (wrist-to-knuckle
+    /// against the first phalanx). A closed fist hides its own fingertips, and
+    /// ARKit then drops or straightens them; the first phalanx stays in view
+    /// and keeps the fist reading closed. The two most-curled fingers decide,
+    /// so one mis-tracked finger cannot open a fist.
+    ///
+    /// Engages at a clear fist (0.75) and lets go only after the hand has read
+    /// clearly open (below 0.4) for 0.12 s; a frame with no estimate keeps the
+    /// previous state. Ported from VeRantyx, where it drives Alyx's grab and the
+    /// gravity gloves. `KL_FIST_GRIP=0` turns it off.
+    private func fistGrip(_ anchor: HandAnchor, hand: Int) -> Bool {
+        guard Self.fistEnabled, let sk = anchor.handSkeleton else { return fistHeld[hand] }
+        let o = anchor.originFromAnchorTransform
+        func pos(_ n: HandSkeleton.JointName) -> SIMD3<Float>? {
+            let j = sk.joint(n)
+            guard j.isTracked else { return nil }
+            let p = (o * j.anchorFromJointTransform).columns.3
+            return SIMD3<Float>(p.x, p.y, p.z)
+        }
+        let wrist = pos(.wrist)
+        func curl(_ knuckle: HandSkeleton.JointName, _ base: HandSkeleton.JointName,
+                  _ mid: HandSkeleton.JointName, _ tip: HandSkeleton.JointName) -> Float? {
+            var fromExtension: Float?
+            if let k = pos(knuckle), let b = pos(base), let m = pos(mid), let t = pos(tip) {
+                let length = simd_distance(k, b) + simd_distance(b, m) + simd_distance(m, t)
+                if length > 0.02 { fromExtension = min(1, max(0, (0.88 - simd_distance(k, t) / length) / 0.30)) }
+            }
+            var fromBend: Float?
+            if let w = wrist, let k = pos(knuckle), let b = pos(base) {
+                let meta = k - w, phal = b - k
+                if simd_length(meta) > 0.02, simd_length(phal) > 0.01 {
+                    let bend = acos(min(1, max(-1, simd_dot(simd_normalize(meta), simd_normalize(phal)))))
+                    fromBend = min(1, max(0, (bend - 20 * .pi / 180) / (65 * .pi / 180)))
+                }
+            }
+            switch (fromExtension, fromBend) {
+            case let (e?, b?): return max(e, b)
+            case let (e?, nil): return e
+            case let (nil, b?): return b
+            case (nil, nil): return nil
+            }
+        }
+        let curls = [
+            curl(.middleFingerKnuckle, .middleFingerIntermediateBase, .middleFingerIntermediateTip, .middleFingerTip),
+            curl(.ringFingerKnuckle, .ringFingerIntermediateBase, .ringFingerIntermediateTip, .ringFingerTip),
+            curl(.littleFingerKnuckle, .littleFingerIntermediateBase, .littleFingerIntermediateTip, .littleFingerTip),
+        ].compactMap { $0 }.sorted(by: >)
+        guard !curls.isEmpty else { fistOpenSince[hand] = nil; return fistHeld[hand] }
+        let c = curls.count >= 2 ? (curls[0] + curls[1]) * 0.5 : curls[0]
+        let now = CACurrentMediaTime()
+        if fistHeld[hand] {
+            if c < 0.4 {
+                if fistOpenSince[hand] == nil { fistOpenSince[hand] = now }
+                if now - (fistOpenSince[hand] ?? now) >= 0.12 { fistHeld[hand] = false; fistOpenSince[hand] = nil }
+            } else {
+                fistOpenSince[hand] = nil
+            }
+        } else {
+            fistOpenSince[hand] = nil
+            fistHeld[hand] = c >= 0.75
+        }
+        return fistHeld[hand]
+    }
+    // MARK: - Hand motion
+
+    /// Linear (m/s) and angular (rad/s) velocity of a hand-tracked grip pose,
+    /// from consecutive frames' poses.
+    ///
+    /// A hand anchor carries no motion, and publishing zeros tells the game the
+    /// hand is standing still — which is exactly what the gravity gloves
+    /// cannot work with: they fire on the flick of the wrist, read from the
+    /// controller's velocity. So the motion is measured here, from the poses
+    /// this file already predicts to each frame's presentation time, and
+    /// lightly smoothed (`KL_HAND_VEL_SMOOTH`, default 0.5 per frame) so tracker
+    /// jitter does not read as motion while a real flick, which lasts several
+    /// frames, keeps its peak. A gap longer than 0.1 s (the hand lost and found
+    /// again) starts afresh rather than reading the jump as a throw, and
+    /// anything beyond 12 m/s or 40 rad/s is a tracking glitch, not a hand.
+    /// The same approach VeRantyx uses for its hand-tracked controllers.
+    private func handMotion(hand: Int, p: SIMD3<Float>, q: simd_quatf,
+                            at t: TimeInterval) -> (SIMD3<Float>, SIMD3<Float>) {
+        defer { lastHandSample[hand] = (p, q, t) }
+        guard let last = lastHandSample[hand] else {
+            handVel[hand] = .zero; handAng[hand] = .zero
+            return (.zero, .zero)
+        }
+        let dt = Float(t - last.t)
+        guard dt > 0.002, dt < 0.1 else {
+            handVel[hand] = .zero; handAng[hand] = .zero
+            return (.zero, .zero)
+        }
+        var v = (p - last.p) / dt
+        var dq = q * last.q.inverse
+        if dq.real < 0 { dq = simd_quatf(vector: -dq.vector) }
+        let s = simd_length(dq.imag)
+        var w = s > 1e-7 ? dq.imag / s * (2 * atan2(s, dq.real) / dt) : SIMD3<Float>.zero
+        if !(v.x.isFinite && v.y.isFinite && v.z.isFinite) { v = .zero }
+        if !(w.x.isFinite && w.y.isFinite && w.z.isFinite) { w = .zero }
+        if simd_length(v) > 12 { v = simd_normalize(v) * 12 }
+        if simd_length(w) > 40 { w = simd_normalize(w) * 40 }
+        let a = Self.handVelSmooth
+        handVel[hand] += (v - handVel[hand]) * a
+        handAng[hand] += (w - handAng[hand]) * a
+        return (handVel[hand], handAng[hand])
+    }
+    private var lastHandSample: [(p: SIMD3<Float>, q: simd_quatf, t: TimeInterval)?] = [nil, nil]
+    private var handVel: [SIMD3<Float>] = [.zero, .zero]
+    private var handAng: [SIMD3<Float>] = [.zero, .zero]
+    private static let handVelSmooth: Float = {
+        let v = ProcessInfo.processInfo.environment["KL_HAND_VEL_SMOOTH"].flatMap { Float($0) } ?? 0.5
+        return v > 0 && v <= 1 ? v : 0.5
+    }()
+
+    /// Last tracked grip pose of a hand holding a Joy-Con (see `update`).
+    private var joyHeldPose: [(SIMD3<Float>, simd_quatf)?] = [nil, nil]
+    private var fistHeld = [false, false]
+    private var fistOpenSince: [CFTimeInterval?] = [nil, nil]
+    private static let fistEnabled = ProcessInfo.processInfo.environment["KL_FIST_GRIP"] != "0"
+
     /// Merge every source and push the result across to kl_ovrp.
     ///
     /// The hand anchors are the fallback: used for a hand's *pose* and its
@@ -1765,9 +2136,39 @@ final class KleptonControllers {
             if let accPose {
                 st.position = accPose.0; st.orientation = accPose.1
                 st.linearVelocity = accPose.2; st.angularVelocity = accPose.3
+            } else if let anchor = (hand == 0 ? leftHand : rightHand), st.fromJoyCon {
+                // A Joy-Con in this hand: the hand tracker says where it is,
+                // the Joy-Con what it presses. No pinch or fist gesture here —
+                // a hand closed around a Joy-Con reads as a fist and a pinch
+                // all the time. The grip offset is held in the wrist's frame
+                // (gripPose), so knuckles hidden by the Joy-Con cost precision,
+                // not position.
+                let (p, q) = gripPose(anchor, hand: hand)
+                st.position = p; st.orientation = q
+                (st.linearVelocity, st.angularVelocity) = handMotion(hand: hand, p: p, q: q, at: presentationTime)
+                joyHeldPose[hand] = (p, q)
+            } else if st.fromJoyCon, let held = joyHeldPose[hand] {
+                // A Joy-Con hand the tracker has lost — the Joy-Con itself, or
+                // the hand leaving the cameras' view, hides it. The runtime only
+                // counts a controller as connected while it has a pose
+                // (klvr_plat_controller), and after its grace window it would
+                // drop this hand's buttons: the stick stops walking mid-run.
+                // Hold the last tracked pose instead, so the buttons and stick
+                // keep working until the hand is seen again.
+                st.position = held.0; st.orientation = held.1
+                st.linearVelocity = .zero; st.angularVelocity = .zero
+                lastHandSample[hand] = nil   // standing still; the next live sample starts afresh
             } else if let anchor = (hand == 0 ? leftHand : rightHand) {
                 let (p, q) = gripPose(anchor, hand: hand)
                 st.position = p; st.orientation = q
+                (st.linearVelocity, st.angularVelocity) = handMotion(hand: hand, p: p, q: q, at: presentationTime)
+                // A closed fist is the grip: grabbing, holding a weapon and
+                // the gravity gloves' catch all read it.
+                if fistGrip(anchor, hand: hand) {
+                    st.handTrigger = 1
+                    let bit = hand == 0 ? OVRPRawButton.lHandTrigger : OVRPRawButton.rHandTrigger
+                    st.buttons |= bit; st.touches |= bit
+                }
                 // pollButtons() has already cleared this hand's bits (no Sense
                 // controller wrote it), so everything the pinch sets is set
                 // here and nothing has to be undone.
@@ -1792,7 +2193,9 @@ final class KleptonControllers {
                 //
                 // KL_PINCH_SRC=system|distance isolates one when the question
                 // is which of them is misbehaving.
-                let byDistance = Self.pinchSrc != .system
+                // A fist also brings thumb and index together, so while the
+                // fist grip is held the fingertip distance does not press.
+                let byDistance = Self.pinchSrc != .system && !fistHeld[hand]
                     && (pinchHeld[hand] ? (t > 0.30) : (t > 0.55))
                 let bySystem = Self.pinchSrc != .distance && sysSeen && sysDown
                 let pressed = byDistance || bySystem

@@ -220,7 +220,8 @@ def headsets():
     out = []
     for d in devs:
         hp, dp, cp = d.get("hardwareProperties", {}), d.get("deviceProperties", {}), d.get("connectionProperties", {})
-        if hp.get("platform") != "visionOS" or cp.get("transportType") == "sameMachine":
+        # Xcode 26.0's devicectl reports a Vision Pro's platform as "xrOS", later ones as "visionOS".
+        if hp.get("platform") not in ("visionOS", "xrOS") or cp.get("transportType") == "sameMachine":
             continue  # simulators show up as sameMachine
         h = {"name": dp.get("name"), "model": hp.get("productType"), "os": dp.get("osVersionNumber"),
              "udid": hp.get("udid"),

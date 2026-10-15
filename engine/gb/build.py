@@ -247,8 +247,9 @@ def defaults(package, work, foz_path, emit):
             if line.startswith("KL_ALYX_PROFILE_ARGS="):
                 line = line.rstrip("\n") + args_extra + "\n"
             f.write(line)
-        # hand tracking is not compiled in (KLEPTON_NO_HANDS); the Sense controllers are the input
-        f.write("KL_HANDS=0\n")
+        # hand tracking is on: hands alone, or a Joy-Con in each hand (pose from the hand tracker), play without
+        # Sense controllers (KleptonControllers.swift); a Sense controller still wins its hand
+        f.write("KL_HANDS=1\n")
         # sysinfo's total RAM: the headset's 16 GB, so the game's minimum-memory notice stays away
         f.write("KL_MEM_TOTAL_MB=16384\n")
         # a new player's movement: continuous, hand-oriented
@@ -389,7 +390,7 @@ def app(package, work, demo, team, emit, provisioning=True, unsigned=False, devi
            # a free Personal Team can have the memory limit but not Extended Virtual Addressing (paid only)
            "KLEPTON_EVA": "0" if free_team else "1",
            "KLEPTON_ALYX_LAUNCHER": os.path.join(ROOT, "launcher"), "KLEPTON_DISPLAY_NAME": man.get("app_name") or man["game"],
-           "KLEPTON_INFOPLIST_SET": os.path.join(pd, man["defaults"]["purpose_strings"]), "KLEPTON_NO_HANDS": "1",
+           "KLEPTON_INFOPLIST_SET": os.path.join(pd, man["defaults"]["purpose_strings"]), "KLEPTON_NO_HANDS": "0",
            "KLEPTON_GUEST_DIR": GUEST_DIR, "KLEPTON_BUNDLE_ID": bundle_id_for(team),
            "KLEPTON_APPICON_DIR": os.environ.get("GLOVEBOX_ICON") or (os.path.join(pd, man["icon"]) if man.get("icon") else "")}
     _run([sys.executable, "gen_xcodeproj.py"], emit, "app", cwd=V, env=env, log=os.path.join(work, "project.log"))

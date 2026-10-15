@@ -7,8 +7,10 @@ import ARKit
 /// are on and the app may track them, and the page says what's missing in a line.
 struct ControllerState: Equatable {
     enum Access: Equatable { case notAsked, allowed, denied }
-    /// Sense controllers connected right now (the game needs both).
+    /// Sense controllers connected right now.
     var connected = 0
+    /// Single Joy-Con connected right now ("Joy-Con (L)" / "Joy-Con (R)").
+    var joyCons = 0
     var access = Access.notAsked
 }
 
@@ -23,15 +25,25 @@ extension LauncherModel {
     /// support, so nothing is checked there either.
     static var requiresControllers = true
 
+    /// The game also plays with hand tracking alone, or with a Joy-Con in each hand (buttons from the
+    /// Joy-Con, position from hand tracking; KleptonControllers.swift), so Play does not wait for Sense
+    /// controllers. False restores the wait for both.
+    static var playWithoutSense = true
+
     /// Other tracking permissions to ask for together with the controllers' at Play, so every
     /// system dialog appears over the launcher rather than as the game starts (e.g. `.handTracking`
     /// while the game still tracks hands).
-    static var alsoAsk: [ARKitSession.AuthorizationType] = []
+    static var alsoAsk: [ARKitSession.AuthorizationType] = [.handTracking]
 
     private static let arSession = ARKitSession()
 
     var controllerIssue: ControllerIssue? {
         guard Self.requiresControllers, #available(visionOS 26.0, *) else { return nil }
+        if Self.playWithoutSense {
+            // Controller tracking only matters to a Sense controller that is on.
+            if controllers.access == .denied && controllers.connected > 0 { return .trackingDenied }
+            return nil
+        }
         if controllers.access == .denied { return .trackingDenied }
         if controllers.connected < 2 { return .notConnected(controllers.connected) }
         return nil
@@ -53,9 +65,13 @@ extension LauncherModel {
 
     @available(visionOS 26.0, *)
     private func countControllers() {
-        controllers.connected = GCController.controllers()
-            .filter { $0.productCategory == GCProductCategorySpatialController }.count
-        NSLog("[launcher] Sense controllers connected: \(controllers.connected)")
+        let all = GCController.controllers()
+        controllers.connected = all.filter { $0.productCategory == GCProductCategorySpatialController }.count
+        controllers.joyCons = all.filter {
+            let n = ($0.vendorName ?? "") + " " + $0.productCategory
+            return n.contains("Joy-Con") && (n.contains("(L)") || n.contains("(R)"))
+        }.count
+        NSLog("[launcher] Sense controllers connected: \(controllers.connected), Joy-Con: \(controllers.joyCons)")
     }
 
     /// The permission as it stands, without asking: at start, and on coming back from Settings.
@@ -73,6 +89,8 @@ extension LauncherModel {
         guard Self.requiresControllers, DemoState.current == nil, #available(visionOS 26.0, *) else { return true }
         let status = await Self.arSession.requestAuthorization(for: [.accessoryTracking] + Self.alsoAsk)
         controllers.access = .init(status[.accessoryTracking])
+        // Without Sense controllers their tracking permission does not matter: hands and Joy-Con play.
+        if Self.playWithoutSense && controllers.connected == 0 { return true }
         return controllers.access != .denied
     }
 }
