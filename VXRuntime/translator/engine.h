@@ -27,6 +27,9 @@ uint64_t xe_rip_at(const xe *e, uint64_t pc);
 void xe_set_smc(xe *e, int on);
 int xe_smc_write(xe *e, uint64_t addr);
 void xe_forget(xe *e, uint64_t addr, uint64_t len);
+// Ordered mode: an LDAPR / STLR across 16 bytes faulted (uc: the signal's ucontext_t); 1: patched (DMB, the plain
+// access, DMB), the access is retried. xe_new installs a handler that calls this; a program with its own calls it.
+int xe_fix_split(xe *e, void *uc);
 // Whether pc is in the engine's translated code.
 int xe_owns(const xe *e, uint64_t pc);
 // Forgets every translation (the code it came from changed). Not while another thread runs translated code.

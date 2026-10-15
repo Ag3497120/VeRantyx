@@ -519,7 +519,9 @@ static WINAPI int __C_specific_handler(EXCEPTION_RECORD *rec, uint64_t frame, CO
 }
 
 // ---- CPU faults: macOS signals become Windows exceptions -------------------------------------------------------------------
+#ifndef __aarch64__
 static void signal_dispatch(EXCEPTION_RECORD *rec, CONTEXT *ctx) { dispatch(rec, ctx); }
+#endif
 
 // Signals are handled on a stack of their own, so that a thread that ran out of stack can still be reported.
 void vx_signal_stack(void) {

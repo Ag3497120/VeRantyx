@@ -120,30 +120,41 @@ static void put_entry(entry *t, uint64_t rip, uint64_t host) { __asm__ volatile(
 // Ordered accesses across 16 bytes: LDAPR / STLR fault there (LSE2 allows other misaligned ones). The first such
 // fault patches the instruction into a branch to a few instructions of its own: DMB ISH, the plain access, DMB ISH,
 // back. (FEX-Emu handles x86 ordering in-process the same way.) Other signals go to the handler before ours.
+uint64_t xe_rip_at(const xe *e, uint64_t pc);
 static xe *fault_engine;
 static struct sigaction prev_bus, prev_segv;
-static void on_fault(int sig, siginfo_t *si, void *uc_) {
+int xe_fix_split(xe *e, void *uc_) {
     ucontext_t *uc = uc_;
-    xe *e = fault_engine;
     uint32_t *pc = (uint32_t *)(uintptr_t)uc->uc_mcontext->__ss.__pc;
-    if (e && pc >= e->code && pc < e->code + e->used && e->used + 8 < e->cap) {
-        uint32_t insn = *pc, sz = insn >> 30, t = insn & 31, n = insn >> 5 & 31;
-        int load = (insn & 0x3FFFFC00u) == 0x38BFC000u, store = (insn & 0x3FFFFC00u) == 0x089FFC00u;
-        if (load || store) {
-            static const int bytes[4] = { 1, 2, 4, 8 };
-            uint32_t *stub = e->code + e->used;
-            writable(1);
-            stub[0] = 0xD5033BBFu;                                        // DMB ISH
-            stub[1] = load ? a64_ldr(bytes[sz], (int)t, (int)n, 0) : a64_str(bytes[sz], (int)t, (int)n, 0);
-            stub[2] = 0xD5033BBFu;
-            stub[3] = a64_b((int32_t)(pc + 1 - (stub + 3)));
-            *pc = a64_b((int32_t)(stub - pc));
-            writable(0);
-            sys_icache_invalidate(stub, 16); sys_icache_invalidate(pc, 4);
-            e->used += 4; e->stats.split_patches++;
-            return;                                                      // (again: through the patch)
-        }
+    if (!e || pc < e->code || pc >= e->code + e->used) return 0;
+    uint32_t insn = *pc, sz = insn >> 30, t = insn & 31, n = insn >> 5 & 31;
+    int load = (insn & 0x3FFFFC00u) == 0x38BFC000u, store = (insn & 0x3FFFFC00u) == 0x089FFC00u;
+    if (!load && !store) return 0;
+    pthread_mutex_lock(&e->lock);                                         // (other threads translate meanwhile)
+    if (*pc != insn) { pthread_mutex_unlock(&e->lock); return 1; }       // (patched by another thread already)
+    if (e->used + 8 >= e->cap) { pthread_mutex_unlock(&e->lock); return 0; }
+    static const int bytes[4] = { 1, 2, 4, 8 };
+    uint32_t *stub = e->code + e->used;
+    uint64_t rip = xe_rip_at(e, (uint64_t)(uintptr_t)pc);
+    writable(1);
+    stub[0] = 0xD5033BBFu;                                                // DMB ISH
+    stub[1] = load ? a64_ldr(bytes[sz], (int)t, (int)n, 0) : a64_str(bytes[sz], (int)t, (int)n, 0);
+    stub[2] = 0xD5033BBFu;
+    stub[3] = a64_b((int32_t)(pc + 1 - (stub + 3)));
+    *pc = a64_b((int32_t)(stub - pc));
+    writable(0);
+    sys_icache_invalidate(stub, 16); sys_icache_invalidate(pc, 4);
+    if (e->nimap + 2 < e->cimap) {                                        // (a fault in the stub: still that instruction's)
+        e->imap[e->nimap].host = (uint64_t)(uintptr_t)stub; e->imap[e->nimap].rip = rip;
+        e->imap[e->nimap + 1].host = (uint64_t)(uintptr_t)(stub + 4); e->imap[e->nimap + 1].rip = 0;
+        __atomic_store_n(&e->nimap, e->nimap + 2, __ATOMIC_RELEASE);
     }
+    e->used += 4; e->stats.split_patches++;
+    pthread_mutex_unlock(&e->lock);
+    return 1;                                                             // (again: through the patch)
+}
+static void on_fault(int sig, siginfo_t *si, void *uc_) {
+    if (xe_fix_split(fault_engine, uc_)) return;
     struct sigaction *p = sig == SIGBUS ? &prev_bus : &prev_segv;
     if (p->sa_flags & SA_SIGINFO) p->sa_sigaction(sig, si, uc_);
     else if (p->sa_handler != SIG_DFL && p->sa_handler != SIG_IGN) p->sa_handler(sig);
@@ -197,7 +208,6 @@ static mentry *find_entry(xe *e, uint64_t rip) {
         if (e->map[i].rip == rip && e->map[i].host) return &e->map[i];
     return NULL;
 }
-static uint64_t find(xe *e, uint64_t rip) { mentry *m = find_entry(e, rip); return m ? m->host : 0; }
 // A branch at p now goes to block id: remembered, to be put back to its stub if the block goes.
 static void add_site(xe *e, uint32_t id, uint32_t *p, int call) {
     blk *b = &e->blocks[id];
@@ -343,7 +353,6 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
     return id;
 }
 
-static int64_t block(xe *e, uint64_t rip, uint64_t stop) { return block_ex(e, rip, stop, 0); }
 static int run(xe *e, x86_ctx *c, uint64_t stop);
 int xe_run(xe *e, x86_ctx *c, uint64_t stop) {
     c->link = 0;

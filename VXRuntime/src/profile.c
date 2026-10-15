@@ -35,7 +35,8 @@ static void on_prof(int sig, siginfo_t *si, void *ucv) {
     if (i - g_tail >= RING) return;                // (the counting thread fell behind: dropped)
     prof_sample *s = &g_ring[i & (RING - 1)];
 #ifdef __aarch64__
-    s->pc = uc ? uc->uc_mcontext->__ss.__pc : 0;
+    uint64_t vx_arm64_x86_pc(uint64_t pc);       // (translated code: the x86 instruction it is: src/arm64.c)
+    s->pc = uc ? vx_arm64_x86_pc(uc->uc_mcontext->__ss.__pc) : 0;
 #else
     s->pc = uc ? uc->uc_mcontext->__ss.__rip : 0;
 #endif

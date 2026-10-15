@@ -241,18 +241,22 @@ static void state_from_signal(x86_ctx *c, const ucontext_t *uc, uint64_t rip) {
     c->flags = ss->__x[27]; c->ras = ss->__fp; c->rip = rip;
 }
 void vx_code_freed(void *addr, size_t len) { xe_forget(g_engine, (uint64_t)(uintptr_t)addr, len); }
+uint64_t vx_arm64_x86_pc(uint64_t pc) {
+    uint64_t rip = xe_owns(g_engine, pc) ? xe_rip_at(g_engine, pc) : 0;
+    return rip ? rip : pc;
+}
 static void on_fault(int sig, siginfo_t *si, void *ucv) {
     ucontext_t *uc = ucv;
     _STRUCT_ARM_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
     uint64_t pc = ss->__pc;
+    if ((sig == SIGSEGV || sig == SIGBUS) && xe_fix_split(g_engine, uc)) return;   // (ordered access across 16 bytes)
     if ((sig == SIGSEGV || sig == SIGBUS) && ((uc->uc_mcontext->__es.__esr >> 6) & 1) && xe_smc_write(g_engine, (uint64_t)(uintptr_t)si->si_addr)) {
         uint64_t at = xe_owns(g_engine, pc) ? xe_rip_at(g_engine, pc) : 0;
         if (at && t_ctx) { state_from_signal(t_ctx, uc, at); ss->__pc = (uint64_t)(uintptr_t)smc_restart; ss->__lr = 0; }
         return;                                               // (native code: the write again, now allowed)
     }
-    Dl_info info;
-    int native = dladdr((void *)(uintptr_t)pc, &info) != 0;
-    if ((sig == SIGSEGV || sig == SIGBUS) && (uint64_t)(uintptr_t)si->si_addr == pc && !native && !xe_owns(g_engine, pc)) {
+    // An instruction fetch from a page that is not executable (native code always is): a call into x86 code.
+    if ((sig == SIGSEGV || sig == SIGBUS) && (uint64_t)(uintptr_t)si->si_addr == pc && !xe_owns(g_engine, pc)) {
         ss->__x[9] = pc;                                      // a call into x86 code: on through the engine
         ss->__pc = (uint64_t)(uintptr_t)vx_cb_tramp;
         return;
@@ -285,7 +289,8 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
 }
 
 void vx_arm64_init(void) {
-    g_engine = xe_new(0);
+    // x86's memory order for accesses other threads may see (LDAPR / STLR, TRANSLATOR.md): VXRT_ORDERED=0 turns it off.
+    g_engine = xe_new(!getenv("VXRT_ORDERED") || atoi(getenv("VXRT_ORDERED")) != 0);
     if (!g_engine) { fprintf(stderr, "vxrt: cannot map the translation cache\n"); exit(1); }
     xe_set_native(g_engine, vx_thunk_find);
     xe_set_smc(g_engine, 1);

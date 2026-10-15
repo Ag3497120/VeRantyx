@@ -273,6 +273,10 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
     and data together) stays writable, and its blocks compare their x86 bytes on entry instead. VirtualFree drops
     the translations of what it frees. `tests/smc.c` (in place, data on the code's page, self-modifying, freed and
     allocated again) passes on both builds.
+  - *Memory order*: the ARM64 runtime runs the engine in ordered mode by default (LDAPR / STLR for accesses other
+    threads may see, phase 4a; `VXRT_ORDERED=0` turns it off); its fault handler patches the ones across 16 bytes
+    first (`xe_fix_split`). The draw benchmark costs the same either way. `VXRT_PROFILE` names the program's
+    instructions in translated code (the host pc's x86 instruction).
   - *Measured against the x86 build under Rosetta* (M1 Max): a Direct3D 11 draw costs 0.72 µs of CPU instead of 1.92
     (`build/drawbench.exe`; the runtime's own work is ARM64 code now), an event round trip between processes 7.0 µs
     instead of 8.8. Games: `VXRT_ARM64=1` makes the launch scripts use `build/vxrt-arm64` (not tried on SteamVR or a
