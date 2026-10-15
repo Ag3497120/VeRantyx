@@ -108,6 +108,8 @@ static void stubs(xe *e) {
         e->vectors = c + n;
         for (int i = 0; i < 16; i++) { c[n + 32 * (size_t)i] = a64_hvc(XV_HVC_VECTOR + i); c[n + 32 * (size_t)i + 1] = a64_b(-1); }
         n += 512;
+        xv_set_tlbi((uint64_t)(uintptr_t)(c + n));                      // TLBI VMALLE1; DSB ISH; ISB; HVC #4
+        n = emit(c, n, 0xD508871Fu); n = emit(c, n, 0xD5033B9Fu); n = emit(c, n, 0xD5033FDFu); n = emit(c, n, a64_hvc(XV_HVC_TLBI));
     }
     e->used = n;
 }
@@ -272,7 +274,10 @@ static void watch_block(xe *e, uint32_t id) {
         if (!r) return;
         if (r->n == r->c) { r->c = r->c ? 2 * r->c : 8; r->ids = realloc(r->ids, r->c * sizeof *r->ids); }
         r->ids[r->n++] = id;
-        if (!r->protected && !r->unprotected && !mprotect((void *)(uintptr_t)pg, PAGE, PROT_READ)) r->protected = 1;
+        if (!r->protected && !r->unprotected && !mprotect((void *)(uintptr_t)pg, PAGE, PROT_READ)) {
+            r->protected = 1;
+            if (e->vcpu) xv_protect(pg, 1);                               // (the guest's writes fault on its own page tables)
+        }
     }
 }
 int xe_smc_write(xe *e, uint64_t addr) {
@@ -287,6 +292,7 @@ int xe_smc_write(xe *e, uint64_t addr) {
     if (++r->faults == 16) r->unprotected = 1;                          // (written often: its blocks check their bytes)
     for (int i = 0; i < e->nrings; i++) ring_clear(e->rings[i]);
     mprotect((void *)(uintptr_t)pg, PAGE, PROT_READ | PROT_WRITE);
+    if (e->vcpu) xv_protect(pg, 0);
     e->stats.smc_pages++;
     pthread_mutex_unlock(&e->lock);
     return 1;
@@ -304,7 +310,7 @@ void xe_forget(xe *e, uint64_t addr, uint64_t len) {
     }
     pthread_mutex_unlock(&e->lock);
 }
-void xe_set_smc(xe *e, int on) { e->smc = on && !e->vcpu; }   // (vcpu: not yet)
+void xe_set_smc(xe *e, int on) { e->smc = on; }
 
 // The block at rip, translated now if it is not yet: its id (-1: it cannot be). once: the instruction at rip
 // alone, not kept (not found by others, no page watched).
@@ -409,7 +415,18 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
         pthread_mutex_unlock(&e->lock);
         e->stats.entries++;
         c->entry = host;
-        if (e->vcpu) { if (xv_enter(c, (uint64_t)(uintptr_t)e->enter, (uint64_t)(uintptr_t)e->vectors)) return -2; }
+        if (e->vcpu) {
+            int r = xv_enter(c, (uint64_t)(uintptr_t)e->enter, (uint64_t)(uintptr_t)e->vectors);
+            if (r == XV_FAULT) {                                          // (an access fault of the program's: its x86 state)
+                uint64_t pc, addr; int write;
+                xv_fault(&pc, &addr, &write);
+                uint64_t rip = xe_rip_at(e, pc);
+                if (!rip) { fprintf(stderr, "[vxrt] engine: a fault at %#llx in no x86 instruction's code\n", (unsigned long long)pc); return -2; }
+                c->rip = rip;
+                if (write && xe_smc_write(e, addr)) c->single = 1;            // (code it had run: on at the write, alone)
+                else { c->fault = X86_FAULT_PF; c->fault_info = addr | (uint64_t)write << 63; }
+            } else if (r) return -2;
+        }
         else ((void (*)(x86_ctx *))(void *)e->enter)(c);
         if (c->stale) {                                                   // (a checked block found its code changed)
             c->stale = 0;

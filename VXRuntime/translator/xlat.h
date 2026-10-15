@@ -47,7 +47,8 @@ enum { CTX_FLAGS = 128, CTX_RIP = 136, CTX_FS = 144, CTX_GS = 152, CTX_FAULT = 1
 // return address and the translated code to go back to. CALL adds one, RET takes one and returns there when it matches.
 enum { XLAT_RAS_BITS = 12 };
 // x86_ctx.fault: 0, or an x86 exception (vector + 1), with ctx->rip at the instruction
-enum { X86_FAULT_DE = 1, X86_FAULT_BP = 4, X86_FAULT_UD = 7, X86_FAULT_GP = 14, X86_FAULT_INT = 0x100 /* INT n: fault_info */ };
+enum { X86_FAULT_DE = 1, X86_FAULT_BP = 4, X86_FAULT_UD = 7, X86_FAULT_GP = 14, X86_FAULT_PF = 15 /* fault_info: address | write << 63 */,
+       X86_FAULT_INT = 0x100 /* INT n: fault_info */ };
 // Registers of translated code that hold more than scratch values: x25 is the string instructions' step.
 
 typedef struct {
@@ -104,7 +105,7 @@ void xlat_block_native(xlat_buf *b, void (*fn)(x86_ctx *));
 void xlat_guest_enter(xlat_buf *b);
 extern const uint8_t *xlat_guest_parity;
 void xlat_guest_exit(xlat_buf *b);
-enum { XV_HVC_EXIT = 1, XV_HVC_HELPER, XV_HVC_NATIVE, XV_HVC_VECTOR = 0x10 };
+enum { XV_HVC_EXIT = 1, XV_HVC_HELPER, XV_HVC_NATIVE, XV_HVC_TLBI, XV_HVC_VECTOR = 0x10 };
 // Helpers translated code calls for rare or intricate instructions (one-operand MUL/IMUL/DIV/IDIV, RCL/RCR).
 void xlat_helper(x86_ctx *ctx);
 // A test harness's entry and exit: loads x86_ctx (pointer in x0) into the registers above, and stores it back.

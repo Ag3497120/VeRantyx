@@ -299,8 +299,22 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   / Rosetta / native: sort 20.1 / 22.0 / 20.4 / 15.4 / 15.0, tree 27.5 / 31.1 / 28.0 / 18.1 / 15.6, physics 4.57 /
   4.94 / 4.91 / 1.84 / 1.19, interp 16.1 / 17.2 / 17.5 / 10.6 / 5.37, matmul 6.53 / 6.49 / 6.65 / 2.72 / 4.94: the
   vCPU costs what unordered in-process code does and gives x86's order exactly; same checksums. Random programs in
-  the vCPU (`DT_VCPU=1`): 4 seeds, 20,000 programs, identical to Rosetta. Next: the runtime on it (native calls by HVC,
-  callbacks, exceptions, the low 4 GB), and how much the exits cost a game.
+  the vCPU (`DT_VCPU=1`): 4 seeds, 20,000 programs, identical to Rosetta.
+  **The runtime on it** (`VXRT_VCPU=1 build/vxrt-arm64`): every runtime test passes in the vCPU on the MacBook Air
+  (the 22 programs of make check's list and the 4 between processes). Native functions and helpers by HVC; the
+  program's access faults come from the guest's vectors with its registers and go to SEH; code that changes is
+  watched with the guest's own page tables (4 KB) and, for the host's writes (the runtime's memcpy into a JIT's
+  buffer), with mprotect. Found: a host page put in the VM keeps its old contents for the guest after the host
+  unmaps it and maps something new there (measured), so `libvxrt_vm.dylib` (linked, its __interpose tuples reach
+  malloc's calls too; the main executable's own do not) reports every munmap, mach_vm_deallocate and overwriting
+  map, and the page leaves the guest (guest physical addresses are never reused: a stale TLB entry faults, the TLB
+  is flushed, the access is retried). Stage 2 is mapped by the host's maximum protection (the SMC watch makes pages
+  read-only for a while).
+  **The cost, measured (MacBook Air, M5):** an HVC round trip is 804 ns; a Direct3D 11 draw costs 10.6 µs of CPU in
+  the vCPU against 0.36 µs in-process (about 12 exits per draw), so a game's thousands of runtime calls per frame
+  make the vCPU unusable as it is: it needs the calls that return nothing (the immediate context's setters and
+  draws) queued in the guest and run by the host in batches, or the program stays in-process. In-process stays the
+  way games run; the vCPU is for what in-process cannot do (the low 4 GB, x86's order without LDAPR/STLR).
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.

@@ -14,6 +14,7 @@
 #include "vx.h"
 #include "arm64.h"
 #include "../translator/engine.h"
+#include "../translator/vcpu.h"
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <pthread.h>
@@ -70,7 +71,7 @@ x86_ctx *vx_x86_ctx(void) {
 // Each level keeps where its x86 frames begin (top: they are below) and a jmp_buf: an exception handled in a frame
 // of level L resumes L's engine loop, and the native frames above it are left, as the x86 build leaves them by
 // moving RSP over them.
-typedef struct level { struct level *outer; uint64_t top; jmp_buf jb; void *seh; } level;
+typedef struct level { struct level *outer; uint64_t top; jmp_buf jb; void *seh; int xv_depth; } level;
 static __thread level *t_level;
 void *vx_x86_return_address(void) {
     return t_ctx && t_ctx->gpr[4] ? (void *)(uintptr_t)*(uint64_t *)(uintptr_t)t_ctx->gpr[4] : NULL;
@@ -95,6 +96,10 @@ static void __attribute__((noreturn)) engine_fault(x86_ctx *c, int r) {
     case X86_FAULT_BP: vx_seh_fault(0x80000003, 0, NULL);                 // STATUS_BREAKPOINT
     case X86_FAULT_UD: vx_seh_fault(0xC000001D, 0, NULL);                 // STATUS_ILLEGAL_INSTRUCTION
     case X86_FAULT_GP: vx_seh_fault(0xC0000096, 0, NULL);                 // STATUS_PRIVILEGED_INSTRUCTION
+    case X86_FAULT_PF: {                                                  // (vCPU: an access fault)
+        uint64_t p[2] = { c->fault_info >> 63, c->fault_info & ~(1ull << 63) };
+        vx_seh_fault(0xC0000005, 2, p);
+    }
     default:
         if (r == X86_FAULT_INT && c->fault_info == 0x29) {             // __fastfail: ends the process
             vx_log("__fastfail(%llu) at %#llx", (unsigned long long)c->gpr[1], (unsigned long long)c->rip);
@@ -117,10 +122,11 @@ uint64_t vx_x86_call(uint64_t fn, int n, const uint64_t *args) {
     for (int i = 0; i < 4; i++) c->gpr[reg[i]] = i < n ? args[i] : 0;
     c->gpr[4] = sp;
     c->rip = fn; c->jump = 0; c->fault = 0;
-    level l = { t_level, sp + 8, {0}, t_level ? vx_seh_level_begin(&saved) : NULL };
+    level l = { t_level, sp + 8, {0}, t_level ? vx_seh_level_begin(&saved) : NULL, xv_depth() };
     t_level = &l;
     uint64_t fpcr = read_fpcr();
-    if (setjmp(l.jb)) { t_level = &l; write_fpcr(fpcr); }   // (resumed in this level: the context is the handler's)
+    if (setjmp(l.jb)) { t_level = &l; write_fpcr(fpcr); xv_set_depth(l.xv_depth); }   // (resumed in this level: the
+                                                                                     //  context is the handler's)
     int r = xe_run(g_engine, c, X86_RETURN);
     if (r) engine_fault(c, r);
     t_level = l.outer;
@@ -290,7 +296,13 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
 
 void vx_arm64_init(void) {
     // x86's memory order for accesses other threads may see (LDAPR / STLR, TRANSLATOR.md): VXRT_ORDERED=0 turns it off.
-    g_engine = xe_new(!getenv("VXRT_ORDERED") || atoi(getenv("VXRT_ORDERED")) != 0);
+    // VXRT_VCPU=1: in a Hypervisor.framework vCPU with x86's order in hardware (translator/vcpu.c).
+    if (getenv("VXRT_VCPU") && atoi(getenv("VXRT_VCPU"))) {
+        g_engine = xe_new_vcpu();
+        void vxvm_set_hook(void (*)(uint64_t, uint64_t));             // (src/vm_hooks.c: memory going away leaves the guest)
+        vxvm_set_hook(xv_unmap);
+    }
+    else g_engine = xe_new(!getenv("VXRT_ORDERED") || atoi(getenv("VXRT_ORDERED")) != 0);
     if (!g_engine) { fprintf(stderr, "vxrt: cannot map the translation cache\n"); exit(1); }
     xe_set_native(g_engine, vx_thunk_find);
     xe_set_smc(g_engine, 1);
