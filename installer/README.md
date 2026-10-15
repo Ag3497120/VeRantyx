@@ -59,6 +59,8 @@ cd installer/App && xcodegen && open Glovebox.xcodeproj
 
 ## Updates
 
+On this branch (VeRantyx Standalone) Sparkle is off: no feed, no key (`App/project.yml` says why).
+
 Sparkle 2 checks `https://github.com/glovebox-vr/glovebox/releases/latest/download/appcast.xml` once a day: every
 release attaches its own appcast, so the latest release's is always the newest. It installs an update
 only when its EdDSA signature matches the public key built into the app and it's signed by the

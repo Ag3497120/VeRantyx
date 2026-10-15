@@ -1,5 +1,9 @@
 # Legal
 
+*VeRantyx Standalone (this branch) is an unofficial build based on Glovebox; what follows is Glovebox's statement,
+and holds for this build too. For anything about this build, including takedown requests, contact its maintainer
+through [github.com/Ag3497120/VeRantyx](https://github.com/Ag3497120/VeRantyx/issues), not the Glovebox address below.*
+
 **Glovebox is an open-source, non-commercial fan project.** It is not affiliated with, endorsed by or sponsored by Valve Corporation or Apple Inc.
 
 **Trademarks.** Half-Life, Half-Life: Alyx, Steam, SteamVR and Source are trademarks of Valve Corporation. Apple, Apple Vision Pro, visionOS, Mac and Xcode are trademarks of Apple Inc. PlayStation and PS VR2 are trademarks of Sony Interactive Entertainment. These names are used only to say what Glovebox works with.

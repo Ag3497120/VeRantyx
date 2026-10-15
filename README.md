@@ -1,34 +1,63 @@
-<img src="installer/App/Glovebox/Assets.xcassets/AppIcon.appiconset/icon_512x512.png" width="128" alt="Glovebox">
+# VeRantyx Standalone
 
-# Glovebox
+**Unofficial and experimental.** Half-Life: Alyx running on Apple Vision Pro itself (no PC, no streaming), played
+**without PS VR2 Sense controllers**: with a Nintendo Switch Joy-Con in each hand, or with bare hands.
 
-**Play your Steam copy of Half-Life: Alyx on Apple Vision Pro.**
-It runs on the headset itself: no PC, no streaming. Glovebox builds it on your Mac from the copy you own and
-installs it on your headset.
+This is the `standalone` branch of [VeRantyx](https://github.com/Ag3497120/VeRantyx). It is based on
+**[Glovebox](https://github.com/glovebox-vr/glovebox) 0.1.5** (commit `521e6a6`) by the Glovebox contributors, under
+the MIT License, and keeps Glovebox's history so later releases can be merged. It is not Glovebox, is not made or
+supported by the Glovebox contributors, and is not affiliated with Valve, Apple, Sony or Nintendo.
+**If you play with Sense controllers, use [official Glovebox](https://github.com/glovebox-vr/glovebox).**
+
+What this build adds to Glovebox:
+
+- **Joy-Con:** a single Joy-Con (L) / (R) in each hand, or a joined pair, for the buttons, sticks and triggers;
+  where each hand is comes from Vision Pro hand tracking. A hand the cameras lose keeps its last pose, so its
+  buttons keep working.
+- **Bare hands:** pinch is the trigger, a closed fist is the grip, and hand motion is measured from tracking, so the
+  gravity gloves and throwing work.
+- Play no longer waits for two Sense controllers. With Sense controllers it plays exactly as Glovebox does (a Sense
+  controller always wins its hand).
+
+The input was offered to Glovebox in [glovebox-vr/glovebox#11](https://github.com/glovebox-vr/glovebox/issues/11);
+until upstream decides, it lives here.
+
+To keep it apart from official Glovebox, this build has its own name, its own bundle identifiers and folders, no
+automatic updates (official updates can't replace it), and it sends nothing to Glovebox's servers (no stutter
+reports, no news sign-up).
+
+**No game files are included.** As with Glovebox, the game comes from your own Steam account and is converted on your
+own Mac, signed with your own Apple developer account, for your own headset.
+
+**Other VeRantyx versions:** [`main`](https://github.com/Ag3497120/VeRantyx) and
+[`native`](https://github.com/Ag3497120/VeRantyx/tree/native) run the game on the Mac, which renders it and streams
+it to the headset (also with Joy-Con and hands).
+
+---
+
+*The rest is Glovebox's README, adjusted where it describes official downloads and updates.*
 
 ## You need
 
 - **Apple Vision Pro** on visionOS 26, with about 75 GB free (tested on M5 and M2)
-- **PlayStation VR2 Sense controllers**
+- **PlayStation VR2 Sense controllers**, **Nintendo Switch Joy-Con** (one in each hand), or just your hands
 - **Half-Life: Alyx** in your Steam library
 - **A Mac with Apple silicon**, with Xcode
 
 ## Install
 
-1. **[Download the Glovebox app](https://github.com/glovebox-vr/glovebox/releases/latest/download/Glovebox.dmg)** and open it.
-2. **Follow along.** It sets up Xcode, your headset and Steam, then builds the game and installs it on your
-   headset. You only step in where Apple or Steam need a person, and it shows you exactly where.
-3. **Put on your headset and open the game.** The rest of the game downloads straight to the headset, with your
-   Steam Cloud saves.
+There is no download of this build: build it from a checkout of this branch. From Terminal (below), or build the Mac
+app yourself (`installer/README.md`, with `GLOVEBOX_SRC` set to this checkout), which then runs as
+"VeRantyx Standalone" and puts "VeRantyx: HLA" on your headset. Neither updates itself: pull this branch and build
+again.
 
-The app keeps itself and the game up to date.
-
-<details>
+<details open>
 <summary>From Terminal</summary>
 
 `build` needs the runtime kit and your game files. From a checkout, build the kit once with
 `brew install cmake && zsh engine/kit/build-kit.sh glovebox-kit` (it lands where `build` looks). The game files come
-from the Mac app's download, or from `GLOVEBOX_GAME` pointing at a copy of the game's `game/` folder.
+from the Mac app's download, or from `GLOVEBOX_GAME` pointing at a copy of the game's `game/` folder. This build keeps
+its work in `~/Library/Application Support/VeRantyx Standalone/alyx` (`GLOVEBOX_WORK` to use another folder).
 
 ```sh
 xcrun python3 engine/glovebox.py doctor    # what this Mac and headset still need
@@ -53,6 +82,8 @@ Built on **[Klepton](https://github.com/shinyquagsire23/Klepton) by Max Thomas**
 from Valve, the Khronos Group, the SDL and LuaJIT projects and Debian. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Not affiliated with Valve or Apple
+
+(Glovebox's own statement. VeRantyx Standalone is likewise free, non-commercial and contains no game files.)
 
 Glovebox is an open-source fan project, not affiliated with or endorsed by Valve or Apple. You need your own copy of the
 game. Glovebox never hosts, shares or sells game files, and never charges money. [Legal](docs/LEGAL.md)

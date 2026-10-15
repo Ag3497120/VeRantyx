@@ -90,6 +90,9 @@ logs, nothing personal).
 
 ## Updates
 
+*VeRantyx Standalone (this branch) has none of this: no Sparkle feed or key, no releases, no stutter reports. It is
+updated by building a newer checkout. The rest describes official Glovebox.*
+
 - **The app itself:** Sparkle 2. The appcast and the signed zips live on GitHub Releases. Each update is checked
   against our EdDSA key and Apple's code signature. The app is Developer ID–signed and notarized.
 - **The game build:** each release names a source tag and a runtime kit. When either changes, or Steam has a new
