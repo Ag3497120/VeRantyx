@@ -219,51 +219,46 @@ enum { TEB_THREAD_ID = 0x48, CS_RECURSION = 12, CS_OWNER = 16, CS_WORD = 24 };
 #define GFIELD(p, off, type) (*(volatile type *)((uint8_t *)(p) + (off)))
 static inline __attribute__((always_inline)) uint64_t gtid(const x86_ctx *c) { return *(volatile uint32_t *)(uintptr_t)(c->gs_base + TEB_THREAD_ID); }
 static inline __attribute__((always_inline)) int gcs_try(x86_ctx *c, void *cs) {
-    uint64_t tid = gtid(c), *w = (uint64_t *)((uint8_t *)cs + CS_WORD), cur = __atomic_load_n(w, __ATOMIC_RELAXED);
-    if ((cur & 3) && cur >> 32 == tid) { GFIELD(cs, CS_RECURSION, int32_t)++; return 1; }
-    uint64_t free_ = 0;
-    if (!__atomic_compare_exchange_n(w, &free_, tid << 32 | 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
+    uint32_t tid = (uint32_t)gtid(c), *w = (uint32_t *)((uint8_t *)cs + CS_WORD);
+    if (__atomic_load_n(w, __ATOMIC_RELAXED) && GFIELD(cs, CS_OWNER, uint32_t) == tid) { GFIELD(cs, CS_RECURSION, int32_t)++; return 1; }
+    uint32_t free_ = 0;
+    if (!__atomic_compare_exchange_n(w, &free_, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0;
     GFIELD(cs, CS_RECURSION, int32_t) = 1; GFIELD(cs, CS_OWNER, uint64_t) = tid;
     return 1;
 }
 GUEST int xv_g_cs_enter(x86_ctx *c, const void *d) { (void)d; return !gcs_try(c, (void *)(uintptr_t)garg(c, 0)); }
-GUEST int xv_g_cs_try(x86_ctx *c, const void *d) {
-    (void)d;
-    void *cs = (void *)(uintptr_t)garg(c, 0);
-    c->gpr[0] = gcs_try(c, cs);
-    return 0;
-}
+GUEST int xv_g_cs_try(x86_ctx *c, const void *d) { (void)d; c->gpr[0] = gcs_try(c, (void *)(uintptr_t)garg(c, 0)); return 0; }
 GUEST int xv_g_cs_leave(x86_ctx *c, const void *d) {
     (void)d;
     void *cs = (void *)(uintptr_t)garg(c, 0);
     int32_t r = GFIELD(cs, CS_RECURSION, int32_t);
     if (r > 1) { GFIELD(cs, CS_RECURSION, int32_t) = r - 1; return 0; }
-    uint64_t *w = (uint64_t *)((uint8_t *)cs + CS_WORD), held = __atomic_load_n(w, __ATOMIC_RELAXED);
-    if ((held & 3) != 1) return 1;                                    // (sleepers: the host wakes one)
+    uint32_t *w = (uint32_t *)((uint8_t *)cs + CS_WORD), held = 1;
+    if (__atomic_load_n(w, __ATOMIC_RELAXED) != 1) return 1;          // (sleepers: the host wakes one)
     uint64_t owner = GFIELD(cs, CS_OWNER, uint64_t);
     GFIELD(cs, CS_RECURSION, int32_t) = 0; GFIELD(cs, CS_OWNER, uint64_t) = 0;
     if (__atomic_compare_exchange_n(w, &held, 0, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return 0;
     GFIELD(cs, CS_RECURSION, int32_t) = r; GFIELD(cs, CS_OWNER, uint64_t) = owner;   // (one came to sleep meanwhile)
     return 1;
 }
-static inline __attribute__((always_inline)) int gsrw_try(uint64_t *w, int shared) {
-    uint64_t cur = __atomic_load_n(w, __ATOMIC_RELAXED);
+static inline __attribute__((always_inline)) int gsrw_try(uint32_t *w, int shared) {
+    uint32_t cur = __atomic_load_n(w, __ATOMIC_RELAXED);
     if (cur & 1) return 0;
     if (!shared && cur >> 2) return 0;
     return __atomic_compare_exchange_n(w, &cur, shared ? cur + 4 : cur | 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
 }
 // (an acquire: done, or the host's to wait; a try: answered either way)
-GUEST int xv_g_srw_acquire_exclusive(x86_ctx *c, const void *d) { (void)d; return !gsrw_try((uint64_t *)(uintptr_t)garg(c, 0), 0); }
-GUEST int xv_g_srw_acquire_shared(x86_ctx *c, const void *d) { (void)d; return !gsrw_try((uint64_t *)(uintptr_t)garg(c, 0), 1); }
-GUEST int xv_g_srw_try_exclusive(x86_ctx *c, const void *d) { (void)d; c->gpr[0] = gsrw_try((uint64_t *)(uintptr_t)garg(c, 0), 0); return 0; }
-GUEST int xv_g_srw_try_shared(x86_ctx *c, const void *d) { (void)d; c->gpr[0] = gsrw_try((uint64_t *)(uintptr_t)garg(c, 0), 1); return 0; }
-static inline __attribute__((always_inline)) int gsrw_release(uint64_t *w, int shared) {
-    uint64_t cur = __atomic_load_n(w, __ATOMIC_RELAXED);
+GUEST int xv_g_srw_acquire_exclusive(x86_ctx *c, const void *d) { (void)d; return !gsrw_try((uint32_t *)(uintptr_t)garg(c, 0), 0); }
+GUEST int xv_g_srw_acquire_shared(x86_ctx *c, const void *d) { (void)d; return !gsrw_try((uint32_t *)(uintptr_t)garg(c, 0), 1); }
+GUEST int xv_g_srw_try_exclusive(x86_ctx *c, const void *d) { (void)d; c->gpr[0] = gsrw_try((uint32_t *)(uintptr_t)garg(c, 0), 0); return 0; }
+GUEST int xv_g_srw_try_shared(x86_ctx *c, const void *d) { (void)d; c->gpr[0] = gsrw_try((uint32_t *)(uintptr_t)garg(c, 0), 1); return 0; }
+static inline __attribute__((always_inline)) int gsrw_release(uint32_t *w, int shared) {
+    uint32_t cur = __atomic_load_n(w, __ATOMIC_RELAXED);
     for (;;) {
         if (cur & 2) return 1;                                        // (sleepers: the host)
-        uint64_t neu = shared ? cur - 4 : cur & ~1ull;
+        uint32_t neu = shared ? cur - 4 : cur & ~1u;
         if (__atomic_compare_exchange_n(w, &cur, neu, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return 0;
     }
 }
-GUEST int xv_g_srw_release_exclusive(x86_ctx *c, const void *d) { (void)d; return gsrw_release((uint64_t *)(uintptr_t)garg(c, 0), 0); }
-GUEST int xv_g_srw_release_shared(x86_ctx *c, const void *d) { (void)d; return gsrw_release((uint64_t *)(uintptr_t)garg(c, 0), 1); }
+GUEST int xv_g_srw_release_exclusive(x86_ctx *c, const void *d) { (void)d; return gsrw_release((uint32_t *)(uintptr_t)garg(c, 0), 0); }
+GUEST int xv_g_srw_release_shared(x86_ctx *c, const void *d) { (void)d; return gsrw_release((uint32_t *)(uintptr_t)garg(c, 0), 1); }

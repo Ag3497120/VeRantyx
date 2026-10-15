@@ -109,6 +109,34 @@ static int stack_walk_ok(void) {
     volatile char here = 0;
     return bottom <= (char *)&here && (char *)&here < base;
 }
+// Locks in a structure packed to 4 bytes (SteamVR's vrserver has such critical sections): none of them may need
+// 8-byte alignment.
+#pragma pack(push, 4)
+static struct { int pad; CRITICAL_SECTION cs; SRWLOCK srw; CONDITION_VARIABLE cv; } packed __attribute__((aligned(8)));   // (cs: 4 bytes off)
+#pragma pack(pop)
+static volatile LONG packed_cs_count, packed_srw_count;
+static DWORD WINAPI packed_worker(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 2000; i++) {
+        EnterCriticalSection(&packed.cs); EnterCriticalSection(&packed.cs); packed_cs_count++; LeaveCriticalSection(&packed.cs); LeaveCriticalSection(&packed.cs);
+        AcquireSRWLockExclusive(&packed.srw); packed_srw_count++; ReleaseSRWLockExclusive(&packed.srw);
+        AcquireSRWLockShared(&packed.srw); ReleaseSRWLockShared(&packed.srw);
+    }
+    return 0;
+}
+static int packed_ok(void) {
+    InitializeCriticalSection(&packed.cs); InitializeSRWLock(&packed.srw); InitializeConditionVariable(&packed.cv);
+    HANDLE t[3];
+    for (int i = 0; i < 3; i++) t[i] = CreateThread(NULL, 0, packed_worker, NULL, 0, NULL);
+    WaitForMultipleObjects(3, t, TRUE, 10000);
+    for (int i = 0; i < 3; i++) CloseHandle(t[i]);
+    EnterCriticalSection(&packed.cs);
+    WakeAllConditionVariable(&packed.cv);
+    BOOL woke = SleepConditionVariableCS(&packed.cv, &packed.cs, 1);   // (nobody wakes it: times out)
+    LeaveCriticalSection(&packed.cs);
+    DeleteCriticalSection(&packed.cs);
+    return packed_cs_count == 6000 && packed_srw_count == 6000 && !woke;
+}
 int main(void) {
     InitializeCriticalSection(&cs);
     tls_index = TlsAlloc();
@@ -135,9 +163,9 @@ int main(void) {
     DWORD wcode = 0;
     if (WaitForSingleObject(wt, 5000) != WAIT_OBJECT_0) ok = 0;
     GetExitCodeThread(wt, &wcode);
-    int fib = fibers_ok(), sus = suspend_ok(), walk = stack_walk_ok();
-    ok = ok && counter == 40000 && interlocked == 40000 && sems == 4 && wcode == 77 && per_thread == 7 && fib && sus && walk;
-    printf("threads: counter=%ld interlocked=%ld semaphores=%d condvar=%lu main_tls=%d fibers=%s suspend+apc=%s stack=%s -> %s\n",
-           counter, interlocked, sems, wcode, per_thread, fib ? "ok" : "bad", sus ? "ok" : "bad", walk ? "ok" : "bad", ok ? "ok" : "FAILED");
+    int fib = fibers_ok(), sus = suspend_ok(), walk = stack_walk_ok(), pk = packed_ok();
+    ok = ok && counter == 40000 && interlocked == 40000 && sems == 4 && wcode == 77 && per_thread == 7 && fib && sus && walk && pk;
+    printf("threads: counter=%ld interlocked=%ld semaphores=%d condvar=%lu main_tls=%d fibers=%s suspend+apc=%s stack=%s packed locks=%s -> %s\n",
+           counter, interlocked, sems, wcode, per_thread, fib ? "ok" : "bad", sus ? "ok" : "bad", walk ? "ok" : "bad", pk ? "ok" : "bad", ok ? "ok" : "FAILED");
     return !ok;
 }
