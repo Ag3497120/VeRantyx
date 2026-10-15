@@ -50,12 +50,35 @@ anti-cheat-protected games. The existing MCP server (`tools/vxrt_mcp.py`) is whe
 What makes this worth building is not running AI models on several operating systems (others already provide
 cross-platform local inference); it is that Windows-only software becomes usable on a Mac **and** by an agent.
 
+## An OS for apps, on top of macOS
+
+Put together, VXRuntime is a runtime that is also a kind of operating system: not one that replaces macOS (the
+kernel, drivers and hardware stay macOS's), but one that owns everything an app sees, its API, files, network and
+devices, and so can run apps safely, let an AI work with them, and be repaired by an AI. Unlike an OS with one
+assistant built in, the AI is the user's choice (Claude, Codex, Gemini, a local model), connected over MCP.
+
+- **Safe to run.** With the translator, every instruction of an app passes through VXRuntime. Under Rosetta a
+  hostile x86 program can still issue macOS system calls directly (the `syscall` instruction); translated code cannot,
+  so access to files, network and devices is mediated at the API, without the weight of a virtual machine. Each app
+  gets its own permissions (which folders, network or not, which devices), and its writes go to its own overlay
+  (already how VXRuntime keeps game folders untouched) with snapshots to roll back to.
+- **AI at the centre.** Agents observe and operate apps through structure (above), within the permissions.
+- **Repaired by AI, never silently.** The loop exists today: a failure becomes evidence (harness), an agent changes
+  VXRuntime, the differential test, harness runs and a playtest show the change works, and what cannot be fixed
+  becomes an issue. A repair is applied only after its tests pass and the user approves it, and can be rolled back.
+  Not breaking things comes before repairing them fast.
+- **One place to start apps.** Windows and Mac apps launched from one place, with the AI at hand (VXRT Studio grown
+  up).
+
 ## Order of work
 
-1. Translator phases 2b–5 (TRANSLATOR.md), with the mixed-ABI choices above built in.
-2. Observation and operation through MCP: the control tree and frames first (they cover the most apps), then
-   permissions and logging, then per-title game state for the games with profiles.
-3. ARM64 PEs next to x86-64 ones; macOS programs loading Windows DLLs through VXRuntime as a library.
+1. Translator phases 2b–5 (TRANSLATOR.md), with the mixed-ABI choices above built in: it is also what makes complete
+   mediation possible.
+2. Safety: per-app permissions, snapshots and rollback of each app's overlay, a log of what apps and agents did.
+3. Observation and operation through MCP: the control tree and frames first (they cover the most apps), then
+   per-title game state for the games with profiles; AI repairs as a tested, approved, reversible flow.
+4. One launcher for Windows and Mac apps with the AI at hand; ARM64 PEs next to x86-64 ones; macOS programs loading
+   Windows DLLs through VXRuntime as a library.
 
 Each step ships only with the measurements that show it (harness runs, differential tests, playtests), and states
 what it does not cover.
