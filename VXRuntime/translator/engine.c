@@ -296,7 +296,8 @@ int xe_smc_write(xe *e, uint64_t addr) {
     uint64_t pg = addr & ~(uint64_t)(PAGE - 1);
     pthread_mutex_lock(&e->lock);
     page_rec *r = page_at(e, pg, 0);
-    if (!r || !r->protected) { pthread_mutex_unlock(&e->lock); return 0; }
+    if (!r) { pthread_mutex_unlock(&e->lock); return 0; }
+    if (!r->protected) { pthread_mutex_unlock(&e->lock); return 1; }      // (another thread's write gave it back just now)
     for (uint32_t k = 0; k < r->n; k++) forget_block(e, r->ids[k]);
     r->n = 0;
     r->protected = 0;

@@ -281,7 +281,11 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
     _STRUCT_ARM_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
     uint64_t pc = ss->__pc;
     if ((sig == SIGSEGV || sig == SIGBUS) && xe_fix_split(g_engine, uc)) return;   // (ordered access across 16 bytes)
-    if ((sig == SIGSEGV || sig == SIGBUS) && ((uc->uc_mcontext->__es.__esr >> 6) & 1) && xe_smc_write(g_engine, (uint64_t)(uintptr_t)si->si_addr)) {
+    // A write to a page whose code was translated (SMC). A permission fault on a readable page is a write, whatever
+    // WnR says (LSE atomics, XCHG's SWPAL, may fault with WnR 0).
+    uint64_t esr = uc->uc_mcontext->__es.__esr;
+    int write = ((esr >> 6) & 1) || ((esr >> 26) == 0x24 && (esr & 0x3C) == 0x0C);
+    if ((sig == SIGSEGV || sig == SIGBUS) && write && xe_smc_write(g_engine, (uint64_t)(uintptr_t)si->si_addr)) {
         uint64_t at = xe_owns(g_engine, pc) ? xe_rip_at(g_engine, pc) : 0;
         if (at && t_ctx) { state_from_signal(t_ctx, uc, at); ss->__pc = (uint64_t)(uintptr_t)smc_restart; ss->__lr = 0; }
         return;                                               // (native code: the write again, now allowed)
@@ -293,6 +297,8 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
         return;
     }
     uint64_t rip = xe_owns(g_engine, pc) ? xe_rip_at(g_engine, pc) : 0;
+    if (rip && t_ctx && (sig == SIGSEGV || sig == SIGBUS) && getenv("VXRT_TRACE_FAULTS"))
+        vx_log("arm64: fault at x86 %#llx (host %#llx), address %p, ESR %#llx", (unsigned long long)rip, (unsigned long long)pc, si->si_addr, (unsigned long long)esr);
     if (rip && t_ctx && (sig == SIGSEGV || sig == SIGBUS)) {
         // The program's access fault: its state from the registers the translation keeps it in, then on (out of
         // the signal) to the dispatch on this thread's stack, below the translated code's frame.

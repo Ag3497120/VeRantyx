@@ -299,9 +299,9 @@ int xv_enter(x86_ctx *c, uint64_t enter, uint64_t vectors) {
                     continue;
                 }
                 if (abort_ && (fsc & 0x3C) == 0x0C) {                          // permission: a stale TLB entry (the page
-                    pthread_mutex_lock(&g_lock);                               //  table allows it now)? flushed, again
-                    uint64_t *p = pte(far);
-                    int allowed = p && (*p & 1) && (!((esr >> 6) & 1) || !(*p & 1u << 7));
+                    pthread_mutex_lock(&g_lock);                               //  table allows it now)? flushed, again.
+                    uint64_t *p = pte(far);                                    // (on a readable page only a write faults:
+                    int allowed = p && (*p & 1) && !(*p & 1u << 7);            //  atomics may say WnR 0)
                     pthread_mutex_unlock(&g_lock);
                     if (allowed) { t_gen = g_gen - 1; hv_vcpu_set_reg(t_vcpu, HV_REG_PC, elr); hv_vcpu_set_reg(t_vcpu, HV_REG_CPSR, spsr); continue; }
                 }
@@ -313,7 +313,7 @@ int xv_enter(x86_ctx *c, uint64_t enter, uint64_t vectors) {
                     }
                     hv_vcpu_get_reg(t_vcpu, HV_REG_X27, &c->flags);
                     hv_vcpu_get_reg(t_vcpu, HV_REG_X29, &c->ras);
-                    t_fault_pc = elr; t_fault_addr = far; t_fault_write = (esr >> 6) & 1;
+                    t_fault_pc = elr; t_fault_addr = far; t_fault_write = ((esr >> 6) & 1) || (fsc & 0x3C) == 0x0C;
                     result = XV_FAULT;
                     break;
                 }
