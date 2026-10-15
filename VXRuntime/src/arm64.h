@@ -11,6 +11,13 @@ typedef struct { const void *fn; void (*thunk)(x86_ctx *); } vx_thunk;
 void vx_thunks_add(const vx_thunk *t, size_t n);
 void vx_thunks_override(const vx_thunk *t, size_t n);       // thunks of their own for functions that work on the x86 state
 void (*vx_thunk_find(uint64_t fn))(x86_ctx *);       // NULL: not a function translated code may call
+// vCPU: calls of these native functions (no result) may be recorded in the guest and run at its next exit; for
+// each, its argument count and the arrays its arguments point to (translator/vcpu.h's xv_copy).
+#include "../translator/vcpu.h"
+typedef struct { const void *fn; uint32_t nargs, ncopy; xv_copy copy[4]; } vx_defer;
+void vx_defer_add(const vx_defer *d, size_t n);
+#define VX_COPY(arg, count_arg, elem, max) { arg, count_arg, elem, 0, max }
+#define VX_COPY_N(arg, n, elem) { arg, -1, elem, n, n }
 
 // Argument i of the call the program just made (RSP at its return address): RCX RDX R8 R9, then the stack above the
 // 32-byte home area. Floating-point arguments 0-3 are in XMM0-3 instead.

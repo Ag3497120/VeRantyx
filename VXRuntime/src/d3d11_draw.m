@@ -2014,5 +2014,32 @@ void d3d_draw_init(void) {
 }
 
 #ifdef __aarch64__
+// vCPU: immediate-context calls the guest may record and the host runs at the guest's next exit (src/arm64.c,
+// translator/guest.c): no result, arrays copied when called. (Get* and Map answer: they are called, after the batch.)
+#include "arm64.h"
+static const vx_defer g_deferred_draw[] = {
+    { ia_set_layout, 2, 0, {{0}} }, { ia_set_index_buffer, 4, 0, {{0}} }, { ia_set_topology, 2, 0, {{0}} },
+    { ia_set_vertex_buffers, 6, 3, { VX_COPY(3, 2, 8, 32), VX_COPY(4, 2, 4, 32), VX_COPY(5, 2, 4, 32) } },
+    { vs_set_shader, 4, 1, { VX_COPY(2, 3, 8, 256) } }, { ps_set_shader, 4, 1, { VX_COPY(2, 3, 8, 256) } },
+    { gs_set_shader, 4, 1, { VX_COPY(2, 3, 8, 256) } }, { cs_set_shader, 4, 1, { VX_COPY(2, 3, 8, 256) } },
+    { vs_set_cbs, 4, 1, { VX_COPY(3, 2, 8, 128) } }, { ps_set_cbs, 4, 1, { VX_COPY(3, 2, 8, 128) } },
+    { gs_set_cbs, 4, 1, { VX_COPY(3, 2, 8, 128) } }, { cs_set_cbs, 4, 1, { VX_COPY(3, 2, 8, 128) } },
+    { vs_set_srvs, 4, 1, { VX_COPY(3, 2, 8, 128) } }, { ps_set_srvs, 4, 1, { VX_COPY(3, 2, 8, 128) } },
+    { gs_set_srvs, 4, 1, { VX_COPY(3, 2, 8, 128) } }, { cs_set_srvs, 4, 1, { VX_COPY(3, 2, 8, 128) } },
+    { vs_set_samplers, 4, 1, { VX_COPY(3, 2, 8, 128) } }, { ps_set_samplers, 4, 1, { VX_COPY(3, 2, 8, 128) } },
+    { gs_set_samplers, 4, 1, { VX_COPY(3, 2, 8, 128) } }, { cs_set_samplers, 4, 1, { VX_COPY(3, 2, 8, 128) } },
+    { cs_set_uavs, 5, 2, { VX_COPY(3, 2, 8, 64), VX_COPY(4, 2, 4, 64) } },
+    { om_set_targets_and_uavs, 8, 3, { VX_COPY(2, 1, 8, 8), VX_COPY(6, 5, 8, 64), VX_COPY(7, 5, 4, 64) } },
+    { om_set_blend, 4, 1, { VX_COPY_N(2, 4, 4) } }, { om_set_depth, 3, 0, {{0}} }, { rs_set_state, 2, 0, {{0}} },
+    { rs_set_scissors, 3, 1, { VX_COPY(2, 1, 16, 16) } },
+    { ctx_draw, 3, 0, {{0}} }, { ctx_draw_instanced, 5, 0, {{0}} }, { ctx_draw_indexed, 4, 0, {{0}} },
+    { ctx_draw_indexed_instanced, 6, 0, {{0}} }, { ctx_dispatch, 4, 0, {{0}} },
+    { so_set_targets, 4, 2, { VX_COPY(2, 1, 8, 4), VX_COPY(3, 1, 4, 4) } },
+    { ctx_begin, 2, 0, {{0}} }, { ctx_end, 2, 0, {{0}} }, { ctx_generate_mips, 2, 0, {{0}} },
+};
+__attribute__((constructor)) static void deferred_draw_add(void) { vx_defer_add(g_deferred_draw, sizeof g_deferred_draw / sizeof *g_deferred_draw); }
+#endif
+
+#ifdef __aarch64__
 #include "thunks/d3d11_draw.m.inc"
 #endif

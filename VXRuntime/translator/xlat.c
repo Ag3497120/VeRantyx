@@ -1579,6 +1579,27 @@ void xlat_block_native(xlat_buf *b, void (*fn)(x86_ctx *)) {
     site_ret(b);
 }
 
+void xlat_block_native_defer(xlat_buf *b, void (*fn)(x86_ctx *), uint64_t desc, uint64_t guest_defer) {
+    E(b, a64_str(8, XS, XC, CTX_RAS));
+    for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
+    for (int r = 0; r < 16; r += 2) E(b, a64_stpq(r, r + 1, XC, CTX_XMM + r * 16));
+    E(b, a64_str(8, XF, XC, CTX_FLAGS));
+    E(b, a64_mov(0, XC));
+    mov_imm(b, 1, desc);
+    mov_imm(b, S0, guest_defer);
+    E(b, a64_blr(S0));                                                    // (in the guest: x19-x28 kept, as callee-saved)
+    size_t slow = here(b); E(b, 0);                                       // CBNZ w0 -> the call itself
+    for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
+    for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
+    E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
+    E(b, a64_ldr8_post(S1, 4, 8));
+    site_ret(b);
+    patch_cbz(b, slow, 1, 0);
+    for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));   // (the state again: the guest call used
+    for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));   //  the registers)
+    xlat_block_native(b, fn);
+}
+
 static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end);
 int xlat_block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end) {
     b->defer_cold = 1;

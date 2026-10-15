@@ -1,6 +1,14 @@
 // Translated code in a Hypervisor.framework guest (vcpu.c, engine.c's xe_new_vcpu).
 #pragma once
 #include "xlat.h"
+// A native function whose calls may be recorded in the guest and run at its next exit (no result): its thunk,
+// its argument count, and the arrays its arguments point to (argument `arg`, `count` elements of `elem` bytes, the
+// count in argument count_arg when >= 0; more than max: not recorded).
+enum { XV_DEFER_ARGS = 12 };
+typedef struct { int8_t arg, count_arg; uint16_t elem; uint32_t count, max; } xv_copy;
+typedef struct { uint64_t thunk; uint32_t nargs, ncopy; xv_copy copy[4]; } xv_defer;
+int xv_guest_defer(x86_ctx *c, const xv_defer *d);          // (guest.c: runs in the guest)
+void xv_guest_code(const uint8_t **code, size_t *size);     // guest.c's code, to copy into the guest
 int xv_init(void);                                         // the VM (once per process); 0: none
 // Runs the guest on the calling thread (its own vCPU) from `enter` with x0 = c until the exit (HVC #1); helpers
 // and native functions run on the host meanwhile. 0, or -1 when the guest stopped where nothing can go on.

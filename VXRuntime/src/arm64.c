@@ -52,6 +52,28 @@ void (*vx_thunk_find(uint64_t fn))(x86_ctx *) {
     return NULL;
 }
 
+// ---- calls the vCPU guest may record (vx_defer_add) -------------------------------------------------------------
+enum { DEFER_BITS = 10 };
+static struct { const void *fn; xv_defer *d; } g_defer[1u << DEFER_BITS];
+void vx_defer_add(const vx_defer *d, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint32_t s = thunk_slot((uint64_t)(uintptr_t)d[i].fn) & ((1u << DEFER_BITS) - 1);
+        while (g_defer[s].fn) s = (s + 1) & ((1u << DEFER_BITS) - 1);
+        xv_defer *x = calloc(1, sizeof *x);                     // (heap: memory the guest may have)
+        x->nargs = d[i].nargs; x->ncopy = d[i].ncopy;
+        memcpy(x->copy, d[i].copy, sizeof x->copy);
+        g_defer[s].fn = d[i].fn; g_defer[s].d = x;
+    }
+}
+static const void *defer_find(uint64_t fn) {
+    for (uint32_t s = thunk_slot(fn) & ((1u << DEFER_BITS) - 1); g_defer[s].fn; s = (s + 1) & ((1u << DEFER_BITS) - 1))
+        if ((uint64_t)(uintptr_t)g_defer[s].fn == fn) {
+            if (!g_defer[s].d->thunk) g_defer[s].d->thunk = (uint64_t)(uintptr_t)vx_thunk_find(fn);
+            return g_defer[s].d->thunk ? g_defer[s].d : NULL;
+        }
+    return NULL;
+}
+
 // ---- the threads' x86 state -------------------------------------------------------------------------------------
 void *vx_x86_return_address(void);
 static __thread x86_ctx *t_ctx;
@@ -63,6 +85,9 @@ x86_ctx *vx_x86_ctx(void) {
     c->gpr[4] = (*(uint64_t *)(teb + TEB_STACK_BASE) - 64) & ~15ull;
     c->mxcsr = 0x1F80; c->fcw = 0x037F; c->flags = 0x202;
     c->ras = xe_ring_new(g_engine);
+    enum { BATCH = 256 << 10 };                               // (vCPU: calls recorded in the guest)
+    uint8_t *batch = mmap(NULL, BATCH, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    c->batch_base = c->batch_ptr = (uint64_t)(uintptr_t)batch; c->batch_end = c->batch_base + BATCH;
     t_ctx = c;
     return c;
 }
@@ -301,6 +326,7 @@ void vx_arm64_init(void) {
         g_engine = xe_new_vcpu();
         void vxvm_set_hook(void (*)(uint64_t, uint64_t));             // (src/vm_hooks.c: memory going away leaves the guest)
         vxvm_set_hook(xv_unmap);
+        if (!getenv("VXRT_VCPU_NO_DEFER")) xe_set_defer(g_engine, defer_find);
     }
     else g_engine = xe_new(!getenv("VXRT_ORDERED") || atoi(getenv("VXRT_ORDERED")) != 0);
     if (!g_engine) { fprintf(stderr, "vxrt: cannot map the translation cache\n"); exit(1); }

@@ -39,6 +39,7 @@ typedef struct x86_ctx_s {
     uint64_t stale;              // set by a checked block (xlat_buf.check_bytes) whose code changed: translate it again
     uint64_t single;             // engine.c: run the instruction at rip alone, translated just for this once (it writes
                                  //   code that comes after it: what follows is translated after the write)
+    uint64_t batch_base, batch_ptr, batch_end;   // vcpu.c: calls recorded in the guest, run at its next exit
 } x86_ctx;
 enum { CTX_FLAGS = 128, CTX_RIP = 136, CTX_FS = 144, CTX_GS = 152, CTX_FAULT = 160, CTX_HELPER_OP = 168, CTX_HELPER_VAL = 176,
        CTX_XMM = 192, CTX_YMMH = 448, CTX_MXCSR = 704, CTX_FCW = 712,
@@ -100,6 +101,9 @@ int xlat_block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end);
 // (a thunk: it reads the call's arguments there and writes the result), the state back, then RET, or on at
 // ctx->rip when the function set ctx->jump.
 void xlat_block_native(xlat_buf *b, void (*fn)(x86_ctx *));
+// The same in the vCPU for a function that returns nothing: guest_defer(ctx, desc) records the call (vcpu.h's
+// xv_guest_defer); only when that cannot, the call leaves the guest.
+void xlat_block_native_defer(xlat_buf *b, void (*fn)(x86_ctx *), uint64_t desc, uint64_t guest_defer);
 // The guest's entry and exit (vcpu.c): x0 = the context on entry, then on at ctx->entry; the exit (S1: the next
 // RIP) stores the state and leaves with HVC #1.
 void xlat_guest_enter(xlat_buf *b);

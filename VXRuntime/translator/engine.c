@@ -33,6 +33,8 @@ struct xe {
     uint64_t ring_at;               //   where it was when xe_run last returned
     uint64_t **rings; int nrings;   // every ring, cleared when the code goes
     void (*(*native)(uint64_t))(x86_ctx *);
+    const void *(*defer)(uint64_t);  // vCPU: the xv_defer of a native function whose calls the guest may record
+    uint64_t guest_defer;            //   guest.c's xv_guest_defer, copied into the guest's code
     pthread_mutex_t lock;           // translating, linking, flushing (threads share the code)
     struct { uint64_t host, rip; } *imap;   // every translated instruction's code, in order (then rip 0: a block's end)
     size_t nimap, cimap;
@@ -110,6 +112,14 @@ static void stubs(xe *e) {
         n += 512;
         xv_set_tlbi((uint64_t)(uintptr_t)(c + n));                      // TLBI VMALLE1; DSB ISH; ISB; HVC #4
         n = emit(c, n, 0xD508871Fu); n = emit(c, n, 0xD5033B9Fu); n = emit(c, n, 0xD5033FDFu); n = emit(c, n, a64_hvc(XV_HVC_TLBI));
+        const uint8_t *gc; size_t gsize;                                   // guest.c's code (the section as it is)
+        xv_guest_code(&gc, &gsize);
+        if (gc && gsize) {
+            n = (n + 3) & ~(size_t)3;
+            memcpy(c + n, gc, gsize);
+            e->guest_defer = (uint64_t)(uintptr_t)((uint8_t *)(c + n) + ((const uint8_t *)(uintptr_t)xv_guest_defer - gc));
+            n += (gsize + 3) / 4;
+        }
     }
     e->used = n;
 }
@@ -130,6 +140,7 @@ uint64_t xe_ring_new(xe *e) {
     return (uint64_t)(uintptr_t)r;
 }
 void xe_set_native(xe *e, void (*(*find)(uint64_t))(x86_ctx *)) { e->native = find; }
+void xe_set_defer(xe *e, const void *(*find)(uint64_t)) { e->defer = find; }
 // A table entry, both words at once (with LSE2 an aligned STP is single-copy atomic): another thread's lookup stub
 // sees the old entry or the new one.
 static void put_entry(entry *t, uint64_t rip, uint64_t host) { __asm__ volatile("stp %1, %2, [%0]" :: "r"(t), "r"(rip), "r"(host) : "memory"); }
@@ -321,7 +332,9 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
     b.ordered = e->ordered; b.stop = stop; b.vcpu = e->vcpu;
     uint64_t end = rip + 1;
     void (*thunk)(x86_ctx *) = e->native ? e->native(rip) : NULL;
-    if (thunk) xlat_block_native(&b, thunk);
+    const void *defer = thunk && e->vcpu && e->defer && e->guest_defer ? e->defer(rip) : NULL;
+    if (defer) xlat_block_native_defer(&b, thunk, (uint64_t)(uintptr_t)defer, e->guest_defer);
+    else if (thunk) xlat_block_native(&b, thunk);
     else {
         if (e->smc) {                                                     // (a page written often: a checked block)
             page_rec *r = page_at(e, rip & ~(uint64_t)(PAGE - 1), 0), *r2 = page_at(e, (rip + 1024) & ~(uint64_t)(PAGE - 1), 0);

@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 
 enum { POOL_IPA = 0x10000000, POOL_BYTES = 64 << 20, DATA_IPA = 0x40000000, HOST_PAGE = 16384 };
 enum { SET_BITS = 22 };                                     // host pages in the guest (open addressing, 4M)
@@ -179,11 +181,59 @@ static int vcpu_setup(uint64_t vectors) {
         hv_vcpu_set_sys_reg(t_vcpu, HV_SYS_REG_ACTLR_EL1, actlr | 2);
     }
     hv_vcpu_set_vtimer_mask(t_vcpu, true);
+    uint8_t *stack = mmap(NULL, 256 << 10, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);   // (guest.c's calls)
+    hv_vcpu_set_sys_reg(t_vcpu, HV_SYS_REG_SP_EL1, (uint64_t)(uintptr_t)(stack + (256 << 10) - 64));
     t_have = 1;
     return 1;
 }
 
 typedef void (*native_fn)(x86_ctx *);
+void xv_guest_code(const uint8_t **code, size_t *size) {
+    extern const struct mach_header_64 *_NSGetMachExecuteHeader(void);
+    unsigned long n = 0;
+    *code = getsectiondata(_NSGetMachExecuteHeader(), "__TEXT", "__vx_guest", &n);
+    *size = n;
+}
+// The calls recorded in the guest (guest.c), in order: each with a context holding its arguments.
+static void drain(x86_ctx *c) {
+    if (!c->batch_base || c->batch_ptr == c->batch_base) return;
+    uint8_t *p = (uint8_t *)(uintptr_t)c->batch_base, *end = (uint8_t *)(uintptr_t)c->batch_ptr;
+    c->batch_ptr = c->batch_base;
+    static __thread x86_ctx *f;
+    if (!f) f = calloc(1, sizeof *f);
+    uint64_t stack[5 + XV_DEFER_ARGS];
+    static const int reg[4] = { 1, 2, 8, 9 };
+    while (p < end) {
+        const uint64_t *r = (const uint64_t *)p;
+        for (uint64_t i = 0; i < r[2]; i++) { if (i < 4) f->gpr[reg[i]] = r[3 + i]; else stack[5 + (i - 4)] = r[3 + i]; }
+        f->gpr[4] = (uint64_t)(uintptr_t)stack;
+        ((native_fn)(uintptr_t)r[1])(f);
+        p += r[0];
+    }
+}
+// XV_STATS=1: exits counted by kind and native function, printed at exit.
+#include <dlfcn.h>
+static uint64_t g_counts[8], g_fn[512], g_fn_n[512];
+static void count_fn(uint64_t fn) {
+    uint32_t s = (uint32_t)(fn >> 2) & 511;
+    for (int k = 0; k < 512; k++, s = (s + 1) & 511) {
+        if (g_fn[s] == fn) { __atomic_fetch_add(&g_fn_n[s], 1, __ATOMIC_RELAXED); return; }
+        if (!g_fn[s]) { g_fn[s] = fn; g_fn_n[s] = 1; return; }
+    }
+}
+static void print_stats(void) {
+    fprintf(stderr, "[vxrt] vcpu exits: engine %llu, helper %llu, native %llu, fault %llu, tlbi %llu\n", (unsigned long long)g_counts[1],
+            (unsigned long long)g_counts[2], (unsigned long long)g_counts[3], (unsigned long long)g_counts[5], (unsigned long long)g_counts[4]);
+    for (int round = 0; round < 25; round++) {
+        int best = -1;
+        for (int i = 0; i < 512; i++) if (g_fn[i] && (best < 0 || g_fn_n[i] > g_fn_n[best])) best = i;
+        if (best < 0 || !g_fn_n[best]) break;
+        Dl_info di; const char *name = dladdr((void *)(uintptr_t)g_fn[best], &di) && di.dli_sname ? di.dli_sname : "?";
+        fprintf(stderr, "   %10llu  %s\n", (unsigned long long)g_fn_n[best], name);
+        g_fn_n[best] = 0;
+    }
+}
+static int g_stats = -1;
 #define DBG(...) do { if (getenv("XV_DEBUG")) { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 int xv_enter(x86_ctx *c, uint64_t enter, uint64_t vectors) {
     DBG("xv_enter ctx %p enter %#llx vectors %#llx", (void *)c, (unsigned long long)enter, (unsigned long long)vectors);
@@ -223,11 +273,15 @@ int xv_enter(x86_ctx *c, uint64_t enter, uint64_t vectors) {
         }
         if (ec == 0x16) {                                                     // HVC
             uint32_t imm = (uint32_t)(syndrome & 0xFFFF);
+            if (g_stats < 0) { g_stats = getenv("XV_STATS") != NULL; if (g_stats) atexit(print_stats); }
+            if (g_stats) __atomic_fetch_add(&g_counts[imm < 5 ? imm : 5], 1, __ATOMIC_RELAXED);
+            if (imm != XV_HVC_HELPER && imm != XV_HVC_TLBI) drain(c);    // (what the guest recorded comes first)
             if (imm == XV_HVC_EXIT) { result = 0; break; }
             if (imm == XV_HVC_TLBI) { hv_vcpu_set_reg(t_vcpu, HV_REG_PC, t_resume); t_resume = 0; continue; }
             if (imm == XV_HVC_HELPER) { xlat_helper(c); continue; }
             if (imm == XV_HVC_NATIVE) {
                 uint64_t fn; hv_vcpu_get_reg(t_vcpu, HV_REG_X16, &fn);
+                if (g_stats) { count_fn(fn); if (g_counts[3] % 1000000 == 0) print_stats(); }
                 ((native_fn)(uintptr_t)fn)(c);
                 continue;
             }

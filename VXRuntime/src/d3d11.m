@@ -1468,5 +1468,17 @@ void vx_d3d11_init(void) {
 }
 
 #ifdef __aarch64__
+// vCPU: immediate-context calls the guest may record (as in d3d11_draw.m).
+#include "arm64.h"
+static const vx_defer g_deferred_ctx[] = {
+    { ctx_om_set_render_targets, 4, 1, { VX_COPY(2, 1, 8, 8) } }, { ctx_rs_set_viewports, 3, 1, { VX_COPY(2, 1, 24, 16) } },
+    { ctx_clear_rtv, 3, 1, { VX_COPY_N(2, 4, 4) } }, { ctx_discard_view, 2, 0, {{0}} }, { ctx_discard_resource, 2, 0, {{0}} },
+    { ctx_copy_resource, 3, 0, {{0}} }, { ctx_copy_subresource_region, 9, 1, { VX_COPY_N(8, 1, 24) } },
+    { ctx_unmap, 3, 0, {{0}} },                                    // (the data was written before: a later Map waits for it)
+};
+__attribute__((constructor)) static void deferred_ctx_add(void) { vx_defer_add(g_deferred_ctx, sizeof g_deferred_ctx / sizeof *g_deferred_ctx); }
+#endif
+
+#ifdef __aarch64__
 #include "thunks/d3d11.m.inc"
 #endif
