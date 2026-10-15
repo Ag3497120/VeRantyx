@@ -11,6 +11,7 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <spawn.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,7 +151,7 @@ static uint64_t last_addr;                           // the memory operand's add
 static void make_case(const form *f, dt_case *c, int *size_out) {
     memset(c, 0, sizeof *c);
     last_addr = 0;
-    for (int i = 0; i < 16; i++) rnd_xmm(c->in.xmm[i]);
+    for (int i = 0; i < 16; i++) { rnd_xmm(c->in.xmm[i]); rnd_xmm(c->in.ymm_hi[i]); }
     c->in.mxcsr = 0x1F80;
     for (int i = 0; i < 16; i++) c->in.gpr[i] = rnd_value();
     for (int i = 0; i < DT_BUF_SIZE; i++) c->mem[i] = (uint8_t)rnd();
@@ -316,7 +317,7 @@ typedef struct { uint8_t *at; int target; } fixup;      // a rel32 at `at` to bl
 static void make_program(dt_case *c) {
     memset(c, 0, sizeof *c);
     c->kind = 1;
-    for (int i = 0; i < 16; i++) rnd_xmm(c->in.xmm[i]);
+    for (int i = 0; i < 16; i++) { rnd_xmm(c->in.xmm[i]); rnd_xmm(c->in.ymm_hi[i]); }
     c->in.mxcsr = 0x1F80;
     for (int i = 0; i < 16; i++) c->in.gpr[i] = rnd_value();
     for (int i = 0; i < DT_BUF_SIZE; i++) c->mem[i] = (uint8_t)rnd();
@@ -387,13 +388,13 @@ static int run_translated(const dt_case *c, const x86_insn *d, dt_result *r) {
     static x86_ctx ctx;
     memset(&ctx, 0, sizeof ctx);
     memcpy(ctx.gpr, c->in.gpr, sizeof ctx.gpr);
-    memcpy(ctx.xmm, c->in.xmm, sizeof ctx.xmm);
+    memcpy(ctx.xmm, c->in.xmm, sizeof ctx.xmm); memcpy(ctx.ymm_hi, c->in.ymm_hi, sizeof ctx.ymm_hi);
     ctx.flags = c->in.flags;
     memcpy((void *)DT_BUF, c->mem, DT_BUF_SIZE);
     signaled = 0;
     if (!sigsetjmp(jb, 1)) ((void (*)(x86_ctx *))jit)(&ctx);
     memcpy(r->out.gpr, ctx.gpr, sizeof ctx.gpr);
-    memcpy(r->out.xmm, ctx.xmm, sizeof ctx.xmm);
+    memcpy(r->out.xmm, ctx.xmm, sizeof ctx.xmm); memcpy(r->out.ymm_hi, ctx.ymm_hi, sizeof ctx.ymm_hi);
     r->out.mxcsr = c->in.mxcsr;
     r->out.flags = ctx.flags;
     r->out.fault = signaled ? 2 : ctx.fault == X86_FAULT_DE ? 1 : 0;
@@ -403,9 +404,17 @@ static int run_translated(const dt_case *c, const x86_insn *d, dt_result *r) {
 }
 
 // ---- SSE forms -----------------------------------------------------------------------------------------------------------
-typedef struct { const char *name; uint8_t pf, op; int kind; int group; int mem; } sse_form;
-// kind bits: reg / rm are general registers, an imm8, register-only, REX.W variants, 16-byte aligned memory
-enum { K_GREG = 1, K_GRM = 2, K_IMM = 4, K_REGONLY = 8, K_W = 16, K_ALIGN = 32 };
+typedef struct { const char *name; uint8_t pf, op; int kind; int group; int mem; int map; } sse_form;
+// kind bits: reg / rm are general registers, an imm8, register-only, REX.W variants, 16-byte aligned memory;
+// VEX: encoded with VEX, VEX.vvvv not used (1111), used only between registers, 256 bits allowed, only 256 bits,
+// no ModRM, imm8[7:4] a register
+enum { K_GREG = 1, K_GRM = 2, K_IMM = 4, K_REGONLY = 8, K_W = 16, K_ALIGN = 32,
+       K_VEX = 64, K_NOV = 128, K_VREG = 256, K_L1 = 512, K_L1ONLY = 1024, K_NOMODRM = 2048, K_MASK4 = 4096, K_KEEPF = 8192,
+       K_SHCNT = 16384, K_APPROX = 32768, K_W1 = 65536, K_NANSIGN = 131072, K_CNT32 = 262144 };
+// K_CNT32: Rosetta 2 reads only the low 32 bits of VPSRLVQ / VPSLLVQ's 64-bit counts (x86: all 64)
+// K_NANSIGN: Rosetta 2 changes the sign of a subtracted NaN (x86 keeps it, as in SUBPS): HSUB, ADDSUB
+// K_SHCNT: shift counts (the r/m operand) often small; K_APPROX: an estimate (RCP/RSQRT, see approx_ok); K_W1: VEX.W = 1
+// K_KEEPF: Rosetta 2 leaves AF OF PF SF as they were where x86 clears them (VTESTPS/PD, VPTEST, PTEST)
 static const sse_form sse_forms[] = {
     { "movups", 0, 0x10, 0, -1, 16 }, { "movupd", 0x66, 0x10, 0, -1, 16 }, { "movss", 0xF3, 0x10, 0, -1, 4 }, { "movsd", 0xF2, 0x10, 0, -1, 8 },
     { "movups st", 0, 0x11, 0, -1, 16 }, { "movss st", 0xF3, 0x11, 0, -1, 4 }, { "movsd st", 0xF2, 0x11, 0, -1, 8 },
@@ -441,18 +450,211 @@ static const sse_form sse_forms[] = {
     PI("pcmpgtb", 0x64), PI("pcmpgtw", 0x65), PI("pcmpgtd", 0x66), PI("punpcklbw", 0x60), PI("punpcklwd", 0x61), PI("punpckldq", 0x62),
     PI("punpcklqdq", 0x6C), PI("punpckhbw", 0x68), PI("punpckhwd", 0x69), PI("punpckhdq", 0x6A), PI("punpckhqdq", 0x6D), PI("pmaddwd", 0xF5), PI("pmullw", 0xD5),
 #undef PI
+    // AVX (VEX; 128 and 256 bits)
+#define V K_VEX
+#define VN (K_VEX | K_NOV)
+    { "movntps", 0, 0x2B, K_ALIGN, -2, 16 }, { "movntdq", 0x66, 0xE7, K_ALIGN, -2, 16 },
+    { "vmovups", 0, 0x10, VN | K_L1, -1, 16 }, { "vmovupd", 0x66, 0x10, VN | K_L1, -1, 16 }, { "vmovss", 0xF3, 0x10, V | K_VREG, -1, 4 }, { "vmovsd", 0xF2, 0x10, V | K_VREG, -1, 8 },
+    { "vmovups st", 0, 0x11, VN | K_L1, -1, 16 }, { "vmovss st", 0xF3, 0x11, V | K_VREG, -1, 4 }, { "vmovsd st", 0xF2, 0x11, V | K_VREG, -1, 8 },
+    { "vmovaps", 0, 0x28, VN | K_L1 | K_ALIGN, -1, 16 }, { "vmovapd", 0x66, 0x28, VN | K_L1 | K_ALIGN, -1, 16 }, { "vmovaps st", 0, 0x29, VN | K_L1 | K_ALIGN, -1, 16 },
+    { "vmovdqa", 0x66, 0x6F, VN | K_L1 | K_ALIGN, -1, 16 }, { "vmovdqu", 0xF3, 0x6F, VN | K_L1, -1, 16 }, { "vmovdqa st", 0x66, 0x7F, VN | K_L1 | K_ALIGN, -1, 16 },
+    { "vmovdqu st", 0xF3, 0x7F, VN | K_L1, -1, 16 }, { "vmovntps", 0, 0x2B, VN | K_L1 | K_ALIGN, -2, 16 }, { "vmovntdq", 0x66, 0xE7, VN | K_L1 | K_ALIGN, -2, 16 },
+    { "vmovlps/vmovhlps", 0, 0x12, V, -1, 8 }, { "vmovhps/vmovlhps", 0, 0x16, V, -1, 8 }, { "vmovlpd", 0x66, 0x12, V, -2, 8 }, { "vmovhpd", 0x66, 0x16, V, -2, 8 },
+    { "vmovlps st", 0, 0x13, VN, -2, 8 }, { "vmovhps st", 0, 0x17, VN, -2, 8 },
+    { "vunpcklps", 0, 0x14, V | K_L1, -1, 16 }, { "vunpckhps", 0, 0x15, V | K_L1, -1, 16 }, { "vunpcklpd", 0x66, 0x14, V | K_L1, -1, 16 }, { "vunpckhpd", 0x66, 0x15, V | K_L1, -1, 16 },
+    { "vshufps", 0, 0xC6, V | K_L1 | K_IMM, -1, 16 }, { "vshufpd", 0x66, 0xC6, V | K_L1 | K_IMM, -1, 16 },
+    { "vandps", 0, 0x54, V | K_L1, -1, 16 }, { "vandnps", 0, 0x55, V | K_L1, -1, 16 }, { "vorps", 0, 0x56, V | K_L1, -1, 16 }, { "vxorps", 0, 0x57, V | K_L1, -1, 16 },
+    { "vandpd", 0x66, 0x54, V | K_L1, -1, 16 }, { "vxorpd", 0x66, 0x57, V | K_L1, -1, 16 },
+#define VFP(nm, o) { "v" nm "ps", 0, o, V | K_L1, -1, 16 }, { "v" nm "pd", 0x66, o, V | K_L1, -1, 16 }, { "v" nm "ss", 0xF3, o, V, -1, 4 }, { "v" nm "sd", 0xF2, o, V, -1, 8 }
+    VFP("add", 0x58), VFP("mul", 0x59), VFP("sub", 0x5C), VFP("div", 0x5E), VFP("min", 0x5D), VFP("max", 0x5F),
+#undef VFP
+    { "vsqrtps", 0, 0x51, VN | K_L1, -1, 16 }, { "vsqrtpd", 0x66, 0x51, VN | K_L1, -1, 16 }, { "vsqrtss", 0xF3, 0x51, V, -1, 4 }, { "vsqrtsd", 0xF2, 0x51, V, -1, 8 },
+    { "vcmpps", 0, 0xC2, V | K_L1 | K_IMM, -1, 16 }, { "vcmppd", 0x66, 0xC2, V | K_L1 | K_IMM, -1, 16 }, { "vcmpss", 0xF3, 0xC2, V | K_IMM, -1, 4 }, { "vcmpsd", 0xF2, 0xC2, V | K_IMM, -1, 8 },
+    { "vucomiss", 0, 0x2E, VN, -1, 4 }, { "vcomiss", 0, 0x2F, VN, -1, 4 }, { "vucomisd", 0x66, 0x2E, VN, -1, 8 }, { "vcomisd", 0x66, 0x2F, VN, -1, 8 },
+    { "vcvtsi2ss", 0xF3, 0x2A, V | K_GRM | K_W, -1, 4 }, { "vcvtsi2sd", 0xF2, 0x2A, V | K_GRM | K_W, -1, 4 },
+    { "vcvttss2si", 0xF3, 0x2C, VN | K_GREG | K_W, -1, 4 }, { "vcvtss2si", 0xF3, 0x2D, VN | K_GREG | K_W, -1, 4 },
+    { "vcvttsd2si", 0xF2, 0x2C, VN | K_GREG | K_W, -1, 8 }, { "vcvtsd2si", 0xF2, 0x2D, VN | K_GREG | K_W, -1, 8 },
+    { "vcvtps2pd", 0, 0x5A, VN | K_L1, -1, 8 }, { "vcvtpd2ps", 0x66, 0x5A, VN | K_L1, -1, 16 }, { "vcvtss2sd", 0xF3, 0x5A, V, -1, 4 }, { "vcvtsd2ss", 0xF2, 0x5A, V, -1, 8 },
+    { "vcvtdq2ps", 0, 0x5B, VN | K_L1, -1, 16 }, { "vcvtps2dq", 0x66, 0x5B, VN | K_L1, -1, 16 }, { "vcvttps2dq", 0xF3, 0x5B, VN | K_L1, -1, 16 },
+    { "vcvtdq2pd", 0xF3, 0xE6, VN | K_L1, -1, 8 },
+    { "vmovmskps", 0, 0x50, VN | K_L1 | K_GREG | K_REGONLY, -1, 0 }, { "vmovmskpd", 0x66, 0x50, VN | K_L1 | K_GREG | K_REGONLY, -1, 0 },
+    { "vmovd/q xmm, r/m", 0x66, 0x6E, VN | K_GRM | K_W, -1, 4 }, { "vmovd/q r/m, xmm", 0x66, 0x7E, VN | K_GRM | K_W, -1, 4 },
+    { "vmovq xmm, xmm/m64", 0xF3, 0x7E, VN, -1, 8 }, { "vmovq xmm/m64, xmm", 0x66, 0xD6, VN, -1, 8 },
+    { "vpshufd", 0x66, 0x70, VN | K_L1 | K_IMM, -1, 16 }, { "vpshuflw", 0xF2, 0x70, VN | K_L1 | K_IMM, -1, 16 }, { "vpshufhw", 0xF3, 0x70, VN | K_L1 | K_IMM, -1, 16 },
+    { "vpsrlw imm", 0x66, 0x71, V | K_L1 | K_IMM | K_REGONLY, 2, 0 }, { "vpsraw imm", 0x66, 0x71, V | K_L1 | K_IMM | K_REGONLY, 4, 0 },
+    { "vpsllw imm", 0x66, 0x71, V | K_L1 | K_IMM | K_REGONLY, 6, 0 }, { "vpsrld imm", 0x66, 0x72, V | K_L1 | K_IMM | K_REGONLY, 2, 0 },
+    { "vpsrad imm", 0x66, 0x72, V | K_L1 | K_IMM | K_REGONLY, 4, 0 }, { "vpslld imm", 0x66, 0x72, V | K_L1 | K_IMM | K_REGONLY, 6, 0 },
+    { "vpsrlq imm", 0x66, 0x73, V | K_L1 | K_IMM | K_REGONLY, 2, 0 }, { "vpsllq imm", 0x66, 0x73, V | K_L1 | K_IMM | K_REGONLY, 6, 0 },
+    { "vpsrldq", 0x66, 0x73, V | K_L1 | K_IMM | K_REGONLY, 3, 0 }, { "vpslldq", 0x66, 0x73, V | K_L1 | K_IMM | K_REGONLY, 7, 0 },
+#define VPI(nm, o) { "v" nm, 0x66, o, V | K_L1, -1, 16 }
+    VPI("paddb", 0xFC), VPI("paddw", 0xFD), VPI("paddd", 0xFE), VPI("paddq", 0xD4), VPI("psubb", 0xF8), VPI("psubw", 0xF9), VPI("psubd", 0xFA), VPI("psubq", 0xFB),
+    VPI("pand", 0xDB), VPI("pandn", 0xDF), VPI("por", 0xEB), VPI("pxor", 0xEF), VPI("pcmpeqb", 0x74), VPI("pcmpeqw", 0x75), VPI("pcmpeqd", 0x76),
+    VPI("pcmpgtb", 0x64), VPI("pcmpgtw", 0x65), VPI("pcmpgtd", 0x66), VPI("punpcklbw", 0x60), VPI("punpcklwd", 0x61), VPI("punpckldq", 0x62),
+    VPI("punpcklqdq", 0x6C), VPI("punpckhbw", 0x68), VPI("punpckhwd", 0x69), VPI("punpckhdq", 0x6A), VPI("punpckhqdq", 0x6D), VPI("pmaddwd", 0xF5), VPI("pmullw", 0xD5),
+#undef VPI
+    { "vzeroupper", 0, 0x77, VN | K_NOMODRM, -1, 0 }, { "vzeroall", 0, 0x77, VN | K_NOMODRM | K_L1ONLY, -1, 0 },
+    { "vbroadcastss", 0x66, 0x18, VN | K_L1, -1, 4, 2 }, { "vbroadcastsd", 0x66, 0x19, VN | K_L1ONLY, -1, 8, 2 }, { "vbroadcastf128", 0x66, 0x1A, VN | K_L1ONLY, -2, 16, 2 },
+    { "vinsertf128", 0x66, 0x18, V | K_L1ONLY | K_IMM, -1, 16, 3 }, { "vextractf128", 0x66, 0x19, VN | K_L1ONLY | K_IMM, -1, 16, 3 },
+    { "vperm2f128", 0x66, 0x06, V | K_L1ONLY | K_IMM, -1, 32, 3 },
+    { "vtestps", 0x66, 0x0E, VN | K_L1 | K_KEEPF, -1, 16, 2 }, { "vtestpd", 0x66, 0x0F, VN | K_L1 | K_KEEPF, -1, 16, 2 }, { "vptest", 0x66, 0x17, VN | K_L1 | K_KEEPF, -1, 16, 2 },
+    { "vmaskmovps", 0x66, 0x2C, V | K_L1, -2, 16, 2 }, { "vmaskmovpd", 0x66, 0x2D, V | K_L1, -2, 16, 2 },
+    { "vmaskmovps st", 0x66, 0x2E, V | K_L1, -2, 16, 2 }, { "vmaskmovpd st", 0x66, 0x2F, V | K_L1, -2, 16, 2 },
+    { "vpermilps", 0x66, 0x0C, V | K_L1, -1, 16, 2 }, { "vpermilpd", 0x66, 0x0D, V | K_L1, -1, 16, 2 },
+    { "vpermilps imm", 0x66, 0x04, VN | K_L1 | K_IMM, -1, 16, 3 }, { "vpermilpd imm", 0x66, 0x05, VN | K_L1 | K_IMM, -1, 16, 3 },
+    { "vblendps", 0x66, 0x0C, V | K_L1 | K_IMM, -1, 16, 3 }, { "vblendpd", 0x66, 0x0D, V | K_L1 | K_IMM, -1, 16, 3 },
+    { "vblendvps", 0x66, 0x4A, V | K_L1 | K_MASK4, -1, 16, 3 }, { "vblendvpd", 0x66, 0x4B, V | K_L1 | K_MASK4, -1, 16, 3 },
+    // SSE / SSE2 rest, SSE3
+    { "rsqrtps", 0, 0x52, K_ALIGN | K_APPROX, -1, 16 }, { "rsqrtss", 0xF3, 0x52, K_APPROX, -1, 4 },
+    { "rcpps", 0, 0x53, K_ALIGN | K_APPROX, -1, 16 }, { "rcpss", 0xF3, 0x53, K_APPROX, -1, 4 },
+    { "haddps", 0xF2, 0x7C, K_ALIGN, -1, 16 }, { "haddpd", 0x66, 0x7C, K_ALIGN, -1, 16 }, { "hsubps", 0xF2, 0x7D, K_ALIGN | K_NANSIGN, -1, 16 }, { "hsubpd", 0x66, 0x7D, K_ALIGN | K_NANSIGN, -1, 16 },
+    { "addsubps", 0xF2, 0xD0, K_ALIGN | K_NANSIGN, -1, 16 }, { "addsubpd", 0x66, 0xD0, K_ALIGN | K_NANSIGN, -1, 16 },
+    { "movddup", 0xF2, 0x12, 0, -1, 8 }, { "movsldup", 0xF3, 0x12, K_ALIGN, -1, 16 }, { "movshdup", 0xF3, 0x16, K_ALIGN, -1, 16 }, { "lddqu", 0xF2, 0xF0, 0, -2, 16 },
+    { "cvtpd2dq", 0xF2, 0xE6, K_ALIGN, -1, 16 }, { "cvttpd2dq", 0x66, 0xE6, K_ALIGN, -1, 16 },
+    { "pinsrw", 0x66, 0xC4, K_GRM | K_IMM, -1, 2 }, { "pextrw", 0x66, 0xC5, K_GREG | K_REGONLY | K_IMM, -1, 0 }, { "pmovmskb", 0x66, 0xD7, K_GREG | K_REGONLY, -1, 0 },
+#define PI2(nm, o, k) { nm, 0x66, o, K_ALIGN | (k), -1, 16 }, { "v" nm, 0x66, o, V | K_L1 | (k), -1, 16 }
+    PI2("packsswb", 0x63, 0), PI2("packuswb", 0x67, 0), PI2("packssdw", 0x6B, 0), PI2("psubusb", 0xD8, 0), PI2("psubusw", 0xD9, 0),
+    PI2("paddusb", 0xDC, 0), PI2("paddusw", 0xDD, 0), PI2("psubsb", 0xE8, 0), PI2("psubsw", 0xE9, 0), PI2("paddsb", 0xEC, 0), PI2("paddsw", 0xED, 0),
+    PI2("pminub", 0xDA, 0), PI2("pmaxub", 0xDE, 0), PI2("pminsw", 0xEA, 0), PI2("pmaxsw", 0xEE, 0), PI2("pavgb", 0xE0, 0), PI2("pavgw", 0xE3, 0),
+    PI2("pmulhuw", 0xE4, 0), PI2("pmulhw", 0xE5, 0), PI2("pmuludq", 0xF4, 0), PI2("psadbw", 0xF6, 0),
+    PI2("psrlw", 0xD1, K_SHCNT), PI2("psrld", 0xD2, K_SHCNT), PI2("psrlq", 0xD3, K_SHCNT), PI2("psraw", 0xE1, K_SHCNT), PI2("psrad", 0xE2, K_SHCNT),
+    PI2("psllw", 0xF1, K_SHCNT), PI2("pslld", 0xF2, K_SHCNT), PI2("psllq", 0xF3, K_SHCNT),
+#undef PI2
+    { "vrsqrtps", 0, 0x52, VN | K_L1 | K_APPROX, -1, 16 }, { "vrsqrtss", 0xF3, 0x52, V | K_APPROX, -1, 4 },
+    { "vrcpps", 0, 0x53, VN | K_L1 | K_APPROX, -1, 16 }, { "vrcpss", 0xF3, 0x53, V | K_APPROX, -1, 4 },
+    { "vhaddps", 0xF2, 0x7C, V | K_L1, -1, 16 }, { "vhaddpd", 0x66, 0x7C, V | K_L1, -1, 16 }, { "vhsubps", 0xF2, 0x7D, V | K_L1 | K_NANSIGN, -1, 16 }, { "vhsubpd", 0x66, 0x7D, V | K_L1 | K_NANSIGN, -1, 16 },
+    { "vaddsubps", 0xF2, 0xD0, V | K_L1 | K_NANSIGN, -1, 16 }, { "vaddsubpd", 0x66, 0xD0, V | K_L1 | K_NANSIGN, -1, 16 },
+    { "vmovddup", 0xF2, 0x12, VN | K_L1, -1, 8 }, { "vmovsldup", 0xF3, 0x12, VN | K_L1, -1, 16 }, { "vmovshdup", 0xF3, 0x16, VN | K_L1, -1, 16 },
+    { "vlddqu", 0xF2, 0xF0, VN | K_L1, -2, 16 }, { "vcvtpd2dq", 0xF2, 0xE6, VN | K_L1, -1, 16 }, { "vcvttpd2dq", 0x66, 0xE6, VN | K_L1, -1, 16 },
+    { "vpinsrw", 0x66, 0xC4, V | K_GRM | K_IMM, -1, 2 }, { "vpextrw", 0x66, 0xC5, VN | K_GREG | K_REGONLY | K_IMM, -1, 0 },
+    { "vpmovmskb", 0x66, 0xD7, VN | K_L1 | K_GREG | K_REGONLY, -1, 0 },
+    // SSSE3, SSE4.1 (legacy and VEX)
+#define S4(nm, o, map, k, vk, mem) { nm, 0x66, o, (k), -1, mem, map }, { "v" nm, 0x66, o, (vk), -1, mem, map }
+    S4("pshufb", 0x00, 2, K_ALIGN, V | K_L1, 16), S4("phaddw", 0x01, 2, K_ALIGN, V | K_L1, 16), S4("phaddd", 0x02, 2, K_ALIGN, V | K_L1, 16),
+    S4("phaddsw", 0x03, 2, K_ALIGN, V | K_L1, 16), S4("pmaddubsw", 0x04, 2, K_ALIGN, V | K_L1, 16), S4("phsubw", 0x05, 2, K_ALIGN, V | K_L1, 16),
+    S4("phsubd", 0x06, 2, K_ALIGN, V | K_L1, 16), S4("phsubsw", 0x07, 2, K_ALIGN, V | K_L1, 16), S4("psignb", 0x08, 2, K_ALIGN, V | K_L1, 16),
+    S4("psignw", 0x09, 2, K_ALIGN, V | K_L1, 16), S4("psignd", 0x0A, 2, K_ALIGN, V | K_L1, 16), S4("pmulhrsw", 0x0B, 2, K_ALIGN, V | K_L1, 16),
+    { "pblendvb", 0x66, 0x10, K_ALIGN, -1, 16, 2 }, { "blendvps", 0x66, 0x14, K_ALIGN, -1, 16, 2 }, { "blendvpd", 0x66, 0x15, K_ALIGN, -1, 16, 2 },
+    { "ptest", 0x66, 0x17, K_ALIGN | K_KEEPF, -1, 16, 2 },
+    S4("pabsb", 0x1C, 2, K_ALIGN, VN | K_L1, 16), S4("pabsw", 0x1D, 2, K_ALIGN, VN | K_L1, 16), S4("pabsd", 0x1E, 2, K_ALIGN, VN | K_L1, 16),
+    S4("pmovsxbw", 0x20, 2, 0, VN | K_L1, 8), S4("pmovsxbd", 0x21, 2, 0, VN | K_L1, 4), S4("pmovsxbq", 0x22, 2, 0, VN | K_L1, 2),
+    S4("pmovsxwd", 0x23, 2, 0, VN | K_L1, 8), S4("pmovsxwq", 0x24, 2, 0, VN | K_L1, 4), S4("pmovsxdq", 0x25, 2, 0, VN | K_L1, 8),
+    S4("pmovzxbw", 0x30, 2, 0, VN | K_L1, 8), S4("pmovzxbd", 0x31, 2, 0, VN | K_L1, 4), S4("pmovzxbq", 0x32, 2, 0, VN | K_L1, 2),
+    S4("pmovzxwd", 0x33, 2, 0, VN | K_L1, 8), S4("pmovzxwq", 0x34, 2, 0, VN | K_L1, 4), S4("pmovzxdq", 0x35, 2, 0, VN | K_L1, 8),
+    S4("pmuldq", 0x28, 2, K_ALIGN, V | K_L1, 16), S4("pcmpeqq", 0x29, 2, K_ALIGN, V | K_L1, 16), S4("packusdw", 0x2B, 2, K_ALIGN, V | K_L1, 16),
+    { "movntdqa", 0x66, 0x2A, K_ALIGN, -2, 16, 2 }, { "vmovntdqa", 0x66, 0x2A, VN | K_L1 | K_ALIGN, -2, 16, 2 },
+    S4("pcmpgtq", 0x37, 2, K_ALIGN, V | K_L1, 16), S4("pminsb", 0x38, 2, K_ALIGN, V | K_L1, 16), S4("pminsd", 0x39, 2, K_ALIGN, V | K_L1, 16),
+    S4("pminuw", 0x3A, 2, K_ALIGN, V | K_L1, 16), S4("pminud", 0x3B, 2, K_ALIGN, V | K_L1, 16), S4("pmaxsb", 0x3C, 2, K_ALIGN, V | K_L1, 16),
+    S4("pmaxsd", 0x3D, 2, K_ALIGN, V | K_L1, 16), S4("pmaxuw", 0x3E, 2, K_ALIGN, V | K_L1, 16), S4("pmaxud", 0x3F, 2, K_ALIGN, V | K_L1, 16),
+    S4("pmulld", 0x40, 2, K_ALIGN, V | K_L1, 16),
+    S4("roundps", 0x08, 3, K_ALIGN | K_IMM, VN | K_L1 | K_IMM, 16), S4("roundpd", 0x09, 3, K_ALIGN | K_IMM, VN | K_L1 | K_IMM, 16),
+    S4("roundss", 0x0A, 3, K_IMM, V | K_IMM, 4), S4("roundsd", 0x0B, 3, K_IMM, V | K_IMM, 8),
+    { "blendps", 0x66, 0x0C, K_ALIGN | K_IMM, -1, 16, 3 }, { "blendpd", 0x66, 0x0D, K_ALIGN | K_IMM, -1, 16, 3 },
+    S4("pblendw", 0x0E, 3, K_ALIGN | K_IMM, V | K_L1 | K_IMM, 16), S4("palignr", 0x0F, 3, K_ALIGN | K_IMM, V | K_L1 | K_IMM, 16),
+    S4("pextrb", 0x14, 3, K_GRM | K_IMM, VN | K_GRM | K_IMM, 1), S4("pextrw m", 0x15, 3, K_GRM | K_IMM, VN | K_GRM | K_IMM, 2),
+    S4("pextrd/q", 0x16, 3, K_GRM | K_W | K_IMM, VN | K_GRM | K_W | K_IMM, 4), S4("extractps", 0x17, 3, K_GRM | K_IMM, VN | K_GRM | K_IMM, 4),
+    S4("pinsrb", 0x20, 3, K_GRM | K_IMM, V | K_GRM | K_IMM, 1), S4("insertps", 0x21, 3, K_IMM, V | K_IMM, 4),
+    S4("pinsrd/q", 0x22, 3, K_GRM | K_W | K_IMM, V | K_GRM | K_W | K_IMM, 4),
+    S4("dpps", 0x40, 3, K_ALIGN | K_IMM, V | K_L1 | K_IMM, 16), S4("dppd", 0x41, 3, K_ALIGN | K_IMM, V | K_IMM, 16),
+    S4("aesimc", 0xDB, 2, K_ALIGN, VN, 16), S4("aesenc", 0xDC, 2, K_ALIGN, V, 16), S4("aesenclast", 0xDD, 2, K_ALIGN, V, 16),
+    S4("aesdec", 0xDE, 2, K_ALIGN, V, 16), S4("aesdeclast", 0xDF, 2, K_ALIGN, V, 16), S4("pclmulqdq", 0x44, 3, K_ALIGN | K_IMM, V | K_IMM, 16),
+#undef S4
+    { "vpblendvb", 0x66, 0x4C, V | K_L1 | K_MASK4, -1, 16, 3 }, { "vpblendd", 0x66, 0x02, V | K_L1 | K_IMM, -1, 16, 3 },
+    // FMA
+#define FMA3(nm, o, k) { "vf" nm "132", 0x66, 0x90 + o, (k), -1, 16, 2 }, { "vf" nm "213", 0x66, 0xA0 + o, (k), -1, 16, 2 }, { "vf" nm "231", 0x66, 0xB0 + o, (k), -1, 16, 2 }
+    FMA3("maddsub", 6, V | K_L1 | K_W), FMA3("msubadd", 7, V | K_L1 | K_W), FMA3("madd p", 8, V | K_L1 | K_W), FMA3("madd s", 9, V | K_W),
+    FMA3("msub p", 0xA, V | K_L1 | K_W), FMA3("msub s", 0xB, V | K_W), FMA3("nmadd p", 0xC, V | K_L1 | K_W), FMA3("nmadd s", 0xD, V | K_W),
+    FMA3("nmsub p", 0xE, V | K_L1 | K_W), FMA3("nmsub s", 0xF, V | K_W),
+#undef FMA3
+    // AVX2
+    { "vpbroadcastb", 0x66, 0x78, VN | K_L1, -1, 1, 2 }, { "vpbroadcastw", 0x66, 0x79, VN | K_L1, -1, 2, 2 },
+    { "vpbroadcastd", 0x66, 0x58, VN | K_L1, -1, 4, 2 }, { "vpbroadcastq", 0x66, 0x59, VN | K_L1, -1, 8, 2 },
+    { "vbroadcasti128", 0x66, 0x5A, VN | K_L1ONLY, -2, 16, 2 }, { "vinserti128", 0x66, 0x38, V | K_L1ONLY | K_IMM, -1, 16, 3 },
+    { "vextracti128", 0x66, 0x39, VN | K_L1ONLY | K_IMM, -1, 16, 3 }, { "vperm2i128", 0x66, 0x46, V | K_L1ONLY | K_IMM, -1, 32, 3 },
+    { "vpermq", 0x66, 0x00, VN | K_L1ONLY | K_IMM | K_W1, -1, 32, 3 }, { "vpermpd", 0x66, 0x01, VN | K_L1ONLY | K_IMM | K_W1, -1, 32, 3 },
+    { "vpermd", 0x66, 0x36, V | K_L1ONLY, -1, 32, 2 }, { "vpermps", 0x66, 0x16, V | K_L1ONLY, -1, 32, 2 },
+    { "vpsrlvd/q", 0x66, 0x45, V | K_L1 | K_W | K_SHCNT | K_CNT32, -1, 16, 2 }, { "vpsravd", 0x66, 0x46, V | K_L1 | K_SHCNT, -1, 16, 2 },
+    { "vpsllvd/q", 0x66, 0x47, V | K_L1 | K_W | K_SHCNT | K_CNT32, -1, 16, 2 },
+    { "vpmaskmovd/q", 0x66, 0x8C, V | K_L1 | K_W, -2, 16, 2 }, { "vpmaskmovd/q st", 0x66, 0x8E, V | K_L1 | K_W, -2, 16, 2 },
+#undef V
+#undef VN
 };
+
+// The r/m operand's 32 bytes (the upper 16 from YMM, or memory past the first 16).
+static void rm_bytes(const dt_case *c, const x86_insn *d, uint8_t out[32]) {
+    if (d->mod == 3) { memcpy(out, c->in.xmm[d->rm], 16); memcpy(out + 16, c->in.ymm_hi[d->rm], 16); }
+    else memcpy(out, c->mem + (c->in.gpr[d->base] + (uint64_t)(int64_t)d->disp - DT_BUF), 32);
+}
+// K_CNT32: a 64-bit count (VEX.W) that is below 64 in its low 32 bits but not in all 64.
+static int cnt32_case(const dt_case *c, const x86_insn *d) {
+    if (!d->vex_w) return 0;
+    uint8_t src[32]; rm_bytes(c, d, src);
+    for (int i = 0; i < (d->vex_l ? 4 : 2); i++) { uint64_t v; memcpy(&v, src + 8 * i, 8); if ((v >> 32) && (uint32_t)v < 64) return 1; }
+    return 0;
+}
+
+// K_NANSIGN: the destination's lanes differ only in the sign of NaNs (Rosetta's then taken as ours). 1 if any did.
+static int nan_signs_only(const sse_form *f, const x86_insn *d, dt_result *want, const dt_result *got) {
+    int dbl = f->pf == 0x66, es = dbl ? 8 : 4, any = 0;
+    for (int h = 0; h < 2; h++) {
+        uint8_t *wp = h ? want->out.ymm_hi[d->reg] : want->out.xmm[d->reg];
+        const uint8_t *gp = h ? got->out.ymm_hi[d->reg] : got->out.xmm[d->reg];
+        for (int i = 0; i < 16; i += es) {
+            uint64_t wv = 0, gv = 0, sign = dbl ? 1ull << 63 : 1ull << 31, abs_max = dbl ? 0x7FF0000000000000ull : 0x7F800000ull;
+            memcpy(&wv, wp + i, (size_t)es); memcpy(&gv, gp + i, (size_t)es);
+            if (wv == gv) continue;
+            if ((wv ^ gv) != sign || (wv & ~sign) <= abs_max) return 0;
+            any = 1;
+        }
+    }
+    if (any) { memcpy(want->out.xmm[d->reg], got->out.xmm[d->reg], 16); memcpy(want->out.ymm_hi[d->reg], got->out.ymm_hi[d->reg], 16); }
+    return any;
+}
+
+// RCP / RSQRT (K_APPROX): x86 leaves the values to the processor within a relative error of 1.5 * 2^-12, with tiny
+// results flushed to zero and denormal inputs taken as zero. Each lane of both results (Rosetta's and ours) is checked
+// against the exact value; then ours is copied into Rosetta's, so that everything else is still compared exactly.
+static int approx_lane(uint32_t xb, uint32_t rb, int rsqrt) {
+    if ((xb & 0x7FFFFFFF) > 0x7F800000) return rb == (xb | 0x400000);                 // NaN: quieted
+    if (!(xb & 0x7F800000)) xb &= 0x80000000;                                          // denormal: zero
+    float x, r; memcpy(&x, &xb, 4); memcpy(&r, &rb, 4);
+    if (rsqrt && (xb >> 31) && (xb & 0x7FFFFFFF)) return rb == 0xFFC00000;             // negative: indefinite
+    if (!(xb & 0x7FFFFFFF)) return rb == ((xb & 0x80000000) | 0x7F800000);             // zero: infinity
+    if ((xb & 0x7FFFFFFF) == 0x7F800000) return rb == (xb & 0x80000000);               // infinity: zero
+    double e = rsqrt ? 1.0 / sqrt((double)x) : 1.0 / (double)x, tol = 1.5 / 4096, tiny = 0x1p-126;
+    if ((rb >> 31) != (xb >> 31)) return 0;
+    if (fabs(e) < tiny * (1 + tol) && !(rb & 0x7FFFFFFF)) return 1;                   // (flushed)
+    if (fabs(e) < tiny * (1 - tol)) return !(rb & 0x7FFFFFFF);
+    return fabs((double)r - e) <= tol * fabs(e);
+}
+// 1: both within the bound; 0: ours is not; -1: Rosetta's is not.
+static int approx_ok(const sse_form *f, const dt_case *c, const x86_insn *d, dt_result *want, const dt_result *got) {
+    int scalar = f->pf == 0xF3, n = scalar ? 1 : 4, L = d->vex_l && !scalar, rsqrt = f->op == 0x52;
+    uint8_t src[32] = { 0 };
+    if (d->mod == 3) { memcpy(src, c->in.xmm[d->rm], 16); memcpy(src + 16, c->in.ymm_hi[d->rm], 16); }
+    else memcpy(src, c->mem + (c->in.gpr[d->base] + (uint64_t)(int64_t)d->disp - DT_BUF), L ? 32 : scalar ? 4 : 16);
+    for (int h = 0; h <= L; h++)
+        for (int i = 0; i < n; i++) {
+            uint8_t *wp = (h ? want->out.ymm_hi[d->reg] : want->out.xmm[d->reg]) + 4 * i;
+            const uint8_t *gp = (h ? got->out.ymm_hi[d->reg] : got->out.xmm[d->reg]) + 4 * i;
+            uint32_t xb, wb, gb; memcpy(&xb, src + 16 * h + 4 * i, 4); memcpy(&wb, wp, 4); memcpy(&gb, gp, 4);
+            if (!approx_lane(xb, gb, rsqrt)) return 0;
+            if (!approx_lane(xb, wb, rsqrt)) return -1;
+            memcpy(wp, gp, 4);
+        }
+    return 1;
+}
 
 static void make_sse_case(const sse_form *f, dt_case *c) {
     memset(c, 0, sizeof *c);
-    for (int i = 0; i < 16; i++) { c->in.gpr[i] = rnd_value(); rnd_xmm(c->in.xmm[i]); }
+    for (int i = 0; i < 16; i++) { c->in.gpr[i] = rnd_value(); rnd_xmm(c->in.xmm[i]); rnd_xmm(c->in.ymm_hi[i]); }
     for (int i = 0; i < DT_BUF_SIZE; i += 16) rnd_xmm(c->mem + i);
     c->in.gpr[4] = DT_STACK;
     c->in.flags = (rnd() & 0x8D5) | 0x202;
     c->in.mxcsr = 0x1F80;
     uint8_t *p = c->code;
-    if (f->pf) *p++ = f->pf;
-    int w = (f->kind & K_W) && (rnd() & 1);
+    int vex = f->kind & K_VEX;
+    if (f->pf && !vex) *p++ = f->pf;
+    int w = ((f->kind & K_W) && (rnd() & 1)) || (f->kind & K_W1);
     int reg = (int)(rnd() % 16), rm = (int)(rnd() % 16);
     if (f->kind & K_GREG) while (reg == 4) reg = (int)(rnd() % 16);
     if (f->group >= 0) reg = f->group;
@@ -461,18 +663,36 @@ static void make_sse_case(const sse_form *f, dt_case *c) {
     if (!mem && (f->kind & K_GRM)) while (rm == 4) rm = (int)(rnd() % 16);
     int base = 0;
     if (mem) { do base = (int)(rnd() % 16); while (base == 4 || base == 5 || base == 12 || base == 13 || ((f->kind & K_GREG) && base == reg)); rm = base; }
-    int rex = 0x40 | w << 3 | (reg >> 3 & 1) << 2 | (rm >> 3);
-    if (rex != 0x40 || (rnd() & 1)) *p++ = (uint8_t)rex;
-    *p++ = 0x0F; *p++ = f->op;
+    int L = (f->kind & K_L1ONLY) || ((f->kind & K_L1) && (rnd() & 1));
+    if (vex) {
+        // C5 (two bytes) when it can say it: map 0F, W0, no REX.X/B; else C4
+        int v = (f->kind & K_NOV) || ((f->kind & K_VREG) && mem) ? 0 : (int)(rnd() % 16);
+        int pp = f->pf == 0x66 ? 1 : f->pf == 0xF3 ? 2 : f->pf == 0xF2 ? 3 : 0, map = f->map ? f->map : 1;
+        int R = reg >> 3 & 1, B = rm >> 3 & 1;
+        if (map == 1 && !w && !B && (rnd() & 1)) { *p++ = 0xC5; *p++ = (uint8_t)(!R << 7 | (~v & 15) << 3 | L << 2 | pp); }
+        else { *p++ = 0xC4; *p++ = (uint8_t)(!R << 7 | 1 << 6 | !B << 5 | map); *p++ = (uint8_t)(w << 7 | (~v & 15) << 3 | L << 2 | pp); }
+        *p++ = f->op;
+        if (f->kind & K_NOMODRM) { c->len = (uint32_t)(p - c->code); return; }
+    } else {
+        int rex = 0x40 | w << 3 | (reg >> 3 & 1) << 2 | (rm >> 3);
+        if (rex != 0x40 || (rnd() & 1)) *p++ = (uint8_t)rex;
+        *p++ = 0x0F;
+        if (f->map) *p++ = f->map == 2 ? 0x38 : 0x3A;
+        *p++ = f->op;
+    }
     if (!mem) *p++ = (uint8_t)(0xC0 | (reg & 7) << 3 | (rm & 7));
     else {
         int disp = (int)(rnd() % 64) - 32;
         *p++ = (uint8_t)(0x40 | (reg & 7) << 3 | (rm & 7)); *p++ = (uint8_t)disp;
         uint64_t a = DT_BUF + 1024 + rnd() % 1024;
-        if (f->kind & K_ALIGN) a &= ~15ull;
+        if (f->kind & K_ALIGN) a &= L ? ~31ull : ~15ull;
         c->in.gpr[base] = a - (uint64_t)(int64_t)disp;
+        if ((f->kind & K_SHCNT) && (rnd() & 1)) for (int i = 0; i < 8; i++) { uint32_t v = (uint32_t)(rnd() % 70); memcpy(c->mem + (a - DT_BUF) + 4 * i, &v, 4); }
     }
+    if (!mem && (f->kind & K_SHCNT) && (rnd() & 1))
+        for (int i = 0; i < 4; i++) { uint32_t v = (uint32_t)(rnd() % 70); memcpy(c->in.xmm[rm] + 4 * i, &v, 4); memcpy(c->in.ymm_hi[rm] + 4 * i, &v, 4); }
     if (f->kind & K_IMM) *p++ = (uint8_t)(f->group >= 0 && (rnd() & 1) ? rnd() % 20 : rnd());   // (shifts: counts near the width)
+    if (f->kind & K_MASK4) *p++ = (uint8_t)rnd();
     c->len = (uint32_t)(p - c->code);
 }
 
@@ -484,7 +704,7 @@ static int run_program(const dt_case *c, dt_result *r) {
     static x86_ctx ctx;
     memset(&ctx, 0, sizeof ctx);
     memcpy(ctx.gpr, c->in.gpr, sizeof ctx.gpr);
-    memcpy(ctx.xmm, c->in.xmm, sizeof ctx.xmm);
+    memcpy(ctx.xmm, c->in.xmm, sizeof ctx.xmm); memcpy(ctx.ymm_hi, c->in.ymm_hi, sizeof ctx.ymm_hi);
     ctx.flags = c->in.flags;
     ctx.rip = DT_PROG;
     memcpy((void *)DT_BUF, c->mem, DT_BUF_SIZE);
@@ -509,7 +729,7 @@ static int run_program(const dt_case *c, dt_result *r) {
         }
     }
     memcpy(r->out.gpr, ctx.gpr, sizeof ctx.gpr);
-    memcpy(r->out.xmm, ctx.xmm, sizeof ctx.xmm);
+    memcpy(r->out.xmm, ctx.xmm, sizeof ctx.xmm); memcpy(r->out.ymm_hi, ctx.ymm_hi, sizeof ctx.ymm_hi);
     r->out.mxcsr = c->in.mxcsr;
     r->out.flags = ctx.flags;
     r->out.fault = signaled ? 2 : ctx.fault == X86_FAULT_DE ? 1 : ctx.rip != DT_END ? 4 : 0;
@@ -574,7 +794,7 @@ int main(int argc, char **argv) {
                 uint64_t sp = want.out.gpr[4] - 8 - DT_BUF;
                 if (sp + 8 <= DT_BUF_SIZE) memcpy(want.mem + sp, got.mem + sp, 8);
                 diff = (want.out.flags & mask) != (got.out.flags & mask) || memcmp(want.mem, got.mem, DT_BUF_SIZE) ||
-                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm) || (want.out.mxcsr & ~0x3Fu) != (got.out.mxcsr & ~0x3Fu);
+                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm) || memcmp(want.out.ymm_hi, got.out.ymm_hi, sizeof want.out.ymm_hi) || (want.out.mxcsr & ~0x3Fu) != (got.out.mxcsr & ~0x3Fu);
                 for (int i = 0; i < 16; i++) diff |= want.out.gpr[i] != got.out.gpr[i];
             }
             if (diff) {
@@ -624,20 +844,31 @@ int main(int argc, char **argv) {
             if (run_translated(&c, &d, &got) < 0) { unsupported++; snprintf(first, sizeof first, "not translated (bytes %02x %02x %02x %02x %02x)", c.code[0], c.code[1], c.code[2], c.code[3], c.code[4]); bad++; break; }
             if (fwrite(&c, sizeof c, 1, out) != 1 || fflush(out) || fread(&want, sizeof want, 1, in) != 1) { fprintf(stderr, "ref_x86 stopped\n"); return 1; }
             ran++;
+            if ((f->kind & K_APPROX) && !want.out.fault && !got.out.fault && approx_ok(f, &c, &d, &want, &got) <= 0) {
+                if (!bad) snprintf(first, sizeof first, "estimate out of x86's bound (bytes %02x %02x %02x %02x %02x)", c.code[0], c.code[1], c.code[2], c.code[3], c.code[4]);
+                bad++; continue;
+            }
+            if ((f->kind & K_NANSIGN) && nan_signs_only(f, &d, &want, &got)) rosetta_deviations++;
+            if ((f->kind & K_CNT32) && cnt32_case(&c, &d)) { rosetta_deviations++; continue; }
+            if ((f->kind & K_KEEPF) && (want.out.flags & 0x894) == (c.in.flags & 0x894) && (got.out.flags & 0x894) == 0 && (c.in.flags & 0x894)) {
+                rosetta_deviations++;                                // (x86 clears them: the translator does)
+                want.out.flags = (want.out.flags & ~0x894ull) | (got.out.flags & 0x894);
+            }
             int diff = want.out.fault != got.out.fault;
             if (!diff && !want.out.fault) {
                 uint64_t sp = want.out.gpr[4] - 8 - DT_BUF;
                 if (sp + 8 <= DT_BUF_SIZE) memcpy(want.mem + sp, got.mem + sp, 8);
                 diff = (want.out.flags & 0x8D5) != (got.out.flags & 0x8D5) || memcmp(want.mem, got.mem, DT_BUF_SIZE) ||
-                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm);
+                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm) || memcmp(want.out.ymm_hi, got.out.ymm_hi, sizeof want.out.ymm_hi);
                 for (int i = 0; i < 16; i++) diff |= want.out.gpr[i] != got.out.gpr[i];
             }
             if (diff) {
                 if (!bad) {
                     int n = snprintf(first, sizeof first, "bytes");
                     for (uint32_t i = 0; i < c.len; i++) n += snprintf(first + n, sizeof first - (size_t)n, " %02x", c.code[i]);
-                    n += snprintf(first + n, sizeof first - (size_t)n, "; fault %llu/%llu flags %03llx/%03llx", (unsigned long long)want.out.fault,
-                                  (unsigned long long)got.out.fault, (unsigned long long)(want.out.flags & 0x8D5), (unsigned long long)(got.out.flags & 0x8D5));
+                    n += snprintf(first + n, sizeof first - (size_t)n, "; fault %llu/%llu flags %03llx/%03llx (in %03llx)", (unsigned long long)want.out.fault,
+                                  (unsigned long long)got.out.fault, (unsigned long long)(want.out.flags & 0x8D5), (unsigned long long)(got.out.flags & 0x8D5),
+                                  (unsigned long long)(c.in.flags & 0x8D5));
                     for (int i = 0; i < 16 && n < 760; i++)
                         if (want.out.gpr[i] != got.out.gpr[i]) n += snprintf(first + n, sizeof first - (size_t)n, "; r%d %llx/%llx", i, (unsigned long long)want.out.gpr[i], (unsigned long long)got.out.gpr[i]);
                     for (int i = 0; i < 16 && n < 760; i++)
@@ -647,6 +878,13 @@ int main(int argc, char **argv) {
                             memcpy(&i0, c.in.xmm[i], 8); memcpy(&i1, c.in.xmm[i] + 8, 8);
                             n += snprintf(first + n, sizeof first - (size_t)n, "; xmm%d %016llx%016llx/%016llx%016llx (in %016llx%016llx)", i,
                                           (unsigned long long)w1, (unsigned long long)w0, (unsigned long long)g1, (unsigned long long)g0, (unsigned long long)i1, (unsigned long long)i0);
+                        }
+                    for (int i = 0; i < 16 && n < 760; i++)
+                        if (memcmp(want.out.ymm_hi[i], got.out.ymm_hi[i], 16)) {
+                            uint64_t w0, w1, g0, g1;
+                            memcpy(&w0, want.out.ymm_hi[i], 8); memcpy(&w1, want.out.ymm_hi[i] + 8, 8); memcpy(&g0, got.out.ymm_hi[i], 8); memcpy(&g1, got.out.ymm_hi[i] + 8, 8);
+                            n += snprintf(first + n, sizeof first - (size_t)n, "; ymm%d.hi %016llx%016llx/%016llx%016llx", i,
+                                          (unsigned long long)w1, (unsigned long long)w0, (unsigned long long)g1, (unsigned long long)g0);
                         }
                     if (memcmp(want.mem, got.mem, DT_BUF_SIZE)) snprintf(first + n, sizeof first - (size_t)n, "; memory differs");
                     if (getenv("DT_DUMP")) { FILE *df = fopen(getenv("DT_DUMP"), "wb"); if (df) { fwrite(&c, sizeof c, 1, df); fclose(df); } }
@@ -679,7 +917,7 @@ int main(int argc, char **argv) {
                 uint64_t sp = want.out.gpr[4] - 8 - DT_BUF;
                 if (sp + 8 <= DT_BUF_SIZE) memcpy(want.mem + sp, got.mem + sp, 8);
                 diff = (want.out.flags & 0x8D5) != (got.out.flags & 0x8D5) || memcmp(want.mem, got.mem, DT_BUF_SIZE) ||
-                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm);
+                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm) || memcmp(want.out.ymm_hi, got.out.ymm_hi, sizeof want.out.ymm_hi);
                 for (int i = 0; i < 16; i++) diff |= want.out.gpr[i] != got.out.gpr[i];
             }
             if (diff) {

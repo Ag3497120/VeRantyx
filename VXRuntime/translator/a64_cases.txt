@@ -122,3 +122,98 @@ a64_casal(1,1,2,3)|casalb w1, w2, [x3]
 a64_casal(2,1,2,3)|casalh w1, w2, [x3]
 a64_swpal(8,1,2,3)|swpal x1, x2, [x3]
 a64_stlr(31,25)|stlr xzr, [x25]
+a64_dup_s(1,2,3)|dup v1.4s, v2.s[3]
+a64_dup_d(1,2,1)|dup v1.2d, v2.d[1]
+a64_fcvtl2_2d(1,2)|fcvtl2 v1.2d, v2.4s
+a64_fcvtn2_4s(1,2)|fcvtn2 v1.4s, v2.2d
+a64_sxtl2_2d(1,2)|sxtl2 v1.2d, v2.4s
+a64_str(8,31,28,696)|str xzr, [x28, #696]
+a64_ldrq(25,28,688)|ldr q25, [x28, #688]
+a64_ldrq(26,24,16)|ldr q26, [x24, #16]
+a64_tbl(1,2,3)|tbl v1.16b, { v2.16b }, v3.16b
+a64_cmeq2d(1,2,3)|cmeq v1.2d, v2.2d, v3.2d
+a64_tbz(16,31,2)|tbz w16, #31, #8
+a64_tbz(16,63,3)|tbz x16, #63, #12
+a64_stp(31,31,16,240)|stp xzr, xzr, [x16, #240]
+a64_addi(16,28,448)|add x16, x28, #448
+a64_sqadd(0,1,2,3)|sqadd v1.16b, v2.16b, v3.16b
+a64_uqadd(1,1,2,3)|uqadd v1.8h, v2.8h, v3.8h
+a64_sqsub(1,1,2,3)|sqsub v1.8h, v2.8h, v3.8h
+a64_uqsub(0,1,2,3)|uqsub v1.16b, v2.16b, v3.16b
+a64_smin(2,1,2,3)|smin v1.4s, v2.4s, v3.4s
+a64_smax(0,1,2,3)|smax v1.16b, v2.16b, v3.16b
+a64_umin(1,1,2,3)|umin v1.8h, v2.8h, v3.8h
+a64_umax(2,1,2,3)|umax v1.4s, v2.4s, v3.4s
+a64_urhadd(1,1,2,3)|urhadd v1.8h, v2.8h, v3.8h
+a64_ushl(3,1,2,3)|ushl v1.2d, v2.2d, v3.2d
+a64_sshl(1,1,2,3)|sshl v1.8h, v2.8h, v3.8h
+a64_uabd(0,1,2,3)|uabd v1.16b, v2.16b, v3.16b
+a64_uzp1(2,1,2,3)|uzp1 v1.4s, v2.4s, v3.4s
+a64_uzp2(1,1,2,3)|uzp2 v1.8h, v2.8h, v3.8h
+a64_trn1(2,1,2,3)|trn1 v1.4s, v2.4s, v3.4s
+a64_trn2(2,1,2,3)|trn2 v1.4s, v2.4s, v3.4s
+a64_vcmgt(3,1,2,3)|cmgt v1.2d, v2.2d, v3.2d
+a64_vcmeq(3,1,2,3)|cmeq v1.2d, v2.2d, v3.2d
+a64_vmul(2,1,2,3)|mul v1.4s, v2.4s, v3.4s
+a64_vadd(1,1,2,3)|add v1.8h, v2.8h, v3.8h
+a64_vsub(2,1,2,3)|sub v1.4s, v2.4s, v3.4s
+a64_sqrdmulh(1,1,2,3)|sqrdmulh v1.8h, v2.8h, v3.8h
+a64_smull_lo(1,1,2,3)|smull v1.4s, v2.4h, v3.4h
+a64_smull_hi(1,1,2,3)|smull2 v1.4s, v2.8h, v3.8h
+a64_umull_lo(2,1,2,3)|umull v1.2d, v2.2s, v3.2s
+a64_umull_hi(1,1,2,3)|umull2 v1.4s, v2.8h, v3.8h
+a64_smull_lo(2,1,2,3)|smull v1.2d, v2.2s, v3.2s
+a64_vneg(1,1,2)|neg v1.8h, v2.8h
+a64_vabs(0,1,2)|abs v1.16b, v2.16b
+a64_cmlt0(2,1,2)|cmlt v1.4s, v2.4s, #0
+a64_cmeq0(1,1,2)|cmeq v1.8h, v2.8h, #0
+a64_uaddlp(0,1,2)|uaddlp v1.8h, v2.16b
+a64_uaddlp(2,1,2)|uaddlp v1.2d, v2.4s
+a64_sqxtn_lo(0,1,2)|sqxtn v1.8b, v2.8h
+a64_sqxtn_hi(1,1,2)|sqxtn2 v1.8h, v2.4s
+a64_sqxtun_lo(0,1,2)|sqxtun v1.8b, v2.8h
+a64_sqxtun_hi(1,1,2)|sqxtun2 v1.8h, v2.4s
+a64_xtn_lo(2,1,2)|xtn v1.2s, v2.2d
+a64_sxtl_lo(0,1,2)|sxtl v1.8h, v2.8b
+a64_sxtl_hi(1,1,2)|sxtl2 v1.4s, v2.8h
+a64_uxtl_lo(2,1,2)|uxtl v1.2d, v2.2s
+a64_uxtl_hi(0,1,2)|uxtl2 v1.8h, v2.16b
+a64_frint(0,0,1,2)|frintn v1.4s, v2.4s
+a64_frint(1,1,1,2)|frintm v1.2d, v2.2d
+a64_frint(2,0,1,2)|frintp v1.4s, v2.4s
+a64_frint(3,1,1,2)|frintz v1.2d, v2.2d
+a64_frecpe4s(1,2)|frecpe v1.4s, v2.4s
+a64_frsqrte4s(1,2)|frsqrte v1.4s, v2.4s
+a64_frecps4s(1,2,3)|frecps v1.4s, v2.4s, v3.4s
+a64_frsqrts4s(1,2,3)|frsqrts v1.4s, v2.4s, v3.4s
+a64_fcvtns2d(1,2)|fcvtns v1.2d, v2.2d
+a64_fcvtzs2d(1,2)|fcvtzs v1.2d, v2.2d
+a64_dupg(0,1,2)|dup v1.16b, w2
+a64_dupg(1,1,2)|dup v1.8h, w2
+a64_dupg(3,1,2)|dup v1.2d, x2
+a64_insg(0,1,9,2)|mov v1.b[9], w2
+a64_insg(1,1,5,2)|mov v1.h[5], w2
+a64_insg(3,1,1,2)|mov v1.d[1], x2
+a64_umovg(0,1,2,13)|umov w1, v2.b[13]
+a64_umovg(1,1,2,6)|umov w1, v2.h[6]
+a64_umovg(3,1,2,1)|mov x1, v2.d[1]
+a64_insv(1,1,3,2,7)|mov v1.h[3], v2.h[7]
+a64_insv(0,1,15,2,4)|mov v1.b[15], v2.b[4]
+a64_crc32c(1,1,2,3)|crc32cb w1, w2, w3
+a64_crc32c(2,1,2,3)|crc32ch w1, w2, w3
+a64_crc32c(4,1,2,3)|crc32cw w1, w2, w3
+a64_crc32c(8,1,2,3)|crc32cx w1, w2, x3
+a64_fmla(0,1,2,3)|fmla v1.4s, v2.4s, v3.4s
+a64_fmla(1,1,2,3)|fmla v1.2d, v2.2d, v3.2d
+a64_fmls(0,1,2,3)|fmls v1.4s, v2.4s, v3.4s
+a64_fmls(1,1,2,3)|fmls v1.2d, v2.2d, v3.2d
+a64_fneg(0,1,2)|fneg v1.4s, v2.4s
+a64_fneg(1,1,2)|fneg v1.2d, v2.2d
+a64_tbl2(1,29,3)|tbl v1.16b, { v29.16b, v30.16b }, v3.16b
+a64_cmhi2d(1,2,3)|cmhi v1.2d, v2.2d, v3.2d
+a64_ldrh_v(1,24,0)|ldr h1, [x24]
+a64_aes(0,1,2)|aese v1.16b, v2.16b
+a64_aes(1,1,2)|aesd v1.16b, v2.16b
+a64_aes(2,1,2)|aesmc v1.16b, v2.16b
+a64_aes(3,1,2)|aesimc v1.16b, v2.16b
+a64_pmull1q(1,2,3)|pmull v1.1q, v2.1d, v3.1d

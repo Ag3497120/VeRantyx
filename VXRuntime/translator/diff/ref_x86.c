@@ -60,6 +60,10 @@ int main(void) {
         for (int x = 0; x < 16; x++) {                                                            // movdqu xmmN, [rax+off]
             b(0xF3); if (x >= 8) b(0x44); b(0x0F); b(0x6F); b(0x80 | (x & 7) << 3); d32((uint32_t)(DT_XMM + 16 * x));
         }
+        for (int x = 0; x < 16; x++) {                                                            // vinsertf128 ymmN, ymmN, [rax+off], 1
+            b(0xC4); b((uint8_t)((x < 8 ? 0x80 : 0) | 0x63)); b((uint8_t)((~x & 15) << 3 | 5)); b(0x18);
+            b(0x80 | (x & 7) << 3); d32((uint32_t)(DT_YMMH + 16 * x)); b(1);
+        }
         b(0x0F); b(0xAE); b(0x90); d32(DT_MXCSR);                                                 // ldmxcsr [rax+off]
         b(0x48); b(0x8B); b(0x00);                                                                // mov rax, [rax]
         if (c.kind == 1) {
@@ -77,6 +81,11 @@ int main(void) {
         for (int x = 0; x < 16; x++) {                                                            // movdqu [rax+off], xmmN
             b(0xF3); if (x >= 8) b(0x44); b(0x0F); b(0x7F); b(0x80 | (x & 7) << 3); d32((uint32_t)(DT_XMM + 16 * x));
         }
+        for (int x = 0; x < 16; x++) {                                                            // vextractf128 [rax+off], ymmN, 1
+            b(0xC4); b((uint8_t)((x < 8 ? 0x80 : 0) | 0x63)); b(0x7D); b(0x19);
+            b(0x80 | (x & 7) << 3); d32((uint32_t)(DT_YMMH + 16 * x)); b(1);
+        }
+        b(0xC5); b(0xF8); b(0x77);                                                                // vzeroupper
         b(0x0F); b(0xAE); b(0x98); d32(DT_MXCSR);                                                 // stmxcsr [rax+off]
         mov_rax_imm((uint64_t)&host_rsp); b(0x48); b(0x8B); b(0x20);                              // mov rsp, [rax]
         b(0x41); b(0x5F); b(0x41); b(0x5E); b(0x41); b(0x5D); b(0x41); b(0x5C); b(0x5D); b(0x5B); b(0xC3);

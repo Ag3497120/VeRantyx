@@ -13,8 +13,9 @@ typedef struct {
     uint8_t xmm[16][16];
     uint32_t mxcsr;
     uint32_t pad;
+    uint8_t ymm_hi[16][16];                 // the upper halves of YMM0-15
 } dt_state;
-enum { DT_XMM = 144, DT_MXCSR = 400 };      // offsets in dt_state
+enum { DT_XMM = 144, DT_MXCSR = 400, DT_YMMH = 408 };   // offsets in dt_state
 
 // Programs (several blocks, branches, calls) run from this address in both processes and end by jumping to DT_END.
 #define DT_PROG ((uint64_t)0x310000000ull)

@@ -110,6 +110,29 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   CMPPS/CMPPD imm & 7 (the SDM reserves everything above 7). Not yet: MXCSR exception flags and rounding modes
   (LDMXCSR is not translated). `translator/a64_check.py` (make check) checks every ARM64 encoder against the
   assembler (124).
+- **Phase 3b result (2026-10-15).** AVX, AVX2, FMA, SSE3, SSSE3, SSE4.1, AES, PCLMULQDQ and the rest of SSE2: 785
+  forms in all (with 3a's). YMM upper halves live in the thread's context (16 registers would not fit next to V0-V15
+  and the scratch registers): a 256-bit operation loads the halves it reads and stores its result's, a VEX instruction
+  with a 128-bit result clears its destination's (two stores). Most VEX forms are the SSE translation run once per
+  half on registers chosen for it (VEX.vvvv as a separate first source), so a form checked at 128 bits is the same code
+  at 256. Rosetta 2 runs AVX, AVX2 and FMA (its CPUID says so only with `ROSETTA_ADVERTISE_AVX=1`), so it is the
+  reference here too; its state now includes the upper halves (VINSERTF128 / VEXTRACTF128 in ref_x86).
+  5 seeds x (773 forms x 3000 + 12,000 programs) plus 5 x 12 AES / PCLMULQDQ forms x 3000: 11,820,000 cases, all
+  identical (83,155 of them are Rosetta deviations below, counted instead of compared).
+  Where x86 lets processors differ, x86's bound is checked instead of Rosetta's bits: RCPPS / RSQRTPS (and SS) are
+  the ARM estimate plus one Newton step (about 2^-16), denormal inputs as zero, tiny reciprocals as zero, the
+  indefinite NaN for negative square roots; every lane of both results is checked against the exact value (relative
+  error at most 1.5 * 2^-12). Rosetta's own estimates have 12 bits and match neither Intel's nor ours bit for bit.
+  Rosetta 2 deviations from x86 found (the translator does what x86 does; the cases are counted, not compared):
+  PTEST / VPTEST / VTESTPS/PD leave AF OF PF SF as they were (x86 clears them); HSUBPS/PD and ADDSUBPS/PD change the
+  sign of a subtracted NaN (x86 keeps it, as SUBPS does, and Rosetta's SUBPS does too); VPSRLVQ / VPSLLVQ read only
+  the low 32 bits of each 64-bit count. FMA's NaN rule is Rosetta's, measured operand by operand: the first NaN of
+  multiplicand 1, multiplicand 2, addend (by role, not by the 132/213/231 position; no preference for SNaNs), negated
+  where the form negates that operand (the addend of VFMSUB, multiplicand 1 of VFNMADD); the SDM is still to be checked
+  for this. Not yet: MXCSR modes and exception flags (LDMXCSR, STMXCSR: 3c), gathers, VCVTPH2PS/PS2PH, PHMINPOSUW,
+  MPSADBW, PCMPxSTRx, AESKEYGENASSIST, CMPXCHG16B, BMI1/BMI2, AVX-512 (Rosetta has none). Of the census's 400 most
+  common mnemonics, the SIMD ones not translated yet appear 14,428 times in the four titles (AES rounds, CMPXCHG16B,
+  MOVNTI, MULX, gathers, AVX-512, LDMXCSR) against about 20 million SIMD instructions.
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.
@@ -123,7 +146,7 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
 | 0 Measure | census, CPU features, TSO and exit cost (above) — done |
 | 1 Decoder | lengths of every instruction in the four apps match LLVM (except data LLVM reads as APX) — done |
 | 2 Integer translator + differential tests | integer and flag instructions match Rosetta on random inputs (2a, done: 154 forms); control flow, blocks, string instructions, RCL/RCR, SHLD/SHRD, atomics with LSE (2b, done: 224 forms and random programs); small PE tests run translated in-process (with phase 4) |
-| 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs): 3a SSE/SSE2 done (128 forms); 3b AVX/FMA/SSE3-4; 3c x87, MXCSR modes and flags |
+| 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs): 3a SSE/SSE2 done (128 forms); 3b AVX/AVX2/FMA/SSE3-4.1/AES done (785 forms with 3a's); 3c x87, MXCSR modes and flags |
 | 4 Runtime on ARM64 + execution environment | `make check` passes translated; in-process vs. vCPU measured on SteamVR and a game |
 | 5 Games | SteamVR, The Lab (Mono JIT), Earth, Alyx at level `controls` with fps at least Rosetta's |
 

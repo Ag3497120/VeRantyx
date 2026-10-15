@@ -200,6 +200,7 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest
 	python3 ../tools/vxrt_tune.py --selftest
 	python3 ../tools/vxrt_playtest.py --selftest
 	build/x86dec_test
+	python3 translator/a64_check.py
 	build/difftest build/ref_x86 200
 	build/vxrt build/hello_k32.exe
 	build/vxrt build/hello_crt.exe one "two words"

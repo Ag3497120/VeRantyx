@@ -436,7 +436,8 @@ static void shld(xlat_buf *b, const x86_insn *d, int right, int count_from_cl, i
 static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
     uint64_t next = rip + d->len;
     int op = d->opcode, size = d->opsize, reg = d->reg;
-    if (d->prefixes & (X86_P_VEX | X86_P_EVEX)) return -1;
+    if (d->prefixes & X86_P_EVEX) return -1;
+    if (d->prefixes & X86_P_VEX) return xlat_vex(b, d, next);         // AVX (xlat_sse.inc)
     if (d->map == X86_MAP_1) {
         if (op < 0x40 && (op & 7) < 6) {                                 // ADD .. CMP, six forms each
             int aop = op >> 3, form = op & 7, sz = (form & 1) ? size : 1;
