@@ -68,6 +68,7 @@ static int guest_write(uint64_t pc, uint64_t addr) {
 }
 static void stubs(xe *e) {
     xlat_buf b = { 0 };
+    b.vcpu = e->vcpu;                                                     // (the guest's FPCR: no FEAT_AFP rule there)
     uint32_t *c = e->code;
     size_t n = 0;
     if (e->vcpu) {

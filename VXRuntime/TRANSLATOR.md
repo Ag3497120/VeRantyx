@@ -337,6 +337,26 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
 - **Games with the harness.** `make -C VXRuntime vr-check` and the levels (AGENTS.md) with the translator instead of
   Rosetta; fps and CPU time compared run for run.
 
+## Rules (translation improvements proposed by an AI, accepted by tests)
+
+A rule is a pattern of x86 instructions with the conditions under which a shorter ARM64 sequence gives the same
+results. Anyone (an AI coding agent included) may propose one; only the tests accept it. `tools/xlat_view.py <XE_DUMP
+file> <image>` shows blocks side by side (x86, then the ARM64 they became); `tools/xlat_rules.py` writes a brief for
+an agent from the blocks with the most ARM64 per x86 instruction (what a rule must keep, how it is checked). A rule
+is in only when difftest matches Rosetta (`build/difftest build/ref_x86 20000 <seed> programs` and its forms), when
+a deliberate mistake planted in it makes difftest fail (the generator reaches it: add a case if not), and when
+`make xlat-bench` shows it helps.
+
+| Rule | Where | Measured |
+|---|---|---|
+| CMP of memory with an immediate, read by JE/JNE only: the value loaded, CBZ/CBNZ for 0 (kept in X25 across instructions in between), CMP #imm otherwise | `mem_compare` | string 36.3 -> 30.9 ms (MacBook Pro M1 Max) |
+| IMUL with every flag dead: the product alone | `imul:` | 16 -> 5 instructions for `imul $imm, r, r` |
+| FEAT_AFP (Apple M2+; not in the vCPU): FPCR.AH = 1, so ADD/SUB/MUL/DIV (ss sd ps pd) need no NaN fix-up; FZ/FIZ are MXCSR's FTZ/DAZ exactly | `afp`, `mxcsr_to_fpcr` | physics 4.7 -> 3.7 ms, matmul 6.7 -> 6.35 (MacBook Air M5); on the M5 the old path's FMA NaNs differed from Rosetta's there, with AH they match (985 forms) |
+
+Mutations checked (each made difftest fail): CBZ/CBNZ swapped (adjacent and across), CMP with the immediate + 1,
+IMUL of the wrong operand. Seen next by the brief: `cmp r, r; jge` whose flags the successors read again (40 ARM64
+instructions computing all six flags), a candidate for flags computed only when read.
+
 ## Phases
 
 | Phase | Done when |

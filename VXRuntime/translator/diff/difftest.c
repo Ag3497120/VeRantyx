@@ -349,12 +349,27 @@ static void clean_flags(void) {                      // CMP r, r: every flag def
 }
 // A CMP / TEST / SUB / AND / OR / XOR of 8 to 64 bits (registers, AH-BH, an immediate, RBX-based memory) for a Jcc right
 // after it: the engine takes such a Jcc's condition from the operands when nothing else reads the flags.
+static uint8_t *g_mem;                               // (the case's memory: RBX + d is g_mem[1024 + d])
 static void fusable(void) {
     int a = preg(0), c = preg(0), k = (int)(rnd() % 6), sz = (int)(rnd() % 4);   // (k: CMP TEST SUB AND OR XOR; sz: 8 16 32 64)
     static const uint8_t rr[] = { 0x38, 0x84, 0x28, 0x20, 0x08, 0x30 }, grp[] = { 7, 0, 5, 4, 1, 6 }, acc[] = { 0x3C, 0xA8, 0x2C, 0x24, 0x0C, 0x34 };
     int imm = sz == 0 ? 1 : sz == 1 ? 2 : 4;
     if (sz == 1) *pp++ = 0x66;
-    switch (rnd() % 4) {
+    switch (rnd() % 5) {
+    case 4: {                                                        // CMP memory, imm: 0 (the memory zero or not), the
+        int op = sz == 0 ? 0x80 : (rnd() & 1) ? 0x83 : 0x81, d = (int)(rnd() % 112), n = op == 0x81 ? imm : 1;   //  value there, any
+        int bytes = sz == 0 ? 1 : sz == 1 ? 2 : sz == 2 ? 4 : 8;
+        uint8_t *m = g_mem + 1024 + d;
+        uint64_t v = 0;
+        int how = (int)(rnd() % 3);
+        if (how == 0 && (rnd() & 1)) memset(m, 0, (size_t)bytes);
+        if (how == 1) {                                              // (equal: an immediate that sign-extends to the value)
+            if (n == 1) { int8_t s8 = (int8_t)rnd(); memset(m, s8 < 0 ? 0xFF : 0, (size_t)bytes); m[0] = (uint8_t)s8; v = (uint64_t)(int64_t)s8; }
+            else { int32_t s32 = (int32_t)rnd(); memset(m, s32 < 0 ? 0xFF : 0, (size_t)bytes); memcpy(m, &s32, (size_t)(bytes < 4 ? bytes : 4)); v = (uint64_t)(int64_t)s32; }
+        } else if (how == 2) v = rnd();
+        rex_rr(sz == 3, 0, 3, 0); *pp++ = (uint8_t)op; *pp++ = (uint8_t)(0x40 | 7 << 3 | 3); *pp++ = (uint8_t)d;
+        for (int i = 0; i < n; i++) *pp++ = (uint8_t)(v >> (8 * i));
+        break; }
     case 0:                                                          // r/m, r
         if (sz == 0 && k < 2 && (rnd() & 1)) { *pp++ = rr[k]; *pp++ = (uint8_t)(0xC0 | (rnd() % 8) << 3 | (rnd() % 8)); break; }   // (AH-BH)
         rex_rr(sz == 3, c, a, sz == 0); *pp++ = (uint8_t)(rr[k] | (sz ? 1 : 0)); *pp++ = (uint8_t)(0xC0 | (c & 7) << 3 | (a & 7)); break;
@@ -408,6 +423,7 @@ static void make_program(dt_case *c) {
     c->in.gpr[4] = DT_STACK; c->in.gpr[3] = DT_BUF + 1024;
     c->in.flags = (rnd() & 0x8D5) | 0x202;
     flags_clean = 1;
+    g_mem = c->mem;
     pp = pp0 = c->prog;
     int nb = 2 + (int)(rnd() % 6);
     uint8_t *start[8]; fixup fx[64]; int nfx = 0;

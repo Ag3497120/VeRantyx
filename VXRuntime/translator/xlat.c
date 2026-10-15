@@ -1,4 +1,5 @@
 // x86-64 -> ARM64: general-purpose integer instructions (phase 2). See xlat.h for the register convention.
+#include <sys/sysctl.h>
 #include "xlat.h"
 #include "a64.h"
 #include "x87.h"
@@ -731,9 +732,26 @@ static void cmpxchg8_16(xlat_buf *b, const x86_insn *d, uint64_t next) {
 // MXCSR on ARM: its rounding control and FTZ/DAZ are FPCR's RMode and FZ (FZ flushes inputs and results alike, so
 // one of FTZ and DAZ alone is taken as both: TRANSLATOR.md); its exception flags are FPSR's cumulative bits, read
 // back when the program reads MXCSR (STMXCSR) and when translated code is left.
+// Rule (FEAT_AFP, Apple M2 and later; not in the vCPU): FPCR.AH = 1 gives x86's NaNs (the first NaN operand, quieted,
+// SNaN or not; the indefinite NaN with its sign bit set), so arithmetic needs no NaN fix-up; with it FZ flushes
+// results and FIZ inputs, which are x86's FTZ and DAZ exactly.
+int xlat_afp = -1;
+static int afp(const xlat_buf *b) {
+    if (xlat_afp < 0) {
+        int v = 0; size_t n = sizeof v;
+        xlat_afp = !sysctlbyname("hw.optional.arm.FEAT_AFP", &v, &n, NULL, 0) && v && !(getenv("XE_AFP") && !atoi(getenv("XE_AFP")));
+    }
+    return xlat_afp && !b->vcpu;
+}
 static void mxcsr_to_fpcr(xlat_buf *b, int dst, int mx) {               // (S0, S1 used)
     E(b, a64_ubfx(S0, mx, 13, 1)); E(b, a64_lsli(S0, S0, 23));         // x86 RC 01 (down) / 10 (up) are ARM's 10 / 01
     E(b, a64_ubfx(S1, mx, 14, 1)); E(b, a64_orr_lsl(S0, S0, S1, 22));
+    if (afp(b)) {                                                        // FZ (24) = FTZ, FIZ (0) = DAZ, AH (1)
+        E(b, a64_ubfx(S1, mx, 15, 1)); E(b, a64_orr_lsl(S0, S0, S1, 24));
+        E(b, a64_ubfx(dst, mx, 6, 1)); E(b, a64_orr(dst, S0, dst));
+        E(b, a64_movz(S1, 2, 0)); E(b, a64_orr(dst, dst, S1));
+        return;
+    }
     E(b, a64_ubfx(S1, mx, 15, 1)); E(b, a64_ubfx(dst, mx, 6, 1)); E(b, a64_orr(S1, S1, dst));
     E(b, a64_orr_lsl(dst, S0, S1, 24));
 }
@@ -1248,7 +1266,13 @@ static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
     return -1;
 
 imul: {
-        // IMUL reg, r/m [, imm]: T_A, T_B loaded; CF = OF = the product does not fit.
+        // IMUL reg, r/m [, imm]: T_A, T_B loaded; CF = OF = the product does not fit. Rule: with every flag written
+        // again before a read, the product alone (its low bits are the same signed or not).
+        if ((b->dead_flags & F_ARITH) == F_ARITH) {
+            E(b, size == 8 ? a64_mul(T_R, T_A, T_B) : a64_w32(a64_mul(T_R, T_A, T_B)));
+            wr_reg(b, d, d->reg, T_R, size);
+            return 0;
+        }
         int msb_shift = bits(size);
         E(b, a64_movz(ACC, 0, 0));
         if (size == 8) {
@@ -1411,6 +1435,30 @@ static int direct_compare(xlat_buf *b, const x86_insn *d) {
     #undef W
 }
 
+// Rule: CMP of memory with an immediate whose flags only a JE / JNE reads (fuse_cc 4 / 5): the value loaded, then
+// for 0 tested itself (CBZ / CBNZ: b->fuse_kind 5, or kept in X_COND with b->fuse_in_reg_zero when instructions
+// come between), else CMP with the immediate (fuse_kind 3). 0: not one.
+static int mem_compare(xlat_buf *b, const x86_insn *d, uint64_t next, int cc, int adjacent) {
+    int op = d->opcode, g = d->reg & 7, sz = d->opsize;
+    if (d->map != X86_MAP_1 || d->mod == 3 || (cc != 4 && cc != 5) || (d->prefixes & (X86_P_VEX | X86_P_EVEX | X86_P_LOCK))) return 0;
+    if (!((op == 0x80 || op == 0x81 || op == 0x83) && g == 7)) return 0;
+    if (op == 0x80) sz = 1;
+    uint64_t v = (uint64_t)d->imm & (sz == 8 ? ~0ull : (1ull << (8 * sz)) - 1);
+    rd_rm_ro(b, d, T_A, sz, next);                                       // (zero-extended: equality as x86's)
+    if (!v) {
+        if (adjacent) { b->fuse_kind = 5; b->fuse_size = cc; return 1; }
+        E(b, a64_mov(X_COND, T_A));
+        b->fuse_in_reg = 1; b->fuse_in_reg_zero = cc == 4;               // (JNE: taken when the value is not 0)
+        return 1;
+    }
+    if (v < 4096) E(b, a64_cmpi(T_A, (uint32_t)v));
+    else { mov_imm(b, T_B, v); E(b, a64_cmp(T_A, T_B)); }
+    if (adjacent) { b->fuse_kind = 3; return 1; }
+    E(b, a64_cset(X_COND, cc == 4 ? EQ : NE));
+    b->fuse_in_reg = 1; b->fuse_in_reg_zero = 0;
+    return 1;
+}
+
 static int control_linked(xlat_buf *b, const x86_insn *d, uint64_t rip) {
     uint64_t next = rip + d->len, target = next + (uint64_t)d->imm;
     int op = d->opcode;
@@ -1450,6 +1498,12 @@ static int control_linked(xlat_buf *b, const x86_insn *d, uint64_t rip) {
     if (d->map == X86_MAP_0F && op >= 0x80 && op <= 0x8F) goto jcc;
     return 0;
 jcc:
+    if (b->fuse_kind == 5) {                                             // (mem_compare: the value against 0)
+        b->fuse_kind = 0; b->nfused++;
+        E(b, b->fuse_size == 4 ? a64_cbnz(T_A, 4) : a64_cbz(T_A, 4));   // (JE taken at 0: over the first site if not)
+        site_link(b, target); site_link(b, next);
+        return 1;
+    }
     if (b->fuse_kind) {                                                  // (right after the producer)
         E(b, a64_bcond(fused_cond(b, op & 15) ^ 1, 4));                  // (not taken: over the first site)
         site_link(b, target); site_link(b, next);
@@ -1457,7 +1511,8 @@ jcc:
     }
     if (b->fuse_in_reg) {                                                // (the producer left the condition in X_COND)
         b->fuse_in_reg = 0;
-        E(b, a64_cbz(X_COND, 4));
+        E(b, b->fuse_in_reg_zero ? a64_cbnz(X_COND, 4) : a64_cbz(X_COND, 4));
+        b->fuse_in_reg_zero = 0;
         site_link(b, target); site_link(b, next);
         return 1;
     }
@@ -1491,7 +1546,8 @@ static fx flag_fx(const x86_insn *d) {
         int mask = d->opsize == 8 ? 63 : 31;
         if ((op == 0xC0 || op == 0xC1) && g >= 4 && ((int)d->imm & mask)) return (fx){ 0, F_ARITH, FX_SKIP };   // (shifts by a
         if ((op == 0xD0 || op == 0xD1) && g >= 4) return (fx){ 0, F_ARITH, FX_SKIP };                         //  non-zero count)
-        if (op == 0x69 || op == 0x6B || ((op == 0xF6 || op == 0xF7) && g >= 4)) return fixed;   // IMUL MUL DIV
+        if (op == 0x69 || op == 0x6B) return (fx){ 0, F_ARITH, FX_SKIP };                  // IMUL (rules: TRANSLATOR.md)
+        if ((op == 0xF6 || op == 0xF7) && g >= 4) return fixed;                           // MUL DIV
         if (op < 0x40 && (op & 7) < 6) return (op >> 3) == 2 || (op >> 3) == 3 ? (fx){ F_CF, F_ARITH, FX_PART } : part;   // (ADC SBB)
         if (op >= 0x80 && op <= 0x83 && op != 0x82) return g == 2 || g == 3 ? (fx){ F_CF, F_ARITH, FX_PART } : part;
         if (op == 0x84 || op == 0x85 || op == 0xA8 || op == 0xA9) return part;
@@ -1505,7 +1561,8 @@ static fx flag_fx(const x86_insn *d) {
         return any;
     }
     if (d->map == X86_MAP_0F) {
-        if (op == 0xAF || op == 0xBC || op == 0xBD || op == 0xB8) return fixed;          // IMUL BSF BSR TZCNT LZCNT POPCNT
+        if (op == 0xAF) return (fx){ 0, F_ARITH, FX_SKIP };                               // IMUL
+        if (op == 0xBC || op == 0xBD || op == 0xB8) return fixed;                         // BSF BSR TZCNT LZCNT POPCNT
         if ((op == 0x2E || op == 0x2F) && (d->mandatory == 0 || d->mandatory == 0x66)) return fixed;   // (U)COMIS
         if ((op >= 0x40 && op <= 0x4F) || (op >= 0x80 && op <= 0x9F)) return (fx){ cc_reads(op), 0, 0 };   // CMOVcc Jcc SETcc
         if (op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF || (op >= 0x18 && op <= 0x1F) || (op >= 0x10 && op <= 0x17) ||
@@ -1703,6 +1760,9 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         if (c < 0) { b->dead_flags = 0; return -1; }
         if (c) { b->dead_flags = 0; *end = rip + d.len; return 0; }
         if (fuse_k && i == fuse_p && fuse_p == n - 2 && (dead[i] & F_ARITH) == F_ARITH && direct_compare(b, &d)) {
+            b->dead_flags = 0; b->keep_operands = 0; rip += d.len; continue;
+        }
+        if (fuse_k == 1 && i == fuse_p && (dead[i] & F_ARITH) == F_ARITH && mem_compare(b, &d, rip + d.len, fuse_cc, fuse_p == n - 2)) {
             b->dead_flags = 0; b->keep_operands = 0; rip += d.len; continue;
         }
         int r = xlat_insn(b, &d, (const uint8_t *)(uintptr_t)rip, rip);

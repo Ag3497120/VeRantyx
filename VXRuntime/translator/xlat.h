@@ -65,6 +65,7 @@ typedef struct {
     uint32_t dead_flags;         // this instruction's flags (EFLAGS bits) that are written again before any read: not computed
     uint64_t stop;               // xlat_block_linked: where the engine returns to C (the flags are live there)
     int fuse_kind, fuse_size, fuse_in_reg, keep_operands;
+    int fuse_in_reg_zero;            // (X_COND holds a value whose zero means "taken", not the condition itself)
     int check_bytes;
     int vcpu;                    // the code runs in a Hypervisor.framework guest (vcpu.c): calls of host code are HVC #2
                                  //   (xlat_helper) and #3 (a native function: its thunk in S0)             // xlat_block_linked: compare the block's x86 bytes first (code on a page written often)

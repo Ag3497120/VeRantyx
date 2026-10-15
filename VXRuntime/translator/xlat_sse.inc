@@ -260,6 +260,17 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
     }
     case 0x58: case 0x59: case 0x5C: case 0x5E: case 0x51: {              // ADD MUL SUB DIV SQRT (ps pd ss sd)
         int s = xmm_rm(b, d, esz, next);
+        if (op != 0x51 && afp(b)) {                                       // (FPCR.AH: ARM's NaNs are x86's, mxcsr_to_fpcr)
+            int r = scalar && (b->zhi[dbl] >> x & 1) ? x : V_R;          // (the rest of x known zero: straight into it)
+            switch (op) {
+            case 0x58: E(b, scalar ? (dbl ? a64_faddd(r, x, s) : a64_fadds(r, x, s)) : dbl ? a64_fadd2d(x, x, s) : a64_fadd4s(x, x, s)); break;
+            case 0x59: E(b, scalar ? (dbl ? a64_fmuld(r, x, s) : a64_fmuls(r, x, s)) : dbl ? a64_fmul2d(x, x, s) : a64_fmul4s(x, x, s)); break;
+            case 0x5C: E(b, scalar ? (dbl ? a64_fsubd(r, x, s) : a64_fsubs(r, x, s)) : dbl ? a64_fsub2d(x, x, s) : a64_fsub4s(x, x, s)); break;
+            case 0x5E: E(b, scalar ? (dbl ? a64_fdivd(r, x, s) : a64_fdivs(r, x, s)) : dbl ? a64_fdiv2d(x, x, s) : a64_fdiv4s(x, x, s)); break;
+            }
+            if (scalar && r != x) E(b, dbl ? a64_ins_d(x, 0, V_R, 0) : a64_ins_s(x, 0, V_R, 0));
+            return 0;
+        }
         if (op == 0x51) {
             if (scalar) E(b, dbl ? a64_fsqrtd(V_R, s) : a64_fsqrts(V_R, s));   // (scalar instructions: no flags from other lanes)
             else E(b, dbl ? a64_fsqrt2d(V_R, s) : a64_fsqrt4s(V_R, s));
