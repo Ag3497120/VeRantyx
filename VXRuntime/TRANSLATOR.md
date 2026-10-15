@@ -133,6 +133,23 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   MPSADBW, PCMPxSTRx, AESKEYGENASSIST, CMPXCHG16B, BMI1/BMI2, AVX-512 (Rosetta has none). Of the census's 400 most
   common mnemonics, the SIMD ones not translated yet appear 14,428 times in the four titles (AES rounds, CMPXCHG16B,
   MOVNTI, MULX, gathers, AVX-512, LDMXCSR) against about 20 million SIMD instructions.
+- **Phase 3c, MXCSR (2026-10-15).** Translated code runs with FPCR made from MXCSR (on entry and at LDMXCSR):
+  x86's rounding control is ARM's RMode, FTZ and DAZ together are ARM's FZ. MXCSR's exception flags are FPSR's
+  cumulative bits (IOC DZC OFC UFC IXC = IE ZE OE UE PE), read back at STMXCSR and on exit, so keeping them costs no
+  instruction in the code that raises them; translations were made flag-exact where they computed more than x86 does
+  (scalar forms now use scalar ARM instructions, ADDSUB one addition, DPPS no left-out products, conversions round
+  first and convert the value as it was only for the flags, RCPPS/RSQRTPS save and restore FPSR as x86 raises nothing
+  there, CMPxx predicates quiet or signalling as x86 defines them). Conversions that round (CVTSS2SI, CVTPS2DQ, ...)
+  and ROUNDxx with imm bit 2 follow MXCSR's mode. The differential test now starts each case in one of the four
+  rounding modes, FTZ+DAZ, FTZ or DAZ alone, some with flags already set, and compares MXCSR after the instruction:
+  3 seeds x 2,376,000 cases (789 forms), all identical. Known differences of ours, counted rather than compared, all in
+  rare corners and each a choice for zero cost: DE (denormal operand) is not kept (it would need a check of every
+  input); FTZ alone and DAZ alone run as both (ARM's FZ cannot tell them apart without FEAT_AFP, which the M1 lacks), so
+  denormal inputs (FTZ alone) or results (DAZ alone) differ (0.16% of the random cases, which favour denormals); ARM
+  finds a result tiny before rounding, x86 after (UE, and with FTZ a result that rounds up to exactly 2^-126 becomes 0);
+  ARM's FMA raises invalid for 0 * inf + QNaN, x86 does not. Rosetta 2 detail matched: CMPSS/CMPSD without VEX take
+  bit 4 of imm too (signalling or quiet, as VEX's 32 predicates). Rosetta 2 deviation found (counted): it raises the
+  flags of both the addition and the subtraction in every lane of VFMADDSUB / VFMSUBADD.
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.
@@ -146,7 +163,7 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
 | 0 Measure | census, CPU features, TSO and exit cost (above) — done |
 | 1 Decoder | lengths of every instruction in the four apps match LLVM (except data LLVM reads as APX) — done |
 | 2 Integer translator + differential tests | integer and flag instructions match Rosetta on random inputs (2a, done: 154 forms); control flow, blocks, string instructions, RCL/RCR, SHLD/SHRD, atomics with LSE (2b, done: 224 forms and random programs); small PE tests run translated in-process (with phase 4) |
-| 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs): 3a SSE/SSE2 done (128 forms); 3b AVX/AVX2/FMA/SSE3-4.1/AES done (785 forms with 3a's); 3c x87, MXCSR modes and flags |
+| 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs): 3a SSE/SSE2 done (128 forms); 3b AVX/AVX2/FMA/SSE3-4.1/AES done (785 forms with 3a's); 3c MXCSR modes and flags done; x87 |
 | 4 Runtime on ARM64 + execution environment | `make check` passes translated; in-process vs. vCPU measured on SteamVR and a game |
 | 5 Games | SteamVR, The Lab (Mono JIT), Earth, Alyx at level `controls` with fps at least Rosetta's |
 

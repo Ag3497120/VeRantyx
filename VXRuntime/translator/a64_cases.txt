@@ -217,3 +217,26 @@ a64_aes(1,1,2)|aesd v1.16b, v2.16b
 a64_aes(2,1,2)|aesmc v1.16b, v2.16b
 a64_aes(3,1,2)|aesimc v1.16b, v2.16b
 a64_pmull1q(1,2,3)|pmull v1.1q, v2.1d, v3.1d
+a64_msr_fpcr(16)|msr fpcr, x16
+a64_mrs_fpcr(16)|mrs x16, fpcr
+a64_msr_fpsr(31)|msr fpsr, xzr
+a64_mrs_fpsr(17)|mrs x17, fpsr
+a64_fcmpes(1,2)|fcmpe s1, s2
+a64_fcmped(1,2)|fcmpe d1, d2
+a64_frinti_s(1,2)|frinti s1, s2
+a64_frinti_d(1,2)|frinti d1, d2
+a64_frint(4,0,1,2)|frinti v1.4s, v2.4s
+a64_frint(4,1,1,2)|frinti v1.2d, v2.2d
+a64_fcmp_s(0,0,1,2,3)|fcmeq s1, s2, s3
+a64_fcmp_s(1,1,1,2,3)|fcmge d1, d2, d3
+a64_fcmp_s(2,0,1,2,3)|fcmgt s1, s2, s3
+a64_fcmp_s(2,1,1,2,3)|fcmgt d1, d2, d3
+a64_frintx_s(1,2)|frintx s1, s2
+a64_frintx_d(1,2)|frintx d1, d2
+a64_frint(5,0,1,2)|frintx v1.4s, v2.4s
+a64_frint(5,1,1,2)|frintx v1.2d, v2.2d
+a64_fmadd_sc(0,1,2,3,4)|fmadd s1, s2, s3, s4
+a64_fmadd_sc(1,1,2,3,4)|fmadd d1, d2, d3, d4
+a64_vorn(1,2,3)|orn v1.16b, v2.16b, v3.16b
+a64_fcsel(0,1,2,3,10)|fcsel s1, s2, s3, ge
+a64_fcsel(1,1,2,3,11)|fcsel d1, d2, d3, lt

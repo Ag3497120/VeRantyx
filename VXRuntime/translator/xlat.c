@@ -431,6 +431,26 @@ static void shld(xlat_buf *b, const x86_insn *d, int right, int count_from_cl, i
     patch_b(b, end);
 }
 
+// MXCSR on ARM: its rounding control and FTZ/DAZ are FPCR's RMode and FZ (FZ flushes inputs and results alike, so
+// one of FTZ and DAZ alone is taken as both: TRANSLATOR.md); its exception flags are FPSR's cumulative bits, read
+// back when the program reads MXCSR (STMXCSR) and when translated code is left.
+static void mxcsr_to_fpcr(xlat_buf *b, int dst, int mx) {               // (S0, S1 used)
+    E(b, a64_ubfx(S0, mx, 13, 1)); E(b, a64_lsli(S0, S0, 23));         // x86 RC 01 (down) / 10 (up) are ARM's 10 / 01
+    E(b, a64_ubfx(S1, mx, 14, 1)); E(b, a64_orr_lsl(S0, S0, S1, 22));
+    E(b, a64_ubfx(S1, mx, 15, 1)); E(b, a64_ubfx(dst, mx, 6, 1)); E(b, a64_orr(S1, S1, dst));
+    E(b, a64_orr_lsl(dst, S0, S1, 24));
+}
+static void fpsr_to_mxcsr(xlat_buf *b, int dst, int fpsr) {             // IOC DZC OFC UFC IXC -> IE ZE OE UE PE (S0 used)
+    E(b, a64_ubfx(dst, fpsr, 0, 1));
+    E(b, a64_ubfx(S0, fpsr, 1, 4)); E(b, a64_orr_lsl(dst, dst, S0, 2));
+    E(b, a64_ubfx(S0, fpsr, 3, 1)); E(b, a64_orr_lsl(dst, dst, S0, 5));  // (x86 reports an underflow only when inexact)
+}
+// The flags so far into ctx->mxcsr (in T_A afterwards); FPSR cleared.
+static void mxcsr_sync(xlat_buf *b) {
+    E(b, a64_mrs_fpsr(T_B)); fpsr_to_mxcsr(b, T_R, T_B);
+    E(b, a64_ldr(4, T_A, XC, CTX_MXCSR)); E(b, a64_orr(T_A, T_A, T_R)); E(b, a64_str(4, T_A, XC, CTX_MXCSR));
+    E(b, a64_msr_fpsr(XZR));
+}
 #include "xlat_sse.inc"
 
 static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
@@ -868,7 +888,7 @@ int xlat_block(xlat_buf *b, uint64_t rip, int max_insns) {
 }
 
 void xlat_prologue(xlat_buf *b) {
-    E(b, a64_stp_pre(29, 30, SP, -160));
+    E(b, a64_stp_pre(29, 30, SP, -176));
     E(b, a64_stp(19, 20, SP, 16)); E(b, a64_stp(21, 22, SP, 32)); E(b, a64_stp(23, 24, SP, 48));
     E(b, a64_stp(25, 26, SP, 64)); E(b, a64_stp(27, 28, SP, 80));
     E(b, a64_stpd(8, 9, SP, 96)); E(b, a64_stpd(10, 11, SP, 112)); E(b, a64_stpd(12, 13, SP, 128)); E(b, a64_stpd(14, 15, SP, 144));
@@ -877,14 +897,18 @@ void xlat_prologue(xlat_buf *b) {
     E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
+    E(b, a64_mrs_fpcr(T_A)); E(b, a64_str(8, T_A, SP, 160));             // (the host's FPCR, back in the epilogue)
+    E(b, a64_ldr(4, T_A, XC, CTX_MXCSR)); mxcsr_to_fpcr(b, T_B, T_A); E(b, a64_msr_fpcr(T_B)); E(b, a64_msr_fpsr(XZR));
 }
 void xlat_epilogue(xlat_buf *b) {
     for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_stpq(r, r + 1, XC, CTX_XMM + r * 16));
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
+    mxcsr_sync(b);
+    E(b, a64_ldr(8, T_A, SP, 160)); E(b, a64_msr_fpcr(T_A));
     E(b, a64_ldp(19, 20, SP, 16)); E(b, a64_ldp(21, 22, SP, 32)); E(b, a64_ldp(23, 24, SP, 48));
     E(b, a64_ldp(25, 26, SP, 64)); E(b, a64_ldp(27, 28, SP, 80));
     E(b, a64_ldpd(8, 9, SP, 96)); E(b, a64_ldpd(10, 11, SP, 112)); E(b, a64_ldpd(12, 13, SP, 128)); E(b, a64_ldpd(14, 15, SP, 144));
-    E(b, a64_ldp_post(29, 30, SP, 160));
+    E(b, a64_ldp_post(29, 30, SP, 176));
     E(b, a64_ret());
 }

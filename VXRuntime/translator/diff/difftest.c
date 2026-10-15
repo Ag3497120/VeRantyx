@@ -389,13 +389,13 @@ static int run_translated(const dt_case *c, const x86_insn *d, dt_result *r) {
     memset(&ctx, 0, sizeof ctx);
     memcpy(ctx.gpr, c->in.gpr, sizeof ctx.gpr);
     memcpy(ctx.xmm, c->in.xmm, sizeof ctx.xmm); memcpy(ctx.ymm_hi, c->in.ymm_hi, sizeof ctx.ymm_hi);
-    ctx.flags = c->in.flags;
+    ctx.flags = c->in.flags; ctx.mxcsr = c->in.mxcsr;
     memcpy((void *)DT_BUF, c->mem, DT_BUF_SIZE);
     signaled = 0;
     if (!sigsetjmp(jb, 1)) ((void (*)(x86_ctx *))jit)(&ctx);
     memcpy(r->out.gpr, ctx.gpr, sizeof ctx.gpr);
     memcpy(r->out.xmm, ctx.xmm, sizeof ctx.xmm); memcpy(r->out.ymm_hi, ctx.ymm_hi, sizeof ctx.ymm_hi);
-    r->out.mxcsr = c->in.mxcsr;
+    r->out.mxcsr = ctx.mxcsr;
     r->out.flags = ctx.flags;
     r->out.fault = signaled ? 2 : ctx.fault == X86_FAULT_DE ? 1 : 0;
     if (r->out.fault) { memcpy(r->out.gpr, c->in.gpr, sizeof ctx.gpr); r->out.flags = c->in.flags; }
@@ -410,7 +410,9 @@ typedef struct { const char *name; uint8_t pf, op; int kind; int group; int mem;
 // no ModRM, imm8[7:4] a register
 enum { K_GREG = 1, K_GRM = 2, K_IMM = 4, K_REGONLY = 8, K_W = 16, K_ALIGN = 32,
        K_VEX = 64, K_NOV = 128, K_VREG = 256, K_L1 = 512, K_L1ONLY = 1024, K_NOMODRM = 2048, K_MASK4 = 4096, K_KEEPF = 8192,
-       K_SHCNT = 16384, K_APPROX = 32768, K_W1 = 65536, K_NANSIGN = 131072, K_CNT32 = 262144 };
+       K_SHCNT = 16384, K_APPROX = 32768, K_W1 = 65536, K_NANSIGN = 131072, K_CNT32 = 262144, K_MEMONLY = 524288, K_BOTHF = 1048576, K_FMA = 2097152 };
+// K_FMA: ARM raises invalid for 0 * inf + QNaN, x86 does not (ours: counted, flags only)
+// K_BOTHF: Rosetta 2 raises the flags of both the addition and the subtraction in every lane (FMADDSUB, FMSUBADD)
 // K_CNT32: Rosetta 2 reads only the low 32 bits of VPSRLVQ / VPSLLVQ's 64-bit counts (x86: all 64)
 // K_NANSIGN: Rosetta 2 changes the sign of a subtracted NaN (x86 keeps it, as in SUBPS): HSUB, ADDSUB
 // K_SHCNT: shift counts (the r/m operand) often small; K_APPROX: an estimate (RCP/RSQRT, see approx_ok); K_W1: VEX.W = 1
@@ -453,6 +455,7 @@ static const sse_form sse_forms[] = {
     // AVX (VEX; 128 and 256 bits)
 #define V K_VEX
 #define VN (K_VEX | K_NOV)
+    { "ldmxcsr", 0, 0xAE, K_MEMONLY, 2, 4 }, { "stmxcsr", 0, 0xAE, K_MEMONLY, 3, 4 }, { "vldmxcsr", 0, 0xAE, VN | K_MEMONLY, 2, 4 }, { "vstmxcsr", 0, 0xAE, VN | K_MEMONLY, 3, 4 },
     { "movntps", 0, 0x2B, K_ALIGN, -2, 16 }, { "movntdq", 0x66, 0xE7, K_ALIGN, -2, 16 },
     { "vmovups", 0, 0x10, VN | K_L1, -1, 16 }, { "vmovupd", 0x66, 0x10, VN | K_L1, -1, 16 }, { "vmovss", 0xF3, 0x10, V | K_VREG, -1, 4 }, { "vmovsd", 0xF2, 0x10, V | K_VREG, -1, 8 },
     { "vmovups st", 0, 0x11, VN | K_L1, -1, 16 }, { "vmovss st", 0xF3, 0x11, V | K_VREG, -1, 4 }, { "vmovsd st", 0xF2, 0x11, V | K_VREG, -1, 8 },
@@ -560,8 +563,8 @@ static const sse_form sse_forms[] = {
 #undef S4
     { "vpblendvb", 0x66, 0x4C, V | K_L1 | K_MASK4, -1, 16, 3 }, { "vpblendd", 0x66, 0x02, V | K_L1 | K_IMM, -1, 16, 3 },
     // FMA
-#define FMA3(nm, o, k) { "vf" nm "132", 0x66, 0x90 + o, (k), -1, 16, 2 }, { "vf" nm "213", 0x66, 0xA0 + o, (k), -1, 16, 2 }, { "vf" nm "231", 0x66, 0xB0 + o, (k), -1, 16, 2 }
-    FMA3("maddsub", 6, V | K_L1 | K_W), FMA3("msubadd", 7, V | K_L1 | K_W), FMA3("madd p", 8, V | K_L1 | K_W), FMA3("madd s", 9, V | K_W),
+#define FMA3(nm, o, k) { "vf" nm "132", 0x66, 0x90 + o, (k) | K_FMA, -1, 16, 2 }, { "vf" nm "213", 0x66, 0xA0 + o, (k) | K_FMA, -1, 16, 2 }, { "vf" nm "231", 0x66, 0xB0 + o, (k) | K_FMA, -1, 16, 2 }
+    FMA3("maddsub", 6, V | K_L1 | K_W | K_BOTHF), FMA3("msubadd", 7, V | K_L1 | K_W | K_BOTHF), FMA3("madd p", 8, V | K_L1 | K_W), FMA3("madd s", 9, V | K_W),
     FMA3("msub p", 0xA, V | K_L1 | K_W), FMA3("msub s", 0xB, V | K_W), FMA3("nmadd p", 0xC, V | K_L1 | K_W), FMA3("nmadd s", 0xD, V | K_W),
     FMA3("nmsub p", 0xE, V | K_L1 | K_W), FMA3("nmsub s", 0xF, V | K_W),
 #undef FMA3
@@ -610,6 +613,47 @@ static int nan_signs_only(const sse_form *f, const x86_insn *d, dt_result *want,
     return any;
 }
 
+// Ours, known: with FTZ, ARM flushes a result that is below the smallest normal number before rounding; x86 decides
+// after rounding. A result that rounds up to exactly +-2^-126 (2^-1022) is +-0 here. 1 if the case differs only so.
+static long ftz_boundary, ue_tiny, fma_ie;   // (ue_tiny: UE alone differs: ARM finds results tiny before rounding, x86 after)
+static int ftz_boundary_only(const dt_case *c, dt_result *want, const dt_result *got) {
+    if (!(c->in.mxcsr & 0x8040)) return 0;                                    // (FZ: FTZ or DAZ set)
+    int any = 0;
+    for (int r = 0; r < 32; r++) {
+        uint8_t *wp = r < 16 ? want->out.xmm[r] : want->out.ymm_hi[r - 16];
+        const uint8_t *gp = r < 16 ? got->out.xmm[r] : got->out.ymm_hi[r - 16];
+        if (!memcmp(wp, gp, 16)) continue;
+        int ok32 = 1, ok64 = 1;
+        for (int i = 0; i < 16; i += 4) { uint32_t w, g; memcpy(&w, wp + i, 4); memcpy(&g, gp + i, 4); if (w != g && !((w & 0x7FFFFFFF) == 0x00800000 && g == (w & 0x80000000))) ok32 = 0; }
+        for (int i = 0; i < 16; i += 8) { uint64_t w, g; memcpy(&w, wp + i, 8); memcpy(&g, gp + i, 8); if (w != g && !((w & ~(1ull << 63)) == 0x0010000000000000ull && g == (w & (1ull << 63)))) ok64 = 0; }
+        if (!ok32 && !ok64) return 0;
+        any = 1;
+    }
+    if (any) { memcpy(want->out.xmm, got->out.xmm, sizeof want->out.xmm); memcpy(want->out.ymm_hi, got->out.ymm_hi, sizeof want->out.ymm_hi); }
+    return any;
+}
+
+// Ours, known: one of FTZ and DAZ alone runs as both (ARM's FZ). That can only matter with a denormal source (FTZ
+// alone: it is flushed too) or a denormal result (DAZ alone: x86 keeps it). 1 if the case has one: its differences are
+// counted as that, not compared.
+static long fz_single;
+static int denormal_in(const uint8_t *p, int n) {
+    for (int i = 0; i + 4 <= n; i += 4) { uint32_t v; memcpy(&v, p + i, 4); if (!(v & 0x7F800000) && (v & 0x7FFFFF)) return 1; }
+    for (int i = 0; i + 8 <= n; i += 8) { uint64_t v; memcpy(&v, p + i, 8); if (!(v & 0x7FF0000000000000ull) && (v & 0xFFFFFFFFFFFFFull)) return 1; }
+    return 0;
+}
+static int fz_single_case(const dt_case *c, const x86_insn *d, const dt_result *want) {
+    uint32_t m = c->in.mxcsr & 0x8040;
+    if ((m != 0x8000 && m != 0x0040) || !d->has_modrm || (d->mod != 3 && (d->base == 0xFF || d->index != 0xFF))) return 0;
+    if (m == 0x0040) return denormal_in(want->out.xmm[d->reg & 15], 16) || denormal_in(want->out.ymm_hi[d->reg & 15], 16);
+    uint8_t src[32];
+    if (denormal_in(c->in.xmm[d->reg & 15], 16) || denormal_in(c->in.ymm_hi[d->reg & 15], 16)) return 1;
+    if ((d->prefixes & X86_P_VEX) && (denormal_in(c->in.xmm[d->vex_vvvv & 15], 16) || denormal_in(c->in.ymm_hi[d->vex_vvvv & 15], 16))) return 1;
+    if (d->mod == 3) return denormal_in(c->in.xmm[d->rm & 15], 16) || denormal_in(c->in.ymm_hi[d->rm & 15], 16);
+    rm_bytes(c, d, src);
+    return denormal_in(src, 32);
+}
+
 // RCP / RSQRT (K_APPROX): x86 leaves the values to the processor within a relative error of 1.5 * 2^-12, with tiny
 // results flushed to zero and denormal inputs taken as zero. Each lane of both results (Rosetta's and ours) is checked
 // against the exact value; then ours is copied into Rosetta's, so that everything else is still compared exactly.
@@ -650,7 +694,10 @@ static void make_sse_case(const sse_form *f, dt_case *c) {
     for (int i = 0; i < DT_BUF_SIZE; i += 16) rnd_xmm(c->mem + i);
     c->in.gpr[4] = DT_STACK;
     c->in.flags = (rnd() & 0x8D5) | 0x202;
-    c->in.mxcsr = 0x1F80;
+    // MXCSR: mostly the default, also the other rounding modes, FTZ+DAZ, and flags already set
+    static const uint32_t modes[] = { 0x1F80, 0x1F80, 0x1F80, 0x3F80, 0x5F80, 0x7F80, 0x9FC0, 0xDFC0, 0x9F80, 0x1FC0 };
+    c->in.mxcsr = modes[rnd() % 10] | (rnd() % 4 == 0 ? (uint32_t)(rnd() & 0x3F) : 0);
+    if (getenv("DT_MXCSR")) c->in.mxcsr = (uint32_t)strtoul(getenv("DT_MXCSR"), NULL, 0);   // (one mode only)
     uint8_t *p = c->code;
     int vex = f->kind & K_VEX;
     if (f->pf && !vex) *p++ = f->pf;
@@ -658,7 +705,7 @@ static void make_sse_case(const sse_form *f, dt_case *c) {
     int reg = (int)(rnd() % 16), rm = (int)(rnd() % 16);
     if (f->kind & K_GREG) while (reg == 4) reg = (int)(rnd() % 16);
     if (f->group >= 0) reg = f->group;
-    int mem = !(f->kind & K_REGONLY) && (f->group == -2 || rnd() % 3 == 0);
+    int mem = (f->kind & K_MEMONLY) || (!(f->kind & K_REGONLY) && (f->group == -2 || rnd() % 3 == 0));
     if (mem && f->op == 0x12 && !f->pf) mem = rnd() & 1;                      // (MOVLPS or MOVHLPS)
     if (!mem && (f->kind & K_GRM)) while (rm == 4) rm = (int)(rnd() % 16);
     int base = 0;
@@ -691,6 +738,11 @@ static void make_sse_case(const sse_form *f, dt_case *c) {
     }
     if (!mem && (f->kind & K_SHCNT) && (rnd() & 1))
         for (int i = 0; i < 4; i++) { uint32_t v = (uint32_t)(rnd() % 70); memcpy(c->in.xmm[rm] + 4 * i, &v, 4); memcpy(c->in.ymm_hi[rm] + 4 * i, &v, 4); }
+    if (mem && f->op == 0xAE && f->group == 2) {                             // (LDMXCSR: a valid value, exceptions masked)
+        static const uint32_t modes[] = { 0x1F80, 0x3F80, 0x5F80, 0x7F80, 0x9FC0, 0xDFC0 };
+        uint32_t v = modes[rnd() % 6] | (uint32_t)(rnd() & 0x3F);
+        memcpy(c->mem + (c->in.gpr[base] + (uint64_t)(int64_t)(int8_t)p[-1] - DT_BUF), &v, 4);
+    }
     if (f->kind & K_IMM) *p++ = (uint8_t)(f->group >= 0 && (rnd() & 1) ? rnd() % 20 : rnd());   // (shifts: counts near the width)
     if (f->kind & K_MASK4) *p++ = (uint8_t)rnd();
     c->len = (uint32_t)(p - c->code);
@@ -705,7 +757,7 @@ static int run_program(const dt_case *c, dt_result *r) {
     memset(&ctx, 0, sizeof ctx);
     memcpy(ctx.gpr, c->in.gpr, sizeof ctx.gpr);
     memcpy(ctx.xmm, c->in.xmm, sizeof ctx.xmm); memcpy(ctx.ymm_hi, c->in.ymm_hi, sizeof ctx.ymm_hi);
-    ctx.flags = c->in.flags;
+    ctx.flags = c->in.flags; ctx.mxcsr = c->in.mxcsr;
     ctx.rip = DT_PROG;
     memcpy((void *)DT_BUF, c->mem, DT_BUF_SIZE);
     signaled = 0;
@@ -730,7 +782,7 @@ static int run_program(const dt_case *c, dt_result *r) {
     }
     memcpy(r->out.gpr, ctx.gpr, sizeof ctx.gpr);
     memcpy(r->out.xmm, ctx.xmm, sizeof ctx.xmm); memcpy(r->out.ymm_hi, ctx.ymm_hi, sizeof ctx.ymm_hi);
-    r->out.mxcsr = c->in.mxcsr;
+    r->out.mxcsr = ctx.mxcsr;
     r->out.flags = ctx.flags;
     r->out.fault = signaled ? 2 : ctx.fault == X86_FAULT_DE ? 1 : ctx.rip != DT_END ? 4 : 0;
     if (r->out.fault) { memcpy(r->out.gpr, c->in.gpr, sizeof ctx.gpr); r->out.flags = c->in.flags; }
@@ -740,6 +792,7 @@ static int run_program(const dt_case *c, dt_result *r) {
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: difftest <ref_x86> [cases per form] [seed]\n"); return 2; }
+    setvbuf(stdout, NULL, _IOLBF, 0);                         // (results as they come)
     int per = argc > 2 ? atoi(argv[2]) : 2000;
     const char *only = argc > 4 ? argv[4] : NULL;            // (a part of the forms' names: only those)
     rng_state = argc > 3 ? strtoull(argv[3], NULL, 0) : 0x9E3779B97F4A7C15ull;
@@ -839,6 +892,7 @@ int main(int argc, char **argv) {
         long bad = 0, ran = 0; char first[900] = "";
         for (int k = 0; k < per; k++) {
             make_sse_case(f, &c);
+            if (getenv("DT_TRACE")) fprintf(stderr, "%s case %d: mxcsr %04x\n", f->name, k, c.in.mxcsr);
             x86_insn d;
             if (x86_decode(c.code, c.len, &d) != (int)c.len) { snprintf(first, sizeof first, "decoder: length %d, want %u", d.len, c.len); bad++; break; }
             if (run_translated(&c, &d, &got) < 0) { unsupported++; snprintf(first, sizeof first, "not translated (bytes %02x %02x %02x %02x %02x)", c.code[0], c.code[1], c.code[2], c.code[3], c.code[4]); bad++; break; }
@@ -850,6 +904,15 @@ int main(int argc, char **argv) {
             }
             if ((f->kind & K_NANSIGN) && nan_signs_only(f, &d, &want, &got)) rosetta_deviations++;
             if ((f->kind & K_CNT32) && cnt32_case(&c, &d)) { rosetta_deviations++; continue; }
+            if (!want.out.fault && !got.out.fault && ftz_boundary_only(&c, &want, &got)) ftz_boundary++;
+            if (!want.out.fault && ((want.out.mxcsr ^ got.out.mxcsr) & ~2u) == 0x10) { ue_tiny++; want.out.mxcsr = got.out.mxcsr; }
+            if ((f->kind & K_FMA) && !want.out.fault && (got.out.mxcsr & ~(want.out.mxcsr | 2u)) == 1) {
+                fma_ie++; want.out.mxcsr |= 1;                            // (IE: ours alone)
+            }
+            if ((f->kind & K_BOTHF) && !want.out.fault && want.out.mxcsr != got.out.mxcsr && (want.out.mxcsr & got.out.mxcsr) == got.out.mxcsr) {
+                rosetta_deviations++; want.out.mxcsr = got.out.mxcsr;     // (Rosetta's flags: ours and more)
+            }
+            int excusable = !want.out.fault && !got.out.fault && fz_single_case(&c, &d, &want);
             if ((f->kind & K_KEEPF) && (want.out.flags & 0x894) == (c.in.flags & 0x894) && (got.out.flags & 0x894) == 0 && (c.in.flags & 0x894)) {
                 rosetta_deviations++;                                // (x86 clears them: the translator does)
                 want.out.flags = (want.out.flags & ~0x894ull) | (got.out.flags & 0x894);
@@ -859,9 +922,11 @@ int main(int argc, char **argv) {
                 uint64_t sp = want.out.gpr[4] - 8 - DT_BUF;
                 if (sp + 8 <= DT_BUF_SIZE) memcpy(want.mem + sp, got.mem + sp, 8);
                 diff = (want.out.flags & 0x8D5) != (got.out.flags & 0x8D5) || memcmp(want.mem, got.mem, DT_BUF_SIZE) ||
-                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm) || memcmp(want.out.ymm_hi, got.out.ymm_hi, sizeof want.out.ymm_hi);
+                       memcmp(want.out.xmm, got.out.xmm, sizeof want.out.xmm) || memcmp(want.out.ymm_hi, got.out.ymm_hi, sizeof want.out.ymm_hi) ||
+                       (want.out.mxcsr & ~2u) != (got.out.mxcsr & ~2u);   // (DE is not kept: TRANSLATOR.md)
                 for (int i = 0; i < 16; i++) diff |= want.out.gpr[i] != got.out.gpr[i];
             }
+            if (diff && excusable) { fz_single++; diff = 0; }
             if (diff) {
                 if (!bad) {
                     int n = snprintf(first, sizeof first, "bytes");
@@ -886,6 +951,7 @@ int main(int argc, char **argv) {
                             n += snprintf(first + n, sizeof first - (size_t)n, "; ymm%d.hi %016llx%016llx/%016llx%016llx", i,
                                           (unsigned long long)w1, (unsigned long long)w0, (unsigned long long)g1, (unsigned long long)g0);
                         }
+                    if (want.out.mxcsr != got.out.mxcsr) n += snprintf(first + n, sizeof first - (size_t)n, "; mxcsr %04x/%04x (in %04x)", want.out.mxcsr, got.out.mxcsr, c.in.mxcsr);
                     if (memcmp(want.mem, got.mem, DT_BUF_SIZE)) snprintf(first + n, sizeof first - (size_t)n, "; memory differs");
                     if (getenv("DT_DUMP")) { FILE *df = fopen(getenv("DT_DUMP"), "wb"); if (df) { fwrite(&c, sizeof c, 1, df); fclose(df); } }
                     if (getenv("DT_RECHECK")) {
@@ -938,7 +1004,7 @@ int main(int argc, char **argv) {
         nforms++;
     }
     fclose(out); fclose(in);
-    printf("x86 -> ARM64 vs Rosetta: %d forms, %ld cases: %ld forms match, %ld differ (%ld cases)%s; %ld cases skipped where Rosetta deviates from x86\n",
-           nforms, total, forms_ok, forms_bad, bad_total, unsupported ? " (some not translated)" : "", rosetta_deviations);
+    printf("x86 -> ARM64 vs Rosetta: %d forms, %ld cases: %ld forms match, %ld differ (%ld cases)%s; %ld cases skipped where Rosetta deviates from x86; ours known to: %ld (FTZ at 2^-126), %ld (UE, tiny before rounding), %ld (FMA's invalid for 0 * inf + QNaN), %ld (FTZ or DAZ alone, with denormals)\n",
+           nforms, total, forms_ok, forms_bad, bad_total, unsupported ? " (some not translated)" : "", rosetta_deviations, ftz_boundary, ue_tiny, fma_ie, fz_single);
     return forms_bad ? 1 : 0;
 }

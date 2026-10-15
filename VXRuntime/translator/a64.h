@@ -186,8 +186,8 @@ static inline uint32_t a64_sxtl_hi(int size, int d, int n) { return 0x4F00A400u 
 static inline uint32_t a64_uxtl_lo(int size, int d, int n) { return 0x2F00A400u | (0x80000u << size) | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_uxtl_hi(int size, int d, int n) { return 0x6F00A400u | (0x80000u << size) | (uint32_t)n << 5 | (uint32_t)d; }
 // floating point, dbl: 2D (else 4S)
-static inline uint32_t a64_frint(int mode, int dbl, int d, int n) {    // mode: 0 nearest even, 1 down, 2 up, 3 toward zero
-    static const uint32_t op[4] = { 0x4E218800u, 0x4E219800u, 0x4EA18800u, 0x4EA19800u };
+static inline uint32_t a64_frint(int mode, int dbl, int d, int n) {    // mode: 0 nearest even, 1 down, 2 up, 3 toward zero, 4 FPCR's, 5 FPCR's, inexact raised
+    static const uint32_t op[6] = { 0x4E218800u, 0x4E219800u, 0x4EA18800u, 0x4EA19800u, 0x6EA19800u, 0x6E219800u };
     return op[mode] | (uint32_t)dbl << 22 | (uint32_t)n << 5 | (uint32_t)d;
 }
 static inline uint32_t a64_frecpe4s(int d, int n) { return 0x4EA1D800u | (uint32_t)n << 5 | (uint32_t)d; }
@@ -209,6 +209,24 @@ static inline uint32_t a64_cmhi2d(int d, int n, int m) { return 0x6EE03400u | (u
 static inline uint32_t a64_ldrh_v(int t, int n, uint32_t off) { return 0x7D400000u | (off / 2 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t; }
 static inline uint32_t a64_aes(int op, int d, int n) { return (0x4E284800u | (uint32_t)op << 12) | (uint32_t)n << 5 | (uint32_t)d; }   // op: 0 AESE 1 AESD 2 AESMC 3 AESIMC
 static inline uint32_t a64_pmull1q(int d, int n, int m) { return 0x0EE0E000u | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)d; }   // 128 <- low 64 x low 64
+static inline uint32_t a64_msr_fpcr(int t) { return 0xD51B4400u | (uint32_t)t; }
+static inline uint32_t a64_mrs_fpcr(int t) { return 0xD53B4400u | (uint32_t)t; }
+static inline uint32_t a64_msr_fpsr(int t) { return 0xD51B4420u | (uint32_t)t; }
+static inline uint32_t a64_mrs_fpsr(int t) { return 0xD53B4420u | (uint32_t)t; }
+static inline uint32_t a64_fcmpes(int n, int m) { return 0x1E202010u | (uint32_t)m << 16 | (uint32_t)n << 5; }   // signalling compares
+static inline uint32_t a64_fcmped(int n, int m) { return 0x1E602010u | (uint32_t)m << 16 | (uint32_t)n << 5; }
+static inline uint32_t a64_frinti_s(int d, int n) { return 0x1E27C000u | (uint32_t)n << 5 | (uint32_t)d; }      // FPCR's rounding mode
+static inline uint32_t a64_frinti_d(int d, int n) { return 0x1E67C000u | (uint32_t)n << 5 | (uint32_t)d; }
+// scalar compares (lane 0; the rest of d zeroed), FRINTX (FPCR's mode, inexact raised), scalar FMADD/FMSUB
+static inline uint32_t a64_fcmp_s(int op, int dbl, int d, int n, int m) {   // op: 0 EQ, 1 GE, 2 GT
+    static const uint32_t c[3] = { 0x5E20E400u, 0x7E20E400u, 0x7EA0E400u };
+    return c[op] | (uint32_t)dbl << 22 | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)d;
+}
+static inline uint32_t a64_vorn(int d, int n, int m) { return 0x4EE01C00u | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)d; }   // n | ~m
+static inline uint32_t a64_fcsel(int dbl, int d, int n, int m, int cond) { return (dbl ? 0x1E600C00u : 0x1E200C00u) | (uint32_t)m << 16 | (uint32_t)cond << 12 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_frintx_s(int d, int n) { return 0x1E274000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_frintx_d(int d, int n) { return 0x1E674000u | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_fmadd_sc(int dbl, int d, int n, int m, int a) { return (dbl ? 0x1F400000u : 0x1F000000u) | (uint32_t)m << 16 | (uint32_t)a << 10 | (uint32_t)n << 5 | (uint32_t)d; }   // a + n*m
 static inline uint32_t a64_crc32c(int size, int d, int n, int m) {     // CRC32CB/H/W/X
     return (size == 8 ? 0x9AC05C00u : 0x1AC05000u | (uint32_t)(size == 1 ? 0 : size == 2 ? 1 : 2) << 10) | (uint32_t)m << 16 | (uint32_t)n << 5 | (uint32_t)d;
 }

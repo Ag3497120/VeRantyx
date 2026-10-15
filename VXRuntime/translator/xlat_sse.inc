@@ -36,7 +36,8 @@ static void nan_fixn(xlat_buf *b, int dbl, int scalar, const int *ops, int n, in
     }
     if (dbl) { mov_imm(b, S0, 0xFFF8000000000000ull); E(b, a64_dup2d(V_U, S0)); mov_imm(b, S0, 0x0008000000000000ull); E(b, a64_dup2d(V_W, S0)); }
     else { mov_imm(b, S0, 0xFFC00000u); E(b, a64_dup4s(V_U, S0)); mov_imm(b, S0, 0x00400000u); E(b, a64_dup4s(V_W, S0)); }
-    #define ISNAN(dst, x) do { E(b, dbl ? a64_fcmeq2d(dst, x, x) : a64_fcmeq4s(dst, x, x)); E(b, a64_vmvn(dst, dst)); } while (0)
+    // (scalar: lane 0 compared only, so that the other lanes raise no flags)
+    #define ISNAN(dst, x) do { E(b, scalar ? a64_fcmp_s(0, dbl, dst, x, x) : dbl ? a64_fcmeq2d(dst, x, x) : a64_fcmeq4s(dst, x, x)); E(b, a64_vmvn(dst, dst)); } while (0)
     ISNAN(V_X, r); E(b, a64_vbsl(V_X, V_U, r));                         // invalid: indefinite
     for (int i = n - 1; i >= 0; i--) {                                    // (the first operand last: it wins)
         ISNAN(V_T, ops[i]); E(b, a64_vorr(V_U, ops[i], V_W)); E(b, a64_vbsl(V_T, V_U, V_X)); E(b, a64_vmov(V_X, V_T));
@@ -51,19 +52,38 @@ static void nan_fix(xlat_buf *b, int dbl, int scalar, int a, int src, int r) {
     nan_fixn(b, dbl, scalar, ops, src >= 0 ? 2 : 1, r);
 }
 
-// Float to integer, x86 style: the ARM conversion (truncating or nearest) of lane 0 of v into general register t
-// (size 4 or 8), and 0x80000000... for NaN and out of range.
+// Float to integer, x86 style: the ARM conversion (truncating, or rounded as MXCSR says) of lane 0 of v into general
+// register t (size 4 or 8), and 0x80000000... for NaN and out of range. The conversion's own flags are x86's (invalid
+// out of range, inexact otherwise when inexact).
 static void cvt_to_int(xlat_buf *b, int t, int v, int dbl, int size, int trunc) {
-    if (dbl) E(b, trunc ? a64_fcvtzs_xd(t, v) : a64_fcvtns_xd(t, v)); else E(b, trunc ? a64_fcvtzs_xs(t, v) : a64_fcvtns_xs(t, v));
+    if (!trunc) {                                                         // MXCSR's rounding (no flags), then for the flags
+        E(b, dbl ? a64_frinti_d(V_U, v) : a64_frinti_s(V_U, v));         //   only a conversion of the value as it was if the
+        int e = size == 8 ? 63 : 31;                                      //   rounded one fits (inexact), else of the rounded
+        mov_imm(b, S0, dbl ? (uint64_t)(1023 + e) << 52 : (uint64_t)(127 + e) << 23);   //   one (invalid alone, as x86)
+        E(b, dbl ? a64_fmov_dx(V_W, S0) : a64_fmov_sw(V_W, S0));         // 2^e
+        E(b, dbl ? a64_fcmpd(V_U, V_W) : a64_fcmps(V_U, V_W)); E(b, a64_fcsel(dbl, V_X, V_U, v, GE));
+        E(b, a64_fneg(dbl, V_W, V_W));                                     // -2^e (vector FNEG: lane 0 is all that is read)
+        E(b, dbl ? a64_fcmpd(V_U, V_W) : a64_fcmps(V_U, V_W)); E(b, a64_fcsel(dbl, V_X, V_U, V_X, LT));
+        E(b, size == 4 ? (dbl ? a64_fcvtzs_wd(XZR, V_X) : a64_fcvtzs_ws(XZR, V_X)) : (dbl ? a64_fcvtzs_xd(XZR, V_X) : a64_fcvtzs_xs(XZR, V_X)));
+        v = V_U;
+    }
     mov_imm(b, S1, size == 8 ? 0x8000000000000000ull : 0x80000000ull);
-    if (size == 4) { E(b, a64_sbfx(S0, t, 0, 32)); E(b, a64_cmp(S0, t)); E(b, a64_csel(t, t, S1, EQ)); }   // out of 32-bit range
-    else { mov_imm(b, S0, 0x7FFFFFFFFFFFFFFFull); E(b, a64_cmp(t, S0)); E(b, a64_csel(t, S1, t, EQ)); }   // saturated high
+    if (size == 4) {                                                      // ARM saturates: x86 wants 0x80000000 at 2^31 and up
+        E(b, dbl ? a64_fcvtzs_wd(t, v) : a64_fcvtzs_ws(t, v));
+        mov_imm(b, S0, dbl ? 0x41E0000000000000ull : 0x4F000000u);        // 2^31
+        E(b, dbl ? a64_fmov_dx(V_W, S0) : a64_fmov_sw(V_W, S0)); E(b, dbl ? a64_fcmpd(v, V_W) : a64_fcmps(v, V_W));
+        E(b, a64_csel(t, S1, t, GE));
+    } else {
+        E(b, dbl ? a64_fcvtzs_xd(t, v) : a64_fcvtzs_xs(t, v));
+        mov_imm(b, S0, 0x7FFFFFFFFFFFFFFFull); E(b, a64_cmp(t, S0)); E(b, a64_csel(t, S1, t, EQ));   // saturated high
+    }
     E(b, dbl ? a64_fcmpd(v, v) : a64_fcmps(v, v)); E(b, a64_csel(t, S1, t, VS));                     // NaN
 }
 
 // The same for 4 lanes: x86 gives 0x80000000 where the value is NaN or not in [-2^31, 2^31).
 static void cvt4_to_int(xlat_buf *b, int dst, int v, int trunc) {
-    E(b, trunc ? a64_fcvtzs4s(V_R, v) : a64_fcvtns4s(V_R, v));
+    if (trunc) E(b, a64_fcvtzs4s(V_R, v));
+    else { E(b, a64_frint(4, 0, V_R, v)); E(b, a64_fcvtzs4s(V_R, V_R)); E(b, a64_fcvtzs4s(V_T, v)); }   // (the last: flags, as above)
     mov_imm(b, S0, 0x4F000000u); E(b, a64_dup4s(V_U, S0));                  // 2^31
     mov_imm(b, S0, 0xCF000000u); E(b, a64_dup4s(V_W, S0));                  // -2^31
     E(b, a64_fcmgt4s(V_T, V_U, v)); E(b, a64_fcmge4s(V_X, v, V_W)); E(b, a64_vand(V_T, V_T, V_X));   // in range (not NaN)
@@ -121,9 +141,13 @@ static void test_flags(xlat_buf *b) {
 static int xlat_sse4(xlat_buf *b, const x86_insn *d, uint64_t next);
 // CVTPD2DQ / CVTTPD2DQ of s into the lower half of r (upper half zero): 0x80000000 where the value does not fit.
 static void pd2dq(xlat_buf *b, int r, int s, int trunc) {
-    E(b, trunc ? a64_fcvtzs2d(V_R, s) : a64_fcvtns2d(V_R, s));
+    E(b, a64_frint(trunc ? 3 : 4, 1, V_R, s)); E(b, a64_fcvtzs2d(V_R, V_R));   // (rounded first: no flags yet)
     E(b, a64_xtn_lo(2, V_T, V_R)); E(b, a64_sxtl_lo(2, V_U, V_T)); E(b, a64_vcmeq(3, V_U, V_U, V_R));   // fits in 32 bits
+    E(b, a64_vand(V_W, s, V_U)); E(b, a64_fcvtzs2d(V_W, V_W));             // (inexact from the lanes that fit)
     E(b, a64_fcmeq2d(V_W, s, s)); E(b, a64_vand(V_U, V_U, V_W)); E(b, a64_xtn_lo(2, V_U, V_U));       // and is not NaN
+    E(b, a64_umov_d(S1, V_U, 0)); E(b, a64_addi(S1, S1, 1)); size_t ok = here(b); E(b, 0);   // (all fit: ~0 + 1 = 0)
+    mov_imm(b, S0, 0x41F0000000000000ull); E(b, a64_fmov_dx(V_W, S0)); E(b, a64_fcvtzs_wd(XZR, V_W));   // invalid, as x86 raises
+    patch_cbz(b, ok, 0, S1);
     mov_imm(b, S0, 0x80000000u); E(b, a64_dup4s(V_W, S0)); E(b, a64_vbsl(V_U, V_T, V_W)); E(b, a64_insg(3, V_U, 1, XZR));
     E(b, a64_vmov(r, V_U));
 }
@@ -135,7 +159,14 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
     if (d->map != X86_MAP_0F) return 1;
     int op = d->opcode, pf = d->mandatory, x = d->reg, dbl = pf == 0x66 || pf == 0xF2;
     int scalar = pf == 0xF3 || pf == 0xF2, esz = scalar ? (pf == 0xF2 ? 8 : 4) : 16;
-    if (op == 0xAE && d->mod == 3 && (d->reg & 7) >= 5) { E(b, 0xD5033BBFu); return 0; }   // LFENCE MFENCE SFENCE: DMB ISH
+    if (op == 0xAE && d->mod == 3 && (d->reg & 7) >= 5 && !(d->prefixes & X86_P_VEX)) { E(b, 0xD5033BBFu); return 0; }   // LFENCE MFENCE SFENCE: DMB ISH
+    if (op == 0xAE && d->mod != 3 && pf == 0 && ((d->reg & 7) == 2 || (d->reg & 7) == 3)) {
+        if ((d->reg & 7) == 2) {                                          // LDMXCSR: FPCR from it, flags from it
+            ea(b, d, next, 0); E(b, a64_ldr(4, T_A, T_ADDR, 0)); E(b, a64_str(4, T_A, XC, CTX_MXCSR));
+            mxcsr_to_fpcr(b, T_B, T_A); E(b, a64_msr_fpcr(T_B)); E(b, a64_msr_fpsr(XZR));
+        } else { mxcsr_sync(b); ea(b, d, next, 0); E(b, a64_str(4, T_A, T_ADDR, 0)); }   // STMXCSR
+        return 0;
+    }
     int sse_op = (op >= 0x10 && op <= 0x17) || (op >= 0x28 && op <= 0x2F) || (op >= 0x50 && op <= 0x7F) || op == 0xC2 ||
                  op == 0xC4 || op == 0xC5 || op == 0xC6 || op >= 0xD0;
     if (!sse_op) return 1;
@@ -201,10 +232,18 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
     case 0x58: case 0x59: case 0x5C: case 0x5E: case 0x51: {              // ADD MUL SUB DIV SQRT (ps pd ss sd)
         int s = xmm_rm(b, d, esz, next);
         if (op == 0x51) {
-            if (scalar) { E(b, a64_vmov(V_T, x)); E(b, dbl ? a64_ins_d(V_T, 0, s, 0) : a64_ins_s(V_T, 0, s, 0)); s = V_T; }
-            E(b, dbl ? a64_fsqrt2d(V_R, s) : a64_fsqrt4s(V_R, s));
+            if (scalar) E(b, dbl ? a64_fsqrtd(V_R, s) : a64_fsqrts(V_R, s));   // (scalar instructions: no flags from other lanes)
+            else E(b, dbl ? a64_fsqrt2d(V_R, s) : a64_fsqrt4s(V_R, s));
             E(b, a64_vmov(22, s));                                        // (nan_fix uses V_T to V_X)
             nan_fix(b, dbl, scalar, 22, -1, V_R);
+        } else if (scalar) {
+            switch (op) {
+            case 0x58: E(b, dbl ? a64_faddd(V_R, x, s) : a64_fadds(V_R, x, s)); break;
+            case 0x59: E(b, dbl ? a64_fmuld(V_R, x, s) : a64_fmuls(V_R, x, s)); break;
+            case 0x5C: E(b, dbl ? a64_fsubd(V_R, x, s) : a64_fsubs(V_R, x, s)); break;
+            case 0x5E: E(b, dbl ? a64_fdivd(V_R, x, s) : a64_fdivs(V_R, x, s)); break;
+            }
+            nan_fix(b, dbl, scalar, x, s, V_R);
         } else {
             switch (op) {
             case 0x58: E(b, dbl ? a64_fadd2d(V_R, x, s) : a64_fadd4s(V_R, x, s)); break;
@@ -220,7 +259,9 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
     case 0x52: case 0x53: {                                               // RSQRTPS/SS RCPPS/SS (estimate())
         if (pf == 0x66 || pf == 0xF2) return -1;
         int s = xmm_rm(b, d, esz, next);
+        E(b, a64_mrs_fpsr(T_B));                                         // (x86 raises no exceptions for these)
         estimate(b, V_R, s, op == 0x52);
+        E(b, a64_msr_fpsr(T_B));
         if (scalar) E(b, a64_ins_s(x, 0, V_R, 0)); else E(b, a64_vmov(x, V_R));
         return 0;
     }
@@ -235,9 +276,10 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
     }
     case 0xD0: {                                                          // ADDSUBPS/PD: even lanes subtract, odd lanes add
         if (pf != 0x66 && pf != 0xF2) return -1;
-        int s = xmm_rm(b, d, 16, next), dd = pf == 0x66;
-        E(b, dd ? a64_fsub2d(V_R, x, s) : a64_fsub4s(V_R, x, s)); E(b, dd ? a64_fadd2d(22, x, s) : a64_fadd4s(22, x, s));
-        lane_mask(b, V_T, dd ? 2 : 10, dd); E(b, a64_vbsl(V_T, 22, V_R)); E(b, a64_vmov(V_R, V_T));
+        int s = xmm_rm(b, d, 16, next), dd = pf == 0x66;                 // (x - s is x + -s exactly: one addition, one
+        lane_mask(b, V_T, dd ? 1 : 5, dd);                                //   set of flags)
+        mov_imm(b, S0, dd ? 0x8000000000000000ull : 0x8000000080000000ull); E(b, a64_dup2d(V_U, S0)); E(b, a64_vand(V_T, V_T, V_U));
+        E(b, a64_veor(22, s, V_T)); E(b, dd ? a64_fadd2d(V_R, x, 22) : a64_fadd4s(V_R, x, 22));
         nan_fix(b, dd, 0, x, s, V_R);
         E(b, a64_vmov(x, V_R));
         return 0;
@@ -265,19 +307,38 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
     }
     case 0x5D: case 0x5F: {                                               // MIN / MAX: a < b ? a : b, a > b ? a : b
         int s = xmm_rm(b, d, esz, next);
-        if (op == 0x5D) E(b, dbl ? a64_fcmgt2d(V_T, s, x) : a64_fcmgt4s(V_T, s, x));
-        else E(b, dbl ? a64_fcmgt2d(V_T, x, s) : a64_fcmgt4s(V_T, x, s));
+        int lt_a = op == 0x5D ? s : x, lt_b = op == 0x5D ? x : s;
+        E(b, scalar ? a64_fcmp_s(2, dbl, V_T, lt_a, lt_b) : dbl ? a64_fcmgt2d(V_T, lt_a, lt_b) : a64_fcmgt4s(V_T, lt_a, lt_b));
         E(b, a64_vbsl(V_T, x, s));
+        // (with DAZ the result is the flushed operand: FCMEQ sees FZ's zeros, which keep their sign)
+        E(b, a64_movi0(V_U)); E(b, scalar ? a64_fcmp_s(0, dbl, V_U, V_T, V_U) : dbl ? a64_fcmeq2d(V_U, V_T, V_U) : a64_fcmeq4s(V_U, V_T, V_U));
+        mov_imm(b, S0, dbl ? 0x7FFFFFFFFFFFFFFFull : 0x7FFFFFFFu); E(b, dbl ? a64_dup2d(V_W, S0) : a64_dup4s(V_W, S0));
+        E(b, a64_vand(V_U, V_U, V_W)); E(b, a64_vbic(V_T, V_T, V_U));
         if (scalar) E(b, dbl ? a64_ins_d(x, 0, V_T, 0) : a64_ins_s(x, 0, V_T, 0)); else E(b, a64_vmov(x, V_T));
         return 0;
     }
     case 0xC2: {                                                          // CMPPS/PD/SS/SD
         // The predicates: 32 with VEX (imm & 31; the upper 16 differ only in signalling, so imm & 15 here). Without VEX the SDM has 8 and
-        // reserves the rest; Rosetta 2 takes imm & 7 for CMPPS/CMPPD but imm & 15 for CMPSS/CMPSD, and so does this.
-        int s = xmm_rm(b, d, esz, next), p = (int)(d->imm & (scalar || (d->prefixes & X86_P_VEX) ? 15 : 7));
-        #define EQ_(dd, a_, b_) E(b, dbl ? a64_fcmeq2d(dd, a_, b_) : a64_fcmeq4s(dd, a_, b_))
-        #define GT_(dd, a_, b_) E(b, dbl ? a64_fcmgt2d(dd, a_, b_) : a64_fcmgt4s(dd, a_, b_))
-        #define GE_(dd, a_, b_) E(b, dbl ? a64_fcmge2d(dd, a_, b_) : a64_fcmge4s(dd, a_, b_))
+        // reserves the rest; Rosetta 2 takes imm & 7 for CMPPS/CMPPD but imm & 31 for CMPSS/CMPSD (bit 4: whether a QNaN
+        // signals, as with VEX), and so does this.
+        int s = xmm_rm(b, d, esz, next), imm5 = (int)(d->imm & ((d->prefixes & X86_P_VEX) || scalar ? 31 : 7)), p = imm5 & 15;
+        #define EQ_(dd, a_, b_) E(b, scalar ? a64_fcmp_s(0, dbl, dd, a_, b_) : dbl ? a64_fcmeq2d(dd, a_, b_) : a64_fcmeq4s(dd, a_, b_))
+        #define GT_(dd, a_, b_) E(b, scalar ? a64_fcmp_s(2, dbl, dd, a_, b_) : dbl ? a64_fcmgt2d(dd, a_, b_) : a64_fcmgt4s(dd, a_, b_))
+        #define GE_(dd, a_, b_) E(b, scalar ? a64_fcmp_s(1, dbl, dd, a_, b_) : dbl ? a64_fcmge2d(dd, a_, b_) : a64_fcmge4s(dd, a_, b_))
+        // Flags: ARM's EQ is quiet (raises invalid for SNaNs only), GT/GE signal (any NaN), as most predicates want. The
+        // others: an extra compare for its flags (signalling EQ, the constants), or ordered operands for a quiet order.
+        int sig = (p == 1 || p == 2 || p == 5 || p == 6 || p == 9 || p == 10 || p == 13 || p == 14) ^ (imm5 >= 16);
+        int ordering = p == 1 || p == 2 || p == 5 || p == 6 || p == 9 || p == 10 || p == 13 || p == 14;
+        if (sig && !ordering) GT_(V_U, x, s);                             // (EQ_OS ... TRUE_US: a signalling compare)
+        else if (!sig && (p == 11 || p == 15)) EQ_(V_U, x, s);            // (FALSE_OQ, TRUE_UQ: invalid for SNaNs)
+        int qx = x, qs = s;
+        if (!sig && ordering) {                                           // LT_OQ ... GT_OQ: NaN lanes compared as zeros,
+            EQ_(V_W, x, x); EQ_(V_X, s, s);                               //   then their result decided by the predicate
+            E(b, a64_vand(V_W, V_W, V_X));
+            E(b, a64_vand(22, x, V_W)); E(b, a64_vand(23, s, V_W)); qx = 22; qs = 23;
+        }
+        #define x qx
+        #define s qs
         #define ORD_(dd) do { EQ_(dd, x, x); EQ_(V_U, s, s); E(b, a64_vand(dd, dd, V_U)); } while (0)
         switch (p) {
         case 0: EQ_(V_R, x, s); break;                                    // EQ_OQ
@@ -297,6 +358,11 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
         case 14: GT_(V_R, x, s); break;                                   // GT_OS
         case 15: E(b, a64_movi0(V_R)); E(b, a64_vmvn(V_R, V_R)); break;   // TRUE_UQ
         }
+        #undef x
+        #undef s
+        if (!sig && ordering) {                                           // (unordered lanes: false, or true for the N.. ones)
+            if (p == 5 || p == 6 || p == 9 || p == 10) E(b, a64_vorn(V_R, V_R, V_W)); else E(b, a64_vand(V_R, V_R, V_W));
+        }
         #undef EQ_
         #undef GT_
         #undef GE_
@@ -307,7 +373,7 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
     case 0x2E: case 0x2F: {                                               // UCOMISS/SD COMISS/SD: ZF PF CF
         if (pf != 0 && pf != 0x66) return -1;
         int s = xmm_rm(b, d, pf ? 8 : 4, next);
-        E(b, pf ? a64_fcmpd(x, s) : a64_fcmps(x, s));
+        E(b, op == 0x2F ? (pf ? a64_fcmped(x, s) : a64_fcmpes(x, s)) : (pf ? a64_fcmpd(x, s) : a64_fcmps(x, s)));   // (COMIS: QNaNs signal too)
         E(b, a64_movz(ACC, 0, 0));
         E(b, a64_cset(S1, VS));                                           // unordered: ZF PF CF all set
         E(b, a64_cset(S0, EQ)); E(b, a64_orr(S0, S0, S1)); put_flag(b, S0, 6);
@@ -547,10 +613,12 @@ static int xlat_sse4(xlat_buf *b, const x86_insn *d, uint64_t next) {
     }
     if (d->map != X86_MAP_0F3A) return 1;
     switch (op) {
-    case 0x08: case 0x09: case 0x0A: case 0x0B: {                         // ROUNDPS/PD/SS/SD (imm bit 2: MXCSR's mode, nearest)
-        int dbl = op & 1, scalar = op >= 0x0A, mode = imm & 4 ? 0 : imm & 3;
+    case 0x08: case 0x09: case 0x0A: case 0x0B: {                         // ROUNDPS/PD/SS/SD (imm bit 2: MXCSR's mode)
+        int dbl = op & 1, scalar = op >= 0x0A, mode = imm & 4 ? 4 : imm & 3;
         int s = xmm_rm(b, d, scalar ? (dbl ? 8 : 4) : 16, next);
+        if (scalar) { E(b, a64_movi0(V_T)); E(b, dbl ? a64_ins_d(V_T, 0, s, 0) : a64_ins_s(V_T, 0, s, 0)); s = V_T; }   // (lane 0 alone: no flags from the rest)
         E(b, a64_frint(mode, dbl, V_R, s));
+        if (!(imm & 8)) E(b, a64_frint(5, dbl, V_U, s));                  // (precision not suppressed: inexact if not integral)
         if (scalar) E(b, dbl ? a64_ins_d(x, 0, V_R, 0) : a64_ins_s(x, 0, V_R, 0)); else E(b, a64_vmov(x, V_R));
         return 0;
     }
@@ -591,8 +659,8 @@ static int xlat_sse4(xlat_buf *b, const x86_insn *d, uint64_t next) {
     }
     case 0x40: case 0x41: {                                               // DPPS DPPD: (p0 + p1) + (p2 + p3), as x86 adds them
         int dbl = op == 0x41, s = xmm_rm(b, d, 16, next);
-        E(b, dbl ? a64_fmul2d(V_R, x, s) : a64_fmul4s(V_R, x, s)); nan_fix(b, dbl, 0, x, s, V_R);
-        lane_mask(b, V_T, imm >> 4, dbl); E(b, a64_vand(V_R, V_R, V_T));                  // (products left out: +0)
+        lane_mask(b, V_T, imm >> 4, dbl); E(b, a64_vand(22, x, V_T)); E(b, a64_vand(23, s, V_T));   // (products left out: +0 * +0)
+        E(b, dbl ? a64_fmul2d(V_R, 22, 23) : a64_fmul4s(V_R, 22, 23)); nan_fix(b, dbl, 0, 22, 23, V_R);
         if (!dbl) {
             E(b, a64_uzp1(2, 22, V_R, V_R)); E(b, a64_uzp2(2, 23, V_R, V_R)); E(b, a64_fadd4s(V_R, 22, 23)); nan_fix(b, 0, 0, 22, 23, V_R);
         }
@@ -675,7 +743,8 @@ static int vex_fma(xlat_buf *b, const x86_insn *d, uint64_t next) {
             c = 22;
         } else if (kind == 0xA || kind == 0xB || kind >= 0xE) { E(b, a64_fneg(dbl, 22, c)); c = 22; }   // a*b - c, -(a*b) - c
         if (neg_p) { E(b, a64_fneg(dbl, 29, m1)); m1 = 29; }              // -(a*b) as (-a)*b
-        E(b, a64_vmov(R, c)); E(b, a64_fmla(dbl, R, m1, m2));
+        if (scalar) E(b, a64_fmadd_sc(dbl, R, m1, m2, c));                // (scalar: no flags from the other lanes)
+        else { E(b, a64_vmov(R, c)); E(b, a64_fmla(dbl, R, m1, m2)); }
         int ops[3] = { m1, m2, c };
         nan_fixn(b, dbl, scalar, ops, 3, R);
     }
@@ -870,6 +939,7 @@ static int xlat_vex(xlat_buf *b, const x86_insn *d, uint64_t next) {
                                                 (op >= 0x58 && op <= 0x5F && op != 0x5B) || op == 0xC2);
     x86_insn e = *d;
     e.opsize = d->vex_w ? 8 : 4;
+    if (op == 0xAE) return d->mod != 3 && pf == 0 && !L && ((d->reg & 7) == 2 || (d->reg & 7) == 3) && !xlat_sse(b, &e, next) ? 0 : -1;   // VLDMXCSR VSTMXCSR
     if (op == 0x77) {                                                     // VZEROUPPER, VZEROALL
         E(b, a64_addi(S0, XC, CTX_YMMH));
         for (int i = 0; i < 16; i++) E(b, a64_stp(XZR, XZR, S0, 16 * i));
