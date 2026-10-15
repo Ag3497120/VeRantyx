@@ -1,0 +1,73 @@
+// The reference side of the differential test: built for x86-64 and run under Rosetta 2, it executes one instruction
+// at a time for real and reports the state after it. Reads dt_case records on stdin, writes dt_result records.
+// It writes x86 machine code at run time (a stub that loads the state, the instruction, a stub that stores it):
+// test tooling of the translator (TRANSLATOR.md).
+#include "difftest.h"
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+static uint8_t *code;
+static size_t at;
+static uint64_t host_rsp;
+static dt_state st_in, st_out;
+static sigjmp_buf jb;
+static volatile int signaled;
+
+static void b(uint8_t x) { code[at++] = x; }
+static void q(uint64_t v) { memcpy(code + at, &v, 8); at += 8; }
+static void d32(uint32_t v) { memcpy(code + at, &v, 4); at += 4; }
+static void mov_rax_imm(uint64_t v) { b(0x48); b(0xB8); q(v); }
+// mov reg, [rax + disp32]  /  mov [rax + disp32], reg
+static void ld(int reg, int32_t disp) { b(0x48 | (reg >= 8 ? 4 : 0)); b(0x8B); b(0x80 | (reg & 7) << 3); d32((uint32_t)disp); }
+static void st(int reg, int32_t disp) { b(0x48 | (reg >= 8 ? 4 : 0)); b(0x89); b(0x80 | (reg & 7) << 3); d32((uint32_t)disp); }
+
+static void on_signal(int sig) { signaled = sig; siglongjmp(jb, 1); }
+
+int main(void) {
+    code = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
+    uint8_t *buf = mmap((void *)DT_BUF, DT_BUF_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    if (code == MAP_FAILED || buf != (uint8_t *)DT_BUF) { fprintf(stderr, "ref_x86: mmap failed\n"); return 1; }
+    // (signals run on a stack of their own: the test's RSP points into the test memory)
+    static uint8_t altstack[65536];
+    stack_t ss = { .ss_sp = altstack, .ss_size = sizeof altstack };
+    sigaltstack(&ss, NULL);
+    struct sigaction sa = { .sa_handler = on_signal };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_NODEFER | SA_ONSTACK;
+    sigaction(SIGFPE, &sa, NULL); sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL);
+    static dt_case c;
+    static dt_result r;
+    while (fread(&c, sizeof c, 1, stdin) == 1) {
+        at = 0;
+        b(0x53); b(0x55); b(0x41); b(0x54); b(0x41); b(0x55); b(0x41); b(0x56); b(0x41); b(0x57);   // push rbx rbp r12-r15
+        mov_rax_imm((uint64_t)&host_rsp); b(0x48); b(0x89); b(0x20);                              // mov [rax], rsp
+        mov_rax_imm((uint64_t)&st_in);
+        b(0xFF); b(0xB0); d32(128); b(0x9D);                                                      // push [rax+128]; popfq
+        for (int reg = 1; reg < 16; reg++) ld(reg, reg * 8);
+        b(0x48); b(0x8B); b(0x00);                                                                // mov rax, [rax]
+        memcpy(code + at, c.code, c.len); at += c.len;                                            // the instruction
+        b(0x48); b(0xA3); q((uint64_t)&st_out.gpr[0]);                                            // mov [moffs], rax
+        b(0x9C);                                                                                  // pushfq (test stack)
+        mov_rax_imm((uint64_t)&st_out);
+        b(0x8F); b(0x80); d32(128);                                                               // pop [rax+128]
+        for (int reg = 1; reg < 16; reg++) st(reg, reg * 8);
+        mov_rax_imm((uint64_t)&host_rsp); b(0x48); b(0x8B); b(0x20);                              // mov rsp, [rax]
+        b(0x41); b(0x5F); b(0x41); b(0x5E); b(0x41); b(0x5D); b(0x41); b(0x5C); b(0x5D); b(0x5B); b(0xC3);
+        st_in = c.in;
+        memset(&st_out, 0, sizeof st_out);
+        memcpy(buf, c.mem, DT_BUF_SIZE);
+        signaled = 0;
+        if (!sigsetjmp(jb, 1)) ((void (*)(void))code)();
+        r.out = signaled ? st_in : st_out;
+        r.out.fault = signaled == SIGFPE ? 1 : signaled ? 2 : 0;
+        memcpy(r.mem, buf, DT_BUF_SIZE);
+        if (fwrite(&r, sizeof r, 1, stdout) != 1) return 1;
+        fflush(stdout);
+    }
+    return 0;
+}

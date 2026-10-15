@@ -97,6 +97,18 @@ build/x86dec_check: translator/x86dec.c translator/x86dec.h translator/x86dec_ch
 	@mkdir -p build
 	$(HOSTCC) translator/x86dec.c translator/x86dec_check.c -o $@
 
+# The differential test (TRANSLATOR.md): ref_x86 runs instructions for real under Rosetta 2, difftest translates them
+# and compares. `make translator-check` runs 3000 cases per form; make check a quick 200.
+build/ref_x86: translator/diff/ref_x86.c translator/diff/difftest.h
+	@mkdir -p build
+	$(CC) -arch x86_64 -O1 -Wall -o $@ translator/diff/ref_x86.c
+build/difftest: translator/diff/difftest.c translator/diff/difftest.h translator/xlat.c translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h
+	@mkdir -p build
+	$(HOSTCC) -Wno-missing-field-initializers translator/x86dec.c translator/xlat.c translator/diff/difftest.c -o $@
+translator-check: build/ref_x86 build/difftest build/x86dec_test
+	build/x86dec_test
+	build/difftest build/ref_x86 3000
+
 build/hvprobe: translator/hvprobe.c translator/hypervisor.entitlements
 	@mkdir -p build
 	$(HOSTCC) translator/hvprobe.c -framework Hypervisor -o $@
@@ -182,12 +194,13 @@ vr-check: build/vxrt
 # The tests' C: drive and registry live in build/root, not in ~/.vxrt.
 check: export VXRT_ROOT = build/root
 check: export VXRT_NO_ACTIVATE = 1
-check: all build/x86dec_test build/x86dec_check
+check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest
 	python3 ../tools/vxrt_games.py check
 	python3 ../tools/vxrt_agents.py check
 	python3 ../tools/vxrt_tune.py --selftest
 	python3 ../tools/vxrt_playtest.py --selftest
 	build/x86dec_test
+	build/difftest build/ref_x86 200
 	build/vxrt build/hello_k32.exe
 	build/vxrt build/hello_crt.exe one "two words"
 	build/vxrt build/threads.exe
@@ -226,4 +239,4 @@ bench: build/vxrt build/drawbench.exe
 clean:
 	rm -rf build
 
-.PHONY: vr-check all tests check bench clean shaders
+.PHONY: vr-check all tests check bench clean shaders translator-check

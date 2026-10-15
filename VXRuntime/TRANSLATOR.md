@@ -75,6 +75,15 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   (2026-10-15): 109,193,188 instructions, 101 differ, all of them data inside code sections that LLVM reads as
   APX/REX2 instructions (`d5` after a prefix; no Apple-era x86 code uses APX) plus `66 E9` (`jmp` with an operand-size
   prefix, which LLVM decodes as AMD does, rel16, and the decoder as Intel does, rel32).
+- **Translation vs. Rosetta: phase 2a result (2026-10-15).** `build/difftest build/ref_x86 N` (`make
+  translator-check`; 200 per form in `make check`): 154 instruction forms (ALU in all six encodings, group 1, TEST,
+  MOV/MOVZX/MOVSX/MOVSXD/LEA/XCHG, IMUL in three forms, MUL/IMUL/DIV/IDIV, NOT/NEG/INC/DEC, ROL/ROR/SHL/SHR/SAR by
+  1/imm8/CL, PUSH/POP, CLC/STC/CMC, LAHF/SAHF, CMOVcc, SETcc, BSWAP, BSF/BSR, TZCNT/LZCNT/POPCNT, BT/BTS/BTR/BTC,
+  XADD, CMPXCHG) with 8/16/32/64-bit operands, REX and high-byte registers, register and memory operands: 4 seeds
+  x 3000 cases per form, 1,848,000 cases, all registers, defined flags, memory and #DE faults identical. Where
+  Rosetta 2 differs from a plain reading of the SDM the translator follows Rosetta: a 32-bit shift or rotate by 0
+  still clears the upper half; MOVSXD sign-extends to 64 bits with any operand size; CMPXCHG sets flags as
+  destination - accumulator and clears a 32-bit accumulator's (and, when unequal, register destination's) upper half.
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.
@@ -87,7 +96,7 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
 |---|---|
 | 0 Measure | census, CPU features, TSO and exit cost (above) — done |
 | 1 Decoder | lengths of every instruction in the four apps match LLVM (except data LLVM reads as APX) — done |
-| 2 Integer translator + differential tests | integer and flag instructions match Rosetta on random inputs; small PE tests run translated in-process |
+| 2 Integer translator + differential tests | integer and flag instructions match Rosetta on random inputs (2a, done: 154 forms); control flow, blocks, string instructions, RCL/RCR, SHLD/SHRD, atomics with LSE (2b); small PE tests run translated in-process |
 | 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs) |
 | 4 Runtime on ARM64 + execution environment | `make check` passes translated; in-process vs. vCPU measured on SteamVR and a game |
 | 5 Games | SteamVR, The Lab (Mono JIT), Earth, Alyx at level `controls` with fps at least Rosetta's |
