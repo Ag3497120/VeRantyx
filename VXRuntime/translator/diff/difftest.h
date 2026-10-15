@@ -14,6 +14,10 @@ typedef struct {
     uint32_t mxcsr;
     uint32_t pad;
     uint8_t ymm_hi[16][16];                 // the upper halves of YMM0-15
+    uint16_t fcw, fsw;                      // x87: control and status words
+    uint8_t ftag;                           //   abridged tags (bit r: physical register r in use)
+    uint8_t pad2[3];
+    uint8_t st[8][10];                      //   ST(0)-ST(7), 80 bits each
 } dt_state;
 enum { DT_XMM = 144, DT_MXCSR = 400, DT_YMMH = 408 };   // offsets in dt_state
 

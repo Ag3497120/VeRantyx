@@ -1,6 +1,7 @@
 // x86-64 -> ARM64: general-purpose integer instructions (phase 2). See xlat.h for the register convention.
 #include "xlat.h"
 #include "a64.h"
+#include "x87.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -202,12 +203,14 @@ static void call_helper_r(xlat_buf *b, uint32_t op, int op_reg, int val) {
     E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
 }
 static void call_helper(xlat_buf *b, uint32_t op, int val) { call_helper_r(b, op, -1, val); }
-enum { H_MUL = 1, H_IMUL, H_DIV, H_IDIV, H_RCL, H_RCR };       // op = kind | size << 8 | count << 16
+enum { H_MUL = 1, H_IMUL, H_DIV, H_IDIV, H_RCL, H_RCR, H_X87, H_FXSAVE, H_FXRSTOR };   // op = kind | size << 8 | count << 16 (x87: opcode, ModRM)
 void xlat_helper(x86_ctx *c) {
     int kind = (int)(c->helper_op & 0xFF), size = (int)(c->helper_op >> 8 & 0xFF), n = size * 8;
     uint64_t mask = n == 64 ? ~0ull : (1ull << n) - 1, v = c->helper_val & mask;
     uint64_t *ax = &c->gpr[0], *dx = &c->gpr[2];
     #define SET(reg, val) do { if (size == 4) *(reg) = (uint32_t)(val); else *(reg) = (*(reg) & ~mask) | ((val) & mask); } while (0)
+    if (kind == H_X87) { xlat_x87(c, (uint32_t)(c->helper_op >> 8 & 0xFF), (uint32_t)(c->helper_op >> 16 & 0xFF), c->helper_val); return; }
+    if (kind == H_FXSAVE || kind == H_FXRSTOR) { xlat_fxsave(c, c->helper_val, kind == H_FXRSTOR); return; }
     if (kind == H_MUL || kind == H_IMUL) {
         if (size == 1) {
             uint16_t r = kind == H_MUL ? (uint16_t)((uint8_t)*ax * (uint8_t)v) : (uint16_t)((int8_t)*ax * (int8_t)v);
@@ -645,6 +648,13 @@ static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
             E(b, a64_bfi(0, T_A, 8, 8));
             return 0;
         }
+        if (op >= 0xD8 && op <= 0xDF) {                                  // x87: in software (x87.c)
+            if (!x87_supported(op, d->modrm)) return -1;
+            if (d->mod != 3) ea(b, d, next, 0);
+            call_helper(b, H_X87 | (uint32_t)op << 8 | (uint32_t)d->modrm << 16, d->mod != 3 ? T_ADDR : XZR);
+            return 0;
+        }
+        if (op == 0x9B) return 0;                                        // FWAIT (no #MF: nothing waits)
         if (op == 0x9E) {                                                // SAHF
             E(b, a64_ubfx(T_A, 0, 8, 8)); mov_imm(b, S0, 0xD5); E(b, a64_and(T_A, T_A, S0));
             E(b, a64_bic(XF, XF, S0)); E(b, a64_orr(XF, XF, T_A));

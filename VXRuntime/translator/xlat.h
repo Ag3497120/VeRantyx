@@ -26,9 +26,13 @@ typedef struct {
     uint8_t ymm_hi[16][16];      // the upper halves of YMM0-15 (AVX, phase 3b)
     uint32_t mxcsr;
     uint32_t pad2;
+    uint16_t fcw, fsw;           // x87 control and status words (TOP: FSW bits 11-13)
+    uint8_t ftag;                // x87: bit r set while physical register r holds a value (FXSAVE's abridged tags)
+    uint8_t pad3[3];
+    uint8_t st[8][16];           // x87 physical registers R0-R7: 64-bit significand, then sign and exponent (x87.c)
 } x86_ctx;
 enum { CTX_FLAGS = 128, CTX_RIP = 136, CTX_FS = 144, CTX_GS = 152, CTX_FAULT = 160, CTX_HELPER_OP = 168, CTX_HELPER_VAL = 176,
-       CTX_XMM = 192, CTX_YMMH = 448, CTX_MXCSR = 704 };
+       CTX_XMM = 192, CTX_YMMH = 448, CTX_MXCSR = 704, CTX_FCW = 712 };
 enum { X86_FAULT_DE = 1 };
 // Registers of translated code that hold more than scratch values: x25 is the string instructions' step.
 

@@ -102,9 +102,18 @@ build/x86dec_check: translator/x86dec.c translator/x86dec.h translator/x86dec_ch
 build/ref_x86: translator/diff/ref_x86.c translator/diff/difftest.h
 	@mkdir -p build
 	$(CC) -arch x86_64 -O1 -Wall -o $@ translator/diff/ref_x86.c
-build/difftest: translator/diff/difftest.c translator/diff/difftest.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h
+build/difftest: translator/diff/difftest.c translator/diff/difftest.h translator/xlat.c translator/xlat_sse.inc translator/xlat.h translator/a64.h translator/x86dec.c translator/x86dec.h translator/x87.c translator/x87.h
 	@mkdir -p build
-	$(HOSTCC) -Wno-missing-field-initializers translator/x86dec.c translator/xlat.c translator/diff/difftest.c -o $@
+	$(HOSTCC) -Wno-missing-field-initializers translator/x86dec.c translator/xlat.c translator/x87.c translator/diff/difftest.c -o $@
+# x87 transcendentals against exact values (slow: decimal arithmetic): `make x87-exact`
+build/x87_ref: translator/diff/x87_ref.c
+	@mkdir -p build
+	$(CC) -arch x86_64 -O1 -Wall -o $@ translator/diff/x87_ref.c
+build/x87_ours: translator/diff/x87_ours.c translator/x87.c translator/x87.h translator/xlat.h
+	@mkdir -p build
+	$(HOSTCC) -O1 -Wall -Itranslator -o $@ translator/diff/x87_ours.c translator/x87.c
+x87-exact: build/x87_ref build/x87_ours
+	python3 translator/diff/x87_exact.py build/x87_ref build/x87_ours 500
 translator-check: build/ref_x86 build/difftest build/x86dec_test
 	build/x86dec_test
 	build/difftest build/ref_x86 3000

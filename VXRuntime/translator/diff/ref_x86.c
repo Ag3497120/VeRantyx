@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 static uint8_t *code, *stub;
+static _Alignas(16) uint8_t fx_in[512], fx_out[512];   // the x87 state, through FXRSTOR64 / FXSAVE64
 static size_t at;
 static uint64_t host_rsp;
 static dt_state st_in, st_out;
@@ -54,6 +55,7 @@ int main(void) {
         code = stub; at = 0;
         b(0x53); b(0x55); b(0x41); b(0x54); b(0x41); b(0x55); b(0x41); b(0x56); b(0x41); b(0x57);   // push rbx rbp r12-r15
         mov_rax_imm((uint64_t)&host_rsp); b(0x48); b(0x89); b(0x20);                              // mov [rax], rsp
+        mov_rax_imm((uint64_t)fx_in); b(0x48); b(0x0F); b(0xAE); b(0x08);                        // fxrstor64 [rax]
         mov_rax_imm((uint64_t)&st_in);
         b(0xFF); b(0xB0); d32(128); b(0x9D);                                                      // push [rax+128]; popfq
         for (int reg = 1; reg < 16; reg++) ld(reg, reg * 8);
@@ -87,17 +89,28 @@ int main(void) {
         }
         b(0xC5); b(0xF8); b(0x77);                                                                // vzeroupper
         b(0x0F); b(0xAE); b(0x98); d32(DT_MXCSR);                                                 // stmxcsr [rax+off]
+        mov_rax_imm((uint64_t)fx_out); b(0x48); b(0x0F); b(0xAE); b(0x00);                       // fxsave64 [rax]
+        b(0x9B); b(0xDB); b(0xE3);                                                                // finit (for the host)
         mov_rax_imm((uint64_t)&host_rsp); b(0x48); b(0x8B); b(0x20);                              // mov rsp, [rax]
         b(0x41); b(0x5F); b(0x41); b(0x5E); b(0x41); b(0x5D); b(0x41); b(0x5C); b(0x5D); b(0x5B); b(0xC3);
         mprotect(stub, 4096, PROT_READ | PROT_EXEC);
         mprotect(prog, DT_PROG_MAX + 4096, PROT_READ | PROT_EXEC);
         st_in = c.in;
         memset(&st_out, 0, sizeof st_out);
+        memset(fx_in, 0, sizeof fx_in);
+        memcpy(fx_in, &st_in.fcw, 2); memcpy(fx_in + 2, &st_in.fsw, 2); fx_in[4] = st_in.ftag;
+        uint32_t mm = 0xFFFF; memcpy(fx_in + 24, &st_in.mxcsr, 4); memcpy(fx_in + 28, &mm, 4);
+        for (int i = 0; i < 8; i++) memcpy(fx_in + 32 + 16 * i, st_in.st[i], 10);
+        memcpy(fx_in + 160, st_in.xmm, 256);
         memcpy(buf, c.mem, DT_BUF_SIZE);
         signaled = 0;
         alarm(2);                                              // (a program that does not end)
         if (!sigsetjmp(jb, 1)) ((void (*)(void))stub)();
         alarm(0);
+        if (!signaled) {
+            memcpy(&st_out.fcw, fx_out, 2); memcpy(&st_out.fsw, fx_out + 2, 2); st_out.ftag = fx_out[4];
+            for (int i = 0; i < 8; i++) memcpy(st_out.st[i], fx_out + 32 + 16 * i, 10);
+        }
         r.out = signaled ? st_in : st_out;
         r.out.fault = signaled == SIGFPE ? 1 : signaled == SIGALRM ? 4 : signaled ? 2 : 0;
         memcpy(r.mem, buf, DT_BUF_SIZE);

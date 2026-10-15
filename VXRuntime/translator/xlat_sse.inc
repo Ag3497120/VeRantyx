@@ -160,6 +160,13 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
     int op = d->opcode, pf = d->mandatory, x = d->reg, dbl = pf == 0x66 || pf == 0xF2;
     int scalar = pf == 0xF3 || pf == 0xF2, esz = scalar ? (pf == 0xF2 ? 8 : 4) : 16;
     if (op == 0xAE && d->mod == 3 && (d->reg & 7) >= 5 && !(d->prefixes & X86_P_VEX)) { E(b, 0xD5033BBFu); return 0; }   // LFENCE MFENCE SFENCE: DMB ISH
+    if (op == 0xAE && d->mod != 3 && pf == 0 && (d->reg & 7) <= 1 && !(d->prefixes & X86_P_VEX)) {   // FXSAVE FXRSTOR
+        if (!(d->reg & 7)) mxcsr_sync(b);
+        ea(b, d, next, 0);
+        call_helper(b, (d->reg & 7) ? H_FXRSTOR : H_FXSAVE, T_ADDR);
+        if (d->reg & 7) { E(b, a64_ldr(4, T_A, XC, CTX_MXCSR)); mxcsr_to_fpcr(b, T_B, T_A); E(b, a64_msr_fpcr(T_B)); E(b, a64_msr_fpsr(XZR)); }
+        return 0;
+    }
     if (op == 0xAE && d->mod != 3 && pf == 0 && ((d->reg & 7) == 2 || (d->reg & 7) == 3)) {
         if ((d->reg & 7) == 2) {                                          // LDMXCSR: FPCR from it, flags from it
             ea(b, d, next, 0); E(b, a64_ldr(4, T_A, T_ADDR, 0)); E(b, a64_str(4, T_A, XC, CTX_MXCSR));

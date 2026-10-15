@@ -150,6 +150,38 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
   ARM's FMA raises invalid for 0 * inf + QNaN, x86 does not. Rosetta 2 detail matched: CMPSS/CMPSD without VEX take
   bit 4 of imm too (signalling or quiet, as VEX's 32 predicates). Rosetta 2 deviation found (counted): it raises the
   flags of both the addition and the subtraction in every lane of VFMADDSUB / VFMSUBADD.
+- **Phase 3c, x87 (2026-10-15).** x87 instructions run in software (`translator/x87.c`, called as a helper: x87 is 0.03 %
+  of the games' instructions, mostly in the C runtime), exact as the SDM describes the unit: 80-bit values with 64-bit
+  significands (128-bit intermediates, so every result is rounded once), precision and rounding control, the stack
+  with overflow and underflow, all six exception flags and C0-C3, loads and stores of every format (single, double,
+  extended, 16/32/64-bit integers, BCD), FPREM/FPREM1 (partial remainders reduce the exponent difference to 32 + d mod
+  32, as Rosetta 2 does), FXTRACT, FSCALE, FRNDINT, the constants rounded as RC says, environments, FNSAVE/FRSTOR,
+  FXSAVE/FXRSTOR. Unmasked exceptions only set ES and B (#MF is not raised). The differential test loads and saves
+  the x87 state through FXRSTOR64/FXSAVE64 in the reference and draws random states (any TOP and tags, zeros,
+  infinities, NaNs with payloads, denormals, unnormals, integers, halves, extreme exponents; any PC and RC); 133 x87
+  forms plus FXSAVE/FXRSTOR, with all the earlier forms: 3 seeds x 2,805,000 cases (932 forms), identical but for one
+  case the test itself misfiled (a DAZ-alone flag difference from a flushed partial result of DPPS: now counted with the
+  other FTZ/DAZ-alone cases, and that form rerun). Measured and matched where the SDM leaves a choice: an empty register reads
+  as the indefinite NaN and the instruction goes on with it (NaN rules: unsupported formats first, then a QNaN over an
+  SNaN, then the larger significand); a single or double SNaN operand stays an SNaN for those rules; DE of a
+  denormal single or double comes before divide-by-zero, an extended one's after; FCMOVcc underflows on an empty ST(i)
+  whatever the condition; FIST has no DE. Rosetta 2 deviations found (the translator follows x86; counted): loads
+  (FLD, FILD, FLD1 ...) keep C1 where the SDM clears it; FBLD does not check for a stack overflow; the undocumented
+  aliases (FSTP1, FCOM2, FXCH4, FFREEP, ...) raise SIGILL; after FXRSTOR every register in use is tagged "zero" in
+  FNSTENV's tag word; a popped register holds the indefinite NaN (its content means nothing either way); a denormal divisor or an
+  exponent difference of exactly 63 gives FPREM/FPREM1 results larger than the divisor; FSQRT of an exact square is
+  1 ulp off (and inexact) when rounding up or down.
+  The transcendental instructions (FSIN, FCOS, FSINCOS, FPTAN, FPATAN, F2XM1, FYL2X, FYL2XP1) compute with 128-bit
+  significands and round once, so their results are correctly rounded (x86 only promises about 1 ulp, and processors
+  differ); FSIN, FCOS, FSINCOS and FPTAN reduce their argument by Intel's 66-bit pi exactly, as x86 processors do (and
+  Rosetta 2: with that reduction, its results are within 1-2 ulps of the exact ones). `make x87-exact` compares both
+  with exact values (`translator/diff/x87_exact.py`, decimal arithmetic) in every rounding mode: VXRuntime's are all
+  correctly rounded (400-800 per instruction and mode; earlier runs 1,500-3,000 each); Rosetta's 50-99 %, off by 1-2
+  ulps otherwise, and FYL2XP1's mostly far off (it loses the precision this instruction exists for). In the
+  differential test the transcendentals' values count as equal within 1 ulp of Rosetta's (2 when rounding up or
+  down) with C1 left out; everything else is exact, and F2XM1 outside [-1, 1] (undefined on x86) is not compared.
+  More Rosetta 2 deviations found there: F2XM1 and FPATAN raise no PE (nor UE) for small arguments, though the
+  results are inexact.
 - **Translation vs. Rosetta, while Rosetta exists.** Every instruction form the census finds is run with random
   register, flag and memory inputs twice: natively on x86 under Rosetta (today's VXRuntime) and translated, and the
   results (registers, flags, memory, exceptions) must match. Keep a Mac on macOS 26/27 for this.
@@ -163,7 +195,7 @@ CPU: since macOS 15 `HV_SYS_REG_ACTLR_EL1` exposes the EnTSO bit. Measured with 
 | 0 Measure | census, CPU features, TSO and exit cost (above) — done |
 | 1 Decoder | lengths of every instruction in the four apps match LLVM (except data LLVM reads as APX) — done |
 | 2 Integer translator + differential tests | integer and flag instructions match Rosetta on random inputs (2a, done: 154 forms); control flow, blocks, string instructions, RCL/RCR, SHLD/SHRD, atomics with LSE (2b, done: 224 forms and random programs); small PE tests run translated in-process (with phase 4) |
-| 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs): 3a SSE/SSE2 done (128 forms); 3b AVX/AVX2/FMA/SSE3-4.1/AES done (785 forms with 3a's); 3c MXCSR modes and flags done; x87 |
+| 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs): 3a SSE/SSE2 done (128 forms); 3b AVX/AVX2/FMA/SSE3-4.1/AES done (785 forms with 3a's); 3c MXCSR modes and flags, x87 (with the transcendentals) done |
 | 4 Runtime on ARM64 + execution environment | `make check` passes translated; in-process vs. vCPU measured on SteamVR and a game |
 | 5 Games | SteamVR, The Lab (Mono JIT), Earth, Alyx at level `controls` with fps at least Rosetta's |
 
