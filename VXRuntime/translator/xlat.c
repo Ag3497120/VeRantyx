@@ -150,11 +150,24 @@ static void wr_rm(xlat_buf *b, const x86_insn *d, int t, int size) {
 }
 
 // ---- flags ---------------------------------------------------------------------------------------------------------------
+// Rule (lazy flags): the last instruction to set the flags, whose flags only code past where the look-ahead stops (a
+// RET, an indirect branch) may read, records its operands and result (ctx->pend_*) and sets x27 bit 3 (reserved in
+// EFLAGS, never set otherwise) instead of computing them. A block's first instruction that reads the flags or writes
+// only some of them computes them first (pending_check: BL the engine's stub, xlat_flags_stub), as does anything that
+// leaves translated code; merging computed flags (merge_flags) clears the bit with them, at no cost (every writer of
+// all six merges its flags, or calls a helper after pending_check). TRANSLATOR.md, "Rules".
+enum { PEND_BIT = 3 };
+static void reloc(xlat_buf *b, uint32_t kind);
+static void pending_check(xlat_buf *b) {
+    if (!b->lazy_flags) return;
+    E(b, 0x36180000u | 2u << 5 | XF);                                     // TBZ x27, #3, over the BL
+    reloc(b, XR_FLAGS); E(b, 0);
+}
 static void put_flag(xlat_buf *b, int bitreg, int pos) { E(b, a64_orr_lsl(ACC, ACC, bitreg, pos)); }
 static void flag_bit(xlat_buf *b, int d, int n, int pos) { E(b, a64_ubfx(d, n, pos, 1)); }
 // Merges ACC into EFLAGS: the bits in mask are replaced.
 static void merge_flags(xlat_buf *b, uint32_t mask) {
-    mov_imm(b, S0, mask);
+    mov_imm(b, S0, mask | 1u << PEND_BIT);                               // (pending flags: these are now computed)
     E(b, a64_bic(XF, XF, S0));
     E(b, a64_orr(XF, XF, ACC));
 }
@@ -179,6 +192,14 @@ enum { K_ADD, K_SUB, K_LOGIC };
 // (b->dead_flags: written again before any read) are not computed.
 static void flags_arith(xlat_buf *b, int kind, int size, int keep_cf) {
     uint32_t want = (keep_cf ? F_ARITH & ~F_CF : F_ARITH) & ~b->dead_flags;
+    if (b->lazy_record && !keep_cf) {                                    // (lazy flags: the record, x27's six left as they are)
+        // (STR, not STP: CTX_PEND is past STP's reach of 504 bytes)
+        E(b, a64_str(8, T_A, XC, CTX_PEND)); E(b, a64_str(8, T_B, XC, CTX_PEND + 8)); E(b, a64_str(8, T_R, XC, CTX_PEND + 16));
+        E(b, a64_movz(S0, (uint16_t)(kind * 4 + log2s_(size)), 0)); E(b, a64_str(8, S0, XC, CTX_PEND + 24));
+        E(b, 0xB27D037Bu);                                                // ORR x27, x27, #8
+        b->lazy_done = 1;
+        return;
+    }
     if (!want) return;
     int msb = bits(size) - 1;
     E(b, a64_movz(ACC, 0, 0));
@@ -223,6 +244,7 @@ static void call_helper_r(xlat_buf *b, uint32_t op, int op_reg, int val) {
     if (op_reg >= 0) E(b, a64_str(8, op_reg, XC, CTX_HELPER_OP));
     for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_stpq(r, r + 1, XC, CTX_XMM + r * 16));
+    pending_check(b);
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
     if (op_reg < 0) { mov_imm(b, S0, op); E(b, a64_str(8, S0, XC, CTX_HELPER_OP)); }
     E(b, a64_mov(0, XC));
@@ -772,7 +794,7 @@ static void mxcsr_sync(xlat_buf *b) {
 // registers themselves, without the scratch registers. (Not for the instruction a Jcc is fused with: b->keep_operands.)
 static int fast(xlat_buf *b, const x86_insn *d, uint64_t next) {
     int op = d->opcode, sz = d->opsize, g = d->reg & 7, rm = d->rm, reg = d->reg;
-    if (b->keep_operands || (d->prefixes & (X86_P_VEX | X86_P_EVEX | X86_P_LOCK)) || (sz != 4 && sz != 8)) return 0;
+    if (b->keep_operands || b->lazy_record || (d->prefixes & (X86_P_VEX | X86_P_EVEX | X86_P_LOCK)) || (sz != 4 && sz != 8)) return 0;
     #define W(i) (sz == 8 ? (i) : a64_w32(i))
     if (d->map == X86_MAP_1 && op == 0x8D && d->mod != 3 && !(d->prefixes & X86_P_ADDRSIZE)) {   // LEA: into the register itself
         int32_t disp = d->disp, from = reg;
@@ -1599,26 +1621,30 @@ static int no_memory(const x86_insn *d) {
 
 // The flags that may be read from r on, decoding only within [lo, hi) (code known to be mapped: a successor elsewhere
 // counts as reading all, and so does the address the engine returns to C at).
-static uint16_t flags_read_at(uint64_t r, uint64_t lo, uint64_t hi, uint64_t stop) {
-    uint16_t want = F_ARITH, read = 0;
+// known: only what the code looked at reads; where it stops looking (a RET, an indirect branch, the page's end) nothing
+// is counted (lazy flags: code there computes pending flags before it touches them).
+static uint16_t flags_read_at(uint64_t r, uint64_t lo, uint64_t hi, uint64_t stop, int known) {
+    uint16_t want = F_ARITH, read = 0, unseen = known ? 0 : 0xFFFF;
     for (int k = 0; k < 16 && want; k++) {
-        if (r < lo || r + 15 > hi || r == stop) return read | want;
+        if (r < lo || r + 15 > hi || r == stop) return read | (want & unseen);
         x86_insn d;
-        if (!x86_decode((const uint8_t *)(uintptr_t)r, 15, &d)) return read | want;
+        if (!x86_decode((const uint8_t *)(uintptr_t)r, 15, &d)) return read | (want & unseen);
         fx f = flag_fx(&d);
         if (is_jmp_call(&d)) { r += d.len + (uint64_t)d.imm; continue; }   // (JMP, CALL: on at the target)
+        if (known && d.map == X86_MAP_1 && (d.opcode == 0xC3 || d.opcode == 0xC2 || (d.opcode == 0xFF && ((d.reg & 7) == 2 || (d.reg & 7) == 4)))) return read;
         read |= f.rd & want;
         want &= (uint16_t)~f.wr;
-        if (is_branch(&d)) return read | want;                            // (what comes after: not looked at)
+        if (is_branch(&d)) return read | (want & unseen);                 // (what comes after: not looked at)
         r += d.len;
     }
-    return read | want;
+    return read | (want & unseen);
 }
 
 void xlat_block_native(xlat_buf *b, void (*fn)(x86_ctx *)) {
     E(b, a64_str(8, XS, XC, CTX_RAS));                                    // (calls back into x86 code go on in the ring)
     for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_stpq(r, r + 1, XC, CTX_XMM + r * 16));
+    pending_check(b);
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
     E(b, a64_mov(0, XC));
     mov_imm(b, S0, (uint64_t)(uintptr_t)fn);
@@ -1640,6 +1666,7 @@ void xlat_block_native_defer(xlat_buf *b, void (*fn)(x86_ctx *), uint64_t desc, 
     E(b, a64_str(8, XS, XC, CTX_RAS));
     for (int r = 0; r < 16; r += 2) E(b, a64_stp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_stpq(r, r + 1, XC, CTX_XMM + r * 16));
+    pending_check(b);
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
     E(b, a64_mov(0, XC));
     mov_imm(b, 1, desc);
@@ -1688,7 +1715,7 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
     uint64_t last = rip;
     for (int i = 0; i + 1 < n; i++) last += ins[i].len;
     uint64_t lo = rip & ~0x3FFFull, hi = n ? ((last + ins[n - 1].len - 1) | 0x3FFF) + 1 : 0;
-    uint16_t out = F_ARITH;
+    uint16_t out = F_ARITH, out_k = 0;                                  // (out_k: what code looked at reads, lazy flags)
     int fuse_p = -1, fuse_k = 0, fuse_sz = 0, fuse_cc = 0;
     if (n && b->check_bytes) {                                            // (code that may change under us: its bytes
         uint64_t len = last + ins[n - 1].len - rip, at = 0;               //  first, and nothing read past them)
@@ -1718,9 +1745,11 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         int t = trap(&probe, l, last);
         free(probe.code);
         if (t) out = F_ARITH;
-        else if (is_jcc(l)) out = flags_read_at(target, lo, hi, b->stop) | flags_read_at(next, lo, hi, b->stop);
-        else if (is_jmp_call(l)) out = flags_read_at(target, lo, hi, b->stop);
-        else if (n == max_insns && !is_branch(l)) out = flags_read_at(next, lo, hi, b->stop);
+        else if (is_jcc(l)) {
+            out = flags_read_at(target, lo, hi, b->stop, 0) | flags_read_at(next, lo, hi, b->stop, 0);
+            out_k = flags_read_at(target, lo, hi, b->stop, 1) | flags_read_at(next, lo, hi, b->stop, 1);
+        } else if (is_jmp_call(l)) { out = flags_read_at(target, lo, hi, b->stop, 0); out_k = flags_read_at(target, lo, hi, b->stop, 1); }
+        else if (n == max_insns && !is_branch(l)) { out = flags_read_at(next, lo, hi, b->stop, 0); out_k = flags_read_at(next, lo, hi, b->stop, 1); }
         // A CMP / TEST / SUB ... before a Jcc: the Jcc's condition from its operands (and of its flags only those read
         // after the Jcc computed). Between them only instructions that touch neither flags nor memory (resumed after a
         // fault there, the Jcc would read flags never computed); with any, the condition waits in X_COND.
@@ -1740,12 +1769,44 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
             if (k && (k == 1 || ((l->opcode & 15) >= 4))) { fuse_k = k; fuse_sz = sz; fuse_cc = l->opcode & 15; }
         }
     }
-    uint16_t live = out;
+    uint16_t live = out, live_after[64];
     for (int i = n - 1; i >= 0; i--) {
         fx f = i == n - 1 && is_jmp_call(&ins[i]) ? (fx){ 0, 0, 0 } : flag_fx(&ins[i]);   // (JMP, CALL: out above)
         if (i == n - 1 && fuse_k) f.rd = 0;                               // (the fused Jcc reads its producer's operands)
+        live_after[i] = live;
         dead[i] = f.how == FX_PART ? f.wr & (uint16_t)~live : f.how == FX_SKIP && !(f.wr & live) ? f.wr : 0;
         live = (uint16_t)((live & ~f.wr) | f.rd);
+    }
+    // Lazy flags (flags section): the first instruction touching them, and the last one to set them if what reads its
+    // flags lies only where the look-ahead stops (past a RET or an indirect branch), if flags_arith computes all six for
+    // it and nothing after it in the block reads them (but a fused Jcc, from its operands): its flags are recorded.
+    int first_touch = -1, lazy_at = -1; uint16_t lazy_dead = 0;
+    if (b->lazy_flags && n) {
+        uint16_t dead_k[64], live_k = out_k;
+        for (int i = n - 1; i >= 0; i--) {
+            const x86_insn *d = &ins[i];                                  // (a RET or an indirect branch: out_k says)
+            int far = i == n - 1 && (is_jmp_call(d) || (d->map == X86_MAP_1 && (d->opcode == 0xC3 || d->opcode == 0xC2 || (d->opcode == 0xFF && ((d->reg & 7) == 2 || (d->reg & 7) == 4)))));
+            fx f = far ? (fx){ 0, 0, 0 } : flag_fx(d);
+            if (i == n - 1 && fuse_k) f.rd = 0;
+            dead_k[i] = f.how == FX_PART ? f.wr & (uint16_t)~live_k : f.how == FX_SKIP && !(f.wr & live_k) ? f.wr : 0;
+            live_k = (uint16_t)((live_k & ~f.wr) | f.rd);
+        }
+        for (int i = n - 1; i >= 0; i--) {
+            const x86_insn *d = &ins[i];
+            int branch = is_jmp_call(d) || (d->map == X86_MAP_1 && (d->opcode == 0xC3 || d->opcode == 0xC2 || (d->opcode == 0xFF && ((d->reg & 7) == 2 || (d->reg & 7) == 4))));
+            fx f = branch ? (fx){ 0, 0, 0 } : flag_fx(d);
+            if (i == n - 1 && fuse_k) f.rd = 0;
+            if (!f.rd && !f.wr) continue;
+            if (!f.rd && f.wr == F_ARITH && f.how == FX_PART && (dead_k[i] & F_ARITH) != (dead[i] & F_ARITH)) { lazy_at = i; lazy_dead = dead[i]; dead[i] = dead_k[i]; }
+            break;
+        }
+        for (int i = 0; i < n && first_touch < 0; i++) {
+            const x86_insn *d = &ins[i];
+            int branch = is_jmp_call(d) || (d->map == X86_MAP_1 && (d->opcode == 0xC3 || d->opcode == 0xC2 || (d->opcode == 0xFF && ((d->reg & 7) == 2 || (d->reg & 7) == 4))));
+            fx f = branch ? (fx){ 0, 0, 0 } : flag_fx(d);
+            if (i == n - 1 && fuse_k) f.rd = 0;
+            if (f.rd || f.wr) first_touch = i;
+        }
     }
     for (int i = 0; i < max_insns; i++) {
         x86_insn d;
@@ -1755,18 +1816,32 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         if (b->nimap == b->cimap) { b->cimap = b->cimap ? 2 * b->cimap : 64; b->imap = realloc(b->imap, b->cimap * sizeof *b->imap); }
         b->imap[b->nimap].at = (uint32_t)b->n; b->imap[b->nimap++].rip = rip;
         b->nskipped += b->dead_flags != 0;
+        if (i == first_touch) {                                           // (pending flags: computed, or dropped when all six
+            fx f = flag_fx(&d);                                           //  are written here)
+            // (a writer of some flags only: computed first if a flag it leaves as it is is read later; a writer of all six
+            //  needs nothing: they go through merge_flags, which clears the bit, or a helper, called after pending_check)
+            if (f.rd || (F_ARITH & ~f.wr & live_after[i]) || (i == n - 1 && fuse_k)) pending_check(b);
+        }
+        b->lazy_record = i == lazy_at;
         if (trap(b, &d, rip)) { b->dead_flags = 0; site_exit(b); *end = rip + d.len; return 0; }
         int c = control_linked(b, &d, rip);
         if (c < 0) { b->dead_flags = 0; return -1; }
         if (c) { b->dead_flags = 0; *end = rip + d.len; return 0; }
-        if (fuse_k && i == fuse_p && fuse_p == n - 2 && (dead[i] & F_ARITH) == F_ARITH && direct_compare(b, &d)) {
+        if (fuse_k && i == fuse_p && i != lazy_at && fuse_p == n - 2 && (dead[i] & F_ARITH) == F_ARITH && direct_compare(b, &d)) {
             b->dead_flags = 0; b->keep_operands = 0; rip += d.len; continue;
         }
-        if (fuse_k == 1 && i == fuse_p && (dead[i] & F_ARITH) == F_ARITH && mem_compare(b, &d, rip + d.len, fuse_cc, fuse_p == n - 2)) {
+        if (fuse_k == 1 && i == fuse_p && i != lazy_at && (dead[i] & F_ARITH) == F_ARITH && mem_compare(b, &d, rip + d.len, fuse_cc, fuse_p == n - 2)) {
             b->dead_flags = 0; b->keep_operands = 0; rip += d.len; continue;
         }
+        size_t n0 = b->n, r0 = b->nrelocs, c0 = b->ncold;
+        b->lazy_done = 0;
         int r = xlat_insn(b, &d, (const uint8_t *)(uintptr_t)rip, rip);
-        b->dead_flags = 0; b->keep_operands = 0;
+        if (r >= 0 && i == lazy_at && !b->lazy_done) {                    // (not through flags_arith: computed after all)
+            b->n = n0; b->nrelocs = r0; b->ncold = c0;
+            b->lazy_record = 0; b->dead_flags = lazy_dead;
+            r = xlat_insn(b, &d, (const uint8_t *)(uintptr_t)rip, rip);
+        }
+        b->dead_flags = 0; b->keep_operands = 0; b->lazy_record = 0;
         if (r < 0) return -1;
         if (fuse_k && i == fuse_p) {
             b->fuse_kind = fuse_k; b->fuse_size = fuse_sz;
@@ -1866,4 +1941,41 @@ void xlat_epilogue(xlat_buf *b) {
     E(b, a64_ldpd(8, 9, SP, 96)); E(b, a64_ldpd(10, 11, SP, 112)); E(b, a64_ldpd(12, 13, SP, 128)); E(b, a64_ldpd(14, 15, SP, 144));
     E(b, a64_ldp_post(29, 30, SP, 176));
     E(b, a64_ret());
+}
+
+// ---- lazy flags: the record computed (TRANSLATOR.md "Rules") -------------------------------------------------------------
+uint64_t xlat_flags_resolve(uint64_t x27, const x86_ctx *c) {
+    if (!(x27 >> PEND_BIT & 1)) return x27;
+    int info = (int)(c->pend_info & 15), kind = info >> 2, size = 1 << (info & 3), msb = 8 * size - 1;
+    uint64_t a = c->pend_a, bb = c->pend_b, r = c->pend_r, m = size == 8 ? ~0ull : (1ull << (8 * size)) - 1, f = 0;
+    if (kind == K_ADD) f |= (((a & bb) | ((a | bb) & ~r)) >> msb) & 1;
+    if (kind == K_SUB) f |= (((~a & bb) | (~(a ^ bb) & r)) >> msb) & 1;
+    f |= (uint64_t)xlat_parity[r & 0xFF] << 2;
+    if (kind != K_LOGIC) f |= ((a ^ bb ^ r) >> 4 & 1) << 4;
+    f |= (uint64_t)!(r & m) << 6;
+    f |= (r >> msb & 1) << 7;
+    if (kind == K_ADD) f |= (((a ^ r) & (bb ^ r)) >> msb & 1) << 11;
+    if (kind == K_SUB) f |= (((a ^ bb) & (a ^ r)) >> msb & 1) << 11;
+    return (x27 & ~(uint64_t)F_ARITH & ~(1ull << PEND_BIT)) | f;
+}
+void xlat_flags_stub(xlat_buf *b) {
+    E(b, 0xA9BF47F0u);                                                    // STP x16, x17, [SP, #-16]!
+    E(b, a64_ldr(8, T_A, XC, CTX_PEND)); E(b, a64_ldr(8, T_B, XC, CTX_PEND + 8)); E(b, a64_ldr(8, T_R, XC, CTX_PEND + 16));
+    E(b, a64_ldr(8, S0, XC, CTX_PEND + 24));                              // kind * 4 + log2(size)
+    size_t done[12]; int nd = 0;
+    uint32_t dead = b->dead_flags; int lazy = b->lazy_record;
+    b->dead_flags = 0; b->lazy_record = 0;
+    for (int kind = 0; kind < 3; kind++)
+        for (int z = 0; z < 4; z++) {
+            E(b, a64_cmpi(S0, (uint32_t)(kind * 4 + z)));
+            size_t skip = here(b); E(b, 0);
+            flags_arith(b, kind, 1 << z, 0);
+            done[nd++] = here(b); E(b, 0);
+            b->code[skip] = a64_bcond(NE, (int32_t)(b->n - skip));
+        }
+    for (int k = 0; k < nd; k++) b->code[done[k]] = a64_b((int32_t)(b->n - done[k]));
+    b->dead_flags = dead; b->lazy_record = lazy;
+    E(b, 0x927CFB7Bu);                                                    // AND x27, x27, #~8 (merge_flags did, but for a bad record)
+    E(b, 0xA8C147F0u);                                                    // LDP x16, x17, [SP], #16
+    E(b, a64_ret_r(30));
 }

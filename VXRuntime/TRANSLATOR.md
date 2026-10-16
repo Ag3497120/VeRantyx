@@ -351,7 +351,16 @@ a deliberate mistake planted in it makes difftest fail (the generator reaches it
 |---|---|---|
 | CMP of memory with an immediate, read by JE/JNE only: the value loaded, CBZ/CBNZ for 0 (kept in X25 across instructions in between), CMP #imm otherwise | `mem_compare` | string 36.3 -> 30.9 ms (MacBook Pro M1 Max) |
 | IMUL with every flag dead: the product alone | `imul:` | 16 -> 5 instructions for `imul $imm, r, r` |
+| Lazy flags: the last instruction to set the flags, when only code past where the look-ahead stops (a RET, an indirect branch) may read them, records its operands and result (`ctx->pend_*`, x27 bit 3, reserved in EFLAGS) instead of computing them; a block's first reader (or a writer of some flags whose others are read later) computes them through the engine's stub; merge_flags clears the bit at no cost; leaving translated code and C (faults, SuspendThread: `xlat_flags_resolve`) compute them | `flags_arith`, `xlat_flags_stub`, block_linked | MacBook Pro M1 Max: fib 0.304 -> 0.210 ms, interp 36.3 -> 30.5 ms, others unchanged (ABBA); MacBook Air M5: interp 16.1 -> 10.8 ms (Rosetta 11.4), fib 0.176 -> 0.144 ms |
 | FEAT_AFP (Apple M2+; not in the vCPU): FPCR.AH = 1, so ADD/SUB/MUL/DIV (ss sd ps pd) need no NaN fix-up; FZ/FIZ are MXCSR's FTZ/DAZ exactly | `afp`, `mxcsr_to_fpcr` | physics 4.7 -> 3.7 ms, matmul 6.7 -> 6.35 (MacBook Air M5); on the M5 the old path's FMA NaNs differed from Rosetta's there, with AH they match (985 forms) |
+
+Lazy flags were checked the same way: the record's operand, its kind, the reader's check and the exit's check, the
+bit merge_flags clears (each made difftest fail), and the C version against Rosetta for every kind and size ("flags
+record" in difftest). A drop before writers of all six that bypass merge_flags turned out unneeded (none do) and is
+not there. Found on the way: STP/LDP's offset reaches only 504 bytes and wrapped silently (the record went 96 bytes
+before the context): the encoders now trap on an offset they cannot hold. The first version, checking at every block's
+first flag writer, cost 3-9 %; the second, checking at partial writers whatever their liveness, made interp 38 %
+slower (an INC after every switch case computed the record each time).
 
 Mutations checked (each made difftest fail): CBZ/CBNZ swapped (adjacent and across), CMP with the immediate + 1,
 IMUL of the wrong operand. Seen next by the brief: `cmp r, r; jge` whose flags the successors read again (40 ARM64

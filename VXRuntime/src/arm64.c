@@ -263,7 +263,7 @@ int vx_arm64_state_at(const void *ucv, void *outv) {
     if (xe_owns(g_engine, ss->__pc)) {
         uint64_t rip = xe_rip_at(g_engine, ss->__pc);
         for (int i = 0; i < 16; i++) { out->gpr[i] = ss->__x[i]; memcpy(out->xmm[i], &uc->uc_mcontext->__ns.__v[i], 16); }
-        out->flags = ss->__x[27];
+        out->flags = xlat_flags_resolve(ss->__x[27], t_ctx);   // (pending flags: computed)
         out->rip = rip ? rip : ss->__x[17];
         return 1;
     }
@@ -282,7 +282,7 @@ static void vcpu_interrupted(x86_ctx *c, const xv_regs *r) {
     if (xe_owns(g_engine, r->pc) && !xe_in_guest(g_engine, r->pc)) {
         uint64_t rip = xe_rip_at(g_engine, r->pc);
         for (int i = 0; i < 16; i++) { s->gpr[i] = r->x[i]; memcpy(s->xmm[i], r->q[i], 16); }
-        s->flags = r->x[27]; s->ras = r->x[29];
+        s->flags = xlat_flags_resolve(r->x[27], c); s->ras = r->x[29];
         s->rip = rip ? rip : r->x[17];
     } else if (s->gpr[4]) {
         s->rip = *(const uint64_t *)(uintptr_t)s->gpr[4]; s->gpr[4] += 8;
@@ -308,7 +308,7 @@ static void __attribute__((noreturn)) smc_restart(void) {
 static void state_from_signal(x86_ctx *c, const ucontext_t *uc, uint64_t rip) {
     const _STRUCT_ARM_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
     for (int i = 0; i < 16; i++) { c->gpr[i] = ss->__x[i]; memcpy(c->xmm[i], &uc->uc_mcontext->__ns.__v[i], 16); }
-    c->flags = ss->__x[27]; c->ras = ss->__fp; c->rip = rip;
+    c->flags = xlat_flags_resolve(ss->__x[27], c); c->ras = ss->__fp; c->rip = rip;
 }
 void vx_code_freed(void *addr, size_t len) { xe_forget(g_engine, (uint64_t)(uintptr_t)addr, len); }
 uint64_t vx_arm64_x86_pc(uint64_t pc) {

@@ -374,7 +374,7 @@ int xv_enter(x86_ctx *c, uint64_t enter, uint64_t vectors) {
                         hv_simd_fp_uchar16_t v; hv_vcpu_get_simd_fp_reg(t_vcpu, (hv_simd_fp_reg_t)(HV_SIMD_FP_REG_Q0 + r), &v);
                         memcpy(c->xmm[r], &v, 16);
                     }
-                    hv_vcpu_get_reg(t_vcpu, HV_REG_X27, &c->flags);
+                    hv_vcpu_get_reg(t_vcpu, HV_REG_X27, &c->flags); c->flags = xlat_flags_resolve(c->flags, c);
                     hv_vcpu_get_reg(t_vcpu, HV_REG_X29, &c->ras);
                     t_fault_pc = elr; t_fault_addr = far; t_fault_write = write;
                     result = XV_FAULT;

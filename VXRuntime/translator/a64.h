@@ -26,8 +26,10 @@ A64_RRR(mul, 0x9B007C00u)                                         // MADD d, n, 
 #undef A64_RRR
 static inline uint32_t a64_msub(int d, int n, int m, int a) { return 0x9B008000u | (uint32_t)m << 16 | (uint32_t)a << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_orr_lsl(int d, int n, int m, int sh) { return 0xAA000000u | (uint32_t)m << 16 | (uint32_t)sh << 10 | (uint32_t)n << 5 | (uint32_t)d; }
-static inline uint32_t a64_stp(int t1, int t2, int n, int imm) { return 0xA9000000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
-static inline uint32_t a64_ldp(int t1, int t2, int n, int imm) { return 0xA9400000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
+// An offset the encoding cannot hold is a translator bug: stop at once (it would wrap and address other memory).
+static inline uint32_t a64_off_(int ok) { if (!ok) __builtin_trap(); return 0; }
+static inline uint32_t a64_stp(int t1, int t2, int n, int imm) { return a64_off_(imm >= -512 && imm <= 504 && !(imm & 7)) | 0xA9000000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
+static inline uint32_t a64_ldp(int t1, int t2, int n, int imm) { return a64_off_(imm >= -512 && imm <= 504 && !(imm & 7)) | 0xA9400000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
 static inline uint32_t a64_add_lsl(int d, int n, int m, int sh) { return 0x8B000000u | (uint32_t)m << 16 | (uint32_t)sh << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_addi(int d, int n, uint32_t imm12) { return 0x91000000u | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_subi(int d, int n, uint32_t imm12) { return 0xD1000000u | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)d; }
@@ -63,11 +65,11 @@ static inline uint32_t a64_msr_nzcv(int t) { return 0xD51B4200u | (uint32_t)t; }
 // Memory: [n] with an unsigned, size-scaled 12-bit offset; register offset (LSL 0)
 static inline uint32_t a64_ldr(int size, int t, int n, uint32_t off) {
     static const uint32_t op[9] = { 0, 0x39400000u, 0x79400000u, 0, 0xB9400000u, 0, 0, 0, 0xF9400000u };
-    return op[size] | (off / (uint32_t)size & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t;
+    return a64_off_(!(off % (uint32_t)size) && off / (uint32_t)size < 4096) | op[size] | (off / (uint32_t)size & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t;
 }
 static inline uint32_t a64_str(int size, int t, int n, uint32_t off) {
     static const uint32_t op[9] = { 0, 0x39000000u, 0x79000000u, 0, 0xB9000000u, 0, 0, 0, 0xF9000000u };
-    return op[size] | (off / (uint32_t)size & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t;
+    return a64_off_(!(off % (uint32_t)size) && off / (uint32_t)size < 4096) | op[size] | (off / (uint32_t)size & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t;
 }
 // Loads and stores at [n + off]: LDR / STR's scaled unsigned offset when it fits, else LDUR / STUR's signed 9 bits (the
 // caller checks off is one of the two). sx: sign-extending load (LDRSB LDRSH LDRSW) to 64 bits (wide) or 32.
@@ -292,7 +294,7 @@ static inline uint32_t a64_ldrd(int t, int n, uint32_t off) { return 0xFD400000u
 static inline uint32_t a64_strd(int t, int n, uint32_t off) { return 0xFD000000u | (off / 8 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t; }
 static inline uint32_t a64_ldrs(int t, int n, uint32_t off) { return 0xBD400000u | (off / 4 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t; }
 static inline uint32_t a64_strs(int t, int n, uint32_t off) { return 0xBD000000u | (off / 4 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)t; }
-static inline uint32_t a64_ldpq(int t1, int t2, int n, int imm) { return 0xAD400000u | ((uint32_t)(imm / 16) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
-static inline uint32_t a64_stpq(int t1, int t2, int n, int imm) { return 0xAD000000u | ((uint32_t)(imm / 16) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
-static inline uint32_t a64_stpd(int t1, int t2, int n, int imm) { return 0x6D000000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
+static inline uint32_t a64_ldpq(int t1, int t2, int n, int imm) { return a64_off_(imm >= -1024 && imm <= 1008 && !(imm & 15)) | 0xAD400000u | ((uint32_t)(imm / 16) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
+static inline uint32_t a64_stpq(int t1, int t2, int n, int imm) { return a64_off_(imm >= -1024 && imm <= 1008 && !(imm & 15)) | 0xAD000000u | ((uint32_t)(imm / 16) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
+static inline uint32_t a64_stpd(int t1, int t2, int n, int imm) { return a64_off_(imm >= -512 && imm <= 504 && !(imm & 7)) | 0x6D000000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }
 static inline uint32_t a64_ldpd(int t1, int t2, int n, int imm) { return 0x6D400000u | ((uint32_t)(imm / 8) & 0x7F) << 15 | (uint32_t)t2 << 10 | (uint32_t)n << 5 | (uint32_t)t1; }

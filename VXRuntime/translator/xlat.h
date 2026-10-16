@@ -40,10 +40,16 @@ typedef struct x86_ctx_s {
     uint64_t single;             // engine.c: run the instruction at rip alone, translated just for this once (it writes
                                  //   code that comes after it: what follows is translated after the write)
     uint64_t batch_base, batch_ptr, batch_end;   // vcpu.c: calls recorded in the guest, run at its next exit
+    uint64_t pend_a, pend_b, pend_r;   // flags not computed yet (x27 bit 3, TRANSLATOR.md "Rules"): the operands and the
+    uint64_t pend_info;                //   result of the instruction that set them, its kind * 4 + log2(size)
 } x86_ctx;
 enum { CTX_FLAGS = 128, CTX_RIP = 136, CTX_FS = 144, CTX_GS = 152, CTX_FAULT = 160, CTX_HELPER_OP = 168, CTX_HELPER_VAL = 176,
        CTX_XMM = 192, CTX_YMMH = 448, CTX_MXCSR = 704, CTX_FCW = 712,
-       CTX_LINK = 848, CTX_ENTRY = 856, CTX_FAULT_INFO = 864, CTX_RAS = 872, CTX_JUMP = 880, CTX_STALE = 888, CTX_SINGLE = 896 };
+       CTX_LINK = 848, CTX_ENTRY = 856, CTX_FAULT_INFO = 864, CTX_RAS = 872, CTX_JUMP = 880, CTX_STALE = 888, CTX_SINGLE = 896, CTX_PEND = 928 };
+_Static_assert(__builtin_offsetof(x86_ctx, pend_a) == CTX_PEND, "CTX_PEND");
+// Flags pending (x27 bit 3, reserved in EFLAGS): the six arithmetic flags in EFLAGS form, from the record (any other x27
+// bits as they are).
+uint64_t xlat_flags_resolve(uint64_t x27, const x86_ctx *c);
 // The return-address ring (xlat_block_linked, engine.c): 2^XLAT_RAS_BITS bytes aligned to that, entries of 16 bytes: the x86
 // return address and the translated code to go back to. CALL adds one, RET takes one and returns there when it matches.
 enum { XLAT_RAS_BITS = 12 };
@@ -67,6 +73,9 @@ typedef struct {
     int fuse_kind, fuse_size, fuse_in_reg, keep_operands;
     int fuse_in_reg_zero;            // (X_COND holds a value whose zero means "taken", not the condition itself)
     int check_bytes;
+    int lazy_flags;              // xlat_block_linked: the engine has a pending-flags stub (XR_FLAGS sites call it)
+    int lazy_record;             //   this instruction's flags are recorded, not computed (flags_arith)
+    int lazy_done;               //   (flags_arith did record them)
     int vcpu;                    // the code runs in a Hypervisor.framework guest (vcpu.c): calls of host code are HVC #2
                                  //   (xlat_helper) and #3 (a native function: its thunk in S0)             // xlat_block_linked: compare the block's x86 bytes first (code on a page written often)
     // xlat_block_linked: rarely taken code (the NaN fixes) goes after the block, out of the straight path
@@ -96,7 +105,10 @@ int xlat_block(xlat_buf *b, uint64_t rip, int max_insns);
 // a block leaves through sites the engine links or patches, listed in b->relocs. *end gets the x86 address after the
 // block's last instruction. Returns 0, or -1 if an instruction is not supported (yet).
 enum { XR_LINK = 1, XR_LOOKUP, XR_EXIT,        // sites: BL link stub (then the target as 8 bytes), B lookup stub, B exit stub,
-       XR_CALL, XR_LOOKUP_CALL };               //   BL call-link stub (the return's site, then the target), BL lookup stub
+       XR_CALL, XR_LOOKUP_CALL,                 //   BL call-link stub (the return's site, then the target), BL lookup stub,
+       XR_FLAGS };                              //   BL the pending-flags stub (xlat_flags_stub)
+// The pending-flags stub (engine.c makes one): computes the flags a record describes into x27 (x16, x17 kept).
+void xlat_flags_stub(xlat_buf *b);
 int xlat_block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end);
 // The "block" at a native function's address (engine.c, the ARM64 runtime): the x86 state into the context, fn(ctx)
 // (a thunk: it reads the call's arguments there and writes the result), the state back, then RET, or on at

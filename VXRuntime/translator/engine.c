@@ -28,7 +28,7 @@ typedef struct { uint64_t page; uint32_t *ids; uint32_t n, c; uint32_t faults; i
 struct xe {
     uint32_t *code;                 // MAP_JIT: stubs first, then blocks
     size_t used, cap;               // (in instructions)
-    uint32_t *enter, *exit, *link, *lookup, *link_call;
+    uint32_t *enter, *exit, *link, *lookup, *link_call, *flags_stub;
     uint64_t *ring;                 // the shared return-address ring (contexts without one of their own)
     uint64_t ring_at;               //   where it was when xe_run last returned
     uint64_t **rings; int nrings;   // every ring, cleared when the code goes
@@ -71,10 +71,13 @@ static void stubs(xe *e) {
     b.vcpu = e->vcpu;                                                     // (the guest's FPCR: no FEAT_AFP rule there)
     uint32_t *c = e->code;
     size_t n = 0;
+    // The pending-flags stub (xlat.c, lazy flags): leaving translated code computes them first
+    e->flags_stub = c + n; xlat_flags_stub(&b); memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
+    #define PENDING_CHECK() do { n = emit(c, n, 0x36180000u | 2u << 5 | 27); n = emit(c, n, a64_bl((int32_t)(e->flags_stub - (c + n)))); } while (0)
     if (e->vcpu) {
         // In the guest (vcpu.c): enter with x0 = the context, exit with HVC #1 (the state stored)
         e->enter = c + n; xlat_guest_enter(&b); memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
-        e->exit = c + n; xlat_guest_exit(&b); memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
+        e->exit = c + n; PENDING_CHECK(); xlat_guest_exit(&b); memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
     } else {
         // enter(ctx): save the host's registers, load the x86 state, go to ctx->entry
         e->enter = c + n;
@@ -84,6 +87,7 @@ static void stubs(xe *e) {
         n = emit(c, n, a64_br(S0));
         // exit: S1 is the next RIP; store the state, back to the host
         e->exit = c + n;
+        PENDING_CHECK();
         n = emit(c, n, a64_str(8, S1, XC, CTX_RIP));
         xlat_epilogue(&b);
         memcpy(c + n, b.code, b.n * 4); n += b.n; b.n = 0;
@@ -344,7 +348,7 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
     mentry *found = once ? NULL : find_entry(e, rip);
     if (found) return found->id;
     xlat_buf b = { 0 };
-    b.ordered = e->ordered; b.stop = stop; b.vcpu = e->vcpu;
+    b.ordered = e->ordered; b.stop = stop; b.vcpu = e->vcpu; b.lazy_flags = 1;
     uint64_t end = rip + 1;
     void (*thunk)(x86_ctx *) = e->native ? e->native(rip) : NULL;
     uint64_t handler = 0; const void *desc = NULL;
@@ -370,6 +374,7 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
         if (b.relocs[i].kind == XR_LOOKUP) *p = a64_b((int32_t)(e->lookup - p));
         else if (b.relocs[i].kind == XR_EXIT) *p = a64_b((int32_t)(e->exit - p));
         else if (b.relocs[i].kind == XR_LOOKUP_CALL) *p = a64_bl((int32_t)(e->lookup - p));
+        else if (b.relocs[i].kind == XR_FLAGS) *p = a64_bl((int32_t)(e->flags_stub - p));
         else if (b.relocs[i].kind == XR_CALL) {                          // (the return's site, 3 words, then the target)
             mentry *t = find_entry(e, (uint64_t)p[4] | (uint64_t)p[5] << 32);
             *p = a64_bl(t ? (int32_t)((uint32_t *)(uintptr_t)t->host - p) : (int32_t)(e->link_call - p));

@@ -50,8 +50,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump"); ap.add_argument("image")
     ap.add_argument("--block", type=lambda s: int(s, 16)); ap.add_argument("--top", type=int, default=0)
+    ap.add_argument("--raw", type=lambda s: int(s, 16), help="the image is raw bytes loaded at this address")
     a = ap.parse_args()
-    read = image_reader(a.image)
+    if a.raw is not None:
+        blob = open(a.image, "rb").read()
+        read = lambda addr, n: blob[addr - a.raw:addr - a.raw + n] if addr >= a.raw else b""
+    else:
+        read = image_reader(a.image)
     found = list(blocks(a.dump))
     if a.block is not None: found = [b for b in found if b[0] == a.block][:1]
     elif a.top:
