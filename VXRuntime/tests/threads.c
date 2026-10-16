@@ -96,6 +96,52 @@ static int suspend_ok(void) {
     CloseHandle(s);
     return ok;
 }
+// A thread stopped in the middle of pushes and pops (which the translator writes at offsets from one register and
+// applies to RSP once, xlat.c's stack runs): GetThreadContext's Rsp must be the one of the instruction at Rip.
+extern char pushloop[], pl_push1[], pl_push2[], pl_push3[], pl_pop1[], pl_pop2[], pl_pop3[], pl_cmp[], pl_end[];
+extern DWORD64 pl_base, pl_count;
+__asm__(".globl pushloop, pl_push1, pl_push2, pl_push3, pl_pop1, pl_pop2, pl_pop3, pl_cmp, pl_end, pl_base, pl_count\n"
+        ".data\npl_base: .quad 0\npl_count: .quad 0\n.text\n"
+        "pushloop: movq %rsp, pl_base(%rip)\n"
+        "pl_push1: pushq %rbx\npl_push2: pushq %rsi\npl_push3: pushq %rdi\n"
+        "pl_pop1: popq %rdi\npl_pop2: popq %rsi\npl_pop3: popq %rbx\n"
+        "pl_cmp: incq pl_count(%rip)\n cmpl $0, (%rcx)\n je pl_push1\npl_end: ret\n");
+static volatile LONG pl_stop;
+static int stack_run_inside;
+static DWORD WINAPI pusher(void *arg) { (void)arg; ((void (*)(volatile LONG *))(void *)pushloop)(&pl_stop); return 3; }
+static int stack_run_ok(void) {
+    HANDLE t = CreateThread(NULL, 0, pusher, NULL, 0, NULL);
+    while (!*(volatile DWORD64 *)&pl_base) Sleep(1);
+    const char *at[] = { pl_push1, pl_push2, pl_push3, pl_pop1, pl_pop2, pl_pop3, pl_cmp, pl_end };
+    static const int depth[] = { 0, 8, 16, 24, 16, 8, 0 };
+    int seen[8] = { 0 }, wrong = 0, inside = 0;
+    DWORD t0 = GetTickCount();
+    for (int k = 0; k < 2000; k++) {
+        if (SuspendThread(t) != 0) { wrong++; break; }
+        CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(t, &c)) {
+            for (int i = 0; i < 7; i++)
+                if (c.Rip >= (DWORD64)(uintptr_t)at[i] && c.Rip < (DWORD64)(uintptr_t)at[i + 1]) {
+                    seen[i]++; inside += i >= 1 && i <= 5;
+                    if (c.Rsp != pl_base - (DWORD64)depth[i]) {
+                        if (wrong < 3) printf("stack run: rip at step %d, rsp %#llx, want %#llx\n", i, (unsigned long long)c.Rsp, (unsigned long long)(pl_base - depth[i]));
+                        wrong++;
+                    }
+                }
+        }
+        DWORD64 before = *(volatile DWORD64 *)&pl_count;
+        ResumeThread(t);
+        for (int w = 0; w < 1000000 && *(volatile DWORD64 *)&pl_count < before + 1 + (DWORD64)(k % 7); w++) {}   // (it runs a little)
+    }
+    if (getenv("PL_DEBUG")) fprintf(stderr, "stack run: 2000 stops in %lu ms (%d %d %d %d %d %d %d)\n", (unsigned long)(GetTickCount() - t0), seen[0], seen[1], seen[2], seen[3], seen[4], seen[5], seen[6]);
+    pl_stop = 1;
+    DWORD code = 0;
+    int ok = WaitForSingleObject(t, 5000) == WAIT_OBJECT_0 && GetExitCodeThread(t, &code) && code == 3;
+    CloseHandle(t);
+    stack_run_inside = inside;                               // (the x86 build under Rosetta stops between blocks: none)
+    return ok && !wrong;
+}
+
 // The lowest page of this thread's stack found as the Boehm GC finds it (walking down from the TEB's stack base while
 // pages are PAGE_READWRITE and not guard pages) must be below the current stack pointer.
 static int stack_walk_ok(void) {
@@ -163,9 +209,9 @@ int main(void) {
     DWORD wcode = 0;
     if (WaitForSingleObject(wt, 5000) != WAIT_OBJECT_0) ok = 0;
     GetExitCodeThread(wt, &wcode);
-    int fib = fibers_ok(), sus = suspend_ok(), walk = stack_walk_ok(), pk = packed_ok();
-    ok = ok && counter == 40000 && interlocked == 40000 && sems == 4 && wcode == 77 && per_thread == 7 && fib && sus && walk && pk;
-    printf("threads: counter=%ld interlocked=%ld semaphores=%d condvar=%lu main_tls=%d fibers=%s suspend+apc=%s stack=%s packed locks=%s -> %s\n",
-           counter, interlocked, sems, wcode, per_thread, fib ? "ok" : "bad", sus ? "ok" : "bad", walk ? "ok" : "bad", pk ? "ok" : "bad", ok ? "ok" : "FAILED");
+    int fib = fibers_ok(), sus = suspend_ok(), walk = stack_walk_ok(), pk = packed_ok(), run = stack_run_ok();
+    ok = ok && counter == 40000 && interlocked == 40000 && sems == 4 && wcode == 77 && per_thread == 7 && fib && sus && walk && pk && run;
+    printf("threads: counter=%ld interlocked=%ld semaphores=%d condvar=%lu main_tls=%d fibers=%s suspend+apc=%s stack=%s packed locks=%s stack runs=%s (%d stops inside) -> %s\n",
+           counter, interlocked, sems, wcode, per_thread, fib ? "ok" : "bad", sus ? "ok" : "bad", walk ? "ok" : "bad", pk ? "ok" : "bad", run ? "ok" : "bad", stack_run_inside, ok ? "ok" : "FAILED");
     return !ok;
 }

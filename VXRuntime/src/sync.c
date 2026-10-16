@@ -35,6 +35,7 @@ typedef struct {
     int type, refs;
     int done, started, priority; DWORD suspended, exit_code, tid; pthread_t pthread;   // thread
     semaphore_t parked_sem, resume_sem; volatile int parked; uint8_t *context;              // (SuspendThread: see below)
+    uint64_t stop_asked, stop_seen;                                                         //  (its stops asked, seen)
     struct apc *apcs; struct waiter *alert_waiter;                                          // (QueueUserAPC: see below)
     DWORD (WINAPI *start)(void *); void *arg; size_t stack;
     int manual, signaled;                                                     // event
@@ -383,13 +384,24 @@ static WINAPI DWORD GetThreadId(HANDLE h) {
 // Suspending a running thread (garbage collectors stop the world this way: Unity's Mono): SIGUSR2 makes it save its
 // registers as a Windows CONTEXT and wait in the signal handler until resumed. Mach semaphores are safe there.
 // GetThreadContext reads what it saved; it takes no lock, as the stopped thread may hold one of the runtime's.
+// Each stop asked has a number (stop_asked); the parked thread says which it has seen (stop_seen). A thread resumed
+// and stopped again before it has left the handler (a collector stopping the world over and over) sees the new number
+// there and stays, telling the new SuspendThread so: it used to wait for a second signal that never came.
 #define CONTEXT_SIZE 0x4d0
 void vx_context_from_signal(void *out, const void *uc);                 // seh.c
 static void park(vx_object *t) {                                        // (t->context saved: stopped till resumed)
-    __atomic_store_n(&t->parked, 1, __ATOMIC_RELEASE);
-    semaphore_signal(t->parked_sem);
-    while (__atomic_load_n(&t->suspended, __ATOMIC_ACQUIRE)) semaphore_wait(t->resume_sem);
-    __atomic_store_n(&t->parked, 0, __ATOMIC_RELEASE);
+    for (;;) {
+        __atomic_store_n(&t->stop_seen, __atomic_load_n(&t->stop_asked, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
+        __atomic_store_n(&t->parked, 1, __ATOMIC_SEQ_CST);
+        semaphore_signal(t->parked_sem);
+        while (__atomic_load_n(&t->suspended, __ATOMIC_SEQ_CST) &&
+               __atomic_load_n(&t->stop_asked, __ATOMIC_SEQ_CST) == __atomic_load_n(&t->stop_seen, __ATOMIC_SEQ_CST))
+            semaphore_wait(t->resume_sem);
+        if (__atomic_load_n(&t->suspended, __ATOMIC_SEQ_CST)) continue;  // (resumed and stopped again: it says so, stays)
+        __atomic_store_n(&t->parked, 0, __ATOMIC_SEQ_CST);
+        if (!__atomic_load_n(&t->suspended, __ATOMIC_SEQ_CST) &&
+            __atomic_load_n(&t->stop_asked, __ATOMIC_SEQ_CST) == __atomic_load_n(&t->stop_seen, __ATOMIC_SEQ_CST)) break;
+    }                                                                   // (stopped again as it left: again, as it is)
 }
 #ifdef __aarch64__
 int vx_arm64_interrupt(void);                                           // arm64.c
@@ -405,7 +417,7 @@ void vx_thread_park_state(const void *state) {
 static void on_suspend_signal(int sig, siginfo_t *si, void *uc) {
     (void)sig; (void)si;
     vx_object *t = t_self;
-    if (!t || !t->context) return;
+    if (!t || !t->context || !__atomic_load_n(&t->suspended, __ATOMIC_SEQ_CST)) return;   // (a stop already seen)
 #ifdef __aarch64__
     if (vx_arm64_interrupt()) return;                                   // (in the vCPU guest: it stops as it leaves)
 #endif
@@ -441,9 +453,11 @@ static WINAPI DWORD SuspendThread(HANDLE h) {
     vx_object *t = thread_object(h);
     DWORD prev = (DWORD)-1;
     int stop = 0;
+    uint64_t asked = 0;
     if (t && !t->done) {
-        prev = __atomic_fetch_add(&t->suspended, 1, __ATOMIC_ACQ_REL);
+        prev = __atomic_fetch_add(&t->suspended, 1, __ATOMIC_SEQ_CST);
         if (t->started && prev == 0) {
+            asked = __atomic_add_fetch(&t->stop_asked, 1, __ATOMIC_SEQ_CST);
             if (!t->context) {                         // (first time: what the handler needs)
                 t->context = calloc(1, CONTEXT_SIZE);
                 semaphore_create(mach_task_self(), &t->parked_sem, SYNC_POLICY_FIFO, 0);
@@ -458,8 +472,9 @@ static WINAPI DWORD SuspendThread(HANDLE h) {
         suspend_signal_install();
         if (t == t_self) {                             // suspending oneself: wait here until resumed
             while (__atomic_load_n(&t->suspended, __ATOMIC_ACQUIRE)) semaphore_wait(t->resume_sem);
-        } else if (!pthread_kill(t->pthread, SIGUSR2)) {
-            semaphore_wait(t->parked_sem);            // (the context is saved once it is parked)
+        } else if (__atomic_load_n(&t->parked, __ATOMIC_SEQ_CST) || !pthread_kill(t->pthread, SIGUSR2)) {
+            while (__atomic_load_n(&t->stop_seen, __ATOMIC_SEQ_CST) < asked)   // (the context is saved once it is
+                semaphore_wait(t->parked_sem);                                 //  parked; still parked: it sees this one)
         }
     }
     return prev;
