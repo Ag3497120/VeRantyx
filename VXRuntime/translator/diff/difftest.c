@@ -355,6 +355,15 @@ static void fusable(void) {
     static const uint8_t rr[] = { 0x38, 0x84, 0x28, 0x20, 0x08, 0x30 }, grp[] = { 7, 0, 5, 4, 1, 6 }, acc[] = { 0x3C, 0xA8, 0x2C, 0x24, 0x0C, 0x34 };
     int imm = sz == 0 ? 1 : sz == 1 ? 2 : 4;
     if (sz == 1) *pp++ = 0x66;
+    if (rnd() % 6 == 0) {                                            // (U)COMISS/SD: registers or memory (special floats there)
+        static const int xr[] = { 0, 1, 2, 9 };
+        int x = xr[rnd() % 4], y = xr[rnd() % 4], dbl = (int)(rnd() & 1);
+        if (dbl) *pp++ = 0x66;
+        if (rnd() & 1) { rex_rr(0, x, y, 0); *pp++ = 0x0F; *pp++ = (uint8_t)(0x2E | (rnd() & 1)); *pp++ = (uint8_t)(0xC0 | (x & 7) << 3 | (y & 7)); }
+        else { rex_rr(0, x, 3, 0); *pp++ = 0x0F; *pp++ = (uint8_t)(0x2E | (rnd() & 1)); *pp++ = (uint8_t)(0x43 | (x & 7) << 3); *pp++ = (uint8_t)(rnd() % 120); }
+        flags_clean = 1;
+        return;
+    }
     switch (rnd() % 5) {
     case 4: {                                                        // CMP memory, imm: 0 (the memory zero or not), the
         int op = sz == 0 ? 0x80 : (rnd() & 1) ? 0x83 : 0x81, d = (int)(rnd() % 112), n = op == 0x81 ? imm : 1;   //  value there, any

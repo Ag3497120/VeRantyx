@@ -1520,6 +1520,13 @@ static int control_linked(xlat_buf *b, const x86_insn *d, uint64_t rip) {
     if (d->map == X86_MAP_0F && op >= 0x80 && op <= 0x8F) goto jcc;
     return 0;
 jcc:
+    if (b->fuse_kind == 6) {                                             // (an FP compare: FCMP's NZCV are x86's CF ZF PF for these)
+        static const int8_t fp_cc[16] = { -1, -1, LT, GE, -1, -1, LE, GT, -1, -1, VS, VC, -1, -1, -1, -1 };
+        b->fuse_kind = 0; b->nfused++;
+        E(b, a64_bcond(fp_cc[b->fuse_size] ^ 1, 4));
+        site_link(b, target); site_link(b, next);
+        return 1;
+    }
     if (b->fuse_kind == 5) {                                             // (mem_compare: the value against 0)
         b->fuse_kind = 0; b->nfused++;
         E(b, b->fuse_size == 4 ? a64_cbnz(T_A, 4) : a64_cbz(T_A, 4));   // (JE taken at 0: over the first site if not)
@@ -1777,6 +1784,7 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         dead[i] = f.how == FX_PART ? f.wr & (uint16_t)~live : f.how == FX_SKIP && !(f.wr & live) ? f.wr : 0;
         live = (uint16_t)((live & ~f.wr) | f.rd);
     }
+    uint16_t live_after_fp = n ? live_after[n - 1] : F_ARITH;            // (after a Jcc that ends the block: an FP compare's)
     // Lazy flags (flags section): the first instruction touching them, and the last one to set them if what reads its
     // flags lies only where the look-ahead stops (past a RET or an indirect branch), if flags_arith computes all six for
     // it and nothing after it in the block reads them (but a fused Jcc, from its operands): its flags are recorded.
@@ -1835,7 +1843,14 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         }
         size_t n0 = b->n, r0 = b->nrelocs, c0 = b->ncold;
         b->lazy_done = 0;
+        // Rule: (U)COMISS/SD whose flags only the Jcc right after reads, for the conditions FCMP's NZCV give directly.
+        if (i == n - 2 && is_jcc(&ins[n - 1]) && d.map == X86_MAP_0F && (d.opcode == 0x2E || d.opcode == 0x2F) &&
+            !(d.prefixes & (X86_P_VEX | X86_P_EVEX)) && (d.mandatory == 0 || d.mandatory == 0x66) && !(live_after_fp & F_ARITH)) {
+            int cc = ins[n - 1].opcode & 15;
+            if (cc == 2 || cc == 3 || cc == 6 || cc == 7 || cc == 0xA || cc == 0xB) b->fp_fuse = cc + 1;
+        }
         int r = xlat_insn(b, &d, (const uint8_t *)(uintptr_t)rip, rip);
+        b->fp_fuse = 0;
         if (r >= 0 && i == lazy_at && !b->lazy_done) {                    // (not through flags_arith: computed after all)
             b->n = n0; b->nrelocs = r0; b->ncold = c0;
             b->lazy_record = 0; b->dead_flags = lazy_dead;

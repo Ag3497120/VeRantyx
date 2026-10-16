@@ -72,6 +72,7 @@ typedef struct {
     uint64_t stop;               // xlat_block_linked: where the engine returns to C (the flags are live there)
     int fuse_kind, fuse_size, fuse_in_reg, keep_operands;
     int fuse_in_reg_zero;            // (X_COND holds a value whose zero means "taken", not the condition itself)
+    int fp_fuse;                     // (U)COMIS[SD] with a JA/JAE/JB/JBE/JP/JNP right after it (its cc + 1): FCMP's NZCV only
     int check_bytes;
     int lazy_flags;              // xlat_block_linked: the engine has a pending-flags stub (XR_FLAGS sites call it)
     int lazy_record;             //   this instruction's flags are recorded, not computed (flags_arith)

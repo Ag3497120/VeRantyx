@@ -424,6 +424,7 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
         if (pf != 0 && pf != 0x66) return -1;
         int s = xmm_rm(b, d, pf ? 8 : 4, next);
         E(b, op == 0x2F ? (pf ? a64_fcmped(x, s) : a64_fcmpes(x, s)) : (pf ? a64_fcmpd(x, s) : a64_fcmps(x, s)));   // (COMIS: QNaNs signal too)
+        if (b->fp_fuse) { b->fuse_kind = 6; b->fuse_size = b->fp_fuse - 1; b->fp_fuse = 0; return 0; }   // (rules: the Jcc reads NZCV)
         E(b, a64_movz(ACC, 0, 0));
         E(b, a64_cset(S1, VS));                                           // unordered: ZF PF CF all set
         E(b, a64_cset(S0, EQ)); E(b, a64_orr(S0, S0, S1)); put_flag(b, S0, 6);
