@@ -5,9 +5,19 @@ ALVR's own streaming core, `alvr_server_core` (https://github.com/alvr-org/ALVR,
 v20.14.1. ALVR's server is made for Windows and Linux; its core builds on macOS (Apple silicon) as it is. Clients
 of ALVR 20.x connect (the protocol is the major version).
 
-Status: a probe, checked on a real headset (the Vision Pro's ALVR app). `alvr_probe` runs the core alone, waits for a client, logs its views, poses and buttons, and streams
-an HEVC test pattern stamped with the newest head pose. The next step is VeRantyx's own frames (MacEncoder's HEVC)
-and poses (VRDriver) through it.
+Status: wired into VeRantyx. `VERANTYX_ALVR=1 scripts/launch_vxrt_steamvr.sh` (and the game launchers on it) sends
+the encoder's HEVC (MacEncoder/HardwareEncoder.swift) to ALVR's core through this library's C interface
+(`src/lib.rs`, loaded at run time), and writes the ALVR client's head, hands or controllers, buttons and eye field
+of view into the shared map's SharedHands, where the SteamVR driver reads the Vision Pro app's: the driver is
+unchanged. Each frame carries the time of the ALVR tracking sample it was rendered for. `alvr_probe` still runs the
+core alone with a test pattern.
+
+A headset whose display settings differ from the last one's (another model, another rate) makes ALVR store them and
+ask for its host to be restarted (ALVR's dashboard restarts SteamVR): here the encoder exits with 75 and the launch
+script starts it again; it then connects with them. SteamVR's display rate follows the last ALVR headset's at the
+next start (`VERANTYX_DISPLAY_HZ` overrides it).
+
+Not yet: haptics (VeRantyx's driver has none), game audio to the headset, IPD from the client's view transforms.
 
 ## Build and run
 
@@ -37,4 +47,10 @@ for); it connects again by itself.
   the headset decoded the stream. It asked for 2144 x 2048 per eye at 90 Hz; the probe now streams at the rate the
   client asks for. In the headset the test pattern looked right (both eyes, the moving bar, the counter; no artifacts
   or stutter noticed), at 90 Hz.
-- A Quest: only through someone who has one.
+- The encoder with ALVR, without SteamVR (a script writing frames into the shared map as the driver does): the mock
+  on the Air connected, received the stream, and its head pose and ALVR's sample times reached SharedHands. A mock
+  with other display settings than the stored ones: the encoder started again once and the mock connected.
+- Earth VR with `VERANTYX_ALVR=1` through the harness: run 20261016T214636Z-earth-start, level controls, 70.8 fps at
+  the 72 Hz the mock asked for, the game's frames (the capture proxy's) encoded at about 72 fps and received by the
+  mock for two and a half minutes without a network drop. (The harness drives the game with simulated poses.)
+- Not yet: a game in a real headset through ALVR; a Quest only through someone who has one.

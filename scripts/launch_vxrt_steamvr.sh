@@ -92,6 +92,21 @@ if [[ "${VXRT_VR_QUALITY:-}" == 3k ]]; then
     VXRT_VR_SETTINGS="${VXRT_VR_SETTINGS:-{\"steamvr\": {\"framesToThrottle\": 0, \"additionalFramesToPredict\": 0}}}"
 fi
 [[ -n "${VXRT_VR_RENDER_SCALE:-}" ]] && export VERANTYX_RENDER_SCALE="$VXRT_VR_RENDER_SCALE"
+# VERANTYX_ALVR=1: the stream goes to the ALVR client apps (Quest, Pico, the Vision Pro's "ALVR") through ALVR's own
+# streaming core (ALVRBridge/README.md), built here the first time (Rust); SteamVR's display rate is the one the last
+# ALVR headset asked for (90 Hz before any).
+if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
+    ALVR_LIB="$REPO_ROOT/ALVRBridge/target/release/libverantyx_alvr_bridge.dylib"
+    if [[ ! -f "$ALVR_LIB" || -n "$(find "$REPO_ROOT/ALVRBridge/src" -newer "$ALVR_LIB" -name '*.rs' 2>/dev/null)" ]]; then
+        CARGO="$(command -v cargo || echo "$HOME/.cargo/bin/cargo")"
+        [[ -x "$CARGO" ]] || { echo "VERANTYX_ALVR=1 needs Rust (https://rustup.rs) to build ALVRBridge" >&2; exit 1; }
+        (cd "$REPO_ROOT/ALVRBridge" && "$CARGO" build --release --lib) || exit 1
+    fi
+    export VERANTYX_ALVR_LIB="$ALVR_LIB"
+    ALVR_SESSION="$HOME/Library/Application Support/VeRantyx/ALVR/session.json"
+    ALVR_HZ="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["openvr_config"]["refresh_rate"]))' "$ALVR_SESSION" 2>/dev/null || echo 90)"
+    export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-$ALVR_HZ}"
+fi
 # The repository's driver, in the overlay's copy of SteamVR's drivers folder (SteamVR as downloaded has no
 # drivers/verantyx; the overlay's entries show in its listing).
 DRIVER_DLL="$REPO_ROOT/VRDriver/driver_verantyx.dll"
@@ -140,6 +155,7 @@ export VXRT_NO_ACTIVATE=1
 VXRT_PATTERN="VXRuntime/build/vxrt(-arm64)? .*[Ss]team[Vv][Rr]/bin/win64/vr"   # (either library's spelling; the path may have "(x86)")
 cleanup() {
     [[ -n "${ENCODER_PID:-}" ]] && kill -TERM "$ENCODER_PID" 2>/dev/null || true
+    pkill -TERM -f "^$ENCODER\$" 2>/dev/null || true             # (the encoder itself: ENCODER_PID is its restart loop)
     [[ -n "${WEBUI_PID:-}" ]] && kill -TERM "$WEBUI_PID" 2>/dev/null || true
     [[ -n "${VR_PID:-}" ]] && kill -TERM "$VR_PID" 2>/dev/null || true
     pkill -TERM -f "$VXRT_PATTERN" 2>/dev/null || true   # vrserver and vrcompositor outlive vrcmd, as on Windows
@@ -153,14 +169,19 @@ trap cleanup EXIT INT TERM
 VR_PID=$!
 echo "SteamVR on VXRuntime started (log: $LOG_DIR/vxrt-steamvr.log)"
 
-VERANTYX_SHARED_FRAME="$VXRT_VR_ROOT/drive_c/vr_shared_frame.dat" "$ENCODER" >"$LOG_DIR/hardware-encoder.log" 2>&1 &
+# (exit 75: an ALVR headset brought other display settings, stored: the encoder again, which connects with them)
+(while :; do VERANTYX_SHARED_FRAME="$VXRT_VR_ROOT/drive_c/vr_shared_frame.dat" "$ENCODER"; [[ $? == 75 ]] || break; done) >"$LOG_DIR/hardware-encoder.log" 2>&1 &
 ENCODER_PID=$!
 
 # Games' SteamVR web UIs need vrwebhelper (Chromium), which does not run on VXRuntime: this answers for
 # Half-Life: Alyx's (it gives up after a minute without the page's "ready").
 python3 "$SCRIPT_DIR/vxrt_webui_standin.py" >"$LOG_DIR/webui-standin.log" 2>&1 &
 WEBUI_PID=$!
-echo "Encoder started (log: $LOG_DIR/hardware-encoder.log); open the Vision Pro app to connect"
+if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
+    echo "Encoder started with ALVR (log: $LOG_DIR/hardware-encoder.log); open an ALVR client app (20.x) on this network"
+else
+    echo "Encoder started (log: $LOG_DIR/hardware-encoder.log); open the Vision Pro app to connect"
+fi
 
 if [[ -n "${VXRT_VR_SECONDS:-}" ]]; then
     sleep "$VXRT_VR_SECONDS"

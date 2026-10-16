@@ -209,6 +209,7 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
     // in one place even if VideoToolbox invokes output on different threads.
     outputLock.lock()
     defer { outputLock.unlock() }
+    if let alvr { alvrSendFrame(alvr, sampleBuffer, isKeyFrame: isKeyFrame, timestamp: visionTimestamp) }
     encoderDiagnosticLock.lock()
     compressedFrameCount += 1
     let outputFrameNumber = compressedFrameCount
@@ -398,7 +399,73 @@ func environmentDouble(_ name: String, default fallback: Double, range: ClosedRa
 // made a visible hitch twice a second; lost frames already request an IDR.
 let keyFrameIntervalSeconds = environmentDouble("VERANTYX_KEYFRAME_INTERVAL", default: 3.0, range: 0.5...30)
 let videoBitrate = Int32(environmentDouble("VERANTYX_BITRATE_MBPS", default: 20, range: 2...80) * 1_000_000)
-let hevcTenBit = ProcessInfo.processInfo.environment["VERANTYX_HEVC_10BIT"] != "0"
+// ALVR (VERANTYX_ALVR=1): ALVR's streaming core (ALVRBridge/, its library loaded at run time from VERANTYX_ALVR_LIB)
+// takes the frames as well, for the ALVR client apps (Quest, Pico, the Vision Pro's "ALVR"); their poses and buttons
+// go into SharedHands as the Vision Pro app's do, so the driver sees no difference. Each frame goes with the time of
+// the tracking sample it was rendered for (SharedHands.visionTimestamp, in ALVR's clock).
+struct ALVRBridge {
+    let start: @convention(c) (UnsafePointer<CChar>?) -> Bool
+    let input: @convention(c) (UnsafeMutableRawPointer, UInt64) -> UInt64
+    let connected: @convention(c) () -> Bool
+    let takeIDR: @convention(c) () -> Bool
+    let setConfig: @convention(c) (UnsafePointer<UInt8>, Int) -> Void
+    let send: @convention(c) (Double, UnsafePointer<UInt8>, Int, Bool) -> Void
+    let restartNeeded: @convention(c) () -> Bool
+}
+let alvrMode = ProcessInfo.processInfo.environment["VERANTYX_ALVR"] == "1"
+func loadALVRBridge() -> ALVRBridge? {
+    let path = ProcessInfo.processInfo.environment["VERANTYX_ALVR_LIB"] ?? "ALVRBridge/target/release/libverantyx_alvr_bridge.dylib"
+    guard let lib = dlopen(path, RTLD_NOW) else { print("ALVR: cannot load \(path): \(String(cString: dlerror()))"); return nil }
+    func fn<T>(_ name: String, _ type: T.Type) -> T? { dlsym(lib, name).map { unsafeBitCast($0, to: type) } }
+    guard let start = fn("vx_alvr_start", (@convention(c) (UnsafePointer<CChar>?) -> Bool).self),
+          let input = fn("vx_alvr_input", (@convention(c) (UnsafeMutableRawPointer, UInt64) -> UInt64).self),
+          let connected = fn("vx_alvr_connected", (@convention(c) () -> Bool).self),
+          let takeIDR = fn("vx_alvr_take_idr_request", (@convention(c) () -> Bool).self),
+          let setConfig = fn("vx_alvr_set_config", (@convention(c) (UnsafePointer<UInt8>, Int) -> Void).self),
+          let send = fn("vx_alvr_send", (@convention(c) (Double, UnsafePointer<UInt8>, Int, Bool) -> Void).self),
+          let restartNeeded = fn("vx_alvr_restart_needed", (@convention(c) () -> Bool).self)
+    else { print("ALVR: \(path) lacks the bridge's functions"); return nil }
+    let bridge = ALVRBridge(start: start, input: input, connected: connected, takeIDR: takeIDR, setConfig: setConfig, send: send, restartNeeded: restartNeeded)
+    guard bridge.start(nil) else { print("ALVR: the streaming core did not start"); return nil }
+    print("ALVR: streaming core started (\(path)); open an ALVR client on this network")
+    return bridge
+}
+let alvr: ALVRBridge? = alvrMode ? loadALVRBridge() : nil
+var alvrConfig = Data()
+
+// The encoded frame to ALVR: Annex-B, the parameter sets before an IDR (and given to the core when they change).
+func alvrSendFrame(_ alvr: ALVRBridge, _ sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, timestamp: Double) {
+    var config = Data()
+    let startCode: [UInt8] = [0, 0, 0, 1]
+    if isKeyFrame, let fd = CMSampleBufferGetFormatDescription(sampleBuffer) {
+        for i in 0..<3 {
+            var p: UnsafePointer<UInt8>? = nil; var n = 0
+            if CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, parameterSetIndex: i, parameterSetPointerOut: &p,
+                                                                  parameterSetSizeOut: &n, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr, let p {
+                config.append(contentsOf: startCode); config.append(p, count: n)
+            }
+        }
+        if !config.isEmpty && config != alvrConfig {
+            alvrConfig = config
+            config.withUnsafeBytes { alvr.setConfig($0.bindMemory(to: UInt8.self).baseAddress!, config.count) }
+        }
+    }
+    guard alvr.connected(), let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+    var length = 0; var ptr: UnsafeMutablePointer<Int8>? = nil
+    guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &ptr) == noErr, let base = ptr else { return }
+    var au = isKeyFrame ? config : Data()
+    var offset = 0
+    while offset + 4 <= length {
+        let n = Int(UInt32(bigEndian: UnsafeRawPointer(base + offset).loadUnaligned(as: UInt32.self)))
+        guard n > 0, n <= length - offset - 4 else { requestKeyFrame(); return }
+        au.append(contentsOf: startCode)
+        au.append(UnsafeRawPointer(base + offset + 4).assumingMemoryBound(to: UInt8.self), count: n)
+        offset += 4 + n
+    }
+    au.withUnsafeBytes { alvr.send(timestamp, $0.bindMemory(to: UInt8.self).baseAddress!, au.count, isKeyFrame) }
+}
+
+let hevcTenBit = ProcessInfo.processInfo.environment["VERANTYX_HEVC_10BIT"].map { $0 != "0" } ?? !alvrMode   // (ALVR: Main, which every ALVR client decodes)
 // Pace UDP bursts so AWDL does not drop them, but fast enough that a frame
 // does not spend most of its interval queued behind the previous one.
 let sendPacingBytesPerSecond = environmentDouble("VERANTYX_SEND_PACING_MBPS", default: 60, range: 8...400) * 1_000_000 / 8
@@ -642,6 +709,51 @@ func withSharedHandsWrite(_ write: () -> Void) {
     write()
     OSMemoryBarrier()
     dbHeaderPtr.pointee.poseSequence = odd &+ 1
+}
+
+// ALVR's input into SharedHands (offsets as the Vision Pro's POSE packet writes them; ALVRBridge's VxAlvrInput layout,
+// which its Rust side checks at compile time), and its clients' IDR requests to the encoder.
+if let alvr {
+    Thread {
+        let input = UnsafeMutableRawPointer.allocate(byteCount: 312, alignment: 8)
+        var seq: UInt64 = 0
+        var checked = Date()
+        while isEncoding {
+            if alvr.takeIDR() { requestKeyFrame() }
+            if Date().timeIntervalSince(checked) > 0.5 {                // (a headset with other display settings:
+                checked = Date()                                        //  scripts/launch_vxrt_steamvr.sh starts the
+                if alvr.restartNeeded() {                               //  encoder again, which connects with them)
+                    print("ALVR: the headset brought other display settings (stored): the encoder starts again")
+                    fflush(stdout)
+                    exit(75)
+                }
+            }
+            let next = alvr.input(input, seq)
+            if next != seq {
+                seq = next
+                withSharedHandsWrite {
+                    memcpy(handsMapPtr, input + 8, 64)                 // head, left, right (column-major)
+                    memcpy(handsMapPtr + 64, input + 72, 64)
+                    memcpy(handsMapPtr + 128, input + 136, 64)
+                    memcpy(handsMapPtr + 192, input + 305, 4)          // leftTracked rightTracked leftTrigger rightTrigger
+                    memcpy(handsMapPtr + 196, input + 296, 8)          // rightButtons leftButtons
+                    memcpy(handsMapPtr + 204, input + 256, 8)          // right stick
+                    memcpy(handsMapPtr + 212, input + 248, 8)          // left stick
+                    memcpy(handsMapPtr + 220, input + 212, 12)         // right velocity
+                    memcpy(handsMapPtr + 232, input + 200, 12)         // left velocity
+                    memcpy(handsMapPtr + 244, input, 8)                // the sample's time (the frame's pose id)
+                    if input.load(fromByteOffset: 311, as: UInt8.self) != 0 {
+                        memcpy(handsMapPtr + 252, input + 264, 32)     // eye tangents, left then right
+                    }
+                    memcpy(handsMapPtr + 284, input + 309, 2)          // grips
+                    memcpy(handsMapPtr + 286, input + 304, 1)          // headTracked
+                    memcpy(handsMapPtr + 287, input + 224, 24)         // angular velocities, left then right
+                    handsMapPtr.advanced(by: 311).storeBytes(of: UInt8(1), as: UInt8.self)
+                }
+            }
+            usleep(500)
+        }
+    }.start()
 }
 
 var lastSeq: UInt32 = 0
