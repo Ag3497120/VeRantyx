@@ -1,0 +1,33 @@
+name: RemoteSpatialProbe
+options:
+  bundleIdPrefix: dev.verantyx
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    # Ad-hoc signing by default. scripts/build.sh can switch to the
+    # local "Apple Development" identity if the headset refuses ad-hoc apps.
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: NO
+targets:
+  RemoteSpatialProbe:
+    type: application
+    platform: macOS
+    sources:
+      - path: RemoteSpatialProbe
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.verantyx.RemoteSpatialProbe
+        PRODUCT_NAME: RemoteSpatialProbe
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: RemoteSpatialProbe
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "RemoteSpatialProbe renders an immersive space on your Apple Vision Pro."
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        SWIFT_OBJC_BRIDGING_HEADER: RemoteSpatialProbe/ShaderTypes.h
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
