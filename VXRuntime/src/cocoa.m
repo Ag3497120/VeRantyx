@@ -284,7 +284,12 @@ void vx_cocoa_create(vx_window *w) {
         VXWindowDelegate *d = [VXWindowDelegate new];
         d->w = w;
         win.delegate = d;
-        if (w->center) [win center];
+        if (w->center) {                                       // (an owned window, a dialog: over its owner, on its screen)
+            vx_window *owner = w->parent ? vx_window_get(w->parent) : NULL;
+            NSWindow *ow = owner && owner->native ? (__bridge NSWindow *)owner->native : nil;
+            if (ow) { NSRect o = ow.frame, f = win.frame; [win setFrameOrigin:NSMakePoint(NSMidX(o) - f.size.width / 2, NSMidY(o) - f.size.height / 2)]; }
+            else [win center];
+        }
         w->native = (__bridge_retained void *)win;
         w->delegate = (__bridge_retained void *)d;
         pthread_mutex_lock(&w->lock);

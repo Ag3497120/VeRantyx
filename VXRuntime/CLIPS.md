@@ -83,6 +83,12 @@ output and file); with Command Clips in 30 % less time (mean 69.9 s against 99.3
 tokens about the same. The screenshots here were the easiest kind (the program's windows only, 1x); details and the
 caveats in `demos/m3-compare/README.md`.
 
+Harder (`demos/m3-hard/README.md`): an 18-item list in pages, look-alike names, a small font, a confirmation that
+reads "Remove ... ?" with "[ Cancel ]" first, and for the screenshot agents the whole screen at Retina scale with
+another app's window that mentions the same words. Command Clips 3 of 3, mean 85.7 s, 15-16 tool calls, 57 k tokens;
+screenshots 3 of 4, mean 190.9 s, 30-33 calls, 71 k tokens. The failed one could not see the confirmation, which had
+opened on the other display; the runtime now centers a window with an owner over its owner.
+
 ## Checked
 
 `tests/clip.c` (a counter, a button drawn into a memory DC and blitted, typed text, R to reset), driven only through
