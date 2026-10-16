@@ -58,6 +58,7 @@ int main(int argc, char **argv) {
 #define c (*cp)
     for (int k = 0; k < 8; k++) {
         if (!addr[k]) { fprintf(stderr, "bench: no %s\n", K[k].name); return 1; }
+        if (getenv("XB_ONLY") && !strstr(K[k].name, getenv("XB_ONLY"))) continue;   // (one kernel, for a profiler)
         uint64_t r = 0; double best = 1e9;
         for (int rep = -1; rep < reps; rep++) {                  // (rep -1: the warm-up call with 1, as rosetta_main.c)
             memset(&c, 0, sizeof c);

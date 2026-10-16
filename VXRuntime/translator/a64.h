@@ -34,6 +34,8 @@ static inline uint32_t a64_add_lsl(int d, int n, int m, int sh) { return 0x8B000
 static inline uint32_t a64_addi(int d, int n, uint32_t imm12) { return 0x91000000u | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_subi(int d, int n, uint32_t imm12) { return 0xD1000000u | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_cmp(int n, int m) { return a64_subs(XZR, n, m); }
+static inline uint32_t a64_addsi(int d, int n, uint32_t imm12) { return 0xB1000000u | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)d; }
+static inline uint32_t a64_subsi(int d, int n, uint32_t imm12) { return 0xF1000000u | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_cmpi(int n, uint32_t imm12) { return 0xF100001Fu | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5; }
 static inline uint32_t a64_cmni(int n, uint32_t imm12) { return 0xB100001Fu | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5; }
 

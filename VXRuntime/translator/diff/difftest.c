@@ -354,6 +354,22 @@ static void fusable(void) {
     int a = preg(0), c = preg(0), k = (int)(rnd() % 6), sz = (int)(rnd() % 4);   // (k: CMP TEST SUB AND OR XOR; sz: 8 16 32 64)
     static const uint8_t rr[] = { 0x38, 0x84, 0x28, 0x20, 0x08, 0x30 }, grp[] = { 7, 0, 5, 4, 1, 6 }, acc[] = { 0x3C, 0xA8, 0x2C, 0x24, 0x0C, 0x34 };
     int imm = sz == 0 ? 1 : sz == 1 ? 2 : 4;
+    if (rnd() % 6 == 0) {                                            // INC / DEC of a register (a value at an edge: 0, 1,
+        static const uint32_t edge[] = { 0, 1, 0xFFFFFFFF, 0x7F, 0x80, 0xFF, 0x7FFF, 0x8000, 0xFFFF, 0x7FFFFFFF, 0x80000000 };   //  -1, signed
+        uint32_t v = (rnd() & 3) ? edge[rnd() % 11] : (uint32_t)rnd();   //  limits) or memory; the CF before it kept
+        clean_flags();
+        if (rnd() % 4 == 0) {                                        // ([RBX + d]: the value written there)
+            int d = (int)(rnd() % 112);
+            memcpy(g_mem + 1024 + d, &v, 4);
+            if (sz == 1) *pp++ = 0x66;
+            rex_rr(sz == 3, 0, 3, 0); *pp++ = sz == 0 ? 0xFE : 0xFF; *pp++ = (uint8_t)(0x40 | (rnd() & 1) << 3 | 3); *pp++ = (uint8_t)d;
+            return;
+        }
+        rex_rr(sz == 3, 0, a, 0); *pp++ = 0xC7; *pp++ = (uint8_t)(0xC0 | (a & 7)); memcpy(pp, &v, 4); pp += 4;   // (MOV: sign-extended)
+        if (sz == 1) *pp++ = 0x66;
+        rex_rr(sz == 3, 0, a, sz == 0); *pp++ = sz == 0 ? 0xFE : 0xFF; *pp++ = (uint8_t)(0xC0 | (rnd() & 1) << 3 | (a & 7));
+        return;
+    }
     if (sz == 1) *pp++ = 0x66;
     if (rnd() % 6 == 0) {                                            // (U)COMISS/SD: registers or memory (special floats there)
         static const int xr[] = { 0, 1, 2, 9 };

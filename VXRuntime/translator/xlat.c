@@ -1029,7 +1029,8 @@ static int xlat_one(xlat_buf *b, const x86_insn *d, uint64_t rip) {
             rd_rm(b, d, T_A, sz, next); E(b, a64_movz(T_B, 1, 0));
             E(b, g ? a64_sub(T_R, T_A, T_B) : a64_add(T_R, T_A, T_B));
             wr_rm(b, d, T_R, sz); flags_arith(b, g ? K_SUB : K_ADD, sz, 1);
-            return 0;
+            if (b->keep_operands && !g) mov_imm(b, T_B, sz == 8 ? ~0ull : (1ull << 8 * sz) - 1);   // (fused: x + 1's ZF SF OF
+            return 0;                                                    //  are those of x - (-1), for fused_cond)
         }
         if (op == 0xC0 || op == 0xC1 || (op >= 0xD0 && op <= 0xD3)) {    // shifts and rotates
             int sz = (op & 1) ? size : 1, g = reg & 7;
@@ -1444,6 +1445,11 @@ static int direct_compare(xlat_buf *b, const x86_insn *d) {
     else if (op == 0x85 && d->mod == 3) { r = d->rm; m = d->reg; logic = 1; }   // TEST
     else if (op == 0xA9) { r = 0; imm = (uint64_t)d->imm; logic = 1; }
     else if (op == 0xF7 && g <= 1 && d->mod == 3) { r = d->rm; imm = (uint64_t)d->imm; logic = 1; }
+    else if (op == 0xFF && g <= 1 && d->mod == 3) {                    // Rule: INC / DEC, the register itself: ADDS / SUBS
+        E(b, W(g ? a64_subsi(d->rm, d->rm, 1) : a64_addsi(d->rm, d->rm, 1)));   //  give x86's ZF SF OF
+        b->fuse_kind = 3;                                                //  (CF, which they keep, no fused Jcc reads)
+        return 1;
+    }
     else return 0;
     if (m < 0) {
         int64_t v = sz == 8 ? (int64_t)imm : (int64_t)(int32_t)imm;
@@ -1764,7 +1770,7 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         while (fuse_p >= 0 && !flag_fx(&ins[fuse_p]).rd && !flag_fx(&ins[fuse_p]).wr && no_memory(&ins[fuse_p])) fuse_p--;
         if (is_jcc(l) && fuse_p >= 0 && (l->opcode & 15) != 0xA && (l->opcode & 15) != 0xB) {
             const x86_insn *p = &ins[fuse_p];
-            int po = p->opcode, g = p->reg & 7, k = 0, sz = p->opsize, aop = -1, reg_dest = 0;
+            int po = p->opcode, g = p->reg & 7, k = 0, sz = p->opsize, aop = -1, reg_dest = 0, incdec = 0;
             if (p->map == X86_MAP_1 && !(p->prefixes & (X86_P_VEX | X86_P_EVEX | X86_P_LOCK))) {
                 if (po < 0x40 && (po & 7) < 6) { aop = po >> 3; reg_dest = (po & 7) >= 2 || p->mod == 3; if (!(po & 1) && (po & 7) < 4) sz = 1; if ((po & 7) == 4) sz = 1; }
                 else if (po >= 0x80 && po <= 0x83 && po != 0x82) { aop = g; reg_dest = p->mod == 3; if (po == 0x80) sz = 1; }
@@ -1772,8 +1778,10 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
                 else if ((po == 0xF6 || po == 0xF7) && g <= 1) { k = 2; if (po == 0xF6) sz = 1; }
                 if (aop == 7 || (aop == 5 && reg_dest)) k = 1;
                 else if ((aop == 1 || aop == 4 || aop == 6) && reg_dest) k = 2;
+                else if ((po == 0xFE || po == 0xFF) && g <= 1) { k = 1; incdec = 1; if (po == 0xFE) sz = 1; }   // (rules)
             }
-            if (k && (k == 1 || ((l->opcode & 15) >= 4))) { fuse_k = k; fuse_sz = sz; fuse_cc = l->opcode & 15; }
+            int cc = l->opcode & 15, reads_cf = cc == 2 || cc == 3 || cc == 6 || cc == 7;   // (INC / DEC keep CF)
+            if (k && (k == 1 || cc >= 4) && !(incdec && reads_cf)) { fuse_k = k; fuse_sz = sz; fuse_cc = cc; }
         }
     }
     uint16_t live = out, live_after[64];
@@ -1835,7 +1843,7 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         int c = control_linked(b, &d, rip);
         if (c < 0) { b->dead_flags = 0; return -1; }
         if (c) { b->dead_flags = 0; *end = rip + d.len; return 0; }
-        if (fuse_k && i == fuse_p && i != lazy_at && fuse_p == n - 2 && (dead[i] & F_ARITH) == F_ARITH && direct_compare(b, &d)) {
+        if (fuse_k && i == fuse_p && i != lazy_at && fuse_p == n - 2 && (dead[i] & flag_fx(&d).wr) == flag_fx(&d).wr && direct_compare(b, &d)) {
             b->dead_flags = 0; b->keep_operands = 0; rip += d.len; continue;
         }
         if (fuse_k == 1 && i == fuse_p && i != lazy_at && (dead[i] & F_ARITH) == F_ARITH && mem_compare(b, &d, rip + d.len, fuse_cc, fuse_p == n - 2)) {

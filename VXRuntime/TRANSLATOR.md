@@ -353,6 +353,7 @@ a deliberate mistake planted in it makes difftest fail (the generator reaches it
 | IMUL with every flag dead: the product alone | `imul:` | 16 -> 5 instructions for `imul $imm, r, r` |
 | Lazy flags: the last instruction to set the flags, when only code past where the look-ahead stops (a RET, an indirect branch) may read them, records its operands and result (`ctx->pend_*`, x27 bit 3, reserved in EFLAGS) instead of computing them; a block's first reader (or a writer of some flags whose others are read later) computes them through the engine's stub; merge_flags clears the bit at no cost; leaving translated code and C (faults, SuspendThread: `xlat_flags_resolve`) compute them | `flags_arith`, `xlat_flags_stub`, block_linked | MacBook Pro M1 Max: fib 0.304 -> 0.210 ms, interp 36.3 -> 30.5 ms, others unchanged (ABBA); MacBook Air M5: interp 16.1 -> 10.8 ms (Rosetta 11.4), fib 0.176 -> 0.144 ms |
 | (U)COMISS/SD whose flags only a JA/JAE/JB/JBE/JP/JNP right after reads: FCMP (FCMPE for COMIS) and B.GT/GE/LT/LE/VS/VC on its NZCV (unordered: C and V set, so these match x86's CF ZF PF; JE/JNE need two conditions and stay as they were) | `fp_fuse`, `fuse_kind` 6 | physics 8.40 -> 6.37 ms (MacBook Pro M1 Max, ABBA); `ucomiss; jbe` 23 -> 8 words |
+| INC/DEC whose flags only a Jcc right after reads (not one reading CF, which they keep): ADDS/SUBS #1 on the register itself (32/64 bits) and the B.cond; other sizes and memory compare their operands (INC's ZF SF OF are those of x - (-1)) | `direct_compare`, `fused_cond` | `decq; jne` 22 -> 9 words; no change in the bench on its own |
 | FEAT_AFP (Apple M2+; not in the vCPU): FPCR.AH = 1, so ADD/SUB/MUL/DIV (ss sd ps pd) need no NaN fix-up; FZ/FIZ are MXCSR's FTZ/DAZ exactly | `afp`, `mxcsr_to_fpcr` | physics 4.7 -> 3.7 ms, matmul 6.7 -> 6.35 (MacBook Air M5); on the M5 the old path's FMA NaNs differed from Rosetta's there, with AH they match (985 forms) |
 
 Lazy flags were checked the same way: the record's operand, its kind, the reader's check and the exit's check, the
@@ -364,7 +365,14 @@ first flag writer, cost 3-9 %; the second, checking at partial writers whatever 
 slower (an INC after every switch case computed the record each time).
 
 Mutations checked (each made difftest fail): CBZ/CBNZ swapped (adjacent and across), CMP with the immediate + 1,
-IMUL of the wrong operand. Seen next by the brief: `cmp r, r; jge` whose flags the successors read again (40 ARM64
+IMUL of the wrong operand, INC/DEC by 2, INC's -1 off by one, INC/DEC fused with a Jcc that reads CF.
+
+Found with a profiler (`sample`, the hot addresses against XE_DUMP; `XB_ONLY=<kernel>` runs one kernel of the bench):
+a branch back to its own block (a loop of one block, a recursive call) was never linked: the block is not in the map
+while it is translated, so the site stayed a BL to the link stub, whose lookup then found the block every time and
+patched nothing. 70 % of string's time was the lookup stub. Such sites are now linked to the block's own start when it
+is put in (`self` in block_ex): string 30.9 -> 14.1 ms (Rosetta 11.4), sort 30.4 -> 27.4, tree 40.5 -> 38.9 (MacBook
+Pro M1 Max, ABBA). Seen next by the brief: `cmp r, r; jge` whose flags the successors read again (40 ARM64
 instructions computing all six flags), a candidate for flags computed only when read.
 
 ## Phases

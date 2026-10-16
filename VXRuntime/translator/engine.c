@@ -367,7 +367,8 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
         e->stats.flushes++;
     }
     uint32_t *at = e->code + e->used;
-    writable(1);
+    uint32_t *self[16]; int nself = 0;                                    // (sites to this block itself: a loop, a recursive
+    writable(1);                                                          //  call; it is not in the map yet)
     memcpy(at, b.code, b.n * 4);
     for (size_t i = 0; i < b.nrelocs; i++) {
         uint32_t *p = at + b.relocs[i].at;
@@ -376,11 +377,15 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
         else if (b.relocs[i].kind == XR_LOOKUP_CALL) *p = a64_bl((int32_t)(e->lookup - p));
         else if (b.relocs[i].kind == XR_FLAGS) *p = a64_bl((int32_t)(e->flags_stub - p));
         else if (b.relocs[i].kind == XR_CALL) {                          // (the return's site, 3 words, then the target)
-            mentry *t = find_entry(e, (uint64_t)p[4] | (uint64_t)p[5] << 32);
+            uint64_t to = (uint64_t)p[4] | (uint64_t)p[5] << 32;
+            mentry *t = find_entry(e, to);
+            if (!t && to == rip && !once && nself < 16) { *p = a64_bl((int32_t)(at - p)); self[nself++] = p; continue; }
             *p = a64_bl(t ? (int32_t)((uint32_t *)(uintptr_t)t->host - p) : (int32_t)(e->link_call - p));
             if (t) { e->stats.linked++; add_site(e, t->id, p, 1); }
         } else {
-            mentry *t = find_entry(e, (uint64_t)p[1] | (uint64_t)p[2] << 32);
+            uint64_t to = (uint64_t)p[1] | (uint64_t)p[2] << 32;
+            mentry *t = find_entry(e, to);
+            if (!t && to == rip && !once && nself < 16) { *p = a64_b((int32_t)(at - p)); self[nself++] = p; continue; }
             *p = t ? a64_b((int32_t)((uint32_t *)(uintptr_t)t->host - p)) : a64_bl((int32_t)(e->link - p));
             if (t) { e->stats.linked++; add_site(e, t->id, p, 0); }
         }
@@ -399,6 +404,7 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
     if (e->nblocks == e->cblocks) { e->cblocks = e->cblocks ? 2 * e->cblocks : 1024; e->blocks = realloc(e->blocks, e->cblocks * sizeof *e->blocks); }
     uint32_t id = (uint32_t)e->nblocks++;
     e->blocks[id] = (blk){ rip, end, host, NULL, 0, 0, 0 };
+    for (int k = 0; k < nself; k++) { e->stats.linked++; add_site(e, id, self[k], (*self[k] & 0xFC000000u) == 0x94000000u); }
     if (!once) {
         uint32_t i = idx(rip, MAP_BITS);
         while (e->map[i].rip) i = (i + 1) & ((1u << MAP_BITS) - 1);
