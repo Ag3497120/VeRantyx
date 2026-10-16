@@ -1,0 +1,21 @@
+# The bridge between VeRantyx's Mac side and ALVR's streaming core (alvr_server_core, MIT): what lets the ALVR client
+# apps (Quest, Pico, visionOS) take VeRantyx's frames. ALVR is used as it is, at a release tag (README.md).
+[package]
+name = "verantyx_alvr_bridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+alvr_server_core = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_filesystem = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_common = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_session = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+alvr_packets = { git = "https://github.com/alvr-org/ALVR", tag = "v20.14.1" }
+serde_json = "1"
+
+[profile.release]
+debug = true

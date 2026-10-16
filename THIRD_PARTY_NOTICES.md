@@ -28,6 +28,10 @@ own Steam account:
   its own license) — fetched by `NativeARM/scripts/fetch_debian_libs.sh`
 - Fossilize (MIT, Valve) — fetched by `NativeARM/scripts/build_fossilize.sh`
   (optional experiment)
+- ALVR's streaming core and the crates it is built from (`alvr_server_core` and
+  its siblings, MIT, alvr-org), at tag v20.14.1, with the OpenVR SDK headers
+  ALVR's build reads (BSD-3-Clause, Valve) and ALVR's crates.io dependencies
+  (each under its own license) — fetched by Cargo when `ALVRBridge/` is built
 - Steam, SteamVR and the game — Valve Corporation, under their own terms. The
   native version uses the Linux ARM64 depot of Half-Life: Alyx, downloaded
   with your own account; the native launcher patches a few instructions of
