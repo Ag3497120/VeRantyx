@@ -354,6 +354,8 @@ a deliberate mistake planted in it makes difftest fail (the generator reaches it
 | Lazy flags: the last instruction to set the flags, when only code past where the look-ahead stops (a RET, an indirect branch) may read them, records its operands and result (`ctx->pend_*`, x27 bit 3, reserved in EFLAGS) instead of computing them; a block's first reader (or a writer of some flags whose others are read later) computes them through the engine's stub; merge_flags clears the bit at no cost; leaving translated code and C (faults, SuspendThread: `xlat_flags_resolve`) compute them | `flags_arith`, `xlat_flags_stub`, block_linked | MacBook Pro M1 Max: fib 0.304 -> 0.210 ms, interp 36.3 -> 30.5 ms, others unchanged (ABBA); MacBook Air M5: interp 16.1 -> 10.8 ms (Rosetta 11.4), fib 0.176 -> 0.144 ms |
 | (U)COMISS/SD whose flags only a JA/JAE/JB/JBE/JP/JNP right after reads: FCMP (FCMPE for COMIS) and B.GT/GE/LT/LE/VS/VC on its NZCV (unordered: C and V set, so these match x86's CF ZF PF; JE/JNE need two conditions and stay as they were) | `fp_fuse`, `fuse_kind` 6 | physics 8.40 -> 6.37 ms (MacBook Pro M1 Max, ABBA); `ucomiss; jbe` 23 -> 8 words |
 | INC/DEC whose flags only a Jcc right after reads (not one reading CF, which they keep): ADDS/SUBS #1 on the register itself (32/64 bits) and the B.cond; other sizes and memory compare their operands (INC's ZF SF OF are those of x - (-1)) | `direct_compare`, `fused_cond` | `decq; jne` 22 -> 9 words; no change in the bench on its own |
+| Zero idioms: XORPS/XORPD/PXOR/ANDNPS/PANDN/PSUBx/PCMPGTx of a register with itself are MOVI #0, XOR/SUB r, r (flags dead) MOVZ #0. EOR v, v, v is not a zero idiom on the Apple cores: it waits for v's last value, so the chains of a loop that each start from `xorps acc, acc` ran one after another instead of side by side | `xlat_sse` (0x57, the integer kernel), `fast` | matmul 10.2 -> 6.8 ms (MacBook Pro M1 Max; Rosetta 4.4, the rest is the NaN checks the M1 needs), 5.86 -> 2.30 ms (MacBook Air M5; Rosetta 2.81) |
+| One instruction for: AND/OR/XOR with a logical immediate, NEG with dead flags, PSHUFD's broadcasts and swaps (DUP, EXT, REV64), MOVD/MOVQ xmm to a register (UMOV into it), a 32-bit LEA with an index (no extra MOV); the forms without a ModRM byte (`and $imm, %eax`, `test $imm, %eax`, MOV r, imm) reach the fast paths at all (they were taken for memory operands) | `fast`, `shuf4`, `a64_logimm` | crc 2.57 -> 1.54 ms (M1 Max; Rosetta 1.49), 3.19/1.80 -> 1.09 ms (M5) |
 | FEAT_AFP (Apple M2+; not in the vCPU): FPCR.AH = 1, so ADD/SUB/MUL/DIV (ss sd ps pd) need no NaN fix-up; FZ/FIZ are MXCSR's FTZ/DAZ exactly | `afp`, `mxcsr_to_fpcr` | physics 4.7 -> 3.7 ms, matmul 6.7 -> 6.35 (MacBook Air M5); on the M5 the old path's FMA NaNs differed from Rosetta's there, with AH they match (985 forms) |
 
 Lazy flags were checked the same way: the record's operand, its kind, the reader's check and the exit's check, the
@@ -365,7 +367,14 @@ first flag writer, cost 3-9 %; the second, checking at partial writers whatever 
 slower (an INC after every switch case computed the record each time).
 
 Mutations checked (each made difftest fail): CBZ/CBNZ swapped (adjacent and across), CMP with the immediate + 1,
-IMUL of the wrong operand, INC/DEC by 2, INC's -1 off by one, INC/DEC fused with a Jcc that reads CF.
+IMUL of the wrong operand, INC/DEC by 2, INC's -1 off by one, INC/DEC fused with a Jcc that reads CF; the logical
+immediate's length off by one, NEG of the wrong operand, PSHUFD's DUP lane, EXT amount and REV64 replaced, MOVD's lane,
+XORPS / PXOR / XOR of two different registers taken as zero, a 32-bit LEA without its zero extension (the generator now
+has `lea d(r), r32`, PSHUFD, MOVD to registers, imm32 masks and the accumulator forms).
+
+Found by reproducing the engine's blocks as they are in assembly (the loop alone, called per output, ran at Rosetta's
+speed; the same blocks chained as the engine links them did not): the difference was `eor v2, v2, v2`, not the
+loop.
 
 Found with a profiler (`sample`, the hot addresses against XE_DUMP; `XB_ONLY=<kernel>` runs one kernel of the bench):
 a branch back to its own block (a loop of one block, a recursive call) was never linked: the block is not in the map

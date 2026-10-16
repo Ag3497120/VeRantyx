@@ -36,6 +36,31 @@ static inline uint32_t a64_subi(int d, int n, uint32_t imm12) { return 0xD100000
 static inline uint32_t a64_cmp(int n, int m) { return a64_subs(XZR, n, m); }
 static inline uint32_t a64_addsi(int d, int n, uint32_t imm12) { return 0xB1000000u | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_subsi(int d, int n, uint32_t imm12) { return 0xF1000000u | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5 | (uint32_t)d; }
+// AND / ORR / EOR with a logical immediate (a run of ones, rotated, repeated in 2..64-bit elements): N:immr:imms for
+// v in a 64-bit (is64) or 32-bit operation, or -1 when v is not one (0 and all ones never are).
+static inline int a64_logimm(uint64_t v, int is64) {
+    if (!is64) { v &= 0xFFFFFFFFu; v |= v << 32; }
+    if (!v || !~v) return -1;
+    int size = 64;
+    while (size > 2) {
+        int half = size / 2; uint64_t m = (1ull << half) - 1;
+        if ((v & m) != ((v >> half) & m)) break;
+        size = half;
+    }
+    uint64_t m = size == 64 ? ~0ull : (1ull << size) - 1, e = v & m;
+    int ones = __builtin_popcountll(e);
+    uint64_t run = (1ull << ones) - 1;
+    for (int r = 0; r < size; r++) {
+        uint64_t x = r ? ((run >> r) | (run << (size - r))) & m : run;   // (the run rotated right by r)
+        if (x == e) return (size == 64) << 12 | r << 6 | ((0x3F & ~(2 * size - 1)) | (ones - 1));
+    }
+    return -1;
+}
+static inline uint32_t a64_logi(int op, int d, int n, int enc) {          // op 0 AND, 1 ORR, 2 EOR (64 bits; a64_w32)
+    static const uint32_t base[] = { 0x92000000u, 0xB2000000u, 0xD2000000u };
+    return base[op] | (uint32_t)enc << 10 | (uint32_t)n << 5 | (uint32_t)d;
+}
+static inline uint32_t a64_rev64_4s(int d, int n) { return 0x4EA00800u | (uint32_t)n << 5 | (uint32_t)d; }
 static inline uint32_t a64_cmpi(int n, uint32_t imm12) { return 0xF100001Fu | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5; }
 static inline uint32_t a64_cmni(int n, uint32_t imm12) { return 0xB100001Fu | (imm12 & 0xFFF) << 10 | (uint32_t)n << 5; }
 

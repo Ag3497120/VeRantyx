@@ -110,6 +110,13 @@ static void cvt4_to_int(xlat_buf *b, int dst, int v, int trunc) {
 
 // SHUFPS / PSHUFD: four 32-bit lanes picked by imm from lo (lanes 0, 1) and hi (lanes 2, 3).
 static void shuf4(xlat_buf *b, int dst, int lo, int hi, int imm) {
+    if (lo == hi) {                                                      // (one source: the common patterns in one instruction)
+        if (imm == 0x00 || imm == 0x55 || imm == 0xAA || imm == 0xFF) { E(b, a64_dup_s(dst, lo, imm & 3)); return; }
+        if (imm == 0x44 || imm == 0xEE) { E(b, a64_dup_d(dst, lo, imm == 0xEE)); return; }
+        if (imm == 0x4E) { E(b, a64_ext(dst, lo, lo, 8)); return; }
+        if (imm == 0xB1) { E(b, a64_rev64_4s(dst, lo)); return; }
+        if (imm == 0xE4) { if (dst != lo) E(b, a64_vmov(dst, lo)); return; }
+    }
     for (int i = 0; i < 4; i++) E(b, a64_ins_s(V_R, i, i < 2 ? lo : hi, imm >> (2 * i) & 3));
     E(b, a64_vmov(dst, V_R));
 }
@@ -255,6 +262,7 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
     case 0x54: case 0x55: case 0x56: case 0x57: {                         // ANDPS ANDNPS ORPS XORPS (and PD)
         if (scalar) return -1;
         int s = xmm_rm(b, d, 16, next);
+        if (d->mod == 3 && s == x && (op == 0x55 || op == 0x57)) { E(b, a64_movi0(x)); return 0; }   // (zero: as for PXOR below)
         E(b, op == 0x54 ? a64_vand(x, x, s) : op == 0x55 ? a64_vbic(x, s, x) : op == 0x56 ? a64_vorr(x, x, s) : a64_veor(x, x, s));
         return 0;
     }
@@ -488,6 +496,7 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
         int w = d->opsize == 8 ? 8 : 4;
         if (op == 0x6E) { rd_rm(b, d, T_A, w, next); E(b, w == 8 ? a64_fmov_dx(x, T_A) : a64_fmov_sw(x, T_A)); }
         else {
+            if (d->mod == 3) { E(b, w == 8 ? a64_umov_d(d->rm, x, 0) : a64_umov_s(d->rm, x, 0)); return 0; }   // (32 bits: the upper half cleared)
             E(b, w == 8 ? a64_umov_d(T_A, x, 0) : a64_umov_s(T_A, x, 0));
             if (d->mod != 3) ea(b, d, next, 0);
             wr_rm(b, d, T_A, w);
@@ -552,6 +561,10 @@ static int xlat_sse(xlat_buf *b, const x86_insn *d, uint64_t next) {
         E(b, op == 0xE1 || op == 0xE2 ? a64_sshl(sz, x, x, V_T) : a64_ushl(sz, x, x, V_T));
         return 0;
     }
+    // Zero idioms (XOR, ANDN, SUB, PCMPGT of a register with itself): MOVI #0, which the Apple cores rename without reading
+    // the register. EOR v, v, v waits for v's last value: chains of a loop that start from such a zero (an accumulator
+    // per output) then run one after another instead of side by side (matmul 10.1 -> 4.5 ms on an M1 Max).
+    if (d->mod == 3 && s == x && (op == 0xEF || op == 0xDF || (op >= 0xF8 && op <= 0xFB) || (op >= 0x64 && op <= 0x66))) { E(b, a64_movi0(x)); return 0; }
     switch (op) {
     case 0xFC: E(b, a64_add16b(x, x, s)); break;   case 0xFD: E(b, a64_add8h(x, x, s)); break;
     case 0xFE: E(b, a64_add4s(x, x, s)); break;    case 0xD4: E(b, a64_add2d(x, x, s)); break;

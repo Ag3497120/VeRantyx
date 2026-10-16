@@ -309,7 +309,13 @@ static void sse_insn(void) {
         }
         return;
     }
-    switch (rnd() % 8) {
+    switch (rnd() % 10) {
+    case 8: {                                            // PSHUFD (the patterns of one instruction, or any)
+        static const uint8_t im[] = { 0x00, 0x55, 0xAA, 0xFF, 0x44, 0xEE, 0x4E, 0xB1, 0xE4, 0x1B };
+        *pp++ = 0x66; rex_rr(0, x, y, 0); *pp++ = 0x0F; *pp++ = 0x70; *pp++ = (uint8_t)(0xC0 | (x & 7) << 3 | (y & 7));
+        *pp++ = (rnd() & 3) ? im[rnd() % 10] : (uint8_t)rnd(); break; }
+    case 9: { int a = preg(1), w = (int)(rnd() & 1);    // MOVD / MOVQ xmm to a general register (not RCX: LOOP counts in it)
+        *pp++ = 0x66; rex_rr(w, x, a, 0); *pp++ = 0x0F; *pp++ = 0x7E; *pp++ = (uint8_t)(0xC0 | (x & 7) << 3 | (a & 7)); break; }
     case 0: case 1: *pp++ = (uint8_t)pf; rex_rr(0, x, 3, 0); *pp++ = 0x0F; *pp++ = 0x10; *pp++ = (uint8_t)(0x43 | (x & 7) << 3); *pp++ = (uint8_t)(rnd() % 120); break;
     case 2: case 3: *pp++ = (uint8_t)pf; rex_rr(0, x, y, 0); *pp++ = 0x0F; *pp++ = arith[rnd() % 7]; *pp++ = (uint8_t)(0xC0 | (x & 7) << 3 | (y & 7)); break;
     case 4: *pp++ = (uint8_t)pf; rex_rr(0, x, 3, 0); *pp++ = 0x0F; *pp++ = arith[rnd() % 7]; *pp++ = (uint8_t)(0x43 | (x & 7) << 3); *pp++ = (uint8_t)(rnd() % 120); break;
@@ -322,7 +328,7 @@ static void sse_insn(void) {
 }
 static void body_insn(int no_rcx) {
     if (rnd() % 4 == 0) { sse_insn(); return; }
-    int k = (int)(rnd() % 13), w = (int)(rnd() & 1), a = preg(no_rcx), c = preg(no_rcx);
+    int k = (int)(rnd() % 14), w = (int)(rnd() & 1), a = preg(no_rcx), c = preg(no_rcx);
     static const uint8_t alu[] = { 0x01, 0x09, 0x11, 0x19, 0x21, 0x29, 0x31, 0x39, 0x85 };
     switch (k) {
     case 0: case 1: rex_rr(w, c, a, 0); *pp++ = alu[rnd() % 9]; *pp++ = (uint8_t)(0xC0 | (c & 7) << 3 | (a & 7)); flags_clean = 1; break;
@@ -335,11 +341,20 @@ static void body_insn(int no_rcx) {
     case 7: rex_rr(w, 0, a, 0); { int g = (int)(rnd() % 4); *pp++ = g < 2 ? 0xFF : 0xF7; *pp++ = (uint8_t)(0xC0 | g << 3 | (a & 7)); if (g != 2) flags_clean = 1; } break;
     case 8: if (!flags_clean) break; rex_rr(0, 0, a, 1); *pp++ = 0x0F; *pp++ = (uint8_t)(0x90 | (rnd() % 16)); *pp++ = (uint8_t)(0xC0 | (a & 7)); break;
     case 9: if (!flags_clean) break; rex_rr(w, a, c, 0); *pp++ = 0x0F; *pp++ = (uint8_t)(0x40 | (rnd() % 16)); *pp++ = (uint8_t)(0xC0 | (a & 7) << 3 | (c & 7)); break;
-    case 10: { int x = preg(no_rcx);                                 // LEA a, [c + x*s + disp8]
+    case 10: { int x = preg(no_rcx);                                 // LEA a, [c + x*s + disp8] (or [c + disp8], 0 too)
+             if (rnd() % 3 == 0) { rex_rr(w, a, c, 0); *pp++ = 0x8D; *pp++ = (uint8_t)(0x40 | (a & 7) << 3 | (c & 7)); *pp++ = (rnd() & 1) ? 0 : (uint8_t)rnd(); break; }
              *pp++ = (uint8_t)(0x40 | w << 3 | (a >> 3) << 2 | (x >> 3) << 1 | (c >> 3)); *pp++ = 0x8D; *pp++ = (uint8_t)(0x44 | (a & 7) << 3);
              *pp++ = (uint8_t)((rnd() % 4) << 6 | (x & 7) << 3 | (c & 7)); *pp++ = (uint8_t)rnd(); break; }
     case 11: rex_rr(0, 0, a, 0); *pp++ = (uint8_t)(0x50 | (a & 7)); if (rnd() & 1) body_insn(no_rcx); rex_rr(0, 0, c, 0); *pp++ = (uint8_t)(0x58 | (c & 7)); break;
     case 12: rex_rr(w, a, c, 0); *pp++ = 0x87; *pp++ = (uint8_t)(0xC0 | (a & 7) << 3 | (c & 7)); break;
+    case 13: {                                                       // ADD OR AND SUB XOR CMP with an imm32 (masks: logical
+        static const uint32_t im[] = { 1, 0xFF, 0xFFFF, 0xFFFF0000u, 0x0F0F0F0F, 0x80000000u, 0x7FFFFFFF, 0xFFFFFFFEu,   //  immediates
+                                       0x00FF00FF, 0xAAAAAAAA, 0xEDB88320u, 0x3C, 0xFFFFFFFFu };                      //  or not)
+        static const int ops[] = { 0, 1, 4, 5, 6, 7 };
+        int op = ops[rnd() % 6]; uint32_t v = (rnd() & 3) ? im[rnd() % 13] : (uint32_t)rnd();
+        if (rnd() & 1) { rex_rr(w, 0, 0, 0); *pp++ = (uint8_t)(op << 3 | 5); }        // (EAX / RAX, imm32: no ModRM)
+        else { rex_rr(w, 0, a, 0); *pp++ = 0x81; *pp++ = (uint8_t)(0xC0 | op << 3 | (a & 7)); }
+        memcpy(pp, &v, 4); pp += 4; flags_clean = 1; break; }
     }
 }
 static void clean_flags(void) {                      // CMP r, r: every flag defined
@@ -1564,8 +1579,8 @@ int main(int argc, char **argv) {
         long pbad = 0, pran = 0; char first[900] = "";
         int nprog = per * 4;
         for (int k = 0; k < nprog; k++) {
-            make_program(&c);
-            if (getenv("DT_PROG_FILE") && !k) { FILE *pf = fopen(getenv("DT_PROG_FILE"), "wb"); if (pf) { fwrite(c.prog, 1, c.prog_len, pf); fclose(pf); } }
+            make_program(&c);                            // (DT_PROG_FILE: each in turn, so a hang leaves its program)
+            if (getenv("DT_PROG_FILE")) { FILE *pf = fopen(getenv("DT_PROG_FILE"), "wb"); if (pf) { fwrite(c.prog, 1, c.prog_len, pf); fclose(pf); } }
             if (run_program(&c, &got) < 0) { snprintf(first, sizeof first, "not translated"); pbad++; break; }
             if (fwrite(&c, sizeof c, 1, out) != 1 || fflush(out) || fread(&want, sizeof want, 1, in) != 1) { fprintf(stderr, "ref_x86 stopped\n"); return 1; }
             pran++;

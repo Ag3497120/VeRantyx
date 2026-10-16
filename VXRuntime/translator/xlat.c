@@ -808,10 +808,10 @@ static int fast(xlat_buf *b, const x86_insn *d, uint64_t next) {
         if (disp > 0 && disp < 4096) E(b, W(a64_addi(reg, from, (uint32_t)disp)));
         else if (disp < 0 && disp > -4096) E(b, W(a64_subi(reg, from, (uint32_t)-disp)));
         else if (disp) { mov_imm(b, T_B, (uint64_t)(int64_t)disp); E(b, W(a64_add(reg, from, T_B))); }
-        else if (from != reg || sz == 4) E(b, sz == 8 ? a64_mov(reg, from) : a64_movw(reg, from));   // (32 bits: the upper half cleared)
-        return 1;
+        else if (d->index == 0xFF && (from != reg || sz == 4)) E(b, sz == 8 ? a64_mov(reg, from) : a64_movw(reg, from));   // (32 bits: the
+        return 1;                                                        //  upper half cleared; by the ADD already with an index)
     }
-    if (d->mod != 3 && !shared_access(b, d)) {                           // loads and stores, at base + offset when they fit
+    if (d->has_modrm && d->mod != 3 && !shared_access(b, d)) {           // loads and stores, at base + offset when they fit
         int32_t off; int n;
         if (d->rip_relative) return 0;
         if (d->map == X86_MAP_1 && op == 0x8B) { n = ea_fold(b, d, 0, sz, &off); E(b, a64_ld_off(sz, reg, n, off)); return 1; }
@@ -851,6 +851,7 @@ static int fast(xlat_buf *b, const x86_insn *d, uint64_t next) {
     if (op == 0x63 && d->mod == 3 && sz == 8) { E(b, a64_sbfx(reg, rm, 0, 32)); return 1; }   // MOVSXD
     if ((b->dead_flags & (F_ARITH & ~F_CF)) != (F_ARITH & ~F_CF)) return 0;
     if (op == 0xFF && g <= 1 && d->mod == 3) { E(b, W(g ? a64_subi(rm, rm, 1) : a64_addi(rm, rm, 1))); return 1; }   // INC DEC
+    if (op == 0xF7 && g == 3 && d->mod == 3 && (b->dead_flags & F_CF)) { E(b, W(a64_sub(rm, XZR, rm))); return 1; }   // NEG
     if (!(b->dead_flags & F_CF)) return 0;
     if (op == 0xA9 || (op == 0x85 && d->mod == 3) || (op == 0xF7 && g <= 1 && d->mod == 3)) return 1;   // TEST: nothing
     if ((op == 0xC1 || op == 0xD1) && d->mod == 3 && g >= 4) {          // SHL SHR SAR by an immediate (not 0: flags written)
@@ -874,9 +875,12 @@ static int fast(xlat_buf *b, const x86_insn *d, uint64_t next) {
             E(b, W((aop == 0) == (v >= 0) ? a64_addi(dst, dst, u) : a64_subi(dst, dst, u)));
             return 1;
         }
+        int enc = aop == 0 || aop == 5 ? -1 : a64_logimm(sz == 8 ? imm : (uint32_t)imm, sz == 8);
+        if (enc >= 0) { E(b, W(a64_logi(aop == 4 ? 0 : aop == 1 ? 1 : 2, dst, dst, enc))); return 1; }   // (a logical immediate)
         mov_imm(b, T_B, sz == 8 ? imm : (uint32_t)imm); src = T_B;
     }
-    E(b, W(aop == 0 ? a64_add(dst, dst, src) : aop == 1 ? a64_orr(dst, dst, src) : aop == 4 ? a64_and(dst, dst, src) :
+    if ((aop == 5 || aop == 6) && src == dst) { E(b, a64_movz(dst, 0, 0)); return 1; }   // (XOR / SUB r, r: MOVZ, which does not
+    E(b, W(aop == 0 ? a64_add(dst, dst, src) : aop == 1 ? a64_orr(dst, dst, src) : aop == 4 ? a64_and(dst, dst, src) :   //  wait for r)
            aop == 5 ? a64_sub(dst, dst, src) : a64_eor(dst, dst, src)));
     return 1;
     #undef W
