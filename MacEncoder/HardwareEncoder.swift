@@ -725,7 +725,8 @@ if let alvr {
                 if alvr.restartNeeded() {                               //  encoder again, which connects with them)
                     print("ALVR: the headset brought other display settings (stored): the encoder starts again")
                     fflush(stdout)
-                    exit(75)
+                    _exit(75)                                           // (not exit: its handlers ran into ALVR's and
+                                                                        //  the audio tap's threads, and it died of it)
                 }
             }
             let next = alvr.input(input, seq)

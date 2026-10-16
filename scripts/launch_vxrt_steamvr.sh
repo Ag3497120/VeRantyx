@@ -106,6 +106,7 @@ if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
     ALVR_SESSION="$HOME/Library/Application Support/VeRantyx/ALVR/session.json"
     ALVR_HZ="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["openvr_config"]["refresh_rate"]))' "$ALVR_SESSION" 2>/dev/null || echo 90)"
     export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-$ALVR_HZ}"
+    export VERANTYX_AUDIO="${VERANTYX_AUDIO:-0}"   # (no game audio over ALVR yet: the Mac's speakers play it, not muted)
 fi
 # The repository's driver, in the overlay's copy of SteamVR's drivers folder (SteamVR as downloaded has no
 # drivers/verantyx; the overlay's entries show in its listing).
