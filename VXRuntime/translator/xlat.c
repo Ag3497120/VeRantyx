@@ -1491,20 +1491,61 @@ static int mem_compare(xlat_buf *b, const x86_insn *d, uint64_t next, int cc, in
     return 1;
 }
 
+// Rule: a run of PUSH / POP of registers and MOV r64, RSP: stores and loads at offsets from x4, RSP's change kept in
+// b->sp_delta until an instruction that needs RSP itself (then one ADD / SUB), and taken up by a CALL or RET's own.
+// (PUSH and POP each as a store or load with writeback make the Apple cores forward a store to the load of the same
+// place more slowly: fib -18 % on an M1, -46 % on an M5 in assembly.) What a fault or SuspendThread sees: imap's sp.
+static void imap_mark(xlat_buf *b, uint64_t rip) {                      // (from here on: rip's code, RSP = x4 + sp_delta)
+    if (b->nimap == b->cimap) { b->cimap = b->cimap ? 2 * b->cimap : 64; b->imap = realloc(b->imap, b->cimap * sizeof *b->imap); }
+    b->imap[b->nimap].at = (uint32_t)b->n; b->imap[b->nimap].sp = b->sp_delta; b->imap[b->nimap++].rip = rip;
+}
+static void sp_apply(xlat_buf *b, int64_t by) {                          // x4 += by
+    if (by > 0 && by < 4096) E(b, a64_addi(4, 4, (uint32_t)by));
+    else if (by < 0 && by > -4096) E(b, a64_subi(4, 4, (uint32_t)-by));
+    else if (by) { mov_imm(b, S0, (uint64_t)by); E(b, a64_add(4, 4, S0)); }
+}
+static void sp_settle(xlat_buf *b, uint64_t rip, int64_t by) {           // x4 += sp_delta + by, then RSP = x4
+    sp_apply(b, b->sp_delta + by);
+    b->sp_delta = 0;
+    imap_mark(b, rip);
+}
+// 1: PUSH reg, 2: POP reg, 3: MOV r64, RSP (not RSP itself pushed, popped or written); 0: none of them.
+static int stack_run(const x86_insn *d) {
+    if (d->map != X86_MAP_1 || (d->prefixes & (X86_P_OPSIZE | X86_P_VEX | X86_P_EVEX | X86_P_LOCK))) return 0;
+    int op = d->opcode, r = (op & 7) | ((d->rex & 1) << 3);
+    if (op >= 0x50 && op <= 0x57 && r != 4) return 1;
+    if (op >= 0x58 && op <= 0x5F && r != 4) return 2;
+    if (d->opsize == 8 && d->mod == 3 && ((op == 0x89 && d->reg == 4 && d->rm != 4) || (op == 0x8B && d->rm == 4 && d->reg != 4))) return 3;
+    return 0;
+}
+static void stack_op(xlat_buf *b, const x86_insn *d, int kind, uint64_t rip) {
+    int r = (d->opcode & 7) | ((d->rex & 1) << 3);
+    if (kind == 1) {
+        if (b->sp_delta - 8 < -256) sp_settle(b, rip, 0);                // (beyond STUR's reach)
+        E(b, a64_st_off(8, r, 4, b->sp_delta - 8)); b->sp_delta -= 8;
+    } else if (kind == 2) {
+        if (b->sp_delta > 248) sp_settle(b, rip, 0);
+        E(b, a64_ld_off(8, r, 4, b->sp_delta)); b->sp_delta += 8;
+    } else {
+        int dst = d->opcode == 0x89 ? d->rm : d->reg;
+        if (!b->sp_delta) E(b, a64_mov(dst, 4));
+        else E(b, b->sp_delta > 0 ? a64_addi(dst, 4, (uint32_t)b->sp_delta) : a64_subi(dst, 4, (uint32_t)-b->sp_delta));
+    }
+}
+
 static int control_linked(xlat_buf *b, const x86_insn *d, uint64_t rip) {
     uint64_t next = rip + d->len, target = next + (uint64_t)d->imm;
     int op = d->opcode;
     if (d->map == X86_MAP_1) {
         if (op >= 0x70 && op <= 0x7F) goto jcc;
         if (op == 0xEB || op == 0xE9) { site_link(b, target); return 1; }
-        if (op == 0xE8) { mov_imm(b, T_A, next); E(b, a64_str8_pre(T_A, 4, -8)); site_call(b, T_A, next, 1, target); return 1; }
+        if (op == 0xE8) {                                                // (the return address at an offset, then RSP once)
+            mov_imm(b, T_A, next); E(b, a64_st_off(8, T_A, 4, b->sp_delta - 8)); sp_settle(b, rip, -8);
+            site_call(b, T_A, next, 1, target); return 1;
+        }
         if (op == 0xC3 || op == 0xC2) {
             uint64_t pop = 8 + (op == 0xC2 ? (uint64_t)(uint16_t)d->imm : 0);
-            if (pop == 8) E(b, a64_ldr8_post(S1, 4, 8));
-            else {
-                E(b, a64_ldr(8, S1, 4, 0));
-                if (pop < 4096) E(b, a64_addi(4, 4, (uint32_t)pop)); else { mov_imm(b, S0, pop); E(b, a64_add(4, 4, S0)); }
-            }
+            E(b, a64_ld_off(8, S1, 4, b->sp_delta)); sp_settle(b, rip, (int64_t)pop);
             site_ret(b); return 1;
         }
         if (op == 0xFF && ((d->reg & 7) == 2 || (d->reg & 7) == 4)) {
@@ -1833,8 +1874,11 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         if (!x86_decode((const uint8_t *)(uintptr_t)rip, 15, &d)) return -1;
         b->dead_flags = i < n ? dead[i] : 0;
         b->keep_operands = fuse_k && i == fuse_p;
-        if (b->nimap == b->cimap) { b->cimap = b->cimap ? 2 * b->cimap : 64; b->imap = realloc(b->imap, b->cimap * sizeof *b->imap); }
-        b->imap[b->nimap].at = (uint32_t)b->n; b->imap[b->nimap++].rip = rip;
+        imap_mark(b, rip);
+        int run = stack_run(&d);
+        int takes_sp = d.map == X86_MAP_1 && (d.opcode == 0xE8 || d.opcode == 0xC3 || d.opcode == 0xC2);   // (CALL, RET: theirs)
+        if (b->sp_delta && !run && !takes_sp) sp_settle(b, rip, 0);
+        if (run) { stack_op(b, &d, run, rip); b->dead_flags = 0; b->keep_operands = 0; rip += d.len; continue; }
         b->nskipped += b->dead_flags != 0;
         if (i == first_touch) {                                           // (pending flags: computed, or dropped when all six
             fx f = flag_fx(&d);                                           //  are written here)
@@ -1888,6 +1932,7 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         }
         rip += d.len;
     }
+    if (b->sp_delta) { imap_mark(b, rip); sp_settle(b, rip, 0); }      // (the next instruction's, in the next block)
     site_link(b, rip);
     *end = rip;
     return 0;

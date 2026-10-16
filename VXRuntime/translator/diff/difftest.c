@@ -328,7 +328,7 @@ static void sse_insn(void) {
 }
 static void body_insn(int no_rcx) {
     if (rnd() % 4 == 0) { sse_insn(); return; }
-    int k = (int)(rnd() % 14), w = (int)(rnd() & 1), a = preg(no_rcx), c = preg(no_rcx);
+    int k = (int)(rnd() % 15), w = (int)(rnd() & 1), a = preg(no_rcx), c = preg(no_rcx);
     static const uint8_t alu[] = { 0x01, 0x09, 0x11, 0x19, 0x21, 0x29, 0x31, 0x39, 0x85 };
     switch (k) {
     case 0: case 1: rex_rr(w, c, a, 0); *pp++ = alu[rnd() % 9]; *pp++ = (uint8_t)(0xC0 | (c & 7) << 3 | (a & 7)); flags_clean = 1; break;
@@ -347,6 +347,20 @@ static void body_insn(int no_rcx) {
              *pp++ = (uint8_t)((rnd() % 4) << 6 | (x & 7) << 3 | (c & 7)); *pp++ = (uint8_t)rnd(); break; }
     case 11: rex_rr(0, 0, a, 0); *pp++ = (uint8_t)(0x50 | (a & 7)); if (rnd() & 1) body_insn(no_rcx); rex_rr(0, 0, c, 0); *pp++ = (uint8_t)(0x58 | (c & 7)); break;
     case 12: rex_rr(w, a, c, 0); *pp++ = 0x87; *pp++ = (uint8_t)(0xC0 | (a & 7) << 3 | (c & 7)); break;
+    case 14: {                                                       // pushes, something that uses RSP, pops (stack runs)
+        int x = preg(no_rcx), y = preg(no_rcx);
+        rex_rr(0, 0, a, 0); *pp++ = (uint8_t)(0x50 | (a & 7)); rex_rr(0, 0, c, 0); *pp++ = (uint8_t)(0x50 | (c & 7));
+        switch (rnd() % 6) {
+        case 0: rex_rr(1, x, 4, 0); *pp++ = 0x8B; *pp++ = (uint8_t)(0x44 | (x & 7) << 3); *pp++ = 0x24; *pp++ = (uint8_t)(8 * (rnd() % 3)); break;   // MOV x, [RSP + d]
+        case 1: rex_rr(1, 4, x, 0); *pp++ = 0x89; *pp++ = (uint8_t)(0xE0 | (x & 7)); break;                     // MOV x, RSP
+        case 2: rex_rr(1, x, 4, 0); *pp++ = 0x8D; *pp++ = (uint8_t)(0x44 | (x & 7) << 3); *pp++ = 0x24; *pp++ = 8; break;   // LEA x, [RSP + 8]
+        case 3: *pp++ = 0x48; *pp++ = 0x83; *pp++ = 0xC4; *pp++ = 8; *pp++ = 0x48; *pp++ = 0x83; *pp++ = 0xEC; *pp++ = 8; flags_clean = 1; break;   // ADD RSP, 8; SUB RSP, 8
+        case 4: rex_rr(0, 0, x, 0); *pp++ = (uint8_t)(0x50 | (x & 7)); rex_rr(1, 4, y, 0); *pp++ = 0x89; *pp++ = (uint8_t)(0xE0 | (y & 7));
+                rex_rr(0, 0, x, 0); *pp++ = (uint8_t)(0x58 | (x & 7)); break;                                    // PUSH, MOV y, RSP, POP
+        case 5: break;
+        }
+        rex_rr(0, 0, c, 0); *pp++ = (uint8_t)(0x58 | (c & 7)); rex_rr(0, 0, a, 0); *pp++ = (uint8_t)(0x58 | (a & 7));
+        break; }
     case 13: {                                                       // ADD OR AND SUB XOR CMP with an imm32 (masks: logical
         static const uint32_t im[] = { 1, 0xFF, 0xFFFF, 0xFFFF0000u, 0x0F0F0F0F, 0x80000000u, 0x7FFFFFFF, 0xFFFFFFFEu,   //  immediates
                                        0x00FF00FF, 0xAAAAAAAA, 0xEDB88320u, 0x3C, 0xFFFFFFFFu };                      //  or not)

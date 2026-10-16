@@ -37,7 +37,7 @@ struct xe {
     uint64_t guest_base, guest_end;  //   guest.c's code: where the guest has it, and where it came from
     const uint8_t *guest_from;
     pthread_mutex_t lock;           // translating, linking, flushing (threads share the code)
-    struct { uint64_t host, rip; } *imap;   // every translated instruction's code, in order (then rip 0: a block's end)
+    struct { uint64_t host, rip; int64_t sp; } *imap;   // every translated instruction's code, in order (then rip 0: a block's end); sp: RSP = x4 + sp there
     size_t nimap, cimap;
     entry *table;                   // read by the lookup stub: direct-mapped
     mentry *map;                    // every block: open addressing (rip 0: empty)
@@ -181,7 +181,8 @@ int xe_fix_split(xe *e, void *uc_) {
     if (e->used + 8 >= e->cap) { pthread_mutex_unlock(&e->lock); return 0; }
     static const int bytes[4] = { 1, 2, 4, 8 };
     uint32_t *stub = e->code + e->used;
-    uint64_t rip = xe_rip_at(e, (uint64_t)(uintptr_t)pc);
+    int64_t sp;
+    uint64_t rip = xe_rip_sp_at(e, (uint64_t)(uintptr_t)pc, &sp);
     writable(1);
     stub[0] = 0xD5033BBFu;                                                // DMB ISH
     stub[1] = load ? a64_ldr(bytes[sz], (int)t, (int)n, 0) : a64_str(bytes[sz], (int)t, (int)n, 0);
@@ -191,8 +192,8 @@ int xe_fix_split(xe *e, void *uc_) {
     writable(0);
     sys_icache_invalidate(stub, 16); sys_icache_invalidate(pc, 4);
     if (e->nimap + 2 < e->cimap) {                                        // (a fault in the stub: still that instruction's)
-        e->imap[e->nimap].host = (uint64_t)(uintptr_t)stub; e->imap[e->nimap].rip = rip;
-        e->imap[e->nimap + 1].host = (uint64_t)(uintptr_t)(stub + 4); e->imap[e->nimap + 1].rip = 0;
+        e->imap[e->nimap].host = (uint64_t)(uintptr_t)stub; e->imap[e->nimap].rip = rip; e->imap[e->nimap].sp = sp;
+        e->imap[e->nimap + 1].host = (uint64_t)(uintptr_t)(stub + 4); e->imap[e->nimap + 1].rip = 0; e->imap[e->nimap + 1].sp = 0;
         __atomic_store_n(&e->nimap, e->nimap + 2, __ATOMIC_RELEASE);
     }
     e->used += 4; e->stats.split_patches++;
@@ -412,8 +413,10 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
         if (e->smc && !thunk) watch_block(e, id);
     }
     if (!once) put_entry(&e->table[idx(rip, TABLE_BITS)], rip, host);
-    for (size_t k = 0; k < b.nimap && e->nimap + 1 < e->cimap; k++) { e->imap[e->nimap].host = host + 4 * b.imap[k].at; e->imap[e->nimap++].rip = b.imap[k].rip; }
-    if (e->nimap < e->cimap) { e->imap[e->nimap].host = host + 4 * b.n; e->imap[e->nimap].rip = 0; __atomic_store_n(&e->nimap, e->nimap + 1, __ATOMIC_RELEASE); }
+    for (size_t k = 0; k < b.nimap && e->nimap + 1 < e->cimap; k++) {
+        e->imap[e->nimap].host = host + 4 * b.imap[k].at; e->imap[e->nimap].sp = b.imap[k].sp; e->imap[e->nimap++].rip = b.imap[k].rip;
+    }
+    if (e->nimap < e->cimap) { e->imap[e->nimap].host = host + 4 * b.n; e->imap[e->nimap].rip = 0; e->imap[e->nimap].sp = 0; __atomic_store_n(&e->nimap, e->nimap + 1, __ATOMIC_RELEASE); }
     free(b.imap);
     e->stats.blocks++; e->stats.x86_bytes += end - rip; e->stats.arm_insns += b.n;
     e->stats.flags_skipped += (uint64_t)b.nskipped; e->stats.fused += (uint64_t)b.nfused;
@@ -468,7 +471,9 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
             if (r == XV_FAULT) {                                          // (an access fault of the program's: its x86 state)
                 uint64_t pc, addr; int write;
                 xv_fault(&pc, &addr, &write);
-                uint64_t rip = xe_rip_at(e, pc);
+                int64_t sp;
+                uint64_t rip = xe_rip_sp_at(e, pc, &sp);
+                c->gpr[4] += (uint64_t)sp;                                // (pushes and pops not applied to x4 yet)
                 if (!rip) { fprintf(stderr, "[vxrt] engine: a fault at %#llx in no x86 instruction's code (address %#llx%s)\n", (unsigned long long)pc, (unsigned long long)addr, write ? ", a write" : ""); return -2; }
                 c->rip = rip;
                 if (write && xe_smc_write(e, addr)) c->single = 1;            // (code it had run: on at the write, alone)
@@ -487,10 +492,12 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
 }
 
 xe_stats xe_get_stats(const xe *e) { return e->stats; }
-uint64_t xe_rip_at(const xe *e, uint64_t pc) {
+uint64_t xe_rip_sp_at(const xe *e, uint64_t pc, int64_t *sp) {
     size_t n = __atomic_load_n(&e->nimap, __ATOMIC_ACQUIRE), lo = 0, hi = n;
     while (lo < hi) { size_t mid = (lo + hi) / 2; if (e->imap[mid].host <= pc) lo = mid + 1; else hi = mid; }
+    if (sp) *sp = lo ? e->imap[lo - 1].sp : 0;
     return lo ? e->imap[lo - 1].rip : 0;
 }
+uint64_t xe_rip_at(const xe *e, uint64_t pc) { return xe_rip_sp_at(e, pc, NULL); }
 int xe_in_guest(const xe *e, uint64_t pc) { return e && pc >= e->guest_base && pc < e->guest_end; }
 int xe_owns(const xe *e, uint64_t pc) { return e && pc >= (uint64_t)(uintptr_t)e->code && pc < (uint64_t)(uintptr_t)(e->code + e->cap); }

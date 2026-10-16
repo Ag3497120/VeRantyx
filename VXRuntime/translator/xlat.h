@@ -85,8 +85,9 @@ typedef struct {
     size_t ncold, ccold;
     uint16_t zhi[2];
     // xlat_block_linked: where each x86 instruction's code starts (for faults: the host pc's x86 RIP)
-    struct { uint32_t at; uint64_t rip; } *imap;
+    struct { uint32_t at; int32_t sp; uint64_t rip; } *imap;   // (sp: RSP is x4 + sp there, b->sp_delta)
     size_t nimap, cimap;             // XMM registers whose bits above 32 [0] / 64 [1] are known zero (xlat_block_linked)
+    int sp_delta;                // xlat_block_linked: RSP = x4 + sp_delta (pushes and pops not applied to x4 yet)
     int nfused, nskipped;        // (counts: Jccs fused, instructions whose flags were not computed)    // the Jcc after a CMP / TEST / SUB / ... whose flags are dead after it: its condition
                                  // from the operands left in the scratch registers (1: subtraction, 2: logic; 0: none)
     struct { uint32_t at, kind; } *relocs;   // xlat_block_linked's sites

@@ -356,6 +356,7 @@ a deliberate mistake planted in it makes difftest fail (the generator reaches it
 | INC/DEC whose flags only a Jcc right after reads (not one reading CF, which they keep): ADDS/SUBS #1 on the register itself (32/64 bits) and the B.cond; other sizes and memory compare their operands (INC's ZF SF OF are those of x - (-1)) | `direct_compare`, `fused_cond` | `decq; jne` 22 -> 9 words; no change in the bench on its own |
 | Zero idioms: XORPS/XORPD/PXOR/ANDNPS/PANDN/PSUBx/PCMPGTx of a register with itself are MOVI #0, XOR/SUB r, r (flags dead) MOVZ #0. EOR v, v, v is not a zero idiom on the Apple cores: it waits for v's last value, so the chains of a loop that each start from `xorps acc, acc` ran one after another instead of side by side | `xlat_sse` (0x57, the integer kernel), `fast` | matmul 10.2 -> 6.8 ms (MacBook Pro M1 Max; Rosetta 4.4, the rest is the NaN checks the M1 needs), 5.86 -> 2.30 ms (MacBook Air M5; Rosetta 2.81) |
 | One instruction for: AND/OR/XOR with a logical immediate, NEG with dead flags, PSHUFD's broadcasts and swaps (DUP, EXT, REV64), MOVD/MOVQ xmm to a register (UMOV into it), a 32-bit LEA with an index (no extra MOV); the forms without a ModRM byte (`and $imm, %eax`, `test $imm, %eax`, MOV r, imm) reach the fast paths at all (they were taken for memory operands) | `fast`, `shuf4`, `a64_logimm` | crc 2.57 -> 1.54 ms (M1 Max; Rosetta 1.49), 3.19/1.80 -> 1.09 ms (M5) |
+| Stack runs: PUSH / POP of registers and MOV r64, RSP as stores and loads at offsets from X4, RSP's change kept (`sp_delta`) until an instruction needs RSP (one ADD / SUB) or a CALL / RET takes it up with its own. Faults and SuspendThread get RSP = X4 + imap's `sp` | `stack_run`, `stack_op`, `sp_settle`, `xe_rip_sp_at` | fib 0.139 -> 0.131 ms on the MacBook Air M5 (-6 %), unchanged on the M1 Max; prologues 5 -> 3 + 1 instructions |
 | FEAT_AFP (Apple M2+; not in the vCPU): FPCR.AH = 1, so ADD/SUB/MUL/DIV (ss sd ps pd) need no NaN fix-up; FZ/FIZ are MXCSR's FTZ/DAZ exactly | `afp`, `mxcsr_to_fpcr` | physics 4.7 -> 3.7 ms, matmul 6.7 -> 6.35 (MacBook Air M5); on the M5 the old path's FMA NaNs differed from Rosetta's there, with AH they match (985 forms) |
 
 Lazy flags were checked the same way: the record's operand, its kind, the reader's check and the exit's check, the
@@ -371,6 +372,16 @@ IMUL of the wrong operand, INC/DEC by 2, INC's -1 off by one, INC/DEC fused with
 immediate's length off by one, NEG of the wrong operand, PSHUFD's DUP lane, EXT amount and REV64 replaced, MOVD's lane,
 XORPS / PXOR / XOR of two different registers taken as zero, a 32-bit LEA without its zero extension (the generator now
 has `lea d(r), r32`, PSHUFD, MOVD to registers, imm32 masks and the accumulator forms).
+
+Calls and returns (fib, 1.7x Rosetta's time on both Macs), taken apart in assembly (the engine's fib as translated,
+then one change at a time): the lazy flags recorded before each RET cost 4 %, the ring's pointer arithmetic nothing,
+the B a return lands on 8-10 %; the pushes and pops with writeback were the one large part on the M5 (a store and the
+load of the same place round-trip in 5.1 cycles with writeback, 2.9 at a fixed offset; 7.0 against 6.3 on the M1),
+hence stack runs. The rest of the gap is not found yet. A sample's hottest instruction was the ring's load, which
+turned out to cost nothing: a sample points at the instruction that waits, not at what it waits for. Mutations
+caught: a pop's or a push's offset off by 8, CALL or RET ignoring the delta, MOV r, RSP's sign, no ADD before an
+instruction that uses RSP (the generator now has pushes, something that reads RSP, pops); and without imap's sp,
+tests/threads.c's Rsp check fails.
 
 Found by reproducing the engine's blocks as they are in assembly (the loop alone, called per output, ran at Rosetta's
 speed; the same blocks chained as the engine links them did not): the difference was `eor v2, v2, v2`, not the

@@ -27,6 +27,7 @@ void xe_set_guest(xe *e, int (*find)(uint64_t fn, uint64_t *handler, const void 
 uint64_t xe_ring_new(xe *e);
 // The x86 instruction whose translation holds host address pc (0: none, or not an x86 instruction's code).
 uint64_t xe_rip_at(const xe *e, uint64_t pc);
+uint64_t xe_rip_sp_at(const xe *e, uint64_t pc, int64_t *sp);   // and RSP's offset from x4 there (xlat.c, stack runs)
 // Code that changes: with smc on, the pages translations come from are write-protected; the program's fault
 // handler calls xe_smc_write for a write fault (1: it was such a page, its translations are gone and it is
 // writable again: retry the write). xe_forget: memory freed or replaced (VirtualFree), its translations go.

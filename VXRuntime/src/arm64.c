@@ -261,8 +261,10 @@ int vx_arm64_state_at(const void *ucv, void *outv) {
     *out = *t_ctx;
     const _STRUCT_ARM_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
     if (xe_owns(g_engine, ss->__pc)) {
-        uint64_t rip = xe_rip_at(g_engine, ss->__pc);
+        int64_t sp;
+        uint64_t rip = xe_rip_sp_at(g_engine, ss->__pc, &sp);
         for (int i = 0; i < 16; i++) { out->gpr[i] = ss->__x[i]; memcpy(out->xmm[i], &uc->uc_mcontext->__ns.__v[i], 16); }
+        out->gpr[4] += (uint64_t)sp;                          // (pushes and pops not applied to x4 yet)
         out->flags = xlat_flags_resolve(ss->__x[27], t_ctx);   // (pending flags: computed)
         out->rip = rip ? rip : ss->__x[17];
         return 1;
@@ -280,8 +282,10 @@ static void vcpu_interrupted(x86_ctx *c, const xv_regs *r) {
     if (!s) s = calloc(1, sizeof *s);
     *s = *c;
     if (xe_owns(g_engine, r->pc) && !xe_in_guest(g_engine, r->pc)) {
-        uint64_t rip = xe_rip_at(g_engine, r->pc);
+        int64_t sp;
+        uint64_t rip = xe_rip_sp_at(g_engine, r->pc, &sp);
         for (int i = 0; i < 16; i++) { s->gpr[i] = r->x[i]; memcpy(s->xmm[i], r->q[i], 16); }
+        s->gpr[4] += (uint64_t)sp;
         s->flags = xlat_flags_resolve(r->x[27], c); s->ras = r->x[29];
         s->rip = rip ? rip : r->x[17];
     } else if (s->gpr[4]) {
@@ -307,7 +311,10 @@ static void __attribute__((noreturn)) smc_restart(void) {
 // From the program's registers in a signal's machine context into its x86 state, at rip.
 static void state_from_signal(x86_ctx *c, const ucontext_t *uc, uint64_t rip) {
     const _STRUCT_ARM_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
+    int64_t sp;
+    xe_rip_sp_at(g_engine, ss->__pc, &sp);
     for (int i = 0; i < 16; i++) { c->gpr[i] = ss->__x[i]; memcpy(c->xmm[i], &uc->uc_mcontext->__ns.__v[i], 16); }
+    c->gpr[4] += (uint64_t)sp;                                // (pushes and pops not applied to x4 yet)
     c->flags = xlat_flags_resolve(ss->__x[27], c); c->ras = ss->__fp; c->rip = rip;
 }
 void vx_code_freed(void *addr, size_t len) { xe_forget(g_engine, (uint64_t)(uintptr_t)addr, len); }
