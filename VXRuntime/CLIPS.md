@@ -17,7 +17,10 @@ tools/vxrt_clip.py --socket /tmp/app.sock click-text 0 Add   # a click on the mi
 tools/vxrt_clip.py --socket /tmp/app.sock type 0 hello
 tools/vxrt_clip.py --socket /tmp/app.sock wait-idle 2000
 tools/vxrt_clip.py --socket /tmp/app.sock texts              # the drawn text alone, one per line
+tools/vxrt_clip.py --socket /tmp/app.sock do "click 0 150 62" "type 0 eggs" "key 0 13" wait-idle texts   # several at once
 ```
+
+`VXRT_CONTROL_LOG=<file>` appends every request with the milliseconds since the socket opened.
 
 The MCP server (`tools/vxrt_mcp.py`) has the same as `clip_state`, `clip_act` (an action, then the state once idle)
 and `clip_wait`.
@@ -55,9 +58,25 @@ visible one).
 - There are no standard controls (BUTTON, EDIT ...) in VXRuntime yet, so no control tree: windows and drawn text.
 - Clicks go to the window given (not the child under the point).
 
+## Demo: an AI agent doing a task it was not shown how to do (M2)
+
+`tests/shoplist.c` is a shopping list of the kind an AI would generate for VXRuntime, drawn with GDI: a name field
+that takes typing only after a click on it, `[ Add ]`, a `[ x ]` per row that asks in a second window
+(`[ Yes ]` / `[ No ]`), `[ Save ]` to shoplist.txt, a status line. An agent (Claude, a subagent with no view of the
+screen and told not to read the program's source) got only the tool's usage and the task: make the list eggs, flour,
+sugar, butter, adding milk before butter first and deleting it with the program's own delete, save, close.
+
+It did, found on its way from `state` that the field loses its focus after each Add, that delete asks in a separate
+window, and where each row's `[ x ]` is. Checked from outside the agent: the program printed
+`items=eggs,flour,sugar,butter saved=1` and shoplist.txt holds the four lines (`demos/m2-shoplist/`). 48 requests
+(15 state, 14 wait-idle, 7 click-text, 6 click, 5 type, 1 close) in 74 s, nearly all of it the agent's own thinking
+(the requests within one of its calls came 40 ms apart, the start of the tool included). Its one stumble was its shell (zsh does not split a command kept in a
+variable), hence `do` for several requests per call.
+
 ## Checked
 
 `tests/clip.c` (a counter, a button drawn into a memory DC and blitted, typed text, R to reset), driven only through
 the socket by `tests/clip_check.py`, in `make check` (x86 build under Rosetta) and `make check-arm64`; on the MacBook
-Air M5 also with `VXRT_VCPU=1`. From a click to idle with the new text: 2.6 ms (M1 Max), 3.1 ms (M5), most of it
-the 1 ms polling of `wait-idle`.
+Air M5 also with `VXRT_VCPU=1`. `tests/shoplist_check.py` does the shopping list as a fixed script (14 actions,
+both windows, the saved file checked) in the same runs. From a click to idle with the new text: 2.6 ms (M1 Max),
+3.1 ms (M5), most of it the 1 ms polling of `wait-idle`.

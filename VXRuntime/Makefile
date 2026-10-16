@@ -33,7 +33,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -73,6 +73,10 @@ build/window.exe: tests/window.c
 	$(MINGW) -O1 -o $@ $< -lgdi32 -lwinmm
 
 build/clip.exe: tests/clip.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lgdi32
+
+build/shoplist.exe: tests/shoplist.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lgdi32
 
@@ -298,6 +302,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/iocp.exe
 	$(VXRT) build/window.exe
 	python3 tests/clip_check.py $(VXRT)
+	python3 tests/shoplist_check.py $(VXRT)
 	$(VXRT) build/d3d11.exe
 	$(VXRT) build/gl.exe
 	build/dxbcscan tests/shaders/*.dxbc

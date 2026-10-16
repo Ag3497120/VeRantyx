@@ -9,6 +9,8 @@ The runtime opens a Unix socket when started with VXRT_CONTROL=<path> (VXRuntime
     tools/vxrt_clip.py --socket /tmp/app.sock type 0 hello      # characters
     tools/vxrt_clip.py --socket /tmp/app.sock wait-idle 2000    # until what was asked is handled and painted
     tools/vxrt_clip.py --socket /tmp/app.sock texts             # just the drawn text, one per line
+    tools/vxrt_clip.py --socket /tmp/app.sock do "click 0 150 62" "type 0 eggs" "key 0 13" wait-idle texts
+                                                               # several requests in one go, each answer on a line
 
 Requests: state, click <hwnd> <x> <y>, click-text <hwnd> <text>, key <hwnd> <vk>, type <hwnd> <text>, close <hwnd>,
 wait-idle [ms]; hwnd 0 is the active window (else the first visible one). Each answer is one line of JSON."""
@@ -62,15 +64,19 @@ class Clip:
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--socket", default=os.environ.get("VXRT_CONTROL"), help="the program's VXRT_CONTROL path")
-    ap.add_argument("request", nargs="+", help="a request (see above), or 'texts'")
+    ap.add_argument("request", nargs="+", help="a request (see above), 'texts', or 'do' and one quoted request per argument")
     a = ap.parse_args()
     if not a.socket:
         sys.exit("vxrt_clip: no socket (--socket or VXRT_CONTROL)")
     c = Clip.wait_for(a.socket, 5)
-    if a.request == ["texts"]:
-        print("\n".join(c.texts()))
-        return
-    print(json.dumps(c.ask(" ".join(a.request)), ensure_ascii=False))
+    for req in (a.request[1:] if a.request[0] == "do" else [" ".join(a.request)]):
+        if req == "texts":
+            print("\n".join(c.texts()))
+            continue
+        r = c.ask(req)
+        print(json.dumps(r, ensure_ascii=False))
+        if req.startswith("close") and r.get("ok"):
+            break                                               # (the program may be gone now)
 
 
 if __name__ == "__main__":

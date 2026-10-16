@@ -10,6 +10,7 @@
 //   close <hwnd>               WM_CLOSE
 //   wait-idle [ms]             answers once the program is idle (user32.c, vx_ui_idle: the actions so far handled and
 //                              painted), or after ms (default 2000) with "idle": false
+// VXRT_CONTROL_LOG=<file>: each request appended with the milliseconds since the socket opened (how an agent worked).
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -23,6 +24,9 @@
 #include "ui.h"
 
 static char g_path[104];
+static FILE *g_log;
+static double g_t0;
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 static void sleep_ms(int ms) { struct timespec t = { 0, ms * 1000000L }; nanosleep(&t, NULL); }
@@ -51,6 +55,7 @@ static HANDLE window_arg(char **s) {
 }
 
 static void request(int fd, char *line) {
+    if (g_log) { pthread_mutex_lock(&g_log_lock); fprintf(g_log, "%.1f %s\n", now_ms() - g_t0, line); fflush(g_log); pthread_mutex_unlock(&g_log_lock); }
     char *s = line, *cmd = word(&s);
     if (!cmd) { reply_err(fd, "empty request"); return; }
     if (!strcmp(cmd, "state")) { char *j = vx_ui_state(); reply(fd, j); free(j); return; }
@@ -142,6 +147,8 @@ void vx_control_start(const char *path) {
     if (!ok) { vx_log("control: cannot listen at %s: %s", path, strerror(errno)); close(ls); return; }
     snprintf(g_path, sizeof g_path, "%s", path);
     atexit(remove_socket);
+    g_t0 = now_ms();
+    if (getenv("VXRT_CONTROL_LOG")) g_log = fopen(getenv("VXRT_CONTROL_LOG"), "a");
     pthread_t t;
     if (pthread_create(&t, NULL, serve, (void *)(intptr_t)ls) == 0) pthread_detach(t);
     vx_log("control: Command Clips at %s", path);
