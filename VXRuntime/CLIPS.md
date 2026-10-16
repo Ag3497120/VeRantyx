@@ -32,7 +32,9 @@ visible one).
 
 | Request | What it does |
 |---|---|
-| `state` | windows (hwnd, parent, class, title, visible, enabled, client size), the text drawn in each with its box (client coordinates), the active window, the focus, `idle` |
+| `state` | windows (hwnd, parent, class, title, visible, enabled, client size, origin on the screen), the text drawn in each with its box (client coordinates), the active window, the focus, `idle` |
+| `windows` | the same without the text |
+| `snapshot <hwnd> <path>` | the client area's pixels as a PNG file |
 | `click <hwnd> <x> <y>` | WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP at client coordinates |
 | `click-text <hwnd> <text>` | the same at the middle of the first drawn text containing `<text>` (hwnd 0: any window) |
 | `key <hwnd> <vk>` | WM_KEYDOWN, WM_KEYUP (no WM_CHAR: use `type`) |
@@ -72,6 +74,14 @@ window, and where each row's `[ x ]` is. Checked from outside the agent: the pro
 (15 state, 14 wait-idle, 7 click-text, 6 click, 5 type, 1 close) in 74 s, nearly all of it the agent's own thinking
 (the requests within one of its calls came 40 ms apart, the start of the tool included). Its one stumble was its shell (zsh does not split a command kept in a
 variable), hence `do` for several requests per call.
+
+## Compared with screenshots (M3)
+
+The same task by six agents, three with screenshots and coordinate clicks only (`tools/vxrt_screen.py`: no text, no
+idle signal; requests `windows` and `snapshot`), three with Command Clips: all six did it (checked from the program's
+output and file); with Command Clips in 30 % less time (mean 69.9 s against 99.3 s) and a third fewer tool calls, the
+tokens about the same. The screenshots here were the easiest kind (the program's windows only, 1x); details and the
+caveats in `demos/m3-compare/README.md`.
 
 ## Checked
 

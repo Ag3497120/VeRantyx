@@ -1438,7 +1438,7 @@ static void sb_json_str(sbuf *b, const char *s) {
     }
     sb_put(b, "\"", 1);
 }
-char *vx_ui_state(void) {
+char *vx_ui_state(int texts) {
     sbuf b = { 0 };
     sb_printf(&b, "{\"idle\":%s,\"active\":%lld,\"focus\":%lld,\"windows\":[", vx_ui_idle() ? "true" : "false",
               (long long)(intptr_t)g_active, (long long)(intptr_t)g_focus);
@@ -1451,8 +1451,11 @@ char *vx_ui_state(void) {
         first = 0;
         sb_json_str(&b, w->cls ? w->cls->name : "");
         sb_put(&b, ",\"title\":", 9); sb_json_str(&b, w->title);
-        sb_printf(&b, ",\"visible\":%s,\"enabled\":%s,\"client\":[%d,%d],\"texts\":[", w->visible ? "true" : "false",
-                  w->enabled ? "true" : "false", w->client_w, w->client_h);
+        POINT o; client_origin(w, &o);
+        sb_printf(&b, ",\"visible\":%s,\"enabled\":%s,\"client\":[%d,%d],\"origin\":[%d,%d]", w->visible ? "true" : "false",
+                  w->enabled ? "true" : "false", w->client_w, w->client_h, (int)o.x, (int)o.y);
+        if (!texts) { sb_put(&b, "}", 1); continue; }
+        sb_put(&b, ",\"texts\":[", 10);
         pthread_mutex_lock(&vx_text_lock);
         for (int k = 0; k < w->texts.n; k++) {
             vx_text *t = &w->texts.v[k];
@@ -1521,6 +1524,21 @@ int vx_ui_find_text(HANDLE hwnd, const char *needle, HANDLE *in, POINT *at) {
     pthread_mutex_unlock(&vx_text_lock);
     pthread_mutex_unlock(&g_win_lock);
     return found;
+}
+int vx_ui_snapshot(HANDLE hwnd, const char *png) {
+    vx_window *w = vx_window_get(hwnd);
+    if (!w) return 0;
+    pthread_mutex_lock(&w->lock);
+    CGImageRef img = w->ctx ? CGBitmapContextCreateImage(w->ctx) : NULL;
+    pthread_mutex_unlock(&w->lock);
+    if (!img) return 0;
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)png, (CFIndex)strlen(png), false);
+    CGImageDestinationRef d = url ? CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL) : NULL;
+    int ok = 0;
+    if (d) { CGImageDestinationAddImage(d, img, NULL); ok = CGImageDestinationFinalize(d); CFRelease(d); }
+    if (url) CFRelease(url);
+    CGImageRelease(img);
+    return ok;
 }
 void vx_ui_click(HANDLE hwnd, int x, int y) {
     vx_window *w = vx_window_get(hwnd);

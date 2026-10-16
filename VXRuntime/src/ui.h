@@ -72,7 +72,8 @@ LRESULT vx_send_message(HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp);
 int vx_virtual_screen(RECT *r);                           // main display, Windows coordinates
 
 // user32.c, for control.c (Command Clips)
-char  *vx_ui_state(void);                                 // the windows and their text as JSON (malloc'd)
+char  *vx_ui_state(int texts);                            // the windows (and their text) as JSON (malloc'd)
+int    vx_ui_snapshot(HANDLE hwnd, const char *png);      // the client area's pixels into a PNG file
 int    vx_ui_idle(void);                                  // every thread with windows waits for messages, nothing to paint
 HANDLE vx_ui_window(HANDLE hwnd);                         // hwnd if live; 0: the active window, else the first visible one
 int    vx_ui_find_text(HANDLE hwnd, const char *needle, HANDLE *in, POINT *at);   // the middle of drawn text with needle

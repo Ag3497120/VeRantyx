@@ -1,0 +1,35 @@
+46653.3 state
+55743.9 click 196608 150 62
+55744.2 type 196608 eggs
+55744.4 wait-idle
+55754.0 state
+55754.2 click-text 196608 [ Add ]
+55754.6 wait-idle
+55771.4 state
+60804.0 click 196608 150 62
+60804.3 type 196608 flour
+60804.4 click-text 196608 [ Add ]
+60804.5 wait-idle
+60816.5 click 196608 150 62
+60817.2 type 196608 sugar
+60817.4 click-text 196608 [ Add ]
+60817.8 wait-idle
+60843.0 click 196608 150 62
+60845.1 type 196608 milk
+60845.3 click-text 196608 [ Add ]
+60847.3 wait-idle
+60863.2 click 196608 150 62
+60863.4 type 196608 butter
+60865.3 click-text 196608 [ Add ]
+60867.6 wait-idle
+60882.7 state
+66528.6 click 196608 359 191
+66528.9 wait-idle
+66623.4 state
+73815.6 click-text 196610 [ Yes ]
+73815.9 wait-idle
+73830.4 state
+77568.5 click-text 196608 [ Save ]
+77569.1 wait-idle
+77588.0 state
+81148.1 close 196608

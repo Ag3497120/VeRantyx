@@ -1,8 +1,10 @@
 // Command Clips: a running program's windows as text, and actions on them as messages, without looking at the screen
 // (docs: VXRuntime/CLIPS.md). VXRT_CONTROL=<path> opens a Unix socket there (mode 0600, removed at exit); each line
 // sent is one request, each answered with one line of JSON:
-//   state                      the windows: class, title, client size, the text drawn in each and where; the active
-//                              window, the focus; whether the program is idle
+//   state                      the windows: class, title, client size and origin on the screen, the text drawn in each
+//                              and where; the active window, the focus; whether the program is idle
+//   windows                    the same without the text (what a screenshot-only agent may know: tools/vxrt_screen.py)
+//   snapshot <hwnd> <path>     the window's client area as a PNG file
 //   click <hwnd> <x> <y>       a left click at client coordinates (hwnd 0: the active window, else the first visible one)
 //   click-text <hwnd> <text>   a click on the middle of the first drawn text that contains <text> (hwnd 0: any window)
 //   key <hwnd> <vk>            a key pressed and let go (a virtual-key code, decimal or 0x..; no WM_CHAR: see type)
@@ -58,7 +60,7 @@ static void request(int fd, char *line) {
     if (g_log) { pthread_mutex_lock(&g_log_lock); fprintf(g_log, "%.1f %s\n", now_ms() - g_t0, line); fflush(g_log); pthread_mutex_unlock(&g_log_lock); }
     char *s = line, *cmd = word(&s);
     if (!cmd) { reply_err(fd, "empty request"); return; }
-    if (!strcmp(cmd, "state")) { char *j = vx_ui_state(); reply(fd, j); free(j); return; }
+    if (!strcmp(cmd, "state") || !strcmp(cmd, "windows")) { char *j = vx_ui_state(cmd[0] == 's'); reply(fd, j); free(j); return; }
     if (!strcmp(cmd, "wait-idle")) {
         char *a = word(&s);
         int ms = a ? atoi(a) : 2000, stable = 0;
@@ -97,8 +99,11 @@ static void request(int fd, char *line) {
     } else if (!strcmp(cmd, "type")) {
         while (*s == ' ') s++;
         vx_ui_type(h, s);
+    } else if (!strcmp(cmd, "snapshot")) {
+        while (*s == ' ') s++;
+        if (!*s || !vx_ui_snapshot(h, s)) { reply_err(fd, "snapshot <hwnd> <path>: not written"); return; }
     } else if (!strcmp(cmd, "close")) vx_window_post(h, WM_CLOSE, 0, 0);
-    else { reply_err(fd, "unknown request (state, click, click-text, key, type, close, wait-idle)"); return; }
+    else { reply_err(fd, "unknown request (state, windows, snapshot, click, click-text, key, type, close, wait-idle)"); return; }
     reply_ok(fd, h);
 }
 
