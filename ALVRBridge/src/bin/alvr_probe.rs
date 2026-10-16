@@ -8,28 +8,10 @@ use alvr_server_core::{ServerCoreContext, ServerCoreEvent};
 use alvr_session::CodecType;
 use std::{
     env, fs,
-    path::PathBuf,
     time::{Duration, Instant},
 };
 
-fn layout() -> alvr_filesystem::Layout {
-    let dir = PathBuf::from(env::var("HOME").unwrap()).join("Library/Application Support/VeRantyx/ALVR");
-    alvr_filesystem::Layout { config_dir: dir.clone(), log_dir: dir, ..Default::default() }
-}
-
-// The session for the Mac: clients trusted as they come (no dashboard here), no game audio (macOS cannot record an
-// output device; VeRantyx's audio comes later), HEVC (VideoToolbox), no server-side foveation (VeRantyx's frames are
-// full resolution), TCP (the visionOS client wants it).
-fn prepare_session(path: &PathBuf) {
-    let mut s: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-    let ss = &mut s["session_settings"];
-    ss["connection"]["client_discovery"]["content"]["auto_trust_clients"] = true.into();
-    ss["connection"]["stream_protocol"]["variant"] = "Tcp".into();
-    ss["audio"]["game_audio"]["enabled"] = false.into();
-    ss["video"]["preferred_codec"]["variant"] = "Hevc".into();
-    ss["video"]["foveated_encoding"]["enabled"] = false.into();
-    fs::write(path, serde_json::to_string_pretty(&s).unwrap()).unwrap();
-}
+fn layout() -> alvr_filesystem::Layout { verantyx_alvr_bridge::layout(None) }
 
 // Annex-B NAL units: (type, bytes with their start code)
 fn nal_units(data: &[u8]) -> Vec<(u8, &[u8])> {
@@ -49,13 +31,7 @@ fn main() {
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let seconds: u64 = arg("--seconds").and_then(|s| s.parse().ok()).unwrap_or(60);
     let session = layout().session();
-    if !session.exists() {
-        alvr_server_core::initialize_environment(layout());           // (writes the default session; then once more)
-        let me = env::current_exe().unwrap();
-        let status = std::process::Command::new(me).args(&args[1..]).status().unwrap();
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    prepare_session(&session);
+    verantyx_alvr_bridge::prepare_session(&layout());
     alvr_server_core::initialize_environment(layout());
     alvr_server_core::init_logging(Some(layout().session_log()), Some(layout().crash_log()));   // (both: else ALVR's log
                                                                                               //  goes to stdout too)
@@ -82,6 +58,7 @@ fn main() {
     let t0 = Instant::now();
     let (mut connected, mut tracking, mut last_sample, mut sent, mut idr_wanted, mut idr_requests, mut delivered) = (false, 0u64, Duration::ZERO, 0usize, true, 0u32, 0usize);
     let mut next_frame = Instant::now();
+    let mut last_views = String::new();
     let mut frame_time = Duration::from_micros(13_889);                     // (the client's rate, once it says it)
     while t0.elapsed() < Duration::from_secs(seconds) {
         while let Ok(e) = events.recv_timeout(Duration::from_millis(1)) {
@@ -95,7 +72,10 @@ fn main() {
                     if !config.is_empty() { ctx.set_video_config_nals(config.clone(), CodecType::Hevc); }
                 }
                 ServerCoreEvent::ClientDisconnected => { connected = false; println!("probe: {:.1} s: client disconnected", t0.elapsed().as_secs_f32()); }
-                ServerCoreEvent::ViewsConfig(v) => println!("probe: views: fov {:?} / {:?}", v.fov[0], v.fov[1]),
+                ServerCoreEvent::ViewsConfig(v) => {
+                    let f = format!("{:?} / {:?}", v.fov[0], v.fov[1]);
+                    if f != last_views { println!("probe: views: fov {f}"); last_views = f; }   // (the client repeats them)
+                }
                 ServerCoreEvent::Tracking { sample_timestamp } => {
                     tracking += 1; last_sample = sample_timestamp;
                     if tracking % 300 == 1 {

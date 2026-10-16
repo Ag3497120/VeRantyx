@@ -157,8 +157,14 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
             ServerCoreEvent::ClientDisconnected => bridge.connected.store(false, Ordering::SeqCst),
             ServerCoreEvent::RequestIDR => bridge.idr_requested.store(true, Ordering::SeqCst),
             ServerCoreEvent::ViewsConfig(v) => {
-                let mut i = bridge.input.lock().unwrap();
-                i.left_tangents = tangents(&v.fov[0]); i.right_tangents = tangents(&v.fov[1]); i.tangents_valid = 1;
+                // (the visionOS client sends an infinite field of view for its first seconds: kept out, as the driver
+                //  would latch a fallback frustum if the map held one it rejects)
+                let sane = |f: &Fov| [f.left, f.right, f.up, f.down].iter().all(|a| a.is_finite() && a.abs() < 1.5)
+                    && f.left < 0.0 && f.right > 0.0 && f.up > 0.0 && f.down < 0.0;
+                if sane(&v.fov[0]) && sane(&v.fov[1]) {
+                    let mut i = bridge.input.lock().unwrap();
+                    i.left_tangents = tangents(&v.fov[0]); i.right_tangents = tangents(&v.fov[1]); i.tangents_valid = 1;
+                }
             }
             ServerCoreEvent::Buttons(entries) => {
                 for b in entries {
