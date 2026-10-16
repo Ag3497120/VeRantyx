@@ -57,7 +57,8 @@ fn main() {
     }
     prepare_session(&session);
     alvr_server_core::initialize_environment(layout());
-    alvr_server_core::init_logging(Some(layout().session_log()), None);
+    alvr_server_core::init_logging(Some(layout().session_log()), Some(layout().crash_log()));   // (both: else ALVR's log
+                                                                                              //  goes to stdout too)
 
     // The test stream: its parameter sets, then its frames (an access unit per IDR or other slice)
     let stream = arg("--hevc").map(|p| fs::read(p).unwrap());
@@ -81,12 +82,16 @@ fn main() {
     let t0 = Instant::now();
     let (mut connected, mut tracking, mut last_sample, mut sent, mut idr_wanted, mut idr_requests, mut delivered) = (false, 0u64, Duration::ZERO, 0usize, true, 0u32, 0usize);
     let mut next_frame = Instant::now();
+    let mut frame_time = Duration::from_micros(13_889);                     // (the client's rate, once it says it)
     while t0.elapsed() < Duration::from_secs(seconds) {
         while let Ok(e) = events.recv_timeout(Duration::from_millis(1)) {
             match e {
                 ServerCoreEvent::ClientConnected => {
                     connected = true; idr_wanted = true;
-                    println!("probe: {:.1} s: client connected", t0.elapsed().as_secs_f32());
+                    let o = &serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&session).unwrap()).unwrap()["openvr_config"];
+                    let hz = o["refresh_rate"].as_f64().unwrap_or(72.0).max(1.0);
+                    frame_time = Duration::from_secs_f64(1.0 / hz);
+                    println!("probe: {:.1} s: client connected: {}x{} per eye at {hz} Hz", t0.elapsed().as_secs_f32(), o["eye_resolution_width"], o["eye_resolution_height"]);
                     if !config.is_empty() { ctx.set_video_config_nals(config.clone(), CodecType::Hevc); }
                 }
                 ServerCoreEvent::ClientDisconnected => { connected = false; println!("probe: {:.1} s: client disconnected", t0.elapsed().as_secs_f32()); }
@@ -109,9 +114,9 @@ fn main() {
                 ServerCoreEvent::ShutdownPending | ServerCoreEvent::RestartPending => println!("probe: restart / shutdown asked"),
             }
         }
-        // 72 frames a second, each stamped with the newest tracking sample (what it would have been rendered for)
+        // The client's rate, each frame stamped with the newest tracking sample (what it would have been rendered for)
         if connected && !frames.is_empty() && tracking > 0 && Instant::now() >= next_frame {
-            next_frame = (next_frame + Duration::from_micros(13_889)).max(Instant::now());   // (no catching up)
+            next_frame = (next_frame + frame_time).max(Instant::now());       // (no catching up)
             if idr_wanted {                                                   // (on from the stream's next IDR)
                 while !frames[sent % frames.len()].0 { sent += 1; }
                 idr_wanted = false;

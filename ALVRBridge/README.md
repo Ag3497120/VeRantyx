@@ -15,7 +15,7 @@ and poses (VRDriver) through it.
 cd ALVRBridge
 cargo build --release                                  # fetches ALVR v20.14.1 and its crates (Rust 1.82 or later)
 swiftc -O tools/hevc_testpattern.swift -o /tmp/hevc_testpattern
-/tmp/hevc_testpattern /tmp/test.h265 2144 2016 144     # both eyes side by side, VideoToolbox HEVC, Annex-B
+/tmp/hevc_testpattern /tmp/test.h265 2144 2048 180     # both eyes side by side, VideoToolbox HEVC, Annex-B
 target/release/alvr_probe --hevc /tmp/test.h265 --seconds 300
 ```
 
@@ -32,5 +32,8 @@ for); it connects again by itself.
 - `alvr_client_mock` on another Mac (the MacBook Air, the same network; one Mac cannot run both: client and server
   both take port 9943) found the probe, connected, sent its views and 4677 tracking samples in 23 s, and received the
   test stream at 72 frames a second with no network drops. (It does not decode, so it keeps asking for IDRs.)
-- Not yet: a real headset. The Vision Pro's ALVR app (built on ALVR 20.14.1) is the next check; a Quest only through
-  someone who has one.
+- The Vision Pro's ALVR app (App Store, built on ALVR 20.14.1) connected over Wi-Fi: real head poses (seated, about
+  1.03 m) and the left hand's, 6480 frames sent with 2 IDRs asked for (the mock asks hundreds: it does not decode), so
+  the headset decoded the stream. It asked for 2144 x 2048 per eye at 90 Hz; the probe now streams at the rate the
+  client asks for. What the picture looked like in the headset: still to be reported.
+- A Quest: only through someone who has one.
