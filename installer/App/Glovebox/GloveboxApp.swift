@@ -88,7 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 /// Sparkle 2: checks the appcast on the latest GitHub release daily, and installs an update only if it's
 /// signed with our EdDSA key and by the same Developer ID. Off until a key is configured.
-/// VeRantyx Standalone: no key and no feed (project.yml), so this stays off and official Glovebox updates can never
+/// Mitten: no key and no feed (project.yml), so this stays off and official Glovebox updates can never
 /// replace this build.
 @MainActor
 final class Updater: ObservableObject {

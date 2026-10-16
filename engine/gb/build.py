@@ -26,11 +26,11 @@ K = os.path.join(ROOT, "klepton")
 V = os.path.join(K, "visionos")
 GUEST_DIR = "build/glovebox-guest"  # relative to klepton/visionos, where gen_xcodeproj.py resolves it
 
-# This branch builds VeRantyx Standalone, an unofficial build based on Glovebox. Its name (the default work folder,
+# This branch builds Mitten, an unofficial build based on Glovebox. Its name (the default work folder,
 # beside the Mac app's own) and the headset app's bundle id prefix are its own, so it never shares a work folder with,
 # or installs over, official Glovebox's app and data. The headset bundle id is still per team (bundle_id_for).
-PRODUCT = "VeRantyx Standalone"
-BUNDLE_ID_PREFIX = "io.github.ag3497120.verantyx-standalone.alyx"
+PRODUCT = "Mitten"
+BUNDLE_ID_PREFIX = "io.github.ag3497120.mitten.alyx"
 # Stutter reports: Glovebox's server belongs to official Glovebox and its data to official builds, so this build
 # sends none (empty endpoint: the headset's uploader has nowhere to send, and the build carries the answer "no").
 REPORTS_ENDPOINT = ""

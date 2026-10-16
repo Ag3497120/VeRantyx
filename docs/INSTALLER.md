@@ -90,7 +90,7 @@ logs, nothing personal).
 
 ## Updates
 
-*VeRantyx Standalone (this branch) has none of this: no Sparkle feed or key, no releases, no stutter reports. It is
+*Mitten (this branch) has none of this: no Sparkle feed or key, no releases, no stutter reports. It is
 updated by building a newer checkout. The rest describes official Glovebox.*
 
 - **The app itself:** Sparkle 2. The appcast and the signed zips live on GitHub Releases. Each update is checked

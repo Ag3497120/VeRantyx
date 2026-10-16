@@ -3,8 +3,8 @@ import SwiftUI
 /// Glovebox's look, as on glovebox.vision and the Mac installer: the orange of the logo's port for
 /// progress and done, white pill buttons, and the game's name set in type.
 enum Brand {
-    /// The name the launcher shows: this branch is VeRantyx Standalone, an unofficial build based on Glovebox.
-    static let name = "VeRantyx Standalone"
+    /// The name the launcher shows: this branch is Mitten, an unofficial build based on Glovebox.
+    static let name = "Mitten"
     /// Glovebox's own services: stutter reports to its server and "a newer Glovebox is out" (GloveboxUpdate.swift).
     /// They belong to official Glovebox, so this unofficial build neither asks for them nor contacts them.
     static let upstreamServices = false

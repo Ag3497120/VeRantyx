@@ -56,7 +56,7 @@ public extension Recipe {
         id: "alyx", title: "Half-Life: Alyx", steamAppID: 546_560, depots: [546_561, 546_564],
         macDownload: ["game/bin/linuxsteamrtarm64/", "game/hlvr/bin/linuxsteamrtarm64/",
                       "game/core/shaders_vulkan_", "game/hlvr/shaders_vulkan_"],
-        headsetAppName: "VeRantyx: HLA", macDownloadGB: 1.7, gameDownloadGB: 67, headsetSpaceGB: 75,
+        headsetAppName: "Mitten: HLA", macDownloadGB: 1.7, gameDownloadGB: 67, headsetSpaceGB: 75,
         needsSenseControllers: false, storeURL: URL(string: "https://store.steampowered.com/app/546560/")!)
 
     static let all: [Recipe] = [.alyx]

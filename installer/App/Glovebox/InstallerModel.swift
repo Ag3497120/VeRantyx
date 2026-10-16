@@ -61,7 +61,7 @@ final class InstallerModel: ObservableObject {
     @Published var xcodeIcon: NSImage?
     /// Whether the headset may send stutter reports: asked once, during the first install, before
     /// its build (which carries the answer to the headset). Nil until the player answers.
-    /// VeRantyx Standalone: always no, never asked (`upstreamServices`).
+    /// Mitten: always no, never asked (`upstreamServices`).
     @Published var shareStutters: Bool? = InstallerModel.upstreamServices
         ? UserDefaults.standard.object(forKey: "shareStutters") as? Bool : false
     /// The reports question is on screen (ShareAsk.swift).
@@ -73,7 +73,7 @@ final class InstallerModel: ObservableObject {
     /// No Thanks or a sign-up: installs don't ask again.
     private var newsAnswered = !InstallerModel.upstreamServices || UserDefaults.standard.bool(forKey: "newsAnswered")
     /// Glovebox's own services: stutter reports to its server and its news sign-up (glovebox.vision). They belong to
-    /// official Glovebox, so this unofficial build (VeRantyx Standalone) neither asks for them nor sends anything there.
+    /// official Glovebox, so this unofficial build (Mitten) neither asks for them nor sends anything there.
     nonisolated static let upstreamServices = false
     private var newsTask: Task<Void, Never>?
     /// macOS will ask, once, before codesign may use the signing key (readyToSign): the card says why.

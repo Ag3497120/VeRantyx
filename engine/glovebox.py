@@ -10,7 +10,7 @@ build options (environment):
   GLOVEBOX_GAME   the depot's game/ folder if it is already on disk (else the Steam download step provides it)
   GLOVEBOX_KIT    the runtime kit, a folder or .zip (else kit/ or glovebox-kit.zip beside the engine, as the app
                   bundles it)
-  GLOVEBOX_WORK   where everything for this package goes (default ~/Library/Application Support/VeRantyx Standalone/alyx)
+  GLOVEBOX_WORK   where everything for this package goes (default ~/Library/Application Support/Mitten/alyx)
   GLOVEBOX_TEAM   the team to sign for (default: the paid team in Xcode's account settings, else the free one)
   GLOVEBOX_FREE_TEAM  0: refuse a free Personal Team. Default: allowed. Its build keeps the memory limit (Apple gives
                   free teams Increased Memory Limit) and drops Extended Virtual Addressing (paid teams only, and

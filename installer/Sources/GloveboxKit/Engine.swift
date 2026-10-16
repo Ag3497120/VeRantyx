@@ -34,7 +34,7 @@ public struct Engine: Sendable {
                               developerDir: String? = nil) -> Engine? {
         let fm = FileManager.default
         let library = fm.urls(for: .libraryDirectory, in: .userDomainMask).first ?? fm.temporaryDirectory
-        // Named after the app (CFBundleName), so an unofficial build such as VeRantyx Standalone never shares its
+        // Named after the app (CFBundleName), so an unofficial build such as Mitten never shares its
         // source copy (source/<version>, the same version as the official app's), work folder or logs with an
         // official Glovebox on the same Mac.
         let folder = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "Glovebox"

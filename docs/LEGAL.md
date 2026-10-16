@@ -1,6 +1,6 @@
 # Legal
 
-*VeRantyx Standalone (this branch) is an unofficial build based on Glovebox; what follows is Glovebox's statement,
+*Mitten (this branch) is an unofficial build based on Glovebox; what follows is Glovebox's statement,
 and holds for this build too. For anything about this build, including takedown requests, contact its maintainer
 through [github.com/Ag3497120/VeRantyx](https://github.com/Ag3497120/VeRantyx/issues), not the Glovebox address below.*
 

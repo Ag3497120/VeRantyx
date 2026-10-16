@@ -60,4 +60,4 @@ Not yet. It's built so that more can be added later.
 
 In the Mac app, press **Copy diagnostics**, then [open an issue on VeRantyx](https://github.com/Ag3497120/VeRantyx/issues/new) (this unofficial build's problems don't belong in Glovebox's tracker) and paste it in. The diagnostics contain logs and your setup, but no passwords or game files.
 
-If the problem is in the game, open VeRantyx: HLA on the headset, tap your name at the top right and choose **Share Diagnostics**. Send the file to yourself (AirDrop or Mail) and attach it to the issue. It holds the game's logs and your setup, but not your Steam sign-in or your saves.
+If the problem is in the game, open Mitten: HLA on the headset, tap your name at the top right and choose **Share Diagnostics**. Send the file to yourself (AirDrop or Mail) and attach it to the issue. It holds the game's logs and your setup, but not your Steam sign-in or your saves.

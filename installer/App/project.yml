@@ -1,9 +1,9 @@
 # XcodeGen spec for the Glovebox Mac installer (`brew install xcodegen && xcodegen`).
-# This branch builds it as VeRantyx Standalone, an unofficial build based on Glovebox: the name the app shows is
+# This branch builds it as Mitten, an unofficial build based on Glovebox: the name the app shows is
 # PRODUCT_DISPLAY_NAME below, and its identifiers are VeRantyx's, so it never replaces or updates as official Glovebox.
 name: Glovebox
 options:
-  bundleIdPrefix: io.github.ag3497120.verantyx-standalone
+  bundleIdPrefix: io.github.ag3497120.mitten
   deploymentTarget:
     macOS: "15.0"
 packages:
@@ -19,10 +19,10 @@ settings:
     MARKETING_VERSION: "0.1.5"
     CURRENT_PROJECT_VERSION: "1"
     # The app's name everywhere it shows (menu bar, Finder, the window, the app's own folders), kept in this one place.
-    PRODUCT_DISPLAY_NAME: "VeRantyx Standalone"
+    PRODUCT_DISPLAY_NAME: "Mitten"
     # Where Sparkle looks for new versions, and the public half of the EdDSA key that signs them
     # (scripts/release.sh). Updates stay off until the key is set.
-    # VeRantyx Standalone: both empty, so Sparkle never starts (GloveboxApp.swift's Updater) and "Check for Updates…"
+    # Mitten: both empty, so Sparkle never starts (GloveboxApp.swift's Updater) and "Check for Updates…"
     # stays disabled. Upstream's feed and key were official Glovebox's: an update signed with that key would have
     # installed official Glovebox over this build, dropping the Joy-Con and hand-tracking input. There is no feed of
     # this build's own (it isn't distributed as a signed app); update it by building a newer checkout of this branch.
@@ -67,7 +67,7 @@ targets:
       properties: {}
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: io.github.ag3497120.verantyx-standalone.installer
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.ag3497120.mitten.installer
         # The .app and its executable carry the display name, so it can't land on (or be mistaken for) an official
         # Glovebox.app in /Applications; the Swift module keeps upstream's name.
         PRODUCT_NAME: $(PRODUCT_DISPLAY_NAME)

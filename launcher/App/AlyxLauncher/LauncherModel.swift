@@ -95,7 +95,7 @@ final class LauncherModel: ObservableObject {
     /// before any window (and model) exists, when the system wakes the app for finished downloads.
     /// Named after the app, so each player's own build (its bundle id carries their team) has its own.
     nonisolated static let backgroundFetcher = BackgroundChunkFetcher(
-        identifier: (Bundle.main.bundleIdentifier ?? "io.github.ag3497120.verantyx-standalone.launcher") + ".chunks",
+        identifier: (Bundle.main.bundleIdentifier ?? "io.github.ag3497120.mitten.launcher") + ".chunks",
         installRoot: defaultInstallRoot)
 
     init(profile: GameProfile = .halfLifeAlyx, installRoot: URL = LauncherModel.defaultInstallRoot) {

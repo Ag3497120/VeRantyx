@@ -5,7 +5,7 @@ import AppKit
 /// with one glass card per step over it (Cinema.swift), always dark like the art; the orange of
 /// the logo's port for progress and done; white pill buttons. Inside the cards it's system fonts
 /// and controls, and Liquid Glass on macOS 26 and later.
-/// The app's name as it shows: project.yml's PRODUCT_DISPLAY_NAME ("VeRantyx Standalone" on this unofficial branch),
+/// The app's name as it shows: project.yml's PRODUCT_DISPLAY_NAME ("Mitten" on this unofficial branch),
 /// so a rename is one line there.
 enum AppName {
     static let shown = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Glovebox"

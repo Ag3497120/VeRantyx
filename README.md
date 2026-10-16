@@ -1,4 +1,25 @@
-# VeRantyx Standalone
+# Mitten
+
+*A mitten from the glovebox.* A mitten is a glove without fingers: this is Glovebox's Half-Life: Alyx for hands
+alone, with no tracked controllers. The name is a nod to the project it comes from; it is not Glovebox.
+
+```
+           _____________
+          /@@@@@@@@@@@@@\
+         |@@@@@@@@@@@@@@@|
+  ___    |@@@@@@@@@@@@@@@|
+ /@@@\   |@@@@@@@@@@@@@@@|
+|@@@@@\  |@@@@@@@@@@@@@@@|
+ \@@@@@\ |@@@@@@@@@@@@@@@|
+  \@@@@@\|@@@@@@@@@@@@@@@|
+   \@@@@@@@@@@@@@@@@@@@@@|
+    '.@@@@@@@@@@@@@@@@@.'
+      |===============|
+      |===============|
+      '---------------'
+```
+
+(The icons are this ASCII art, drawn by `tools/ascii_icon.py` from `tools/mitten.txt`; Glovebox's artwork is not used.)
 
 **Unofficial and experimental.** Half-Life: Alyx running on Apple Vision Pro itself (no PC, no streaming), played
 **without PS VR2 Sense controllers**: with a Nintendo Switch Joy-Con in each hand, or with bare hands.
@@ -48,7 +69,7 @@ it to the headset (also with Joy-Con and hands).
 
 There is no download of this build: build it from a checkout of this branch. From Terminal (below), or build the Mac
 app yourself (`installer/README.md`, with `GLOVEBOX_SRC` set to this checkout), which then runs as
-"VeRantyx Standalone" and puts "VeRantyx: HLA" on your headset. Neither updates itself: pull this branch and build
+"Mitten" and puts "Mitten: HLA" on your headset. Neither updates itself: pull this branch and build
 again.
 
 <details open>
@@ -57,7 +78,7 @@ again.
 `build` needs the runtime kit and your game files. From a checkout, build the kit once with
 `brew install cmake && zsh engine/kit/build-kit.sh glovebox-kit` (it lands where `build` looks). The game files come
 from the Mac app's download, or from `GLOVEBOX_GAME` pointing at a copy of the game's `game/` folder. This build keeps
-its work in `~/Library/Application Support/VeRantyx Standalone/alyx` (`GLOVEBOX_WORK` to use another folder).
+its work in `~/Library/Application Support/Mitten/alyx` (`GLOVEBOX_WORK` to use another folder).
 
 ```sh
 xcrun python3 engine/glovebox.py doctor    # what this Mac and headset still need
@@ -83,7 +104,7 @@ from Valve, the Khronos Group, the SDL and LuaJIT projects and Debian. See [THIR
 
 ## Not affiliated with Valve or Apple
 
-(Glovebox's own statement. VeRantyx Standalone is likewise free, non-commercial and contains no game files.)
+(Glovebox's own statement. Mitten is likewise free, non-commercial and contains no game files.)
 
 Glovebox is an open-source fan project, not affiliated with or endorsed by Valve or Apple. You need your own copy of the
 game. Glovebox never hosts, shares or sells game files, and never charges money. [Legal](docs/LEGAL.md)
