@@ -108,7 +108,7 @@ fn main() {
                 }
                 ServerCoreEvent::Buttons(b) => println!("probe: {} buttons", b.len()),
                 ServerCoreEvent::RequestIDR => { if !idr_wanted { idr_requests += 1; } idr_wanted = true; }
-                ServerCoreEvent::Battery(b) => println!("probe: battery {:.0} %", b.gauge_value * 100.0),
+                ServerCoreEvent::Battery(b) => println!("probe: battery of device {:#x}: {} (plugged in: {})", b.device_id, b.gauge_value, b.is_plugged),
                 ServerCoreEvent::PlayspaceSync(_) | ServerCoreEvent::CaptureFrame | ServerCoreEvent::GameRenderLatencyFeedback(_)
                 | ServerCoreEvent::SetOpenvrProperty { .. } => {}
                 ServerCoreEvent::ShutdownPending | ServerCoreEvent::RestartPending => println!("probe: restart / shutdown asked"),

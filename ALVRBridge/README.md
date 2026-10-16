@@ -5,7 +5,7 @@ ALVR's own streaming core, `alvr_server_core` (https://github.com/alvr-org/ALVR,
 v20.14.1. ALVR's server is made for Windows and Linux; its core builds on macOS (Apple silicon) as it is. Clients
 of ALVR 20.x connect (the protocol is the major version).
 
-Status: a probe. `alvr_probe` runs the core alone, waits for a client, logs its views, poses and buttons, and streams
+Status: a probe, checked on a real headset (the Vision Pro's ALVR app). `alvr_probe` runs the core alone, waits for a client, logs its views, poses and buttons, and streams
 an HEVC test pattern stamped with the newest head pose. The next step is VeRantyx's own frames (MacEncoder's HEVC)
 and poses (VRDriver) through it.
 
@@ -35,5 +35,6 @@ for); it connects again by itself.
 - The Vision Pro's ALVR app (App Store, built on ALVR 20.14.1) connected over Wi-Fi: real head poses (seated, about
   1.03 m) and the left hand's, 6480 frames sent with 2 IDRs asked for (the mock asks hundreds: it does not decode), so
   the headset decoded the stream. It asked for 2144 x 2048 per eye at 90 Hz; the probe now streams at the rate the
-  client asks for. What the picture looked like in the headset: still to be reported.
+  client asks for. In the headset the test pattern looked right (both eyes, the moving bar, the counter; no artifacts
+  or stutter noticed), at 90 Hz.
 - A Quest: only through someone who has one.
