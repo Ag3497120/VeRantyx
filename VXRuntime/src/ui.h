@@ -21,6 +21,14 @@ typedef LRESULT (WINAPI *WNDPROC)(HANDLE, uint32_t, WPARAM, LPARAM);
 typedef struct vx_class vx_class;
 typedef struct vx_queue vx_queue;
 
+// Text drawn with GDI (TextOut, ExtTextOut, DrawText) and where it is on a surface (a window's client area or a
+// bitmap): what Command Clips (control.c) report of a window without its pixels. Painting over a place forgets
+// the text there; a blit copies it along with the pixels. Guarded by vx_text_lock.
+typedef struct { RECT r; char *s; } vx_text;                // r: the text's box in the surface's coordinates; s: UTF-8
+typedef struct { vx_text *v; int n, cap; } vx_texts;
+extern pthread_mutex_t vx_text_lock;
+void vx_texts_free(vx_texts *t);
+
 typedef struct vx_window {
     HANDLE   hwnd;
     WNDPROC  proc;
@@ -45,6 +53,7 @@ typedef struct vx_window {
     int      visible, invalid, erase, destroyed, minimized, enabled;
     uint8_t *extra;                 // cbWndExtra bytes
     int      extra_size;
+    vx_texts texts;                 // what GDI drew there as text (control.c)
 } vx_window;
 
 // user32.c
@@ -61,6 +70,15 @@ void vx_raw_mouse(int dx, int dy, uint16_t button_flags, int16_t wheel);   // WM
 void vx_request_redraw(vx_window *w);                     // after drawing into the client area
 LRESULT vx_send_message(HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp);
 int vx_virtual_screen(RECT *r);                           // main display, Windows coordinates
+
+// user32.c, for control.c (Command Clips)
+char  *vx_ui_state(void);                                 // the windows and their text as JSON (malloc'd)
+int    vx_ui_idle(void);                                  // every thread with windows waits for messages, nothing to paint
+HANDLE vx_ui_window(HANDLE hwnd);                         // hwnd if live; 0: the active window, else the first visible one
+int    vx_ui_find_text(HANDLE hwnd, const char *needle, HANDLE *in, POINT *at);   // the middle of drawn text with needle
+void   vx_ui_click(HANDLE hwnd, int x, int y);            // a left click at client coordinates
+void   vx_ui_key(HANDLE hwnd, int vk);                    // WM_KEYDOWN, WM_KEYUP
+void   vx_ui_type(HANDLE hwnd, const char *utf8);         // WM_CHAR for each UTF-16 unit
 
 // gdi.c
 HANDLE vx_dc_for_window(vx_window *w);

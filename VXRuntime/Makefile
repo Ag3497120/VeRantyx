@@ -2,7 +2,7 @@
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
 SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/extras.c src/context.S src/text.c src/files.c src/registry.c \
-          src/user32.c src/gdi.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/input.m src/audio.m src/xaudio2.m
+          src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/input.m src/audio.m src/xaudio2.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
@@ -33,7 +33,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -71,6 +71,10 @@ build/smc.exe: tests/smc.c
 build/window.exe: tests/window.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lgdi32 -lwinmm
+
+build/clip.exe: tests/clip.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lgdi32
 
 build/net.exe: tests/net.c
 	@mkdir -p build
@@ -293,6 +297,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/com.exe
 	$(VXRT) build/iocp.exe
 	$(VXRT) build/window.exe
+	python3 tests/clip_check.py $(VXRT)
 	$(VXRT) build/d3d11.exe
 	$(VXRT) build/gl.exe
 	build/dxbcscan tests/shaders/*.dxbc

@@ -827,6 +827,7 @@ int main(int argc, char **argv, char **envp) {
     vx_d3d9_init();
     vx_vcruntime_init();
     vx_extras_init();                            // (last: the tables above come first)
+    if (getenv("VXRT_CONTROL")) vx_control_start(getenv("VXRT_CONTROL"));
 
     // vxrt --list-exports: every function the runtime implements, "dll<TAB>name" per line (tools/vxrt_doctor.py
     // compares a game's imports with it, without running the game).

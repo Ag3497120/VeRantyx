@@ -30,6 +30,7 @@ typedef struct gdi_obj {
     int bk_mode;
     POINT pos;
     RECT rgn;                                                 // region: a rectangle
+    vx_texts texts;                                           // bitmap: text drawn on it (ui.h)
 } gdi_obj;
 
 static gdi_obj *g_objs[MAX_GDI];
@@ -54,6 +55,36 @@ static gdi_obj *obj(HANDLE h) {
 }
 static gdi_obj *obj_of(HANDLE h, int type) { gdi_obj *o = obj(h); return o && o->type == type ? o : NULL; }
 static gdi_obj *dc_of(HANDLE h) { gdi_obj *o = obj(h); return o && (o->type == OBJ_DC || o->type == OBJ_MEMDC) ? o : NULL; }
+
+// ---- text on surfaces (ui.h, for Command Clips) ---------------------------------------------------------------------
+pthread_mutex_t vx_text_lock = PTHREAD_MUTEX_INITIALIZER;
+static int overlaps(RECT a, RECT b) { return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom; }
+static void texts_forget(vx_texts *t, RECT r) {                // (vx_text_lock held)
+    int k = 0;
+    for (int i = 0; i < t->n; i++) { if (overlaps(t->v[i].r, r)) free(t->v[i].s); else t->v[k++] = t->v[i]; }
+    t->n = k;
+}
+static void texts_add(vx_texts *t, RECT r, char *s) {          // (held; s is taken)
+    texts_forget(t, r);
+    if (t->n == t->cap) { t->cap = t->cap ? 2 * t->cap : 16; t->v = realloc(t->v, (size_t)t->cap * sizeof *t->v); }
+    t->v[t->n++] = (vx_text){ r, s };
+}
+void vx_texts_free(vx_texts *t) {
+    pthread_mutex_lock(&vx_text_lock);
+    for (int i = 0; i < t->n; i++) free(t->v[i].s);
+    free(t->v); *t = (vx_texts){ 0 };
+    pthread_mutex_unlock(&vx_text_lock);
+}
+static vx_texts *texts_of(gdi_obj *dc) {
+    if (dc->type == OBJ_DC) return dc->w ? &dc->w->texts : NULL;
+    gdi_obj *b = obj_of(dc->bitmap, OBJ_BITMAP);
+    return b ? &b->texts : NULL;
+}
+static void texts_painted(gdi_obj *dc, RECT r) {               // r painted over: its text is gone
+    vx_texts *t = texts_of(dc);
+    if (!t || !t->n) return;
+    pthread_mutex_lock(&vx_text_lock); texts_forget(t, r); pthread_mutex_unlock(&vx_text_lock);
+}
 
 // ---- colors ----------------------------------------------------------------------------------------------------------
 uint32_t vx_sys_color(int i) {
@@ -125,6 +156,7 @@ static void free_obj(HANDLE h) {
     g_objs[v] = NULL;
     pthread_mutex_unlock(&g_gdi_lock);
     if (o && o->type == OBJ_BITMAP) {
+        vx_texts_free(&o->texts);
         if (o->ctx) CGContextRelease(o->ctx);
         if (o->pixels && (void *)o->pixels != (void *)o->bits) free(o->pixels);
         if (o->own_bits) free(o->bits);
@@ -340,6 +372,7 @@ static void fill(gdi_obj *dc, RECT r, uint32_t color) {
     set_fill(t.ctx, color);
     CGContextFillRect(t.ctx, CGRectMake(r.left, r.top, r.right - r.left, r.bottom - r.top));
     unlock_target(&t);
+    texts_painted(dc, r);
 }
 static WINAPI int FillRect(HANDLE h, const RECT *r, HANDLE brush) {
     gdi_obj *dc = dc_of(h);
@@ -498,6 +531,7 @@ static CGImageRef image_from_bgrx(uint32_t *px, int w, int h) {
 static int stretch_dib(HANDLE h, int xd, int yd, int wd, int hd, int xs, int ys, int ws, int hs, const void *bits, const BITMAPINFOHEADER *bi) {
     gdi_obj *dc = dc_of(h);
     if (!dc || !bits || !bi) return 0;
+    texts_painted(dc, (RECT){ xd, yd, xd + wd, yd + hd });
     int w, hgt;
     uint32_t *px = dib_to_bgrx(bi, bits, (const uint32_t *)((const uint8_t *)bi + bi->size), &w, &hgt);
     if (!px) return 0;
@@ -564,6 +598,18 @@ static WINAPI BOOL StretchBlt(HANDLE dst, int xd, int yd, int wd, int hd, HANDLE
     target t;
     if (part && lock_target(d, &t)) { draw_image(&t, part, xd, yd, wd, hd, 1); unlock_target(&t); }
     if (part) CGImageRelease(part);
+    vx_texts *dt = texts_of(d), *st = texts_of(s);                 // (the text goes along, scaled as the pixels)
+    if (dt && dt != st && ws && hs) {
+        pthread_mutex_lock(&vx_text_lock);
+        texts_forget(dt, (RECT){ xd, yd, xd + wd, yd + hd });
+        for (int i = 0; st && i < st->n; i++) {
+            RECT r = st->v[i].r;
+            if (r.left < xs || r.top < ys || r.right > xs + ws || r.bottom > ys + hs) continue;
+            RECT to = { xd + (r.left - xs) * wd / ws, yd + (r.top - ys) * hd / hs, xd + (r.right - xs) * wd / ws, yd + (r.bottom - ys) * hd / hs };
+            texts_add(dt, to, strdup(st->v[i].s));
+        }
+        pthread_mutex_unlock(&vx_text_lock);
+    }
     return 1;
 }
 static WINAPI BOOL BitBlt(HANDLE dst, int x, int y, int w, int h, HANDLE src, int xs, int ys, DWORD rop) {
@@ -624,6 +670,15 @@ static void draw_text(gdi_obj *dc, int x, int y, const uint16_t *text, int n, co
     CGContextRestoreGState(t.ctx);
     CFRelease(line); CFRelease(font);
     unlock_target(&t);
+    vx_texts *tx = texts_of(dc);
+    if (tx && n > 0) {
+        WCHAR *z = malloc(((size_t)n + 1) * sizeof *z);
+        memcpy(z, text, (size_t)n * sizeof *z); z[n] = 0;
+        char *u = vx_utf8_dup(z);
+        free(z);
+        RECT box = { x, y, x + (LONG)(width + 0.5), y + (LONG)(ascent + descent + 0.5) };
+        pthread_mutex_lock(&vx_text_lock); texts_add(tx, box, u); pthread_mutex_unlock(&vx_text_lock);
+    }
 }
 static uint16_t *wide_from(const char *s, int n, int *len) {
     size_t l = n < 0 ? strlen(s) : (size_t)n;

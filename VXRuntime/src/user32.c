@@ -5,6 +5,7 @@
 // sent messages first (handled inside GetMessage/PeekMessage), then posted ones, then quit, paint, timers.
 // Messages sent within a thread call the window procedure directly.
 #include <ctype.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
@@ -125,6 +126,7 @@ struct vx_queue {
     sent_msg *sent;
     int quit; WPARAM quit_code;
     vx_timer timers[64]; int ntimers;
+    int waiting;                    // its thread waits in GetMessage / WaitMessage / MsgWait... (vx_ui_idle)
     vx_queue *next;
 };
 static vx_queue *g_queues;
@@ -362,7 +364,7 @@ static void wait_queue(vx_queue *q, int max_ms) {         // q->lock held
 static WINAPI BOOL GetMessageA(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max) {
     vx_queue *q = my_queue();
     pthread_mutex_lock(&q->lock);
-    while (!next_message(q, out, hwnd, min, max, 1)) wait_queue(q, -1);
+    while (!next_message(q, out, hwnd, min, max, 1)) { q->waiting = 1; wait_queue(q, -1); q->waiting = 0; }
     pthread_mutex_unlock(&q->lock);
     t_last_time = out->time;
     return out->message != WM_QUIT;
@@ -382,7 +384,7 @@ static WINAPI BOOL WaitMessage(void) {
     vx_queue *q = my_queue();
     MSG m;
     pthread_mutex_lock(&q->lock);
-    while (!next_message(q, &m, NULL, 0, 0, 0)) wait_queue(q, -1);
+    while (!next_message(q, &m, NULL, 0, 0, 0)) { q->waiting = 1; wait_queue(q, -1); q->waiting = 0; }
     pthread_mutex_unlock(&q->lock);
     return 1;
 }
@@ -408,12 +410,13 @@ static WINAPI DWORD MsgWaitForMultipleObjectsEx(DWORD n, const HANDLE *hs, DWORD
         MSG m;
         pthread_mutex_lock(&q->lock);
         int ready = next_message(q, &m, NULL, 0, 0, 0);
+        q->waiting = !ready;
         pthread_mutex_unlock(&q->lock);
         if (ready) return n;                                         // WAIT_OBJECT_0 + n: input is available
         DWORD r = n ? wait(n, hs, flags & 1 /* MWMO_WAITALL */, 0) : 0x102;
-        if (r != 0x102) return r;
+        if (r != 0x102) { q->waiting = 0; return r; }
         DWORD elapsed = tick_ms() - start;
-        if (ms != 0xffffffffu && elapsed >= ms) return 0x102;      // WAIT_TIMEOUT
+        if (ms != 0xffffffffu && elapsed >= ms) { q->waiting = 0; return 0x102; }   // WAIT_TIMEOUT
         pthread_mutex_lock(&q->lock);
         wait_queue(q, 2);
         pthread_mutex_unlock(&q->lock);
@@ -544,6 +547,7 @@ static WINAPI BOOL DestroyWindow(HANDLE hwnd) {
     kill_timer(w->queue, hwnd, 0, 1);
     vx_cocoa_destroy(w);
     w->destroyed = 1;                                 // the slot is never reused, so stale handles stay invalid
+    vx_texts_free(&w->texts);
     if (g_focus == hwnd) g_focus = NULL;
     if (g_active == hwnd) g_active = NULL;
     if (g_capture == hwnd) g_capture = NULL;
@@ -1411,6 +1415,135 @@ static WINAPI BOOL GetWindowPlacement(HANDLE h, uint8_t *wp) {
     *(uint32_t *)(wp + 8) = w->minimized ? 2 : 1;               // showCmd
     memcpy(wp + 28, &w->rect, sizeof w->rect);                  // rcNormalPosition
     return 1;
+}
+
+// ---- Command Clips (control.c): the windows as text, actions as messages ----------------------------------------------
+typedef struct { char *p; size_t n, cap; } sbuf;
+static void sb_put(sbuf *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) { b->cap = (b->n + n + 1) * 2; b->p = realloc(b->p, b->cap); }
+    memcpy(b->p + b->n, s, n); b->n += n; b->p[b->n] = 0;
+}
+static void sb_printf(sbuf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void sb_printf(sbuf *b, const char *fmt, ...) {
+    char tmp[256]; va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof tmp, fmt, ap); va_end(ap);
+    sb_put(b, tmp, n < 0 ? 0 : (size_t)n < sizeof tmp ? (size_t)n : sizeof tmp - 1);
+}
+static void sb_json_str(sbuf *b, const char *s) {
+    sb_put(b, "\"", 1);
+    for (const unsigned char *c = (const unsigned char *)(s ? s : ""); *c; c++) {
+        if (*c == '"' || *c == '\\') { char e[2] = { '\\', (char)*c }; sb_put(b, e, 2); }
+        else if (*c < 0x20) sb_printf(b, "\\u%04x", *c);
+        else sb_put(b, (const char *)c, 1);
+    }
+    sb_put(b, "\"", 1);
+}
+char *vx_ui_state(void) {
+    sbuf b = { 0 };
+    sb_printf(&b, "{\"idle\":%s,\"active\":%lld,\"focus\":%lld,\"windows\":[", vx_ui_idle() ? "true" : "false",
+              (long long)(intptr_t)g_active, (long long)(intptr_t)g_focus);
+    int first = 1;
+    pthread_mutex_lock(&g_win_lock);
+    for (int i = 0; i < g_window_next; i++) {
+        vx_window *w = g_windows[i];
+        if (!w || w->destroyed) continue;
+        sb_printf(&b, "%s{\"hwnd\":%lld,\"parent\":%lld,\"class\":", first ? "" : ",", (long long)(intptr_t)w->hwnd, (long long)(intptr_t)w->parent);
+        first = 0;
+        sb_json_str(&b, w->cls ? w->cls->name : "");
+        sb_put(&b, ",\"title\":", 9); sb_json_str(&b, w->title);
+        sb_printf(&b, ",\"visible\":%s,\"enabled\":%s,\"client\":[%d,%d],\"texts\":[", w->visible ? "true" : "false",
+                  w->enabled ? "true" : "false", w->client_w, w->client_h);
+        pthread_mutex_lock(&vx_text_lock);
+        for (int k = 0; k < w->texts.n; k++) {
+            vx_text *t = &w->texts.v[k];
+            sb_printf(&b, "%s{\"text\":", k ? "," : ""); sb_json_str(&b, t->s);
+            sb_printf(&b, ",\"box\":[%d,%d,%d,%d]}", (int)t->r.left, (int)t->r.top, (int)(t->r.right - t->r.left), (int)(t->r.bottom - t->r.top));
+        }
+        pthread_mutex_unlock(&vx_text_lock);
+        sb_put(&b, "]}", 2);
+    }
+    pthread_mutex_unlock(&g_win_lock);
+    sb_put(&b, "]}", 2);
+    return b.p;
+}
+// Idle: every thread that owns a window waits for messages with none queued, none sent to it and nothing of its windows
+// left to paint. (A program that renders in a loop of PeekMessage is never idle.)
+int vx_ui_idle(void) {
+    vx_queue *qs[256]; int nq = 0;
+    pthread_mutex_lock(&g_queues_lock);
+    for (vx_queue *q = g_queues; q && nq < 256; q = q->next) qs[nq++] = q;
+    pthread_mutex_unlock(&g_queues_lock);
+    int owners = 0;
+    for (int k = 0; k < nq; k++) {
+        vx_queue *q = qs[k];
+        int owns = 0, unpainted = 0;
+        pthread_mutex_lock(&g_win_lock);
+        for (int i = 0; i < g_window_next; i++) {
+            vx_window *w = g_windows[i];
+            if (w && !w->destroyed && w->tid == q->tid) { owns = 1; unpainted |= w->invalid && w->visible; }
+        }
+        pthread_mutex_unlock(&g_win_lock);
+        if (!owns) continue;
+        owners++;
+        pthread_mutex_lock(&q->lock);
+        int busy = !q->waiting || q->count || q->sent || q->quit || unpainted;
+        pthread_mutex_unlock(&q->lock);
+        if (busy) return 0;
+    }
+    return owners > 0;
+}
+HANDLE vx_ui_window(HANDLE hwnd) {
+    if (hwnd) return vx_window_get(hwnd) ? hwnd : NULL;
+    if (g_active && vx_window_get(g_active)) return g_active;
+    HANDLE found = NULL;
+    pthread_mutex_lock(&g_win_lock);
+    for (int i = 0; i < g_window_next && !found; i++) {
+        vx_window *w = g_windows[i];
+        if (w && !w->destroyed && w->visible && !w->parent) found = w->hwnd;
+    }
+    pthread_mutex_unlock(&g_win_lock);
+    return found;
+}
+// The first drawn text containing needle, in hwnd or (0) in any window: its window and the middle of its box.
+int vx_ui_find_text(HANDLE hwnd, const char *needle, HANDLE *in, POINT *at) {
+    int found = 0;
+    pthread_mutex_lock(&g_win_lock);
+    pthread_mutex_lock(&vx_text_lock);
+    for (int i = 0; i < g_window_next && !found; i++) {
+        vx_window *w = g_windows[i];
+        if (!w || w->destroyed || (hwnd && w->hwnd != hwnd)) continue;
+        for (int k = 0; k < w->texts.n && !found; k++)
+            if (strstr(w->texts.v[k].s, needle)) {
+                RECT r = w->texts.v[k].r;
+                *in = w->hwnd; *at = (POINT){ (r.left + r.right) / 2, (r.top + r.bottom) / 2 }; found = 1;
+            }
+    }
+    pthread_mutex_unlock(&vx_text_lock);
+    pthread_mutex_unlock(&g_win_lock);
+    return found;
+}
+void vx_ui_click(HANDLE hwnd, int x, int y) {
+    vx_window *w = vx_window_get(hwnd);
+    if (!w) return;
+    LPARAM at = (LPARAM)((uint32_t)(uint16_t)x | (uint32_t)(uint16_t)y << 16);
+    queue_post(w->queue, hwnd, WM_MOUSEMOVE, 0, at);
+    queue_post(w->queue, hwnd, WM_LBUTTONDOWN, 1 /* MK_LBUTTON */, at);
+    queue_post(w->queue, hwnd, WM_LBUTTONUP, 0, at);
+}
+void vx_ui_key(HANDLE hwnd, int vk) {
+    vx_window *w = vx_window_get(hwnd);
+    if (!w) return;
+    queue_post(w->queue, hwnd, WM_KEYDOWN, (WPARAM)vk, 1);
+    queue_post(w->queue, hwnd, WM_KEYUP, (WPARAM)vk, (LPARAM)(1 | 3u << 30));
+}
+void vx_ui_type(HANDLE hwnd, const char *utf8) {
+    vx_window *w = vx_window_get(hwnd);
+    if (!w) return;
+    size_t n = vx_utf8_to_utf16(utf8, strlen(utf8), NULL, 0);
+    WCHAR *u = malloc((n + 1) * sizeof *u);
+    vx_utf8_to_utf16(utf8, strlen(utf8), u, n);
+    for (size_t i = 0; i < n; i++) queue_post(w->queue, hwnd, WM_CHAR, u[i], 1);
+    free(u);
 }
 
 static const vx_export user32[] = {
