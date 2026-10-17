@@ -118,6 +118,12 @@ static const size_t kPoseHistoryOffset = kHandsOffset + 512;
 struct SharedExtras { uint32_t ipdMagic; float ipdMeters; };
 static const size_t kSharedExtrasOffset = kHandsOffset + 320;
 static const uint32_t kIpdMagic = 0x44504956; // "VIPD"
+// The game's vibrations, per hand (left, right), for the encoder to pass on (ALVR's send_haptics): seq counts the
+// pulses, written last.
+struct SharedHaptic { uint32_t seq; float durationSeconds, frequency, amplitude; };
+static const size_t kSharedHapticsOffset = kHandsOffset + 336;
+static_assert(kSharedHapticsOffset >= kSharedExtrasOffset + sizeof(SharedExtras) && kSharedHapticsOffset + 2 * sizeof(SharedHaptic) <= kPoseHistoryOffset,
+              "SharedHaptic must sit between SharedExtras and the pose history");
 static_assert(kSharedExtrasOffset >= kHandsOffset + sizeof(SharedHands) && kSharedExtrasOffset + sizeof(SharedExtras) <= kPoseHistoryOffset,
               "SharedExtras must sit between SharedHands and the pose history");
 static const uint32_t kPoseHistoryMagic = 0x53485056; // "VPHS"
@@ -1104,6 +1110,7 @@ public:
     vr::VRInputComponentHandle_t m_compThumbrestTouch = 0;
     vr::VRInputComponentHandle_t m_compSystem = 0;
     vr::VRInputComponentHandle_t m_compSystemTouch = 0;
+    vr::VRInputComponentHandle_t m_compHaptic = vr::k_ulInvalidInputComponentHandle;
 
     CVerantyxControllerDriver(bool isLeft) : m_bIsLeft(isLeft) {}
 
@@ -1180,6 +1187,9 @@ public:
             LogInputComponentStatus("/input/system/touch", vr::VRDriverInput()->CreateBooleanComponent(
                 m_ulPropertyContainer, "/input/system/touch", &m_compSystemTouch));
         }
+        // Vibration: SteamVR sends VREvent_Input_HapticVibration for this component (RunFrame passes it on).
+        LogInputComponentStatus("/output/haptic", vr::VRDriverInput()->CreateHapticComponent(
+            m_ulPropertyContainer, "/output/haptic", &m_compHaptic));
         
         m_ready = true;
         return vr::VRInitError_None;
@@ -1501,7 +1511,34 @@ public:
         }
     }
 
+    // The game's vibrations, into the map's tail for the encoder (an ALVR headset gets them; the Vision Pro app's
+    // stream does not read them). SteamVR delivers them as events, polled here, on its thread.
+    uint64_t m_hapticPulses = 0;
+    void PassOnHaptics() {
+        vr::VREvent_t event;
+        while (vr::VRServerDriverHost()->PollNextEvent(&event, sizeof(event))) {
+            if (event.eventType != vr::VREvent_Input_HapticVibration || !g_sharedMap) continue;
+            const vr::VREvent_HapticVibration_t& v = event.data.hapticVibration;
+            int hand = -1;
+            if (m_pControllerLeft && v.componentHandle == m_pControllerLeft->m_compHaptic) hand = 0;
+            else if (m_pControllerRight && v.componentHandle == m_pControllerRight->m_compHaptic) hand = 1;
+            if (hand < 0) continue;
+            SharedHaptic* h = (SharedHaptic*)((uint8_t*)g_sharedMap + kSharedHapticsOffset) + hand;
+            h->durationSeconds = v.fDurationSeconds;
+            h->frequency = v.fFrequency;
+            h->amplitude = v.fAmplitude;
+            MemoryBarrier();
+            h->seq = h->seq + 1;
+            if (++m_hapticPulses <= 5 || m_hapticPulses % 500 == 0) {
+                char message[160];
+                snprintf(message, sizeof(message), "[Verantyx] Vibration #%llu, %s hand: %.3f s, %.0f Hz, amplitude %.2f",
+                    (unsigned long long)m_hapticPulses, hand ? "right" : "left", v.fDurationSeconds, v.fFrequency, v.fAmplitude);
+                LogDriver(message);
+            }
+        }
+    }
     virtual void RunFrame() override {
+        PassOnHaptics();
         if (m_poseThreadRunning.load()) return;
         if (!InitSharedMemoryDriver()) return;
         SharedHands hands = {};

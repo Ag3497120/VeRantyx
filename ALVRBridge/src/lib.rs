@@ -15,7 +15,7 @@ use alvr_common::{
     RIGHT_SYSTEM_CLICK_ID, RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_TOUCH_ID, RIGHT_THUMBSTICK_X_ID,
     RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_VALUE_ID,
 };
-use alvr_packets::ButtonValue;
+use alvr_packets::{ButtonValue, Haptics};
 use alvr_server_core::{HandType, ServerCoreContext, ServerCoreEvent};
 use alvr_session::{CodecType, SessionConfig};
 use std::{
@@ -320,6 +320,22 @@ pub extern "C" fn vx_alvr_refresh_hz() -> f32 {
     let path = layout(None).session();
     fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|s| s["openvr_config"]["refresh_rate"].as_f64()).unwrap_or(0.0) as f32
+}
+
+/// A vibration the game asked for (hand 0 left, 1 right), to the headset's controller through ALVR, which scales it
+/// by its haptics settings (on by default).
+#[no_mangle]
+pub extern "C" fn vx_alvr_haptics(hand: u32, duration_s: f32, frequency: f32, amplitude: f32) {
+    static PULSES: AtomicU64 = AtomicU64::new(0);
+    let Some(b) = BRIDGE.get() else { return };
+    let guard = b.ctx.read().unwrap();
+    let Some(ctx) = guard.as_ref() else { return };
+    let device_id = if hand == 0 { *HAND_LEFT_ID } else { *HAND_RIGHT_ID };
+    ctx.send_haptics(Haptics { device_id, duration: Duration::from_secs_f32(duration_s.clamp(0.0, 5.0)), frequency, amplitude });
+    let n = PULSES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 3 || n % 500 == 0 {
+        alvr_common::info!("VeRantyx: vibration #{n} to the {} hand: {duration_s:.3} s, {frequency:.0} Hz, amplitude {amplitude:.2}", if hand == 0 { "left" } else { "right" });
+    }
 }
 
 /// The distance between the headset's eyes, in metres, as its client reports it (0 before it has).

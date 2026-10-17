@@ -412,6 +412,7 @@ struct ALVRBridge {
     let send: @convention(c) (Double, UnsafePointer<UInt8>, Int, Bool) -> Void
     let restartNeeded: @convention(c) () -> Bool
     let ipd: (@convention(c) () -> Float)?                              // (a library from before it had one: nil)
+    let haptics: (@convention(c) (UInt32, Float, Float, Float) -> Void)?
 }
 let alvrMode = ProcessInfo.processInfo.environment["VERANTYX_ALVR"] == "1"
 func loadALVRBridge() -> ALVRBridge? {
@@ -427,7 +428,8 @@ func loadALVRBridge() -> ALVRBridge? {
           let restartNeeded = fn("vx_alvr_restart_needed", (@convention(c) () -> Bool).self)
     else { print("ALVR: \(path) lacks the bridge's functions"); return nil }
     let bridge = ALVRBridge(start: start, input: input, connected: connected, takeIDR: takeIDR, setConfig: setConfig, send: send, restartNeeded: restartNeeded,
-                            ipd: fn("vx_alvr_ipd", (@convention(c) () -> Float).self))
+                            ipd: fn("vx_alvr_ipd", (@convention(c) () -> Float).self),
+                            haptics: fn("vx_alvr_haptics", (@convention(c) (UInt32, Float, Float, Float) -> Void).self))
     guard bridge.start(nil) else { print("ALVR: the streaming core did not start"); return nil }
     print("ALVR: streaming core started (\(path)); open an ALVR client on this network")
     return bridge
@@ -769,6 +771,9 @@ if let alvr {
     Thread {
         let input = UnsafeMutableRawPointer.allocate(byteCount: 312, alignment: 8)
         var seq: UInt64 = 0
+        // The game's vibrations, which the driver writes per hand at 336 in the map's tail (SharedHaptic: seq, then
+        // duration, frequency, amplitude), to the headset (the seqs already there are old ones: skipped)
+        var hapticSeq = [handsMapPtr.advanced(by: 336).load(as: UInt32.self), handsMapPtr.advanced(by: 352).load(as: UInt32.self)]
         var checked = Date()
         while isEncoding {
             if alvr.takeIDR() { requestKeyFrame() }
@@ -786,6 +791,18 @@ if let alvr {
                     fflush(stdout)
                     _exit(75)                                           // (not exit: its handlers ran into ALVR's and
                                                                         //  the audio tap's threads, and it died of it)
+                }
+            }
+            if let haptics = alvr.haptics {
+                for hand in 0..<2 {
+                    let at = handsMapPtr.advanced(by: 336 + 16 * hand)
+                    let s = at.load(as: UInt32.self)
+                    if s != hapticSeq[hand] {
+                        hapticSeq[hand] = s
+                        OSMemoryBarrier()
+                        haptics(UInt32(hand), at.load(fromByteOffset: 4, as: Float.self), at.load(fromByteOffset: 8, as: Float.self),
+                                at.load(fromByteOffset: 12, as: Float.self))
+                    }
                 }
             }
             let next = alvr.input(input, seq)

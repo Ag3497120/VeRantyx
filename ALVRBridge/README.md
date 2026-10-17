@@ -28,7 +28,10 @@ The distance between the headset's eyes (its view transforms) goes to SteamVR as
 (Prop_UserIpdMeters): the encoder writes it after SharedHands in the map's tail ("VIPD"), the driver sets it when it
 differs by half a millimetre. 63 mm until a headset reports one, and with the Vision Pro app.
 
-Not yet: haptics (VeRantyx's driver has none).
+Vibration: the driver's controllers have a haptic component; the game's vibrations (VREvent_Input_HapticVibration)
+go per hand into the map's tail (SharedHaptic at 336: seq, duration, frequency, amplitude), the encoder passes each on
+(`vx_alvr_haptics`) and ALVR sends it to the headset's controller, scaled by its haptics settings. Whether a
+controller then shakes needs a headset with vibrating controllers (Quest, Pico): not checked yet.
 
 ## Build and run
 
@@ -82,4 +85,7 @@ for); it connects again by itself.
 - IPD (2026-10-17): ALVR's client_mock, changed locally to report eyes 61.2 mm apart, connected from the Air to a
   harness run (20261017T080322Z-alyx-chapter, 60.0 fps): the bridge logged the eyes at +-0.0306 m and the driver
   "IPD 61.2 mm (the headset's)" a second later.
+- Vibration (2026-10-17): Half-Life: Alyx in the harness with client_mock connected from the Air
+  (20261017T080757Z-alyx-chapter, 60.0 fps): the driver got the game's first vibration at 17:08:42.841 (right hand,
+  amplitude 0.20) and over 1000 in two minutes; the bridge sent them to ALVR from the same moment.
 - A Quest: only through someone who has one.

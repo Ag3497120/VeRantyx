@@ -107,7 +107,7 @@ What is known about each game is in [games/](games/).
 | Controls | Vision Pro hand tracking + Joy-Con (or bare hands) | The headset's controllers or hand tracking, through ALVR |
 | Stream | HEVC (Main10 with the 3K preset), VeRantyx's own UDP protocol, each frame drawn at the game's exact frustum and pose | HEVC through ALVR's own streaming core (unchanged, v20.14.1), each frame stamped with the ALVR tracking sample it was rendered for |
 | Audio | Core Audio process tap → the app | The same tap, given to ALVR as a device (the Mac's speakers mute while a headset listens) |
-| Not yet | — | Haptics |
+| Vibration | — | Passed on to the controllers (the game's pulses reach ALVR); felt in a controller: not checked yet (no Quest) |
 
 With ALVR the headset shows its own rate (90 Hz on the Vision Pro) and stretches
 the last frame to the head's turn until the next comes: when the game runs far
@@ -193,7 +193,7 @@ repository (vxrt version):
 | D3D11 on Metal | Our own translator (DXBC → Metal Shading Language), one layer | DXMT (one layer) |
 | Video | HEVC: to the Vision Pro app (own UDP protocol, exact render pose per frame) or through ALVR's streaming core | H.264, ALVR protocol, USB (100 Mbps) or Wi-Fi, 72 fps claimed |
 | Headset | Apple Vision Pro (own visionOS app), and ALVR clients: the Vision Pro's ALVR app checked, Quest and Pico not tested yet | Any ALVR client (tested on Quest 3) |
-| Input | Vision Pro app: hand tracking + Joy-Con (buttons, sticks, triggers, inertial sensors); ALVR: the headset's controllers or hands; no haptics yet | VR controllers through ALVR: 6DoF, buttons, sticks, haptics |
+| Input | Vision Pro app: hand tracking + Joy-Con (buttons, sticks, triggers, inertial sensors); ALVR: the headset's controllers or hands, vibration passed on (not felt yet: no Quest) | VR controllers through ALVR: 6DoF, buttons, sticks, haptics |
 | Audio | Core Audio process tap, no extra driver (also to ALVR) | BlackHole virtual audio device |
 | Games checked | Half-Life: Alyx, The Lab, Google Earth VR | Half-Life: Alyx, Beat Saber, Minecraft (Vivecraft) and more, per its author |
 | Source | MIT, full source | Binaries only, 7-day trial then license key |
