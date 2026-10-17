@@ -182,6 +182,7 @@ x87-exact: build/x87_ref build/x87_ours
 translator-check: build/ref_x86 build/difftest build/x86dec_test
 	build/x86dec_test
 	build/difftest build/ref_x86 3000
+	DT_ORDERED=1 build/difftest build/ref_x86 1000    # (the ARM64 runtime's default: x86's order with LDAPR / STLR)
 
 build/hvprobe: translator/hvprobe.c translator/hypervisor.entitlements
 	@mkdir -p build
