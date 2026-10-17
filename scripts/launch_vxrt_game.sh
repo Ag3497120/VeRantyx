@@ -78,6 +78,10 @@ for _ in $(seq 1 40); do                               # vrserver's web server i
 done
 LOG="$LOG_DIR/vxrt-${EXE_NAME%.*}.log"
 echo "SteamVR on VXRuntime is up; starting $EXE_NAME${APP_ID:+ (Steam app $APP_ID)} (log: $LOG)"
+# (the quality presets are the Vision Pro app's; an ALVR headset shows its own rate, 90 Hz, and stretches the last
+#  frame to the head's turn until the next comes: Half-Life: Alyx at 3k on a MacBook Air M5 made some 44 fps and
+#  warped when turning, with ALVR's defaults it did not, 2026-10-17)
+[[ "${VERANTYX_ALVR:-0}" == 1 && -n "${VXRT_VR_QUALITY:-}" ]] && echo "ALVR with VXRT_VR_QUALITY=$VXRT_VR_QUALITY: if turning your head warps the picture, the game runs too far below the headset's rate; leave VXRT_VR_QUALITY out for ALVR's lighter defaults"
 
 cd "$GAME_DIR"
 # The game's own debug output (VXRT_DEBUGGER, VXRT_DEBUG_OUTPUT) goes to the log with the time: why it quit, if it does.
