@@ -84,7 +84,7 @@ Then, with Steam running on the Mac and signed in:
 ```bash
 scripts/launch_vxrt_alyx.sh                      # Vision Pro app: SteamVR on vxrt + encoder + Half-Life: Alyx
 VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 1440×1620 per eye, 2880×1620 10-bit HEVC at 40 Mbps, 60 fps
-VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 2560×2880 per eye rendered (2× MSAA), same stream, 50–60 fps
+VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 2560×2880 per eye rendered (2× MSAA), same stream: ~50 fps in the menu, 30–37 in chapter 1
 VXRT_VR_QUALITY=max scripts/launch_vxrt_alyx.sh  # 3200×3600 per eye (a Vision Pro eye's pixels), 3840×2160 stream, 16–21 fps
 VERANTYX_ALVR=1 scripts/launch_vxrt_alyx.sh      # ALVR client apps instead (needs Rust, https://rustup.rs, the first time)
 ```
@@ -288,7 +288,7 @@ Half-Life: Alyx, MacBook Pro M1 Max, measured with each version's own logs.
 | Graphics | D3D11 → DXVK → Vulkan → MoltenVK → Metal | Vulkan → MoltenVK → Metal | D3D11 → Metal (own translator) |
 | Steam | Windows Steam + Chromium under Wine | Mac Steam client | Mac Steam client (bridge) |
 | In game, default size | ~30 fps (CPU-bound, SteamVR scale 0.7) | 60 fps, 1298×1056 per eye | 45–57 fps, ~840×940 per eye |
-| Larger sizes | — | 1982×1536 per eye ~39 fps; ~3K per eye ~20 fps | 3K preset: 1440×1620 per eye at 60 fps, streamed at 60 fps (HEVC Main10, ~4.7 megapixels); 2.5K preset: 2560×2880 per eye (2× MSAA) at 50–60 fps; max preset: 3200×3600 per eye at 16–21 fps |
+| Larger sizes | — | 1982×1536 per eye ~39 fps; ~3K per eye ~20 fps | 3K preset: 1440×1620 per eye at 60 fps, streamed at 60 fps (HEVC Main10, ~4.7 megapixels); 2.5K preset: 2560×2880 per eye (2× MSAA), 50–55 fps in the menu but 30–37 in chapter 1 (GPU-bound; 2026-10-17); max preset: 3200×3600 per eye at 16–21 fps |
 | Other Windows VR games | Possible (Wine) | No: needs a Linux ARM64 build | The Lab (title scene 53–58 fps) and Google Earth VR run; Bigscreen does not start yet |
 | Played in the headset | Yes | Yes (20+ min sessions) | Yes (2026-10-14, across level changes, 3K) |
 
