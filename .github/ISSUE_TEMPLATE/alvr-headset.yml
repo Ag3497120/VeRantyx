@@ -1,0 +1,44 @@
+name: "A headset through ALVR (Quest, Pico, ...): test report"
+description: How VeRantyx ran on your headset through ALVR (VERANTYX_ALVR=1) – working or not, both help.
+title: "[ALVR] <headset> + <Mac>: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing! Steps: README, "Testing with a Quest or Pico (ALVR)". Please don't attach game files.
+  - type: input
+    id: headset
+    attributes: {label: "Headset and ALVR client version", placeholder: "Quest 3, ALVR 20.14.1 (SideQuest)"}
+    validations: {required: true}
+  - type: input
+    id: mac
+    attributes: {label: "Mac (chip, GPU cores, memory), macOS, VeRantyx commit", placeholder: "M5 MacBook Pro, 10-core GPU, 24 GB, macOS 26.5, 58c13f5"}
+    validations: {required: true}
+  - type: input
+    id: command
+    attributes: {label: "Launch command", placeholder: "VERANTYX_ALVR=1 scripts/launch_vxrt_alyx.sh"}
+  - type: checkboxes
+    id: works
+    attributes:
+      label: What worked
+      options:
+        - label: It connected and the picture showed
+        - label: Head tracking
+        - label: Controller position (both hands)
+        - label: Buttons, sticks, triggers, grip
+        - label: Hand tracking (controllers put down)
+        - label: Game audio in the headset
+        - label: Vibration in the controllers
+  - type: input
+    id: smooth
+    attributes: {label: "How smooth (and Wi-Fi: 5 GHz? channel width?)", placeholder: "smooth / small stutters / unplayable; 5 GHz 80 MHz"}
+  - type: textarea
+    id: notes
+    attributes: {label: "What went wrong, or anything strange"}
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (if something failed)
+      description: |
+        ~/Library/Application Support/VeRantyx/ALVR/session_log.txt (the previous start's: session_log.prev.txt) and
+        logs/hardware-encoder.log from the repository. Drag the files here.

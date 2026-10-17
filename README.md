@@ -115,6 +115,26 @@ below that rate, turning the head warps the picture. Alyx at the 3K preset on a
 MacBook Air M5 did; with ALVR's defaults (no preset) it did not. Details,
 settings and what was checked: [ALVRBridge/README.md](ALVRBridge/README.md).
 
+### Testing with a Quest or Pico (ALVR)
+
+Not tested on either yet – we have neither. If you do, a report helps a lot, whether it works or not.
+
+1. Set up the Mac as in [Quick start](#quick-start-vxrt-version), and install Rust (https://rustup.rs) for the ALVR
+   part, which is built at the first start.
+2. Install ALVR's client, version 20.x, on the headset (from ALVR's GitHub releases or SideQuest).
+3. With Steam running on the Mac, start the game for ALVR:
+   ```bash
+   VERANTYX_ALVR=1 scripts/launch_vxrt_alyx.sh                      # Air and base chips: ALVR's defaults
+   VERANTYX_ALVR=1 VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # Pro/Max chips (24+ GPU cores)
+   ```
+4. Open ALVR on the headset on the same Wi-Fi (5 GHz, 80 MHz channel if you can). It connects by itself; the first
+   time it connects once, applies the headset's display settings and connects again.
+5. Report with the issue form "A headset through ALVR": what worked (picture, head, controllers, buttons, hand
+   tracking, audio, vibration), how smooth it was, and, if something failed,
+   `~/Library/Application Support/VeRantyx/ALVR/session_log.txt` and `logs/hardware-encoder.log`.
+
+USB (wired) streaming is not wired up yet: use Wi-Fi.
+
 ## Status and limits (vxrt version)
 
 2026-10-17, MacBook Pro (M1 Max) and MacBook Air (M5):
