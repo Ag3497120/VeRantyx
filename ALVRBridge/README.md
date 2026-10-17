@@ -72,4 +72,7 @@ for); it connects again by itself.
 - Game audio in the Vision Pro's ALVR app (2026-10-17, the user, Half-Life: Alyx): the game's sound plays in the
   headset. With ALVR's 50 ms buffer, and 150, it broke up (the game's own output had no gaps: no `gaps of silence`
   in its log); with 250 ms it did not. The device and the handshake (sample rate) were first checked with the mock.
+- Hands in the Vision Pro's ALVR app (2026-10-17, the user, on the Air): they vanished whenever the app had gone
+  over to hand tracking (the Joy-Con untouched for a while: ALVR then drops the controller's motion); with the
+  palm's pose in its place they stay.
 - A Quest: only through someone who has one.

@@ -8,15 +8,15 @@
 // into SharedHands.visionTimestamp, travels with the frame rendered for it, and comes back in vx_alvr_send, where
 // it is turned back into the same Duration (exact to the nanosecond for some 100 days of uptime).
 use alvr_common::{
-    glam::{Quat, Vec3},
-    DeviceMotion, Fov, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, LEFT_MENU_CLICK_ID, LEFT_SQUEEZE_VALUE_ID,
+    glam::{EulerRot, Quat, Vec3},
+    DeviceMotion, Fov, Pose, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, LEFT_MENU_CLICK_ID, LEFT_SQUEEZE_VALUE_ID,
     LEFT_THUMBSTICK_CLICK_ID, LEFT_THUMBSTICK_TOUCH_ID, LEFT_THUMBSTICK_X_ID, LEFT_THUMBSTICK_Y_ID, LEFT_TRIGGER_VALUE_ID,
     LEFT_X_CLICK_ID, LEFT_Y_CLICK_ID, RIGHT_A_CLICK_ID, RIGHT_B_CLICK_ID, RIGHT_SQUEEZE_VALUE_ID,
     RIGHT_SYSTEM_CLICK_ID, RIGHT_THUMBSTICK_CLICK_ID, RIGHT_THUMBSTICK_TOUCH_ID, RIGHT_THUMBSTICK_X_ID,
     RIGHT_THUMBSTICK_Y_ID, RIGHT_TRIGGER_VALUE_ID,
 };
 use alvr_packets::ButtonValue;
-use alvr_server_core::{ServerCoreContext, ServerCoreEvent};
+use alvr_server_core::{HandType, ServerCoreContext, ServerCoreEvent};
 use alvr_session::{CodecType, SessionConfig};
 use std::{
     collections::HashMap,
@@ -159,6 +159,22 @@ fn matrix(m: Option<DeviceMotion>) -> Option<([f32; 16], [f32; 3], [f32; 3])> {
     let r = alvr_common::glam::Mat4::from_rotation_translation(m.pose.orientation, m.pose.position);
     Some((r.to_cols_array(), m.linear_velocity.to_array(), m.angular_velocity.to_array()))
 }
+// A hand the client tracks as a hand (its skeleton) rather than as a controller: ALVR then drops that hand's
+// controller motion, so the hand vanished in the game whenever the Vision Pro's ALVR app had gone over to hand
+// tracking (the Joy-Con untouched for a while). Its pose is then the palm moved by ALVR's default hand-tracking offset,
+// as ALVR's own SteamVR driver places a tracked hand (server_openvr tracking.rs, to_openvr_ffi_hand_skeleton), so it
+// sits where the controller would.
+fn hand_motion(ctx: &ServerCoreContext, hand: HandType, t: Duration) -> Option<DeviceMotion> {
+    let (offset, turn) = ([0.04f32, -0.02, -0.13], [0.0f32, -45.0, -90.0]);   // (ALVR's left hand; the right mirrored)
+    let (sign, d) = (if matches!(hand, HandType::Left) { 1.0 } else { -1.0 }, std::f32::consts::PI / 180.0);
+    let palm = ctx.get_hand_skeleton(hand, t)?[0];
+    let o = Quat::from_euler(EulerRot::XYZ, turn[0] * d, sign * turn[1] * d, sign * turn[2] * d);
+    let at = Vec3::new(sign * offset[0], offset[1], offset[2]);
+    Some(DeviceMotion {
+        pose: Pose { orientation: palm.orientation * o, position: palm.position + palm.orientation * o * at },
+        linear_velocity: Vec3::ZERO, angular_velocity: Vec3::ZERO,
+    })
+}
 fn tangents(f: &Fov) -> [f32; 4] { [f.left.tan(), f.right.tan(), f.down.tan(), f.up.tan()] }
 
 fn apply_buttons(input: &mut VxAlvrInput, values: &HashMap<u64, f32>) {
@@ -229,8 +245,10 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
                 let (head, left, right) = {
                     let guard = bridge.ctx.read().unwrap();
                     let Some(ctx) = guard.as_ref() else { continue };
-                    (matrix(ctx.get_device_motion(*HEAD_ID, sample_timestamp)), matrix(ctx.get_device_motion(*HAND_LEFT_ID, sample_timestamp)),
-                     matrix(ctx.get_device_motion(*HAND_RIGHT_ID, sample_timestamp)))
+                    let t = sample_timestamp;
+                    (matrix(ctx.get_device_motion(*HEAD_ID, t)),
+                     matrix(ctx.get_device_motion(*HAND_LEFT_ID, t).or_else(|| hand_motion(ctx, HandType::Left, t))),
+                     matrix(ctx.get_device_motion(*HAND_RIGHT_ID, t).or_else(|| hand_motion(ctx, HandType::Right, t))))
                 };
                 bridge.samples.lock().unwrap().sample(sample_timestamp.as_nanos() as u64);
                 let mut i = bridge.input.lock().unwrap();
