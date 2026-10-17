@@ -38,7 +38,7 @@ pub fn layout(config_dir: Option<PathBuf>) -> alvr_filesystem::Layout {
 }
 
 // The session for the Mac, written before ALVR reads it (it reads it once): clients trusted as they come (there is no
-// dashboard), no game audio (macOS cannot record an output device; VeRantyx's audio comes later), HEVC
+// dashboard), game audio only from the device the encoder made for it (macOS cannot record an output device), HEVC
 // (VideoToolbox), no server-side foveation (VeRantyx's frames are full resolution), TCP (the visionOS client wants it).
 pub fn prepare_session(layout: &alvr_filesystem::Layout) {
     let path = layout.session();
@@ -48,7 +48,22 @@ pub fn prepare_session(layout: &alvr_filesystem::Layout) {
     let ss = &mut s["session_settings"];
     ss["connection"]["client_discovery"]["content"]["auto_trust_clients"] = true.into();
     ss["connection"]["stream_protocol"]["variant"] = "Tcp".into();
-    ss["audio"]["game_audio"]["enabled"] = false.into();
+    // (game audio: the device the encoder made, VERANTYX_ALVR_AUDIO_DEVICE, when it made one; macOS has no loopback)
+    match env::var("VERANTYX_ALVR_AUDIO_DEVICE") {
+        Ok(name) if !name.is_empty() => {
+            ss["audio"]["game_audio"]["enabled"] = true.into();
+            let device = &mut ss["audio"]["game_audio"]["content"]["device"];
+            device["set"] = true.into();
+            device["content"]["variant"] = "NameSubstring".into();
+            device["content"]["NameSubstring"] = name.into();
+            // (the headset's buffer: ALVR's 50 ms ran dry, heard as breaks, in Half-Life: Alyx with the Vision Pro's
+            //  ALVR app, where the sound shares the TCP stream with 40 Mbps of video; 150 ms still broke, 250 did not.
+            //  VERANTYX_ALVR_AUDIO_BUFFER_MS)
+            let ms = env::var("VERANTYX_ALVR_AUDIO_BUFFER_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(250);
+            ss["audio"]["game_audio"]["content"]["buffering"]["average_buffering_ms"] = ms.into();
+        }
+        _ => ss["audio"]["game_audio"]["enabled"] = false.into(),
+    }
     ss["video"]["preferred_codec"]["variant"] = "Hevc".into();
     ss["video"]["foveated_encoding"]["enabled"] = false.into();
     fs::write(&path, serde_json::to_string_pretty(&s).unwrap()).unwrap();

@@ -430,6 +430,56 @@ func loadALVRBridge() -> ALVRBridge? {
     print("ALVR: streaming core started (\(path)); open an ALVR client on this network")
     return bridge
 }
+// Game audio for ALVR: ALVR records an output device it finds by name (on Windows, the speakers by loopback). macOS has
+// no loopback, so this makes one: an aggregate device of the Mac's output (so that it counts as an output device) and
+// a tap of the Mac's sound (its input), which ALVR, in this process, records. The tap mutes the speakers while it is
+// read (VERANTYX_AUDIO_KEEP_MAC_SPEAKERS=1: not). VERANTYX_ALVR_AUDIO=0: no game audio over ALVR.
+let alvrAudioDeviceName = "VeRantyx ALVR game audio"
+func makeALVRAudioDevice() -> Bool {
+    guard ProcessInfo.processInfo.environment["VERANTYX_ALVR_AUDIO"] != "0" else { return false }
+    guard #available(macOS 14.2, *) else { print("ALVR: game audio needs macOS 14.2 or later"); return false }
+    var output = AudioObjectID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                             mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &output) == noErr else {
+        print("ALVR: no default output device for game audio"); return false
+    }
+    var uid: Unmanaged<CFString>?
+    size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    address.mSelector = kAudioDevicePropertyDeviceUID
+    guard AudioObjectGetPropertyData(output, &address, 0, nil, &size, &uid) == noErr, let outputUID = uid?.takeRetainedValue() as String? else {
+        print("ALVR: the output device has no UID"); return false
+    }
+    let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+    description.name = "VeRantyx ALVR game audio tap"
+    description.muteBehavior = ProcessInfo.processInfo.environment["VERANTYX_AUDIO_KEEP_MAC_SPEAKERS"] == "1" ? .unmuted : .mutedWhenTapped
+    description.isPrivate = true
+    var tap = AudioObjectID(kAudioObjectUnknown)
+    var status = AudioHardwareCreateProcessTap(description, &tap)
+    guard status == noErr else {
+        print("ALVR: could not create the system audio tap (\(status)). Allow this terminal under System Settings > Privacy & Security > Screen & System Audio Recording, then relaunch.")
+        return false
+    }
+    let aggregate: [String: Any] = [
+        kAudioAggregateDeviceNameKey as String: alvrAudioDeviceName,
+        kAudioAggregateDeviceUIDKey as String: "com.verantyx.alvr.game-audio",
+        kAudioAggregateDeviceIsPrivateKey as String: true,
+        kAudioAggregateDeviceMainSubDeviceKey as String: outputUID,
+        kAudioAggregateDeviceSubDeviceListKey as String: [[kAudioSubDeviceUIDKey as String: outputUID]],
+        kAudioAggregateDeviceTapAutoStartKey as String: true,
+        kAudioAggregateDeviceTapListKey as String: [[
+            kAudioSubTapUIDKey as String: description.uuid.uuidString,
+            kAudioSubTapDriftCompensationKey as String: true,
+        ]],
+    ]
+    var device = AudioObjectID(kAudioObjectUnknown)
+    status = AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &device)
+    guard status == noErr else { print("ALVR: could not create the game audio device (\(status))"); return false }
+    print("ALVR: game audio from \"\(alvrAudioDeviceName)\" (the Mac's sound; its speakers \(description.muteBehavior == .unmuted ? "stay on" : "muted while a headset listens"))")
+    return true
+}
+if alvrMode && makeALVRAudioDevice() { setenv("VERANTYX_ALVR_AUDIO_DEVICE", alvrAudioDeviceName, 1) }   // (ALVRBridge's session reads it)
 let alvr: ALVRBridge? = alvrMode ? loadALVRBridge() : nil
 var alvrConfig = Data()
 

@@ -17,7 +17,14 @@ ask for its host to be restarted (ALVR's dashboard restarts SteamVR): here the e
 script starts it again; it then connects with them. SteamVR's display rate follows the last ALVR headset's at the
 next start (`VERANTYX_DISPLAY_HZ` overrides it).
 
-Not yet: haptics (VeRantyx's driver has none), game audio to the headset, IPD from the client's view transforms.
+Game audio: macOS cannot record an output device (ALVR records the speakers on Windows), so the encoder makes a
+device ALVR can: an aggregate of the Mac's output and a tap of the Mac's sound, "VeRantyx ALVR game audio", private
+to its process (ALVR runs in it), and names it to the session. The tap mutes the Mac's speakers while a headset
+listens (`VERANTYX_AUDIO_KEEP_MAC_SPEAKERS=1`: not); `VERANTYX_ALVR_AUDIO=0`: no game audio. The headset buffers
+250 ms of it (`VERANTYX_ALVR_AUDIO_BUFFER_MS`; ALVR's 50 ms, and 150, broke up with the Vision Pro's ALVR app). The first time, macOS
+asks to allow the terminal under Screen & System Audio Recording (the tap needs it).
+
+Not yet: haptics (VeRantyx's driver has none), IPD from the client's view transforms.
 
 ## Build and run
 
@@ -30,8 +37,8 @@ target/release/alvr_probe --hevc /tmp/test.h265 --seconds 300
 ```
 
 Then open an ALVR 20.x client on the same network. The session (`~/Library/Application Support/VeRantyx/ALVR/`) is
-set for the Mac on every start: clients trusted as they come (there is no dashboard), no game audio (macOS cannot
-record an output device), HEVC, no server-side foveation, TCP (the visionOS client wants it). The first connection
+set for the Mac on every start: clients trusted as they come (there is no dashboard), game audio only from the
+encoder's device (above; the probe has none), HEVC, no server-side foveation, TCP (the visionOS client wants it). The first connection
 of a new client ends once ("Cannot restart SteamVR": the settings it brought need a restart there is no dashboard
 for); it connects again by itself.
 
@@ -62,4 +69,7 @@ for); it connects again by itself.
   GPU time), none dropped by the encoder: hence ALVR mode's defaults (2880x1040 budget, 1.4x, 40 Mbps). Flying and
   zooming in still stutter at times (frames 100-200 ms apart while Earth loads map data); whether that is Earth's
   own is to be seen with another game.
+- Game audio in the Vision Pro's ALVR app (2026-10-17, the user, Half-Life: Alyx): the game's sound plays in the
+  headset. With ALVR's 50 ms buffer, and 150, it broke up (the game's own output had no gaps: no `gaps of silence`
+  in its log); with 250 ms it did not. The device and the handshake (sample rate) were first checked with the mock.
 - A Quest: only through someone who has one.
