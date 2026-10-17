@@ -370,8 +370,11 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
         fprintf(stderr, "[vxrt] engine: translation cache full (%zu words, %llu blocks): flushed (%llu)\n", e->used, (unsigned long long)e->stats.blocks, (unsigned long long)e->stats.flushes);
     }
     uint32_t *at = e->code + e->used;
-    uint32_t *self[16]; int nself = 0;                                    // (sites to this block itself: a loop, a recursive
-    writable(1);                                                          //  call; it is not in the map yet)
+    // (sites to this block itself: a loop, a recursive call; it is not in the map yet. Not in a checked block: with them
+    //  linked there, Unity's heap came apart about 40 s into The Lab on the ARM64 runtime (List.EnsureCapacity on a
+    //  null list, the allocator's block headers garbage); without, it runs. Why is not found yet.)
+    uint32_t *self[16]; int nself = 0;
+    writable(1);
     memcpy(at, b.code, b.n * 4);
     for (size_t i = 0; i < b.nrelocs; i++) {
         uint32_t *p = at + b.relocs[i].at;
@@ -382,13 +385,13 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
         else if (b.relocs[i].kind == XR_CALL) {                          // (the return's site, 3 words, then the target)
             uint64_t to = (uint64_t)p[4] | (uint64_t)p[5] << 32;
             mentry *t = find_entry(e, to);
-            if (!t && to == rip && !once && nself < 16) { *p = a64_bl((int32_t)(at - p)); self[nself++] = p; continue; }
+            if (!t && to == rip && !once && !b.check_bytes && nself < 16) { *p = a64_bl((int32_t)(at - p)); self[nself++] = p; continue; }
             *p = a64_bl(t ? (int32_t)((uint32_t *)(uintptr_t)t->host - p) : (int32_t)(e->link_call - p));
             if (t) { e->stats.linked++; add_site(e, t->id, p, 1); }
         } else {
             uint64_t to = (uint64_t)p[1] | (uint64_t)p[2] << 32;
             mentry *t = find_entry(e, to);
-            if (!t && to == rip && !once && nself < 16) { *p = a64_b((int32_t)(at - p)); self[nself++] = p; continue; }
+            if (!t && to == rip && !once && !b.check_bytes && nself < 16) { *p = a64_b((int32_t)(at - p)); self[nself++] = p; continue; }
             *p = t ? a64_b((int32_t)((uint32_t *)(uintptr_t)t->host - p)) : a64_bl((int32_t)(e->link - p));
             if (t) { e->stats.linked++; add_site(e, t->id, p, 0); }
         }
