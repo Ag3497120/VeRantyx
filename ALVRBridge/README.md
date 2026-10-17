@@ -24,7 +24,11 @@ listens (`VERANTYX_AUDIO_KEEP_MAC_SPEAKERS=1`: not); `VERANTYX_ALVR_AUDIO=0`: no
 250 ms of it (`VERANTYX_ALVR_AUDIO_BUFFER_MS`; ALVR's 50 ms, and 150, broke up with the Vision Pro's ALVR app). The first time, macOS
 asks to allow the terminal under Screen & System Audio Recording (the tap needs it).
 
-Not yet: haptics (VeRantyx's driver has none), IPD from the client's view transforms.
+The distance between the headset's eyes (its view transforms) goes to SteamVR as the user's IPD
+(Prop_UserIpdMeters): the encoder writes it after SharedHands in the map's tail ("VIPD"), the driver sets it when it
+differs by half a millimetre. 63 mm until a headset reports one, and with the Vision Pro app.
+
+Not yet: haptics (VeRantyx's driver has none).
 
 ## Build and run
 
@@ -75,4 +79,7 @@ for); it connects again by itself.
 - Hands in the Vision Pro's ALVR app (2026-10-17, the user, on the Air): they vanished whenever the app had gone
   over to hand tracking (the Joy-Con untouched for a while: ALVR then drops the controller's motion); with the
   palm's pose in its place they stay.
+- IPD (2026-10-17): ALVR's client_mock, changed locally to report eyes 61.2 mm apart, connected from the Air to a
+  harness run (20261017T080322Z-alyx-chapter, 60.0 fps): the bridge logged the eyes at +-0.0306 m and the driver
+  "IPD 61.2 mm (the headset's)" a second later.
 - A Quest: only through someone who has one.

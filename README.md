@@ -107,7 +107,7 @@ What is known about each game is in [games/](games/).
 | Controls | Vision Pro hand tracking + Joy-Con (or bare hands) | The headset's controllers or hand tracking, through ALVR |
 | Stream | HEVC (Main10 with the 3K preset), VeRantyx's own UDP protocol, each frame drawn at the game's exact frustum and pose | HEVC through ALVR's own streaming core (unchanged, v20.14.1), each frame stamped with the ALVR tracking sample it was rendered for |
 | Audio | Core Audio process tap → the app | The same tap, given to ALVR as a device (the Mac's speakers mute while a headset listens) |
-| Not yet | — | Haptics; eye distance (IPD) from the headset (63 mm is used) |
+| Not yet | — | Haptics |
 
 With ALVR the headset shows its own rate (90 Hz on the Vision Pro) and stretches
 the last frame to the head's turn until the next comes: when the game runs far

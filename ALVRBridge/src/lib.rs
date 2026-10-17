@@ -25,7 +25,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, OnceLock, RwLock,
     },
     thread,
@@ -153,6 +153,7 @@ struct Bridge {
 }
 static BRIDGE: OnceLock<Arc<Bridge>> = OnceLock::new();
 static LAST_VIEWS: Mutex<String> = Mutex::new(String::new());
+static IPD_BITS: AtomicU32 = AtomicU32::new(0);                        // (the eyes' distance in metres, f32; 0: none)
 
 fn matrix(m: Option<DeviceMotion>) -> Option<([f32; 16], [f32; 3], [f32; 3])> {
     let m = m?;
@@ -228,6 +229,8 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
                         t[0].position.x, t[0].position.y, t[0].position.z, t[0].orientation, t[1].position.x, t[1].position.y, t[1].position.z, t[1].orientation, v.fov[0], v.fov[1]);
                     let mut last = LAST_VIEWS.lock().unwrap();
                     if *last != line { alvr_common::info!("VeRantyx: the client's {line}"); *last = line; }
+                    let ipd = (t[1].position - t[0].position).length();
+                    if (0.04..0.09).contains(&ipd) { IPD_BITS.store(ipd.to_bits(), Ordering::Relaxed); }   // (the mock sends 0)
                 }
                 if sane(&v.fov[0]) && sane(&v.fov[1]) {
                     let mut i = bridge.input.lock().unwrap();
@@ -318,6 +321,10 @@ pub extern "C" fn vx_alvr_refresh_hz() -> f32 {
     fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|s| s["openvr_config"]["refresh_rate"].as_f64()).unwrap_or(0.0) as f32
 }
+
+/// The distance between the headset's eyes, in metres, as its client reports it (0 before it has).
+#[no_mangle]
+pub extern "C" fn vx_alvr_ipd() -> f32 { f32::from_bits(IPD_BITS.load(Ordering::Relaxed)) }
 
 /// The HEVC parameter sets (VPS SPS PPS, Annex-B), before the first frame and whenever they change.
 #[no_mangle]

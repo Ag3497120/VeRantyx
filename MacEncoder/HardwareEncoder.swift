@@ -411,6 +411,7 @@ struct ALVRBridge {
     let setConfig: @convention(c) (UnsafePointer<UInt8>, Int) -> Void
     let send: @convention(c) (Double, UnsafePointer<UInt8>, Int, Bool) -> Void
     let restartNeeded: @convention(c) () -> Bool
+    let ipd: (@convention(c) () -> Float)?                              // (a library from before it had one: nil)
 }
 let alvrMode = ProcessInfo.processInfo.environment["VERANTYX_ALVR"] == "1"
 func loadALVRBridge() -> ALVRBridge? {
@@ -425,7 +426,8 @@ func loadALVRBridge() -> ALVRBridge? {
           let send = fn("vx_alvr_send", (@convention(c) (Double, UnsafePointer<UInt8>, Int, Bool) -> Void).self),
           let restartNeeded = fn("vx_alvr_restart_needed", (@convention(c) () -> Bool).self)
     else { print("ALVR: \(path) lacks the bridge's functions"); return nil }
-    let bridge = ALVRBridge(start: start, input: input, connected: connected, takeIDR: takeIDR, setConfig: setConfig, send: send, restartNeeded: restartNeeded)
+    let bridge = ALVRBridge(start: start, input: input, connected: connected, takeIDR: takeIDR, setConfig: setConfig, send: send, restartNeeded: restartNeeded,
+                            ipd: fn("vx_alvr_ipd", (@convention(c) () -> Float).self))
     guard bridge.start(nil) else { print("ALVR: the streaming core did not start"); return nil }
     print("ALVR: streaming core started (\(path)); open an ALVR client on this network")
     return bridge
@@ -772,6 +774,13 @@ if let alvr {
             if alvr.takeIDR() { requestKeyFrame() }
             if Date().timeIntervalSince(checked) > 0.5 {                // (a headset with other display settings:
                 checked = Date()                                        //  scripts/launch_vxrt_steamvr.sh starts the
+                // The headset's eye distance, for the driver (Prop_UserIpdMeters): in the map's tail after SharedHands,
+                // at 320 ("VIPD", then the metres; driver_verantyx.cpp's SharedExtras)
+                if let ipd = alvr.ipd?(), ipd > 0 {
+                    handsMapPtr.advanced(by: 324).storeBytes(of: ipd, as: Float.self)
+                    OSMemoryBarrier()
+                    handsMapPtr.advanced(by: 320).storeBytes(of: UInt32(0x4450_4956), as: UInt32.self)
+                }
                 if alvr.restartNeeded() {                               //  encoder again, which connects with them)
                     print("ALVR: the headset brought other display settings (stored): the encoder starts again")
                     fflush(stdout)

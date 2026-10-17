@@ -113,6 +113,13 @@ static const size_t kSharedMapSize = sizeof(DoubleBufferHeader) +
 static const size_t kHandsOffset = sizeof(DoubleBufferHeader) + (kFrameBlockSize * 2);
 // Lives in the map's existing 1024-byte tail, so the encoder's layout is unchanged.
 static const size_t kPoseHistoryOffset = kHandsOffset + 512;
+// Also in that tail, after SharedHands: what an ALVR headset reports beyond SharedHands (HardwareEncoder.swift writes
+// it): the distance between its eyes. The Vision Pro app's stream leaves it unset (the default IPD stays).
+struct SharedExtras { uint32_t ipdMagic; float ipdMeters; };
+static const size_t kSharedExtrasOffset = kHandsOffset + 320;
+static const uint32_t kIpdMagic = 0x44504956; // "VIPD"
+static_assert(kSharedExtrasOffset >= kHandsOffset + sizeof(SharedHands) && kSharedExtrasOffset + sizeof(SharedExtras) <= kPoseHistoryOffset,
+              "SharedExtras must sit between SharedHands and the pose history");
 static const uint32_t kPoseHistoryMagic = 0x53485056; // "VPHS"
 static_assert(kPoseHistoryOffset + sizeof(PoseHistory) <= kSharedMapSize, "Pose history must fit in the shared map");
 static HANDLE hMapFile = NULL;
@@ -938,6 +945,23 @@ public:
         m_ready = true;
         return vr::VRInitError_None;
     }
+    // An ALVR headset's eye distance (SharedExtras), once it differs from the one in use by half a millimetre:
+    // SteamVR moves the eyes when the property changes (63 mm before any, and for the Vision Pro app).
+    float m_ipd = 0.063f;
+    void UpdateIpd() {
+        if (!g_sharedMap || m_ulPropertyContainer == vr::k_ulInvalidPropertyContainer) return;
+        const SharedExtras* extras = (const SharedExtras*)((const uint8_t*)g_sharedMap + kSharedExtrasOffset);
+        if (extras->ipdMagic != kIpdMagic) return;
+        MemoryBarrier();
+        const float ipd = extras->ipdMeters;
+        if (!(ipd > 0.04f && ipd < 0.09f) || fabsf(ipd - m_ipd) < 0.0005f) return;
+        m_ipd = ipd;
+        vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_UserIpdMeters_Float, ipd);
+        char message[128];
+        snprintf(message, sizeof(message), "[Verantyx] IPD %.1f mm (the headset's)", ipd * 1000.0f);
+        LogDriver(message);
+    }
+
     void UpdatePresence(const SharedHands* hands) {
         if (!m_proximityComponent) return;
         const uint64_t nowMs = GetTickCount64();
@@ -1404,6 +1428,7 @@ public:
         double lastTimestamp = -1.0;
         ULONGLONG lastAdvanceMs = 0;
         ULONGLONG lastPublishMs = 0;
+        ULONGLONG lastIpdCheckMs = 0;
         SharedHands latest = {};
         bool hasLatest = false;
         uint64_t publishedPoses = 0;
@@ -1469,6 +1494,7 @@ public:
                 }
             }
             if (m_pHmd && m_pHmd->m_ready.load()) m_pHmd->UpdatePresence(newInput ? &latest : nullptr);
+            if (m_pHmd && m_pHmd->m_ready.load() && nowMs - lastIpdCheckMs >= 500) { lastIpdCheckMs = nowMs; m_pHmd->UpdateIpd(); }
             if (newPose && !benchActive) PersistLiveTangents(latest);
             PublishEffectiveTangents();
             Sleep(1);
