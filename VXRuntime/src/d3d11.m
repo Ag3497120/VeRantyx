@@ -402,6 +402,7 @@ void d3d_view_get_desc(const d3d_view *v, int which, uint32_t *out) {
     }
     out[0] = v->format; out[1] = dim;
     uint32_t *u = out + (which == 2 ? 3 : 2);                  // a DSV has its flags first
+    if (which == 2) out[2] = v->flags & 3;
     if (r->kind == K_BUFFER) { u[0] = v->first; u[1] = v->count; if (which == 3 || dim == 11) u[2] = v->flags; return; }
     const d3d_texture *t = (const d3d_texture *)r;
     uint32_t mips = v->mips ? v->mips : t->desc[TD_MIPS] - v->mip, slices = v->slices ? v->slices : 1;
@@ -443,6 +444,7 @@ static d3d_view *make_view(d3d_device *dev, int kind, void **vtbl, d3d_object *r
         if (desc[0]) v->format = desc[0];
         uint32_t dim = v->dim = desc[1];
         const uint32_t *u = desc + (dsv ? 3 : 2);              // a DSV has a Flags field before its union
+        if (dsv) v->flags = desc[2];                           // (D3D11_DSV_READ_ONLY_DEPTH 1, _STENCIL 2)
         if (res->kind == K_BUFFER) { v->first = u[0]; v->count = u[1]; v->flags = dim == 11 ? u[2] : 0; }   // BUFFER / BUFFEREX
         else if (kind == K_SRV) {
             switch (dim) {

@@ -1056,6 +1056,40 @@ static void bind_sampler(id<MTLRenderCommandEncoder> enc, bound_state *b, int st
     if (st == STAGE_VS) [enc setVertexSamplerState:sm atIndex:idx]; else [enc setFragmentSamplerState:sm atIndex:idx];
     if (idx < 16) b->smp[st][idx] = p;
 }
+// Whether a shader resource view reads what a render target or depth view writes: the same texture, overlapping
+// mips and layers (a view made without a description covers all of them). Direct3D never lets a shader read a
+// texture that is bound for output: binding it as a target unbinds its shader resource views, so the shader reads
+// 0. Metal leaves such a read undefined (the tile memory being drawn, half written). A read-only depth view (Flags)
+// may be read. (Half-Life: Alyx's chapter scenario never does it.)
+static void view_range(const d3d_view *v, int srv, uint32_t *mip0, uint32_t *mip1, uint32_t *s0, uint32_t *s1) {
+    const d3d_texture *t = (const d3d_texture *)v->resource;
+    uint32_t mips = t->desc[TD_MIPS] ? t->desc[TD_MIPS] : 1, layers = t->dim == 3 ? 0xffffffffu : t->desc[TD_ARRAY] ? t->desc[TD_ARRAY] : 1;
+    *mip0 = v->dim ? v->mip : 0;
+    *mip1 = !v->dim ? mips : srv ? (v->mips == 0 || v->mips == 0xffffffffu ? mips : v->mip + v->mips) : v->mip + 1;
+    int all_layers = !v->dim || t->dim == 3;                    // (3D: a target's W slices, a view's whole volume)
+    *s0 = all_layers ? 0 : v->first_slice;
+    *s1 = all_layers ? layers : srv && v->dim == 9 ? 6 : v->first_slice + (v->slices ? v->slices : 1);   // (a cube: 6)
+}
+static int reads_target(const d3d_view *srv, const d3d_view *out, int depth) {
+    if (!srv || !out || srv->resource != out->resource || srv->resource->kind != K_TEXTURE) return 0;
+    if (depth) {
+        int stencil = srv->format == 22 || srv->format == 62;   // (X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT)
+        if (out->flags & (stencil ? 2 : 1)) return 0;           // that plane is read-only in the depth view
+    }
+    uint32_t a0, a1, b0, b1, l0, l1, k0, k1;
+    view_range(srv, 1, &a0, &a1, &l0, &l1);
+    view_range(out, 0, &b0, &b1, &k0, &k1);
+    return a0 < b1 && b0 < a1 && l0 < k1 && k0 < l1;
+}
+static d3d_view *readable_srv(d3d_context *c, d3d_shader *sh, int slot, d3d_view *v) {
+    if (!v || v->resource->kind != K_TEXTURE) return v;
+    int hit = reads_target(v, c->dsv, 1);
+    for (int i = 0; i < 8 && !hit; i++) hit = reads_target(v, c->rtv[i], 0);
+    if (!hit) return v;
+    static int logged;                                          // (a few, to see that it happens)
+    if (logged < 20) { logged++; vx_log("Direct3D: shader %08x reads t%d, which is bound as a render target: it reads 0, as in Direct3D", sh->hash, slot); }
+    return NULL;
+}
 static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCommandEncoder> renc, id<MTLComputeCommandEncoder> cenc) {
     d3d_shader *sh = s->shader[st];
     if (!sh) return;
@@ -1071,7 +1105,7 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
     }
     for (int i = 0; i < 32; i++) {
         if (!(sh->info.textures[0] & (1ull << i))) continue;
-        SET_TEXTURE(shader_texture(s->srv[st][i]), i);
+        SET_TEXTURE(shader_texture(readable_srv(c, sh, i, s->srv[st][i])), i);
     }
     for (int i = 0; i < 16; i++) {
         if (!(sh->info.samplers & (1u << i))) continue;
