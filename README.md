@@ -1,28 +1,36 @@
 # VeRantyx
 
-**Play PC VR games from an Apple Silicon Mac in an Apple Vision Pro — with your hands and a pair of Joy-Con, no tracked VR controllers.**
+**Play PC VR games from an Apple Silicon Mac — in an Apple Vision Pro with your hands and a pair of Joy-Con, or in any ALVR headset.**
 
-VeRantyx renders Half-Life: Alyx on the Mac, streams every stereo frame to a
-native visionOS app in hardware-encoded HEVC, and sends the headset's head and
-hand poses back. Hands are tracked by the Vision Pro; buttons, sticks and
-triggers come from Nintendo Switch Joy-Con (one in each hand), or the game is
-played with bare hands. No tracked VR controllers are needed: the PS VR2 Sense
-controllers that other Vision Pro ports of Alyx require are not sold in every
-region (not in Japan at the time of writing).
+VeRantyx runs Windows SteamVR games such as Half-Life: Alyx on the Mac, streams
+every stereo frame to the headset in hardware-encoded HEVC, and sends the
+headset's head and hand poses back. Two ways to see it:
 
-There are **three versions**, on their own branches:
+- **The VeRantyx app on Apple Vision Pro** (`VisionProClient/`): hands are
+  tracked by the Vision Pro; buttons, sticks and triggers come from Nintendo
+  Switch Joy-Con (one in each hand), or the game is played with bare hands. No
+  tracked VR controllers are needed: the PS VR2 Sense controllers that other
+  Vision Pro ports of Alyx require are not sold in every region (not in Japan at
+  the time of writing).
+- **ALVR's client apps** (`VERANTYX_ALVR=1`, vxrt version): the Vision Pro's
+  "ALVR" app from the App Store, and the ALVR apps of Meta Quest and Pico, with
+  their own controllers. Checked with the Vision Pro's ALVR app; **Quest and Pico
+  are not tested yet** (we have none: reports are welcome).
+
+The newest version, **vxrt**, needs no Wine: the Windows game and the real
+Windows SteamVR run on [VXRuntime](#the-vxrt-version-vxruntime), a Windows
+runtime written from scratch for Apple silicon in this repository.
 
 | Branch | How the game runs on the Mac | Status |
 |---|---|---|
-| [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) | Valve's **Linux ARM64** build of Half-Life: Alyx (made for the Steam Frame) runs natively on macOS — no Wine, no Rosetta, no SteamVR — through a patched [Klepton](https://github.com/shinyquagsire23/Klepton) loader, a glibc compatibility layer and an OpenVR runtime of our own | New (2026-10-11). Menu at 60 fps, levels played for 20+ minutes on an M1 Max |
-| [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine) | The Windows build with the real Windows SteamVR under Wine 11, DXVK → MoltenVK, and a SteamVR driver of our own | Stable since 2026-10-10; ~30 fps in game on an M1 Max |
-| [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) | The Windows build and the real Windows SteamVR on **[VXRuntime](#the-vxrt-version-vxruntime)** (vxrt), a Windows runtime written from scratch for Apple silicon in this repository — no Wine: Direct3D 11 on Metal, Steam through the Mac Steam client | Newest (2026-10-12 to 15). No Wine at all, setup included (`scripts/setup_vxrt.sh`). Played in the headset across level changes; 3K preset (1440×1620 per eye) at 60 fps, 2.5K preset (2560×2880 per eye, 2× MSAA) at 50–60 fps on an M1 Max. The Lab and Google Earth VR run too |
-| `main` | All of the above | Development |
+| `main`, [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) | The Windows build and the real Windows SteamVR on **VXRuntime** (vxrt): no Wine, Direct3D 11 on Metal by our own translator, Steam through the Mac Steam client (`main` and `vxrt` are the same) | Newest and developed every day. Played in the headset (Vision Pro app and ALVR) on a MacBook Pro M1 Max and a MacBook Air M5. Alyx 3K preset (1440×1620 per eye) at 60 fps on the M1 Max; The Lab and Google Earth VR run too |
+| [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) | Valve's **Linux ARM64** build of Half-Life: Alyx (made for the Steam Frame) runs natively on macOS — no Wine, no Rosetta, no SteamVR — through a patched [Klepton](https://github.com/shinyquagsire23/Klepton) loader, a glibc compatibility layer and an OpenVR runtime of our own | 2026-10-11. Menu at 60 fps, levels played for 20+ minutes on an M1 Max; Alyx only |
+| [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine) | The Windows build with the real Windows SteamVR under Wine 11, DXVK → MoltenVK, and a SteamVR driver of our own | 2026-10-10, kept as it was; ~30 fps in game on an M1 Max |
 
 All versions share the Mac HEVC encoder (`MacEncoder/`) and the Vision Pro
 app (`VisionProClient/`).
 
-### vxrt version (Windows build + SteamVR on VXRuntime, no Wine) — recorded 2026-10-14
+### Recorded 2026-10-14 (vxrt version, Vision Pro app)
 
 ![vxrt version: the Windows build of Half-Life: Alyx and the Windows SteamVR running on VXRuntime (no Wine) on a MacBook Pro, played in Apple Vision Pro — main menu, the quarantine zone, then after a level change the pistol, hands and fingers, the wrist pocket and reloading](docs/media/vxrt-highlight.gif)
 
@@ -34,55 +42,123 @@ level change into a2_pistol, the pistol, hands and fingers, an item put in the
 wrist pocket and reloading. The Windows build of the game and the Windows
 SteamVR, on VXRuntime instead of Wine; 3K preset (1440×1620 per eye), streamed
 at 3404×1372 HEVC Main10, 40 Mbps, on an M1 Max. Hands are Vision Pro hand
-tracking, buttons and sticks are Joy-Con. Known problems, such as green
-artefacts on some surfaces, are listed under [its status](#status-and-limits-vxrt-version).
-Full 4-minute unedited recording of the vxrt version: https://youtu.be/qF09ETv1TpU.*
-
-### Native version (Linux ARM64 build, no Wine) — recorded 2026-10-11
-
-![Native version: Half-Life: Alyx (Linux ARM64 build) running natively on a MacBook Pro, played in Apple Vision Pro — the Joy-Con, hands and fingers, gravity gloves, reloading a pistol](docs/media/native-highlight.gif)
-
-[![Native version — watch the full recording on YouTube](docs/media/native-poster.jpg)](https://youtu.be/2z-GyAqAtpA)
-
-*Native version, 48-second highlight: [docs/media/native-highlight.mp4](docs/media/native-highlight.mp4).
-The Joy-Con it is played with (seen through the passthrough), hands and fingers
-in Russell's lab, gravity gloves (pulling and catching a helmet), then
-reloading the pistol. 60 fps on an M1 Max. Full 6-minute unedited recording of the native version: https://youtu.be/2z-GyAqAtpA.*
-
-### Wine version (Windows build + SteamVR under Wine) — recorded 2026-10-10
-
-<!-- VIDEO: after uploading docs/media/highlight.mp4 through the README editor
-     on github.com, replace the poster link below with the generated
-     https://github.com/user-attachments/... URL on its own line; GitHub then
-     renders a player. -->
-![Wine version: Half-Life: Alyx in Apple Vision Pro, rendered on a MacBook Pro (54-second highlight; the last seconds show the room through the headset's passthrough)](docs/media/highlight.gif)
-
-[![Wine version — watch the full recording on YouTube](docs/media/poster.jpg)](https://youtu.be/6xVGgdChDes)
-
-*Wine version, 54-second highlight: [docs/media/highlight.mp4](docs/media/highlight.mp4) — the last seconds show the room through the Vision Pro's passthrough, where it was recorded. Full 6-minute unedited recording of the Wine version: https://youtu.be/6xVGgdChDes.*
+tracking, buttons and sticks are Joy-Con. The surfaces lit green in places
+(fences, plants) were fixed on 2026-10-17. Full 4-minute unedited recording:
+https://youtu.be/qF09ETv1TpU. Recordings of the native and Wine versions are
+under [Other versions](#other-versions).*
 
 MIT licensed. No proprietary code is included (see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)): Wine, DXVK and Steam are
-downloaded from their publishers by the setup script, SteamVR and the game
-come from your own Steam account, and Apple's Game Porting Toolkit is neither
-shipped nor needed: the normal setup does not use it, and an optional,
-experimental Wine-version backend (`VERANTYX_D3D_BACKEND=d3dmetal`, see
-[docs/SETUP.md](docs/SETUP.md)) uses D3DMetal only from a copy you obtained from
-Apple yourself. The vxrt version uses no Wine, DXVK or MoltenVK at all: its
-Windows runtime and Direct3D 11 → Metal translator are written in this
-repository.
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)): SteamVR and the games come
+from your own Steam account; the Microsoft runtime DLLs the games need are taken
+from the redistributable installers your own SteamVR and games carry, on your
+Mac only; ALVR's streaming core (MIT) is fetched when it is built. The vxrt
+version uses no Wine, DXVK or MoltenVK at all. The Wine version's setup
+downloads Wine, DXVK and Steam from their publishers; Apple's Game Porting
+Toolkit is neither shipped nor needed (an optional, experimental Wine-version
+backend, `VERANTYX_D3D_BACKEND=d3dmetal`, uses D3DMetal only from a copy you
+obtained from Apple yourself, [docs/SETUP.md](docs/SETUP.md)).
+
+## Quick start (vxrt version)
+
+You need an Apple silicon Mac with Rosetta 2, Xcode (or its command line tools),
+[Homebrew](https://brew.sh), the Mac Steam client signed in to your account with
+the games you own, and a headset: an Apple Vision Pro, or an ALVR 20.x client.
+
+```bash
+git clone https://github.com/Ag3497120/VeRantyx.git && cd VeRantyx
+scripts/setup_vxrt.sh <steam-login> 546560 348250    # builds; SteamVR, Half-Life: Alyx, Google Earth VR (steamcmd)
+scripts/setup_vxrt.sh --import "<a Steam library>"   # or: apps you already have, as APFS clones (no download)
+```
+
+SteamVR and the games go to `~/Verantyx_VR_Drive/vxrt_steam`, a Steam library
+of its own (`tools/vxrt_steam.py fetch|import|status`). The Microsoft runtime
+DLLs (msvcp140, vcruntime140, msvcp100, ...) are taken out of the
+redistributable installers your own SteamVR and games carry
+(`_CommonRedist/vcredist/*/VC_redist.x64.exe`, DirectX cabinets), opened without
+running them, into `~/Verantyx_VR_Drive/vxrt_redist` (`tools/vxrt_redist.py`).
+Nothing of Valve's or Microsoft's is in this repository or downloaded by it.
+A Mac set up for the Wine version keeps working: its prefix is read (never
+written) only while `vxrt_steam` has no SteamVR; `VXRT_NO_WINE=1` forbids it.
+Then, with Steam running on the Mac and signed in:
+
+```bash
+scripts/launch_vxrt_alyx.sh                      # Vision Pro app: SteamVR on vxrt + encoder + Half-Life: Alyx
+VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 1440×1620 per eye, 2880×1620 10-bit HEVC at 40 Mbps, 60 fps
+VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 2560×2880 per eye rendered (2× MSAA), same stream, 50–60 fps
+VXRT_VR_QUALITY=max scripts/launch_vxrt_alyx.sh  # 3200×3600 per eye (a Vision Pro eye's pixels), 3840×2160 stream, 16–21 fps
+VERANTYX_ALVR=1 scripts/launch_vxrt_alyx.sh      # ALVR client apps instead (needs Rust, https://rustup.rs, the first time)
+```
+
+The first start compiles the game's shaders (a few minutes). The 10-bit stream
+needs the current Vision Pro app (`scripts/deploy_vision_pro_app.sh`). The
+quality presets are made for the Vision Pro app; with ALVR, leave them out at
+first (see [Headsets](#headsets)).
+
+Other SteamVR games: `scripts/launch_vxrt_game.sh "<game .exe>"` (The Lab and
+Google Earth VR run; most games still need some Windows functions VXRuntime lacks).
+What is known about each game is in [games/](games/).
+
+## Headsets
+
+| | VeRantyx app (Apple Vision Pro) | ALVR client apps (`VERANTYX_ALVR=1`) |
+|---|---|---|
+| Headsets | Apple Vision Pro (M2 or M5) | ALVR 20.x: the Vision Pro's "ALVR" (App Store), Meta Quest, Pico |
+| Checked | Yes: Alyx, The Lab, Earth VR | The Vision Pro's ALVR app: Alyx and Earth VR (2026-10-17, MacBook Pro M1 Max and MacBook Air M5). **Quest, Pico: not tested yet** |
+| Controls | Vision Pro hand tracking + Joy-Con (or bare hands) | The headset's controllers or hand tracking, through ALVR |
+| Stream | HEVC (Main10 with the 3K preset), VeRantyx's own UDP protocol, each frame drawn at the game's exact frustum and pose | HEVC through ALVR's own streaming core (unchanged, v20.14.1), each frame stamped with the ALVR tracking sample it was rendered for |
+| Audio | Core Audio process tap → the app | The same tap, given to ALVR as a device (the Mac's speakers mute while a headset listens) |
+| Not yet | — | Haptics; eye distance (IPD) from the headset (63 mm is used) |
+
+With ALVR the headset shows its own rate (90 Hz on the Vision Pro) and stretches
+the last frame to the head's turn until the next comes: when the game runs far
+below that rate, turning the head warps the picture. Alyx at the 3K preset on a
+MacBook Air M5 did; with ALVR's defaults (no preset) it did not. Details,
+settings and what was checked: [ALVRBridge/README.md](ALVRBridge/README.md).
+
+## Status and limits (vxrt version)
+
+2026-10-17, MacBook Pro (M1 Max) and MacBook Air (M5):
+
+- **Half-Life: Alyx** plays in the headset with hands and Joy-Con, through
+  level changes and saves (the 2026-10-14 recording goes from
+  a2_quarantine_entrance into a2_pistol), and through the Vision Pro's ALVR
+  app with game audio and hand tracking. Harness runs on the M1 Max: chapter 1
+  at 60.0 fps with the 3K preset (20261017T022746Z-alyx-chapter-3k).
+- **MacBook Air M5** (10 GPU cores, 24 GB): Alyx through ALVR at its defaults,
+  27 fps median in game (20–34) in the session of 2026-10-17 (with
+  `VXRT_FLASH_CAPTURE` on); the 3K preset is too much for it (see
+  [Headsets](#headsets)).
+- **Fixed on 2026-10-17:** fences, plants, fog and bottles that lit in one
+  strong colour (red, green or blue) for single frames. A shader read beyond a
+  constant buffer the game binds smaller than the shader declares; Direct3D
+  reads 0 there, the translation read other draws' constants. Found with
+  `VXRT_FLASH_CAPTURE` (a capture of the frames around such a flash).
+- **Wi-Fi:** the stream needs a fast link. On 2.4 GHz it stutters and smears;
+  5 GHz with an 80 MHz channel is much better.
+- **max preset:** 16–21 fps on the M1 Max (3K holds 60).
+- **First start** compiles thousands of shaders (a few minutes); Metal caches them.
+- **Saves** made before 2026-10-14 (commit 8d10cfb) have no level state; start
+  the chapter again.
+- **Setup** without Wine (`scripts/setup_vxrt.sh`): checked on 2026-10-15 with
+  `VXRT_NO_WINE=1` (the prefix never used) in harness runs: Alyx chapter 1 at
+  3K 60.0 fps (20261015T005456Z-alyx-chapter-3k), Google Earth VR 57.4 fps
+  (20261015T005918Z-earth-start), The Lab 54.8 fps (20261015T010214Z-thelab-title),
+  with SteamVR and the games imported and the DLLs from SteamVR's redistributables.
+  The steamcmd download path itself has not been run here (it needs your sign-in).
+- Not there: Direct3D 12, Vulkan, tessellation, anti-cheat (never worked around).
 
 ## Why VeRantyx
 
-- **No tracked VR controllers.** Vision Pro hand tracking gives the hands'
+- **No tracked VR controllers needed (Vision Pro app).** Vision Pro hand tracking gives the hands'
   position; Joy-Con gyro and accelerometer are fused in for fast motion and
   for when a hand leaves the cameras' view, and the grip pose is carried from
   the wrist while a Joy-Con hides the knuckles. Gravity gloves, grabbing,
   pinch-to-trigger and finger animation (native version) all work without
   PS VR2 Sense controllers.
-- **Any Vision Pro.** The game renders on the Mac's GPU, so a first-generation
-  (M2) Vision Pro plays the same as a new one; the headset only decodes and
-  displays.
+- **Any Vision Pro, and ALVR headsets.** The game renders on the Mac's GPU, so
+  a first-generation (M2) Vision Pro plays the same as a new one; the headset
+  only decodes and displays. With `VERANTYX_ALVR=1` the vxrt version streams to
+  ALVR's client apps instead (the Vision Pro's "ALVR", Meta Quest, Pico).
 - **Your own copy, nothing redistributed.** The game, SteamVR (Wine and vxrt
   versions) and Steam come from your own Steam account; this repository contains no
   Valve or Apple code apart from Valve's BSD-licensed OpenVR headers.
@@ -102,21 +178,32 @@ repository.
   OpenVR runtime, encoder, visionOS app — is in this repository and can be read
   and rebuilt.
 
-## Built on
 
-| Project | Used for | License | In this repository? |
-|---|---|---|---|
-| [Klepton](https://github.com/shinyquagsire23/Klepton) by ShinyQuagsire | Native version: loading Valve's ARM64 ELF libraries on macOS, its bionic libc and Vulkan-on-MoltenVK runtime; our patch set adds glibc TLS, x18 and loader fixes, CPU topology, asynchronous pipelines (`NativeARM/klepton-patches/`) | MIT | No — fetched by `NativeARM/scripts/fetch_klepton.sh`, patched by `apply.py` |
-| [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | Vulkan → Metal (both versions; Wine version via DXVK) | Apache-2.0 | No (Klepton's build / DXVK) |
-| Valve's Half-Life: Alyx (Linux ARM64 depot 546564, Windows build) | The game | Valve's terms | No — your own Steam account |
-| Valve's [OpenVR SDK headers](https://github.com/ValveSoftware/openvr) | SteamVR driver, capture proxy, native OpenVR runtime | BSD-3-Clause | Yes (`VRDriver/include/`, `NativeARM/vrruntime/openvr/`) |
-| [ALVR](https://github.com/alvr-org/ALVR) | OpenVR hand-skeleton bone poses for finger animation (native version) | MIT | Yes, unchanged data with its license (`NativeARM/vrruntime/hand_skeleton_alvr.inc`) |
-| [Fossilize](https://github.com/ValveSoftware/Fossilize) | Optional shader-prewarm experiment (not used by the launcher) | MIT | No — fetched by `NativeARM/scripts/build_fossilize.sh` |
-| Debian trixie arm64 packages | glib, libstdc++, ssl, png … the Linux libraries the game expects from the Steam Linux Runtime | various (DFSG) | No — fetched by `NativeARM/scripts/fetch_debian_libs.sh` |
-| Wine Staging (Gcenx build), DXVK for macOS (Gcenx) | Wine version | LGPL-2.1, zlib | No — fetched by `scripts/setup.sh` |
-| Windows SteamVR, Microsoft Visual C++ / DirectX runtime DLLs | vxrt version: SteamVR from your own Steam account (steamcmd); the DLLs taken from the redistributable installers your SteamVR and games carry, on your Mac only | Valve's and Microsoft's terms | No |
+## Compared with MoltenVR
 
-Details: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[MoltenVR](https://github.com/MoltenVR/MoltenVR-Preview) (first public
+preview 2026-07-04, v1.0.0 2026-07-12) also plays PC VR games from an Apple
+Silicon Mac, but takes a different route. From its README and this
+repository (vxrt version):
+
+| | VeRantyx (vxrt) | MoltenVR |
+|---|---|---|
+| Windows layer | VXRuntime, written for this project: no Wine | Wine bottles (WhiskyWine / GPTK: Whisky, CrossOver, Wineskin) |
+| SteamVR | Runs the real Windows SteamVR; our driver provides the HMD and controllers, and the game's `Submit` calls are hooked to capture frames | Does not run SteamVR; OpenComposite translates OpenVR calls to its own OpenXR runtime, which receives every frame directly |
+| D3D11 on Metal | Our own translator (DXBC → Metal Shading Language), one layer | DXMT (one layer) |
+| Video | HEVC: to the Vision Pro app (own UDP protocol, exact render pose per frame) or through ALVR's streaming core | H.264, ALVR protocol, USB (100 Mbps) or Wi-Fi, 72 fps claimed |
+| Headset | Apple Vision Pro (own visionOS app), and ALVR clients: the Vision Pro's ALVR app checked, Quest and Pico not tested yet | Any ALVR client (tested on Quest 3) |
+| Input | Vision Pro app: hand tracking + Joy-Con (buttons, sticks, triggers, inertial sensors); ALVR: the headset's controllers or hands; no haptics yet | VR controllers through ALVR: 6DoF, buttons, sticks, haptics |
+| Audio | Core Audio process tap, no extra driver (also to ALVR) | BlackHole virtual audio device |
+| Games checked | Half-Life: Alyx, The Lab, Google Earth VR | Half-Life: Alyx, Beat Saber, Minecraft (Vivecraft) and more, per its author |
+| Source | MIT, full source | Binaries only, 7-day trial then license key |
+
+Running SteamVR keeps SteamVR Input (the game's own controller bindings),
+chaperone and the dashboard working, at the cost of `vrserver`/`vrcompositor`
+CPU time; MoltenVR's design avoids that cost but needs OpenComposite to cover
+each game's OpenVR usage. Wine runs many more Windows programs than VXRuntime
+does today; VXRuntime is what lets this project change every layer down to the
+shader translation (the fix above is one example).
 
 ## The vxrt version: VXRuntime
 
@@ -210,72 +297,23 @@ only because Valve made an ARM64 Alyx; the Wine version runs any Windows game
 but pays for Wine and double graphics translation; vxrt keeps the Windows build
 and the real SteamVR while removing Wine, and is the one we can optimize down
 to every call. It is a research project: Direct3D 12, Vulkan and tessellation
-are not there yet, and it has been tested with four games on one Mac.
+are not there yet, and it has been tested with four games on two Macs.
 
 Where it is going: [docs/VISION.md](docs/VISION.md): Windows apps on a Mac without Rosetta or Wine, x86-64 and
 ARM64 code mixed in one process, and AI agents that observe and operate the apps through structure (with the
 user's permission).
 
-### Running the vxrt version
+### Beyond games
 
-No Wine, no Windows Steam. One setup, with your own Steam account:
-
-```bash
-scripts/setup_vxrt.sh <steam-login> 546560 348250    # builds; SteamVR, Half-Life: Alyx, Google Earth VR (steamcmd)
-scripts/setup_vxrt.sh --import "<a Steam library>"   # or: apps you already have, as APFS clones (no download)
-```
-
-SteamVR and the games go to `~/Verantyx_VR_Drive/vxrt_steam`, a Steam library
-of its own (`tools/vxrt_steam.py fetch|import|status`). The Microsoft runtime
-DLLs (msvcp140, vcruntime140, msvcp100, ...) are taken out of the
-redistributable installers your own SteamVR and games carry
-(`_CommonRedist/vcredist/*/VC_redist.x64.exe`, DirectX cabinets), opened without
-running them, into `~/Verantyx_VR_Drive/vxrt_redist` (`tools/vxrt_redist.py`).
-Nothing of Valve's or Microsoft's is in this repository or downloaded by it.
-A Mac set up for the Wine version keeps working: its prefix is read (never
-written) only while `vxrt_steam` has no SteamVR; `VXRT_NO_WINE=1` forbids it.
-Then, with Steam running on the Mac and signed in:
-
-```bash
-scripts/launch_vxrt_alyx.sh                      # SteamVR on vxrt + encoder + Half-Life: Alyx
-VXRT_VR_QUALITY=3k scripts/launch_vxrt_alyx.sh   # 1440×1620 per eye, 2880×1620 10-bit HEVC at 40 Mbps, 60 fps
-VXRT_VR_QUALITY=2.5k scripts/launch_vxrt_alyx.sh # 2560×2880 per eye rendered (2× MSAA), same stream, 50–60 fps
-VXRT_VR_QUALITY=max scripts/launch_vxrt_alyx.sh  # 3200×3600 per eye (a Vision Pro eye's pixels), 3840×2160 stream, 16–21 fps
-```
-
-The first start compiles the game's shaders (a few minutes). The 10-bit stream
-needs the current Vision Pro app (`scripts/deploy_vision_pro_app.sh`).
-
-Other SteamVR games: `scripts/launch_vxrt_game.sh "<game .exe>"` (The Lab and
-Google Earth VR run; most games still need some Windows functions VXRuntime lacks).
-What is known about each game is in [games/](games/).
-
-### Status and limits (vxrt version)
-
-MacBook Pro (M1 Max), 2026-10-14:
-
-- **Half-Life: Alyx** plays in the headset with hands and Joy-Con, through
-  level changes and saves (the 2026-10-14 recording goes from
-  a2_quarantine_entrance into a2_pistol). Harness runs: chapter 1 at 60.0 fps
-  and the menu at 54–59 fps with the 3K preset.
-- **Green artefacts:** some surfaces (distant fences, the shadows of plants,
-  bottles) glow or smear green in the headset. The cause is not known yet:
-  lost stream packets (green until the next keyframe) or the shader
-  translator; it is being separated.
-- **Wi-Fi:** the stream needs a fast link. On 2.4 GHz it stutters and smears;
-  5 GHz with an 80 MHz channel is much better.
-- **max preset:** 16–21 fps (3K holds 60).
-- **First start** compiles thousands of shaders (a few minutes); Metal caches them.
-- **Saves** made before 2026-10-14 (commit 8d10cfb) have no level state; start
-  the chapter again.
-- **Setup** without Wine (`scripts/setup_vxrt.sh`): checked on 2026-10-15 with
-  `VXRT_NO_WINE=1` (the prefix never used) in harness runs: Alyx chapter 1 at
-  3K 60.0 fps (20261015T005456Z-alyx-chapter-3k), Google Earth VR 57.4 fps
-  (20261015T005918Z-earth-start), The Lab 54.8 fps (20261015T010214Z-thelab-title),
-  with SteamVR and the games imported and the DLLs from SteamVR's redistributables.
-  The steamcmd download path itself has not been run here (it needs your sign-in).
-- Tested on one Mac. Not there: Direct3D 12, Vulkan, tessellation, anti-cheat
-  (never worked around).
+- **Its own x86-64 → ARM64 translator** (in progress,
+  [VXRuntime/TRANSLATOR.md](VXRuntime/TRANSLATOR.md)): VXRuntime as a native
+  ARM64 program that translates only the program's code, for when Rosetta 2 is
+  gone. Its test programs and benchmarks run; games do not use it yet.
+- **Command Clips** ([VXRuntime/CLIPS.md](VXRuntime/CLIPS.md)): a program on
+  VXRuntime can be read and operated through a socket (its windows, the text
+  drawn in them, clicks and keys as Windows messages, and when the result is
+  painted), so an AI agent works with it as with a command-line tool instead of
+  screenshots.
 
 ### Tuning a game or making one run, with an AI coding tool
 
@@ -382,7 +420,35 @@ itself. Both are open source and use your own copy of the game.
 
 Not affiliated with Valve, Apple, Nintendo, Sony, Glovebox or Klepton.
 
-## Setup — native version
+## Other versions
+
+The native and Wine versions, as they were when they were made (their own
+branches have them).
+
+### Native version (Linux ARM64 build, no Wine) — recorded 2026-10-11
+
+![Native version: Half-Life: Alyx (Linux ARM64 build) running natively on a MacBook Pro, played in Apple Vision Pro — the Joy-Con, hands and fingers, gravity gloves, reloading a pistol](docs/media/native-highlight.gif)
+
+[![Native version — watch the full recording on YouTube](docs/media/native-poster.jpg)](https://youtu.be/2z-GyAqAtpA)
+
+*Native version, 48-second highlight: [docs/media/native-highlight.mp4](docs/media/native-highlight.mp4).
+The Joy-Con it is played with (seen through the passthrough), hands and fingers
+in Russell's lab, gravity gloves (pulling and catching a helmet), then
+reloading the pistol. 60 fps on an M1 Max. Full 6-minute unedited recording of the native version: https://youtu.be/2z-GyAqAtpA.*
+
+### Wine version (Windows build + SteamVR under Wine) — recorded 2026-10-10
+
+<!-- VIDEO: after uploading docs/media/highlight.mp4 through the README editor
+     on github.com, replace the poster link below with the generated
+     https://github.com/user-attachments/... URL on its own line; GitHub then
+     renders a player. -->
+![Wine version: Half-Life: Alyx in Apple Vision Pro, rendered on a MacBook Pro (54-second highlight; the last seconds show the room through the headset's passthrough)](docs/media/highlight.gif)
+
+[![Wine version — watch the full recording on YouTube](docs/media/poster.jpg)](https://youtu.be/6xVGgdChDes)
+
+*Wine version, 54-second highlight: [docs/media/highlight.mp4](docs/media/highlight.mp4) — the last seconds show the room through the Vision Pro's passthrough, where it was recorded. Full 6-minute unedited recording of the Wine version: https://youtu.be/6xVGgdChDes.*
+
+### Setup — native version
 
 Step by step in **[docs/NATIVE_SETUP.md](docs/NATIVE_SETUP.md)**: download the
 Linux depot with your own Steam account, fetch Klepton and the Debian
@@ -395,7 +461,7 @@ NativeARM/scripts/launch_native_vr.sh
 
 Internals, findings and status: [NativeARM/README.md](NativeARM/README.md).
 
-## Setup — Wine version
+### Setup — Wine version
 
 ```bash
 git clone https://github.com/Ag3497120/VeRantyx.git
@@ -414,7 +480,7 @@ The full walkthrough, requirements, tuning variables and troubleshooting are
 in **[docs/SETUP.md](docs/SETUP.md)**. A Japanese write-up of the internals is
 in [docs/README_ja.md](docs/README_ja.md).
 
-## How the native version works
+### How the native version works
 
 ```
  Mac (Apple Silicon)                                         Apple Vision Pro
@@ -434,7 +500,7 @@ in [docs/README_ja.md](docs/README_ja.md).
  └───────────────────────────────────────────────┘           └────────────────────────┘
 ```
 
-## How the Wine version works
+### How the Wine version works
 
 ```
  Mac (Apple Silicon)                                        Apple Vision Pro
@@ -483,7 +549,7 @@ in [docs/README_ja.md](docs/README_ja.md).
   same source), atomic installs, Steam launch-option management, and the
   launch supervisor.
 
-### Languages
+#### Languages
 
 C++ (SteamVR driver, OpenVR capture proxy, D3D11 proxy; MinGW-w64 cross
 compiled to Windows x64), C (Steam WebHelper shim), Swift (macOS encoder,
@@ -491,7 +557,7 @@ visionOS app), Metal Shading Language (frame conversion, eye-image rendering),
 Bash and Python (build, install and launch scripts). The only third-party
 source in the tree is Valve's OpenVR SDK headers.
 
-## Measurements (Wine version)
+### Measurements (Wine version)
 
 MacBook Pro (M1 Max, 64 GB), macOS 26, Vision Pro on the same Wi-Fi 6 network,
 Half-Life: Alyx, 2026-10-10. Numbers come from the pipeline's own logs
@@ -512,28 +578,64 @@ the streaming pipeline adds little. Lowering the virtual display from 90 Hz to
 60 Hz and the SteamVR resolution scale raised the in-game rate from ~18 to
 ~30 fps.
 
-## Compared with MoltenVR
+### Native version: measurements and limits
 
-[MoltenVR](https://github.com/MoltenVR/MoltenVR-Preview) (first public
-preview 2026-07-04, v1.0.0 2026-07-12) also plays PC VR games from an Apple
-Silicon Mac, but takes a different route. From its README and this
-repository:
+MacBook Pro (M1 Max), 2026-10-11, from the runtime's own logs:
 
-| | VeRantyx | MoltenVR |
-|---|---|---|
-| SteamVR | Runs the real Windows SteamVR; a custom driver provides the HMD and controllers, and the game's `Submit` calls are hooked to capture frames | Does not run SteamVR; OpenComposite translates OpenVR calls to its own OpenXR runtime, which receives every frame directly |
-| D3D11 on Metal | DXVK → MoltenVK (two layers) | DXMT (one layer) |
-| Wine | Wine 11 Staging (Gcenx build) | WhiskyWine / GPTK bottles (Whisky, CrossOver, Wineskin) |
-| Video | HEVC, custom UDP protocol, Wi-Fi 20 Mbps; frames carry the exact render pose for the headset's reprojection | H.264, ALVR protocol, USB (100 Mbps) or Wi-Fi, 72 fps claimed |
-| Headset | Apple Vision Pro, own visionOS app (Compositor Services) | Any ALVR client (tested on Quest 3); Vision Pro not mentioned |
-| Input | Vision Pro hand tracking for position, Joy-Con for buttons/sticks/triggers and inertial sensors; no haptics | VR controllers through ALVR: 6DoF, buttons, sticks, haptics |
-| Audio | Core Audio process tap, no extra driver | BlackHole virtual audio device |
-| Source | MIT, full source | Binaries only, 7-day trial then license key |
+| | Value |
+|---|---|
+| Main menu | 60 fps at the 60 Hz virtual display (game thread ~4.5 ms/frame) |
+| Per-eye image | 1298×1056 (default); `VERANTYX_QUALITY=high` 1982×1536 at ~39 fps |
+| First-time shader compile | 250–500 ms per pipeline, now off the render thread; ~2 ms once cached |
+| Play session | 20+ minutes in the first levels |
 
-Running SteamVR keeps SteamVR Input (the game's own controller bindings),
-chaperone and the dashboard working, at the cost of `vrserver`/`vrcompositor`
-CPU time; MoltenVR's design avoids that cost but needs OpenComposite to cover
-each game's OpenVR usage.
+Limits: the Mac's GPU caps resolution (`ultra`, ~3K per eye, runs at ~20 fps
+on an M1 Max); level-transition screens are not drawn; the game pauses while
+the headset reports no user.
+
+### Status and limits (Wine version)
+
+- Verified: SteamVR + Half-Life: Alyx on the Mac above, streaming to a Vision Pro,
+  playing with Joy-Con. Other games and other Macs are untested; the Mac
+  profiles are derived from this machine's measurements.
+- Gravity gloves: the wrist-flick velocity path is implemented (Joy-Con gyro and
+  accelerometer fused into the controller velocity) but not yet verified in
+  game.
+- The Mac is CPU-bound at ~30 fps in game; the Vision Pro reprojects every
+  frame to the current head pose, so head movement stays smooth, but hands and
+  the world update at the game's rate.
+- visionOS still opens Home when you look at your palm and pinch; this cannot
+  be disabled by an app. With Joy-Con you rarely pinch.
+- Hand tracking holds the hand's last head-relative position while it is out
+  of the cameras' view; Joy-Con gyro/accelerometer move it meanwhile (right
+  hand only: a merged pair exposes one sensor set).
+
+### Other Macs (Wine version)
+
+`scripts/mac_profile.sh` classes the Mac (performance cores, GPU cores,
+memory) into a tier and the launch script takes that tier's defaults for the
+SteamVR render scale, virtual display rate, bitrate and stream size; the
+encoder picks GPU or CPU frame conversion by timing both and lowers the
+bitrate while the Wi-Fi link loses packets. `scripts/bench_alyx.sh` measures
+the game's frame rate and the CPU/GPU load on any Mac without a headset, so
+settings can be compared before playing. See
+[docs/SETUP.md](docs/SETUP.md#mac-profiles-and-tuning).
+
+## Built on
+
+| Project | Used for | License | In this repository? |
+|---|---|---|---|
+| [Klepton](https://github.com/shinyquagsire23/Klepton) by ShinyQuagsire | Native version: loading Valve's ARM64 ELF libraries on macOS, its bionic libc and Vulkan-on-MoltenVK runtime; our patch set adds glibc TLS, x18 and loader fixes, CPU topology, asynchronous pipelines (`NativeARM/klepton-patches/`) | MIT | No — fetched by `NativeARM/scripts/fetch_klepton.sh`, patched by `apply.py` |
+| [MoltenVK](https://github.com/KhronosGroup/MoltenVK) | Vulkan → Metal (both versions; Wine version via DXVK) | Apache-2.0 | No (Klepton's build / DXVK) |
+| Valve's Half-Life: Alyx (Linux ARM64 depot 546564, Windows build) | The game | Valve's terms | No — your own Steam account |
+| Valve's [OpenVR SDK headers](https://github.com/ValveSoftware/openvr) | SteamVR driver, capture proxy, native OpenVR runtime | BSD-3-Clause | Yes (`VRDriver/include/`, `NativeARM/vrruntime/openvr/`) |
+| [ALVR](https://github.com/alvr-org/ALVR) | vxrt version with `VERANTYX_ALVR=1`: its streaming core `alvr_server_core` v20.14.1, unchanged, behind `ALVRBridge/`; native version: OpenVR hand-skeleton bone poses for finger animation | MIT | Core: no — fetched by Cargo when `ALVRBridge` is built; hand data: yes, unchanged with its license (`NativeARM/vrruntime/hand_skeleton_alvr.inc`) |
+| [Fossilize](https://github.com/ValveSoftware/Fossilize) | Optional shader-prewarm experiment (not used by the launcher) | MIT | No — fetched by `NativeARM/scripts/build_fossilize.sh` |
+| Debian trixie arm64 packages | glib, libstdc++, ssl, png … the Linux libraries the game expects from the Steam Linux Runtime | various (DFSG) | No — fetched by `NativeARM/scripts/fetch_debian_libs.sh` |
+| Wine Staging (Gcenx build), DXVK for macOS (Gcenx) | Wine version | LGPL-2.1, zlib | No — fetched by `scripts/setup.sh` |
+| Windows SteamVR, Microsoft Visual C++ / DirectX runtime DLLs | vxrt version: SteamVR from your own Steam account (steamcmd); the DLLs taken from the redistributable installers your SteamVR and games carry, on your Mac only | Valve's and Microsoft's terms | No |
+
+Details: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Project history
 
@@ -552,47 +654,13 @@ written from scratch with Opus 5.5 in Claude Code, and the Windows build of
 Alyx with the real SteamVR ran on it without Wine (the `vxrt` branch). On
 2026-10-14 The Lab (Unity) ran on it as well, the harness, game profiles and
 VXRT Studio let an AI coding tool measure and extend it, and Alyx on vxrt was
-played in the headset through level changes.
-
-## Other Macs
-
-`scripts/mac_profile.sh` classes the Mac (performance cores, GPU cores,
-memory) into a tier and the launch script takes that tier's defaults for the
-SteamVR render scale, virtual display rate, bitrate and stream size; the
-encoder picks GPU or CPU frame conversion by timing both and lowers the
-bitrate while the Wi-Fi link loses packets. `scripts/bench_alyx.sh` measures
-the game's frame rate and the CPU/GPU load on any Mac without a headset, so
-settings can be compared before playing. See
-[docs/SETUP.md](docs/SETUP.md#mac-profiles-and-tuning).
-
-## Native version: measurements and limits
-
-MacBook Pro (M1 Max), 2026-10-11, from the runtime's own logs:
-
-| | Value |
-|---|---|
-| Main menu | 60 fps at the 60 Hz virtual display (game thread ~4.5 ms/frame) |
-| Per-eye image | 1298×1056 (default); `VERANTYX_QUALITY=high` 1982×1536 at ~39 fps |
-| First-time shader compile | 250–500 ms per pipeline, now off the render thread; ~2 ms once cached |
-| Play session | 20+ minutes in the first levels |
-
-Limits: the Mac's GPU caps resolution (`ultra`, ~3K per eye, runs at ~20 fps
-on an M1 Max); level-transition screens are not drawn; the game pauses while
-the headset reports no user.
-
-## Status and limits (Wine version)
-
-- Verified: SteamVR + Half-Life: Alyx on the Mac above, streaming to a Vision Pro,
-  playing with Joy-Con. Other games and other Macs are untested; the Mac
-  profiles are derived from this machine's measurements.
-- Gravity gloves: the wrist-flick velocity path is implemented (Joy-Con gyro and
-  accelerometer fused into the controller velocity) but not yet verified in
-  game.
-- The Mac is CPU-bound at ~30 fps in game; the Vision Pro reprojects every
-  frame to the current head pose, so head movement stays smooth, but hands and
-  the world update at the game's rate.
-- visionOS still opens Home when you look at your palm and pinch; this cannot
-  be disabled by an app. With Joy-Con you rarely pinch.
-- Hand tracking holds the hand's last head-relative position while it is out
-  of the cameras' view; Joy-Con gyro/accelerometer move it meanwhile (right
-  hand only: a merged pair exposes one sensor set).
+played in the headset through level changes. From 2026-10-15 to 17 came
+VXRuntime's own x86-64 → ARM64 translator
+([VXRuntime/TRANSLATOR.md](VXRuntime/TRANSLATOR.md), not yet used for games),
+Command Clips (programs on VXRuntime read and operated through a socket instead
+of screenshots, [VXRuntime/CLIPS.md](VXRuntime/CLIPS.md)), and ALVR: the frames
+go to ALVR's client apps through ALVR's own streaming core, with game audio,
+hand tracking and controllers. Alyx was played through the Vision Pro's ALVR
+app on a MacBook Pro and on a MacBook Air M5 (its SteamVR and game cloned from
+an existing library), and the last known rendering problem (surfaces lit in
+one strong colour for single frames) was found with a frame capture and fixed.
