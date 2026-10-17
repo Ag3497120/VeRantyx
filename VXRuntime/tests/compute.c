@@ -12,6 +12,7 @@
 #include "shaders/append_cs.h"
 #include "shaders/views_cs.h"
 #include "shaders/formats_cs.h"
+#include "shaders/bounds_cs.h"
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("check failed (line %d): %s\n", __LINE__, #c); failures++; } } while (0)
 static ID3D11Device *dev;
@@ -229,6 +230,96 @@ static void test_views(void) {
     ID3D11Buffer_Release(results); ID3D11Buffer_Release(fb); ID3D11ComputeShader_Release(cs);
 }
 
+// Outside views (Direct3D defines it; Metal does not): loads read 0, stores and atomics are dropped, a sample's
+// array index is clamped. Each view is part of a larger resource whose other data is not 0, as a game's often are.
+// (Before: buffer loads read the data beyond the view, stores and atomics changed it; the textures here read 0.)
+static ID3D11Texture2D *make_texture(UINT w, UINT h, UINT layers, UINT bind, const UINT *data) {
+    D3D11_SUBRESOURCE_DATA init[2] = { { data, w * 4, w * h * 4 }, { data + w * h, w * 4, w * h * 4 } };
+    D3D11_TEXTURE2D_DESC td = { w, h, 1, layers, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, bind, 0, 0 };
+    ID3D11Texture2D *t = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, data ? init : NULL, &t)));
+    return t;
+}
+static void test_bounds(void) {
+    ID3D11ComputeShader *cs;
+    CHECK(SUCCEEDED(ID3D11Device_CreateComputeShader(dev, bounds_cs, sizeof bounds_cs, NULL, &cs)));
+    UINT words[8], ones[8], layer[8];
+    for (int i = 0; i < 8; i++) { words[i] = 1000 + i; ones[i] = 0xffffffffu; layer[i] = i < 4 ? 0x40404040u : 0xffffffffu; }
+    float floats[16];
+    for (int i = 0; i < 16; i++) floats[i] = 50;
+    ID3D11Buffer *structured = make_buffer(32, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4, words, D3D11_USAGE_DEFAULT, 0);
+    ID3D11Buffer *raw = make_buffer(32, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0, words, D3D11_USAGE_DEFAULT, 0);
+    ID3D11Buffer *fb = make_buffer(sizeof floats, D3D11_BIND_SHADER_RESOURCE, 0, 0, floats, D3D11_USAGE_DEFAULT, 0);
+    ID3D11Buffer *rwb = make_buffer(32, D3D11_BIND_UNORDERED_ACCESS, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 4, words, D3D11_USAGE_DEFAULT, 0);
+    ID3D11Buffer *results = make_buffer(64, D3D11_BIND_UNORDERED_ACCESS, 0, 0, NULL, D3D11_USAGE_DEFAULT, 0);
+    ID3D11Texture2D *image = make_texture(2, 2, 1, D3D11_BIND_SHADER_RESOURCE, ones);
+    ID3D11Texture2D *layers = make_texture(2, 2, 2, D3D11_BIND_SHADER_RESOURCE, layer);
+    ID3D11Texture2D *target = make_texture(2, 2, 1, D3D11_BIND_UNORDERED_ACCESS, NULL);
+    ID3D11ShaderResourceView *srvs[5];
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = { DXGI_FORMAT_UNKNOWN, D3D11_SRV_DIMENSION_BUFFER };
+    sd.Buffer.FirstElement = 0; sd.Buffer.NumElements = 4;
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)structured, &sd, &srvs[0])));
+    D3D11_SHADER_RESOURCE_VIEW_DESC rd = { DXGI_FORMAT_R32_TYPELESS, D3D11_SRV_DIMENSION_BUFFEREX };
+    rd.BufferEx.FirstElement = 0; rd.BufferEx.NumElements = 4; rd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)raw, &rd, &srvs[1])));
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)image, NULL, &srvs[2])));
+    D3D11_SHADER_RESOURCE_VIEW_DESC bd = { DXGI_FORMAT_R32G32B32A32_FLOAT, D3D11_SRV_DIMENSION_BUFFER };
+    bd.Buffer.FirstElement = 0; bd.Buffer.NumElements = 2;
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)fb, &bd, &srvs[3])));
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)layers, NULL, &srvs[4])));
+    ID3D11UnorderedAccessView *uavs[3];
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = { DXGI_FORMAT_UNKNOWN, D3D11_UAV_DIMENSION_BUFFER };
+    ud.Buffer.FirstElement = 0; ud.Buffer.NumElements = 4;
+    CHECK(SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)rwb, &ud, &uavs[0])));
+    D3D11_UNORDERED_ACCESS_VIEW_DESC td = { DXGI_FORMAT_R32_UINT, D3D11_UAV_DIMENSION_BUFFER };
+    td.Buffer.FirstElement = 0; td.Buffer.NumElements = 16;
+    CHECK(SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)results, &td, &uavs[1])));
+    CHECK(SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)target, NULL, &uavs[2])));
+    D3D11_SAMPLER_DESC smp = { D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP };
+    smp.MaxLOD = 1000;
+    ID3D11SamplerState *sampler;
+    CHECK(SUCCEEDED(ID3D11Device_CreateSamplerState(dev, &smp, &sampler)));
+    ID3D11DeviceContext_CSSetShader(ctx, cs, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(ctx, 0, 5, srvs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 3, uavs, NULL);
+    ID3D11DeviceContext_CSSetSamplers(ctx, 0, 1, &sampler);
+    ID3D11DeviceContext_Dispatch(ctx, 1, 1, 1);
+    UINT r[16], w[8];
+    read_buffer(results, r, sizeof r);
+    read_buffer(rwb, w, sizeof w);
+    CHECK(r[0] == 1003 && r[1] == 1);                          // structured: inside, outside
+    CHECK(r[2] == 1003 && r[3] == 1);                          // raw
+    CHECK(r[4] == 100 && r[5] == 1 && r[6] == 1);              // texture: inside, outside, a mip it lacks
+    CHECK(r[7] == 1);                                          // typed buffer
+    CHECK(r[8] == 100 && r[9] == 25);                          // array index clamped to the last, the first layer
+    CHECK(r[10] == 1);                                         // a layer it lacks
+    CHECK(r[11] == 1);                                         // the atomic outside returned 0
+    CHECK(w[1] == 11 && w[5] == 1005 && w[6] == 1006);         // stores outside the view dropped
+    D3D11_TEXTURE2D_DESC sdesc = { 2, 2, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0 };
+    ID3D11Texture2D *staging;
+    ID3D11Device_CreateTexture2D(dev, &sdesc, NULL, &staging);
+    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)target);
+    D3D11_MAPPED_SUBRESOURCE m;
+    UINT px[4] = { 1, 1, 1, 1 };
+    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m))) {
+        for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) px[y * 2 + x] = *(UINT *)((BYTE *)m.pData + y * m.RowPitch + x * 4);
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+    }
+    CHECK(px[0] == 0 && px[1] == 0 && px[2] == 0 && px[3] == 0xff00ff00u);   // the write outside dropped
+    printf("  outside views: structured %u %u, raw %u %u, texture %u %u %u, typed %u, layers %u %u %u, atomic %u, buffer %u %u %u, image %08x %08x %08x %08x\n",
+           r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], w[1], w[5], w[6], px[0], px[1], px[2], px[3]);
+    ID3D11ShaderResourceView *no_srv[5] = { 0 };
+    ID3D11UnorderedAccessView *no_uav[3] = { 0 };
+    ID3D11DeviceContext_CSSetShaderResources(ctx, 0, 5, no_srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 3, no_uav, NULL);
+    for (int i = 0; i < 5; i++) ID3D11ShaderResourceView_Release(srvs[i]);
+    for (int i = 0; i < 3; i++) ID3D11UnorderedAccessView_Release(uavs[i]);
+    ID3D11SamplerState_Release(sampler); ID3D11Texture2D_Release(staging);
+    ID3D11Texture2D_Release(target); ID3D11Texture2D_Release(layers); ID3D11Texture2D_Release(image);
+    ID3D11Buffer_Release(results); ID3D11Buffer_Release(rwb); ID3D11Buffer_Release(fb); ID3D11Buffer_Release(raw); ID3D11Buffer_Release(structured);
+    ID3D11ComputeShader_Release(cs);
+}
+
 // Block-compressed textures (BC1, and BC3 updated in part), a 3D and a 1D texture.
 static void test_formats(void) {
     ID3D11ComputeShader *cs;
@@ -312,6 +403,7 @@ int main(void) {
     test_append_consume();
     test_views();
     test_formats();
-    printf("compute: shared-memory sums, atomics, writable texture, UAV clear, append/consume, texture atomics, views, formats: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    test_bounds();
+    printf("compute: shared-memory sums, atomics, writable texture, UAV clear, append/consume, texture atomics, views, formats, outside views: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }

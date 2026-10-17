@@ -375,7 +375,9 @@ static void condition(gen *g, const instr *in, const operand *o, char *out, size
 // Texture coordinates and the sampling call, by resource dimension.
 enum { DIM_BUFFER = 1, DIM_1D = 2, DIM_2D = 3, DIM_2DMS = 4, DIM_3D = 5, DIM_CUBE = 6, DIM_1DARRAY = 7, DIM_2DARRAY = 8,
        DIM_2DMSARRAY = 9, DIM_CUBEARRAY = 10 };
-static void coords(gen *g, const operand *o, int dim, int kind, char *xy, size_t cap, char *slice, size_t scap) {
+// tex: for a float array index, the texture whose array it is clamped to, as Direct3D does (the nearest layer that
+// exists; Metal leaves one outside undefined).
+static void coords(gen *g, const operand *o, int dim, int kind, char *xy, size_t cap, char *slice, size_t scap, const char *tex) {
     int c4[4] = { 0, 1, 2, 3 };
     int n = dim == DIM_1D || dim == DIM_1DARRAY || dim == DIM_BUFFER ? 1 : dim == DIM_3D || dim == DIM_CUBE || dim == DIM_CUBEARRAY ? 3 : 2;
     src(g, o, c4, n, kind, xy, cap);
@@ -384,8 +386,27 @@ static void coords(gen *g, const operand *o, int dim, int kind, char *xy, size_t
     if (slice_comp >= 0) {
         char s[700];
         src(g, o, &slice_comp, 1, kind, s, sizeof s);
-        snprintf(slice, scap, kind == K_FLOAT ? "uint(rint(%s))" : "uint(%s)", s);
+        if (kind == K_FLOAT && tex) snprintf(slice, scap, "min(uint(max(rint(%s), 0.0)), %s.get_array_size() - 1u)", s, tex);
+        else snprintf(slice, scap, kind == K_FLOAT ? "uint(rint(%s))" : "uint(%s)", s);
     }
+}
+// Whether a texel address is inside texture tex (a load from outside reads 0 in Direct3D, a store is dropped; Metal
+// leaves both undefined: what lies beside it in memory). xy: its coordinates (ints or uints), slice: its layer or "",
+// mip: its level, or NULL for a texture of one level as these take it (multisampled, a UAV's view).
+static void in_bounds(char *out, size_t cap, const char *tex, int dim, const char *xy, const char *slice, const char *mip) {
+    char lod[720] = "";
+    if (mip) snprintf(lod, sizeof lod, "uint(%s)", mip);
+    int n = dim == DIM_BUFFER || dim == DIM_1D || dim == DIM_1DARRAY ? 1 : dim == DIM_3D ? 3 : 2;
+    char size[1800];
+    if (dim == DIM_BUFFER) snprintf(size, sizeof size, "%s.get_width()", tex);
+    else if (n == 1) snprintf(size, sizeof size, "%s.get_width(%s)", tex, lod);
+    else if (n == 2) snprintf(size, sizeof size, "uint2(%s.get_width(%s), %s.get_height(%s))", tex, lod, tex, lod);
+    else snprintf(size, sizeof size, "uint3(%s.get_width(%s), %s.get_height(%s), %s.get_depth(%s))", tex, lod, tex, lod, tex, lod);
+    size_t k = 0;
+    if (mip) k += (size_t)snprintf(out + k, cap - k, "%s < %s.get_num_mip_levels() && ", lod, tex);
+    if (n == 1) k += (size_t)snprintf(out + k, cap - k, "uint(%s) < %s", xy, size);
+    else k += (size_t)snprintf(out + k, cap - k, "all(uint%d(%s) < %s)", n, xy, size);
+    if (slice[0]) snprintf(out + k, cap - k, " && %s < %s.get_array_size()", slice, tex);
 }
 static void sample(gen *g, const instr *in) {
     const operand *dst = &in->ops[0], *addr = &in->ops[1], *res = &in->ops[2], *smp = in->nops > 3 ? &in->ops[3] : NULL;
@@ -393,7 +414,9 @@ static void sample(gen *g, const instr *in) {
     int dim = t < 128 ? g->tex_dim[t] : DIM_2D;
     char xy[700], slice[720], extra[1600] = "", a[700], b[700];
     int c0 = 0, c4[4] = { 0, 1, 2, 3 };
-    coords(g, addr, dim, K_FLOAT, xy, sizeof xy, slice, sizeof slice);
+    char tn[16];
+    snprintf(tn, sizeof tn, "t%u", t);
+    coords(g, addr, dim, K_FLOAT, xy, sizeof xy, slice, sizeof slice, tn);
     char args[2400];
     snprintf(args, sizeof args, "s%u, %s%s%s", smp ? smp->index[0] : 0, xy, slice[0] ? ", " : "", slice);
     int gn = dim == DIM_3D || dim == DIM_CUBE || dim == DIM_CUBEARRAY ? 3 : 2;
@@ -436,9 +459,16 @@ static void load(gen *g, const instr *in) {
     uint32_t t = res->index[0];
     int dim = t < 128 ? g->tex_dim[t] : DIM_2D;
     char xy[700], slice[720], mip[700] = "0", call[2400];
-    coords(g, addr, dim, K_INT, xy, sizeof xy, slice, sizeof slice);
-    int c3 = 3;
-    if (dim != DIM_BUFFER && dim != DIM_2DMS && dim != DIM_2DMSARRAY) src(g, addr, &c3, 1, K_INT, mip, sizeof mip);
+    coords(g, addr, dim, K_INT, xy, sizeof xy, slice, sizeof slice, NULL);
+    int c3 = 3, has_mip = dim != DIM_BUFFER && dim != DIM_2DMS && dim != DIM_2DMSARRAY;
+    if (has_mip) src(g, addr, &c3, 1, K_INT, mip, sizeof mip);
+    if ((in->offset[0] || in->offset[1] || in->offset[2]) && dim != DIM_BUFFER) {   // (ld's immediate texel offset)
+        char moved[800];
+        if (dim == DIM_3D) snprintf(moved, sizeof moved, "(%s + int3(%d, %d, %d))", xy, in->offset[0], in->offset[1], in->offset[2]);
+        else if (dim == DIM_1D || dim == DIM_1DARRAY) snprintf(moved, sizeof moved, "(%s + %d)", xy, in->offset[0]);
+        else snprintf(moved, sizeof moved, "(%s + int2(%d, %d))", xy, in->offset[0], in->offset[1]);
+        snprintf(xy, sizeof xy, "%s", moved);
+    }
     const char *ut = dim == DIM_1D || dim == DIM_1DARRAY || dim == DIM_BUFFER ? "uint" : dim == DIM_3D ? "uint3" : "uint2";
     if (dim == DIM_BUFFER) snprintf(call, sizeof call, "t%u.read(uint(%s))", t, xy);
     else if (dim == DIM_2DMS || dim == DIM_2DMSARRAY) {
@@ -454,9 +484,12 @@ static void load(gen *g, const instr *in) {
     char sw[5];
     for (int i = 0; i < n; i++) sw[i] = CH[res->swz[comps[i]]];
     sw[n] = 0;
-    char expr[2500];
+    char expr[8000], tn[16], inside[4000];
     int kind = g->tex_ret[t] == 3 ? K_INT : g->tex_ret[t] == 4 ? K_UINT : K_FLOAT;
-    snprintf(expr, sizeof expr, "%s.%s", call, sw);
+    if (g->tex_cmp[t]) kind = K_FLOAT;
+    snprintf(tn, sizeof tn, "t%u", t);
+    in_bounds(inside, sizeof inside, tn, dim, xy, slice, has_mip ? mip : NULL);
+    snprintf(expr, sizeof expr, "((%s) ? %s : %s(0)).%s", inside, call, type_name(kind, 4), sw);
     assign(g, dst, expr, kind, n, in->saturate);
 }
 // resinfo: width, height, depth or array size, mip count, as floats (or 1/x, or uints).
@@ -545,7 +578,12 @@ static void memory_access(gen *g, const instr *in) {
     uint32_t stride; int shared;
     if (!memory(g, res, m, sizeof m, &stride, &shared)) return;
     word_address(g, &in->ops[1], 0, structured ? &in->ops[2] : NULL, 0, stride, addr, sizeof addr);
+    // (outside the view: a load reads 0 and a store is dropped, as in Direct3D; Metal would read or write what lies
+    //  beyond it. Group shared memory is not checked: outside it, Direct3D leaves it undefined too.)
+    char limit[64] = "";
+    if (!shared) { snprintf(limit, sizeof limit, "(vx_sizes[%u] >> 2)", res->type == OPD_UAV ? res->index[0] : 8 + res->index[0]); g->sh->uses_sizes = 1; }
     line(g, "{ uint vx_a = %s;", addr);
+    if (limit[0]) line(g, "  uint vx_n = %s;", limit);
     if (store) {
         const operand *val = &in->ops[structured ? 3 : 2];
         int comps[4], n = dest_comps(res, comps);
@@ -553,13 +591,18 @@ static void memory_access(gen *g, const instr *in) {
             char v[700];
             int c = comps[i];
             src(g, val, &c, 1, K_UINT, v, sizeof v);
-            line(g, "    %s[vx_a + %d] = %s;", m, c, v);
+            if (limit[0]) line(g, "    if (vx_a + %d < vx_n) %s[vx_a + %d] = %s;", c, m, c, v);
+            else line(g, "    %s[vx_a + %d] = %s;", m, c, v);
         }
     } else {
         int comps[4], n = dest_comps(&in->ops[0], comps);
         char vals[400] = "";
         size_t k = 0;
-        for (int i = 0; i < n; i++) k += (size_t)snprintf(vals + k, sizeof vals - k, "%s%s[vx_a + %d]", i ? ", " : "", m, res->swz[comps[i]]);
+        for (int i = 0; i < n; i++) {
+            int c = res->swz[comps[i]];
+            if (limit[0]) k += (size_t)snprintf(vals + k, sizeof vals - k, "%s(vx_a + %d < vx_n ? %s[vx_a + %d] : 0u)", i ? ", " : "", c, m, c);
+            else k += (size_t)snprintf(vals + k, sizeof vals - k, "%s%s[vx_a + %d]", i ? ", " : "", m, c);
+        }
         char expr[500];
         snprintf(expr, sizeof expr, "%s(%s)", type_name(K_UINT, n), vals);
         g->indent++;
@@ -574,15 +617,17 @@ static void typed_uav(gen *g, const instr *in) {
     uint32_t i = u->index[0] & 7;
     int dim = g->uav_dim[i], kind = g->uav_ret[i] == 3 ? K_INT : g->uav_ret[i] == 4 ? K_UINT : K_FLOAT;
     char xy[700], slice[720];
-    coords(g, addr, dim, K_UINT, xy, sizeof xy, slice, sizeof slice);
+    coords(g, addr, dim, K_UINT, xy, sizeof xy, slice, sizeof slice, NULL);
     const char *ut = dim == DIM_1D || dim == DIM_1DARRAY || dim == DIM_BUFFER ? "uint" : dim == DIM_3D ? "uint3" : "uint2";
-    char at[800];
+    char at[800], un[16], inside[2400];
     snprintf(at, sizeof at, "%s(%s)%s%s", ut, xy, slice[0] ? ", " : "", slice);
+    snprintf(un, sizeof un, "u%u", i);
+    in_bounds(inside, sizeof inside, un, dim, xy, slice, NULL);
     if (store) {
         int c4[4] = { 0, 1, 2, 3 };
         char v[700];
         src(g, &in->ops[2], c4, 4, kind, v, sizeof v);
-        line(g, "u%u.write(%s, %s);", i, v, at);
+        line(g, "if (%s) u%u.write(%s, %s);", inside, i, v, at);
         return;
     }
     g->sh->uav_read[i] = 1;
@@ -590,8 +635,8 @@ static void typed_uav(gen *g, const instr *in) {
     char sw[5];
     for (int k = 0; k < n; k++) sw[k] = CH[u->swz[comps[k]]];
     sw[n] = 0;
-    char expr[1000];
-    snprintf(expr, sizeof expr, "u%u.read(%s).%s", i, at, sw);
+    char expr[4000];
+    snprintf(expr, sizeof expr, "((%s) ? u%u.read(%s) : %s(0)).%s", inside, i, at, type_name(kind, 4), sw);
     assign(g, &in->ops[0], expr, kind, n, 0);
 }
 // bufinfo: the element count (structured), byte size (raw) or width (typed) of a buffer view. Sizes in bytes
@@ -638,7 +683,7 @@ static void atomic(gen *g, const instr *in) {
         if (g->uav_ret[i] != 3 && g->uav_ret[i] != 4) { fail(g, "atomics on a float typed UAV"); return; }
         g->sh->uav_read[i] = 1;
         char xy[700], slice[720], at[1500], v[700], w[700];
-        coords(g, addr, dim, K_UINT, xy, sizeof xy, slice, sizeof slice);
+        coords(g, addr, dim, K_UINT, xy, sizeof xy, slice, sizeof slice, NULL);
         const char *ut = dim == DIM_1D || dim == DIM_1DARRAY || dim == DIM_BUFFER ? "uint" : dim == DIM_3D ? "uint3" : "uint2";
         snprintf(at, sizeof at, "%s(%s)%s%s", ut, xy, slice[0] ? ", " : "", slice);
         int c0 = 0;
@@ -665,6 +710,15 @@ static void atomic(gen *g, const instr *in) {
     uint32_t stride; int shared;
     if (!memory(g, res, m, sizeof m, &stride, &shared)) return;
     word_address(g, addr, 0, stride ? addr : NULL, 1, stride, a, sizeof a);
+    // (outside a buffer view: nothing changes and an immediate atomic returns 0, as in Direct3D; the address is
+    //  taken first, as the destination may be one of the registers it is made of)
+    if (!shared) {
+        g->sh->uses_sizes = 1;
+        line(g, "{ uint vx_a = %s;", a);
+        line(g, "if (vx_a < (vx_sizes[%u] >> 2)) {", res->type == OPD_UAV ? res->index[0] : 8 + res->index[0]);
+        g->indent++;
+        snprintf(a, sizeof a, "vx_a");
+    }
     int is_signed = op == OP_ATOMIC_IMAX || op == OP_ATOMIC_IMIN;
     int kind = is_signed ? K_INT : K_UINT, c0 = 0;
     char ptr[1800], v[700], w[700];
@@ -676,16 +730,21 @@ static void atomic(gen *g, const instr *in) {
         line(g, "  while (!atomic_compare_exchange_weak_explicit(%s, &vx_e, %s, memory_order_relaxed, memory_order_relaxed) && vx_e == %s) {}", ptr, w, v);
         if (imm) { g->indent++; assign(g, &in->ops[0], "vx_e", K_UINT, 1, 0); g->indent--; }
         line(g, "}");
-        return;
+    } else {
+        const char *fn = op == 0 ? "atomic_exchange_explicit" : op == OP_ATOMIC_AND ? "atomic_fetch_and_explicit" :
+                         op == OP_ATOMIC_OR ? "atomic_fetch_or_explicit" : op == OP_ATOMIC_XOR ? "atomic_fetch_xor_explicit" :
+                         op == OP_ATOMIC_IADD ? "atomic_fetch_add_explicit" : op == OP_ATOMIC_IMAX || op == OP_ATOMIC_UMAX ? "atomic_fetch_max_explicit" :
+                         "atomic_fetch_min_explicit";
+        char call[2600];
+        snprintf(call, sizeof call, "%s(%s, %s, memory_order_relaxed)", fn, ptr, v);
+        if (imm) assign(g, &in->ops[0], call, kind, 1, 0);
+        else line(g, "%s;", call);
     }
-    const char *fn = op == 0 ? "atomic_exchange_explicit" : op == OP_ATOMIC_AND ? "atomic_fetch_and_explicit" :
-                     op == OP_ATOMIC_OR ? "atomic_fetch_or_explicit" : op == OP_ATOMIC_XOR ? "atomic_fetch_xor_explicit" :
-                     op == OP_ATOMIC_IADD ? "atomic_fetch_add_explicit" : op == OP_ATOMIC_IMAX || op == OP_ATOMIC_UMAX ? "atomic_fetch_max_explicit" :
-                     "atomic_fetch_min_explicit";
-    char call[2600];
-    snprintf(call, sizeof call, "%s(%s, %s, memory_order_relaxed)", fn, ptr, v);
-    if (imm) assign(g, &in->ops[0], call, kind, 1, 0);
-    else line(g, "%s;", call);
+    if (!shared) {
+        g->indent--;
+        if (imm) { line(g, "} else {"); g->indent++; assign(g, &in->ops[0], "0u", K_UINT, 1, 0); g->indent--; }
+        line(g, "} }");
+    }
 }
 
 // gather4 (dst, addr, res, smp), gather4_c (+ ref), gather4_po (dst, addr, offset, res, smp), gather4_po_c (+ ref).
@@ -698,7 +757,9 @@ static void gather(gen *g, const instr *in) {
     int cube = dim == DIM_CUBE || dim == DIM_CUBEARRAY;
     char xy[700], slice[720], args[2400], extra[800] = "", ref[700] = "";
     int c0 = 0, c4[4] = { 0, 1, 2, 3 };
-    coords(g, addr, dim, K_FLOAT, xy, sizeof xy, slice, sizeof slice);
+    char tn[16];
+    snprintf(tn, sizeof tn, "t%u", t);
+    coords(g, addr, dim, K_FLOAT, xy, sizeof xy, slice, sizeof slice, tn);
     if (po && !cube) {
         char off[700], moved[1600];
         src(g, &in->ops[2], c4, 2, K_INT, off, sizeof off);
