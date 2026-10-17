@@ -13,6 +13,7 @@
 #include "shaders/views_cs.h"
 #include "shaders/formats_cs.h"
 #include "shaders/bounds_cs.h"
+#include "shaders/cbounds_cs.h"
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("check failed (line %d): %s\n", __LINE__, #c); failures++; } } while (0)
 static ID3D11Device *dev;
@@ -320,6 +321,52 @@ static void test_bounds(void) {
     ID3D11ComputeShader_Release(cs);
 }
 
+// A constant buffer read beyond the one bound (declared with 32 float4s, 2 bound: a dynamic buffer, so a slice with
+// other constants after it) and an indexable temp outside itself: both read 0, and the write outside is dropped.
+static void test_cb_bounds(void) {
+    ID3D11ComputeShader *cs;
+    CHECK(SUCCEEDED(ID3D11Device_CreateComputeShader(dev, cbounds_cs, sizeof cbounds_cs, NULL, &cs)));
+    ID3D11Buffer *small = make_buffer(32, D3D11_BIND_CONSTANT_BUFFER, 0, 0, NULL, D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE);
+    ID3D11Buffer *others[8];
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)small, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        memcpy(&v[4], &(UINT){ 7 }, 4);
+        memcpy(m.pData, v, 32);
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)small, 0);
+    }
+    for (int i = 0; i < 8; i++) {                               // (constants after it: 0x55 everywhere)
+        others[i] = make_buffer(256, D3D11_BIND_CONSTANT_BUFFER, 0, 0, NULL, D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)others[i], 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memset(m.pData, 0x55, 256);
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)others[i], 0);
+        }
+    }
+    UINT idx[8] = { 1, 20, 6, 2, 7, 0, 0, 0 };
+    ID3D11Buffer *ib = make_buffer(32, D3D11_BIND_CONSTANT_BUFFER, 0, 0, idx, D3D11_USAGE_DEFAULT, 0);
+    ID3D11Buffer *results = make_buffer(32, D3D11_BIND_UNORDERED_ACCESS, 0, 0, NULL, D3D11_USAGE_DEFAULT, 0);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = { DXGI_FORMAT_R32_UINT, D3D11_UAV_DIMENSION_BUFFER };
+    ud.Buffer.FirstElement = 0; ud.Buffer.NumElements = 8;
+    ID3D11UnorderedAccessView *uav;
+    CHECK(SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)results, &ud, &uav)));
+    ID3D11Buffer *cbs[2] = { small, ib };
+    ID3D11DeviceContext_CSSetShader(ctx, cs, NULL, 0);
+    ID3D11DeviceContext_CSSetConstantBuffers(ctx, 0, 2, cbs);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1, &uav, NULL);
+    ID3D11DeviceContext_Dispatch(ctx, 1, 1, 1);
+    UINT r[8];
+    read_buffer(results, r, sizeof r);
+    CHECK(r[0] == 7 && r[1] == 1 && r[4] == 1);                 // inside the bound constants; beyond them (computed, fixed)
+    CHECK(r[2] == 12 && r[3] == 1);                             // the temp array: inside; outside (and not written)
+    printf("  outside constants and temp arrays: %u %u %u, %u %u\n", r[0], r[1], r[4], r[2], r[3]);
+    ID3D11UnorderedAccessView *no_uav = NULL;
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(ctx, 0, 1, &no_uav, NULL);
+    ID3D11UnorderedAccessView_Release(uav);
+    ID3D11Buffer_Release(results); ID3D11Buffer_Release(ib); ID3D11Buffer_Release(small);
+    for (int i = 0; i < 8; i++) ID3D11Buffer_Release(others[i]);
+    ID3D11ComputeShader_Release(cs);
+}
+
 // Block-compressed textures (BC1, and BC3 updated in part), a 3D and a 1D texture.
 static void test_formats(void) {
     ID3D11ComputeShader *cs;
@@ -404,6 +451,7 @@ int main(void) {
     test_views();
     test_formats();
     test_bounds();
-    printf("compute: shared-memory sums, atomics, writable texture, UAV clear, append/consume, texture atomics, views, formats, outside views: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    test_cb_bounds();
+    printf("compute: shared-memory sums, atomics, writable texture, UAV clear, append/consume, texture atomics, views, formats, outside views and constants: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
     return failures;
 }

@@ -190,6 +190,7 @@ typedef struct {
     int temps;
     struct { uint32_t reg, size; } xt[32];
     int nxt;
+    int lvalue;                               // reg_text names a destination (no bounds check: assign guards it)
     uint8_t in_decl[32], out_decl[32];
     uint32_t in_sv[32], out_sv[32], in_interp[32];
     uint8_t in_mask[32], in_eval[32];      // in_eval: read through an interpolant (eval_* instructions)
@@ -259,6 +260,10 @@ static void index_text(gen *g, const operand *o, int d, char *out, size_t cap) {
     else snprintf(out, cap, "%s", rel);
 }
 
+static uint32_t xt_size(gen *g, uint32_t reg) {
+    for (int i = 0; i < g->nxt; i++) if (g->xt[i].reg == reg) return g->xt[i].size;
+    return 0;
+}
 // The float4 (or scalar) a register operand names.
 static void reg_text(gen *g, const operand *o, char *out, size_t cap) {
     char i0[300], i1[300];
@@ -270,8 +275,21 @@ static void reg_text(gen *g, const operand *o, char *out, size_t cap) {
         break;
     case OPD_GS_INSTANCE_ID: snprintf(out, cap, "vInstance"); break;
     case OPD_OUTPUT: snprintf(out, cap, "o%u", o->index[0]); break;
-    case OPD_INDEXABLE_TEMP: index_text(g, o, 1, i1, sizeof i1); snprintf(out, cap, "x%u[%s]", o->index[0], i1); break;
-    case OPD_CB: index_text(g, o, 1, i1, sizeof i1); snprintf(out, cap, "cb%u[%s]", o->index[0], i1); break;
+    // An indexable temp at a computed index, and a constant buffer: outside them a read gives 0, as in Direct3D (Metal
+    // would read what lies beyond: the stack; for a constant buffer, other draws' constants in the same chunk, which
+    // lit Half-Life: Alyx's fences and fog in one strong colour for a frame).
+    case OPD_INDEXABLE_TEMP:
+        index_text(g, o, 1, i1, sizeof i1);
+        if (o->rel[1] && !g->lvalue) snprintf(out, cap, "(uint(%s) < %uu ? x%u[%s] : float4(0))", i1, xt_size(g, o->index[0]), o->index[0], i1);
+        else snprintf(out, cap, "x%u[%s]", o->index[0], i1);
+        break;
+    case OPD_CB:
+        index_text(g, o, 1, i1, sizeof i1);
+        if (o->index[0] < 14 && o->rel[1]) {                  // (fixed indices: checked when bound, d3d11_draw.m)
+            g->sh->uses_sizes = 1;
+            snprintf(out, cap, "(uint(%s) < vx_sizes[%u] ? cb%u[%s] : float4(0))", i1, DXBC_CB_SIZES + o->index[0], o->index[0], i1);
+        } else snprintf(out, cap, "cb%u[%s]", o->index[0], i1);
+        break;
     case OPD_ICB: index_text(g, o, 0, i0, sizeof i0); snprintf(out, cap, "icb[%s]", i0); break;
     case OPD_INPUT_PRIMITIVEID: snprintf(out, cap, "vPrim"); break;
     case OPD_INPUT_COVERAGE: snprintf(out, cap, "vCoverage"); break;
@@ -322,7 +340,9 @@ static void src(gen *g, const operand *o, const int *comps, int n, int kind, cha
 static void assign(gen *g, const operand *d, const char *expr, int kind, int n, int saturate) {
     if (d->type == OPD_NULL) return;
     char reg[400], lhs[420];
+    g->lvalue = 1;
     reg_text(g, d, reg, sizeof reg);
+    g->lvalue = 0;
     if (scalar_register(d)) snprintf(lhs, sizeof lhs, "%s", reg);
     else {
         int comps[4], m = dest_comps(d, comps);
@@ -332,8 +352,15 @@ static void assign(gen *g, const operand *d, const char *expr, int kind, int n, 
         snprintf(lhs, sizeof lhs, "%s.%s", reg, sw);
     }
     if (d->type == OPD_OUTPUT_COVERAGE) { line(g, "%s = as_type<uint>(%s);", lhs, expr); return; }
+    if (d->type == OPD_INDEXABLE_TEMP && d->rel[1]) {        // (outside it: dropped, as in Direct3D)
+        char i1[300];
+        index_text(g, d, 1, i1, sizeof i1);
+        line(g, "if (uint(%s) < %uu)", i1, xt_size(g, d->index[0]));
+        g->indent++;
+    }
     if (kind == K_FLOAT) line(g, saturate ? "%s = saturate(%s);" : "%s = %s;", lhs, expr);
     else line(g, "%s = as_type<%s>(%s);", lhs, type_name(K_FLOAT, n), expr);
+    if (d->type == OPD_INDEXABLE_TEMP && d->rel[1]) g->indent--;
 }
 
 // ---- instructions --------------------------------------------------------------------------------------------------------------
@@ -1138,7 +1165,7 @@ static void declare(gen *g, uint32_t op, uint32_t token, reader *r, pool *pl) {
         break;
     case OP_DCL_CONSTANT_BUFFER:
         read_operand(r, pl, &o);
-        if (o.index[0] < 16) { g->sh->cbuffers |= 1u << o.index[0]; g->cb_size[o.index[0]] = o.index[1]; }
+        if (o.index[0] < 16) { g->sh->cbuffers |= 1u << o.index[0]; g->sh->cb_size[o.index[0]] = g->cb_size[o.index[0]] = o.index[1]; }
         break;
     case OP_DCL_SAMPLER:
         read_operand(r, pl, &o);
@@ -1241,13 +1268,13 @@ static void resource_params(gen *g, text *t) {
 }
 static void locals(gen *g, text *t) {
     for (int i = 0; i < g->temps; i++) put(t, "    float4 r%d = 0;\n", i);
-    for (int i = 0; i < g->nxt; i++) put(t, "    float4 x%u[%u];\n", g->xt[i].reg, g->xt[i].size);
+    for (int i = 0; i < g->nxt; i++) put(t, "    float4 x%u[%u] = {};\n", g->xt[i].reg, g->xt[i].size);
 }
 
 static void preamble(gen *g, text *t) {
     put(t, "#include <metal_stdlib>\nusing namespace metal;\n\n");
     if (g->sh->uav_counters)
-        put(t, "struct VxCounters { device atomic_uint *c[8]; };\n#define vx_counter(u) ((*reinterpret_cast<constant VxCounters *>(vx_sizes + 32)).c[u])\n\n");
+        put(t, "struct VxCounters { device atomic_uint *c[8]; };\n#define vx_counter(u) ((*reinterpret_cast<constant VxCounters *>(vx_sizes + 48)).c[u])\n\n");
     if (g->uses_msad)
         put(t, "template <typename T> T vx_msad(T r, T s, T a) {\n"
                "    for (uint i = 0; i < 32; i += 8) { T rb = (r >> i) & 0xffu, sb = (s >> i) & 0xffu; a += select(T(0u), absdiff(rb, sb), rb != 0u); }\n"

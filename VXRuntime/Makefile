@@ -255,7 +255,7 @@ build/vxplugin.dll: tests/vxplugin.c tests/vxplugin.def
 # Test shaders: HLSL compiled to DXBC by a d3dcompiler DLL (Microsoft's, as games ship it) running on vxrt.
 # The generated tests/shaders/*.h are kept in the repository; regenerate with
 #   make shaders D3DCOMPILER='Z:\path\to\d3dcompiler_43.dll'
-SHADERS = color_vs:vs_4_0 color_ps:ps_4_0 tex_vs:vs_4_0 tex_ps:ps_4_0 fullscreen_vs:vs_4_0 math_ps:ps_4_0 sum_cs:cs_5_0 atomic_cs:cs_5_0 append_cs:cs_5_0 views_cs:cs_5_0 formats_cs:cs_5_0 features_ps:ps_5_0 features_vs:vs_5_0 features_cs:cs_5_0 quad_gs:gs_4_0 bounds_cs:cs_5_0
+SHADERS = color_vs:vs_4_0 color_ps:ps_4_0 tex_vs:vs_4_0 tex_ps:ps_4_0 fullscreen_vs:vs_4_0 math_ps:ps_4_0 sum_cs:cs_5_0 atomic_cs:cs_5_0 append_cs:cs_5_0 views_cs:cs_5_0 formats_cs:cs_5_0 features_ps:ps_5_0 features_vs:vs_5_0 features_cs:cs_5_0 quad_gs:gs_4_0 bounds_cs:cs_5_0 cbounds_cs:cs_5_0
 shaders: build/vxrt build/hlslc.exe
 	@for s in $(SHADERS); do n=$${s%%:*}; p=$${s##*:}; \
 	  VXRT_ROOT=build/root build/vxrt build/hlslc.exe '$(D3DCOMPILER)' tests/shaders/$$n.hlsl main $$p tests/shaders/$$n.h $$n || exit 1; done

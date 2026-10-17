@@ -1102,6 +1102,23 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
     for (int i = 0; i < 14; i++) {
         if (!(sh->info.cbuffers & (1u << i))) continue;
         d3d_buffer *cb = s->cb[st][i];
+        uint32_t bound = cb && cb->desc[0] > s->cb_offset[st][i] ? (cb->desc[0] - s->cb_offset[st][i]) / 16 : 0;   // (float4s)
+        sizes[DXBC_CB_SIZES + i] = bound;
+        // A constant buffer smaller than the shader declares (Half-Life: Alyx binds 1 float4 where a shader declares
+        // 37): Direct3D reads 0 beyond it, Metal the constants of other draws after it in the same chunk, which
+        // change every frame. Such a one goes as a copy of the declared size, the rest 0 (setBytes: up to 4 KB).
+        uint32_t want = sh->info.cb_size[i];
+        if (cb && bound < want && want * 16 <= 4096 && ((__bridge id<MTLBuffer>)cb->mtl).storageMode == MTLStorageModeShared) {
+            uint8_t padded[4096] = { 0 };
+            memcpy(padded, (const uint8_t *)((__bridge id<MTLBuffer>)cb->mtl).contents + cb->off + s->cb_offset[st][i], (size_t)bound * 16);
+            if (cenc) [cenc setBytes:padded length:want * 16 atIndex:i];
+            else {
+                if (st == STAGE_VS) [renc setVertexBytes:padded length:want * 16 atIndex:i];
+                else [renc setFragmentBytes:padded length:want * 16 atIndex:i];
+                s->bound.buf[st][i] = (void *)-1;                // (no longer a buffer of ours)
+            }
+            continue;
+        }
         SET_BUFFER(cb ? (__bridge id<MTLBuffer>)cb->mtl : nil, cb ? cb->off + s->cb_offset[st][i] : 0, i);
     }
     for (int i = 0; i < 32; i++) {

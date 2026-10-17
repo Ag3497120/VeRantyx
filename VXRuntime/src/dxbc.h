@@ -21,6 +21,7 @@ typedef struct {
     dxbc_element inputs[32], outputs[32];
     int ninputs, noutputs;
     uint32_t cbuffers;              // slots used (bit per slot)
+    uint32_t cb_size[16];           // float4s each declares
     uint64_t textures[2];           // t0..t127
     uint32_t samplers;
     // Compute (and UAV) resources: unordered access views u0..u7, raw/structured buffer SRVs, the group size.
@@ -31,7 +32,7 @@ typedef struct {
     uint64_t srv_buffers;           // t# that are raw or structured buffers (bound as Metal buffers)
     uint32_t srv_stride[64];
     uint32_t threads[3];            // [numthreads(x, y, z)]
-    int uses_sizes;                 // reads buffer sizes (bufinfo) or UAV counters from buffer(DXBC_SIZES_BUFFER)
+    int uses_sizes;                 // reads buffer sizes (bufinfo, bounds) or UAV counters from buffer(DXBC_SIZES_BUFFER)
     uint8_t uav_counters;           // u# with a hidden counter (append, consume, IncrementCounter)
     int writes_depth;               // a pixel shader writing oDepth
     // Geometry shaders run as compute kernels (Metal has no such stage): the vertex shader before one runs as a
@@ -59,7 +60,9 @@ enum { DXBC_UAV_TYPED = 1, DXBC_UAV_RAW, DXBC_UAV_STRUCTURED };
 #define DXBC_GS_IN 28
 #define DXBC_GS_OUT 29
 #define DXBC_GS_COUNTS 26           // (the geometry kernel: triangles made per primitive)
-typedef struct { uint32_t sizes[32]; uint64_t counters[8]; } dxbc_aux;   // bytes of u0..u7 then t0..t21; GPU addresses
+// bytes of u0..u7 then t0..t21, float4s of cb0..cb13 (DXBC_CB_SIZES on); GPU addresses
+typedef struct { uint32_t sizes[48]; uint64_t counters[8]; } dxbc_aux;
+#define DXBC_CB_SIZES 32
 
 // Translates a DXBC container. Returns 0 and fills *out, or -1 with out->error set.
 int  dxbc_translate(const void *code, size_t size, dxbc_shader *out);
