@@ -41,6 +41,10 @@ if [[ ! -x "$ENCODER" || "$REPO_ROOT/MacEncoder/HardwareEncoder.swift" -nt "$ENC
     swiftc -O "$REPO_ROOT/MacEncoder/HardwareEncoder.swift" -o "$ENCODER"
 fi
 mkdir -p "$LOG_DIR" "$VXRT_VR_OVERLAY/config"
+# The last start's logs are kept beside the new ones (<name>.prev.log), so two runs can be compared.
+for f in vxrt-steamvr.log hardware-encoder.log webui-standin.log; do
+    [[ -s "$LOG_DIR/$f" ]] && mv -f "$LOG_DIR/$f" "$LOG_DIR/${f%.log}.prev.log"
+done
 
 # SteamVR finds its runtime through openvrpaths.vrpath in the user's local app data (C:\ = the root above).
 to_windows() { printf 'Z:%s' "$1" | tr '/' '\\' | sed 's/\\/\\\\/g'; }
@@ -106,6 +110,13 @@ if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
     ALVR_SESSION="$HOME/Library/Application Support/VeRantyx/ALVR/session.json"
     ALVR_HZ="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["openvr_config"]["refresh_rate"]))' "$ALVR_SESSION" 2>/dev/null || echo 90)"
     export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-$ALVR_HZ}"
+    # SteamVR does not hold the game back by whole frames when it misses the headset's rate (as with the 3k preset):
+    # on a MacBook Air M5, Half-Life: Alyx at ALVR's defaults ran some 31 fps either way, and the user found it
+    # smoother this way although it ran second (fanless, warmer), 2026-10-17. On the M1 Max no difference (60.0/59.0).
+    VXRT_VR_SETTINGS="${VXRT_VR_SETTINGS:-{\"steamvr\": {\"framesToThrottle\": 0, \"additionalFramesToPredict\": 0}}}"
+    # (ALVR writes its log anew each start: the last one kept, session_log.prev.txt)
+    ALVR_LOG="$HOME/Library/Application Support/VeRantyx/ALVR/session_log.txt"
+    [[ -s "$ALVR_LOG" ]] && mv -f "$ALVR_LOG" "${ALVR_LOG%.txt}.prev.txt"
     export VERANTYX_AUDIO="${VERANTYX_AUDIO:-0}"   # (the game's sound goes through ALVR instead: VERANTYX_ALVR_AUDIO, the encoder)
     # (the defaults an Earth VR session with the Vision Pro's ALVR app settled on, 2026-10-17: 90 Hz wants the stream
     #  within some 3 MP, which one HEVC session encodes at 90 fps on an M1 Max (2736x1096: 0-3 frames dropped, 4.7 MP:

@@ -34,6 +34,7 @@ VXRT="$REPO_ROOT/VXRuntime/build/vxrt"
 pgrep -f "Steam.AppBundle/Steam/Contents/MacOS/steam_osx" >/dev/null || { echo "Start Steam on the Mac and sign in first" >&2; exit 1; }
 if pgrep -f "wine.*(vrserver|hlvr)|build/vxrt.*(vrserver|hlvr)" >/dev/null; then echo "SteamVR or the game is already running" >&2; exit 1; fi
 mkdir -p "$LOG_DIR"
+for f in vxrt-steamvr-launch.log vxrt-alyx.log; do [[ -s "$LOG_DIR/$f" ]] && mv -f "$LOG_DIR/$f" "$LOG_DIR/${f%.log}.prev.log"; done   # (the last start's, kept)
 
 # SteamVR on VXRuntime (with the encoder and the web UI stand-in), until this script ends.
 "$SCRIPT_DIR/launch_vxrt_steamvr.sh" >"$LOG_DIR/vxrt-steamvr-launch.log" 2>&1 &

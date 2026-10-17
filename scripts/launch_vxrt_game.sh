@@ -29,6 +29,7 @@ EXE_NAME="$(basename "$EXE")"
 pgrep -f "Steam.AppBundle/Steam/Contents/MacOS/steam_osx" >/dev/null || echo "Note: Mac Steam is not running; games that use Steam will not start" >&2
 if pgrep -f "build/vxrt.*(vrserver|vrcompositor)" >/dev/null; then echo "SteamVR on VXRuntime is already running" >&2; exit 1; fi
 mkdir -p "$LOG_DIR"
+for f in vxrt-steamvr-launch.log; do [[ -s "$LOG_DIR/$f" ]] && mv -f "$LOG_DIR/$f" "$LOG_DIR/${f%.log}.prev.log"; done   # (the last start's, kept)
 
 # Where the game's writes go: the Steam library's overlay, or one of the game's own.
 LIB="$(steam_library_of "$EXE")"
@@ -77,6 +78,7 @@ for _ in $(seq 1 40); do                               # vrserver's web server i
     lsof -nP -iTCP:27062 -sTCP:LISTEN >/dev/null 2>&1 && break
 done
 LOG="$LOG_DIR/vxrt-${EXE_NAME%.*}.log"
+[[ -s "$LOG" ]] && mv -f "$LOG" "${LOG%.log}.prev.log"   # (the last start's, kept)
 echo "SteamVR on VXRuntime is up; starting $EXE_NAME${APP_ID:+ (Steam app $APP_ID)} (log: $LOG)"
 # (the quality presets are the Vision Pro app's; an ALVR headset shows its own rate, 90 Hz, and stretches the last
 #  frame to the head's turn until the next comes: Half-Life: Alyx at 3k on a MacBook Air M5 made some 44 fps and
