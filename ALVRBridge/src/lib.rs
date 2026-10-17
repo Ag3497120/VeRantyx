@@ -97,6 +97,34 @@ const _: () = {
     assert!(offset_of!(VxAlvrInput, head_tracked) == 304 && offset_of!(VxAlvrInput, tangents_valid) == 311);
 };
 
+// The tracking samples' times and how the frames' stamps compare: logged every 5 s (session_log.txt). A stamp that is
+// not a sample's time, or one far older than the newest, is a frame the client cannot place (it reprojects from it).
+#[derive(Default)]
+struct SampleLog {
+    recent: std::collections::VecDeque<u64>,                           // (the last 2000 samples' times, ns)
+    newest: u64,
+    frames: u64, exact: u64, age_ns_sum: u64, age_ns_max: u64,
+    since: Option<std::time::Instant>,
+}
+impl SampleLog {
+    fn sample(&mut self, t: u64) {
+        if self.recent.len() == 2000 { self.recent.pop_front(); }
+        self.recent.push_back(t); self.newest = self.newest.max(t);
+    }
+    fn frame(&mut self, t: u64) {
+        self.frames += 1;
+        if self.recent.iter().rev().take(2000).any(|&x| x == t) { self.exact += 1; }
+        let age = self.newest.saturating_sub(t);
+        self.age_ns_sum += age; self.age_ns_max = self.age_ns_max.max(age);
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() > Duration::from_secs(5) && self.frames > 0 {
+            alvr_common::info!("VeRantyx: {} frames in {:.1} s, {} stamped with a sample's exact time; stamp age (newest sample minus the stamp) mean {:.1} ms, max {:.1} ms",
+                self.frames, since.elapsed().as_secs_f32(), self.exact, self.age_ns_sum as f64 / self.frames as f64 / 1e6, self.age_ns_max as f64 / 1e6);
+            *self = SampleLog { recent: std::mem::take(&mut self.recent), newest: self.newest, since: Some(std::time::Instant::now()), ..Default::default() };
+        }
+    }
+}
+
 struct Bridge {
     ctx: RwLock<Option<ServerCoreContext>>,
     input: Mutex<VxAlvrInput>,
@@ -104,10 +132,12 @@ struct Bridge {
     connected: AtomicBool,
     idr_requested: AtomicBool,
     config: Mutex<Vec<u8>>,
+    samples: Mutex<SampleLog>,                                         // (what frames are stamped with, checked)
     layout: alvr_filesystem::Layout,
     started_with: serde_json::Value,                                   // (the display settings the core read)
 }
 static BRIDGE: OnceLock<Arc<Bridge>> = OnceLock::new();
+static LAST_VIEWS: Mutex<String> = Mutex::new(String::new());
 
 fn matrix(m: Option<DeviceMotion>) -> Option<([f32; 16], [f32; 3], [f32; 3])> {
     let m = m?;
@@ -161,6 +191,13 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
                 //  would latch a fallback frustum if the map held one it rejects)
                 let sane = |f: &Fov| [f.left, f.right, f.up, f.down].iter().all(|a| a.is_finite() && a.abs() < 1.5)
                     && f.left < 0.0 && f.right > 0.0 && f.up > 0.0 && f.down < 0.0;
+                {
+                    let t = &v.local_view_transforms;
+                    let line = format!("eyes: left at ({:.4}, {:.4}, {:.4}) turned {:?}, right at ({:.4}, {:.4}, {:.4}) turned {:?}; fov {:?} / {:?}",
+                        t[0].position.x, t[0].position.y, t[0].position.z, t[0].orientation, t[1].position.x, t[1].position.y, t[1].position.z, t[1].orientation, v.fov[0], v.fov[1]);
+                    let mut last = LAST_VIEWS.lock().unwrap();
+                    if *last != line { alvr_common::info!("VeRantyx: the client's {line}"); *last = line; }
+                }
                 if sane(&v.fov[0]) && sane(&v.fov[1]) {
                     let mut i = bridge.input.lock().unwrap();
                     i.left_tangents = tangents(&v.fov[0]); i.right_tangents = tangents(&v.fov[1]); i.tangents_valid = 1;
@@ -180,6 +217,7 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
                     (matrix(ctx.get_device_motion(*HEAD_ID, sample_timestamp)), matrix(ctx.get_device_motion(*HAND_LEFT_ID, sample_timestamp)),
                      matrix(ctx.get_device_motion(*HAND_RIGHT_ID, sample_timestamp)))
                 };
+                bridge.samples.lock().unwrap().sample(sample_timestamp.as_nanos() as u64);
                 let mut i = bridge.input.lock().unwrap();
                 i.timestamp_s = sample_timestamp.as_secs_f64();
                 if let Some((m, _, _)) = head { i.head = m; }
@@ -208,7 +246,7 @@ pub unsafe extern "C" fn vx_alvr_start(config_dir: *const c_char) -> bool {
     let identity = alvr_common::glam::Mat4::from_rotation_translation(Quat::IDENTITY, Vec3::new(0.0, 1.6, 0.0)).to_cols_array();
     let bridge = Arc::new(Bridge {
         ctx: RwLock::new(None), input: Mutex::new(VxAlvrInput { head: identity, left: identity, right: identity, ..Default::default() }),
-        seq: AtomicU64::new(0), connected: AtomicBool::new(false), idr_requested: AtomicBool::new(false), config: Mutex::new(vec![]),
+        seq: AtomicU64::new(0), connected: AtomicBool::new(false), idr_requested: AtomicBool::new(false), config: Mutex::new(vec![]), samples: Mutex::new(SampleLog::default()),
         started_with: openvr_config(&l), layout: l,
     });
     BRIDGE.set(Arc::clone(&bridge)).ok();
@@ -263,6 +301,7 @@ pub unsafe extern "C" fn vx_alvr_set_config(nals: *const u8, len: usize) {
 pub unsafe extern "C" fn vx_alvr_send(timestamp_s: f64, au: *const u8, len: usize, is_idr: bool) {
     if let (Some(b), false) = (BRIDGE.get(), au.is_null()) {
         let t = Duration::from_nanos((timestamp_s * 1e9).round() as u64);
+        b.samples.lock().unwrap().frame(t.as_nanos() as u64);
         if let Some(ctx) = b.ctx.read().unwrap().as_ref() { ctx.send_video_nal(t, std::slice::from_raw_parts(au, len).to_vec(), is_idr); }
     }
 }

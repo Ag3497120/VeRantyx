@@ -107,6 +107,12 @@ if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
     ALVR_HZ="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["openvr_config"]["refresh_rate"]))' "$ALVR_SESSION" 2>/dev/null || echo 90)"
     export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-$ALVR_HZ}"
     export VERANTYX_AUDIO="${VERANTYX_AUDIO:-0}"   # (no game audio over ALVR yet: the Mac's speakers play it, not muted)
+    # (the defaults an Earth VR session with the Vision Pro's ALVR app settled on, 2026-10-17: 90 Hz wants the stream
+    #  within some 3 MP, which one HEVC session encodes at 90 fps on an M1 Max (2736x1096: 0-3 frames dropped, 4.7 MP:
+    #  59 fps); frames rendered at 1.4x and scaled down to it; 40 Mbps at most. A quality preset or these overrides it.)
+    export VERANTYX_STREAM_WIDTH="${VERANTYX_STREAM_WIDTH:-2880}" VERANTYX_STREAM_HEIGHT="${VERANTYX_STREAM_HEIGHT:-1040}"
+    export VERANTYX_BITRATE_MBPS="${VERANTYX_BITRATE_MBPS:-40}"
+    [[ -z "${VERANTYX_RENDER_SCALE:-}" ]] && export VERANTYX_RENDER_SCALE=1.4
 fi
 # The repository's driver, in the overlay's copy of SteamVR's drivers folder (SteamVR as downloaded has no
 # drivers/verantyx; the overlay's entries show in its listing).

@@ -53,4 +53,13 @@ for); it connects again by itself.
 - Earth VR with `VERANTYX_ALVR=1` through the harness: run 20261016T214636Z-earth-start, level controls, 70.8 fps at
   the 72 Hz the mock asked for, the game's frames (the capture proxy's) encoded at about 72 fps and received by the
   mock for two and a half minutes without a network drop. (The harness drives the game with simulated poses.)
-- Not yet: a game in a real headset through ALVR; a Quest only through someone who has one.
+- Earth VR in the Vision Pro's ALVR app (2026-10-17, the user): it plays; picture, head tracking and hands work.
+  Every frame was stamped with an ALVR sample's exact time (`VeRantyx:` lines in session_log.txt, every 5 s) and the
+  game rendered each with the exact pose recorded (the capture proxy: render_pose_exact for all). A distortion when
+  turning seen in the first session was gone in the next: the eyes' field of view had been latched before the client
+  sent it (it sends +-inf for its first seconds, now kept out). Stream size against frame rate at 90 Hz: 2270x914
+  88 fps; 3416x1366 59 fps reaching ALVR (the encoder falls behind); 2736x1096 at 1.6x rendering 78 fps (the game's
+  GPU time), none dropped by the encoder: hence ALVR mode's defaults (2880x1040 budget, 1.4x, 40 Mbps). Flying and
+  zooming in still stutter at times (frames 100-200 ms apart while Earth loads map data); whether that is Earth's
+  own is to be seen with another game.
+- A Quest: only through someone who has one.
