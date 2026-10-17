@@ -5,6 +5,7 @@
 // blending into one pipeline state object; those are made on first use for each combination and cached.
 // Draws go into one render pass for as long as the render targets stay the same.
 #include <CommonCrypto/CommonDigest.h>
+#include <sys/stat.h>
 #include "d3d_common.h"
 #include "dxbc.h"
 #pragma clang diagnostic push
@@ -1149,6 +1150,153 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
 #undef SET_SAMPLER
 }
 
+// VXRT_FLASH_CAPTURE=<directory>: catching single frames that come out wrong (Half-Life: Alyx's fences, foliage and
+// bottles lit for a moment in green, blue or red). Every frame the game hands over (the capture proxy's copy of the
+// left eye into a staging texture: the game's eye texture, both eyes) is shrunk to 512x256 on the GPU, which also counts its pixels of one strong colour; every draw and
+// dispatch is noted (shaders, targets, the textures its pixel shader reads). When a frame has many more such pixels
+// than the one before, the frames around it go to the directory: frame_<n>.ppm and frame_<n>.txt (its draws, in
+// order), up to 12 times (a game's own flashes count too: an explosion); the file <directory>/now does the same at
+// once (it is removed).
+#define FLASH_FRAMES 64
+#define FLASH_DRAWS (1u << 18)
+#define FLASH_W 512
+#define FLASH_H 256
+typedef struct { uint32_t frame, kind, vs, ps, rt, rt_format, depth, srv[6]; } flash_draw;   // kind: 0 draw, 1 dispatch
+static struct {
+    int on; const char *dir;
+    flash_draw *draws; uint64_t ndraws;
+    uint32_t frame;                                              // frames handed over so far
+    uint64_t start[FLASH_FRAMES];                                // each frame's first draw
+    void *thumb[FLASH_FRAMES], *counts[FLASH_FRAMES];            // id<MTLBuffer>: RGBA8 512x256, 3 counters
+    uint32_t done[FLASH_FRAMES];                                 // the frame whose counts are in (+1), by the GPU
+    void *pso;
+    volatile uint32_t flagged;                                   // a frame to write out (+1)
+    uint32_t last_counts[3], last_frame, dumps, last_dump;
+} g_flash = { .on = -1 };
+static uint32_t flash_id(const void *p) { uintptr_t v = (uintptr_t)p; return (uint32_t)(v ^ v >> 32); }
+static int flash_on(void) {
+    if (g_flash.on < 0) {
+        g_flash.dir = getenv("VXRT_FLASH_CAPTURE");
+        g_flash.on = g_flash.dir && *g_flash.dir;
+        if (g_flash.on) {
+            mkdir(g_flash.dir, 0755);
+            g_flash.draws = calloc(FLASH_DRAWS, sizeof *g_flash.draws);
+            vx_log("flash capture: on, into %s", g_flash.dir);
+        }
+    }
+    return g_flash.on;
+}
+static void flash_note(d3d_context *c, d3d_draw_state *s, int compute) {
+    if (!flash_on()) return;
+    flash_draw *d = &g_flash.draws[g_flash.ndraws++ % FLASH_DRAWS];
+    memset(d, 0, sizeof *d);
+    d->frame = g_flash.frame; d->kind = (uint32_t)compute;
+    int st = compute ? STAGE_CS : STAGE_PS;
+    if (compute) d->ps = s->shader[STAGE_CS] ? s->shader[STAGE_CS]->hash : 0;
+    else {
+        d->vs = s->shader[STAGE_VS] ? s->shader[STAGE_VS]->hash : 0;
+        d->ps = s->shader[STAGE_PS] ? s->shader[STAGE_PS]->hash : 0;
+        if (c->rtv[0]) { d->rt = flash_id(c->rtv[0]->resource); d->rt_format = c->rtv[0]->format; }
+        if (c->dsv) d->depth = flash_id(c->dsv->resource);
+    }
+    for (int i = 0, k = 0; i < 32 && k < 6; i++) if (s->srv[st][i]) d->srv[k++] = flash_id(s->srv[st][i]->resource) ^ (uint32_t)i << 27;
+}
+static void flash_write(uint32_t from, uint32_t to, const char *why) {
+    for (uint32_t f = from; f <= to; f++) {
+        int k = f % FLASH_FRAMES;
+        if (g_flash.done[k] != f + 1 || !g_flash.thumb[k]) continue;
+        char path[1024];
+        snprintf(path, sizeof path, "%s/frame_%u.ppm", g_flash.dir, f);
+        FILE *o = fopen(path, "wb");
+        if (o) {
+            const uint8_t *px = ((__bridge id<MTLBuffer>)g_flash.thumb[k]).contents;
+            fprintf(o, "P6\n%d %d\n255\n", FLASH_W, FLASH_H);
+            for (int i = 0; i < FLASH_W * FLASH_H; i++) fwrite(px + 4 * i, 1, 3, o);
+            fclose(o);
+        }
+        snprintf(path, sizeof path, "%s/frame_%u.txt", g_flash.dir, f);
+        o = fopen(path, "w");
+        if (!o) continue;
+        const uint32_t *n = ((__bridge id<MTLBuffer>)g_flash.counts[k]).contents;
+        fprintf(o, "frame %u (%s): strong red %u, green %u, blue %u pixels of %d\n", f, why, n[0], n[1], n[2], FLASH_W * FLASH_H);
+        uint64_t a = g_flash.start[f % FLASH_FRAMES], b = f + 1 < g_flash.frame ? g_flash.start[(f + 1) % FLASH_FRAMES] : g_flash.ndraws;
+        if (g_flash.ndraws - a > FLASH_DRAWS) { fprintf(o, "(its draws are gone from the ring)\n"); fclose(o); continue; }
+        for (uint64_t i = a; i < b; i++) {
+            const flash_draw *d = &g_flash.draws[i % FLASH_DRAWS];
+            if (d->kind) fprintf(o, "%llu dispatch cs %08x", (unsigned long long)(i - a), d->ps);
+            else fprintf(o, "%llu draw vs %08x ps %08x rt %08x f%u depth %08x", (unsigned long long)(i - a), d->vs, d->ps, d->rt, d->rt_format, d->depth);
+            for (int j = 0; j < 6 && d->srv[j]; j++) fprintf(o, " t%u:%07x", d->srv[j] >> 27, d->srv[j] & 0x7ffffff);
+            fputc('\n', o);
+        }
+        fclose(o);
+    }
+    vx_log("flash capture: frames %u-%u written to %s (%s)", from, to, g_flash.dir, why);
+}
+void d3d_flash_frame(d3d_device *dev, d3d_texture *t, d3d_texture *dst, const uint32_t *box) {
+    if (!flash_on() || dst->desc[TD_USAGE] != 3 || (box && box[0]) || t->desc[TD_WIDTH] < 1024 || t->desc[TD_SAMPLES] > 1) return;
+    d3d_context *c = (d3d_context *)dev->context;
+    uint32_t f = g_flash.frame++;
+    g_flash.start[g_flash.frame % FLASH_FRAMES] = g_flash.ndraws;
+    // A frame flagged by the GPU (counted a frame or two ago), or the file "now": the frames around it, written.
+    uint32_t flagged = __atomic_exchange_n(&g_flash.flagged, 0, __ATOMIC_ACQ_REL);
+    char now[1024];
+    snprintf(now, sizeof now, "%s/now", g_flash.dir);
+    if (flagged) flash_write(flagged - 1 > 3 ? flagged - 4 : 0, f ? f - 1 : 0, "strong colour");
+    else if (f % 30 == 0 && !access(now, F_OK)) { unlink(now); flash_write(f > 8 ? f - 8 : 0, f ? f - 1 : 0, "asked for"); }
+    id<MTLDevice> mdev = (__bridge id<MTLDevice>)dev->mtl;
+    if (!g_flash.pso) {
+        static const char *msl =
+            "#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void flash_thumb(texture2d<float> src [[texture(0)]], device uchar4 *out [[buffer(0)]], device atomic_uint *n [[buffer(1)]],\n"
+            "                        uint2 id [[thread_position_in_grid]]) {\n"
+            "    const uint2 size = uint2(512, 256);\n"
+            "    if (id.x >= size.x || id.y >= size.y) return;\n"
+            "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+            "    float2 uv = (float2(id) + 0.5) / float2(size), d = 0.25 / float2(size);\n"
+            "    float3 c = (src.sample(s, uv + float2(-d.x, -d.y)).rgb + src.sample(s, uv + float2(d.x, -d.y)).rgb +\n"
+            "                src.sample(s, uv + float2(-d.x, d.y)).rgb + src.sample(s, uv + float2(d.x, d.y)).rgb) * (255.0 / 4.0);\n"
+            "    c = clamp(c, 0.0, 255.0);\n"
+            "    out[id.y * size.x + id.x] = uchar4(uchar3(c), 255);\n"
+            "    if (c.r - max(c.g, c.b) > 90 && c.r > 140) atomic_fetch_add_explicit(&n[0], 1, memory_order_relaxed);\n"
+            "    if (c.g - max(c.r, c.b) > 60 && c.g > 110) atomic_fetch_add_explicit(&n[1], 1, memory_order_relaxed);\n"
+            "    if (c.b - max(c.r, c.g) > 70 && c.b > 120) atomic_fetch_add_explicit(&n[2], 1, memory_order_relaxed);\n"
+            "}\n";
+        NSError *err = nil;
+        id<MTLLibrary> lib = [mdev newLibraryWithSource:@(msl) options:nil error:&err];
+        id<MTLComputePipelineState> pso = lib ? [mdev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"flash_thumb"] error:&err] : nil;
+        if (!pso) { vx_log("flash capture: %s", err.localizedDescription.UTF8String); g_flash.on = 0; return; }
+        g_flash.pso = (void *)CFBridgingRetain(pso);
+    }
+    int k = f % FLASH_FRAMES;
+    if (!g_flash.thumb[k]) {
+        g_flash.thumb[k] = (void *)CFBridgingRetain([mdev newBufferWithLength:FLASH_W * FLASH_H * 4 options:MTLResourceStorageModeShared]);
+        g_flash.counts[k] = (void *)CFBridgingRetain([mdev newBufferWithLength:16 options:MTLResourceStorageModeShared]);
+    }
+    g_flash.done[k] = 0;
+    memset(((__bridge id<MTLBuffer>)g_flash.counts[k]).contents, 0, 16);
+    d3d_end_render(c);
+    id<MTLCommandBuffer> cmd = (__bridge id<MTLCommandBuffer>)d3d_context_cmd(c);
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)g_flash.pso];
+    [enc setTexture:(__bridge id<MTLTexture>)t->mtl atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)g_flash.thumb[k] offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)g_flash.counts[k] offset:0 atIndex:1];
+    [enc dispatchThreads:MTLSizeMake(FLASH_W, FLASH_H, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    [enc endEncoding];
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        const uint32_t *n = ((__bridge id<MTLBuffer>)g_flash.counts[k]).contents;
+        int jump = 0;                                           // (a frame much more coloured than the one before)
+        for (int i = 0; i < 3; i++) if (n[i] >= 300 && n[i] > 4 * g_flash.last_counts[i] + 100 && g_flash.last_frame + 1 == f) jump = 1;
+        memcpy(g_flash.last_counts, n, sizeof g_flash.last_counts);
+        g_flash.last_frame = f;
+        __atomic_store_n(&g_flash.done[k], f + 1, __ATOMIC_RELEASE);
+        if (jump && g_flash.dumps < 12 && (!g_flash.dumps || f > g_flash.last_dump + 120)) {
+            g_flash.dumps++; g_flash.last_dump = f;
+            __atomic_store_n(&g_flash.flagged, f + 1, __ATOMIC_RELEASE);
+        }
+    }];
+}
 // Sets everything a draw needs; returns the encoder, or nil when the draw cannot happen.
 // VXRT_TRACE_DRAWS=file: once that file exists, the next 300 draws are logged (shaders, targets, textures bound).
 static void trace_draw(d3d_context *c, d3d_draw_state *s) {
@@ -1197,6 +1345,7 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
     d3d_draw_state *s = state_of(c);
     if (!s->shader[STAGE_VS]) return nil;
     trace_draw(c, s);
+    flash_note(c, s, 0);
     if (s->gs_vertices) *type = MTLPrimitiveTypeTriangle;   // a geometry kernel's output
     else switch (s->topology) {
     case 1: *type = MTLPrimitiveTypePoint; break;
@@ -1647,6 +1796,7 @@ static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) 
     d3d_draw_state *s = state_of(c);
     d3d_shader *cs = s->shader[STAGE_CS];
     if (!cs || !x || !y || !z) return;
+    flash_note(c, s, 1);
     if (!cs->compute) {
         if (!shader_function(cs)) return;              // did not compile
         NSError *err = nil;

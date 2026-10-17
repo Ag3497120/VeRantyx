@@ -913,6 +913,7 @@ static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint
     [blit endEncoding];
     d3d_mark_gpu(c, dst); d3d_mark_gpu(c, src);
     if (dst->kind == K_TEXTURE) d3d_shared_written(c->base.dev, (d3d_texture *)dst);
+    if (dst->kind == K_TEXTURE) d3d_flash_frame(c->base.dev, (d3d_texture *)src, (d3d_texture *)dst, box);
 }
 
 // Uploads go through a temporary buffer and a blit, so they land in order with the other recorded work. Rows
