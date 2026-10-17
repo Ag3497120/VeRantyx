@@ -100,7 +100,7 @@ fi
 [[ -n "${VXRT_VR_RENDER_SCALE:-}" ]] && export VERANTYX_RENDER_SCALE="$VXRT_VR_RENDER_SCALE"
 # VERANTYX_ALVR=1: the stream goes to the ALVR client apps (Quest, Pico, the Vision Pro's "ALVR") through ALVR's own
 # streaming core (ALVRBridge/README.md), built here the first time (Rust); SteamVR's display rate is the one the last
-# ALVR headset asked for (90 Hz before any).
+# ALVR headset asked for (90 Hz before any). VERANTYX_ALVR_WIRED=1 as well: a headset on a USB cable (adb; README.md).
 if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
     ALVR_LIB="$REPO_ROOT/ALVRBridge/target/release/libverantyx_alvr_bridge.dylib"
     if [[ ! -f "$ALVR_LIB" || -n "$(find "$REPO_ROOT/ALVRBridge/src" -newer "$ALVR_LIB" -name '*.rs' 2>/dev/null)" ]]; then

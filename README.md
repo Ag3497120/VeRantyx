@@ -133,7 +133,21 @@ Not tested on either yet – we have neither. If you do, a report helps a lot, w
    tracking, audio, vibration), how smooth it was, and, if something failed,
    `~/Library/Application Support/VeRantyx/ALVR/session_log.txt` and `logs/hardware-encoder.log`.
 
-USB (wired) streaming is not wired up yet: use Wi-Fi.
+**Over a USB cable** (when Wi-Fi drops the resolution or makes the controllers lag): ALVR's wired connection, which
+forwards its ports through adb, as its dashboard's "Wired Connection" switch does.
+
+1. Turn on developer mode for the headset (the Meta Horizon phone app: Devices > Headset settings > Developer mode).
+2. Install adb on the Mac: `brew install android-platform-tools` (without it, ALVR downloads Google's platform-tools
+   itself into `~/Library/Application Support/VeRantyx/ALVR/` the first time).
+3. Connect the headset with a USB-C cable (USB 3 if you can), put it on and allow USB debugging for this Mac.
+4. Start the game with `VERANTYX_ALVR_WIRED=1` as well:
+   ```bash
+   VERANTYX_ALVR=1 VERANTYX_ALVR_WIRED=1 scripts/launch_vxrt_alyx.sh
+   ```
+   ALVR starts its app on the headset by itself and streams over the cable (TCP). Without `VERANTYX_ALVR_WIRED=1` it
+   is Wi-Fi again.
+
+Checked only with a stand-in for the headset (the next section's mock behind an adb that tunnels), not a real Quest yet.
 
 ## Status and limits (vxrt version)
 

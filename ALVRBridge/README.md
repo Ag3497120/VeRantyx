@@ -49,6 +49,15 @@ encoder's device (above; the probe has none), HEVC, no server-side foveation, TC
 of a new client ends once ("Cannot restart SteamVR": the settings it brought need a restart there is no dashboard
 for); it connects again by itself.
 
+## Over a USB cable
+
+`VERANTYX_ALVR_WIRED=1` puts ALVR's wired client (`client.wired`, trusted) into the session, as its dashboard's Wired
+Connection switch does; without it the entry is taken out again. ALVR's server core then, every second, looks for a
+device with `adb devices -l` (adb from PATH, else the platform-tools it downloads from Google into the session's
+folder), forwards ports 9943 and 9944 to it (`adb forward`), finds its ALVR app (`alvr.client` from the store or
+`alvr.client.stable` from GitHub), starts it if it is not running, and once it runs in front connects to it at
+127.0.0.1, streaming over TCP. Wi-Fi discovery goes on beside it.
+
 ## Checked (2026-10-17)
 
 - `alvr_server_core` and `alvr_client_mock` build on a MacBook Pro M1 Max with Rust 1.99.1, ALVR unchanged (with its
@@ -56,6 +65,11 @@ for); it connects again by itself.
 - `alvr_client_mock` on another Mac (the MacBook Air, the same network; one Mac cannot run both: client and server
   both take port 9943) found the probe, connected, sent its views and 4677 tracking samples in 23 s, and received the
   test stream at 72 frames a second with no network drops. (It does not decode, so it keeps asking for IDRs.)
+- The wired path, with no headset: an `adb` on PATH that answers for a Quest 3 and does `adb forward` as an ssh tunnel
+  to the Air, where `alvr_client_mock` ran; Wi-Fi discovery off and the Air's Wi-Fi entries removed, so only the
+  wired one could connect. The probe listed the device, forwarded 9943 and 9944, found `alvr.client.stable` running
+  and resumed, connected to 127.0.0.1 (the session's `client.wired`, current_ip 127.0.0.1) and got 4534 tracking
+  samples in 25 s.
 - The Vision Pro's ALVR app (App Store, built on ALVR 20.14.1) connected over Wi-Fi: real head poses (seated, about
   1.03 m) and the left hand's, 6480 frames sent with 2 IDRs asked for (the mock asks hundreds: it does not decode), so
   the headset decoded the stream. It asked for 2144 x 2048 per eye at 90 Hz; the probe now streams at the rate the

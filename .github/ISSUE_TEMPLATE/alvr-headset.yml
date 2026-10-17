@@ -31,7 +31,7 @@ body:
         - label: Vibration in the controllers
   - type: input
     id: smooth
-    attributes: {label: "How smooth (and Wi-Fi: 5 GHz? channel width?)", placeholder: "smooth / small stutters / unplayable; 5 GHz 80 MHz"}
+    attributes: {label: "How smooth, and how connected (USB cable, or Wi-Fi: 5 GHz? channel width?)", placeholder: "smooth / small stutters / unplayable; USB cable / 5 GHz 80 MHz"}
   - type: textarea
     id: notes
     attributes: {label: "What went wrong, or anything strange"}

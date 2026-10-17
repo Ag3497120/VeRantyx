@@ -34,7 +34,8 @@ use std::{
 
 pub fn layout(config_dir: Option<PathBuf>) -> alvr_filesystem::Layout {
     let dir = config_dir.unwrap_or_else(|| PathBuf::from(env::var("HOME").unwrap()).join("Library/Application Support/VeRantyx/ALVR"));
-    alvr_filesystem::Layout { config_dir: dir.clone(), log_dir: dir, ..Default::default() }
+    // (executables_dir: where ALVR puts the adb it downloads for a wired headset when there is none on PATH)
+    alvr_filesystem::Layout { config_dir: dir.clone(), log_dir: dir.clone(), executables_dir: dir, ..Default::default() }
 }
 
 // The session for the Mac, written before ALVR reads it (it reads it once): clients trusted as they come (there is no
@@ -64,6 +65,20 @@ pub fn prepare_session(layout: &alvr_filesystem::Layout) {
         }
         _ => ss["audio"]["game_audio"]["enabled"] = false.into(),
     }
+    // (a headset on a USB cable, VERANTYX_ALVR_WIRED=1: the entry ALVR's dashboard adds with its Wired Connection
+    //  switch. ALVR then forwards its two ports with adb to the headset's ALVR app, starts the app, and streams over
+    //  the cable as TCP to localhost; adb from PATH, else ALVR downloads Google's platform-tools once.)
+    let wired = "client.wired"; // (alvr_sockets::WIRED_CLIENT_HOSTNAME)
+    if env::var("VERANTYX_ALVR_WIRED").is_ok_and(|v| v == "1") {
+        if s["client_connections"].get(wired).is_none() {
+            s["client_connections"][wired] = serde_json::json!({
+                "display_name": "Wired", "current_ip": null, "manual_ips": [], "trusted": true,
+                "connection_state": "Disconnected" });
+        }
+    } else if let Some(clients) = s["client_connections"].as_object_mut() {
+        clients.remove(wired);
+    }
+    let ss = &mut s["session_settings"];
     ss["video"]["preferred_codec"]["variant"] = "Hevc".into();
     ss["video"]["foveated_encoding"]["enabled"] = false.into();
     fs::write(&path, serde_json::to_string_pretty(&s).unwrap()).unwrap();
