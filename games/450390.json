@@ -45,6 +45,7 @@
     }
   ],
   "notes": [
-    "2026-10-15: level controls (20261015T011747Z-thelab-title, VXRT_NO_WINE=1); playable needs a playtest (tools/vxrt_playtest.py 450390)."
+    "2026-10-15: level controls (20261015T011747Z-thelab-title, VXRT_NO_WINE=1); playable needs a playtest (tools/vxrt_playtest.py 450390).",
+    "2026-10-17: on the ARM64 runtime (VXRT_ARM64=1, the program translated by VXRuntime's own translator): the title scenario runs 150 s at 52.7-56.4 fps (Rosetta 59.4-59.6, alternating runs 20261017T0854-0901), after b3b2368 and eff0df3; one run of two ended early, and Mono reports its collation tables broken there (VXRuntime/TRANSLATOR.md)."
   ]
 }

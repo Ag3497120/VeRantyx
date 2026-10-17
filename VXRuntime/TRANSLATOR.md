@@ -404,7 +404,31 @@ instructions computing all six flags), a candidate for flags computed only when 
 | 2 Integer translator + differential tests | integer and flag instructions match Rosetta on random inputs (2a, done: 154 forms); control flow, blocks, string instructions, RCL/RCR, SHLD/SHRD, atomics with LSE (2b, done: 224 forms and random programs); small PE tests run translated in-process (with phase 4) |
 | 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs): 3a SSE/SSE2 done (128 forms); 3b AVX/AVX2/FMA/SSE3-4.1/AES done (785 forms with 3a's); 3c MXCSR modes and flags, x87 (with the transcendentals) done |
 | 4 Runtime on ARM64 + execution environment | 4a engine (cache, linking, indirect lookup, return ring, traps, CPUID/RDTSC/XGETBV, ordered mode) done, 1.3-3.1x Rosetta's time on the kernels; then `make check` passes translated; in-process vs. vCPU measured on SteamVR and a game |
-| 5 Games | SteamVR, The Lab (Mono JIT), Earth, Alyx at level `controls` with fps at least Rosetta's |
+| 5 Games | SteamVR, The Lab (Mono JIT), Earth, Alyx at level `controls` with fps at least Rosetta's — started 2026-10-17: Earth VR runs (57.8 fps, 2026-10-16); The Lab runs its 150 s title scenario at 52.7-56.4 fps (Rosetta 59.4-59.6), not yet reliably (one run of two ended early) and with Mono's collation tables reported broken; Alyx needs the vCPU (LuaJIT wants memory below 2 GB) |
 
 Machine code written at run time is allowed here, and only here: the translator's code emitter (AOT cache and JIT).
 Everything else in VXRuntime keeps the rule in AGENTS.md.
+
+## The Lab on the ARM64 runtime (2026-10-17)
+
+Unity with Mono's JIT was the first program here whose code changes while it runs, all the time: Mono writes new
+methods next to old ones and patches call sites in code it is running, so its pages soon become checked ones (a block
+compares its bytes at its start). What it found:
+
+- A return into a checked block went through the return-address ring straight into the middle of the block's old
+  translation, past the check: Mono's char.ToLower and TextInfo.ToLower then called each other until the stack ran out
+  (the stack showed one function's return address in the other's frame). A call in a checked block now puts no x86
+  address in the ring (its return goes through the lookup to code made from the bytes there now), and a block
+  forgotten as stale, or code freed, clears the rings (b3b2368).
+- With that, Unity's heap came apart about 40 s in (List.EnsureCapacity on a null list, allocator headers garbage).
+  Bisected over the translator's commits (b3b2368 applied to each): add02ef's self-linked sites, only in checked
+  blocks. Not linked there now (eff0df3); why the two together break is not found yet.
+- Left: Mono reports its collation tailoring table broken for the invariant culture (a managed check in
+  Mono.Globalization.Unicode.SimpleCollator; not with Rosetta), and one run of two ended early. The forms are
+  identical to Rosetta in the ordered mode too (difftest DT_ORDERED, now part of translator-check), and random
+  programs as well, so the cause is in something those do not cover.
+
+Tools made for it: `VXRT_TRACE_FAULTS=1` logs each fault with RSP, the stack's range and the code addresses above RSP
+(module+offset, or JIT code); `VXRT_TRACE_FAULTS_DUMP=<file>` writes the 8 KB of x86 code around RIP and the stack's
+last 4 KB (a disassembler takes the code as `.byte` lines assembled for x86_64 and `llvm-objdump --start-address`).
+
