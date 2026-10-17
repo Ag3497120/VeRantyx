@@ -72,10 +72,6 @@
   },
   "known_issues": [
     {
-      "summary": "Some surfaces (distant fences, foliage shadows, bottles) glow or smear green in the headset; cause not known yet (stream packet loss or the shader translator)",
-      "since": "2026-10-14"
-    },
-    {
       "summary": "VXRT_VR_QUALITY=max: 16-21 fps (the 3k preset holds 60)",
       "since": "2026-10-14"
     },
@@ -86,7 +82,8 @@
   ],
   "notes": [
     "Needs -vr (scripts/launch_vxrt_alyx.sh passes it); without it the game starts in desktop mode.",
-    "2026-10-14: played in the headset at 3k through a2_quarantine_entrance -> a2_pistol (the level change that crashed before 8d10cfb); saves 2.5-6.2 MB."
+    "2026-10-14: played in the headset at 3k through a2_quarantine_entrance -> a2_pistol (the level change that crashed before 8d10cfb); saves 2.5-6.2 MB.",
+    "2026-10-17: fences, foliage, fog and bottles that lit in one strong colour (red, green or blue) for single frames were reads beyond a constant buffer smaller than the shader declares (shader a10a2d66: cb3 37 float4s, 1 bound), fixed in 89e32a8; played on the MacBook Air without them, VXRT_FLASH_CAPTURE caught none in the game (before: 7 in about 90 s in the same rooms)."
   ],
   "tuned": {
     "Apple M1 Max, 32-core GPU": {
