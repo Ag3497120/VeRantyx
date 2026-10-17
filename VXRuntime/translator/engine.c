@@ -339,6 +339,7 @@ void xe_forget(xe *e, uint64_t addr, uint64_t len) {
         if (r->protected) mprotect((void *)(uintptr_t)pg, PAGE, PROT_READ | PROT_WRITE);
         r->protected = 0;
     }
+    for (int i = 0; i < e->nrings; i++) ring_clear(e->rings[i]);          // (returns into code that is gone: the lookup)
     pthread_mutex_unlock(&e->lock);
 }
 void xe_set_smc(xe *e, int on) { e->smc = on; }
@@ -363,9 +364,10 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
         }
         if (xlat_block_linked(&b, rip, once ? 1 : 64, &end) < 0) { free(b.code); free(b.relocs); free(b.imap); return -1; }
     }
-    if (e->used + b.n > e->cap || e->stats.blocks + 1 >= (1u << (MAP_BITS - 1))) {   // (full: start over)
+    if (e->used + b.n > e->cap || e->nblocks + 1 >= (1u << (MAP_BITS - 1))) {   // (full: start over; nblocks: since the last)
         xe_flush(e);
         e->stats.flushes++;
+        fprintf(stderr, "[vxrt] engine: translation cache full (%zu words, %llu blocks): flushed (%llu)\n", e->used, (unsigned long long)e->stats.blocks, (unsigned long long)e->stats.flushes);
     }
     uint32_t *at = e->code + e->used;
     uint32_t *self[16]; int nself = 0;                                    // (sites to this block itself: a loop, a recursive
@@ -486,6 +488,7 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
             pthread_mutex_lock(&e->lock);
             mentry *m = find_entry(e, c->rip);
             if (m) forget_block(e, m->id);
+            for (int i = 0; i < e->nrings; i++) ring_clear(e->rings[i]);   // (returns into it: through the lookup)
             pthread_mutex_unlock(&e->lock);
         }
     }

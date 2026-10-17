@@ -1397,9 +1397,13 @@ static void ras_step(xlat_buf *b, int up) {                               // X29
 // CALL: the x86 return address (in ret) and where translated code goes on after the call (the BL's return) into the
 // ring, then BL to the target (direct: through the call-link stub until linked; indirect: S1, the lookup stub), so
 // that the host's return prediction follows; then the site of the return address.
+// In a checked block (code that changes: check_bytes) the entry's x86 address is 0, which no return matches: the
+// return goes through the lookup to a block made from the bytes there now. (A return into the block itself would skip
+// its check, which is only at its start: Mono's JIT patches call sites in code it is running, and a return into the
+// old translation ran the old code; The Lab recursed until its stack ran out.)
 static void site_call(xlat_buf *b, int ret, uint64_t next, int direct, uint64_t target) {
     E(b, a64_adr(S0, 5 * 4));                                             // (the instruction after the BL)
-    E(b, a64_stp(ret, S0, XS, 0)); ras_step(b, 1);
+    E(b, a64_stp(b->check_bytes ? 31 : ret, S0, XS, 0)); ras_step(b, 1);   // (31: XZR)
     reloc(b, direct ? XR_CALL : XR_LOOKUP_CALL); E(b, 0);
     site_link(b, next);
     if (direct) { E(b, (uint32_t)target); E(b, (uint32_t)(target >> 32)); }

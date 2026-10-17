@@ -349,6 +349,28 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
                (unsigned long long)rip, m ? m->name : "?", m ? (unsigned long long)(rip - (uint64_t)(uintptr_t)m->base) : 0ull,
                (unsigned long long)pc, si->si_addr, (unsigned long long)esr, (unsigned long long)ss->__x[4],
                *(void **)(teb + TEB_STACK_LIMIT), *(void **)(teb + TEB_STACK_BASE));
+        // (and the words above RSP that look like code addresses: a recursion shows its return addresses repeating)
+        int64_t sp_delta; xe_rip_sp_at(g_engine, pc, &sp_delta);
+        uint64_t from = ss->__x[4] + (uint64_t)sp_delta, limit = (uint64_t)(uintptr_t)*(void **)(teb + TEB_STACK_LIMIT);
+        const uint64_t *w = (const uint64_t *)(uintptr_t)(from < limit ? limit : from);   // (below the limit: unmapped)
+        char line[1024]; size_t k = 0;
+        for (int i = 0; i < 160 && k < sizeof line - 40; i++)
+            if ((uint64_t)(uintptr_t)(w + i) < (uint64_t)(uintptr_t)*(void **)(teb + TEB_STACK_BASE) && w[i] > 0x100000000ull && w[i] < 0x800000000000ull &&
+                (vx_image_at(w[i]) || (w[i] > rip - (16u << 20) && w[i] < rip + (16u << 20))))   // (a module's, or near rip: JIT code)
+            { const vx_image *im = vx_image_at(w[i]);
+                if (im) k += (size_t)snprintf(line + k, sizeof line - k, " +%d:%s+%#llx", i * 8, im->name, (unsigned long long)(w[i] - (uint64_t)(uintptr_t)im->base));
+                else k += (size_t)snprintf(line + k, sizeof line - k, " +%d:%#llx", i * 8, (unsigned long long)w[i]); }
+        vx_log("arm64: code addresses above rsp:%s", line);
+        const char *dump = getenv("VXRT_TRACE_FAULTS_DUMP");      // (the 8 KB of x86 code around rip, raw, for a disassembler)
+        if (dump && *dump) {
+            FILE *f = fopen(dump, "wb");
+            if (f) { fwrite((const void *)(uintptr_t)((rip & ~0xFFFull) - 0x1000), 1, 0x2000, f); fclose(f); }
+            vx_log("arm64: x86 code %#llx-%#llx written to %s", (unsigned long long)((rip & ~0xFFFull) - 0x1000), (unsigned long long)((rip & ~0xFFFull) + 0x1000), dump);
+            char sp_path[1100]; snprintf(sp_path, sizeof sp_path, "%s.stack", dump);   // (and the stack's last 4 KB)
+            f = fopen(sp_path, "wb");
+            if (f) { fwrite(w, 1, 4096, f); fclose(f); }
+            vx_log("arm64: stack %p-%p written to %s", (void *)w, (void *)(w + 512), sp_path);
+        }
     }
     if (rip && t_ctx && (sig == SIGSEGV || sig == SIGBUS)) {
         // The program's access fault: its state from the registers the translation keeps it in, then on (out of
