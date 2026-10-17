@@ -72,6 +72,8 @@ EOF
 # VXRT_VR_QUALITY=max: the game renders 3200x3600 per eye (as many pixels as a Vision Pro eye's display, about 11.5
 # megapixels) and the stream is 3840x2160 (1920x2160 per eye: what one HEVC session and Wi-Fi can carry at 60 fps);
 # otherwise as 3k. Expect a much lower frame rate than 2.5k (1.6 times its pixels).
+# (a variable: braces inside ${VAR:-default} end it early, and a set VAR came out with one "}" too many)
+NO_THROTTLE='{"steamvr": {"framesToThrottle": 0, "additionalFramesToPredict": 0}}'
 if [[ "${VXRT_VR_QUALITY:-}" == max ]]; then
     VXRT_VR_RENDER_SCALE="${VXRT_VR_RENDER_SCALE:-4.0}"
     export VERANTYX_DISPLAY_SCALE="${VERANTYX_DISPLAY_SCALE:-2.4}"
@@ -93,7 +95,7 @@ if [[ "${VXRT_VR_QUALITY:-}" == 3k ]]; then
     export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-60}"
     # SteamVR does not hold the game back by whole frames when it misses one (it switched into that mode now and
     # then: 45 fps fell to 30 for the rest of the run).
-    VXRT_VR_SETTINGS="${VXRT_VR_SETTINGS:-{\"steamvr\": {\"framesToThrottle\": 0, \"additionalFramesToPredict\": 0}}}"
+    VXRT_VR_SETTINGS="${VXRT_VR_SETTINGS:-$NO_THROTTLE}"
 fi
 [[ -n "${VXRT_VR_RENDER_SCALE:-}" ]] && export VERANTYX_RENDER_SCALE="$VXRT_VR_RENDER_SCALE"
 # VERANTYX_ALVR=1: the stream goes to the ALVR client apps (Quest, Pico, the Vision Pro's "ALVR") through ALVR's own
@@ -113,7 +115,7 @@ if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
     # SteamVR does not hold the game back by whole frames when it misses the headset's rate (as with the 3k preset):
     # on a MacBook Air M5, Half-Life: Alyx at ALVR's defaults ran some 31 fps either way, and the user found it
     # smoother this way although it ran second (fanless, warmer), 2026-10-17. On the M1 Max no difference (60.0/59.0).
-    VXRT_VR_SETTINGS="${VXRT_VR_SETTINGS:-{\"steamvr\": {\"framesToThrottle\": 0, \"additionalFramesToPredict\": 0}}}"
+    VXRT_VR_SETTINGS="${VXRT_VR_SETTINGS:-$NO_THROTTLE}"
     # (ALVR writes its log anew each start: the last one kept, session_log.prev.txt)
     ALVR_LOG="$HOME/Library/Application Support/VeRantyx/ALVR/session_log.txt"
     [[ -s "$ALVR_LOG" ]] && mv -f "$ALVR_LOG" "${ALVR_LOG%.txt}.prev.txt"
