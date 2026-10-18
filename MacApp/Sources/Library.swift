@@ -18,7 +18,7 @@ struct Title: Identifiable, Hashable {
     var bytes: Int64        // about, as Steam installs it (for the space check)
     var free: Bool
     var exe: String?        // the game's executable (nil: Half-Life: Alyx, which has its own launcher)
-    var summary: (en: String, ja: String)
+    var summary: String     // in the app's language
     var works: Bool         // played through in a headset (games/<appid>.json: "works"), not only measured
 
     static func == (a: Title, b: Title) -> Bool { a.id == b.id }
@@ -27,14 +27,16 @@ struct Title: Identifiable, Hashable {
     static let steamVR = "250820"
     static let all: [Title] = [
         Title(id: steamVR, name: "SteamVR", bytes: 5_820_607_244, free: true, exe: nil,
-              summary: ("Needed for every game. Free.", "どのゲームにも必要です。無料。"), works: true),
+              summary: T("Needed for every game. Free.", "どのゲームにも必要です。無料。"), works: true),
         Title(id: "546560", name: "Half-Life: Alyx", bytes: 73_476_413_180, free: false, exe: nil,
-              summary: ("Plays in the headset, levels and saves included. 60 fps with the 3K preset on an M1 Max.",
-                        "ヘッドセットでプレイ済み（ステージの切り替えとセーブも）。M1 Max で 3K 設定 60 fps。"), works: true),
+              summary: T("Plays in the headset, levels and saves included. 60 fps with the 3K preset on an M1 Max.",
+                         "ヘッドセットでプレイ済み（ステージの切り替えとセーブも）。M1 Max で 3K 設定 60 fps。"), works: true),
         Title(id: "450390", name: "The Lab", bytes: 16_625_763_869, free: true, exe: "TheLab.exe",
-              summary: ("Runs (title scene about 55 fps); not played through yet. Free.", "動作（タイトル場面 約 55 fps）。通しのプレイはまだ。無料。"), works: false),
+              summary: T("Runs (title scene about 55 fps); not played through yet. Free.",
+                         "動作（タイトル場面 約 55 fps）。通しのプレイはまだ。無料。"), works: false),
         Title(id: "348250", name: "Google Earth VR", bytes: 2_996_347_031, free: true, exe: "Earth.exe",
-              summary: ("Runs (terrain and labels, about 57 fps); not played through yet. Free.", "動作（地形とラベル、約 57 fps）。通しのプレイはまだ。無料。"), works: false),
+              summary: T("Runs (terrain and labels, about 57 fps); not played through yet. Free.",
+                         "動作（地形とラベル、約 57 fps）。通しのプレイはまだ。無料。"), works: false),
     ]
     static func named(_ id: String) -> Title? { all.first { $0.id == id } }
 }
@@ -142,11 +144,11 @@ enum Library {
     /// Copies an app from another Steam library into vxrt_steam: as an APFS clone on the same disk (no extra space,
     /// immediate; the source is only read), else as a copy. `progress` gets 0...1 while copying.
     static func importApp(_ app: SteamApp, from library: URL, progress: @escaping @Sendable (Double) -> Void) async throws {
-        guard let source = folder(app, in: library) else { throw Failure(T("\(app.name) is not in that folder", "\(app.name) はそのフォルダにありません")) }
+        guard let source = folder(app, in: library) else { throw Failure(TF("%@ is not in that folder", "%@ はそのフォルダにありません", app.name)) }
         let common = Paths.steamLibrary.appendingPathComponent("steamapps/common")
         try FileManager.default.createDirectory(at: common, withIntermediateDirectories: true)
         let dest = common.appendingPathComponent(app.installdir)
-        if FileManager.default.fileExists(atPath: dest.path) { throw Failure(T("\(app.name) is already there", "\(app.name) はもう入っています")) }
+        if FileManager.default.fileExists(atPath: dest.path) { throw Failure(TF("%@ is already there", "%@ はもう入っています", app.name)) }
         let partial = common.appendingPathComponent(".\(app.installdir).partial")
         try? FileManager.default.removeItem(at: partial)
         let sameDisk = Mac.volumeID(source) == Mac.volumeID(common) && Mac.volumeID(source) != nil

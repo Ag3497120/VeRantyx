@@ -200,7 +200,7 @@ struct SetupView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(model.drive.path).font(.system(.body, design: .monospaced)).lineLimit(1).truncationMode(.middle)
-                        Text(model.freeBytes.map { T("\(gigabytes($0)) free", "空き \(gigabytes($0))") } ?? "").font(.callout).foregroundStyle(.secondary)
+                        Text(model.freeBytes.map { TF("%@ free", "空き %@", gigabytes($0)) } ?? "").font(.callout).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Button(T("Change…", "変更…")) { model.chooseDrive() }.disabled(model.job != nil || model.play?.running == true)
@@ -225,7 +225,7 @@ struct SetupView: View {
                                     Text(t.name).fontWeight(.medium)
                                     if t.free { Chip(text: T("Free", "無料"), color: .blue) }
                                 }
-                                Text(T(t.summary.en, t.summary.ja)).font(.caption).foregroundStyle(.secondary)
+                                Text(t.summary).font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
                             Text(model.isInstalled(t.id) ? T("Installed", "インストール済み") : gigabytes(t.bytes)).font(.callout).foregroundStyle(.secondary)
@@ -257,7 +257,7 @@ struct SetupView: View {
                 }
             }
             Card(number: 5, title: T("Windows runtime files", "Windows のランタイムファイル"), done: model.redistCount > 0) {
-                Check(ok: model.redistCount > 0, text: model.redistCount > 0 ? T("\(model.redistCount) files ready", "\(model.redistCount) 個のファイルを用意済み") : T("Not gathered yet", "まだ集めていません"),
+                Check(ok: model.redistCount > 0, text: model.redistCount > 0 ? TF("%@ files ready", "%@ 個のファイルを用意済み", "\(model.redistCount)") : T("Not gathered yet", "まだ集めていません"),
                       note: T("Microsoft's runtime DLLs the games need, taken from the installers SteamVR and the games bring with them. Done by itself after a download or copy.",
                               "ゲームが必要とする Microsoft のランタイム DLL です。SteamVR やゲームに付いてくるインストーラーから取り出します。ダウンロードやコピーの後に自動で行います。")) {
                     Button(model.redistCount > 0 ? T("Gather again", "集め直す") : T("Gather", "集める")) { Task { await model.collect() } }
@@ -476,9 +476,9 @@ struct GameCard: View {
                 else if game.title != nil { Chip(text: T("Runs", "動作"), color: .blue) }
                 else { Chip(text: T("Not tested", "未検証"), color: .secondary) }
             }
-            Text(game.title.map { T($0.summary.en, $0.summary.ja) } ??
+            Text(game.title?.summary ??
                  (game.antiCheat.isEmpty ? T("Not tried on VeRantyx yet: it may not start. A report helps.", "VeRantyx ではまだ試されていません。起動しないかもしれません。報告が助けになります。")
-                                         : T("Uses \(game.antiCheat.joined(separator: ", ")); VeRantyx does not run games with anti-cheat.", "\(game.antiCheat.joined(separator: ", ")) を使うため、VeRantyx では起動しません。")))
+                                         : TF("Uses %@; VeRantyx does not run games with anti-cheat.", "%@ を使うため、VeRantyx では起動しません。", game.antiCheat.joined(separator: ", "))))
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
             HStack {
@@ -506,7 +506,7 @@ struct SessionCard: View {
     @State private var showLog = false
 
     var body: some View {
-        Card(title: play.running ? T("Playing \(play.title)", "\(play.title) をプレイ中") : T("\(play.title) has ended", "\(play.title) は終了しました")) {
+        Card(title: play.running ? TF("Playing %@", "%@ をプレイ中", play.title) : TF("%@ has ended", "%@ は終了しました", play.title)) {
             HStack(spacing: 18) {
                 Step(done: play.phase != .starting, active: play.phase == .starting, text: T("SteamVR", "SteamVR"))
                 Step(done: play.headsetConnected, active: play.running && !play.headsetConnected && play.phase != .starting,
@@ -649,6 +649,7 @@ struct HelpView: View {
     @Environment(AppModel.self) private var model
     @State private var log: (String, String)? = nil
     @State private var copied = false
+    @AppStorage("language") private var language = ""
 
     var body: some View {
         PageView(title: T("Help", "ヘルプ")) {
@@ -690,6 +691,19 @@ struct HelpView: View {
                     Button(T("Licenses", "ライセンス")) {
                         let url = Bundle.main.resourceURL!.appendingPathComponent("licenses")
                         NSWorkspace.shared.open(FileManager.default.fileExists(atPath: url.path) ? url : Paths.repoURL)
+                    }
+                }
+                Divider()
+                HStack {
+                    Picker(T("Language", "言語"), selection: $language) {
+                        Text(T("Automatic", "自動")).tag("")
+                        ForEach(Language.all, id: \.code) { Text($0.name).tag($0.code) }
+                    }
+                    .fixedSize()
+                    .onChange(of: language) { Language.choose(language) }
+                    if language != Language.chosenAtStart {
+                        Text(T("Takes effect when VeRantyx starts again.", "VeRantyx を開き直すと切り替わります。")).font(.callout).foregroundStyle(.secondary)
+                        Button(T("Restart", "開き直す")) { Language.relaunch() }.disabled(model.play?.running == true || model.job != nil)
                     }
                 }
             }

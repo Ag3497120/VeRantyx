@@ -3,7 +3,7 @@
 // Also, for testing without the window (development):
 //   VeRantyx --collect-redist              gathers the runtime DLLs as the app does (VXRT_REDIST: elsewhere)
 //   VeRantyx --play <app id> [seconds]     starts a game as the Play button does and reports what the app sees
-//   VeRantyx --snapshot <folder>           saves a picture of each page of the window
+//   VeRantyx --snapshot <folder>           saves pictures of each page of the window (scrolled: <page>-2.png, ...)
 import AppKit
 import SwiftUI
 
@@ -47,7 +47,7 @@ struct VeRantyxApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(replacing: .help) {
-                Link("VeRantyx on GitHub", destination: Paths.repoURL)
+                Link(T("VeRantyx on GitHub", "GitHub の VeRantyx"), destination: Paths.repoURL)
             }
         }
     }
@@ -116,10 +116,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for page in Page.allCases {
             model.page = page
             try? await Task.sleep(nanoseconds: 1_200_000_000)
-            guard let window = NSApp.windows.first(where: { $0.isVisible }),
-                  let image = createImage?(.null, 1 << 3, UInt32(window.windowNumber), 1 << 0 | 1 << 3)?.takeRetainedValue() else { continue }
-            try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("\(page.rawValue).png"))
+            guard let window = NSApp.windows.first(where: { $0.isVisible }) else { continue }
+            // (the page, then the rest of it a screen at a time: <page>-2.png, ...)
+            let scroll = window.contentView.flatMap { scrollViews(in: $0) }?.max { $0.frame.width < $1.frame.width }
+            var shot = 1
+            while true {
+                guard let image = createImage?(.null, 1 << 3, UInt32(window.windowNumber), 1 << 0 | 1 << 3)?.takeRetainedValue() else { break }
+                try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?
+                    .write(to: dir.appendingPathComponent(shot == 1 ? "\(page.rawValue).png" : "\(page.rawValue)-\(shot).png"))
+                guard let scroll, let document = scroll.documentView, shot < 6 else { break }
+                let visible = scroll.contentView.bounds
+                guard visible.maxY < document.frame.height - 1 else { break }
+                let y = min(visible.minY + visible.height * 0.9, document.frame.height - visible.height)
+                scroll.contentView.scroll(to: NSPoint(x: visible.minX, y: y))
+                scroll.reflectScrolledClipView(scroll.contentView)
+                shot += 1
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
         }
         NSApp.terminate(nil)
+    }
+
+    static func scrollViews(in view: NSView) -> [NSScrollView] {
+        (view as? NSScrollView).map { [$0] } ?? view.subviews.flatMap { scrollViews(in: $0) }
     }
 }

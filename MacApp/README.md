@@ -28,6 +28,20 @@ remembers the sign-in itself. Only the account name is kept (in the app's settin
 (`steamcdn-a.akamaihd.net`, the first time; Homebrew's is used if installed), the games from Steam, and with a USB
 cable Google's Android platform tools, which ALVR downloads once when there is no adb.
 
+## Languages
+
+English, Japanese, Korean, Simplified and Traditional Chinese, Spanish, French, German, Portuguese (Brazil), Russian
+and Italian. The app speaks the first of the Mac's preferred languages it has (English when none), or the one chosen
+in Help > About (the setting `language`; it applies when the app starts again, which the picker offers to do).
+
+Every text is written as `T("English", "日本語")` at its call site (`TF("Copying %@…", "%@ をコピー中…", name)` when it
+holds values: the English stays constant). The other languages are tables, `Localizations/<code>.json`, from the
+exact English text to its translation (`%@` as in the English; `%1$@`, `%2$@` to reorder); `build_app.sh` copies them
+into `Contents/Resources/Localizations`. `python3 MacApp/check_localizations.py` lists the texts a table lacks (and
+the ones no longer used, and placeholders that differ): run it after changing a text. To add a language: a new
+`Localizations/<code>.json` with every English text, its code and its own name in `Language.all`
+(`Sources/Base.swift`), and the code in `CFBundleLocalizations` (`Info.plist`).
+
 ## Build
 
 ```bash
@@ -59,6 +73,7 @@ the license and notice texts of the Rust crates in the ALVR bridge (`crate_licen
 VeRantyx.app/Contents/MacOS/VeRantyx --collect-redist          # gathers the runtime DLLs (VXRT_REDIST=<folder>: elsewhere)
 VeRantyx.app/Contents/MacOS/VeRantyx --play 546560 120         # starts a game as Play does, prints what the app sees
 VeRantyx.app/Contents/MacOS/VeRantyx --snapshot <folder>       # a PNG of each page
+VeRantyx.app/Contents/MacOS/VeRantyx -language ko --snapshot <folder>   # the same in another language
 ```
 
 ## Checked (2026-10-18)

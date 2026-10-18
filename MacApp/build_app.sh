@@ -42,6 +42,10 @@ sed -e "s/@VERSION@/$VERSION/" -e "s/@BUILD@/$BUILD/" "$MACAPP/Info.plist" > "$A
 rm -rf "$OUT/AppIcon.iconset"
 swift "$MACAPP/make_icon.swift" "$OUT/AppIcon.iconset"
 iconutil -c icns "$OUT/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
+# The translations beyond English and Japanese (MacApp/Localizations/<code>.json; check_localizations.py checks them).
+python3 "$MACAPP/check_localizations.py" >/dev/null || echo "warning: translations incomplete (python3 MacApp/check_localizations.py)" >&2
+mkdir -p "$APP/Contents/Resources/Localizations"
+cp "$MACAPP"/Localizations/*.json "$APP/Contents/Resources/Localizations/"
 
 # The runtime, laid out as in the repository: the scripts find everything where they look (REPO_ROOT is runtime/).
 mkdir -p "$RT/scripts" "$RT/VXRuntime/build" "$RT/build" "$RT/VRDriver" "$RT/ALVRBridge/target/release" "$RT/games"

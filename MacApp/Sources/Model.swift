@@ -165,8 +165,9 @@ struct Job {
         error = nil
         let need = ids.compactMap { Title.named($0)?.bytes }.reduce(0, +)
         if let free = Mac.freeSpace(drive), free < need + (5 << 30) {
-            error = T("Not enough space: these need about \(gigabytes(need)), \(gigabytes(free)) is free on that disk. Choose another place in step 3, or fewer games.",
-                      "空き容量が足りません。約 \(gigabytes(need)) 必要で、そのディスクの空きは \(gigabytes(free)) です。手順 3 で別の場所を選ぶか、ゲームを減らしてください。")
+            error = TF("Not enough space: these need about %@, %@ is free on that disk. Choose another place in step 3, or fewer games.",
+                       "空き容量が足りません。約 %@ 必要で、そのディスクの空きは %@ です。手順 3 で別の場所を選ぶか、ゲームを減らしてください。",
+                       gigabytes(need), gigabytes(free))
             return
         }
         do {
@@ -179,7 +180,7 @@ struct Job {
             showConsole = true
             for id in ids {
                 let name = Title.named(id)?.name ?? id
-                job = Job(title: T("Downloading \(name)…", "\(name) をダウンロード中…"))
+                job = Job(title: TF("Downloading %@…", "%@ をダウンロード中…", name))
                 let have = Library.apps(in: Paths.steamLibrary)[id].flatMap { Library.folder($0, in: Paths.steamLibrary) }
                 let dest = have ?? common.appendingPathComponent("app_\(id)")
                 try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
@@ -201,7 +202,7 @@ struct Job {
                 let acf = dest.appendingPathComponent("steamapps/appmanifest_\(id).acf")
                 guard status == 0, let m = Library.manifest(acf) else {
                     let said = console.lines.last { $0.contains("ERROR") || $0.contains("FAILED") } ?? ""
-                    throw Failure(T("steamcmd did not finish \(name) (exit \(status)). \(said)", "steamcmd が \(name) を完了しませんでした（終了コード \(status)）。\(said)"))
+                    throw Failure(TF("steamcmd did not finish %@ (exit %@). %@", "steamcmd が %@ を完了しませんでした（終了コード %@）。%@", name, "\(status)", said))
                 }
                 // (the first download goes to app_<id>: then named after the app's own folder, as Steam names it)
                 let final = common.appendingPathComponent(m.installdir)
@@ -240,7 +241,7 @@ struct Job {
         importChoice = nil
         error = nil
         for app in apps where !isInstalled(app.id) {
-            job = Job(title: T("Copying \(app.name)…", "\(app.name) をコピー中…"))
+            job = Job(title: TF("Copying %@…", "%@ をコピー中…", app.name))
             do {
                 try await Library.importApp(app, from: library) { p in Task { @MainActor in self.job?.progress = p } }
             } catch {

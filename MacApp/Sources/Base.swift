@@ -1,13 +1,83 @@
-// The app's ground: its words in two languages, where things are, and the small facts about this Mac it checks.
+// The app's ground: its words in several languages, where things are, and the small facts about this Mac it checks.
 import AppKit
 import Darwin
 import Foundation
 
 // MARK: - Words
 
-/// English, or Japanese when the Mac's first language is Japanese.
-let japanese = Locale.preferredLanguages.first?.hasPrefix("ja") ?? false
-func T(_ en: String, _ ja: String) -> String { japanese ? ja : en }
+/// The languages the app speaks. English and Japanese are written at each call site (`T(en, ja)`); the others are
+/// tables in Contents/Resources/Localizations/<code>.json, from the exact English text to its translation (MacApp/Localizations).
+enum Language {
+    /// Each language's code and its own name, in the order the picker shows them.
+    static let all: [(code: String, name: String)] = [
+        ("en", "English"), ("ja", "日本語"), ("ko", "한국어"), ("zh-Hans", "简体中文"), ("zh-Hant", "繁體中文"),
+        ("es", "Español"), ("fr", "Français"), ("de", "Deutsch"), ("pt-BR", "Português (Brasil)"), ("ru", "Русский"),
+        ("it", "Italiano"),
+    ]
+
+    /// The language chosen in Help ("language" in the app's settings; `-language <code>` on the command line), or else
+    /// the first of the Mac's preferred languages the app has; English when it has none of them.
+    static let current: String = {
+        if let chosen = UserDefaults.standard.string(forKey: "language"), let code = match(chosen) { return code }
+        for preferred in Locale.preferredLanguages { if let code = match(preferred) { return code } }
+        return "en"
+    }()
+
+    /// The app's language for a language identifier ("zh-TW" → zh-Hant, "pt-PT" → pt-BR, "es-419" → es), if it has one.
+    static func match(_ identifier: String) -> String? {
+        if all.contains(where: { $0.code == identifier }) { return identifier }
+        let language = Locale.Language(identifier: identifier)
+        guard let code = language.languageCode?.identifier else { return nil }
+        if code == "zh" {
+            let script = Locale.Language(identifier: language.maximalIdentifier).script?.identifier
+            return script == "Hant" ? "zh-Hant" : "zh-Hans"
+        }
+        if code == "pt" { return "pt-BR" }
+        return all.contains(where: { $0.code == code }) ? code : nil
+    }
+
+    /// The table of the current language (empty for English and Japanese, or when its file is missing).
+    static let table: [String: String] = {
+        guard current != "en" && current != "ja",
+              let url = Bundle.main.resourceURL?.appendingPathComponent("Localizations/\(current).json"),
+              let data = try? Data(contentsOf: url),
+              let table = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
+        return table
+    }()
+
+    /// The choice in the settings when the app started ("": automatic): the picker says a restart is needed when it differs.
+    static let chosenAtStart = UserDefaults.standard.string(forKey: "language") ?? ""
+
+    /// Starts the app again (a new instance, then this one quits), to speak the language chosen.
+    @MainActor static func relaunch() {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { _, error in
+            if error == nil { DispatchQueue.main.async { NSApp.terminate(nil) } }
+        }
+    }
+
+    /// Chooses a language for the next start ("" or nil: automatic). AppleLanguages too, so that the menus and the
+    /// panels macOS draws speak the same language.
+    static func choose(_ code: String?) {
+        if let code, !code.isEmpty {
+            UserDefaults.standard.set(code, forKey: "language")
+            UserDefaults.standard.set([code], forKey: "AppleLanguages")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "language")
+            UserDefaults.standard.removeObject(forKey: "AppleLanguages")
+        }
+    }
+}
+
+let japanese = Language.current == "ja"
+
+/// The text in the app's language: the Japanese given, the table's translation of the English, or the English.
+func T(_ en: String, _ ja: String) -> String { japanese ? ja : Language.table[en] ?? en }
+
+/// The same for a text with values in it: `%@` in the English and the Japanese (`%1$@`, `%2$@` when a translation
+/// puts them in another order), filled with `values`.
+func TF(_ en: String, _ ja: String, _ values: String...) -> String { String(format: T(en, ja), arguments: values) }
 
 /// An error with a message for the player.
 struct Failure: LocalizedError {
