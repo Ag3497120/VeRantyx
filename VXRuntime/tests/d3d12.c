@@ -7,6 +7,7 @@
 #define INITGUID
 #include <windows.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,6 +163,79 @@ static int draw_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
     return 0;
 }
 
+// Presenting: a window, a swap chain on the D3D12 queue (2 buffers, flip discard), three frames each clearing the
+// current back buffer to its own colour and presenting; the index must go 0 1 0 and buffer 0 hold frame 2's colour.
+static int present_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
+    WNDCLASSA wc = { 0 };
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "vxrt_d3d12_test";
+    RegisterClassA(&wc);
+    HWND hwnd = CreateWindowExA(0, "vxrt_d3d12_test", "D3D12 present", WS_OVERLAPPEDWINDOW, 0, 0, 160, 120, NULL, NULL, wc.hInstance, NULL);
+    if (!hwnd) { printf("present: no window\n"); return ++bad; }
+    IDXGIFactory4 *factory;
+    CHECK(CreateDXGIFactory2(0, &IID_IDXGIFactory4, (void **)&factory));
+    DXGI_SWAP_CHAIN_DESC1 sd = { 128, 96, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, { 1, 0 }, DXGI_USAGE_RENDER_TARGET_OUTPUT, 2,
+                                 DXGI_SCALING_STRETCH, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_ALPHA_MODE_UNSPECIFIED, 0 };
+    IDXGISwapChain1 *sc1;
+    CHECK(IDXGIFactory4_CreateSwapChainForHwnd(factory, (IUnknown *)queue, hwnd, &sd, NULL, NULL, &sc1));
+    IDXGISwapChain3 *sc;
+    CHECK(IDXGISwapChain1_QueryInterface(sc1, &IID_IDXGISwapChain3, (void **)&sc));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2 };
+    ID3D12DescriptorHeap *rtvs;
+    CHECK(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&rtvs));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv0 = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtvs);
+    UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    ID3D12Resource *back[2];
+    for (UINT i = 0; i < 2; i++) {
+        CHECK(IDXGISwapChain3_GetBuffer(sc, i, &IID_ID3D12Resource, (void **)&back[i]));
+        D3D12_CPU_DESCRIPTOR_HANDLE h = { rtv0.ptr + i * inc };
+        ID3D12Device_CreateRenderTargetView(dev, back[i], NULL, h);
+    }
+    ID3D12CommandAllocator *alloc;
+    CHECK(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc));
+    ID3D12GraphicsCommandList *list;
+    CHECK(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    ID3D12GraphicsCommandList_Close(list);
+    UINT seen[3];
+    float colors[3][4] = { { 1, 0, 0, 1 }, { 0, 1, 0, 1 }, { 1, 1, 0, 1 } };
+    for (UINT f = 0; f < 3; f++) {
+        UINT i = seen[f] = IDXGISwapChain3_GetCurrentBackBufferIndex(sc);
+        ID3D12CommandAllocator_Reset(alloc);
+        ID3D12GraphicsCommandList_Reset(list, alloc, NULL);
+        D3D12_CPU_DESCRIPTOR_HANDLE h = { rtv0.ptr + i * inc };
+        ID3D12GraphicsCommandList_ClearRenderTargetView(list, h, colors[f], 0, NULL);
+        ID3D12GraphicsCommandList_Close(list);
+        ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+        ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+        CHECK(IDXGISwapChain3_Present(sc, 1, 0));
+        wait_queue(dev, queue);
+    }
+    if (seen[0] != 0 || seen[1] != 1 || seen[2] != 0) { printf("present: back buffer indices %u %u %u, want 0 1 0\n", seen[0], seen[1], seen[2]); bad++; }
+    // buffer 0 last held frame 2's colour
+    ID3D12Resource *rb = buffer(dev, D3D12_HEAP_TYPE_READBACK, 512 * 96, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12CommandAllocator_Reset(alloc);
+    ID3D12GraphicsCommandList_Reset(list, alloc, NULL);
+    D3D12_TEXTURE_COPY_LOCATION dst = { rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+    dst.PlacedFootprint.Footprint = (D3D12_SUBRESOURCE_FOOTPRINT){ DXGI_FORMAT_R8G8B8A8_UNORM, 128, 96, 1, 512 };
+    D3D12_TEXTURE_COPY_LOCATION src = { back[0], D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
+    ID3D12GraphicsCommandList_Close(list);
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+    wait_queue(dev, queue);
+    unsigned char *px;
+    CHECK(ID3D12Resource_Map(rb, 0, NULL, (void **)&px));
+    int yellow = px[0] == 255 && px[1] == 255 && px[2] == 0 && px[3] == 255;
+    if (!yellow) { printf("present: buffer 0 holds (%u, %u, %u, %u), want frame 2's yellow\n", px[0], px[1], px[2], px[3]); bad++; }
+    UINT presents = 0;
+    IDXGISwapChain3_GetLastPresentCount(sc, &presents);
+    printf("d3d12 present: swap chain on the queue, %u presents, back buffer indices %u %u %u: %s\n", presents, seen[0], seen[1], seen[2],
+           seen[0] == 0 && seen[1] == 1 && seen[2] == 0 && yellow ? "ok" : "FAILED");
+    DestroyWindow(hwnd);
+    return 0;
+}
+
 int main(void) {
     FILE *f = fopen("tests/shaders12/sum_cs.dxil", "rb");
     if (!f) { printf("tests/shaders12/sum_cs.dxil not found (run from VXRuntime)\n"); return 1; }
@@ -292,5 +366,6 @@ int main(void) {
     printf("d3d12 compute: root signature serialized and created, descriptor table, upload -> default copy, dispatch of DXIL, "
            "readback of a buffer and a texture, fence (SIMD width %u): %s\n", simd, bad ? "FAILED" : "ok");
     draw_test(dev, queue);
+    present_test(dev, queue);
     return bad ? 1 : 0;
 }

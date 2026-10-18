@@ -16,11 +16,13 @@
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
 #include "d3d12_tables.h"
+#include "d3d_tables.h"                                            // (IDXGISwapChain3, for swap chains on D3D12 queues)
 #pragma clang diagnostic pop
 
 enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG };
 
 static const GUID IID_IUnknown_ = { 0, 0, 0, { 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
+static void **g_swapchain_vtbl;
 static void **g_device_vtbl, **g_queue_vtbl, **g_allocator_vtbl, **g_list_vtbl, **g_fence_vtbl, **g_heap_vtbl, **g_rootsig_vtbl,
             **g_pso_vtbl, **g_resource_vtbl, **g_blob_vtbl, **g_debug_vtbl;
 static pthread_once_t g_tables_once = PTHREAD_ONCE_INIT;
@@ -1606,6 +1608,181 @@ static WINAPI HRESULT dev_create_heap(void *this, const HEAP_DESC *desc, const G
 
 static WINAPI uint32_t dev_increment(void *this, int32_t type) { return 32; }
 
+
+// ---- swap chains on D3D12 queues (DXGI's factory hands them here) ---------------------------------------------------
+//
+// BufferCount textures the program gets one by one (GetBuffer) and renders into in turn (GetCurrentBackBufferIndex);
+// Present draws the current one into the window's CAMetalLayer on the queue's Metal queue, after the work executed
+// before it, and moves on to the next.
+
+typedef struct {
+    d3d_object base;
+    dev12 *dev;
+    queue12 *queue;
+    void *factory;
+    HANDLE hwnd;
+    uint32_t width, height, format, count, flags, index, presents;
+    res12 *buffers[16];
+    CAMetalLayer *layer;
+    id<MTLRenderPipelineState> pipeline;
+    HANDLE waitable;
+} swap12;
+
+static const char *g_present12_msl =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct V { float4 pos [[position]]; float2 uv; };\n"
+    "vertex V present_vs(uint id [[vertex_id]]) {\n"
+    "    float2 p = float2((id << 1) & 2, id & 2);\n"
+    "    V o; o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = p; return o;\n"
+    "}\n"
+    "fragment float4 present_fs(V in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+    "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+    "    return float4(t.sample(s, in.uv).rgb, 1);\n"
+    "}\n";
+
+static HRESULT swap_make_buffers(swap12 *sc) {
+    for (uint32_t i = 0; i < sc->count; i++) {
+        if (sc->buffers[i]) { d3d_release(&sc->buffers[i]->base); sc->buffers[i] = NULL; }
+        HEAP_PROPS hp = { 1, 0, 0, 0, 0 };
+        RES_DESC rd = { 3, 0, sc->width, sc->height, 1, 1, sc->format, 1, 0, 0, 0x1 };   // a 2D render target
+        void *out = NULL;
+        HRESULT hr = create_committed(sc->dev, &hp, 0, &rd, 0, NULL, &IID_ID3D12Resource, &out);
+        if (hr != S_OK) return hr;
+        sc->buffers[i] = out;
+    }
+    sc->index = 0;
+    return S_OK;
+}
+
+static void swap_destroy(d3d_object *o) {
+    swap12 *sc = (swap12 *)o;
+    for (uint32_t i = 0; i < 16; i++) if (sc->buffers[i]) d3d_release(&sc->buffers[i]->base);
+    sc->layer = nil;
+    sc->pipeline = nil;
+    if (sc->queue) d3d_release(&sc->queue->base);
+    if (sc->factory) d3d_release(sc->factory);
+    if (sc->dev) d3d_release(&sc->dev->base);
+}
+
+int d3d12_is_queue(void *p) { return p && ((d3d_object *)p)->vtbl == g_queue_vtbl; }
+
+HRESULT d3d12_swapchain_create(void *factory, void *queue, HANDLE hwnd, uint32_t w, uint32_t h, uint32_t format, uint32_t count, uint32_t flags, void **out) {
+    queue12 *q = queue;
+    vx_window *win = vx_window_get(hwnd);
+    if (!win || !out) return E_INVALIDARG;
+    if (count < 2 || count > 16) count = count < 2 ? 2 : 16;
+    swap12 *sc = d3d_alloc(sizeof *sc, K_SWAPCHAIN, g_swapchain_vtbl, NULL);
+    sc->base.destroy = swap_destroy;
+    sc->dev = q->dev; d3d_addref(&sc->dev->base);
+    sc->queue = q; d3d_addref(&q->base);
+    sc->factory = factory; d3d_addref(factory);
+    sc->hwnd = hwnd;
+    if (!w || !h) { w = win->client_w > 0 ? (uint32_t)win->client_w : 640; h = win->client_h > 0 ? (uint32_t)win->client_h : 480; }
+    sc->width = w; sc->height = h; sc->format = format; sc->count = count; sc->flags = flags;
+    MTLPixelFormat lf = d3d_is_srgb(format) ? MTLPixelFormatBGRA8Unorm_sRGB : format == 10 ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+    sc->layer = (__bridge CAMetalLayer *)vx_cocoa_metal_layer(win, (__bridge void *)sc->dev->mtl, (int)lf);
+    NSError *err = nil;
+    id<MTLLibrary> lib = [sc->dev->mtl newLibraryWithSource:@(g_present12_msl) options:nil error:&err];
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"present_vs"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"present_fs"];
+    pd.colorAttachments[0].pixelFormat = lf;
+    sc->pipeline = lib ? [sc->dev->mtl newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+    if (!sc->layer || !sc->pipeline || swap_make_buffers(sc) != S_OK) { d3d_release(&sc->base); return E_FAIL; }
+    *out = sc;
+    return S_OK;
+}
+
+static WINAPI HRESULT swap_query(void *this, const GUID *iid, void **out) {
+    const GUID *k[] = { &IID_IDXGIObject, &IID_IDXGIDeviceSubObject, &IID_IDXGISwapChain, &IID_IDXGISwapChain1, &IID_IDXGISwapChain2, &IID_IDXGISwapChain3 };
+    return query(this, iid, out, k, 6);
+}
+static WINAPI HRESULT swap_get_buffer(void *this, uint32_t i, const GUID *iid, void **out) {
+    swap12 *sc = this;
+    if (i >= sc->count || !sc->buffers[i]) return E_INVALIDARG;
+    return res_query(sc->buffers[i], iid, out);
+}
+static WINAPI uint32_t swap_index(void *this) { return ((swap12 *)this)->index; }
+static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
+    swap12 *sc = this;
+    if (flags & 1) return S_OK;                                    // DXGI_PRESENT_TEST
+    sc->layer.displaySyncEnabled = sync != 0;
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = [sc->layer nextDrawable];
+        if (drawable) {
+            id<MTLCommandBuffer> cb = [sc->dev->queue commandBuffer];
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = drawable.texture;
+            rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+            [enc setRenderPipelineState:sc->pipeline];
+            [enc setFragmentTexture:sc->buffers[sc->index]->texture atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [enc endEncoding];
+            [cb presentDrawable:drawable];
+            [cb commit];
+        }
+    }
+    sc->index = (sc->index + 1) % sc->count;
+    sc->presents++;
+    return S_OK;
+}
+static WINAPI HRESULT swap_present1(void *this, uint32_t sync, uint32_t flags, const void *params) { return swap_present(this, sync, flags); }
+static WINAPI HRESULT swap_resize(void *this, uint32_t count, uint32_t w, uint32_t h, uint32_t format, uint32_t flags) {
+    swap12 *sc = this;
+    vx_window *win = vx_window_get(sc->hwnd);
+    if (count) sc->count = count > 16 ? 16 : count;
+    if (format) sc->format = format;
+    if (!w || !h) { w = win && win->client_w > 0 ? (uint32_t)win->client_w : sc->width; h = win && win->client_h > 0 ? (uint32_t)win->client_h : sc->height; }
+    sc->width = w; sc->height = h; sc->flags = flags;
+    return swap_make_buffers(sc);
+}
+static WINAPI HRESULT swap_resize3(void *this, uint32_t count, uint32_t w, uint32_t h, uint32_t format, uint32_t flags, const uint32_t *masks, void *const *queues) {
+    return swap_resize(this, count, w, h, format, flags);
+}
+// DXGI_SWAP_CHAIN_DESC1: width, height, format, stereo, sample count/quality, usage, buffer count, scaling, effect, alpha, flags
+static WINAPI HRESULT swap_get_desc1(void *this, uint32_t *d) {
+    swap12 *sc = this;
+    memset(d, 0, 11 * 4);
+    d[0] = sc->width; d[1] = sc->height; d[2] = sc->format; d[4] = 1; d[6] = 0x20; d[7] = sc->count; d[9] = 4; d[10] = sc->flags;
+    return S_OK;
+}
+// DXGI_SWAP_CHAIN_DESC: mode (width, height, refresh, format, ordering, scaling), samples, usage, count, window, windowed, effect, flags
+static WINAPI HRESULT swap_get_desc(void *this, uint8_t *d) {
+    swap12 *sc = this;
+    memset(d, 0, 68);
+    uint32_t *m = (uint32_t *)d;
+    m[0] = sc->width; m[1] = sc->height; m[2] = 60; m[3] = 1; m[4] = sc->format;
+    *(uint32_t *)(d + 28) = 1; *(uint32_t *)(d + 36) = 0x20; *(uint32_t *)(d + 40) = sc->count;
+    *(HANDLE *)(d + 48) = sc->hwnd; *(int32_t *)(d + 56) = 1; *(uint32_t *)(d + 60) = 4; *(uint32_t *)(d + 64) = sc->flags;
+    return S_OK;
+}
+static WINAPI HRESULT swap_get_hwnd(void *this, HANDLE *h) { *h = ((swap12 *)this)->hwnd; return S_OK; }
+static WINAPI HRESULT swap_set_fullscreen(void *this, int32_t full, void *output) { return S_OK; }
+static WINAPI HRESULT swap_get_fullscreen(void *this, int32_t *full, void **output) { if (full) *full = 0; if (output) *output = NULL; return S_OK; }
+static WINAPI HRESULT swap_get_device(void *this, const GUID *iid, void **out) { return queue_query(((swap12 *)this)->queue, iid, out); }
+static WINAPI HRESULT swap_get_parent(void *this, const GUID *iid, void **out) {
+    void *f = ((swap12 *)this)->factory;
+    return ((HRESULT (WINAPI *)(void *, const GUID *, void **))(((d3d_object *)f)->vtbl[0]))(f, iid, out);
+}
+static WINAPI HRESULT swap_set_latency(void *this, uint32_t n) { return S_OK; }
+static WINAPI HRESULT swap_get_latency(void *this, uint32_t *n) { *n = 1; return S_OK; }
+static WINAPI HANDLE swap_waitable(void *this) {
+    // (presents do not queue up beyond the GPU's own: the object is always signalled)
+    swap12 *sc = this;
+    if (!sc->waitable) {
+        HANDLE (WINAPI *create)(void *, int, int, const uint16_t *) = (HANDLE (WINAPI *)(void *, int, int, const uint16_t *))vx_find_export("kernel32.dll", "CreateEventW");
+        sc->waitable = create(NULL, 1, 1, NULL);                  // manual reset, signalled
+    }
+    return sc->waitable;
+}
+static WINAPI HRESULT swap_check_color_space(void *this, uint32_t cs, uint32_t *support) { *support = cs == 0 ? 1 : 0; return S_OK; }
+static WINAPI HRESULT swap_set_color_space(void *this, uint32_t cs) { return cs == 0 ? S_OK : E_INVALIDARG; }
+static WINAPI HRESULT swap_last_present(void *this, uint32_t *n) { *n = ((swap12 *)this)->presents; return S_OK; }
+static WINAPI HRESULT swap_frame_stats(void *this, void *stats) { return DXGI_ERROR_FRAME_STATISTICS_DISJOINT; }
+
 // ---- the device ---------------------------------------------------------------------------------------------------------
 
 static WINAPI HRESULT dev_query(void *this, const GUID *iid, void **out) {
@@ -1822,6 +1999,18 @@ static void make_tables(void) {
                                         { "EnableDebugLayer", (void *)debug_noop }, { "SetEnableGPUBasedValidation", (void *)debug_noop },
                                         { "SetEnableSynchronizedCommandQueueValidation", (void *)debug_noop }, { NULL, NULL } };
     g_debug_vtbl = D3D_VTABLE(ID3D12Debug5, debug);
+    static const d3d_method swap[] = {
+        { "QueryInterface", (void *)swap_query }, { "AddRef", (void *)obj_addref }, { "Release", (void *)obj_release },
+        { "SetPrivateData", (void *)obj_set_private }, { "GetPrivateData", (void *)obj_get_private }, { "SetPrivateDataInterface", (void *)obj_set_private_iface },
+        { "GetParent", (void *)swap_get_parent }, { "GetDevice", (void *)swap_get_device }, { "Present", (void *)swap_present },
+        { "Present1", (void *)swap_present1 }, { "GetBuffer", (void *)swap_get_buffer }, { "SetFullscreenState", (void *)swap_set_fullscreen },
+        { "GetFullscreenState", (void *)swap_get_fullscreen }, { "GetDesc", (void *)swap_get_desc }, { "GetDesc1", (void *)swap_get_desc1 },
+        { "ResizeBuffers", (void *)swap_resize }, { "ResizeBuffers1", (void *)swap_resize3 }, { "GetHwnd", (void *)swap_get_hwnd },
+        { "GetCurrentBackBufferIndex", (void *)swap_index }, { "SetMaximumFrameLatency", (void *)swap_set_latency },
+        { "GetMaximumFrameLatency", (void *)swap_get_latency }, { "GetFrameLatencyWaitableObject", (void *)swap_waitable },
+        { "CheckColorSpaceSupport", (void *)swap_check_color_space }, { "SetColorSpace1", (void *)swap_set_color_space },
+        { "GetLastPresentCount", (void *)swap_last_present }, { "GetFrameStatistics", (void *)swap_frame_stats }, { NULL, NULL } };
+    g_swapchain_vtbl = D3D_VTABLE(IDXGISwapChain3, swap);
 }
 
 static const vx_export d3d12[] = {

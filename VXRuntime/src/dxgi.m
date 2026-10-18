@@ -269,6 +269,7 @@ static void client_size(HANDLE hwnd, uint32_t *w, uint32_t *h) {
 static void swapchain_destroy(d3d_object *o);
 static HRESULT swapchain_create(void *factory, void *device, HANDLE hwnd, uint32_t w, uint32_t h, uint32_t format,
                                 uint32_t count, uint32_t usage, uint32_t flags, uint32_t effect, uint32_t samples, void **out) {
+    if (d3d12_is_queue(device)) return d3d12_swapchain_create(factory, device, hwnd, w, h, format, count, flags, out);
     d3d_device *dev = d3d_device_from(device);
     vx_window *win = vx_window_get(hwnd);
     if (!dev || !win || !out) return E_INVALIDARG;

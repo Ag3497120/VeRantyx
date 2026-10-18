@@ -225,7 +225,7 @@ build/compute.exe: tests/compute.c tests/shaders/*.h
 
 build/d3d12.exe: tests/d3d12.c tests/shaders12/sum_cs.dxil tests/shaders12/tri_vs.dxil tests/shaders12/tri_ps.dxil
 	@mkdir -p build
-	$(MINGW) -O1 -o $@ $< -ld3d12 -lm
+	$(MINGW) -O1 -o $@ $< -ld3d12 -ldxgi -lm
 
 build/input.exe: tests/input.c
 	@mkdir -p build
