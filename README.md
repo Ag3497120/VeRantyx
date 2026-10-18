@@ -67,9 +67,9 @@ library you already have), gathers the Microsoft runtime files from their own in
 headset you choose: Meta Quest or Pico through ALVR (Wi-Fi or a USB cable), or Apple Vision Pro (the VeRantyx app or
 the ALVR app). The runtime is inside the app: the Mac needs nothing but macOS and Steam.
 
-Get it from the [Releases](https://github.com/Ag3497120/VeRantyx/releases) page when a build is published, or build it:
-`MacApp/build_app.sh`. A build that is not notarized by Apple yet asks once to be allowed: System Settings > Privacy &
-Security > Open Anyway. The app and the scripts below share one setup.
+**Download: [VeRantyx for Mac 0.1.0](https://github.com/Ag3497120/VeRantyx/releases/tag/mac-v0.1.0)** (signed with a
+Developer ID and notarized by Apple; 11 languages), or build it: `MacApp/build_app.sh`. The app and the scripts below
+share one setup.
 
 ## Quick start (vxrt version)
 
