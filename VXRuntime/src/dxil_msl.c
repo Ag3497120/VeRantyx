@@ -1359,7 +1359,7 @@ static void io_structs(tr *t, sb *s) {
                 any = 1;
             }
         }
-        if (!any) put(s, "    float vx_unused [[user(VX_UNUSED)]];\n");
+        if (!any) put(s, stage == 1 ? "    float vx_unused;\n" : "    float vx_unused [[user(VX_UNUSED)]];\n");   // (a vertex shader without inputs takes no stage_in)
         put(s, "};\n");
     }
     // outputs
@@ -1489,7 +1489,7 @@ int dxil_to_msl(const dxil_module *m, dxil_msl *out) {
             if (t.need_ltid) put(&file, ", uint3 vx_ltid [[thread_position_in_threadgroup]]");
             if (t.need_lidx) put(&file, ", uint vx_lidx [[thread_index_in_threadgroup]]");
         } else if (stage == 1) {
-            put(&file, "vertex VxOut vx_main(VxIn vx_in [[stage_in]], constant VxRoot &vx_root [[buffer(0)]]");
+            put(&file, out->ninputs ? "vertex VxOut vx_main(VxIn vx_in [[stage_in]], constant VxRoot &vx_root [[buffer(0)]]" : "vertex VxOut vx_main(constant VxRoot &vx_root [[buffer(0)]]");
             if (t.need_vid) put(&file, ", uint vx_vid [[vertex_id]]");
             if (t.need_iid) put(&file, ", uint vx_iid0 [[instance_id]], uint vx_base_instance [[base_instance]]");
         } else {
@@ -1502,6 +1502,7 @@ int dxil_to_msl(const dxil_module *m, dxil_msl *out) {
         if (t.need_lanes) put(&file, ", uint vx_lanes [[threads_per_simdgroup]]");
         put(&file, ") {\n");
         if (stage != 5) put(&file, "    VxOut vx_out = {};\n");
+        if (stage == 1 && !out->ninputs) put(&file, "    VxIn vx_in = {}; (void)vx_in;\n");
         if (t.need_iid) put(&file, "    uint vx_iid = vx_iid0 - vx_base_instance;   // (D3D's SV_InstanceID leaves out StartInstanceLocation)\n");
         put(&file, "%s", glocal.s ? glocal.s : "");
         put(&file, "%s", t.decls.s ? t.decls.s : "");

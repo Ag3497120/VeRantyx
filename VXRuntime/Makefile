@@ -287,7 +287,7 @@ shaders: build/vxrt build/hlslc.exe
 # beside SteamVR's vrwebhelper), with dxcompiler's own disassembly of each as the reference tools/dxil_check.py reads
 # src/dxil.c's reading against. tests/shaders12/*.dxil and *.dis.txt are kept in the repository; regenerate with
 #   make shaders12 DXCOMPILER='Z:\path\to\dxcompiler.dll'
-SHADERS12 = color_ps:ps_6_0 tex_ps:ps_6_0 sum_cs:cs_6_0 color_vs:vs_6_0 bindless_ps:ps_6_6 tri_vs:vs_6_0 tri_ps:ps_6_0
+SHADERS12 = color_ps:ps_6_0 tex_ps:ps_6_0 sum_cs:cs_6_0 color_vs:vs_6_0 bindless_ps:ps_6_6 tri_vs:vs_6_0 tri_ps:ps_6_0 texq_vs:vs_6_0 texq_ps:ps_6_0
 shaders12: build/vxrt build/dxc.exe
 	@for s in $(SHADERS12); do n=$${s%%:*}; p=$${s##*:}; \
 	  VXRT_ROOT=build/root build/vxrt build/dxc.exe '$(DXCOMPILER)' tests/shaders12/$$n.hlsl main $$p tests/shaders12/$$n.h $$n || exit 1; \

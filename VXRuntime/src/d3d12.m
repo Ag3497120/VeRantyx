@@ -19,12 +19,12 @@
 #include "d3d_tables.h"                                            // (IDXGISwapChain3, for swap chains on D3D12 queues)
 #pragma clang diagnostic pop
 
-enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG };
+enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG, K12_MEMHEAP };
 
 static const GUID IID_IUnknown_ = { 0, 0, 0, { 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
 static void **g_swapchain_vtbl;
 static void **g_device_vtbl, **g_queue_vtbl, **g_allocator_vtbl, **g_list_vtbl, **g_fence_vtbl, **g_heap_vtbl, **g_rootsig_vtbl,
-            **g_pso_vtbl, **g_resource_vtbl, **g_blob_vtbl, **g_debug_vtbl;
+            **g_pso_vtbl, **g_resource_vtbl, **g_blob_vtbl, **g_debug_vtbl, **g_memheap_vtbl;
 static pthread_once_t g_tables_once = PTHREAD_ONCE_INIT;
 static void make_tables(void);
 
@@ -33,6 +33,8 @@ static void make_tables(void);
 typedef struct { int32_t Type, Priority, Flags; uint32_t NodeMask; } Q_DESC;
 typedef struct { int32_t Type; uint32_t NumDescriptors; int32_t Flags; uint32_t NodeMask; } HEAP_DESC;
 typedef struct { int32_t Type, CPUPageProperty, MemoryPoolPreference; uint32_t CreationNodeMask, VisibleNodeMask; } HEAP_PROPS;
+typedef struct { uint64_t SizeInBytes; HEAP_PROPS Properties; uint64_t Alignment; int32_t Flags; } MEMHEAP_DESC;   // D3D12_HEAP_DESC
+typedef struct { uint64_t SizeInBytes, Alignment; } ALLOC_INFO;
 typedef struct { int32_t Dimension; uint64_t Alignment, Width; uint32_t Height; uint16_t DepthOrArraySize, MipLevels; uint32_t Format, SampleCount, SampleQuality; int32_t Layout, Flags; } RES_DESC;
 typedef struct { const void *code; size_t size; } BYTECODE;
 typedef struct { void *root; BYTECODE cs; uint32_t node; const void *cached; size_t cached_size; int32_t flags; } COMPUTE_PSO_DESC;
@@ -120,7 +122,16 @@ typedef struct {
     id<MTLBuffer> buffer;
     id<MTLTexture> texture;
     uint32_t mapped;
+    int32_t heap_flags;
 } res12;
+
+// A heap (ID3D12Heap) for placed resources: a Metal placement heap, so resources placed at the same offset share
+// memory as they do in D3D12.
+typedef struct {
+    d3d_object base; dev12 *dev;
+    MEMHEAP_DESC desc;
+    id<MTLHeap> heap;
+} memheap12;
 
 // A root signature, from its serialized form.
 typedef struct { int32_t type; uint32_t count, base, space, offset; } range12;
@@ -457,47 +468,68 @@ static WINAPI RES_DESC *res_get_desc(void *this, RES_DESC *out) { *out = ((res12
 static WINAPI uint64_t res_gpu_va(void *this) { res12 *r = this; return r->buffer ? r->buffer.gpuAddress : 0; }
 static WINAPI HRESULT res_get_heap_props(void *this, HEAP_PROPS *props, int32_t *flags) {
     if (props) *props = ((res12 *)this)->heap;
-    if (flags) *flags = 0;
+    if (flags) *flags = ((res12 *)this)->heap_flags;
     return S_OK;
 }
 
 static uint32_t bytes_per(uint32_t format) { uint32_t b = 0; d3d_mtl_format(format, &b); return b; }
 
-static HRESULT create_committed(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
+// The Metal texture a D3D12 texture description stands for (nil: a format it has no Metal counterpart for).
+static MTLTextureDescriptor *texture_descriptor(const RES_DESC *desc) {
+    uint32_t bpp = 0;
+    MTLPixelFormat fmt = d3d_mtl_format(desc->Format, &bpp);
+    if (desc->Flags & 0x2) {                                       // ALLOW_DEPTH_STENCIL: a typeless format as its depth format
+        uint32_t f = desc->Format;
+        if (f == 39 || f == 40 || f == 41) fmt = MTLPixelFormatDepth32Float;
+        else if (f == 19 || f == 20 || f == 21 || f == 44 || f == 45 || f == 46 || f == 47) fmt = MTLPixelFormatDepth32Float_Stencil8;
+        else if (f == 53 || f == 55 || f == 56) fmt = MTLPixelFormatDepth16Unorm;
+    }
+    if (fmt == MTLPixelFormatInvalid) { vx_log("D3D12: texture format %u is not supported", desc->Format); return nil; }
+    MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+    td.pixelFormat = fmt;
+    td.width = desc->Width;
+    td.height = desc->Height ? desc->Height : 1;
+    td.mipmapLevelCount = desc->MipLevels ? desc->MipLevels : 1;
+    if (!desc->MipLevels) {                                        // 0: the full chain
+        uint64_t m = desc->Width > td.height ? desc->Width : td.height;
+        uint32_t n = 1;
+        while (m > 1) { m >>= 1; n++; }
+        td.mipmapLevelCount = n;
+    }
+    if (desc->Dimension == 4) { td.textureType = MTLTextureType3D; td.depth = desc->DepthOrArraySize; }
+    else if (desc->DepthOrArraySize > 1) { td.textureType = desc->Dimension == 2 ? MTLTextureType1DArray : MTLTextureType2DArray; td.arrayLength = desc->DepthOrArraySize; }
+    else td.textureType = desc->Dimension == 2 ? MTLTextureType1D : MTLTextureType2D;
+    if (desc->SampleCount > 1) { td.textureType = desc->DepthOrArraySize > 1 ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample; td.sampleCount = desc->SampleCount; td.mipmapLevelCount = 1; }
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    if (desc->Flags & 0x4) td.usage |= MTLTextureUsageShaderWrite;              // ALLOW_UNORDERED_ACCESS
+    if (desc->Flags & 0x3) td.usage |= MTLTextureUsageRenderTarget;             // ALLOW_RENDER_TARGET, ALLOW_DEPTH_STENCIL
+    td.storageMode = MTLStorageModePrivate;
+    return td;
+}
+
+// A committed resource (heap nil) or one placed in a heap at an offset.
+static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, memheap12 *in, uint64_t offset, const GUID *iid, void **out) {
     res12 *r = alloc12(sizeof *r, K12_RESOURCE, g_resource_vtbl, d);
     r->base.destroy = res_destroy;
     r->desc = *desc;
     r->heap = *hp;
+    r->heap_flags = heap_flags;
     if (desc->Dimension == 1) {                                    // D3D12_RESOURCE_DIMENSION_BUFFER
-        r->buffer = [d->mtl newBufferWithLength:desc->Width ? desc->Width : 1 options:MTLResourceStorageModeShared];
-        if (!r->buffer) { d3d_release(&r->base); return E_OUTOFMEMORY; }
+        NSUInteger len = desc->Width ? desc->Width : 1;
+        if (in) r->buffer = [in->heap newBufferWithLength:len options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked offset:offset];
+        else r->buffer = [d->mtl newBufferWithLength:len options:MTLResourceStorageModeShared];
+        if (!r->buffer) { d3d_release(&r->base); return in ? E_INVALIDARG : E_OUTOFMEMORY; }
         vx_guest_forget(r->buffer.contents, r->buffer.length);
-        if (hp->Type != 2) memset(r->buffer.contents, 0, r->buffer.length);   // (default and readback heaps start zeroed)
+        if (!in && hp->Type != 2) memset(r->buffer.contents, 0, r->buffer.length);   // (default and readback heaps start zeroed)
     } else {
-        uint32_t bpp = 0;
-        MTLPixelFormat fmt = d3d_mtl_format(desc->Format, &bpp);
-        if (desc->Flags & 0x2) {                                   // ALLOW_DEPTH_STENCIL: a typeless format as its depth format
-            uint32_t f = desc->Format;
-            if (f == 39 || f == 40 || f == 41) fmt = MTLPixelFormatDepth32Float;
-            else if (f == 19 || f == 20 || f == 21 || f == 44 || f == 45 || f == 46 || f == 47) fmt = MTLPixelFormatDepth32Float_Stencil8;
-            else if (f == 53 || f == 55 || f == 56) fmt = MTLPixelFormatDepth16Unorm;
-        }
-        if (fmt == MTLPixelFormatInvalid) { vx_log("D3D12: texture format %u is not supported", desc->Format); d3d_release(&r->base); return E_INVALIDARG; }
-        MTLTextureDescriptor *td = [MTLTextureDescriptor new];
-        td.pixelFormat = fmt;
-        td.width = desc->Width;
-        td.height = desc->Height ? desc->Height : 1;
-        td.mipmapLevelCount = desc->MipLevels ? desc->MipLevels : 1;
-        if (desc->Dimension == 4) { td.textureType = MTLTextureType3D; td.depth = desc->DepthOrArraySize; }
-        else if (desc->DepthOrArraySize > 1) { td.textureType = desc->Dimension == 2 ? MTLTextureType1DArray : MTLTextureType2DArray; td.arrayLength = desc->DepthOrArraySize; }
-        else td.textureType = desc->Dimension == 2 ? MTLTextureType1D : MTLTextureType2D;
-        if (desc->SampleCount > 1) { td.textureType = desc->DepthOrArraySize > 1 ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample; td.sampleCount = desc->SampleCount; td.mipmapLevelCount = 1; }
-        td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-        if (desc->Flags & 0x4) td.usage |= MTLTextureUsageShaderWrite;          // ALLOW_UNORDERED_ACCESS
-        if (desc->Flags & 0x3) td.usage |= MTLTextureUsageRenderTarget;         // ALLOW_RENDER_TARGET, ALLOW_DEPTH_STENCIL
-        td.storageMode = MTLStorageModePrivate;
-        r->texture = [d->mtl newTextureWithDescriptor:td];
-        if (!r->texture) { d3d_release(&r->base); return E_OUTOFMEMORY; }
+        MTLTextureDescriptor *td = texture_descriptor(desc);
+        if (!td) { d3d_release(&r->base); return E_INVALIDARG; }
+        if (in) {
+            td.storageMode = in->heap.storageMode;
+            td.hazardTrackingMode = MTLHazardTrackingModeTracked;
+            r->texture = [in->heap newTextureWithDescriptor:td offset:offset];
+        } else r->texture = [d->mtl newTextureWithDescriptor:td];
+        if (!r->texture) { d3d_release(&r->base); return in ? E_INVALIDARG : E_OUTOFMEMORY; }
         if (r->desc.MipLevels == 0) r->desc.MipLevels = (uint16_t)td.mipmapLevelCount;
     }
     pthread_mutex_lock(&d->lock);
@@ -511,6 +543,110 @@ static HRESULT create_committed(dev12 *d, const HEAP_PROPS *hp, int32_t heap_fla
     HRESULT hr = res_query(r, iid, out);
     d3d_release(&r->base);
     return hr;
+}
+
+static HRESULT create_committed(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
+    return create_resource(d, hp, heap_flags, desc, NULL, 0, iid, out);
+}
+
+// ---- heaps and placed resources -----------------------------------------------------------------------------------
+
+static void memheap_destroy(d3d_object *o) { ((memheap12 *)o)->heap = nil; release_dev(o); }
+static WINAPI HRESULT memheap_query(void *this, const GUID *iid, void **out) {
+    const GUID *k[] = { &IID_ID3D12Heap, &IID_ID3D12Heap1, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
+    return query(this, iid, out, k, 5);
+}
+static WINAPI MEMHEAP_DESC *memheap_get_desc(void *this, MEMHEAP_DESC *out) { *out = ((memheap12 *)this)->desc; return out; }
+static WINAPI HRESULT memheap_session(void *this, const GUID *iid, void **out) { if (out) *out = NULL; return E_NOINTERFACE; }
+
+// D3D12's alignments (64 KiB, 4 MiB for multisampled textures) are larger than Metal's, so offsets a program
+// computes with them are valid in a Metal heap too.
+static ALLOC_INFO allocation_info(dev12 *d, const RES_DESC *desc) {
+    ALLOC_INFO a = { 0, desc->Alignment ? desc->Alignment : desc->SampleCount > 1 ? 4u << 20 : 64u << 10 };
+    MTLSizeAndAlign m;
+    if (desc->Dimension == 1) m = [d->mtl heapBufferSizeAndAlignWithLength:desc->Width ? desc->Width : 1 options:MTLResourceStorageModeShared];
+    else {
+        MTLTextureDescriptor *td = texture_descriptor(desc);
+        if (!td) return (ALLOC_INFO){ UINT64_MAX, a.Alignment };
+        m = [d->mtl heapTextureSizeAndAlignWithDescriptor:td];
+    }
+    if (m.align > a.Alignment) a.Alignment = m.align;
+    a.SizeInBytes = (m.size + a.Alignment - 1) & ~(a.Alignment - 1);
+    return a;
+}
+
+static WINAPI ALLOC_INFO *dev_allocation_info(void *this, ALLOC_INFO *out, uint32_t mask, uint32_t n, const RES_DESC *descs) {
+    ALLOC_INFO all = { 0, 64u << 10 };
+    for (uint32_t i = 0; i < n; i++) {
+        ALLOC_INFO a = allocation_info(this, &descs[i]);
+        if (a.SizeInBytes == UINT64_MAX) { *out = a; return out; }
+        if (a.Alignment > all.Alignment) all.Alignment = a.Alignment;
+        all.SizeInBytes = ((all.SizeInBytes + a.Alignment - 1) & ~(a.Alignment - 1)) + a.SizeInBytes;
+    }
+    *out = all;
+    return out;
+}
+static WINAPI ALLOC_INFO *dev_allocation_info1(void *this, ALLOC_INFO *out, uint32_t mask, uint32_t n, const RES_DESC *descs, ALLOC_INFO *each) {
+    // (each: D3D12_RESOURCE_ALLOCATION_INFO1 {Offset, Alignment, SizeInBytes})
+    ALLOC_INFO all = { 0, 64u << 10 };
+    for (uint32_t i = 0; i < n; i++) {
+        ALLOC_INFO a = allocation_info(this, &descs[i]);
+        if (a.SizeInBytes == UINT64_MAX) { *out = a; return out; }
+        if (a.Alignment > all.Alignment) all.Alignment = a.Alignment;
+        uint64_t at = (all.SizeInBytes + a.Alignment - 1) & ~(a.Alignment - 1);
+        if (each) { uint64_t *e = (uint64_t *)each + 3 * i; e[0] = at; e[1] = a.Alignment; e[2] = a.SizeInBytes; }
+        all.SizeInBytes = at + a.SizeInBytes;
+    }
+    *out = all;
+    return out;
+}
+
+static WINAPI HRESULT dev_create_memheap(void *this, const MEMHEAP_DESC *desc, const GUID *iid, void **out) {
+    dev12 *d = this;
+    if (!desc || !desc->SizeInBytes) return E_INVALIDARG;
+    MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+    hd.type = MTLHeapTypePlacement;
+    hd.size = desc->SizeInBytes;
+    // Upload and readback heaps, and heaps that may hold buffers, are shared memory (a buffer's contents are read and
+    // written by the program); a heap only for textures is private.
+    int tex_only = (desc->Flags & 0x4) != 0;                       // D3D12_HEAP_FLAG_DENY_BUFFERS
+    hd.storageMode = tex_only && desc->Properties.Type != 2 && desc->Properties.Type != 3 ? MTLStorageModePrivate : MTLStorageModeShared;
+    hd.hazardTrackingMode = MTLHazardTrackingModeTracked;
+    id<MTLHeap> h = [d->mtl newHeapWithDescriptor:hd];
+    if (!h) { vx_log("D3D12: a heap of %llu bytes could not be made", (unsigned long long)desc->SizeInBytes); return E_OUTOFMEMORY; }
+    if (!out) return S_FALSE;
+    memheap12 *m = alloc12(sizeof *m, K12_MEMHEAP, g_memheap_vtbl, d);
+    m->base.destroy = memheap_destroy;
+    m->desc = *desc;
+    if (!m->desc.Alignment) m->desc.Alignment = 64u << 10;
+    m->heap = h;
+    HRESULT hr = memheap_query(m, iid, out);
+    d3d_release(&m->base);
+    return hr;
+}
+static WINAPI HRESULT dev_create_memheap1(void *this, const MEMHEAP_DESC *desc, void *session, const GUID *iid, void **out) {
+    return dev_create_memheap(this, desc, iid, out);
+}
+
+static WINAPI HRESULT dev_create_placed(void *this, void *heap, uint64_t offset, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
+    memheap12 *m = heap;
+    if (!m || m->base.kind != K12_MEMHEAP || !desc) return E_INVALIDARG;
+    // (D3D12 lets small textures take 4 KiB alignment; what Metal needs at the offset is what is checked)
+    dev12 *d = this;
+    MTLTextureDescriptor *td = desc->Dimension == 1 ? nil : texture_descriptor(desc);
+    if (desc->Dimension != 1 && !td) return E_INVALIDARG;
+    MTLSizeAndAlign ma = td ? [d->mtl heapTextureSizeAndAlignWithDescriptor:td]
+                            : [d->mtl heapBufferSizeAndAlignWithLength:desc->Width ? desc->Width : 1 options:MTLResourceStorageModeShared];
+    if (offset % ma.align || offset + ma.size > m->desc.SizeInBytes) {
+        vx_log("D3D12: a resource placed at %llu does not fit in its heap of %llu bytes", (unsigned long long)offset, (unsigned long long)m->desc.SizeInBytes);
+        return E_INVALIDARG;
+    }
+    if (desc->Dimension == 1 && m->heap.storageMode != MTLStorageModeShared) return E_INVALIDARG;
+    return create_resource(this, &m->desc.Properties, m->desc.Flags, desc, m, offset, iid, out);
+}
+static WINAPI HRESULT dev_create_placed1(void *this, void *heap, uint64_t offset, const void *desc1, int32_t state, const void *clear, const GUID *iid, void **out) {
+    // (D3D12_RESOURCE_DESC1: D3D12_RESOURCE_DESC followed by a sampler feedback mip region)
+    return dev_create_placed(this, heap, offset, desc1, state, clear, iid, out);
 }
 
 // ---- descriptor heaps -----------------------------------------------------------------------------------------------
@@ -1948,7 +2084,10 @@ static void make_tables(void) {
         { "GetCopyableFootprints", (void *)dev_footprints }, { "MakeResident", (void *)dev_make_resident },
         { "Evict", (void *)dev_make_resident }, { "GetAdapterLuid", (void *)dev_adapter_luid },
         { "CreateGraphicsPipelineState", (void *)dev_create_graphics_pso }, { "CreateRenderTargetView", (void *)dev_create_rtv },
-        { "CreateDepthStencilView", (void *)dev_create_dsv }, { NULL, NULL } };
+        { "CreateDepthStencilView", (void *)dev_create_dsv }, { "CreateHeap", (void *)dev_create_memheap },
+        { "CreateHeap1", (void *)dev_create_memheap1 }, { "CreatePlacedResource", (void *)dev_create_placed },
+        { "CreatePlacedResource1", (void *)dev_create_placed1 }, { "GetResourceAllocationInfo", (void *)dev_allocation_info },
+        { "GetResourceAllocationInfo1", (void *)dev_allocation_info1 }, { NULL, NULL } };
     g_device_vtbl = D3D_VTABLE(ID3D12Device10, device);
     static const d3d_method queue[] = {
         { "QueryInterface", (void *)queue_query }, COMMON_METHODS, { "ExecuteCommandLists", (void *)queue_execute },
@@ -1992,6 +2131,10 @@ static void make_tables(void) {
         { "QueryInterface", (void *)res_query }, COMMON_METHODS, { "Map", (void *)res_map }, { "Unmap", (void *)res_unmap },
         { "GetDesc", (void *)res_get_desc }, { "GetGPUVirtualAddress", (void *)res_gpu_va }, { "GetHeapProperties", (void *)res_get_heap_props }, { NULL, NULL } };
     g_resource_vtbl = D3D_VTABLE(ID3D12Resource2, resource);
+    static const d3d_method memheap[] = {
+        { "QueryInterface", (void *)memheap_query }, COMMON_METHODS, { "GetDesc", (void *)memheap_get_desc },
+        { "GetProtectedResourceSession", (void *)memheap_session }, { NULL, NULL } };
+    g_memheap_vtbl = D3D_VTABLE(ID3D12Heap1, memheap);
     static const d3d_method blob[] = { { "QueryInterface", (void *)blob_query }, { "AddRef", (void *)obj_addref }, { "Release", (void *)obj_release },
                                        { "GetBufferPointer", (void *)blob_pointer }, { "GetBufferSize", (void *)blob_size }, { NULL, NULL } };
     g_blob_vtbl = D3D_VTABLE(ID3D10Blob, blob);
