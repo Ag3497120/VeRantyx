@@ -1018,8 +1018,11 @@ const dxil_md *dxil_md_op(const dxil_module *m, const dxil_md *node, uint32_t i)
 }
 
 int dxil_md_int(const dxil_module *m, const dxil_md *md, int64_t *out) {
-    if (!md || md->kind != DXM_VALUE || md->value >= m->nmodule_values || m->values[md->value].kind != DXV_CONST_INT) return 0;
-    *out = m->values[md->value].u.i;
+    if (!md || md->kind != DXM_VALUE || md->value >= m->nmodule_values) return 0;
+    const dxil_value *v = &m->values[md->value];
+    if (v->kind == DXV_CONST_NULL) { *out = 0; return 1; }       // (a zero integer is written as a null constant)
+    if (v->kind != DXV_CONST_INT) return 0;
+    *out = v->u.i;
     return 1;
 }
 
@@ -1032,7 +1035,7 @@ int dxil_dxop(const dxil_module *m, const dxil_function *f, const dxil_inst *in)
     const char *name = dxil_value_name(m, in->ops[0]);
     if (!name || strncmp(name, "dx.op.", 6)) return -1;
     const dxil_value *v = dxil_value_at(m, f, in->ops[1]);
-    return v && v->kind == DXV_CONST_INT ? (int)v->u.i : -1;
+    return v && v->kind == DXV_CONST_INT ? (int)v->u.i : v && v->kind == DXV_CONST_NULL ? 0 : -1;
 }
 
 // ---- dump ----------------------------------------------------------------------------------------------------------

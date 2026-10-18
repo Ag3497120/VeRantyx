@@ -202,6 +202,15 @@ build/dxildump: tools/dxildump.c src/dxil.c src/dxil.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tools/dxildump.c src/dxil.c
 
+# DXIL -> Metal Shading Language (src/dxil_msl.c): translated and compiled (dxil2msl), compute shaders run and checked (dxilrun).
+build/dxil2msl: tools/dxil2msl.m src/dxil_msl.c src/dxil_msl.h src/dxil.c src/dxil.h
+	@mkdir -p build
+	$(CC) -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0 -fobjc-arc -o $@ tools/dxil2msl.m src/dxil_msl.c src/dxil.c -framework Metal -framework Foundation
+
+build/dxilrun: tools/dxilrun.m src/dxil_msl.c src/dxil_msl.h src/dxil.c src/dxil.h
+	@mkdir -p build
+	$(CC) -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0 -fobjc-arc -o $@ tools/dxilrun.m src/dxil_msl.c src/dxil.c -framework Metal -framework Foundation
+
 build/dxc.exe: tools/dxc.cpp
 	@mkdir -p build
 	$(MINGWXX) -O1 -static -o $@ $<
@@ -288,7 +297,7 @@ vr-check: build/vxrt
 # The tests' C: drive and registry live in build/root, not in ~/.vxrt.
 check: export VXRT_ROOT = build/root
 check: export VXRT_NO_ACTIVATE = 1
-check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest build/dxildump
+check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest build/dxildump build/dxil2msl build/dxilrun
 	python3 ../tools/vxrt_games.py check
 	python3 ../tools/vxrt_agents.py check
 	python3 ../tools/vxrt_tune.py --selftest
@@ -296,6 +305,8 @@ check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest bui
 	build/x86dec_test
 	python3 translator/a64_check.py
 	python3 tools/dxil_check.py build/dxildump tests/shaders12
+	build/dxil2msl tests/shaders12/*.dxil
+	build/dxilrun tests/shaders12
 	build/difftest build/ref_x86 200
 	$(MAKE) runtime-tests VXRT=build/vxrt
 
