@@ -197,6 +197,15 @@ build/dxbc2msl: tools/dxbc2msl.m src/dxbc.c src/dxbc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ tools/dxbc2msl.m src/dxbc.c -framework Metal
 
+# DXIL (Shader Model 6, Direct3D 12): src/dxil.c reads the container and its LLVM bitcode.
+build/dxildump: tools/dxildump.c src/dxil.c src/dxil.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tools/dxildump.c src/dxil.c
+
+build/dxc.exe: tools/dxc.cpp
+	@mkdir -p build
+	$(MINGWXX) -O1 -static -o $@ $<
+
 build/draw.exe: tests/draw.c tests/shaders/*.h
 	@mkdir -p build
 	$(MINGW) -O1 -Itests -o $@ $< -ld3d11 -ldxgi -ldxguid -luuid -lm
@@ -261,6 +270,16 @@ shaders: build/vxrt build/hlslc.exe
 	@for s in $(SHADERS); do n=$${s%%:*}; p=$${s##*:}; \
 	  VXRT_ROOT=build/root build/vxrt build/hlslc.exe '$(D3DCOMPILER)' tests/shaders/$$n.hlsl main $$p tests/shaders/$$n.h $$n || exit 1; done
 
+# Shader Model 6 test shaders: HLSL compiled to DXIL by Microsoft's dxcompiler.dll running on vxrt (Chromium ships one
+# beside SteamVR's vrwebhelper), with dxcompiler's own disassembly of each as the reference tools/dxil_check.py reads
+# src/dxil.c's reading against. tests/shaders12/*.dxil and *.dis.txt are kept in the repository; regenerate with
+#   make shaders12 DXCOMPILER='Z:\path\to\dxcompiler.dll'
+SHADERS12 = color_ps:ps_6_0 tex_ps:ps_6_0 sum_cs:cs_6_0 color_vs:vs_6_0 bindless_ps:ps_6_6
+shaders12: build/vxrt build/dxc.exe
+	@for s in $(SHADERS12); do n=$${s%%:*}; p=$${s##*:}; \
+	  VXRT_ROOT=build/root build/vxrt build/dxc.exe '$(DXCOMPILER)' tests/shaders12/$$n.hlsl main $$p tests/shaders12/$$n.h $$n || exit 1; \
+	  VXRT_ROOT=build/root build/vxrt build/dxc.exe -dis '$(DXCOMPILER)' tests/shaders12/$$n.dxil tests/shaders12/$$n.dis.txt || exit 1; done
+
 # Games in VR against their profiles' baselines, games/*.json (tools/vxrt_run.py: own roots, simulated headset, evidence in runs/):
 # minutes per scenario; Mac Steam must be signed in and nothing else running. GAME=alyx|thelab|earth: only that one.
 vr-check: build/vxrt
@@ -269,13 +288,14 @@ vr-check: build/vxrt
 # The tests' C: drive and registry live in build/root, not in ~/.vxrt.
 check: export VXRT_ROOT = build/root
 check: export VXRT_NO_ACTIVATE = 1
-check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest
+check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest build/dxildump
 	python3 ../tools/vxrt_games.py check
 	python3 ../tools/vxrt_agents.py check
 	python3 ../tools/vxrt_tune.py --selftest
 	python3 ../tools/vxrt_playtest.py --selftest
 	build/x86dec_test
 	python3 translator/a64_check.py
+	python3 tools/dxil_check.py build/dxildump tests/shaders12
 	build/difftest build/ref_x86 200
 	$(MAKE) runtime-tests VXRT=build/vxrt
 

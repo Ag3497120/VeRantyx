@@ -26,3 +26,4 @@ build/steamvr-d3d11-proxy/.build-*
 /NativeARM/build/
 __pycache__/
 runs/
+VXRuntime/tests/shaders12/*.h
