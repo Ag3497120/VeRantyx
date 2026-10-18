@@ -185,5 +185,6 @@ command. A tune is many runs (half an hour or more): the user cannot play meanwh
 5. Measure again with the harness; repeat until it reaches SteamVR and draws. Run `make -C VXRuntime vr-check` for the
    games that already worked. Report what works and what is left, with run ids.
 
-Known limits: no Direct3D 12, no Vulkan, no tessellation; stream output only with a vertex shader's code (not from a
-geometry shader); geometry shaders run as compute (and split render passes). Each is a larger project; say so rather than starting it unasked.
+Known limits: Direct3D 12 only in its first steps (its tests pass, no game runs on it yet: `d3d12.m`, `dxil_msl.c`),
+no Vulkan, no tessellation; stream output only with a vertex shader's code (not from a geometry shader); geometry
+shaders run as compute (and split render passes). Each is a larger project; say so rather than starting it unasked.

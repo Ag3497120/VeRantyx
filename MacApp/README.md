@@ -91,6 +91,8 @@ VeRantyx.app/Contents/MacOS/VeRantyx -language ko --snapshot <folder>   # the sa
 - The steamcmd console with a stand-in program: lines written over themselves, steamcmd's progress lines (87 %,
   downloading), a line typed into it, its exit status.
 - The pages (`--snapshot`), in Japanese.
+- Signed with a Developer ID and notarized by Apple (release mac-v0.1.0); Alyx started from that signed bundle on the
+  MacBook Air M5 (`SteamAPI_Init` OK, map "startup").
 
 Not checked yet: a real steamcmd sign-in and download through the app (it needs the player's own account), a Quest or
-Pico, copying from another disk, a Developer ID signature and notarization.
+Pico, copying from another disk.

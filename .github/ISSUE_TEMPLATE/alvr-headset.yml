@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for testing! Steps: README, "Testing with a Quest or Pico (ALVR)". Please don't attach game files.
+        Thank you for testing! Steps: docs/VXRT.md, "Testing with a Quest or Pico (ALVR)". Please don't attach game files.
   - type: input
     id: headset
     attributes: {label: "Headset and ALVR client version", placeholder: "Quest 3, ALVR 20.14.1 (SideQuest)"}
