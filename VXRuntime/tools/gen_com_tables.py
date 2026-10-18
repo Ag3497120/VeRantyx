@@ -4,6 +4,7 @@
 # stub that reports itself as not implemented (d3d_not_implemented, defined by the includer).
 #   tools/gen_com_tables.py <mingw include dir> > src/d3d_tables.h
 #   tools/gen_com_tables.py <mingw include dir> audio > src/audio_tables.h
+#   tools/gen_com_tables.py <mingw include dir> d3d12 > src/d3d12_tables.h
 import re, sys
 
 AUDIO = {
@@ -45,6 +46,23 @@ def uuid(text, name):
 XAUDIO2 = {
     "xaudio2.h": ["IXAudio2", "IXAudio2SourceVoice", "IXAudio2SubmixVoice", "IXAudio2MasteringVoice"],
 }
+# Direct3D 12 (src/d3d12.m): the newest version of each interface is implemented with one table (each version's
+# methods are the previous one's and more), the older versions are there for their IIDs.
+D3D12 = {
+    "d3d12.h": ["ID3D12Object", "ID3D12DeviceChild", "ID3D12Pageable", "ID3D12Heap", "ID3D12Heap1", "ID3D12Resource",
+                "ID3D12Resource1", "ID3D12Resource2", "ID3D12CommandList", "ID3D12DescriptorHeap", "ID3D12QueryHeap",
+                "ID3D12CommandSignature", "ID3D12GraphicsCommandList", "ID3D12GraphicsCommandList1",
+                "ID3D12GraphicsCommandList2", "ID3D12GraphicsCommandList3", "ID3D12GraphicsCommandList4",
+                "ID3D12GraphicsCommandList5", "ID3D12GraphicsCommandList6", "ID3D12GraphicsCommandList7",
+                "ID3D12CommandQueue", "ID3D12RootSignature", "ID3D12PipelineState", "ID3D12Fence", "ID3D12Fence1",
+                "ID3D12CommandAllocator", "ID3D12Device", "ID3D12Device1", "ID3D12Device2", "ID3D12Device3",
+                "ID3D12Device4", "ID3D12Device5", "ID3D12Device6", "ID3D12Device7", "ID3D12Device8", "ID3D12Device9",
+                "ID3D12Device10", "ID3D12RootSignatureDeserializer", "ID3D12VersionedRootSignatureDeserializer"],
+    "d3d12sdklayers.h": ["ID3D12Debug", "ID3D12Debug1", "ID3D12Debug2", "ID3D12Debug3", "ID3D12Debug4", "ID3D12Debug5"],
+    "d3dcommon.h": ["ID3D10Blob"],
+}
+if len(sys.argv) > 2 and sys.argv[2] == "d3d12":
+    INTERFACES = D3D12
 if len(sys.argv) > 2 and sys.argv[2] == "audio":
     INTERFACES = AUDIO
 if len(sys.argv) > 2 and sys.argv[2] == "xaudio2":

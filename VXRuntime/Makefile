@@ -2,13 +2,13 @@
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
 SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/extras.c src/context.S src/text.c src/files.c src/registry.c \
-          src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/input.m src/audio.m src/xaudio2.m
+          src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d12.m src/dxil.c src/dxil_msl.c src/input.m src/audio.m src/xaudio2.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
 
-build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
+build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -Wl,-pagezero_size,0x10000
 
@@ -27,13 +27,13 @@ build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator
 build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
 	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
-build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
+build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
 	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework Hypervisor build/libvxrt_vm.dylib build/guest.o
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe
+       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -223,6 +223,10 @@ build/compute.exe: tests/compute.c tests/shaders/*.h
 	@mkdir -p build
 	$(MINGW) -O1 -Itests -o $@ $< -ld3d11 -ldxguid -luuid -lm
 
+build/d3d12.exe: tests/d3d12.c tests/shaders12/sum_cs.dxil
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -ld3d12 -lm
+
 build/input.exe: tests/input.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lxinput
@@ -340,6 +344,7 @@ runtime-tests: $(VXRT) tests
 	build/dxbcscan tests/shaders/*.dxbc
 	$(VXRT) build/draw.exe
 	$(VXRT) build/compute.exe
+	$(VXRT) build/d3d12.exe
 	$(VXRT) build/input.exe
 	$(VXRT) build/audio.exe
 	$(VXRT) build/xaudio2.exe
