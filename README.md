@@ -1,27 +1,29 @@
-# VeRantyx
+# VeRantyx — native: Valve's ARM64 Half-Life: Alyx on macOS
 
-> **This is the `native` branch**: Valve's Linux ARM64 build on macOS, no Wine. The Wine version is on the [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine) branch; `main` has both.
+> **This is the `native` branch, kept as it was on 2026-10-11.** The current version of VeRantyx, which runs the
+> Windows build of Alyx and other SteamVR games without Wine, is on [`main`](https://github.com/Ag3497120/VeRantyx#readme)
+> (with a no-Terminal Mac app). Other versions: [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) ·
+> [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine)
 
-**Play PC VR games from an Apple Silicon Mac in an Apple Vision Pro — with your hands and a pair of Joy-Con, no tracked VR controllers.**
+**Half-Life: Alyx from an Apple silicon Mac in an Apple Vision Pro — no Wine, no Rosetta, no SteamVR — with your
+hands and a pair of Joy-Con, no tracked VR controllers.**
 
-VeRantyx renders Half-Life: Alyx on the Mac, streams every stereo frame to a
-native visionOS app in hardware-encoded HEVC, and sends the headset's head and
-hand poses back. Hands are tracked by the Vision Pro; buttons, sticks and
-triggers come from Nintendo Switch Joy-Con (one in each hand), or the game is
-played with bare hands. No tracked VR controllers are needed: the PS VR2 Sense
-controllers that other Vision Pro ports of Alyx require are not sold in every
-region (not in Japan at the time of writing).
+Valve's **Linux ARM64** build of Half-Life: Alyx (made for the Steam Frame) runs natively on macOS through a patched
+[Klepton](https://github.com/shinyquagsire23/Klepton) loader, a glibc compatibility layer and an OpenVR runtime of
+our own. The Mac renders the game, streams every stereo frame to a native visionOS app in hardware-encoded HEVC, and
+gets the headset's head and hand poses back. Hands are tracked by the Vision Pro; buttons, sticks and triggers come
+from Nintendo Switch Joy-Con (one in each hand), or the game is played with bare hands. No tracked VR controllers are
+needed: the PS VR2 Sense controllers that other Vision Pro ports of Alyx require are not sold in every region (not in
+Japan at the time of writing).
 
-There are **two versions**, on their own branches:
+| | |
+|---|---|
+| Game | Half-Life: Alyx only (the only SteamVR title with a Linux ARM64 build) |
+| Measured | Menu at 60 fps, levels played for 20+ minutes on a MacBook Pro M1 Max |
+| Headset | Apple Vision Pro (M2 or M5), the VeRantyx visionOS app |
+| Setup | [docs/NATIVE_SETUP.md](docs/NATIVE_SETUP.md) (Terminal, Xcode) |
 
-| Branch | How the game runs on the Mac | Status |
-|---|---|---|
-| [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) | Valve's **Linux ARM64** build of Half-Life: Alyx (made for the Steam Frame) runs natively on macOS — no Wine, no Rosetta, no SteamVR — through a patched [Klepton](https://github.com/shinyquagsire23/Klepton) loader, a glibc compatibility layer and an OpenVR runtime of our own | New (2026-10-11). Menu at 60 fps, levels played for 20+ minutes on an M1 Max |
-| [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine) | The Windows build with the real Windows SteamVR under Wine 11, DXVK → MoltenVK, and a SteamVR driver of our own | Stable since 2026-10-10; ~30 fps in game on an M1 Max |
-| `main` | Both of the above | Development |
-
-Both versions share the Mac HEVC encoder (`MacEncoder/`) and the Vision Pro
-app (`VisionProClient/`).
+The Mac HEVC encoder (`MacEncoder/`) and the Vision Pro app (`VisionProClient/`) are shared with the other versions.
 
 ### Native version (Linux ARM64 build, no Wine) — recorded 2026-10-11
 
@@ -33,18 +35,6 @@ app (`VisionProClient/`).
 The Joy-Con it is played with (seen through the passthrough), hands and fingers
 in Russell's lab, gravity gloves (pulling and catching a helmet), then
 reloading the pistol. 60 fps on an M1 Max. Full 6-minute unedited recording of the native version: https://youtu.be/2z-GyAqAtpA.*
-
-### Wine version (Windows build + SteamVR under Wine) — recorded 2026-10-10
-
-<!-- VIDEO: after uploading docs/media/highlight.mp4 through the README editor
-     on github.com, replace the poster link below with the generated
-     https://github.com/user-attachments/... URL on its own line; GitHub then
-     renders a player. -->
-![Wine version: Half-Life: Alyx in Apple Vision Pro, rendered on a MacBook Pro (54-second highlight; the last seconds show the room through the headset's passthrough)](docs/media/highlight.gif)
-
-[![Wine version — watch the full recording on YouTube](docs/media/poster.jpg)](https://youtu.be/6xVGgdChDes)
-
-*Wine version, 54-second highlight: [docs/media/highlight.mp4](docs/media/highlight.mp4) — the last seconds show the room through the Vision Pro's passthrough, where it was recorded. Full 6-minute unedited recording of the Wine version: https://youtu.be/6xVGgdChDes.*
 
 MIT licensed. No proprietary code is included (see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)): Wine, DXVK and Steam are
