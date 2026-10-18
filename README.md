@@ -35,6 +35,12 @@ Windows SteamVR games run on our own Windows runtime and stream to Apple Vision 
 That's it. Details, languages (11) and what is checked: [MacApp/README.md](MacApp/README.md).
 Prefer Terminal? `scripts/setup_vxrt.sh` then `scripts/launch_vxrt_alyx.sh` — see [the vxrt guide](docs/VXRT.md#quick-start).
 
+<p align="center">
+  <img src="docs/media/app-setup.png" width="32%" alt="VeRantyx for Mac: Get started, every step checked">
+  <img src="docs/media/app-play.png" width="32%" alt="VeRantyx for Mac: Play, the installed games with what is known about each">
+  <img src="docs/media/app-headset.png" width="32%" alt="VeRantyx for Mac: Headset, Vision Pro with hands and Joy-Con, or ALVR headsets">
+</p>
+
 ## What runs
 
 | Game | Status on VXRuntime | Measured |
