@@ -58,6 +58,25 @@ typedef struct { uint64_t offset; uint32_t format, width, height, depth, row_pit
 typedef struct { void *res; int32_t type; uint32_t pad; union { FOOTPRINT footprint; uint32_t subresource; }; } COPY_LOC;
 typedef struct { uint32_t left, top, front, right, bottom, back; } BOX;
 typedef struct { size_t begin, end; } RANGE;
+typedef struct { const void *decl; uint32_t n, pad; const uint32_t *strides; uint32_t nstrides, rasterized; } SO_DESC;
+typedef struct { int32_t enable, logic_enable, src, dst, op, src_a, dst_a, op_a, logic_op; uint8_t mask, pad[3]; } RT_BLEND;
+typedef struct { int32_t a2c, independent; RT_BLEND rt[8]; } BLEND_DESC;
+typedef struct { int32_t fill, cull, front_ccw, depth_bias; float bias_clamp, slope; int32_t depth_clip, msaa, aa_lines; uint32_t forced_samples; int32_t conservative; } RASTER_DESC;
+typedef struct { int32_t fail, depth_fail, pass, func; } STENCIL_OP;
+typedef struct { int32_t depth_enable, depth_write, depth_func, stencil_enable; uint8_t read_mask, write_mask, pad[2]; STENCIL_OP front, back; } DS_DESC;
+typedef struct { const void *elements; uint32_t n, pad; } IL_DESC;
+typedef struct {
+    void *root; BYTECODE vs, ps, ds, hs, gs; SO_DESC so; BLEND_DESC blend; uint32_t sample_mask; RASTER_DESC raster; DS_DESC depth;
+    IL_DESC input; int32_t strip_cut, topology_type; uint32_t nrt, rtv_formats[8], dsv_format, samples, quality, node;
+    const void *cached; size_t cached_size; int32_t flags;
+} GFX_PSO_DESC;
+typedef struct { const char *name; uint32_t index, format, slot, offset; int32_t cls; uint32_t step; } INPUT_ELEMENT;
+typedef struct { uint32_t format; int32_t dim; union { struct { uint32_t mip, plane; } tex2d; struct { uint32_t mip, first, size, plane; } tex2darray; uint32_t raw[4]; }; } RTV_DESC;
+typedef struct { uint32_t format; int32_t dim; int32_t flags; union { struct { uint32_t mip; } tex2d; struct { uint32_t mip, first, size; } tex2darray; uint32_t raw[3]; }; } DSV_DESC;
+typedef struct { float x, y, w, h, min_depth, max_depth; } VIEWPORT;
+typedef struct { int32_t left, top, right, bottom; } RECT12;
+typedef struct { uint64_t va; uint32_t size, stride; } VBV;
+typedef struct { uint64_t va; uint32_t size, format; } IBV;
 
 // ---- objects ----------------------------------------------------------------------------------------------------
 
@@ -71,6 +90,8 @@ struct dev12 {
     NSMutableArray *resources;       // every live buffer and texture (made resident for each command buffer)
     pthread_mutex_t lock;
     NSMutableDictionary *pso_cache;  // MSL source -> id<MTLComputePipelineState>
+    void **bufs;                     // the buffers (res12), for a GPU address's buffer (vertex and index buffers)
+    uint32_t nbufs, capbufs;
 };
 
 typedef struct { d3d_object base; dev12 *dev; Q_DESC desc; } queue12;
@@ -114,12 +135,23 @@ typedef struct {
     d3d_object base; dev12 *dev;
     id<MTLComputePipelineState> compute;
     dxil_msl msl;                    // the translation's slots and thread counts (msl.msl freed)
+    // graphics
+    id<MTLRenderPipelineState> render;
+    id<MTLDepthStencilState> depth;
+    dxil_msl vs, ps;                 // their slots
+    MTLCullMode cull;
+    MTLWinding winding;
+    MTLTriangleFillMode fill;
+    MTLDepthClipMode clip;
+    float bias, bias_slope, bias_clamp;
+    int has_depth, has_stencil;
 } pso12;
 
 typedef struct { d3d_object base; void *data; size_t size; } blob12;
 
 // Recorded commands, replayed when the list is executed.
-enum { C_PSO, C_ROOTSIG, C_HEAPS, C_TABLE, C_CONSTANTS, C_ROOT_VA, C_DISPATCH, C_COPY_BUFFER, C_COPY_RESOURCE, C_COPY_TEXTURE, C_UAV_BARRIER };
+enum { C_PSO, C_ROOTSIG, C_HEAPS, C_TABLE, C_CONSTANTS, C_ROOT_VA, C_DISPATCH, C_COPY_BUFFER, C_COPY_RESOURCE, C_COPY_TEXTURE, C_UAV_BARRIER,
+       C_TOPOLOGY, C_VB, C_IB, C_TARGETS, C_VIEWPORTS, C_SCISSORS, C_CLEAR_RTV, C_CLEAR_DSV, C_DRAW, C_DRAW_INDEXED, C_BLEND_FACTOR, C_STENCIL_REF };
 typedef struct {
     int op;
     uint32_t a, b, c;
@@ -129,6 +161,8 @@ typedef struct {
     COPY_LOC dst, src;
     BOX box;
     int has_box;
+    int gfx;                         // root signature and root arguments: the graphics ones (else compute)
+    void *tex[9];                    // C_TARGETS, clears: the views (retained Metal textures), depth last
     uint32_t values[64];
 } cmd12;
 
@@ -396,6 +430,7 @@ static void res_destroy(d3d_object *o) {
     res12 *r = (res12 *)o;
     dev12 *d = r->dev;
     pthread_mutex_lock(&d->lock);
+    for (uint32_t i = 0; r->buffer && i < d->nbufs; i++) if (d->bufs[i] == r) { d->bufs[i] = d->bufs[--d->nbufs]; break; }
     if (r->buffer) [d->resources removeObjectIdenticalTo:r->buffer];
     if (r->texture) [d->resources removeObjectIdenticalTo:r->texture];
     pthread_mutex_unlock(&d->lock);
@@ -439,6 +474,12 @@ static HRESULT create_committed(dev12 *d, const HEAP_PROPS *hp, int32_t heap_fla
     } else {
         uint32_t bpp = 0;
         MTLPixelFormat fmt = d3d_mtl_format(desc->Format, &bpp);
+        if (desc->Flags & 0x2) {                                   // ALLOW_DEPTH_STENCIL: a typeless format as its depth format
+            uint32_t f = desc->Format;
+            if (f == 39 || f == 40 || f == 41) fmt = MTLPixelFormatDepth32Float;
+            else if (f == 19 || f == 20 || f == 21 || f == 44 || f == 45 || f == 46 || f == 47) fmt = MTLPixelFormatDepth32Float_Stencil8;
+            else if (f == 53 || f == 55 || f == 56) fmt = MTLPixelFormatDepth16Unorm;
+        }
         if (fmt == MTLPixelFormatInvalid) { vx_log("D3D12: texture format %u is not supported", desc->Format); d3d_release(&r->base); return E_INVALIDARG; }
         MTLTextureDescriptor *td = [MTLTextureDescriptor new];
         td.pixelFormat = fmt;
@@ -459,6 +500,10 @@ static HRESULT create_committed(dev12 *d, const HEAP_PROPS *hp, int32_t heap_fla
     }
     pthread_mutex_lock(&d->lock);
     [d->resources addObject:r->buffer ? (id)r->buffer : (id)r->texture];
+    if (r->buffer) {
+        if (d->nbufs == d->capbufs) { d->capbufs = d->capbufs ? d->capbufs * 2 : 256; d->bufs = realloc(d->bufs, d->capbufs * sizeof *d->bufs); }
+        d->bufs[d->nbufs++] = r;
+    }
     pthread_mutex_unlock(&d->lock);
     if (!out) { d3d_release(&r->base); return S_FALSE; }
     HRESULT hr = res_query(r, iid, out);
@@ -682,7 +727,7 @@ static WINAPI HRESULT dev_create_fence(void *this, uint64_t initial, int32_t fla
 
 // ---- pipeline states ---------------------------------------------------------------------------------------------
 
-static void pso_destroy(d3d_object *o) { pso12 *p = (pso12 *)o; p->compute = nil; release_dev(o); }
+static void pso_destroy(d3d_object *o) { pso12 *p = (pso12 *)o; p->compute = nil; p->render = nil; p->depth = nil; release_dev(o); }
 static WINAPI HRESULT pso_query(void *this, const GUID *iid, void **out) {
     const GUID *k[] = { &IID_ID3D12PipelineState, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
     return query(this, iid, out, k, 4);
@@ -757,6 +802,7 @@ static void list_clear(list12 *l) {
         if (c->obj) d3d_release(c->obj);
         if (c->obj2) d3d_release(c->obj2);
         if (c->op == C_COPY_TEXTURE) { if (c->dst.res) d3d_release(c->dst.res); if (c->src.res) d3d_release(c->src.res); }
+        for (int k = 0; k < 9; k++) if (c->tex[k]) CFRelease(c->tex[k]);
     }
     l->n = 0;
 }
@@ -818,6 +864,297 @@ static WINAPI void list_copy_texture(void *this, const COPY_LOC *dst, uint32_t x
 }
 static WINAPI void list_barrier(void *this, uint32_t n, const void *barriers) { rec(this, C_UAV_BARRIER); }   // (Metal tracks the hazards it sees; see replay)
 
+// Render target and depth-stencil views: CPU-only descriptors holding the Metal texture view they draw to (read
+// when OMSetRenderTargets or a clear is recorded, as D3D12 reads them then).
+static WINAPI void dev_create_rtv(void *this, void *resource, const RTV_DESC *desc, size_t cpu) {
+    res12 *r = resource;
+    VxDesc v = { 0 };
+    id keep = nil;
+    if (r && r->texture) {
+        int32_t dim = desc ? desc->dim : (r->desc.DepthOrArraySize > 1 ? 5 : 4);   // D3D12_RTV_DIMENSION: 4 tex2d, 5 tex2darray
+        uint32_t mip = 0, slice = 0, slices = 1;
+        if (desc && dim == 4) mip = desc->tex2d.mip;
+        if (desc && dim == 5) { mip = desc->tex2darray.mip; slice = desc->tex2darray.first; slices = desc->tex2darray.size; }
+        id<MTLTexture> t = texture_view(r, desc ? desc->format : 0, r->texture.sampleCount > 1 ? MTLTextureType2DMultisample : MTLTextureType2D, mip, 1, slice, 1);
+        (void)slices;
+        v.fmt = desc ? desc->format : r->desc.Format;
+        keep = t;
+    }
+    put_desc(cpu, &v, keep);
+}
+
+static WINAPI void dev_create_dsv(void *this, void *resource, const DSV_DESC *desc, size_t cpu) {
+    res12 *r = resource;
+    VxDesc v = { 0 };
+    id keep = nil;
+    if (r && r->texture) {
+        uint32_t mip = desc && desc->dim == 3 ? desc->tex2d.mip : 0, slice = desc && desc->dim == 4 ? desc->tex2darray.first : 0;
+        if (desc && desc->dim == 4) mip = desc->tex2darray.mip;
+        keep = [r->texture newTextureViewWithPixelFormat:r->texture.pixelFormat textureType:r->texture.sampleCount > 1 ? MTLTextureType2DMultisample : MTLTextureType2D
+                                                  levels:NSMakeRange(mip, 1) slices:NSMakeRange(slice, 1)];
+        v.fmt = desc ? desc->format : r->desc.Format;
+    }
+    put_desc(cpu, &v, keep);
+}
+
+// The Metal texture a CPU descriptor (RTV/DSV) names, retained for a recorded command; NULL for none.
+static void *view_texture(size_t cpu) {
+    uint32_t i;
+    heap12 *h = heap_at(cpu, &i);
+    if (!h || !h->keep[i]) return NULL;
+    return (void *)CFBridgingRetain(h->keep[i]);
+}
+
+// ---- graphics pipeline states -------------------------------------------------------------------------------------------
+
+static MTLBlendFactor blend_factor(int32_t b) {
+    switch (b) {
+    case 1: return MTLBlendFactorZero;
+    case 3: return MTLBlendFactorSourceColor;
+    case 4: return MTLBlendFactorOneMinusSourceColor;
+    case 5: return MTLBlendFactorSourceAlpha;
+    case 6: return MTLBlendFactorOneMinusSourceAlpha;
+    case 7: return MTLBlendFactorDestinationAlpha;
+    case 8: return MTLBlendFactorOneMinusDestinationAlpha;
+    case 9: return MTLBlendFactorDestinationColor;
+    case 10: return MTLBlendFactorOneMinusDestinationColor;
+    case 11: return MTLBlendFactorSourceAlphaSaturated;
+    case 14: return MTLBlendFactorBlendColor;
+    case 15: return MTLBlendFactorOneMinusBlendColor;
+    case 16: return MTLBlendFactorSource1Color;
+    case 17: return MTLBlendFactorOneMinusSource1Color;
+    case 18: return MTLBlendFactorSource1Alpha;
+    case 19: return MTLBlendFactorOneMinusSource1Alpha;
+    case 20: return MTLBlendFactorBlendAlpha;
+    case 21: return MTLBlendFactorOneMinusBlendAlpha;
+    default: return MTLBlendFactorOne;
+    }
+}
+static MTLBlendOperation blend_op(int32_t o) {
+    switch (o) {
+    case 2: return MTLBlendOperationSubtract;
+    case 3: return MTLBlendOperationReverseSubtract;
+    case 4: return MTLBlendOperationMin;
+    case 5: return MTLBlendOperationMax;
+    default: return MTLBlendOperationAdd;
+    }
+}
+static MTLCompareFunction compare(int32_t f) {
+    static const MTLCompareFunction m[] = { MTLCompareFunctionAlways, MTLCompareFunctionNever, MTLCompareFunctionLess, MTLCompareFunctionEqual,
+                                            MTLCompareFunctionLessEqual, MTLCompareFunctionGreater, MTLCompareFunctionNotEqual,
+                                            MTLCompareFunctionGreaterEqual, MTLCompareFunctionAlways };
+    return f >= 1 && f <= 8 ? m[f] : MTLCompareFunctionAlways;
+}
+static MTLStencilOperation stencil_op(int32_t o) {
+    static const MTLStencilOperation m[] = { MTLStencilOperationKeep, MTLStencilOperationKeep, MTLStencilOperationZero, MTLStencilOperationReplace,
+                                             MTLStencilOperationIncrementClamp, MTLStencilOperationDecrementClamp, MTLStencilOperationInvert,
+                                             MTLStencilOperationIncrementWrap, MTLStencilOperationDecrementWrap };
+    return o >= 1 && o <= 8 ? m[o] : MTLStencilOperationKeep;
+}
+static MTLStencilDescriptor *stencil(const STENCIL_OP *o, uint8_t rm, uint8_t wm) {
+    MTLStencilDescriptor *s = [MTLStencilDescriptor new];
+    s.stencilFailureOperation = stencil_op(o->fail);
+    s.depthFailureOperation = stencil_op(o->depth_fail);
+    s.depthStencilPassOperation = stencil_op(o->pass);
+    s.stencilCompareFunction = compare(o->func);
+    s.readMask = rm;
+    s.writeMask = wm;
+    return s;
+}
+
+static MTLVertexFormat vertex_format(uint32_t f) {
+    switch (f) {
+    case 2: return MTLVertexFormatFloat4;   case 6: return MTLVertexFormatFloat3;   case 16: return MTLVertexFormatFloat2;  case 41: return MTLVertexFormatFloat;
+    case 3: return MTLVertexFormatUInt4;    case 7: return MTLVertexFormatUInt3;    case 17: return MTLVertexFormatUInt2;   case 42: return MTLVertexFormatUInt;
+    case 4: return MTLVertexFormatInt4;     case 8: return MTLVertexFormatInt3;     case 18: return MTLVertexFormatInt2;    case 43: return MTLVertexFormatInt;
+    case 10: return MTLVertexFormatHalf4;   case 34: return MTLVertexFormatHalf2;   case 54: return MTLVertexFormatHalf;
+    case 11: return MTLVertexFormatUShort4Normalized; case 35: return MTLVertexFormatUShort2Normalized; case 56: return MTLVertexFormatUShortNormalized;
+    case 12: return MTLVertexFormatUShort4; case 36: return MTLVertexFormatUShort2; case 57: return MTLVertexFormatUShort;
+    case 13: return MTLVertexFormatShort4Normalized;  case 37: return MTLVertexFormatShort2Normalized;  case 58: return MTLVertexFormatShortNormalized;
+    case 14: return MTLVertexFormatShort4;  case 38: return MTLVertexFormatShort2;  case 59: return MTLVertexFormatShort;
+    case 24: return MTLVertexFormatUInt1010102Normalized;
+    case 28: return MTLVertexFormatUChar4Normalized;  case 49: return MTLVertexFormatUChar2Normalized; case 61: return MTLVertexFormatUCharNormalized;
+    case 30: return MTLVertexFormatUChar4;  case 50: return MTLVertexFormatUChar2;  case 62: return MTLVertexFormatUChar;
+    case 31: return MTLVertexFormatChar4Normalized;   case 51: return MTLVertexFormatChar2Normalized;  case 63: return MTLVertexFormatCharNormalized;
+    case 32: return MTLVertexFormatChar4;   case 52: return MTLVertexFormatChar2;   case 64: return MTLVertexFormatChar;
+    case 87: return MTLVertexFormatUChar4Normalized_BGRA;
+    }
+    return MTLVertexFormatInvalid;
+}
+
+static id<MTLFunction> stage_function(dev12 *d, const BYTECODE *code, dxil_msl *out, const char *what) {
+    dxil_module m;
+    if (dxil_read(code->code, code->size, &m)) { vx_log("D3D12: %s: %s", what, m.error); return nil; }
+    int rc = dxil_to_msl(&m, out);
+    dxil_free(&m);
+    if (rc) { vx_log("D3D12: %s not translated: %s", what, out->error); return nil; }
+    MTLCompileOptions *opt = [MTLCompileOptions new];
+    opt.languageVersion = MTLLanguageVersion3_1;
+    NSError *err = nil;
+    id<MTLLibrary> lib = [d->mtl newLibraryWithSource:@(out->msl) options:opt error:&err];
+    if (!lib) { vx_log("D3D12: %s did not compile: %s\n%s", what, err.localizedDescription.UTF8String, out->msl); return nil; }
+    dxil_msl_free(out);
+    return [lib newFunctionWithName:@"vx_main"];
+}
+
+static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
+    dev12 *d = this;
+    if (desc->hs.size || desc->ds.size || desc->gs.size) { vx_log("D3D12: hull, domain and geometry shaders are not done yet"); return E_NOTIMPL; }
+    pso12 *p = alloc12(sizeof *p, K12_PSO, g_pso_vtbl, d);
+    p->base.destroy = pso_destroy;
+    MTLRenderPipelineDescriptor *rp = [MTLRenderPipelineDescriptor new];
+    rp.vertexFunction = stage_function(d, &desc->vs, &p->vs, "vertex shader");
+    if (!rp.vertexFunction) { d3d_release(&p->base); return E_INVALIDARG; }
+    if (desc->ps.size) {
+        rp.fragmentFunction = stage_function(d, &desc->ps, &p->ps, "pixel shader");
+        if (!rp.fragmentFunction) { d3d_release(&p->base); return E_INVALIDARG; }
+    }
+    // the input layout, onto the vertex shader's [[attribute(n)]] by semantic (vertex buffers at Metal buffers 16 + slot)
+    MTLVertexDescriptor *vd = [MTLVertexDescriptor new];
+    uint32_t running[16] = { 0 };
+    const INPUT_ELEMENT *el = desc->input.elements;
+    for (uint32_t i = 0; i < desc->input.n; i++) {
+        const INPUT_ELEMENT *e = &el[i];
+        uint32_t slot = e->slot < 16 ? e->slot : 15, off = e->offset == 0xFFFFFFFFu ? running[slot] : e->offset;
+        uint32_t bpp = 0;
+        d3d_mtl_format(e->format, &bpp);
+        running[slot] = off + (bpp ? bpp : 4);
+        for (uint32_t k = 0; k < p->vs.ninputs; k++) {
+            const dxil_msl_element *x = &p->vs.inputs[k];
+            if (strcasecmp(x->name, e->name) || x->index != e->index) continue;
+            MTLVertexFormat vf = vertex_format(e->format);
+            if (vf == MTLVertexFormatInvalid) vx_log("D3D12: vertex format %u is not supported", e->format);
+            vd.attributes[x->attribute].format = vf;
+            vd.attributes[x->attribute].offset = off;
+            vd.attributes[x->attribute].bufferIndex = 16 + slot;
+            vd.layouts[16 + slot].stride = MTLBufferLayoutStrideDynamic;
+            vd.layouts[16 + slot].stepFunction = e->cls == 1 ? MTLVertexStepFunctionPerInstance : MTLVertexStepFunctionPerVertex;
+            vd.layouts[16 + slot].stepRate = e->cls == 1 ? (e->step ? e->step : 1) : 1;
+        }
+    }
+    rp.vertexDescriptor = vd;
+    for (uint32_t i = 0; i < desc->nrt && i < 8; i++) {
+        uint32_t bpp;
+        MTLPixelFormat f = d3d_mtl_format(desc->rtv_formats[i], &bpp);
+        rp.colorAttachments[i].pixelFormat = f;
+        const RT_BLEND *b = &desc->blend.rt[desc->blend.independent ? i : 0];
+        rp.colorAttachments[i].blendingEnabled = b->enable != 0;
+        rp.colorAttachments[i].sourceRGBBlendFactor = blend_factor(b->src);
+        rp.colorAttachments[i].destinationRGBBlendFactor = blend_factor(b->dst);
+        rp.colorAttachments[i].rgbBlendOperation = blend_op(b->op);
+        rp.colorAttachments[i].sourceAlphaBlendFactor = blend_factor(b->src_a);
+        rp.colorAttachments[i].destinationAlphaBlendFactor = blend_factor(b->dst_a);
+        rp.colorAttachments[i].alphaBlendOperation = blend_op(b->op_a);
+        MTLColorWriteMask m = 0;
+        if (b->mask & 1) m |= MTLColorWriteMaskRed;
+        if (b->mask & 2) m |= MTLColorWriteMaskGreen;
+        if (b->mask & 4) m |= MTLColorWriteMaskBlue;
+        if (b->mask & 8) m |= MTLColorWriteMaskAlpha;
+        rp.colorAttachments[i].writeMask = m;
+    }
+    if (desc->dsv_format) {
+        uint32_t f = desc->dsv_format;
+        MTLPixelFormat df = f == 55 ? MTLPixelFormatDepth16Unorm : f == 40 ? MTLPixelFormatDepth32Float : MTLPixelFormatDepth32Float_Stencil8;
+        rp.depthAttachmentPixelFormat = df;
+        p->has_depth = 1;
+        if (df == MTLPixelFormatDepth32Float_Stencil8) { rp.stencilAttachmentPixelFormat = df; p->has_stencil = 1; }
+    }
+    rp.rasterSampleCount = desc->samples ? desc->samples : 1;
+    rp.alphaToCoverageEnabled = desc->blend.a2c != 0;
+    // D3D12_PRIMITIVE_TOPOLOGY_TYPE: 1 point, 2 line, 3 triangle
+    rp.inputPrimitiveTopology = desc->topology_type == 1 ? MTLPrimitiveTopologyClassPoint : desc->topology_type == 2 ? MTLPrimitiveTopologyClassLine : MTLPrimitiveTopologyClassTriangle;
+    NSError *err = nil;
+    p->render = [d->mtl newRenderPipelineStateWithDescriptor:rp error:&err];
+    if (!p->render) { vx_log("D3D12: graphics pipeline: %s", err.localizedDescription.UTF8String); d3d_release(&p->base); return E_INVALIDARG; }
+    MTLDepthStencilDescriptor *ds = [MTLDepthStencilDescriptor new];
+    if (desc->depth.depth_enable && p->has_depth) {
+        ds.depthCompareFunction = compare(desc->depth.depth_func);
+        ds.depthWriteEnabled = desc->depth.depth_write != 0;
+    }
+    if (desc->depth.stencil_enable && p->has_stencil) {
+        ds.frontFaceStencil = stencil(&desc->depth.front, desc->depth.read_mask, desc->depth.write_mask);
+        ds.backFaceStencil = stencil(&desc->depth.back, desc->depth.read_mask, desc->depth.write_mask);
+    }
+    p->depth = [d->mtl newDepthStencilStateWithDescriptor:ds];
+    // D3D12_CULL_MODE: 1 none, 2 front, 3 back; D3D12_FILL_MODE: 2 wireframe, 3 solid
+    p->cull = desc->raster.cull == 2 ? MTLCullModeFront : desc->raster.cull == 3 ? MTLCullModeBack : MTLCullModeNone;
+    p->winding = desc->raster.front_ccw ? MTLWindingCounterClockwise : MTLWindingClockwise;
+    p->fill = desc->raster.fill == 2 ? MTLTriangleFillModeLines : MTLTriangleFillModeFill;
+    p->clip = desc->raster.depth_clip ? MTLDepthClipModeClip : MTLDepthClipModeClamp;
+    p->bias = (float)desc->raster.depth_bias;
+    p->bias_slope = desc->raster.slope;
+    p->bias_clamp = desc->raster.bias_clamp;
+    HRESULT hr = pso_query(p, iid, out);
+    d3d_release(&p->base);
+    return hr;
+}
+
+// ---- command lists: graphics recording -----------------------------------------------------------------------------
+
+static WINAPI void list_set_gfx_root(void *this, void *rs) { cmd12 *c = rec(this, C_ROOTSIG); c->obj = rs; c->gfx = 1; hold(rs); }
+static WINAPI void list_set_gfx_table(void *this, uint32_t param, uint64_t gpu) { cmd12 *c = rec(this, C_TABLE); c->a = param; c->va = gpu; c->gfx = 1; }
+static WINAPI void list_set_gfx_constant(void *this, uint32_t param, uint32_t value, uint32_t offset) {
+    cmd12 *c = rec(this, C_CONSTANTS);
+    c->a = param; c->b = 1; c->c = offset; c->values[0] = value; c->gfx = 1;
+}
+static WINAPI void list_set_gfx_constants(void *this, uint32_t param, uint32_t n, const void *values, uint32_t offset) {
+    cmd12 *c = rec(this, C_CONSTANTS);
+    c->a = param; c->b = n > 64 ? 64 : n; c->c = offset; c->gfx = 1;
+    memcpy(c->values, values, 4 * c->b);
+}
+static WINAPI void list_set_gfx_root_va(void *this, uint32_t param, uint64_t va) { cmd12 *c = rec(this, C_ROOT_VA); c->a = param; c->va = va; c->gfx = 1; }
+static WINAPI void list_topology(void *this, int32_t t) { cmd12 *c = rec(this, C_TOPOLOGY); c->a = (uint32_t)t; }
+static WINAPI void list_vbs(void *this, uint32_t start, uint32_t n, const VBV *views) {
+    cmd12 *c = rec(this, C_VB);
+    c->a = start; c->b = n > 16 ? 16 : n;
+    if (views) memcpy(c->values, views, c->b * sizeof(VBV));
+    else memset(c->values, 0, sizeof c->values);
+}
+static WINAPI void list_ib(void *this, const IBV *view) {
+    cmd12 *c = rec(this, C_IB);
+    if (view) memcpy(c->values, view, sizeof *view);
+}
+static WINAPI void list_targets(void *this, uint32_t n, const size_t *rtvs, int32_t single, const size_t *dsv) {
+    cmd12 *c = rec(this, C_TARGETS);
+    c->a = n > 8 ? 8 : n;
+    for (uint32_t i = 0; i < c->a; i++) c->tex[i] = view_texture(single ? rtvs[0] + 32 * (size_t)i : rtvs[i]);
+    if (dsv) c->tex[8] = view_texture(*dsv);
+}
+static WINAPI void list_viewports(void *this, uint32_t n, const VIEWPORT *v) {
+    cmd12 *c = rec(this, C_VIEWPORTS);
+    c->a = n > 10 ? 10 : n;
+    memcpy(c->values, v, c->a * sizeof *v);
+}
+static WINAPI void list_scissors(void *this, uint32_t n, const RECT12 *r) {
+    cmd12 *c = rec(this, C_SCISSORS);
+    c->a = n > 16 ? 16 : n;
+    memcpy(c->values, r, c->a * sizeof *r);
+}
+static WINAPI void list_clear_rtv(void *this, size_t rtv, const float color[4], uint32_t nrects, const RECT12 *rects) {
+    cmd12 *c = rec(this, C_CLEAR_RTV);
+    c->tex[0] = view_texture(rtv);
+    memcpy(c->values, color, 16);
+    if (nrects) d3d_not_implemented("ClearRenderTargetView with rectangles (the whole view is cleared)");
+}
+static WINAPI void list_clear_dsv(void *this, size_t dsv, int32_t flags, float depth, uint8_t stencil_value, uint32_t nrects, const RECT12 *rects) {
+    cmd12 *c = rec(this, C_CLEAR_DSV);
+    c->tex[8] = view_texture(dsv);
+    c->a = (uint32_t)flags;
+    memcpy(&c->values[0], &depth, 4);
+    c->values[1] = stencil_value;
+    if (nrects) d3d_not_implemented("ClearDepthStencilView with rectangles (the whole view is cleared)");
+}
+static WINAPI void list_draw(void *this, uint32_t vertices, uint32_t instances, uint32_t start, uint32_t start_instance) {
+    cmd12 *c = rec(this, C_DRAW);
+    c->a = vertices; c->b = instances; c->c = start; c->off = start_instance;
+}
+static WINAPI void list_draw_indexed(void *this, uint32_t indices, uint32_t instances, uint32_t start, int32_t base_vertex, uint32_t start_instance) {
+    cmd12 *c = rec(this, C_DRAW_INDEXED);
+    c->a = indices; c->b = instances; c->c = start; c->off = (uint64_t)(int64_t)base_vertex; c->off2 = start_instance;
+}
+static WINAPI void list_blend_factor(void *this, const float f[4]) { cmd12 *c = rec(this, C_BLEND_FACTOR); if (f) memcpy(c->values, f, 16); else { float one[4] = { 1, 1, 1, 1 }; memcpy(c->values, one, 16); } }
+static WINAPI void list_stencil_ref(void *this, uint32_t v) { cmd12 *c = rec(this, C_STENCIL_REF); c->a = v; }
+
 // ---- command lists: replay into Metal -----------------------------------------------------------------------------
 
 typedef struct {
@@ -876,28 +1213,226 @@ static uint64_t resolve_slot(dev12 *d, const rootsig12 *rs, const root_state *st
     return 0;
 }
 
+// The buffer a GPU address is in, and the offset in it.
+static id<MTLBuffer> buffer_at(dev12 *d, uint64_t va, uint64_t *off) {
+    pthread_mutex_lock(&d->lock);
+    id<MTLBuffer> found = nil;
+    for (uint32_t i = 0; i < d->nbufs; i++) {
+        res12 *r = d->bufs[i];
+        uint64_t base = r->buffer.gpuAddress;
+        if (va >= base && va < base + r->buffer.length) { found = r->buffer; *off = va - base; break; }
+    }
+    pthread_mutex_unlock(&d->lock);
+    return found;
+}
+
+typedef struct {
+    rootsig12 *rs;
+    root_state st;
+} root_binding;
+
+// The root argument buffer of one stage (VxRoot): a pointer per resource range, then the two heaps.
+static void stage_root(dev12 *d, const dxil_msl *msl, root_binding *rb, heap12 *heap, heap12 *sheap, scratch *sc, uint64_t *root, uint32_t *words) {
+    uint32_t n = msl->nslots ? msl->nslots : 1;
+    memset(root, 0, 8 * (n + 2));
+    for (uint32_t k = 0; k < msl->nslots; k++) root[k] = resolve_slot(d, rb->rs, &rb->st, &msl->slots[k], sc, nil);
+    root[n] = heap && heap->gpu ? heap->gpu.gpuAddress : 0;
+    root[n + 1] = sheap && sheap->gpu ? sheap->gpu.gpuAddress : 0;
+    *words = n + 2;
+}
+
+typedef struct {
+    void *tex[9];                    // the render targets (retained), depth last
+    int changed;
+    MTLPrimitiveType prim;
+    VBV vb[16];
+    IBV ib;
+    VIEWPORT vp[10];
+    uint32_t nvp;
+    RECT12 sc[16];
+    uint32_t nsc;
+    float blend[4];
+    uint32_t stencil_ref;
+} gfx_state;
+
+static void end_encoders(id<MTLComputeCommandEncoder> __strong *ce, id<MTLBlitCommandEncoder> __strong *be, id<MTLRenderCommandEncoder> __strong *re) {
+    if (*ce) { [*ce endEncoding]; *ce = nil; }
+    if (*be) { [*be endEncoding]; *be = nil; }
+    if (*re) { [*re endEncoding]; *re = nil; }
+}
+
+static void make_resident_render(id<MTLRenderCommandEncoder> re, NSArray *resident, heap12 *heap) {
+    for (id<MTLResource> res in resident) [re useResource:res usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    for (heap12 *h = heap; h; h = NULL)
+        for (uint32_t k = 0; k < h->desc.NumDescriptors; k++)
+            if ([h->keep[k] conformsToProtocol:@protocol(MTLTexture)]) [re useResource:h->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
+}
+
 static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
     pso12 *pso = NULL;
-    rootsig12 *rs = NULL;
     heap12 *heap = NULL, *sheap = NULL;
-    root_state *st = calloc(1, sizeof *st);
+    root_binding *compute = calloc(1, sizeof *compute), *graphics = calloc(1, sizeof *graphics);
+    gfx_state *g = calloc(1, sizeof *g);
+    g->prim = MTLPrimitiveTypeTriangle;
+    for (int k = 0; k < 4; k++) g->blend[k] = 1;
     id<MTLComputeCommandEncoder> ce = nil;
     id<MTLBlitCommandEncoder> be = nil;
+    id<MTLRenderCommandEncoder> re = nil;
     pthread_mutex_lock(&d->lock);
     NSArray *resident = [d->resources copy];
     pthread_mutex_unlock(&d->lock);
     for (uint32_t i = 0; i < l->n; i++) {
         cmd12 *c = &l->cmds[i];
+        root_binding *rb = c->gfx ? graphics : compute;
         switch (c->op) {
         case C_PSO: pso = c->obj; break;
-        case C_ROOTSIG: rs = c->obj; memset(st, 0, sizeof *st); break;
+        case C_ROOTSIG: rb->rs = c->obj; memset(&rb->st, 0, sizeof rb->st); break;
         case C_HEAPS: heap = c->obj; sheap = c->obj2; break;
-        case C_TABLE: if (c->a < 64) st->table[c->a] = c->va; break;
-        case C_CONSTANTS: if (c->a < 64) for (uint32_t k = 0; k < c->b && c->c + k < 64; k++) st->constants[c->a][c->c + k] = c->values[k]; break;
-        case C_ROOT_VA: if (c->a < 64) st->root_va[c->a] = c->va; break;
+        case C_TABLE: if (c->a < 64) rb->st.table[c->a] = c->va; break;
+        case C_CONSTANTS: if (c->a < 64) for (uint32_t k = 0; k < c->b && c->c + k < 64; k++) rb->st.constants[c->a][c->c + k] = c->values[k]; break;
+        case C_ROOT_VA: if (c->a < 64) rb->st.root_va[c->a] = c->va; break;
+        case C_TOPOLOGY: {
+            // D3D_PRIMITIVE_TOPOLOGY: 1 points, 2 lines, 3 line strip, 4 triangles, 5 triangle strip
+            uint32_t t = c->a;
+            g->prim = t == 1 ? MTLPrimitiveTypePoint : t == 2 ? MTLPrimitiveTypeLine : t == 3 ? MTLPrimitiveTypeLineStrip : t == 5 ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle;
+            if (t > 5) vx_log("D3D12: primitive topology %u is not supported", t);
+            break;
+        }
+        case C_VB: for (uint32_t k = 0; k < c->b && c->a + k < 16; k++) memcpy(&g->vb[c->a + k], (VBV *)c->values + k, sizeof(VBV)); break;
+        case C_IB: memcpy(&g->ib, c->values, sizeof g->ib); break;
+        case C_VIEWPORTS: g->nvp = c->a; memcpy(g->vp, c->values, c->a * sizeof(VIEWPORT)); break;
+        case C_SCISSORS: g->nsc = c->a; memcpy(g->sc, c->values, c->a * sizeof(RECT12)); break;
+        case C_BLEND_FACTOR: memcpy(g->blend, c->values, 16); break;
+        case C_STENCIL_REF: g->stencil_ref = c->a; break;
+        case C_TARGETS:
+            for (int k = 0; k < 9; k++) g->tex[k] = c->tex[k];       // (the command holds them)
+            g->changed = 1;
+            break;
+        case C_CLEAR_RTV: case C_CLEAR_DSV: {
+            // a pass of its own whose load action clears (the next draws open their own pass)
+            end_encoders(&ce, &be, &re);
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            if (c->op == C_CLEAR_RTV) {
+                if (!c->tex[0]) break;
+                float *col = (float *)c->values;
+                rp.colorAttachments[0].texture = (__bridge id<MTLTexture>)c->tex[0];
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(col[0], col[1], col[2], col[3]);
+            } else {
+                if (!c->tex[8]) break;
+                id<MTLTexture> t = (__bridge id<MTLTexture>)c->tex[8];
+                float depth;
+                memcpy(&depth, &c->values[0], 4);
+                rp.depthAttachment.texture = t;
+                rp.depthAttachment.loadAction = (c->a & 1) ? MTLLoadActionClear : MTLLoadActionLoad;
+                rp.depthAttachment.storeAction = MTLStoreActionStore;
+                rp.depthAttachment.clearDepth = depth;
+                if (t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+                    rp.stencilAttachment.texture = t;
+                    rp.stencilAttachment.loadAction = (c->a & 2) ? MTLLoadActionClear : MTLLoadActionLoad;
+                    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+                    rp.stencilAttachment.clearStencil = c->values[1];
+                }
+            }
+            [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+            g->changed = 1;
+            break;
+        }
+        case C_DRAW: case C_DRAW_INDEXED: {
+            if (!pso || !pso->render) { vx_log("D3D12: a draw without a graphics pipeline state"); break; }
+            if (!re || g->changed) {
+                end_encoders(&ce, &be, &re);
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                uint32_t w = 0, h = 0;
+                for (int k = 0; k < 8; k++) {
+                    if (!g->tex[k]) continue;
+                    id<MTLTexture> t = (__bridge id<MTLTexture>)g->tex[k];
+                    rp.colorAttachments[k].texture = t;
+                    rp.colorAttachments[k].loadAction = MTLLoadActionLoad;
+                    rp.colorAttachments[k].storeAction = MTLStoreActionStore;
+                    w = (uint32_t)t.width; h = (uint32_t)t.height;
+                }
+                if (g->tex[8]) {
+                    id<MTLTexture> t = (__bridge id<MTLTexture>)g->tex[8];
+                    rp.depthAttachment.texture = t;
+                    rp.depthAttachment.loadAction = MTLLoadActionLoad;
+                    rp.depthAttachment.storeAction = MTLStoreActionStore;
+                    if (t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+                        rp.stencilAttachment.texture = t;
+                        rp.stencilAttachment.loadAction = MTLLoadActionLoad;
+                        rp.stencilAttachment.storeAction = MTLStoreActionStore;
+                    }
+                    if (!w) { w = (uint32_t)t.width; h = (uint32_t)t.height; }
+                }
+                if (!w && g->nvp) {                                 // (no attachments: the viewport's size)
+                    rp.renderTargetWidth = (NSUInteger)(g->vp[0].x + g->vp[0].w);
+                    rp.renderTargetHeight = (NSUInteger)(g->vp[0].y + g->vp[0].h);
+                    rp.defaultRasterSampleCount = 1;
+                }
+                re = [cb renderCommandEncoderWithDescriptor:rp];
+                make_resident_render(re, resident, heap);
+                g->changed = 0;
+                // (the pass's size, for the scissor rectangles, which Metal wants inside the targets)
+                g->sc[15].right = (int32_t)(w ? w : rp.renderTargetWidth);
+                g->sc[15].bottom = (int32_t)(h ? h : rp.renderTargetHeight);
+            }
+            [re setRenderPipelineState:pso->render];
+            [re setDepthStencilState:pso->depth];
+            [re setCullMode:pso->cull];
+            [re setFrontFacingWinding:pso->winding];
+            [re setTriangleFillMode:pso->fill];
+            [re setDepthClipMode:pso->clip];
+            [re setDepthBias:pso->bias slopeScale:pso->bias_slope clamp:pso->bias_clamp];
+            [re setStencilReferenceValue:g->stencil_ref];
+            [re setBlendColorRed:g->blend[0] green:g->blend[1] blue:g->blend[2] alpha:g->blend[3]];
+            if (g->nvp) {
+                MTLViewport v[10];
+                for (uint32_t k = 0; k < g->nvp; k++) v[k] = (MTLViewport){ g->vp[k].x, g->vp[k].y, g->vp[k].w, g->vp[k].h, g->vp[k].min_depth, g->vp[k].max_depth };
+                [re setViewports:v count:g->nvp];
+            }
+            {
+                int32_t W = g->sc[15].right, H = g->sc[15].bottom;
+                uint32_t n = g->nsc ? (g->nsc > 15 ? 15 : g->nsc) : 0;
+                MTLScissorRect r[16];
+                for (uint32_t k = 0; k < n; k++) {
+                    int32_t x0 = MAX(0, g->sc[k].left), y0 = MAX(0, g->sc[k].top), x1 = MIN(W, g->sc[k].right), y1 = MIN(H, g->sc[k].bottom);
+                    r[k] = (MTLScissorRect){ (NSUInteger)x0, (NSUInteger)y0, (NSUInteger)MAX(0, x1 - x0), (NSUInteger)MAX(0, y1 - y0) };
+                }
+                if (!n) { r[0] = (MTLScissorRect){ 0, 0, 0, 0 }; n = 1; }   // (D3D12: no scissor rectangle set draws nothing)
+                [re setScissorRects:r count:n];
+            }
+            for (uint32_t k = 0; k < 16; k++) {
+                if (!g->vb[k].va) continue;
+                uint64_t off = 0;
+                id<MTLBuffer> b = buffer_at(d, g->vb[k].va, &off);
+                if (b) [re setVertexBuffer:b offset:off attributeStride:g->vb[k].stride atIndex:16 + k];
+            }
+            uint64_t root[64 + 2];
+            uint32_t words;
+            stage_root(d, &pso->vs, graphics, heap, sheap, sc, root, &words);
+            [re setVertexBytes:root length:8 * words atIndex:0];
+            if (pso->render) {
+                stage_root(d, &pso->ps, graphics, heap, sheap, sc, root, &words);
+                [re setFragmentBytes:root length:8 * words atIndex:0];
+            }
+            if (sc->buf) [re useResource:sc->buf usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+            uint32_t instances = c->b ? c->b : 1;
+            if (c->op == C_DRAW) {
+                [re drawPrimitives:g->prim vertexStart:c->c vertexCount:c->a instanceCount:instances baseInstance:(NSUInteger)c->off];
+            } else {
+                uint64_t off = 0;
+                id<MTLBuffer> ib = buffer_at(d, g->ib.va, &off);
+                if (!ib) { vx_log("D3D12: an indexed draw without an index buffer"); break; }
+                int i32 = g->ib.format == 42;                       // DXGI_FORMAT_R32_UINT (else R16_UINT)
+                [re drawIndexedPrimitives:g->prim indexCount:c->a indexType:i32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:ib
+                        indexBufferOffset:off + (uint64_t)c->c * (i32 ? 4 : 2) instanceCount:instances baseVertex:(NSInteger)(int64_t)c->off baseInstance:(NSUInteger)c->off2];
+            }
+            break;
+        }
         case C_DISPATCH: {
             if (!pso || !pso->compute) { vx_log("D3D12: Dispatch without a compute pipeline state"); break; }
-            if (be) { [be endEncoding]; be = nil; }
+            if (be || re) { if (be) [be endEncoding]; if (re) [re endEncoding]; be = nil; re = nil; g->changed = 1; }
             if (!ce) {
                 ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
                 // (what the shaders reach through pointers and argument buffers must be resident: every resource
@@ -908,11 +1443,10 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
                         if ([h2->keep[k] conformsToProtocol:@protocol(MTLTexture)]) [ce useResource:h2->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
             }
             [ce setComputePipelineState:pso->compute];
-            uint64_t root[64 + 2] = { 0 };
-            for (uint32_t k = 0; k < pso->msl.nslots; k++) root[k] = resolve_slot(d, rs, st, &pso->msl.slots[k], sc, nil);
-            root[pso->msl.nslots ? pso->msl.nslots : 1] = heap && heap->gpu ? heap->gpu.gpuAddress : 0;
-            root[(pso->msl.nslots ? pso->msl.nslots : 1) + 1] = sheap && sheap->gpu ? sheap->gpu.gpuAddress : 0;
-            [ce setBytes:root length:8 * ((pso->msl.nslots ? pso->msl.nslots : 1) + 2) atIndex:0];
+            uint64_t root[64 + 2];
+            uint32_t words;
+            stage_root(d, &pso->msl, compute, heap, sheap, sc, root, &words);
+            [ce setBytes:root length:8 * words atIndex:0];
             if (sc->buf) [ce useResource:sc->buf usage:MTLResourceUsageRead];
             [ce dispatchThreadgroups:MTLSizeMake(c->a, c->b, c->c) threadsPerThreadgroup:MTLSizeMake(pso->msl.threads[0], pso->msl.threads[1], pso->msl.threads[2])];
             // (the next dispatch sees this one's writes, as D3D12's UAV barriers promise; resources reached through
@@ -925,6 +1459,7 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
             break;
         case C_COPY_BUFFER: case C_COPY_RESOURCE: case C_COPY_TEXTURE: {
             if (ce) { [ce endEncoding]; ce = nil; }
+            if (re) { [re endEncoding]; re = nil; g->changed = 1; }
             if (!be) be = [cb blitCommandEncoder];
             if (c->op == C_COPY_BUFFER) {
                 res12 *dst = c->obj, *src = c->obj2;
@@ -962,9 +1497,10 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
         }
         }
     }
-    if (ce) [ce endEncoding];
-    if (be) [be endEncoding];
-    free(st);
+    end_encoders(&ce, &be, &re);
+    free(compute);
+    free(graphics);
+    free(g);
 }
 
 // ---- queues -----------------------------------------------------------------------------------------------------------
@@ -1233,7 +1769,9 @@ static void make_tables(void) {
         { "CopyDescriptorsSimple", (void *)dev_copy_simple }, { "CreateCommittedResource", (void *)dev_create_committed },
         { "CreateFence", (void *)dev_create_fence }, { "GetDeviceRemovedReason", (void *)dev_removed_reason },
         { "GetCopyableFootprints", (void *)dev_footprints }, { "MakeResident", (void *)dev_make_resident },
-        { "Evict", (void *)dev_make_resident }, { "GetAdapterLuid", (void *)dev_adapter_luid }, { NULL, NULL } };
+        { "Evict", (void *)dev_make_resident }, { "GetAdapterLuid", (void *)dev_adapter_luid },
+        { "CreateGraphicsPipelineState", (void *)dev_create_graphics_pso }, { "CreateRenderTargetView", (void *)dev_create_rtv },
+        { "CreateDepthStencilView", (void *)dev_create_dsv }, { NULL, NULL } };
     g_device_vtbl = D3D_VTABLE(ID3D12Device10, device);
     static const d3d_method queue[] = {
         { "QueryInterface", (void *)queue_query }, COMMON_METHODS, { "ExecuteCommandLists", (void *)queue_execute },
@@ -1250,7 +1788,16 @@ static void make_tables(void) {
         { "SetComputeRootConstantBufferView", (void *)list_set_root_va }, { "SetComputeRootShaderResourceView", (void *)list_set_root_va },
         { "SetComputeRootUnorderedAccessView", (void *)list_set_root_va }, { "Dispatch", (void *)list_dispatch },
         { "CopyBufferRegion", (void *)list_copy_buffer }, { "CopyResource", (void *)list_copy_resource },
-        { "CopyTextureRegion", (void *)list_copy_texture }, { "ResourceBarrier", (void *)list_barrier }, { NULL, NULL } };
+        { "CopyTextureRegion", (void *)list_copy_texture }, { "ResourceBarrier", (void *)list_barrier },
+        { "SetGraphicsRootSignature", (void *)list_set_gfx_root }, { "SetGraphicsRootDescriptorTable", (void *)list_set_gfx_table },
+        { "SetGraphicsRoot32BitConstant", (void *)list_set_gfx_constant }, { "SetGraphicsRoot32BitConstants", (void *)list_set_gfx_constants },
+        { "SetGraphicsRootConstantBufferView", (void *)list_set_gfx_root_va }, { "SetGraphicsRootShaderResourceView", (void *)list_set_gfx_root_va },
+        { "SetGraphicsRootUnorderedAccessView", (void *)list_set_gfx_root_va }, { "IASetPrimitiveTopology", (void *)list_topology },
+        { "IASetVertexBuffers", (void *)list_vbs }, { "IASetIndexBuffer", (void *)list_ib }, { "OMSetRenderTargets", (void *)list_targets },
+        { "RSSetViewports", (void *)list_viewports }, { "RSSetScissorRects", (void *)list_scissors },
+        { "ClearRenderTargetView", (void *)list_clear_rtv }, { "ClearDepthStencilView", (void *)list_clear_dsv },
+        { "DrawInstanced", (void *)list_draw }, { "DrawIndexedInstanced", (void *)list_draw_indexed },
+        { "OMSetBlendFactor", (void *)list_blend_factor }, { "OMSetStencilRef", (void *)list_stencil_ref }, { NULL, NULL } };
     g_list_vtbl = D3D_VTABLE(ID3D12GraphicsCommandList7, list);
     static const d3d_method fence[] = {
         { "QueryInterface", (void *)fence_query }, COMMON_METHODS, { "GetCompletedValue", (void *)fence_completed },

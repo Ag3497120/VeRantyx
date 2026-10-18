@@ -24,6 +24,144 @@ static ID3D12Resource *buffer(ID3D12Device *dev, D3D12_HEAP_TYPE heap, UINT64 si
     return r;
 }
 
+static int load(const char *path, unsigned char *buf, size_t cap, size_t *size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("%s not found (run from VXRuntime)\n", path); return -1; }
+    *size = fread(buf, 1, cap, f);
+    fclose(f);
+    return 0;
+}
+
+static void wait_queue(ID3D12Device *dev, ID3D12CommandQueue *queue) {
+    ID3D12Fence *fence;
+    ID3D12Device_CreateFence(dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence);
+    HANDLE ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    ID3D12CommandQueue_Signal(queue, fence, 1);
+    ID3D12Fence_SetEventOnCompletion(fence, 1, ev);
+    if (WaitForSingleObject(ev, 5000) != WAIT_OBJECT_0) { printf("FAILED: the fence did not reach 1 in 5 s\n"); bad++; }
+    ID3D12Fence_Release(fence);
+    CloseHandle(ev);
+}
+
+// Drawing: a 64x64 RGBA8 target cleared to blue and a D32 depth buffer cleared to 1, one triangle drawn indexed
+// (base vertex 3) through a graphics pipeline from DXIL (tri_vs, tri_ps), the pixel shader's tint from root
+// constants; the target read back through a placed footprint.
+static int draw_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
+    static unsigned char vs[65536], ps[65536];
+    size_t vs_size, ps_size;
+    if (load("tests/shaders12/tri_vs.dxil", vs, sizeof vs, &vs_size) || load("tests/shaders12/tri_ps.dxil", ps, sizeof ps, &ps_size)) return 1;
+    D3D12_ROOT_PARAMETER param = { D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS };
+    param.Constants.ShaderRegister = 0;
+    param.Constants.Num32BitValues = 4;
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &param, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    ID3DBlob *blob, *errs;
+    CHECK(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errs));
+    ID3D12RootSignature *rs;
+    CHECK(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&rs));
+    D3D12_INPUT_ELEMENT_DESC il[2] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+    memset(&pd, 0, sizeof pd);
+    pd.pRootSignature = rs;
+    pd.VS = (D3D12_SHADER_BYTECODE){ vs, vs_size };
+    pd.PS = (D3D12_SHADER_BYTECODE){ ps, ps_size };
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = 0xFFFFFFFF;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pd.InputLayout = (D3D12_INPUT_LAYOUT_DESC){ il, 2 };
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso;
+    CHECK(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+
+    // the target, the depth buffer, their views
+    D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET };
+    ID3D12Resource *rt, *depth;
+    CHECK(ID3D12Device_CreateCommittedResource(dev, &dh, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&rt));
+    td.Format = DXGI_FORMAT_D32_FLOAT;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    CHECK(ID3D12Device_CreateCommittedResource(dev, &dh, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, NULL, &IID_ID3D12Resource, (void **)&depth));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtvs, *dsvs;
+    CHECK(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&rtvs));
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    CHECK(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&dsvs));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtvs);
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(dsvs);
+    ID3D12Device_CreateRenderTargetView(dev, rt, NULL, rtv);
+    ID3D12Device_CreateDepthStencilView(dev, depth, NULL, dsv);
+
+    // vertices: three off to the side (skipped by the base vertex), then the triangle; indices 0 1 2
+    float verts[6][6] = {
+        { 9, 9, 0, 0, 0, 0 }, { 9, 9, 0, 0, 0, 0 }, { 9, 9, 0, 0, 0, 0 },
+        { -0.5f, -0.5f, 1, 1, 1, 1 }, { 0, 0.5f, 1, 1, 1, 1 }, { 0.5f, -0.5f, 1, 1, 1, 1 },
+    };
+    unsigned short idx[3] = { 0, 1, 2 };
+    ID3D12Resource *vb = buffer(dev, D3D12_HEAP_TYPE_UPLOAD, sizeof verts, 0, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource *ib = buffer(dev, D3D12_HEAP_TYPE_UPLOAD, sizeof idx, 0, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource *rb = buffer(dev, D3D12_HEAP_TYPE_READBACK, 256 * 64, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (bad) return 1;
+    void *p;
+    CHECK(ID3D12Resource_Map(vb, 0, NULL, &p)); memcpy(p, verts, sizeof verts); ID3D12Resource_Unmap(vb, 0, NULL);
+    CHECK(ID3D12Resource_Map(ib, 0, NULL, &p)); memcpy(p, idx, sizeof idx); ID3D12Resource_Unmap(ib, 0, NULL);
+
+    ID3D12CommandAllocator *alloc;
+    CHECK(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc));
+    ID3D12GraphicsCommandList *list;
+    CHECK(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, pso, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    float blue[4] = { 0, 0, 1, 1 };
+    ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, blue, 0, NULL);
+    ID3D12GraphicsCommandList_ClearDepthStencilView(list, dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, NULL);
+    ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &rtv, FALSE, &dsv);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rs);
+    float tint[4] = { 0.5f, 1, 0.25f, 1 };
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 4, tint, 0);
+    D3D12_VIEWPORT vp = { 0, 0, 64, 64, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 64, 64 };
+    ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+    ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    D3D12_VERTEX_BUFFER_VIEW vbv = { ID3D12Resource_GetGPUVirtualAddress(vb), sizeof verts, sizeof verts[0] };
+    D3D12_INDEX_BUFFER_VIEW ibv = { ID3D12Resource_GetGPUVirtualAddress(ib), sizeof idx, DXGI_FORMAT_R16_UINT };
+    ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+    ID3D12GraphicsCommandList_IASetIndexBuffer(list, &ibv);
+    ID3D12GraphicsCommandList_DrawIndexedInstanced(list, 3, 1, 0, 3, 0);
+    D3D12_TEXTURE_COPY_LOCATION dst = { rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+    dst.PlacedFootprint.Footprint = (D3D12_SUBRESOURCE_FOOTPRINT){ DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 256 };
+    D3D12_TEXTURE_COPY_LOCATION src = { rt, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    src.SubresourceIndex = 0;
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
+    CHECK(ID3D12GraphicsCommandList_Close(list));
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+    wait_queue(dev, queue);
+
+    unsigned char *px;
+    CHECK(ID3D12Resource_Map(rb, 0, NULL, (void **)&px));
+    const unsigned char *center = px + 32 * 256 + 32 * 4, *corner = px;
+    int hit = abs(center[0] - 128) <= 1 && center[1] == 255 && abs(center[2] - 64) <= 1 && center[3] == 255;
+    int bg = corner[0] == 0 && corner[1] == 0 && corner[2] == 255 && corner[3] == 255;
+    if (!hit) { printf("draw: the triangle's pixel is (%u, %u, %u, %u), want (128, 255, 64, 255)\n", center[0], center[1], center[2], center[3]); bad++; }
+    if (!bg) { printf("draw: the corner is (%u, %u, %u, %u), want the clear colour (0, 0, 255, 255)\n", corner[0], corner[1], corner[2], corner[3]); bad++; }
+    int covered = 0;
+    for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) covered += px[y * 256 + x * 4 + 1] == 255;
+    printf("d3d12 draw: graphics pipeline from DXIL, input layout, indexed draw with a base vertex, root constants, clears, "
+           "depth test, %d pixels covered: %s\n", covered, hit && bg ? "ok" : "FAILED");
+    return 0;
+}
+
 int main(void) {
     FILE *f = fopen("tests/shaders12/sum_cs.dxil", "rb");
     if (!f) { printf("tests/shaders12/sum_cs.dxil not found (run from VXRuntime)\n"); return 1; }
@@ -153,5 +291,6 @@ int main(void) {
     }
     printf("d3d12 compute: root signature serialized and created, descriptor table, upload -> default copy, dispatch of DXIL, "
            "readback of a buffer and a texture, fence (SIMD width %u): %s\n", simd, bad ? "FAILED" : "ok");
+    draw_test(dev, queue);
     return bad ? 1 : 0;
 }
