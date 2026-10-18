@@ -1,38 +1,28 @@
-# VeRantyx
+# VeRantyx — wine: Half-Life: Alyx and SteamVR under Wine
 
-> **This is the `wine` branch**: the Windows build with SteamVR under Wine. The native ARM version is on the [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) branch; `main` has both.
+> **This is the `wine` branch, kept as it was on 2026-10-10.** The current version of VeRantyx, which runs the Windows
+> build of Alyx and other SteamVR games on its own runtime instead of Wine (60 fps where this version reaches ~30), is
+> on [`main`](https://github.com/Ag3497120/VeRantyx#readme) (with a no-Terminal Mac app). Other versions:
+> [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) · [`native`](https://github.com/Ag3497120/VeRantyx/tree/native)
 
-**Play PC VR games from an Apple Silicon Mac in an Apple Vision Pro — with your hands and a pair of Joy-Con, no tracked VR controllers.**
+**Play PC VR games from an Apple Silicon Mac in an Apple Vision Pro — with your hands and a pair of Joy-Con, no
+tracked VR controllers.**
 
-VeRantyx renders Half-Life: Alyx on the Mac, streams every stereo frame to a
-native visionOS app in hardware-encoded HEVC, and sends the headset's head and
-hand poses back. Hands are tracked by the Vision Pro; buttons, sticks and
-triggers come from Nintendo Switch Joy-Con (one in each hand), or the game is
-played with bare hands. No tracked VR controllers are needed: the PS VR2 Sense
-controllers that other Vision Pro ports of Alyx require are not sold in every
+The Windows build of Half-Life: Alyx and the real Windows SteamVR run under Wine 11 (DXVK → MoltenVK) with a SteamVR
+driver of our own. The Mac renders the game, streams every stereo frame to a native visionOS app in hardware-encoded
+HEVC, and gets the headset's head and hand poses back. Hands are tracked by the Vision Pro; buttons, sticks and
+triggers come from Nintendo Switch Joy-Con (one in each hand), or the game is played with bare hands. No tracked VR
+controllers are needed: the PS VR2 Sense controllers that other Vision Pro ports of Alyx require are not sold in every
 region (not in Japan at the time of writing).
 
-There are **two versions**, on their own branches:
+| | |
+|---|---|
+| Games | Half-Life: Alyx confirmed; other Windows SteamVR titles can be launched ([docs/OTHER_GAMES.md](docs/OTHER_GAMES.md)) |
+| Measured | ~30 fps in game on a MacBook Pro M1 Max (CPU-bound; [Measurements](#measurements)) |
+| Headset | Apple Vision Pro (M2 or M5), the VeRantyx visionOS app |
+| Setup | `./scripts/setup.sh`, then [docs/SETUP.md](docs/SETUP.md) (Terminal, Xcode) |
 
-| Branch | How the game runs on the Mac | Status |
-|---|---|---|
-| [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) | Valve's **Linux ARM64** build of Half-Life: Alyx (made for the Steam Frame) runs natively on macOS — no Wine, no Rosetta, no SteamVR — through a patched [Klepton](https://github.com/shinyquagsire23/Klepton) loader, a glibc compatibility layer and an OpenVR runtime of our own | New (2026-10-11). Menu at 60 fps, levels played for 20+ minutes on an M1 Max |
-| [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine) | The Windows build with the real Windows SteamVR under Wine 11, DXVK → MoltenVK, and a SteamVR driver of our own | Stable since 2026-10-10; ~30 fps in game on an M1 Max |
-| `main` | Both of the above | Development |
-
-Both versions share the Mac HEVC encoder (`MacEncoder/`) and the Vision Pro
-app (`VisionProClient/`).
-
-### Native version (Linux ARM64 build, no Wine) — recorded 2026-10-11
-
-![Native version: Half-Life: Alyx (Linux ARM64 build) running natively on a MacBook Pro, played in Apple Vision Pro — the Joy-Con, hands and fingers, gravity gloves, reloading a pistol](docs/media/native-highlight.gif)
-
-[![Native version — watch the full recording on YouTube](docs/media/native-poster.jpg)](https://youtu.be/2z-GyAqAtpA)
-
-*Native version, 48-second highlight: [docs/media/native-highlight.mp4](docs/media/native-highlight.mp4).
-The Joy-Con it is played with (seen through the passthrough), hands and fingers
-in Russell's lab, gravity gloves (pulling and catching a helmet), then
-reloading the pistol. 60 fps on an M1 Max. Full 6-minute unedited recording of the native version: https://youtu.be/2z-GyAqAtpA.*
+The Mac HEVC encoder (`MacEncoder/`) and the Vision Pro app (`VisionProClient/`) are shared with the other versions.
 
 ### Wine version (Windows build + SteamVR under Wine) — recorded 2026-10-10
 
@@ -50,7 +40,9 @@ MIT licensed. No proprietary code is included (see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)): Wine, DXVK and Steam are
 downloaded from their publishers by the setup script, SteamVR and the game
 come from your own Steam account, and Apple's Game Porting Toolkit is neither
-used nor shipped.
+shipped nor needed (an optional, experimental backend,
+`VERANTYX_D3D_BACKEND=d3dmetal`, uses D3DMetal only from a copy you obtained
+from Apple yourself, [docs/SETUP.md](docs/SETUP.md)).
 
 ## Why VeRantyx
 
