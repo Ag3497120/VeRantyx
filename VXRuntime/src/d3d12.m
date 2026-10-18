@@ -19,12 +19,12 @@
 #include "d3d_tables.h"                                            // (IDXGISwapChain3, for swap chains on D3D12 queues)
 #pragma clang diagnostic pop
 
-enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG, K12_MEMHEAP };
+enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG, K12_MEMHEAP, K12_QUERYHEAP };
 
 static const GUID IID_IUnknown_ = { 0, 0, 0, { 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
 static void **g_swapchain_vtbl;
 static void **g_device_vtbl, **g_queue_vtbl, **g_allocator_vtbl, **g_list_vtbl, **g_fence_vtbl, **g_heap_vtbl, **g_rootsig_vtbl,
-            **g_pso_vtbl, **g_resource_vtbl, **g_blob_vtbl, **g_debug_vtbl, **g_memheap_vtbl;
+            **g_pso_vtbl, **g_resource_vtbl, **g_blob_vtbl, **g_debug_vtbl, **g_memheap_vtbl, **g_queryheap_vtbl;
 static pthread_once_t g_tables_once = PTHREAD_ONCE_INIT;
 static void make_tables(void);
 
@@ -96,6 +96,7 @@ struct dev12 {
     NSMutableDictionary *pso_cache;  // MSL source -> id<MTLComputePipelineState>
     void **bufs;                     // the buffers (res12), for a GPU address's buffer (vertex and index buffers)
     uint32_t nbufs, capbufs;
+    id<MTLComputePipelineState> occ_sum;   // adds a render pass's occlusion counts into a query heap (made when first needed)
 };
 
 typedef struct { d3d_object base; dev12 *dev; Q_DESC desc; } queue12;
@@ -133,6 +134,16 @@ typedef struct {
     id<MTLHeap> heap;
 } memheap12;
 
+// A query heap: occlusion queries count into a Metal visibility result buffer, timestamps are samples of the GPU's
+// timestamp counter (in nanoseconds, as GetTimestampFrequency says); the other kinds read as zeros.
+typedef struct {
+    d3d_object base; dev12 *dev;
+    int32_t type;                    // D3D12_QUERY_HEAP_TYPE: 0 occlusion, 1 timestamp, 2 pipeline statistics, 5 copy queue timestamp, ...
+    uint32_t count, stride;          // queries, bytes of each one's result
+    id<MTLBuffer> results;           // occlusion: Metal's visibility results; others: zeros
+    id<MTLCounterSampleBuffer> samples;
+} queryheap12;
+
 // A root signature, from its serialized form.
 typedef struct { int32_t type; uint32_t count, base, space, offset; } range12;
 typedef struct { int32_t type, visibility; uint32_t reg, space, n32; uint32_t nranges; range12 *ranges; } param12;
@@ -164,7 +175,8 @@ typedef struct { d3d_object base; void *data; size_t size; } blob12;
 
 // Recorded commands, replayed when the list is executed.
 enum { C_PSO, C_ROOTSIG, C_HEAPS, C_TABLE, C_CONSTANTS, C_ROOT_VA, C_DISPATCH, C_COPY_BUFFER, C_COPY_RESOURCE, C_COPY_TEXTURE, C_UAV_BARRIER,
-       C_TOPOLOGY, C_VB, C_IB, C_TARGETS, C_VIEWPORTS, C_SCISSORS, C_CLEAR_RTV, C_CLEAR_DSV, C_DRAW, C_DRAW_INDEXED, C_BLEND_FACTOR, C_STENCIL_REF };
+       C_TOPOLOGY, C_VB, C_IB, C_TARGETS, C_VIEWPORTS, C_SCISSORS, C_CLEAR_RTV, C_CLEAR_DSV, C_DRAW, C_DRAW_INDEXED, C_BLEND_FACTOR, C_STENCIL_REF,
+       C_BEGIN_QUERY, C_END_QUERY, C_RESOLVE_QUERY };
 typedef struct {
     int op;
     uint32_t a, b, c;
@@ -647,6 +659,47 @@ static WINAPI HRESULT dev_create_placed(void *this, void *heap, uint64_t offset,
 static WINAPI HRESULT dev_create_placed1(void *this, void *heap, uint64_t offset, const void *desc1, int32_t state, const void *clear, const GUID *iid, void **out) {
     // (D3D12_RESOURCE_DESC1: D3D12_RESOURCE_DESC followed by a sampler feedback mip region)
     return dev_create_placed(this, heap, offset, desc1, state, clear, iid, out);
+}
+
+// ---- query heaps -----------------------------------------------------------------------------------------------------
+
+static void queryheap_destroy(d3d_object *o) { queryheap12 *q = (queryheap12 *)o; q->results = nil; q->samples = nil; release_dev(o); }
+static WINAPI HRESULT queryheap_query(void *this, const GUID *iid, void **out) {
+    const GUID *k[] = { &IID_ID3D12QueryHeap, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
+    return query(this, iid, out, k, 4);
+}
+
+static WINAPI HRESULT dev_create_query_heap(void *this, const uint32_t *desc, const GUID *iid, void **out) {
+    // D3D12_QUERY_HEAP_DESC: Type, Count, NodeMask
+    dev12 *d = this;
+    if (!desc || !desc[1]) return E_INVALIDARG;
+    int32_t type = (int32_t)desc[0];
+    uint32_t count = desc[1], stride = type == 2 ? 88 : type == 7 ? 112 : type == 3 ? 16 : 8;
+    id<MTLCounterSampleBuffer> samples = nil;
+    if (type == 1 || type == 5) {
+        id<MTLCounterSet> set = nil;
+        for (id<MTLCounterSet> cs in d->mtl.counterSets) if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) set = cs;
+        if (!set || ![d->mtl supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { vx_log("D3D12: this GPU samples no timestamps"); return E_FAIL; }
+        MTLCounterSampleBufferDescriptor *sd = [MTLCounterSampleBufferDescriptor new];
+        sd.counterSet = set;
+        sd.sampleCount = count;
+        sd.storageMode = MTLStorageModePrivate;              // (resolved on the GPU by ResolveQueryData)
+        NSError *err = nil;
+        samples = [d->mtl newCounterSampleBufferWithDescriptor:sd error:&err];
+        if (!samples) { vx_log("D3D12: a timestamp heap of %u: %s", count, err.localizedDescription.UTF8String); return E_OUTOFMEMORY; }
+    } else if (type != 0) vx_log("D3D12: query heap type %d reads as zeros", type);
+    if (!out) return S_FALSE;
+    queryheap12 *q = alloc12(sizeof *q, K12_QUERYHEAP, g_queryheap_vtbl, d);
+    q->base.destroy = queryheap_destroy;
+    q->type = type;
+    q->count = count;
+    q->stride = stride;
+    q->results = [d->mtl newBufferWithLength:(NSUInteger)count * stride options:MTLResourceStorageModeShared];
+    memset(q->results.contents, 0, q->results.length);
+    q->samples = samples;
+    HRESULT hr = queryheap_query(q, iid, out);
+    d3d_release(&q->base);
+    return hr;
 }
 
 // ---- descriptor heaps -----------------------------------------------------------------------------------------------
@@ -1292,6 +1345,15 @@ static WINAPI void list_draw_indexed(void *this, uint32_t indices, uint32_t inst
 }
 static WINAPI void list_blend_factor(void *this, const float f[4]) { cmd12 *c = rec(this, C_BLEND_FACTOR); if (f) memcpy(c->values, f, 16); else { float one[4] = { 1, 1, 1, 1 }; memcpy(c->values, one, 16); } }
 static WINAPI void list_stencil_ref(void *this, uint32_t v) { cmd12 *c = rec(this, C_STENCIL_REF); c->a = v; }
+static WINAPI void list_begin_query(void *this, void *heap, int32_t type, uint32_t index) {
+    cmd12 *c = rec(this, C_BEGIN_QUERY); c->obj = heap; hold(heap); c->a = (uint32_t)type; c->b = index;
+}
+static WINAPI void list_end_query(void *this, void *heap, int32_t type, uint32_t index) {
+    cmd12 *c = rec(this, C_END_QUERY); c->obj = heap; hold(heap); c->a = (uint32_t)type; c->b = index;
+}
+static WINAPI void list_resolve_query(void *this, void *heap, int32_t type, uint32_t start, uint32_t n, void *dst, uint64_t offset) {
+    cmd12 *c = rec(this, C_RESOLVE_QUERY); c->obj = heap; hold(heap); c->obj2 = dst; hold(dst); c->a = (uint32_t)type; c->b = start; c->c = n; c->off = offset;
+}
 
 // ---- command lists: replay into Metal -----------------------------------------------------------------------------
 
@@ -1391,7 +1453,66 @@ typedef struct {
     uint32_t nsc;
     float blend[4];
     uint32_t stencil_ref;
+    queryheap12 *occ;                // the occlusion query heap of the last query begun
+    int occ_on, occ_binary, occ_fresh;   // a query begun and not ended (counting into occ_index); not in a pass yet
+    uint32_t occ_index;
+    // Metal writes a pass's visibility results over its buffer when the pass ends, while a D3D12 query counts across
+    // passes: each pass counts into a buffer of its own, added into the heap's results when it ends.
+    queryheap12 *pass_heap;          // the open pass's heap (NULL: it counts nothing)
+    id<MTLBuffer> pass_vis;
+    uint32_t npass, pass_q[64];      // the queries the open pass counted: index | 1 << 30 begun in it | 1 << 31 binary
 } gfx_state;
+
+static void pass_query(gfx_state *g) {
+    if (!g->occ_on || g->npass >= 64) return;
+    for (uint32_t k = 0; k < g->npass; k++) if ((g->pass_q[k] & 0x3fffffff) == g->occ_index) return;
+    g->pass_q[g->npass++] = g->occ_index | (g->occ_fresh ? 1u << 30 : 0) | (g->occ_binary ? 1u << 31 : 0);
+    g->occ_fresh = 0;
+}
+
+static id<MTLComputePipelineState> occ_sum_pipeline(dev12 *d) {
+    pthread_mutex_lock(&d->lock);
+    if (!d->occ_sum) {
+        static const char src[] =
+            "#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void vx_occ(device ulong *dst [[buffer(0)]], device const ulong *src [[buffer(1)]], constant uint *q [[buffer(2)]], uint i [[thread_position_in_grid]]) {\n"
+            "    uint x = q[i], k = x & 0x3fffffff;\n"
+            "    ulong v = ((x >> 30) & 1 ? 0 : dst[k]) + src[k];\n"
+            "    dst[k] = (x >> 31) ? (ulong)(v != 0) : v;\n"
+            "}\n";
+        NSError *err = nil;
+        id<MTLLibrary> lib = [d->mtl newLibraryWithSource:@(src) options:nil error:&err];
+        id<MTLFunction> f = [lib newFunctionWithName:@"vx_occ"];
+        d->occ_sum = f ? [d->mtl newComputePipelineStateWithFunction:f error:&err] : nil;
+        if (!d->occ_sum) vx_log("D3D12: the occlusion query kernel: %s", err.localizedDescription.UTF8String);
+    }
+    id<MTLComputePipelineState> p = d->occ_sum;
+    pthread_mutex_unlock(&d->lock);
+    return p;
+}
+
+// Ends the open render pass, adding what its occlusion queries counted into their heap.
+static void close_pass(dev12 *d, gfx_state *g, id<MTLCommandBuffer> cb, id<MTLRenderCommandEncoder> __strong *re) {
+    if (!*re) return;
+    [*re endEncoding];
+    *re = nil;
+    g->changed = 1;
+    if (g->pass_heap && g->npass) {
+        id<MTLComputePipelineState> p = occ_sum_pipeline(d);
+        if (p) {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:p];
+            [e setBuffer:g->pass_heap->results offset:0 atIndex:0];
+            [e setBuffer:g->pass_vis offset:0 atIndex:1];
+            [e setBytes:g->pass_q length:4 * g->npass atIndex:2];
+            [e dispatchThreads:MTLSizeMake(g->npass, 1, 1) threadsPerThreadgroup:MTLSizeMake(g->npass, 1, 1)];
+            [e endEncoding];
+        }
+    }
+    g->pass_heap = NULL;
+    g->pass_vis = nil;
+    g->npass = 0;
+}
 
 static void end_encoders(id<MTLComputeCommandEncoder> __strong *ce, id<MTLBlitCommandEncoder> __strong *be, id<MTLRenderCommandEncoder> __strong *re) {
     if (*ce) { [*ce endEncoding]; *ce = nil; }
@@ -1442,13 +1563,70 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
         case C_SCISSORS: g->nsc = c->a; memcpy(g->sc, c->values, c->a * sizeof(RECT12)); break;
         case C_BLEND_FACTOR: memcpy(g->blend, c->values, 16); break;
         case C_STENCIL_REF: g->stencil_ref = c->a; break;
+        case C_BEGIN_QUERY: {
+            queryheap12 *q = c->obj;
+            if (q->type != 0 || c->b >= q->count) break;           // (only occlusion queries are begun; others read as zeros)
+            g->occ = q;
+            g->occ_on = 1;
+            g->occ_fresh = 1;
+            g->occ_index = c->b;
+            g->occ_binary = c->a == 1;
+            if (re && g->pass_heap != q) g->changed = 1;           // (the next draw opens a pass counting into this heap)
+            else if (re) { [re setVisibilityResultMode:MTLVisibilityResultModeCounting offset:8 * c->b]; pass_query(g); }
+            break;
+        }
+        case C_END_QUERY: {
+            queryheap12 *q = c->obj;
+            if (q->type == 0) {
+                if (re && g->occ_on && g->pass_heap == q) [re setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+                if (g->occ_on && g->occ_fresh && c->b < q->count) {   // (no pass counted it: zero)
+                    if (re && g->pass_heap == q) pass_query(g);
+                    else {
+                        if (ce) { [ce endEncoding]; ce = nil; }
+                        close_pass(d, g, cb, &re);
+                        if (!be) be = [cb blitCommandEncoder];
+                        [be fillBuffer:q->results range:NSMakeRange(8 * (NSUInteger)c->b, 8) value:0];
+                    }
+                }
+                g->occ_on = 0;
+            } else if (q->samples && c->b < q->count) {
+                // A timestamp: when the work before it has finished; Apple GPUs sample only where an encoder starts
+                // or ends, so an encoder of its own ends here and samples at its end.
+                close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
+                g->changed = 1;
+                MTLBlitPassDescriptor *bp = [MTLBlitPassDescriptor blitPassDescriptor];
+                bp.sampleBufferAttachments[0].sampleBuffer = q->samples;
+                bp.sampleBufferAttachments[0].startOfEncoderSampleIndex = MTLCounterDontSample;
+                bp.sampleBufferAttachments[0].endOfEncoderSampleIndex = c->b;
+                id<MTLBlitCommandEncoder> tb = [cb blitCommandEncoderWithDescriptor:bp];
+                [tb fillBuffer:q->results range:NSMakeRange(0, 4) value:0];   // (an encoder with no work may be dropped)
+                [tb endEncoding];
+            }
+            break;
+        }
+        case C_RESOLVE_QUERY: {
+            queryheap12 *q = c->obj;
+            res12 *dst = c->obj2;
+            if (!dst || !dst->buffer || c->b + c->c > q->count || c->off + (uint64_t)c->c * q->stride > dst->buffer.length) {
+                vx_log("D3D12: ResolveQueryData outside the heap or the buffer");
+                break;
+            }
+            if (ce) { [ce endEncoding]; ce = nil; }
+            close_pass(d, g, cb, &re);
+            if (!be) be = [cb blitCommandEncoder];
+            if (q->samples) [be resolveCounters:q->samples inRange:NSMakeRange(c->b, c->c) destinationBuffer:dst->buffer destinationOffset:c->off];
+            else {
+                [be copyFromBuffer:q->results sourceOffset:(uint64_t)c->b * q->stride toBuffer:dst->buffer destinationOffset:c->off size:(uint64_t)c->c * q->stride];
+            }
+            break;
+        }
         case C_TARGETS:
             for (int k = 0; k < 9; k++) g->tex[k] = c->tex[k];       // (the command holds them)
             g->changed = 1;
             break;
         case C_CLEAR_RTV: case C_CLEAR_DSV: {
             // a pass of its own whose load action clears (the next draws open their own pass)
-            end_encoders(&ce, &be, &re);
+            close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
             if (c->op == C_CLEAR_RTV) {
                 if (!c->tex[0]) break;
@@ -1480,7 +1658,7 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
         case C_DRAW: case C_DRAW_INDEXED: {
             if (!pso || !pso->render) { vx_log("D3D12: a draw without a graphics pipeline state"); break; }
             if (!re || g->changed) {
-                end_encoders(&ce, &be, &re);
+                close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
                 MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
                 uint32_t w = 0, h = 0;
                 for (int k = 0; k < 8; k++) {
@@ -1508,8 +1686,15 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
                     rp.renderTargetHeight = (NSUInteger)(g->vp[0].y + g->vp[0].h);
                     rp.defaultRasterSampleCount = 1;
                 }
+                if (g->occ) {
+                    g->pass_heap = g->occ;
+                    g->pass_vis = [d->mtl newBufferWithLength:g->occ->results.length options:MTLResourceStorageModeShared];
+                    memset(g->pass_vis.contents, 0, g->pass_vis.length);
+                    rp.visibilityResultBuffer = g->pass_vis;
+                }
                 re = [cb renderCommandEncoderWithDescriptor:rp];
                 make_resident_render(re, resident, heap);
+                if (g->occ_on) { [re setVisibilityResultMode:MTLVisibilityResultModeCounting offset:8 * g->occ_index]; pass_query(g); }
                 g->changed = 0;
                 // (the pass's size, for the scissor rectangles, which Metal wants inside the targets)
                 g->sc[15].right = (int32_t)(w ? w : rp.renderTargetWidth);
@@ -1570,7 +1755,8 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
         }
         case C_DISPATCH: {
             if (!pso || !pso->compute) { vx_log("D3D12: Dispatch without a compute pipeline state"); break; }
-            if (be || re) { if (be) [be endEncoding]; if (re) [re endEncoding]; be = nil; re = nil; g->changed = 1; }
+            if (be) { [be endEncoding]; be = nil; }
+            close_pass(d, g, cb, &re);
             if (!ce) {
                 ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
                 // (what the shaders reach through pointers and argument buffers must be resident: every resource
@@ -1597,7 +1783,7 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
             break;
         case C_COPY_BUFFER: case C_COPY_RESOURCE: case C_COPY_TEXTURE: {
             if (ce) { [ce endEncoding]; ce = nil; }
-            if (re) { [re endEncoding]; re = nil; g->changed = 1; }
+            close_pass(d, g, cb, &re);
             if (!be) be = [cb blitCommandEncoder];
             if (c->op == C_COPY_BUFFER) {
                 res12 *dst = c->obj, *src = c->obj2;
@@ -1635,7 +1821,7 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
         }
         }
     }
-    end_encoders(&ce, &be, &re);
+    close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
     free(compute);
     free(graphics);
     free(g);
@@ -1680,6 +1866,14 @@ static WINAPI HRESULT queue_wait(void *this, void *fence, uint64_t v) {
     return S_OK;
 }
 static WINAPI HRESULT queue_timestamp_frequency(void *this, uint64_t *f) { if (f) *f = 1000000000ull; return S_OK; }
+// (the GPU's timestamps and QueryPerformanceCounter are both nanoseconds of the same clock, mach_absolute_time's)
+static WINAPI HRESULT queue_clock_calibration(void *this, uint64_t *gpu, uint64_t *cpu) {
+    MTLTimestamp c = 0, g = 0;
+    [((queue12 *)this)->dev->mtl sampleTimestamps:&c gpuTimestamp:&g];
+    if (gpu) *gpu = g;
+    if (cpu) *cpu = c;
+    return S_OK;
+}
 static WINAPI Q_DESC *queue_get_desc(void *this, Q_DESC *out) { *out = ((queue12 *)this)->desc; return out; }
 
 static WINAPI HRESULT dev_create_queue(void *this, const Q_DESC *desc, const GUID *iid, void **out) {
@@ -2087,11 +2281,12 @@ static void make_tables(void) {
         { "CreateDepthStencilView", (void *)dev_create_dsv }, { "CreateHeap", (void *)dev_create_memheap },
         { "CreateHeap1", (void *)dev_create_memheap1 }, { "CreatePlacedResource", (void *)dev_create_placed },
         { "CreatePlacedResource1", (void *)dev_create_placed1 }, { "GetResourceAllocationInfo", (void *)dev_allocation_info },
-        { "GetResourceAllocationInfo1", (void *)dev_allocation_info1 }, { NULL, NULL } };
+        { "GetResourceAllocationInfo1", (void *)dev_allocation_info1 }, { "CreateQueryHeap", (void *)dev_create_query_heap }, { NULL, NULL } };
     g_device_vtbl = D3D_VTABLE(ID3D12Device10, device);
     static const d3d_method queue[] = {
         { "QueryInterface", (void *)queue_query }, COMMON_METHODS, { "ExecuteCommandLists", (void *)queue_execute },
         { "Signal", (void *)queue_signal }, { "Wait", (void *)queue_wait }, { "GetTimestampFrequency", (void *)queue_timestamp_frequency },
+        { "GetClockCalibration", (void *)queue_clock_calibration },
         { "GetDesc", (void *)queue_get_desc }, { NULL, NULL } };
     g_queue_vtbl = D3D_VTABLE(ID3D12CommandQueue, queue);
     static const d3d_method allocator[] = { { "QueryInterface", (void *)allocator_query }, COMMON_METHODS, { "Reset", (void *)allocator_reset }, { NULL, NULL } };
@@ -2113,7 +2308,8 @@ static void make_tables(void) {
         { "RSSetViewports", (void *)list_viewports }, { "RSSetScissorRects", (void *)list_scissors },
         { "ClearRenderTargetView", (void *)list_clear_rtv }, { "ClearDepthStencilView", (void *)list_clear_dsv },
         { "DrawInstanced", (void *)list_draw }, { "DrawIndexedInstanced", (void *)list_draw_indexed },
-        { "OMSetBlendFactor", (void *)list_blend_factor }, { "OMSetStencilRef", (void *)list_stencil_ref }, { NULL, NULL } };
+        { "OMSetBlendFactor", (void *)list_blend_factor }, { "OMSetStencilRef", (void *)list_stencil_ref },
+        { "BeginQuery", (void *)list_begin_query }, { "EndQuery", (void *)list_end_query }, { "ResolveQueryData", (void *)list_resolve_query }, { NULL, NULL } };
     g_list_vtbl = D3D_VTABLE(ID3D12GraphicsCommandList7, list);
     static const d3d_method fence[] = {
         { "QueryInterface", (void *)fence_query }, COMMON_METHODS, { "GetCompletedValue", (void *)fence_completed },
@@ -2135,6 +2331,8 @@ static void make_tables(void) {
         { "QueryInterface", (void *)memheap_query }, COMMON_METHODS, { "GetDesc", (void *)memheap_get_desc },
         { "GetProtectedResourceSession", (void *)memheap_session }, { NULL, NULL } };
     g_memheap_vtbl = D3D_VTABLE(ID3D12Heap1, memheap);
+    static const d3d_method queryheap[] = { { "QueryInterface", (void *)queryheap_query }, COMMON_METHODS, { NULL, NULL } };
+    g_queryheap_vtbl = D3D_VTABLE(ID3D12QueryHeap, queryheap);
     static const d3d_method blob[] = { { "QueryInterface", (void *)blob_query }, { "AddRef", (void *)obj_addref }, { "Release", (void *)obj_release },
                                        { "GetBufferPointer", (void *)blob_pointer }, { "GetBufferSize", (void *)blob_size }, { NULL, NULL } };
     g_blob_vtbl = D3D_VTABLE(ID3D10Blob, blob);
