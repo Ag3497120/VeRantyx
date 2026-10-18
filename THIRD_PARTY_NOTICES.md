@@ -32,6 +32,8 @@ own Steam account:
   its siblings, MIT, alvr-org), at tag v20.14.1, with the OpenVR SDK headers
   ALVR's build reads (BSD-3-Clause, Valve) and ALVR's crates.io dependencies
   (each under its own license) — fetched by Cargo when `ALVRBridge/` is built
+  The VeRantyx app (`MacApp/`) carries the ALVR bridge built, with these licenses in its licenses folder: ALVR's,
+  OpenVR's, and every crate's license and notice texts (`MacApp/crate_licenses.py`).
 - Steam, SteamVR and the game — Valve Corporation, under their own terms. The
   native version uses the Linux ARM64 depot of Half-Life: Alyx, downloaded
   with your own account; the native launcher patches a few instructions of

@@ -32,13 +32,19 @@ VXRT_VR_NO_STANDBY="${VXRT_VR_NO_STANDBY:-1}"
 VXRT="$REPO_ROOT/VXRuntime/build/vxrt"
 [[ "${VXRT_ARM64:-0}" == 1 ]] && VXRT="$VXRT-arm64"   # (the ARM64 runtime, the program translated: experimental)
 ENCODER="$REPO_ROOT/build/HardwareEncoder"
+HELPER="$REPO_ROOT/build/vxrt-helper"             # (the settings, a JSON value, the web UI stand-in: scripts/vxrt_helper.swift)
 LOG_DIR="${VXRT_VR_LOG_DIR:-$REPO_ROOT/logs}"
 
 [[ -d "$STEAMVR_BIN" ]] || { echo "SteamVR not found at $STEAMVR_BIN" >&2; exit 1; }
-make -C "$REPO_ROOT/VXRuntime" "${VXRT#$REPO_ROOT/VXRuntime/}" >/dev/null
+# (built here from the repository's sources; the VeRantyx app carries them built and no sources: nothing to build)
+[[ -f "$REPO_ROOT/VXRuntime/Makefile" ]] && make -C "$REPO_ROOT/VXRuntime" "${VXRT#$REPO_ROOT/VXRuntime/}" >/dev/null
 if [[ ! -x "$ENCODER" || "$REPO_ROOT/MacEncoder/HardwareEncoder.swift" -nt "$ENCODER" ]]; then
     mkdir -p "$(dirname "$ENCODER")"
     swiftc -O "$REPO_ROOT/MacEncoder/HardwareEncoder.swift" -o "$ENCODER"
+fi
+if [[ ! -x "$HELPER" || "$SCRIPT_DIR/vxrt_helper.swift" -nt "$HELPER" ]]; then
+    mkdir -p "$(dirname "$HELPER")"
+    swiftc -O "$SCRIPT_DIR/vxrt_helper.swift" -o "$HELPER"
 fi
 mkdir -p "$LOG_DIR" "$VXRT_VR_OVERLAY/config"
 # The last start's logs are kept beside the new ones (<name>.prev.log), so two runs can be compared.
@@ -110,7 +116,8 @@ if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
     fi
     export VERANTYX_ALVR_LIB="$ALVR_LIB"
     ALVR_SESSION="$HOME/Library/Application Support/VeRantyx/ALVR/session.json"
-    ALVR_HZ="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["openvr_config"]["refresh_rate"]))' "$ALVR_SESSION" 2>/dev/null || echo 90)"
+    ALVR_HZ="$("$HELPER" json-get "$ALVR_SESSION" openvr_config.refresh_rate 2>/dev/null || echo 90)"
+    ALVR_HZ="${ALVR_HZ%.*}"
     export VERANTYX_DISPLAY_HZ="${VERANTYX_DISPLAY_HZ:-$ALVR_HZ}"
     # SteamVR does not hold the game back by whole frames when it misses the headset's rate (as with the 3k preset):
     # on a MacBook Air M5, Half-Life: Alyx at ALVR's defaults ran some 31 fps either way, and the user found it
@@ -138,31 +145,8 @@ mkdir -p "$OVERLAY_DRIVER"
 cmp -s "$DRIVER_DLL" "$OVERLAY_DRIVER/driver_verantyx.dll" || cp -p "$DRIVER_DLL" "$OVERLAY_DRIVER/driver_verantyx.dll"
 
 # VXRT_VR_SETTINGS='{"steamvr": {"framesToThrottle": 0}}': settings merged in, section by section (experiments).
-python3 - "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" "$VXRT_VR_NO_STANDBY" "${VXRT_VR_RENDER_SCALE:-}" "${VXRT_VR_SETTINGS:-}" <<'EOF'
-import json, os, sys
-settings = json.load(open(sys.argv[1])) if os.path.exists(sys.argv[1]) else {}   # (a new library has none yet)
-# The VeRantyx headset only: no other driver is started (SteamVR's own, vrlink, calls Windows networking functions
-# VXRuntime lacks and stops vrserver), no SteamVR Home or dashboard, no safe mode. The Wine version's setup wrote
-# these into its Steam config; here they are set every start.
-for section, values in {"steamvr": {"forcedDriver": "verantyx", "activateMultipleDrivers": False, "requireHmd": False,
-                                    "enableHomeApp": False, "enableSafeMode": False, "showMirrorView": False,
-                                    "startDashboardFromAppLaunch": False, "motionSmoothing": False},
-                        "dashboard": {"enableDashboard": False}, "verantyx": {"enable": True},
-                        "driver_verantyx": {"blocked_by_safe_mode": False}, "driver_vrlink": {"enable": False},
-                        "lighthouse": {"enable": False}, "oculus": {"enable": False}}.items():
-    settings.setdefault(section, {}).update(values)
-# The default picture size the measurements without a preset were made with (the Wine version's setting).
-settings["steamvr"].setdefault("supersampleManualOverride", True)
-settings["steamvr"].setdefault("supersampleScale", 0.55)
-settings["steamvr"]["allowDisplayLockedMode"] = True
-if sys.argv[4]:   # the driver's render size as given (SteamVR's automatic resolution would scale it back down)
-    settings["steamvr"].update({"supersampleManualOverride": True, "supersampleScale": 1.0})
-if sys.argv[3] == "1":
-    settings.setdefault("power", {}).update({"pauseCompositorOnStandby": False, "turnOffScreensTimeout": 3600.0})
-for section, values in (json.loads(sys.argv[5]) if sys.argv[5] else {}).items():
-    settings.setdefault(section, {}).update(values)
-json.dump(settings, open(sys.argv[2], "w"), indent=3)
-EOF
+# The VeRantyx headset is the only driver, no SteamVR Home, dashboard or safe mode (vxrt_helper.swift: vrsettings).
+"$HELPER" vrsettings "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" "$VXRT_VR_NO_STANDBY" "${VXRT_VR_RENDER_SCALE:-}" "${VXRT_VR_SETTINGS:-}"
 
 # Frames are scaled and converted for the encoder on the GPU: the encoder's own CPU/GPU timing picks the CPU when the
 # Mac is idle, and the CPU then loses to a game running at full rate (60 frames captured, 20 encoded).
@@ -195,7 +179,7 @@ ENCODER_PID=$!
 
 # Games' SteamVR web UIs need vrwebhelper (Chromium), which does not run on VXRuntime: this answers for
 # Half-Life: Alyx's (it gives up after a minute without the page's "ready").
-python3 "$SCRIPT_DIR/vxrt_webui_standin.py" >"$LOG_DIR/webui-standin.log" 2>&1 &
+"$HELPER" webui-standin >"$LOG_DIR/webui-standin.log" 2>&1 &
 WEBUI_PID=$!
 if [[ "${VERANTYX_ALVR:-0}" == 1 ]]; then
     echo "Encoder started with ALVR (log: $LOG_DIR/hardware-encoder.log); open an ALVR client app (20.x) on this network"

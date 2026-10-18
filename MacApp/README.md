@@ -1,0 +1,81 @@
+# VeRantyx for Mac (the app)
+
+A Mac app for players who would rather not use Terminal: it sets up the vxrt version and starts the games from a
+window. It carries the runtime built (VXRuntime, the encoder, the SteamVR driver and capture proxy, ALVR's streaming
+core, the launch scripts), so the player's Mac needs only macOS and Steam: no Homebrew, Xcode, Python or Rust.
+
+- **Get started**: checks the Mac (Apple silicon, macOS 14.2 or later, Rosetta 2, with a button that has macOS install
+  it), Steam for Mac (installed, running), where the games go (any folder, an external SSD too), then gets SteamVR and
+  the games' Windows builds: downloaded with the player's own Steam account through Valve's steamcmd, or copied from a
+  Steam library they have (a Windows PC's drive, a CrossOver or Whisky bottle; an APFS clone on the same disk). Then it
+  gathers the Microsoft runtime DLLs from the installers those installs carry (`Sources/Redist.swift`, the same choice
+  of files as `tools/vxrt_redist.py`).
+- **Play**: the installed games, with what is known about each (games/*.json), a picture setting, and the session:
+  SteamVR up, the headset connected, the frame rate, the game's log, Stop.
+- **Headset**: Meta Quest or Pico through ALVR (Wi-Fi or a USB cable), Apple Vision Pro with the VeRantyx app, or with
+  the ALVR app; the steps for each.
+- **Help**: the logs folder, a report form on GitHub filled in with the Mac's facts, Stop everything.
+
+It uses the same places as the scripts (`~/Verantyx_VR_Drive/vxrt_steam`, `vxrt_redist`, the overlay and the root;
+another folder can be chosen) and starts the games with the same scripts (`scripts/launch_vxrt_alyx.sh`,
+`launch_vxrt_game.sh`), from its own copy, with `VXRT_NO_WINE=1` and its logs in `~/Library/Logs/VeRantyx`. A setup made
+with either works with the other.
+
+steamcmd runs in a pseudo-terminal shown in a console in the app (`Sources/SteamCmd.swift`). When it asks for the
+password or a Steam Guard code, the player types it into the console's field and it is written to steamcmd as typed;
+the app keeps it nowhere (not in a file, its settings or the console's text: steamcmd does not echo it). steamcmd
+remembers the sign-in itself. Only the account name is kept (in the app's settings). Network: steamcmd from Valve
+(`steamcdn-a.akamaihd.net`, the first time; Homebrew's is used if installed), the games from Steam, and with a USB
+cable Google's Android platform tools, which ALVR downloads once when there is no adb.
+
+## Build
+
+```bash
+MacApp/build_app.sh                    # build/app/VeRantyx.app and build/app/VeRantyx-<version>.dmg, signed ad hoc
+```
+
+Needs what the repository's own setup builds with (Xcode or its command line tools, mingw-w64, Rust). The version is
+`MacApp/VERSION`. Signed ad hoc, the app runs on the Mac that built it; another Mac asks once to allow it (System
+Settings > Privacy & Security > Open Anyway).
+
+To hand it out without that step, sign it with a Developer ID and have Apple notarize it (the publisher, once):
+
+1. Xcode > Settings > Accounts > the team > Manage Certificates > + > **Developer ID Application** (needs the paid
+   Apple Developer Program).
+2. `xcrun notarytool store-credentials verantyx-notary --apple-id <Apple ID> --team-id <team>` (asks for an
+   app-specific password, made at appleid.apple.com; kept in the keychain).
+3. `VERANTYX_SIGN_IDENTITY="Developer ID Application: <name> (<team>)" VERANTYX_NOTARY_PROFILE=verantyx-notary MacApp/build_app.sh`
+
+With a Developer ID everything is signed with the hardened runtime: VXRuntime with `entitlements/vxrt.plist` (it maps the
+Windows programs' code itself, and loads Steam for Mac's `steamclient.dylib`, which Valve signs), the encoder with
+`entitlements/encoder.plist` (it loads the ALVR bridge). `VERANTYX_HARDENED=1` tries the same with ad-hoc signing.
+
+The licenses folder in the app holds VeRantyx's license, THIRD_PARTY_NOTICES.md, ALVR's and OpenVR's licenses, and
+the license and notice texts of the Rust crates in the ALVR bridge (`crate_licenses.py`).
+
+## Testing without the window
+
+```bash
+VeRantyx.app/Contents/MacOS/VeRantyx --collect-redist          # gathers the runtime DLLs (VXRT_REDIST=<folder>: elsewhere)
+VeRantyx.app/Contents/MacOS/VeRantyx --play 546560 120         # starts a game as Play does, prints what the app sees
+VeRantyx.app/Contents/MacOS/VeRantyx --snapshot <folder>       # a PNG of each page
+```
+
+## Checked (2026-10-18)
+
+- The runtime DLLs: `--collect-redist` and `tools/vxrt_redist.py collect` on the same libraries chose the same 136
+  DLLs, every one with the same version and SHA-256.
+- Half-Life: Alyx started from the app's own copy of the runtime on the MacBook Air M5 (`--play 546560`, the Quest
+  setting, no headset): SteamVR up, the web UI stand-in (now `scripts/vxrt_helper.swift`) told the game its page was
+  ready, the game loaded its menu (map "startup"), the encoder took its frames (30-40 a second with no headset) with
+  ALVR's streaming core and game audio, Stop ended everything. The same with the hardened runtime (ad-hoc,
+  `VERANTYX_HARDENED=1`): VXRuntime ran the game, its Steam bridge loaded Steam for Mac's client (`SteamAPI_Init`
+  OK), the encoder loaded the ALVR bridge.
+- Copying from a Steam library (a library made for the test): the app's folder and its manifest cloned into
+  vxrt_steam, its executable found, anti-cheat files noticed, a second copy refused.
+- The steamcmd console with a stand-in program: lines written over themselves, steamcmd's progress lines (87 %,
+  downloading), a line typed into it, its exit status.
+- The pages (`--snapshot`), in Japanese.
+
+Not checked yet: a real steamcmd sign-in and download through the app (it needs the player's own account), a Quest or
+Pico, copying from another disk, a Developer ID signature and notarization.

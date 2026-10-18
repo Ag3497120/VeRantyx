@@ -58,6 +58,19 @@ Toolkit is neither shipped nor needed (an optional, experimental Wine-version
 backend, `VERANTYX_D3D_BACKEND=d3dmetal`, uses D3DMetal only from a copy you
 obtained from Apple yourself, [docs/SETUP.md](docs/SETUP.md)).
 
+## The app: VeRantyx for Mac (no Terminal)
+
+**VeRantyx for Mac** ([`MacApp/`](MacApp/README.md)) does the setup and starts the games from a window, for players who
+would rather not use Terminal. It checks the Mac (Apple silicon, macOS 14.2 or later, Rosetta 2), gets the Windows
+builds of SteamVR and the games with your own Steam account through Valve's steamcmd (or copies them from a Steam
+library you already have), gathers the Microsoft runtime files from their own installers, and starts a game for the
+headset you choose: Meta Quest or Pico through ALVR (Wi-Fi or a USB cable), or Apple Vision Pro (the VeRantyx app or
+the ALVR app). The runtime is inside the app: the Mac needs nothing but macOS and Steam.
+
+Get it from the [Releases](https://github.com/Ag3497120/VeRantyx/releases) page when a build is published, or build it:
+`MacApp/build_app.sh`. A build that is not notarized by Apple yet asks once to be allowed: System Settings > Privacy &
+Security > Open Anyway. The app and the scripts below share one setup.
+
 ## Quick start (vxrt version)
 
 You need an Apple silicon Mac with Rosetta 2, Xcode (or its command line tools),
