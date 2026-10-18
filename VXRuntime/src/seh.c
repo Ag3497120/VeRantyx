@@ -611,8 +611,10 @@ static void on_signal(int sig, siginfo_t *si, void *ucv) {
         rec->code = si->si_code == FPE_INTDIV ? 0xC0000094 : si->si_code == FPE_INTOVF ? 0xC0000095 : 0xC0000090;
         break;
     case SIGILL: rec->code = 0xC000001D; break;    // EXCEPTION_ILLEGAL_INSTRUCTION
-    case SIGTRAP:                                   // int3: Windows reports the breakpoint's own address
-        rec->code = 0x80000003; c->rip--; rec->address = (void *)c->rip; break;
+    case SIGTRAP:                                   // int3 (a trap): the saved Rip is already past the int3, where a
+        rec->code = 0x80000003;                     // handler that continues without touching it resumes, as on
+        rec->address = (void *)(c->rip - 1);        // Windows; only the reported address is the int3's own
+        break;
     }
     uint64_t call_sp = (sp - 64) & ~(uint64_t)15;
     *(uint64_t *)(call_sp - 8) = 0;                 // fake return address
@@ -792,7 +794,10 @@ __attribute__((constructor)) static void seh_special_add(void) { vx_thunks_add(s
 // An exception of the program's code where translated code stopped (src/arm64.c): RIP at the instruction.
 void __attribute__((noreturn)) vx_seh_fault(DWORD code, DWORD n, const uint64_t *params) {
     x86_ctx *x = vx_x86_ctx();
-    CONTEXT c; context_from(&c, x, x->rip, x->gpr[4]);
+    // int3 (STATUS_BREAKPOINT) is a trap: the context resumes after the 0xCC (where the engine left Rip at it), so a
+    // handler that continues without touching Rip runs on past the breakpoint; only the reported address is the int3.
+    uint64_t rip = code == 0x80000003 ? x->rip + 1 : x->rip;
+    CONTEXT c; context_from(&c, x, rip, x->gpr[4]);
     EXCEPTION_RECORD rec = { code, 0, NULL, (void *)(uintptr_t)x->rip, n, 0, {0} };
     if (params) memcpy(rec.info, params, n * 8);
     dispatch(&rec, &c);
