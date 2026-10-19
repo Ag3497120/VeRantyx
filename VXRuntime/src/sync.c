@@ -1156,7 +1156,8 @@ static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_pr
 }
 
 // ---- critical sections and SRW locks -------------------------------------------------------------------------------------
-#ifdef __aarch64__
+// (both builds: the x86 one under Rosetta ran a pthread mutex per section before, which went to the kernel on every
+//  contended lock and unlock; Elite Dangerous's threads spent 60 % of their time there)
 // Lock words in the program's memory, so that the vCPU guest takes and releases a free lock itself (translator/
 // guest.c, the same protocol): only a lock that is held makes a call that waits here, on the word. 32-bit words:
 // programs pack these structures to 4 bytes (SteamVR's vrserver), and an 8-byte atomic there is a bus error.
@@ -1168,10 +1169,16 @@ extern int __ulock_wait(uint32_t op, void *addr, uint64_t value, uint32_t timeou
 extern int __ulock_wake(uint32_t op, void *addr, uint64_t wake_value);
 enum { UL_COMPARE_AND_WAIT = 1, ULF_WAKE_ALL = 0x100 };
 enum { CS_RECURSION = 12, CS_OWNER = 16, CS_WORD = 24 };
+#ifdef __aarch64__
+#define cpu_relax() __builtin_arm_yield()
+#else
+#define cpu_relax() __builtin_ia32_pause()
+#endif
 #define CS_FIELD(cs, off, type) (*(type *)((uint8_t *)(cs) + (off)))
 static WINAPI void InitializeCriticalSection(void *cs) { memset(cs, 0, 40); }
 static WINAPI BOOL InitializeCriticalSectionAndSpinCount(void *cs, DWORD spin) { (void)spin; InitializeCriticalSection(cs); return 1; }
 static WINAPI BOOL InitializeCriticalSectionEx(void *cs, DWORD spin, DWORD flags) { (void)spin; (void)flags; InitializeCriticalSection(cs); return 1; }
+static WINAPI DWORD SetCriticalSectionSpinCount(void *cs, DWORD spin) { (void)cs; (void)spin; return 0; }   // (no spinning here; the previous count)
 static int cs_try(void *cs, uint32_t tid) {
     uint32_t *w = &CS_FIELD(cs, CS_WORD, uint32_t);
     if (__atomic_load_n(w, __ATOMIC_RELAXED) && CS_FIELD(cs, CS_OWNER, uint32_t) == tid) { CS_FIELD(cs, CS_RECURSION, int32_t)++; return 1; }
@@ -1183,7 +1190,7 @@ static int cs_try(void *cs, uint32_t tid) {
 static WINAPI BOOL TryEnterCriticalSection(void *cs) { return cs_try(cs, vx_current_tid()); }
 static WINAPI void EnterCriticalSection(void *cs) {
     uint32_t tid = vx_current_tid(), *w = &CS_FIELD(cs, CS_WORD, uint32_t);
-    for (int spin = 0; spin < 64; spin++) { if (cs_try(cs, tid)) return; __builtin_arm_yield(); }
+    for (int spin = 0; spin < 64; spin++) { if (cs_try(cs, tid)) return; cpu_relax(); }
     // (taken as 2: others may sleep on it still)
     while (__atomic_exchange_n(w, 2, __ATOMIC_ACQUIRE)) __ulock_wait(UL_COMPARE_AND_WAIT, w, 2, 0);
     CS_FIELD(cs, CS_RECURSION, int32_t) = 1; CS_FIELD(cs, CS_OWNER, uint64_t) = tid;
@@ -1203,7 +1210,7 @@ static int srw_try(uint32_t *w, int shared) {
     return __atomic_compare_exchange_n(w, &cur, shared ? cur + 4 : cur | 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
 }
 static void srw_acquire(uint32_t *w, int shared) {
-    for (int spin = 0; spin < 64; spin++) { if (srw_try(w, shared)) return; __builtin_arm_yield(); }
+    for (int spin = 0; spin < 64; spin++) { if (srw_try(w, shared)) return; cpu_relax(); }
     for (;;) {
         if (srw_try(w, shared)) return;
         uint32_t cur = __atomic_load_n(w, __ATOMIC_RELAXED);
@@ -1226,45 +1233,6 @@ static WINAPI void AcquireSRWLockShared(void *l) { srw_acquire(l, 1); }
 static WINAPI void ReleaseSRWLockShared(void *l) { srw_release(l, 1); }
 static WINAPI BOOL TryAcquireSRWLockExclusive(void *l) { return srw_try(l, 0); }
 static WINAPI BOOL TryAcquireSRWLockShared(void *l) { return srw_try(l, 1); }
-#else
-// A CRITICAL_SECTION (40 bytes, in the program's memory) holds a pointer to a recursive pthread mutex.
-static pthread_mutex_t *cs_mutex(void *cs) {
-    pthread_mutex_t **slot = (pthread_mutex_t **)cs;
-    if (!*slot) {
-        pthread_mutex_t *m = malloc(sizeof *m);
-        pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-        pthread_mutex_init(m, &a); pthread_mutexattr_destroy(&a);
-        if (!__sync_bool_compare_and_swap(slot, NULL, m)) { pthread_mutex_destroy(m); free(m); }
-    }
-    return *slot;
-}
-static WINAPI void InitializeCriticalSection(void *cs) { memset(cs, 0, 40); cs_mutex(cs); }
-static WINAPI BOOL InitializeCriticalSectionAndSpinCount(void *cs, DWORD spin) { (void)spin; InitializeCriticalSection(cs); return 1; }
-static WINAPI BOOL InitializeCriticalSectionEx(void *cs, DWORD spin, DWORD flags) { (void)spin; (void)flags; InitializeCriticalSection(cs); return 1; }
-static WINAPI void EnterCriticalSection(void *cs) { pthread_mutex_lock(cs_mutex(cs)); }
-static WINAPI BOOL TryEnterCriticalSection(void *cs) { return pthread_mutex_trylock(cs_mutex(cs)) == 0; }
-static WINAPI void LeaveCriticalSection(void *cs) { pthread_mutex_unlock(cs_mutex(cs)); }
-static WINAPI void DeleteCriticalSection(void *cs) {
-    pthread_mutex_t **slot = (pthread_mutex_t **)cs;
-    if (*slot) { pthread_mutex_destroy(*slot); free(*slot); *slot = NULL; }
-}
-// SRW lock: one pointer, holding a pthread rwlock.
-static pthread_rwlock_t *srw(void *l) {
-    pthread_rwlock_t **slot = (pthread_rwlock_t **)l;
-    if (!*slot) {
-        pthread_rwlock_t *r = malloc(sizeof *r); pthread_rwlock_init(r, NULL);
-        if (!__sync_bool_compare_and_swap(slot, NULL, r)) { pthread_rwlock_destroy(r); free(r); }
-    }
-    return *slot;
-}
-static WINAPI void InitializeSRWLock(void *l) { *(void **)l = NULL; }
-static WINAPI void AcquireSRWLockExclusive(void *l) { pthread_rwlock_wrlock(srw(l)); }
-static WINAPI void ReleaseSRWLockExclusive(void *l) { pthread_rwlock_unlock(srw(l)); }
-static WINAPI void AcquireSRWLockShared(void *l) { pthread_rwlock_rdlock(srw(l)); }
-static WINAPI void ReleaseSRWLockShared(void *l) { pthread_rwlock_unlock(srw(l)); }
-static WINAPI BOOL TryAcquireSRWLockExclusive(void *l) { return pthread_rwlock_trywrlock(srw(l)) == 0; }
-static WINAPI BOOL TryAcquireSRWLockShared(void *l) { return pthread_rwlock_tryrdlock(srw(l)) == 0; }
-#endif
 
 // ---- condition variables ------------------------------------------------------------------------------------------------------
 // A CONDITION_VARIABLE (one pointer) holds a wake counter. A sleeper reads it while still holding its lock, so a
@@ -1321,11 +1289,7 @@ static WINAPI BOOL SleepConditionVariableCS(uint64_t *cv, void *cs, DWORD ms) {
 static WINAPI BOOL SleepConditionVariableSRW(uint64_t *cv, void *l, DWORD ms, DWORD flags) {
     int shared = flags & 1;                    // CONDITION_VARIABLE_LOCKMODE_SHARED
     uint32_t seen = __atomic_load_n((uint32_t *)cv, __ATOMIC_ACQUIRE);
-#ifdef __aarch64__
     if (shared) ReleaseSRWLockShared(l); else ReleaseSRWLockExclusive(l);
-#else
-    pthread_rwlock_unlock(srw(l));
-#endif
     int woken = cv_sleep((uint32_t *)cv, seen, ms);
     if (shared) AcquireSRWLockShared(l); else AcquireSRWLockExclusive(l);
     return woken;
@@ -1733,7 +1697,7 @@ static const vx_export sync_k32[] = {
     VX_EXPORT(WaitOnAddress), VX_EXPORT(WakeByAddressAll), VX_EXPORT(WakeByAddressSingle),
     VX_EXPORT(WaitForSingleObject), VX_EXPORT(WaitForSingleObjectEx), VX_EXPORT(WaitForMultipleObjects),
     VX_EXPORT(WaitForMultipleObjectsEx), VX_EXPORT(SleepEx), VX_EXPORT(QueueUserAPC), VX_EXPORT(CloseHandle), VX_EXPORT(DuplicateHandle),
-    VX_EXPORT(InitializeCriticalSection), VX_EXPORT(InitializeCriticalSectionAndSpinCount), VX_EXPORT(InitializeCriticalSectionEx),
+    VX_EXPORT(InitializeCriticalSection), VX_EXPORT(InitializeCriticalSectionAndSpinCount), VX_EXPORT(InitializeCriticalSectionEx), VX_EXPORT(SetCriticalSectionSpinCount),
     VX_EXPORT(EnterCriticalSection), VX_EXPORT(TryEnterCriticalSection), VX_EXPORT(LeaveCriticalSection), VX_EXPORT(DeleteCriticalSection),
     VX_EXPORT(InitializeSRWLock), VX_EXPORT(AcquireSRWLockExclusive), VX_EXPORT(ReleaseSRWLockExclusive),
     VX_EXPORT(AcquireSRWLockShared), VX_EXPORT(ReleaseSRWLockShared),

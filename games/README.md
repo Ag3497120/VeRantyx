@@ -10,6 +10,12 @@ state (`status`, with the `level` reached: starts, connects, draws, runs, contro
 from a person's playtest, `tools/vxrt_playtest.py`, recorded in `playtests`), and what is known (`known_issues` with
 their GitHub issues, `notes`). `works` means a playtest found it playable.
 
+Set `exe` to a path relative to the installed game folder when the measured entry point differs from the installer's
+largest detected executable (for example, when the official launcher must run first). The harness and doctor resolve
+that path inside the install folder and refuse the run if it is missing or escapes the folder. Set `game_exe` when
+the launcher and the actual game have different binaries, so the doctor can inspect the game's API imports while runs
+still enter through the official launcher.
+
 Adding a game or changing what is known about one is a pull request anyone can make, usually with an AI coding tool:
 
 1. `tools/vxrt_run.py <app id>` (an installed game without a profile runs with a default one), until it runs.

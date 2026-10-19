@@ -210,6 +210,8 @@ typedef struct {
     char why[200];
 } gen;
 
+// a buffer SRV's rank (its slot and size index) from its t#
+#define SRV_RANK(g, t) (((t) < 64 && (g)->sh->srv_rank[t]) ? (uint32_t)(g)->sh->srv_rank[t] - 1 : (uint32_t)(t))
 static void line(gen *g, const char *fmt, ...) {
     char buf[2048];
     va_list ap;
@@ -374,7 +376,11 @@ static void componentwise(gen *g, const instr *in, int kind, int result_kind, co
     if (in->nops > 1) src(g, &in->ops[1], comps, n, kind, a, sizeof a);
     if (in->nops > 2) src(g, &in->ops[2], comps, n, kind, b, sizeof b);
     if (in->nops > 3) src(g, &in->ops[3], comps, n, kind, c, sizeof c);
-    snprintf(expr, sizeof expr, fmt, a, b, c, type_name(result_kind, n), type_name(K_UINT, n));
+    // %6$s / %7$s: the half and ushort types of the same width (f16tof32 / f32tof16 convert per component)
+    char half_type[8], ushort_type[10];
+    snprintf(half_type, sizeof half_type, n > 1 ? "half%d" : "half", n);
+    snprintf(ushort_type, sizeof ushort_type, n > 1 ? "ushort%d" : "ushort", n);
+    snprintf(expr, sizeof expr, fmt, a, b, c, type_name(result_kind, n), type_name(K_UINT, n), half_type, ushort_type);
     assign(g, &in->ops[0], expr, result_kind, n, in->saturate);
 }
 // Comparisons give all ones or zero per component.
@@ -608,7 +614,7 @@ static void memory_access(gen *g, const instr *in) {
     // (outside the view: a load reads 0 and a store is dropped, as in Direct3D; Metal would read or write what lies
     //  beyond it. Group shared memory is not checked: outside it, Direct3D leaves it undefined too.)
     char limit[64] = "";
-    if (!shared) { snprintf(limit, sizeof limit, "(vx_sizes[%u] >> 2)", res->type == OPD_UAV ? res->index[0] : 8 + res->index[0]); g->sh->uses_sizes = 1; }
+    if (!shared) { snprintf(limit, sizeof limit, "(vx_sizes[%u] >> 2)", res->type == OPD_UAV ? res->index[0] : 8 + SRV_RANK(g, res->index[0])); g->sh->uses_sizes = 1; }
     line(g, "{ uint vx_a = %s;", addr);
     if (limit[0]) line(g, "  uint vx_n = %s;", limit);
     if (store) {
@@ -678,7 +684,7 @@ static void bufinfo(gen *g, const instr *in) {
     else {
         uint32_t stride = r->type == OPD_UAV ? g->sh->uav_stride[i & 7] : g->sh->srv_stride[i & 63];
         g->sh->uses_sizes = 1;
-        snprintf(v, sizeof v, "(vx_sizes[%u]%s)", r->type == OPD_UAV ? i : 8 + i, stride ? "" : "");
+        snprintf(v, sizeof v, "(vx_sizes[%u]%s)", r->type == OPD_UAV ? i : 8 + SRV_RANK(g, i), stride ? "" : "");
         if (stride) { char t[250]; snprintf(t, sizeof t, "(%s / %uu)", v, stride); snprintf(v, sizeof v, "%s", t); }
     }
     snprintf(expr, sizeof expr, "%s(%s)", type_name(K_UINT, n), v);
@@ -742,7 +748,7 @@ static void atomic(gen *g, const instr *in) {
     if (!shared) {
         g->sh->uses_sizes = 1;
         line(g, "{ uint vx_a = %s;", a);
-        line(g, "if (vx_a < (vx_sizes[%u] >> 2)) {", res->type == OPD_UAV ? res->index[0] : 8 + res->index[0]);
+        line(g, "if (vx_a < (vx_sizes[%u] >> 2)) {", res->type == OPD_UAV ? res->index[0] : 8 + SRV_RANK(g, res->index[0]));
         g->indent++;
         snprintf(a, sizeof a, "vx_a");
     }
@@ -1027,8 +1033,8 @@ static void translate(gen *g, const instr *in) {
     case OP_FIRSTBIT_LO: componentwise(g, in, K_UINT, K_UINT, "select(ctz(%1$s), %4$s(0xffffffffu), %1$s == 0u)"); break;
     case OP_FIRSTBIT_HI: componentwise(g, in, K_UINT, K_UINT, "select(%4$s(31u) - clz(%1$s), %4$s(0xffffffffu), %1$s == 0u)"); break;
     case OP_FIRSTBIT_SHI: componentwise(g, in, K_INT, K_UINT, "select(%4$s(31u) - clz(as_type<%4$s>(select(%1$s, ~%1$s, %1$s < 0))), %4$s(0xffffffffu), %1$s == 0 || %1$s == -1)"); break;
-    case OP_F32TOF16: componentwise(g, in, K_FLOAT, K_UINT, "%4$s(as_type<ushort>(half(%1$s)))"); break;
-    case OP_F16TOF32: componentwise(g, in, K_UINT, K_FLOAT, "float(as_type<half>(ushort(%1$s & 0xffffu)))"); break;
+    case OP_F32TOF16: componentwise(g, in, K_FLOAT, K_UINT, "%4$s(as_type<%7$s>(%6$s(%1$s)))"); break;
+    case OP_F16TOF32: componentwise(g, in, K_UINT, K_FLOAT, "%4$s(as_type<%6$s>(%7$s(%1$s & 0xffffu)))"); break;
     case OP_UBFE: case OP_IBFE: case OP_BFI: bitfield(g, in); break;
     case OP_MOVC: {
         int comps[4], n = dest_comps(&in->ops[0], comps);
@@ -1204,10 +1210,13 @@ static void declare(gen *g, uint32_t op, uint32_t token, reader *r, pool *pl) {
     }
     case OP_DCL_RESOURCE_RAW: case OP_DCL_RESOURCE_STRUCTURED:
         read_operand(r, pl, &o);
-        if (o.index[0] < 22) {
+        if (o.index[0] < 64) {                                   // any t#: the slot is by rank (22 buffers at most)
+            uint32_t rank = (uint32_t)__builtin_popcountll(g->sh->srv_buffers);
+            if (rank >= 22) { fail(g, "buffer t%u: more than 22 buffer SRVs are not supported", o.index[0]); break; }
             g->sh->srv_buffers |= 1ull << o.index[0];
+            g->sh->srv_rank[o.index[0]] = (uint8_t)(rank + 1);
             g->sh->srv_stride[o.index[0]] = op == OP_DCL_RESOURCE_STRUCTURED ? next(r) : 0;
-        } else fail(g, "buffer t%u: only t0..t21 are supported", o.index[0]);
+        } else fail(g, "buffer t%u: only t0..t63 are supported", o.index[0]);
         break;
     default: break;                                          // flags, index ranges and the like change nothing here
     }
@@ -1255,7 +1264,7 @@ static void resource_params(gen *g, text *t) {
         put(t, ", %s<%s> t%d [[texture(%d)]]", tt, g->tex_cmp[i] ? "float" : rt, i, i);
     }
     for (int i = 0; i < 32; i++) if (sh->samplers & (1u << i)) put(t, ", sampler s%d [[sampler(%d)]]", i, i);
-    for (int i = 0; i < 22; i++) if (sh->srv_buffers & (1ull << i)) put(t, ", const device uint *t%d [[buffer(%d)]]", i, DXBC_SRV_BUFFER_BASE + i);
+    for (int i = 0; i < 64; i++) if (sh->srv_buffers & (1ull << i)) put(t, ", const device uint *t%d [[buffer(%d)]]", i, DXBC_SRV_BUFFER_BASE + sh->srv_rank[i] - 1);
     for (int i = 0; i < 8; i++) {
         if (!(sh->uavs & (1u << i))) continue;
         if (sh->uav_kind[i] != DXBC_UAV_TYPED) { put(t, ", device uint *u%d [[buffer(%d)]]", i, DXBC_UAV_BUFFER_BASE + i); continue; }
@@ -1636,7 +1645,7 @@ int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
         out->gs_instances = g.gs_instances ? (int)g.gs_instances : 1;
         const char *why = !out->gs_in_verts ? "its input primitive" : g.gs_topology != 5 ? "an output other than triangle strips" :
                           !out->gs_max_tris ? "no triangles" : out->gs_instances > 1 ? "instancing" :
-                          (out->srv_buffers >> (DXBC_GS_COUNTS - DXBC_SRV_BUFFER_BASE)) ? "buffers at the slots the geometry path uses" : NULL;
+                          __builtin_popcountll(out->srv_buffers) > DXBC_GS_COUNTS - DXBC_SRV_BUFFER_BASE ? "buffers at the slots the geometry path uses" : NULL;
         if (why) { snprintf(out->error, sizeof out->error, "geometry shader with %s is not supported yet", why); free(g.body.s); free(g.icb); return -1; }
         out->msl = compose_gs(&g, out->gs_max_tris);
         out->msl_passthrough = compose_passthrough(&g, out->gs_max_tris);

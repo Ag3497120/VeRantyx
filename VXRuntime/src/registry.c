@@ -139,6 +139,25 @@ static void defaults(void) {
     set_value(nt, "CurrentMinorVersionNumber", REG_DWORD, &minor, 4);
 }
 
+// HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid: the installation's own id, which Windows makes once at setup and
+// programs read to tell machines apart (Frontier's launcher hashes it). Made here once per VXRT_ROOT (a random UUID,
+// kept in registry.txt), also in a registry.txt made before this existed.
+static void ensure_machine_guid(void) {
+    reg_key *crypto = walk(&g_roots[2], "Software\\Microsoft\\Cryptography", 1);
+    reg_value *existing = *find_value(crypto, "MachineGuid");
+    if (existing) return;
+    uint8_t b[16];
+    arc4random_buf(b, sizeof b);
+    b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);                        // version 4
+    b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);
+    char text[40];
+    snprintf(text, sizeof text, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    WCHAR *w = vx_utf16_dup(text);
+    set_value(crypto, "MachineGuid", REG_SZ, w, (DWORD)(vx_wcslen(w) + 1) * 2);
+    free(w);
+}
+
 void vx_steam_registry(void);   // steambridge.c
 // A value set while the registry loads (the lock is held): the path starts with a root's full name.
 void vx_reg_put(const char *path, const char *name, DWORD type, const void *data, DWORD size) {
@@ -154,7 +173,7 @@ static void load(void) {
     char file[4200];
     snprintf(file, sizeof file, "%s/registry.txt", vx_root());
     FILE *f = fopen(file, "r");
-    if (!f) { defaults(); vx_steam_registry(); save(); return; }
+    if (!f) { defaults(); ensure_machine_guid(); vx_steam_registry(); save(); return; }
     size_t cap = 1 << 16;
     char *line = malloc(cap);
     uint8_t *buf = malloc(cap);
@@ -182,7 +201,10 @@ static void load(void) {
     }
     free(line); free(buf);
     fclose(f);
+    reg_value *had = *find_value(walk(&g_roots[2], "Software\\Microsoft\\Cryptography", 1), "MachineGuid");
+    ensure_machine_guid();
     vx_steam_registry();
+    if (!had) save();                                              // (a registry.txt from before the id existed)
 }
 
 static void set_value(reg_key *k, const char *name, DWORD type, const void *data, DWORD size) {

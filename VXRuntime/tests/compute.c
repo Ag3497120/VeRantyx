@@ -6,6 +6,7 @@
 #include <d3d11.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include "shaders/sum_cs.h"
 #include "shaders/atomic_cs.h"
@@ -442,6 +443,72 @@ static void test_formats(void) {
     ID3D11Texture3D_Release(t3d); ID3D11Texture1D_Release(t1d); ID3D11ComputeShader_Release(cs);
 }
 
+static void test_uav_buffer_clear(void) {
+    uint32_t structured_initial[16], structured_expected[16];
+    for (uint32_t i = 0; i < 16; i++) structured_initial[i] = structured_expected[i] = 0xa0000000u + i;
+    ID3D11Buffer *structured = make_buffer(sizeof structured_initial, D3D11_BIND_UNORDERED_ACCESS,
+        D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 16, structured_initial, D3D11_USAGE_DEFAULT, 0);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC structured_desc = { DXGI_FORMAT_UNKNOWN, D3D11_UAV_DIMENSION_BUFFER };
+    structured_desc.Buffer.FirstElement = 1;
+    structured_desc.Buffer.NumElements = 2;
+    ID3D11UnorderedAccessView *structured_view = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)structured,
+        &structured_desc, &structured_view)));
+    const uint32_t values[4] = { 0x12345678u, 0xabcdef01u, 0x13579bdfu, 0x2468ace0u };
+    if (structured && structured_view) {
+        ID3D11DeviceContext_ClearUnorderedAccessViewUint(ctx, structured_view, values);
+        for (uint32_t i = 4; i < 12; i++) structured_expected[i] = values[0];
+        uint32_t actual[16] = { 0 };
+        read_buffer(structured, actual, sizeof actual);
+        CHECK(!memcmp(actual, structured_expected, sizeof actual));
+    }
+    if (structured_view) ID3D11UnorderedAccessView_Release(structured_view);
+    if (structured) ID3D11Buffer_Release(structured);
+
+    uint16_t typed16_initial[8], typed16_expected[8];
+    for (uint32_t i = 0; i < 8; i++) typed16_initial[i] = typed16_expected[i] = (uint16_t)(0x7100u + i);
+    ID3D11Buffer *typed16 = make_buffer(sizeof typed16_initial, D3D11_BIND_UNORDERED_ACCESS,
+        0, 0, typed16_initial, D3D11_USAGE_DEFAULT, 0);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC typed16_desc = { DXGI_FORMAT_R16_UINT, D3D11_UAV_DIMENSION_BUFFER };
+    typed16_desc.Buffer.FirstElement = 2;
+    typed16_desc.Buffer.NumElements = 3;
+    ID3D11UnorderedAccessView *typed16_view = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)typed16,
+        &typed16_desc, &typed16_view)));
+    if (typed16 && typed16_view) {
+        ID3D11DeviceContext_ClearUnorderedAccessViewUint(ctx, typed16_view, values);
+        for (uint32_t i = 2; i < 5; i++) typed16_expected[i] = (uint16_t)values[0];
+        uint16_t actual[8] = { 0 };
+        read_buffer(typed16, actual, sizeof actual);
+        CHECK(!memcmp(actual, typed16_expected, sizeof actual));
+    }
+    if (typed16_view) ID3D11UnorderedAccessView_Release(typed16_view);
+    if (typed16) ID3D11Buffer_Release(typed16);
+
+    uint8_t typed4_initial[16], typed4_expected[16];
+    for (uint32_t i = 0; i < 16; i++) typed4_initial[i] = typed4_expected[i] = (uint8_t)(0x30u + i);
+    ID3D11Buffer *typed4 = make_buffer(sizeof typed4_initial, D3D11_BIND_UNORDERED_ACCESS,
+        0, 0, typed4_initial, D3D11_USAGE_DEFAULT, 0);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC typed4_desc = { DXGI_FORMAT_R8G8B8A8_UINT, D3D11_UAV_DIMENSION_BUFFER };
+    typed4_desc.Buffer.FirstElement = 1;
+    typed4_desc.Buffer.NumElements = 2;
+    ID3D11UnorderedAccessView *typed4_view = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)typed4,
+        &typed4_desc, &typed4_view)));
+    if (typed4 && typed4_view) {
+        ID3D11DeviceContext_ClearUnorderedAccessViewUint(ctx, typed4_view, values);
+        for (uint32_t element = 1; element < 3; element++)
+            for (uint32_t channel = 0; channel < 4; channel++)
+                typed4_expected[element * 4 + channel] = (uint8_t)values[channel];
+        uint8_t actual[16] = { 0 };
+        read_buffer(typed4, actual, sizeof actual);
+        CHECK(!memcmp(actual, typed4_expected, sizeof actual));
+    }
+    if (typed4_view) ID3D11UnorderedAccessView_Release(typed4_view);
+    if (typed4) ID3D11Buffer_Release(typed4);
+    puts("d3d11 UAV buffer clear: structured stride, typed 16-bit ranges and 4-channel 8-bit values: ok");
+}
+
 int main(void) {
     D3D_FEATURE_LEVEL level;
     if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, &level, &ctx))) { printf("compute: no device -> FAILED\n"); return 1; }
@@ -450,6 +517,7 @@ int main(void) {
     test_append_consume();
     test_views();
     test_formats();
+    test_uav_buffer_clear();
     test_bounds();
     test_cb_bounds();
     printf("compute: shared-memory sums, atomics, writable texture, UAV clear, append/consume, texture atomics, views, formats, outside views and constants: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");

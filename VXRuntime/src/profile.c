@@ -1,4 +1,4 @@
-// VXRT_PROFILE=file: a sampling profiler that sees through Rosetta. Every millisecond of CPU time (SIGPROF) the
+// VXRT_PROFILE=file (VXRT_PROFILE_FOR=<program.exe> limits it to one program): a sampling profiler that sees through Rosetta. Every millisecond of CPU time (SIGPROF) the
 // interrupted x86-64 instruction pointer is recorded with its thread; a thread of its own counts them, and every 10 s
 // (and at exit) writes the hottest functions to the file: a Windows image's function by its .pdata entry
 // ("hlvr.dll!0x1234"), anything else by dladdr (the runtime as "vxrt+0x5678": `atos -o build/vxrt -l <base>` names it).
@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -173,6 +174,14 @@ void vx_profile_finish(void) {
 void vx_profile_start(void) {
     g_path = getenv("VXRT_PROFILE");
     if (!g_path || !*g_path) return;
+    // VXRT_PROFILE_FOR=<program.exe>: only that program (a launcher's game, not the launcher and SteamVR started
+    // with the same environment, which would all write the one file)
+    const char *only = getenv("VXRT_PROFILE_FOR");
+    if (only && *only) {
+        const char *b = vx_proc.argv && vx_proc.argv[0] ? vx_proc.argv[0] : "";
+        for (const char *c = b; *c; c++) if (*c == '\\' || *c == '/') b = c + 1;
+        if (strcasecmp(b, only)) return;
+    }
     g_counts = calloc(SLOTS, sizeof *g_counts);
     pthread_key_create(&g_held_key, NULL);
     g_on = 1;

@@ -11,7 +11,7 @@ first, the rules, when to stop and what to report; --agent words the tools the w
 printed (or written to --out, or copied to the clipboard with --copy); paste it into your AI tool, started in this
 repository, or use the agents' commands (/vxrt-support <game> ...; see AGENTS.md). Nothing is sent anywhere by this script. The rules the AI follows are in AGENTS.md.
 """
-import argparse, os, re, struct, subprocess, sys
+import argparse, os, re, struct, subprocess, sys, xml.etree.ElementTree as ET
 from collections import defaultdict
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -93,6 +93,106 @@ def pe_imports(path):
             t += 8 if wide else 4
         o += 32
     return dict(out), machine
+
+def pe_details(path):
+    """The PE class and CLR flags needed to distinguish native x86 images from managed assemblies."""
+    try:
+        d = open(path, "rb").read()
+        if len(d) < 0x40 or d[:2] != b"MZ":
+            return None
+        pe = struct.unpack_from("<I", d, 0x3C)[0]
+        if pe > len(d) - 24 or d[pe:pe + 4] != b"PE\0\0":
+            return None
+        machine, nsec = struct.unpack_from("<HH", d, pe + 4)
+        opt_size = struct.unpack_from("<H", d, pe + 20)[0]
+        opt = pe + 24
+        if opt > len(d) - opt_size or opt_size < 2:
+            return None
+        magic = struct.unpack_from("<H", d, opt)[0]
+        if magic == 0x10B:
+            dirs, count_at, headers_at = 96, 92, 60
+            base = struct.unpack_from("<I", d, opt + 28)[0] if opt_size >= 32 else 0
+        elif magic == 0x20B:
+            dirs, count_at, headers_at = 112, 108, 60
+            base = struct.unpack_from("<Q", d, opt + 24)[0] if opt_size >= 32 else 0
+        else:
+            return None
+        if opt_size < dirs or count_at + 4 > opt_size or headers_at + 4 > opt_size:
+            return None
+        image_size, header_size = struct.unpack_from("<II", d, opt + 56)
+        directory_count = struct.unpack_from("<I", d, opt + count_at)[0]
+        available = (opt_size - dirs) // 8
+        if (directory_count > available or nsec > 96 or not image_size or
+                header_size > image_size or header_size > len(d)):
+            return None
+        section_at = opt + opt_size
+        if section_at > len(d) or nsec * 40 > len(d) - section_at:
+            return None
+        sections = []
+        for i in range(nsec):
+            off = section_at + i * 40
+            virtual_size, virtual_address, raw_size, raw_offset = struct.unpack_from("<IIII", d, off + 8)
+            span = max(virtual_size, raw_size)
+            if (raw_offset > len(d) or raw_size > len(d) - raw_offset or
+                    virtual_address + span > image_size):
+                return None
+            sections.append((virtual_size, virtual_address, raw_size, raw_offset))
+
+        def file_offset(rva, size):
+            if rva < header_size and rva <= len(d) and size <= len(d) - rva:
+                return rva
+            for virtual_size, virtual_address, raw_size, raw_offset in sections:
+                span = max(virtual_size, raw_size)
+                delta = rva - virtual_address
+                if delta < 0 or delta + size > span or delta + size > raw_size:
+                    continue
+                off = raw_offset + delta
+                return off if off <= len(d) and size <= len(d) - off else None
+            return None
+
+        result = {"machine": {0x014C: "x86", 0x8664: "x86-64", 0xAA64: "ARM64"}.get(machine, "0x%04x" % machine),
+                  "machine_value": machine, "format": "PE32" if magic == 0x10B else "PE32+",
+                  "image_base": base, "managed": False, "metadata_version": None}
+        if directory_count <= 14:
+            return result
+        cli_rva, cli_size = struct.unpack_from("<II", d, opt + dirs + 14 * 8)
+        if not cli_rva and not cli_size:
+            return result
+        if not cli_rva or cli_size < 72:
+            return None
+        cli = file_offset(cli_rva, 72)
+        if cli is None:
+            return None
+        cb = struct.unpack_from("<I", d, cli)[0]
+        metadata_rva, metadata_size, flags, entry = struct.unpack_from("<IIII", d, cli + 8)
+        if cb < 72 or cb > cli_size or metadata_size < 16:
+            return None
+        md = file_offset(metadata_rva, metadata_size)
+        if md is None or struct.unpack_from("<I", d, md)[0] != 0x424A5342:
+            return None
+        version_len = struct.unpack_from("<I", d, md + 12)[0]
+        if not version_len or version_len > metadata_size - 16:
+            return None
+        version = d[md + 16:md + 16 + version_len].split(b"\0", 1)[0].decode("ascii", "replace")
+        result.update(managed=True, metadata_version=version, clr_major=struct.unpack_from("<H", d, cli + 4)[0],
+                      clr_minor=struct.unpack_from("<H", d, cli + 6)[0], clr_flags=flags,
+                      il_only=bool(flags & 1), requires_32bit=bool(flags & 2), prefers_32bit=bool(flags & 0x20000),
+                      clr_entry_point=entry)
+        return result
+    except (OSError, struct.error, OverflowError):
+        return None
+
+def managed_runtime_config(path):
+    """The launcher-adjacent .NET startup selection, if it is present and well-formed."""
+    config = path + ".config"
+    try:
+        root = ET.parse(config).getroot()
+        runtime = root.find("./startup/supportedRuntime")
+        if runtime is None:
+            return None
+        return {"file": os.path.basename(config), "version": runtime.get("version"), "sku": runtime.get("sku")}
+    except (OSError, ET.ParseError):
+        return None
 
 def wine_builtin(path):
     """Wine's own DLLs (marked after the DOS header) need Wine: VXRuntime passes over them (loader.c wine_builtin)."""
@@ -405,6 +505,12 @@ def analyze(game, log=None, root_c=DEFAULT_ROOT, dll_path=DEFAULT_DLL_PATH):
     main_exe = game if game.lower().endswith(".exe") else pick_exe(exes, name or os.path.basename(os.path.normpath(root)))
     if not main_exe:
         raise ValueError("No .exe found in %s" % root)
+    profile = _profile(appid)
+    launch_exe = main_exe
+    if profile and profile.get("exe"):
+        launch_exe = profile_install_executable(root, profile["exe"], "exe")
+    if profile and profile.get("game_exe"):
+        main_exe = profile_install_executable(root, profile["game_exe"], "game_exe")
     disk_dlls = {f.lower() for f in os.listdir(dll_path) if not wine_builtin(os.path.join(dll_path, f))} if os.path.isdir(dll_path) else set()
     if _exports is None:
         _exports = runtime_exports()
@@ -431,7 +537,7 @@ def analyze(game, log=None, root_c=DEFAULT_ROOT, dll_path=DEFAULT_DLL_PATH):
     if any(m.startswith("engine:Unity") for m in markers) and not any(x.startswith("Direct3D") for x in apis):
         apis.add("Direct3D 11 (Unity's default on Windows, loaded at run time)")
 
-    log = log or find_log(os.path.basename(main_exe))
+    log = log or find_log(os.path.basename(main_exe)) or find_log(os.path.basename(launch_exe))
     found = read_log(log, os.path.basename(main_exe))
     proxy = os.path.join(root_c, "vr_openvr_capture_proxy.log")
     fps = proxy_fps(root_c) if log and os.path.exists(proxy) and abs(os.path.getmtime(log) - os.path.getmtime(proxy)) < 600 else None
@@ -439,17 +545,35 @@ def analyze(game, log=None, root_c=DEFAULT_ROOT, dll_path=DEFAULT_DLL_PATH):
     return {
         "name": name or os.path.basename(os.path.normpath(root)), "folder": root, "exe": main_exe,
         "other_exes": others, "machine": machine_info(),
+        "launch_image": pe_details(launch_exe), "launch_runtime_config": managed_runtime_config(launch_exe),
+        "game_image": pe_details(main_exe),
         "engine": sorted(m.split(":", 1)[1] for m in markers if m.startswith(("engine:", "vr:"))),
         "anticheat": sorted({m.split(":", 1)[1] for m in markers if m.startswith("anticheat:")}),
-        "appid": appid, "apis": sorted(apis), "launch": launch_command(main_exe),
+        "appid": appid, "apis": sorted(apis), "launch": launch_command(launch_exe), "launch_exe": launch_exe,
         "harness": f"tools/vxrt_run.py {appid or '<game>'}",
         # Static: imported, so possibly called; a stub stops the program only when it is called.
         "missing_functions": {dll: sorted(v) for dll, v in sorted(missing.items(), key=lambda kv: -len(kv[1]))},
         "missing_dlls": sorted(nodll),
         "log": log, "log_problems": {k: dict(sorted(v.items(), key=lambda kv: -kv[1])[:8]) for k, v in found.items()},
         "recent_submit_fps": fps[-12:] if fps else None,
-        "profile": _profile(appid),
+        "profile": profile,
     }
+
+def profile_install_executable(folder, relative, field):
+    """Resolve a profile executable beneath its installed game folder."""
+    if not isinstance(relative, str) or not relative:
+        raise ValueError("profile %s must be a nonempty path relative to the install folder" % field)
+    base = os.path.realpath(folder)
+    path = os.path.realpath(os.path.join(base, relative))
+    try:
+        inside = os.path.commonpath((base, path)) == base
+    except ValueError:
+        inside = False
+    if not inside:
+        raise ValueError("profile %s resolves outside the install folder" % field)
+    if not os.path.isfile(path):
+        raise ValueError("profile %s does not exist: %s" % (field, relative))
+    return path
 
 def _profile(appid):
     """What games/<appid>.json says (status, known issues, notes), or None."""
@@ -458,7 +582,8 @@ def _profile(appid):
         p = vxrt_games.load_all().get(appid or "")
     except Exception:
         return None
-    return {"file": f"games/{appid}.json", "key": p["key"], "status": p["status"], "known_issues": p["known_issues"], "notes": p["notes"]} if p else None
+    return {"file": f"games/{appid}.json", "key": p["key"], "exe": p.get("exe"), "game_exe": p.get("game_exe"),
+            "status": p["status"], "known_issues": p["known_issues"], "notes": p["notes"]} if p else None
 
 def locate(game):
     """A game's folder or .exe as given, or the installed game a profile key or Steam app id names (tools/vxrt_run.py)."""
@@ -468,6 +593,8 @@ def locate(game):
     _, _, inst = vxrt_run.resolve(game)
     if not inst:
         raise ValueError(f"{game}: neither a folder or .exe nor an installed game (tools/vxrt_run.py --list)")
+    if inst.get("launch_exe_error"):
+        raise ValueError(f"{game}: {inst['launch_exe_error']}")
     return inst["exe"]
 
 def prompt_facts(f, goal):
@@ -476,7 +603,10 @@ def prompt_facts(f, goal):
     missing = f["missing_functions"]
     return {
         "game": {"name": f["name"], "steam_app_id": f["appid"], "harness_key": (prof or {}).get("key") or f["appid"],
-                 "exe": os.path.relpath(f["exe"], f["folder"]), "other_exes": f["other_exes"][:6], "engine": f["engine"],
+                 "exe": os.path.relpath(f["exe"], f["folder"]), "launch_exe": os.path.relpath(f["launch_exe"], f["folder"]),
+                 "launch_image": f["launch_image"], "launch_runtime_config": f["launch_runtime_config"],
+                 "game_image": f["game_image"],
+                 "other_exes": f["other_exes"][:6], "engine": f["engine"],
                  "graphics_and_apis": f["apis"], "anticheat": f["anticheat"]},
         "machine": f["machine"],
         "launch_command_for_the_player": f["launch"],

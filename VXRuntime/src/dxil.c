@@ -907,6 +907,7 @@ static int read_module(ctx *x, cursor *c) {
 // ---- the container ------------------------------------------------------------------------------------------------
 
 static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint64_t le64(const uint8_t *p) { return le32(p) | (uint64_t)le32(p + 4) << 32; }
 
 int dxil_read(const void *data, size_t size, dxil_module *m) {
     memset(m, 0, sizeof *m);
@@ -914,23 +915,37 @@ int dxil_read(const void *data, size_t size, dxil_module *m) {
     size_t bcsize = 0;
     if (size >= 32 && !memcmp(p, "DXBC", 4)) {
         uint32_t count = le32(p + 28);
+        if (count > (size - 32) / sizeof(uint32_t)) {
+            snprintf(m->error, sizeof m->error, "DXIL container part table is out of bounds");
+            return -1;
+        }
+        int feature_info_seen = 0;
         for (uint32_t i = 0; i < count && 32 + 4 * (size_t)i + 4 <= size; i++) {
             uint32_t off = le32(p + 32 + 4 * i);
             if ((size_t)off + 8 > size) continue;
             uint32_t len = le32(p + off + 4);
+            if (!memcmp(p + off, "SFI0", 4)) {
+                if (feature_info_seen || len != sizeof(uint64_t) || (size_t)off + 8 + len > size) {
+                    snprintf(m->error, sizeof m->error, "invalid or duplicate DXIL feature-info part");
+                    return -1;
+                }
+                m->shader_feature_flags = le64(p + off + 8);
+                feature_info_seen = 1;
+            }
             if (memcmp(p + off, "DXIL", 4) || (size_t)off + 8 + len > size || len < 24) continue;
-            const uint8_t *chunk = p + off + 8;
-            uint32_t version = le32(chunk);
-            m->shader_kind = version >> 16;
-            m->shader_major = (version >> 4) & 15;
-            m->shader_minor = version & 15;
-            if (memcmp(chunk + 8, "DXIL", 4)) { snprintf(m->error, sizeof m->error, "DXIL chunk without its header"); return -1; }
-            m->dxil_version = le32(chunk + 12);
-            uint32_t bcoff = le32(chunk + 16), bclen = le32(chunk + 20);
-            if (8 + (size_t)bcoff + bclen > len) { snprintf(m->error, sizeof m->error, "DXIL bitcode past its chunk"); return -1; }
-            bc = chunk + 8 + bcoff;
-            bcsize = bclen;
-            break;
+            if (!bc) {
+                const uint8_t *chunk = p + off + 8;
+                uint32_t version = le32(chunk);
+                m->shader_kind = version >> 16;
+                m->shader_major = (version >> 4) & 15;
+                m->shader_minor = version & 15;
+                if (memcmp(chunk + 8, "DXIL", 4)) { snprintf(m->error, sizeof m->error, "DXIL chunk without its header"); return -1; }
+                m->dxil_version = le32(chunk + 12);
+                uint32_t bcoff = le32(chunk + 16), bclen = le32(chunk + 20);
+                if (8 + (size_t)bcoff + bclen > len) { snprintf(m->error, sizeof m->error, "DXIL bitcode past its chunk"); return -1; }
+                bc = chunk + 8 + bcoff;
+                bcsize = bclen;
+            }
         }
         if (!bc) { snprintf(m->error, sizeof m->error, "no DXIL chunk in the container"); return -1; }
     } else {

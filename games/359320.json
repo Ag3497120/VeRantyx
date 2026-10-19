@@ -1,0 +1,428 @@
+{
+  "$schema": "./profile.schema.json",
+  "appid": "359320",
+  "key": "elite_dangerous",
+  "name": "Elite Dangerous",
+  "launcher": "game",
+  "engine": "vxrt",
+  "exe": "EDLaunch.exe",
+  "game_exe": "Products/elite-dangerous-odyssey-64/EliteDangerous64.exe",
+  "default_scenario": "start",
+  "scenarios": {
+    "start": {
+      "args": [],
+      "seconds": 45,
+      "note": "official Frontier launcher entry point; the game executable is not started separately"
+    }
+  },
+  "status": {
+    "state": "broken",
+    "level": "starts",
+    "summary": {
+      "ja": "最新実行 20261018T205736Z-elite_dangerous-start は公式ランチャーの Signup フォームで40秒間動作。以前終了した空白座標 (700, 500) をクリックしてもフォームは残り、CLR例外・ネイティブシグナル・未実装呼び出しはない。原因はリンクの描画文字より広い当たり判定で、GDI測定の文字範囲に修正した。資格情報入力・登録送信はしていない。ランチャーは 1.7.7036.1 requires update と表示し、SteamVR接続・ゲーム本体起動は未到達。",
+      "en": "Latest run 20261018T205736Z-elite_dangerous-start keeps the official launcher's Signup form alive for the full 40 seconds. Clicking the previously failing blank coordinate (700, 500) leaves the form open, with no CLR exception, native signal, or unimplemented call. The cause was a hyperlink hit target wider than its rendered text; it now uses GDI-measured text bounds. No credentials were entered and signup was not submitted. The launcher reports 1.7.7036.1 requires update; SteamVR connection and the game process remain unreached."
+    },
+    "checked": "2026-10-19",
+    "machine": "Apple M1 Max, 32-core GPU"
+  },
+  "baselines": {},
+  "known_issues": [
+    {
+      "summary": "Run 20261018T205736Z-elite_dangerous-start verifies the blank-click fix. Before it, run 20261018T205445Z clicked the visually empty coordinate (700, 500), but VXRuntime's hyperlink hit rectangle extended from x=108 to x=780; the click incorrectly invoked HomeCreateAccountPage.OnTandC and exited at a null System.Object.ToString receiver. The hyperlink now gets a hit rectangle from GetTextExtentPoint32W. After the fix, the same click leaves the rendered Signup page open and the 40-second run completes: o1 exited_early=false, o10-o13 are 0, o14 first_problem=null. No credentials were entered and signup was not submitted. SteamVR was not reached (o2=null), and EliteDangerous64.exe did not launch. Actual clicks on the T&C/Privacy Policy glyphs have not been tested."
+    },
+    {
+      "summary": "Run 20261018T193452Z-elite_dangerous-start confirms EDLaunch.exe reaches a usable WPF login screen without CLR exceptions, managed exceptions, native signals, or unimplemented calls. A dummy character entered through the watermark hit target updates the TextBoxText binding source. The official launcher still reports version 1.7.7036.1 requires update. No Frontier credentials were entered, no login was submitted, no update was started, and EliteDangerous64.exe was not launched; the game's D3D11/OpenVR/input/network path remains unmeasured until the user updates and signs in through the official launcher."
+    },
+    {
+      "summary": "Harness run 20261018T185019Z-elite_dangerous-start reaches an idle, visible 840x608 official WPF launcher window. Its UI has six empty edit boxes, an unlabeled blue button, and the text “Launcher version (1.7.7036.1 requires update) FD”; controls and window are captured in launcher.png. No credentials were entered and no login action was submitted. The run has no unimplemented calls, CLR exceptions, native signals, or first problem (o10-o14), but there is no SteamVR connection (o2=null, d3=false) and no game launch."
+    },
+    {
+      "summary": "Harness run 20261018T184652Z-elite_dangerous-start confirms a visible WPF launcher window via an initially game-owned Command Clips socket. The later snapshot request used an unscoped socket shared with SteamVR helpers and cannot be attributed to the launcher; its 1700x850 image is not launcher evidence. The run had no unimplemented calls or CLR exceptions, but no SteamVR connection. Run 20261018T185019Z with a game-scoped socket supersedes it and captures the 840x608 launcher window."
+    },
+    {
+      "summary": "Harness run 20261018T183226Z-elite_dangerous-start constructs HomeLoginPage and advances through the power-mode event subscription. LauncherWindow.CheckXInputDLL next calls the standard String.Split(char[]) overload on an environment-derived value. The launcher has not been shown interactive and the game executable has not launched."
+    },
+    {
+      "summary": "Harness run 20261018T183048Z-elite_dangerous-start passes construction of the PowerModeChangedEventHandler delegate and reaches SystemEvents.add_PowerModeChanged. VXRuntime does not yet represent static SystemEvents subscriptions. Launcher UI/login and the game executable remain unreached."
+    },
+    {
+      "summary": "Harness run 20261018T182920Z-elite_dangerous-start passes async TaskAwaiter calls and reaches the Microsoft.Win32.PowerModeChangedEventHandler constructor. The runtime delegate constructor matcher currently excludes this framework namespace. No launcher UI/login or game executable yet."
+    },
+    {
+      "summary": "Harness run 20261018T182751Z-elite_dangerous-start passes VersionInfo deserialization and enum comparison, then enters LauncherModelManager async creation and stops at TaskAwaiter.IsCompleted because the awaiter is passed as a managed pointer to a value-type receiver. WPF launcher UI/login and the game executable remain unreached."
+    },
+    {
+      "summary": "Harness run 20261018T182536Z-elite_dangerous-start confirms generic JavaScriptSerializer.Deserialize<VersionInfo> succeeds on the installed VersionInfo.txt, including conversion of the string \"true\" into a Boolean field. Execution advances through project initialization and stops when a managed enum is compared with an Int32 in CobraBayView.OculusWarning. Launcher UI/login and the game executable remain unreached."
+    },
+    {
+      "summary": "Harness run 20261018T182407Z-elite_dangerous-start confirms ReadAllText, the VersionInfo generic object constructor and string field hydration work against the installed VersionInfo.txt. It stops at the JSON string \"true\" to Boolean field conversion for useWatchDog64. Login UI, SteamVR connection and EliteDangerous64.exe launch remain unreached."
+    },
+    {
+      "summary": "Harness run 20261018T181945Z-elite_dangerous-start passes UTF-16 String.Replace, then reads the project version file with File.ReadAllText. It stops because generic JavaScriptSerializer.Deserialize<VersionInfo> object hydration is not implemented. Login UI, SteamVR connection and EliteDangerous64.exe launch remain unreached."
+    },
+    {
+      "summary": "Harness run 20261018T181343Z-elite_dangerous-start confirms Project.DetermineInstallPath and String.Contains execute, then Project.ValidFileName stops at unsupported System.IO.Path.GetInvalidFileNameChars. Login UI, SteamVR connection and game launch remain unreached."
+    },
+    {
+      "summary": "Harness run 20261018T181150Z-elite_dangerous-start confirms Directory.GetDirectories and Path.GetFileName work through ProjectCollection and reaches Project.DetermineInstallPath, which calls unsupported System.String.Contains. Login UI, SteamVR connection and game launch remain unreached."
+    },
+    {
+      "summary": "Harness run 20261018T181017Z-elite_dangerous-start confirms Directory.GetDirectories can enumerate the install's Products directory. ProjectCollection.AddOfflineProjects next calls unsupported System.IO.Path.GetFileName. Login UI, SteamVR connection and game executable launch remain unreached."
+    },
+    {
+      "summary": "Harness run 20261018T180633Z-elite_dangerous-start passes Environment OS identification, query collection creation and count, WebRequest.Create, HTTP method, KeepAlive, UserAgent and TLS setup. It stops at unsupported System.IO.Directory.GetDirectories from ProjectCollection.AddOfflineProjects. No login UI, SteamVR connection or game process."
+    },
+    {
+      "summary": "Harness run 20261018T180507Z-elite_dangerous-start passes query collection Count and WebRequest.Create, then stops at the HttpWebRequest.UserAgent setter's argument validation. No launcher login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T180344Z-elite_dangerous-start confirms HttpUtility.ParseQueryString and the query NameValueCollection setter now execute; JSONWebQuery.get_Query then dispatches to the missing base API System.Collections.Specialized.NameObjectCollectionBase.get_Count. Login UI, SteamVR connection and EliteDangerous64.exe launch remain unreached."
+    },
+    {
+      "summary": "Harness run 20261018T180009Z-elite_dangerous-start confirms System.Environment.get_OSVersion and GetEnvironmentVariable are implemented sufficiently for ClientSupport.Utils.OSIdent.GetOSIdent; execution advances to unsupported System.Web.HttpUtility.ParseQueryString in JSONWebQuery.AddParameter. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T175617Z-elite_dangerous-start confirms the interface dispatch fix and reaches unsupported System.Environment.get_OSVersion in ClientSupport.Utils.OSIdent.GetOSIdent. The method then reads PROCESSOR_ARCHITECTURE."
+    },
+    {
+      "summary": "Harness run 20261018T175315Z-elite_dangerous-start confirms the failure is CLR interface dispatch: CBViewModel.UserInterface is an interface and Launcher.LauncherWindow plus Launcher.ProductUserCtrl implement it, but find_virtual_override does not select newslot interface implementations."
+    },
+    {
+      "summary": "Harness run 20261018T175027Z-elite_dangerous-start passes FileSystemInfo.LastWriteTimeUtc, then stops at UserInterface.GetOSIdent with no supported CIL body. Method metadata still needs classification (P/Invoke, runtime implementation, or declaration). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T174858Z-elite_dangerous-start passes FileSystemInfo.FullName/Name, then exits at unsupported System.IO.FileSystemInfo.get_LastWriteTimeUtc. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T174734Z-elite_dangerous-start passes Assembly.GetName, Version, and FullName, then exits at unsupported System.IO.FileSystemInfo.get_FullName. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T174401Z-elite_dangerous-start passes the previous numeric ToString boundary, then exits at unsupported System.Reflection.Assembly.GetName. The run confirms the value-type receiver fix. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T174228Z-elite_dangerous-start passes synchronous WebRequest/JSON parsing and UI initialization, then exits after 6.7 s because System.Int64.ToString receives a managed pointer to a value-type receiver. The CLR primitive conversion path now handles managed and field pointers. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T172812Z-elite_dangerous-start passes FileLogger, URI resolution, stind.ref and the timestamp API query setup, then exits after 4.7 s at unsupported System.Net.WebRequest.Create (o1 exited_early, o12). No account login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T172627Z-elite_dangerous-start passes FileLogger file output and System.Uri(baseUri, relativeUri), then exits after 4.7 s at unsupported CIL stind.ref (0x51) in JSONWebQuery.Execute IL_0002 (o1 exited_early, o12). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T172419Z-elite_dangerous-start passes the FileLogger append/write/close path and reaches FORCServerState.GetServerAPI; then exits after 4.7 s at a System.Uri constructor call whose argument representation is unsupported (o1 exited_early, o12). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T172136Z-elite_dangerous-start passes FileLogger timestamp creation, dictionary serialization and String.Concat(string[]); then exits after 4.7 s at unsupported System.IO.File.AppendText (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or game launch."
+    },
+    {
+      "summary": "Harness run 20261018T171944Z-elite_dangerous-start passes the DateTime timestamp formats and builds LogEntry values; then exits after 4.7 s at unsupported System.String.Concat while FileLogger.Log serializes its map (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or game launch."
+    },
+    {
+      "summary": "Harness run 20261018T171649Z-elite_dangerous-start passes FileSystemInfo.Exists, LogEntry.IsCommand and reference cgt.un; then exits after 4.7 s at unsupported System.DateTime.ToString(format) while FileLogger.Log builds its timestamp (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or game launch."
+    },
+    {
+      "summary": "Harness run 20261018T171453Z-elite_dangerous-start passes FileInfo existence and reaches LogEntry.get_IsCommand, then exits after 4.7 s at invalid operands for CIL cgt.un at IL_0007 (o1 exited_early, o12 first_problem); no account UI or game process is reached."
+    },
+    {
+      "summary": "Harness run 20261018T171313Z-elite_dangerous-start passes FileSystemInfo.get_Exists and reaches FileLogger.Log; then exits after 4.7 s at unsupported CIL prefix readonly. (0xfe03) in LogEntry.get_IsCommand IL_0007 (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T171130Z-elite_dangerous-start passes FileInfo(string) construction, then exits after 4.7 s at unsupported System.IO.FileSystemInfo.get_Exists in FileLogger.SetLogFile (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T170923Z-elite_dangerous-start passes conv.i8 and log-directory setup, then exits after 4.7 s at unsupported System.IO.FileInfo(string) in FileLogger.SetLogFile (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T170741Z-elite_dangerous-start passes the parameterless Mutex constructor, then exits after 4.7 s at unsupported CIL conv.i8 (opcode 0x6a) in FileLogger.SetLogFile (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T170618Z-elite_dangerous-start passes CIL array handling, then exits after 4.7 s because the parameterless System.Threading.Mutex::.ctor used by DownloadManagerLocalCache is unsupported (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T170448Z-elite_dangerous-start reaches the same Mutex overload after the CIL array fix; Dictionary, connection settings and array stores pass, then System.Threading.Mutex(bool, string, out bool) fails during FORCDownloadManager initialization after 4.7 s (o1/o12). No login UI, SteamVR connection or game executable launch."
+    },
+    {
+      "summary": "Harness run 20261018T170319Z-elite_dangerous-start passes reference-array stores, then exits after 4.7 s during FORCDownloadManager initialization at unsupported System.Threading.Mutex(bool, string, out bool) (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T170034Z-elite_dangerous-start passes FORCServerConnection settings persistence, ProcessorCount and the connection-limit setter, then exits after 4.7 s at unsupported CIL stelem.ref (opcode 0xa2) in FORCServerState::.ctor (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T165908Z-elite_dangerous-start passes Dictionary construction/value assignment and ProcessorCount, then exits after 4.7 s during FORCServerConnection initialization at unsupported ServicePointManager.DefaultConnectionLimit (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T165745Z-elite_dangerous-start passes LogEntry Dictionary construction and set_Item, then exits after 4.7 s during FORCServerConnection initialization at unsupported System.Environment.ProcessorCount (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T165330Z-elite_dangerous-start passes prior CLR/WPF/settings initialization, SortedDictionary and System.Console.WriteLine, then exits after 4.7 s during WaitPage construction at unsupported System.Collections.Generic.Dictionary`2::.ctor (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T164957Z-elite_dangerous-start passes entry location, version info, TLS setup and ProjectCollection SortedDictionary initialization, then exits after 4.7 s at unsupported System.Console.WriteLine from FORCManager.InitialiseEpic (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T164501Z-elite_dangerous-start passes entry location, version info and TLS protocol initialization, then exits after 4.7 s when ProjectCollection constructs System.Collections.Generic.SortedDictionary`2 (unsupported framework call; o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T164309Z-elite_dangerous-start passes entry Assembly.Location, FileVersionInfo and FORCManager settings initialization, then exits after 4.7 s at unsupported System.Net.ServicePointManager.set_SecurityProtocol (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T164041Z-elite_dangerous-start fixed the entry Assembly.Location path and passed FileVersionInfo.GetVersionInfo/FilePrivatePart, then exited after 4.7 s at unsupported CIL opcode 0xfe01 (ceq) in FORCManager.UpdateVersionInfo at IL_0014 (o1 exited_early, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T163644Z-elite_dangerous-start reached FileVersionInfo.GetVersionInfo but stopped with error 2 opening the resolved executable (o1 exited after 4.7 s; o12 first_problem). GetFolderPath passed; no login UI, SteamVR connection or game executable launch."
+    },
+    {
+      "summary": "Harness run 20261018T163512Z-elite_dangerous-start reached FileVersionInfo.GetVersionInfo but stopped with error 2 opening its mapped path (o1 exited after 4.9 s; o12 first_problem). Environment.GetFolderPath passed; no login UI, SteamVR connection or game executable launch."
+    },
+    {
+      "summary": "Harness run 20261018T162653Z-elite_dangerous-start passed Environment.GetFolderPath(LocalApplicationData), then stopped at unsupported FileVersionInfo.GetVersionInfo (o1 exited after 4.8 s; o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T162110Z-elite_dangerous-start passed multiple System.IO.File.Exists checks, then stopped at unsupported System.Environment.GetFolderPath (o1 exited after 4.7 s; o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch; run validation and ledger verification follow."
+    },
+    {
+      "summary": "Harness run 20261018T161853Z-elite_dangerous-start passed File.WriteAllText/File.Delete, Directory.CreateDirectory and path initialization, then stopped at unsupported System.IO.File.Exists (o1 exited after 4.7 s; o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch; run validation and ledger verification follow."
+    },
+    {
+      "summary": "Harness run 20261018T161428Z-elite_dangerous-start passed System.IO.File.WriteAllText and File.Delete, then stopped at unsupported System.IO.Directory.CreateDirectory (o1 exited after 4.7 s; o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch; run validation and ledger verification follow."
+    },
+    {
+      "summary": "Harness run 20261018T161003Z-elite_dangerous-start passed System.IO.File.WriteAllText, then stopped at unsupported System.IO.File.Delete (o1 exited after 4.7 s; o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch; run validation and ledger verification follow."
+    },
+    {
+      "summary": "Harness run 20261018T160132Z-elite_dangerous-start passed Directory.Exists and stopped at unsupported System.IO.File.WriteAllText (o1 exited after 4.8 s, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch; run validation and ledger verification follow."
+    },
+    {
+      "summary": "Harness run 20261018T155935Z-elite_dangerous-start passed Path.Combine and exited after 4.7 s at unsupported System.IO.Directory::Exists (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T155748Z-elite_dangerous-start passed Path.GetDirectoryName and exited after 4.7 s at unsupported System.IO.Path::Combine (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T155529Z-elite_dangerous-start passed Assembly.Location and exited after 4.8 s at unsupported System.IO.Path::GetDirectoryName (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T155329Z-elite_dangerous-start passed Assembly.GetEntryAssembly and exited after 4.8 s at unsupported System.Reflection.Assembly::get_Location (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T155146Z-elite_dangerous-start passed LINQ Enumerable.ToArray<T> and exited after 4.7 s at unsupported System.Reflection.Assembly::GetEntryAssembly (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T154912Z-elite_dangerous-start passed String.StartsWith/EndsWith and exited after 4.8 s at unsupported System.Linq.Enumerable::ToArray (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T154637Z-elite_dangerous-start passed String.ToLowerInvariant and String.op_Equality, then exited after 4.8 s at unsupported System.String::StartsWith (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T154458Z-elite_dangerous-start passed System.String.ToLowerInvariant and exited after 4.8 s at unsupported System.String::op_Equality (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T154139Z-elite_dangerous-start passed Environment.GetCommandLineArgs and DateTime.UtcNow and advanced through HashSet<T> initialization, then exited after 4.7 s at unsupported System.String::ToLowerInvariant (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T153851Z-elite_dangerous-start passed Environment.GetCommandLineArgs, array length/element access and DateTime.UtcNow, then exited after 4.8 s at unsupported System.Collections.Generic.HashSet`1::.ctor (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T153709Z-elite_dangerous-start passed Environment.GetCommandLineArgs and the launcher command-line array path, then exited after 4.7 s at unsupported System.DateTime::get_UtcNow (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T153311Z-elite_dangerous-start passed WPF Color.op_Inequality and then exited after 4.7 s at unsupported System.Environment.GetCommandLineArgs (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T153140Z-elite_dangerous-start exited after 4.8 s at WPF Color.op_Inequality: one operand was the zero-initialized Color field represented internally as V_REF/null (o1 exited_early=true, o12 first_problem). The runtime is being updated to treat this representation as default Color in the Color-specific path. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T153001Z-elite_dangerous-start exited after 4.8 s at WPF Color.op_Inequality: the operator implementation was reached, but one operand had an unsupported CLR representation (o1 exited_early=true, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T152724Z-elite_dangerous-start completed its 45-second scenario without an early process exit, but launcher startup stopped at unsupported WPF Color.op_Inequality (o1 exited_early=false, o12 first_problem). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T152556Z-elite_dangerous-start showed the native WPF host window and passed async startup, theme color conversion, Color channel access and floating-point brightness adjustment. It exited after about 4.8 s at CIL box in WaitUserCtrl.set_RotationsPerSec because R4/R8 values are not boxed yet. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T152147Z-elite_dangerous-start showed the WPF host window and passed async builder startup, WPF color-string conversion and SolidColorBrush/theme setter initialization. It exited after about 4.7 s at unsupported System.Windows.Media.Color::get_R. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T151957Z-elite_dangerous-start showed the native WPF host window and passed async builder startup plus ColorConverter parsing of the launcher theme color. It exited after about 4.8 s at IL_0007 in CBTheme.set_DefaultButtonColour with a CLR stack, argument or local error. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T151548Z-elite_dangerous-start showed the native WPF host window, initialized the value-type async state machine and accepted the managed-pointer AsyncVoidMethodBuilder.Start receiver. It exited after about 4.7 s at unsupported System.ComponentModel.TypeConverter::ConvertFromInvariantString during BAML/style conversion. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T151422Z-elite_dangerous-start created and showed the WPF host window and progressed through Launcher.LauncherWindow::OnShown after zero-initializing its value-type async state-machine local. It exited after about 4.7 s at AsyncVoidMethodBuilder.Start<TStateMachine> because the value-type builder receiver arrived as a managed pointer. No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T151118Z-elite_dangerous-start created and showed the WPF host window, rendered the BAML-backed launcher tree, and invoked ContentRendered/Launcher.LauncherWindow::OnShown. It exited after about 4.7 s because the CLR interpreter failed silently at IL_0003 opcode 0x7d (stfld). No login UI, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T150406Z-elite_dangerous-start reproduced the WPF display boundary: 125 launcherwindow.baml records parsed and Window Initialized ran, then native WPF Window.Show/presentation source/layout/dispatcher support stopped startup; no visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T144305Z-elite_dangerous-start reached Launcher.LauncherWindow::OnShown, then a field write at IL_0003 failed without a diagnostic after about 4.8 s. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T144036Z-elite_dangerous-start reached WPF Application.Run from App.Main under CLR tracing, then failed without an internal diagnostic at IL_000b after about 4.8 s. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T143714Z-elite_dangerous-start exited after about 4.7 s with managed method token 060001ad unresolved as a supported MethodDef, also under --trace. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T143609Z-elite_dangerous-start passed DispatcherTimer.add_Tick, then stopped after about 4.7 s with unsupported managed entry token 060001ad. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T143453Z-elite_dangerous-start passed DispatcherTimer(priority, dispatcher) construction, then stopped after about 4.7 s at unsupported System.Windows.Threading.DispatcherTimer::add_Tick. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T143257Z-elite_dangerous-start passed custom DependencyProperty registration and get/set, then stopped after about 4.7 s at unsupported System.Windows.Threading.DispatcherTimer::.ctor. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T142914Z-elite_dangerous-start passed WaitUserCtrl construction and CIL ldc.r8, then stopped after about 4.7 s at unsupported System.Windows.DependencyProperty::Register. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T142655Z-elite_dangerous-start passed BAML Canvas known type -66 and progressed into WaitUserCtrl construction, then stopped after about 4.8 s at unsupported CIL opcode 0x23 (ldc.r8). No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T142506Z-elite_dangerous-start passed the UIElement.IsVisibleChanged CLR event subscription path after correcting WPF dispatch order, then stopped after about 4.7 s at unmapped BAML framework type ID -66. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T142315Z-elite_dangerous-start confirms FDUserControls.dll is found and its metadata is readable after correcting the ECMA-335 GenericParam.Owner coded-index schema. EDLaunch.exe then stops after about 4.8 s at unsupported System.Windows.UIElement::add_IsVisibleChanged. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T142031Z-elite_dangerous-start passed NavigationCommands and InputGestureCollection initialization, then stopped after about 2.8 s because WPF BAML type FDUserControls.WaitUserCtrl needs unavailable assembly FDUserControls. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T141741Z-elite_dangerous-start passed NavigationCommands.BrowseBack and stopped after about 2.8 s at unsupported System.Windows.Input.RoutedCommand::get_InputGestures. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T141514Z-elite_dangerous-start passed UIElement.Visibility and String.IsNullOrWhiteSpace, then stopped after about 2.8 s at unsupported System.Windows.Input.NavigationCommands::get_BrowseBack. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T141345Z-elite_dangerous-start passed String.IsNullOrWhiteSpace and stopped after about 2.8 s at unsupported System.Windows.UIElement::get_Visibility. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T141224Z-elite_dangerous-start passed Object.ToString and Dispatcher.Invoke(Action), then stopped after about 2.8 s at unsupported System.String::IsNullOrWhiteSpace. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T141006Z-elite_dangerous-start passed Dispatcher.Invoke(Action) and stopped after about 2.8 s at unsupported System.Object::ToString. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T140829Z-elite_dangerous-start passed System.Action construction and stopped after about 2.8 s at unsupported System.Windows.Threading.Dispatcher::Invoke. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T140639Z-elite_dangerous-start passed DispatcherObject.Dispatcher resolution and stopped after about 2.8 s at unsupported System.Action::.ctor while creating a delegate. No visible login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T140401Z-elite_dangerous-start remained alive through the 45 s scenario after managed-address and Monitor support, then reported unsupported System.Windows.Threading.DispatcherObject::get_Dispatcher. The dispatcher/message loop and visible UI are still not reached; no login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T140013Z-elite_dangerous-start passed System.Object::.ctor and ResourceManager.GetString, then stopped after about 4.0 s at unsupported CIL opcode 0x12 (ldloc.0) in InfoUserCtrl.SetApplicationVersion at IL_0009. No login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T135850Z-elite_dangerous-start passed ResourceManager.GetString, then stopped after about 4.7 s at unsupported System.Object::.ctor while constructing a managed launcher object. No login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T135607Z-elite_dangerous-start advanced through CIL ldtoken, Type.GetTypeFromHandle, Type.Assembly and the ResourceManager(string, Assembly) constructor, then stopped after about 4.7 s at unsupported System.Resources.ResourceManager::GetString. No login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T135330Z-elite_dangerous-start passed ContentControl.set_Content and set the main Frame to WaitPage, then stopped after about 4.7 s because CIL ldtoken (0xd0) is unsupported in Resources.get_ResourceManager at IL_000c. No login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T135201Z-elite_dangerous-start exited after about 4.7 s at unsupported WPF System.Windows.Controls.ContentControl::set_Content. The launcher now passes the String.Empty MemberRef access and completes the known-type connections for its initial UI components, then attempts to navigate the main Frame to WaitPage. No visible UI, login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T134729Z-elite_dangerous-start exited after about 4.7 s at unsupported CIL field instruction token 0a000046. The InfoUserCtrl ConnectionId 2 cast to WPF Label now passes with corrected BAML known-type mapping; the CIL interpreter currently handles FieldDef tokens but not field MemberRef tokens. No visible UI, login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T134328Z-elite_dangerous-start exited after about 4.8 s because castclass failed in InfoUserCtrl.System.Windows.Markup.IComponentConnector.Connect at IL_0034. LauncherWindow BAML connection now proceeds far enough to load InfoUserCtrl, but this control is not constructed as the type expected by its generated connector. No visible UI, login, SteamVR connection or EliteDangerous64.exe launch."
+    },
+    {
+      "summary": "Harness run 20261018T134157Z-elite_dangerous-start exited after about 4.7 s at an unmapped WPF BAML framework type ID -601. The UserControl constructor now passes. No visible UI, login, SteamVR connection or EliteDangerous64.exe launch. Run validation and ledger verification are pending."
+    },
+    {
+      "summary": "Harness run 20261018T133943Z-elite_dangerous-start stayed alive for the full 45 s (level starts), but did not connect to SteamVR. Its final runtime log reports unsupported System.Windows.Controls.UserControl::.ctor. No visible UI or EliteDangerous64.exe launch was confirmed. Run validation and ledger verification are pending."
+    },
+    {
+      "summary": "Harness run 20261018T133749Z-elite_dangerous-start advanced through BAML object creation, IComponentConnector.Connect and WPF initialization, then exited after 4.8 s at unsupported System.Windows.Media.Colors::get_Red. No visible launcher UI, SteamVR connection or EliteDangerous64.exe launch. Run validation and ledger verification are pending."
+    },
+    {
+      "summary": "Harness run 20261018T133612Z-elite_dangerous-start exited after 4.8 s in LauncherWindow.System.Windows.Markup.IComponentConnector.Connect at IL_005e, failing the cast for ConnectionId 2. BAML object creation and ConnectionId 1 succeeded; no visible UI, SteamVR connection or EliteDangerous64.exe launch. Run validation and ledger verification are pending."
+    },
+    {
+      "summary": "Harness run 20261018T133442Z-elite_dangerous-start exited after 4.7 s while connecting launcherwindow.baml ConnectionId 1: the generated connector method was not found by exact-name lookup. No visible launcher/login UI, SteamVR connection or EliteDangerous64.exe launch. Run validation and ledger verification are pending."
+    },
+    {
+      "summary": "Harness run 20261018T133130Z-elite_dangerous-start exited after 4.8 s while resolving WPF BAML type Launcher.LauncherWindow because the new object-tree loader did not decode AssemblyInfo 1. No object construction, launcher UI, SteamVR connection or EliteDangerous64.exe launch. Run validation and ledger verification are pending."
+    },
+    {
+      "summary": "Harness run 20261018T131420Z-elite_dangerous-start passed settings, composite formatting, named mutex and ACL initialization, and validated launcherwindow.baml (125 records), then stopped at the unimplemented WPF dispatcher/message loop (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. Run validation passed; the profile ledger has 157 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T130711Z-elite_dangerous-start passed settings defaults, culture/string operations, Thread.CurrentThread, and System.String.Format, then stopped at unsupported System.Threading.Mutex::.ctor (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. Run validation passed; the profile ledger has 156 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T130149Z-elite_dangerous-start passed settings defaults, culture/string initialization, String.Chars, and Thread.CurrentThread, then stopped at unsupported System.String::Format (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. The profile ledger has 154 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T130014Z-elite_dangerous-start passed settings defaults, CultureInfo.CurrentCulture, String.Length, and String.Chars, then stopped at unsupported System.Threading.Thread::get_CurrentThread (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. The profile ledger had 153 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T125856Z-elite_dangerous-start passed settings defaults, String.IsNullOrEmpty, CultureInfo.CurrentCulture, and String.Length, then stopped at unsupported System.String::get_Chars (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. The profile ledger had 152 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T125741Z-elite_dangerous-start passed cross-assembly settings, DefaultSettingValueAttribute loading, String.IsNullOrEmpty, and CultureInfo.CurrentCulture, then stopped at unsupported System.String::get_Length (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. The profile ledger had 151 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T125524Z-elite_dangerous-start resolved cross-assembly settings, loaded DefaultSettingValueAttribute values, and passed System.String.IsNullOrEmpty; it then stopped at unsupported System.Globalization.CultureInfo::get_CurrentCulture (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. The profile ledger had 150 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T125355Z-elite_dangerous-start resolved the cross-assembly Settings.get_Default call and read generated settings defaults, then stopped at unsupported System.String.IsNullOrEmpty (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. The profile ledger had 149 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T125120Z-elite_dangerous-start entered settings initialization, then stopped at CBViewModel.Properties.Settings::get_Default from a cross-assembly member reference (o1 exited_early, o12 first_problem). The resolved type's MemberRef signature encoded Settings as a TypeRef while its MethodDef encoded it as a TypeDef; the resolver compared those signature tokens byte-for-byte. No SteamVR connection or EliteDangerous64.exe launch. The profile ledger had 148 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T124348Z-elite_dangerous executed CIL static-field access and Settings type initialization, then stopped at the external System.Configuration.ApplicationSettingsBase::.ctor call (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. The profile ledger has 147 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T124102Z-elite_dangerous reached CBViewModel.Properties.Settings.get_Default after loading the referenced CBViewModel.dll, then stopped at unsupported CIL ldsfld (0x7e) (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. The profile ledger has 146 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T123947Z-elite_dangerous-start progressed through BAML source validation and CIL exception-section decoding, then stopped while constructing System.UnhandledExceptionEventHandler because its static target may be null (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. The profile ledger has 145 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T123434Z-elite_dangerous-start validated the exception-section framing and entered App.ApplicationStart. It then stopped at System.AppDomain.get_CurrentDomain (o1 exited_early, o12 first_problem); no SteamVR connection or EliteDangerous64.exe launch. Run validation passed; ledger has 144 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T123214Z-elite_dangerous-start validated app.baml and all 13 merged ResourceDictionary sources, then dispatched the registered Startup handler. App.ApplicationStart stopped because methods with extra CIL sections were rejected (o1 exited_early, o12 first_problem); no SteamVR connection or EliteDangerous64.exe launch. Run validation passed; ledger has 143 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T122435Z-elite_dangerous-start validated app.baml and resolved all 13 merged ResourceDictionary.Source references, including the 907-record ButtonStyles BAML. EDLaunch.exe then stopped at WPF object-tree construction (o1 exited_early, o12 first_problem); no SteamVR connection or EliteDangerous64.exe launch. Run validation passed; ledger has 143 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T122222Z-elite_dangerous-start resolved WindowStyles and began following its nested ResourceDictionary.Source. It reached styles/buttonstyles.baml, whose deferred dictionary-key record framing was rejected (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. Run validation passed; ledger has 142 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T121828Z-elite_dangerous-start advanced through app.baml and the embedded styles/windowstyles.baml (171 records) after correcting WPF record framing. EDLaunch.exe exits at the first WPF object-tree construction request (o1 exited_early, o12 first_problem); no SteamVR connection or EliteDangerous64.exe launch. Run validation passed; ledger has 141 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T120101Z-elite_dangerous-start on the make-check-built VXRuntime reproduces the current boundary: EDLaunch.exe enters App.Main, resolves app.baml and validates WPF BAML 0.96, then exits at unsupported BAML object construction (o1 exited_early, o12 first_problem). No SteamVR connection or EliteDangerous64.exe launch. Run validation passed; ledger has 138 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T115658Z-elite_dangerous-start: the CLR host runs App.Main, resolves /EDLaunch;component/app.xaml to app.baml, validates its .resources Stream and WPF BAML 0.96 header, then exits because BAML record execution/object construction is not implemented (o1 exited_early, o12 first_problem). It does not reach SteamVR or launch EliteDangerous64.exe. Run validation passed; ledger has 137 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T114953Z-elite_dangerous-start: EDLaunch.exe exits after about 3 s at System.Windows.Application.LoadComponent with WPF BAML/XAML loading not implemented (o1 exited_early, o12 first_problem). It does not reach SteamVR and EliteDangerous64.exe is not launched. Run validation passed; ledger contains 136 valid rows."
+    },
+    {
+      "summary": "Harness run 20261018T113837Z-elite_dangerous-start: the official EDLaunch.exe entry exits after 4.7 s at unsupported CIL newobj in App.Main (o1, o12). VXRuntime now recognizes the I386 PE32 image, enters its built-in _CorExeMain host and reaches IL_0000. The 64-bit game executable was not launched."
+    }
+  ],
+  "notes": [
+    "Use the official EDLaunch.exe entry point for support runs; do not launch EliteDangerous64.exe separately to bypass the launcher or its account checks.",
+    "EDLaunch.exe is PE32/I386 but its CLR flags are IL-only and do not require 32-bit execution. It references .NET Framework 4.8/WPF assemblies; launcher support needs managed runtime behavior plus WPF desktop/UI APIs.",
+    "VXRuntime includes bounds-checked PE/ECMA-335 metadata, .resources and WPF BAML readers, a bounded CIL interpreter with managed objects, fields, delegates and method calls, and a built-in mscoree.dll _CorExeMain path. For EDLaunch.exe it validates app.baml and recursively resolves all 13 merged ResourceDictionary.Source references, including deferred dictionary-key records in ButtonStyles. Mapping BAML records into WPF types, constructing XAML object trees, the dispatcher and message loop remain incomplete.",
+    "The installed game executable is EliteDangerous64.exe. Its compatibility remains unknown until the official launcher can run.",
+    "Static imports from the x64 game include Direct3D 11, DXGI, OpenVR, DirectInput 8, XInput, WinHTTP and Winsock; D3D12 and Vulkan are not imported. Elite will first exercise the D3D11 path once the official launcher can run."
+  ]
+}

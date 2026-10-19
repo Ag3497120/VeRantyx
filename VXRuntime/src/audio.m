@@ -20,6 +20,8 @@ static const GUID CLSID_MMDeviceEnumerator = { 0xBCDE0395, 0xE52F, 0x467C, { 0x8
 static const GUID SUBTYPE_PCM = { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 static const GUID SUBTYPE_FLOAT = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 static const GUID PKEY_FriendlyName = { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } };
+static const GUID PKEY_AudioEngine_DeviceFormat = { 0xf19f064d, 0x082c, 0x4e27, { 0xbc, 0x73, 0x68, 0x82, 0xa1, 0xbb, 0x8e, 0x4c } };   // pid 0: the mix format (VT_BLOB)
+static const GUID PKEY_AudioEndpoint_FormFactor = { 0x1da5d803, 0xd492, 0x4edd, { 0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e } };   // pid 0: Speakers (VT_UI4)
 #define AUDCLNT_E_NOT_INITIALIZED ((HRESULT)0x88890001)
 #define AUDCLNT_E_ALREADY_INITIALIZED ((HRESULT)0x88890002)
 #define AUDCLNT_E_BUFFER_TOO_LARGE ((HRESULT)0x88890006)
@@ -32,10 +34,18 @@ static void **g_enum_vtbl, **g_device_vtbl, **g_collection_vtbl, **g_client_vtbl
 static d3d_object *self_of(void *this) { return (d3d_object *)this; }
 static WINAPI uint32_t obj_addref(void *this) { return d3d_addref(self_of(this)); }
 static WINAPI uint32_t obj_release(void *this) { return d3d_release(self_of(this)); }
+// VXRT_TRACE_AUDIO=1: what a program asks the audio objects for and does not get (interfaces, properties, formats)
+static int audio_trace(void) { static int on = -1; if (on < 0) { const char *e = getenv("VXRT_TRACE_AUDIO"); on = e && *e == '1'; } return on; }
+static void trace_guid(const char *what, const GUID *g) {
+    if (!audio_trace() || !g) return;
+    vx_log("audio: %s {%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}", what, g->d1, g->d2, g->d3,
+           g->d4[0], g->d4[1], g->d4[2], g->d4[3], g->d4[4], g->d4[5], g->d4[6], g->d4[7]);
+}
 static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface) {
     if (!out) return E_POINTER;
     if (d3d_same_guid(iid, &IID_IUnknown_) || d3d_same_guid(iid, iface)) { d3d_addref(self_of(this)); *out = this; return S_OK; }
     *out = NULL;
+    trace_guid("QueryInterface without", iid);
     return E_NOINTERFACE;
 }
 typedef void *(WINAPI *task_alloc_fn)(size_t);
@@ -157,6 +167,7 @@ static WINAPI HRESULT client_initialize(void *this, uint32_t share, DWORD flags,
     client *c = this;
     if (c->initialized) return AUDCLNT_E_ALREADY_INITIALIZED;
     int kind = fmt ? format_kind(fmt) : 0;
+    if (audio_trace()) vx_log("audio: Initialize(share %u, flags %#x, %lld00 ns, %s %u ch %u Hz %u bits)", share, flags, (long long)duration, fmt ? "format" : "no format", fmt ? fmt->channels : 0, fmt ? fmt->rate : 0, fmt ? fmt->bits : 0);
     if (!kind || !fmt->channels || !fmt->rate) return AUDCLNT_E_UNSUPPORTED_FORMAT;
     c->fmt = *fmt;
     c->frame_bytes = fmt->block ? fmt->block : (uint32_t)fmt->channels * fmt->bits / 8;
@@ -198,6 +209,7 @@ static WINAPI HRESULT client_is_format_supported(void *this, uint32_t share, con
     (void)this; (void)share;
     if (closest) *closest = NULL;
     if (fmt && format_kind(fmt)) return S_OK;
+    if (audio_trace() && fmt) vx_log("audio: IsFormatSupported: tag %#x %u ch %u Hz %u bits (share %u) is not one Core Audio takes%s", fmt->tag, fmt->channels, fmt->rate, fmt->bits, share, closest ? ": the mix format is offered" : "");
     if (closest) *closest = mix_format();
     return closest ? S_FALSE : AUDCLNT_E_UNSUPPORTED_FORMAT;
 }
@@ -286,7 +298,7 @@ static WINAPI HRESULT device_qi(void *this, const GUID *iid, void **out) {
 }
 static WINAPI HRESULT device_activate(void *this, const GUID *iid, DWORD ctx, void *params, void **out) {
     (void)this; (void)ctx; (void)params;
-    if (!d3d_same_guid(iid, &IID_IAudioClient) && !d3d_same_guid(iid, &IID_IUnknown_)) { *out = NULL; return E_NOINTERFACE; }
+    if (!d3d_same_guid(iid, &IID_IAudioClient) && !d3d_same_guid(iid, &IID_IUnknown_)) { *out = NULL; trace_guid("Activate without", iid); return E_NOINTERFACE; }
     client *c = d3d_alloc(sizeof *c, K_STATE, g_client_vtbl, NULL);
     c->volume = 1.0f;
     c->base.destroy = client_destroy;
@@ -309,7 +321,18 @@ static WINAPI HRESULT props_get_at(void *this, DWORD i, PROPERTYKEY *key) { (voi
 static WINAPI HRESULT props_get_value(void *this, const PROPERTYKEY *key, uint8_t *pv) {
     (void)this;
     memset(pv, 0, 24);
-    if (!d3d_same_guid(&key->fmtid, &PKEY_FriendlyName) || (key->pid != 14 && key->pid != 2)) return S_OK;   // VT_EMPTY
+    if (d3d_same_guid(&key->fmtid, &PKEY_AudioEngine_DeviceFormat) && key->pid == 0) {
+        WAVEFORMATEX *w = mix_format();                             // (PROPVARIANT: vt, then BLOB { cbSize, pBlobData })
+        *(uint16_t *)pv = 65;                                       // VT_BLOB
+        *(DWORD *)(pv + 8) = 18 + w->extra;
+        *(void **)(pv + 16) = w;
+        return S_OK;
+    }
+    if (d3d_same_guid(&key->fmtid, &PKEY_AudioEndpoint_FormFactor) && key->pid == 0) { *(uint16_t *)pv = 19; *(DWORD *)(pv + 8) = 1; return S_OK; }   // VT_UI4 Speakers
+    if (!d3d_same_guid(&key->fmtid, &PKEY_FriendlyName) || (key->pid != 14 && key->pid != 2)) {
+        if (audio_trace()) { char what[64]; snprintf(what, sizeof what, "property pid %u not provided:", (unsigned)key->pid); trace_guid(what, &key->fmtid); }
+        return S_OK;                                                // VT_EMPTY
+    }
     char name[256];
     device_name(name, sizeof name);
     size_t n = vx_utf8_to_utf16(name, strlen(name), NULL, 0);

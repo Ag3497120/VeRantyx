@@ -3,14 +3,30 @@
 // pipeline states made from DXIL translated by dxil_msl.c, committed resources and their views.
 //
 // Descriptors are 32 bytes in the layout the translated shaders read (VxDesc, dxil_msl.h): a GPU address, a Metal
-// resource id, a size, a stride, a format and flags. Shader-visible heaps live in Metal buffers, so a GPU descriptor
+// resource id, a size (or flagged texture-SRV min-LOD float bits), a stride, a format and flags. Shader-visible heaps
+// live in Metal buffers, so a GPU descriptor
 // handle is a GPU address the shaders can read; at each dispatch the root signature is resolved into one pointer per
 // resource range the shader declares (VxRoot at buffer 0).
 //
-// Not done yet: graphics pipelines and draws, swap chains on D3D12 queues, placed and reserved resources, queries,
-// indirect execution, typed buffer views.
+// Implemented: compute and graphics pipelines, draws, UAV clears for typed and raw buffers plus common texture views, swap
+// chains on D3D12 queues, placed resources, timestamp and occlusion queries, and ExecuteIndirect tier 1.0 argument
+// types plus tier 1.1 incrementing constants, including GPU-side Metal lowering for fixed-signature dispatch/draw
+// ranges and their optional count buffers. Direct command lists can execute closed graphics bundles with inherited
+// target/root state and bundle state leakage; the current bundle subset supports direct draws and restricted
+// single-operation ExecuteIndirect draw signatures without count buffers or root/IA updates. WriteBufferImmediate
+// records aligned 32-bit writes on direct, compute, and copy lists through ordered Metal blit operations.
+// Opaque-layout textures support Map plus synchronous WriteToSubresource/ReadFromSubresource transfers in COMMON state
+// for single-sample, single-plane formats through shared Metal staging buffers and blit commands.
+// Not done yet: reserved resources, protected resource sessions, sampler feedback, ray/mesh dispatch,
+// geometry/hull/domain stages, full typed-buffer format coverage, atomics outside R32 integer resources supported by
+// the active Metal GPU, structured-buffer UAV clears, and ExecuteIndirect bundle signatures that change root or IA
+// state or use a count buffer.
 #include "d3d_common.h"
+#include "d3d12_view.h"
 #include "dxil_msl.h"
+#include "dxil_ir.h"
+#include "gpu_ir.h"
+#include "gpu_ir_metal.h"
 #include <float.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -19,12 +35,38 @@
 #include "d3d_tables.h"                                            // (IDXGISwapChain3, for swap chains on D3D12 queues)
 #pragma clang diagnostic pop
 
-enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG, K12_MEMHEAP, K12_QUERYHEAP };
+enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG, K12_MEMHEAP, K12_QUERYHEAP, K12_COMMAND_SIGNATURE };
+#define D3D12_ALL_SUBRESOURCES UINT32_MAX
+enum { D3D12_RESOLVE_MODE_MIN12 = 1, D3D12_RESOLVE_MODE_MAX12 = 2, D3D12_RESOLVE_MODE_AVERAGE12 = 3 };
+enum {
+    D3D12_STATE_VERTEX_CONSTANT = 0x00000001u,
+    D3D12_STATE_INDEX = 0x00000002u,
+    D3D12_STATE_RENDER_TARGET = 0x00000004u,
+    D3D12_STATE_UAV = 0x00000008u,
+    D3D12_STATE_DEPTH_WRITE = 0x00000010u,
+    D3D12_STATE_DEPTH_READ = 0x00000020u,
+    D3D12_STATE_NON_PIXEL_SHADER = 0x00000040u,
+    D3D12_STATE_PIXEL_SHADER = 0x00000080u,
+    D3D12_STATE_STREAM_OUT = 0x00000100u,
+    D3D12_STATE_INDIRECT = 0x00000200u,
+    D3D12_STATE_COPY_DEST = 0x00000400u,
+    D3D12_STATE_COPY_SOURCE = 0x00000800u,
+    D3D12_STATE_RESOLVE_DEST = 0x00001000u,
+    D3D12_STATE_RESOLVE_SOURCE = 0x00002000u,
+    D3D12_STATE_VIDEO_DECODE_READ = 0x00010000u,
+    D3D12_STATE_VIDEO_DECODE_WRITE = 0x00020000u,
+    D3D12_STATE_VIDEO_PROCESS_READ = 0x00040000u,
+    D3D12_STATE_VIDEO_PROCESS_WRITE = 0x00080000u,
+    D3D12_STATE_RAYTRACING_AS = 0x00400000u,
+    D3D12_STATE_VIDEO_ENCODE_READ = 0x00200000u,
+    D3D12_STATE_VIDEO_ENCODE_WRITE = 0x00800000u,
+    D3D12_STATE_SHADING_RATE = 0x01000000u
+};
 
 static const GUID IID_IUnknown_ = { 0, 0, 0, { 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
 static void **g_swapchain_vtbl;
 static void **g_device_vtbl, **g_queue_vtbl, **g_allocator_vtbl, **g_list_vtbl, **g_fence_vtbl, **g_heap_vtbl, **g_rootsig_vtbl,
-            **g_pso_vtbl, **g_resource_vtbl, **g_blob_vtbl, **g_debug_vtbl, **g_memheap_vtbl, **g_queryheap_vtbl;
+            **g_pso_vtbl, **g_resource_vtbl, **g_blob_vtbl, **g_debug_vtbl, **g_memheap_vtbl, **g_queryheap_vtbl, **g_command_signature_vtbl;
 static pthread_once_t g_tables_once = PTHREAD_ONCE_INIT;
 static void make_tables(void);
 
@@ -36,6 +78,10 @@ typedef struct { int32_t Type, CPUPageProperty, MemoryPoolPreference; uint32_t C
 typedef struct { uint64_t SizeInBytes; HEAP_PROPS Properties; uint64_t Alignment; int32_t Flags; } MEMHEAP_DESC;   // D3D12_HEAP_DESC
 typedef struct { uint64_t SizeInBytes, Alignment; } ALLOC_INFO;
 typedef struct { int32_t Dimension; uint64_t Alignment, Width; uint32_t Height; uint16_t DepthOrArraySize, MipLevels; uint32_t Format, SampleCount, SampleQuality; int32_t Layout, Flags; } RES_DESC;
+typedef struct { RES_DESC resource; struct { uint32_t Width, Height, Depth; } sampler_feedback_mip_region; } RES_DESC1;
+_Static_assert(__builtin_offsetof(RES_DESC1, sampler_feedback_mip_region) == sizeof(RES_DESC),
+               "D3D12_RESOURCE_DESC1 mip-region ABI layout");
+static int resource_alignment12(const RES_DESC *desc, uint64_t *alignment);
 typedef struct { const void *code; size_t size; } BYTECODE;
 typedef struct { void *root; BYTECODE cs; uint32_t node; const void *cached; size_t cached_size; int32_t flags; } COMPUTE_PSO_DESC;
 typedef struct { uint64_t location; uint32_t size; } CBV_DESC;
@@ -54,6 +100,7 @@ typedef struct {
         struct { uint64_t first; uint32_t count, stride; uint64_t counter_offset; int32_t flags; } buffer;
         struct { uint32_t mip, plane; } tex2d;
         struct { uint32_t mip, first_slice, slices, plane; } tex2darray;
+        struct { uint32_t mip, first_w_slice, w_size; } tex3d;
         uint32_t raw[8];
     };
 } UAV_DESC;
@@ -61,6 +108,10 @@ typedef struct { int32_t filter, u, v, w; float bias; uint32_t aniso; int32_t cm
 typedef struct { uint64_t offset; uint32_t format, width, height, depth, row_pitch; } FOOTPRINT;
 typedef struct { void *res; int32_t type; uint32_t pad; union { FOOTPRINT footprint; uint32_t subresource; }; } COPY_LOC;
 typedef struct { uint32_t left, top, front, right, bottom, back; } BOX;
+typedef struct { void *resource; uint32_t subresource; int32_t before, after; } TRANSITION_BARRIER;
+typedef struct { void *before, *after; } ALIASING_BARRIER;
+typedef struct { void *resource; } UAV_BARRIER;
+typedef struct { int32_t type, flags; union { TRANSITION_BARRIER transition; ALIASING_BARRIER aliasing; UAV_BARRIER uav; }; } RESOURCE_BARRIER;
 typedef struct { size_t begin, end; } RANGE;
 typedef struct { const void *decl; uint32_t n, pad; const uint32_t *strides; uint32_t nstrides, rasterized; } SO_DESC;
 typedef struct { int32_t enable, logic_enable, src, dst, op, src_a, dst_a, op_a, logic_op; uint8_t mask, pad[3]; } RT_BLEND;
@@ -81,26 +132,82 @@ typedef struct { float x, y, w, h, min_depth, max_depth; } VIEWPORT;
 typedef struct { int32_t left, top, right, bottom; } RECT12;
 typedef struct { uint64_t va; uint32_t size, stride; } VBV;
 typedef struct { uint64_t va; uint32_t size, format; } IBV;
+typedef struct {
+    int32_t type;
+    union {
+        struct { uint32_t slot; } vb;
+        struct { uint32_t root, offset, count; } constants;
+        struct { uint32_t root, offset; } incrementing_constant;
+        struct { uint32_t root; } descriptor;
+        uint32_t raw[3];
+    };
+} INDIRECT_ARGUMENT_DESC;
+typedef struct { uint32_t stride, count; const INDIRECT_ARGUMENT_DESC *args; uint32_t node_mask; } COMMAND_SIGNATURE_DESC;
+typedef struct { uint64_t Dest; uint32_t Value, padding; } WRITE_BUFFER_IMMEDIATE_PARAMETER12;
 
 // ---- objects ----------------------------------------------------------------------------------------------------
 
 typedef struct dev12 dev12;
+typedef struct res12 res12;
+typedef struct memheap12 memheap12;
+static uint32_t d3d12_resource_plane_count(uint32_t format);
+typedef struct {
+    res12 *resource;
+    uint64_t offset;
+    uint32_t value, mode;
+} write_buffer_immediate12;
 typedef struct { d3d_object base; dev12 *dev; } obj12;
+typedef struct {
+    res12 *resource;
+    uint32_t mip, mips, slice, slices, plane;
+    res12 *counter_resource;
+    uint64_t counter_offset;
+} shader_view12;
+
+typedef struct res_state_override12 {
+    uint32_t subresource, state, promoted;
+    struct res_state_override12 *next;
+} res_state_override12;
+typedef struct res_state_pending12 {
+    uint32_t subresource, before, after;
+    struct res_state_pending12 *next;
+} res_state_pending12;
 
 struct dev12 {
     d3d_object base;
     id<MTLDevice> mtl;
-    id<MTLCommandQueue> queue;
     NSMutableArray *resources;       // every live buffer and texture (made resident for each command buffer)
     pthread_mutex_t lock;
+    pthread_mutex_t submit_lock;     // preserves queue submission and tracked state order across calling threads
+    pthread_mutex_t format_lock;
+    uint32_t format_support1[256], format_support2[256];
+    uint8_t format_support_valid[256];
+    int typed_uav_load_additional_formats;
+    id<MTLLibrary> format_probe_library;
+    id<MTLFunction> format_probe_vertex, format_probe_fragment;
     NSMutableDictionary *pso_cache;  // MSL source -> id<MTLComputePipelineState>
+    gpu_ir_metal_device *common_metal; // shared Metal resource and command backend for API-neutral operations
+    id<MTLCommandQueue> cpu_transfer_queue; // synchronous opaque-layout resource access
+    id<MTLComputePipelineState> indirect_args_filter; // applies ExecuteIndirect count-buffer limits on the GPU
     void **bufs;                     // the buffers (res12), for a GPU address's buffer (vertex and index buffers)
     uint32_t nbufs, capbufs;
     id<MTLComputePipelineState> occ_sum;   // adds a render pass's occlusion counts into a query heap (made when first needed)
 };
 
-typedef struct { d3d_object base; dev12 *dev; Q_DESC desc; } queue12;
-typedef struct { d3d_object base; dev12 *dev; int32_t type; } allocator12;
+typedef struct {
+    d3d_object base;
+    dev12 *dev;
+    Q_DESC desc;
+    id<MTLCommandQueue> mtl_queue;
+} queue12;
+typedef struct {
+    d3d_object base;
+    dev12 *dev;
+    int32_t type;
+    uint32_t recording_lists;
+    uint32_t in_flight; // accessed atomically so completion callbacks never wait on submit_lock
+    uint64_t generation;
+} allocator12;
 
 typedef struct {
     d3d_object base; dev12 *dev;
@@ -111,28 +218,49 @@ typedef struct {
 typedef struct {
     d3d_object base; dev12 *dev;
     HEAP_DESC desc;
+    uint32_t residency_refs;
+    uint32_t residency_priority;
     id<MTLBuffer> gpu;               // shader-visible heaps
     uint8_t *cpu;                    // the descriptors (gpu.contents, or memory of its own)
     __strong id *keep;               // the Metal object each descriptor stands for (texture view, sampler), held
+    uint8_t *descriptor_kind;        // DXIL class + 1 for shader descriptors; zero means unset/non-shader descriptor
+    gpu_ir_buffer_view **buffer_view; // API-neutral buffer view, retained alongside the descriptor
+    shader_view12 *shader_view;      // API resource and subresource selection for SRV/UAV state validation
+    res12 **target_resource;         // RTV/DSV descriptor owner, retained for API-state validation
+    uint32_t *target_subresource;
+    uint32_t *target_flags;
 } heap12;
 
-typedef struct {
+struct res12 {
     d3d_object base; dev12 *dev;
     RES_DESC desc;
     HEAP_PROPS heap;
     id<MTLBuffer> buffer;
+    gpu_ir_resource *gpu_buffer;   // API-neutral reference used by the common command IR
     id<MTLTexture> texture;
+    gpu_ir_resource *gpu_texture;  // API-neutral reference used by the common command IR
     uint32_t mapped;
+    uint32_t *mapped_subresources;
+    uint32_t mapped_subresource_count;
     int32_t heap_flags;
-} res12;
+    uint32_t residency_refs;
+    uint32_t residency_priority;
+    memheap12 *owner_heap;           // placed resources borrow the physical memory owned by this heap
+    uint32_t initial_state;
+    uint32_t initial_promoted;
+    res_state_override12 *state_overrides;
+    res_state_pending12 *pending_transitions;
+};
 
 // A heap (ID3D12Heap) for placed resources: a Metal placement heap, so resources placed at the same offset share
 // memory as they do in D3D12.
-typedef struct {
+struct memheap12 {
     d3d_object base; dev12 *dev;
     MEMHEAP_DESC desc;
+    uint32_t residency_refs;
+    uint32_t residency_priority;
     id<MTLHeap> heap;
-} memheap12;
+};
 
 // A query heap: occlusion queries count into a Metal visibility result buffer, timestamps are samples of the GPU's
 // timestamp counter (in nanoseconds, as GetTimestampFrequency says); the other kinds read as zeros.
@@ -140,24 +268,50 @@ typedef struct {
     d3d_object base; dev12 *dev;
     int32_t type;                    // D3D12_QUERY_HEAP_TYPE: 0 occlusion, 1 timestamp, 2 pipeline statistics, 5 copy queue timestamp, ...
     uint32_t count, stride;          // queries, bytes of each one's result
+    uint32_t residency_refs;
+    uint32_t residency_priority;
     id<MTLBuffer> results;           // occlusion: Metal's visibility results; others: zeros
     id<MTLCounterSampleBuffer> samples;
 } queryheap12;
 
+static int resource_resident12(const res12 *resource) {
+    if (!resource) return 0;
+    const uint32_t *refs = resource->owner_heap ? &resource->owner_heap->residency_refs : &resource->residency_refs;
+    return __atomic_load_n(refs, __ATOMIC_RELAXED) != 0;
+}
+
+static int descriptor_heap_resident12(const heap12 *heap) {
+    return heap && __atomic_load_n(&heap->residency_refs, __ATOMIC_RELAXED) != 0;
+}
+
+enum { VX12_RESIDENCY_PRIORITY_NORMAL = 0x78000000u, VX12_RESIDENCY_PRIORITY_HIGH = 0xa0010000u };
+
 // A root signature, from its serialized form.
-typedef struct { int32_t type; uint32_t count, base, space, offset; } range12;
-typedef struct { int32_t type, visibility; uint32_t reg, space, n32; uint32_t nranges; range12 *ranges; } param12;
-typedef struct { uint32_t reg, space; id<MTLSamplerState> state; } static_sampler12;
+typedef struct { int32_t type; uint32_t count, base, space, offset, flags; } range12;
+typedef struct { int32_t type, visibility; uint32_t reg, space, n32, flags; uint32_t nranges; range12 *ranges; } param12;
+typedef struct { uint32_t reg, space; int32_t visibility; id<MTLSamplerState> state; } static_sampler12;
 typedef struct {
     d3d_object base; dev12 *dev;
     uint32_t nparams, nsamplers, flags;
     param12 *params;
     static_sampler12 *samplers;
+    gpu_ir_pipeline_layout *gpu_layout;
 } rootsig12;
+
+typedef struct { uint32_t type, payload_offset, size, a, b, c; } command_argument12;
+typedef struct {
+    d3d_object base; dev12 *dev;
+    uint32_t stride, count, payload_size;
+    command_argument12 *args;
+    rootsig12 *root;
+    int gfx;
+} command_signature12;
 
 typedef struct {
     d3d_object base; dev12 *dev;
     id<MTLComputePipelineState> compute;
+    gpu_ir_pipeline *gpu_pipeline;
+    int common_ir_compute;
     dxil_msl msl;                    // the translation's slots and thread counts (msl.msl freed)
     // graphics
     id<MTLRenderPipelineState> render;
@@ -169,34 +323,57 @@ typedef struct {
     MTLDepthClipMode clip;
     float bias, bias_slope, bias_clamp;
     int has_depth, has_stencil;
+    int depth_enable, depth_write, stencil_enable, stencil_write;
 } pso12;
 
 typedef struct { d3d_object base; void *data; size_t size; } blob12;
 
 // Recorded commands, replayed when the list is executed.
-enum { C_PSO, C_ROOTSIG, C_HEAPS, C_TABLE, C_CONSTANTS, C_ROOT_VA, C_DISPATCH, C_COPY_BUFFER, C_COPY_RESOURCE, C_COPY_TEXTURE, C_UAV_BARRIER,
-       C_TOPOLOGY, C_VB, C_IB, C_TARGETS, C_VIEWPORTS, C_SCISSORS, C_CLEAR_RTV, C_CLEAR_DSV, C_DRAW, C_DRAW_INDEXED, C_BLEND_FACTOR, C_STENCIL_REF,
-       C_BEGIN_QUERY, C_END_QUERY, C_RESOLVE_QUERY };
+enum { C_PSO, C_ROOTSIG, C_HEAPS, C_TABLE, C_CONSTANTS, C_ROOT_VA, C_DISPATCH, C_COPY_RESOURCE, C_COPY_TEXTURE,
+       C_TOPOLOGY, C_VB, C_IB, C_TARGETS, C_VIEWPORTS, C_SCISSORS, C_CLEAR_RTV, C_CLEAR_DSV, C_CLEAR_UAV, C_DRAW, C_DRAW_INDEXED, C_BLEND_FACTOR, C_STENCIL_REF,
+       C_BEGIN_QUERY, C_END_QUERY, C_RESOLVE_QUERY, C_GPU_IR, C_EXECUTE_INDIRECT, C_BUNDLE_BEGIN, C_BUNDLE_END,
+       C_WRITE_BUFFER_IMMEDIATE };
+enum { D3D12_TRACK_COPY_BUFFER = 0x100, D3D12_TRACK_COPY_RESOURCE, D3D12_TRACK_COPY_TEXTURE, D3D12_TRACK_RESOLVE };
 typedef struct {
     int op;
     uint32_t a, b, c;
     uint64_t va;
-    void *obj, *obj2;
+    void *obj, *obj2, *obj3;
     uint64_t off, off2, size;
     COPY_LOC dst, src;
     BOX box;
     int has_box;
+    RECT12 *rects;
+    write_buffer_immediate12 *immediate_writes;
     int gfx;                         // root signature and root arguments: the graphics ones (else compute)
     void *tex[9];                    // C_TARGETS, clears: the views (retained Metal textures), depth last
+    res12 *resource[9];              // API resource named by a target descriptor, retained
+    uint32_t subresource[9], view_flags[9];
     uint32_t values[64];
+    uint32_t gpu_ir_index;
+    int gpu_ir_recorded, gpu_ir_transient;
+    uint32_t replay_source_index;    // original list index; UINT32_MAX for commands expanded during replay
 } cmd12;
+
+typedef struct {
+    uint32_t command_index, available;
+    const uint8_t *records;
+} d3d12_indirect_validation_override12;
 
 typedef struct {
     d3d_object base; dev12 *dev;
     int32_t type;
+    allocator12 *allocator;
+    uint64_t allocator_generation;
+    int allocator_recording;
     cmd12 *cmds;
     uint32_t n, cap;
+    pso12 *recording_pso;
+    uint32_t recording_topology;
+    int recording_topology_set;
+    gpu_ir_stream gpu_ir;
     int closed;
+    int32_t validation_error;
 } list12;
 
 static d3d_object *obj(void *this) { return (d3d_object *)this; }
@@ -326,17 +503,33 @@ static blob12 *serialize_rootsig(int version, const RS_DESC *d) {
 }
 
 // The RTS0 part of a container (a serialized root signature, or a shader that carries one), or the bytes as they are.
+static int span_ok(size_t total, size_t offset, size_t size) {
+    return offset <= total && size <= total - offset;
+}
+
 static const uint8_t *rts0(const uint8_t *p, size_t size, size_t *len) {
-    if (size >= 32 && !memcmp(p, "DXBC", 4)) {
-        uint32_t count;
+    if (!p || !len) return NULL;
+    if (size >= 4 && !memcmp(p, "DXBC", 4)) {
+        uint32_t count, container_size;
+        if (!span_ok(size, 0, 32)) return NULL;
+        memcpy(&container_size, p + 24, 4);
         memcpy(&count, p + 28, 4);
-        for (uint32_t i = 0; i < count && 32 + 4 * (size_t)i + 4 <= size; i++) {
+        if (container_size < 32 || container_size > size || count > (container_size - 32) / 4 ||
+            !span_ok(container_size, 32, (size_t)count * 4)) return NULL;
+        size_t chunks = 32 + (size_t)count * 4;
+        for (uint32_t i = 0; i < count; i++) {
             uint32_t off;
             memcpy(&off, p + 32 + 4 * i, 4);
-            if ((size_t)off + 8 > size || memcmp(p + off, "RTS0", 4)) continue;
+            if (off < chunks || !span_ok(container_size, off, 8)) return NULL;
+            if (memcmp(p + off, "RTS0", 4)) {
+                uint32_t chunk_size;
+                memcpy(&chunk_size, p + off + 4, 4);
+                if (!span_ok(container_size, (size_t)off + 8, chunk_size)) return NULL;
+                continue;
+            }
             uint32_t n;
             memcpy(&n, p + off + 4, 4);
-            if ((size_t)off + 8 + n > size) return NULL;
+            if (!span_ok(container_size, (size_t)off + 8, n)) return NULL;
             *len = n;
             return p + off + 8;
         }
@@ -348,15 +541,212 @@ static const uint8_t *rts0(const uint8_t *p, size_t size, size_t *len) {
 
 static uint32_t rd32(const uint8_t *p, size_t len, size_t at) { uint32_t v = 0; if (at + 4 <= len) memcpy(&v, p + at, 4); return v; }
 
+static int valid_descriptor_range_flags12(uint32_t flags) {
+    switch (flags) {
+    case 0: case 0x1: case 0x2: case 0x4: case 0x8: case 0x3: case 0x5: return 1;
+    default: return 0;
+    }
+}
+
+static int valid_root_descriptor_flags12(uint32_t flags) {
+    return flags == 0 || flags == 0x2 || flags == 0x4 || flags == 0x8;
+}
+
 static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int32_t v, int32_t w, float bias, uint32_t aniso, int32_t cmp, const float border[4], float min_lod, float max_lod);
 
 static void rootsig_destroy(d3d_object *o) {
     rootsig12 *r = (rootsig12 *)o;
-    for (uint32_t i = 0; i < r->nparams; i++) free(r->params[i].ranges);
+    if (r->params) for (uint32_t i = 0; i < r->nparams; i++) free(r->params[i].ranges);
     free(r->params);
-    for (uint32_t i = 0; i < r->nsamplers; i++) r->samplers[i].state = nil;
+    gpu_ir_pipeline_layout_release(r->gpu_layout);
+    if (r->samplers) for (uint32_t i = 0; i < r->nsamplers; i++) r->samplers[i].state = nil;
     free(r->samplers);
     release_dev(o);
+}
+
+typedef struct { uint32_t type, space, base, count; int32_t visibility; } root_binding12;
+
+static uint64_t root_binding_end(const root_binding12 *binding) {
+    return binding->count == UINT32_MAX ? UINT64_MAX : (uint64_t)binding->base + binding->count;
+}
+
+static int root_binding_compare(const void *left, const void *right) {
+    const root_binding12 *a = left, *b = right;
+    if (a->type != b->type) return a->type < b->type ? -1 : 1;
+    if (a->space != b->space) return a->space < b->space ? -1 : 1;
+    if (a->base != b->base) return a->base < b->base ? -1 : 1;
+    if (a->visibility != b->visibility) return a->visibility < b->visibility ? -1 : 1;
+    return 0;
+}
+
+static int range_offset_compare(const void *left, const void *right) {
+    const range12 *a = left, *b = right;
+    if (a->offset != b->offset) return a->offset < b->offset ? -1 : 1;
+    if (a->type != b->type) return a->type < b->type ? -1 : 1;
+    return 0;
+}
+
+static HRESULT validate_table_ranges(const param12 *param) {
+    int has_sampler = 0, has_resource = 0;
+    for (uint32_t i = 0; i < param->nranges; i++) {
+        if (param->ranges[i].type == 3) has_sampler = 1;
+        else has_resource = 1;
+    }
+    if (has_sampler && has_resource) return E_INVALIDARG;
+    if (param->nranges < 2) return S_OK;
+    if ((size_t)param->nranges > SIZE_MAX / sizeof *param->ranges) return E_OUTOFMEMORY;
+    range12 *sorted = malloc((size_t)param->nranges * sizeof *sorted);
+    if (!sorted) return E_OUTOFMEMORY;
+    memcpy(sorted, param->ranges, (size_t)param->nranges * sizeof *sorted);
+    qsort(sorted, param->nranges, sizeof *sorted, range_offset_compare);
+    uint64_t end_by_type[4] = { 0 };
+    for (uint32_t i = 0; i < param->nranges; i++) {
+        range12 *range = &sorted[i];
+        for (uint32_t type = 0; type < 4; type++) {
+            if (type != (uint32_t)range->type && end_by_type[type] > range->offset) {
+                free(sorted);
+                return E_INVALIDARG;
+            }
+        }
+        uint64_t end = range->count == UINT32_MAX ? UINT64_MAX : (uint64_t)range->offset + range->count;
+        if (end > end_by_type[range->type]) end_by_type[range->type] = end;
+    }
+    free(sorted);
+    return S_OK;
+}
+
+static HRESULT validate_root_bindings(const rootsig12 *root) {
+    size_t count = root->nsamplers;
+    for (uint32_t i = 0; i < root->nparams; i++) {
+        const param12 *param = &root->params[i];
+        size_t add = param->type == 0 ? param->nranges : 1;
+        if (add > SIZE_MAX - count) return E_OUTOFMEMORY;
+        count += add;
+    }
+    if (!count) return S_OK;
+    if (count > SIZE_MAX / sizeof(root_binding12)) return E_OUTOFMEMORY;
+    root_binding12 *bindings = malloc(count * sizeof *bindings);
+    if (!bindings) return E_OUTOFMEMORY;
+    size_t at = 0;
+    for (uint32_t i = 0; i < root->nparams; i++) {
+        const param12 *param = &root->params[i];
+        if (param->type == 0) {
+            for (uint32_t j = 0; j < param->nranges; j++) {
+                const range12 *range = &param->ranges[j];
+                bindings[at++] = (root_binding12){ (uint32_t)range->type, range->space, range->base,
+                                                   range->count, param->visibility };
+            }
+        } else {
+            uint32_t type = param->type == 2 ? 2 : param->type == 3 ? 0 : param->type == 4 ? 1 : 2;
+            bindings[at++] = (root_binding12){ type, param->space, param->reg, 1, param->visibility };
+        }
+    }
+    for (uint32_t i = 0; i < root->nsamplers; i++) {
+        const static_sampler12 *sampler = &root->samplers[i];
+        bindings[at++] = (root_binding12){ 3, sampler->space, sampler->reg, 1, sampler->visibility };
+    }
+    qsort(bindings, count, sizeof *bindings, root_binding_compare);
+    uint32_t previous_type = UINT32_MAX, previous_space = UINT32_MAX;
+    uint64_t end_by_visibility[8] = { 0 };
+    uint8_t seen_visibility[8] = { 0 };
+    for (size_t i = 0; i < count; i++) {
+        const root_binding12 *binding = &bindings[i];
+        if (binding->type != previous_type || binding->space != previous_space) {
+            memset(end_by_visibility, 0, sizeof end_by_visibility);
+            memset(seen_visibility, 0, sizeof seen_visibility);
+            previous_type = binding->type;
+            previous_space = binding->space;
+        }
+        for (uint32_t visibility = 0; visibility < 8; visibility++) {
+            if (!seen_visibility[visibility] ||
+                (binding->visibility && visibility && binding->visibility != (int32_t)visibility)) continue;
+            if (end_by_visibility[visibility] > binding->base) { free(bindings); return E_INVALIDARG; }
+        }
+        uint32_t visibility = (uint32_t)binding->visibility;
+        uint64_t end = root_binding_end(binding);
+        if (end > end_by_visibility[visibility]) end_by_visibility[visibility] = end;
+        seen_visibility[visibility] = 1;
+    }
+    free(bindings);
+    return S_OK;
+}
+
+static uint32_t root_visibility_gpu_stages12(int32_t visibility) {
+    switch (visibility) {
+    case 0: return GPU_IR_STAGE_ALL;
+    case 1: return GPU_IR_STAGE_VERTEX;
+    case 2: return GPU_IR_STAGE_TESS_CONTROL;
+    case 3: return GPU_IR_STAGE_TESS_EVALUATION;
+    case 4: return GPU_IR_STAGE_GEOMETRY;
+    case 5: return GPU_IR_STAGE_FRAGMENT;
+    case 6: return GPU_IR_STAGE_MESH;
+    case 7: return GPU_IR_STAGE_TASK;
+    default: return 0;
+    }
+}
+
+static uint32_t root_gpu_kind12(uint32_t register_class) {
+    switch (register_class) {
+    case 0: return GPU_IR_DESCRIPTOR_READ_ONLY_RESOURCE;
+    case 1: return GPU_IR_DESCRIPTOR_STORAGE_RESOURCE;
+    case 2: return GPU_IR_DESCRIPTOR_UNIFORM_BUFFER;
+    case 3: return GPU_IR_DESCRIPTOR_SAMPLER;
+    default: return 0;
+    }
+}
+
+static uint32_t root_gpu_access12(uint32_t register_class) {
+    switch (register_class) {
+    case 0: return GPU_IR_ACCESS_SHADER_READ;
+    case 1: return GPU_IR_ACCESS_SHADER_READ | GPU_IR_ACCESS_SHADER_WRITE;
+    case 2: return GPU_IR_ACCESS_UNIFORM_READ;
+    case 3: return 0;
+    default: return UINT32_MAX;
+    }
+}
+
+static void root_gpu_binding12(gpu_ir_descriptor_binding *out, uint32_t register_class, uint32_t count,
+                               uint32_t reg, uint32_t space, int32_t visibility) {
+    *out = (gpu_ir_descriptor_binding){
+        .set = space, .binding = reg, .kind = root_gpu_kind12(register_class), .count = count,
+        .stage_mask = root_visibility_gpu_stages12(visibility), .access_mask = root_gpu_access12(register_class),
+        .binding_namespace = register_class
+    };
+}
+
+static HRESULT create_root_gpu_layout12(rootsig12 *root) {
+    size_t count = root->nsamplers;
+    for (uint32_t i = 0; i < root->nparams; i++) {
+        const param12 *param = &root->params[i];
+        size_t add = param->type == 0 ? param->nranges : (param->type >= 2 && param->type <= 4 ? 1 : 0);
+        if (add > SIZE_MAX - count) return E_OUTOFMEMORY;
+        count += add;
+    }
+    if (count > UINT32_MAX || count > SIZE_MAX / sizeof(gpu_ir_descriptor_binding)) return E_OUTOFMEMORY;
+    gpu_ir_descriptor_binding *bindings = count ? calloc(count, sizeof *bindings) : NULL;
+    if (count && !bindings) return E_OUTOFMEMORY;
+    size_t at = 0;
+    for (uint32_t i = 0; i < root->nparams; i++) {
+        const param12 *param = &root->params[i];
+        if (param->type == 0) {
+            for (uint32_t j = 0; j < param->nranges; j++) {
+                const range12 *range = &param->ranges[j];
+                root_gpu_binding12(&bindings[at++], (uint32_t)range->type, range->count,
+                                   range->base, range->space, param->visibility);
+            }
+        } else if (param->type >= 2 && param->type <= 4) {
+            uint32_t register_class = param->type == 2 ? 2 : param->type == 3 ? 0 : 1;
+            root_gpu_binding12(&bindings[at++], register_class, 1, param->reg, param->space, param->visibility);
+        }
+    }
+    for (uint32_t i = 0; i < root->nsamplers; i++) {
+        const static_sampler12 *sampler = &root->samplers[i];
+        root_gpu_binding12(&bindings[at++], 3, 1, sampler->reg, sampler->space, sampler->visibility);
+    }
+    gpu_ir_pipeline_layout_desc desc = { .bindings = bindings, .binding_count = (uint32_t)count };
+    root->gpu_layout = gpu_ir_pipeline_layout_create(&desc);
+    free(bindings);
+    return root->gpu_layout ? S_OK : E_INVALIDARG;
 }
 
 static HRESULT parse_rootsig(dev12 *d, const void *data, size_t size, rootsig12 *r) {
@@ -364,53 +754,102 @@ static HRESULT parse_rootsig(dev12 *d, const void *data, size_t size, rootsig12 
     const uint8_t *p = rts0(data, size, &len);
     if (!p || len < 24) return E_INVALIDARG;
     uint32_t version = rd32(p, len, 0);
-    r->nparams = rd32(p, len, 4);
     uint32_t params_at = rd32(p, len, 8);
-    r->nsamplers = rd32(p, len, 12);
+    uint32_t nparams = rd32(p, len, 4), nsamplers = rd32(p, len, 12);
     uint32_t samplers_at = rd32(p, len, 16);
     r->flags = rd32(p, len, 20);
-    if (r->nparams > 64 || r->nsamplers > 2048) return E_INVALIDARG;
-    r->params = calloc(r->nparams + 1, sizeof *r->params);
-    for (uint32_t i = 0; i < r->nparams; i++) {
+    // D3D12_ROOT_SIGNATURE_FLAGS currently occupies bits 0 through 11. A local root signature is
+    // raytracing-only and cannot be combined with graphics root-signature flags.
+    if ((version != 1 && version != 2) || (r->flags & ~0xFFFu) ||
+        ((r->flags & 0x80u) && r->flags != 0x80u) || nparams > 64 || nsamplers > 2048 || params_at < 24 ||
+        !span_ok(len, params_at, (size_t)nparams * 12) ||
+        (nsamplers && (samplers_at < 24 || !span_ok(len, samplers_at, (size_t)nsamplers * 52)))) return E_INVALIDARG;
+    r->params = calloc((size_t)nparams + 1, sizeof *r->params);
+    if (!r->params) return E_OUTOFMEMORY;
+    r->nparams = nparams;
+    uint32_t root_cost = 0;
+    for (uint32_t i = 0; i < nparams; i++) {
         param12 *q = &r->params[i];
-        size_t at = params_at + 12 * i;
+        size_t at = (size_t)params_at + 12 * (size_t)i;
         q->type = (int32_t)rd32(p, len, at);
         q->visibility = (int32_t)rd32(p, len, at + 4);
         uint32_t payload = rd32(p, len, at + 8);
+        if (q->visibility < 0 || q->visibility > 7) return E_INVALIDARG;
         if (q->type == 0) {
+            if (root_cost == 64) return E_INVALIDARG;
+            root_cost++;
+            if (!span_ok(len, payload, 8)) return E_INVALIDARG;
             q->nranges = rd32(p, len, payload);
             uint32_t ranges_at = rd32(p, len, payload + 4);
-            q->ranges = calloc(q->nranges + 1, sizeof *q->ranges);
-            uint32_t stride = version == 1 ? 20 : 24, running = 0;
+            uint32_t stride = version == 1 ? 20 : 24;
+            if (q->nranges == UINT32_MAX || ranges_at < 24 ||
+                !span_ok(len, ranges_at, (size_t)q->nranges * stride)) return E_INVALIDARG;
+            q->ranges = calloc((size_t)q->nranges + 1, sizeof *q->ranges);
+            if (!q->ranges) return E_OUTOFMEMORY;
+            uint32_t running = 0;
+            int append_valid = 1;
+            int table_has_sampler = 0, table_has_resource = 0;
             for (uint32_t k = 0; k < q->nranges; k++) {
-                size_t g = ranges_at + stride * k;
+                size_t g = (size_t)ranges_at + (size_t)stride * k;
                 range12 *x = &q->ranges[k];
                 x->type = (int32_t)rd32(p, len, g);
                 x->count = rd32(p, len, g + 4);
                 x->base = rd32(p, len, g + 8);
                 x->space = rd32(p, len, g + 12);
+                x->flags = version == 1 ? 0 : rd32(p, len, g + 16);
                 x->offset = rd32(p, len, g + (version == 1 ? 16 : 20));
-                if (x->offset == 0xFFFFFFFFu) x->offset = running;     // D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
-                running = x->offset + (x->count == 0xFFFFFFFFu ? 0 : x->count);
+                if (x->type < 0 || x->type > 3 || !x->count ||
+                    (version == 2 && !valid_descriptor_range_flags12(x->flags))) return E_INVALIDARG;
+                if (x->type == 3) table_has_sampler = 1;
+                else table_has_resource = 1;
+                if (table_has_sampler && table_has_resource) return E_INVALIDARG;
+                if (x->offset == UINT32_MAX) {
+                    if (!append_valid || running == UINT32_MAX) return E_INVALIDARG;
+                    x->offset = running;                              // D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                }
+                if (x->count == UINT32_MAX) append_valid = 0;
+                else {
+                    if (x->offset > UINT32_MAX - x->count) return E_INVALIDARG;
+                    running = x->offset + x->count;
+                    append_valid = 1;
+                }
             }
+            HRESULT hr = validate_table_ranges(q);
+            if (hr != S_OK) return hr;
         } else if (q->type == 1) {
+            if (!span_ok(len, payload, 12)) return E_INVALIDARG;
             q->reg = rd32(p, len, payload); q->space = rd32(p, len, payload + 4); q->n32 = rd32(p, len, payload + 8);
-        } else {
+            if (!q->n32 || q->n32 > 64 - root_cost) return E_INVALIDARG;
+            root_cost += q->n32;
+        } else if (q->type >= 2 && q->type <= 4) {
+            if (!span_ok(len, payload, version == 1 ? 8 : 12)) return E_INVALIDARG;
+            if (root_cost > 62) return E_INVALIDARG;
+            root_cost += 2;
             q->reg = rd32(p, len, payload); q->space = rd32(p, len, payload + 4);
+            q->flags = version == 1 ? 0 : rd32(p, len, payload + 8);
+            if (version == 2 && !valid_root_descriptor_flags12(q->flags)) return E_INVALIDARG;
+        } else {
+            return E_INVALIDARG;
         }
     }
-    r->samplers = calloc(r->nsamplers + 1, sizeof *r->samplers);
-    for (uint32_t i = 0; i < r->nsamplers; i++) {
+    r->samplers = calloc((size_t)nsamplers + 1, sizeof *r->samplers);
+    if (!r->samplers) return E_OUTOFMEMORY;
+    r->nsamplers = nsamplers;
+    for (uint32_t i = 0; i < nsamplers; i++) {
         uint32_t s[13];
-        for (int k = 0; k < 13; k++) s[k] = rd32(p, len, samplers_at + 52 * i + 4 * k);
+        size_t sampler_at = (size_t)samplers_at + 52 * (size_t)i;
+        for (int k = 0; k < 13; k++) s[k] = rd32(p, len, sampler_at + 4 * (size_t)k);
+        if (s[7] > 2 || s[12] > 7) return E_INVALIDARG;
         float bias, mn, mx;
         memcpy(&bias, &s[4], 4); memcpy(&mn, &s[8], 4); memcpy(&mx, &s[9], 4);
         static const float borders[3][4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 1 }, { 1, 1, 1, 1 } };
         r->samplers[i].reg = s[10];
         r->samplers[i].space = s[11];
+        r->samplers[i].visibility = (int32_t)s[12];
         r->samplers[i].state = make_sampler(d, (int32_t)s[0], (int32_t)s[1], (int32_t)s[2], (int32_t)s[3], bias, s[5], (int32_t)s[6], borders[s[7] < 3 ? s[7] : 0], mn, mx);
     }
-    return S_OK;
+    HRESULT hr = validate_root_bindings(r);
+    return hr == S_OK ? create_root_gpu_layout12(r) : hr;
 }
 
 // ---- samplers ---------------------------------------------------------------------------------------------------
@@ -451,6 +890,8 @@ static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int
 
 // ---- resources ----------------------------------------------------------------------------------------------------
 
+static void gpu12_release_mtl_object(void *object) { (void)CFBridgingRelease(object); }
+
 static void res_destroy(d3d_object *o) {
     res12 *r = (res12 *)o;
     dev12 *d = r->dev;
@@ -459,6 +900,26 @@ static void res_destroy(d3d_object *o) {
     if (r->buffer) [d->resources removeObjectIdenticalTo:r->buffer];
     if (r->texture) [d->resources removeObjectIdenticalTo:r->texture];
     pthread_mutex_unlock(&d->lock);
+    gpu_ir_resource_release(r->gpu_buffer);
+    r->gpu_buffer = NULL;
+    gpu_ir_resource_release(r->gpu_texture);
+    r->gpu_texture = NULL;
+    while (r->state_overrides) {
+        res_state_override12 *next = r->state_overrides->next;
+        free(r->state_overrides);
+        r->state_overrides = next;
+    }
+    while (r->pending_transitions) {
+        res_state_pending12 *next = r->pending_transitions->next;
+        free(r->pending_transitions);
+        r->pending_transitions = next;
+    }
+    free(r->mapped_subresources);
+    r->mapped_subresources = NULL;
+    if (r->owner_heap) {
+        d3d_release(&r->owner_heap->base);
+        r->owner_heap = NULL;
+    }
     r->buffer = nil;
     r->texture = nil;
     release_dev(o);
@@ -468,15 +929,236 @@ static WINAPI HRESULT res_query(void *this, const GUID *iid, void **out) {
     const GUID *k[] = { &IID_ID3D12Resource, &IID_ID3D12Resource1, &IID_ID3D12Resource2, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
     return query(this, iid, out, k, 6);
 }
+
+static int res_texture_cpu_access_valid12(res12 *resource, uint32_t subresource) {
+    if (!resource || !resource->texture || subresource >= resource->mapped_subresource_count ||
+        !__atomic_load_n(&resource->mapped_subresources[subresource], __ATOMIC_RELAXED)) return 0;
+    dev12 *device = resource->dev;
+    int valid = 1;
+    pthread_mutex_lock(&device->lock);
+    uint32_t state = resource->initial_state;
+    for (res_state_override12 *entry = resource->state_overrides; entry; entry = entry->next)
+        if (entry->subresource == subresource) { state = entry->state; break; }
+    for (res_state_pending12 *pending = resource->pending_transitions; pending; pending = pending->next)
+        if (pending->subresource == subresource || pending->subresource == D3D12_ALL_SUBRESOURCES) { valid = 0; break; }
+    if (state != 0) valid = 0;                                   // Textures require COMMON for CPU transfer.
+    pthread_mutex_unlock(&device->lock);
+    return valid;
+}
+
 static WINAPI HRESULT res_map(void *this, uint32_t sub, const RANGE *read, void **data) {
     res12 *r = this;
-    if (!r->buffer) return d3d_not_implemented("ID3D12Resource::Map of a texture");
-    if (data) *data = r->buffer.contents;
-    r->mapped++;
+    if (r->texture) {
+        if (sub >= r->mapped_subresource_count) return E_INVALIDARG;
+        if (data) *data = NULL;                                  // Opaque Metal texture layouts have no guest pointer.
+        __atomic_add_fetch(&r->mapped_subresources[sub], 1, __ATOMIC_RELAXED);
+        return S_OK;
+    }
+    if (!r->buffer) return E_INVALIDARG;
+    if (sub != 0) return E_INVALIDARG;
+    if (read && (read->begin > r->desc.Width || read->end > r->desc.Width)) return E_INVALIDARG;
+    int cpu_visible = r->heap.Type == 2 || r->heap.Type == 3 ||
+        (r->heap.Type == 4 && (r->heap.CPUPageProperty == 2 || r->heap.CPUPageProperty == 3));
+    if (!cpu_visible) return DXGI_ERROR_INVALID_CALL;
+    if (data) {
+        if (!r->buffer.contents) return E_FAIL;
+        *data = r->buffer.contents;
+    }
+    __atomic_add_fetch(&r->mapped, 1, __ATOMIC_RELAXED);
     return S_OK;
 }
-static WINAPI void res_unmap(void *this, uint32_t sub, const RANGE *written) { res12 *r = this; if (r->mapped) r->mapped--; }
+static WINAPI void res_unmap(void *this, uint32_t sub, const RANGE *written) {
+    res12 *r = this;
+    (void)written;
+    if (r->texture) {
+        if (sub >= r->mapped_subresource_count) return;
+        uint32_t mapped = __atomic_load_n(&r->mapped_subresources[sub], __ATOMIC_RELAXED);
+        while (mapped && !__atomic_compare_exchange_n(&r->mapped_subresources[sub], &mapped, mapped - 1, 0,
+                                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        return;
+    }
+    if (sub != 0 || !r->buffer) return;
+    uint32_t mapped = __atomic_load_n(&r->mapped, __ATOMIC_RELAXED);
+    while (mapped && !__atomic_compare_exchange_n(&r->mapped, &mapped, mapped - 1, 0,
+                                                   __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
+typedef struct {
+    uint32_t mip, block_width, block_height, bytes_per_block;
+    NSUInteger slice;
+    MTLOrigin origin;
+    MTLSize size;
+    uint64_t row_bytes, row_count, depth;
+    int empty;
+} res_texture_copy12;
+
+static uint64_t res_mip_extent12(uint64_t extent, uint32_t mip) {
+    if (mip >= 64) return 1;
+    extent >>= mip;
+    return extent ? extent : 1;
+}
+
+static int res_texture_copy_region12(res12 *resource, uint32_t subresource, const BOX *box,
+                                     res_texture_copy12 *copy) {
+    if (!copy) return 0;
+    memset(copy, 0, sizeof *copy);
+    if (!resource || !resource->texture) return 0;
+    if (resource->desc.SampleCount != 1 || d3d12_resource_plane_count(resource->desc.Format) != 1) return -1;
+    uint32_t mips = (uint32_t)resource->texture.mipmapLevelCount;
+    uint32_t array_size = resource->desc.Dimension == 4 ? 1u : resource->desc.DepthOrArraySize;
+    uint64_t plane_size = (uint64_t)mips * array_size;
+    if (!mips || !array_size || !plane_size || subresource >= plane_size) return 0;
+    copy->mip = subresource % mips;
+    copy->slice = resource->desc.Dimension == 4 ? 0 : subresource / mips;
+
+    uint64_t width = res_mip_extent12(resource->texture.width, copy->mip);
+    uint64_t height = resource->desc.Dimension == 2 ? 1 : res_mip_extent12(resource->texture.height, copy->mip);
+    uint64_t depth = resource->desc.Dimension == 4 ? res_mip_extent12(resource->texture.depth, copy->mip) : 1;
+    if (width > UINT32_MAX || height > UINT32_MAX || depth > UINT32_MAX) return 0;
+    BOX region = box ? *box : (BOX){ 0, 0, 0, (uint32_t)width, (uint32_t)height, (uint32_t)depth };
+    if (region.left >= region.right || region.top >= region.bottom || region.front >= region.back) {
+        copy->empty = 1;
+        return 1;
+    }
+    if (region.right > width || region.bottom > height || region.back > depth) return 0;
+    if (resource->desc.Dimension != 4 && (region.front != 0 || region.back != 1)) return 0;
+    if (resource->desc.Dimension == 2 && (region.top != 0 || region.bottom != 1)) return 0;
+    if (!d3d_copy_format_block(resource->desc.Format, &copy->block_width, &copy->block_height,
+                               &copy->bytes_per_block) || !copy->block_width || !copy->block_height ||
+        !copy->bytes_per_block) return -1;
+    if (region.left % copy->block_width || region.top % copy->block_height ||
+        (region.right != width && region.right % copy->block_width) ||
+        (region.bottom != height && region.bottom % copy->block_height)) return 0;
+    uint64_t region_width = region.right - region.left;
+    uint64_t region_height = region.bottom - region.top;
+    copy->row_bytes = (region_width / copy->block_width + (region_width % copy->block_width != 0)) *
+                      copy->bytes_per_block;
+    copy->row_count = region_height / copy->block_height + (region_height % copy->block_height != 0);
+    copy->depth = region.back - region.front;
+    if (!copy->row_bytes || !copy->row_count || !copy->depth || copy->row_bytes > SIZE_MAX) return 0;
+    copy->origin = MTLOriginMake(region.left, region.top, region.front);
+    copy->size = MTLSizeMake(region_width, region_height, copy->depth);
+    return 1;
+}
+
+static HRESULT res_texture_transfer12(res12 *resource, uint32_t subresource, const BOX *box,
+                                      void *memory, uint32_t row_pitch, uint32_t depth_pitch, int write) {
+    res_texture_copy12 copy;
+    int region_result = res_texture_copy_region12(resource, subresource, box, &copy);
+    if (region_result < 0) return DXGI_ERROR_UNSUPPORTED;
+    if (!region_result) return E_INVALIDARG;
+    if (copy.empty) return S_OK;
+    if (!memory) return E_POINTER;
+    uint64_t minimum_depth_pitch;
+    if (copy.row_bytes > UINT32_MAX || row_pitch < copy.row_bytes ||
+        copy.row_count > UINT64_MAX / row_pitch) return E_INVALIDARG;
+    minimum_depth_pitch = (uint64_t)row_pitch * copy.row_count;
+    if (copy.depth > 1 && depth_pitch < minimum_depth_pitch) return E_INVALIDARG;
+    if (!res_texture_cpu_access_valid12(resource, subresource)) return DXGI_ERROR_INVALID_CALL;
+
+    uint64_t staging_row_pitch = (copy.row_bytes + 255u) & ~UINT64_C(255);
+    if (staging_row_pitch < copy.row_bytes || copy.row_count > UINT64_MAX / staging_row_pitch) return E_INVALIDARG;
+    uint64_t staging_image_pitch = staging_row_pitch * copy.row_count;
+    if (copy.depth > UINT64_MAX / staging_image_pitch) return E_INVALIDARG;
+    uint64_t staging_size = staging_image_pitch * copy.depth;
+    if (!staging_size || staging_size > SIZE_MAX || staging_row_pitch > UINT32_MAX ||
+        staging_image_pitch > UINT32_MAX) return E_INVALIDARG;
+
+    dev12 *device = resource->dev;
+    HRESULT result = E_FAIL;
+    pthread_mutex_lock(&device->submit_lock);
+    if (!res_texture_cpu_access_valid12(resource, subresource)) {
+        pthread_mutex_unlock(&device->submit_lock);
+        return DXGI_ERROR_INVALID_CALL;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> staging = [device->mtl newBufferWithLength:(NSUInteger)staging_size
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> command_buffer = staging ? [device->cpu_transfer_queue commandBuffer] : nil;
+        id<MTLBlitCommandEncoder> blit = command_buffer ? [command_buffer blitCommandEncoder] : nil;
+        if (!staging || !command_buffer || !blit) {
+            result = E_OUTOFMEMORY;
+        } else {
+            uint8_t *bytes = staging.contents;
+            if (write) {
+                const uint8_t *source = memory;
+                for (uint64_t z = 0; z < copy.depth; z++)
+                    for (uint64_t y = 0; y < copy.row_count; y++)
+                        memcpy(bytes + z * staging_image_pitch + y * staging_row_pitch,
+                               source + z * depth_pitch + y * row_pitch, (size_t)copy.row_bytes);
+                [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:(NSUInteger)staging_row_pitch
+                    sourceBytesPerImage:(NSUInteger)staging_image_pitch sourceSize:copy.size toTexture:resource->texture
+                    destinationSlice:copy.slice destinationLevel:copy.mip destinationOrigin:copy.origin];
+            } else {
+                [blit copyFromTexture:resource->texture sourceSlice:copy.slice sourceLevel:copy.mip
+                    sourceOrigin:copy.origin sourceSize:copy.size toBuffer:staging destinationOffset:0
+                    destinationBytesPerRow:(NSUInteger)staging_row_pitch destinationBytesPerImage:(NSUInteger)staging_image_pitch];
+            }
+            [blit endEncoding];
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+                vx_log("D3D12: CPU texture transfer failed: %s",
+                       command_buffer.error.localizedDescription.UTF8String ?: "unknown Metal error");
+                result = E_FAIL;
+            } else {
+                if (!write) {
+                    uint8_t *destination = memory;
+                    const uint8_t *source = staging.contents;
+                    for (uint64_t z = 0; z < copy.depth; z++)
+                        for (uint64_t y = 0; y < copy.row_count; y++)
+                            memcpy(destination + z * depth_pitch + y * row_pitch,
+                                   source + z * staging_image_pitch + y * staging_row_pitch,
+                                   (size_t)copy.row_bytes);
+                }
+                result = S_OK;
+            }
+        }
+    }
+    pthread_mutex_unlock(&device->submit_lock);
+    return result;
+}
+
+static WINAPI HRESULT res_write_to_subresource(void *this, uint32_t subresource, const BOX *box,
+                                                const void *source, uint32_t row_pitch, uint32_t depth_pitch) {
+    res12 *resource = this;
+    if (resource->texture)
+        return res_texture_transfer12(resource, subresource, box, (void *)source, row_pitch, depth_pitch, 1);
+    if (!resource->buffer || subresource) return E_INVALIDARG;
+    if (box && (box->left >= box->right || box->top >= box->bottom || box->front >= box->back)) return S_OK;
+    if (!source) return E_POINTER;
+    if (!__atomic_load_n(&resource->mapped, __ATOMIC_RELAXED)) return DXGI_ERROR_INVALID_CALL;
+    if (resource->desc.Width > UINT32_MAX) return DXGI_ERROR_UNSUPPORTED;
+    BOX region = box ? *box : (BOX){ 0, 0, 0, (uint32_t)resource->desc.Width, 1, 1 };
+    if (region.top || region.bottom != 1 || region.front || region.back != 1 ||
+        region.right > resource->desc.Width || row_pitch < region.right - region.left) return E_INVALIDARG;
+    memcpy((uint8_t *)resource->buffer.contents + region.left, source, region.right - region.left);
+    return S_OK;
+}
+
+static WINAPI HRESULT res_read_from_subresource(void *this, void *destination, uint32_t row_pitch,
+                                                uint32_t depth_pitch, uint32_t subresource, const BOX *box) {
+    res12 *resource = this;
+    if (resource->texture)
+        return res_texture_transfer12(resource, subresource, box, destination, row_pitch, depth_pitch, 0);
+    if (!resource->buffer || subresource) return E_INVALIDARG;
+    if (box && (box->left >= box->right || box->top >= box->bottom || box->front >= box->back)) return S_OK;
+    if (!destination) return E_POINTER;
+    if (!__atomic_load_n(&resource->mapped, __ATOMIC_RELAXED)) return DXGI_ERROR_INVALID_CALL;
+    if (resource->desc.Width > UINT32_MAX) return DXGI_ERROR_UNSUPPORTED;
+    BOX region = box ? *box : (BOX){ 0, 0, 0, (uint32_t)resource->desc.Width, 1, 1 };
+    if (region.top || region.bottom != 1 || region.front || region.back != 1 ||
+        region.right > resource->desc.Width || row_pitch < region.right - region.left) return E_INVALIDARG;
+    memcpy(destination, (const uint8_t *)resource->buffer.contents + region.left, region.right - region.left);
+    return S_OK;
+}
+
 static WINAPI RES_DESC *res_get_desc(void *this, RES_DESC *out) { *out = ((res12 *)this)->desc; return out; }
+static WINAPI RES_DESC1 *res_get_desc1(void *this, RES_DESC1 *out) {
+    memset(out, 0, sizeof *out);
+    out->resource = ((res12 *)this)->desc;
+    return out;
+}
 static WINAPI uint64_t res_gpu_va(void *this) { res12 *r = this; return r->buffer ? r->buffer.gpuAddress : 0; }
 static WINAPI HRESULT res_get_heap_props(void *this, HEAP_PROPS *props, int32_t *flags) {
     if (props) *props = ((res12 *)this)->heap;
@@ -486,8 +1168,10 @@ static WINAPI HRESULT res_get_heap_props(void *this, HEAP_PROPS *props, int32_t 
 
 static uint32_t bytes_per(uint32_t format) { uint32_t b = 0; d3d_mtl_format(format, &b); return b; }
 
+static int d3d12_texture_atomic_format_supported(id<MTLDevice> mtl, uint32_t format);
+
 // The Metal texture a D3D12 texture description stands for (nil: a format it has no Metal counterpart for).
-static MTLTextureDescriptor *texture_descriptor(const RES_DESC *desc) {
+static MTLTextureDescriptor *texture_descriptor(dev12 *d, const RES_DESC *desc) {
     uint32_t bpp = 0;
     MTLPixelFormat fmt = d3d_mtl_format(desc->Format, &bpp);
     if (desc->Flags & 0x2) {                                       // ALLOW_DEPTH_STENCIL: a typeless format as its depth format
@@ -514,35 +1198,97 @@ static MTLTextureDescriptor *texture_descriptor(const RES_DESC *desc) {
     if (desc->SampleCount > 1) { td.textureType = desc->DepthOrArraySize > 1 ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample; td.sampleCount = desc->SampleCount; td.mipmapLevelCount = 1; }
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     if (desc->Flags & 0x4) td.usage |= MTLTextureUsageShaderWrite;              // ALLOW_UNORDERED_ACCESS
+    if ((desc->Flags & 0x4) && desc->SampleCount <= 1 && d3d12_texture_atomic_format_supported(d->mtl, desc->Format))
+        td.usage |= MTLTextureUsageShaderAtomic;
     if (desc->Flags & 0x3) td.usage |= MTLTextureUsageRenderTarget;             // ALLOW_RENDER_TARGET, ALLOW_DEPTH_STENCIL
     td.storageMode = MTLStorageModePrivate;
     return td;
 }
 
 // A committed resource (heap nil) or one placed in a heap at an offset.
-static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, memheap12 *in, uint64_t offset, const GUID *iid, void **out) {
+static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t initial_state,
+                               memheap12 *in, uint64_t offset, const GUID *iid, void **out) {
+    const uint32_t generic_read = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX | D3D12_STATE_NON_PIXEL_SHADER |
+        D3D12_STATE_PIXEL_SHADER | D3D12_STATE_INDIRECT | D3D12_STATE_COPY_SOURCE;
+    uint64_t required_alignment = 0;
+    if (!hp || !desc) return E_INVALIDARG;
+    if ((hp->Type == 2 && (uint32_t)initial_state != generic_read) ||
+        (hp->Type == 3 && (uint32_t)initial_state != D3D12_STATE_COPY_DEST) ||
+        !resource_alignment12(desc, &required_alignment)) return E_INVALIDARG;
     res12 *r = alloc12(sizeof *r, K12_RESOURCE, g_resource_vtbl, d);
     r->base.destroy = res_destroy;
     r->desc = *desc;
     r->heap = *hp;
     r->heap_flags = heap_flags;
+    r->residency_refs = in ? 0 : 1;
+    r->residency_priority = desc->Flags & 0x7u ? VX12_RESIDENCY_PRIORITY_HIGH : VX12_RESIDENCY_PRIORITY_NORMAL;
+    r->owner_heap = in;
+    if (in) d3d_addref(&in->base);
+    r->initial_state = (uint32_t)initial_state;
+    r->initial_promoted = 0;
     if (desc->Dimension == 1) {                                    // D3D12_RESOURCE_DIMENSION_BUFFER
         NSUInteger len = desc->Width ? desc->Width : 1;
         if (in) r->buffer = [in->heap newBufferWithLength:len options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked offset:offset];
         else r->buffer = [d->mtl newBufferWithLength:len options:MTLResourceStorageModeShared];
         if (!r->buffer) { d3d_release(&r->base); return in ? E_INVALIDARG : E_OUTOFMEMORY; }
+        void *backend = (void *)CFBridgingRetain(r->buffer);
+        r->gpu_buffer = gpu_ir_buffer_create(r->buffer.length, backend, gpu12_release_mtl_object);
+        if (!r->gpu_buffer) {
+            gpu12_release_mtl_object(backend);
+            d3d_release(&r->base);
+            return E_OUTOFMEMORY;
+        }
         vx_guest_forget(r->buffer.contents, r->buffer.length);
         if (!in && hp->Type != 2) memset(r->buffer.contents, 0, r->buffer.length);   // (default and readback heaps start zeroed)
     } else {
-        MTLTextureDescriptor *td = texture_descriptor(desc);
+        MTLTextureDescriptor *td = texture_descriptor(d, desc);
         if (!td) { d3d_release(&r->base); return E_INVALIDARG; }
-        if (in) {
-            td.storageMode = in->heap.storageMode;
-            td.hazardTrackingMode = MTLHazardTrackingModeTracked;
-            r->texture = [in->heap newTextureWithDescriptor:td offset:offset];
-        } else r->texture = [d->mtl newTextureWithDescriptor:td];
-        if (!r->texture) { d3d_release(&r->base); return in ? E_INVALIDARG : E_OUTOFMEMORY; }
+        int texture_exception = 0;
+        @try {
+            if (in) {
+                td.storageMode = in->heap.storageMode;
+                td.hazardTrackingMode = MTLHazardTrackingModeTracked;
+                r->texture = [in->heap newTextureWithDescriptor:td offset:offset];
+            } else r->texture = [d->mtl newTextureWithDescriptor:td];
+        } @catch (NSException *exception) {
+            texture_exception = 1;
+            vx_log("D3D12: Metal rejected texture resource: %s",
+                   exception.reason.UTF8String ? exception.reason.UTF8String : "unknown Metal exception");
+        }
+        if (!r->texture) { d3d_release(&r->base); return texture_exception || in ? E_INVALIDARG : E_OUTOFMEMORY; }
         if (r->desc.MipLevels == 0) r->desc.MipLevels = (uint16_t)td.mipmapLevelCount;
+        uint64_t mapped_subresources = (uint64_t)r->desc.MipLevels *
+            (r->desc.Dimension == 4 ? 1u : r->desc.DepthOrArraySize) * d3d12_resource_plane_count(r->desc.Format);
+        if (!mapped_subresources || mapped_subresources > UINT32_MAX ||
+            mapped_subresources > SIZE_MAX / sizeof *r->mapped_subresources) {
+            d3d_release(&r->base);
+            return E_INVALIDARG;
+        }
+        r->mapped_subresources = calloc((size_t)mapped_subresources, sizeof *r->mapped_subresources);
+        if (!r->mapped_subresources) { d3d_release(&r->base); return E_OUTOFMEMORY; }
+        r->mapped_subresource_count = (uint32_t)mapped_subresources;
+        uint32_t block_width = 1, block_height = 1, bytes_per_block = bytes_per(desc->Format);
+        d3d_copy_format_block(desc->Format, &block_width, &block_height, &bytes_per_block);
+        gpu_ir_texture_desc ir_desc = {
+            .width = (uint32_t)r->texture.width,
+            .height = (uint32_t)r->texture.height,
+            .depth = (uint32_t)r->texture.depth,
+            .array_layers = (uint32_t)r->texture.arrayLength,
+            .mip_levels = (uint32_t)r->texture.mipmapLevelCount,
+            .bytes_per_texel = bytes_per(desc->Format),
+            .sample_count = (uint32_t)r->texture.sampleCount,
+            .is_3d = r->texture.textureType == MTLTextureType3D,
+            .block_width = block_width,
+            .block_height = block_height,
+            .bytes_per_block = bytes_per_block
+        };
+        void *backend = (void *)CFBridgingRetain(r->texture);
+        r->gpu_texture = gpu_ir_texture_create(&ir_desc, backend, gpu12_release_mtl_object);
+        if (!r->gpu_texture) {
+            gpu12_release_mtl_object(backend);
+            d3d_release(&r->base);
+            return E_OUTOFMEMORY;
+        }
     }
     pthread_mutex_lock(&d->lock);
     [d->resources addObject:r->buffer ? (id)r->buffer : (id)r->texture];
@@ -558,7 +1304,7 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
 }
 
 static HRESULT create_committed(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
-    return create_resource(d, hp, heap_flags, desc, NULL, 0, iid, out);
+    return create_resource(d, hp, heap_flags, desc, state, NULL, 0, iid, out);
 }
 
 // ---- heaps and placed resources -----------------------------------------------------------------------------------
@@ -572,40 +1318,187 @@ static WINAPI MEMHEAP_DESC *memheap_get_desc(void *this, MEMHEAP_DESC *out) { *o
 static WINAPI HRESULT memheap_session(void *this, const GUID *iid, void **out) { if (out) *out = NULL; return E_NOINTERFACE; }
 
 // D3D12's alignments (64 KiB, 4 MiB for multisampled textures) are larger than Metal's, so offsets a program
-// computes with them are valid in a Metal heap too.
-static ALLOC_INFO allocation_info(dev12 *d, const RES_DESC *desc) {
-    ALLOC_INFO a = { 0, desc->Alignment ? desc->Alignment : desc->SampleCount > 1 ? 4u << 20 : 64u << 10 };
-    MTLSizeAndAlign m;
-    if (desc->Dimension == 1) m = [d->mtl heapBufferSizeAndAlignWithLength:desc->Width ? desc->Width : 1 options:MTLResourceStorageModeShared];
-    else {
-        MTLTextureDescriptor *td = texture_descriptor(desc);
-        if (!td) return (ALLOC_INFO){ UINT64_MAX, a.Alignment };
-        m = [d->mtl heapTextureSizeAndAlignWithDescriptor:td];
+// computes with them are valid in a Metal heap too. Small-resource eligibility follows the public D3D12 estimate:
+// build near-equilateral power-of-two tiles from the smaller alignment restriction, then allow at most 16 tiles for
+// ordinary textures or 64 tiles for MSAA textures. Array layers are separate subresources and do not multiply the
+// estimate for the most-detailed mip.
+static uint32_t resource_floor_log2_12(uint64_t value) {
+    uint32_t result = 0;
+    while (value >>= 1) result++;
+    return result;
+}
+
+static int resource_tile_shape12(uint64_t tile_size, uint32_t bytes_per_element, uint32_t dimensions,
+                                uint32_t shape[3]) {
+    if (!bytes_per_element || tile_size < bytes_per_element || !dimensions || dimensions > 3 || !shape) return 0;
+    uint64_t elements = tile_size / bytes_per_element;
+    uint32_t total_log2 = resource_floor_log2_12(elements);
+    uint32_t exponents[3] = { total_log2, 0, 0 };
+    if (dimensions == 2) {
+        uint32_t best_spread = UINT32_MAX;
+        for (uint32_t x = 0; x <= total_log2; x++) {
+            uint32_t y = total_log2 - x;
+            uint32_t spread = x > y ? x - y : y - x;
+            if (spread < best_spread) {
+                exponents[0] = x;
+                exponents[1] = y;
+                best_spread = spread;
+            }
+        }
+    } else if (dimensions == 3) {
+        uint32_t best_spread = UINT32_MAX;
+        for (uint32_t x = 0; x <= total_log2; x++) {
+            for (uint32_t y = 0; y <= total_log2 - x; y++) {
+                uint32_t z = total_log2 - x - y;
+                uint32_t min = x < y ? x : y;
+                uint32_t max = x > y ? x : y;
+                if (z < min) min = z;
+                if (z > max) max = z;
+                uint32_t spread = max - min;
+                if (spread < best_spread) {
+                    exponents[0] = x;
+                    exponents[1] = y;
+                    exponents[2] = z;
+                    best_spread = spread;
+                }
+            }
+        }
     }
-    if (m.align > a.Alignment) a.Alignment = m.align;
-    a.SizeInBytes = (m.size + a.Alignment - 1) & ~(a.Alignment - 1);
+    // Stable, widest-to-deepest ordering makes the generated tile dimensions deterministic when axes are tied.
+    for (uint32_t i = 0; i < dimensions; i++) {
+        for (uint32_t j = i + 1; j < dimensions; j++) {
+            if (exponents[j] > exponents[i]) {
+                uint32_t t = exponents[i]; exponents[i] = exponents[j]; exponents[j] = t;
+            }
+        }
+    }
+    shape[0] = 1u << exponents[0];
+    shape[1] = dimensions > 1 ? 1u << exponents[1] : 1;
+    shape[2] = dimensions > 2 ? 1u << exponents[2] : 1;
+    return 1;
+}
+
+static uint64_t resource_axis_tile_count12(uint64_t extent, uint32_t block_extent, uint32_t tile_extent) {
+    if (!extent || !block_extent || !tile_extent) return 0;
+    uint64_t blocks = extent / block_extent + (extent % block_extent != 0);
+    return blocks / tile_extent + (blocks % tile_extent != 0);
+}
+
+static int small_texture12(const RES_DESC *desc, uint64_t tile_size, int multisampled) {
+    if (desc->Dimension < 2 || desc->Dimension > 4) return 0; // 1D, 2D, or 3D texture.
+    if (desc->Layout != 0 || !desc->Width || !desc->DepthOrArraySize || !desc->Format) return 0;
+    if (desc->Dimension == 2 && desc->Height != 1) return 0;
+    if (desc->Dimension >= 3 && !desc->Height) return 0;
+    if (multisampled) {
+        if (desc->Dimension != 3 || !(desc->Flags & 0x3) ||
+            (desc->SampleCount != 2 && desc->SampleCount != 4 && desc->SampleCount != 8 && desc->SampleCount != 16)) return 0;
+    } else if (desc->SampleCount != 1 || (desc->Flags & 0x3)) return 0;
+
+    uint32_t block_width = 1, block_height = 1, bytes_per_block = 0;
+    if (!d3d_copy_format_block(desc->Format, &block_width, &block_height, &bytes_per_block) ||
+        !block_width || !block_height || !bytes_per_block) return 0;
+    uint64_t bytes_per_element = (uint64_t)bytes_per_block * (multisampled ? desc->SampleCount : 1u);
+    if (!bytes_per_element || bytes_per_element > UINT32_MAX) return 0;
+    uint32_t tile[3];
+    uint32_t dimensions = desc->Dimension - 1; // Buffer=1, Texture1D=2, Texture2D=3, Texture3D=4.
+    if (!resource_tile_shape12(tile_size, (uint32_t)bytes_per_element, dimensions, tile)) return 0;
+
+    uint64_t count[3] = {
+        resource_axis_tile_count12(desc->Width, block_width, tile[0]),
+        dimensions > 1 ? resource_axis_tile_count12(desc->Height, block_height, tile[1]) : 1,
+        dimensions > 2 ? resource_axis_tile_count12(desc->DepthOrArraySize, 1, tile[2]) : 1
+    };
+    uint64_t max_tiles = tile_size == (4u << 10) ? 16 : tile_size == (64u << 10) ? 64 : 0;
+    if (!max_tiles) return 0;
+    uint64_t total = 1;
+    for (uint32_t i = 0; i < dimensions; i++) {
+        if (!count[i] || count[i] > max_tiles / total) return 0;
+        total *= count[i];
+    }
+    return total <= max_tiles;
+}
+
+static int resource_alignment12(const RES_DESC *desc, uint64_t *alignment) {
+    if (!desc || !alignment || !desc->Width || !desc->SampleCount || desc->SampleQuality) return 0;
+    uint64_t requested = desc->Alignment;
+    if (!requested) requested = desc->SampleCount > 1 ? (4u << 20) : (64u << 10);
+    if (requested != (4u << 10) && requested != (64u << 10) && requested != (4u << 20)) return 0;
+    if (desc->Dimension == 1) {
+        if (desc->SampleCount != 1 || requested != (64u << 10)) return 0;
+    } else if (desc->Dimension >= 2 && desc->Dimension <= 4) {
+        if (desc->SampleCount > 1) {
+            if (requested == (4u << 10) ||
+                (requested == (64u << 10) && !small_texture12(desc, 64u << 10, 1))) return 0;
+        } else if (requested == (4u << 10) && !small_texture12(desc, 4u << 10, 0)) return 0;
+    } else return 0;
+    *alignment = requested;
+    return 1;
+}
+
+static int align_up_resource12(uint64_t value, uint64_t alignment, uint64_t *result) {
+    uint64_t remainder = value % alignment;
+    uint64_t padding = remainder ? alignment - remainder : 0;
+    if (value > UINT64_MAX - padding) return 0;
+    *result = value + padding;
+    return 1;
+}
+
+static ALLOC_INFO allocation_info(dev12 *d, const RES_DESC *desc) {
+    uint64_t requested_alignment = 0;
+    if (!resource_alignment12(desc, &requested_alignment)) return (ALLOC_INFO){ UINT64_MAX, 0 };
+    ALLOC_INFO a = { 0, requested_alignment };
+    MTLSizeAndAlign m;
+    @try {
+        if (desc->Dimension == 1) m = [d->mtl heapBufferSizeAndAlignWithLength:desc->Width ? desc->Width : 1 options:MTLResourceStorageModeShared];
+        else {
+            MTLTextureDescriptor *td = texture_descriptor(d, desc);
+            if (!td) return (ALLOC_INFO){ UINT64_MAX, a.Alignment };
+            m = [d->mtl heapTextureSizeAndAlignWithDescriptor:td];
+        }
+    } @catch (NSException *exception) {
+        (void)exception;
+        return (ALLOC_INFO){ UINT64_MAX, a.Alignment };
+    }
+    // Report one of D3D12's public alignment values even if Metal asks for an intermediate alignment.
+    if (m.align > a.Alignment) {
+        if (m.align <= (64u << 10) && a.Alignment <= (64u << 10)) a.Alignment = 64u << 10;
+        else if (m.align <= (4u << 20) && a.Alignment <= (4u << 20)) a.Alignment = 4u << 20;
+        else return (ALLOC_INFO){ UINT64_MAX, a.Alignment };
+    }
+    if (!align_up_resource12(m.size, a.Alignment, &a.SizeInBytes)) return (ALLOC_INFO){ UINT64_MAX, a.Alignment };
     return a;
 }
 
 static WINAPI ALLOC_INFO *dev_allocation_info(void *this, ALLOC_INFO *out, uint32_t mask, uint32_t n, const RES_DESC *descs) {
-    ALLOC_INFO all = { 0, 64u << 10 };
+    (void)mask;
+    ALLOC_INFO all = { 0, 0 };
     for (uint32_t i = 0; i < n; i++) {
         ALLOC_INFO a = allocation_info(this, &descs[i]);
         if (a.SizeInBytes == UINT64_MAX) { *out = a; return out; }
         if (a.Alignment > all.Alignment) all.Alignment = a.Alignment;
-        all.SizeInBytes = ((all.SizeInBytes + a.Alignment - 1) & ~(a.Alignment - 1)) + a.SizeInBytes;
+        uint64_t at;
+        if (!align_up_resource12(all.SizeInBytes, a.Alignment, &at) || at > UINT64_MAX - a.SizeInBytes) {
+            *out = (ALLOC_INFO){ UINT64_MAX, all.Alignment };
+            return out;
+        }
+        all.SizeInBytes = at + a.SizeInBytes;
     }
     *out = all;
     return out;
 }
 static WINAPI ALLOC_INFO *dev_allocation_info1(void *this, ALLOC_INFO *out, uint32_t mask, uint32_t n, const RES_DESC *descs, ALLOC_INFO *each) {
+    (void)mask;
     // (each: D3D12_RESOURCE_ALLOCATION_INFO1 {Offset, Alignment, SizeInBytes})
-    ALLOC_INFO all = { 0, 64u << 10 };
+    ALLOC_INFO all = { 0, 0 };
     for (uint32_t i = 0; i < n; i++) {
         ALLOC_INFO a = allocation_info(this, &descs[i]);
         if (a.SizeInBytes == UINT64_MAX) { *out = a; return out; }
         if (a.Alignment > all.Alignment) all.Alignment = a.Alignment;
-        uint64_t at = (all.SizeInBytes + a.Alignment - 1) & ~(a.Alignment - 1);
+        uint64_t at;
+        if (!align_up_resource12(all.SizeInBytes, a.Alignment, &at) || at > UINT64_MAX - a.SizeInBytes) {
+            *out = (ALLOC_INFO){ UINT64_MAX, all.Alignment };
+            return out;
+        }
         if (each) { uint64_t *e = (uint64_t *)each + 3 * i; e[0] = at; e[1] = a.Alignment; e[2] = a.SizeInBytes; }
         all.SizeInBytes = at + a.SizeInBytes;
     }
@@ -615,7 +1508,8 @@ static WINAPI ALLOC_INFO *dev_allocation_info1(void *this, ALLOC_INFO *out, uint
 
 static WINAPI HRESULT dev_create_memheap(void *this, const MEMHEAP_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
-    if (!desc || !desc->SizeInBytes) return E_INVALIDARG;
+    if (!desc || !desc->SizeInBytes || (desc->Flags & 0x8) || // ALLOW_DISPLAY is committed-resource-only
+        (desc->Alignment && desc->Alignment != (64u << 10) && desc->Alignment != (4u << 20))) return E_INVALIDARG;
     MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
     hd.type = MTLHeapTypePlacement;
     hd.size = desc->SizeInBytes;
@@ -630,6 +1524,8 @@ static WINAPI HRESULT dev_create_memheap(void *this, const MEMHEAP_DESC *desc, c
     memheap12 *m = alloc12(sizeof *m, K12_MEMHEAP, g_memheap_vtbl, d);
     m->base.destroy = memheap_destroy;
     m->desc = *desc;
+    m->residency_refs = 1;
+    m->residency_priority = VX12_RESIDENCY_PRIORITY_NORMAL;
     if (!m->desc.Alignment) m->desc.Alignment = 64u << 10;
     m->heap = h;
     HRESULT hr = memheap_query(m, iid, out);
@@ -637,28 +1533,49 @@ static WINAPI HRESULT dev_create_memheap(void *this, const MEMHEAP_DESC *desc, c
     return hr;
 }
 static WINAPI HRESULT dev_create_memheap1(void *this, const MEMHEAP_DESC *desc, void *session, const GUID *iid, void **out) {
+    if (session) { if (out) *out = NULL; return DXGI_ERROR_UNSUPPORTED; }
     return dev_create_memheap(this, desc, iid, out);
+}
+
+// D3D12_HEAP_FLAGS constrain the resource classes a placed resource may use. These bits are
+// also used by the ALLOW_ONLY_* aliases, so check the individual deny bits rather than comparing
+// the full flag value. Committed resources get their implicit heap restrictions from D3D12.
+static int heap_flags_allow_placed_resource12(int32_t heap_flags, const RES_DESC *desc) {
+    if (!desc) return 0;
+    uint32_t flags = (uint32_t)heap_flags;
+    if (desc->Dimension == 1) return (flags & 0x4u) == 0;          // DENY_BUFFERS
+    if (desc->Dimension < 2 || desc->Dimension > 4) return 0;    // texture1D/2D/3D only
+    if (desc->Flags & 0x3) return (flags & 0x40u) == 0;           // DENY_RT_DS_TEXTURES
+    return (flags & 0x80u) == 0;                                 // DENY_NON_RT_DS_TEXTURES
 }
 
 static WINAPI HRESULT dev_create_placed(void *this, void *heap, uint64_t offset, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
     memheap12 *m = heap;
     if (!m || m->base.kind != K12_MEMHEAP || !desc) return E_INVALIDARG;
-    // (D3D12 lets small textures take 4 KiB alignment; what Metal needs at the offset is what is checked)
+    if (!heap_flags_allow_placed_resource12(m->desc.Flags, desc)) return E_INVALIDARG;
+    uint64_t required_alignment = 0;
+    if (!resource_alignment12(desc, &required_alignment) || offset % required_alignment) return E_INVALIDARG;
     dev12 *d = this;
-    MTLTextureDescriptor *td = desc->Dimension == 1 ? nil : texture_descriptor(desc);
+    MTLTextureDescriptor *td = desc->Dimension == 1 ? nil : texture_descriptor(d, desc);
     if (desc->Dimension != 1 && !td) return E_INVALIDARG;
     MTLSizeAndAlign ma = td ? [d->mtl heapTextureSizeAndAlignWithDescriptor:td]
                             : [d->mtl heapBufferSizeAndAlignWithLength:desc->Width ? desc->Width : 1 options:MTLResourceStorageModeShared];
-    if (offset % ma.align || offset + ma.size > m->desc.SizeInBytes) {
+    if (offset % ma.align || offset > m->desc.SizeInBytes || ma.size > m->desc.SizeInBytes - offset) {
         vx_log("D3D12: a resource placed at %llu does not fit in its heap of %llu bytes", (unsigned long long)offset, (unsigned long long)m->desc.SizeInBytes);
         return E_INVALIDARG;
     }
     if (desc->Dimension == 1 && m->heap.storageMode != MTLStorageModeShared) return E_INVALIDARG;
-    return create_resource(this, &m->desc.Properties, m->desc.Flags, desc, m, offset, iid, out);
+    return create_resource(this, &m->desc.Properties, m->desc.Flags, desc, state, m, offset, iid, out);
 }
-static WINAPI HRESULT dev_create_placed1(void *this, void *heap, uint64_t offset, const void *desc1, int32_t state, const void *clear, const GUID *iid, void **out) {
-    // (D3D12_RESOURCE_DESC1: D3D12_RESOURCE_DESC followed by a sampler feedback mip region)
-    return dev_create_placed(this, heap, offset, desc1, state, clear, iid, out);
+static WINAPI HRESULT dev_create_placed1(void *this, void *heap, uint64_t offset, const RES_DESC1 *desc1,
+                                         int32_t state, const void *clear, const GUID *iid, void **out) {
+    if (!desc1) { if (out) *out = NULL; return E_INVALIDARG; }
+    if (desc1->sampler_feedback_mip_region.Width || desc1->sampler_feedback_mip_region.Height ||
+        desc1->sampler_feedback_mip_region.Depth) {
+        if (out) *out = NULL;
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    return dev_create_placed(this, heap, offset, &desc1->resource, state, clear, iid, out);
 }
 
 // ---- query heaps -----------------------------------------------------------------------------------------------------
@@ -669,6 +1586,15 @@ static WINAPI HRESULT queryheap_query(void *this, const GUID *iid, void **out) {
     return query(this, iid, out, k, 4);
 }
 
+static int d3d12_copy_timestamp_counters_supported12(dev12 *device) {
+    // Copy-queue timestamps are sampled between blit operations. Stage-boundary support alone only
+    // covers encoder boundaries; Metal exposes the needed in-encoder sampling as AtBlitBoundary.
+    if (!device || ![device->mtl supportsCounterSampling:MTLCounterSamplingPointAtBlitBoundary]) return 0;
+    for (id<MTLCounterSet> set in device->mtl.counterSets)
+        if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) return 1;
+    return 0;
+}
+
 static WINAPI HRESULT dev_create_query_heap(void *this, const uint32_t *desc, const GUID *iid, void **out) {
     // D3D12_QUERY_HEAP_DESC: Type, Count, NodeMask
     dev12 *d = this;
@@ -677,9 +1603,11 @@ static WINAPI HRESULT dev_create_query_heap(void *this, const uint32_t *desc, co
     uint32_t count = desc[1], stride = type == 2 ? 88 : type == 7 ? 112 : type == 3 ? 16 : 8;
     id<MTLCounterSampleBuffer> samples = nil;
     if (type == 1 || type == 5) {
+        if (type == 5 && !d3d12_copy_timestamp_counters_supported12(d)) return E_INVALIDARG;
         id<MTLCounterSet> set = nil;
         for (id<MTLCounterSet> cs in d->mtl.counterSets) if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) set = cs;
-        if (!set || ![d->mtl supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { vx_log("D3D12: this GPU samples no timestamps"); return E_FAIL; }
+        MTLCounterSamplingPoint sampling_point = type == 5 ? MTLCounterSamplingPointAtBlitBoundary : MTLCounterSamplingPointAtStageBoundary;
+        if (!set || ![d->mtl supportsCounterSampling:sampling_point]) { vx_log("D3D12: this GPU samples no timestamps"); return E_FAIL; }
         MTLCounterSampleBufferDescriptor *sd = [MTLCounterSampleBufferDescriptor new];
         sd.counterSet = set;
         sd.sampleCount = count;
@@ -694,6 +1622,8 @@ static WINAPI HRESULT dev_create_query_heap(void *this, const uint32_t *desc, co
     q->type = type;
     q->count = count;
     q->stride = stride;
+    q->residency_refs = 1;
+    q->residency_priority = VX12_RESIDENCY_PRIORITY_NORMAL;
     q->results = [d->mtl newBufferWithLength:(NSUInteger)count * stride options:MTLResourceStorageModeShared];
     memset(q->results.contents, 0, q->results.length);
     q->samples = samples;
@@ -715,8 +1645,20 @@ static void heap_destroy(d3d_object *o) {
     pthread_mutex_lock(&g_heaps_lock);
     for (uint32_t i = 0; i < g_nheaps; i++) if (g_heaps[i] == h) { g_heaps[i] = g_heaps[--g_nheaps]; break; }
     pthread_mutex_unlock(&g_heaps_lock);
-    for (uint32_t i = 0; i < h->desc.NumDescriptors; i++) h->keep[i] = nil;
+    for (uint32_t i = 0; i < h->desc.NumDescriptors; i++) {
+        if (h->keep) h->keep[i] = nil;
+        if (h->buffer_view) gpu_ir_buffer_view_release(h->buffer_view[i]);
+        if (h->shader_view && h->shader_view[i].resource) d3d_release(&h->shader_view[i].resource->base);
+        if (h->shader_view && h->shader_view[i].counter_resource) d3d_release(&h->shader_view[i].counter_resource->base);
+        if (h->target_resource && h->target_resource[i]) d3d_release(&h->target_resource[i]->base);
+    }
     free((void *)h->keep);
+    free(h->descriptor_kind);
+    free(h->buffer_view);
+    free(h->shader_view);
+    free(h->target_resource);
+    free(h->target_subresource);
+    free(h->target_flags);
     if (!h->gpu) free(h->cpu);
     h->gpu = nil;
     release_dev(o);
@@ -734,6 +1676,65 @@ static heap12 *heap_at(size_t cpu, uint32_t *index) {
     return found;
 }
 
+static heap12 *heap_cpu_descriptor(size_t cpu, uint32_t *index) {
+    uint32_t found_index = 0;
+    heap12 *heap = heap_at(cpu, &found_index);
+    if (!heap || (cpu - (size_t)heap->cpu) % 32u) return NULL;
+    if (index) *index = found_index;
+    return heap;
+}
+
+static heap12 *heap_gpu_descriptor(uint64_t gpu, uint32_t *index) {
+    pthread_mutex_lock(&g_heaps_lock);
+    heap12 *found = NULL;
+    uint32_t found_index = 0;
+    for (uint32_t i = 0; i < g_nheaps; i++) {
+        heap12 *heap = g_heaps[i];
+        if (!heap->gpu) continue;
+        uint64_t base = heap->gpu.gpuAddress;
+        uint64_t bytes = (uint64_t)heap->desc.NumDescriptors * 32u;
+        if (gpu < base || gpu - base >= bytes || (gpu - base) % 32u) continue;
+        found = heap;
+        found_index = (uint32_t)((gpu - base) / 32u);
+        break;
+    }
+    pthread_mutex_unlock(&g_heaps_lock);
+    if (found && index) *index = found_index;
+    return found;
+}
+
+static int heap_uav_views_match12(const heap12 *cpu_heap, uint32_t cpu_index,
+                                  const heap12 *gpu_heap, uint32_t gpu_index) {
+    if (!cpu_heap || !gpu_heap || cpu_index >= cpu_heap->desc.NumDescriptors ||
+        gpu_index >= gpu_heap->desc.NumDescriptors ||
+        !cpu_heap->descriptor_kind || !gpu_heap->descriptor_kind ||
+        cpu_heap->descriptor_kind[cpu_index] != DXIL_UAV + 1 ||
+        gpu_heap->descriptor_kind[gpu_index] != DXIL_UAV + 1) return 0;
+    shader_view12 *cpu_view = cpu_heap->shader_view ? &cpu_heap->shader_view[cpu_index] : NULL;
+    shader_view12 *gpu_view = gpu_heap->shader_view ? &gpu_heap->shader_view[gpu_index] : NULL;
+    if (!cpu_view || !gpu_view || !cpu_view->resource || cpu_view->resource != gpu_view->resource ||
+        cpu_view->counter_resource != gpu_view->counter_resource || cpu_view->counter_offset != gpu_view->counter_offset ||
+        cpu_view->mip != gpu_view->mip || cpu_view->mips != gpu_view->mips ||
+        cpu_view->slice != gpu_view->slice || cpu_view->slices != gpu_view->slices ||
+        cpu_view->plane != gpu_view->plane) return 0;
+    VxDesc cpu_desc, gpu_desc;
+    memcpy(&cpu_desc, cpu_heap->cpu + 32ull * cpu_index, sizeof cpu_desc);
+    memcpy(&gpu_desc, gpu_heap->cpu + 32ull * gpu_index, sizeof gpu_desc);
+    if (cpu_desc.va != gpu_desc.va || cpu_desc.res != gpu_desc.res || cpu_desc.size != gpu_desc.size || cpu_desc.stride != gpu_desc.stride ||
+        cpu_desc.fmt != gpu_desc.fmt || cpu_desc.flags != gpu_desc.flags) return 0;
+    gpu_ir_buffer_view *cpu_buffer_view = cpu_heap->buffer_view ? cpu_heap->buffer_view[cpu_index] : NULL;
+    gpu_ir_buffer_view *gpu_buffer_view = gpu_heap->buffer_view ? gpu_heap->buffer_view[gpu_index] : NULL;
+    if (!!cpu_buffer_view != !!gpu_buffer_view) return 0;
+    if (cpu_buffer_view) {
+        const gpu_ir_buffer_view_desc *a = gpu_ir_buffer_view_description(cpu_buffer_view);
+        const gpu_ir_buffer_view_desc *b = gpu_ir_buffer_view_description(gpu_buffer_view);
+        if (!a || !b || a->kind != b->kind || a->byte_offset != b->byte_offset ||
+            a->byte_size != b->byte_size || a->element_count != b->element_count ||
+            a->element_size != b->element_size || a->structure_stride != b->structure_stride) return 0;
+    }
+    return 1;
+}
+
 static WINAPI HRESULT heap_query(void *this, const GUID *iid, void **out) {
     const GUID *k[] = { &IID_ID3D12DescriptorHeap, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
     return query(this, iid, out, k, 4);
@@ -743,24 +1744,140 @@ static WINAPI size_t *heap_cpu_start(void *this, size_t *out) { *out = (size_t)(
 static WINAPI uint64_t *heap_gpu_start(void *this, uint64_t *out) { heap12 *h = this; *out = h->gpu ? h->gpu.gpuAddress : 0; return out; }
 
 // Writes a descriptor and holds the Metal object it names.
-static void put_desc(size_t cpu, const VxDesc *v, id keep) {
+static void put_desc(size_t cpu, const VxDesc *v, id keep, int32_t descriptor_class) {
     uint32_t i;
     heap12 *h = heap_at(cpu, &i);
     if (!h) { vx_log("D3D12: a descriptor written outside any heap (%#zx)", cpu); return; }
     memcpy(h->cpu + 32 * (size_t)i, v, 32);
     h->keep[i] = keep;
+    if (h->descriptor_kind) h->descriptor_kind[i] = descriptor_class >= DXIL_SRV && descriptor_class <= DXIL_SAMPLER
+        ? (uint8_t)(descriptor_class + 1) : 0;
+    if (h->buffer_view && h->buffer_view[i]) {
+        gpu_ir_buffer_view_release(h->buffer_view[i]);
+        h->buffer_view[i] = NULL;
+    }
+    if (h->shader_view && h->shader_view[i].resource) {
+        d3d_release(&h->shader_view[i].resource->base);
+    }
+    if (h->shader_view && h->shader_view[i].counter_resource)
+        d3d_release(&h->shader_view[i].counter_resource->base);
+    if (h->shader_view) memset(&h->shader_view[i], 0, sizeof h->shader_view[i]);
+    if (h->target_resource && h->target_resource[i]) {
+        d3d_release(&h->target_resource[i]->base);
+        h->target_resource[i] = NULL;
+    }
+    if (h->target_subresource) h->target_subresource[i] = 0;
+    if (h->target_flags) h->target_flags[i] = 0;
+}
+
+static void put_buffer_view(size_t cpu, gpu_ir_buffer_view *view) {
+    if (view) gpu_ir_buffer_view_retain(view);
+    gpu_ir_buffer_view *old = NULL;
+    int found = 0;
+    pthread_mutex_lock(&g_heaps_lock);
+    for (uint32_t k = 0; k < g_nheaps; k++) {
+        heap12 *h = g_heaps[k];
+        if (cpu < (size_t)h->cpu || cpu >= (size_t)h->cpu + 32 * (size_t)h->desc.NumDescriptors) continue;
+        uint32_t i = (uint32_t)((cpu - (size_t)h->cpu) / 32);
+        if (h->buffer_view) {
+            old = h->buffer_view[i];
+            h->buffer_view[i] = view;
+            found = 1;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_heaps_lock);
+    if (!found && view) gpu_ir_buffer_view_release(view);
+    if (old) gpu_ir_buffer_view_release(old);
+}
+
+// Attach API resource identity to an RTV/DSV descriptor. The Metal view alone cannot validate D3D12 resource states.
+static void put_target_metadata(size_t cpu, res12 *resource, uint32_t subresource, uint32_t flags) {
+    if (resource) d3d_addref(&resource->base);
+    res12 *old = NULL;
+    int found = 0;
+    pthread_mutex_lock(&g_heaps_lock);
+    for (uint32_t k = 0; k < g_nheaps; k++) {
+        heap12 *h = g_heaps[k];
+        if (cpu < (size_t)h->cpu || cpu >= (size_t)h->cpu + 32 * (size_t)h->desc.NumDescriptors) continue;
+        uint32_t i = (uint32_t)((cpu - (size_t)h->cpu) / 32);
+        if (h->target_resource && h->target_subresource && h->target_flags) {
+            old = h->target_resource[i];
+            h->target_resource[i] = resource;
+            h->target_subresource[i] = subresource;
+            h->target_flags[i] = flags;
+            found = 1;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_heaps_lock);
+    if (!found && resource) d3d_release(&resource->base);
+    if (old) d3d_release(&old->base);
+}
+
+static void put_shader_view(size_t cpu, res12 *resource, uint32_t mip, uint32_t mips,
+                            uint32_t slice, uint32_t slices, uint32_t plane,
+                            res12 *counter_resource, uint64_t counter_offset) {
+    if (resource) d3d_addref(&resource->base);
+    if (counter_resource) d3d_addref(&counter_resource->base);
+    res12 *old = NULL, *old_counter = NULL;
+    int found = 0;
+    pthread_mutex_lock(&g_heaps_lock);
+    for (uint32_t k = 0; k < g_nheaps; k++) {
+        heap12 *h = g_heaps[k];
+        if (cpu < (size_t)h->cpu || cpu >= (size_t)h->cpu + 32 * (size_t)h->desc.NumDescriptors) continue;
+        uint32_t i = (uint32_t)((cpu - (size_t)h->cpu) / 32);
+        if (h->shader_view) {
+            old = h->shader_view[i].resource;
+            old_counter = h->shader_view[i].counter_resource;
+            h->shader_view[i] = (shader_view12){
+                .resource = resource, .mip = mip, .mips = mips, .slice = slice, .slices = slices, .plane = plane,
+                .counter_resource = counter_resource, .counter_offset = counter_offset
+            };
+            found = 1;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_heaps_lock);
+    if (!found && resource) d3d_release(&resource->base);
+    if (!found && counter_resource) d3d_release(&counter_resource->base);
+    if (old) d3d_release(&old->base);
+    if (old_counter) d3d_release(&old_counter->base);
 }
 
 // ---- views ------------------------------------------------------------------------------------------------------------
 
 static id<MTLTexture> texture_view(res12 *r, uint32_t format, MTLTextureType type, uint32_t mip, uint32_t mips, uint32_t slice, uint32_t slices) {
+    if (!r || !r->texture) return nil;
     uint32_t bpp;
     MTLPixelFormat fmt = format ? d3d_mtl_format(format, &bpp) : r->texture.pixelFormat;
+    // D3D12 exposes a D32_FLOAT depth allocation as an R32_FLOAT SRV. Metal comparison sampling requires a depth
+    // texture view, so preserve the allocation's depth pixel format for that compatible view.
+    if (format == 41 && r->texture.pixelFormat == MTLPixelFormatDepth32Float) fmt = MTLPixelFormatDepth32Float;
     if (fmt == MTLPixelFormatInvalid) fmt = r->texture.pixelFormat;
-    if (mips == 0 || mips == 0xFFFFFFFFu || mip + mips > r->texture.mipmapLevelCount) mips = (uint32_t)r->texture.mipmapLevelCount - mip;
+    uint32_t total_mips = (uint32_t)r->texture.mipmapLevelCount;
+    if (mip >= total_mips) return nil;
+    if (mips == 0 || mips == 0xFFFFFFFFu) mips = total_mips - mip;
+    else if (mips > total_mips - mip) return nil;
     uint32_t total = r->texture.textureType == MTLTextureType3D ? 1 : (uint32_t)r->texture.arrayLength;
-    if (slices == 0 || slices == 0xFFFFFFFFu || slice + slices > total) slices = total - slice;
-    return [r->texture newTextureViewWithPixelFormat:fmt textureType:type levels:NSMakeRange(mip, mips) slices:NSMakeRange(slice, slices)];
+    if (slice > total) return nil;
+    if (slices == 0 || slices == 0xFFFFFFFFu) slices = total - slice;
+    else if (slices > total - slice) return nil;
+    if (!slices) return nil;
+    @try {
+        return [r->texture newTextureViewWithPixelFormat:fmt textureType:type levels:NSMakeRange(mip, mips) slices:NSMakeRange(slice, slices)];
+    } @catch (NSException *exception) {
+        (void)exception;
+        return nil;
+    }
+}
+
+static int d3d12_metal_min_lod_clamp_supported(id<MTLDevice> device) {
+    if (!device) return 0;
+    if (@available(macOS 10.15, *))
+        if ([device supportsFamily:MTLGPUFamilyMac2]) return 1;
+    if (@available(macOS 14.0, *)) return [device supportsFamily:MTLGPUFamilyApple6];
+    return 0;
 }
 
 static MTLTextureType view_type(int32_t dim, int uav) {
@@ -786,75 +1903,269 @@ static uint64_t resource_id(id<MTLResource> r) {
     return v;
 }
 
+// Metal texture buffers share their source buffer's storage. Use a view from offset zero so D3D12's FirstElement
+// remains independent of Metal's per-format offset alignment; the descriptor carries the base element to DXIL MSL.
+static id<MTLTexture> typed_buffer_texture(res12 *r, uint32_t format, uint32_t access) {
+    if (!r || !r->buffer) return nil;
+    uint32_t bpp = 0;
+    MTLPixelFormat fmt = d3d_mtl_format(format, &bpp);
+    if (fmt == MTLPixelFormatInvalid || !bpp) return nil;
+    uint64_t bytes = MIN((uint64_t)r->desc.Width, (uint64_t)r->buffer.length);
+    NSUInteger width = (NSUInteger)(bytes / bpp);
+    if (!width || width > UINT32_MAX) return nil;
+    NSUInteger align = [r->buffer.device minimumTextureBufferAlignmentForPixelFormat:fmt];
+    NSUInteger row_bytes = width * bpp;
+    if (align) {
+        NSUInteger remainder = row_bytes % align;
+        if (remainder) {
+            if (row_bytes > NSUIntegerMax - (align - remainder)) return nil;
+            row_bytes += align - remainder;
+        }
+    }
+    MTLTextureUsage usage = MTLTextureUsageShaderRead;
+    if (access & GPU_IR_ACCESS_SHADER_WRITE) usage |= MTLTextureUsageShaderWrite;
+    if ((access & GPU_IR_ACCESS_SHADER_WRITE) && d3d12_texture_atomic_format_supported(r->dev->mtl, format))
+        usage |= MTLTextureUsageShaderAtomic;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:fmt width:width
+                                                                            resourceOptions:r->buffer.resourceOptions
+                                                                                      usage:usage];
+    id<MTLTexture> texture = nil;
+    @try {
+        texture = [r->buffer newTextureWithDescriptor:td offset:0 bytesPerRow:row_bytes];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    if (texture || !(usage & MTLTextureUsageShaderAtomic)) return texture;
+    td.usage = usage & ~MTLTextureUsageShaderAtomic;
+    @try {
+        return [r->buffer newTextureWithDescriptor:td offset:0 bytesPerRow:row_bytes];
+    } @catch (NSException *exception) {
+        (void)exception;
+        return nil;
+    }
+}
+
+static gpu_ir_buffer_view *make_buffer_view(res12 *r, uint64_t first, uint32_t count, uint32_t format,
+                                            uint32_t stride, uint32_t flags, uint32_t access,
+                                            VxDesc *descriptor, id *keep) {
+    int raw = (flags & 1u) != 0;
+    if (!r || !r->buffer || !r->gpu_buffer || !count || (flags & ~1u)) return NULL;
+    uint32_t element_size = raw ? 4u : stride ? stride : bytes_per(format);
+    if (!element_size || first > UINT64_MAX / element_size) return NULL;
+    uint64_t byte_offset = first * element_size, byte_size = (uint64_t)count * element_size;
+    if (byte_offset > r->desc.Width || byte_size > r->desc.Width - byte_offset ||
+        byte_offset > r->buffer.length || byte_size > r->buffer.length - byte_offset ||
+        r->buffer.gpuAddress > UINT64_MAX - byte_offset) return NULL;
+    uint32_t kind = raw ? GPU_IR_BUFFER_VIEW_RAW : stride ? GPU_IR_BUFFER_VIEW_STRUCTURED : GPU_IR_BUFFER_VIEW_TYPED;
+    if (kind != GPU_IR_BUFFER_VIEW_TYPED && byte_size > UINT32_MAX) return NULL;
+    gpu_ir_buffer_view_desc desc = {
+        .kind = kind, .access_mask = access, .byte_offset = byte_offset, .byte_size = byte_size,
+        .element_count = count, .element_size = kind == GPU_IR_BUFFER_VIEW_TYPED ? element_size : 0,
+        .structure_stride = kind == GPU_IR_BUFFER_VIEW_STRUCTURED ? stride : 0
+    };
+    id<MTLTexture> texture = nil;
+    void *backend = NULL;
+    gpu_ir_backend_object_release release = NULL;
+    if (kind == GPU_IR_BUFFER_VIEW_TYPED) {
+        texture = typed_buffer_texture(r, format, access);
+        if (!texture || first > texture.width || count > texture.width - first) return NULL;
+        backend = (void *)CFBridgingRetain(texture);
+        release = gpu12_release_mtl_object;
+    }
+    gpu_ir_buffer_view *view = gpu_ir_buffer_view_create(r->gpu_buffer, &desc, backend, release);
+    if (!view) {
+        if (backend) gpu12_release_mtl_object(backend);
+        return NULL;
+    }
+    const gpu_ir_buffer_view_desc *normalized = gpu_ir_buffer_view_description(view);
+    // Typed-buffer shaders index a texture_buffer, so va holds FirstElement and size holds the view's element count.
+    // Raw and structured shaders use the byte GPU address and byte size as before.
+    if (kind == GPU_IR_BUFFER_VIEW_TYPED) {
+        id<MTLTexture> view_texture = (__bridge id<MTLTexture>)gpu_ir_buffer_view_backend_object(view);
+        descriptor->va = normalized->byte_offset / normalized->element_size;
+        descriptor->size = normalized->element_count;
+        descriptor->stride = 0;
+        descriptor->res = resource_id(view_texture);
+        *keep = view_texture;
+    } else {
+        descriptor->va = r->buffer.gpuAddress + normalized->byte_offset;
+        descriptor->size = (uint32_t)normalized->byte_size;
+        descriptor->stride = normalized->structure_stride;
+        descriptor->res = 0;
+    }
+    descriptor->fmt = format;
+    descriptor->flags = flags;
+    return view;
+}
+
 static WINAPI void dev_create_cbv(void *this, const CBV_DESC *desc, size_t cpu) {
     VxDesc v = { 0 };
     if (desc) { v.va = desc->location; v.size = desc->size; }
-    put_desc(cpu, &v, nil);
+    put_desc(cpu, &v, nil, DXIL_CBV);
 }
 
 static WINAPI void dev_create_srv(void *this, void *resource, const SRV_DESC *desc, size_t cpu) {
     res12 *r = resource;
     VxDesc v = { 0 };
     id keep = nil;
+    gpu_ir_buffer_view *ir_view = NULL;
+    uint32_t view_mip = 0, view_mips = 0, view_slice = 0, view_slices = 0, view_plane = 0;
+    float resource_min_lod = 0.0f;
+    int texture_view_valid = 1;
     if (r && r->buffer) {
         if (!desc) { v.va = r->buffer.gpuAddress; v.size = (uint32_t)r->desc.Width; }
         else {
-            uint32_t stride = desc->buffer.stride ? desc->buffer.stride : (desc->buffer.flags & 1) ? 4 : bytes_per(desc->format);
-            if (!stride) stride = 4;
-            v.va = r->buffer.gpuAddress + desc->buffer.first * stride;
-            v.size = desc->buffer.count * stride;
-            v.stride = desc->buffer.stride;
-            v.fmt = desc->format;
-            if (!desc->buffer.stride && !(desc->buffer.flags & 1) && desc->format) {
-                d3d_not_implemented("typed buffer shader resource views");
-            }
+            ir_view = make_buffer_view(r, desc->buffer.first, desc->buffer.count, desc->format,
+                                       desc->buffer.stride, (uint32_t)desc->buffer.flags,
+                                       GPU_IR_ACCESS_SHADER_READ, &v, &keep);
+            if (!ir_view) vx_log("D3D12: buffer SRV range, format, or Metal view is unsupported; descriptor left null");
         }
     } else if (r && r->texture) {
-        int32_t dim = desc ? desc->dim : (r->desc.DepthOrArraySize > 1 ? 5 : 4);
-        uint32_t mip = 0, mips = 0, slice = 0, slices = 0;
-        if (desc && (dim == 4 || dim == 2)) { mip = desc->tex2d.most_detailed; mips = desc->tex2d.mips; }
-        if (desc && (dim == 5 || dim == 3 || dim == 7)) { mip = desc->tex2darray.most_detailed; mips = desc->tex2darray.mips; slice = desc->tex2darray.first_slice; slices = desc->tex2darray.slices; }
-        id<MTLTexture> t = texture_view(r, desc ? desc->format : 0, view_type(dim, 0), mip, mips, slice, slices);
-        v.res = resource_id(t);
-        v.fmt = desc ? desc->format : r->desc.Format;
-        keep = t;
+        int32_t dim = desc ? desc->dim : (int32_t)d3d12_default_srv_texture_dimension12(
+            (uint32_t)r->desc.Dimension, r->desc.DepthOrArraySize, r->desc.SampleCount);
+        if (desc) {
+            d3d12_srv_texture_range12 range;
+            texture_view_valid = d3d12_normalize_srv_texture_range12((uint32_t)dim, desc->raw,
+                (uint32_t)r->texture.mipmapLevelCount, (uint32_t)r->texture.arrayLength, &range);
+            if (texture_view_valid) {
+                view_mip = range.mip;
+                view_mips = range.mips;
+                view_slice = range.first_slice;
+                view_slices = range.slices;
+                view_plane = range.plane;
+                resource_min_lod = range.min_lod;
+            }
+        } else if (!dim) {
+            texture_view_valid = 0;
+        }
+        if (texture_view_valid && resource_min_lod != 0.0f &&
+            (!d3d12_metal_min_lod_clamp_supported(r->dev->mtl) || dim == 2 || dim == 3)) {
+            vx_log("D3D12: nonzero ResourceMinLODClamp needs Metal Mac2/Apple6 sampling support and a non-1D texture view; descriptor left null");
+            texture_view_valid = 0;
+        }
+        id<MTLTexture> t = texture_view_valid ? texture_view(r, desc ? desc->format : 0, view_type(dim, 0),
+                                        view_mip, view_mips, view_slice, view_slices) : nil;
+        texture_view_valid = t != nil;
+        if (texture_view_valid) {
+            v.res = resource_id(t);
+            v.fmt = desc ? desc->format : r->desc.Format;
+            if (resource_min_lod != 0.0f) {
+                memcpy(&v.size, &resource_min_lod, sizeof v.size);
+                v.flags |= DXIL_MSL_DESC_HAS_MIN_LOD_CLAMP;
+            }
+            keep = t;
+        } else {
+            vx_log("D3D12: invalid or unsupported texture SRV dimension or subresource range; descriptor left null");
+        }
     }
-    put_desc(cpu, &v, keep);
+    put_desc(cpu, &v, keep, DXIL_SRV);
+    put_buffer_view(cpu, ir_view);
+    gpu_ir_buffer_view_release(ir_view);
+    if (r && (r->buffer || (r->texture && texture_view_valid)))
+        put_shader_view(cpu, r, view_mip, view_mips, view_slice, view_slices, view_plane, NULL, 0);
 }
 
 static WINAPI void dev_create_uav(void *this, void *resource, void *counter, const UAV_DESC *desc, size_t cpu) {
+    dev12 *d = this;
     res12 *r = resource;
+    res12 *counter_resource = counter;
     VxDesc v = { 0 };
     id keep = nil;
+    gpu_ir_buffer_view *ir_view = NULL;
+    uint32_t view_mip = 0, view_slice = 0, view_slices = 0, view_plane = 0;
+    uint64_t counter_offset = 0;
+    if (counter) {
+        int valid = r && desc && r->base.kind == K12_RESOURCE && counter_resource->base.kind == K12_RESOURCE &&
+            r->dev == d && counter_resource->dev == d && r->buffer && counter_resource->buffer &&
+            desc->dim == 1 && desc->format == 0 && desc->buffer.stride > 0 &&
+            !(desc->buffer.flags & 1) && desc->buffer.counter_offset % 4096u == 0 &&
+            desc->buffer.counter_offset <= counter_resource->desc.Width &&
+            counter_resource->desc.Width - desc->buffer.counter_offset >= sizeof(uint32_t) &&
+            desc->buffer.counter_offset <= counter_resource->buffer.length &&
+            counter_resource->buffer.length - desc->buffer.counter_offset >= sizeof(uint32_t) &&
+            counter_resource->buffer.gpuAddress <= UINT64_MAX - desc->buffer.counter_offset;
+        if (!valid) {
+            vx_log("D3D12: invalid UAV counter resource, view format/stride, or 4096-byte counter offset; descriptor left null");
+            put_desc(cpu, &v, nil, DXIL_UAV);
+            put_buffer_view(cpu, NULL);
+            return;
+        }
+        counter_offset = desc->buffer.counter_offset;
+    } else if (r && r->buffer && desc && desc->buffer.counter_offset) {
+        vx_log("D3D12: a UAV without a counter must have CounterOffsetInBytes equal to zero; descriptor left null");
+        put_desc(cpu, &v, nil, DXIL_UAV);
+        put_buffer_view(cpu, NULL);
+        return;
+    }
     if (r && r->buffer) {
         if (!desc) { v.va = r->buffer.gpuAddress; v.size = (uint32_t)r->desc.Width; }
         else {
-            uint32_t stride = desc->buffer.stride ? desc->buffer.stride : (desc->buffer.flags & 1) ? 4 : bytes_per(desc->format);
-            if (!stride) stride = 4;
-            v.va = r->buffer.gpuAddress + desc->buffer.first * stride;
-            v.size = desc->buffer.count * stride;
-            v.stride = desc->buffer.stride;
-            v.fmt = desc->format;
-            if (counter) d3d_not_implemented("UAV counters");
+            ir_view = make_buffer_view(r, desc->buffer.first, desc->buffer.count, desc->format,
+                                       desc->buffer.stride, (uint32_t)desc->buffer.flags,
+                                       GPU_IR_ACCESS_SHADER_READ | GPU_IR_ACCESS_SHADER_WRITE, &v, &keep);
+            if (!ir_view) vx_log("D3D12: buffer UAV range, format, or Metal view is unsupported; descriptor left null");
+            if (ir_view && counter_resource) {
+                v.res = counter_resource->buffer.gpuAddress + counter_offset;
+                v.flags |= DXIL_MSL_DESC_HAS_COUNTER;
+                keep = counter_resource->buffer;
+            }
         }
     } else if (r && r->texture) {
-        int32_t dim = desc ? desc->dim : 4;
-        uint32_t mip = 0, slice = 0, slices = 0;
-        if (desc && (dim == 4 || dim == 2)) mip = desc->tex2d.mip;
-        if (desc && (dim == 5 || dim == 3)) { mip = desc->tex2darray.mip; slice = desc->tex2darray.first_slice; slices = desc->tex2darray.slices; }
-        id<MTLTexture> t = texture_view(r, desc ? desc->format : 0, view_type(dim, 1), mip, 1, slice, slices);
-        v.res = resource_id(t);
-        v.fmt = desc ? desc->format : r->desc.Format;
-        keep = t;
+        uint32_t resource_dimension = (uint32_t)r->desc.Dimension;
+        uint32_t array_size = r->desc.DepthOrArraySize;
+        int32_t dim = desc ? desc->dim : (int32_t)d3d12_default_uav_texture_dimension12(
+            resource_dimension, array_size);
+        int texture_view_valid = r->texture.sampleCount == 1 &&
+            d3d12_uav_texture_dimension_matches12(resource_dimension, (uint32_t)dim);
+        if (texture_view_valid && dim == 8) {
+            d3d12_uav_texture3d_range12 range;
+            uint32_t mip = desc ? desc->tex3d.mip : 0;
+            uint32_t first_w_slice = desc ? desc->tex3d.first_w_slice : 0;
+            uint32_t w_size = desc ? desc->tex3d.w_size : UINT32_MAX;
+            texture_view_valid = d3d12_normalize_uav_texture3d_range12(mip, first_w_slice, w_size,
+                (uint32_t)r->texture.mipmapLevelCount, array_size, &range);
+            if (texture_view_valid) {
+                view_mip = range.mip;
+                v.stride = range.first_w_slice;
+                v.size = range.w_size;
+                v.flags |= DXIL_MSL_DESC_HAS_W_SLICE_RANGE;
+            }
+        } else if (texture_view_valid) {
+            if (desc && (dim == 2 || dim == 4)) {
+                view_mip = desc->tex2d.mip;
+                if (dim == 4) view_plane = desc->tex2d.plane;
+            }
+            if (desc && (dim == 3 || dim == 5)) {
+                view_mip = desc->tex2darray.mip;
+                view_slice = desc->tex2darray.first_slice;
+                view_slices = desc->tex2darray.slices;
+                if (dim == 5) view_plane = desc->tex2darray.plane;
+            }
+        }
+        id<MTLTexture> t = texture_view_valid ? texture_view(r, desc ? desc->format : 0,
+            view_type(dim, 1), view_mip, 1, view_slice, view_slices) : nil;
+        texture_view_valid = t != nil;
+        if (texture_view_valid) {
+            v.res = resource_id(t);
+            v.fmt = desc ? desc->format : r->desc.Format;
+            keep = t;
+        } else {
+            vx_log("D3D12: invalid or unsupported texture UAV dimension or subresource range; descriptor left null");
+        }
     }
-    put_desc(cpu, &v, keep);
+    put_desc(cpu, &v, keep, DXIL_UAV);
+    put_buffer_view(cpu, ir_view);
+    gpu_ir_buffer_view_release(ir_view);
+    if (r && ((r->texture && v.res) || (r->buffer && (!desc || ir_view))))
+        put_shader_view(cpu, r, view_mip, r->texture ? 1 : 0, view_slice, view_slices, view_plane,
+                        ir_view && counter_resource ? counter_resource : NULL, ir_view ? counter_offset : 0);
 }
 
 static WINAPI void dev_create_sampler(void *this, const SAMPLER_DESC *s, size_t cpu) {
     id<MTLSamplerState> st = make_sampler(this, s->filter, s->u, s->v, s->w, s->bias, s->aniso, s->cmp, s->border, s->min_lod, s->max_lod);
     VxDesc v = { 0 };
     v.res = resource_id((id<MTLResource>)st);
-    put_desc(cpu, &v, st);
+    put_desc(cpu, &v, st, DXIL_SAMPLER);
 }
 
 static WINAPI void dev_copy_simple(void *this, uint32_t n, size_t dst, size_t src, int32_t type) {
@@ -864,6 +2175,27 @@ static WINAPI void dev_copy_simple(void *this, uint32_t n, size_t dst, size_t sr
         if (!sh || !dh) continue;
         memcpy(dh->cpu + 32 * (size_t)di, sh->cpu + 32 * (size_t)si, 32);
         dh->keep[di] = sh->keep[si];
+        if (dh->descriptor_kind) dh->descriptor_kind[di] = sh->descriptor_kind ? sh->descriptor_kind[si] : 0;
+        gpu_ir_buffer_view *view_ref = sh->buffer_view ? sh->buffer_view[si] : NULL;
+        if (view_ref) gpu_ir_buffer_view_retain(view_ref);
+        gpu_ir_buffer_view *old_buffer_view = dh->buffer_view ? dh->buffer_view[di] : NULL;
+        if (dh->buffer_view) dh->buffer_view[di] = view_ref;
+        if (old_buffer_view) gpu_ir_buffer_view_release(old_buffer_view);
+        shader_view12 view = sh->shader_view ? sh->shader_view[si] : (shader_view12){ 0 };
+        if (view.resource) d3d_addref(&view.resource->base);
+        if (view.counter_resource) d3d_addref(&view.counter_resource->base);
+        res12 *old_view = dh->shader_view ? dh->shader_view[di].resource : NULL;
+        res12 *old_counter_view = dh->shader_view ? dh->shader_view[di].counter_resource : NULL;
+        if (dh->shader_view) dh->shader_view[di] = view;
+        if (old_view) d3d_release(&old_view->base);
+        if (old_counter_view) d3d_release(&old_counter_view->base);
+        res12 *target = sh->target_resource ? sh->target_resource[si] : NULL;
+        if (target) d3d_addref(&target->base);
+        res12 *old = dh->target_resource ? dh->target_resource[di] : NULL;
+        if (dh->target_resource) dh->target_resource[di] = target;
+        if (dh->target_subresource) dh->target_subresource[di] = sh->target_subresource ? sh->target_subresource[si] : 0;
+        if (dh->target_flags) dh->target_flags[di] = sh->target_flags ? sh->target_flags[si] : 0;
+        if (old) d3d_release(&old->base);
     }
 }
 
@@ -902,15 +2234,24 @@ static WINAPI HRESULT fence_set_event(void *this, uint64_t value, HANDLE h) {
 static WINAPI int32_t fence_flags(void *this) { return 0; }
 
 static WINAPI HRESULT dev_create_fence(void *this, uint64_t initial, int32_t flags, const GUID *iid, void **out) {
+    if (!out) return E_POINTER;
+    *out = NULL;
+    uint32_t fence_flags = (uint32_t)flags;
+    if (fence_flags & ~7u) return E_INVALIDARG;
+    // The runtime exposes a local monitored MTLSharedEvent. Shared/cross-adapter handles and
+    // non-monitored fences have no matching implementation, so don't accept those flags silently.
+    if (fence_flags) return DXGI_ERROR_UNSUPPORTED;
     dev12 *d = this;
     fence12 *f = alloc12(sizeof *f, K12_FENCE, g_fence_vtbl, d);
     f->base.destroy = fence_destroy;
     f->event = [d->mtl newSharedEvent];
+    if (!f->event) { d3d_release(&f->base); return E_OUTOFMEMORY; }
     f->event.signaledValue = initial;
     static dispatch_queue_t q;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ q = dispatch_queue_create("vxrt.d3d12.fences", DISPATCH_QUEUE_SERIAL); });
     f->listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:q];
+    if (!f->listener) { d3d_release(&f->base); return E_OUTOFMEMORY; }
     HRESULT hr = fence_query(f, iid, out);
     d3d_release(&f->base);
     return hr;
@@ -918,10 +2259,123 @@ static WINAPI HRESULT dev_create_fence(void *this, uint64_t initial, int32_t fla
 
 // ---- pipeline states ---------------------------------------------------------------------------------------------
 
-static void pso_destroy(d3d_object *o) { pso12 *p = (pso12 *)o; p->compute = nil; p->render = nil; p->depth = nil; release_dev(o); }
+static void pso_destroy(d3d_object *o) {
+    pso12 *p = (pso12 *)o;
+    gpu_ir_pipeline_release(p->gpu_pipeline);
+    p->gpu_pipeline = NULL;
+    p->compute = nil; p->render = nil; p->depth = nil;
+    release_dev(o);
+}
 static WINAPI HRESULT pso_query(void *this, const GUID *iid, void **out) {
     const GUID *k[] = { &IID_ID3D12PipelineState, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
     return query(this, iid, out, k, 4);
+}
+
+static int shader_root_heap_flags_valid12(dev12 *device, const dxil_msl *shader, void *root_object) {
+    if (!shader->uses_heap && !shader->uses_sampler_heap) return 1;
+    rootsig12 *root = root_object;
+    if (!root || root->base.kind != K12_ROOTSIG || root->dev != device) return 0;
+    if (shader->uses_heap && !(root->flags & 0x400u)) return 0;
+    if (shader->uses_sampler_heap && !(root->flags & 0x800u)) return 0;
+    return 1;
+}
+
+static int root_visibility_allows_shader12(int32_t visibility, int shader_kind) {
+    if (visibility == 0) return 1; // D3D12_SHADER_VISIBILITY_ALL
+    if (shader_kind == 1) return visibility == 1; // vertex
+    if (shader_kind == 0) return visibility == 5; // pixel
+    return 0; // compute shaders use ALL visibility
+}
+
+static uint32_t root_deny_flag_for_shader12(int shader_kind) {
+    if (shader_kind == 1) return 0x2u;  // DENY_VERTEX_SHADER_ROOT_ACCESS
+    if (shader_kind == 0) return 0x20u; // DENY_PIXEL_SHADER_ROOT_ACCESS
+    return 0;                           // D3D12 has no compute-root-access deny flag
+}
+
+static uint64_t root_register_end12(uint32_t first, uint32_t count) {
+    return count == UINT32_MAX ? (1ull << 32) : (uint64_t)first + count;
+}
+
+static uint64_t root_binding_end_at12(const rootsig12 *root, uint32_t register_class,
+                                      uint32_t space, int shader_kind, uint64_t cursor) {
+    uint64_t best = cursor;
+    for (uint32_t i = 0; i < root->nparams; i++) {
+        const param12 *parameter = &root->params[i];
+        if (!root_visibility_allows_shader12(parameter->visibility, shader_kind)) continue;
+        if (parameter->type == 0) {
+            for (uint32_t j = 0; j < parameter->nranges; j++) {
+                const range12 *range = &parameter->ranges[j];
+                if ((uint32_t)range->type != register_class || range->space != space || range->base > cursor)
+                    continue;
+                uint64_t end = root_register_end12(range->base, range->count);
+                if (end > cursor && end > best) best = end;
+            }
+            continue;
+        }
+
+        uint32_t parameter_class;
+        if (parameter->type == 1 || parameter->type == 2) parameter_class = DXIL_CBV;
+        else if (parameter->type == 3) parameter_class = DXIL_SRV;
+        else if (parameter->type == 4) parameter_class = DXIL_UAV;
+        else continue;
+        if (parameter_class == register_class && parameter->space == space && parameter->reg == cursor && best < cursor + 1)
+            best = cursor + 1;
+    }
+
+    if (register_class == DXIL_SAMPLER) {
+        for (uint32_t i = 0; i < root->nsamplers; i++) {
+            const static_sampler12 *sampler = &root->samplers[i];
+            if (sampler->space == space && sampler->reg == cursor &&
+                root_visibility_allows_shader12(sampler->visibility, shader_kind) && best < cursor + 1)
+                best = cursor + 1;
+        }
+    }
+    return best;
+}
+
+static int root_signature_covers_shader_slot12(const rootsig12 *root, const dxil_msl_slot *slot,
+                                               int shader_kind) {
+    if (!root || !slot || slot->cls > DXIL_SAMPLER || !slot->count) return 0;
+    uint64_t end = root_register_end12(slot->lower, slot->count);
+    if (end > (1ull << 32) || end <= slot->lower) return 0;
+    uint64_t cursor = slot->lower;
+    while (cursor < end) {
+        uint64_t next = root_binding_end_at12(root, slot->cls, slot->space, shader_kind, cursor);
+        if (next <= cursor) return 0;
+        cursor = next < end ? next : end;
+    }
+    return 1;
+}
+
+static int shader_root_signature_valid12(dev12 *device, const dxil_msl *shader, void *root_object) {
+    if (!shader) return 1;
+    rootsig12 *root = root_object;
+    if (!root_object) return shader->nslots == 0 && !shader->uses_heap && !shader->uses_sampler_heap;
+    if (root->base.kind != K12_ROOTSIG || root->dev != device ||
+        !shader_root_heap_flags_valid12(device, shader, root_object)) return 0;
+
+    int has_root_access = shader->nslots || shader->uses_heap || shader->uses_sampler_heap;
+    uint32_t deny_flag = root_deny_flag_for_shader12(shader->stage);
+    if (has_root_access && deny_flag && (root->flags & deny_flag)) return 0;
+    for (uint32_t i = 0; i < shader->nslots; i++)
+        if (!root_signature_covers_shader_slot12(root, &shader->slots[i], shader->stage)) return 0;
+    return 1;
+}
+
+static MTLCompileOptions *d3d12_shader_compile_options12(dev12 *device, const dxil_msl *shader) {
+    int supports_min_lod = d3d12_metal_min_lod_clamp_supported(device->mtl);
+    if (shader && shader->uses_min_lod_clamp && !supports_min_lod) return nil;
+    MTLCompileOptions *options = [MTLCompileOptions new];
+    if (shader && shader->uses_thread_fence) {
+        if (@available(macOS 15.0, *)) options.languageVersion = MTLLanguageVersion3_2;
+        else {
+            vx_log("D3D12: shader memory fences require Metal shading language 3.2 (macOS 15 or later)");
+            return nil;
+        }
+    } else options.languageVersion = MTLLanguageVersion3_1;
+    if (supports_min_lod) options.preprocessorMacros = @{ @"VXRT_HAS_MIN_LOD_CLAMP": @1 };
+    return options;
 }
 
 static WINAPI HRESULT dev_create_compute_pso(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
@@ -931,16 +2385,36 @@ static WINAPI HRESULT dev_create_compute_pso(void *this, const COMPUTE_PSO_DESC 
     pso12 *p = alloc12(sizeof *p, K12_PSO, g_pso_vtbl, d);
     p->base.destroy = pso_destroy;
     int rc = dxil_to_msl(&m, &p->msl);
+    gpu_ir_shader *common_shader = NULL;
+    if (!rc) {
+        int ir_rc = dxil_build_gpu_ir_shader(&m, DXIL_IR_ENTRY_FUNCTION, &common_shader);
+        if (ir_rc != GPU_IR_OK && ir_rc != GPU_IR_UNSUPPORTED)
+            vx_log("D3D12: compute shader common-IR lowering returned %d; retaining direct DXIL translation", ir_rc);
+    }
     dxil_free(&m);
     if (rc) { vx_log("D3D12: compute shader not translated: %s", p->msl.error); d3d_release(&p->base); return E_INVALIDARG; }
+    if (p->msl.uses_min_lod_clamp && !d3d12_metal_min_lod_clamp_supported(d->mtl)) {
+        vx_log("D3D12: shader-level min-LOD sampling needs Metal Mac2/Apple6 support");
+        d3d_release(&p->base);
+        return E_NOTIMPL;
+    }
+    if (!shader_root_signature_valid12(d, &p->msl, desc->root)) {
+        vx_log("D3D12: compute shader bindings are not covered by a compatible root signature");
+        d3d_release(&p->base);
+        return E_INVALIDARG;
+    }
+    rootsig12 *root = desc->root;
     NSString *src = @(p->msl.msl);
     pthread_mutex_lock(&d->lock);
     id<MTLComputePipelineState> cached = d->pso_cache[src];
     pthread_mutex_unlock(&d->lock);
     if (cached) p->compute = cached;
     else {
-        MTLCompileOptions *opt = [MTLCompileOptions new];
-        opt.languageVersion = MTLLanguageVersion3_1;
+        MTLCompileOptions *opt = d3d12_shader_compile_options12(d, &p->msl);
+        if (!opt) {
+            d3d_release(&p->base);
+            return E_NOTIMPL;
+        }
         NSError *err = nil;
         id<MTLLibrary> lib = [d->mtl newLibraryWithSource:src options:opt error:&err];
         if (lib) p->compute = [d->mtl newComputePipelineStateWithFunction:[lib newFunctionWithName:@"vx_main"] error:&err];
@@ -952,6 +2426,45 @@ static WINAPI HRESULT dev_create_compute_pso(void *this, const COMPUTE_PSO_DESC 
         pthread_mutex_lock(&d->lock);
         d->pso_cache[src] = p->compute;
         pthread_mutex_unlock(&d->lock);
+    }
+    gpu_ir_pipeline *common_metal_pipeline = NULL;
+    char common_error[512] = { 0 };
+    gpu_ir_pipeline_layout *common_layout =
+        root && root->base.kind == K12_ROOTSIG && root->dev == d ? root->gpu_layout : NULL;
+    if (common_shader) {
+        common_metal_pipeline = gpu_ir_metal_compute_pipeline_create_for_metal_device(
+            (__bridge void *)d->mtl, common_shader, common_layout, common_error, sizeof common_error);
+        if (!common_metal_pipeline)
+            vx_log("D3D12: common compute MSL/Metal pipeline unavailable; retaining direct DXIL path: %s",
+                   common_error[0] ? common_error : "unsupported common shader or root layout");
+    }
+    void *metal_pipeline_object = NULL;
+    if (common_metal_pipeline) {
+        id<MTLComputePipelineState> common_state =
+            (__bridge id<MTLComputePipelineState>)gpu_ir_pipeline_backend_object(common_metal_pipeline);
+        if (common_state) {
+            metal_pipeline_object = (__bridge_retained void *)common_state;
+            p->common_ir_compute = 1;
+        }
+    }
+    if (!metal_pipeline_object) metal_pipeline_object = (__bridge_retained void *)p->compute;
+    gpu_ir_pipeline_desc ir_desc = {
+        .info = { .kind = GPU_IR_PIPELINE_COMPUTE, .stage_mask = GPU_IR_STAGE_COMPUTE,
+                  .threadgroup_size = { p->msl.threads[0], p->msl.threads[1], p->msl.threads[2] } },
+        .layout = common_layout,
+        .backend_object = metal_pipeline_object,
+        .release = gpu12_release_mtl_object,
+        .stage_shaders = { [GPU_IR_STAGE_SLOT_COMPUTE] = common_shader }
+    };
+    p->gpu_pipeline = gpu_ir_pipeline_create(&ir_desc);
+    gpu_ir_pipeline_release(common_metal_pipeline);
+    gpu_ir_shader_release(common_shader);
+    if (!p->gpu_pipeline) {
+        gpu12_release_mtl_object(ir_desc.backend_object);
+        vx_log("D3D12: compute pipeline could not be represented by the common GPU IR");
+        dxil_msl_free(&p->msl);
+        d3d_release(&p->base);
+        return E_OUTOFMEMORY;
     }
     dxil_msl_free(&p->msl);
     HRESULT hr = pso_query(p, iid, out);
@@ -966,6 +2479,8 @@ static WINAPI HRESULT rootsig_query(void *this, const GUID *iid, void **out) {
     return query(this, iid, out, k, 3);
 }
 static WINAPI HRESULT dev_create_rootsig(void *this, uint32_t node, const void *data, size_t size, const GUID *iid, void **out) {
+    if (out) *out = NULL;
+    if (!data || !out) return E_INVALIDARG;
     dev12 *d = this;
     rootsig12 *r = alloc12(sizeof *r, K12_ROOTSIG, g_rootsig_vtbl, d);
     r->base.destroy = rootsig_destroy;
@@ -973,6 +2488,127 @@ static WINAPI HRESULT dev_create_rootsig(void *this, uint32_t node, const void *
     if (hr == S_OK) hr = rootsig_query(r, iid, out);
     d3d_release(&r->base);
     return hr;
+}
+
+// ---- command signatures and ExecuteIndirect ----------------------------------------------------------------------
+
+enum {
+    INDIRECT_DRAW, INDIRECT_DRAW_INDEXED, INDIRECT_DISPATCH, INDIRECT_VERTEX_BUFFER, INDIRECT_INDEX_BUFFER,
+    INDIRECT_CONSTANT, INDIRECT_CBV, INDIRECT_SRV, INDIRECT_UAV, INDIRECT_DISPATCH_RAYS, INDIRECT_DISPATCH_MESH,
+    INDIRECT_INCREMENTING_CONSTANT
+};
+
+static void command_signature_destroy(d3d_object *o) {
+    command_signature12 *s = (command_signature12 *)o;
+    if (s->root) d3d_release(&s->root->base);
+    free(s->args);
+    release_dev(o);
+}
+static WINAPI HRESULT command_signature_query(void *this, const GUID *iid, void **out) {
+    const GUID *k[] = { &IID_ID3D12CommandSignature, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
+    return query(this, iid, out, k, 4);
+}
+
+static int command_root_arg_valid(const rootsig12 *root, const INDIRECT_ARGUMENT_DESC *arg) {
+    if (!root || arg->raw[0] >= root->nparams) return 0;
+    const param12 *p = &root->params[arg->raw[0]];
+    switch (arg->type) {
+    case INDIRECT_CONSTANT:
+        return p->type == 1 && arg->constants.count && arg->constants.offset <= p->n32 &&
+               arg->constants.count <= p->n32 - arg->constants.offset;
+    case INDIRECT_INCREMENTING_CONSTANT:
+        return p->type == 1 && arg->incrementing_constant.offset < p->n32;
+    case INDIRECT_CBV: return p->type == 2;
+    case INDIRECT_SRV: return p->type == 3;
+    case INDIRECT_UAV: return p->type == 4;
+    default: return 0;
+    }
+}
+
+static WINAPI HRESULT dev_create_command_signature(void *this, const COMMAND_SIGNATURE_DESC *desc, void *root_object,
+                                                    const GUID *iid, void **out) {
+    if (out) *out = NULL;
+    if (!desc || !desc->args || !desc->count || !desc->stride || (desc->stride & 3)) return E_INVALIDARG;
+    rootsig12 *root = root_object;
+    if (root && (root->base.kind != K12_ROOTSIG || root->dev != this)) return E_INVALIDARG;
+    command_argument12 *args = calloc(desc->count, sizeof *args);
+    if (!args) return E_OUTOFMEMORY;
+    uint32_t payload = 0, operation = UINT32_MAX, operation_count = 0, root_index = 0, previous_constant_end = 0;
+    int has_root_args = 0, has_vb = 0, has_ib = 0, has_dispatch = 0, has_draw = 0, has_indexed_draw = 0,
+        have_previous_root = 0, has_incrementing_constant = 0;
+    uint32_t ib_count = 0;
+    uint32_t vb_slots = 0;
+    for (uint32_t i = 0; i < desc->count; i++) {
+        const INDIRECT_ARGUMENT_DESC *arg = &desc->args[i];
+        command_argument12 *dst = &args[i];
+        dst->type = (uint32_t)arg->type;
+        switch (arg->type) {
+        case INDIRECT_DRAW: dst->size = 16; has_draw = 1; operation = i; operation_count++; break;
+        case INDIRECT_DRAW_INDEXED: dst->size = 20; has_draw = 1; has_indexed_draw = 1; operation = i; operation_count++; break;
+        case INDIRECT_DISPATCH: dst->size = 12; has_dispatch = 1; operation = i; operation_count++; break;
+        case INDIRECT_VERTEX_BUFFER:
+            if (arg->vb.slot >= 16 || (vb_slots & (1u << arg->vb.slot))) goto invalid;
+            vb_slots |= 1u << arg->vb.slot;
+            dst->a = arg->vb.slot; dst->size = 16; has_vb = 1; break;
+        case INDIRECT_INDEX_BUFFER: dst->size = 16; has_ib = 1; ib_count++; break;
+        case INDIRECT_CONSTANT: case INDIRECT_CBV: case INDIRECT_SRV: case INDIRECT_UAV:
+            if (!command_root_arg_valid(root, arg)) goto invalid;
+            has_root_args = 1;
+            dst->a = arg->raw[0];
+            if (have_previous_root && dst->a < root_index) goto invalid;
+            if (!have_previous_root || dst->a != root_index) previous_constant_end = 0;
+            if (arg->type == INDIRECT_CONSTANT) {
+                if (arg->constants.offset < previous_constant_end) goto invalid;
+                dst->b = arg->constants.offset; dst->c = arg->constants.count;
+                previous_constant_end = arg->constants.offset + arg->constants.count;
+                dst->size = arg->constants.count * 4;
+            } else {
+                if (have_previous_root && dst->a == root_index) goto invalid;
+                dst->size = 8;
+                previous_constant_end = UINT32_MAX;
+            }
+            root_index = dst->a; have_previous_root = 1;
+            break;
+        case INDIRECT_INCREMENTING_CONSTANT:
+            if (has_incrementing_constant || !command_root_arg_valid(root, arg)) goto invalid;
+            has_incrementing_constant = 1;
+            has_root_args = 1;
+            dst->a = arg->incrementing_constant.root;
+            dst->b = arg->incrementing_constant.offset;
+            dst->c = 1;
+            if (have_previous_root && dst->a < root_index) goto invalid;
+            if (!have_previous_root || dst->a != root_index) previous_constant_end = 0;
+            if (dst->b < previous_constant_end) goto invalid;
+            previous_constant_end = dst->b + 1;
+            root_index = dst->a;
+            have_previous_root = 1;
+            // The counter is supplied by the runtime, so this argument consumes no record bytes.
+            dst->size = 0;
+            break;
+        case INDIRECT_DISPATCH_RAYS:
+        case INDIRECT_DISPATCH_MESH:
+        default:
+            // DXR and mesh dispatch signatures are not supported by this device.
+            goto invalid;
+        }
+        if (payload > UINT32_MAX - dst->size) goto invalid;
+        dst->payload_offset = payload;
+        payload += dst->size;
+    }
+    if (has_draw == has_dispatch || operation_count != 1 || operation != desc->count - 1 || (has_dispatch && (has_vb || has_ib)) ||
+        (has_ib && !has_indexed_draw) || ib_count > 1 || (has_root_args != (root != NULL)) || payload > desc->stride) goto invalid;
+    if (!out) { free(args); return S_FALSE; }
+    command_signature12 *s = alloc12(sizeof *s, K12_COMMAND_SIGNATURE, g_command_signature_vtbl, this);
+    s->base.destroy = command_signature_destroy;
+    s->stride = desc->stride; s->count = desc->count; s->payload_size = payload; s->args = args;
+    s->root = root; if (root) d3d_addref(&root->base);
+    s->gfx = has_draw;
+    HRESULT hr = command_signature_query(s, iid, out);
+    d3d_release(&s->base);
+    return hr;
+invalid:
+    free(args);
+    return E_INVALIDARG;
 }
 
 // ---- command lists: recording ------------------------------------------------------------------------------------------
@@ -987,17 +2623,44 @@ static cmd12 *rec(list12 *l, int op) {
 
 // (objects a recorded command names are held until the list is reset or released)
 static void hold(void *o) { if (o) d3d_addref(o); }
+static void list_allocator_stop_recording12(list12 *list) {
+    if (!list->allocator_recording || !list->allocator) return;
+    if (list->allocator->recording_lists) list->allocator->recording_lists--;
+    list->allocator_recording = 0;
+}
 static void list_clear(list12 *l) {
     for (uint32_t i = 0; i < l->n; i++) {
         cmd12 *c = &l->cmds[i];
+        free(c->rects);
+        for (uint32_t j = 0; c->immediate_writes && j < c->a; j++)
+            if (c->immediate_writes[j].resource) d3d_release(&c->immediate_writes[j].resource->base);
+        free(c->immediate_writes);
         if (c->obj) d3d_release(c->obj);
         if (c->obj2) d3d_release(c->obj2);
+        if (c->obj3) d3d_release(c->obj3);
         if (c->op == C_COPY_TEXTURE) { if (c->dst.res) d3d_release(c->dst.res); if (c->src.res) d3d_release(c->src.res); }
         for (int k = 0; k < 9; k++) if (c->tex[k]) CFRelease(c->tex[k]);
+        for (int k = 0; k < 9; k++) if (c->resource[k]) d3d_release(&c->resource[k]->base);
     }
+    gpu_ir_stream_clear(&l->gpu_ir);
+    l->recording_pso = NULL;
+    l->recording_topology = 4; // D3D12 triangle list; matches the replay state's initial topology.
+    l->recording_topology_set = 0;
     l->n = 0;
 }
-static void list_destroy(d3d_object *o) { list12 *l = (list12 *)o; list_clear(l); free(l->cmds); release_dev(o); }
+static void list_destroy(d3d_object *o) {
+    list12 *l = (list12 *)o;
+    pthread_mutex_lock(&l->dev->submit_lock);
+    list_allocator_stop_recording12(l);
+    allocator12 *allocator = l->allocator;
+    l->allocator = NULL;
+    pthread_mutex_unlock(&l->dev->submit_lock);
+    if (allocator) d3d_release(&allocator->base);
+    list_clear(l);
+    gpu_ir_stream_destroy(&l->gpu_ir);
+    free(l->cmds);
+    release_dev(o);
+}
 
 static WINAPI HRESULT list_query(void *this, const GUID *iid, void **out) {
     const GUID *k[] = { &IID_ID3D12GraphicsCommandList, &IID_ID3D12GraphicsCommandList1, &IID_ID3D12GraphicsCommandList2, &IID_ID3D12GraphicsCommandList3,
@@ -1006,15 +2669,196 @@ static WINAPI HRESULT list_query(void *this, const GUID *iid, void **out) {
     return query(this, iid, out, k, 11);
 }
 static WINAPI int32_t list_type(void *this) { return ((list12 *)this)->type; }
-static WINAPI HRESULT list_close(void *this) { ((list12 *)this)->closed = 1; return S_OK; }
+static int list_bundle_commands_valid12(const list12 *bundle) {
+    if (!bundle || bundle->type != 1 || !bundle->closed || bundle->validation_error) return 0;
+    pso12 *pipeline = NULL;
+    int topology_set = 0;
+    for (uint32_t i = 0; i < bundle->n; i++) {
+        const cmd12 *command = &bundle->cmds[i];
+        switch (command->op) {
+        case C_PSO: {
+            pso12 *next = command->obj;
+            if (!next || next->base.kind != K12_PSO || next->dev != bundle->dev || !next->render) return 0;
+            pipeline = next;
+            break;
+        }
+        case C_ROOTSIG: {
+            rootsig12 *root = command->obj;
+            if (!command->gfx || (root && (root->base.kind != K12_ROOTSIG || root->dev != bundle->dev))) return 0;
+            break;
+        }
+        case C_HEAPS: {
+            heap12 *resources = command->obj, *samplers = command->obj2;
+            if ((resources && (resources->base.kind != K12_HEAP || resources->dev != bundle->dev || resources->desc.Type != 0)) ||
+                (samplers && (samplers->base.kind != K12_HEAP || samplers->dev != bundle->dev || samplers->desc.Type != 1))) return 0;
+            break;
+        }
+        case C_TABLE: case C_CONSTANTS: case C_ROOT_VA:
+            if (!command->gfx) return 0;
+            break;
+        case C_TOPOLOGY:
+            if (command->a < 1 || command->a > 5) return 0;
+            topology_set = 1;
+            break;
+        case C_VB: case C_IB: case C_BLEND_FACTOR: case C_STENCIL_REF:
+            break;
+        case C_DRAW: case C_DRAW_INDEXED:
+            if (command->a && command->b && (!pipeline || !topology_set)) return 0;
+            break;
+        case C_EXECUTE_INDIRECT: {
+            command_signature12 *signature = command->obj;
+            res12 *arguments = command->obj2;
+            if (!pipeline || !topology_set || !signature || signature->dev != bundle->dev || !signature->gfx ||
+                signature->root || signature->count != 1 || signature->payload_size != signature->args[0].size ||
+                (signature->args[0].type != INDIRECT_DRAW && signature->args[0].type != INDIRECT_DRAW_INDEXED) ||
+                command->obj3 || !arguments || arguments->dev != bundle->dev || !arguments->buffer) return 0;
+            break;
+        }
+        // Bundles cannot clear, copy, transition resources, dispatch compute, query, or nest another bundle.
+        default:
+            return 0;
+        }
+    }
+    return 1;
+}
+static int list_reserve12(list12 *list, uint32_t additional) {
+    if (additional > UINT32_MAX - list->n) return 0;
+    uint32_t need = list->n + additional;
+    if (need <= list->cap) return 1;
+    uint32_t capacity = list->cap ? list->cap : 64;
+    while (capacity < need) {
+        if (capacity > UINT32_MAX / 2) { capacity = need; break; }
+        capacity *= 2;
+    }
+    if ((size_t)capacity > SIZE_MAX / sizeof *list->cmds) return 0;
+    cmd12 *commands = realloc(list->cmds, (size_t)capacity * sizeof *commands);
+    if (!commands) return 0;
+    list->cmds = commands;
+    list->cap = capacity;
+    return 1;
+}
+static WINAPI HRESULT list_close(void *this) {
+    list12 *l = this;
+    pthread_mutex_lock(&l->dev->submit_lock);
+    if (l->closed) {
+        pthread_mutex_unlock(&l->dev->submit_lock);
+        return E_FAIL;
+    }
+    l->closed = 1;
+    list_allocator_stop_recording12(l);
+    if (l->type == 1 && !list_bundle_commands_valid12(l)) l->validation_error = E_INVALIDARG;
+    HRESULT hr = l->validation_error ? l->validation_error : S_OK;
+    pthread_mutex_unlock(&l->dev->submit_lock);
+    return hr;
+}
 static WINAPI HRESULT list_reset(void *this, void *allocator, void *pso) {
     list12 *l = this;
+    allocator12 *next_allocator = allocator;
+    pthread_mutex_lock(&l->dev->submit_lock);
+    if (!l->closed) {
+        pthread_mutex_unlock(&l->dev->submit_lock);
+        return E_FAIL;
+    }
+    if (l->validation_error) {
+        HRESULT hr = l->validation_error;
+        pthread_mutex_unlock(&l->dev->submit_lock);
+        return hr;
+    }
+    if (!next_allocator || next_allocator->base.kind != K12_ALLOCATOR || next_allocator->dev != l->dev ||
+        next_allocator->type != l->type || next_allocator->recording_lists) {
+        pthread_mutex_unlock(&l->dev->submit_lock);
+        return E_INVALIDARG;
+    }
     list_clear(l);
+    if (next_allocator != l->allocator) {
+        d3d_addref(&next_allocator->base);
+        allocator12 *old_allocator = l->allocator;
+        l->allocator = next_allocator;
+        if (old_allocator) d3d_release(&old_allocator->base);
+    }
+    l->allocator_generation = next_allocator->generation;
+    next_allocator->recording_lists++;
+    l->allocator_recording = 1;
     l->closed = 0;
-    if (pso) { cmd12 *c = rec(l, C_PSO); c->obj = pso; hold(pso); }
+    l->validation_error = S_OK;
+    l->recording_topology = 4;
+    l->recording_topology_set = 0;
+    if (pso) {
+        cmd12 *c = rec(l, C_PSO);
+        c->obj = pso;
+        hold(pso);
+        l->recording_pso = ((d3d_object *)pso)->kind == K12_PSO ? (pso12 *)pso : NULL;
+    }
+    pthread_mutex_unlock(&l->dev->submit_lock);
     return S_OK;
 }
-static WINAPI void list_set_pso(void *this, void *pso) { cmd12 *c = rec(this, C_PSO); c->obj = pso; hold(pso); }
+static WINAPI void list_set_pso(void *this, void *pso) {
+    list12 *list = this;
+    cmd12 *c = rec(list, C_PSO);
+    c->obj = pso;
+    hold(pso);
+    list->recording_pso = pso && ((d3d_object *)pso)->kind == K12_PSO ? (pso12 *)pso : NULL;
+}
+static WINAPI void list_execute_bundle(void *this, void *bundle) {
+    list12 *parent = this, *child = bundle;
+    if (!parent || parent->validation_error) return;
+    if (parent->closed || parent->type != 0 || !child || child->base.kind != K12_LIST ||
+        child->dev != parent->dev || !list_bundle_commands_valid12(child)) {
+        parent->validation_error = E_INVALIDARG;
+        return;
+    }
+    if (parent->n > UINT32_MAX - 2 || child->n > UINT32_MAX - parent->n - 2 ||
+        !list_reserve12(parent, child->n + 2)) {
+        parent->validation_error = E_OUTOFMEMORY;
+        return;
+    }
+    rec(parent, C_BUNDLE_BEGIN);
+    parent->recording_pso = NULL;
+    parent->recording_topology_set = 0;
+    for (uint32_t i = 0; i < child->n; i++) {
+        const cmd12 *source = &child->cmds[i];
+        cmd12 *copy = &parent->cmds[parent->n++];
+        *copy = *source;
+        hold(copy->obj);
+        hold(copy->obj2);
+        hold(copy->obj3);
+        if (copy->op == C_DRAW || copy->op == C_DRAW_INDEXED || copy->op == C_EXECUTE_INDIRECT) {
+            copy->gpu_ir_recorded = 0;
+            copy->gpu_ir_index = GPU_IR_NO_COMMAND;
+            copy->gpu_ir_transient = copy->op != C_EXECUTE_INDIRECT;
+        }
+        if (copy->op == C_PSO) parent->recording_pso = copy->obj;
+        if (copy->op == C_TOPOLOGY) {
+            parent->recording_topology = copy->a;
+            parent->recording_topology_set = 1;
+        }
+        if (copy->op == C_EXECUTE_INDIRECT && parent->recording_pso &&
+            parent->recording_pso->render && parent->recording_pso->gpu_pipeline &&
+            parent->recording_topology_set && parent->recording_topology >= 1 && parent->recording_topology <= 5) {
+            command_signature12 *signature = copy->obj;
+            res12 *arguments = copy->obj2;
+            if (signature && arguments && !copy->obj3 && signature->gfx && !signature->root &&
+                signature->count == 1 && arguments->gpu_buffer &&
+                (signature->args[0].type == INDIRECT_DRAW || signature->args[0].type == INDIRECT_DRAW_INDEXED)) {
+                gpu_ir_indirect_draw_info draw = {
+                    .topology = parent->recording_topology,
+                    .indexed = signature->args[0].type == INDIRECT_DRAW_INDEXED,
+                    .draw_count = copy->a, .stride = signature->stride,
+                    .argument_offset = copy->off
+                };
+                uint32_t index = GPU_IR_NO_COMMAND;
+                int rc = gpu_ir_record_draw_indirect_counted(&parent->gpu_ir,
+                    parent->recording_pso->gpu_pipeline, arguments->gpu_buffer, NULL, &draw, &index);
+                if (rc == GPU_IR_OUT_OF_MEMORY) parent->validation_error = E_OUTOFMEMORY;
+                else if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
+                    copy->gpu_ir_recorded = 1;
+                    copy->gpu_ir_index = index;
+                }
+            }
+        }
+    }
+    rec(parent, C_BUNDLE_END);
+}
 static WINAPI void list_set_root(void *this, void *rs) { cmd12 *c = rec(this, C_ROOTSIG); c->obj = rs; hold(rs); }
 static WINAPI void list_set_heaps(void *this, uint32_t n, void *const *heaps) {
     cmd12 *c = rec(this, C_HEAPS);
@@ -1035,25 +2879,945 @@ static WINAPI void list_set_constants(void *this, uint32_t param, uint32_t n, co
     memcpy(c->values, values, 4 * c->b);
 }
 static WINAPI void list_set_root_va(void *this, uint32_t param, uint64_t va) { cmd12 *c = rec(this, C_ROOT_VA); c->a = param; c->va = va; }
-static WINAPI void list_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) { cmd12 *c = rec(this, C_DISPATCH); c->a = x; c->b = y; c->c = z; }
+static WINAPI void list_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) {
+    list12 *list = this;
+    if (!x || !y || !z) return;
+    cmd12 *command = rec(list, C_DISPATCH);
+    command->a = x; command->b = y; command->c = z;
+    pso12 *pipeline = list->recording_pso;
+    if (pipeline && pipeline->gpu_pipeline) {
+        uint32_t index = GPU_IR_NO_COMMAND;
+        int rc = gpu_ir_record_dispatch(&list->gpu_ir, pipeline->gpu_pipeline, x, y, z, &index);
+        if (rc == GPU_IR_OUT_OF_MEMORY) list->validation_error = E_OUTOFMEMORY;
+        else if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
+            command->gpu_ir_recorded = 1;
+            command->gpu_ir_index = index;
+        }
+    }
+}
+static WINAPI void list_execute_indirect(void *this, void *signature, uint32_t max_count, void *arguments,
+                                         uint64_t argument_offset, void *count_buffer, uint64_t count_offset) {
+    list12 *l = this;
+    if (l->validation_error) return;
+    command_signature12 *s = signature;
+    res12 *arg = arguments, *count = count_buffer;
+    int bundle_draw = l->type == 1 && s && s->gfx && !s->root && s->count == 1 && !count &&
+        (s->args[0].type == INDIRECT_DRAW || s->args[0].type == INDIRECT_DRAW_INDEXED) &&
+        s->payload_size == s->args[0].size;
+    if (!s || s->base.kind != K12_COMMAND_SIGNATURE || s->dev != l->dev || !arg ||
+        arg->base.kind != K12_RESOURCE || arg->dev != l->dev || arg->desc.Dimension != 1 ||
+        (count && (count->base.kind != K12_RESOURCE || count->dev != l->dev || count->desc.Dimension != 1)) ||
+        (l->type != 0 && l->type != 2 && !bundle_draw) || (l->type == 2 && s->gfx)) {
+        l->validation_error = E_INVALIDARG;
+        return;
+    }
+    uint64_t bytes = (uint64_t)max_count * s->stride;
+    if ((argument_offset & 3) || argument_offset > arg->buffer.length || bytes > arg->buffer.length - argument_offset ||
+        (count && ((count_offset & 3) || count_offset > count->buffer.length || 4 > count->buffer.length - count_offset))) {
+        l->validation_error = E_INVALIDARG;
+        return;
+    }
+    cmd12 *c = rec(l, C_EXECUTE_INDIRECT);
+    c->obj = s; hold(s);
+    c->obj2 = arg; hold(arg);
+    c->obj3 = count; hold(count);
+    c->a = max_count; c->off = argument_offset; c->off2 = count_offset;
+    if ((!count || count->gpu_buffer) && !s->gfx && !s->root && s->count == 1 &&
+        s->payload_size == 12 && s->args[0].type == INDIRECT_DISPATCH &&
+        s->args[0].payload_offset == 0 && arg->gpu_buffer && l->recording_pso &&
+        l->recording_pso->compute && l->recording_pso->gpu_pipeline) {
+        gpu_ir_indirect_dispatch_info dispatch = {
+            .dispatch_count = max_count, .stride = s->stride,
+            .argument_offset = argument_offset, .count_offset = count ? count_offset : 0
+        };
+        uint32_t index = GPU_IR_NO_COMMAND;
+        int rc = gpu_ir_record_dispatch_indirect_range_counted(&l->gpu_ir,
+            l->recording_pso->gpu_pipeline, arg->gpu_buffer, count ? count->gpu_buffer : NULL,
+            &dispatch, &index);
+        if (rc == GPU_IR_OUT_OF_MEMORY) l->validation_error = E_OUTOFMEMORY;
+        else if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
+            c->gpu_ir_recorded = 1;
+            c->gpu_ir_index = index;
+        }
+    }
+    if ((!count || count->gpu_buffer) && s->gfx && !s->root && s->count == 1 && arg->gpu_buffer && l->recording_pso &&
+        l->recording_pso->render && l->recording_pso->gpu_pipeline &&
+        (s->args[0].type == INDIRECT_DRAW || s->args[0].type == INDIRECT_DRAW_INDEXED) &&
+        s->payload_size == s->args[0].size) {
+        uint32_t topology = l->recording_topology >= 1 && l->recording_topology <= 5 ? l->recording_topology : 4;
+        gpu_ir_indirect_draw_info draw = {
+            .topology = topology, .indexed = s->args[0].type == INDIRECT_DRAW_INDEXED,
+            .draw_count = max_count, .stride = s->stride, .argument_offset = argument_offset,
+            .count_offset = count_offset
+        };
+        uint32_t index = GPU_IR_NO_COMMAND;
+        int rc = gpu_ir_record_draw_indirect_counted(&l->gpu_ir, l->recording_pso->gpu_pipeline,
+                                                      arg->gpu_buffer, count ? count->gpu_buffer : NULL,
+                                                      &draw, &index);
+        if (rc == GPU_IR_OUT_OF_MEMORY) l->validation_error = E_OUTOFMEMORY;
+        else if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
+            c->gpu_ir_recorded = 1;
+            c->gpu_ir_index = index;
+        }
+    }
+}
+static int list_record_gpu_buffer_copy(list12 *l, res12 *dst, uint64_t dst_off, res12 *src, uint64_t src_off, uint64_t size) {
+    if (!dst || !src || !dst->gpu_buffer || !src->gpu_buffer) {
+        vx_log("D3D12: buffer copy used a resource without a GPU buffer representation");
+        return 0;
+    }
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc = gpu_ir_record_copy_buffer(&l->gpu_ir, src->gpu_buffer, src_off, dst->gpu_buffer, dst_off, size, &index);
+    if (rc != GPU_IR_OK) {
+        vx_log("D3D12: buffer copy could not be lowered to the common GPU IR (error %d)", rc);
+        return 0;
+    }
+    if (index != GPU_IR_NO_COMMAND) {
+        cmd12 *c = rec(l, C_GPU_IR);
+        c->a = index;
+        c->b = UINT32_MAX;
+        c->gfx = D3D12_TRACK_COPY_BUFFER;
+        c->obj = dst; c->obj2 = src;
+        hold(dst); hold(src);
+    }
+    return 1;
+}
 static WINAPI void list_copy_buffer(void *this, void *dst, uint64_t dst_off, void *src, uint64_t src_off, uint64_t n) {
-    cmd12 *c = rec(this, C_COPY_BUFFER);
-    c->obj = dst; c->obj2 = src; c->off = dst_off; c->off2 = src_off; c->size = n;
-    hold(dst); hold(src);
+    list_record_gpu_buffer_copy(this, dst, dst_off, src, src_off, n);
 }
 static WINAPI void list_copy_resource(void *this, void *dst, void *src) {
+    list12 *l = this;
+    res12 *d = dst, *s = src;
+    if (d && s && d->gpu_buffer && s->gpu_buffer) {
+        uint32_t index = GPU_IR_NO_COMMAND;
+        int rc = gpu_ir_record_copy_resource(&l->gpu_ir, s->gpu_buffer, d->gpu_buffer, &index);
+        if (rc == GPU_IR_OK) {
+            cmd12 *command = rec(l, C_GPU_IR);
+            command->a = index;
+            command->b = UINT32_MAX;
+            command->gfx = D3D12_TRACK_COPY_RESOURCE;
+            command->obj = dst; command->obj2 = src;
+            hold(dst); hold(src);
+            return;
+        }
+        vx_log("D3D12: buffer CopyResource source and destination do not match (error %d)", rc);
+        return;
+    }
+    if (d && s && d->gpu_texture && s->gpu_texture && d->texture.pixelFormat == s->texture.pixelFormat) {
+        uint32_t index = GPU_IR_NO_COMMAND;
+        int rc = gpu_ir_record_copy_resource(&l->gpu_ir, s->gpu_texture, d->gpu_texture, &index);
+        if (rc == GPU_IR_OK) {
+            cmd12 *command = rec(l, C_GPU_IR);
+            command->a = index;
+            command->b = UINT32_MAX;
+            command->gfx = D3D12_TRACK_COPY_RESOURCE;
+            command->obj = dst; command->obj2 = src;
+            hold(dst); hold(src);
+            return;
+        }
+        vx_log("D3D12: texture CopyResource source and destination do not match (error %d)", rc);
+        return;
+    }
     cmd12 *c = rec(this, C_COPY_RESOURCE);
     c->obj = dst; c->obj2 = src;
     hold(dst); hold(src);
 }
+
+static res12 *d3d12_barrier_resource(void *resource);
+static uint32_t d3d12_resource_plane_count(uint32_t format);
+
+static uint32_t d3d12_resolve_format_family(uint32_t format) {
+    if (format >= 1 && format <= 4) return 1;
+    if (format >= 5 && format <= 8) return 2;
+    if (format >= 9 && format <= 14) return 3;
+    if (format >= 15 && format <= 18) return 4;
+    if (format >= 19 && format <= 22) return 5;
+    if (format >= 23 && format <= 25) return 6;
+    if (format >= 27 && format <= 32) return 7;
+    if (format >= 33 && format <= 38) return 8;
+    if (format >= 39 && format <= 43) return 9;
+    if (format >= 44 && format <= 47) return 10;
+    if (format >= 48 && format <= 52) return 11;
+    if (format >= 53 && format <= 59) return 12;
+    if (format >= 60 && format <= 64) return 13;
+    return 0;
+}
+
+static int d3d12_resolve_typeless(uint32_t format) {
+    switch (format) {
+    case 1: case 5: case 9: case 15: case 19: case 23: case 27:
+    case 33: case 39: case 44: case 48: case 53: case 60:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int d3d12_resolve_format_valid(uint32_t source, uint32_t destination, uint32_t format) {
+    if (source == destination && source == format && !d3d12_resolve_typeless(source)) return 1;
+    uint32_t family = d3d12_resolve_format_family(format);
+    if (!family || d3d12_resolve_typeless(format) ||
+        d3d12_resolve_format_family(source) != family || d3d12_resolve_format_family(destination) != family) return 0;
+    if (!d3d12_resolve_typeless(source) && source != format) return 0;
+    if (!d3d12_resolve_typeless(destination) && destination != format) return 0;
+    return 1;
+}
+
+static int d3d12_resolve_location(res12 *resource, uint32_t subresource, gpu_ir_resolve_location *location) {
+    uint32_t mips = resource->desc.MipLevels ? resource->desc.MipLevels : 1;
+    uint32_t slices = resource->desc.DepthOrArraySize;
+    uint32_t planes = d3d12_resource_plane_count(resource->desc.Format);
+    uint64_t plane_size = (uint64_t)mips * slices;
+    if (subresource >= plane_size * planes || !plane_size || subresource / plane_size) return 0;
+    location->mip_level = subresource % mips;
+    location->array_slice = subresource / mips;
+    return 1;
+}
+
+static int d3d12_depth_resolve_format(uint32_t format) {
+    return format == 20 || format == 40 || format == 45 || format == 55;
+}
+
+static int d3d12_depth_average_resolve_format(uint32_t format) {
+    // Metal fragment depth output preserves the native depth representation for these formats.
+    return format == 40 || format == 55;
+}
+
+static int d3d12_depth_resolve_supported12(dev12 *device) {
+    return device && [device->mtl supportsFamily:MTLGPUFamilyApple3];
+}
+
+static uint32_t gpu_ir_mip_extent(uint32_t size, uint32_t mip);
+static BOOL d3d12_color_resolve_float_format(MTLPixelFormat format);
+static BOOL d3d12_color_resolve_format_supported(MTLPixelFormat format);
+
+static void list_resolve_subresource_region_mode12(list12 *list, void *dst, uint32_t dst_subresource,
+                                                   uint32_t dst_x, uint32_t dst_y, void *src,
+                                                   uint32_t src_subresource, const RECT12 *src_rect,
+                                                   uint32_t format, uint32_t mode) {
+    if (list->validation_error) return;
+    res12 *destination = d3d12_barrier_resource(dst), *source = d3d12_barrier_resource(src);
+    gpu_ir_resolve_location src_location, dst_location;
+    gpu_ir_resolve_region region = { 0 };
+    int depth_format = d3d12_depth_resolve_format(format);
+    int depth_mode = mode == GPU_IR_RESOLVE_MODE_MIN || mode == GPU_IR_RESOLVE_MODE_MAX;
+    int depth_average_mode = mode == GPU_IR_RESOLVE_MODE_AVERAGE && d3d12_depth_average_resolve_format(format);
+    int depth_operation = depth_format && (depth_mode || depth_average_mode);
+    int color_average_mode = mode == GPU_IR_RESOLVE_MODE_AVERAGE && !depth_format &&
+        d3d12_color_resolve_float_format(source ? source->texture.pixelFormat : MTLPixelFormatInvalid);
+    int color_extrema_mode = depth_mode && !depth_format &&
+        d3d12_color_resolve_format_supported(source ? source->texture.pixelFormat : MTLPixelFormatInvalid);
+    int mode_valid = depth_operation || color_average_mode || color_extrema_mode;
+    int flags_valid = depth_format
+        ? destination && source && (source->desc.Flags & 0x2) && (destination->desc.Flags & 0x2) &&
+          d3d12_depth_resolve_supported12(list->dev)
+        : destination && source && (source->desc.Flags & 0x1) && (destination->desc.Flags & 0x1) &&
+          !(source->desc.Flags & 0x2) && !(destination->desc.Flags & 0x2);
+    if (!mode_valid || !flags_valid || !destination || !source || source->dev != list->dev ||
+        destination->dev != list->dev || !source->gpu_texture || !destination->gpu_texture || source == destination ||
+        source->desc.Dimension != 3 || destination->desc.Dimension != 3 ||
+        source->desc.SampleCount <= 1 || destination->desc.SampleCount != 1 ||
+        source->desc.SampleQuality != 0 || destination->desc.SampleQuality != 0 ||
+        !d3d12_resolve_format_valid(source->desc.Format, destination->desc.Format, format) ||
+        source->texture.pixelFormat != destination->texture.pixelFormat ||
+        !d3d12_resolve_location(source, src_subresource, &src_location) ||
+        !d3d12_resolve_location(destination, dst_subresource, &dst_location)) {
+        vx_log("D3D12: resolve has unsupported mode, resources, formats, or subresources");
+        list->validation_error = E_INVALIDARG;
+        return;
+    }
+    const gpu_ir_texture_desc *source_desc = gpu_ir_texture_description(source->gpu_texture);
+    const gpu_ir_texture_desc *destination_desc = gpu_ir_texture_description(destination->gpu_texture);
+    if (!source_desc || !destination_desc) {
+        list->validation_error = E_INVALIDARG;
+        return;
+    }
+    uint32_t source_width = gpu_ir_mip_extent(source_desc->width, src_location.mip_level);
+    uint32_t source_height = gpu_ir_mip_extent(source_desc->height, src_location.mip_level);
+    uint32_t destination_width = gpu_ir_mip_extent(destination_desc->width, dst_location.mip_level);
+    uint32_t destination_height = gpu_ir_mip_extent(destination_desc->height, dst_location.mip_level);
+    if (src_rect) {
+        int64_t width = (int64_t)src_rect->right - src_rect->left;
+        int64_t height = (int64_t)src_rect->bottom - src_rect->top;
+        if (src_rect->left < 0 || src_rect->top < 0 || width <= 0 || height <= 0 ||
+            width > UINT32_MAX || height > UINT32_MAX) {
+            vx_log("D3D12: ResolveSubresourceRegion has an empty or negative source rectangle");
+            list->validation_error = E_INVALIDARG;
+            return;
+        }
+        region.source_x = (uint32_t)src_rect->left;
+        region.source_y = (uint32_t)src_rect->top;
+        region.width = (uint32_t)width;
+        region.height = (uint32_t)height;
+    } else {
+        region.width = source_width;
+        region.height = source_height;
+    }
+    region.destination_x = dst_x;
+    region.destination_y = dst_y;
+    if (!region.width || !region.height || region.source_x > source_width ||
+        region.width > source_width - region.source_x || region.source_y > source_height ||
+        region.height > source_height - region.source_y || region.destination_x > destination_width ||
+        region.width > destination_width - region.destination_x || region.destination_y > destination_height ||
+        region.height > destination_height - region.destination_y) {
+        vx_log("D3D12: ResolveSubresourceRegion rectangle exceeds its source or destination subresource");
+        list->validation_error = E_INVALIDARG;
+        return;
+    }
+    BOOL full_region = !region.source_x && !region.source_y && !region.destination_x && !region.destination_y &&
+        region.width == source_width && region.height == source_height &&
+        source_width == destination_width && source_height == destination_height;
+    if (depth_operation && !full_region &&
+        (!d3d12_depth_average_resolve_format(format) ||
+         !(destination->texture.usage & MTLTextureUsageRenderTarget))) {
+        vx_log("D3D12: partial depth resolve format or destination usage is unsupported by the Metal path");
+        list->validation_error = E_INVALIDARG;
+        return;
+    }
+    if ((color_extrema_mode || (color_average_mode && !full_region)) &&
+        !(destination->texture.usage & MTLTextureUsageRenderTarget)) {
+        vx_log("D3D12: color resolve destination lacks Metal render-target usage");
+        list->validation_error = E_INVALIDARG;
+        return;
+    }
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc = gpu_ir_record_resolve_texture_region(&list->gpu_ir, source->gpu_texture, &src_location,
+        destination->gpu_texture, &dst_location, &region, mode, &index);
+    if (rc != GPU_IR_OK) {
+        vx_log("D3D12: resolve could not be lowered to the common GPU IR (error %d)", rc);
+        list->validation_error = rc == GPU_IR_OUT_OF_MEMORY ? E_OUTOFMEMORY : E_INVALIDARG;
+        return;
+    }
+    cmd12 *command = rec(list, C_GPU_IR);
+    command->a = index;
+    command->b = UINT32_MAX;
+    command->gfx = D3D12_TRACK_RESOLVE;
+    command->obj = destination; command->obj2 = source;
+    command->c = src_subresource; command->off = dst_subresource;
+    hold(destination); hold(source);
+}
+
+static void list_resolve_subresource_mode12(list12 *list, void *dst, uint32_t dst_subresource,
+                                            void *src, uint32_t src_subresource, uint32_t format, uint32_t mode) {
+    res12 *destination = d3d12_barrier_resource(dst), *source = d3d12_barrier_resource(src);
+    gpu_ir_resolve_location src_location, dst_location;
+    if (!source || !destination || source->desc.Width != destination->desc.Width ||
+        source->desc.Height != destination->desc.Height ||
+        source->desc.DepthOrArraySize != destination->desc.DepthOrArraySize ||
+        !d3d12_resolve_location(source, src_subresource, &src_location) ||
+        !d3d12_resolve_location(destination, dst_subresource, &dst_location)) {
+        if (list && !list->validation_error) list->validation_error = E_INVALIDARG;
+        return;
+    }
+    const gpu_ir_texture_desc *source_desc = gpu_ir_texture_description(source->gpu_texture);
+    const gpu_ir_texture_desc *destination_desc = gpu_ir_texture_description(destination->gpu_texture);
+    if (!source_desc || !destination_desc ||
+        gpu_ir_mip_extent(source_desc->width, src_location.mip_level) !=
+            gpu_ir_mip_extent(destination_desc->width, dst_location.mip_level) ||
+        gpu_ir_mip_extent(source_desc->height, src_location.mip_level) !=
+            gpu_ir_mip_extent(destination_desc->height, dst_location.mip_level)) {
+        if (list && !list->validation_error) list->validation_error = E_INVALIDARG;
+        return;
+    }
+    list_resolve_subresource_region_mode12(list, dst, dst_subresource, 0, 0, src, src_subresource,
+                                          NULL, format, mode);
+}
+
+static WINAPI void list_resolve_subresource(void *this, void *dst, uint32_t dst_subresource,
+                                            void *src, uint32_t src_subresource, uint32_t format) {
+    list_resolve_subresource_mode12(this, dst, dst_subresource, src, src_subresource, format,
+                                    GPU_IR_RESOLVE_MODE_AVERAGE);
+}
+
+// Metal resolves color attachments by averaging, and depth attachments by sample min/max on Apple3+.
+// Partial color average and supported D16/D32 depth resolves use render passes; decompression remains unsupported.
+static WINAPI void list_resolve_subresource_region(void *this, void *dst, uint32_t dst_subresource,
+                                                    uint32_t dst_x, uint32_t dst_y, void *src,
+                                                    uint32_t src_subresource, RECT12 *src_rect,
+                                                    uint32_t format, int32_t mode) {
+    list12 *list = this;
+    if (list->validation_error) return;
+    uint32_t ir_mode = mode == D3D12_RESOLVE_MODE_AVERAGE12 ? GPU_IR_RESOLVE_MODE_AVERAGE :
+                       mode == D3D12_RESOLVE_MODE_MIN12 ? GPU_IR_RESOLVE_MODE_MIN :
+                       mode == D3D12_RESOLVE_MODE_MAX12 ? GPU_IR_RESOLVE_MODE_MAX : 0;
+    if (!ir_mode) {
+        vx_log("D3D12: ResolveSubresourceRegion has an unsupported resolve mode");
+        list->validation_error = E_INVALIDARG;
+        return;
+    }
+    list_resolve_subresource_region_mode12(list, dst, dst_subresource, dst_x, dst_y, src,
+        src_subresource, src_rect, format, ir_mode);
+}
+
+static uint32_t gpu_ir_mip_extent(uint32_t size, uint32_t mip) {
+    return mip >= 32 ? 1 : (size >> mip) ? (size >> mip) : 1;
+}
+
+// Resolve the D3D12 copy location into a common buffer or texture reference. Plane subresources and
+// unsupported pixel formats stay on the established D3D12 replay path below.
+static int d3d12_gpu_ir_copy_location(res12 *resource, const COPY_LOC *location, uint32_t x, uint32_t y, uint32_t z,
+                                      gpu_ir_resource **ir_resource, gpu_ir_texture_location *ir_location) {
+    if (!resource || !location || !ir_resource || !ir_location) return 0;
+    memset(ir_location, 0, sizeof *ir_location);
+    if (location->type == 1) {
+        uint32_t block_width = 1, block_height = 1, bytes_per_block = 0;
+        if (!resource->gpu_buffer || !gpu_ir_resource_is_buffer(resource->gpu_buffer) || !location->footprint.row_pitch ||
+            !location->footprint.width || !location->footprint.height || !location->footprint.depth ||
+            (location->footprint.offset & 511) || (location->footprint.row_pitch & 255)) return 0;
+        if (!d3d_copy_format_block(location->footprint.format, &block_width, &block_height, &bytes_per_block)) return 0;
+        ir_location->buffer_offset = location->footprint.offset;
+        ir_location->row_pitch = location->footprint.row_pitch;
+        ir_location->image_pitch = (uint64_t)location->footprint.row_pitch *
+                                   (((uint64_t)location->footprint.height + block_height - 1) / block_height);
+        ir_location->buffer_width = location->footprint.width;
+        ir_location->buffer_height = location->footprint.height;
+        ir_location->buffer_depth = location->footprint.depth;
+        ir_location->origin_x = x;
+        ir_location->origin_y = y;
+        ir_location->origin_z = z;
+        *ir_resource = resource->gpu_buffer;
+        return 1;
+    }
+    if (location->type != 0 || !resource->gpu_texture) return 0;
+    if (resource->texture.sampleCount > 1 || (resource->desc.Flags & 0x2)) return 0;
+    const gpu_ir_texture_desc *texture = gpu_ir_texture_description(resource->gpu_texture);
+    if (!texture) return 0;
+    uint32_t mips = texture->mip_levels;
+    uint32_t subresource = location->subresource;
+    if (texture->is_3d) {
+        if (subresource >= mips) return 0; // D3D12 3D texture subresources have no array-slice component.
+        ir_location->mip_level = subresource;
+    } else {
+        ir_location->mip_level = subresource % mips;
+        ir_location->array_slice = subresource / mips;
+        if (ir_location->array_slice >= texture->array_layers) return 0; // Also excludes unsupported plane indices.
+    }
+    ir_location->origin_x = x;
+    ir_location->origin_y = y;
+    ir_location->origin_z = z;
+    *ir_resource = resource->gpu_texture;
+    return 1;
+}
+
+static int list_record_gpu_texture_copy(list12 *list, res12 *dst, const COPY_LOC *dst_location,
+                                       uint32_t dst_x, uint32_t dst_y, uint32_t dst_z, res12 *src,
+                                       const COPY_LOC *src_location, const BOX *box) {
+    gpu_ir_resource *ir_src = NULL, *ir_dst = NULL;
+    gpu_ir_texture_location src_loc, dst_loc;
+    uint32_t src_x = box ? box->left : 0, src_y = box ? box->top : 0, src_z = box ? box->front : 0;
+    if (!d3d12_gpu_ir_copy_location(src, src_location, src_x, src_y, src_z, &ir_src, &src_loc) ||
+        !d3d12_gpu_ir_copy_location(dst, dst_location, dst_x, dst_y, dst_z, &ir_dst, &dst_loc)) return 0;
+    const gpu_ir_texture_desc *src_texture = gpu_ir_texture_description(ir_src);
+    const gpu_ir_texture_desc *dst_texture = gpu_ir_texture_description(ir_dst);
+    if (!src_texture && !dst_texture) return 0;
+    if (src_texture && dst_texture && src->texture.pixelFormat != dst->texture.pixelFormat) return 0;
+    const gpu_ir_texture_desc *format = src_texture ? src_texture : dst_texture;
+    if (src_location->type == 1) {
+        uint32_t block_width, block_height, bytes_per_block;
+        if (!d3d_copy_format_block(src_location->footprint.format, &block_width, &block_height, &bytes_per_block) ||
+            block_width != format->block_width || block_height != format->block_height ||
+            bytes_per_block != format->bytes_per_block ||
+            d3d_mtl_format(src_location->footprint.format, NULL) != dst->texture.pixelFormat) return 0;
+    }
+    if (dst_location->type == 1) {
+        uint32_t block_width, block_height, bytes_per_block;
+        if (!d3d_copy_format_block(dst_location->footprint.format, &block_width, &block_height, &bytes_per_block) ||
+            block_width != format->block_width || block_height != format->block_height ||
+            bytes_per_block != format->bytes_per_block ||
+            d3d_mtl_format(dst_location->footprint.format, NULL) != src->texture.pixelFormat) return 0;
+    }
+    if (src_texture && dst_texture && ir_src == ir_dst && src_loc.mip_level == dst_loc.mip_level &&
+        src_loc.array_slice == dst_loc.array_slice) {
+        vx_log("D3D12: CopyTextureRegion source and destination name the same subresource");
+        return 1;
+    }
+
+    uint32_t width, height, depth;
+    if (box) {
+        if (box->right < box->left || box->bottom < box->top || box->back < box->front) {
+            vx_log("D3D12: CopyTextureRegion has an inverted source box");
+            return 1;
+        }
+        width = box->right - box->left;
+        height = box->bottom - box->top;
+        depth = box->back - box->front;
+    } else if (src_texture) {
+        width = gpu_ir_mip_extent(src_texture->width, src_loc.mip_level);
+        height = gpu_ir_mip_extent(src_texture->height, src_loc.mip_level);
+        depth = src_texture->is_3d ? gpu_ir_mip_extent(src_texture->depth, src_loc.mip_level) : 1;
+    } else {
+        width = src_location->footprint.width;
+        height = src_location->footprint.height;
+        depth = src_location->footprint.depth;
+    }
+    if (!width || !height || !depth) return 1;
+
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc = gpu_ir_record_copy_texture(&list->gpu_ir, ir_src, &src_loc, ir_dst, &dst_loc,
+                                        width, height, depth, &index);
+    if (rc == GPU_IR_OK) {
+        if (index != GPU_IR_NO_COMMAND) {
+            cmd12 *command = rec(list, C_GPU_IR);
+            command->a = index;
+            command->b = UINT32_MAX;
+            command->gfx = D3D12_TRACK_COPY_TEXTURE;
+            command->obj = dst; command->obj2 = src;
+            command->c = src_location->type == 0 ? src_location->subresource : 0;
+            command->off = dst_location->type == 0 ? dst_location->subresource : 0;
+            hold(command->obj); hold(command->obj2);
+        }
+        return 1;
+    }
+    if (rc == GPU_IR_RANGE) {
+        vx_log("D3D12: CopyTextureRegion is outside the source/destination resource range");
+        return 1;
+    }
+    return 0;
+}
+
 static WINAPI void list_copy_texture(void *this, const COPY_LOC *dst, uint32_t x, uint32_t y, uint32_t z, const COPY_LOC *src, const BOX *box) {
+    list12 *list = this;
+    if (dst && src && list_record_gpu_texture_copy(list, dst->res, dst, x, y, z, src->res, src, box)) return;
     cmd12 *c = rec(this, C_COPY_TEXTURE);
     c->dst = *dst; c->src = *src;
     c->a = x; c->b = y; c->c = z;
     if (box) { c->box = *box; c->has_box = 1; }
     hold(dst->res); hold(src->res);
 }
-static WINAPI void list_barrier(void *this, uint32_t n, const void *barriers) { rec(this, C_UAV_BARRIER); }   // (Metal tracks the hazards it sees; see replay)
+static int d3d12_barrier_state_access(uint32_t state, uint32_t *access) {
+    const uint32_t known = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX | D3D12_STATE_RENDER_TARGET |
+        D3D12_STATE_UAV | D3D12_STATE_DEPTH_WRITE | D3D12_STATE_DEPTH_READ | D3D12_STATE_NON_PIXEL_SHADER |
+        D3D12_STATE_PIXEL_SHADER | D3D12_STATE_STREAM_OUT | D3D12_STATE_INDIRECT | D3D12_STATE_COPY_DEST |
+        D3D12_STATE_COPY_SOURCE | D3D12_STATE_RESOLVE_DEST | D3D12_STATE_RESOLVE_SOURCE |
+        D3D12_STATE_VIDEO_DECODE_READ | D3D12_STATE_VIDEO_DECODE_WRITE | D3D12_STATE_VIDEO_PROCESS_READ |
+        D3D12_STATE_VIDEO_PROCESS_WRITE | D3D12_STATE_VIDEO_ENCODE_READ | D3D12_STATE_VIDEO_ENCODE_WRITE |
+        D3D12_STATE_RAYTRACING_AS | D3D12_STATE_SHADING_RATE;
+    const uint32_t read_only = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX | D3D12_STATE_DEPTH_READ |
+        D3D12_STATE_NON_PIXEL_SHADER | D3D12_STATE_PIXEL_SHADER | D3D12_STATE_INDIRECT |
+        D3D12_STATE_COPY_SOURCE | D3D12_STATE_RESOLVE_SOURCE | D3D12_STATE_VIDEO_DECODE_READ |
+        D3D12_STATE_VIDEO_PROCESS_READ | D3D12_STATE_VIDEO_ENCODE_READ | D3D12_STATE_SHADING_RATE;
+    const uint32_t write_only = D3D12_STATE_RENDER_TARGET | D3D12_STATE_DEPTH_WRITE | D3D12_STATE_STREAM_OUT |
+        D3D12_STATE_COPY_DEST | D3D12_STATE_RESOLVE_DEST | D3D12_STATE_VIDEO_DECODE_WRITE |
+        D3D12_STATE_VIDEO_PROCESS_WRITE | D3D12_STATE_VIDEO_ENCODE_WRITE;
+    if (state & ~known) return 0;
+    if ((state & D3D12_STATE_UAV) && state != D3D12_STATE_UAV) return 0;
+    if ((state & D3D12_STATE_DEPTH_WRITE) && state != D3D12_STATE_DEPTH_WRITE) return 0;
+    uint32_t writes = state & write_only;
+    if ((writes && (writes & (writes - 1))) || (writes && (state & read_only))) return 0;
+
+    uint32_t result = 0;
+    if (state & D3D12_STATE_VERTEX_CONSTANT) result |= GPU_IR_ACCESS_VERTEX_READ | GPU_IR_ACCESS_UNIFORM_READ;
+    if (state & D3D12_STATE_INDEX) result |= GPU_IR_ACCESS_INDEX_READ;
+    if (state & (D3D12_STATE_NON_PIXEL_SHADER | D3D12_STATE_PIXEL_SHADER | D3D12_STATE_SHADING_RATE |
+                 D3D12_STATE_VIDEO_DECODE_READ | D3D12_STATE_VIDEO_PROCESS_READ | D3D12_STATE_VIDEO_ENCODE_READ))
+        result |= GPU_IR_ACCESS_SHADER_READ;
+    if (state & D3D12_STATE_UAV) result |= GPU_IR_ACCESS_SHADER_READ | GPU_IR_ACCESS_SHADER_WRITE;
+    if (state & (D3D12_STATE_RENDER_TARGET)) result |= GPU_IR_ACCESS_COLOR_WRITE;
+    if (state & D3D12_STATE_DEPTH_READ) result |= GPU_IR_ACCESS_DEPTH_READ;
+    if (state & D3D12_STATE_DEPTH_WRITE) result |= GPU_IR_ACCESS_DEPTH_WRITE;
+    if (state & D3D12_STATE_STREAM_OUT) result |= GPU_IR_ACCESS_STREAM_WRITE;
+    if (state & D3D12_STATE_INDIRECT) result |= GPU_IR_ACCESS_INDIRECT_READ;
+    if (state & (D3D12_STATE_COPY_SOURCE | D3D12_STATE_VIDEO_DECODE_READ | D3D12_STATE_VIDEO_PROCESS_READ |
+                 D3D12_STATE_VIDEO_ENCODE_READ)) result |= GPU_IR_ACCESS_COPY_READ;
+    if (state & (D3D12_STATE_COPY_DEST | D3D12_STATE_VIDEO_DECODE_WRITE | D3D12_STATE_VIDEO_PROCESS_WRITE |
+                 D3D12_STATE_VIDEO_ENCODE_WRITE)) result |= GPU_IR_ACCESS_COPY_WRITE;
+    if (state & D3D12_STATE_RESOLVE_SOURCE) result |= GPU_IR_ACCESS_RESOLVE_READ;
+    if (state & D3D12_STATE_RESOLVE_DEST) result |= GPU_IR_ACCESS_RESOLVE_WRITE;
+    if (state & D3D12_STATE_RAYTRACING_AS) result |= GPU_IR_ACCESS_ACCELERATION_STRUCTURE;
+    *access = result;
+    return 1;
+}
+
+static res12 *d3d12_barrier_resource(void *resource) {
+    if (!resource || ((d3d_object *)resource)->kind != K12_RESOURCE) return NULL;
+    return resource;
+}
+
+static uint32_t d3d12_resource_plane_count(uint32_t format) {
+    switch (format) {
+    case 19: case 20: case 21: case 22: case 44: case 45: case 46: case 47:
+    case 103: case 104: case 105: case 110: case 130:
+        return 2;
+    case 131: case 132:
+        return 3;
+    default:
+        return 1;
+    }
+}
+
+static int d3d12_barrier_validate_transition(res12 *resource, const TRANSITION_BARRIER *transition,
+                                             uint32_t *before, uint32_t *after) {
+    uint32_t before_state = (uint32_t)transition->before, after_state = (uint32_t)transition->after;
+    if (!d3d12_barrier_state_access(before_state, before) || !d3d12_barrier_state_access(after_state, after) ||
+        before_state == after_state || (before_state & D3D12_STATE_RAYTRACING_AS) ||
+        (after_state & D3D12_STATE_RAYTRACING_AS) || resource->heap.Type == 2 || resource->heap.Type == 3) return 0;
+    uint32_t flags = (uint32_t)resource->desc.Flags;
+    if ((before_state & D3D12_STATE_RENDER_TARGET || after_state & D3D12_STATE_RENDER_TARGET) && !(flags & 0x1)) return 0;
+    if ((before_state & (D3D12_STATE_DEPTH_READ | D3D12_STATE_DEPTH_WRITE) ||
+         after_state & (D3D12_STATE_DEPTH_READ | D3D12_STATE_DEPTH_WRITE)) && !(flags & 0x2)) return 0;
+    if ((before_state & D3D12_STATE_UAV || after_state & D3D12_STATE_UAV) && !(flags & 0x4)) return 0;
+    if ((before_state & D3D12_STATE_RESOLVE_SOURCE) && resource->desc.SampleCount <= 1) return 0;
+    if ((after_state & D3D12_STATE_RESOLVE_SOURCE) && resource->desc.SampleCount <= 1) return 0;
+    if ((before_state & D3D12_STATE_RESOLVE_DEST) && resource->desc.SampleCount != 1) return 0;
+    if ((after_state & D3D12_STATE_RESOLVE_DEST) && resource->desc.SampleCount != 1) return 0;
+    if (transition->subresource != D3D12_ALL_SUBRESOURCES) {
+        uint64_t mips = resource->desc.MipLevels ? resource->desc.MipLevels : 1;
+        uint64_t slices = resource->desc.Dimension == 4 ? 1 : resource->desc.DepthOrArraySize;
+        uint64_t count = mips * slices * d3d12_resource_plane_count(resource->desc.Format);
+        if (transition->subresource >= count) return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    res12 *resource;
+    uint32_t initial_state;
+    uint32_t initial_promoted;
+    res_state_override12 *overrides;
+    res_state_pending12 *pending;
+} resource_state_shadow12;
+
+static int queue_validate_list_states12(dev12 *device, int32_t queue_type, id<MTLCommandQueue> metal_queue,
+        list12 *list, const d3d12_indirect_validation_override12 *overrides, uint32_t override_count,
+        resource_state_shadow12 **out_shadows, uint32_t *out_count);
+static void queue_discard_list_states12(resource_state_shadow12 *shadows, uint32_t count);
+
+static void state_overrides_free12(res_state_override12 *p) {
+    while (p) { res_state_override12 *next = p->next; free(p); p = next; }
+}
+static void state_pending_free12(res_state_pending12 *p) {
+    while (p) { res_state_pending12 *next = p->next; free(p); p = next; }
+}
+static int state_overrides_clone12(const res_state_override12 *source, res_state_override12 **out) {
+    res_state_override12 **tail = out;
+    *out = NULL;
+    for (; source; source = source->next) {
+        *tail = malloc(sizeof **tail);
+        if (!*tail) { state_overrides_free12(*out); *out = NULL; return 0; }
+        **tail = *source;
+        (*tail)->next = NULL;
+        tail = &(*tail)->next;
+    }
+    return 1;
+}
+static int state_pending_clone12(const res_state_pending12 *source, res_state_pending12 **out) {
+    res_state_pending12 **tail = out;
+    *out = NULL;
+    for (; source; source = source->next) {
+        *tail = malloc(sizeof **tail);
+        if (!*tail) { state_pending_free12(*out); *out = NULL; return 0; }
+        **tail = *source;
+        (*tail)->next = NULL;
+        tail = &(*tail)->next;
+    }
+    return 1;
+}
+static void state_shadow_clear12(resource_state_shadow12 *shadow) {
+    state_overrides_free12(shadow->overrides);
+    state_pending_free12(shadow->pending);
+    memset(shadow, 0, sizeof *shadow);
+}
+static resource_state_shadow12 *state_shadow_get12(resource_state_shadow12 **shadows, uint32_t *count,
+                                                    uint32_t *capacity, res12 *resource) {
+    for (uint32_t i = 0; i < *count; i++) if ((*shadows)[i].resource == resource) return &(*shadows)[i];
+    if (*count == *capacity) {
+        if (*capacity > UINT32_MAX / 2) return NULL;
+        uint32_t next_capacity = *capacity ? *capacity * 2 : 8;
+        resource_state_shadow12 *next = realloc(*shadows, next_capacity * sizeof **shadows);
+        if (!next) return NULL;
+        *shadows = next;
+        *capacity = next_capacity;
+    }
+    resource_state_shadow12 shadow = { .resource = resource, .initial_state = resource->initial_state,
+                                       .initial_promoted = resource->initial_promoted };
+    if (!state_overrides_clone12(resource->state_overrides, &shadow.overrides) ||
+        !state_pending_clone12(resource->pending_transitions, &shadow.pending)) {
+        state_shadow_clear12(&shadow);
+        return NULL;
+    }
+    (*shadows)[*count] = shadow;
+    return &(*shadows)[(*count)++];
+}
+static resource_state_shadow12 *state_shadow_find12(resource_state_shadow12 *shadows, uint32_t count, res12 *resource) {
+    for (uint32_t i = 0; i < count; i++) if (shadows[i].resource == resource) return &shadows[i];
+    return NULL;
+}
+static uint32_t state_get12(const resource_state_shadow12 *shadow, uint32_t subresource) {
+    for (const res_state_override12 *p = shadow->overrides; p; p = p->next)
+        if (p->subresource == subresource) return p->state;
+    return shadow->initial_state;
+}
+static uint32_t state_promoted12(const resource_state_shadow12 *shadow, uint32_t subresource) {
+    for (const res_state_override12 *p = shadow->overrides; p; p = p->next)
+        if (p->subresource == subresource) return p->promoted;
+    return shadow->initial_promoted;
+}
+static int state_is_read_only12(uint32_t state) {
+    const uint32_t writes = D3D12_STATE_RENDER_TARGET | D3D12_STATE_UAV | D3D12_STATE_DEPTH_WRITE |
+        D3D12_STATE_STREAM_OUT | D3D12_STATE_COPY_DEST | D3D12_STATE_RESOLVE_DEST |
+        D3D12_STATE_VIDEO_DECODE_WRITE | D3D12_STATE_VIDEO_PROCESS_WRITE | D3D12_STATE_VIDEO_ENCODE_WRITE;
+    uint32_t access;
+    return state && !(state & writes) && d3d12_barrier_state_access(state, &access);
+}
+static int state_can_promote12(const res12 *resource, uint32_t state) {
+    const uint32_t buffer_and_simultaneous = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX |
+        D3D12_STATE_RENDER_TARGET | D3D12_STATE_UAV | D3D12_STATE_NON_PIXEL_SHADER |
+        D3D12_STATE_PIXEL_SHADER | D3D12_STATE_STREAM_OUT | D3D12_STATE_INDIRECT |
+        D3D12_STATE_COPY_DEST | D3D12_STATE_COPY_SOURCE | D3D12_STATE_RESOLVE_DEST |
+        D3D12_STATE_RESOLVE_SOURCE;
+    const uint32_t ordinary_texture = D3D12_STATE_NON_PIXEL_SHADER | D3D12_STATE_PIXEL_SHADER |
+        D3D12_STATE_COPY_DEST | D3D12_STATE_COPY_SOURCE;
+    int buffer_or_simultaneous = resource->desc.Dimension == 1 || ((uint32_t)resource->desc.Flags & 0x20u);
+    uint32_t allowed = buffer_or_simultaneous ? buffer_and_simultaneous : ordinary_texture;
+    if (resource->heap.Type == 2) {
+        // Upload buffers can serve read accesses covered by GENERIC_READ, but never a write access.
+        allowed = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX | D3D12_STATE_NON_PIXEL_SHADER |
+            D3D12_STATE_PIXEL_SHADER | D3D12_STATE_INDIRECT | D3D12_STATE_COPY_SOURCE;
+    } else if (resource->heap.Type == 3) {
+        allowed = D3D12_STATE_COPY_DEST;
+    }
+    uint32_t access;
+    return state && !(state & ~allowed) && d3d12_barrier_state_access(state, &access);
+}
+static int state_queue_access_allowed12(uint32_t state, int32_t queue_type) {
+    if (!state) return 1;
+    if (queue_type == 3)
+        return state && !(state & ~(D3D12_STATE_COPY_SOURCE | D3D12_STATE_COPY_DEST));
+    if (queue_type == 2)
+        return !(state & (D3D12_STATE_PIXEL_SHADER | D3D12_STATE_RENDER_TARGET | D3D12_STATE_DEPTH_READ |
+                          D3D12_STATE_DEPTH_WRITE | D3D12_STATE_INDEX | D3D12_STATE_STREAM_OUT |
+                          D3D12_STATE_RESOLVE_SOURCE | D3D12_STATE_RESOLVE_DEST));
+    return 1;
+}
+static int state_can_promote_on_queue12(const res12 *resource, uint32_t state, int32_t queue_type) {
+    return state_can_promote12(resource, state) && state_queue_access_allowed12(state, queue_type);
+}
+static int state_assign12(resource_state_shadow12 *shadow, uint32_t subresource, uint32_t state, uint32_t promoted) {
+    res_state_override12 **link = &shadow->overrides;
+    while (*link && (*link)->subresource != subresource) link = &(*link)->next;
+    if (state == shadow->initial_state && promoted == shadow->initial_promoted) {
+        if (*link) { res_state_override12 *old = *link; *link = old->next; free(old); }
+        return 1;
+    }
+    if (*link) { (*link)->state = state; (*link)->promoted = promoted; return 1; }
+    res_state_override12 *entry = malloc(sizeof *entry);
+    if (!entry) return 0;
+    *entry = (res_state_override12){ .subresource = subresource, .state = state, .promoted = promoted,
+                                     .next = shadow->overrides };
+    shadow->overrides = entry;
+    return 1;
+}
+static int state_set12(resource_state_shadow12 *shadow, uint32_t subresource, uint32_t state) {
+    return state_assign12(shadow, subresource, state, 0);
+}
+static int state_promote12_set(resource_state_shadow12 *shadow, uint32_t subresource, uint32_t state) {
+    return state_assign12(shadow, subresource, state, 1);
+}
+static uint64_t resource_subresource_count12(const res12 *resource) {
+    if (resource->desc.Dimension == 1) return 1;
+    uint64_t mips = resource->desc.MipLevels ? resource->desc.MipLevels : 1;
+    uint64_t slices = resource->desc.Dimension == 4 ? 1 : resource->desc.DepthOrArraySize;
+    return mips * slices * d3d12_resource_plane_count(resource->desc.Format);
+}
+static int state_all_matches12(const resource_state_shadow12 *shadow, uint32_t expected) {
+    uint64_t count = resource_subresource_count12(shadow->resource);
+    for (uint64_t i = 0; i < count; i++) {
+        uint32_t actual = state_get12(shadow, (uint32_t)i);
+        if (actual == expected) continue;
+        if (actual != 0 || state_promoted12(shadow, (uint32_t)i) || !state_can_promote12(shadow->resource, expected)) return 0;
+    }
+    return 1;
+}
+static res_state_pending12 **state_pending_find12(resource_state_shadow12 *shadow, uint32_t subresource) {
+    res_state_pending12 **link = &shadow->pending;
+    while (*link && (*link)->subresource != subresource) link = &(*link)->next;
+    return link;
+}
+static int state_has_pending12(const resource_state_shadow12 *shadow) { return shadow->pending != NULL; }
+static int state_subresource_pending12(const resource_state_shadow12 *shadow, uint32_t subresource) {
+    for (const res_state_pending12 *p = shadow->pending; p; p = p->next)
+        if (p->subresource == D3D12_ALL_SUBRESOURCES || p->subresource == subresource) return 1;
+    return 0;
+}
+static int state_matches_before12(const resource_state_shadow12 *shadow, uint32_t subresource, uint32_t before) {
+    uint32_t actual = state_get12(shadow, subresource);
+    if (actual == before) return 1;
+    // Buffers and eligible textures may have decayed to COMMON after an earlier ExecuteCommandLists call.
+    return actual == 0 && !state_promoted12(shadow, subresource) && state_can_promote12(shadow->resource, before);
+}
+// Return 1 for a valid transition, 0 for an invalid state sequence, and -1 on allocation failure.
+static int state_transition12(resource_state_shadow12 *shadow, uint32_t subresource, uint32_t before,
+                              uint32_t after, uint32_t flags) {
+    if (flags == 1) { // BEGIN_ONLY: state changes only when the matching END_ONLY is submitted.
+        if ((subresource == D3D12_ALL_SUBRESOURCES ? state_has_pending12(shadow) :
+             state_subresource_pending12(shadow, subresource)) ||
+            (subresource == D3D12_ALL_SUBRESOURCES ? !state_all_matches12(shadow, before) :
+             !state_matches_before12(shadow, subresource, before))) return 0;
+        res_state_pending12 *pending = malloc(sizeof *pending);
+        if (!pending) return -1;
+        *pending = (res_state_pending12){ subresource, before, after, shadow->pending };
+        shadow->pending = pending;
+        return 1;
+    }
+    if (flags == 2) { // END_ONLY
+        res_state_pending12 **link = state_pending_find12(shadow, subresource);
+        if (!*link || (*link)->before != before || (*link)->after != after ||
+            (subresource == D3D12_ALL_SUBRESOURCES ? !state_all_matches12(shadow, before) :
+             !state_matches_before12(shadow, subresource, before))) return 0;
+        if (subresource == D3D12_ALL_SUBRESOURCES) {
+            shadow->initial_state = after;
+            shadow->initial_promoted = 0;
+            state_overrides_free12(shadow->overrides);
+            shadow->overrides = NULL;
+        } else if (!state_set12(shadow, subresource, after)) return -1;
+        res_state_pending12 *done = *link;
+        *link = done->next;
+        free(done);
+        return 1;
+    }
+    if (subresource == D3D12_ALL_SUBRESOURCES) {
+        if (state_has_pending12(shadow)) return 0;
+        if (!state_all_matches12(shadow, before)) return 0;
+        shadow->initial_state = after;
+        shadow->initial_promoted = 0;
+        state_overrides_free12(shadow->overrides);
+        shadow->overrides = NULL;
+        return 1;
+    }
+    if (state_subresource_pending12(shadow, subresource)) return 0;
+    if (!state_matches_before12(shadow, subresource, before)) return 0;
+    return state_set12(shadow, subresource, after) ? 1 : -1;
+}
+static int state_resource_use12(resource_state_shadow12 *shadow, uint32_t subresource,
+                                uint32_t required_state, int write, int32_t queue_type) {
+    uint64_t count = resource_subresource_count12(shadow->resource);
+    if (!state_queue_access_allowed12(required_state, queue_type)) return 0;
+    if (subresource == D3D12_ALL_SUBRESOURCES) {
+        if (state_has_pending12(shadow)) return 0;
+        for (uint64_t i = 0; i < count; i++)
+            if (!state_resource_use12(shadow, (uint32_t)i, required_state, write, queue_type)) return 0;
+        return 1;
+    }
+    if (subresource >= count || state_subresource_pending12(shadow, subresource)) return 0;
+    uint32_t state = state_get12(shadow, subresource), access;
+    if (state == 0 && !state_promoted12(shadow, subresource)) {
+        if (!state_can_promote_on_queue12(shadow->resource, required_state, queue_type)) return 0;
+        return state_promote12_set(shadow, subresource, required_state) ? 1 : -1;
+    }
+    if (state_promoted12(shadow, subresource) && state_is_read_only12(state) &&
+        state_is_read_only12(required_state) && state_can_promote_on_queue12(shadow->resource, required_state, queue_type)) {
+        uint32_t merged = state | required_state;
+        if (merged != state && state_can_promote_on_queue12(shadow->resource, merged, queue_type))
+            return state_promote12_set(shadow, subresource, merged) ? 1 : -1;
+    }
+    if (write) return state == required_state;
+    return (state & required_state) && d3d12_barrier_state_access(state, &access);
+}
+static int state_validate_resource_pair12(dev12 *device, int32_t queue_type, resource_state_shadow12 **shadows,
+                                          uint32_t *count, uint32_t *capacity, res12 *destination,
+                                          uint32_t destination_subresource, uint32_t destination_state,
+                                          res12 *source, uint32_t source_subresource, uint32_t source_state) {
+    if (!destination || !source || destination == source || destination->dev != device || source->dev != device ||
+        !resource_resident12(destination) || !resource_resident12(source)) return 0;
+    resource_state_shadow12 *source_shadow = state_shadow_get12(shadows, count, capacity, source);
+    resource_state_shadow12 *destination_shadow = state_shadow_get12(shadows, count, capacity, destination);
+    if (!source_shadow || !destination_shadow) return -1;
+    source_shadow = state_shadow_find12(*shadows, *count, source);
+    destination_shadow = state_shadow_find12(*shadows, *count, destination);
+    if (!source_shadow || !destination_shadow) return -1;
+    int source_result = state_resource_use12(source_shadow, source_subresource, source_state, 0, queue_type);
+    if (source_result <= 0) return source_result;
+    return state_resource_use12(destination_shadow, destination_subresource, destination_state, 1, queue_type);
+}
+static int state_validate_resource_use_desc12(dev12 *device, int32_t queue_type, resource_state_shadow12 **shadows,
+                                              uint32_t *count, uint32_t *capacity, res12 *resource,
+                                              uint32_t subresource, uint32_t required_state, int write) {
+    if (!resource || resource->dev != device || !resource_resident12(resource)) return 0;
+    resource_state_shadow12 *shadow = state_shadow_get12(shadows, count, capacity, resource);
+    if (!shadow) return -1;
+    shadow = state_shadow_find12(*shadows, *count, resource);
+    if (!shadow) return -1;
+    return state_resource_use12(shadow, subresource, required_state, write, queue_type);
+}
+static res12 *state_resource_for_gpu_range_locked12(dev12 *device, uint64_t va, uint64_t size) {
+    if (!va || !size || size > UINT64_MAX - va) return NULL;
+    for (uint32_t i = 0; i < device->nbufs; i++) {
+        res12 *resource = device->bufs[i];
+        if (!resource || !resource->buffer) continue;
+        uint64_t base = resource->buffer.gpuAddress, length = resource->buffer.length;
+        if (va >= base && va - base <= length && size <= length - (va - base)) return resource;
+    }
+    return NULL;
+}
+
+static WINAPI void list_barrier(void *this, uint32_t n, const void *barriers) {
+    list12 *list = this;
+    if (list->validation_error) return;
+    if (n && !barriers) { list->validation_error = E_INVALIDARG; return; }
+    const RESOURCE_BARRIER *items = barriers;
+    for (uint32_t i = 0; i < n; i++) {
+        const RESOURCE_BARRIER *item = &items[i];
+        gpu_ir_barrier_desc ir = { 0 };
+        if (item->flags < 0 || item->flags > 2) { list->validation_error = E_INVALIDARG; return; }
+        if (item->type == 0) {
+            res12 *resource = d3d12_barrier_resource(item->transition.resource);
+            if (!resource || !d3d12_barrier_validate_transition(resource, &item->transition,
+                                                                 &ir.before_access, &ir.after_access)) {
+                list->validation_error = E_INVALIDARG;
+                return;
+            }
+            ir.type = resource->gpu_buffer || resource->gpu_texture ? GPU_IR_BARRIER_TRANSITION : GPU_IR_BARRIER_GLOBAL;
+            ir.flags = item->flags == 1 ? GPU_IR_BARRIER_BEGIN_ONLY : item->flags == 2 ? GPU_IR_BARRIER_END_ONLY : 0;
+            ir.subresource = item->transition.subresource;
+            ir.resource = resource->gpu_buffer ? resource->gpu_buffer : resource->gpu_texture;
+        } else if (item->type == 1) {
+            if (item->flags) { list->validation_error = E_INVALIDARG; return; }
+            res12 *before = d3d12_barrier_resource(item->aliasing.before);
+            res12 *after = d3d12_barrier_resource(item->aliasing.after);
+            if ((item->aliasing.before && !before) || (item->aliasing.after && !after)) {
+                list->validation_error = E_INVALIDARG;
+                return;
+            }
+            ir.type = GPU_IR_BARRIER_ALIASING;
+            ir.resource = before ? (before->gpu_buffer ? before->gpu_buffer : before->gpu_texture) : NULL;
+            ir.resource_after = after ? (after->gpu_buffer ? after->gpu_buffer : after->gpu_texture) : NULL;
+            if ((before && !ir.resource) || (after && !ir.resource_after)) {
+                ir.type = GPU_IR_BARRIER_GLOBAL;
+                ir.resource = ir.resource_after = NULL;
+            }
+        } else if (item->type == 2) {
+            if (item->flags) { list->validation_error = E_INVALIDARG; return; }
+            res12 *resource = d3d12_barrier_resource(item->uav.resource);
+            if (item->uav.resource && (!resource || !(resource->desc.Flags & 0x4))) {
+                list->validation_error = E_INVALIDARG;
+                return;
+            }
+            ir.type = resource && (resource->gpu_buffer || resource->gpu_texture) ? GPU_IR_BARRIER_UAV : GPU_IR_BARRIER_GLOBAL;
+            ir.resource = resource ? (resource->gpu_buffer ? resource->gpu_buffer : resource->gpu_texture) : NULL;
+            ir.before_access = ir.after_access = GPU_IR_ACCESS_SHADER_READ | GPU_IR_ACCESS_SHADER_WRITE;
+        } else {
+            list->validation_error = E_INVALIDARG;
+            return;
+        }
+        uint32_t index = GPU_IR_NO_COMMAND;
+        int rc = gpu_ir_record_barrier(&list->gpu_ir, &ir, &index);
+        if (rc != GPU_IR_OK) {
+            list->validation_error = rc == GPU_IR_OUT_OF_MEMORY ? E_OUTOFMEMORY : E_INVALIDARG;
+            return;
+        }
+        cmd12 *command = rec(list, C_GPU_IR);
+        command->a = index;
+        command->b = (uint32_t)item->type;
+        if (item->type == 0) {
+            command->obj = item->transition.resource;
+            command->c = item->transition.subresource;
+            command->off = (uint32_t)item->transition.before;
+            command->off2 = (uint32_t)item->transition.after;
+            command->gfx = item->flags;
+            hold(command->obj);
+        }
+    }
+}
 
 // Render target and depth-stencil views: CPU-only descriptors holding the Metal texture view they draw to (read
 // when OMSetRenderTargets or a clear is recorded, as D3D12 reads them then).
@@ -1061,31 +3825,46 @@ static WINAPI void dev_create_rtv(void *this, void *resource, const RTV_DESC *de
     res12 *r = resource;
     VxDesc v = { 0 };
     id keep = nil;
+    uint32_t subresource = 0;
     if (r && r->texture) {
         int32_t dim = desc ? desc->dim : (r->desc.DepthOrArraySize > 1 ? 5 : 4);   // D3D12_RTV_DIMENSION: 4 tex2d, 5 tex2darray
         uint32_t mip = 0, slice = 0, slices = 1;
-        if (desc && dim == 4) mip = desc->tex2d.mip;
-        if (desc && dim == 5) { mip = desc->tex2darray.mip; slice = desc->tex2darray.first; slices = desc->tex2darray.size; }
+        uint32_t plane = 0;
+        if (desc && dim == 4) { mip = desc->tex2d.mip; plane = desc->tex2d.plane; }
+        if (desc && dim == 5) { mip = desc->tex2darray.mip; slice = desc->tex2darray.first; slices = desc->tex2darray.size; plane = desc->tex2darray.plane; }
+        if (desc && dim == 7) { slice = desc->raw[0]; slices = desc->raw[1]; }
+        // D3D12 RTV dimensions 6 and 7 are TEXTURE2DMS and TEXTURE2DMSARRAY. For a
+        // single array slice, a 2DMS texture view binds that slice as an ordinary attachment.
         id<MTLTexture> t = texture_view(r, desc ? desc->format : 0, r->texture.sampleCount > 1 ? MTLTextureType2DMultisample : MTLTextureType2D, mip, 1, slice, 1);
         (void)slices;
         v.fmt = desc ? desc->format : r->desc.Format;
         keep = t;
+        uint32_t mips = r->desc.MipLevels ? r->desc.MipLevels : 1;
+        uint32_t array_size = r->desc.Dimension == 4 ? 1 : r->desc.DepthOrArraySize;
+        subresource = mip + (r->desc.Dimension == 4 ? 0 : slice * mips) + plane * mips * array_size;
     }
-    put_desc(cpu, &v, keep);
+    put_desc(cpu, &v, keep, -1);
+    if (r && keep) put_target_metadata(cpu, r, subresource, 0);
 }
 
 static WINAPI void dev_create_dsv(void *this, void *resource, const DSV_DESC *desc, size_t cpu) {
     res12 *r = resource;
     VxDesc v = { 0 };
     id keep = nil;
+    uint32_t subresource = 0;
     if (r && r->texture) {
-        uint32_t mip = desc && desc->dim == 3 ? desc->tex2d.mip : 0, slice = desc && desc->dim == 4 ? desc->tex2darray.first : 0;
+        uint32_t mip = desc && desc->dim == 3 ? desc->tex2d.mip : 0;
+        uint32_t slice = desc && desc->dim == 4 ? desc->tex2darray.first : 0;
         if (desc && desc->dim == 4) mip = desc->tex2darray.mip;
+        if (desc && desc->dim == 6) slice = desc->raw[0];
         keep = [r->texture newTextureViewWithPixelFormat:r->texture.pixelFormat textureType:r->texture.sampleCount > 1 ? MTLTextureType2DMultisample : MTLTextureType2D
                                                   levels:NSMakeRange(mip, 1) slices:NSMakeRange(slice, 1)];
         v.fmt = desc ? desc->format : r->desc.Format;
+        uint32_t mips = r->desc.MipLevels ? r->desc.MipLevels : 1;
+        subresource = mip + (r->desc.Dimension == 4 ? 0 : slice * mips);
     }
-    put_desc(cpu, &v, keep);
+    put_desc(cpu, &v, keep, -1);
+    if (r && keep) put_target_metadata(cpu, r, subresource, desc ? (uint32_t)desc->flags : 0);
 }
 
 // The Metal texture a CPU descriptor (RTV/DSV) names, retained for a recorded command; NULL for none.
@@ -1094,6 +3873,26 @@ static void *view_texture(size_t cpu) {
     heap12 *h = heap_at(cpu, &i);
     if (!h || !h->keep[i]) return NULL;
     return (void *)CFBridgingRetain(h->keep[i]);
+}
+
+// Return a retained API resource because the descriptor heap may be released after command recording.
+static res12 *view_target_metadata(size_t cpu, uint32_t *subresource, uint32_t *flags) {
+    pthread_mutex_lock(&g_heaps_lock);
+    res12 *resource = NULL;
+    for (uint32_t k = 0; k < g_nheaps; k++) {
+        heap12 *h = g_heaps[k];
+        if (cpu < (size_t)h->cpu || cpu >= (size_t)h->cpu + 32 * (size_t)h->desc.NumDescriptors) continue;
+        uint32_t i = (uint32_t)((cpu - (size_t)h->cpu) / 32);
+        if (h->target_resource && h->target_resource[i]) {
+            resource = h->target_resource[i];
+            d3d_addref(&resource->base);
+            if (subresource) *subresource = h->target_subresource[i];
+            if (flags) *flags = h->target_flags[i];
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_heaps_lock);
+    return resource;
 }
 
 // ---- graphics pipeline states -------------------------------------------------------------------------------------------
@@ -1173,14 +3972,23 @@ static MTLVertexFormat vertex_format(uint32_t f) {
     return MTLVertexFormatInvalid;
 }
 
-static id<MTLFunction> stage_function(dev12 *d, const BYTECODE *code, dxil_msl *out, const char *what) {
+static id<MTLFunction> stage_function(dev12 *d, const BYTECODE *code, dxil_msl *out, const char *what,
+                                      uint32_t sample_mask) {
     dxil_module m;
     if (dxil_read(code->code, code->size, &m)) { vx_log("D3D12: %s: %s", what, m.error); return nil; }
-    int rc = dxil_to_msl(&m, out);
+    int rc = dxil_to_msl_with_sample_mask(&m, sample_mask, out);
     dxil_free(&m);
     if (rc) { vx_log("D3D12: %s not translated: %s", what, out->error); return nil; }
-    MTLCompileOptions *opt = [MTLCompileOptions new];
-    opt.languageVersion = MTLLanguageVersion3_1;
+    if (out->uses_min_lod_clamp && !d3d12_metal_min_lod_clamp_supported(d->mtl)) {
+        vx_log("D3D12: %s uses shader-level min-LOD sampling, which needs Metal Mac2/Apple6 support", what);
+        dxil_msl_free(out);
+        return nil;
+    }
+    MTLCompileOptions *opt = d3d12_shader_compile_options12(d, out);
+    if (!opt) {
+        dxil_msl_free(out);
+        return nil;
+    }
     NSError *err = nil;
     id<MTLLibrary> lib = [d->mtl newLibraryWithSource:@(out->msl) options:opt error:&err];
     if (!lib) { vx_log("D3D12: %s did not compile: %s\n%s", what, err.localizedDescription.UTF8String, out->msl); return nil; }
@@ -1191,14 +3999,41 @@ static id<MTLFunction> stage_function(dev12 *d, const BYTECODE *code, dxil_msl *
 static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
     if (desc->hs.size || desc->ds.size || desc->gs.size) { vx_log("D3D12: hull, domain and geometry shaders are not done yet"); return E_NOTIMPL; }
+    if (desc->nrt > 8) return E_INVALIDARG;
+    if (desc->raster.conservative < 0 || desc->raster.conservative > 1) return E_INVALIDARG;
+    if (desc->raster.forced_samples != 0 && desc->raster.forced_samples != 1 &&
+        desc->raster.forced_samples != 4 && desc->raster.forced_samples != 8 &&
+        desc->raster.forced_samples != 16) return E_INVALIDARG;
+    if (desc->raster.conservative || desc->raster.forced_samples) {
+        vx_log("D3D12: conservative rasterization and forced sample count are not supported by the Metal raster path");
+        return E_NOTIMPL;
+    }
+    for (uint32_t i = 0; i < desc->nrt; i++) {
+        const RT_BLEND *b = &desc->blend.rt[desc->blend.independent ? i : 0];
+        if (b->logic_enable && (b->enable || desc->blend.independent)) return E_INVALIDARG;
+        if (b->logic_enable) {
+            vx_log("D3D12: render-target logic operations are not supported by the Metal raster path");
+            return E_NOTIMPL;
+        }
+    }
+    if (desc->sample_mask != UINT32_MAX && !desc->ps.size) {
+        vx_log("D3D12: a non-default sample mask requires a pixel shader for Metal coverage lowering");
+        return E_NOTIMPL;
+    }
     pso12 *p = alloc12(sizeof *p, K12_PSO, g_pso_vtbl, d);
     p->base.destroy = pso_destroy;
     MTLRenderPipelineDescriptor *rp = [MTLRenderPipelineDescriptor new];
-    rp.vertexFunction = stage_function(d, &desc->vs, &p->vs, "vertex shader");
+    rp.vertexFunction = stage_function(d, &desc->vs, &p->vs, "vertex shader", UINT32_MAX);
     if (!rp.vertexFunction) { d3d_release(&p->base); return E_INVALIDARG; }
     if (desc->ps.size) {
-        rp.fragmentFunction = stage_function(d, &desc->ps, &p->ps, "pixel shader");
+        rp.fragmentFunction = stage_function(d, &desc->ps, &p->ps, "pixel shader", desc->sample_mask);
         if (!rp.fragmentFunction) { d3d_release(&p->base); return E_INVALIDARG; }
+    }
+    if (!shader_root_signature_valid12(d, &p->vs, desc->root) ||
+        !shader_root_signature_valid12(d, &p->ps, desc->root)) {
+        vx_log("D3D12: graphics shader bindings are not covered by a compatible root signature");
+        d3d_release(&p->base);
+        return E_INVALIDARG;
     }
     // the input layout, onto the vertex shader's [[attribute(n)]] by semantic (vertex buffers at Metal buffers 16 + slot)
     MTLVertexDescriptor *vd = [MTLVertexDescriptor new];
@@ -1250,6 +4085,12 @@ static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *de
         p->has_depth = 1;
         if (df == MTLPixelFormatDepth32Float_Stencil8) { rp.stencilAttachmentPixelFormat = df; p->has_stencil = 1; }
     }
+    p->depth_enable = p->has_depth && desc->depth.depth_enable;
+    p->depth_write = p->depth_enable && desc->depth.depth_write;
+    p->stencil_enable = p->has_stencil && desc->depth.stencil_enable;
+    p->stencil_write = p->stencil_enable && desc->depth.write_mask &&
+        (desc->depth.front.fail != 1 || desc->depth.front.depth_fail != 1 || desc->depth.front.pass != 1 ||
+         desc->depth.back.fail != 1 || desc->depth.back.depth_fail != 1 || desc->depth.back.pass != 1);
     rp.rasterSampleCount = desc->samples ? desc->samples : 1;
     rp.alphaToCoverageEnabled = desc->blend.a2c != 0;
     // D3D12_PRIMITIVE_TOPOLOGY_TYPE: 1 point, 2 line, 3 triangle
@@ -1275,6 +4116,21 @@ static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *de
     p->bias = (float)desc->raster.depth_bias;
     p->bias_slope = desc->raster.slope;
     p->bias_clamp = desc->raster.bias_clamp;
+    rootsig12 *root = desc->root;
+    gpu_ir_pipeline_desc ir_desc = {
+        .info = { .kind = GPU_IR_PIPELINE_GRAPHICS,
+                  .stage_mask = GPU_IR_STAGE_VERTEX | (desc->ps.size ? GPU_IR_STAGE_FRAGMENT : 0) },
+        .layout = root && root->base.kind == K12_ROOTSIG && root->dev == d ? root->gpu_layout : NULL,
+        .backend_object = (__bridge_retained void *)p->render,
+        .release = gpu12_release_mtl_object
+    };
+    p->gpu_pipeline = gpu_ir_pipeline_create(&ir_desc);
+    if (!p->gpu_pipeline) {
+        gpu12_release_mtl_object(ir_desc.backend_object);
+        vx_log("D3D12: graphics pipeline could not be represented by the common GPU IR");
+        d3d_release(&p->base);
+        return E_OUTOFMEMORY;
+    }
     HRESULT hr = pso_query(p, iid, out);
     d3d_release(&p->base);
     return hr;
@@ -1294,10 +4150,16 @@ static WINAPI void list_set_gfx_constants(void *this, uint32_t param, uint32_t n
     memcpy(c->values, values, 4 * c->b);
 }
 static WINAPI void list_set_gfx_root_va(void *this, uint32_t param, uint64_t va) { cmd12 *c = rec(this, C_ROOT_VA); c->a = param; c->va = va; c->gfx = 1; }
-static WINAPI void list_topology(void *this, int32_t t) { cmd12 *c = rec(this, C_TOPOLOGY); c->a = (uint32_t)t; }
+static WINAPI void list_topology(void *this, int32_t t) {
+    list12 *list = this;
+    cmd12 *c = rec(list, C_TOPOLOGY);
+    c->a = (uint32_t)t;
+    list->recording_topology = (uint32_t)t;
+    list->recording_topology_set = 1;
+}
 static WINAPI void list_vbs(void *this, uint32_t start, uint32_t n, const VBV *views) {
     cmd12 *c = rec(this, C_VB);
-    c->a = start; c->b = n > 16 ? 16 : n;
+    c->a = start; c->b = start >= 16 ? 0 : MIN(n, 16 - start);
     if (views) memcpy(c->values, views, c->b * sizeof(VBV));
     else memset(c->values, 0, sizeof c->values);
 }
@@ -1308,8 +4170,15 @@ static WINAPI void list_ib(void *this, const IBV *view) {
 static WINAPI void list_targets(void *this, uint32_t n, const size_t *rtvs, int32_t single, const size_t *dsv) {
     cmd12 *c = rec(this, C_TARGETS);
     c->a = n > 8 ? 8 : n;
-    for (uint32_t i = 0; i < c->a; i++) c->tex[i] = view_texture(single ? rtvs[0] + 32 * (size_t)i : rtvs[i]);
-    if (dsv) c->tex[8] = view_texture(*dsv);
+    for (uint32_t i = 0; rtvs && i < c->a; i++) {
+        size_t handle = single ? rtvs[0] + 32 * (size_t)i : rtvs[i];
+        c->tex[i] = view_texture(handle);
+        c->resource[i] = view_target_metadata(handle, &c->subresource[i], &c->view_flags[i]);
+    }
+    if (dsv) {
+        c->tex[8] = view_texture(*dsv);
+        c->resource[8] = view_target_metadata(*dsv, &c->subresource[8], &c->view_flags[8]);
+    }
 }
 static WINAPI void list_viewports(void *this, uint32_t n, const VIEWPORT *v) {
     cmd12 *c = rec(this, C_VIEWPORTS);
@@ -1321,30 +4190,247 @@ static WINAPI void list_scissors(void *this, uint32_t n, const RECT12 *r) {
     c->a = n > 16 ? 16 : n;
     memcpy(c->values, r, c->a * sizeof *r);
 }
+static float d3d12_clear_float_input12(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    if ((bits & 0x7f800000u) == 0 && (bits & 0x007fffffu) != 0) return 0.0f;
+    return value;
+}
+static int list_record_attachment_clear_ir12(list12 *list, cmd12 *command, int depth_stencil) {
+    int texture_slot = depth_stencil ? 8 : 0;
+    if (!command->tex[texture_slot]) return 1;
+    if (command->b && !command->rects) {
+        list->validation_error = E_INVALIDARG;
+        return 0;
+    }
+    gpu_ir_rect *rectangles = NULL;
+    if (command->b) {
+        if ((size_t)command->b > SIZE_MAX / sizeof *rectangles) {
+            list->validation_error = E_OUTOFMEMORY;
+            return 0;
+        }
+        rectangles = malloc((size_t)command->b * sizeof *rectangles);
+        if (!rectangles) {
+            list->validation_error = E_OUTOFMEMORY;
+            return 0;
+        }
+        for (uint32_t i = 0; i < command->b; i++) {
+            rectangles[i] = (gpu_ir_rect){ command->rects[i].left, command->rects[i].top,
+                                             command->rects[i].right, command->rects[i].bottom };
+        }
+    }
+    id<MTLTexture> texture = (__bridge id<MTLTexture>)command->tex[texture_slot];
+    gpu_ir_texture_desc desc = {
+        .width = (uint32_t)texture.width, .height = (uint32_t)texture.height,
+        .depth = (uint32_t)texture.depth, .array_layers = 1, .mip_levels = 1,
+        .bytes_per_texel = 1, .sample_count = (uint32_t)texture.sampleCount,
+        .block_width = 1, .block_height = 1, .bytes_per_block = 1
+    };
+    gpu_ir_resource *target = gpu_ir_texture_create(&desc, command->tex[texture_slot], gpu12_release_mtl_object);
+    if (!target) {
+        free(rectangles);
+        list->validation_error = E_OUTOFMEMORY;
+        return 0;
+    }
+    command->tex[texture_slot] = NULL; // the common texture resource now owns this retained Metal view
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc;
+    if (depth_stencil) {
+        float depth;
+        memcpy(&depth, &command->values[0], sizeof depth);
+        rc = gpu_ir_record_clear_depth_stencil(&list->gpu_ir, target,
+            command->a & (GPU_IR_CLEAR_DEPTH | GPU_IR_CLEAR_STENCIL), depth, command->values[1],
+            rectangles, command->b, &index);
+    } else {
+        float color[4];
+        memcpy(color, command->values, sizeof color);
+        rc = gpu_ir_record_clear_color(&list->gpu_ir, target, color, rectangles, command->b, &index);
+    }
+    free(rectangles);
+    gpu_ir_resource_release(target);
+    if (rc != GPU_IR_OK || index == GPU_IR_NO_COMMAND) {
+        list->validation_error = rc == GPU_IR_OUT_OF_MEMORY ? E_OUTOFMEMORY : E_INVALIDARG;
+        return 0;
+    }
+    command->gpu_ir_recorded = 1;
+    command->gpu_ir_index = index;
+    free(command->rects);
+    command->rects = NULL;
+    return 1;
+}
+
 static WINAPI void list_clear_rtv(void *this, size_t rtv, const float color[4], uint32_t nrects, const RECT12 *rects) {
-    cmd12 *c = rec(this, C_CLEAR_RTV);
+    list12 *list = this;
+    if (list->validation_error) return;
+    if (!color || (nrects && !rects)) { list->validation_error = E_INVALIDARG; return; }
+    if ((size_t)nrects > SIZE_MAX / sizeof *rects) { list->validation_error = E_OUTOFMEMORY; return; }
+    cmd12 *c = rec(list, C_CLEAR_RTV);
     c->tex[0] = view_texture(rtv);
-    memcpy(c->values, color, 16);
-    if (nrects) d3d_not_implemented("ClearRenderTargetView with rectangles (the whole view is cleared)");
+    c->resource[0] = view_target_metadata(rtv, &c->subresource[0], &c->view_flags[0]);
+    float clear_color[4];
+    for (uint32_t i = 0; i < 4; i++) clear_color[i] = d3d12_clear_float_input12(color[i]);
+    memcpy(c->values, clear_color, sizeof clear_color);
+    if (nrects) {
+        c->rects = malloc((size_t)nrects * sizeof *rects);
+        if (!c->rects) { list->validation_error = E_OUTOFMEMORY; return; }
+        memcpy(c->rects, rects, (size_t)nrects * sizeof *rects);
+        c->b = nrects;
+    }
+    list_record_attachment_clear_ir12(list, c, 0);
 }
 static WINAPI void list_clear_dsv(void *this, size_t dsv, int32_t flags, float depth, uint8_t stencil_value, uint32_t nrects, const RECT12 *rects) {
-    cmd12 *c = rec(this, C_CLEAR_DSV);
+    list12 *list = this;
+    if (list->validation_error) return;
+    if (nrects && !rects) { list->validation_error = E_INVALIDARG; return; }
+    if ((size_t)nrects > SIZE_MAX / sizeof *rects) { list->validation_error = E_OUTOFMEMORY; return; }
+    cmd12 *c = rec(list, C_CLEAR_DSV);
     c->tex[8] = view_texture(dsv);
+    c->resource[8] = view_target_metadata(dsv, &c->subresource[8], &c->view_flags[8]);
     c->a = (uint32_t)flags;
+    depth = d3d12_clear_float_input12(depth);
+    if (depth < 0.0f) depth = 0.0f;
+    else if (depth > 1.0f) depth = 1.0f;
     memcpy(&c->values[0], &depth, 4);
     c->values[1] = stencil_value;
-    if (nrects) d3d_not_implemented("ClearDepthStencilView with rectangles (the whole view is cleared)");
+    if (nrects) {
+        c->rects = malloc((size_t)nrects * sizeof *rects);
+        if (!c->rects) { list->validation_error = E_OUTOFMEMORY; return; }
+        memcpy(c->rects, rects, (size_t)nrects * sizeof *rects);
+        c->b = nrects;
+    }
+    list_record_attachment_clear_ir12(list, c, 1);
+}
+static WINAPI void list_clear_uav(void *this, uint64_t gpu, size_t cpu, void *resource, const void *values,
+                                  uint32_t nrects, const RECT12 *rects, uint32_t floating_point) {
+    list12 *list = this;
+    if (list->validation_error) return;
+    res12 *target = resource;
+    if (!target || target->base.kind != K12_RESOURCE || target->dev != list->dev || !values ||
+        (nrects && !rects)) {
+        list->validation_error = E_INVALIDARG;
+        return;
+    }
+    uint32_t gpu_index = 0;
+    heap12 *gpu_heap = heap_gpu_descriptor(gpu, &gpu_index);
+    gpu_ir_buffer_view *buffer_view = gpu_heap && gpu_heap->buffer_view &&
+        gpu_index < gpu_heap->desc.NumDescriptors ? gpu_heap->buffer_view[gpu_index] : NULL;
+    const gpu_ir_buffer_view_desc *buffer_desc = buffer_view ? gpu_ir_buffer_view_description(buffer_view) : NULL;
+    if (buffer_desc && buffer_desc->kind == GPU_IR_BUFFER_VIEW_STRUCTURED) {
+        list->validation_error = E_INVALIDARG;
+        vx_log("D3D12: ClearUnorderedAccessView%s is incompatible with structured buffer UAVs",
+               floating_point ? "Float" : "Uint");
+        return;
+    }
+    cmd12 *command = rec(list, C_CLEAR_UAV);
+    command->a = floating_point;
+    command->b = nrects;
+    command->off = cpu;
+    command->va = gpu;
+    command->resource[0] = target;
+    d3d_addref(&target->base);
+    memcpy(command->values, values, 4 * sizeof(uint32_t));
+    if (floating_point) {
+        float *clear = (float *)command->values;
+        for (uint32_t i = 0; i < 4; i++)
+            if (fpclassify(clear[i]) == FP_SUBNORMAL) clear[i] = 0.0f;
+    }
+    if (nrects) {
+        command->rects = malloc((size_t)nrects * sizeof *command->rects);
+        if (!command->rects) {
+            list->validation_error = E_OUTOFMEMORY;
+            return;
+        }
+        memcpy(command->rects, rects, (size_t)nrects * sizeof *command->rects);
+    }
+}
+static WINAPI void list_clear_uav_uint(void *this, uint64_t gpu, size_t cpu, void *resource,
+                                       const uint32_t values[4], uint32_t nrects, const RECT12 *rects) {
+    list_clear_uav(this, gpu, cpu, resource, values, nrects, rects, 0);
+}
+static WINAPI void list_clear_uav_float(void *this, uint64_t gpu, size_t cpu, void *resource,
+                                        const float values[4], uint32_t nrects, const RECT12 *rects) {
+    list_clear_uav(this, gpu, cpu, resource, values, nrects, rects, 1);
 }
 static WINAPI void list_draw(void *this, uint32_t vertices, uint32_t instances, uint32_t start, uint32_t start_instance) {
-    cmd12 *c = rec(this, C_DRAW);
+    list12 *list = this;
+    cmd12 *c = rec(list, C_DRAW);
     c->a = vertices; c->b = instances; c->c = start; c->off = start_instance;
+    pso12 *pipeline = list->recording_pso;
+    if (pipeline && pipeline->gpu_pipeline) {
+        uint32_t topology = list->recording_topology >= 1 && list->recording_topology <= 5 ?
+            list->recording_topology : 4;
+        gpu_ir_draw_info draw = { .topology = topology, .vertex_count = vertices,
+            .instance_count = instances, .first_vertex = start, .first_instance = start_instance };
+        uint32_t index = GPU_IR_NO_COMMAND;
+        int rc = gpu_ir_record_draw(&list->gpu_ir, pipeline->gpu_pipeline, &draw, &index);
+        if (rc == GPU_IR_OUT_OF_MEMORY) list->validation_error = E_OUTOFMEMORY;
+        else if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
+            c->gpu_ir_recorded = 1;
+            c->gpu_ir_index = index;
+        }
+    }
 }
 static WINAPI void list_draw_indexed(void *this, uint32_t indices, uint32_t instances, uint32_t start, int32_t base_vertex, uint32_t start_instance) {
-    cmd12 *c = rec(this, C_DRAW_INDEXED);
+    list12 *list = this;
+    cmd12 *c = rec(list, C_DRAW_INDEXED);
     c->a = indices; c->b = instances; c->c = start; c->off = (uint64_t)(int64_t)base_vertex; c->off2 = start_instance;
+    pso12 *pipeline = list->recording_pso;
+    if (pipeline && pipeline->gpu_pipeline) {
+        uint32_t topology = list->recording_topology >= 1 && list->recording_topology <= 5 ?
+            list->recording_topology : 4;
+        gpu_ir_draw_info draw = { .topology = topology, .indexed = 1, .index_count = indices,
+            .instance_count = instances, .first_index = start, .first_instance = start_instance,
+            .vertex_offset = base_vertex };
+        uint32_t index = GPU_IR_NO_COMMAND;
+        int rc = gpu_ir_record_draw(&list->gpu_ir, pipeline->gpu_pipeline, &draw, &index);
+        if (rc == GPU_IR_OUT_OF_MEMORY) list->validation_error = E_OUTOFMEMORY;
+        else if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
+            c->gpu_ir_recorded = 1;
+            c->gpu_ir_index = index;
+        }
+    }
 }
 static WINAPI void list_blend_factor(void *this, const float f[4]) { cmd12 *c = rec(this, C_BLEND_FACTOR); if (f) memcpy(c->values, f, 16); else { float one[4] = { 1, 1, 1, 1 }; memcpy(c->values, one, 16); } }
 static WINAPI void list_stencil_ref(void *this, uint32_t v) { cmd12 *c = rec(this, C_STENCIL_REF); c->a = v; }
+static WINAPI void list_write_buffer_immediate(void *this, uint32_t count,
+    const WRITE_BUFFER_IMMEDIATE_PARAMETER12 *parameters, const int32_t *modes) {
+    list12 *list = this;
+    if (!list || list->validation_error || !count) return;
+    if (list->closed || !parameters || (size_t)count > SIZE_MAX / sizeof(write_buffer_immediate12)) {
+        list->validation_error = E_INVALIDARG;
+        return;
+    }
+    write_buffer_immediate12 *writes = calloc(count, sizeof *writes);
+    if (!writes) { list->validation_error = E_OUTOFMEMORY; return; }
+    uint32_t resolved = 0;
+    int valid = 1;
+    pthread_mutex_lock(&list->dev->lock);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t mode = modes ? (uint32_t)modes[i] : 0;
+        if ((parameters[i].Dest & 3u) || mode > 2u) { valid = 0; break; }
+        res12 *resource = state_resource_for_gpu_range_locked12(list->dev, parameters[i].Dest, sizeof(uint32_t));
+        if (!resource || resource->dev != list->dev || !resource->buffer) { valid = 0; break; }
+        writes[i] = (write_buffer_immediate12){
+            .resource = resource,
+            .offset = parameters[i].Dest - resource->buffer.gpuAddress,
+            .value = parameters[i].Value,
+            .mode = mode
+        };
+        d3d_addref(&resource->base);
+        resolved++;
+    }
+    pthread_mutex_unlock(&list->dev->lock);
+    if (!valid) {
+        for (uint32_t i = 0; i < resolved; i++) d3d_release(&writes[i].resource->base);
+        free(writes);
+        list->validation_error = E_INVALIDARG;
+        vx_log("D3D12: WriteBufferImmediate requires aligned GPU addresses, a live buffer, and a valid mode");
+        return;
+    }
+    cmd12 *command = rec(list, C_WRITE_BUFFER_IMMEDIATE);
+    command->a = count;
+    command->immediate_writes = writes;
+}
 static WINAPI void list_begin_query(void *this, void *heap, int32_t type, uint32_t index) {
     cmd12 *c = rec(this, C_BEGIN_QUERY); c->obj = heap; hold(heap); c->a = (uint32_t)type; c->b = index;
 }
@@ -1365,16 +4451,559 @@ typedef struct {
 
 // Small per-execution memory for root descriptors and constants the shaders read through pointers.
 typedef struct { id<MTLBuffer> buf; size_t used; } scratch;
-static uint64_t scratch_put(dev12 *d, scratch *s, const void *data, size_t n) {
-    n = (n + 31) & ~(size_t)31;
-    if (!s->buf || s->used + n > s->buf.length) {
-        s->buf = [d->mtl newBufferWithLength:MAX(65536, n * 2) options:MTLResourceStorageModeShared];
+static int scratch_alloc(dev12 *d, scratch *s, size_t n, size_t *offset) {
+    if (!d || !s || !offset || n > SIZE_MAX - 31) return 0;
+    size_t aligned = (n + 31) & ~(size_t)31;
+    if (aligned > SIZE_MAX / 2) return 0;
+    if (!s->buf || s->used > s->buf.length || aligned > s->buf.length - s->used) {
+        size_t capacity = MAX((size_t)65536, aligned * 2);
+        id<MTLBuffer> replacement = [d->mtl newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+        if (!replacement) return 0;
+        s->buf = replacement;
         s->used = 0;
     }
-    memcpy((uint8_t *)s->buf.contents + s->used, data, n);
-    uint64_t va = s->buf.gpuAddress + s->used;
-    s->used += n;
-    return va;
+    *offset = s->used;
+    s->used += aligned;
+    return 1;
+}
+static uint64_t scratch_put(dev12 *d, scratch *s, const void *data, size_t n) {
+    if (!data) return 0;
+    size_t offset;
+    if (!scratch_alloc(d, s, n, &offset)) return 0;
+    memcpy((uint8_t *)s->buf.contents + offset, data, n);
+    size_t aligned = (n + 31) & ~(size_t)31;
+    if (aligned > n) memset((uint8_t *)s->buf.contents + offset + n, 0, aligned - n);
+    return s->buf.gpuAddress + offset;
+}
+
+static int d3d12_gpu_ir_copy_buffer(void *context, const gpu_ir_resource *src, uint64_t src_off,
+                                   const gpu_ir_resource *dst, uint64_t dst_off, uint64_t size) {
+    id<MTLBlitCommandEncoder> encoder = (__bridge id<MTLBlitCommandEncoder>)context;
+    id<MTLBuffer> source = (__bridge id<MTLBuffer>)gpu_ir_backend_object(src);
+    id<MTLBuffer> destination = (__bridge id<MTLBuffer>)gpu_ir_backend_object(dst);
+    if (!encoder || !source || !destination || src_off > source.length || size > source.length - src_off ||
+        dst_off > destination.length || size > destination.length - dst_off) return GPU_IR_RANGE;
+    [encoder copyFromBuffer:source sourceOffset:(NSUInteger)src_off toBuffer:destination
+            destinationOffset:(NSUInteger)dst_off size:(NSUInteger)size];
+    return GPU_IR_OK;
+}
+
+typedef struct {
+    dev12 *device;
+    scratch *scratch_buffer;
+    id<MTLBlitCommandEncoder> encoder;
+} d3d12_gpu_ir_fill_context;
+
+static int d3d12_gpu_ir_fill_buffer_pattern(void *context, const gpu_ir_resource *dst, uint64_t dst_offset,
+                                            uint64_t size, const void *pattern, uint32_t pattern_size) {
+    d3d12_gpu_ir_fill_context *fill = context;
+    id<MTLBuffer> destination = (__bridge id<MTLBuffer>)gpu_ir_backend_object(dst);
+    if (!fill || !fill->device || !fill->scratch_buffer || !fill->encoder || !destination || !pattern ||
+        !pattern_size || pattern_size > GPU_IR_MAX_FILL_PATTERN_SIZE ||
+        (pattern_size & (pattern_size - 1u)) ||
+        !gpu_ir_resource_is_buffer(dst)) return GPU_IR_INVALID;
+    if (dst_offset % pattern_size || size % pattern_size || dst_offset > NSUIntegerMax || size > NSUIntegerMax ||
+        dst_offset > destination.length || size > destination.length - dst_offset ||
+        dst_offset > gpu_ir_buffer_size(dst) || size > gpu_ir_buffer_size(dst) - dst_offset)
+        return GPU_IR_RANGE;
+    if (!size) return GPU_IR_OK;
+
+    // Metal's blit fill writes one byte. Stage a bounded element pattern and copy it over the
+    // selected UAV range without expanding the guest's full buffer size.
+    const size_t max_upload_size = 1024u * 1024u;
+    size_t upload_size = size < max_upload_size ? (size_t)size : max_upload_size;
+    upload_size -= upload_size % pattern_size;
+    size_t source_offset = 0;
+    if (!upload_size || !scratch_alloc(fill->device, fill->scratch_buffer, upload_size, &source_offset))
+        return GPU_IR_OUT_OF_MEMORY;
+    uint8_t *source = (uint8_t *)fill->scratch_buffer->buf.contents + source_offset;
+    for (size_t i = 0; i < upload_size; i += pattern_size)
+        memcpy(source + i, pattern, pattern_size);
+
+    uint64_t copied = 0;
+    while (copied < size) {
+        NSUInteger block = (NSUInteger)((size - copied) < upload_size ? (size - copied) : upload_size);
+        [fill->encoder copyFromBuffer:fill->scratch_buffer->buf sourceOffset:source_offset toBuffer:destination
+                    destinationOffset:(NSUInteger)(dst_offset + copied) size:block];
+        copied += block;
+    }
+    return GPU_IR_OK;
+}
+
+static int d3d12_gpu_ir_execute_fill_buffer_pattern(dev12 *device, scratch *scratch_buffer,
+                                                    id<MTLBlitCommandEncoder> encoder,
+                                                    gpu_ir_resource *destination, uint64_t dst_offset,
+                                                    uint64_t size, const void *pattern, uint32_t pattern_size) {
+    gpu_ir_stream stream;
+    gpu_ir_stream_init(&stream);
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc = gpu_ir_record_fill_buffer_pattern(&stream, destination, dst_offset, size, pattern, pattern_size, &index);
+    if (rc == GPU_IR_OK) {
+        d3d12_gpu_ir_fill_context context = { device, scratch_buffer, encoder };
+        gpu_ir_backend backend = { .context = &context, .fill_buffer_pattern = d3d12_gpu_ir_fill_buffer_pattern };
+        rc = gpu_ir_execute(&stream, index, &backend);
+    }
+    gpu_ir_stream_destroy(&stream);
+    return rc;
+}
+
+static int d3d12_gpu_ir_execute_fill_buffer(dev12 *device, scratch *scratch_buffer,
+                                            id<MTLBlitCommandEncoder> encoder,
+                                            gpu_ir_resource *destination, uint64_t dst_offset,
+                                            uint64_t size, uint32_t value) {
+    return d3d12_gpu_ir_execute_fill_buffer_pattern(device, scratch_buffer, encoder, destination,
+                                                    dst_offset, size, &value, sizeof value);
+}
+
+static int d3d12_typed_uav_clear_pattern12(const heap12 *heap, uint32_t descriptor_index,
+                                          const gpu_ir_buffer_view_desc *view, const uint32_t values[4],
+                                          uint8_t pattern[GPU_IR_MAX_FILL_PATTERN_SIZE],
+                                          uint32_t *pattern_size) {
+    if (!heap || !view || !values || !pattern || !pattern_size ||
+        descriptor_index >= heap->desc.NumDescriptors || !heap->cpu) return 0;
+    VxDesc descriptor;
+    memcpy(&descriptor, heap->cpu + 32ull * descriptor_index, sizeof descriptor);
+    if (view->kind != GPU_IR_BUFFER_VIEW_TYPED) return 0;
+    if (descriptor.fmt == 25) { // R10G10B10A2_UINT packs four values into one DWORD.
+        if (view->element_size != sizeof(uint32_t) || view->byte_size % sizeof(uint32_t)) return 0;
+        uint32_t packed = (values[0] & 0x3ffu) | ((values[1] & 0x3ffu) << 10) |
+                          ((values[2] & 0x3ffu) << 20) | ((values[3] & 0x3u) << 30);
+        memcpy(pattern, &packed, sizeof packed);
+        *pattern_size = sizeof packed;
+        return 1;
+    }
+    uint32_t channel_count = 0, channel_size = 0;
+    switch (descriptor.fmt) {
+    case 62: case 64: channel_count = 1; channel_size = 1; break; // R8_UINT / R8_SINT
+    case 50: case 52: channel_count = 2; channel_size = 1; break; // R8G8_UINT / R8G8_SINT
+    case 30: case 32: channel_count = 4; channel_size = 1; break; // R8G8B8A8_UINT / R8G8B8A8_SINT
+    case 57: case 59: channel_count = 1; channel_size = 2; break; // R16_UINT / R16_SINT
+    case 36: case 38: channel_count = 2; channel_size = 2; break; // R16G16_UINT / R16G16_SINT
+    case 12: case 14: channel_count = 4; channel_size = 2; break; // R16G16B16A16_UINT / SINT
+    case 42: case 43: channel_count = 1; channel_size = 4; break; // R32_UINT / R32_SINT
+    case 17: case 18: channel_count = 2; channel_size = 4; break; // R32G32_UINT / R32G32_SINT
+    case 3: case 4: channel_count = 4; channel_size = 4; break; // R32G32B32A32_UINT / SINT
+    default: return 0;
+    }
+    uint32_t element_size = channel_count * channel_size;
+    if (view->element_size != element_size || view->byte_size % element_size) return 0;
+    for (uint32_t channel = 0; channel < channel_count; channel++)
+        memcpy(pattern + channel * channel_size, &values[channel], channel_size);
+    *pattern_size = element_size;
+    return 1;
+}
+
+static int d3d12_gpu_ir_copy_resource(void *context, const gpu_ir_resource *src, const gpu_ir_resource *dst) {
+    id<MTLBlitCommandEncoder> encoder = (__bridge id<MTLBlitCommandEncoder>)context;
+    if (!encoder || !src || !dst) return GPU_IR_INVALID;
+    if (gpu_ir_resource_is_buffer(src)) {
+        id<MTLBuffer> source = (__bridge id<MTLBuffer>)gpu_ir_backend_object(src);
+        id<MTLBuffer> destination = (__bridge id<MTLBuffer>)gpu_ir_backend_object(dst);
+        uint64_t size = gpu_ir_buffer_size(src);
+        if (!source || !destination || size != gpu_ir_buffer_size(dst) || size > source.length || size > destination.length) return GPU_IR_RANGE;
+        [encoder copyFromBuffer:source sourceOffset:0 toBuffer:destination destinationOffset:0 size:(NSUInteger)size];
+        return GPU_IR_OK;
+    }
+    id<MTLTexture> source = (__bridge id<MTLTexture>)gpu_ir_backend_object(src);
+    id<MTLTexture> destination = (__bridge id<MTLTexture>)gpu_ir_backend_object(dst);
+    if (!source || !destination) return GPU_IR_INVALID;
+    [encoder copyFromTexture:source toTexture:destination];
+    return GPU_IR_OK;
+}
+
+static int d3d12_gpu_ir_copy_texture(void *context, const gpu_ir_resource *src, const gpu_ir_texture_location *src_loc,
+                                    const gpu_ir_resource *dst, const gpu_ir_texture_location *dst_loc,
+                                    uint32_t width, uint32_t height, uint32_t depth) {
+    id<MTLBlitCommandEncoder> encoder = (__bridge id<MTLBlitCommandEncoder>)context;
+    id<MTLTexture> source_texture = gpu_ir_resource_is_buffer(src) ? nil : (__bridge id<MTLTexture>)gpu_ir_backend_object(src);
+    id<MTLTexture> destination_texture = gpu_ir_resource_is_buffer(dst) ? nil : (__bridge id<MTLTexture>)gpu_ir_backend_object(dst);
+    id<MTLBuffer> source_buffer = gpu_ir_resource_is_buffer(src) ? (__bridge id<MTLBuffer>)gpu_ir_backend_object(src) : nil;
+    id<MTLBuffer> destination_buffer = gpu_ir_resource_is_buffer(dst) ? (__bridge id<MTLBuffer>)gpu_ir_backend_object(dst) : nil;
+    const gpu_ir_texture_desc *texture = gpu_ir_texture_description(source_texture ? src : dst);
+    if (!encoder || !texture || !width || !height || !depth) return GPU_IR_INVALID;
+    uint64_t src_offset, dst_offset;
+    uint32_t bw = texture->block_width, bh = texture->block_height, bytes_per_block = texture->bytes_per_block;
+    if (source_texture && destination_texture) {
+        [encoder copyFromTexture:source_texture sourceSlice:src_loc->array_slice sourceLevel:src_loc->mip_level
+                    sourceOrigin:MTLOriginMake(src_loc->origin_x, src_loc->origin_y, src_loc->origin_z)
+                      sourceSize:MTLSizeMake(width, height, depth)
+                        toTexture:destination_texture destinationSlice:dst_loc->array_slice destinationLevel:dst_loc->mip_level
+                destinationOrigin:MTLOriginMake(dst_loc->origin_x, dst_loc->origin_y, dst_loc->origin_z)];
+    } else if (source_buffer && destination_texture) {
+        src_offset = src_loc->buffer_offset + (uint64_t)src_loc->origin_z * src_loc->image_pitch +
+                     (uint64_t)(src_loc->origin_y / bh) * src_loc->row_pitch +
+                     (uint64_t)(src_loc->origin_x / bw) * bytes_per_block;
+        [encoder copyFromBuffer:source_buffer sourceOffset:(NSUInteger)src_offset sourceBytesPerRow:(NSUInteger)src_loc->row_pitch
+           sourceBytesPerImage:destination_texture.textureType == MTLTextureType3D ? (NSUInteger)src_loc->image_pitch : 0
+                       sourceSize:MTLSizeMake(width, height, depth)
+                       toTexture:destination_texture destinationSlice:dst_loc->array_slice destinationLevel:dst_loc->mip_level
+               destinationOrigin:MTLOriginMake(dst_loc->origin_x, dst_loc->origin_y, dst_loc->origin_z)];
+    } else if (source_texture && destination_buffer) {
+        dst_offset = dst_loc->buffer_offset + (uint64_t)dst_loc->origin_z * dst_loc->image_pitch +
+                     (uint64_t)(dst_loc->origin_y / bh) * dst_loc->row_pitch +
+                     (uint64_t)(dst_loc->origin_x / bw) * bytes_per_block;
+        [encoder copyFromTexture:source_texture sourceSlice:src_loc->array_slice sourceLevel:src_loc->mip_level
+                    sourceOrigin:MTLOriginMake(src_loc->origin_x, src_loc->origin_y, src_loc->origin_z)
+                      sourceSize:MTLSizeMake(width, height, depth)
+                          toBuffer:destination_buffer destinationOffset:(NSUInteger)dst_offset
+            destinationBytesPerRow:(NSUInteger)dst_loc->row_pitch
+          destinationBytesPerImage:source_texture.textureType == MTLTextureType3D ? (NSUInteger)dst_loc->image_pitch : 0];
+    } else return GPU_IR_INVALID;
+    return GPU_IR_OK;
+}
+
+static int d3d12_is_depth_pixel_format(MTLPixelFormat format);
+
+static pthread_mutex_t g_resolve_pipeline_lock = PTHREAD_MUTEX_INITIALIZER;
+static NSMutableDictionary<NSString *, NSDictionary *> *g_depth_resolve_pipeline_cache;
+static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *g_color_resolve_pipeline_cache;
+
+static BOOL d3d12_get_depth_resolve_pipeline(id<MTLDevice> device, MTLPixelFormat format, BOOL array_source,
+                                             id<MTLRenderPipelineState> *pipeline_out,
+                                             id<MTLDepthStencilState> *depth_state_out) {
+    if (!device || !pipeline_out || !depth_state_out) return NO;
+    pthread_mutex_lock(&g_resolve_pipeline_lock);
+    if (!g_depth_resolve_pipeline_cache) g_depth_resolve_pipeline_cache = [NSMutableDictionary dictionary];
+    NSString *key = [NSString stringWithFormat:@"%p:%lu:%u", (__bridge void *)device,
+                     (unsigned long)format, array_source ? 1u : 0u];
+    NSDictionary *cached = g_depth_resolve_pipeline_cache[key];
+    if (cached) {
+        *pipeline_out = cached[@"pipeline"];
+        *depth_state_out = cached[@"depth_state"];
+        pthread_mutex_unlock(&g_resolve_pipeline_lock);
+        return YES;
+    }
+
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct VxDepthResolveRegion { uint source_x, source_y, destination_x, destination_y, source_slice, mode; };\n"
+        "struct VxDepthResolveOut { float depth [[depth(any)]]; };\n"
+        "vertex float4 vx_depth_resolve_vs(uint id [[vertex_id]]) {\n"
+        "  constexpr float2 p[3] = { float2(-1.0f,-1.0f), float2(3.0f,-1.0f), float2(-1.0f,3.0f) };\n"
+        "  return float4(p[id], 0.0f, 1.0f);\n}\n"
+        "fragment VxDepthResolveOut vx_depth_resolve_2d(float4 pos [[position]],\n"
+        "    depth2d_ms<float, access::read> src [[texture(0)]],\n"
+        "    constant VxDepthResolveRegion& region [[buffer(0)]]) {\n"
+        "  uint2 dst = uint2(pos.xy); uint2 xy = uint2(region.source_x, region.source_y) +\n"
+        "      (dst - uint2(region.destination_x, region.destination_y));\n"
+        "  uint n = src.get_num_samples(); float value = region.mode == 2u ? 1.0f : 0.0f;\n"
+        "  for (uint s = 0; s < n; ++s) { float v = src.read(xy, s);\n"
+        "    if (region.mode == 1u) value += v;\n"
+        "    else if (region.mode == 2u) value = min(value, v);\n"
+        "    else value = max(value, v); }\n"
+        "  if (region.mode == 1u) value /= float(n);\n"
+        "  return VxDepthResolveOut{ value };\n}\n"
+        "fragment VxDepthResolveOut vx_depth_resolve_array(float4 pos [[position]],\n"
+        "    depth2d_ms_array<float, access::read> src [[texture(0)]],\n"
+        "    constant VxDepthResolveRegion& region [[buffer(0)]]) {\n"
+        "  uint2 dst = uint2(pos.xy); uint2 xy = uint2(region.source_x, region.source_y) +\n"
+        "      (dst - uint2(region.destination_x, region.destination_y));\n"
+        "  uint n = src.get_num_samples(); float value = region.mode == 2u ? 1.0f : 0.0f;\n"
+        "  for (uint s = 0; s < n; ++s) { float v = src.read(xy, region.source_slice, s);\n"
+        "    if (region.mode == 1u) value += v;\n"
+        "    else if (region.mode == 2u) value = min(value, v);\n"
+        "    else value = max(value, v); }\n"
+        "  if (region.mode == 1u) value /= float(n);\n"
+        "  return VxDepthResolveOut{ value };\n}";
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    id<MTLFunction> vertex = [library newFunctionWithName:@"vx_depth_resolve_vs"];
+    id<MTLFunction> fragment = [library newFunctionWithName:array_source ? @"vx_depth_resolve_array" : @"vx_depth_resolve_2d"];
+    if (!library || !vertex || !fragment) {
+        vx_log("D3D12: depth resolve shader compilation failed: %s",
+               error.localizedDescription.UTF8String ?: "missing Metal function");
+        pthread_mutex_unlock(&g_resolve_pipeline_lock);
+        return NO;
+    }
+
+    MTLRenderPipelineDescriptor *pipeline_desc = [MTLRenderPipelineDescriptor new];
+    pipeline_desc.vertexFunction = vertex;
+    pipeline_desc.fragmentFunction = fragment;
+    pipeline_desc.depthAttachmentPixelFormat = format;
+    pipeline_desc.rasterSampleCount = 1;
+    id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:pipeline_desc error:&error];
+    MTLDepthStencilDescriptor *depth_desc = [MTLDepthStencilDescriptor new];
+    depth_desc.depthCompareFunction = MTLCompareFunctionAlways;
+    depth_desc.depthWriteEnabled = YES;
+    id<MTLDepthStencilState> depth_state = [device newDepthStencilStateWithDescriptor:depth_desc];
+    if (!pipeline || !depth_state) {
+        vx_log("D3D12: depth resolve pipeline creation failed: %s",
+               error.localizedDescription.UTF8String ?: "Metal returned no pipeline state");
+        pthread_mutex_unlock(&g_resolve_pipeline_lock);
+        return NO;
+    }
+    NSDictionary *entry = @{ @"pipeline": pipeline, @"depth_state": depth_state };
+    g_depth_resolve_pipeline_cache[key] = entry;
+    *pipeline_out = pipeline;
+    *depth_state_out = depth_state;
+    pthread_mutex_unlock(&g_resolve_pipeline_lock);
+    return YES;
+}
+
+typedef enum d3d12_color_resolve_kind {
+    D3D12_COLOR_RESOLVE_UNSUPPORTED,
+    D3D12_COLOR_RESOLVE_FLOAT,
+    D3D12_COLOR_RESOLVE_UINT,
+    D3D12_COLOR_RESOLVE_SINT,
+} d3d12_color_resolve_kind;
+
+static d3d12_color_resolve_kind d3d12_color_resolve_format_kind(MTLPixelFormat format) {
+    switch (format) {
+    case MTLPixelFormatA8Unorm: case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Unorm_sRGB:
+    case MTLPixelFormatR8Snorm:
+    case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Unorm_sRGB: case MTLPixelFormatRG8Snorm:
+    case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
+    case MTLPixelFormatRGBA8Snorm: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm: case MTLPixelFormatR16Float:
+    case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm: case MTLPixelFormatRG16Float:
+    case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm: case MTLPixelFormatRGBA16Float:
+    case MTLPixelFormatR32Float: case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA32Float:
+    case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float:
+    case MTLPixelFormatB5G6R5Unorm: case MTLPixelFormatBGR5A1Unorm: case MTLPixelFormatABGR4Unorm:
+        return D3D12_COLOR_RESOLVE_FLOAT;
+    case MTLPixelFormatR8Uint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRGBA8Uint:
+    case MTLPixelFormatR16Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatR32Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRGBA32Uint:
+    case MTLPixelFormatRGB10A2Uint:
+        return D3D12_COLOR_RESOLVE_UINT;
+    case MTLPixelFormatR8Sint: case MTLPixelFormatRG8Sint: case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatR16Sint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA16Sint:
+    case MTLPixelFormatR32Sint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA32Sint:
+        return D3D12_COLOR_RESOLVE_SINT;
+    default:
+        return D3D12_COLOR_RESOLVE_UNSUPPORTED;
+    }
+}
+
+static BOOL d3d12_color_resolve_float_format(MTLPixelFormat format) {
+    return d3d12_color_resolve_format_kind(format) == D3D12_COLOR_RESOLVE_FLOAT;
+}
+
+static BOOL d3d12_color_resolve_format_supported(MTLPixelFormat format) {
+    return d3d12_color_resolve_format_kind(format) != D3D12_COLOR_RESOLVE_UNSUPPORTED;
+}
+
+static id<MTLRenderPipelineState> d3d12_get_color_resolve_pipeline(id<MTLDevice> device,
+                                                                    MTLPixelFormat format,
+                                                                    BOOL array_source) {
+    d3d12_color_resolve_kind kind = d3d12_color_resolve_format_kind(format);
+    if (!device || kind == D3D12_COLOR_RESOLVE_UNSUPPORTED) return nil;
+    pthread_mutex_lock(&g_resolve_pipeline_lock);
+    if (!g_color_resolve_pipeline_cache) g_color_resolve_pipeline_cache = [NSMutableDictionary dictionary];
+    NSString *key = [NSString stringWithFormat:@"%p:%lu:%u", (__bridge void *)device,
+                     (unsigned long)format, array_source ? 1u : 0u];
+    id<MTLRenderPipelineState> cached = g_color_resolve_pipeline_cache[key];
+    if (cached) {
+        pthread_mutex_unlock(&g_resolve_pipeline_lock);
+        return cached;
+    }
+
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "vertex float4 vx_color_resolve_vs(uint id [[vertex_id]]) {\n"
+        "  constexpr float2 p[3] = { float2(-1.0f,-1.0f), float2(3.0f,-1.0f), float2(-1.0f,3.0f) };\n"
+        "  return float4(p[id], 0.0f, 1.0f);\n}\n"
+        "struct VxColorResolveRegion { uint source_x, source_y, destination_x, destination_y, source_slice, mode; };\n";
+    NSString *value_type = kind == D3D12_COLOR_RESOLVE_UINT ? @"uint4" :
+        kind == D3D12_COLOR_RESOLVE_SINT ? @"int4" : @"float4";
+    NSString *texture_type = kind == D3D12_COLOR_RESOLVE_UINT ? @"uint" :
+        kind == D3D12_COLOR_RESOLVE_SINT ? @"int" : @"float";
+    NSString *sample_read = array_source ? @"src.read(xy, region.source_slice, s)" : @"src.read(xy, s)";
+    NSString *first_read = array_source ? @"src.read(xy, region.source_slice, 0u)" : @"src.read(xy, 0u)";
+    NSString *texture_decl = array_source ? @"texture2d_ms_array<%@, access::read>" :
+        @"texture2d_ms<%@, access::read>";
+    NSString *reduce_body = kind == D3D12_COLOR_RESOLVE_FLOAT
+        ? @"if (region.mode == 1u) value += sample; else if (region.mode == 2u) value = min(value, sample); else value = max(value, sample);"
+        : @"if (region.mode == 2u) value = min(value, sample); else value = max(value, sample);";
+    NSString *finish = kind == D3D12_COLOR_RESOLVE_FLOAT
+        ? @"if (region.mode == 1u) value /= float(n); " : @"";
+    NSString *fragment_source = [NSString stringWithFormat:
+        @"fragment %@ vx_color_resolve(float4 pos [[position]], %@ src [[texture(0)]], "
+         "constant VxColorResolveRegion& region [[buffer(0)]]) { "
+         "uint2 dst = uint2(pos.xy); uint2 xy = uint2(region.source_x, region.source_y) + "
+         "(dst - uint2(region.destination_x, region.destination_y)); "
+         "uint n = src.get_num_samples(); %@ value = %@; "
+         "for (uint s = 1u; s < n; ++s) { %@ sample = %@; %@ } %@ return value; }",
+         value_type, [NSString stringWithFormat:texture_decl, texture_type], value_type, first_read, value_type,
+         sample_read, reduce_body, finish];
+    source = [NSString stringWithFormat:@"%@%@", source, fragment_source];
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    id<MTLFunction> vertex = [library newFunctionWithName:@"vx_color_resolve_vs"];
+    id<MTLFunction> fragment = [library newFunctionWithName:@"vx_color_resolve"];
+    MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
+    descriptor.vertexFunction = vertex;
+    descriptor.fragmentFunction = fragment;
+    descriptor.colorAttachments[0].pixelFormat = format;
+    id<MTLRenderPipelineState> pipeline = library && vertex && fragment ?
+        [device newRenderPipelineStateWithDescriptor:descriptor error:&error] : nil;
+    if (!pipeline) {
+        vx_log("D3D12: partial color resolve pipeline creation failed for format %lu: %s",
+               (unsigned long)format, error.localizedDescription.UTF8String ?: "Metal returned no pipeline state");
+        pthread_mutex_unlock(&g_resolve_pipeline_lock);
+        return nil;
+    }
+    g_color_resolve_pipeline_cache[key] = pipeline;
+    pthread_mutex_unlock(&g_resolve_pipeline_lock);
+    return pipeline;
+}
+
+static int d3d12_gpu_ir_resolve_texture(void *context, const gpu_ir_resource *src,
+                                       const gpu_ir_resolve_location *src_location,
+                                       const gpu_ir_resource *dst, const gpu_ir_resolve_location *dst_location,
+                                       const gpu_ir_resolve_region *region, uint32_t mode) {
+    id<MTLCommandBuffer> command_buffer = (__bridge id<MTLCommandBuffer>)context;
+    id<MTLTexture> source = (__bridge id<MTLTexture>)gpu_ir_backend_object(src);
+    id<MTLTexture> destination = (__bridge id<MTLTexture>)gpu_ir_backend_object(dst);
+    if (!command_buffer || !source || !destination || !region || source.sampleCount <= 1 || destination.sampleCount != 1 ||
+        source.pixelFormat != destination.pixelFormat) return GPU_IR_INVALID;
+    NSUInteger source_width = gpu_ir_mip_extent((uint32_t)source.width, src_location->mip_level);
+    NSUInteger source_height = gpu_ir_mip_extent((uint32_t)source.height, src_location->mip_level);
+    NSUInteger destination_width = gpu_ir_mip_extent((uint32_t)destination.width, dst_location->mip_level);
+    NSUInteger destination_height = gpu_ir_mip_extent((uint32_t)destination.height, dst_location->mip_level);
+    BOOL full_region = !region->source_x && !region->source_y && !region->destination_x && !region->destination_y &&
+        region->width == source_width && region->height == source_height &&
+        source_width == destination_width && source_height == destination_height;
+    BOOL depth_format = d3d12_is_depth_pixel_format(source.pixelFormat);
+    if (depth_format && !full_region) {
+        if ((source.pixelFormat != MTLPixelFormatDepth16Unorm && source.pixelFormat != MTLPixelFormatDepth32Float) ||
+            !(destination.usage & MTLTextureUsageRenderTarget) ||
+            (mode != GPU_IR_RESOLVE_MODE_AVERAGE && mode != GPU_IR_RESOLVE_MODE_MIN && mode != GPU_IR_RESOLVE_MODE_MAX))
+            return GPU_IR_UNSUPPORTED;
+        BOOL array_source = source.textureType == MTLTextureType2DMultisampleArray;
+        if (!array_source && source.textureType != MTLTextureType2DMultisample) return GPU_IR_UNSUPPORTED;
+        id<MTLDevice> device = command_buffer.commandQueue.device;
+        id<MTLRenderPipelineState> pipeline = nil;
+        id<MTLDepthStencilState> depth_state = nil;
+        if (!d3d12_get_depth_resolve_pipeline(device, destination.pixelFormat, array_source, &pipeline, &depth_state))
+            return GPU_IR_UNSUPPORTED;
+        MTLRenderPassDescriptor *partial_pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassDepthAttachmentDescriptor *attachment = partial_pass.depthAttachment;
+        attachment.texture = destination;
+        attachment.level = dst_location->mip_level;
+        attachment.slice = dst_location->array_slice;
+        attachment.loadAction = MTLLoadActionLoad;
+        attachment.storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> partial_encoder = [command_buffer renderCommandEncoderWithDescriptor:partial_pass];
+        if (!partial_encoder) return GPU_IR_UNSUPPORTED;
+        struct { uint32_t source_x, source_y, destination_x, destination_y, source_slice, mode; } parameters = {
+            region->source_x, region->source_y, region->destination_x, region->destination_y,
+            src_location->array_slice, mode
+        };
+        [partial_encoder setRenderPipelineState:pipeline];
+        [partial_encoder setDepthStencilState:depth_state];
+        [partial_encoder setFragmentTexture:source atIndex:0];
+        [partial_encoder setFragmentBytes:&parameters length:sizeof parameters atIndex:0];
+        [partial_encoder setViewport:(MTLViewport){ 0, 0, (double)destination_width, (double)destination_height, 0, 1 }];
+        [partial_encoder setScissorRect:(MTLScissorRect){ region->destination_x, region->destination_y,
+            region->width, region->height }];
+        [partial_encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [partial_encoder endEncoding];
+        return GPU_IR_OK;
+    }
+    BOOL custom_color_resolve = !depth_format &&
+        (mode == GPU_IR_RESOLVE_MODE_MIN || mode == GPU_IR_RESOLVE_MODE_MAX ||
+         (mode == GPU_IR_RESOLVE_MODE_AVERAGE && !full_region));
+    if (custom_color_resolve) {
+        if (!(destination.usage & MTLTextureUsageRenderTarget)) return GPU_IR_UNSUPPORTED;
+        id<MTLRenderPipelineState> pipeline = d3d12_get_color_resolve_pipeline(
+            command_buffer.commandQueue.device, destination.pixelFormat,
+            source.textureType == MTLTextureType2DMultisampleArray);
+        if (!pipeline) return GPU_IR_UNSUPPORTED;
+        MTLRenderPassDescriptor *color_pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassColorAttachmentDescriptor *attachment = color_pass.colorAttachments[0];
+        attachment.texture = destination;
+        attachment.level = dst_location->mip_level;
+        attachment.slice = dst_location->array_slice;
+        attachment.loadAction = full_region ? MTLLoadActionDontCare : MTLLoadActionLoad;
+        attachment.storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> color_encoder = [command_buffer renderCommandEncoderWithDescriptor:color_pass];
+        if (!color_encoder) return GPU_IR_UNSUPPORTED;
+        struct { uint32_t source_x, source_y, destination_x, destination_y, source_slice, mode; } parameters = {
+            region->source_x, region->source_y, region->destination_x, region->destination_y,
+            src_location->array_slice, mode
+        };
+        [color_encoder setRenderPipelineState:pipeline];
+        [color_encoder setFragmentTexture:source atIndex:0];
+        [color_encoder setFragmentBytes:&parameters length:sizeof parameters atIndex:0];
+        [color_encoder setViewport:(MTLViewport){ 0, 0, (double)destination_width, (double)destination_height, 0, 1 }];
+        if (!full_region) [color_encoder setScissorRect:(MTLScissorRect){ region->destination_x, region->destination_y,
+            region->width, region->height }];
+        [color_encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [color_encoder endEncoding];
+        return GPU_IR_OK;
+    }
+    if (!full_region) return GPU_IR_UNSUPPORTED;
+    if (depth_format && mode == GPU_IR_RESOLVE_MODE_AVERAGE) {
+        if (source.pixelFormat != MTLPixelFormatDepth16Unorm && source.pixelFormat != MTLPixelFormatDepth32Float)
+            return GPU_IR_UNSUPPORTED;
+        BOOL array_source = source.textureType == MTLTextureType2DMultisampleArray;
+        if (!array_source && source.textureType != MTLTextureType2DMultisample) return GPU_IR_UNSUPPORTED;
+        id<MTLDevice> device = command_buffer.commandQueue.device;
+        id<MTLRenderPipelineState> pipeline = nil;
+        id<MTLDepthStencilState> depth_state = nil;
+        if (!d3d12_get_depth_resolve_pipeline(device, destination.pixelFormat, array_source, &pipeline, &depth_state))
+            return GPU_IR_UNSUPPORTED;
+        MTLRenderPassDescriptor *average_pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        MTLRenderPassDepthAttachmentDescriptor *depth_attachment = average_pass.depthAttachment;
+        depth_attachment.texture = destination;
+        depth_attachment.level = dst_location->mip_level;
+        depth_attachment.slice = dst_location->array_slice;
+        depth_attachment.loadAction = MTLLoadActionDontCare;
+        depth_attachment.storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> average_encoder = [command_buffer renderCommandEncoderWithDescriptor:average_pass];
+        if (!average_encoder) return GPU_IR_UNSUPPORTED;
+        NSUInteger width = gpu_ir_mip_extent((uint32_t)destination.width, dst_location->mip_level);
+        NSUInteger height = gpu_ir_mip_extent((uint32_t)destination.height, dst_location->mip_level);
+        [average_encoder setRenderPipelineState:pipeline];
+        [average_encoder setDepthStencilState:depth_state];
+        [average_encoder setFragmentTexture:source atIndex:0];
+        struct { uint32_t source_x, source_y, destination_x, destination_y, source_slice, mode; } parameters = {
+            region->source_x, region->source_y, region->destination_x, region->destination_y,
+            src_location->array_slice, mode
+        };
+        [average_encoder setFragmentBytes:&parameters length:sizeof parameters atIndex:0];
+        [average_encoder setViewport:(MTLViewport){ 0, 0, (double)width, (double)height, 0, 1 }];
+        [average_encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [average_encoder endEncoding];
+        return GPU_IR_OK;
+    }
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (d3d12_is_depth_pixel_format(source.pixelFormat)) {
+        if (mode != GPU_IR_RESOLVE_MODE_MIN && mode != GPU_IR_RESOLVE_MODE_MAX) return GPU_IR_UNSUPPORTED;
+        MTLRenderPassDepthAttachmentDescriptor *attachment = pass.depthAttachment;
+        attachment.texture = source;
+        attachment.level = src_location->mip_level;
+        attachment.slice = src_location->array_slice;
+        attachment.loadAction = MTLLoadActionLoad;
+        attachment.storeAction = MTLStoreActionMultisampleResolve;
+        attachment.resolveTexture = destination;
+        attachment.resolveLevel = dst_location->mip_level;
+        attachment.resolveSlice = dst_location->array_slice;
+        attachment.depthResolveFilter = mode == GPU_IR_RESOLVE_MODE_MIN
+            ? MTLMultisampleDepthResolveFilterMin : MTLMultisampleDepthResolveFilterMax;
+    } else {
+        if (mode != GPU_IR_RESOLVE_MODE_AVERAGE) return GPU_IR_UNSUPPORTED;
+        MTLRenderPassColorAttachmentDescriptor *attachment = pass.colorAttachments[0];
+        attachment.texture = source;
+        attachment.level = src_location->mip_level;
+        attachment.slice = src_location->array_slice;
+        attachment.loadAction = MTLLoadActionLoad;
+        attachment.storeAction = MTLStoreActionMultisampleResolve;
+        attachment.resolveTexture = destination;
+        attachment.resolveLevel = dst_location->mip_level;
+        attachment.resolveSlice = dst_location->array_slice;
+    }
+    id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) return GPU_IR_UNSUPPORTED;
+    [encoder endEncoding];
+    return GPU_IR_OK;
+}
+
+static int d3d12_gpu_ir_barrier(void *context, const gpu_ir_barrier_desc *barrier) {
+    (void)context;
+    (void)barrier;
+    // Replay ends the active Metal encoder at every recorded barrier. Metal's tracked-resource hazard handling
+    // orders those encoders; keeping the barrier in the common stream preserves API order for other backends.
+    return GPU_IR_OK;
 }
 
 // The pointer the shader's slot reads its descriptors through, from the root signature and the root arguments.
@@ -1441,8 +5070,586 @@ static void stage_root(dev12 *d, const dxil_msl *msl, root_binding *rb, heap12 *
     *words = n + 2;
 }
 
+// Resolve one reflected shader register to its root parameter. Return 1 for a descriptor location, 2 for
+// root constants/static samplers (no resource state to check), 0 when the application has not bound it, and -1
+// for an invalid root-table range.
+static int state_root_slot12(const rootsig12 *root, const root_state *state, const dxil_msl_slot *slot,
+                             uint64_t *descriptor_va, uint64_t *root_va, const range12 **matched_range) {
+    *descriptor_va = 0;
+    *root_va = 0;
+    *matched_range = NULL;
+    if (!root) return 0;
+    for (uint32_t i = 0; i < root->nparams; i++) {
+        const param12 *parameter = &root->params[i];
+        if (parameter->type == 0) {
+            for (uint32_t k = 0; k < parameter->nranges; k++) {
+                const range12 *range = &parameter->ranges[k];
+                if (range->type != slot->cls || range->space != slot->space || slot->lower < range->base ||
+                    (range->count != UINT32_MAX && slot->lower - range->base >= range->count)) continue;
+                uint64_t descriptor_offset = (uint64_t)range->offset + slot->lower - range->base;
+                if (descriptor_offset > (UINT64_MAX - state->table[i]) / 32) return -1;
+                if (!state->table[i]) return 0;
+                *descriptor_va = state->table[i] + 32 * descriptor_offset;
+                *matched_range = range;
+                return 1;
+            }
+        } else if (parameter->type == 1 && slot->cls == DXIL_CBV &&
+                   parameter->reg == slot->lower && parameter->space == slot->space) {
+            return 2;
+        } else if (parameter->type >= 2) {
+            int cls = parameter->type == 2 ? DXIL_CBV : parameter->type == 3 ? DXIL_SRV : DXIL_UAV;
+            if (cls != slot->cls || parameter->reg != slot->lower || parameter->space != slot->space) continue;
+            *root_va = state->root_va[i];
+            return *root_va ? 1 : 0;
+        }
+    }
+    if (slot->cls == DXIL_SAMPLER) {
+        for (uint32_t i = 0; i < root->nsamplers; i++)
+            if (root->samplers[i].reg == slot->lower && root->samplers[i].space == slot->space) return 2;
+    }
+    return 0;
+}
+
+typedef struct {
+    gpu_ir_resource_access *values;
+    uint32_t count, capacity;
+} gpu_ir_access_list12;
+
+static int gpu_ir_access_add_resource12(gpu_ir_access_list12 *list, gpu_ir_resource *resource,
+                                        uint32_t stage, uint32_t access) {
+    if (!list || !resource || !stage || !access) return GPU_IR_INVALID;
+    for (uint32_t i = 0; i < list->count; i++) {
+        gpu_ir_resource_access *existing = &list->values[i];
+        if (existing->resource == resource && existing->stage_mask == stage) {
+            existing->access_mask |= access;
+            return GPU_IR_OK;
+        }
+    }
+    if (list->count == list->capacity) {
+        uint32_t capacity = list->capacity ? list->capacity * 2 : 16;
+        if (capacity < list->capacity || (size_t)capacity > SIZE_MAX / sizeof *list->values)
+            return GPU_IR_OUT_OF_MEMORY;
+        gpu_ir_resource_access *values = realloc(list->values, (size_t)capacity * sizeof *values);
+        if (!values) return GPU_IR_OUT_OF_MEMORY;
+        list->values = values;
+        list->capacity = capacity;
+    }
+    gpu_ir_resource_retain(resource);
+    list->values[list->count++] = (gpu_ir_resource_access){ resource, stage, access };
+    return GPU_IR_OK;
+}
+
+static void gpu_ir_access_list_release12(gpu_ir_access_list12 *list) {
+    if (!list) return;
+    for (uint32_t i = 0; i < list->count; i++) gpu_ir_resource_release(list->values[i].resource);
+    free(list->values);
+    memset(list, 0, sizeof *list);
+}
+
+static int gpu_ir_access_add12(gpu_ir_access_list12 *list, res12 *resource, uint32_t stage, uint32_t access) {
+    if (!resource) return GPU_IR_INVALID;
+    gpu_ir_resource *ir_resource = resource->gpu_buffer ? resource->gpu_buffer : resource->gpu_texture;
+    return gpu_ir_access_add_resource12(list, ir_resource, stage, access);
+}
+
+typedef struct {
+    gpu_ir_descriptor_value *values;
+    uint32_t count, capacity;
+} gpu_ir_descriptor_values12;
+
+static void gpu_ir_descriptor_value_discard12(gpu_ir_descriptor_value *value) {
+    if (!value) return;
+    if (value->backend_release) value->backend_release(value->backend_object);
+    if (value->backend_release_aux) value->backend_release_aux(value->backend_object_aux);
+    value->backend_object = value->backend_object_aux = NULL;
+    value->backend_release = value->backend_release_aux = NULL;
+}
+
+static int gpu_ir_descriptor_value_append12(gpu_ir_descriptor_values12 *list,
+                                             const gpu_ir_descriptor_value *value) {
+    if (!list || !value) return GPU_IR_INVALID;
+    if (list->count == list->capacity) {
+        uint32_t capacity = list->capacity ? list->capacity * 2 : 16;
+        if (capacity < list->capacity || (size_t)capacity > SIZE_MAX / sizeof *list->values)
+            return GPU_IR_OUT_OF_MEMORY;
+        gpu_ir_descriptor_value *values = realloc(list->values, (size_t)capacity * sizeof *values);
+        if (!values) return GPU_IR_OUT_OF_MEMORY;
+        list->values = values;
+        list->capacity = capacity;
+    }
+    list->values[list->count++] = *value;
+    return GPU_IR_OK;
+}
+
+static int gpu_ir_descriptor_value_for_slot12(dev12 *device, const rootsig12 *root,
+    const root_state *state, const dxil_msl_slot *slot, uint32_t stage, heap12 *resource_heap,
+    heap12 *sampler_heap, const range12 *range, uint32_t array_element,
+    uint64_t descriptor_va, uint64_t root_va, gpu_ir_descriptor_value *out) {
+    if (slot->cls == DXIL_SAMPLER && !range && !descriptor_va && !root_va) {
+        for (uint32_t i = 0; i < root->nsamplers; i++) {
+            const static_sampler12 *sampler = &root->samplers[i];
+            if (sampler->reg != slot->lower || sampler->space != slot->space) continue;
+            gpu_ir_descriptor_binding binding;
+            if (!root->gpu_layout || gpu_ir_pipeline_layout_find_binding_for_stage(root->gpu_layout,
+                    slot->space, slot->cls, sampler->reg, stage, &binding) != GPU_IR_OK)
+                return GPU_IR_INVALID;
+            *out = (gpu_ir_descriptor_value){
+                .set = slot->space, .binding_namespace = slot->cls, .binding = sampler->reg,
+                .kind = binding.kind, .stage_mask = stage, .access_mask = binding.access_mask
+            };
+            if (!sampler->state) return GPU_IR_INVALID;
+            out->backend_object = (void *)CFBridgingRetain(sampler->state);
+            out->backend_release = gpu12_release_mtl_object;
+            return GPU_IR_OK;
+        }
+        return GPU_IR_INVALID;
+    }
+
+    uint32_t binding_register = 0;
+    if (range) {
+        binding_register = range->base;
+    } else {
+        int found = 0;
+        for (uint32_t i = 0; i < root->nparams; i++) {
+            const param12 *parameter = &root->params[i];
+            uint32_t register_class = parameter->type == 2 ? DXIL_CBV :
+                parameter->type == 3 ? DXIL_SRV : parameter->type == 4 ? DXIL_UAV : UINT32_MAX;
+            if (register_class == slot->cls && parameter->reg == slot->lower &&
+                parameter->space == slot->space) {
+                binding_register = parameter->reg;
+                found = 1;
+                break;
+            }
+        }
+        if (!found || !root_va) return GPU_IR_INVALID;
+    }
+
+    gpu_ir_descriptor_binding binding;
+    if (!root->gpu_layout || gpu_ir_pipeline_layout_find_binding_for_stage(root->gpu_layout,
+        slot->space, slot->cls, binding_register, stage, &binding) != GPU_IR_OK) return GPU_IR_INVALID;
+    *out = (gpu_ir_descriptor_value){
+        .set = slot->space, .binding_namespace = slot->cls, .binding = binding_register,
+        .array_element = array_element, .kind = binding.kind, .stage_mask = stage,
+        .access_mask = binding.access_mask
+    };
+
+    if (root_va) {
+        if (slot->has_counter) return GPU_IR_INVALID; // D3D12 root UAV descriptors do not carry a hidden counter.
+        res12 *resource = state_resource_for_gpu_range_locked12(device, root_va, 1);
+        if (!resource || !resource->buffer || !resource->gpu_buffer ||
+            root_va < resource->buffer.gpuAddress) return GPU_IR_INVALID;
+        out->resource = resource->gpu_buffer;
+        out->offset = root_va - resource->buffer.gpuAddress;
+        out->range = resource->buffer.length - out->offset;
+        return GPU_IR_OK;
+    }
+
+    heap12 *heap = slot->cls == DXIL_SAMPLER ? sampler_heap : resource_heap;
+    if (!descriptor_heap_resident12(heap) || !heap->gpu || descriptor_va < heap->gpu.gpuAddress ||
+        (descriptor_va - heap->gpu.gpuAddress) % 32) return GPU_IR_INVALID;
+    uint64_t index64 = (descriptor_va - heap->gpu.gpuAddress) / 32;
+    if (index64 >= heap->desc.NumDescriptors) return GPU_IR_INVALID;
+    uint32_t index = (uint32_t)index64;
+    VxDesc descriptor;
+    memcpy(&descriptor, heap->cpu + 32ull * index, sizeof descriptor);
+    uint8_t encoded_class = heap->descriptor_kind ? heap->descriptor_kind[index] : 0;
+    if (encoded_class && encoded_class - 1 != slot->cls) return GPU_IR_INVALID;
+
+    if (binding.kind == GPU_IR_DESCRIPTOR_SAMPLER) {
+        id<MTLSamplerState> sampler = heap->keep ? heap->keep[index] : nil;
+        if (!sampler) {
+            if (descriptor.va || descriptor.res || descriptor.size || descriptor.stride || descriptor.fmt || descriptor.flags)
+                return GPU_IR_INVALID;
+            out->flags = GPU_IR_DESCRIPTOR_VALUE_NULL;
+            return GPU_IR_OK;
+        }
+        out->backend_object = (void *)CFBridgingRetain(sampler);
+        out->backend_release = gpu12_release_mtl_object;
+        return GPU_IR_OK;
+    }
+
+    gpu_ir_buffer_view *buffer_view = heap->buffer_view ? heap->buffer_view[index] : NULL;
+    shader_view12 *shader_view = heap->shader_view ? &heap->shader_view[index] : NULL;
+    if (slot->has_counter && (!(descriptor.flags & DXIL_MSL_DESC_HAS_COUNTER) ||
+        !shader_view || !shader_view->counter_resource)) return GPU_IR_INVALID;
+    if (buffer_view) {
+        const gpu_ir_resource *resource = gpu_ir_buffer_view_resource(buffer_view);
+        if (!resource) return GPU_IR_INVALID;
+        out->resource = (gpu_ir_resource *)resource;
+        out->buffer_view = buffer_view;
+    } else if (shader_view && shader_view->resource) {
+        res12 *resource = shader_view->resource;
+        out->resource = resource->gpu_buffer ? resource->gpu_buffer : resource->gpu_texture;
+        if (!out->resource) return GPU_IR_INVALID;
+        if (heap->keep && heap->keep[index]) {
+            out->backend_object = (void *)CFBridgingRetain(heap->keep[index]);
+            out->backend_release = gpu12_release_mtl_object;
+        }
+    } else if (descriptor.va) {
+        uint64_t size = descriptor.size ? descriptor.size : 1;
+        res12 *resource = state_resource_for_gpu_range_locked12(device, descriptor.va, size);
+        if (!resource || !resource->buffer || !resource->gpu_buffer ||
+            descriptor.va < resource->buffer.gpuAddress) return GPU_IR_INVALID;
+        out->resource = resource->gpu_buffer;
+        out->offset = descriptor.va - resource->buffer.gpuAddress;
+        out->range = descriptor.size;
+    } else if (descriptor.res) {
+        return GPU_IR_INVALID;
+    } else {
+        out->flags = GPU_IR_DESCRIPTOR_VALUE_NULL;
+    }
+    if (shader_view && shader_view->counter_resource) {
+        res12 *counter = shader_view->counter_resource;
+        if (!counter->gpu_buffer || shader_view->counter_offset > counter->buffer.length ||
+            sizeof(uint32_t) > counter->buffer.length - shader_view->counter_offset) return GPU_IR_INVALID;
+        out->auxiliary_resource = counter->gpu_buffer;
+        out->auxiliary_access_mask = GPU_IR_ACCESS_SHADER_READ | GPU_IR_ACCESS_SHADER_WRITE;
+        out->auxiliary_offset = shader_view->counter_offset;
+        out->auxiliary_range = sizeof(uint32_t);
+    }
+    return GPU_IR_OK;
+}
+
+static int gpu_ir_snapshot_root_bindings12(dev12 *device, const dxil_msl *shader, uint32_t stage,
+    root_binding *root_binding, heap12 *resource_heap, heap12 *sampler_heap,
+    gpu_ir_descriptor_state **out_state) {
+    if (!out_state) return GPU_IR_INVALID;
+    *out_state = NULL;
+    if (!shader) return GPU_IR_OK;
+    if (!root_binding || !root_binding->rs || !root_binding->rs->gpu_layout) return GPU_IR_INVALID;
+    gpu_ir_descriptor_values12 values = { 0 };
+    int result = GPU_IR_OK;
+    for (uint32_t i = 0; i < shader->nslots; i++) {
+        const dxil_msl_slot *slot = &shader->slots[i];
+        uint64_t descriptor_va, root_va;
+        const range12 *range;
+        int slot_result = state_root_slot12(root_binding->rs, &root_binding->st, slot,
+                                            &descriptor_va, &root_va, &range);
+        if (slot_result < 0) { result = GPU_IR_INVALID; break; }
+        if (!slot_result || (slot_result == 2 && slot->cls != DXIL_SAMPLER)) continue;
+        if (slot_result == 2) {
+            gpu_ir_descriptor_value value;
+            result = gpu_ir_descriptor_value_for_slot12(device, root_binding->rs, &root_binding->st,
+                slot, stage, resource_heap, sampler_heap, NULL, 0, 0, 0, &value);
+            if (result != GPU_IR_OK) break;
+            result = gpu_ir_descriptor_value_append12(&values, &value);
+            if (result != GPU_IR_OK) { gpu_ir_descriptor_value_discard12(&value); break; }
+            continue;
+        }
+        if (root_va) {
+            gpu_ir_descriptor_value value;
+            result = gpu_ir_descriptor_value_for_slot12(device, root_binding->rs, &root_binding->st,
+                slot, stage, resource_heap, sampler_heap, NULL, 0, 0, root_va, &value);
+            if (result != GPU_IR_OK) break;
+            result = gpu_ir_descriptor_value_append12(&values, &value);
+            if (result != GPU_IR_OK) { gpu_ir_descriptor_value_discard12(&value); break; }
+            continue;
+        }
+        if (!range || slot->lower < range->base) { result = GPU_IR_INVALID; break; }
+        heap12 *heap = slot->cls == DXIL_SAMPLER ? sampler_heap : resource_heap;
+        if (!descriptor_heap_resident12(heap) || !heap->gpu || descriptor_va < heap->gpu.gpuAddress ||
+            (descriptor_va - heap->gpu.gpuAddress) % 32) { result = GPU_IR_INVALID; break; }
+        uint64_t first = (descriptor_va - heap->gpu.gpuAddress) / 32;
+        if (first >= heap->desc.NumDescriptors) { result = GPU_IR_INVALID; break; }
+        uint64_t heap_available = heap->desc.NumDescriptors - first;
+        uint64_t range_available = range->count == UINT32_MAX ? UINT64_MAX :
+            (uint64_t)range->count - (slot->lower - range->base);
+        uint64_t elements = slot->count == UINT32_MAX ? MIN(heap_available, range_available) :
+            (slot->count ? slot->count : 1);
+        if (!elements || elements > heap_available || elements > range_available) {
+            result = GPU_IR_INVALID;
+            break;
+        }
+        for (uint64_t element = 0; element < elements; element++) {
+            if (element > UINT32_MAX - slot->lower) { result = GPU_IR_RANGE; break; }
+            dxil_msl_slot element_slot = *slot;
+            element_slot.lower += (uint32_t)element;
+            uint64_t element_va, element_root_va;
+            const range12 *element_range;
+            int element_result = state_root_slot12(root_binding->rs, &root_binding->st, &element_slot,
+                &element_va, &element_root_va, &element_range);
+            if (element_result != 1 || element_root_va || !element_range) {
+                result = GPU_IR_INVALID;
+                break;
+            }
+            gpu_ir_descriptor_value value;
+            result = gpu_ir_descriptor_value_for_slot12(device, root_binding->rs, &root_binding->st,
+                &element_slot, stage, resource_heap, sampler_heap, element_range,
+                element_slot.lower - element_range->base, element_va, 0, &value);
+            if (result != GPU_IR_OK) break;
+            result = gpu_ir_descriptor_value_append12(&values, &value);
+            if (result != GPU_IR_OK) { gpu_ir_descriptor_value_discard12(&value); break; }
+        }
+        if (result != GPU_IR_OK) break;
+    }
+    int state_created = 0;
+    if (result == GPU_IR_OK) {
+        gpu_ir_descriptor_state_desc desc = { .values = values.values, .value_count = values.count };
+        *out_state = gpu_ir_descriptor_state_create(root_binding->rs->gpu_layout, &desc);
+        if (!*out_state) result = GPU_IR_INVALID;
+        else state_created = 1; // Successful state creation takes ownership of backend-object references.
+    }
+    if (!state_created)
+        for (uint32_t i = 0; i < values.count; i++) gpu_ir_descriptor_value_discard12(&values.values[i]);
+    free(values.values);
+    return result;
+}
+
+static int gpu_ir_access_add_descriptor12(dev12 *device, gpu_ir_access_list12 *list, heap12 *heap,
+                                          uint32_t index, uint32_t stage, uint32_t access) {
+    if (!device || !list || !heap || index >= heap->desc.NumDescriptors) return GPU_IR_INVALID;
+    VxDesc descriptor;
+    memcpy(&descriptor, heap->cpu + 32ull * index, sizeof descriptor);
+    shader_view12 *view = heap->shader_view ? &heap->shader_view[index] : NULL;
+    int primary_result = GPU_IR_OK;
+    if (heap->buffer_view && heap->buffer_view[index]) {
+        const gpu_ir_resource *resource = gpu_ir_buffer_view_resource(heap->buffer_view[index]);
+        if (!resource) return GPU_IR_INVALID;
+        primary_result = gpu_ir_access_add_resource12(list, (gpu_ir_resource *)resource, stage, access);
+    } else if (view && view->resource) {
+        primary_result = gpu_ir_access_add12(list, view->resource, stage, access);
+    } else if (descriptor.va) {
+        res12 *resource = state_resource_for_gpu_range_locked12(device, descriptor.va,
+            descriptor.size ? descriptor.size : 1);
+        primary_result = resource ? gpu_ir_access_add12(list, resource, stage, access) : GPU_IR_INVALID;
+    } else if (descriptor.res) return GPU_IR_INVALID;
+    if (primary_result != GPU_IR_OK) return primary_result;
+    if (view && view->counter_resource)
+        return gpu_ir_access_add12(list, view->counter_resource, stage,
+                                   GPU_IR_ACCESS_SHADER_READ | GPU_IR_ACCESS_SHADER_WRITE);
+    return GPU_IR_OK; // A null descriptor has no resource access.
+}
+
+static int gpu_ir_collect_shader_accesses12(dev12 *device, const dxil_msl *shader, uint32_t stage,
+                                            root_binding *root, heap12 *resource_heap, heap12 *sampler_heap,
+                                            gpu_ir_access_list12 *list) {
+    if (!shader) return GPU_IR_OK;
+    if (!root) return GPU_IR_INVALID;
+    if ((shader->uses_heap && (!root->rs || !(root->rs->flags & 0x400u) || !resource_heap || !resource_heap->gpu ||
+                               resource_heap->desc.Type != 0 || !descriptor_heap_resident12(resource_heap))) ||
+        (shader->uses_sampler_heap && (!root->rs || !(root->rs->flags & 0x800u) || !sampler_heap || !sampler_heap->gpu ||
+                                       sampler_heap->desc.Type != 1 || !descriptor_heap_resident12(sampler_heap))))
+        return GPU_IR_INVALID;
+
+    gpu_ir_descriptor_state *bindings = NULL;
+    int binding_result = gpu_ir_snapshot_root_bindings12(device, shader, stage, root, resource_heap,
+                                                         sampler_heap, &bindings);
+    if (binding_result != GPU_IR_OK) return binding_result;
+    for (uint32_t i = 0; i < gpu_ir_descriptor_state_value_count(bindings); i++) {
+        gpu_ir_descriptor_value value;
+        if (gpu_ir_descriptor_state_value_at(bindings, i, &value) != GPU_IR_OK) {
+            gpu_ir_descriptor_state_release(bindings);
+            return GPU_IR_INVALID;
+        }
+        const gpu_ir_resource *resource = value.resource ? value.resource :
+            gpu_ir_buffer_view_resource(value.buffer_view);
+        if (!resource) continue; // samplers and explicit null descriptors do not name resource accesses.
+        int rc = gpu_ir_access_add_resource12(list, (gpu_ir_resource *)resource,
+                                              value.stage_mask, value.access_mask);
+        if (rc == GPU_IR_OK && value.auxiliary_resource)
+            rc = gpu_ir_access_add_resource12(list, value.auxiliary_resource, value.stage_mask,
+                                              value.auxiliary_access_mask);
+        if (rc != GPU_IR_OK) {
+            gpu_ir_descriptor_state_release(bindings);
+            return rc;
+        }
+    }
+    gpu_ir_descriptor_state_release(bindings);
+
+    // Direct ResourceDescriptorHeap indexing is data-dependent. Match residency/useResource access to the DXIL class.
+    if (shader->uses_heap) {
+        uint32_t classes = shader->heap_resource_classes;
+        if (!classes) classes = 1u << DXIL_SRV; // CreateHandleFromHeap defaults to an SRV absent AnnotateHandle.
+        for (uint32_t i = 0; i < resource_heap->desc.NumDescriptors; i++) {
+            uint8_t encoded = resource_heap->descriptor_kind ? resource_heap->descriptor_kind[i] : 0;
+            if (!encoded) continue;
+            uint32_t descriptor_class = encoded - 1;
+            if (descriptor_class > DXIL_CBV || !(classes & (1u << descriptor_class))) continue;
+            uint32_t access = descriptor_class == DXIL_CBV ? GPU_IR_ACCESS_UNIFORM_READ :
+                descriptor_class == DXIL_UAV ? GPU_IR_ACCESS_SHADER_READ | GPU_IR_ACCESS_SHADER_WRITE :
+                                                GPU_IR_ACCESS_SHADER_READ;
+            int rc = gpu_ir_access_add_descriptor12(device, list, resource_heap, i, stage, access);
+            if (rc != GPU_IR_OK) return rc;
+        }
+    }
+    return GPU_IR_OK;
+}
+
+static int state_texture_view12(dev12 *device, int32_t queue_type, resource_state_shadow12 **shadows, uint32_t *count,
+                                uint32_t *capacity, const shader_view12 *view, uint32_t required_state, int write) {
+    res12 *resource = view->resource;
+    if (!resource || resource->dev != device) return 0;
+    if (resource->buffer) return state_validate_resource_use_desc12(device, queue_type, shadows, count, capacity,
+        resource, 0, required_state, write);
+    if (!resource->texture) return 0;
+    uint32_t mips_total = resource->desc.MipLevels ? resource->desc.MipLevels : 1;
+    uint32_t planes_total = d3d12_resource_plane_count(resource->desc.Format);
+    uint32_t slices_total = resource->desc.Dimension == 4 ? 1 : resource->desc.DepthOrArraySize;
+    uint32_t mips = view->mips == 0 || view->mips == UINT32_MAX ? mips_total - view->mip : view->mips;
+    uint32_t slices = view->slices == 0 || view->slices == UINT32_MAX ? slices_total - view->slice : view->slices;
+    if (view->mip >= mips_total || mips > mips_total - view->mip || view->slice >= slices_total ||
+        slices > slices_total - view->slice || view->plane >= planes_total) return 0;
+    for (uint32_t slice = 0; slice < slices; slice++) {
+        uint32_t array_slice = resource->desc.Dimension == 4 ? 0 : view->slice + slice;
+        for (uint32_t mip = 0; mip < mips; mip++) {
+            uint32_t subresource = view->mip + mip + array_slice * mips_total + view->plane * mips_total * slices_total;
+            int use_result = state_validate_resource_use_desc12(device, queue_type, shadows, count, capacity,
+                resource, subresource, required_state, write);
+            if (use_result <= 0) return use_result;
+        }
+    }
+    return 1;
+}
+
+static int state_validate_shader_descriptor12(dev12 *device, int32_t queue_type, resource_state_shadow12 **shadows,
+                                              uint32_t *count, uint32_t *capacity, heap12 *heap, uint32_t index,
+                                              uint32_t required_state, int write, int require_counter) {
+    if (!descriptor_heap_resident12(heap) || index >= heap->desc.NumDescriptors) return 0;
+    VxDesc descriptor;
+    memcpy(&descriptor, heap->cpu + 32ull * index, sizeof descriptor);
+    shader_view12 *view = heap->shader_view ? &heap->shader_view[index] : NULL;
+    if (require_counter && (!(descriptor.flags & DXIL_MSL_DESC_HAS_COUNTER) || !view || !view->counter_resource)) return 0;
+    if (view && view->resource) {
+        int main_result = state_texture_view12(device, queue_type, shadows, count, capacity, view, required_state, write);
+        if (main_result <= 0) return main_result;
+        if (view->counter_resource) {
+            if (!write || required_state != D3D12_STATE_UAV || view->counter_resource->dev != device ||
+                !view->counter_resource->buffer || view->counter_offset > view->counter_resource->buffer.length ||
+                sizeof(uint32_t) > view->counter_resource->buffer.length - view->counter_offset) return 0;
+            return state_validate_resource_use_desc12(device, queue_type, shadows, count, capacity,
+                view->counter_resource, 0, D3D12_STATE_UAV, 1);
+        }
+        return main_result;
+    }
+    if (descriptor.va) {
+        res12 *resource = state_resource_for_gpu_range_locked12(device, descriptor.va,
+            descriptor.size ? descriptor.size : 1);
+        if (!resource) return 0;
+        return state_validate_resource_use_desc12(device, queue_type, shadows, count, capacity,
+            resource, 0, required_state, write);
+    }
+    if (descriptor.res) return 0; // resource descriptors created by the API must retain their D3D12 owner
+    return 1; // null descriptor
+}
+
+static int descriptor_has_min_lod12(const heap12 *heap, uint32_t index) {
+    if (!heap || index >= heap->desc.NumDescriptors || !heap->cpu) return 0;
+    VxDesc descriptor;
+    memcpy(&descriptor, heap->cpu + 32ull * index, sizeof descriptor);
+    return (descriptor.flags & DXIL_MSL_DESC_HAS_MIN_LOD_CLAMP) != 0;
+}
+
+static const char *shader_min_lod_incompatible_access12(const dxil_msl *shader) {
+    if (shader->uses_gather && shader->uses_texture_load) return "TextureGather/TextureLoad";
+    if (shader->uses_gather) return "TextureGather";
+    if (shader->uses_texture_load) return "TextureLoad";
+    return NULL;
+}
+
+static int state_validate_shader_stage12(dev12 *device, int32_t queue_type, resource_state_shadow12 **shadows, uint32_t *count,
+                                         uint32_t *capacity, const dxil_msl *shader, const rootsig12 *root,
+                                         const root_state *state, heap12 *resource_heap, heap12 *sampler_heap) {
+    if (!shader) return 1;
+    const char *min_lod_incompatible_access = shader_min_lod_incompatible_access12(shader);
+    // ResourceDescriptorHeap and SamplerDescriptorHeap are only valid when their root-signature flags
+    // opt in, and require the matching shader-visible heap to be bound at submission time.
+    if ((shader->uses_heap && (!root || !(root->flags & 0x400u) || !resource_heap || !resource_heap->gpu ||
+                               resource_heap->desc.Type != 0 || !descriptor_heap_resident12(resource_heap))) ||
+        (shader->uses_sampler_heap && (!root || !(root->flags & 0x800u) || !sampler_heap || !sampler_heap->gpu ||
+                                       sampler_heap->desc.Type != 1 || !descriptor_heap_resident12(sampler_heap)))) return 0;
+    uint32_t required_state_by_class[] = {
+        D3D12_STATE_PIXEL_SHADER, D3D12_STATE_UAV, D3D12_STATE_VERTEX_CONSTANT, 0
+    };
+    for (uint32_t i = 0; i < shader->nslots; i++) {
+        const dxil_msl_slot *slot = &shader->slots[i];
+        uint64_t descriptor_va, root_va;
+        const range12 *range;
+        int slot_result = state_root_slot12(root, state, slot, &descriptor_va, &root_va, &range);
+        if (slot_result < 0) return 0;
+        if (slot_result == 0 || slot_result == 2) continue;
+        if (slot->cls == DXIL_SAMPLER) {
+            heap12 *heap = sampler_heap;
+            if (root_va || !range || !heap || !heap->gpu || !descriptor_heap_resident12(heap)) return 0;
+            uint64_t base = heap->gpu.gpuAddress;
+            if (descriptor_va < base || (descriptor_va - base) % 32) return 0;
+            uint64_t first = (descriptor_va - base) / 32;
+            if (first >= heap->desc.NumDescriptors) return 0;
+            uint64_t available = heap->desc.NumDescriptors - first;
+            uint64_t elements = slot->count == UINT32_MAX ? available : (slot->count ? slot->count : 1);
+            if (range->count != UINT32_MAX) {
+                uint64_t range_available = (uint64_t)range->count - (slot->lower - range->base);
+                if (elements > range_available) return 0;
+            }
+            if (elements > available) return 0;
+            continue;
+        }
+        int is_root_descriptor = root_va != 0;
+        int is_write = slot->cls == DXIL_UAV;
+        if (slot->has_counter && is_root_descriptor) return 0;
+        uint32_t required_state = slot->cls == DXIL_SRV ?
+            (shader->stage == 0 ? D3D12_STATE_PIXEL_SHADER : D3D12_STATE_NON_PIXEL_SHADER) :
+            required_state_by_class[slot->cls];
+        if (is_root_descriptor) {
+            res12 *resource = state_resource_for_gpu_range_locked12(device, root_va, 1);
+            if (!resource) return 0;
+            int use_result = state_validate_resource_use_desc12(device, queue_type, shadows, count, capacity,
+                resource, 0, required_state, is_write);
+            if (use_result <= 0) return use_result;
+            continue;
+        }
+        heap12 *heap = slot->cls == DXIL_SAMPLER ? sampler_heap : resource_heap;
+        if (!heap || !heap->gpu || !descriptor_heap_resident12(heap)) return 0;
+        uint64_t base = heap->gpu.gpuAddress;
+        if (descriptor_va < base || (descriptor_va - base) % 32) return 0;
+        uint64_t first = (descriptor_va - base) / 32;
+        if (first >= heap->desc.NumDescriptors) return 0;
+        uint64_t available = heap->desc.NumDescriptors - first;
+        uint64_t elements = slot->count == UINT32_MAX ? available : (slot->count ? slot->count : 1);
+        if (range && range->count != UINT32_MAX) {
+            uint64_t range_available = (uint64_t)range->count - (slot->lower - range->base);
+            if (elements > range_available) return 0;
+        }
+        if (elements > available) return 0;
+        for (uint64_t element = 0; element < elements; element++) {
+            uint32_t descriptor_index = (uint32_t)(first + element);
+            if (min_lod_incompatible_access && slot->cls == DXIL_SRV && descriptor_has_min_lod12(heap, descriptor_index)) {
+                vx_log("D3D12: %s cannot preserve a nonzero SRV ResourceMinLODClamp", min_lod_incompatible_access);
+                return 0;
+            }
+            int use_result = state_validate_shader_descriptor12(device, queue_type, shadows, count, capacity,
+                heap, descriptor_index, required_state, is_write, slot->has_counter);
+            if (use_result <= 0) return use_result;
+        }
+    }
+    // ResourceDescriptorHeap indexes are data-dependent, so check every live descriptor of each class used by DXIL.
+    // This can include entries the dynamic index never selects, but avoids accepting a reachable bad D3D12 state.
+    if (shader->uses_heap) {
+        uint32_t classes = shader->heap_resource_classes;
+        if (!classes) classes = 1u << DXIL_SRV;
+        for (uint32_t index = 0; index < resource_heap->desc.NumDescriptors; index++) {
+            uint8_t encoded = resource_heap->descriptor_kind ? resource_heap->descriptor_kind[index] : 0;
+            if (!encoded) continue;
+            uint32_t descriptor_class = encoded - 1;
+            if (descriptor_class > DXIL_CBV || !(classes & (1u << descriptor_class))) continue;
+            if (min_lod_incompatible_access && descriptor_class == DXIL_SRV &&
+                descriptor_has_min_lod12(resource_heap, index)) {
+                vx_log("D3D12: %s cannot preserve a nonzero SRV ResourceMinLODClamp", min_lod_incompatible_access);
+                return 0;
+            }
+            uint32_t required_state = descriptor_class == DXIL_CBV ? D3D12_STATE_VERTEX_CONSTANT :
+                descriptor_class == DXIL_UAV ? D3D12_STATE_UAV :
+                shader->stage == 0 ? D3D12_STATE_PIXEL_SHADER : D3D12_STATE_NON_PIXEL_SHADER;
+            int use_result = state_validate_shader_descriptor12(device, queue_type, shadows, count, capacity,
+                resource_heap, index, required_state, descriptor_class == DXIL_UAV, 0);
+            if (use_result <= 0) return use_result;
+        }
+    }
+    return 1;
+}
+
 typedef struct {
     void *tex[9];                    // the render targets (retained), depth last
+    res12 *resource[9];              // their API resources, retained by the recorded target commands
     int changed;
     MTLPrimitiveType prim;
     VBV vb[16];
@@ -1462,6 +5669,52 @@ typedef struct {
     id<MTLBuffer> pass_vis;
     uint32_t npass, pass_q[64];      // the queries the open pass counted: index | 1 << 30 begun in it | 1 << 31 binary
 } gfx_state;
+
+static int gpu_ir_collect_draw_accesses12(dev12 *device, pso12 *pipeline, gfx_state *graphics,
+                                          root_binding *root, heap12 *resource_heap, heap12 *sampler_heap,
+                                          gpu_ir_access_list12 *list, int indexed) {
+    int rc = gpu_ir_collect_shader_accesses12(device, &pipeline->vs, GPU_IR_STAGE_VERTEX,
+                                               root, resource_heap, sampler_heap, list);
+    if (rc != GPU_IR_OK) return rc;
+    rc = gpu_ir_collect_shader_accesses12(device, &pipeline->ps, GPU_IR_STAGE_FRAGMENT,
+                                           root, resource_heap, sampler_heap, list);
+    if (rc != GPU_IR_OK) return rc;
+
+    for (uint32_t i = 0; i < 16; i++) {
+        const VBV *view = &graphics->vb[i];
+        if (!view->va && !view->size) continue;
+        res12 *resource = state_resource_for_gpu_range_locked12(device, view->va, view->size);
+        rc = resource ? gpu_ir_access_add12(list, resource, GPU_IR_STAGE_VERTEX, GPU_IR_ACCESS_VERTEX_READ) : GPU_IR_INVALID;
+        if (rc != GPU_IR_OK) return rc;
+    }
+    if (indexed) {
+        res12 *resource = state_resource_for_gpu_range_locked12(device, graphics->ib.va, graphics->ib.size);
+        rc = resource ? gpu_ir_access_add12(list, resource, GPU_IR_STAGE_VERTEX, GPU_IR_ACCESS_INDEX_READ) : GPU_IR_INVALID;
+        if (rc != GPU_IR_OK) return rc;
+    }
+
+    const gpu_ir_pipeline_info *pipeline_info = gpu_ir_pipeline_description(pipeline->gpu_pipeline);
+    if (!pipeline_info) return GPU_IR_INVALID;
+    if (pipeline_info->stage_mask & GPU_IR_STAGE_FRAGMENT) {
+        for (uint32_t i = 0; i < 8; i++) {
+            if (!graphics->resource[i]) continue;
+            rc = gpu_ir_access_add12(list, graphics->resource[i], GPU_IR_STAGE_FRAGMENT, GPU_IR_ACCESS_COLOR_WRITE);
+            if (rc != GPU_IR_OK) return rc;
+        }
+    }
+    if (graphics->resource[8] && (pipeline->depth_enable || pipeline->stencil_enable)) {
+        uint32_t access = 0;
+        if (pipeline->depth_enable)
+            access |= pipeline->depth_write ? GPU_IR_ACCESS_DEPTH_WRITE : GPU_IR_ACCESS_DEPTH_READ;
+        if (pipeline->stencil_enable)
+            access |= pipeline->stencil_write ? GPU_IR_ACCESS_DEPTH_WRITE : GPU_IR_ACCESS_DEPTH_READ;
+        if (!access) access = GPU_IR_ACCESS_DEPTH_READ;
+        uint32_t stage = pipeline_info->stage_mask & GPU_IR_STAGE_FRAGMENT ? GPU_IR_STAGE_FRAGMENT : GPU_IR_STAGE_VERTEX;
+        rc = gpu_ir_access_add12(list, graphics->resource[8], stage, access);
+        if (rc != GPU_IR_OK) return rc;
+    }
+    return GPU_IR_OK;
+}
 
 static void pass_query(gfx_state *g) {
     if (!g->occ_on || g->npass >= 64) return;
@@ -1527,23 +5780,1174 @@ static void make_resident_render(id<MTLRenderCommandEncoder> re, NSArray *reside
             if ([h->keep[k] conformsToProtocol:@protocol(MTLTexture)]) [re useResource:h->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
 }
 
-static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
+static int open_render_pass12(dev12 *device, gfx_state *g, id<MTLCommandBuffer> command_buffer,
+                              id<MTLComputeCommandEncoder> __strong *compute_encoder,
+                              id<MTLBlitCommandEncoder> __strong *blit_encoder,
+                              id<MTLRenderCommandEncoder> __strong *render_encoder,
+                              NSArray *resident, heap12 *resource_heap) {
+    if (*render_encoder && !g->changed) return 1;
+    close_pass(device, g, command_buffer, render_encoder);
+    end_encoders(compute_encoder, blit_encoder, render_encoder);
+    MTLRenderPassDescriptor *descriptor = [MTLRenderPassDescriptor renderPassDescriptor];
+    uint32_t width = 0, height = 0;
+    for (int k = 0; k < 8; k++) {
+        if (!g->tex[k]) continue;
+        id<MTLTexture> texture = (__bridge id<MTLTexture>)g->tex[k];
+        descriptor.colorAttachments[k].texture = texture;
+        descriptor.colorAttachments[k].loadAction = MTLLoadActionLoad;
+        descriptor.colorAttachments[k].storeAction = MTLStoreActionStore;
+        width = (uint32_t)texture.width;
+        height = (uint32_t)texture.height;
+    }
+    if (g->tex[8]) {
+        id<MTLTexture> texture = (__bridge id<MTLTexture>)g->tex[8];
+        descriptor.depthAttachment.texture = texture;
+        descriptor.depthAttachment.loadAction = MTLLoadActionLoad;
+        descriptor.depthAttachment.storeAction = MTLStoreActionStore;
+        if (texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+            descriptor.stencilAttachment.texture = texture;
+            descriptor.stencilAttachment.loadAction = MTLLoadActionLoad;
+            descriptor.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+        if (!width) { width = (uint32_t)texture.width; height = (uint32_t)texture.height; }
+    }
+    if (!width && g->nvp) {
+        descriptor.renderTargetWidth = (NSUInteger)(g->vp[0].x + g->vp[0].w);
+        descriptor.renderTargetHeight = (NSUInteger)(g->vp[0].y + g->vp[0].h);
+        descriptor.defaultRasterSampleCount = 1;
+    }
+    if (g->occ) {
+        g->pass_heap = g->occ;
+        g->pass_vis = [device->mtl newBufferWithLength:g->occ->results.length options:MTLResourceStorageModeShared];
+        if (!g->pass_vis) { g->pass_heap = NULL; return 0; }
+        memset(g->pass_vis.contents, 0, g->pass_vis.length);
+        descriptor.visibilityResultBuffer = g->pass_vis;
+    }
+    *render_encoder = [command_buffer renderCommandEncoderWithDescriptor:descriptor];
+    if (!*render_encoder) { g->pass_heap = NULL; g->pass_vis = nil; return 0; }
+    make_resident_render(*render_encoder, resident, resource_heap);
+    if (g->occ_on) { [*render_encoder setVisibilityResultMode:MTLVisibilityResultModeCounting offset:8 * g->occ_index]; pass_query(g); }
+    g->changed = 0;
+    g->sc[15].right = (int32_t)(width ? width : descriptor.renderTargetWidth);
+    g->sc[15].bottom = (int32_t)(height ? height : descriptor.renderTargetHeight);
+    return 1;
+}
+
+typedef struct {
+    dev12 *device;
+    void *command_buffer, *compute_encoder, *blit_encoder, *render_encoder, *resident_resources;
+    gfx_state *graphics_state;
+    pso12 *api_pipeline;
+    heap12 *resource_heap, *sampler_heap;
+    root_binding *compute_root;
+    scratch *scratch_buffer;
+} d3d12_dispatch_context;
+
+static MTLResourceUsage d3d12_metal_usage12(uint32_t access) {
+    const uint32_t reads = GPU_IR_ACCESS_VERTEX_READ | GPU_IR_ACCESS_INDEX_READ | GPU_IR_ACCESS_UNIFORM_READ |
+        GPU_IR_ACCESS_SHADER_READ | GPU_IR_ACCESS_DEPTH_READ | GPU_IR_ACCESS_INDIRECT_READ |
+        GPU_IR_ACCESS_COPY_READ | GPU_IR_ACCESS_RESOLVE_READ | GPU_IR_ACCESS_ACCELERATION_STRUCTURE;
+    const uint32_t writes = GPU_IR_ACCESS_SHADER_WRITE | GPU_IR_ACCESS_COLOR_WRITE | GPU_IR_ACCESS_DEPTH_WRITE |
+        GPU_IR_ACCESS_STREAM_WRITE | GPU_IR_ACCESS_COPY_WRITE | GPU_IR_ACCESS_RESOLVE_WRITE |
+        GPU_IR_ACCESS_ACCELERATION_STRUCTURE;
+    MTLResourceUsage usage = 0;
+    if (access & reads) usage |= MTLResourceUsageRead;
+    if (access & writes) usage |= MTLResourceUsageWrite;
+    return usage ? usage : MTLResourceUsageRead;
+}
+
+static MTLRenderStages d3d12_metal_stages12(uint32_t stage_mask) {
+    MTLRenderStages stages = 0;
+    if (stage_mask & GPU_IR_STAGE_VERTEX) stages |= MTLRenderStageVertex;
+    if (stage_mask & GPU_IR_STAGE_FRAGMENT) stages |= MTLRenderStageFragment;
+    return stages ? stages : MTLRenderStageVertex | MTLRenderStageFragment;
+}
+
+static int d3d12_use_compute_accesses12(id<MTLComputeCommandEncoder> encoder,
+                                       const gpu_ir_resource_access *accesses, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        id<MTLResource> resource = (__bridge id<MTLResource>)gpu_ir_backend_object(accesses[i].resource);
+        if (!resource) return GPU_IR_INVALID;
+        [encoder useResource:resource usage:d3d12_metal_usage12(accesses[i].access_mask)];
+    }
+    return GPU_IR_OK;
+}
+
+static int d3d12_bind_common_compute_descriptors12(id<MTLComputeCommandEncoder> encoder,
+                                                   const gpu_ir_pipeline *pipeline,
+                                                   const gpu_ir_descriptor_state *state) {
+    const gpu_ir_pipeline_layout *layout = gpu_ir_pipeline_layout_of(pipeline);
+    if (!layout) return GPU_IR_OK;
+    uint64_t buffer_ranges[GPU_IR_METAL_MAX_COMPUTE_STORAGE_BUFFERS] = { 0 };
+    uint32_t metal_slot = 0;
+    for (uint32_t i = 0; i < gpu_ir_pipeline_layout_binding_count(layout); i++) {
+        gpu_ir_descriptor_binding binding;
+        if (gpu_ir_pipeline_layout_binding_at(layout, i, &binding) != GPU_IR_OK) return GPU_IR_INVALID;
+        if (!(binding.stage_mask & GPU_IR_STAGE_COMPUTE)) continue;
+        if (!binding.count || binding.count == GPU_IR_DESCRIPTOR_COUNT_UNBOUNDED ||
+            binding.count > GPU_IR_METAL_MAX_COMPUTE_STORAGE_BUFFERS - metal_slot ||
+            !((binding.binding_namespace == 0 &&
+               (binding.kind == GPU_IR_DESCRIPTOR_STORAGE_BUFFER ||
+                binding.kind == GPU_IR_DESCRIPTOR_READ_ONLY_RESOURCE)) ||
+              (binding.binding_namespace == 1 && binding.kind == GPU_IR_DESCRIPTOR_STORAGE_RESOURCE)))
+            return GPU_IR_UNSUPPORTED;
+        for (uint32_t array_element = 0; array_element < binding.count; array_element++) {
+            gpu_ir_descriptor_value value = { 0 };
+            int result = state ? gpu_ir_descriptor_state_find_for_stage(state, binding.set,
+                binding.binding_namespace, binding.binding, array_element, GPU_IR_STAGE_COMPUTE, &value) :
+                GPU_IR_NOT_FOUND;
+            if (result == GPU_IR_NOT_FOUND || (result == GPU_IR_OK &&
+                (value.flags & GPU_IR_DESCRIPTOR_VALUE_NULL))) {
+                [encoder setBuffer:nil offset:0 atIndex:metal_slot++];
+                continue;
+            }
+            if (result != GPU_IR_OK || !value.resource || !gpu_ir_resource_is_buffer(value.resource))
+                return result == GPU_IR_OK ? GPU_IR_INVALID : result;
+
+            id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)gpu_ir_backend_object(value.resource);
+            if (!buffer) return GPU_IR_INVALID;
+            uint64_t offset = value.offset;
+            uint64_t range = value.range;
+            if (value.buffer_view) {
+                const gpu_ir_buffer_view_desc *view = gpu_ir_buffer_view_description(value.buffer_view);
+                if (!view || offset || range) return GPU_IR_INVALID;
+                offset = view->byte_offset;
+                range = view->byte_size;
+            }
+            uint64_t buffer_size = gpu_ir_buffer_size(value.resource);
+            if (offset > NSUIntegerMax || offset > buffer.length || offset > buffer_size) return GPU_IR_RANGE;
+            if (!range) range = MIN((uint64_t)buffer.length - offset, buffer_size - offset);
+            if (range > (uint64_t)buffer.length - offset || range > buffer_size - offset) return GPU_IR_RANGE;
+
+            buffer_ranges[metal_slot] = range;
+            [encoder setBuffer:buffer offset:(NSUInteger)offset atIndex:metal_slot];
+            [encoder useResource:buffer usage:d3d12_metal_usage12(value.access_mask)];
+            metal_slot++;
+        }
+    }
+    if (metal_slot)
+        [encoder setBytes:buffer_ranges length:sizeof buffer_ranges atIndex:GPU_IR_METAL_BUFFER_RANGE_SLOT];
+    return GPU_IR_OK;
+}
+
+static int d3d12_clear_uav_format_kind12(MTLPixelFormat format) {
+    switch (format) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRGBA8Uint:
+    case MTLPixelFormatR16Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatR32Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRGBA32Uint:
+        return 2;
+    case MTLPixelFormatR8Sint: case MTLPixelFormatRG8Sint: case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatR16Sint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA16Sint:
+    case MTLPixelFormatR32Sint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA32Sint:
+        return 3;
+    case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Snorm: case MTLPixelFormatRG8Unorm:
+    case MTLPixelFormatRG8Snorm: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Snorm:
+    case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm:
+    case MTLPixelFormatR16Float: case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm:
+    case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm:
+    case MTLPixelFormatRGBA16Float: case MTLPixelFormatR32Float: case MTLPixelFormatRG32Float:
+    case MTLPixelFormatRGBA32Float: case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRG11B10Float:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static uint32_t d3d12_clear_uav_component_bits12(MTLPixelFormat format) {
+    switch (format) {
+    case MTLPixelFormatR8Uint: case MTLPixelFormatRG8Uint: case MTLPixelFormatRGBA8Uint:
+    case MTLPixelFormatR8Sint: case MTLPixelFormatRG8Sint: case MTLPixelFormatRGBA8Sint:
+        return 8;
+    case MTLPixelFormatR16Uint: case MTLPixelFormatRG16Uint: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatR16Sint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA16Sint:
+        return 16;
+    case MTLPixelFormatR32Uint: case MTLPixelFormatRG32Uint: case MTLPixelFormatRGBA32Uint:
+    case MTLPixelFormatR32Sint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA32Sint:
+        return 32;
+    default:
+        return 0;
+    }
+}
+
+static id<MTLComputePipelineState> d3d12_clear_uav_pipeline12(dev12 *device, MTLTextureType texture_type,
+                                                               int format_kind, uint32_t component_bits) {
+    NSString *metal_texture = nil, *bounds = nil, *coordinate = nil;
+    switch (texture_type) {
+    case MTLTextureTypeTextureBuffer:
+        metal_texture = @"texture_buffer"; bounds = @"p.x < dst.get_width()"; coordinate = @"p.x"; break;
+    case MTLTextureType1D:
+        metal_texture = @"texture1d"; bounds = @"p.x < dst.get_width()"; coordinate = @"p.x"; break;
+    case MTLTextureType1DArray:
+        metal_texture = @"texture1d_array";
+        bounds = @"p.x < dst.get_width() && p.y < dst.get_array_size()";
+        coordinate = @"p.x, p.y";
+        break;
+    case MTLTextureType2D:
+        metal_texture = @"texture2d";
+        bounds = @"p.x < dst.get_width() && p.y < dst.get_height()";
+        coordinate = @"p.xy";
+        break;
+    case MTLTextureType2DArray:
+        metal_texture = @"texture2d_array";
+        bounds = @"p.x < dst.get_width() && p.y < dst.get_height() && p.z < dst.get_array_size()";
+        coordinate = @"p.xy, p.z";
+        break;
+    case MTLTextureType3D:
+        metal_texture = @"texture3d";
+        bounds = @"p.x < dst.get_width() && p.y < dst.get_height() && p.z < dst.get_depth()";
+        coordinate = @"p";
+        break;
+    default:
+        return nil;
+    }
+    NSString *component = format_kind == 1 ? @"float" : format_kind == 3 ? @"int" : @"uint";
+    NSString *vector = format_kind == 1 ? @"float4" : format_kind == 3 ? @"int4" : @"uint4";
+    NSString *value_conversion = @"";
+    NSString *write_value = @"value";
+    if (format_kind != 1 && component_bits < 32) {
+        NSString *mask = component_bits == 8 ? @"0xffu" : @"0xffffu";
+        if (format_kind == 2) {
+            value_conversion = [NSString stringWithFormat:
+                @"uint4 stored_value = value & uint4(%@); ", mask];
+        } else {
+            NSString *sign = component_bits == 8 ? @"0x80u" : @"0x8000u";
+            value_conversion = [NSString stringWithFormat:
+                @"uint4 value_bits = as_type<uint4>(value) & uint4(%@); "
+                @"int4 stored_value = as_type<int4>((value_bits ^ uint4(%@)) - uint4(%@)); ",
+                mask, sign, sign];
+        }
+        write_value = @"stored_value";
+    }
+    NSString *source = [NSString stringWithFormat:
+        @"#include <metal_stdlib>\nusing namespace metal;\n"
+        @"kernel void vx_clear(%@<%@, access::write> dst [[texture(0)]], "
+        @"constant %@& value [[buffer(0)]], constant uint3& origin [[buffer(1)]], "
+        @"uint3 tid [[thread_position_in_grid]]) { uint3 p = tid + origin; "
+        @"if (%@) { %@dst.write(%@, %@); } }\n",
+         metal_texture, component, vector, bounds, value_conversion, write_value, coordinate];
+    pthread_mutex_lock(&device->lock);
+    id<MTLComputePipelineState> cached = device->pso_cache[source];
+    pthread_mutex_unlock(&device->lock);
+    if (cached) return cached;
+
+    MTLCompileOptions *options = [MTLCompileOptions new];
+    options.languageVersion = MTLLanguageVersion3_1;
+    NSError *error = nil;
+    id<MTLLibrary> library = [device->mtl newLibraryWithSource:source options:options error:&error];
+    id<MTLComputePipelineState> pipeline = library ?
+        [device->mtl newComputePipelineStateWithFunction:[library newFunctionWithName:@"vx_clear"] error:&error] : nil;
+    if (!pipeline) {
+        vx_log("D3D12: UAV clear shader did not compile: %s\n%s", error.localizedDescription.UTF8String,
+               source.UTF8String);
+        return nil;
+    }
+    pthread_mutex_lock(&device->lock);
+    cached = device->pso_cache[source];
+    if (!cached) device->pso_cache[source] = pipeline;
+    else pipeline = cached;
+    pthread_mutex_unlock(&device->lock);
+    return pipeline;
+}
+
+static int d3d12_clear_uav_encode12(dev12 *device, id<MTLCommandBuffer> command_buffer,
+                                   id<MTLComputeCommandEncoder> __strong *encoder,
+                                   const cmd12 *command, heap12 *resource_heap) {
+    uint32_t descriptor_index = 0;
+    heap12 *descriptor_heap = heap_gpu_descriptor(command->va, &descriptor_index);
+    if (!descriptor_heap || descriptor_heap != resource_heap || descriptor_index >= descriptor_heap->desc.NumDescriptors ||
+        !descriptor_heap->keep || ![descriptor_heap->keep[descriptor_index] conformsToProtocol:@protocol(MTLTexture)])
+        return 0;
+    id<MTLTexture> texture = descriptor_heap->keep[descriptor_index];
+    int format_kind = d3d12_clear_uav_format_kind12(texture.pixelFormat);
+    if (command->a ? format_kind != 1 : (format_kind != 2 && format_kind != 3)) return 0;
+    uint32_t component_bits = format_kind == 1 ? 32 : d3d12_clear_uav_component_bits12(texture.pixelFormat);
+    if (!component_bits) return 0;
+    id<MTLComputePipelineState> pipeline = d3d12_clear_uav_pipeline12(device, texture.textureType,
+                                                                      format_kind, component_bits);
+    if (!pipeline) return 0;
+
+    MTLSize full_size;
+    NSUInteger texture_buffer_first = 0;
+    switch (texture.textureType) {
+    case MTLTextureTypeTextureBuffer: {
+        VxDesc descriptor;
+        memcpy(&descriptor, descriptor_heap->cpu + 32ull * descriptor_index, sizeof descriptor);
+        if (!descriptor.size || descriptor.va > texture.width || descriptor.size > texture.width - descriptor.va)
+            return 0;
+        texture_buffer_first = (NSUInteger)descriptor.va;
+        full_size = MTLSizeMake(descriptor.size, 1, 1);
+        break;
+    }
+    case MTLTextureType1D:
+        full_size = MTLSizeMake(texture.width, 1, 1); break;
+    case MTLTextureType1DArray:
+        full_size = MTLSizeMake(texture.width, texture.arrayLength, 1); break;
+    case MTLTextureType2D:
+        full_size = MTLSizeMake(texture.width, texture.height, 1); break;
+    case MTLTextureType2DArray:
+        full_size = MTLSizeMake(texture.width, texture.height, texture.arrayLength); break;
+    case MTLTextureType3D:
+        full_size = MTLSizeMake(texture.width, texture.height, texture.depth); break;
+    default:
+        return 0;
+    }
+    int rect_supported = texture.textureType != MTLTextureTypeTextureBuffer;
+    if (command->b && !rect_supported) return 0;
+    [*encoder setComputePipelineState:pipeline];
+    [*encoder setTexture:texture atIndex:0];
+    [*encoder setBytes:command->values length:4 * sizeof(uint32_t) atIndex:0];
+    uint32_t threadgroup_origin[4] = { 0, 0, 0, 0 };
+    NSUInteger width = MAX((NSUInteger)1, MIN((NSUInteger)pipeline.threadExecutionWidth, full_size.width));
+    MTLSize threads_per_group = MTLSizeMake(width, 1, 1);
+    uint32_t rectangle_count = command->b ? command->b : 1;
+    for (uint32_t i = 0; i < rectangle_count; i++) {
+        MTLSize region = full_size;
+        memset(threadgroup_origin, 0, sizeof threadgroup_origin);
+        if (command->b) {
+            const RECT12 *rect = &command->rects[i];
+            int64_t left = MAX((int64_t)0, (int64_t)rect->left);
+            int64_t top = MAX((int64_t)0, (int64_t)rect->top);
+            int64_t right = MIN((int64_t)full_size.width, (int64_t)rect->right);
+            int64_t bottom = MIN((int64_t)full_size.height, (int64_t)rect->bottom);
+            if (right <= left || bottom <= top) continue;
+            threadgroup_origin[0] = (uint32_t)left;
+            threadgroup_origin[1] = (uint32_t)top;
+            region.width = (NSUInteger)(right - left);
+            region.height = (NSUInteger)(bottom - top);
+        } else if (texture.textureType == MTLTextureTypeTextureBuffer)
+            threadgroup_origin[0] = (uint32_t)texture_buffer_first;
+        [*encoder setBytes:&threadgroup_origin length:sizeof threadgroup_origin atIndex:1];
+        [*encoder dispatchThreads:region threadsPerThreadgroup:threads_per_group];
+    }
+    [*encoder useResource:texture usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    if (command->resource[0] && command->resource[0]->texture &&
+        command->resource[0]->texture != texture)
+        [*encoder useResource:command->resource[0]->texture usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    (void)command_buffer;
+    return 1;
+}
+
+static int d3d12_use_render_accesses12(id<MTLRenderCommandEncoder> encoder,
+                                      const gpu_ir_resource_access *accesses, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        id<MTLResource> resource = (__bridge id<MTLResource>)gpu_ir_backend_object(accesses[i].resource);
+        if (!resource) return GPU_IR_INVALID;
+        [encoder useResource:resource usage:d3d12_metal_usage12(accesses[i].access_mask)
+                      stages:d3d12_metal_stages12(accesses[i].stage_mask)];
+    }
+    return GPU_IR_OK;
+}
+
+static int d3d12_gpu_ir_dispatch(void *opaque, const gpu_ir_pipeline *pipeline,
+                                 uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z,
+                                 const gpu_ir_resource_access *accesses, uint32_t access_count) {
+    d3d12_dispatch_context *context = opaque;
+    pso12 *api_pipeline = context->api_pipeline;
+    const gpu_ir_pipeline_info *info = gpu_ir_pipeline_description(pipeline);
+    if (!api_pipeline || !api_pipeline->compute || api_pipeline->gpu_pipeline != pipeline || !info ||
+        info->kind != GPU_IR_PIPELINE_COMPUTE) return GPU_IR_INVALID;
+
+    dev12 *device = context->device;
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)context->command_buffer;
+    id<MTLComputeCommandEncoder> __strong *ce = (id<MTLComputeCommandEncoder> __strong *)context->compute_encoder;
+    id<MTLBlitCommandEncoder> __strong *be = (id<MTLBlitCommandEncoder> __strong *)context->blit_encoder;
+    id<MTLRenderCommandEncoder> __strong *re = (id<MTLRenderCommandEncoder> __strong *)context->render_encoder;
+    NSArray *resident = (__bridge NSArray *)context->resident_resources;
+    gfx_state *g = context->graphics_state;
+
+    if (*be) { [*be endEncoding]; *be = nil; }
+    close_pass(device, g, cb, re);
+    if (!*ce) {
+        *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
+        for (id<MTLResource> res in resident) [*ce useResource:res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        for (heap12 *heap = context->resource_heap; heap; heap = NULL)
+            for (uint32_t k = 0; k < heap->desc.NumDescriptors; k++)
+                if ([heap->keep[k] conformsToProtocol:@protocol(MTLTexture)])
+                    [*ce useResource:heap->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    }
+
+    id<MTLComputePipelineState> metal_pipeline = api_pipeline->common_ir_compute ?
+        (__bridge id<MTLComputePipelineState>)gpu_ir_pipeline_backend_object(pipeline) : api_pipeline->compute;
+    if (!metal_pipeline) return GPU_IR_INVALID;
+    int access_result = d3d12_use_compute_accesses12(*ce, accesses, access_count);
+    if (access_result != GPU_IR_OK) return access_result;
+    [*ce setComputePipelineState:metal_pipeline];
+    if (api_pipeline->common_ir_compute) {
+        gpu_ir_descriptor_state *bindings = NULL;
+        int bind_result = GPU_IR_OK;
+        if (api_pipeline->msl.nslots) {
+            pthread_mutex_lock(&device->lock);
+            bind_result = gpu_ir_snapshot_root_bindings12(device, &api_pipeline->msl,
+                GPU_IR_STAGE_COMPUTE, context->compute_root, context->resource_heap,
+                context->sampler_heap, &bindings);
+            pthread_mutex_unlock(&device->lock);
+        }
+        if (bind_result == GPU_IR_OK)
+            bind_result = d3d12_bind_common_compute_descriptors12(*ce, pipeline, bindings);
+        gpu_ir_descriptor_state_release(bindings);
+        if (bind_result != GPU_IR_OK) return bind_result;
+    } else {
+        uint64_t root[64 + 2];
+        uint32_t words;
+        stage_root(device, &api_pipeline->msl, context->compute_root, context->resource_heap,
+                   context->sampler_heap, context->scratch_buffer, root, &words);
+        [*ce setBytes:root length:8 * words atIndex:0];
+        if (context->scratch_buffer->buf) [*ce useResource:context->scratch_buffer->buf usage:MTLResourceUsageRead];
+    }
+    [*ce dispatchThreadgroups:MTLSizeMake(group_count_x, group_count_y, group_count_z)
+        threadsPerThreadgroup:MTLSizeMake(info->threadgroup_size[0], info->threadgroup_size[1], info->threadgroup_size[2])];
+    // D3D12 UAV ordering is retained here until common resource-access records can express shader hazards.
+    [*ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+    return GPU_IR_OK;
+}
+
+static int d3d12_gpu_ir_dispatch_indirect(void *opaque, const gpu_ir_pipeline *pipeline,
+                                         const gpu_ir_resource *arguments, uint64_t argument_offset,
+                                         const gpu_ir_resource_access *accesses, uint32_t access_count) {
+    d3d12_dispatch_context *context = opaque;
+    pso12 *api_pipeline = context->api_pipeline;
+    const gpu_ir_pipeline_info *info = gpu_ir_pipeline_description(pipeline);
+    if (!api_pipeline || !api_pipeline->compute || api_pipeline->gpu_pipeline != pipeline || !info ||
+        info->kind != GPU_IR_PIPELINE_COMPUTE || !gpu_ir_resource_is_buffer(arguments) ||
+        (argument_offset & 3) || argument_offset > gpu_ir_buffer_size(arguments) ||
+        12 > gpu_ir_buffer_size(arguments) - argument_offset) return GPU_IR_INVALID;
+
+    dev12 *device = context->device;
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)context->command_buffer;
+    id<MTLComputeCommandEncoder> __strong *ce = (id<MTLComputeCommandEncoder> __strong *)context->compute_encoder;
+    id<MTLBlitCommandEncoder> __strong *be = (id<MTLBlitCommandEncoder> __strong *)context->blit_encoder;
+    id<MTLRenderCommandEncoder> __strong *re = (id<MTLRenderCommandEncoder> __strong *)context->render_encoder;
+    NSArray *resident = (__bridge NSArray *)context->resident_resources;
+    gfx_state *g = context->graphics_state;
+    id<MTLBuffer> argument_buffer = (__bridge id<MTLBuffer>)gpu_ir_backend_object(arguments);
+    id<MTLComputePipelineState> metal_pipeline = api_pipeline->compute;
+    if (!argument_buffer || !metal_pipeline || argument_offset > argument_buffer.length ||
+        12 > argument_buffer.length - argument_offset) return GPU_IR_INVALID;
+
+    if (*be) { [*be endEncoding]; *be = nil; }
+    close_pass(device, g, cb, re);
+    if (!*ce) {
+        *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
+        for (id<MTLResource> res in resident) [*ce useResource:res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        for (heap12 *heap = context->resource_heap; heap; heap = NULL)
+            for (uint32_t k = 0; k < heap->desc.NumDescriptors; k++)
+                if ([heap->keep[k] conformsToProtocol:@protocol(MTLTexture)])
+                    [*ce useResource:heap->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    }
+
+    int access_result = d3d12_use_compute_accesses12(*ce, accesses, access_count);
+    if (access_result != GPU_IR_OK) return access_result;
+    [*ce useResource:argument_buffer usage:MTLResourceUsageRead];
+    [*ce setComputePipelineState:metal_pipeline];
+    uint64_t root[64 + 2];
+    uint32_t words;
+    stage_root(device, &api_pipeline->msl, context->compute_root, context->resource_heap,
+               context->sampler_heap, context->scratch_buffer, root, &words);
+    [*ce setBytes:root length:8 * words atIndex:0];
+    if (context->scratch_buffer->buf) [*ce useResource:context->scratch_buffer->buf usage:MTLResourceUsageRead];
+    [*ce dispatchThreadgroupsWithIndirectBuffer:argument_buffer indirectBufferOffset:(NSUInteger)argument_offset
+                         threadsPerThreadgroup:MTLSizeMake(info->threadgroup_size[0], info->threadgroup_size[1],
+                                                            info->threadgroup_size[2])];
+    // Keep the same ordering point as a direct dispatch until common resource accesses model UAV hazards.
+    [*ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+    return GPU_IR_OK;
+}
+
+typedef struct {
+    dev12 *device;
+    void *command_buffer;
+    void *compute_encoder, *blit_encoder, *resident_resources;
+    void *render_encoder;
+    gfx_state *graphics_state;
+    pso12 *api_pipeline;
+    heap12 *resource_heap, *sampler_heap;
+    root_binding *graphics_root;
+    scratch *scratch_buffer;
+} d3d12_draw_context;
+
+static uint32_t gpu_ir_topology_from_metal12(MTLPrimitiveType primitive) {
+    switch (primitive) {
+    case MTLPrimitiveTypePoint: return GPU_IR_TOPOLOGY_POINT_LIST;
+    case MTLPrimitiveTypeLine: return GPU_IR_TOPOLOGY_LINE_LIST;
+    case MTLPrimitiveTypeLineStrip: return GPU_IR_TOPOLOGY_LINE_STRIP;
+    case MTLPrimitiveTypeTriangle: return GPU_IR_TOPOLOGY_TRIANGLE_LIST;
+    case MTLPrimitiveTypeTriangleStrip: return GPU_IR_TOPOLOGY_TRIANGLE_STRIP;
+    default: return GPU_IR_TOPOLOGY_TRIANGLE_LIST;
+    }
+}
+
+static int d3d12_gpu_ir_prepare_draw12(d3d12_draw_context *context, const gpu_ir_pipeline *pipeline,
+                                      uint32_t topology, const gpu_ir_resource_access *accesses,
+                                      uint32_t access_count, MTLPrimitiveType *primitive_out,
+                                      id<MTLRenderCommandEncoder> __strong *encoder_out) {
+    pso12 *api_pipeline = context->api_pipeline;
+    const gpu_ir_pipeline_info *info = gpu_ir_pipeline_description(pipeline);
+    if (!api_pipeline || !api_pipeline->render || api_pipeline->gpu_pipeline != pipeline || !info ||
+        info->kind != GPU_IR_PIPELINE_GRAPHICS) return GPU_IR_INVALID;
+    MTLPrimitiveType primitive;
+    switch (topology) {
+    case GPU_IR_TOPOLOGY_POINT_LIST: primitive = MTLPrimitiveTypePoint; break;
+    case GPU_IR_TOPOLOGY_LINE_LIST: primitive = MTLPrimitiveTypeLine; break;
+    case GPU_IR_TOPOLOGY_LINE_STRIP: primitive = MTLPrimitiveTypeLineStrip; break;
+    case GPU_IR_TOPOLOGY_TRIANGLE_LIST: primitive = MTLPrimitiveTypeTriangle; break;
+    case GPU_IR_TOPOLOGY_TRIANGLE_STRIP: primitive = MTLPrimitiveTypeTriangleStrip; break;
+    default: return GPU_IR_INVALID;
+    }
+    id<MTLRenderCommandEncoder> __strong *re = (id<MTLRenderCommandEncoder> __strong *)context->render_encoder;
+    if (!re || !*re) return GPU_IR_INVALID;
+    int access_result = d3d12_use_render_accesses12(*re, accesses, access_count);
+    if (access_result != GPU_IR_OK) return access_result;
+    dev12 *device = context->device;
+    gfx_state *g = context->graphics_state;
+    heap12 *heap = context->resource_heap, *sheap = context->sampler_heap;
+    scratch *sc = context->scratch_buffer;
+
+    [*re setRenderPipelineState:api_pipeline->render];
+    [*re setDepthStencilState:api_pipeline->depth];
+    [*re setCullMode:api_pipeline->cull];
+    [*re setFrontFacingWinding:api_pipeline->winding];
+    [*re setTriangleFillMode:api_pipeline->fill];
+    [*re setDepthClipMode:api_pipeline->clip];
+    [*re setDepthBias:api_pipeline->bias slopeScale:api_pipeline->bias_slope clamp:api_pipeline->bias_clamp];
+    [*re setStencilReferenceValue:g->stencil_ref];
+    [*re setBlendColorRed:g->blend[0] green:g->blend[1] blue:g->blend[2] alpha:g->blend[3]];
+    if (g->nvp) {
+        MTLViewport viewports[10];
+        for (uint32_t k = 0; k < g->nvp; k++)
+            viewports[k] = (MTLViewport){ g->vp[k].x, g->vp[k].y, g->vp[k].w, g->vp[k].h,
+                                          g->vp[k].min_depth, g->vp[k].max_depth };
+        [*re setViewports:viewports count:g->nvp];
+    }
+    {
+        int32_t width = g->sc[15].right, height = g->sc[15].bottom;
+        uint32_t count = g->nsc ? (g->nsc > 15 ? 15 : g->nsc) : 0;
+        MTLScissorRect scissors[16];
+        for (uint32_t k = 0; k < count; k++) {
+            int32_t x0 = MAX(0, g->sc[k].left), y0 = MAX(0, g->sc[k].top);
+            int32_t x1 = MIN(width, g->sc[k].right), y1 = MIN(height, g->sc[k].bottom);
+            scissors[k] = (MTLScissorRect){ (NSUInteger)x0, (NSUInteger)y0,
+                (NSUInteger)MAX(0, x1 - x0), (NSUInteger)MAX(0, y1 - y0) };
+        }
+        if (!count) { scissors[0] = (MTLScissorRect){ 0, 0, 0, 0 }; count = 1; }
+        [*re setScissorRects:scissors count:count];
+    }
+    for (uint32_t k = 0; k < 16; k++) {
+        if (!g->vb[k].va) { [*re setVertexBuffer:nil offset:0 atIndex:16 + k]; continue; }
+        uint64_t offset = 0;
+        id<MTLBuffer> buffer = buffer_at(device, g->vb[k].va, &offset);
+        if (buffer) [*re setVertexBuffer:buffer offset:offset attributeStride:g->vb[k].stride atIndex:16 + k];
+    }
+    uint64_t root[64 + 2];
+    uint32_t words;
+    stage_root(device, &api_pipeline->vs, context->graphics_root, heap, sheap, sc, root, &words);
+    [*re setVertexBytes:root length:8 * words atIndex:0];
+    if (api_pipeline->render) {
+        stage_root(device, &api_pipeline->ps, context->graphics_root, heap, sheap, sc, root, &words);
+        [*re setFragmentBytes:root length:8 * words atIndex:0];
+    }
+    if (sc->buf) [*re useResource:sc->buf usage:MTLResourceUsageRead
+        stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    *primitive_out = primitive;
+    *encoder_out = *re;
+    return GPU_IR_OK;
+}
+
+static int d3d12_gpu_ir_draw(void *opaque, const gpu_ir_pipeline *pipeline, const gpu_ir_draw_info *draw,
+                             const gpu_ir_resource_access *accesses, uint32_t access_count) {
+    d3d12_draw_context *context = opaque;
+    if (!draw || draw->indexed > 1 || !context || !context->api_pipeline ||
+        !context->api_pipeline->render || context->api_pipeline->gpu_pipeline != pipeline)
+        return GPU_IR_INVALID;
+    if (!draw->instance_count || (draw->indexed ? !draw->index_count : !draw->vertex_count)) return GPU_IR_OK;
+    MTLPrimitiveType primitive;
+    id<MTLRenderCommandEncoder> encoder = nil;
+    int rc = d3d12_gpu_ir_prepare_draw12(context, pipeline, draw->topology, accesses, access_count,
+                                          &primitive, &encoder);
+    if (rc != GPU_IR_OK) return rc;
+    if (!draw->indexed) {
+        [encoder drawPrimitives:primitive vertexStart:draw->first_vertex vertexCount:draw->vertex_count
+            instanceCount:draw->instance_count baseInstance:draw->first_instance];
+    } else {
+        uint64_t offset = 0;
+        id<MTLBuffer> index_buffer = buffer_at(context->device, context->graphics_state->ib.va, &offset);
+        if (!index_buffer || (context->graphics_state->ib.format != 42 && context->graphics_state->ib.format != 57)) {
+            vx_log("D3D12: an indexed draw without a supported index buffer");
+            return GPU_IR_INVALID;
+        }
+        int index32 = context->graphics_state->ib.format == 42;
+        [encoder drawIndexedPrimitives:primitive indexCount:draw->index_count
+            indexType:index32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:index_buffer
+            indexBufferOffset:offset + (uint64_t)draw->first_index * (index32 ? 4 : 2)
+            instanceCount:draw->instance_count baseVertex:draw->vertex_offset baseInstance:draw->first_instance];
+    }
+    return GPU_IR_OK;
+}
+
+static id<MTLComputePipelineState> d3d12_indirect_args_filter_pipeline12(dev12 *device) {
+    static NSString *source =
+        @"#include <metal_stdlib>\nusing namespace metal;\n"
+        @"struct FilterArgs { ulong source_stride_words; uint payload_words; uint max_count; };\n"
+        @"kernel void vx_filter(device const uint *source [[buffer(0)]], device uint *destination [[buffer(1)]],\n"
+        @"    device const uint *count [[buffer(2)]], constant FilterArgs& args [[buffer(3)]],\n"
+        @"    uint i [[thread_position_in_grid]]) {\n"
+        @"    if (i >= args.max_count) return;\n"
+        @"    bool active = i < min(*count, args.max_count);\n"
+        @"    ulong src = (ulong)i * args.source_stride_words;\n"
+        @"    ulong dst = (ulong)i * args.payload_words;\n"
+        @"    for (uint word = 0; word < args.payload_words; ++word) {\n"
+        @"        uint value = source[src + word];\n"
+        @"        destination[dst + word] = (!active && word == 0) ? 0 : value;\n"
+        @"    }\n"
+        @"}\n";
+    pthread_mutex_lock(&device->lock);
+    id<MTLComputePipelineState> pipeline = device->indirect_args_filter;
+    pthread_mutex_unlock(&device->lock);
+    if (pipeline) return pipeline;
+
+    NSError *error = nil;
+    id<MTLLibrary> library = [device->mtl newLibraryWithSource:source options:nil error:&error];
+    id<MTLFunction> function = [library newFunctionWithName:@"vx_filter"];
+    pipeline = function ? [device->mtl newComputePipelineStateWithFunction:function error:&error] : nil;
+    if (!pipeline) {
+        vx_log("D3D12: ExecuteIndirect argument filter did not compile: %s", error.localizedDescription.UTF8String);
+        return nil;
+    }
+    pthread_mutex_lock(&device->lock);
+    if (!device->indirect_args_filter) device->indirect_args_filter = pipeline;
+    else pipeline = device->indirect_args_filter;
+    pthread_mutex_unlock(&device->lock);
+    return pipeline;
+}
+
+static int d3d12_gpu_ir_dispatch_indirect_range(void *opaque, const gpu_ir_pipeline *pipeline,
+                                               const gpu_ir_resource *arguments,
+                                               const gpu_ir_resource *count_arguments,
+                                               const gpu_ir_indirect_dispatch_info *dispatch,
+                                               const gpu_ir_resource_access *accesses, uint32_t access_count) {
+    d3d12_dispatch_context *context = opaque;
+    if (!context || !dispatch || !dispatch->dispatch_count || dispatch->stride < 12 || (dispatch->stride & 3) ||
+        (dispatch->argument_offset & 3) || (count_arguments && (dispatch->count_offset & 3)) ||
+        !gpu_ir_resource_is_buffer(arguments) ||
+        (count_arguments && !gpu_ir_resource_is_buffer(count_arguments))) return GPU_IR_INVALID;
+    pso12 *api_pipeline = context->api_pipeline;
+    const gpu_ir_pipeline_info *info = gpu_ir_pipeline_description(pipeline);
+    if (!api_pipeline || !api_pipeline->compute || api_pipeline->gpu_pipeline != pipeline || !info ||
+        info->kind != GPU_IR_PIPELINE_COMPUTE) return GPU_IR_INVALID;
+
+    uint64_t records = (uint64_t)dispatch->dispatch_count - 1;
+    uint64_t last_offset, required_end;
+    uint64_t argument_size = gpu_ir_buffer_size(arguments);
+    if ((records && dispatch->stride > UINT64_MAX / records) ||
+        dispatch->argument_offset > UINT64_MAX - records * dispatch->stride) return GPU_IR_RANGE;
+    last_offset = records * dispatch->stride;
+    required_end = dispatch->argument_offset + last_offset;
+    if (required_end > UINT64_MAX - 12 || (required_end += 12) > argument_size) return GPU_IR_RANGE;
+    if (!count_arguments) {
+        for (uint32_t i = 0; i < dispatch->dispatch_count; i++) {
+            uint64_t offset = dispatch->argument_offset + (uint64_t)i * dispatch->stride;
+            int rc = d3d12_gpu_ir_dispatch_indirect(opaque, pipeline, arguments, offset, accesses, access_count);
+            if (rc != GPU_IR_OK) return rc;
+        }
+        return GPU_IR_OK;
+    }
+    if (dispatch->argument_offset > SIZE_MAX ||
+        dispatch->count_offset > SIZE_MAX || dispatch->count_offset > gpu_ir_buffer_size(count_arguments) ||
+        4 > gpu_ir_buffer_size(count_arguments) - dispatch->count_offset) return GPU_IR_RANGE;
+
+    dev12 *device = context->device;
+    id<MTLCommandBuffer> command_buffer = (__bridge id<MTLCommandBuffer>)context->command_buffer;
+    id<MTLComputeCommandEncoder> __strong *compute_encoder =
+        (id<MTLComputeCommandEncoder> __strong *)context->compute_encoder;
+    id<MTLBlitCommandEncoder> __strong *blit_encoder =
+        (id<MTLBlitCommandEncoder> __strong *)context->blit_encoder;
+    id<MTLRenderCommandEncoder> __strong *render_encoder =
+        (id<MTLRenderCommandEncoder> __strong *)context->render_encoder;
+    NSArray *resident = (__bridge NSArray *)context->resident_resources;
+    scratch *scratch_buffer = context->scratch_buffer;
+    id<MTLBuffer> argument_buffer = (__bridge id<MTLBuffer>)gpu_ir_backend_object(arguments);
+    id<MTLBuffer> count_buffer = (__bridge id<MTLBuffer>)gpu_ir_backend_object(count_arguments);
+    id<MTLComputePipelineState> metal_pipeline = api_pipeline->compute;
+    if (!device || !command_buffer || !compute_encoder || !blit_encoder || !render_encoder || !scratch_buffer ||
+        !argument_buffer || !count_buffer || !metal_pipeline ||
+        required_end > argument_buffer.length || dispatch->count_offset > count_buffer.length ||
+        sizeof(uint32_t) > count_buffer.length - dispatch->count_offset) return GPU_IR_INVALID;
+    id<MTLComputePipelineState> filter = d3d12_indirect_args_filter_pipeline12(device);
+    if (!filter) return GPU_IR_UNSUPPORTED;
+
+    size_t output_size = (size_t)dispatch->dispatch_count * 12;
+    size_t output_offset = 0;
+    if (!scratch_alloc(device, scratch_buffer, output_size, &output_offset)) return GPU_IR_OUT_OF_MEMORY;
+
+    close_pass(device, context->graphics_state, command_buffer, render_encoder);
+    if (*blit_encoder) { [*blit_encoder endEncoding]; *blit_encoder = nil; }
+    if (!*compute_encoder) {
+        *compute_encoder = [command_buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
+        for (id<MTLResource> res in resident) [*compute_encoder useResource:res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        for (heap12 *heap = context->resource_heap; heap; heap = NULL)
+            for (uint32_t k = 0; k < heap->desc.NumDescriptors; k++)
+                if ([heap->keep[k] conformsToProtocol:@protocol(MTLTexture)])
+                    [*compute_encoder useResource:heap->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    }
+    if (!*compute_encoder) return GPU_IR_UNSUPPORTED;
+    int access_result = d3d12_use_compute_accesses12(*compute_encoder, accesses, access_count);
+    if (access_result != GPU_IR_OK) return access_result;
+    [*compute_encoder useResource:argument_buffer usage:MTLResourceUsageRead];
+    [*compute_encoder useResource:count_buffer usage:MTLResourceUsageRead];
+    [*compute_encoder useResource:scratch_buffer->buf usage:MTLResourceUsageWrite];
+    [*compute_encoder setComputePipelineState:filter];
+    [*compute_encoder setBuffer:argument_buffer offset:(NSUInteger)dispatch->argument_offset atIndex:0];
+    [*compute_encoder setBuffer:scratch_buffer->buf offset:output_offset atIndex:1];
+    [*compute_encoder setBuffer:count_buffer offset:(NSUInteger)dispatch->count_offset atIndex:2];
+    struct { uint64_t source_stride_words; uint32_t payload_words, max_count; } parameters = {
+        .source_stride_words = dispatch->stride / sizeof(uint32_t),
+        .payload_words = 3,
+        .max_count = dispatch->dispatch_count
+    };
+    [*compute_encoder setBytes:&parameters length:sizeof parameters atIndex:3];
+    NSUInteger width = MIN((NSUInteger)dispatch->dispatch_count,
+                           MAX((NSUInteger)1, filter.threadExecutionWidth));
+    [*compute_encoder dispatchThreads:MTLSizeMake(dispatch->dispatch_count, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+    [*compute_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    uint64_t root[64 + 2];
+    uint32_t words;
+    stage_root(device, &api_pipeline->msl, context->compute_root, context->resource_heap,
+               context->sampler_heap, scratch_buffer, root, &words);
+    [*compute_encoder setComputePipelineState:metal_pipeline];
+    [*compute_encoder setBytes:root length:8 * words atIndex:0];
+    [*compute_encoder useResource:scratch_buffer->buf usage:MTLResourceUsageRead];
+    for (uint32_t i = 0; i < dispatch->dispatch_count; i++) {
+        NSUInteger offset = output_offset + (NSUInteger)i * 12;
+        [*compute_encoder dispatchThreadgroupsWithIndirectBuffer:scratch_buffer->buf indirectBufferOffset:offset
+            threadsPerThreadgroup:MTLSizeMake(info->threadgroup_size[0], info->threadgroup_size[1],
+                                               info->threadgroup_size[2])];
+        [*compute_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+    }
+    return GPU_IR_OK;
+}
+
+static int d3d12_gpu_ir_draw_indirect(void *opaque, const gpu_ir_pipeline *pipeline,
+                                     const gpu_ir_resource *arguments, const gpu_ir_resource *count_arguments,
+                                     const gpu_ir_indirect_draw_info *draw,
+                                     const gpu_ir_resource_access *accesses, uint32_t access_count) {
+    d3d12_draw_context *context = opaque;
+    if (!context || !draw || draw->indexed > 1 || !draw->draw_count ||
+        !gpu_ir_resource_is_buffer(arguments) || (draw->argument_offset & 3) ||
+        draw->argument_offset > SIZE_MAX) return GPU_IR_INVALID;
+    uint32_t argument_size = draw->indexed ? 20 : 16;
+    uint64_t last_offset, end_offset;
+    if (draw->stride < argument_size || (draw->stride & 3) ||
+        (draw->draw_count - 1 && draw->stride > UINT64_MAX / (draw->draw_count - 1))) return GPU_IR_INVALID;
+    last_offset = (uint64_t)(draw->draw_count - 1) * draw->stride;
+    if (draw->argument_offset > UINT64_MAX - last_offset ||
+        draw->argument_offset + last_offset > UINT64_MAX - argument_size) return GPU_IR_INVALID;
+    end_offset = draw->argument_offset + last_offset + argument_size;
+    id<MTLBuffer> argument_buffer = (__bridge id<MTLBuffer>)gpu_ir_backend_object(arguments);
+    if (!argument_buffer || end_offset > argument_buffer.length)
+        return GPU_IR_RANGE;
+    id<MTLBuffer> indirect_buffer = argument_buffer;
+    NSUInteger indirect_offset = (NSUInteger)draw->argument_offset;
+    if (count_arguments) {
+        if (!gpu_ir_resource_is_buffer(count_arguments) || (draw->count_offset & 3) || draw->count_offset > SIZE_MAX)
+            return GPU_IR_INVALID;
+        id<MTLBuffer> count_buffer = (__bridge id<MTLBuffer>)gpu_ir_backend_object(count_arguments);
+        if (!count_buffer || draw->count_offset > count_buffer.length ||
+            sizeof(uint32_t) > count_buffer.length - draw->count_offset) return GPU_IR_RANGE;
+        if (!context->command_buffer || !context->compute_encoder || !context->blit_encoder ||
+            !context->resident_resources || !context->scratch_buffer) return GPU_IR_INVALID;
+
+        dev12 *device = context->device;
+        id<MTLCommandBuffer> command_buffer = (__bridge id<MTLCommandBuffer>)context->command_buffer;
+        id<MTLComputeCommandEncoder> __strong *compute_encoder =
+            (id<MTLComputeCommandEncoder> __strong *)context->compute_encoder;
+        id<MTLBlitCommandEncoder> __strong *blit_encoder =
+            (id<MTLBlitCommandEncoder> __strong *)context->blit_encoder;
+        id<MTLRenderCommandEncoder> __strong *render_encoder =
+            (id<MTLRenderCommandEncoder> __strong *)context->render_encoder;
+        NSArray *resident = (__bridge NSArray *)context->resident_resources;
+        scratch *scratch_buffer = context->scratch_buffer;
+        id<MTLComputePipelineState> filter = d3d12_indirect_args_filter_pipeline12(device);
+        if (!filter || (size_t)draw->draw_count > SIZE_MAX / argument_size) return GPU_IR_UNSUPPORTED;
+        size_t output_size = (size_t)draw->draw_count * argument_size;
+        size_t output_offset = 0;
+        if (!scratch_alloc(device, scratch_buffer, output_size, &output_offset)) return GPU_IR_OUT_OF_MEMORY;
+
+        close_pass(device, context->graphics_state, command_buffer, render_encoder);
+        if (*blit_encoder) { [*blit_encoder endEncoding]; *blit_encoder = nil; }
+        if (!*compute_encoder)
+            *compute_encoder = [command_buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        if (!*compute_encoder) return GPU_IR_UNSUPPORTED;
+        [*compute_encoder useResource:argument_buffer usage:MTLResourceUsageRead];
+        [*compute_encoder useResource:count_buffer usage:MTLResourceUsageRead];
+        [*compute_encoder useResource:scratch_buffer->buf usage:MTLResourceUsageWrite];
+        [*compute_encoder setComputePipelineState:filter];
+        [*compute_encoder setBuffer:argument_buffer offset:(NSUInteger)draw->argument_offset atIndex:0];
+        [*compute_encoder setBuffer:scratch_buffer->buf offset:output_offset atIndex:1];
+        [*compute_encoder setBuffer:count_buffer offset:(NSUInteger)draw->count_offset atIndex:2];
+        struct { uint64_t source_stride_words; uint32_t payload_words, max_count; } parameters = {
+            .source_stride_words = draw->stride / sizeof(uint32_t),
+            .payload_words = argument_size / sizeof(uint32_t),
+            .max_count = draw->draw_count
+        };
+        [*compute_encoder setBytes:&parameters length:sizeof parameters atIndex:3];
+        NSUInteger width = MIN((NSUInteger)draw->draw_count, MAX((NSUInteger)1, filter.threadExecutionWidth));
+        [*compute_encoder dispatchThreads:MTLSizeMake(draw->draw_count, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        [*compute_encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [*compute_encoder endEncoding];
+        *compute_encoder = nil;
+
+        // A new render pass loads the existing attachments; tracked Metal resources order the filter writes
+        // before these indirect argument reads in the same command buffer.
+        if (!open_render_pass12(device, context->graphics_state, command_buffer, compute_encoder,
+                                blit_encoder, render_encoder, resident, context->resource_heap))
+            return GPU_IR_UNSUPPORTED;
+        indirect_buffer = scratch_buffer->buf;
+        indirect_offset = output_offset;
+    }
+    gfx_state *g = context->graphics_state;
+    MTLPrimitiveType primitive;
+    id<MTLRenderCommandEncoder> encoder = nil;
+    int rc = d3d12_gpu_ir_prepare_draw12(context, pipeline, draw->topology, accesses, access_count,
+                                          &primitive, &encoder);
+    if (rc != GPU_IR_OK) return rc;
+    id<MTLBuffer> index_buffer = nil;
+    uint64_t index_offset = 0;
+    MTLIndexType index_type = MTLIndexTypeUInt16;
+    if (draw->indexed) {
+        if (!g->ib.va || (g->ib.format != 42 && g->ib.format != 57)) return GPU_IR_INVALID;
+        index_buffer = buffer_at(context->device, g->ib.va, &index_offset);
+        if (!index_buffer) return GPU_IR_INVALID;
+        index_type = g->ib.format == 42 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
+    }
+    [encoder useResource:indirect_buffer usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+    for (uint32_t i = 0; i < draw->draw_count; i++) {
+        NSUInteger offset = indirect_offset + (NSUInteger)i * (count_arguments ? argument_size : draw->stride);
+        if (!draw->indexed)
+            [encoder drawPrimitives:primitive indirectBuffer:indirect_buffer indirectBufferOffset:offset];
+        else
+            [encoder drawIndexedPrimitives:primitive indexType:index_type indexBuffer:index_buffer
+                indexBufferOffset:(NSUInteger)index_offset indirectBuffer:indirect_buffer indirectBufferOffset:offset];
+    }
+    return GPU_IR_OK;
+}
+
+static int gpu_ir_execute_transient_dispatch(gpu_ir_pipeline *pipeline, uint32_t x, uint32_t y, uint32_t z,
+                                             const gpu_ir_resource_access *accesses, uint32_t access_count,
+                                             const gpu_ir_backend *backend) {
+    gpu_ir_stream stream;
+    gpu_ir_stream_init(&stream);
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc = gpu_ir_record_dispatch_with_accesses(&stream, pipeline, x, y, z, accesses, access_count, &index);
+    if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) rc = gpu_ir_execute(&stream, index, backend);
+    gpu_ir_stream_destroy(&stream);
+    return rc;
+}
+
+static int gpu_ir_execute_transient_draw(gpu_ir_pipeline *pipeline, const gpu_ir_draw_info *draw,
+                                         const gpu_ir_resource_access *accesses, uint32_t access_count,
+                                         const gpu_ir_backend *backend) {
+    gpu_ir_stream stream;
+    gpu_ir_stream_init(&stream);
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc = gpu_ir_record_draw_with_accesses(&stream, pipeline, draw, accesses, access_count, &index);
+    if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) rc = gpu_ir_execute(&stream, index, backend);
+    gpu_ir_stream_destroy(&stream);
+    return rc;
+}
+
+static int replay_insert(cmd12 **commands, uint32_t *count, uint32_t at, const cmd12 *items, uint32_t nitems) {
+    if (!nitems) return 1;
+    if (at > *count || nitems > UINT32_MAX - *count || (size_t)(*count + nitems) > SIZE_MAX / sizeof **commands) return 0;
+    uint32_t next_count = *count + nitems;
+    cmd12 *next = realloc(*commands, (size_t)next_count * sizeof **commands);
+    if (!next) return 0;
+    memmove(next + at + nitems, next + at, (size_t)(*count - at) * sizeof *next);
+    memcpy(next + at, items, (size_t)nitems * sizeof *next);
+    *commands = next;
+    *count = next_count;
+    return 1;
+}
+
+enum {
+    D3D12_INDIRECT_CPU_OK,
+    D3D12_INDIRECT_CPU_COUNT_UNREADABLE,
+    D3D12_INDIRECT_CPU_ARGUMENT_RANGE,
+    D3D12_INDIRECT_CPU_ARGUMENT_UNREADABLE
+};
+
+// The CPU compatibility path can only decode UPLOAD buffers. Share its exact count clamp and range checks between
+// replay and submission-time state validation so both interpret the same records and skip conditions.
+static int d3d12_indirect_cpu_records12(const cmd12 *command, const command_signature12 *signature,
+                                       const res12 *arguments, const res12 *count_buffer,
+                                       uint32_t *available_out, const uint8_t **records_out) {
+    if (!command || !signature || !arguments || !available_out || !records_out) return D3D12_INDIRECT_CPU_ARGUMENT_RANGE;
+    uint32_t available = command->a;
+    const uint8_t *records = NULL;
+    if (count_buffer && available) {
+        if (!count_buffer->buffer || count_buffer->heap.Type != 2 || !count_buffer->buffer.contents ||
+            command->off2 > count_buffer->buffer.length || 4 > count_buffer->buffer.length - command->off2) {
+            *available_out = 0;
+            *records_out = NULL;
+            return D3D12_INDIRECT_CPU_COUNT_UNREADABLE;
+        }
+        uint32_t gpu_count = 0;
+        memcpy(&gpu_count, (const uint8_t *)count_buffer->buffer.contents + command->off2, sizeof gpu_count);
+        if (gpu_count < available) available = gpu_count;
+    }
+    if (available && (!arguments->buffer || command->off > arguments->buffer.length ||
+        (uint64_t)available * signature->stride > arguments->buffer.length - command->off)) {
+        *available_out = 0;
+        *records_out = NULL;
+        return D3D12_INDIRECT_CPU_ARGUMENT_RANGE;
+    }
+    if (available && (arguments->heap.Type != 2 || !arguments->buffer.contents)) {
+        *available_out = 0;
+        *records_out = NULL;
+        return D3D12_INDIRECT_CPU_ARGUMENT_UNREADABLE;
+    }
+    if (available) records = (const uint8_t *)arguments->buffer.contents + command->off;
+    *available_out = available;
+    *records_out = records;
+    return D3D12_INDIRECT_CPU_OK;
+}
+
+// A preflight readback is safe only if this command list has not already issued GPU work that could have
+// produced the argument or count data. Earlier command lists on this Metal queue are ordered before the
+// readback command buffer; work earlier in this list is not, because replay has not submitted it yet.
+static int d3d12_indirect_has_prior_gpu_work12(const list12 *list, uint32_t command_index) {
+    if (!list || command_index > list->n) return 1;
+    for (uint32_t i = 0; i < command_index; i++) {
+        switch (list->cmds[i].op) {
+        case C_PSO: case C_ROOTSIG: case C_HEAPS: case C_TABLE: case C_CONSTANTS: case C_ROOT_VA:
+        case C_TOPOLOGY: case C_VB: case C_IB: case C_TARGETS: case C_VIEWPORTS: case C_SCISSORS:
+        case C_BLEND_FACTOR: case C_STENCIL_REF: case C_BUNDLE_BEGIN: case C_BUNDLE_END:
+            break;
+        case C_GPU_IR:
+            if (gpu_ir_command_kind(&list->gpu_ir, list->cmds[i].gpu_ir_index) == GPU_IR_COMMAND_BARRIER) break;
+            return 1;
+        default:
+            // This includes draws, dispatches, clears, copies, queries, and immediate writes.
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Stage GPU-only ExecuteIndirect data during submission preflight when no earlier command in this list can
+// write it. This lets the state validator inspect root/IA-updating records without executing or committing the
+// list. If the list already contains GPU work, its producer must run first and replay retains its ordered fallback.
+static int d3d12_indirect_preflight_gpu_records12(id<MTLCommandQueue> queue, const cmd12 *command,
+        const command_signature12 *signature, const res12 *arguments, const res12 *count_buffer,
+        uint32_t *available_out, const uint8_t **records_out, id<MTLBuffer> __strong *staging_out) {
+    if (!queue || !command || !signature || !arguments || !arguments->buffer ||
+        !available_out || !records_out || !staging_out) return 0;
+    *available_out = 0;
+    *records_out = NULL;
+    *staging_out = nil;
+    if (!command->a) return 1;
+
+    uint64_t argument_bytes64 = (uint64_t)command->a * signature->stride;
+    if (argument_bytes64 > SIZE_MAX || argument_bytes64 > NSUIntegerMax ||
+        command->off > arguments->buffer.length || argument_bytes64 > arguments->buffer.length - command->off)
+        return 0;
+    size_t argument_bytes = (size_t)argument_bytes64;
+    size_t count_offset = argument_bytes;
+    size_t readback_bytes = argument_bytes;
+    if (count_buffer) {
+        if (!count_buffer->buffer || command->off2 > count_buffer->buffer.length ||
+            sizeof(uint32_t) > count_buffer->buffer.length - command->off2 ||
+            readback_bytes > SIZE_MAX - sizeof(uint32_t)) return 0;
+        readback_bytes += sizeof(uint32_t);
+    }
+    if (!readback_bytes || readback_bytes > NSUIntegerMax) return 0;
+
+    id<MTLBuffer> staging = [queue.device newBufferWithLength:(NSUInteger)readback_bytes
+        options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+    if (!staging || !command_buffer) return 0;
+    id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+    if (!blit) return 0;
+    [blit copyFromBuffer:arguments->buffer sourceOffset:(NSUInteger)command->off
+        toBuffer:staging destinationOffset:0 size:(NSUInteger)argument_bytes];
+    if (count_buffer) {
+        [blit copyFromBuffer:count_buffer->buffer sourceOffset:(NSUInteger)command->off2
+            toBuffer:staging destinationOffset:count_offset size:sizeof(uint32_t)];
+    }
+    [blit endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    if (command_buffer.status != MTLCommandBufferStatusCompleted || !staging.contents) return 0;
+
+    uint32_t available = command->a;
+    if (count_buffer) {
+        uint32_t gpu_count = 0;
+        memcpy(&gpu_count, (const uint8_t *)staging.contents + count_offset, sizeof gpu_count);
+        if (gpu_count < available) available = gpu_count;
+    }
+    *available_out = available;
+    *records_out = (const uint8_t *)staging.contents;
+    *staging_out = staging;
+    return 1;
+}
+
+// Root/IA-changing ExecuteIndirect signatures need their records on the CPU for the current Metal lowering.
+// When D3D12 puts those records in DEFAULT resources, stage them through an ordered Metal blit and wait for that
+// blit before expanding the signature. This is a compatibility fallback; fixed draw/dispatch signatures stay GPU-side.
+static int d3d12_indirect_gpu_records12(dev12 *device, id<MTLCommandQueue> queue,
+                                       id<MTLCommandBuffer> __strong *command_buffer,
+                                       id<MTLCommandBuffer> *outer_command_buffer,
+                                       id<MTLComputeCommandEncoder> __strong *compute_encoder,
+                                       id<MTLBlitCommandEncoder> __strong *blit_encoder,
+                                       id<MTLRenderCommandEncoder> __strong *render_encoder,
+                                       gfx_state *graphics_state, const cmd12 *command,
+                                       const command_signature12 *signature, const res12 *arguments,
+                                       const res12 *count_buffer, uint32_t *available_out,
+                                       const uint8_t **records_out, id<MTLBuffer> __strong *readback_out) {
+    if (!device || !queue || !command_buffer || !*command_buffer || !outer_command_buffer || !command ||
+        !signature || !arguments || !arguments->buffer || !available_out || !records_out || !readback_out)
+        return 0;
+    *available_out = 0;
+    *records_out = NULL;
+    *readback_out = nil;
+    if (!command->a) return 1;
+
+    uint64_t argument_bytes64 = (uint64_t)command->a * signature->stride;
+    if (argument_bytes64 > SIZE_MAX || argument_bytes64 > NSUIntegerMax) return 0;
+    size_t argument_bytes = (size_t)argument_bytes64;
+    size_t count_offset = argument_bytes;
+    size_t readback_bytes = argument_bytes;
+    if (count_buffer) {
+        if (readback_bytes > SIZE_MAX - sizeof(uint32_t)) return 0;
+        readback_bytes += sizeof(uint32_t);
+    }
+    if (!readback_bytes || readback_bytes > NSUIntegerMax) return 0;
+
+    id<MTLBuffer> staging = [device->mtl newBufferWithLength:(NSUInteger)readback_bytes
+        options:MTLResourceStorageModeShared];
+    if (!staging) return 0;
+
+    id<MTLCommandBuffer> next_command_buffer = [queue commandBuffer];
+    if (!next_command_buffer) return 0;
+
+    id<MTLCommandBuffer> current = *command_buffer;
+    close_pass(device, graphics_state, current, render_encoder);
+    end_encoders(compute_encoder, blit_encoder, render_encoder);
+    *blit_encoder = [current blitCommandEncoder];
+    if (!*blit_encoder) return 0;
+    [*blit_encoder copyFromBuffer:arguments->buffer sourceOffset:(NSUInteger)command->off
+        toBuffer:staging destinationOffset:0 size:(NSUInteger)argument_bytes];
+    if (count_buffer) {
+        [*blit_encoder copyFromBuffer:count_buffer->buffer sourceOffset:(NSUInteger)command->off2
+            toBuffer:staging destinationOffset:count_offset size:sizeof(uint32_t)];
+    }
+    [*blit_encoder endEncoding];
+    *blit_encoder = nil;
+    [current commit];
+    [current waitUntilCompleted];
+    if (current.status != MTLCommandBufferStatusCompleted) {
+        vx_log("D3D12: Metal command buffer failed while staging ExecuteIndirect records: %s",
+               current.error.localizedDescription.UTF8String ?: "unknown Metal error");
+        return -1;
+    }
+
+    uint32_t available = command->a;
+    if (count_buffer) {
+        uint32_t gpu_count = 0;
+        memcpy(&gpu_count, (const uint8_t *)staging.contents + count_offset, sizeof gpu_count);
+        if (gpu_count < available) available = gpu_count;
+    }
+    *available_out = available;
+    *records_out = (const uint8_t *)staging.contents;
+    *readback_out = staging;
+    *command_buffer = next_command_buffer;
+    *outer_command_buffer = next_command_buffer;
+    return 1;
+}
+
+typedef struct { dev12 *device; void *command_buffer; } d3d12_clear_context12;
+
+static int d3d12_gpu_ir_clear_color12(void *opaque, const gpu_ir_resource *resource,
+                                     const gpu_ir_clear_color_info *clear) {
+    d3d12_clear_context12 *context = opaque;
+    if (!context || !context->device || !context->device->common_metal || !context->command_buffer)
+        return GPU_IR_INVALID;
+    return gpu_ir_metal_encode_clear_color(context->device->common_metal, context->command_buffer,
+                                           resource, clear);
+}
+
+static int d3d12_gpu_ir_clear_depth_stencil12(void *opaque, const gpu_ir_resource *resource,
+                                              const gpu_ir_clear_depth_stencil_info *clear) {
+    d3d12_clear_context12 *context = opaque;
+    if (!context || !context->device || !context->device->common_metal || !context->command_buffer)
+        return GPU_IR_INVALID;
+    return gpu_ir_metal_encode_clear_depth_stencil(context->device->common_metal, context->command_buffer,
+                                                    resource, clear);
+}
+
+static int replay_indirect_override_reserve12(d3d12_indirect_validation_override12 **overrides,
+        uint32_t *capacity, uint32_t need) {
+    if (need <= *capacity) return 1;
+    uint32_t next = *capacity ? *capacity : 4;
+    while (next < need) {
+        if (next > UINT32_MAX / 2) { next = need; break; }
+        next *= 2;
+    }
+    d3d12_indirect_validation_override12 *grown = realloc(*overrides, (size_t)next * sizeof **overrides);
+    if (!grown) return 0;
+    *overrides = grown;
+    *capacity = next;
+    return 1;
+}
+
+static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list12 *l,
+                  resource_state_shadow12 **state_shadows, uint32_t *state_count,
+                  id<MTLCommandBuffer> *command_buffer, scratch *sc) {
+    id<MTLCommandBuffer> cb = *command_buffer;
+    uint32_t command_count = l->n;
+    cmd12 *commands = command_count ? malloc((size_t)command_count * sizeof *commands) : NULL;
+    if (command_count && !commands) { vx_log("D3D12: could not copy a command list for replay"); return 0; }
+    if (command_count) {
+        memcpy(commands, l->cmds, (size_t)command_count * sizeof *commands);
+        for (uint32_t i = 0; i < command_count; i++) commands[i].replay_source_index = i;
+    }
     pso12 *pso = NULL;
     heap12 *heap = NULL, *sheap = NULL;
     root_binding *compute = calloc(1, sizeof *compute), *graphics = calloc(1, sizeof *graphics);
     gfx_state *g = calloc(1, sizeof *g);
+    if (!compute || !graphics || !g) {
+        vx_log("D3D12: could not allocate command-list replay state");
+        free(commands); free(compute); free(graphics); free(g);
+        return 0;
+    }
     g->prim = MTLPrimitiveTypeTriangle;
     for (int k = 0; k < 4; k++) g->blend[k] = 1;
     id<MTLComputeCommandEncoder> ce = nil;
     id<MTLBlitCommandEncoder> be = nil;
     id<MTLRenderCommandEncoder> re = nil;
+    d3d12_indirect_validation_override12 *indirect_overrides = NULL;
+    uint32_t indirect_override_count = 0, indirect_override_capacity = 0;
+    NSMutableArray<id<MTLBuffer>> *indirect_staging_buffers = [NSMutableArray array];
+    int replay_failed = 0;
     pthread_mutex_lock(&d->lock);
     NSArray *resident = [d->resources copy];
     pthread_mutex_unlock(&d->lock);
-    for (uint32_t i = 0; i < l->n; i++) {
-        cmd12 *c = &l->cmds[i];
+    for (uint32_t i = 0; i < command_count; i++) {
+        cmd12 *c = &commands[i];
         root_binding *rb = c->gfx ? graphics : compute;
         switch (c->op) {
+        case C_BUNDLE_BEGIN:
+            // Bundles inherit graphics bindings and targets, but start with undefined PSO and topology.
+            pso = NULL;
+            g->prim = (MTLPrimitiveType)-1;
+            break;
+        case C_BUNDLE_END:
+            // State set by the bundle remains active on the parent command list.
+            break;
         case C_PSO: pso = c->obj; break;
         case C_ROOTSIG: rb->rs = c->obj; memset(&rb->st, 0, sizeof rb->st); break;
         case C_HEAPS: heap = c->obj; sheap = c->obj2; break;
@@ -1589,6 +6993,13 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
                     }
                 }
                 g->occ_on = 0;
+            } else if (q->type == 5 && q->samples && c->b < q->count) {
+                // Copy-queue timestamps mark the point between blit operations. Metal only exposes
+                // those points on devices advertising AtBlitBoundary sampling.
+                close_pass(d, g, cb, &re);
+                if (ce) { [ce endEncoding]; ce = nil; }
+                if (!be) be = [cb blitCommandEncoder];
+                [be sampleCountersInBuffer:q->samples atSampleIndex:c->b withBarrier:YES];
             } else if (q->samples && c->b < q->count) {
                 // A timestamp: when the work before it has finished; Apple GPUs sample only where an encoder starts
                 // or ends, so an encoder of its own ends here and samples at its end.
@@ -1613,6 +7024,7 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
             }
             if (ce) { [ce endEncoding]; ce = nil; }
             close_pass(d, g, cb, &re);
+            if (q->type == 5 && be) { [be endEncoding]; be = nil; }
             if (!be) be = [cb blitCommandEncoder];
             if (q->samples) [be resolveCounters:q->samples inRange:NSMakeRange(c->b, c->c) destinationBuffer:dst->buffer destinationOffset:c->off];
             else {
@@ -1621,140 +7033,152 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
             break;
         }
         case C_TARGETS:
-            for (int k = 0; k < 9; k++) g->tex[k] = c->tex[k];       // (the command holds them)
+            for (int k = 0; k < 9; k++) {
+                g->tex[k] = c->tex[k];       // (the command holds them)
+                g->resource[k] = c->resource[k];
+            }
             g->changed = 1;
             break;
-        case C_CLEAR_RTV: case C_CLEAR_DSV: {
-            // a pass of its own whose load action clears (the next draws open their own pass)
-            close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
-            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-            if (c->op == C_CLEAR_RTV) {
-                if (!c->tex[0]) break;
-                float *col = (float *)c->values;
-                rp.colorAttachments[0].texture = (__bridge id<MTLTexture>)c->tex[0];
-                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-                rp.colorAttachments[0].clearColor = MTLClearColorMake(col[0], col[1], col[2], col[3]);
-            } else {
-                if (!c->tex[8]) break;
-                id<MTLTexture> t = (__bridge id<MTLTexture>)c->tex[8];
-                float depth;
-                memcpy(&depth, &c->values[0], 4);
-                rp.depthAttachment.texture = t;
-                rp.depthAttachment.loadAction = (c->a & 1) ? MTLLoadActionClear : MTLLoadActionLoad;
-                rp.depthAttachment.storeAction = MTLStoreActionStore;
-                rp.depthAttachment.clearDepth = depth;
-                if (t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
-                    rp.stencilAttachment.texture = t;
-                    rp.stencilAttachment.loadAction = (c->a & 2) ? MTLLoadActionClear : MTLLoadActionLoad;
-                    rp.stencilAttachment.storeAction = MTLStoreActionStore;
-                    rp.stencilAttachment.clearStencil = c->values[1];
+        case C_CLEAR_UAV: {
+            uint32_t descriptor_index = 0;
+            heap12 *descriptor_heap = heap_gpu_descriptor(c->va, &descriptor_index);
+            gpu_ir_buffer_view *buffer_view = descriptor_heap && descriptor_heap->buffer_view &&
+                descriptor_index < descriptor_heap->desc.NumDescriptors ? descriptor_heap->buffer_view[descriptor_index] : NULL;
+            const gpu_ir_buffer_view_desc *buffer_desc = buffer_view ? gpu_ir_buffer_view_description(buffer_view) : NULL;
+            int raw_buffer = buffer_desc && buffer_desc->kind == GPU_IR_BUFFER_VIEW_RAW;
+            uint8_t typed_pattern[GPU_IR_MAX_FILL_PATTERN_SIZE];
+            uint32_t typed_pattern_size = 0;
+            int typed_clear = !c->a && !c->b &&
+                d3d12_typed_uav_clear_pattern12(descriptor_heap, descriptor_index, buffer_desc,
+                                                 c->values, typed_pattern, &typed_pattern_size);
+            close_pass(d, g, cb, &re);
+            if (raw_buffer || typed_clear) {
+                end_encoders(&ce, &be, &re);
+                if (raw_buffer && (c->a || c->b)) {
+                    vx_log("D3D12: raw-buffer ClearUnorderedAccessView requires Uint values and no rectangles");
+                    replay_failed = 1;
+                    break;
                 }
+                be = [cb blitCommandEncoder];
+                if (!be) {
+                    vx_log("D3D12: could not create a Metal blit encoder for a buffer UAV clear");
+                    replay_failed = 1;
+                    break;
+                }
+                int rc = raw_buffer ? d3d12_gpu_ir_execute_fill_buffer(d, sc, be,
+                    (gpu_ir_resource *)gpu_ir_buffer_view_resource(buffer_view), buffer_desc->byte_offset,
+                    buffer_desc->byte_size, c->values[0]) : d3d12_gpu_ir_execute_fill_buffer_pattern(d, sc, be,
+                    (gpu_ir_resource *)gpu_ir_buffer_view_resource(buffer_view), buffer_desc->byte_offset,
+                    buffer_desc->byte_size, typed_pattern, typed_pattern_size);
+                if (rc != GPU_IR_OK) {
+                    const char *clear_kind = raw_buffer ? "raw-buffer" : "typed-buffer";
+                    vx_log("D3D12: %s UAV clear failed through common GPU IR (error %d)", clear_kind, rc);
+                    replay_failed = 1;
+                }
+                break;
             }
-            [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+            if (be) { [be endEncoding]; be = nil; }
+            if (!ce) ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+            if (!ce || !d3d12_clear_uav_encode12(d, cb, &ce, c, heap)) {
+                vx_log("D3D12: could not execute ClearUnorderedAccessView%s", c->a ? "Float" : "Uint");
+                replay_failed = 1;
+            }
+            break;
+        }
+        case C_CLEAR_RTV: case C_CLEAR_DSV: {
+            // Clears are common IR operations so later API front ends can share attachment semantics and backend hooks.
+            close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
+            d3d12_clear_context12 context = { d, (__bridge void *)cb };
+            gpu_ir_backend backend = { .context = &context, .clear_color = d3d12_gpu_ir_clear_color12,
+                                       .clear_depth_stencil = d3d12_gpu_ir_clear_depth_stencil12 };
+            if (!c->gpu_ir_recorded) break;
+            int rc = gpu_ir_execute(&l->gpu_ir, c->gpu_ir_index, &backend);
+            if (rc != GPU_IR_OK) {
+                vx_log("D3D12: common GPU IR could not execute ClearRenderTargetView or ClearDepthStencilView (error %d)", rc);
+                replay_failed = 1;
+            }
             g->changed = 1;
             break;
         }
         case C_DRAW: case C_DRAW_INDEXED: {
             if (!pso || !pso->render) { vx_log("D3D12: a draw without a graphics pipeline state"); break; }
-            if (!re || g->changed) {
-                close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
-                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-                uint32_t w = 0, h = 0;
-                for (int k = 0; k < 8; k++) {
-                    if (!g->tex[k]) continue;
-                    id<MTLTexture> t = (__bridge id<MTLTexture>)g->tex[k];
-                    rp.colorAttachments[k].texture = t;
-                    rp.colorAttachments[k].loadAction = MTLLoadActionLoad;
-                    rp.colorAttachments[k].storeAction = MTLStoreActionStore;
-                    w = (uint32_t)t.width; h = (uint32_t)t.height;
-                }
-                if (g->tex[8]) {
-                    id<MTLTexture> t = (__bridge id<MTLTexture>)g->tex[8];
-                    rp.depthAttachment.texture = t;
-                    rp.depthAttachment.loadAction = MTLLoadActionLoad;
-                    rp.depthAttachment.storeAction = MTLStoreActionStore;
-                    if (t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
-                        rp.stencilAttachment.texture = t;
-                        rp.stencilAttachment.loadAction = MTLLoadActionLoad;
-                        rp.stencilAttachment.storeAction = MTLStoreActionStore;
-                    }
-                    if (!w) { w = (uint32_t)t.width; h = (uint32_t)t.height; }
-                }
-                if (!w && g->nvp) {                                 // (no attachments: the viewport's size)
-                    rp.renderTargetWidth = (NSUInteger)(g->vp[0].x + g->vp[0].w);
-                    rp.renderTargetHeight = (NSUInteger)(g->vp[0].y + g->vp[0].h);
-                    rp.defaultRasterSampleCount = 1;
-                }
-                if (g->occ) {
-                    g->pass_heap = g->occ;
-                    g->pass_vis = [d->mtl newBufferWithLength:g->occ->results.length options:MTLResourceStorageModeShared];
-                    memset(g->pass_vis.contents, 0, g->pass_vis.length);
-                    rp.visibilityResultBuffer = g->pass_vis;
-                }
-                re = [cb renderCommandEncoderWithDescriptor:rp];
-                make_resident_render(re, resident, heap);
-                if (g->occ_on) { [re setVisibilityResultMode:MTLVisibilityResultModeCounting offset:8 * g->occ_index]; pass_query(g); }
-                g->changed = 0;
-                // (the pass's size, for the scissor rectangles, which Metal wants inside the targets)
-                g->sc[15].right = (int32_t)(w ? w : rp.renderTargetWidth);
-                g->sc[15].bottom = (int32_t)(h ? h : rp.renderTargetHeight);
+            if (!open_render_pass12(d, g, cb, &ce, &be, &re, resident, heap)) {
+                vx_log("D3D12: could not open a render pass for a draw");
+                break;
             }
-            [re setRenderPipelineState:pso->render];
-            [re setDepthStencilState:pso->depth];
-            [re setCullMode:pso->cull];
-            [re setFrontFacingWinding:pso->winding];
-            [re setTriangleFillMode:pso->fill];
-            [re setDepthClipMode:pso->clip];
-            [re setDepthBias:pso->bias slopeScale:pso->bias_slope clamp:pso->bias_clamp];
-            [re setStencilReferenceValue:g->stencil_ref];
-            [re setBlendColorRed:g->blend[0] green:g->blend[1] blue:g->blend[2] alpha:g->blend[3]];
-            if (g->nvp) {
-                MTLViewport v[10];
-                for (uint32_t k = 0; k < g->nvp; k++) v[k] = (MTLViewport){ g->vp[k].x, g->vp[k].y, g->vp[k].w, g->vp[k].h, g->vp[k].min_depth, g->vp[k].max_depth };
-                [re setViewports:v count:g->nvp];
-            }
-            {
-                int32_t W = g->sc[15].right, H = g->sc[15].bottom;
-                uint32_t n = g->nsc ? (g->nsc > 15 ? 15 : g->nsc) : 0;
-                MTLScissorRect r[16];
-                for (uint32_t k = 0; k < n; k++) {
-                    int32_t x0 = MAX(0, g->sc[k].left), y0 = MAX(0, g->sc[k].top), x1 = MIN(W, g->sc[k].right), y1 = MIN(H, g->sc[k].bottom);
-                    r[k] = (MTLScissorRect){ (NSUInteger)x0, (NSUInteger)y0, (NSUInteger)MAX(0, x1 - x0), (NSUInteger)MAX(0, y1 - y0) };
-                }
-                if (!n) { r[0] = (MTLScissorRect){ 0, 0, 0, 0 }; n = 1; }   // (D3D12: no scissor rectangle set draws nothing)
-                [re setScissorRects:r count:n];
-            }
-            for (uint32_t k = 0; k < 16; k++) {
-                if (!g->vb[k].va) continue;
-                uint64_t off = 0;
-                id<MTLBuffer> b = buffer_at(d, g->vb[k].va, &off);
-                if (b) [re setVertexBuffer:b offset:off attributeStride:g->vb[k].stride atIndex:16 + k];
-            }
-            uint64_t root[64 + 2];
-            uint32_t words;
-            stage_root(d, &pso->vs, graphics, heap, sheap, sc, root, &words);
-            [re setVertexBytes:root length:8 * words atIndex:0];
-            if (pso->render) {
-                stage_root(d, &pso->ps, graphics, heap, sheap, sc, root, &words);
-                [re setFragmentBytes:root length:8 * words atIndex:0];
-            }
-            if (sc->buf) [re useResource:sc->buf usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
-            uint32_t instances = c->b ? c->b : 1;
-            if (c->op == C_DRAW) {
-                [re drawPrimitives:g->prim vertexStart:c->c vertexCount:c->a instanceCount:instances baseInstance:(NSUInteger)c->off];
+            d3d12_draw_context context = {
+                .device = d, .render_encoder = &re, .graphics_state = g, .api_pipeline = pso,
+                .resource_heap = heap, .sampler_heap = sheap, .graphics_root = graphics, .scratch_buffer = sc
+            };
+            gpu_ir_backend backend = { .context = &context, .draw = d3d12_gpu_ir_draw };
+            gpu_ir_draw_info draw = {
+                .topology = gpu_ir_topology_from_metal12(g->prim), .indexed = c->op == C_DRAW_INDEXED,
+                .instance_count = c->b, .first_instance = c->op == C_DRAW ? (uint32_t)c->off : (uint32_t)c->off2
+            };
+            if (draw.indexed) {
+                draw.index_count = c->a;
+                draw.first_index = c->c;
+                draw.vertex_offset = (int32_t)(int64_t)c->off;
             } else {
-                uint64_t off = 0;
-                id<MTLBuffer> ib = buffer_at(d, g->ib.va, &off);
-                if (!ib) { vx_log("D3D12: an indexed draw without an index buffer"); break; }
-                int i32 = g->ib.format == 42;                       // DXGI_FORMAT_R32_UINT (else R16_UINT)
-                [re drawIndexedPrimitives:g->prim indexCount:c->a indexType:i32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:ib
-                        indexBufferOffset:off + (uint64_t)c->c * (i32 ? 4 : 2) instanceCount:instances baseVertex:(NSInteger)(int64_t)c->off baseInstance:(NSUInteger)c->off2];
+                draw.vertex_count = c->a;
+                draw.first_vertex = c->c;
             }
+            gpu_ir_access_list12 accesses = { 0 };
+            pthread_mutex_lock(&d->lock);
+            int access_rc = gpu_ir_collect_draw_accesses12(d, pso, g, graphics, heap, sheap, &accesses, draw.indexed);
+            pthread_mutex_unlock(&d->lock);
+            int rc;
+            if (access_rc == GPU_IR_OK) {
+                if (c->gpu_ir_recorded)
+                    rc = gpu_ir_execute_with_accesses(&l->gpu_ir, c->gpu_ir_index, &backend, accesses.values, accesses.count);
+                else if (c->gpu_ir_transient)
+                    rc = gpu_ir_execute_transient_draw(pso->gpu_pipeline, &draw, accesses.values, accesses.count, &backend);
+                else
+                    rc = d3d12_gpu_ir_draw(&context, pso->gpu_pipeline, &draw, accesses.values, accesses.count);
+            } else {
+                vx_log("D3D12: common IR could not collect draw resource accesses (error %d); keeping conservative Metal residency",
+                       access_rc);
+                if (c->gpu_ir_recorded) rc = gpu_ir_execute(&l->gpu_ir, c->gpu_ir_index, &backend);
+                else rc = d3d12_gpu_ir_draw(&context, pso->gpu_pipeline, &draw, NULL, 0);
+            }
+            gpu_ir_access_list_release12(&accesses);
+            if (rc != GPU_IR_OK) vx_log("D3D12: common GPU IR draw failed (error %d)", rc);
             break;
         }
         case C_DISPATCH: {
             if (!pso || !pso->compute) { vx_log("D3D12: Dispatch without a compute pipeline state"); break; }
+            if (c->gpu_ir_recorded || c->gpu_ir_transient) {
+                d3d12_dispatch_context context = {
+                    .device = d, .command_buffer = (__bridge void *)cb,
+                    .compute_encoder = &ce, .blit_encoder = &be, .render_encoder = &re,
+                    .resident_resources = (__bridge void *)resident, .graphics_state = g,
+                    .api_pipeline = pso, .resource_heap = heap, .sampler_heap = sheap,
+                    .compute_root = compute, .scratch_buffer = sc
+                };
+                gpu_ir_backend backend = { .context = &context, .dispatch = d3d12_gpu_ir_dispatch };
+                gpu_ir_access_list12 accesses = { 0 };
+                pthread_mutex_lock(&d->lock);
+                int access_rc = gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
+                                                                  compute, heap, sheap, &accesses);
+                pthread_mutex_unlock(&d->lock);
+                int rc;
+                if (access_rc == GPU_IR_OK) {
+                    if (c->gpu_ir_recorded)
+                        rc = gpu_ir_execute_with_accesses(&l->gpu_ir, c->gpu_ir_index, &backend,
+                                                          accesses.values, accesses.count);
+                    else
+                        rc = gpu_ir_execute_transient_dispatch(pso->gpu_pipeline, c->a, c->b, c->c,
+                                                               accesses.values, accesses.count, &backend);
+                } else {
+                    vx_log("D3D12: common IR could not collect dispatch resource accesses (error %d); keeping conservative Metal residency",
+                           access_rc);
+                    if (c->gpu_ir_recorded) rc = gpu_ir_execute(&l->gpu_ir, c->gpu_ir_index, &backend);
+                    else rc = d3d12_gpu_ir_dispatch(&context, pso->gpu_pipeline, c->a, c->b, c->c, NULL, 0);
+                }
+                gpu_ir_access_list_release12(&accesses);
+                if (rc != GPU_IR_OK) vx_log("D3D12: common GPU IR dispatch failed (error %d)", rc);
+                break;
+            }
             if (be) { [be endEncoding]; be = nil; }
             close_pass(d, g, cb, &re);
             if (!ce) {
@@ -1778,20 +7202,284 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
             [ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
             break;
         }
-        case C_UAV_BARRIER:
-            if (ce) [ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+        case C_EXECUTE_INDIRECT: {
+            command_signature12 *sig = c->obj;
+            res12 *arg_buffer = c->obj2, *count_buffer = c->obj3;
+            if (!sig) { vx_log("D3D12: ExecuteIndirect has no command signature"); break; }
+            root_binding *indirect_root = sig->gfx ? graphics : compute;
+            uint32_t indirect_count = c->a;
+            if (!sig || !arg_buffer || !arg_buffer->buffer ||
+                (sig->root && indirect_root->rs != sig->root)) {
+                vx_log("D3D12: ExecuteIndirect has an invalid command signature, argument buffer, or root signature");
+                break;
+            }
+            // A fixed-signature dispatch range stays on the GPU, including count-buffer clamping. Keep the broader
+            // root-update path below for signatures that cannot be represented by the API-neutral range operation.
+            if (indirect_count && (!count_buffer || count_buffer->gpu_buffer) && !sig->gfx && !sig->root && sig->count == 1 &&
+                sig->payload_size == 12 && sig->args[0].type == INDIRECT_DISPATCH &&
+                sig->args[0].payload_offset == 0 && c->gpu_ir_recorded && pso && pso->compute &&
+                pso->gpu_pipeline && arg_buffer->gpu_buffer) {
+                d3d12_dispatch_context context = {
+                    .device = d, .command_buffer = (__bridge void *)cb,
+                    .compute_encoder = &ce, .blit_encoder = &be, .render_encoder = &re,
+                    .resident_resources = (__bridge void *)resident, .graphics_state = g,
+                    .api_pipeline = pso, .resource_heap = heap, .sampler_heap = sheap,
+                    .compute_root = compute, .scratch_buffer = sc
+                };
+                gpu_ir_backend backend = { .context = &context,
+                    .dispatch_indirect_range = d3d12_gpu_ir_dispatch_indirect_range };
+                gpu_ir_access_list12 accesses = { 0 };
+                pthread_mutex_lock(&d->lock);
+                int access_rc = gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
+                                                                  indirect_root, heap, sheap, &accesses);
+                pthread_mutex_unlock(&d->lock);
+                int rc = access_rc == GPU_IR_OK ?
+                    gpu_ir_execute_with_accesses(&l->gpu_ir, c->gpu_ir_index, &backend,
+                                                 accesses.values, accesses.count) : access_rc;
+                gpu_ir_access_list_release12(&accesses);
+                if (rc == GPU_IR_OK) {
+                    if (vx_trace) vx_log("D3D12: ExecuteIndirect %u dispatch records%s used GPU-side Metal indirect arguments",
+                                          indirect_count, count_buffer ? " with count-buffer clamping" : "");
+                    break;
+                }
+                if (access_rc != GPU_IR_OK) {
+                    vx_log("D3D12: native indirect-dispatch access collection failed (error %d); using conservative residency",
+                           access_rc);
+                    rc = gpu_ir_execute(&l->gpu_ir, c->gpu_ir_index, &backend);
+                    if (rc == GPU_IR_OK) break;
+                }
+                vx_log("D3D12: native indirect-dispatch lowering failed (error %d); using the compatibility path", rc);
+            }
+            if (indirect_count && (!count_buffer || count_buffer->gpu_buffer) && sig->gfx && !sig->root && sig->count == 1 &&
+                (sig->args[0].type == INDIRECT_DRAW || sig->args[0].type == INDIRECT_DRAW_INDEXED) &&
+                sig->payload_size == sig->args[0].size && c->gpu_ir_recorded && arg_buffer->gpu_buffer &&
+                pso && pso->render && pso->gpu_pipeline) {
+                int indexed = sig->args[0].type == INDIRECT_DRAW_INDEXED;
+                if (!open_render_pass12(d, g, cb, &ce, &be, &re, resident, heap)) {
+                    vx_log("D3D12: could not open a render pass for ExecuteIndirect");
+                    break;
+                }
+                d3d12_draw_context context = {
+                    .device = d, .command_buffer = (__bridge void *)cb,
+                    .compute_encoder = &ce, .blit_encoder = &be,
+                    .resident_resources = (__bridge void *)resident,
+                    .render_encoder = &re, .graphics_state = g, .api_pipeline = pso,
+                    .resource_heap = heap, .sampler_heap = sheap, .graphics_root = graphics, .scratch_buffer = sc
+                };
+                gpu_ir_backend backend = { .context = &context, .draw_indirect = d3d12_gpu_ir_draw_indirect };
+                gpu_ir_access_list12 accesses = { 0 };
+                pthread_mutex_lock(&d->lock);
+                int access_rc = gpu_ir_collect_draw_accesses12(d, pso, g, graphics, heap, sheap, &accesses, indexed);
+                pthread_mutex_unlock(&d->lock);
+                int rc = access_rc == GPU_IR_OK ?
+                    gpu_ir_execute_with_accesses(&l->gpu_ir, c->gpu_ir_index, &backend,
+                                                 accesses.values, accesses.count) : access_rc;
+                gpu_ir_access_list_release12(&accesses);
+                if (rc == GPU_IR_OK) {
+                    if (vx_trace) vx_log("D3D12: ExecuteIndirect %u draw records used Metal indirect arguments without CPU readback",
+                                          indirect_count);
+                    break;
+                }
+                if (access_rc != GPU_IR_OK) {
+                    vx_log("D3D12: native indirect-draw access collection failed (error %d); using conservative residency",
+                           access_rc);
+                    rc = gpu_ir_execute(&l->gpu_ir, c->gpu_ir_index, &backend);
+                    if (rc == GPU_IR_OK) break;
+                }
+                vx_log("D3D12: native indirect draw lowering failed (error %d); using the compatibility path", rc);
+            }
+            uint32_t available = 0;
+            const uint8_t *data = NULL;
+            id<MTLBuffer> __strong indirect_readback = nil;
+            int gpu_records_readback = 0;
+            int cpu_status = d3d12_indirect_cpu_records12(c, sig, arg_buffer, count_buffer, &available, &data);
+            if (cpu_status == D3D12_INDIRECT_CPU_COUNT_UNREADABLE ||
+                cpu_status == D3D12_INDIRECT_CPU_ARGUMENT_UNREADABLE) {
+                int readback_status = d3d12_indirect_gpu_records12(d, queue, &cb, command_buffer,
+                    &ce, &be, &re, g, c, sig, arg_buffer, count_buffer,
+                    &available, &data, &indirect_readback);
+                if (readback_status > 0) {
+                    cpu_status = D3D12_INDIRECT_CPU_OK;
+                    gpu_records_readback = 1;
+                    if (vx_trace) vx_log("D3D12: staged %u ExecuteIndirect records from GPU-only buffers for compatibility replay",
+                                          available);
+                } else if (readback_status < 0) {
+                    replay_failed = 1;
+                    break;
+                } else {
+                    available = 0;
+                    data = NULL;
+                    vx_log("D3D12: ExecuteIndirect GPU readback allocation failed; skipping records and applying signature resets");
+                }
+            } else if (cpu_status == D3D12_INDIRECT_CPU_ARGUMENT_RANGE) {
+                vx_log("D3D12: ExecuteIndirect argument buffer is out of range");
+            }
+            int changes_indirect_state = sig->root != NULL;
+            for (uint32_t argument_index = 0; argument_index < sig->count; argument_index++)
+                if (sig->args[argument_index].type == INDIRECT_VERTEX_BUFFER ||
+                    sig->args[argument_index].type == INDIRECT_INDEX_BUFFER) changes_indirect_state = 1;
+            if (gpu_records_readback && changes_indirect_state && available) {
+                int validation_ready = c->replay_source_index != UINT32_MAX && state_shadows && state_count &&
+                    replay_indirect_override_reserve12(&indirect_overrides, &indirect_override_capacity,
+                                                       indirect_override_count + 1);
+                if (validation_ready) {
+                    indirect_overrides[indirect_override_count++] = (d3d12_indirect_validation_override12){
+                        .command_index = c->replay_source_index, .available = available, .records = data };
+                    resource_state_shadow12 *validated_shadows = NULL;
+                    uint32_t validated_count = 0;
+                    int validation_result = queue_validate_list_states12(d, queue_type, queue, l,
+                        indirect_overrides, indirect_override_count, &validated_shadows, &validated_count);
+                    if (validation_result == 1) {
+                        queue_discard_list_states12(*state_shadows, *state_count);
+                        *state_shadows = validated_shadows;
+                        *state_count = validated_count;
+                        [indirect_staging_buffers addObject:indirect_readback];
+                    } else {
+                        indirect_override_count--;
+                        available = 0;
+                        data = NULL;
+                        vx_log("D3D12: GPU-produced ExecuteIndirect records failed per-record resource-state validation; skipping records and applying signature resets");
+                        if (validated_shadows) queue_discard_list_states12(validated_shadows, validated_count);
+                    }
+                } else {
+                    available = 0;
+                    data = NULL;
+                    vx_log("D3D12: could not retain GPU-produced ExecuteIndirect validation data; skipping records and applying signature resets");
+                }
+            }
+            uint64_t generated64 = (uint64_t)available * sig->count + sig->count;
+            if (generated64 > UINT32_MAX || generated64 > SIZE_MAX / sizeof(cmd12)) {
+                vx_log("D3D12: ExecuteIndirect would expand to too many Metal commands");
+                break;
+            }
+            uint32_t generated_count = 0, capacity = (uint32_t)generated64;
+            cmd12 *generated = calloc(capacity, sizeof *generated);
+            if (!generated) {
+                vx_log("D3D12: could not expand ExecuteIndirect arguments");
+                break;
+            }
+            for (uint32_t j = 0; j < available; j++) {
+                const uint8_t *record = data + (uint64_t)j * sig->stride;
+                for (uint32_t k = 0; k < sig->count; k++) {
+                    const command_argument12 *a = &sig->args[k];
+                    const uint8_t *p = record + a->payload_offset;
+                    cmd12 *out = &generated[generated_count++];
+                    switch (a->type) {
+                    case INDIRECT_DRAW: {
+                        uint32_t v[4]; memcpy(v, p, sizeof v);
+                        out->op = C_DRAW; out->a = v[0]; out->b = v[1]; out->c = v[2]; out->off = v[3];
+                        out->gpu_ir_transient = 1;
+                        break;
+                    }
+                    case INDIRECT_DRAW_INDEXED: {
+                        uint32_t v[5]; memcpy(v, p, sizeof v);
+                        out->op = C_DRAW_INDEXED; out->a = v[0]; out->b = v[1]; out->c = v[2];
+                        out->off = (uint64_t)(int64_t)(int32_t)v[3]; out->off2 = v[4];
+                        out->gpu_ir_transient = 1;
+                        break;
+                    }
+                    case INDIRECT_DISPATCH: {
+                        uint32_t v[3]; memcpy(v, p, sizeof v);
+                        out->op = C_DISPATCH; out->a = v[0]; out->b = v[1]; out->c = v[2];
+                        out->gpu_ir_transient = 1;
+                        break;
+                    }
+                    case INDIRECT_VERTEX_BUFFER: {
+                        VBV view; memcpy(&view, p, sizeof view);
+                        out->op = C_VB; out->a = a->a; out->b = 1; memcpy(out->values, &view, sizeof view);
+                        break;
+                    }
+                    case INDIRECT_INDEX_BUFFER: {
+                        IBV view; memcpy(&view, p, sizeof view);
+                        out->op = C_IB; memcpy(out->values, &view, sizeof view);
+                        break;
+                    }
+                    case INDIRECT_CONSTANT:
+                        out->op = C_CONSTANTS; out->a = a->a; out->b = a->c; out->c = a->b; out->gfx = sig->gfx;
+                        memcpy(out->values, p, a->size);
+                        break;
+                    case INDIRECT_INCREMENTING_CONSTANT:
+                        out->op = C_CONSTANTS; out->a = a->a; out->b = 1; out->c = a->b; out->gfx = sig->gfx;
+                        out->values[0] = j;
+                        break;
+                    case INDIRECT_CBV: case INDIRECT_SRV: case INDIRECT_UAV:
+                        out->op = C_ROOT_VA; out->a = a->a; out->gfx = sig->gfx; memcpy(&out->va, p, sizeof out->va);
+                        break;
+                    default: break;
+                    }
+                }
+            }
+            for (uint32_t j = 0; j < generated_count; j++) generated[j].replay_source_index = UINT32_MAX;
+            // D3D12 defines the bindings touched by a signature as null/zero after the indirect commands.
+            for (uint32_t k = 0; k < sig->count; k++) {
+                const command_argument12 *a = &sig->args[k];
+                if (a->type != INDIRECT_VERTEX_BUFFER && a->type != INDIRECT_INDEX_BUFFER &&
+                    a->type != INDIRECT_CONSTANT && a->type != INDIRECT_INCREMENTING_CONSTANT &&
+                    a->type != INDIRECT_CBV && a->type != INDIRECT_SRV && a->type != INDIRECT_UAV) continue;
+                cmd12 *out = &generated[generated_count++];
+                switch (a->type) {
+                case INDIRECT_VERTEX_BUFFER: out->op = C_VB; out->a = a->a; out->b = 1; break;
+                case INDIRECT_INDEX_BUFFER: out->op = C_IB; break;
+                case INDIRECT_CONSTANT:
+                    out->op = C_CONSTANTS; out->a = a->a; out->b = a->c; out->c = a->b; out->gfx = sig->gfx; break;
+                case INDIRECT_INCREMENTING_CONSTANT:
+                    out->op = C_CONSTANTS; out->a = a->a; out->b = 1; out->c = a->b; out->gfx = sig->gfx; break;
+                case INDIRECT_CBV: case INDIRECT_SRV: case INDIRECT_UAV:
+                    out->op = C_ROOT_VA; out->a = a->a; out->gfx = sig->gfx; break;
+                }
+            }
+            if (!replay_insert(&commands, &command_count, i + 1, generated, generated_count))
+                vx_log("D3D12: could not insert expanded ExecuteIndirect commands");
+            free(generated);
             break;
-        case C_COPY_BUFFER: case C_COPY_RESOURCE: case C_COPY_TEXTURE: {
+        }
+        case C_WRITE_BUFFER_IMMEDIATE: {
+            for (uint32_t write_index = 0; write_index < c->a; write_index++) {
+                const write_buffer_immediate12 *write = &c->immediate_writes[write_index];
+                close_pass(d, g, cb, &re);
+                if (write->mode) end_encoders(&ce, &be, &re);
+                else if (ce) { [ce endEncoding]; ce = nil; }
+                if (!be) be = [cb blitCommandEncoder];
+                size_t source_offset = 0;
+                if (!be || !scratch_alloc(d, sc, sizeof write->value, &source_offset)) {
+                    vx_log("D3D12: could not stage a WriteBufferImmediate value");
+                    replay_failed = 1;
+                    break;
+                }
+                memcpy((uint8_t *)sc->buf.contents + source_offset, &write->value, sizeof write->value);
+                [be copyFromBuffer:sc->buf sourceOffset:source_offset toBuffer:write->resource->buffer
+                  destinationOffset:(NSUInteger)write->offset size:sizeof write->value];
+            }
+            break;
+        }
+        case C_GPU_IR: {
+            close_pass(d, g, cb, &re);
+            uint32_t kind = gpu_ir_command_kind(&l->gpu_ir, c->a);
+            if (kind == GPU_IR_COMMAND_BARRIER || kind == GPU_IR_COMMAND_RESOLVE_TEXTURE) end_encoders(&ce, &be, &re);
+            else {
+                if (ce) { [ce endEncoding]; ce = nil; }
+                if (!be) be = [cb blitCommandEncoder];
+            }
+            gpu_ir_backend backend = {
+                .context = kind == GPU_IR_COMMAND_BARRIER ? NULL :
+                           kind == GPU_IR_COMMAND_RESOLVE_TEXTURE ? (__bridge void *)cb : (__bridge void *)be,
+                .copy_resource = d3d12_gpu_ir_copy_resource,
+                .copy_buffer = d3d12_gpu_ir_copy_buffer,
+                .copy_texture = d3d12_gpu_ir_copy_texture,
+                .resolve_texture = d3d12_gpu_ir_resolve_texture,
+                .barrier = d3d12_gpu_ir_barrier
+            };
+            int rc = gpu_ir_execute(&l->gpu_ir, c->a, &backend);
+            if (rc != GPU_IR_OK) vx_log("D3D12: common GPU IR command failed (error %d)", rc);
+            break;
+        }
+        case C_COPY_RESOURCE: case C_COPY_TEXTURE: {
             if (ce) { [ce endEncoding]; ce = nil; }
             close_pass(d, g, cb, &re);
             if (!be) be = [cb blitCommandEncoder];
-            if (c->op == C_COPY_BUFFER) {
+            if (c->op == C_COPY_RESOURCE) {
                 res12 *dst = c->obj, *src = c->obj2;
-                if (dst->buffer && src->buffer) [be copyFromBuffer:src->buffer sourceOffset:c->off2 toBuffer:dst->buffer destinationOffset:c->off size:c->size];
-            } else if (c->op == C_COPY_RESOURCE) {
-                res12 *dst = c->obj, *src = c->obj2;
-                if (dst->buffer && src->buffer) [be copyFromBuffer:src->buffer sourceOffset:0 toBuffer:dst->buffer destinationOffset:0 size:MIN(dst->buffer.length, src->buffer.length)];
-                else if (dst->texture && src->texture) [be copyFromTexture:src->texture toTexture:dst->texture];
+                if (dst->texture && src->texture) [be copyFromTexture:src->texture toTexture:dst->texture];
             } else {
                 res12 *dst = c->dst.res, *src = c->src.res;
                 // D3D12_TEXTURE_COPY_TYPE: 0 subresource index, 1 placed footprint
@@ -1820,56 +7508,766 @@ static void replay(dev12 *d, list12 *l, id<MTLCommandBuffer> cb, scratch *sc) {
             break;
         }
         }
+        if (replay_failed) break;
+    }
+    if (replay_failed) {
+        close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
+        free(indirect_overrides);
+        free(commands); free(compute); free(graphics); free(g);
+        *command_buffer = cb;
+        return 0;
     }
     close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
+    free(indirect_overrides);
+    free(commands);
     free(compute);
     free(graphics);
     free(g);
+    *command_buffer = cb;
+    return 1;
 }
 
 // ---- queues -----------------------------------------------------------------------------------------------------------
 
-static void queue_destroy(d3d_object *o) { release_dev(o); }
+static void queue_destroy(d3d_object *o) {
+    ((queue12 *)o)->mtl_queue = nil;
+    release_dev(o);
+}
 static WINAPI HRESULT queue_query(void *this, const GUID *iid, void **out) {
     const GUID *k[] = { &IID_ID3D12CommandQueue, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
     return query(this, iid, out, k, 4);
 }
 
+static int queue_supports_list_type12(int32_t queue_type, int32_t list_type) {
+    if (list_type == 1) return 0; // Bundles execute only through ExecuteBundle on a direct list.
+    if (queue_type == 0) return list_type == 0 || list_type == 2 || list_type == 3;
+    if (queue_type == 2) return list_type == 2 || list_type == 3;
+    if (queue_type == 3) return list_type == 3;
+    return 0;
+}
+
+static int queue_query_command_allowed12(dev12 *device, int32_t queue_type, const cmd12 *command) {
+    queryheap12 *query = command ? command->obj : NULL;
+    if (!device || !query || query->dev != device || !__atomic_load_n(&query->residency_refs, __ATOMIC_RELAXED)) return 0;
+    if (command->op == C_BEGIN_QUERY || command->op == C_END_QUERY) {
+        if (command->b >= query->count) return 0;
+        if (query->type == 0)
+            return queue_type == 0 && command->a <= 1;
+        if (command->op == C_BEGIN_QUERY) return 0; // D3D12 timestamps are written by EndQuery only.
+        if (query->type == 1)
+            return queue_type != 3 && command->a == 2;
+        if (query->type == 5)
+            return queue_type == 3 && command->a == 2 && d3d12_copy_timestamp_counters_supported12(device);
+        if (query->type == 2) return queue_type != 3 && command->a == 3;
+        if (query->type == 3) return queue_type != 3 && command->a >= 4 && command->a <= 7;
+        return 0;
+    }
+    if (command->op == C_RESOLVE_QUERY) {
+        if (command->b > query->count || command->c > query->count - command->b) return 0;
+        if (query->type == 0)
+            return queue_type == 0 && command->a <= 1;
+        if (query->type == 1)
+            return queue_type != 3 && command->a == 2;
+        if (query->type == 5)
+            return queue_type == 3 && command->a == 2 && d3d12_copy_timestamp_counters_supported12(device);
+        if (query->type == 2) return queue_type != 3 && command->a == 3;
+        if (query->type == 3) return queue_type != 3 && command->a >= 4 && command->a <= 7;
+        return queue_type != 3;
+    }
+    return 0;
+}
+
+static int queue_command_allowed12(dev12 *device, int32_t queue_type, int32_t list_type, const cmd12 *command) {
+    int graphics_command = 0;
+    switch (command->op) {
+    case C_CLEAR_RTV: case C_CLEAR_DSV: case C_DRAW: case C_DRAW_INDEXED:
+    case C_TARGETS: case C_VIEWPORTS: case C_SCISSORS: case C_TOPOLOGY:
+    case C_VB: case C_IB: case C_BLEND_FACTOR: case C_STENCIL_REF:
+        graphics_command = 1;
+        break;
+    default:
+        break;
+    }
+    if (graphics_command && (queue_type != 0 || list_type != 0)) return 0;
+    if ((command->op == C_BUNDLE_BEGIN || command->op == C_BUNDLE_END) && (queue_type != 0 || list_type != 0)) return 0;
+    if (list_type == 3) {
+        if (command->op == C_WRITE_BUFFER_IMMEDIATE) return 1;
+        if (command->op == C_END_QUERY || command->op == C_RESOLVE_QUERY) {
+            int allowed = queue_type == 3 && queue_query_command_allowed12(device, queue_type, command);
+            if (!allowed) vx_log("D3D12: copy-list query command rejected (op %u, heap type %d, query type %u, queue %d)",
+                                 command->op, command->obj ? ((queryheap12 *)command->obj)->type : -1,
+                                 command->a, queue_type);
+            return allowed;
+        }
+        if (command->op != C_GPU_IR) return 0;
+        if (command->b == UINT32_MAX)
+            return command->gfx >= D3D12_TRACK_COPY_BUFFER && command->gfx <= D3D12_TRACK_COPY_TEXTURE;
+        if (command->b == 0)
+            return state_queue_access_allowed12((uint32_t)command->off, 3) &&
+                   state_queue_access_allowed12((uint32_t)command->off2, 3);
+        return command->b == 1; // aliasing barriers
+    }
+    if (queue_type == 3) {
+        switch (command->op) {
+        case C_DISPATCH: case C_CLEAR_UAV: case C_EXECUTE_INDIRECT: case C_BEGIN_QUERY:
+            return 0;
+        default:
+            break;
+        }
+    }
+    if (list_type == 2 && command->op == C_EXECUTE_INDIRECT &&
+        (!command->obj || ((command_signature12 *)command->obj)->gfx)) return 0;
+    if (queue_type == 2 && command->op == C_EXECUTE_INDIRECT &&
+        (!command->obj || ((command_signature12 *)command->obj)->gfx)) return 0;
+    if (command->op == C_GPU_IR && command->b == UINT32_MAX && command->gfx == D3D12_TRACK_RESOLVE &&
+        (queue_type != 0 || list_type != 0))
+        return 0;
+    if (command->op == C_GPU_IR && command->b == 2 && queue_type == 3) return 0; // UAV barriers are not copy-queue work.
+    if (command->op == C_BEGIN_QUERY || command->op == C_END_QUERY || command->op == C_RESOLVE_QUERY) {
+        int allowed = queue_query_command_allowed12(device, queue_type, command);
+        if (!allowed) vx_log("D3D12: query command rejected (op %u, heap type %d, query type %u, queue %d)",
+                             command->op, command->obj ? ((queryheap12 *)command->obj)->type : -1,
+                             command->a, queue_type);
+        return allowed;
+    }
+    return 1;
+}
+
+static int queue_validate_graphics_draw12(dev12 *device, int32_t queue_type,
+                                          resource_state_shadow12 **shadows, uint32_t *count, uint32_t *capacity,
+                                          const VBV vertex_buffers[16], const IBV *index_buffer,
+                                          pso12 *pipeline, root_binding *graphics,
+                                          heap12 *resource_heap, heap12 *sampler_heap,
+                                          res12 *const targets[9], uint32_t target_count,
+                                          const uint32_t target_subresources[9],
+                                          const uint32_t target_flags[9], int indexed) {
+    for (uint32_t k = 0; k < 16; k++) {
+        if (!vertex_buffers[k].va && !vertex_buffers[k].size) continue;
+        res12 *resource = state_resource_for_gpu_range_locked12(device, vertex_buffers[k].va, vertex_buffers[k].size);
+        if (!resource) return 0;
+        int use_result = state_validate_resource_use_desc12(device, queue_type, shadows, count, capacity,
+            resource, 0, D3D12_STATE_VERTEX_CONSTANT, 0);
+        if (use_result <= 0) return use_result < 0 ? -1 : 0;
+    }
+    if (indexed) {
+        res12 *resource = state_resource_for_gpu_range_locked12(device, index_buffer->va, index_buffer->size);
+        if (!resource) return 0;
+        int use_result = state_validate_resource_use_desc12(device, queue_type, shadows, count, capacity,
+            resource, 0, D3D12_STATE_INDEX, 0);
+        if (use_result <= 0) return use_result < 0 ? -1 : 0;
+    }
+    if (pipeline) {
+        if (!shader_root_signature_valid12(device, &pipeline->vs, graphics->rs) ||
+            !shader_root_signature_valid12(device, &pipeline->ps, graphics->rs)) return 0;
+        int use_result = state_validate_shader_stage12(device, queue_type, shadows, count, capacity,
+            &pipeline->vs, graphics->rs, &graphics->st, resource_heap, sampler_heap);
+        if (use_result <= 0) return use_result < 0 ? -1 : 0;
+        use_result = state_validate_shader_stage12(device, queue_type, shadows, count, capacity,
+            &pipeline->ps, graphics->rs, &graphics->st, resource_heap, sampler_heap);
+        if (use_result <= 0) return use_result < 0 ? -1 : 0;
+    }
+    for (uint32_t k = 0; k < target_count; k++) {
+        if (!targets[k]) continue;
+        int use_result = state_validate_resource_use_desc12(device, queue_type, shadows, count, capacity,
+            targets[k], target_subresources[k], D3D12_STATE_RENDER_TARGET, 1);
+        if (use_result <= 0) return use_result < 0 ? -1 : 0;
+    }
+    if (pipeline && targets[8] && (pipeline->depth_enable || pipeline->stencil_enable)) {
+        int depth_write = pipeline->depth_enable && pipeline->depth_write;
+        int stencil_write = pipeline->stencil_enable && pipeline->stencil_write;
+        if ((depth_write && (target_flags[8] & 1u)) || (stencil_write && (target_flags[8] & 2u))) return 0;
+        uint32_t required = depth_write || stencil_write ? D3D12_STATE_DEPTH_WRITE : D3D12_STATE_DEPTH_READ;
+        int use_result = state_validate_resource_use_desc12(device, queue_type, shadows, count, capacity,
+            targets[8], target_subresources[8], required, required == D3D12_STATE_DEPTH_WRITE);
+        if (use_result <= 0) return use_result < 0 ? -1 : 0;
+    }
+    return 1;
+}
+
+static int queue_validate_indirect_state12(dev12 *device, int32_t queue_type,
+                                           resource_state_shadow12 **shadows, uint32_t *count, uint32_t *capacity,
+                                           id<MTLCommandQueue> metal_queue, const list12 *list, uint32_t command_index,
+                                           const d3d12_indirect_validation_override12 *overrides,
+                                           uint32_t override_count,
+                                           const cmd12 *command, const command_signature12 *signature,
+                                           res12 *arguments, res12 *count_buffer, root_binding *compute,
+                                           root_binding *graphics, VBV vertex_buffers[16], IBV *index_buffer,
+                                           pso12 *pipeline, heap12 *resource_heap, heap12 *sampler_heap,
+                                           res12 *const targets[9], uint32_t target_count,
+                                           const uint32_t target_subresources[9], const uint32_t target_flags[9]) {
+    uint32_t available = 0;
+    const uint8_t *records = NULL;
+    int read_status = D3D12_INDIRECT_CPU_ARGUMENT_UNREADABLE;
+    for (uint32_t i = 0; i < override_count; i++) {
+        if (overrides[i].command_index != command_index) continue;
+        available = overrides[i].available;
+        records = overrides[i].records;
+        read_status = D3D12_INDIRECT_CPU_OK;
+        break;
+    }
+    if (read_status != D3D12_INDIRECT_CPU_OK)
+        read_status = d3d12_indirect_cpu_records12(command, signature, arguments, count_buffer,
+                                                   &available, &records);
+    id<MTLBuffer> __strong staged_records = nil;
+    if ((read_status == D3D12_INDIRECT_CPU_COUNT_UNREADABLE ||
+         read_status == D3D12_INDIRECT_CPU_ARGUMENT_UNREADABLE) &&
+        !d3d12_indirect_has_prior_gpu_work12(list, command_index)) {
+        int staged = d3d12_indirect_preflight_gpu_records12(metal_queue, command, signature, arguments,
+            count_buffer, &available, &records, &staged_records);
+        if (staged) read_status = D3D12_INDIRECT_CPU_OK;
+    }
+    // If this list has already issued GPU work, replay reads producer data only after that prefix completes,
+    // then re-runs this validator with the staged records before expanding any indirect commands.
+    if (read_status != D3D12_INDIRECT_CPU_OK) available = 0;
+    root_binding *binding = signature->gfx ? graphics : compute;
+    for (uint32_t record_index = 0; record_index < available; record_index++) {
+        const uint8_t *record = records + (uint64_t)record_index * signature->stride;
+        for (uint32_t argument_index = 0; argument_index < signature->count; argument_index++) {
+            const command_argument12 *argument = &signature->args[argument_index];
+            const uint8_t *payload = record + argument->payload_offset;
+            switch (argument->type) {
+            case INDIRECT_VERTEX_BUFFER:
+                if (argument->a >= 16) return 0;
+                memcpy(&vertex_buffers[argument->a], payload, sizeof vertex_buffers[argument->a]);
+                break;
+            case INDIRECT_INDEX_BUFFER:
+                memcpy(index_buffer, payload, sizeof *index_buffer);
+                break;
+            case INDIRECT_CONSTANT:
+                if (argument->a >= 64 || argument->b > 64 || argument->c > 64 - argument->b) return 0;
+                memcpy(&binding->st.constants[argument->a][argument->b], payload, (size_t)argument->c * sizeof(uint32_t));
+                break;
+            case INDIRECT_INCREMENTING_CONSTANT:
+                if (argument->a >= 64 || argument->b >= 64) return 0;
+                binding->st.constants[argument->a][argument->b] = record_index;
+                break;
+            case INDIRECT_CBV: case INDIRECT_SRV: case INDIRECT_UAV:
+                if (argument->a >= 64) return 0;
+                memcpy(&binding->st.root_va[argument->a], payload, sizeof(uint64_t));
+                break;
+            default:
+                break;
+            }
+        }
+
+        const command_argument12 *operation = &signature->args[signature->count - 1];
+        const uint8_t *payload = record + operation->payload_offset;
+        int use_result = 1;
+        if (operation->type == INDIRECT_DRAW) {
+            uint32_t draw[4];
+            memcpy(draw, payload, sizeof draw);
+            if (draw[0] && draw[1])
+                use_result = queue_validate_graphics_draw12(device, queue_type, shadows, count, capacity,
+                    vertex_buffers, index_buffer, pipeline, graphics, resource_heap, sampler_heap,
+                    targets, target_count, target_subresources, target_flags, 0);
+        } else if (operation->type == INDIRECT_DRAW_INDEXED) {
+            uint32_t draw[5];
+            memcpy(draw, payload, sizeof draw);
+            if (draw[0] && draw[1])
+                use_result = queue_validate_graphics_draw12(device, queue_type, shadows, count, capacity,
+                    vertex_buffers, index_buffer, pipeline, graphics, resource_heap, sampler_heap,
+                    targets, target_count, target_subresources, target_flags, 1);
+        } else if (operation->type == INDIRECT_DISPATCH && pipeline && pipeline->compute) {
+            uint32_t dispatch[3];
+            memcpy(dispatch, payload, sizeof dispatch);
+            if (dispatch[0] && dispatch[1] && dispatch[2]) {
+                if (!shader_root_signature_valid12(device, &pipeline->msl, compute->rs)) use_result = 0;
+                else use_result = state_validate_shader_stage12(device, queue_type, shadows, count, capacity,
+                    &pipeline->msl, compute->rs, &compute->st, resource_heap, sampler_heap);
+            }
+        }
+        if (use_result <= 0) return use_result;
+    }
+
+    // ExecuteIndirect clears every root argument and IA binding named by its signature, even for zero commands.
+    for (uint32_t argument_index = 0; argument_index < signature->count; argument_index++) {
+        const command_argument12 *argument = &signature->args[argument_index];
+        switch (argument->type) {
+        case INDIRECT_VERTEX_BUFFER:
+            if (argument->a >= 16) return 0;
+            memset(&vertex_buffers[argument->a], 0, sizeof vertex_buffers[argument->a]);
+            break;
+        case INDIRECT_INDEX_BUFFER:
+            memset(index_buffer, 0, sizeof *index_buffer);
+            break;
+        case INDIRECT_CONSTANT:
+            if (argument->a >= 64 || argument->b > 64 || argument->c > 64 - argument->b) return 0;
+            memset(&binding->st.constants[argument->a][argument->b], 0, (size_t)argument->c * sizeof(uint32_t));
+            break;
+        case INDIRECT_INCREMENTING_CONSTANT:
+            if (argument->a >= 64 || argument->b >= 64) return 0;
+            binding->st.constants[argument->a][argument->b] = 0;
+            break;
+        case INDIRECT_CBV: case INDIRECT_SRV: case INDIRECT_UAV:
+            if (argument->a >= 64) return 0;
+            binding->st.root_va[argument->a] = 0;
+            break;
+        default:
+            break;
+        }
+    }
+    return 1;
+}
+
+// State advances in command-list submission order, because different threads may record lists concurrently and a
+// list can be submitted more than once. Work on a per-list shadow so a bad transition cannot partially corrupt the
+// resource state used to validate later submissions.
+static int queue_validate_list_states12(dev12 *device, int32_t queue_type, id<MTLCommandQueue> metal_queue,
+                                        list12 *list,
+                                        const d3d12_indirect_validation_override12 *overrides,
+                                        uint32_t override_count, resource_state_shadow12 **out_shadows,
+                                        uint32_t *out_count) {
+    if (!out_shadows || !out_count || !list->closed || list->validation_error) return 0;
+    *out_shadows = NULL;
+    *out_count = 0;
+    resource_state_shadow12 *shadows = NULL;
+    uint32_t count = 0, capacity = 0;
+    res12 *targets[9] = { 0 };
+    uint32_t target_subresources[9] = { 0 }, target_flags[9] = { 0 }, target_count = 0;
+    VBV vertex_buffers[16] = { 0 };
+    IBV index_buffer = { 0 };
+    root_binding compute = { 0 }, graphics = { 0 };
+    heap12 *resource_heap = NULL, *sampler_heap = NULL;
+    pso12 *pipeline = NULL;
+    heap12 *bundle_resource_heap = NULL, *bundle_sampler_heap = NULL;
+    uint32_t topology = 4;
+    int in_bundle = 0;
+    int result = 1;
+    pthread_mutex_lock(&device->lock);
+    for (uint32_t i = 0; i < list->n; i++) {
+        const cmd12 *command = &list->cmds[i];
+        if (!queue_command_allowed12(device, queue_type, list->type, command)) {
+            vx_log("D3D12: queue %d rejected command %u at index %u from list type %d",
+                   queue_type, command->op, i, list->type);
+            result = 0;
+            break;
+        }
+        if (command->op == C_BUNDLE_BEGIN) {
+            if (in_bundle) { result = 0; break; }
+            in_bundle = 1;
+            bundle_resource_heap = resource_heap;
+            bundle_sampler_heap = sampler_heap;
+            pipeline = NULL;
+            topology = 0;
+        } else if (command->op == C_BUNDLE_END) {
+            if (!in_bundle) { result = 0; break; }
+            in_bundle = 0;
+        } else if (in_bundle && command->op == C_HEAPS &&
+                   (command->obj != bundle_resource_heap || command->obj2 != bundle_sampler_heap)) {
+            result = 0;
+            break;
+        } else if (command->op == C_PSO) {
+            pipeline = command->obj;
+        } else if (command->op == C_ROOTSIG) {
+            root_binding *binding = command->gfx ? &graphics : &compute;
+            binding->rs = command->obj;
+            memset(&binding->st, 0, sizeof binding->st);
+        } else if (command->op == C_HEAPS) {
+            resource_heap = command->obj;
+            sampler_heap = command->obj2;
+        } else if (command->op == C_TOPOLOGY) {
+            topology = command->a;
+        } else if (command->op == C_TABLE) {
+            root_binding *binding = command->gfx ? &graphics : &compute;
+            if (command->a < 64) binding->st.table[command->a] = command->va;
+        } else if (command->op == C_CONSTANTS) {
+            root_binding *binding = command->gfx ? &graphics : &compute;
+            if (command->a < 64) for (uint32_t k = 0; k < command->b && command->c + k < 64; k++)
+                binding->st.constants[command->a][command->c + k] = command->values[k];
+        } else if (command->op == C_ROOT_VA) {
+            root_binding *binding = command->gfx ? &graphics : &compute;
+            if (command->a < 64) binding->st.root_va[command->a] = command->va;
+        } else if (command->op == C_TARGETS) {
+            target_count = command->a > 8 ? 8 : command->a;
+            for (uint32_t k = 0; k < 9; k++) {
+                targets[k] = command->resource[k];
+                target_subresources[k] = command->subresource[k];
+                target_flags[k] = command->view_flags[k];
+            }
+        } else if (command->op == C_VB) {
+            for (uint32_t k = 0; k < command->b && command->a + k < 16; k++)
+                memcpy(&vertex_buffers[command->a + k], (const VBV *)command->values + k, sizeof(VBV));
+        } else if (command->op == C_IB) {
+            memcpy(&index_buffer, command->values, sizeof index_buffer);
+        } else if (command->op == C_CLEAR_RTV && command->resource[0]) {
+            int use_result = state_validate_resource_use_desc12(device, queue_type, &shadows, &count, &capacity,
+                command->resource[0], command->subresource[0], D3D12_STATE_RENDER_TARGET, 1);
+            if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+        } else if (command->op == C_CLEAR_DSV) {
+            uint32_t clear_flags = command->a;
+            if (!command->resource[8] || !clear_flags || (clear_flags & ~3u) ||
+                ((clear_flags & 1u) && (command->view_flags[8] & 1u)) ||
+                ((clear_flags & 2u) && (command->view_flags[8] & 2u))) {
+                result = 0;
+                break;
+            }
+            int use_result = state_validate_resource_use_desc12(device, queue_type, &shadows, &count, &capacity,
+                command->resource[8], command->subresource[8], D3D12_STATE_DEPTH_WRITE, 1);
+            if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+        } else if (command->op == C_CLEAR_UAV) {
+            uint32_t cpu_index = 0, gpu_index = 0;
+            heap12 *cpu_heap = heap_cpu_descriptor((size_t)command->off, &cpu_index);
+            heap12 *gpu_heap = heap_gpu_descriptor(command->va, &gpu_index);
+            res12 *resource = command->resource[0];
+            if (!resource || resource->dev != device || !(resource->desc.Flags & 0x4u) ||
+                !cpu_heap || cpu_heap->desc.Type != 0 || cpu_heap->gpu || (cpu_heap->desc.Flags & 1u) ||
+                !gpu_heap || gpu_heap != resource_heap || gpu_heap->desc.Type != 0 || !gpu_heap->gpu ||
+                !(gpu_heap->desc.Flags & 1u) || !heap_uav_views_match12(cpu_heap, cpu_index, gpu_heap, gpu_index)) {
+                result = 0;
+                break;
+            }
+            shader_view12 *view = &gpu_heap->shader_view[gpu_index];
+            if (view->resource != resource) { result = 0; break; }
+            gpu_ir_buffer_view *buffer_view = gpu_heap->buffer_view ? gpu_heap->buffer_view[gpu_index] : NULL;
+            const gpu_ir_buffer_view_desc *buffer_desc = buffer_view ? gpu_ir_buffer_view_description(buffer_view) : NULL;
+            if (buffer_view && (!buffer_desc ||
+                buffer_desc->kind == GPU_IR_BUFFER_VIEW_STRUCTURED || command->b ||
+                (buffer_desc->kind == GPU_IR_BUFFER_VIEW_RAW && command->a))) {
+                // Structured buffers are incompatible with D3D12 ClearUnorderedAccessView*; raw
+                // buffers support Uint clears only, and buffer rectangles are invalid.
+                result = 0;
+                break;
+            }
+            int use_result = state_texture_view12(device, queue_type, &shadows, &count, &capacity,
+                view, D3D12_STATE_UAV, 1);
+            if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+        } else if ((command->op == C_DRAW && command->a && command->b) ||
+                   (command->op == C_DRAW_INDEXED && command->a && command->b)) {
+            if (!topology || topology > 5) { result = 0; break; }
+            int use_result = queue_validate_graphics_draw12(device, queue_type, &shadows, &count, &capacity,
+                vertex_buffers, &index_buffer, pipeline, &graphics, resource_heap, sampler_heap, targets,
+                target_count, target_subresources, target_flags, command->op == C_DRAW_INDEXED);
+            if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+        } else if (command->op == C_DISPATCH && pipeline) {
+            int use_result = shader_root_signature_valid12(device, &pipeline->msl, compute.rs) ?
+                state_validate_shader_stage12(device, queue_type, &shadows, &count, &capacity,
+                    &pipeline->msl, compute.rs, &compute.st, resource_heap, sampler_heap) : 0;
+            if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+        } else if (command->op == C_WRITE_BUFFER_IMMEDIATE) {
+            if (!command->a || !command->immediate_writes) { result = 0; break; }
+            for (uint32_t write_index = 0; write_index < command->a; write_index++) {
+                const write_buffer_immediate12 *write = &command->immediate_writes[write_index];
+                if (!write->resource || write->resource->dev != device || !write->resource->buffer ||
+                    (write->offset & 3u) || write->offset > write->resource->buffer.length ||
+                    sizeof write->value > write->resource->buffer.length - write->offset || write->mode > 2u) {
+                    result = 0;
+                    break;
+                }
+                int use_result = state_validate_resource_use_desc12(device, queue_type, &shadows, &count, &capacity,
+                    write->resource, 0, D3D12_STATE_COPY_DEST, 1);
+                if (use_result <= 0) {
+                    result = use_result < 0 ? -1 : 0;
+                    break;
+                }
+            }
+            if (result != 1) break;
+        } else if (command->op == C_GPU_IR && command->b == 0) {
+            res12 *resource = command->obj;
+            if (!resource || resource->dev != device || !resource_resident12(resource)) { result = 0; break; }
+            if (!state_queue_access_allowed12((uint32_t)command->off, queue_type) ||
+                !state_queue_access_allowed12((uint32_t)command->off2, queue_type)) { result = 0; break; }
+            resource_state_shadow12 *shadow = state_shadow_get12(&shadows, &count, &capacity, resource);
+            if (!shadow) { result = -1; break; }
+            int transition_result = state_transition12(shadow, command->c, (uint32_t)command->off,
+                                                       (uint32_t)command->off2, (uint32_t)command->gfx);
+            if (transition_result <= 0) { result = transition_result < 0 ? -1 : 0; break; }
+        } else if (command->op == C_GPU_IR && command->b == UINT32_MAX &&
+                   command->gfx >= D3D12_TRACK_COPY_BUFFER && command->gfx <= D3D12_TRACK_RESOLVE) {
+            uint32_t src_state = command->gfx == D3D12_TRACK_RESOLVE ? D3D12_STATE_RESOLVE_SOURCE : D3D12_STATE_COPY_SOURCE;
+            uint32_t dst_state = command->gfx == D3D12_TRACK_RESOLVE ? D3D12_STATE_RESOLVE_DEST : D3D12_STATE_COPY_DEST;
+            uint32_t src_subresource = command->gfx == D3D12_TRACK_COPY_RESOURCE ? D3D12_ALL_SUBRESOURCES : command->c;
+            uint32_t dst_subresource = command->gfx == D3D12_TRACK_COPY_RESOURCE ? D3D12_ALL_SUBRESOURCES :
+                                       command->gfx == D3D12_TRACK_RESOLVE ? (uint32_t)command->off :
+                                       command->gfx == D3D12_TRACK_COPY_TEXTURE ? (uint32_t)command->off : 0;
+            int use_result = state_validate_resource_pair12(device, queue_type, &shadows, &count, &capacity,
+                command->obj, dst_subresource, dst_state, command->obj2, src_subresource, src_state);
+            if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+        } else if (command->op == C_COPY_RESOURCE) {
+            int use_result = state_validate_resource_pair12(device, queue_type, &shadows, &count, &capacity,
+                command->obj, D3D12_ALL_SUBRESOURCES, D3D12_STATE_COPY_DEST,
+                command->obj2, D3D12_ALL_SUBRESOURCES, D3D12_STATE_COPY_SOURCE);
+            if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+        } else if (command->op == C_COPY_TEXTURE) {
+            res12 *destination = command->dst.res, *source = command->src.res;
+            uint32_t dst_subresource = command->dst.type == 0 ? command->dst.subresource : 0;
+            uint32_t src_subresource = command->src.type == 0 ? command->src.subresource : 0;
+            int use_result = state_validate_resource_pair12(device, queue_type, &shadows, &count, &capacity,
+                destination, dst_subresource, D3D12_STATE_COPY_DEST,
+                source, src_subresource, D3D12_STATE_COPY_SOURCE);
+            if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+        } else if (command->op == C_RESOLVE_QUERY) {
+            queryheap12 *query = command->obj;
+            res12 *destination = command->obj2;
+            if (!query || query->dev != device || !destination || destination->dev != device ||
+                destination->desc.Dimension != 1 || !destination->buffer || (command->off & 7u)) {
+                vx_log("D3D12: ResolveQueryData parameters are invalid");
+                result = 0;
+                break;
+            }
+            uint64_t bytes = (uint64_t)command->c * query->stride;
+            if (command->off > destination->buffer.length || bytes > destination->buffer.length - command->off) {
+                vx_log("D3D12: ResolveQueryData output range is invalid");
+                result = 0;
+                break;
+            }
+            int use_result = state_validate_resource_use_desc12(device, queue_type, &shadows, &count, &capacity,
+                destination, 0, D3D12_STATE_COPY_DEST, 1);
+            if (use_result <= 0) {
+                vx_log("D3D12: ResolveQueryData destination is not in COPY_DEST (queue %d)", queue_type);
+                result = use_result < 0 ? -1 : 0;
+                break;
+            }
+        } else if (command->op == C_EXECUTE_INDIRECT) {
+            command_signature12 *signature = command->obj;
+            res12 *arguments = command->obj2, *count_buffer = command->obj3;
+            root_binding *indirect_root = signature && signature->gfx ? &graphics : &compute;
+            if (!signature || signature->dev != device ||
+                (signature->root && indirect_root->rs != signature->root) ||
+                !arguments || arguments->dev != device || arguments->desc.Dimension != 1 ||
+                !resource_resident12(arguments) ||
+                (count_buffer && (count_buffer->dev != device || count_buffer->desc.Dimension != 1 ||
+                                  !resource_resident12(count_buffer)))) {
+                result = 0;
+                break;
+            }
+            resource_state_shadow12 *arg_state = state_shadow_get12(&shadows, &count, &capacity, arguments);
+            resource_state_shadow12 *count_state = count_buffer ?
+                state_shadow_get12(&shadows, &count, &capacity, count_buffer) : NULL;
+            if (!arg_state || (count_buffer && !count_state)) { result = -1; break; }
+            arg_state = state_shadow_find12(shadows, count, arguments);
+            count_state = count_buffer ? state_shadow_find12(shadows, count, count_buffer) : NULL;
+            int arg_use = arg_state ? state_resource_use12(arg_state, 0, D3D12_STATE_INDIRECT, 0, queue_type) : 0;
+            int count_use = count_state ? state_resource_use12(count_state, 0, D3D12_STATE_INDIRECT, 0, queue_type) : 1;
+            if (!arg_state || (count_buffer && !count_state) || arg_use <= 0 || count_use <= 0) {
+                result = arg_use < 0 || count_use < 0 ? -1 : 0;
+                break;
+            }
+            if (command->a && (!count_buffer || count_buffer->gpu_buffer) && signature && signature->gfx && !signature->root &&
+                signature->count == 1 && signature->payload_size == signature->args[0].size &&
+                (signature->args[0].type == INDIRECT_DRAW || signature->args[0].type == INDIRECT_DRAW_INDEXED)) {
+                int use_result = queue_validate_graphics_draw12(device, queue_type, &shadows, &count, &capacity,
+                    vertex_buffers, &index_buffer, pipeline, &graphics, resource_heap, sampler_heap, targets,
+                    target_count, target_subresources, target_flags,
+                    signature->args[0].type == INDIRECT_DRAW_INDEXED);
+                if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+            }
+            if (command->a && signature && !signature->gfx && !signature->root && signature->count == 1 &&
+                signature->payload_size == signature->args[0].size &&
+                signature->args[0].type == INDIRECT_DISPATCH && pipeline && pipeline->compute) {
+                int use_result = shader_root_signature_valid12(device, &pipeline->msl, compute.rs) ?
+                    state_validate_shader_stage12(device, queue_type, &shadows, &count, &capacity,
+                        &pipeline->msl, compute.rs, &compute.st, resource_heap, sampler_heap) : 0;
+                if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+            }
+            int changes_indirect_state = signature->root != NULL;
+            for (uint32_t argument_index = 0; argument_index < signature->count; argument_index++)
+                if (signature->args[argument_index].type == INDIRECT_VERTEX_BUFFER ||
+                    signature->args[argument_index].type == INDIRECT_INDEX_BUFFER) changes_indirect_state = 1;
+            if (changes_indirect_state) {
+                int use_result = queue_validate_indirect_state12(device, queue_type, &shadows, &count, &capacity,
+                    metal_queue, list, i, overrides, override_count, command, signature, arguments, count_buffer,
+                    &compute, &graphics, vertex_buffers, &index_buffer,
+                    pipeline, resource_heap, sampler_heap, targets, target_count, target_subresources, target_flags);
+                if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
+            }
+        }
+    }
+    if (result == 1 && in_bundle) result = 0;
+    pthread_mutex_unlock(&device->lock);
+    if (result == 1) { *out_shadows = shadows; *out_count = count; }
+    else {
+        for (uint32_t i = 0; i < count; i++) state_shadow_clear12(&shadows[i]);
+        free(shadows);
+    }
+    return result;
+}
+static void queue_commit_list_states12(dev12 *device, resource_state_shadow12 *shadows, uint32_t count) {
+    pthread_mutex_lock(&device->lock);
+    for (uint32_t i = 0; i < count; i++) {
+        resource_state_shadow12 *shadow = &shadows[i];
+        res12 *resource = shadow->resource;
+        state_overrides_free12(resource->state_overrides);
+        state_pending_free12(resource->pending_transitions);
+        resource->initial_state = shadow->initial_state;
+        resource->initial_promoted = shadow->initial_promoted;
+        resource->state_overrides = shadow->overrides;
+        resource->pending_transitions = shadow->pending;
+        shadow->overrides = NULL;
+        shadow->pending = NULL;
+    }
+    pthread_mutex_unlock(&device->lock);
+    for (uint32_t i = 0; i < count; i++) state_shadow_clear12(&shadows[i]);
+    free(shadows);
+}
+static void queue_discard_list_states12(resource_state_shadow12 *shadows, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) state_shadow_clear12(&shadows[i]);
+    free(shadows);
+}
+
+static int queue_batch_touched_reserve12(res12 ***resources, uint32_t *capacity, uint32_t need) {
+    if (need <= *capacity) return 1;
+    if (need && sizeof **resources > SIZE_MAX / (size_t)need) return 0;
+    uint32_t next = *capacity ? *capacity : 16;
+    while (next < need) {
+        if (next > UINT32_MAX / 2) { next = need; break; }
+        next *= 2;
+    }
+    res12 **grown = realloc(*resources, (size_t)next * sizeof **resources);
+    if (!grown) return 0;
+    *resources = grown;
+    *capacity = next;
+    return 1;
+}
+
+static void resource_decay_promoted_reads12(res12 *resource) {
+    if (resource->initial_promoted && state_is_read_only12(resource->initial_state)) {
+        resource->initial_state = 0;
+        resource->initial_promoted = 0;
+    }
+    res_state_override12 **link = &resource->state_overrides;
+    while (*link) {
+        res_state_override12 *entry = *link;
+        if (entry->promoted && state_is_read_only12(entry->state)) {
+            entry->state = 0;
+            entry->promoted = 0;
+            if (entry->state == resource->initial_state && entry->promoted == resource->initial_promoted) {
+                *link = entry->next;
+                free(entry);
+                continue;
+            }
+        }
+        link = &entry->next;
+    }
+}
+
+static void queue_decay_batch_states12(dev12 *device, res12 *const *resources, uint32_t count,
+                                      int32_t queue_type) {
+    pthread_mutex_lock(&device->lock);
+    for (uint32_t i = 0; i < count; i++) {
+        res12 *resource = resources[i];
+        if (!resource || resource->pending_transitions) continue;
+        int whole_resource_decays = queue_type == 3 || resource->desc.Dimension == 1 ||
+                                    ((uint32_t)resource->desc.Flags & 0x20u);
+        if (whole_resource_decays) {
+            resource->initial_state = 0;
+            resource->initial_promoted = 0;
+            state_overrides_free12(resource->state_overrides);
+            resource->state_overrides = NULL;
+        } else {
+            resource_decay_promoted_reads12(resource);
+        }
+    }
+    pthread_mutex_unlock(&device->lock);
+}
+
 static WINAPI void queue_execute(void *this, uint32_t n, void *const *lists) {
     queue12 *q = this;
     dev12 *d = q->dev;
+    if (n && !lists) return;
+    res12 **batch_touched = NULL;
+    uint32_t batch_touched_count = 0, batch_touched_capacity = 0;
+    pthread_mutex_lock(&d->submit_lock);
     for (uint32_t i = 0; i < n; i++) {
         list12 *l = lists[i];
-        if (!l) continue;
-        id<MTLCommandBuffer> cb = [d->queue commandBuffer];
+        if (!l || l->dev != d) continue;
+        if (!l->closed || !l->allocator || l->allocator->generation != l->allocator_generation) {
+            vx_log("D3D12: open command list or command list invalidated by allocator reset; skipping it");
+            continue;
+        }
+        if (!queue_supports_list_type12(q->desc.Type, l->type)) {
+            vx_log("D3D12: bundle or unsupported command-list type cannot be submitted directly; skipping it");
+            continue;
+        }
+        resource_state_shadow12 *shadows = NULL;
+        uint32_t state_count = 0;
+        int state_result = queue_validate_list_states12(d, q->desc.Type, q->mtl_queue, l,
+            NULL, 0, &shadows, &state_count);
+        if (state_result != 1) {
+            if (state_result < 0) vx_log("D3D12: could not allocate resource-state validation data; skipping command list");
+            else vx_log("D3D12: command list has an invalid transition or resource-use state; skipping it");
+            continue;
+        }
+        if (state_count > UINT32_MAX - batch_touched_count ||
+            !queue_batch_touched_reserve12(&batch_touched, &batch_touched_capacity,
+                                           batch_touched_count + state_count)) {
+            vx_log("D3D12: could not allocate submission-batch resource-state data; skipping command list");
+            queue_discard_list_states12(shadows, state_count);
+            continue;
+        }
+        id<MTLCommandBuffer> cb = [q->mtl_queue commandBuffer];
         scratch sc = { nil, 0 };
-        replay(d, l, cb, &sc);
+        if (!replay(d, q->mtl_queue, q->desc.Type, l, &shadows, &state_count, &cb, &sc)) {
+            queue_discard_list_states12(shadows, state_count);
+            continue;
+        }
         // (the scratch memory lives until the GPU is done with it: held by the handler; Metal holds the rest)
         id<MTLBuffer> held = sc.buf;
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)held; }];
+        allocator12 *command_allocator = l->allocator;
+        __atomic_add_fetch(&command_allocator->in_flight, 1, __ATOMIC_RELEASE);
+        d3d_addref(&command_allocator->base);
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)held;
+            if (done.status == MTLCommandBufferStatusError)
+                vx_log("D3D12: Metal command buffer failed: %s",
+                       done.error.localizedDescription.UTF8String ?: "unknown Metal error");
+            __atomic_fetch_sub(&command_allocator->in_flight, 1, __ATOMIC_ACQ_REL);
+            d3d_release(&command_allocator->base);
+        }];
         [cb commit];
+        for (uint32_t j = 0; j < state_count; j++) batch_touched[batch_touched_count++] = shadows[j].resource;
+        queue_commit_list_states12(d, shadows, state_count);
     }
+    // D3D12 keeps state across lists passed to one ExecuteCommandLists call, then decays eligible resources once
+    // the whole batch completes. submit_lock preserves this logical order for later calls on the queue.
+    queue_decay_batch_states12(d, batch_touched, batch_touched_count, q->desc.Type);
+    free(batch_touched);
+    pthread_mutex_unlock(&d->submit_lock);
 }
 
 static WINAPI HRESULT queue_signal(void *this, void *fence, uint64_t v) {
     queue12 *q = this;
-    id<MTLCommandBuffer> cb = [q->dev->queue commandBuffer];
-    [cb encodeSignalEvent:((fence12 *)fence)->event value:v];
+    fence12 *fence_object = fence;
+    if (!fence_object || fence_object->base.kind != K12_FENCE || fence_object->dev != q->dev ||
+        !fence_object->event) return E_INVALIDARG;
+    pthread_mutex_lock(&q->dev->submit_lock);
+    id<MTLCommandBuffer> cb = [q->mtl_queue commandBuffer];
+    if (!cb) {
+        pthread_mutex_unlock(&q->dev->submit_lock);
+        return E_FAIL;
+    }
+    [cb encodeSignalEvent:fence_object->event value:v];
     [cb commit];
+    pthread_mutex_unlock(&q->dev->submit_lock);
     return S_OK;
 }
 static WINAPI HRESULT queue_wait(void *this, void *fence, uint64_t v) {
     queue12 *q = this;
-    id<MTLCommandBuffer> cb = [q->dev->queue commandBuffer];
-    [cb encodeWaitForEvent:((fence12 *)fence)->event value:v];
+    fence12 *fence_object = fence;
+    if (!fence_object || fence_object->base.kind != K12_FENCE || fence_object->dev != q->dev ||
+        !fence_object->event) return E_INVALIDARG;
+    pthread_mutex_lock(&q->dev->submit_lock);
+    id<MTLCommandBuffer> cb = [q->mtl_queue commandBuffer];
+    if (!cb) {
+        pthread_mutex_unlock(&q->dev->submit_lock);
+        return E_FAIL;
+    }
+    [cb encodeWaitForEvent:fence_object->event value:v];
     [cb commit];
+    pthread_mutex_unlock(&q->dev->submit_lock);
     return S_OK;
 }
-static WINAPI HRESULT queue_timestamp_frequency(void *this, uint64_t *f) { if (f) *f = 1000000000ull; return S_OK; }
+static WINAPI HRESULT queue_timestamp_frequency(void *this, uint64_t *f) {
+    queue12 *queue = this;
+    if (queue->desc.Type == 3 && !d3d12_copy_timestamp_counters_supported12(queue->dev)) return E_FAIL;
+    if (f) *f = 1000000000ull;
+    return S_OK;
+}
 // (the GPU's timestamps and QueryPerformanceCounter are both nanoseconds of the same clock, mach_absolute_time's)
 static WINAPI HRESULT queue_clock_calibration(void *this, uint64_t *gpu, uint64_t *cpu) {
+    queue12 *queue = this;
+    if (queue->desc.Type == 3 && !d3d12_copy_timestamp_counters_supported12(queue->dev)) return E_FAIL;
     MTLTimestamp c = 0, g = 0;
-    [((queue12 *)this)->dev->mtl sampleTimestamps:&c gpuTimestamp:&g];
+    [queue->dev->mtl sampleTimestamps:&c gpuTimestamp:&g];
     if (gpu) *gpu = g;
     if (cpu) *cpu = c;
     return S_OK;
@@ -1877,10 +8275,19 @@ static WINAPI HRESULT queue_clock_calibration(void *this, uint64_t *gpu, uint64_
 static WINAPI Q_DESC *queue_get_desc(void *this, Q_DESC *out) { *out = ((queue12 *)this)->desc; return out; }
 
 static WINAPI HRESULT dev_create_queue(void *this, const Q_DESC *desc, const GUID *iid, void **out) {
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!desc || (desc->Type != 0 && desc->Type != 2 && desc->Type != 3) ||
+        (desc->Priority != 0 && desc->Priority != 100 && desc->Priority != 10000) ||
+        (desc->Flags & ~1) || desc->NodeMask != 0) return E_INVALIDARG;
+    // Metal does not expose a queue scheduling guarantee equivalent to D3D12's global real-time priority.
+    if (desc->Priority == 10000) return DXGI_ERROR_UNSUPPORTED;
     dev12 *d = this;
     queue12 *q = alloc12(sizeof *q, K12_QUEUE, g_queue_vtbl, d);
     q->base.destroy = queue_destroy;
     q->desc = *desc;
+    q->mtl_queue = [d->mtl newCommandQueue];
+    if (!q->mtl_queue) { d3d_release(&q->base); return E_FAIL; }
     HRESULT hr = queue_query(q, iid, out);
     d3d_release(&q->base);
     return hr;
@@ -1892,20 +8299,51 @@ static WINAPI HRESULT allocator_query(void *this, const GUID *iid, void **out) {
     const GUID *k[] = { &IID_ID3D12CommandAllocator, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
     return query(this, iid, out, k, 4);
 }
-static WINAPI HRESULT allocator_reset(void *this) { return S_OK; }
+static WINAPI HRESULT allocator_reset(void *this) {
+    allocator12 *allocator = this;
+    pthread_mutex_lock(&allocator->dev->submit_lock);
+    HRESULT hr = S_OK;
+    if (allocator->recording_lists || __atomic_load_n(&allocator->in_flight, __ATOMIC_ACQUIRE) ||
+        allocator->generation == UINT64_MAX) {
+        hr = E_FAIL;
+    } else {
+        allocator->generation++;
+    }
+    pthread_mutex_unlock(&allocator->dev->submit_lock);
+    return hr;
+}
 static WINAPI HRESULT dev_create_allocator(void *this, int32_t type, const GUID *iid, void **out) {
+    if (type < 0 || type > 3) return E_INVALIDARG;
     allocator12 *a = alloc12(sizeof *a, K12_ALLOCATOR, g_allocator_vtbl, this);
     a->base.destroy = release_dev;
     a->type = type;
+    a->generation = 1;
     HRESULT hr = allocator_query(a, iid, out);
     d3d_release(&a->base);
     return hr;
 }
 static WINAPI HRESULT dev_create_list(void *this, uint32_t node, int32_t type, void *allocator, void *pso, const GUID *iid, void **out) {
+    dev12 *device = this;
+    allocator12 *command_allocator = allocator;
+    if (type < 0 || type > 3 || !command_allocator || command_allocator->base.kind != K12_ALLOCATOR ||
+        command_allocator->dev != device || command_allocator->type != type) return E_INVALIDARG;
+    pthread_mutex_lock(&device->submit_lock);
+    if (command_allocator->recording_lists) {
+        pthread_mutex_unlock(&device->submit_lock);
+        return E_INVALIDARG;
+    }
     list12 *l = alloc12(sizeof *l, K12_LIST, g_list_vtbl, this);
     l->base.destroy = list_destroy;
     l->type = type;
+    l->allocator = command_allocator;
+    l->allocator_generation = command_allocator->generation;
+    l->allocator_recording = 1;
+    command_allocator->recording_lists++;
+    d3d_addref(&command_allocator->base);
+    l->recording_topology = 4;
+    gpu_ir_stream_init(&l->gpu_ir);
     if (pso) list_set_pso(l, pso);
+    pthread_mutex_unlock(&device->submit_lock);
     HRESULT hr = list_query(l, iid, out);
     d3d_release(&l->base);
     return hr;
@@ -1913,12 +8351,23 @@ static WINAPI HRESULT dev_create_list(void *this, uint32_t node, int32_t type, v
 
 static WINAPI HRESULT dev_create_heap(void *this, const HEAP_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
+    if (!desc) return E_INVALIDARG;
+    if (out) *out = NULL;
+    if (desc->Type < 0 || desc->Type > 3 || !desc->NumDescriptors ||
+        (desc->Flags & ~1) || (desc->Flags & 1 && desc->Type > 1) || desc->NodeMask ||
+        (desc->Type == 1 && (desc->Flags & 1) && desc->NumDescriptors > 2048))
+        return E_INVALIDARG;
+    if (!out) return S_FALSE;                                      // capability test: validate but do not create the heap
     heap12 *h = alloc12(sizeof *h, K12_HEAP, g_heap_vtbl, d);
     h->base.destroy = heap_destroy;
     h->desc = *desc;
-    size_t size = 32 * (size_t)(desc->NumDescriptors ? desc->NumDescriptors : 1);
+    h->residency_refs = 1;
+    h->residency_priority = VX12_RESIDENCY_PRIORITY_NORMAL;
+    size_t count = desc->NumDescriptors ? desc->NumDescriptors : 1;
+    size_t size = 32 * count;
     if (desc->Flags & 1) {                                         // SHADER_VISIBLE
         h->gpu = [d->mtl newBufferWithLength:size options:MTLResourceStorageModeShared];
+        if (!h->gpu) { d3d_release(&h->base); return E_OUTOFMEMORY; }
         h->cpu = h->gpu.contents;
         memset(h->cpu, 0, size);
         pthread_mutex_lock(&d->lock);
@@ -1927,10 +8376,22 @@ static WINAPI HRESULT dev_create_heap(void *this, const HEAP_DESC *desc, const G
     } else {
         h->cpu = calloc(1, size);
     }
-    h->keep = (__strong id *)calloc(desc->NumDescriptors + 1, sizeof(id));
+    h->keep = (__strong id *)calloc(count, sizeof(id));
+    h->descriptor_kind = calloc(count, sizeof(*h->descriptor_kind));
+    h->buffer_view = calloc(count, sizeof(*h->buffer_view));
+    h->shader_view = calloc(count, sizeof(*h->shader_view));
+    h->target_resource = calloc(count, sizeof(*h->target_resource));
+    h->target_subresource = calloc(count, sizeof(*h->target_subresource));
+    h->target_flags = calloc(count, sizeof(*h->target_flags));
+    if (!h->cpu || !h->keep || !h->descriptor_kind || !h->buffer_view || !h->shader_view || !h->target_resource || !h->target_subresource || !h->target_flags) {
+        d3d_release(&h->base);
+        return E_OUTOFMEMORY;
+    }
     pthread_mutex_lock(&g_heaps_lock);
-    if (g_nheaps < 4096) g_heaps[g_nheaps++] = h;
+    int registered = g_nheaps < 4096;
+    if (registered) g_heaps[g_nheaps++] = h;
     pthread_mutex_unlock(&g_heaps_lock);
+    if (!registered) { d3d_release(&h->base); return E_OUTOFMEMORY; }
     HRESULT hr = heap_query(h, iid, out);
     d3d_release(&h->base);
     return hr;
@@ -2038,10 +8499,11 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     swap12 *sc = this;
     if (flags & 1) return S_OK;                                    // DXGI_PRESENT_TEST
     sc->layer.displaySyncEnabled = sync != 0;
+    pthread_mutex_lock(&sc->dev->submit_lock);
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [sc->layer nextDrawable];
         if (drawable) {
-            id<MTLCommandBuffer> cb = [sc->dev->queue commandBuffer];
+            id<MTLCommandBuffer> cb = [sc->queue->mtl_queue commandBuffer];
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture = drawable.texture;
             rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -2055,6 +8517,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
             [cb commit];
         }
     }
+    pthread_mutex_unlock(&sc->dev->submit_lock);
     sc->index = (sc->index + 1) % sc->count;
     sc->presents++;
     return S_OK;
@@ -2122,93 +8585,861 @@ static WINAPI HRESULT dev_query(void *this, const GUID *iid, void **out) {
 }
 static WINAPI uint32_t dev_node_count(void *this) { return 1; }
 static WINAPI HRESULT dev_removed_reason(void *this) { return S_OK; }
-static WINAPI HRESULT dev_make_resident(void *this, uint32_t n, void *const *objs) { return S_OK; }
+static uint32_t *residency_counter12(dev12 *device, void *object) {
+    if (!device || !object) return NULL;
+    d3d_object *base = object;
+    if (((obj12 *)base)->dev != device) return NULL;
+    switch (base->kind) {
+    case K12_HEAP: return &((heap12 *)base)->residency_refs;
+    case K12_MEMHEAP: return &((memheap12 *)base)->residency_refs;
+    case K12_QUERYHEAP: return &((queryheap12 *)base)->residency_refs;
+    case K12_RESOURCE: {
+        res12 *resource = (res12 *)base;
+        // Placed resources borrow physical memory from their heap. Residency is managed on that owner.
+        return resource->owner_heap ? NULL : &resource->residency_refs;
+    }
+    default: return NULL;
+    }
+}
+
+static uint32_t *residency_priority12(dev12 *device, void *object) {
+    if (!device || !object) return NULL;
+    d3d_object *base = object;
+    if (((obj12 *)base)->dev != device) return NULL;
+    switch (base->kind) {
+    case K12_HEAP: return &((heap12 *)base)->residency_priority;
+    case K12_MEMHEAP: return &((memheap12 *)base)->residency_priority;
+    case K12_QUERYHEAP: return &((queryheap12 *)base)->residency_priority;
+    case K12_RESOURCE: {
+        res12 *resource = (res12 *)base;
+        return resource->owner_heap ? NULL : &resource->residency_priority;
+    }
+    default: return NULL;
+    }
+}
+
+static WINAPI HRESULT dev_update_residency(void *this, uint32_t count, void *const *objects, int make_resident) {
+    dev12 *device = this;
+    if (count && !objects) return E_INVALIDARG;
+    pthread_mutex_lock(&device->lock);
+    HRESULT result = S_OK;
+    // Validate the whole batch first so a bad object cannot leave a partially changed residency set.
+    for (uint32_t i = 0; i < count && result >= 0; i++) {
+        uint32_t *refs = residency_counter12(device, objects[i]);
+        if (!refs) { result = E_INVALIDARG; break; }
+        int first = 1;
+        uint64_t occurrences = 1;
+        for (uint32_t j = 0; j < i; j++) if (objects[j] == objects[i]) { first = 0; break; }
+        if (!first) continue;
+        for (uint32_t j = i + 1; j < count; j++) if (objects[j] == objects[i]) occurrences++;
+        if (make_resident) {
+            uint32_t current = __atomic_load_n(refs, __ATOMIC_RELAXED);
+            if (occurrences > UINT32_MAX - current) result = E_OUTOFMEMORY;
+        } else if (occurrences > __atomic_load_n(refs, __ATOMIC_RELAXED)) result = E_INVALIDARG;
+    }
+    if (result >= 0) {
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t *refs = residency_counter12(device, objects[i]);
+            if (make_resident) __atomic_add_fetch(refs, 1, __ATOMIC_RELAXED);
+            else __atomic_sub_fetch(refs, 1, __ATOMIC_RELAXED);
+        }
+    }
+    pthread_mutex_unlock(&device->lock);
+    return result;
+}
+static WINAPI HRESULT dev_make_resident(void *this, uint32_t n, void *const *objs) {
+    return dev_update_residency(this, n, objs, 1);
+}
+static WINAPI HRESULT dev_evict(void *this, uint32_t n, void *const *objs) {
+    return dev_update_residency(this, n, objs, 0);
+}
+static WINAPI HRESULT dev_set_residency_priority(void *this, uint32_t count, void *const *objects,
+                                                 const uint32_t *priorities) {
+    dev12 *device = this;
+    if (count && (!objects || !priorities)) return E_INVALIDARG;
+    pthread_mutex_lock(&device->lock);
+    HRESULT result = S_OK;
+    for (uint32_t i = 0; i < count; i++)
+        if (!residency_priority12(device, objects[i])) { result = E_INVALIDARG; break; }
+    if (result >= 0)
+        for (uint32_t i = 0; i < count; i++)
+            __atomic_store_n(residency_priority12(device, objects[i]), priorities[i], __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&device->lock);
+    return result;
+}
+static WINAPI HRESULT dev_enqueue_make_resident(void *this, uint32_t flags, uint32_t count,
+                                               void *const *objects, void *fence_object,
+                                               uint64_t fence_value) {
+    dev12 *device = this;
+    fence12 *fence = fence_object;
+    if ((flags & ~1u) || !fence || fence->dev != device) return E_INVALIDARG;
+    HRESULT result = dev_update_residency(device, count, objects, 1);
+    if (result < 0) return result;
+    // The Metal backend has no explicit residency queue; residency bookkeeping completes synchronously here.
+    return fence_signal(fence, fence_value);
+}
 static WINAPI uint64_t *dev_adapter_luid(void *this, uint64_t *out) { *out = 0x5658525400000001ull; return out; }
+
+enum {
+    VX12_FS1_BUFFER = 0x00000001, VX12_FS1_IA_VERTEX_BUFFER = 0x00000002,
+    VX12_FS1_IA_INDEX_BUFFER = 0x00000004, VX12_FS1_TEXTURE1D = 0x00000010,
+    VX12_FS1_TEXTURE2D = 0x00000020, VX12_FS1_TEXTURE3D = 0x00000040,
+    VX12_FS1_TEXTURECUBE = 0x00000080, VX12_FS1_SHADER_LOAD = 0x00000100,
+    VX12_FS1_SHADER_SAMPLE = 0x00000200, VX12_FS1_SHADER_SAMPLE_COMPARISON = 0x00000400,
+    VX12_FS1_MIP = 0x00001000, VX12_FS1_RENDER_TARGET = 0x00004000,
+    VX12_FS1_BLENDABLE = 0x00008000, VX12_FS1_DEPTH_STENCIL = 0x00010000,
+    VX12_FS1_MULTISAMPLE_RESOLVE = 0x00040000, VX12_FS1_DISPLAY = 0x00080000,
+    VX12_FS1_MULTISAMPLE_RENDERTARGET = 0x00200000, VX12_FS1_MULTISAMPLE_LOAD = 0x00400000,
+    VX12_FS1_SHADER_GATHER = 0x00800000, VX12_FS1_TYPED_UNORDERED_ACCESS_VIEW = 0x02000000,
+    VX12_FS1_SHADER_GATHER_COMPARISON = 0x04000000,
+    VX12_FS2_UAV_ATOMIC_ADD = 0x00000001, VX12_FS2_UAV_ATOMIC_BITWISE_OPS = 0x00000002,
+    VX12_FS2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE = 0x00000004, VX12_FS2_UAV_ATOMIC_EXCHANGE = 0x00000008,
+    VX12_FS2_UAV_ATOMIC_SIGNED_MIN_OR_MAX = 0x00000010, VX12_FS2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX = 0x00000020,
+    VX12_FS2_UAV_TYPED_LOAD = 0x00000040, VX12_FS2_UAV_TYPED_STORE = 0x00000080
+};
+
+static int d3d12_dxgi_format_valid(uint32_t format) {
+    return (format >= 1 && format <= 26) || (format >= 27 && format <= 115) ||
+           (format >= 130 && format <= 132) || (format >= 189 && format <= 191);
+}
+
+static int d3d12_typed_uav_load_tier_format(uint32_t format, MTLReadWriteTextureTier tier) {
+    if (tier >= MTLReadWriteTextureTier1 && (format == 41 || format == 42 || format == 43)) return 1;
+    if (tier < MTLReadWriteTextureTier2) return 0;
+    switch (format) {
+    case 2: case 3: case 4:                                      // R32G32B32A32_FLOAT/UINT/SINT
+    case 10: case 11: case 12: case 13: case 14:                 // R16G16B16A16_* typed loads
+    case 16: case 17: case 18:                                   // R32G32_FLOAT/UINT/SINT
+    case 24: case 25: case 26:                                   // R10G10B10A2_UNORM/UINT, R11G11B10_FLOAT
+    case 28: case 30: case 32:                                   // R8G8B8A8_UNORM/UINT/SINT
+    case 31:                                                      // R8G8B8A8_SNORM
+    case 34: case 35: case 36: case 37: case 38:                 // R16G16_* typed loads
+    case 49: case 50: case 51: case 52:                           // R8G8_* typed loads
+    case 54: case 57: case 59:                                   // R16_FLOAT/UINT/SINT
+    case 56: case 58: case 61: case 62: case 63: case 64: case 65: // R16/R8/A8 single-channel typed loads
+    case 85: case 86: case 115:                                  // B5G6R5, B5G5R5A1, B4G4R4A4
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static id<MTLTexture> d3d12_probe_texture(dev12 *d, uint32_t format, MTLTextureType type,
+                                          MTLTextureUsage usage, uint32_t samples, uint32_t mip_levels) {
+    MTLPixelFormat pixel_format = d3d_mtl_format(format, NULL);
+    if (pixel_format == MTLPixelFormatInvalid || (samples > 1 && ![d->mtl supportsTextureSampleCount:samples])) return nil;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+    td.pixelFormat = pixel_format;
+    td.textureType = type;
+    td.width = 4;
+    td.height = (type == MTLTextureType1D || type == MTLTextureType1DArray) ? 1 : 4;
+    td.depth = type == MTLTextureType3D ? 4 : 1;
+    td.arrayLength = 1;
+    td.mipmapLevelCount = samples > 1 ? 1 : mip_levels;
+    td.sampleCount = samples;
+    td.usage = usage;
+    td.storageMode = MTLStorageModePrivate;
+    @try {
+        return [d->mtl newTextureWithDescriptor:td];
+    } @catch (NSException *exception) {
+        (void)exception;
+        return nil;
+    }
+}
+
+static int d3d12_is_depth_pixel_format(MTLPixelFormat format) {
+    return format == MTLPixelFormatDepth16Unorm || format == MTLPixelFormatDepth32Float ||
+           format == MTLPixelFormatDepth32Float_Stencil8 || format == MTLPixelFormatX32_Stencil8;
+}
+
+static int d3d12_is_block_compressed_format(uint32_t format) {
+    return (format >= 70 && format <= 84) || (format >= 94 && format <= 99);
+}
+
+// Texture buffers accept a smaller pixel-format set than ordinary textures. Probe each requested usage
+// separately after this conservative format filter; depth, sRGB, and block-compressed formats are excluded.
+static int d3d12_typed_buffer_format(uint32_t format) {
+    switch (format) {
+    case 2: case 3: case 4: case 10: case 11: case 12: case 13: case 14:
+    case 16: case 17: case 18: case 24: case 25: case 26:
+    case 28: case 30: case 31: case 32: case 34: case 35: case 36: case 37: case 38:
+    case 41: case 42: case 43: case 48: case 49: case 50: case 51: case 52:
+    case 54: case 56: case 57: case 58: case 59: case 61: case 62: case 63: case 64: case 65:
+    case 87: case 88:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int d3d12_texture_atomic_format_supported(id<MTLDevice> mtl, uint32_t format) {
+    if (!mtl || (format != 42 && format != 43)) return 0;          // R32_UINT / R32_SINT
+    if (@available(macOS 14.0, *)) return [mtl supportsFamily:MTLGPUFamilyApple6];
+    return 0;
+}
+
+// Metal permits blend-enabled pipelines only for pixel formats with the Blend capability. Keep this
+// candidate list to those color formats; a Metal validation assertion on an unsupported format is fatal.
+static int d3d12_blend_probe_format(uint32_t format) {
+    switch (format) {
+    case 2: case 10: case 11: case 13: case 16: case 24: case 26: case 28: case 29: case 31:
+    case 34: case 35: case 37: case 41: case 48: case 49: case 51: case 54: case 56: case 58:
+    case 61: case 63: case 85: case 86: case 87: case 88: case 90: case 92: case 115:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int d3d12_metal_resolve_format(uint32_t format) {
+    switch (format) {
+    case 10: case 11: case 13: case 24: case 26: case 28: case 29: case 31:
+    case 34: case 35: case 37: case 48: case 49: case 51: case 54: case 56: case 58:
+    case 61: case 63: case 67: case 85: case 86: case 87: case 88: case 90: case 91:
+    case 92: case 93: case 115:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int d3d12_probe_typed_buffer(dev12 *d, uint32_t format, MTLTextureUsage usage) {
+    if (!d3d12_typed_buffer_format(format)) return 0;
+    uint32_t bytes = 0;
+    MTLPixelFormat pixel_format = d3d_mtl_format(format, &bytes);
+    if (pixel_format == MTLPixelFormatInvalid || !bytes || d3d12_is_depth_pixel_format(pixel_format)) return 0;
+    const NSUInteger width = 8;
+    NSUInteger row_bytes = width * bytes;
+    NSUInteger alignment = [d->mtl minimumTextureBufferAlignmentForPixelFormat:pixel_format];
+    if (alignment) {
+        NSUInteger remainder = row_bytes % alignment;
+        if (remainder) row_bytes += alignment - remainder;
+    }
+    id<MTLBuffer> buffer = [d->mtl newBufferWithLength:row_bytes options:MTLResourceStorageModeShared];
+    if (!buffer) return 0;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:pixel_format
+                                                                                       width:width
+                                                                              resourceOptions:buffer.resourceOptions
+                                                                                       usage:usage];
+    @try {
+        return [buffer newTextureWithDescriptor:td offset:0 bytesPerRow:row_bytes] != nil;
+    } @catch (NSException *exception) {
+        (void)exception;
+        return 0;
+    }
+}
+
+static int d3d12_probe_typed_uav_store(dev12 *d, uint32_t format) {
+    if (d3d12_is_depth_pixel_format(d3d_mtl_format(format, NULL))) return 0;
+    MTLTextureUsage usage = MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+    if (d3d12_probe_texture(d, format, MTLTextureType2D, usage, 1, 1)) return 1;
+    return d3d12_probe_typed_buffer(d, format, MTLTextureUsageShaderWrite);
+}
+
+static int d3d12_probe_typed_uav_load(dev12 *d, uint32_t format) {
+    if (!d3d12_typed_uav_load_tier_format(format, d->mtl.readWriteTextureSupport)) return 0;
+    // D3D12 reports the 15-format additional group as all-or-none. Optional formats still receive
+    // individual checks after the required Metal resource and shader access modes are available.
+    static const uint32_t additional_set[] = {
+        2, 3, 4, 10, 12, 14, 28, 30, 32, 54, 57, 59, 61, 62, 64
+    };
+    for (size_t i = 0; i < sizeof additional_set / sizeof additional_set[0]; i++)
+        if (format == additional_set[i] && !d->typed_uav_load_additional_formats) return 0;
+    MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+    if (d3d12_probe_texture(d, format, MTLTextureType2D, usage, 1, 1)) return 1;
+    return d3d12_probe_typed_buffer(d, format, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+}
+
+static int d3d12_probe_typed_uav_load_additional_set(dev12 *d) {
+    static const uint32_t formats[] = {
+        2, 3, 4, 10, 12, 14, 28, 30, 32, 54, 57, 59, 61, 62, 64
+    };
+    if (d->mtl.readWriteTextureSupport < MTLReadWriteTextureTier2) return 0;
+    MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+    for (size_t i = 0; i < sizeof formats / sizeof formats[0]; i++) {
+        uint32_t format = formats[i];
+        if (!d3d12_probe_texture(d, format, MTLTextureType2D, usage, 1, 1) &&
+            !d3d12_probe_typed_buffer(d, format, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite)) return 0;
+    }
+    return 1;
+}
+
+static int d3d12_probe_typed_buffer_atomic(dev12 *d, uint32_t format) {
+    if (!d3d12_texture_atomic_format_supported(d->mtl, format) ||
+        !d3d12_probe_typed_buffer(d, format, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite)) return 0;
+    uint32_t bytes = 0;
+    MTLPixelFormat pixel_format = d3d_mtl_format(format, &bytes);
+    if (pixel_format == MTLPixelFormatInvalid || !bytes) return 0;
+    const NSUInteger width = 8;
+    NSUInteger row_bytes = width * bytes;
+    NSUInteger alignment = [d->mtl minimumTextureBufferAlignmentForPixelFormat:pixel_format];
+    if (alignment) {
+        NSUInteger remainder = row_bytes % alignment;
+        if (remainder) row_bytes += alignment - remainder;
+    }
+    id<MTLBuffer> buffer = [d->mtl newBufferWithLength:row_bytes options:MTLResourceStorageModeShared];
+    if (!buffer) return 0;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:pixel_format
+                                                                                       width:width
+                                                                              resourceOptions:buffer.resourceOptions
+                                                                                       usage:MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageShaderAtomic];
+    @try {
+        return [buffer newTextureWithDescriptor:td offset:0 bytesPerRow:row_bytes] != nil;
+    } @catch (NSException *exception) {
+        (void)exception;
+        return 0;
+    }
+}
+
+static int d3d12_probe_texture_atomics(dev12 *d, uint32_t format) {
+    if (!d3d12_texture_atomic_format_supported(d->mtl, format)) return 0;
+    MTLTextureUsage usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageShaderAtomic;
+    const MTLTextureType types[] = { MTLTextureType1D, MTLTextureType1DArray, MTLTextureType2D,
+                                     MTLTextureType2DArray, MTLTextureType3D };
+    for (size_t i = 0; i < sizeof types / sizeof types[0]; i++)
+        if (!d3d12_probe_texture(d, format, types[i], usage, 1, 1)) return 0;
+    return d3d12_probe_typed_buffer_atomic(d, format);
+}
+
+static int d3d12_probe_blending(dev12 *d, MTLPixelFormat format) {
+    if (!d->format_probe_library) {
+        NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "vertex float4 vx_probe_vertex(uint id [[vertex_id]]) { return float4(0.0f, 0.0f, 0.0f, 1.0f); }\n"
+            "fragment float4 vx_probe_fragment() { return float4(1.0f); }\n";
+        NSError *error = nil;
+        d->format_probe_library = [d->mtl newLibraryWithSource:source options:nil error:&error];
+        if (!d->format_probe_library) return 0;
+        d->format_probe_vertex = [d->format_probe_library newFunctionWithName:@"vx_probe_vertex"];
+        d->format_probe_fragment = [d->format_probe_library newFunctionWithName:@"vx_probe_fragment"];
+        if (!d->format_probe_vertex || !d->format_probe_fragment) return 0;
+    }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = d->format_probe_vertex;
+    pd.fragmentFunction = d->format_probe_fragment;
+    MTLRenderPipelineColorAttachmentDescriptor *color = pd.colorAttachments[0];
+    color.pixelFormat = format;
+    color.blendingEnabled = YES;
+    color.rgbBlendOperation = MTLBlendOperationAdd;
+    color.alphaBlendOperation = MTLBlendOperationAdd;
+    color.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    color.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    color.sourceAlphaBlendFactor = MTLBlendFactorOne;
+    color.destinationAlphaBlendFactor = MTLBlendFactorZero;
+    @try {
+        NSError *error = nil;
+        return [d->mtl newRenderPipelineStateWithDescriptor:pd error:&error] != nil;
+    } @catch (NSException *exception) {
+        (void)exception;
+        return 0;
+    }
+}
+
+static void d3d12_query_format_support(dev12 *d, uint32_t format, uint32_t *support1, uint32_t *support2) {
+    const MTLTextureUsage read_usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    uint32_t s1 = 0, s2 = 0;
+    if (vertex_format(format) != MTLVertexFormatInvalid) s1 |= VX12_FS1_IA_VERTEX_BUFFER;
+    if (format == 42 || format == 57) s1 |= VX12_FS1_IA_INDEX_BUFFER;
+    if (d3d12_probe_typed_buffer(d, format, MTLTextureUsageShaderRead)) s1 |= VX12_FS1_BUFFER;
+
+    id<MTLTexture> tex2d = d3d12_probe_texture(d, format, MTLTextureType2D, read_usage, 1, 1);
+    if (tex2d) {
+        s1 |= VX12_FS1_TEXTURE2D | VX12_FS1_SHADER_LOAD;
+        // TextureGather lowers to MSL gather on sample-access color textures. The DXIL
+        // lowering currently emits depth texture types only for TextureGatherCmp.
+        if (!d3d12_is_depth_pixel_format(tex2d.pixelFormat)) s1 |= VX12_FS1_SHADER_GATHER;
+        if ((format != 2 && format != 16 && format != 41) || d->mtl.supports32BitFloatFiltering)
+            s1 |= VX12_FS1_SHADER_SAMPLE;
+        if (d3d12_probe_texture(d, format, MTLTextureType2D, read_usage, 1, 2)) s1 |= VX12_FS1_MIP;
+        if (!d3d12_is_depth_pixel_format(tex2d.pixelFormat)) {
+            if (!d3d12_is_block_compressed_format(format)) {
+                if (d3d12_probe_texture(d, format, MTLTextureType1D, read_usage, 1, 1)) s1 |= VX12_FS1_TEXTURE1D;
+                if (d3d12_probe_texture(d, format, MTLTextureType3D, read_usage, 1, 1)) s1 |= VX12_FS1_TEXTURE3D;
+            }
+        }
+        if (d3d12_probe_texture(d, format, MTLTextureTypeCube, read_usage, 1, 1)) s1 |= VX12_FS1_TEXTURECUBE;
+
+        int depth_format = format == 20 || format == 40 || format == 45 || format == 55;
+        MTLTextureUsage target_usage = read_usage | MTLTextureUsageRenderTarget;
+        if (!d3d12_is_block_compressed_format(format) &&
+            d3d12_probe_texture(d, format, MTLTextureType2D, target_usage, 1, 1)) {
+            if (depth_format) {
+                s1 |= VX12_FS1_DEPTH_STENCIL | VX12_FS1_SHADER_SAMPLE_COMPARISON |
+                      VX12_FS1_SHADER_GATHER_COMPARISON;
+                // D3D12's multisample-render-target bit also covers depth-stencil targets. Probe the
+                // requested sample count and actual Metal depth texture format before advertising it.
+                if ([d->mtl supportsTextureSampleCount:2] &&
+                    d3d12_probe_texture(d, format, MTLTextureType2DMultisample, target_usage, 2, 1))
+                    s1 |= VX12_FS1_MULTISAMPLE_RENDERTARGET;
+                // The custom depth-average resolve path supports these two depth formats on the same
+                // Apple GPU families accepted by ResolveSubresourceRegion validation.
+                if ((s1 & VX12_FS1_MULTISAMPLE_RENDERTARGET) &&
+                    d3d12_depth_average_resolve_format(format) && d3d12_depth_resolve_supported12(d))
+                    s1 |= VX12_FS1_MULTISAMPLE_RESOLVE;
+            } else {
+                s1 |= VX12_FS1_RENDER_TARGET;
+                if (d3d12_blend_probe_format(format) && d3d12_probe_blending(d, tex2d.pixelFormat))
+                    s1 |= VX12_FS1_BLENDABLE;
+                if (format == 28 || format == 87) s1 |= VX12_FS1_DISPLAY;
+                if ([d->mtl supportsTextureSampleCount:2]) {
+                    if (d3d12_probe_texture(d, format, MTLTextureType2DMultisample, target_usage, 2, 1)) {
+                        s1 |= VX12_FS1_MULTISAMPLE_RENDERTARGET;
+                        if (d3d12_metal_resolve_format(format)) s1 |= VX12_FS1_MULTISAMPLE_RESOLVE;
+                        if (d3d12_probe_texture(d, format, MTLTextureType2DMultisample,
+                                                target_usage | MTLTextureUsageShaderRead, 2, 1))
+                            s1 |= VX12_FS1_MULTISAMPLE_LOAD;
+                    }
+                }
+            }
+        }
+    }
+
+    int depth_format = format == 20 || format == 40 || format == 45 || format == 55;
+    if (!depth_format) {
+        int typed_store = d3d12_probe_typed_uav_store(d, format);
+        int typed_load = d3d12_probe_typed_uav_load(d, format);
+        if (typed_store || typed_load) s1 |= VX12_FS1_TYPED_UNORDERED_ACCESS_VIEW;
+        if (typed_store) s2 |= VX12_FS2_UAV_TYPED_STORE;
+        if (typed_load) s2 |= VX12_FS2_UAV_TYPED_LOAD;
+    }
+    if ((format == 42 || format == 43) && d3d12_probe_texture_atomics(d, format)) {
+        s2 |= VX12_FS2_UAV_ATOMIC_ADD | VX12_FS2_UAV_ATOMIC_BITWISE_OPS |
+              VX12_FS2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE | VX12_FS2_UAV_ATOMIC_EXCHANGE;
+        s2 |= format == 43 ? VX12_FS2_UAV_ATOMIC_SIGNED_MIN_OR_MAX : VX12_FS2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+    }
+    *support1 = s1;
+    *support2 = s2;
+}
+
+static int d3d12_is_apple_gpu(id<MTLDevice> mtl) {
+    // Apple-family GPU 1 is the common baseline for Apple-designed GPUs. This distinguishes Apple Silicon's
+    // tile-based renderer from Intel/AMD Mac GPUs, which can also be exposed through Metal.
+    return mtl && [mtl supportsFamily:(MTLGPUFamily)1001];
+}
+
+static WINAPI HEAP_PROPS *dev_custom_heap_properties(void *this, HEAP_PROPS *out,
+                                                    uint32_t node_mask, int32_t heap_type) {
+    dev12 *device = this;
+    memset(out, 0, sizeof *out);
+    if ((node_mask && node_mask != 1) || heap_type < 1 || heap_type > 3) return out;
+
+    int uma = device->mtl.hasUnifiedMemory;
+    int cache_coherent_uma = uma && d3d12_is_apple_gpu(device->mtl);
+    out->Type = 4;                                                 // D3D12_HEAP_TYPE_CUSTOM
+    out->CreationNodeMask = out->VisibleNodeMask = node_mask ? node_mask : 1;
+    out->MemoryPoolPreference = heap_type == 1 && !uma ? 1 : 0;   // DEFAULT uses L1 only on non-UMA adapters.
+    if (heap_type == 1) out->CPUPageProperty = 1;                 // NOT_AVAILABLE
+    else if (heap_type == 2 && !cache_coherent_uma) out->CPUPageProperty = 2; // WRITE_COMBINE upload
+    else out->CPUPageProperty = 3;                               // WRITE_BACK readback/coherent UMA upload
+    return out;
+}
+
+static int d3d12_int64_shader_ops_supported12(dev12 *device) {
+    // Metal exposes 64-bit integer arithmetic starting with Apple GPU family 3.
+    return device && device->mtl && [device->mtl supportsFamily:MTLGPUFamilyApple3];
+}
 
 // D3D12_FEATURE: only what tells a program what it may use.
 static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data, uint32_t size) {
+    dev12 *device = this;
     switch (feature) {
-    case 0:                                                        // D3D12_OPTIONS
-        if (size >= 60) {
-            memset(data, 0, size);
-            uint32_t *o = data;
-            o[0] = 1;                                              // DoublePrecisionFloatShaderOps (as float)
-            o[1] = 1;                                              // OutputMergerLogicOp
-            o[2] = 0;                                              // MinPrecisionSupport: none
-            o[3] = 3;                                              // TiledResourcesTier: 0? (none)
-            o[3] = 0;
-            o[4] = 3;                                              // ResourceBindingTier 3
-            o[5] = 1;                                              // PSSpecifiedStencilRefSupported
-            o[6] = 1;                                              // TypedUAVLoadAdditionalFormats
-            o[7] = 0;                                              // ROVsSupported
-            o[8] = 0;                                              // ConservativeRasterizationTier
-            o[9] = 40;                                             // MaxGPUVirtualAddressBitsPerResource
-            o[10] = 1;                                             // StandardSwizzle64KBSupported
-            o[11] = 0;                                             // CrossNodeSharingTier
-            o[12] = 0;                                             // CrossAdapterRowMajorTextureSupported
-            o[13] = 1;                                             // VPAndRTArrayIndexFromAnyShaderFeedingRasterizer...
-            o[14] = 2;                                             // ResourceHeapTier 2
-        }
+    case 0: {                                                       // D3D12_OPTIONS (15 32-bit fields)
+        struct options {
+            int32_t double_precision_float_shader_ops, output_merger_logic_op;
+            uint32_t min_precision_support, tiled_resources_tier, resource_binding_tier;
+            int32_t ps_stencil_ref, typed_uav_load_additional_formats, rovs_supported;
+            uint32_t conservative_rasterization_tier, max_gpu_va_bits_per_resource;
+            int32_t standard_swizzle_64kb, cross_node_sharing_tier, cross_adapter_row_major;
+            int32_t vp_and_rt_array_index_without_gs_emulation;
+            uint32_t resource_heap_tier;
+        };
+        if (!data || size != sizeof(struct options)) return E_INVALIDARG;
+        struct options *o = data;
+        memset(o, 0, sizeof *o);
+        // DXIL double types are lowered to float; Metal does not implement D3D12 logic ops or the swizzle layout.
+        o->resource_binding_tier = 3;                              // descriptor heaps and dynamically indexed ranges
+        o->ps_stencil_ref = 1;                                     // pixel output [[stencil]] and OM stencil reference
+        o->typed_uav_load_additional_formats = device->typed_uav_load_additional_formats;
+        o->max_gpu_va_bits_per_resource = 40;
+        o->vp_and_rt_array_index_without_gs_emulation = 1;
+        o->resource_heap_tier = 2;
         return S_OK;
+    }
     case 1: {                                                      // ARCHITECTURE {NodeIndex, TileBasedRenderer, UMA, CacheCoherentUMA}
+        if (!data || size != 16) return E_INVALIDARG;
         uint32_t *o = data;
-        if (size >= 16) { o[1] = 1; o[2] = 1; o[3] = 1; }
+        if (o[0] != 0) return E_INVALIDARG;
+        int apple_gpu = d3d12_is_apple_gpu(device->mtl);
+        int uma = device->mtl.hasUnifiedMemory;
+        o[1] = apple_gpu;
+        o[2] = uma;
+        o[3] = apple_gpu && uma;
         return S_OK;
     }
     case 2: {                                                      // FEATURE_LEVELS {NumFeatureLevels, pFeatureLevelsRequested, MaxSupportedFeatureLevel}
         struct { uint32_t n; uint32_t pad; const int32_t *levels; int32_t max; } *f = data;
+        if (!data || size != sizeof *f || !f->n || !f->levels) return E_INVALIDARG;
         int32_t best = 0;
         for (uint32_t i = 0; i < f->n; i++) if (f->levels[i] <= 0xc000 && f->levels[i] > best) best = f->levels[i];
-        f->max = best ? best : 0xb000;
+        f->max = best;
+        return S_OK;
+    }
+    case 3: {                                                      // FORMAT_SUPPORT
+        struct format_support { uint32_t format, support1, support2; } *f = data;
+        if (!data || size != sizeof *f || !d3d12_dxgi_format_valid(f->format)) return E_INVALIDARG;
+        dev12 *d = this;
+        uint32_t format = f->format;
+        pthread_mutex_lock(&d->format_lock);
+        if (!d->format_support_valid[format]) {
+            d3d12_query_format_support(d, format, &d->format_support1[format], &d->format_support2[format]);
+            d->format_support_valid[format] = 1;
+        }
+        f->support1 = d->format_support1[format];
+        f->support2 = d->format_support2[format];
+        pthread_mutex_unlock(&d->format_lock);
+        return S_OK;
+    }
+    case 4: {                                                      // MULTISAMPLE_QUALITY_LEVELS
+        struct multisample_quality_levels { uint32_t format, sample_count, flags, quality_levels; } *q = data;
+        if (!data || size != sizeof *q || (q->flags & ~1u)) return E_INVALIDARG;
+        uint32_t sample_count = q->sample_count;
+        q->quality_levels = 0;
+        if (!sample_count || sample_count > 16 || (sample_count & (sample_count - 1)) || (q->flags & 1)) return S_OK;
+        dev12 *d = this;
+        uint32_t bytes_per_pixel = 0;
+        MTLPixelFormat format = d3d_mtl_format(q->format, &bytes_per_pixel);
+        if (format == MTLPixelFormatInvalid || ![d->mtl supportsTextureSampleCount:sample_count]) return S_OK;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:1 height:1 mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        if (sample_count > 1) {
+            td.textureType = MTLTextureType2DMultisample;
+            td.sampleCount = sample_count;
+        }
+        @try {
+            id<MTLTexture> texture = [d->mtl newTextureWithDescriptor:td];
+            if (texture) q->quality_levels = 1;                 // Metal's standard sample positions map to quality index 0.
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        return S_OK;
+    }
+    case 5: {                                                      // FORMAT_INFO
+        struct format_info { uint32_t format; uint8_t plane_count, padding[3]; } *f = data;
+        if (!data || size != sizeof *f || !d3d12_dxgi_format_valid(f->format)) return E_INVALIDARG;
+        f->plane_count = (uint8_t)d3d12_resource_plane_count(f->format);
+        return S_OK;
+    }
+    case 6: {                                                      // GPU_VIRTUAL_ADDRESS_SUPPORT
+        struct gpu_va_support { uint32_t per_resource, per_process; } *v = data;
+        if (!data || size != sizeof *v) return E_INVALIDARG;
+        v->per_resource = 40;
+        v->per_process = 40;
         return S_OK;
     }
     case 7: {                                                      // SHADER_MODEL {HighestShaderModel}
+        if (!data || size != sizeof(int32_t)) return E_INVALIDARG;
         int32_t *sm = data;
-        if (*sm > 0x66) *sm = 0x66;                                // (6.6: SM 6.7+ features are not translated yet)
+        int32_t requested = *sm;
+        if (requested != 0x51 && (requested < 0x60 || requested > 0x69)) return E_INVALIDARG;
+        if (requested > 0x66) *sm = 0x66;                          // (6.6: SM 6.7+ features are not translated yet)
+        return S_OK;
+    }
+    case 8: {                                                      // D3D12_OPTIONS1
+        struct options1 {
+            int32_t wave_ops;
+            uint32_t wave_lane_count_min, wave_lane_count_max, total_lane_count;
+            int32_t expanded_compute_resource_states, int64_shader_ops;
+        };
+        if (!data || size != sizeof(struct options1)) return E_INVALIDARG;
+        struct options1 *o = data;
+        memset(o, 0, sizeof *o);
+        // The translator implements only part of the wave intrinsic set, so expose no WaveOps yet. Metal tracks
+        // resource transitions; only advertise shader int64 arithmetic on GPU families that support it.
+        o->expanded_compute_resource_states = 1;
+        o->int64_shader_ops = d3d12_int64_shader_ops_supported12(device);
+        return S_OK;
+    }
+    case 52: {                                                     // D3D12_OPTIONS21
+        // Work graphs, expanded comparison sampling and extended command info remain unsupported. ExecuteIndirect
+        // tier 1.1 is implemented, including the zero-payload incrementing-constant argument.
+        if (!data || size != 4 * sizeof(uint32_t)) return E_INVALIDARG;
+        uint32_t *o = data;
+        memset(o, 0, 4 * sizeof *o);
+        o[1] = 11;                                                  // D3D12_EXECUTE_INDIRECT_TIER_1_1
+        return S_OK;
+    }
+    case 18: {                                                     // D3D12_OPTIONS2
+        struct options2 { int32_t depth_bounds_test_supported; uint32_t programmable_sample_positions_tier; };
+        if (!data || size != sizeof(struct options2)) return E_INVALIDARG;
+        memset(data, 0, sizeof(struct options2));
+        return S_OK;
+    }
+    case 21: {                                                     // D3D12_OPTIONS3
+        struct options3 {
+            int32_t copy_queue_timestamp_queries_supported;
+            int32_t casting_fully_typed_format_supported;
+            uint32_t write_buffer_immediate_support_flags;
+            uint32_t view_instancing_tier;
+            int32_t barycentrics_supported;
+        };
+        if (!data || size != sizeof(struct options3)) return E_INVALIDARG;
+        memset(data, 0, sizeof(struct options3));
+        struct options3 *options = data;
+        options->copy_queue_timestamp_queries_supported = d3d12_copy_timestamp_counters_supported12(device);
+        // WriteBufferImmediate is lowered to ordered Metal blit writes on direct, compute, and copy lists.
+        // D3D12 command-list support bits are DIRECT=1, COMPUTE=4, and COPY=8; bundles remain unsupported.
+        options->write_buffer_immediate_support_flags = 1u | 4u | 8u;
         return S_OK;
     }
     case 13: {                                                     // ROOT_SIGNATURE {HighestVersion}
+        if (!data || size != sizeof(int32_t)) return E_INVALIDARG;
         int32_t *v = data;
         if (*v > 2) *v = 2;
+        return S_OK;
+    }
+    case 16: {                                                     // ARCHITECTURE1 (adds IsolatedMMU)
+        struct architecture1 { uint32_t node_index; int32_t tile_based, uma, cache_coherent_uma, isolated_mmu; } *a = data;
+        if (!data || size != sizeof *a || a->node_index != 0) return E_INVALIDARG;
+        int apple_gpu = d3d12_is_apple_gpu(device->mtl);
+        int uma = device->mtl.hasUnifiedMemory;
+        a->tile_based = apple_gpu;
+        a->uma = uma;
+        a->cache_coherent_uma = apple_gpu && uma;
+        // The guest address-space bridge does not expose the CPU page-table guarantees this field promises.
+        a->isolated_mmu = 0;
         return S_OK;
     }
     }
     return E_INVALIDARG;
 }
 
-// GetCopyableFootprints: the layout of a texture's subresources in a buffer (rows 256-byte aligned, subresources 512).
-static WINAPI void dev_footprints(void *this, const RES_DESC *desc, uint32_t first, uint32_t n, uint64_t base, FOOTPRINT *layouts,
-                                  uint32_t *rows, uint64_t *row_bytes, uint64_t *total) {
-    uint64_t off = base, all = 0;
-    uint32_t bpp = bytes_per(desc->Format);
-    uint32_t mips = desc->MipLevels ? desc->MipLevels : 1;
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t sub = first + i, mip = sub % mips;
-        uint32_t w = (uint32_t)MAX(1ull, desc->Width >> mip), h = desc->Dimension == 1 ? 1 : MAX(1u, desc->Height >> mip);
-        uint32_t d = desc->Dimension == 4 ? MAX(1u, (uint32_t)desc->DepthOrArraySize >> mip) : 1;
-        if (desc->Dimension == 1) { w = (uint32_t)desc->Width; bpp = 1; }
-        uint64_t rb = (uint64_t)w * (bpp ? bpp : 4);
-        uint32_t pitch = (uint32_t)((rb + 255) & ~255ull);
-        off = (off + 511) & ~511ull;
-        if (layouts) { layouts[i].offset = off; layouts[i].format = desc->Format; layouts[i].width = w; layouts[i].height = h; layouts[i].depth = d; layouts[i].row_pitch = pitch; }
-        if (rows) rows[i] = h;
-        if (row_bytes) row_bytes[i] = rb;
-        uint64_t size = (uint64_t)pitch * h * d;
-        all = off + size - base;
-        off += size;
+static int d3d12_footprint_align(uint64_t value, uint32_t alignment, uint64_t *out) {
+    uint64_t mask = alignment - 1;
+    if (!alignment || (alignment & mask) || value > UINT64_MAX - mask) return 0;
+    *out = (value + mask) & ~mask;
+    return 1;
+}
+
+static uint64_t d3d12_footprint_mip(uint64_t extent, uint32_t mip) {
+    if (mip >= 64) return 1;
+    extent >>= mip;
+    return extent ? extent : 1;
+}
+
+static uint32_t d3d12_footprint_full_mips(uint64_t extent) {
+    uint32_t count = 0;
+    do { count++; extent >>= 1; } while (extent);
+    return count;
+}
+
+static uint64_t d3d12_footprint_ceil_div(uint64_t value, uint32_t divisor) {
+    return value / divisor + (value % divisor != 0);
+}
+
+static int d3d12_footprint_plane(uint32_t format, uint32_t plane, uint32_t width, uint32_t height,
+                                 uint32_t *plane_format, uint32_t *pitch_width,
+                                 uint32_t *plane_width, uint32_t *plane_height, int *is_planar) {
+    *plane_format = format;
+    *pitch_width = *plane_width = width;
+    *plane_height = height;
+    *is_planar = 0;
+    switch (format) {
+    case 103: case 104: case 105: case 110: case 130: case 131: case 132:
+        *is_planar = 1;
+        break;
+    case 19: case 20: case 21: case 22: case 44: case 45: case 46: case 47:
+        if (plane > 1) return 0;
+        *plane_format = plane ? 60 : 39;                   // stencil is one byte; depth is a 32-bit plane
+        return 1;
+    default:
+        if (plane) return 0;
+        return 1;
     }
-    if (total) *total = all;
+
+    switch (format) {
+    case 103: case 104: case 105:                      // 4:2:0: Y and interleaved UV
+        if (plane > 1) return 0;
+        if (!plane) {
+            *plane_format = format == 103 ? 60 : 53;
+        } else {
+            *plane_format = format == 103 ? 48 : 33;
+            *plane_width = *pitch_width = width / 2 + (width & 1);
+            *plane_height = height / 2 + (height & 1);
+        }
+        return 1;
+    case 110:                                           // NV11: 4:1:1, with row-major chroma padding
+        if (plane > 1) return 0;
+        if (!plane) *plane_format = 60;
+        else {
+            *plane_format = 48;
+            *plane_width = width / 4 + ((width & 3) != 0);
+            *pitch_width = width / 2 + (width & 1);
+        }
+        return 1;
+    case 130:                                           // P208: 4:2:2
+        if (plane > 1) return 0;
+        if (!plane) *plane_format = 60;
+        else { *plane_format = 48; *plane_width = *pitch_width = width / 2 + (width & 1); }
+        return 1;
+    case 131:                                           // V208: 4:4:0
+        if (plane > 2) return 0;
+        *plane_format = 60;
+        if (plane) *plane_height = height / 2 + (height & 1);
+        return 1;
+    case 132:                                           // V408: 4:4:4
+        if (plane > 2) return 0;
+        *plane_format = 60;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void d3d12_footprints_invalid(uint32_t n, FOOTPRINT *layouts, uint32_t *rows,
+                                    uint64_t *row_bytes, uint64_t *total) {
+    if (layouts) memset(layouts, 0xff, (size_t)n * sizeof *layouts);
+    if (rows) memset(rows, 0xff, (size_t)n * sizeof *rows);
+    if (row_bytes) memset(row_bytes, 0xff, (size_t)n * sizeof *row_bytes);
+    if (total) *total = UINT64_MAX;
+}
+
+// Footprints are adapter-independent: rows use 256-byte alignment and each subresource starts at 512 bytes.
+static WINAPI void dev_footprints(void *this, const RES_DESC *desc, uint32_t first, uint32_t n, uint64_t base,
+                                  FOOTPRINT *layouts, uint32_t *rows, uint64_t *row_bytes, uint64_t *total) {
+    (void)this;
+    if (total) *total = UINT64_MAX;
+    if (!desc || (uint64_t)first + n > UINT32_MAX) {
+        d3d12_footprints_invalid(n, layouts, rows, row_bytes, total);
+        return;
+    }
+
+    uint32_t mips = desc->MipLevels;
+    uint32_t array_size = 1;
+    uint32_t planes = 1;
+    uint64_t max_dimension = desc->Width;
+    if (desc->Dimension == 1) {                            // buffer
+        if (!desc->Width || desc->Width > UINT32_MAX || desc->Height != 1 || desc->DepthOrArraySize != 1 ||
+            desc->MipLevels != 1 || desc->Format != 0 || desc->SampleCount != 1 || desc->SampleQuality != 0) goto invalid;
+    } else if (desc->Dimension >= 2 && desc->Dimension <= 4) {
+        if (!desc->Width || !desc->DepthOrArraySize || !desc->Format || desc->SampleCount != 1 || desc->SampleQuality != 0) goto invalid;
+        if (desc->Dimension == 2 && desc->Height != 1) goto invalid;
+        if (desc->Dimension == 3 && !desc->Height) goto invalid;
+        if (desc->Dimension == 4 && (!desc->Height || desc->DepthOrArraySize == 0)) goto invalid;
+        array_size = desc->Dimension == 4 ? 1 : desc->DepthOrArraySize;
+        if (desc->Dimension >= 3 && desc->Height > max_dimension) max_dimension = desc->Height;
+        if (desc->Dimension == 4 && desc->DepthOrArraySize > max_dimension) max_dimension = desc->DepthOrArraySize;
+        if (!mips) mips = d3d12_footprint_full_mips(max_dimension);
+        if (!mips || mips > d3d12_footprint_full_mips(max_dimension)) goto invalid;
+        planes = d3d12_resource_plane_count(desc->Format);
+        if (!planes) goto invalid;
+    } else goto invalid;
+
+    uint64_t subresource_count = (uint64_t)mips * array_size * planes;
+    if ((uint64_t)first > subresource_count || n > subresource_count - first) goto invalid;
+
+    uint64_t cursor = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t subresource = first + i;
+        uint32_t mip = subresource % mips;
+        uint32_t plane = (subresource / mips) / array_size;
+        uint64_t width64, height64, depth64;
+        uint32_t footprint_format = desc->Format;
+        uint32_t min_pitch_width = 0, plane_width = 0, plane_height = 0;
+        uint32_t block_width = 1, block_height = 1, bytes_per_block = 1;
+        int planar = 0;
+
+        if (desc->Dimension == 1) {
+            width64 = desc->Width; height64 = depth64 = 1;
+            min_pitch_width = plane_width = (uint32_t)width64;
+            plane_height = 1;
+            footprint_format = 0;
+        } else {
+            width64 = d3d12_footprint_mip(desc->Width, mip);
+            height64 = desc->Dimension == 2 ? 1 : d3d12_footprint_mip(desc->Height, mip);
+            depth64 = desc->Dimension == 4 ? d3d12_footprint_mip(desc->DepthOrArraySize, mip) : 1;
+            if (width64 > UINT32_MAX || height64 > UINT32_MAX || depth64 > UINT32_MAX) goto invalid;
+            if (!d3d12_footprint_plane(desc->Format, plane, (uint32_t)width64, (uint32_t)height64,
+                                       &footprint_format, &min_pitch_width, &plane_width, &plane_height, &planar)) goto invalid;
+            if (!d3d_copy_format_block(footprint_format, &block_width, &block_height, &bytes_per_block)) goto invalid;
+            if (!planar) {
+                uint64_t aligned_width, aligned_height;
+                if (!d3d12_footprint_align(width64, block_width, &aligned_width) ||
+                    !d3d12_footprint_align(height64, block_height, &aligned_height) ||
+                    aligned_width > UINT32_MAX || aligned_height > UINT32_MAX) goto invalid;
+                plane_width = min_pitch_width = (uint32_t)aligned_width;
+                plane_height = (uint32_t)aligned_height;
+            }
+        }
+
+        uint64_t minimum_row_bytes = d3d12_footprint_ceil_div(min_pitch_width, block_width) * bytes_per_block;
+        uint64_t actual_row_bytes = d3d12_footprint_ceil_div(plane_width, block_width) * bytes_per_block;
+        uint64_t pitch;
+        uint32_t pitch_alignment = planar ? 512 : 256;
+        if (!minimum_row_bytes || !actual_row_bytes || !plane_height || !depth64 ||
+            !d3d12_footprint_align(minimum_row_bytes, pitch_alignment, &pitch) || pitch > UINT32_MAX) goto invalid;
+        uint64_t num_rows = planar ? plane_height : d3d12_footprint_ceil_div(plane_height, block_height);
+        uint64_t row_slices, padded_rows, size;
+        if (!num_rows || num_rows > UINT64_MAX / depth64) goto invalid;
+        row_slices = num_rows * depth64;
+        if (row_slices - 1 > UINT64_MAX / pitch) goto invalid;
+        padded_rows = (row_slices - 1) * pitch;
+        if (minimum_row_bytes > UINT64_MAX - padded_rows) goto invalid;
+        size = padded_rows + minimum_row_bytes;
+
+        uint64_t aligned_cursor, placed_offset;
+        if (!d3d12_footprint_align(cursor, 512, &aligned_cursor) || base > UINT64_MAX - aligned_cursor) goto invalid;
+        placed_offset = base + aligned_cursor;
+        if (layouts) layouts[i] = (FOOTPRINT){ placed_offset, footprint_format, plane_width, plane_height,
+                                                (uint32_t)depth64, (uint32_t)pitch };
+        if (rows) rows[i] = (uint32_t)num_rows;
+        if (row_bytes) row_bytes[i] = actual_row_bytes;
+        if (size > UINT64_MAX - aligned_cursor) goto invalid;
+        cursor = aligned_cursor + size;
+    }
+    if (total) *total = cursor;
+    return;
+
+invalid:
+    d3d12_footprints_invalid(n, layouts, rows, row_bytes, total);
 }
 
 static WINAPI HRESULT dev_create_committed(void *this, const HEAP_PROPS *hp, int32_t flags, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
     return create_committed(this, hp, flags, desc, state, clear, iid, out);
 }
+static WINAPI HRESULT dev_create_committed1(void *this, const HEAP_PROPS *hp, int32_t flags, const RES_DESC *desc,
+                                             int32_t state, const void *clear, void *protected_session,
+                                             const GUID *iid, void **out) {
+    if (protected_session) {
+        if (out) *out = NULL;
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    return create_committed(this, hp, flags, desc, state, clear, iid, out);
+}
+static WINAPI HRESULT dev_create_committed2(void *this, const HEAP_PROPS *hp, int32_t flags, const RES_DESC1 *desc,
+                                             int32_t state, const void *clear, void *protected_session,
+                                             const GUID *iid, void **out) {
+    if (!desc) { if (out) *out = NULL; return E_INVALIDARG; }
+    if (protected_session || desc->sampler_feedback_mip_region.Width || desc->sampler_feedback_mip_region.Height ||
+        desc->sampler_feedback_mip_region.Depth) {
+        if (out) *out = NULL;
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    return create_committed(this, hp, flags, &desc->resource, state, clear, iid, out);
+}
 
 static void device_destroy(d3d_object *o) {
     dev12 *d = (dev12 *)o;
+    gpu_ir_metal_device_release(d->common_metal);
+    d->common_metal = NULL;
+    d->cpu_transfer_queue = nil;
+    pthread_mutex_destroy(&d->submit_lock);
+    pthread_mutex_destroy(&d->format_lock);
+    pthread_mutex_destroy(&d->lock);
+    d->format_probe_library = nil;
+    d->format_probe_vertex = nil;
+    d->format_probe_fragment = nil;
     d->resources = nil;
     d->pso_cache = nil;
-    d->queue = nil;
     d->mtl = nil;
 }
 
@@ -2231,10 +9462,18 @@ static WINAPI HRESULT D3D12CreateDevice(void *adapter, int32_t min_level, const 
     dev12 *d = d3d_alloc(sizeof *d, K12_DEVICE, g_device_vtbl, NULL);
     d->base.destroy = device_destroy;
     d->mtl = mtl;
-    d->queue = [mtl newCommandQueue];
+    pthread_mutex_init(&d->lock, NULL);
+    pthread_mutex_init(&d->submit_lock, NULL);
+    pthread_mutex_init(&d->format_lock, NULL);
+    d->common_metal = gpu_ir_metal_device_create_for_metal_device((__bridge void *)mtl);
+    d->cpu_transfer_queue = [mtl newCommandQueue];
+    if (!d->common_metal || !d->cpu_transfer_queue) {
+        d3d_release(&d->base);
+        return E_OUTOFMEMORY;
+    }
+    d->typed_uav_load_additional_formats = d3d12_probe_typed_uav_load_additional_set(d);
     d->resources = [NSMutableArray new];
     d->pso_cache = [NSMutableDictionary new];
-    pthread_mutex_init(&d->lock, NULL);
     HRESULT hr = dev_query(d, iid, out);
     d3d_release(&d->base);
     return hr;
@@ -2276,12 +9515,17 @@ static void make_tables(void) {
         { "CopyDescriptorsSimple", (void *)dev_copy_simple }, { "CreateCommittedResource", (void *)dev_create_committed },
         { "CreateFence", (void *)dev_create_fence }, { "GetDeviceRemovedReason", (void *)dev_removed_reason },
         { "GetCopyableFootprints", (void *)dev_footprints }, { "MakeResident", (void *)dev_make_resident },
-        { "Evict", (void *)dev_make_resident }, { "GetAdapterLuid", (void *)dev_adapter_luid },
+        { "Evict", (void *)dev_evict }, { "SetResidencyPriority", (void *)dev_set_residency_priority },
+        { "EnqueueMakeResident", (void *)dev_enqueue_make_resident }, { "GetAdapterLuid", (void *)dev_adapter_luid },
         { "CreateGraphicsPipelineState", (void *)dev_create_graphics_pso }, { "CreateRenderTargetView", (void *)dev_create_rtv },
         { "CreateDepthStencilView", (void *)dev_create_dsv }, { "CreateHeap", (void *)dev_create_memheap },
         { "CreateHeap1", (void *)dev_create_memheap1 }, { "CreatePlacedResource", (void *)dev_create_placed },
-        { "CreatePlacedResource1", (void *)dev_create_placed1 }, { "GetResourceAllocationInfo", (void *)dev_allocation_info },
-        { "GetResourceAllocationInfo1", (void *)dev_allocation_info1 }, { "CreateQueryHeap", (void *)dev_create_query_heap }, { NULL, NULL } };
+        { "CreatePlacedResource1", (void *)dev_create_placed1 }, { "CreateCommandSignature", (void *)dev_create_command_signature },
+        { "GetResourceAllocationInfo", (void *)dev_allocation_info },
+        { "GetCustomHeapProperties", (void *)dev_custom_heap_properties },
+        { "GetResourceAllocationInfo1", (void *)dev_allocation_info1 }, { "CreateQueryHeap", (void *)dev_create_query_heap },
+        { "CreateCommittedResource1", (void *)dev_create_committed1 }, { "CreateCommittedResource2", (void *)dev_create_committed2 },
+        { NULL, NULL } };
     g_device_vtbl = D3D_VTABLE(ID3D12Device10, device);
     static const d3d_method queue[] = {
         { "QueryInterface", (void *)queue_query }, COMMON_METHODS, { "ExecuteCommandLists", (void *)queue_execute },
@@ -2299,7 +9543,9 @@ static void make_tables(void) {
         { "SetComputeRootConstantBufferView", (void *)list_set_root_va }, { "SetComputeRootShaderResourceView", (void *)list_set_root_va },
         { "SetComputeRootUnorderedAccessView", (void *)list_set_root_va }, { "Dispatch", (void *)list_dispatch },
         { "CopyBufferRegion", (void *)list_copy_buffer }, { "CopyResource", (void *)list_copy_resource },
-        { "CopyTextureRegion", (void *)list_copy_texture }, { "ResourceBarrier", (void *)list_barrier },
+        { "CopyTextureRegion", (void *)list_copy_texture }, { "ResolveSubresource", (void *)list_resolve_subresource },
+        { "ResolveSubresourceRegion", (void *)list_resolve_subresource_region },
+        { "ResourceBarrier", (void *)list_barrier }, { "ExecuteBundle", (void *)list_execute_bundle },
         { "SetGraphicsRootSignature", (void *)list_set_gfx_root }, { "SetGraphicsRootDescriptorTable", (void *)list_set_gfx_table },
         { "SetGraphicsRoot32BitConstant", (void *)list_set_gfx_constant }, { "SetGraphicsRoot32BitConstants", (void *)list_set_gfx_constants },
         { "SetGraphicsRootConstantBufferView", (void *)list_set_gfx_root_va }, { "SetGraphicsRootShaderResourceView", (void *)list_set_gfx_root_va },
@@ -2307,9 +9553,13 @@ static void make_tables(void) {
         { "IASetVertexBuffers", (void *)list_vbs }, { "IASetIndexBuffer", (void *)list_ib }, { "OMSetRenderTargets", (void *)list_targets },
         { "RSSetViewports", (void *)list_viewports }, { "RSSetScissorRects", (void *)list_scissors },
         { "ClearRenderTargetView", (void *)list_clear_rtv }, { "ClearDepthStencilView", (void *)list_clear_dsv },
+        { "ClearUnorderedAccessViewUint", (void *)list_clear_uav_uint },
+        { "ClearUnorderedAccessViewFloat", (void *)list_clear_uav_float },
         { "DrawInstanced", (void *)list_draw }, { "DrawIndexedInstanced", (void *)list_draw_indexed },
         { "OMSetBlendFactor", (void *)list_blend_factor }, { "OMSetStencilRef", (void *)list_stencil_ref },
-        { "BeginQuery", (void *)list_begin_query }, { "EndQuery", (void *)list_end_query }, { "ResolveQueryData", (void *)list_resolve_query }, { NULL, NULL } };
+        { "BeginQuery", (void *)list_begin_query }, { "EndQuery", (void *)list_end_query }, { "ResolveQueryData", (void *)list_resolve_query },
+        { "ExecuteIndirect", (void *)list_execute_indirect },
+        { "WriteBufferImmediate", (void *)list_write_buffer_immediate }, { NULL, NULL } };
     g_list_vtbl = D3D_VTABLE(ID3D12GraphicsCommandList7, list);
     static const d3d_method fence[] = {
         { "QueryInterface", (void *)fence_query }, COMMON_METHODS, { "GetCompletedValue", (void *)fence_completed },
@@ -2325,7 +9575,10 @@ static void make_tables(void) {
     g_pso_vtbl = D3D_VTABLE(ID3D12PipelineState, pso);
     static const d3d_method resource[] = {
         { "QueryInterface", (void *)res_query }, COMMON_METHODS, { "Map", (void *)res_map }, { "Unmap", (void *)res_unmap },
-        { "GetDesc", (void *)res_get_desc }, { "GetGPUVirtualAddress", (void *)res_gpu_va }, { "GetHeapProperties", (void *)res_get_heap_props }, { NULL, NULL } };
+        { "WriteToSubresource", (void *)res_write_to_subresource },
+        { "ReadFromSubresource", (void *)res_read_from_subresource },
+        { "GetDesc", (void *)res_get_desc }, { "GetDesc1", (void *)res_get_desc1 },
+        { "GetGPUVirtualAddress", (void *)res_gpu_va }, { "GetHeapProperties", (void *)res_get_heap_props }, { NULL, NULL } };
     g_resource_vtbl = D3D_VTABLE(ID3D12Resource2, resource);
     static const d3d_method memheap[] = {
         { "QueryInterface", (void *)memheap_query }, COMMON_METHODS, { "GetDesc", (void *)memheap_get_desc },
@@ -2333,6 +9586,8 @@ static void make_tables(void) {
     g_memheap_vtbl = D3D_VTABLE(ID3D12Heap1, memheap);
     static const d3d_method queryheap[] = { { "QueryInterface", (void *)queryheap_query }, COMMON_METHODS, { NULL, NULL } };
     g_queryheap_vtbl = D3D_VTABLE(ID3D12QueryHeap, queryheap);
+    static const d3d_method command_signature[] = { { "QueryInterface", (void *)command_signature_query }, COMMON_METHODS, { NULL, NULL } };
+    g_command_signature_vtbl = D3D_VTABLE(ID3D12CommandSignature, command_signature);
     static const d3d_method blob[] = { { "QueryInterface", (void *)blob_query }, { "AddRef", (void *)obj_addref }, { "Release", (void *)obj_release },
                                        { "GetBufferPointer", (void *)blob_pointer }, { "GetBufferSize", (void *)blob_size }, { NULL, NULL } };
     g_blob_vtbl = D3D_VTABLE(ID3D10Blob, blob);

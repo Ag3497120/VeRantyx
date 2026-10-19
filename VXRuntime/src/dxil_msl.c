@@ -27,7 +27,7 @@ static void put(sb *b, const char *fmt, ...) { va_list ap; va_start(ap, fmt); sb
 
 // ---- translation state --------------------------------------------------------------------------------------------
 
-typedef struct { uint8_t cls, kind, comp; uint32_t slot; uint32_t stride; int heap, sampler_heap; uint8_t cmp; } handle_info;
+typedef struct { uint8_t cls, kind, comp, has_counter; uint32_t slot; uint32_t stride; int heap, sampler_heap; uint8_t cmp, access; } handle_info;
 
 typedef struct {
     const dxil_module *m;
@@ -46,6 +46,8 @@ typedef struct {
     uint8_t *declared_types;    // struct and array types emitted
     // signatures (by element id)
     const dxil_md *insig, *outsig;
+    uint32_t sample_mask;
+    int apply_sample_mask;
     // the control flow
     uint32_t nb;
     uint32_t *term;             // the terminator instruction of each block
@@ -56,6 +58,8 @@ typedef struct {
     uint32_t nloops;
     char views[64][32];
     uint32_t nviews;
+    uint8_t heap_uav_access;
+    uint8_t unresolved_uav_access;
 } tr;
 
 static void err(tr *t, const char *fmt, ...) {
@@ -81,6 +85,53 @@ static const dxil_value *val(tr *t, uint32_t id) { return dxil_value_at(t->m, t-
 static uint32_t local(tr *t, uint32_t id) { return id - t->m->nmodule_values; }
 
 static int is_float_kind(int k) { return k == DXT_FLOAT || k == DXT_HALF || k == DXT_DOUBLE; }
+static const char *wave_active_predicate(tr *t) {
+    return t->out->stage == 0 && !(t->m->shader_feature_flags & DXIL_FEATURE_WAVE_OPS_INCLUDE_HELPER_LANES) ?
+        "!simd_is_helper_thread()" : "true";
+}
+static int wave_int_kind(const dxil_type *type) {
+    return type && type->kind == DXT_INT &&
+        (type->bits == 1 || type->bits == 8 || type->bits == 16 || type->bits == 32 || type->bits == 64);
+}
+static int wave_value_type_supported(tr *t, uint32_t type_id) {
+    const dxil_type *type = ty(t, type_id);
+    const dxil_type *component = type && type->kind == DXT_VECTOR ? ty(t, type->elem) : type;
+    if (!type || !component ||
+        (type->kind == DXT_VECTOR && (type->count < 2 || type->count > 4))) return 0;
+    return component->kind == DXT_FLOAT || component->kind == DXT_HALF || wave_int_kind(component);
+}
+static int wave_mask_type(tr *t, uint32_t type_id) {
+    const dxil_type *type = ty(t, type_id);
+    if (type && type->kind == DXT_VECTOR) {
+        const dxil_type *element = ty(t, type->elem);
+        return type->count == 4 && element && element->kind == DXT_INT && element->bits == 32;
+    }
+    // DXIL represents uint4 wave masks as the four-field dx.types.fouri32 aggregate.
+    if (!type || type->kind != DXT_STRUCT || type->count != 4) return 0;
+    for (uint32_t i = 0; i < 4; i++) {
+        const dxil_type *element = ty(t, type->members[i]);
+        if (!element || element->kind != DXT_INT || element->bits != 32) return 0;
+    }
+    return 1;
+}
+static void wave_shuffle_expression(tr *t, uint32_t value_id, const char *value, const char *lane,
+                                    char *out, size_t cap) {
+    const dxil_value *v = val(t, value_id);
+    const dxil_type *value_type = v ? ty(t, v->type) : NULL;
+    const dxil_type *component = value_type && value_type->kind == DXT_VECTOR ?
+        ty(t, value_type->elem) : value_type;
+    if (component && component->kind == DXT_INT && component->bits == 1) {
+        char uint_type[24];
+        if (value_type->kind == DXT_VECTOR) snprintf(uint_type, sizeof uint_type, "uint%u", value_type->count);
+        else snprintf(uint_type, sizeof uint_type, "uint");
+        if (value_type->kind == DXT_VECTOR)
+            snprintf(out, cap, "(simd_shuffle(%s(%s), ushort(%s)) != %s(0))", uint_type, value, lane, uint_type);
+        else
+            snprintf(out, cap, "(simd_shuffle(uint(%s), ushort(%s)) != 0u)", value, lane);
+    } else {
+        snprintf(out, cap, "simd_shuffle(%s, ushort(%s))", value, lane);
+    }
+}
 
 // ---- types ---------------------------------------------------------------------------------------------------------
 
@@ -141,6 +192,7 @@ static int int_bits(tr *t, uint32_t id) {
     if (y && y->kind == DXT_VECTOR) y = ty(t, y->elem);
     return y && y->kind == DXT_INT ? (int)y->bits : 0;
 }
+static const char *unsigned_name(int bits) { return bits <= 8 ? "uchar" : bits <= 16 ? "ushort" : bits <= 32 ? "uint" : "ulong"; }
 static int is_float(tr *t, uint32_t id) {
     const dxil_type *y = ty(t, id);
     if (y && y->kind == DXT_VECTOR) y = ty(t, y->elem);
@@ -240,6 +292,46 @@ static int64_t const_int(tr *t, uint32_t id, int *ok) {
 }
 static int is_undef(tr *t, uint32_t id) { const dxil_value *v = val(t, id); return v && v->kind == DXV_CONST_UNDEF; }
 
+// LLVM's shuffle mask is a fixed vector of i32 constants. Undef mask lanes, and indices outside the two
+// concatenated source vectors, produce undef/poison result lanes; zero is a valid lowering for those lanes.
+static int shuffle_mask_lane(tr *t, uint32_t mask_id, uint32_t lane, uint32_t *index, int *undefined) {
+    const dxil_value *mask = val(t, mask_id);
+    const dxil_type *mask_type = mask ? ty(t, mask->type) : NULL;
+    if (!mask || !mask_type || mask_type->kind != DXT_VECTOR || lane >= mask_type->count) return 0;
+    const dxil_type *element_type = ty(t, mask_type->elem);
+    if (!element_type || element_type->kind != DXT_INT || element_type->bits != 32) return 0;
+    *undefined = 0;
+    if (mask->kind == DXV_CONST_UNDEF) { *undefined = 1; return 1; }
+    if (mask->kind == DXV_CONST_NULL) { *index = 0; return 1; }
+
+    if (mask->kind == DXV_CONST_AGGREGATE) {
+        if (lane >= mask->u.list.n) return 0;
+        const dxil_value *element = val(t, mask->u.list.ids[lane]);
+        if (!element || element->type != mask_type->elem) return 0;
+        if (element->kind == DXV_CONST_UNDEF || element->kind == DXV_CONST_NULL) {
+            *undefined = 1;
+            return 1;
+        }
+        if (element->kind != DXV_CONST_INT) return 0;
+        if (element->u.i < 0 || (uint64_t)element->u.i > UINT32_MAX) {
+            *undefined = 1;
+            return 1;
+        }
+        *index = (uint32_t)element->u.i;
+        return 1;
+    }
+    if (mask->kind == DXV_CONST_DATA) {
+        if (lane >= mask->u.list.n || !mask->data) return 0;
+        uint32_t raw = (uint32_t)mask->data[lane];
+        int32_t signed_index;
+        memcpy(&signed_index, &raw, sizeof signed_index);
+        if (signed_index < 0) { *undefined = 1; return 1; }
+        *index = raw;
+        return 1;
+    }
+    return 0;
+}
+
 // The address space of a pointer value: 1 thread, 2 threadgroup, 3 constant.
 static uint8_t space_of(tr *t, uint32_t id) {
     const dxil_value *v = val(t, id);
@@ -284,6 +376,7 @@ static void read_resources(tr *t) {
             s->count = (uint32_t)md_i(t, r, 5, 1);
             if (cls == DXIL_SRV || cls == DXIL_UAV) {
                 s->kind = (uint8_t)md_i(t, r, 6, 0);
+                s->has_counter = cls == DXIL_UAV && md_i(t, r, 8, 0) != 0;
                 const dxil_md *ext = dxil_md_op(t->m, r, cls == DXIL_SRV ? 8 : 10);
                 s->comp = (uint8_t)md_tag(t, ext, 0, 9);
                 s->stride = (uint32_t)md_tag(t, ext, 1, 0);
@@ -309,6 +402,90 @@ static int slot_by_binding(tr *t, int cls, uint32_t space, uint32_t reg) {
         if (s->cls == cls && s->space == space && reg >= s->lower && (s->count == UINT32_MAX || reg - s->lower < s->count)) return (int)i;
     }
     return -1;
+}
+
+// DXIL handle values usually come directly from CreateHandle/AnnotateHandle. Follow those definitions (and
+// handle-valued selects/phis) so a write-only UAV can use Metal's less restrictive access::write type.
+static int resource_handle_slots(tr *t, uint32_t id, uint8_t *slots, int *heap, uint32_t depth) {
+    if (depth >= 32) return 0;
+    const dxil_value *v = val(t, id);
+    if (!v || v->kind != DXV_INST || v->u.index >= t->f->ninsts) return 0;
+    const dxil_inst *in = &t->f->insts[v->u.index];
+    if (in->op == DXI_CALL) {
+        int op = dxil_dxop(t->m, t->f, in);
+        if (op == 57 && in->n >= 4) {
+            int ok_cls = 0, ok_range = 0;
+            int cls = (int)const_int(t, in->ops[2], &ok_cls);
+            uint32_t range = (uint32_t)const_int(t, in->ops[3], &ok_range);
+            int slot = ok_cls && ok_range ? slot_by_range(t, cls, range) : -1;
+            if (slot < 0) return 0;
+            slots[slot] = 1;
+            return 1;
+        }
+        if (op == 217 && in->n >= 3) {
+            const dxil_value *bind = val(t, in->ops[2]);
+            if (!bind || bind->kind != DXV_CONST_AGGREGATE || bind->u.list.n < 4) return 0;
+            int ok_lower = 0, ok_space = 0, ok_cls = 0;
+            uint32_t lower = (uint32_t)const_int(t, bind->u.list.ids[0], &ok_lower);
+            uint32_t space = (uint32_t)const_int(t, bind->u.list.ids[2], &ok_space);
+            int cls = (int)const_int(t, bind->u.list.ids[3], &ok_cls);
+            int slot = ok_lower && ok_space && ok_cls ? slot_by_binding(t, cls, space, lower) : -1;
+            if (slot < 0) return 0;
+            slots[slot] = 1;
+            return 1;
+        }
+        if (op == 218) {
+            *heap = 1;
+            return 1;
+        }
+        if (op == 216 && in->n >= 3)
+            return resource_handle_slots(t, in->ops[2], slots, heap, depth + 1);
+        return 0;
+    }
+    if (in->op == DXI_PHI) {
+        int complete = in->n != 0;
+        for (uint32_t i = 0; i + 1 < in->n; i += 2)
+            complete &= resource_handle_slots(t, in->ops[i], slots, heap, depth + 1);
+        return complete;
+    }
+    if (in->op == DXI_SELECT && in->n >= 3)
+        return resource_handle_slots(t, in->ops[1], slots, heap, depth + 1) &&
+               resource_handle_slots(t, in->ops[2], slots, heap, depth + 1);
+    if (in->op == DXI_CAST && in->n >= 1)
+        return resource_handle_slots(t, in->ops[0], slots, heap, depth + 1);
+    return 0;
+}
+
+static void analyze_uav_accesses(tr *t) {
+    for (uint32_t i = 0; i < t->f->ninsts; i++) {
+        const dxil_inst *in = &t->f->insts[i];
+        int op = dxil_dxop(t->m, t->f, in);
+        uint8_t access = 0;
+        switch (op) {
+        case 66: case 68: case 139: access = DXIL_MSL_ACCESS_READ; break;
+        case 67: case 69: case 140: access = DXIL_MSL_ACCESS_WRITE; break;
+        case 78: case 79: access = DXIL_MSL_ACCESS_READ | DXIL_MSL_ACCESS_WRITE; break;
+        default: break;
+        }
+        if (!access || in->n < 3) continue;
+        uint8_t slots[64] = { 0 };
+        int heap = 0;
+        int complete = resource_handle_slots(t, in->ops[2], slots, &heap, 0);
+        for (uint32_t k = 0; k < t->out->nslots; k++)
+            if (slots[k] && t->out->slots[k].cls == DXIL_UAV)
+                t->out->slots[k].uav_access |= access;
+        if (heap) t->heap_uav_access |= access;
+        if (!complete) t->unresolved_uav_access |= access;
+    }
+    if (t->unresolved_uav_access) {
+        for (uint32_t i = 0; i < t->out->nslots; i++)
+            if (t->out->slots[i].cls == DXIL_UAV) t->out->slots[i].uav_access = DXIL_MSL_ACCESS_READ | DXIL_MSL_ACCESS_WRITE;
+        t->heap_uav_access = DXIL_MSL_ACCESS_READ | DXIL_MSL_ACCESS_WRITE;
+    }
+    for (uint32_t i = 0; i < t->out->nslots; i++)
+        if (t->out->slots[i].cls == DXIL_UAV && !t->out->slots[i].uav_access)
+            t->out->slots[i].uav_access = DXIL_MSL_ACCESS_READ | DXIL_MSL_ACCESS_WRITE;
+    if (!t->heap_uav_access) t->heap_uav_access = DXIL_MSL_ACCESS_READ | DXIL_MSL_ACCESS_WRITE;
 }
 
 static const dxil_md *signature_element(const dxil_md *sig, tr *t, uint32_t id) {
@@ -354,26 +531,34 @@ static void element_type(tr *t, const dxil_md *e, char *out, size_t cap) {
 
 // ---- handles ------------------------------------------------------------------------------------------------------
 
-static const char *tex_type(int kind, int comp, int uav) {
+static const char *tex_type(int kind, int comp, uint8_t access, int depth) {
     static char out[96];
     const char *c = comp == 4 || comp == 2 ? "int" : comp == 5 || comp == 3 ? "uint" : comp == 8 ? "half" : "float";
-    const char *dim = kind == 1 ? "texture1d" : kind == 2 ? "texture2d" : kind == 3 ? "texture2d_ms" : kind == 4 ? "texture3d" : kind == 5 ? "texturecube"
+    const char *dim = depth ? kind == 2 ? "depth2d" : kind == 7 ? "depth2d_array" :
+                               kind == 5 ? "depthcube" : kind == 9 ? "depthcube_array" : "depth2d"
+                    : kind == 1 ? "texture1d" : kind == 2 ? "texture2d" : kind == 3 ? "texture2d_ms" : kind == 4 ? "texture3d" : kind == 5 ? "texturecube"
                     : kind == 6 ? "texture1d_array" : kind == 7 ? "texture2d_array" : kind == 8 ? "texture2d_ms_array" : kind == 9 ? "texturecube_array"
-                    : kind == 10 ? "texture_buffer" : "texture2d";
-    snprintf(out, sizeof out, "%s<%s%s>", dim, c, uav ? ", access::read_write" : "");
+                    : kind == 10 || kind == 15 ? "texture_buffer" : "texture2d";
+    if (depth) c = "float";
+    const char *qualifier = access == DXIL_MSL_ACCESS_READ ? ", access::read" :
+        access == DXIL_MSL_ACCESS_WRITE ? ", access::write" :
+        access == (DXIL_MSL_ACCESS_READ | DXIL_MSL_ACCESS_WRITE) ? ", access::read_write" : "";
+    snprintf(out, sizeof out, "%s<%s%s>", dim, c, qualifier);
     return out;
 }
 
 // The view struct a handle is read through: the descriptor with its resource id as the right Metal type.
-static const char *view(tr *t, const handle_info *h) {
+static const char *view(tr *t, const handle_info *h, int depth) {
     char key[32];
     if (h->cls == DXIL_SAMPLER) snprintf(key, sizeof key, "VxS");
-    else snprintf(key, sizeof key, "VxV%d_%d_%d", h->kind, h->comp, h->cls == DXIL_UAV);
+    else snprintf(key, sizeof key, "VxV%d_%d_%d_%d_%d", h->kind, h->comp, h->cls == DXIL_UAV, h->access, depth);
     for (uint32_t i = 0; i < t->nviews; i++) if (!strcmp(t->views[i], key)) return t->views[i];
     if (t->nviews >= 64) { err(t, "too many resource views"); return "VxDesc"; }
     strcpy(t->views[t->nviews], key);
     if (h->cls == DXIL_SAMPLER) put(&t->prelude, "struct VxS { ulong va; sampler s; uint size, stride, fmt, flags; };\n");
-    else put(&t->prelude, "struct %s { ulong va; %s t; uint size, stride, fmt, flags; };\n", key, tex_type(h->kind, h->comp, h->cls == DXIL_UAV));
+    else if (h->kind == 11 || h->kind == 12) put(&t->prelude, "struct %s { ulong va; ulong t; uint size, stride, fmt, flags; };\n", key);
+    else put(&t->prelude, "struct %s { ulong va; %s t; uint size, stride, fmt, flags; };\n", key,
+             tex_type(h->kind, h->comp, h->cls == DXIL_UAV ? h->access : 0, depth));
     return t->views[t->nviews++];
 }
 
@@ -384,12 +569,28 @@ static handle_info *hinfo(tr *t, uint32_t id) {
 }
 
 // The texture expression of a handle: ((device const VxV.. *)h)->t
-static void tex_of(tr *t, uint32_t id, char *out, size_t cap) {
+static void tex_of(tr *t, uint32_t id, int depth, char *out, size_t cap) {
     handle_info *h = hinfo(t, id);
     char r[64];
     ref(t, id, r, sizeof r);
     if (!h) { err(t, "a resource handle that does not come from createHandle"); snprintf(out, cap, "0"); return; }
-    snprintf(out, cap, "((device const %s *)%s)->%s", view(t, h), r, h->cls == DXIL_SAMPLER ? "s" : "t");
+    snprintf(out, cap, "((device const %s *)%s)->%s", view(t, h, depth), r, h->cls == DXIL_SAMPLER ? "s" : "t");
+}
+
+static void desc_min_lod_of(tr *t, uint32_t id, char *out, size_t cap) {
+    char r[64];
+    if (!hinfo(t, id)) {
+        err(t, "a min-LOD clamp requires a resource handle");
+        snprintf(out, cap, "0.0f");
+        return;
+    }
+    ref(t, id, r, sizeof r);
+    snprintf(out, cap, "vx_desc_min_lod((device const VxDesc *)%s)", r);
+}
+
+static int sample_min_lod_supported(int kind) {
+    // Metal 1D textures have no min_lod_clamp overload. Metal 3D, 2D, arrays and cubes do.
+    return kind == 2 || kind == 4 || kind == 5 || kind == 7 || kind == 9;
 }
 
 // ---- instructions ---------------------------------------------------------------------------------------------------
@@ -453,7 +654,202 @@ static void resret(tr *t, const dxil_inst *in, const char *vec4, int status) {
          y && y->count > 4 ? (status ? ", 1u" : ", 0u") : "");
 }
 
+static void resret_min_lod_feature(tr *t, const dxil_inst *in, const char *supported_expr,
+                                   const char *fallback_expr, int status) {
+    line(t, "#if defined(VXRT_HAS_MIN_LOD_CLAMP)");
+    resret(t, in, supported_expr, status);
+    line(t, "#else");
+    resret(t, in, fallback_expr, status);
+    line(t, "#endif");
+}
+
+static int texture_load_offsets(tr *t, const dxil_inst *in, int kind, int64_t offsets[3]) {
+    uint32_t count = kind == 1 || kind == 6 ? 1 :
+                     kind == 2 || kind == 3 || kind == 7 || kind == 8 ? 2 :
+                     kind == 4 ? 3 : 0;
+    for (uint32_t i = 0; i < 3; i++) offsets[i] = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t operand = 7 + i;
+        if (operand >= in->n || is_undef(t, in->ops[operand])) continue;
+        const dxil_value *value = val(t, in->ops[operand]);
+        if (value && value->kind == DXV_CONST_NULL) continue;
+        if (!value || value->kind != DXV_CONST_INT || int_bits(t, value->type) != 32) {
+            err(t, "a TextureLoad offset that is not a static 32-bit integer");
+            return 0;
+        }
+        uint32_t bits = (uint32_t)value->u.i;
+        offsets[i] = bits <= INT32_MAX ? (int64_t)bits : (int64_t)bits - INT64_C(0x100000000);
+    }
+    return 1;
+}
+
+// DXIL Load guarantees zero for invalid coordinates, mip levels, array layers, and sample indices. Metal's
+// texture read is undefined outside those bounds, so guard it explicitly before issuing the read. Compute the
+// coordinate plus the statically encoded DXIL offset in 64 bits to keep signed overflow from wrapping in-bounds.
+static void emit_texture_load(tr *t, const dxil_inst *in, const char a[12][96], const handle_info *h) {
+    if (h->kind == 5 || h->kind == 9) {
+        err(t, "TextureLoad from cube resources is not supported by Direct3D");
+        return;
+    }
+    int64_t offsets[3];
+    if (!texture_load_offsets(t, in, h->kind, offsets)) return;
+
+    char tex[160];
+    tex_of(t, in->ops[2], 0, tex, sizeof tex);
+    uint32_t coordinate_count = (uint32_t)coord_count(h->kind);
+    static const char axes[] = { 'x', 'y', 'z' };
+    for (uint32_t i = 0; i < coordinate_count; i++)
+        line(t, "long vx_texture_load_%u_%c = long(int(%s)) + long(%lld);", in->result, axes[i],
+             a[2 + i], (long long)offsets[i]);
+
+    uint32_t valid_id = in->result;
+    line(t, "bool vx_texture_load_valid_%u = true;", valid_id);
+    int multisample = h->kind == 3 || h->kind == 8;
+    int array = h->kind == 6 || h->kind == 7 || h->kind == 8;
+    if (multisample) {
+        line(t, "vx_texture_load_valid_%u = int(%s) >= 0 && uint(%s) < %s.get_num_samples();",
+             valid_id, a[1], a[1], tex);
+    } else if (h->cls != DXIL_UAV) {
+        line(t, "vx_texture_load_valid_%u = int(%s) >= 0 && uint(%s) < %s.get_num_mip_levels();",
+             valid_id, a[1], a[1], tex);
+    }
+
+    for (uint32_t i = 0; i < coordinate_count; i++) {
+        const char *dimension = i == 0 ? "get_width" : i == 1 ? "get_height" : "get_depth";
+        char bound[384];
+        if (h->cls == DXIL_UAV || multisample) {
+            if (i == 2 && h->kind == 4)
+                snprintf(bound, sizeof bound,
+                    "vx_texture_load_%u_z >= 0 && ulong(vx_texture_load_%u_z) < ulong(%s->size) && "
+                    "ulong(vx_texture_load_%u_z) + ulong(%s->stride) < ulong(%s.get_depth())",
+                    valid_id, valid_id, a[0], valid_id, a[0], tex);
+            else
+                snprintf(bound, sizeof bound, "vx_texture_load_%u_%c >= 0 && "
+                         "vx_texture_load_%u_%c < long(%s.%s())",
+                         valid_id, axes[i], valid_id, axes[i], tex, dimension);
+        } else {
+            snprintf(bound, sizeof bound, "vx_texture_load_%u_%c >= 0 && "
+                     "vx_texture_load_%u_%c < long(%s.%s(uint(%s)))",
+                     valid_id, axes[i], valid_id, axes[i], tex, dimension, a[1]);
+        }
+        line(t, "if (vx_texture_load_valid_%u) vx_texture_load_valid_%u = %s;", valid_id, valid_id, bound);
+    }
+
+    char layer[128] = "";
+    if (array) {
+        const char *index = a[2 + coordinate_count];
+        line(t, "if (vx_texture_load_valid_%u) vx_texture_load_valid_%u = int(%s) >= 0 && "
+             "uint(%s) < %s.get_array_size();", valid_id, valid_id, index, index, tex);
+        snprintf(layer, sizeof layer, ", uint(%s)", index);
+    }
+
+    char coord[256];
+    if (coordinate_count == 1)
+        snprintf(coord, sizeof coord, "uint(vx_texture_load_%u_x)", valid_id);
+    else if (coordinate_count == 2)
+        snprintf(coord, sizeof coord, "uint2(uint(vx_texture_load_%u_x), uint(vx_texture_load_%u_y))",
+                 valid_id, valid_id);
+    else if (h->kind == 4 && h->cls == DXIL_UAV)
+        snprintf(coord, sizeof coord, "uint3(uint(vx_texture_load_%u_x), uint(vx_texture_load_%u_y), "
+                 "uint(vx_texture_load_%u_z) + %s->stride)", valid_id, valid_id, valid_id, a[0]);
+    else
+        snprintf(coord, sizeof coord, "uint3(uint(vx_texture_load_%u_x), uint(vx_texture_load_%u_y), "
+                 "uint(vx_texture_load_%u_z))", valid_id, valid_id, valid_id);
+
+    char read[512], expression[768];
+    if (multisample)
+        snprintf(read, sizeof read, "%s.read(%s%s, uint(%s))", tex, coord, layer, a[1]);
+    else if (h->cls == DXIL_UAV)
+        snprintf(read, sizeof read, "%s.read(%s%s)", tex, coord, layer);
+    else
+        snprintf(read, sizeof read, "%s.read(%s%s, uint(%s))", tex, coord, layer, a[1]);
+
+    const char *vector_type = h->comp == 2 || h->comp == 4 ? "int4" :
+                              h->comp == 3 || h->comp == 5 ? "uint4" : "float4";
+    snprintf(expression, sizeof expression, "(vx_texture_load_valid_%u ? %s(%s) : %s(0))",
+             valid_id, vector_type, read, vector_type);
+    resret(t, in, expression, 1);
+}
+
 static int buffer_kind(int kind) { return kind == 11 ? 1 : kind == 12 ? 2 : kind == 10 || kind == 15 ? 3 : 0; }   // raw, structured, typed
+
+static int atomic_texture_kind(int kind) {
+    return kind == 1 || kind == 2 || kind == 4 || kind == 6 || kind == 7 || kind == 10;
+}
+
+static int atomic_texture_arguments(tr *t, const handle_info *h, const char *const c[3], const char *desc,
+                                    const char *tex, char *coord, size_t coord_cap, char *bounds, size_t bounds_cap) {
+    switch (h->kind) {
+    case 1:
+        snprintf(coord, coord_cap, "uint(%s)", c[0]);
+        snprintf(bounds, bounds_cap, "int(%s) >= 0 && uint(%s) < %s.get_width()", c[0], c[0], tex);
+        break;
+    case 6:
+        snprintf(coord, coord_cap, "uint(%s), uint(%s)", c[0], c[1]);
+        snprintf(bounds, bounds_cap, "int(%s) >= 0 && uint(%s) < %s.get_width() && int(%s) >= 0 && uint(%s) < %s.get_array_size()",
+                 c[0], c[0], tex, c[1], c[1], tex);
+        break;
+    case 2:
+        snprintf(coord, coord_cap, "uint2(uint(%s), uint(%s))", c[0], c[1]);
+        snprintf(bounds, bounds_cap, "int(%s) >= 0 && uint(%s) < %s.get_width() && int(%s) >= 0 && uint(%s) < %s.get_height()",
+                 c[0], c[0], tex, c[1], c[1], tex);
+        break;
+    case 7:
+        snprintf(coord, coord_cap, "uint2(uint(%s), uint(%s)), uint(%s)", c[0], c[1], c[2]);
+        snprintf(bounds, bounds_cap, "int(%s) >= 0 && uint(%s) < %s.get_width() && int(%s) >= 0 && uint(%s) < %s.get_height() && int(%s) >= 0 && uint(%s) < %s.get_array_size()",
+                 c[0], c[0], tex, c[1], c[1], tex, c[2], c[2], tex);
+        break;
+    case 4:
+        snprintf(coord, coord_cap, "uint3(uint(%s), uint(%s), uint(%s))", c[0], c[1], c[2]);
+        snprintf(bounds, bounds_cap, "int(%s) >= 0 && uint(%s) < %s.get_width() && int(%s) >= 0 && uint(%s) < %s.get_height() && int(%s) >= 0 && uint(%s) < %s.get_depth()",
+                 c[0], c[0], tex, c[1], c[1], tex, c[2], c[2], tex);
+        if (h->cls == DXIL_UAV)
+            snprintf(coord, coord_cap, "uint3(uint(%s), uint(%s), uint(%s) + %s->stride)", c[0], c[1], c[2], desc);
+        if (h->cls == DXIL_UAV)
+            snprintf(bounds, bounds_cap, "int(%s) >= 0 && uint(%s) < %s.get_width() && int(%s) >= 0 && uint(%s) < %s.get_height() && int(%s) >= 0 && uint(%s) < %s->size && uint(%s) + %s->stride < %s.get_depth()",
+                     c[0], c[0], tex, c[1], c[1], tex, c[2], c[2], desc, c[2], desc, tex);
+        break;
+    case 10:
+        snprintf(coord, coord_cap, "uint(%s->va + uint(%s))", desc, c[0]);
+        snprintf(bounds, bounds_cap, "uint(%s) < %s->size", c[0], desc);
+        break;
+    default:
+        err(t, "atomics on DXIL resource kind %u are not supported", h->kind);
+        return 0;
+    }
+    return 1;
+}
+
+static void emit_texture_atomic_minmax(tr *t, const char *tex, const char *coord, const char *bounds,
+                                       const char *storage_vector_type, int signed_operation,
+                                       const char *operation, const char *value, const char *result) {
+    const char *type = signed_operation ? "int" : "uint";
+    line(t, "if (%s) {", bounds);
+    t->indent++;
+    line(t, "uint vx_old_bits = as_type<uint>(%s.atomic_load(%s).x);", tex, coord);
+    line(t, "bool vx_done = false;");
+    line(t, "while (!vx_done) {");
+    t->indent++;
+    line(t, "%s vx_value = %s(%s);", type, type, value);
+    line(t, "%s vx_old = as_type<%s>(vx_old_bits);", type, type);
+    line(t, "%s vx_new = %s(vx_old, vx_value);", type, operation);
+    line(t, "uint vx_new_bits = as_type<uint>(vx_new);");
+    line(t, "%s vx_expected = as_type<%s>(uint4(vx_old_bits));", storage_vector_type, storage_vector_type);
+    line(t, "vx_done = %s.atomic_compare_exchange_weak(%s, &vx_expected, as_type<%s>(uint4(vx_new_bits)));",
+         tex, coord, storage_vector_type);
+    line(t, "if (!vx_done) vx_old_bits = as_type<uint>(vx_expected.x);");
+    t->indent--;
+    line(t, "}");
+    if (result[0]) line(t, "%s = as_type<int>(vx_old_bits);", result);
+    else line(t, "(void)vx_old_bits;");
+    t->indent--;
+    line(t, "} else {");
+    t->indent++;
+    if (result[0]) line(t, "%s = 0;", result);
+    else line(t, "(void)0;");
+    t->indent--;
+    line(t, "}");
+}
 
 static void call(tr *t, const dxil_inst *in) {
     int op = dxil_dxop(t->m, t->f, in);
@@ -565,6 +961,8 @@ static void call(tr *t, const dxil_inst *in) {
         if (slot < 0) { err(t, "a handle for a resource not in dx.resources"); return; }
         const dxil_msl_slot *s = &t->out->slots[slot];
         h->cls = s->cls; h->kind = s->kind; h->comp = s->comp; h->slot = (uint32_t)slot; h->stride = s->stride;
+        h->access = s->cls == DXIL_UAV ? s->uav_access : 0;
+        h->has_counter = s->has_counter;
         line(t, "%s = (device const VxDesc *)(vx_root.slot[%d]) + (uint(%s) - %uu);", r, slot, index, s->lower);
         return;
     }
@@ -581,6 +979,10 @@ static void call(tr *t, const dxil_inst *in) {
             if (h->cls != DXIL_SAMPLER) h->cls = (basic >> 12) & 1 ? DXIL_UAV : (h->kind == 13 ? DXIL_CBV : h->kind == 14 ? DXIL_SAMPLER : DXIL_SRV);
             if (h->kind == 12) h->stride = extra; else if (h->kind != 11 && h->kind != 13) h->comp = extra & 0xFF;
             if (h->kind == 14) h->cls = DXIL_SAMPLER;
+            if (h->cls == DXIL_UAV)
+                h->access = h->heap ? t->heap_uav_access : h->slot < t->out->nslots ? t->out->slots[h->slot].uav_access : 0;
+            if (h->heap && h->cls <= DXIL_CBV)
+                t->out->heap_resource_classes |= 1u << h->cls;
         }
         line(t, "%s = %s;", r, a[0]);
         return;
@@ -603,64 +1005,292 @@ static void call(tr *t, const dxil_inst *in) {
     case 60: case 61: case 62: case 63: case 64: case 65: {       // Sample, SampleBias, SampleLevel, SampleGrad, SampleCmp, SampleCmpLevelZero
         handle_info *h = hinfo(t, in->ops[2]);
         if (!h) { err(t, "sampling a handle that does not come from createHandle"); return; }
-        if (op == 64 || op == 65) { err(t, "comparison sampling (SampleCmp) is not done yet"); return; }
+        int one_d = h->kind == 1 || h->kind == 6;
+        if (one_d && op == 60 && in->n > 8 && !is_undef(t, in->ops[8])) {
+            int constant_offset = 0;
+            int64_t offset = const_int(t, in->ops[8], &constant_offset);
+            if (!constant_offset || offset != 0) {
+                err(t, "Metal 1D textures cannot preserve nonzero or dynamic texel offsets");
+                return;
+            }
+        }
+        if (one_d && (op == 61 || op == 62 || op == 63)) {
+            err(t, "Metal 1D textures cannot preserve explicit bias, LOD, or gradients");
+            return;
+        }
+        if (one_d && op == 60 && in->n > 11 && !is_undef(t, in->ops[11])) {
+            err(t, "Metal 1D textures cannot preserve a sampler min-LOD clamp");
+            return;
+        }
+        if (op == 64 || op == 65) {
+            if (t->out->stage != 0) { err(t, "comparison sampling outside a pixel shader"); return; }
+            if (h->cls != DXIL_SRV || (h->kind != 2 && h->kind != 7 && h->kind != 5 && h->kind != 9)) {
+                err(t, "comparison sampling supports 2D, 2D-array, cube, and cube-array depth textures"); return;
+            }
+            handle_info *s = hinfo(t, in->ops[3]);
+            if (!s || s->cls != DXIL_SAMPLER) { err(t, "comparison sampling without a sampler handle"); return; }
+            char tex[160], smp[160], c[256], layer[128], off[64], opt[128] = "";
+            tex_of(t, in->ops[2], 1, tex, sizeof tex);
+            tex_of(t, in->ops[3], 0, smp, sizeof smp);
+            coords(t, in, 4, h->kind, "float", c, sizeof c, layer, sizeof layer);
+            offsets(t, in, 8, h->kind, off, sizeof off);
+            char lod[160], clamp[224];
+            desc_min_lod_of(t, in->ops[2], lod, sizeof lod);
+            if (op == 65) {
+                snprintf(opt, sizeof opt, ", level(max(0.0f, %s))", lod);
+            } else {
+                int shader_clamp = in->n > 12 && !is_undef(t, in->ops[12]);
+                if (shader_clamp) {
+                    char shader_lod[96];
+                    ref(t, in->ops[12], shader_lod, sizeof shader_lod);
+                    snprintf(clamp, sizeof clamp, "max(%s, %s)", lod, shader_lod);
+                    t->out->uses_min_lod_clamp = 1;
+                } else snprintf(clamp, sizeof clamp, "%s", lod);
+                snprintf(opt, sizeof opt, ", min_lod_clamp(%s)", clamp);
+            }
+            char e[700];
+            snprintf(e, sizeof e, "float4(%s.sample_compare(%s, %s%s, %s%s%s), 0.0f, 0.0f, 0.0f)", tex, smp, c, layer, a[9], opt, off);
+            if (op == 65) resret(t, in, e, 1);
+            else {
+                char fallback[700];
+                snprintf(fallback, sizeof fallback, "float4(%s.sample_compare(%s, %s%s, %s%s), 0.0f, 0.0f, 0.0f)",
+                         tex, smp, c, layer, a[9], off);
+                resret_min_lod_feature(t, in, e, fallback, 1);
+            }
+            return;
+        }
         char tex[160], smp[160], c[256], layer[128], off[64], opt[256] = "";
-        tex_of(t, in->ops[2], tex, sizeof tex);
-        tex_of(t, in->ops[3], smp, sizeof smp);
+        tex_of(t, in->ops[2], 0, tex, sizeof tex);
+        tex_of(t, in->ops[3], 0, smp, sizeof smp);
         coords(t, in, 4, h->kind, "float", c, sizeof c, layer, sizeof layer);
         offsets(t, in, 8, h->kind, off, sizeof off);
-        int n = in->n - 2;
+        char lod[160];
+        desc_min_lod_of(t, in->ops[2], lod, sizeof lod);
         if (op == 61) snprintf(opt, sizeof opt, ", bias(%s)", a[9]);
-        if (op == 62) snprintf(opt, sizeof opt, ", level(%s)", a[9]);
+        if (op == 62) snprintf(opt, sizeof opt, ", level(max(float(%s), %s))", a[9], lod);
         if (op == 63) {
             int k = coord_count(h->kind);
-            const char *g = h->kind == 5 || h->kind == 9 ? "gradientcube" : k == 3 ? "gradient3d" : "gradient2d";
-            if (k == 3) snprintf(opt, sizeof opt, ", %s(float3(%s, %s, %s), float3(%s, %s, %s))", g, a[9], a[10], a[11], a[12 < n ? 11 : 11], a[11], a[11]);
-            else snprintf(opt, sizeof opt, ", %s(float2(%s, %s), float2(%s, %s))", g, a[9], a[10], a[11 + 1 < 12 ? 11 : 11], a[11]);
-            if (k == 3 || h->kind == 5) { err(t, "SampleGrad on 3D and cube textures is not done yet"); return; }
-            char b[4][96];
-            args(t, in, 2 + 9, 4, b);
-            snprintf(opt, sizeof opt, ", gradient2d(float2(%s, %s), float2(%s, %s))", b[0], b[2 - 0 > 0 ? 1 : 1], b[2], b[3]);
-            // (DXIL: ddx0, ddx1, ddx2, ddy0, ddy1, ddy2)
+            // DXIL's fixed sampleGrad signature stores ddx0..2 and ddy0..2 at operands 11..16.
+            // Keep this separate from `a`: it only retains the first 12 call arguments.
+            if (in->n <= 16) { err(t, "SampleGrad is missing gradient operands"); return; }
+            if (h->kind == 3 || h->kind == 8) { err(t, "SampleGrad on multisampled textures"); return; }
             char d[6][96];
-            args(t, in, 2 + 9, 6, d);
-            snprintf(opt, sizeof opt, ", gradient2d(float2(%s, %s), float2(%s, %s))", d[0], d[1], d[3], d[4]);
+            args(t, in, 11, 6, d);
+            if (h->kind == 5 || h->kind == 9)
+                snprintf(opt, sizeof opt, ", gradientcube(float3(%s, %s, %s), float3(%s, %s, %s))",
+                         d[0], d[1], d[2], d[3], d[4], d[5]);
+            else if (k == 3)
+                snprintf(opt, sizeof opt, ", gradient3d(float3(%s, %s, %s), float3(%s, %s, %s))",
+                         d[0], d[1], d[2], d[3], d[4], d[5]);
+            else if (k == 2)
+                snprintf(opt, sizeof opt, ", gradient2d(float2(%s, %s), float2(%s, %s))",
+                         d[0], d[1], d[3], d[4]);
+            else { err(t, "SampleGrad on unsupported texture kind %u", h->kind); return; }
+
+            // The optional min-LOD clamp is the last operand in the canonical DXIL sampleGrad signature.
+            if (in->n > 17 && !is_undef(t, in->ops[17])) {
+                char shader_lod[96], clamp[224];
+                ref(t, in->ops[17], shader_lod, sizeof shader_lod);
+                if (!sample_min_lod_supported(h->kind)) {
+                    err(t, "a min-LOD clamp on unsupported texture kind %u", h->kind);
+                    return;
+                }
+                snprintf(clamp, sizeof clamp, "max(%s, %s)", lod, shader_lod);
+                size_t used = strlen(opt);
+                snprintf(opt + used, sizeof opt - used, ", min_lod_clamp(%s)", clamp);
+                t->out->uses_min_lod_clamp = 1;
+            }
         }
-        if ((op == 60 || op == 61) && in->n > 2 + 10 && !is_undef(t, in->ops[2 + (op == 60 ? 9 : 10)])) {
-            char cl[96];
-            ref(t, in->ops[2 + (op == 60 ? 9 : 10)], cl, sizeof cl);
-            if (h->kind == 2 || h->kind == 7 || h->kind == 4 || h->kind == 5) { size_t l = strlen(opt); snprintf(opt + l, sizeof opt - l, ", min_lod_clamp(%s)", cl); }
+        uint32_t clamp_index = op == 60 ? 11u : 12u;
+        if ((op == 60 || op == 61) && in->n > clamp_index && !is_undef(t, in->ops[clamp_index])) {
+            char shader_lod[96], clamp[224];
+            ref(t, in->ops[clamp_index], shader_lod, sizeof shader_lod);
+            if (sample_min_lod_supported(h->kind)) {
+                snprintf(clamp, sizeof clamp, "max(%s, %s)", lod, shader_lod);
+                size_t used = strlen(opt);
+                snprintf(opt + used, sizeof opt - used, ", min_lod_clamp(%s)", clamp);
+                t->out->uses_min_lod_clamp = 1;
+            } else {
+                err(t, "a min-LOD clamp on unsupported texture kind %u", h->kind);
+                return;
+            }
         }
-        if (h->kind == 1 || h->kind == 6) opt[0] = 0;              // (Metal's 1D textures take no level options)
+        char e[700], fallback[700];
+        if (sample_min_lod_supported(h->kind)) {
+            if (op == 60 || op == 61 || op == 63) {
+                int already_has_clamp = (op == 63 && in->n > 17 && !is_undef(t, in->ops[17])) ||
+                    ((op == 60 || op == 61) && in->n > clamp_index && !is_undef(t, in->ops[clamp_index]));
+                if (!already_has_clamp) {
+                    size_t used = strlen(opt);
+                    snprintf(opt + used, sizeof opt - used, ", min_lod_clamp(%s)", lod);
+                }
+                snprintf(e, sizeof e, "float4(%s.sample(%s, %s%s%s%s))", tex, smp, c, layer, opt, off);
+                char fallback_opt[256] = "";
+                if (op == 61) snprintf(fallback_opt, sizeof fallback_opt, ", bias(%s)", a[9]);
+                if (op == 63) {
+                    int k = coord_count(h->kind);
+                    char d[6][96];
+                    args(t, in, 11, 6, d);
+                    if (h->kind == 5 || h->kind == 9)
+                        snprintf(fallback_opt, sizeof fallback_opt, ", gradientcube(float3(%s, %s, %s), float3(%s, %s, %s))",
+                                 d[0], d[1], d[2], d[3], d[4], d[5]);
+                    else if (k == 3)
+                        snprintf(fallback_opt, sizeof fallback_opt, ", gradient3d(float3(%s, %s, %s), float3(%s, %s, %s))",
+                                 d[0], d[1], d[2], d[3], d[4], d[5]);
+                    else if (k == 2)
+                        snprintf(fallback_opt, sizeof fallback_opt, ", gradient2d(float2(%s, %s), float2(%s, %s))",
+                                 d[0], d[1], d[3], d[4]);
+                }
+                snprintf(fallback, sizeof fallback, "float4(%s.sample(%s, %s%s%s%s))", tex, smp, c, layer, fallback_opt, off);
+                resret_min_lod_feature(t, in, e, fallback, 1);
+            } else {
+                snprintf(e, sizeof e, "float4(%s.sample(%s, %s%s%s%s))", tex, smp, c, layer, opt, off);
+                resret(t, in, e, 1);
+            }
+        } else {
+            snprintf(e, sizeof e, "float4(%s.sample(%s, %s%s%s%s))", tex, smp, c, layer, opt, off);
+            resret(t, in, e, 1);
+        }
+        return;
+    }
+    case 73: case 74: {                                           // TextureGather, TextureGatherCmp
+        t->out->uses_gather = 1;
+        uint32_t expected_operands = op == 73 ? 11u : 12u;
+        if (in->n != expected_operands) {
+            err(t, "malformed texture gather signature: expected %u operands, got %u", expected_operands, in->n);
+            return;
+        }
+        handle_info *h = hinfo(t, in->ops[2]);
+        handle_info *sampler = hinfo(t, in->ops[3]);
+        if (!h || h->cls != DXIL_SRV || !sampler || sampler->cls != DXIL_SAMPLER) {
+            err(t, "gather requires an SRV texture and sampler handle");
+            return;
+        }
+        if (h->kind != 2 && h->kind != 7 && h->kind != 5 && h->kind != 9) {
+            err(t, "gather supports only 2D, 2D-array, cube and cube-array textures");
+            return;
+        }
+
+        int ok;
+        uint32_t channel = (uint32_t)const_int(t, in->ops[10], &ok);
+        if (!ok || channel > 3) {
+            err(t, "gather channel must be a constant in [0, 3]");
+            return;
+        }
+        // Comparison gather addresses the depth component. DXIL still carries the channel operand, which must be 0.
+        if (op == 74 && channel != 0) {
+            err(t, "comparison gather must select the depth component");
+            return;
+        }
+        if (h->kind == 2 || h->kind == 7) {
+            for (uint32_t i = 0; i < 2; i++) {
+                uint32_t offset_id = in->ops[8 + i];
+                if (is_undef(t, offset_id)) continue;
+                int offset_ok;
+                int64_t offset = const_int(t, offset_id, &offset_ok);
+                if (!offset_ok || offset < -8 || offset > 7) {
+                    err(t, "Metal gather offsets must be constants in [-8, 7]");
+                    return;
+                }
+            }
+        }
+
+        char tex[160], smp[160], c[256], layer[128], off[64];
+        tex_of(t, in->ops[2], op == 74, tex, sizeof tex);
+        tex_of(t, in->ops[3], 0, smp, sizeof smp);
+        coords(t, in, 4, h->kind, "float", c, sizeof c, layer, sizeof layer);
+        offsets(t, in, 8, h->kind, off, sizeof off);
         char e[700];
-        snprintf(e, sizeof e, "float4(%s.sample(%s, %s%s%s%s))", tex, smp, c, layer, opt, off);
+        if (op == 73) {
+            static const char *components[] = { "component::x", "component::y", "component::z", "component::w" };
+            if (h->kind == 2 || h->kind == 7)
+                snprintf(e, sizeof e, "%s.gather(%s, %s%s%s, %s)", tex, smp, c, layer, off, components[channel]);
+            else
+                snprintf(e, sizeof e, "%s.gather(%s, %s%s, %s)", tex, smp, c, layer, components[channel]);
+        } else if (h->kind == 2 || h->kind == 7) {
+            snprintf(e, sizeof e, "%s.gather_compare(%s, %s%s, %s%s)", tex, smp, c, layer, a[9], off);
+        } else {
+            snprintf(e, sizeof e, "%s.gather_compare(%s, %s%s, %s)", tex, smp, c, layer, a[9]);
+        }
         resret(t, in, e, 1);
         return;
     }
     case 66: {                                                     // TextureLoad(srv, mip or sample, c0, c1, c2, o0, o1, o2)
         handle_info *h = hinfo(t, in->ops[2]);
         if (!h) { err(t, "a load from a handle that does not come from createHandle"); return; }
-        char tex[160], c[256], layer[128];
-        tex_of(t, in->ops[2], tex, sizeof tex);
-        coords(t, in, 4, h->kind, "uint", c, sizeof c, layer, sizeof layer);
-        char e[700];
-        if (h->kind == 10) snprintf(e, sizeof e, "float4(%s.read(uint(%s)))", tex, a[2]);   // (typed buffer as a texture buffer)
-        else if (h->kind == 3 || h->kind == 8) snprintf(e, sizeof e, "float4(%s.read(%s%s, uint(%s)))", tex, c, layer, a[1]);
-        else if (h->cls == DXIL_UAV || h->kind == 1 || h->kind == 6) snprintf(e, sizeof e, "float4(%s.read(%s%s))", tex, c, layer);
-        else snprintf(e, sizeof e, "float4(%s.read(%s%s, uint(%s)))", tex, c, layer, a[1]);
-        int ints = h->comp == 4 || h->comp == 5 || h->comp == 2 || h->comp == 3;
-        if (ints) { char *p = strstr(e, "float4("); if (p) memcpy(p, "uint4( ", 7); }
-        resret(t, in, e, 1);
+        if (h->cls == DXIL_SRV && !buffer_kind(h->kind) && h->kind != 3 && h->kind != 8)
+            t->out->uses_texture_load = 1;
+        if (buffer_kind(h->kind) == 3) {
+            char tex[160], e[300];
+            tex_of(t, in->ops[2], 0, tex, sizeof tex);
+            const char *vt = h->comp == 4 || h->comp == 2 ? "int4" : h->comp == 5 || h->comp == 3 ? "uint4"
+                         : h->comp == 8 ? "half4" : "float4";
+            snprintf(e, sizeof e, "uint(%s) < %s->size ? %s(%s.read(uint(%s->va + uint(%s)))) : %s(0)",
+                     a[2], a[0], vt, tex, a[0], a[2], vt);             // typed-buffer index within the D3D12 view
+            resret(t, in, e, 1);
+        }
+        else emit_texture_load(t, in, a, h);
+        return;
+    }
+    case 72: {                                                     // GetDimensions(resource, mip)
+        handle_info *h = hinfo(t, in->ops[2]);
+        if (!h) { err(t, "GetDimensions on a handle that does not come from createHandle"); return; }
+        if (h->cls != DXIL_SRV && h->cls != DXIL_UAV) { err(t, "GetDimensions on a non-SRV/UAV resource"); return; }
+        char e[640];
+        int bk = buffer_kind(h->kind);
+        if (bk == 1) {
+            snprintf(e, sizeof e, "uint4(%s->size, 0u, 0u, 0u)", a[0]);  // ByteAddressBuffer: bytes
+        } else if (bk == 2) {
+            snprintf(e, sizeof e, "uint4(%s->stride ? %s->size / %s->stride : 0u, %s->stride, 0u, 0u)", a[0], a[0], a[0], a[0]);
+        } else if (bk == 3) {
+            snprintf(e, sizeof e, "uint4(%s->size, 0u, 0u, 0u)", a[0]);
+        } else {
+            char tex[160];
+            tex_of(t, in->ops[2], 0, tex, sizeof tex);
+            const char *lod = h->cls == DXIL_UAV ? "0u" : a[1];
+            char width[192], height[192] = "0u", depth[192] = "0u", layers[192] = "0u", fourth[192] = "0u";
+            if (h->kind == 1 || h->kind == 6) {
+                snprintf(width, sizeof width, "%s.get_width(uint(%s))", tex, lod);
+                if (h->kind == 6) snprintf(height, sizeof height, "%s.get_array_size()", tex);
+                if (h->cls != DXIL_UAV) snprintf(fourth, sizeof fourth, "%s.get_num_mip_levels()", tex);
+            } else if (h->kind == 2 || h->kind == 7 || h->kind == 4 || h->kind == 5 || h->kind == 9) {
+                snprintf(width, sizeof width, "%s.get_width(uint(%s))", tex, lod);
+                snprintf(height, sizeof height, "%s.get_height(uint(%s))", tex, lod);
+                if (h->kind == 4 && h->cls == DXIL_UAV)
+                    snprintf(depth, sizeof depth, "((%s->flags & %uu) != 0u ? %s->size : %s.get_depth(uint(%s)))",
+                        a[0], DXIL_MSL_DESC_HAS_W_SLICE_RANGE, a[0], tex, lod);
+                else if (h->kind == 4) snprintf(depth, sizeof depth, "%s.get_depth(uint(%s))", tex, lod);
+                if (h->kind == 7 || h->kind == 9) snprintf(layers, sizeof layers, "%s.get_array_size()", tex);
+                if (h->cls != DXIL_UAV) snprintf(fourth, sizeof fourth, "%s.get_num_mip_levels()", tex);
+            } else if (h->kind == 3 || h->kind == 8) {
+                snprintf(width, sizeof width, "%s.get_width()", tex);
+                snprintf(height, sizeof height, "%s.get_height()", tex);
+                if (h->kind == 8) snprintf(layers, sizeof layers, "%s.get_array_size()", tex);
+                snprintf(fourth, sizeof fourth, "%s.get_num_samples()", tex);
+            } else {
+                err(t, "GetDimensions for resource kind %u", h->kind);
+                return;
+            }
+            // DXIL returns width, height, depth/array size, then mip levels or sample count.
+            const char *c2 = h->kind == 4 ? depth : layers;
+            snprintf(e, sizeof e, "uint4(%s, %s, %s, %s)", width, height, c2, fourth);
+        }
+        resret(t, in, e, 0);
         return;
     }
     case 67: {                                                     // TextureStore(uav, c0, c1, c2, v0..v3, mask)
         handle_info *h = hinfo(t, in->ops[2]);
         if (!h) { err(t, "a store to a handle that does not come from createHandle"); return; }
         char tex[160], c[256], layer[128];
-        tex_of(t, in->ops[2], tex, sizeof tex);
+        tex_of(t, in->ops[2], 0, tex, sizeof tex);
         coords(t, in, 3, h->kind, "uint", c, sizeof c, layer, sizeof layer);
         int ints = h->comp == 4 || h->comp == 5 || h->comp == 2 || h->comp == 3;
         const char *vt = h->comp == 4 || h->comp == 2 ? "int4" : ints ? "uint4" : h->comp == 8 ? "half4" : "float4";
+        if (h->kind == 4 && h->cls == DXIL_UAV) {
+            line(t, "if (uint(%s) < %s->size) %s.write(%s(%s, %s, %s, %s), uint3(uint(%s), uint(%s), uint(%s) + %s->stride));",
+                 a[3], a[0], tex, vt, a[4], a[5], a[6], a[7], a[1], a[2], a[3], a[0]);
+            return;
+        }
         line(t, "%s.write(%s(%s, %s, %s, %s), %s%s);", tex, vt, a[4], a[5], a[6], a[7], c, layer);
         return;
     }
@@ -671,9 +1301,11 @@ static void call(tr *t, const dxil_inst *in) {
         char e[400];
         if (bk == 3) {
             char tex[160];
-            tex_of(t, in->ops[2], tex, sizeof tex);
-            int ints = h->comp == 4 || h->comp == 5 || h->comp == 2 || h->comp == 3;
-            snprintf(e, sizeof e, "%s(%s.read(uint(%s)))", ints ? "uint4" : "float4", tex, a[1]);
+            tex_of(t, in->ops[2], 0, tex, sizeof tex);
+            const char *vt = h->comp == 4 || h->comp == 2 ? "int4" : h->comp == 5 || h->comp == 3 ? "uint4"
+                         : h->comp == 8 ? "half4" : "float4";
+            snprintf(e, sizeof e, "uint(%s) < %s->size ? %s(%s.read(uint(%s->va + uint(%s)))) : %s(0)",
+                     a[1], a[0], vt, tex, a[0], a[1], vt);
         } else {
             char addr[256];
             if (bk == 2 && !(op == 139 && is_undef(t, in->ops[4]))) snprintf(addr, sizeof addr, "uint(%s) * %s->stride + uint(%s)", a[1], a[0], a[2]);
@@ -693,9 +1325,11 @@ static void call(tr *t, const dxil_inst *in) {
         if (!ok) mask = 15;
         if (bk == 3) {
             char tex[160];
-            tex_of(t, in->ops[2], tex, sizeof tex);
-            int ints = h->comp == 4 || h->comp == 5 || h->comp == 2 || h->comp == 3;
-            line(t, "%s.write(%s(%s, %s, %s, %s), uint(%s));", tex, ints ? "uint4" : "float4", a[3], a[4], a[5], a[6], a[1]);
+            tex_of(t, in->ops[2], 0, tex, sizeof tex);
+            const char *vt = h->comp == 4 || h->comp == 2 ? "int4" : h->comp == 5 || h->comp == 3 ? "uint4"
+                         : h->comp == 8 ? "half4" : "float4";
+            line(t, "if (uint(%s) < %s->size) %s.write(%s(%s, %s, %s, %s), uint(%s->va + uint(%s)));",
+                 a[1], a[0], tex, vt, a[3], a[4], a[5], a[6], a[0], a[1]);
             return;
         }
         char addr[256];
@@ -708,43 +1342,116 @@ static void call(tr *t, const dxil_inst *in) {
         }
         return;
     }
+    case 70: {                                                     // BufferUpdateCounter(handle, +/-1)
+        handle_info *h = hinfo(t, in->ops[2]);
+        const dxil_value *delta = in->n == 4 ? val(t, in->ops[3]) : NULL;
+        const dxil_type *delta_type = delta ? ty(t, delta->type) : NULL;
+        if (in->n != 4 || !h || h->cls != DXIL_UAV || h->kind != 12 ||
+            (!h->has_counter && !h->heap) || !delta_type || delta_type->kind != DXT_INT || delta_type->bits != 8 ||
+            in->result != UINT32_MAX) {
+            err(t, "a counter update on a handle without a structured UAV counter");
+            return;
+        }
+        t->out->uses_counters = 1;
+        line(t, "if ((%s->flags & %uu) != 0u) atomic_fetch_add_explicit((device atomic_uint *)%s->res, uint(int(as_type<char>(%s))), memory_order_relaxed);",
+             a[0], DXIL_MSL_DESC_HAS_COUNTER, a[0], a[1]);
+        return;
+    }
     case 78: case 79: {                                            // AtomicBinOp(h, op, c0, c1, c2, v), AtomicCompareExchange(h, c0, c1, c2, cmp, v)
         handle_info *h = hinfo(t, in->ops[2]);
-        if (!h) { err(t, "an atomic on a handle that does not come from createHandle"); return; }
+        if (in->n != 8 || !h) { err(t, "an atomic on a handle that does not come from createHandle"); return; }
+        if (h->cls != DXIL_UAV) { err(t, "an atomic on a non-UAV resource"); return; }
         int bk = buffer_kind(h->kind);
-        if (!bk || bk == 3) { err(t, "atomics on textures are not done yet"); return; }
+        if (h->kind == 12 && !h->stride) { err(t, "an atomic on a structured buffer without a stride"); return; }
+        if (bk == 3 && (h->kind != 10 || (h->comp != 4 && h->comp != 5))) {
+            err(t, "typed-buffer atomics require an R32_SINT or R32_UINT view"); return;
+        }
+        if (!bk && (!atomic_texture_kind(h->kind) || (h->comp != 4 && h->comp != 5))) {
+            err(t, "atomics require a typed integer UAV with 32-bit components"); return;
+        }
         uint32_t c0 = op == 78 ? 4 : 3;
         char c[3][96];
         for (int k = 0; k < 3; k++) ref(t, in->ops[c0 + k], c[k], 96);
-        char addr[256];
-        if (bk == 2) snprintf(addr, sizeof addr, "uint(%s) * %s->stride + uint(%s)", c[0], a[0], c[1]);
-        else snprintf(addr, sizeof addr, "uint(%s)", c[0]);
+        char offset[192] = { 0 }, bounds[512] = { 0 }, tex[160] = { 0 }, coord[192] = { 0 };
+        if (bk == 1 || bk == 2) {
+            if (bk == 2) snprintf(offset, sizeof offset, "ulong(uint(%s)) * ulong(%s->stride) + ulong(uint(%s))", c[0], a[0], c[1]);
+            else snprintf(offset, sizeof offset, "ulong(uint(%s))", c[0]);
+            snprintf(bounds, sizeof bounds, "%s->size >= 4u && vx_offset <= ulong(%s->size - 4u) && (vx_offset & 3ul) == 0ul", a[0], a[0]);
+        } else {
+            const char *coords[3] = { c[0], c[1], c[2] };
+            tex_of(t, in->ops[2], 0, tex, sizeof tex);
+            atomic_texture_arguments(t, h, coords, a[0], tex, coord, sizeof coord, bounds, sizeof bounds);
+            if (t->failed) return;
+        }
         if (op == 78) {
             int ok;
             int aop = (int)const_int(t, in->ops[3], &ok);
             static const char *fn[] = { "add", "and", "or", "xor", "min", "max", "min", "max", "exchange" };
-            if (!ok || aop > 8) { err(t, "atomic operation %d", aop); return; }
-            int sgn = aop == 4 || aop == 5;
+            if (!ok || aop < 0 || aop > 8) { err(t, "atomic operation %d", aop); return; }
+            int signed_operation = aop == 4 || aop == 5;
+            const char *type = (bk == 1 || bk == 2) ? (signed_operation ? "int" : "uint")
+                                                     : h->comp == 4 ? "int" : "uint";
             char v[96];
+            char result_stmt[96], oob_stmt[96];
             ref(t, in->ops[7], v, sizeof v);
-            line(t, "%s%s%s(atomic_%s_explicit((device atomic_%s *)(%s->va + (%s)), %s(%s), memory_order_relaxed));", r[0] ? r : "", r[0] ? " = " : "",
-                 r[0] ? tn : "", aop == 8 ? "exchange" : (snprintf(a[11], 96, "fetch_%s", fn[aop]), a[11]), sgn ? "int" : "uint", a[0], addr, sgn ? "as_type<int>" : "uint", v);
+            if (r[0]) { snprintf(result_stmt, sizeof result_stmt, "%s = as_type<int>(vx_old);", r); snprintf(oob_stmt, sizeof oob_stmt, "%s = 0;", r); }
+            else { snprintf(result_stmt, sizeof result_stmt, "(void)vx_old;"); snprintf(oob_stmt, sizeof oob_stmt, "(void)0;"); }
+            if (bk == 1 || bk == 2) {
+                const char *atomic_fn = aop == 8 ? "exchange" : (snprintf(a[11], 96, "fetch_%s", fn[aop]), a[11]);
+                line(t, "{ ulong vx_offset = %s; if (%s) { auto vx_old = atomic_%s_explicit((device atomic_%s *)(%s->va + vx_offset), %s(%s), memory_order_relaxed); %s } else { %s } }",
+                     offset, bounds, atomic_fn, type, a[0], type, v, result_stmt, oob_stmt);
+            } else {
+                const char *atomic_fn = aop == 8 ? "atomic_exchange" : (snprintf(a[11], 96, "atomic_fetch_%s", fn[aop]), a[11]);
+                char operation_vector[16], storage_vector[16];
+                snprintf(operation_vector, sizeof operation_vector, "%s4", type);
+                snprintf(storage_vector, sizeof storage_vector, "%s4", h->comp == 4 ? "int" : "uint");
+                int mismatched_minmax = (aop == 4 || aop == 5) ? h->comp != 4 :
+                                        (aop == 6 || aop == 7) ? h->comp != 5 : 0;
+                if (mismatched_minmax) {
+                    emit_texture_atomic_minmax(t, tex, coord, bounds, storage_vector,
+                                               aop == 4 || aop == 5, aop == 4 || aop == 6 ? "min" : "max", v, r);
+                } else {
+                    line(t, "if (%s) { auto vx_old = %s.%s(%s, %s(%s)); %s } else { %s }",
+                         bounds, tex, atomic_fn, coord, operation_vector, v,
+                         r[0] ? (snprintf(result_stmt, sizeof result_stmt, "%s = as_type<int>(vx_old.x);", r), result_stmt) : "(void)vx_old;",
+                         oob_stmt);
+                }
+            }
         } else {
             char cmp[96], v[96];
+            char result_stmt[96], oob_stmt[96];
             ref(t, in->ops[6], cmp, sizeof cmp);
             ref(t, in->ops[7], v, sizeof v);
-            line(t, "{ uint vx_e = %s; atomic_compare_exchange_weak_explicit((device atomic_uint *)(%s->va + (%s)), &vx_e, uint(%s), memory_order_relaxed, memory_order_relaxed); %s%s vx_e; }",
-                 cmp, a[0], addr, v, r[0] ? r : "(void)", r[0] ? " =" : "");
+            if (r[0]) { snprintf(result_stmt, sizeof result_stmt, "%s = as_type<int>(vx_e);", r); snprintf(oob_stmt, sizeof oob_stmt, "%s = 0;", r); }
+            else { snprintf(result_stmt, sizeof result_stmt, "(void)vx_e;"); snprintf(oob_stmt, sizeof oob_stmt, "(void)0;"); }
+            if (bk == 1 || bk == 2) {
+                line(t, "{ ulong vx_offset = %s; if (%s) { uint vx_e = uint(%s); bool vx_ok = atomic_compare_exchange_weak_explicit((device atomic_uint *)(%s->va + vx_offset), &vx_e, uint(%s), memory_order_relaxed, memory_order_relaxed); while (!vx_ok && vx_e == uint(%s)) vx_ok = atomic_compare_exchange_weak_explicit((device atomic_uint *)(%s->va + vx_offset), &vx_e, uint(%s), memory_order_relaxed, memory_order_relaxed); %s } else { %s } }",
+                     offset, bounds, cmp, a[0], v, cmp, a[0], v,
+                     result_stmt, oob_stmt);
+            } else {
+                const char *type = h->comp == 4 ? "int" : "uint";
+                char vector[16];
+                snprintf(vector, sizeof vector, "%s4", type);
+                if (r[0]) { snprintf(result_stmt, sizeof result_stmt, "%s = as_type<int>(vx_e.x);", r); snprintf(oob_stmt, sizeof oob_stmt, "%s = 0;", r); }
+                line(t, "if (%s) { %s vx_e = %s(%s); bool vx_ok = %s.atomic_compare_exchange_weak(%s, &vx_e, %s(%s)); while (!vx_ok && vx_e.x == %s(%s)) vx_ok = %s.atomic_compare_exchange_weak(%s, &vx_e, %s(%s)); %s } else { %s }",
+                     bounds, vector, vector, cmp, tex, coord, vector, v, type, cmp, tex, coord, vector, v,
+                     result_stmt, oob_stmt);
+            }
         }
         return;
     }
     case 80: {                                                     // Barrier(mode): 1 sync, 2 UAV global, 4 UAV group, 8 groupshared
         int ok;
         int mode = (int)const_int(t, in->ops[2], &ok);
-        const char *flags = (mode & 2) || (mode & 4) ? ((mode & 8) ? "mem_flags::mem_device | mem_flags::mem_threadgroup" : "mem_flags::mem_device")
+        const char *flags = (mode & 2) || (mode & 4) ? ((mode & 8) ? "mem_flags::mem_device | mem_flags::mem_texture | mem_flags::mem_threadgroup"
+                                                                        : "mem_flags::mem_device | mem_flags::mem_texture")
                           : (mode & 8) ? "mem_flags::mem_threadgroup" : "mem_flags::mem_none";
         if (mode & 1) line(t, "threadgroup_barrier(%s);", flags);
-        else line(t, "atomic_thread_fence(%s, memory_order_seq_cst);", flags);
+        else {
+            t->out->uses_thread_fence = 1;
+            const char *scope = mode & 2 ? "thread_scope_device" : mode & (4 | 8) ? "thread_scope_threadgroup" : "thread_scope_thread";
+            line(t, "atomic_thread_fence(%s, memory_order_seq_cst, %s);", flags, scope);
+        }
         return;
     }
     case 82: line(t, "if (%s) discard_fragment();", a[0]); return;
@@ -759,30 +1466,234 @@ static void call(tr *t, const dxil_inst *in) {
         return;
     }
     case 96: t->need_lidx = 1; line(t, "%s = vx_lidx;", r); return;
-    case 110: line(t, "%s = simd_is_first();", r); return;
+    case 110: {                                                    // WaveIsFirstLane: helpers do not precede active pixel lanes
+        const char *active = wave_active_predicate(t);
+        t->need_lane = t->need_lanes = 1;
+        line(t, "{");
+        t->indent++;
+        line(t, "ulong vx_wf_active = ulong(simd_ballot(%s));", active);
+        line(t, "uint vx_wf_first = 0u;");
+        line(t, "while (vx_wf_first < vx_lanes && ((vx_wf_active >> vx_wf_first) & 1ul) == 0ul) ++vx_wf_first;");
+        line(t, "%s = vx_lane == vx_wf_first;", r);
+        t->indent--;
+        line(t, "}");
+        return;
+    }
     case 111: t->need_lane = 1; line(t, "%s = vx_lane;", r); return;
     case 112: t->need_lanes = 1; line(t, "%s = vx_lanes;", r); return;
-    case 113: line(t, "%s = simd_any(%s);", r, a[0]); return;
-    case 114: line(t, "%s = simd_all(%s);", r, a[0]); return;
-    case 115: line(t, "%s = simd_all(%s == simd_broadcast_first(%s));", r, a[0], a[0]); return;
-    case 117: line(t, "%s = simd_shuffle(%s, ushort(%s));", r, a[0], a[1]); return;
-    case 118: line(t, "%s = simd_broadcast_first(%s);", r, a[0]); return;
+    case 113: {                                                    // WaveActiveAnyTrue
+        const char *active = wave_active_predicate(t);
+        line(t, "{ ulong vx_wa_true = ulong(simd_ballot((%s) && bool(%s))); %s = vx_wa_true != 0ul; }",
+             active, a[0], r);
+        return;
+    }
+    case 114: {                                                    // WaveActiveAllTrue
+        const char *active = wave_active_predicate(t);
+        line(t, "{ ulong vx_wt_active = ulong(simd_ballot(%s)); ulong vx_wt_true = ulong(simd_ballot((%s) && bool(%s))); %s = vx_wt_active == vx_wt_true; }",
+             active, active, a[0], r);
+        return;
+    }
+    case 115: {                                                    // WaveActiveAllEqual
+        const dxil_value *value = in->n > 2 ? val(t, in->ops[2]) : NULL;
+        const dxil_type *value_type = value ? ty(t, value->type) : NULL;
+        if (in->n != 3 || !value_type || !wave_value_type_supported(t, value->type)) {
+            err(t, "unsupported WaveActiveAllEqual type or operands");
+            return;
+        }
+        const char *active = wave_active_predicate(t);
+        t->need_lane = t->need_lanes = 1;
+        line(t, "{");
+        t->indent++;
+        line(t, "ulong vx_we_active = ulong(simd_ballot(%s));", active);
+        line(t, "uint vx_we_first = 0u;");
+        line(t, "while (vx_we_first < vx_lanes && ((vx_we_active >> vx_we_first) & 1ul) == 0ul) ++vx_we_first;");
+        line(t, "if (vx_we_first == vx_lanes) vx_we_first = 0u;");
+        char first_value[512];
+        wave_shuffle_expression(t, in->ops[2], a[0], "vx_we_first", first_value, sizeof first_value);
+        line(t, "auto vx_we_value = %s;", first_value);
+        if (value_type->kind == DXT_VECTOR)
+            line(t, "ulong vx_we_equal = ulong(simd_ballot((%s) && all(%s == vx_we_value)));", active, a[0]);
+        else
+            line(t, "ulong vx_we_equal = ulong(simd_ballot((%s) && %s == vx_we_value));", active, a[0]);
+        line(t, "%s = vx_we_equal == vx_we_active;", r);
+        t->indent--;
+        line(t, "}");
+        return;
+    }
+    case 117: {                                                    // WaveReadLaneAt
+        if (in->n != 4 || !val(t, in->ops[2]) || in->type != val(t, in->ops[2])->type ||
+            !wave_value_type_supported(t, val(t, in->ops[2])->type)) {
+            err(t, "unsupported WaveReadLaneAt operands");
+            return;
+        }
+        char expression[512];
+        wave_shuffle_expression(t, in->ops[2], a[0], a[1], expression, sizeof expression);
+        line(t, "%s = %s;", r, expression);
+        return;
+    }
+    case 118: {                                                    // WaveReadLaneFirst
+        if (in->n != 3 || !val(t, in->ops[2]) || in->type != val(t, in->ops[2])->type ||
+            !wave_value_type_supported(t, val(t, in->ops[2])->type)) {
+            err(t, "unsupported WaveReadLaneFirst operands");
+            return;
+        }
+        const char *active = wave_active_predicate(t);
+        t->need_lane = t->need_lanes = 1;
+        line(t, "{");
+        t->indent++;
+        line(t, "ulong vx_wf_active = ulong(simd_ballot(%s));", active);
+        line(t, "uint vx_wf_first = 0u;");
+        line(t, "while (vx_wf_first < vx_lanes && ((vx_wf_active >> vx_wf_first) & 1ul) == 0ul) ++vx_wf_first;");
+        line(t, "if (vx_wf_first == vx_lanes) vx_wf_first = 0u;");
+        char expression[512];
+        wave_shuffle_expression(t, in->ops[2], a[0], "vx_wf_first", expression, sizeof expression);
+        line(t, "%s = %s;", r, expression);
+        t->indent--;
+        line(t, "}");
+        return;
+    }
     case 119: case 121: {                                          // WaveActiveOp / WavePrefixOp(value, op, sop)
-        int ok;
-        int wop = (int)const_int(t, in->ops[3], &ok), sop = (int)const_int(t, in->ops[4], &ok);
+        const dxil_value *value = in->n > 2 ? val(t, in->ops[2]) : NULL;
+        const dxil_type *value_type = value ? ty(t, value->type) : NULL;
+        const dxil_type *component = value_type && value_type->kind == DXT_VECTOR ?
+            ty(t, value_type->elem) : value_type;
+        if (in->n != 5 || !value_type || value_type->kind == DXT_VECTOR || in->type != value->type ||
+            !(component && (component->kind == DXT_FLOAT || component->kind == DXT_HALF ||
+              (component->kind == DXT_INT && wave_int_kind(component) && component->bits > 1)))) {
+            err(t, "unsupported wave reduction type or operands");
+            return;
+        }
+        int ok_wop, ok_sop;
+        int wop = (int)const_int(t, in->ops[3], &ok_wop), sop = (int)const_int(t, in->ops[4], &ok_sop);
         static const char *fn[] = { "sum", "product", "min", "max" };
-        if (wop > 3) { err(t, "wave operation %d", wop); return; }
-        if (op == 121 && wop > 1) { err(t, "wave prefix min/max"); return; }
-        const char *pre = op == 121 ? "simd_prefix_exclusive_" : "simd_";
-        if (!fp && !sop && (wop == 2 || wop == 3)) line(t, "%s = %s(%s%s(as_type<%s>(%s)));", r, tn, pre, fn[wop], signed_name(bits), a[0]);
-        else line(t, "%s = %s%s(%s);", r, pre, fn[wop], a[0]);
+        if (!ok_wop || !ok_sop || wop < 0 || wop > 3 || sop < 0 || sop > 1) { err(t, "invalid wave operation %d/%d", wop, sop); return; }
+        int fp_value = component->kind == DXT_FLOAT || component->kind == DXT_HALF;
+        int value_bits = component->bits;
+        if (op == 121 && (wop == 2 || wop == 3)) {
+            char ot[32];
+            if (fp_value) snprintf(ot, sizeof ot, "%s", tn);
+            else snprintf(ot, sizeof ot, "%s", sop ? unsigned_name(value_bits) : signed_name(value_bits));
+            char input[192];
+            if (fp_value) snprintf(input, sizeof input, "%s", a[0]);
+            else snprintf(input, sizeof input, "as_type<%s>(%s)", ot, a[0]);
+            const char *identity;
+            if (fp_value) {
+                int half = component->kind == DXT_HALF;
+                identity = half ? (wop == 2 ? "as_type<half>(ushort(0x7c00u))" : "as_type<half>(ushort(0xfc00u))")
+                                : (wop == 2 ? "as_type<float>(0x7f800000u)" : "as_type<float>(0xff800000u)");
+            } else if (sop) {
+                if (wop == 2) identity = value_bits > 32 ? "0xfffffffffffffffful" : value_bits > 16 ? "0xffffffffu" : value_bits > 8 ? "0xffffu" : "0xffu";
+                else identity = "0";
+            } else if (wop == 2) {
+                identity = value_bits > 32 ? "as_type<long>(0x7ffffffffffffffful)" : value_bits > 16 ? "as_type<int>(0x7fffffffu)" : value_bits > 8 ? "as_type<short>(ushort(0x7fffu))" : "as_type<char>(uchar(0x7fu))";
+            } else {
+                identity = value_bits > 32 ? "as_type<long>(0x8000000000000000ul)" : value_bits > 16 ? "as_type<int>(0x80000000u)" : value_bits > 8 ? "as_type<short>(ushort(0x8000u))" : "as_type<char>(uchar(0x80u))";
+            }
+            const char *active = wave_active_predicate(t);
+            t->need_lane = t->need_lanes = 1;
+            line(t, "{");
+            t->indent++;
+            line(t, "ulong vx_wp_active = ulong(simd_ballot(%s));", active);
+            line(t, "%s vx_wp_acc = %s;", ot, identity);
+            line(t, "for (uint vx_wp_i = 0; vx_wp_i < vx_lanes; ++vx_wp_i) {");
+            t->indent++;
+            line(t, "bool vx_wp_include = vx_wp_i < vx_lane && ((vx_wp_active >> vx_wp_i) & ulong(1)) != 0;");
+            line(t, "uint vx_wp_source = vx_wp_include ? vx_wp_i : vx_lane;");
+            line(t, "%s vx_wp_value = simd_shuffle(%s, ushort(vx_wp_source));", ot, input);
+            if (fp) {
+                line(t, "if (vx_wp_include) {");
+                t->indent++;
+                line(t, "if (isnan(vx_wp_acc)) vx_wp_acc = vx_wp_value;");
+                line(t, "else if (!isnan(vx_wp_value)) vx_wp_acc = vx_wp_acc %s vx_wp_value ? vx_wp_acc : vx_wp_value;", wop == 2 ? "<" : ">=");
+                t->indent--;
+                line(t, "}");
+            } else {
+                line(t, "if (vx_wp_include) vx_wp_acc = %s(vx_wp_acc, vx_wp_value);", fn[wop]);
+            }
+            t->indent--;
+            line(t, "}");
+            line(t, "%s = as_type<%s>(vx_wp_acc);", r, tn);
+            t->indent--;
+            line(t, "}");
+            return;
+        }
+        char ot[32], input[192];
+        if (wop < 2 || fp_value || sop) snprintf(ot, sizeof ot, "%s", tn);
+        else snprintf(ot, sizeof ot, "%s", signed_name(value_bits));
+        if (wop >= 2 && !fp_value && !sop) snprintf(input, sizeof input, "as_type<%s>(%s)", ot, a[0]);
+        else snprintf(input, sizeof input, "%s", a[0]);
+        const char *identity = NULL;
+        if (wop == 0) identity = fp_value ? (component->kind == DXT_HALF ? "half(0.0)" : "0.0f") : "0";
+        else if (wop == 1) identity = fp_value ? (component->kind == DXT_HALF ? "half(1.0)" : "1.0f") : "1";
+        else if (fp_value) {
+            int half = component->kind == DXT_HALF;
+            identity = half ? (wop == 2 ? "as_type<half>(ushort(0x7c00u))" : "as_type<half>(ushort(0xfc00u))")
+                            : (wop == 2 ? "as_type<float>(0x7f800000u)" : "as_type<float>(0xff800000u)");
+        } else if (sop) {
+            if (wop == 2) identity = value_bits > 32 ? "0xfffffffffffffffful" : value_bits > 16 ? "0xffffffffu" : value_bits > 8 ? "0xffffu" : "0xffu";
+            else identity = "0";
+        } else if (wop == 2) {
+            identity = value_bits > 32 ? "as_type<long>(0x7ffffffffffffffful)" : value_bits > 16 ? "as_type<int>(0x7fffffffu)" : value_bits > 8 ? "as_type<short>(ushort(0x7fffu))" : "as_type<char>(uchar(0x7fu))";
+        } else {
+            identity = value_bits > 32 ? "as_type<long>(0x8000000000000000ul)" : value_bits > 16 ? "as_type<int>(0x80000000u)" : value_bits > 8 ? "as_type<short>(ushort(0x8000u))" : "as_type<char>(uchar(0x80u))";
+        }
+        const char *active = wave_active_predicate(t);
+        line(t, "{");
+        t->indent++;
+        line(t, "%s vx_wo_value = (%s) ? %s : %s;", ot, active, input, identity);
+        if (op == 119) {
+            if (wop >= 2 && !fp_value && !sop)
+                line(t, "%s = as_type<%s>(simd_%s(vx_wo_value));", r, tn, fn[wop]);
+            else
+                line(t, "%s = simd_%s(vx_wo_value);", r, fn[wop]);
+        } else if (wop >= 2) {
+            // Metal has no prefix min/max; evaluate the source's active-lane prefix in lane order.
+            line(t, "ulong vx_wp_active = ulong(simd_ballot(%s));", active);
+            line(t, "%s vx_wp_acc = %s;", ot, identity);
+            line(t, "for (uint vx_wp_i = 0; vx_wp_i < vx_lanes; ++vx_wp_i) {");
+            t->indent++;
+            line(t, "bool vx_wp_include = vx_wp_i < vx_lane && ((vx_wp_active >> vx_wp_i) & 1ul) != 0ul;");
+            line(t, "uint vx_wp_source = vx_wp_include ? vx_wp_i : vx_lane;");
+            line(t, "%s vx_wp_value = simd_shuffle(%s, ushort(vx_wp_source));", ot, input);
+            if (fp_value) {
+                line(t, "if (vx_wp_include) {");
+                t->indent++;
+                line(t, "if (isnan(vx_wp_acc)) vx_wp_acc = vx_wp_value;");
+                line(t, "else if (!isnan(vx_wp_value)) vx_wp_acc = vx_wp_acc %s vx_wp_value ? vx_wp_acc : vx_wp_value;", wop == 2 ? "<" : ">=");
+                t->indent--;
+                line(t, "}");
+            } else {
+                line(t, "if (vx_wp_include) vx_wp_acc = %s(vx_wp_acc, vx_wp_value);", fn[wop]);
+            }
+            t->indent--;
+            line(t, "}");
+            line(t, "%s = as_type<%s>(vx_wp_acc);", r, tn);
+        } else {
+            line(t, "%s = simd_prefix_exclusive_%s(vx_wo_value);", r, fn[wop]);
+        }
+        t->indent--;
+        line(t, "}");
         return;
     }
     case 120: {                                                    // WaveActiveBit(value, op): and, or, xor
         int ok;
         int bop = (int)const_int(t, in->ops[3], &ok);
         static const char *fn[] = { "simd_and", "simd_or", "simd_xor" };
-        line(t, "%s = %s(%s);", r, bop < 3 ? fn[bop] : "simd_or", a[0]);
+        const dxil_value *value = in->n > 2 ? val(t, in->ops[2]) : NULL;
+        const dxil_type *value_type = value ? ty(t, value->type) : NULL;
+        if (in->n != 4 || !ok || bop < 0 || bop > 2 || !value_type || value_type->kind != DXT_INT ||
+            !wave_int_kind(value_type) || value_type->bits <= 1 || value->type != in->type) {
+            err(t, "unsupported WaveActiveBit operation or type");
+            return;
+        }
+        const char *active = wave_active_predicate(t);
+        line(t, "{");
+        t->indent++;
+        if (bop == 0) line(t, "%s vx_wb_value = (%s) ? %s : ~%s(0);", tn, active, a[0], tn);
+        else line(t, "%s vx_wb_value = (%s) ? %s : %s(0);", tn, active, a[0], tn);
+        line(t, "%s = %s(vx_wb_value);", r, fn[bop]);
+        t->indent--;
+        line(t, "}");
         return;
     }
     case 122: line(t, "%s = quad_shuffle(%s, ushort(%s));", r, a[0], a[1]); return;
@@ -795,8 +1706,154 @@ static void call(tr *t, const dxil_inst *in) {
     case 124: case 125: case 126: case 127: line(t, "%s = as_type<%s>(%s);", r, tn, a[0]); return;
     case 130: line(t, "%s = uint(as_type<ushort>(half(%s)));", r, a[0]); return;
     case 131: line(t, "%s = float(as_type<half>(ushort(%s)));", r, a[0]); return;
-    case 135: line(t, "{ simd_vote vx_v = simd_ballot(%s); %s = popcount(uint(ulong(vx_v))) + popcount(uint(ulong(vx_v) >> 32)); }", a[0], r); return;
-    case 116: line(t, "{ ulong vx_v = ulong(simd_ballot(%s)); %s = %s{ uint(vx_v), uint(vx_v >> 32), 0u, 0u }; }", a[0], r, tn); return;
+    case 135: {                                                    // WaveAllBitCount
+        const char *active = wave_active_predicate(t);
+        line(t, "{ ulong vx_v = ulong(simd_ballot((%s) && bool(%s))); %s = popcount(uint(vx_v)) + popcount(uint(vx_v >> 32)); }",
+             active, a[0], r);
+        return;
+    }
+    case 116: {                                                    // WaveActiveBallot
+        if (!wave_mask_type(t, in->type)) { err(t, "unsupported WaveActiveBallot result type"); return; }
+        const char *active = wave_active_predicate(t);
+        line(t, "{ ulong vx_v = ulong(simd_ballot((%s) && bool(%s))); %s = %s{ uint(vx_v), uint(vx_v >> 32), 0u, 0u }; }",
+             active, a[0], r, tn);
+        return;
+    }
+    case 136: {                                                    // WavePrefixBitCount
+        const char *active = wave_active_predicate(t);
+        t->need_lane = t->need_lanes = 1;
+        line(t, "{");
+        t->indent++;
+        line(t, "ulong vx_wbc_true = ulong(simd_ballot((%s) && bool(%s)));", active, a[0]);
+        line(t, "uint vx_wbc_count = 0u;");
+        line(t, "for (uint vx_wbc_i = 0; vx_wbc_i < vx_lane; ++vx_wbc_i) vx_wbc_count += uint((vx_wbc_true >> vx_wbc_i) & 1ul);");
+        line(t, "%s = vx_wbc_count;", r);
+        t->indent--;
+        line(t, "}");
+        return;
+    }
+    case 165: {                                                    // WaveMatch(value): active-lane match mask
+        const dxil_value *value = in->n > 2 ? val(t, in->ops[2]) : NULL;
+        const dxil_type *value_type = value ? ty(t, value->type) : NULL;
+        const dxil_type *component = value_type && value_type->kind == DXT_VECTOR ?
+            ty(t, value_type->elem) : value_type;
+        const dxil_type *result_type = ty(t, in->type);
+        if (in->n != 3 || !component || !wave_value_type_supported(t, value->type) ||
+            !result_type || !wave_mask_type(t, in->type)) {
+            err(t, "unsupported WaveMatch value or result type");
+            return;
+        }
+        char shuffle_type[32] = "";
+        int bool_value = component->kind == DXT_INT && component->bits == 1;
+        if (bool_value && value_type->kind == DXT_VECTOR)
+            snprintf(shuffle_type, sizeof shuffle_type, "uint%u", value_type->count);
+        else if (bool_value)
+            snprintf(shuffle_type, sizeof shuffle_type, "uint");
+        const char *active_lanes = wave_active_predicate(t);
+        t->need_lane = t->need_lanes = 1;
+        line(t, "{");
+        t->indent++;
+        line(t, "ulong vx_wm_active = ulong(simd_ballot(%s));", active_lanes);
+        line(t, "uint4 vx_wm_mask = uint4(0u);");
+        line(t, "for (uint vx_wm_i = 0; vx_wm_i < vx_lanes; ++vx_wm_i) {");
+        t->indent++;
+        line(t, "if (((vx_wm_active >> vx_wm_i) & ulong(1)) != 0ul) {");
+        t->indent++;
+        if (bool_value)
+            line(t, "%s vx_wm_value = simd_shuffle(%s(%s), ushort(vx_wm_i));", shuffle_type, shuffle_type, a[0]);
+        else
+            line(t, "auto vx_wm_value = simd_shuffle(%s, ushort(vx_wm_i));", a[0]);
+        if (value_type->kind == DXT_VECTOR) {
+            if (bool_value) line(t, "if (vx_wm_i == vx_lane || all(vx_wm_value == %s(%s)))", shuffle_type, a[0]);
+            else line(t, "if (vx_wm_i == vx_lane || all(vx_wm_value == %s))", a[0]);
+        } else {
+            if (bool_value) line(t, "if (vx_wm_i == vx_lane || vx_wm_value == uint(%s))", a[0]);
+            else line(t, "if (vx_wm_i == vx_lane || vx_wm_value == %s)", a[0]);
+        }
+        t->indent++;
+        line(t, "vx_wm_mask[vx_wm_i >> 5] |= 1u << (vx_wm_i & 31u);");
+        t->indent--;
+        t->indent--;
+        line(t, "}");
+        t->indent--;
+        line(t, "}");
+        line(t, "%s = %s{ vx_wm_mask.x, vx_wm_mask.y, vx_wm_mask.z, vx_wm_mask.w };", r, tn);
+        t->indent--;
+        line(t, "}");
+        return;
+    }
+    case 166: case 167: {                                          // WaveMultiPrefixOp / WaveMultiPrefixBitCount
+        int bit_count = op == 167;
+        uint32_t required_operands = bit_count ? 7u : 9u;
+        const dxil_value *value = in->n > 2 ? val(t, in->ops[2]) : NULL;
+        const dxil_type *value_type = value ? ty(t, value->type) : NULL;
+        const dxil_type *component = value_type && value_type->kind == DXT_VECTOR ?
+            ty(t, value_type->elem) : value_type;
+        int kind = -1, signed_kind = -1;
+        int ok_kind = 0, ok_signed_kind = 0;
+        if (!bit_count) {
+            kind = in->n > 7 ? (int)const_int(t, in->ops[7], &ok_kind) : -1;
+            signed_kind = in->n > 8 ? (int)const_int(t, in->ops[8], &ok_signed_kind) : -1;
+        }
+        if (in->n != required_operands || !component ||
+            (bit_count ? (value_type->kind != DXT_INT || component->kind != DXT_INT || component->bits != 1 ||
+                          !ty(t, in->type) || ty(t, in->type)->kind != DXT_INT || ty(t, in->type)->bits != 32) :
+             (!(component->kind == DXT_FLOAT || component->kind == DXT_HALF ||
+                (component->kind == DXT_INT && wave_int_kind(component))) ||
+              (value_type->kind == DXT_VECTOR && (value_type->count < 2 || value_type->count > 4)) ||
+              in->type != value->type || !ok_kind || !ok_signed_kind || kind < 0 || kind > 4 ||
+              signed_kind < 0 || signed_kind > 1 ||
+              ((component->kind == DXT_FLOAT || component->kind == DXT_HALF) && kind != 0 && kind != 4) ||
+              (component->kind == DXT_INT && component->bits <= 1)))) {
+            err(t, "unsupported WaveMultiPrefix type or operation");
+            return;
+        }
+        const char *active_lanes = wave_active_predicate(t);
+        t->need_lane = t->need_lanes = 1;
+        line(t, "{");
+        t->indent++;
+        line(t, "ulong vx_mp_active = ulong(simd_ballot(%s));", active_lanes);
+        line(t, "uint4 vx_mp_active_words = uint4(uint(vx_mp_active), uint(vx_mp_active >> 32), 0u, 0u);");
+        if (bit_count) {
+            line(t, "uint4 vx_mp_target_mask = uint4(uint(%s), uint(%s), uint(%s), uint(%s)) & vx_mp_active_words;",
+                 a[1], a[2], a[3], a[4]);
+            line(t, "uint vx_mp_acc = 0u;");
+            line(t, "for (uint vx_mp_i = 0; vx_mp_i < vx_lanes; ++vx_mp_i) {");
+        } else {
+            line(t, "uint4 vx_mp_target_mask = uint4(uint(%s), uint(%s), uint(%s), uint(%s)) & vx_mp_active_words;",
+                 a[1], a[2], a[3], a[4]);
+            if (kind == 1) line(t, "%s vx_mp_acc = ~%s(0);", tn, tn);
+            else line(t, "%s vx_mp_acc = %s(%s);", tn, tn,
+                kind == 4 ? (fp ? "1.0" : "1u") : (fp ? "0.0" : "0u"));
+            line(t, "for (uint vx_mp_i = 0; vx_mp_i < vx_lanes; ++vx_mp_i) {");
+        }
+        t->indent++;
+        // Keep SIMD shuffles in a uniform loop; a lane-dependent loop bound can read inactive sources.
+        line(t, "bool vx_mp_include = vx_mp_i < vx_lane && ((vx_mp_active >> vx_mp_i) & ulong(1)) != 0ul;");
+        line(t, "uint vx_mp_source = vx_mp_include ? vx_mp_i : vx_lane;");
+        line(t, "uint4 vx_mp_lane_mask = uint4(uint(simd_shuffle(uint(%s), ushort(vx_mp_source))), uint(simd_shuffle(uint(%s), ushort(vx_mp_source))), uint(simd_shuffle(uint(%s), ushort(vx_mp_source))), uint(simd_shuffle(uint(%s), ushort(vx_mp_source)))) & vx_mp_active_words;",
+             a[1], a[2], a[3], a[4]);
+        if (bit_count)
+            line(t, "uint vx_mp_value = simd_shuffle(uint(%s), ushort(vx_mp_source));", a[0]);
+        else
+            line(t, "auto vx_mp_value = simd_shuffle(%s, ushort(vx_mp_source));", a[0]);
+        line(t, "if (vx_mp_include && all(vx_mp_lane_mask == vx_mp_target_mask)) {");
+        t->indent++;
+        if (bit_count) {
+            line(t, "vx_mp_acc += vx_mp_value != 0u ? 1u : 0u;");
+        } else {
+            static const char *operators[] = { "+", "&", "|", "^", "*" };
+            line(t, "vx_mp_acc = vx_mp_acc %s vx_mp_value;", operators[kind]);
+        }
+        t->indent--;
+        line(t, "}");
+        t->indent--;
+        line(t, "}");
+        line(t, "%s = vx_mp_acc;", r);
+        t->indent--;
+        line(t, "}");
+        return;
+    }
     default: {
         const char *name = callee ? callee : "?";
         err(t, "DXIL intrinsic %d (%s) is not done yet", op, name);
@@ -810,7 +1867,7 @@ static const char *fcmp_op(int p, int *negate) {
     *negate = 0;
     switch (p) {
     case 1: return "=="; case 2: return ">"; case 3: return ">="; case 4: return "<"; case 5: return "<="; case 6: return "!=";
-    case 9: *negate = 1; return "!="; case 10: *negate = 1; return "<="; case 11: *negate = 1; return "<"; case 12: *negate = 1; return ">=";
+    case 10: *negate = 1; return "<="; case 11: *negate = 1; return "<"; case 12: *negate = 1; return ">=";
     case 13: *negate = 1; return ">"; case 14: return "!=";
     }
     return NULL;
@@ -871,6 +1928,12 @@ static void inst(tr *t, const dxil_inst *in) {
             if (p >= 6) line(t, "%s = as_type<%s>(%s) %s as_type<%s>(%s);", r, signed_name(bits), a[0], ops[p], signed_name(bits), a[1]);
             else line(t, "%s = %s %s %s;", r, a[0], ops[p], a[1]);
         } else {
+            if (in->sub == 9) {
+                // LLVM's unordered-or-equal predicate is true for NaN operands as well as equal values.
+                // Use bitwise OR so this remains component-wise when DXIL compares floating vectors.
+                line(t, "%s = (%s == %s) | (isnan(%s) | isnan(%s));", r, a[0], a[1], a[0], a[1]);
+                return;
+            }
             int neg;
             const char *o = fcmp_op(in->sub, &neg);
             if (in->sub == 0 || in->sub == 15) { line(t, "%s = %s;", r, in->sub ? "true" : "false"); return; }
@@ -884,6 +1947,42 @@ static void inst(tr *t, const dxil_inst *in) {
     case DXI_SELECT: line(t, "%s = %s ? %s : %s;", r, a[0], a[1], a[2]); return;
     case DXI_EXTRACTELT: line(t, "%s = %s[%s];", r, a[0], a[1]); return;
     case DXI_INSERTELT: line(t, "%s = %s; %s[%s] = %s;", r, a[0], r, a[2], a[1]); return;
+    case DXI_SHUFFLEVEC: {
+        const dxil_value *lhs = in->n > 0 ? val(t, in->ops[0]) : NULL;
+        const dxil_value *rhs = in->n > 1 ? val(t, in->ops[1]) : NULL;
+        const dxil_value *mask = in->n > 2 ? val(t, in->ops[2]) : NULL;
+        const dxil_type *input = lhs ? ty(t, lhs->type) : NULL;
+        const dxil_type *output = ty(t, in->type);
+        const dxil_type *rhs_type = rhs ? ty(t, rhs->type) : NULL;
+        const dxil_type *mask_type = mask ? ty(t, mask->type) : NULL;
+        if (in->n != 3 || !input || input->kind != DXT_VECTOR || !rhs_type || rhs_type->kind != DXT_VECTOR ||
+            rhs->type != lhs->type || !output || output->kind != DXT_VECTOR || output->elem != input->elem ||
+            !output->count || !input->count || !mask_type || mask_type->kind != DXT_VECTOR ||
+            mask_type->elem >= t->m->ntypes || t->m->types[mask_type->elem].kind != DXT_INT ||
+            t->m->types[mask_type->elem].bits != 32 || mask_type->count != output->count) {
+            err(t, "malformed or unsupported shufflevector types");
+            return;
+        }
+        sb expression = { 0 };
+        put(&expression, "%s(", tn);
+        for (uint32_t lane = 0; lane < output->count; lane++) {
+            uint32_t index = 0;
+            int undefined = 0;
+            if (!shuffle_mask_lane(t, in->ops[2], lane, &index, &undefined)) {
+                free(expression.s);
+                err(t, "shufflevector mask is not a constant i32 vector");
+                return;
+            }
+            put(&expression, "%s", lane ? ", " : "");
+            if (undefined || (index >= input->count && index - input->count >= input->count)) put(&expression, "0");
+            else if (index < input->count) put(&expression, "%s[%u]", a[0], index);
+            else put(&expression, "%s[%u]", a[1], index - input->count);
+        }
+        put(&expression, ")");
+        line(t, "%s = %s;", r, expression.s ? expression.s : "0");
+        free(expression.s);
+        return;
+    }
     case DXI_EXTRACTVAL: case DXI_INSERTVAL: {
         char path[256] = "";
         uint32_t tid = val(t, in->ops[0]) ? val(t, in->ops[0])->type : 0;
@@ -951,7 +2050,10 @@ static void inst(tr *t, const dxil_inst *in) {
         return;
     }
     case DXI_CALL: call(t, in); return;
-    case DXI_FENCE: line(t, "atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_threadgroup, memory_order_seq_cst);"); return;
+    case DXI_FENCE:
+        t->out->uses_thread_fence = 1;
+        line(t, "atomic_thread_fence(mem_flags::mem_device | mem_flags::mem_texture | mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_device);");
+        return;
     case DXI_PHI: return;                                          // (assigned on the edges into its block)
     }
     err(t, "instruction %u", in->op);
@@ -996,6 +2098,18 @@ static void block_body(tr *t, uint32_t b) {
 
 static void ret_line(tr *t) {
     int stage = t->out->stage;
+    if (stage == 0 && t->apply_sample_mask) {
+        int found = 0;
+        for (uint32_t i = 0; t->outsig && i < t->outsig->n; i++) {
+            const dxil_md *e = dxil_md_op(t->m, t->outsig, i);
+            if (md_i(t, e, 3, 0) != 14) continue;
+            int id = md_i(t, e, 0, 0), rows = md_i(t, e, 6, 1);
+            for (int row = 0; row < rows; row++)
+                line(t, "vx_out.o%d_%d &= 0x%08xu;", id, row, t->sample_mask);
+            found = 1;
+        }
+        if (!found) line(t, "vx_out.vx_sample_mask = 0x%08xu;", t->sample_mask);
+    }
     line(t, stage == 5 ? "return;" : "return vx_out;");
 }
 
@@ -1366,9 +2480,11 @@ static void io_structs(tr *t, sb *s) {
     if (stage == 0 || stage == 1) {
         put(s, "struct VxOut {\n");
         int any = 0;
+        int has_coverage = 0;
         for (uint32_t i = 0; t->outsig && i < t->outsig->n; i++) {
             const dxil_md *e = dxil_md_op(t->m, t->outsig, i);
             int id = md_i(t, e, 0, 0), kind = md_i(t, e, 3, 0), rows = md_i(t, e, 6, 1), comp = md_i(t, e, 2, 9);
+            if (stage == 0 && kind == 14) has_coverage = 1;
             char et[32];
             element_type(t, e, et, sizeof et);
             for (int r = 0; r < rows; r++) {
@@ -1398,6 +2514,8 @@ static void io_structs(tr *t, sb *s) {
         }
         if (!any && stage == 0) put(s, "    float4 vx_unused [[color(0)]];\n");
         if (!any && stage == 1) put(s, "    float4 vx_pos [[position]];\n");
+        if (stage == 0 && t->apply_sample_mask && !has_coverage)
+            put(s, "    uint vx_sample_mask [[sample_mask]];\n");
         put(s, "};\n");
     }
 }
@@ -1406,17 +2524,20 @@ static const char *PRELUDE =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "struct VxDesc { ulong va; ulong res; uint size, stride, fmt, flags; };\n"
+    "static inline float vx_desc_min_lod(device const VxDesc *d) { return (d->flags & 4u) ? as_type<float>(d->size) : 0.0f; }\n"
     "static inline float4 vx_cb(device const VxDesc *h, uint row) { return row * 16 < h->size ? ((device const float4 *)h->va)[row] : float4(0); }\n"
     "static inline uint vx_ld(device const VxDesc *h, uint off) { return off + 4 <= h->size ? *(device const uint *)(h->va + off) : 0u; }\n"
     "static inline uint4 vx_ld4(device const VxDesc *h, uint off) { return uint4(vx_ld(h, off), vx_ld(h, off + 4), vx_ld(h, off + 8), vx_ld(h, off + 12)); }\n"
     "static inline void vx_st(device const VxDesc *h, uint off, uint v) { if (off + 4 <= h->size) *(device uint *)(h->va + off) = v; }\n";
 
-int dxil_to_msl(const dxil_module *m, dxil_msl *out) {
+int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxil_msl *out) {
     memset(out, 0, sizeof *out);
     out->stage = (int)m->shader_kind;
     tr t = { 0 };
     t.m = m;
     t.out = out;
+    t.sample_mask = sample_mask;
+    t.apply_sample_mask = sample_mask != UINT32_MAX;
     const dxil_function *f = NULL;
     const dxil_named_md *ep = dxil_named(m, "dx.entryPoints");
     if (ep && ep->n) {
@@ -1434,6 +2555,7 @@ int dxil_to_msl(const dxil_module *m, dxil_msl *out) {
     t.ptr_space = calloc(t.nvals + 1, 1);
     t.declared_types = calloc(m->ntypes + 1, 1);
     read_resources(&t);
+    analyze_uav_accesses(&t);
     read_signatures(&t);
     // blocks
     t.nb = f->nblocks ? f->nblocks : 1;
@@ -1517,6 +2639,10 @@ done:
     free(t.term); free(t.first); free(t.idom); free(t.ipdom); free(t.rpo_index); free(t.loop_header_of); free(t.loop_exit); free(t.emitted); free(t.loops);
     if (t.failed || !out->msl) { if (!out->error[0]) snprintf(out->error, sizeof out->error, "translation failed"); free(out->msl); out->msl = NULL; return -1; }
     return 0;
+}
+
+int dxil_to_msl(const dxil_module *m, dxil_msl *out) {
+    return dxil_to_msl_with_sample_mask(m, UINT32_MAX, out);
 }
 
 void dxil_msl_free(dxil_msl *out) { free(out->msl); out->msl = NULL; }

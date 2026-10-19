@@ -72,6 +72,8 @@ const vx_image *vx_image_at(uint64_t pc);    // the image containing an address,
 int vx_image_list(const vx_image **out, int cap);   // the loaded images (all of them is the return value)
 int vx_overlay_file(const char *unix_path, char *out, size_t cap);   // files.c: VXRT_OVERLAY's copy of a file, if any
 void vx_wininet_init(void);                  // wininet.m: HTTP and HTTPS on NSURLSession
+void vx_winhttp_init(void);                  // winhttp.m: synchronous WinHTTP request handles on NSURLSession
+void vx_directinput_init(void);              // directinput.m: DirectInput 8 HID joystick/gamepad polling
 void vx_extras_init(void);                   // extras.c: smaller functions more programs need
 void vx_opengl_init(void);                   // opengl.c: opengl32.dll on macOS's OpenGL
 int vx_gl_describe_pixel_format(void *pfd, uint32_t size);   // (gdi32's pixel-format calls and SwapBuffers)
@@ -181,6 +183,7 @@ void vx_d3d11_init(void);              // Direct3D 11 on Metal (d3d11.m)
 void vx_d3d9_init(void);               // IDirect3D9: adapters and display modes (d3d9.m)
 void vx_dxgi_init(void);               // DXGI (dxgi.m)
 void vx_d3d12_init(void);              // Direct3D 12 on Metal (d3d12.m)
+void vx_vulkan_init(void);             // Vulkan 1.0 bootstrap; Vulkan GPU objects are added with their Metal backend
 void vx_input_init(void);              // XInput (input.m)
 void vx_audio_init(void);              // WASAPI on Core Audio (audio.m; after COM)
 void vx_xaudio2_init(void);            // XAudio2 2.8/2.9 on Core Audio (xaudio2.m)
@@ -195,6 +198,7 @@ char  *vx_utf8_dup(const WCHAR *w);    // malloc'd, NULL for NULL
 WCHAR *vx_utf16_dup(const char *s);
 DWORD  vx_return_string_a(const char *s, char *buf, DWORD cap);    // Windows' "copy out or report the size"
 DWORD  vx_return_string_w(const char *s, WCHAR *buf, DWORD cap);
+const char *vx_special_folder_path(int csidl);   // shell folder map shared with managed Environment.GetFolderPath
 
 // Paths (files.c): C:\ is $VXRT_ROOT/drive_c, Z:\ is the Mac's root.
 const char *vx_root(void);

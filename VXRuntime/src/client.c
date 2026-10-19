@@ -656,9 +656,9 @@ static const vx_export hid[] = {
 };
 static const vx_export iphlpapi[] = {
     { "GetExtendedTcpTable", (void *)iphlp_unsupported }, { "GetExtendedUdpTable", (void *)iphlp_unsupported },
-    { "GetAdaptersAddresses", (void *)iphlp_unsupported }, { "GetAdaptersInfo", (void *)iphlp_unsupported },
-    { "GetBestInterface", (void *)iphlp_unsupported }, { "GetIfTable", (void *)iphlp_unsupported }, { "GetIpAddrTable", (void *)iphlp_unsupported },
-    { "NotifyAddrChange", (void *)iphlp_unsupported }, { "GetNetworkParams", (void *)iphlp_unsupported },
+    { "GetAdaptersInfo", (void *)iphlp_unsupported },                   // (GetAdaptersAddresses, GetBestInterface, GetBestRoute: extras.c)
+    { "GetIfTable", (void *)iphlp_unsupported },
+    { "NotifyAddrChange", (void *)iphlp_unsupported },                   // (GetNetworkParams: extras.c)
     { "ConvertInterfaceGuidToLuid", (void *)iphlp_not_found }, { "GetIfEntry2", (void *)iphlp_not_found },
 };
 static const vx_export gdi32[] = {

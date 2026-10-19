@@ -44,7 +44,10 @@ func vrsettings(_ a: [String]) {
     // setup wrote these into its Steam config; here they are set every start.
     update("steamvr", ["forcedDriver": "verantyx", "activateMultipleDrivers": false, "requireHmd": false,
                        "enableHomeApp": false, "enableSafeMode": false, "showMirrorView": false,
-                       "startDashboardFromAppLaunch": false, "motionSmoothing": false])
+                       "startDashboardFromAppLaunch": false, "motionSmoothing": false,
+                       // SteamVR covers the game with its empty environment while it judges the tracking bad; with
+                       // the Vision Pro's head (or the bench pose) it does so for Elite Dangerous all the time.
+                       "forceFadeOnBadTracking": false])
     update("dashboard", ["enableDashboard": false])
     update("verantyx", ["enable": true])
     update("driver_verantyx", ["blocked_by_safe_mode": false])

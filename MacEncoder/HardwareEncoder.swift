@@ -6,6 +6,8 @@ import Network
 import Accelerate
 import CoreAudio
 import Metal
+import CoreImage
+import ImageIO
 
 import simd
 
@@ -359,6 +361,22 @@ func processSampleBuffer(sampleBuffer: CMSampleBuffer, isKeyFrame: Bool, frameSe
 // MARK: - VideoToolbox Setup
 
 var compressionSession: VTCompressionSession?
+
+// VERANTYX_SNAPSHOT=<directory>: every 5 seconds one captured frame (what the headset is sent) as a PNG there,
+// evidence of what a game draws when nobody wears the headset.
+var snapshotDirectory: String? = ProcessInfo.processInfo.environment["VERANTYX_SNAPSHOT"]
+var lastSnapshotAt: Double = 0
+func writeSnapshotIfDue(_ pb: CVPixelBuffer, now: Double) {
+    guard let dir = snapshotDirectory, now - lastSnapshotAt >= 5 else { return }
+    lastSnapshotAt = now
+    let image = CIImage(cvPixelBuffer: pb)
+    guard let cg = CIContext().createCGImage(image, from: image.extent) else { return }
+    let stamp = Int(Date().timeIntervalSince1970)
+    let url = URL(fileURLWithPath: dir).appendingPathComponent("frame-\(stamp).png")
+    guard let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return }
+    CGImageDestinationAddImage(dest, cg, nil)
+    CGImageDestinationFinalize(dest)
+}
 var pixelBufferPool: CVPixelBufferPool?
 let encoderInFlightFrames = DispatchSemaphore(value: 3)
 var isEncoding = true
@@ -1792,6 +1810,7 @@ while isEncoding {
                 if framesEncoded < 3 || framesEncoded % 90 == 0 {
                     print("Queued capture frame seq=\(currentSeq), source=\(width)x\(height) format=\(sourceFormat), status=\(status)")
                 }
+                writeSnapshotIfDue(pb, now: now)
 
                 if status != noErr {
                     print("VTCompressionSessionEncodeFrame failed: \(status)")

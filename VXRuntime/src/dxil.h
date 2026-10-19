@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define DXIL_FEATURE_WAVE_OPS_INCLUDE_HELPER_LANES UINT64_C(0x20000000)
+
 enum dxil_type_kind {
     DXT_VOID, DXT_HALF, DXT_FLOAT, DXT_DOUBLE, DXT_LABEL, DXT_METADATA, DXT_INT, DXT_POINTER, DXT_FUNCTION,
     DXT_STRUCT, DXT_ARRAY, DXT_VECTOR, DXT_OPAQUE, DXT_OTHER
@@ -111,6 +113,7 @@ typedef struct {
     uint32_t shader_kind;    // the program header's: 0 pixel, 1 vertex, 2 geometry, 3 hull, 4 domain, 5 compute, ...
     uint32_t shader_major, shader_minor;
     uint32_t dxil_version;
+    uint64_t shader_feature_flags; // SFI0 / DFCC_FeatureInfo feature bitmask, zero when absent
 
     uint32_t ntypes;
     dxil_type *types;

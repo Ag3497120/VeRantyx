@@ -336,7 +336,9 @@ static char **environment_from_block(const void *block, int wide) {
     env[n] = NULL;
     return env;
 }
-static BOOL create_process(const char *app, const char *cmd, const void *env_block, int wide_env, const char *dir, void **pi) {
+// si: the program's STARTUPINFO (A and W share the layout up to hStdError). With STARTF_USESTDHANDLES (0x100) the
+// child's standard handles are the given ones: pipes and files here are descriptors, so they are dup2'd into 0, 1, 2.
+static BOOL create_process(const char *app, const char *cmd, const void *env_block, int wide_env, const char *dir, const void *si, void **pi) {
     int argc = 0;
     char **args = split_command_line(cmd && *cmd ? cmd : app, &argc);
     char exe[1024];
@@ -356,6 +358,13 @@ static BOOL create_process(const char *app, const char *cmd, const void *env_blo
     char cwd_win[1024], cwd_unix[1024];
     if (dir && *dir) snprintf(cwd_win, sizeof cwd_win, "%s", dir); else vx_get_cwd(cwd_win, sizeof cwd_win);
     if (vx_unix_path(cwd_win, cwd_unix, sizeof cwd_unix)) posix_spawn_file_actions_addchdir_np(&fa, cwd_unix);
+    if (si && (*(const DWORD *)((const char *)si + 60) & 0x100)) {
+        for (int k = 0; k < 3; k++) {
+            HANDLE h = *(HANDLE const *)((const char *)si + 80 + 8 * k);       // hStdInput, hStdOutput, hStdError
+            int fd = h ? vx_handle_fd(h) : -1;
+            if (fd >= 0 && fd != k) posix_spawn_file_actions_adddup2(&fa, fd, k);
+        }
+    }
     pid_t pid;
     int r = posix_spawn(&pid, self, &fa, NULL, argv, envp);
     posix_spawn_file_actions_destroy(&fa);
@@ -372,13 +381,13 @@ static BOOL create_process(const char *app, const char *cmd, const void *env_blo
 }
 #define CREATE_UNICODE_ENVIRONMENT 0x400
 static WINAPI BOOL CreateProcessA(const char *app, char *cmd, void *pa, void *ta, BOOL inherit, DWORD flags, void *env, const char *dir, void *si, void *pi) {
-    (void)pa; (void)ta; (void)inherit; (void)si;
-    return create_process(app, cmd, env, (flags & CREATE_UNICODE_ENVIRONMENT) != 0, dir, pi);
+    (void)pa; (void)ta; (void)inherit;
+    return create_process(app, cmd, env, (flags & CREATE_UNICODE_ENVIRONMENT) != 0, dir, si, pi);
 }
 static WINAPI BOOL CreateProcessW(const WCHAR *app, WCHAR *cmd, void *pa, void *ta, BOOL inherit, DWORD flags, void *env, const WCHAR *dir, void *si, void *pi) {
-    (void)pa; (void)ta; (void)inherit; (void)si;
+    (void)pa; (void)ta; (void)inherit;
     char *a = vx_utf8_dup(app), *c = vx_utf8_dup(cmd), *d = vx_utf8_dup(dir);
-    BOOL r = create_process(a, c, env, (flags & CREATE_UNICODE_ENVIRONMENT) != 0, d, pi);
+    BOOL r = create_process(a, c, env, (flags & CREATE_UNICODE_ENVIRONMENT) != 0, d, si, pi);
     free(a); free(c); free(d);
     return r;
 }
@@ -977,7 +986,7 @@ static BOOL shell_run(const char *file, const char *params, const char *dir, voi
     if (n < 4 || strcasecmp(file + n - 4, ".exe")) return 0;
     char *cmd = malloc(n + (params ? strlen(params) : 0) + 8);
     sprintf(cmd, "\"%s\"%s%s", file, params && *params ? " " : "", params && *params ? params : "");
-    BOOL ok = create_process(file, cmd, NULL, 0, dir, pi);
+    BOOL ok = create_process(file, cmd, NULL, 0, dir, NULL, pi);
     free(cmd);
     return ok;
 }

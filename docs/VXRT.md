@@ -150,8 +150,8 @@ Checked only with a stand-in for the headset (a mock behind an adb that tunnels)
   (20261015T005918Z-earth-start), The Lab 54.8 fps (20261015T010214Z-thelab-title), with SteamVR and the games
   imported and the DLLs from SteamVR's redistributables. The steamcmd download path itself has not been run here (it
   needs your sign-in).
-- Not there: Direct3D 12 games (the runtime side is in progress, [below](#direct3d-12-in-progress)), Vulkan,
-  tessellation, anti-cheat (never worked around).
+- Not there: Direct3D 12 game compatibility (the runtime side is in progress, [below](#direct3d-12-in-progress));
+  Vulkan has a narrow transfer/compute path but no game support yet; tessellation and anti-cheat (never worked around).
 
 ## Why VeRantyx
 
@@ -221,7 +221,8 @@ the only SteamVR title with one, made for the Steam Frame).
   Shading Language once (in the background, cached by Metal). The Wine version went D3D11 → Vulkan (DXVK) → Metal
   (MoltenVK). Geometry shaders run as compute kernels, stream output (Unity's skinning) as well; textures shared
   between the game, the compositor and the driver are IOSurfaces with keyed mutexes, so SteamVR's compositor accepts
-  the game's frames directly (under Wine it could not open them).
+  the game's frames directly (under Wine it could not open them). The `vxrt` D3D11 and D3D12 translators and runtime
+  are in this repository and link to Apple's Metal framework; they do not use D3DMetal or the Game Porting Toolkit.
 - **Steam without Windows Steam.** The game's `steamclient64.dll` is a built-in that forwards every Steam interface to
   the Mac Steam client you are signed in to (static ms_abi → System V stubs per interface method), so no Windows
   Steam and no Chromium run.
@@ -242,15 +243,20 @@ Direct3D 12 game runs yet**; what exists is checked by test programs that run on
 
 | Step | What | Checked by |
 |---|---|---|
-| DXIL reader (`src/dxil.c`) | Shader Model 6 bitcode read without LLVM | 5 shaders (242 instructions, 23 blocks) compared instruction by instruction with Microsoft's dxcompiler disassembly; dxcompiler itself runs on vxrt |
-| DXIL → MSL (`src/dxil_msl.c`) | Structured control flow, bindless descriptors (SM 6.6), wave and quad ops | The test shaders translate and Metal compiles them; a compute shader's results match HLSL on the GPU |
-| `d3d12.dll` on Metal (`src/d3d12.m`) | Devices, queues, command lists, fences, root signatures, descriptor heaps, compute | `tests/d3d12.c`: dispatch and readback as HLSL says |
-| Graphics | Pipelines, draws (indexed, base vertex/instance), depth, blending | A triangle with the expected pixels and coverage |
+| DXIL reader (`src/dxil.c`) | Shader Model 6 bitcode read without LLVM | 12 shaders (356 instructions, 30 blocks) compared instruction by instruction with Microsoft's dxcompiler disassembly; dxcompiler itself runs on vxrt |
+| DXIL → MSL (`src/dxil_msl.c`) | Structured control flow, bindless descriptors (SM 6.6), wave and quad ops, 2D and 2D-array depth comparison sampling, texture `GetDimensions` | The test shaders translate and Metal compiles them; compute, comparison-sampling, and 2D/1D-array dimensions results match HLSL on the GPU |
+| `d3d12.dll` on Metal (`src/d3d12.m`) | Devices, queues, command lists, fences, root signatures (also normalized into common GPU IR descriptor layouts), descriptor heaps, compute, copyable texture footprints, typed-buffer and common texture UAV clears, capability queries including Metal-backed multisample quality levels, and ExecuteIndirect tier 1.0; serialized root-signature limits/conflicts and per-subresource transition states are checked at queue submission, including Direct/Compute/Copy command restrictions, COMMON promotion/decay, paired split barriers, copy/resolve/UAV-clear use states, reflected finite CBV/SRV/UAV bindings, indirect argument/count buffers, RTV/DSV clear and draw uses, and bound vertex/index buffers | `tests/d3d12.c`: malformed/truncated, mixed sampler/resource tables, overlapping typed table slots, duplicate visible registers and over-budget root signatures are rejected; disjoint-stage register aliases are accepted; stale transition before-state, invalid copy/attachment/shader-resource states and read-only DSV clears reject their entire list without advancing state; split transition pair succeeds across submissions; COMMON buffer promotion is retained between lists in one submission and decays after the call; a Copy queue rejects Dispatch and successfully copies through COMMON/COPY states; GPU-written count buffer is transitioned to INDIRECT_ARGUMENT and clamps dispatches to `MaxCommandCount`; no-count two-record non-indexed and indexed indirect draws preserve padded argument strides; the compatibility indexed path supplies root constants and vertex/index views, then checks documented binding resets; float/uint texture clear rectangles and typed-buffer UAV range clear match expected readback |
+| Common GPU IR (`src/gpu_ir.h`, `src/gpu_ir.c`) | API-neutral buffer/texture references with block-compressed format metadata, immutable descriptor and push-constant layout records, ordered copies, color resolves and barriers; D3D11/D3D12 copies, resolves and barriers plus Vulkan buffer transfers and compute dispatch lower to this IR. D3D12 root signatures and Vulkan pipeline layouts create normalized descriptor layouts preserving each API's binding rules | `tests/gpu_ir.c` checks layout sorting/validation, ranges, uncompressed and BC footprints/alignment, multisample restrictions, resolve subresources, barrier fields/order, execution and resource lifetime; D3D11/D3D12 tests verify copies and readback, BC upload, multisample resolve, UAV barriers and stale-state rejection; `tests/vulkan.c` checks a SPIR-V storage-buffer compute dispatch |
+| Graphics | Pipelines, draws (indexed, base vertex/instance), depth, blending, `SampleCmp` and `SampleCmpLevelZero` for 2D depth textures | Expected triangle pixels and coverage; implicit, explicit-clamp, level-zero, and array comparisons from typeless D32 depth SRVs match the HLSL reference |
 | Swap chains | DXGI swap chains on D3D12 queues, presenting to a window | Three frames presented, back-buffer indices as on Windows |
-| Heaps | Heaps and placed (aliased) resources, sampled textures | 0 of 4096 pixels wrong |
+| Heaps | Heaps and placed (aliased) resources, sampled textures, 2D and 1D-array SRV `GetDimensions` | Texture values and dimensions: 0 of 4096 pixels wrong in each readback |
+| Query heaps | Occlusion, binary occlusion and timestamp queries; resolve and queue clock calibration | `tests/d3d12.c`: counts span pass splits and timestamps fall within calibration bounds |
 
-Not yet: comparison sampling, gather, GetDimensions, texture atomics, hull/domain/geometry/mesh shaders, raytracing,
-queries, ExecuteIndirect. Details are in the commit messages (`git log --grep D3D12`).
+Not yet: comparison sampling outside 2D and 2D-array depth textures, gather, runtime coverage for `GetDimensions` resource kinds beyond 2D and 1D-array SRVs,
+texture atomics, reserved resources, ExecuteIndirect tier 1.1 incrementing constants, raytracing and mesh dispatch,
+hull/domain/geometry shaders. ExecuteIndirect count buffers and signatures that change root arguments or IA views still
+wait for earlier GPU work and read shared argument buffers on the CPU. No game has been run on D3D12; these results are
+from standalone programs and shader tests. See [the ExecuteIndirect implementation notes](D3D12-ExecuteIndirect.md).
 
 ### Compared with the Wine and native versions
 
@@ -289,7 +295,7 @@ plays PC VR games from an Apple Silicon Mac, but takes a different route. From i
 | D3D11 on Metal | Our own translator (DXBC → Metal Shading Language), one layer | DXMT (one layer) |
 | Video | HEVC: to the Vision Pro app (own UDP protocol, exact render pose per frame) or through ALVR's streaming core | H.264, ALVR protocol, USB (100 Mbps) or Wi-Fi, 72 fps claimed |
 | Headset | Apple Vision Pro (own visionOS app), and ALVR clients: the Vision Pro's ALVR app checked, Quest and Pico not tested yet | Any ALVR client (tested on Quest 3) |
-| Input | Vision Pro app: hand tracking + Joy-Con (buttons, sticks, triggers, inertial sensors); ALVR: the headset's controllers or hands, vibration passed on (not felt yet: no Quest) | VR controllers through ALVR: 6DoF, buttons, sticks, haptics |
+| Input | Vision Pro app: hand tracking + Joy-Con (buttons, sticks, triggers, inertial sensors); ALVR: the headset's controllers or hands, vibration passed on (not felt yet: no Quest); DirectInput 8 enumerates HID game controllers and supports immediate state, buffered object changes and polled event notification | VR controllers through ALVR: 6DoF, buttons, sticks, haptics |
 | Audio | Core Audio process tap, no extra driver (also to ALVR) | BlackHole virtual audio device |
 | Games checked | Half-Life: Alyx, The Lab, Google Earth VR | Half-Life: Alyx, Beat Saber, Minecraft (Vivecraft) and more, per its author |
 | Source | MIT, full source | Binaries only, 7-day trial then license key |

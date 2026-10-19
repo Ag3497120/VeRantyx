@@ -1,4 +1,4 @@
-// VXRT_TRACE_CALLS=N: every call from Windows code into this runtime's functions is logged with its first four
+// VXRT_TRACE_CALLS=N (VXRT_TRACE_CALLS_FOR=<program.exe> limits it to one program): every call from Windows code into this runtime's functions is logged with its first four
 // arguments, and its return value and last error, up to N times per function (200 for N < 10). Imports and
 // GetProcAddress results go through a trampoline (context.S); functions that capture or switch stacks (setjmp,
 // unwinding, fibers, thread and process exits) are left alone. A debugging aid: the return addresses it swaps
@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include "vx.h"
 
@@ -27,6 +28,14 @@ int vx_trace_calls_on(void) {
         const char *e = getenv("VXRT_TRACE_CALLS");
         int n = e ? atoi(e) : 0;
         g_limit = n <= 0 ? 0 : n < 10 ? 200 : n;
+        // VXRT_TRACE_CALLS_FOR=<program.exe>: only that program (a launcher's game, not the launcher and SteamVR
+        // started with the same environment)
+        const char *only = getenv("VXRT_TRACE_CALLS_FOR");
+        if (g_limit && only && *only) {
+            const char *b = vx_proc.argv && vx_proc.argv[0] ? vx_proc.argv[0] : "";
+            for (const char *c = b; *c; c++) if (*c == '\\' || *c == '/') b = c + 1;
+            if (strcasecmp(b, only)) g_limit = 0;
+        }
     }
     return g_limit > 0;
 }

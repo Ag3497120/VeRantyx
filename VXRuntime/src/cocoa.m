@@ -377,8 +377,16 @@ void vx_cocoa_redraw(vx_window *w) {
 }
 
 // MessageBox: an NSAlert with the buttons of the MB_* type; returns the ID* of the button pressed.
+static const struct { const char *labels[3]; int ids[3]; } message_box_kinds[] = {
+    { { "OK" }, { 1 } }, { { "OK", "Cancel" }, { 1, 2 } }, { { "Abort", "Retry", "Ignore" }, { 3, 4, 5 } },
+    { { "Yes", "No", "Cancel" }, { 6, 7, 2 } }, { { "Yes", "No" }, { 6, 7 } }, { { "Retry", "Cancel" }, { 4, 2 } },
+    { { "Cancel", "Try Again", "Continue" }, { 2, 10, 11 } },
+};
 int vx_cocoa_message_box(const char *text, const char *caption, unsigned type) {
     __block int result = 1;
+    // VXRT_MESSAGEBOX=auto: the box's first button, pressed at once (unattended runs; the text is in the log already)
+    const char *automatic = getenv("VXRT_MESSAGEBOX");
+    if (automatic && !strcmp(automatic, "auto")) return message_box_kinds[(type & 0xf) > 6 ? 0 : (type & 0xf)].ids[0];
     char *t = strdup(text ? text : ""), *c = strdup(caption ? caption : "");
     on_main(^{
         NSAlert *a = [NSAlert new];
@@ -386,11 +394,7 @@ int vx_cocoa_message_box(const char *text, const char *caption, unsigned type) {
         a.informativeText = [NSString stringWithUTF8String:t] ?: @"";
         unsigned icon = type & 0xf0;
         a.alertStyle = icon == 0x10 ? NSAlertStyleCritical : icon == 0x30 ? NSAlertStyleWarning : NSAlertStyleInformational;
-        static const struct { const char *labels[3]; int ids[3]; } kinds[] = {
-            { { "OK" }, { 1 } }, { { "OK", "Cancel" }, { 1, 2 } }, { { "Abort", "Retry", "Ignore" }, { 3, 4, 5 } },
-            { { "Yes", "No", "Cancel" }, { 6, 7, 2 } }, { { "Yes", "No" }, { 6, 7 } }, { { "Retry", "Cancel" }, { 4, 2 } },
-            { { "Cancel", "Try Again", "Continue" }, { 2, 10, 11 } },
-        };
+        #define kinds message_box_kinds
         unsigned k = type & 0xf;
         if (k > 6) k = 0;
         int n = 0;
@@ -399,6 +403,7 @@ int vx_cocoa_message_box(const char *text, const char *caption, unsigned type) {
         NSModalResponse r = [a runModal];
         int index = (int)(r - NSAlertFirstButtonReturn);
         result = index >= 0 && index < n ? kinds[k].ids[index] : kinds[k].ids[0];
+        #undef kinds
     });
     free(t); free(c);
     return result;

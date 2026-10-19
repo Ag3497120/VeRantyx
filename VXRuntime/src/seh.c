@@ -377,6 +377,11 @@ static void __attribute__((noreturn)) resume(CONTEXT *ctx) {
     vx_restore_context(ctx);
 }
 
+static int seh_trace(void) {                       // VXRT_TRACE_SEH=1: every raise, and what runs when nothing handles one
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("VXRT_TRACE_SEH"); on = e && *e == '1'; }
+    return on;
+}
 static void __attribute__((noreturn)) dispatch(EXCEPTION_RECORD *rec, CONTEXT *ctx) {
     vx_entry self = ENTRY(t_entries, ctx);
     ENTRY_SET_AT(self);
@@ -400,7 +405,25 @@ static void __attribute__((noreturn)) dispatch(EXCEPTION_RECORD *rec, CONTEXT *c
             resume(ctx);
         }
     }
-    if (g_unhandled_filter && g_unhandled_filter(&ep) == -1) resume(ctx);
+    if (g_unhandled_filter) {
+        // VXRT_TRACE_SEH=1: the program's unhandled-exception filter is about to run (it may write a dump and wait)
+        if (seh_trace()) {
+            const vx_image *m = vx_image_at(ctx->rip);
+            vx_log("SEH: no handler for %#x raised at %s+%#llx: the program's unhandled filter runs", rec->code,
+                   m ? m->name : "?", m ? (unsigned long long)(ctx->rip - (uint64_t)(uintptr_t)m->base) : (unsigned long long)ctx->rip);
+            CONTEXT walk = *ctx; vx_entry *at = self.next;
+            for (int depth = 0; depth < 12; depth++) {
+                const vx_image *f = vx_image_at(walk.rip);
+                vx_log("   #%d %s+%#llx", depth, f ? f->name : "?", f ? (unsigned long long)(walk.rip - (uint64_t)(uintptr_t)f->base) : (unsigned long long)walk.rip);
+                uint64_t base; RUNTIME_FUNCTION *fn = next_function(&walk, &at, 0, &base);
+                if (!fn) break;
+                void *data = NULL; uint64_t frame = 0;
+                RtlVirtualUnwind(0, base, walk.rip, fn, &walk, &data, &frame, NULL);
+                if (!walk.rip) break;
+            }
+        }
+        if (g_unhandled_filter(&ep) == -1) resume(ctx);
+    }
     vx_log("unhandled exception %#x at %p", rec->code, rec->address);
     CONTEXT walk = *ctx;                          // the program's frames, unwound
     vx_entry *at = self.next;
@@ -422,7 +445,7 @@ static void __attribute__((noreturn)) dispatch(EXCEPTION_RECORD *rec, CONTEXT *c
 void __attribute__((noreturn)) vx_raise(DWORD code, DWORD flags, DWORD n, const uint64_t *args, CONTEXT *ctx) {
     EXCEPTION_RECORD rec = { code, flags & EXCEPTION_NONCONTINUABLE, NULL, (void *)ctx->rip, n > 15 ? 15 : n, 0, {0} };
     if (args) memcpy(rec.info, args, rec.nparams * 8);
-    if (vx_trace && code != 0xe06d7363 && code != 0x406d1388) {   // not C++ exceptions or thread names
+    if (seh_trace() || (vx_trace && code != 0xe06d7363 && code != 0x406d1388)) {   // (vx_trace: not C++ exceptions or thread names)
         const vx_image *m = vx_image_at(ctx->rip);
         vx_log("RaiseException %#x from %s+%#llx", code, m ? m->name : "?", m ? (unsigned long long)(ctx->rip - (uint64_t)m->base) : (unsigned long long)ctx->rip);
     }
@@ -487,7 +510,8 @@ void __attribute__((noreturn)) vx_unwind(uint64_t target_frame, uint64_t target_
 // ---- __C_specific_handler (the C runtime's handler for __try/__except/__finally) ----------------------------------------------
 typedef struct { DWORD begin, end, handler, target; } scope_record;
 typedef struct { DWORD count; scope_record r[]; } scope_table;
-void vx_rtl_unwind_ex(uint64_t, uint64_t, EXCEPTION_RECORD *, uint64_t, CONTEXT *, void *) __asm__("_vx_RtlUnwindEx");
+// (the Windows entry: called with its convention, as a program would; a plain C call put the arguments elsewhere)
+void WINAPI vx_rtl_unwind_ex(uint64_t, uint64_t, EXCEPTION_RECORD *, uint64_t, CONTEXT *, void *) __asm__("_vx_RtlUnwindEx");
 
 static WINAPI int __C_specific_handler(EXCEPTION_RECORD *rec, uint64_t frame, CONTEXT *ctx, DISPATCHER_CONTEXT *dc) {
     const scope_table *t = dc->handler_data;

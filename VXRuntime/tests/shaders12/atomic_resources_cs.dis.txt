@@ -1,0 +1,268 @@
+;
+; Note: shader requires additional functionality:
+;       64 UAV slots
+;
+;
+; Input signature:
+;
+; Name                 Index   Mask Register SysValue  Format   Used
+; -------------------- ----- ------ -------- -------- ------- ------
+; no parameters
+;
+; Output signature:
+;
+; Name                 Index   Mask Register SysValue  Format   Used
+; -------------------- ----- ------ -------- -------- ------- ------
+; no parameters
+; shader hash: 50403e51c6fdde6b6848e161b40d4dad
+;
+; Pipeline Runtime Information: 
+;
+; Compute Shader
+; NumThreads=(1,1,1)
+;
+;
+; Buffer Definitions:
+;
+; Resource bind info for 
+; {
+;
+;   [4 x i8] (type annotation not present)
+;
+; }
+;
+; Resource bind info for 
+; {
+;
+;   [4 x i8] (type annotation not present)
+;
+; }
+;
+;
+; Resource Bindings:
+;
+; Name                                 Type  Format         Dim      ID      HLSL Bind  Count
+; ------------------------------ ---------- ------- ----------- ------- -------------- ------
+;                                       UAV     u32         buf      U0             u0     1
+;                                       UAV     i32         buf      U1             u1     1
+;                                       UAV     u32          2d      U2             u2     1
+;                                       UAV     i32          2d      U3             u3     1
+;                                       UAV    byte         r/w      U4             u4     1
+;                                       UAV  struct         r/w      U5             u5     1
+;                                       UAV  struct         r/w      U6             u6     1
+;                                       UAV     u32          1d      U7             u7     1
+;                                       UAV     u32     1darray      U8             u8     1
+;                                       UAV     u32     2darray      U9             u9     1
+;                                       UAV     u32          3d     U10            u10     1
+;                                       UAV     u32          3d     U11            u11     1
+;
+target datalayout = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+target triple = "dxil-ms-dx"
+
+%dx.types.Handle = type { i8* }
+%dx.types.ResRet.i32 = type { i32, i32, i32, i32, i32 }
+%dx.types.Dimensions = type { i32, i32, i32, i32 }
+%"class.RWBuffer<unsigned int>" = type { i32 }
+%"class.RWBuffer<int>" = type { i32 }
+%"class.RWTexture2D<unsigned int>" = type { i32 }
+%"class.RWTexture2D<int>" = type { i32 }
+%struct.RWByteAddressBuffer = type { i32 }
+%"class.RWStructuredBuffer<unsigned int>" = type { i32 }
+%"class.RWTexture1D<unsigned int>" = type { i32 }
+%"class.RWTexture1DArray<unsigned int>" = type { i32 }
+%"class.RWTexture2DArray<unsigned int>" = type { i32 }
+%"class.RWTexture3D<unsigned int>" = type { i32 }
+
+define void @main() {
+  %1 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 11, i32 11, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %2 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 10, i32 10, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %3 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 9, i32 9, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %4 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 8, i32 8, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %5 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 7, i32 7, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %6 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 6, i32 6, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %7 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 5, i32 5, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %8 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 4, i32 4, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %9 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 3, i32 3, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %10 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 2, i32 2, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %11 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 1, i32 1, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %12 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 0, i32 0, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %13 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %12, i32 8, i32 0, i32 undef, i32 undef, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %14 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %12, i32 7, i32 0, i32 undef, i32 undef, i32 100)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %15 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %12, i32 6, i32 0, i32 undef, i32 undef, i32 20)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %16 = call i32 @dx.op.atomicCompareExchange.i32(i32 79, %dx.types.Handle %12, i32 0, i32 undef, i32 undef, i32 20, i32 21)  ; AtomicCompareExchange(handle,offset0,offset1,offset2,compareValue,newValue)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 0, i32 0, i32 %14, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 1, i32 0, i32 %15, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 2, i32 0, i32 %16, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %17 = call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %12, i32 0, i32 undef)  ; BufferLoad(srv,index,wot)
+  %18 = extractvalue %dx.types.ResRet.i32 %17, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 3, i32 0, i32 %18, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %19 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %11, i32 8, i32 0, i32 undef, i32 undef, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %20 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %11, i32 4, i32 0, i32 undef, i32 undef, i32 -50)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %21 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %11, i32 5, i32 0, i32 undef, i32 undef, i32 -10)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %22 = call i32 @dx.op.atomicCompareExchange.i32(i32 79, %dx.types.Handle %11, i32 0, i32 undef, i32 undef, i32 -10, i32 -1)  ; AtomicCompareExchange(handle,offset0,offset1,offset2,compareValue,newValue)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 4, i32 0, i32 %20, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 5, i32 0, i32 %21, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 6, i32 0, i32 %22, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %23 = call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %11, i32 0, i32 undef)  ; BufferLoad(srv,index,wot)
+  %24 = extractvalue %dx.types.ResRet.i32 %23, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 7, i32 0, i32 %24, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %25 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %10, i32 8, i32 0, i32 0, i32 undef, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %26 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %10, i32 7, i32 0, i32 0, i32 undef, i32 100)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %27 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %10, i32 6, i32 0, i32 0, i32 undef, i32 20)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %28 = call i32 @dx.op.atomicCompareExchange.i32(i32 79, %dx.types.Handle %10, i32 0, i32 0, i32 undef, i32 20, i32 21)  ; AtomicCompareExchange(handle,offset0,offset1,offset2,compareValue,newValue)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 8, i32 0, i32 %26, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 9, i32 0, i32 %27, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 10, i32 0, i32 %28, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %29 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %10, i32 undef, i32 0, i32 0, i32 undef, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %30 = extractvalue %dx.types.ResRet.i32 %29, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 11, i32 0, i32 %30, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %31 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %9, i32 8, i32 0, i32 0, i32 undef, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %32 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %9, i32 4, i32 0, i32 0, i32 undef, i32 -50)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %33 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %9, i32 5, i32 0, i32 0, i32 undef, i32 -10)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %34 = call i32 @dx.op.atomicCompareExchange.i32(i32 79, %dx.types.Handle %9, i32 0, i32 0, i32 undef, i32 -10, i32 -1)  ; AtomicCompareExchange(handle,offset0,offset1,offset2,compareValue,newValue)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 12, i32 0, i32 %32, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 13, i32 0, i32 %33, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 14, i32 0, i32 %34, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %35 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %9, i32 undef, i32 0, i32 0, i32 undef, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %36 = extractvalue %dx.types.ResRet.i32 %35, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 15, i32 0, i32 %36, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %37 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %8, i32 8, i32 0, i32 undef, i32 undef, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %38 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %8, i32 7, i32 0, i32 undef, i32 undef, i32 100)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %39 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %8, i32 6, i32 0, i32 undef, i32 undef, i32 20)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %40 = call i32 @dx.op.atomicCompareExchange.i32(i32 79, %dx.types.Handle %8, i32 0, i32 undef, i32 undef, i32 20, i32 21)  ; AtomicCompareExchange(handle,offset0,offset1,offset2,compareValue,newValue)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 16, i32 0, i32 %38, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 17, i32 0, i32 %39, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 18, i32 0, i32 %40, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %41 = call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %8, i32 0, i32 undef)  ; BufferLoad(srv,index,wot)
+  %42 = extractvalue %dx.types.ResRet.i32 %41, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 19, i32 0, i32 %42, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %43 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %7, i32 8, i32 0, i32 0, i32 undef, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %44 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %7, i32 0, i32 0, i32 0, i32 undef, i32 5)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %45 = call i32 @dx.op.atomicCompareExchange.i32(i32 79, %dx.types.Handle %7, i32 0, i32 0, i32 undef, i32 5, i32 7)  ; AtomicCompareExchange(handle,offset0,offset1,offset2,compareValue,newValue)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 20, i32 0, i32 %44, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 21, i32 0, i32 %45, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %46 = call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %7, i32 0, i32 0)  ; BufferLoad(srv,index,wot)
+  %47 = extractvalue %dx.types.ResRet.i32 %46, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 22, i32 0, i32 %47, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %48 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %5, i32 8, i32 1, i32 undef, i32 undef, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %49 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %5, i32 0, i32 1, i32 undef, i32 undef, i32 5)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %50 = call i32 @dx.op.atomicCompareExchange.i32(i32 79, %dx.types.Handle %5, i32 1, i32 undef, i32 undef, i32 5, i32 7)  ; AtomicCompareExchange(handle,offset0,offset1,offset2,compareValue,newValue)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 23, i32 0, i32 %49, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 24, i32 0, i32 %50, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %51 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %5, i32 undef, i32 1, i32 undef, i32 undef, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %52 = extractvalue %dx.types.ResRet.i32 %51, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 25, i32 0, i32 %52, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %53 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %4, i32 8, i32 1, i32 1, i32 undef, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %54 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %4, i32 0, i32 1, i32 1, i32 undef, i32 5)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %55 = call i32 @dx.op.atomicCompareExchange.i32(i32 79, %dx.types.Handle %4, i32 1, i32 1, i32 undef, i32 5, i32 7)  ; AtomicCompareExchange(handle,offset0,offset1,offset2,compareValue,newValue)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 26, i32 0, i32 %54, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 27, i32 0, i32 %55, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %56 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %4, i32 undef, i32 1, i32 1, i32 undef, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %57 = extractvalue %dx.types.ResRet.i32 %56, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 28, i32 0, i32 %57, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %58 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %3, i32 8, i32 1, i32 1, i32 1, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %59 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %3, i32 0, i32 1, i32 1, i32 1, i32 5)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %60 = call i32 @dx.op.atomicCompareExchange.i32(i32 79, %dx.types.Handle %3, i32 1, i32 1, i32 1, i32 5, i32 7)  ; AtomicCompareExchange(handle,offset0,offset1,offset2,compareValue,newValue)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 29, i32 0, i32 %59, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 30, i32 0, i32 %60, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %61 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %3, i32 undef, i32 1, i32 1, i32 1, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %62 = extractvalue %dx.types.ResRet.i32 %61, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 31, i32 0, i32 %62, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %63 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %1, i32 8, i32 1, i32 1, i32 1, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %64 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %1, i32 8, i32 1, i32 1, i32 2, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %65 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %1, i32 8, i32 0, i32 0, i32 1, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %66 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %1, i32 8, i32 0, i32 0, i32 3, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  call void @dx.op.textureStore.i32(i32 67, %dx.types.Handle %2, i32 0, i32 0, i32 0, i32 11, i32 11, i32 11, i32 11, i8 15)  ; TextureStore(srv,coord0,coord1,coord2,value0,value1,value2,value3,mask)
+  call void @dx.op.textureStore.i32(i32 67, %dx.types.Handle %2, i32 0, i32 0, i32 2, i32 13, i32 13, i32 13, i32 13, i8 15)  ; TextureStore(srv,coord0,coord1,coord2,value0,value1,value2,value3,mask)
+  call void @dx.op.barrier(i32 80, i32 2)  ; Barrier(barrierMode)
+  %67 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %2, i32 undef, i32 0, i32 0, i32 2, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %68 = extractvalue %dx.types.ResRet.i32 %67, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 38, i32 0, i32 %68, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %69 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %1, i32 undef, i32 0, i32 0, i32 1, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %70 = extractvalue %dx.types.ResRet.i32 %69, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 39, i32 0, i32 %70, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %71 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %1, i32 undef, i32 0, i32 0, i32 3, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %72 = extractvalue %dx.types.ResRet.i32 %71, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 40, i32 0, i32 %72, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %73 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %2, i32 8, i32 1, i32 1, i32 1, i32 0)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %74 = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %2, i32 0, i32 1, i32 1, i32 1, i32 5)  ; AtomicBinOp(handle,atomicOp,offset0,offset1,offset2,newValue)
+  %75 = call i32 @dx.op.atomicCompareExchange.i32(i32 79, %dx.types.Handle %2, i32 1, i32 1, i32 1, i32 5, i32 7)  ; AtomicCompareExchange(handle,offset0,offset1,offset2,compareValue,newValue)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 32, i32 0, i32 %74, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 33, i32 0, i32 %75, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %76 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %2, i32 undef, i32 1, i32 1, i32 1, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %77 = extractvalue %dx.types.ResRet.i32 %76, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 34, i32 0, i32 %77, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %78 = call %dx.types.Dimensions @dx.op.getDimensions(i32 72, %dx.types.Handle %2, i32 0)  ; GetDimensions(handle,mipLevel)
+  %79 = extractvalue %dx.types.Dimensions %78, 2
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 35, i32 0, i32 %79, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %80 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %1, i32 undef, i32 1, i32 1, i32 2, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %81 = extractvalue %dx.types.ResRet.i32 %80, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 36, i32 0, i32 %81, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %82 = call %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32 66, %dx.types.Handle %1, i32 undef, i32 1, i32 1, i32 1, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %83 = extractvalue %dx.types.ResRet.i32 %82, 0
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %6, i32 37, i32 0, i32 %83, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  ret void
+}
+
+; Function Attrs: nounwind
+declare i32 @dx.op.atomicBinOp.i32(i32, %dx.types.Handle, i32, i32, i32, i32, i32) #0
+
+; Function Attrs: nounwind
+declare i32 @dx.op.atomicCompareExchange.i32(i32, %dx.types.Handle, i32, i32, i32, i32, i32) #0
+
+; Function Attrs: nounwind readonly
+declare %dx.types.ResRet.i32 @dx.op.textureLoad.i32(i32, %dx.types.Handle, i32, i32, i32, i32, i32, i32, i32) #1
+
+; Function Attrs: nounwind readonly
+declare %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32, %dx.types.Handle, i32, i32) #1
+
+; Function Attrs: nounwind
+declare void @dx.op.textureStore.i32(i32, %dx.types.Handle, i32, i32, i32, i32, i32, i32, i32, i8) #0
+
+; Function Attrs: noduplicate nounwind
+declare void @dx.op.barrier(i32, i32) #2
+
+; Function Attrs: nounwind readonly
+declare %dx.types.Dimensions @dx.op.getDimensions(i32, %dx.types.Handle, i32) #1
+
+; Function Attrs: nounwind readonly
+declare %dx.types.Handle @dx.op.createHandle(i32, i8, i32, i32, i1) #1
+
+; Function Attrs: nounwind
+declare void @dx.op.bufferStore.i32(i32, %dx.types.Handle, i32, i32, i32, i32, i32, i32, i8) #0
+
+attributes #0 = { nounwind }
+attributes #1 = { nounwind readonly }
+attributes #2 = { noduplicate nounwind }
+
+!llvm.ident = !{!0}
+!dx.version = !{!1}
+!dx.valver = !{!2}
+!dx.shaderModel = !{!3}
+!dx.resources = !{!4}
+!dx.entryPoints = !{!21}
+
+!0 = !{!"dxcoob 1.8.2405.0"}
+!1 = !{i32 1, i32 0}
+!2 = !{i32 1, i32 8}
+!3 = !{!"cs", i32 6, i32 0}
+!4 = !{null, !5, null, null}
+!5 = !{!6, !8, !10, !11, !12, !13, !15, !16, !17, !18, !19, !20}
+!6 = !{i32 0, %"class.RWBuffer<unsigned int>"* undef, !"", i32 0, i32 0, i32 1, i32 10, i1 false, i1 false, i1 false, !7}
+!7 = !{i32 0, i32 5}
+!8 = !{i32 1, %"class.RWBuffer<int>"* undef, !"", i32 0, i32 1, i32 1, i32 10, i1 false, i1 false, i1 false, !9}
+!9 = !{i32 0, i32 4}
+!10 = !{i32 2, %"class.RWTexture2D<unsigned int>"* undef, !"", i32 0, i32 2, i32 1, i32 2, i1 false, i1 false, i1 false, !7}
+!11 = !{i32 3, %"class.RWTexture2D<int>"* undef, !"", i32 0, i32 3, i32 1, i32 2, i1 false, i1 false, i1 false, !9}
+!12 = !{i32 4, %struct.RWByteAddressBuffer* undef, !"", i32 0, i32 4, i32 1, i32 11, i1 false, i1 false, i1 false, null}
+!13 = !{i32 5, %"class.RWStructuredBuffer<unsigned int>"* undef, !"", i32 0, i32 5, i32 1, i32 12, i1 false, i1 false, i1 false, !14}
+!14 = !{i32 1, i32 4}
+!15 = !{i32 6, %"class.RWStructuredBuffer<unsigned int>"* undef, !"", i32 0, i32 6, i32 1, i32 12, i1 false, i1 false, i1 false, !14}
+!16 = !{i32 7, %"class.RWTexture1D<unsigned int>"* undef, !"", i32 0, i32 7, i32 1, i32 1, i1 false, i1 false, i1 false, !7}
+!17 = !{i32 8, %"class.RWTexture1DArray<unsigned int>"* undef, !"", i32 0, i32 8, i32 1, i32 6, i1 false, i1 false, i1 false, !7}
+!18 = !{i32 9, %"class.RWTexture2DArray<unsigned int>"* undef, !"", i32 0, i32 9, i32 1, i32 7, i1 false, i1 false, i1 false, !7}
+!19 = !{i32 10, %"class.RWTexture3D<unsigned int>"* undef, !"", i32 0, i32 10, i32 1, i32 4, i1 false, i1 false, i1 false, !7}
+!20 = !{i32 11, %"class.RWTexture3D<unsigned int>"* undef, !"", i32 0, i32 11, i32 1, i32 4, i1 false, i1 false, i1 false, !7}
+!21 = !{void ()* @main, !"main", null, !4, !22}
+!22 = !{i32 0, i64 32784, i32 4, !23}
+!23 = !{i32 1, i32 1, i32 1}

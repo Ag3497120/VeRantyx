@@ -92,6 +92,45 @@ int main(int argc, char **argv) {
     CHECK(read_pixel(dev, ctx, a, 2, 2) == patch && read_pixel(dev, ctx, a, 1, 2) == pixels[9]);
     ID3D11Texture2D_Release(a); ID3D11Texture2D_Release(b);
 
+    // Whole-buffer copies share the same API-neutral GPU IR path as texture copies.
+    UINT buffer_words[4] = { 0x11223344u, 0x55667788u, 0x90abcdefu, 0x13579bdfu };
+    UINT buffer_initial_dst[4] = { 0xaaaaaaaa, 0xbbbbbbbb, 0xcccccccc, 0xdddddddd };
+    D3D11_BUFFER_DESC buffer_desc = { sizeof buffer_words, D3D11_USAGE_DEFAULT, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0 };
+    D3D11_SUBRESOURCE_DATA buffer_init = { buffer_words, 0, 0 };
+    D3D11_SUBRESOURCE_DATA dst_init = { buffer_initial_dst, 0, 0 };
+    ID3D11Buffer *buffer_src = NULL, *buffer_dst = NULL, *buffer_readback = NULL;
+    CHECK(SUCCEEDED(ID3D11Device_CreateBuffer(dev, &buffer_desc, &buffer_init, &buffer_src)));
+    CHECK(SUCCEEDED(ID3D11Device_CreateBuffer(dev, &buffer_desc, &dst_init, &buffer_dst)));
+    D3D11_BUFFER_DESC readback_desc = buffer_desc;
+    readback_desc.Usage = D3D11_USAGE_STAGING;
+    readback_desc.BindFlags = 0;
+    readback_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    CHECK(SUCCEEDED(ID3D11Device_CreateBuffer(dev, &readback_desc, NULL, &buffer_readback)));
+    if (buffer_src && buffer_dst && buffer_readback) {
+        D3D11_BOX buffer_region = { sizeof(UINT), 0, 0, 3 * sizeof(UINT), 1, 1 };
+        ID3D11DeviceContext_CopySubresourceRegion(ctx, (ID3D11Resource *)buffer_dst, 0, sizeof(UINT), 0, 0,
+                                                 (ID3D11Resource *)buffer_src, 0, &buffer_region);
+        ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)buffer_readback, (ID3D11Resource *)buffer_dst);
+        D3D11_MAPPED_SUBRESOURCE mapped = { 0 };
+        CHECK(SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)buffer_readback, 0, D3D11_MAP_READ, 0, &mapped)));
+        if (mapped.pData) {
+            UINT expected_region[4] = { buffer_initial_dst[0], buffer_words[1], buffer_words[2], buffer_initial_dst[3] };
+            CHECK(!memcmp(mapped.pData, expected_region, sizeof expected_region));
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)buffer_readback, 0);
+        }
+        ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)buffer_dst, (ID3D11Resource *)buffer_src);
+        ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)buffer_readback, (ID3D11Resource *)buffer_dst);
+        mapped = (D3D11_MAPPED_SUBRESOURCE){ 0 };
+        CHECK(SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)buffer_readback, 0, D3D11_MAP_READ, 0, &mapped)));
+        if (mapped.pData) {
+            CHECK(!memcmp(mapped.pData, buffer_words, sizeof buffer_words));
+            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)buffer_readback, 0);
+        }
+    }
+    if (buffer_src) ID3D11Buffer_Release(buffer_src);
+    if (buffer_dst) ID3D11Buffer_Release(buffer_dst);
+    if (buffer_readback) ID3D11Buffer_Release(buffer_readback);
+
     // Frames: a few presents with changing colors (more when watching).
     int frames = interactive ? 600 : 30;
     for (int f = 0; f < frames; f++) {

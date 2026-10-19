@@ -157,4 +157,8 @@ void vx_control_start(const char *path) {
     pthread_t t;
     if (pthread_create(&t, NULL, serve, (void *)(intptr_t)ls) == 0) pthread_detach(t);
     vx_log("control: Command Clips at %s", path);
+    // the socket is this program's: a program it starts (a launcher's game) must not take the path over and
+    // remove it when it exits (g_path keeps the copy the socket needs)
+    unsetenv("VXRT_CONTROL");
+    unsetenv("VXRT_CONTROL_LOG");
 }

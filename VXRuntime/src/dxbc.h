@@ -31,6 +31,8 @@ typedef struct {
     uint32_t uav_stride[8];         // structured element size
     uint64_t srv_buffers;           // t# that are raw or structured buffers (bound as Metal buffers)
     uint32_t srv_stride[64];
+    uint8_t srv_rank[64];           // a buffer SRV's rank among the shader's buffer SRVs + 1 (0: not one): its Metal buffer
+                                    // slot is DXBC_SRV_BUFFER_BASE + rank and its size vx_sizes[8 + rank] (t# itself may be any of t0..t63)
     uint32_t threads[3];            // [numthreads(x, y, z)]
     int uses_sizes;                 // reads buffer sizes (bufinfo, bounds) or UAV counters from buffer(DXBC_SIZES_BUFFER)
     uint8_t uav_counters;           // u# with a hidden counter (append, consume, IncrementCounter)
@@ -60,7 +62,7 @@ enum { DXBC_UAV_TYPED = 1, DXBC_UAV_RAW, DXBC_UAV_STRUCTURED };
 #define DXBC_GS_IN 28
 #define DXBC_GS_OUT 29
 #define DXBC_GS_COUNTS 26           // (the geometry kernel: triangles made per primitive)
-// bytes of u0..u7 then t0..t21, float4s of cb0..cb13 (DXBC_CB_SIZES on); GPU addresses
+// bytes of u0..u7 then the buffer SRVs by rank (22 at most), float4s of cb0..cb13 (DXBC_CB_SIZES on); GPU addresses
 typedef struct { uint32_t sizes[48]; uint64_t counters[8]; } dxbc_aux;
 #define DXBC_CB_SIZES 32
 

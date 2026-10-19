@@ -147,6 +147,24 @@ cmp -s "$DRIVER_DLL" "$OVERLAY_DRIVER/driver_verantyx.dll" || cp -p "$DRIVER_DLL
 # VXRT_VR_SETTINGS='{"steamvr": {"framesToThrottle": 0}}': settings merged in, section by section (experiments).
 # The VeRantyx headset is the only driver, no SteamVR Home, dashboard or safe mode (vxrt_helper.swift: vrsettings).
 "$HELPER" vrsettings "$STEAM_ROOT/config/steamvr.vrsettings" "$VXRT_VR_OVERLAY/config/steamvr.vrsettings" "$VXRT_VR_NO_STANDBY" "${VXRT_VR_RENDER_SCALE:-}" "${VXRT_VR_SETTINGS:-}"
+# A play area (chaperone universe 1, the driver's): without one SteamVR reads none ("Failed to read chaperone file"),
+# marks the head's poses invalid for programs (bPoseIsValid false, though tracking runs) and covers games with its
+# environment; Elite Dangerous then shows nothing and its view does not follow the head. A 3x3 m area with the floor
+# at the headset's floor and the seated origin where it is, as the Wine version's setup wrote (disable_steamvr_home.sh).
+CHAPERONE="$VXRT_VR_OVERLAY/config/chaperone_info.vrchap"
+if [[ ! -f "$CHAPERONE" ]]; then
+    python3 - "$CHAPERONE" <<'PY'
+import json, sys, time
+half, height = 1.5, 2.43
+corners = [(-half, -half), (-half, half), (half, half), (half, -half)]
+bounds = [[[x0, 0, z0], [x0, height, z0], [x1, height, z1], [x1, 0, z1]]
+          for (x0, z0), (x1, z1) in zip(corners, corners[1:] + corners[:1])]
+universe = {"collision_bounds": bounds, "play_area": [2 * half, 2 * half],
+            "seated": {"translation": [0, 0, 0], "yaw": 0}, "standing": {"translation": [0, 0, 0], "yaw": 0},
+            "time": time.strftime("%a %b %d %H:%M:%S %Y"), "universeID": "1"}
+json.dump({"jsonid": "chaperone_info", "universes": [universe], "version": 5}, open(sys.argv[1], "w"), indent=3)
+PY
+fi
 
 # Frames are scaled and converted for the encoder on the GPU: the encoder's own CPU/GPU timing picks the CPU when the
 # Mac is idle, and the CPU then loses to a game running at full rate (60 frames captured, 20 encoded).

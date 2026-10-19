@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1137,6 +1138,15 @@ static WINAPI WCHAR *ms_wgetenv(const WCHAR *name) {             // the wide cop
     free(n);
     return v ? vx_utf16_dup(v) : NULL;
 }
+static WINAPI WCHAR *ms_wcsstr(const WCHAR *haystack, const WCHAR *needle) {
+    if (!*needle) return (WCHAR *)haystack;
+    for (; *haystack; haystack++) {
+        size_t i = 0;
+        while (needle[i] && haystack[i] == needle[i]) i++;
+        if (!needle[i]) return (WCHAR *)haystack;
+    }
+    return NULL;
+}
 static WINAPI int ms_wcsncmp(const WCHAR *a, const WCHAR *b, size_t n) {
     for (size_t i = 0; i < n; i++) { if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1; if (!a[i]) break; }
     return 0;
@@ -1241,7 +1251,7 @@ static const vx_export msvcrt_extra[] = {
     { "_open", (void *)ms_open }, { "_wopen", (void *)ms_wopen }, { "_wsopen", (void *)ms_wsopen }, { "_close", (void *)ms_close },
     { "_write", (void *)ms_write }, { "_lseeki64", (void *)ms_lseeki64 }, { "_isatty", (void *)ms_isatty }, { "_chsize", (void *)ms_chsize },
     { "_get_osfhandle", (void *)ms_get_osfhandle }, { "_open_osfhandle", (void *)ms_open_osfhandle }, { "_fdopen", (void *)ms_fdopen },
-    { "_wgetenv", (void *)ms_wgetenv }, { "wcsncmp", (void *)ms_wcsncmp }, { "wcstol", (void *)ms_wcstol }, { "atol", (void *)ms_atol },
+    { "_wgetenv", (void *)ms_wgetenv }, { "wcsncmp", (void *)ms_wcsncmp }, { "wcsstr", (void *)ms_wcsstr }, { "wcstol", (void *)ms_wcstol }, { "atol", (void *)ms_atol },
     { "_strlwr", (void *)ms_strlwr }, { "_wcslwr", (void *)ms_wcslwr }, { "_itoa", (void *)ms_itoa }, { "_ltoa", (void *)ms_itoa },
     { "_ultoa", (void *)ms_ultoa }, { "_memicmp", (void *)ms_memicmp }, { "mbtowc", (void *)ms_mbtowc }, { "btowc", (void *)ms_btowc }, { "wctomb", (void *)ms_wctomb },
     { "isleadbyte", (void *)ms_isleadbyte }, { "_ismbblead", (void *)ms_ismbblead }, { "_mbscmp", (void *)ms_mbscmp },
@@ -1252,7 +1262,129 @@ static const vx_export msvcrt_extra[] = {
     { "__mb_cur_max", (void *)&g_mb_cur_max }, { "__pioinfo", (void *)g_pioinfo }, { "__badioinfo", (void *)g_ioinfo },
 };
 
+// ---- what the Epic Online Services SDK (EOSSDK-Win64-Shipping.dll, carried by Elite Dangerous) imports from the CRT
+static size_t narrow_wide(const WCHAR *s, char *buf, size_t capacity) {
+    size_t i = 0;
+    while (i < capacity - 1 && s && s[i] && s[i] < 128) { buf[i] = (char)s[i]; i++; }
+    buf[i] = 0;
+    return i;
+}
+static WINAPI intptr_t ms_get_heap_handle(void) {
+    HANDLE (WINAPI *process_heap)(void) = (HANDLE (WINAPI *)(void))vx_find_export("kernel32.dll", "GetProcessHeap");
+    return process_heap ? (intptr_t)process_heap() : 1;
+}
+static WINAPI int ms_heapchk(void) { return -2; }                                  // _HEAPOK
+static WINAPI int ms_wtoi(const WCHAR *s) { char b[64]; narrow_wide(s, b, sizeof b); return atoi(b); }
+static WINAPI int64_t ms_wtoi64(const WCHAR *s) { char b[64]; narrow_wide(s, b, sizeof b); return strtoll(b, NULL, 10); }
+static WINAPI double ms_wtof(const WCHAR *s) { char b[128]; narrow_wide(s, b, sizeof b); return strtod(b, NULL); }
+static WINAPI int64_t ms_wcstoi64(const WCHAR *s, WCHAR **end, int base) {
+    char b[64]; narrow_wide(s, b, sizeof b); char *e; int64_t v = strtoll(b, &e, base);
+    if (end) *end = (WCHAR *)s + (e - b);
+    return v;
+}
+static WINAPI uint64_t ms_wcstoui64(const WCHAR *s, WCHAR **end, int base) {
+    char b[64]; narrow_wide(s, b, sizeof b); char *e; uint64_t v = strtoull(b, &e, base);
+    if (end) *end = (WCHAR *)s + (e - b);
+    return v;
+}
+static WINAPI uint32_t ms_wcstoul(const WCHAR *s, WCHAR **end, int base) { return (uint32_t)ms_wcstoui64(s, end, base); }
+static WINAPI int64_t ms_atoll(const char *s) { return strtoll(s, NULL, 10); }
+static WINAPI int ms_strerror_s(char *buf, size_t size, int e) { if (buf && size) snprintf(buf, size, "%s", strerror(e)); return 0; }
+static WINAPI int ms_raise(int sig) { vx_log("raise(%d) ignored", sig); return 0; }
+static WINAPI void ms_setbuf(vx_file *f, char *buf) { (void)f; (void)buf; }
+static WINAPI int ms_isgraph(int c) { return c >= 0 && c < 256 && isgraph(c); }
+static WINAPI WCHAR *ms_wcsncpy(WCHAR *dst, const WCHAR *src, size_t n) {
+    size_t i = 0;
+    for (; i < n && src[i]; i++) dst[i] = src[i];
+    for (; i < n; i++) dst[i] = 0;
+    return dst;
+}
+static WINAPI void ms_ftime64(uint8_t *out) {                                    // struct __timeb64: time, millitm, timezone, dstflag
+    struct timeval now; gettimeofday(&now, NULL);
+    *(int64_t *)out = now.tv_sec; *(uint16_t *)(out + 8) = (uint16_t)(now.tv_usec / 1000);
+    *(int16_t *)(out + 10) = 0; *(int16_t *)(out + 12) = 0;
+}
+static WINAPI void ms_tzset(void) { }
+static int ms_daylight_value; static long ms_timezone_value; static char *ms_tzname_value[2] = { "UTC", "UTC" }; static int ms_sys_nerr_value = 43;
+static WINAPI int *ms_daylight(void) { return &ms_daylight_value; }
+static WINAPI long *ms_timezone(void) { return &ms_timezone_value; }
+static WINAPI char **ms_tzname(void) { return ms_tzname_value; }
+static WINAPI int *ms_sys_nerr(void) { return &ms_sys_nerr_value; }
+typedef struct { int quot, rem; } ms_div_t;
+static WINAPI ms_div_t ms_div(int a, int b) { ms_div_t r = { b ? a / b : 0, b ? a % b : 0 }; return r; }
+static WINAPI int ms_cputs(const char *s) { vx_log("%s", s ? s : ""); return 0; }
+static WINAPI int ms_fstat64i32(int fd, uint8_t *out) {
+    struct stat st;
+    if (fstat(fd, &st)) { set_errno(9); return -1; }
+    windows_stat(&st, out, 0);
+    return 0;
+}
+static WINAPI int ms_stat32i64(const char *path, uint8_t *out) {                 // 32-bit times, 64-bit size
+    uint8_t wide[56];
+    if (stat_path(path, wide, 1)) return -1;
+    memset(out, 0, 48);
+    memcpy(out, wide, 24);                                                       // dev .. rdev as in _stat64
+    *(int64_t *)(out + 24) = *(int64_t *)(wide + 24);
+    *(int32_t *)(out + 32) = (int32_t)*(int64_t *)(wide + 32); *(int32_t *)(out + 36) = (int32_t)*(int64_t *)(wide + 40); *(int32_t *)(out + 40) = (int32_t)*(int64_t *)(wide + 48);
+    return 0;
+}
+static WINAPI int __stdio_common_vfwprintf(uint64_t options, vx_file *f, const WCHAR *fmt, void *locale, const char *ap) {
+    (void)options; (void)locale;
+    WCHAR wide[4096];
+    int n = vx_format_w(wide, 4096, fmt, ap);
+    if (n < 0) return -1;
+    char *utf8 = vx_utf8_dup(wide);
+    int r = utf8 && file_write(f, utf8, strlen(utf8)) ? -1 : n;
+    free(utf8);
+    return r;
+}
+// _splitpath_s / _wsplitpath_s: a Windows path into drive, directory, file name and extension (sizes checked)
+static int split_path(const char *path, char *drive, size_t drive_n, char *dir, size_t dir_n, char *name, size_t name_n, char *ext, size_t ext_n) {
+    const char *p = path ? path : "";
+    const char *after_drive = p[0] && p[1] == ':' ? p + 2 : p;
+    const char *slash = NULL;
+    for (const char *c = after_drive; *c; c++) if (*c == '\\' || *c == '/') slash = c;
+    const char *file = slash ? slash + 1 : after_drive;
+    const char *dot = strrchr(file, '.');
+    size_t drive_len = (size_t)(after_drive - p), dir_len = (size_t)(file - after_drive), name_len = dot ? (size_t)(dot - file) : strlen(file), ext_len = dot ? strlen(dot) : 0;
+    if ((drive && drive_len + 1 > drive_n) || (dir && dir_len + 1 > dir_n) || (name && name_len + 1 > name_n) || (ext && ext_len + 1 > ext_n)) return 34;   // ERANGE
+    if (drive) { memcpy(drive, p, drive_len); drive[drive_len] = 0; }
+    if (dir) { memcpy(dir, after_drive, dir_len); dir[dir_len] = 0; }
+    if (name) { memcpy(name, file, name_len); name[name_len] = 0; }
+    if (ext) { memcpy(ext, dot ? dot : "", ext_len); ext[ext_len] = 0; }
+    return 0;
+}
+static WINAPI int ms_splitpath_s(const char *path, char *drive, size_t drive_n, char *dir, size_t dir_n, char *name, size_t name_n, char *ext, size_t ext_n) {
+    if (!path) return 22;
+    int e = split_path(path, drive, drive_n, dir, dir_n, name, name_n, ext, ext_n);
+    if (e) set_errno(e);
+    return e;
+}
+static WINAPI int ms_wsplitpath_s(const WCHAR *path, WCHAR *drive, size_t drive_n, WCHAR *dir, size_t dir_n, WCHAR *name, size_t name_n, WCHAR *ext, size_t ext_n) {
+    char p[1024], d[8], di[1024], n[512], x[64];
+    if (!path) return 22;
+    narrow_wide(path, p, sizeof p);
+    int e = split_path(p, drive ? d : NULL, drive ? sizeof d : 0, dir ? di : NULL, dir ? sizeof di : 0, name ? n : NULL, name ? sizeof n : 0, ext ? x : NULL, ext ? sizeof x : 0);
+    #define WIDEN(src, dst, cap) do { if (dst) { size_t len = strlen(src); if (len + 1 > (cap)) e = 34; else { for (size_t k = 0; k <= len; k++) (dst)[k] = (WCHAR)(src)[k]; } } } while (0)
+    if (!e) { WIDEN(d, drive, drive_n); WIDEN(di, dir, dir_n); WIDEN(n, name, name_n); WIDEN(x, ext, ext_n); }
+    #undef WIDEN
+    if (e) set_errno(e);
+    return e;
+}
+static const vx_export ucrt_eos[] = {
+    { "_splitpath_s", (void *)ms_splitpath_s }, { "_wsplitpath_s", (void *)ms_wsplitpath_s },
+    { "_get_heap_handle", (void *)ms_get_heap_handle }, { "_heapchk", (void *)ms_heapchk }, { "_wtoi", (void *)ms_wtoi }, { "_wtoi64", (void *)ms_wtoi64 },
+    { "_wtof", (void *)ms_wtof }, { "_wcstoi64", (void *)ms_wcstoi64 }, { "_wcstoui64", (void *)ms_wcstoui64 }, { "wcstoul", (void *)ms_wcstoul },
+    { "wcstoll", (void *)ms_wcstoi64 }, { "wcstoull", (void *)ms_wcstoui64 }, { "atoll", (void *)ms_atoll }, { "strerror_s", (void *)ms_strerror_s },
+    { "raise", (void *)ms_raise }, { "setbuf", (void *)ms_setbuf }, { "isgraph", (void *)ms_isgraph }, { "wcsncpy", (void *)ms_wcsncpy },
+    { "_ftime64", (void *)ms_ftime64 }, { "_tzset", (void *)ms_tzset }, { "__daylight", (void *)ms_daylight }, { "__timezone", (void *)ms_timezone },
+    { "__tzname", (void *)ms_tzname }, { "__sys_nerr", (void *)ms_sys_nerr }, { "div", (void *)ms_div }, { "_cputs", (void *)ms_cputs },
+    { "_fstat64i32", (void *)ms_fstat64i32 }, { "_stat32i64", (void *)ms_stat32i64 }, { "__stdio_common_vfwprintf", (void *)__stdio_common_vfwprintf },
+};
+
 void vx_ucrt_init(void) {
+    vx_register_module("ucrtbase.dll", ucrt_eos, sizeof ucrt_eos / sizeof ucrt_eos[0]);
+    vx_register_module("msvcrt.dll", ucrt_eos, sizeof ucrt_eos / sizeof ucrt_eos[0]);
     vx_register_module("ucrtbase.dll", ucrt, sizeof ucrt / sizeof ucrt[0]);
     vx_register_module("msvcrt.dll", ucrt, sizeof ucrt / sizeof ucrt[0]);
     vx_register_module("msvcrt.dll", msvcrt_extra, sizeof msvcrt_extra / sizeof msvcrt_extra[0]);

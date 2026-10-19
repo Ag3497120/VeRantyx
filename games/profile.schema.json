@@ -12,7 +12,8 @@
     "name": {"type": "string"},
     "launcher": {"enum": ["alyx", "game"], "description": "alyx: scripts/launch_vxrt_alyx.sh; game: scripts/launch_vxrt_game.sh <exe>"},
     "engine": {"enum": ["vxrt"], "description": "the runtime it runs on (more may come: a native build, another translation layer)"},
-    "exe": {"type": "string", "description": "the executable, relative to the install folder, when tools cannot pick it"},
+    "exe": {"type": "string", "minLength": 1, "description": "the entry executable, relative to the install folder, when the official launcher differs from the detected game"},
+    "game_exe": {"type": "string", "minLength": 1, "description": "the game executable to inspect for API/import facts when it differs from the launcher"},
     "default_scenario": {"type": "string"},
     "scenarios": {
       "type": "object", "minProperties": 1,

@@ -42,7 +42,15 @@ static int wsa_error(int e) {
     default: return 10022;
     }
 }
-static int fail(void) { vx_set_last_error((DWORD)wsa_error(errno)); return SOCKET_ERROR; }
+// EOPNOTSUPP from a socket call is usually a mismatch in this layer (a flag or option meant for Windows), not the
+// program's doing, and a program may retry it without end: the first few are logged with the call that got them.
+static int wsa_error_from(const char *call, int e, int detail) {
+    static int logged;
+    if (e == EOPNOTSUPP && logged < 5) { logged++; vx_log("winsock: %s got EOPNOTSUPP (%#x)", call, detail); }
+    return wsa_error(e);
+}
+static int fail_in(const char *call) { vx_set_last_error((DWORD)wsa_error_from(call, errno, 0)); return SOCKET_ERROR; }
+#define fail() fail_in(__func__)
 static int to_fd(SOCKET s) { return s > 0x7fffffff ? -1 : (int)s; }
 
 // ---- addresses ------------------------------------------------------------------------------------------------------
@@ -155,6 +163,12 @@ static WINAPI int ws_getpeername(SOCKET s, void *addr, int *len) {
 // WSABUF arrays (length, pointer). Sends complete at once; an overlapped receive with nothing to read yet waits in
 // a background thread and completes the OVERLAPPED (its event, the socket's completion port) when data comes.
 // Completion routines are not supported.
+// A program answered WSAEOPNOTSUPP usually retries: the first few answers from each place are logged so the loop can be found.
+static void not_supported(const char *what, unsigned detail) {
+    static int logged[8]; int slot = (int)(((uintptr_t)what >> 4) & 7);
+    if (logged[slot] < 3) { logged[slot]++; vx_log("winsock: %s is not supported (%#x)", what, detail); }
+    vx_set_last_error(10045);
+}
 typedef struct { uint32_t len; char *buf; } WSABUF;
 #define WSA_IO_PENDING 997
 static int load_iov(struct iovec *iov, const WSABUF *bufs, DWORD n) {
@@ -162,18 +176,50 @@ static int load_iov(struct iovec *iov, const WSABUF *bufs, DWORD n) {
     for (DWORD i = 0; i < n; i++) iov[i] = (struct iovec){ bufs[i].buf, bufs[i].len };
     return (int)n;
 }
+// Completion routines: a WSARecv/WSASend given one is told its result by a call on the issuing thread's next
+// alertable wait (SleepEx, WSAWaitForMultipleEvents with fAlertable, WaitFor*Ex), as Windows does with an APC; the
+// OVERLAPPED's hEvent is then the program's own field and is left alone.
+typedef struct { void (WINAPI *routine)(DWORD, DWORD, void *, DWORD); DWORD error, bytes; void *ov; } completion_call;
+static WINAPI void completion_apc(uintptr_t data) {
+    completion_call *c = (completion_call *)data;
+    c->routine(c->error, c->bytes, c->ov, 0);
+    free(c);
+}
+static HANDLE issuing_thread(void) {                               // (a real handle: the pseudo handle means the caller)
+    static HANDLE (WINAPI *open_thread)(DWORD, BOOL, DWORD);
+    static DWORD (WINAPI *current_tid)(void);
+    if (!open_thread) {
+        open_thread = (HANDLE (WINAPI *)(DWORD, BOOL, DWORD))vx_find_export("kernel32.dll", "OpenThread");
+        current_tid = (DWORD (WINAPI *)(void))vx_find_export("kernel32.dll", "GetCurrentThreadId");
+    }
+    return open_thread(0x1FFFFF, 0, current_tid());
+}
+static void complete_with_routine(HANDLE thread, void *cr, void *ov, DWORD bytes, DWORD error) {
+    static DWORD (WINAPI *queue)(void (WINAPI *)(uintptr_t), HANDLE, uintptr_t);
+    static BOOL (WINAPI *close)(HANDLE);
+    if (!queue) {
+        queue = (DWORD (WINAPI *)(void (WINAPI *)(uintptr_t), HANDLE, uintptr_t))vx_find_export("kernel32.dll", "QueueUserAPC");
+        close = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "CloseHandle");
+    }
+    uint64_t *o = ov;
+    if (o) { o[0] = error; o[1] = bytes; }                         // Internal, InternalHigh as WSAGetOverlappedResult reads them
+    completion_call *c = malloc(sizeof *c);
+    *c = (completion_call){ (void (WINAPI *)(DWORD, DWORD, void *, DWORD))cr, error, bytes, ov };
+    if (!queue(completion_apc, thread, (uintptr_t)c)) free(c);
+    close(thread);
+}
 static int send_msg(SOCKET s, const WSABUF *bufs, DWORD n, DWORD *sent, DWORD flags, const void *to, int tolen, void *ov, void *cr) {
-    if (cr) { vx_set_last_error(10045); return SOCKET_ERROR; }
     struct iovec iov[64];
     struct sockaddr_storage a; socklen_t l = to ? addr_in(to, tolen, &a) : 0;
     struct msghdr m = { to ? &a : NULL, l, iov, load_iov(iov, bufs, n), NULL, 0, 0 };
     ssize_t r = sendmsg(to_fd(s), &m, flags_in((int)flags));
-    if (r < 0) { int e = fail(); if (ov) vx_io_completed((HANDLE)s, ov, 0, vx_get_last_error()); return e; }
+    if (r < 0) { int e = fail(); if (ov && !cr) vx_io_completed((HANDLE)s, ov, 0, vx_get_last_error()); return e; }
     if (sent) *sent = (DWORD)r;
-    if (ov) vx_io_completed((HANDLE)s, ov, (DWORD)r, 0);
+    if (cr) complete_with_routine(issuing_thread(), cr, ov, (DWORD)r, 0);
+    else if (ov) vx_io_completed((HANDLE)s, ov, (DWORD)r, 0);
     return 0;
 }
-typedef struct { SOCKET s; struct iovec iov[64]; int n; void *ov; void *from; int *fromlen; int flags; } pending_recv;
+typedef struct { SOCKET s; struct iovec iov[64]; int n; void *ov; void *from; int *fromlen; int flags; void *cr; HANDLE thread; } pending_recv;
 static ssize_t recv_now(SOCKET s, struct iovec *iov, int n, int flags, void *from, int *fromlen) {
     struct sockaddr_storage a; socklen_t l = sizeof a;
     struct msghdr m = { from ? &a : NULL, from ? l : 0, iov, n, NULL, 0, 0 };
@@ -193,15 +239,15 @@ static void *recv_in_background(void *arg) {
         if (k == 0) { if (fcntl(w.fd, F_GETFD) < 0) break; continue; }
         r = recv_now(p->s, p->iov, p->n, p->flags | MSG_DONTWAIT, p->from, p->fromlen);
         if (r < 0 && (errno == EAGAIN || errno == EINTR)) continue;
-        err = r < 0 ? (DWORD)wsa_error(errno) : 0;
+        err = r < 0 ? (DWORD)wsa_error_from("an overlapped receive", errno, p->flags) : 0;
         break;
     }
-    vx_io_completed((HANDLE)p->s, p->ov, r > 0 ? (DWORD)r : 0, err);
+    if (p->cr) complete_with_routine(p->thread, p->cr, p->ov, r > 0 ? (DWORD)r : 0, err);
+    else vx_io_completed((HANDLE)p->s, p->ov, r > 0 ? (DWORD)r : 0, err);
     free(p);
     return NULL;
 }
 static int recv_msg(SOCKET s, WSABUF *bufs, DWORD n, DWORD *got, DWORD *flags, void *from, int *fromlen, void *ov, void *cr) {
-    if (cr) { vx_set_last_error(10045); return SOCKET_ERROR; }
     struct iovec iov[64];
     int count = load_iov(iov, bufs, n), f = flags ? flags_in((int)*flags) : 0;
     if (!ov) {
@@ -215,14 +261,16 @@ static int recv_msg(SOCKET s, WSABUF *bufs, DWORD n, DWORD *got, DWORD *flags, v
     if (r >= 0) {
         if (got) *got = (DWORD)r;
         if (flags) *flags = 0;
-        vx_io_completed((HANDLE)s, ov, (DWORD)r, 0);
+        if (cr) complete_with_routine(issuing_thread(), cr, ov, (DWORD)r, 0);
+        else vx_io_completed((HANDLE)s, ov, (DWORD)r, 0);
         return 0;
     }
-    if (errno != EAGAIN) { int e = fail(); vx_io_completed((HANDLE)s, ov, 0, vx_get_last_error()); return e; }
+    if (errno != EAGAIN) { int e = fail(); if (!cr) vx_io_completed((HANDLE)s, ov, 0, vx_get_last_error()); return e; }
     pending_recv *p = calloc(1, sizeof *p);
     p->s = s; memcpy(p->iov, iov, sizeof iov); p->n = count; p->ov = ov; p->from = from; p->fromlen = fromlen; p->flags = f;
+    p->cr = cr; p->thread = cr ? issuing_thread() : NULL;
     *(uint64_t *)ov = 0x103;                                       // STATUS_PENDING; the event is reset as the I/O starts
-    HANDLE event = (HANDLE)((uintptr_t)*(HANDLE *)((uint8_t *)ov + 24) & ~(uintptr_t)1);
+    HANDLE event = cr ? NULL : (HANDLE)((uintptr_t)*(HANDLE *)((uint8_t *)ov + 24) & ~(uintptr_t)1);
     if (event) {
         BOOL (WINAPI *reset)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "ResetEvent");
         reset(event);
@@ -367,7 +415,7 @@ static WINAPI int ioctlsocket(SOCKET s, LONG cmd, uint32_t *arg) {
         *arg = (uint32_t)n;
         return 0;
     }
-    vx_set_last_error(10045);
+    not_supported("this ioctlsocket command", (unsigned)cmd);
     return SOCKET_ERROR;
 }
 // Extension functions, by GUID: ConnectEx (a connection that completes like overlapped I/O) and DisconnectEx.
@@ -443,8 +491,7 @@ static WINAPI int WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_len, void *o
         setsockopt(to_fd(s), SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);   // best effort (not for every socket type)
         r = 0;
     } else {
-        if (vx_trace) vx_log("WSAIoctl %#x is not supported (in %08x)", (unsigned)code, in && in_len >= 4 ? *(uint32_t *)in : 0);
-        vx_set_last_error(10045);                                      // WSAEOPNOTSUPP
+        not_supported("this WSAIoctl code", (unsigned)code);
     }
     if (!r && ov) vx_io_completed((HANDLE)s, ov, 0, 0);
     return r;
@@ -536,9 +583,9 @@ static WINAPI BOOL WSACloseEvent(HANDLE e) { BOOL (WINAPI *f)(HANDLE) = (BOOL (W
 static WINAPI BOOL WSASetEvent(HANDLE e) { BOOL (WINAPI *f)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "SetEvent"); return f(e); }
 static WINAPI BOOL WSAResetEvent(HANDLE e) { BOOL (WINAPI *f)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "ResetEvent"); return f(e); }
 static WINAPI DWORD WSAWaitForMultipleEvents(DWORD n, const HANDLE *events, BOOL all, DWORD ms, BOOL alertable) {
-    (void)alertable;
-    DWORD (WINAPI *wait)(DWORD, const HANDLE *, BOOL, DWORD) = (DWORD (WINAPI *)(DWORD, const HANDLE *, BOOL, DWORD))vx_find_export("kernel32.dll", "WaitForMultipleObjects");
-    return wait(n, events, all, ms);                              // WSA_WAIT_EVENT_0 / WSA_WAIT_TIMEOUT match
+    static DWORD (WINAPI *wait)(DWORD, const HANDLE *, BOOL, DWORD, BOOL);
+    if (!wait) wait = (DWORD (WINAPI *)(DWORD, const HANDLE *, BOOL, DWORD, BOOL))vx_find_export("kernel32.dll", "WaitForMultipleObjectsEx");
+    return wait(n, events, all, ms, alertable);                   // WSA_WAIT_EVENT_0 / _TIMEOUT / _IO_COMPLETION match
 }
 
 // fd_set: a count, then up to 64 sockets.

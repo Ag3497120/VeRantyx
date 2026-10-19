@@ -508,7 +508,7 @@ static WINAPI int GetLocaleInfoEx(const WCHAR *name, DWORD type, WCHAR *out, int
 }
 
 // ---- shell folders: the user's profile, application data, documents ------------------------------------------------------
-static const char *folder_path(int csidl) {
+const char *vx_special_folder_path(int csidl) {
     switch (csidl & 0xff) {
     case 0x05: return "C:\\users\\vxrt\\Documents";                   // CSIDL_PERSONAL
     case 0x1a: return "C:\\users\\vxrt\\AppData\\Roaming";            // CSIDL_APPDATA
@@ -532,7 +532,7 @@ static void make_folder(const char *win) {
 }
 static WINAPI LONG SHGetFolderPathW(void *wnd, int csidl, HANDLE token, DWORD flags, WCHAR *out) {
     (void)wnd; (void)token; (void)flags;
-    const char *p = folder_path(csidl);
+    const char *p = vx_special_folder_path(csidl);
     if (!p) return (LONG)0x80070057;
     make_folder(p);
     vx_return_string_w(p, out, 260);
@@ -540,7 +540,7 @@ static WINAPI LONG SHGetFolderPathW(void *wnd, int csidl, HANDLE token, DWORD fl
 }
 static WINAPI LONG SHGetFolderPathA(void *wnd, int csidl, HANDLE token, DWORD flags, char *out) {
     (void)wnd; (void)token; (void)flags;
-    const char *p = folder_path(csidl);
+    const char *p = vx_special_folder_path(csidl);
     if (!p) return (LONG)0x80070057;
     make_folder(p);
     vx_return_string_a(p, out, 260);
@@ -559,7 +559,7 @@ static WINAPI LONG SHGetKnownFolderPath(const uint8_t *id, DWORD flags, HANDLE t
     memcpy(&d1, id, 4); memcpy(&d2, id + 4, 2); memcpy(&d3, id + 6, 2);
     const char *p = NULL;
     for (size_t i = 0; i < sizeof known / sizeof known[0] && !p; i++)
-        if (known[i].d1 == d1 && known[i].d2 == d2 && known[i].d3 == d3) p = folder_path(known[i].csidl);
+        if (known[i].d1 == d1 && known[i].d2 == d2 && known[i].d3 == d3) p = vx_special_folder_path(known[i].csidl);
     if (d1 == 0xa520a1a4 && d2 == 0x1780) p = "C:\\users\\vxrt\\AppData\\LocalLow";
     if (d1 == 0x4c5c32ff && d2 == 0xbb9d) p = "C:\\users\\vxrt\\Saved Games";
     if (out) *out = NULL;

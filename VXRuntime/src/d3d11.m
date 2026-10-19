@@ -2,8 +2,9 @@
 //
 // Resources are Metal textures and buffers. The immediate context records clears and copies into a Metal command
 // buffer that is committed on Flush, Map and Present, so the GPU sees them in the order the program issued them.
-// Draws need shader translation (DXBC to Metal) and are the next step; until then they are reported once.
+// Draws and compute dispatches use the DXBC-to-MSL path in d3d11_draw.m; ordinary operations lower through the common GPU IR.
 #include "d3d_common.h"
+#include "gpu_ir.h"
 #include <dlfcn.h>
 #include <os/os_sync_wait_on_address.h>
 #pragma clang diagnostic push
@@ -129,6 +130,61 @@ MTLPixelFormat d3d_mtl_format(uint32_t dxgi, uint32_t *bytes) {
         if (g_formats[i].dxgi == dxgi) { if (bytes) *bytes = g_formats[i].block == 1 ? g_formats[i].bytes : 0; return g_formats[i].mtl; }
     if (bytes) *bytes = 0;
     return MTLPixelFormatInvalid;
+}
+int d3d_copy_format_block(uint32_t dxgi, uint32_t *block_width, uint32_t *block_height,
+                          uint32_t *bytes_per_block) {
+    for (size_t i = 0; i < sizeof g_formats / sizeof g_formats[0]; i++) {
+        if (g_formats[i].dxgi != dxgi) continue;
+        if (block_width) *block_width = g_formats[i].block;
+        if (block_height) *block_height = g_formats[i].block;
+        if (bytes_per_block) *bytes_per_block = g_formats[i].bytes;
+        return 1;
+    }
+    uint32_t width = 1, height = 1, bytes = 0;
+    if (dxgi >= 5 && dxgi <= 8) bytes = 12;
+    else if (dxgi == 66) { width = 8; bytes = 1; }             // R1_UNORM, one bit per texel
+    else if (dxgi == 68 || dxgi == 69 || dxgi == 107) { width = 2; bytes = 4; }
+    else if (dxgi == 108 || dxgi == 109) { width = 2; bytes = 8; }
+    else switch (dxgi) {
+    case 100: case 101: bytes = 4; break;                     // AYUV, Y410
+    case 102: bytes = 8; break;                               // Y416
+    case 111: case 112: case 113: bytes = 1; break;           // AI44, IA44, P8
+    case 114: bytes = 2; break;                               // A8P8
+    case 191: bytes = 2; break;                               // A4B4G4R4
+    default: return 0;
+    }
+    if (block_width) *block_width = width;
+    if (block_height) *block_height = height;
+    if (bytes_per_block) *bytes_per_block = bytes;
+    return bytes != 0;
+}
+static uint32_t copy_format_family(uint32_t format) {
+    if (format >= 1 && format <= 4) return 1;
+    if (format >= 5 && format <= 8) return 2;
+    if (format >= 9 && format <= 14) return 3;
+    if (format >= 15 && format <= 18) return 4;
+    if (format >= 19 && format <= 22) return 5;
+    if (format >= 23 && format <= 25) return 6;
+    if (format >= 27 && format <= 32) return 7;
+    if (format >= 33 && format <= 38) return 8;
+    if (format >= 39 && format <= 43) return 9;
+    if (format >= 44 && format <= 47) return 10;
+    if (format >= 48 && format <= 52) return 11;
+    if (format >= 53 && format <= 59) return 12;
+    if (format >= 60 && format <= 64) return 13;
+    if (format >= 70 && format <= 72) return 14;
+    if (format >= 73 && format <= 75) return 15;
+    if (format >= 76 && format <= 78) return 16;
+    if (format >= 79 && format <= 81) return 17;
+    if (format >= 82 && format <= 84) return 18;
+    if (format >= 94 && format <= 96) return 19;
+    if (format >= 97 && format <= 99) return 20;
+    return 0;
+}
+int d3d_copy_formats_compatible(uint32_t source, uint32_t destination) {
+    if (source == destination) return 1;
+    uint32_t family = copy_format_family(source);
+    return family && family == copy_format_family(destination);
 }
 // The layout of a format's data: bytes per row of `width` texels and the number of rows for `height` (rows of
 // 4x4 blocks for the block-compressed formats).
@@ -270,6 +326,9 @@ static void *make_mtl_texture(d3d_device *dev, const uint32_t *desc, uint32_t di
     if (desc[TD_BIND] & (BIND_RENDER_TARGET | BIND_DEPTH_STENCIL)) usage |= MTLTextureUsageRenderTarget;
     if (desc[TD_BIND] & BIND_UNORDERED_ACCESS) usage |= MTLTextureUsageShaderWrite;
     if ((desc[TD_BIND] & BIND_UNORDERED_ACCESS) && (desc[TD_FORMAT] == 39 || desc[TD_FORMAT] == 42 || desc[TD_FORMAT] == 43)) usage |= MTLTextureUsageShaderAtomic;   // R32 (typeless, uint, sint): atomics
+    // Metal validates that an atomic-capable texture is R32Uint/R32Sint: a typeless R32 kept as float (Elite Dangerous)
+    // is made as R32Uint, its float views coming through the pixel-format view usage
+    if ((usage & MTLTextureUsageShaderAtomic) && td.pixelFormat == MTLPixelFormatR32Float) td.pixelFormat = MTLPixelFormatR32Uint;
     // Multisampled and depth targets are made without pixel-format views, which Apple GPUs need to keep a render
     // target losslessly compressed (at 2.5K per eye Half-Life: Alyx's 4x-multisampled targets are written out and read
     // back several times a frame; alternating runs: 27-31 -> 31-35 fps). Their views keep the texture's own format
@@ -851,6 +910,266 @@ static void subresource(const d3d_texture *t, uint32_t sub, uint32_t *mip, uint3
     *mip = sub % mips; *slice = sub / mips;
 }
 static uint32_t mip_size(uint32_t size, uint32_t mip) { size >>= mip; return size ? size : 1; }
+
+typedef struct { void *mtl; uint64_t offset; int is_buffer; } d3d11_ir_object;
+static void d3d11_ir_object_release(void *opaque) {
+    d3d11_ir_object *object = opaque;
+    if (!object) return;
+    if (object->mtl) CFRelease((CFTypeRef)object->mtl);
+    free(object);
+}
+gpu_ir_resource *d3d11_gpu_ir_resource(d3d_object *resource) {
+    if (!resource) return NULL;
+    d3d11_ir_object *object = calloc(1, sizeof *object);
+    if (!object) return NULL;
+    gpu_ir_resource *ir = NULL;
+    if (resource->kind == K_BUFFER) {
+        d3d_buffer *buffer = (d3d_buffer *)resource;
+        id<MTLBuffer> mtl = (__bridge id<MTLBuffer>)buffer->mtl;
+        if (mtl) {
+            object->mtl = (__bridge_retained void *)mtl;
+            object->offset = buffer->off;
+            object->is_buffer = 1;
+            ir = gpu_ir_buffer_create(buffer->desc[0], object, d3d11_ir_object_release);
+        }
+    } else if (resource->kind == K_TEXTURE) {
+        d3d_texture *texture = (d3d_texture *)resource;
+        id<MTLTexture> mtl = (__bridge id<MTLTexture>)texture->mtl;
+        uint32_t block_width, block_height, bytes_per_block, bytes_per_texel = 0;
+        if (mtl && d3d_copy_format_block(texture->desc[TD_FORMAT], &block_width, &block_height, &bytes_per_block)) {
+            (void)d3d_mtl_format(texture->desc[TD_FORMAT], &bytes_per_texel);
+            gpu_ir_texture_desc desc = {
+                .width = (uint32_t)mtl.width, .height = (uint32_t)mtl.height,
+                .depth = texture->dim == 3 ? (uint32_t)mtl.depth : 1,
+                .array_layers = texture->desc[TD_ARRAY] ? texture->desc[TD_ARRAY] : 1,
+                .mip_levels = (uint32_t)mtl.mipmapLevelCount,
+                .bytes_per_texel = bytes_per_texel, .sample_count = (uint32_t)mtl.sampleCount,
+                .is_3d = texture->dim == 3, .block_width = block_width,
+                .block_height = block_height, .bytes_per_block = bytes_per_block
+            };
+            object->mtl = (__bridge_retained void *)mtl;
+            ir = gpu_ir_texture_create(&desc, object, d3d11_ir_object_release);
+        }
+    }
+    if (!ir) d3d11_ir_object_release(object);
+    return ir;
+}
+void *d3d11_gpu_ir_metal_resource(const gpu_ir_resource *resource) {
+    d3d11_ir_object *object = resource ? gpu_ir_backend_object(resource) : NULL;
+    return object ? object->mtl : NULL;
+}
+typedef struct { d3d_context *context; d3d_buffer *buffer; } d3d11_ir_fill_context;
+static int d3d11_ir_fill_buffer_pattern(void *opaque, const gpu_ir_resource *dst, uint64_t dst_offset,
+                                        uint64_t size, const void *pattern, uint32_t pattern_size) {
+    d3d11_ir_fill_context *fill = opaque;
+    if (!fill || !fill->context || !fill->buffer || !dst || !pattern ||
+        !gpu_ir_resource_is_buffer(dst) || !pattern_size || pattern_size > GPU_IR_MAX_FILL_PATTERN_SIZE ||
+        (pattern_size & (pattern_size - 1u))) return GPU_IR_INVALID;
+    if (dst_offset % pattern_size || size % pattern_size || dst_offset > gpu_ir_buffer_size(dst) ||
+        size > gpu_ir_buffer_size(dst) - dst_offset) return GPU_IR_RANGE;
+    if (!size) return GPU_IR_OK;
+    id<MTLBuffer> destination = (__bridge id<MTLBuffer>)d3d11_gpu_ir_metal_resource(dst);
+    if (!destination || fill->buffer->off > destination.length || dst_offset > destination.length - fill->buffer->off ||
+        size > destination.length - fill->buffer->off - dst_offset) return GPU_IR_RANGE;
+    uint64_t destination_offset = fill->buffer->off + dst_offset;
+    const uint8_t *pattern_bytes = pattern;
+    int repeated_byte = 1;
+    for (uint32_t i = 1; i < pattern_size; i++) repeated_byte &= pattern_bytes[i] == pattern_bytes[0];
+
+    d3d_end_render(fill->context);
+    if (repeated_byte) {
+        id<MTLCommandBuffer> command = (__bridge id<MTLCommandBuffer>)d3d_context_cmd(fill->context);
+        id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+        if (!blit) return GPU_IR_UNSUPPORTED;
+        [blit fillBuffer:destination range:NSMakeRange((NSUInteger)destination_offset, (NSUInteger)size)
+                   value:pattern_bytes[0]];
+        [blit endEncoding];
+        d3d_mark_gpu(fill->context, &fill->buffer->base);
+        return GPU_IR_OK;
+    }
+
+    // Metal buffer blits require four-byte-aligned ranges. Narrow typed views use a synchronous
+    // shared-memory write only when their subrange cannot be copied by a blit.
+    if (((destination_offset | size) & 3u) != 0) {
+        d3d_flush(fill->context->base.dev, 1);
+        if (!destination.contents) return GPU_IR_UNSUPPORTED;
+        uint8_t *bytes = (uint8_t *)destination.contents + destination_offset;
+        for (uint64_t i = 0; i < size; i += pattern_size)
+            memcpy(bytes + i, pattern, pattern_size);
+        return GPU_IR_OK;
+    }
+
+    const NSUInteger max_upload_size = 1024u * 1024u;
+    NSUInteger upload_size = (NSUInteger)(size < max_upload_size ? size : max_upload_size);
+    upload_size &= ~(NSUInteger)3u;
+    if (!upload_size) return GPU_IR_RANGE;
+    id<MTLBuffer> upload = [(__bridge id<MTLDevice>)fill->context->base.dev->mtl
+        newBufferWithLength:upload_size options:MTLResourceStorageModeShared];
+    if (!upload || !upload.contents) return GPU_IR_OUT_OF_MEMORY;
+    uint8_t *upload_bytes = upload.contents;
+    for (NSUInteger i = 0; i < upload_size; i += pattern_size)
+        memcpy(upload_bytes + i, pattern, pattern_size);
+    id<MTLCommandBuffer> command = (__bridge id<MTLCommandBuffer>)d3d_context_cmd(fill->context);
+    id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+    if (!blit) return GPU_IR_UNSUPPORTED;
+    uint64_t copied = 0;
+    while (copied < size) {
+        NSUInteger block = (NSUInteger)((size - copied) < upload_size ? size - copied : upload_size);
+        [blit copyFromBuffer:upload sourceOffset:0 toBuffer:destination
+            destinationOffset:(NSUInteger)(destination_offset + copied) size:block];
+        copied += block;
+    }
+    [blit endEncoding];
+    d3d_mark_gpu(fill->context, &fill->buffer->base);
+    return GPU_IR_OK;
+}
+int d3d11_record_fill_buffer_pattern(d3d_context *context, d3d_buffer *buffer, uint64_t offset,
+                                    uint64_t size, const void *pattern, uint32_t pattern_size) {
+    if (!context || !buffer || !pattern) return GPU_IR_INVALID;
+    gpu_ir_resource *destination = d3d11_gpu_ir_resource(&buffer->base);
+    if (!destination) return GPU_IR_OUT_OF_MEMORY;
+    gpu_ir_stream stream;
+    gpu_ir_stream_init(&stream);
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc = gpu_ir_record_fill_buffer_pattern(&stream, destination, offset, size, pattern,
+                                                pattern_size, &index);
+    if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
+        d3d11_ir_fill_context fill = { context, buffer };
+        gpu_ir_backend backend = { .context = &fill, .fill_buffer_pattern = d3d11_ir_fill_buffer_pattern };
+        rc = gpu_ir_execute(&stream, index, &backend);
+    }
+    gpu_ir_stream_destroy(&stream);
+    gpu_ir_resource_release(destination);
+    return rc;
+}
+static int d3d11_ir_copy_buffer(void *context, const gpu_ir_resource *src, uint64_t src_offset,
+                                const gpu_ir_resource *dst, uint64_t dst_offset, uint64_t size) {
+    id<MTLBlitCommandEncoder> blit = (__bridge id<MTLBlitCommandEncoder>)context;
+    d3d11_ir_object *source = gpu_ir_backend_object(src), *destination = gpu_ir_backend_object(dst);
+    if (!blit || !source || !destination || !source->is_buffer || !destination->is_buffer) return GPU_IR_INVALID;
+    id<MTLBuffer> source_buffer = (__bridge id<MTLBuffer>)source->mtl;
+    id<MTLBuffer> destination_buffer = (__bridge id<MTLBuffer>)destination->mtl;
+    if (!source_buffer || !destination_buffer || src_offset > gpu_ir_buffer_size(src) ||
+        size > gpu_ir_buffer_size(src) - src_offset || dst_offset > gpu_ir_buffer_size(dst) ||
+        size > gpu_ir_buffer_size(dst) - dst_offset || source->offset > source_buffer.length ||
+        src_offset > source_buffer.length - source->offset ||
+        size > source_buffer.length - source->offset - src_offset ||
+        destination->offset > destination_buffer.length ||
+        dst_offset > destination_buffer.length - destination->offset ||
+        size > destination_buffer.length - destination->offset - dst_offset) return GPU_IR_RANGE;
+    [blit copyFromBuffer:source_buffer sourceOffset:(NSUInteger)(source->offset + src_offset)
+                toBuffer:destination_buffer destinationOffset:(NSUInteger)(destination->offset + dst_offset)
+                    size:(NSUInteger)size];
+    return GPU_IR_OK;
+}
+static int d3d11_ir_copy_resource(void *context, const gpu_ir_resource *src, const gpu_ir_resource *dst) {
+    id<MTLBlitCommandEncoder> blit = (__bridge id<MTLBlitCommandEncoder>)context;
+    d3d11_ir_object *source = gpu_ir_backend_object(src), *destination = gpu_ir_backend_object(dst);
+    if (!blit || !source || !destination || source->is_buffer != destination->is_buffer) return GPU_IR_INVALID;
+    if (source->is_buffer) {
+        if (gpu_ir_buffer_size(src) != gpu_ir_buffer_size(dst)) return GPU_IR_RANGE;
+        return d3d11_ir_copy_buffer(context, src, 0, dst, 0, gpu_ir_buffer_size(src));
+    }
+    id<MTLTexture> source_texture = (__bridge id<MTLTexture>)source->mtl;
+    id<MTLTexture> destination_texture = (__bridge id<MTLTexture>)destination->mtl;
+    if (!source_texture || !destination_texture || source_texture.width != destination_texture.width ||
+        source_texture.height != destination_texture.height || source_texture.depth != destination_texture.depth ||
+        source_texture.mipmapLevelCount != destination_texture.mipmapLevelCount ||
+        source_texture.arrayLength != destination_texture.arrayLength ||
+        source_texture.sampleCount != destination_texture.sampleCount) return GPU_IR_RANGE;
+    [blit copyFromTexture:source_texture toTexture:destination_texture];
+    return GPU_IR_OK;
+}
+static int d3d11_ir_copy_texture(void *context, const gpu_ir_resource *src,
+                                 const gpu_ir_texture_location *src_location, const gpu_ir_resource *dst,
+                                 const gpu_ir_texture_location *dst_location, uint32_t width,
+                                 uint32_t height, uint32_t depth) {
+    id<MTLBlitCommandEncoder> blit = (__bridge id<MTLBlitCommandEncoder>)context;
+    d3d11_ir_object *source = gpu_ir_backend_object(src), *destination = gpu_ir_backend_object(dst);
+    if (!blit || !source || !destination || source->is_buffer || destination->is_buffer ||
+        !src_location || !dst_location) return GPU_IR_INVALID;
+    id<MTLTexture> source_texture = (__bridge id<MTLTexture>)source->mtl;
+    id<MTLTexture> destination_texture = (__bridge id<MTLTexture>)destination->mtl;
+    const gpu_ir_texture_desc *source_desc = gpu_ir_texture_description(src);
+    const gpu_ir_texture_desc *destination_desc = gpu_ir_texture_description(dst);
+    if (!source_texture || !destination_texture || src_location->mip_level >= source_texture.mipmapLevelCount ||
+        dst_location->mip_level >= destination_texture.mipmapLevelCount ||
+        !source_desc || !destination_desc || src_location->array_slice >= source_desc->array_layers ||
+        dst_location->array_slice >= destination_desc->array_layers ||
+        source_desc->sample_count != destination_desc->sample_count)
+        return GPU_IR_RANGE;
+    [blit copyFromTexture:source_texture sourceSlice:src_location->array_slice sourceLevel:src_location->mip_level
+             sourceOrigin:MTLOriginMake(src_location->origin_x, src_location->origin_y, src_location->origin_z)
+               sourceSize:MTLSizeMake(width, height, depth)
+                 toTexture:destination_texture destinationSlice:dst_location->array_slice
+          destinationLevel:dst_location->mip_level
+         destinationOrigin:MTLOriginMake(dst_location->origin_x, dst_location->origin_y, dst_location->origin_z)];
+    return GPU_IR_OK;
+}
+static id<MTLBlitCommandEncoder> d3d11_blit_encoder(d3d_context *context) {
+    id<MTLCommandBuffer> command = (__bridge id<MTLCommandBuffer>)d3d_context_cmd(context);
+    return [command blitCommandEncoder];
+}
+static int d3d11_record_copy_resource(d3d_context *context, d3d_object *dst, d3d_object *src) {
+    gpu_ir_resource *ir_src = d3d11_gpu_ir_resource(src), *ir_dst = d3d11_gpu_ir_resource(dst);
+    if (!ir_src || !ir_dst) { gpu_ir_resource_release(ir_src); gpu_ir_resource_release(ir_dst); return 0; }
+    gpu_ir_stream stream;
+    gpu_ir_stream_init(&stream);
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc = gpu_ir_record_copy_resource(&stream, ir_src, ir_dst, &index);
+    if (rc == GPU_IR_OK) {
+        id<MTLBlitCommandEncoder> blit = d3d11_blit_encoder(context);
+        gpu_ir_backend backend = { .context = (__bridge void *)blit, .copy_resource = d3d11_ir_copy_resource,
+                                   .copy_buffer = d3d11_ir_copy_buffer };
+        rc = gpu_ir_execute(&stream, index, &backend);
+        [blit endEncoding];
+    }
+    gpu_ir_stream_destroy(&stream);
+    gpu_ir_resource_release(ir_src);
+    gpu_ir_resource_release(ir_dst);
+    return rc == GPU_IR_OK;
+}
+static int d3d11_record_copy_buffer(d3d_context *context, d3d_buffer *dst, uint64_t dst_offset,
+                                    d3d_buffer *src, uint64_t src_offset, uint64_t size) {
+    gpu_ir_resource *ir_src = d3d11_gpu_ir_resource(&src->base), *ir_dst = d3d11_gpu_ir_resource(&dst->base);
+    if (!ir_src || !ir_dst) { gpu_ir_resource_release(ir_src); gpu_ir_resource_release(ir_dst); return 0; }
+    gpu_ir_stream stream;
+    gpu_ir_stream_init(&stream);
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc = gpu_ir_record_copy_buffer(&stream, ir_src, src_offset, ir_dst, dst_offset, size, &index);
+    if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
+        id<MTLBlitCommandEncoder> blit = d3d11_blit_encoder(context);
+        gpu_ir_backend backend = { .context = (__bridge void *)blit, .copy_buffer = d3d11_ir_copy_buffer };
+        rc = gpu_ir_execute(&stream, index, &backend);
+        [blit endEncoding];
+    }
+    gpu_ir_stream_destroy(&stream);
+    gpu_ir_resource_release(ir_src);
+    gpu_ir_resource_release(ir_dst);
+    return rc == GPU_IR_OK;
+}
+static int d3d11_record_copy_texture(d3d_context *context, d3d_texture *dst,
+                                     const gpu_ir_texture_location *dst_location, d3d_texture *src,
+                                     const gpu_ir_texture_location *src_location,
+                                     uint32_t width, uint32_t height, uint32_t depth) {
+    gpu_ir_resource *ir_src = d3d11_gpu_ir_resource(&src->base), *ir_dst = d3d11_gpu_ir_resource(&dst->base);
+    if (!ir_src || !ir_dst) { gpu_ir_resource_release(ir_src); gpu_ir_resource_release(ir_dst); return 0; }
+    gpu_ir_stream stream;
+    gpu_ir_stream_init(&stream);
+    uint32_t index = GPU_IR_NO_COMMAND;
+    int rc = gpu_ir_record_copy_texture(&stream, ir_src, src_location, ir_dst, dst_location,
+                                        width, height, depth, &index);
+    if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
+        id<MTLBlitCommandEncoder> blit = d3d11_blit_encoder(context);
+        gpu_ir_backend backend = { .context = (__bridge void *)blit, .copy_texture = d3d11_ir_copy_texture };
+        rc = gpu_ir_execute(&stream, index, &backend);
+        [blit endEncoding];
+    }
+    gpu_ir_stream_destroy(&stream);
+    gpu_ir_resource_release(ir_src);
+    gpu_ir_resource_release(ir_dst);
+    return rc == GPU_IR_OK;
+}
 // The region of a subresource a box covers (all of it without one): origin and size in texels.
 static void region(const d3d_texture *t, uint32_t mip, const uint32_t *box, MTLOrigin *o, MTLSize *sz) {
     uint32_t w = mip_size(t->desc[TD_WIDTH], mip), h = mip_size(t->desc[TD_HEIGHT], mip), d = mip_size(t->depth, mip);
@@ -860,24 +1179,45 @@ static void region(const d3d_texture *t, uint32_t mip, const uint32_t *box, MTLO
     *sz = MTLSizeMake(MIN(box[3], w) - MIN(box[0], w), MIN(box[4], h) - MIN(box[1], h), t->dim == 3 ? MIN(box[5], d) - MIN(box[2], d) : 1);
 }
 
+// VXRT_TRACE_SHARED_USE=1: the first uses of each shared texture in this process (views made of it, copies from or
+// into it), to see whether a process reads what another one hands over.
+static void trace_shared_use(const char *what, d3d_object *res) {
+    static int on = -1; static int counts[64];
+    if (on < 0) on = getenv("VXRT_TRACE_SHARED_USE") != NULL;
+    if (!on || !res || res->kind == K_BUFFER) return;
+    int slot = ((d3d_texture *)res)->shared - 1;
+    if (slot < 0) return;
+    if (counts[slot & 63]++ < 3) vx_log("shared slot %d: %s", slot, what);
+}
 static WINAPI void ctx_copy_resource(void *this, d3d_object *dst, d3d_object *src) {
     d3d_context *c = this;
     HELD_OP(2);
-    if (!dst || !src || dst->kind != src->kind) return;
-    d3d_end_render(c);
-    id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
+    trace_shared_use("copy source", src); trace_shared_use("copy destination", dst);
+    if (!dst || !src || dst == src || dst->kind != src->kind) return;
+    if (dst->kind == K_BUFFER && ((d3d_buffer *)dst)->desc[0] != ((d3d_buffer *)src)->desc[0]) return;
     if (dst->kind == K_TEXTURE) {
-        id<MTLTexture> s = (__bridge id<MTLTexture>)((d3d_texture *)src)->mtl, d = (__bridge id<MTLTexture>)((d3d_texture *)dst)->mtl;
-        if (s.width == d.width && s.height == d.height && s.depth == d.depth && s.mipmapLevelCount == d.mipmapLevelCount && s.arrayLength == d.arrayLength && s.sampleCount == d.sampleCount)
-            [blit copyFromTexture:s toTexture:d];
-        else if (vx_trace) vx_log("CopyResource between textures that differ: %lux%lu x%lu -> %lux%lu x%lu", (unsigned long)s.width, (unsigned long)s.height,
-                                  (unsigned long)s.sampleCount, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.sampleCount);
-    } else {
-        d3d_buffer *sb = (d3d_buffer *)src, *db = (d3d_buffer *)dst;
-        [blit copyFromBuffer:(__bridge id<MTLBuffer>)sb->mtl sourceOffset:sb->off toBuffer:(__bridge id<MTLBuffer>)db->mtl destinationOffset:db->off
-                        size:MIN(sb->desc[0], db->desc[0])];
+        d3d_texture *d = (d3d_texture *)dst, *s = (d3d_texture *)src;
+    if (d->desc[TD_WIDTH] != s->desc[TD_WIDTH] || d->desc[TD_HEIGHT] != s->desc[TD_HEIGHT] ||
+            d->depth != s->depth || d->desc[TD_MIPS] != s->desc[TD_MIPS] || d->desc[TD_ARRAY] != s->desc[TD_ARRAY] ||
+            d->desc[TD_SAMPLES] != s->desc[TD_SAMPLES] || d->desc[TD_QUALITY] != s->desc[TD_QUALITY] ||
+            !d3d_copy_formats_compatible(d->desc[TD_FORMAT], s->desc[TD_FORMAT]))
+            return;
     }
-    [blit endEncoding];
+    d3d_end_render(c);
+    if (!d3d11_record_copy_resource(c, dst, src)) {
+        // Keep the prior Metal path available for a resource shape the common metadata cannot describe.
+        id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
+        if (dst->kind == K_TEXTURE) {
+            id<MTLTexture> source = (__bridge id<MTLTexture>)((d3d_texture *)src)->mtl;
+            id<MTLTexture> destination = (__bridge id<MTLTexture>)((d3d_texture *)dst)->mtl;
+            [blit copyFromTexture:source toTexture:destination];
+        } else {
+            d3d_buffer *sb = (d3d_buffer *)src, *db = (d3d_buffer *)dst;
+            id<MTLBuffer> source = (__bridge id<MTLBuffer>)sb->mtl, destination = (__bridge id<MTLBuffer>)db->mtl;
+            [blit copyFromBuffer:source sourceOffset:sb->off toBuffer:destination destinationOffset:db->off size:sb->desc[0]];
+        }
+        [blit endEncoding];
+    }
     d3d_mark_gpu(c, dst); d3d_mark_gpu(c, src);
     if (dst->kind == K_TEXTURE) d3d_shared_written(c->base.dev, (d3d_texture *)dst);
 }
@@ -886,9 +1226,10 @@ static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint
                                                d3d_object *src, uint32_t src_sub, const uint32_t *box) {
     d3d_context *c = this;
     HELD_OP(3);
-    if (!dst || !src || dst->kind != src->kind) return;
+    trace_shared_use("region copy source", src); trace_shared_use("region copy destination", dst);
+    if (!dst || !src || dst->kind != src->kind ||
+        (dst == src && (dst->kind == K_BUFFER || dst_sub == src_sub))) return;
     d3d_end_render(c);
-    id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
     if (dst->kind == K_TEXTURE) {
         d3d_texture *ds = (d3d_texture *)dst, *ss = (d3d_texture *)src;
         uint32_t smip, sslice, dmip, dslice;
@@ -900,17 +1241,37 @@ static WINAPI void ctx_copy_subresource_region(void *this, d3d_object *dst, uint
         sz.width = MIN(sz.width, mip_size(ds->desc[TD_WIDTH], dmip) - MIN(x, mip_size(ds->desc[TD_WIDTH], dmip)));
         sz.height = MIN(sz.height, (ds->dim == 1 ? 1 : mip_size(ds->desc[TD_HEIGHT], dmip)) - MIN(y, mip_size(ds->desc[TD_HEIGHT], dmip)));
         sz.depth = MIN(sz.depth, mip_size(ds->depth, dmip) - MIN(z, mip_size(ds->depth, dmip)));
-        if (sz.width && sz.height && sz.depth)
-            [blit copyFromTexture:(__bridge id<MTLTexture>)ss->mtl sourceSlice:sslice sourceLevel:smip sourceOrigin:o sourceSize:sz
-                        toTexture:(__bridge id<MTLTexture>)ds->mtl destinationSlice:dslice destinationLevel:dmip
-                destinationOrigin:MTLOriginMake(x, ds->dim == 1 ? 0 : y, ds->dim == 3 ? z : 0)];
+        if (sz.width && sz.height && sz.depth) {
+            if (!d3d_copy_formats_compatible(ss->desc[TD_FORMAT], ds->desc[TD_FORMAT])) return;
+            if (ss->desc[TD_SAMPLES] > 1 &&
+                (box || x || y || z || sz.width != mip_size(ss->desc[TD_WIDTH], smip) ||
+                 sz.height != (ss->dim == 1 ? 1 : mip_size(ss->desc[TD_HEIGHT], smip)) ||
+                 sz.depth != (ss->dim == 3 ? mip_size(ss->depth, smip) : 1) ||
+                 ss->desc[TD_SAMPLES] != ds->desc[TD_SAMPLES] || ss->desc[TD_QUALITY] != ds->desc[TD_QUALITY])) return;
+            gpu_ir_texture_location src_location = {
+                .mip_level = smip, .array_slice = sslice,
+                .origin_x = (uint32_t)o.x, .origin_y = (uint32_t)o.y, .origin_z = (uint32_t)o.z
+            };
+            gpu_ir_texture_location dst_location = {
+                .mip_level = dmip, .array_slice = dslice,
+                .origin_x = x, .origin_y = ds->dim == 1 ? 0 : y, .origin_z = ds->dim == 3 ? z : 0
+            };
+            if (!d3d11_record_copy_texture(c, ds, &dst_location, ss, &src_location,
+                                           (uint32_t)sz.width, (uint32_t)sz.height, (uint32_t)sz.depth))
+                vx_log("Direct3D 11: CopySubresourceRegion texture copy was rejected by the common GPU IR");
+        }
     } else {
         d3d_buffer *sb = (d3d_buffer *)src, *db = (d3d_buffer *)dst;
         uint32_t from = box ? box[0] : 0, size = box ? box[3] - box[0] : sb->desc[0];
-        if (from + size <= sb->desc[0] && x + size <= db->desc[0])
-            [blit copyFromBuffer:(__bridge id<MTLBuffer>)sb->mtl sourceOffset:sb->off + from toBuffer:(__bridge id<MTLBuffer>)db->mtl destinationOffset:db->off + x size:size];
+        if (!d3d11_record_copy_buffer(c, db, x, sb, from, size)) {
+            if (from <= sb->desc[0] && size <= sb->desc[0] - from && x <= db->desc[0] && size <= db->desc[0] - x) {
+                id<MTLBlitCommandEncoder> blit = [context_cmd(c) blitCommandEncoder];
+                [blit copyFromBuffer:(__bridge id<MTLBuffer>)sb->mtl sourceOffset:sb->off + from
+                              toBuffer:(__bridge id<MTLBuffer>)db->mtl destinationOffset:db->off + x size:size];
+                [blit endEncoding];
+            }
+        }
     }
-    [blit endEncoding];
     d3d_mark_gpu(c, dst); d3d_mark_gpu(c, src);
     if (dst->kind == K_TEXTURE) d3d_shared_written(c->base.dev, (d3d_texture *)dst);
     if (dst->kind == K_TEXTURE) d3d_flash_frame(c->base.dev, (d3d_texture *)src, (d3d_texture *)dst, box);
@@ -1253,6 +1614,7 @@ static WINAPI HRESULT device_create_dsv(void *this, d3d_object *res, const uint3
 }
 static WINAPI HRESULT device_create_srv(void *this, d3d_object *res, const uint32_t *desc, void **out) {
     if (!res) return E_INVALIDARG;
+    trace_shared_use("shader resource view", res);
     if (!out) return S_FALSE;
     *out = make_view(dev_of(this), K_SRV, g_srv_vtbl, res, desc, 0);
     return S_OK;

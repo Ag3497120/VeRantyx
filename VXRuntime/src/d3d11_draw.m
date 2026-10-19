@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include "d3d_common.h"
 #include "dxbc.h"
+#include "gpu_ir.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -16,6 +17,8 @@
 
 static const GUID IID_IUnknown_ = { 0, 0, 0, { 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
 static void **g_gs_vtbl, **g_vs_vtbl, **g_ps_vtbl, **g_cs_vtbl, **g_uav_vtbl, **g_layout_vtbl, **g_blend_vtbl, **g_depth_vtbl, **g_raster_vtbl, **g_sampler_vtbl;
+static int reads_target(const d3d_view *srv, const d3d_view *out, int depth);
+static void gpu11_release_mtl_object(void *object);
 
 static d3d_object *self_of(void *this) { return (d3d_object *)this; }
 static WINAPI uint32_t child_addref(void *this) { return d3d_addref(self_of(this)); }
@@ -40,7 +43,7 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface)
 // works on many at once, and a game creating thousands while it loads would otherwise wait for each in turn; the
 // first draw (or dispatch) that needs one waits for it.
 // so: a geometry shader made with stream output (so_layout), else NULL.
-typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; uint32_t id, hash; volatile int ready; void *dual; int dual_tried; void *variant; int variant_tried; void *so; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
+typedef struct { d3d_object base; dxbc_shader info; void *function, *compute; gpu_ir_pipeline *compute_ir; uint32_t id, hash; volatile int ready; void *dual; int dual_tried; void *variant; int variant_tried; void *so; } d3d_shader;   // hash: as in VXRT_DUMP_SHADERS names
 // Stream output (stream 0): which output register components go where in the target buffers. An entry copies
 // count components from register reg, component comp on, to dword dword of each vertex's record in buffer slot.
 typedef struct { uint32_t reg, comp, count, slot_dword; } so_entry;   // slot_dword: slot << 24 | dword
@@ -84,6 +87,7 @@ static void shader_destroy(d3d_object *o) {
     if (s->function) CFBridgingRelease(s->function);
     if (s->dual) CFBridgingRelease(s->dual);
     if (s->variant) CFBridgingRelease(s->variant);
+    gpu_ir_pipeline_release(s->compute_ir);
     if (s->compute) CFBridgingRelease(s->compute);
     free(s->so);
     dxbc_free(&s->info);
@@ -379,7 +383,7 @@ typedef struct d3d_draw_state {
     d3d_buffer *ib; uint32_t ib_format, ib_offset, topology;
     d3d_shader *shader[STAGES];
     d3d_buffer *cb[STAGES][14]; uint32_t cb_offset[STAGES][14];
-    d3d_view *srv[STAGES][32];
+    d3d_view *srv[STAGES][64];
     d3d_sampler *smp[STAGES][16];
     d3d_view *uav[STAGES][8];                  // pixel shaders (with render targets) and compute shaders
     d3d_blend *blend; float blend_factor[4];
@@ -402,11 +406,339 @@ typedef struct d3d_draw_state {
         uint32_t nvp; MTLViewport vp[16]; MTLScissorRect sc[16];
         void *buf[2][64]; NSUInteger off[2][64]; void *tex[2][80]; void *smp[2][16];
     } bound;
+    gpu_ir_stream gpu_ir;                     // D3D11 immediate operations execute and clear one common IR command
 } d3d_draw_state;
 
 static d3d_draw_state *state_of(d3d_context *c) {
-    if (!c->draw) c->draw = calloc(1, sizeof *c->draw);
+    if (!c->draw) {
+        c->draw = calloc(1, sizeof *c->draw);
+        if (c->draw) gpu_ir_stream_init(&c->draw->gpu_ir);
+    }
     return c->draw;
+}
+
+#define GPU11_MAX_RESOURCE_ACCESSES 192
+typedef struct {
+    gpu_ir_resource_access accesses[GPU11_MAX_RESOURCE_ACCESSES];
+    d3d_object *objects[GPU11_MAX_RESOURCE_ACCESSES];
+    uint32_t count;
+} gpu11_resource_access_set;
+
+static void gpu11_resource_accesses_clear(gpu11_resource_access_set *set) {
+    if (!set) return;
+    for (uint32_t i = 0; i < set->count; i++) gpu_ir_resource_release(set->accesses[i].resource);
+    memset(set, 0, sizeof *set);
+}
+
+static int gpu11_resource_access_add(gpu11_resource_access_set *set, d3d_object *object,
+                                     uint32_t stage, uint32_t access) {
+    if (!object || !access) return 1;
+    for (uint32_t i = 0; i < set->count; i++) {
+        if (set->objects[i] != object) continue;
+        set->accesses[i].stage_mask |= stage;
+        set->accesses[i].access_mask |= access;
+        return 1;
+    }
+    if (set->count == GPU11_MAX_RESOURCE_ACCESSES) return 0;
+    gpu_ir_resource *resource = d3d11_gpu_ir_resource(object);
+    if (!resource) return 0;
+    set->objects[set->count] = object;
+    set->accesses[set->count] = (gpu_ir_resource_access){ resource, stage, access };
+    set->count++;
+    return 1;
+}
+
+static int gpu11_resource_access_add_ir(gpu11_resource_access_set *set, gpu_ir_resource *resource,
+                                        uint32_t stage, uint32_t access) {
+    if (!resource || !stage || !access) return resource != NULL;
+    for (uint32_t i = 0; i < set->count; i++) {
+        if (set->accesses[i].resource != resource) continue;
+        set->accesses[i].stage_mask |= stage;
+        set->accesses[i].access_mask |= access;
+        return 1;
+    }
+    if (set->count == GPU11_MAX_RESOURCE_ACCESSES) return 0;
+    gpu_ir_resource_retain(resource);
+    set->accesses[set->count] = (gpu_ir_resource_access){ resource, stage, access };
+    set->count++;
+    return 1;
+}
+
+enum { GPU11_DESCRIPTOR_CBV, GPU11_DESCRIPTOR_SRV, GPU11_DESCRIPTOR_UAV, GPU11_DESCRIPTOR_SAMPLER };
+#define GPU11_DESCRIPTOR_CAPACITY 128
+typedef struct { d3d_object *object; gpu_ir_resource *resource; } gpu11_ir_resource_entry;
+
+static gpu_ir_resource *gpu11_ir_resource_cached(gpu11_ir_resource_entry *cache, uint32_t *count,
+                                                  d3d_object *object) {
+    if (!object) return NULL;
+    for (uint32_t i = 0; i < *count; i++) if (cache[i].object == object) return cache[i].resource;
+    if (*count == GPU11_DESCRIPTOR_CAPACITY) return NULL;
+    gpu_ir_resource *resource = d3d11_gpu_ir_resource(object);
+    if (!resource) return NULL;
+    cache[*count] = (gpu11_ir_resource_entry){ object, resource };
+    (*count)++;
+    return resource;
+}
+
+// Preserve a D3D11 buffer view's element type and range in the common descriptor snapshot. Shader translation still
+// binds the Metal arguments through its existing D3D11 path; this record gives common-layer validation and future
+// backends the API-neutral view shape.
+static gpu_ir_buffer_view *gpu11_descriptor_buffer_view(gpu_ir_resource *resource, const d3d_view *view,
+                                                         uint32_t access, uint32_t reflected_kind) {
+    if (!resource || !view || view->resource->kind != K_BUFFER || !gpu_ir_resource_is_buffer(resource)) return NULL;
+    const d3d_buffer *buffer = (const d3d_buffer *)view->resource;
+    uint32_t kind, element_size, stride = 0;
+    if (view->flags & 1u) {                                           // D3D11 raw-view flag
+        kind = GPU_IR_BUFFER_VIEW_RAW;
+        element_size = 4;
+    } else if (view->format) {
+        uint32_t block_width = 0, block_height = 0, bytes_per_block = 0;
+        if (!d3d_copy_format_block(view->format, &block_width, &block_height, &bytes_per_block) ||
+            block_width != 1 || block_height != 1 || !bytes_per_block) return NULL;
+        kind = GPU_IR_BUFFER_VIEW_TYPED;
+        element_size = bytes_per_block;
+    } else if (buffer->desc[5] &&
+               (!reflected_kind || reflected_kind == GPU_IR_BUFFER_VIEW_STRUCTURED)) {
+        kind = GPU_IR_BUFFER_VIEW_STRUCTURED;
+        stride = buffer->desc[5];
+        element_size = stride;
+    } else if (reflected_kind == GPU_IR_BUFFER_VIEW_RAW) {
+        kind = GPU_IR_BUFFER_VIEW_RAW;                                // raw DXBC declarations may omit a view desc
+        element_size = 4;
+    } else return NULL;                                                // unknown format and no structured stride
+
+    uint64_t resource_size = gpu_ir_buffer_size(resource);
+    uint64_t byte_offset = (uint64_t)view->first * element_size;
+    if (!element_size || byte_offset >= resource_size) return NULL;
+    uint64_t remaining = resource_size - byte_offset;
+    uint64_t element_count = view->count ? view->count : remaining / element_size;
+    if (!element_count || element_count > UINT32_MAX || element_count > remaining / element_size) return NULL;
+    gpu_ir_buffer_view_desc desc = {
+        .kind = kind,
+        .access_mask = access,
+        .byte_offset = byte_offset,
+        .byte_size = element_count * element_size,
+        .element_count = (uint32_t)element_count,
+        .element_size = kind == GPU_IR_BUFFER_VIEW_TYPED ? element_size : 0,
+        .structure_stride = stride
+    };
+    return gpu_ir_buffer_view_create(resource, &desc, NULL, NULL);
+}
+
+static int gpu11_descriptor_append(gpu_ir_descriptor_binding *layout, gpu_ir_descriptor_value *values,
+    uint32_t *count, gpu11_ir_resource_entry *cache, uint32_t *cache_count, uint32_t stage_index,
+    uint32_t stage_mask, uint32_t binding_namespace, uint32_t binding, uint32_t kind, uint32_t access,
+    d3d_object *resource_object, d3d_view *view, uint32_t reflected_buffer_kind, d3d_sampler *sampler) {
+    if (*count == GPU11_DESCRIPTOR_CAPACITY) return 0;
+    gpu_ir_descriptor_binding *slot = &layout[*count];
+    *slot = (gpu_ir_descriptor_binding){
+        .set = stage_index, .binding_namespace = binding_namespace, .binding = binding,
+        .kind = kind, .count = 1, .stage_mask = stage_mask, .access_mask = access
+    };
+    gpu_ir_descriptor_value *value = &values[*count];
+    *value = (gpu_ir_descriptor_value){
+        .set = stage_index, .binding_namespace = binding_namespace, .binding = binding,
+        .kind = kind, .stage_mask = stage_mask, .access_mask = access
+    };
+    if (kind == GPU_IR_DESCRIPTOR_SAMPLER) {
+        id<MTLSamplerState> state = sampler ? (__bridge id<MTLSamplerState>)sampler->mtl : nil;
+        if (state) {
+            value->backend_object = (void *)CFBridgingRetain(state);
+            value->backend_release = gpu11_release_mtl_object;
+        } else value->flags = GPU_IR_DESCRIPTOR_VALUE_NULL;
+    } else if (resource_object) {
+        value->resource = gpu11_ir_resource_cached(cache, cache_count, resource_object);
+        if (!value->resource) return 0;
+        value->buffer_view = gpu11_descriptor_buffer_view(value->resource, view, access, reflected_buffer_kind);
+        if (view && view->mtl_view) {
+            id mtl_view = (__bridge id)view->mtl_view;
+            value->backend_object = (void *)CFBridgingRetain(mtl_view);
+            value->backend_release = gpu11_release_mtl_object;
+        }
+    } else value->flags = GPU_IR_DESCRIPTOR_VALUE_NULL;
+    (*count)++;
+    return 1;
+}
+
+static void gpu11_descriptor_values_release_backend(gpu_ir_descriptor_value *values, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (values[i].backend_release) values[i].backend_release(values[i].backend_object);
+        if (values[i].backend_release_aux) values[i].backend_release_aux(values[i].backend_object_aux);
+    }
+}
+
+static void gpu11_descriptor_values_release_views(gpu_ir_descriptor_value *values, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) gpu_ir_buffer_view_release(values[i].buffer_view);
+}
+
+static int gpu11_shader_descriptor_state(d3d_draw_state *state, int stage_index,
+                                         uint32_t stage_mask, gpu_ir_descriptor_state **out_state) {
+    if (!state || !out_state || stage_index < 0 || stage_index >= STAGES || !stage_mask) return 0;
+    *out_state = NULL;
+    d3d_shader *shader = state->shader[stage_index];
+    if (!shader) return 1;
+    gpu_ir_descriptor_binding layout_bindings[GPU11_DESCRIPTOR_CAPACITY];
+    gpu_ir_descriptor_value values[GPU11_DESCRIPTOR_CAPACITY];
+    gpu11_ir_resource_entry resource_cache[GPU11_DESCRIPTOR_CAPACITY];
+    uint32_t binding_count = 0, resource_count = 0;
+    memset(values, 0, sizeof values);
+    const dxbc_shader *info = &shader->info;
+
+    for (uint32_t i = 0; i < 14; i++) {
+        if (!(info->cbuffers & (1u << i))) continue;
+        d3d_buffer *buffer = state->cb[stage_index][i];
+        if (!gpu11_descriptor_append(layout_bindings, values, &binding_count, resource_cache,
+                &resource_count, stage_index, stage_mask, GPU11_DESCRIPTOR_CBV, i,
+                GPU_IR_DESCRIPTOR_UNIFORM_BUFFER, GPU_IR_ACCESS_UNIFORM_READ,
+                buffer ? &buffer->base : NULL, NULL, 0, NULL)) goto fail;
+    }
+
+    for (uint32_t i = 0; i < 64; i++) {
+        int texture = (info->textures[i / 64] & (UINT64_C(1) << (i % 64))) != 0;
+        int buffer = (info->srv_buffers & (UINT64_C(1) << i)) != 0;
+        if (!texture && !buffer) continue;
+        d3d_view *view = state->srv[stage_index][i];
+        if (!gpu11_descriptor_append(layout_bindings, values, &binding_count, resource_cache,
+                &resource_count, stage_index, stage_mask, GPU11_DESCRIPTOR_SRV, i,
+                GPU_IR_DESCRIPTOR_READ_ONLY_RESOURCE, GPU_IR_ACCESS_SHADER_READ,
+                view ? view->resource : NULL, view,
+                buffer ? (info->srv_stride[i] ? GPU_IR_BUFFER_VIEW_STRUCTURED : GPU_IR_BUFFER_VIEW_RAW) : 0,
+                NULL)) goto fail;
+    }
+
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!(info->uavs & (1u << i))) continue;
+        d3d_view *view = state->uav[stage_index][i];
+        uint32_t access = GPU_IR_ACCESS_SHADER_WRITE |
+            (info->uav_read[i] ? GPU_IR_ACCESS_SHADER_READ : 0);
+        uint32_t reflected_buffer_kind = info->uav_kind[i] == DXBC_UAV_RAW ? GPU_IR_BUFFER_VIEW_RAW :
+            info->uav_kind[i] == DXBC_UAV_STRUCTURED ? GPU_IR_BUFFER_VIEW_STRUCTURED : 0;
+        if (!gpu11_descriptor_append(layout_bindings, values, &binding_count, resource_cache,
+                &resource_count, stage_index, stage_mask, GPU11_DESCRIPTOR_UAV, i,
+                GPU_IR_DESCRIPTOR_STORAGE_RESOURCE, access, view ? view->resource : NULL, view,
+                reflected_buffer_kind, NULL)) goto fail;
+    }
+
+    for (uint32_t i = 0; i < 16; i++) {
+        if (!(info->samplers & (1u << i))) continue;
+        if (!gpu11_descriptor_append(layout_bindings, values, &binding_count, resource_cache,
+                &resource_count, stage_index, stage_mask, GPU11_DESCRIPTOR_SAMPLER, i,
+                GPU_IR_DESCRIPTOR_SAMPLER, 0, NULL, NULL, 0, state->smp[stage_index][i])) goto fail;
+    }
+
+    gpu_ir_pipeline_layout_desc layout_desc = { .bindings = layout_bindings, .binding_count = binding_count };
+    gpu_ir_pipeline_layout *layout = gpu_ir_pipeline_layout_create(&layout_desc);
+    if (!layout) goto fail;
+    gpu_ir_descriptor_state_desc state_desc = { .values = values, .value_count = binding_count };
+    *out_state = gpu_ir_descriptor_state_create(layout, &state_desc);
+    gpu_ir_pipeline_layout_release(layout);
+    if (!*out_state) goto fail;
+    gpu11_descriptor_values_release_views(values, binding_count);
+    for (uint32_t i = 0; i < resource_count; i++) gpu_ir_resource_release(resource_cache[i].resource);
+    return 1;
+
+fail:
+    gpu11_descriptor_values_release_backend(values, binding_count);
+    gpu11_descriptor_values_release_views(values, binding_count);
+    for (uint32_t i = 0; i < resource_count; i++) gpu_ir_resource_release(resource_cache[i].resource);
+    return 0;
+}
+
+static int gpu11_collect_shader_accesses(d3d_context *context, d3d_draw_state *state, int stage,
+                                         gpu11_resource_access_set *set) {
+    static const uint32_t common_stages[STAGES] = {
+        GPU_IR_STAGE_VERTEX, GPU_IR_STAGE_FRAGMENT, GPU_IR_STAGE_COMPUTE, 0
+    };
+    d3d_shader *shader = state->shader[stage];
+    uint32_t common_stage = common_stages[stage];
+    if (!shader || !common_stage) return 1;
+    const dxbc_shader *info = &shader->info;
+    gpu_ir_descriptor_state *bindings = NULL;
+    if (!gpu11_shader_descriptor_state(state, stage, common_stage, &bindings)) return 0;
+    for (uint32_t i = 0; i < gpu_ir_descriptor_state_value_count(bindings); i++) {
+        gpu_ir_descriptor_value value;
+        if (gpu_ir_descriptor_state_value_at(bindings, i, &value) != GPU_IR_OK) {
+            gpu_ir_descriptor_state_release(bindings);
+            return 0;
+        }
+        if (value.flags & GPU_IR_DESCRIPTOR_VALUE_NULL) continue;
+        if (value.binding_namespace == GPU11_DESCRIPTOR_SRV && value.binding < 64 &&
+            !(info->srv_buffers & (UINT64_C(1) << value.binding))) {
+            d3d_view *view = state->srv[stage][value.binding];
+            if (view && reads_target(view, context->dsv, 1)) continue;
+            int target = 0;
+            for (uint32_t k = 0; view && k < 8 && !target; k++)
+                target = reads_target(view, context->rtv[k], 0);
+            if (target) continue;
+        }
+        if (value.resource && value.access_mask &&
+            !gpu11_resource_access_add_ir(set, value.resource, value.stage_mask, value.access_mask)) {
+            gpu_ir_descriptor_state_release(bindings);
+            return 0;
+        }
+    }
+    gpu_ir_descriptor_state_release(bindings);
+    return 1;
+}
+
+static int gpu11_collect_draw_accesses(d3d_context *context, d3d_draw_state *state,
+                                       const gpu_ir_pipeline *pipeline, const gpu_ir_draw_info *draw,
+                                       gpu11_resource_access_set *set) {
+    const gpu_ir_pipeline_info *info = gpu_ir_pipeline_description(pipeline);
+    if (!info || info->kind != GPU_IR_PIPELINE_GRAPHICS) return 0;
+    if ((info->stage_mask & GPU_IR_STAGE_VERTEX) &&
+        !gpu11_collect_shader_accesses(context, state, STAGE_VS, set)) return 0;
+    if ((info->stage_mask & GPU_IR_STAGE_FRAGMENT) &&
+        !gpu11_collect_shader_accesses(context, state, STAGE_PS, set)) return 0;
+    if ((info->stage_mask & GPU_IR_STAGE_VERTEX) && state->layout) {
+        for (uint32_t i = 0; i < state->layout->n; i++) {
+            uint32_t slot = state->layout->attr[i].slot;
+            if (slot < 16 && state->vb[slot] &&
+                !gpu11_resource_access_add(set, &state->vb[slot]->base, GPU_IR_STAGE_VERTEX,
+                                           GPU_IR_ACCESS_VERTEX_READ)) return 0;
+        }
+    }
+    if (draw->indexed && state->ib &&
+        !gpu11_resource_access_add(set, &state->ib->base, GPU_IR_STAGE_VERTEX, GPU_IR_ACCESS_INDEX_READ)) return 0;
+    if (info->stage_mask & GPU_IR_STAGE_FRAGMENT) {
+        for (uint32_t i = 0; i < 8; i++)
+            if (context->rtv[i] && !gpu11_resource_access_add(set, context->rtv[i]->resource,
+                GPU_IR_STAGE_FRAGMENT, GPU_IR_ACCESS_COLOR_WRITE)) return 0;
+        if (context->dsv && state->depth) {
+            const uint32_t *depth = state->depth->desc;
+            uint32_t access = depth[0] ? GPU_IR_ACCESS_DEPTH_READ : 0;
+            if (depth[0] && depth[1]) access |= GPU_IR_ACCESS_DEPTH_WRITE;
+            if (depth[3] && depth[5]) access |= GPU_IR_ACCESS_DEPTH_WRITE;
+            if (access && !gpu11_resource_access_add(set, context->dsv->resource,
+                GPU_IR_STAGE_FRAGMENT, access)) return 0;
+        }
+    }
+    return 1;
+}
+
+static MTLResourceUsage gpu11_metal_usage(uint32_t access) {
+    const uint32_t reads = GPU_IR_ACCESS_VERTEX_READ | GPU_IR_ACCESS_INDEX_READ | GPU_IR_ACCESS_UNIFORM_READ |
+        GPU_IR_ACCESS_SHADER_READ | GPU_IR_ACCESS_DEPTH_READ | GPU_IR_ACCESS_COPY_READ | GPU_IR_ACCESS_RESOLVE_READ |
+        GPU_IR_ACCESS_INPUT_ATTACHMENT_READ | GPU_IR_ACCESS_INDIRECT_READ | GPU_IR_ACCESS_HOST_READ |
+        GPU_IR_ACCESS_MEMORY_READ | GPU_IR_ACCESS_COLOR_READ;
+    const uint32_t writes = GPU_IR_ACCESS_SHADER_WRITE | GPU_IR_ACCESS_COLOR_WRITE | GPU_IR_ACCESS_DEPTH_WRITE |
+        GPU_IR_ACCESS_STREAM_WRITE | GPU_IR_ACCESS_COPY_WRITE | GPU_IR_ACCESS_RESOLVE_WRITE |
+        GPU_IR_ACCESS_HOST_WRITE | GPU_IR_ACCESS_MEMORY_WRITE;
+    MTLResourceUsage usage = 0;
+    if (access & reads) usage |= MTLResourceUsageRead;
+    if (access & writes) usage |= MTLResourceUsageWrite;
+    return usage;
+}
+
+static int gpu11_use_compute_resources(id<MTLComputeCommandEncoder> encoder,
+                                       const gpu_ir_resource_access *accesses, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        id<MTLResource> resource = (__bridge id<MTLResource>)d3d11_gpu_ir_metal_resource(accesses[i].resource);
+        MTLResourceUsage usage = gpu11_metal_usage(accesses[i].access_mask);
+        if (!resource || !usage) return 0;
+        [encoder useResource:resource usage:usage];
+    }
+    return 1;
 }
 // Bindings keep a reference, as Direct3D does.
 static void bind(void *slot_ptr, void *obj) {
@@ -418,12 +750,13 @@ static void bind(void *slot_ptr, void *obj) {
 void d3d_draw_release(d3d_context *c) {
     d3d_draw_state *s = c->draw;
     if (!s) return;
+    gpu_ir_stream_destroy(&s->gpu_ir);
     bind(&s->layout, NULL); bind(&s->ib, NULL); bind(&s->blend, NULL); bind(&s->depth, NULL); bind(&s->raster, NULL);
     for (int i = 0; i < 16; i++) bind(&s->vb[i], NULL);
     for (int st = 0; st < STAGES; st++) {
         bind(&s->shader[st], NULL);
         for (int i = 0; i < 14; i++) bind(&s->cb[st][i], NULL);
-        for (int i = 0; i < 32; i++) bind(&s->srv[st][i], NULL);
+        for (int i = 0; i < 64; i++) bind(&s->srv[st][i], NULL);
         for (int i = 0; i < 16; i++) bind(&s->smp[st][i], NULL);
         for (int i = 0; i < 8; i++) bind(&s->uav[st][i], NULL);
     }
@@ -455,9 +788,22 @@ static void set_cbs(d3d_context *c, int st, uint32_t start, uint32_t n, d3d_buff
 }
 static WINAPI void vs_set_cbs(void *this, uint32_t start, uint32_t n, d3d_buffer *const *b) { set_cbs(this, STAGE_VS, start, n, b); }
 static WINAPI void ps_set_cbs(void *this, uint32_t start, uint32_t n, d3d_buffer *const *b) { set_cbs(this, STAGE_PS, start, n, b); }
+// VXRT_TRACE_SHARED_USE=1: binding a shared texture for shaders is counted per slot (logged at 1, 100, 1000, ...).
+static void trace_shared_bind(d3d_view *v) {
+    static int on = -1; static unsigned counts[256];
+    if (on < 0) on = getenv("VXRT_TRACE_SHARED_USE") != NULL;
+    if (!on || !v || !v->resource || v->resource->kind != K_TEXTURE) return;
+    int slot = ((d3d_texture *)v->resource)->shared - 1;
+    if (slot < 0) return;
+    unsigned k = ++counts[slot & 255];
+    if (k == 1 || k == 100 || k == 1000 || k % 10000 == 0) {
+        d3d_texture *t = (d3d_texture *)v->resource;
+        vx_log("shared slot %d (%ux%u, DXGI format %u): bound for shaders %u times", slot, t->desc[TD_WIDTH], t->desc[TD_HEIGHT], t->desc[TD_FORMAT], k);
+    }
+}
 static void set_srvs(d3d_context *c, int st, uint32_t start, uint32_t n, d3d_view *const *v) {
     d3d_draw_state *s = state_of(c);
-    for (uint32_t i = 0; i < n && start + i < 32; i++) bind(&s->srv[st][start + i], v ? v[i] : NULL);
+    for (uint32_t i = 0; i < n && start + i < 64; i++) { bind(&s->srv[st][start + i], v ? v[i] : NULL); if (v) trace_shared_bind(v[i]); }
 }
 static WINAPI void vs_set_srvs(void *this, uint32_t start, uint32_t n, d3d_view *const *v) { set_srvs(this, STAGE_VS, start, n, v); }
 static WINAPI void ps_set_srvs(void *this, uint32_t start, uint32_t n, d3d_view *const *v) { set_srvs(this, STAGE_PS, start, n, v); }
@@ -535,21 +881,49 @@ static MTLBlendOperation blend_op(uint32_t op) {
 // string key cost more per draw than the draw itself); the context also remembers the last one, which most
 // draws reuse. Shader, layout and blend ids are never reused, so entries never go stale.
 typedef struct pso_key pso_key;
-typedef struct { pso_key key; void *pso; } pso_entry;
+typedef struct { pso_key key; void *pso; gpu_ir_pipeline *gpu_ir; } pso_entry;
 static pso_entry *g_psos;
 static size_t g_pso_cap, g_pso_count;
 static pthread_mutex_t g_pso_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_pso_failed;
+#define PSO_FAILED ((void *)&g_pso_failed)
+static void gpu11_release_mtl_object(void *object) { if (object) CFBridgingRelease(object); }
+static gpu_ir_pipeline *gpu11_render_pipeline_ir(const pso_key *key, void *pso) {
+    if (!pso || pso == PSO_FAILED) return NULL;
+    gpu_ir_pipeline_desc desc = {
+        .info = { .kind = GPU_IR_PIPELINE_GRAPHICS,
+                  .stage_mask = GPU_IR_STAGE_VERTEX | (key->vs & 0x80000000u ? GPU_IR_STAGE_GEOMETRY : 0) |
+                                (key->ps ? GPU_IR_STAGE_FRAGMENT : 0) },
+        .backend_object = (void *)CFBridgingRetain((__bridge id)pso),
+        .release = gpu11_release_mtl_object
+    };
+    gpu_ir_pipeline *pipeline = gpu_ir_pipeline_create(&desc);
+    if (!pipeline) gpu11_release_mtl_object(desc.backend_object);
+    return pipeline;
+}
 static size_t pso_hash(const pso_key *k) {
     const uint32_t *w = (const uint32_t *)k;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     for (size_t i = 0; i < sizeof *k / 4; i++) h = (h ^ w[i]) * 0xff51afd7ed558ccdull;
     return (size_t)(h ^ h >> 32);
 }
-static void *pso_find(const pso_key *k) {           // with g_pso_lock held
+static pso_entry *pso_find_entry(const pso_key *k) { // with g_pso_lock held
     if (!g_pso_cap) return NULL;
     for (size_t i = pso_hash(k) & (g_pso_cap - 1); g_psos[i].pso; i = (i + 1) & (g_pso_cap - 1))
-        if (!memcmp(&g_psos[i].key, k, sizeof *k)) return g_psos[i].pso;
+        if (!memcmp(&g_psos[i].key, k, sizeof *k)) return &g_psos[i];
     return NULL;
+}
+static void *pso_find(const pso_key *k) {           // with g_pso_lock held
+    pso_entry *entry = pso_find_entry(k);
+    return entry ? entry->pso : NULL;
+}
+static gpu_ir_pipeline *pso_gpu_ir_find(const pso_key *k) {
+    pthread_mutex_lock(&g_pso_lock);
+    pso_entry *entry = pso_find_entry(k);
+    gpu_ir_pipeline *pipeline = entry ? entry->gpu_ir : NULL;
+    gpu_ir_pipeline_retain(pipeline);
+    pthread_mutex_unlock(&g_pso_lock);
+    return pipeline;
 }
 static void pso_add(const pso_key *k, void *pso) {  // with g_pso_lock held; pso retained
     if (2 * (g_pso_count + 1) > g_pso_cap) {
@@ -565,7 +939,7 @@ static void pso_add(const pso_key *k, void *pso) {  // with g_pso_lock held; pso
     }
     size_t i = pso_hash(k) & (g_pso_cap - 1);
     while (g_psos[i].pso) i = (i + 1) & (g_pso_cap - 1);
-    g_psos[i] = (pso_entry){ *k, pso };
+    g_psos[i] = (pso_entry){ *k, pso, gpu11_render_pipeline_ir(k, pso) };
     g_pso_count++;
 }
 // The geometry path's other functions, compiled the first time a draw needs them: a geometry shader's
@@ -585,8 +959,6 @@ static id<MTLFunction> shader_variant(d3d_device *dev, d3d_shader *s, const char
 }
 static id<MTLFunction> gs_passthrough(d3d_device *dev, d3d_shader *gs) { return shader_variant(dev, gs, gs->info.msl_passthrough, "pass-through"); }
 
-static char g_pso_failed;
-#define PSO_FAILED ((void *)&g_pso_failed)
 // Metal converts vertex data only within a kind (floats, signed or unsigned integers); Direct3D hands an integer
 // format's bits to whichever integer type the shader declares. A signed format read as uint (or the reverse) is
 // fetched as its counterpart (the same bits, but for negative values' sign extension).
@@ -1121,7 +1493,7 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
         }
         SET_BUFFER(cb ? (__bridge id<MTLBuffer>)cb->mtl : nil, cb ? cb->off + s->cb_offset[st][i] : 0, i);
     }
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < 64; i++) {                              // texture SRVs t0..t63 (the shader may declare up to t127)
         if (!(sh->info.textures[0] & (1ull << i))) continue;
         SET_TEXTURE(shader_texture(readable_srv(c, sh, i, s->srv[st][i])), i);
     }
@@ -1129,15 +1501,16 @@ static void bind_stage(d3d_context *c, d3d_draw_state *s, int st, id<MTLRenderCo
         if (!(sh->info.samplers & (1u << i))) continue;
         SET_SAMPLER(s->smp[st][i] ? (__bridge id<MTLSamplerState>)s->smp[st][i]->mtl : default_sampler(c), i);
     }
-    for (int i = 0; i < 22; i++) {                              // raw and structured buffer SRVs
+    for (int i = 0; i < 64; i++) {                              // raw and structured buffer SRVs, at the slot of their rank
         if (!(sh->info.srv_buffers & (1ull << i))) continue;
+        uint32_t rank = sh->info.srv_rank[i] ? sh->info.srv_rank[i] - 1u : (uint32_t)i;
         d3d_view *v = s->srv[st][i];
-        if (!v || v->resource->kind != K_BUFFER) { SET_BUFFER(nil, 0, DXBC_SRV_BUFFER_BASE + i); continue; }
+        if (!v || v->resource->kind != K_BUFFER) { SET_BUFFER(nil, 0, DXBC_SRV_BUFFER_BASE + rank); continue; }
         id<MTLBuffer> b = (__bridge id<MTLBuffer>)((d3d_buffer *)v->resource)->mtl;
         uint32_t stride = sh->info.srv_stride[i] ? sh->info.srv_stride[i] : 4;
         NSUInteger off = (NSUInteger)v->first * stride;
-        SET_BUFFER(b, off, DXBC_SRV_BUFFER_BASE + i);
-        sizes[8 + i] = v->count ? v->count * stride : (uint32_t)(b.length - MIN(off, b.length));
+        SET_BUFFER(b, off, DXBC_SRV_BUFFER_BASE + rank);
+        sizes[8 + rank] = v->count ? v->count * stride : (uint32_t)(b.length - MIN(off, b.length));
     }
     for (int i = 0; i < 8; i++) {                                // UAVs
         if (!(sh->info.uavs & (1u << i))) continue;
@@ -1216,7 +1589,7 @@ static void flash_note(d3d_context *c, d3d_draw_state *s, int compute) {
         if (c->rtv[0]) { d->rt = flash_id(c->rtv[0]->resource); d->rt_format = c->rtv[0]->format; }
         if (c->dsv) d->depth = flash_id(c->dsv->resource);
     }
-    for (int i = 0, k = 0; i < 32 && k < 6; i++) if (s->srv[st][i]) d->srv[k++] = flash_id(s->srv[st][i]->resource) ^ (uint32_t)i << 27;
+    for (int i = 0, k = 0; i < 64 && k < 6; i++) if (s->srv[st][i]) d->srv[k++] = flash_id(s->srv[st][i]->resource) ^ (uint32_t)i << 26;
 }
 static void flash_write(uint32_t from, uint32_t to, const char *why) {
     for (uint32_t f = from; f <= to; f++) {
@@ -1377,7 +1750,7 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
         for (int k = 0; k < c->nclears && !reads; k++) {
             d3d_object *res = c->clears[k].v ? c->clears[k].v->resource : c->clears[k].res;
             for (int st = 0; st < STAGES && !reads; st++) {
-                for (int i = 0; i < 32 && !reads; i++) reads = s->srv[st][i] && s->srv[st][i]->resource == res;
+                for (int i = 0; i < 64 && !reads; i++) reads = s->srv[st][i] && s->srv[st][i]->resource == res;
                 for (int i = 0; i < 8 && !reads; i++) reads = s->uav[st][i] && s->uav[st][i]->resource == res;
             }
         }
@@ -1480,6 +1853,101 @@ static id<MTLRenderCommandEncoder> prepare(d3d_context *c, MTLPrimitiveType *typ
     return enc;
 }
 
+static uint32_t gpu11_topology(uint32_t topology) {
+    switch (topology) {
+    case 1: return GPU_IR_TOPOLOGY_POINT_LIST;
+    case 2: return GPU_IR_TOPOLOGY_LINE_LIST;
+    case 3: return GPU_IR_TOPOLOGY_LINE_STRIP;
+    case 4: return GPU_IR_TOPOLOGY_TRIANGLE_LIST;
+    case 5: return GPU_IR_TOPOLOGY_TRIANGLE_STRIP;
+    default: return 0;
+    }
+}
+static MTLPrimitiveType gpu11_mtl_topology(uint32_t topology) {
+    switch (topology) {
+    case GPU_IR_TOPOLOGY_POINT_LIST: return MTLPrimitiveTypePoint;
+    case GPU_IR_TOPOLOGY_LINE_LIST: return MTLPrimitiveTypeLine;
+    case GPU_IR_TOPOLOGY_LINE_STRIP: return MTLPrimitiveTypeLineStrip;
+    case GPU_IR_TOPOLOGY_TRIANGLE_LIST: return MTLPrimitiveTypeTriangle;
+    case GPU_IR_TOPOLOGY_TRIANGLE_STRIP: return MTLPrimitiveTypeTriangleStrip;
+    default: return (MTLPrimitiveType)-1;
+    }
+}
+typedef struct { d3d_context *context; d3d_draw_state *state; id<MTLRenderCommandEncoder> encoder; } gpu11_draw_context;
+static int gpu11_emit_draw(gpu11_draw_context *context, void *pipeline, const gpu_ir_draw_info *draw) {
+    if (!context || !context->state || !context->encoder || !draw ||
+        context->state->bound.pso != pipeline) return GPU_IR_INVALID;
+    MTLPrimitiveType topology = gpu11_mtl_topology(draw->topology);
+    if ((int)topology < 0) return GPU_IR_INVALID;
+    if (!draw->instance_count || (draw->indexed ? !draw->index_count : !draw->vertex_count)) return GPU_IR_OK;
+    d3d_draw_state *s = context->state;
+    id<MTLRenderCommandEncoder> enc = context->encoder;
+    if (!draw->indexed) {
+        [enc drawPrimitives:topology vertexStart:draw->first_vertex vertexCount:draw->vertex_count
+              instanceCount:draw->instance_count baseInstance:draw->first_instance];
+        return GPU_IR_OK;
+    }
+    if (!s->ib) return GPU_IR_INVALID;
+    int wide = s->ib_format == 42;
+    [enc drawIndexedPrimitives:topology indexCount:draw->index_count indexType:wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                   indexBuffer:(__bridge id<MTLBuffer>)s->ib->mtl
+             indexBufferOffset:s->ib->off + s->ib_offset + (NSUInteger)draw->first_index * (wide ? 4 : 2)
+                instanceCount:draw->instance_count baseVertex:draw->vertex_offset baseInstance:draw->first_instance];
+    return GPU_IR_OK;
+}
+static int gpu11_gpu_ir_draw(void *opaque, const gpu_ir_pipeline *pipeline, const gpu_ir_draw_info *draw,
+                             const gpu_ir_resource_access *accesses, uint32_t access_count) {
+    gpu11_draw_context *context = opaque;
+    const gpu_ir_pipeline_info *info = gpu_ir_pipeline_description(pipeline);
+    if (!info || info->kind != GPU_IR_PIPELINE_GRAPHICS) return GPU_IR_INVALID;
+    for (uint32_t i = 0; i < access_count; i++) {
+        id<MTLResource> resource = (__bridge id<MTLResource>)d3d11_gpu_ir_metal_resource(accesses[i].resource);
+        MTLResourceUsage usage = gpu11_metal_usage(accesses[i].access_mask);
+        MTLRenderStages stages = 0;
+        if (accesses[i].stage_mask & GPU_IR_STAGE_VERTEX) stages |= MTLRenderStageVertex;
+        if (accesses[i].stage_mask & GPU_IR_STAGE_FRAGMENT) stages |= MTLRenderStageFragment;
+        if (!resource || !usage || !stages) return GPU_IR_INVALID;
+        [context->encoder useResource:resource usage:usage stages:stages];
+    }
+    return gpu11_emit_draw(context, gpu_ir_pipeline_backend_object(pipeline), draw);
+}
+static void gpu11_draw(d3d_context *c, d3d_draw_state *s, id<MTLRenderCommandEncoder> enc,
+                       uint32_t vertex_count, uint32_t index_count, uint32_t instance_count,
+                       uint32_t first_vertex, uint32_t first_index, int32_t vertex_offset,
+                       uint32_t first_instance, int indexed) {
+    uint32_t topology = gpu11_topology(s->topology);
+    gpu_ir_pipeline *pipeline = topology ? pso_gpu_ir_find(&s->last_key) : NULL;
+    gpu_ir_draw_info draw = {
+        .topology = topology, .indexed = indexed != 0,
+        .vertex_count = indexed ? 0 : vertex_count, .index_count = indexed ? index_count : 0,
+        .instance_count = instance_count,
+        .first_vertex = indexed ? 0 : first_vertex, .first_index = indexed ? first_index : 0,
+        .first_instance = first_instance, .vertex_offset = indexed ? vertex_offset : 0
+    };
+    if (pipeline) {
+        gpu_ir_stream_clear(&s->gpu_ir);
+        gpu11_resource_access_set accesses = { 0 };
+        uint32_t command = GPU_IR_NO_COMMAND;
+        int rc = gpu11_collect_draw_accesses(c, s, pipeline, &draw, &accesses) ?
+            gpu_ir_record_draw_with_accesses(&s->gpu_ir, pipeline, &draw, accesses.accesses, accesses.count, &command) :
+            GPU_IR_INVALID;
+        gpu11_resource_accesses_clear(&accesses);
+        if (rc == GPU_IR_OK && command != GPU_IR_NO_COMMAND) {
+            gpu11_draw_context context = { c, s, enc };
+            gpu_ir_backend backend = { .context = &context, .draw = gpu11_gpu_ir_draw };
+            rc = gpu_ir_execute(&s->gpu_ir, command, &backend);
+        }
+        gpu_ir_stream_clear(&s->gpu_ir);
+        gpu_ir_pipeline_release(pipeline);
+        if (rc == GPU_IR_OK) return;
+        static int warned;
+        if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+            vx_log("Direct3D 11: common GPU IR draw failed (%d); issuing the draw directly", rc);
+    }
+    gpu11_draw_context context = { c, s, enc };
+    gpu11_emit_draw(&context, s->bound.pso, &draw);
+}
+
 // ---- draws with a geometry shader ------------------------------------------------------------------------------------------
 // The vertex shader runs as a kernel over the draw's vertices (fetched by Metal through a stage-input
 // descriptor made from the input layout, indices included), the geometry kernel over its primitives, and the
@@ -1573,7 +2041,7 @@ static int gs_inputs_from_cpu(d3d_context *c, d3d_draw_state *s) {
     static const int stages[2] = { STAGE_VS, STAGE_GS };
     for (int k = 0; k < 2; k++) {
         for (int i = 0; i < 14; i++) if (s->cb[stages[k]][i] && gpu_may_write(&s->cb[stages[k]][i]->base, sub)) GS_NOT_EARLY(k ? "GS constants" : "VS constants", i, &s->cb[stages[k]][i]->base);
-        for (int i = 0; i < 32; i++) if (s->srv[stages[k]][i] && gpu_may_write(s->srv[stages[k]][i]->resource, sub)) GS_NOT_EARLY(k ? "GS resource" : "VS resource", i, s->srv[stages[k]][i]->resource);
+        for (int i = 0; i < 64; i++) if (s->srv[stages[k]][i] && gpu_may_write(s->srv[stages[k]][i]->resource, sub)) GS_NOT_EARLY(k ? "GS resource" : "VS resource", i, s->srv[stages[k]][i]->resource);
     }
     #undef GS_NOT_EARLY
     return 1;
@@ -1777,15 +2245,19 @@ static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t
 
 static WINAPI void ctx_draw(void *this, uint32_t count, uint32_t start) {
     if (state_of(this)->shader[STAGE_GS]) { gs_draw(this, count, 1, start, 0, 0, 0); return; }
+    d3d_context *c = this;
+    d3d_draw_state *s = state_of(c);
     MTLPrimitiveType type;
-    id<MTLRenderCommandEncoder> enc = prepare(this, &type);
-    if (enc && count) [enc drawPrimitives:type vertexStart:start vertexCount:count];
+    id<MTLRenderCommandEncoder> enc = prepare(c, &type);
+    if (enc) gpu11_draw(c, s, enc, count, 0, 1, start, 0, 0, 0, 0);
 }
 static WINAPI void ctx_draw_instanced(void *this, uint32_t count, uint32_t instances, uint32_t start, uint32_t start_instance) {
     if (state_of(this)->shader[STAGE_GS]) { gs_draw(this, count, instances, start, 0, start_instance, 0); return; }
+    d3d_context *c = this;
+    d3d_draw_state *s = state_of(c);
     MTLPrimitiveType type;
-    id<MTLRenderCommandEncoder> enc = prepare(this, &type);
-    if (enc && count && instances) [enc drawPrimitives:type vertexStart:start vertexCount:count instanceCount:instances baseInstance:start_instance];
+    id<MTLRenderCommandEncoder> enc = prepare(c, &type);
+    if (enc) gpu11_draw(c, s, enc, count, 0, instances, start, 0, 0, start_instance, 0);
 }
 static void draw_indexed(d3d_context *c, uint32_t count, uint32_t instances, uint32_t start, int32_t base_vertex, uint32_t start_instance) {
     d3d_draw_state *s = state_of(c);
@@ -1794,10 +2266,8 @@ static void draw_indexed(d3d_context *c, uint32_t count, uint32_t instances, uin
     if (!s->ib || !count || !instances) return;
     id<MTLRenderCommandEncoder> enc = prepare(c, &type);
     if (!enc) return;
-    int wide = s->ib_format == 42;                             // R32_UINT, else R16_UINT
-    [enc drawIndexedPrimitives:type indexCount:count indexType:wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
-                   indexBuffer:(__bridge id<MTLBuffer>)s->ib->mtl indexBufferOffset:s->ib->off + s->ib_offset + start * (wide ? 4 : 2)
-                 instanceCount:instances baseVertex:base_vertex baseInstance:start_instance];
+    (void)type;                                                // prepare validates the topology and binds the pipeline
+    gpu11_draw(c, s, enc, 0, count, instances, 0, start, base_vertex, start_instance, 1);
 }
 static WINAPI void ctx_draw_indexed(void *this, uint32_t count, uint32_t start, int32_t base_vertex) { draw_indexed(this, count, 1, start, base_vertex, 0); }
 static WINAPI void ctx_draw_indexed_instanced(void *this, uint32_t count, uint32_t instances, uint32_t start, int32_t base_vertex, uint32_t start_instance) {
@@ -1806,6 +2276,55 @@ static WINAPI void ctx_draw_indexed_instanced(void *this, uint32_t count, uint32
 
 
 // ---- compute ---------------------------------------------------------------------------------------------------------------------
+static int gpu11_dispatch_metal(d3d_context *c, id<MTLComputePipelineState> pso, const uint32_t *threads,
+                                uint32_t x, uint32_t y, uint32_t z,
+                                const gpu_ir_resource_access *accesses, uint32_t access_count) {
+    if (!pso || !threads) return GPU_IR_INVALID;
+    d3d_draw_state *s = state_of(c);
+    d3d_shader *cs = s->shader[STAGE_CS];
+    d3d_end_render(c);
+    id<MTLComputeCommandEncoder> enc;
+    if (prof_on(c->base.dev)) {                         // VXRT_GPU_PROFILE: the dispatch timed
+        char sig[120]; snprintf(sig, sizeof sig, "compute cs %08x", cs ? cs->hash : 0);
+        uint32_t smp = prof_take(sig);
+        MTLComputePassDescriptor *cd = [MTLComputePassDescriptor computePassDescriptor];
+        cd.sampleBufferAttachments[0].sampleBuffer = g_prof_buf;
+        cd.sampleBufferAttachments[0].startOfEncoderSampleIndex = smp;
+        cd.sampleBufferAttachments[0].endOfEncoderSampleIndex = smp + 1;
+        enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoderWithDescriptor:cd];
+    } else enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    bind_stage(c, s, STAGE_CS, nil, enc);
+    if (!gpu11_use_compute_resources(enc, accesses, access_count)) {
+        [enc endEncoding];
+        return GPU_IR_INVALID;
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(x, y, z)
+        threadsPerThreadgroup:MTLSizeMake(threads[0] ? threads[0] : 1, threads[1] ? threads[1] : 1, threads[2] ? threads[2] : 1)];
+    [enc endEncoding];
+    return GPU_IR_OK;
+}
+static int gpu11_gpu_ir_dispatch(void *opaque, const gpu_ir_pipeline *pipeline,
+                                 uint32_t x, uint32_t y, uint32_t z,
+                                 const gpu_ir_resource_access *accesses, uint32_t access_count) {
+    const gpu_ir_pipeline_info *info = gpu_ir_pipeline_description(pipeline);
+    if (!info || info->kind != GPU_IR_PIPELINE_COMPUTE) return GPU_IR_INVALID;
+    id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)gpu_ir_pipeline_backend_object(pipeline);
+    return gpu11_dispatch_metal(opaque, pso, info->threadgroup_size, x, y, z, accesses, access_count);
+}
+static gpu_ir_pipeline *gpu11_compute_pipeline_ir(d3d_shader *shader) {
+    if (shader->compute_ir || !shader->compute) return shader->compute_ir;
+    const uint32_t *t = shader->info.threads;
+    gpu_ir_pipeline_desc desc = {
+        .info = { .kind = GPU_IR_PIPELINE_COMPUTE, .stage_mask = GPU_IR_STAGE_COMPUTE,
+                  .threadgroup_size = { t[0] ? t[0] : 1, t[1] ? t[1] : 1, t[2] ? t[2] : 1 } },
+        .backend_object = (void *)CFBridgingRetain((__bridge id)shader->compute),
+        .release = gpu11_release_mtl_object
+    };
+    shader->compute_ir = gpu_ir_pipeline_create(&desc);
+    if (!shader->compute_ir) gpu11_release_mtl_object(desc.backend_object);
+    return shader->compute_ir;
+}
 static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) {
     d3d_context *c = this;
     HELD_OP(1);
@@ -1821,22 +2340,29 @@ static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) 
         if (!pso) { vx_log("Direct3D: compute pipeline failed: %s", err.localizedDescription.UTF8String); return; }
         cs->compute = (void *)CFBridgingRetain(pso);
     }
-    d3d_end_render(c);
-    id<MTLComputeCommandEncoder> enc;
-    if (prof_on(c->base.dev)) {                         // VXRT_GPU_PROFILE: the dispatch timed
-        char sig[120]; snprintf(sig, sizeof sig, "compute cs %08x", cs->hash);
-        uint32_t smp = prof_take(sig);
-        MTLComputePassDescriptor *cd = [MTLComputePassDescriptor computePassDescriptor];
-        cd.sampleBufferAttachments[0].sampleBuffer = g_prof_buf;
-        cd.sampleBufferAttachments[0].startOfEncoderSampleIndex = smp;
-        cd.sampleBufferAttachments[0].endOfEncoderSampleIndex = smp + 1;
-        enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoderWithDescriptor:cd];
-    } else enc = [(__bridge id<MTLCommandBuffer>)d3d_context_cmd(c) computeCommandEncoder];
-    [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)cs->compute];
-    bind_stage(c, s, STAGE_CS, nil, enc);
-    const uint32_t *t = cs->info.threads;
-    [enc dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:MTLSizeMake(t[0] ? t[0] : 1, t[1] ? t[1] : 1, t[2] ? t[2] : 1)];
-    [enc endEncoding];
+    gpu_ir_pipeline *pipeline = gpu11_compute_pipeline_ir(cs);
+    int rc = GPU_IR_OUT_OF_MEMORY;
+    if (pipeline) {
+        gpu_ir_stream_clear(&s->gpu_ir);
+        gpu11_resource_access_set accesses = { 0 };
+        uint32_t command = GPU_IR_NO_COMMAND;
+        rc = gpu11_collect_shader_accesses(c, s, STAGE_CS, &accesses) ?
+            gpu_ir_record_dispatch_with_accesses(&s->gpu_ir, pipeline, x, y, z,
+                accesses.accesses, accesses.count, &command) : GPU_IR_INVALID;
+        gpu11_resource_accesses_clear(&accesses);
+        if (rc == GPU_IR_OK && command != GPU_IR_NO_COMMAND) {
+            gpu_ir_backend backend = { .context = c, .dispatch = gpu11_gpu_ir_dispatch };
+            rc = gpu_ir_execute(&s->gpu_ir, command, &backend);
+        }
+        gpu_ir_stream_clear(&s->gpu_ir);
+    }
+    if (rc != GPU_IR_OK) {
+        static int warned;
+        if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+            vx_log("Direct3D 11: common GPU IR dispatch failed (%d); issuing the dispatch directly", rc);
+        gpu11_dispatch_metal(c, (__bridge id<MTLComputePipelineState>)cs->compute, cs->info.threads,
+                             x, y, z, NULL, 0);
+    }
 }
 // ClearUnorderedAccessView: buffers are filled on the GPU (in order with the other work); a value whose four bytes
 // differ is written as words after the GPU work so far has finished.
@@ -1857,6 +2383,115 @@ static void clear_uav(d3d_context *c, d3d_view *v, uint32_t value) {
     uint32_t *w = (uint32_t *)((uint8_t *)b.contents + off);
     for (NSUInteger i = 0; i < len / 4; i++) w[i] = value;
 }
+static int clear_uav_uint_pattern(uint32_t format, const uint32_t values[4], uint8_t pattern[16],
+                                  uint32_t *pattern_size) {
+    uint32_t bytes = 0, block_width = 0, block_height = 0, bytes_per_block = 0;
+    MTLPixelFormat metal = d3d_mtl_format(format, &bytes);
+    if (metal == MTLPixelFormatInvalid ||
+        !d3d_copy_format_block(format, &block_width, &block_height, &bytes_per_block) ||
+        block_width != 1 || block_height != 1 || !bytes_per_block) return 0;
+    uint32_t component_bits = 0, component_count = 0;
+    int bgra = 0;
+    switch (metal) {
+    case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Snorm:
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint:
+        component_bits = 8; component_count = 1; break;
+    case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Snorm:
+    case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
+        component_bits = 8; component_count = 2; break;
+    case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Snorm:
+    case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+        component_bits = 8; component_count = 4; break;
+    case MTLPixelFormatBGRA8Unorm:
+        component_bits = 8; component_count = 4; bgra = 1; break;
+    case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm:
+    case MTLPixelFormatR16Float: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+        component_bits = 16; component_count = 1; break;
+    case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm:
+    case MTLPixelFormatRG16Float: case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint:
+        component_bits = 16; component_count = 2; break;
+    case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm:
+    case MTLPixelFormatRGBA16Float: case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint:
+        component_bits = 16; component_count = 4; break;
+    case MTLPixelFormatR32Float: case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint:
+        component_bits = 32; component_count = 1; break;
+    case MTLPixelFormatRG32Float: case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint:
+        component_bits = 32; component_count = 2; break;
+    case MTLPixelFormatRGBA32Float: case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint:
+        component_bits = 32; component_count = 4; break;
+    case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRGB10A2Uint: {
+        uint32_t packed = (values[0] & 0x3ffu) | ((values[1] & 0x3ffu) << 10) |
+            ((values[2] & 0x3ffu) << 20) | ((values[3] & 0x3u) << 30);
+        memcpy(pattern, &packed, sizeof packed);
+        *pattern_size = sizeof packed;
+        return bytes_per_block == sizeof packed;
+    }
+    case MTLPixelFormatRG11B10Float: {
+        uint32_t packed = (values[0] & 0x7ffu) | ((values[1] & 0x7ffu) << 11) |
+            ((values[2] & 0x3ffu) << 22);
+        memcpy(pattern, &packed, sizeof packed);
+        *pattern_size = sizeof packed;
+        return bytes_per_block == sizeof packed;
+    }
+    default:
+        return 0;
+    }
+    uint32_t component_size = component_bits / 8;
+    uint32_t size = component_count * component_size;
+    if (!size || size != bytes_per_block || size != bytes) return 0;
+    for (uint32_t i = 0; i < component_count; i++) {
+        uint32_t value_index = bgra ? (i == 0 ? 2 : i == 2 ? 0 : i) : i;
+        if (component_bits == 8) {
+            pattern[i] = (uint8_t)values[value_index];
+        } else if (component_bits == 16) {
+            uint16_t value = (uint16_t)values[value_index];
+            memcpy(pattern + i * sizeof value, &value, sizeof value);
+        } else {
+            memcpy(pattern + i * sizeof values[i], &values[value_index], sizeof values[i]);
+        }
+    }
+    *pattern_size = size;
+    return 1;
+}
+static void clear_uav_uint(d3d_context *context, d3d_view *view, const uint32_t values[4]) {
+    if (!view || view->resource->kind != K_BUFFER || !values) {
+        d3d_not_implemented("ID3D11DeviceContext::ClearUnorderedAccessViewUint (textures or invalid view)");
+        return;
+    }
+    d3d_buffer *buffer = (d3d_buffer *)view->resource;
+    uint8_t pattern[GPU_IR_MAX_FILL_PATTERN_SIZE] = { 0 };
+    uint32_t pattern_size = 0;
+    uint64_t element_size = 0;
+    if (view->flags & 1u) {
+        memcpy(pattern, values, sizeof values[0]);
+        pattern_size = sizeof values[0];
+        element_size = sizeof values[0];
+    } else if (view->format) {
+        if (!clear_uav_uint_pattern(view->format, values, pattern, &pattern_size)) {
+            d3d_not_implemented("ID3D11DeviceContext::ClearUnorderedAccessViewUint (typed buffer format)");
+            return;
+        }
+        element_size = pattern_size;
+    } else if (buffer->desc[5]) {
+        memcpy(pattern, values, sizeof values[0]);
+        pattern_size = sizeof values[0];
+        element_size = buffer->desc[5];
+    } else {
+        d3d_not_implemented("ID3D11DeviceContext::ClearUnorderedAccessViewUint (buffer view format)");
+        return;
+    }
+    uint64_t resource_size = buffer->desc[0];
+    if (!element_size || view->first > UINT64_MAX / element_size) return;
+    uint64_t byte_offset = (uint64_t)view->first * element_size;
+    if (byte_offset > resource_size) return;
+    uint64_t remaining = resource_size - byte_offset;
+    uint64_t element_count = view->count ? view->count : remaining / element_size;
+    if (element_count > remaining / element_size || element_count > UINT64_MAX / element_size) return;
+    uint64_t byte_size = element_count * element_size;
+    int rc = d3d11_record_fill_buffer_pattern(context, buffer, byte_offset, byte_size, pattern, pattern_size);
+    if (rc != GPU_IR_OK)
+        vx_log("Direct3D 11: ClearUnorderedAccessViewUint could not record its common buffer fill (%d)", rc);
+}
 // CopyStructureCount: a UAV's counter into a buffer, on the GPU in order with the other work.
 static WINAPI void ctx_copy_structure_count(void *this, d3d_buffer *dst, uint32_t offset, d3d_view *v) {
     d3d_context *c = this;
@@ -1867,7 +2502,7 @@ static WINAPI void ctx_copy_structure_count(void *this, d3d_buffer *dst, uint32_
     [blit endEncoding];
     d3d_mark_gpu(c, &dst->base);
 }
-static WINAPI void ctx_clear_uav_uint(void *this, d3d_view *v, const uint32_t *values) { clear_uav(this, v, values[0]); }
+static WINAPI void ctx_clear_uav_uint(void *this, d3d_view *v, const uint32_t *values) { clear_uav_uint(this, v, values); }
 static WINAPI void ctx_clear_uav_float(void *this, d3d_view *v, const float *values) { uint32_t bits; memcpy(&bits, &values[0], 4); clear_uav(this, v, bits); }
 
 // ---- tables -------------------------------------------------------------------------------------------------------------------------

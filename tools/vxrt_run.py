@@ -43,12 +43,36 @@ def installed():
     import vxrt_studio                                          # (game discovery lives there)
     return {g["appid"]: g for g in vxrt_studio.find_games()}
 
+def profile_executable(profile, game):
+    """Apply a profile's explicit install-relative entry executable, without allowing it out of the install folder."""
+    if not profile or "exe" not in profile or not game:
+        return game, None
+    relative = profile["exe"]
+    if not isinstance(relative, str) or not relative:
+        return game, "profile executable must be a nonempty path relative to the install folder"
+    folder = os.path.realpath(game["folder"])
+    executable = os.path.realpath(os.path.join(folder, relative))
+    try:
+        inside = os.path.commonpath((folder, executable)) == folder
+    except ValueError:
+        inside = False
+    if not inside:
+        return game, "profile executable resolves outside the install folder"
+    if not os.path.isfile(executable):
+        return game, "profile executable does not exist: " + relative
+    selected = dict(game)
+    selected["exe"] = executable
+    return selected, None
+
 def resolve(game):
     """(key, profile, installed game) for a profile's key or a Steam app id."""
     inst = installed()
     p = profiles_db.by_key(str(game))
     if p:
-        return p["key"], p, inst.get(p["appid"])
+        selected, error = profile_executable(p, inst.get(p["appid"]))
+        if error and selected:
+            selected = dict(selected, launch_exe_error=error)
+        return p["key"], p, selected
     if game in inst:
         return game, profiles_db.default_profile(game, inst[game]["name"]), inst[game]
     return game, None, None
@@ -66,7 +90,9 @@ def preconditions(spec, game, args, root, overlay, need_steam=True):
     checks = []
     def check(code, ok, detail):
         checks.append({"code": code, "ok": bool(ok), "detail": detail})
-    check("game_installed", spec and game, "found in a Steam library" if game else "not installed (tools/vxrt_steam.py fetch or import) or unknown")
+    entry_error = game.get("launch_exe_error") if game else None
+    check("game_installed", spec and game and not entry_error,
+          entry_error or ("found in a Steam library; entry: " + game["exe"] if game else "not installed (tools/vxrt_steam.py fetch or import) or unknown"))
     busy = pgrep("[b]uild/vxrt") + pgrep("[w]ine.*(vrserver|hlvr)")
     check("user_not_playing", not busy, "no VXRuntime or Wine game/SteamVR running" if not busy else "running: " + "; ".join(b[:120] for b in busy[:3]))
     check("steamvr_not_running", not listening(27062), "port 27062 free" if not listening(27062) else "a SteamVR is listening on 27062")
@@ -269,6 +295,12 @@ def game_log_facts(path, exe):
         elif "called an unimplemented function:" in line:
             fn = line.split("called an unimplemented function:", 1)[1].strip()
             facts["unimplemented"][fn] = facts["unimplemented"].get(fn, 0) + 1; problem = line
+        elif ("not a PE32+ x86-64 image" in line or "CLR hosting is not implemented" in line or
+              "unsupported CIL opcode" in line or "invalid or unsupported ECMA-335 metadata" in line or
+              "CLR image uses a native entry point" in line or
+              "32-bit native execution is not implemented" in line or "unsupported PE machine" in line or
+              (": CLR " in line and "returned" not in line)):
+            problem = line
         elif re.match(r"[A-Za-z_][\w.]*Exception: ", line):
             facts["managed_exceptions"] += 1
             if facts["managed_exceptions"] == 1: problem = line

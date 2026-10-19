@@ -8,6 +8,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include "ui.h"
+#include "gpu_ir.h"
 
 typedef int32_t HRESULT;
 typedef struct { DWORD d1; uint16_t d2, d3; uint8_t d4[8]; } GUID;
@@ -21,6 +22,7 @@ HRESULT d3d_not_implemented(const char *what);    // reports a method once, retu
 #define E_FAIL ((HRESULT)0x80004005)
 #define E_OUTOFMEMORY ((HRESULT)0x8007000E)
 #define E_INVALIDARG ((HRESULT)0x80070057)
+#define DXGI_ERROR_INVALID_CALL ((HRESULT)0x887A0001)
 #define DXGI_ERROR_NOT_FOUND ((HRESULT)0x887A0002)
 #define DXGI_ERROR_UNSUPPORTED ((HRESULT)0x887A0004)
 #define DXGI_ERROR_FRAME_STATISTICS_DISJOINT ((HRESULT)0x887A000B)
@@ -41,6 +43,10 @@ typedef struct d3d_object {
     uint64_t gpu_seq;                // resources: the command buffer (device sequence number) that last copied to or from it
 } d3d_object;
 
+// Common GPU IR wrappers used by the D3D11 immediate-context path. Returned resources are retained.
+gpu_ir_resource *d3d11_gpu_ir_resource(d3d_object *resource);
+void *d3d11_gpu_ir_metal_resource(const gpu_ir_resource *resource);
+
 // `this` of a method called through the second table.
 #define FROM_VTBL2(p) ((d3d_object *)((char *)(p) - offsetof(d3d_object, vtbl2)))
 
@@ -59,6 +65,9 @@ int      d3d_same_guid(const GUID *a, const GUID *b);
 // Formats: the Metal pixel format and bytes per pixel of a DXGI_FORMAT (MTLPixelFormatInvalid if unsupported).
 MTLPixelFormat d3d_mtl_format(uint32_t dxgi, uint32_t *bytes_per_pixel);
 int            d3d_is_srgb(uint32_t dxgi);
+int            d3d_copy_format_block(uint32_t dxgi, uint32_t *block_width, uint32_t *block_height,
+                                      uint32_t *bytes_per_block);
+int            d3d_copy_formats_compatible(uint32_t source, uint32_t destination);
 
 // D3D11_TEXTURE2D_DESC as eleven 32-bit fields.
 enum { TD_WIDTH, TD_HEIGHT, TD_MIPS, TD_ARRAY, TD_FORMAT, TD_SAMPLES, TD_QUALITY, TD_USAGE, TD_BIND, TD_CPU, TD_MISC, TD_COUNT };
@@ -144,6 +153,8 @@ void *d3d_context_cmd(d3d_context *c);                                   // id<M
 extern const d3d_method d3d_draw_device_methods[], d3d_draw_context_methods[];   // d3d11_draw.m
 void d3d_draw_init(void);
 void d3d_draw_release(d3d_context *c);
+int d3d11_record_fill_buffer_pattern(d3d_context *context, d3d_buffer *buffer, uint64_t offset,
+                                    uint64_t size, const void *pattern, uint32_t pattern_size);
 
 d3d_texture *d3d_texture_create(d3d_device *dev, const uint32_t desc[TD_COUNT], HRESULT *hr);
 // Resources shared between processes (d3d11_shared.m): IOSurface textures and shared-memory buffers in a table

@@ -36,7 +36,7 @@ typedef struct {
     volatile int32_t gpu_pending;    // releases whose GPU work has not finished yet (by gpu_pid; others wait for 0)
     volatile int32_t gpu_pid;
 } shared_slot;
-typedef struct { volatile uint32_t spin; shared_slot s[SLOTS]; } shared_table;
+typedef struct { volatile uint32_t spin; uint32_t next; shared_slot s[SLOTS]; } shared_table;   // next: where the search for a free slot starts
 static shared_table *g_table;
 
 static shared_table *table(void) {
@@ -44,7 +44,7 @@ static shared_table *table(void) {
     uint64_t h = 1469598103934665603ull;
     for (const char *c = vx_root(); *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
     char name[32];
-    snprintf(name, sizeof name, "/vxsh2.%08llx", (unsigned long long)(h & 0xffffffffull));   // (2: the slot layout)
+    snprintf(name, sizeof name, "/vxsh3.%08llx", (unsigned long long)(h & 0xffffffffull));   // (3: the slot layout)
     int fd = shm_open(name, O_RDWR | O_CREAT, 0600);
     if (fd < 0) return NULL;
     struct stat st;
@@ -59,12 +59,20 @@ static int take_slot(void) {
     shared_table *t = table();
     if (!t) return -1;
     while (__atomic_exchange_n(&t->spin, 1, __ATOMIC_ACQUIRE)) sched_yield();
+    // Slots are taken in turn, not the lowest free one: a handle freed (or left by a process that ended) is given out
+    // again only after all others, as Windows never hands out a released handle at once. Otherwise another process
+    // that still knows the old handle (SteamVR's compositor caches the textures it opened) takes the new texture for
+    // the old one.
     int found = -1;
-    for (int i = 0; i < SLOTS && found < 0; i++) {
+    for (int k = 0; k < SLOTS && found < 0; k++) {
+        int i = (int)((t->next + (uint32_t)k) % SLOTS);
         if (t->s[i].used && t->s[i].creator && kill(t->s[i].creator, 0) && errno == ESRCH) t->s[i].used = 0;   // its process ended
         if (!t->s[i].used) found = i;
     }
-    if (found >= 0) { memset(&t->s[found], 0, sizeof t->s[found]); t->s[found].used = 1; t->s[found].creator = getpid(); }
+    if (found >= 0) {
+        memset(&t->s[found], 0, sizeof t->s[found]); t->s[found].used = 1; t->s[found].creator = getpid();
+        t->next = (uint32_t)(found + 1) % SLOTS;
+    }
     __atomic_store_n(&t->spin, 0, __ATOMIC_RELEASE);
     return found;
 }
@@ -263,6 +271,10 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
     if (g_keyed_stats < 0) g_keyed_stats = getenv("VXRT_STATS") != NULL;
     d3d_texture *t = keyed_of(this);
     if (!t->shared) return S_OK;
+    // VXRT_KEYED_NO_WAIT=<exe>: that program's AcquireSync never waits (an experiment: whether a wait in it matters)
+    static int no_wait = -1;
+    if (no_wait < 0) { const char *w = getenv("VXRT_KEYED_NO_WAIT"); no_wait = w && vx_proc.argv && vx_proc.argv[0] && strcasestr(vx_proc.argv[0], w); }
+    if (no_wait) return S_OK;
     shared_slot *e = &table()->s[t->shared - 1];
     struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
     int why = 0;                                       // what the first look found missing: 1 the GPU, 2 the key, 3 the owner

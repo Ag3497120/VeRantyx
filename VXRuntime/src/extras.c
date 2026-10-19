@@ -8,8 +8,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <net/if_dl.h>
+#include <net/if.h>
+#include <ifaddrs.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"   // (MD5, for programs that ask for it; nothing secure here)
 #include <CommonCrypto/CommonDigest.h>
 
@@ -257,6 +265,342 @@ static WINAPI LONG HidP_SetUsages(int type, uint16_t page, uint16_t coll, uint16
     (void)type; (void)page; (void)coll; (void)list; (void)n; (void)pre; (void)report; (void)len; return HIDP_STATUS_NOT_IMPLEMENTED;
 }
 
+// ---- what Elite Dangerous (and the Epic Online Services SDK it carries) import and never needs to work for the
+// game to run: string normalization as a copy, no hot keys, no routes, no crash dumps
+static WINAPI int NormalizeString(int form, const WCHAR *src, int src_len, WCHAR *dst, int dst_len) {
+    (void)form;
+    int n = src_len < 0 ? (int)wcslen((const wchar_t *)src) + 1 : src_len;         // (ASCII input is already normalized)
+    if (!dst || !dst_len) return n;
+    if (n > dst_len) { vx_set_last_error(122); return -n; }                       // ERROR_INSUFFICIENT_BUFFER
+    memcpy(dst, src, (size_t)n * sizeof *dst);
+    return n;
+}
+static WINAPI int IdnToAscii(DWORD flags, const WCHAR *src, int src_len, WCHAR *dst, int dst_len) {
+    (void)flags;
+    int n = src_len < 0 ? (int)wcslen((const wchar_t *)src) + 1 : src_len;
+    if (!dst || !dst_len) return n;
+    if (n > dst_len) { vx_set_last_error(122); return 0; }
+    memcpy(dst, src, (size_t)n * sizeof *dst);
+    return n;
+}
+static WINAPI DWORD SearchPathW(const WCHAR *path, const WCHAR *file, const WCHAR *extension, DWORD size, WCHAR *buffer, WCHAR **file_part) {
+    // the file as given when it exists (the launcher's own folder is the working directory); no search of PATH
+    (void)path;
+    DWORD (WINAPI *attributes)(const WCHAR *) = (DWORD (WINAPI *)(const WCHAR *))vx_find_export("kernel32.dll", "GetFileAttributesW");
+    DWORD (WINAPI *full)(const WCHAR *, DWORD, WCHAR *, WCHAR **) = (DWORD (WINAPI *)(const WCHAR *, DWORD, WCHAR *, WCHAR **))vx_find_export("kernel32.dll", "GetFullPathNameW");
+    WCHAR candidate[1024];
+    size_t n = wcslen((const wchar_t *)file);
+    if (n + (extension ? wcslen((const wchar_t *)extension) : 0) + 1 > 1024) { vx_set_last_error(2); return 0; }
+    memcpy(candidate, file, (n + 1) * sizeof *candidate);
+    if (extension && !wcschr((const wchar_t *)file, '.')) memcpy(candidate + n, extension, (wcslen((const wchar_t *)extension) + 1) * sizeof *candidate);
+    if (!attributes || !full || attributes(candidate) == 0xffffffffu) { vx_set_last_error(2); return 0; }     // ERROR_FILE_NOT_FOUND
+    return full(candidate, size, buffer, file_part);
+}
+static WINAPI HANDLE OpenWaitableTimerA(DWORD access, BOOL inherit, const char *name) { (void)access; (void)inherit; (void)name; vx_set_last_error(2); return NULL; }
+static WINAPI BOOL VirtualUnlock(void *address, size_t size) { (void)address; (void)size; return 1; }
+static WINAPI DWORD GetFinalPathNameByHandleW(HANDLE h, WCHAR *buffer, DWORD size, DWORD flags) {
+    (void)h; (void)buffer; (void)size; (void)flags;
+    vx_set_last_error(6);                                                           // ERROR_INVALID_HANDLE: not provided
+    return 0;
+}
+static WINAPI int ToAsciiEx(uint32_t vk, uint32_t scan, const uint8_t *state, uint16_t *out, uint32_t flags, HANDLE layout) {
+    (void)vk; (void)scan; (void)state; (void)out; (void)flags; (void)layout; return 0;
+}
+static WINAPI BOOL UnloadKeyboardLayout(HANDLE layout) { (void)layout; return 1; }
+static WINAPI BOOL RegisterHotKey(HANDLE hwnd, int id, uint32_t modifiers, uint32_t vk) { (void)hwnd; (void)id; (void)modifiers; (void)vk; vx_set_last_error(1409); return 0; }
+static WINAPI BOOL UnregisterHotKey(HANDLE hwnd, int id) { (void)hwnd; (void)id; return 0; }
+static WINAPI int ExtEscape(HANDLE dc, int escape, int in_size, const char *in, int out_size, char *out) {
+    (void)dc; (void)escape; (void)in_size; (void)in; (void)out_size; (void)out; return 0;                   // not supported
+}
+// ---- iphlpapi: the Mac's primary IPv4 interface as the one adapter (Elite Dangerous picks its outbound address with
+// GetBestRoute(223.255.255.255) and reads the adapter's address with GetAdaptersAddresses before it talks to its servers)
+typedef struct { char name[32]; uint32_t ip, mask, index; uint8_t mac[6]; int ok; } primary_interface;
+static primary_interface primary_ipv4_interface(void) {
+    primary_interface p; memset(&p, 0, sizeof p);
+    struct ifaddrs *list = NULL;
+    if (getifaddrs(&list)) return p;
+    // the interface of the default route: the local address a UDP socket connected to a public address gets (nothing
+    // is sent), then its entry in the list; without a route, the first one up with an IPv4 address
+    uint32_t preferred = 0;
+    int probe = socket(AF_INET, SOCK_DGRAM, 0);
+    if (probe >= 0) {
+        struct sockaddr_in far = { .sin_len = sizeof far, .sin_family = AF_INET, .sin_port = htons(53) };
+        far.sin_addr.s_addr = htonl(0x08080808);
+        struct sockaddr_in local; socklen_t local_length = sizeof local;
+        if (!connect(probe, (struct sockaddr *)&far, sizeof far) && !getsockname(probe, (struct sockaddr *)&local, &local_length)) preferred = local.sin_addr.s_addr;
+        close(probe);
+    }
+    for (int pass = preferred ? 0 : 1; pass < 2 && !p.ok; pass++)
+    for (struct ifaddrs *a = list; a && !p.ok; a = a->ifa_next) {
+        if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET || (a->ifa_flags & IFF_LOOPBACK) || !(a->ifa_flags & IFF_UP)) continue;
+        if (pass == 0 && ((struct sockaddr_in *)a->ifa_addr)->sin_addr.s_addr != preferred) continue;
+        snprintf(p.name, sizeof p.name, "%s", a->ifa_name);
+        p.ip = ((struct sockaddr_in *)a->ifa_addr)->sin_addr.s_addr;
+        p.mask = a->ifa_netmask ? ((struct sockaddr_in *)a->ifa_netmask)->sin_addr.s_addr : 0;
+        p.index = if_nametoindex(a->ifa_name);
+        p.ok = 1;
+    }
+    for (struct ifaddrs *a = list; p.ok && a; a = a->ifa_next)
+        if (a->ifa_addr && a->ifa_addr->sa_family == AF_LINK && !strcmp(a->ifa_name, p.name) && ((struct sockaddr_dl *)a->ifa_addr)->sdl_alen == 6)
+            memcpy(p.mac, LLADDR((struct sockaddr_dl *)a->ifa_addr), 6);
+    freeifaddrs(list);
+    return p;
+}
+static WINAPI DWORD GetBestRoute(DWORD destination, DWORD source, DWORD *row) {   // MIB_IPFORWARDROW: 14 DWORDs
+    (void)destination; (void)source;
+    primary_interface p = primary_ipv4_interface();
+    if (!row) return 87;
+    if (!p.ok) return 1168;                                                      // ERROR_NOT_FOUND
+    memset(row, 0, 56);
+    row[3] = (p.ip & p.mask) | htonl(1);                                        // the default route through the network's first address
+    row[4] = p.index; row[5] = 4; row[6] = 3; row[9] = 25;                       // indirect, NETMGMT, metric
+    row[10] = row[11] = row[12] = row[13] = 0xffffffffu;
+    return 0;
+}
+static WINAPI DWORD GetBestInterface(DWORD destination, DWORD *index) {
+    (void)destination;
+    primary_interface p = primary_ipv4_interface();
+    if (!index) return 87;
+    if (!p.ok) return 1168;
+    *index = p.index;
+    return 0;
+}
+static WINAPI DWORD GetIpAddrTable(uint8_t *table, DWORD *size, BOOL order) {   // MIB_IPADDRTABLE: count, then 24-byte rows
+    (void)order;
+    if (!size) return 87;
+    primary_interface p = primary_ipv4_interface();
+    if (!p.ok) return 232;                                                       // ERROR_NO_DATA
+    if (!table || *size < 4 + 2 * 24) { *size = 4 + 2 * 24; return 122; }       // ERROR_INSUFFICIENT_BUFFER
+    memset(table, 0, 4 + 2 * 24);
+    *(uint32_t *)table = 2;
+    uint32_t *row = (uint32_t *)(table + 4);
+    row[0] = p.ip; row[1] = p.index; row[2] = p.mask; row[3] = p.ip | ~p.mask; row[4] = 65535; row[5] = 0x1 << 16;   // primary
+    row += 6;
+    row[0] = htonl(0x7f000001); row[1] = 1; row[2] = htonl(0xff000000); row[3] = htonl(0x7fffffff); row[4] = 65535; row[5] = 0x1 << 16;   // loopback
+    *size = 4 + 2 * 24;
+    return 0;
+}
+static WINAPI DWORD GetNetworkParams(uint8_t *info, DWORD *size) {       // FIXED_INFO (592 bytes): host and DNS names and servers
+    enum { NEED = 592 };
+    if (!size) return 87;
+    if (!info || *size < NEED) { *size = NEED; return 111; }
+    memset(info, 0, NEED);
+    gethostname((char *)info, 128);                                              // HostName[132], DomainName[132] empty
+    char *dot = strchr((char *)info, '.');
+    if (dot) { snprintf((char *)info + 132, 132, "%s", dot + 1); *dot = 0; }
+    *(uint64_t *)(info + 264) = (uint64_t)(uintptr_t)(info + 272);               // CurrentDnsServer -> DnsServerList
+    const char *dns = "8.8.8.8";                                                 // the first nameserver of /etc/resolv.conf, else Google's
+    FILE *resolv = fopen("/etc/resolv.conf", "r");
+    char line[256], server[64] = "";
+    while (resolv && fgets(line, sizeof line, resolv))
+        if (sscanf(line, "nameserver %63s", server) == 1 && strchr(server, '.')) { dns = server; break; }
+    if (resolv) fclose(resolv);
+    snprintf((char *)info + 280, 16, "%s", dns);                                 // DnsServerList.IpAddress (Next NULL)
+    snprintf((char *)info + 296, 16, "255.255.255.255");
+    *(uint32_t *)(info + 312) = 8;                                               // NodeType: hybrid
+    *(uint32_t *)(info + 584) = 1;                                               // EnableDns
+    *size = NEED;
+    return 0;
+}
+static WINAPI DWORD GetAdaptersAddresses(DWORD family, DWORD flags, void *reserved, uint8_t *buffer, DWORD *size) {
+    // IP_ADAPTER_ADDRESSES_LH (448 bytes on x64) + IP_ADAPTER_UNICAST_ADDRESS_LH (64) + a Windows sockaddr_in + the strings
+    // ... and an IP_ADAPTER_GATEWAY_ADDRESS_LH and IP_ADAPTER_DNS_SERVER_ADDRESS (32 bytes each: Length, Next, Address)
+    enum { ADAPTER = 448, UNICAST = 64, SOCKADDR = 32, NAME = 48, WIDE = 64, ENTRY = 32,
+           NEED = ADAPTER + UNICAST + SOCKADDR + NAME + WIDE + WIDE + 8 + 2 * (ENTRY + SOCKADDR) };
+    (void)flags; (void)reserved;
+    if (!size) return 87;
+    primary_interface p = primary_ipv4_interface();
+    if (!p.ok || family == 23) { *size = 0; return 232; }                        // ERROR_NO_DATA (no IPv6 here)
+    if (!buffer || *size < NEED) { *size = NEED; return 111; }                  // ERROR_BUFFER_OVERFLOW
+    memset(buffer, 0, NEED);
+    uint8_t *adapter = buffer, *unicast = buffer + ADAPTER, *address = unicast + UNICAST, *name = address + SOCKADDR,
+            *description = name + NAME, *friendly = description + WIDE, *suffix = friendly + WIDE;
+    snprintf((char *)name, NAME, "{7A0B4C2D-3E1F-4A5B-9C8D-%02X%02X%02X%02X%02X%02X}", p.mac[0], p.mac[1], p.mac[2], p.mac[3], p.mac[4], p.mac[5]);
+    for (int i = 0; i < 8; i++) { ((WCHAR *)description)[i] = (WCHAR)"Ethernet"[i]; ((WCHAR *)friendly)[i] = (WCHAR)"Ethernet"[i]; }
+    address[0] = 2; address[1] = 0; memcpy(address + 4, &p.ip, 4);               // a Windows sockaddr_in: family, port, address
+    *(uint32_t *)unicast = UNICAST; *(uint32_t *)(unicast + 4) = 0;             // Length, Flags
+    *(uint64_t *)(unicast + 16) = (uint64_t)(uintptr_t)address; *(int32_t *)(unicast + 24) = 16;
+    *(uint32_t *)(unicast + 32) = 1; *(uint32_t *)(unicast + 36) = 1; *(uint32_t *)(unicast + 40) = 4;   // manual origins, preferred
+    *(uint32_t *)(unicast + 44) = *(uint32_t *)(unicast + 48) = *(uint32_t *)(unicast + 52) = 0xffffffffu;
+    unicast[56] = (uint8_t)__builtin_popcount(p.mask);
+    *(uint32_t *)adapter = ADAPTER; *(uint32_t *)(adapter + 4) = p.index;
+    *(uint64_t *)(adapter + 16) = (uint64_t)(uintptr_t)name;
+    *(uint64_t *)(adapter + 24) = (uint64_t)(uintptr_t)unicast;
+    *(uint64_t *)(adapter + 56) = (uint64_t)(uintptr_t)suffix;
+    *(uint64_t *)(adapter + 64) = (uint64_t)(uintptr_t)description;
+    *(uint64_t *)(adapter + 72) = (uint64_t)(uintptr_t)friendly;
+    memcpy(adapter + 80, p.mac, 6); *(uint32_t *)(adapter + 88) = 6;
+    *(uint32_t *)(adapter + 96) = 1500; *(uint32_t *)(adapter + 100) = 6; *(uint32_t *)(adapter + 104) = 1;   // Mtu, Ethernet, up
+    *(uint64_t *)(adapter + 184) = *(uint64_t *)(adapter + 192) = 1000000000ull;
+    *(uint32_t *)(adapter + 216) = 25; *(uint32_t *)(adapter + 220) = 25;
+    *(uint64_t *)(adapter + 224) = ((uint64_t)6 << 48) | ((uint64_t)p.index << 24);   // the LUID: type, index
+    *(uint32_t *)(adapter + 248) = 1; *(uint32_t *)(adapter + 268) = 1;        // compartment, dedicated connection
+    *(uint32_t *)(adapter + 92) = 0x80 | 0x4;                                    // Ipv4Enabled, Dhcpv4Enabled
+    // the gateway (the network's first address, the usual home router) and the DNS server
+    uint8_t *gateway = suffix + 8, *gateway_address = gateway + ENTRY, *dns = gateway_address + SOCKADDR, *dns_address = dns + ENTRY;
+    uint32_t gateway_ip = (p.ip & p.mask) | htonl(1), dns_ip = gateway_ip;
+    FILE *resolv = fopen("/etc/resolv.conf", "r");
+    char line[256], server[64];
+    while (resolv && fgets(line, sizeof line, resolv))
+        if (sscanf(line, "nameserver %63s", server) == 1 && strchr(server, '.') && inet_pton(AF_INET, server, &dns_ip) == 1) break;
+    if (resolv) fclose(resolv);
+    *(uint32_t *)gateway = ENTRY; *(uint64_t *)(gateway + 16) = (uint64_t)(uintptr_t)gateway_address; *(int32_t *)(gateway + 24) = 16;
+    gateway_address[0] = 2; memcpy(gateway_address + 4, &gateway_ip, 4);
+    *(uint32_t *)dns = ENTRY; *(uint64_t *)(dns + 16) = (uint64_t)(uintptr_t)dns_address; *(int32_t *)(dns + 24) = 16;
+    dns_address[0] = 2; memcpy(dns_address + 4, &dns_ip, 4);
+    *(uint64_t *)(adapter + 208) = (uint64_t)(uintptr_t)gateway;                 // FirstGatewayAddress
+    *(uint64_t *)(adapter + 48) = (uint64_t)(uintptr_t)dns;                      // FirstDnsServerAddress
+    *size = NEED;
+    return 0;
+}
+static WINAPI BOOL SetupDiGetDeviceInstanceIdW(HANDLE set, void *data, WCHAR *id, DWORD size, DWORD *required) {
+    (void)set; (void)data; (void)id; (void)size; (void)required; vx_set_last_error(6); return 0;
+}
+static WINAPI BOOL MiniDumpWriteDump(HANDLE process, DWORD pid, HANDLE file, int type, void *exception, void *user, void *callback) {
+    (void)process; (void)pid; (void)file; (void)type; (void)exception; (void)user; (void)callback; vx_set_last_error(50); return 0;
+}
+// WSAAddressToString / WSAStringToAddress: IPv4 "a.b.c.d[:port]"
+static int ws_address_text(const uint8_t *address, int length, char *text, size_t capacity) {
+    if (length < 16 || (address[0] | (address[1] << 8)) != 2) return 0;              // AF_INET only
+    uint16_t port = (uint16_t)((address[2] << 8) | address[3]);
+    if (port) snprintf(text, capacity, "%u.%u.%u.%u:%u", address[4], address[5], address[6], address[7], port);
+    else snprintf(text, capacity, "%u.%u.%u.%u", address[4], address[5], address[6], address[7]);
+    return 1;
+}
+static WINAPI int WSAAddressToStringA(const uint8_t *address, DWORD length, void *info, char *out, DWORD *out_length) {
+    char text[64]; (void)info;
+    if (!ws_address_text(address, (int)length, text, sizeof text)) { vx_set_last_error(10047); return -1; }     // WSAEAFNOSUPPORT
+    DWORD need = (DWORD)strlen(text) + 1;
+    if (!out || !out_length || *out_length < need) { if (out_length) *out_length = need; vx_set_last_error(10014); return -1; }
+    memcpy(out, text, need); *out_length = need;
+    return 0;
+}
+static WINAPI int WSAAddressToStringW(const uint8_t *address, DWORD length, void *info, WCHAR *out, DWORD *out_length) {
+    char text[64]; (void)info;
+    if (!ws_address_text(address, (int)length, text, sizeof text)) { vx_set_last_error(10047); return -1; }
+    DWORD need = (DWORD)strlen(text) + 1;
+    if (!out || !out_length || *out_length < need) { if (out_length) *out_length = need; vx_set_last_error(10014); return -1; }
+    for (DWORD i = 0; i < need; i++) out[i] = (WCHAR)text[i];
+    *out_length = need;
+    return 0;
+}
+static int ws_address_parse(const char *text, int family, uint8_t *address, int *length) {
+    unsigned a, b, c, d, port = 0;
+    if (family != 2 || !length || *length < 16 || sscanf(text, "%u.%u.%u.%u:%u", &a, &b, &c, &d, &port) < 4 || a > 255 || b > 255 || c > 255 || d > 255 || port > 65535) return 0;
+    memset(address, 0, 16);
+    address[0] = 2; address[2] = (uint8_t)(port >> 8); address[3] = (uint8_t)port;
+    address[4] = (uint8_t)a; address[5] = (uint8_t)b; address[6] = (uint8_t)c; address[7] = (uint8_t)d;
+    *length = 16;
+    return 1;
+}
+static WINAPI int WSAStringToAddressA(const char *text, int family, void *info, uint8_t *address, int *length) {
+    (void)info;
+    if (!ws_address_parse(text, family, address, length)) { vx_set_last_error(10022); return -1; }           // WSAEINVAL
+    return 0;
+}
+static WINAPI int WSAStringToAddressW(const WCHAR *text, int family, void *info, uint8_t *address, int *length) {
+    char narrow[64]; size_t i = 0; (void)info;
+    for (; i < 63 && text && text[i]; i++) narrow[i] = (char)text[i];
+    narrow[i] = 0;
+    if (!ws_address_parse(narrow, family, address, length)) { vx_set_last_error(10022); return -1; }
+    return 0;
+}
+// A socket's overlapped operations complete through the same OVERLAPPED bookkeeping as a file's (net.c calls
+// vx_io_completed), so the socket result is the file result; sockets report no completion flags.
+static WINAPI BOOL WSAGetOverlappedResult(uintptr_t s, void *overlapped, DWORD *transferred, BOOL wait, DWORD *flags) {
+    static BOOL (WINAPI *result)(HANDLE, const void *, DWORD *, BOOL);
+    if (!result) result = (BOOL (WINAPI *)(HANDLE, const void *, DWORD *, BOOL))vx_find_export("kernel32.dll", "GetOverlappedResult");
+    if (flags) *flags = 0;
+    return result((HANDLE)s, overlapped, transferred, wait);
+}
+// the Epic Online Services SDK's credential store, certificate, LDAP and trust imports: nothing stored, nothing
+// verified (its servers are not reached from here), each answered with the API's "not available" result
+static WINAPI BOOL CredReadW(const WCHAR *target, DWORD type, DWORD flags, void **credential) { (void)target; (void)type; (void)flags; if (credential) *credential = NULL; vx_set_last_error(1168); return 0; }
+static WINAPI BOOL CredWriteW(void *credential, DWORD flags) { (void)credential; (void)flags; vx_set_last_error(5); return 0; }
+static WINAPI BOOL CredDeleteW(const WCHAR *target, DWORD type, DWORD flags) { (void)target; (void)type; (void)flags; vx_set_last_error(1168); return 0; }
+static WINAPI void CredFree(void *buffer) { (void)buffer; }
+static WINAPI BOOL CryptDecrypt(uintptr_t key, uintptr_t hash, BOOL final, DWORD flags, uint8_t *data, DWORD *length) { (void)key; (void)hash; (void)final; (void)flags; (void)data; (void)length; vx_set_last_error(0x80090016); return 0; }
+static WINAPI BOOL CryptEnumProvidersW(DWORD index, DWORD *reserved, DWORD flags, DWORD *type, WCHAR *name, DWORD *length) { (void)index; (void)reserved; (void)flags; (void)type; (void)name; (void)length; vx_set_last_error(259); return 0; }
+static WINAPI BOOL CryptExportKey(uintptr_t key, uintptr_t exp, DWORD type, DWORD flags, uint8_t *data, DWORD *length) { (void)key; (void)exp; (void)type; (void)flags; (void)data; (void)length; vx_set_last_error(0x80090016); return 0; }
+static WINAPI BOOL CryptGetProvParam(uintptr_t prov, DWORD param, uint8_t *data, DWORD *length, DWORD flags) { (void)prov; (void)param; (void)data; (void)length; (void)flags; vx_set_last_error(0x80090017); return 0; }
+static WINAPI BOOL CryptGetUserKey(uintptr_t prov, DWORD spec, uintptr_t *key) { (void)prov; (void)spec; if (key) *key = 0; vx_set_last_error(0x8009000D); return 0; }
+static WINAPI BOOL CryptSetHashParam(uintptr_t hash, DWORD param, const uint8_t *data, DWORD flags) { (void)hash; (void)param; (void)data; (void)flags; vx_set_last_error(0x80090017); return 0; }
+static WINAPI BOOL CryptSignHashW(uintptr_t hash, DWORD spec, const WCHAR *description, DWORD flags, uint8_t *signature, DWORD *length) { (void)hash; (void)spec; (void)description; (void)flags; (void)signature; (void)length; vx_set_last_error(0x8009000D); return 0; }
+static WINAPI BOOL CertGetCertificateContextProperty(const void *context, DWORD property, void *data, DWORD *length) { (void)context; (void)property; (void)data; (void)length; vx_set_last_error(0x80092004); return 0; }
+static WINAPI DWORD CertGetNameStringW(const void *context, DWORD type, DWORD flags, void *parameter, WCHAR *name, DWORD length) { (void)context; (void)type; (void)flags; (void)parameter; if (name && length) name[0] = 0; return 1; }
+static WINAPI BOOL CryptMsgGetParam(void *message, DWORD type, DWORD index, void *data, DWORD *length) { (void)message; (void)type; (void)index; (void)data; (void)length; vx_set_last_error(0x80092004); return 0; }
+static WINAPI BOOL CryptQueryObject(DWORD object_type, const void *object, DWORD expected, DWORD flags, DWORD *encoding, DWORD *content, DWORD *format, void **store, void **message, const void **context) {
+    (void)object_type; (void)object; (void)expected; (void)flags; (void)encoding; (void)content; (void)format;
+    if (store) *store = NULL; if (message) *message = NULL; if (context) *context = NULL;
+    vx_set_last_error(0x80092009); return 0;                                    // CRYPT_E_NO_MATCH
+}
+static WINAPI int32_t CompleteAuthToken(void *context, void *token) { (void)context; (void)token; return (int32_t)0x80090302; }   // SEC_E_UNSUPPORTED_FUNCTION
+static WINAPI int32_t WinVerifyTrust(HANDLE hwnd, void *action, void *data) { (void)hwnd; (void)action; (void)data; return (int32_t)0x800B0100; }   // TRUST_E_NOSIGNATURE
+static WINAPI DWORD ldap_unavailable(void) { return 0x51; }                       // LDAP_SERVER_DOWN, for every wldap32 ordinal
+static uint8_t ws_tcp_name[] = "tcp", ws_udp_name[] = "udp";
+static char *ws_no_alias[] = { NULL };
+static struct { char *name; char **aliases; int16_t proto; } ws_tcp = { (char *)ws_tcp_name, ws_no_alias, 6 }, ws_udp = { (char *)ws_udp_name, ws_no_alias, 17 };
+static WINAPI void *ws_getprotobyname(const char *name) {
+    if (name && !strcasecmp(name, "tcp")) return &ws_tcp;
+    if (name && !strcasecmp(name, "udp")) return &ws_udp;
+    vx_set_last_error(11004); return NULL;
+}
+static const vx_export advapi32_ed[] = { VX_EXPORT(CredReadW), VX_EXPORT(CredWriteW), VX_EXPORT(CredDeleteW), VX_EXPORT(CredFree), VX_EXPORT(CryptDecrypt), VX_EXPORT(CryptEnumProvidersW),
+                                         VX_EXPORT(CryptExportKey), VX_EXPORT(CryptGetProvParam), VX_EXPORT(CryptGetUserKey), VX_EXPORT(CryptSetHashParam), VX_EXPORT(CryptSignHashW) };
+static const vx_export crypt32_ed[] = { VX_EXPORT(CertGetCertificateContextProperty), VX_EXPORT(CertGetNameStringW), VX_EXPORT(CryptMsgGetParam), VX_EXPORT(CryptQueryObject) };
+static const vx_export secur32_ed[] = { VX_EXPORT(CompleteAuthToken) };
+static const vx_export wintrust_ed[] = { VX_EXPORT(WinVerifyTrust) };
+static const vx_export wldap32_ed[] = { { "#27", (void *)ldap_unavailable }, { "#30", (void *)ldap_unavailable }, { "#32", (void *)ldap_unavailable }, { "#33", (void *)ldap_unavailable },
+                                        { "#35", (void *)ldap_unavailable }, { "#41", (void *)ldap_unavailable }, { "#46", (void *)ldap_unavailable }, { "#50", (void *)ldap_unavailable },
+                                        { "#60", (void *)ldap_unavailable }, { "#79", (void *)ldap_unavailable }, { "#143", (void *)ldap_unavailable }, { "#200", (void *)ldap_unavailable },
+                                        { "#211", (void *)ldap_unavailable }, { "#301", (void *)ldap_unavailable } };
+static const vx_export ws2_32_proto[] = { { "getprotobyname", (void *)ws_getprotobyname }, { "#53", (void *)ws_getprotobyname } };
+// process mitigation policies (looked up with GetProcAddress and called without a check): nothing is enabled
+static WINAPI BOOL GetProcessMitigationPolicy(HANDLE process, int policy, void *buffer, size_t length) {
+    (void)process; (void)policy;
+    if (buffer && length) memset(buffer, 0, length);
+    return 1;
+}
+static WINAPI BOOL SetProcessMitigationPolicy(int policy, void *buffer, size_t length) { (void)policy; (void)buffer; (void)length; return 1; }
+// looked up by name at start-up and called unchecked: thread information classes are accepted (ThreadHideFromDebugger
+// included: there is no debugger to hide from), DLL directories are remembered as a cookie, the newer allocation and
+// temp-path entry points forward to the older ones
+static WINAPI int32_t NtSetInformationThread(HANDLE thread, int class_, const void *information, DWORD length) { (void)thread; (void)class_; (void)information; (void)length; return 0; }
+static WINAPI void *AddDllDirectory(const WCHAR *directory) { (void)directory; static int cookie; return &cookie; }
+static WINAPI BOOL RemoveDllDirectory(void *cookie) { (void)cookie; return 1; }
+static WINAPI DWORD GetTempPath2W(DWORD length, WCHAR *buffer) {
+    DWORD (WINAPI *temp_path)(DWORD, WCHAR *) = (DWORD (WINAPI *)(DWORD, WCHAR *))vx_find_export("kernel32.dll", "GetTempPathW");
+    return temp_path ? temp_path(length, buffer) : 0;
+}
+static WINAPI void *VirtualAlloc2(HANDLE process, void *address, size_t size, DWORD type, DWORD protection, void *parameters, DWORD parameter_count) {
+    (void)process; (void)parameters; (void)parameter_count;
+    void *(WINAPI *allocate)(void *, size_t, DWORD, DWORD) = (void *(WINAPI *)(void *, size_t, DWORD, DWORD))vx_find_export("kernel32.dll", "VirtualAlloc");
+    return allocate ? allocate(address, size, type, protection) : NULL;
+}
+// the volume behind a mount point: one fixed volume name for every drive (looked up, then called unchecked by Elite Dangerous)
+static const char volume_name[] = "\\\\?\\Volume{3f4e8c2a-9b1d-4c6e-8a7f-1d2e3f4a5b6c}\\";
+static WINAPI BOOL GetVolumeNameForVolumeMountPointA(const char *mount_point, char *name, DWORD length) {
+    (void)mount_point;
+    if (!name || length < sizeof volume_name) { vx_set_last_error(234); return 0; }   // ERROR_MORE_DATA
+    memcpy(name, volume_name, sizeof volume_name);
+    return 1;
+}
+static WINAPI BOOL GetVolumeNameForVolumeMountPointW(const WCHAR *mount_point, WCHAR *name, DWORD length) {
+    (void)mount_point;
+    if (!name || length < sizeof volume_name) { vx_set_last_error(234); return 0; }
+    for (size_t i = 0; i < sizeof volume_name; i++) name[i] = (WCHAR)volume_name[i];
+    return 1;
+}
+static const vx_export ntdll_ed[] = { VX_EXPORT(NtSetInformationThread) };
+static const vx_export kernel32_ed[] = { VX_EXPORT(GetVolumeNameForVolumeMountPointA), VX_EXPORT(GetVolumeNameForVolumeMountPointW), VX_EXPORT(AddDllDirectory), VX_EXPORT(RemoveDllDirectory), VX_EXPORT(GetTempPath2W), VX_EXPORT(VirtualAlloc2), VX_EXPORT(GetProcessMitigationPolicy), VX_EXPORT(SetProcessMitigationPolicy), VX_EXPORT(NormalizeString), VX_EXPORT(SearchPathW), VX_EXPORT(OpenWaitableTimerA), VX_EXPORT(VirtualUnlock), VX_EXPORT(GetFinalPathNameByHandleW) };
+static const vx_export user32_ed[] = { VX_EXPORT(ToAsciiEx), VX_EXPORT(UnloadKeyboardLayout), VX_EXPORT(RegisterHotKey), VX_EXPORT(UnregisterHotKey) };
+static const vx_export gdi32_ed[] = { VX_EXPORT(ExtEscape) };
+static const vx_export iphlpapi_ed[] = { VX_EXPORT(GetBestRoute), VX_EXPORT(GetBestInterface), VX_EXPORT(GetAdaptersAddresses), VX_EXPORT(GetIpAddrTable), VX_EXPORT(GetNetworkParams) };
+static const vx_export setupapi_ed[] = { VX_EXPORT(SetupDiGetDeviceInstanceIdW) };
+static const vx_export dbghelp_ed[] = { VX_EXPORT(MiniDumpWriteDump) };
+static const vx_export normaliz_ed[] = { VX_EXPORT(IdnToAscii) };
+static const vx_export ws2_32_ed[] = { VX_EXPORT(WSAAddressToStringA), VX_EXPORT(WSAAddressToStringW), VX_EXPORT(WSAStringToAddressA), VX_EXPORT(WSAStringToAddressW), VX_EXPORT(WSAGetOverlappedResult) };
+
 static const vx_export kernel32_more[] = {
     VX_EXPORT(GetSystemTimes), VX_EXPORT(InitializeProcThreadAttributeList),
     VX_EXPORT(UpdateProcThreadAttribute), VX_EXPORT(DeleteProcThreadAttributeList),
@@ -313,6 +657,10 @@ void vx_extras_init(void) {
     MORE("kernel32.dll", kernel32_more); MORE("kernelbase.dll", kernel32_more); MORE("user32.dll", user32_more);
     MORE("advapi32.dll", advapi32_more); MORE("shlwapi.dll", shlwapi_more); MORE("shell32.dll", shell32_more);
     MORE("winmm.dll", winmm_more); MORE("ws2_32.dll", ws2_32_more); MORE("hid.dll", hid_more);
+    MORE("kernel32.dll", kernel32_ed); MORE("kernelbase.dll", kernel32_ed); MORE("user32.dll", user32_ed); MORE("gdi32.dll", gdi32_ed);
+    MORE("iphlpapi.dll", iphlpapi_ed); MORE("setupapi.dll", setupapi_ed); MORE("dbghelp.dll", dbghelp_ed); MORE("normaliz.dll", normaliz_ed);
+    MORE("ws2_32.dll", ws2_32_ed); MORE("ws2_32.dll", ws2_32_proto); MORE("advapi32.dll", advapi32_ed); MORE("crypt32.dll", crypt32_ed);
+    MORE("secur32.dll", secur32_ed); MORE("wintrust.dll", wintrust_ed); MORE("wldap32.dll", wldap32_ed); MORE("ntdll.dll", ntdll_ed);
 #undef MORE
 }
 

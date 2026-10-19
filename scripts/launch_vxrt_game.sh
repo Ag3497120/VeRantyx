@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Any Windows SteamVR game on VXRuntime: SteamVR (with the encoder) as scripts/launch_vxrt_steamvr.sh starts it,
 # then the game, until the game exits or Ctrl-C. Half-Life: Alyx has its own launcher (launch_vxrt_alyx.sh).
+# VXRT_GAME_CONTROL (and optionally VXRT_GAME_CONTROL_LOG) enables Command Clips for only the game process;
+# SteamVR's helper processes do not claim that socket.
 #
 #   scripts/launch_vxrt_game.sh "<path to the game's .exe>" [game arguments...]
 #   VXRT_VR_QUALITY=3k scripts/launch_vxrt_game.sh ~/Verantyx_VR_Drive/vxrt_library/450390/TheLab/win64/TheLab.exe
@@ -86,11 +88,16 @@ echo "SteamVR on VXRuntime is up; starting $EXE_NAME${APP_ID:+ (Steam app $APP_I
 [[ "${VERANTYX_ALVR:-0}" == 1 && -n "${VXRT_VR_QUALITY:-}" ]] && echo "ALVR with VXRT_VR_QUALITY=$VXRT_VR_QUALITY: if turning your head warps the picture, the game runs too far below the headset's rate; leave VXRT_VR_QUALITY out for ALVR's lighter defaults"
 
 cd "$GAME_DIR"
+# Keep the optional control socket scoped to the game. SteamVR is already running in separate VXRuntime
+# processes, and sharing the same Unix socket path would let those processes replace each other's endpoint.
+GAME_ENV=("VXRT_ROOT=$VXRT_VR_ROOT" "VXRT_OVERLAY=$OVERLAY" "VXRT_DLL_PATH=$VXRT_DLL_DIRS"
+    "VXRT_STEAM_BRIDGE=1" "VXRT_NO_ACTIVATE=1" "VXRT_DEBUGGER=1" "VXRT_DEBUG_OUTPUT=1"
+    "VXRT_LOG_TIME=1")
+if [[ -n "${VXRT_GAME_CONTROL:-}" ]]; then GAME_ENV+=("VXRT_CONTROL=$VXRT_GAME_CONTROL"); fi
+if [[ -n "${VXRT_GAME_CONTROL_LOG:-}" ]]; then GAME_ENV+=("VXRT_CONTROL_LOG=$VXRT_GAME_CONTROL_LOG"); fi
+if [[ -n "$APP_ID" ]]; then GAME_ENV+=("SteamAppId=$APP_ID" "SteamGameId=$APP_ID"); fi
 # The game's own debug output (VXRT_DEBUGGER, VXRT_DEBUG_OUTPUT) goes to the log with the time: why it quit, if it does.
-env VXRT_ROOT="$VXRT_VR_ROOT" VXRT_OVERLAY="$OVERLAY" VXRT_DLL_PATH="$VXRT_DLL_DIRS" \
-    VXRT_STEAM_BRIDGE=1 VXRT_NO_ACTIVATE=1 VXRT_DEBUGGER=1 VXRT_DEBUG_OUTPUT=1 VXRT_LOG_TIME=1 \
-    ${APP_ID:+SteamAppId=$APP_ID SteamGameId=$APP_ID} \
-    "$VXRT" "$EXE_NAME" "$@" >"$LOG" 2>&1 &
+env "${GAME_ENV[@]}" "$VXRT" "$EXE_NAME" "$@" >"$LOG" 2>&1 &
 GAME_PID=$!
 wait "$GAME_PID" || true
 GAME_PID=

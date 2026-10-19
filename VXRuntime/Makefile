@@ -1,16 +1,16 @@
 # vxrt: the VeRantyx Windows runtime. An x86-64 macOS binary; Rosetta 2 runs it and the Windows program together.
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
-SRC     = src/loader.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/extras.c src/context.S src/text.c src/files.c src/registry.c \
-          src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d12.m src/dxil.c src/dxil_msl.c src/input.m src/audio.m src/xaudio2.m
+SRC     = src/loader.c src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src/dotnet_baml.c src/dotnet_il.c src/dotnet_exec.c src/dotnet_runtime.c src/dotnet_host.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/winhttp.m src/directinput.m src/extras.c src/context.S src/text.c src/files.c src/registry.c \
+          src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d12.m src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/dxil.c src/dxil_msl.c src/dxil_ir.c src/spirv.c src/spirv_ir.c src/vulkan.c src/directinput_buffer.c src/directinput_format.c src/input.m src/audio.m src/xaudio2.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
 
-build/vxrt: $(SRC) src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
+build/vxrt: $(SRC) src/vx.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -fobjc-arc -o $@ $(SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -Wl,-pagezero_size,0x10000
+	$(CC) $(CFLAGS) -fobjc-arc -o $@.tmp $(SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -Wl,-pagezero_size,0x10000 -licucore -lz && mv -f $@.tmp $@
 
 # The ARM64 build (phase 4, TRANSLATOR.md): the same runtime as ARM64 code, the program run by the translator's
 # engine in the process. Thunks for every ms_abi function come from the sources' C signatures (tools/vx_thunks.py).
@@ -27,13 +27,13 @@ build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator
 build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
 	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
-build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/vx.h src/ui.h src/d3d_common.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
-	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework Hypervisor build/libvxrt_vm.dylib build/guest.o
+build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
+	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework Hypervisor build/libvxrt_vm.dylib build/guest.o -licucore
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
-tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/breakpoint.exe \
+tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe
+       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -55,8 +55,17 @@ build/lowmem.exe: tests/lowmem.c
 build/hw_exceptions.exe: tests/hw_exceptions.c
 	@mkdir -p build
 	$(MINGW) -O1 -static -o $@ $<
+# __try/__except is MSVC's extension: clang compiles it for the MinGW target (gcc has no __try), MinGW links it
+build/seh_try.exe: tests/seh_try.c
+	@mkdir -p build
+	clang --target=x86_64-w64-mingw32 -fms-extensions -O1 -isystem $(shell $(MINGW) -print-sysroot)/x86_64-w64-mingw32/include -c -o build/seh_try.o $<
+	$(MINGW) -static -o $@ build/seh_try.o
 
 build/breakpoint.exe: tests/breakpoint.c
+	@mkdir -p build
+	$(MINGW) -O1 -static -o $@ $<
+
+build/child_stdout.exe: tests/child_stdout.c
 	@mkdir -p build
 	$(MINGW) -O1 -static -o $@ $<
 
@@ -87,6 +96,14 @@ build/shoplist.exe: tests/shoplist.c
 build/net.exe: tests/net.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lws2_32
+
+build/winhttp.exe: tests/winhttp.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lwinhttp -lws2_32
+
+build/directinput.exe: tests/directinput.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -ldinput8 -ldxguid
 
 # MSVC-ABI test programs: compiled by clang for x86_64-pc-windows-msvc, linked by MinGW's linker against import
 # libraries of this runtime's DLLs, without any C runtime.
@@ -215,6 +232,62 @@ build/dxilrun: tools/dxilrun.m src/dxil_msl.c src/dxil_msl.h src/dxil.c src/dxil
 	@mkdir -p build
 	$(CC) -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0 -fobjc-arc -o $@ tools/dxilrun.m src/dxil_msl.c src/dxil.c -framework Metal -framework Foundation
 
+build/dxil_msl_test: src/dxil_msl.c src/dxil_msl.h src/dxil.c src/dxil.h tests/dxil_msl.c tests/shaders12/bindless_ps.dxil tests/shaders12/samplegrad_ps.dxil tests/shaders12/cmp_ps.dxil tests/shaders12/sum_cs.dxil
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/dxil_msl.c src/dxil.c tests/dxil_msl.c
+
+build/dxil_ir_test: src/dxil_ir.c src/dxil_ir.h src/dxil.c src/dxil.h src/gpu_ir.c src/gpu_ir.h src/gpu_ir_msl.c src/gpu_ir_msl.h tests/dxil_ir.c tests/shaders12/typed_buffer_cs.dxil tests/shaders12/typed_sint_buffer_cs.dxil tests/shaders12/typed_float_buffer_cs.dxil tests/shaders12/signed_conversion_cs.dxil
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/dxil_ir.c src/dxil.c src/gpu_ir.c src/gpu_ir_msl.c tests/dxil_ir.c
+
+build/dxil_core_compute.metal: build/dxil_ir_test
+	build/dxil_ir_test --write-core-compute $@
+
+build/dxil_core_compute.air: build/dxil_core_compute.metal
+	xcrun -sdk macosx metal -c $< -o $@
+
+build/dxil_bit_intrinsics.metal: build/dxil_ir_test
+	build/dxil_ir_test --write-bit-intrinsics $@
+
+build/dxil_bit_intrinsics.air: build/dxil_bit_intrinsics.metal
+	xcrun -sdk macosx metal -c $< -o $@
+
+build/dxil_typed_buffer.metal: build/dxil_ir_test tests/shaders12/typed_buffer_cs.dxil
+	build/dxil_ir_test --write-typed-buffer $@
+
+build/dxil_typed_buffer.air: build/dxil_typed_buffer.metal
+	xcrun -sdk macosx metal -c $< -o $@
+
+build/dxil_typed_sint_buffer.metal: build/dxil_ir_test tests/shaders12/typed_sint_buffer_cs.dxil
+	build/dxil_ir_test --write-typed-sint-buffer $@
+
+build/dxil_typed_sint_buffer.air: build/dxil_typed_sint_buffer.metal
+	xcrun -sdk macosx metal -c $< -o $@
+
+build/dxil_typed_float_buffer.metal: build/dxil_ir_test tests/shaders12/typed_buffer_cs.dxil
+	build/dxil_ir_test --write-typed-float-buffer $@
+
+build/dxil_typed_float_buffer.air: build/dxil_typed_float_buffer.metal
+	xcrun -sdk macosx metal -c $< -o $@
+
+build/dxil_signed_conversions.metal: build/dxil_ir_test tests/shaders12/signed_conversion_cs.dxil
+	build/dxil_ir_test --write-signed-conversions $@
+
+build/dxil_signed_conversions.air: build/dxil_signed_conversions.metal
+	xcrun -sdk macosx metal -c $< -o $@
+
+build/dxil_typed_float_real.metal: build/dxil_ir_test tests/shaders12/typed_float_buffer_cs.dxil
+	build/dxil_ir_test --write-typed-float-dxil $@
+
+build/dxil_typed_float_real.air: build/dxil_typed_float_real.metal
+	xcrun -sdk macosx metal -c $< -o $@
+
+build/dxil_unary_intrinsics.metal: build/dxil_ir_test
+	build/dxil_ir_test --write-unary-intrinsics $@
+
+build/dxil_unary_intrinsics.air: build/dxil_unary_intrinsics.metal
+	xcrun -sdk macosx metal -c $< -o $@
+
 build/dxc.exe: tools/dxc.cpp
 	@mkdir -p build
 	$(MINGWXX) -O1 -static -o $@ $<
@@ -227,9 +300,13 @@ build/compute.exe: tests/compute.c tests/shaders/*.h
 	@mkdir -p build
 	$(MINGW) -O1 -Itests -o $@ $< -ld3d11 -ldxguid -luuid -lm
 
-build/d3d12.exe: tests/d3d12.c tests/shaders12/sum_cs.dxil tests/shaders12/tri_vs.dxil tests/shaders12/tri_ps.dxil
+build/d3d12.exe: tests/d3d12.c tests/shaders12/sum_cs.dxil tests/shaders12/tri_vs.dxil tests/shaders12/tri_ps.dxil tests/shaders12/cmp_ps.dxil tests/shaders12/gather_ps.dxil tests/shaders12/gather_cmp_ps.dxil tests/shaders12/dim_ps.dxil tests/shaders12/dim1da_ps.dxil tests/shaders12/typed_buffer_cs.dxil tests/shaders12/typed_sint_buffer_cs.dxil tests/shaders12/signed_conversion_cs.dxil tests/shaders12/typed_float_buffer_cs.dxil tests/shaders12/atomic_resources_cs.dxil tests/shaders12/texload_bounds_cs.dxil tests/shaders12/wave_ops_cs.dxil tests/shaders12/wave_ops_partial_cs.dxil
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d12 -ldxgi -lm
+
+build/d3d12_view_test: src/d3d12_view.h tests/d3d12_view.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ tests/d3d12_view.c
 
 build/input.exe: tests/input.c
 	@mkdir -p build
@@ -291,7 +368,7 @@ shaders: build/vxrt build/hlslc.exe
 # beside SteamVR's vrwebhelper), with dxcompiler's own disassembly of each as the reference tools/dxil_check.py reads
 # src/dxil.c's reading against. tests/shaders12/*.dxil and *.dis.txt are kept in the repository; regenerate with
 #   make shaders12 DXCOMPILER='Z:\path\to\dxcompiler.dll'
-SHADERS12 = color_ps:ps_6_0 tex_ps:ps_6_0 sum_cs:cs_6_0 color_vs:vs_6_0 bindless_ps:ps_6_6 tri_vs:vs_6_0 tri_ps:ps_6_0 texq_vs:vs_6_0 texq_ps:ps_6_0
+SHADERS12 = color_ps:ps_6_0 tex_ps:ps_6_0 sum_cs:cs_6_0 color_vs:vs_6_0 bindless_ps:ps_6_6 tri_vs:vs_6_0 tri_ps:ps_6_0 texq_vs:vs_6_0 texq_ps:ps_6_0 cmp_ps:ps_6_0 gather_ps:ps_6_0 gather_cmp_ps:ps_6_0 dim_ps:ps_6_0 dim1da_ps:ps_6_0 vector_math_ps:ps_6_0 samplegrad_ps:ps_6_0 atomic_resources_cs:cs_6_0 texload_bounds_cs:cs_6_0 signed_conversion_cs:cs_6_0 typed_sint_buffer_cs:cs_6_0 typed_float_buffer_cs:cs_6_0 wave_ops_cs:cs_6_5 wave_ops_partial_cs:cs_6_5
 shaders12: build/vxrt build/dxc.exe
 	@for s in $(SHADERS12); do n=$${s%%:*}; p=$${s##*:}; \
 	  VXRT_ROOT=build/root build/vxrt build/dxc.exe '$(DXCOMPILER)' tests/shaders12/$$n.hlsl main $$p tests/shaders12/$$n.h $$n || exit 1; \
@@ -303,17 +380,162 @@ vr-check: build/vxrt
 	python3 ../tools/vxrt_run.py --baselines $(GAME)
 
 # The tests' C: drive and registry live in build/root, not in ~/.vxrt.
+build/gpu_ir_test: src/gpu_ir.c src/gpu_ir.h tests/gpu_ir.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/gpu_ir.c tests/gpu_ir.c
+
+# SPIR-V -> common shader IR -> MSL is exercised by dispatching a storage-buffer compute kernel on Metal.
+build/spirv_msl_test: src/gpu_ir.c src/gpu_ir.h src/gpu_ir_msl.c src/gpu_ir_msl.h src/gpu_ir_metal.m src/gpu_ir_metal.h src/spirv.c src/spirv.h src/spirv_ir.c src/spirv_ir.h tests/spirv_msl.m
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -fobjc-arc -o $@ src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/spirv.c src/spirv_ir.c tests/spirv_msl.m -framework Metal -framework Foundation
+
+build/spirv_loop.metal: build/spirv_msl_test
+	build/spirv_msl_test --emit-loop $@
+
+build/spirv_helper.metal: build/spirv_msl_test
+	build/spirv_msl_test --emit-helper $@
+
+build/spirv_helper_capture.metal: build/spirv_msl_test
+	build/spirv_msl_test --emit-helper-capture $@
+
+build/vulkan_spirv_fixture.spv: build/spirv_msl_test
+	build/spirv_msl_test --write-fixture $@
+
+build/vulkan_spirv_array_fixture.spv: build/spirv_msl_test
+	build/spirv_msl_test --write-array-fixture $@
+
+build/vulkan_spirv_uniform_fixture.spv: build/spirv_msl_test
+	build/spirv_msl_test --write-uniform-fixture $@
+
+build/vulkan_spirv_push_fixture.spv: build/spirv_msl_test
+	build/spirv_msl_test --write-push-fixture $@
+
+build/vulkan_spirv_storage_image_fixture.spv: build/spirv_msl_test
+	build/spirv_msl_test --write-storage-image-fixture $@
+
+build/vulkan_spirv_sampled_image_fixture.spv: build/spirv_msl_test
+	build/spirv_msl_test --write-sampled-image-fixture $@
+
+build/vulkan_spirv_sampler_fixture.spv: build/spirv_msl_test
+	build/spirv_msl_test --write-sampler-fixture $@
+
+build/vulkan_spirv_separate_sampler_fixture.spv: build/spirv_msl_test
+	build/spirv_msl_test --write-separate-sampler-fixture $@
+
+# Translate a compute SPIR-V module through the in-tree reader, common IR and MSL emitter.
+build/spirv2msl: tools/spirv2msl.m src/gpu_ir.c src/gpu_ir.h src/gpu_ir_msl.c src/gpu_ir_msl.h src/spirv.c src/spirv.h src/spirv_ir.c src/spirv_ir.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -Isrc -fobjc-arc -o $@ src/gpu_ir.c src/gpu_ir_msl.c src/spirv.c src/spirv_ir.c tools/spirv2msl.m -framework Metal -framework Foundation
+
+# SPIR-V's binary word reader (Vulkan shaders): header, byte order and instruction framing.
+build/spirv_test: src/spirv.c src/spirv.h src/spirv_ir.c src/spirv_ir.h src/gpu_ir.c src/gpu_ir.h tests/spirv.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/spirv.c src/spirv_ir.c src/gpu_ir.c tests/spirv.c
+
+# DirectInput's buffered event queue is independent from host HID enumeration and can be tested without a joystick.
+build/directinput_buffer_test: src/directinput_buffer.c src/directinput_buffer.h tests/directinput_buffer.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/directinput_buffer.c tests/directinput_buffer.c
+
+# DirectInput's standard and custom data formats can be resolved against synthetic HID inventories without hardware.
+build/directinput_format_test: src/directinput_format.c src/directinput_format.h tests/directinput_format.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/directinput_format.c tests/directinput_format.c
+
+build/pe_test: src/pe.c src/pe.h tests/pe.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/pe.c tests/pe.c
+
+build/dotnet_eh_test: src/pe.c src/pe.h src/dotnet_metadata.c src/dotnet_metadata.h src/dotnet_resources.c src/dotnet_resources.h src/dotnet_baml.c src/dotnet_baml.h src/dotnet_il.c src/dotnet_il.h src/dotnet_exec.c src/dotnet_runtime.c src/dotnet_exec.h tests/dotnet_eh.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src/dotnet_baml.c src/dotnet_il.c src/dotnet_exec.c src/dotnet_runtime.c tests/dotnet_eh.c -framework CoreFoundation -framework CoreServices -licucore -lz
+
+build/dotnet_metadata_test: src/pe.c src/pe.h src/dotnet_metadata.c src/dotnet_metadata.h src/dotnet_resources.c src/dotnet_resources.h src/dotnet_baml.c src/dotnet_baml.h src/dotnet_il.c src/dotnet_il.h src/dotnet_exec.c src/dotnet_runtime.c src/dotnet_exec.h tests/dotnet_metadata.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src/dotnet_baml.c src/dotnet_il.c src/dotnet_exec.c src/dotnet_runtime.c tests/dotnet_metadata.c -framework CoreFoundation -framework CoreServices -licucore -lz
+
+build/dotnet_resources_test: src/dotnet_resources.c src/dotnet_resources.h tests/dotnet_resources.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/dotnet_resources.c tests/dotnet_resources.c
+
+build/dotnet_baml_test: src/dotnet_baml.c src/dotnet_baml.h tests/dotnet_baml.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/dotnet_baml.c tests/dotnet_baml.c
+
+build/dotnet_il_test: src/dotnet_il.c src/dotnet_il.h tests/dotnet_il.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ src/dotnet_il.c tests/dotnet_il.c
+
+build/vulkan_test: src/vulkan.c src/vx_vulkan.h src/vx.h src/gpu_ir.c src/gpu_ir.h src/gpu_ir_msl.c src/gpu_ir_msl.h src/gpu_ir_metal.m src/gpu_ir_metal.h src/spirv.c src/spirv.h src/spirv_ir.c src/spirv_ir.h tests/vulkan.c build/vulkan_spirv_fixture.spv build/vulkan_spirv_array_fixture.spv build/vulkan_spirv_uniform_fixture.spv build/vulkan_spirv_push_fixture.spv build/vulkan_spirv_storage_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampler_fixture.spv build/vulkan_spirv_separate_sampler_fixture.spv
+	@mkdir -p build
+	$(HOSTCC) -Isrc -fobjc-arc -o $@ src/vulkan.c src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/spirv.c src/spirv_ir.c tests/vulkan.c -framework Metal -framework Foundation -framework CoreFoundation
+
 check: export VXRT_ROOT = build/root
 check: export VXRT_NO_ACTIVATE = 1
-check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest build/dxildump build/dxil2msl build/dxilrun
+check: all build/x86dec_test build/x86dec_check build/ref_x86 build/difftest build/dxildump build/dxil2msl build/dxilrun build/dxil_msl_test build/dxil_ir_test build/dxil_core_compute.air build/dxil_bit_intrinsics.air build/dxil_typed_buffer.air build/dxil_typed_sint_buffer.air build/dxil_typed_float_buffer.air build/dxil_signed_conversions.air build/dxil_typed_float_real.air build/dxil_unary_intrinsics.air build/gpu_ir_test build/spirv_test build/spirv_msl_test build/spirv_loop.metal build/spirv_helper.metal build/spirv_helper_capture.metal build/spirv2msl build/directinput_buffer_test build/directinput_format_test build/pe_test build/dotnet_metadata_test build/dotnet_eh_test build/dotnet_resources_test build/dotnet_baml_test build/dotnet_il_test build/vulkan_test build/vulkan_spirv_storage_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampler_fixture.spv build/vulkan_spirv_separate_sampler_fixture.spv build/d3d12_view_test
 	python3 ../tools/vxrt_games.py check
+	python3 ../tests/vxrt_run_profile_test.py
+	python3 ../tests/vxrt_doctor_pe_test.py
 	python3 ../tools/vxrt_agents.py check
 	python3 ../tools/vxrt_tune.py --selftest
 	python3 ../tools/vxrt_playtest.py --selftest
 	build/x86dec_test
 	python3 translator/a64_check.py
 	python3 tools/dxil_check.py build/dxildump tests/shaders12
-	build/dxil2msl tests/shaders12/*.dxil
+	build/dxil_msl_test
+	build/dxil_ir_test --write-system-values build/dxil_system_values.metal
+	xcrun -sdk macosx metal -c build/dxil_system_values.metal -o build/dxil_system_values.air
+	build/dxil_msl_test --sample-mask build/dxil_sample_mask.metal
+	xcrun -sdk macosx metal -c build/dxil_sample_mask.metal -o build/dxil_sample_mask.air
+	build/dxil_msl_test --cube-array-min-lod build/dxil_cube_array_min_lod.metal
+	xcrun -sdk macosx metal -c build/dxil_cube_array_min_lod.metal -o build/dxil_cube_array_min_lod.air
+	xcrun -sdk macosx metal -D VXRT_HAS_MIN_LOD_CLAMP=1 -c build/dxil_cube_array_min_lod.metal -o build/dxil_cube_array_min_lod_supported.air
+	build/dxil_msl_test --depth-cube-compare build/dxil_depth_cube_compare.metal
+	xcrun -sdk macosx metal -c build/dxil_depth_cube_compare.metal -o build/dxil_depth_cube_compare.air
+	xcrun -sdk macosx metal -D VXRT_HAS_MIN_LOD_CLAMP=1 -c build/dxil_depth_cube_compare.metal -o build/dxil_depth_cube_compare_supported.air
+	build/dxil_msl_test --fcmp-ueq build/dxil_fcmp_ueq.metal
+	xcrun -sdk macosx metal -c build/dxil_fcmp_ueq.metal -o build/dxil_fcmp_ueq.air
+	build/dxil_msl_test --texture-gather build/dxil_texture_gather.metal
+	xcrun -sdk macosx metal -c build/dxil_texture_gather.metal -o build/dxil_texture_gather.air
+	build/dxil_msl_test build/wave_prefix_min.metal build/wave_prefix_max.metal build/wave_match_multiprefix.metal build/wave_match_pixel.metal build/wave_pixel_helpers.metal build/buffer_update_counter.metal build/dxil_atomic
+	xcrun -sdk macosx metal -c build/wave_prefix_min.metal -o build/wave_prefix_min.air
+	xcrun -sdk macosx metal -c build/wave_prefix_max.metal -o build/wave_prefix_max.air
+	xcrun -sdk macosx metal -c build/wave_match_multiprefix.metal -o build/wave_match_multiprefix.air
+	xcrun -sdk macosx metal -c build/wave_match_pixel.metal -o build/wave_match_pixel.air
+	xcrun -sdk macosx metal -c build/wave_pixel_helpers.metal -o build/wave_pixel_helpers.air
+	xcrun -sdk macosx metal -c build/buffer_update_counter.metal -o build/buffer_update_counter.air
+	xcrun -sdk macosx metal -c build/dxil_atomic_typed_buffer.metal -o build/dxil_atomic_typed_buffer.air
+	xcrun -sdk macosx metal -c build/dxil_atomic_texture_1d.metal -o build/dxil_atomic_texture_1d.air
+	xcrun -sdk macosx metal -c build/dxil_atomic_texture_1d_array.metal -o build/dxil_atomic_texture_1d_array.air
+	xcrun -sdk macosx metal -c build/dxil_atomic_texture_2d.metal -o build/dxil_atomic_texture_2d.air
+	xcrun -sdk macosx metal -c build/dxil_atomic_texture_2d_array.metal -o build/dxil_atomic_texture_2d_array.air
+	xcrun -sdk macosx metal -c build/dxil_atomic_texture_3d.metal -o build/dxil_atomic_texture_3d.air
+	xcrun -sdk macosx metal -c build/dxil_atomic_typed_sint_umin.metal -o build/dxil_atomic_typed_sint_umin.air
+	xcrun -sdk macosx metal -c build/dxil_atomic_typed_uint_imin.metal -o build/dxil_atomic_typed_uint_imin.air
+	xcrun -sdk macosx metal -c build/dxil_atomic_texture_2d_uint_imin.metal -o build/dxil_atomic_texture_2d_uint_imin.air
+	xcrun -sdk macosx metal -c build/dxil_atomic_texture_2d_sint_umin.metal -o build/dxil_atomic_texture_2d_sint_umin.air
+	build/gpu_ir_test
+	build/spirv_test
+	build/spirv_msl_test
+	xcrun -sdk macosx metal -c build/spirv_loop.metal -o build/spirv_loop.air
+	xcrun -sdk macosx metal -c build/spirv_helper.metal -o build/spirv_helper.air
+	xcrun -sdk macosx metal -c build/spirv_helper_capture.metal -o build/spirv_helper_capture.air
+	build/spirv_msl_test --write-fixture build/spirv_arithmetic_cs.spv
+	python3 ../tools/spirv_check.py --translator build/spirv2msl --compile build/spirv_arithmetic_cs.spv
+	python3 ../tools/spirv_check.py --translator build/spirv2msl --compile build/vulkan_spirv_array_fixture.spv
+	python3 ../tools/spirv_check.py --translator build/spirv2msl --compile build/vulkan_spirv_uniform_fixture.spv
+	python3 ../tools/spirv_check.py --translator build/spirv2msl --compile build/vulkan_spirv_storage_image_fixture.spv
+	build/directinput_buffer_test
+	build/directinput_format_test
+	build/d3d12_view_test
+	build/pe_test
+	build/dotnet_metadata_test
+	build/dotnet_eh_test | tail -1
+	build/dotnet_resources_test
+	build/dotnet_baml_test
+	build/dotnet_il_test
+	build/vulkan_test build/vulkan_spirv_fixture.spv build/vulkan_spirv_array_fixture.spv build/vulkan_spirv_uniform_fixture.spv build/vulkan_spirv_push_fixture.spv build/vulkan_spirv_storage_image_fixture.spv build/vulkan_spirv_sampled_image_fixture.spv build/vulkan_spirv_sampler_fixture.spv build/vulkan_spirv_separate_sampler_fixture.spv
+	build/dxil2msl $(filter-out tests/shaders12/samplegrad_ps.dxil,$(wildcard tests/shaders12/*.dxil))
 	build/dxilrun tests/shaders12
 	build/difftest build/ref_x86 200
 	$(MAKE) runtime-tests VXRT=build/vxrt
@@ -330,7 +552,9 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/threads.exe
 	$(VXRT) build/cxx_exceptions.exe
 	$(VXRT) build/hw_exceptions.exe
+	$(VXRT) build/seh_try.exe
 	$(VXRT) build/breakpoint.exe
+	$(VXRT) build/child_stdout.exe
 	$(VXRT) build/lowmem.exe
 	$(VXRT) build/files.exe
 	rm -rf build/ovtree build/ovshadow && mkdir -p build/ovtree/save && echo old > build/ovtree/save/old.sav && echo orig > build/ovtree/save/same.hl1
@@ -338,6 +562,8 @@ runtime-tests: $(VXRT) tests
 	test "$$(cat build/ovtree/save/same.hl1)" = orig && test ! -e build/ovtree/save/a.hl1
 	$(VXRT) build/dll_test.exe
 	$(VXRT) build/net.exe
+	$(VXRT) build/winhttp.exe
+	$(VXRT) build/directinput.exe
 	$(VXRT) build/msvc_eh.exe
 	$(VXRT) build/com.exe
 	$(VXRT) build/iocp.exe
@@ -354,10 +580,10 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/audio.exe
 	$(VXRT) build/xaudio2.exe
 	$(VXRT) build/pipes.exe
-	$(VXRT) build/pipes.exe serve & $(VXRT) build/pipes.exe ask; wait
-	$(VXRT) build/ipc.exe second & $(VXRT) build/ipc.exe first; wait
-	$(VXRT) build/shared.exe make & $(VXRT) build/shared.exe open; wait
-	$(VXRT) build/shared.exe pingpong 1 & $(VXRT) build/shared.exe pingpong 2; wait
+	$(VXRT) build/pipes.exe serve & server=$$!; $(VXRT) build/pipes.exe ask; client_status=$$?; wait $$server; server_status=$$?; test $$client_status -eq 0 -a $$server_status -eq 0
+	$(VXRT) build/ipc.exe second & second=$$!; $(VXRT) build/ipc.exe first; first_status=$$?; wait $$second; second_status=$$?; test $$first_status -eq 0 -a $$second_status -eq 0
+	$(VXRT) build/shared.exe make & creator=$$!; $(VXRT) build/shared.exe open; open_status=$$?; wait $$creator; creator_status=$$?; test $$open_status -eq 0 -a $$creator_status -eq 0
+	$(VXRT) build/shared.exe pingpong 1 & first=$$!; $(VXRT) build/shared.exe pingpong 2 & second=$$!; wait $$first; first_status=$$?; wait $$second; second_status=$$?; test $$first_status -eq 0 -a $$second_status -eq 0
 
 check-arm64: build/vxrt-arm64 tests
 	$(MAKE) runtime-tests VXRT=build/vxrt-arm64

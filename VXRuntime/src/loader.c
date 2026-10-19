@@ -18,6 +18,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "vx.h"
+#include "pe.h"
+#include "dotnet_host.h"
 #include <sys/resource.h>
 #include <limits.h>
 
@@ -438,27 +440,40 @@ static vx_image *load_pe(const char *path, int is_main) {
     FILE *f = fopen(path, "rb");
     if (!f) { vx_log("cannot open %s: %s", path, strerror(errno)); vx_set_last_error(2); return NULL; }
     fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    if (len < 0) { fclose(f); vx_log("cannot size %s", path); vx_set_last_error(193); return NULL; }
     uint8_t *file = malloc(len);
-    if (fread(file, 1, len, f) != (size_t)len) { fclose(f); free(file); return NULL; }
+    if (!file || fread(file, 1, (size_t)len, f) != (size_t)len) { fclose(f); free(file); return NULL; }
     fclose(f);
-    if (len < 0x200 || file[0] != 'M' || file[1] != 'Z') { vx_log("%s: not an MZ executable", path); free(file); vx_set_last_error(193); return NULL; }
-    const uint8_t *nt = file + rd32(file + 0x3c);
-    if (memcmp(nt, "PE\0\0", 4) || rd16(nt + 4) != 0x8664 || rd16(nt + 24) != 0x20b) {
-        vx_log("%s: not a PE32+ x86-64 image", path); free(file); vx_set_last_error(193 /* ERROR_BAD_EXE_FORMAT */); return NULL;
+    vx_pe_info pe;
+    if (!vx_pe_inspect(file, (size_t)len, &pe)) {
+        vx_log("%s: invalid or unsupported PE image", path); free(file); vx_set_last_error(193); return NULL;
     }
-    uint16_t nsections = rd16(nt + 6), characteristics = rd16(nt + 22), opt_size = rd16(nt + 20);
-    const uint8_t *opt = nt + 24;
-    uint64_t pref_base = rd64(opt + 24);
-    uint32_t image_size = rd32(opt + 56), headers_size = rd32(opt + 60), entry_rva = rd32(opt + 16);
-    uint32_t ndirs = rd32(opt + 108);
+    if (pe.has_cli) {
+        vx_log("%s: managed %s image (machine 0x%04x, CLR metadata %s); CLR hosting is not implemented",
+               path, pe.optional_magic == 0x10b ? "PE32" : "PE32+", pe.machine,
+               pe.metadata_version[0] ? pe.metadata_version : "version unknown");
+        free(file); vx_set_last_error(193 /* ERROR_BAD_EXE_FORMAT */); return NULL;
+    }
+    if (pe.machine != 0x8664 || pe.optional_magic != 0x20b) {
+        if (pe.machine == 0x014c && pe.optional_magic == 0x10b)
+            vx_log("%s: native 32-bit x86 PE32 image; 32-bit native execution is not implemented", path);
+        else
+            vx_log("%s: unsupported PE machine 0x%04x / optional-header format 0x%04x",
+                   path, pe.machine, pe.optional_magic);
+        free(file); vx_set_last_error(193 /* ERROR_BAD_EXE_FORMAT */); return NULL;
+    }
+    uint16_t nsections = pe.section_count, characteristics = pe.characteristics;
+    size_t section_table_offset = pe.section_table_offset;
+    uint64_t pref_base = pe.image_base;
+    uint32_t image_size = pe.image_size, headers_size = pe.headers_size, entry_rva = pe.entry_rva;
     pe_dir dirs[16];
-    for (uint32_t i = 0; i < 16; i++) dirs[i] = i < ndirs ? *(const pe_dir *)(opt + 112 + i * 8) : (pe_dir){0, 0};
+    for (uint32_t i = 0; i < 16; i++) dirs[i] = (pe_dir){ pe.directories[i].rva, pe.directories[i].size };
 
     // Map at the preferred base when free, anywhere otherwise (then relocate).
     uint8_t *base = mmap((void *)pref_base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (base == MAP_FAILED) { vx_log("cannot map %u bytes", image_size); free(file); return NULL; }
     memcpy(base, file, headers_size);
-    const pe_section *sec = (const pe_section *)(opt + opt_size);
+    const pe_section *sec = (const pe_section *)(file + section_table_offset);
     for (uint16_t i = 0; i < nsections; i++) {
         uint32_t n = sec[i].raw_size < sec[i].vsize || !sec[i].vsize ? sec[i].raw_size : sec[i].vsize;
         if (n) memcpy(base + sec[i].va, file + sec[i].raw_ptr, n);
@@ -668,6 +683,282 @@ static WINAPI BOOL GetModuleHandleExW(DWORD flags, const WCHAR *name, void **out
     return r;
 }
 
+
+// ---- VXRT_TRACE_OPENVR=1: what a program asks of OpenVR's compositor ------------------------------------------------------
+// openvr_api.dll's VR_GetGenericInterface is wrapped: each interface asked for is logged with its error, and on an
+// IVRCompositor the first methods every version has kept (WaitGetPoses 2, Submit 5, PostPresentHandoff 7) are
+// patched in its vtable to log their results: the first 20 calls, then every error and every 1000th call.
+typedef int (WINAPI *ovr_wait_fn)(void *, void *, uint32_t, void *, uint32_t);
+typedef int (WINAPI *ovr_submit_fn)(void *, int, const void *, const float *, int);
+typedef void (WINAPI *ovr_handoff_fn)(void *);
+static void *(WINAPI *g_ovr_get_interface)(const char *, int *);
+static ovr_wait_fn g_ovr_wait; static ovr_submit_fn g_ovr_submit; static ovr_handoff_fn g_ovr_handoff;
+static int ovr_note(unsigned *count, int error) { unsigned n = __sync_add_and_fetch(count, 1); return n <= 20 || error || n % 1000 == 0 ? (int)n : 0; }
+
+#ifdef __x86_64__
+// The compositor's other methods (8 to 39, those that point into vrclient) are counted by thunks that only bump a
+// counter and jump on, whatever their arguments; the counts are logged with every 200th WaitGetPoses.
+static volatile int g_ovr_counts[40];
+static void *g_ovr_orig[40];
+__attribute__((naked)) static void ovr_count_8(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[8]), "m"(g_ovr_orig[8])); }
+__attribute__((naked)) static void ovr_count_9(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[9]), "m"(g_ovr_orig[9])); }
+__attribute__((naked)) static void ovr_count_10(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[10]), "m"(g_ovr_orig[10])); }
+__attribute__((naked)) static void ovr_count_11(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[11]), "m"(g_ovr_orig[11])); }
+__attribute__((naked)) static void ovr_count_12(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[12]), "m"(g_ovr_orig[12])); }
+__attribute__((naked)) static void ovr_count_13(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[13]), "m"(g_ovr_orig[13])); }
+__attribute__((naked)) static void ovr_count_14(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[14]), "m"(g_ovr_orig[14])); }
+__attribute__((naked)) static void ovr_count_15(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[15]), "m"(g_ovr_orig[15])); }
+__attribute__((naked)) static void ovr_count_16(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[16]), "m"(g_ovr_orig[16])); }
+__attribute__((naked)) static void ovr_count_17(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[17]), "m"(g_ovr_orig[17])); }
+__attribute__((naked)) static void ovr_count_18(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[18]), "m"(g_ovr_orig[18])); }
+__attribute__((naked)) static void ovr_count_19(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[19]), "m"(g_ovr_orig[19])); }
+__attribute__((naked)) static void ovr_count_20(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[20]), "m"(g_ovr_orig[20])); }
+__attribute__((naked)) static void ovr_count_21(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[21]), "m"(g_ovr_orig[21])); }
+__attribute__((naked)) static void ovr_count_22(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[22]), "m"(g_ovr_orig[22])); }
+__attribute__((naked)) static void ovr_count_23(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[23]), "m"(g_ovr_orig[23])); }
+__attribute__((naked)) static void ovr_count_24(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[24]), "m"(g_ovr_orig[24])); }
+__attribute__((naked)) static void ovr_count_25(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[25]), "m"(g_ovr_orig[25])); }
+__attribute__((naked)) static void ovr_count_26(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[26]), "m"(g_ovr_orig[26])); }
+__attribute__((naked)) static void ovr_count_27(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[27]), "m"(g_ovr_orig[27])); }
+__attribute__((naked)) static void ovr_count_28(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[28]), "m"(g_ovr_orig[28])); }
+__attribute__((naked)) static void ovr_count_29(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[29]), "m"(g_ovr_orig[29])); }
+__attribute__((naked)) static void ovr_count_30(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[30]), "m"(g_ovr_orig[30])); }
+__attribute__((naked)) static void ovr_count_31(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[31]), "m"(g_ovr_orig[31])); }
+__attribute__((naked)) static void ovr_count_32(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[32]), "m"(g_ovr_orig[32])); }
+__attribute__((naked)) static void ovr_count_33(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[33]), "m"(g_ovr_orig[33])); }
+__attribute__((naked)) static void ovr_count_34(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[34]), "m"(g_ovr_orig[34])); }
+__attribute__((naked)) static void ovr_count_35(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[35]), "m"(g_ovr_orig[35])); }
+__attribute__((naked)) static void ovr_count_36(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[36]), "m"(g_ovr_orig[36])); }
+__attribute__((naked)) static void ovr_count_37(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[37]), "m"(g_ovr_orig[37])); }
+__attribute__((naked)) static void ovr_count_38(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[38]), "m"(g_ovr_orig[38])); }
+__attribute__((naked)) static void ovr_count_39(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovr_counts[39]), "m"(g_ovr_orig[39])); }
+static void (*const g_ovr_counters[40])(void) = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ovr_count_8, ovr_count_9, ovr_count_10, ovr_count_11, ovr_count_12, ovr_count_13, ovr_count_14, ovr_count_15, ovr_count_16, ovr_count_17, ovr_count_18, ovr_count_19, ovr_count_20, ovr_count_21, ovr_count_22, ovr_count_23, ovr_count_24, ovr_count_25, ovr_count_26, ovr_count_27, ovr_count_28, ovr_count_29, ovr_count_30, ovr_count_31, ovr_count_32, ovr_count_33, ovr_count_34, ovr_count_35, ovr_count_36, ovr_count_37, ovr_count_38, ovr_count_39 };
+static WINAPI int ovr_skip_skybox(void *this, const void *textures, uint32_t count) {
+    (void)this; (void)textures;
+    vx_log("openvr: SetSkyboxOverride with %u textures skipped (VXRT_OPENVR_NO_SKYBOX)", count);
+    return 0;
+}
+static void ovr_patch_rest(void **vtbl, void *any_method) {
+    const vx_image *owner = vx_image_at((uint64_t)(uintptr_t)any_method);
+    for (int i = 8; i < 40 && owner; i++) {
+        if (vx_image_at((uint64_t)(uintptr_t)vtbl[i]) != owner) break;      // past the vtable's end
+        g_ovr_orig[i] = vtbl[i]; vtbl[i] = (void *)g_ovr_counters[i];
+    }
+    if (getenv("VXRT_OPENVR_NO_SKYBOX") && g_ovr_orig[12]) vtbl[12] = (void *)ovr_skip_skybox;   // (014: SetSkyboxOverride)
+}
+
+#ifdef __x86_64__
+// IVROverlay: FindOverlay (0) and CreateOverlay (1) are logged with their keys; the rest (2 to 89) are counted.
+static volatile int g_ovl_counts[90];
+static void *g_ovl_orig[90];
+__attribute__((naked)) static void ovl_count_2(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[2]), "m"(g_ovl_orig[2])); }
+__attribute__((naked)) static void ovl_count_3(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[3]), "m"(g_ovl_orig[3])); }
+__attribute__((naked)) static void ovl_count_4(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[4]), "m"(g_ovl_orig[4])); }
+__attribute__((naked)) static void ovl_count_5(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[5]), "m"(g_ovl_orig[5])); }
+__attribute__((naked)) static void ovl_count_6(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[6]), "m"(g_ovl_orig[6])); }
+__attribute__((naked)) static void ovl_count_7(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[7]), "m"(g_ovl_orig[7])); }
+__attribute__((naked)) static void ovl_count_8(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[8]), "m"(g_ovl_orig[8])); }
+__attribute__((naked)) static void ovl_count_9(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[9]), "m"(g_ovl_orig[9])); }
+__attribute__((naked)) static void ovl_count_10(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[10]), "m"(g_ovl_orig[10])); }
+__attribute__((naked)) static void ovl_count_11(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[11]), "m"(g_ovl_orig[11])); }
+__attribute__((naked)) static void ovl_count_12(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[12]), "m"(g_ovl_orig[12])); }
+__attribute__((naked)) static void ovl_count_13(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[13]), "m"(g_ovl_orig[13])); }
+__attribute__((naked)) static void ovl_count_14(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[14]), "m"(g_ovl_orig[14])); }
+__attribute__((naked)) static void ovl_count_15(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[15]), "m"(g_ovl_orig[15])); }
+__attribute__((naked)) static void ovl_count_16(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[16]), "m"(g_ovl_orig[16])); }
+__attribute__((naked)) static void ovl_count_17(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[17]), "m"(g_ovl_orig[17])); }
+__attribute__((naked)) static void ovl_count_18(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[18]), "m"(g_ovl_orig[18])); }
+__attribute__((naked)) static void ovl_count_19(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[19]), "m"(g_ovl_orig[19])); }
+__attribute__((naked)) static void ovl_count_20(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[20]), "m"(g_ovl_orig[20])); }
+__attribute__((naked)) static void ovl_count_21(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[21]), "m"(g_ovl_orig[21])); }
+__attribute__((naked)) static void ovl_count_22(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[22]), "m"(g_ovl_orig[22])); }
+__attribute__((naked)) static void ovl_count_23(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[23]), "m"(g_ovl_orig[23])); }
+__attribute__((naked)) static void ovl_count_24(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[24]), "m"(g_ovl_orig[24])); }
+__attribute__((naked)) static void ovl_count_25(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[25]), "m"(g_ovl_orig[25])); }
+__attribute__((naked)) static void ovl_count_26(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[26]), "m"(g_ovl_orig[26])); }
+__attribute__((naked)) static void ovl_count_27(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[27]), "m"(g_ovl_orig[27])); }
+__attribute__((naked)) static void ovl_count_28(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[28]), "m"(g_ovl_orig[28])); }
+__attribute__((naked)) static void ovl_count_29(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[29]), "m"(g_ovl_orig[29])); }
+__attribute__((naked)) static void ovl_count_30(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[30]), "m"(g_ovl_orig[30])); }
+__attribute__((naked)) static void ovl_count_31(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[31]), "m"(g_ovl_orig[31])); }
+__attribute__((naked)) static void ovl_count_32(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[32]), "m"(g_ovl_orig[32])); }
+__attribute__((naked)) static void ovl_count_33(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[33]), "m"(g_ovl_orig[33])); }
+__attribute__((naked)) static void ovl_count_34(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[34]), "m"(g_ovl_orig[34])); }
+__attribute__((naked)) static void ovl_count_35(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[35]), "m"(g_ovl_orig[35])); }
+__attribute__((naked)) static void ovl_count_36(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[36]), "m"(g_ovl_orig[36])); }
+__attribute__((naked)) static void ovl_count_37(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[37]), "m"(g_ovl_orig[37])); }
+__attribute__((naked)) static void ovl_count_38(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[38]), "m"(g_ovl_orig[38])); }
+__attribute__((naked)) static void ovl_count_39(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[39]), "m"(g_ovl_orig[39])); }
+__attribute__((naked)) static void ovl_count_40(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[40]), "m"(g_ovl_orig[40])); }
+__attribute__((naked)) static void ovl_count_41(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[41]), "m"(g_ovl_orig[41])); }
+__attribute__((naked)) static void ovl_count_42(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[42]), "m"(g_ovl_orig[42])); }
+__attribute__((naked)) static void ovl_count_43(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[43]), "m"(g_ovl_orig[43])); }
+__attribute__((naked)) static void ovl_count_44(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[44]), "m"(g_ovl_orig[44])); }
+__attribute__((naked)) static void ovl_count_45(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[45]), "m"(g_ovl_orig[45])); }
+__attribute__((naked)) static void ovl_count_46(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[46]), "m"(g_ovl_orig[46])); }
+__attribute__((naked)) static void ovl_count_47(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[47]), "m"(g_ovl_orig[47])); }
+__attribute__((naked)) static void ovl_count_48(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[48]), "m"(g_ovl_orig[48])); }
+__attribute__((naked)) static void ovl_count_49(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[49]), "m"(g_ovl_orig[49])); }
+__attribute__((naked)) static void ovl_count_50(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[50]), "m"(g_ovl_orig[50])); }
+__attribute__((naked)) static void ovl_count_51(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[51]), "m"(g_ovl_orig[51])); }
+__attribute__((naked)) static void ovl_count_52(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[52]), "m"(g_ovl_orig[52])); }
+__attribute__((naked)) static void ovl_count_53(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[53]), "m"(g_ovl_orig[53])); }
+__attribute__((naked)) static void ovl_count_54(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[54]), "m"(g_ovl_orig[54])); }
+__attribute__((naked)) static void ovl_count_55(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[55]), "m"(g_ovl_orig[55])); }
+__attribute__((naked)) static void ovl_count_56(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[56]), "m"(g_ovl_orig[56])); }
+__attribute__((naked)) static void ovl_count_57(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[57]), "m"(g_ovl_orig[57])); }
+__attribute__((naked)) static void ovl_count_58(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[58]), "m"(g_ovl_orig[58])); }
+__attribute__((naked)) static void ovl_count_59(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[59]), "m"(g_ovl_orig[59])); }
+__attribute__((naked)) static void ovl_count_60(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[60]), "m"(g_ovl_orig[60])); }
+__attribute__((naked)) static void ovl_count_61(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[61]), "m"(g_ovl_orig[61])); }
+__attribute__((naked)) static void ovl_count_62(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[62]), "m"(g_ovl_orig[62])); }
+__attribute__((naked)) static void ovl_count_63(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[63]), "m"(g_ovl_orig[63])); }
+__attribute__((naked)) static void ovl_count_64(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[64]), "m"(g_ovl_orig[64])); }
+__attribute__((naked)) static void ovl_count_65(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[65]), "m"(g_ovl_orig[65])); }
+__attribute__((naked)) static void ovl_count_66(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[66]), "m"(g_ovl_orig[66])); }
+__attribute__((naked)) static void ovl_count_67(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[67]), "m"(g_ovl_orig[67])); }
+__attribute__((naked)) static void ovl_count_68(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[68]), "m"(g_ovl_orig[68])); }
+__attribute__((naked)) static void ovl_count_69(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[69]), "m"(g_ovl_orig[69])); }
+__attribute__((naked)) static void ovl_count_70(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[70]), "m"(g_ovl_orig[70])); }
+__attribute__((naked)) static void ovl_count_71(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[71]), "m"(g_ovl_orig[71])); }
+__attribute__((naked)) static void ovl_count_72(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[72]), "m"(g_ovl_orig[72])); }
+__attribute__((naked)) static void ovl_count_73(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[73]), "m"(g_ovl_orig[73])); }
+__attribute__((naked)) static void ovl_count_74(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[74]), "m"(g_ovl_orig[74])); }
+__attribute__((naked)) static void ovl_count_75(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[75]), "m"(g_ovl_orig[75])); }
+__attribute__((naked)) static void ovl_count_76(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[76]), "m"(g_ovl_orig[76])); }
+__attribute__((naked)) static void ovl_count_77(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[77]), "m"(g_ovl_orig[77])); }
+__attribute__((naked)) static void ovl_count_78(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[78]), "m"(g_ovl_orig[78])); }
+__attribute__((naked)) static void ovl_count_79(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[79]), "m"(g_ovl_orig[79])); }
+__attribute__((naked)) static void ovl_count_80(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[80]), "m"(g_ovl_orig[80])); }
+__attribute__((naked)) static void ovl_count_81(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[81]), "m"(g_ovl_orig[81])); }
+__attribute__((naked)) static void ovl_count_82(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[82]), "m"(g_ovl_orig[82])); }
+__attribute__((naked)) static void ovl_count_83(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[83]), "m"(g_ovl_orig[83])); }
+__attribute__((naked)) static void ovl_count_84(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[84]), "m"(g_ovl_orig[84])); }
+__attribute__((naked)) static void ovl_count_85(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[85]), "m"(g_ovl_orig[85])); }
+__attribute__((naked)) static void ovl_count_86(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[86]), "m"(g_ovl_orig[86])); }
+__attribute__((naked)) static void ovl_count_87(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[87]), "m"(g_ovl_orig[87])); }
+__attribute__((naked)) static void ovl_count_88(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[88]), "m"(g_ovl_orig[88])); }
+__attribute__((naked)) static void ovl_count_89(void) { __asm__ volatile("lock incl %0\n\tjmp *%1" :: "m"(g_ovl_counts[89]), "m"(g_ovl_orig[89])); }
+static void (*const g_ovl_counters[90])(void) = { NULL, NULL, ovl_count_2, ovl_count_3, ovl_count_4, ovl_count_5, ovl_count_6, ovl_count_7, ovl_count_8, ovl_count_9, ovl_count_10, ovl_count_11, ovl_count_12, ovl_count_13, ovl_count_14, ovl_count_15, ovl_count_16, ovl_count_17, ovl_count_18, ovl_count_19, ovl_count_20, ovl_count_21, ovl_count_22, ovl_count_23, ovl_count_24, ovl_count_25, ovl_count_26, ovl_count_27, ovl_count_28, ovl_count_29, ovl_count_30, ovl_count_31, ovl_count_32, ovl_count_33, ovl_count_34, ovl_count_35, ovl_count_36, ovl_count_37, ovl_count_38, ovl_count_39, ovl_count_40, ovl_count_41, ovl_count_42, ovl_count_43, ovl_count_44, ovl_count_45, ovl_count_46, ovl_count_47, ovl_count_48, ovl_count_49, ovl_count_50, ovl_count_51, ovl_count_52, ovl_count_53, ovl_count_54, ovl_count_55, ovl_count_56, ovl_count_57, ovl_count_58, ovl_count_59, ovl_count_60, ovl_count_61, ovl_count_62, ovl_count_63, ovl_count_64, ovl_count_65, ovl_count_66, ovl_count_67, ovl_count_68, ovl_count_69, ovl_count_70, ovl_count_71, ovl_count_72, ovl_count_73, ovl_count_74, ovl_count_75, ovl_count_76, ovl_count_77, ovl_count_78, ovl_count_79, ovl_count_80, ovl_count_81, ovl_count_82, ovl_count_83, ovl_count_84, ovl_count_85, ovl_count_86, ovl_count_87, ovl_count_88, ovl_count_89 };
+static WINAPI int ovl_find(void *this, const char *key, uint64_t *handle) {
+    int r = ((int (WINAPI *)(void *, const char *, uint64_t *))g_ovl_orig[0])(this, key, handle);
+    vx_log("openvr: FindOverlay(%s) = %d, handle %#llx", key ? key : "?", r, handle ? (unsigned long long)*handle : 0ull);
+    return r;
+}
+static WINAPI int ovl_create(void *this, const char *key, const char *name, uint64_t *handle) {
+    int r = ((int (WINAPI *)(void *, const char *, const char *, uint64_t *))g_ovl_orig[1])(this, key, name, handle);
+    vx_log("openvr: CreateOverlay(%s, \"%s\") = %d, handle %#llx", key ? key : "?", name ? name : "?", r, handle ? (unsigned long long)*handle : 0ull);
+    return r;
+}
+static void ovl_patch(void **vtbl) {
+    const vx_image *owner = vx_image_at((uint64_t)(uintptr_t)vtbl[0]);
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t start = (uintptr_t)vtbl & ~(uintptr_t)(page - 1), end = ((uintptr_t)(vtbl + 90) + page - 1) & ~(uintptr_t)(page - 1);
+    if (!owner || mprotect((void *)start, end - start, PROT_READ | PROT_WRITE)) { vx_log("openvr: cannot patch the overlay vtable"); return; }
+    g_ovl_orig[0] = vtbl[0]; g_ovl_orig[1] = vtbl[1];
+    vtbl[0] = (void *)ovl_find; vtbl[1] = (void *)ovl_create;
+    int i = 2;
+    for (; i < 90 && vx_image_at((uint64_t)(uintptr_t)vtbl[i]) == owner; i++) { g_ovl_orig[i] = vtbl[i]; vtbl[i] = (void *)g_ovl_counters[i]; }
+    vx_log("openvr: tracing the overlay interface (%d methods)", i);
+}
+static void ovl_log_counts(void) {
+    char text[900]; size_t len = 0;
+    for (int i = 2; i < 90; i++) if (g_ovl_counts[i]) len += (size_t)snprintf(text + len, sizeof text - len, " [%d]=%d", i, g_ovl_counts[i]);
+    vx_log("openvr: overlay methods called:%s", len ? text : " none");
+}
+#else
+static void ovl_patch(void **vtbl) { (void)vtbl; }
+static void ovl_log_counts(void) {}
+#endif
+static void *g_ovr_this;
+static void ovr_log_counts(void) {
+    char text[600]; size_t len = 0;
+    for (int i = 8; i < 40; i++) if (g_ovr_counts[i]) len += (size_t)snprintf(text + len, sizeof text - len, " [%d]=%d", i, g_ovr_counts[i]);
+    vx_log("openvr: other compositor methods called:%s", len ? text : " none");
+    ovl_log_counts();
+    // IVRCompositor_014 (SetSkyboxOverride is 12): GetCurrentSceneFocusProcess 18, GetLastFrameRenderer 19, CanRenderScene 20
+    if (g_ovr_this && g_ovr_orig[18] && g_ovr_orig[19] && g_ovr_orig[20]) {
+        uint32_t focus = ((uint32_t (WINAPI *)(void *))g_ovr_orig[18])(g_ovr_this);
+        uint32_t last = ((uint32_t (WINAPI *)(void *))g_ovr_orig[19])(g_ovr_this);
+        int can = ((uint8_t (WINAPI *)(void *))g_ovr_orig[20])(g_ovr_this);
+        vx_log("openvr: scene focus process %u, last frame renderer %u, can render scene %d (this process %d)", focus, last, can, (int)getpid());
+    }
+    // GetFrameTiming (8): the struct's size is the version; the first size the client takes is the one it knows.
+    if (g_ovr_this && g_ovr_orig[8]) {
+        static uint32_t known;
+        uint32_t timing[128];
+        for (uint32_t size = known ? known : 400; size >= 16; size -= 4) {           // the largest size it takes
+            memset(timing, 0, sizeof timing); timing[0] = size;
+            if (((uint8_t (WINAPI *)(void *, void *, uint32_t))g_ovr_orig[8])(g_ovr_this, timing, 0)) { known = size; break; }
+            if (known) break;
+        }
+        if (known) {
+            char text[1400]; size_t len = 0;
+            for (uint32_t i = 0; i < known / 4 && i < 60; i++) {
+                float f; memcpy(&f, &timing[i], 4);
+                if (i < 4 || timing[i] < 0x1000000) len += (size_t)snprintf(text + len, sizeof text - len, " %u", timing[i]);
+                else len += (size_t)snprintf(text + len, sizeof text - len, " %.2f", f);
+            }
+            vx_log("openvr: frame timing (%u bytes):%s", known, text);
+        } else vx_log("openvr: GetFrameTiming takes no size from 16 to 400");
+    }
+}
+#else
+static void ovr_patch_rest(void **vtbl, void *any_method) { (void)vtbl; (void)any_method; }
+static void ovr_log_counts(void) {}
+#endif
+static WINAPI int ovr_wait(void *this, void *render, uint32_t nrender, void *game, uint32_t ngame) {
+    static unsigned count;
+    int r = g_ovr_wait(this, render, nrender, game, ngame);
+#ifdef __x86_64__
+    g_ovr_this = this;
+#endif
+    int n = ovr_note(&count, r);
+    if (n) vx_log("openvr: WaitGetPoses #%d (%u render poses, %u game poses) = %d", n, nrender, ngame, r);
+    if ((count <= 3 || count % 100 == 0) && render && nrender) {   // TrackedDevicePose_t: a 3x4 matrix, velocities, result, valid
+        const float *m = render; const uint8_t *b = render;
+        vx_log("openvr: HMD render pose #%u: position %.3f %.3f %.3f, row0 %.3f %.3f %.3f, result %d, valid %d, connected %d",
+               count, m[3], m[7], m[11], m[0], m[1], m[2], *(const int *)(b + 72), b[76], b[77]);
+    }
+    if (count % 200 == 0) ovr_log_counts();
+    return r;
+}
+static WINAPI int ovr_submit(void *this, int eye, const void *texture, const float *bounds, int flags) {
+    static unsigned count;
+    int r = g_ovr_submit(this, eye, texture, bounds, flags);
+    int n = ovr_note(&count, r);
+    if (n) {
+        const int *t = texture ? (const int *)((const uint8_t *)texture + 8) : NULL;   // Texture_t: handle, type, colour space
+        vx_log("openvr: Submit #%d eye %d texture %p (type %d, colour space %d) bounds %s%.3f %.3f %.3f %.3f flags %#x = %d", n, eye,
+               texture ? *(void *const *)texture : NULL, t ? t[0] : -1, t ? t[1] : -1, bounds ? "" : "(none) ",
+               bounds ? bounds[0] : 0, bounds ? bounds[1] : 0, bounds ? bounds[2] : 0, bounds ? bounds[3] : 0, flags, r);
+    }
+    return r;
+}
+static WINAPI void ovr_handoff(void *this) {
+    static unsigned count;
+    int n = ovr_note(&count, 0);
+    if (n) vx_log("openvr: PostPresentHandoff #%d", n);
+    g_ovr_handoff(this);
+}
+static WINAPI void *ovr_get_interface(const char *version, int *error) {
+    void *r = g_ovr_get_interface(version, error);
+    vx_log("openvr: VR_GetGenericInterface(%s) = %p, error %d", version ? version : "?", r, error ? *error : 0);
+    static int overlay_patched;
+    if (r && version && !strncmp(version, "IVROverlay_", 11) && !overlay_patched) { overlay_patched = 1; ovl_patch(*(void ***)r); }
+    if (r && version && !strncmp(version, "IVRCompositor_", 14) && !g_ovr_submit) {
+        void **vtbl = *(void ***)r;
+        long page = sysconf(_SC_PAGESIZE);
+        uintptr_t start = (uintptr_t)vtbl & ~(uintptr_t)(page - 1), end = ((uintptr_t)(vtbl + 40) + page - 1) & ~(uintptr_t)(page - 1);
+        if (!mprotect((void *)start, end - start, PROT_READ | PROT_WRITE)) {
+            g_ovr_wait = (ovr_wait_fn)vtbl[2]; g_ovr_submit = (ovr_submit_fn)vtbl[5]; g_ovr_handoff = (ovr_handoff_fn)vtbl[7];
+            ovr_patch_rest(vtbl, vtbl[0]);
+            vtbl[2] = (void *)ovr_wait; vtbl[5] = (void *)ovr_submit; vtbl[7] = (void *)ovr_handoff;
+            vx_log("openvr: tracing %s's WaitGetPoses, Submit and PostPresentHandoff", version);
+        } else vx_log("openvr: cannot patch %s's vtable (%s)", version, strerror(errno));
+    }
+    return r;
+}
 static WINAPI void *GetProcAddress(void *module, const char *name) {
     int ordinal = (uintptr_t)name < 0x10000 ? (int)(uintptr_t)name : 0;
     if (!module) module = vx_proc.image_base;             // NULL is the program itself
@@ -679,8 +970,14 @@ static WINAPI void *GetProcAddress(void *module, const char *name) {
     void *fn = m ? pe_export(m, ordinal ? NULL : name, ordinal, 0) : builtin ? vx_find_export((const char *)module, ordinal ? by_number : name) : NULL;
     pthread_mutex_unlock(&g_loader_lock);
     if (fn && builtin) fn = vx_trace_wrap((const char *)module, ordinal ? by_number : name, fn);
+    if (fn && m && !ordinal && !strcmp(name, "VR_GetGenericInterface") && getenv("VXRT_TRACE_OPENVR")) {
+        g_ovr_get_interface = (void *(WINAPI *)(const char *, int *))fn;
+        fn = (void *)ovr_get_interface;
+    }
     if (!fn) vx_set_last_error(m || builtin ? 127 /* ERROR_PROC_NOT_FOUND */ : 6 /* ERROR_INVALID_HANDLE */);
-    if (!fn && vx_trace) vx_log("GetProcAddress(%s, %s) failed", m ? m->name : builtin ? (const char *)module : "?", ordinal ? by_number : name);
+    // a miss on one of the runtime's own modules is logged always: a program that calls the result unchecked
+    // crashes at address 0, and the name here is what it wanted
+    if (!fn && (vx_trace || builtin)) vx_log("GetProcAddress(%s, %s) failed", m ? m->name : builtin ? (const char *)module : "?", ordinal ? by_number : name);
     return fn;
 }
 
@@ -729,6 +1026,8 @@ static int run_program(void *arg) {
     vx_x86_stack_size = g_main_stack;
 #endif
     vx_thread_attach();
+    int managed_rc = vx_dotnet_run_file(exe);
+    if (managed_rc >= 0) return managed_rc;
     pthread_mutex_lock(&g_loader_lock);
     vx_image *m = load_pe(exe, 1);
     pthread_mutex_unlock(&g_loader_lock);
@@ -796,8 +1095,9 @@ int main(int argc, char **argv, char **envp) {
 #ifdef __aarch64__
     vx_arm64_init();                             // (the engine, before any x86 code)
 #endif
-    vx_profile_start();
     vx_wininet_init();                           // (before desktop.c's stand-ins for the same functions)
+    vx_winhttp_init();
+    vx_directinput_init();
     vx_kernel32_init();
     vx_system_init();
     vx_desktop_init();
@@ -825,8 +1125,10 @@ int main(int argc, char **argv, char **envp) {
     vx_d3d11_init();
     vx_dxgi_init();
     vx_d3d12_init();
+    vx_vulkan_init();
     vx_d3d9_init();
     vx_vcruntime_init();
+    vx_dotnet_init();
     vx_extras_init();                            // (last: the tables above come first)
     if (getenv("VXRT_CONTROL")) vx_control_start(getenv("VXRT_CONTROL"));
 
@@ -841,6 +1143,7 @@ int main(int argc, char **argv, char **envp) {
 
     vx_proc.argc = argc - 1;
     vx_proc.argv = argv + 1;
+    vx_profile_start();                            // (after argv: VXRT_PROFILE_FOR names the program)
     vx_proc.envp = envp;
     size_t len = 1;
     for (int i = 1; i < argc; i++) len += strlen(argv[i]) + 3;
