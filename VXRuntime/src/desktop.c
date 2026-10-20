@@ -186,9 +186,11 @@ static WINAPI BOOL GetFileVersionInfoW(const WCHAR *f, DWORD h, DWORD n, void *d
 static WINAPI BOOL VerQueryValueA(const void *b, const char *s, void **out, DWORD *n) { (void)b; (void)s; *out = NULL; *n = 0; return 0; }
 static WINAPI BOOL VerQueryValueW(const void *b, const WCHAR *s, void **out, DWORD *n) { (void)b; (void)s; *out = NULL; *n = 0; return 0; }
 
-// ---- setupapi: no device classes to enumerate ------------------------------------------------------------------------------
-static WINAPI HANDLE SetupDiGetClassDevsA(const void *guid, const char *e, void *w, DWORD f) { (void)guid; (void)e; (void)w; (void)f; vx_set_last_error(13); return INVALID_HANDLE; }
-static WINAPI HANDLE SetupDiGetClassDevsW(const void *guid, const WCHAR *e, void *w, DWORD f) { (void)guid; (void)e; (void)w; (void)f; vx_set_last_error(13); return INVALID_HANDLE; }
+// ---- setupapi: device lists that are empty --------------------------------------------------------------------------------
+// A list is made (an empty one): a program that looks through the HID devices for XInput controllers (Elite Dangerous,
+// before it opens its DirectInput joysticks) took the failure for a broken system and set up no joystick at all.
+static WINAPI HANDLE SetupDiGetClassDevsA(const void *guid, const char *e, void *w, DWORD f) { (void)guid; (void)e; (void)w; (void)f; return (HANDLE)(uintptr_t)0x5e7d0001; }
+static WINAPI HANDLE SetupDiGetClassDevsW(const void *guid, const WCHAR *e, void *w, DWORD f) { (void)guid; (void)e; (void)w; (void)f; return (HANDLE)(uintptr_t)0x5e7d0001; }
 static WINAPI BOOL setupdi_none(void) { vx_set_last_error(259); return 0; }                     // ERROR_NO_MORE_ITEMS
 static WINAPI BOOL SetupDiDestroyDeviceInfoList(HANDLE h) { (void)h; return 1; }
 

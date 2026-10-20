@@ -18,6 +18,10 @@ REPO="$(cd "$MACAPP/.." && pwd)"
 OUT="$REPO/build/app"
 VERSION="$(tr -d '[:space:]' < "$MACAPP/VERSION")"
 BUILD="$(date -u +%Y%m%d%H%M)"
+# The commit the app is built from ("-modified": with changes not committed yet), in the app's Info.plist and the
+# runtime's COMMIT file: the About card, problem reports and the launch log show it.
+COMMIT="$(git -C "$REPO" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+[[ "$COMMIT" != unknown && -n "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]] && COMMIT="$COMMIT-modified"
 APP="$OUT/VeRantyx.app"
 RT="$APP/Contents/Resources/runtime"
 TARGET="arm64-apple-macos14.0"
@@ -34,11 +38,11 @@ swiftc -O -target "$TARGET" "$REPO/scripts/vxrt_helper.swift" -o "$OUT/obj/vxrt-
 "$REPO/scripts/build_openvr_capture_proxy.sh" >/dev/null
 (cd "$REPO/ALVRBridge" && "$CARGO" build --release --lib --locked)
 
-step "App: $VERSION ($BUILD)"
+step "App: $VERSION ($BUILD, commit $COMMIT)"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/licenses"
 swiftc -O -swift-version 5 -parse-as-library -target "$TARGET" "$MACAPP"/Sources/*.swift -o "$APP/Contents/MacOS/VeRantyx"
-sed -e "s/@VERSION@/$VERSION/" -e "s/@BUILD@/$BUILD/" "$MACAPP/Info.plist" > "$APP/Contents/Info.plist"
+sed -e "s/@VERSION@/$VERSION/" -e "s/@BUILD@/$BUILD/" -e "s/@COMMIT@/$COMMIT/" "$MACAPP/Info.plist" > "$APP/Contents/Info.plist"
 rm -rf "$OUT/AppIcon.iconset"
 swift "$MACAPP/make_icon.swift" "$OUT/AppIcon.iconset"
 iconutil -c icns "$OUT/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
@@ -56,6 +60,7 @@ cp "$REPO/VRDriver/driver_verantyx.dll" "$RT/VRDriver/"
 cp "$REPO/ALVRBridge/target/release/libverantyx_alvr_bridge.dylib" "$RT/ALVRBridge/target/release/"
 strip -x "$RT/ALVRBridge/target/release/libverantyx_alvr_bridge.dylib"
 cp "$REPO"/games/*.json "$RT/games/"
+echo "$COMMIT" > "$RT/COMMIT"
 
 # Licenses: VeRantyx's own, the notices, ALVR's and OpenVR's (from the checkout Cargo built), the Rust crates'.
 L="$APP/Contents/Resources/licenses"

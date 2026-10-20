@@ -84,6 +84,12 @@ static void **g_engine_vtbl, **g_source_vtbl, **g_submix_vtbl, **g_master_vtbl;
 static void lock(engine *e) { pthread_mutex_lock(&e->lock); }
 static void unlock(engine *e) { pthread_mutex_unlock(&e->lock); }
 
+// VXRT_TRACE_AUDIO=1: what a program does with XAudio2 (engines, voices, buffers) and, every 10 s, how loud the
+// output was (a game that plays nothing and one whose sound is lost on the way look the same from outside)
+static int xa_trace(void) { static int on = -1; if (on < 0) { const char *t = getenv("VXRT_TRACE_AUDIO"); on = t && *t == '1'; } return on; }
+static volatile uint64_t g_xa_submitted, g_xa_callbacks;
+static volatile float g_xa_peak;
+
 // ---- output -----------------------------------------------------------------------------------------------------------
 static OSStatus output_callback(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 n, AudioBufferList *io) {
     (void)flags; (void)ts; (void)bus;
@@ -99,6 +105,18 @@ static OSStatus output_callback(void *ctx, AudioUnitRenderActionFlags *flags, co
     if (muted) memset(out, 0, (size_t)n * ch * sizeof(float));
     __atomic_add_fetch(&e->read, take, __ATOMIC_RELEASE);
     dispatch_semaphore_signal(ROOM(e));
+    if (xa_trace()) {
+        float peak = g_xa_peak;
+        for (uint32_t i = 0; i < n * ch; i++) { float a = out[i] < 0 ? -out[i] : out[i]; if (a > peak) peak = a; }
+        g_xa_peak = peak;
+        static double last; double now = CFAbsoluteTimeGetCurrent();
+        if (++g_xa_callbacks && now - last >= 10) {
+            last = now;
+            vx_log("XAudio2: output peak %.3f, %llu buffers submitted, %llu frames written in all%s", peak, (unsigned long long)g_xa_submitted,
+                   (unsigned long long)e->written, e->engine_started ? "" : " (engine stopped)");
+            g_xa_peak = 0;
+        }
+    }
     return noErr;
 }
 
@@ -326,6 +344,7 @@ static WINAPI void voice_destroy(void *this) {
 static WINAPI HRESULT source_start(void *this, uint32_t flags, uint32_t op) { (void)flags; (void)op; vself(this)->started = 1; return S_OK; }
 static WINAPI HRESULT source_stop(void *this, uint32_t flags, uint32_t op) { (void)flags; (void)op; vself(this)->started = 0; return S_OK; }
 static WINAPI HRESULT source_submit(void *this, const XA_BUFFER *b, const void *wma) {
+    __atomic_add_fetch(&g_xa_submitted, 1, __ATOMIC_RELAXED);
     voice *v = vself(this);
     if (wma || !b || !b->data || !b->bytes) return XAUDIO2_E_INVALID_CALL;
     queued *q = calloc(1, sizeof *q);
@@ -412,6 +431,7 @@ static WINAPI HRESULT engine_create_source(void *this, voice **out, const WAVEFO
     set_sends(v, sends);
     if (effects) voice_set_effects(v, effects);
     lock(e); v->next = e->voices; e->voices = v; unlock(e);
+    if (xa_trace()) { static int n; if (n++ < 10) vx_log("XAudio2: source voice tag %#x %u ch %u Hz %u bits", fmt->tag, fmt->channels, fmt->rate, fmt->bits); }
     *out = v;
     return S_OK;
 }
@@ -456,6 +476,7 @@ static WINAPI HRESULT engine_create_master(void *this, voice **out, uint32_t cha
         return (HRESULT)0x88960002;                              // XAUDIO2_E_DEVICE_INVALIDATED
     }
     lock(e); m->next = e->voices; e->voices = m; e->master = m; unlock(e);
+    if (xa_trace()) vx_log("XAudio2: mastering voice %u ch %u Hz started", channels, rate);
     if (!e->thread_running) {
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 1 << 20);
         e->thread_running = pthread_create(&e->thread, &a, engine_thread, e) == 0;
@@ -501,6 +522,7 @@ static void make_tables(void) {
 
 static WINAPI HRESULT XAudio2Create(void **out, uint32_t flags, uint32_t processor) {
     (void)flags; (void)processor;
+    if (xa_trace()) vx_log("XAudio2: XAudio2Create (flags %#x)", flags);
     pthread_once(&g_once, make_tables);
     engine *e = d3d_alloc(sizeof *e, K_STATE, g_engine_vtbl, NULL);
     pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);

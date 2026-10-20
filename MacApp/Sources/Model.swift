@@ -282,20 +282,35 @@ struct Job {
     // MARK: help
 
     func systemReport() -> String {
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
         return """
-        VeRantyx app \(version)
+        VeRantyx app \(AppBuild.description)
         Mac: \(Mac.model), \(Mac.chip), \(Mac.memoryGB) GB, macOS \(Mac.macOS)
         Headset: \(headset.rawValue)\(headset == .quest && wired ? " (USB cable)" : ""), quality \(quality.rawValue)
         Installed: \(steamVR ? "SteamVR" : "no SteamVR"), \(games.map(\.name).joined(separator: ", ")); runtime DLLs: \(redistCount)
         """
     }
 
-    func reportURL() -> URL {
+    /// GitHub's form, filled in: the title says the headset, the Mac and what went wrong (the last play's problem),
+    /// so that reports differ at a glance; `logs`, the zip file saved for it (Report.saveLogs).
+    func reportURL(logs: String? = nil) -> URL {
         var c = URLComponents(string: "https://github.com/Ag3497120/VeRantyx/issues/new")!
+        let kind: String
+        switch headset {
+        case .quest: kind = "[ALVR] Quest/Pico"
+        case .visionALVR: kind = "[ALVR] Vision Pro"
+        case .visionApp: kind = "[Vision Pro app]"
+        }
+        var what = (Play.lastProblem ?? "test report").split(whereSeparator: { ".。\n".contains($0) }).first.map(String.init) ?? "test report"
+        if what.count > 70 { what = String(what.prefix(67)) + "..." }
+        let title = "\(kind) + \(Mac.chip), macOS \(Mac.macOS): \(what)"
+        let logsText = logs.map { "Attached: \($0) (saved on the Desktop by the app; drag it here)" }
+            ?? "Logs: ~/Library/Logs/VeRantyx (Help > Open the logs folder)"
         c.queryItems = [URLQueryItem(name: "template", value: "alvr-headset.yml"),
-                        URLQueryItem(name: "mac", value: "\(Mac.model), \(Mac.chip), \(Mac.memoryGB) GB, macOS \(Mac.macOS)"),
+                        URLQueryItem(name: "title", value: title),
+                        URLQueryItem(name: "logs", value: logsText),
+                        URLQueryItem(name: "mac", value: "\(Mac.model), \(Mac.chip), \(Mac.memoryGB) GB, macOS \(Mac.macOS), VeRantyx \(AppBuild.description)"),
                         URLQueryItem(name: "command", value: "VeRantyx app: \(headset.rawValue)\(headset == .quest && wired ? ", USB cable" : ""), \(quality.rawValue)")]
+        c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")   // (a "+" is a space to GitHub)
         return c.url!
     }
 }

@@ -364,7 +364,23 @@ static int wine_builtin(const char *path) {
     fclose(f);
     return n == sizeof head && !memcmp(head + 0x40, "Wine builtin DLL", 16);
 }
+// VXRT_DLL_FIRST: a Mac directory whose DLLs are loaded in place of the program's own of the same file name, however it
+// names them (by name or by full path). The launch scripts put the frame-capture proxy there as openvr_api.dll (with
+// the game's own copied beside it as openvr_api_valve.dll), so a game's folder is never changed.
+static int preferred_dll(const char *name, char *out, size_t cap) {
+    const char *dir = getenv("VXRT_DLL_FIRST");
+    if (!dir || !*dir) return 0;
+    const char *base = name;
+    for (const char *c = name; *c; c++) if (*c == '\\' || *c == '/') base = c + 1;
+    char file[256];
+    snprintf(file, sizeof file, "%s%s", base, strchr(base, '.') ? "" : ".dll");
+    for (char *c = file; *c; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');   // (the files there: lower case)
+    snprintf(out, cap, "%s/%s", dir, file);
+    struct stat st;
+    return !stat(out, &st) && S_ISREG(st.st_mode);
+}
 static int search_dll(const char *name, char *out, size_t cap) {
+    if (preferred_dll(name, out, cap)) return 1;
     char file[256];
     snprintf(file, sizeof file, "%s%s", name, strchr(name, '.') ? "" : ".dll");
     char dirs[5][4096];
@@ -567,6 +583,15 @@ static void *load_library(const char *name, DWORD flags) {
     pthread_mutex_lock(&g_loader_lock);
     vx_image *m = NULL;
     void *h = NULL;
+    char preferred[4096];
+    if ((strchr(name, '\\') || strchr(name, '/')) && preferred_dll(name, preferred, sizeof preferred)) {
+        const char *base = name;                                     // (a full path to a DLL that VXRT_DLL_FIRST replaces)
+        for (const char *c = name; *c; c++) if (*c == '\\' || *c == '/') base = c + 1;
+        if (!(m = image_by_name(base))) m = load_pe(preferred, 0);
+        if (m) { m->refs++; if (!init_dll(m)) m = NULL; else h = m->base; }
+        pthread_mutex_unlock(&g_loader_lock);
+        return h;
+    }
     if (strchr(name, '\\') || strchr(name, '/')) {
         char path[4096], saved[4096];
         if (vx_unix_path(name, path, sizeof path)) {
@@ -970,7 +995,10 @@ static WINAPI void *GetProcAddress(void *module, const char *name) {
     void *fn = m ? pe_export(m, ordinal ? NULL : name, ordinal, 0) : builtin ? vx_find_export((const char *)module, ordinal ? by_number : name) : NULL;
     pthread_mutex_unlock(&g_loader_lock);
     if (fn && builtin) fn = vx_trace_wrap((const char *)module, ordinal ? by_number : name, fn);
-    if (fn && m && !ordinal && !strcmp(name, "VR_GetGenericInterface") && getenv("VXRT_TRACE_OPENVR")) {
+    // only the first module asked is wrapped: with the capture proxy that is the proxy, which itself then asks the
+    // real openvr_api for the same export; wrapping that too would send the game's calls past the proxy
+    if (fn && m && !ordinal && !strcmp(name, "VR_GetGenericInterface") && getenv("VXRT_TRACE_OPENVR")
+        && (!g_ovr_get_interface || g_ovr_get_interface == fn)) {
         g_ovr_get_interface = (void *(WINAPI *)(const char *, int *))fn;
         fn = (void *)ovr_get_interface;
     }

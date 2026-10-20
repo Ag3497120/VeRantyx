@@ -48,7 +48,11 @@ enum Quality: String, CaseIterable, Identifiable {
     var headsetConnected = false
     var fps: Double? = nil
     var gameLines: [String] = []
-    var problem: String? = nil
+    var problem: String? = nil { didSet { if let problem { Play.lastProblem = problem } } }
+    /// Something the player is asked to do now (not a problem): a first ALVR headset to connect.
+    var notice: String? = nil
+    /// The last problem a play ended with (in the title of a report written after it).
+    static var lastProblem: String?
     var startedAt = Date()
     @ObservationIgnored private var stopping = false
 
@@ -170,7 +174,15 @@ enum Quality: String, CaseIterable, Identifiable {
             let lastGone = log.range(of: "Client disconnected", options: .backwards)?.lowerBound
             headsetConnected = fresh && lastStream != nil && (lastGone == nil || lastStream! > lastGone!)
         }
-        if let hint = Play.hint(Play.tail(launcherLog, 6000)) { problem = hint }   // (the scripts' own messages)
+        let launcher = Play.tail(launcherLog, 6000)
+        if let hint = Play.hint(launcher) { problem = hint }   // (the scripts' own messages)
+        // a first ALVR headset: SteamVR waits for it (scripts/launch_vxrt_steamvr.sh), so the player connects it now
+        let firstWait = launcher.range(of: "First start with this ALVR headset", options: .backwards)?.lowerBound
+        let waitOver = launcher.range(of: "starting SteamVR", options: .backwards)?.lowerBound ?? launcher.range(of: "No ALVR headset connected yet", options: .backwards)?.lowerBound
+        notice = firstWait != nil && (waitOver == nil || waitOver! < firstWait!)
+            ? T("First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.",
+                "このヘッドセットで初めての起動です。ヘッドセットで ALVR を開いて接続してください。接続すると SteamVR が始まり、両目の映像がずれずに表示されます。")
+            : nil
     }
 
     nonisolated static func number(in line: Substring, after key: String) -> Double? {

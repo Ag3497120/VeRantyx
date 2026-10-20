@@ -45,9 +45,11 @@ cleanup() {
     wait "$STEAMVR_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
-for _ in $(seq 1 30); do                               # vrserver's web server is up once SteamVR has started
+waited=0                                               # vrserver's web server is up once SteamVR has started
+while (( waited < 30 )); do                            # (not counted while a first ALVR headset is awaited)
     sleep 1
     lsof -nP -iTCP:27062 -sTCP:LISTEN >/dev/null 2>&1 && break
+    [[ -f "$LOG_DIR/alvr-first-connection.wait" ]] || waited=$((waited + 1))
 done
 echo "SteamVR on VXRuntime is up; starting Half-Life: Alyx (log: $LOG_DIR/vxrt-alyx.log)"
 # (the quality presets are the Vision Pro app's; an ALVR headset shows its own rate, 90 Hz, and stretches the last
@@ -78,6 +80,17 @@ fi
 OVERLAY_ALYX_BIN="$VXRT_VR_OVERLAY/steamapps/common/Half-Life Alyx/game/bin/win64"
 mkdir -p "$OVERLAY_ALYX_BIN"
 cp -p "$PROXY_DLL" "$OVERLAY_ALYX_BIN/openvr_api.dll"
+# The proxy forwards to Valve's OpenVR client under the name openvr_api_valve.dll: the game's own openvr_api.dll,
+# copied into the overlay beside the proxy (the game's folder stays as it is). Without it VR initialization fails
+# with an empty error code (issues #2, #4). A game folder that still has a proxy as openvr_api.dll (an old Wine-era
+# install) keeps Valve's beside it as openvr_api_valve.dll: that one is used then.
+VALVE_DLL="$ALYX_BIN/openvr_api.dll"
+grep -aq "openvr_api_valve.dll" "$VALVE_DLL" 2>/dev/null && VALVE_DLL="$ALYX_BIN/openvr_api_valve.dll"
+if [[ -f "$VALVE_DLL" ]]; then
+    cmp -s "$VALVE_DLL" "$OVERLAY_ALYX_BIN/openvr_api_valve.dll" || cp -p "$VALVE_DLL" "$OVERLAY_ALYX_BIN/openvr_api_valve.dll"
+else
+    echo "Half-Life: Alyx's openvr_api.dll was not found in $ALYX_BIN: verify the game's files in Steam" >&2
+fi
 # Poses at the display's rate from the headset instead of SteamVR's compositor, which handed out the next ones only
 # once the GPU had finished the last frame (a frame took the CPU's time plus the GPU's: 45 fps at 3K, now 60).
 # VERANTYX_DECOUPLED_POSES=0: SteamVR's.

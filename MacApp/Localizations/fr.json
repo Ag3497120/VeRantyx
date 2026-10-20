@@ -162,5 +162,10 @@
   "Language": "Langue",
   "Automatic": "Automatique",
   "Takes effect when VeRantyx starts again.": "Prend effet au prochain lancement de VeRantyx.",
-  "Restart": "Relancer"
+  "Restart": "Relancer",
+  "Before you report": "Avant de signaler",
+  "Someone may have reported the same problem already: a look at the existing reports first can save you the time. For a new report, the app saves your logs as a zip file on the Desktop, with your Mac user name and Steam ID taken out; drag it into the form's Logs field.": "Quelqu’un a peut-être déjà signalé le même problème : jeter d’abord un œil aux signalements existants peut vous faire gagner du temps. Pour un nouveau signalement, l’app enregistre vos journaux dans un fichier zip sur le Bureau, sans votre nom d’utilisateur Mac ni votre identifiant Steam ; glissez-le dans le champ « Logs » du formulaire.",
+  "Write a new report": "Écrire un nouveau signalement",
+  "Look at existing reports": "Voir les signalements existants",
+  "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "Premier démarrage avec ce casque : ouvrez ALVR sur le casque et connectez-vous maintenant. SteamVR démarre dès qu’il est connecté, pour que l’image soit alignée dans les deux yeux."
 }

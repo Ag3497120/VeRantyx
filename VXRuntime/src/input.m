@@ -11,6 +11,10 @@ static uint32_t g_packets[4];
 static GAMEPAD g_last[4];
 
 static GCExtendedGamepad *gamepad(DWORD user) {
+    // macOS gives controller input only to the frontmost app unless asked: a game played in a headset is seldom
+    // the Mac's frontmost window.
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ if (@available(macOS 11.3, *)) GCController.shouldMonitorBackgroundEvents = YES; });
     DWORD n = 0;
     for (GCController *c in GCController.controllers) {
         if (!c.extendedGamepad) continue;
@@ -20,7 +24,18 @@ static GCExtendedGamepad *gamepad(DWORD user) {
 }
 static int16_t axis(float v) { return (int16_t)(v < -1 ? -32768 : v > 1 ? 32767 : v < 0 ? v * 32768 : v * 32767); }
 
+static void trace_calls(DWORD user) {
+    static int on = -1; static unsigned calls;
+    if (on < 0) on = getenv("VXRT_TRACE_INPUT") != NULL;
+    if (!on || __sync_add_and_fetch(&calls, 1) % 600 != 1) return;
+    NSMutableString *names = [NSMutableString string];
+    for (GCController *c in GCController.controllers)
+        [names appendFormat:@" [%@%s]", c.vendorName ?: @"?", c.extendedGamepad ? "" : ", no extended profile"];
+    vx_log("XInput: %u calls (user %u now); macOS shows %lu controller(s):%s", calls, (unsigned)user,
+           (unsigned long)GCController.controllers.count, names.length ? names.UTF8String : " none");
+}
 static WINAPI DWORD XInputGetState(DWORD user, STATE *state) {
+    trace_calls(user);
     if (user > 3) return 87;
     GCExtendedGamepad *g = gamepad(user);
     if (!g) return ERROR_DEVICE_NOT_CONNECTED;
@@ -43,7 +58,12 @@ static WINAPI DWORD XInputGetState(DWORD user, STATE *state) {
     p.right_trigger = (uint8_t)(g.rightTrigger.value * 255.0f + 0.5f);
     p.lx = axis(g.leftThumbstick.xAxis.value); p.ly = axis(g.leftThumbstick.yAxis.value);   // both y axes point up, as in XInput
     p.rx = axis(g.rightThumbstick.xAxis.value); p.ry = axis(g.rightThumbstick.yAxis.value);
-    if (memcmp(&p, &g_last[user], sizeof p)) { g_last[user] = p; g_packets[user]++; }
+    if (memcmp(&p, &g_last[user], sizeof p)) {
+        if (!g_packets[user]) vx_log("XInput user %u: %s", (unsigned)user, g.controller.vendorName.UTF8String ?: "a controller");
+        if (getenv("VXRT_TRACE_INPUT")) vx_log("XInput user %u: buttons %#x triggers %u %u sticks %d %d %d %d", (unsigned)user, p.buttons,
+                                               p.left_trigger, p.right_trigger, p.lx, p.ly, p.rx, p.ry);
+        g_last[user] = p; g_packets[user]++;
+    }
     state->packet = g_packets[user];
     state->pad = p;
     return 0;

@@ -36,6 +36,8 @@
 	<string>@VERSION@</string>
 	<key>CFBundleVersion</key>
 	<string>@BUILD@</string>
+	<key>VeRantyxCommit</key>
+	<string>@COMMIT@</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.2</string>
 	<key>LSApplicationCategoryType</key>

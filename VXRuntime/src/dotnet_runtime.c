@@ -30,6 +30,12 @@
 
 extern char **environ;
 
+static int gil_enter(void);
+static void gil_leave(int entered);
+static int gil_suspend(void);
+static void gil_resume(int depth);
+static DWORD clr_wait_one(HANDLE handle, DWORD ms);
+
 static int clr_trace_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -40,6 +46,7 @@ static int clr_trace_enabled(void) {
 }
 
 // VXRT_TRACE_CLR=1: the managed methods entered, one line each (without VXRT_TRACE's record of every Windows call).
+static __thread uint32_t t_call_depth;   // managed calls on this host thread (each managed thread has its own)
 static int clr_trace_methods_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -290,7 +297,7 @@ typedef struct {
     uint32_t field_address_capacity;
     clr_wpf_command wpf_commands[128];
     uint32_t wpf_command_count;
-    uint32_t call_depth;
+    uint32_t call_depth_unused;    // (the call depth is per host thread: t_call_depth)
     uint32_t steps;
     clr_object *pending_exception;   // a managed exception on its way up the frames (throw, or a framework call that threw)
     char *error;
@@ -943,6 +950,7 @@ static clr_object *new_array(clr_runtime *rt, clr_module *module,
     return array;
 }
 
+static int clr_throw(clr_runtime *rt, clr_module *module, const char *namespace_, const char *name, const char *message);
 static int clr_array_index(clr_runtime *rt, clr_object *array, clr_value index,
                            uint32_t *element_index) {
     if (!array || !array->is_array || !element_index ||
@@ -951,10 +959,11 @@ static int clr_array_index(clr_runtime *rt, clr_object *array, clr_value index,
         return 0;
     }
     int64_t signed_index = index.kind == V_I4 ? (int32_t)index.bits : (int64_t)index.bits;
-    if (signed_index < 0 || (uint64_t)signed_index >= array->array_length) {
-        set_error(rt, "managed array index %lld is outside length %u",
-                  (long long)signed_index, array->array_length);
-        return 0;
+    if (signed_index < 0 || (uint64_t)signed_index >= array->array_length) {   // (an exception the program can catch)
+        char message[96];
+        snprintf(message, sizeof message, "Index %lld was outside the bounds of the array (length %u).",
+                 (long long)signed_index, array->array_length);
+        return clr_throw(rt, array->module, "System", "IndexOutOfRangeException", message);
     }
     *element_index = (uint32_t)signed_index;
     return 1;
@@ -1001,7 +1010,9 @@ static int clr_array_load(clr_runtime *rt, clr_object *array, uint32_t index,
             set_error(rt, "CIL ldelem.ref received a value-type array");
             return 0;
         }
-        *value = (clr_value){ .bits = (uintptr_t)array->array_items[index], .kind = V_REF };
+        // (array_values holds the element too, and is what an ldelema pointer writes through: it wins when set)
+        clr_value element = array->array_values[index];
+        *value = element.kind == V_REF ? element : (clr_value){ .bits = (uintptr_t)array->array_items[index], .kind = V_REF };
         return 1;
     }
     clr_value element = array->array_values[index];
@@ -1520,6 +1531,7 @@ static int managed_file_write_all_text(clr_runtime *rt, const clr_method *method
 static int managed_file_append_text(clr_runtime *rt, const clr_method *method,
                                     clr_value *arguments, uint32_t argument_count,
                                     clr_value *result) {
+    int create = !strcmp(method->name, "CreateText");            // (CreateText: the same writer on an emptied file)
     if (method->has_this || argument_count != 1 || arguments[0].kind != V_REF ||
         !arguments[0].bits) {
         set_error(rt, "File.AppendText requires one non-null path");
@@ -1541,7 +1553,7 @@ static int managed_file_append_text(clr_runtime *rt, const clr_method *method,
         return 0;
     }
     free(windows_path);
-    FILE *stream = fopen(unix_path, "ab");
+    FILE *stream = fopen(unix_path, create ? "wb" : "ab");
     if (!stream) {
         DWORD error = vx_error_from_errno(errno);
         vx_set_last_error(error);
@@ -1864,6 +1876,54 @@ typedef struct {
 typedef HANDLE (WINAPI *clr_find_first_w_fn)(const WCHAR *, clr_find_data_w *);
 typedef BOOL (WINAPI *clr_find_next_w_fn)(HANDLE, clr_find_data_w *);
 typedef BOOL (WINAPI *clr_find_close_fn)(HANDLE);
+// Directory.Delete(path[, recursive]) on kernel32 (so through the overlay as every write): 1 deleted, 0 failed with
+// the Windows error in *error (3 path not found, 145 not empty)
+static int delete_directory_w(const WCHAR *path, int recursive, DWORD *error) {
+    clr_find_first_w_fn find_first = (clr_find_first_w_fn)vx_find_export("kernel32.dll", "FindFirstFileW");
+    clr_find_next_w_fn find_next = (clr_find_next_w_fn)vx_find_export("kernel32.dll", "FindNextFileW");
+    clr_find_close_fn find_close = (clr_find_close_fn)vx_find_export("kernel32.dll", "FindClose");
+    BOOL (WINAPI *delete_file)(const WCHAR *) = (BOOL (WINAPI *)(const WCHAR *))vx_find_export("kernel32.dll", "DeleteFileW");
+    BOOL (WINAPI *remove_directory)(const WCHAR *) = (BOOL (WINAPI *)(const WCHAR *))vx_find_export("kernel32.dll", "RemoveDirectoryW");
+    BOOL (WINAPI *set_attributes)(const WCHAR *, DWORD) = (BOOL (WINAPI *)(const WCHAR *, DWORD))vx_find_export("kernel32.dll", "SetFileAttributesW");
+    if (!find_first || !find_next || !find_close || !delete_file || !remove_directory) { *error = 120; return 0; }
+    size_t length = 0;
+    while (path[length]) length++;
+    if (recursive) {
+        WCHAR *pattern = calloc(length + 3, sizeof *pattern);
+        if (!pattern) { *error = 8; return 0; }
+        memcpy(pattern, path, length * sizeof *pattern);
+        size_t at = length;
+        if (at && pattern[at - 1] != '\\' && pattern[at - 1] != '/') pattern[at++] = '\\';
+        pattern[at] = '*';
+        clr_find_data_w data;
+        HANDLE find = find_first(pattern, &data);
+        if (find != (HANDLE)(intptr_t)-1) {                                    // (INVALID_HANDLE_VALUE)
+            do {
+                if (data.name[0] == '.' && (!data.name[1] || (data.name[1] == '.' && !data.name[2]))) continue;
+                size_t name_length = 0;
+                while (data.name[name_length]) name_length++;
+                WCHAR *child = calloc(at + name_length + 1, sizeof *child);
+                if (!child) { find_close(find); free(pattern); *error = 8; return 0; }
+                memcpy(child, pattern, at * sizeof *child);
+                memcpy(child + at, data.name, name_length * sizeof *child);
+                int ok;
+                if (data.attributes & 0x10) ok = delete_directory_w(child, 1, error);                 // FILE_ATTRIBUTE_DIRECTORY
+                else {
+                    if (set_attributes && (data.attributes & 1)) set_attributes(child, 0x80);         // read-only: as .NET
+                    ok = delete_file(child);
+                    if (!ok) *error = vx_get_last_error();
+                }
+                free(child);
+                if (!ok) { find_close(find); free(pattern); return 0; }
+            } while (find_next(find, &data));
+            find_close(find);
+        }
+        free(pattern);
+    }
+    if (!remove_directory(path)) { *error = vx_get_last_error(); return 0; }
+    return 1;
+}
+
 
 static int clr_directory_vector_add(clr_runtime *rt, clr_directory_vector *vector,
                                     clr_object *path) {
@@ -5266,13 +5326,69 @@ static void insert_thousands_groups(char *text, size_t capacity) {
     }
 }
 
+
+// A custom numeric format ("0.00", "#,##0", "00", "0.#%", literal text, 'quoted' text, \x escapes; one section, no
+// exponent): the value rounded to the format's decimals, at least as many integer digits as it has 0s before the
+// point, grouped by threes when a ',' stands between digit places, times 100 with a '%'. 0 when it is not one.
+static int custom_number_format(const char *format, double value, char *out, size_t capacity) {
+    if (!format || !*format || strchr(format, ';') || strchr(format, 'E') || strchr(format, 'e')) return 0;
+    int int_zeros = 0, frac_zeros = 0, frac_hashes = 0, group = 0, percent = 0, digit_places = 0, seen_point = 0;
+    for (const char *f = format; *f; f++) {
+        if (*f == '\\' && f[1]) { f++; continue; }
+        if (*f == '\'' || *f == '"') { char q = *f; while (f[1] && f[1] != q) f++; if (f[1]) f++; continue; }
+        if (*f == '0' || *f == '#') { digit_places++; if (seen_point) { if (*f == '0') frac_zeros++; else frac_hashes++; } else if (*f == '0') int_zeros++; }
+        else if (*f == '.') seen_point = 1;
+        else if (*f == ',' && !seen_point && digit_places && (f[1] == '0' || f[1] == '#')) group = 1;
+        else if (*f == '%') percent = 1;
+    }
+    if (!digit_places) return 0;
+    if (percent) value *= 100.0;
+    int decimals = frac_zeros + frac_hashes;
+    char digits[128];
+    double scale = pow(10.0, decimals), magnitude = round(fabs(value) * scale) / scale;   // halves away from zero, as .NET
+    snprintf(digits, sizeof digits, "%.*f", decimals, magnitude);
+    char *point = strchr(digits, '.');
+    if (point && frac_hashes) {                                   // optional decimals: trailing zeros dropped
+        char *end = digits + strlen(digits) - 1;
+        while (end > point + frac_zeros && *end == '0') *end-- = 0;
+        if (end == point) *end = 0;
+    }
+    point = strchr(digits, '.');
+    size_t int_len = point ? (size_t)(point - digits) : strlen(digits);
+    char integer[160] = "";
+    size_t pad = int_len == 1 && digits[0] == '0' && int_zeros == 0 ? 1 : 0;   // "#" and 0: no integer digit at all
+    if ((int)int_len < int_zeros) { memset(integer, '0', (size_t)int_zeros - int_len); integer[int_zeros - int_len] = 0; }
+    strncat(integer, pad ? "" : digits, pad ? 0 : int_len);
+    if (group) insert_thousands_groups(integer, sizeof integer);
+    int negative = value < 0 && strspn(digits, "0.") != strlen(digits);
+    char number[200];
+    snprintf(number, sizeof number, "%s%s%s", negative ? "-" : "", integer, point ? point : "");
+    // the number goes where the first digit place is; the literal text around it stays
+    size_t n = 0; int placed = 0;
+    for (const char *f = format; *f && n + 1 < capacity; f++) {
+        if (*f == '\\' && f[1]) { out[n++] = *++f; continue; }
+        if (*f == '\'' || *f == '"') { char q = *f; while (f[1] && f[1] != q && n + 1 < capacity) out[n++] = *++f; if (f[1]) f++; continue; }
+        if (*f == '0' || *f == '#' || *f == '.' || (*f == ',' && group)) {
+            if (!placed) { size_t len = strlen(number); if (n + len >= capacity) return 0; memcpy(out + n, number, len); n += len; placed = 1; }
+            continue;
+        }
+        out[n++] = *f;
+    }
+    out[n] = 0;
+    return 1;
+}
 static int append_integer_value(clr_runtime *rt, clr_string_builder *builder,
                                 const char *type_name, clr_value value, const char *format) {
     char specifier;
     unsigned precision;
     int has_precision;
     if (!string_format_spec(format, &specifier, &precision, &has_precision)) {
-        set_error(rt, "System.String.Format received an unsupported integer format specifier");
+        int is_signed = !strcmp(type_name, "SByte") || !strcmp(type_name, "Int16") || !strcmp(type_name, "Int32") || !strcmp(type_name, "Int64");
+        int is_64 = value.kind == V_I8 || !strcmp(type_name, "Int64") || !strcmp(type_name, "UInt64");
+        double d = is_signed ? (double)(is_64 ? (int64_t)value.bits : (int32_t)value.bits) : (double)(is_64 ? value.bits : (uint32_t)value.bits);
+        char custom[256];
+        if (custom_number_format(format, d, custom, sizeof custom)) return string_builder_append_ascii(rt, builder, custom);
+        set_error(rt, "System.String.Format received an unsupported integer format \"%s\"", format);
         return 0;
     }
     int is_signed = !strcmp(type_name, "SByte") || !strcmp(type_name, "Int16") ||
@@ -5328,7 +5444,12 @@ static int append_float_value(clr_runtime *rt, clr_string_builder *builder,
     if (!string_format_spec(format, &specifier, &precision, &has_precision) ||
         (specifier && specifier != 'G' && specifier != 'g' && specifier != 'F' && specifier != 'f' &&
          specifier != 'N' && specifier != 'n' && specifier != 'E' && specifier != 'e' && specifier != 'P' && specifier != 'p')) {
-        set_error(rt, "System.String.Format received an unsupported floating-point format specifier");
+        double d;
+        if (!strcmp(type_name, "Single")) { uint32_t bits = (uint32_t)value.bits; float f; memcpy(&f, &bits, sizeof f); d = f; }
+        else memcpy(&d, &value.bits, sizeof d);
+        char custom[256];
+        if (custom_number_format(format, d, custom, sizeof custom)) return string_builder_append_ascii(rt, builder, custom);
+        set_error(rt, "System.String.Format received an unsupported floating-point format \"%s\"", format);
         return 0;
     }
     double number;
@@ -6650,6 +6771,12 @@ static int mutex_construct(clr_runtime *rt, const clr_method *method,
         for (uint32_t i = 0; i < name->string_units; i++) name_copy[i] = string_unit_at(name, i);
     }
     mutex->mutex_handle = create_mutex(NULL, initially_owned, name_copy);
+    {   // (which mutex a later WaitOne waits on, if one blocks: see mutex_wait)
+        char narrow[128] = "(unnamed)";
+        for (uint32_t i = 0; name_copy && i < name->string_units && i < sizeof narrow - 1; i++) { narrow[i] = (char)name_copy[i]; narrow[i + 1] = 0; }
+        if (clr_trace_methods_enabled() || getenv("VXRT_TRACE_MUTEX"))
+            vx_log("[vxrt] CLR: Mutex %s made (owned %d): handle %p", narrow, (int)initially_owned, mutex->mutex_handle);
+    }
     free(name_copy);
     DWORD creation_error = get_last_error ? get_last_error() : 0;
     if (!mutex->mutex_handle) {
@@ -6669,6 +6796,9 @@ static int mutex_construct(clr_runtime *rt, const clr_method *method,
     return 1;
 }
 
+static DWORD clr_wait_one(HANDLE handle, DWORD ms);      // (managed threads take turns: see clr_thread_spawn)
+static int gil_suspend(void);
+static void gil_resume(int depth);
 static int mutex_wait(clr_runtime *rt, clr_value *arguments, uint32_t argument_count,
                       clr_value *result) {
     if ((argument_count != 1 && argument_count != 2 && argument_count != 3) ||
@@ -6698,7 +6828,9 @@ static int mutex_wait(clr_runtime *rt, clr_value *arguments, uint32_t argument_c
         set_error(rt, "System.Threading.WaitHandle.WaitOne requires kernel32!WaitForSingleObject");
         return 0;
     }
-    DWORD status = wait_one(mutex->mutex_handle, timeout);
+    // (the other managed threads run while this one waits: clr_wait_one)
+    (void)wait_one;
+    DWORD status = clr_wait_one(mutex->mutex_handle, timeout);
     if (status == 0 || status == 0x80) {
         *result = (clr_value){ .bits = 1, .kind = V_I4 };
         return 1;
@@ -7032,7 +7164,12 @@ static int monitor_enter(clr_runtime *rt, clr_value *arguments, uint32_t argumen
     }
     clr_object *object = (clr_object *)(uintptr_t)arguments[0].bits;
     if (!monitor_initialize(rt, object)) return 0;
-    int status = pthread_mutex_lock(&object->monitor);
+    int status = pthread_mutex_trylock(&object->monitor);
+    if (status == EBUSY) {                                       // another thread holds it: the others run meanwhile
+        int held = gil_suspend();
+        status = pthread_mutex_lock(&object->monitor);
+        gil_resume(held);
+    }
     if (status) {
         set_error(rt, "System.Threading.Monitor.Enter failed (pthread error %d)", status);
         return 0;
@@ -8090,8 +8227,16 @@ static int dispatch_drain(clr_runtime *rt) {
     return 1;
 }
 
+static int64_t WINAPI clr_wpf_window_proc_locked(HANDLE hwnd, uint32_t message, uint64_t wparam, int64_t lparam);
 static int64_t WINAPI clr_wpf_window_proc(HANDLE hwnd, uint32_t message,
                                            uint64_t wparam, int64_t lparam) {
+    int entered = gil_enter();                     // (a message sent while the loop waited arrives without the lock)
+    int64_t r = clr_wpf_window_proc_locked(hwnd, message, wparam, lparam);
+    gil_leave(entered);
+    return r;
+}
+static int64_t WINAPI clr_wpf_window_proc_locked(HANDLE hwnd, uint32_t message,
+                                                  uint64_t wparam, int64_t lparam) {
     clr_runtime *rt = g_wpf_runtime;
     void *def_window_proc = vx_find_export("user32.dll", "DefWindowProcW");
     if (!rt || !g_wpf_window) return def_window_proc ?
@@ -8252,8 +8397,11 @@ static int wpf_show_and_run(clr_runtime *rt, clr_object *window) {
 
     clr_wpf_msg message;
     int status;
-    while ((status = ((int (WINAPI *)(clr_wpf_msg *, HANDLE, uint32_t, uint32_t))get_message)(
-                &message, NULL, 0, 0)) > 0) {
+    for (;;) {
+        int held = gil_suspend();                                      // (the other managed threads run while it waits)
+        status = ((int (WINAPI *)(clr_wpf_msg *, HANDLE, uint32_t, uint32_t))get_message)(&message, NULL, 0, 0);
+        gil_resume(held);
+        if (status <= 0) break;
         ((BOOL (WINAPI *)(const clr_wpf_msg *))translate)(&message);
         ((int64_t (WINAPI *)(const clr_wpf_msg *))dispatch)(&message);
     }
@@ -9417,15 +9565,15 @@ static char *cfstring_copy_utf8(CFStringRef string) {
 
 static int web_buffer_append(clr_runtime *rt, uint8_t **buffer, size_t *length,
                              size_t *capacity, const void *bytes, size_t count) {
-    if (count > 64u * 1024u * 1024u || *length > 64u * 1024u * 1024u - count) {
-        set_error(rt, "managed HTTP body exceeds the 64 MiB runtime limit");
+    if (count > 1024u * 1024u * 1024u || *length > 1024u * 1024u * 1024u - count) {   // (the launcher fetches the game's .exe, 100 MB)
+        set_error(rt, "managed HTTP body exceeds the 1 GiB runtime limit");
         return 0;
     }
     size_t needed = *length + count;
     if (needed > *capacity) {
         size_t grown = *capacity ? *capacity : 4096;
         while (grown < needed) {
-            if (grown > (64u * 1024u * 1024u) / 2) { grown = 64u * 1024u * 1024u; break; }
+            if (grown > (1024u * 1024u * 1024u) / 2) { grown = 1024u * 1024u * 1024u; break; }
             grown *= 2;
         }
         uint8_t *copy = realloc(*buffer, grown ? grown : 1);
@@ -9953,47 +10101,51 @@ static int web_perform_request(clr_runtime *rt, clr_object *managed_request,
         DWORD never = 0;
         winhttp_set_option(win_request, 88u /* WINHTTP_OPTION_REDIRECT_POLICY */, &never, sizeof never);
     }
-    if (!winhttp_send(win_request, header_wide, UINT32_MAX, NULL, 0,
-                      (DWORD)managed_request->web_upload_size, 0)) {
-        free(header_wide); set_error(rt, "WinHTTP could not send the request headers");
-        goto web_cleanup_handles;
+    // The network part runs without the interpreter's lock (other managed threads run meanwhile: the launcher fetches
+    // with several threads), so it touches nothing of the runtime: the body goes into a buffer of its own first.
+    const char *network_error = NULL;
+    uint8_t *body = NULL;
+    size_t body_size = 0, body_capacity = 0;
+    DWORD status_code = 0, status_size = sizeof status_code;
+    const uint8_t *upload = managed_request->web_upload;
+    size_t upload_size = managed_request->web_upload_size;
+    int held = gil_suspend();
+    if (!winhttp_send(win_request, header_wide, UINT32_MAX, NULL, 0, (DWORD)upload_size, 0)) {
+        network_error = "WinHTTP could not send the request headers";
     }
-    free(header_wide);
-    size_t upload_at = 0;
-    while (upload_at < managed_request->web_upload_size) {
-        size_t remain = managed_request->web_upload_size - upload_at;
+    for (size_t upload_at = 0; !network_error && upload_at < upload_size; ) {
+        size_t remain = upload_size - upload_at;
         DWORD count = remain > UINT32_MAX ? UINT32_MAX : (DWORD)remain;
         DWORD written = 0;
-        if (!winhttp_write(win_request, managed_request->web_upload + upload_at, count, &written) ||
-            !written || written > count) {
-            set_error(rt, "WinHTTP could not write the request body");
-            goto web_cleanup_handles;
-        }
+        if (!winhttp_write(win_request, upload + upload_at, count, &written) || !written || written > count)
+            network_error = "WinHTTP could not write the request body";
         upload_at += written;
     }
-    if (!winhttp_receive(win_request, NULL)) {
-        set_error(rt, "WinHTTP could not receive the HTTP response");
-        goto web_cleanup_handles;
-    }
-    DWORD status_code = 0, status_size = sizeof status_code;
-    if (!winhttp_query(win_request, 19u | 0x20000000u, NULL,
-                       &status_code, &status_size, NULL)) {
-        set_error(rt, "WinHTTP could not query the HTTP status code");
-        goto web_cleanup_handles;
-    }
-    response->web_status = status_code;
-    uint8_t chunk[8192];
-    for (;;) {
+    if (!network_error && !winhttp_receive(win_request, NULL)) network_error = "WinHTTP could not receive the HTTP response";
+    if (!network_error && !winhttp_query(win_request, 19u | 0x20000000u, NULL, &status_code, &status_size, NULL))
+        network_error = "WinHTTP could not query the HTTP status code";
+    while (!network_error) {
+        uint8_t chunk[65536];
         DWORD read_count = 0;
-        if (!winhttp_read(win_request, chunk, sizeof chunk, &read_count)) {
-            set_error(rt, "WinHTTP could not read the HTTP response body");
-            goto web_cleanup_handles;
-        }
+        if (!winhttp_read(win_request, chunk, sizeof chunk, &read_count)) { network_error = "WinHTTP could not read the HTTP response body"; break; }
         if (!read_count) break;
-        if (!web_buffer_append(rt, &response->web_body, &response->web_body_size,
-                               &response->web_body_capacity, chunk, read_count))
-            goto web_cleanup_handles;
+        if (body_size + read_count > body_capacity) {
+            size_t capacity = body_capacity ? body_capacity * 2 : 65536;
+            while (capacity < body_size + read_count) capacity *= 2;
+            uint8_t *grown = realloc(body, capacity);
+            if (!grown) { network_error = "out of memory reading an HTTP response body"; break; }
+            body = grown; body_capacity = capacity;
+        }
+        memcpy(body + body_size, chunk, read_count);
+        body_size += read_count;
     }
+    gil_resume(held);
+    free(header_wide);
+    if (network_error) { free(body); set_error(rt, "%s", network_error); goto web_cleanup_handles; }
+    response->web_status = status_code;
+    if (body_size && !web_buffer_append(rt, &response->web_body, &response->web_body_size,
+                                        &response->web_body_capacity, body, (uint32_t)body_size)) { free(body); goto web_cleanup_handles; }
+    free(body);
     if (!response->web_headers) {
         response->web_headers = new_object(rt, managed_request->module, 0,
             "System.Collections.Specialized", "NameValueCollection");
@@ -13048,6 +13200,100 @@ static int thread_run_inline(clr_runtime *rt, clr_object *delegate, int has_argu
     return execute_method(rt, callback.module, callback.token, call_arguments, n, &ignored);
 }
 
+// ---- managed threads on host threads, one at a time ------------------------------------------------------------------
+// The interpreter's state (clr_runtime) is not made for two threads at once, so a program's threads run on host threads
+// that take turns: one lock, held while managed code runs and given up where a thread blocks (Thread.Sleep and Join,
+// WaitHandle.WaitOne, Monitor.Enter on a lock another thread holds, the window message loop's wait). Before the first
+// Thread.Start (or QueueUserWorkItem) there is one thread and the lock is not used. FIFO tickets keep the turns fair.
+// (Before, a thread's body ran to its end inside Start: a worker that sleeps until another thread has done its part,
+// as the launcher's file check does, then never woke.)
+static struct {
+    pthread_mutex_t m; pthread_cond_t c;
+    volatile int active;
+    uint64_t next, serving;
+    pthread_t owner; int depth;
+} g_gil = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0, 0, 0 };
+static void gil_acquire(void) {
+    pthread_mutex_lock(&g_gil.m);
+    uint64_t ticket = g_gil.next++;
+    while (g_gil.serving != ticket) pthread_cond_wait(&g_gil.c, &g_gil.m);
+    g_gil.owner = pthread_self();
+    g_gil.depth = 1;
+    pthread_mutex_unlock(&g_gil.m);
+}
+static void gil_release(void) {
+    pthread_mutex_lock(&g_gil.m);
+    g_gil.depth = 0;
+    g_gil.owner = 0;
+    g_gil.serving++;
+    pthread_cond_broadcast(&g_gil.c);
+    pthread_mutex_unlock(&g_gil.m);
+}
+static int gil_holding(void) { return g_gil.active && g_gil.depth > 0 && pthread_equal(g_gil.owner, pthread_self()); }
+// managed code is about to run on this host thread (a window procedure, a thread's body): 1 when it took the lock
+static int gil_enter(void) {
+    if (!g_gil.active) return 0;
+    if (gil_holding()) { g_gil.depth++; return 1; }
+    gil_acquire();
+    return 1;
+}
+static void gil_leave(int entered) {
+    if (entered && --g_gil.depth == 0) gil_release();
+}
+// around a wait that blocks: the lock goes to the other threads meanwhile (returns what gil_resume needs)
+static int gil_suspend(void) {
+    if (!gil_holding()) return 0;
+    int depth = g_gil.depth;
+    gil_release();
+    return depth;
+}
+static void gil_resume(int depth) {
+    if (!depth) return;
+    gil_acquire();
+    g_gil.depth = depth;
+}
+static void gil_activate(void) {                       // (the first second thread: the starter holds the lock from now on)
+    if (g_gil.active) return;
+    g_gil.active = 1;
+    gil_acquire();
+}
+
+typedef struct { clr_runtime *rt; clr_object *delegate; int has_argument; clr_value argument; } clr_thread_start;
+static WINAPI DWORD clr_thread_main(void *param) {
+    clr_thread_start start = *(clr_thread_start *)param;
+    free(param);
+    int entered = gil_enter();
+    if (!thread_run_inline(start.rt, start.delegate, start.has_argument, start.argument)) {
+        // (an exception left the thread's body: on Windows it ends the process; here it is logged and the thread ends)
+        vx_log("[vxrt] CLR: a thread ended with an error: %s", start.rt->error[0] ? start.rt->error : "an unhandled exception");
+        start.rt->error[0] = 0;
+    }
+    gil_leave(entered);
+    return 0;
+}
+// a managed thread's body on a host thread of its own; its handle (for Join and IsAlive), or NULL
+static HANDLE clr_thread_spawn(clr_runtime *rt, clr_object *delegate, int has_argument, clr_value argument) {
+    HANDLE (WINAPI *create_thread)(void *, size_t, DWORD (WINAPI *)(void *), void *, DWORD, DWORD *) =
+        (HANDLE (WINAPI *)(void *, size_t, DWORD (WINAPI *)(void *), void *, DWORD, DWORD *))dotnet_kernel32_export("CreateThread");
+    clr_thread_start *start = malloc(sizeof *start);
+    if (!create_thread || !start) { free(start); return NULL; }
+    *start = (clr_thread_start){ rt, delegate, has_argument, argument };
+    gil_activate();
+    HANDLE thread = create_thread(NULL, 64u << 20, clr_thread_main, start, 0, NULL);   // (deep interpreter recursion: 64 MB)
+    if (!thread) free(start);
+    return thread;
+}
+static DWORD clr_wait_one(HANDLE handle, DWORD ms) {   // a wait that lets the other managed threads run meanwhile
+    DWORD (WINAPI *wait)(HANDLE, DWORD) = (DWORD (WINAPI *)(HANDLE, DWORD))dotnet_kernel32_export("WaitForSingleObject");
+    if (!wait) return 0xffffffffu;
+    DWORD status = wait(handle, 0);
+    if (status != 0x102 || !ms) return status;
+    int held = gil_suspend();
+    status = wait(handle, ms);
+    gil_resume(held);
+    return status;
+}
+
 
 static int text_system_invoke(clr_runtime *rt, const clr_method *method, clr_value *arguments,
                               uint32_t argument_count, clr_value *result) {
@@ -13196,6 +13442,28 @@ static int text_system_invoke(clr_runtime *rt, const clr_method *method, clr_val
         }
     }
     // ---- Directory.GetFiles: the directory enumerator in its files mode
+    if (!strcmp(ns, "System.IO") && !strcmp(type, "Directory") && !strcmp(name, "Delete") && !method->has_this &&
+        argument_count >= 1 && arguments[0].kind == V_REF && arguments[0].bits) {
+        WCHAR *path = managed_wide_copy(rt, (clr_object *)(uintptr_t)arguments[0].bits);
+        if (!path) return 0;
+        DWORD error = 0;
+        int ok = delete_directory_w(path, argument_count >= 2 && arguments[1].bits, &error);
+        free(path);
+        if (!ok) {
+            if (error == 2 || error == 3) return clr_throw(rt, module, "System.IO", "DirectoryNotFoundException", "Could not find a part of the path.");
+            if (error == 5) return clr_throw(rt, module, "System", "UnauthorizedAccessException", "Access to the path is denied.");
+            return clr_throw(rt, module, "System.IO", "IOException", error == 145 ? "The directory is not empty." : "The directory could not be deleted.");
+        }
+        *result = (clr_value){ .kind = V_I4 };
+        return 1;
+    }
+    // ---- System.Windows.Window.GetWindow(DependencyObject): the window an element is in (one window: the launcher's)
+    if (!strcmp(ns, "System.Windows") && !strcmp(type, "Window") && !strcmp(name, "GetWindow") && !method->has_this && argument_count == 1) {
+        clr_object *element = arguments[0].kind == V_REF ? (clr_object *)(uintptr_t)arguments[0].bits : NULL;
+        clr_object *window = element && !strcmp(element->type_name, "Window") ? element : g_wpf_window;
+        *result = (clr_value){ .bits = (uintptr_t)window, .kind = V_REF };
+        return 1;
+    }
     if (!strcmp(ns, "System.IO") && !strcmp(type, "Directory") && !strcmp(name, "GetFiles")) {
         g_enumerate_files = 1;
         int ok = managed_directory_get_directories(rt, method, arguments, argument_count, result);
@@ -13256,6 +13524,26 @@ static int text_system_invoke(clr_runtime *rt, const clr_method *method, clr_val
     }
     if (!strcmp(ns, "System.IO") && !strcmp(type, "DriveInfo")) {
         clr_object *drive = method->has_this && argument_count >= 1 ? managed_pointer_object(rt, arguments[0]) : NULL;
+        if (!strcmp(name, "GetDrives") && !method->has_this) {   // C:, the one fixed drive (the C: root)
+            static const uint16_t c_root[] = { 'C', ':', '\\' };
+            clr_object *drives = new_array(rt, module, "System.IO", "DriveInfo", 1);
+            clr_object *c = new_object(rt, module, 0, "System.IO", "DriveInfo");
+            clr_object *root = new_string_from_units(rt, module, c_root, 3);
+            if (!drives || !c || !root || !object_setting_set(rt, c, "Name", (clr_value){ .bits = (uintptr_t)root, .kind = V_REF })) return 0;
+            drives->array_items[0] = c;
+            drives->array_values[0] = (clr_value){ .bits = (uintptr_t)c, .kind = V_REF };
+            *result = (clr_value){ .bits = (uintptr_t)drives, .kind = V_REF };
+            return 1;
+        }
+        if ((!strcmp(name, "get_DriveType") || !strcmp(name, "get_DriveFormat") || !strcmp(name, "get_VolumeLabel") ||
+             !strcmp(name, "get_RootDirectory")) && drive) {
+            if (!strcmp(name, "get_DriveType")) { *result = (clr_value){ .bits = 3, .kind = V_I4 }; return 1; }   // Fixed
+            static const uint16_t ntfs[] = { 'N', 'T', 'F', 'S' };
+            clr_object *text = !strcmp(name, "get_DriveFormat") ? new_string_from_units(rt, module, ntfs, 4) : NULL;
+            if (!strcmp(name, "get_RootDirectory")) return -1;             // (a DirectoryInfo: not made here)
+            *result = (clr_value){ .bits = (uintptr_t)text, .kind = V_REF };
+            return 1;
+        }
         if (!strcmp(name, ".ctor") && drive && argument_count == 2) { if (!object_setting_set(rt, drive, "Name", arguments[1])) return 0; *result = (clr_value){ .kind = V_I4 }; return 1; }
         if ((!strcmp(name, "get_AvailableFreeSpace") || !strcmp(name, "get_TotalFreeSpace") || !strcmp(name, "get_TotalSize")) && drive) {
             char unix_path[4096] = "/";
@@ -13321,7 +13609,12 @@ static int text_system_invoke(clr_runtime *rt, const clr_method *method, clr_val
         if (!thread) return -1;
         if (!strcmp(name, "set_Name") && argument_count == 2) { if (!object_setting_set(rt, thread, "Name", arguments[1])) return 0; *result = (clr_value){ .kind = V_I4 }; return 1; }
         if (!strcmp(name, "get_Name")) { if (!object_setting_get(thread, "Name", result)) *result = (clr_value){ .kind = V_REF }; return 1; }
-        if (!strcmp(name, "get_IsAlive")) { *result = (clr_value){ .bits = 0, .kind = V_I4 }; return 1; }
+        if (!strcmp(name, "get_IsAlive")) {
+            clr_value host = { .kind = V_I8 };
+            HANDLE handle = object_setting_get(thread, "HostThread", &host) ? (HANDLE)(uintptr_t)host.bits : NULL;
+            *result = (clr_value){ .bits = handle && clr_wait_one(handle, 0) == 0x102, .kind = V_I4 };
+            return 1;
+        }
         *result = (clr_value){ .bits = 1, .kind = V_I4 };
         return 1;
     }
@@ -13584,15 +13877,44 @@ static int text_system_invoke(clr_runtime *rt, const clr_method *method, clr_val
         }
         if (!strcmp(name, "Start")) {
             if (!thread->referenced_object) return clr_throw(rt, module, "System.Threading", "ThreadStateException", "The thread has no start delegate.");
-            if (!thread_run_inline(rt, thread->referenced_object, argument_count == 2, argument_count == 2 ? arguments[1] : (clr_value){ .kind = V_REF })) return 0;
+            HANDLE handle = clr_thread_spawn(rt, thread->referenced_object, argument_count == 2, argument_count == 2 ? arguments[1] : (clr_value){ .kind = V_REF });
+            if (!handle) {                                             // (no host thread: the body runs here, to its end)
+                if (!thread_run_inline(rt, thread->referenced_object, argument_count == 2, argument_count == 2 ? arguments[1] : (clr_value){ .kind = V_REF })) return 0;
+            } else if (!object_setting_set(rt, thread, "HostThread", (clr_value){ .bits = (uint64_t)(uintptr_t)handle, .kind = V_I8 })) return 0;
             *result = (clr_value){ .kind = V_I4 };
             return 1;
         }
-        if (!strcmp(name, "Join") || !strcmp(name, "TrySetApartmentState")) { *result = (clr_value){ .bits = 1, .kind = V_I4 }; return 1; }
-        if (!strcmp(name, "get_ThreadState")) { *result = (clr_value){ .bits = 16, .kind = V_I4 }; return 1; }       // Stopped
+        clr_value host = { .kind = V_I8 };
+        HANDLE handle = object_setting_get(thread, "HostThread", &host) ? (HANDLE)(uintptr_t)host.bits : NULL;
+        if (!strcmp(name, "Join")) {                                    // Join() or Join(milliseconds) / Join(TimeSpan)
+            DWORD ms = argument_count == 2 ? (arguments[1].kind == V_I8 ? (DWORD)((int64_t)arguments[1].bits / 10000) : (DWORD)(int32_t)arguments[1].bits) : 0xffffffffu;
+            DWORD status = handle ? clr_wait_one(handle, ms) : 0;
+            *result = (clr_value){ .bits = status == 0, .kind = V_I4 };
+            return 1;
+        }
+        if (!strcmp(name, "TrySetApartmentState")) { *result = (clr_value){ .bits = 1, .kind = V_I4 }; return 1; }
+        if (!strcmp(name, "get_ThreadState")) {
+            int alive = handle && clr_wait_one(handle, 0) == 0x102;
+            *result = (clr_value){ .bits = alive ? 0 : 16, .kind = V_I4 };          // Running, or Stopped
+            return 1;
+        }
         if (!strncmp(name, "get_", 4)) { if (!object_setting_get(thread, name + 4, result)) *result = (clr_value){ .bits = !strcmp(name, "get_Priority") ? 2 : 0, .kind = V_I4 }; return 1; }
         if (!strncmp(name, "set_", 4) && argument_count == 2 && !object_setting_set(rt, thread, name + 4, arguments[1])) return 0;
         *result = (clr_value){ .kind = V_I4 };
+        return 1;
+    }
+    // ---- System.Threading.ThreadPool.QueueUserWorkItem(WaitCallback[, state]): the work item on a host thread of its
+    // own, as a Thread's body (taking turns with the others); the launcher starts its game updates this way
+    if (!strcmp(ns, "System.Threading") && !strcmp(type, "ThreadPool") && !method->has_this &&
+        (!strcmp(name, "QueueUserWorkItem") || !strcmp(name, "UnsafeQueueUserWorkItem")) && argument_count >= 1) {
+        clr_object *callback = arguments[0].kind == V_REF ? (clr_object *)(uintptr_t)arguments[0].bits : NULL;
+        if (!callback) return clr_throw(rt, module, "System", "ArgumentNullException", "Value cannot be null.\r\nParameter name: callBack");
+        HANDLE handle = clr_thread_spawn(rt, callback, 1, argument_count >= 2 ? arguments[1] : (clr_value){ .kind = V_REF });
+        if (handle) {
+            BOOL (WINAPI *close)(HANDLE) = (BOOL (WINAPI *)(HANDLE))dotnet_kernel32_export("CloseHandle");
+            if (close) close(handle);
+        } else if (!thread_run_inline(rt, callback, 1, argument_count >= 2 ? arguments[1] : (clr_value){ .kind = V_REF })) return 0;
+        *result = (clr_value){ .bits = 1, .kind = V_I4 };                       // queued
         return 1;
     }
     // ---- System.Timers.Timer: a timer that never elapses (the launcher uses it for progress animation only)
@@ -13712,6 +14034,27 @@ static int text_system_invoke(clr_runtime *rt, const clr_method *method, clr_val
     }
     if (!strcmp(ns, "System.Net.Cache") && !strcmp(name, ".ctor")) { *result = (clr_value){ .kind = V_I4 }; return 1; }
     if (!strcmp(ns, "System") && !strcmp(type, "EventArgs") && !strcmp(name, ".ctor")) { *result = (clr_value){ .kind = V_I4 }; return 1; }   // a program's EventArgs base
+    // ---- System.ComponentModel event arguments: what they were made with, kept as settings and read back
+    if (!strcmp(ns, "System.ComponentModel") && method->has_this && argument_count >= 1 &&
+        (!strcmp(type, "PropertyChangedEventArgs") || !strcmp(type, "PropertyChangingEventArgs") ||
+         !strcmp(type, "ProgressChangedEventArgs") || !strcmp(type, "CancelEventArgs"))) {
+        clr_object *args = managed_pointer_object(rt, arguments[0]);
+        if (!args) return -1;
+        if (!strcmp(name, ".ctor")) {
+            static const char *const fields[][2] = { { "PropertyName", NULL }, { "ProgressPercentage", "UserState" }, { "Cancel", NULL } };
+            int k = type[0] == 'P' && type[1] == 'r' && type[2] == 'o' && type[3] == 'p' ? 0 : type[0] == 'P' ? 1 : 2;
+            for (uint32_t i = 1; i < argument_count && i <= 2 && fields[k][i - 1]; i++)
+                if (!object_setting_set(rt, args, fields[k][i - 1], arguments[i])) return 0;
+            *result = (clr_value){ .kind = V_I4 };
+            return 1;
+        }
+        if (!strncmp(name, "get_", 4) && argument_count == 1) {
+            if (!object_setting_get(args, name + 4, result))
+                *result = !strcmp(name, "get_PropertyName") || !strcmp(name, "get_UserState") ? (clr_value){ .kind = V_REF } : (clr_value){ .kind = V_I4 };
+            return 1;
+        }
+        if (!strncmp(name, "set_", 4) && argument_count == 2) { if (!object_setting_set(rt, args, name + 4, arguments[1])) return 0; *result = (clr_value){ .kind = V_I4 }; return 1; }
+    }
     // ---- IWebProxy / WebProxy: no proxy (GetProxy gives the destination back, IsBypassed is true)
     if (!strcmp(ns, "System.Net") && (!strcmp(type, "IWebProxy") || !strcmp(type, "WebProxy")) && method->has_this && argument_count == 2 &&
         (!strcmp(name, "GetProxy") || !strcmp(name, "IsBypassed"))) {
@@ -13828,7 +14171,9 @@ static int text_system_invoke(clr_runtime *rt, const clr_method *method, clr_val
             uint8_t *bytes = malloc(count ? count : 1);
             if (!bytes) { set_error(rt, "out of memory in FileStream.%s", name); return 0; }
             if (!strcmp(name, "Read")) {
+                int held = gil_suspend();                                  // (disk reads: the other threads run meanwhile)
                 size_t got = count ? fread(bytes, 1, count, file) : 0;
+                gil_resume(held);
                 for (size_t i = 0; i < got; i++) array->array_values[offset + i].bits = bytes[i];
                 free(bytes);
                 *result = (clr_value){ .bits = (uint32_t)got, .kind = V_I4 };
@@ -14520,12 +14865,25 @@ static int text_system_invoke(clr_runtime *rt, const clr_method *method, clr_val
     }
     if (!strcmp(ns, "System.Threading") && !strcmp(type, "Thread") && !strcmp(name, "Sleep") && !method->has_this && argument_count == 1) {
         int64_t ms = arguments[0].kind == V_I4 ? (int32_t)arguments[0].bits : (int64_t)arguments[0].bits;
+        int held = gil_suspend();                                      // (Sleep(0) too: a turn for the others)
         if (ms > 0) usleep((useconds_t)(ms > 60000 ? 60000 : ms) * 1000);
+        else if (held) sched_yield();
+        gil_resume(held);
         *result = (clr_value){ .kind = V_I4 };
         return 1;
     }
-    // ---- System.IDisposable.Dispose on an object the host made (enumerators, readers ...): nothing to release
+    // ---- System.IDisposable.Dispose on an object the host made: a stream, reader or writer closes its file (a using
+    // block ends this way: the launcher's file check otherwise left 30,000 game files open, until opens failed);
+    // enumerators and the rest have nothing to release
     if (!strcmp(ns, "System") && !strcmp(type, "IDisposable") && !strcmp(name, "Dispose") && method->has_this && argument_count == 1) {
+        clr_object *disposed = managed_pointer_object(rt, arguments[0]);
+        if (disposed && disposed->io_stream) {
+            FILE *file = disposed->io_stream;
+            fclose(file);
+            disposed->io_stream = NULL;
+            clr_object *owner = disposed->referenced_object;           // (a reader or writer over a stream: closes it too)
+            if (owner && owner->io_stream == file) owner->io_stream = NULL;
+        }
         *result = (clr_value){ .kind = V_I4 };
         return 1;
     }
@@ -14572,11 +14930,13 @@ static int text_system_invoke(clr_runtime *rt, const clr_method *method, clr_val
             FILE *file = ((clr_object *)(uintptr_t)arguments[1].bits)->io_stream;     // a stream: hashed from its position to the end
             uint8_t chunk[65536], digest[64];
             size_t got;
+            int held = gil_suspend();                                      // (a whole file read and hashed: others run)
             if (size == 16) { CC_MD5_CTX c; CC_MD5_Init(&c); while ((got = fread(chunk, 1, sizeof chunk, file)) > 0) CC_MD5_Update(&c, chunk, (CC_LONG)got); CC_MD5_Final(digest, &c); }
             else if (size == 20) { CC_SHA1_CTX c; CC_SHA1_Init(&c); while ((got = fread(chunk, 1, sizeof chunk, file)) > 0) CC_SHA1_Update(&c, chunk, (CC_LONG)got); CC_SHA1_Final(digest, &c); }
             else if (size == 32) { CC_SHA256_CTX c; CC_SHA256_Init(&c); while ((got = fread(chunk, 1, sizeof chunk, file)) > 0) CC_SHA256_Update(&c, chunk, (CC_LONG)got); CC_SHA256_Final(digest, &c); }
             else if (size == 48) { CC_SHA512_CTX c; CC_SHA384_Init(&c); while ((got = fread(chunk, 1, sizeof chunk, file)) > 0) CC_SHA384_Update(&c, chunk, (CC_LONG)got); CC_SHA384_Final(digest, &c); }
             else { CC_SHA512_CTX c; CC_SHA512_Init(&c); while ((got = fread(chunk, 1, sizeof chunk, file)) > 0) CC_SHA512_Update(&c, chunk, (CC_LONG)got); CC_SHA512_Final(digest, &c); }
+            gil_resume(held);
             clr_object *array = managed_byte_array(rt, module, digest, (uint32_t)size);
             if (!array) return 0;
             *result = (clr_value){ .bits = (uintptr_t)array, .kind = V_REF };
@@ -15402,7 +15762,93 @@ static int registry_external_invoke(clr_runtime *rt, const clr_method *method, c
 
 static int external_invoke(clr_runtime *rt, const clr_method *method,
                            clr_value *arguments, uint32_t argument_count,
+                           int constructing, clr_value *result);
+// a delegate called from the host with up to three arguments, its return value in result (Func<...>, a factory)
+static int delegate_call(clr_runtime *rt, clr_object *delegate, const clr_value *values, uint32_t count, clr_value *result) {
+    clr_method callback;
+    if (!delegate || !delegate->delegate_method || !delegate->delegate_module ||
+        !resolve_method(rt, delegate->delegate_module, delegate->delegate_method, &callback) || !callback.is_internal ||
+        callback.parameter_count != count || count > 3) {
+        set_error(rt, "a delegate the host calls has an unsupported target or signature"); return 0;
+    }
+    clr_value call_arguments[4];
+    uint32_t n = 0;
+    if (callback.has_this) call_arguments[n++] = (clr_value){ .bits = (uintptr_t)delegate->delegate_target, .kind = V_REF };
+    for (uint32_t i = 0; i < count; i++) call_arguments[n++] = values[i];
+    return execute_method(rt, callback.module, callback.token, call_arguments, n, result);
+}
+static int is_delegate_object(clr_value v) {
+    clr_object *o = v.kind == V_REF ? (clr_object *)(uintptr_t)v.bits : NULL;
+    return o && o->delegate_method && o->delegate_module;
+}
+// System.Collections.Concurrent.ConcurrentDictionary<TKey,TValue>: a Dictionary (one host thread runs the program's
+// threads, so nothing races); its own methods on top: TryAdd, TryRemove, TryUpdate, GetOrAdd, AddOrUpdate
+static int concurrent_dictionary_invoke(clr_runtime *rt, const clr_method *method, clr_value *arguments,
+                                        uint32_t argument_count, int constructing, clr_value *result) {
+    const char *name = method->name;
+    clr_method as_dictionary = *method;
+    as_dictionary.type_namespace = "System.Collections.Generic";
+    as_dictionary.type_name = "Dictionary`2";
+    if (!strcmp(name, ".ctor")) {                     // (concurrency level, capacity, comparer, items: a plain dictionary)
+        clr_object *dictionary = argument_count >= 1 ? managed_pointer_object(rt, arguments[0]) : NULL;
+        if (!dictionary) return -1;
+        dictionary->is_dictionary = 1;
+        *result = (clr_value){ .kind = V_I4 };
+        return 1;
+    }
+    clr_object *dictionary = method->has_this && argument_count >= 1 ? managed_pointer_object(rt, arguments[0]) : NULL;
+    int own = !strcmp(name, "TryAdd") || !strcmp(name, "TryRemove") || !strcmp(name, "TryUpdate") ||
+              !strcmp(name, "GetOrAdd") || !strcmp(name, "AddOrUpdate");
+    if (!own) return external_invoke(rt, &as_dictionary, arguments, argument_count, constructing, result);
+    if (!dictionary || !dictionary->is_dictionary || argument_count < 2) return -1;
+    uint32_t index;
+    int found;
+    if (!managed_dictionary_search(rt, dictionary, arguments[1], &index, &found)) return 0;
+    if (!strcmp(name, "TryAdd") && argument_count == 3) {
+        if (!found && !managed_dictionary_set(rt, dictionary, arguments[1], arguments[2], 1)) return 0;
+        *result = (clr_value){ .bits = !found, .kind = V_I4 };
+        return 1;
+    }
+    if (!strcmp(name, "TryRemove") && argument_count == 3) {   // Remove(key, out value)
+        as_dictionary.name = "Remove";
+        return external_invoke(rt, &as_dictionary, arguments, argument_count, constructing, result);
+    }
+    if (!strcmp(name, "TryUpdate") && argument_count == 4) {    // (key, new value, the value it must have now)
+        int matches = found && dictionary->map_values[index].bits == arguments[3].bits;
+        if (matches) dictionary->map_values[index] = arguments[2];
+        *result = (clr_value){ .bits = matches, .kind = V_I4 };
+        return 1;
+    }
+    if (!strcmp(name, "GetOrAdd") && argument_count == 3) {     // (key, value) or (key, Func<TKey,TValue>)
+        if (found) { *result = dictionary->map_values[index]; return 1; }
+        clr_value value = arguments[2];
+        if (is_delegate_object(arguments[2]) && !delegate_call(rt, (clr_object *)(uintptr_t)arguments[2].bits, &arguments[1], 1, &value)) return 0;
+        if (!managed_dictionary_set(rt, dictionary, arguments[1], value, 0)) return 0;
+        *result = value;
+        return 1;
+    }
+    if (!strcmp(name, "AddOrUpdate") && argument_count == 4) {  // (key, add value or factory, Func<TKey,TValue,TValue> update)
+        clr_value value;
+        if (found) {
+            clr_value both[2] = { arguments[1], dictionary->map_values[index] };
+            if (!delegate_call(rt, (clr_object *)(uintptr_t)arguments[3].bits, both, 2, &value)) return 0;
+        } else {
+            value = arguments[2];
+            if (is_delegate_object(arguments[2]) && !delegate_call(rt, (clr_object *)(uintptr_t)arguments[2].bits, &arguments[1], 1, &value)) return 0;
+        }
+        if (!managed_dictionary_set(rt, dictionary, arguments[1], value, 0)) return 0;
+        *result = value;
+        return 1;
+    }
+    return -1;
+}
+static int external_invoke(clr_runtime *rt, const clr_method *method,
+                           clr_value *arguments, uint32_t argument_count,
                            int constructing, clr_value *result) {
+    if (!strcmp(method->type_namespace, "System.Collections.Concurrent") && !strncmp(method->type_name, "ConcurrentDictionary`2", 22)) {
+        int concurrent_result = concurrent_dictionary_invoke(rt, method, arguments, argument_count, constructing, result);
+        if (concurrent_result >= 0) return concurrent_result;
+    }
     int web_result = web_external_invoke(rt, method, arguments, argument_count,
                                          constructing, result);
     if (web_result >= 0) return web_result;
@@ -17087,7 +17533,7 @@ static int external_invoke(clr_runtime *rt, const clr_method *method,
             *result = (clr_value){ .bits = (uintptr_t)lines, .kind = V_REF };
             return 1;
         }
-        if (!strcmp(name, "AppendText"))
+        if (!strcmp(name, "AppendText") || !strcmp(name, "CreateText"))
             return managed_file_append_text(rt, method, arguments, argument_count, result);
         if (!strcmp(name, "WriteAllText")) {
             if (!managed_file_write_all_text(rt, method, arguments, argument_count)) return 0;
@@ -19759,7 +20205,7 @@ static int pinvoke_invoke(clr_runtime *rt, clr_module *module, const clr_method 
 static int execute_method(clr_runtime *rt, clr_module *module, uint32_t token,
                           const clr_value *arguments,
                           uint32_t argument_count, clr_value *return_value) {
-    if (rt->call_depth >= CLR_MAX_CALL_DEPTH) {
+    if (t_call_depth >= CLR_MAX_CALL_DEPTH) {
         set_error(rt, "managed call depth exceeds %u", CLR_MAX_CALL_DEPTH); return 0;
     }
     clr_method method;
@@ -19833,7 +20279,7 @@ static int execute_method(clr_runtime *rt, clr_module *module, uint32_t token,
     clr_object *eh_exc = NULL;
     int constrained = 0;                                  // the previous instruction was the constrained. prefix
 
-    rt->call_depth++;
+    t_call_depth++;
     uint32_t pc = 0, depth = 0;
 eh_resume:
     while (pc < instruction_count) {
@@ -20261,16 +20707,14 @@ eh_resume:
             }
             if (!push(stack, &depth, stack_limit,
                       (clr_value){ .bits = array->array_length, .kind = V_I8 })) goto bad_stack;
-        } else if (op == 0x008f) { // ldelema: a pointer to an element (arrays of numbers and characters; calls on it work through the pointer)
+        } else if (op == 0x008f) { // ldelema: a pointer to an element (its array_values slot; calls on it work through the pointer)
             if (!pop(stack, &depth, &b) || !pop(stack, &depth, &a) || a.kind != V_REF) goto bad_stack;
             if (!a.bits) { clr_throw(rt, module, "System", "NullReferenceException", "Object reference not set to an instance of an object."); goto failed; }
             clr_object *array = (clr_object *)(uintptr_t)a.bits;
             uint32_t index;
             if (!clr_array_index(rt, array, b, &index)) goto failed;
-            if (array->array_element_kind == V_REF) {
-                set_error(rt, "ldelema on an array of references is not supported in %s.%s at IL_%04x", method.type_name, method.name, ins->offset);
-                goto failed;
-            }
+            if (array->array_element_kind == V_REF && array->array_values[index].kind != V_REF)   // (the slot ldelem.ref reads)
+                array->array_values[index] = (clr_value){ .bits = (uintptr_t)array->array_items[index], .kind = V_REF };
             if (!push(stack, &depth, stack_limit, (clr_value){ .bits = (uintptr_t)&array->array_values[index], .kind = V_MANAGED_PTR })) goto bad_stack;
         } else if (op >= 0x0090 && op <= 0x009a) { // ldelem.*
             if (!pop(stack, &depth, &b) || !pop(stack, &depth, &a) ||
@@ -20492,7 +20936,7 @@ eh_resume:
             } else {
                 if (depth != 1 || !pop(stack, &depth, return_value)) goto bad_return;
             }
-            rt->call_depth--;
+            t_call_depth--;
             free(locals); free(instructions); free(offset_map); free(stack);
             return 1;
         } else if (op == 0x007a) { // throw
@@ -20579,8 +21023,8 @@ failed:
             goto eh_enter;
         }
 failed_unhandled:                                                     // this frame has no handler: the caller's turn
-        rt->call_depth--;
-        if (rt->call_depth == 0) {                                    // (nobody above: it is an error now)
+        t_call_depth--;
+        if (t_call_depth == 0) {                                    // (nobody above: it is an error now)
             if (rt->error && rt->error_capacity) eh_describe(rt, rt->pending_exception, rt->error, rt->error_capacity);
             rt->pending_exception = NULL;
         }
@@ -20595,7 +21039,7 @@ failed_unhandled:                                                     // this fr
             set_error(rt, "CIL execution of %s.%s failed without a diagnostic after IL stream",
                       method.type_name, method.name);
     }
-    rt->call_depth--;
+    t_call_depth--;
 failed_frame:
     free(locals); free(instructions); free(offset_map); free(stack);
     return 0;

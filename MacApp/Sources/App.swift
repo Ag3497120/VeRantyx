@@ -4,6 +4,7 @@
 //   VeRantyx --collect-redist              gathers the runtime DLLs as the app does (VXRT_REDIST: elsewhere)
 //   VeRantyx --play <app id> [seconds]     starts a game as the Play button does and reports what the app sees
 //   VeRantyx --snapshot <folder>           saves pictures of each page of the window (scrolled: <page>-2.png, ...)
+//   VeRantyx --report                      saves the logs as a report does and prints the form's link (opens nothing)
 import AppKit
 import SwiftUI
 
@@ -19,6 +20,15 @@ enum Entry {
                     print("\(n) DLLs in \(Paths.redist.path)")
                     exit(0)
                 } catch { print(error.localizedDescription); exit(1) }
+            }
+            dispatchMain()
+        }
+        if a.contains("--report") {
+            Task { @MainActor in
+                let zip = await Report.saveLogs()
+                print(zip?.path ?? "no logs")
+                print(AppModel().reportURL(logs: zip?.lastPathComponent).absoluteString)
+                exit(0)
             }
             dispatchMain()
         }

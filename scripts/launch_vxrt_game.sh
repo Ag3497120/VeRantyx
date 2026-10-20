@@ -75,9 +75,11 @@ cleanup() {
     wait "$STEAMVR_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
-for _ in $(seq 1 40); do                               # vrserver's web server is up once SteamVR has started
+waited=0                                               # vrserver's web server is up once SteamVR has started
+while (( waited < 40 )); do                            # (not counted while a first ALVR headset is awaited)
     sleep 1
     lsof -nP -iTCP:27062 -sTCP:LISTEN >/dev/null 2>&1 && break
+    [[ -f "$LOG_DIR/alvr-first-connection.wait" ]] || waited=$((waited + 1))
 done
 LOG="$LOG_DIR/vxrt-${EXE_NAME%.*}.log"
 [[ -s "$LOG" ]] && mv -f "$LOG" "${LOG%.log}.prev.log"   # (the last start's, kept)
@@ -96,6 +98,33 @@ GAME_ENV=("VXRT_ROOT=$VXRT_VR_ROOT" "VXRT_OVERLAY=$OVERLAY" "VXRT_DLL_PATH=$VXRT
 if [[ -n "${VXRT_GAME_CONTROL:-}" ]]; then GAME_ENV+=("VXRT_CONTROL=$VXRT_GAME_CONTROL"); fi
 if [[ -n "${VXRT_GAME_CONTROL_LOG:-}" ]]; then GAME_ENV+=("VXRT_CONTROL_LOG=$VXRT_GAME_CONTROL_LOG"); fi
 if [[ -n "$APP_ID" ]]; then GAME_ENV+=("SteamAppId=$APP_ID" "SteamGameId=$APP_ID"); fi
+# VXRT_CAPTURE_PROXY=<the game's openvr_api.dll, relative to the .exe's folder>: the game's frames go to the encoder
+# straight from its Submit (the capture proxy, as for Half-Life: Alyx) instead of through SteamVR's compositor, which
+# composed every frame at the headset's size and kept the game waiting on the hand-over (Elite Dangerous:
+# Products/elite-dangerous-odyssey-64/Openvr/win64/openvr_api.dll). The proxy and a copy of the game's own DLL (its overlay copy
+# when the game was updated there) go into a folder of their own that VXRuntime loads first (VXRT_DLL_FIRST, child
+# processes included): the game's folder stays as it is.
+if [[ -n "${VXRT_CAPTURE_PROXY:-}" ]]; then
+    PROXY_DLL="$REPO_ROOT/build/openvr_api_capture_proxy.dll"
+    if [[ ! -f "$PROXY_DLL" || "$REPO_ROOT/VRDriver/src/openvr_capture_proxy.cpp" -nt "$PROXY_DLL" ]]; then
+        "$SCRIPT_DIR/build_openvr_capture_proxy.sh" >/dev/null
+    fi
+    GAME_OPENVR="$GAME_DIR/$VXRT_CAPTURE_PROXY"
+    for root in ${OVERLAY//:/ }; do                                    # (the overlay's copy wins, as for the game)
+        [[ "$root" == "${OVERLAY%%:*}" ]] && continue
+        [[ -f "$root/${GAME_OPENVR#"${OVERLAY%%:*}"/}" ]] && GAME_OPENVR="$root/${GAME_OPENVR#"${OVERLAY%%:*}"/}"
+    done
+    FIRST_DIR="$VXRT_VR_OVERLAY/capture-proxy/${APP_ID:-$(basename "$GAME_DIR")}"
+    mkdir -p "$FIRST_DIR"
+    if [[ -f "$GAME_OPENVR" ]] && ! grep -aq "openvr_api_valve.dll" "$GAME_OPENVR"; then
+        cmp -s "$GAME_OPENVR" "$FIRST_DIR/openvr_api_valve.dll" || cp -p "$GAME_OPENVR" "$FIRST_DIR/openvr_api_valve.dll"
+        cmp -s "$PROXY_DLL" "$FIRST_DIR/openvr_api.dll" || cp -p "$PROXY_DLL" "$FIRST_DIR/openvr_api.dll"
+        GAME_ENV+=("VXRT_DLL_FIRST=$FIRST_DIR" "VERANTYX_DECOUPLED_POSES=${VERANTYX_DECOUPLED_POSES:-1}")
+        echo "Frames straight from the game's Submit (capture proxy in $FIRST_DIR)"
+    else
+        echo "VXRT_CAPTURE_PROXY: no OpenVR DLL of the game at $GAME_OPENVR; frames go through SteamVR's compositor" >&2
+    fi
+fi
 # The game's own debug output (VXRT_DEBUGGER, VXRT_DEBUG_OUTPUT) goes to the log with the time: why it quit, if it does.
 env "${GAME_ENV[@]}" "$VXRT" "$EXE_NAME" "$@" >"$LOG" 2>&1 &
 GAME_PID=$!

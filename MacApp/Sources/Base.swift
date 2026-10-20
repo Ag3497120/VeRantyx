@@ -89,6 +89,15 @@ struct Failure: LocalizedError {
 // MARK: - Places
 
 /// The same places the command-line scripts use (scripts/vxrt_paths.sh), so the app and the scripts share one setup.
+/// This build: the version, the build time (UTC) and the commit it was built from (MacApp/build_app.sh).
+enum AppBuild {
+    static func value(_ key: String) -> String? { Bundle.main.object(forInfoDictionaryKey: key) as? String }
+    static var version: String { value("CFBundleShortVersionString") ?? "dev" }
+    static var commit: String { value("VeRantyxCommit") ?? "unknown" }
+    /// "0.1.0 (build 202610200930, commit 0123456789ab)"
+    static var description: String { "\(version) (build \(value("CFBundleVersion") ?? "dev"), commit \(commit))" }
+}
+
 enum Paths {
     static let home = FileManager.default.homeDirectoryForCurrentUser
     static let defaultDrive = home.appendingPathComponent("Verantyx_VR_Drive")
@@ -180,7 +189,15 @@ enum Mac {
         sysctlbyname("hw.model", &buf, &size, nil, 0)
         return String(cString: buf)
     }
-    static var macOS: String { ProcessInfo.processInfo.operatingSystemVersionString }
+    /// "26.5.2 (25F84)": the version and build, the same in every language (the system's own text is translated).
+    static var macOS: String {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        var size = 0
+        sysctlbyname("kern.osversion", nil, &size, nil, 0)
+        var buf = [CChar](repeating: 0, count: max(size, 1))
+        sysctlbyname("kern.osversion", &buf, &size, nil, 0)
+        return "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion) (\(String(cString: buf)))"
+    }
     /// x86-64 programs run (Rosetta 2 installed): VXRuntime and steamcmd are x86-64.
     static func rosetta() async -> Bool { await run("/usr/bin/arch", ["-x86_64", "/usr/bin/true"]).status == 0 }
     /// Installs Rosetta 2 with macOS's own installer; macOS asks for an administrator's password.

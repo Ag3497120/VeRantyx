@@ -40,5 +40,6 @@ body:
     attributes:
       label: Logs (if something failed)
       description: |
-        ~/Library/Application Support/VeRantyx/ALVR/session_log.txt (the previous start's: session_log.prev.txt) and
-        logs/hardware-encoder.log from the repository. Drag the files here.
+        The VeRantyx app: Help > Report a problem saves them as VeRantyx-logs-<date>.zip on the Desktop (your Mac user
+        name and Steam ID taken out); drag that file here. From the repository: logs/ (vxrt-steamvr.log,
+        hardware-encoder.log, the game's vxrt-<game>.log) and ~/Library/Application Support/VeRantyx/ALVR/session_log.txt.

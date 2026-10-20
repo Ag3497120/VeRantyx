@@ -318,7 +318,10 @@ static ULONG WINAPI di_input_release(di_input *self) {
     if (!refs) free(self);
     return refs;
 }
+static int trace_dinput(void) { static int on = -1; if (on < 0) on = getenv("VXRT_TRACE_INPUT") != NULL; return on; }
 static HRESULT WINAPI di_input_create_device(di_input *self, const GUID *guid, di_device **out, void *outer) {
+    if (guid && trace_dinput())
+        vx_log("DirectInput: CreateDevice {%08x-%04x-%04x-%02x%02x-...}", (unsigned)guid->Data1, guid->Data2, guid->Data3, guid->Data4[0], guid->Data4[1]);
     if (!guid || !out) return VX_DI_E_POINTER;
     *out = NULL;
     if (outer) return DIERR_NOAGGREGATION;
@@ -353,6 +356,7 @@ static HRESULT WINAPI di_input_enum_devices(di_input *self, DWORD type, enum_dev
     if (flags & DIEDFL_FORCEFEEDBACK) return VX_DI_S_OK;
     size_t count = 0;
     hid_device *devices = snapshot_devices(&count);
+    if (trace_dinput()) vx_log("DirectInput: EnumDevices(type %#x, flags %#x): %zu HID game controller(s)", (unsigned)type, (unsigned)flags, count);
     for (size_t i = 0; i < count; i++) {
         if (!acceptable_type(type, devices[i].type)) continue;
         dideviceinstancew instance;

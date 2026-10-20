@@ -173,6 +173,11 @@ export VXRT_ROOT="$VXRT_VR_ROOT"
 export VXRT_OVERLAY="$STEAM_ROOT:$VXRT_VR_OVERLAY"
 export VXRT_DLL_PATH="$VXRT_DLL_DIRS"
 export VXRT_NO_ACTIVATE=1
+# SteamVR's own watchdog ends vrcompositor when one frame of its rendering takes over ~6 s ("Failed Watchdog timeout in
+# thread Render ... Aborting"): it does when a pipeline waits behind macOS's Metal compiler service, which a game
+# compiling its shaders (the first start after an update: hundreds) keeps busy; SteamVR then falls over with the game.
+# With a debugger present it skips the abort (as on Windows), and VXRT_DEBUGGER=1 says one is.
+export VXRT_DEBUGGER="${VXRT_DEBUGGER:-1}"
 
 VXRT_PATTERN="VXRuntime/build/vxrt(-arm64)? .*[Ss]team[Vv][Rr]/bin/win64/vr"   # (either library's spelling; the path may have "(x86)")
 cleanup() {
@@ -186,14 +191,38 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# (exit 75: an ALVR headset brought other display settings, stored: the encoder again, which connects with them)
+SHARED_FRAME="$VXRT_VR_ROOT/drive_c/vr_shared_frame.dat"
+TANGENTS="$VXRT_VR_ROOT/drive_c/vr_verantyx_tangents.txt"
+FIRST_WAIT="$LOG_DIR/alvr-first-connection.wait"
+rm -f "$FIRST_WAIT"
+# A first ALVR headset (no eye frustum saved yet): SteamVR reads the frustum once, when it starts, so the encoder starts
+# first and the headset connects before SteamVR does; the encoder saves its frustum and SteamVR starts with it. Without
+# this the first session showed the eyes apart (a symmetric fallback; issue #4). The encoder needs the shared map,
+# which the driver makes: made here first, at the driver's size (sparse). VERANTYX_ALVR_FIRST_WAIT: seconds (180).
+if [[ "${VERANTYX_ALVR:-0}" == 1 && ! -s "$TANGENTS" ]]; then
+    [[ -f "$SHARED_FRAME" ]] || python3 -c "import sys; open(sys.argv[1], 'wb').truncate(64 + 2 * (88 + 4096 * 4096 * 8) + 312 + 1024)" "$SHARED_FRAME"
+    touch "$FIRST_WAIT"
+fi
+(while :; do VERANTYX_SHARED_FRAME="$SHARED_FRAME" "$ENCODER"; [[ $? == 75 ]] || break; done) >"$LOG_DIR/hardware-encoder.log" 2>&1 &
+ENCODER_PID=$!
+if [[ -f "$FIRST_WAIT" ]]; then
+    echo "First start with this ALVR headset: open the ALVR app on the headset and connect now (SteamVR starts once it has; up to ${VERANTYX_ALVR_FIRST_WAIT:-180} s)"
+    for _ in $(seq 1 "${VERANTYX_ALVR_FIRST_WAIT:-180}"); do [[ -s "$TANGENTS" ]] && break; sleep 1; done
+    [[ -s "$TANGENTS" ]] && echo "ALVR headset connected: its eye frustum is saved; starting SteamVR" \
+                         || echo "No ALVR headset connected yet: SteamVR starts with a symmetric eye frustum (restart once the headset has connected)"
+    rm -f "$FIRST_WAIT"
+fi
+
 # vrcmd starts vrserver (which starts vrcompositor) and keeps a client connected.
 (cd "$STEAMVR_BIN" && exec "$VXRT" vrcmd.exe --pollposes) >"$LOG_DIR/vxrt-steamvr.log" 2>&1 &
 VR_PID=$!
 echo "SteamVR on VXRuntime started (log: $LOG_DIR/vxrt-steamvr.log)"
+# Which runtime this is: the app's COMMIT file, or the checkout's commit.
+if [[ -f "$REPO_ROOT/COMMIT" ]]; then echo "VeRantyx commit $(cat "$REPO_ROOT/COMMIT"), macOS $(sw_vers -productVersion)"
+elif commit="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null)"; then echo "VeRantyx commit $commit (checkout), macOS $(sw_vers -productVersion)"; fi
 
-# (exit 75: an ALVR headset brought other display settings, stored: the encoder again, which connects with them)
-(while :; do VERANTYX_SHARED_FRAME="$VXRT_VR_ROOT/drive_c/vr_shared_frame.dat" "$ENCODER"; [[ $? == 75 ]] || break; done) >"$LOG_DIR/hardware-encoder.log" 2>&1 &
-ENCODER_PID=$!
+
 
 # Games' SteamVR web UIs need vrwebhelper (Chromium), which does not run on VXRuntime: this answers for
 # Half-Life: Alyx's (it gives up after a minute without the page's "ready").

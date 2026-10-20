@@ -525,6 +525,9 @@ struct SessionCard: View {
                        "初回はゲームのシェーダをコンパイルするため、数分かかることがあります。2 回目からは速くなります。"))
                     .font(.callout).foregroundStyle(.secondary)
             }
+            if let notice = play.notice {
+                Label(notice, systemImage: "visionpro").foregroundStyle(.blue).fixedSize(horizontal: false, vertical: true)
+            }
             if let problem = play.problem {
                 Label(problem, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
@@ -612,7 +615,7 @@ struct HeadsetView: View {
                 }
                 Banner(icon: "person.2.wave.2", text: T("Quest and Pico have not been tested by the author yet (no headset). If you try, a report helps a lot, whether it works or not.",
                                                        "Quest と Pico は作者がまだ試せていません（実機がないため）。試したら、動いても動かなくても報告が大きな助けになります。"),
-                       action: (T("Report", "報告する"), { NSWorkspace.shared.open(model.reportURL()) }))
+                       action: (T("Report", "報告する"), { Report.start(model) }))
             case .visionApp:
                 Card(title: T("On the Vision Pro", "Vision Pro 側")) {
                     Numbered(1, T("Install the VeRantyx app for Vision Pro (TestFlight when the author shares a link, or from Xcode: see the repository).", "Vision Pro 用の VeRantyx アプリをインストール（作者が共有する TestFlight、または Xcode から：リポジトリ参照）。"))
@@ -667,7 +670,7 @@ struct HelpView: View {
                     if copied { Text(T("Copied", "コピーしました")).foregroundStyle(.secondary) }
                 }
                 HStack {
-                    Button(T("Report a problem…", "問題を報告…")) { NSWorkspace.shared.open(model.reportURL()) }
+                    Button(T("Report a problem…", "問題を報告…")) { Report.start(model) }
                     Text(T("Opens a form on GitHub (an account is needed). Attach the logs if you can.", "GitHub のフォームを開きます（アカウントが必要）。できればログを添付してください。")).font(.callout).foregroundStyle(.secondary)
                 }
                 HStack {
@@ -682,7 +685,9 @@ struct HelpView: View {
                 Numbered(4, T("If turning your head warps the picture, the game runs below the headset's rate: choose Recommended.", "頭を動かすと映像が歪む時は、ゲームがヘッドセットの速さに追いついていません。「おすすめ」を選んでください。"))
             }
             Card(title: T("About", "このアプリについて")) {
-                Text("VeRantyx \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev")").fontWeight(.semibold)
+                Text("VeRantyx \(AppBuild.version)").fontWeight(.semibold)
+                Text(verbatim: "build \(AppBuild.value("CFBundleVersion") ?? "dev"), commit \(AppBuild.commit)")   // (as in reports: not translated)
+                    .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
                 Text(T("A personal open-source project (MIT), not affiliated with Valve, Apple or Meta. It contains no Valve or Microsoft files.",
                        "個人のオープンソースプロジェクト（MIT）です。Valve・Apple・Meta とは関係ありません。Valve や Microsoft のファイルは含みません。"))
                     .font(.callout).foregroundStyle(.secondary)

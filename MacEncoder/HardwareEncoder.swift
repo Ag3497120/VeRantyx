@@ -716,6 +716,23 @@ func setupEncoder(width: Int32, height: Int32) {
 
 // MARK: - Main IPC Loop
 
+// An ALVR headset's eye frustum, saved where the SteamVR driver reads it when SteamVR starts
+// (C:\\vr_verantyx_tangents.txt beside the shared map, the format the driver writes): SteamVR asks for the frustum once,
+// at its start, so a headset that connects before SteamVR does (the launch script waits for a headset it has not seen)
+// gets its own shape from the first frame instead of a symmetric fallback that shows the eyes apart (issue #4).
+var savedFrustum: [Float] = []
+func saveHeadsetFrustum(_ tangents: UnsafeRawPointer) {
+    let values = (0..<8).map { tangents.load(fromByteOffset: 4 * $0, as: Float.self) }
+    guard values != savedFrustum, values.allSatisfy({ $0.isFinite }), values[0] < values[1], values[2] < values[3],
+          values[4] < values[5], values[6] < values[7] else { return }
+    savedFrustum = values
+    let path = URL(fileURLWithPath: filePath).deletingLastPathComponent().appendingPathComponent("vr_verantyx_tangents.txt")
+    let text = values.map { String(format: "%.6f", $0) }.joined(separator: " ") + "\n"
+    if (try? String(contentsOf: path, encoding: .utf8)) == text { return }
+    try? text.write(to: path, atomically: true, encoding: .utf8)
+    print("ALVR headset eye frustum saved for SteamVR's next start: \(text.trimmingCharacters(in: .whitespacesAndNewlines))")
+}
+
 let winePrefix = ProcessInfo.processInfo.environment["WINEPREFIX"]
     ?? (NSHomeDirectory() + "/Verantyx_VR_Drive/SteamVR_Prefix")
 // VERANTYX_SHARED_FRAME names the file directly (the native ARM build keeps
@@ -839,6 +856,7 @@ if let alvr {
                     memcpy(handsMapPtr + 244, input, 8)                // the sample's time (the frame's pose id)
                     if input.load(fromByteOffset: 311, as: UInt8.self) != 0 {
                         memcpy(handsMapPtr + 252, input + 264, 32)     // eye tangents, left then right
+                        saveHeadsetFrustum(input + 264)
                     }
                     memcpy(handsMapPtr + 284, input + 309, 2)          // grips
                     memcpy(handsMapPtr + 286, input + 304, 1)          // headTracked

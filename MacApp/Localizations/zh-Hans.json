@@ -162,5 +162,10 @@
  "Language": "语言",
  "Automatic": "自动",
  "Takes effect when VeRantyx starts again.": "重新启动 VeRantyx 后生效。",
- "Restart": "重新启动"
+ "Restart": "重新启动",
+ "Before you report": "报告之前",
+ "Someone may have reported the same problem already: a look at the existing reports first can save you the time. For a new report, the app saves your logs as a zip file on the Desktop, with your Mac user name and Steam ID taken out; drag it into the form's Logs field.": "可能已经有人报告过同样的问题：先看看已有的报告，也许能省下时间。新建报告时，应用会把日志保存为桌面上的 zip 文件（已去掉你的 Mac 用户名和 Steam ID），请把它拖到表单的“Logs”栏。",
+ "Write a new report": "新建报告",
+ "Look at existing reports": "查看已有报告",
+ "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "首次使用此头显启动：请在头显上打开 ALVR 并立即连接。连接后 SteamVR 才会启动，这样两只眼睛的画面才能对齐。"
 }
