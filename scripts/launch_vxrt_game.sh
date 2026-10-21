@@ -95,7 +95,12 @@ cd "$GAME_DIR"
 GAME_ENV=("VXRT_ROOT=$VXRT_VR_ROOT" "VXRT_OVERLAY=$OVERLAY" "VXRT_DLL_PATH=$VXRT_DLL_DIRS"
     "VXRT_STEAM_BRIDGE=1" "VXRT_NO_ACTIVATE=1" "VXRT_DEBUGGER=1" "VXRT_DEBUG_OUTPUT=1"
     "VXRT_LOG_TIME=1")
+# Played in the headset, the game's window seldom stays the Mac's frontmost one; told it is in the background, a game
+# stops reading its controllers (and keys).
+GAME_ENV+=("VXRT_STAY_ACTIVE=${VXRT_STAY_ACTIVE:-1}")
 if [[ -n "${VXRT_GAME_CONTROL:-}" ]]; then GAME_ENV+=("VXRT_CONTROL=$VXRT_GAME_CONTROL"); fi
+if [[ -n "${VXRT_GAME_CONTROL_CHILD:-}" ]]; then GAME_ENV+=("VXRT_CONTROL_CHILD=$VXRT_GAME_CONTROL_CHILD"); fi   # the launcher's game
+if [[ -n "${VXRT_GAME_CONTROL_CHILD_FOR:-}" ]]; then GAME_ENV+=("VXRT_CONTROL_CHILD_FOR=$VXRT_GAME_CONTROL_CHILD_FOR"); fi
 if [[ -n "${VXRT_GAME_CONTROL_LOG:-}" ]]; then GAME_ENV+=("VXRT_CONTROL_LOG=$VXRT_GAME_CONTROL_LOG"); fi
 if [[ -n "$APP_ID" ]]; then GAME_ENV+=("SteamAppId=$APP_ID" "SteamGameId=$APP_ID"); fi
 # VXRT_CAPTURE_PROXY=<the game's openvr_api.dll, relative to the .exe's folder>: the game's frames go to the encoder

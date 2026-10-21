@@ -235,7 +235,7 @@ static WINAPI HRESULT CoCreateInstance(const GUID *clsid, void *outer, DWORD ctx
     void *factory = NULL;
     HRESULT r = class_object(clsid, &IID_IClassFactory, &factory, &create);
     if (r != S_OK) {
-        { char t[40]; guid_text(clsid, t); vx_log("CoCreateInstance: class %s is not available", t); }   // (always: a program's audio or video stack may hinge on it)
+        { char t[40], i[40]; guid_text(clsid, t); guid_text(iid, i); vx_log("CoCreateInstance: class %s is not available (interface %s wanted)", t, i); }   // (always: a program's audio or video stack may hinge on it)
         return r;
     }
     if (create) return outer ? CLASS_E_NOAGGREGATION : create(iid, out);

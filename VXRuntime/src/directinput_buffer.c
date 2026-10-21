@@ -42,13 +42,17 @@ int vx_di_buffer_set_size(vx_di_buffer *buffer, uint32_t size) {
 uint32_t vx_di_buffer_capacity(const vx_di_buffer *buffer) { return buffer ? buffer->capacity : 0; }
 uint32_t vx_di_buffer_count(const vx_di_buffer *buffer) { return buffer ? buffer->count : 0; }
 
+// Sequence numbers run across every device, as DirectInput's do: a program orders the events of its keyboard, mouse
+// and pads by them (DISEQUENCE_COMPARE).
+static uint32_t g_sequence;
 void vx_di_buffer_push(vx_di_buffer *buffer, uint32_t offset, uint32_t data,
                        uint32_t timestamp, uintptr_t app_data) {
     if (!buffer || !buffer->capacity) return;
     vx_di_buffer_event event = {
         .offset = offset, .data = data, .timestamp = timestamp,
-        .sequence = ++buffer->sequence, .app_data = app_data
+        .sequence = __sync_add_and_fetch(&g_sequence, 1), .app_data = app_data
     };
+    buffer->sequence = event.sequence;
     if (buffer->count == buffer->capacity) {
         buffer->head = (buffer->head + 1) % buffer->capacity;
         buffer->count--;

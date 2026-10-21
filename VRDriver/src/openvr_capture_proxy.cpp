@@ -1133,6 +1133,81 @@ static bool DecoupledWait(vr::TrackedDevicePose_t* renderPoses, uint32_t renderP
     return true;
 }
 
+// Seated games (Elite Dangerous) put their cockpit's eye point at the seated origin, which the launch script's play
+// area puts on the floor, while the Vision Pro reports the head at its real height above the floor: the cockpit
+// came out at the wrong height. Once the head has been tracked for two seconds the seated origin is moved to it, as
+// a game's "reset seated position" does. VERANTYX_RECENTER_SEATED=0 leaves it as it is.
+typedef void* (VR_CALLTYPE *GetGenericInterfaceFn2)(const char*, vr::EVRInitError*);
+static LONG g_seatedRecentered = 0;
+static uint64_t g_firstTrackedTicks = 0;
+static void LogSeatedOrigin(vr::IVRSystem* system, const char* when) {
+    vr::HmdMatrix34_t m = {};
+    system->GetSeatedZeroPoseToStandingAbsoluteTrackingPose(&m);
+    char message[160];
+    snprintf(message, sizeof(message), "Seated origin %s: %.3f %.3f %.3f (standing space)", when, m.m[0][3], m.m[1][3], m.m[2][3]);
+    Log(message);
+}
+// Taking the headset off and putting it back on moves the Vision Pro's origin (it finds the floor again), so the
+// seated origin is moved again then. While the headset is off its pose stops changing entirely (real tracking
+// always moves a little): a head that has not moved for a second counts as off.
+static vr::HmdMatrix34_t g_lastHead = {};
+static uint64_t g_lastHeadChangeTicks = 0;
+// SteamVR's seated reset changes nothing here (the seated origin stays where it was, F12 in Elite included) and the
+// game got the head at its height above the floor: Elite put its cockpit's eye point a metre below the eyes. So for
+// a game that asked for the seated universe the head's position at the reset is taken off its poses here. The
+// poses kept for the frames (CaptureRenderPose, the history) stay as SteamVR gave them.
+static float g_seatedOffset[3] = {};
+static volatile LONG g_seatedOffsetSet = 0;
+typedef vr::ETrackingUniverseOrigin (VR_CALLTYPE *GetTrackingSpaceFn)(void*);
+static void ApplySeatedOffset(vr::TrackedDevicePose_t* poses, uint32_t count) {
+    if (!poses || !InterlockedCompareExchange(&g_seatedOffsetSet, 0, 0)) return;
+    for (uint32_t i = 0; i < count; ++i)
+        for (int axis = 0; axis < 3; ++axis) poses[i].mDeviceToAbsoluteTracking.m[axis][3] -= g_seatedOffset[axis];
+}
+static void MaybeRecenterSeated(void* compositor, const vr::TrackedDevicePose_t* poses, uint32_t count) {
+    if (!poses || !count || !poses[0].bPoseIsValid || !poses[0].bDeviceIsConnected) { g_firstTrackedTicks = 0; return; }
+    const uint64_t now = PerformanceTicks();
+    if (memcmp(&g_lastHead, &poses[0].mDeviceToAbsoluteTracking, sizeof g_lastHead)) {
+        g_lastHead = poses[0].mDeviceToAbsoluteTracking;
+        g_lastHeadChangeTicks = now;
+    } else if (g_lastHeadChangeTicks && TicksToMilliseconds(now - g_lastHeadChangeTicks) > 1000.0) {
+        if (InterlockedExchange(&g_seatedRecentered, 0)) Log("Headset off (its pose stopped); the seated origin moves to the head again when it is back");
+        g_firstTrackedTicks = 0;
+        return;
+    }
+    if (InterlockedCompareExchange(&g_seatedRecentered, 0, 0)) return;
+    if (!g_firstTrackedTicks) { g_firstTrackedTicks = now; return; }
+    if (TicksToMilliseconds(now - g_firstTrackedTicks) < 2000.0) return;
+    if (InterlockedExchange(&g_seatedRecentered, 1)) return;
+    char setting[8] = {};
+    if (GetEnvironmentVariableA("VERANTYX_RECENTER_SEATED", setting, sizeof(setting)) > 0 && setting[0] == '0') return;
+    HMODULE real = LoadRealOpenVR();
+    GetGenericInterfaceFn2 getInterface = real ? (GetGenericInterfaceFn2)GetProcAddress(real, "VR_GetGenericInterface") : nullptr;
+    vr::EVRInitError error = vr::VRInitError_None;
+    vr::IVRSystem* system = getInterface ? (vr::IVRSystem*)getInterface(vr::IVRSystem_Version, &error) : nullptr;
+    if (!system || error != vr::VRInitError_None) { Log("Seated origin: no IVRSystem to reset it with"); return; }
+    const vr::HmdMatrix34_t& head = poses[0].mDeviceToAbsoluteTracking;
+    char message[160];
+    snprintf(message, sizeof(message), "Head at %.3f %.3f %.3f; moving the seated origin there", head.m[0][3], head.m[1][3], head.m[2][3]);
+    Log(message);
+    LogSeatedOrigin(system, "before");
+    system->ResetSeatedZeroPose();
+    LogSeatedOrigin(system, "after");
+    // IVRCompositor's second method, GetTrackingSpace, in every version
+    void** vtable = compositor ? *(void***)compositor : nullptr;
+    const vr::ETrackingUniverseOrigin space = vtable ? ((GetTrackingSpaceFn)vtable[1])(compositor) : vr::TrackingUniverseStanding;
+    if (space != vr::TrackingUniverseSeated) {
+        snprintf(message, sizeof(message), "The game uses tracking universe %d, not the seated one; its poses are left as they are", (int)space);
+        Log(message);
+        return;
+    }
+    for (int axis = 0; axis < 3; ++axis) g_seatedOffset[axis] = head.m[axis][3];
+    InterlockedExchange(&g_seatedOffsetSet, 1);
+    snprintf(message, sizeof(message), "Seated game: its poses now start from the head (%.3f %.3f %.3f taken off)",
+        g_seatedOffset[0], g_seatedOffset[1], g_seatedOffset[2]);
+    Log(message);
+}
+
 static vr::EVRCompositorError VR_CALLTYPE HookedWaitGetPoses(void* self,
     vr::TrackedDevicePose_t* renderPoses, uint32_t renderPoseCount,
     vr::TrackedDevicePose_t* gamePoses, uint32_t gamePoseCount) {
@@ -1145,6 +1220,7 @@ static vr::EVRCompositorError VR_CALLTYPE HookedWaitGetPoses(void* self,
         ? hook->waitGetPoses(self, renderPoses, renderPoseCount, gamePoses, gamePoseCount)
         : vr::VRCompositorError_RequestFailed;
     if (!decoupled && result == vr::VRCompositorError_None) InterlockedIncrement(&g_realPoseSets);
+    if (result == vr::VRCompositorError_None) MaybeRecenterSeated(self, renderPoses, renderPoseCount);   // (decoupled poses too)
     InterlockedExchangeAdd64(&g_waitPoseTicks, (LONG64)(PerformanceTicks() - waitStart));
     InterlockedIncrement64(&g_waitPoseCalls);
     if (result == vr::VRCompositorError_None && !decoupled) {
@@ -1191,6 +1267,10 @@ static vr::EVRCompositorError VR_CALLTYPE HookedWaitGetPoses(void* self,
             vtable ? vtable[submitIndex] : nullptr, (void*)&HookedSubmit,
             vtable && vtable[submitIndex] == (void*)&HookedSubmit ? 1 : 0);
         Log(message);
+    }
+    if (result == vr::VRCompositorError_None) {
+        ApplySeatedOffset(renderPoses, renderPoseCount);
+        ApplySeatedOffset(gamePoses, gamePoseCount);
     }
     return result;
 }
@@ -1532,6 +1612,38 @@ static bool ReadVtableEntries(void** vtable, void** out, size_t count) {
 // from the same thunks (identical functions are folded), so each slot of a
 // public version with a known layout is matched by pointer against the
 // game's table. Nothing is called until every slot has been found.
+// IVRSystem_012 (OpenVR 1.0, Elite Dangerous) has no IsInputAvailable: a game asks it whether another process has
+// captured the input focus (method 39, IsInputFocusCapturedByAnotherProcess) and ignores its controls while it has.
+// What SteamVR answers is logged; the game is told no (VERANTYX_FOCUS_HOOKS=0 leaves SteamVR's answer).
+typedef bool (VR_CALLTYPE *FocusCapturedFn)(void*);
+static FocusCapturedFn g_focusCaptured012 = nullptr;
+static void** g_system012Vtable = nullptr;
+static bool VR_CALLTYPE HookedFocusCaptured012(void* self) {
+    const bool captured = g_focusCaptured012 ? g_focusCaptured012(self) : false;
+    static LONG calls = 0; static LONG last = -1;
+    const LONG n = InterlockedIncrement(&calls);
+    if (n <= 3 || InterlockedExchange(&last, captured ? 1 : 0) != (captured ? 1 : 0)) {
+        char message[160];
+        snprintf(message, sizeof(message), "IVRSystem_012::IsInputFocusCapturedByAnotherProcess #%ld: SteamVR says %d; the game is told 0", n, captured ? 1 : 0);
+        Log(message);
+    }
+    return false;
+}
+static void InstallFocusHook012(void* system) {
+    char setting[8] = {};
+    if (GetEnvironmentVariableA("VERANTYX_FOCUS_HOOKS", setting, sizeof(setting)) > 0 && setting[0] == '0') return;
+    void** vtable = *(void***)system;
+    if (g_system012Vtable == vtable) return;
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(&vtable[39], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) { Log("ERROR: VirtualProtect failed for IVRSystem_012"); return; }
+    g_focusCaptured012 = (FocusCapturedFn)vtable[39];
+    vtable[39] = (void*)&HookedFocusCaptured012;
+    DWORD ignored = 0;
+    VirtualProtect(&vtable[39], sizeof(void*), oldProtect, &ignored);
+    g_system012Vtable = vtable;
+    Log("Installed IVRSystem_012 input focus hook (method 39)");
+}
+
 static bool InstallSystemHook(void* system, const char* version) {
     if (!system || !version) return false;
     char setting[8] = {};
@@ -1653,6 +1765,7 @@ extern "C" __declspec(dllexport) void* VR_CALLTYPE VR_GetGenericInterface(const 
     }
     if (version && strstr(version, "IVRCompositor") && result) InstallSubmitHook(result, version);
     if (version && strncmp(version, "IVRSystem_", 10) == 0 && result) InstallSystemHook(result, version);
+    if (version && strcmp(version, "IVRSystem_012") == 0 && result) InstallFocusHook012(result);
     return result;
 }
 

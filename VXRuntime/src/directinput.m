@@ -2,6 +2,7 @@
 // gamepads and multi-axis controllers, then maps their axes, buttons and POV hats into the caller's data format.
 #import <IOKit/hid/IOHIDManager.h>
 #import <IOKit/hid/IOHIDKeys.h>
+#import <GameController/GameController.h>
 #include "vx.h"
 #include "directinput_buffer.h"
 #include "directinput_format.h"
@@ -38,6 +39,8 @@ enum {
     DI8DEVTYPE_JOYSTICK = 0x14,
     DI8DEVTYPE_GAMEPAD = 0x15,
     DI8DEVTYPE_FLIGHT = 0x17,
+    DI8DEVTYPEJOYSTICK_STANDARD = 2,
+    DI8DEVTYPEGAMEPAD_STANDARD = 2,
     DIEDFL_FORCEFEEDBACK = 0x00000100,
     DIDFT_ABSAXIS = 0x00000002,
     DIDFT_PSHBUTTON = 0x00000004,
@@ -50,6 +53,9 @@ enum {
     DIPH_BYID = 2,
     DIPROP_BUFFERSIZE_ID = 1,
     DIPROP_RANGE_ID = 4,
+    DIPROP_GUIDANDPATH_ID = 12,
+    DIPROP_APPDATA_ID = 22,
+    DIPROP_VIDPID_ID = 24,
     DIGDD_PEEK = 1,
     DI_MAX_BUFFER_SIZE = 65536,
 };
@@ -66,6 +72,8 @@ typedef struct { const GUID *guid; DWORD offset, type, flags; } diobjectdataform
 typedef struct { DWORD dwSize, dwHeaderSize, dwObj, dwHow; } dipropheader;
 typedef struct { dipropheader header; DWORD data; } dipropdword;
 typedef struct { dipropheader header; LONG min, max; } diproprange;
+typedef struct { dipropheader header; uintptr_t data; } dippropointer;
+typedef struct { dipropheader header; GUID guid_class; WCHAR path[260]; } dipropguidandpath;
 typedef vx_di_buffer_event diobjectdata;
 typedef struct { DWORD offset, type, flags; GUID guid; BOOL32 has_guid; uint32_t source_index, width, category; } diobject;
 
@@ -103,6 +111,10 @@ struct di_device {
     vx_di_buffer event_buffer;
     BOOL32 opened, acquired, format_set;
     BOOL32 ansi;                                       // created through IDirectInput8A: char names in instances and objects
+    int sys;                                           // SYS_KEYBOARD, SYS_MOUSE: the system's keyboard or mouse, not HID
+    uint8_t sys_keys[256], sys_buttons[8];
+    LONG sys_moved[3];                                 // the mouse's movement since GetDeviceState last read it
+    uintptr_t app_data[512];                           // DIPROP_APPDATA by offset in the data format: carried by each event
 };
 
 static const GUID IID_IUnknown = { 0, 0, 0, { 0xc0,0,0,0,0,0,0,0x46 } };
@@ -175,10 +187,21 @@ static BOOL32 make_hid_info(IOHIDDeviceRef hid, hid_device *out) {
     uint32_t vid = cf_u32(IOHIDDeviceGetProperty(hid, CFSTR(kIOHIDVendorIDKey)));
     uint32_t pid = cf_u32(IOHIDDeviceGetProperty(hid, CFSTR(kIOHIDProductIDKey)));
     uint32_t location = cf_u32(IOHIDDeviceGetProperty(hid, CFSTR(kIOHIDLocationIDKey)));
+    // A DualSense (and its Edge) is shown as a DualShock 4 (v2): the same buttons and axes in DirectInput, and games
+    // older than it know that one (Elite Dangerous has a preset for it, none for the DualSense).
+    // VXRT_DUALSENSE_AS_DS4=0 shows it as it is.
+    static int as_ds4 = -1;
+    if (as_ds4 < 0) { const char *e = getenv("VXRT_DUALSENSE_AS_DS4"); as_ds4 = !(e && *e == '0'); }
+    if (as_ds4 && vid == 0x054c && (pid == 0x0ce6 || pid == 0x0df2)) pid = 0x09cc;
     out->hid = (IOHIDDeviceRef)CFRetain(hid);
     out->instance = device_guid(vid, pid, location, page, usage);
-    out->product = device_guid(vid, pid, 0, page, usage);
-    out->type = DIDEVTYPE_HID | DIDEVTYPE_JOYSTICK;
+    // the product GUID as Windows makes it, {PIDVID-0000-0000-0000-504944564944}: games read the vendor and
+    // product from it (and match it against the XInput pads among setupapi's HID interfaces)
+    out->product = (GUID){ (pid << 16) | (vid & 0xffff), 0, 0, { 0, 0, 'P', 'I', 'D', 'V', 'I', 'D' } };
+    // DirectInput 8's types (its only interface here): a game ignores a device whose type it does not know
+    // (Elite Dangerous enumerated a DualSense typed DIDEVTYPE_JOYSTICK, 4, and never opened it)
+    out->type = DIDEVTYPE_HID | (usage == 5 ? DI8DEVTYPE_GAMEPAD | DI8DEVTYPEGAMEPAD_STANDARD << 8
+                                            : DI8DEVTYPE_JOYSTICK | DI8DEVTYPEJOYSTICK_STANDARD << 8);
     out->primary_page = (uint16_t)page;
     out->primary_usage = (uint16_t)usage;
     cf_string_to_wide(IOHIDDeviceGetProperty(hid, CFSTR(kIOHIDProductKey)), out->name, 260);
@@ -220,6 +243,40 @@ static void release_snapshot(hid_device *devices, size_t count) {
     if (!devices) return;
     for (size_t i = 0; i < count; i++) if (devices[i].hid) CFRelease(devices[i].hid);
     free(devices);
+}
+// ---- the system keyboard and mouse ------------------------------------------------------------------------------------
+// Games read them through DirectInput too (Elite Dangerous: no keys or mouse without them). Their state comes from
+// the windows' input (user32.c): the keys by DIK code, the mouse's movement since the last read, its buttons.
+enum { SYS_NONE, SYS_KEYBOARD, SYS_MOUSE };
+static const GUID GUID_SysMouse = { 0x6f1d2b60, 0xd5a0, 0x11cf, { 0xbf, 0xc7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+static const GUID GUID_SysKeyboard = { 0x6f1d2b61, 0xd5a0, 0x11cf, { 0xbf, 0xc7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+int vx_dinput_key_down(int dik);
+void vx_dinput_mouse_take(LONG *dx, LONG *dy, LONG *dz);
+int vx_dinput_mouse_button(int i);
+static void sys_device_info(int sys, hid_device *out) {
+    memset(out, 0, sizeof *out);
+    out->instance = out->product = sys == SYS_KEYBOARD ? GUID_SysKeyboard : GUID_SysMouse;
+    out->type = sys == SYS_KEYBOARD ? 0x0413 /* DI8DEVTYPE_KEYBOARD, PCENH */ : 0x0112 /* DI8DEVTYPE_MOUSE, UNKNOWN */;
+    out->primary_page = 1; out->primary_usage = sys == SYS_KEYBOARD ? 6 : 2;
+    const char *name = sys == SYS_KEYBOARD ? "Keyboard" : "Mouse";
+    for (int i = 0; name[i]; i++) out->name[i] = (WCHAR)name[i];
+}
+static BOOL32 sys_sample(di_device *self, int push);
+static int sys_kind(const GUID *guid) {
+    return !memcmp(guid, &GUID_SysKeyboard, sizeof *guid) ? SYS_KEYBOARD : !memcmp(guid, &GUID_SysMouse, sizeof *guid) ? SYS_MOUSE : SYS_NONE;
+}
+
+// The pads macOS's Game Controller framework reads (Xbox, PlayStation, Nintendo) are XInput's here (input.m).
+static int read_by_xinput(uint32_t vid) { return vid == 0x045e || vid == 0x054c || vid == 0x057e; }
+// A HID device's interface path and instance ID as Windows makes them; xinput >= 0 adds the "IG_nn" of an XInput pad
+// (lower case in the path, upper case in the ID, as Windows has them).
+static void hid_interface_path(const hid_device *device, int xinput, char *path, size_t path_size, char *id, size_t id_size) {
+    uint32_t vid = device->product.Data1 & 0xffff, pid = device->product.Data1 >> 16;
+    uint32_t serial = device->instance.Data2 | (uint32_t)device->instance.Data4[2] << 16 | (uint32_t)device->instance.Data4[3] << 24;
+    char ig[8] = "", IG[8] = "";
+    if (xinput >= 0) { snprintf(ig, sizeof ig, "&ig_%02d", xinput); snprintf(IG, sizeof IG, "&IG_%02d", xinput); }
+    snprintf(path, path_size, "\\\\?\\hid#vid_%04x&pid_%04x%s#7&%08x&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}", vid, pid, ig, serial);
+    if (id) snprintf(id, id_size, "HID\\VID_%04X&PID_%04X%s\\7&%08X&0&0000", vid, pid, IG, serial);
 }
 static void fill_instance(const hid_device *device, dideviceinstancew *out) {
     memset(out, 0, sizeof *out);
@@ -290,15 +347,73 @@ static HRESULT WINAPI di_dev_run_control_panel(di_device *, void *, DWORD);
 static HRESULT WINAPI di_dev_initialize(di_device *, void *, DWORD, const GUID *);
 static HRESULT WINAPI di_dev_poll(di_device *);
 static HRESULT WINAPI di_dev_unimplemented(void);
+// VXRT_TRACE_INPUT: what a game does with a device (first calls of each method, then every 1000th, and every error)
+static int trace_dinput(void);
+static int trace_note(volatile int *count, HRESULT r) { int n = __sync_add_and_fetch(count, 1); return trace_dinput() && (n <= 5 || r < 0 && n <= 50 || n % 1000 == 0) ? n : 0; }
+#define TRACED(name, params, args, fmt, ...) \
+    static HRESULT WINAPI traced_##name params { \
+        static volatile int calls; HRESULT r = di_dev_##name args; int n = trace_note(&calls, r); \
+        if (n) vx_log("DirectInput: " #name " #%d " fmt " = %#x", n, ##__VA_ARGS__, (unsigned)r); return r; }
+TRACED(acquire, (di_device *self), (self), "")
+TRACED(set_format, (di_device *self, const didataformat *f), (self, f), "(%u objects, %u bytes, flags %#x)", f ? (unsigned)f->dwNumObjs : 0u, f ? (unsigned)f->dwDataSize : 0u, f ? (unsigned)f->dwFlags : 0u)
+TRACED(set_coop, (di_device *self, void *w, DWORD flags), (self, w, flags), "(flags %#x)", (unsigned)flags)
+static uint32_t object_offset(di_device *self, DWORD how, DWORD object);
+static const char *device_kind(const di_device *self) { return self->sys == SYS_KEYBOARD ? "keyboard" : self->sys == SYS_MOUSE ? "mouse" : "pad"; }
+static HRESULT WINAPI traced_get_data(di_device *self, DWORD size, void *data, DWORD *count, DWORD flags) {
+    DWORD wanted = count ? *count : 0;
+    HRESULT r = di_dev_get_data(self, size, data, count, flags);
+    if (trace_dinput()) {
+        static volatile int calls[3], delivered[3];
+        int which = self->sys == SYS_KEYBOARD ? 1 : self->sys == SYS_MOUSE ? 2 : 0;
+        int n = __sync_add_and_fetch(&calls[which], 1);
+        DWORD got = count ? *count : 0;
+        int d = got && data ? __sync_add_and_fetch(&delivered[which], 1) : 0;
+        if (n <= 5 || (d && d <= 40) || n % 2000 == 0)
+            vx_log("DirectInput: %s get_data #%d (%u wanted, %u bytes each, %s, flags %#x) = %#x, %u given", device_kind(self), n, (unsigned)wanted, (unsigned)size,
+                   data ? "into a buffer" : "no buffer", (unsigned)flags, (unsigned)r, (unsigned)got);
+        if (d && d <= 40)
+            for (DWORD i = 0; i < got && i < 4; i++) {
+                const DWORD *item = (const DWORD *)((const uint8_t *)data + i * size);
+                vx_log("DirectInput:   offset %u value %#x app data %#llx", (unsigned)item[0], (unsigned)item[1], size >= 24 ? (unsigned long long)*(const uint64_t *)((const uint8_t *)item + 16) : 0ull);
+            }
+    }
+    return r;
+}
+TRACED(poll, (di_device *self), (self), "")
+static HRESULT WINAPI traced_get_state(di_device *self, DWORD bytes, void *state) {
+    static volatile int calls[3], changes[3];
+    HRESULT r = di_dev_get_state(self, bytes, state);
+    if (!trace_dinput()) return r;
+    int which = self->sys == SYS_KEYBOARD ? 1 : self->sys == SYS_MOUSE ? 2 : 0;
+    int n = __sync_add_and_fetch(&calls[which], 1);
+    char pressed[96] = ""; size_t len = 0;
+    if (r >= 0 && self->sys == SYS_KEYBOARD) {
+        for (int k = 0; k < 256 && (DWORD)k < bytes && len + 6 < sizeof pressed; k++) if (((uint8_t *)state)[k] & 0x80) len += (size_t)snprintf(pressed + len, sizeof pressed - len, " %#x", k);
+    } else if (r >= 0 && !self->sys && bytes >= 80) {
+        for (int b = 0; b < 32 && len + 4 < sizeof pressed; b++) if (((uint8_t *)state)[48 + b] & 0x80) len += (size_t)snprintf(pressed + len, sizeof pressed - len, " %d", b);
+    } else if (r >= 0 && self->sys == SYS_MOUSE && bytes >= 16) {
+        for (int b = 0; b < 4 && len + 4 < sizeof pressed; b++) if (((uint8_t *)state)[12 + b] & 0x80) len += (size_t)snprintf(pressed + len, sizeof pressed - len, " %d", b);
+    }
+    static char last[3][96];
+    int changed = strcmp(last[which], pressed) != 0;
+    if (changed) { strncpy(last[which], pressed, sizeof last[which] - 1); __sync_add_and_fetch(&changes[which], 1); }
+    if (n <= 3 || r < 0 || (changed && changes[which] <= 60) || n % 2000 == 0)
+        vx_log("DirectInput: %s get_state #%d (%u bytes) = %#x, axes %d %d, pressed:%s", device_kind(self), n, (unsigned)bytes, (unsigned)r,
+               r >= 0 && bytes >= 8 ? ((LONG *)state)[0] : 0, r >= 0 && bytes >= 8 ? ((LONG *)state)[1] : 0, len ? pressed : " none");
+    return r;
+}
+#define UNIMPLEMENTED(i) static HRESULT WINAPI unimplemented_##i(void) { if (trace_dinput()) vx_log("DirectInput: device method %d called (not implemented)", i); return di_dev_unimplemented(); }
+UNIMPLEMENTED(18) UNIMPLEMENTED(19) UNIMPLEMENTED(20) UNIMPLEMENTED(21) UNIMPLEMENTED(22) UNIMPLEMENTED(23) UNIMPLEMENTED(24)
+UNIMPLEMENTED(26) UNIMPLEMENTED(27) UNIMPLEMENTED(28) UNIMPLEMENTED(29) UNIMPLEMENTED(30) UNIMPLEMENTED(31)
 static const void *g_device_vtable[32] = {
     di_dev_qi, di_dev_addref, di_dev_release, di_dev_caps, di_dev_enum_objects, di_dev_get_property,
-    di_dev_set_property, di_dev_acquire, di_dev_unacquire, di_dev_get_state, di_dev_get_data,
-    di_dev_set_format, di_dev_set_event, di_dev_set_coop, di_dev_get_object_info, di_dev_get_info,
+    di_dev_set_property, traced_acquire, di_dev_unacquire, traced_get_state, traced_get_data,
+    traced_set_format, di_dev_set_event, traced_set_coop, di_dev_get_object_info, di_dev_get_info,
     di_dev_run_control_panel, di_dev_initialize,
-    di_dev_unimplemented, di_dev_unimplemented, di_dev_unimplemented, di_dev_unimplemented,
-    di_dev_unimplemented, di_dev_unimplemented, di_dev_unimplemented, di_dev_poll,
-    di_dev_unimplemented, di_dev_unimplemented, di_dev_unimplemented, di_dev_unimplemented,
-    di_dev_unimplemented, di_dev_unimplemented
+    unimplemented_18, unimplemented_19, unimplemented_20, unimplemented_21,
+    unimplemented_22, unimplemented_23, unimplemented_24, traced_poll,
+    unimplemented_26, unimplemented_27, unimplemented_28, unimplemented_29,
+    unimplemented_30, unimplemented_31
 };
 
 static HRESULT WINAPI di_input_qi(di_input *self, const GUID *iid, void **out) {
@@ -325,6 +440,16 @@ static HRESULT WINAPI di_input_create_device(di_input *self, const GUID *guid, d
     if (!guid || !out) return VX_DI_E_POINTER;
     *out = NULL;
     if (outer) return DIERR_NOAGGREGATION;
+    if (sys_kind(guid)) {
+        di_device *device = calloc(1, sizeof *device);
+        if (!device) return VX_DI_E_OUTOFMEMORY;
+        device->vtable = g_device_vtable; device->refs = 1; device->ansi = self->ansi;
+        device->sys = sys_kind(guid);
+        sys_device_info(device->sys, &device->source);
+        vx_di_buffer_init(&device->event_buffer);
+        *out = device;
+        return VX_DI_S_OK;
+    }
     size_t count = 0;
     hid_device *devices = snapshot_devices(&count);
     hid_device *found = NULL;
@@ -348,12 +473,26 @@ static HRESULT WINAPI di_input_create_device(di_input *self, const GUID *guid, d
 static BOOL32 acceptable_type(DWORD requested, DWORD actual) {
     if (!requested || requested == DI8DEVCLASS_ALL || requested == DI8DEVCLASS_GAMECTRL) return 1;
     return requested == DIDEVTYPE_JOYSTICK || requested == DI8DEVTYPE_JOYSTICK ||
-           requested == DI8DEVTYPE_GAMEPAD || requested == DI8DEVTYPE_FLIGHT || requested == actual;
+           requested == DI8DEVTYPE_GAMEPAD || requested == DI8DEVTYPE_FLIGHT || requested == (actual & 0xffu);
 }
 static HRESULT WINAPI di_input_enum_devices(di_input *self, DWORD type, enum_devices_cb callback, void *context, DWORD flags) {
     (void)self;
     if (!callback) return VX_DI_E_INVALIDARG;
     if (flags & DIEDFL_FORCEFEEDBACK) return VX_DI_S_OK;
+    // the mouse and the keyboard first, as Windows lists them: for every device, for pointers or keyboards
+    for (int sys = SYS_MOUSE; sys >= SYS_KEYBOARD; sys--) {
+        DWORD kind = sys == SYS_MOUSE ? 2 /* DI8DEVCLASS_POINTER */ : 3 /* DI8DEVCLASS_KEYBOARD */;
+        DWORD dev_type = sys == SYS_MOUSE ? 0x12 : 0x13;
+        if (type && type != kind && type != dev_type) continue;
+        hid_device info; dideviceinstancew instance;
+        sys_device_info(sys, &info);
+        fill_instance(&info, &instance);
+        BOOL32 go;
+        if (self->ansi) { dideviceinstancea ansi; instance_to_ansi(&instance, &ansi); go = ((BOOL32 (WINAPI *)(const dideviceinstancea *, void *))callback)(&ansi, context); }
+        else go = callback(&instance, context);
+        if (!go) return VX_DI_S_OK;
+    }
+    if (type == 2 || type == 3 || type == 0x12 || type == 0x13) return VX_DI_S_OK;
     size_t count = 0;
     hid_device *devices = snapshot_devices(&count);
     if (trace_dinput()) vx_log("DirectInput: EnumDevices(type %#x, flags %#x): %zu HID game controller(s)", (unsigned)type, (unsigned)flags, count);
@@ -373,6 +512,7 @@ static HRESULT WINAPI di_input_enum_devices(di_input *self, DWORD type, enum_dev
 static HRESULT WINAPI di_input_get_device_status(di_input *self, const GUID *guid) {
     (void)self;
     if (!guid) return VX_DI_E_INVALIDARG;
+    if (sys_kind(guid)) return VX_DI_S_OK;
     size_t count = 0;
     hid_device *devices = snapshot_devices(&count);
     HRESULT result = DIERR_NOTFOUND;
@@ -462,6 +602,12 @@ static HRESULT WINAPI di_dev_caps(di_device *self, didevcaps *caps) {
     caps->dwSize = size;
     caps->dwFlags = 1 /* DIDC_ATTACHED */ | 2 /* DIDC_POLLEDDEVICE */;
     caps->dwDevType = self->source.type;
+    if (self->sys) {
+        caps->dwFlags = 1;
+        caps->dwAxes = self->sys == SYS_MOUSE ? 3 : 0;
+        caps->dwButtons = self->sys == SYS_MOUSE ? 5 : 128;
+        return VX_DI_S_OK;
+    }
     caps->dwAxes = count_objects(self, 0);
     caps->dwButtons = count_objects(self, 1);
     caps->dwPOVs = count_objects(self, 2);
@@ -526,6 +672,8 @@ static BOOL32 axis_range_index(di_device *self, DWORD how, DWORD object, DWORD *
 }
 static HRESULT WINAPI di_dev_enum_objects(di_device *self, enum_objects_cb callback, void *context, DWORD flags) {
     if (!callback) return VX_DI_E_INVALIDARG;
+    if (trace_dinput()) { static volatile int calls; if (__sync_add_and_fetch(&calls, 1) <= 10) vx_log("DirectInput: EnumObjects(flags %#x) on %s", (unsigned)flags, self->sys == SYS_KEYBOARD ? "the keyboard" : self->sys == SYS_MOUSE ? "the mouse" : "a HID device"); }
+    if (self->sys) return VX_DI_S_OK;                    // (the keyboard's and mouse's objects are not listed)
     if (!load_objects(self)) return DIERR_INPUTLOST;
     uint32_t axes = 0, buttons = 0, povs = 0;
     for (size_t i = 0; i < self->object_count; i++) {
@@ -561,6 +709,7 @@ static HRESULT WINAPI di_dev_enum_objects(di_device *self, enum_objects_cb callb
 static HRESULT WINAPI di_dev_get_property(di_device *self, const GUID *property, dipropheader *header) {
     if (!property || !header) return VX_DI_E_INVALIDARG;
     uint32_t id = property_id(property);
+    if (trace_dinput()) { static volatile int calls; if (__sync_add_and_fetch(&calls, 1) <= 40) vx_log("DirectInput: GetProperty %u", (unsigned)id); }
     if (header->dwSize < sizeof *header || header->dwHeaderSize != sizeof *header) return VX_DI_E_INVALIDARG;
     if (id == DIPROP_BUFFERSIZE_ID && header->dwSize >= sizeof(dipropdword)) {
         if (header->dwHow != DIPH_DEVICE) return VX_DI_E_INVALIDARG;
@@ -574,13 +723,66 @@ static HRESULT WINAPI di_dev_get_property(di_device *self, const GUID *property,
         range->min = self->range_min[axis]; range->max = self->range_max[axis];
         return VX_DI_S_OK;
     }
+    if (id == DIPROP_APPDATA_ID && header->dwSize >= sizeof(dippropointer)) {
+        uint32_t offset = object_offset(self, header->dwHow, header->dwObj);
+        if (offset >= 512) return DIERR_NOTFOUND;
+        ((dippropointer *)header)->data = self->app_data[offset];
+        return VX_DI_S_OK;
+    }
+    if (id == DIPROP_VIDPID_ID && header->dwSize >= sizeof(dipropdword)) {
+        ((dipropdword *)header)->data = self->source.product.Data1;                     // MAKELONG(vendor, product)
+        return VX_DI_S_OK;
+    }
+    if (id == DIPROP_GUIDANDPATH_ID && header->dwSize >= sizeof(dipropguidandpath)) {
+        // the HID class and the device's path, as setupapi lists it: "ig_" in it marks a pad XInput reads
+        dipropguidandpath *out = (dipropguidandpath *)header;
+        static const GUID hid_class = { 0x745a17a0, 0x74d3, 0x11d0, { 0xb6, 0xfe, 0x00, 0xa0, 0xc9, 0x0f, 0x57, 0xda } };
+        char path[160];
+        hid_interface_path(&self->source, read_by_xinput(self->source.product.Data1 & 0xffff) ? 0 : -1, path, sizeof path, NULL, 0);
+        out->guid_class = hid_class;
+        size_t n = vx_utf8_to_utf16(path, strlen(path), out->path, 259);
+        out->path[n] = 0;
+        return VX_DI_S_OK;
+    }
+    if (trace_dinput()) vx_log("DirectInput: GetProperty %u not supported", (unsigned)id);
     return DIERR_UNSUPPORTED;
 }
+// The data-format offset of the object a property names (DIPH_BYOFFSET, or DIPH_BYID: the keyboard's and mouse's
+// instance numbers, a HID device's IDs as EnumObjects gives them). UINT32_MAX when there is none.
+static uint32_t object_offset(di_device *self, DWORD how, DWORD object) {
+    if (how == DIPH_BYOFFSET) return object;
+    if (how != DIPH_BYID) return UINT32_MAX;
+    uint32_t kind = object & 0xffu, instance = (object >> 8) & 0xffffu;
+    if (self->sys == SYS_KEYBOARD) return instance < 256 ? instance : UINT32_MAX;
+    if (self->sys == SYS_MOUSE) return kind & 0x03u ? (instance < 3 ? instance * 4 : UINT32_MAX) : instance < 8 ? 12 + instance : UINT32_MAX;
+    if (!load_objects(self)) return UINT32_MAX;
+    uint32_t axes = 0, buttons = 0, povs = 0;
+    for (size_t i = 0; i < self->object_count; i++) {
+        hid_object *src = &self->objects[i];
+        uint32_t this_kind, this_instance = object_instance(src, buttons, povs, axes);
+        if (src->page == 9) { buttons++; this_kind = DIDFT_PSHBUTTON; }
+        else if (src->page == 1 && src->usage == 0x39) { povs++; this_kind = DIDFT_POV; }
+        else { axes++; this_kind = DIDFT_ABSAXIS; }
+        if (this_instance != instance || !(this_kind & kind)) continue;
+        for (DWORD f = 0; f < self->format_count; f++) if (self->format[f].source_index == i) return self->format[f].offset;
+        return UINT32_MAX;
+    }
+    return UINT32_MAX;
+}
+static uintptr_t app_data_at(const di_device *self, uint32_t offset) { return offset < 512 ? self->app_data[offset] : 0; }
 static HRESULT WINAPI di_dev_set_property(di_device *self, const GUID *property, const dipropheader *header) {
     if (!property || !header) return VX_DI_E_INVALIDARG;
-    if (self->acquired) return DIERR_ACQUIRED;
     uint32_t id = property_id(property);
+    if (trace_dinput()) { static volatile int calls; if (__sync_add_and_fetch(&calls, 1) <= 40) vx_log("DirectInput: SetProperty %u (how %u, object %#x) on the %s", (unsigned)id, (unsigned)header->dwHow, (unsigned)header->dwObj, device_kind(self)); }
     if (header->dwSize < sizeof *header || header->dwHeaderSize != sizeof *header) return VX_DI_E_INVALIDARG;
+    if (id == DIPROP_APPDATA_ID && header->dwSize >= sizeof(dippropointer)) {     // (allowed while acquired)
+        if (!self->format_set) return DIERR_NOTFOUND;
+        uint32_t offset = object_offset(self, header->dwHow, header->dwObj);
+        if (offset >= 512) return DIERR_NOTFOUND;
+        self->app_data[offset] = ((const dippropointer *)header)->data;
+        return VX_DI_S_OK;
+    }
+    if (self->acquired) return DIERR_ACQUIRED;
     if (id == DIPROP_BUFFERSIZE_ID && header->dwSize >= sizeof(dipropdword)) {
         if (header->dwHow != DIPH_DEVICE) return VX_DI_E_INVALIDARG;
         DWORD size = ((const dipropdword *)header)->data;
@@ -604,6 +806,15 @@ static HRESULT WINAPI di_dev_set_property(di_device *self, const GUID *property,
     return DIERR_UNSUPPORTED;
 }
 static HRESULT WINAPI di_dev_acquire(di_device *self) {
+    if (self->sys) {
+        if (!self->format_set) return VX_DI_E_INVALIDARG;
+        if (self->acquired) return 1;                                    // S_FALSE: already
+        self->acquired = 1;
+        vx_di_buffer_clear(&self->event_buffer);
+        sys_sample(self, 0);
+        memset(self->sys_moved, 0, sizeof self->sys_moved);
+        return VX_DI_S_OK;
+    }
     if (!self->source.hid) return DIERR_INPUTLOST;
     if (self->acquired) return DIERR_ACQUIRED;
     if (!self->format_set) return VX_DI_E_INVALIDARG;
@@ -634,7 +845,76 @@ static LONG axis_usage_for(const GUID *guid, uint32_t instance) {
     default: return (LONG)(0x30 + instance);
     }
 }
+// The pads macOS's Game Controller framework reads (read_by_xinput): once it has one, it switches it to its own
+// report mode (a DualSense's full report), and the HID elements of the plain report DirectInput looks at stop
+// changing. Their values are made from the framework's state instead, in each element's logical range, with the
+// buttons where Windows has them (a PlayStation pad's square, cross, circle, triangle, L1, R1, L2, R2, Create,
+// Options, L3, R3, PS, touchpad; others as an Xbox pad's A, B, X, Y, LB, RB, View, Menu, LS, RS).
+static GCExtendedGamepad *framework_pad(uint32_t vid) {
+    static dispatch_once_t once;                                       // (as XInput: input from a background app too)
+    dispatch_once(&once, ^{ if (@available(macOS 11.3, *)) GCController.shouldMonitorBackgroundEvents = YES; });
+    for (GCController *c in GCController.controllers) {
+        GCExtendedGamepad *pad = c.extendedGamepad;
+        if (!pad) continue;
+        NSString *kind = [c.productCategory stringByAppendingFormat:@" %@", c.vendorName ?: @""];
+        BOOL sony = [kind rangeOfString:@"Dual" options:NSCaseInsensitiveSearch].location != NSNotFound;
+        BOOL nintendo = [kind rangeOfString:@"Switch" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                        [kind rangeOfString:@"Joy-Con" options:NSCaseInsensitiveSearch].location != NSNotFound;
+        if (vid == 0x054c ? sony : vid == 0x057e ? nintendo : !sony && !nintendo) return pad;
+    }
+    return nil;
+}
+static int64_t in_range(const hid_object *object, double unit) {      // 0..1 onto the element's logical range
+    if (unit < 0) unit = 0;
+    if (unit > 1) unit = 1;
+    return object->logical_min + (int64_t)llround(unit * (double)(object->logical_max - object->logical_min));
+}
+static BOOL32 framework_value(di_device *self, hid_object *object, int64_t *value) {
+    uint32_t vid = self->source.product.Data1 & 0xffff;
+    if (!read_by_xinput(vid)) return 0;
+    @autoreleasepool {
+        GCExtendedGamepad *pad = framework_pad(vid);
+        static int told = -1;
+        if ((pad != nil) != told && trace_dinput()) {
+            told = pad != nil;
+            vx_log("DirectInput: %s", pad ? "the pad's state comes from the Game Controller framework"
+                                          : "the Game Controller framework shows no such pad (yet); reading HID");
+        }
+        if (!pad) return 0;
+        if (object->page == 1) {
+            switch (object->usage) {
+            case 0x30: *value = in_range(object, (pad.leftThumbstick.xAxis.value + 1) / 2); return 1;
+            case 0x31: *value = in_range(object, (1 - pad.leftThumbstick.yAxis.value) / 2); return 1;    // HID's y grows downwards
+            case 0x32: *value = in_range(object, (pad.rightThumbstick.xAxis.value + 1) / 2); return 1;
+            case 0x35: *value = in_range(object, (1 - pad.rightThumbstick.yAxis.value) / 2); return 1;
+            case 0x33: *value = in_range(object, pad.leftTrigger.value); return 1;
+            case 0x34: *value = in_range(object, pad.rightTrigger.value); return 1;
+            case 0x39: {                                                    // the hat: 0 up, clockwise in eighths; else centred
+                BOOL up = pad.dpad.up.pressed, down = pad.dpad.down.pressed, left = pad.dpad.left.pressed, right = pad.dpad.right.pressed;
+                int dir = up ? (right ? 1 : left ? 7 : 0) : down ? (right ? 3 : left ? 5 : 4) : right ? 2 : left ? 6 : -1;
+                *value = dir < 0 ? object->logical_min - 1 : object->logical_min + dir;
+                return 1;
+            }
+            default: return 0;
+            }
+        }
+        if (object->page != 9) return 0;
+        GCControllerButtonInput *sony[] = { pad.buttonX, pad.buttonA, pad.buttonB, pad.buttonY, pad.leftShoulder, pad.rightShoulder,
+                                            pad.leftTrigger, pad.rightTrigger, pad.buttonOptions, pad.buttonMenu,
+                                            pad.leftThumbstickButton, pad.rightThumbstickButton, pad.buttonHome,
+                                            [pad isKindOfClass:GCDualSenseGamepad.class] ? ((GCDualSenseGamepad *)pad).touchpadButton : nil };
+        GCControllerButtonInput *xbox[] = { pad.buttonA, pad.buttonB, pad.buttonX, pad.buttonY, pad.leftShoulder, pad.rightShoulder,
+                                            pad.buttonOptions, pad.buttonMenu, pad.leftThumbstickButton, pad.rightThumbstickButton };
+        BOOL is_sony = vid == 0x054c;
+        uint32_t n = is_sony ? sizeof sony / sizeof sony[0] : sizeof xbox / sizeof xbox[0];
+        if (object->usage < 1 || object->usage > n) { *value = 0; return 1; }
+        GCControllerButtonInput *button = is_sony ? sony[object->usage - 1] : xbox[object->usage - 1];
+        *value = button.pressed ? 1 : 0;
+        return 1;
+    }
+}
 static BOOL32 read_hid_value(di_device *self, hid_object *object, int64_t *value) {
+    if (framework_value(self, object, value)) return 1;
     IOHIDValueRef result = NULL;
     IOReturn status = IOHIDDeviceGetValue(self->source.hid, object->element, &result);
     if (status != kIOReturnSuccess || !result) return 0;
@@ -689,7 +969,42 @@ static DWORD di_time_now(void) {
     return get_tick_count ? get_tick_count() : 0;
 }
 
+// The keyboard's keys and the mouse's movement and buttons into events (DIK code, DIMOFS_X/Y/Z, DIMOFS_BUTTON0..),
+// and the movement kept for GetDeviceState. push 0: only take the current state (on Acquire).
+static BOOL32 sys_sample(di_device *self, int push) {
+    BOOL32 changed = 0;
+    DWORD timestamp = di_time_now();
+    if (self->sys == SYS_KEYBOARD) {
+        for (int i = 0; i < 256; i++) {
+            uint8_t down = vx_dinput_key_down(i) ? 0x80 : 0;
+            if (down == self->sys_keys[i]) continue;
+            self->sys_keys[i] = down; changed = 1;
+            if (push && self->buffer_size) vx_di_buffer_push(&self->event_buffer, (uint32_t)i, down, timestamp, app_data_at(self, (uint32_t)i));
+        }
+    } else {
+        LONG moved[3];
+        vx_dinput_mouse_take(&moved[0], &moved[1], &moved[2]);
+        for (int axis = 0; axis < 3; axis++) {
+            if (!moved[axis]) continue;
+            if (!push) continue;
+            self->sys_moved[axis] += moved[axis]; changed = 1;
+            if (self->buffer_size) vx_di_buffer_push(&self->event_buffer, (uint32_t)(axis * 4), (uint32_t)moved[axis], timestamp, app_data_at(self, (uint32_t)(axis * 4)));
+        }
+        for (int i = 0; i < 5; i++) {
+            uint8_t down = vx_dinput_mouse_button(i) ? 0x80 : 0;
+            if (down == self->sys_buttons[i]) continue;
+            self->sys_buttons[i] = down; changed = 1;
+            if (push && self->buffer_size) vx_di_buffer_push(&self->event_buffer, (uint32_t)(12 + i), down, timestamp, app_data_at(self, (uint32_t)(12 + i)));
+        }
+    }
+    if (changed && push && self->event) {
+        BOOL32 (WINAPI *set_event)(HANDLE) = (BOOL32 (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "SetEvent");
+        if (set_event) (void)set_event(self->event);
+    }
+    return 1;
+}
 static BOOL32 di_dev_sample(di_device *self) {
+    if (self->sys) return sys_sample(self, 1);
     if (!load_objects(self)) return 0;
     if (!self->format_set) return 1;
     BOOL32 changed = 0;
@@ -703,7 +1018,7 @@ static BOOL32 di_dev_sample(di_device *self) {
         } else if (self->last_values[i] != value) {
             self->last_values[i] = value;
             changed = 1;
-            vx_di_buffer_push(&self->event_buffer, object->offset, value, timestamp, 0);
+            vx_di_buffer_push(&self->event_buffer, object->offset, value, timestamp, app_data_at(self, object->offset));
         }
     }
     if (changed && self->event) {
@@ -750,6 +1065,11 @@ static HRESULT WINAPI di_dev_set_format(di_device *self, const didataformat *for
     if (!format || format->dwSize != sizeof *format || format->dwObjSize != sizeof(diobjectdataformat) ||
         format->dwDataSize == 0 || format->dwNumObjs > 1024 || (format->dwNumObjs && !format->objects)) return VX_DI_E_INVALIDARG;
     if (self->acquired) return DIERR_ACQUIRED;
+    if (self->sys) {                     // c_dfDIKeyboard (256 bytes by DIK code) or c_dfDIMouse(2): taken as such
+        self->format_size = format->dwDataSize;
+        self->format_set = 1;
+        return VX_DI_S_OK;
+    }
     diobject *objects = format->dwNumObjs ? calloc(format->dwNumObjs, sizeof *objects) : NULL;
     uint32_t *last_values = format->dwNumObjs ? calloc(format->dwNumObjs, sizeof *last_values) : NULL;
     uint8_t *last_valid = format->dwNumObjs ? calloc(format->dwNumObjs, sizeof *last_valid) : NULL;
@@ -809,6 +1129,7 @@ static HRESULT WINAPI di_dev_set_coop(di_device *self, void *window, DWORD flags
     return VX_DI_S_OK;
 }
 static HRESULT WINAPI di_dev_get_object_info(di_device *self, dideviceobjectinstancew *out, DWORD object, DWORD how) {
+    if (self->sys) return (HRESULT)0x80070002;           // DIERR_OBJECTNOTFOUND
     if (!out || !load_objects(self)) return VX_DI_E_INVALIDARG;
     uint32_t axes = 0, buttons = 0, povs = 0;
     for (size_t i = 0; i < self->object_count; i++) {
@@ -876,9 +1197,101 @@ static WINAPI HRESULT DirectInput8Create(void *instance, DWORD version, const GU
     return VX_DI_S_OK;
 }
 
+// ---- setupapi: the HID device interfaces ----------------------------------------------------------------------------------
+// A program that reads pads through both XInput and DirectInput (Elite Dangerous) finds the XInput ones among the HID
+// device interfaces: a path with "IG_" in it is one, and the DirectInput device of the same vendor and product is left
+// to XInput. The pads macOS's Game Controller framework reads (Xbox, PlayStation, Nintendo: XInput here, input.m) are
+// listed so, other HID joysticks and gamepads plainly. Any other class or interface gives an empty list.
+typedef struct { DWORD cbSize; GUID InterfaceClassGuid; DWORD Flags; uintptr_t Reserved; } sp_interface_data;
+typedef struct { DWORD cbSize; GUID ClassGuid; DWORD DevInst; uintptr_t Reserved; } sp_devinfo_data;
+typedef struct { uint32_t magic, count; struct { char path[160], id[96]; } item[16]; } hid_interface_set;
+enum { HID_SET_MAGIC = 0x48494453, DIGCF_DEVICEINTERFACE = 0x10 };
+static const GUID GUID_DEVINTERFACE_HID = { 0x4d1e55b2, 0xf16f, 0x11cf, { 0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30 } };
+#define EMPTY_DEVICE_SET ((HANDLE)(uintptr_t)0x5e7d0001)
+
+static int trace_setupdi(void) { return trace_dinput(); }
+static WINAPI HANDLE SetupDiGetClassDevsW(const GUID *guid, const WCHAR *enumerator, void *window, DWORD flags) {
+    (void)enumerator; (void)window;
+    if (trace_setupdi()) vx_log("setupapi: GetClassDevs({%08x-%04x-...}, flags %#x)", guid ? (unsigned)guid->Data1 : 0u, guid ? guid->Data2 : 0, (unsigned)flags);
+    if (!guid || !(flags & DIGCF_DEVICEINTERFACE) || memcmp(guid, &GUID_DEVINTERFACE_HID, sizeof *guid)) return EMPTY_DEVICE_SET;
+    hid_interface_set *set = calloc(1, sizeof *set);
+    if (!set) return EMPTY_DEVICE_SET;
+    set->magic = HID_SET_MAGIC;
+    size_t count = 0;
+    hid_device *devices = snapshot_devices(&count);
+    unsigned xinput = 0;
+    for (size_t i = 0; i < count && set->count < 16; i++) {
+        hid_interface_path(&devices[i], read_by_xinput(devices[i].product.Data1 & 0xffff) && xinput < 4 ? (int)xinput++ : -1,
+                           set->item[set->count].path, sizeof set->item[0].path, set->item[set->count].id, sizeof set->item[0].id);
+        if (trace_setupdi()) vx_log("setupapi: HID interface %u: %s", set->count, set->item[set->count].path);
+        set->count++;
+    }
+    release_snapshot(devices, count);
+    return set;
+}
+static hid_interface_set *hid_set(HANDLE h) {
+    hid_interface_set *set = (hid_interface_set *)h;
+    return h && h != EMPTY_DEVICE_SET && (uintptr_t)h > 0x10000 && set->magic == HID_SET_MAGIC ? set : NULL;
+}
+static WINAPI BOOL32 SetupDiEnumDeviceInterfaces(HANDLE h, void *info, const GUID *guid, DWORD index, sp_interface_data *data) {
+    (void)info; (void)guid;
+    hid_interface_set *set = hid_set(h);
+    if (!set || index >= set->count) { vx_set_last_error(259); return 0; }       // ERROR_NO_MORE_ITEMS
+    if (!data || data->cbSize != sizeof *data) { vx_set_last_error(87); return 0; }
+    data->InterfaceClassGuid = GUID_DEVINTERFACE_HID; data->Flags = 1 /* SPINT_ACTIVE */; data->Reserved = index + 1;
+    return 1;
+}
+static WINAPI BOOL32 SetupDiGetDeviceInterfaceDetailW(HANDLE h, const sp_interface_data *data, void *detail, DWORD size, DWORD *required, sp_devinfo_data *info) {
+    hid_interface_set *set = hid_set(h);
+    if (!set || !data || !data->Reserved || data->Reserved > set->count) { vx_set_last_error(87); return 0; }
+    const char *path = set->item[data->Reserved - 1].path;
+    DWORD need = 4 + (DWORD)(strlen(path) + 1) * 2;                                 // cbSize, then the path
+    if (required) *required = need;
+    if (info) {
+        if (info->cbSize != sizeof *info) { vx_set_last_error(87); return 0; }
+        memset(&info->ClassGuid, 0, sizeof info->ClassGuid); info->DevInst = (DWORD)data->Reserved; info->Reserved = data->Reserved;
+    }
+    if (!detail || size < need) { vx_set_last_error(122); return 0; }               // ERROR_INSUFFICIENT_BUFFER
+    WCHAR *out = (WCHAR *)((uint8_t *)detail + 4);
+    size_t n = vx_utf8_to_utf16(path, strlen(path), out, (size - 4) / 2);
+    out[n] = 0;
+    return 1;
+}
+static WINAPI BOOL32 SetupDiGetDeviceInstanceIdW(HANDLE h, const sp_devinfo_data *info, WCHAR *id, DWORD size, DWORD *required) {
+    hid_interface_set *set = hid_set(h);
+    if (!set || !info || !info->Reserved || info->Reserved > set->count) { vx_set_last_error(13); return 0; }
+    const char *text = set->item[info->Reserved - 1].id;
+    DWORD need = (DWORD)strlen(text) + 1;
+    if (required) *required = need;
+    if (!id || size < need) { vx_set_last_error(122); return 0; }
+    size_t n = vx_utf8_to_utf16(text, strlen(text), id, size);
+    id[n] = 0;
+    return 1;
+}
+static WINAPI BOOL32 SetupDiDestroyDeviceInfoList(HANDLE h) {
+    hid_interface_set *set = hid_set(h);
+    if (set) { set->magic = 0; free(set); }
+    return 1;
+}
+
+// CoCreateInstance(CLSID_DirectInput8): the same object, made ready by IDirectInput8::Initialize (Elite Dangerous
+// reads its keyboard and mouse through one made so).
+static const GUID CLSID_DirectInput8 = { 0x25e609e4, 0xb259, 0x11cf, { 0xbf, 0xc7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+void vx_com_register_class(const void *clsid, HRESULT (*create)(const void *iid, void **out));
+static HRESULT create_com_input(const void *iid, void **out) {
+    HRESULT r = DirectInput8Create(NULL, 0x0800, (const GUID *)iid, out, NULL);
+    if (trace_dinput()) vx_log("DirectInput: made through CoCreateInstance = %#x", (unsigned)r);
+    return r;
+}
 static const vx_export g_directinput_exports[] = { VX_EXPORT(DirectInput8Create) };
+static const vx_export g_setupapi_exports[] = {
+    VX_EXPORT(SetupDiGetClassDevsW), VX_EXPORT(SetupDiEnumDeviceInterfaces), VX_EXPORT(SetupDiGetDeviceInterfaceDetailW),
+    VX_EXPORT(SetupDiGetDeviceInstanceIdW), VX_EXPORT(SetupDiDestroyDeviceInfoList),
+};
 void vx_directinput_init(void) {
     vx_register_module("dinput8.dll", g_directinput_exports, sizeof g_directinput_exports / sizeof g_directinput_exports[0]);
+    vx_register_module("setupapi.dll", g_setupapi_exports, sizeof g_setupapi_exports / sizeof g_setupapi_exports[0]);
+    vx_com_register_class(&CLSID_DirectInput8, create_com_input);
 }
 
 #ifdef __aarch64__

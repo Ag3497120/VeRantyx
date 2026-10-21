@@ -1126,6 +1126,7 @@ int main(int argc, char **argv, char **envp) {
     vx_wininet_init();                           // (before desktop.c's stand-ins for the same functions)
     vx_winhttp_init();
     vx_directinput_init();
+    vx_msxml_init();
     vx_kernel32_init();
     vx_system_init();
     vx_desktop_init();
@@ -1158,7 +1159,10 @@ int main(int argc, char **argv, char **envp) {
     vx_vcruntime_init();
     vx_dotnet_init();
     vx_extras_init();                            // (last: the tables above come first)
-    if (getenv("VXRT_CONTROL")) vx_control_start(getenv("VXRT_CONTROL"));
+    // VXRT_CONTROL_FOR=<program.exe>: only that program takes the socket; others (a launcher's watchdog) pass it on
+    const char *control_for = getenv("VXRT_CONTROL_FOR");
+    const char *base = strrchr(argv[1], '/') ? strrchr(argv[1], '/') + 1 : argv[1];
+    if (getenv("VXRT_CONTROL") && (!control_for || !strcasecmp(base, control_for))) vx_control_start(getenv("VXRT_CONTROL"));
 
     // vxrt --list-exports: every function the runtime implements, "dll<TAB>name" per line (tools/vxrt_doctor.py
     // compares a game's imports with it, without running the game).

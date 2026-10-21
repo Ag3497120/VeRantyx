@@ -59,9 +59,11 @@ typedef struct vx_window {
 // user32.c
 vx_window *vx_window_get(HANDLE hwnd);                     // NULL if hwnd is not a live window
 void vx_window_post(HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp);   // from any thread
+void vx_window_post_all(uint32_t msg, WPARAM wp, LPARAM lp);                       // to every top-level window
 void vx_window_resized(vx_window *w, int client_w, int client_h);      // from cocoa, main thread
 void vx_window_moved(vx_window *w, RECT frame);
 void vx_window_activated(vx_window *w, int active);
+void   vx_window_shown_inactive(vx_window *w);              // shown without the Mac's focus: active for the game with VXRT_STAY_ACTIVE
 void vx_window_minimized(vx_window *w, int minimized);
 void vx_key_event(vx_window *w, int mac_keycode, int down, int repeat, int alt);
 void vx_char_event(vx_window *w, const uint16_t *chars, int n);
@@ -101,6 +103,7 @@ int  vx_cocoa_message_box(const char *text, const char *caption, unsigned type);
 void vx_cocoa_beep(void);
 int  vx_cocoa_title_height(void);
 void *vx_cocoa_metal_layer(vx_window *w, void *mtl_device, int mtl_pixel_format);   // the view's CAMetalLayer
+void *vx_cocoa_metal_layer_bgra(vx_window *w, void *mtl_device);                    // Vulkan's BGRA8 WSI layer
 // Runs program(arg) on a thread of its own with the given stack size and AppKit on the calling (main) thread
 // once the program asks for it. The process ends when program returns.
 int  vx_ui_run_main(int (*program)(void *), void *arg, size_t stack);

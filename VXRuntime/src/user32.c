@@ -194,6 +194,16 @@ void vx_window_post(HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp) {
     if (w) queue_post(w->queue, hwnd, msg, wp, lp);
 }
 
+// To every top-level window, as Windows broadcasts WM_DEVICECHANGE.
+void vx_window_post_all(uint32_t msg, WPARAM wp, LPARAM lp) {
+    pthread_mutex_lock(&g_win_lock);
+    for (int i = 0; i < g_window_next; i++) {
+        vx_window *w = g_windows[i];
+        if (w && !w->destroyed && !(w->style & WS_CHILD)) queue_post(w->queue, w->hwnd, msg, wp, lp);
+    }
+    pthread_mutex_unlock(&g_win_lock);
+}
+
 static LRESULT call_proc(vx_window *w, uint32_t msg, WPARAM wp, LPARAM lp) { return w->proc(w->hwnd, msg, wp, lp); }
 
 // Handles the messages other threads sent to this thread's windows. Called with q->lock held; drops it while a
@@ -606,13 +616,23 @@ void vx_window_moved(vx_window *w, RECT frame) {
     pthread_mutex_unlock(&w->lock);
     if (moved) vx_window_post(w->hwnd, WM_MOVE, 0, MAKELPARAM(frame.left, frame.bottom - w->client_h));
 }
+// VXRT_STAY_ACTIVE=1: a window that was active stays so when the Mac moves on to another app. A game played in a
+// headset is seldom the Mac's frontmost app, and a game told it is in the background stops reading its controllers
+// (Elite Dangerous acquired no DirectInput device, read no XInput pad and took no key).
+static int stay_active(void) { static int on = -1; if (on < 0) { const char *e = getenv("VXRT_STAY_ACTIVE"); on = e && *e == '1'; } return on; }
+static int trace_focus(void) { static int on = -1; if (on < 0) on = getenv("VXRT_TRACE_INPUT") != NULL; return on; }
 void vx_window_activated(vx_window *w, int active) {
+    if (trace_focus()) vx_log("focus: window %p (%s) %s%s", w->hwnd, w->title ? w->title : "?", active ? "activated" : "deactivated",
+                              !active && stay_active() && g_active == w->hwnd ? " (kept active: VXRT_STAY_ACTIVE)" : "");
+    if (!active && stay_active() && g_active == w->hwnd) return;
     if (active) { g_active = g_focus = w->hwnd; }
     else if (g_active == w->hwnd) { g_active = NULL; if (g_focus == w->hwnd) g_focus = NULL; }
     vx_window_post(w->hwnd, WM_ACTIVATEAPP, active, 0);
     vx_window_post(w->hwnd, WM_ACTIVATE, active ? 1 : 0, 0);
     vx_window_post(w->hwnd, active ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
 }
+// A window shown without taking the Mac's focus (VXRT_NO_ACTIVATE) is still the game's active one with VXRT_STAY_ACTIVE.
+void vx_window_shown_inactive(vx_window *w) { if (stay_active() && !g_active) vx_window_activated(w, 1); }
 void vx_window_minimized(vx_window *w, int minimized) {
     w->minimized = minimized;
     vx_window_post(w->hwnd, WM_SIZE, minimized ? 1 /* SIZE_MINIMIZED */ : 0, MAKELPARAM(w->client_w, w->client_h));
@@ -652,9 +672,24 @@ static void set_key(int vk, int down) {
 }
 void vx_mouse_button(int vk, int down) { set_key(vk, down); }
 
+// DirectInput's keyboard and mouse (directinput.m) read these: the keys by DIK code (the set-1 scan code, 0x80 added
+// for an extended key) and the mouse's movement since it last asked.
+static volatile uint8_t g_dik[256];
+static volatile LONG g_mouse_dx, g_mouse_dy, g_mouse_dz;
+int vx_dinput_key_down(int dik) { return g_dik[dik & 0xff] != 0; }
+void vx_dinput_mouse_take(LONG *dx, LONG *dy, LONG *dz) {
+    *dx = __sync_lock_test_and_set(&g_mouse_dx, 0);
+    *dy = __sync_lock_test_and_set(&g_mouse_dy, 0);
+    *dz = __sync_lock_test_and_set(&g_mouse_dz, 0);
+}
+int vx_dinput_mouse_button(int i) {                   // left, right, middle, X1, X2
+    static const uint8_t vks[5] = { 0x01, 0x02, 0x04, 0x05, 0x06 };
+    return i >= 0 && i < 5 && (g_keys[vks[i]] & 0x80);
+}
 void vx_key_event(vx_window *w, int code, int down, int repeat, int alt) {
     if (code < 0 || code >= 128 || !g_keymap[code].vk) return;
     int vk = g_keymap[code].vk, scan = g_keymap[code].scan;
+    g_dik[(scan & 0x7f) | (scan & 0x100 ? 0x80 : 0)] = down ? 1 : 0;
     set_key(vk, down);
     static const struct { int code, vk; } sides[] = { { 0x38, 0xA0 }, { 0x3C, 0xA1 }, { 0x3B, 0xA2 }, { 0x3E, 0xA3 }, { 0x3A, 0xA4 }, { 0x3D, 0xA5 } };
     for (size_t i = 0; i < sizeof sides / sizeof sides[0]; i++) if (sides[i].code == code) set_key(sides[i].vk, down);
@@ -662,6 +697,7 @@ void vx_key_event(vx_window *w, int code, int down, int repeat, int alt) {
     if (!down) lp |= (LPARAM)3 << 30;
     else if (repeat) lp |= (LPARAM)1 << 30;
     int sys = alt || vk == 0x12;
+    if (trace_focus() && down) { static volatile int keys; if (__sync_add_and_fetch(&keys, 1) <= 30) vx_log("input: key %#x down to window %p (%s)", vk, w->hwnd, w->title ? w->title : "?"); }
     vx_window_post(w->hwnd, down ? (sys ? WM_SYSKEYDOWN : WM_KEYDOWN) : (sys ? WM_SYSKEYUP : WM_KEYUP), (WPARAM)vk, lp);
     raw_key(scan, vk, down);
 }
@@ -790,6 +826,9 @@ static void post_raw(const RAWINPUTDEVICE *reg, const uint8_t *record, uint32_t 
     vx_window_post(target, 0x00FF /* WM_INPUT */, 0 /* RIM_INPUT */, (LPARAM)(0x60000 + i));
 }
 void vx_raw_mouse(int dx, int dy, uint16_t button_flags, int16_t wheel) {
+    __sync_fetch_and_add(&g_mouse_dx, dx);
+    __sync_fetch_and_add(&g_mouse_dy, dy);
+    if (button_flags & 0x0400 /* RI_MOUSE_WHEEL */) __sync_fetch_and_add(&g_mouse_dz, wheel);
     if (!g_raw_has_mouse || (!dx && !dy && !button_flags)) return;
     uint8_t r[48] = { 0 };
     *(DWORD *)r = 0; *(DWORD *)(r + 4) = 48; *(HANDLE *)(r + 8) = RAW_MOUSE_DEVICE;
@@ -921,7 +960,14 @@ static WINAPI HANDLE GetAncestor(HANDLE h, uint32_t flags) {
 }
 static WINAPI HANDLE GetWindow(HANDLE h, uint32_t cmd) { (void)h; (void)cmd; return NULL; }
 static WINAPI HANDLE GetDesktopWindow(void) { return HWND_DESKTOP_VALUE; }
-static WINAPI HANDLE GetForegroundWindow(void) { return g_active; }
+static WINAPI HANDLE GetForegroundWindow(void) {
+    if (trace_focus()) {
+        static volatile int calls; static HANDLE last = (HANDLE)1;
+        int n = __sync_add_and_fetch(&calls, 1);
+        if (n <= 3 || last != g_active) { last = g_active; vx_log("focus: GetForegroundWindow #%d = %p", n, g_active); }
+    }
+    return g_active;
+}
 static WINAPI HANDLE GetActiveWindow(void) { return g_active; }
 static WINAPI HANDLE GetFocus(void) { return g_focus; }
 static WINAPI BOOL SetForegroundWindow(HANDLE h) { vx_window *w = vx_window_get(h); if (!w) return 0; vx_cocoa_activate(w); return 1; }
@@ -1385,7 +1431,11 @@ static WINAPI uint32_t RegisterWindowMessageA(const char *name) {
 static WINAPI uint32_t RegisterWindowMessageW(const WCHAR *name) { char *a = vx_utf8_dup(name); uint32_t r = RegisterWindowMessageA(a); free(a); return r; }
 
 // Hooks, menus, clipboard and dialogs exist only as far as programs probe for them.
-static WINAPI HANDLE SetWindowsHookExA(int id, void *fn, HANDLE mod, DWORD tid) { (void)id; (void)fn; (void)mod; (void)tid; return (HANDLE)(intptr_t)0x1; }
+static WINAPI HANDLE SetWindowsHookExA(int id, void *fn, HANDLE mod, DWORD tid) {
+    (void)fn; (void)mod;
+    if (trace_focus()) vx_log("input: SetWindowsHookEx(%d, thread %u) accepted, not called", id, (unsigned)tid);
+    return (HANDLE)(intptr_t)0x1;
+}
 static WINAPI HANDLE SetWindowsHookExW(int id, void *fn, HANDLE mod, DWORD tid) { return SetWindowsHookExA(id, fn, mod, tid); }
 static WINAPI BOOL UnhookWindowsHookEx(HANDLE h) { (void)h; return 1; }
 static WINAPI LRESULT CallNextHookEx(HANDLE h, int code, WPARAM w, LPARAM l) { (void)h; (void)code; (void)w; (void)l; return 0; }

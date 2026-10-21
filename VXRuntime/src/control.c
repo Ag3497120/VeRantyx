@@ -159,6 +159,12 @@ void vx_control_start(const char *path) {
     vx_log("control: Command Clips at %s", path);
     // the socket is this program's: a program it starts (a launcher's game) must not take the path over and
     // remove it when it exits (g_path keeps the copy the socket needs)
-    unsetenv("VXRT_CONTROL");
+    // VXRT_CONTROL_CHILD=<path>: the program it starts gets that socket instead (a launcher's game, to look at it)
+    // (VXRT_CONTROL_CHILD_FOR=<program.exe>: only that one of them takes it, a watchdog started first passes it on)
+    const char *child = getenv("VXRT_CONTROL_CHILD"), *child_for = getenv("VXRT_CONTROL_CHILD_FOR");
+    if (child && *child) {
+        setenv("VXRT_CONTROL", child, 1); unsetenv("VXRT_CONTROL_CHILD");
+        if (child_for && *child_for) { setenv("VXRT_CONTROL_FOR", child_for, 1); unsetenv("VXRT_CONTROL_CHILD_FOR"); }
+    } else unsetenv("VXRT_CONTROL");
     unsetenv("VXRT_CONTROL_LOG");
 }

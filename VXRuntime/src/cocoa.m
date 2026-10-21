@@ -52,8 +52,14 @@ int vx_ui_run_main(int (*program)(void *), void *arg, size_t stack) {
     pthread_attr_setstacksize(&a, (stack + 16383) & ~(size_t)16383);
     pthread_t t;
     if (pthread_create(&t, &a, program_thread, &start)) { vx_log("cannot start the program thread"); return 1; }
+    // Until a window is wanted the main thread serves the main queue (in 50 ms slices) without starting AppKit: the
+    // Game Controller framework tells about controllers there, so XInput sees them in a program without windows too.
     pthread_mutex_lock(&g_ui_lock);
-    while (!g_ui_wanted) pthread_cond_wait(&g_ui_cond, &g_ui_lock);
+    while (!g_ui_wanted) {
+        pthread_mutex_unlock(&g_ui_lock);
+        @autoreleasepool { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false); }
+        pthread_mutex_lock(&g_ui_lock);
+    }
     pthread_mutex_unlock(&g_ui_lock);
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -333,12 +339,13 @@ void vx_cocoa_show(vx_window *w, int cmd) {
         default:
             if (win.isMiniaturized) [win deminiaturize:nil];
             if (activation_allowed()) { [win makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; }
-            else [win orderFront:nil];
+            else { [win orderFront:nil]; vx_window_shown_inactive(w); }
         }
     });
 }
 
 void vx_cocoa_activate(vx_window *w) {
+    if (w->native && !activation_allowed()) { vx_window_shown_inactive(w); return; }
     if (!w->native || !activation_allowed()) return;
     on_main(^{ [native(w) makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; });
 }
@@ -428,6 +435,10 @@ void *vx_cocoa_metal_layer(vx_window *w, void *device, int pixel_format) {
         result = (__bridge void *)ml;
     });
     return result;
+}
+
+void *vx_cocoa_metal_layer_bgra(vx_window *w, void *device) {
+    return vx_cocoa_metal_layer(w, device, (int)MTLPixelFormatBGRA8Unorm);
 }
 
 void vx_cocoa_beep(void) { ui_ensure(); dispatch_async(dispatch_get_main_queue(), ^{ NSBeep(); }); }

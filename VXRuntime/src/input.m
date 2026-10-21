@@ -2,6 +2,7 @@
 // PlayStation, Switch Pro, a pair of Joy-Cons and others macOS knows) are XInput users 0..3.
 #import <GameController/GameController.h>
 #include "vx.h"
+#include "ui.h"
 
 #define ERROR_DEVICE_NOT_CONNECTED 1167
 typedef struct { uint16_t buttons; uint8_t left_trigger, right_trigger; int16_t lx, ly, rx, ry; } GAMEPAD;
@@ -13,8 +14,14 @@ static GAMEPAD g_last[4];
 static GCExtendedGamepad *gamepad(DWORD user) {
     // macOS gives controller input only to the frontmost app unless asked: a game played in a headset is seldom
     // the Mac's frontmost window.
+    // The framework finds the controllers a moment after it is first used, and a game that is told no pad is there
+    // when it first asks may never ask again (Elite Dangerous): the first call waits up to 1.5 s for them, and a
+    // controller connected later is announced as Windows does, with WM_DEVICECHANGE (DBT_DEVNODES_CHANGED).
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ if (@available(macOS 11.3, *)) GCController.shouldMonitorBackgroundEvents = YES; });
+    dispatch_once(&once, ^{
+        if (@available(macOS 11.3, *)) GCController.shouldMonitorBackgroundEvents = YES;
+        if (!NSThread.isMainThread) for (int i = 0; i < 30 && !GCController.controllers.count; i++) usleep(50000);
+    });
     DWORD n = 0;
     for (GCController *c in GCController.controllers) {
         if (!c.extendedGamepad) continue;
@@ -73,7 +80,9 @@ static WINAPI DWORD XInputSetState(DWORD user, void *vibration) { (void)vibratio
 // XINPUT_CAPABILITIES: type, subtype, flags, the gamepad's ranges, vibration.
 static WINAPI DWORD XInputGetCapabilities(DWORD user, DWORD flags, uint8_t *caps) {
     (void)flags;
-    if (!gamepad(user)) return ERROR_DEVICE_NOT_CONNECTED;
+    GCExtendedGamepad *pad = gamepad(user);
+    if (getenv("VXRT_TRACE_INPUT")) { static volatile int calls; if (__sync_add_and_fetch(&calls, 1) <= 20) vx_log("XInputGetCapabilities(%u): %s", (unsigned)user, pad ? "a pad" : "none"); }
+    if (!pad) return ERROR_DEVICE_NOT_CONNECTED;
     memset(caps, 0, 20);
     caps[0] = 1; caps[1] = 1;                                           // XINPUT_DEVTYPE_GAMEPAD, XINPUT_DEVSUBTYPE_GAMEPAD
     GAMEPAD *g = (GAMEPAD *)(caps + 4);
@@ -100,6 +109,15 @@ static const vx_export xinput[] = {
     { "#100", (void *)XInputGetState },                                // XInputGetStateEx (adds the guide button)
 };
 void vx_input_init(void) {
+    // the framework starts looking for controllers now, and one connected later is announced to the windows
+    if (@available(macOS 11.3, *)) GCController.shouldMonitorBackgroundEvents = YES;
+    [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidConnectNotification object:nil queue:nil
+                                                usingBlock:^(NSNotification *n) {
+        GCController *c = n.object;
+        vx_log("XInput: %s connected; telling the windows (WM_DEVICECHANGE)", c.vendorName.UTF8String ?: "a controller");
+        vx_window_post_all(0x0219, 0x0007, 0);                         // DBT_DEVNODES_CHANGED
+    }];
+    (void)GCController.controllers;
     vx_register_module("xinput1_4.dll", xinput, sizeof xinput / sizeof xinput[0]);
     vx_register_module("xinput1_3.dll", xinput, sizeof xinput / sizeof xinput[0]);
     vx_register_module("xinput9_1_0.dll", xinput, sizeof xinput / sizeof xinput[0]);

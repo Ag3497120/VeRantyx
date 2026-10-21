@@ -169,7 +169,61 @@ static void ResetStagingRing() {
     g_stagingFormat = DXGI_FORMAT_UNKNOWN;
 }
 
+// Taking the Vision Pro off and putting it back on can move its idea of the floor: the head then came back a metre
+// higher (seen: 1.12 m -> 2.27 m) and a seated game showed its cockpit far below the eyes. After such a break in the
+// tracking (no new head sample for a second), once the head has been back for half a second, a jump in height of
+// more than 0.7 m (more than sitting down or standing up while it was off) is taken out, keeping the height from
+// before the break; head and hands move together. VERANTYX_KEEP_HEIGHT=0 leaves the heights as the headset sends them.
+static SRWLOCK g_heightLock = SRWLOCK_INIT;
+static float g_heightOffset = 0.0f;
+static double g_lastHeadTimestamp = 0.0;
+static ULONGLONG g_lastHeadSampleMs = 0, g_backSinceMs = 0;
+static float g_heightBeforeBreak = 0.0f, g_lastCorrectedHeight = 0.0f;
+static bool g_afterBreak = false;
+static void KeepHeightAcrossBreaks(SharedHands* hands) {
+    static int enabled = -1;
+    if (enabled < 0) { char v[8] = {}; enabled = !(GetEnvironmentVariableA("VERANTYX_KEEP_HEIGHT", v, sizeof(v)) > 0 && v[0] == '0'); }
+    if (!enabled) return;
+    const ULONGLONG now = GetTickCount64();
+    char message[192] = {};
+    AcquireSRWLockExclusive(&g_heightLock);
+    if (hands->headTracked && hands->visionTimestamp != g_lastHeadTimestamp && std::isfinite(hands->headTransform[13])) {
+        g_lastHeadTimestamp = hands->visionTimestamp;
+        const float raw = hands->headTransform[13];
+        if (g_lastHeadSampleMs && now - g_lastHeadSampleMs > 1000) {
+            g_afterBreak = true;
+            g_backSinceMs = now;
+            g_heightBeforeBreak = g_lastCorrectedHeight;
+        }
+        g_lastHeadSampleMs = now;
+        if (g_afterBreak && now - g_backSinceMs >= 500) {
+            g_afterBreak = false;
+            const float jump = raw + g_heightOffset - g_heightBeforeBreak;
+            if (fabsf(jump) > 0.7f) {
+                g_heightOffset = g_heightBeforeBreak - raw;
+                snprintf(message, sizeof(message), "[Verantyx] Head came back %.2f m %s after a break in tracking; keeping it at %.2f m",
+                    fabsf(jump), jump > 0 ? "higher" : "lower", g_heightBeforeBreak);
+            }
+        }
+        g_lastCorrectedHeight = raw + g_heightOffset;
+    }
+    const float offset = g_heightOffset;
+    ReleaseSRWLockExclusive(&g_heightLock);
+    if (message[0]) LogDriver(message);
+    if (offset != 0.0f) {
+        hands->headTransform[13] += offset;
+        hands->leftTransform[13] += offset;
+        hands->rightTransform[13] += offset;
+    }
+}
+
+static bool ReadSharedHandsRaw(SharedHands* snapshot);
 static bool ReadSharedHandsSnapshot(SharedHands* snapshot) {
+    if (!ReadSharedHandsRaw(snapshot)) return false;
+    KeepHeightAcrossBreaks(snapshot);
+    return true;
+}
+static bool ReadSharedHandsRaw(SharedHands* snapshot) {
     if (!snapshot || !pSharedHands || !g_doubleBufferHeader) return false;
     for (int attempt = 0; attempt < 8; ++attempt) {
         const LONG before = InterlockedCompareExchange(&g_doubleBufferHeader->poseSequence, 0, 0);

@@ -74,6 +74,7 @@ int vx_overlay_file(const char *unix_path, char *out, size_t cap);   // files.c:
 void vx_wininet_init(void);                  // wininet.m: HTTP and HTTPS on NSURLSession
 void vx_winhttp_init(void);                  // winhttp.m: synchronous WinHTTP request handles on NSURLSession
 void vx_directinput_init(void);              // directinput.m: DirectInput 8 HID joystick/gamepad polling
+void vx_msxml_init(void);                    // msxml.c: MSXML DOMDocument through CoCreateInstance
 void vx_extras_init(void);                   // extras.c: smaller functions more programs need
 void vx_opengl_init(void);                   // opengl.c: opengl32.dll on macOS's OpenGL
 int vx_gl_describe_pixel_format(void *pfd, uint32_t size);   // (gdi32's pixel-format calls and SwapBuffers)

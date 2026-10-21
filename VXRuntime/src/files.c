@@ -138,6 +138,7 @@ static void overlay_init(void) {
 }
 
 // Windows path -> Mac path. Returns 0 (with the last error set) for paths outside the mapped drives.
+static int trace_opens_all(void) { static int on = -1; if (on < 0) { const char *e = getenv("VXRT_TRACE_FILES"); on = e && *e == '2'; } return on; }
 int vx_unix_path(const char *win, char *out, size_t cap) {
     char full[MAX_PATH_LEN];
     if (!strcasecmp(win, "NUL")) { snprintf(out, cap, "/dev/null"); return 1; }
@@ -256,7 +257,7 @@ static HANDLE create_file(const char *name, DWORD access, DWORD disposition, DWO
     int rd = (access & (GENERIC_READ | GENERIC_ALL | FILE_READ_DATA)) != 0;
     int wr = (access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
     int writes = wr || disposition == 1 || disposition == 2 || disposition == 4 || disposition == 5;
-    static int trace = -1;                                    // VXRT_TRACE_FILES=1: opens that fail, with the path
+    static int trace = -1;                                    // VXRT_TRACE_FILES=1: opens that fail, with the path; 2: every open
     if (trace < 0) trace = getenv("VXRT_TRACE_FILES") != NULL;
     if (!(writes ? vx_unix_path_write(name, path, sizeof path, disposition != 2 && disposition != 5) : vx_unix_path(name, path, sizeof path))) {
         if (trace) vx_log("CreateFile(%s): no path", name);
@@ -286,6 +287,7 @@ static HANDLE create_file(const char *name, DWORD access, DWORD disposition, DWO
         return INVALID_HANDLE;
     }
     if (fd >= 0x10000) { close(fd); vx_set_last_error(4); return INVALID_HANDLE; }   // (handles 0x10000 + fd)
+    if (trace && trace_opens_all()) vx_log("CreateFile(%s, access %#x, disposition %u): %s", name, access, disposition, writes ? "for writing" : "opened");
     vx_set_last_error(existed && (disposition == 2 || disposition == 4) ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
     return (HANDLE)(intptr_t)(0x10000 + fd);
 }
