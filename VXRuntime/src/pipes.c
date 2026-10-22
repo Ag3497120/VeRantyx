@@ -337,11 +337,15 @@ int vx_pipe_write(HANDLE h, const void *buf, DWORD n, DWORD *written, void *ov, 
     *ok = 1;
     return 1;
 }
+// PeekNamedPipe on a pipe handle: 0 not a pipe, 1 peeked, -1 failed (the last error set). An empty pipe whose other
+// end has gone fails with BROKEN_PIPE, as on Windows: SteamVR's server learns that a client went this way, and kept
+// The Lab's first connection (closed at its VR_Shutdown) until its next VR_Init, then took it for a legacy-input app.
 int vx_pipe_peek(HANDLE h, void *buf, DWORD n, DWORD *got, DWORD *avail, DWORD *left) {
     vx_pipe *p = pipe_of(h);
     if (!p) return 0;
     pthread_mutex_lock(&p->lock);
     DWORD have = 0, msg = 0;
+    int gone = 0;
     if (p->rest && p->rest_off < p->rest_len) {
         have = msg = (DWORD)(p->rest_len - p->rest_off);
         if (buf && n) memcpy(buf, p->rest + p->rest_off, have < n ? have : n);
@@ -350,8 +354,15 @@ int vx_pipe_peek(HANDLE h, void *buf, DWORD n, DWORD *got, DWORD *avail, DWORD *
         int pending = 0;
         ioctl(p->fd, FIONREAD, &pending);
         if (pending >= 4 && recv(p->fd, &len, 4, MSG_PEEK | MSG_DONTWAIT) == 4) { have = (DWORD)(pending - 4); msg = len; }
+        else if (!pending) {
+            char c;
+            ssize_t r;
+            do r = recv(p->fd, &c, 1, MSG_PEEK | MSG_DONTWAIT); while (r < 0 && errno == EINTR);
+            gone = r == 0 || (r < 0 && errno != EAGAIN);
+        }
     }
     pthread_mutex_unlock(&p->lock);
+    if (gone) { vx_set_last_error(ERROR_BROKEN_PIPE); return -1; }
     if (got) *got = buf ? (have < n ? have : n) : 0;
     if (avail) *avail = have;
     if (left) *left = (p->mode & PIPE_READMODE_MESSAGE) && msg > n ? msg - n : 0;

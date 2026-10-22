@@ -91,6 +91,9 @@ static void nowait(void) {
     DWORD state = 0;
     CHECK(GetNamedPipeHandleStateA(server, &state, NULL, NULL, NULL, NULL, 0) && (state & PIPE_NOWAIT));
     CloseHandle(c);
+    // The client has gone: peeking fails with a broken pipe (SteamVR's server finds out that way), then reading.
+    DWORD avail = 1;
+    CHECK(!PeekNamedPipe(server, NULL, 0, NULL, &avail, NULL) && GetLastError() == ERROR_BROKEN_PIPE);
     for (int i = 0; i < 200; i++) { if (!ReadFile(server, buf, sizeof buf, &n, NULL) && GetLastError() == ERROR_BROKEN_PIPE) break; Sleep(5); }
     CHECK(GetLastError() == ERROR_BROKEN_PIPE);
     CloseHandle(server);

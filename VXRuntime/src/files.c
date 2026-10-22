@@ -449,7 +449,8 @@ static WINAPI DWORD GetDriveTypeA(const char *root) {
 static WINAPI DWORD GetDriveTypeW(const WCHAR *root) { char r[4] = { root ? (char)root[0] : 0, root ? (char)root[1] : 0, 0, 0 }; return GetDriveTypeA(root ? r : NULL); }
 static WINAPI DWORD GetLogicalDrives(void) { return (1u << 2) | (1u << 25); }   // C: and Z:
 static WINAPI BOOL PeekNamedPipe(HANDLE h, void *buf, DWORD n, DWORD *got, DWORD *avail, DWORD *left) {
-    if (vx_pipe_peek(h, buf, n, got, avail, left)) return 1;
+    int peeked = vx_pipe_peek(h, buf, n, got, avail, left);
+    if (peeked) return peeked > 0;
     int fd = vx_handle_fd(h), pending = 0;
     if (fd < 0 || ioctl(fd, FIONREAD, &pending) < 0) { vx_set_last_error(6); return 0; }
     if (got) *got = 0;
