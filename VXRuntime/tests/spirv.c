@@ -1,5 +1,7 @@
 #include "spirv_ir.h"
+#include "gpu_ir_msl.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures;
@@ -39,8 +41,10 @@ int main(void) {
     make_module(bytes, 0, 0x00010600u, 2, 0, instructions, sizeof instructions / sizeof instructions[0]);
     int rc = spirv_read(bytes, sizeof bytes, &module);
     int ok = rc == SPIRV_OK && module.version == 0x00010600u && module.generator == 0x00010600u &&
-             module.id_bound == 2 && module.instruction_count == 3;
-    check("header, version and forward-compatible instruction framing", ok);
+             module.id_bound == 2 && module.instruction_count == 3 && module.has_memory_model &&
+             module.addressing_model == SPIRV_ADDRESSING_MODEL_LOGICAL &&
+             module.memory_model == SPIRV_MEMORY_MODEL_GLSL450 && spirv_vulkan_memory_model_supported(&module);
+    check("header, memory model and forward-compatible instruction framing", ok);
     if (rc == SPIRV_OK) {
         spirv_iterator iterator;
         spirv_instruction instruction;
@@ -51,6 +55,39 @@ int main(void) {
              instruction.words[1] == 0x12345678u && spirv_iter_next(&iterator, &instruction) == 0;
         check("sequential instruction iteration", ok);
     } else check("sequential instruction iteration", 0);
+    spirv_free(&module);
+
+    make_module(bytes, 0, 0x00010600u, 1, 0, NULL, 0);
+    rc = spirv_read(bytes, 5 * 4, &module);
+    check("Vulkan compatibility rejects a missing OpMemoryModel", rc == SPIRV_OK &&
+          !spirv_vulkan_memory_model_supported(&module));
+    spirv_free(&module);
+
+    const uint32_t physical_memory_model[] = { 0x0003000eu, 1, SPIRV_MEMORY_MODEL_GLSL450 };
+    make_module(bytes, 0, 0x00010600u, 1, 0, physical_memory_model,
+                sizeof physical_memory_model / sizeof physical_memory_model[0]);
+    rc = spirv_read(bytes, (5 + sizeof physical_memory_model / sizeof physical_memory_model[0]) * 4, &module);
+    check("Vulkan compatibility rejects a physical addressing model when buffer device address is unavailable",
+          rc == SPIRV_OK && module.has_memory_model && module.addressing_model == 1 &&
+          !spirv_vulkan_memory_model_supported(&module));
+    spirv_free(&module);
+
+    const uint32_t vulkan_memory_model[] = { 0x0003000eu, SPIRV_ADDRESSING_MODEL_LOGICAL, 3 };
+    make_module(bytes, 0, 0x00010600u, 1, 0, vulkan_memory_model,
+                sizeof vulkan_memory_model / sizeof vulkan_memory_model[0]);
+    rc = spirv_read(bytes, (5 + sizeof vulkan_memory_model / sizeof vulkan_memory_model[0]) * 4, &module);
+    check("Vulkan compatibility rejects the Vulkan memory model while its feature is unadvertised",
+          rc == SPIRV_OK && module.memory_model == 3 && !spirv_vulkan_memory_model_supported(&module));
+    spirv_free(&module);
+
+    const uint32_t duplicate_memory_model[] = {
+        0x0003000eu, SPIRV_ADDRESSING_MODEL_LOGICAL, SPIRV_MEMORY_MODEL_GLSL450,
+        0x0003000eu, SPIRV_ADDRESSING_MODEL_LOGICAL, SPIRV_MEMORY_MODEL_GLSL450
+    };
+    make_module(bytes, 0, 0x00010600u, 1, 0, duplicate_memory_model,
+                sizeof duplicate_memory_model / sizeof duplicate_memory_model[0]);
+    check("duplicate OpMemoryModel instructions are rejected", spirv_read(bytes,
+          (5 + sizeof duplicate_memory_model / sizeof duplicate_memory_model[0]) * 4, &module) == SPIRV_INVALID);
     spirv_free(&module);
 
     const uint32_t extended_import[] = {
@@ -228,10 +265,12 @@ int main(void) {
     spirv_free(&module);
 
     const uint32_t builtin_shader[] = {
-        0x0007000fu, SPIRV_EXECUTION_MODEL_GL_COMPUTE, 10, 0x6e69616du, 0, 8, 9,
+        0x0009000fu, SPIRV_EXECUTION_MODEL_GL_COMPUTE, 10, 0x6e69616du, 0, 8, 9, 12, 13,
         0x00060010u, 10, 17, 8, 4, 1,
         0x00040047u, 8, 11, 28,          // BuiltIn GlobalInvocationId
         0x00040047u, 9, 11, 29,          // BuiltIn LocalInvocationIndex
+        0x00040047u, 12, 11, 36,         // BuiltIn SubgroupSize
+        0x00040047u, 13, 11, 41,         // BuiltIn SubgroupLocalInvocationId
         0x00020013u, 1,                  // void
         0x00040015u, 2, 32, 0,           // uint32
         0x00040017u, 3, 2, 3,            // uint3
@@ -240,13 +279,15 @@ int main(void) {
         0x00030021u, 6, 1,               // void()
         0x0004003bu, 4, 8, 1,
         0x0004003bu, 5, 9, 1,
+        0x0004003bu, 5, 12, 1,
+        0x0004003bu, 5, 13, 1,
         0x00050036u, 1, 10, 0, 6,
         0x000200f8u, 11,
         0x000100fdu,
         0x00010038u
     };
     uint8_t builtin_bytes[(5 + sizeof builtin_shader / sizeof builtin_shader[0]) * 4];
-    make_module(builtin_bytes, 0, 0x00010600u, 12, 0, builtin_shader,
+    make_module(builtin_bytes, 0, 0x00010600u, 14, 0, builtin_shader,
                 sizeof builtin_shader / sizeof builtin_shader[0]);
     rc = spirv_read(builtin_bytes, sizeof builtin_bytes, &module);
     shader_entry = rc == SPIRV_OK ?
@@ -255,12 +296,344 @@ int main(void) {
     shader_rc = shader_entry ? spirv_build_gpu_ir_shader(&module, shader_entry, &common_shader) : GPU_IR_INVALID;
     const gpu_ir_shader_instruction *global_id = common_shader ? gpu_ir_shader_instruction_at(common_shader, 0) : NULL;
     const gpu_ir_shader_instruction *local_index = common_shader ? gpu_ir_shader_instruction_at(common_shader, 1) : NULL;
-    check("SPIR-V storage classes and compute built-ins normalize into API-neutral shader semantics",
-          rc == SPIRV_OK && shader_rc == GPU_IR_OK && global_id && local_index &&
+    const gpu_ir_shader_instruction *subgroup_size = common_shader ? gpu_ir_shader_instruction_at(common_shader, 2) : NULL;
+    const gpu_ir_shader_instruction *subgroup_lane = common_shader ? gpu_ir_shader_instruction_at(common_shader, 3) : NULL;
+    check("SPIR-V compute and subgroup built-ins normalize into API-neutral shader semantics",
+          rc == SPIRV_OK && shader_rc == GPU_IR_OK && global_id && local_index && subgroup_size && subgroup_lane &&
           global_id->storage_class == GPU_IR_SHADER_STORAGE_INPUT && global_id->source_storage_class == 1 &&
           global_id->builtin == GPU_IR_SHADER_BUILTIN_GLOBAL_INVOCATION_ID && global_id->source_builtin == 28 &&
           local_index->storage_class == GPU_IR_SHADER_STORAGE_INPUT && local_index->source_storage_class == 1 &&
-          local_index->builtin == GPU_IR_SHADER_BUILTIN_LOCAL_INVOCATION_INDEX && local_index->source_builtin == 29);
+          local_index->builtin == GPU_IR_SHADER_BUILTIN_LOCAL_INVOCATION_INDEX && local_index->source_builtin == 29 &&
+          subgroup_size->builtin == GPU_IR_SHADER_BUILTIN_SUBGROUP_SIZE && subgroup_size->source_builtin == 36 &&
+          subgroup_lane->builtin == GPU_IR_SHADER_BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID &&
+          subgroup_lane->source_builtin == 41);
+    gpu_ir_shader_release(common_shader);
+    spirv_free(&module);
+
+    const uint32_t subgroup_vote_shader[] = {
+        0x00020011u, 1,                    // OpCapability Shader
+        0x00020011u, 61,                   // OpCapability GroupNonUniform
+        0x00020011u, 62,                   // OpCapability GroupNonUniformVote
+        0x0003000eu, 0, 1,                // OpMemoryModel Logical GLSL450
+        0x0005000fu, SPIRV_EXECUTION_MODEL_GL_COMPUTE, 10, 0x6e69616du, 0,
+        0x00060010u, 10, 17, 1, 1, 1,     // OpExecutionMode LocalSize
+        0x00020013u, 1,                    // OpTypeVoid
+        0x00020014u, 2,                    // OpTypeBool
+        0x00040015u, 3, 32, 0,            // OpTypeInt uint32
+        0x0004002bu, 3, 4, 3,             // OpConstant Subgroup scope
+        0x00030029u, 2, 5,                // OpConstantTrue
+        0x0003002au, 2, 6,                // OpConstantFalse
+        0x00030021u, 7, 1,                // OpTypeFunction void()
+        0x00050036u, 1, 10, 0, 7,         // OpFunction
+        0x000200f8u, 11,                  // OpLabel
+        0x0005014fu, 2, 12, 4, 5,         // OpGroupNonUniformAny
+        0x0005014eu, 2, 13, 4, 6,         // OpGroupNonUniformAll
+        0x000100fdu,                      // OpReturn
+        0x00010038u                       // OpFunctionEnd
+    };
+    uint8_t subgroup_vote_bytes[(5 + sizeof subgroup_vote_shader / sizeof subgroup_vote_shader[0]) * 4];
+    make_module(subgroup_vote_bytes, 0, 0x00010600u, 14, 0, subgroup_vote_shader,
+                sizeof subgroup_vote_shader / sizeof subgroup_vote_shader[0]);
+    rc = spirv_read(subgroup_vote_bytes, sizeof subgroup_vote_bytes, &module);
+    shader_entry = rc == SPIRV_OK ?
+        spirv_find_entry_point(&module, "main", SPIRV_EXECUTION_MODEL_GL_COMPUTE) : NULL;
+    common_shader = NULL;
+    shader_rc = shader_entry ? spirv_build_gpu_ir_shader(&module, shader_entry, &common_shader) : GPU_IR_INVALID;
+    const gpu_ir_shader_instruction *subgroup_any = NULL, *subgroup_all = NULL;
+    for (uint32_t i = 0; common_shader && i < gpu_ir_shader_instruction_count(common_shader); i++) {
+        const gpu_ir_shader_instruction *instruction = gpu_ir_shader_instruction_at(common_shader, i);
+        if (!instruction || instruction->opcode != GPU_IR_SHADER_OP_ARITHMETIC) continue;
+        if (instruction->result_id == 12) subgroup_any = instruction;
+        if (instruction->result_id == 13) subgroup_all = instruction;
+    }
+    char *subgroup_vote_msl = NULL;
+    size_t subgroup_vote_msl_size = 0;
+    int subgroup_vote_msl_rc = common_shader ? gpu_ir_msl_emit_compute(common_shader,
+        &subgroup_vote_msl, &subgroup_vote_msl_size) : GPU_IR_INVALID;
+    check("SPIR-V subgroup All/Any lower through shared IR to active-lane MSL votes",
+          rc == SPIRV_OK && shader_rc == GPU_IR_OK && subgroup_any && subgroup_all &&
+          subgroup_any->source_opcode == 335 &&
+          subgroup_any->operation == GPU_IR_SHADER_ARITH_SUBGROUP_ANY && subgroup_any->operand_count == 1 &&
+          subgroup_all->source_opcode == 334 &&
+          subgroup_all->operation == GPU_IR_SHADER_ARITH_SUBGROUP_ALL && subgroup_all->operand_count == 1 &&
+          subgroup_vote_msl_rc == GPU_IR_OK && subgroup_vote_msl && subgroup_vote_msl_size &&
+          strstr(subgroup_vote_msl, "simd_any(true)") && strstr(subgroup_vote_msl, "simd_all(false)"));
+    free(subgroup_vote_msl);
+    gpu_ir_shader_release(common_shader);
+    spirv_free(&module);
+
+    uint32_t wrong_scope_shader[sizeof subgroup_vote_shader / sizeof subgroup_vote_shader[0]];
+    memcpy(wrong_scope_shader, subgroup_vote_shader, sizeof wrong_scope_shader);
+    wrong_scope_shader[31] = 2; // OpConstant id 4: Workgroup scope is invalid for these vote operations.
+    uint8_t wrong_scope_bytes[(5 + sizeof wrong_scope_shader / sizeof wrong_scope_shader[0]) * 4];
+    make_module(wrong_scope_bytes, 0, 0x00010600u, 14, 0, wrong_scope_shader,
+                sizeof wrong_scope_shader / sizeof wrong_scope_shader[0]);
+    rc = spirv_read(wrong_scope_bytes, sizeof wrong_scope_bytes, &module);
+    shader_entry = rc == SPIRV_OK ?
+        spirv_find_entry_point(&module, "main", SPIRV_EXECUTION_MODEL_GL_COMPUTE) : NULL;
+    common_shader = NULL;
+    shader_rc = shader_entry ? spirv_build_gpu_ir_shader(&module, shader_entry, &common_shader) : GPU_IR_INVALID;
+    check("SPIR-V subgroup votes reject non-Subgroup execution scopes",
+          rc == SPIRV_OK && shader_rc == GPU_IR_INVALID && !common_shader);
+    gpu_ir_shader_release(common_shader);
+    spirv_free(&module);
+
+    uint32_t missing_vote_capability_shader[sizeof subgroup_vote_shader / sizeof subgroup_vote_shader[0]];
+    size_t missing_vote_capability_words = 0;
+    for (size_t source_word = 0; source_word < sizeof subgroup_vote_shader / sizeof subgroup_vote_shader[0];) {
+        uint32_t header = subgroup_vote_shader[source_word];
+        uint32_t word_count = header >> 16, opcode = header & 0xffffu;
+        if (opcode == 17 && word_count == 2 &&
+            (subgroup_vote_shader[source_word + 1] == 61 || subgroup_vote_shader[source_word + 1] == 62)) {
+            source_word += word_count;
+            continue;
+        }
+        memcpy(missing_vote_capability_shader + missing_vote_capability_words,
+            subgroup_vote_shader + source_word, (size_t)word_count * sizeof(uint32_t));
+        missing_vote_capability_words += word_count;
+        source_word += word_count;
+    }
+    uint8_t missing_vote_capability_bytes[(5 + sizeof missing_vote_capability_shader / sizeof missing_vote_capability_shader[0]) * 4];
+    make_module(missing_vote_capability_bytes, 0, 0x00010600u, 14, 0,
+        missing_vote_capability_shader, missing_vote_capability_words);
+    rc = spirv_read(missing_vote_capability_bytes, (5 + missing_vote_capability_words) * 4, &module);
+    shader_entry = rc == SPIRV_OK ?
+        spirv_find_entry_point(&module, "main", SPIRV_EXECUTION_MODEL_GL_COMPUTE) : NULL;
+    common_shader = NULL;
+    shader_rc = shader_entry ? spirv_build_gpu_ir_shader(&module, shader_entry, &common_shader) : GPU_IR_INVALID;
+    check("SPIR-V subgroup votes require GroupNonUniform and GroupNonUniformVote capabilities",
+          rc == SPIRV_OK && shader_rc == GPU_IR_INVALID && !common_shader);
+    gpu_ir_shader_release(common_shader);
+    spirv_free(&module);
+
+    const uint32_t subgroup_minmax_shader[] = {
+        0x00020011u, 1,                     // OpCapability Shader
+        0x00020011u, 61,                    // OpCapability GroupNonUniform
+        0x00020011u, 63,                    // OpCapability GroupNonUniformArithmetic
+        0x0003000eu, 0, 1,                 // OpMemoryModel Logical GLSL450
+        0x0005000fu, SPIRV_EXECUTION_MODEL_GL_COMPUTE, 12, 0x6e69616du, 0,
+        0x00060010u, 12, 17, 1, 1, 1,      // OpExecutionMode LocalSize
+        0x00020013u, 1,                     // OpTypeVoid
+        0x00040015u, 2, 32, 1,             // OpTypeInt int32
+        0x00040015u, 3, 32, 0,             // OpTypeInt uint32
+        0x00030021u, 9, 1,                 // OpTypeFunction void()
+        0x0004002bu, 3, 5, 3,              // OpConstant Subgroup scope
+        0x0004002bu, 3, 6, 0,              // OpConstant Reduce group operation
+        0x0004002bu, 2, 7, 0xfffffffeu,    // OpConstant signed input -2
+        0x0004002bu, 3, 8, 7,              // OpConstant unsigned input 7
+        0x00050036u, 1, 12, 0, 9,          // OpFunction
+        0x000200f8u, 13,                   // OpLabel
+        0x00060160u, 2, 14, 5, 6, 7,       // OpGroupNonUniformSMin
+        0x00060161u, 3, 15, 5, 6, 8,       // OpGroupNonUniformUMin
+        0x00060163u, 2, 16, 5, 6, 7,       // OpGroupNonUniformSMax
+        0x00060164u, 3, 17, 5, 6, 8,       // OpGroupNonUniformUMax
+        0x0006015fu, 2, 18, 5, 6, 7,       // OpGroupNonUniformIMul
+        0x00060166u, 3, 19, 5, 6, 8,       // OpGroupNonUniformBitwiseAnd
+        0x00060167u, 3, 20, 5, 6, 8,       // OpGroupNonUniformBitwiseOr
+        0x00060168u, 3, 21, 5, 6, 8,       // OpGroupNonUniformBitwiseXor
+        0x000100fdu,                       // OpReturn
+        0x00010038u                        // OpFunctionEnd
+    };
+    uint8_t subgroup_minmax_bytes[(5 + sizeof subgroup_minmax_shader / sizeof subgroup_minmax_shader[0]) * 4];
+    make_module(subgroup_minmax_bytes, 0, 0x00010600u, 22, 0, subgroup_minmax_shader,
+                sizeof subgroup_minmax_shader / sizeof subgroup_minmax_shader[0]);
+    rc = spirv_read(subgroup_minmax_bytes, sizeof subgroup_minmax_bytes, &module);
+    shader_entry = rc == SPIRV_OK ?
+        spirv_find_entry_point(&module, "main", SPIRV_EXECUTION_MODEL_GL_COMPUTE) : NULL;
+    common_shader = NULL;
+    shader_rc = shader_entry ? spirv_build_gpu_ir_shader(&module, shader_entry, &common_shader) : GPU_IR_INVALID;
+    const gpu_ir_shader_instruction *subgroup_smin = NULL, *subgroup_umin = NULL;
+    const gpu_ir_shader_instruction *subgroup_smax = NULL, *subgroup_umax = NULL;
+    const gpu_ir_shader_instruction *subgroup_imul = NULL, *subgroup_band = NULL;
+    const gpu_ir_shader_instruction *subgroup_bor = NULL, *subgroup_bxor = NULL;
+    for (uint32_t i = 0; common_shader && i < gpu_ir_shader_instruction_count(common_shader); i++) {
+        const gpu_ir_shader_instruction *instruction = gpu_ir_shader_instruction_at(common_shader, i);
+        if (!instruction || instruction->opcode != GPU_IR_SHADER_OP_ARITHMETIC) continue;
+        if (instruction->result_id == 14) subgroup_smin = instruction;
+        if (instruction->result_id == 15) subgroup_umin = instruction;
+        if (instruction->result_id == 16) subgroup_smax = instruction;
+        if (instruction->result_id == 17) subgroup_umax = instruction;
+        if (instruction->result_id == 18) subgroup_imul = instruction;
+        if (instruction->result_id == 19) subgroup_band = instruction;
+        if (instruction->result_id == 20) subgroup_bor = instruction;
+        if (instruction->result_id == 21) subgroup_bxor = instruction;
+    }
+    char *subgroup_minmax_msl = NULL;
+    size_t subgroup_minmax_msl_size = 0;
+    int subgroup_minmax_msl_rc = common_shader ? gpu_ir_msl_emit_compute(common_shader,
+        &subgroup_minmax_msl, &subgroup_minmax_msl_size) : GPU_IR_INVALID;
+    check("SPIR-V integer subgroup multiply/min/max/bitwise use Subgroup Reduce and common MSL reductions",
+          rc == SPIRV_OK && shader_rc == GPU_IR_OK && subgroup_smin && subgroup_umin &&
+          subgroup_smax && subgroup_umax && subgroup_imul && subgroup_band && subgroup_bor && subgroup_bxor &&
+          subgroup_smin->source_opcode == 352 &&
+          subgroup_smin->operation == GPU_IR_SHADER_ARITH_SUBGROUP_SMIN && subgroup_smin->operand_count == 1 &&
+          subgroup_umin->source_opcode == 353 &&
+          subgroup_umin->operation == GPU_IR_SHADER_ARITH_SUBGROUP_UMIN && subgroup_umin->operand_count == 1 &&
+          subgroup_smax->source_opcode == 355 &&
+          subgroup_smax->operation == GPU_IR_SHADER_ARITH_SUBGROUP_SMAX && subgroup_smax->operand_count == 1 &&
+          subgroup_umax->source_opcode == 356 &&
+          subgroup_umax->operation == GPU_IR_SHADER_ARITH_SUBGROUP_UMAX && subgroup_umax->operand_count == 1 &&
+          subgroup_imul->source_opcode == 351 &&
+          subgroup_imul->operation == GPU_IR_SHADER_ARITH_SUBGROUP_IMUL && subgroup_imul->operand_count == 1 &&
+          subgroup_band->source_opcode == 358 &&
+          subgroup_band->operation == GPU_IR_SHADER_ARITH_SUBGROUP_BIT_AND && subgroup_band->operand_count == 1 &&
+          subgroup_bor->source_opcode == 359 &&
+          subgroup_bor->operation == GPU_IR_SHADER_ARITH_SUBGROUP_BIT_OR && subgroup_bor->operand_count == 1 &&
+          subgroup_bxor->source_opcode == 360 &&
+          subgroup_bxor->operation == GPU_IR_SHADER_ARITH_SUBGROUP_BIT_XOR && subgroup_bxor->operand_count == 1 &&
+          subgroup_minmax_msl_rc == GPU_IR_OK && subgroup_minmax_msl && subgroup_minmax_msl_size &&
+          strstr(subgroup_minmax_msl, "simd_min(") && strstr(subgroup_minmax_msl, "simd_max(") &&
+          strstr(subgroup_minmax_msl, "simd_product(") && strstr(subgroup_minmax_msl, "simd_and(") &&
+          strstr(subgroup_minmax_msl, "simd_or(") && strstr(subgroup_minmax_msl, "simd_xor("));
+    free(subgroup_minmax_msl);
+    gpu_ir_shader_release(common_shader);
+    spirv_free(&module);
+
+    uint32_t wrong_minmax_scope[sizeof subgroup_minmax_shader / sizeof subgroup_minmax_shader[0]];
+    memcpy(wrong_minmax_scope, subgroup_minmax_shader, sizeof wrong_minmax_scope);
+    wrong_minmax_scope[36] = 2; // Workgroup scope is invalid for OpGroupNonUniform reductions.
+    uint8_t wrong_minmax_scope_bytes[(5 + sizeof wrong_minmax_scope / sizeof wrong_minmax_scope[0]) * 4];
+    make_module(wrong_minmax_scope_bytes, 0, 0x00010600u, 18, 0, wrong_minmax_scope,
+                sizeof wrong_minmax_scope / sizeof wrong_minmax_scope[0]);
+    rc = spirv_read(wrong_minmax_scope_bytes, sizeof wrong_minmax_scope_bytes, &module);
+    shader_entry = rc == SPIRV_OK ?
+        spirv_find_entry_point(&module, "main", SPIRV_EXECUTION_MODEL_GL_COMPUTE) : NULL;
+    common_shader = NULL;
+    shader_rc = shader_entry ? spirv_build_gpu_ir_shader(&module, shader_entry, &common_shader) : GPU_IR_INVALID;
+    check("SPIR-V integer subgroup reductions reject non-Subgroup execution scopes",
+          rc == SPIRV_OK && shader_rc == GPU_IR_INVALID && !common_shader);
+    gpu_ir_shader_release(common_shader);
+    spirv_free(&module);
+
+    uint32_t missing_minmax_capability[sizeof subgroup_minmax_shader / sizeof subgroup_minmax_shader[0]];
+    memcpy(missing_minmax_capability, subgroup_minmax_shader, sizeof missing_minmax_capability);
+    missing_minmax_capability[5] = 62; // Vote capability does not enable arithmetic subgroup operations.
+    uint8_t missing_minmax_capability_bytes[(5 + sizeof missing_minmax_capability / sizeof missing_minmax_capability[0]) * 4];
+    make_module(missing_minmax_capability_bytes, 0, 0x00010600u, 18, 0, missing_minmax_capability,
+                sizeof missing_minmax_capability / sizeof missing_minmax_capability[0]);
+    rc = spirv_read(missing_minmax_capability_bytes, sizeof missing_minmax_capability_bytes, &module);
+    shader_entry = rc == SPIRV_OK ?
+        spirv_find_entry_point(&module, "main", SPIRV_EXECUTION_MODEL_GL_COMPUTE) : NULL;
+    common_shader = NULL;
+    shader_rc = shader_entry ? spirv_build_gpu_ir_shader(&module, shader_entry, &common_shader) : GPU_IR_INVALID;
+    check("SPIR-V integer subgroup reductions require GroupNonUniformArithmetic",
+          rc == SPIRV_OK && shader_rc == GPU_IR_INVALID && !common_shader);
+    gpu_ir_shader_release(common_shader);
+    spirv_free(&module);
+
+    const uint32_t vertex_interface_shader[] = {
+        0x0008000fu, SPIRV_EXECUTION_MODEL_VERTEX, 12, 0x6e69616du, 0, 9, 10, 11,
+        0x00040047u, 9, 11, 42,         // BuiltIn VertexIndex
+        0x00040047u, 10, 11, 43,        // BuiltIn InstanceIndex
+        0x00040047u, 11, 11, 0,         // BuiltIn Position
+        0x00020013u, 1,                 // void
+        0x00040015u, 2, 32, 0,          // uint32
+        0x00030016u, 3, 32,             // float32
+        0x00040017u, 4, 3, 4,           // float4
+        0x00040020u, 5, 1, 2,           // Input pointer to uint
+        0x00040020u, 6, 3, 4,           // Output pointer to float4
+        0x00030021u, 8, 1,              // void()
+        0x0004003bu, 5, 9, 1,
+        0x0004003bu, 5, 10, 1,
+        0x0004003bu, 6, 11, 3,
+        0x0004003bu, 5, 14, 1,         // unrelated, unlisted entry-point input
+        0x00050036u, 1, 12, 0, 8,
+        0x000200f8u, 13,
+        0x000100fdu,
+        0x00010038u
+    };
+    uint8_t vertex_interface_bytes[(5 + sizeof vertex_interface_shader / sizeof vertex_interface_shader[0]) * 4];
+    make_module(vertex_interface_bytes, 0, 0x00010600u, 15, 0, vertex_interface_shader,
+                sizeof vertex_interface_shader / sizeof vertex_interface_shader[0]);
+    rc = spirv_read(vertex_interface_bytes, sizeof vertex_interface_bytes, &module);
+    shader_entry = rc == SPIRV_OK ?
+        spirv_find_entry_point(&module, "main", SPIRV_EXECUTION_MODEL_VERTEX) : NULL;
+    common_shader = NULL;
+    shader_rc = shader_entry ? spirv_build_gpu_ir_shader(&module, shader_entry, &common_shader) : GPU_IR_INVALID;
+    const gpu_ir_shader_instruction *vertex_index = common_shader ? gpu_ir_shader_instruction_at(common_shader, 0) : NULL;
+    const gpu_ir_shader_instruction *instance_index = common_shader ? gpu_ir_shader_instruction_at(common_shader, 1) : NULL;
+    const gpu_ir_shader_instruction *position = common_shader ? gpu_ir_shader_instruction_at(common_shader, 2) : NULL;
+    int unrelated_interface_excluded = 1;
+    for (uint32_t i = 0; common_shader && i < gpu_ir_shader_instruction_count(common_shader); i++) {
+        const gpu_ir_shader_instruction *instruction = gpu_ir_shader_instruction_at(common_shader, i);
+        if (instruction && instruction->result_id == 14) unrelated_interface_excluded = 0;
+    }
+    check("SPIR-V vertex entry retains VertexIndex, InstanceIndex and Position semantics in common IR",
+          rc == SPIRV_OK && shader_rc == GPU_IR_OK && common_shader &&
+          gpu_ir_shader_stage(common_shader) == GPU_IR_STAGE_VERTEX && vertex_index && instance_index && position &&
+          unrelated_interface_excluded &&
+          vertex_index->result_id == 9 && vertex_index->storage_class == GPU_IR_SHADER_STORAGE_INPUT &&
+          vertex_index->entry_point_interface &&
+          vertex_index->builtin == GPU_IR_SHADER_BUILTIN_VERTEX_INDEX && vertex_index->source_builtin == 42 &&
+          instance_index->result_id == 10 && instance_index->storage_class == GPU_IR_SHADER_STORAGE_INPUT &&
+          instance_index->entry_point_interface &&
+          instance_index->builtin == GPU_IR_SHADER_BUILTIN_INSTANCE_INDEX && instance_index->source_builtin == 43 &&
+          position->result_id == 11 && position->storage_class == GPU_IR_SHADER_STORAGE_OUTPUT &&
+          position->entry_point_interface &&
+          position->builtin == GPU_IR_SHADER_BUILTIN_POSITION && position->source_builtin == 0);
+    char *vertex_msl = NULL;
+    size_t vertex_msl_size = 0;
+    int vertex_msl_rc = common_shader ? gpu_ir_msl_emit_vertex(common_shader, &vertex_msl,
+        &vertex_msl_size) : GPU_IR_INVALID;
+    check("Vulkan InstanceIndex maps to Metal instance_id without a D3D base-instance adjustment",
+          vertex_msl_rc == GPU_IR_OK && vertex_msl && vertex_msl_size &&
+          strstr(vertex_msl, "uint vx_builtin_10 [[instance_id]]") &&
+          !strstr(vertex_msl, "[[base_instance]]"));
+    free(vertex_msl);
+    gpu_ir_shader_release(common_shader);
+    spirv_free(&module);
+
+    const uint32_t fragment_interface_shader[] = {
+        0x0009000fu, SPIRV_EXECUTION_MODEL_FRAGMENT, 14, 0x6e69616du, 0, 10, 11, 12, 13,
+        0x00040047u, 10, 11, 15,        // BuiltIn FragCoord
+        0x00040047u, 11, 11, 17,        // BuiltIn FrontFacing
+        0x00040047u, 12, 30, 0,         // Location 0
+        0x00040047u, 13, 11, 22,        // BuiltIn FragDepth
+        0x00020013u, 1,                 // void
+        0x00020014u, 2,                 // bool
+        0x00030016u, 3, 32,             // float32
+        0x00040017u, 4, 3, 4,           // float4
+        0x00040020u, 5, 1, 4,           // Input pointer to float4
+        0x00040020u, 6, 1, 2,           // Input pointer to bool
+        0x00040020u, 7, 3, 4,           // Output pointer to float4
+        0x00030021u, 8, 1,              // void()
+        0x00040020u, 9, 3, 3,           // Output pointer to float
+        0x0004003bu, 5, 10, 1,
+        0x0004003bu, 6, 11, 1,
+        0x0004003bu, 7, 12, 3,
+        0x0004003bu, 9, 13, 3,
+        0x00050036u, 1, 14, 0, 8,
+        0x000200f8u, 15,
+        0x000100fdu,
+        0x00010038u
+    };
+    uint8_t fragment_interface_bytes[(5 + sizeof fragment_interface_shader / sizeof fragment_interface_shader[0]) * 4];
+    make_module(fragment_interface_bytes, 0, 0x00010600u, 16, 0, fragment_interface_shader,
+                sizeof fragment_interface_shader / sizeof fragment_interface_shader[0]);
+    rc = spirv_read(fragment_interface_bytes, sizeof fragment_interface_bytes, &module);
+    shader_entry = rc == SPIRV_OK ?
+        spirv_find_entry_point(&module, "main", SPIRV_EXECUTION_MODEL_FRAGMENT) : NULL;
+    common_shader = NULL;
+    shader_rc = shader_entry ? spirv_build_gpu_ir_shader(&module, shader_entry, &common_shader) : GPU_IR_INVALID;
+    const gpu_ir_shader_instruction *frag_coord = common_shader ? gpu_ir_shader_instruction_at(common_shader, 0) : NULL;
+    const gpu_ir_shader_instruction *front_facing = common_shader ? gpu_ir_shader_instruction_at(common_shader, 1) : NULL;
+    const gpu_ir_shader_instruction *color_output = common_shader ? gpu_ir_shader_instruction_at(common_shader, 2) : NULL;
+    const gpu_ir_shader_instruction *frag_depth = common_shader ? gpu_ir_shader_instruction_at(common_shader, 3) : NULL;
+    check("SPIR-V fragment entry retains built-ins and location-decorated outputs in common IR",
+          rc == SPIRV_OK && shader_rc == GPU_IR_OK && common_shader &&
+          gpu_ir_shader_stage(common_shader) == GPU_IR_STAGE_FRAGMENT && frag_coord && front_facing && color_output && frag_depth &&
+          frag_coord->storage_class == GPU_IR_SHADER_STORAGE_INPUT &&
+          frag_coord->entry_point_interface &&
+          frag_coord->builtin == GPU_IR_SHADER_BUILTIN_FRAG_COORD && frag_coord->source_builtin == 15 &&
+          front_facing->storage_class == GPU_IR_SHADER_STORAGE_INPUT &&
+          front_facing->entry_point_interface &&
+          front_facing->builtin == GPU_IR_SHADER_BUILTIN_FRONT_FACING && front_facing->source_builtin == 17 &&
+          color_output->storage_class == GPU_IR_SHADER_STORAGE_OUTPUT && color_output->has_location &&
+          color_output->entry_point_interface &&
+          color_output->location == 0 && !color_output->has_builtin &&
+          frag_depth->storage_class == GPU_IR_SHADER_STORAGE_OUTPUT && frag_depth->has_builtin &&
+          frag_depth->entry_point_interface &&
+          frag_depth->builtin == GPU_IR_SHADER_BUILTIN_FRAG_DEPTH && frag_depth->source_builtin == 22);
     gpu_ir_shader_release(common_shader);
     spirv_free(&module);
 
@@ -758,6 +1131,124 @@ int main(void) {
     gpu_ir_shader_release(common_shader);
     spirv_free(&module);
 
+    const uint32_t float_mix_shader[] = {
+        0x0005000fu, SPIRV_EXECUTION_MODEL_GL_COMPUTE, 10, 0x6e69616du, 0,
+        0x00060010u, 10, 17, 1, 1, 1,
+        0x0006000bu, 7, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0,
+        0x00020013u, 1,                  // void
+        0x00030016u, 2, 32,             // float
+        0x00040017u, 3, 2, 4,           // float4
+        0x00030021u, 4, 1,              // void()
+        0x0004002bu, 2, 5, 0x3e800000u, // float 0.25
+        0x0004002bu, 2, 6, 0x3f800000u, // float 1.0
+        0x0004002bu, 2, 17, 0x3f000000u, // float 0.5
+        0x0004002bu, 2, 18, 0x3f400000u, // float 0.75
+        0x0007002cu, 3, 9, 5, 6, 5, 6, // float4
+        0x0007002cu, 3, 19, 17, 18, 17, 18, // float4
+        0x0007002cu, 3, 20, 6, 5, 6, 5, // float4
+        0x0004002bu, 2, 21, 0x3e800000u, // float 0.25
+        0x0004002bu, 2, 22, 0x3f400000u, // float 0.75
+        0x0004002bu, 2, 23, 0x3f000000u, // float 0.5
+        0x0007002cu, 3, 24, 21, 21, 21, 21, // float4 edge0
+        0x0007002cu, 3, 25, 22, 22, 22, 22, // float4 edge1
+        0x0007002cu, 3, 26, 23, 23, 23, 23, // float4 x
+        0x00050036u, 1, 10, 0, 4,
+        0x000200f8u, 15,
+        0x0008000cu, 3, 16, 7, 46, 9, 19, 20, // FMix(x, y, a)
+        0x0007000cu, 3, 27, 7, 48, 24, 26, // Step(edge, x)
+        0x0008000cu, 3, 28, 7, 49, 24, 25, 26, // SmoothStep(edge0, edge1, x)
+        0x000100fdu,
+        0x00010038u
+    };
+    uint8_t float_mix_bytes[(5 + sizeof float_mix_shader / sizeof float_mix_shader[0]) * 4];
+    make_module(float_mix_bytes, 0, 0x00010600u, 29, 0, float_mix_shader,
+                sizeof float_mix_shader / sizeof float_mix_shader[0]);
+    rc = spirv_read(float_mix_bytes, sizeof float_mix_bytes, &module);
+    shader_entry = rc == SPIRV_OK ?
+        spirv_find_entry_point(&module, "main", SPIRV_EXECUTION_MODEL_GL_COMPUTE) : NULL;
+    common_shader = NULL;
+    shader_rc = shader_entry ? spirv_build_gpu_ir_shader(&module, shader_entry, &common_shader) : GPU_IR_INVALID;
+    const gpu_ir_shader_instruction *float_mix = NULL;
+    for (uint32_t i = 0; common_shader && i < gpu_ir_shader_instruction_count(common_shader); i++) {
+        const gpu_ir_shader_instruction *candidate = gpu_ir_shader_instruction_at(common_shader, i);
+        if (candidate && candidate->result_id == 16) { float_mix = candidate; break; }
+    }
+    const gpu_ir_shader_operand *float_mix_x = float_mix ?
+        gpu_ir_shader_operand_at(common_shader, float_mix->first_operand) : NULL;
+    const gpu_ir_shader_operand *float_mix_y = float_mix ?
+        gpu_ir_shader_operand_at(common_shader, float_mix->first_operand + 1u) : NULL;
+    const gpu_ir_shader_operand *float_mix_a = float_mix ?
+        gpu_ir_shader_operand_at(common_shader, float_mix->first_operand + 2u) : NULL;
+    const gpu_ir_shader_instruction *float_step = NULL, *float_smoothstep = NULL;
+    for (uint32_t i = 0; common_shader && i < gpu_ir_shader_instruction_count(common_shader); i++) {
+        const gpu_ir_shader_instruction *candidate = gpu_ir_shader_instruction_at(common_shader, i);
+        if (!candidate) continue;
+        if (candidate->result_id == 27) float_step = candidate;
+        if (candidate->result_id == 28) float_smoothstep = candidate;
+    }
+    const gpu_ir_shader_operand *float_step_edge = float_step ?
+        gpu_ir_shader_operand_at(common_shader, float_step->first_operand) : NULL;
+    const gpu_ir_shader_operand *float_step_x = float_step ?
+        gpu_ir_shader_operand_at(common_shader, float_step->first_operand + 1u) : NULL;
+    const gpu_ir_shader_operand *float_smoothstep_edge0 = float_smoothstep ?
+        gpu_ir_shader_operand_at(common_shader, float_smoothstep->first_operand) : NULL;
+    const gpu_ir_shader_operand *float_smoothstep_edge1 = float_smoothstep ?
+        gpu_ir_shader_operand_at(common_shader, float_smoothstep->first_operand + 1u) : NULL;
+    const gpu_ir_shader_operand *float_smoothstep_x = float_smoothstep ?
+        gpu_ir_shader_operand_at(common_shader, float_smoothstep->first_operand + 2u) : NULL;
+    char *float_mix_msl = NULL;
+    size_t float_mix_msl_size = 0;
+    int float_mix_msl_rc = common_shader ? gpu_ir_msl_emit_compute(common_shader, &float_mix_msl,
+                                                                     &float_mix_msl_size) : GPU_IR_INVALID;
+    const char *expected_float_mix =
+        "float4(as_type<float>(0x3e800000u), as_type<float>(0x3f800000u), "
+        "as_type<float>(0x3e800000u), as_type<float>(0x3f800000u)) * "
+        "(float4(1.0f) - float4(as_type<float>(0x3f800000u), as_type<float>(0x3e800000u), "
+        "as_type<float>(0x3f800000u), as_type<float>(0x3e800000u))) + "
+        "float4(as_type<float>(0x3f000000u), as_type<float>(0x3f400000u), "
+        "as_type<float>(0x3f000000u), as_type<float>(0x3f400000u)) * "
+        "float4(as_type<float>(0x3f800000u), as_type<float>(0x3e800000u), "
+        "as_type<float>(0x3f800000u), as_type<float>(0x3e800000u));";
+    const char *expected_float_step =
+        "float4 vx_value_27 = step(float4(as_type<float>(0x3e800000u), as_type<float>(0x3e800000u), "
+        "as_type<float>(0x3e800000u), as_type<float>(0x3e800000u)), "
+        "float4(as_type<float>(0x3f000000u), as_type<float>(0x3f000000u), "
+        "as_type<float>(0x3f000000u), as_type<float>(0x3f000000u)));";
+    const char *expected_float_smoothstep =
+        "float4 vx_value_28 = smoothstep(float4(as_type<float>(0x3e800000u), as_type<float>(0x3e800000u), "
+        "as_type<float>(0x3e800000u), as_type<float>(0x3e800000u)), "
+        "float4(as_type<float>(0x3f400000u), as_type<float>(0x3f400000u), "
+        "as_type<float>(0x3f400000u), as_type<float>(0x3f400000u)), "
+        "float4(as_type<float>(0x3f000000u), as_type<float>(0x3f000000u), "
+        "as_type<float>(0x3f000000u), as_type<float>(0x3f000000u)));";
+    int float_mix_ok = rc == SPIRV_OK && shader_rc == GPU_IR_OK && float_mix &&
+        float_mix->source_api == GPU_IR_SHADER_SOURCE_SPIRV && float_mix->source_opcode == 12 &&
+        float_mix->opcode == GPU_IR_SHADER_OP_ARITHMETIC &&
+        float_mix->operation == GPU_IR_SHADER_ARITH_INTERPOLATE && float_mix->result_type_id == 3 &&
+        float_mix->flags == GPU_IR_SHADER_FLAG_FLOAT && float_mix->operand_count == 3 &&
+        float_mix_x && float_mix_x->kind == GPU_IR_SHADER_OPERAND_ID && float_mix_x->value == 9 &&
+        float_mix_y && float_mix_y->kind == GPU_IR_SHADER_OPERAND_ID && float_mix_y->value == 19 &&
+        float_mix_a && float_mix_a->kind == GPU_IR_SHADER_OPERAND_ID && float_mix_a->value == 20 &&
+        float_mix_msl_rc == GPU_IR_OK && float_mix_msl_size && float_mix_msl &&
+        strstr(float_mix_msl, expected_float_mix) &&
+        float_step && float_step->operation == GPU_IR_SHADER_ARITH_STEP && float_step->operand_count == 2 &&
+        float_step_edge && float_step_edge->kind == GPU_IR_SHADER_OPERAND_ID && float_step_edge->value == 24 &&
+        float_step_x && float_step_x->kind == GPU_IR_SHADER_OPERAND_ID && float_step_x->value == 26 &&
+        float_smoothstep && float_smoothstep->operation == GPU_IR_SHADER_ARITH_SMOOTHSTEP &&
+        float_smoothstep->operand_count == 3 &&
+        float_smoothstep_edge0 && float_smoothstep_edge0->kind == GPU_IR_SHADER_OPERAND_ID &&
+        float_smoothstep_edge0->value == 24 &&
+        float_smoothstep_edge1 && float_smoothstep_edge1->kind == GPU_IR_SHADER_OPERAND_ID &&
+        float_smoothstep_edge1->value == 25 &&
+        float_smoothstep_x && float_smoothstep_x->kind == GPU_IR_SHADER_OPERAND_ID &&
+        float_smoothstep_x->value == 26 &&
+        strstr(float_mix_msl, expected_float_step) && strstr(float_mix_msl, expected_float_smoothstep);
+    check("GLSL.std.450 FMix, Step and SmoothStep preserve operands in common IR and emit their specified MSL operations",
+          float_mix_ok);
+    free(float_mix_msl);
+    gpu_ir_shader_release(common_shader);
+    spirv_free(&module);
+
     uint32_t unterminated_function[sizeof function_body / sizeof function_body[0]];
     memcpy(unterminated_function, function_body, sizeof function_body);
     unterminated_function[sizeof unterminated_function / sizeof unterminated_function[0] - 2] = 0x00010000u;
@@ -1058,6 +1549,117 @@ int main(void) {
           integer_type && integer_type->kind == SPIRV_ID_TYPE && integer_type->type_kind == SPIRV_TYPE_INT &&
           integer_type->width == 32 && integer_type->signedness == 0 && spec_value &&
           spec_value->kind == SPIRV_ID_CONSTANT && spec_value->is_specialization && spec_value->value_bits == 4);
+    spirv_free(&module);
+
+    const uint32_t specialization_shifts[] = {
+        0x0005000fu, SPIRV_EXECUTION_MODEL_GL_COMPUTE, 1, 0x6e69616du, 0,
+        0x00060010u, 1, 17, 1, 1, 1,
+        0x00040047u, 6, 1, 7,          // SpecId 7
+        0x00020013u, 2,                // OpTypeVoid
+        0x00040015u, 3, 32, 0,         // OpTypeInt uint32
+        0x00040015u, 4, 32, 1,         // OpTypeInt int32
+        0x00030021u, 5, 2,             // OpTypeFunction void()
+        0x00040032u, 3, 6, 0x80000001u,// OpSpecConstant
+        0x0004002bu, 3, 7, 1,          // shift amount
+        0x00060034u, 3, 8, 194, 6, 7,  // OpSpecConstantOp ShiftRightLogical
+        0x00060034u, 3, 9, 196, 6, 7,  // OpSpecConstantOp ShiftLeftLogical
+        0x0004002bu, 4, 10, 0x80000001u,// signed base
+        0x0004002bu, 3, 11, 1,          // unsigned shift amount
+        0x00060034u, 4, 12, 195, 10, 11,// OpSpecConstantOp ShiftRightArithmetic
+        0x00050036u, 2, 1, 0, 5,
+        0x000200f8u, 13,
+        0x000100fdu,
+        0x00010038u
+    };
+    uint8_t specialization_shift_bytes[(5 + sizeof specialization_shifts / sizeof specialization_shifts[0]) * 4];
+    make_module(specialization_shift_bytes, 0, 0x00010600u, 14, 0, specialization_shifts,
+                sizeof specialization_shifts / sizeof specialization_shifts[0]);
+    rc = spirv_read(specialization_shift_bytes, sizeof specialization_shift_bytes, &module);
+    const spirv_id_record *logical_right = rc == SPIRV_OK ? spirv_find_id(&module, 8) : NULL;
+    const spirv_id_record *logical_left = rc == SPIRV_OK ? spirv_find_id(&module, 9) : NULL;
+    const spirv_id_record *arithmetic_right = rc == SPIRV_OK ? spirv_find_id(&module, 12) : NULL;
+    check("32-bit specialization shifts preserve logical and sign-filled results",
+          rc == SPIRV_OK && logical_right && logical_right->value_bits == 0x40000000u &&
+          logical_left && logical_left->value_bits == 2 && arithmetic_right &&
+          arithmetic_right->value_bits == 0xc0000000u);
+    spirv_free(&module);
+    uint32_t invalid_specialization_shift[sizeof specialization_shifts / sizeof specialization_shifts[0]];
+    memcpy(invalid_specialization_shift, specialization_shifts, sizeof specialization_shifts);
+    invalid_specialization_shift[35] = 32; // OpConstant shift amount for result ID 7.
+    make_module(specialization_shift_bytes, 0, 0x00010600u, 14, 0, invalid_specialization_shift,
+                sizeof invalid_specialization_shift / sizeof invalid_specialization_shift[0]);
+    rc = spirv_read(specialization_shift_bytes, sizeof specialization_shift_bytes, &module);
+    check("specialization shifts that produce poison are rejected instead of assigned a fabricated value",
+          rc == SPIRV_UNSUPPORTED);
+    spirv_free(&module);
+
+    const uint32_t specialization_division[] = {
+        0x0005000fu, SPIRV_EXECUTION_MODEL_GL_COMPUTE, 1, 0x6e69616du, 0,
+        0x00060010u, 1, 17, 1, 1, 1,
+        0x00020013u, 2,                // OpTypeVoid
+        0x00040015u, 3, 32, 0,         // OpTypeInt uint32
+        0x00040015u, 4, 32, 1,         // OpTypeInt int32
+        0x00030021u, 5, 2,             // OpTypeFunction void()
+        0x00040032u, 3, 6, 7,          // OpSpecConstant uint 7
+        0x0004002bu, 3, 7, 2,          // OpConstant uint 2
+        0x00060034u, 3, 8, 134, 6, 7,  // OpSpecConstantOp UDiv => 3
+        0x00060034u, 3, 9, 137, 6, 7,  // OpSpecConstantOp UMod => 1
+        0x0004002bu, 4, 10, 0xfffffff9u,// OpConstant int -7
+        0x0004002bu, 4, 11, 2,          // OpConstant int 2
+        0x00060034u, 4, 12, 135, 10, 11,// OpSpecConstantOp SDiv => -3
+        0x00050036u, 2, 1, 0, 5,
+        0x000200f8u, 13,
+        0x000100fdu,
+        0x00010038u
+    };
+    uint8_t specialization_division_bytes[(5 + sizeof specialization_division /
+        sizeof specialization_division[0]) * 4];
+    make_module(specialization_division_bytes, 0, 0x00010600u, 14, 0, specialization_division,
+                sizeof specialization_division / sizeof specialization_division[0]);
+    rc = spirv_read(specialization_division_bytes, sizeof specialization_division_bytes, &module);
+    const spirv_id_record *unsigned_quotient = rc == SPIRV_OK ? spirv_find_id(&module, 8) : NULL;
+    const spirv_id_record *unsigned_remainder = rc == SPIRV_OK ? spirv_find_id(&module, 9) : NULL;
+    const spirv_id_record *signed_quotient = rc == SPIRV_OK ? spirv_find_id(&module, 12) : NULL;
+    check("32-bit unsigned quotient/remainder and signed quotient resolve from specialization constants",
+          rc == SPIRV_OK && unsigned_quotient && unsigned_quotient->value_bits == 3 && unsigned_remainder &&
+          unsigned_remainder->value_bits == 1 && signed_quotient && signed_quotient->value_bits == 0xfffffffdu);
+    spirv_free(&module);
+
+    uint32_t invalid_specialization_division[sizeof specialization_division / sizeof specialization_division[0]];
+    memcpy(invalid_specialization_division, specialization_division, sizeof specialization_division);
+    for (size_t offset = 0; offset < sizeof invalid_specialization_division / sizeof invalid_specialization_division[0];) {
+        uint32_t word_count = invalid_specialization_division[offset] >> 16;
+        uint32_t opcode = invalid_specialization_division[offset] & 0xffffu;
+        if (!word_count || word_count > sizeof invalid_specialization_division /
+            sizeof invalid_specialization_division[0] - offset) break;
+        if (opcode == 43 && invalid_specialization_division[offset + 2] == 7)
+            invalid_specialization_division[offset + 3] = 0;
+        offset += word_count;
+    }
+    make_module(specialization_division_bytes, 0, 0x00010600u, 14, 0, invalid_specialization_division,
+                sizeof invalid_specialization_division / sizeof invalid_specialization_division[0]);
+    rc = spirv_read(specialization_division_bytes, sizeof specialization_division_bytes, &module);
+    check("integer specialization division by zero is rejected instead of assigned a fabricated value",
+          rc == SPIRV_UNSUPPORTED);
+    spirv_free(&module);
+
+    memcpy(invalid_specialization_division, specialization_division, sizeof specialization_division);
+    for (size_t offset = 0; offset < sizeof invalid_specialization_division / sizeof invalid_specialization_division[0];) {
+        uint32_t word_count = invalid_specialization_division[offset] >> 16;
+        uint32_t opcode = invalid_specialization_division[offset] & 0xffffu;
+        if (!word_count || word_count > sizeof invalid_specialization_division /
+            sizeof invalid_specialization_division[0] - offset) break;
+        if (opcode == 43 && invalid_specialization_division[offset + 2] == 10)
+            invalid_specialization_division[offset + 3] = 0x80000000u;
+        if (opcode == 43 && invalid_specialization_division[offset + 2] == 11)
+            invalid_specialization_division[offset + 3] = UINT32_MAX;
+        offset += word_count;
+    }
+    make_module(specialization_division_bytes, 0, 0x00010600u, 14, 0, invalid_specialization_division,
+                sizeof invalid_specialization_division / sizeof invalid_specialization_division[0]);
+    rc = spirv_read(specialization_division_bytes, sizeof specialization_division_bytes, &module);
+    check("signed specialization division overflow is rejected instead of invoking host integer undefined behavior",
+          rc == SPIRV_UNSUPPORTED);
     spirv_free(&module);
 
     // A pipeline specialization map can replace these LocalSizeId defaults; common IR must not freeze them early.

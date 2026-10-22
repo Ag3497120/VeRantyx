@@ -63,6 +63,13 @@ static void color_pipeline(void) {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
+    D3D11_INPUT_ELEMENT_DESC invalid = el[0];
+    invalid.InstanceDataStepRate = 1;
+    ID3D11InputLayout *invalid_layout = NULL;
+    HRESULT invalid_hr = ID3D11Device_CreateInputLayout(dev, &invalid, 1, color_vs, sizeof color_vs,
+                                                        &invalid_layout);
+    CHECK(invalid_hr == E_INVALIDARG && invalid_layout == NULL);
+    if (invalid_layout) ID3D11InputLayout_Release(invalid_layout);
     CHECK(SUCCEEDED(ID3D11Device_CreateInputLayout(dev, el, 2, color_vs, sizeof color_vs, &color_layout)));
 }
 static void draw_colored(const color_vertex *v, UINT n) {

@@ -1,4 +1,5 @@
 #include "gpu_ir.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,8 @@ typedef struct {
     uint8_t fill_pattern[GPU_IR_MAX_FILL_PATTERN_SIZE];
     uint32_t clear_color_calls, clear_depth_stencil_calls, clear_texture_id;
     uint32_t clear_aspects, clear_stencil, clear_rectangle_count;
+    uint32_t clear_color_value_type, clear_color_bits[4];
+    uint32_t clear_base_array_layer, clear_array_layer_count;
     float clear_color[4], clear_depth;
     gpu_ir_rect clear_rectangles[4];
     gpu_ir_texture_location src_location, dst_location;
@@ -43,6 +46,89 @@ static void release_fake(void *p) {
     fake_resource *b = p;
     (*b->destroyed)++;
     free(b);
+}
+
+static gpu_ir_shader *empty_graphics_stage_shader(uint32_t stage) {
+    gpu_ir_shader_type types[] = {
+        { .id = 1, .kind = GPU_IR_SHADER_TYPE_VOID },
+        { .id = 2, .kind = GPU_IR_SHADER_TYPE_FUNCTION, .element_type_id = 1 }
+    };
+    gpu_ir_shader_function function = {
+        .id = 10, .result_type_id = 1, .function_type_id = 2,
+        .first_block = 0, .block_count = 1, .first_instruction = 0, .instruction_count = 1
+    };
+    gpu_ir_shader_block block = {
+        .function_index = 0, .label_id = 11, .first_instruction = 0, .instruction_count = 1,
+        .terminator_opcode = GPU_IR_SHADER_OP_RETURN
+    };
+    gpu_ir_shader_instruction instruction = {
+        .source_api = GPU_IR_SHADER_SOURCE_SPIRV, .opcode = GPU_IR_SHADER_OP_RETURN, .source_opcode = 253,
+        .function_index = 0, .block_index = 0
+    };
+    gpu_ir_shader_desc desc = {
+        .source_api = GPU_IR_SHADER_SOURCE_SPIRV, .stage_mask = stage, .entry_function_id = 10,
+        .types = types, .type_count = sizeof types / sizeof types[0],
+        .functions = &function, .function_count = 1, .blocks = &block, .block_count = 1,
+        .instructions = &instruction, .instruction_count = 1
+    };
+    return gpu_ir_shader_create(&desc);
+}
+
+static int partial_graphics_pipeline_test(void) {
+    uint32_t destroyed = 0;
+    gpu_ir_shader *vertex = empty_graphics_stage_shader(GPU_IR_STAGE_VERTEX);
+    gpu_ir_shader *fragment = empty_graphics_stage_shader(GPU_IR_STAGE_FRAGMENT);
+    if (!vertex || !fragment) {
+        gpu_ir_shader_release(vertex);
+        gpu_ir_shader_release(fragment);
+        return fail("could not build minimal graphics stage IR for partial-pipeline validation");
+    }
+    static const uint32_t graphics_slots[] = {
+        GPU_IR_STAGE_SLOT_VERTEX, GPU_IR_STAGE_SLOT_FRAGMENT
+    };
+    for (uint32_t slot = 0; slot < sizeof graphics_slots / sizeof graphics_slots[0]; slot++) {
+        uint32_t stage = graphics_slots[slot];
+        fake_resource *backend = malloc(sizeof *backend);
+        if (!backend) {
+            gpu_ir_shader_release(vertex);
+            gpu_ir_shader_release(fragment);
+            return fail("partial graphics pipeline backend allocation failed");
+        }
+        *backend = (fake_resource){ 100u + stage, &destroyed };
+        gpu_ir_pipeline_desc desc = {
+            .info = { .kind = GPU_IR_PIPELINE_GRAPHICS,
+                      .stage_mask = GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT },
+            .backend_object = backend, .release = release_fake
+        };
+        desc.stage_shaders[stage] = stage == GPU_IR_STAGE_SLOT_VERTEX ? vertex : fragment;
+        gpu_ir_pipeline *pipeline = gpu_ir_pipeline_create(&desc);
+        if (!pipeline || gpu_ir_pipeline_shader(pipeline, stage == GPU_IR_STAGE_SLOT_VERTEX ?
+                GPU_IR_STAGE_VERTEX : GPU_IR_STAGE_FRAGMENT) != desc.stage_shaders[stage] ||
+            gpu_ir_pipeline_description(pipeline)->stage_mask != desc.info.stage_mask) {
+            gpu_ir_pipeline_release(pipeline);
+            if (!pipeline) free(backend);
+            gpu_ir_shader_release(vertex);
+            gpu_ir_shader_release(fragment);
+            return fail("graphics pipeline rejected or lost one lowered stage with another stage left native");
+        }
+        gpu_ir_pipeline_desc invalid = desc;
+        invalid.stage_shaders[stage == GPU_IR_STAGE_SLOT_VERTEX ?
+            GPU_IR_STAGE_SLOT_FRAGMENT : GPU_IR_STAGE_SLOT_VERTEX] = desc.stage_shaders[stage];
+        gpu_ir_pipeline *invalid_pipeline = gpu_ir_pipeline_create(&invalid);
+        if (invalid_pipeline) {
+            gpu_ir_pipeline_release(invalid_pipeline);
+            gpu_ir_pipeline_release(pipeline);
+            gpu_ir_shader_release(vertex);
+            gpu_ir_shader_release(fragment);
+            return fail("graphics pipeline accepted a shader in the wrong stage slot");
+        }
+        gpu_ir_pipeline_release(pipeline);
+    }
+    gpu_ir_shader_release(vertex);
+    gpu_ir_shader_release(fragment);
+    if (destroyed != 2) return fail("partial graphics pipeline backend lifetime was incorrect");
+    puts("gpu_ir: graphics pipelines retain only the stages lowered by the frontend: ok");
+    return 0;
 }
 
 static int copy_buffer(void *context, const gpu_ir_resource *src, uint64_t src_offset,
@@ -180,7 +266,11 @@ static int clear_color(void *context, const gpu_ir_resource *texture, const gpu_
         (clear->rectangle_count && !clear->rectangles)) return GPU_IR_INVALID;
     b->clear_color_calls++;
     b->clear_texture_id = resource->id;
+    b->clear_color_value_type = clear->value_type;
+    b->clear_base_array_layer = clear->base_array_layer;
+    b->clear_array_layer_count = clear->array_layer_count;
     memcpy(b->clear_color, clear->color, sizeof b->clear_color);
+    memcpy(b->clear_color_bits, clear->color, sizeof b->clear_color_bits);
     b->clear_rectangle_count = clear->rectangle_count;
     if (clear->rectangle_count)
         memcpy(b->clear_rectangles, clear->rectangles, clear->rectangle_count * sizeof *clear->rectangles);
@@ -522,8 +612,38 @@ static int shader_model_test(void) {
     return 0;
 }
 
+static int vertex_format_info_test(void) {
+    static const struct {
+        uint32_t format, components, bytes, numeric_class;
+    } cases[] = {
+        { GPU_IR_VERTEX_FORMAT_FLOAT32X3, 3, 12, GPU_IR_VERTEX_NUMERIC_FLOAT },
+        { GPU_IR_VERTEX_FORMAT_SINT32X4, 4, 16, GPU_IR_VERTEX_NUMERIC_SINT },
+        { GPU_IR_VERTEX_FORMAT_UINT32X2, 2, 8, GPU_IR_VERTEX_NUMERIC_UINT },
+        { GPU_IR_VERTEX_FORMAT_FLOAT16X4, 4, 8, GPU_IR_VERTEX_NUMERIC_FLOAT },
+        { GPU_IR_VERTEX_FORMAT_UNORM8X4, 4, 4, GPU_IR_VERTEX_NUMERIC_FLOAT },
+        { GPU_IR_VERTEX_FORMAT_SNORM8X2, 2, 2, GPU_IR_VERTEX_NUMERIC_FLOAT },
+        { GPU_IR_VERTEX_FORMAT_UINT8, 1, 1, GPU_IR_VERTEX_NUMERIC_UINT },
+        { GPU_IR_VERTEX_FORMAT_SINT16X3, 3, 6, GPU_IR_VERTEX_NUMERIC_SINT },
+        { GPU_IR_VERTEX_FORMAT_UNORM16X2, 2, 4, GPU_IR_VERTEX_NUMERIC_FLOAT },
+        { GPU_IR_VERTEX_FORMAT_UINT16X4, 4, 8, GPU_IR_VERTEX_NUMERIC_UINT }
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        uint32_t components = 0, bytes = 0, numeric_class = 0;
+        if (!gpu_ir_vertex_format_info(cases[i].format, &components, &bytes, &numeric_class) ||
+            components != cases[i].components || bytes != cases[i].bytes ||
+            numeric_class != cases[i].numeric_class) return fail("vertex format metadata was misclassified");
+    }
+    if (gpu_ir_vertex_format_info(GPU_IR_VERTEX_FORMAT_OPAQUE, NULL, NULL, NULL) ||
+        gpu_ir_vertex_format_info(0x1FF, NULL, NULL, NULL))
+        return fail("opaque or unknown vertex format received normalized metadata");
+    puts("gpu_ir: vertex formats retain byte width and float/signed/unsigned numeric classes: ok");
+    return 0;
+}
+
 int main(void) {
     if (shader_model_test()) return 1;
+    if (partial_graphics_pipeline_test()) return 1;
+    if (vertex_format_info_test()) return 1;
     uint32_t destroyed = 0, index = 0;
     gpu_ir_resource *src = new_buffer(3, 128, &destroyed);
     gpu_ir_resource *dst = new_buffer(7, 256, &destroyed);
@@ -737,12 +857,13 @@ int main(void) {
     puts("gpu_ir: multisample resolve validation, execution and lifetime: ok");
 
     uint32_t clear_destroyed = 0;
-    gpu_ir_texture_desc clear_desc = { .width = 32, .height = 24, .depth = 1, .array_layers = 1,
+    gpu_ir_texture_desc clear_desc = { .width = 32, .height = 24, .depth = 1, .array_layers = 2,
         .mip_levels = 1, .bytes_per_texel = 4, .sample_count = 1 };
     gpu_ir_resource *color_target = new_texture(61, &clear_desc, &clear_destroyed);
     gpu_ir_resource *depth_target = new_texture(63, &clear_desc, &clear_destroyed);
     gpu_ir_rect clear_rects[2] = { { -2, 1, 12, 18 }, { 8, 5, 30, 24 } };
     const float clear_rgba[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+    const uint32_t clear_uint[4] = { 0xfedcba98u, 0x80000001u, 0x12345678u, UINT32_MAX };
     gpu_ir_stream_init(&stream);
     if (!color_target || !depth_target ||
         gpu_ir_record_clear_color(&stream, color_target, clear_rgba, clear_rects, 2, &index) != GPU_IR_OK ||
@@ -753,7 +874,15 @@ int main(void) {
         gpu_ir_record_clear_depth_stencil(&stream, depth_target, 0, 0, 0, NULL, 0, NULL) != GPU_IR_INVALID ||
         gpu_ir_record_clear_color(&stream, color_target, clear_rgba, NULL, 1, NULL) != GPU_IR_INVALID ||
         gpu_ir_record_clear_color(&stream, color_target, clear_rgba, NULL, 0, &index) != GPU_IR_OK ||
-        index != 2 || gpu_ir_stream_count(&stream) != 3)
+        index != 2 ||
+        gpu_ir_record_clear_color_typed(&stream, color_target, GPU_IR_CLEAR_COLOR_VALUE_UINT,
+            clear_uint, NULL, 0, &index) != GPU_IR_OK || index != 3 ||
+        gpu_ir_record_clear_color_typed(&stream, color_target, (gpu_ir_clear_color_value_type)3,
+            clear_uint, NULL, 0, NULL) != GPU_IR_INVALID ||
+        gpu_ir_record_clear_color_layers_typed(&stream, color_target, GPU_IR_CLEAR_COLOR_VALUE_UINT,
+            clear_uint, 1, 1, NULL, 0, &index) != GPU_IR_OK || index != 4 ||
+        gpu_ir_record_clear_color_layers_typed(&stream, color_target, GPU_IR_CLEAR_COLOR_VALUE_UINT,
+            clear_uint, 2, 1, NULL, 0, NULL) != GPU_IR_INVALID || gpu_ir_stream_count(&stream) != 5)
         return fail("attachment clear recording accepted invalid inputs or lost command order");
     clear_rects[0] = (gpu_ir_rect){ 99, 99, 100, 100 };
     gpu_ir_resource_release(color_target);
@@ -775,9 +904,17 @@ int main(void) {
         state.clear_texture_id != 61 || state.clear_rectangle_count != 0 ||
         memcmp(state.clear_color, clear_rgba, sizeof clear_rgba))
         return fail("full attachment clear did not preserve an empty rectangle list");
+    if (gpu_ir_execute(&stream, 3, &clear_backend) != GPU_IR_OK || state.clear_color_calls != 3 ||
+        state.clear_texture_id != 61 || state.clear_color_value_type != GPU_IR_CLEAR_COLOR_VALUE_UINT ||
+        state.clear_rectangle_count != 0 || memcmp(state.clear_color_bits, clear_uint, sizeof clear_uint))
+        return fail("typed color clear lost its UINT format or exact component bits");
+    if (gpu_ir_execute(&stream, 4, &clear_backend) != GPU_IR_OK || state.clear_color_calls != 4 ||
+        state.clear_color_value_type != GPU_IR_CLEAR_COLOR_VALUE_UINT || state.clear_base_array_layer != 1 ||
+        state.clear_array_layer_count != 1 || memcmp(state.clear_color_bits, clear_uint, sizeof clear_uint))
+        return fail("layered color clear lost its selected array range or typed values");
     gpu_ir_stream_destroy(&stream);
     if (clear_destroyed != 2) return fail("attachment clears did not retain and release their textures");
-    puts("gpu_ir: color and depth-stencil attachment clears, rectangle snapshots, execution and lifetime: ok");
+    puts("gpu_ir: float and typed-integer color clears, depth-stencil clears, rectangle snapshots and lifetime: ok");
 
     gpu_ir_resource *before = new_buffer(29, 64, &destroyed);
     gpu_ir_resource *after = new_buffer(31, 64, &destroyed);
@@ -998,6 +1135,9 @@ int main(void) {
     gpu_ir_descriptor_value descriptor_values[] = {
         { .set = 0, .binding = 0, .array_element = 2, .kind = GPU_IR_DESCRIPTOR_SAMPLED_IMAGE,
           .stage_mask = GPU_IR_STAGE_FRAGMENT, .access_mask = GPU_IR_ACCESS_SHADER_READ,
+          .component_mapping = (GPU_IR_COMPONENT_SWIZZLE_G << 3) |
+                              (GPU_IR_COMPONENT_SWIZZLE_R << 6) |
+                              (GPU_IR_COMPONENT_SWIZZLE_ONE << 9),
           .resource = descriptor_texture, .backend_object = image_view, .backend_release = release_fake },
         { .set = 0, .binding = 1, .kind = GPU_IR_DESCRIPTOR_SAMPLER, .stage_mask = GPU_IR_STAGE_FRAGMENT,
           .backend_object = sampler_state, .backend_release = release_fake },
@@ -1024,12 +1164,19 @@ int main(void) {
     gpu_ir_descriptor_state_desc invalid_aux_desc = { .values = &invalid_aux_value, .value_count = 1 };
     if (gpu_ir_descriptor_state_create(state_layout, &invalid_aux_desc))
         return fail("an auxiliary buffer access on a non-buffer descriptor was accepted");
+    gpu_ir_descriptor_value invalid_mapping_value = descriptor_values[0];
+    invalid_mapping_value.component_mapping |= 7u << 9;
+    gpu_ir_descriptor_state_desc invalid_mapping_desc = { .values = &invalid_mapping_value, .value_count = 1 };
+    if (gpu_ir_descriptor_state_create(state_layout, &invalid_mapping_desc))
+        return fail("a descriptor component selector outside the common range was accepted");
     gpu_ir_descriptor_state *descriptor_state = gpu_ir_descriptor_state_create(state_layout, &state_desc);
     gpu_ir_descriptor_value auxiliary_value;
     if (!descriptor_state || gpu_ir_descriptor_state_value_count(descriptor_state) != 5 ||
         gpu_ir_descriptor_state_find_for_stage(descriptor_state, 0, 0, 2, 0, GPU_IR_STAGE_VERTEX, &invalid_value) != GPU_IR_OK ||
         invalid_value.range != 112 || gpu_ir_descriptor_state_find(descriptor_state, 2, 0, 0, 0, &invalid_value) != GPU_IR_OK ||
         invalid_value.flags != GPU_IR_DESCRIPTOR_VALUE_NULL ||
+        gpu_ir_descriptor_state_find(descriptor_state, 0, 0, 0, 2, &invalid_value) != GPU_IR_OK ||
+        invalid_value.component_mapping != descriptor_values[0].component_mapping ||
         gpu_ir_descriptor_state_find(descriptor_state, 1, 0, 3, 2, &auxiliary_value) != GPU_IR_OK ||
         auxiliary_value.auxiliary_resource != descriptor_aux_buffer || auxiliary_value.auxiliary_offset != 16 ||
         auxiliary_value.auxiliary_range != 4 ||
@@ -1196,12 +1343,51 @@ int main(void) {
     if (!graphics_native) return fail("graphics pipeline backend setup failed");
     *graphics_native = (fake_resource){ 72, &pipeline_destroyed };
     gpu_ir_pipeline_desc graphics_desc = {
-        .info = { .kind = GPU_IR_PIPELINE_GRAPHICS, .stage_mask = GPU_IR_STAGE_VERTEX },
+        .info = { .kind = GPU_IR_PIPELINE_GRAPHICS, .stage_mask = GPU_IR_STAGE_VERTEX,
+                  .color_blend = {
+                      .attachment_count = 1,
+                      .alpha_to_coverage_enabled = 1,
+                      .blend_constants = { 0.25f, 0.5f, 0.75f, 1.0f },
+                      .attachments = {{
+                          .enabled = 1,
+                          .source_color_factor = GPU_IR_BLEND_FACTOR_SOURCE_ALPHA,
+                          .destination_color_factor = GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+                          .color_operation = GPU_IR_BLEND_OPERATION_ADD,
+                          .source_alpha_factor = GPU_IR_BLEND_FACTOR_ONE,
+                          .destination_alpha_factor = GPU_IR_BLEND_FACTOR_ZERO,
+                          .alpha_operation = GPU_IR_BLEND_OPERATION_ADD,
+                          .write_mask = GPU_IR_COLOR_WRITE_ALL
+                      }}
+                  } },
         .backend_object = graphics_native,
         .release = release_fake
     };
     gpu_ir_pipeline *graphics_pipeline = gpu_ir_pipeline_create(&graphics_desc);
     if (!graphics_pipeline) { free(graphics_native); return fail("valid graphics pipeline was rejected"); }
+    const gpu_ir_pipeline_info *graphics_info = gpu_ir_pipeline_description(graphics_pipeline);
+    if (!graphics_info || graphics_info->color_blend.attachment_count != 1 ||
+        !graphics_info->color_blend.alpha_to_coverage_enabled ||
+        !graphics_info->color_blend.attachments[0].enabled ||
+        graphics_info->color_blend.attachments[0].source_color_factor != GPU_IR_BLEND_FACTOR_SOURCE_ALPHA ||
+        graphics_info->color_blend.attachments[0].destination_color_factor !=
+            GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA || graphics_info->color_blend.blend_constants[2] != 0.75f)
+        return fail("graphics pipeline did not retain API-neutral blend state");
+    gpu_ir_pipeline_desc out_of_range_blend_constant = graphics_desc;
+    out_of_range_blend_constant.info.color_blend.blend_constants[0] = 1.5f;
+    uint32_t unclamped_blend_destroyed = 0;
+    fake_resource *unclamped_blend_native = malloc(sizeof *unclamped_blend_native);
+    if (!unclamped_blend_native) return fail("unclamped blend pipeline backend setup failed");
+    *unclamped_blend_native = (fake_resource){ 73, &unclamped_blend_destroyed };
+    out_of_range_blend_constant.backend_object = unclamped_blend_native;
+    out_of_range_blend_constant.release = release_fake;
+    gpu_ir_pipeline *out_of_range_blend_pipeline = gpu_ir_pipeline_create(&out_of_range_blend_constant);
+    if (!out_of_range_blend_pipeline) { free(unclamped_blend_native); return fail("graphics pipeline rejected an unclamped blend constant"); }
+    gpu_ir_pipeline_release(out_of_range_blend_pipeline);
+    if (unclamped_blend_destroyed != 1) return fail("unclamped blend pipeline did not release its backend object");
+    gpu_ir_pipeline_desc invalid_blend = graphics_desc;
+    invalid_blend.info.color_blend.attachments[0].write_mask = 0x10u;
+    if (gpu_ir_pipeline_create(&invalid_blend)) return fail("graphics pipeline accepted an invalid color write mask");
+    puts("gpu_ir: graphics pipeline retains validated color blend factors, ops, constants and write mask: ok");
     uint32_t access_destroyed = 0;
     gpu_ir_resource *access_buffer = new_buffer(75, 256, &access_destroyed);
     if (!access_buffer) return fail("command access resource setup failed");
@@ -1358,22 +1544,44 @@ int main(void) {
     gpu_ir_pipeline *draw_pipeline = gpu_ir_pipeline_create(&graphics_desc);
     if (!draw_pipeline) { free(draw_native); return fail("draw graphics pipeline was rejected"); }
     gpu_ir_draw_info draw_info = { .topology = GPU_IR_TOPOLOGY_TRIANGLE_STRIP,
-        .vertex_count = 4, .instance_count = 2, .first_vertex = 3, .first_instance = 5 };
+        .vertex_count = 4, .instance_count = 2, .first_vertex = 3, .first_instance = 5,
+        .vertex_buffers_captured = 1,
+        .has_blend_constants = 1, .blend_constants = { 0.2f, 0.4f, 0.6f, 0.8f },
+        .has_viewport = 1, .has_scissor = 1,
+        .viewport = { 2.0f, 3.0f, 32.0f, 24.0f, 0.0f, 1.0f },
+        .scissor = { 4, 5, 16, 12 } };
+    uint32_t draw_index_buffer_destroyed = 0;
+    gpu_ir_resource *draw_index_buffer = new_buffer(85, 64, &draw_index_buffer_destroyed);
+    uint32_t draw_vertex_buffer_destroyed = 0;
+    gpu_ir_resource *draw_vertex_buffer = new_buffer(87, 256, &draw_vertex_buffer_destroyed);
+    draw_info.vertex_buffer_count = 1;
+    draw_info.vertex_buffers[0] = (gpu_ir_vertex_buffer_binding){
+        .binding = 3, .resource = draw_vertex_buffer, .offset = 16, .size = 240, .stride = 24
+    };
     gpu_ir_draw_info indexed_info = { .topology = GPU_IR_TOPOLOGY_LINE_LIST, .indexed = 1,
-        .index_count = 6, .instance_count = 3, .first_index = 7, .first_instance = 9, .vertex_offset = -2 };
+        .index_count = 6, .instance_count = 3, .first_index = 7, .first_instance = 9, .vertex_offset = -2,
+        .index_type = GPU_IR_INDEX_TYPE_UINT16, .index_buffer_offset = 2, .index_buffer = draw_index_buffer,
+        .index_buffer_size = 62,
+        .vertex_buffers_captured = 1,
+        .vertex_buffer_count = 1,
+        .vertex_buffers = { { .binding = 3, .resource = draw_vertex_buffer, .offset = 16,
+                              .size = 240, .stride = 24 } } };
     uint32_t draw_access_destroyed = 0;
     gpu_ir_resource *draw_access_buffer = new_buffer(82, 128, &draw_access_destroyed);
-    if (!draw_access_buffer) return fail("draw resource access setup failed");
+    if (!draw_vertex_buffer || !draw_access_buffer) return fail("draw resource access setup failed");
     gpu_ir_resource_access vertex_access = { draw_access_buffer, GPU_IR_STAGE_VERTEX, GPU_IR_ACCESS_VERTEX_READ };
     gpu_ir_resource_access wrong_draw_access = { draw_access_buffer, GPU_IR_STAGE_FRAGMENT, GPU_IR_ACCESS_SHADER_READ };
     uint32_t indirect_draw_destroyed = 0;
     gpu_ir_resource *indirect_draw_args = new_buffer(83, 48, &indirect_draw_destroyed);
     uint32_t indirect_draw_count_destroyed = 0;
     gpu_ir_resource *indirect_draw_count = new_buffer(84, 8, &indirect_draw_count_destroyed);
+    uint32_t indirect_index_destroyed = 0;
+    gpu_ir_resource *indirect_index_buffer = new_buffer(86, 64, &indirect_index_destroyed);
     gpu_ir_stream_init(&stream);
     gpu_ir_indirect_draw_info indirect_draw_info = { .topology = GPU_IR_TOPOLOGY_TRIANGLE_LIST,
-        .draw_count = 2, .stride = 24, .argument_offset = 12 };
-    if (!indirect_draw_args || !indirect_draw_count ||
+        .draw_count = 2, .stride = 24, .argument_offset = 12,
+        .has_blend_constants = 1, .blend_constants = { 1.0f, 0.5f, 0.25f, 0.0f } };
+    if (!draw_index_buffer || !indirect_draw_args || !indirect_draw_count || !indirect_index_buffer ||
         gpu_ir_record_draw_indirect(&stream, NULL, indirect_draw_args, &indirect_draw_info, NULL) != GPU_IR_INVALID ||
         gpu_ir_record_draw_indirect(&stream, draw_pipeline, indirect_draw_args, &indirect_draw_info, NULL) != GPU_IR_RANGE ||
         gpu_ir_record_draw_with_accesses(&stream, draw_pipeline, &draw_info,
@@ -1409,19 +1617,73 @@ int main(void) {
                                                  .count_offset = 1 }, NULL) != GPU_IR_INVALID) {
         return fail("counted indirect draw did not validate and retain its count buffer");
     }
+    gpu_ir_indirect_draw_info indexed_indirect_info = {
+        .topology = GPU_IR_TOPOLOGY_TRIANGLE_LIST, .indexed = 1,
+        .draw_count = 1, .stride = 20, .argument_offset = 0,
+        .index_buffer = indirect_index_buffer, .index_type = GPU_IR_INDEX_TYPE_UINT16,
+        .has_viewport = 1, .has_scissor = 1, .index_buffer_offset = 2, .index_buffer_size = 62,
+        .viewport = { 1, 2, 32, 24, 0, 1 }, .scissor = { 3, 4, 16, 12 }
+    };
+    gpu_ir_indirect_draw_info out_of_range_indexed_indirect = indexed_indirect_info;
+    out_of_range_indexed_indirect.index_buffer_size = 63;
+    if (gpu_ir_record_draw_indirect(&stream, draw_pipeline, indirect_draw_args,
+                                    &indexed_indirect_info, &pipeline_index) != GPU_IR_OK || pipeline_index != 4)
+        return fail("indexed indirect draw state was not recorded");
     gpu_ir_resource_release(draw_access_buffer);
+    gpu_ir_resource_release(draw_index_buffer);
+    gpu_ir_resource_release(draw_vertex_buffer);
     gpu_ir_resource_release(indirect_draw_args);
     gpu_ir_resource_release(indirect_draw_count);
+    gpu_ir_resource_release(indirect_index_buffer);
     if (draw_access_destroyed) return fail("draw command did not retain its accessed resource");
     if (indirect_draw_destroyed) return fail("indirect draw did not retain its argument buffer");
     if (indirect_draw_count_destroyed) return fail("counted indirect draw did not retain its count buffer");
+    if (indirect_index_destroyed) return fail("indexed indirect draw did not retain its index buffer");
+    if (draw_vertex_buffer_destroyed) return fail("draw command did not retain its vertex buffer");
     gpu_ir_draw_info invalid_draw = draw_info;
     invalid_draw.index_count = 1;
+    gpu_ir_draw_info invalid_raster_draw = draw_info;
+    invalid_raster_draw.viewport.width = 0.0f;
+    gpu_ir_draw_info invalid_raster_flags = draw_info;
+    invalid_raster_flags.has_viewport = 2;
+    gpu_ir_draw_info invalid_draw_blend_flag = draw_info;
+    invalid_draw_blend_flag.has_blend_constants = 2;
+    gpu_ir_draw_info invalid_vertex_capture = draw_info;
+    invalid_vertex_capture.vertex_buffers_captured = 2;
+    gpu_ir_draw_info invalid_indexed_draw = indexed_info;
+    invalid_indexed_draw.index_buffer_offset = 62;
+    gpu_ir_draw_info invalid_index_view_range = indexed_info;
+    invalid_index_view_range.index_buffer_size = 25;
+    gpu_ir_draw_info duplicate_vertex_binding = draw_info;
+    duplicate_vertex_binding.vertex_buffer_count = 2;
+    duplicate_vertex_binding.vertex_buffers[1] = duplicate_vertex_binding.vertex_buffers[0];
+    gpu_ir_draw_info out_of_range_vertex_binding = draw_info;
+    out_of_range_vertex_binding.vertex_buffers[0].offset = 257;
+    gpu_ir_draw_info out_of_range_vertex_view = draw_info;
+    out_of_range_vertex_view.vertex_buffers[0].size = 241;
+    gpu_ir_draw_info too_many_vertex_bindings = draw_info;
+    too_many_vertex_bindings.vertex_buffer_count = GPU_IR_MAX_VERTEX_BUFFERS + 1;
     gpu_ir_indirect_draw_info invalid_indirect_draw = indirect_draw_info;
     invalid_indirect_draw.stride = 8;
+    gpu_ir_indirect_draw_info invalid_indirect_blend_flag = indirect_draw_info;
+    invalid_indirect_blend_flag.has_blend_constants = 2;
     if (gpu_ir_record_draw(&stream, draw_pipeline, &invalid_draw, NULL) != GPU_IR_INVALID ||
+        gpu_ir_record_draw(&stream, draw_pipeline, &invalid_raster_draw, NULL) != GPU_IR_INVALID ||
+        gpu_ir_record_draw(&stream, draw_pipeline, &invalid_raster_flags, NULL) != GPU_IR_INVALID ||
+        gpu_ir_record_draw(&stream, draw_pipeline, &invalid_draw_blend_flag, NULL) != GPU_IR_INVALID ||
+        gpu_ir_record_draw(&stream, draw_pipeline, &invalid_vertex_capture, NULL) != GPU_IR_INVALID ||
+        gpu_ir_record_draw(&stream, draw_pipeline, &invalid_indexed_draw, NULL) != GPU_IR_RANGE ||
+        gpu_ir_record_draw(&stream, draw_pipeline, &invalid_index_view_range, NULL) != GPU_IR_RANGE ||
+        gpu_ir_record_draw(&stream, draw_pipeline, &duplicate_vertex_binding, NULL) != GPU_IR_INVALID ||
+        gpu_ir_record_draw(&stream, draw_pipeline, &out_of_range_vertex_binding, NULL) != GPU_IR_INVALID ||
+        gpu_ir_record_draw(&stream, draw_pipeline, &out_of_range_vertex_view, NULL) != GPU_IR_INVALID ||
+        gpu_ir_record_draw(&stream, draw_pipeline, &too_many_vertex_bindings, NULL) != GPU_IR_INVALID ||
         gpu_ir_record_draw_indirect(&stream, draw_pipeline, indirect_draw_args, &invalid_indirect_draw, NULL) != GPU_IR_INVALID ||
-        gpu_ir_stream_count(&stream) != 4) return fail("inconsistent draw arguments were accepted");
+        gpu_ir_record_draw_indirect(&stream, draw_pipeline, indirect_draw_args,
+                                    &out_of_range_indexed_indirect, NULL) != GPU_IR_RANGE ||
+        gpu_ir_record_draw_indirect(&stream, draw_pipeline, indirect_draw_args,
+                                    &invalid_indirect_blend_flag, NULL) != GPU_IR_INVALID ||
+        gpu_ir_stream_count(&stream) != 5) return fail("inconsistent draw arguments were accepted");
     gpu_ir_pipeline_release(draw_pipeline);
     if (draw_destroyed) return fail("draw stream did not retain its graphics pipeline");
     fake_backend draw_state = { 0 };
@@ -1432,24 +1694,138 @@ int main(void) {
         gpu_ir_execute(&stream, 3, &draw_backend) != GPU_IR_OK ||
         draw_state.draw_calls != 2 || draw_state.draw_indirect_calls != 2 ||
         draw_state.draw_pipeline_id != 81 || draw_state.draws[0].topology != GPU_IR_TOPOLOGY_TRIANGLE_STRIP ||
+        !draw_state.draws[0].has_viewport || !draw_state.draws[0].has_scissor ||
+        !draw_state.draws[0].has_blend_constants || draw_state.draws[0].blend_constants[2] != 0.6f ||
+        draw_state.draws[0].viewport.x != 2.0f || draw_state.draws[0].viewport.width != 32.0f ||
+        draw_state.draws[0].scissor.x != 4 || draw_state.draws[0].scissor.width != 16 ||
         draw_state.draws[0].vertex_count != 4 || draw_state.draws[0].instance_count != 2 ||
         draw_state.draws[0].first_vertex != 3 || draw_state.draws[0].first_instance != 5 ||
+        !draw_state.draws[0].vertex_buffers_captured ||
+        draw_state.draws[0].vertex_buffer_count != 1 || draw_state.draws[0].vertex_buffers[0].binding != 3 ||
+        draw_state.draws[0].vertex_buffers[0].offset != 16 || draw_state.draws[0].vertex_buffers[0].stride != 24 ||
+        draw_state.draws[0].vertex_buffers[0].size != 240 ||
+        ((fake_resource *)gpu_ir_backend_object(draw_state.draws[0].vertex_buffers[0].resource))->id != 87 ||
         draw_state.draw_access_counts[0] != 1 || draw_state.draw_access_resource_ids[0] != 82 ||
         !draw_state.draws[1].indexed || draw_state.draws[1].index_count != 6 ||
+        !draw_state.draws[1].vertex_buffers_captured ||
+        draw_state.draws[1].index_type != GPU_IR_INDEX_TYPE_UINT16 ||
+        draw_state.draws[1].index_buffer_offset != 2 || !draw_state.draws[1].index_buffer ||
+        draw_state.draws[1].index_buffer_size != 62 ||
+        gpu_ir_backend_object(draw_state.draws[1].index_buffer) == NULL ||
+        draw_state.draws[1].vertex_buffer_count != 1 || draw_state.draws[1].vertex_buffers[0].binding != 3 ||
+        ((fake_resource *)gpu_ir_backend_object(draw_state.draws[1].vertex_buffers[0].resource))->id != 87 ||
         draw_state.draws[1].first_index != 7 || draw_state.draws[1].instance_count != 3 ||
         draw_state.draws[1].vertex_offset != -2 || draw_state.draws[1].first_instance != 9 ||
         draw_state.draw_access_counts[1] != 0 || draw_state.draw_indirect_pipeline_id != 81 ||
         draw_state.draw_indirect_arguments_id != 83 || draw_state.draw_indirect_count_id != 84 ||
+        !draw_state.indirect_draw.has_blend_constants || draw_state.indirect_draw.blend_constants[1] != 0.5f ||
         draw_state.indirect_draw.topology != GPU_IR_TOPOLOGY_TRIANGLE_LIST || draw_state.indirect_draw.indexed ||
         draw_state.indirect_draw.draw_count != 2 || draw_state.indirect_draw.stride != 24 ||
         draw_state.indirect_draw.argument_offset != 8 || draw_state.indirect_draw.count_offset != 4 ||
         draw_state.access_resource_id != 82 ||
         draw_state.access_stage_mask != GPU_IR_STAGE_VERTEX || draw_state.access_mask != GPU_IR_ACCESS_VERTEX_READ)
         return fail("draw execution changed graphics pipeline or draw arguments");
+    if (gpu_ir_execute(&stream, 4, &draw_backend) != GPU_IR_OK || draw_state.draw_indirect_calls != 3 ||
+        !draw_state.indirect_draw.indexed || draw_state.indirect_draw.index_type != GPU_IR_INDEX_TYPE_UINT16 ||
+        draw_state.indirect_draw.index_buffer_offset != 2 || !draw_state.indirect_draw.index_buffer ||
+        draw_state.indirect_draw.index_buffer_size != 62 ||
+        ((fake_resource *)gpu_ir_backend_object(draw_state.indirect_draw.index_buffer))->id != 86 ||
+        !draw_state.indirect_draw.has_viewport || !draw_state.indirect_draw.has_scissor ||
+        draw_state.indirect_draw.viewport.x != 1 || draw_state.indirect_draw.scissor.x != 3)
+        return fail("indexed indirect draw execution lost captured Vulkan state");
     gpu_ir_stream_destroy(&stream);
     if (draw_destroyed != 1 || draw_access_destroyed != 1 || indirect_draw_destroyed != 1 ||
-        indirect_draw_count_destroyed != 1)
+        indirect_draw_count_destroyed != 1 || draw_index_buffer_destroyed != 1 || indirect_index_destroyed != 1 ||
+        draw_vertex_buffer_destroyed != 1)
         return fail("draw stream did not release its retained pipeline and accesses");
-    puts("gpu_ir: draw access propagation, indexed arguments, execution and lifetime: ok");
+
+    uint32_t vertex_layout_pipeline_destroyed = 0, vertex_layout_buffer_destroyed = 0;
+    fake_resource *vertex_layout_native = malloc(sizeof *vertex_layout_native);
+    if (!vertex_layout_native) return fail("vertex-layout pipeline backend setup failed");
+    *vertex_layout_native = (fake_resource){ 88, &vertex_layout_pipeline_destroyed };
+    gpu_ir_pipeline_desc vertex_layout_description = {
+        .info = { .kind = GPU_IR_PIPELINE_GRAPHICS, .stage_mask = GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT,
+                  .vertex_input = { .binding_count = 1, .attribute_count = 1,
+                      .bindings = { { .binding = 2, .stride = 16,
+                                      .input_rate = GPU_IR_VERTEX_INPUT_RATE_VERTEX, .step_rate = 1 } },
+                      .attributes = { { .location = 0, .binding = 2,
+                                        .format = GPU_IR_VERTEX_FORMAT_OPAQUE, .offset = 4, .byte_size = 12 } } } },
+        .backend_object = vertex_layout_native, .release = release_fake
+    };
+    gpu_ir_pipeline *vertex_layout_pipeline = gpu_ir_pipeline_create(&vertex_layout_description);
+    gpu_ir_resource *vertex_layout_buffer = new_buffer(89, 64, &vertex_layout_buffer_destroyed);
+    gpu_ir_stream vertex_layout_stream;
+    gpu_ir_stream_init(&vertex_layout_stream);
+    gpu_ir_draw_info vertex_layout_draw = { .topology = GPU_IR_TOPOLOGY_TRIANGLE_LIST,
+        .vertex_count = 3, .instance_count = 1 };
+    if (!vertex_layout_pipeline || !vertex_layout_buffer ||
+        gpu_ir_record_draw(&vertex_layout_stream, vertex_layout_pipeline, &vertex_layout_draw, NULL) != GPU_IR_INVALID) {
+        return fail("draw without a required vertex attribute binding was accepted");
+    }
+    vertex_layout_draw.vertex_buffer_count = 1;
+    vertex_layout_draw.vertex_buffers[0] = (gpu_ir_vertex_buffer_binding){
+        .binding = 2, .resource = vertex_layout_buffer, .offset = 0, .size = 64, .stride = 16
+    };
+    vertex_layout_draw.vertex_buffers_captured = 1;
+    gpu_ir_draw_info out_of_range_vertex_fetch = vertex_layout_draw;
+    out_of_range_vertex_fetch.first_vertex = 1;
+    out_of_range_vertex_fetch.vertex_count = 4;
+    if (gpu_ir_record_draw(&vertex_layout_stream, vertex_layout_pipeline, &vertex_layout_draw, NULL) != GPU_IR_OK ||
+        gpu_ir_record_draw(&vertex_layout_stream, vertex_layout_pipeline, &out_of_range_vertex_fetch, NULL) != GPU_IR_RANGE ||
+        gpu_ir_stream_count(&vertex_layout_stream) != 1)
+        return fail("draw with its required vertex attribute binding was rejected");
+    gpu_ir_pipeline_release(vertex_layout_pipeline);
+    gpu_ir_resource_release(vertex_layout_buffer);
+    gpu_ir_stream_destroy(&vertex_layout_stream);
+    if (vertex_layout_pipeline_destroyed != 1 || vertex_layout_buffer_destroyed != 1)
+        return fail("vertex-layout draw did not release retained objects");
+    uint32_t instance_pipeline_destroyed = 0, instance_buffer_destroyed = 0;
+    fake_resource *instance_native = malloc(sizeof *instance_native);
+    if (!instance_native) return fail("instance-layout pipeline backend setup failed");
+    *instance_native = (fake_resource){ 90, &instance_pipeline_destroyed };
+    gpu_ir_pipeline_desc instance_description = {
+        .info = { .kind = GPU_IR_PIPELINE_GRAPHICS, .stage_mask = GPU_IR_STAGE_VERTEX,
+                  .vertex_input = { .binding_count = 1, .attribute_count = 1,
+                      .bindings = { { .binding = 4, .stride = 8,
+                                      .input_rate = GPU_IR_VERTEX_INPUT_RATE_INSTANCE, .step_rate = 2 } },
+                      .attributes = { { .location = 0, .binding = 4,
+                                        .format = GPU_IR_VERTEX_FORMAT_OPAQUE, .offset = 4, .byte_size = 4 } } } },
+        .backend_object = instance_native, .release = release_fake
+    };
+    gpu_ir_pipeline *instance_pipeline = gpu_ir_pipeline_create(&instance_description);
+    gpu_ir_resource *instance_buffer = new_buffer(91, 32, &instance_buffer_destroyed);
+    gpu_ir_stream instance_stream;
+    gpu_ir_stream_init(&instance_stream);
+    gpu_ir_draw_info instance_draw = { .topology = GPU_IR_TOPOLOGY_TRIANGLE_LIST,
+        .vertex_count = 3, .instance_count = 2, .first_instance = 5,
+        .vertex_buffers_captured = 1, .vertex_buffer_count = 1,
+        .vertex_buffers = { { .binding = 4, .resource = instance_buffer,
+                              .offset = 0, .size = 32 } } };
+    gpu_ir_draw_info out_of_range_instance_fetch = instance_draw;
+    out_of_range_instance_fetch.first_instance = 7;
+    uint32_t instance_arguments_destroyed = 0;
+    gpu_ir_resource *instance_arguments = new_buffer(92, 16, &instance_arguments_destroyed);
+    gpu_ir_indirect_draw_info instance_indirect = { .topology = GPU_IR_TOPOLOGY_TRIANGLE_LIST,
+        .draw_count = 1, .stride = 16, .vertex_buffers_captured = 1, .vertex_buffer_count = 1,
+        .vertex_buffers = { { .binding = 4, .resource = instance_buffer, .size = 32 } } };
+    gpu_ir_indirect_draw_info short_indirect_vertex_view = instance_indirect;
+    short_indirect_vertex_view.vertex_buffers[0].size = 7;
+    if (!instance_pipeline || !instance_buffer ||
+        gpu_ir_record_draw(&instance_stream, instance_pipeline, &instance_draw, NULL) != GPU_IR_OK ||
+        gpu_ir_record_draw(&instance_stream, instance_pipeline, &out_of_range_instance_fetch, NULL) != GPU_IR_RANGE ||
+        !instance_arguments ||
+        gpu_ir_record_draw_indirect(&instance_stream, instance_pipeline, instance_arguments,
+                                    &instance_indirect, NULL) != GPU_IR_OK ||
+        gpu_ir_record_draw_indirect(&instance_stream, instance_pipeline, instance_arguments,
+                                    &short_indirect_vertex_view, NULL) != GPU_IR_RANGE ||
+        gpu_ir_stream_count(&instance_stream) != 2)
+        return fail("per-instance fetch range or step-rate calculation was incorrect");
+    gpu_ir_pipeline_release(instance_pipeline);
+    gpu_ir_resource_release(instance_buffer);
+    gpu_ir_resource_release(instance_arguments);
+    gpu_ir_stream_destroy(&instance_stream);
+    if (instance_pipeline_destroyed != 1 || instance_buffer_destroyed != 1 || instance_arguments_destroyed != 1)
+        return fail("instance-layout draw did not release retained objects");
+    puts("gpu_ir: draw bindings and per-vertex/per-instance fetch bounds, indexed views and lifetime: ok");
     return 0;
 }

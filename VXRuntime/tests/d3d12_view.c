@@ -20,7 +20,21 @@ int main(void) {
     uint32_t words[6] = { 0 };
     d3d12_srv_texture_range12 actual;
     d3d12_uav_texture3d_range12 uav3d;
+    uint32_t component_mapping = UINT32_MAX;
     int failed = 0;
+
+    const uint32_t default_component_mapping = (1u << 12) | (1u << 3) | (2u << 6) | (3u << 9);
+    const uint32_t red_green_zero_one_mapping = (1u << 12) | (4u << 6) | (5u << 9) | 1u;
+    failed += check(d3d12_normalize_srv_component_mapping12(default_component_mapping, &component_mapping) &&
+                    component_mapping == 0,
+                    "D3D12 default SRV swizzle normalizes to identity");
+    failed += check(d3d12_normalize_srv_component_mapping12(red_green_zero_one_mapping, &component_mapping) &&
+                    component_mapping == (GPU_IR_COMPONENT_SWIZZLE_G | (GPU_IR_COMPONENT_SWIZZLE_R << 3) |
+                        (GPU_IR_COMPONENT_SWIZZLE_ZERO << 6) | (GPU_IR_COMPONENT_SWIZZLE_ONE << 9)),
+                    "D3D12 channel selections and constants normalize to common selectors");
+    failed += check(!d3d12_normalize_srv_component_mapping12(0, &component_mapping) &&
+                    !d3d12_normalize_srv_component_mapping12((1u << 12) | (6u << 6), &component_mapping),
+                    "unset D3D12 mapping marker and reserved selectors are rejected");
 
     failed += check(d3d12_default_srv_texture_dimension12(2, 1, 1) == 2 &&
                     d3d12_default_srv_texture_dimension12(2, 4, 1) == 3 &&

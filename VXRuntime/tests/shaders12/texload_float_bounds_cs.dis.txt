@@ -1,0 +1,113 @@
+;
+; Input signature:
+;
+; Name                 Index   Mask Register SysValue  Format   Used
+; -------------------- ----- ------ -------- -------- ------- ------
+; no parameters
+;
+; Output signature:
+;
+; Name                 Index   Mask Register SysValue  Format   Used
+; -------------------- ----- ------ -------- -------- ------- ------
+; no parameters
+; shader hash: 9e63cb880f44c2492d201273458b3bf8
+;
+; Pipeline Runtime Information: 
+;
+; Compute Shader
+; NumThreads=(1,1,1)
+;
+;
+; Buffer Definitions:
+;
+; Resource bind info for 
+; {
+;
+;   [4 x i8] (type annotation not present)
+;
+; }
+;
+;
+; Resource Bindings:
+;
+; Name                                 Type  Format         Dim      ID      HLSL Bind  Count
+; ------------------------------ ---------- ------- ----------- ------- -------------- ------
+;                                   texture     f32          2d      T0             t0     1
+;                                       UAV  struct         r/w      U0             u0     1
+;
+target datalayout = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+target triple = "dxil-ms-dx"
+
+%dx.types.Handle = type { i8* }
+%dx.types.ResRet.f32 = type { float, float, float, float, i32 }
+%"class.Texture2D<float>" = type { float, %"class.Texture2D<float>::mips_type" }
+%"class.Texture2D<float>::mips_type" = type { i32 }
+%"class.RWStructuredBuffer<unsigned int>" = type { i32 }
+
+define void @main() {
+  %1 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 0, i32 0, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %2 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 0, i32 0, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %3 = call %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32 66, %dx.types.Handle %2, i32 0, i32 0, i32 0, i32 undef, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %4 = extractvalue %dx.types.ResRet.f32 %3, 0
+  %5 = bitcast float %4 to i32
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %1, i32 0, i32 0, i32 %5, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %6 = call %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32 66, %dx.types.Handle %2, i32 0, i32 1, i32 0, i32 undef, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %7 = extractvalue %dx.types.ResRet.f32 %6, 0
+  %8 = bitcast float %7 to i32
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %1, i32 1, i32 0, i32 %8, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %9 = call %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32 66, %dx.types.Handle %2, i32 0, i32 2, i32 0, i32 undef, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %10 = extractvalue %dx.types.ResRet.f32 %9, 0
+  %11 = bitcast float %10 to i32
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %1, i32 2, i32 0, i32 %11, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %12 = call %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32 66, %dx.types.Handle %2, i32 0, i32 0, i32 -1, i32 undef, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %13 = extractvalue %dx.types.ResRet.f32 %12, 0
+  %14 = bitcast float %13 to i32
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %1, i32 3, i32 0, i32 %14, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %15 = call %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32 66, %dx.types.Handle %2, i32 1, i32 0, i32 0, i32 undef, i32 undef, i32 undef, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %16 = extractvalue %dx.types.ResRet.f32 %15, 0
+  %17 = bitcast float %16 to i32
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %1, i32 4, i32 0, i32 %17, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %18 = call %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32 66, %dx.types.Handle %2, i32 0, i32 0, i32 1, i32 undef, i32 1, i32 0, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %19 = extractvalue %dx.types.ResRet.f32 %18, 0
+  %20 = bitcast float %19 to i32
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %1, i32 5, i32 0, i32 %20, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  %21 = call %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32 66, %dx.types.Handle %2, i32 0, i32 0, i32 1, i32 undef, i32 -1, i32 0, i32 undef)  ; TextureLoad(srv,mipLevelOrSampleCount,coord0,coord1,coord2,offset0,offset1,offset2)
+  %22 = extractvalue %dx.types.ResRet.f32 %21, 0
+  %23 = bitcast float %22 to i32
+  call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle %1, i32 6, i32 0, i32 %23, i32 undef, i32 undef, i32 undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  ret void
+}
+
+; Function Attrs: nounwind readonly
+declare %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32, %dx.types.Handle, i32, i32, i32, i32, i32, i32, i32) #0
+
+; Function Attrs: nounwind readonly
+declare %dx.types.Handle @dx.op.createHandle(i32, i8, i32, i32, i1) #0
+
+; Function Attrs: nounwind
+declare void @dx.op.bufferStore.i32(i32, %dx.types.Handle, i32, i32, i32, i32, i32, i32, i8) #1
+
+attributes #0 = { nounwind readonly }
+attributes #1 = { nounwind }
+
+!llvm.ident = !{!0}
+!dx.version = !{!1}
+!dx.valver = !{!2}
+!dx.shaderModel = !{!3}
+!dx.resources = !{!4}
+!dx.entryPoints = !{!11}
+
+!0 = !{!"dxcoob 1.8.2405.0"}
+!1 = !{i32 1, i32 0}
+!2 = !{i32 1, i32 8}
+!3 = !{!"cs", i32 6, i32 0}
+!4 = !{!5, !8, null, null}
+!5 = !{!6}
+!6 = !{i32 0, %"class.Texture2D<float>"* undef, !"", i32 0, i32 0, i32 1, i32 2, i32 0, !7}
+!7 = !{i32 0, i32 9}
+!8 = !{!9}
+!9 = !{i32 0, %"class.RWStructuredBuffer<unsigned int>"* undef, !"", i32 0, i32 0, i32 1, i32 12, i1 false, i1 false, i1 false, !10}
+!10 = !{i32 1, i32 4}
+!11 = !{void ()* @main, !"main", null, !4, !12}
+!12 = !{i32 0, i64 16, i32 4, !13}
+!13 = !{i32 1, i32 1, i32 1}

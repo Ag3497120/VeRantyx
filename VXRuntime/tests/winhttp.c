@@ -6,11 +6,42 @@
 #include <string.h>
 
 static SOCKET listener;
-static int server_ok, redirect_ok;
+static int server_ok, redirect_ok, proxy_ok, bypass_ok;
+
+static SOCKET accept_with_timeout(void) {
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(listener, &readable);
+    struct timeval timeout = { 10, 0 };
+    if (select(0, &readable, NULL, NULL, &timeout) <= 0) return INVALID_SOCKET;
+    return accept(listener, NULL, NULL);
+}
+
+static int receive_headers(SOCKET client, char *request, size_t capacity) {
+    size_t used = 0;
+    while (used + 1 < capacity) {
+        int n = recv(client, request + used, (int)(capacity - used - 1), 0);
+        if (n <= 0) break;
+        used += (size_t)n;
+        request[used] = 0;
+        if (strstr(request, "\r\n\r\n")) break;
+    }
+    return (int)used;
+}
+
+static int send_all(SOCKET client, const char *response, size_t size) {
+    size_t sent = 0;
+    while (sent < size) {
+        int n = send(client, response + sent, (int)(size - sent), 0);
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
+    return sent == size;
+}
 
 static DWORD WINAPI serve_one(void *unused) {
     (void)unused;
-    SOCKET client = accept(listener, NULL, NULL);
+    SOCKET client = accept_with_timeout();
     if (client == INVALID_SOCKET) return 1;
     char request[2048] = { 0 };
     int used = 0;
@@ -33,7 +64,7 @@ static DWORD WINAPI serve_one(void *unused) {
     if (!server_ok || sent != (int)sizeof response - 1) return 2;
     // a second connection: GET /go is answered with a redirect; a client whose redirect policy is "never" must see it
     // as the response (nobody serves a third connection, so a client that followed it would fail)
-    client = accept(listener, NULL, NULL);
+    client = accept_with_timeout();
     if (client == INVALID_SOCKET) return 3;
     memset(request, 0, sizeof request);
     used = 0;
@@ -53,7 +84,27 @@ static DWORD WINAPI serve_one(void *unused) {
         sent += n;
     }
     closesocket(client);
-    return redirect_ok && sent == (int)sizeof redirect - 1 ? 0 : 4;
+    if (!redirect_ok || sent != (int)sizeof redirect - 1) return 4;
+
+    // An HTTP proxy receives absolute-form request targets; bypassed hosts go directly to the origin.
+    client = accept_with_timeout();
+    if (client == INVALID_SOCKET) return 5;
+    memset(request, 0, sizeof request);
+    receive_headers(client, request, sizeof request);
+    proxy_ok = strstr(request, "GET http://proxy-target.invalid/via-proxy HTTP/") != NULL;
+    static const char proxy_response[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nproxy";
+    int proxy_sent = send_all(client, proxy_response, sizeof proxy_response - 1);
+    closesocket(client);
+
+    client = accept_with_timeout();
+    if (client == INVALID_SOCKET) return 6;
+    memset(request, 0, sizeof request);
+    receive_headers(client, request, sizeof request);
+    bypass_ok = strstr(request, "GET /bypass HTTP/") != NULL;
+    static const char bypass_response[] = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect";
+    int bypass_sent = send_all(client, bypass_response, sizeof bypass_response - 1);
+    closesocket(client);
+    return proxy_ok && proxy_sent && bypass_ok && bypass_sent ? 0 : 7;
 }
 
 int main(void) {
@@ -89,7 +140,7 @@ int main(void) {
     struct sockaddr_in address = { 0 };
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(listener, (struct sockaddr *)&address, sizeof address) || listen(listener, 1)) return 3;
+    if (bind(listener, (struct sockaddr *)&address, sizeof address) || listen(listener, 4)) return 3;
     int address_size = sizeof address;
     if (getsockname(listener, (struct sockaddr *)&address, &address_size)) return 4;
     HANDLE thread = CreateThread(NULL, 0, serve_one, NULL, 0, NULL);
@@ -143,6 +194,50 @@ int main(void) {
                         WinHttpQueryHeaders(redirected, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX,
                                             location, &location_bytes, WINHTTP_NO_HEADER_INDEX) && wcsstr(location, L"/health?probe=1");
     if (redirected) WinHttpCloseHandle(redirected);
+
+    WCHAR proxy_name[64];
+    swprintf(proxy_name, sizeof proxy_name / sizeof proxy_name[0], L"127.0.0.1:%u", ntohs(address.sin_port));
+    HINTERNET named_session = WinHttpOpen(L"vxrt proxy test", WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                                           proxy_name, L"127.0.0.1;*.bypass.invalid", 0);
+    HINTERNET proxy_connection = named_session ? WinHttpConnect(named_session, L"proxy-target.invalid", 80, 0) : NULL;
+    HINTERNET proxy_request = proxy_connection ? WinHttpOpenRequest(proxy_connection, L"GET", L"/via-proxy", NULL, NULL,
+                                                                     WINHTTP_DEFAULT_ACCEPT_TYPES, 0) : NULL;
+    int named_proxy_seen = proxy_request && WinHttpSendRequest(proxy_request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                           WinHttpReceiveResponse(proxy_request, NULL);
+    DWORD proxy_status = 0, proxy_status_size = sizeof proxy_status;
+    if (named_proxy_seen)
+        named_proxy_seen = WinHttpQueryHeaders(proxy_request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                               WINHTTP_HEADER_NAME_BY_INDEX, &proxy_status, &proxy_status_size,
+                                               WINHTTP_NO_HEADER_INDEX) && proxy_status == 200;
+    char proxy_body[6] = { 0 };
+    DWORD proxy_body_size = 0;
+    if (named_proxy_seen)
+        named_proxy_seen = WinHttpReadData(proxy_request, proxy_body, 5, &proxy_body_size) && proxy_body_size == 5 &&
+                           !memcmp(proxy_body, "proxy", 5);
+    if (proxy_request) WinHttpCloseHandle(proxy_request);
+    if (proxy_connection) WinHttpCloseHandle(proxy_connection);
+
+    HINTERNET bypass_connection = named_session ? WinHttpConnect(named_session, L"127.0.0.1", ntohs(address.sin_port), 0) : NULL;
+    HINTERNET bypass_request = bypass_connection ? WinHttpOpenRequest(bypass_connection, L"GET", L"/bypass", NULL, NULL,
+                                                                       WINHTTP_DEFAULT_ACCEPT_TYPES, 0) : NULL;
+    int bypass_seen = bypass_request && WinHttpSendRequest(bypass_request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                      WinHttpReceiveResponse(bypass_request, NULL);
+    DWORD bypass_status = 0, bypass_status_size = sizeof bypass_status;
+    if (bypass_seen)
+        bypass_seen = WinHttpQueryHeaders(bypass_request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                           WINHTTP_HEADER_NAME_BY_INDEX, &bypass_status, &bypass_status_size,
+                                           WINHTTP_NO_HEADER_INDEX) && bypass_status == 200;
+    char bypass_body[7] = { 0 };
+    DWORD bypass_body_size = 0;
+    if (bypass_seen)
+        bypass_seen = WinHttpReadData(bypass_request, bypass_body, 6, &bypass_body_size) && bypass_body_size == 6 &&
+                      !memcmp(bypass_body, "direct", 6);
+    if (bypass_request) WinHttpCloseHandle(bypass_request);
+    if (bypass_connection) WinHttpCloseHandle(bypass_connection);
+    if (named_session) WinHttpCloseHandle(named_session);
+
     if (request) WinHttpCloseHandle(request);
     if (connection) WinHttpCloseHandle(connection);
     if (session) WinHttpCloseHandle(session);
@@ -152,11 +247,13 @@ int main(void) {
     CloseHandle(thread);
     closesocket(listener);
     WSACleanup();
-    if (!ok || !server_ok || server_exit || !redirect_seen) {
-        fprintf(stderr, "winhttp: local POST / chunked response failed (status=%lu, body=%s, server=%d/%lu, redirect seen=%d status=%lu)\n",
-                status, body, server_ok, server_exit, redirect_seen, redirect_status);
+    if (!ok || !server_ok || server_exit || !redirect_seen || !named_proxy_seen || !proxy_ok ||
+        !bypass_seen || !bypass_ok) {
+        fprintf(stderr, "winhttp: local request failed (status=%lu, body=%s, server=%d/%lu, redirect=%d/%lu, proxy=%d/%d/%lu, bypass=%d/%d/%lu)\n",
+                status, body, server_ok, server_exit, redirect_seen, redirect_status,
+                named_proxy_seen, proxy_ok, proxy_status, bypass_seen, bypass_ok, bypass_status);
         return 1;
     }
-    puts("winhttp: local POST, body upload, status/content headers, chunked reads, a redirect kept as the response: ok");
+    puts("winhttp: local POST, response headers, redirect policy, named proxy routing and bypass: ok");
     return 0;
 }

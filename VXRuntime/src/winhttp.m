@@ -1,12 +1,19 @@
 // winhttp.dll: synchronous HTTP(S) requests for Windows programs, on NSURLSession. Handles follow the WinHTTP
 // session -> connection -> request shape. Responses are buffered so WinHttpReadData can return them in caller chunks.
 #import <Foundation/Foundation.h>
+#import <CFNetwork/CFNetwork.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #include "vx.h"
 #include <stdlib.h>
 #include <string.h>
 
 enum { WH_SESSION = 1, WH_CONNECTION, WH_REQUEST };
+enum {
+    WH_ACCESS_DEFAULT_PROXY = 0,
+    WH_ACCESS_NO_PROXY = 1,
+    WH_ACCESS_NAMED_PROXY = 3,
+    WH_ACCESS_AUTOMATIC_PROXY = 4
+};
 enum {
     ERROR_WINHTTP_TIMEOUT = 12002,
     ERROR_WINHTTP_INVALID_URL = 12005,
@@ -42,6 +49,9 @@ enum {
 typedef struct {
     uint32_t kind;
     char *agent;
+    uint32_t access_type;
+    char *proxy;
+    char *proxy_bypass;
     char *host;
     uint16_t port;
     int secure;
@@ -142,6 +152,108 @@ static void free_ie_proxy_config(winhttp_ie_proxy_config *config) {
     free(config->proxy);
     free(config->proxy_bypass);
     memset(config, 0, sizeof *config);
+}
+
+static NSArray<NSString *> *proxy_tokens(NSString *list) {
+    NSCharacterSet *separators = [NSCharacterSet characterSetWithCharactersInString:@"; \t\r\n"];
+    NSMutableArray<NSString *> *tokens = [NSMutableArray array];
+    for (NSString *token in [list componentsSeparatedByCharactersInSet:separators]) {
+        NSString *trimmed = [token stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length) [tokens addObject:trimmed];
+    }
+    return tokens;
+}
+
+static BOOL parse_proxy_endpoint(NSString *text, NSString **host_out, NSNumber **port_out) {
+    if (!text.length) return NO;
+    NSString *url_text = [text containsString:@"://"] ? text : [@"http://" stringByAppendingString:text];
+    NSURLComponents *components = [NSURLComponents componentsWithString:url_text];
+    NSString *path = components.path;
+    if (!components.host.length || components.user.length || components.password.length ||
+        components.query.length || components.fragment.length || (path.length && ![path isEqualToString:@"/"]))
+        return NO;
+    NSNumber *port = components.port ?: @80;
+    if (port.intValue < 1 || port.intValue > UINT16_MAX) return NO;
+    if (host_out) *host_out = components.host;
+    if (port_out) *port_out = port;
+    return YES;
+}
+
+static BOOL valid_proxy_list(NSString *list) {
+    if (!list.length) return NO;
+    NSArray<NSString *> *tokens = proxy_tokens(list);
+    if (!tokens.count) return NO;
+    for (NSString *token in tokens) {
+        NSRange equals = [token rangeOfString:@"="];
+        NSString *endpoint = token;
+        if (equals.location != NSNotFound) {
+            NSString *target_scheme = [[token substringToIndex:equals.location] lowercaseString];
+            if (![target_scheme isEqualToString:@"http"] && ![target_scheme isEqualToString:@"https"])
+                return NO;
+            endpoint = [token substringFromIndex:equals.location + 1];
+        }
+        if (!parse_proxy_endpoint(endpoint, NULL, NULL)) return NO;
+    }
+    return YES;
+}
+
+static NSString *proxy_endpoint_for_scheme(NSString *list, NSString *scheme) {
+    NSString *generic = nil;
+    NSString *specific = nil;
+    for (NSString *token in proxy_tokens(list)) {
+        NSRange equals = [token rangeOfString:@"="];
+        if (equals.location == NSNotFound) {
+            if (!generic) generic = token;
+            continue;
+        }
+        NSString *target_scheme = [[token substringToIndex:equals.location] lowercaseString];
+        if ([target_scheme isEqualToString:scheme]) specific = [token substringFromIndex:equals.location + 1];
+    }
+    return specific ?: generic;
+}
+
+static BOOL proxy_bypass_matches(NSString *list, NSString *host) {
+    if (!list.length || !host.length) return NO;
+    for (NSString *pattern in proxy_tokens(list)) {
+        if ([pattern caseInsensitiveCompare:@"<local>"] == NSOrderedSame &&
+            [host rangeOfString:@"."].location == NSNotFound) return YES;
+        NSString *expression = [NSRegularExpression escapedPatternForString:pattern];
+        expression = [expression stringByReplacingOccurrencesOfString:@"\\*" withString:@".*"];
+        expression = [expression stringByReplacingOccurrencesOfString:@"\\?" withString:@"."];
+        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:
+            [NSString stringWithFormat:@"^(?:%@)$", expression] options:NSRegularExpressionCaseInsensitive error:nil];
+        if ([regex firstMatchInString:host options:0 range:NSMakeRange(0, host.length)]) return YES;
+    }
+    return NO;
+}
+
+static NSDictionary *direct_proxy_settings(void) {
+    return @{ (__bridge NSString *)kCFNetworkProxiesHTTPEnable: @NO,
+              (__bridge NSString *)kCFNetworkProxiesHTTPSEnable: @NO,
+              (__bridge NSString *)kCFNetworkProxiesSOCKSEnable: @NO };
+}
+
+static NSDictionary *proxy_settings_for_request(const winhttp_handle *handle, NSURL *url) {
+    if (handle->access_type == WH_ACCESS_AUTOMATIC_PROXY) return nil;
+    if (handle->access_type != WH_ACCESS_NAMED_PROXY ||
+        proxy_bypass_matches(string_a(handle->proxy_bypass), url.host)) return direct_proxy_settings();
+
+    NSString *scheme = [url.scheme.lowercaseString isEqualToString:@"https"] ? @"https" : @"http";
+    NSString *endpoint = proxy_endpoint_for_scheme(string_a(handle->proxy), scheme);
+    NSString *proxy_host = nil;
+    NSNumber *proxy_port = nil;
+    if (!parse_proxy_endpoint(endpoint, &proxy_host, &proxy_port)) return direct_proxy_settings();
+    if ([scheme isEqualToString:@"https"])
+        return @{ (__bridge NSString *)kCFNetworkProxiesHTTPEnable: @NO,
+                  (__bridge NSString *)kCFNetworkProxiesHTTPSEnable: @YES,
+                  (__bridge NSString *)kCFNetworkProxiesHTTPSProxy: proxy_host,
+                  (__bridge NSString *)kCFNetworkProxiesHTTPSPort: proxy_port,
+                  (__bridge NSString *)kCFNetworkProxiesSOCKSEnable: @NO };
+    return @{ (__bridge NSString *)kCFNetworkProxiesHTTPEnable: @YES,
+              (__bridge NSString *)kCFNetworkProxiesHTTPProxy: proxy_host,
+              (__bridge NSString *)kCFNetworkProxiesHTTPPort: proxy_port,
+              (__bridge NSString *)kCFNetworkProxiesHTTPSEnable: @NO,
+              (__bridge NSString *)kCFNetworkProxiesSOCKSEnable: @NO };
 }
 
 // WinHTTP's machine default is distinct from the interactive user's Internet proxy settings. The runtime has no
@@ -309,13 +421,13 @@ static BOOL perform_request(winhttp_handle *h) {
         __block NSHTTPURLResponse *response = nil;
         __block NSError *error = nil;
         dispatch_semaphore_t completed = dispatch_semaphore_create(0);
-        NSURLSession *session = [NSURLSession sharedSession];
-        if (h->no_redirect) {
-            static VXNoRedirectDelegate *no_redirect;
-            if (!no_redirect) no_redirect = [VXNoRedirectDelegate new];
-            session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]
-                                                    delegate:no_redirect delegateQueue:nil];
-        }
+        NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
+        NSDictionary *proxy_settings = proxy_settings_for_request(h, url);
+        if (proxy_settings) configuration.connectionProxyDictionary = proxy_settings;
+        static VXNoRedirectDelegate *no_redirect;
+        if (!no_redirect) no_redirect = [VXNoRedirectDelegate new];
+        NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration
+            delegate:h->no_redirect ? no_redirect : nil delegateQueue:nil];
         [[session dataTaskWithRequest:request completionHandler:^(NSData *received,
                                                                                       NSURLResponse *url_response,
                                                                                       NSError *failure) {
@@ -325,7 +437,7 @@ static BOOL perform_request(winhttp_handle *h) {
             dispatch_semaphore_signal(completed);
         }] resume];
         dispatch_semaphore_wait(completed, DISPATCH_TIME_FOREVER);
-        if (h->no_redirect) [session finishTasksAndInvalidate];
+        [session finishTasksAndInvalidate];
         if (error || !response) {
             if (error.code == NSURLErrorTimedOut) vx_set_last_error(ERROR_WINHTTP_TIMEOUT);
             else vx_set_last_error(ERROR_WINHTTP_CANNOT_CONNECT);
@@ -357,16 +469,31 @@ static BOOL perform_request(winhttp_handle *h) {
 
 static WINAPI HANDLE WinHttpOpen(const WCHAR *agent, DWORD access_type, const WCHAR *proxy,
                                  const WCHAR *bypass, DWORD flags) {
-    (void)access_type; (void)proxy; (void)bypass;
     if (flags & 0x10000000u /* WINHTTP_FLAG_ASYNC */) {
         vx_set_last_error(50 /* ERROR_NOT_SUPPORTED */);
+        return NULL;
+    }
+    if ((access_type != WH_ACCESS_DEFAULT_PROXY && access_type != WH_ACCESS_NO_PROXY &&
+         access_type != WH_ACCESS_NAMED_PROXY && access_type != WH_ACCESS_AUTOMATIC_PROXY) ||
+        (access_type == WH_ACCESS_NAMED_PROXY && (!proxy || !valid_proxy_list(string_w(proxy))))) {
+        vx_set_last_error(87 /* ERROR_INVALID_PARAMETER */);
         return NULL;
     }
     winhttp_handle *h = calloc(1, sizeof *h);
     if (!h) { vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     h->kind = WH_SESSION;
+    h->access_type = access_type;
     h->agent = utf8_copy(string_w(agent));
+    // WinHttpOpen ignores proxy and bypass strings for every access type except NAMED_PROXY.
+    h->proxy = access_type == WH_ACCESS_NAMED_PROXY ? utf8_copy(string_w(proxy)) : NULL;
+    h->proxy_bypass = access_type == WH_ACCESS_NAMED_PROXY ? utf8_copy(string_w(bypass)) : NULL;
     h->timeout_ms = 60000;
+    if ((agent && !h->agent) || (access_type == WH_ACCESS_NAMED_PROXY &&
+        ((proxy && !h->proxy) || (bypass && !h->proxy_bypass)))) {
+        free(h->agent); free(h->proxy); free(h->proxy_bypass); free(h);
+        vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     return h;
 }
 
@@ -385,10 +512,18 @@ static WINAPI HANDLE WinHttpConnect(HANDLE session, const WCHAR *server, uint16_
     h->host = utf8_copy(host);
     h->port = port;
     h->agent = copy_string(parent->agent);
+    h->access_type = parent->access_type;
+    h->proxy = copy_string(parent->proxy);
+    h->proxy_bypass = copy_string(parent->proxy_bypass);
     h->timeout_ms = parent->timeout_ms;
     h->connect_timeout_ms = parent->connect_timeout_ms;
     h->send_timeout_ms = parent->send_timeout_ms;
-    if (!h->host) { free(h->agent); free(h); vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (!h->host || (parent->agent && !h->agent) || (parent->proxy && !h->proxy) ||
+        (parent->proxy_bypass && !h->proxy_bypass)) {
+        free(h->host); free(h->agent); free(h->proxy); free(h->proxy_bypass); free(h);
+        vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     return h;
 }
 
@@ -412,11 +547,15 @@ static WINAPI HANDLE WinHttpOpenRequest(HANDLE connection, const WCHAR *verb, co
     if (!h->verb) h->verb = copy_string("GET");
     h->path = utf8_copy(path);
     h->agent = copy_string(parent->agent);
+    h->access_type = parent->access_type;
+    h->proxy = copy_string(parent->proxy);
+    h->proxy_bypass = copy_string(parent->proxy_bypass);
     h->timeout_ms = parent->timeout_ms;
     h->connect_timeout_ms = parent->connect_timeout_ms;
     h->send_timeout_ms = parent->send_timeout_ms;
-    if (!h->host || !h->verb || !h->path || (parent->agent && !h->agent)) {
-        free(h->host); free(h->verb); free(h->path); free(h->agent); free(h);
+    if (!h->host || !h->verb || !h->path || (parent->agent && !h->agent) ||
+        (parent->proxy && !h->proxy) || (parent->proxy_bypass && !h->proxy_bypass)) {
+        free(h->host); free(h->verb); free(h->path); free(h->agent); free(h->proxy); free(h->proxy_bypass); free(h);
         vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
@@ -658,7 +797,7 @@ static WINAPI BOOL WinHttpSetOption(HANDLE handle, DWORD option, void *buffer, D
 static WINAPI BOOL WinHttpCloseHandle(HANDLE handle) {
     winhttp_handle *h = handle;
     if (!h || h->kind < WH_SESSION || h->kind > WH_REQUEST) { vx_set_last_error(12018); return NO; }
-    free(h->agent); free(h->host); free(h->verb); free(h->path); free(h->headers);
+    free(h->agent); free(h->proxy); free(h->proxy_bypass); free(h->host); free(h->verb); free(h->path); free(h->headers);
     free(h->upload); free(h->body);
     h->response_headers = nil;
     h->status_text = nil;

@@ -112,8 +112,10 @@ static int bindless_resource_heap_class(void) {
     int failed = read != (size_t)length || dxil_read(bytes, read, &module) != 0;
     free(bytes);
     if (!failed) failed = dxil_to_msl(&module, &result) != 0;
-    if (!failed && (!result.uses_heap || result.heap_resource_classes != (1u << DXIL_SRV))) {
-        fprintf(stderr, "bindless DXIL heap classes were %#x, expected SRV only\n", result.heap_resource_classes);
+    if (!failed && (!result.uses_heap || result.heap_resource_classes != (1u << DXIL_SRV) ||
+                    result.uses_component_mapping_unsupported_read)) {
+        fprintf(stderr, "bindless DXIL heap classes were %#x, expected SRV only; unsupported comparison read=%d\n",
+                result.heap_resource_classes, result.uses_component_mapping_unsupported_read);
         failed = 1;
     }
     if (failed) fprintf(stderr, "bindless DXIL class translation failed: %s\n", result.error);
@@ -169,9 +171,10 @@ static int translate_sample_mask_fixture(const char *write_path) {
     int failed = read != (size_t)length || dxil_read(bytes, read, &module) != 0;
     free(bytes);
     if (!failed) failed = dxil_to_msl_with_sample_mask(&module, 0x5au, &result) != 0;
-    if (!failed && (!strstr(result.msl, "uint vx_sample_mask [[sample_mask]];") ||
+    if (!failed && (!result.uses_component_mapping_unsupported_read ||
+                    !strstr(result.msl, "uint vx_sample_mask [[sample_mask]];") ||
                     !strstr(result.msl, "vx_out.vx_sample_mask = 0x0000005au;"))) {
-        fprintf(stderr, "DXIL PSO sample-mask lowering was missing from MSL:\n%s\n", result.msl);
+        fprintf(stderr, "DXIL PSO sample-mask lowering or mapped-sampling metadata was missing from MSL:\n%s\n", result.msl);
         failed = 1;
     }
     if (!failed && write_path) {
@@ -708,8 +711,11 @@ static int translate_cube_array_min_lod(const char *write_path) {
                      (unsigned)(cube_array->ops[2] - module.nmodule_values),
                      clamp_id - module.nmodule_values);
             if (!strstr(result.msl, "texturecube_array") || !strstr(result.msl, "#if defined(VXRT_HAS_MIN_LOD_CLAMP)") ||
-                !strstr(result.msl, expected) || !result.uses_min_lod_clamp) {
-                fprintf(stderr, "CubeArray min-LOD lowering missing %s\nMSL:\n%s\n", expected, result.msl);
+                !strstr(result.msl, expected) || !result.uses_min_lod_clamp ||
+                result.uses_component_mapping_unsupported_read ||
+                !strstr(result.msl, "vx_desc_swizzle(float4(")) {
+                fprintf(stderr, "CubeArray min-LOD or filtered-sample component mapping was missing %s\nMSL:\n%s\n",
+                        expected, result.msl);
                 failed = 1;
             }
         }
@@ -952,18 +958,36 @@ static int translate_texture_gathers(const char *write_path) {
         .nmodule_values = MODULE_VALUE_COUNT, .values = module_values, .nfunctions = 1, .functions = &function };
     dxil_msl result = { 0 };
     int failed = dxil_to_msl(&module, &result) != 0;
-    if (!failed && !result.uses_gather) {
-        fprintf(stderr, "DXIL gather shader metadata omitted its use of TextureGather\n");
+    if (!failed && (!result.uses_gather || !result.uses_component_mapping_unsupported_read)) {
+        fprintf(stderr, "DXIL gather shader metadata omitted its gather or component-mapping-unsupported use\n");
         failed = 1;
     }
     const char *required[] = { "texture2d<float>", "texture2d_array<float>", "texturecube<float>",
         "texturecube_array<float>", "depth2d<float>", "depth2d_array<float>", "depthcube<float>",
-        "depthcube_array<float>", ".gather(", ".gather_compare(", "component::z", "int2(1, -1)" };
+        "depthcube_array<float>", ".gather(", ".gather_compare(", "component::z", "int2(1, -1)",
+        "vx_desc_component_selector((device const VxDesc *)", "case 4u:", "float4(1.0f)" };
     for (size_t i = 0; !failed && i < sizeof required / sizeof required[0]; i++) {
         if (!strstr(result.msl, required[i])) {
             fprintf(stderr, "DXIL texture gather MSL missing %s\nMSL:\n%s\n", required[i], result.msl);
             failed = 1;
         }
+    }
+    if (!failed) {
+        dxil_inst gather_only_insts[14];
+        memcpy(gather_only_insts, insts, 13 * sizeof *gather_only_insts);
+        gather_only_insts[13] = insts[17];
+        function.insts = gather_only_insts;
+        function.ninsts = 14;
+        dxil_msl gather_only = { 0 };
+        if (dxil_to_msl(&module, &gather_only) || !gather_only.uses_gather ||
+            gather_only.uses_component_mapping_unsupported_read) {
+            fprintf(stderr, "ordinary DXIL TextureGather was incorrectly marked as component-mapping unsupported: %s\n",
+                    gather_only.error);
+            failed = 1;
+        }
+        dxil_msl_free(&gather_only);
+        function.insts = insts;
+        function.ninsts = 18;
     }
     if (!failed) {
         module_values[V_ONE].u.i = 8;

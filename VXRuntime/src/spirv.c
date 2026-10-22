@@ -109,6 +109,7 @@ static void release_contents(spirv_module *module) {
     for (size_t i = 0; i < module->id_capacity; i++) {
         free(slots[i].literal_words);
         free(slots[i].constituent_ids);
+        free(slots[i].specialization_operand_ids);
         free(slots[i].members);
     }
     free(slots);
@@ -268,6 +269,14 @@ static int parse_execution_mode(spirv_module *module, size_t offset, uint32_t co
         }
         if (opcode == 16) entry->has_local_size_default = 1;
     }
+    return SPIRV_OK;
+}
+
+static int parse_memory_model(spirv_module *module, const uint32_t *words, uint32_t count) {
+    if (!module || !words || count != 3 || module->has_memory_model) return SPIRV_INVALID;
+    module->addressing_model = words[1];
+    module->memory_model = words[2];
+    module->has_memory_model = 1;
     return SPIRV_OK;
 }
 
@@ -442,7 +451,8 @@ static int decoration_is_tracked(uint32_t decoration, int *has_value) {
     case 1: // SpecId
         *has_value = 1;
         return 1;
-    case 2: case 3: case 4: case 5: case 24: case 25: // Block, BufferBlock, RowMajor, ColMajor, access qualifiers
+    case 2: case 3: case 4: case 5: case 13: case 14: case 16: case 17: case 18: case 24: case 25:
+        // Block, BufferBlock, matrix layout, interpolation, invariant and access qualifiers.
         *has_value = 0;
         return 1;
     case 6: case 7: case 11: case 30: case 31: case 32: case 33: case 34: case 35:
@@ -546,6 +556,7 @@ static int parse_group_decorate(spirv_module *module, const uint32_t *words,
 static int parse_constant(spirv_module *module, const uint32_t *words, uint32_t count, uint32_t opcode) {
     uint32_t kind, type_id, result_id, first_literal = 0, literal_count = 0, specialization = 0;
     uint32_t first_constituent = 0, constituent_count = 0;
+    uint32_t specialization_opcode = 0, first_specialization_operand = 0, specialization_operand_count = 0;
     uint64_t bits = 0;
     switch (opcode) {
     case 41: case 42: case 48: case 49: // true/false scalar constants
@@ -579,6 +590,27 @@ static int parse_constant(spirv_module *module, const uint32_t *words, uint32_t 
         first_constituent = 3; constituent_count = count - 3;
         specialization = opcode == 51;
         break;
+    case 52: { // OpSpecConstantOp: currently a scalar 32-bit integer subset.
+        if (count != 6) return SPIRV_INVALID;
+        specialization_opcode = words[3];
+        if (specialization_opcode != 128 && specialization_opcode != 130 && specialization_opcode != 132 &&
+            specialization_opcode != 134 && specialization_opcode != 135 && specialization_opcode != 137 &&
+            (specialization_opcode < 194 || specialization_opcode > 196) &&
+            specialization_opcode != 197 && specialization_opcode != 198 && specialization_opcode != 199)
+            return SPIRV_UNSUPPORTED; // integer arithmetic/division, shifts, and bitwise operations
+        type_id = words[1]; result_id = words[2]; kind = SPIRV_CONSTANT_SCALAR;
+        const spirv_id_record *type = spirv_find_id(module, type_id);
+        if (!type || type->kind != SPIRV_ID_TYPE || type->type_kind != SPIRV_TYPE_INT || type->width != 32)
+            return SPIRV_UNSUPPORTED;
+        if (((specialization_opcode == 134 || specialization_opcode == 137) && type->signedness != 0) ||
+            (specialization_opcode == 135 && type->signedness != 1)) return SPIRV_INVALID;
+        if (!id_in_bound(module, words[4]) || !id_in_bound(module, words[5])) return SPIRV_INVALID;
+        literal_count = 1;
+        first_specialization_operand = 4;
+        specialization_operand_count = 2;
+        specialization = 1;
+        break;
+    }
     default:
         return SPIRV_OK;
     }
@@ -590,13 +622,28 @@ static int parse_constant(spirv_module *module, const uint32_t *words, uint32_t 
     spirv_id_record constant = {
         .id = result_id, .kind = SPIRV_ID_CONSTANT, .type_id = type_id,
         .constant_kind = kind, .is_specialization = specialization,
+        .specialization_opcode = specialization_opcode,
+        .specialization_operand_count = specialization_operand_count,
+        .specialization_evaluation_state = specialization_opcode ? 0u : 2u,
         .literal_word_count = literal_count, .value_bits = bits,
         .constituent_count = constituent_count
     };
     if (literal_count) {
         constant.literal_words = malloc((size_t)literal_count * sizeof *constant.literal_words);
         if (!constant.literal_words) return SPIRV_OUT_OF_MEMORY;
-        memcpy(constant.literal_words, words + first_literal, (size_t)literal_count * sizeof *constant.literal_words);
+        if (specialization_opcode) constant.literal_words[0] = 0;
+        else memcpy(constant.literal_words, words + first_literal,
+                    (size_t)literal_count * sizeof *constant.literal_words);
+    }
+    if (specialization_operand_count) {
+        constant.specialization_operand_ids = malloc((size_t)specialization_operand_count *
+                                                       sizeof *constant.specialization_operand_ids);
+        if (!constant.specialization_operand_ids) {
+            free(constant.literal_words);
+            return SPIRV_OUT_OF_MEMORY;
+        }
+        memcpy(constant.specialization_operand_ids, words + first_specialization_operand,
+               (size_t)specialization_operand_count * sizeof *constant.specialization_operand_ids);
     }
     if (constituent_count) {
         constant.constituent_ids = malloc((size_t)constituent_count * sizeof *constant.constituent_ids);
@@ -610,7 +657,11 @@ static int parse_constant(spirv_module *module, const uint32_t *words, uint32_t 
         }
     }
     int rc = id_table_insert(module, &constant);
-    if (rc != SPIRV_OK) { free(constant.literal_words); free(constant.constituent_ids); }
+    if (rc != SPIRV_OK) {
+        free(constant.literal_words);
+        free(constant.constituent_ids);
+        free(constant.specialization_operand_ids);
+    }
     return rc;
 }
 
@@ -642,6 +693,7 @@ static int apply_one_decoration(spirv_id_record *record, spirv_member_record *me
     switch (decoration->decoration) {
     case 1:
         if (member || record->kind != SPIRV_ID_CONSTANT || !record->is_specialization ||
+            record->specialization_opcode ||
             (record->constant_kind != SPIRV_CONSTANT_SCALAR && record->constant_kind != SPIRV_CONSTANT_BOOL))
             return SPIRV_INVALID;
         value_slot = &record->specialization_id; has_slot = &record->has_specialization_id; break;
@@ -657,6 +709,21 @@ static int apply_one_decoration(spirv_id_record *record, spirv_member_record *me
     case 5:
         if (!member) return SPIRV_INVALID;
         return set_decoration_flag(flags, SPIRV_DECORATION_COL_MAJOR);
+    case 13:
+        if ((!member && record->kind != SPIRV_ID_VARIABLE)) return SPIRV_INVALID;
+        return set_decoration_flag(flags, SPIRV_DECORATION_NO_PERSPECTIVE);
+    case 14:
+        if ((!member && record->kind != SPIRV_ID_VARIABLE)) return SPIRV_INVALID;
+        return set_decoration_flag(flags, SPIRV_DECORATION_FLAT);
+    case 16:
+        if ((!member && record->kind != SPIRV_ID_VARIABLE)) return SPIRV_INVALID;
+        return set_decoration_flag(flags, SPIRV_DECORATION_CENTROID);
+    case 17:
+        if ((!member && record->kind != SPIRV_ID_VARIABLE)) return SPIRV_INVALID;
+        return set_decoration_flag(flags, SPIRV_DECORATION_SAMPLE);
+    case 18:
+        if ((!member && record->kind != SPIRV_ID_VARIABLE)) return SPIRV_INVALID;
+        return set_decoration_flag(flags, SPIRV_DECORATION_INVARIANT);
     case 24: return set_decoration_flag(flags, SPIRV_DECORATION_NON_WRITABLE);
     case 25: return set_decoration_flag(flags, SPIRV_DECORATION_NON_READABLE);
     case 6:
@@ -901,6 +968,105 @@ static int validate_semantic_records(spirv_module *module) {
     return SPIRV_OK;
 }
 
+static int resolve_specialization_constant_value(spirv_module *module, spirv_id_record *constant,
+                                                  uint32_t depth) {
+    if (!module || !constant || constant->kind != SPIRV_ID_CONSTANT) return SPIRV_INVALID;
+    if (!constant->specialization_opcode) return SPIRV_OK;
+    if (constant->specialization_evaluation_state == 2) return SPIRV_OK;
+    if (constant->specialization_evaluation_state == 1 || depth >= module->id_bound ||
+        constant->specialization_operand_count != 2 || !constant->specialization_operand_ids ||
+        constant->literal_word_count != 1 || !constant->literal_words) return SPIRV_INVALID;
+    const spirv_id_record *result_type = spirv_find_id(module, constant->type_id);
+    if (!result_type || result_type->kind != SPIRV_ID_TYPE || result_type->type_kind != SPIRV_TYPE_INT ||
+        result_type->width != 32) return SPIRV_UNSUPPORTED;
+    constant->specialization_evaluation_state = 1;
+    uint32_t operands[2];
+    for (uint32_t i = 0; i < 2; i++) {
+        spirv_id_record *operand = (spirv_id_record *)spirv_find_id(module, constant->specialization_operand_ids[i]);
+        const spirv_id_record *operand_type = operand ? spirv_find_id(module, operand->type_id) : NULL;
+        int shift_amount = i == 1 && constant->specialization_opcode >= 194 &&
+            constant->specialization_opcode <= 196;
+        if (!operand || operand->kind != SPIRV_ID_CONSTANT || operand->constant_kind != SPIRV_CONSTANT_SCALAR ||
+            (!shift_amount && operand->type_id != constant->type_id) ||
+            (shift_amount && (!operand_type || operand_type->kind != SPIRV_ID_TYPE ||
+                              operand_type->type_kind != SPIRV_TYPE_INT || operand_type->width != 32)) ||
+            operand->literal_word_count != 1 || !operand->literal_words) {
+            constant->specialization_evaluation_state = 0;
+            return SPIRV_INVALID;
+        }
+        int rc = resolve_specialization_constant_value(module, operand, depth + 1u);
+        if (rc != SPIRV_OK) { constant->specialization_evaluation_state = 0; return rc; }
+        operands[i] = (uint32_t)operand->value_bits;
+    }
+    uint32_t value;
+    switch (constant->specialization_opcode) {
+    case 128: value = operands[0] + operands[1]; break; // IAdd, modulo 2^32
+    case 130: value = operands[0] - operands[1]; break; // ISub, modulo 2^32
+    case 132: value = operands[0] * operands[1]; break; // IMul, modulo 2^32
+    case 134: // UDiv
+        if (!operands[1]) {
+            constant->specialization_evaluation_state = 0;
+            return SPIRV_UNSUPPORTED; // The SPIR-V result is undefined for a zero divisor.
+        }
+        value = operands[0] / operands[1];
+        break;
+    case 135: { // SDiv
+        if (!operands[1] || (operands[0] == UINT32_C(0x80000000) && operands[1] == UINT32_MAX)) {
+            constant->specialization_evaluation_state = 0;
+            return SPIRV_UNSUPPORTED; // Zero divisors and signed overflow have undefined results.
+        }
+        int64_t dividend = (operands[0] & UINT32_C(0x80000000)) ?
+            (int64_t)operands[0] - INT64_C(0x100000000) : operands[0];
+        int64_t divisor = (operands[1] & UINT32_C(0x80000000)) ?
+            (int64_t)operands[1] - INT64_C(0x100000000) : operands[1];
+        value = (uint32_t)(dividend / divisor);
+        break;
+    }
+    case 137: // UMod
+        if (!operands[1]) {
+            constant->specialization_evaluation_state = 0;
+            return SPIRV_UNSUPPORTED; // The SPIR-V result is undefined for a zero divisor.
+        }
+        value = operands[0] % operands[1];
+        break;
+    case 194: // ShiftRightLogical
+    case 195: // ShiftRightArithmetic
+    case 196: // ShiftLeftLogical
+        if (operands[1] >= 32) {
+            constant->specialization_evaluation_state = 0;
+            return SPIRV_UNSUPPORTED; // The SPIR-V result is poison for an out-of-range shift.
+        }
+        if (constant->specialization_opcode == 194) value = operands[0] >> operands[1];
+        else if (constant->specialization_opcode == 195) {
+            value = operands[1] ? operands[0] >> operands[1] : operands[0];
+            if (operands[1] && (operands[0] & UINT32_C(0x80000000)))
+                value |= UINT32_MAX << (32u - operands[1]);
+        } else value = operands[0] << operands[1];
+        break;
+    case 197: value = operands[0] | operands[1]; break; // BitwiseOr
+    case 198: value = operands[0] ^ operands[1]; break; // BitwiseXor
+    case 199: value = operands[0] & operands[1]; break; // BitwiseAnd
+    default:
+        constant->specialization_evaluation_state = 0;
+        return SPIRV_UNSUPPORTED;
+    }
+    constant->value_bits = value;
+    constant->literal_words[0] = value;
+    constant->specialization_evaluation_state = 2;
+    return SPIRV_OK;
+}
+
+static int resolve_specialization_constant_values(spirv_module *module) {
+    spirv_id_record *slots = id_slots(module);
+    for (size_t i = 0; i < module->id_capacity; i++) {
+        spirv_id_record *constant = &slots[i];
+        if (!constant->id || constant->kind != SPIRV_ID_CONSTANT || !constant->specialization_opcode) continue;
+        int rc = resolve_specialization_constant_value(module, constant, 0);
+        if (rc != SPIRV_OK) return rc;
+    }
+    return SPIRV_OK;
+}
+
 static int resolve_local_size_ids(spirv_module *module) {
     for (uint32_t i = 0; i < module->entry_point_count; i++) {
         spirv_entry_point *entry = &module->entry_points[i];
@@ -972,7 +1138,8 @@ static int instruction_has_typed_result(uint16_t opcode) {
            (opcode >= 109 && opcode <= 124) || (opcode >= 126 && opcode <= 152) ||
            (opcode >= 154 && opcode <= 191) || (opcode >= 194 && opcode <= 205) ||
            (opcode >= 207 && opcode <= 215) || opcode == 227 ||
-           (opcode >= 229 && opcode <= 242) || opcode == 245;
+           (opcode >= 229 && opcode <= 242) || opcode == 245 || opcode == 334 || opcode == 335 ||
+           (opcode >= 352 && opcode <= 357);
 }
 
 // Index function and block boundaries without interpreting the instruction semantics. The saved word ranges
@@ -1228,7 +1395,8 @@ int spirv_read(const void *data, size_t size, spirv_module *module) {
         int rc = SPIRV_OK;
         if (opcode == 54) in_function = 1;
         if (opcode == 56) in_function = 0;
-        if (opcode == 15) rc = parse_entry_point(module, offset, count);
+        if (opcode == 14) rc = parse_memory_model(module, module->words + offset, count);
+        else if (opcode == 15) rc = parse_entry_point(module, offset, count);
         else if (opcode == 16 || opcode == 331) rc = parse_execution_mode(module, offset, count, opcode);
         else if (opcode == 71 || opcode == 72)
             rc = parse_decoration(module, module->words + offset, count, opcode == 72, offset);
@@ -1249,6 +1417,8 @@ int spirv_read(const void *data, size_t size, spirv_module *module) {
     if (rc != SPIRV_OK) return fail(module, rc, "SPIR-V decoration target or operands are invalid");
     rc = validate_semantic_records(module);
     if (rc != SPIRV_OK) return fail(module, rc, "SPIR-V type, variable or decoration references are invalid");
+    rc = resolve_specialization_constant_values(module);
+    if (rc != SPIRV_OK) return fail(module, rc, "SPIR-V specialization expression is malformed or unsupported");
     rc = resolve_local_size_ids(module);
     if (rc != SPIRV_OK) return fail(module, rc, "LocalSizeId does not refer to an integer scalar constant");
     rc = index_function_bodies(module);
@@ -1258,6 +1428,12 @@ int spirv_read(const void *data, size_t size, spirv_module *module) {
     rc = validate_function_branch_targets(module);
     if (rc != SPIRV_OK) return fail(module, rc, "SPIR-V branch target is missing or belongs to another function");
     return SPIRV_OK;
+}
+
+int spirv_vulkan_memory_model_supported(const spirv_module *module) {
+    return module && module->has_memory_model &&
+           module->addressing_model == SPIRV_ADDRESSING_MODEL_LOGICAL &&
+           module->memory_model == SPIRV_MEMORY_MODEL_GLSL450;
 }
 
 const spirv_entry_point *spirv_find_entry_point(const spirv_module *module, const char *name,

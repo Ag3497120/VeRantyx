@@ -37,8 +37,8 @@ run again. The main `EliteDangerous64.exe` was not started, no credentials were 
 login remain untested. The game's own executable remains x64 Direct3D 11; D3D12 and Vulkan are not imported.
 
 WinHTTP currently covers synchronous HTTP(S) request handles, upload, common response headers, buffered response reads
-and timeouts. It exposes the WinHTTP default proxy as a direct connection and maps the active macOS network's
-auto-detect, PAC URL, HTTP/HTTPS/SOCKS proxy and bypass settings through the current-user query API. These query APIs
-are exercised by the local loopback test. Applying an explicit proxy to a request, HTTPS against Frontier,
-asynchronous callbacks and large streaming responses have not been verified. HOTAS input also remains unverified
-without a physical controller.
+and timeouts. A named HTTP/HTTPS proxy is applied to requests, including the supplied bypass list; loopback tests
+verify absolute-form proxy requests and direct requests for bypassed hosts. The default proxy query remains direct,
+and the current-user query maps macOS auto-detect, PAC URL, HTTP/HTTPS/SOCKS proxy and bypass preferences. PAC/WPAD
+resolution, proxy authentication, HTTPS through a proxy, asynchronous callbacks and large streaming responses have
+not been verified. HOTAS input also remains unverified without a physical controller.

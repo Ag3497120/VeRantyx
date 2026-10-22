@@ -240,18 +240,26 @@ static MTLVertexFormat vertex_format(uint32_t dxgi, uint32_t *bytes) {
 // D3D11_INPUT_ELEMENT_DESC: semantic name, semantic index, format, slot, offset, classification, step rate.
 typedef struct { const char *semantic; uint32_t index, format, slot, offset, classification, step; } INPUT_ELEMENT;
 static WINAPI HRESULT device_create_layout(void *this, const INPUT_ELEMENT *els, uint32_t n, const void *code, size_t size, void **out) {
+    if (out) *out = NULL;
+    if ((n && !els) || n > 32 || (n && !code)) return E_INVALIDARG;
     dxbc_element sig[32];
     int nsig = dxbc_input_signature(code, size, sig, 32);
     d3d_layout *l = d3d_alloc(sizeof *l, K_LAYOUT, g_layout_vtbl, this);
     uint32_t next_offset[16] = { 0 };
     for (uint32_t i = 0; i < n && l->n < 32; i++) {
         uint32_t bytes;
+        if (!els[i].semantic || els[i].slot >= 16 || els[i].classification > 1 ||
+            (!els[i].classification && els[i].step)) {
+            vx_log("Direct3D: invalid input-layout semantic, slot, classification, or per-vertex step rate");
+            d3d_release(&l->base);
+            return E_INVALIDARG;
+        }
         if (vertex_format(els[i].format, &bytes) == MTLVertexFormatInvalid) {
             vx_log("Direct3D: vertex format %u is not supported yet", els[i].format);
             d3d_release(&l->base);
             return E_INVALIDARG;
         }
-        uint32_t slot = els[i].slot < 16 ? els[i].slot : 0;
+        uint32_t slot = els[i].slot;
         uint32_t offset = els[i].offset == 0xffffffffu ? next_offset[slot] : els[i].offset;   // D3D11_APPEND_ALIGNED_ELEMENT
         next_offset[slot] = offset + bytes;
         for (int k = 0; k < nsig; k++) {
@@ -888,12 +896,103 @@ static pthread_mutex_t g_pso_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_pso_failed;
 #define PSO_FAILED ((void *)&g_pso_failed)
 static void gpu11_release_mtl_object(void *object) { if (object) CFBridgingRelease(object); }
-static gpu_ir_pipeline *gpu11_render_pipeline_ir(const pso_key *key, void *pso) {
+static uint32_t gpu11_vertex_format_size(uint32_t dxgi) {
+    for (size_t i = 0; i < sizeof g_vertex_formats / sizeof g_vertex_formats[0]; i++)
+        if (g_vertex_formats[i].dxgi == dxgi) return g_vertex_formats[i].bytes;
+    return 0;
+}
+static uint32_t gpu11_blend_factor_ir(uint32_t factor) {
+    switch (factor) {
+    case 1: return GPU_IR_BLEND_FACTOR_ZERO;
+    case 2: return GPU_IR_BLEND_FACTOR_ONE;
+    case 3: return GPU_IR_BLEND_FACTOR_SOURCE_COLOR;
+    case 4: return GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE_COLOR;
+    case 5: return GPU_IR_BLEND_FACTOR_SOURCE_ALPHA;
+    case 6: return GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA;
+    case 7: return GPU_IR_BLEND_FACTOR_DESTINATION_ALPHA;
+    case 8: return GPU_IR_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA;
+    case 9: return GPU_IR_BLEND_FACTOR_DESTINATION_COLOR;
+    case 10: return GPU_IR_BLEND_FACTOR_ONE_MINUS_DESTINATION_COLOR;
+    case 11: return GPU_IR_BLEND_FACTOR_SOURCE_ALPHA_SATURATE;
+    case 14: return GPU_IR_BLEND_FACTOR_CONSTANT_COLOR;
+    case 15: return GPU_IR_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    case 16: return GPU_IR_BLEND_FACTOR_SOURCE1_COLOR;
+    case 17: return GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE1_COLOR;
+    case 18: return GPU_IR_BLEND_FACTOR_SOURCE1_ALPHA;
+    case 19: return GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE1_ALPHA;
+    default: return GPU_IR_BLEND_FACTOR_ONE;
+    }
+}
+
+static uint32_t gpu11_blend_operation_ir(uint32_t operation) {
+    switch (operation) {
+    case 2: return GPU_IR_BLEND_OPERATION_SUBTRACT;
+    case 3: return GPU_IR_BLEND_OPERATION_REVERSE_SUBTRACT;
+    case 4: return GPU_IR_BLEND_OPERATION_MINIMUM;
+    case 5: return GPU_IR_BLEND_OPERATION_MAXIMUM;
+    default: return GPU_IR_BLEND_OPERATION_ADD;
+    }
+}
+
+static gpu_ir_color_blend_state gpu11_color_blend_ir(const d3d_blend *blend) {
+    gpu_ir_color_blend_state state = { 0 };
+    if (!blend) return state;
+    state.attachment_count = 8;
+    state.alpha_to_coverage_enabled = blend->desc[0] != 0;
+    for (uint32_t i = 0; i < 8; i++) {
+        const uint32_t *rt = blend->desc + 2 + 8 * (blend->desc[1] ? i : 0);
+        state.attachments[i] = (gpu_ir_color_blend_attachment){
+            .enabled = rt[0] != 0,
+            .source_color_factor = gpu11_blend_factor_ir(rt[1]),
+            .destination_color_factor = gpu11_blend_factor_ir(rt[2]),
+            .color_operation = gpu11_blend_operation_ir(rt[3]),
+            .source_alpha_factor = gpu11_blend_factor_ir(rt[4]),
+            .destination_alpha_factor = gpu11_blend_factor_ir(rt[5]),
+            .alpha_operation = gpu11_blend_operation_ir(rt[6]),
+            .write_mask = rt[7] & GPU_IR_COLOR_WRITE_ALL
+        };
+    }
+    return state;
+}
+
+static gpu_ir_pipeline *gpu11_render_pipeline_ir(const pso_key *key, void *pso,
+                                                  const d3d_layout *layout, const d3d_blend *blend) {
     if (!pso || pso == PSO_FAILED) return NULL;
+    gpu_ir_vertex_input_desc vertex_input = { 0 };
+    if (layout && key->layout == layout->id) {
+        for (uint32_t i = 0; i < layout->n; i++) {
+            const layout_attr *attribute = &layout->attr[i];
+            uint32_t byte_size = gpu11_vertex_format_size(attribute->format);
+            if (!byte_size || attribute->slot >= GPU_IR_MAX_VERTEX_BUFFERS) return NULL;
+            uint32_t binding_index = 0;
+            while (binding_index < vertex_input.binding_count &&
+                   vertex_input.bindings[binding_index].binding != attribute->slot) binding_index++;
+            uint32_t input_rate = attribute->instanced ? GPU_IR_VERTEX_INPUT_RATE_INSTANCE : GPU_IR_VERTEX_INPUT_RATE_VERTEX;
+            uint32_t step_rate = attribute->instanced ? (attribute->step ? attribute->step : 1) : 1;
+            if (binding_index == vertex_input.binding_count) {
+                if (binding_index >= GPU_IR_MAX_VERTEX_BUFFERS) return NULL;
+                vertex_input.bindings[vertex_input.binding_count++] = (gpu_ir_vertex_binding_desc){
+                    .binding = attribute->slot,
+                    .stride = key->stride[attribute->slot] & 0x7fffffffu,
+                    .input_rate = input_rate,
+                    .step_rate = step_rate
+                };
+            } else if (vertex_input.bindings[binding_index].input_rate != input_rate ||
+                       vertex_input.bindings[binding_index].step_rate != step_rate) return NULL;
+            if (vertex_input.attribute_count >= GPU_IR_MAX_VERTEX_ATTRIBUTES) return NULL;
+            vertex_input.attributes[vertex_input.attribute_count++] = (gpu_ir_vertex_attribute_desc){
+                .location = attribute->reg, .binding = attribute->slot,
+                .format = GPU_IR_VERTEX_FORMAT_OPAQUE, .offset = attribute->offset,
+                .byte_size = byte_size
+            };
+        }
+    }
     gpu_ir_pipeline_desc desc = {
         .info = { .kind = GPU_IR_PIPELINE_GRAPHICS,
                   .stage_mask = GPU_IR_STAGE_VERTEX | (key->vs & 0x80000000u ? GPU_IR_STAGE_GEOMETRY : 0) |
-                                (key->ps ? GPU_IR_STAGE_FRAGMENT : 0) },
+                                (key->ps ? GPU_IR_STAGE_FRAGMENT : 0),
+                  .vertex_input = vertex_input,
+                  .color_blend = gpu11_color_blend_ir(blend) },
         .backend_object = (void *)CFBridgingRetain((__bridge id)pso),
         .release = gpu11_release_mtl_object
     };
@@ -925,7 +1024,8 @@ static gpu_ir_pipeline *pso_gpu_ir_find(const pso_key *k) {
     pthread_mutex_unlock(&g_pso_lock);
     return pipeline;
 }
-static void pso_add(const pso_key *k, void *pso) {  // with g_pso_lock held; pso retained
+static void pso_add(const pso_key *k, void *pso, const d3d_layout *layout,
+                    const d3d_blend *blend) {  // with g_pso_lock held; pso retained
     if (2 * (g_pso_count + 1) > g_pso_cap) {
         size_t cap = g_pso_cap ? 2 * g_pso_cap : 256;
         pso_entry *old = g_psos, *grown = calloc(cap, sizeof *grown);
@@ -939,7 +1039,7 @@ static void pso_add(const pso_key *k, void *pso) {  // with g_pso_lock held; pso
     }
     size_t i = pso_hash(k) & (g_pso_cap - 1);
     while (g_psos[i].pso) i = (i + 1) & (g_pso_cap - 1);
-    g_psos[i] = (pso_entry){ *k, pso, gpu11_render_pipeline_ir(k, pso) };
+    g_psos[i] = (pso_entry){ *k, pso, gpu11_render_pipeline_ir(k, pso, layout, blend) };
     g_pso_count++;
 }
 // The geometry path's other functions, compiled the first time a draw needs them: a geometry shader's
@@ -1078,13 +1178,13 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
     if (!ps_state) {
         vx_log("Direct3D: pipeline state failed: %s", err.localizedDescription.UTF8String);
         pthread_mutex_lock(&g_pso_lock);
-        if (!pso_find(&key)) pso_add(&key, PSO_FAILED);
+        if (!pso_find(&key)) pso_add(&key, PSO_FAILED, s->layout, s->blend);
         pthread_mutex_unlock(&g_pso_lock);
         return nil;
     }
     pthread_mutex_lock(&g_pso_lock);
     void *kept = pso_find(&key);                       // another thread may have made the same one meanwhile
-    if (!kept) pso_add(&key, kept = (void *)CFBridgingRetain(ps_state));
+    if (!kept) pso_add(&key, kept = (void *)CFBridgingRetain(ps_state), s->layout, s->blend);
     pthread_mutex_unlock(&g_pso_lock);
     s->last_key = key; s->last_pso = kept;
     return (__bridge id<MTLRenderPipelineState>)kept;
@@ -1880,6 +1980,56 @@ static MTLPrimitiveType gpu11_mtl_topology(uint32_t topology) {
     }
 }
 typedef struct { d3d_context *context; d3d_draw_state *state; id<MTLRenderCommandEncoder> encoder; } gpu11_draw_context;
+static void gpu11_release_draw_bindings(gpu_ir_draw_info *draw) {
+    if (!draw) return;
+    for (uint32_t i = 0; i < draw->vertex_buffer_count; i++)
+        gpu_ir_resource_release(draw->vertex_buffers[i].resource);
+    gpu_ir_resource_release(draw->index_buffer);
+    draw->vertex_buffer_count = 0;
+    draw->index_buffer = NULL;
+}
+static int gpu11_capture_draw_bindings(d3d_draw_state *state, const gpu_ir_pipeline *pipeline,
+                                       gpu_ir_draw_info *draw) {
+    const gpu_ir_pipeline_info *info = gpu_ir_pipeline_description(pipeline);
+    if (!state || !info || !draw || info->kind != GPU_IR_PIPELINE_GRAPHICS) return GPU_IR_INVALID;
+    draw->vertex_buffers_captured = 1;
+    for (uint32_t i = 0; i < info->vertex_input.binding_count; i++) {
+        uint32_t slot = info->vertex_input.bindings[i].binding;
+        if (slot >= 16 || !state->vb[slot]) {
+            gpu11_release_draw_bindings(draw);
+            return GPU_IR_INVALID;
+        }
+        gpu_ir_resource *resource = d3d11_gpu_ir_resource(&state->vb[slot]->base);
+        uint64_t size = gpu_ir_buffer_size(resource), offset = state->offset[slot];
+        if (!resource || offset >= size || draw->vertex_buffer_count >= GPU_IR_MAX_VERTEX_BUFFERS) {
+            gpu_ir_resource_release(resource);
+            gpu11_release_draw_bindings(draw);
+            return GPU_IR_RANGE;
+        }
+        draw->vertex_buffers[draw->vertex_buffer_count++] = (gpu_ir_vertex_buffer_binding){
+            .binding = slot, .resource = resource, .offset = offset, .size = size - offset,
+            .stride = state->stride[slot]
+        };
+    }
+    if (draw->indexed) {
+        if (!state->ib || (state->ib_format != 42 && state->ib_format != 57)) {
+            gpu11_release_draw_bindings(draw);
+            return GPU_IR_INVALID;
+        }
+        gpu_ir_resource *resource = d3d11_gpu_ir_resource(&state->ib->base);
+        uint64_t size = gpu_ir_buffer_size(resource), offset = state->ib_offset;
+        if (!resource || offset >= size) {
+            gpu_ir_resource_release(resource);
+            gpu11_release_draw_bindings(draw);
+            return GPU_IR_RANGE;
+        }
+        draw->index_buffer = resource;
+        draw->index_buffer_offset = offset;
+        draw->index_buffer_size = size - offset;
+        draw->index_type = state->ib_format == 42 ? GPU_IR_INDEX_TYPE_UINT32 : GPU_IR_INDEX_TYPE_UINT16;
+    }
+    return GPU_IR_OK;
+}
 static int gpu11_emit_draw(gpu11_draw_context *context, void *pipeline, const gpu_ir_draw_info *draw) {
     if (!context || !context->state || !context->encoder || !draw ||
         context->state->bound.pso != pipeline) return GPU_IR_INVALID;
@@ -1888,6 +2038,11 @@ static int gpu11_emit_draw(gpu11_draw_context *context, void *pipeline, const gp
     if (!draw->instance_count || (draw->indexed ? !draw->index_count : !draw->vertex_count)) return GPU_IR_OK;
     d3d_draw_state *s = context->state;
     id<MTLRenderCommandEncoder> enc = context->encoder;
+    if (draw->has_blend_constants && memcmp(s->bound.blend, draw->blend_constants, sizeof s->bound.blend)) {
+        [enc setBlendColorRed:draw->blend_constants[0] green:draw->blend_constants[1]
+                         blue:draw->blend_constants[2] alpha:draw->blend_constants[3]];
+        memcpy(s->bound.blend, draw->blend_constants, sizeof s->bound.blend);
+    }
     if (!draw->indexed) {
         [enc drawPrimitives:topology vertexStart:draw->first_vertex vertexCount:draw->vertex_count
               instanceCount:draw->instance_count baseInstance:draw->first_instance];
@@ -1928,15 +2083,19 @@ static void gpu11_draw(d3d_context *c, d3d_draw_state *s, id<MTLRenderCommandEnc
         .vertex_count = indexed ? 0 : vertex_count, .index_count = indexed ? index_count : 0,
         .instance_count = instance_count,
         .first_vertex = indexed ? 0 : first_vertex, .first_index = indexed ? first_index : 0,
-        .first_instance = first_instance, .vertex_offset = indexed ? vertex_offset : 0
+        .first_instance = first_instance, .vertex_offset = indexed ? vertex_offset : 0,
+        .has_blend_constants = 1,
+        .blend_constants = { s->blend_factor[0], s->blend_factor[1], s->blend_factor[2], s->blend_factor[3] }
     };
     if (pipeline) {
+        int has_work = instance_count && (indexed ? index_count : vertex_count);
+        int capture_rc = has_work ? gpu11_capture_draw_bindings(s, pipeline, &draw) : GPU_IR_OK;
         gpu_ir_stream_clear(&s->gpu_ir);
         gpu11_resource_access_set accesses = { 0 };
         uint32_t command = GPU_IR_NO_COMMAND;
-        int rc = gpu11_collect_draw_accesses(c, s, pipeline, &draw, &accesses) ?
+        int rc = capture_rc == GPU_IR_OK && gpu11_collect_draw_accesses(c, s, pipeline, &draw, &accesses) ?
             gpu_ir_record_draw_with_accesses(&s->gpu_ir, pipeline, &draw, accesses.accesses, accesses.count, &command) :
-            GPU_IR_INVALID;
+            capture_rc == GPU_IR_OK ? GPU_IR_INVALID : capture_rc;
         gpu11_resource_accesses_clear(&accesses);
         if (rc == GPU_IR_OK && command != GPU_IR_NO_COMMAND) {
             gpu11_draw_context context = { c, s, enc };
@@ -1944,6 +2103,7 @@ static void gpu11_draw(d3d_context *c, d3d_draw_state *s, id<MTLRenderCommandEnc
             rc = gpu_ir_execute(&s->gpu_ir, command, &backend);
         }
         gpu_ir_stream_clear(&s->gpu_ir);
+        gpu11_release_draw_bindings(&draw);
         gpu_ir_pipeline_release(pipeline);
         if (rc == GPU_IR_OK) return;
         static int warned;

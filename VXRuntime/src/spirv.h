@@ -34,6 +34,11 @@ enum {
 };
 
 enum {
+    SPIRV_ADDRESSING_MODEL_LOGICAL = 0,
+    SPIRV_MEMORY_MODEL_GLSL450 = 1
+};
+
+enum {
     SPIRV_ID_TYPE = 1,
     SPIRV_ID_CONSTANT,
     SPIRV_ID_VARIABLE,
@@ -89,7 +94,12 @@ enum {
     SPIRV_DECORATION_NON_WRITABLE = 1u << 2,
     SPIRV_DECORATION_NON_READABLE = 1u << 3,
     SPIRV_DECORATION_ROW_MAJOR = 1u << 4,
-    SPIRV_DECORATION_COL_MAJOR = 1u << 5
+    SPIRV_DECORATION_COL_MAJOR = 1u << 5,
+    SPIRV_DECORATION_NO_PERSPECTIVE = 1u << 6,
+    SPIRV_DECORATION_FLAT = 1u << 7,
+    SPIRV_DECORATION_CENTROID = 1u << 8,
+    SPIRV_DECORATION_SAMPLE = 1u << 9,
+    SPIRV_DECORATION_INVARIANT = 1u << 10
 };
 
 typedef struct {
@@ -111,6 +121,10 @@ typedef struct {
     uint32_t element_count;       // vector/matrix component count
     uint32_t constant_kind;
     uint32_t is_specialization;
+    uint32_t specialization_opcode;             // Embedded opcode for OpSpecConstantOp; zero for literal constants.
+    uint32_t specialization_operand_count;
+    uint32_t *specialization_operand_ids;
+    uint32_t specialization_evaluation_state;   // 0 pending, 1 resolving, 2 resolved.
     uint32_t literal_word_count;
     uint32_t *literal_words;      // little-word-order payload for scalar literal constants
     uint32_t constituent_count;
@@ -175,6 +189,9 @@ typedef struct {
     uint32_t generator;
     uint32_t id_bound;
     uint32_t schema;
+    uint32_t has_memory_model;
+    uint32_t addressing_model;
+    uint32_t memory_model;
     uint32_t *words;             // canonical host-endian copy; includes the five-word module header
     size_t word_count;
     size_t instruction_count;
@@ -220,6 +237,8 @@ typedef struct {
 // Returns SPIRV_OK or an error with a human-readable module->error. Accepts byte streams in either endian order.
 int spirv_read(const void *data, size_t size, spirv_module *module);
 void spirv_free(spirv_module *module);
+// This Vulkan 1.0 frontend supports the Logical + GLSL450 SPIR-V memory model only.
+int spirv_vulkan_memory_model_supported(const spirv_module *module);
 const spirv_entry_point *spirv_find_entry_point(const spirv_module *module, const char *name,
                                                  uint32_t execution_model);
 const spirv_id_record *spirv_find_id(const spirv_module *module, uint32_t id);

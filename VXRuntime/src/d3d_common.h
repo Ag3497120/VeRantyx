@@ -9,6 +9,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #include "ui.h"
 #include "gpu_ir.h"
+#include "d3d_format.h"
 
 typedef int32_t HRESULT;
 typedef struct { DWORD d1; uint16_t d2, d3; uint8_t d4[8]; } GUID;
@@ -67,7 +68,6 @@ MTLPixelFormat d3d_mtl_format(uint32_t dxgi, uint32_t *bytes_per_pixel);
 int            d3d_is_srgb(uint32_t dxgi);
 int            d3d_copy_format_block(uint32_t dxgi, uint32_t *block_width, uint32_t *block_height,
                                       uint32_t *bytes_per_block);
-int            d3d_copy_formats_compatible(uint32_t source, uint32_t destination);
 
 // D3D11_TEXTURE2D_DESC as eleven 32-bit fields.
 enum { TD_WIDTH, TD_HEIGHT, TD_MIPS, TD_ARRAY, TD_FORMAT, TD_SAMPLES, TD_QUALITY, TD_USAGE, TD_BIND, TD_CPU, TD_MISC, TD_COUNT };

@@ -16,7 +16,9 @@ enum {
     DXIL_MSL_DESC_RAW = 1u,
     DXIL_MSL_DESC_HAS_COUNTER = 2u,
     DXIL_MSL_DESC_HAS_MIN_LOD_CLAMP = 4u,
-    DXIL_MSL_DESC_HAS_W_SLICE_RANGE = 8u
+    DXIL_MSL_DESC_HAS_W_SLICE_RANGE = 8u,
+    DXIL_MSL_DESC_COMPONENT_MAPPING_SHIFT = 8u,
+    DXIL_MSL_DESC_COMPONENT_MAPPING_MASK = 0x1fffu << DXIL_MSL_DESC_COMPONENT_MAPPING_SHIFT
 };
 enum {
     DXIL_MSL_ACCESS_READ = 1u,
@@ -52,6 +54,7 @@ typedef struct {
     int uses_min_lod_clamp;  // A DXIL sample instruction carries its own non-undef min-LOD operand.
     int uses_gather;         // Metal gather has no per-operation min-LOD clamp overload.
     int uses_texture_load;   // ResourceMinLODClamp still rejects integer-coordinate reads without a matching clamp path.
+    int uses_component_mapping_unsupported_read; // SampleCmp and GatherCmp need API-specific component handling.
     int uses_thread_fence;   // MSL atomic_thread_fence requires Metal shading language 3.2.
     uint32_t heap_resource_classes; // bitset of DXIL_SRV / DXIL_UAV / DXIL_CBV descriptors used from ResourceDescriptorHeap
     uint32_t ninputs, noutputs;

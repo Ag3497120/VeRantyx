@@ -1030,11 +1030,24 @@ static BOOL32 di_dev_sample(di_device *self) {
 
 static HRESULT WINAPI di_dev_get_state(di_device *self, DWORD bytes, void *state) {
     if (!self->acquired) return DIERR_NOTACQUIRED;
+    if (self->sys) {
+        if (!state || bytes < self->format_size) return VX_DI_E_INVALIDARG;
+        sys_sample(self, 1);
+        memset(state, 0, bytes);
+        if (self->sys == SYS_KEYBOARD) memcpy(state, self->sys_keys, bytes < 256 ? bytes : 256);
+        else {                                                           // DIMOUSESTATE(2): x, y, z, then the buttons
+            if (bytes >= 12) memcpy(state, self->sys_moved, 12);
+            memset(self->sys_moved, 0, sizeof self->sys_moved);
+            for (DWORD i = 0; i < 8 && 12 + i < bytes; i++) ((uint8_t *)state)[12 + i] = self->sys_buttons[i];
+        }
+        return VX_DI_S_OK;
+    }
     if (!state || !self->format_set || bytes < self->format_size) return VX_DI_E_INVALIDARG;
     if (!di_dev_sample(self)) return DIERR_INPUTLOST;
     memset(state, 0, self->format_size);
     for (DWORD i = 0; i < self->format_count; i++) {
         diobject *object = &self->format[i];
+        if (object->source_index == UINT32_MAX) continue;
         if (object->offset >= self->format_size) continue;
         uint32_t kind = object->type & 0xffu;
         uint8_t *target = (uint8_t *)state + object->offset;

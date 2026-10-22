@@ -27,6 +27,7 @@
 #include "dxil_ir.h"
 #include "gpu_ir.h"
 #include "gpu_ir_metal.h"
+#include "gpu_ir_msl.h"
 #include <float.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -37,6 +38,7 @@
 
 enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG, K12_MEMHEAP, K12_QUERYHEAP, K12_COMMAND_SIGNATURE };
 #define D3D12_ALL_SUBRESOURCES UINT32_MAX
+enum { D3D12_LAYOUT_UNKNOWN12 = 0, D3D12_LAYOUT_ROW_MAJOR12 = 1 };
 enum { D3D12_RESOLVE_MODE_MIN12 = 1, D3D12_RESOLVE_MODE_MAX12 = 2, D3D12_RESOLVE_MODE_AVERAGE12 = 3 };
 enum {
     D3D12_STATE_VERTEX_CONSTANT = 0x00000001u,
@@ -82,6 +84,7 @@ typedef struct { RES_DESC resource; struct { uint32_t Width, Height, Depth; } sa
 _Static_assert(__builtin_offsetof(RES_DESC1, sampler_feedback_mip_region) == sizeof(RES_DESC),
                "D3D12_RESOURCE_DESC1 mip-region ABI layout");
 static int resource_alignment12(const RES_DESC *desc, uint64_t *alignment);
+static int d3d12_resolve_typeless(uint32_t format);
 typedef struct { const void *code; size_t size; } BYTECODE;
 typedef struct { void *root; BYTECODE cs; uint32_t node; const void *cached; size_t cached_size; int32_t flags; } COMPUTE_PSO_DESC;
 typedef struct { uint64_t location; uint32_t size; } CBV_DESC;
@@ -315,6 +318,8 @@ typedef struct {
     dxil_msl msl;                    // the translation's slots and thread counts (msl.msl freed)
     // graphics
     id<MTLRenderPipelineState> render;
+    gpu_ir_shader *common_ir_vertex;
+    gpu_ir_shader *common_ir_fragment;
     id<MTLDepthStencilState> depth;
     dxil_msl vs, ps;                 // their slots
     MTLCullMode cull;
@@ -371,10 +376,16 @@ typedef struct {
     pso12 *recording_pso;
     uint32_t recording_topology;
     int recording_topology_set;
+    float recording_blend_factor[4];
+    VBV recording_vertex_buffers[16];
+    IBV recording_index_buffer;
     gpu_ir_stream gpu_ir;
     int closed;
     int32_t validation_error;
 } list12;
+
+static int list_capture_draw_buffers12(list12 *list, gpu_ir_draw_info *draw);
+static void list_release_captured_draw_buffers12(gpu_ir_draw_info *draw);
 
 static d3d_object *obj(void *this) { return (d3d_object *)this; }
 
@@ -434,6 +445,9 @@ typedef struct { int32_t type; uint32_t count, base, space, offset; } RANGE10;
 typedef struct { int32_t type; uint32_t count, base, space; int32_t flags; uint32_t offset; } RANGE11;
 typedef struct { int32_t type; uint32_t pad; union { struct { uint32_t n; uint32_t pad2; const void *ranges; } table; struct { uint32_t reg, space, n32; } constants; struct { uint32_t reg, space; int32_t flags; } desc; }; int32_t visibility; uint32_t pad3; } PARAM;
 typedef struct { int32_t filter, u, v, w; float bias; uint32_t aniso; int32_t cmp, border; float min_lod, max_lod; uint32_t reg, space; int32_t visibility; } STATIC_SAMPLER;
+typedef struct { STATIC_SAMPLER sampler; uint32_t flags; } STATIC_SAMPLER1;
+_Static_assert(sizeof(STATIC_SAMPLER) == 52, "RTS0 v1 static sampler layout");
+_Static_assert(sizeof(STATIC_SAMPLER1) == 56, "RTS0 v3 static sampler layout");
 typedef struct { uint32_t nparams; uint32_t pad; const PARAM *params; uint32_t nsamplers; uint32_t pad2; const STATIC_SAMPLER *samplers; int32_t flags; } RS_DESC;
 typedef struct { int32_t version; uint32_t pad; RS_DESC desc; } VERSIONED_RS_DESC;
 
@@ -445,10 +459,10 @@ static void b_u32(bytes *b, uint32_t v) {
 }
 static void b_set(bytes *b, size_t at, uint32_t v) { memcpy(b->p + at, &v, 4); }
 
-// Writes RTS0 (version 1: 1.0 ranges, 2: 1.1) in a DXBC container with one chunk, as D3D12SerializeRootSignature does.
+// Writes RTS0 (version 1: 1.0, 2: 1.1, 3: 1.2) in a DXBC container with one chunk.
 static blob12 *serialize_rootsig(int version, const RS_DESC *d) {
     bytes r = { 0 };
-    b_u32(&r, version == 1 ? 1 : 2);
+    b_u32(&r, (uint32_t)version);
     b_u32(&r, d->nparams);
     b_u32(&r, 24);
     b_u32(&r, d->nsamplers);
@@ -482,8 +496,12 @@ static blob12 *serialize_rootsig(int version, const RS_DESC *d) {
     }
     b_set(&r, 16, d->nsamplers ? (uint32_t)r.n : 0);
     for (uint32_t i = 0; i < d->nsamplers; i++) {
-        const uint32_t *s = (const uint32_t *)&d->samplers[i];
-        for (int k = 0; k < 13; k++) b_u32(&r, s[k]);
+        uint32_t fields[14] = { 0 };
+        size_t sampler_size = version == 3 ? sizeof(STATIC_SAMPLER1) : sizeof(STATIC_SAMPLER);
+        const void *sampler = version == 3 ? (const void *)&((const STATIC_SAMPLER1 *)d->samplers)[i] :
+                                                  (const void *)&d->samplers[i];
+        memcpy(fields, sampler, sampler_size);
+        for (size_t k = 0; k < sampler_size / sizeof fields[0]; k++) b_u32(&r, fields[k]);
     }
     // the container: DXBC, a hash (not checked by this runtime), version 1, size, one chunk "RTS0"
     bytes c = { 0 };
@@ -552,7 +570,8 @@ static int valid_root_descriptor_flags12(uint32_t flags) {
     return flags == 0 || flags == 0x2 || flags == 0x4 || flags == 0x8;
 }
 
-static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int32_t v, int32_t w, float bias, uint32_t aniso, int32_t cmp, const float border[4], float min_lod, float max_lod);
+static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int32_t v, int32_t w, float bias,
+    uint32_t aniso, int32_t cmp, const float border[4], float min_lod, float max_lod, int normalized_coordinates);
 
 static void rootsig_destroy(d3d_object *o) {
     rootsig12 *r = (rootsig12 *)o;
@@ -760,10 +779,11 @@ static HRESULT parse_rootsig(dev12 *d, const void *data, size_t size, rootsig12 
     r->flags = rd32(p, len, 20);
     // D3D12_ROOT_SIGNATURE_FLAGS currently occupies bits 0 through 11. A local root signature is
     // raytracing-only and cannot be combined with graphics root-signature flags.
-    if ((version != 1 && version != 2) || (r->flags & ~0xFFFu) ||
+    if ((version < 1 || version > 3) || (r->flags & ~0xFFFu) ||
         ((r->flags & 0x80u) && r->flags != 0x80u) || nparams > 64 || nsamplers > 2048 || params_at < 24 ||
         !span_ok(len, params_at, (size_t)nparams * 12) ||
-        (nsamplers && (samplers_at < 24 || !span_ok(len, samplers_at, (size_t)nsamplers * 52)))) return E_INVALIDARG;
+        (nsamplers && (samplers_at < 24 ||
+         !span_ok(len, samplers_at, (size_t)nsamplers * (version == 3 ? 56 : 52))))) return E_INVALIDARG;
     r->params = calloc((size_t)nparams + 1, sizeof *r->params);
     if (!r->params) return E_OUTOFMEMORY;
     r->nparams = nparams;
@@ -799,7 +819,7 @@ static HRESULT parse_rootsig(dev12 *d, const void *data, size_t size, rootsig12 
                 x->flags = version == 1 ? 0 : rd32(p, len, g + 16);
                 x->offset = rd32(p, len, g + (version == 1 ? 16 : 20));
                 if (x->type < 0 || x->type > 3 || !x->count ||
-                    (version == 2 && !valid_descriptor_range_flags12(x->flags))) return E_INVALIDARG;
+                    (version >= 2 && !valid_descriptor_range_flags12(x->flags))) return E_INVALIDARG;
                 if (x->type == 3) table_has_sampler = 1;
                 else table_has_resource = 1;
                 if (table_has_sampler && table_has_resource) return E_INVALIDARG;
@@ -827,7 +847,7 @@ static HRESULT parse_rootsig(dev12 *d, const void *data, size_t size, rootsig12 
             root_cost += 2;
             q->reg = rd32(p, len, payload); q->space = rd32(p, len, payload + 4);
             q->flags = version == 1 ? 0 : rd32(p, len, payload + 8);
-            if (version == 2 && !valid_root_descriptor_flags12(q->flags)) return E_INVALIDARG;
+            if (version >= 2 && !valid_root_descriptor_flags12(q->flags)) return E_INVALIDARG;
         } else {
             return E_INVALIDARG;
         }
@@ -836,17 +856,29 @@ static HRESULT parse_rootsig(dev12 *d, const void *data, size_t size, rootsig12 
     if (!r->samplers) return E_OUTOFMEMORY;
     r->nsamplers = nsamplers;
     for (uint32_t i = 0; i < nsamplers; i++) {
-        uint32_t s[13];
-        size_t sampler_at = (size_t)samplers_at + 52 * (size_t)i;
-        for (int k = 0; k < 13; k++) s[k] = rd32(p, len, sampler_at + 4 * (size_t)k);
-        if (s[7] > 2 || s[12] > 7) return E_INVALIDARG;
+        uint32_t s[14] = { 0 };
+        uint32_t sampler_stride = version == 3 ? 56 : 52;
+        size_t sampler_at = (size_t)samplers_at + sampler_stride * (size_t)i;
+        for (int k = 0; k < (version == 3 ? 14 : 13); k++)
+            s[k] = rd32(p, len, sampler_at + 4 * (size_t)k);
+        uint32_t sampler_flags = s[13];
+        // Version 1.2 adds the two integer border enums; Metal exposes only floating-point sampler border colors.
+        if (s[7] > (version == 3 ? 4u : 2u) || s[12] > 7 || s[7] >= 3 || (sampler_flags & ~0x2u))
+            return E_INVALIDARG;
         float bias, mn, mx;
         memcpy(&bias, &s[4], 4); memcpy(&mn, &s[8], 4); memcpy(&mx, &s[9], 4);
+        int normalized_coordinates = !(sampler_flags & 0x2u);
+        if (!normalized_coordinates &&
+            ((s[0] != 0 && s[0] != 0x15u) ||
+             bias != 0.0f || mn != 0.0f || mx != 0.0f ||
+             (s[1] != 3 && s[1] != 4) || (s[2] != 3 && s[2] != 4) ||
+             ((s[1] == 4 || s[2] == 4) && s[7] != 0))) return E_INVALIDARG;
         static const float borders[3][4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 1 }, { 1, 1, 1, 1 } };
         r->samplers[i].reg = s[10];
         r->samplers[i].space = s[11];
         r->samplers[i].visibility = (int32_t)s[12];
-        r->samplers[i].state = make_sampler(d, (int32_t)s[0], (int32_t)s[1], (int32_t)s[2], (int32_t)s[3], bias, s[5], (int32_t)s[6], borders[s[7] < 3 ? s[7] : 0], mn, mx);
+        r->samplers[i].state = make_sampler(d, (int32_t)s[0], (int32_t)s[1], (int32_t)s[2], (int32_t)s[3],
+            bias, s[5], (int32_t)s[6], borders[s[7]], mn, mx, normalized_coordinates);
     }
     HRESULT hr = validate_root_bindings(r);
     return hr == S_OK ? create_root_gpu_layout12(r) : hr;
@@ -854,29 +886,41 @@ static HRESULT parse_rootsig(dev12 *d, const void *data, size_t size, rootsig12 
 
 // ---- samplers ---------------------------------------------------------------------------------------------------
 
-static MTLSamplerAddressMode address_mode(int32_t m) {
+static MTLSamplerAddressMode address_mode(int32_t m, int normalized_coordinates, int transparent_border) {
     switch (m) {
     case 2: return MTLSamplerAddressModeMirrorRepeat;
     case 3: return MTLSamplerAddressModeClampToEdge;
-    case 4: return MTLSamplerAddressModeClampToBorderColor;
+    case 4: return !normalized_coordinates && transparent_border ?
+        MTLSamplerAddressModeClampToZero : MTLSamplerAddressModeClampToBorderColor;
     case 5: return MTLSamplerAddressModeMirrorClampToEdge;
     default: return MTLSamplerAddressModeRepeat;
     }
 }
 
-static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int32_t v, int32_t w, float bias, uint32_t aniso, int32_t cmp, const float border[4], float min_lod, float max_lod) {
+static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int32_t v, int32_t w,
+    float bias, uint32_t aniso, int32_t cmp, const float border[4], float min_lod, float max_lod,
+    int normalized_coordinates) {
     MTLSamplerDescriptor *s = [MTLSamplerDescriptor new];
     // D3D12_FILTER: bits 0 mip linear, 2 mag linear, 4 min linear, 6 anisotropic, 7 comparison
     s.minFilter = (filter & 0x10) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
     s.magFilter = (filter & 0x04) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
     s.mipFilter = (filter & 0x01) ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
     if (filter & 0x40) { s.minFilter = s.magFilter = MTLSamplerMinMagFilterLinear; s.mipFilter = MTLSamplerMipFilterLinear; s.maxAnisotropy = aniso < 1 ? 1 : aniso > 16 ? 16 : aniso; }
-    s.sAddressMode = address_mode(u);
-    s.tAddressMode = address_mode(v);
-    s.rAddressMode = address_mode(w);
+    if (!normalized_coordinates) s.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    int transparent_border = border[0] == 0 && border[1] == 0 && border[2] == 0 && border[3] == 0;
+    s.sAddressMode = address_mode(u, normalized_coordinates, transparent_border);
+    s.tAddressMode = address_mode(v, normalized_coordinates, transparent_border);
+    s.rAddressMode = address_mode(w, normalized_coordinates, transparent_border);
     s.borderColor = border[3] == 0 ? MTLSamplerBorderColorTransparentBlack : border[0] == 0 ? MTLSamplerBorderColorOpaqueBlack : MTLSamplerBorderColorOpaqueWhite;
+    s.normalizedCoordinates = normalized_coordinates;
     s.lodMinClamp = min_lod < 0 ? 0 : min_lod;
     s.lodMaxClamp = max_lod > 1000 ? FLT_MAX : max_lod;
+    if (bias != 0.0f) {
+        // Metal exposes sampler LOD bias only on Apple GPU family 10. Older Metal devices keep
+        // the existing zero-bias behavior because there is no descriptor property to map this to.
+        if (@available(macOS 26.0, *))
+            if ([d->mtl supportsFamily:MTLGPUFamilyApple10]) s.lodBias = bias;
+    }
     if (filter & 0x80) {
         static const MTLCompareFunction f[] = { MTLCompareFunctionNever, MTLCompareFunctionNever, MTLCompareFunctionLess, MTLCompareFunctionEqual,
                                                 MTLCompareFunctionLessEqual, MTLCompareFunctionGreater, MTLCompareFunctionNotEqual,
@@ -884,7 +928,6 @@ static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int
         s.compareFunction = cmp >= 1 && cmp <= 8 ? f[cmp] : MTLCompareFunctionNever;
     }
     s.supportArgumentBuffers = YES;
-    (void)bias;                                                    // (Metal samplers take no LOD bias)
     return [d->mtl newSamplerStateWithDescriptor:s];
 }
 
@@ -1003,13 +1046,20 @@ static int res_texture_copy_region12(res12 *resource, uint32_t subresource, cons
     if (!copy) return 0;
     memset(copy, 0, sizeof *copy);
     if (!resource || !resource->texture) return 0;
-    if (resource->desc.SampleCount != 1 || d3d12_resource_plane_count(resource->desc.Format) != 1) return -1;
     uint32_t mips = (uint32_t)resource->texture.mipmapLevelCount;
     uint32_t array_size = resource->desc.Dimension == 4 ? 1u : resource->desc.DepthOrArraySize;
+    uint32_t planes = d3d12_resource_plane_count(resource->desc.Format);
     uint64_t plane_size = (uint64_t)mips * array_size;
-    if (!mips || !array_size || !plane_size || subresource >= plane_size) return 0;
-    copy->mip = subresource % mips;
-    copy->slice = resource->desc.Dimension == 4 ? 0 : subresource / mips;
+    if (!mips || !array_size || !planes || !plane_size || plane_size > UINT64_MAX / planes ||
+        subresource >= plane_size * planes) return 0;
+    if (box && (box->left >= box->right || box->top >= box->bottom || box->front >= box->back)) {
+        copy->empty = 1;
+        return 1;
+    }
+    if (resource->desc.SampleCount != 1 || planes != 1) return -1;
+    uint32_t subresource_in_plane = (uint32_t)(subresource % plane_size);
+    copy->mip = subresource_in_plane % mips;
+    copy->slice = resource->desc.Dimension == 4 ? 0 : subresource_in_plane / mips;
 
     uint64_t width = res_mip_extent12(resource->texture.width, copy->mip);
     uint64_t height = resource->desc.Dimension == 2 ? 1 : res_mip_extent12(resource->texture.height, copy->mip);
@@ -1196,7 +1246,8 @@ static MTLTextureDescriptor *texture_descriptor(dev12 *d, const RES_DESC *desc) 
     else if (desc->DepthOrArraySize > 1) { td.textureType = desc->Dimension == 2 ? MTLTextureType1DArray : MTLTextureType2DArray; td.arrayLength = desc->DepthOrArraySize; }
     else td.textureType = desc->Dimension == 2 ? MTLTextureType1D : MTLTextureType2D;
     if (desc->SampleCount > 1) { td.textureType = desc->DepthOrArraySize > 1 ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample; td.sampleCount = desc->SampleCount; td.mipmapLevelCount = 1; }
-    td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+    td.usage = MTLTextureUsagePixelFormatView;
+    if (!(desc->Flags & 0x8)) td.usage |= MTLTextureUsageShaderRead;        // DENY_SHADER_RESOURCE
     if (desc->Flags & 0x4) td.usage |= MTLTextureUsageShaderWrite;              // ALLOW_UNORDERED_ACCESS
     if ((desc->Flags & 0x4) && desc->SampleCount <= 1 && d3d12_texture_atomic_format_supported(d->mtl, desc->Format))
         td.usage |= MTLTextureUsageShaderAtomic;
@@ -1205,16 +1256,89 @@ static MTLTextureDescriptor *texture_descriptor(dev12 *d, const RES_DESC *desc) 
     return td;
 }
 
+static int texture_sample_supported12(dev12 *device, const RES_DESC *desc) {
+    if (!device || !desc || !desc->SampleCount) return 0;
+    if (![device->mtl supportsTextureSampleCount:desc->SampleCount]) return 0;
+    RES_DESC probe = *desc;
+    probe.Width = 1;
+    probe.Height = 1;
+    probe.DepthOrArraySize = 1;
+    probe.MipLevels = 1;
+    probe.Alignment = 0;
+    probe.SampleQuality = 0;
+    MTLTextureDescriptor *td = texture_descriptor(device, &probe);
+    if (!td) return 0;
+    @autoreleasepool {
+        @try {
+            id<MTLTexture> texture = [device->mtl newTextureWithDescriptor:td];
+            return texture != nil;
+        } @catch (NSException *exception) {
+            (void)exception;
+            return 0;
+        }
+    }
+}
+
+static int resource_clear_value_valid12(const RES_DESC *desc, const void *clear) {
+    if (!clear) return 1;
+    if (!desc || desc->Dimension == 1) return 0;                  // D3D12 requires NULL for buffers.
+    uint32_t clear_format = 0;
+    memcpy(&clear_format, clear, sizeof clear_format);
+    if (!clear_format || d3d12_resolve_typeless(clear_format)) return 0;
+    return d3d_copy_formats_compatible(desc->Format, clear_format);
+}
+
+static int d3d12_resource_state_dimension_valid12(const RES_DESC *desc, uint32_t state) {
+    const uint32_t buffer_only = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX |
+        D3D12_STATE_STREAM_OUT | D3D12_STATE_INDIRECT;
+    const uint32_t texture_only = D3D12_STATE_RENDER_TARGET | D3D12_STATE_DEPTH_READ |
+        D3D12_STATE_DEPTH_WRITE | D3D12_STATE_RESOLVE_SOURCE | D3D12_STATE_RESOLVE_DEST |
+        D3D12_STATE_SHADING_RATE;
+    if (desc->Dimension == 1) return !(state & texture_only);
+    if (state & buffer_only) return 0;
+    return !(state & D3D12_STATE_SHADING_RATE) || desc->Dimension == 3;
+}
+
+static int d3d12_resource_state_descriptor_valid12(const RES_DESC *desc, uint32_t state) {
+    if ((state & (D3D12_STATE_NON_PIXEL_SHADER | D3D12_STATE_PIXEL_SHADER)) && (desc->Flags & 0x8)) return 0;
+    if (!(state & D3D12_STATE_SHADING_RATE)) return 1;
+    const uint32_t shading_rate_forbidden_flags = 0x1u | 0x2u | 0x10u | 0x20u | 0x40u | 0x80u;
+    return desc->Dimension == 3 && desc->Format == 62 /* DXGI_FORMAT_R8_UINT */ &&
+        desc->DepthOrArraySize == 1 && desc->MipLevels == 1 && desc->SampleCount == 1 &&
+        !desc->SampleQuality && desc->Layout == D3D12_LAYOUT_UNKNOWN12 &&
+        !(desc->Flags & shading_rate_forbidden_flags);
+}
+
+static int d3d12_barrier_state_access(uint32_t state, uint32_t *access);
+
+static int d3d12_resource_initial_state_valid12(const RES_DESC *desc, uint32_t state) {
+    uint32_t access;
+    if (!d3d12_barrier_state_access(state, &access) ||
+        !d3d12_resource_state_dimension_valid12(desc, state) || (desc->Flags & 0x8 && !(desc->Flags & 0x2)) ||
+        !d3d12_resource_state_descriptor_valid12(desc, state)) return 0;
+    if ((state & D3D12_STATE_RENDER_TARGET) && !(desc->Flags & 0x1)) return 0;
+    if ((state & (D3D12_STATE_DEPTH_READ | D3D12_STATE_DEPTH_WRITE)) && !(desc->Flags & 0x2)) return 0;
+    if ((state & D3D12_STATE_UAV) && !(desc->Flags & 0x4)) return 0;
+    if ((state & D3D12_STATE_RESOLVE_SOURCE) && desc->SampleCount <= 1) return 0;
+    if ((state & D3D12_STATE_RESOLVE_DEST) && desc->SampleCount != 1) return 0;
+    return 1;
+}
+
 // A committed resource (heap nil) or one placed in a heap at an offset.
 static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t initial_state,
-                               memheap12 *in, uint64_t offset, const GUID *iid, void **out) {
+                               const void *clear, memheap12 *in, uint64_t offset, const GUID *iid, void **out) {
     const uint32_t generic_read = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX | D3D12_STATE_NON_PIXEL_SHADER |
         D3D12_STATE_PIXEL_SHADER | D3D12_STATE_INDIRECT | D3D12_STATE_COPY_SOURCE;
     uint64_t required_alignment = 0;
     if (!hp || !desc) return E_INVALIDARG;
-    if ((hp->Type == 2 && (uint32_t)initial_state != generic_read) ||
+    // Abstract UPLOAD and READBACK heaps are buffer-only. CPU-visible textures,
+    // where supported, use a CUSTOM heap with explicit properties.
+    if ((desc->Dimension != 1 && (hp->Type == 2 || hp->Type == 3)) ||
+        (hp->Type == 2 && (uint32_t)initial_state != generic_read) ||
         (hp->Type == 3 && (uint32_t)initial_state != D3D12_STATE_COPY_DEST) ||
-        !resource_alignment12(desc, &required_alignment)) return E_INVALIDARG;
+        !d3d12_resource_initial_state_valid12(desc, (uint32_t)initial_state) ||
+        !resource_alignment12(desc, &required_alignment) || !resource_clear_value_valid12(desc, clear)) return E_INVALIDARG;
+    if (desc->SampleCount > 1 && !texture_sample_supported12(d, desc)) return E_INVALIDARG;
     res12 *r = alloc12(sizeof *r, K12_RESOURCE, g_resource_vtbl, d);
     r->base.destroy = res_destroy;
     r->desc = *desc;
@@ -1304,7 +1428,7 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
 }
 
 static HRESULT create_committed(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
-    return create_resource(d, hp, heap_flags, desc, state, NULL, 0, iid, out);
+    return create_resource(d, hp, heap_flags, desc, state, clear, NULL, 0, iid, out);
 }
 
 // ---- heaps and placed resources -----------------------------------------------------------------------------------
@@ -1386,7 +1510,7 @@ static uint64_t resource_axis_tile_count12(uint64_t extent, uint32_t block_exten
 
 static int small_texture12(const RES_DESC *desc, uint64_t tile_size, int multisampled) {
     if (desc->Dimension < 2 || desc->Dimension > 4) return 0; // 1D, 2D, or 3D texture.
-    if (desc->Layout != 0 || !desc->Width || !desc->DepthOrArraySize || !desc->Format) return 0;
+    if (desc->Layout != D3D12_LAYOUT_UNKNOWN12 || !desc->Width || !desc->DepthOrArraySize || !desc->Format) return 0;
     if (desc->Dimension == 2 && desc->Height != 1) return 0;
     if (desc->Dimension >= 3 && !desc->Height) return 0;
     if (multisampled) {
@@ -1418,8 +1542,29 @@ static int small_texture12(const RES_DESC *desc, uint64_t tile_size, int multisa
     return total <= max_tiles;
 }
 
+static int resource_flags_valid12(const RES_DESC *desc) {
+    const uint32_t flags = (uint32_t)desc->Flags;
+    const uint32_t supported_flags = 0x1u | 0x2u | 0x4u | 0x8u | 0x20u;
+    // Cross-adapter sharing, video reference resources, and acceleration structures have no backend path.
+    if (flags & ~supported_flags) return 0;
+    if (desc->Dimension == 1 && (flags & (0x1u | 0x2u))) return 0;
+    if ((flags & 0x2u) && (flags & (0x1u | 0x4u | 0x20u))) return 0;
+    if ((flags & 0x8u) && !(flags & 0x2u)) return 0;
+    if ((flags & 0x20u) && desc->Dimension == 1) return 0;
+    return 1;
+}
+
 static int resource_alignment12(const RES_DESC *desc, uint64_t *alignment) {
-    if (!desc || !alignment || !desc->Width || !desc->SampleCount || desc->SampleQuality) return 0;
+    if (!desc || !alignment || !desc->Width || !desc->SampleCount || desc->SampleQuality ||
+        !resource_flags_valid12(desc)) return 0;
+    // Buffers expose linear bytes; texture layouts other than UNKNOWN need row-major, tiled, or swizzle
+    // support that this Metal backend does not advertise.
+    if ((desc->Dimension == 1 && desc->Layout != D3D12_LAYOUT_ROW_MAJOR12) ||
+        (desc->Dimension >= 2 && desc->Dimension <= 4 && desc->Layout != D3D12_LAYOUT_UNKNOWN12)) return 0;
+    if (desc->SampleCount > 16) return 0;
+    if (desc->SampleCount > 1 &&
+        ((desc->SampleCount & (desc->SampleCount - 1)) || desc->Dimension != 3 || desc->MipLevels != 1 ||
+         !(desc->Flags & 0x3) || (desc->Flags & (0x4 | 0x20)))) return 0;
     uint64_t requested = desc->Alignment;
     if (!requested) requested = desc->SampleCount > 1 ? (4u << 20) : (64u << 10);
     if (requested != (4u << 10) && requested != (64u << 10) && requested != (4u << 20)) return 0;
@@ -1446,6 +1591,8 @@ static int align_up_resource12(uint64_t value, uint64_t alignment, uint64_t *res
 static ALLOC_INFO allocation_info(dev12 *d, const RES_DESC *desc) {
     uint64_t requested_alignment = 0;
     if (!resource_alignment12(desc, &requested_alignment)) return (ALLOC_INFO){ UINT64_MAX, 0 };
+    if (desc->SampleCount > 1 && !texture_sample_supported12(d, desc))
+        return (ALLOC_INFO){ UINT64_MAX, requested_alignment };
     ALLOC_INFO a = { 0, requested_alignment };
     MTLSizeAndAlign m;
     @try {
@@ -1470,7 +1617,7 @@ static ALLOC_INFO allocation_info(dev12 *d, const RES_DESC *desc) {
 }
 
 static WINAPI ALLOC_INFO *dev_allocation_info(void *this, ALLOC_INFO *out, uint32_t mask, uint32_t n, const RES_DESC *descs) {
-    (void)mask;
+    if (mask) { *out = (ALLOC_INFO){ UINT64_MAX, 0 }; return out; }
     ALLOC_INFO all = { 0, 0 };
     for (uint32_t i = 0; i < n; i++) {
         ALLOC_INFO a = allocation_info(this, &descs[i]);
@@ -1487,7 +1634,7 @@ static WINAPI ALLOC_INFO *dev_allocation_info(void *this, ALLOC_INFO *out, uint3
     return out;
 }
 static WINAPI ALLOC_INFO *dev_allocation_info1(void *this, ALLOC_INFO *out, uint32_t mask, uint32_t n, const RES_DESC *descs, ALLOC_INFO *each) {
-    (void)mask;
+    if (mask) { *out = (ALLOC_INFO){ UINT64_MAX, 0 }; return out; }
     // (each: D3D12_RESOURCE_ALLOCATION_INFO1 {Offset, Alignment, SizeInBytes})
     ALLOC_INFO all = { 0, 0 };
     for (uint32_t i = 0; i < n; i++) {
@@ -1565,7 +1712,7 @@ static WINAPI HRESULT dev_create_placed(void *this, void *heap, uint64_t offset,
         return E_INVALIDARG;
     }
     if (desc->Dimension == 1 && m->heap.storageMode != MTLStorageModeShared) return E_INVALIDARG;
-    return create_resource(this, &m->desc.Properties, m->desc.Flags, desc, state, m, offset, iid, out);
+    return create_resource(this, &m->desc.Properties, m->desc.Flags, desc, state, clear, m, offset, iid, out);
 }
 static WINAPI HRESULT dev_create_placed1(void *this, void *heap, uint64_t offset, const RES_DESC1 *desc1,
                                          int32_t state, const void *clear, const GUID *iid, void **out) {
@@ -2011,21 +2158,28 @@ static WINAPI void dev_create_srv(void *this, void *resource, const SRV_DESC *de
     gpu_ir_buffer_view *ir_view = NULL;
     uint32_t view_mip = 0, view_mips = 0, view_slice = 0, view_slices = 0, view_plane = 0;
     float resource_min_lod = 0.0f;
-    int texture_view_valid = 1;
-    if (r && r->buffer) {
+    uint32_t raw_component_mapping = desc ? desc->mapping : 0x1688u;
+    uint32_t component_mapping = 0;
+    int mapping_valid = !desc || d3d12_normalize_srv_component_mapping12(raw_component_mapping, &component_mapping);
+    int texture_view_valid = mapping_valid;
+    if (!mapping_valid) vx_log("D3D12: invalid SRV Shader4ComponentMapping; descriptor left null");
+    if (r && (r->desc.Flags & 0x8)) {
+        vx_log("D3D12: DENY_SHADER_RESOURCE resource cannot create an SRV; descriptor left null");
+    } else if (r && r->buffer) {
         if (!desc) { v.va = r->buffer.gpuAddress; v.size = (uint32_t)r->desc.Width; }
-        else {
+        else if (mapping_valid) {
             ir_view = make_buffer_view(r, desc->buffer.first, desc->buffer.count, desc->format,
                                        desc->buffer.stride, (uint32_t)desc->buffer.flags,
                                        GPU_IR_ACCESS_SHADER_READ, &v, &keep);
             if (!ir_view) vx_log("D3D12: buffer SRV range, format, or Metal view is unsupported; descriptor left null");
         }
+        if (!mapping_valid) { v = (VxDesc){ 0 }; keep = nil; }
     } else if (r && r->texture) {
         int32_t dim = desc ? desc->dim : (int32_t)d3d12_default_srv_texture_dimension12(
             (uint32_t)r->desc.Dimension, r->desc.DepthOrArraySize, r->desc.SampleCount);
         if (desc) {
             d3d12_srv_texture_range12 range;
-            texture_view_valid = d3d12_normalize_srv_texture_range12((uint32_t)dim, desc->raw,
+            texture_view_valid = mapping_valid && d3d12_normalize_srv_texture_range12((uint32_t)dim, desc->raw,
                 (uint32_t)r->texture.mipmapLevelCount, (uint32_t)r->texture.arrayLength, &range);
             if (texture_view_valid) {
                 view_mip = range.mip;
@@ -2058,10 +2212,15 @@ static WINAPI void dev_create_srv(void *this, void *resource, const SRV_DESC *de
             vx_log("D3D12: invalid or unsupported texture SRV dimension or subresource range; descriptor left null");
         }
     }
+    if (mapping_valid && component_mapping &&
+        ((r && r->texture && texture_view_valid) || (r && r->buffer && (!desc || ir_view)))) {
+        v.flags |= (raw_component_mapping << DXIL_MSL_DESC_COMPONENT_MAPPING_SHIFT) &
+                   DXIL_MSL_DESC_COMPONENT_MAPPING_MASK;
+    }
     put_desc(cpu, &v, keep, DXIL_SRV);
     put_buffer_view(cpu, ir_view);
     gpu_ir_buffer_view_release(ir_view);
-    if (r && (r->buffer || (r->texture && texture_view_valid)))
+    if (mapping_valid && r && (r->buffer || (r->texture && texture_view_valid)))
         put_shader_view(cpu, r, view_mip, view_mips, view_slice, view_slices, view_plane, NULL, 0);
 }
 
@@ -2162,7 +2321,8 @@ static WINAPI void dev_create_uav(void *this, void *resource, void *counter, con
 }
 
 static WINAPI void dev_create_sampler(void *this, const SAMPLER_DESC *s, size_t cpu) {
-    id<MTLSamplerState> st = make_sampler(this, s->filter, s->u, s->v, s->w, s->bias, s->aniso, s->cmp, s->border, s->min_lod, s->max_lod);
+    id<MTLSamplerState> st = make_sampler(this, s->filter, s->u, s->v, s->w, s->bias, s->aniso, s->cmp,
+        s->border, s->min_lod, s->max_lod, 1);
     VxDesc v = { 0 };
     v.res = resource_id((id<MTLResource>)st);
     put_desc(cpu, &v, st, DXIL_SAMPLER);
@@ -2262,6 +2422,10 @@ static WINAPI HRESULT dev_create_fence(void *this, uint64_t initial, int32_t fla
 static void pso_destroy(d3d_object *o) {
     pso12 *p = (pso12 *)o;
     gpu_ir_pipeline_release(p->gpu_pipeline);
+    gpu_ir_shader_release(p->common_ir_vertex);
+    p->common_ir_vertex = NULL;
+    gpu_ir_shader_release(p->common_ir_fragment);
+    p->common_ir_fragment = NULL;
     p->gpu_pipeline = NULL;
     p->compute = nil; p->render = nil; p->depth = nil;
     release_dev(o);
@@ -2646,6 +2810,9 @@ static void list_clear(list12 *l) {
     l->recording_pso = NULL;
     l->recording_topology = 4; // D3D12 triangle list; matches the replay state's initial topology.
     l->recording_topology_set = 0;
+    for (uint32_t i = 0; i < 4; i++) l->recording_blend_factor[i] = 1.0f;
+    memset(l->recording_vertex_buffers, 0, sizeof l->recording_vertex_buffers);
+    memset(&l->recording_index_buffer, 0, sizeof l->recording_index_buffer);
     l->n = 0;
 }
 static void list_destroy(d3d_object *o) {
@@ -2783,6 +2950,7 @@ static WINAPI HRESULT list_reset(void *this, void *allocator, void *pso) {
     l->validation_error = S_OK;
     l->recording_topology = 4;
     l->recording_topology_set = 0;
+    for (uint32_t i = 0; i < 4; i++) l->recording_blend_factor[i] = 1.0f;
     if (pso) {
         cmd12 *c = rec(l, C_PSO);
         c->obj = pso;
@@ -2828,6 +2996,14 @@ static WINAPI void list_execute_bundle(void *this, void *bundle) {
             copy->gpu_ir_transient = copy->op != C_EXECUTE_INDIRECT;
         }
         if (copy->op == C_PSO) parent->recording_pso = copy->obj;
+        // (input-assembler bindings a bundle sets stay set in its parent, as its pipeline state and topology do:
+        //  the parent's later draws capture them)
+        if (copy->op == C_VB)
+            for (uint32_t b = 0; b < copy->b && copy->a + b < 16; b++)
+                parent->recording_vertex_buffers[copy->a + b] = ((const VBV *)copy->values)[b];
+        if (copy->op == C_IB) parent->recording_index_buffer = *(const IBV *)copy->values;
+        if (copy->op == C_BLEND_FACTOR)
+            memcpy(parent->recording_blend_factor, copy->values, sizeof parent->recording_blend_factor);
         if (copy->op == C_TOPOLOGY) {
             parent->recording_topology = copy->a;
             parent->recording_topology_set = 1;
@@ -2948,13 +3124,27 @@ static WINAPI void list_execute_indirect(void *this, void *signature, uint32_t m
         gpu_ir_indirect_draw_info draw = {
             .topology = topology, .indexed = s->args[0].type == INDIRECT_DRAW_INDEXED,
             .draw_count = max_count, .stride = s->stride, .argument_offset = argument_offset,
-            .count_offset = count_offset
+            .count_offset = count_offset, .has_blend_constants = 1
         };
+        memcpy(draw.blend_constants, l->recording_blend_factor, sizeof draw.blend_constants);
         uint32_t index = GPU_IR_NO_COMMAND;
-        int rc = gpu_ir_record_draw_indirect_counted(&l->gpu_ir, l->recording_pso->gpu_pipeline,
-                                                      arg->gpu_buffer, count ? count->gpu_buffer : NULL,
-                                                      &draw, &index);
+        gpu_ir_draw_info captured = { .indexed = draw.indexed };
+        int rc = l->type == 1 || !max_count ? GPU_IR_OK : list_capture_draw_buffers12(l, &captured);
+        if (rc == GPU_IR_OK && l->type != 1 && max_count) {
+            draw.vertex_buffers_captured = captured.vertex_buffers_captured;
+            draw.vertex_buffer_count = captured.vertex_buffer_count;
+            memcpy(draw.vertex_buffers, captured.vertex_buffers,
+                   captured.vertex_buffer_count * sizeof captured.vertex_buffers[0]);
+            draw.index_buffer = captured.index_buffer;
+            draw.index_buffer_offset = captured.index_buffer_offset;
+            draw.index_buffer_size = captured.index_buffer_size;
+            draw.index_type = captured.index_type;
+        }
+        if (rc == GPU_IR_OK) rc = gpu_ir_record_draw_indirect_counted(&l->gpu_ir,
+            l->recording_pso->gpu_pipeline, arg->gpu_buffer, count ? count->gpu_buffer : NULL, &draw, &index);
+        list_release_captured_draw_buffers12(&captured);
         if (rc == GPU_IR_OUT_OF_MEMORY) l->validation_error = E_OUTOFMEMORY;
+        else if (rc != GPU_IR_OK) l->validation_error = E_INVALIDARG;
         else if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
             c->gpu_ir_recorded = 1;
             c->gpu_ir_index = index;
@@ -3046,7 +3236,8 @@ static uint32_t d3d12_resolve_format_family(uint32_t format) {
 static int d3d12_resolve_typeless(uint32_t format) {
     switch (format) {
     case 1: case 5: case 9: case 15: case 19: case 23: case 27:
-    case 33: case 39: case 44: case 48: case 53: case 60:
+    case 33: case 39: case 44: case 48: case 53: case 60: case 70: case 73:
+    case 76: case 79: case 82: case 90: case 92: case 94: case 97:
         return 1;
     default:
         return 0;
@@ -3388,17 +3579,12 @@ static int d3d12_barrier_state_access(uint32_t state, uint32_t *access) {
     const uint32_t known = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX | D3D12_STATE_RENDER_TARGET |
         D3D12_STATE_UAV | D3D12_STATE_DEPTH_WRITE | D3D12_STATE_DEPTH_READ | D3D12_STATE_NON_PIXEL_SHADER |
         D3D12_STATE_PIXEL_SHADER | D3D12_STATE_STREAM_OUT | D3D12_STATE_INDIRECT | D3D12_STATE_COPY_DEST |
-        D3D12_STATE_COPY_SOURCE | D3D12_STATE_RESOLVE_DEST | D3D12_STATE_RESOLVE_SOURCE |
-        D3D12_STATE_VIDEO_DECODE_READ | D3D12_STATE_VIDEO_DECODE_WRITE | D3D12_STATE_VIDEO_PROCESS_READ |
-        D3D12_STATE_VIDEO_PROCESS_WRITE | D3D12_STATE_VIDEO_ENCODE_READ | D3D12_STATE_VIDEO_ENCODE_WRITE |
-        D3D12_STATE_RAYTRACING_AS | D3D12_STATE_SHADING_RATE;
+        D3D12_STATE_COPY_SOURCE | D3D12_STATE_RESOLVE_DEST | D3D12_STATE_RESOLVE_SOURCE | D3D12_STATE_SHADING_RATE;
     const uint32_t read_only = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX | D3D12_STATE_DEPTH_READ |
         D3D12_STATE_NON_PIXEL_SHADER | D3D12_STATE_PIXEL_SHADER | D3D12_STATE_INDIRECT |
-        D3D12_STATE_COPY_SOURCE | D3D12_STATE_RESOLVE_SOURCE | D3D12_STATE_VIDEO_DECODE_READ |
-        D3D12_STATE_VIDEO_PROCESS_READ | D3D12_STATE_VIDEO_ENCODE_READ | D3D12_STATE_SHADING_RATE;
+        D3D12_STATE_COPY_SOURCE | D3D12_STATE_RESOLVE_SOURCE | D3D12_STATE_SHADING_RATE;
     const uint32_t write_only = D3D12_STATE_RENDER_TARGET | D3D12_STATE_DEPTH_WRITE | D3D12_STATE_STREAM_OUT |
-        D3D12_STATE_COPY_DEST | D3D12_STATE_RESOLVE_DEST | D3D12_STATE_VIDEO_DECODE_WRITE |
-        D3D12_STATE_VIDEO_PROCESS_WRITE | D3D12_STATE_VIDEO_ENCODE_WRITE;
+        D3D12_STATE_COPY_DEST | D3D12_STATE_RESOLVE_DEST;
     if (state & ~known) return 0;
     if ((state & D3D12_STATE_UAV) && state != D3D12_STATE_UAV) return 0;
     if ((state & D3D12_STATE_DEPTH_WRITE) && state != D3D12_STATE_DEPTH_WRITE) return 0;
@@ -3408,22 +3594,19 @@ static int d3d12_barrier_state_access(uint32_t state, uint32_t *access) {
     uint32_t result = 0;
     if (state & D3D12_STATE_VERTEX_CONSTANT) result |= GPU_IR_ACCESS_VERTEX_READ | GPU_IR_ACCESS_UNIFORM_READ;
     if (state & D3D12_STATE_INDEX) result |= GPU_IR_ACCESS_INDEX_READ;
-    if (state & (D3D12_STATE_NON_PIXEL_SHADER | D3D12_STATE_PIXEL_SHADER | D3D12_STATE_SHADING_RATE |
-                 D3D12_STATE_VIDEO_DECODE_READ | D3D12_STATE_VIDEO_PROCESS_READ | D3D12_STATE_VIDEO_ENCODE_READ))
+    if (state & (D3D12_STATE_NON_PIXEL_SHADER | D3D12_STATE_PIXEL_SHADER))
         result |= GPU_IR_ACCESS_SHADER_READ;
+    if (state & D3D12_STATE_SHADING_RATE) result |= GPU_IR_ACCESS_MEMORY_READ;
     if (state & D3D12_STATE_UAV) result |= GPU_IR_ACCESS_SHADER_READ | GPU_IR_ACCESS_SHADER_WRITE;
     if (state & (D3D12_STATE_RENDER_TARGET)) result |= GPU_IR_ACCESS_COLOR_WRITE;
     if (state & D3D12_STATE_DEPTH_READ) result |= GPU_IR_ACCESS_DEPTH_READ;
     if (state & D3D12_STATE_DEPTH_WRITE) result |= GPU_IR_ACCESS_DEPTH_WRITE;
     if (state & D3D12_STATE_STREAM_OUT) result |= GPU_IR_ACCESS_STREAM_WRITE;
     if (state & D3D12_STATE_INDIRECT) result |= GPU_IR_ACCESS_INDIRECT_READ;
-    if (state & (D3D12_STATE_COPY_SOURCE | D3D12_STATE_VIDEO_DECODE_READ | D3D12_STATE_VIDEO_PROCESS_READ |
-                 D3D12_STATE_VIDEO_ENCODE_READ)) result |= GPU_IR_ACCESS_COPY_READ;
-    if (state & (D3D12_STATE_COPY_DEST | D3D12_STATE_VIDEO_DECODE_WRITE | D3D12_STATE_VIDEO_PROCESS_WRITE |
-                 D3D12_STATE_VIDEO_ENCODE_WRITE)) result |= GPU_IR_ACCESS_COPY_WRITE;
+    if (state & D3D12_STATE_COPY_SOURCE) result |= GPU_IR_ACCESS_COPY_READ;
+    if (state & D3D12_STATE_COPY_DEST) result |= GPU_IR_ACCESS_COPY_WRITE;
     if (state & D3D12_STATE_RESOLVE_SOURCE) result |= GPU_IR_ACCESS_RESOLVE_READ;
     if (state & D3D12_STATE_RESOLVE_DEST) result |= GPU_IR_ACCESS_RESOLVE_WRITE;
-    if (state & D3D12_STATE_RAYTRACING_AS) result |= GPU_IR_ACCESS_ACCELERATION_STRUCTURE;
     *access = result;
     return 1;
 }
@@ -3450,7 +3633,11 @@ static int d3d12_barrier_validate_transition(res12 *resource, const TRANSITION_B
     uint32_t before_state = (uint32_t)transition->before, after_state = (uint32_t)transition->after;
     if (!d3d12_barrier_state_access(before_state, before) || !d3d12_barrier_state_access(after_state, after) ||
         before_state == after_state || (before_state & D3D12_STATE_RAYTRACING_AS) ||
-        (after_state & D3D12_STATE_RAYTRACING_AS) || resource->heap.Type == 2 || resource->heap.Type == 3) return 0;
+        (after_state & D3D12_STATE_RAYTRACING_AS) || resource->heap.Type == 2 || resource->heap.Type == 3 ||
+        !d3d12_resource_state_dimension_valid12(&resource->desc, before_state) ||
+        !d3d12_resource_state_dimension_valid12(&resource->desc, after_state) ||
+        !d3d12_resource_state_descriptor_valid12(&resource->desc, before_state) ||
+        !d3d12_resource_state_descriptor_valid12(&resource->desc, after_state)) return 0;
     uint32_t flags = (uint32_t)resource->desc.Flags;
     if ((before_state & D3D12_STATE_RENDER_TARGET || after_state & D3D12_STATE_RENDER_TARGET) && !(flags & 0x1)) return 0;
     if ((before_state & (D3D12_STATE_DEPTH_READ | D3D12_STATE_DEPTH_WRITE) ||
@@ -3929,6 +4116,62 @@ static MTLBlendOperation blend_op(int32_t o) {
     default: return MTLBlendOperationAdd;
     }
 }
+
+static uint32_t blend_factor_ir12(int32_t factor) {
+    switch (factor) {
+    case 1: return GPU_IR_BLEND_FACTOR_ZERO;
+    case 2: return GPU_IR_BLEND_FACTOR_ONE;
+    case 3: return GPU_IR_BLEND_FACTOR_SOURCE_COLOR;
+    case 4: return GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE_COLOR;
+    case 5: return GPU_IR_BLEND_FACTOR_SOURCE_ALPHA;
+    case 6: return GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA;
+    case 7: return GPU_IR_BLEND_FACTOR_DESTINATION_ALPHA;
+    case 8: return GPU_IR_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA;
+    case 9: return GPU_IR_BLEND_FACTOR_DESTINATION_COLOR;
+    case 10: return GPU_IR_BLEND_FACTOR_ONE_MINUS_DESTINATION_COLOR;
+    case 11: return GPU_IR_BLEND_FACTOR_SOURCE_ALPHA_SATURATE;
+    case 14: return GPU_IR_BLEND_FACTOR_CONSTANT_COLOR;
+    case 15: return GPU_IR_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    case 16: return GPU_IR_BLEND_FACTOR_SOURCE1_COLOR;
+    case 17: return GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE1_COLOR;
+    case 18: return GPU_IR_BLEND_FACTOR_SOURCE1_ALPHA;
+    case 19: return GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE1_ALPHA;
+    case 20: return GPU_IR_BLEND_FACTOR_CONSTANT_ALPHA;
+    case 21: return GPU_IR_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+    default: return GPU_IR_BLEND_FACTOR_ONE;
+    }
+}
+
+static uint32_t blend_operation_ir12(int32_t operation) {
+    switch (operation) {
+    case 2: return GPU_IR_BLEND_OPERATION_SUBTRACT;
+    case 3: return GPU_IR_BLEND_OPERATION_REVERSE_SUBTRACT;
+    case 4: return GPU_IR_BLEND_OPERATION_MINIMUM;
+    case 5: return GPU_IR_BLEND_OPERATION_MAXIMUM;
+    default: return GPU_IR_BLEND_OPERATION_ADD;
+    }
+}
+
+static gpu_ir_color_blend_state color_blend_ir12(const GFX_PSO_DESC *desc) {
+    gpu_ir_color_blend_state state = { 0 };
+    if (!desc || !desc->nrt) return state;
+    state.attachment_count = desc->nrt;
+    state.alpha_to_coverage_enabled = desc->blend.a2c != 0;
+    for (uint32_t i = 0; i < desc->nrt; i++) {
+        const RT_BLEND *blend = &desc->blend.rt[desc->blend.independent ? i : 0];
+        state.attachments[i] = (gpu_ir_color_blend_attachment){
+            .enabled = blend->enable != 0,
+            .source_color_factor = blend_factor_ir12(blend->src),
+            .destination_color_factor = blend_factor_ir12(blend->dst),
+            .color_operation = blend_operation_ir12(blend->op),
+            .source_alpha_factor = blend_factor_ir12(blend->src_a),
+            .destination_alpha_factor = blend_factor_ir12(blend->dst_a),
+            .alpha_operation = blend_operation_ir12(blend->op_a),
+            .write_mask = blend->mask & GPU_IR_COLOR_WRITE_ALL
+        };
+    }
+    return state;
+}
 static MTLCompareFunction compare(int32_t f) {
     static const MTLCompareFunction m[] = { MTLCompareFunctionAlways, MTLCompareFunctionNever, MTLCompareFunctionLess, MTLCompareFunctionEqual,
                                             MTLCompareFunctionLessEqual, MTLCompareFunctionGreater, MTLCompareFunctionNotEqual,
@@ -3972,6 +4215,22 @@ static MTLVertexFormat vertex_format(uint32_t f) {
     return MTLVertexFormatInvalid;
 }
 
+static uint32_t d3d12_vertex_format_size12(uint32_t format) {
+    switch (format) {
+    case 2: case 3: case 4: return 16;
+    case 6: case 7: case 8: return 12;
+    case 10: case 11: case 12: case 13: case 14: return 8;
+    case 16: case 17: case 18: return 8;
+    case 24: case 28: case 30: case 31: case 32: case 87: return 4;
+    case 34: case 35: case 36: case 37: case 38: return 4;
+    case 41: case 42: case 43: return 4;
+    case 49: case 50: case 51: case 52: return 2;
+    case 54: case 56: case 57: case 58: case 59: return 2;
+    case 61: case 62: case 63: case 64: return 1;
+    default: return 0;
+    }
+}
+
 static id<MTLFunction> stage_function(dev12 *d, const BYTECODE *code, dxil_msl *out, const char *what,
                                       uint32_t sample_mask) {
     dxil_module m;
@@ -3994,6 +4253,113 @@ static id<MTLFunction> stage_function(dev12 *d, const BYTECODE *code, dxil_msl *
     if (!lib) { vx_log("D3D12: %s did not compile: %s\n%s", what, err.localizedDescription.UTF8String, out->msl); return nil; }
     dxil_msl_free(out);
     return [lib newFunctionWithName:@"vx_main"];
+}
+
+static id<MTLFunction> common_fragment_stage_function12(dev12 *device, const BYTECODE *code,
+                                                        const dxil_msl *reflection,
+                                                        gpu_ir_shader **shader_out) {
+    if (shader_out) *shader_out = NULL;
+    if (!device || !code || !code->code || !code->size || !shader_out || !reflection ||
+        reflection->nslots || reflection->uses_heap || reflection->uses_sampler_heap) return nil;
+    dxil_module module;
+    if (dxil_read(code->code, code->size, &module)) return nil;
+    gpu_ir_shader *shader = NULL;
+    int rc = dxil_build_gpu_ir_shader(&module, DXIL_IR_ENTRY_FUNCTION, &shader);
+    dxil_free(&module);
+    if (rc != GPU_IR_OK || !shader) {
+        gpu_ir_shader_release(shader);
+        return nil;
+    }
+    char *source = NULL;
+    size_t source_size = 0;
+    rc = gpu_ir_msl_emit_fragment(shader, &source, &source_size);
+    if (rc != GPU_IR_OK || !source || !source_size) {
+        free(source);
+        gpu_ir_shader_release(shader);
+        return nil;
+    }
+    NSString *msl = [[NSString alloc] initWithBytes:source length:source_size encoding:NSUTF8StringEncoding];
+    free(source);
+    MTLCompileOptions *options = d3d12_shader_compile_options12(device, reflection);
+    NSError *error = nil;
+    id<MTLLibrary> library = msl && options ? [device->mtl newLibraryWithSource:msl options:options error:&error] : nil;
+    id<MTLFunction> function = library ? [library newFunctionWithName:@"vx_fragment"] : nil;
+    if (!function) {
+        if (error) vx_log("D3D12: common fragment MSL compilation failed: %s", error.localizedDescription.UTF8String);
+        gpu_ir_shader_release(shader);
+        return nil;
+    }
+    *shader_out = shader;
+    return function;
+}
+
+static id<MTLFunction> common_vertex_stage_function12(dev12 *device, const BYTECODE *code,
+                                                      const dxil_msl *reflection,
+                                                      gpu_ir_shader **shader_out) {
+    if (shader_out) *shader_out = NULL;
+    if (!device || !code || !code->code || !code->size || !shader_out || !reflection ||
+        reflection->nslots || reflection->uses_heap || reflection->uses_sampler_heap) return nil;
+    dxil_module module;
+    if (dxil_read(code->code, code->size, &module)) return nil;
+    gpu_ir_shader *shader = NULL;
+    int rc = dxil_build_gpu_ir_shader(&module, DXIL_IR_ENTRY_FUNCTION, &shader);
+    dxil_free(&module);
+    if (rc != GPU_IR_OK || !shader) {
+        gpu_ir_shader_release(shader);
+        return nil;
+    }
+    char *source = NULL;
+    size_t source_size = 0;
+    rc = gpu_ir_msl_emit_vertex(shader, &source, &source_size);
+    if (rc != GPU_IR_OK || !source || !source_size) {
+        free(source);
+        gpu_ir_shader_release(shader);
+        return nil;
+    }
+    NSString *msl = [[NSString alloc] initWithBytes:source length:source_size encoding:NSUTF8StringEncoding];
+    free(source);
+    MTLCompileOptions *options = d3d12_shader_compile_options12(device, reflection);
+    NSError *error = nil;
+    id<MTLLibrary> library = msl && options ? [device->mtl newLibraryWithSource:msl options:options error:&error] : nil;
+    id<MTLFunction> function = library ? [library newFunctionWithName:@"vx_vertex"] : nil;
+    if (!function) {
+        if (error) vx_log("D3D12: common vertex MSL compilation failed: %s", error.localizedDescription.UTF8String);
+        gpu_ir_shader_release(shader);
+        return nil;
+    }
+    *shader_out = shader;
+    return function;
+}
+
+static int common_vertex_inputs_bound12(const gpu_ir_shader *shader,
+                                        const gpu_ir_vertex_input_desc *input_desc,
+                                        const dxil_msl *reflection) {
+    if (!shader || !input_desc || !reflection) return 0;
+    for (uint32_t i = 0; i < gpu_ir_shader_instruction_count(shader); i++) {
+        const gpu_ir_shader_instruction *variable = gpu_ir_shader_instruction_at(shader, i);
+        if (!variable || variable->opcode != GPU_IR_SHADER_OP_VARIABLE ||
+            variable->function_index != UINT32_MAX || !variable->entry_point_interface ||
+            variable->storage_class != GPU_IR_SHADER_STORAGE_INPUT || variable->has_builtin ||
+            !variable->has_location) continue;
+        int found = 0;
+        for (uint32_t j = 0; j < input_desc->attribute_count; j++)
+            if (input_desc->attributes[j].location == variable->location) found = 1;
+        if (!found) return 0;
+        const gpu_ir_shader_type *pointer = gpu_ir_shader_find_type(shader, variable->result_type_id);
+        const gpu_ir_shader_type *attribute = pointer && pointer->kind == GPU_IR_SHADER_TYPE_POINTER ?
+            gpu_ir_shader_find_type(shader, pointer->element_type_id) : NULL;
+        uint32_t components = attribute && attribute->kind == GPU_IR_SHADER_TYPE_VECTOR ?
+            attribute->element_count : attribute ? 1u : 0u;
+        int reflected = 0;
+        for (uint32_t j = 0; j < reflection->ninputs; j++) {
+            const dxil_msl_element *input = &reflection->inputs[j];
+            if (input->attribute != variable->location) continue;
+            reflected = input->comp == 9 && input->cols == components;
+            break;
+        }
+        if (!reflected) return 0;
+    }
+    return 1;
 }
 
 static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
@@ -4024,10 +4390,18 @@ static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *de
     p->base.destroy = pso_destroy;
     MTLRenderPipelineDescriptor *rp = [MTLRenderPipelineDescriptor new];
     rp.vertexFunction = stage_function(d, &desc->vs, &p->vs, "vertex shader", UINT32_MAX);
-    if (!rp.vertexFunction) { d3d_release(&p->base); return E_INVALIDARG; }
     if (desc->ps.size) {
         rp.fragmentFunction = stage_function(d, &desc->ps, &p->ps, "pixel shader", desc->sample_mask);
         if (!rp.fragmentFunction) { d3d_release(&p->base); return E_INVALIDARG; }
+        if (desc->sample_mask == UINT32_MAX && desc->nrt == 1) {
+            gpu_ir_shader *common_shader = NULL;
+            id<MTLFunction> common_function = common_fragment_stage_function12(d, &desc->ps, &p->ps,
+                                                                               &common_shader);
+            if (common_function) {
+                rp.fragmentFunction = common_function;
+                p->common_ir_fragment = common_shader;
+            }
+        }
     }
     if (!shader_root_signature_valid12(d, &p->vs, desc->root) ||
         !shader_root_signature_valid12(d, &p->ps, desc->root)) {
@@ -4038,12 +4412,26 @@ static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *de
     // the input layout, onto the vertex shader's [[attribute(n)]] by semantic (vertex buffers at Metal buffers 16 + slot)
     MTLVertexDescriptor *vd = [MTLVertexDescriptor new];
     uint32_t running[16] = { 0 };
+    gpu_ir_vertex_input_desc common_vertex_input = { 0 };
     const INPUT_ELEMENT *el = desc->input.elements;
     for (uint32_t i = 0; i < desc->input.n; i++) {
         const INPUT_ELEMENT *e = &el[i];
-        uint32_t slot = e->slot < 16 ? e->slot : 15, off = e->offset == 0xFFFFFFFFu ? running[slot] : e->offset;
-        uint32_t bpp = 0;
-        d3d_mtl_format(e->format, &bpp);
+        if (e->slot >= 16 || e->cls < 0 || e->cls > 1 || (e->cls == 0 && e->step != 0)) {
+            vx_log("D3D12: invalid input-assembler slot, classification, or per-vertex step rate");
+            d3d_release(&p->base);
+            return E_INVALIDARG;
+        }
+        uint32_t slot = e->slot, bpp = d3d12_vertex_format_size12(e->format);
+        if (!bpp || vertex_format(e->format) == MTLVertexFormatInvalid) {
+            vx_log("D3D12: unsupported vertex input format %u", e->format);
+            d3d_release(&p->base);
+            return E_NOTIMPL;
+        }
+        uint32_t off = e->offset == 0xFFFFFFFFu ? running[slot] : e->offset;
+        if (off > UINT32_MAX - bpp) {
+            d3d_release(&p->base);
+            return E_INVALIDARG;
+        }
         running[slot] = off + (bpp ? bpp : 4);
         for (uint32_t k = 0; k < p->vs.ninputs; k++) {
             const dxil_msl_element *x = &p->vs.inputs[k];
@@ -4056,7 +4444,49 @@ static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *de
             vd.layouts[16 + slot].stride = MTLBufferLayoutStrideDynamic;
             vd.layouts[16 + slot].stepFunction = e->cls == 1 ? MTLVertexStepFunctionPerInstance : MTLVertexStepFunctionPerVertex;
             vd.layouts[16 + slot].stepRate = e->cls == 1 ? (e->step ? e->step : 1) : 1;
+
+            uint32_t binding_index = 0;
+            while (binding_index < common_vertex_input.binding_count &&
+                   common_vertex_input.bindings[binding_index].binding != slot) binding_index++;
+            uint32_t input_rate = e->cls == 1 ? GPU_IR_VERTEX_INPUT_RATE_INSTANCE : GPU_IR_VERTEX_INPUT_RATE_VERTEX;
+            uint32_t step_rate = e->cls == 1 ? (e->step ? e->step : 1) : 1;
+            if (binding_index == common_vertex_input.binding_count) {
+                if (binding_index >= GPU_IR_MAX_VERTEX_BUFFERS) {
+                    d3d_release(&p->base);
+                    return E_NOTIMPL;
+                }
+                common_vertex_input.bindings[common_vertex_input.binding_count++] = (gpu_ir_vertex_binding_desc){
+                    .binding = slot, .input_rate = input_rate, .step_rate = step_rate
+                };
+            } else if (common_vertex_input.bindings[binding_index].input_rate != input_rate ||
+                       common_vertex_input.bindings[binding_index].step_rate != step_rate) {
+                vx_log("D3D12: one input slot uses conflicting per-vertex/per-instance classifications");
+                d3d_release(&p->base);
+                return E_INVALIDARG;
+            }
+            if (common_vertex_input.attribute_count >= GPU_IR_MAX_VERTEX_ATTRIBUTES) {
+                d3d_release(&p->base);
+                return E_NOTIMPL;
+            }
+            common_vertex_input.attributes[common_vertex_input.attribute_count++] = (gpu_ir_vertex_attribute_desc){
+                .location = x->attribute, .binding = slot, .format = GPU_IR_VERTEX_FORMAT_OPAQUE,
+                .offset = off, .byte_size = bpp
+            };
         }
+    }
+    gpu_ir_shader *common_vertex_shader = NULL;
+    id<MTLFunction> common_vertex_function = common_vertex_stage_function12(d, &desc->vs, &p->vs,
+                                                                            &common_vertex_shader);
+    if (common_vertex_function && common_vertex_inputs_bound12(common_vertex_shader, &common_vertex_input, &p->vs)) {
+        rp.vertexFunction = common_vertex_function;
+        p->common_ir_vertex = common_vertex_shader;
+    } else {
+        gpu_ir_shader_release(common_vertex_shader);
+    }
+    if (!rp.vertexFunction) {
+        vx_log("D3D12: vertex shader is unsupported by both direct DXIL-to-MSL and the common vertex path");
+        d3d_release(&p->base);
+        return E_INVALIDARG;
     }
     rp.vertexDescriptor = vd;
     for (uint32_t i = 0; i < desc->nrt && i < 8; i++) {
@@ -4119,10 +4549,16 @@ static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *de
     rootsig12 *root = desc->root;
     gpu_ir_pipeline_desc ir_desc = {
         .info = { .kind = GPU_IR_PIPELINE_GRAPHICS,
-                  .stage_mask = GPU_IR_STAGE_VERTEX | (desc->ps.size ? GPU_IR_STAGE_FRAGMENT : 0) },
+                  .stage_mask = GPU_IR_STAGE_VERTEX | (desc->ps.size ? GPU_IR_STAGE_FRAGMENT : 0),
+                  .vertex_input = common_vertex_input,
+                  .color_blend = color_blend_ir12(desc) },
         .layout = root && root->base.kind == K12_ROOTSIG && root->dev == d ? root->gpu_layout : NULL,
         .backend_object = (__bridge_retained void *)p->render,
-        .release = gpu12_release_mtl_object
+        .release = gpu12_release_mtl_object,
+        .stage_shaders = {
+            [GPU_IR_STAGE_SLOT_VERTEX] = p->common_ir_vertex,
+            [GPU_IR_STAGE_SLOT_FRAGMENT] = p->common_ir_fragment
+        }
     };
     p->gpu_pipeline = gpu_ir_pipeline_create(&ir_desc);
     if (!p->gpu_pipeline) {
@@ -4158,14 +4594,122 @@ static WINAPI void list_topology(void *this, int32_t t) {
     list->recording_topology_set = 1;
 }
 static WINAPI void list_vbs(void *this, uint32_t start, uint32_t n, const VBV *views) {
-    cmd12 *c = rec(this, C_VB);
+    list12 *list = this;
+    cmd12 *c = rec(list, C_VB);
     c->a = start; c->b = start >= 16 ? 0 : MIN(n, 16 - start);
     if (views) memcpy(c->values, views, c->b * sizeof(VBV));
     else memset(c->values, 0, sizeof c->values);
+    for (uint32_t i = 0; i < c->b; i++)
+        list->recording_vertex_buffers[start + i] = views ? views[i] : (VBV){ 0 };
 }
 static WINAPI void list_ib(void *this, const IBV *view) {
-    cmd12 *c = rec(this, C_IB);
+    list12 *list = this;
+    cmd12 *c = rec(list, C_IB);
     if (view) memcpy(c->values, view, sizeof *view);
+    list->recording_index_buffer = view ? *view : (IBV){ 0 };
+}
+
+static gpu_ir_resource *list_capture_gpu_buffer12(list12 *list, uint64_t va, uint32_t size,
+                                                   uint64_t *offset) {
+    if (!list || !va || !size || !offset) return NULL;
+    dev12 *device = list->dev;
+    pthread_mutex_lock(&device->lock);
+    res12 *resource = state_resource_for_gpu_range_locked12(device, va, size);
+    gpu_ir_resource *buffer = resource ? resource->gpu_buffer : NULL;
+    if (buffer) {
+        *offset = va - resource->buffer.gpuAddress;
+        if (*offset > gpu_ir_buffer_size(buffer) || size > gpu_ir_buffer_size(buffer) - *offset)
+            buffer = NULL;
+        else gpu_ir_resource_retain(buffer);
+    }
+    pthread_mutex_unlock(&device->lock);
+    return buffer;
+}
+
+static void list_release_captured_draw_buffers12(gpu_ir_draw_info *draw) {
+    if (!draw) return;
+    for (uint32_t i = 0; i < draw->vertex_buffer_count; i++)
+        gpu_ir_resource_release(draw->vertex_buffers[i].resource);
+    gpu_ir_resource_release(draw->index_buffer);
+    draw->vertex_buffer_count = 0;
+    draw->index_buffer = NULL;
+    draw->index_buffer_size = 0;
+}
+
+static int list_capture_draw_buffers12(list12 *list, gpu_ir_draw_info *draw) {
+    if (!list || !draw) return GPU_IR_INVALID;
+    draw->vertex_buffers_captured = 1;
+    for (uint32_t binding = 0; binding < 16; binding++) {
+        const VBV *view = &list->recording_vertex_buffers[binding];
+        if (!view->va && !view->size) continue;
+        uint64_t offset = 0;
+        gpu_ir_resource *resource = list_capture_gpu_buffer12(list, view->va, view->size, &offset);
+        if (!resource) {
+            list_release_captured_draw_buffers12(draw);
+            return GPU_IR_INVALID;
+        }
+        draw->vertex_buffers[draw->vertex_buffer_count++] = (gpu_ir_vertex_buffer_binding){
+            .binding = binding, .resource = resource, .offset = offset, .size = view->size,
+            .stride = view->stride
+        };
+    }
+    if (draw->indexed) {
+        const IBV *view = &list->recording_index_buffer;
+        if (!view->va && !view->size) return GPU_IR_OK;
+        if ((!view->va || !view->size) || (view->format != 42 && view->format != 57)) {
+            list_release_captured_draw_buffers12(draw);
+            return GPU_IR_INVALID;
+        }
+        uint64_t offset = 0;
+        gpu_ir_resource *resource = list_capture_gpu_buffer12(list, view->va, view->size, &offset);
+        if (!resource) {
+            list_release_captured_draw_buffers12(draw);
+            return GPU_IR_INVALID;
+        }
+        draw->index_buffer = resource;
+        draw->index_buffer_offset = offset;
+        draw->index_buffer_size = view->size;
+        draw->index_type = view->format == 42 ? GPU_IR_INDEX_TYPE_UINT32 : GPU_IR_INDEX_TYPE_UINT16;
+    }
+    return GPU_IR_OK;
+}
+static int list_capture_replay_draw_buffers12(list12 *list, const VBV vertex_views[16], const IBV *index_view,
+                                               gpu_ir_draw_info *draw) {
+    if (!list || !vertex_views || !index_view || !draw) return GPU_IR_INVALID;
+    draw->vertex_buffers_captured = 1;
+    for (uint32_t binding = 0; binding < 16; binding++) {
+        const VBV *view = &vertex_views[binding];
+        if (!view->va && !view->size) continue;
+        uint64_t offset = 0;
+        gpu_ir_resource *resource = list_capture_gpu_buffer12(list, view->va, view->size, &offset);
+        if (!resource) {
+            list_release_captured_draw_buffers12(draw);
+            return GPU_IR_INVALID;
+        }
+        draw->vertex_buffers[draw->vertex_buffer_count++] = (gpu_ir_vertex_buffer_binding){
+            .binding = binding, .resource = resource, .offset = offset, .size = view->size,
+            .stride = view->stride
+        };
+    }
+    if (draw->indexed) {
+        const IBV *view = index_view;
+        if (!view->va && !view->size) return GPU_IR_OK;
+        if ((!view->va || !view->size) || (view->format != 42 && view->format != 57)) {
+            list_release_captured_draw_buffers12(draw);
+            return GPU_IR_INVALID;
+        }
+        uint64_t offset = 0;
+        gpu_ir_resource *resource = list_capture_gpu_buffer12(list, view->va, view->size, &offset);
+        if (!resource) {
+            list_release_captured_draw_buffers12(draw);
+            return GPU_IR_INVALID;
+        }
+        draw->index_buffer = resource;
+        draw->index_buffer_offset = offset;
+        draw->index_buffer_size = view->size;
+        draw->index_type = view->format == 42 ? GPU_IR_INDEX_TYPE_UINT32 : GPU_IR_INDEX_TYPE_UINT16;
+    }
+    return GPU_IR_OK;
 }
 static WINAPI void list_targets(void *this, uint32_t n, const size_t *rtvs, int32_t single, const size_t *dsv) {
     cmd12 *c = rec(this, C_TARGETS);
@@ -4356,14 +4900,19 @@ static WINAPI void list_draw(void *this, uint32_t vertices, uint32_t instances, 
     cmd12 *c = rec(list, C_DRAW);
     c->a = vertices; c->b = instances; c->c = start; c->off = start_instance;
     pso12 *pipeline = list->recording_pso;
-    if (pipeline && pipeline->gpu_pipeline) {
+    if (pipeline && pipeline->gpu_pipeline && vertices && instances) {
         uint32_t topology = list->recording_topology >= 1 && list->recording_topology <= 5 ?
             list->recording_topology : 4;
         gpu_ir_draw_info draw = { .topology = topology, .vertex_count = vertices,
-            .instance_count = instances, .first_vertex = start, .first_instance = start_instance };
+            .instance_count = instances, .first_vertex = start, .first_instance = start_instance,
+            .has_blend_constants = 1 };
+        memcpy(draw.blend_constants, list->recording_blend_factor, sizeof draw.blend_constants);
         uint32_t index = GPU_IR_NO_COMMAND;
-        int rc = gpu_ir_record_draw(&list->gpu_ir, pipeline->gpu_pipeline, &draw, &index);
+        int rc = list_capture_draw_buffers12(list, &draw);
+        if (rc == GPU_IR_OK) rc = gpu_ir_record_draw(&list->gpu_ir, pipeline->gpu_pipeline, &draw, &index);
+        list_release_captured_draw_buffers12(&draw);
         if (rc == GPU_IR_OUT_OF_MEMORY) list->validation_error = E_OUTOFMEMORY;
+        else if (rc != GPU_IR_OK) list->validation_error = E_INVALIDARG;
         else if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
             c->gpu_ir_recorded = 1;
             c->gpu_ir_index = index;
@@ -4375,22 +4924,32 @@ static WINAPI void list_draw_indexed(void *this, uint32_t indices, uint32_t inst
     cmd12 *c = rec(list, C_DRAW_INDEXED);
     c->a = indices; c->b = instances; c->c = start; c->off = (uint64_t)(int64_t)base_vertex; c->off2 = start_instance;
     pso12 *pipeline = list->recording_pso;
-    if (pipeline && pipeline->gpu_pipeline) {
+    if (pipeline && pipeline->gpu_pipeline && indices && instances) {
         uint32_t topology = list->recording_topology >= 1 && list->recording_topology <= 5 ?
             list->recording_topology : 4;
         gpu_ir_draw_info draw = { .topology = topology, .indexed = 1, .index_count = indices,
             .instance_count = instances, .first_index = start, .first_instance = start_instance,
-            .vertex_offset = base_vertex };
+            .vertex_offset = base_vertex, .has_blend_constants = 1 };
+        memcpy(draw.blend_constants, list->recording_blend_factor, sizeof draw.blend_constants);
         uint32_t index = GPU_IR_NO_COMMAND;
-        int rc = gpu_ir_record_draw(&list->gpu_ir, pipeline->gpu_pipeline, &draw, &index);
+        int rc = list_capture_draw_buffers12(list, &draw);
+        if (rc == GPU_IR_OK) rc = gpu_ir_record_draw(&list->gpu_ir, pipeline->gpu_pipeline, &draw, &index);
+        list_release_captured_draw_buffers12(&draw);
         if (rc == GPU_IR_OUT_OF_MEMORY) list->validation_error = E_OUTOFMEMORY;
+        else if (rc != GPU_IR_OK) list->validation_error = E_INVALIDARG;
         else if (rc == GPU_IR_OK && index != GPU_IR_NO_COMMAND) {
             c->gpu_ir_recorded = 1;
             c->gpu_ir_index = index;
         }
     }
 }
-static WINAPI void list_blend_factor(void *this, const float f[4]) { cmd12 *c = rec(this, C_BLEND_FACTOR); if (f) memcpy(c->values, f, 16); else { float one[4] = { 1, 1, 1, 1 }; memcpy(c->values, one, 16); } }
+static WINAPI void list_blend_factor(void *this, const float f[4]) {
+    list12 *list = this;
+    cmd12 *command = rec(list, C_BLEND_FACTOR);
+    if (f) memcpy(command->values, f, sizeof list->recording_blend_factor);
+    else for (uint32_t i = 0; i < 4; i++) ((float *)command->values)[i] = 1.0f;
+    memcpy(list->recording_blend_factor, command->values, sizeof list->recording_blend_factor);
+}
 static WINAPI void list_stencil_ref(void *this, uint32_t v) { cmd12 *c = rec(this, C_STENCIL_REF); c->a = v; }
 static WINAPI void list_write_buffer_immediate(void *this, uint32_t count,
     const WRITE_BUFFER_IMMEDIATE_PARAMETER12 *parameters, const int32_t *modes) {
@@ -5254,6 +5813,12 @@ static int gpu_ir_descriptor_value_for_slot12(dev12 *device, const rootsig12 *ro
     memcpy(&descriptor, heap->cpu + 32ull * index, sizeof descriptor);
     uint8_t encoded_class = heap->descriptor_kind ? heap->descriptor_kind[index] : 0;
     if (encoded_class && encoded_class - 1 != slot->cls) return GPU_IR_INVALID;
+    if (slot->cls == DXIL_SRV) {
+        uint32_t raw_mapping = (descriptor.flags & DXIL_MSL_DESC_COMPONENT_MAPPING_MASK) >>
+                               DXIL_MSL_DESC_COMPONENT_MAPPING_SHIFT;
+        if (raw_mapping && !d3d12_normalize_srv_component_mapping12(raw_mapping, &out->component_mapping))
+            return GPU_IR_INVALID;
+    }
 
     if (binding.kind == GPU_IR_DESCRIPTOR_SAMPLER) {
         id<MTLSamplerState> sampler = heap->keep ? heap->keep[index] : nil;
@@ -5393,6 +5958,54 @@ static int gpu_ir_snapshot_root_bindings12(dev12 *device, const dxil_msl *shader
         for (uint32_t i = 0; i < values.count; i++) gpu_ir_descriptor_value_discard12(&values.values[i]);
     free(values.values);
     return result;
+}
+
+static int d3d12_shader_component_mapping_read12(dev12 *device, const dxil_msl *shader, uint32_t stage,
+    root_binding *root, heap12 *resource_heap, heap12 *sampler_heap) {
+    if (!device || !shader || !shader->uses_component_mapping_unsupported_read) return GPU_IR_OK;
+    int mapped = 0;
+    if (shader->nslots) {
+        gpu_ir_descriptor_state *bindings = NULL;
+        pthread_mutex_lock(&device->lock);
+        int result = gpu_ir_snapshot_root_bindings12(device, shader, stage, root, resource_heap,
+                                                     sampler_heap, &bindings);
+        pthread_mutex_unlock(&device->lock);
+        if (result != GPU_IR_OK) return result;
+        for (uint32_t i = 0; i < gpu_ir_descriptor_state_value_count(bindings); i++) {
+            gpu_ir_descriptor_value value;
+            result = gpu_ir_descriptor_state_value_at(bindings, i, &value);
+            if (result != GPU_IR_OK) break;
+            if (value.component_mapping) { mapped = 1; break; }
+        }
+        gpu_ir_descriptor_state_release(bindings);
+        if (result != GPU_IR_OK) return result;
+    }
+    // SM 6.6 handles can index any SRV in the visible heap. Scan conservatively because the shader
+    // does not expose which runtime index will be read at dispatch/draw time.
+    if (!mapped && shader->uses_heap && resource_heap && resource_heap->cpu) {
+        pthread_mutex_lock(&device->lock);
+        for (uint32_t i = 0; i < resource_heap->desc.NumDescriptors; i++) {
+            uint8_t encoded_class = resource_heap->descriptor_kind ? resource_heap->descriptor_kind[i] : 0;
+            if (encoded_class && encoded_class != DXIL_SRV + 1) continue;
+            VxDesc descriptor;
+            memcpy(&descriptor, resource_heap->cpu + 32ull * i, sizeof descriptor);
+            uint32_t raw_mapping = (descriptor.flags & DXIL_MSL_DESC_COMPONENT_MAPPING_MASK) >>
+                                   DXIL_MSL_DESC_COMPONENT_MAPPING_SHIFT;
+            if (!raw_mapping) continue;
+            uint32_t normalized;
+            if (!d3d12_normalize_srv_component_mapping12(raw_mapping, &normalized)) {
+                pthread_mutex_unlock(&device->lock);
+                return GPU_IR_INVALID;
+            }
+            if (normalized) { mapped = 1; break; }
+        }
+        pthread_mutex_unlock(&device->lock);
+    }
+    if (mapped) {
+        vx_log("D3D12: non-identity SRV component mapping is unsupported for comparison sampling and comparison gather");
+        return GPU_IR_UNSUPPORTED;
+    }
+    return GPU_IR_OK;
 }
 
 static int gpu_ir_access_add_descriptor12(dev12 *device, gpu_ir_access_list12 *list, heap12 *heap,
@@ -5873,17 +6486,69 @@ static int d3d12_use_compute_accesses12(id<MTLComputeCommandEncoder> encoder,
     return GPU_IR_OK;
 }
 
+static int d3d12_common_binding_is_texture12(const gpu_ir_shader *shader,
+                                             const gpu_ir_descriptor_binding *binding) {
+    if (!shader || !binding) return 0;
+    for (uint32_t i = 0; i < gpu_ir_shader_instruction_count(shader); i++) {
+        const gpu_ir_shader_instruction *variable = gpu_ir_shader_instruction_at(shader, i);
+        if (!variable || variable->opcode != GPU_IR_SHADER_OP_VARIABLE ||
+            variable->function_index != UINT32_MAX ||
+            variable->storage_class != GPU_IR_SHADER_STORAGE_UNIFORM_CONSTANT ||
+            variable->resource_set != binding->set || variable->binding_namespace != binding->binding_namespace ||
+            variable->binding != binding->binding) continue;
+        const gpu_ir_shader_type *pointer = gpu_ir_shader_find_type(shader, variable->result_type_id);
+        const gpu_ir_shader_type *image = pointer && pointer->kind == GPU_IR_SHADER_TYPE_POINTER ?
+            gpu_ir_shader_find_type(shader, pointer->element_type_id) : NULL;
+        if (image && image->kind == GPU_IR_SHADER_TYPE_IMAGE) return 1;
+    }
+    return 0;
+}
+
 static int d3d12_bind_common_compute_descriptors12(id<MTLComputeCommandEncoder> encoder,
                                                    const gpu_ir_pipeline *pipeline,
                                                    const gpu_ir_descriptor_state *state) {
     const gpu_ir_pipeline_layout *layout = gpu_ir_pipeline_layout_of(pipeline);
     if (!layout) return GPU_IR_OK;
+    const gpu_ir_shader *shader = gpu_ir_pipeline_shader(pipeline, GPU_IR_STAGE_COMPUTE);
     uint64_t buffer_ranges[GPU_IR_METAL_MAX_COMPUTE_STORAGE_BUFFERS] = { 0 };
-    uint32_t metal_slot = 0;
+    uint32_t metal_slot = 0, texture_slot = 0;
     for (uint32_t i = 0; i < gpu_ir_pipeline_layout_binding_count(layout); i++) {
         gpu_ir_descriptor_binding binding;
         if (gpu_ir_pipeline_layout_binding_at(layout, i, &binding) != GPU_IR_OK) return GPU_IR_INVALID;
         if (!(binding.stage_mask & GPU_IR_STAGE_COMPUTE)) continue;
+        if (d3d12_common_binding_is_texture12(shader, &binding)) {
+            if (binding.binding_namespace != 0 || binding.kind != GPU_IR_DESCRIPTOR_READ_ONLY_RESOURCE ||
+                !binding.count || binding.count == GPU_IR_DESCRIPTOR_COUNT_UNBOUNDED ||
+                binding.count > GPU_IR_METAL_MAX_COMPUTE_TEXTURES - texture_slot)
+                return GPU_IR_UNSUPPORTED;
+            for (uint32_t array_element = 0; array_element < binding.count; array_element++) {
+                gpu_ir_descriptor_value value = { 0 };
+                int result = state ? gpu_ir_descriptor_state_find_for_stage(state, binding.set,
+                    binding.binding_namespace, binding.binding, array_element, GPU_IR_STAGE_COMPUTE, &value) :
+                    GPU_IR_NOT_FOUND;
+                if (result == GPU_IR_NOT_FOUND || (result == GPU_IR_OK &&
+                    (value.flags & GPU_IR_DESCRIPTOR_VALUE_NULL))) {
+                    [encoder setTexture:nil atIndex:texture_slot++];
+                    continue;
+                }
+                if (result != GPU_IR_OK || !value.resource || gpu_ir_resource_is_buffer(value.resource))
+                    return result == GPU_IR_OK ? GPU_IR_INVALID : result;
+                id<MTLTexture> texture = value.backend_object ?
+                    (__bridge id<MTLTexture>)value.backend_object :
+                    (__bridge id<MTLTexture>)gpu_ir_backend_object(value.resource);
+                if (!texture) return GPU_IR_INVALID;
+                if (value.component_mapping) {
+                    void *swizzled_view = gpu_ir_metal_texture_view_with_component_mapping(
+                        (__bridge void *)texture, value.component_mapping);
+                    if (!swizzled_view) return GPU_IR_UNSUPPORTED;
+                    texture = (__bridge_transfer id<MTLTexture>)swizzled_view;
+                }
+                [encoder setTexture:texture atIndex:texture_slot];
+                [encoder useResource:texture usage:d3d12_metal_usage12(value.access_mask)];
+                texture_slot++;
+            }
+            continue;
+        }
         if (!binding.count || binding.count == GPU_IR_DESCRIPTOR_COUNT_UNBOUNDED ||
             binding.count > GPU_IR_METAL_MAX_COMPUTE_STORAGE_BUFFERS - metal_slot ||
             !((binding.binding_namespace == 0 &&
@@ -6167,27 +6832,29 @@ static int d3d12_gpu_ir_dispatch(void *opaque, const gpu_ir_pipeline *pipeline,
                     [*ce useResource:heap->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
     }
 
-    id<MTLComputePipelineState> metal_pipeline = api_pipeline->common_ir_compute ?
-        (__bridge id<MTLComputePipelineState>)gpu_ir_pipeline_backend_object(pipeline) : api_pipeline->compute;
-    if (!metal_pipeline) return GPU_IR_INVALID;
     int access_result = d3d12_use_compute_accesses12(*ce, accesses, access_count);
     if (access_result != GPU_IR_OK) return access_result;
-    [*ce setComputePipelineState:metal_pipeline];
-    if (api_pipeline->common_ir_compute) {
-        gpu_ir_descriptor_state *bindings = NULL;
-        int bind_result = GPU_IR_OK;
-        if (api_pipeline->msl.nslots) {
-            pthread_mutex_lock(&device->lock);
-            bind_result = gpu_ir_snapshot_root_bindings12(device, &api_pipeline->msl,
-                GPU_IR_STAGE_COMPUTE, context->compute_root, context->resource_heap,
-                context->sampler_heap, &bindings);
-            pthread_mutex_unlock(&device->lock);
-        }
-        if (bind_result == GPU_IR_OK)
-            bind_result = d3d12_bind_common_compute_descriptors12(*ce, pipeline, bindings);
-        gpu_ir_descriptor_state_release(bindings);
-        if (bind_result != GPU_IR_OK) return bind_result;
+    int use_common_pipeline = api_pipeline->common_ir_compute;
+    gpu_ir_descriptor_state *bindings = NULL;
+    int bind_result = GPU_IR_OK;
+    if (use_common_pipeline && api_pipeline->msl.nslots) {
+        pthread_mutex_lock(&device->lock);
+        bind_result = gpu_ir_snapshot_root_bindings12(device, &api_pipeline->msl,
+            GPU_IR_STAGE_COMPUTE, context->compute_root, context->resource_heap,
+            context->sampler_heap, &bindings);
+        pthread_mutex_unlock(&device->lock);
+    }
+    if (bind_result == GPU_IR_OK && use_common_pipeline)
+        bind_result = d3d12_bind_common_compute_descriptors12(*ce, pipeline, bindings);
+    gpu_ir_descriptor_state_release(bindings);
+    if (bind_result != GPU_IR_OK) return bind_result;
+    if (use_common_pipeline) {
+        id<MTLComputePipelineState> metal_pipeline =
+            (__bridge id<MTLComputePipelineState>)gpu_ir_pipeline_backend_object(pipeline);
+        if (!metal_pipeline) return GPU_IR_INVALID;
+        [*ce setComputePipelineState:metal_pipeline];
     } else {
+        [*ce setComputePipelineState:api_pipeline->compute];
         uint64_t root[64 + 2];
         uint32_t words;
         stage_root(device, &api_pipeline->msl, context->compute_root, context->resource_heap,
@@ -6212,6 +6879,9 @@ static int d3d12_gpu_ir_dispatch_indirect(void *opaque, const gpu_ir_pipeline *p
         info->kind != GPU_IR_PIPELINE_COMPUTE || !gpu_ir_resource_is_buffer(arguments) ||
         (argument_offset & 3) || argument_offset > gpu_ir_buffer_size(arguments) ||
         12 > gpu_ir_buffer_size(arguments) - argument_offset) return GPU_IR_INVALID;
+    int mapping_result = d3d12_shader_component_mapping_read12(context->device, &api_pipeline->msl,
+        GPU_IR_STAGE_COMPUTE, context->compute_root, context->resource_heap, context->sampler_heap);
+    if (mapping_result != GPU_IR_OK) return mapping_result;
 
     dev12 *device = context->device;
     id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)context->command_buffer;
@@ -6279,7 +6949,8 @@ static uint32_t gpu_ir_topology_from_metal12(MTLPrimitiveType primitive) {
 }
 
 static int d3d12_gpu_ir_prepare_draw12(d3d12_draw_context *context, const gpu_ir_pipeline *pipeline,
-                                      uint32_t topology, const gpu_ir_resource_access *accesses,
+                                      const gpu_ir_draw_info *draw, uint32_t topology,
+                                      const gpu_ir_resource_access *accesses,
                                       uint32_t access_count, MTLPrimitiveType *primitive_out,
                                       id<MTLRenderCommandEncoder> __strong *encoder_out) {
     pso12 *api_pipeline = context->api_pipeline;
@@ -6297,6 +6968,12 @@ static int d3d12_gpu_ir_prepare_draw12(d3d12_draw_context *context, const gpu_ir
     }
     id<MTLRenderCommandEncoder> __strong *re = (id<MTLRenderCommandEncoder> __strong *)context->render_encoder;
     if (!re || !*re) return GPU_IR_INVALID;
+    int mapping_result = d3d12_shader_component_mapping_read12(context->device, &api_pipeline->vs,
+        GPU_IR_STAGE_VERTEX, context->graphics_root, context->resource_heap, context->sampler_heap);
+    if (mapping_result != GPU_IR_OK) return mapping_result;
+    mapping_result = d3d12_shader_component_mapping_read12(context->device, &api_pipeline->ps,
+        GPU_IR_STAGE_FRAGMENT, context->graphics_root, context->resource_heap, context->sampler_heap);
+    if (mapping_result != GPU_IR_OK) return mapping_result;
     int access_result = d3d12_use_render_accesses12(*re, accesses, access_count);
     if (access_result != GPU_IR_OK) return access_result;
     dev12 *device = context->device;
@@ -6312,7 +6989,9 @@ static int d3d12_gpu_ir_prepare_draw12(d3d12_draw_context *context, const gpu_ir
     [*re setDepthClipMode:api_pipeline->clip];
     [*re setDepthBias:api_pipeline->bias slopeScale:api_pipeline->bias_slope clamp:api_pipeline->bias_clamp];
     [*re setStencilReferenceValue:g->stencil_ref];
-    [*re setBlendColorRed:g->blend[0] green:g->blend[1] blue:g->blend[2] alpha:g->blend[3]];
+    const float *blend_constants = draw && draw->has_blend_constants ? draw->blend_constants : g->blend;
+    [*re setBlendColorRed:blend_constants[0] green:blend_constants[1]
+                     blue:blend_constants[2] alpha:blend_constants[3]];
     if (g->nvp) {
         MTLViewport viewports[10];
         for (uint32_t k = 0; k < g->nvp; k++)
@@ -6334,6 +7013,22 @@ static int d3d12_gpu_ir_prepare_draw12(d3d12_draw_context *context, const gpu_ir
         [*re setScissorRects:scissors count:count];
     }
     for (uint32_t k = 0; k < 16; k++) {
+        if (draw && draw->vertex_buffers_captured) {
+            const gpu_ir_vertex_buffer_binding *vertex = NULL;
+            for (uint32_t i = 0; i < draw->vertex_buffer_count; i++)
+                if (draw->vertex_buffers[i].binding == k) { vertex = &draw->vertex_buffers[i]; break; }
+            if (!vertex) {
+                [*re setVertexBuffer:nil offset:0 atIndex:16 + k];
+                continue;
+            }
+            if (!gpu_ir_resource_is_buffer(vertex->resource) || vertex->offset > NSUIntegerMax)
+                return GPU_IR_INVALID;
+            id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)gpu_ir_backend_object(vertex->resource);
+            if (!buffer || vertex->offset > buffer.length) return GPU_IR_RANGE;
+            [*re setVertexBuffer:buffer offset:(NSUInteger)vertex->offset attributeStride:vertex->stride
+                         atIndex:16 + k];
+            continue;
+        }
         if (!g->vb[k].va) { [*re setVertexBuffer:nil offset:0 atIndex:16 + k]; continue; }
         uint64_t offset = 0;
         id<MTLBuffer> buffer = buffer_at(device, g->vb[k].va, &offset);
@@ -6363,7 +7058,7 @@ static int d3d12_gpu_ir_draw(void *opaque, const gpu_ir_pipeline *pipeline, cons
     if (!draw->instance_count || (draw->indexed ? !draw->index_count : !draw->vertex_count)) return GPU_IR_OK;
     MTLPrimitiveType primitive;
     id<MTLRenderCommandEncoder> encoder = nil;
-    int rc = d3d12_gpu_ir_prepare_draw12(context, pipeline, draw->topology, accesses, access_count,
+    int rc = d3d12_gpu_ir_prepare_draw12(context, pipeline, draw, draw->topology, accesses, access_count,
                                           &primitive, &encoder);
     if (rc != GPU_IR_OK) return rc;
     if (!draw->indexed) {
@@ -6371,12 +7066,24 @@ static int d3d12_gpu_ir_draw(void *opaque, const gpu_ir_pipeline *pipeline, cons
             instanceCount:draw->instance_count baseInstance:draw->first_instance];
     } else {
         uint64_t offset = 0;
-        id<MTLBuffer> index_buffer = buffer_at(context->device, context->graphics_state->ib.va, &offset);
-        if (!index_buffer || (context->graphics_state->ib.format != 42 && context->graphics_state->ib.format != 57)) {
+        id<MTLBuffer> index_buffer = nil;
+        uint32_t format = 0;
+        if (draw->vertex_buffers_captured && draw->index_buffer) {
+            if (!gpu_ir_resource_is_buffer(draw->index_buffer) ||
+                (draw->index_type != GPU_IR_INDEX_TYPE_UINT32 && draw->index_type != GPU_IR_INDEX_TYPE_UINT16))
+                return GPU_IR_INVALID;
+            index_buffer = (__bridge id<MTLBuffer>)gpu_ir_backend_object(draw->index_buffer);
+            offset = draw->index_buffer_offset;
+            format = draw->index_type == GPU_IR_INDEX_TYPE_UINT32 ? 42u : 57u;
+        } else if (!draw->vertex_buffers_captured) {
+            index_buffer = buffer_at(context->device, context->graphics_state->ib.va, &offset);
+            format = context->graphics_state->ib.format;
+        }
+        if (!index_buffer || (format != 42 && format != 57)) {
             vx_log("D3D12: an indexed draw without a supported index buffer");
             return GPU_IR_INVALID;
         }
-        int index32 = context->graphics_state->ib.format == 42;
+        int index32 = format == 42;
         [encoder drawIndexedPrimitives:primitive indexCount:draw->index_count
             indexType:index32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:index_buffer
             indexBufferOffset:offset + (uint64_t)draw->first_index * (index32 ? 4 : 2)
@@ -6435,6 +7142,9 @@ static int d3d12_gpu_ir_dispatch_indirect_range(void *opaque, const gpu_ir_pipel
     const gpu_ir_pipeline_info *info = gpu_ir_pipeline_description(pipeline);
     if (!api_pipeline || !api_pipeline->compute || api_pipeline->gpu_pipeline != pipeline || !info ||
         info->kind != GPU_IR_PIPELINE_COMPUTE) return GPU_IR_INVALID;
+    int mapping_result = d3d12_shader_component_mapping_read12(context->device, &api_pipeline->msl,
+        GPU_IR_STAGE_COMPUTE, context->compute_root, context->resource_heap, context->sampler_heap);
+    if (mapping_result != GPU_IR_OK) return mapping_result;
 
     uint64_t records = (uint64_t)dispatch->dispatch_count - 1;
     uint64_t last_offset, required_end;
@@ -6612,17 +7322,37 @@ static int d3d12_gpu_ir_draw_indirect(void *opaque, const gpu_ir_pipeline *pipel
     gfx_state *g = context->graphics_state;
     MTLPrimitiveType primitive;
     id<MTLRenderCommandEncoder> encoder = nil;
-    int rc = d3d12_gpu_ir_prepare_draw12(context, pipeline, draw->topology, accesses, access_count,
+    gpu_ir_draw_info captured_state = {
+        .vertex_buffers_captured = draw->vertex_buffers_captured,
+        .vertex_buffer_count = draw->vertex_buffer_count,
+        .has_blend_constants = draw->has_blend_constants
+    };
+    memcpy(captured_state.blend_constants, draw->blend_constants, sizeof captured_state.blend_constants);
+    if (draw->vertex_buffer_count)
+        memcpy(captured_state.vertex_buffers, draw->vertex_buffers,
+               draw->vertex_buffer_count * sizeof draw->vertex_buffers[0]);
+    int rc = d3d12_gpu_ir_prepare_draw12(context, pipeline, &captured_state, draw->topology, accesses, access_count,
                                           &primitive, &encoder);
     if (rc != GPU_IR_OK) return rc;
     id<MTLBuffer> index_buffer = nil;
     uint64_t index_offset = 0;
     MTLIndexType index_type = MTLIndexTypeUInt16;
     if (draw->indexed) {
-        if (!g->ib.va || (g->ib.format != 42 && g->ib.format != 57)) return GPU_IR_INVALID;
-        index_buffer = buffer_at(context->device, g->ib.va, &index_offset);
-        if (!index_buffer) return GPU_IR_INVALID;
-        index_type = g->ib.format == 42 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
+        if (draw->vertex_buffers_captured) {
+            if (!draw->index_buffer ||
+                (draw->index_type != GPU_IR_INDEX_TYPE_UINT16 && draw->index_type != GPU_IR_INDEX_TYPE_UINT32))
+                return GPU_IR_INVALID;
+            index_buffer = (__bridge id<MTLBuffer>)gpu_ir_backend_object(draw->index_buffer);
+            index_offset = draw->index_buffer_offset;
+            if (!index_buffer || index_offset > index_buffer.length ||
+                draw->index_buffer_size > index_buffer.length - index_offset) return GPU_IR_RANGE;
+            index_type = draw->index_type == GPU_IR_INDEX_TYPE_UINT32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
+        } else {
+            if (!g->ib.va || (g->ib.format != 42 && g->ib.format != 57)) return GPU_IR_INVALID;
+            index_buffer = buffer_at(context->device, g->ib.va, &index_offset);
+            if (!index_buffer) return GPU_IR_INVALID;
+            index_type = g->ib.format == 42 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
+        }
     }
     [encoder useResource:indirect_buffer usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
     for (uint32_t i = 0; i < draw->draw_count; i++) {
@@ -7113,8 +7843,10 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             gpu_ir_backend backend = { .context = &context, .draw = d3d12_gpu_ir_draw };
             gpu_ir_draw_info draw = {
                 .topology = gpu_ir_topology_from_metal12(g->prim), .indexed = c->op == C_DRAW_INDEXED,
-                .instance_count = c->b, .first_instance = c->op == C_DRAW ? (uint32_t)c->off : (uint32_t)c->off2
+                .instance_count = c->b, .first_instance = c->op == C_DRAW ? (uint32_t)c->off : (uint32_t)c->off2,
+                .has_blend_constants = 1
             };
+            memcpy(draw.blend_constants, g->blend, sizeof draw.blend_constants);
             if (draw.indexed) {
                 draw.index_count = c->a;
                 draw.first_index = c->c;
@@ -7131,8 +7863,13 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             if (access_rc == GPU_IR_OK) {
                 if (c->gpu_ir_recorded)
                     rc = gpu_ir_execute_with_accesses(&l->gpu_ir, c->gpu_ir_index, &backend, accesses.values, accesses.count);
-                else if (c->gpu_ir_transient)
-                    rc = gpu_ir_execute_transient_draw(pso->gpu_pipeline, &draw, accesses.values, accesses.count, &backend);
+                else if (c->gpu_ir_transient) {
+                    rc = list_capture_replay_draw_buffers12(l, g->vb, &g->ib, &draw);
+                    if (rc == GPU_IR_OK)
+                        rc = gpu_ir_execute_transient_draw(pso->gpu_pipeline, &draw, accesses.values,
+                                                           accesses.count, &backend);
+                    list_release_captured_draw_buffers12(&draw);
+                }
                 else
                     rc = d3d12_gpu_ir_draw(&context, pso->gpu_pipeline, &draw, accesses.values, accesses.count);
             } else {
@@ -7147,6 +7884,9 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
         }
         case C_DISPATCH: {
             if (!pso || !pso->compute) { vx_log("D3D12: Dispatch without a compute pipeline state"); break; }
+            int mapping_result = d3d12_shader_component_mapping_read12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
+                                                                        compute, heap, sheap);
+            if (mapping_result != GPU_IR_OK) break;
             if (c->gpu_ir_recorded || c->gpu_ir_transient) {
                 d3d12_dispatch_context context = {
                     .device = d, .command_buffer = (__bridge void *)cb,
@@ -8341,6 +9081,7 @@ static WINAPI HRESULT dev_create_list(void *this, uint32_t node, int32_t type, v
     command_allocator->recording_lists++;
     d3d_addref(&command_allocator->base);
     l->recording_topology = 4;
+    for (uint32_t i = 0; i < 4; i++) l->recording_blend_factor[i] = 1.0f;
     gpu_ir_stream_init(&l->gpu_ir);
     if (pso) list_set_pso(l, pso);
     pthread_mutex_unlock(&device->submit_lock);
@@ -9038,6 +9779,10 @@ static int d3d12_int64_shader_ops_supported12(dev12 *device) {
     return device && device->mtl && [device->mtl supportsFamily:MTLGPUFamilyApple3];
 }
 
+static int d3d12_feature_level_known12(int32_t level) {
+    return level == 0xb000 || level == 0xb100 || level == 0xc000 || level == 0xc100 || level == 0xc200;
+}
+
 // D3D12_FEATURE: only what tells a program what it may use.
 static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data, uint32_t size) {
     dev12 *device = this;
@@ -9079,7 +9824,11 @@ static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data,
         struct { uint32_t n; uint32_t pad; const int32_t *levels; int32_t max; } *f = data;
         if (!data || size != sizeof *f || !f->n || !f->levels) return E_INVALIDARG;
         int32_t best = 0;
-        for (uint32_t i = 0; i < f->n; i++) if (f->levels[i] <= 0xc000 && f->levels[i] > best) best = f->levels[i];
+        // D3D12 12_0 requires tiled resources tier 2, min/max filters, and output-merger logic operations.
+        // VXRuntime reports tiled resources and logic operations unsupported, so it must not advertise 12_0.
+        for (uint32_t i = 0; i < f->n; i++)
+            if (d3d12_feature_level_known12(f->levels[i]) && f->levels[i] <= 0xb100 && f->levels[i] > best)
+                best = f->levels[i];
         f->max = best;
         return S_OK;
     }
@@ -9105,22 +9854,9 @@ static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data,
         q->quality_levels = 0;
         if (!sample_count || sample_count > 16 || (sample_count & (sample_count - 1)) || (q->flags & 1)) return S_OK;
         dev12 *d = this;
-        uint32_t bytes_per_pixel = 0;
-        MTLPixelFormat format = d3d_mtl_format(q->format, &bytes_per_pixel);
-        if (format == MTLPixelFormatInvalid || ![d->mtl supportsTextureSampleCount:sample_count]) return S_OK;
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:1 height:1 mipmapped:NO];
-        td.usage = MTLTextureUsageRenderTarget;
-        td.storageMode = MTLStorageModePrivate;
-        if (sample_count > 1) {
-            td.textureType = MTLTextureType2DMultisample;
-            td.sampleCount = sample_count;
-        }
-        @try {
-            id<MTLTexture> texture = [d->mtl newTextureWithDescriptor:td];
-            if (texture) q->quality_levels = 1;                 // Metal's standard sample positions map to quality index 0.
-        } @catch (NSException *exception) {
-            (void)exception;
-        }
+        RES_DESC probe = { 3, 0, 1, 1, 1, 1, q->format, sample_count, 0, D3D12_LAYOUT_UNKNOWN12, 1 };
+        if (texture_sample_supported12(d, &probe))
+            q->quality_levels = 1;                               // Metal's standard sample positions map to quality index 0.
         return S_OK;
     }
     case 5: {                                                      // FORMAT_INFO
@@ -9191,7 +9927,7 @@ static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data,
         options->write_buffer_immediate_support_flags = 1u | 4u | 8u;
         return S_OK;
     }
-    case 13: {                                                     // ROOT_SIGNATURE {HighestVersion}
+    case 12: {                                                     // ROOT_SIGNATURE {HighestVersion}
         if (!data || size != sizeof(int32_t)) return E_INVALIDARG;
         int32_t *v = data;
         if (*v > 2) *v = 2;
@@ -9455,7 +10191,8 @@ static WINAPI void debug_noop(void *this) { }
 
 static WINAPI HRESULT D3D12CreateDevice(void *adapter, int32_t min_level, const GUID *iid, void **out) {
     pthread_once(&g_tables_once, make_tables);
-    if (min_level > 0xc200) return E_INVALIDARG;                   // (feature level 12_2 and above: not offered)
+    if (min_level && !d3d12_feature_level_known12(min_level)) return E_INVALIDARG;
+    if (min_level > 0xb100) return DXGI_ERROR_UNSUPPORTED;          // highest advertised feature level is 11_1
     id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
     if (!mtl) return E_FAIL;
     if (!out) return S_FALSE;                                      // (a check that a device could be made)
@@ -9489,15 +10226,19 @@ static WINAPI HRESULT D3D12GetDebugInterface(const GUID *iid, void **out) {
 
 static WINAPI HRESULT D3D12SerializeRootSignature(const RS_DESC *desc, int32_t version, void **blob, void **errors) {
     if (errors) *errors = NULL;
-    if (!desc || !blob) return E_INVALIDARG;
-    *blob = serialize_rootsig(version == 2 ? 2 : 1, desc);
-    return S_OK;
+    if (!blob) return E_INVALIDARG;
+    *blob = NULL;
+    if (!desc || version != 1) return E_INVALIDARG;
+    *blob = serialize_rootsig(version, desc);
+    return *blob ? S_OK : E_OUTOFMEMORY;
 }
 static WINAPI HRESULT D3D12SerializeVersionedRootSignature(const VERSIONED_RS_DESC *desc, void **blob, void **errors) {
     if (errors) *errors = NULL;
-    if (!desc || !blob) return E_INVALIDARG;
-    *blob = serialize_rootsig(desc->version == 2 || desc->version == 3 ? 2 : 1, &desc->desc);
-    return S_OK;
+    if (!blob) return E_INVALIDARG;
+    *blob = NULL;
+    if (!desc || desc->version < 1 || desc->version > 3) return E_INVALIDARG;
+    *blob = serialize_rootsig(desc->version, &desc->desc);
+    return *blob ? S_OK : E_OUTOFMEMORY;
 }
 static WINAPI HRESULT D3D12EnableExperimentalFeatures(uint32_t n, const GUID *iids, void *configs, uint32_t *sizes) { return E_NOINTERFACE; }
 static WINAPI HRESULT D3D12GetInterface(const GUID *clsid, const GUID *iid, void **out) { if (out) *out = NULL; return E_NOINTERFACE; }

@@ -3,6 +3,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+enum {
+    SPIRV_OPCODE_CAPABILITY = 17,
+    SPIRV_CAPABILITY_GROUP_NON_UNIFORM = 61,
+    SPIRV_CAPABILITY_GROUP_NON_UNIFORM_VOTE = 62,
+    SPIRV_CAPABILITY_GROUP_NON_UNIFORM_ARITHMETIC = 63,
+    SPIRV_SCOPE_SUBGROUP = 3
+};
+
 static uint32_t gpu_stage(uint32_t model) {
     switch (model) {
     case SPIRV_EXECUTION_MODEL_VERTEX: return GPU_IR_STAGE_VERTEX;
@@ -305,6 +313,11 @@ static uint32_t gpu_shader_decoration_flags(uint32_t flags) {
     if (flags & SPIRV_DECORATION_NON_READABLE) mapped |= GPU_IR_SHADER_TYPE_FLAG_NON_READABLE;
     if (flags & SPIRV_DECORATION_ROW_MAJOR) mapped |= GPU_IR_SHADER_TYPE_FLAG_ROW_MAJOR;
     if (flags & SPIRV_DECORATION_COL_MAJOR) mapped |= GPU_IR_SHADER_TYPE_FLAG_COLUMN_MAJOR;
+    if (flags & SPIRV_DECORATION_NO_PERSPECTIVE) mapped |= GPU_IR_SHADER_DECORATION_NO_PERSPECTIVE;
+    if (flags & SPIRV_DECORATION_FLAT) mapped |= GPU_IR_SHADER_DECORATION_FLAT;
+    if (flags & SPIRV_DECORATION_CENTROID) mapped |= GPU_IR_SHADER_DECORATION_CENTROID;
+    if (flags & SPIRV_DECORATION_SAMPLE) mapped |= GPU_IR_SHADER_DECORATION_SAMPLE;
+    if (flags & SPIRV_DECORATION_INVARIANT) mapped |= GPU_IR_SHADER_DECORATION_INVARIANT;
     return mapped;
 }
 
@@ -330,12 +343,20 @@ static uint32_t gpu_shader_storage_class(uint32_t source_storage_class) {
 
 static uint32_t gpu_shader_builtin(uint32_t source_builtin) {
     switch (source_builtin) {
+    case 0: return GPU_IR_SHADER_BUILTIN_POSITION;
+    case 15: return GPU_IR_SHADER_BUILTIN_FRAG_COORD;
+    case 17: return GPU_IR_SHADER_BUILTIN_FRONT_FACING;
+    case 22: return GPU_IR_SHADER_BUILTIN_FRAG_DEPTH;
     case 24: return GPU_IR_SHADER_BUILTIN_NUM_WORKGROUPS;
     case 25: return GPU_IR_SHADER_BUILTIN_WORKGROUP_SIZE;
     case 26: return GPU_IR_SHADER_BUILTIN_WORKGROUP_ID;
     case 27: return GPU_IR_SHADER_BUILTIN_LOCAL_INVOCATION_ID;
     case 28: return GPU_IR_SHADER_BUILTIN_GLOBAL_INVOCATION_ID;
     case 29: return GPU_IR_SHADER_BUILTIN_LOCAL_INVOCATION_INDEX;
+    case 36: return GPU_IR_SHADER_BUILTIN_SUBGROUP_SIZE;
+    case 41: return GPU_IR_SHADER_BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID;
+    case 42: return GPU_IR_SHADER_BUILTIN_VERTEX_INDEX;
+    case 43: return GPU_IR_SHADER_BUILTIN_INSTANCE_INDEX;
     default: return GPU_IR_SHADER_BUILTIN_UNMAPPED;
     }
 }
@@ -383,6 +404,29 @@ static int gpu_shader_is_32bit_integer_scalar_constant(const spirv_module *modul
     const spirv_id_record *type = value ? spirv_find_id(module, value->type_id) : NULL;
     return value && value->kind == SPIRV_ID_CONSTANT && value->constant_kind == SPIRV_CONSTANT_SCALAR &&
            type && type->kind == SPIRV_ID_TYPE && type->type_kind == SPIRV_TYPE_INT && type->width == 32;
+}
+
+static int gpu_shader_u32_constant(const spirv_module *module, uint32_t id, uint32_t *value) {
+    const spirv_id_record *constant = spirv_find_id(module, id);
+    const spirv_id_record *type = constant ? spirv_find_id(module, constant->type_id) : NULL;
+    if (!value || !constant || constant->kind != SPIRV_ID_CONSTANT || constant->is_specialization ||
+        constant->constant_kind != SPIRV_CONSTANT_SCALAR || !type || type->kind != SPIRV_ID_TYPE ||
+        type->type_kind != SPIRV_TYPE_INT || type->width != 32 || type->signedness)
+        return 0;
+    *value = (uint32_t)constant->value_bits;
+    return 1;
+}
+
+static int gpu_shader_has_capability(const spirv_module *module, uint32_t capability) {
+    spirv_iterator iterator;
+    spirv_instruction instruction;
+    spirv_iter_begin(module, &iterator);
+    int next;
+    while ((next = spirv_iter_next(&iterator, &instruction)) > 0) {
+        if (instruction.opcode == SPIRV_OPCODE_CAPABILITY && instruction.word_count == 2 &&
+            instruction.words[1] == capability) return 1;
+    }
+    return 0;
 }
 
 static int gpu_shader_is_zero_32bit_integer_scalar_constant(const spirv_module *module, uint32_t id) {
@@ -469,6 +513,9 @@ static uint32_t gpu_shader_glsl450_arithmetic(uint32_t opcode) {
     case 37: return GPU_IR_SHADER_ARITH_MINIMUM;        // FMin
     case 40: return GPU_IR_SHADER_ARITH_MAXIMUM;        // FMax
     case 43: return GPU_IR_SHADER_ARITH_CLAMP;          // FClamp
+    case 46: return GPU_IR_SHADER_ARITH_INTERPOLATE;    // FMix
+    case 48: return GPU_IR_SHADER_ARITH_STEP;           // Step
+    case 49: return GPU_IR_SHADER_ARITH_SMOOTHSTEP;     // SmoothStep
     case 50: return GPU_IR_SHADER_ARITH_FMA;            // Fma
     case 1: return GPU_IR_SHADER_ARITH_ROUND;            // Round
     case 2: return GPU_IR_SHADER_ARITH_ROUND_EVEN;       // RoundEven
@@ -530,6 +577,8 @@ static int gpu_shader_validate_glsl450_arithmetic(const spirv_module *module,
         return result->width == 32 ? GPU_IR_OK : GPU_IR_UNSUPPORTED;
     }
     uint32_t operand_count = operation == GPU_IR_SHADER_ARITH_CLAMP ||
+        operation == GPU_IR_SHADER_ARITH_INTERPOLATE ||
+        operation == GPU_IR_SHADER_ARITH_SMOOTHSTEP ||
         operation == GPU_IR_SHADER_ARITH_FMA ? 3u :
         operation == GPU_IR_SHADER_ARITH_ABSOLUTE || operation == GPU_IR_SHADER_ARITH_FLOOR ||
         operation == GPU_IR_SHADER_ARITH_CEILING || operation == GPU_IR_SHADER_ARITH_SQRT ||
@@ -989,6 +1038,48 @@ static int gpu_shader_validate_bit_reverse(const spirv_module *module, const spi
     return input->width == 32 && result->width == 32 ? GPU_IR_OK : GPU_IR_UNSUPPORTED;
 }
 
+static int gpu_shader_validate_subgroup_vote(const spirv_module *module, const spirv_instruction *source) {
+    const uint32_t *w = source->words;
+    if (source->word_count != 5) return GPU_IR_INVALID;
+    uint32_t scope = 0;
+    const spirv_id_record *result = gpu_shader_type_record(module, w[1]);
+    const spirv_id_record *predicate = spirv_find_id(module, w[4]);
+    const spirv_id_record *predicate_type = predicate ? gpu_shader_type_record(module, predicate->type_id) : NULL;
+    if (!gpu_shader_has_capability(module, SPIRV_CAPABILITY_GROUP_NON_UNIFORM) ||
+        !gpu_shader_has_capability(module, SPIRV_CAPABILITY_GROUP_NON_UNIFORM_VOTE) ||
+        !gpu_shader_u32_constant(module, w[3], &scope) || scope != SPIRV_SCOPE_SUBGROUP || !result ||
+        result->type_kind != SPIRV_TYPE_BOOL || !predicate ||
+        (predicate->kind != SPIRV_ID_CONSTANT && predicate->kind != SPIRV_ID_INSTRUCTION_RESULT &&
+         predicate->kind != SPIRV_ID_FUNCTION_PARAMETER) || !predicate_type ||
+        predicate_type->type_kind != SPIRV_TYPE_BOOL) return GPU_IR_INVALID;
+    return GPU_IR_OK;
+}
+
+static int gpu_shader_validate_subgroup_integer_reduction(const spirv_module *module,
+                                                           const spirv_instruction *source,
+                                                           uint32_t opcode) {
+    const uint32_t *w = source->words;
+    if (source->word_count != 6) return GPU_IR_INVALID;
+    uint32_t scope = 0, group_operation = UINT32_MAX;
+    const spirv_id_record *result = gpu_shader_type_record(module, w[1]);
+    const spirv_id_record *value = spirv_find_id(module, w[5]);
+    const spirv_id_record *input = value ? gpu_shader_type_record(module, value->type_id) : NULL;
+    int signed_operation = opcode == 352 || opcode == 355;
+    int minmax_operation = opcode == 352 || opcode == 353 || opcode == 355 || opcode == 356;
+    if (!gpu_shader_has_capability(module, SPIRV_CAPABILITY_GROUP_NON_UNIFORM) ||
+        !gpu_shader_has_capability(module, SPIRV_CAPABILITY_GROUP_NON_UNIFORM_ARITHMETIC) ||
+        !gpu_shader_u32_constant(module, w[3], &scope) || scope != SPIRV_SCOPE_SUBGROUP ||
+        !gpu_shader_u32_constant(module, w[4], &group_operation) || group_operation != 0 ||
+        !result || result->type_kind != SPIRV_TYPE_INT || result->width != 32 || !value || !input ||
+        value->type_id != w[1] || input->type_kind != SPIRV_TYPE_INT || input->width != 32 ||
+        (minmax_operation && (result->signedness != (uint32_t)signed_operation ||
+                              input->signedness != (uint32_t)signed_operation)) ||
+        result->signedness != input->signedness ||
+        (value->kind != SPIRV_ID_CONSTANT && value->kind != SPIRV_ID_INSTRUCTION_RESULT &&
+         value->kind != SPIRV_ID_FUNCTION_PARAMETER)) return GPU_IR_INVALID;
+    return GPU_IR_OK;
+}
+
 static int gpu_shader_validate_bit_field(const spirv_module *module, const spirv_instruction *source,
                                          uint32_t opcode) {
     const uint32_t *w = source->words;
@@ -1061,6 +1152,71 @@ static int gpu_shader_validate_image_instruction(const spirv_module *module,
     return GPU_IR_OK;
 }
 
+static int gpu_shader_validate_image_query_size(const spirv_module *module,
+                                                const spirv_instruction *source,
+                                                uint32_t opcode) {
+    const uint32_t *w = source->words;
+    if (source->word_count != (opcode == 103 ? 5u : 4u)) return GPU_IR_INVALID;
+    if (opcode == 103) {
+        const spirv_id_record *lod = spirv_find_id(module, gpu_shader_value_type_id(module, w[4]));
+        if (!lod || lod->kind != SPIRV_ID_TYPE || lod->type_kind != SPIRV_TYPE_INT || lod->width != 32)
+            return GPU_IR_UNSUPPORTED;
+    }
+    const spirv_id_record *image = spirv_find_id(module, gpu_shader_value_type_id(module, w[3]));
+    const spirv_id_record *sampled = image ? spirv_find_id(module, image->element_type) : NULL;
+    const spirv_id_record *result = spirv_find_id(module, w[1]);
+    const spirv_id_record *component = result && result->type_kind == SPIRV_TYPE_VECTOR ?
+        spirv_find_id(module, result->element_type) : NULL;
+    int sampled_color = image && image->image_sampled == 1 && image->image_format == 0;
+    int storage_rgba8 = image && image->image_sampled == 2 && image->image_format == 4;
+    if (!image || image->kind != SPIRV_ID_TYPE || image->type_kind != SPIRV_TYPE_IMAGE ||
+        image->image_dimension != 1 || image->image_depth ||
+        image->image_multisampled || (!sampled_color && !storage_rgba8) || image->image_access_qualifier ||
+        !sampled || sampled->kind != SPIRV_ID_TYPE || sampled->type_kind != SPIRV_TYPE_FLOAT ||
+        sampled->width != 32 || !result || result->kind != SPIRV_ID_TYPE ||
+        result->type_kind != SPIRV_TYPE_VECTOR ||
+        result->element_count != (image->image_arrayed ? 3u : 2u) || !component ||
+        component->kind != SPIRV_ID_TYPE || component->type_kind != SPIRV_TYPE_INT || component->width != 32)
+        return GPU_IR_UNSUPPORTED;
+    return GPU_IR_OK;
+}
+
+static int gpu_shader_validate_image_query_levels(const spirv_module *module,
+                                                   const spirv_instruction *source) {
+    if (!module || !source || source->opcode != 106 || source->word_count != 4) return GPU_IR_INVALID;
+    const uint32_t *w = source->words;
+    const spirv_id_record *image = spirv_find_id(module, gpu_shader_value_type_id(module, w[3]));
+    const spirv_id_record *sampled = image ? spirv_find_id(module, image->element_type) : NULL;
+    const spirv_id_record *result = spirv_find_id(module, w[1]);
+    int sampled_color = image && image->image_sampled == 1 && image->image_format == 0;
+    int storage_rgba8 = image && image->image_sampled == 2 && image->image_format == 4;
+    if (!image || image->kind != SPIRV_ID_TYPE || image->type_kind != SPIRV_TYPE_IMAGE ||
+        image->image_dimension != 1 || image->image_depth ||
+        image->image_multisampled || (!sampled_color && !storage_rgba8) || image->image_access_qualifier ||
+        !sampled || sampled->kind != SPIRV_ID_TYPE || sampled->type_kind != SPIRV_TYPE_FLOAT ||
+        sampled->width != 32 || !result || result->kind != SPIRV_ID_TYPE ||
+        result->type_kind != SPIRV_TYPE_INT || result->width != 32)
+        return GPU_IR_UNSUPPORTED;
+    return GPU_IR_OK;
+}
+
+static int gpu_shader_validate_image_query_samples(const spirv_module *module,
+                                                    const spirv_instruction *source) {
+    if (!module || !source || source->opcode != 107 || source->word_count != 4) return GPU_IR_INVALID;
+    const uint32_t *w = source->words;
+    const spirv_id_record *image = spirv_find_id(module, gpu_shader_value_type_id(module, w[3]));
+    const spirv_id_record *sampled = image ? spirv_find_id(module, image->element_type) : NULL;
+    const spirv_id_record *result = spirv_find_id(module, w[1]);
+    if (!image || image->kind != SPIRV_ID_TYPE || image->type_kind != SPIRV_TYPE_IMAGE ||
+        image->image_dimension != 1 || image->image_depth || image->image_arrayed > 1 ||
+        image->image_multisampled != 1 || image->image_sampled != 1 || image->image_format ||
+        image->image_access_qualifier || !sampled || sampled->kind != SPIRV_ID_TYPE ||
+        sampled->type_kind != SPIRV_TYPE_FLOAT || sampled->width != 32 || !result ||
+        result->kind != SPIRV_ID_TYPE || result->type_kind != SPIRV_TYPE_INT || result->width != 32)
+        return GPU_IR_UNSUPPORTED;
+    return GPU_IR_OK;
+}
+
 static int gpu_shader_validate_sampled_image(const spirv_module *module,
                                             const spirv_instruction *source) {
     if (!module || !source || source->opcode != 86 || source->word_count != 5) return GPU_IR_INVALID;
@@ -1077,9 +1233,10 @@ static int gpu_shader_validate_sampled_image(const spirv_module *module,
     return GPU_IR_OK;
 }
 
-static int gpu_shader_validate_image_sample_explicit_lod(const spirv_module *module,
-                                                          const spirv_instruction *source) {
-    if (!module || !source || source->opcode != 88 || source->word_count != 7) return GPU_IR_INVALID;
+static int gpu_shader_validate_image_sample(const spirv_module *module, const spirv_instruction *source) {
+    if (!module || !source || (source->opcode != 87 && source->opcode != 88)) return GPU_IR_INVALID;
+    int implicit_lod = source->opcode == 87;
+    if (source->word_count != (implicit_lod ? 5u : 7u)) return GPU_IR_INVALID;
     const uint32_t *w = source->words;
     const spirv_id_record *sampled_value = spirv_find_id(module, w[3]);
     const spirv_id_record *sampled_type = sampled_value ? spirv_find_id(module, sampled_value->type_id) : NULL;
@@ -1094,7 +1251,7 @@ static int gpu_shader_validate_image_sample_explicit_lod(const spirv_module *mod
     const spirv_id_record *result_component = result && result->type_kind == SPIRV_TYPE_VECTOR ?
         spirv_find_id(module, result->element_type) : NULL;
     const spirv_id_record *sampled_component = image ? spirv_find_id(module, image->element_type) : NULL;
-    if (w[5] != 2 || !gpu_shader_is_zero_32bit_float_scalar_constant(module, w[6]) ||
+    if ((!implicit_lod && (w[5] != 2 || !gpu_shader_is_zero_32bit_float_scalar_constant(module, w[6]))) ||
         !image || image->kind != SPIRV_ID_TYPE || image->type_kind != SPIRV_TYPE_IMAGE ||
         image->image_dimension != 1 || image->image_depth || image->image_arrayed ||
         image->image_multisampled || image->image_sampled != 1 || image->image_format != 0 ||
@@ -1108,6 +1265,162 @@ static int gpu_shader_validate_image_sample_explicit_lod(const spirv_module *mod
         result_component->kind != SPIRV_ID_TYPE || result_component->type_kind != SPIRV_TYPE_FLOAT ||
         result_component->width != 32)
         return GPU_IR_UNSUPPORTED;
+    return GPU_IR_OK;
+}
+
+static uint32_t gpu_shader_atomic_operation(uint32_t opcode) {
+    switch (opcode) {
+    case 227: return GPU_IR_SHADER_ATOMIC_INTEGER_LOAD;
+    case 228: return GPU_IR_SHADER_ATOMIC_INTEGER_STORE;
+    case 229: return GPU_IR_SHADER_ATOMIC_INTEGER_EXCHANGE;
+    case 234: return GPU_IR_SHADER_ATOMIC_INTEGER_ADD;
+    case 235: return GPU_IR_SHADER_ATOMIC_INTEGER_SUBTRACT;
+    case 236: return GPU_IR_SHADER_ATOMIC_INTEGER_SIGNED_MINIMUM;
+    case 237: return GPU_IR_SHADER_ATOMIC_INTEGER_UNSIGNED_MINIMUM;
+    case 238: return GPU_IR_SHADER_ATOMIC_INTEGER_SIGNED_MAXIMUM;
+    case 239: return GPU_IR_SHADER_ATOMIC_INTEGER_UNSIGNED_MAXIMUM;
+    case 240: return GPU_IR_SHADER_ATOMIC_INTEGER_AND;
+    case 241: return GPU_IR_SHADER_ATOMIC_INTEGER_OR;
+    case 242: return GPU_IR_SHADER_ATOMIC_INTEGER_XOR;
+    case 232: return GPU_IR_SHADER_ATOMIC_INTEGER_INCREMENT;
+    case 233: return GPU_IR_SHADER_ATOMIC_INTEGER_DECREMENT;
+    default: return 0;
+    }
+}
+
+static int gpu_shader_atomic_memory_semantics_supported(uint32_t opcode, uint32_t semantics) {
+    if (semantics == 0) return 1;
+    if (opcode == 227) return semantics == 0x42u; // UniformMemory | Acquire.
+    if (opcode == 228) return semantics == 0x44u; // UniformMemory | Release.
+    if (opcode == 229 || opcode == 230 || (opcode >= 232 && opcode <= 242))
+        return semantics == 0x42u || semantics == 0x44u || semantics == 0x48u;
+    return 0;
+}
+
+static int gpu_shader_validate_atomic_load_store(const spirv_module *module,
+                                                 const spirv_instruction *source) {
+    if (!module || !source || (source->opcode != 227 && source->opcode != 228) ||
+        source->word_count != (source->opcode == 227 ? 6u : 5u)) return GPU_IR_INVALID;
+    const uint32_t *w = source->words;
+    int atomic_load = source->opcode == 227;
+    uint32_t pointer_id = atomic_load ? w[3] : w[1];
+    uint32_t atomic_type_id = atomic_load ? w[1] : 0;
+    uint32_t scope_id = atomic_load ? w[4] : w[2];
+    uint32_t semantics_id = atomic_load ? w[5] : w[3];
+    const spirv_id_record *result = atomic_load ? spirv_find_id(module, w[2]) : NULL;
+    const spirv_id_record *pointer = spirv_find_id(module, pointer_id);
+    const spirv_id_record *pointer_type = pointer ? spirv_find_id(module, pointer->type_id) : NULL;
+    const spirv_id_record *value = atomic_load ? NULL : spirv_find_id(module, w[4]);
+    if (!pointer || !pointer_type || pointer_type->kind != SPIRV_ID_TYPE ||
+        pointer_type->type_kind != SPIRV_TYPE_POINTER) return GPU_IR_INVALID;
+    if (atomic_load && (!result ||
+        (result->kind != SPIRV_ID_INSTRUCTION_RESULT && result->kind != SPIRV_ID_UNDEFINED) ||
+        result->type_id != atomic_type_id)) return GPU_IR_INVALID;
+    if (!atomic_load) {
+        atomic_type_id = pointer_type->element_type;
+        if (!value || (value->kind != SPIRV_ID_INSTRUCTION_RESULT && value->kind != SPIRV_ID_CONSTANT &&
+                       value->kind != SPIRV_ID_UNDEFINED) || value->type_id != atomic_type_id)
+            return GPU_IR_INVALID;
+    }
+    const spirv_id_record *atomic_type = spirv_find_id(module, atomic_type_id);
+    if (!atomic_type || atomic_type->kind != SPIRV_ID_TYPE || atomic_type->type_kind != SPIRV_TYPE_INT ||
+        pointer_type->element_type != atomic_type_id) return GPU_IR_INVALID;
+    if (atomic_type->width != 32) return GPU_IR_UNSUPPORTED;
+    if (pointer_type->storage_class != 12) return GPU_IR_UNSUPPORTED;
+    uint32_t scope = 0, semantics = 0;
+    if (!gpu_shader_u32_constant(module, scope_id, &scope) ||
+        !gpu_shader_u32_constant(module, semantics_id, &semantics)) return GPU_IR_INVALID;
+    if (scope != 1 || !gpu_shader_atomic_memory_semantics_supported(source->opcode, semantics))
+        return GPU_IR_UNSUPPORTED;
+    return GPU_IR_OK;
+}
+
+static int gpu_shader_validate_atomic_increment_decrement(const spirv_module *module,
+                                                           const spirv_instruction *source) {
+    if (!module || !source || (source->opcode != 232 && source->opcode != 233) || source->word_count != 6)
+        return GPU_IR_INVALID;
+    const uint32_t *w = source->words;
+    const spirv_id_record *result = spirv_find_id(module, w[2]);
+    const spirv_id_record *result_type = spirv_find_id(module, w[1]);
+    const spirv_id_record *pointer = spirv_find_id(module, w[3]);
+    const spirv_id_record *pointer_type = pointer ? spirv_find_id(module, pointer->type_id) : NULL;
+    uint32_t scope = 0, semantics = 0;
+    if (!result || (result->kind != SPIRV_ID_INSTRUCTION_RESULT && result->kind != SPIRV_ID_UNDEFINED) ||
+        !result_type || result_type->kind != SPIRV_ID_TYPE || result_type->type_kind != SPIRV_TYPE_INT ||
+        !pointer || !pointer_type || pointer_type->kind != SPIRV_ID_TYPE ||
+        pointer_type->type_kind != SPIRV_TYPE_POINTER || result->type_id != w[1] ||
+        pointer_type->element_type != w[1]) return GPU_IR_INVALID;
+    if (result_type->width != 32) return GPU_IR_UNSUPPORTED;
+    if (pointer_type->storage_class != 12) return GPU_IR_UNSUPPORTED;
+    if (!gpu_shader_u32_constant(module, w[4], &scope) ||
+        !gpu_shader_u32_constant(module, w[5], &semantics)) return GPU_IR_INVALID;
+    if (scope != 1 || !gpu_shader_atomic_memory_semantics_supported(source->opcode, semantics))
+        return GPU_IR_UNSUPPORTED;
+    return GPU_IR_OK;
+}
+
+static int gpu_shader_validate_atomic_rmw(const spirv_module *module, const spirv_instruction *source) {
+    if (!module || !source || !gpu_shader_atomic_operation(source->opcode) || source->word_count != 7)
+        return GPU_IR_INVALID;
+    const uint32_t *w = source->words;
+    const spirv_id_record *result = spirv_find_id(module, w[2]);
+    const spirv_id_record *result_type = spirv_find_id(module, w[1]);
+    const spirv_id_record *pointer = spirv_find_id(module, w[3]);
+    const spirv_id_record *pointer_type = pointer ? spirv_find_id(module, pointer->type_id) : NULL;
+    const spirv_id_record *pointee_type = pointer_type && pointer_type->kind == SPIRV_ID_TYPE &&
+        pointer_type->type_kind == SPIRV_TYPE_POINTER ? spirv_find_id(module, pointer_type->element_type) : NULL;
+    const spirv_id_record *value = spirv_find_id(module, w[6]);
+    uint32_t scope = 0, semantics = 0;
+    if (!result || (result->kind != SPIRV_ID_INSTRUCTION_RESULT && result->kind != SPIRV_ID_UNDEFINED) ||
+        !result_type || result_type->kind != SPIRV_ID_TYPE || result_type->type_kind != SPIRV_TYPE_INT ||
+        !pointer || !pointer_type || pointer_type->kind != SPIRV_ID_TYPE ||
+        pointer_type->type_kind != SPIRV_TYPE_POINTER || !pointee_type || pointee_type->kind != SPIRV_ID_TYPE ||
+        result->type_id != w[1] || !value ||
+        (value->kind != SPIRV_ID_INSTRUCTION_RESULT && value->kind != SPIRV_ID_CONSTANT &&
+         value->kind != SPIRV_ID_UNDEFINED) || value->type_id != w[1] || pointer_type->element_type != w[1])
+        return GPU_IR_INVALID;
+    if (result_type->width != 32) return GPU_IR_UNSUPPORTED;
+    if (pointer_type->storage_class != 12) return GPU_IR_UNSUPPORTED;
+    if (!gpu_shader_u32_constant(module, w[4], &scope) ||
+        !gpu_shader_u32_constant(module, w[5], &semantics)) return GPU_IR_INVALID;
+    if (scope != 1 || !gpu_shader_atomic_memory_semantics_supported(source->opcode, semantics))
+        return GPU_IR_UNSUPPORTED; // Device scope; the MSL path implements non-relaxed orders with fences.
+    return GPU_IR_OK;
+}
+
+static int gpu_shader_validate_atomic_compare_exchange(const spirv_module *module,
+                                                       const spirv_instruction *source) {
+    if (!module || !source || source->opcode != 230 || source->word_count != 9) return GPU_IR_INVALID;
+    const uint32_t *w = source->words;
+    const spirv_id_record *result = spirv_find_id(module, w[2]);
+    const spirv_id_record *result_type = spirv_find_id(module, w[1]);
+    const spirv_id_record *pointer = spirv_find_id(module, w[3]);
+    const spirv_id_record *pointer_type = pointer ? spirv_find_id(module, pointer->type_id) : NULL;
+    const spirv_id_record *pointee_type = pointer_type && pointer_type->kind == SPIRV_ID_TYPE &&
+        pointer_type->type_kind == SPIRV_TYPE_POINTER ? spirv_find_id(module, pointer_type->element_type) : NULL;
+    const spirv_id_record *value = spirv_find_id(module, w[7]);
+    const spirv_id_record *comparator = spirv_find_id(module, w[8]);
+    uint32_t scope = 0, equal_semantics = 0, unequal_semantics = 0;
+    if (!result || (result->kind != SPIRV_ID_INSTRUCTION_RESULT && result->kind != SPIRV_ID_UNDEFINED) ||
+        !result_type || result_type->kind != SPIRV_ID_TYPE || result_type->type_kind != SPIRV_TYPE_INT ||
+        !pointer || !pointer_type || pointer_type->kind != SPIRV_ID_TYPE ||
+        pointer_type->type_kind != SPIRV_TYPE_POINTER || !pointee_type || pointee_type->kind != SPIRV_ID_TYPE ||
+        result->type_id != w[1] || !value || !comparator ||
+        (value->kind != SPIRV_ID_INSTRUCTION_RESULT && value->kind != SPIRV_ID_CONSTANT &&
+         value->kind != SPIRV_ID_UNDEFINED) ||
+        (comparator->kind != SPIRV_ID_INSTRUCTION_RESULT && comparator->kind != SPIRV_ID_CONSTANT &&
+         comparator->kind != SPIRV_ID_UNDEFINED) ||
+        value->type_id != w[1] || comparator->type_id != w[1] || pointer_type->element_type != w[1])
+        return GPU_IR_INVALID;
+    if (result_type->width != 32) return GPU_IR_UNSUPPORTED;
+    if (pointer_type->storage_class != 12) return GPU_IR_UNSUPPORTED; // StorageBuffer only.
+    if (!gpu_shader_u32_constant(module, w[4], &scope) ||
+        !gpu_shader_u32_constant(module, w[5], &equal_semantics) ||
+        !gpu_shader_u32_constant(module, w[6], &unequal_semantics)) return GPU_IR_INVALID;
+    if (scope != 1 || !gpu_shader_atomic_memory_semantics_supported(source->opcode, equal_semantics) ||
+        !(unequal_semantics == 0 || unequal_semantics == 0x42u) ||
+        (unequal_semantics == 0x42u && equal_semantics != 0x42u && equal_semantics != 0x48u))
+        return GPU_IR_UNSUPPORTED; // Device scope; failure order cannot be stronger than success.
     return GPU_IR_OK;
 }
 
@@ -1129,7 +1442,7 @@ static int gpu_shader_emit_function_instruction(const spirv_module *module,
     uint32_t ir_opcode = 0, operation = 0, result_type = 0, result_id = 0, flags = 0;
     uint32_t memory_access_flags = 0, memory_alignment = 0;
     const uint32_t *ids = NULL, *literals = NULL;
-    uint32_t sampled_image_operands[3];
+    uint32_t sampled_image_operands[3], atomic_operands[6];
     uint32_t id_count = 0, literal_count_for_instruction = 0;
     if (opcode == 77 || opcode == 78 || opcode == 79 || opcode == 80 ||
         opcode == 81 || opcode == 82 || opcode == 84) {
@@ -1144,12 +1457,40 @@ static int gpu_shader_emit_function_instruction(const spirv_module *module,
         int validation = gpu_shader_validate_sampled_image(module, source);
         if (validation != GPU_IR_OK) return validation;
     }
-    if (opcode == 88) {
-        int validation = gpu_shader_validate_image_sample_explicit_lod(module, source);
+    if (opcode == 87 || opcode == 88) {
+        int validation = gpu_shader_validate_image_sample(module, source);
         if (validation != GPU_IR_OK) return validation;
     }
     if (opcode == 95 || opcode == 98 || opcode == 99) {
         int validation = gpu_shader_validate_image_instruction(module, source, opcode);
+        if (validation != GPU_IR_OK) return validation;
+    }
+    if (opcode == 103 || opcode == 104) {
+        int validation = gpu_shader_validate_image_query_size(module, source, opcode);
+        if (validation != GPU_IR_OK) return validation;
+    }
+    if (opcode == 106) {
+        int validation = gpu_shader_validate_image_query_levels(module, source);
+        if (validation != GPU_IR_OK) return validation;
+    }
+    if (opcode == 107) {
+        int validation = gpu_shader_validate_image_query_samples(module, source);
+        if (validation != GPU_IR_OK) return validation;
+    }
+    if (opcode == 334 || opcode == 335) {
+        int validation = gpu_shader_validate_subgroup_vote(module, source);
+        if (validation != GPU_IR_OK) return validation;
+    }
+    if (opcode == 351 || opcode == 352 || opcode == 353 || opcode == 355 || opcode == 356 ||
+        opcode == 358 || opcode == 359 || opcode == 360) {
+        int validation = gpu_shader_validate_subgroup_integer_reduction(module, source, opcode);
+        if (validation != GPU_IR_OK) return validation;
+    }
+    if (opcode == 230 || gpu_shader_atomic_operation(opcode)) {
+        int validation = opcode == 230 ? gpu_shader_validate_atomic_compare_exchange(module, source) :
+            (opcode == 227 || opcode == 228) ? gpu_shader_validate_atomic_load_store(module, source) :
+            (opcode == 232 || opcode == 233) ? gpu_shader_validate_atomic_increment_decrement(module, source) :
+            gpu_shader_validate_atomic_rmw(module, source);
         if (validation != GPU_IR_OK) return validation;
     }
     switch (opcode) {
@@ -1175,6 +1516,23 @@ static int gpu_shader_emit_function_instruction(const spirv_module *module,
         ids = w + 5; id_count = n - 5;
         break;
     }
+    case 334: case 335: // OpGroupNonUniformAll / Any; only Subgroup scope has Vulkan semantics.
+        ir_opcode = GPU_IR_SHADER_OP_ARITHMETIC;
+        operation = opcode == 335 ? GPU_IR_SHADER_ARITH_SUBGROUP_ANY : GPU_IR_SHADER_ARITH_SUBGROUP_ALL;
+        result_type = w[1]; result_id = w[2]; ids = w + 4; id_count = 1;
+        break;
+    case 351: case 352: case 353: case 355: case 356: case 358: case 359: case 360:
+        // Subgroup integer multiply, min/max, and bitwise reductions.
+        ir_opcode = GPU_IR_SHADER_OP_ARITHMETIC;
+        operation = opcode == 351 ? GPU_IR_SHADER_ARITH_SUBGROUP_IMUL :
+                    opcode == 352 ? GPU_IR_SHADER_ARITH_SUBGROUP_SMIN :
+                    opcode == 353 ? GPU_IR_SHADER_ARITH_SUBGROUP_UMIN :
+                    opcode == 355 ? GPU_IR_SHADER_ARITH_SUBGROUP_SMAX :
+                    opcode == 356 ? GPU_IR_SHADER_ARITH_SUBGROUP_UMAX :
+                    opcode == 358 ? GPU_IR_SHADER_ARITH_SUBGROUP_BIT_AND :
+                    opcode == 359 ? GPU_IR_SHADER_ARITH_SUBGROUP_BIT_OR : GPU_IR_SHADER_ARITH_SUBGROUP_BIT_XOR;
+        result_type = w[1]; result_id = w[2]; ids = w + 5; id_count = 1;
+        break;
     case 57: // OpFunctionCall
         if (n < 4) return GPU_IR_INVALID;
         ir_opcode = GPU_IR_SHADER_OP_FUNCTION_CALL; result_type = w[1]; result_id = w[2];
@@ -1205,6 +1563,14 @@ static int gpu_shader_emit_function_instruction(const spirv_module *module,
         ir_opcode = GPU_IR_SHADER_OP_SAMPLED_IMAGE; result_type = w[1]; result_id = w[2];
         ids = w + 3; id_count = 2;
         break;
+    case 87: // OpImageSampleImplicitLod without optional Image Operands
+        ir_opcode = GPU_IR_SHADER_OP_IMAGE_SAMPLE;
+        operation = GPU_IR_SHADER_IMAGE_SAMPLE_IMPLICIT_LOD;
+        result_type = w[1]; result_id = w[2];
+        sampled_image_operands[0] = w[3];
+        sampled_image_operands[1] = w[4];
+        ids = sampled_image_operands; id_count = 2;
+        break;
     case 88: // OpImageSampleExplicitLod with Lod 0
         ir_opcode = GPU_IR_SHADER_OP_IMAGE_SAMPLE; result_type = w[1]; result_id = w[2];
         sampled_image_operands[0] = w[3];
@@ -1219,6 +1585,18 @@ static int gpu_shader_emit_function_instruction(const spirv_module *module,
     case 95: // OpImageFetch at mip level zero
         ir_opcode = GPU_IR_SHADER_OP_IMAGE_READ; result_type = w[1]; result_id = w[2];
         ids = w + 3; id_count = 2;
+        break;
+    case 103: case 104: // OpImageQuerySizeLod / OpImageQuerySize
+        ir_opcode = GPU_IR_SHADER_OP_IMAGE_QUERY; operation = GPU_IR_SHADER_IMAGE_QUERY_SIZE;
+        result_type = w[1]; result_id = w[2]; ids = w + 3; id_count = opcode == 103 ? 2u : 1u;
+        break;
+    case 106: // OpImageQueryLevels
+        ir_opcode = GPU_IR_SHADER_OP_IMAGE_QUERY; operation = GPU_IR_SHADER_IMAGE_QUERY_LEVELS;
+        result_type = w[1]; result_id = w[2]; ids = w + 3; id_count = 1;
+        break;
+    case 107: // OpImageQuerySamples
+        ir_opcode = GPU_IR_SHADER_OP_IMAGE_QUERY; operation = GPU_IR_SHADER_IMAGE_QUERY_SAMPLES;
+        result_type = w[1]; result_id = w[2]; ids = w + 3; id_count = 1;
         break;
     case 99: // OpImageWrite without optional Image Operands
         ir_opcode = GPU_IR_SHADER_OP_IMAGE_WRITE; ids = w + 1; id_count = 3;
@@ -1248,6 +1626,35 @@ static int gpu_shader_emit_function_instruction(const spirv_module *module,
         ir_opcode = GPU_IR_SHADER_OP_ARRAY_LENGTH; result_type = w[1]; result_id = w[2];
         ids = w + 3; id_count = 1;
         literals = w + 4; literal_count_for_instruction = 1;
+        break;
+    case 227: // OpAtomicLoad (pointer, scope, semantics).
+        ir_opcode = GPU_IR_SHADER_OP_ATOMIC; operation = GPU_IR_SHADER_ATOMIC_INTEGER_LOAD;
+        result_type = w[1]; result_id = w[2]; ids = w + 3; id_count = 3;
+        break;
+    case 228: // OpAtomicStore has no result.
+        ir_opcode = GPU_IR_SHADER_OP_ATOMIC; operation = GPU_IR_SHADER_ATOMIC_INTEGER_STORE;
+        ids = w + 1; id_count = 4;
+        break;
+    case 232: case 233: // OpAtomicIIncrement / OpAtomicIDecrement return the old value.
+        ir_opcode = GPU_IR_SHADER_OP_ATOMIC; operation = gpu_shader_atomic_operation(opcode);
+        result_type = w[1]; result_id = w[2]; ids = w + 3; id_count = 3;
+        break;
+    case 229: case 234: case 235: case 236: case 237: case 238: case 239: case 240: case 241: case 242:
+        // Integer read-modify-write operations share the four-operand common-IR atomic shape.
+        ir_opcode = GPU_IR_SHADER_OP_ATOMIC; operation = gpu_shader_atomic_operation(opcode);
+        result_type = w[1]; result_id = w[2]; ids = w + 3; id_count = 4;
+        break;
+    case 230: // OpAtomicCompareExchange. The legacy Kernel-only Weak opcode is not a Vulkan shader operation.
+        ir_opcode = GPU_IR_SHADER_OP_ATOMIC;
+        operation = GPU_IR_SHADER_ATOMIC_INTEGER_COMPARE_EXCHANGE;
+        result_type = w[1]; result_id = w[2];
+        atomic_operands[0] = w[3]; // pointer
+        atomic_operands[1] = w[4]; // scope
+        atomic_operands[2] = w[5]; // equal semantics
+        atomic_operands[3] = w[6]; // unequal semantics
+        atomic_operands[4] = w[8]; // comparator (expected value)
+        atomic_operands[5] = w[7]; // value (desired value)
+        ids = atomic_operands; id_count = 6;
         break;
     case 77: // OpVectorExtractDynamic
         if (n != 5) return GPU_IR_INVALID;
@@ -1484,6 +1891,10 @@ static int gpu_shader_emit_function_instruction(const spirv_module *module,
         if (n != 1) return GPU_IR_INVALID;
         ir_opcode = GPU_IR_SHADER_OP_UNREACHABLE;
         break;
+    case 252: // OpKill
+        if (n != 1) return GPU_IR_INVALID;
+        ir_opcode = GPU_IR_SHADER_OP_TERMINATE_INVOCATION;
+        break;
     default:
         return GPU_IR_UNSUPPORTED;
     }
@@ -1506,6 +1917,12 @@ static uint32_t gpu_shader_source_function_index(const spirv_module *module, uin
         if (function && function->function_id == function_id) return i;
     }
     return UINT32_MAX;
+}
+
+static int gpu_shader_entry_point_has_interface(const spirv_entry_point *entry_point, uint32_t variable_id) {
+    for (uint32_t i = 0; i < entry_point->interface_count; i++)
+        if (entry_point->interfaces[i] == variable_id) return 1;
+    return 0;
 }
 
 int spirv_build_gpu_ir_shader(const spirv_module *module, const spirv_entry_point *entry_point,
@@ -1705,18 +2122,27 @@ int spirv_build_gpu_ir_shader(const spirv_module *module, const spirv_entry_poin
                     UINT32_MAX, UINT32_MAX, 0, NULL, 0, NULL, 0);
             } else if (source.opcode == 41 || source.opcode == 42 || source.opcode == 43 || source.opcode == 44 ||
                 source.opcode == 46 || source.opcode == 48 || source.opcode == 49 ||
-                source.opcode == 50 || source.opcode == 51) {
+                source.opcode == 50 || source.opcode == 51 || source.opcode == 52) {
                 rc = gpu_shader_emit_constant(module, &source, &instruction_count, instructions,
                     instruction_capacity, operands, word_capacity, &operand_count, literal_words,
                     word_capacity, &literal_count);
             } else if (source.opcode == 59) {
                 if (source.word_count != 4 && source.word_count != 5) { rc = GPU_IR_INVALID; break; }
+                const spirv_id_record *variable = spirv_find_id(module, source.words[2]);
+                if (!variable || variable->kind != SPIRV_ID_VARIABLE) { rc = GPU_IR_INVALID; break; }
+                int stage_interface = variable->storage_class == 1 || variable->storage_class == 3;
+                if (stage_interface && !gpu_shader_entry_point_has_interface(entry_point, variable->id))
+                    continue;
                 const uint32_t *init = source.word_count == 5 ? source.words + 4 : NULL;
                 rc = gpu_shader_emit(instructions, instruction_capacity, &instruction_count, operands,
                     word_capacity, &operand_count, literal_words, word_capacity, &literal_count,
                     source.opcode, GPU_IR_SHADER_OP_VARIABLE, 0, source.words[1], source.words[2],
                     UINT32_MAX, UINT32_MAX, 0, init, init ? 1u : 0u, NULL, 0);
-                if (rc == GPU_IR_OK) gpu_shader_variable_metadata(module, &instructions[instruction_count - 1]);
+                if (rc == GPU_IR_OK) {
+                    gpu_ir_shader_instruction *lowered = &instructions[instruction_count - 1];
+                    gpu_shader_variable_metadata(module, lowered);
+                    lowered->entry_point_interface = stage_interface;
+                }
             } else if (source.opcode == 45 || source.opcode == 52) {
                 rc = GPU_IR_UNSUPPORTED;
             }
@@ -1769,7 +2195,8 @@ int spirv_build_gpu_ir_shader(const spirv_module *module, const spirv_entry_poin
                     lowered_opcode == GPU_IR_SHADER_OP_SWITCH ||
                     lowered_opcode == GPU_IR_SHADER_OP_RETURN ||
                     lowered_opcode == GPU_IR_SHADER_OP_RETURN_VALUE ||
-                    lowered_opcode == GPU_IR_SHADER_OP_UNREACHABLE)
+                    lowered_opcode == GPU_IR_SHADER_OP_UNREACHABLE ||
+                    lowered_opcode == GPU_IR_SHADER_OP_TERMINATE_INVOCATION)
                     blocks[current_block].terminator_opcode = lowered_opcode;
             }
         }

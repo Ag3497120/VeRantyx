@@ -12,6 +12,10 @@ description permits them. Small-resource validation estimates near-equilateral p
 format block size and texture dimensions. It allows up to 16 4 KiB tiles for non-MSAA textures and up to 64 64 KiB
 tiles for eligible MSAA textures; texture-array layers do not multiply the most-detailed-mip estimate. Unknown format
 block layouts are rejected for small alignment. This follows the [D3D12 resource description rules](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_resource_desc).
+Both allocation-info methods accept only a zero `visibleMask` on this single-node device. Microsoft's
+[GetResourceAllocationInfo contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-getresourceallocationinfo%28uint_uint_constd3d12_resource_desc%29)
+specifies zero for single-GPU operation; the ordinary tests also check that a nonzero mask returns the documented
+`UINT64_MAX` size error sentinel.
 
 `CreateHeap` accepts the documented default, 64 KiB, and 4 MiB heap alignments, rejects other values, and rejects
 `ALLOW_DISPLAY`, which is valid only for committed resources. `CreatePlacedResource`
@@ -19,6 +23,45 @@ enforces `DENY_BUFFERS`, `DENY_RT_DS_TEXTURES`, and `DENY_NON_RT_DS_TEXTURES`, i
 combinations, before attempting Metal placement. This follows the [D3D12 heap description](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_heap_desc)
 and [heap flags](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_heap_flags) contracts. Ordinary D3D12
 tests exercise invalid and accepted alignments, plus buffer, RT/DS texture, and non-RT/DS texture rejection on incompatible heaps.
+
+Resource layout validation requires `ROW_MAJOR` for buffers and accepts only `UNKNOWN` for textures. Row-major
+cross-adapter textures, tiled `64KB_UNDEFINED_SWIZZLE`, and `64KB_STANDARD_SWIZZLE` are rejected because the runtime
+reports cross-adapter row-major, tiled-resource, and standard-swizzle support as unavailable. Allocation-info queries
+return the documented `UINT64_MAX` size sentinel for these layouts, and resource creation returns `E_INVALIDARG`.
+Ordinary D3D12 tests cover each rejected texture layout and the invalid buffer layout.
+
+Initial resource states and legacy transition-barrier before/after states are checked for known bits, legal read/write
+combinations, resource dimension, required resource flags, and resolve sample counts. Vertex/constant-buffer,
+index-buffer, stream-output, and indirect-argument states are buffer-only; render-target, depth, resolve, and
+shading-rate-source states are texture states, with shading-rate-source restricted to 2D textures. Video and
+raytracing-acceleration-structure states are rejected because those execution paths are not implemented. Common copy
+and shader-resource states remain valid for both resource kinds where the resource's other flags and heap properties
+allow them. The ordinary D3D12 test rejects incompatible initial states and
+buffer-only texture transitions, accepts a compatible combined shader-read initial state, and checks a valid texture
+shader-read transition. `DENY_SHADER_RESOURCE` is restricted to depth-stencil resources, prevents shader-resource
+states, and leaves created SRV descriptors null. Shading-rate-source state requires an R8_UINT 2D image with one mip,
+one slice, one sample, UNKNOWN layout, and no render-target, depth-stencil, cross-adapter, simultaneous-access, or
+video-reference-only flags. Its access is represented as generic memory read in GPU IR rather than shader read. These
+rules follow the public
+[`D3D12_RESOURCE_STATES`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_resource_states)
+and [`D3D12_RESOURCE_DIMENSION`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_resource_dimension)
+definitions, [resource flags](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_resource_flags),
+Microsoft's [VRS image requirements](https://learn.microsoft.com/en-us/windows/win32/direct3d12/vrs), and [resource requirements](https://github.com/microsoft/DirectX-Specs/blob/master/d3d/ResourceHeaps.md).
+
+Resource descriptions accept render-target, depth-stencil, unordered-access, and deny-shader-resource flags only in
+valid combinations. Render-target/depth-stencil and simultaneous-access flags are rejected on buffers; unordered
+access remains valid for buffers. Unsupported cross-adapter, video-reference, acceleration-structure, tight-alignment
+(`0x400`), and unknown flags are rejected by resource creation and allocation-info queries. The ordinary D3D12 test
+covers invalid combinations and unsupported flags, as well as the supported simultaneous-access texture and UAV
+buffer cases. These constraints follow Microsoft's [resource flag definitions](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_resource_flags) and the DirectX-Specs [tight-alignment proposal](https://github.com/microsoft/DirectX-Specs/blob/master/d3d/D3D12TightPlacedResourceAlignment.md).
+
+MSAA resources are validated as 2D textures with exactly one mip, a render-target or depth-stencil flag, sample
+counts in the D3D12 power-of-two range, and no unordered-access or simultaneous-access flag. A small Metal texture
+probe with the resource's format and attachment usage keeps allocation-info results and resource creation consistent
+with `MULTISAMPLE_QUALITY_LEVELS` and the active device's sample-count support. Invalid descriptions are rejected
+before allocating the guest resource.
+This matches the [D3D12_RESOURCE_DESC multisampling restrictions](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_resource_desc)
+and the per-format [multisample quality query](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_feature_data_multisample_quality_levels).
 
 Implemented feature queries require the exact structure size for the selected
 feature. `D3D12_OPTIONS2` reports depth bounds and programmable sample positions
@@ -43,18 +86,31 @@ Cache-coherent UMA is reported for Apple-family unified-memory devices; isolated
 MMU is conservatively reported as unsupported because the guest address-space
 bridge does not promise CPU page-table protection semantics.
 
+Feature-level queries and `D3D12CreateDevice` are capped at 11_1. The runtime reports
+Tiled Resources Tier 0 and `OutputMergerLogicOp = FALSE`; Microsoft's feature-level
+table requires Tier 2 tiled resources, min/max filters, and output-merger logic
+operations for 12_0. Returning 12_0 while those required features are unavailable
+would let applications select an unsupported path. The query chooses the highest
+requested known level no higher than the cap, and device creation rejects a higher
+minimum level. This follows Microsoft's [hardware feature-level table](https://learn.microsoft.com/en-us/windows/win32/direct3d12/hardware-feature-levels).
+
 `GetCustomHeapProperties` reports the matching custom heap properties for
 DEFAULT, UPLOAD, and READBACK on the single exposed node. DEFAULT is CPU
 inaccessible; UPLOAD is write-back on the reported cache-coherent UMA path and
 write-combined otherwise; READBACK is write-back. `ID3D12Resource::Map` exposes
 buffer memory only for UPLOAD, READBACK, and CPU-visible CUSTOM heaps, requires
 subresource zero, and validates the optional range against the buffer size.
+The abstract UPLOAD and READBACK heap types accept buffers only; CPU-accessible
+textures require a CUSTOM heap with explicit CPU page and memory pool properties.
+Resource creation requires optimized clear values to be null for buffers and
+accepts typed formats from the resource's compatible format family for textures.
 Texture `Map` tracks nested mappings per subresource and returns a null CPU
 pointer for opaque layouts. `WriteToSubresource` and `ReadFromSubresource` copy
 mapped buffer ranges directly and transfer mapped, single-sample, single-plane
 textures through a synchronous Metal blit; texture calls require `COMMON` state
-and validate subresource bounds, box alignment, and row/depth pitches. Planar
-and multisampled texture CPU transfers remain unsupported. This path uses the
+and validate subresource bounds, box alignment, and row/depth pitches. Nonempty
+planar and multisampled texture CPU transfers remain unsupported; empty-box
+requests are returned as no-ops after validating the subresource index. This path uses the
 public D3D12 Map and CPU transfer rules plus Metal's private-texture staging and
 blit mechanism:
 [`WriteToSubresource`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12resource-writetosubresource),
@@ -175,6 +231,28 @@ This follows Microsoft's
 [root-signature flags](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_root_signature_flags),
 [root-signature creation and PSO compatibility](https://learn.microsoft.com/en-us/windows/win32/direct3d12/creating-root-signature),
 and [shader visibility](https://learn.microsoft.com/en-us/windows/win32/direct3d12/creating-root-signature#shader-visibility) rules.
+The runtime advertises root signature version 1.1 as its highest fully supported
+version. The versioned serializer and RTS0 reader also accept version 1.2 static
+samplers with non-normalized coordinates, lowering them to Metal's unnormalized
+sampler mode for point or min/mag-linear filters, clamp or transparent-border
+addressing, zero LOD range, and no comparison or anisotropy. Version 1.2
+integer border colors remain unsupported because Metal exposes only the
+floating-point border-color modes; the feature query therefore continues to
+report 1.1. The legacy serializer accepts only version 1.0; callers use the
+versioned serializer for 1.1 and 1.2 descriptions. Version 1.2 extends
+`STATIC_SAMPLER_DESC1` with flags and uses the
+RTS0 v3 static-sampler encoding. These mappings follow Microsoft's
+[root signature version enumeration](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d_root_signature_version)
+and [root signature 1.2 layout](https://github.com/microsoft/DirectX-Specs/blob/master/d3d/VulkanOn12.md),
+the [RTS0 container format](https://llvm.org/docs/DirectX/DXContainer.html), and Apple's
+[`MTLSamplerDescriptor.normalizedCoordinates`](https://developer.apple.com/documentation/metal/mtlsamplerdescriptor/normalizedcoordinates)
+constraints. Ordinary D3D12 tests serialize and create a version-1.2 root signature with non-normalized coordinates,
+reject unsigned-integer border colors, verify that the legacy serializer rejects versions above 1.0, and query the
+advertised root-signature version. Dynamic and static sampler `MipLODBias` values map to
+`MTLSamplerDescriptor.lodBias` on macOS 26 and Apple GPU family 10; other Metal families retain zero bias because
+they do not expose this feature. The ordinary sampler draw fixture supplies a nonzero bias to both sampler forms
+while sampling a single-mip texture. See Apple's [`lodBias` property](https://developer.apple.com/documentation/metal/mtlsamplerdescriptor/lodbias)
+and [Metal feature set table](https://developer.apple.com/metal/limits/).
 
 Texture SRVs normalize mip, array-slice, and plane fields for 1D, 2D, 3D,
 multisample-array, cube, and cube-array views. `MipLevels = UINT_MAX` selects
@@ -410,6 +488,24 @@ against expected values for ballots, reductions, exclusive prefixes, lane
 reads, `WaveMatch`, and all SM 6.5 multi-prefix forms; a 33-thread group leaves
 inactive lanes in its final wave. Pixel helper-lane policy and behavior with
 inactive pixel lanes still lack a GPU reference comparison.
+The common DXIL compute path lowers `WaveGetLaneIndex` and `WaveGetLaneCount` to
+API-neutral subgroup built-ins and emits Metal's `thread_index_in_simdgroup`
+and `threads_per_simdgroup` input attributes. It also lowers
+`WaveActiveAnyTrue`/`WaveActiveAllTrue` to shared subgroup-vote operations and
+MSL `simd_any`/`simd_all`, and compute `WaveActiveMin`/`WaveActiveMax` for
+32-bit signed and unsigned integers to shared subgroup min/max operations and
+MSL `simd_min`/`simd_max`. DXIL's signless integer representation is bitcast
+through signed MSL `int` for signed reductions. The tests check all four
+integer reductions and compile the generated MSL. This narrow common-IR slice
+does not change the conservative `WaveOps` report or Vulkan feature reporting;
+it does not test D3D12 command-list execution. The lane-query signatures follow Microsoft's
+[`WaveGetLaneIndex`](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/wavegetlaneindex)
+and [`WaveGetLaneCount`](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/wavegetlanecount) definitions;
+the vote operations follow [`WaveActiveAnyTrue`](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/waveanytrue)
+and [`WaveActiveAllTrue`](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/wavealltrue),
+[`WaveActiveMin`](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/waveactivemin),
+and [`WaveActiveMax`](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/waveactivemax). MSL's
+`simd_any`/`simd_all` active-thread rules are documented in Apple's [Metal Shading Language specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf).
 See Microsoft's
 [Shader Model 6.5 wave-intrinsic specification](https://microsoft.github.io/DirectX-Specs/d3d/HLSL_ShaderModel6_5.html)
 and [SM 6.7 helper-lane option](https://microsoft.github.io/DirectX-Specs/d3d/HLSL_SM_6_7_Wave_Ops_Include_Helper_Lanes.html).
@@ -423,3 +519,24 @@ before drawing. Descriptor heaps set inside the bundle must match the heaps boun
 subset is graphics PSO/root/IA state, direct draw calls, and one-operation Draw/DrawIndexed `ExecuteIndirect`
 signatures with no count buffer or root/IA updates. Commands prohibited in bundles fail `Close`. Bundles cannot be
 submitted directly; the other `ExecuteIndirect` bundle forms remain unsupported.
+
+The D3D12 PSO path also attempts the common DXIL-to-MSL vertex route for a vertex shader that writes a complete
+float32 `SV_Position`, reads only generic one-row float32 inputs with one to four components, has no resource bindings,
+and has a matching D3D12 input-layout element for every used input. Input signature IDs retain their reflected Metal
+attribute locations. Unsupported shaders and layouts continue through the direct DXIL-to-MSL shader path. This is a
+narrow graphics-I/O slice; it does not make the full D3D12 graphics shader path common.
+
+For a single render target, default sample mask and no pixel-shader resource bindings, the PSO path also attempts the
+common fragment route. That shader may read scalar float32 `SV_Position` components and bool `SV_IsFrontFace`, then
+write a complete float32 `SV_Target0`. The latter maps DXIL's `I1`/`IsFrontFace` signature input to Metal's
+`[[front_facing]]` builtin and accepts both packed start row zero and the `-1` system-generated sentinel used by
+newer shader models. Unsupported signatures remain on direct DXIL-to-MSL.
+
+Graphics PSOs also lower each shader-matched input element's byte width, input slot, attribute offset, per-vertex or
+per-instance classification, and instance step rate into common GPU IR metadata. Direct draws retain their bound VBV
+and IBV ranges. The common recorder checks statically known nonindexed vertex and instance fetch extents and checks
+the selected index bytes against the IBV; indexed vertex IDs are GPU data, so the exact vertex fetch range cannot be
+validated before execution. Ordinary command-list `ExecuteIndirect` captures the IA views at record time, while bundle
+indirect draws use the inherited IA state during replay. Format interpretation stays in the D3D12 input assembler and
+Metal vertex descriptor. Input-layout creation rejects nonzero `InstanceDataStepRate` on per-vertex elements, as required
+by Microsoft's [`D3D12_INPUT_ELEMENT_DESC` contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_input_element_desc).

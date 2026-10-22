@@ -223,12 +223,45 @@ enum {
     GPU_IR_COMMAND_DRAW_INDIRECT,
     GPU_IR_COMMAND_BIND_DESCRIPTOR_STATE,
     GPU_IR_COMMAND_CLEAR_COLOR,
-    GPU_IR_COMMAND_CLEAR_DEPTH_STENCIL
+    GPU_IR_COMMAND_CLEAR_DEPTH_STENCIL,
+    GPU_IR_COMMAND_BEGIN_RENDER_PASS,
+    GPU_IR_COMMAND_END_RENDER_PASS
 };
 
 // Half-open signed pixel bounds. API front ends preserve their rectangle values here; backends clip them to the
 // selected attachment extent when encoding the clear.
 typedef struct { int32_t left, top, right, bottom; } gpu_ir_rect;
+
+enum {
+    GPU_IR_RENDER_PASS_LOAD = 0,
+    GPU_IR_RENDER_PASS_CLEAR,
+    GPU_IR_RENDER_PASS_DONT_CARE
+};
+
+enum {
+    GPU_IR_RENDER_PASS_STORE = 0,
+    GPU_IR_RENDER_PASS_STORE_DONT_CARE
+};
+
+typedef enum {
+    GPU_IR_CLEAR_COLOR_VALUE_FLOAT = 0,
+    GPU_IR_CLEAR_COLOR_VALUE_UINT,
+    GPU_IR_CLEAR_COLOR_VALUE_SINT
+} gpu_ir_clear_color_value_type;
+
+// The first shared raster path binds one single-sample color target and a render-area scissor. API front ends
+// retain attachment compatibility and layout rules; this record carries the load/store action and typed clear.
+typedef struct {
+    uint32_t mip_level, array_layer;
+    gpu_ir_rect render_area;
+    uint32_t load_action, store_action;
+    gpu_ir_clear_color_value_type clear_value_type;
+    union {
+        float color[4];
+        uint32_t color_uint[4];
+        int32_t color_sint[4];
+    } clear_value;
+} gpu_ir_render_pass_desc;
 
 enum {
     GPU_IR_CLEAR_DEPTH = 1u << 0,
@@ -237,7 +270,14 @@ enum {
 };
 
 typedef struct {
-    float color[4];
+    union {
+        float color[4];
+        uint32_t color_uint[4];
+        int32_t color_sint[4];
+    };
+    gpu_ir_clear_color_value_type value_type;
+    // A zero count clears the whole bound texture view. Nonzero ranges are checked against array_layers.
+    uint32_t base_array_layer, array_layer_count;
     const gpu_ir_rect *rectangles;
     uint32_t rectangle_count;
 } gpu_ir_clear_color_info;
@@ -285,7 +325,9 @@ enum {
     GPU_IR_FORMAT_RGBA8_UNORM,
     GPU_IR_FORMAT_BGRA8_UNORM,
     GPU_IR_FORMAT_R16G16B16A16_FLOAT,
-    GPU_IR_FORMAT_R32_FLOAT
+    GPU_IR_FORMAT_R32_FLOAT,
+    GPU_IR_FORMAT_R32_UINT,
+    GPU_IR_FORMAT_R32_SINT
 };
 
 typedef struct {
@@ -363,9 +405,21 @@ void *gpu_ir_buffer_view_backend_object(const gpu_ir_buffer_view *view);
 // resource/view references are retained and ownership of optional backend objects transfers to the state. A null
 // descriptor is explicit; an omitted value remains unwritten. Value accessors return borrowed references.
 enum { GPU_IR_DESCRIPTOR_VALUE_NULL = 1u << 0 };
+enum {
+    // Four 3-bit selectors packed in component order. Zero keeps that output component's identity mapping;
+    // 1..4 select R/G/B/A, 5 selects zero, and 6 selects one. This representation is API-neutral.
+    GPU_IR_COMPONENT_SWIZZLE_IDENTITY = 0,
+    GPU_IR_COMPONENT_SWIZZLE_R = 1,
+    GPU_IR_COMPONENT_SWIZZLE_G = 2,
+    GPU_IR_COMPONENT_SWIZZLE_B = 3,
+    GPU_IR_COMPONENT_SWIZZLE_A = 4,
+    GPU_IR_COMPONENT_SWIZZLE_ZERO = 5,
+    GPU_IR_COMPONENT_SWIZZLE_ONE = 6
+};
 typedef struct {
     uint32_t set, binding_namespace, binding, array_element;
     uint32_t kind, stage_mask, access_mask, flags;
+    uint32_t component_mapping; // API-neutral four-channel mapping; zero means identity.
     gpu_ir_resource *resource;
     gpu_ir_buffer_view *buffer_view;
     uint64_t offset, range;
@@ -423,9 +477,155 @@ enum {
     GPU_IR_PIPELINE_COMPUTE
 };
 
+enum {
+    GPU_IR_VERTEX_INPUT_RATE_VERTEX = 0,
+    GPU_IR_VERTEX_INPUT_RATE_INSTANCE = 1
+};
+
+enum {
+    GPU_IR_VERTEX_FORMAT_FLOAT32 = 1,
+    GPU_IR_VERTEX_FORMAT_FLOAT32X2,
+    GPU_IR_VERTEX_FORMAT_FLOAT32X3,
+    GPU_IR_VERTEX_FORMAT_FLOAT32X4,
+    // API-native vertex formats whose scalar interpretation is frontend-specific. `byte_size`
+    // preserves the fetch width for common draw-range validation without rewriting format rules.
+    GPU_IR_VERTEX_FORMAT_OPAQUE,
+    GPU_IR_VERTEX_FORMAT_SINT32,
+    GPU_IR_VERTEX_FORMAT_UINT32,
+    GPU_IR_VERTEX_FORMAT_SINT32X2,
+    GPU_IR_VERTEX_FORMAT_SINT32X3,
+    GPU_IR_VERTEX_FORMAT_SINT32X4,
+    GPU_IR_VERTEX_FORMAT_UINT32X2,
+    GPU_IR_VERTEX_FORMAT_UINT32X3,
+    GPU_IR_VERTEX_FORMAT_UINT32X4,
+    GPU_IR_VERTEX_FORMAT_FLOAT16 = 0x100,
+    GPU_IR_VERTEX_FORMAT_FLOAT16X2,
+    GPU_IR_VERTEX_FORMAT_FLOAT16X3,
+    GPU_IR_VERTEX_FORMAT_FLOAT16X4,
+    GPU_IR_VERTEX_FORMAT_UNORM8 = 0x110,
+    GPU_IR_VERTEX_FORMAT_UNORM8X2,
+    GPU_IR_VERTEX_FORMAT_UNORM8X3,
+    GPU_IR_VERTEX_FORMAT_UNORM8X4,
+    GPU_IR_VERTEX_FORMAT_SNORM8 = 0x120,
+    GPU_IR_VERTEX_FORMAT_SNORM8X2,
+    GPU_IR_VERTEX_FORMAT_SNORM8X3,
+    GPU_IR_VERTEX_FORMAT_SNORM8X4,
+    GPU_IR_VERTEX_FORMAT_UINT8 = 0x130,
+    GPU_IR_VERTEX_FORMAT_UINT8X2,
+    GPU_IR_VERTEX_FORMAT_UINT8X3,
+    GPU_IR_VERTEX_FORMAT_UINT8X4,
+    GPU_IR_VERTEX_FORMAT_SINT8 = 0x140,
+    GPU_IR_VERTEX_FORMAT_SINT8X2,
+    GPU_IR_VERTEX_FORMAT_SINT8X3,
+    GPU_IR_VERTEX_FORMAT_SINT8X4,
+    GPU_IR_VERTEX_FORMAT_UNORM16 = 0x150,
+    GPU_IR_VERTEX_FORMAT_UNORM16X2,
+    GPU_IR_VERTEX_FORMAT_UNORM16X3,
+    GPU_IR_VERTEX_FORMAT_UNORM16X4,
+    GPU_IR_VERTEX_FORMAT_SNORM16 = 0x160,
+    GPU_IR_VERTEX_FORMAT_SNORM16X2,
+    GPU_IR_VERTEX_FORMAT_SNORM16X3,
+    GPU_IR_VERTEX_FORMAT_SNORM16X4,
+    GPU_IR_VERTEX_FORMAT_UINT16 = 0x170,
+    GPU_IR_VERTEX_FORMAT_UINT16X2,
+    GPU_IR_VERTEX_FORMAT_UINT16X3,
+    GPU_IR_VERTEX_FORMAT_UINT16X4,
+    GPU_IR_VERTEX_FORMAT_SINT16 = 0x180,
+    GPU_IR_VERTEX_FORMAT_SINT16X2,
+    GPU_IR_VERTEX_FORMAT_SINT16X3,
+    GPU_IR_VERTEX_FORMAT_SINT16X4
+};
+
+enum {
+    GPU_IR_VERTEX_NUMERIC_FLOAT = 1,
+    GPU_IR_VERTEX_NUMERIC_SINT,
+    GPU_IR_VERTEX_NUMERIC_UINT
+};
+int gpu_ir_vertex_format_info(uint32_t format, uint32_t *component_count, uint32_t *byte_size,
+                              uint32_t *numeric_class);
+
+enum {
+    GPU_IR_MAX_VERTEX_BUFFERS = 16,
+    GPU_IR_MAX_VERTEX_ATTRIBUTES = 32,
+    GPU_IR_MAX_COLOR_ATTACHMENTS = 8
+};
+
+typedef struct {
+    uint32_t binding, stride, input_rate, step_rate;
+} gpu_ir_vertex_binding_desc;
+
+typedef struct {
+    uint32_t location, binding, format, offset;
+    uint32_t byte_size;
+} gpu_ir_vertex_attribute_desc;
+
+typedef struct {
+    uint32_t binding_count, attribute_count;
+    gpu_ir_vertex_binding_desc bindings[GPU_IR_MAX_VERTEX_BUFFERS];
+    gpu_ir_vertex_attribute_desc attributes[GPU_IR_MAX_VERTEX_ATTRIBUTES];
+} gpu_ir_vertex_input_desc;
+
+enum {
+    GPU_IR_BLEND_FACTOR_ZERO = 0,
+    GPU_IR_BLEND_FACTOR_ONE,
+    GPU_IR_BLEND_FACTOR_SOURCE_COLOR,
+    GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE_COLOR,
+    GPU_IR_BLEND_FACTOR_DESTINATION_COLOR,
+    GPU_IR_BLEND_FACTOR_ONE_MINUS_DESTINATION_COLOR,
+    GPU_IR_BLEND_FACTOR_SOURCE_ALPHA,
+    GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA,
+    GPU_IR_BLEND_FACTOR_DESTINATION_ALPHA,
+    GPU_IR_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA,
+    GPU_IR_BLEND_FACTOR_CONSTANT_COLOR,
+    GPU_IR_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR,
+    GPU_IR_BLEND_FACTOR_CONSTANT_ALPHA,
+    GPU_IR_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA,
+    GPU_IR_BLEND_FACTOR_SOURCE_ALPHA_SATURATE,
+    GPU_IR_BLEND_FACTOR_SOURCE1_COLOR,
+    GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE1_COLOR,
+    GPU_IR_BLEND_FACTOR_SOURCE1_ALPHA,
+    GPU_IR_BLEND_FACTOR_ONE_MINUS_SOURCE1_ALPHA
+};
+
+enum {
+    GPU_IR_BLEND_OPERATION_ADD = 0,
+    GPU_IR_BLEND_OPERATION_SUBTRACT,
+    GPU_IR_BLEND_OPERATION_REVERSE_SUBTRACT,
+    GPU_IR_BLEND_OPERATION_MINIMUM,
+    GPU_IR_BLEND_OPERATION_MAXIMUM
+};
+
+enum {
+    GPU_IR_COLOR_WRITE_RED = 1u << 0,
+    GPU_IR_COLOR_WRITE_GREEN = 1u << 1,
+    GPU_IR_COLOR_WRITE_BLUE = 1u << 2,
+    GPU_IR_COLOR_WRITE_ALPHA = 1u << 3,
+    GPU_IR_COLOR_WRITE_ALL = GPU_IR_COLOR_WRITE_RED | GPU_IR_COLOR_WRITE_GREEN |
+                             GPU_IR_COLOR_WRITE_BLUE | GPU_IR_COLOR_WRITE_ALPHA
+};
+
+typedef struct {
+    uint32_t enabled;
+    uint32_t source_color_factor, destination_color_factor, color_operation;
+    uint32_t source_alpha_factor, destination_alpha_factor, alpha_operation;
+    uint32_t write_mask;
+} gpu_ir_color_blend_attachment;
+
+// A zero attachment_count means that the front end did not provide color-blend state.
+// Constant factors use the four API-neutral blend_constants values retained here.
+typedef struct {
+    uint32_t attachment_count;
+    uint32_t alpha_to_coverage_enabled;
+    float blend_constants[4];
+    gpu_ir_color_blend_attachment attachments[GPU_IR_MAX_COLOR_ATTACHMENTS];
+} gpu_ir_color_blend_state;
+int gpu_ir_color_blend_state_valid(const gpu_ir_color_blend_state *state);
+
 typedef struct {
     uint32_t kind, stage_mask;
     uint32_t threadgroup_size[3];
+    gpu_ir_vertex_input_desc vertex_input;
+    gpu_ir_color_blend_state color_blend;
 } gpu_ir_pipeline_info;
 
 typedef struct {
@@ -433,7 +633,8 @@ typedef struct {
     gpu_ir_pipeline_layout *layout;
     void *backend_object;
     gpu_ir_backend_object_release release;
-    // Optional complete normalized stage set, indexed by the matching GPU_IR_STAGE_SLOT_* value.
+    // Optional normalized stage shaders, indexed by the matching GPU_IR_STAGE_SLOT_* value. Graphics pipelines
+    // may retain a subset while a frontend keeps other stages in its native representation; compute has one stage.
     // Existing direct-translation front ends may leave this empty while they migrate their shader readers.
     gpu_ir_shader *stage_shaders[GPU_IR_STAGE_SLOT_COUNT];
 } gpu_ir_pipeline_desc;
@@ -483,6 +684,15 @@ enum {
     GPU_IR_SHADER_TYPE_FLAG_COLUMN_MAJOR = 1u << 5
 };
 
+// Shader-interface interpolation qualifiers retained from SPIR-V variable/member decorations.
+enum {
+    GPU_IR_SHADER_DECORATION_NO_PERSPECTIVE = 1u << 16,
+    GPU_IR_SHADER_DECORATION_FLAT = 1u << 17,
+    GPU_IR_SHADER_DECORATION_CENTROID = 1u << 18,
+    GPU_IR_SHADER_DECORATION_SAMPLE = 1u << 19,
+    GPU_IR_SHADER_DECORATION_INVARIANT = 1u << 20
+};
+
 // Common semantic classes. `source_storage_class` retains the frontend's numeric value for diagnostics and
 // validation; backends and future shader frontends must use these normalized values for behavior.
 enum {
@@ -514,6 +724,17 @@ enum {
     GPU_IR_SHADER_BUILTIN_LOCAL_INVOCATION_ID,
     GPU_IR_SHADER_BUILTIN_GLOBAL_INVOCATION_ID,
     GPU_IR_SHADER_BUILTIN_LOCAL_INVOCATION_INDEX,
+    GPU_IR_SHADER_BUILTIN_POSITION,
+    GPU_IR_SHADER_BUILTIN_VERTEX_INDEX,
+    // API instance index including the draw's firstInstance/baseInstance offset.
+    GPU_IR_SHADER_BUILTIN_INSTANCE_INDEX,
+    // Per-draw zero-based D3D SV_InstanceID; Metal requires subtracting [[base_instance]].
+    GPU_IR_SHADER_BUILTIN_INSTANCE_ID,
+    GPU_IR_SHADER_BUILTIN_SUBGROUP_SIZE,
+    GPU_IR_SHADER_BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID,
+    GPU_IR_SHADER_BUILTIN_FRAG_COORD,
+    GPU_IR_SHADER_BUILTIN_FRONT_FACING,
+    GPU_IR_SHADER_BUILTIN_FRAG_DEPTH,
     GPU_IR_SHADER_BUILTIN_UNMAPPED
 };
 
@@ -570,7 +791,48 @@ enum {
     GPU_IR_SHADER_OP_IMAGE_READ,
     GPU_IR_SHADER_OP_IMAGE_WRITE,
     GPU_IR_SHADER_OP_SAMPLED_IMAGE,
-    GPU_IR_SHADER_OP_IMAGE_SAMPLE
+    GPU_IR_SHADER_OP_IMAGE_SAMPLE,
+    GPU_IR_SHADER_OP_IMAGE_QUERY,
+    GPU_IR_SHADER_OP_ATOMIC,
+    GPU_IR_SHADER_OP_DISCARD,
+    GPU_IR_SHADER_OP_TERMINATE_INVOCATION
+};
+
+enum {
+    GPU_IR_SHADER_IMAGE_SAMPLE_EXPLICIT_LOD = 0,
+    GPU_IR_SHADER_IMAGE_SAMPLE_IMPLICIT_LOD
+};
+
+enum {
+    // 2D or 2D-array unsigned-integer mip read; out-of-range mip, coordinates or array layer return zero.
+    GPU_IR_SHADER_IMAGE_READ_2D_LOD_OOB = 1,
+    // 2D or 2D-array float MSAA sample read; out-of-range coordinates/layers return zero, sample index follows API undefined behavior.
+    GPU_IR_SHADER_IMAGE_READ_2D_MSAA_OOB = 2
+};
+
+enum {
+    GPU_IR_SHADER_IMAGE_QUERY_SIZE = 1,
+    GPU_IR_SHADER_IMAGE_QUERY_LEVELS,
+    GPU_IR_SHADER_IMAGE_QUERY_ARRAY_SIZE,
+    GPU_IR_SHADER_IMAGE_QUERY_SAMPLES
+};
+
+enum {
+    GPU_IR_SHADER_ATOMIC_INTEGER_ADD = 1,
+    GPU_IR_SHADER_ATOMIC_INTEGER_SUBTRACT,
+    GPU_IR_SHADER_ATOMIC_INTEGER_AND,
+    GPU_IR_SHADER_ATOMIC_INTEGER_OR,
+    GPU_IR_SHADER_ATOMIC_INTEGER_XOR,
+    GPU_IR_SHADER_ATOMIC_INTEGER_SIGNED_MINIMUM,
+    GPU_IR_SHADER_ATOMIC_INTEGER_SIGNED_MAXIMUM,
+    GPU_IR_SHADER_ATOMIC_INTEGER_UNSIGNED_MINIMUM,
+    GPU_IR_SHADER_ATOMIC_INTEGER_UNSIGNED_MAXIMUM,
+    GPU_IR_SHADER_ATOMIC_INTEGER_EXCHANGE,
+    GPU_IR_SHADER_ATOMIC_INTEGER_COMPARE_EXCHANGE,
+    GPU_IR_SHADER_ATOMIC_INTEGER_INCREMENT,
+    GPU_IR_SHADER_ATOMIC_INTEGER_DECREMENT,
+    GPU_IR_SHADER_ATOMIC_INTEGER_LOAD,
+    GPU_IR_SHADER_ATOMIC_INTEGER_STORE
 };
 
 enum {
@@ -655,7 +917,29 @@ enum {
     GPU_IR_SHADER_ARITH_BIT_FIND_LSB,
     GPU_IR_SHADER_ARITH_BIT_FIND_MSB_UNSIGNED,
     GPU_IR_SHADER_ARITH_BIT_FIND_MSB_SIGNED,
-    GPU_IR_SHADER_ARITH_SATURATE
+    GPU_IR_SHADER_ARITH_SATURATE,
+    // 32-bit integer multiply-add with modulo-2^32 result semantics.
+    GPU_IR_SHADER_ARITH_INTEGER_MAD,
+    // Floating multiply-add with a separately rounded product and sum.
+    GPU_IR_SHADER_ARITH_FLOAT_MAD,
+    // Component-wise linear blend x * (1 - a) + y * a.
+    GPU_IR_SHADER_ARITH_INTERPOLATE,
+    // Component-wise threshold: 0 when x < edge, otherwise 1.
+    GPU_IR_SHADER_ARITH_STEP,
+    // Component-wise cubic interpolation between edge0 and edge1.
+    GPU_IR_SHADER_ARITH_SMOOTHSTEP,
+    // Vote over active lanes of the current API subgroup; result is scalar bool.
+    GPU_IR_SHADER_ARITH_SUBGROUP_ANY,
+    GPU_IR_SHADER_ARITH_SUBGROUP_ALL,
+    // Reduce one 32-bit integer value across active lanes of the current API subgroup.
+    GPU_IR_SHADER_ARITH_SUBGROUP_SMIN,
+    GPU_IR_SHADER_ARITH_SUBGROUP_UMIN,
+    GPU_IR_SHADER_ARITH_SUBGROUP_SMAX,
+    GPU_IR_SHADER_ARITH_SUBGROUP_UMAX,
+    GPU_IR_SHADER_ARITH_SUBGROUP_IMUL,
+    GPU_IR_SHADER_ARITH_SUBGROUP_BIT_AND,
+    GPU_IR_SHADER_ARITH_SUBGROUP_BIT_OR,
+    GPU_IR_SHADER_ARITH_SUBGROUP_BIT_XOR
 };
 
 enum {
@@ -712,7 +996,12 @@ enum {
     GPU_IR_SHADER_FLAG_FAST_MATH = 1u << 5,
     GPU_IR_SHADER_FLAG_SPECIALIZATION = 1u << 6,
     // DXIL BFE/BFI consume only the low five bits of width and offset; SPIR-V does not use this flag.
-    GPU_IR_SHADER_FLAG_DXIL_BITFIELD_LOW5 = 1u << 7
+    GPU_IR_SHADER_FLAG_DXIL_BITFIELD_LOW5 = 1u << 7,
+    // Float min/max rules that select the source operand on equality, ignore a single NaN, and
+    // compare denormals as signed zero while returning the original selected value.
+    GPU_IR_SHADER_FLAG_MINMAX_ORDERED_SELECT = 1u << 8,
+    GPU_IR_SHADER_FLAG_MINMAX_IGNORE_SINGLE_NAN = 1u << 9,
+    GPU_IR_SHADER_FLAG_MINMAX_FLUSH_DENORMS = 1u << 10
 };
 
 enum {
@@ -733,6 +1022,8 @@ typedef struct {
     uint32_t storage_class, source_storage_class, resource_set, binding_namespace, binding;
     uint32_t decoration_flags, location, component, index, builtin, source_builtin;
     uint32_t has_descriptor_set, has_binding, has_location, has_component, has_index, has_builtin;
+    // True when a SPIR-V Input/Output variable belongs to the selected OpEntryPoint interface.
+    uint32_t entry_point_interface;
     uint32_t first_operand, operand_count, first_literal, literal_word_count;
 } gpu_ir_shader_instruction;
 
@@ -799,16 +1090,68 @@ enum {
     GPU_IR_TOPOLOGY_TRIANGLE_STRIP
 };
 
+enum {
+    GPU_IR_INDEX_TYPE_NONE = 0,
+    GPU_IR_INDEX_TYPE_UINT16,
+    GPU_IR_INDEX_TYPE_UINT32
+};
+
+typedef struct {
+    uint32_t binding;
+    gpu_ir_resource *resource;
+    uint64_t offset;
+    // Available bytes from offset to the end of the API-bound range.
+    uint64_t size;
+    // Stride carried with a captured API binding; pipeline-static APIs leave this zero.
+    uint32_t stride;
+} gpu_ir_vertex_buffer_binding;
+
+typedef struct {
+    float x, y, width, height, min_depth, max_depth;
+} gpu_ir_viewport;
+
+typedef struct {
+    int32_t x, y;
+    uint32_t width, height;
+} gpu_ir_scissor;
+
 typedef struct {
     uint32_t topology, indexed;
     uint32_t vertex_count, index_count, instance_count;
     uint32_t first_vertex, first_index, first_instance;
     int32_t vertex_offset;
+    uint32_t index_type;
+    uint64_t index_buffer_offset;
+    uint64_t index_buffer_size;
+    gpu_ir_resource *index_buffer;
+    // Indicates that the frontend captured the complete vertex-buffer binding state for this draw.
+    uint32_t vertex_buffers_captured;
+    uint32_t vertex_buffer_count;
+    gpu_ir_vertex_buffer_binding vertex_buffers[GPU_IR_MAX_VERTEX_BUFFERS];
+    // D3D blend factors are command state. Vulkan keeps its constants on the pipeline instead.
+    uint32_t has_blend_constants;
+    float blend_constants[4];
+    // Optional API-neutral raster state; absent values keep the backend's render-pass defaults.
+    uint32_t has_viewport, has_scissor;
+    gpu_ir_viewport viewport;
+    gpu_ir_scissor scissor;
 } gpu_ir_draw_info;
 
 typedef struct {
     uint32_t topology, indexed, draw_count, stride;
     uint64_t argument_offset, count_offset;
+    // Optional API-captured indexed state. D3D12 supplies the index buffer through its replay state;
+    // Vulkan captures the bound buffer and dynamic raster state when vkCmdDrawIndexedIndirect is recorded.
+    gpu_ir_resource *index_buffer;
+    uint32_t index_type, has_viewport, has_scissor, vertex_buffers_captured;
+    uint32_t has_blend_constants;
+    float blend_constants[4];
+    uint64_t index_buffer_offset;
+    uint64_t index_buffer_size;
+    uint32_t vertex_buffer_count;
+    gpu_ir_vertex_buffer_binding vertex_buffers[GPU_IR_MAX_VERTEX_BUFFERS];
+    gpu_ir_viewport viewport;
+    gpu_ir_scissor scissor;
 } gpu_ir_indirect_draw_info;
 
 typedef struct {
@@ -865,6 +1208,9 @@ typedef struct {
                                const gpu_ir_clear_depth_stencil_info *clear);
     int (*fill_buffer_pattern)(void *context, const gpu_ir_resource *dst, uint64_t dst_offset,
                                uint64_t size, const void *pattern, uint32_t pattern_size);
+    int (*begin_render_pass)(void *context, const gpu_ir_resource *color_attachment,
+                             const gpu_ir_render_pass_desc *description);
+    int (*end_render_pass)(void *context);
 } gpu_ir_backend;
 
 typedef struct { void *commands; uint32_t count, capacity; } gpu_ir_stream;
@@ -901,9 +1247,20 @@ int gpu_ir_record_resolve_texture_region(gpu_ir_stream *stream, gpu_ir_resource 
 // list means the full selected attachment; API front ends validate attachment format and access state.
 int gpu_ir_record_clear_color(gpu_ir_stream *stream, gpu_ir_resource *texture, const float color[4],
                               const gpu_ir_rect *rectangles, uint32_t rectangle_count, uint32_t *index);
+int gpu_ir_record_clear_color_typed(gpu_ir_stream *stream, gpu_ir_resource *texture,
+                                    gpu_ir_clear_color_value_type value_type, const void *color,
+                                    const gpu_ir_rect *rectangles, uint32_t rectangle_count, uint32_t *index);
+int gpu_ir_record_clear_color_layers_typed(gpu_ir_stream *stream, gpu_ir_resource *texture,
+                                           gpu_ir_clear_color_value_type value_type, const void *color,
+                                           uint32_t base_array_layer, uint32_t array_layer_count,
+                                           const gpu_ir_rect *rectangles, uint32_t rectangle_count,
+                                           uint32_t *index);
 int gpu_ir_record_clear_depth_stencil(gpu_ir_stream *stream, gpu_ir_resource *texture, uint32_t aspects,
                                       float depth, uint32_t stencil, const gpu_ir_rect *rectangles,
                                       uint32_t rectangle_count, uint32_t *index);
+int gpu_ir_record_begin_render_pass(gpu_ir_stream *stream, gpu_ir_resource *color_attachment,
+                                    const gpu_ir_render_pass_desc *description, uint32_t *index);
+int gpu_ir_record_end_render_pass(gpu_ir_stream *stream, uint32_t *index);
 int gpu_ir_record_barrier(gpu_ir_stream *stream, const gpu_ir_barrier_desc *barrier, uint32_t *index);
 int gpu_ir_record_dispatch(gpu_ir_stream *stream, gpu_ir_pipeline *pipeline,
                            uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z,

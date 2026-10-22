@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
+#include "gpu_ir.h"
 
 typedef struct {
     uint32_t mip, mips, first_slice, slices, plane;
@@ -13,6 +14,23 @@ typedef struct {
 typedef struct {
     uint32_t mip, first_w_slice, w_size;
 } d3d12_uav_texture3d_range12;
+
+// D3D12 encodes four 3-bit source selectors and requires bit 12 to be set. Convert the selected channels into the
+// API-neutral descriptor representation; zero in a lane means that lane's identity source.
+static inline int d3d12_normalize_srv_component_mapping12(uint32_t mapping, uint32_t *out) {
+    if (!out || !(mapping & (1u << 12)) || (mapping & ~0x1fffu)) return 0;
+    uint32_t normalized = 0;
+    for (uint32_t component = 0; component < 4; component++) {
+        uint32_t selector = (mapping >> (component * 3)) & 7u;
+        if (selector > 5) return 0;
+        uint32_t common = selector == component ? GPU_IR_COMPONENT_SWIZZLE_IDENTITY :
+            selector < 4 ? GPU_IR_COMPONENT_SWIZZLE_R + selector :
+            selector == 4 ? GPU_IR_COMPONENT_SWIZZLE_ZERO : GPU_IR_COMPONENT_SWIZZLE_ONE;
+        normalized |= common << (component * 3);
+    }
+    *out = normalized;
+    return 1;
+}
 
 // D3D12_RESOURCE_DIMENSION values: BUFFER=1, TEXTURE1D=2, TEXTURE2D=3, TEXTURE3D=4.
 static inline uint32_t d3d12_default_srv_texture_dimension12(uint32_t resource_dimension,

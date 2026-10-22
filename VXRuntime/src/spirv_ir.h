@@ -9,8 +9,10 @@
 int spirv_build_gpu_ir_layout(const spirv_module *module, const spirv_entry_point *entry_point,
                               gpu_ir_pipeline_layout **layout);
 
-// Lowers the core type and executable subset understood by this front end into an owned, API-neutral shader.
-// The selected entry point must belong to module; an unrepresented executable instruction is rejected.
+// Lowers the core type and executable subset understood by this front end into an owned, API-neutral shader,
+// including Subgroup-scope OpGroupNonUniformAny/All votes and 32-bit OpGroupNonUniformIMul,
+// SMin/UMin/SMax/UMax and BitwiseAnd/Or/Xor reductions. The selected entry point must belong to module;
+// an unrepresented executable instruction is rejected.
 int spirv_build_gpu_ir_shader(const spirv_module *module, const spirv_entry_point *entry_point,
                               gpu_ir_shader **shader);
 

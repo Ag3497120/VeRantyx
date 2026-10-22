@@ -6,6 +6,7 @@ enum {
     DIDF_ABSAXIS = 0x01,
     DIDF_RELAXIS = 0x02,
     DIDFT_ABSAXIS = 0x02,
+    DIDFT_AXIS = 0x03,
     DIDFT_BUTTON = 0x0c,
     DIDFT_POV = 0x10,
     DIDFT_TYPEMASK = 0xff,
@@ -99,10 +100,10 @@ int vx_di_resolve_format(const vx_di_hid_usage *inventory, size_t inventory_coun
         uint32_t type = objects[i].type;
         uint32_t kind = type & DIDFT_TYPEMASK;
         uint32_t category;
-        if (kind == DIDFT_ABSAXIS) category = 1;
+        if (kind == DIDFT_ABSAXIS || kind == DIDFT_AXIS) category = 1;
         else if (kind == 0x04 || kind == 0x08 || kind == DIDFT_BUTTON) category = 2;
         else if (kind == DIDFT_POV) category = 3;
-        else if (kind == 0x01 || kind == 0x03) { result = VX_DI_FORMAT_UNSUPPORTED; break; }
+        else if (kind == 0x01) { result = VX_DI_FORMAT_UNSUPPORTED; break; }
         else { result = VX_DI_FORMAT_INVALID; break; }
 
         // Only the type, instance and optional bits are defined for the HID objects we expose.
@@ -111,7 +112,8 @@ int vx_di_resolve_format(const vx_di_hid_usage *inventory, size_t inventory_coun
             break;
         }
         guid_match match;
-        if (!guid_category(objects[i].guid, &match) || match.category != category) {
+        if (!objects[i].guid) match = (guid_match){ category, 0 };
+        else if (!guid_category(objects[i].guid, &match) || match.category != category) {
             result = VX_DI_FORMAT_INVALID;
             break;
         }
@@ -120,21 +122,26 @@ int vx_di_resolve_format(const vx_di_hid_usage *inventory, size_t inventory_coun
             result = VX_DI_FORMAT_INVALID;
             break;
         }
-        for (size_t j = 0; j < i; j++) {
-            uint32_t other_width = resolved[j].width;
-            if (objects[i].offset < objects[j].offset + other_width &&
-                objects[j].offset < objects[i].offset + width) {
-                result = VX_DI_FORMAT_INVALID;
-                break;
-            }
-        }
-        if (result != VX_DI_FORMAT_OK) break;
 
         uint32_t source = UINT32_MAX;
         int found = resolve_one(inventory, inventory_count, &objects[i], category, &match,
                                 used, &source);
         if (!found && !(type & DIDFT_OPTIONAL)) { result = VX_DI_FORMAT_INVALID; break; }
-        if (found) used[source] = 1;
+        if (found) {
+            // Missing optional HID aspects produce no data, so their offsets do not conflict with
+            // present objects. c_dfDIJoystick2 includes optional axis aspects that share offsets.
+            for (size_t j = 0; j < i; j++) {
+                if (resolved[j].source_index == UINT32_MAX) continue;
+                uint32_t other_width = resolved[j].width;
+                if (objects[i].offset < objects[j].offset + other_width &&
+                    objects[j].offset < objects[i].offset + width) {
+                    result = VX_DI_FORMAT_INVALID;
+                    break;
+                }
+            }
+            if (result != VX_DI_FORMAT_OK) break;
+            used[source] = 1;
+        }
         resolved[i] = (vx_di_resolved_object){ source, width, category };
     }
     free(used);

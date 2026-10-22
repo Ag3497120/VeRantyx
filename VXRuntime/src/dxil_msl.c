@@ -663,6 +663,27 @@ static void resret_min_lod_feature(tr *t, const dxil_inst *in, const char *suppo
     line(t, "#endif");
 }
 
+static void resret_component_mapping(tr *t, const dxil_inst *in, const char *expression,
+                                     const char *descriptor, int status) {
+    if (!descriptor) { resret(t, in, expression, status); return; }
+    char mapped[1024];
+    snprintf(mapped, sizeof mapped, "vx_desc_swizzle(%s, %s)", expression, descriptor);
+    resret(t, in, mapped, status);
+}
+
+static void resret_min_lod_component_mapping(tr *t, const dxil_inst *in, const char *supported_expression,
+                                             const char *fallback_expression, const char *descriptor,
+                                             int status) {
+    if (!descriptor) {
+        resret_min_lod_feature(t, in, supported_expression, fallback_expression, status);
+        return;
+    }
+    char supported[1024], fallback[1024];
+    snprintf(supported, sizeof supported, "vx_desc_swizzle(%s, %s)", supported_expression, descriptor);
+    snprintf(fallback, sizeof fallback, "vx_desc_swizzle(%s, %s)", fallback_expression, descriptor);
+    resret_min_lod_feature(t, in, supported, fallback, status);
+}
+
 static int texture_load_offsets(tr *t, const dxil_inst *in, int kind, int64_t offsets[3]) {
     uint32_t count = kind == 1 || kind == 6 ? 1 :
                      kind == 2 || kind == 3 || kind == 7 || kind == 8 ? 2 :
@@ -766,8 +787,12 @@ static void emit_texture_load(tr *t, const dxil_inst *in, const char a[12][96], 
 
     const char *vector_type = h->comp == 2 || h->comp == 4 ? "int4" :
                               h->comp == 3 || h->comp == 5 ? "uint4" : "float4";
-    snprintf(expression, sizeof expression, "(vx_texture_load_valid_%u ? %s(%s) : %s(0))",
-             valid_id, vector_type, read, vector_type);
+    if (h->cls == DXIL_SRV)
+        snprintf(expression, sizeof expression, "(vx_texture_load_valid_%u ? vx_desc_swizzle(%s(%s), %s) : %s(0))",
+                 valid_id, vector_type, read, a[0], vector_type);
+    else
+        snprintf(expression, sizeof expression, "(vx_texture_load_valid_%u ? %s(%s) : %s(0))",
+                 valid_id, vector_type, read, vector_type);
     resret(t, in, expression, 1);
 }
 
@@ -1005,6 +1030,8 @@ static void call(tr *t, const dxil_inst *in) {
     case 60: case 61: case 62: case 63: case 64: case 65: {       // Sample, SampleBias, SampleLevel, SampleGrad, SampleCmp, SampleCmpLevelZero
         handle_info *h = hinfo(t, in->ops[2]);
         if (!h) { err(t, "sampling a handle that does not come from createHandle"); return; }
+        if (h->cls == DXIL_SRV && (op == 64 || op == 65))
+            t->out->uses_component_mapping_unsupported_read = 1;
         int one_d = h->kind == 1 || h->kind == 6;
         if (one_d && op == 60 && in->n > 8 && !is_undef(t, in->ops[8])) {
             int constant_offset = 0;
@@ -1142,14 +1169,15 @@ static void call(tr *t, const dxil_inst *in) {
                                  d[0], d[1], d[3], d[4]);
                 }
                 snprintf(fallback, sizeof fallback, "float4(%s.sample(%s, %s%s%s%s))", tex, smp, c, layer, fallback_opt, off);
-                resret_min_lod_feature(t, in, e, fallback, 1);
+                resret_min_lod_component_mapping(t, in, e, fallback,
+                                                  h->cls == DXIL_SRV ? a[0] : NULL, 1);
             } else {
                 snprintf(e, sizeof e, "float4(%s.sample(%s, %s%s%s%s))", tex, smp, c, layer, opt, off);
-                resret(t, in, e, 1);
+                resret_component_mapping(t, in, e, h->cls == DXIL_SRV ? a[0] : NULL, 1);
             }
         } else {
             snprintf(e, sizeof e, "float4(%s.sample(%s, %s%s%s%s))", tex, smp, c, layer, opt, off);
-            resret(t, in, e, 1);
+            resret_component_mapping(t, in, e, h->cls == DXIL_SRV ? a[0] : NULL, 1);
         }
         return;
     }
@@ -1166,6 +1194,7 @@ static void call(tr *t, const dxil_inst *in) {
             err(t, "gather requires an SRV texture and sampler handle");
             return;
         }
+        if (op == 74) t->out->uses_component_mapping_unsupported_read = 1;
         if (h->kind != 2 && h->kind != 7 && h->kind != 5 && h->kind != 9) {
             err(t, "gather supports only 2D, 2D-array, cube and cube-array textures");
             return;
@@ -1203,10 +1232,32 @@ static void call(tr *t, const dxil_inst *in) {
         char e[700];
         if (op == 73) {
             static const char *components[] = { "component::x", "component::y", "component::z", "component::w" };
-            if (h->kind == 2 || h->kind == 7)
-                snprintf(e, sizeof e, "%s.gather(%s, %s%s%s, %s)", tex, smp, c, layer, off, components[channel]);
-            else
-                snprintf(e, sizeof e, "%s.gather(%s, %s%s, %s)", tex, smp, c, layer, components[channel]);
+            char selector[64], gathered[64];
+            snprintf(selector, sizeof selector, "vx_gather_component_%u", in->result);
+            snprintf(gathered, sizeof gathered, "vx_gather_result_%u", in->result);
+            line(t, "{");
+            t->indent++;
+            line(t, "uint %s = vx_desc_component_selector((device const VxDesc *)%s, %uu);", selector, a[0], channel);
+            line(t, "float4 %s = float4(0.0f);", gathered);
+            line(t, "switch (%s) {", selector);
+            t->indent++;
+            for (uint32_t component = 0; component < 4; component++) {
+                if (h->kind == 2 || h->kind == 7)
+                    line(t, "case %uu: %s = %s.gather(%s, %s%s%s, %s); break;", component, gathered,
+                         tex, smp, c, layer, off, components[component]);
+                else
+                    line(t, "case %uu: %s = %s.gather(%s, %s%s, %s); break;", component, gathered,
+                         tex, smp, c, layer, components[component]);
+            }
+            line(t, "case 4u: %s = float4(0.0f); break;", gathered);
+            line(t, "case 5u: %s = float4(1.0f); break;", gathered);
+            line(t, "default: %s = float4(0.0f); break;", gathered);
+            t->indent--;
+            line(t, "}");
+            resret(t, in, gathered, 1);
+            t->indent--;
+            line(t, "}");
+            return;
         } else if (h->kind == 2 || h->kind == 7) {
             snprintf(e, sizeof e, "%s.gather_compare(%s, %s%s, %s%s)", tex, smp, c, layer, a[9], off);
         } else {
@@ -1221,12 +1272,16 @@ static void call(tr *t, const dxil_inst *in) {
         if (h->cls == DXIL_SRV && !buffer_kind(h->kind) && h->kind != 3 && h->kind != 8)
             t->out->uses_texture_load = 1;
         if (buffer_kind(h->kind) == 3) {
-            char tex[160], e[300];
+            char tex[160], e[600];
             tex_of(t, in->ops[2], 0, tex, sizeof tex);
             const char *vt = h->comp == 4 || h->comp == 2 ? "int4" : h->comp == 5 || h->comp == 3 ? "uint4"
                          : h->comp == 8 ? "half4" : "float4";
-            snprintf(e, sizeof e, "uint(%s) < %s->size ? %s(%s.read(uint(%s->va + uint(%s)))) : %s(0)",
-                     a[2], a[0], vt, tex, a[0], a[2], vt);             // typed-buffer index within the D3D12 view
+            if (h->cls == DXIL_SRV)
+                snprintf(e, sizeof e, "uint(%s) < %s->size ? vx_desc_swizzle(%s(%s.read(uint(%s->va + uint(%s)))), %s) : %s(0)",
+                         a[2], a[0], vt, tex, a[0], a[2], a[0], vt);
+            else
+                snprintf(e, sizeof e, "uint(%s) < %s->size ? %s(%s.read(uint(%s->va + uint(%s)))) : %s(0)",
+                         a[2], a[0], vt, tex, a[0], a[2], vt);
             resret(t, in, e, 1);
         }
         else emit_texture_load(t, in, a, h);
@@ -1298,14 +1353,20 @@ static void call(tr *t, const dxil_inst *in) {
         handle_info *h = hinfo(t, in->ops[2]);
         if (!h) { err(t, "a buffer load from a handle that does not come from createHandle"); return; }
         int bk = buffer_kind(h->kind);
-        char e[400];
+        char e[600];
         if (bk == 3) {
             char tex[160];
             tex_of(t, in->ops[2], 0, tex, sizeof tex);
             const char *vt = h->comp == 4 || h->comp == 2 ? "int4" : h->comp == 5 || h->comp == 3 ? "uint4"
                          : h->comp == 8 ? "half4" : "float4";
-            snprintf(e, sizeof e, "uint(%s) < %s->size ? %s(%s.read(uint(%s->va + uint(%s)))) : %s(0)",
-                     a[1], a[0], vt, tex, a[0], a[1], vt);
+            if (h->cls == DXIL_SRV) {
+                snprintf(e, sizeof e, "uint(%s) < %s->size ? vx_desc_swizzle(%s(%s.read(uint(%s->va + uint(%s)))), %s) : %s(0)",
+                         a[1], a[0], vt, tex, a[0], a[1], a[0], vt);
+            } else {
+                snprintf(e, sizeof e, "uint(%s) < %s->size ? %s(%s.read(uint(%s->va + uint(%s)))) : %s(0)",
+                         a[1], a[0], vt, tex, a[0], a[1], vt);
+            }
+            resret(t, in, e, 1);
         } else {
             char addr[256];
             if (bk == 2 && !(op == 139 && is_undef(t, in->ops[4]))) snprintf(addr, sizeof addr, "uint(%s) * %s->stride + uint(%s)", a[1], a[0], a[2]);
@@ -1313,8 +1374,8 @@ static void call(tr *t, const dxil_inst *in) {
             snprintf(e, sizeof e, "vx_ld4(%s, %s)", a[0], addr);
             int f = in->result != UINT32_MAX && ty(t, in->type) && ty(t, in->type)->count && is_float(t, ty(t, in->type)->members[0]);
             if (f) { char e2[420]; snprintf(e2, sizeof e2, "as_type<float4>(%s)", e); snprintf(e, sizeof e, "%s", e2); }
+            resret_component_mapping(t, in, e, h->cls == DXIL_SRV ? a[0] : NULL, 1);
         }
-        resret(t, in, e, 1);
         return;
     }
     case 69: case 140: {                                           // BufferStore(uav, c0, c1, v0..v3, mask), RawBufferStore(... mask, align)
@@ -1455,8 +1516,34 @@ static void call(tr *t, const dxil_inst *in) {
         return;
     }
     case 82: line(t, "if (%s) discard_fragment();", a[0]); return;
-    case 83: case 85: line(t, "%s = dfdx(%s);", r, a[0]); return;
-    case 84: case 86: line(t, "%s = dfdy(%s);", r, a[0]); return;
+    case 83: case 84: case 85: case 86: {
+        const dxil_value *source = in->n == 3 ? val(t, in->ops[2]) : NULL;
+        if (in->n != 3 || in->result == UINT32_MAX || !source || source->type != in->type ||
+            !is_float(t, in->type) || t->out->stage != 0) {
+            err(t, "unsupported derivative type, operands, or shader stage");
+            return;
+        }
+        if (op == 83 || op == 84) {
+            uint32_t pair_lane = op == 83 ? 1u : 2u;
+            line(t, "%s = quad_shuffle(%s, ushort(%uu)) - quad_shuffle(%s, ushort(0u));",
+                 r, a[0], pair_lane, a[0]);
+            return;
+        }
+        // Fine derivatives use the current pixel and its horizontal/vertical quad neighbor.
+        // Metal's quad XOR permutes by the corresponding lane bit; the lane parity selects sign.
+        int axis_y = op == 86;
+        uint32_t axis_mask = axis_y ? 2u : 1u;
+        t->need_lane = 1;
+        line(t, "{");
+        t->indent++;
+        line(t, "uint vx_derivative_lane = vx_lane & 3u;");
+        line(t, "%s vx_derivative_neighbor = quad_shuffle_xor(%s, ushort(%u));", tn, a[0], axis_mask);
+        line(t, "%s = (vx_derivative_lane & %uu) != 0u ? (%s - vx_derivative_neighbor) : (vx_derivative_neighbor - %s);",
+             r, axis_mask, a[0], a[0]);
+        t->indent--;
+        line(t, "}");
+        return;
+    }
     case 93: case 94: case 95: {
         int ok;
         int c = (int)const_int(t, in->ops[2], &ok);
@@ -1467,6 +1554,12 @@ static void call(tr *t, const dxil_inst *in) {
     }
     case 96: t->need_lidx = 1; line(t, "%s = vx_lidx;", r); return;
     case 110: {                                                    // WaveIsFirstLane: helpers do not precede active pixel lanes
+        const dxil_type *result_type = ty(t, in->type);
+        if (in->n != 2 || in->result == UINT32_MAX || !result_type ||
+            result_type->kind != DXT_INT || result_type->bits != 1) {
+            err(t, "unsupported WaveIsFirstLane result or operands");
+            return;
+        }
         const char *active = wave_active_predicate(t);
         t->need_lane = t->need_lanes = 1;
         line(t, "{");
@@ -1479,18 +1572,45 @@ static void call(tr *t, const dxil_inst *in) {
         line(t, "}");
         return;
     }
-    case 111: t->need_lane = 1; line(t, "%s = vx_lane;", r); return;
-    case 112: t->need_lanes = 1; line(t, "%s = vx_lanes;", r); return;
-    case 113: {                                                    // WaveActiveAnyTrue
-        const char *active = wave_active_predicate(t);
-        line(t, "{ ulong vx_wa_true = ulong(simd_ballot((%s) && bool(%s))); %s = vx_wa_true != 0ul; }",
-             active, a[0], r);
+    case 111: {                                                    // WaveGetLaneIndex
+        const dxil_type *result_type = ty(t, in->type);
+        if (in->n != 2 || in->result == UINT32_MAX || !result_type ||
+            result_type->kind != DXT_INT || result_type->bits != 32) {
+            err(t, "unsupported WaveGetLaneIndex result or operands");
+            return;
+        }
+        t->need_lane = 1;
+        line(t, "%s = vx_lane;", r);
         return;
     }
-    case 114: {                                                    // WaveActiveAllTrue
+    case 112: {                                                    // WaveGetLaneCount
+        const dxil_type *result_type = ty(t, in->type);
+        if (in->n != 2 || in->result == UINT32_MAX || !result_type ||
+            result_type->kind != DXT_INT || result_type->bits != 32) {
+            err(t, "unsupported WaveGetLaneCount result or operands");
+            return;
+        }
+        t->need_lanes = 1;
+        line(t, "%s = vx_lanes;", r);
+        return;
+    }
+    case 113: case 114: {                                          // WaveActiveAnyTrue / WaveActiveAllTrue
+        const dxil_value *condition = in->n == 3 ? val(t, in->ops[2]) : NULL;
+        const dxil_type *condition_type = condition ? ty(t, condition->type) : NULL;
+        const dxil_type *result_type = ty(t, in->type);
+        if (in->n != 3 || in->result == UINT32_MAX || !condition_type ||
+            condition_type->kind != DXT_INT || condition_type->bits != 1 || !result_type ||
+            result_type->kind != DXT_INT || result_type->bits != 1) {
+            err(t, "unsupported WaveActiveVote result or operands");
+            return;
+        }
         const char *active = wave_active_predicate(t);
-        line(t, "{ ulong vx_wt_active = ulong(simd_ballot(%s)); ulong vx_wt_true = ulong(simd_ballot((%s) && bool(%s))); %s = vx_wt_active == vx_wt_true; }",
-             active, active, a[0], r);
+        if (op == 113)
+            line(t, "{ ulong vx_wa_true = ulong(simd_ballot((%s) && bool(%s))); %s = vx_wa_true != 0ul; }",
+                 active, a[0], r);
+        else
+            line(t, "{ ulong vx_wt_active = ulong(simd_ballot(%s)); ulong vx_wt_true = ulong(simd_ballot((%s) && bool(%s))); %s = vx_wt_active == vx_wt_true; }",
+                 active, active, a[0], r);
         return;
     }
     case 115: {                                                    // WaveActiveAllEqual
@@ -1696,10 +1816,31 @@ static void call(tr *t, const dxil_inst *in) {
         line(t, "}");
         return;
     }
-    case 122: line(t, "%s = quad_shuffle(%s, ushort(%s));", r, a[0], a[1]); return;
+    case 122: {                                                    // QuadReadLaneAt(value, quadLaneID)
+        const dxil_value *value = in->n > 2 ? val(t, in->ops[2]) : NULL;
+        const dxil_value *lane = in->n > 3 ? val(t, in->ops[3]) : NULL;
+        const dxil_type *lane_type = lane ? ty(t, lane->type) : NULL;
+        if (in->n != 4 || in->result == UINT32_MAX || !value || value->type != in->type ||
+            !wave_value_type_supported(t, value->type) || !lane_type || lane_type->kind != DXT_INT ||
+            lane_type->bits != 32) {
+            err(t, "unsupported QuadReadLaneAt operands");
+            return;
+        }
+        line(t, "%s = quad_shuffle(%s, ushort(%s));", r, a[0], a[1]);
+        return;
+    }
     case 123: {
-        int ok;
-        int q = (int)const_int(t, in->ops[3], &ok);
+        const dxil_value *value = in->n > 2 ? val(t, in->ops[2]) : NULL;
+        const dxil_value *operation = in->n > 3 ? val(t, in->ops[3]) : NULL;
+        const dxil_type *operation_type = operation ? ty(t, operation->type) : NULL;
+        int ok = 0;
+        int64_t q = in->n > 3 ? const_int(t, in->ops[3], &ok) : -1;
+        if (in->n != 4 || in->result == UINT32_MAX || !value || value->type != in->type ||
+            !wave_value_type_supported(t, value->type) || !operation_type ||
+            operation_type->kind != DXT_INT || operation_type->bits != 8 || !ok || q < 0 || q > 2) {
+            err(t, "unsupported QuadOp selector or operands");
+            return;
+        }
         line(t, "%s = quad_shuffle_xor(%s, ushort(%d));", r, a[0], q == 0 ? 1 : q == 1 ? 2 : 3);
         return;
     }
@@ -1707,19 +1848,43 @@ static void call(tr *t, const dxil_inst *in) {
     case 130: line(t, "%s = uint(as_type<ushort>(half(%s)));", r, a[0]); return;
     case 131: line(t, "%s = float(as_type<half>(ushort(%s)));", r, a[0]); return;
     case 135: {                                                    // WaveAllBitCount
+        const dxil_value *condition = in->n == 3 ? val(t, in->ops[2]) : NULL;
+        const dxil_type *condition_type = condition ? ty(t, condition->type) : NULL;
+        const dxil_type *result_type = ty(t, in->type);
+        if (in->n != 3 || in->result == UINT32_MAX || !condition_type ||
+            condition_type->kind != DXT_INT || condition_type->bits != 1 || !result_type ||
+            result_type->kind != DXT_INT || result_type->bits != 32) {
+            err(t, "unsupported WaveActiveCountBits result or operands");
+            return;
+        }
         const char *active = wave_active_predicate(t);
         line(t, "{ ulong vx_v = ulong(simd_ballot((%s) && bool(%s))); %s = popcount(uint(vx_v)) + popcount(uint(vx_v >> 32)); }",
              active, a[0], r);
         return;
     }
     case 116: {                                                    // WaveActiveBallot
-        if (!wave_mask_type(t, in->type)) { err(t, "unsupported WaveActiveBallot result type"); return; }
+        const dxil_value *condition = in->n == 3 ? val(t, in->ops[2]) : NULL;
+        const dxil_type *condition_type = condition ? ty(t, condition->type) : NULL;
+        if (in->n != 3 || in->result == UINT32_MAX || !condition_type ||
+            condition_type->kind != DXT_INT || condition_type->bits != 1 || !wave_mask_type(t, in->type)) {
+            err(t, "unsupported WaveActiveBallot result or operands");
+            return;
+        }
         const char *active = wave_active_predicate(t);
         line(t, "{ ulong vx_v = ulong(simd_ballot((%s) && bool(%s))); %s = %s{ uint(vx_v), uint(vx_v >> 32), 0u, 0u }; }",
              active, a[0], r, tn);
         return;
     }
     case 136: {                                                    // WavePrefixBitCount
+        const dxil_value *condition = in->n == 3 ? val(t, in->ops[2]) : NULL;
+        const dxil_type *condition_type = condition ? ty(t, condition->type) : NULL;
+        const dxil_type *result_type = ty(t, in->type);
+        if (in->n != 3 || in->result == UINT32_MAX || !condition_type ||
+            condition_type->kind != DXT_INT || condition_type->bits != 1 || !result_type ||
+            result_type->kind != DXT_INT || result_type->bits != 32) {
+            err(t, "unsupported WavePrefixCountBits result or operands");
+            return;
+        }
         const char *active = wave_active_predicate(t);
         t->need_lane = t->need_lanes = 1;
         line(t, "{");
@@ -2525,6 +2690,17 @@ static const char *PRELUDE =
     "using namespace metal;\n"
     "struct VxDesc { ulong va; ulong res; uint size, stride, fmt, flags; };\n"
     "static inline float vx_desc_min_lod(device const VxDesc *d) { return (d->flags & 4u) ? as_type<float>(d->size) : 0.0f; }\n"
+    "template<typename T> static inline T vx_desc_swizzle_component(vec<T, 4> value, uint selector) { "
+        "switch (selector) { case 0u: return value.x; case 1u: return value.y; case 2u: return value.z; "
+        "case 3u: return value.w; case 4u: return T(0); case 5u: return T(1); default: return T(0); } }\n"
+    "template<typename T> static inline vec<T, 4> vx_desc_swizzle(vec<T, 4> value, device const VxDesc *d) { "
+        "uint mapping = (d->flags >> 8u) & 0x1fffu; if (!mapping) return value; "
+        "return vec<T, 4>(vx_desc_swizzle_component(value, mapping & 7u), "
+        "vx_desc_swizzle_component(value, (mapping >> 3u) & 7u), "
+        "vx_desc_swizzle_component(value, (mapping >> 6u) & 7u), "
+        "vx_desc_swizzle_component(value, (mapping >> 9u) & 7u)); }\n"
+    "static inline uint vx_desc_component_selector(device const VxDesc *d, uint channel) { "
+        "uint mapping = (d->flags >> 8u) & 0x1fffu; return mapping ? ((mapping >> (channel * 3u)) & 7u) : channel; }\n"
     "static inline float4 vx_cb(device const VxDesc *h, uint row) { return row * 16 < h->size ? ((device const float4 *)h->va)[row] : float4(0); }\n"
     "static inline uint vx_ld(device const VxDesc *h, uint off) { return off + 4 <= h->size ? *(device const uint *)(h->va + off) : 0u; }\n"
     "static inline uint4 vx_ld4(device const VxDesc *h, uint off) { return uint4(vx_ld(h, off), vx_ld(h, off + 4), vx_ld(h, off + 8), vx_ld(h, off + 12)); }\n"
