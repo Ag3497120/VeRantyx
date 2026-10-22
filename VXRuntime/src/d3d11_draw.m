@@ -1462,6 +1462,25 @@ static id<MTLRenderCommandEncoder> render_pass(d3d_context *c, id<MTLTexture> ex
     if (!any) return nil;
     if (c->nclears) d3d_clears_into_pass(c, (__bridge void *)rp, c->rtv, c->dsv);
     pass_stats(rp);
+    if (d3d_pass_dump_begin()) {                      // VXRT_PASS_DUMP: each target as c<i>/d <w>x<h> f<format> x<samples> <load><store>
+        static const char act[] = "LCDS";             // load: L(oad) C(lear) D(ont care); store: S(tore) D(ont care)
+        char text[400]; size_t l = 0;
+        MTLRenderPassAttachmentDescriptor *all[10]; char name[10][4];
+        int n = 0;
+        for (int i = 0; i < 8; i++) if (rp.colorAttachments[i].texture) { snprintf(name[n], 4, "c%d", i); all[n++] = rp.colorAttachments[i]; }
+        if (rp.depthAttachment.texture) { snprintf(name[n], 4, "d"); all[n++] = rp.depthAttachment; }
+        if (rp.stencilAttachment.texture) { snprintf(name[n], 4, "s"); all[n++] = rp.stencilAttachment; }
+        for (int i = 0; i < n && l < sizeof text - 80; i++) {
+            id<MTLTexture> t = all[i].texture;
+            MTLLoadAction la = all[i].loadAction; MTLStoreAction sa = all[i].storeAction;
+            l += (size_t)snprintf(text + l, sizeof text - l, " %s %lux%lu f%lu x%lu %c%c", name[i],
+                                  (unsigned long)MAX(t.width >> all[i].level, 1u), (unsigned long)MAX(t.height >> all[i].level, 1u),
+                                  (unsigned long)t.pixelFormat, (unsigned long)t.sampleCount,
+                                  la == MTLLoadActionLoad ? act[0] : la == MTLLoadActionClear ? act[1] : act[2],
+                                  sa == MTLStoreActionDontCare ? 'D' : 'S');
+        }
+        d3d_pass_dump_note(text, c->unsent ? c->unsent - 1 : 0);   // (the draw opening it is counted already)
+    }
     c->prof_sample = -1;
     if (prof_on(c->base.dev)) {
         char sig[120]; size_t l = 0;
@@ -2072,12 +2091,21 @@ static int gpu11_gpu_ir_draw(void *opaque, const gpu_ir_pipeline *pipeline, cons
     }
     return gpu11_emit_draw(context, gpu_ir_pipeline_backend_object(pipeline), draw);
 }
+// VXRT_D3D11_GPU_IR=1: draws and dispatches are also recorded in the common GPU IR (descriptor snapshots, resource
+// accesses declared with useResource) before they reach Metal. Off by default: the record changes nothing Metal does
+// (the bindings are set directly) and cost 11 us of CPU per draw (drawbench 3.1 -> 14 us), the render thread's limit
+// in Elite Dangerous.
+static int gpu11_ir_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_D3D11_GPU_IR") && atoi(getenv("VXRT_D3D11_GPU_IR")) > 0;
+    return on;
+}
 static void gpu11_draw(d3d_context *c, d3d_draw_state *s, id<MTLRenderCommandEncoder> enc,
                        uint32_t vertex_count, uint32_t index_count, uint32_t instance_count,
                        uint32_t first_vertex, uint32_t first_index, int32_t vertex_offset,
                        uint32_t first_instance, int indexed) {
     uint32_t topology = gpu11_topology(s->topology);
-    gpu_ir_pipeline *pipeline = topology ? pso_gpu_ir_find(&s->last_key) : NULL;
+    gpu_ir_pipeline *pipeline = topology && gpu11_ir_on() ? pso_gpu_ir_find(&s->last_key) : NULL;
     gpu_ir_draw_info draw = {
         .topology = topology, .indexed = indexed != 0,
         .vertex_count = indexed ? 0 : vertex_count, .index_count = indexed ? index_count : 0,
@@ -2505,6 +2533,10 @@ static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) 
         id<MTLComputePipelineState> pso = [(__bridge id<MTLDevice>)c->base.dev->mtl newComputePipelineStateWithFunction:shader_function(cs) error:&err];
         if (!pso) { vx_log("Direct3D: compute pipeline failed: %s", err.localizedDescription.UTF8String); return; }
         cs->compute = (void *)CFBridgingRetain(pso);
+    }
+    if (!gpu11_ir_on()) {
+        gpu11_dispatch_metal(c, (__bridge id<MTLComputePipelineState>)cs->compute, cs->info.threads, x, y, z, NULL, 0);
+        return;
     }
     gpu_ir_pipeline *pipeline = gpu11_compute_pipeline_ir(cs);
     int rc = GPU_IR_OUT_OF_MEMORY;

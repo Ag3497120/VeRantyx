@@ -522,8 +522,35 @@ void d3d_end_reasons_log(void) {
     }
     if (len) vx_log("multisampled passes ended by:%s", text);
 }
+// VXRT_PASS_DUMP=<seconds>: that long after the first render pass, the next 600 passes are listed one per line (their
+// targets with load/store actions, how many draws, what ended them): where a frame's passes and attachment traffic go.
+static int g_dump_left = -1;
+static uint64_t g_dump_at;
+static char g_dump_pass[400];
+static uint32_t g_dump_unsent, g_dump_n;
+int d3d_pass_dump_begin(void) {
+    if (g_dump_left < 0) {
+        const char *e = getenv("VXRT_PASS_DUMP");
+        g_dump_left = e ? 600 : 0;
+        g_dump_at = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + (uint64_t)((e ? atof(e) : 0) * 1e9);
+    }
+    return g_dump_left > 0 && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= g_dump_at;
+}
+void d3d_pass_dump_note(const char *targets, uint32_t unsent) {
+    snprintf(g_dump_pass, sizeof g_dump_pass, "%s", targets);
+    g_dump_unsent = unsent;
+}
+static void pass_dump_end(d3d_context *c, void *caller) {
+    if (!g_dump_pass[0]) return;
+    Dl_info info;
+    const char *by = dladdr(caller, &info) && info.dli_sname ? info.dli_sname : "?";
+    vx_log("pass %u:%s; %u draws; ended by %s", g_dump_n++, g_dump_pass, c->unsent - g_dump_unsent, by);
+    g_dump_pass[0] = 0;
+    if (--g_dump_left == 0) vx_log("pass dump: done");
+}
 void d3d_end_render(d3d_context *c) {
     if (!c->render) return;
+    if (g_dump_left > 0) pass_dump_end(c, VX_RETURN_ADDRESS());
     if (g_end_stats < 0) g_end_stats = getenv("VXRT_STATS") != NULL;
     if (g_end_stats) {
         int multi = c->render_dsv && ((d3d_texture *)c->render_dsv->resource)->desc[TD_SAMPLES] > 1;
@@ -1380,14 +1407,14 @@ static uint8_t *rename_buffer(d3d_device *dev, d3d_buffer *b, int keep) {
     int view = (b->desc[2] & 8) != 0;                            // BIND_SHADER_RESOURCE
     slice_chunk *k = NULL;
     id<MTLBuffer> fresh;
+    // Buffers shader resource views read get whole buffers (a view's texture is cached per Metal buffer, so slices of
+    // one chunk would share it), recycled too: making one per Map(DISCARD) cost Elite Dangerous's render thread 4 %.
     if (!view && len <= SLICE_LIMIT) { k = take_slice(dev, len, &off); fresh = (__bridge id<MTLBuffer>)k->mtl; }
-    else if (!view) fresh = take_buffer(dev, old.length);
-    else fresh = cpu_buffer((__bridge id<MTLDevice>)dev->mtl, old.length);
+    else fresh = take_buffer(dev, old.length);
     uint8_t *p = (uint8_t *)fresh.contents + off;
     if (keep) memcpy(p, before, len);
     if (b->chunk) { drop_slice(dev, b); CFRelease(b->mtl); }    // command buffers hold what they use
-    else if (!view && !k) retire_buffer(dev, b->mtl);
-    else CFRelease(b->mtl);
+    else retire_buffer(dev, b->mtl);
     b->mtl = (void *)CFBridgingRetain(fresh);
     b->off = off; b->chunk = k;
     return p;

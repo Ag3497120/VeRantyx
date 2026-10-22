@@ -136,7 +136,7 @@ use first, the rules, when to stop and what to report. `--facts` prints only the
 | --- | --- |
 | Frame rate, GPU busy, crashes, black frames | the harness (`fps_median`, `gpu_utilization_median`, ...) |
 | GPU time per render pass | `VXRT_GPU_PROFILE=1` (the costliest passes every 4 s, in the game's log) |
-| Render passes, memory traffic, what ends passes | `VXRT_STATS=1` |
+| Render passes, memory traffic, what ends passes | `VXRT_STATS=1`; every pass of a moment (targets, load/store, draws, what ended it): `VXRT_PASS_DUMP=<seconds>` |
 | CPU hot spots | `VXRT_PROFILE=/path/file` |
 | Audio gaps | the game's log: `audio: N gaps of silence` |
 | Why it quit | the game's log: `ExitProcess(...) from ...`, `MessageBox:`, `called an unimplemented function` |

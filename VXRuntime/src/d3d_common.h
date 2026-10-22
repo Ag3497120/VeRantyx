@@ -140,6 +140,8 @@ typedef struct {
 } d3d_context;
 void d3d_clears_flush(d3d_context *c);                                   // does the pending clears as passes of their own
 int d3d_same_target(const d3d_view *a, const d3d_view *b);              // d3d11.m: the same subresource, as the same format
+int d3d_pass_dump_begin(void);                                            // VXRT_PASS_DUMP: whether to list this pass
+void d3d_pass_dump_note(const char *targets, uint32_t unsent);           // ... its targets (when d3d_pass_dump_begin said so)
 void d3d_end_reasons_log(void);                                          // VXRT_STATS: what ended render passes with multisampled targets
 void d3d_gpu_profile_submit(d3d_device *dev, void *cmd);                 // d3d11_draw.m: VXRT_GPU_PROFILE, the passes of a command buffer
 // The pending clears the render pass being made can do as its load actions (d3d11.m): marks those attachments
