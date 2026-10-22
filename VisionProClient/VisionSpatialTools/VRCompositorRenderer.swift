@@ -13,6 +13,57 @@ struct VRRenderStatistics {
     let anchored: Bool
     let gpuErrors: Int
     let eyeGeometry: String
+    let reprojection: String
+}
+
+/// Why a displayed frame went to the compositor with the display-time pose
+/// (head-locked, no reprojection) instead of the pose its image was made from.
+enum HeadLockReason: Int, CaseIterable {
+    case none, noFrame, unstamped, poseNotFound, untracked, poseTooOld, frameStale
+
+    var label: String {
+        switch self {
+        case .none: return "reprojected"
+        case .noFrame: return "no_frame"
+        case .unstamped: return "unstamped"
+        case .poseNotFound: return "pose_not_found"
+        case .untracked: return "untracked"
+        case .poseTooOld: return "pose_too_old"
+        case .frameStale: return "frame_stale"
+        }
+    }
+}
+
+/// Counts, per statistics interval, how displayed frames were anchored and
+/// how old each new frame's pose was when it was first shown. Head-locked
+/// frames between reprojected ones make the image jump at the game's rate.
+struct VRReprojectionCounters {
+    private var displayed = [Int](repeating: 0, count: HeadLockReason.allCases.count)
+    private var newFrames = 0
+    private var stampedNewFrames = 0
+    private var poseAges: [Double] = []
+
+    mutating func displayed(_ reason: HeadLockReason) {
+        displayed[reason.rawValue] += 1
+    }
+
+    mutating func newFrame(stamped: Bool, poseAge: Double?) {
+        newFrames += 1
+        if stamped { stampedNewFrames += 1 }
+        if let poseAge { poseAges.append(poseAge) }
+    }
+
+    /// One line for CLIENT_STATS, e.g. "reproject: new=40 stamped=40 age_ms
+    /// p50=180 max=260 shown reprojected=445 pose_too_old=0 ...".
+    mutating func summaryAndReset() -> String {
+        poseAges.sort()
+        let p50 = poseAges.isEmpty ? -1 : Int(poseAges[poseAges.count / 2] * 1000)
+        let maximum = poseAges.last.map { Int($0 * 1000) } ?? -1
+        let shown = HeadLockReason.allCases.map { "\($0.label)=\(displayed[$0.rawValue])" }.joined(separator: " ")
+        let line = "reproject: new=\(newFrames) stamped=\(stampedNewFrames) age_ms p50=\(p50) max=\(maximum) shown \(shown)"
+        self = VRReprojectionCounters()
+        return line
+    }
 }
 
 /// The eye frustum SteamVR renders with, sent by the Mac encoder. SteamVR
@@ -69,6 +120,17 @@ final class VRCompositorRenderer {
     private var cachedVideoFrame: VRDecodedFrame?
     private var cachedVideoTexture: CVMetalTexture?
     private var cachedSource: DeviceAnchorHistory.Sample?
+    private var cachedFrameArrivedAt: CFTimeInterval = 0
+    private var reprojection = VRReprojectionCounters()
+    // A frame stays world-locked (reprojected from its own pose) while its pose
+    // is younger than this. Elite Dangerous at 6-12 fps showed frames 320-440 ms
+    // after their pose; with the former 0.5 s limit each one turned head-locked
+    // for its last tens of milliseconds and snapped back when the next arrived,
+    // so the picture shook at the game's frame rate.
+    private static let maximumPoseAge: CFTimeInterval = 1.2
+    // No new frame for this long (a level load, a stalled stream): show the
+    // last one head-locked rather than keep reprojecting it.
+    private static let maximumFrameHold: CFTimeInterval = 0.5
     private var eyeCenter = SIMD3<Float>.zero
     private var eyeSeparation: Float = 0
     private let statisticsLock = NSLock()
@@ -205,6 +267,7 @@ final class VRCompositorRenderer {
                 cachedVideoFrame = videoFrame
                 cachedVideoTexture = nil
                 cachedSource = nil
+                cachedFrameArrivedAt = CACurrentMediaTime()
                 isNewVideoFrame = videoFrame != nil
                 if videoFrame != nil {
                     newVideoFrames += 1
@@ -218,24 +281,40 @@ final class VRCompositorRenderer {
             // Supplying the display-time pose instead would tell it the image
             // was rendered from a newer viewpoint, which warps head motion.
             var anchor: DeviceAnchor?
+            var headLocked = HeadLockReason.noFrame
             if let videoFrame {
-                if videoFrame.timestamp > 0,
-                   let source = cachedSource ?? poseSampler.history.sample(for: videoFrame.timestamp),
-                   source.anchor.isTracked,
-                   // While the game loads a level no frames arrive for many
-                   // seconds. Reprojecting the last frame from a pose that old
-                   // swings it across the view and gives the compositor's warp
-                   // pass an enormous delta; show it head-locked instead.
-                   presentationTime - source.sampledAt < 0.5 {
+                let source = videoFrame.timestamp > 0
+                    ? cachedSource ?? poseSampler.history.sample(for: videoFrame.timestamp) : nil
+                if videoFrame.timestamp <= 0 {
+                    headLocked = .unstamped
+                } else if source == nil {
+                    headLocked = .poseNotFound
+                } else if source?.anchor.isTracked != true {
+                    headLocked = .untracked
+                } else if let source, presentationTime - source.sampledAt >= Self.maximumPoseAge {
+                    headLocked = .poseTooOld
+                } else if CACurrentMediaTime() - cachedFrameArrivedAt >= Self.maximumFrameHold {
+                    // While the game loads a level no frames arrive for many
+                    // seconds. Reprojecting the last frame from a pose that old
+                    // swings it across the view and gives the compositor's warp
+                    // pass an enormous delta; show it head-locked instead.
+                    headLocked = .frameStale
+                } else if let source {
                     // Keep this frame's source anchor while reusing its pixels.
                     cachedSource = source
                     anchor = source.anchor
+                    headLocked = .none
                     if isNewVideoFrame {
                         poseSampler.reportDisplayed(poseID: source.id, sampledAt: source.sampledAt,
                                                     presentationTime: presentationTime)
                     }
                 }
+                if isNewVideoFrame {
+                    reprojection.newFrame(stamped: headLocked == .none,
+                                          poseAge: source.map { presentationTime - $0.sampledAt })
+                }
             }
+            reprojection.displayed(headLocked)
             if anchor == nil {
                 // No fresh frame (level load, or a frame whose pose is unknown):
                 // give the compositor the predicted display pose, which shows
@@ -267,7 +346,8 @@ final class VRCompositorRenderer {
                     anchored: drawable.deviceAnchor != nil,
                     gpuErrors: errors,
                     eyeGeometry: String(format: "eye_center=(%.3f,%.3f,%.3f) ipd=%.1fmm",
-                                        eyeCenter.x, eyeCenter.y, eyeCenter.z, eyeSeparation * 1000)
+                                        eyeCenter.x, eyeCenter.y, eyeCenter.z, eyeSeparation * 1000),
+                    reprojection: reprojection.summaryAndReset()
                 ))
                 statisticsStartedAt = now
                 newVideoFrames = 0

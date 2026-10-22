@@ -43,7 +43,7 @@ final class VRStreamerModel: ObservableObject {
         let line = "decode_fps=\(decoder.decodedVideoFPS) " +
             "render_fps=\(statistics.renderFPS) new_frame_fps=\(statistics.newFrameFPS) " +
             "pose_age_ms=\(statistics.frameAgeMilliseconds) anchor=\(statistics.anchored) gpu_errors=\(statistics.gpuErrors) " +
-            "\(statistics.eyeGeometry) \(receiver.diagnosticsSummary) \(decoder.diagnosticsSummary) " +
+            "\(statistics.eyeGeometry) \(statistics.reprojection) \(receiver.diagnosticsSummary) \(decoder.diagnosticsSummary) " +
             "\(streamStats) \(tracking.latencyStatus)"
         appendDiagnosticsLog("Stream stats: \(line)")
         receiver.sendClientDiagnostics(line)

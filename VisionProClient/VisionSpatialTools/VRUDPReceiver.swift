@@ -274,7 +274,7 @@ final class VRUDPReceiver: ObservableObject {
         // including when the caller supplies multibyte or composed characters.
         var bounded = ""
         var byteCount = 0
-        for character in message.prefix(512) {
+        for character in message.prefix(1100) {
             let value = String(character)
             let size = value.utf8.count
             guard byteCount + size <= 1100 else { break }
