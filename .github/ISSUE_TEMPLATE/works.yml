@@ -1,0 +1,34 @@
+name: "It runs: a game on my Mac"
+description: A game ran on VeRantyx (well or with problems). The app fills this in when a game ends; you only press Submit.
+title: "[runs] <game> on <Mac>"
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you! These reports build the list of games that run, and which Macs and headsets they run on.
+        Please don't attach game files.
+  - type: input
+    id: game
+    attributes: {label: "Game and Steam app id", placeholder: "Elite Dangerous (359320)"}
+    validations: {required: true}
+  - type: dropdown
+    id: result
+    attributes:
+      label: How it went
+      options: [Played well, Played with problems, Started but not playable]
+    validations: {required: true}
+  - type: input
+    id: mode
+    attributes: {label: "Where you played (headset and picture setting, or the Mac's screen)", placeholder: "Vision Pro, VeRantyx app, 3K"}
+    validations: {required: true}
+  - type: input
+    id: mac
+    attributes: {label: "Mac (model, chip, memory), macOS, VeRantyx version", placeholder: "MacBook Pro, M1 Max, 64 GB, macOS 26.5, 0.2.0"}
+    validations: {required: true}
+  - type: input
+    id: fps
+    attributes: {label: "Frame rate (the app's measurement)", placeholder: "median 34 fps, 18-52, over 12 min"}
+  - type: textarea
+    id: notes
+    attributes: {label: "Anything else (controls, sound, what did not work)"}

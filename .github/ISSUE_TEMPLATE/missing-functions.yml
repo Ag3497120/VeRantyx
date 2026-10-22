@@ -1,0 +1,21 @@
+name: "Windows functions a game needs"
+description: A game stopped on Windows functions VXRuntime does not have yet. The app fills this in (function names only).
+title: "[missing] <game>: <functions>"
+labels: ["missing-functions"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you! The names of the functions a game called that VXRuntime lacks; they are implemented in the order most
+        games need them. Nothing from the game is in this report.
+  - type: input
+    id: game
+    attributes: {label: "Game and Steam app id", placeholder: "No Man's Sky (275850)"}
+    validations: {required: true}
+  - type: textarea
+    id: functions
+    attributes: {label: "Missing functions (DLL!function, as the app listed them)", render: text}
+    validations: {required: true}
+  - type: input
+    id: mac
+    attributes: {label: "Mac, macOS, VeRantyx version", placeholder: "MacBook Air, M4, 16 GB, macOS 27.0, 0.2.0"}
