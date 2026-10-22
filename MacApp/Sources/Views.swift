@@ -483,25 +483,37 @@ struct GameCard: View {
                                          : TF("Uses %@; VeRantyx does not run games with anti-cheat.", "%@ を使うため、VeRantyx では起動しません。", game.antiCheat.joined(separator: ", "))))
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
-            HStack {
+            if game.flat {
+                // (two ways to play, one above the other and each as wide as the card: side by side, the labels were
+                //  cut short in the narrowest cards)
                 Text(gigabytes(game.bytes)).font(.caption).foregroundStyle(.tertiary)
-                Spacer()
-                if game.flat {
+                VStack(spacing: 6) {
                     Button {
                         model.start(game, flat: true)
                     } label: {
-                        Label(T("On this Mac", "Mac の画面で"), systemImage: "desktopcomputer")
+                        Label(T("On this Mac", "Mac の画面で"), systemImage: "desktopcomputer").frame(maxWidth: .infinity)
                     }
                     .help(T("Plays in a window on this Mac, without a headset or SteamVR.", "ヘッドセットも SteamVR も使わず、この Mac のウィンドウで遊びます。"))
+                    Button {
+                        model.start(game)
+                    } label: {
+                        Label(T("Headset", "ヘッドセット"), systemImage: "visionpro").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .disabled(!canStart)
+            } else {
+                HStack {
+                    Text(gigabytes(game.bytes)).font(.caption).foregroundStyle(.tertiary)
+                    Spacer()
+                    Button {
+                        model.start(game)
+                    } label: {
+                        Label(T("Play", "プレイ"), systemImage: "play.fill").frame(minWidth: 70)
+                    }
+                    .buttonStyle(.borderedProminent)
                     .disabled(!canStart)
                 }
-                Button {
-                    model.start(game)
-                } label: {
-                    Label(game.flat ? T("Headset", "ヘッドセット") : T("Play", "プレイ"), systemImage: game.flat ? "visionpro" : "play.fill").frame(minWidth: 70)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!canStart)
             }
         }
         .padding(16)
