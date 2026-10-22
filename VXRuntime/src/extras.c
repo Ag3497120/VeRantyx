@@ -296,7 +296,6 @@ static WINAPI DWORD SearchPathW(const WCHAR *path, const WCHAR *file, const WCHA
     if (!attributes || !full || attributes(candidate) == 0xffffffffu) { vx_set_last_error(2); return 0; }     // ERROR_FILE_NOT_FOUND
     return full(candidate, size, buffer, file_part);
 }
-static WINAPI HANDLE OpenWaitableTimerA(DWORD access, BOOL inherit, const char *name) { (void)access; (void)inherit; (void)name; vx_set_last_error(2); return NULL; }
 static WINAPI BOOL VirtualUnlock(void *address, size_t size) { (void)address; (void)size; return 1; }
 static WINAPI DWORD GetFinalPathNameByHandleW(HANDLE h, WCHAR *buffer, DWORD size, DWORD flags) {
     (void)h; (void)buffer; (void)size; (void)flags;
@@ -592,7 +591,7 @@ static WINAPI BOOL GetVolumeNameForVolumeMountPointW(const WCHAR *mount_point, W
     return 1;
 }
 static const vx_export ntdll_ed[] = { VX_EXPORT(NtSetInformationThread) };
-static const vx_export kernel32_ed[] = { VX_EXPORT(GetVolumeNameForVolumeMountPointA), VX_EXPORT(GetVolumeNameForVolumeMountPointW), VX_EXPORT(AddDllDirectory), VX_EXPORT(RemoveDllDirectory), VX_EXPORT(GetTempPath2W), VX_EXPORT(VirtualAlloc2), VX_EXPORT(GetProcessMitigationPolicy), VX_EXPORT(SetProcessMitigationPolicy), VX_EXPORT(NormalizeString), VX_EXPORT(SearchPathW), VX_EXPORT(OpenWaitableTimerA), VX_EXPORT(VirtualUnlock), VX_EXPORT(GetFinalPathNameByHandleW) };
+static const vx_export kernel32_ed[] = { VX_EXPORT(GetVolumeNameForVolumeMountPointA), VX_EXPORT(GetVolumeNameForVolumeMountPointW), VX_EXPORT(AddDllDirectory), VX_EXPORT(RemoveDllDirectory), VX_EXPORT(GetTempPath2W), VX_EXPORT(VirtualAlloc2), VX_EXPORT(GetProcessMitigationPolicy), VX_EXPORT(SetProcessMitigationPolicy), VX_EXPORT(NormalizeString), VX_EXPORT(SearchPathW), VX_EXPORT(VirtualUnlock), VX_EXPORT(GetFinalPathNameByHandleW) };
 static const vx_export user32_ed[] = { VX_EXPORT(ToAsciiEx), VX_EXPORT(UnloadKeyboardLayout), VX_EXPORT(RegisterHotKey), VX_EXPORT(UnregisterHotKey) };
 static const vx_export gdi32_ed[] = { VX_EXPORT(ExtEscape) };
 static const vx_export iphlpapi_ed[] = { VX_EXPORT(GetBestRoute), VX_EXPORT(GetBestInterface), VX_EXPORT(GetAdaptersAddresses), VX_EXPORT(GetIpAddrTable), VX_EXPORT(GetNetworkParams) };

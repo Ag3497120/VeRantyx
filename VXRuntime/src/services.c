@@ -287,7 +287,11 @@ static WINAPI int vx_callnewh(size_t n) { (void)n; return 0; }
 
 // ---- keyboard layouts and the IME: US English, no composition ---------------------------------------------------------------
 #define US_LAYOUT ((void *)(uintptr_t)0x04090409)
-static WINAPI int GetKeyboardLayoutList(int n, void **out) { if (n >= 1 && out) out[0] = US_LAYOUT; return 1; }
+static WINAPI int GetKeyboardLayoutList(int n, void **out) {
+    if (getenv("VXRT_TRACE_LOCALE")) vx_log("locale: GetKeyboardLayoutList(%d)", n);
+    if (n >= 1 && out) out[0] = US_LAYOUT;
+    return 1;
+}
 static WINAPI void *LoadKeyboardLayoutA(const char *id, unsigned flags) { (void)id; (void)flags; return US_LAYOUT; }
 static WINAPI void *LoadKeyboardLayoutW(const WCHAR *id, unsigned flags) { (void)id; (void)flags; return US_LAYOUT; }
 static WINAPI void *ActivateKeyboardLayout(void *hkl, unsigned flags) { (void)hkl; (void)flags; return US_LAYOUT; }

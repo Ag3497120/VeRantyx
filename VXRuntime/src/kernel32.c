@@ -91,6 +91,7 @@ static WINAPI BOOL TerminateProcess(HANDLE h, DWORD code) {
     if ((intptr_t)h == -1) { ExitProcess(code); return 1; }
     int pid = vx_process_info(h, NULL);
     if (pid <= 0) { vx_set_last_error(6); return 0; }
+    vx_log("TerminateProcess: ending process %d with code %u", pid, (unsigned)code);   // (always: otherwise it just vanishes)
     kill(pid, SIGKILL);
     return 1;
 }

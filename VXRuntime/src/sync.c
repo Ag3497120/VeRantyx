@@ -558,7 +558,8 @@ static void *watch_process(void *arg) {
     if (w->child) {
         while (waitpid(w->pid, &status, 0) < 0 && errno == EINTR) {}
         code = WIFEXITED(status) ? (DWORD)WEXITSTATUS(status) : WIFSIGNALED(status) ? 0xC0000005u : 1;
-        if (vx_trace) vx_log("process %d ended: %s %d", (int)w->pid, WIFSIGNALED(status) ? "signal" : "exit code", WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
+        // (a child killed by a signal always: it leaves no log line of its own, and no macOS crash report for SIGKILL)
+        if (vx_trace || WIFSIGNALED(status)) vx_log("process %d ended: %s %d", (int)w->pid, WIFSIGNALED(status) ? "signal" : "exit code", WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
     } else {
         while (!kill(w->pid, 0) || errno != ESRCH) usleep(100000);
     }

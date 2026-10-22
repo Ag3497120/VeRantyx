@@ -75,6 +75,9 @@ void vx_wininet_init(void);                  // wininet.m: HTTP and HTTPS on NSU
 void vx_winhttp_init(void);                  // winhttp.m: synchronous WinHTTP request handles on NSURLSession
 void vx_directinput_init(void);              // directinput.m: DirectInput 8 HID joystick/gamepad polling
 void vx_msxml_init(void);                    // msxml.c: MSXML DOMDocument through CoCreateInstance
+typedef struct { DWORD lcid; const char *name, *english, *abbrev, *iso639, *iso3166; } vx_locale;   // desktop.c
+const vx_locale *vx_locale_by_lcid(DWORD lcid);              // NULL when unknown; 0 and the default LCIDs give the user's
+const vx_locale *vx_locale_by_name(const char *name);        // "en-GB" (any case); NULL or "" give the user's
 void vx_extras_init(void);                   // extras.c: smaller functions more programs need
 void vx_opengl_init(void);                   // opengl.c: opengl32.dll on macOS's OpenGL
 int vx_gl_describe_pixel_format(void *pfd, uint32_t size);   // (gdi32's pixel-format calls and SwapBuffers)

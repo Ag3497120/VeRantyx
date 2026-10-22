@@ -49,21 +49,71 @@ static WINAPI DWORD GetSystemDefaultLCID(void) { return 0x409; }
 static WINAPI uint16_t GetUserDefaultLangID(void) { return 0x409; }
 static WINAPI uint16_t GetSystemDefaultLangID(void) { return 0x409; }
 static WINAPI uint16_t GetUserDefaultUILanguage(void) { return 0x409; }
-// LOCALE_* values programs ask for, in English (United States).
-static const char *locale_value(DWORD type) {
-    switch (type & 0xfff) {
-    case 0x01: return "0409";             case 0x02: case 0x1001: return "English (United States)";
-    case 0x03: return "ENU";              case 0x59: return "en";      case 0x5a: return "US";
+// Locales by LCID and name: the user's is English (United States); the others are known so a program can name them
+// (Elite Dangerous rejected its controller presets, made for "en-GB", when every name came back as en-US).
+static const vx_locale g_locales[] = {
+    { 0x0409, "en-US", "English (United States)", "ENU", "en", "US" }, { 0x0809, "en-GB", "English (United Kingdom)", "ENG", "en", "GB" },
+    { 0x0c09, "en-AU", "English (Australia)", "ENA", "en", "AU" },     { 0x1009, "en-CA", "English (Canada)", "ENC", "en", "CA" },
+    { 0x0407, "de-DE", "German (Germany)", "DEU", "de", "DE" },        { 0x040c, "fr-FR", "French (France)", "FRA", "fr", "FR" },
+    { 0x0c0a, "es-ES", "Spanish (Spain)", "ESN", "es", "ES" },         { 0x0410, "it-IT", "Italian (Italy)", "ITA", "it", "IT" },
+    { 0x0416, "pt-BR", "Portuguese (Brazil)", "PTB", "pt", "BR" },     { 0x0816, "pt-PT", "Portuguese (Portugal)", "PTG", "pt", "PT" },
+    { 0x0419, "ru-RU", "Russian (Russia)", "RUS", "ru", "RU" },        { 0x0415, "pl-PL", "Polish (Poland)", "PLK", "pl", "PL" },
+    { 0x0413, "nl-NL", "Dutch (Netherlands)", "NLD", "nl", "NL" },     { 0x041d, "sv-SE", "Swedish (Sweden)", "SVE", "sv", "SE" },
+    { 0x0411, "ja-JP", "Japanese (Japan)", "JPN", "ja", "JP" },        { 0x0412, "ko-KR", "Korean (Korea)", "KOR", "ko", "KR" },
+    { 0x0804, "zh-CN", "Chinese (Simplified, China)", "CHS", "zh", "CN" }, { 0x0404, "zh-TW", "Chinese (Traditional, Taiwan)", "CHT", "zh", "TW" },
+};
+const vx_locale *vx_locale_by_lcid(DWORD lcid) {
+    lcid &= 0xffff;
+    if (!lcid || lcid == 0x0400 || lcid == 0x0800 || lcid == 0x0c00 || lcid == 0x1000) lcid = 0x0409;   // the user's, the system's, ...
+    for (size_t i = 0; i < sizeof g_locales / sizeof g_locales[0]; i++) if (g_locales[i].lcid == lcid) return &g_locales[i];
+    return NULL;
+}
+const vx_locale *vx_locale_by_name(const char *name) {
+    if (!name || !*name) return &g_locales[0];                            // LOCALE_NAME_USER_DEFAULT (NULL) and the invariant ("")
+    for (size_t i = 0; i < sizeof g_locales / sizeof g_locales[0]; i++) if (!strcasecmp(g_locales[i].name, name)) return &g_locales[i];
+    if (!strcasecmp(name, "!x-sys-default-locale")) return &g_locales[0];
+    return NULL;
+}
+// LOCALE_* values programs ask for: names from the table above, the rest (number and date formats) as English (United States).
+static const char *locale_value(const vx_locale *l, DWORD type, char *scratch) {
+    if (!l) l = &g_locales[0];
+    switch (type & 0xffff) {                                   // (without LOCALE_NOUSEROVERRIDE and the like, above it)
+    case 0x01: snprintf(scratch, 8, "%04x", (unsigned)l->lcid); return scratch;
+    case 0x02: case 0x1001: case 0x72: case 0x73: return l->english;
+    case 0x03: return l->abbrev;          case 0x59: return l->iso639; case 0x5a: return l->iso3166;
+    case 0x5c: return l->name;
     case 0x0e: return ".";                case 0x0f: return ",";       case 0x14: return "$";
     case 0x1004: return "1252";           case 0x0b: return "437";     case 0x1d: return "/";
     case 0x1e: return ":";                case 0x1f: return "M/d/yyyy"; case 0x20: return "dddd, MMMM d, yyyy";
     case 0x1003: return "h:mm:ss tt";     case 0x28: return "AM";      case 0x29: return "PM";
-    case 0x5c: return "en-US";
     default: return "";
     }
 }
-static WINAPI int GetLocaleInfoW(DWORD lcid, DWORD type, WCHAR *out, int cap) { (void)lcid; return (int)vx_return_string_w(locale_value(type), out, (DWORD)cap) + (out && cap ? 1 : 0); }
-static WINAPI int GetLocaleInfoA(DWORD lcid, DWORD type, char *out, int cap) { (void)lcid; return (int)vx_return_string_a(locale_value(type), out, (DWORD)cap) + (out && cap ? 1 : 0); }
+// LOCALE_RETURN_NUMBER: the value as a DWORD in the buffer (two WCHARs, four chars) instead of text; LOCALE_ILANGUAGE
+// is the LCID (its text is hex), the other numeric values are decimal text.
+static int locale_number(const vx_locale *l, DWORD type, void *out, int cap, int units) {
+    if (!out && !cap) return units;
+    if (!out || cap < units) { vx_set_last_error(122); return 0; }
+    char scratch[8];
+    const char *text = locale_value(l, type, scratch);
+    DWORD value = (type & 0xffff) == 0x01 ? l->lcid : (DWORD)strtoul(text, NULL, 10);
+    memcpy(out, &value, sizeof value);
+    return units;
+}
+static WINAPI int GetLocaleInfoW(DWORD lcid, DWORD type, WCHAR *out, int cap) {
+    const vx_locale *l = vx_locale_by_lcid(lcid);
+    if (!l) { vx_set_last_error(87); return 0; }
+    if (type & 0x20000000) return locale_number(l, type, out, cap, 2);
+    char scratch[8];
+    return (int)vx_return_string_w(locale_value(l, type, scratch), out, (DWORD)cap) + (out && cap ? 1 : 0);
+}
+static WINAPI int GetLocaleInfoA(DWORD lcid, DWORD type, char *out, int cap) {
+    const vx_locale *l = vx_locale_by_lcid(lcid);
+    if (!l) { vx_set_last_error(87); return 0; }
+    if (type & 0x20000000) return locale_number(l, type, out, cap, 4);
+    char scratch[8];
+    return (int)vx_return_string_a(locale_value(l, type, scratch), out, (DWORD)cap) + (out && cap ? 1 : 0);
+}
 // SYSTEMTIME: year, month, weekday, day, hour, minute, second, ms.
 static int format_time(const uint16_t *st, int date, char *out, size_t cap) {
     if (st) return snprintf(out, cap, date ? "%u/%u/%u" : "%u:%02u:%02u", date ? st[1] : st[4], date ? st[3] : st[5], date ? st[0] : st[6]);

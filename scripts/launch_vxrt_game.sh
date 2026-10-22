@@ -66,24 +66,32 @@ if [[ -z "$APP_ID" ]]; then
     done
 fi
 
-# SteamVR on VXRuntime (with the encoder and the web UI stand-in), until this script ends.
-"$SCRIPT_DIR/launch_vxrt_steamvr.sh" >"$LOG_DIR/vxrt-steamvr-launch.log" 2>&1 &
-STEAMVR_PID=$!
+# SteamVR on VXRuntime (with the encoder and the web UI stand-in), until this script ends. VXRT_FLAT=1: none, the game
+# on the Mac's screen (a game that finds SteamVR running may choose VR by itself: Elite Dangerous did).
 cleanup() {
     [[ -n "${GAME_PID:-}" ]] && kill -TERM "$GAME_PID" 2>/dev/null || true
-    kill -TERM "$STEAMVR_PID" 2>/dev/null || true
-    wait "$STEAMVR_PID" 2>/dev/null || true
+    [[ -n "${STEAMVR_PID:-}" ]] && { kill -TERM "$STEAMVR_PID" 2>/dev/null || true; wait "$STEAMVR_PID" 2>/dev/null || true; }
 }
 trap cleanup EXIT INT TERM
+LOG="$LOG_DIR/vxrt-${EXE_NAME%.*}.log"
+if [[ "${VXRT_FLAT:-0}" == 1 ]]; then
+    # A game that finds an OpenVR runtime starts SteamVR itself (Elite Dangerous did): without the runtime's
+    # registration it stays on the screen. launch_vxrt_steamvr.sh writes it again for the next VR start.
+    rm -f "$VXRT_VR_ROOT"/drive_c/users/*/AppData/Local/openvr/openvrpaths.vrpath
+    [[ -s "$LOG" ]] && mv -f "$LOG" "${LOG%.log}.prev.log"
+    echo "Flat (no SteamVR); starting $EXE_NAME${APP_ID:+ (Steam app $APP_ID)} (log: $LOG)"
+else
+"$SCRIPT_DIR/launch_vxrt_steamvr.sh" >"$LOG_DIR/vxrt-steamvr-launch.log" 2>&1 &
+STEAMVR_PID=$!
 waited=0                                               # vrserver's web server is up once SteamVR has started
 while (( waited < 40 )); do                            # (not counted while a first ALVR headset is awaited)
     sleep 1
     lsof -nP -iTCP:27062 -sTCP:LISTEN >/dev/null 2>&1 && break
     [[ -f "$LOG_DIR/alvr-first-connection.wait" ]] || waited=$((waited + 1))
 done
-LOG="$LOG_DIR/vxrt-${EXE_NAME%.*}.log"
 [[ -s "$LOG" ]] && mv -f "$LOG" "${LOG%.log}.prev.log"   # (the last start's, kept)
 echo "SteamVR on VXRuntime is up; starting $EXE_NAME${APP_ID:+ (Steam app $APP_ID)} (log: $LOG)"
+fi
 # (the quality presets are the Vision Pro app's; an ALVR headset shows its own rate, 90 Hz, and stretches the last
 #  frame to the head's turn until the next comes: Half-Life: Alyx at 3k on a MacBook Air M5 made some 44 fps and
 #  warped when turning, with ALVR's defaults it did not, 2026-10-17)
@@ -93,11 +101,11 @@ cd "$GAME_DIR"
 # Keep the optional control socket scoped to the game. SteamVR is already running in separate VXRuntime
 # processes, and sharing the same Unix socket path would let those processes replace each other's endpoint.
 GAME_ENV=("VXRT_ROOT=$VXRT_VR_ROOT" "VXRT_OVERLAY=$OVERLAY" "VXRT_DLL_PATH=$VXRT_DLL_DIRS"
-    "VXRT_STEAM_BRIDGE=1" "VXRT_NO_ACTIVATE=1" "VXRT_DEBUGGER=1" "VXRT_DEBUG_OUTPUT=1"
-    "VXRT_LOG_TIME=1")
+    "VXRT_STEAM_BRIDGE=1" "VXRT_DEBUGGER=1" "VXRT_DEBUG_OUTPUT=1" "VXRT_LOG_TIME=1")
 # Played in the headset, the game's window seldom stays the Mac's frontmost one; told it is in the background, a game
-# stops reading its controllers (and keys).
-GAME_ENV+=("VXRT_STAY_ACTIVE=${VXRT_STAY_ACTIVE:-1}")
+# stops reading its controllers (and keys). Flat, it is the window the player uses: it takes the Mac's focus.
+if [[ "${VXRT_FLAT:-0}" == 1 ]]; then GAME_ENV+=("VXRT_STAY_ACTIVE=${VXRT_STAY_ACTIVE:-0}")
+else GAME_ENV+=("VXRT_NO_ACTIVATE=1" "VXRT_STAY_ACTIVE=${VXRT_STAY_ACTIVE:-1}"); fi
 if [[ -n "${VXRT_GAME_CONTROL:-}" ]]; then GAME_ENV+=("VXRT_CONTROL=$VXRT_GAME_CONTROL"); fi
 if [[ -n "${VXRT_GAME_CONTROL_CHILD:-}" ]]; then GAME_ENV+=("VXRT_CONTROL_CHILD=$VXRT_GAME_CONTROL_CHILD"); fi   # the launcher's game
 if [[ -n "${VXRT_GAME_CONTROL_CHILD_FOR:-}" ]]; then GAME_ENV+=("VXRT_CONTROL_CHILD_FOR=$VXRT_GAME_CONTROL_CHILD_FOR"); fi

@@ -33,7 +33,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe
+       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/locale.exe build/waitable_timer.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -124,6 +124,14 @@ build/com.exe: tests/com.c
 build/msxml.exe: tests/msxml.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lole32 -loleaut32 -luuid
+
+build/locale.exe: tests/locale.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+build/waitable_timer.exe: tests/waitable_timer.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
 
 build/vxcom.dll: tests/vxcom.c
 	@mkdir -p build
@@ -571,6 +579,8 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/msvc_eh.exe
 	$(VXRT) build/com.exe
 	$(VXRT) build/msxml.exe
+	$(VXRT) build/locale.exe
+	$(VXRT) build/waitable_timer.exe
 	$(VXRT) build/iocp.exe
 	$(VXRT) build/window.exe
 	python3 tests/clip_check.py $(VXRT)

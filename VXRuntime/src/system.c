@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <signal.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -339,21 +343,83 @@ static WINAPI BOOL UnregisterWaitEx(tp_legacy *l, HANDLE done) {
 }
 static WINAPI BOOL UnregisterWait(tp_legacy *l) { return UnregisterWaitEx(l, NULL); }
 // Waitable timers: an event the pool's timer sets when due (and resets on SetWaitableTimer for auto-reset ones).
-typedef struct wtimer { HANDLE event; tp_item *item; struct wtimer *next; } wtimer;
+// A named timer is shared between processes: its event is a named one, and its due time lives in shared memory under
+// the name, so any process can push it back. Elite Dangerous's WatchDog64.exe creates "EliteDangerousHeartbeatTimer"
+// and ends the game when it fires; the game opens it and keeps setting it later (until then every game was ended a
+// minute after it started). A process's pool timer, when it fires, looks at the shared due time first and waits again
+// if someone has moved it.
+typedef struct { volatile int64_t due; volatile int32_t period; int32_t manual; int32_t creator; } wtimer_shared;   // due: CLOCK_REALTIME ns, 0 none
+typedef struct wtimer { HANDLE event; tp_item *item; wtimer_shared *shared; struct wtimer *next; } wtimer;
 static wtimer *g_wtimers;
+static int64_t realtime_ns(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec; }
 static WINAPI void wtimer_fire(void *instance, void *ctx, void *timer) {
     (void)instance; (void)timer;
+    wtimer *w = ctx;
+    if (w->shared) {
+        int64_t due = w->shared->due, now = realtime_ns();
+        if (!due) return;                                                  // cancelled (by any process)
+        if (due > now + 1000000) {                                         // pushed back: wait for the new time
+            int64_t rel = -(due - now) / 100;
+            SetThreadpoolTimer(w->item, &rel, 0, 0);
+            return;
+        }
+        int32_t period = w->shared->period;
+        if (getenv("VXRT_TRACE_TIMERS")) vx_log("timer: a shared waitable timer fired (%lld ms late)", (long long)((now - due) / 1000000));
+        __sync_bool_compare_and_swap(&w->shared->due, due, period ? now + (int64_t)period * 1000000 : 0);
+        if (period) { int64_t rel = -(int64_t)period * 10000; SetThreadpoolTimer(w->item, &rel, 0, 0); }
+    }
     BOOL (WINAPI *set)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "SetEvent");
-    set(((wtimer *)ctx)->event);
+    set(w->event);
 }
-static HANDLE wtimer_create(BOOL manual) {
-    HANDLE (WINAPI *create)(void *, BOOL, BOOL, const WCHAR *) = (HANDLE (WINAPI *)(void *, BOOL, BOOL, const WCHAR *))vx_find_export("kernel32.dll", "CreateEventW");
+// The shared part of a named timer: /vxwt-<hash of the name>; created (create) or only opened.
+static wtimer_shared *wtimer_shared_for(const char *name, int create, int manual, int *existed) {
+    uint32_t h = 2166136261u;
+    for (const char *c = name; *c; c++) h = (h ^ (uint8_t)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c)) * 16777619u;
+    char shm[32];
+    snprintf(shm, sizeof shm, "/vxwt-%08x", h);
+    int fd = shm_open(shm, O_RDWR, 0600);
+    *existed = fd >= 0;
+    if (fd < 0 && create) fd = shm_open(shm, O_RDWR | O_CREAT, 0600);
+    if (fd < 0) return NULL;
+    if (!*existed && ftruncate(fd, sizeof(wtimer_shared))) { close(fd); return NULL; }
+    wtimer_shared *s = mmap(NULL, sizeof *s, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (s == MAP_FAILED) return NULL;
+    // The memory outlives the processes: one whose creator has gone (an earlier run's) starts over, as a new object
+    // would on Windows, instead of firing at once on its old due time.
+    if (*existed && create && s->creator && kill(s->creator, 0) && errno == ESRCH) { *existed = 0; s->due = 0; s->period = 0; }
+    if (!*existed) { s->manual = manual; s->creator = getpid(); }
+    return s;
+}
+static HANDLE wtimer_make(BOOL manual, const char *name, int open_only) {
+    wtimer_shared *shared = NULL;
+    int existed = 0;
+    HANDLE event = NULL;
+    if (name && *name) {
+        shared = wtimer_shared_for(name, !open_only, manual, &existed);
+        if (!shared) { vx_set_last_error(2); return NULL; }                 // ERROR_FILE_NOT_FOUND (opening one nobody made)
+        char event_name[300];
+        snprintf(event_name, sizeof event_name, "vxwt:%s", name);
+        HANDLE (WINAPI *create)(void *, BOOL, BOOL, const char *) = (HANDLE (WINAPI *)(void *, BOOL, BOOL, const char *))vx_find_export("kernel32.dll", "CreateEventA");
+        event = create(NULL, shared->manual, 0, event_name);
+        if (getenv("VXRT_TRACE_TIMERS")) vx_log("timer: %s waitable timer \"%s\"%s", open_only ? "opened" : "created", name, existed ? " (it existed)" : "");
+    } else {
+        HANDLE (WINAPI *create)(void *, BOOL, BOOL, const WCHAR *) = (HANDLE (WINAPI *)(void *, BOOL, BOOL, const WCHAR *))vx_find_export("kernel32.dll", "CreateEventW");
+        event = create(NULL, manual, 0, NULL);
+    }
     wtimer *w = calloc(1, sizeof *w);
-    w->event = create(NULL, manual, 0, NULL);
+    w->event = event;
+    w->shared = shared;
     w->item = CreateThreadpoolTimer((void *)wtimer_fire, w, NULL);
     pthread_mutex_lock(&g_tp_lock);
     w->next = g_wtimers; g_wtimers = w;
     pthread_mutex_unlock(&g_tp_lock);
+    vx_set_last_error(existed && !open_only ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
+    if (shared && shared->due) {                                           // set by another process: fire here too, on time
+        int64_t rel = -(shared->due - realtime_ns()) / 100;
+        if (rel > 0) rel = 0;
+        SetThreadpoolTimer(w->item, &rel, 0, 0);
+    }
     return w->event;
 }
 static wtimer *wtimer_of(HANDLE h) {
@@ -363,9 +429,17 @@ static wtimer *wtimer_of(HANDLE h) {
     pthread_mutex_unlock(&g_tp_lock);
     return w;
 }
-static WINAPI HANDLE CreateWaitableTimerW(void *sa, BOOL manual, const WCHAR *name) { (void)sa; (void)name; return wtimer_create(manual); }
-static WINAPI HANDLE CreateWaitableTimerA(void *sa, BOOL manual, const char *name) { (void)sa; (void)name; return wtimer_create(manual); }
-static WINAPI HANDLE CreateWaitableTimerExW(void *sa, const WCHAR *name, DWORD flags, DWORD access) { (void)sa; (void)name; (void)access; return wtimer_create(flags & 1); }
+static WINAPI HANDLE CreateWaitableTimerW(void *sa, BOOL manual, const WCHAR *name) {
+    (void)sa; char *a = vx_utf8_dup(name); HANDLE h = wtimer_make(manual, a, 0); free(a); return h;
+}
+static WINAPI HANDLE CreateWaitableTimerA(void *sa, BOOL manual, const char *name) { (void)sa; return wtimer_make(manual, name, 0); }
+static WINAPI HANDLE CreateWaitableTimerExW(void *sa, const WCHAR *name, DWORD flags, DWORD access) {
+    (void)sa; (void)access; char *a = vx_utf8_dup(name); HANDLE h = wtimer_make(flags & 1, a, 0); free(a); return h;
+}
+static WINAPI HANDLE OpenWaitableTimerA(DWORD access, BOOL inherit, const char *name) { (void)access; (void)inherit; return wtimer_make(0, name, 1); }
+static WINAPI HANDLE OpenWaitableTimerW(DWORD access, BOOL inherit, const WCHAR *name) {
+    (void)access; (void)inherit; char *a = vx_utf8_dup(name); HANDLE h = wtimer_make(0, a, 1); free(a); return h;
+}
 // The due time: negative is relative (100 ns units), positive absolute (a FILETIME; taken against the system clock).
 static WINAPI BOOL SetWaitableTimer(HANDLE h, const int64_t *due, LONG period, void *routine, void *arg, BOOL resume) {
     (void)routine; (void)arg; (void)resume;
@@ -380,14 +454,25 @@ static WINAPI BOOL SetWaitableTimer(HANDLE h, const int64_t *due, LONG period, v
         rel = now - rel;                                          // in the past: fires at once
         if (rel > 0) rel = 0;
     }
-    SetThreadpoolTimer(w->item, &rel, (DWORD)period, 0);
+    if (w->shared) {
+        w->shared->period = period; w->shared->due = realtime_ns() + (-rel) * 100;
+        if (getenv("VXRT_TRACE_TIMERS")) { static int n; if (++n <= 20 || n % 100 == 0) vx_log("timer: shared waitable timer set #%d, due in %lld ms, period %d ms (asked %lld)", n, (long long)(-rel / 10000), (int)period, (long long)*due); }
+    }
+    SetThreadpoolTimer(w->item, &rel, w->shared ? 0 : (DWORD)period, 0);   // (a shared one repeats in wtimer_fire)
     return 1;
 }
 static WINAPI BOOL SetWaitableTimerEx(HANDLE h, const int64_t *due, LONG period, void *routine, void *arg, void *reason, DWORD delay) {
     (void)reason; (void)delay;
     return SetWaitableTimer(h, due, period, routine, arg, 0);
 }
-static WINAPI BOOL CancelWaitableTimer(HANDLE h) { wtimer *w = wtimer_of(h); if (w) SetThreadpoolTimer(w->item, NULL, 0, 0); return w != NULL; }
+static WINAPI BOOL CancelWaitableTimer(HANDLE h) {
+    wtimer *w = wtimer_of(h);
+    if (!w) return 0;
+    if (w->shared && getenv("VXRT_TRACE_TIMERS")) vx_log("timer: shared waitable timer cancelled");
+    if (w->shared) w->shared->due = 0;
+    SetThreadpoolTimer(w->item, NULL, 0, 0);
+    return 1;
+}
 
 // ---- files ------------------------------------------------------------------------------------------------------------------
 // FILE_BASIC_INFO (times, attributes), FILE_STANDARD_INFO (allocation, size, links, delete pending, directory).
@@ -498,12 +583,29 @@ static WINAPI BOOL SetProcessUserModeExceptionPolicy(DWORD f) { g_exception_poli
 // ---- locales by name ------------------------------------------------------------------------------------------------------
 static WINAPI int GetUserDefaultLocaleName(WCHAR *out, int cap) { return (int)vx_return_string_w("en-US", out, (DWORD)cap) + 1; }
 static WINAPI int GetSystemDefaultLocaleName(WCHAR *out, int cap) { return GetUserDefaultLocaleName(out, cap); }
-static WINAPI int LCIDToLocaleName(DWORD lcid, WCHAR *out, int cap, DWORD flags) { (void)lcid; (void)flags; return GetUserDefaultLocaleName(out, cap); }
-static WINAPI DWORD LocaleNameToLCID(const WCHAR *name, DWORD flags) { (void)name; (void)flags; return 0x409; }
+static WINAPI int LCIDToLocaleName(DWORD lcid, WCHAR *out, int cap, DWORD flags) {
+    (void)flags;
+    const vx_locale *l = vx_locale_by_lcid(lcid);
+    if (!l) { vx_set_last_error(87); return 0; }
+    return (int)vx_return_string_w(l->name, out, (DWORD)cap) + 1;
+}
+static WINAPI DWORD LocaleNameToLCID(const WCHAR *name, DWORD flags) {
+    (void)flags;
+    char *a = vx_utf8_dup(name);
+    const vx_locale *l = vx_locale_by_name(a);
+    if (getenv("VXRT_TRACE_LOCALE")) vx_log("locale: LocaleNameToLCID(%s) = %#x", a ? a : "NULL", l ? (unsigned)l->lcid : 0u);
+    free(a);
+    if (!l) { vx_set_last_error(87); return 0; }
+    return l->lcid;
+}
 static WINAPI int GetLocaleInfoEx(const WCHAR *name, DWORD type, WCHAR *out, int cap) {
-    (void)name;
+    char *a = vx_utf8_dup(name);
+    const vx_locale *l = vx_locale_by_name(a);
+    if (getenv("VXRT_TRACE_LOCALE")) vx_log("locale: GetLocaleInfoEx(%s, %#x)%s", a ? a : "NULL", (unsigned)type, l ? "" : ": unknown");
+    free(a);
+    if (!l) { vx_set_last_error(87); return 0; }
     int (WINAPI *info)(DWORD, DWORD, WCHAR *, int) = (int (WINAPI *)(DWORD, DWORD, WCHAR *, int))vx_find_export("kernel32.dll", "GetLocaleInfoW");
-    if (info) return info(0x409, type, out, cap);
+    if (info) return info(l->lcid, type, out, cap);
     return (int)vx_return_string_w("", out, (DWORD)cap) + 1;
 }
 
@@ -644,7 +746,7 @@ static const vx_export k32[] = {
     VX_EXPORT(SetThreadpoolThreadMaximum), VX_EXPORT(SetThreadpoolThreadMinimum),
     VX_EXPORT(CreateTimerQueue), VX_EXPORT(DeleteTimerQueue), VX_EXPORT(DeleteTimerQueueEx), VX_EXPORT(CreateTimerQueueTimer),
     VX_EXPORT(ChangeTimerQueueTimer), VX_EXPORT(DeleteTimerQueueTimer), VX_EXPORT(RegisterWaitForSingleObject),
-    VX_EXPORT(UnregisterWait), VX_EXPORT(UnregisterWaitEx), VX_EXPORT(CreateWaitableTimerW), VX_EXPORT(CreateWaitableTimerA),
+    VX_EXPORT(UnregisterWait), VX_EXPORT(UnregisterWaitEx), VX_EXPORT(CreateWaitableTimerW), VX_EXPORT(OpenWaitableTimerA), VX_EXPORT(OpenWaitableTimerW), VX_EXPORT(CreateWaitableTimerA),
     VX_EXPORT(CreateWaitableTimerExW), VX_EXPORT(SetWaitableTimer), VX_EXPORT(SetWaitableTimerEx), VX_EXPORT(CancelWaitableTimer),
     VX_EXPORT(GetFileInformationByHandleEx), VX_EXPORT(SetFileInformationByHandle), VX_EXPORT(GetLongPathNameW),
     VX_EXPORT(GetLongPathNameA), VX_EXPORT(CreateSymbolicLinkW), VX_EXPORT(AreFileApisANSI),

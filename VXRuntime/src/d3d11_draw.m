@@ -1015,7 +1015,13 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
     // result undefined: the first output stands in).
     int dual = 0;
     if (s->blend && ncolors > 0) for (int k = 1; k <= 6 && !dual; k++) if (k != 3) dual = s->blend->desc[2 + k] >= 16 && s->blend->desc[2 + k] <= 19;
-    if (dual && ps && shader_function(ps)) {
+    // Metal refuses dual-source blending with more than one color target, and stops the program over it (an assertion
+    // in its pipeline validation; Elite Dangerous's loading screen, flat); Direct3D allows it (only target 0 blends
+    // so). Then the first output stands in for the second, as when the shader has none.
+    int targets = 0;
+    for (int i = 0; i < ncolors; i++) if (colors[i]) targets++;
+    if (dual && targets > 1) dual = 2;
+    if (dual == 1 && ps && shader_function(ps)) {
         id<MTLFunction> f = dual_source_function(c->base.dev, ps);
         if (f) pd.fragmentFunction = f; else dual = 2;
     }
