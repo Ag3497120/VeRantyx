@@ -645,7 +645,28 @@ void *objc_autoreleasePoolPush(void);
 void objc_autoreleasePoolPop(void *pool);
 static __thread void *t_pool;
 static void flush_work(d3d_device *dev, int wait);
+// VXRT_STATS: what sends recorded work to the GPU (each flush ends the render pass in progress: its targets are
+// written out and loaded again by the next pass).
+static struct { void *fn; uint64_t n; } g_flush_reasons[32];
+void d3d_flush_reasons_log(void) {
+    char text[600] = ""; size_t len = 0;
+    for (int i = 0; i < 32 && g_flush_reasons[i].fn; i++) {
+        Dl_info info;
+        const char *name = dladdr(g_flush_reasons[i].fn, &info) && info.dli_sname ? info.dli_sname : "?";
+        len += (size_t)snprintf(text + len, sizeof text - len, " %s %llu,", name, (unsigned long long)g_flush_reasons[i].n);
+        if (len >= sizeof text - 64) break;
+        g_flush_reasons[i].n = 0;
+    }
+    if (len) vx_log("command buffers sent by:%s", text);
+}
 void d3d_flush(d3d_device *dev, int wait) {
+    if (g_end_stats < 0) g_end_stats = getenv("VXRT_STATS") != NULL;
+    if (g_end_stats && ((d3d_context *)dev->context)->cmd) {
+        Dl_info info;
+        void *caller = VX_RETURN_ADDRESS();
+        void *fn = dladdr(caller, &info) && info.dli_saddr ? info.dli_saddr : caller;
+        for (int i = 0; i < 32; i++) if (!g_flush_reasons[i].fn || g_flush_reasons[i].fn == fn) { g_flush_reasons[i].fn = fn; g_flush_reasons[i].n++; break; }
+    }
     flush_work(dev, wait);
     if (t_pool) objc_autoreleasePoolPop(t_pool);
     t_pool = objc_autoreleasePoolPush();

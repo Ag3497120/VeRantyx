@@ -1388,6 +1388,7 @@ static void pass_stats(MTLRenderPassDescriptor *rp) {
     vx_log("render passes: %.0f/s (%.0f with multisampled targets); attachments loaded %.1f GB/s, stored %.1f GB/s, cleared on load %.1f GB/s",
            passes / s, msaa / s, loaded / s / 1e9, stored / s / 1e9, cleared / s / 1e9);
     d3d_end_reasons_log();
+    d3d_flush_reasons_log();
     passes = msaa = loaded = stored = cleared = 0; since = now;
 }
 

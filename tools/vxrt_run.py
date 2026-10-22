@@ -31,7 +31,7 @@ HARNESS = os.path.join(DRIVE, "vxrt_harness")                  # this tool's roo
 # Settings a run may set (AGENTS.md, "Settings you may tune"); recorded in the result. Anything else is refused.
 TUNABLES = {"VXRT_VR_RENDER_SCALE", "VERANTYX_DISPLAY_SCALE", "VERANTYX_DISPLAY_HZ", "VERANTYX_STREAM_WIDTH", "VERANTYX_STREAM_HEIGHT",
             "VERANTYX_BITRATE_MBPS", "VERANTYX_HEVC_QUALITY", "VXRT_MSAA_MAX", "VXRT_MAX_ANISOTROPY", "VXRT_VR_SETTINGS",
-            "VERANTYX_DECOUPLED_POSES", "VXRT_GPU_PROFILE", "VXRT_STATS", "VXRT_TRACE_CALLS"}
+            "VERANTYX_DECOUPLED_POSES", "VXRT_GPU_PROFILE", "VXRT_STATS", "VXRT_TRACE_CALLS", "VXRT_MIRROR_EVERY"}
 
 # Games the harness knows (games/<app id>.json, by key): how they start, the scenarios, the baselines. Other installed
 # games are run with a default profile (the generic launcher, scenario "start").

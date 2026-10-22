@@ -157,6 +157,7 @@ compare settings in alternating runs (A B B A), not one after another.
 | `VERANTYX_STREAM_WIDTH/HEIGHT` | the stream's pixel budget (aspect follows the eyes); one HEVC session encodes ~60 fps of 2880x1620 |
 | `VERANTYX_BITRATE_MBPS`, `VERANTYX_HEVC_QUALITY` (0–1) | stream bitrate and quality target |
 | `VXRT_MSAA_MAX` (1/2/4), `VXRT_MAX_ANISOTROPY` | caps on multisampling and anisotropic filtering |
+| `VXRT_MIRROR_EVERY` (n) | a game in the headset shows only every n-th frame in its Mac window (the desktop mirror costs the Mac's compositor GPU time) |
 | `VXRT_VR_SETTINGS='{"steamvr": {...}}'` | SteamVR settings merged into the overlay's copy |
 | game arguments | e.g. Source 2: `-noautofidelity +vr_fidelity_level N` |
 

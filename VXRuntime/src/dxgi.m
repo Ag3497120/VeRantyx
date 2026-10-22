@@ -410,6 +410,12 @@ static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flag
     if (flags & DXGI_PRESENT_TEST) return S_OK;
     d3d_flush(sc->dev, 0);                          // the frame's work goes first, on the same queue
     snapshot(sc);
+    // VXRT_MIRROR_EVERY=n: only every n-th frame goes to the window. A game played in the headset still presents its
+    // desktop mirror each frame, and the Mac's compositor redrawing it took 12 % of the GPU (Elite Dangerous, M1 Max).
+    static int every = -1;
+    if (every < 0) every = getenv("VXRT_MIRROR_EVERY") && atoi(getenv("VXRT_MIRROR_EVERY")) > 1 ? atoi(getenv("VXRT_MIRROR_EVERY")) : 1;
+    static uint64_t frames;
+    if (every > 1 && frames++ % (uint64_t)every) { sc->presents++; return S_OK; }
     CAMetalLayer *layer = (__bridge CAMetalLayer *)sc->layer;
     layer.displaySyncEnabled = sync != 0;
     @autoreleasepool {
