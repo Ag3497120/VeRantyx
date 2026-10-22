@@ -1,7 +1,9 @@
 <h1 align="center">VeRantyx</h1>
 
-<p align="center"><b>PC VR on an Apple silicon Mac — no Windows PC, no Wine.</b><br>
-Windows SteamVR games run on our own Windows runtime and stream to Apple Vision Pro or an ALVR headset.</p>
+<p align="center"><b>Half-Life: Alyx and Elite Dangerous on Apple Vision Pro, from just a Mac.<br>
+No gaming PC, no Wine, no CrossOver.</b><br>
+Windows PC VR games run on our own Windows runtime, written from scratch for Apple silicon, and stream to Vision Pro
+or an ALVR headset. Some also play on the Mac's own screen.</p>
 
 <p align="center">
   <a href="https://github.com/Ag3497120/VeRantyx/releases/latest"><img alt="Download VeRantyx for Mac" src="https://img.shields.io/github/v/release/Ag3497120/VeRantyx?label=VeRantyx%20for%20Mac&logo=apple"></a>
@@ -12,16 +14,50 @@ Windows SteamVR games run on our own Windows runtime and stream to Apple Vision 
 
 <p align="center">
   <a href="https://youtu.be/qF09ETv1TpU"><img src="docs/media/vxrt-highlight.gif" width="720" alt="Half-Life: Alyx (Windows build) with the real Windows SteamVR on VXRuntime, on a MacBook Pro, played in Apple Vision Pro with hand tracking and Joy-Con"></a><br>
-  <sub>Half-Life: Alyx, Windows build, on a MacBook Pro M1 Max — no Wine. 3K preset, played in Vision Pro with hands + Joy-Con. <a href="https://youtu.be/qF09ETv1TpU">Full 4-minute unedited recording</a>.</sub>
+  <sub>Half-Life: Alyx, Windows build, on a MacBook Pro M1 Max, no Wine. 3K preset, played in Vision Pro with hands + Joy-Con. <a href="https://youtu.be/qF09ETv1TpU">Full 4-minute unedited recording</a>.</sub>
 </p>
+
+> **New in 0.2.0 (Oct 22):** Elite Dangerous, on the Mac's screen or in the headset, with keyboard, mouse and a
+> PS5 DualSense. **[Download VeRantyx for Mac →](https://github.com/Ag3497120/VeRantyx/releases/latest)**
+
+> **Want your game to run? Ask your AI assistant.** VeRantyx is built to be extended with Claude Code, Codex,
+> Gemini CLI or Cursor: run `/vxrt-support <your game>` in this repository and the agent measures the game, finds
+> what stops it and implements the missing Windows functions, with the test harness checking every claim
+> ([AGENTS.md](AGENTS.md)). Send what you get as a pull request or a report.
+
+**You need your own copy of each game.** Nothing from Valve, Microsoft or any game is in this repository or its
+releases: games and SteamVR come from your own Steam account. No anti-cheat is ever worked around.
 
 <p align="center">
   <a href="#get-started">Get started</a> ·
   <a href="#what-runs">What runs</a> ·
+  <a href="#updates">Updates</a> ·
   <a href="#under-the-hood">Under the hood</a> ·
   <a href="#branches">Branches</a> ·
   <a href="docs/README_ja.md">日本語</a>
 </p>
+
+## Updates
+
+| Date | What changed |
+|---|---|
+| Oct 22 | **VeRantyx for Mac 0.2.0**: Elite Dangerous with two buttons, **On this Mac** and **Headset**; the Mac shows its frame rate while you play |
+| Oct 22 | **The Lab: controllers work** (any headset): SteamVR now sees The Lab's controller bindings (a Windows pipe call answered wrongly, #2) |
+| Oct 22 | ALVR over Wi-Fi: socket buffers fixed at 4 MB, which ended 270-800 ms frame delay spikes (#4); a new headset's first connection no longer shows double vision (#2, #4) |
+| Oct 22 | **Vulkan, first steps** in our own `vulkan-1.dll`: a Windows program draws with depth test, culling, uniform buffers and push constants, and presents to a window. Next: what real games need (No Man's Sky, X-Plane 12) |
+| Oct 22 | Elite Dangerous: PS5 DualSense in game; plays flat on the Mac's screen (about 60 fps in game, M1 Max) |
+| Oct 21 | Elite Dangerous reaches the headset: official launcher (WPF on our own .NET runtime), sign-in, game, SteamVR (30-35 fps at 1700×1372 per eye) |
+| Oct 18 | **VeRantyx for Mac 0.1.0**: setup and play without Terminal, signed and notarized, 11 languages |
+| Oct 18 | Direct3D 12 steps 1-5: DXIL read without LLVM, translated to Metal, compute, graphics and swap chains |
+| Oct 17 | The Lab runs on our own x86-64 → ARM64 translator (the path that replaces Rosetta 2), 52-56 fps |
+| Oct 12 | VXRuntime, the Windows runtime, starts from scratch |
+
+## Help wanted: does it run for you?
+
+The fastest way to grow the list of games and headsets is your report, whether it works or not:
+**[Report a game or headset →](https://github.com/Ag3497120/VeRantyx/issues/new/choose)** (in the app: Help >
+Report a problem; it attaches the logs with your user name and Steam ID taken out). Quest and Pico are tested by
+players only so far.
 
 ## Get started
 
