@@ -23,6 +23,15 @@ tests are rejected at pipeline creation. The common GPU IR carries this for ever
 a D32 attachment cleared to 0.5 and `LESS`: a triangle at z 0.8 alone leaves the clear color, and one at z 0.2 drawn
 after it shows.
 
+Clip space and winding: a SPIR-V vertex shader's clip space has y pointing down and Metal's up, so the MSL emitter
+negates the position's y for shaders read from SPIR-V (not DXIL, whose clip space is Metal's). A Vulkan picture then
+lands as Vulkan's viewport transform puts it, row 0 at the top for y = -1, and Vulkan's winding, judged in framebuffer
+coordinates, is Metal's winding in its window coordinates: `cullMode` NONE/FRONT/BACK and `frontFace` map to the
+common `gpu_ir_raster_state` and from there to `setCullMode`/`setFrontFacingWinding` (FRONT_AND_BACK is rejected).
+Before this, Vulkan output was upside down; the checks that sampled only a centre pixel or used negative-height
+viewports could not see it. `tests/vulkan_win.c` checks the orientation (pixels near the triangle's base and apex)
+and three culling cases against the signed-area rule.
+
 `VXRuntime/src/vulkan.c` registers an in-tree `vulkan-1.dll` frontend and reports Vulkan 1.0 with no layers. It
 advertises the `VK_KHR_maintenance1` and `VK_KHR_swapchain` device extensions; enabling swapchain support requires
 the instance to enable both Win32 surface prerequisites. It creates a graphics/compute/transfer device on unified-memory
@@ -296,7 +305,7 @@ vertex formats may have a different component count from the matching float32 sh
 expands missing components with the specified defaults or discards unused components, matching Vulkan's component
 assignment rules ([Metal vertex attribute conversion](https://developer.apple.com/documentation/metal/mtlvertexattributedescriptor/format)). It currently
 accepts only triangle-list/strip topology, one RGBA8/BGRA8
-color attachment, one static or dynamic viewport and scissor, fill/no-cull rasterization, single-sample rendering,
+color attachment, one static or dynamic viewport and scissor, fill rasterization with no, front or back culling, single-sample rendering,
 disabled depth, and fixed-function color blending for that one attachment. It maps Vulkan's standard blend factors,
 ADD/SUBTRACT/REVERSE_SUBTRACT/MIN/MAX operations, channel write mask, and static blend constants to Metal. Dynamic
 blend constants are supported through `VK_DYNAMIC_STATE_BLEND_CONSTANTS` and `vkCmdSetBlendConstants`; the command-buffer
@@ -490,7 +499,7 @@ records the color-attachment-to-final-layout transition. The first graphics-pipe
 vertex shaders and fragment outputs, plus fragment combined-image-sampler, sampled-image, and sampler bindings as
 described above; it also accepts
 one static or dynamic viewport and scissor (including clipped subrects and maintenance1
-negative-height viewports), triangle list or strip topology, fill/no-cull, one
+negative-height viewports), triangle list or strip topology, fill with optional front/back culling, one
 RGBA8/BGRA8 output, fixed-function blend state for its single attachment, and no depth or logic-op state. Standard
 blend factors and operations, channel write masks, and static pipeline constants are retained in common GPU IR.
 `VK_DYNAMIC_STATE_BLEND_CONSTANTS` snapshots `vkCmdSetBlendConstants` values into each direct or indirect draw; the

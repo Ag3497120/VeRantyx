@@ -5394,10 +5394,14 @@ static int emit_graphics_interface_struct(const gpu_ir_shader *shader, uint32_t 
     return rc;
 }
 
+// flip_y: a Vulkan (SPIR-V) shader's clip space has y pointing down, Metal's (and Direct3D's) up; negating y makes the
+// picture land as Vulkan's viewport transform puts it (row 0 at the top for y = -1), which also makes Vulkan's
+// winding, judged in that pixel grid, Metal's winding in its window coordinates.
 static int emit_graphics_vertex_return(msl_builder *body, const char *position_name,
-                                       const msl_graphics_varying *varyings, uint32_t varying_count) {
+                                       const msl_graphics_varying *varyings, uint32_t varying_count, int flip_y) {
     int rc = builder_appendf(body,
         "    VxVertexOutput vx_output;\n    vx_output.position = %s;\n", position_name);
+    if (rc == GPU_IR_OK && flip_y) rc = builder_appendf(body, "    vx_output.position.y = -vx_output.position.y;\n");
     for (uint32_t i = 0; rc == GPU_IR_OK && i < varying_count; i++)
         rc = builder_appendf(body, "    vx_output.vx_location_%u = vx_io_%u;\n",
                             varyings[i].location, varyings[i].variable_id);
@@ -5505,7 +5509,8 @@ static int emit_graphics_stage(const gpu_ir_shader *shader, const gpu_ir_pipelin
             if (i + 1 != block->instruction_count || instruction->result_id || instruction->operand_count) {
                 rc = GPU_IR_INVALID;
             } else if (stage == GPU_IR_STAGE_VERTEX) {
-                rc = emit_graphics_vertex_return(&body, output_name, varyings, varying_count);
+                rc = emit_graphics_vertex_return(&body, output_name, varyings, varying_count,
+                    gpu_ir_shader_source_api(shader) == GPU_IR_SHADER_SOURCE_SPIRV);
             } else {
                 rc = builder_appendf(&body, "    return %s;\n", output_name);
             }

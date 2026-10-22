@@ -69,14 +69,21 @@ static VkRenderPass render_pass_depth(VkDevice device, VkFormat format, VkImageL
     return vkCreateRenderPass(device, &info, NULL, &pass) == VK_SUCCESS ? pass : 0;
 }
 
-static VkPipeline pipeline_depth(VkDevice device, VkRenderPass pass, VkPipelineLayout layout,
-                                 VkShaderModule vs, VkShaderModule fs, uint32_t width, uint32_t height, int depth_test);
+static VkPipeline pipeline_full(VkDevice device, VkRenderPass pass, VkPipelineLayout layout, VkShaderModule vs,
+                                VkShaderModule fs, uint32_t width, uint32_t height, int depth_test,
+                                VkFlags cull_mode, VkFrontFace front_face);
 static VkPipeline pipeline(VkDevice device, VkRenderPass pass, VkPipelineLayout layout,
                            VkShaderModule vs, VkShaderModule fs, uint32_t width, uint32_t height) {
-    return pipeline_depth(device, pass, layout, vs, fs, width, height, 0);
+    return pipeline_full(device, pass, layout, vs, fs, width, height, 0, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE);
 }
 static VkPipeline pipeline_depth(VkDevice device, VkRenderPass pass, VkPipelineLayout layout,
                                  VkShaderModule vs, VkShaderModule fs, uint32_t width, uint32_t height, int depth_test) {
+    return pipeline_full(device, pass, layout, vs, fs, width, height, depth_test, VK_CULL_MODE_NONE,
+                         VK_FRONT_FACE_COUNTER_CLOCKWISE);
+}
+static VkPipeline pipeline_full(VkDevice device, VkRenderPass pass, VkPipelineLayout layout, VkShaderModule vs,
+                                VkShaderModule fs, uint32_t width, uint32_t height, int depth_test,
+                                VkFlags cull_mode, VkFrontFace front_face) {
     VkPipelineShaderStageCreateInfo stages[2] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
           .module = vs, .pName = "main" },
@@ -101,8 +108,8 @@ static VkPipeline pipeline_depth(VkDevice device, VkRenderPass pass, VkPipelineL
     };
     VkPipelineRasterizationStateCreateInfo raster = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
-        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = cull_mode,
+        .frontFace = front_face, .lineWidth = 1.0f
     };
     VkPipelineMultisampleStateCreateInfo multisample = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT
@@ -148,6 +155,7 @@ int main(int argc, char **argv) {
     HWND window = NULL;
     int presented = 0;
     unsigned char center[4] = { 0 }, corner[4] = { 0 }, depth_center[2][4] = { { 0 } };
+    unsigned char near_base[4] = { 0 }, near_apex[4] = { 0 }, culled[3][4] = { { 0 } };
 
     const char *instance_extensions[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vulkan_win",
@@ -266,10 +274,15 @@ int main(int argc, char **argv) {
     CHECK(vkMapMemory(device, rb_memory, 0, W * H * 4, 0, &mapped) == VK_SUCCESS);
     memcpy(center, (unsigned char *)mapped + ((H / 2) * W + W / 2) * 4, 4);
     memcpy(corner, (unsigned char *)mapped, 4);
+    // (Vulkan's y points down: the base at clip y -0.5 is row 16 and the apex at +0.5 row 48, so (20, 20) is inside
+    //  near the base and (20, 44) outside near the apex; upside down it is the other way round)
+    memcpy(near_base, (unsigned char *)mapped + (20 * W + 20) * 4, 4);
+    memcpy(near_apex, (unsigned char *)mapped + (44 * W + 20) * 4, 4);
     vkUnmapMemory(device, rb_memory);
     // (BGRA bytes: red is 00 00 ff ff, blue ff 00 00 ff)
     CHECK(center[0] == 0 && center[1] == 0 && center[2] == 255 && center[3] == 255);
     CHECK(corner[0] == 255 && corner[1] == 0 && corner[2] == 0 && corner[3] == 255);
+    CHECK(near_base[2] == 255 && near_base[0] == 0 && near_apex[0] == 255 && near_apex[2] == 0);
 
     // 2. Depth: a D32 attachment cleared to 0.5 with LESS. A: the triangle at z 0.8 alone fails the test (blue stays);
     //    B: z 0.8, then z 0.2, which passes (red).
@@ -346,7 +359,36 @@ int main(int argc, char **argv) {
     CHECK(depth_center[0][0] == 255 && depth_center[0][2] == 0);    // A: blue, the far triangle was rejected
     CHECK(depth_center[1][0] == 0 && depth_center[1][2] == 255);    // B: red, the near one passed
 
-    // 3. A window's swapchain: the same picture, presented three times.
+    // 3. Culling. The triangle winds clockwise as Vulkan judges it in framebuffer coordinates (its signed area there
+    //    is negative), so with counter-clockwise fronts it is a back face: BACK culls it (blue); with clockwise fronts
+    //    BACK keeps it, and FRONT with counter-clockwise fronts keeps it too (red).
+    const struct { VkFlags cull; VkFrontFace front; } cull_cases[3] = {
+        { VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE },
+        { VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_CLOCKWISE },
+        { VK_CULL_MODE_FRONT_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE },
+    };
+    for (int c = 0; c < 3; c++) {
+        VkPipeline cull_pipeline = pipeline_full(device, offscreen_pass, layout, vs, fs, W, H, 0,
+                                                 cull_cases[c].cull, cull_cases[c].front);
+        CHECK(cull_pipeline);
+        CHECK(vkResetFences(device, 1, &fence) == VK_SUCCESS);
+        CHECK(vkResetCommandBuffer(cmd, 0) == VK_SUCCESS);
+        CHECK(vkBeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+        draw(cmd, offscreen_pass, offscreen_fb, cull_pipeline, vertices, W, H);
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &region);
+        CHECK(vkEndCommandBuffer(cmd) == VK_SUCCESS);
+        CHECK(vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS);
+        CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS);
+        CHECK(vkMapMemory(device, rb_memory, 0, W * H * 4, 0, &mapped) == VK_SUCCESS);
+        memcpy(culled[c], (unsigned char *)mapped + ((H / 2) * W + W / 2) * 4, 4);
+        vkUnmapMemory(device, rb_memory);
+        vkDestroyPipeline(device, cull_pipeline, NULL);
+    }
+    CHECK(culled[0][0] == 255 && culled[0][2] == 0);    // BACK, CCW fronts: culled, blue
+    CHECK(culled[1][0] == 0 && culled[1][2] == 255);    // BACK, CW fronts: drawn, red
+    CHECK(culled[2][0] == 0 && culled[2][2] == 255);    // FRONT, CCW fronts: drawn, red
+
+    // 4. A window's swapchain: the same picture, presented three times.
     WNDCLASSA wc = { .lpfnWndProc = DefWindowProcA, .hInstance = GetModuleHandleA(NULL), .lpszClassName = "vulkan_win" };
     RegisterClassA(&wc);
     window = CreateWindowExA(0, "vulkan_win", "vulkan_win", WS_OVERLAPPEDWINDOW, 0, 0, 320, 240, NULL, NULL, wc.hInstance, NULL);
@@ -427,10 +469,13 @@ done:
     if (instance) vkDestroyInstance(instance, NULL);
     if (window) DestroyWindow(window);
     printf("vulkan from a Windows program: commands imported from vulkan-1.dll, offscreen triangle "
-           "(center %02x%02x%02x%02x, corner %02x%02x%02x%02x as BGRA), D32 depth test LESS against 0.5 "
-           "(z 0.8 alone: %02x%02x%02x, then z 0.2: %02x%02x%02x), %d frames presented: %s\n",
+           "(center %02x%02x%02x%02x, corner %02x%02x%02x%02x as BGRA, y down: %s), D32 depth test LESS against 0.5 "
+           "(z 0.8 alone: %02x%02x%02x, then z 0.2: %02x%02x%02x), culling (back/ccw %s, back/cw %s, front/ccw %s), "
+           "%d frames presented: %s\n",
            center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2], corner[3],
+           near_base[2] == 255 && near_apex[0] == 255 ? "yes" : "NO",
            depth_center[0][0], depth_center[0][1], depth_center[0][2], depth_center[1][0], depth_center[1][1],
-           depth_center[1][2], presented, bad ? "FAILED" : "ok");
+           depth_center[1][2], culled[0][0] == 255 ? "culled" : "DRAWN", culled[1][2] == 255 ? "drawn" : "CULLED",
+           culled[2][2] == 255 ? "drawn" : "CULLED", presented, bad ? "FAILED" : "ok");
     return bad ? 1 : 0;
 }

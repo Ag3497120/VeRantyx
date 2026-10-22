@@ -649,12 +649,22 @@ typedef struct {
     uint32_t test_enabled, write_enabled, compare;
 } gpu_ir_depth_state;
 
+// Face culling, and which winding is the front, judged in the render target's pixel grid (row 0 at the top) as
+// Vulkan judges it in framebuffer coordinates. Zero is no culling with clockwise fronts, Metal's own default, which
+// front ends that set nothing (D3D12's pipelines today) keep.
+enum { GPU_IR_CULL_NONE = 0, GPU_IR_CULL_FRONT, GPU_IR_CULL_BACK };
+enum { GPU_IR_FRONT_FACE_CLOCKWISE = 0, GPU_IR_FRONT_FACE_COUNTER_CLOCKWISE };
+typedef struct {
+    uint32_t cull_mode, front_face;
+} gpu_ir_raster_state;
+
 typedef struct {
     uint32_t kind, stage_mask;
     uint32_t threadgroup_size[3];
     gpu_ir_vertex_input_desc vertex_input;
     gpu_ir_color_blend_state color_blend;
     gpu_ir_depth_state depth;
+    gpu_ir_raster_state raster;
 } gpu_ir_pipeline_info;
 int gpu_ir_format_is_depth(uint32_t format);
 

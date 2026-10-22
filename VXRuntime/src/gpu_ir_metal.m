@@ -43,6 +43,8 @@ typedef struct {
     MTLPixelFormat pixel_format;
     MTLPixelFormat depth_format;             // (Invalid: no depth attachment)
     void *depth_state;                       // id<MTLDepthStencilState>, with a depth attachment
+    MTLCullMode cull_mode;
+    MTLWinding front_face;
 } gpu_ir_metal_graphics_pipeline;
 
 static void release_metal_object(void *object) {
@@ -679,7 +681,21 @@ gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_depth(gpu_ir_metal_d
     const gpu_ir_vertex_input_desc *vertex_input, const gpu_ir_color_blend_state *color_blend,
     const gpu_ir_depth_state *depth, gpu_ir_pipeline_layout *layout,
     char *error, size_t error_capacity) {
+    return gpu_ir_metal_graphics_pipeline_create_with_state(device, vertex_source, fragment_source, color_format,
+        vertex_input, color_blend, depth, NULL, layout, error, error_capacity);
+}
+
+gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_state(gpu_ir_metal_device *device,
+    const char *vertex_source, const char *fragment_source, uint32_t color_format,
+    const gpu_ir_vertex_input_desc *vertex_input, const gpu_ir_color_blend_state *color_blend,
+    const gpu_ir_depth_state *depth, const gpu_ir_raster_state *raster, gpu_ir_pipeline_layout *layout,
+    char *error, size_t error_capacity) {
     if (error && error_capacity) error[0] = 0;
+    gpu_ir_raster_state raster_state = raster ? *raster : (gpu_ir_raster_state){ 0 };
+    if (raster_state.cull_mode > GPU_IR_CULL_BACK || raster_state.front_face > GPU_IR_FRONT_FACE_COUNTER_CLOCKWISE) {
+        if (error && error_capacity) snprintf(error, error_capacity, "invalid raster state");
+        return NULL;
+    }
     gpu_ir_depth_state depth_state = depth ? *depth : (gpu_ir_depth_state){ 0 };
     if (depth_state.format != GPU_IR_FORMAT_UNDEFINED &&
         (!gpu_ir_format_is_depth(depth_state.format) || depth_state.compare > GPU_IR_COMPARE_ALWAYS)) {
@@ -782,6 +798,10 @@ gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_depth(gpu_ir_metal_d
     backend->state = (__bridge_retained void *)state;
     backend->pixel_format = pixel_format;
     backend->depth_format = depth_state.format != GPU_IR_FORMAT_UNDEFINED ? depth_format : MTLPixelFormatInvalid;
+    backend->cull_mode = raster_state.cull_mode == GPU_IR_CULL_FRONT ? MTLCullModeFront :
+                         raster_state.cull_mode == GPU_IR_CULL_BACK ? MTLCullModeBack : MTLCullModeNone;
+    backend->front_face = raster_state.front_face == GPU_IR_FRONT_FACE_COUNTER_CLOCKWISE ?
+                          MTLWindingCounterClockwise : MTLWindingClockwise;
     if (depth_state.format != GPU_IR_FORMAT_UNDEFINED) {
         // (a disabled test is ALWAYS without writes: Metal has no switch for the test itself)
         MTLDepthStencilDescriptor *depth_descriptor = [MTLDepthStencilDescriptor new];
@@ -802,7 +822,7 @@ gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_depth(gpu_ir_metal_d
                   .stage_mask = GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT,
                   .vertex_input = vertex_input ? *vertex_input : (gpu_ir_vertex_input_desc){ 0 },
                   .color_blend = color_blend ? *color_blend : (gpu_ir_color_blend_state){ 0 },
-                  .depth = depth_state },
+                  .depth = depth_state, .raster = raster_state },
         .layout = layout,
         .backend_object = backend,
         .release = release_metal_graphics_pipeline
@@ -1089,6 +1109,8 @@ static int metal_draw(void *context, const gpu_ir_pipeline *pipeline, const gpu_
     [submission->render_encoder setRenderPipelineState:state];
     if (backend->depth_state)
         [submission->render_encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)backend->depth_state];
+    [submission->render_encoder setCullMode:backend->cull_mode];
+    [submission->render_encoder setFrontFacingWinding:backend->front_face];
     const gpu_ir_pipeline_info *pipeline_info = gpu_ir_pipeline_description(pipeline);
     if (!pipeline_info) return GPU_IR_INVALID;
     metal_set_blend_constants(submission->render_encoder, pipeline_info,
@@ -1213,6 +1235,8 @@ static int metal_draw_indirect(void *context, const gpu_ir_pipeline *pipeline,
     [submission->render_encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)backend->state];
     if (backend->depth_state)
         [submission->render_encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)backend->depth_state];
+    [submission->render_encoder setCullMode:backend->cull_mode];
+    [submission->render_encoder setFrontFacingWinding:backend->front_face];
     metal_set_blend_constants(submission->render_encoder, info,
                               draw->has_blend_constants, draw->blend_constants);
     [submission->render_encoder setViewport:viewport];

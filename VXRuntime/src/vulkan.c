@@ -4362,7 +4362,9 @@ VkResult WINAPI vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipel
             viewport_state->viewportCount != 1 || !viewport_valid || viewport_state->scissorCount != 1 ||
             !scissor_valid ||
             rasterization->depthClampEnable || rasterization->rasterizerDiscardEnable ||
-            rasterization->polygonMode != VK_POLYGON_MODE_FILL || rasterization->cullMode != VK_CULL_MODE_NONE ||
+            rasterization->polygonMode != VK_POLYGON_MODE_FILL ||
+            (rasterization->cullMode != VK_CULL_MODE_NONE && rasterization->cullMode != VK_CULL_MODE_FRONT_BIT &&
+             rasterization->cullMode != VK_CULL_MODE_BACK_BIT) ||
             (rasterization->frontFace != VK_FRONT_FACE_COUNTER_CLOCKWISE &&
              rasterization->frontFace != VK_FRONT_FACE_CLOCKWISE) || rasterization->depthBiasEnable ||
             rasterization->lineWidth != 1.0f || multisample->rasterizationSamples != VK_SAMPLE_COUNT_1_BIT ||
@@ -4520,10 +4522,19 @@ VkResult WINAPI vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipel
                 common_depth.compare = (uint32_t)info->pDepthStencilState->depthCompareOp;
             }
         }
+        // (culling and the front winding as Vulkan judges them in framebuffer coordinates, which the flipped clip y
+        //  of SPIR-V vertex shaders makes the pixel grid the common state names)
+        gpu_ir_raster_state common_raster = {
+            .cull_mode = rasterization->cullMode == VK_CULL_MODE_FRONT_BIT ? GPU_IR_CULL_FRONT :
+                         rasterization->cullMode == VK_CULL_MODE_BACK_BIT ? GPU_IR_CULL_BACK : GPU_IR_CULL_NONE,
+            .front_face = rasterization->frontFace == VK_FRONT_FACE_COUNTER_CLOCKWISE ?
+                          GPU_IR_FRONT_FACE_COUNTER_CLOCKWISE : GPU_IR_FRONT_FACE_CLOCKWISE
+        };
         char error[512] = { 0 };
-        gpu_ir_pipeline *gpu_pipeline = gpu_ir_metal_graphics_pipeline_create_with_depth(
+        gpu_ir_pipeline *gpu_pipeline = gpu_ir_metal_graphics_pipeline_create_with_state(
             device->physical_device->owner->metal, vertex_msl, fragment_msl, gpu_format,
-            &common_vertex_input, &common_color_blend, &common_depth, layout->gpu_layout, error, sizeof error);
+            &common_vertex_input, &common_color_blend, &common_depth, &common_raster, layout->gpu_layout,
+            error, sizeof error);
         gpu_ir_shader_release(vertex_shader);
         gpu_ir_shader_release(fragment_shader);
         gpu_ir_pipeline_layout_release(vertex_layout);

@@ -84,6 +84,12 @@ gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_layout(gpu_ir_metal_
     const char *vertex_source, const char *fragment_source, uint32_t color_format,
     const gpu_ir_vertex_input_desc *vertex_input, gpu_ir_pipeline_layout *layout,
     char *error, size_t error_capacity);
+// The same with face culling and winding (NULL: none, clockwise fronts).
+gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_state(gpu_ir_metal_device *device,
+    const char *vertex_source, const char *fragment_source, uint32_t color_format,
+    const gpu_ir_vertex_input_desc *vertex_input, const gpu_ir_color_blend_state *color_blend,
+    const gpu_ir_depth_state *depth, const gpu_ir_raster_state *raster, gpu_ir_pipeline_layout *layout,
+    char *error, size_t error_capacity);
 // The same with a depth state (NULL or a format of GPU_IR_FORMAT_UNDEFINED: no depth attachment).
 gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_depth(gpu_ir_metal_device *device,
     const char *vertex_source, const char *fragment_source, uint32_t color_format,
