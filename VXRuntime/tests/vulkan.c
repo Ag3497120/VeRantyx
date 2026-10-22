@@ -209,7 +209,7 @@ static int test_win32_surface_queries(VkInstance instance, VkPhysicalDevice phys
     return failed;
 }
 
-static vx_export registered[8];
+static vx_export registered[256];
 static size_t registered_count;
 static int allocations, frees;
 
@@ -3805,9 +3805,18 @@ int main(int argc, char **argv) {
         return check_specialized_vertex_fixture_cpu(argv[2]);
     if (argc > 38) return 2;
     vx_vulkan_init();
-    CHECK(registered_count == 6);
+    // (vulkan-1.dll exports every implemented command, as the Khronos loader does: once each, by its own function)
+    CHECK(registered_count > 100);
     CHECK(strcmp(registered[0].name, "vkGetInstanceProcAddr") == 0);
     CHECK(registered[0].fn == (void *)vkGetInstanceProcAddr);
+    for (size_t i = 0; i < registered_count; i++)
+        for (size_t j = i + 1; j < registered_count; j++) CHECK(strcmp(registered[i].name, registered[j].name) != 0);
+    int exports_create_device = 0, exports_cmd_draw = 0;
+    for (size_t i = 0; i < registered_count; i++) {
+        if (!strcmp(registered[i].name, "vkCreateDevice")) exports_create_device = registered[i].fn == (void *)vkCreateDevice;
+        if (!strcmp(registered[i].name, "vkCmdDraw")) exports_cmd_draw = registered[i].fn == (void *)vkCmdDraw;
+    }
+    CHECK(exports_create_device && exports_cmd_draw);
 
     uint32_t version = 0;
     CHECK(vkEnumerateInstanceVersion(&version) == VK_SUCCESS);

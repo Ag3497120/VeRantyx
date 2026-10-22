@@ -33,7 +33,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe
+       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -542,6 +542,18 @@ build/compute.exe: tests/compute.c tests/shaders/*.h
 	@mkdir -p build
 	$(MINGW) -O1 -Itests -o $@ $< -ld3d11 -ldxguid -luuid -lm
 
+# Vulkan from a Windows program: an import library of this runtime's vulkan-1.dll (every command it exports, as the
+# Vulkan SDK's vulkan-1.lib names them), and a program linked against it that draws, reads back and presents.
+build/vulkan-1.def: build/vxrt
+	@mkdir -p build
+	(echo "LIBRARY vulkan-1.dll"; echo "EXPORTS"; build/vxrt --list-exports | awk '$$1=="vulkan-1.dll" { print "    " $$2 }') > $@
+
+build/libvulkan-1.a: build/vulkan-1.def
+	x86_64-w64-mingw32-dlltool -d $< -l $@ -m i386:x86-64
+
+build/vulkan_win.exe: tests/vulkan_win.c src/vx_vulkan.h build/libvulkan-1.a build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv
+	$(MINGW) -O1 -Wall -o $@ $< -Lbuild -lvulkan-1
+
 build/d3d12.exe: tests/d3d12.c tests/shaders12/sum_cs.dxil tests/shaders12/tri_vs.dxil tests/shaders12/tri_ps.dxil tests/shaders12/cmp_ps.dxil tests/shaders12/gather_ps.dxil tests/shaders12/gather_cmp_ps.dxil tests/shaders12/dim_ps.dxil tests/shaders12/dim1da_ps.dxil tests/shaders12/typed_buffer_cs.dxil tests/shaders12/typed_sint_buffer_cs.dxil tests/shaders12/integer_minmax_buffer_cs.dxil tests/shaders12/integer_mad_buffer_cs.dxil tests/shaders12/float_mad_buffer_cs.dxil tests/shaders12/float_minmax_buffer_cs.dxil tests/shaders12/signed_conversion_cs.dxil tests/shaders12/typed_float_buffer_cs.dxil tests/shaders12/texture_dimensions_cs.dxil tests/shaders12/texture_dimensions_msaa_cs.dxil tests/shaders12/texture_load_msaa_cs.dxil tests/shaders12/atomic_resources_cs.dxil tests/shaders12/texload_bounds_cs.dxil tests/shaders12/texload_array_bounds_cs.dxil tests/shaders12/texload_sint_bounds_cs.dxil tests/shaders12/texload_array_sint_bounds_cs.dxil tests/shaders12/texload_float_bounds_cs.dxil tests/shaders12/wave_ops_cs.dxil tests/shaders12/wave_ops_partial_cs.dxil
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d12 -ldxgi -lm
@@ -1013,6 +1025,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/draw.exe
 	$(VXRT) build/compute.exe
 	$(VXRT) build/d3d12.exe
+	$(VXRT) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv
 	$(VXRT) build/input.exe
 	$(VXRT) build/audio.exe
 	$(VXRT) build/xaudio2.exe

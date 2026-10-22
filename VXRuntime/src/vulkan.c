@@ -1268,16 +1268,27 @@ static const vx_vk_dispatch g_vk_dispatch = {
     .get_device_proc_addr = vkGetDeviceProcAddr,
 };
 
+// vulkan-1.dll exports every command the frontend implements, as the Khronos loader does for core 1.0 and its WSI
+// commands: programs linked against vulkan-1.lib import vkCreateDevice, vkCmdDraw and the rest by name instead of
+// asking vkGetInstanceProcAddr. The same tables answer both ways, so the two never disagree.
 void vx_vulkan_init(void) {
-    static const vx_export exports[] = {
-        { "vkGetInstanceProcAddr", (void *)vkGetInstanceProcAddr },
-        { "vkEnumerateInstanceVersion", (void *)vkEnumerateInstanceVersion },
-        { "vkEnumerateInstanceExtensionProperties", (void *)vkEnumerateInstanceExtensionProperties },
-        { "vkEnumerateInstanceLayerProperties", (void *)vkEnumerateInstanceLayerProperties },
-        { "vkCreateInstance", (void *)vkCreateInstance },
-        { "vkGetDeviceProcAddr", (void *)vkGetDeviceProcAddr },
+    enum {
+        GLOBAL = sizeof g_vk_global_functions / sizeof g_vk_global_functions[0],
+        INSTANCE = sizeof g_vk_instance_functions / sizeof g_vk_instance_functions[0],
+        DEVICE = sizeof g_vk_device_functions / sizeof g_vk_device_functions[0],
     };
-    vx_register_module("vulkan-1.dll", exports, sizeof exports / sizeof exports[0]);
+    static vx_export exports[GLOBAL + INSTANCE + DEVICE];
+    size_t n = 0;
+    for (size_t i = 0; i < GLOBAL; i++)
+        exports[n++] = (vx_export){ g_vk_global_functions[i].name, (void *)g_vk_global_functions[i].function };
+    for (size_t i = 0; i < INSTANCE; i++)
+        exports[n++] = (vx_export){ g_vk_instance_functions[i].name, (void *)g_vk_instance_functions[i].function };
+    for (size_t i = 0; i < DEVICE; i++) {
+        int seen = 0;   // (vkGetDeviceProcAddr and a few more are in both tables)
+        for (size_t j = 0; j < n && !seen; j++) seen = !strcmp(exports[j].name, g_vk_device_functions[i].name);
+        if (!seen) exports[n++] = (vx_export){ g_vk_device_functions[i].name, (void *)g_vk_device_functions[i].function };
+    }
+    vx_register_module("vulkan-1.dll", exports, n);
 }
 
 VkResult WINAPI vkEnumeratePhysicalDevices(VkInstance instance, uint32_t *pPhysicalDeviceCount,

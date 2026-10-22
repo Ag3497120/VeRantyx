@@ -4,6 +4,13 @@ VXRuntime will implement Vulkan's C API in its own `vulkan-1.dll` module and low
 GPU intermediate representation. Vulkan objects and rules remain in the Vulkan front end; resource execution and
 backend-facing operations can be shared with D3D11 and D3D12 where their semantics match.
 
+`vulkan-1.dll` exports every command the frontend implements (112), as the Khronos loader exports core 1.0 and its
+WSI commands, so a program linked against the Vulkan SDK's `vulkan-1.lib` imports `vkCreateDevice`, `vkCmdDraw` and
+the rest by name; `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr` answer from the same tables. `tests/vulkan_win.c`
+is such a Windows program (MinGW, linked against an import library made from the runtime's own export list): it
+draws a triangle into an offscreen BGRA8 image, copies it to a host-visible buffer and checks a pixel inside and one
+outside, then draws into a window's swapchain and presents three frames.
+
 `VXRuntime/src/vulkan.c` registers an in-tree `vulkan-1.dll` frontend and reports Vulkan 1.0 with no layers. It
 advertises the `VK_KHR_maintenance1` and `VK_KHR_swapchain` device extensions; enabling swapchain support requires
 the instance to enable both Win32 surface prerequisites. It creates a graphics/compute/transfer device on unified-memory

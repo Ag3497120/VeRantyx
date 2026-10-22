@@ -18,6 +18,8 @@
 typedef int32_t VkResult;
 typedef uint32_t VkFlags;
 typedef uint32_t VkBool32;
+#define VK_TRUE 1u
+#define VK_FALSE 0u
 typedef uint64_t VkDeviceSize;
 #define VK_WHOLE_SIZE (~(VkDeviceSize)0)
 typedef uint32_t VkInstanceCreateFlags;
