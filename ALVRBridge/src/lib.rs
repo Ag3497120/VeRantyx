@@ -172,6 +172,7 @@ struct Bridge {
     samples: Mutex<SampleLog>,                                         // (what frames are stamped with, checked)
     layout: alvr_filesystem::Layout,
     started_with: serde_json::Value,                                   // (the display settings the core read)
+    connecting_since: Mutex<Option<std::time::Instant>>,               // (a headset's handshake, as the session shows it)
 }
 static BRIDGE: OnceLock<Arc<Bridge>> = OnceLock::new();
 static LAST_VIEWS: Mutex<String> = Mutex::new(String::new());
@@ -305,7 +306,7 @@ pub unsafe extern "C" fn vx_alvr_start(config_dir: *const c_char) -> bool {
     let bridge = Arc::new(Bridge {
         ctx: RwLock::new(None), input: Mutex::new(VxAlvrInput { head: identity, left: identity, right: identity, ..Default::default() }),
         seq: AtomicU64::new(0), connected: AtomicBool::new(false), idr_requested: AtomicBool::new(false), config: Mutex::new(vec![]), samples: Mutex::new(SampleLog::default()),
-        started_with: openvr_config(&l), layout: l,
+        started_with: openvr_config(&l), layout: l, connecting_since: Mutex::new(None),
     });
     BRIDGE.set(Arc::clone(&bridge)).ok();
     thread::spawn(move || run(bridge));
@@ -329,11 +330,34 @@ pub extern "C" fn vx_alvr_connected() -> bool { BRIDGE.get().is_some_and(|b| b.c
 #[no_mangle]
 pub extern "C" fn vx_alvr_take_idr_request() -> bool { BRIDGE.get().is_some_and(|b| b.idr_requested.swap(false, Ordering::SeqCst)) }
 
-/// True when a headset brought display settings other than those the core started with (see run): the host has to
-/// start again.
+// A headset that connects again can find ALVR's core stuck for good in its handshake (issue #6: the headset says
+// "Connection error: Try again (os error 11)", or 35 on a Mac, and ALVR logs nothing more). ALVR's game audio
+// callback reads the session lock on CoreAudio's thread; cpal 0.15.3 never stops a stream on a named device (its
+// disconnect listener keeps the stream alive), so the last connection's recording goes on, and the next handshake holds
+// that lock for writing while it asks CoreAudio about the same device, which waits for that callback. A handshake takes
+// well under a second and ALVR gives up on each of its steps after 2 s, so a client still "Connecting" after
+// HANDSHAKE_HUNG means the core is stuck: the encoder starts again, as after new display settings, and the headset
+// connects to the new one. (Whether a client still counts as connected does not matter: when the last connection's
+// recording was being stopped as the lock was taken, its end hangs too and ALVR never says it ended.)
+const HANDSHAKE_HUNG: Duration = Duration::from_secs(6);
+
+fn handshake_hung(b: &Bridge) -> bool {
+    let connecting = fs::read_to_string(b.layout.session()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|s| s["client_connections"].as_object().map(|c| c.values().any(|v| v["connection_state"] == "Connecting")))
+        .unwrap_or(false);
+    let mut since = b.connecting_since.lock().unwrap();
+    if !connecting { *since = None; return false; }
+    let hung = since.get_or_insert_with(std::time::Instant::now).elapsed() > HANDSHAKE_HUNG;
+    // (to the encoder's log: the core started again writes session_log.txt anew)
+    if hung { eprintln!("ALVR: a headset's handshake has not ended in {} s (ALVR's core is stuck)", HANDSHAKE_HUNG.as_secs()); }
+    hung
+}
+
+/// True when the host has to start again: a headset brought display settings other than those the core started with
+/// (see run), or a handshake hangs (handshake_hung).
 #[no_mangle]
 pub extern "C" fn vx_alvr_restart_needed() -> bool {
-    BRIDGE.get().is_some_and(|b| !b.connected.load(Ordering::SeqCst) && openvr_config(&b.layout) != b.started_with)
+    BRIDGE.get().is_some_and(|b| (!b.connected.load(Ordering::SeqCst) && openvr_config(&b.layout) != b.started_with) || handshake_hung(b))
 }
 
 /// The client's display rate (ALVR's session, as negotiated at the last connection), 0 before any.

@@ -17,6 +17,13 @@ ask for its host to be restarted (ALVR's dashboard restarts SteamVR): here the e
 script starts it again; it then connects with them. SteamVR's display rate follows the last ALVR headset's at the
 next start (`VERANTYX_DISPLAY_HZ` overrides it).
 
+Reconnecting: with game audio on, a headset that connects again (its ALVR app was left for the headset's home, or the
+Wi-Fi dropped) finds ALVR's core stuck in the handshake, and the headset says "Connection error: Try again (os error
+11)" (issue #6). ALVR's audio callback reads its session lock on CoreAudio's thread; cpal 0.15.3 never stops a stream
+on a named device, so the last connection's recording runs on, and the next handshake holds that lock for writing
+while it asks CoreAudio about the same device. The bridge sees a client still "Connecting" after 6 s (a handshake takes
+well under one) and the encoder starts again (exit 75, as above); the headset connects some 10 s after it came back.
+
 Game audio: macOS cannot record an output device (ALVR records the speakers on Windows), so the encoder makes a
 device ALVR can: an aggregate of the Mac's output and a tap of the Mac's sound, "VeRantyx ALVR game audio", private
 to its process (ALVR runs in it), and names it to the session. The tap mutes the Mac's speakers while a headset
@@ -102,4 +109,11 @@ folder), forwards ports 9943 and 9944 to it (`adb forward`), finds its ALVR app 
 - Vibration (2026-10-17): Half-Life: Alyx in the harness with client_mock connected from the Air
   (20261017T080757Z-alyx-chapter, 60.0 fps): the driver got the game's first vibration at 17:08:42.841 (right hand,
   amplitude 0.20) and over 1000 in two minutes; the bridge sent them to ALVR from the same moment.
+- Reconnecting (2026-10-23): the encoder with ALVR and game audio (sound playing on the Mac), the mock on the Air killed
+  and started again, as a headset's app going away and coming back. Before: the second connection (or the third)
+  never got past the handshake: ALVR logged nothing more, the mock said "Resource temporarily unavailable (os error
+  35)", and a `sample` of the encoder showed the handshake in cpal's device listing (`AudioObjectGetPropertyDataSize`)
+  while a CoreAudio IO thread ran the earlier connection's recording callback, waiting for ALVR's session lock. The
+  issue #6 session log stops at the same step. With the restart: 20 of 20 reconnections streamed again, 9-14 s after
+  the mock came back (12-14 s with 10 s, 9-11 s with 6 s); no restart in a minute of steady streaming.
 - A Quest: only through someone who has one.

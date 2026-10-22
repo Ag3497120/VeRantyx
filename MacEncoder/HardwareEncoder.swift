@@ -821,8 +821,9 @@ if let alvr {
                     OSMemoryBarrier()
                     handsMapPtr.advanced(by: 320).storeBytes(of: UInt32(0x4450_4956), as: UInt32.self)
                 }
-                if alvr.restartNeeded() {                               //  encoder again, which connects with them)
-                    print("ALVR: the headset brought other display settings (stored): the encoder starts again")
+                if alvr.restartNeeded() {                               //  encoder again, which connects with them;
+                                                                        //  also when ALVR's handshake hung: lib.rs)
+                    print("ALVR: the headset brought other display settings (stored), or its handshake hung: the encoder starts again")
                     fflush(stdout)
                     _exit(75)                                           // (not exit: its handlers ran into ALVR's and
                                                                         //  the audio tap's threads, and it died of it)
