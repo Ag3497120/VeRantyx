@@ -1222,8 +1222,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: dxil_msl_test [--sample-mask output.metal | --fcmp-ueq output.metal | --texture-gather output.metal | --cube-array-min-lod output.metal | --depth-cube-compare output.metal | signed-min-msl-path float-max-msl-path wave-match-multiprefix-msl-path pixel-wave-msl-path pixel-wave-helper-msl-path [counter-msl-path atomic-fixture-prefix]]\n");
         return 2;
     }
-    const char *signed_path = argc == 6 ? argv[1] : NULL;
-    const char *float_path = argc == 6 ? argv[2] : NULL;
+    const char *signed_path = argc >= 6 ? argv[1] : NULL;
+    const char *float_path = argc >= 6 ? argv[2] : NULL;
     const char *counter_path = argc == 7 || argc == 8 ? argv[6] : NULL;
     const char *atomic_prefix = argc == 8 ? argv[7] : NULL;
     static const uint8_t atomic_kinds[] = { 10, 1, 6, 2, 7, 4 };
@@ -1242,8 +1242,8 @@ int main(int argc, char **argv) {
                  translate_wave_prefix(121, 2, 0, signed_path) |
                  translate_wave_prefix(121, 3, 1, float_path) |
                  translate_wave_prefix(136, 0, 0, NULL) |
-                 translate_wave_match_multiprefix(argc == 6 ? argv[3] : NULL, argc == 6 ? argv[4] : NULL) |
-                 translate_pixel_wave_helpers(argc == 6 ? argv[5] : NULL) |
+                 translate_wave_match_multiprefix(argc >= 6 ? argv[3] : NULL, argc >= 6 ? argv[4] : NULL) |
+                 translate_pixel_wave_helpers(argc >= 6 ? argv[5] : NULL) |
                  0;
     for (size_t i = 0; i < sizeof atomic_kinds / sizeof atomic_kinds[0]; i++) {
         char path[512];
