@@ -476,6 +476,8 @@ struct VkCommandBuffer_T {
     vx_vk_pipeline_layout *bound_layout;
     vx_vk_pipeline_layout *push_constant_layout;
     gpu_ir_resource *push_constant_resource;
+    // (the values last pushed for any stage: graphics draws capture them; compute reads push_constant_resource)
+    uint8_t push_constant_data[GPU_IR_METAL_MAX_PUSH_CONSTANT_SIZE];
     VkDescriptorSet bound_sets[VX_VK_MAX_DESCRIPTOR_SETS];
     uint32_t bound_dynamic_offsets[VX_VK_MAX_DESCRIPTOR_SETS][VX_VK_MAX_DESCRIPTOR_VALUES];
     vx_vk_descriptor_set_version *used_descriptor_sets;
@@ -545,7 +547,8 @@ struct vx_vk_pipeline {
     vx_vk_descriptor_layout **set_layouts;
     vx_vk_pipeline_layout *layout;
     gpu_ir_pipeline *gpu_pipeline;
-    gpu_ir_pipeline_layout *reflected_layout;
+    gpu_ir_pipeline_layout *reflected_layout;          // (graphics: the fragment stage's)
+    gpu_ir_pipeline_layout *vertex_reflected_layout;
     VkFormat color_format;
     VkViewport viewport;
     VkRect2D scissor;
@@ -841,23 +844,28 @@ static int pipeline_layout_push_constants_compatible(const vx_vk_pipeline_layout
 static int pipeline_layout_covers_push_constants(const vx_vk_pipeline_layout *layout,
                                                   uint32_t offset, uint32_t size,
                                                   uint32_t stage_mask) {
+    const uint32_t stages = GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT | GPU_IR_STAGE_COMPUTE;
     if (!layout || !size || offset >= VX_VK_MAX_PUSH_CONSTANT_SIZE ||
-        size > VX_VK_MAX_PUSH_CONSTANT_SIZE - offset || stage_mask != GPU_IR_STAGE_COMPUTE)
+        size > VX_VK_MAX_PUSH_CONSTANT_SIZE - offset || !stage_mask || (stage_mask & ~stages))
         return 0;
     uint32_t end = offset + size;
-    for (uint32_t cursor = offset; cursor < end;) {
-        uint32_t covered_until = cursor;
-        for (uint32_t i = 0; i < gpu_ir_pipeline_layout_push_constant_count(layout->gpu_layout); i++) {
-            gpu_ir_push_constant_range range;
-            if (gpu_ir_pipeline_layout_push_constant_at(layout->gpu_layout, i, &range) != GPU_IR_OK)
-                return 0;
-            uint32_t range_end = range.offset + range.size;
-            if (range.offset <= cursor && range_end > cursor &&
-                (range.stage_mask & stage_mask) == stage_mask && range_end > covered_until)
-                covered_until = range_end;
+    // (each stage asked for on its own: ranges of different stages may overlap)
+    for (uint32_t stage = 1; stage <= stage_mask; stage <<= 1) {
+        if (!(stage_mask & stage)) continue;
+        for (uint32_t cursor = offset; cursor < end;) {
+            uint32_t covered_until = cursor;
+            for (uint32_t i = 0; i < gpu_ir_pipeline_layout_push_constant_count(layout->gpu_layout); i++) {
+                gpu_ir_push_constant_range range;
+                if (gpu_ir_pipeline_layout_push_constant_at(layout->gpu_layout, i, &range) != GPU_IR_OK)
+                    return 0;
+                uint32_t range_end = range.offset + range.size;
+                if (range.offset <= cursor && range_end > cursor && (range.stage_mask & stage) &&
+                    range_end > covered_until)
+                    covered_until = range_end;
+            }
+            if (covered_until == cursor) return 0;
+            cursor = covered_until < end ? covered_until : end;
         }
-        if (covered_until == cursor) return 0;
-        cursor = covered_until < end ? covered_until : end;
     }
     return 1;
 }
@@ -884,6 +892,7 @@ static void pipeline_release(vx_vk_pipeline *pipeline) {
     pipeline_layout_release(pipeline->layout);
     gpu_ir_pipeline_release(pipeline->gpu_pipeline);
     gpu_ir_pipeline_layout_release(pipeline->reflected_layout);
+    gpu_ir_pipeline_layout_release(pipeline->vertex_reflected_layout);
     pipeline->magic = 0;
     object_free(has_allocator ? &allocator : NULL, pipeline);
 }
@@ -3123,6 +3132,7 @@ VkResult WINAPI vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCr
         calloc(pCreateInfo->pushConstantRangeCount, sizeof *push_ranges) : NULL;
     if (pCreateInfo->pushConstantRangeCount && !push_ranges) return VK_ERROR_OUT_OF_HOST_MEMORY;
     VkResult range_result = VK_SUCCESS;
+    uint32_t push_stages = 0;
     for (uint32_t i = 0; i < pCreateInfo->pushConstantRangeCount; i++) {
         const VkPushConstantRange *range = &pCreateInfo->pPushConstantRanges[i];
         if (!range->stageFlags || (range->offset & 3u) || !range->size || (range->size & 3u) ||
@@ -3131,19 +3141,23 @@ VkResult WINAPI vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCr
             range_result = VK_ERROR_INITIALIZATION_FAILED;
             break;
         }
-        if (range->stageFlags != VK_SHADER_STAGE_COMPUTE_BIT) {
+        uint32_t range_stages = 0;
+        if (!vk_shader_stage_mask(range->stageFlags, &range_stages)) {
             range_result = VK_ERROR_FEATURE_NOT_PRESENT;
             break;
         }
         push_ranges[i] = (gpu_ir_push_constant_range){
             .offset = range->offset,
             .size = range->size,
-            .stage_mask = GPU_IR_STAGE_COMPUTE
+            .stage_mask = range_stages
         };
+        push_stages |= range_stages;
+        // (two ranges may share bytes, not a stage)
         for (uint32_t j = 0; j < i; j++) {
             uint32_t previous_end = push_ranges[j].offset + push_ranges[j].size;
             uint32_t current_end = range->offset + range->size;
-            if (range->offset < previous_end && push_ranges[j].offset < current_end) {
+            if (range->offset < previous_end && push_ranges[j].offset < current_end &&
+                (push_ranges[j].stage_mask & range_stages)) {
                 range_result = VK_ERROR_INITIALIZATION_FAILED;
                 break;
             }
@@ -3269,7 +3283,7 @@ VkResult WINAPI vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCr
             .binding = GPU_IR_INTERNAL_PUSH_CONSTANT_BINDING,
             .kind = GPU_IR_DESCRIPTOR_UNIFORM_BUFFER,
             .count = 1,
-            .stage_mask = GPU_IR_STAGE_COMPUTE,
+            .stage_mask = push_stages,
             .access_mask = GPU_IR_ACCESS_UNIFORM_READ,
             .binding_namespace = GPU_IR_INTERNAL_BINDING_NAMESPACE
         };
@@ -4267,6 +4281,44 @@ static int vk_validate_vertex_shader_inputs(const gpu_ir_shader *shader,
     return GPU_IR_OK;
 }
 
+// What a graphics stage's shader declares must be in the pipeline layout: uniform buffers in either stage, images
+// and samplers in the fragment stage, each of its descriptor type with the stage among its stages, and its push
+// constants inside ranges for the stage.
+static int vk_validate_graphics_reflection(const vx_vk_pipeline_layout *layout,
+                                           const gpu_ir_pipeline_layout *reflected_layout, uint32_t stage) {
+    for (uint32_t i = 0; i < gpu_ir_pipeline_layout_binding_count(reflected_layout); i++) {
+        gpu_ir_descriptor_binding reflected;
+        if (gpu_ir_pipeline_layout_binding_at(reflected_layout, i, &reflected) != GPU_IR_OK)
+            return GPU_IR_INVALID;
+        int image = reflected.kind == GPU_IR_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ||
+            reflected.kind == GPU_IR_DESCRIPTOR_SAMPLED_IMAGE || reflected.kind == GPU_IR_DESCRIPTOR_SAMPLER;
+        if ((reflected.kind != GPU_IR_DESCRIPTOR_UNIFORM_BUFFER && !(image && stage == GPU_IR_STAGE_FRAGMENT)) ||
+            reflected.set >= layout->set_layout_count || !reflected.count ||
+            reflected.count == GPU_IR_DESCRIPTOR_COUNT_UNBOUNDED) return GPU_IR_UNSUPPORTED;
+        vx_vk_descriptor_layout *set_layout = layout->set_layouts[reflected.set];
+        uint32_t descriptor_binding_index = 0;
+        if (!descriptor_layout_find(set_layout, reflected.binding, &descriptor_binding_index))
+            return GPU_IR_UNSUPPORTED;
+        const VkDescriptorSetLayoutBinding *actual = &set_layout->bindings[descriptor_binding_index];
+        VkShaderStageFlags reflected_stages = vk_stage_flags_for_gpu(reflected.stage_mask);
+        int type_matches = reflected.kind == GPU_IR_DESCRIPTOR_UNIFORM_BUFFER ?
+            vk_uniform_descriptor_type(actual->descriptorType) :
+            actual->descriptorType == (reflected.kind == GPU_IR_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ?
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : reflected.kind == GPU_IR_DESCRIPTOR_SAMPLED_IMAGE ?
+                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER);
+        if (!type_matches || actual->descriptorCount < reflected.count ||
+            (actual->stageFlags & reflected_stages) != reflected_stages) return GPU_IR_UNSUPPORTED;
+    }
+    for (uint32_t i = 0; i < gpu_ir_pipeline_layout_push_constant_count(reflected_layout); i++) {
+        gpu_ir_push_constant_range reflected;
+        if (gpu_ir_pipeline_layout_push_constant_at(reflected_layout, i, &reflected) != GPU_IR_OK)
+            return GPU_IR_INVALID;
+        if (!pipeline_layout_covers_push_constants(layout, reflected.offset, reflected.size, stage))
+            return GPU_IR_UNSUPPORTED;
+    }
+    return GPU_IR_OK;
+}
+
 VkResult WINAPI vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_t createInfoCount,
     const VkGraphicsPipelineCreateInfo *pCreateInfos, const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines) {
     if (!device_is_valid(device) || pipelineCache || !createInfoCount || !pCreateInfos || !pPipelines ||
@@ -4384,8 +4436,7 @@ VkResult WINAPI vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipel
         if ((render_pass->attachment.format != VK_FORMAT_R8G8B8A8_UNORM &&
              render_pass->attachment.format != VK_FORMAT_B8G8R8A8_UNORM) ||
             render_pass->attachment.samples != VK_SAMPLE_COUNT_1_BIT ||
-            !vk_format_to_gpu(render_pass->attachment.format, &gpu_format, &bytes_per_texel) ||
-            gpu_ir_pipeline_layout_push_constant_count(layout->gpu_layout)) {
+            !vk_format_to_gpu(render_pass->attachment.format, &gpu_format, &bytes_per_texel)) {
             result = VK_ERROR_FEATURE_NOT_PRESENT;
             break;
         }
@@ -4457,37 +4508,8 @@ VkResult WINAPI vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipel
             free(fragment_msl);
             break;
         }
-        if (rc == GPU_IR_OK && (gpu_ir_pipeline_layout_binding_count(vertex_layout) ||
-            gpu_ir_pipeline_layout_push_constant_count(vertex_layout) ||
-            gpu_ir_pipeline_layout_push_constant_count(fragment_layout))) rc = GPU_IR_UNSUPPORTED;
-        for (uint32_t binding_index = 0; rc == GPU_IR_OK &&
-             binding_index < gpu_ir_pipeline_layout_binding_count(fragment_layout); binding_index++) {
-            gpu_ir_descriptor_binding reflected;
-            if (gpu_ir_pipeline_layout_binding_at(fragment_layout, binding_index, &reflected) != GPU_IR_OK ||
-                (reflected.kind != GPU_IR_DESCRIPTOR_COMBINED_IMAGE_SAMPLER &&
-                 reflected.kind != GPU_IR_DESCRIPTOR_SAMPLED_IMAGE &&
-                 reflected.kind != GPU_IR_DESCRIPTOR_SAMPLER) ||
-                reflected.set >= layout->set_layout_count || !reflected.count ||
-                reflected.count == GPU_IR_DESCRIPTOR_COUNT_UNBOUNDED) {
-                rc = GPU_IR_UNSUPPORTED;
-                break;
-            }
-            vx_vk_descriptor_layout *set_layout = layout->set_layouts[reflected.set];
-            uint32_t descriptor_binding_index = 0;
-            if (!descriptor_layout_find(set_layout, reflected.binding, &descriptor_binding_index)) {
-                rc = GPU_IR_UNSUPPORTED;
-                break;
-            }
-            const VkDescriptorSetLayoutBinding *actual = &set_layout->bindings[descriptor_binding_index];
-            VkShaderStageFlags reflected_stages = vk_stage_flags_for_gpu(reflected.stage_mask);
-            VkDescriptorType expected_type = reflected.kind == GPU_IR_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ?
-                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : reflected.kind == GPU_IR_DESCRIPTOR_SAMPLED_IMAGE ?
-                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER;
-            if (actual->descriptorType != expected_type ||
-                actual->descriptorCount < reflected.count ||
-                (actual->stageFlags & reflected_stages) != reflected_stages)
-                rc = GPU_IR_UNSUPPORTED;
-        }
+        if (rc == GPU_IR_OK) rc = vk_validate_graphics_reflection(layout, vertex_layout, GPU_IR_STAGE_VERTEX);
+        if (rc == GPU_IR_OK) rc = vk_validate_graphics_reflection(layout, fragment_layout, GPU_IR_STAGE_FRAGMENT);
         if (rc == GPU_IR_OK) rc = vk_validate_vertex_shader_inputs(vertex_shader, &common_vertex_input);
         if (rc == GPU_IR_OK) {
             rc = gpu_ir_msl_validate_graphics_link(vertex_shader, fragment_shader,
@@ -4537,11 +4559,11 @@ VkResult WINAPI vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipel
             error, sizeof error);
         gpu_ir_shader_release(vertex_shader);
         gpu_ir_shader_release(fragment_shader);
-        gpu_ir_pipeline_layout_release(vertex_layout);
         free(vertex_msl);
         free(fragment_msl);
         if (!gpu_pipeline) {
             if (error[0]) fprintf(stderr, "[vxrt] Vulkan: graphics pipeline translation failed: %s\n", error);
+            gpu_ir_pipeline_layout_release(vertex_layout);
             gpu_ir_pipeline_layout_release(fragment_layout);
             result = VK_ERROR_FEATURE_NOT_PRESENT;
             break;
@@ -4550,6 +4572,7 @@ VkResult WINAPI vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipel
                                                     VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
         if (!pipeline) {
             gpu_ir_pipeline_release(gpu_pipeline);
+            gpu_ir_pipeline_layout_release(vertex_layout);
             gpu_ir_pipeline_layout_release(fragment_layout);
             result = VK_ERROR_OUT_OF_HOST_MEMORY;
             break;
@@ -4564,6 +4587,7 @@ VkResult WINAPI vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipel
         pipeline_layout_retain(layout);
         pipeline->gpu_pipeline = gpu_pipeline;
         pipeline->reflected_layout = fragment_layout;
+        pipeline->vertex_reflected_layout = vertex_layout;
         pipeline->color_format = render_pass->attachment.format;
         pipeline->dynamic_viewport = (uint8_t)dynamic_viewport;
         pipeline->dynamic_scissor = (uint8_t)dynamic_scissor;
@@ -5476,6 +5500,7 @@ static void command_buffer_reset(VkCommandBuffer commandBuffer) {
     commandBuffer->push_constant_layout = NULL;
     gpu_ir_resource_release(commandBuffer->push_constant_resource);
     commandBuffer->push_constant_resource = NULL;
+    memset(commandBuffer->push_constant_data, 0, sizeof commandBuffer->push_constant_data);
     for (uint32_t i = 0; i < VX_VK_MAX_DESCRIPTOR_SETS; i++) {
         vx_vk_descriptor_set *set = descriptor_set_from_internal_handle(commandBuffer->bound_sets[i],
                                                                           commandBuffer->device);
@@ -7093,30 +7118,37 @@ void WINAPI vkCmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout l
     if (!commandBuffer || commandBuffer->dispatch != &g_vk_dispatch ||
         commandBuffer->magic != VX_VK_COMMAND_BUFFER_MAGIC || commandBuffer->state != VX_VK_COMMAND_RECORDING) return;
     vx_vk_pipeline_layout *layout = pipeline_layout_from_handle(layoutHandle, commandBuffer->device);
-    if (!layout || stageFlags != VK_SHADER_STAGE_COMPUTE_BIT || (offset & 3u) || !size || (size & 3u) ||
-        !pValues || !pipeline_layout_covers_push_constants(layout, offset, size, GPU_IR_STAGE_COMPUTE) ||
-        (commandBuffer->push_constant_layout &&
+    uint32_t stage_mask = 0;
+    if (!layout || !vk_shader_stage_mask(stageFlags, &stage_mask) || (offset & 3u) || !size || (size & 3u) ||
+        !pValues || !pipeline_layout_covers_push_constants(layout, offset, size, stage_mask) ||
+        ((stage_mask & GPU_IR_STAGE_COMPUTE) && commandBuffer->push_constant_layout &&
          !pipeline_layout_push_constants_compatible(commandBuffer->push_constant_layout, layout)) ||
-        (commandBuffer->compute_pipeline &&
+        ((stage_mask & GPU_IR_STAGE_COMPUTE) && commandBuffer->compute_pipeline &&
          !pipeline_layout_push_constants_compatible(commandBuffer->compute_pipeline->layout, layout))) {
         commandBuffer->record_error = GPU_IR_INVALID;
         return;
     }
-    if (!command_buffer_ensure_push_constant_resource(commandBuffer)) {
-        commandBuffer->record_error = GPU_IR_OUT_OF_MEMORY;
-        return;
+    // Compute reads its push constants from a buffer the stream updates in order (with one layout's ranges per
+    // command buffer); graphics draws capture the values at each draw, whatever layout pushed them (an update inside
+    // a render pass would have to end it).
+    if (stage_mask & GPU_IR_STAGE_COMPUTE) {
+        if (!command_buffer_ensure_push_constant_resource(commandBuffer)) {
+            commandBuffer->record_error = GPU_IR_OUT_OF_MEMORY;
+            return;
+        }
+        int rc = gpu_ir_record_update_buffer(&commandBuffer->stream, commandBuffer->push_constant_resource,
+                                            offset, pValues, size, NULL);
+        if (rc != GPU_IR_OK) {
+            commandBuffer->record_error = rc;
+            return;
+        }
     }
-    int rc = gpu_ir_record_update_buffer(&commandBuffer->stream, commandBuffer->push_constant_resource,
-                                        offset, pValues, size, NULL);
-    if (rc != GPU_IR_OK) {
-        commandBuffer->record_error = rc;
-        return;
-    }
+    memcpy(commandBuffer->push_constant_data + offset, pValues, size);
     if (!command_buffer_track_pipeline_layout(commandBuffer, layout)) {
         commandBuffer->record_error = GPU_IR_OUT_OF_MEMORY;
         return;
     }
-    if (!commandBuffer->push_constant_layout) {
+    if ((stage_mask & GPU_IR_STAGE_COMPUTE) && !commandBuffer->push_constant_layout) {
         pipeline_layout_retain(layout);
         commandBuffer->push_constant_layout = layout;
     }
@@ -7212,50 +7244,80 @@ static int vk_descriptor_binding_value(VkCommandBuffer commandBuffer, uint32_t s
     return 1;
 }
 
+// The descriptors a draw's shaders read, captured from the bound sets (and the pushed constants) when it is recorded:
+// fragment images and samplers, uniform buffers of either stage, and the push constants as inline bytes.
 static int vk_cmd_record_graphics_descriptors(VkCommandBuffer commandBuffer, vx_vk_pipeline *pipeline) {
     if (!commandBuffer || !pipeline || pipeline->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS ||
-        !pipeline->layout || !pipeline->reflected_layout) return GPU_IR_INVALID;
-    uint32_t binding_count = gpu_ir_pipeline_layout_binding_count(pipeline->reflected_layout);
-    if (!binding_count) return GPU_IR_OK;
-    gpu_ir_descriptor_value values[VX_VK_MAX_DESCRIPTOR_VALUES];
+        !pipeline->layout || !pipeline->reflected_layout || !pipeline->vertex_reflected_layout)
+        return GPU_IR_INVALID;
+    gpu_ir_descriptor_value values[VX_VK_MAX_DESCRIPTOR_VALUES + 1u];
     uint32_t value_count = 0;
-    for (uint32_t i = 0; i < binding_count; i++) {
-        gpu_ir_descriptor_binding binding;
-        if (gpu_ir_pipeline_layout_binding_at(pipeline->reflected_layout, i, &binding) != GPU_IR_OK ||
-            (binding.kind != GPU_IR_DESCRIPTOR_COMBINED_IMAGE_SAMPLER &&
-             binding.kind != GPU_IR_DESCRIPTOR_SAMPLED_IMAGE &&
-             binding.kind != GPU_IR_DESCRIPTOR_SAMPLER) ||
-            binding.set >= pipeline->layout->set_layout_count || !binding.count ||
-            binding.count == GPU_IR_DESCRIPTOR_COUNT_UNBOUNDED ||
-            binding.count > VX_VK_MAX_DESCRIPTOR_VALUES - value_count)
-            return GPU_IR_UNSUPPORTED;
-        vx_vk_descriptor_set *set = descriptor_set_from_handle(commandBuffer->bound_sets[binding.set],
-                                                                 commandBuffer->device);
-        if (!set || !descriptor_layouts_compatible(set->layout, pipeline->layout->set_layouts[binding.set]))
-            return GPU_IR_INVALID;
-        for (uint32_t element = 0; element < binding.count; element++) {
-            gpu_ir_descriptor_value value;
-            vx_vk_image *image = NULL;
-            VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-            if (!vk_descriptor_binding_value(commandBuffer, binding.set, set, binding.binding, element,
-                    binding.stage_mask, &value, NULL, &image, &image_layout) || value.kind != binding.kind ||
-                ((binding.kind == GPU_IR_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ||
-                  binding.kind == GPU_IR_DESCRIPTOR_SAMPLED_IMAGE) && !image) ||
-                (binding.kind == GPU_IR_DESCRIPTOR_SAMPLER && (image || !value.backend_object)) ||
-                (binding.kind == GPU_IR_DESCRIPTOR_COMBINED_IMAGE_SAMPLER && !value.backend_object))
+    const gpu_ir_pipeline_layout *stage_layouts[2] = { pipeline->vertex_reflected_layout, pipeline->reflected_layout };
+    for (uint32_t stage_index = 0; stage_index < 2; stage_index++) {
+        const gpu_ir_pipeline_layout *reflected = stage_layouts[stage_index];
+        for (uint32_t i = 0; i < gpu_ir_pipeline_layout_binding_count(reflected); i++) {
+            gpu_ir_descriptor_binding binding;
+            if (gpu_ir_pipeline_layout_binding_at(reflected, i, &binding) != GPU_IR_OK ||
+                (binding.kind != GPU_IR_DESCRIPTOR_COMBINED_IMAGE_SAMPLER &&
+                 binding.kind != GPU_IR_DESCRIPTOR_SAMPLED_IMAGE &&
+                 binding.kind != GPU_IR_DESCRIPTOR_SAMPLER &&
+                 binding.kind != GPU_IR_DESCRIPTOR_UNIFORM_BUFFER) ||
+                binding.set >= pipeline->layout->set_layout_count || !binding.count ||
+                binding.count == GPU_IR_DESCRIPTOR_COUNT_UNBOUNDED ||
+                binding.count > VX_VK_MAX_DESCRIPTOR_VALUES - value_count)
+                return GPU_IR_UNSUPPORTED;
+            vx_vk_descriptor_set *set = descriptor_set_from_handle(commandBuffer->bound_sets[binding.set],
+                                                                     commandBuffer->device);
+            if (!set || !descriptor_layouts_compatible(set->layout, pipeline->layout->set_layouts[binding.set]))
                 return GPU_IR_INVALID;
-            if (image) {
-                int rc = command_buffer_record_image_layout_op(commandBuffer, image, 0,
-                    image_layout, image_layout, 0, 1);
-                if (rc != GPU_IR_OK) return rc;
-                if (!command_buffer_track_image(commandBuffer, image)) return GPU_IR_OUT_OF_MEMORY;
+            for (uint32_t element = 0; element < binding.count; element++) {
+                gpu_ir_descriptor_value value;
+                vx_vk_buffer *buffer = NULL;
+                vx_vk_image *image = NULL;
+                VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                if (!vk_descriptor_binding_value(commandBuffer, binding.set, set, binding.binding, element,
+                        binding.stage_mask, &value, &buffer, &image, &image_layout) || value.kind != binding.kind ||
+                    ((binding.kind == GPU_IR_DESCRIPTOR_COMBINED_IMAGE_SAMPLER ||
+                      binding.kind == GPU_IR_DESCRIPTOR_SAMPLED_IMAGE) && !image) ||
+                    (binding.kind == GPU_IR_DESCRIPTOR_SAMPLER && (image || !value.backend_object)) ||
+                    (binding.kind == GPU_IR_DESCRIPTOR_COMBINED_IMAGE_SAMPLER && !value.backend_object) ||
+                    (binding.kind == GPU_IR_DESCRIPTOR_UNIFORM_BUFFER && !buffer))
+                    return GPU_IR_INVALID;
+                if (image) {
+                    int rc = command_buffer_record_image_layout_op(commandBuffer, image, 0,
+                        image_layout, image_layout, 0, 1);
+                    if (rc != GPU_IR_OK) return rc;
+                    if (!command_buffer_track_image(commandBuffer, image)) return GPU_IR_OUT_OF_MEMORY;
+                }
+                if (buffer && !command_buffer_track_buffer(commandBuffer, buffer)) return GPU_IR_OUT_OF_MEMORY;
+                value.set = binding.set;
+                values[value_count++] = value;
             }
-            value.set = binding.set;
-            values[value_count++] = value;
         }
     }
+    // (push constants: the layout's adapter binding, carrying a copy of the pushed bytes for the graphics stages)
+    gpu_ir_descriptor_binding push_binding;
+    if (gpu_ir_pipeline_layout_find_binding_in_namespace(pipeline->layout->gpu_layout, GPU_IR_INTERNAL_SET,
+            GPU_IR_INTERNAL_BINDING_NAMESPACE, GPU_IR_INTERNAL_PUSH_CONSTANT_BINDING, &push_binding) == GPU_IR_OK &&
+        (push_binding.stage_mask & (GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT))) {
+        void *bytes = malloc(sizeof commandBuffer->push_constant_data);
+        if (!bytes) return GPU_IR_OUT_OF_MEMORY;
+        memcpy(bytes, commandBuffer->push_constant_data, sizeof commandBuffer->push_constant_data);
+        values[value_count++] = (gpu_ir_descriptor_value){
+            .set = GPU_IR_INTERNAL_SET,
+            .binding_namespace = GPU_IR_INTERNAL_BINDING_NAMESPACE,
+            .binding = GPU_IR_INTERNAL_PUSH_CONSTANT_BINDING,
+            .kind = GPU_IR_DESCRIPTOR_UNIFORM_BUFFER,
+            .stage_mask = push_binding.stage_mask & (GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT),
+            .access_mask = GPU_IR_ACCESS_UNIFORM_READ,
+            .range = sizeof commandBuffer->push_constant_data,
+            .backend_object = bytes,
+            .backend_release = free
+        };
+    }
+    if (!value_count) return GPU_IR_OK;
     for (uint32_t i = 0; i < value_count; i++) {
-        if (values[i].backend_object) {
+        if (values[i].backend_object && !values[i].backend_release) {
             gpu_ir_metal_sampler_retain(values[i].backend_object);
             values[i].backend_release = gpu_ir_metal_sampler_release;
         }

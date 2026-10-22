@@ -24,6 +24,11 @@ typedef struct {
     char *secondary_descriptor_index_expression;
     uint32_t secondary_descriptor_array_count;
     char *capture_argument_expression;
+    // A pointer into a uniform or push-constant block that is not a cast scalar pointer: expression is the
+    // block's constant uint*, block_offset_expression the first 32-bit word of the value, and the matrix stride
+    // (bytes, with its major order) and the step between a vector's components (words) come from the layout.
+    char *block_offset_expression;
+    uint32_t block_matrix_stride, block_row_major, block_component_stride;
 } msl_symbol;
 
 typedef struct {
@@ -99,6 +104,16 @@ static int shader_type_name(const gpu_ir_shader *shader, uint32_t id, char *name
         if (!strcmp(element, "int")) return snprintf(name, capacity, "int%u", type->element_count) < (int)capacity;
         if (!strcmp(element, "float")) return snprintf(name, capacity, "float%u", type->element_count) < (int)capacity;
     }
+    if (type->kind == GPU_IR_SHADER_TYPE_MATRIX && type->element_count >= 2 && type->element_count <= 4) {
+        const gpu_ir_shader_type *column = shader_type(shader, type->element_type_id);
+        const gpu_ir_shader_type *scalar = column && column->kind == GPU_IR_SHADER_TYPE_VECTOR ?
+            shader_type(shader, column->element_type_id) : NULL;
+        // (Metal's floatCxR is C columns of R rows, as SPIR-V's matrix of C column vectors)
+        if (scalar && scalar->kind == GPU_IR_SHADER_TYPE_FLOAT && scalar->bit_width == 32 &&
+            column->element_count >= 2 && column->element_count <= 4)
+            return snprintf(name, capacity, "float%ux%u", type->element_count, column->element_count) <
+                (int)capacity;
+    }
     return 0;
 }
 
@@ -160,6 +175,7 @@ static void symbols_destroy(msl_symbols *symbols) {
         free(symbols->items[i].descriptor_index_expression);
         free(symbols->items[i].secondary_descriptor_index_expression);
         free(symbols->items[i].capture_argument_expression);
+        free(symbols->items[i].block_offset_expression);
     }
     free(symbols->items);
     memset(symbols, 0, sizeof *symbols);
@@ -310,6 +326,24 @@ static int symbols_set_aux_expression(msl_symbols *symbols, uint32_t id, const c
         if (!copy) return GPU_IR_OUT_OF_MEMORY;
         free(symbols->items[i].aux_expression);
         symbols->items[i].aux_expression = copy;
+        return GPU_IR_OK;
+    }
+    return GPU_IR_INVALID;
+}
+
+static int symbols_set_block_layout(msl_symbols *symbols, uint32_t id, const char *offset_expression,
+                                    uint32_t matrix_stride, uint32_t row_major, uint32_t component_stride) {
+    if (!symbols || !offset_expression || !component_stride) return GPU_IR_INVALID;
+    for (uint32_t i = 0; i < symbols->count; i++) {
+        if (symbols->items[i].id != id) continue;
+        if (!symbols->items[i].is_pointer) return GPU_IR_INVALID;
+        char *copy = msl_string_copy(offset_expression);
+        if (!copy) return GPU_IR_OUT_OF_MEMORY;
+        free(symbols->items[i].block_offset_expression);
+        symbols->items[i].block_offset_expression = copy;
+        symbols->items[i].block_matrix_stride = matrix_stride;
+        symbols->items[i].block_row_major = row_major != 0;
+        symbols->items[i].block_component_stride = component_stride;
         return GPU_IR_OK;
     }
     return GPU_IR_INVALID;
@@ -775,6 +809,44 @@ static const gpu_ir_shader_type *global_resource_element_type(const gpu_ir_shade
         shader_type(shader, array->element_type_id) : NULL;
 }
 
+// What a uniform block may hold, laid out by its Offset, ArrayStride and MatrixStride decorations: 32-bit scalars and
+// their vectors, float matrices (a stride and the major order from the enclosing member), arrays of a fixed length
+// and structs. Everything is read as 32-bit words, so every offset and stride is a multiple of four.
+static int uniform_block_type_supported(const gpu_ir_shader *shader, uint32_t type_id,
+                                        const gpu_ir_shader_member *member, uint32_t depth) {
+    const gpu_ir_shader_type *type = shader_type(shader, type_id);
+    if (!type || depth > 16) return 0;
+    char name[32];
+    uint32_t length = 0;
+    switch (type->kind) {
+    case GPU_IR_SHADER_TYPE_INT:
+    case GPU_IR_SHADER_TYPE_FLOAT:
+        return type->bit_width == 32;
+    case GPU_IR_SHADER_TYPE_VECTOR:
+        return type->element_count >= 2 && type->element_count <= 4 &&
+            shader_type_is_32bit_buffer_scalar(shader, type->element_type_id);
+    case GPU_IR_SHADER_TYPE_MATRIX:
+        return member && member->has_matrix_stride && member->matrix_stride && !(member->matrix_stride & 3u) &&
+            shader_type_name(shader, type_id, name, sizeof name);
+    case GPU_IR_SHADER_TYPE_ARRAY:
+        return constant_u32(shader, type->array_length_id, &length) && length && type->has_array_stride &&
+            type->array_stride && !(type->array_stride & 3u) &&
+            uniform_block_type_supported(shader, type->element_type_id, member, depth + 1);
+    case GPU_IR_SHADER_TYPE_STRUCT:
+        if (!type->member_count) return 0;
+        for (uint32_t i = 0; i < type->member_count; i++) {
+            const gpu_ir_shader_member *child = gpu_ir_shader_type_member_at(shader, type->first_member + i);
+            if (!child || !child->has_offset || (child->offset & 3u) ||
+                (child->decoration_flags & ~(GPU_IR_SHADER_TYPE_FLAG_NON_WRITABLE | GPU_IR_SHADER_TYPE_FLAG_ROW_MAJOR |
+                                             GPU_IR_SHADER_TYPE_FLAG_COLUMN_MAJOR)) ||
+                !uniform_block_type_supported(shader, child->type_id, child, depth + 1)) return 0;
+        }
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int global_uniform_buffer_shape(const gpu_ir_shader *shader,
                                        const gpu_ir_shader_instruction *variable) {
     if (variable->storage_class != GPU_IR_SHADER_STORAGE_UNIFORM ||
@@ -789,17 +861,7 @@ static int global_uniform_buffer_shape(const gpu_ir_shader *shader,
         !(block->decoration_flags & GPU_IR_SHADER_TYPE_FLAG_BLOCK) ||
         (block->decoration_flags & ~(GPU_IR_SHADER_TYPE_FLAG_BLOCK | GPU_IR_SHADER_TYPE_FLAG_NON_WRITABLE)))
         return GPU_IR_UNSUPPORTED;
-    uint32_t previous_end = 0;
-    for (uint32_t i = 0; i < block->member_count; i++) {
-        const gpu_ir_shader_member *member = gpu_ir_shader_type_member_at(shader, block->first_member + i);
-        if (!member || !member->has_offset || (member->offset & 3u) ||
-            member->offset < previous_end || member->offset > UINT32_MAX - 4u ||
-            !shader_type_is_32bit_buffer_scalar(shader, member->type_id) ||
-            (member->decoration_flags & ~GPU_IR_SHADER_TYPE_FLAG_NON_WRITABLE))
-            return GPU_IR_UNSUPPORTED;
-        previous_end = member->offset + 4u;
-    }
-    return GPU_IR_OK;
+    return uniform_block_type_supported(shader, block->id, NULL, 0) ? GPU_IR_OK : GPU_IR_UNSUPPORTED;
 }
 
 static int layout_binding_supported(const gpu_ir_descriptor_binding *entry) {
@@ -1129,7 +1191,8 @@ static int compute_builtin_parameter(const gpu_ir_shader *shader,
 static int add_global_parameters(const gpu_ir_shader *shader, const gpu_ir_pipeline_layout *layout,
                                  uint32_t stage_mask,
                                  msl_symbols *symbols, msl_builder *parameters, msl_builder *body) {
-    uint32_t parameter_count = 0;
+    // (after any graphics stage inputs already written)
+    uint32_t parameter_count = parameters->length ? 1u : 0u;
     int has_buffer_ranges = 0;
     int combined_runtime_data = 0;
     int uses_push_constants = 0;
@@ -1140,15 +1203,20 @@ static int add_global_parameters(const gpu_ir_shader *shader, const gpu_ir_pipel
             if (binding.set == GPU_IR_INTERNAL_SET &&
                 binding.binding_namespace == GPU_IR_INTERNAL_BINDING_NAMESPACE &&
                 binding.binding == GPU_IR_INTERNAL_PUSH_CONSTANT_BINDING) {
-                if (binding.kind != GPU_IR_DESCRIPTOR_UNIFORM_BUFFER || binding.count != 1 ||
-                    !(binding.stage_mask & stage_mask)) return GPU_IR_UNSUPPORTED;
+                if (binding.kind != GPU_IR_DESCRIPTOR_UNIFORM_BUFFER || binding.count != 1)
+                    return GPU_IR_UNSUPPORTED;
+                if (!(binding.stage_mask & stage_mask)) continue;
                 if (stage_mask == GPU_IR_STAGE_COMPUTE) {
                     combined_runtime_data = 1;
                     break;
                 }
             }
         }
+        // (a graphics stage always reads its push constants and buffer ranges from one runtime-data buffer, the
+        //  rule gpu_ir_metal_graphics_buffer_slot describes)
+        if (stage_mask != GPU_IR_STAGE_COMPUTE) combined_runtime_data = 1;
     }
+    int graphics_slots = layout && stage_mask != GPU_IR_STAGE_COMPUTE;
     for (uint32_t i = 0; i < gpu_ir_shader_instruction_count(shader); i++) {
         const gpu_ir_shader_instruction *variable = gpu_ir_shader_instruction_at(shader, i);
         if (!variable || variable->opcode != GPU_IR_SHADER_OP_VARIABLE || variable->function_index != UINT32_MAX)
@@ -1166,7 +1234,11 @@ static int add_global_parameters(const gpu_ir_shader *shader, const gpu_ir_pipel
                 shader_type(shader, resource_pointer->element_type_id) : NULL;
             int is_descriptor_array = resource_array && resource_array->kind == GPU_IR_SHADER_TYPE_ARRAY;
             uint32_t slot = 0;
-            rc = descriptor_slot(shader, layout, variable, descriptor_count, stage_mask, &slot);
+            rc = graphics_slots ? gpu_ir_metal_graphics_buffer_slot(layout, stage_mask, variable->resource_set,
+                                      variable->binding_namespace, variable->binding, &slot) :
+                descriptor_slot(shader, layout, variable, descriptor_count, stage_mask, &slot);
+            if (rc == GPU_IR_OK && graphics_slots && descriptor_count > GPU_IR_METAL_MAX_GRAPHICS_BUFFERS - slot)
+                rc = GPU_IR_UNSUPPORTED;
             if (rc != GPU_IR_OK) return rc;
             for (uint32_t j = 0; j < i; j++) {
                 const gpu_ir_shader_instruction *prior = gpu_ir_shader_instruction_at(shader, j);
@@ -1209,7 +1281,10 @@ static int add_global_parameters(const gpu_ir_shader *shader, const gpu_ir_pipel
             has_buffer_ranges = 1;
             rc = global_uniform_buffer_shape(shader, variable);
             uint32_t slot = 0;
-            if (rc == GPU_IR_OK) rc = descriptor_slot(shader, layout, variable, 1, stage_mask, &slot);
+            if (rc == GPU_IR_OK) rc = graphics_slots ? gpu_ir_metal_graphics_buffer_slot(layout, stage_mask,
+                                                         variable->resource_set, variable->binding_namespace,
+                                                         variable->binding, &slot) :
+                descriptor_slot(shader, layout, variable, 1, stage_mask, &slot);
             if (rc != GPU_IR_OK) return rc;
             for (uint32_t j = 0; j < i; j++) {
                 const gpu_ir_shader_instruction *prior = gpu_ir_shader_instruction_at(shader, j);
@@ -1431,7 +1506,8 @@ static int add_global_parameters(const gpu_ir_shader *shader, const gpu_ir_pipel
         } else return GPU_IR_UNSUPPORTED;
         if (rc != GPU_IR_OK) return rc;
     }
-    if (layout) {
+    // (a graphics stage declares its runtime data only when its own code reads buffers or push constants)
+    if (layout && !graphics_slots) {
         for (uint32_t i = 0; i < gpu_ir_pipeline_layout_binding_count(layout); i++) {
             gpu_ir_descriptor_binding binding;
             if (gpu_ir_pipeline_layout_binding_at(layout, i, &binding) != GPU_IR_OK) return GPU_IR_INVALID;
@@ -1516,6 +1592,103 @@ static int emit_function_variable(const gpu_ir_shader *shader,
     return rc;
 }
 
+// A chain into a uniform block folds into a word offset from the block's constant uint*: constant indices add the
+// positions Offset, ArrayStride and MatrixStride give, dynamic ones uint(index) times the stride. A scalar is read
+// through a cast pointer; a vector, matrix, array or struct keeps the offset and its layout (for emit_load to gather
+// the value, or for a further chain).
+static int emit_uniform_access_chain(const gpu_ir_shader *shader, const gpu_ir_shader_instruction *instruction,
+                                     const msl_symbols *symbols, msl_symbols *mutable_symbols,
+                                     const msl_symbol *base_symbol, const gpu_ir_shader_type *pointer) {
+    const msl_symbol base = *base_symbol;   // (symbols_add may move the array the base lives in)
+    uint32_t current_type_id = pointer->element_type_id;
+    uint64_t words = 0;
+    uint32_t matrix_stride = base.block_matrix_stride, row_major = base.block_row_major;
+    uint32_t component_stride = base.block_component_stride ? base.block_component_stride : 1u;
+    msl_builder dynamic = { 0 }, offset = { 0 }, expression = { 0 };
+    int rc = base.block_offset_expression ? builder_appendf(&dynamic, " + %s", base.block_offset_expression) :
+        GPU_IR_OK;
+    for (uint32_t operand_index = 1; rc == GPU_IR_OK && operand_index < instruction->operand_count; operand_index++) {
+        uint32_t index_id, index = 0, count = 0, stride = 0;
+        const gpu_ir_shader_type *current = shader_type(shader, current_type_id);
+        if (!instruction_id_operand(shader, instruction, operand_index, &index_id) || !current) {
+            rc = GPU_IR_INVALID;
+            break;
+        }
+        int constant = constant_u32(shader, index_id, &index);
+        if (current->kind == GPU_IR_SHADER_TYPE_STRUCT) {
+            const gpu_ir_shader_member *member = constant && index < current->member_count ?
+                gpu_ir_shader_type_member_at(shader, current->first_member + index) : NULL;
+            if (!member || !member->has_offset || (member->offset & 3u)) { rc = GPU_IR_UNSUPPORTED; break; }
+            words += member->offset / 4u;
+            matrix_stride = member->has_matrix_stride ? member->matrix_stride : 0;
+            row_major = (member->decoration_flags & GPU_IR_SHADER_TYPE_FLAG_ROW_MAJOR) != 0;
+            component_stride = 1;
+            current_type_id = member->type_id;
+        } else {
+            if (current->kind == GPU_IR_SHADER_TYPE_ARRAY) {
+                if (!current->has_array_stride || !current->array_stride || (current->array_stride & 3u) ||
+                    !constant_u32(shader, current->array_length_id, &count)) { rc = GPU_IR_UNSUPPORTED; break; }
+                stride = current->array_stride / 4u;
+            } else if (current->kind == GPU_IR_SHADER_TYPE_MATRIX) {
+                // (a column-major matrix has its columns MatrixStride apart, a row-major one its rows)
+                if (!matrix_stride || (matrix_stride & 3u)) { rc = GPU_IR_UNSUPPORTED; break; }
+                count = current->element_count;
+                stride = row_major ? 1u : matrix_stride / 4u;
+                component_stride = row_major ? matrix_stride / 4u : 1u;
+            } else if (current->kind == GPU_IR_SHADER_TYPE_VECTOR) {
+                count = current->element_count;
+                stride = component_stride;
+                component_stride = 1;
+            } else { rc = GPU_IR_UNSUPPORTED; break; }
+            if (constant) {
+                if (index >= count) { rc = GPU_IR_UNSUPPORTED; break; }
+                words += (uint64_t)index * stride;
+            } else {
+                const msl_symbol *value = symbols_find(symbols, index_id);
+                const gpu_ir_shader_type *value_type = value ? shader_type(shader, value->type_id) : NULL;
+                if (!value || value->is_pointer || !value_type || value_type->kind != GPU_IR_SHADER_TYPE_INT ||
+                    value_type->bit_width != 32) { rc = GPU_IR_UNSUPPORTED; break; }
+                rc = builder_appendf(&dynamic, " + uint(%s) * %uu", value->expression, stride);
+            }
+            current_type_id = current->element_type_id;
+        }
+        if (words > UINT32_MAX / 4u) rc = GPU_IR_UNSUPPORTED;
+    }
+    const gpu_ir_shader_type *result = shader_type(shader, current_type_id);
+    const gpu_ir_shader_type *result_pointer = shader_type(shader, instruction->result_type_id);
+    if (rc == GPU_IR_OK && (!result || !result_pointer || result_pointer->kind != GPU_IR_SHADER_TYPE_POINTER ||
+        result_pointer->storage_class != pointer->storage_class || result_pointer->element_type_id != current_type_id))
+        rc = GPU_IR_INVALID;
+    if (rc == GPU_IR_OK) rc = dynamic.data ? builder_appendf(&offset, "(%uu%s)", (uint32_t)words, dynamic.data) :
+        builder_appendf(&offset, "%u", (uint32_t)words);
+    int scalar = result && (result->kind == GPU_IR_SHADER_TYPE_INT || result->kind == GPU_IR_SHADER_TYPE_FLOAT);
+    if (rc == GPU_IR_OK && scalar) {
+        char pointee_name[32];
+        if (!shader_type_is_32bit_buffer_scalar(shader, current_type_id) ||
+            !shader_type_name(shader, current_type_id, pointee_name, sizeof pointee_name))
+            rc = GPU_IR_UNSUPPORTED;
+        else if (!dynamic.data && !words && shader_type_is_u32(shader, current_type_id))
+            rc = builder_appendf(&expression, "%s", base.expression);
+        else
+            rc = builder_appendf(&expression, "reinterpret_cast<constant %s*>(%s + %s)", pointee_name,
+                                 base.expression, offset.data);
+    } else if (rc == GPU_IR_OK) {
+        rc = builder_appendf(&expression, "%s", base.expression);
+    }
+    if (rc == GPU_IR_OK)
+        rc = symbols_add(mutable_symbols, instruction->result_id, instruction->result_type_id, 1, expression.data);
+    if (rc == GPU_IR_OK && base.descriptor_slot != UINT32_MAX)
+        rc = symbols_set_buffer_access(mutable_symbols, instruction->result_id, base.descriptor_slot,
+                                       offset.data, 0);
+    if (rc == GPU_IR_OK && !scalar)
+        rc = symbols_set_block_layout(mutable_symbols, instruction->result_id, offset.data, matrix_stride,
+                                      row_major, component_stride);
+    free(dynamic.data);
+    free(offset.data);
+    free(expression.data);
+    return rc;
+}
+
 static int emit_access_chain(const gpu_ir_shader *shader, const gpu_ir_shader_instruction *instruction,
                              const msl_symbols *symbols, msl_symbols *mutable_symbols) {
     uint32_t base_id;
@@ -1530,6 +1703,8 @@ static int emit_access_chain(const gpu_ir_shader *shader, const gpu_ir_shader_in
          pointer->storage_class != GPU_IR_SHADER_STORAGE_PUSH_CONSTANT &&
          pointer->storage_class != GPU_IR_SHADER_STORAGE_FUNCTION &&
          pointer->storage_class != GPU_IR_SHADER_STORAGE_WORKGROUP))) return GPU_IR_UNSUPPORTED;
+    if (pointer->storage_class == GPU_IR_SHADER_STORAGE_UNIFORM)
+        return emit_uniform_access_chain(shader, instruction, symbols, mutable_symbols, base, pointer);
     // symbols_add may reallocate the symbol array. Keep a value snapshot so the base
     // expression and access state remain valid after adding the derived pointer.
     const msl_symbol base_snapshot = *base;
@@ -1539,7 +1714,6 @@ static int emit_access_chain(const gpu_ir_shader *shader, const gpu_ir_shader_in
     uint32_t descriptor_array_element = UINT32_MAX;
     uint32_t buffer_descriptor_array_count = base->descriptor_array_count;
     uint32_t push_constant_offset = 0;
-    uint32_t uniform_buffer_offset = 0;
     uint32_t push_matrix_stride = 0;
     char *buffer_index_expression = base->buffer_index_expression ?
         msl_string_copy(base->buffer_index_expression) : NULL;
@@ -1717,12 +1891,6 @@ static int emit_access_chain(const gpu_ir_shader *shader, const gpu_ir_shader_in
                 push_matrix_stride = member_type && member_type->kind == GPU_IR_SHADER_TYPE_MATRIX &&
                     member->has_matrix_stride && !(member->decoration_flags & GPU_IR_SHADER_TYPE_FLAG_ROW_MAJOR) ?
                     member->matrix_stride : 0;
-            } else if (pointer->storage_class == GPU_IR_SHADER_STORAGE_UNIFORM) {
-                if (operand_index != 1 || current_type_id != pointer->element_type_id || !member->has_offset ||
-                    (member->offset & 3u) || member->offset > UINT32_MAX - uniform_buffer_offset) {
-                    rc = GPU_IR_UNSUPPORTED; break;
-                }
-                uniform_buffer_offset += member->offset;
             } else if (member_index != 0 || current->member_count != 1) {
                 rc = GPU_IR_UNSUPPORTED; break;
             }
@@ -1786,7 +1954,17 @@ static int emit_access_chain(const gpu_ir_shader *shader, const gpu_ir_shader_in
             rc = GPU_IR_UNSUPPORTED;
         }
     }
-    if (rc == GPU_IR_OK && pointer->storage_class == GPU_IR_SHADER_STORAGE_PUSH_CONSTANT) {
+    const gpu_ir_shader_type *push_pointee = shader_type(shader, current_type_id);
+    int push_matrix = pointer->storage_class == GPU_IR_SHADER_STORAGE_PUSH_CONSTANT && push_pointee &&
+        push_pointee->kind == GPU_IR_SHADER_TYPE_MATRIX && push_matrix_stride && !(push_matrix_stride & 3u);
+    char push_matrix_offset[16];
+    snprintf(push_matrix_offset, sizeof push_matrix_offset, "%u", push_constant_offset / 4u);
+    if (rc == GPU_IR_OK && push_matrix) {
+        // (a column-major matrix: emit_load gathers its columns from the block's words)
+        free(expression.data);
+        memset(&expression, 0, sizeof expression);
+        rc = builder_appendf(&expression, "%s", base->expression);
+    } else if (rc == GPU_IR_OK && pointer->storage_class == GPU_IR_SHADER_STORAGE_PUSH_CONSTANT) {
         char pointee_name[32];
         if ((push_constant_offset & 3u) ||
             !push_constant_type_name(shader, current_type_id, pointee_name, sizeof pointee_name)) {
@@ -1798,33 +1976,6 @@ static int emit_access_chain(const gpu_ir_shader *shader, const gpu_ir_shader_in
                                  pointee_name, base->expression, push_constant_offset / 4u);
         }
     }
-    if (rc == GPU_IR_OK && pointer->storage_class == GPU_IR_SHADER_STORAGE_UNIFORM &&
-        current_type_id != pointer->element_type_id) {
-        char pointee_name[32];
-        if ((uniform_buffer_offset & 3u) ||
-            !shader_type_name(shader, current_type_id, pointee_name, sizeof pointee_name)) {
-            rc = GPU_IR_UNSUPPORTED;
-        } else if (!shader_type_is_u32(shader, current_type_id) || uniform_buffer_offset) {
-            free(expression.data);
-            memset(&expression, 0, sizeof expression);
-            rc = builder_appendf(&expression, "reinterpret_cast<constant %s*>(%s + %u)",
-                                 pointee_name, base->expression, uniform_buffer_offset / 4u);
-        }
-        if (rc == GPU_IR_OK) {
-            char index[32];
-            int length = snprintf(index, sizeof index, "%u", uniform_buffer_offset / 4u);
-            if (length < 0 || (size_t)length >= sizeof index) {
-                rc = GPU_IR_RANGE;
-            } else {
-                char *copy = msl_string_copy(index);
-                if (!copy) rc = GPU_IR_OUT_OF_MEMORY;
-                else {
-                    free(buffer_index_expression);
-                    buffer_index_expression = copy;
-                }
-            }
-        }
-    }
     const gpu_ir_shader_type *result_pointer = shader_type(shader, instruction->result_type_id);
     if (rc == GPU_IR_OK && (!result_pointer || result_pointer->kind != GPU_IR_SHADER_TYPE_POINTER ||
         result_pointer->storage_class != pointer->storage_class || result_pointer->element_type_id != current_type_id))
@@ -1832,6 +1983,9 @@ static int emit_access_chain(const gpu_ir_shader *shader, const gpu_ir_shader_in
     if (rc == GPU_IR_OK) {
         rc = symbols_add(mutable_symbols, instruction->result_id,
             instruction->result_type_id, 1, expression.data ? expression.data : "");
+        if (rc == GPU_IR_OK && push_matrix)
+            rc = symbols_set_block_layout(mutable_symbols, instruction->result_id, push_matrix_offset,
+                                          push_matrix_stride, 0, 1);
         if (rc == GPU_IR_OK && descriptor_array_element != UINT32_MAX &&
             pointer->storage_class == GPU_IR_SHADER_STORAGE_UNIFORM_CONSTANT) {
             const gpu_ir_shader_type *array = shader_type(shader, pointer->element_type_id);
@@ -1904,6 +2058,66 @@ static int emit_buffer_bounds_condition(msl_builder *body, const msl_symbol *poi
                            pointer->buffer_index_expression, pointer->descriptor_slot);
 }
 
+// Gathers a vector or matrix from a uniform or push-constant block word by word: std140 and other layouts put
+// columns MatrixStride apart and need not align them as Metal's vector types are. From a uniform buffer the whole
+// value reads as zero unless it lies inside the bound range, as robust buffer access allows.
+static int emit_block_composite_load(const gpu_ir_shader *shader, const gpu_ir_shader_instruction *instruction,
+                                     const msl_symbol *pointer, msl_builder *body, msl_symbols *mutable_symbols) {
+    const gpu_ir_shader_type *type = shader_type(shader, instruction->result_type_id);
+    int matrix = type && type->kind == GPU_IR_SHADER_TYPE_MATRIX;
+    const gpu_ir_shader_type *column = matrix ? shader_type(shader, type->element_type_id) : type;
+    char type_name[32], column_name[32], scalar_name[32];
+    if (!type || !column || column->kind != GPU_IR_SHADER_TYPE_VECTOR ||
+        !shader_type_is_32bit_buffer_scalar(shader, column->element_type_id) ||
+        !shader_type_name(shader, type->id, type_name, sizeof type_name) ||
+        !shader_type_name(shader, column->id, column_name, sizeof column_name) ||
+        !shader_type_name(shader, column->element_type_id, scalar_name, sizeof scalar_name) ||
+        (matrix && (!pointer->block_matrix_stride || (pointer->block_matrix_stride & 3u))) ||
+        !pointer->block_component_stride) return GPU_IR_UNSUPPORTED;
+    uint32_t columns = matrix ? type->element_count : 1u, rows = column->element_count;
+    uint32_t column_step = !matrix ? 0u : pointer->block_row_major ? 1u : pointer->block_matrix_stride / 4u;
+    uint32_t row_step = matrix ? (pointer->block_row_major ? pointer->block_matrix_stride / 4u : 1u) :
+        pointer->block_component_stride;
+    uint64_t span = (uint64_t)(columns - 1u) * column_step + (uint64_t)(rows - 1u) * row_step + 1u;
+    // (a constant offset folds into each word's index)
+    char *end = NULL;
+    unsigned long constant_offset = strtoul(pointer->block_offset_expression, &end, 10);
+    int folded = end && end != pointer->block_offset_expression && !*end;
+    if (span > UINT32_MAX || (folded && constant_offset > UINT32_MAX - span)) return GPU_IR_UNSUPPORTED;
+    msl_builder value = { 0 };
+    int rc = matrix ? builder_appendf(&value, "%s(", type_name) : GPU_IR_OK;
+    for (uint32_t c = 0; rc == GPU_IR_OK && c < columns; c++) {
+        rc = builder_appendf(&value, "%s%s(", c ? ", " : "", column_name);
+        for (uint32_t r = 0; rc == GPU_IR_OK && r < rows; r++) {
+            uint32_t word = c * column_step + r * row_step;
+            rc = folded ? builder_appendf(&value, "%sas_type<%s>(%s[%u])", r ? ", " : "", scalar_name,
+                                          pointer->expression, (uint32_t)constant_offset + word) :
+                builder_appendf(&value, "%sas_type<%s>(%s[%s + %uu])", r ? ", " : "", scalar_name,
+                                pointer->expression, pointer->block_offset_expression, word);
+        }
+        if (rc == GPU_IR_OK) rc = builder_appendf(&value, ")");
+    }
+    if (rc == GPU_IR_OK && matrix) rc = builder_appendf(&value, ")");
+    if (rc == GPU_IR_OK && pointer->descriptor_slot != UINT32_MAX) {
+        rc = body->assign_values ? builder_appendf(body, "    vx_value_%u = %s(0);\n", instruction->result_id, type_name) :
+            builder_appendf(body, "    %s vx_value_%u = %s(0);\n", type_name, instruction->result_id, type_name);
+        if (rc == GPU_IR_OK)
+            rc = builder_appendf(body, "    if ((ulong(%s) + ulong(%u)) * ulong(4) <= vx_buffer_ranges[%u]) "
+                                 "vx_value_%u = %s;\n", pointer->block_offset_expression, (uint32_t)span,
+                                 pointer->descriptor_slot, instruction->result_id, value.data);
+    } else if (rc == GPU_IR_OK) {
+        rc = emit_value_lhs(shader, body, instruction);
+        if (rc == GPU_IR_OK) rc = builder_appendf(body, "%s;\n", value.data);
+    }
+    free(value.data);
+    if (rc == GPU_IR_OK) {
+        char name[48];
+        snprintf(name, sizeof name, "vx_value_%u", instruction->result_id);
+        rc = symbols_add(mutable_symbols, instruction->result_id, instruction->result_type_id, 0, name);
+    }
+    return rc;
+}
+
 static int emit_load(const gpu_ir_shader *shader, const gpu_ir_shader_instruction *instruction,
                      const msl_symbols *symbols, msl_builder *body, msl_symbols *mutable_symbols) {
     uint32_t pointer_id;
@@ -1932,6 +2146,10 @@ static int emit_load(const gpu_ir_shader *shader, const gpu_ir_shader_instructio
                 pointer_symbol->image_readable, pointer_symbol->image_writable);
         return rc;
     }
+    if (pointer_symbol->block_offset_expression &&
+        (pointer->storage_class == GPU_IR_SHADER_STORAGE_UNIFORM ||
+         pointer->storage_class == GPU_IR_SHADER_STORAGE_PUSH_CONSTANT))
+        return emit_block_composite_load(shader, instruction, pointer_symbol, body, mutable_symbols);
     char type_name[32];
     if (!shader_type_name(shader, instruction->result_type_id, type_name, sizeof type_name)) return GPU_IR_UNSUPPORTED;
     int rc;
@@ -2903,8 +3121,41 @@ static int emit_ordered_float_minmax(const gpu_ir_shader *shader,
     return rc;
 }
 
+// Metal's matrices are column vectors as SPIR-V's are, so its * is each of the four products (M * v, v * M, A * B,
+// M * s); the SPIR-V reader has checked the shapes.
+static int emit_matrix_arithmetic(const gpu_ir_shader *shader, const gpu_ir_shader_instruction *instruction,
+                                  const msl_symbols *symbols, msl_builder *body, msl_symbols *mutable_symbols) {
+    uint32_t left_id, right_id;
+    if (instruction->operand_count != 2 || instruction->literal_word_count ||
+        !instruction_id_operand(shader, instruction, 0, &left_id) ||
+        !instruction_id_operand(shader, instruction, 1, &right_id)) return GPU_IR_INVALID;
+    const msl_symbol *left = symbols_find(symbols, left_id), *right = symbols_find(symbols, right_id);
+    const gpu_ir_shader_type *left_type = left ? shader_type(shader, left->type_id) : NULL;
+    const gpu_ir_shader_type *right_type = right ? shader_type(shader, right->type_id) : NULL;
+    uint32_t operation = instruction->operation;
+    const gpu_ir_shader_type *matrix = operation == GPU_IR_SHADER_ARITH_VECTOR_TIMES_MATRIX ? right_type : left_type;
+    char left_name[32], right_name[32], result_name[32];
+    if (!left || !right || left->is_pointer || right->is_pointer || !matrix ||
+        matrix->kind != GPU_IR_SHADER_TYPE_MATRIX ||
+        !shader_type_name(shader, left->type_id, left_name, sizeof left_name) ||
+        !shader_type_name(shader, right->type_id, right_name, sizeof right_name) ||
+        !shader_type_name(shader, instruction->result_type_id, result_name, sizeof result_name))
+        return GPU_IR_UNSUPPORTED;
+    int rc = emit_value_lhs(shader, body, instruction);
+    if (rc == GPU_IR_OK) rc = builder_appendf(body, "(%s * %s);\n", left->expression, right->expression);
+    if (rc == GPU_IR_OK) {
+        char name[48];
+        snprintf(name, sizeof name, "vx_value_%u", instruction->result_id);
+        rc = symbols_add(mutable_symbols, instruction->result_id, instruction->result_type_id, 0, name);
+    }
+    return rc;
+}
+
 static int emit_arithmetic(const gpu_ir_shader *shader, const gpu_ir_shader_instruction *instruction,
                            const msl_symbols *symbols, msl_builder *body, msl_symbols *mutable_symbols) {
+    if (instruction->operation >= GPU_IR_SHADER_ARITH_MATRIX_TIMES_VECTOR &&
+        instruction->operation <= GPU_IR_SHADER_ARITH_MATRIX_TIMES_SCALAR)
+        return emit_matrix_arithmetic(shader, instruction, symbols, body, mutable_symbols);
     uint32_t left_id, right_id = 0, third_id = 0, fourth_id = 0;
     int vector_times_scalar = instruction->operation == GPU_IR_SHADER_ARITH_VECTOR_TIMES_SCALAR;
     int dot_operation = instruction->operation == GPU_IR_SHADER_ARITH_DOT;
@@ -5458,6 +5709,9 @@ static int emit_graphics_stage(const gpu_ir_shader *shader, const gpu_ir_pipelin
         switch (instruction->opcode) {
         case GPU_IR_SHADER_OP_VARIABLE:
             rc = emit_function_variable(shader, instruction, &symbols, &body, &symbols);
+            break;
+        case GPU_IR_SHADER_OP_ACCESS_CHAIN:
+            rc = emit_access_chain(shader, instruction, &symbols, &symbols);
             break;
         case GPU_IR_SHADER_OP_LOAD:
             rc = emit_load(shader, instruction, &symbols, &body, &symbols);

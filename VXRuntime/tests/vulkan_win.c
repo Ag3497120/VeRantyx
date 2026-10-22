@@ -1,8 +1,12 @@
 // Vulkan from a Windows program: imports its commands from vulkan-1.dll by name (as a program linked against the
 // Vulkan SDK's vulkan-1.lib does), draws a red triangle on blue into an offscreen image and reads its pixels back,
 // then draws the same into a window's swapchain and presents three frames, and checks a depth test: with a D32 depth
-// attachment cleared to 0.5 and LESS, a triangle at z 0.8 leaves the clear color and one at z 0.2 draws.
-//   vulkan_win.exe <vertex .spv> <fragment .spv>     (build/vulkan_spirv_vertex_fixture.spv, ..._fragment_fixture.spv)
+// attachment cleared to 0.5 and LESS, a triangle at z 0.8 leaves the clear color and one at z 0.2 draws. With the
+// uniform shaders it also draws through a uniform buffer and push constants: the vertex shader picks a mat4 from the
+// buffer by a pushed index, multiplies and adds a pushed offset; the fragment shader colors with a pushed color
+// times a tint from the same buffer.
+//   vulkan_win.exe <vertex .spv> <fragment .spv> [<uniform vertex .spv> <uniform fragment .spv>]
+//   (build/vulkan_spirv_vertex_fixture.spv, ..._fragment_fixture.spv, ..._uniform_vertex_fixture.spv, ...)
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,6 +160,8 @@ int main(int argc, char **argv) {
     int presented = 0;
     unsigned char center[4] = { 0 }, corner[4] = { 0 }, depth_center[2][4] = { { 0 } };
     unsigned char near_base[4] = { 0 }, near_apex[4] = { 0 }, culled[3][4] = { { 0 } };
+    unsigned char moved[4][4] = { { 0 } };
+    int uniform_drawn = 0;
 
     const char *instance_extensions[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vulkan_win",
@@ -388,7 +394,124 @@ int main(int argc, char **argv) {
     CHECK(culled[1][0] == 0 && culled[1][2] == 255);    // BACK, CW fronts: drawn, red
     CHECK(culled[2][0] == 0 && culled[2][2] == 255);    // FRONT, CCW fronts: drawn, red
 
-    // 4. A window's swapchain: the same picture, presented three times.
+    // 4. A uniform buffer and push constants. The block holds a tint and two matrices (std140: 16 + 2 x 64 bytes);
+    //    the pushed index picks the second, a translation by +0.5 in x, and the pushed offset adds +0.25 in y, so the
+    //    triangle's corners land at pixels (32, 24), (64, 24) and (48, 56). The fragment color is the tint (1, 1, 0, 1)
+    //    times the pushed (0, 1, 1, 1): green. The first matrix is zero (it would collapse the triangle). A second
+    //    draw in the same pass pushes new values, an offset of -1 in x and the color (1, 1, 1, 1): a yellow triangle
+    //    at (0, 24), (32, 24), (16, 56), while the first keeps its own.
+    if (argc >= 5) {
+        size_t uvs_size = 0, ufs_size = 0;
+        uint32_t *uvs_words = read_spv(argv[3], &uvs_size), *ufs_words = read_spv(argv[4], &ufs_size);
+        CHECK(uvs_words && ufs_words);
+        VkShaderModuleCreateInfo uvs_info = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                              .codeSize = uvs_size, .pCode = uvs_words };
+        VkShaderModuleCreateInfo ufs_info = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                              .codeSize = ufs_size, .pCode = ufs_words };
+        VkShaderModule uvs = 0, ufs = 0;
+        CHECK(vkCreateShaderModule(device, &uvs_info, NULL, &uvs) == VK_SUCCESS);
+        CHECK(vkCreateShaderModule(device, &ufs_info, NULL, &ufs) == VK_SUCCESS);
+        VkDescriptorSetLayoutBinding ubo_binding = {
+            .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT
+        };
+        VkDescriptorSetLayoutCreateInfo set_layout_info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &ubo_binding
+        };
+        VkDescriptorSetLayout set_layout = 0;
+        CHECK(vkCreateDescriptorSetLayout(device, &set_layout_info, NULL, &set_layout) == VK_SUCCESS);
+        VkPushConstantRange push_ranges[2] = { { VK_SHADER_STAGE_VERTEX_BIT, 0, 32 },
+                                               { VK_SHADER_STAGE_FRAGMENT_BIT, 32, 16 } };
+        VkPipelineLayoutCreateInfo uniform_layout_info = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &set_layout,
+            .pushConstantRangeCount = 2, .pPushConstantRanges = push_ranges
+        };
+        VkPipelineLayout uniform_layout = 0;
+        CHECK(vkCreatePipelineLayout(device, &uniform_layout_info, NULL, &uniform_layout) == VK_SUCCESS);
+
+        const float block[4 + 2 * 16] = {
+            1, 1, 0, 1,                                                         // tint
+            0, 0, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0,                  // transforms[0]: zero
+            1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0.5f, 0, 0, 1,               // transforms[1]: x + 0.5 (columns)
+        };
+        VkBufferCreateInfo ubo_info = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sizeof block,
+                                        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT };
+        VkBuffer ubo = 0;
+        CHECK(vkCreateBuffer(device, &ubo_info, NULL, &ubo) == VK_SUCCESS);
+        vkGetBufferMemoryRequirements(device, ubo, &req);
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = memory_type(gpu, req.memoryTypeBits,
+                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkDeviceMemory ubo_memory = 0;
+        CHECK(vkAllocateMemory(device, &alloc, NULL, &ubo_memory) == VK_SUCCESS);
+        CHECK(vkBindBufferMemory(device, ubo, ubo_memory, 0) == VK_SUCCESS);
+        CHECK(vkMapMemory(device, ubo_memory, 0, sizeof block, 0, &mapped) == VK_SUCCESS);
+        memcpy(mapped, block, sizeof block);
+        vkUnmapMemory(device, ubo_memory);
+
+        VkDescriptorPoolSize pool_size = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 };
+        VkDescriptorPoolCreateInfo descriptor_pool_info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1,
+            .pPoolSizes = &pool_size
+        };
+        VkDescriptorPool descriptor_pool = 0;
+        CHECK(vkCreateDescriptorPool(device, &descriptor_pool_info, NULL, &descriptor_pool) == VK_SUCCESS);
+        VkDescriptorSetAllocateInfo set_info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = descriptor_pool,
+            .descriptorSetCount = 1, .pSetLayouts = &set_layout
+        };
+        VkDescriptorSet set = 0;
+        CHECK(vkAllocateDescriptorSets(device, &set_info, &set) == VK_SUCCESS);
+        VkDescriptorBufferInfo ubo_descriptor = { ubo, 0, sizeof block };
+        VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &ubo_descriptor
+        };
+        vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+
+        VkPipeline uniform_pipeline = pipeline(device, offscreen_pass, uniform_layout, uvs, ufs, W, H);
+        CHECK(uniform_pipeline);
+        struct { float offset[4]; int32_t which, pad[3]; } vertex_push = { { 0, 0.25f, 0, 0 }, 1, { 0 } };
+        float fragment_push[4] = { 0, 1, 1, 1 };
+        CHECK(vkResetFences(device, 1, &fence) == VK_SUCCESS);
+        CHECK(vkResetCommandBuffer(cmd, 0) == VK_SUCCESS);
+        CHECK(vkBeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+        VkClearValue blue = { .color = { .float32 = { 0, 0, 1, 1 } } };
+        VkRenderPassBeginInfo uniform_begin = {
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = offscreen_pass, .framebuffer = offscreen_fb,
+            .renderArea = { { 0, 0 }, { W, H } }, .clearValueCount = 1, .pClearValues = &blue
+        };
+        vkCmdBeginRenderPass(cmd, &uniform_begin, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, uniform_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, uniform_layout, 0, 1, &set, 0, NULL);
+        vkCmdPushConstants(cmd, uniform_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof vertex_push, &vertex_push);
+        vkCmdPushConstants(cmd, uniform_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 32, sizeof fragment_push, fragment_push);
+        VkDeviceSize zero = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vertex_push.offset[0] = -1.0f;
+        fragment_push[0] = 1.0f;
+        vkCmdPushConstants(cmd, uniform_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof vertex_push, &vertex_push);
+        vkCmdPushConstants(cmd, uniform_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 32, sizeof fragment_push, fragment_push);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cmd);
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &region);
+        CHECK(vkEndCommandBuffer(cmd) == VK_SUCCESS);
+        CHECK(vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS);
+        CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS);
+        CHECK(vkMapMemory(device, rb_memory, 0, W * H * 4, 0, &mapped) == VK_SUCCESS);
+        memcpy(moved[0], (unsigned char *)mapped + (30 * W + 48) * 4, 4);    // inside the moved triangle
+        memcpy(moved[3], (unsigned char *)mapped + (30 * W + 16) * 4, 4);    // inside the second draw's
+        memcpy(moved[1], (unsigned char *)mapped + (32 * W + 32) * 4, 4);    // the old center, now left of it
+        memcpy(moved[2], (unsigned char *)mapped + (40 * W + 34) * 4, 4);    // left of its left edge
+        vkUnmapMemory(device, rb_memory);
+        CHECK(moved[0][0] == 0 && moved[0][1] == 255 && moved[0][2] == 0);  // green
+        CHECK(moved[1][0] == 255 && moved[1][1] == 0 && moved[2][0] == 255 && moved[2][1] == 0);  // blue
+        CHECK(moved[3][0] == 0 && moved[3][1] == 255 && moved[3][2] == 255);  // yellow
+        uniform_drawn = 1;
+    }
+
+    // 5. A window's swapchain: the same picture, presented three times.
     WNDCLASSA wc = { .lpfnWndProc = DefWindowProcA, .hInstance = GetModuleHandleA(NULL), .lpszClassName = "vulkan_win" };
     RegisterClassA(&wc);
     window = CreateWindowExA(0, "vulkan_win", "vulkan_win", WS_OVERLAPPEDWINDOW, 0, 0, 320, 240, NULL, NULL, wc.hInstance, NULL);
@@ -471,11 +594,16 @@ done:
     printf("vulkan from a Windows program: commands imported from vulkan-1.dll, offscreen triangle "
            "(center %02x%02x%02x%02x, corner %02x%02x%02x%02x as BGRA, y down: %s), D32 depth test LESS against 0.5 "
            "(z 0.8 alone: %02x%02x%02x, then z 0.2: %02x%02x%02x), culling (back/ccw %s, back/cw %s, front/ccw %s), "
+           "uniform mat4 picked by a pushed index and pushed colors (%s: %02x%02x%02x moved, %02x%02x%02x left, "
+           "%02x%02x%02x pushed again), "
            "%d frames presented: %s\n",
            center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2], corner[3],
            near_base[2] == 255 && near_apex[0] == 255 ? "yes" : "NO",
            depth_center[0][0], depth_center[0][1], depth_center[0][2], depth_center[1][0], depth_center[1][1],
            depth_center[1][2], culled[0][0] == 255 ? "culled" : "DRAWN", culled[1][2] == 255 ? "drawn" : "CULLED",
-           culled[2][2] == 255 ? "drawn" : "CULLED", presented, bad ? "FAILED" : "ok");
+           culled[2][2] == 255 ? "drawn" : "CULLED", uniform_drawn ? "drawn" : "NOT DRAWN",
+           moved[0][0], moved[0][1], moved[0][2], moved[1][0], moved[1][1], moved[1][2],
+           moved[3][0], moved[3][1], moved[3][2], presented,
+           bad ? "FAILED" : "ok");
     return bad ? 1 : 0;
 }

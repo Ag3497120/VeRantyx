@@ -570,7 +570,7 @@ gpu_ir_shader *gpu_ir_shader_create(const gpu_ir_shader_desc *desc) {
                          instruction->operation <= GPU_IR_SHADER_COMPOSITE_TRANSPOSE;
             else if (instruction->opcode == GPU_IR_SHADER_OP_ARITHMETIC)
                 valid &= instruction->operation >= GPU_IR_SHADER_ARITH_ADD &&
-                         instruction->operation <= GPU_IR_SHADER_ARITH_SUBGROUP_BIT_XOR &&
+                         instruction->operation <= GPU_IR_SHADER_ARITH_MATRIX_TIMES_SCALAR &&
                          ((instruction->operation != GPU_IR_SHADER_ARITH_BIT_COUNT &&
                            instruction->operation != GPU_IR_SHADER_ARITH_BIT_REVERSE &&
                            instruction->operation != GPU_IR_SHADER_ARITH_BIT_FIND_LSB &&
@@ -1662,6 +1662,13 @@ static int valid_descriptor_value(const gpu_ir_pipeline_layout *layout, gpu_ir_d
 
     switch (binding.kind) {
     case GPU_IR_DESCRIPTOR_UNIFORM_BUFFER:
+        // (the adapter's push-constant binding may carry its bytes inline: range bytes at backend_object, which
+        //  the state owns and frees with backend_release)
+        if (value->set == GPU_IR_INTERNAL_SET && value->binding_namespace == GPU_IR_INTERNAL_BINDING_NAMESPACE &&
+            value->binding == GPU_IR_INTERNAL_PUSH_CONSTANT_BINDING && !value->resource && value->backend_object) {
+            return value->range && !value->offset && !value->buffer_view && !value->backend_object_aux &&
+                   !value->auxiliary_resource;
+        }
         if (!gpu_ir_resource_is_buffer(resource) || value->buffer_view || value->backend_object_aux) return 0;
         break;
     case GPU_IR_DESCRIPTOR_STORAGE_BUFFER:

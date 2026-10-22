@@ -160,10 +160,26 @@ Descriptor-set layouts accept visibility in the supported compute, vertex, and f
 preserve that visibility in the shared GPU IR. Graphics pipelines consume fragment-stage combined image-sampler,
 sampled-image, and sampler descriptors, including fixed-size arrays. The frontend validates them against the Vulkan
 set layout, captures their values at each draw, checks the sampled image layout for image-bearing descriptors, and
-binds stage-local Metal texture and sampler slots. It does not yet support graphics storage images, graphics buffer
-descriptors, or push constants. The ordinary graphics descriptor tests compile each pipeline and record a draw; they
-do not submit those draws or verify sampled pixels.
-The compute path accepts read-only uniform-buffer descriptors whose block members are direct 32-bit integer or float scalars with explicit, aligned, nonoverlapping offsets, plus storage-buffer and dynamic-storage-buffer descriptors, including fixed-size descriptor arrays. Both ordinary and dynamic uniform-buffer descriptors are tested through descriptor snapshots and compute dispatch. It creates a compute pipeline from the selected SPIR-V entry point, lowers it through the
+binds stage-local Metal texture and sampler slots. Uniform-buffer descriptors (ordinary and dynamic) are accepted in
+both the vertex and the fragment stage, and push constants in ranges for the vertex, fragment or compute stage (ranges
+of different stages may share bytes). Each graphics stage gives the uniform and storage buffers visible to it Metal
+slots 0-13 in layout order (`gpu_ir_metal_graphics_buffer_slot`, the one rule the MSL emitter and the Metal binder
+share) and receives its runtime data at slot 30 as compute does: the push constants, then each slot's byte range for
+robust access. `vkCmdPushConstants` keeps a copy of the pushed bytes; each draw captures the uniform buffers and that
+copy (inline in the common descriptor state, so pushes between draws inside a render pass need no buffer update) and
+the backend binds them with `setVertexBuffer`/`setFragmentBuffer` and `setVertexBytes`/`setFragmentBytes`. Graphics
+storage buffers and storage images are not supported yet. `tests/vulkan_win.c` draws through them and reads the
+pixels back: the vertex shader takes a `mat4` from an std140 array in a uniform buffer by a pushed index, multiplies
+the position and adds a pushed offset; the fragment shader multiplies a pushed color by a tint from the same buffer.
+The other ordinary graphics descriptor tests compile each pipeline and record a draw; they do not submit those draws
+or verify sampled pixels.
+Uniform blocks may hold 32-bit integer and float scalars and vectors, float matrices (column- or row-major, with a
+`MatrixStride`), fixed-size arrays (`ArrayStride`) and nested structs, all at four-byte-aligned offsets. Access chains
+into them fold constant indices into a word offset and add dynamic 32-bit array, column and component indices times
+their stride; scalars are read through a cast pointer, vectors and matrices are gathered word by word (std140 columns
+need not have Metal's vector alignment), and a load returns zero unless the whole value lies inside the bound range.
+`OpMatrixTimesVector`, `OpVectorTimesMatrix`, `OpMatrixTimesMatrix` and `OpMatrixTimesScalar` on 32-bit float matrices
+lower to Metal's matrix products. The compute path accepts these read-only uniform-buffer descriptors, plus storage-buffer and dynamic-storage-buffer descriptors, including fixed-size descriptor arrays. Both ordinary and dynamic uniform-buffer descriptors are tested through descriptor snapshots and compute dispatch. It creates a compute pipeline from the selected SPIR-V entry point, lowers it through the
 shared GPU IR and MSL emitter, and submits direct or indirect dispatches on Metal. Device creation accepts
 `VK_KHR_maintenance1`, plus `VK_KHR_swapchain` when the instance enabled both Win32 surface prerequisites; other
 unimplemented extensions are rejected. Device creation also accepts
@@ -181,13 +197,13 @@ covered by the layout. `vkCmdPushConstants` validates stage/range coverage and r
 the Metal backend binds the command buffer's push-constant storage in a reserved runtime-data buffer slot. That buffer
 also carries descriptor byte-range metadata when buffer bounds checks are needed. SPIR-V
 push-constant reads currently lower 32-bit integer/float scalar or vector members, nested struct offsets, and fixed
-arrays or column-major matrices when access-chain indices are compile-time constants. Dynamic indices and row-major
-matrix access remain unsupported.
+arrays or column-major matrices (whole matrices load as one value) when access-chain indices are compile-time
+constants. Dynamic indices and row-major matrix access in push constants remain unsupported.
 Other storage/sampled-image shader shapes, formats, access operands and dimensions beyond the single-sample,
 non-arrayed 2D `Rgba8` storage and float32 sampled-image shader subset (Vulkan sampled formats include R8, RG8, RGBA8,
 BGRA8, RGBA16F and R32F), sampled/storage Vulkan array images, unsupported sampler features and sampling forms,
 depth/stencil image clears, stencil and depth-bounds tests, more than one color attachment, graphics pipelines beyond the documented triangle slice, vertex formats and shader inputs outside the float32 scalar/vector and scalar 32-bit signed/unsigned integer subset,
-non-float or non-default-interpolation varyings, uniform-buffer block vectors, array members, nested structs or non-32-bit scalar members,
+non-float or non-default-interpolation varyings, non-32-bit uniform-buffer members and whole-struct or whole-array uniform loads,
 timeline semaphores and broader WSI features remain unsupported; this frontend is not yet suitable for general Vulkan
 games or claimed as a conformant Vulkan implementation. The Win32 WSI path creates surfaces for live VXRuntime windows,
 reports the supported color format, FIFO mode, and surface capabilities, and provides the limited swapchain, acquire,
@@ -370,7 +386,7 @@ and [integer division definitions](https://registry.khronos.org/SPIR-V/specs/uni
 It maps core scalar/container types, scalar, null and composite constants, module-level undefined values, function
 parameters/calls, variables (including descriptor and stage-interface decorations), loads/stores with the core
 Volatile, Aligned and Nontemporal memory operands, access chains, runtime-array length, copies, common conversions, vector/composite
-construction, static vector-lane extraction and insertion, dynamic vector extraction and insertion, shuffles, matrix transpose, component-wise arithmetic including 32-bit integer `OpBitCount`, `OpBitReverse`, `OpBitFieldInsert`, `OpBitFieldSExtract` and `OpBitFieldUExtract`, float vector-times-scalar scaling, vector dot products, vector float remainder/modulo, subgroup-scope `OpGroupNonUniformAny`/`OpGroupNonUniformAll`, and `GLSL.std.450` `FMix`, comparisons, select/phi,
+construction, static vector-lane extraction and insertion, dynamic vector extraction and insertion, shuffles, matrix transpose, matrix products, component-wise arithmetic including 32-bit integer `OpBitCount`, `OpBitReverse`, `OpBitFieldInsert`, `OpBitFieldSExtract` and `OpBitFieldUExtract`, float vector-times-scalar scaling, vector dot products, vector float remainder/modulo, subgroup-scope `OpGroupNonUniformAny`/`OpGroupNonUniformAll`, and `GLSL.std.450` `FMix`, comparisons, select/phi,
 runtime-array length, control/memory barriers, structured merge instructions, branches, switch literals, and returns. Barrier records
 preserve the source operation and scope/semantics IDs. The MSL emitter lowers compute `OpControlBarrier` with
 Workgroup or Subgroup execution scope to `threadgroup_barrier` or `simdgroup_barrier`; it lowers supported

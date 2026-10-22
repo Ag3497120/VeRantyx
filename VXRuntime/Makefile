@@ -551,7 +551,7 @@ build/vulkan-1.def: build/vxrt
 build/libvulkan-1.a: build/vulkan-1.def
 	x86_64-w64-mingw32-dlltool -d $< -l $@ -m i386:x86-64
 
-build/vulkan_win.exe: tests/vulkan_win.c src/vx_vulkan.h build/libvulkan-1.a build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv
+build/vulkan_win.exe: tests/vulkan_win.c src/vx_vulkan.h build/libvulkan-1.a build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv build/vulkan_spirv_uniform_vertex_fixture.spv build/vulkan_spirv_uniform_fragment_fixture.spv
 	$(MINGW) -O1 -Wall -o $@ $< -Lbuild -lvulkan-1
 
 build/d3d12.exe: tests/d3d12.c tests/shaders12/sum_cs.dxil tests/shaders12/tri_vs.dxil tests/shaders12/tri_ps.dxil tests/shaders12/cmp_ps.dxil tests/shaders12/gather_ps.dxil tests/shaders12/gather_cmp_ps.dxil tests/shaders12/dim_ps.dxil tests/shaders12/dim1da_ps.dxil tests/shaders12/typed_buffer_cs.dxil tests/shaders12/typed_sint_buffer_cs.dxil tests/shaders12/integer_minmax_buffer_cs.dxil tests/shaders12/integer_mad_buffer_cs.dxil tests/shaders12/float_mad_buffer_cs.dxil tests/shaders12/float_minmax_buffer_cs.dxil tests/shaders12/signed_conversion_cs.dxil tests/shaders12/typed_float_buffer_cs.dxil tests/shaders12/texture_dimensions_cs.dxil tests/shaders12/texture_dimensions_msaa_cs.dxil tests/shaders12/texture_load_msaa_cs.dxil tests/shaders12/atomic_resources_cs.dxil tests/shaders12/texload_bounds_cs.dxil tests/shaders12/texload_array_bounds_cs.dxil tests/shaders12/texload_sint_bounds_cs.dxil tests/shaders12/texload_array_sint_bounds_cs.dxil tests/shaders12/texload_float_bounds_cs.dxil tests/shaders12/wave_ops_cs.dxil tests/shaders12/wave_ops_partial_cs.dxil
@@ -722,6 +722,12 @@ build/vulkan_spirv_vertex_fixture.spv: build/spirv_msl_test
 
 build/vulkan_spirv_fragment_fixture.spv: build/spirv_msl_test
 	build/spirv_msl_test --write-graphics-fragment-fixture $@
+
+build/vulkan_spirv_uniform_vertex_fixture.spv: build/spirv_msl_test
+	build/spirv_msl_test --write-graphics-uniform-vertex-fixture $@
+
+build/vulkan_spirv_uniform_fragment_fixture.spv: build/spirv_msl_test
+	build/spirv_msl_test --write-graphics-uniform-fragment-fixture $@
 
 build/vulkan_spirv_graphics_sampled_image_fixture.spv: build/spirv_msl_test
 	build/spirv_msl_test --write-graphics-sampled-image-fixture $@
@@ -1025,7 +1031,8 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/draw.exe
 	$(VXRT) build/compute.exe
 	$(VXRT) build/d3d12.exe
-	$(VXRT) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv
+	$(VXRT) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv \
+		build/vulkan_spirv_uniform_vertex_fixture.spv build/vulkan_spirv_uniform_fragment_fixture.spv
 	$(VXRT) build/input.exe
 	$(VXRT) build/audio.exe
 	$(VXRT) build/xaudio2.exe

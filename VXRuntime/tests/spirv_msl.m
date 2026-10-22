@@ -4549,6 +4549,211 @@ static int attachment_clear_on_metal(gpu_ir_metal_device *backend) {
     return wrong == 0;
 }
 
+// Graphics uniform buffers and push constants (tests/vulkan_win.c draws with these). The vertex shader is
+//   layout(set 0, binding 0) uniform U { vec4 tint; mat4 transforms[2]; } u;           (std140: 0, 16, stride 64)
+//   layout(push_constant) uniform P { vec4 offset; int which; } p;                     (0, 16)
+//   gl_Position = u.transforms[p.which] * position + p.offset;
+// and the fragment shader, with the same block and push constants from byte 32,
+//   layout(push_constant) uniform P { layout(offset = 32) vec4 color; } p;   color = u.tint * p.color;
+static int make_graphics_uniform_shader(uint32_t *words, size_t capacity, size_t *word_count, int vertex) {
+    if (!words || !word_count || capacity < 5) return 0;
+    words[0] = SPIRV_MAGIC;
+    words[1] = 0x00010600u;
+    words[2] = 0;
+    words[3] = vertex ? 36 : 24;
+    words[4] = 0;
+    size_t count = 5;
+#define OP(code, n, ...) do { \
+    const uint32_t operands_[] = { __VA_ARGS__ }; \
+    if (!append_instruction(words, capacity, &count, code, n, operands_)) return 0; \
+} while (0)
+    OP(17, 2, 1);                                     // Shader capability
+    OP(14, 3, 0, 1);                                  // Logical GLSL450 memory model
+    if (vertex) {
+        OP(15, 9, SPIRV_EXECUTION_MODEL_VERTEX, 25, 0x6e69616du, 0, 21, 22, 23, 24);
+        OP(71, 4, 7, 6, 64);                          // transforms[] ArrayStride 64
+        OP(71, 3, 11, 2);                             // U Block
+        OP(72, 5, 11, 0, 35, 0);                      // tint at 0
+        OP(72, 5, 11, 1, 35, 16);                     // transforms at 16,
+        OP(72, 4, 11, 1, 5);                          //   ColMajor,
+        OP(72, 5, 11, 1, 7, 16);                      //   MatrixStride 16
+        OP(71, 3, 13, 2);                             // P Block
+        OP(72, 5, 13, 0, 35, 0);                      // offset at 0
+        OP(72, 5, 13, 1, 35, 16);                     // which at 16
+        OP(71, 4, 21, 34, 0);                         // u: DescriptorSet 0
+        OP(71, 4, 21, 33, 0);                         //    Binding 0
+        OP(71, 4, 23, 30, 0);                         // position: Location 0
+        OP(71, 4, 24, 11, 0);                         // BuiltIn Position
+        OP(19, 2, 1);                                 // void
+        OP(22, 3, 2, 32);                             // float
+        OP(23, 4, 3, 2, 4);                           // vec4
+        OP(24, 4, 4, 3, 4);                           // mat4
+        OP(21, 4, 5, 32, 1);                          // int
+        OP(43, 4, 5, 8, 0);                           // int 0
+        OP(43, 4, 5, 9, 1);                           // int 1
+        OP(43, 4, 5, 10, 2);                          // int 2
+        OP(28, 4, 7, 4, 10);                          // mat4[2]
+        OP(30, 4, 11, 3, 7);                          // U
+        OP(32, 4, 12, 2, 11);                         // Uniform U*
+        OP(30, 4, 13, 3, 5);                          // P
+        OP(32, 4, 14, 9, 13);                         // PushConstant P*
+        OP(32, 4, 15, 1, 3);                          // Input vec4*
+        OP(32, 4, 16, 3, 3);                          // Output vec4*
+        OP(32, 4, 17, 2, 4);                          // Uniform mat4*
+        OP(32, 4, 18, 9, 3);                          // PushConstant vec4*
+        OP(32, 4, 19, 9, 5);                          // PushConstant int*
+        OP(33, 3, 20, 1);                             // void()
+        OP(59, 4, 12, 21, 2);                         // u
+        OP(59, 4, 14, 22, 9);                         // p
+        OP(59, 4, 15, 23, 1);                         // position
+        OP(59, 4, 16, 24, 3);                         // gl_Position
+        OP(54, 5, 1, 25, 0, 20);
+        OP(248, 2, 26);
+        OP(65, 5, 19, 27, 22, 9);                     // &p.which
+        OP(61, 4, 5, 28, 27);
+        OP(65, 6, 17, 29, 21, 9, 28);                 // &u.transforms[which] (a dynamic index)
+        OP(61, 4, 4, 30, 29);
+        OP(61, 4, 3, 31, 23);
+        OP(145, 5, 3, 32, 30, 31);                    // OpMatrixTimesVector
+        OP(65, 5, 18, 33, 22, 8);                     // &p.offset
+        OP(61, 4, 3, 34, 33);
+        OP(129, 5, 3, 35, 32, 34);                    // + offset
+        OP(62, 3, 24, 35);
+    } else {
+        OP(15, 8, SPIRV_EXECUTION_MODEL_FRAGMENT, 17, 0x6e69616du, 0, 14, 15, 16);
+        OP(16, 3, 17, 7);                             // OriginUpperLeft
+        OP(71, 3, 4, 2);                              // U Block (only tint)
+        OP(72, 5, 4, 0, 35, 0);
+        OP(71, 3, 6, 2);                              // P Block
+        OP(72, 5, 6, 0, 35, 32);                      // color at 32
+        OP(71, 4, 14, 34, 0);
+        OP(71, 4, 14, 33, 0);
+        OP(71, 4, 16, 30, 0);                         // output: Location 0
+        OP(19, 2, 1);
+        OP(22, 3, 2, 32);
+        OP(23, 4, 3, 2, 4);
+        OP(30, 3, 4, 3);                              // U
+        OP(32, 4, 5, 2, 4);
+        OP(30, 3, 6, 3);                              // P
+        OP(32, 4, 7, 9, 6);
+        OP(32, 4, 8, 3, 3);                           // Output vec4*
+        OP(21, 4, 9, 32, 1);
+        OP(43, 4, 9, 10, 0);
+        OP(32, 4, 11, 2, 3);                          // Uniform vec4*
+        OP(32, 4, 12, 9, 3);                          // PushConstant vec4*
+        OP(33, 3, 13, 1);
+        OP(59, 4, 5, 14, 2);                          // u
+        OP(59, 4, 7, 15, 9);                          // p
+        OP(59, 4, 8, 16, 3);                          // output
+        OP(54, 5, 1, 17, 0, 13);
+        OP(248, 2, 18);
+        OP(65, 5, 11, 19, 14, 10);                    // &u.tint
+        OP(61, 4, 3, 20, 19);
+        OP(65, 5, 12, 21, 15, 10);                    // &p.color
+        OP(61, 4, 3, 22, 21);
+        OP(133, 5, 3, 23, 20, 22);                    // tint * color
+        OP(62, 3, 16, 23);
+    }
+    OP(253, 1);
+    OP(56, 1);
+#undef OP
+    *word_count = count;
+    return 1;
+}
+
+// Writes the stage's SPIR-V after checking its MSL under the pipeline layout vulkan_win.exe builds (the block at
+// binding 0 for both stages, push constants for both) and compiling it with Metal.
+static int write_graphics_uniform_fixture(const char *path, int vertex) {
+    uint32_t words[512] = { 0 };
+    size_t word_count = 0;
+    spirv_module module = { 0 };
+    gpu_ir_shader *shader = NULL;
+    gpu_ir_pipeline_layout *reflected = NULL, *layout = NULL;
+    char *source = NULL;
+    size_t source_size = 0;
+    int ok = 0;
+    if (!path || !make_graphics_uniform_shader(words, sizeof words / sizeof words[0], &word_count, vertex) ||
+        spirv_read(words, word_count * sizeof words[0], &module) != SPIRV_OK) goto done;
+    const spirv_entry_point *entry = spirv_find_entry_point(&module, "main",
+        vertex ? SPIRV_EXECUTION_MODEL_VERTEX : SPIRV_EXECUTION_MODEL_FRAGMENT);
+    gpu_ir_push_constant_range reflected_push = { 0 };
+    gpu_ir_descriptor_binding reflected_binding = { 0 };
+    if (!entry || spirv_build_gpu_ir_shader(&module, entry, &shader) != GPU_IR_OK ||
+        spirv_build_gpu_ir_layout(&module, entry, &reflected) != GPU_IR_OK ||
+        gpu_ir_pipeline_layout_binding_count(reflected) != 1 ||
+        gpu_ir_pipeline_layout_binding_at(reflected, 0, &reflected_binding) != GPU_IR_OK ||
+        reflected_binding.kind != GPU_IR_DESCRIPTOR_UNIFORM_BUFFER ||
+        gpu_ir_pipeline_layout_push_constant_count(reflected) != 1 ||
+        gpu_ir_pipeline_layout_push_constant_at(reflected, 0, &reflected_push) != GPU_IR_OK ||
+        reflected_push.offset != (vertex ? 0u : 32u) || reflected_push.size != (vertex ? 20u : 16u)) {
+        fprintf(stderr, "spirv_msl: graphics uniform %s shader did not lower or reflect\n",
+                vertex ? "vertex" : "fragment");
+        goto done;
+    }
+    gpu_ir_descriptor_binding bindings[2] = {
+        { .set = 0, .binding = 0, .kind = GPU_IR_DESCRIPTOR_UNIFORM_BUFFER, .count = 1,
+          .stage_mask = GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT, .access_mask = GPU_IR_ACCESS_UNIFORM_READ },
+        { .set = GPU_IR_INTERNAL_SET, .binding = GPU_IR_INTERNAL_PUSH_CONSTANT_BINDING,
+          .kind = GPU_IR_DESCRIPTOR_UNIFORM_BUFFER, .count = 1,
+          .stage_mask = GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT, .access_mask = GPU_IR_ACCESS_UNIFORM_READ,
+          .binding_namespace = GPU_IR_INTERNAL_BINDING_NAMESPACE }
+    };
+    gpu_ir_push_constant_range ranges[2] = { { 0, 32, GPU_IR_STAGE_VERTEX }, { 32, 16, GPU_IR_STAGE_FRAGMENT } };
+    gpu_ir_pipeline_layout_desc desc = { bindings, 2, ranges, 2 };
+    layout = gpu_ir_pipeline_layout_create(&desc);
+    int emit_rc = !layout ? GPU_IR_OUT_OF_MEMORY : vertex ?
+        gpu_ir_msl_emit_vertex_with_layout(shader, layout, &source, &source_size) :
+        gpu_ir_msl_emit_fragment_with_layout(shader, layout, &source, &source_size);
+    // (the block at slot 0, the runtime data at 30; the matrix gathered at 16 + 16 * which words, the whole of it
+    //  inside the bound range or zero)
+    const char *expected[] = {
+        "constant uint* vx_uniform_21 [[buffer(0)]]", "constant uchar* vx_runtime_data [[buffer(30)]]",
+        "as_type<float>(vx_uniform_21[(4u + uint(vx_value_28) * 16u) + 15u])",
+        "if ((ulong((4u + uint(vx_value_28) * 16u)) + ulong(16)) * ulong(4) <= vx_buffer_ranges[0])",
+        "(vx_value_30 * vx_value_31)", "reinterpret_cast<constant int*>(reinterpret_cast<constant uint*>(vx_runtime_data) + 4)"
+    };
+    const char *expected_fragment[] = {
+        "constant uint* vx_uniform_14 [[buffer(0)]]", "constant uchar* vx_runtime_data [[buffer(30)]]",
+        "as_type<float>(vx_uniform_14[3])", "reinterpret_cast<constant float4*>(reinterpret_cast<constant uint*>(vx_runtime_data) + 8)"
+    };
+    if (emit_rc != GPU_IR_OK || !source) {
+        fprintf(stderr, "spirv_msl: graphics uniform %s MSL emission failed (%d)\n", vertex ? "vertex" : "fragment",
+                emit_rc);
+        goto done;
+    }
+    const char **want = vertex ? expected : expected_fragment;
+    size_t want_count = vertex ? sizeof expected / sizeof expected[0] : sizeof expected_fragment / sizeof expected_fragment[0];
+    for (size_t i = 0; i < want_count; i++)
+        if (!strstr(source, want[i])) {
+            fprintf(stderr, "spirv_msl: graphics uniform MSL lacks %s\n%s", want[i], source);
+            goto done;
+        }
+    @autoreleasepool {
+        id<MTLDevice> metal_device = MTLCreateSystemDefaultDevice();
+        NSError *metal_error = nil;
+        NSString *metal_source = [[NSString alloc] initWithBytes:source length:source_size
+                                                        encoding:NSUTF8StringEncoding];
+        id<MTLLibrary> library = metal_device && metal_source ?
+            [metal_device newLibraryWithSource:metal_source options:nil error:&metal_error] : nil;
+        if (!library || ![library newFunctionWithName:vertex ? @"vx_vertex" : @"vx_fragment"]) {
+            fprintf(stderr, "spirv_msl: graphics uniform MSL did not compile: %s\n%s",
+                    metal_error ? metal_error.localizedDescription.UTF8String : "", source);
+            goto done;
+        }
+    }
+    FILE *file = fopen(path, "wb");
+    if (!file) goto done;
+    ok = fwrite(words, sizeof words[0], word_count, file) == word_count && !ferror(file);
+    if (fclose(file)) ok = 0;
+done:
+    free(source);
+    gpu_ir_pipeline_layout_release(layout);
+    gpu_ir_pipeline_layout_release(reflected);
+    gpu_ir_shader_release(shader);
+    spirv_free(&module);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--check-graphics-stage"))
         return check_graphics_stage_msl() ? 0 : 1;
@@ -4781,6 +4986,15 @@ int main(int argc, char **argv) {
         if (!write_dynamic_sampled_image_array_fixture(argv[2], 0, 28)) {
             fprintf(stderr, "spirv_msl: could not write nonuniform sampled-image-array SPIR-V fixture: %s\n",
                     argv[2]);
+            return 1;
+        }
+        return 0;
+    }
+    if (argc == 3 && (!strcmp(argv[1], "--write-graphics-uniform-vertex-fixture") ||
+                      !strcmp(argv[1], "--write-graphics-uniform-fragment-fixture"))) {
+        int vertex = !strcmp(argv[1], "--write-graphics-uniform-vertex-fixture");
+        if (!write_graphics_uniform_fixture(argv[2], vertex)) {
+            fprintf(stderr, "spirv_msl: could not write graphics uniform SPIR-V fixture: %s\n", argv[2]);
             return 1;
         }
         return 0;

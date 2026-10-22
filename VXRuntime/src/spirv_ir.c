@@ -1783,6 +1783,46 @@ static int gpu_shader_emit_function_instruction(const spirv_module *module,
         flags = GPU_IR_SHADER_FLAG_FLOAT;
         break;
     }
+    case 143: case 144: case 145: case 146: { // OpMatrixTimesScalar, VectorTimesMatrix, MatrixTimesVector, ...Matrix
+        if (n != 5) return GPU_IR_INVALID;
+        const spirv_id_record *result = gpu_shader_type_record(module, w[1]);
+        const spirv_id_record *left = gpu_shader_type_record(module, gpu_shader_value_type_id(module, w[3]));
+        const spirv_id_record *right = gpu_shader_type_record(module, gpu_shader_value_type_id(module, w[4]));
+        // (the matrix operands: their column vectors and the float scalar beneath)
+        const spirv_id_record *matrix = opcode == 144 ? right : left;
+        const spirv_id_record *column = matrix && matrix->type_kind == SPIRV_TYPE_MATRIX ?
+            gpu_shader_type_record(module, matrix->element_type) : NULL;
+        const spirv_id_record *scalar = column && column->type_kind == SPIRV_TYPE_VECTOR ?
+            gpu_shader_type_record(module, column->element_type) : NULL;
+        if (!result || !left || !right || !column || !scalar) return GPU_IR_INVALID;
+        if (scalar->type_kind != SPIRV_TYPE_FLOAT || scalar->width != 32) return GPU_IR_UNSUPPORTED;
+        int valid;
+        if (opcode == 143)          // M * s: the matrix's type, a scalar of its component type
+            valid = result->id == left->id && right->id == scalar->id;
+        else if (opcode == 145)     // M * v: v has one component per column, the result one per row
+            valid = right->type_kind == SPIRV_TYPE_VECTOR && right->element_type == scalar->id &&
+                    right->element_count == matrix->element_count && result->id == column->id;
+        else if (opcode == 144)     // v * M: v has one component per row, the result one per column
+            valid = left->type_kind == SPIRV_TYPE_VECTOR && left->id == column->id &&
+                    result->type_kind == SPIRV_TYPE_VECTOR && result->element_type == scalar->id &&
+                    result->element_count == matrix->element_count;
+        else {                      // A * B: A's columns are the result's, B has a row per column of A
+            const spirv_id_record *right_column = right->type_kind == SPIRV_TYPE_MATRIX ?
+                gpu_shader_type_record(module, right->element_type) : NULL;
+            valid = right_column && right_column->type_kind == SPIRV_TYPE_VECTOR &&
+                    right_column->element_type == scalar->id && right_column->element_count == left->element_count &&
+                    result->type_kind == SPIRV_TYPE_MATRIX && result->element_type == column->id &&
+                    result->element_count == right->element_count;
+        }
+        if (!valid) return GPU_IR_INVALID;
+        ir_opcode = GPU_IR_SHADER_OP_ARITHMETIC;
+        operation = opcode == 143 ? GPU_IR_SHADER_ARITH_MATRIX_TIMES_SCALAR :
+                    opcode == 144 ? GPU_IR_SHADER_ARITH_VECTOR_TIMES_MATRIX :
+                    opcode == 145 ? GPU_IR_SHADER_ARITH_MATRIX_TIMES_VECTOR : GPU_IR_SHADER_ARITH_MATRIX_TIMES_MATRIX;
+        result_type = w[1]; result_id = w[2]; ids = w + 3; id_count = 2;
+        flags = GPU_IR_SHADER_FLAG_FLOAT;
+        break;
+    }
     case 148: { // OpDot
         if (n != 5) return GPU_IR_INVALID;
         const spirv_id_record *result = gpu_shader_type_record(module, w[1]);

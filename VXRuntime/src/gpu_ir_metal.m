@@ -1460,15 +1460,73 @@ static int graphics_descriptor_slots(const gpu_ir_pipeline_layout *layout,
         GPU_IR_OK : GPU_IR_NOT_FOUND;
 }
 
+// A graphics stage's buffers: uniform and storage buffers at the slots gpu_ir_metal_graphics_buffer_slot gives, and
+// its runtime data (push constants from the adapter's internal binding, carried inline, then each slot's range).
+static int encode_graphics_stage_buffers(gpu_ir_metal_submission *submission, const gpu_ir_descriptor_state *state,
+                                         uint32_t stage) {
+    const gpu_ir_pipeline_layout *layout = gpu_ir_descriptor_state_layout(state);
+    id<MTLRenderCommandEncoder> encoder = submission->render_encoder;
+    MTLRenderStages metal_stage = stage == GPU_IR_STAGE_VERTEX ? MTLRenderStageVertex : MTLRenderStageFragment;
+    uint8_t runtime_data[GPU_IR_METAL_RUNTIME_DATA_SIZE] = { 0 };
+    uint64_t *ranges = (uint64_t *)(runtime_data + GPU_IR_METAL_MAX_PUSH_CONSTANT_SIZE);
+    int has_runtime_data = 0;
+    for (uint32_t i = 0; i < gpu_ir_descriptor_state_value_count(state); i++) {
+        gpu_ir_descriptor_value value;
+        if (gpu_ir_descriptor_state_value_at(state, i, &value) != GPU_IR_OK) return GPU_IR_INVALID;
+        if (!(value.stage_mask & stage)) continue;
+        if (value.set == GPU_IR_INTERNAL_SET && value.binding_namespace == GPU_IR_INTERNAL_BINDING_NAMESPACE &&
+            value.binding == GPU_IR_INTERNAL_PUSH_CONSTANT_BINDING) {
+            if (value.resource || !value.backend_object || value.range > GPU_IR_METAL_MAX_PUSH_CONSTANT_SIZE)
+                return GPU_IR_UNSUPPORTED;
+            memcpy(runtime_data, value.backend_object, (size_t)value.range);
+            has_runtime_data = 1;
+            continue;
+        }
+        if (value.kind != GPU_IR_DESCRIPTOR_UNIFORM_BUFFER && value.kind != GPU_IR_DESCRIPTOR_STORAGE_BUFFER) continue;
+        uint32_t slot = 0;
+        int rc = gpu_ir_metal_graphics_buffer_slot(layout, stage, value.set, value.binding_namespace, value.binding,
+                                                   &slot);
+        if (rc != GPU_IR_OK) return rc;
+        if (value.array_element >= GPU_IR_METAL_MAX_GRAPHICS_BUFFERS - slot) return GPU_IR_RANGE;
+        slot += value.array_element;
+        has_runtime_data = 1;
+        if (value.flags & GPU_IR_DESCRIPTOR_VALUE_NULL) {
+            if (stage == GPU_IR_STAGE_VERTEX) [encoder setVertexBuffer:nil offset:0 atIndex:slot];
+            else [encoder setFragmentBuffer:nil offset:0 atIndex:slot];
+            continue;
+        }
+        id<MTLBuffer> buffer = value.resource && gpu_ir_resource_is_buffer(value.resource) ?
+            (__bridge id<MTLBuffer>)gpu_ir_backend_object(value.resource) : nil;
+        if (!buffer || value.buffer_view || value.offset > buffer.length) return GPU_IR_INVALID;
+        uint64_t range = value.range ? value.range : buffer.length - value.offset;
+        if (range > buffer.length - value.offset) return GPU_IR_RANGE;
+        ranges[slot] = range;
+        if (stage == GPU_IR_STAGE_VERTEX) [encoder setVertexBuffer:buffer offset:(NSUInteger)value.offset atIndex:slot];
+        else [encoder setFragmentBuffer:buffer offset:(NSUInteger)value.offset atIndex:slot];
+        MTLResourceUsage usage = metal_resource_usage(value.access_mask);
+        if (usage) [encoder useResource:buffer usage:usage stages:metal_stage];
+    }
+    if (!has_runtime_data) return GPU_IR_OK;
+    if (stage == GPU_IR_STAGE_VERTEX)
+        [encoder setVertexBytes:runtime_data length:sizeof runtime_data atIndex:GPU_IR_METAL_BUFFER_RANGE_SLOT];
+    else
+        [encoder setFragmentBytes:runtime_data length:sizeof runtime_data atIndex:GPU_IR_METAL_BUFFER_RANGE_SLOT];
+    return GPU_IR_OK;
+}
+
 static int encode_graphics_descriptor_state(gpu_ir_metal_submission *submission,
                                             const gpu_ir_descriptor_state *state) {
     if (!submission || !submission->render_encoder || !state) return GPU_IR_INVALID;
     const gpu_ir_pipeline_layout *layout = gpu_ir_descriptor_state_layout(state);
     if (!layout) return GPU_IR_INVALID;
+    int buffers_rc = encode_graphics_stage_buffers(submission, state, GPU_IR_STAGE_VERTEX);
+    if (buffers_rc == GPU_IR_OK) buffers_rc = encode_graphics_stage_buffers(submission, state, GPU_IR_STAGE_FRAGMENT);
+    if (buffers_rc != GPU_IR_OK) return buffers_rc;
     for (uint32_t i = 0; i < gpu_ir_descriptor_state_value_count(state); i++) {
         gpu_ir_descriptor_value value;
         if (gpu_ir_descriptor_state_value_at(state, i, &value) != GPU_IR_OK) return GPU_IR_INVALID;
-        if (!(value.stage_mask & GPU_IR_STAGE_FRAGMENT)) continue;
+        if (!(value.stage_mask & GPU_IR_STAGE_FRAGMENT) || value.set == GPU_IR_INTERNAL_SET ||
+            value.kind == GPU_IR_DESCRIPTOR_UNIFORM_BUFFER || value.kind == GPU_IR_DESCRIPTOR_STORAGE_BUFFER) continue;
         gpu_ir_descriptor_binding binding;
         int rc = gpu_ir_pipeline_layout_find_binding_for_stage(layout, value.set, value.binding_namespace,
             value.binding, GPU_IR_STAGE_FRAGMENT, &binding);
@@ -1518,6 +1576,9 @@ static int metal_bind_descriptor_state(void *context, const gpu_ir_descriptor_st
         if (rc == GPU_IR_OK) submission->descriptors = state;
         return rc;
     }
+    // (the new state replaces the old one, which a new compute encoder must not re-encode first: a graphics state
+    //  can name runtime data only its stages carry)
+    submission->descriptors = NULL;
     int rc = ensure_compute_encoder(submission);
     if (rc != GPU_IR_OK) return rc;
     rc = encode_descriptor_state(submission, state);

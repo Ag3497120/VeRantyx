@@ -2068,7 +2068,7 @@ static int run_push_constants(VkDevice device, VkQueue queue, VkCommandBuffer co
     CHECK(vkCreatePipelineLayout(device, &invalid_layout_info, NULL, &invalid_layout) ==
           VK_ERROR_INITIALIZATION_FAILED && invalid_layout == 0);
     invalid_range = push_range;
-    invalid_range.stageFlags = 1u; // Vertex stage is not implemented by this Vulkan device.
+    invalid_range.stageFlags = 8u; // The geometry stage is not implemented by this Vulkan device.
     CHECK(vkCreatePipelineLayout(device, &invalid_layout_info, NULL, &invalid_layout) ==
           VK_ERROR_FEATURE_NOT_PRESENT && invalid_layout == 0);
     VkPipelineLayout pipeline_layout = 0;

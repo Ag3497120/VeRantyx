@@ -18,6 +18,32 @@
 #define GPU_IR_METAL_MAX_PUSH_CONSTANT_SIZE 128u
 #define GPU_IR_METAL_RUNTIME_DATA_SIZE \
     (GPU_IR_METAL_MAX_PUSH_CONSTANT_SIZE + GPU_IR_METAL_MAX_COMPUTE_STORAGE_BUFFERS * 8u)
+#define GPU_IR_METAL_MAX_GRAPHICS_BUFFERS GPU_IR_METAL_VERTEX_BUFFER_BASE
+
+// Buffer slots of a graphics stage, one rule for the MSL emitter and the Metal binder: the uniform and storage buffer
+// bindings visible to the stage take consecutive slots from 0 in layout order (one per array element), below the
+// vertex buffers; the stage's runtime data, laid out as compute's (push constants, then the byte range of each
+// slot for robust access), goes at GPU_IR_METAL_BUFFER_RANGE_SLOT.
+static inline int gpu_ir_metal_graphics_buffer_slot(const gpu_ir_pipeline_layout *layout, uint32_t stage_mask,
+                                                    uint32_t set, uint32_t binding_namespace, uint32_t binding,
+                                                    uint32_t *slot) {
+    if (!layout || !slot) return GPU_IR_INVALID;
+    uint32_t next = 0;
+    for (uint32_t i = 0; i < gpu_ir_pipeline_layout_binding_count(layout); i++) {
+        gpu_ir_descriptor_binding entry;
+        if (gpu_ir_pipeline_layout_binding_at(layout, i, &entry) != GPU_IR_OK) return GPU_IR_INVALID;
+        if (!(entry.stage_mask & stage_mask) || entry.set == GPU_IR_INTERNAL_SET ||
+            (entry.kind != GPU_IR_DESCRIPTOR_UNIFORM_BUFFER && entry.kind != GPU_IR_DESCRIPTOR_STORAGE_BUFFER))
+            continue;
+        if (!entry.count || entry.count > GPU_IR_METAL_MAX_GRAPHICS_BUFFERS - next) return GPU_IR_UNSUPPORTED;
+        if (entry.set == set && entry.binding_namespace == binding_namespace && entry.binding == binding) {
+            *slot = next;
+            return GPU_IR_OK;
+        }
+        next += entry.count;
+    }
+    return GPU_IR_NOT_FOUND;
+}
 
 typedef struct gpu_ir_metal_device gpu_ir_metal_device;
 
