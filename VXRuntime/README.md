@@ -1,7 +1,9 @@
 # VXRuntime: running Windows programs on Apple silicon without Wine
 
 A research project inside VeRantyx: a Windows compatibility layer written from scratch for Apple silicon
-Macs, meant to eventually replace Wine for the Wine version of VeRantyx. Results are expected to come slowly;
+Macs, meant to eventually replace Wine for the Wine version of VeRantyx. It uses no Wine code, except about 120 lines
+of the x64 unwinder in `src/seh.c` in versions from 2026-10-12 to 2026-10-23, which were derived from Wine and have
+since been replaced (see [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)). Results are expected to come slowly;
 each milestone is a small Windows program that has to run unchanged. What vxrt is, how it is put together and how
 the vxrt version compares with the Wine and native versions: [the repository README](../README.md#the-vxrt-version-vxruntime)
 ([日本語](../docs/README_ja.md#vxrt版vxruntime)). It is the `vxrt` branch's version of VeRantyx.

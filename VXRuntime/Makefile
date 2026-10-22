@@ -31,7 +31,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Hypervisor build/libvxrt_vm.dylib build/guest.o -licucore
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
-tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/breakpoint.exe build/child_stdout.exe \
+tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
        build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe
 
@@ -60,6 +60,10 @@ build/seh_try.exe: tests/seh_try.c
 	@mkdir -p build
 	clang --target=x86_64-w64-mingw32 -fms-extensions -O1 -isystem $(shell $(MINGW) -print-sysroot)/x86_64-w64-mingw32/include -c -o build/seh_try.o $<
 	$(MINGW) -static -o $@ build/seh_try.o
+
+build/unwind.exe: tests/unwind.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $<
 
 build/breakpoint.exe: tests/breakpoint.c
 	@mkdir -p build
@@ -1007,6 +1011,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/cxx_exceptions.exe
 	$(VXRT) build/hw_exceptions.exe
 	$(VXRT) build/seh_try.exe
+	$(VXRT) build/unwind.exe
 	$(VXRT) build/breakpoint.exe
 	$(VXRT) build/child_stdout.exe
 	$(VXRT) build/lowmem.exe

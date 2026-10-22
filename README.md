@@ -99,11 +99,14 @@ worked around).
 
 ## Under the hood
 
-Everything below is in this repository, MIT licensed, and was written for this project.
+Everything below is in this repository, MIT licensed, and was written for this project (with the exceptions listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 
 - **VXRuntime — a Windows runtime written from scratch for Apple silicon.** No Wine, no wineserver: a PE loader and
   the Windows API (kernel32, exceptions, files and registry, windows on AppKit, COM, audio on Core Audio) as native
-  code that Windows programs call directly. [VXRuntime/](VXRuntime/README.md)
+  code that Windows programs call directly. It uses no Wine code, except about 120 lines of the x64 exception
+  unwinder in versions from 2026-10-12 to 2026-10-23 (mac-v0.1.0, mac-v0.2.0), which were derived from Wine and have
+  since been replaced ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). [VXRuntime/](VXRuntime/README.md)
 - **Direct3D 11 → Metal in one step.** Our own DXBC → Metal Shading Language translator; geometry shaders and
   stream output run as compute. Alyx went from ~30 fps under Wine (DXVK → MoltenVK) to 60 fps on the same Mac.
 - **Direct3D 12 → Metal, from scratch (early).** A DXIL reader with no LLVM, a DXIL → MSL translator and `d3d12.dll`
@@ -139,4 +142,5 @@ Mac only. Licenses: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Not affili
 Meta, Nintendo, Sony, ALVR, Glovebox or Klepton.
 
 **Help wanted:** a Quest or Pico report (works or not), and game profiles with harness runs as evidence
-([games/README.md](games/README.md)). MIT © 2026 Ag3497120.
+([games/README.md](games/README.md)). MIT © 2026 Ag3497120 (earlier versions contained about 120 lines of
+Wine-derived LGPL code: see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).

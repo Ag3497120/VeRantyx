@@ -7,9 +7,12 @@ run. Read this file before you change anything.
 
 ## What this repository is
 
-- **VXRuntime (`VXRuntime/`)**: a Windows runtime written from scratch for Apple silicon (no Wine). One macOS
-  x86-64 process under Rosetta; Windows APIs are C/Objective-C functions (`VXRuntime/src`), Direct3D 11 is translated
-  to Metal by our own DXBC→MSL translator (`dxbc.c`, `d3d11*.m`), OpenGL goes to macOS's OpenGL (`opengl.c`).
+- **VXRuntime (`VXRuntime/`)**: a Windows runtime written from scratch for Apple silicon, with no Wine code (about
+  120 lines of the x64 unwinder in earlier versions were derived from Wine and have been replaced:
+  `THIRD_PARTY_NOTICES.md`). Never copy or translate code from Wine, ReactOS or other LGPL/GPL projects; work from
+  Microsoft's documentation and observed behaviour. One macOS x86-64 process under Rosetta; Windows APIs are
+  C/Objective-C functions (`VXRuntime/src`), Direct3D 11 is translated to Metal by our own DXBC→MSL translator
+  (`dxbc.c`, `d3d11*.m`), OpenGL goes to macOS's OpenGL (`opengl.c`).
   `VXRuntime/README.md` has the design and the history of every milestone.
 - **SteamVR on VXRuntime**: the real Windows SteamVR runs on VXRuntime with our driver (`VRDriver/`), which hands the
   frames to the Mac encoder (`MacEncoder/HardwareEncoder.swift`, HEVC) that streams them to the Vision Pro app

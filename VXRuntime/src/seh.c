@@ -183,124 +183,144 @@ static WINAPI void *RtlPcToFileHeader(uint64_t pc, void **base) {
 }
 
 // ---- virtual unwind ------------------------------------------------------------------------------------------------------
-typedef struct { uint8_t offset; uint8_t op_info; } unwind_code;
-typedef struct { uint8_t version_flags, prolog, count, frame; unwind_code codes[]; } unwind_info;
+// RtlVirtualUnwind: one frame back, from Microsoft's documented formats ("x64 exception handling", "x64 prolog and
+// epilog"). The unwind codes describe the prolog; an epilog has none, so a pc inside one is recognised by its bytes.
+typedef struct { uint8_t offset, op_info; } unwind_code;            // op: low 4 bits, its info: high 4
+typedef struct {
+    uint8_t version_flags, prolog_size, count, frame;      // frame: register (low 4 bits), offset / 16 (high 4)
+    unwind_code code[];
+} unwind_info;
+enum { UWOP_PUSH_NONVOL, UWOP_ALLOC_LARGE, UWOP_ALLOC_SMALL, UWOP_SET_FPREG, UWOP_SAVE_NONVOL, UWOP_SAVE_NONVOL_FAR,
+       UWOP_SAVE_XMM128 = 8, UWOP_SAVE_XMM128_FAR, UWOP_PUSH_MACHFRAME };
 
-static int code_slots(const unwind_code *c) {
-    switch (c->op_info & 0xf) {
-    case 1: return (c->op_info >> 4) ? 3 : 2;   // ALLOC_LARGE
-    case 4: case 8: return 2;                     // SAVE_NONVOL, SAVE_XMM128
-    case 5: case 9: return 3;                     // the _FAR forms
+static uint64_t load64(uint64_t a) { uint64_t v; memcpy(&v, (const void *)(uintptr_t)a, 8); return v; }
+static int64_t imm(const uint8_t *p, int wide) { int32_t v; if (!wide) return (int8_t)*p; memcpy(&v, p, 4); return v; }
+// The 16- or 32-bit operand held in the slots after a code.
+static uint32_t operand(const unwind_code *u, int wide) {
+    uint32_t v = u[1].offset | u[1].op_info << 8;
+    return wide ? v | (uint32_t)(u[2].offset | u[2].op_info << 8) << 16 : v;
+}
+static int code_slots(const unwind_code *u) {
+    switch (u->op_info & 15) {
+    case UWOP_ALLOC_LARGE: return u->op_info >> 4 ? 3 : 2;
+    case UWOP_SAVE_NONVOL: case UWOP_SAVE_XMM128: return 2;
+    case UWOP_SAVE_NONVOL_FAR: case UWOP_SAVE_XMM128_FAR: return 3;
     default: return 1;
     }
 }
+// What follows the codes (kept to an even number of slots): a chained RUNTIME_FUNCTION or the handler's RVA and data.
+static const uint8_t *info_tail(const unwind_info *ui) { return (const uint8_t *)&ui->code[(ui->count + 1) & ~1]; }
 
-// Is pc inside an epilogue (add/lea rsp; pops; ret or a jump out of the function)? Wine's check.
-static int in_epilog(const uint8_t *pc, uint64_t base, const RUNTIME_FUNCTION *fn) {
-    if ((pc[0] & 0xf8) == 0x48) {
-        switch (pc[1]) {
-        case 0x81: if (pc[0] == 0x48 && pc[2] == 0xc4) { pc += 7; break; } return 0;
-        case 0x83: if (pc[0] == 0x48 && pc[2] == 0xc4) { pc += 4; break; } return 0;
-        case 0x8d:
-            if (pc[0] & 0x06) return 0;
-            if (((pc[2] >> 3) & 7) != 4 || (pc[2] & 7) == 4) return 0;
-            if ((pc[2] >> 6) == 1) { pc += 4; break; }
-            if ((pc[2] >> 6) == 2) { pc += 7; break; }
-            return 0;
+// Undoes one prolog step. SAVE_* read relative to the frame (the frame register's value less its offset, or the
+// stack pointer the walk started from).
+static void undo_code(const unwind_code *u, CONTEXT *c, uint64_t frame, uint64_t *frame_ret, int *machframe) {
+    uint64_t *g = c->gpr;
+    int reg = u->op_info >> 4;
+    switch (u->op_info & 15) {
+    case UWOP_PUSH_NONVOL: g[reg] = load64(g[RSP]); g[RSP] += 8; break;
+    case UWOP_ALLOC_LARGE: g[RSP] += reg ? operand(u, 1) : operand(u, 0) * 8; break;
+    case UWOP_ALLOC_SMALL: g[RSP] += reg * 8 + 8; break;
+    case UWOP_SET_FPREG: g[RSP] = *frame_ret = frame; break;
+    case UWOP_SAVE_NONVOL: g[reg] = load64(frame + operand(u, 0) * 8); break;
+    case UWOP_SAVE_NONVOL_FAR: g[reg] = load64(frame + operand(u, 1)); break;
+    case UWOP_SAVE_XMM128: memcpy(&c->xmm[reg], (const void *)(uintptr_t)(frame + operand(u, 0) * 16), 16); break;
+    case UWOP_SAVE_XMM128_FAR: memcpy(&c->xmm[reg], (const void *)(uintptr_t)(frame + operand(u, 1)), 16); break;
+    case UWOP_PUSH_MACHFRAME:                                      // an interrupt's frame: rip, cs, eflags, rsp, ss
+        if (reg) g[RSP] += 8;                                      // (above an error code)
+        c->rip = load64(g[RSP]);
+        g[RSP] = load64(g[RSP] + 24);
+        *machframe = 1;
+        break;
+    }
+}
+
+// The rest of an epilog from pc: `add rsp, imm` or `lea rsp, [reg + disp]`, pops, then ret or a jump out of the
+// function (a tail call, which leaves the return address on the stack like ret).
+typedef struct {
+    enum { ADJUST_NONE, ADJUST_ADD, ADJUST_LEA } adjust;
+    int base, npops;                                               // lea's base register
+    int64_t disp;                                                  // add's immediate, lea's displacement
+    uint8_t pop[64];                                               // (no compiler pops more than the 16 registers)
+} epilog;
+static int decode_epilog(const uint8_t *p, uint64_t begin, uint64_t end, epilog *e) {
+    e->adjust = ADJUST_NONE; e->npops = 0;
+    if ((p[0] & 0xf8) == 0x48) {                                   // REX.W: perhaps the stack adjustment
+        if (p[1] == 0x81 || p[1] == 0x83) {
+            if (p[0] != 0x48 || p[2] != 0xc4) return 0;            // add to a register other than rsp
+            e->adjust = ADJUST_ADD;
+            e->disp = imm(p + 3, p[1] == 0x81);
+            p += p[1] == 0x81 ? 7 : 4;
+        } else if (p[1] == 0x8d) {
+            int modrm = p[2], mod = modrm >> 6;
+            if (p[0] & 6 || (modrm >> 3 & 7) != RSP || (modrm & 7) == 4 || mod == 0 || mod == 3) return 0;
+            e->adjust = ADJUST_LEA;
+            e->base = (modrm & 7) | (p[0] & 1) << 3;
+            e->disp = imm(p + 3, mod == 2);
+            p += mod == 2 ? 7 : 4;
         }
     }
     for (;;) {
-        if ((*pc & 0xf0) == 0x40) pc++;
-        switch (*pc) {
-        case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f: pc++; continue;
-        case 0xc2: case 0xc3: return 1;
-        case 0xe9: { uint64_t t = (uint64_t)pc + 5 + *(int32_t *)(pc + 1);
-                     return t < base + fn->begin || t >= base + fn->end; }
-        case 0xeb: { uint64_t t = (uint64_t)pc + 2 + (int8_t)pc[1];
-                     return t < base + fn->begin || t >= base + fn->end; }
-        case 0xf3: return pc[1] == 0xc3;
-        case 0xff: return pc[1] == 0x25;
+        int rex = (*p & 0xf0) == 0x40 ? *p++ : 0;
+        switch (*p) {
+        case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f:
+            if (e->npops == (int)sizeof e->pop) return 0;
+            e->pop[e->npops++] = (*p++ - 0x58) | (rex & 1) << 3;
+            continue;
+        case 0xc3: case 0xc2: return 1;                            // ret (ret imm16's imm is not applied)
+        case 0xf3: return p[1] == 0xc3;                            // rep ret
+        case 0xff: return p[1] == 0x25;                            // jmp [rip + disp32]
+        case 0xe9: case 0xeb: {                                    // jmp rel32 / rel8: an epilog if it leaves
+            int wide = *p == 0xe9;
+            uint64_t target = (uint64_t)(uintptr_t)(p + (wide ? 5 : 2)) + imm(p + 1, wide);
+            return target < begin || target >= end;
+        }
         default: return 0;
         }
     }
 }
-
-static void run_epilog(const uint8_t *pc, CONTEXT *c) {
-    if ((pc[0] & 0xf8) == 0x48) {
-        switch (pc[1]) {
-        case 0x81: c->gpr[RSP] += *(int32_t *)(pc + 3); pc += 7; break;
-        case 0x83: c->gpr[RSP] += (int8_t)pc[3]; pc += 4; break;
-        case 0x8d: {
-            int reg = (pc[2] & 7) | ((pc[0] & 1) << 3);
-            if ((pc[2] >> 6) == 1) { c->gpr[RSP] = c->gpr[reg] + (int8_t)pc[3]; pc += 4; }
-            else { c->gpr[RSP] = c->gpr[reg] + *(int32_t *)(pc + 3); pc += 7; }
-            break;
-        }
-        }
-    }
-    for (;;) {
-        int rex = (*pc & 0xf0) == 0x40 ? *pc++ & 0xf : 0;
-        if (*pc >= 0x58 && *pc <= 0x5f) {
-            c->gpr[(*pc - 0x58) | ((rex & 1) << 3)] = *(uint64_t *)c->gpr[RSP];
-            c->gpr[RSP] += 8; pc++; continue;
-        }
-        break;   // ret / jmp: the return address is popped below
-    }
-    c->rip = *(uint64_t *)c->gpr[RSP];
-    c->gpr[RSP] += 8;
+static void run_epilog(const epilog *e, CONTEXT *c) {
+    uint64_t *g = c->gpr;
+    if (e->adjust == ADJUST_ADD) g[RSP] += e->disp;
+    else if (e->adjust == ADJUST_LEA) g[RSP] = g[e->base] + e->disp;
+    for (int i = 0; i < e->npops; i++) { g[e->pop[i]] = load64(g[RSP]); g[RSP] += 8; }
+    c->rip = load64(g[RSP]);
+    g[RSP] += 8;
 }
 
+// Unwinds c one frame (its function's entry and the entries chained to it). Returns the language handler of the
+// kind `type` asks for, with its data in *data, unless pc is in a prolog or epilog, where the function's handler
+// does not apply yet or any more. *frame_ret: the establisher frame.
 static WINAPI void *RtlVirtualUnwind(DWORD type, uint64_t base, uint64_t pc, RUNTIME_FUNCTION *fn, CONTEXT *c,
                                      void **data, uint64_t *frame_ret, void *ctx_pointers) {
     (void)ctx_pointers;
-    uint64_t frame = c->gpr[RSP];
+    uint64_t *g = c->gpr, frame = g[RSP];
+    const unwind_info *ui;
+    int machframe = 0, in_prolog;
     *frame_ret = frame;
-    const unwind_info *info;
-    DWORD prolog_offset;
-    int mach_frame = 0;
     for (;;) {
-        info = (const unwind_info *)(base + fn->unwind);
-        int frame_reg = info->frame & 0xf;
-        if (frame_reg) frame = c->gpr[frame_reg] - (info->frame >> 4) * 16;
-        if (pc >= base + fn->begin && pc < base + fn->begin + info->prolog) {
-            prolog_offset = (DWORD)(pc - base - fn->begin);
-        } else {
-            prolog_offset = ~0u;
-            if (in_epilog((const uint8_t *)pc, base, fn)) {
-                *frame_ret = frame;
-                run_epilog((const uint8_t *)pc, c);
-                return NULL;
-            }
+        ui = (const unwind_info *)(uintptr_t)(base + fn->unwind);
+        uint64_t begin = base + fn->begin;
+        if (ui->frame & 15) frame = g[ui->frame & 15] - (ui->frame >> 4) * 16;
+        in_prolog = pc >= begin && pc < begin + ui->prolog_size;
+        epilog e;
+        if (!in_prolog && decode_epilog((const uint8_t *)(uintptr_t)pc, begin, base + fn->end, &e)) {
+            *frame_ret = frame;
+            run_epilog(&e, c);
+            return NULL;
         }
-        for (int i = 0; i < info->count; i += code_slots(&info->codes[i])) {
-            const unwind_code *uc = &info->codes[i];
-            if (prolog_offset < uc->offset) continue;
-            int op = uc->op_info & 0xf, opinfo = uc->op_info >> 4;
-            switch (op) {
-            case 0: c->gpr[opinfo] = *(uint64_t *)c->gpr[RSP]; c->gpr[RSP] += 8; break;                       // PUSH_NONVOL
-            case 1: c->gpr[RSP] += opinfo ? *(uint32_t *)&info->codes[i + 1] : *(uint16_t *)&info->codes[i + 1] * 8u; break;
-            case 2: c->gpr[RSP] += (opinfo + 1) * 8; break;                                                     // ALLOC_SMALL
-            case 3: c->gpr[RSP] = *frame_ret = frame; break;                                                    // SET_FPREG
-            case 4: c->gpr[opinfo] = *(uint64_t *)(frame + *(uint16_t *)&info->codes[i + 1] * 8); break;
-            case 5: c->gpr[opinfo] = *(uint64_t *)(frame + *(uint32_t *)&info->codes[i + 1]); break;
-            case 8: memcpy(&c->xmm[opinfo], (void *)(frame + *(uint16_t *)&info->codes[i + 1] * 16), 16); break;
-            case 9: memcpy(&c->xmm[opinfo], (void *)(frame + *(uint32_t *)&info->codes[i + 1]), 16); break;
-            case 10:                                                                                            // PUSH_MACHFRAME
-                if (opinfo) c->gpr[RSP] += 8;
-                c->rip = *(uint64_t *)c->gpr[RSP];
-                c->gpr[RSP] = *(uint64_t *)(c->gpr[RSP] + 24);
-                mach_frame = 1;
-                break;
-            }
-        }
-        if (!(info->version_flags >> 3 & UNW_FLAG_CHAININFO)) break;
-        fn = (RUNTIME_FUNCTION *)&info->codes[(info->count + 1) & ~1];
+        // In the prolog, only the steps already taken (those whose instruction ends at or before pc) are undone.
+        for (int i = 0; i < ui->count; i += code_slots(&ui->code[i]))
+            if (!in_prolog || ui->code[i].offset <= pc - begin)
+                undo_code(&ui->code[i], c, frame, frame_ret, &machframe);
+        if (!(ui->version_flags >> 3 & UNW_FLAG_CHAININFO)) break;
+        fn = (RUNTIME_FUNCTION *)info_tail(ui);
     }
-    if (!mach_frame) { c->rip = *(uint64_t *)c->gpr[RSP]; c->gpr[RSP] += 8; }
-    if (!((info->version_flags >> 3) & type) || prolog_offset != ~0u) return NULL;
-    const DWORD *handler_rva = (const DWORD *)&info->codes[(info->count + 1) & ~1];
-    *data = (void *)(handler_rva + 1);
-    return (void *)(base + *handler_rva);
+    if (!machframe) { c->rip = load64(g[RSP]); g[RSP] += 8; }
+    if (!(ui->version_flags >> 3 & type) || in_prolog) return NULL;
+    uint32_t handler;
+    memcpy(&handler, info_tail(ui), 4);
+    *data = (void *)(info_tail(ui) + 4);
+    return (void *)(uintptr_t)(base + handler);
 }
 
 // ---- dispatch ---------------------------------------------------------------------------------------------------------------
