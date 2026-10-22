@@ -20,6 +20,16 @@ struct Title: Identifiable, Hashable {
     var exe: String?        // the game's executable (nil: Half-Life: Alyx, which has its own launcher)
     var summary: String     // in the app's language
     var works: Bool         // played through in a headset (games/<appid>.json: "works"), not only measured
+    var flat = false        // also plays on the Mac's screen, without a headset
+    var args: [String] = [] // the game's arguments (its launcher's)
+    var vrArgs: [String] = []   // and those that ask it for VR
+    /// The game's own openvr_api.dll, relative to its executable's folder: its frames are taken from its Submit
+    /// (launch_vxrt_game.sh's VXRT_CAPTURE_PROXY) instead of through SteamVR's compositor.
+    var captureProxy: String? = nil
+    /// The game opens its own launcher first, which the player uses as on Windows (sign in, PLAY).
+    var launcher = false
+    /// The game the launcher starts (its lines in the launcher's log are "[vxrt <name>:<pid>] ...").
+    var gameExe: String? = nil
 
     static func == (a: Title, b: Title) -> Bool { a.id == b.id }
     func hash(into h: inout Hasher) { h.combine(id) }
@@ -37,6 +47,11 @@ struct Title: Identifiable, Hashable {
         Title(id: "348250", name: "Google Earth VR", bytes: 2_996_347_031, free: true, exe: "Earth.exe",
               summary: T("Runs (terrain and labels, about 57 fps); not played through yet. Free.",
                          "動作（地形とラベル、約 57 fps）。通しのプレイはまだ。無料。"), works: false),
+        Title(id: "359320", name: "Elite Dangerous", bytes: 58_055_995_280, free: false, exe: "EDLaunch.exe",
+              summary: T("Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.",
+                         "Mac の画面（M1 Max のゲーム中で約 60 fps）でもヘッドセット（30〜35 fps）でも飛べます。キーボード・マウス・DualSense。専用のランチャーが開くので、そこでサインインして PLAY を押します。"),
+              works: false, flat: true, args: ["/steam"], vrArgs: ["/vr"],
+              captureProxy: "Products/elite-dangerous-odyssey-64/Openvr/win64/openvr_api.dll", launcher: true, gameExe: "EliteDangerous64.exe"),
     ]
     static func named(_ id: String) -> Title? { all.first { $0.id == id } }
 }

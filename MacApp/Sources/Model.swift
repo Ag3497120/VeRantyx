@@ -14,6 +14,7 @@ struct Game: Identifiable, Hashable {
     var bytes: Int64
     var alyx: Bool { id == "546560" }
     var playable: Bool { antiCheat.isEmpty && (alyx || exe != nil) }
+    var flat: Bool { title?.flat == true }
 }
 
 enum Page: String, CaseIterable, Identifiable {
@@ -269,11 +270,12 @@ struct Job {
 
     // MARK: play
 
-    func start(_ game: Game) {
+    func start(_ game: Game, flat: Bool = false) {
         guard play?.running != true else { return }
         error = nil
         do {
-            play = try Play(title: game.name, exe: game.alyx ? nil : game.exe, headset: headset, wired: wired, quality: quality)
+            play = try Play(title: game.name, exe: game.alyx ? nil : game.exe, headset: headset, wired: wired, quality: quality,
+                            known: game.title, flat: flat && game.title?.flat == true)
         } catch {
             self.error = error.localizedDescription
         }

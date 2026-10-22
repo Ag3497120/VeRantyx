@@ -79,6 +79,13 @@ pub fn prepare_session(layout: &alvr_filesystem::Layout) {
         clients.remove(wired);
     }
     let ss = &mut s["session_settings"];
+    // (socket buffers: ALVR's default, "Maximum", fails on macOS ("Error setting socket send buffer: Invalid
+    //  argument") and leaves them at 128 KB; a Quest over Wi-Fi then saw frames held 270-800 ms (issue #4, and #2's
+    //  session log). A fixed 4 MB is taken (macOS allows 8) and ended those spikes there.)
+    for key in ["server_send_buffer_bytes", "server_recv_buffer_bytes"] {
+        ss["connection"][key]["variant"] = "Custom".into();
+        ss["connection"][key]["Custom"] = 4_000_000.into();
+    }
     ss["video"]["preferred_codec"]["variant"] = "Hevc".into();
     ss["video"]["foveated_encoding"]["enabled"] = false.into();
     fs::write(&path, serde_json::to_string_pretty(&s).unwrap()).unwrap();

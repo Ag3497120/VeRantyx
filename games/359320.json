@@ -16,13 +16,13 @@
     }
   },
   "status": {
-    "state": "broken",
-    "level": "starts",
+    "state": "partial",
+    "level": "runs",
     "summary": {
-      "ja": "最新実行 20261018T205736Z-elite_dangerous-start は公式ランチャーの Signup フォームで40秒間動作。以前終了した空白座標 (700, 500) をクリックしてもフォームは残り、CLR例外・ネイティブシグナル・未実装呼び出しはない。原因はリンクの描画文字より広い当たり判定で、GDI測定の文字範囲に修正した。資格情報入力・登録送信はしていない。ランチャーは 1.7.7036.1 requires update と表示し、SteamVR接続・ゲーム本体起動は未到達。",
-      "en": "Latest run 20261018T205736Z-elite_dangerous-start keeps the official launcher's Signup form alive for the full 40 seconds. Clicking the previously failing blank coordinate (700, 500) leaves the form open, with no CLR exception, native signal, or unimplemented call. The cause was a hyperlink hit target wider than its rendered text; it now uses GDI-measured text bounds. No credentials were entered and signup was not submitted. The launcher reports 1.7.7036.1 requires update; SteamVR connection and the game process remain unreached."
+      "ja": "公式ランチャーからゲーム本体まで動作。Mac の画面（VXRT_FLAT=1）では M1 Max・Low でゲーム中 約 52〜122 fps（メニューは 250〜330）、ヘッドセットでは片目 1700x1372 で 30〜35 fps 前後。キーボード・マウスはゲーム内で効き、DualSense は平面で確認（VR は未確認）。ランチャーはプレイヤーがサインインして PLAY を押す。",
+      "en": "Runs from the official launcher to the game. On the Mac's screen (VXRT_FLAT=1), about 52-122 fps in game on an M1 Max with graphics on Low (menus 250-330); in the headset, around 30-35 fps at 1700x1372 per eye. Keyboard and mouse work in game; a DualSense is checked flat (not yet in VR). The player signs in and presses PLAY in the launcher."
     },
-    "checked": "2026-10-19",
+    "checked": "2026-10-22",
     "machine": "Apple M1 Max, 32-core GPU"
   },
   "baselines": {},
@@ -423,6 +423,7 @@
     "EDLaunch.exe is PE32/I386 but its CLR flags are IL-only and do not require 32-bit execution. It references .NET Framework 4.8/WPF assemblies; launcher support needs managed runtime behavior plus WPF desktop/UI APIs.",
     "VXRuntime includes bounds-checked PE/ECMA-335 metadata, .resources and WPF BAML readers, a bounded CIL interpreter with managed objects, fields, delegates and method calls, and a built-in mscoree.dll _CorExeMain path. For EDLaunch.exe it validates app.baml and recursively resolves all 13 merged ResourceDictionary.Source references, including deferred dictionary-key records in ButtonStyles. Mapping BAML records into WPF types, constructing XAML object trees, the dispatcher and message loop remain incomplete.",
     "The installed game executable is EliteDangerous64.exe. Its compatibility remains unknown until the official launcher can run.",
-    "Static imports from the x64 game include Direct3D 11, DXGI, OpenVR, DirectInput 8, XInput, WinHTTP and Winsock; D3D12 and Vulkan are not imported. Elite will first exercise the D3D11 path once the official launcher can run."
+    "Static imports from the x64 game include Direct3D 11, DXGI, OpenVR, DirectInput 8, XInput, WinHTTP and Winsock; D3D12 and Vulkan are not imported. Elite will first exercise the D3D11 path once the official launcher can run.",
+    "2026-10-22: VeRantyx for Mac starts it (Title 359320 in MacApp/Sources/Library.swift): \"On this Mac\" runs it flat (VXRT_FLAT=1, VXRT_STATS=1 for the frame rate from \"present: N/s\"), \"Headset\" in VR with the capture proxy and /vr. Through the app (headless --play 359320 --flat): the launcher opened, signed in with Steam, PLAY started one game, the app saw it start and read 52.7-122 fps in game, 248-290 in menus; it stopped with the app. Pressing PLAY in both the launcher and a script had started two games, so the launcher is the player's alone."
   ]
 }

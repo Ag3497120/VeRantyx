@@ -167,5 +167,12 @@
  "Someone may have reported the same problem already: a look at the existing reports first can save you the time. For a new report, the app saves your logs as a zip file on the Desktop, with your Mac user name and Steam ID taken out; drag it into the form's Logs field.": "Qualcuno potrebbe aver già segnalato lo stesso problema: dare prima un’occhiata alle segnalazioni esistenti può farti risparmiare tempo. Per una nuova segnalazione, l’app salva i log in un file zip sulla Scrivania, senza il tuo nome utente del Mac e il tuo ID Steam; trascinalo nel campo «Logs» del modulo.",
  "Write a new report": "Scrivi una nuova segnalazione",
  "Look at existing reports": "Guarda le segnalazioni esistenti",
- "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "Primo avvio con questo visore: apri ALVR sul visore e connettiti ora. SteamVR si avvia appena è connesso, così l’immagine coincide in entrambi gli occhi."
+ "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "Primo avvio con questo visore: apri ALVR sul visore e connettiti ora. SteamVR si avvia appena è connesso, così l’immagine coincide in entrambi gli occhi.",
+ "Mac screen + VR": "Schermo del Mac + VR",
+ "On this Mac": "Su questo Mac",
+ "Plays in a window on this Mac, without a headset or SteamVR.": "Si gioca in una finestra su questo Mac, senza visore né SteamVR.",
+ "Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.": "Tastiera e mouse funzionano come su Windows; per un DualSense scegli il suo preset in Opzioni > Controlli del gioco. Esc apre il menu del gioco.",
+ "Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.": "Si vola sullo schermo del Mac (circa 60 fps in gioco su un M1 Max) o nel visore (30–35 fps); tastiera, mouse e un DualSense. Apre il suo launcher: accedi e premi PLAY lì.",
+ "The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.": "Si apre il launcher del gioco: usalo come su Windows. Accedi, lascialo aggiornare se lo chiede, poi premi PLAY una volta.",
+ "Launcher: sign in, PLAY": "Launcher: accedi, PLAY"
 }

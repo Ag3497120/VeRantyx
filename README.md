@@ -47,7 +47,8 @@ Prefer Terminal? `scripts/setup_vxrt.sh` then `scripts/launch_vxrt_alyx.sh` — 
 |---|---|---|
 | **Half-Life: Alyx** | ✅ Playable — played in the headset across level changes and saves | 60 fps at the 3K preset (1440×1620 per eye), MacBook Pro M1 Max |
 | **Google Earth VR** | 🟡 Runs in VR, playtest pending | 56.7 fps, M1 Max |
-| **The Lab** | 🟡 Runs in VR (title scene), playtest pending | 54.1 fps, M1 Max |
+| **Elite Dangerous** | 🟡 Flies on the Mac's screen and in the headset (official launcher; keyboard, mouse, DualSense) | flat: about 52-122 fps in game; VR: 30-35 fps at 1700×1372 per eye; M1 Max, Low |
+| **The Lab** | 🟡 Runs in VR (title scene), playtest pending; its controller bindings load since 0.2.0 | 54.0 fps, M1 Max |
 | Other SteamVR games | ⚪ Most still need Windows functions VXRuntime lacks | [games/](games/) has what is known |
 
 Checked on a MacBook Pro M1 Max and a MacBook Air M5. Numbers come from harness runs with their run ids in

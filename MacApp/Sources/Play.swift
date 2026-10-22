@@ -44,9 +44,14 @@ enum Quality: String, CaseIterable, Identifiable {
     enum Phase: Equatable { case starting, steamVR, playing, stopping, ended }
 
     let title: String
+    /// On the Mac's screen, without SteamVR or a headset.
+    let flat: Bool
     var phase: Phase = .starting
     var headsetConnected = false
     var fps: Double? = nil
+    /// A game with its own launcher (Elite Dangerous): the game itself has started (from the launcher's PLAY).
+    var gameStarted = false
+    var usesLauncher: Bool { known?.launcher == true }
     var gameLines: [String] = []
     var problem: String? = nil { didSet { if let problem { Play.lastProblem = problem } } }
     /// Something the player is asked to do now (not a problem): a first ALVR headset to connect.
@@ -59,12 +64,15 @@ enum Quality: String, CaseIterable, Identifiable {
     @ObservationIgnored private var process = Process()
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private let headset: Headset
+    @ObservationIgnored private let known: Title?
     @ObservationIgnored private let gameLog: URL
     @ObservationIgnored private let launcherLog = Paths.logs.appendingPathComponent("launcher.log")
 
-    init(title: String, exe: URL?, headset: Headset, wired: Bool, quality: Quality) throws {
+    init(title: String, exe: URL?, headset: Headset, wired: Bool, quality: Quality, known: Title? = nil, flat: Bool = false) throws {
         self.title = title
         self.headset = headset
+        self.known = known
+        self.flat = flat
         let scripts = Paths.runtime.appendingPathComponent("scripts")
         try FileManager.default.createDirectory(at: Paths.logs, withIntermediateDirectories: true)
         var env = ProcessInfo.processInfo.environment
@@ -73,7 +81,11 @@ enum Quality: String, CaseIterable, Identifiable {
         env["VERANTYX_VR_DRIVE"] = Paths.drive.path
         env["VXRT_NO_WINE"] = "1"                          // (the app's setup only: never a Wine version's prefix)
         env["VXRT_VR_LOG_DIR"] = Paths.logs.path
-        if headset.usesALVR {
+        if known?.launcher == true { env["VXRT_MESSAGEBOX"] = "auto" }   // (the launcher's message boxes answer themselves)
+        if flat {
+            env["VXRT_FLAT"] = "1"                          // (launch_vxrt_game.sh: no SteamVR, the game takes the Mac's focus)
+            env["VXRT_STATS"] = "1"                         // (the game's frame rate, "present: N/s", in its log)
+        } else if headset.usesALVR {
             env["VERANTYX_ALVR"] = "1"
             if wired && headset == .quest { env["VERANTYX_ALVR_WIRED"] = "1" }
             if quality == .sharp {
@@ -82,9 +94,10 @@ enum Quality: String, CaseIterable, Identifiable {
         } else if [.k3, .k25, .max].contains(quality) {
             env["VXRT_VR_QUALITY"] = quality.rawValue
         }
+        if !flat, let proxy = known?.captureProxy { env["VXRT_CAPTURE_PROXY"] = proxy }
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         if let exe {
-            process.arguments = [scripts.appendingPathComponent("launch_vxrt_game.sh").path, exe.path]
+            process.arguments = [scripts.appendingPathComponent("launch_vxrt_game.sh").path, exe.path] + (known?.args ?? []) + (flat ? [] : known?.vrArgs ?? [])
             process.currentDirectoryURL = exe.deletingLastPathComponent()
             gameLog = Paths.logs.appendingPathComponent("vxrt-\(exe.deletingPathExtension().lastPathComponent).log")
         } else {
@@ -154,8 +167,19 @@ enum Quality: String, CaseIterable, Identifiable {
     private func poll() {
         if phase == .starting && listening(27062) { phase = .steamVR }
         let game = fresh(gameLog) ? Play.tail(gameLog, 8000) : ""
-        if phase == .steamVR && !game.isEmpty { phase = .playing }
+        if (phase == .steamVR || flat && phase == .starting) && !game.isEmpty { phase = .playing }
         gameLines = Array(game.split(separator: "\n", omittingEmptySubsequences: true).suffix(14).map(String.init))
+        if let exe = known?.gameExe, game.contains("[vxrt \(exe):") {
+            gameStarted = true
+            if flat, let line = game.split(separator: "\n").last(where: { $0.contains("[vxrt \(exe):") && $0.contains("present: ") }) {
+                fps = Play.number(in: line, after: "present: ")
+            }
+        }
+        if flat {
+            if let hint = Play.hint(Play.tail(launcherLog, 6000)) { problem = hint }
+            notice = launcherNotice
+            return
+        }
         // The encoder's report every 5 s: frames reaching it (the game's, through SteamVR) and the headset's poses.
         let encoderLog = Paths.logs.appendingPathComponent("hardware-encoder.log")
         let encoder = fresh(encoderLog) ? Play.tail(encoderLog, 6000) : ""
@@ -182,7 +206,14 @@ enum Quality: String, CaseIterable, Identifiable {
         notice = firstWait != nil && (waitOver == nil || waitOver! < firstWait!)
             ? T("First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.",
                 "このヘッドセットで初めての起動です。ヘッドセットで ALVR を開いて接続してください。接続すると SteamVR が始まり、両目の映像がずれずに表示されます。")
-            : nil
+            : launcherNotice
+    }
+
+    /// What the player does in a launcher game's launcher (nil once the game has started).
+    private var launcherNotice: String? {
+        guard usesLauncher && !gameStarted else { return nil }
+        return T("The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.",
+                 "ゲーム専用のランチャーが開きます。Windows と同じように操作してください。サインインし、更新を求められたら済ませてから、PLAY を 1 回押します。")
     }
 
     nonisolated static func number(in line: Substring, after key: String) -> Double? {

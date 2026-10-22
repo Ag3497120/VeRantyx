@@ -167,5 +167,12 @@
  "Someone may have reported the same problem already: a look at the existing reports first can save you the time. For a new report, the app saves your logs as a zip file on the Desktop, with your Mac user name and Steam ID taken out; drag it into the form's Logs field.": "可能已經有人回報過同樣的問題：先看看現有的回報，也許能省下時間。新增回報時，App 會把記錄檔存成桌面上的 zip 檔（已移除你的 Mac 使用者名稱和 Steam ID），請把它拖到表單的「Logs」欄位。",
  "Write a new report": "新增回報",
  "Look at existing reports": "查看現有回報",
- "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "首次使用此頭戴裝置啟動：請在頭戴裝置上開啟 ALVR 並立即連線。連線後 SteamVR 才會啟動，這樣兩眼的畫面才能對齊。"
+ "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "首次使用此頭戴裝置啟動：請在頭戴裝置上開啟 ALVR 並立即連線。連線後 SteamVR 才會啟動，這樣兩眼的畫面才能對齊。",
+ "Mac screen + VR": "Mac 螢幕 + VR",
+ "On this Mac": "在這台 Mac 上",
+ "Plays in a window on this Mac, without a headset or SteamVR.": "在這台 Mac 的視窗中遊玩，不需要頭戴裝置和 SteamVR。",
+ "Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.": "鍵盤和滑鼠的用法與 Windows 相同；使用 DualSense 時，請在遊戲的 選項 > 控制 中選擇其預設。按 Esc 開啟遊戲選單。",
+ "Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.": "可在 Mac 螢幕上飛行（M1 Max 上遊戲中約 60 fps），也可在頭戴裝置中（30–35 fps）；支援鍵盤、滑鼠和 DualSense。會開啟遊戲自己的啟動器：在那裡登入並按 PLAY。",
+ "The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.": "會開啟遊戲自己的啟動器：像在 Windows 上一樣使用。登入，如要求更新就先完成更新，然後按一次 PLAY。",
+ "Launcher: sign in, PLAY": "啟動器：登入、PLAY"
 }

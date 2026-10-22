@@ -167,5 +167,12 @@
  "Someone may have reported the same problem already: a look at the existing reports first can save you the time. For a new report, the app saves your logs as a zip file on the Desktop, with your Mac user name and Steam ID taken out; drag it into the form's Logs field.": "같은 문제가 이미 보고되었을 수 있습니다. 먼저 기존 보고를 보면 시간을 아낄 수 있습니다. 새로 보고할 때는 앱이 로그를 zip 파일로 데스크톱에 저장합니다(Mac 사용자 이름과 Steam ID는 제거합니다). 양식의 \"Logs\" 칸으로 끌어다 놓으세요.",
  "Write a new report": "새로 보고하기",
  "Look at existing reports": "기존 보고 보기",
- "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "이 헤드셋으로 처음 시작합니다. 헤드셋에서 ALVR을 열고 지금 연결하세요. 연결되면 SteamVR이 시작되어 양쪽 눈의 화면이 맞게 표시됩니다."
+ "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "이 헤드셋으로 처음 시작합니다. 헤드셋에서 ALVR을 열고 지금 연결하세요. 연결되면 SteamVR이 시작되어 양쪽 눈의 화면이 맞게 표시됩니다.",
+ "Mac screen + VR": "Mac 화면 + VR",
+ "On this Mac": "이 Mac에서",
+ "Plays in a window on this Mac, without a headset or SteamVR.": "헤드셋이나 SteamVR 없이 이 Mac의 창에서 플레이합니다.",
+ "Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.": "키보드와 마우스는 Windows에서처럼 작동합니다. DualSense는 게임의 옵션 > 조작에서 해당 프리셋을 선택하세요. Esc로 게임 메뉴를 엽니다.",
+ "Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.": "Mac 화면(M1 Max에서 게임 중 약 60fps) 또는 헤드셋(30–35fps)에서 비행합니다. 키보드, 마우스, DualSense 지원. 전용 런처가 열리면 로그인하고 PLAY를 누르세요.",
+ "The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.": "게임 전용 런처가 열립니다. Windows에서처럼 사용하세요. 로그인하고, 업데이트를 요청하면 끝낸 뒤 PLAY를 한 번 누르세요.",
+ "Launcher: sign in, PLAY": "런처: 로그인, PLAY"
 }

@@ -167,5 +167,12 @@
  "Someone may have reported the same problem already: a look at the existing reports first can save you the time. For a new report, the app saves your logs as a zip file on the Desktop, with your Mac user name and Steam ID taken out; drag it into the form's Logs field.": "Vielleicht hat schon jemand dasselbe Problem gemeldet: Ein Blick in die vorhandenen Meldungen kann dir Zeit sparen. Für eine neue Meldung speichert die App deine Protokolle als ZIP-Datei auf dem Schreibtisch, ohne deinen Mac-Benutzernamen und deine Steam-ID; zieh sie in das Feld „Logs“ des Formulars.",
  "Write a new report": "Neue Meldung schreiben",
  "Look at existing reports": "Vorhandene Meldungen ansehen",
- "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "Erster Start mit diesem Headset: Öffne ALVR auf dem Headset und verbinde dich jetzt. SteamVR startet, sobald es verbunden ist, damit das Bild in beiden Augen übereinstimmt."
+ "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "Erster Start mit diesem Headset: Öffne ALVR auf dem Headset und verbinde dich jetzt. SteamVR startet, sobald es verbunden ist, damit das Bild in beiden Augen übereinstimmt.",
+ "Mac screen + VR": "Mac-Bildschirm + VR",
+ "On this Mac": "Auf diesem Mac",
+ "Plays in a window on this Mac, without a headset or SteamVR.": "Spielt in einem Fenster auf diesem Mac, ohne Headset und ohne SteamVR.",
+ "Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.": "Tastatur und Maus funktionieren wie unter Windows; für einen DualSense wähle seine Vorlage im Spiel unter Optionen > Steuerung. Esc öffnet das Menü des Spiels.",
+ "Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.": "Fliegt auf dem Bildschirm des Mac (im Spiel etwa 60 fps auf einem M1 Max) oder im Headset (30–35 fps); Tastatur, Maus und ein DualSense. Es öffnet seinen eigenen Launcher: Dort anmelden und PLAY drücken.",
+ "The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.": "Der eigene Launcher des Spiels öffnet sich: Bediene ihn wie unter Windows. Melde dich an, lass ihn aktualisieren, wenn er danach fragt, und drücke dann einmal PLAY.",
+ "Launcher: sign in, PLAY": "Launcher: anmelden, PLAY"
 }

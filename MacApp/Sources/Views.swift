@@ -465,6 +465,7 @@ struct Banner: View {
 struct GameCard: View {
     @Environment(AppModel.self) private var model
     var game: Game
+    private var canStart: Bool { game.playable && model.ready && model.steamRunning && model.play?.running != true && model.elsewhere.isEmpty }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -473,6 +474,7 @@ struct GameCard: View {
                 Spacer()
                 if !game.antiCheat.isEmpty { Chip(text: T("Anti-cheat", "アンチチート"), color: .red) }
                 else if game.title?.works == true { Chip(text: T("Plays", "プレイ可"), color: .green) }
+                else if game.flat { Chip(text: T("Mac screen + VR", "Mac 画面 + VR"), color: .purple) }
                 else if game.title != nil { Chip(text: T("Runs", "動作"), color: .blue) }
                 else { Chip(text: T("Not tested", "未検証"), color: .secondary) }
             }
@@ -484,13 +486,22 @@ struct GameCard: View {
             HStack {
                 Text(gigabytes(game.bytes)).font(.caption).foregroundStyle(.tertiary)
                 Spacer()
+                if game.flat {
+                    Button {
+                        model.start(game, flat: true)
+                    } label: {
+                        Label(T("On this Mac", "Mac の画面で"), systemImage: "desktopcomputer")
+                    }
+                    .help(T("Plays in a window on this Mac, without a headset or SteamVR.", "ヘッドセットも SteamVR も使わず、この Mac のウィンドウで遊びます。"))
+                    .disabled(!canStart)
+                }
                 Button {
                     model.start(game)
                 } label: {
-                    Label(T("Play", "プレイ"), systemImage: "play.fill").frame(minWidth: 70)
+                    Label(game.flat ? T("Headset", "ヘッドセット") : T("Play", "プレイ"), systemImage: game.flat ? "visionpro" : "play.fill").frame(minWidth: 70)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!game.playable || !model.ready || !model.steamRunning || model.play?.running == true || !model.elsewhere.isEmpty)
+                .disabled(!canStart)
             }
         }
         .padding(16)
@@ -508,10 +519,19 @@ struct SessionCard: View {
     var body: some View {
         Card(title: play.running ? TF("Playing %@", "%@ をプレイ中", play.title) : TF("%@ has ended", "%@ は終了しました", play.title)) {
             HStack(spacing: 18) {
-                Step(done: play.phase != .starting, active: play.phase == .starting, text: T("SteamVR", "SteamVR"))
-                Step(done: play.headsetConnected, active: play.running && !play.headsetConnected && play.phase != .starting,
-                     text: play.headsetConnected ? T("Headset connected", "ヘッドセット接続") : T("Open the app on the headset", "ヘッドセットでアプリを開く"))
-                Step(done: play.phase == .playing, active: play.phase == .steamVR, text: T("Game", "ゲーム"))
+                if play.flat {
+                    Label(T("On this Mac", "Mac の画面で"), systemImage: "desktopcomputer").font(.callout).foregroundStyle(.secondary)
+                } else {
+                    Step(done: play.phase != .starting, active: play.phase == .starting, text: T("SteamVR", "SteamVR"))
+                    Step(done: play.headsetConnected, active: play.running && !play.headsetConnected && play.phase != .starting,
+                         text: play.headsetConnected ? T("Headset connected", "ヘッドセット接続") : T("Open the app on the headset", "ヘッドセットでアプリを開く"))
+                }
+                if play.usesLauncher {
+                    Step(done: play.gameStarted, active: play.running && !play.gameStarted && (play.flat || play.phase != .starting),
+                         text: T("Launcher: sign in, PLAY", "ランチャー：サインイン、PLAY"))
+                }
+                Step(done: play.usesLauncher ? play.gameStarted : play.phase == .playing,
+                     active: play.usesLauncher ? false : play.phase == .steamVR, text: T("Game", "ゲーム"))
                 Spacer()
                 if let fps = play.fps, play.running {
                     VStack(alignment: .trailing, spacing: 0) {
@@ -520,13 +540,19 @@ struct SessionCard: View {
                     }
                 }
             }
-            if play.running && play.phase != .playing {
+            if play.running && (play.usesLauncher ? !play.gameStarted : play.phase != .playing) {
                 Text(T("The first start compiles the game's shaders: it can take a few minutes. Later starts are quick.",
                        "初回はゲームのシェーダをコンパイルするため、数分かかることがあります。2 回目からは速くなります。"))
                     .font(.callout).foregroundStyle(.secondary)
             }
             if let notice = play.notice {
-                Label(notice, systemImage: "visionpro").foregroundStyle(.blue).fixedSize(horizontal: false, vertical: true)
+                Label(notice, systemImage: play.usesLauncher ? "macwindow" : "visionpro").foregroundStyle(.blue).fixedSize(horizontal: false, vertical: true)
+            }
+            if play.flat && play.gameStarted && play.running {
+                Label(T("Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.",
+                        "キーボードとマウスは Windows と同じく使えます。DualSense はゲームの オプション > 操作 でそのプリセットを選んでください。Esc でゲームのメニュー。"),
+                      systemImage: "keyboard")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if let problem = play.problem {
                 Label(problem, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)

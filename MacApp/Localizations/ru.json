@@ -167,5 +167,12 @@
  "Someone may have reported the same problem already: a look at the existing reports first can save you the time. For a new report, the app saves your logs as a zip file on the Desktop, with your Mac user name and Steam ID taken out; drag it into the form's Logs field.": "Возможно, кто-то уже сообщил о той же проблеме: сначала загляните в существующие сообщения — это может сэкономить время. Для нового сообщения приложение сохранит журналы в zip-файл на рабочем столе, убрав из них имя пользователя Mac и Steam ID; перетащите его в поле «Logs» формы.",
  "Write a new report": "Написать новое сообщение",
  "Look at existing reports": "Посмотреть существующие сообщения",
- "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "Первый запуск с этой гарнитурой: откройте ALVR на гарнитуре и подключитесь сейчас. SteamVR запустится после подключения, чтобы изображение совпадало в обоих глазах."
+ "First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.": "Первый запуск с этой гарнитурой: откройте ALVR на гарнитуре и подключитесь сейчас. SteamVR запустится после подключения, чтобы изображение совпадало в обоих глазах.",
+ "Mac screen + VR": "Экран Mac + VR",
+ "On this Mac": "На этом Mac",
+ "Plays in a window on this Mac, without a headset or SteamVR.": "Игра в окне на этом Mac, без шлема и SteamVR.",
+ "Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.": "Клавиатура и мышь работают как в Windows; для DualSense выберите его предустановку в игре: Параметры > Управление. Esc открывает меню игры.",
+ "Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.": "Летает на экране Mac (около 60 fps в игре на M1 Max) или в шлеме (30–35 fps); клавиатура, мышь и DualSense. Открывает собственный лаунчер: войдите и нажмите в нём PLAY.",
+ "The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.": "Откроется лаунчер игры: пользуйтесь им как в Windows. Войдите, дайте ему обновиться, если он попросит, затем один раз нажмите PLAY.",
+ "Launcher: sign in, PLAY": "Лаунчер: вход, PLAY"
 }

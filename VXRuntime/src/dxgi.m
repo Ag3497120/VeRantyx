@@ -431,6 +431,18 @@ static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flag
         [cmd commit];
     }
     sc->presents++;
+    // VXRT_STATS=1: the presents a second and the back buffer's size, every 5 s (a flat game's frame rate)
+    static int stats = -1;
+    if (stats < 0) stats = getenv("VXRT_STATS") != NULL;
+    if (stats) {
+        static uint64_t t0, n0;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (!t0) { t0 = now; n0 = sc->presents; }
+        else if (now - t0 >= 5000000000ull) {
+            vx_log("present: %.1f/s, back buffer %ux%u (sync interval %u)", (double)(sc->presents - n0) * 1e9 / (double)(now - t0), sc->width, sc->height, sync);
+            t0 = now; n0 = sc->presents;
+        }
+    }
     return S_OK;
 }
 static WINAPI HRESULT swapchain_present1(void *this, uint32_t sync, uint32_t flags, const void *params) { (void)params; return swapchain_present(this, sync, flags); }
