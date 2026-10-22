@@ -19,7 +19,7 @@ All code in this repository was written for VeRantyx, with these exceptions:
 ## Code derived from Wine in earlier versions (replaced)
 
 From commit 744de86 (2026-10-12, "VXRuntime milestone 2") up to, but not
-including, the commit that added this section, the x64
+including, 6956637 (the commit that added this section), the x64
 virtual unwinder in `VXRuntime/src/seh.c` (the functions `code_slots`,
 `in_epilog`, `run_epilog` and `RtlVirtualUnwind`, about 120 lines) was derived
 from Wine's `dlls/ntdll/unwind.c` (`get_opcode_size`, `is_inside_epilog`,
@@ -44,7 +44,7 @@ source of each of those versions is this repository at that commit or tag; Wine'
 source is at https://gitlab.winehq.org/wine/wine. The full text of LGPL-2.1 is at
 the end of this file.
 
-The commit that added this section replaced that code. The new unwinder was
+Commit 6956637 replaced that code. The new unwinder was
 written by an agent that did not look at Wine, from a behaviour description
 based only on Microsoft's public documentation ("x64 exception handling", "x64
 prolog and epilog"), and is checked by a new test (`VXRuntime/tests/unwind.c`,
