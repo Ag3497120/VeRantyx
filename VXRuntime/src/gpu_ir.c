@@ -1952,7 +1952,13 @@ static int stream_render_pass_active(const gpu_ir_stream *stream) {
     return active;
 }
 
-int gpu_ir_record_begin_render_pass(gpu_ir_stream *s, gpu_ir_resource *color_attachment,
+int gpu_ir_format_is_depth(uint32_t format) {
+    return format == GPU_IR_FORMAT_D16_UNORM || format == GPU_IR_FORMAT_D32_FLOAT ||
+           format == GPU_IR_FORMAT_D32_FLOAT_S8_UINT;
+}
+
+static int record_begin_render_pass(gpu_ir_stream *s, gpu_ir_resource *color_attachment,
+                                    gpu_ir_resource *depth_attachment,
                                     const gpu_ir_render_pass_desc *description, uint32_t *index) {
     if (index) *index = GPU_IR_NO_COMMAND;
     const gpu_ir_texture_desc *texture = gpu_ir_texture_description(color_attachment);
@@ -1969,15 +1975,42 @@ int gpu_ir_record_begin_render_pass(gpu_ir_stream *s, gpu_ir_resource *color_att
     uint32_t height = mip_extent(texture->height, description->mip_level);
     if ((uint32_t)description->render_area.right > width ||
         (uint32_t)description->render_area.bottom > height) return GPU_IR_RANGE;
+    if (depth_attachment) {
+        // (the depth attachment: one level, one layer, the color level's size, single-sample like it)
+        const gpu_ir_texture_desc *depth = gpu_ir_texture_description(depth_attachment);
+        if (!depth || !gpu_ir_format_is_depth(depth->format) || depth->is_3d || depth->sample_count != 1 ||
+            depth->width != width || depth->height != height ||
+            description->depth_load_action > GPU_IR_RENDER_PASS_DONT_CARE ||
+            description->depth_store_action > GPU_IR_RENDER_PASS_STORE_DONT_CARE ||
+            (description->depth_load_action == GPU_IR_RENDER_PASS_CLEAR &&
+             !(description->clear_depth >= 0.0f && description->clear_depth <= 1.0f))) return GPU_IR_INVALID;
+    }
     if (stream_render_pass_active(s) != 0) return GPU_IR_INVALID;
     gpu_ir_command *command = stream_append_command(s, GPU_IR_OP_BEGIN_RENDER_PASS);
     if (!command) return GPU_IR_OUT_OF_MEMORY;
     command->src = color_attachment;
+    command->dst = depth_attachment;            // (released with the command, as every command's src and dst)
     command->copy.render_pass = *description;
     gpu_ir_resource_retain(color_attachment);
+    if (depth_attachment) gpu_ir_resource_retain(depth_attachment);
     if (index) *index = s->count;
     s->count++;
     return GPU_IR_OK;
+}
+
+int gpu_ir_record_begin_render_pass(gpu_ir_stream *s, gpu_ir_resource *color_attachment,
+                                    const gpu_ir_render_pass_desc *description, uint32_t *index) {
+    return record_begin_render_pass(s, color_attachment, NULL, description, index);
+}
+
+int gpu_ir_record_begin_render_pass_depth(gpu_ir_stream *s, gpu_ir_resource *color_attachment,
+                                          gpu_ir_resource *depth_attachment,
+                                          const gpu_ir_render_pass_desc *description, uint32_t *index) {
+    if (!depth_attachment) {
+        if (index) *index = GPU_IR_NO_COMMAND;
+        return GPU_IR_INVALID;
+    }
+    return record_begin_render_pass(s, color_attachment, depth_attachment, description, index);
 }
 
 int gpu_ir_record_end_render_pass(gpu_ir_stream *s, uint32_t *index) {
@@ -2890,7 +2923,7 @@ int gpu_ir_execute(const gpu_ir_stream *s, uint32_t index, const gpu_ir_backend 
     }
     if (cmd->op == GPU_IR_OP_BEGIN_RENDER_PASS) {
         if (!backend->begin_render_pass) return GPU_IR_UNSUPPORTED;
-        return backend->begin_render_pass(backend->context, cmd->src, &cmd->copy.render_pass);
+        return backend->begin_render_pass(backend->context, cmd->src, cmd->dst, &cmd->copy.render_pass);
     }
     if (cmd->op == GPU_IR_OP_END_RENDER_PASS) {
         if (!backend->end_render_pass) return GPU_IR_UNSUPPORTED;

@@ -60,6 +60,7 @@ gpu_ir_resource *gpu_ir_metal_buffer_create(gpu_ir_metal_device *device, uint64_
 gpu_ir_resource *gpu_ir_metal_texture_create_from_buffer(gpu_ir_metal_device *device,
     gpu_ir_resource *buffer, uint64_t offset, uint64_t row_pitch, const gpu_ir_texture_desc *description,
     int shader_read, int shader_write);
+gpu_ir_resource *gpu_ir_metal_depth_texture_create(gpu_ir_metal_device *device, const gpu_ir_texture_desc *description);
 void *gpu_ir_metal_buffer_contents(const gpu_ir_resource *resource);
 gpu_ir_pipeline *gpu_ir_metal_compute_pipeline_create(gpu_ir_metal_device *device,
                                                       const gpu_ir_shader *shader,
@@ -83,6 +84,11 @@ gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_layout(gpu_ir_metal_
     const char *vertex_source, const char *fragment_source, uint32_t color_format,
     const gpu_ir_vertex_input_desc *vertex_input, gpu_ir_pipeline_layout *layout,
     char *error, size_t error_capacity);
+// The same with a depth state (NULL or a format of GPU_IR_FORMAT_UNDEFINED: no depth attachment).
+gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_depth(gpu_ir_metal_device *device,
+    const char *vertex_source, const char *fragment_source, uint32_t color_format,
+    const gpu_ir_vertex_input_desc *vertex_input, const gpu_ir_color_blend_state *color_blend,
+    const gpu_ir_depth_state *depth, gpu_ir_pipeline_layout *layout, char *error, size_t error_capacity);
 gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_blend(gpu_ir_metal_device *device,
     const char *vertex_source, const char *fragment_source, uint32_t color_format,
     const gpu_ir_vertex_input_desc *vertex_input, const gpu_ir_color_blend_state *color_blend,

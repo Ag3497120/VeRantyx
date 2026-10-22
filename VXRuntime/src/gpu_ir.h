@@ -261,6 +261,10 @@ typedef struct {
         uint32_t color_uint[4];
         int32_t color_sint[4];
     } clear_value;
+    // With a depth attachment (gpu_ir_record_begin_render_pass_depth): its load/store actions and clear value,
+    // confined to the render area as the color attachment's are.
+    uint32_t depth_load_action, depth_store_action;
+    float clear_depth;
 } gpu_ir_render_pass_desc;
 
 enum {
@@ -327,7 +331,11 @@ enum {
     GPU_IR_FORMAT_R16G16B16A16_FLOAT,
     GPU_IR_FORMAT_R32_FLOAT,
     GPU_IR_FORMAT_R32_UINT,
-    GPU_IR_FORMAT_R32_SINT
+    GPU_IR_FORMAT_R32_SINT,
+    // Depth formats: attachments only (Metal keeps them in private textures, not in a buffer's memory).
+    GPU_IR_FORMAT_D16_UNORM,
+    GPU_IR_FORMAT_D32_FLOAT,
+    GPU_IR_FORMAT_D32_FLOAT_S8_UINT
 };
 
 typedef struct {
@@ -621,12 +629,34 @@ typedef struct {
 } gpu_ir_color_blend_state;
 int gpu_ir_color_blend_state_valid(const gpu_ir_color_blend_state *state);
 
+// Depth comparisons, in Vulkan's VkCompareOp order (D3D12's D3D12_COMPARISON_FUNC is this plus one).
+enum {
+    GPU_IR_COMPARE_NEVER = 0,
+    GPU_IR_COMPARE_LESS,
+    GPU_IR_COMPARE_EQUAL,
+    GPU_IR_COMPARE_LESS_OR_EQUAL,
+    GPU_IR_COMPARE_GREATER,
+    GPU_IR_COMPARE_NOT_EQUAL,
+    GPU_IR_COMPARE_GREATER_OR_EQUAL,
+    GPU_IR_COMPARE_ALWAYS
+};
+
+// A graphics pipeline's depth state. format is the depth attachment's common format the pipeline renders with
+// (GPU_IR_FORMAT_UNDEFINED: none, and the pass must have none); a pipeline with a format and the test disabled still
+// renders into a pass with that attachment.
+typedef struct {
+    uint32_t format;
+    uint32_t test_enabled, write_enabled, compare;
+} gpu_ir_depth_state;
+
 typedef struct {
     uint32_t kind, stage_mask;
     uint32_t threadgroup_size[3];
     gpu_ir_vertex_input_desc vertex_input;
     gpu_ir_color_blend_state color_blend;
+    gpu_ir_depth_state depth;
 } gpu_ir_pipeline_info;
+int gpu_ir_format_is_depth(uint32_t format);
 
 typedef struct {
     gpu_ir_pipeline_info info;
@@ -1209,6 +1239,7 @@ typedef struct {
     int (*fill_buffer_pattern)(void *context, const gpu_ir_resource *dst, uint64_t dst_offset,
                                uint64_t size, const void *pattern, uint32_t pattern_size);
     int (*begin_render_pass)(void *context, const gpu_ir_resource *color_attachment,
+                             const gpu_ir_resource *depth_attachment,
                              const gpu_ir_render_pass_desc *description);
     int (*end_render_pass)(void *context);
 } gpu_ir_backend;
@@ -1260,6 +1291,10 @@ int gpu_ir_record_clear_depth_stencil(gpu_ir_stream *stream, gpu_ir_resource *te
                                       uint32_t rectangle_count, uint32_t *index);
 int gpu_ir_record_begin_render_pass(gpu_ir_stream *stream, gpu_ir_resource *color_attachment,
                                     const gpu_ir_render_pass_desc *description, uint32_t *index);
+// The same with a depth attachment (a depth-format texture the size of the color attachment's level).
+int gpu_ir_record_begin_render_pass_depth(gpu_ir_stream *stream, gpu_ir_resource *color_attachment,
+                                          gpu_ir_resource *depth_attachment,
+                                          const gpu_ir_render_pass_desc *description, uint32_t *index);
 int gpu_ir_record_end_render_pass(gpu_ir_stream *stream, uint32_t *index);
 int gpu_ir_record_barrier(gpu_ir_stream *stream, const gpu_ir_barrier_desc *barrier, uint32_t *index);
 int gpu_ir_record_dispatch(gpu_ir_stream *stream, gpu_ir_pipeline *pipeline,

@@ -11,6 +11,18 @@ is such a Windows program (MinGW, linked against an import library made from the
 draws a triangle into an offscreen BGRA8 image, copies it to a host-visible buffer and checks a pixel inside and one
 outside, then draws into a window's swapchain and presents three frames.
 
+Depth attachments: `VK_FORMAT_D16_UNORM`, `D32_SFLOAT` and `D32_SFLOAT_S8_UINT` (not `D24_UNORM_S8_UINT`, which
+Apple silicon lacks; programs fall back to `D32_SFLOAT_S8_UINT`) are optimal-tiled depth/stencil attachment formats.
+A depth image is its own private Metal texture: Metal keeps depth formats out of buffers' memory, so it does not alias
+its bound `VkDeviceMemory`, which nothing reads it through. A render pass may have one color attachment and one depth
+attachment (layout `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`), with load/store actions and a clear value confined to the
+render area as the color's are; a pipeline in such a pass renders with its depth format and applies
+`depthTestEnable`, `depthWriteEnable` and `depthCompareOp` (an `MTLDepthStencilState`). Stencil and depth-bounds
+tests are rejected at pipeline creation. The common GPU IR carries this for every front end:
+`gpu_ir_record_begin_render_pass_depth` and the pipeline's `gpu_ir_depth_state`. `tests/vulkan_win.c` checks it with
+a D32 attachment cleared to 0.5 and `LESS`: a triangle at z 0.8 alone leaves the clear color, and one at z 0.2 drawn
+after it shows.
+
 `VXRuntime/src/vulkan.c` registers an in-tree `vulkan-1.dll` frontend and reports Vulkan 1.0 with no layers. It
 advertises the `VK_KHR_maintenance1` and `VK_KHR_swapchain` device extensions; enabling swapchain support requires
 the instance to enable both Win32 surface prerequisites. It creates a graphics/compute/transfer device on unified-memory
@@ -165,7 +177,7 @@ matrix access remain unsupported.
 Other storage/sampled-image shader shapes, formats, access operands and dimensions beyond the single-sample,
 non-arrayed 2D `Rgba8` storage and float32 sampled-image shader subset (Vulkan sampled formats include R8, RG8, RGBA8,
 BGRA8, RGBA16F and R32F), sampled/storage Vulkan array images, unsupported sampler features and sampling forms,
-depth/stencil image clears, graphics pipelines beyond the documented one-attachment triangle slice, vertex formats and shader inputs outside the float32 scalar/vector and scalar 32-bit signed/unsigned integer subset,
+depth/stencil image clears, stencil and depth-bounds tests, more than one color attachment, graphics pipelines beyond the documented triangle slice, vertex formats and shader inputs outside the float32 scalar/vector and scalar 32-bit signed/unsigned integer subset,
 non-float or non-default-interpolation varyings, uniform-buffer block vectors, array members, nested structs or non-32-bit scalar members,
 timeline semaphores and broader WSI features remain unsupported; this frontend is not yet suitable for general Vulkan
 games or claimed as a conformant Vulkan implementation. The Win32 WSI path creates surfaces for live VXRuntime windows,

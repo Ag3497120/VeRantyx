@@ -394,7 +394,11 @@ typedef struct {
     VkAllocationCallbacks allocator;
     uint8_t has_allocator, externally_alive;
     uint32_t refs;
-    VkAttachmentDescription attachment;
+    VkAttachmentDescription attachment;          // the color attachment
+    uint32_t color_index;                        // its index in the pass's (and framebuffers') attachments
+    uint8_t has_depth;                           // and a depth attachment, at depth_index
+    uint32_t depth_index;
+    VkAttachmentDescription depth_attachment;
 } vx_vk_render_pass;
 
 typedef struct {
@@ -403,7 +407,8 @@ typedef struct {
     VkAllocationCallbacks allocator;
     uint8_t has_allocator, externally_alive;
     vx_vk_render_pass *render_pass;
-    vx_vk_image_view *view;
+    vx_vk_image_view *view;                      // the color attachment's view
+    vx_vk_image_view *depth_view;                // the depth attachment's, with a pass that has one
     uint32_t width, height, layer;
 } vx_vk_framebuffer;
 
@@ -1349,13 +1354,35 @@ static int vk_format_to_gpu(VkFormat format, uint32_t *gpu_format, uint32_t *byt
             *gpu_format = GPU_IR_FORMAT_R32_SINT; *bytes_per_texel = 4; return 1;
         case VK_FORMAT_R32_SFLOAT:
             *gpu_format = GPU_IR_FORMAT_R32_FLOAT; *bytes_per_texel = 4; return 1;
+        case VK_FORMAT_D16_UNORM:
+            *gpu_format = GPU_IR_FORMAT_D16_UNORM; *bytes_per_texel = 2; return 1;
+        case VK_FORMAT_D32_SFLOAT:
+            *gpu_format = GPU_IR_FORMAT_D32_FLOAT; *bytes_per_texel = 4; return 1;
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            *gpu_format = GPU_IR_FORMAT_D32_FLOAT_S8_UINT; *bytes_per_texel = 8; return 1;
         default: return 0;
     }
+}
+
+// Depth formats: optimal-tiled depth attachments only, each its own private Metal texture (VK_FORMAT_D24_UNORM_S8_UINT
+// is not offered: Apple silicon has no 24-bit depth, and programs fall back to D32_SFLOAT_S8_UINT when it is absent).
+static int vk_format_is_depth(VkFormat format) {
+    return format == VK_FORMAT_D16_UNORM || format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+}
+
+// The aspects a view of a depth image may name: DEPTH, and with D32_SFLOAT_S8_UINT also DEPTH|STENCIL (an attachment
+// view). Any other mask answers DEPTH, which does not equal it, so the caller rejects it.
+static VkImageAspectFlags vk_depth_view_aspects(VkFormat format, VkImageAspectFlags requested) {
+    if (format == VK_FORMAT_D32_SFLOAT_S8_UINT && requested == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+        return requested;
+    return VK_IMAGE_ASPECT_DEPTH_BIT;
 }
 
 static VkFormatFeatureFlags vk_image_format_features(VkPhysicalDevice physicalDevice, VkFormat format,
                                                        VkImageTiling tiling) {
     uint32_t gpu_format = 0, bytes = 0;
+    if (physical_device_is_valid(physicalDevice) && vk_format_is_depth(format))
+        return tiling == VK_IMAGE_TILING_OPTIMAL ? VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
     if (!physical_device_is_valid(physicalDevice) ||
         (tiling != VK_IMAGE_TILING_LINEAR && tiling != VK_IMAGE_TILING_OPTIMAL) ||
         !vk_format_to_gpu(format, &gpu_format, &bytes) ||
@@ -1385,6 +1412,8 @@ static int vk_image_usage_supported(VkPhysicalDevice physicalDevice, VkFormat fo
                                     VkImageUsageFlags usage, int maintenance1_enabled) {
     VkFormatFeatureFlags features = vk_image_format_features(physicalDevice, format, tiling);
     if (!features) return 0;
+    if (vk_format_is_depth(format)) return usage == VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) return 0;
     if ((usage & VK_IMAGE_USAGE_SAMPLED_BIT) && !(features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return 0;
     if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return 0;
     if ((usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
@@ -2286,13 +2315,15 @@ VkResult WINAPI vkCreateImage(VkDevice device, const VkImageCreateInfo *pCreateI
         pCreateInfo->samples != VK_SAMPLE_COUNT_1_BIT || !pCreateInfo->usage ||
         (pCreateInfo->usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) ||
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ||
         pCreateInfo->sharingMode != VK_SHARING_MODE_EXCLUSIVE || pCreateInfo->queueFamilyIndexCount ||
         (pCreateInfo->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
          pCreateInfo->initialLayout != VK_IMAGE_LAYOUT_PREINITIALIZED) || !allocator_is_valid(pAllocator))
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    int depth = vk_format_is_depth(pCreateInfo->format);
     if (!vk_format_to_gpu(pCreateInfo->format, &gpu_format, &bytes_per_texel) ||
-        !gpu_ir_metal_linear_texture_alignment(device->physical_device->owner->metal, gpu_format) ||
+        (!depth && !gpu_ir_metal_linear_texture_alignment(device->physical_device->owner->metal, gpu_format)) ||
+        (depth && pCreateInfo->arrayLayers != 1) ||
         !vk_image_usage_supported(device->physical_device, pCreateInfo->format, pCreateInfo->tiling,
                                   pCreateInfo->usage, device->maintenance1_enabled))
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -2310,8 +2341,10 @@ VkResult WINAPI vkCreateImage(VkDevice device, const VkImageCreateInfo *pCreateI
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     if (pCreateInfo->extent.width > 4096 || pCreateInfo->extent.height > 4096)
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
-    uint64_t row_pitch = gpu_ir_metal_linear_texture_row_pitch(device->physical_device->owner->metal,
-        gpu_format, pCreateInfo->extent.width);
+    // (a depth image's memory is only its size: the image lives in its own private texture, see vkBindImageMemory)
+    uint64_t row_pitch = depth ? (uint64_t)pCreateInfo->extent.width * bytes_per_texel :
+        gpu_ir_metal_linear_texture_row_pitch(device->physical_device->owner->metal, gpu_format,
+                                              pCreateInfo->extent.width);
     if (!row_pitch || row_pitch > UINT64_MAX / pCreateInfo->extent.height)
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     uint64_t array_pitch = row_pitch * pCreateInfo->extent.height;
@@ -2339,7 +2372,8 @@ VkResult WINAPI vkCreateImage(VkDevice device, const VkImageCreateInfo *pCreateI
     image->row_pitch = row_pitch;
     image->array_pitch = array_pitch;
     image->size = size;
-    image->alignment = gpu_ir_metal_linear_texture_alignment(device->physical_device->owner->metal, gpu_format);
+    image->alignment = depth ? 256 :
+        gpu_ir_metal_linear_texture_alignment(device->physical_device->owner->metal, gpu_format);
     if (pAllocator) {
         image->allocator = *pAllocator;
         image->has_allocator = 1;
@@ -2421,7 +2455,8 @@ VkResult WINAPI vkCreateImageView(VkDevice device, const VkImageViewCreateInfo *
         !vk_component_swizzle_valid(pCreateInfo->components.g) ||
         !vk_component_swizzle_valid(pCreateInfo->components.b) ||
         !vk_component_swizzle_valid(pCreateInfo->components.a) ||
-        range->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT || range->baseMipLevel != 0 ||
+        range->aspectMask != (vk_format_is_depth(image->format) ? vk_depth_view_aspects(image->format, range->aspectMask) :
+                              VK_IMAGE_ASPECT_COLOR_BIT) || range->baseMipLevel != 0 ||
         (range->levelCount != 1 && range->levelCount != UINT32_MAX) || !view_layer_count ||
         view_layer_count != 1 || range->baseArrayLayer >= image->array_layers)
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -2481,11 +2516,34 @@ VkResult WINAPI vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo
     if (!device_is_valid(device) || !pCreateInfo ||
         pCreateInfo->sType != VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO || pCreateInfo->pNext ||
         pCreateInfo->flags || !allocator_is_valid(pAllocator)) return VK_ERROR_INITIALIZATION_FAILED;
-    if (pCreateInfo->attachmentCount != 1 || !pCreateInfo->pAttachments ||
+    // One subpass with one color attachment, and optionally a depth attachment (the other of two).
+    if (pCreateInfo->attachmentCount < 1 || pCreateInfo->attachmentCount > 2 || !pCreateInfo->pAttachments ||
         pCreateInfo->subpassCount != 1 || !pCreateInfo->pSubpasses || pCreateInfo->dependencyCount ||
         pCreateInfo->pDependencies) return VK_ERROR_FEATURE_NOT_PRESENT;
-    const VkAttachmentDescription *attachment = &pCreateInfo->pAttachments[0];
     const VkSubpassDescription *subpass = &pCreateInfo->pSubpasses[0];
+    if (subpass->colorAttachmentCount != 1 || !subpass->pColorAttachments ||
+        subpass->pColorAttachments[0].attachment >= pCreateInfo->attachmentCount) return VK_ERROR_FEATURE_NOT_PRESENT;
+    uint32_t color_index = subpass->pColorAttachments[0].attachment;
+    const VkAttachmentReference *depth_reference = subpass->pDepthStencilAttachment &&
+        subpass->pDepthStencilAttachment->attachment != VK_ATTACHMENT_UNUSED ? subpass->pDepthStencilAttachment : NULL;
+    if ((pCreateInfo->attachmentCount == 2) != (depth_reference != NULL) ||
+        (depth_reference && (depth_reference->attachment >= 2 || depth_reference->attachment == color_index ||
+                             depth_reference->layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)))
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    const VkAttachmentDescription *attachment = &pCreateInfo->pAttachments[color_index];
+    const VkAttachmentDescription *depth = depth_reference ? &pCreateInfo->pAttachments[depth_reference->attachment] : NULL;
+    if (depth) {
+        // (stencil contents are not kept apart from depth yet: stencil load/store actions are accepted and do as depth's)
+        if ((depth->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && depth->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED) ||
+            depth->flags || depth->samples != VK_SAMPLE_COUNT_1_BIT || !vk_format_is_depth(depth->format) ||
+            depth->loadOp > VK_ATTACHMENT_LOAD_OP_DONT_CARE || depth->storeOp > VK_ATTACHMENT_STORE_OP_DONT_CARE ||
+            (depth->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
+             depth->initialLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL &&
+             depth->initialLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) ||
+            (depth->finalLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL &&
+             depth->finalLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL))
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
     if (attachment->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD &&
         attachment->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED) return VK_ERROR_INITIALIZATION_FAILED;
     if (attachment->flags || attachment->samples != VK_SAMPLE_COUNT_1_BIT ||
@@ -2498,10 +2556,8 @@ VkResult WINAPI vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo
         !(vk_image_format_features(device->physical_device, attachment->format, VK_IMAGE_TILING_OPTIMAL) &
           VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     if (subpass->flags || subpass->pipelineBindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS ||
-        subpass->inputAttachmentCount || subpass->pInputAttachments || subpass->colorAttachmentCount != 1 ||
-        !subpass->pColorAttachments || subpass->pResolveAttachments || subpass->pDepthStencilAttachment ||
-        subpass->preserveAttachmentCount || subpass->pPreserveAttachments ||
-        subpass->pColorAttachments[0].attachment != 0 ||
+        subpass->inputAttachmentCount || subpass->pInputAttachments ||
+        subpass->pResolveAttachments || subpass->preserveAttachmentCount || subpass->pPreserveAttachments ||
         subpass->pColorAttachments[0].layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
         return VK_ERROR_FEATURE_NOT_PRESENT;
     vx_vk_render_pass *render_pass = object_allocate(pAllocator, sizeof *render_pass,
@@ -2512,6 +2568,10 @@ VkResult WINAPI vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo
     render_pass->externally_alive = 1;
     render_pass->refs = 1;
     render_pass->attachment = *attachment;
+    render_pass->color_index = color_index;
+    render_pass->has_depth = depth != NULL;
+    render_pass->depth_index = depth_reference ? depth_reference->attachment : 0;
+    if (depth) render_pass->depth_attachment = *depth;
     if (pAllocator) { render_pass->allocator = *pAllocator; render_pass->has_allocator = 1; }
     *pRenderPass = render_pass_to_handle(render_pass);
     return VK_SUCCESS;
@@ -2533,21 +2593,36 @@ VkResult WINAPI vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateIn
     if (!device_is_valid(device) || !pCreateInfo ||
         pCreateInfo->sType != VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO || pCreateInfo->pNext ||
         pCreateInfo->flags || !pCreateInfo->width || !pCreateInfo->height || pCreateInfo->layers != 1 ||
-        pCreateInfo->attachmentCount != 1 || !pCreateInfo->pAttachments || !allocator_is_valid(pAllocator))
+        pCreateInfo->attachmentCount < 1 || pCreateInfo->attachmentCount > 2 || !pCreateInfo->pAttachments ||
+        !allocator_is_valid(pAllocator))
         return VK_ERROR_INITIALIZATION_FAILED;
     vx_vk_render_pass *render_pass = render_pass_from_handle(pCreateInfo->renderPass, device);
-    vx_vk_image_view *view = image_view_from_handle(pCreateInfo->pAttachments[0], device);
+    if (!render_pass || pCreateInfo->attachmentCount != 1u + render_pass->has_depth) return VK_ERROR_INITIALIZATION_FAILED;
+    vx_vk_image_view *view = image_view_from_handle(pCreateInfo->pAttachments[render_pass->color_index], device);
+    vx_vk_image_view *depth_view = render_pass->has_depth ?
+        image_view_from_handle(pCreateInfo->pAttachments[render_pass->depth_index], device) : NULL;
+    // (the depth view: the pass's depth format, bound, at least the framebuffer's size, one level and layer)
+    if (render_pass->has_depth &&
+        (!view || !depth_view || depth_view->format != render_pass->depth_attachment.format || !depth_view->image->bound ||
+         !(depth_view->image->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) ||
+         depth_view->image->width != view->image->width || depth_view->image->height != view->image->height))
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
     if (!render_pass || !view || view->format != render_pass->attachment.format || !view->image->bound ||
         !(view->image->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || pCreateInfo->width > view->image->width ||
         pCreateInfo->height > view->image->height || pCreateInfo->width > 4096 || pCreateInfo->height > 4096 ||
         view->subresource_range.baseMipLevel != 0 || view->subresource_range.levelCount != 1)
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     if (render_pass->refs == UINT32_MAX || !image_view_retain(view)) return VK_ERROR_TOO_MANY_OBJECTS;
+    if (depth_view && !image_view_retain(depth_view)) {
+        image_view_release(view);
+        return VK_ERROR_TOO_MANY_OBJECTS;
+    }
     render_pass_retain(render_pass);
     vx_vk_framebuffer *framebuffer = object_allocate(pAllocator, sizeof *framebuffer,
         alignof(vx_vk_framebuffer), VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
     if (!framebuffer) {
         image_view_release(view);
+        if (depth_view) image_view_release(depth_view);
         render_pass_release(render_pass);
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
@@ -2556,6 +2631,7 @@ VkResult WINAPI vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateIn
     framebuffer->externally_alive = 1;
     framebuffer->render_pass = render_pass;
     framebuffer->view = view;
+    framebuffer->depth_view = depth_view;
     framebuffer->width = pCreateInfo->width;
     framebuffer->height = pCreateInfo->height;
     framebuffer->layer = view->subresource_range.baseArrayLayer;
@@ -2573,6 +2649,7 @@ void WINAPI vkDestroyFramebuffer(VkDevice device, VkFramebuffer framebufferHandl
     int has_allocator = framebuffer->has_allocator;
     framebuffer->externally_alive = 0;
     image_view_release(framebuffer->view);
+    if (framebuffer->depth_view) image_view_release(framebuffer->depth_view);
     render_pass_release(framebuffer->render_pass);
     framebuffer->magic = 0;
     object_free(has_allocator ? &allocator : NULL, framebuffer);
@@ -2706,7 +2783,12 @@ VkResult WINAPI vkBindImageMemory(VkDevice device, VkImage imageHandle, VkDevice
     };
     gpu_ir_resource **layer_resources = NULL;
     gpu_ir_resource *resource = NULL;
-    if (image->array_layers > 1) {
+    if (vk_format_is_depth(image->format)) {
+        // (its own private texture: Metal keeps depth formats out of buffers' memory; the memory is still bound
+        //  and counted, as Vulkan requires, but nothing reads a depth image through it)
+        resource = gpu_ir_metal_depth_texture_create(device->physical_device->owner->metal, &description);
+        if (!resource) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    } else if (image->array_layers > 1) {
         size_t allocation_size = (size_t)image->array_layers * sizeof *layer_resources;
         if (allocation_size / sizeof *layer_resources != image->array_layers) return VK_ERROR_OUT_OF_HOST_MEMORY;
         layer_resources = object_allocate(image->has_allocator ? &image->allocator : NULL, allocation_size,
@@ -4286,9 +4368,12 @@ VkResult WINAPI vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipel
             rasterization->lineWidth != 1.0f || multisample->rasterizationSamples != VK_SAMPLE_COUNT_1_BIT ||
             multisample->sampleShadingEnable || multisample->alphaToCoverageEnable || multisample->alphaToOneEnable ||
             (multisample->pSampleMask && !(*multisample->pSampleMask & 1u)) ||
-            (info->pDepthStencilState && (info->pDepthStencilState->depthTestEnable ||
-             info->pDepthStencilState->depthWriteEnable || info->pDepthStencilState->depthBoundsTestEnable ||
-             info->pDepthStencilState->stencilTestEnable))) {
+            // (depth test and writes need the pass's depth attachment; bounds and stencil tests are not done yet)
+            (info->pDepthStencilState && (info->pDepthStencilState->depthBoundsTestEnable ||
+             info->pDepthStencilState->stencilTestEnable ||
+             ((info->pDepthStencilState->depthTestEnable || info->pDepthStencilState->depthWriteEnable) &&
+              !render_pass->has_depth) ||
+             (unsigned)info->pDepthStencilState->depthCompareOp > VK_COMPARE_OP_ALWAYS))) {
             result = VK_ERROR_FEATURE_NOT_PRESENT;
             break;
         }
@@ -4423,10 +4508,22 @@ VkResult WINAPI vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipel
             break;
         }
 
+        // The pass's depth attachment: the pipeline renders with its format whether or not it tests (VkCompareOp and
+        // the common compare enum share their order).
+        gpu_ir_depth_state common_depth = { 0 };
+        if (render_pass->has_depth) {
+            uint32_t depth_bytes = 0;
+            vk_format_to_gpu(render_pass->depth_attachment.format, &common_depth.format, &depth_bytes);
+            if (info->pDepthStencilState) {
+                common_depth.test_enabled = info->pDepthStencilState->depthTestEnable != 0;
+                common_depth.write_enabled = info->pDepthStencilState->depthWriteEnable != 0;
+                common_depth.compare = (uint32_t)info->pDepthStencilState->depthCompareOp;
+            }
+        }
         char error[512] = { 0 };
-        gpu_ir_pipeline *gpu_pipeline = gpu_ir_metal_graphics_pipeline_create_with_blend(
+        gpu_ir_pipeline *gpu_pipeline = gpu_ir_metal_graphics_pipeline_create_with_depth(
             device->physical_device->owner->metal, vertex_msl, fragment_msl, gpu_format,
-            &common_vertex_input, &common_color_blend, layout->gpu_layout, error, sizeof error);
+            &common_vertex_input, &common_color_blend, &common_depth, layout->gpu_layout, error, sizeof error);
         gpu_ir_shader_release(vertex_shader);
         gpu_ir_shader_release(fragment_shader);
         gpu_ir_pipeline_layout_release(vertex_layout);
@@ -5608,13 +5705,17 @@ void WINAPI vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPa
         !framebuffer->view || !framebuffer->view->image->bound || !framebuffer->view->image->resource ||
         pRenderPassBegin->renderArea.offset.x < 0 || pRenderPassBegin->renderArea.offset.y < 0 ||
         !pRenderPassBegin->renderArea.extent.width || !pRenderPassBegin->renderArea.extent.height ||
-        pRenderPassBegin->clearValueCount > 1 ||
+        pRenderPassBegin->clearValueCount > 1u + render_pass->has_depth ||
         (pRenderPassBegin->clearValueCount && !pRenderPassBegin->pClearValues) ||
+        (render_pass->has_depth && (!framebuffer->depth_view || !framebuffer->depth_view->image->resource ||
+         (render_pass->depth_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+          pRenderPassBegin->clearValueCount <= render_pass->depth_index))) ||
         (uint64_t)(uint32_t)pRenderPassBegin->renderArea.offset.x + pRenderPassBegin->renderArea.extent.width >
             framebuffer->width ||
         (uint64_t)(uint32_t)pRenderPassBegin->renderArea.offset.y + pRenderPassBegin->renderArea.extent.height >
             framebuffer->height ||
-        (render_pass->attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR && !pRenderPassBegin->clearValueCount)) {
+        (render_pass->attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+         pRenderPassBegin->clearValueCount <= render_pass->color_index)) {
         commandBuffer->record_error = GPU_IR_INVALID;
         return;
     }
@@ -5645,16 +5746,27 @@ void WINAPI vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPa
             GPU_IR_RENDER_PASS_STORE_DONT_CARE : GPU_IR_RENDER_PASS_STORE,
         .clear_value_type = vk_clear_color_value_type(image->format)
     };
+    if (render_pass->has_depth) {
+        const VkAttachmentDescription *depth = &render_pass->depth_attachment;
+        pass.depth_load_action = depth->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? GPU_IR_RENDER_PASS_CLEAR :
+            depth->loadOp == VK_ATTACHMENT_LOAD_OP_DONT_CARE ? GPU_IR_RENDER_PASS_DONT_CARE : GPU_IR_RENDER_PASS_LOAD;
+        pass.depth_store_action = depth->storeOp == VK_ATTACHMENT_STORE_OP_DONT_CARE ?
+            GPU_IR_RENDER_PASS_STORE_DONT_CARE : GPU_IR_RENDER_PASS_STORE;
+        if (depth->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
+            pass.clear_depth = pRenderPassBegin->pClearValues[render_pass->depth_index].depthStencil.depth;
+    }
     if (render_pass->attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
-        const VkClearColorValue *color = &pRenderPassBegin->pClearValues[0].color;
+        const VkClearColorValue *color = &pRenderPassBegin->pClearValues[render_pass->color_index].color;
         if (pass.clear_value_type == GPU_IR_CLEAR_COLOR_VALUE_UINT)
             memcpy(pass.clear_value.color_uint, color->uint32, sizeof pass.clear_value.color_uint);
         else if (pass.clear_value_type == GPU_IR_CLEAR_COLOR_VALUE_SINT)
             memcpy(pass.clear_value.color_sint, color->int32, sizeof pass.clear_value.color_sint);
         else memcpy(pass.clear_value.color, color->float32, sizeof pass.clear_value.color);
     }
-    int pass_result = gpu_ir_record_begin_render_pass(&commandBuffer->stream,
-        image_layer_resource(image, layer), &pass, NULL);
+    int pass_result = render_pass->has_depth ?
+        gpu_ir_record_begin_render_pass_depth(&commandBuffer->stream, image_layer_resource(image, layer),
+                                              framebuffer->depth_view->image->resource, &pass, NULL) :
+        gpu_ir_record_begin_render_pass(&commandBuffer->stream, image_layer_resource(image, layer), &pass, NULL);
     if (pass_result != GPU_IR_OK) {
         commandBuffer->record_error = pass_result;
         return;

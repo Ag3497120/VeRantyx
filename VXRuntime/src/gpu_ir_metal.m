@@ -31,6 +31,7 @@ typedef struct {
     __strong id<MTLRenderCommandEncoder> render_encoder;
     __strong id<MTLTexture> render_target;
     MTLPixelFormat render_pixel_format;
+    MTLPixelFormat render_depth_format;      // (Invalid: the pass has no depth attachment)
     NSUInteger render_width, render_height;
     MTLScissorRect render_area_scissor;
     __strong NSMutableArray *upload_buffers;
@@ -40,6 +41,8 @@ typedef struct {
 typedef struct {
     void *state;
     MTLPixelFormat pixel_format;
+    MTLPixelFormat depth_format;             // (Invalid: no depth attachment)
+    void *depth_state;                       // id<MTLDepthStencilState>, with a depth attachment
 } gpu_ir_metal_graphics_pipeline;
 
 static void release_metal_object(void *object) {
@@ -50,6 +53,7 @@ static void release_metal_graphics_pipeline(void *object) {
     gpu_ir_metal_graphics_pipeline *pipeline = object;
     if (!pipeline) return;
     if (pipeline->state) CFRelease(pipeline->state);
+    if (pipeline->depth_state) CFRelease(pipeline->depth_state);
     free(pipeline);
 }
 
@@ -63,11 +67,15 @@ static MTLPixelFormat metal_pixel_format(uint32_t format) {
         case GPU_IR_FORMAT_R32_FLOAT: return MTLPixelFormatR32Float;
         case GPU_IR_FORMAT_R32_UINT: return MTLPixelFormatR32Uint;
         case GPU_IR_FORMAT_R32_SINT: return MTLPixelFormatR32Sint;
+        case GPU_IR_FORMAT_D16_UNORM: return MTLPixelFormatDepth16Unorm;
+        case GPU_IR_FORMAT_D32_FLOAT: return MTLPixelFormatDepth32Float;
+        case GPU_IR_FORMAT_D32_FLOAT_S8_UINT: return MTLPixelFormatDepth32Float_Stencil8;
         default: return MTLPixelFormatInvalid;
     }
 }
 
 uint64_t gpu_ir_metal_linear_texture_alignment(gpu_ir_metal_device *device, uint32_t format) {
+    if (gpu_ir_format_is_depth(format)) return 0;            // (depth textures cannot live in a buffer's memory)
     MTLPixelFormat pixel_format = metal_pixel_format(format);
     if (!device || !device->device || pixel_format == MTLPixelFormatInvalid) return 0;
     NSUInteger alignment = [device->device minimumLinearTextureAlignmentForPixelFormat:pixel_format];
@@ -225,6 +233,26 @@ gpu_ir_resource *gpu_ir_metal_texture_create_from_buffer(gpu_ir_metal_device *de
                        (shader_write ? MTLTextureUsageShaderWrite : MTLTextureUsageUnknown);
     id<MTLTexture> texture = [buffer newTextureWithDescriptor:descriptor offset:(NSUInteger)offset
                                                   bytesPerRow:(NSUInteger)row_pitch];
+    if (!texture) return NULL;
+    void *backend_object = (__bridge_retained void *)texture;
+    gpu_ir_resource *resource = gpu_ir_texture_create(description, backend_object, release_metal_object);
+    if (!resource) CFRelease(backend_object);
+    return resource;
+}
+
+// A depth attachment: its own private texture (Metal keeps depth formats out of buffers' memory, so a Vulkan depth
+// image does not alias its VkDeviceMemory; nothing maps a depth image). Render target, and shader read for sampling.
+gpu_ir_resource *gpu_ir_metal_depth_texture_create(gpu_ir_metal_device *device, const gpu_ir_texture_desc *description) {
+    if (!device || !device->device || !description || !gpu_ir_format_is_depth(description->format) ||
+        description->is_3d || description->depth != 1 || description->array_layers != 1 ||
+        description->mip_levels != 1 || description->sample_count != 1 || !description->width ||
+        !description->height) return NULL;
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:metal_pixel_format(description->format)
+                                     width:description->width height:description->height mipmapped:NO];
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [device->device newTextureWithDescriptor:descriptor];
     if (!texture) return NULL;
     void *backend_object = (__bridge_retained void *)texture;
     gpu_ir_resource *resource = gpu_ir_texture_create(description, backend_object, release_metal_object);
@@ -624,12 +652,40 @@ static void metal_set_blend_constants(id<MTLRenderCommandEncoder> encoder,
     [encoder setBlendColorRed:constants[0] green:constants[1] blue:constants[2] alpha:constants[3]];
 }
 
+static MTLCompareFunction metal_compare_function(uint32_t compare) {
+    switch (compare) {
+        case GPU_IR_COMPARE_NEVER: return MTLCompareFunctionNever;
+        case GPU_IR_COMPARE_LESS: return MTLCompareFunctionLess;
+        case GPU_IR_COMPARE_EQUAL: return MTLCompareFunctionEqual;
+        case GPU_IR_COMPARE_LESS_OR_EQUAL: return MTLCompareFunctionLessEqual;
+        case GPU_IR_COMPARE_GREATER: return MTLCompareFunctionGreater;
+        case GPU_IR_COMPARE_NOT_EQUAL: return MTLCompareFunctionNotEqual;
+        case GPU_IR_COMPARE_GREATER_OR_EQUAL: return MTLCompareFunctionGreaterEqual;
+        default: return MTLCompareFunctionAlways;
+    }
+}
+
 gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_blend(gpu_ir_metal_device *device,
     const char *vertex_source, const char *fragment_source, uint32_t color_format,
     const gpu_ir_vertex_input_desc *vertex_input, const gpu_ir_color_blend_state *color_blend,
     gpu_ir_pipeline_layout *layout,
     char *error, size_t error_capacity) {
+    return gpu_ir_metal_graphics_pipeline_create_with_depth(device, vertex_source, fragment_source, color_format,
+        vertex_input, color_blend, NULL, layout, error, error_capacity);
+}
+
+gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_depth(gpu_ir_metal_device *device,
+    const char *vertex_source, const char *fragment_source, uint32_t color_format,
+    const gpu_ir_vertex_input_desc *vertex_input, const gpu_ir_color_blend_state *color_blend,
+    const gpu_ir_depth_state *depth, gpu_ir_pipeline_layout *layout,
+    char *error, size_t error_capacity) {
     if (error && error_capacity) error[0] = 0;
+    gpu_ir_depth_state depth_state = depth ? *depth : (gpu_ir_depth_state){ 0 };
+    if (depth_state.format != GPU_IR_FORMAT_UNDEFINED &&
+        (!gpu_ir_format_is_depth(depth_state.format) || depth_state.compare > GPU_IR_COMPARE_ALWAYS)) {
+        if (error && error_capacity) snprintf(error, error_capacity, "invalid depth state");
+        return NULL;
+    }
     if (!device || !device->device || !vertex_source || !*vertex_source || !fragment_source || !*fragment_source) {
         if (error && error_capacity) snprintf(error, error_capacity, "graphics pipeline needs a device and both MSL stages");
         return NULL;
@@ -674,6 +730,11 @@ gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_blend(gpu_ir_metal_d
     description.rasterSampleCount = 1;
     description.alphaToCoverageEnabled = color_blend && color_blend->alpha_to_coverage_enabled;
     description.colorAttachments[0].pixelFormat = pixel_format;
+    MTLPixelFormat depth_format = metal_pixel_format(depth_state.format);
+    if (depth_state.format != GPU_IR_FORMAT_UNDEFINED) {
+        description.depthAttachmentPixelFormat = depth_format;
+        if (depth_format == MTLPixelFormatDepth32Float_Stencil8) description.stencilAttachmentPixelFormat = depth_format;
+    }
     const gpu_ir_color_blend_attachment *blend = color_blend && color_blend->attachment_count ?
         &color_blend->attachments[0] : NULL;
     description.colorAttachments[0].writeMask = blend ? metal_color_write_mask(blend->write_mask) : MTLColorWriteMaskAll;
@@ -720,11 +781,28 @@ gpu_ir_pipeline *gpu_ir_metal_graphics_pipeline_create_with_blend(gpu_ir_metal_d
     }
     backend->state = (__bridge_retained void *)state;
     backend->pixel_format = pixel_format;
+    backend->depth_format = depth_state.format != GPU_IR_FORMAT_UNDEFINED ? depth_format : MTLPixelFormatInvalid;
+    if (depth_state.format != GPU_IR_FORMAT_UNDEFINED) {
+        // (a disabled test is ALWAYS without writes: Metal has no switch for the test itself)
+        MTLDepthStencilDescriptor *depth_descriptor = [MTLDepthStencilDescriptor new];
+        depth_descriptor.depthCompareFunction = depth_state.test_enabled ?
+            metal_compare_function(depth_state.compare) : MTLCompareFunctionAlways;
+        depth_descriptor.depthWriteEnabled = depth_state.test_enabled && depth_state.write_enabled;
+        id<MTLDepthStencilState> depth_stencil = [device->device newDepthStencilStateWithDescriptor:depth_descriptor];
+        if (!depth_stencil) {
+            CFRelease(backend->state);
+            free(backend);
+            if (error && error_capacity) snprintf(error, error_capacity, "Metal refused the depth state");
+            return NULL;
+        }
+        backend->depth_state = (__bridge_retained void *)depth_stencil;
+    }
     gpu_ir_pipeline_desc pipeline_description = {
         .info = { .kind = GPU_IR_PIPELINE_GRAPHICS,
                   .stage_mask = GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT,
                   .vertex_input = vertex_input ? *vertex_input : (gpu_ir_vertex_input_desc){ 0 },
-                  .color_blend = color_blend ? *color_blend : (gpu_ir_color_blend_state){ 0 } },
+                  .color_blend = color_blend ? *color_blend : (gpu_ir_color_blend_state){ 0 },
+                  .depth = depth_state },
         .layout = layout,
         .backend_object = backend,
         .release = release_metal_graphics_pipeline
@@ -771,6 +849,7 @@ static void end_render_encoder(gpu_ir_metal_submission *submission) {
     submission->render_encoder = nil;
     submission->render_target = nil;
     submission->render_pixel_format = MTLPixelFormatInvalid;
+    submission->render_depth_format = MTLPixelFormatInvalid;
     submission->render_width = submission->render_height = 0;
     submission->render_area_scissor = (MTLScissorRect){ 0, 0, 0, 0 };
 }
@@ -821,7 +900,11 @@ static MTLResourceUsage metal_resource_usage(uint32_t access_mask) {
 static int metal_clear_color(void *context, const gpu_ir_resource *resource,
                              const gpu_ir_clear_color_info *clear);
 
+static int metal_clear_depth_stencil(void *context, const gpu_ir_resource *resource,
+                                     const gpu_ir_clear_depth_stencil_info *clear);
+
 static int metal_begin_render_pass(void *context, const gpu_ir_resource *color_attachment,
+                                   const gpu_ir_resource *depth_attachment,
                                    const gpu_ir_render_pass_desc *description) {
     gpu_ir_metal_submission *submission = context;
     const gpu_ir_texture_desc *resource_description = gpu_ir_texture_description(color_attachment);
@@ -862,7 +945,34 @@ static int metal_begin_render_pass(void *context, const gpu_ir_resource *color_a
         int clear_result = metal_clear_color(submission, color_attachment, &clear);
         if (clear_result != GPU_IR_OK) return clear_result;
     }
+    id<MTLTexture> depth_texture = nil;
+    if (depth_attachment) {
+        const gpu_ir_texture_desc *depth_description = gpu_ir_texture_description(depth_attachment);
+        depth_texture = (__bridge id<MTLTexture>)gpu_ir_backend_object(depth_attachment);
+        if (!depth_description || !depth_texture || depth_texture.width != width || depth_texture.height != height ||
+            depth_texture.pixelFormat != metal_pixel_format(depth_description->format) ||
+            !(depth_texture.usage & MTLTextureUsageRenderTarget)) return GPU_IR_INVALID;
+        // (cleared as the color is: a scissored clear of the render area first, then loaded)
+        if (description->depth_load_action == GPU_IR_RENDER_PASS_CLEAR) {
+            gpu_ir_clear_depth_stencil_info clear = {
+                .aspects = GPU_IR_CLEAR_DEPTH, .depth = description->clear_depth,
+                .rectangles = &description->render_area, .rectangle_count = 1
+            };
+            int clear_result = metal_clear_depth_stencil(submission, depth_attachment, &clear);
+            if (clear_result != GPU_IR_OK) return clear_result;
+        }
+    }
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (depth_texture) {
+        pass.depthAttachment.texture = depth_texture;
+        pass.depthAttachment.loadAction = MTLLoadActionLoad;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
+        if (depth_texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+            pass.stencilAttachment.texture = depth_texture;
+            pass.stencilAttachment.loadAction = MTLLoadActionLoad;
+            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+        }
+    }
     pass.colorAttachments[0].texture = texture;
     pass.colorAttachments[0].level = description->mip_level;
     pass.colorAttachments[0].slice = description->array_layer;
@@ -885,6 +995,7 @@ static int metal_begin_render_pass(void *context, const gpu_ir_resource *color_a
     submission->render_encoder = encoder;
     submission->render_target = texture;
     submission->render_pixel_format = texture.pixelFormat;
+    submission->render_depth_format = depth_texture ? depth_texture.pixelFormat : MTLPixelFormatInvalid;
     submission->render_width = width;
     submission->render_height = height;
     submission->render_area_scissor = (MTLScissorRect){
@@ -910,7 +1021,8 @@ static int metal_draw(void *context, const gpu_ir_pipeline *pipeline, const gpu_
     gpu_ir_metal_graphics_pipeline *backend = gpu_ir_pipeline_backend_object(pipeline);
     if (!submission || !submission->render_encoder || !info || info->kind != GPU_IR_PIPELINE_GRAPHICS ||
         info->stage_mask != (GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT) || !backend || !backend->state ||
-        backend->pixel_format != submission->render_pixel_format || !draw ||
+        backend->pixel_format != submission->render_pixel_format ||
+        backend->depth_format != submission->render_depth_format || !draw ||
         (access_count && !accesses)) return GPU_IR_INVALID;
     if ((!draw->indexed && (!draw->vertex_count || !draw->instance_count)) ||
         (draw->indexed && (!draw->index_count || !draw->instance_count))) return GPU_IR_OK;
@@ -975,6 +1087,8 @@ static int metal_draw(void *context, const gpu_ir_pipeline *pipeline, const gpu_
     }
     id<MTLRenderPipelineState> state = (__bridge id<MTLRenderPipelineState>)backend->state;
     [submission->render_encoder setRenderPipelineState:state];
+    if (backend->depth_state)
+        [submission->render_encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)backend->depth_state];
     const gpu_ir_pipeline_info *pipeline_info = gpu_ir_pipeline_description(pipeline);
     if (!pipeline_info) return GPU_IR_INVALID;
     metal_set_blend_constants(submission->render_encoder, pipeline_info,
@@ -1023,7 +1137,8 @@ static int metal_draw_indirect(void *context, const gpu_ir_pipeline *pipeline,
     gpu_ir_metal_graphics_pipeline *backend = gpu_ir_pipeline_backend_object(pipeline);
     if (!submission || !submission->render_encoder || !info || info->kind != GPU_IR_PIPELINE_GRAPHICS ||
         info->stage_mask != (GPU_IR_STAGE_VERTEX | GPU_IR_STAGE_FRAGMENT) || !backend || !backend->state ||
-        backend->pixel_format != submission->render_pixel_format || !gpu_ir_resource_is_buffer(arguments) ||
+        backend->pixel_format != submission->render_pixel_format ||
+        backend->depth_format != submission->render_depth_format || !gpu_ir_resource_is_buffer(arguments) ||
         count_arguments || !draw || draw->indexed > 1 || draw->has_viewport > 1 || draw->has_scissor > 1 ||
         (access_count && !accesses)) return GPU_IR_INVALID;
     if (!draw->draw_count) return GPU_IR_OK;
@@ -1096,6 +1211,8 @@ static int metal_draw_indirect(void *context, const gpu_ir_pipeline *pipeline,
                                     (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0) };
     }
     [submission->render_encoder setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)backend->state];
+    if (backend->depth_state)
+        [submission->render_encoder setDepthStencilState:(__bridge id<MTLDepthStencilState>)backend->depth_state];
     metal_set_blend_constants(submission->render_encoder, info,
                               draw->has_blend_constants, draw->blend_constants);
     [submission->render_encoder setViewport:viewport];

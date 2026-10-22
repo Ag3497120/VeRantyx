@@ -1,6 +1,7 @@
 // Vulkan from a Windows program: imports its commands from vulkan-1.dll by name (as a program linked against the
 // Vulkan SDK's vulkan-1.lib does), draws a red triangle on blue into an offscreen image and reads its pixels back,
-// then draws the same into a window's swapchain and presents three frames.
+// then draws the same into a window's swapchain and presents three frames, and checks a depth test: with a D32 depth
+// attachment cleared to 0.5 and LESS, a triangle at z 0.8 leaves the clear color and one at z 0.2 draws.
 //   vulkan_win.exe <vertex .spv> <fragment .spv>     (build/vulkan_spirv_vertex_fixture.spv, ..._fragment_fixture.spv)
 #include <windows.h>
 #include <stdio.h>
@@ -36,27 +37,46 @@ static uint32_t memory_type(VkPhysicalDevice gpu, uint32_t bits, VkFlags want) {
     return UINT32_MAX;
 }
 
+static VkRenderPass render_pass_depth(VkDevice device, VkFormat format, VkImageLayout final_layout, VkFormat depth_format);
 static VkRenderPass render_pass(VkDevice device, VkFormat format, VkImageLayout final_layout) {
+    return render_pass_depth(device, format, final_layout, 0);
+}
+// A pass with one color attachment and, with a depth_format, a depth attachment (index 1) cleared and not stored.
+static VkRenderPass render_pass_depth(VkDevice device, VkFormat format, VkImageLayout final_layout, VkFormat depth_format) {
     VkAttachmentDescription color = {
         .format = format, .samples = VK_SAMPLE_COUNT_1_BIT,
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = final_layout
     };
+    VkAttachmentDescription attachments[2] = { color, {
+        .format = depth_format, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    } };
     VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference depth_ref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
     VkSubpassDescription subpass = {
-        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &ref
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &ref,
+        .pDepthStencilAttachment = depth_format ? &depth_ref : NULL
     };
     VkRenderPassCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-        .attachmentCount = 1, .pAttachments = &color, .subpassCount = 1, .pSubpasses = &subpass
+        .attachmentCount = depth_format ? 2 : 1, .pAttachments = attachments, .subpassCount = 1, .pSubpasses = &subpass
     };
     VkRenderPass pass = 0;
     return vkCreateRenderPass(device, &info, NULL, &pass) == VK_SUCCESS ? pass : 0;
 }
 
+static VkPipeline pipeline_depth(VkDevice device, VkRenderPass pass, VkPipelineLayout layout,
+                                 VkShaderModule vs, VkShaderModule fs, uint32_t width, uint32_t height, int depth_test);
 static VkPipeline pipeline(VkDevice device, VkRenderPass pass, VkPipelineLayout layout,
                            VkShaderModule vs, VkShaderModule fs, uint32_t width, uint32_t height) {
+    return pipeline_depth(device, pass, layout, vs, fs, width, height, 0);
+}
+static VkPipeline pipeline_depth(VkDevice device, VkRenderPass pass, VkPipelineLayout layout,
+                                 VkShaderModule vs, VkShaderModule fs, uint32_t width, uint32_t height, int depth_test) {
     VkPipelineShaderStageCreateInfo stages[2] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
           .module = vs, .pName = "main" },
@@ -91,10 +111,15 @@ static VkPipeline pipeline(VkDevice device, VkRenderPass pass, VkPipelineLayout 
     VkPipelineColorBlendStateCreateInfo blend_state = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &blend
     };
+    VkPipelineDepthStencilStateCreateInfo depth_state = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS
+    };
     VkGraphicsPipelineCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = stages,
         .pVertexInputState = &vertex_input, .pInputAssemblyState = &assembly, .pViewportState = &viewport_state,
-        .pRasterizationState = &raster, .pMultisampleState = &multisample, .pColorBlendState = &blend_state,
+        .pRasterizationState = &raster, .pMultisampleState = &multisample,
+        .pDepthStencilState = depth_test ? &depth_state : NULL, .pColorBlendState = &blend_state,
         .layout = layout, .renderPass = pass, .subpass = 0
     };
     VkPipeline p = 0;
@@ -122,7 +147,7 @@ int main(int argc, char **argv) {
     VkDevice device = NULL;
     HWND window = NULL;
     int presented = 0;
-    unsigned char center[4] = { 0 }, corner[4] = { 0 };
+    unsigned char center[4] = { 0 }, corner[4] = { 0 }, depth_center[2][4] = { { 0 } };
 
     const char *instance_extensions[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vulkan_win",
@@ -246,7 +271,82 @@ int main(int argc, char **argv) {
     CHECK(center[0] == 0 && center[1] == 0 && center[2] == 255 && center[3] == 255);
     CHECK(corner[0] == 255 && corner[1] == 0 && corner[2] == 0 && corner[3] == 255);
 
-    // 2. A window's swapchain: the same picture, presented three times.
+    // 2. Depth: a D32 attachment cleared to 0.5 with LESS. A: the triangle at z 0.8 alone fails the test (blue stays);
+    //    B: z 0.8, then z 0.2, which passes (red).
+    const float layered[6][4] = {
+        { -0.5f, -0.5f, 0.8f, 1 }, { 0.5f, -0.5f, 0.8f, 1 }, { 0.0f, 0.5f, 0.8f, 1 },
+        { -0.5f, -0.5f, 0.2f, 1 }, { 0.5f, -0.5f, 0.2f, 1 }, { 0.0f, 0.5f, 0.2f, 1 },
+    };
+    vb_info.size = sizeof layered;
+    VkBuffer layered_vertices = 0;
+    CHECK(vkCreateBuffer(device, &vb_info, NULL, &layered_vertices) == VK_SUCCESS);
+    vkGetBufferMemoryRequirements(device, layered_vertices, &req);
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = memory_type(gpu, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkDeviceMemory layered_memory = 0;
+    CHECK(vkAllocateMemory(device, &alloc, NULL, &layered_memory) == VK_SUCCESS);
+    CHECK(vkBindBufferMemory(device, layered_vertices, layered_memory, 0) == VK_SUCCESS);
+    CHECK(vkMapMemory(device, layered_memory, 0, sizeof layered, 0, &mapped) == VK_SUCCESS);
+    memcpy(mapped, layered, sizeof layered);
+    vkUnmapMemory(device, layered_memory);
+    VkImageCreateInfo depth_info = image_info;
+    depth_info.format = VK_FORMAT_D32_SFLOAT;
+    depth_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    VkImage depth_image = 0;
+    CHECK(vkCreateImage(device, &depth_info, NULL, &depth_image) == VK_SUCCESS);
+    vkGetImageMemoryRequirements(device, depth_image, &req);
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = memory_type(gpu, req.memoryTypeBits, 0);
+    VkDeviceMemory depth_memory = 0;
+    CHECK(vkAllocateMemory(device, &alloc, NULL, &depth_memory) == VK_SUCCESS);
+    CHECK(vkBindImageMemory(device, depth_image, depth_memory, 0) == VK_SUCCESS);
+    VkImageViewCreateInfo depth_view_info = view_info;
+    depth_view_info.image = depth_image;
+    depth_view_info.format = VK_FORMAT_D32_SFLOAT;
+    depth_view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    VkImageView depth_view = 0;
+    CHECK(vkCreateImageView(device, &depth_view_info, NULL, &depth_view) == VK_SUCCESS);
+    VkRenderPass depth_pass = render_pass_depth(device, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                VK_FORMAT_D32_SFLOAT);
+    CHECK(depth_pass);
+    VkImageView depth_attachments[2] = { view, depth_view };
+    VkFramebufferCreateInfo depth_fb_info = fb_info;
+    depth_fb_info.renderPass = depth_pass;
+    depth_fb_info.attachmentCount = 2;
+    depth_fb_info.pAttachments = depth_attachments;
+    VkFramebuffer depth_fb = 0;
+    CHECK(vkCreateFramebuffer(device, &depth_fb_info, NULL, &depth_fb) == VK_SUCCESS);
+    VkPipeline depth_pipeline = pipeline_depth(device, depth_pass, layout, vs, fs, W, H, 1);
+    CHECK(depth_pipeline);
+    for (int run = 0; run < 2; run++) {
+        CHECK(vkResetFences(device, 1, &fence) == VK_SUCCESS);
+        CHECK(vkResetCommandBuffer(cmd, 0) == VK_SUCCESS);
+        CHECK(vkBeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+        VkClearValue clears[2] = { { .color = { .float32 = { 0, 0, 1, 1 } } },
+                                   { .depthStencil = { 0.5f, 0 } } };
+        VkRenderPassBeginInfo depth_begin = {
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = depth_pass, .framebuffer = depth_fb,
+            .renderArea = { { 0, 0 }, { W, H } }, .clearValueCount = 2, .pClearValues = clears
+        };
+        vkCmdBeginRenderPass(cmd, &depth_begin, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, depth_pipeline);
+        VkDeviceSize zero = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &layered_vertices, &zero);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        if (run) vkCmdDraw(cmd, 3, 1, 3, 0);
+        vkCmdEndRenderPass(cmd);
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &region);
+        CHECK(vkEndCommandBuffer(cmd) == VK_SUCCESS);
+        CHECK(vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS);
+        CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS);
+        CHECK(vkMapMemory(device, rb_memory, 0, W * H * 4, 0, &mapped) == VK_SUCCESS);
+        memcpy(depth_center[run], (unsigned char *)mapped + ((H / 2) * W + W / 2) * 4, 4);
+        vkUnmapMemory(device, rb_memory);
+    }
+    CHECK(depth_center[0][0] == 255 && depth_center[0][2] == 0);    // A: blue, the far triangle was rejected
+    CHECK(depth_center[1][0] == 0 && depth_center[1][2] == 255);    // B: red, the near one passed
+
+    // 3. A window's swapchain: the same picture, presented three times.
     WNDCLASSA wc = { .lpfnWndProc = DefWindowProcA, .hInstance = GetModuleHandleA(NULL), .lpszClassName = "vulkan_win" };
     RegisterClassA(&wc);
     window = CreateWindowExA(0, "vulkan_win", "vulkan_win", WS_OVERLAPPEDWINDOW, 0, 0, 320, 240, NULL, NULL, wc.hInstance, NULL);
@@ -327,8 +427,10 @@ done:
     if (instance) vkDestroyInstance(instance, NULL);
     if (window) DestroyWindow(window);
     printf("vulkan from a Windows program: commands imported from vulkan-1.dll, offscreen triangle "
-           "(center %02x%02x%02x%02x, corner %02x%02x%02x%02x as BGRA), %d frames presented: %s\n",
-           center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2], corner[3], presented,
-           bad ? "FAILED" : "ok");
+           "(center %02x%02x%02x%02x, corner %02x%02x%02x%02x as BGRA), D32 depth test LESS against 0.5 "
+           "(z 0.8 alone: %02x%02x%02x, then z 0.2: %02x%02x%02x), %d frames presented: %s\n",
+           center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2], corner[3],
+           depth_center[0][0], depth_center[0][1], depth_center[0][2], depth_center[1][0], depth_center[1][1],
+           depth_center[1][2], presented, bad ? "FAILED" : "ok");
     return bad ? 1 : 0;
 }
