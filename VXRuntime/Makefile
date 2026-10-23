@@ -2,13 +2,13 @@
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
 SRC     = src/loader.c src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src/dotnet_baml.c src/dotnet_il.c src/dotnet_exec.c src/dotnet_runtime.c src/dotnet_host.c src/kernel32.c src/system.c src/desktop.c src/services.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/winhttp.m src/directinput.m src/msxml.c src/extras.c src/context.S src/text.c src/files.c src/registry.c \
-          src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/d3d11on12.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d_format.c src/d3d12.m src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/dxil.c src/dxil_msl.c src/dxil_ir.c src/spirv.c src/spirv_ir.c src/vk_msl.c src/vk_format.m src/vk_device.m src/vk_descriptor.m src/vk_pipeline.m src/vk_command.m src/vk_internal.m src/vk_queue.m src/vk_wsi.m src/vk_dispatch.m src/directinput_buffer.c src/directinput_format.c src/input.m src/audio.m src/xaudio2.m
+          src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/d3d11on12.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d_format.c src/d3d12.m src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/dxil.c src/dxil_msl.c src/dxil_ir.c src/spirv.c src/spirv_ir.c src/vk_msl.c src/vk_format.m src/vk_device.m src/vk_descriptor.m src/vk_pipeline.m src/vk_command.m src/vk_internal.m src/vk_queue.m src/vk_wsi.m src/vk_dispatch.m src/directinput_buffer.c src/directinput_format.c src/input.m src/audio.m src/xaudio2.m src/dwrite.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
 
-build/vxrt: $(SRC) src/vx.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
+build/vxrt: $(SRC) src/vx.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Ithird_party/vulkan -fobjc-arc -o $@.tmp $(SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -Wl,-pagezero_size,0x10000 -licucore -lz && mv -f $@.tmp $@
 
@@ -27,13 +27,13 @@ build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator
 build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
 	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
-build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
+build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
 	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -Ithird_party/vulkan -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Hypervisor build/libvxrt_vm.dylib build/guest.o -licucore -lz
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe
+       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -614,6 +614,10 @@ build/xaudio2.exe: tests/xaudio2.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lxaudio2_9 -lm
 
+build/dwrite.exe: tests/dwrite.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -ldwrite -lm
+
 build/shared.exe: tests/shared.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxgi -ldxguid -luuid
@@ -1086,6 +1090,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/input.exe
 	$(VXRT) build/audio.exe
 	$(VXRT) build/xaudio2.exe
+	$(VXRT) build/dwrite.exe
 	$(VXRT) build/pipes.exe
 	$(VXRT) build/pipes.exe serve & server=$$!; $(VXRT) build/pipes.exe ask; client_status=$$?; wait $$server; server_status=$$?; test $$client_status -eq 0 -a $$server_status -eq 0
 	$(VXRT) build/ipc.exe second & second=$$!; $(VXRT) build/ipc.exe first; first_status=$$?; wait $$second; second_status=$$?; test $$first_status -eq 0 -a $$second_status -eq 0

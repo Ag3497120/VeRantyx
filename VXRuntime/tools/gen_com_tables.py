@@ -5,6 +5,7 @@
 #   tools/gen_com_tables.py <mingw include dir> > src/d3d_tables.h
 #   tools/gen_com_tables.py <mingw include dir> audio > src/audio_tables.h
 #   tools/gen_com_tables.py <mingw include dir> d3d12 > src/d3d12_tables.h
+#   tools/gen_com_tables.py <mingw include dir> dwrite > src/dwrite_tables.h
 import re, sys
 
 AUDIO = {
@@ -64,6 +65,23 @@ D3D12 = {
     "d3d12sdklayers.h": ["ID3D12Debug", "ID3D12Debug1", "ID3D12Debug2", "ID3D12Debug3", "ID3D12Debug4", "ID3D12Debug5"],
     "d3dcommon.h": ["ID3D10Blob"],
 }
+# DirectWrite (src/dwrite.m): one table per object, its newest version implemented; "?" marks interfaces wanted for
+# their IIDs only (versions not offered: QueryInterface names them in traces and answers E_NOINTERFACE).
+DWRITE = {
+    "dwrite.h": ["?IDWriteFactory", "IDWriteLocalFontFileLoader", "IDWriteFontFileStream", "IDWriteFontFile",
+                 "IDWriteLocalizedStrings", "?IDWriteRenderingParams", "?IDWriteFontFace", "?IDWriteFont", "IDWriteFontList",
+                 "IDWriteFontFamily", "IDWriteFontCollection", "IDWriteGlyphRunAnalysis", "IDWriteGdiInterop",
+                 "?IDWriteFontFileLoader", "?IDWriteFontCollectionLoader", "?IDWriteFontFileEnumerator",
+                 "?IDWriteTextAnalysisSource", "?IDWriteTextFormat", "?IDWriteTextLayout", "?IDWriteTextAnalyzer"],
+    "dwrite_1.h": ["?IDWriteFactory1", "?IDWriteFontFace1", "?IDWriteFont1", "?IDWriteRenderingParams1"],
+    "dwrite_2.h": ["IDWriteFactory2", "IDWriteFontFace2", "IDWriteFont2", "IDWriteRenderingParams2", "IDWriteFontFallback"],
+    "dwrite_3.h": ["?IDWriteFactory3", "?IDWriteFactory4", "?IDWriteFactory5", "?IDWriteFactory6", "?IDWriteFactory7",
+                   "?IDWriteFontFace3", "?IDWriteFontFace4", "?IDWriteFontFace5", "?IDWriteFont3",
+                   "?IDWriteRenderingParams3", "?IDWriteFontCollection1", "?IDWriteFontFamily1", "?IDWriteFontList1",
+                   "?IDWriteFontFallback1", "?IDWriteGdiInterop1", "?IDWriteInMemoryFontFileLoader"],
+}
+if len(sys.argv) > 2 and sys.argv[2] == "dwrite":
+    INTERFACES = DWRITE
 if len(sys.argv) > 2 and sys.argv[2] == "d3d12":
     INTERFACES = D3D12
 if len(sys.argv) > 2 and sys.argv[2] == "audio":
@@ -76,6 +94,9 @@ print("// Do not edit.")
 for header, names in INTERFACES.items():
     text = open(sys.argv[1] + "/" + header).read()
     for n in names:
+        if n.startswith("?"):
+            print("static const GUID IID_%s = %s;" % (n[1:], uuid(text, n[1:])))
+            continue
         ms = methods(text, n)
         print("static const char *const vt_%s[] = { %s };" % (n, ", ".join('"%s"' % x for x in ms)))
         for x in ms:
