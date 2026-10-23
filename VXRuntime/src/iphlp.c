@@ -10,6 +10,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <SystemConfiguration/SystemConfiguration.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <net/if_dl.h>
@@ -374,6 +375,7 @@ static int ip_monitor_start(void) {                                 // with g_ip
     if (g_ip_monitor) return g_ip_monitor > 0;
     if (!g_ip_file) g_ip_file = vx_handle_new(VX_HANDLE_IPNOTIFY, NULL, NULL);
     int s = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
+    if (s >= 0) fcntl(s, F_SETFD, FD_CLOEXEC);                     // (not for the programs this one starts)
     pthread_t thread;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
