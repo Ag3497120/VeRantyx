@@ -126,4 +126,9 @@ folder), forwards ports 9943 and 9944 to it (`adb forward`), finds its ALVR app 
   while a CoreAudio IO thread ran the earlier connection's recording callback, waiting for ALVR's session lock. The
   issue #6 session log stops at the same step. With the restart: 20 of 20 reconnections streamed again, 9-14 s after
   the mock came back (12-14 s with 10 s, 9-11 s with 6 s); no restart in a minute of steady streaming.
+- Pausing and resuming (2026-10-24, issue #8: stepping out of a Quest's boundary stops its ALVR app's OpenXR session,
+  which pauses the client, and starts it again): the mock on the Air, changed to call ALVR's pause() every 20 s and
+  resume() 3 s later, game audio on and sound playing. The bridge before the fix: the first resume left the client
+  "Connecting" for the remaining 199 s (0 of 9). Now: 13 of 13 streamed again, 6.6-9.7 s after the resume, each
+  through the encoder's restart (the handshake hung every time).
 - A Quest: only through someone who has one.

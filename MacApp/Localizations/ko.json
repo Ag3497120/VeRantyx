@@ -30,7 +30,7 @@
  "Sharper": "더 선명하게",
  "Maximum": "최대",
  "Smooth on any Apple silicon Mac.": "모든 Apple silicon Mac에서 부드럽게.",
- "3680×1840 at 100 Mbps: for Pro and Max chips, best over a USB cable.": "3680×1840, 100 Mbps: Pro 및 Max 칩용, USB 케이블 권장.",
+ "Renders about 1300×1400 per eye (Recommended: 850×920), at 100 Mbps: for Pro and Max chips, best over a USB cable.": "눈당 약 1300×1400으로 렌더링(권장: 850×920), 100 Mbps. Pro·Max 칩용, USB 케이블 권장.",
  "1440×1620 per eye, 60 fps: for Pro and Max chips (24+ GPU cores).": "한쪽 눈 1440×1620, 60 fps: Pro 및 Max 칩용(GPU 코어 24개 이상).",
  "2560×2880 per eye rendered: Max chips; 30–50 fps.": "한쪽 눈 2560×2880으로 렌더링: Max 칩용, 30–50 fps.",
  "A Vision Pro eye's pixels: 16–21 fps on an M1 Max.": "Vision Pro 한쪽 눈의 픽셀 수: M1 Max에서 16–21 fps.",

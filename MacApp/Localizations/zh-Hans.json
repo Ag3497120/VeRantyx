@@ -30,7 +30,7 @@
  "Sharper": "更清晰",
  "Maximum": "最高",
  "Smooth on any Apple silicon Mac.": "在任何 Apple silicon Mac 上都流畅。",
- "3680×1840 at 100 Mbps: for Pro and Max chips, best over a USB cable.": "3680×1840，100 Mbps：适用于 Pro 和 Max 芯片，最好用 USB 线缆。",
+ "Renders about 1300×1400 per eye (Recommended: 850×920), at 100 Mbps: for Pro and Max chips, best over a USB cable.": "每只眼约 1300×1400 渲染（推荐：850×920），100 Mbps：适合 Pro 和 Max 芯片，最好用 USB 线。",
  "1440×1620 per eye, 60 fps: for Pro and Max chips (24+ GPU cores).": "单眼 1440×1620，60 fps：适用于 Pro 和 Max 芯片（24 核以上 GPU）。",
  "2560×2880 per eye rendered: Max chips; 30–50 fps.": "单眼渲染 2560×2880：Max 芯片；30–50 fps。",
  "A Vision Pro eye's pixels: 16–21 fps on an M1 Max.": "Vision Pro 单眼的像素数：M1 Max 上 16–21 fps。",

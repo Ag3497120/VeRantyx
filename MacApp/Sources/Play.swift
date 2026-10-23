@@ -32,7 +32,8 @@ enum Quality: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .standard: return T("Smooth on any Apple silicon Mac.", "どの Apple silicon Mac でも滑らか。")
-        case .sharp: return T("3680×1840 at 100 Mbps: for Pro and Max chips, best over a USB cable.", "3680×1840・100 Mbps。Pro・Max チップ向け、USB ケーブル推奨。")
+        case .sharp: return T("Renders about 1300×1400 per eye (Recommended: 850×920), at 100 Mbps: for Pro and Max chips, best over a USB cable.",
+                              "片目 約 1300×1400 で描画（おすすめは 850×920）・100 Mbps。Pro・Max チップ向け、USB ケーブル推奨。")
         case .k3: return T("1440×1620 per eye, 60 fps: for Pro and Max chips (24+ GPU cores).", "片目 1440×1620・60 fps。Pro・Max チップ向け（GPU 24 コア以上）。")
         case .k25: return T("2560×2880 per eye rendered: Max chips; 30–50 fps.", "片目 2560×2880 で描画。Max チップ向け、30〜50 fps。")
         case .max: return T("A Vision Pro eye's pixels: 16–21 fps on an M1 Max.", "Vision Pro の片目の画素数。M1 Max で 16〜21 fps。")
@@ -111,7 +112,12 @@ enum Quality: String, CaseIterable, Identifiable {
             env["VERANTYX_ALVR"] = "1"
             if wired && headset == .quest { env["VERANTYX_ALVR_WIRED"] = "1" }
             if quality == .sharp {
-                env["VERANTYX_STREAM_WIDTH"] = "3680"; env["VERANTYX_STREAM_HEIGHT"] = "1840"; env["VERANTYX_BITRATE_MBPS"] = "100"
+                // (the game renders more pixels, not only the stream: with ALVR's defaults SteamVR's 0.55 supersampling
+                //  leaves some 850x920 per eye whatever the stream's size, so a 3680x1840 stream only stretched them,
+                //  issue #8. VXRT_VR_RENDER_SCALE sets supersampling to 1.0, as the Vision Pro app's 3k preset does;
+                //  1.6: the driver's 800x900 x 1.6 a side; the stream about the same size, both eyes)
+                env["VXRT_VR_RENDER_SCALE"] = "1.6"
+                env["VERANTYX_STREAM_WIDTH"] = "2560"; env["VERANTYX_STREAM_HEIGHT"] = "1440"; env["VERANTYX_BITRATE_MBPS"] = "100"
             }
         } else if [.k3, .k25, .max].contains(quality) {
             env["VXRT_VR_QUALITY"] = quality.rawValue

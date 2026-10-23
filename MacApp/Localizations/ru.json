@@ -30,7 +30,7 @@
  "Sharper": "Чётче",
  "Maximum": "Максимум",
  "Smooth on any Apple silicon Mac.": "Плавно на любом Mac с Apple silicon.",
- "3680×1840 at 100 Mbps: for Pro and Max chips, best over a USB cable.": "3680×1840 при 100 Mbps: для чипов Pro и Max, лучше по кабелю USB.",
+ "Renders about 1300×1400 per eye (Recommended: 850×920), at 100 Mbps: for Pro and Max chips, best over a USB cable.": "Рендер около 1300×1400 на глаз («Рекомендуемое»: 850×920), 100 Мбит/с: для чипов Pro и Max, лучше по USB-кабелю.",
  "1440×1620 per eye, 60 fps: for Pro and Max chips (24+ GPU cores).": "1440×1620 на глаз, 60 fps: для чипов Pro и Max (24+ ядер GPU).",
  "2560×2880 per eye rendered: Max chips; 30–50 fps.": "Рендеринг 2560×2880 на глаз: чипы Max; 30–50 fps.",
  "A Vision Pro eye's pixels: 16–21 fps on an M1 Max.": "Пиксели одного глаза Vision Pro: 16–21 fps на M1 Max.",
