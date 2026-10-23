@@ -179,5 +179,18 @@
  "Report: it ran": "Segnala: ha funzionato",
  "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "Apre un modulo GitHub compilato con il gioco, questo Mac e i fps; niente di personale. Premi tu Invia.",
  "Send the missing functions": "Invia le funzioni mancanti",
- "Opens a GitHub form with the names of the functions only. You press Submit.": "Apre un modulo GitHub con i soli nomi delle funzioni. Premi tu Invia."
+ "Opens a GitHub form with the names of the functions only. You press Submit.": "Apre un modulo GitHub con i soli nomi delle funzioni. Premi tu Invia.",
+ "choose the quality Recommended (Headset page)": "scegli la qualità Consigliato (pagina Visore)",
+ "connect the headset with a USB cable": "collega il visore con un cavo USB",
+ "put the Mac on Ethernet (a cable to the router)": "collega il Mac via Ethernet (un cavo al router)",
+ "have the headset on the router's 5 or 6 GHz band with 80 MHz channels or wider, near the router": "collega il visore alla banda 5 o 6 GHz del router con canali da 80 MHz o più, vicino al router",
+ "The headset shows %@ of the %@ frames a second the Mac makes: the stream is held up on the way.": "Il visore mostra %1$@ dei %2$@ fotogrammi al secondo prodotti dal Mac: lo stream si blocca lungo il percorso.",
+ "Each frame spends %@ ms on the network to the headset: the stream is held up on the way.": "Ogni fotogramma impiega %@ ms in rete fino al visore: lo stream viene rallentato lungo il percorso.",
+ "Video is lost on the way to the headset.": "Parte del video va persa lungo il percorso verso il visore.",
+ "%@ Try: %@.": "%@ Prova: %@.",
+ "; ": "; ",
+ "fps in the headset, %@ ms": "fps nel visore, %@ ms",
+ "fps in the headset": "fps nel visore",
+ "Frames a second the headset shows, and the time from your movement to the picture, as the headset's ALVR app reports them.": "Fotogrammi al secondo mostrati dal visore e tempo dal tuo movimento all'immagine, come li riporta l'app ALVR del visore.",
+ "fps on the Mac": "fps sul Mac"
 }

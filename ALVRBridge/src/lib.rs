@@ -48,7 +48,9 @@ pub fn prepare_session(layout: &alvr_filesystem::Layout) {
         .unwrap_or_else(|| serde_json::to_value(SessionConfig::default()).unwrap());
     let ss = &mut s["session_settings"];
     ss["connection"]["client_discovery"]["content"]["auto_trust_clients"] = true.into();
-    ss["connection"]["stream_protocol"]["variant"] = "Tcp".into();
+    // (VERANTYX_ALVR_PROTOCOL=udp: ALVR's own default, for a headset whose client takes it)
+    let udp = env::var("VERANTYX_ALVR_PROTOCOL").is_ok_and(|v| v.eq_ignore_ascii_case("udp"));
+    ss["connection"]["stream_protocol"]["variant"] = (if udp { "Udp" } else { "Tcp" }).into();
     // (game audio: the device the encoder made, VERANTYX_ALVR_AUDIO_DEVICE, when it made one; macOS has no loopback)
     match env::var("VERANTYX_ALVR_AUDIO_DEVICE") {
         Ok(name) if !name.is_empty() => {
@@ -157,9 +159,92 @@ impl SampleLog {
         if since.elapsed() > Duration::from_secs(5) && self.frames > 0 {
             alvr_common::info!("VeRantyx: {} frames in {:.1} s, {} stamped with a sample's exact time; stamp age (newest sample minus the stamp) mean {:.1} ms, max {:.1} ms",
                 self.frames, since.elapsed().as_secs_f32(), self.exact, self.age_ns_sum as f64 / self.frames as f64 / 1e6, self.age_ns_max as f64 / 1e6);
+            let line = HEADSET.lock().unwrap().line(since.elapsed().as_secs_f64());
+            alvr_common::info!("VeRantyx: headset: {line}");
             *self = SampleLog { recent: std::mem::take(&mut self.recent), newest: self.newest, since: Some(std::time::Instant::now()), ..Default::default() };
         }
     }
+}
+
+// What reaches the headset. The ALVR client reports each frame it shows, once, when it shows it (ClientStatistics:
+// its time on the client and the whole latency from the tracking sample to the display); ALVR's statistics turn
+// each into a GraphStatistics event, which its logger hands only to its dashboard (session_log.txt gets an empty
+// "[GRAPH]" line). There is no dashboard here: the bridge's logger (init_logging) counts them, and every 5 s the
+// line above says how many frames the headset showed a second, against the Mac's frames sent. Lost video is not in
+// ALVR 20's packet count (only an old client's VideoErrorReport counts there): the client asks for an IDR instead
+// (and the core asks for one when it cannot push a frame to the network), so those are counted.
+#[derive(Default)]
+struct HeadsetLog {
+    frames: u64, total_s: f64, mac_s: f64, network_s: f64, decode_s: f64, headset_s: f64,
+    idr_requests: u64,
+    bytes: u64, sent: u64,
+    reported: bool,                                                    // (the client has sent statistics since it connected)
+}
+static HEADSET: Mutex<HeadsetLog> = Mutex::new(HeadsetLog {
+    frames: 0, total_s: 0.0, mac_s: 0.0, network_s: 0.0, decode_s: 0.0, headset_s: 0.0, idr_requests: 0, bytes: 0, sent: 0, reported: false });
+// (the same, since the encoder last asked: vx_alvr_link_trouble)
+static LINK: Mutex<HeadsetLog> = Mutex::new(HeadsetLog {
+    frames: 0, total_s: 0.0, mac_s: 0.0, network_s: 0.0, decode_s: 0.0, headset_s: 0.0, idr_requests: 0, bytes: 0, sent: 0, reported: false });
+fn headset_logs(f: impl Fn(&mut HeadsetLog)) { f(&mut HEADSET.lock().unwrap()); f(&mut LINK.lock().unwrap()); }
+impl HeadsetLog {
+    fn line(&mut self, seconds: f64) -> String {
+        let n = self.frames.max(1) as f64;
+        let shown = if self.frames > 0 {
+            format!("{:.1} fps shown, latency {:.0} ms (Mac {:.0} ms, network {:.0} ms, decode {:.0} ms, headset {:.0} ms)",
+                self.frames as f64 / seconds, self.total_s / n * 1e3, self.mac_s / n * 1e3, self.network_s / n * 1e3,
+                self.decode_s / n * 1e3, self.headset_s / n * 1e3)
+        } else if self.reported || self.sent >= 30 {
+            // (every ALVR 20 client reports what it shows; a frame later than ALVR's 256 tracking samples back, a second
+            //  or so, is no longer matched: a link far slower than the bitrate leaves none reported)
+            "0.0 fps shown".into()
+        } else { "no statistics from the client yet".into() };
+        let line = format!("{shown}, {} video losses (IDRs asked for), {:.1} Mbps sent", self.idr_requests, self.bytes as f64 * 8.0 / seconds / 1e6);
+        *self = HeadsetLog { reported: self.reported, ..Default::default() };
+        line
+    }
+}
+
+// ALVR's logger (alvr_server_core::init_logging), line for line the same in session_log.txt and crash_log.txt, with
+// the statistics kept (HeadsetLog) and their empty lines left out (one a frame).
+struct Logger { session: Mutex<fs::File>, crash: Option<Mutex<fs::File>> }
+impl alvr_common::log::Log for Logger {
+    fn enabled(&self, m: &alvr_common::log::Metadata) -> bool {
+        m.level() <= alvr_common::log::Level::Info && !m.target().starts_with("mdns_sd")
+    }
+    fn log(&self, record: &alvr_common::log::Record) {
+        use alvr_events::{Event, EventType};
+        use std::io::Write;
+        if !self.enabled(record.metadata()) { return; }
+        let text = format!("{}", record.args());
+        let event_type = (text.starts_with('{') && text.ends_with('}')).then(|| serde_json::from_str::<EventType>(&text).ok()).flatten()
+            .unwrap_or_else(|| EventType::Log(alvr_common::LogEntry { severity: alvr_common::LogSeverity::from_log_level(record.level()), content: text }));
+        match &event_type {
+            EventType::GraphStatistics(g) => return headset_logs(|h| {
+                h.frames += 1; h.reported = true;
+                // (Mac: from the tracking sample's arrival to the frame's encoding, which is all "encoder" to ALVR here:
+                //  the bridge does not report present or composed; headset: waiting to be shown, its compositor, vsync)
+                h.total_s += g.total_pipeline_latency_s as f64; h.network_s += g.network_s as f64; h.decode_s += g.decoder_s as f64;
+                h.mac_s += (g.game_time_s + g.server_compositor_s + g.encoder_s) as f64;
+                h.headset_s += (g.decoder_queue_s + g.client_compositor_s + g.vsync_queue_s) as f64;
+            }),
+            EventType::StatisticsSummary(_) => return,
+            _ => {}
+        }
+        let event = Event { timestamp: chrono::Local::now().format("%H:%M:%S.%3f").to_string(), event_type };
+        let line = format!("{} [{}] {}\n", event.timestamp, event.event_type_string(), event.message());
+        self.session.lock().unwrap().write_all(line.as_bytes()).ok();
+        if let (Some(crash), alvr_common::log::Level::Error) = (&self.crash, record.level()) { crash.lock().unwrap().write_all(line.as_bytes()).ok(); }
+    }
+    fn flush(&self) {}
+}
+
+fn init_logging(session_log: PathBuf, crash_log: PathBuf) {
+    let Ok(session) = fs::File::create(&session_log) else { return alvr_server_core::init_logging(Some(session_log), Some(crash_log)) };
+    let crash = fs::OpenOptions::new().create(true).append(true).open(crash_log).ok().map(Mutex::new);
+    if alvr_common::log::set_boxed_logger(Box::new(Logger { session: Mutex::new(session), crash })).is_ok() {
+        alvr_common::log::set_max_level(alvr_common::log::LevelFilter::Info);
+    }
+    alvr_common::set_panic_hook();
 }
 
 struct Bridge {
@@ -238,9 +323,12 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
     let mut buttons: HashMap<u64, f32> = HashMap::new();
     while let Ok(e) = receiver.recv() {
         match e {
-            ServerCoreEvent::ClientConnected => { bridge.connected.store(true, Ordering::SeqCst); bridge.idr_requested.store(true, Ordering::SeqCst); }
+            ServerCoreEvent::ClientConnected => {
+                bridge.connected.store(true, Ordering::SeqCst); bridge.idr_requested.store(true, Ordering::SeqCst);
+                headset_logs(|h| *h = HeadsetLog::default());
+            }
             ServerCoreEvent::ClientDisconnected => bridge.connected.store(false, Ordering::SeqCst),
-            ServerCoreEvent::RequestIDR => bridge.idr_requested.store(true, Ordering::SeqCst),
+            ServerCoreEvent::RequestIDR => { bridge.idr_requested.store(true, Ordering::SeqCst); headset_logs(|h| h.idr_requests += 1); }
             ServerCoreEvent::ViewsConfig(v) => {
                 // (the visionOS client sends an infinite field of view for its first seconds: kept out, as the driver
                 //  would latch a fallback frustum if the map held one it rejects)
@@ -301,7 +389,7 @@ pub unsafe extern "C" fn vx_alvr_start(config_dir: *const c_char) -> bool {
     let l = layout(dir);
     prepare_session(&l);
     alvr_server_core::initialize_environment(l.clone());
-    alvr_server_core::init_logging(Some(l.session_log()), Some(l.crash_log()));
+    init_logging(l.session_log(), l.crash_log());
     let identity = alvr_common::glam::Mat4::from_rotation_translation(Quat::IDENTITY, Vec3::new(0.0, 1.6, 0.0)).to_cols_array();
     let bridge = Arc::new(Bridge {
         ctx: RwLock::new(None), input: Mutex::new(VxAlvrInput { head: identity, left: identity, right: identity, ..Default::default() }),
@@ -360,6 +448,25 @@ pub extern "C" fn vx_alvr_restart_needed() -> bool {
     BRIDGE.get().is_some_and(|b| (!b.connected.load(Ordering::SeqCst) && openvr_config(&b.layout) != b.started_with) || handshake_hung(b))
 }
 
+/// The link's trouble since the last call, as loss events for the encoder's adaptive bitrate (HardwareEncoder.swift,
+/// AdaptiveBitrate, which lowers the bitrate at two in a period): the video lost (IDRs asked for), and two more when the
+/// frames spent over 80 ms on the network (some 20-40 ms over a home Wi-Fi), or the headset showed none of them. A link
+/// slower than the bitrate loses nothing over TCP: the frames queue (ALVR keeps up to 1024) and the stream falls behind,
+/// until they are too late to be counted at all. (Not the share of the frames shown: a client drops some of its own when
+/// they come in bursts, and that is no reason for a lower bitrate.)
+#[no_mangle]
+pub extern "C" fn vx_alvr_link_trouble() -> u32 {
+    let mut l = LINK.lock().unwrap();
+    let reported = l.reported;
+    let t = std::mem::replace(&mut *l, HeadsetLog { reported, ..Default::default() });
+    let mut events = t.idr_requests as u32;
+    if t.sent >= 30 {
+        let network = if t.frames > 0 { t.network_s / t.frames as f64 } else { 1.0 };
+        if network > 0.08 { events += 2; }
+    }
+    events
+}
+
 /// The client's display rate (ALVR's session, as negotiated at the last connection), 0 before any.
 #[no_mangle]
 pub extern "C" fn vx_alvr_refresh_hz() -> f32 {
@@ -403,6 +510,7 @@ pub unsafe extern "C" fn vx_alvr_set_config(nals: *const u8, len: usize) {
 pub unsafe extern "C" fn vx_alvr_send(timestamp_s: f64, au: *const u8, len: usize, is_idr: bool) {
     if let (Some(b), false) = (BRIDGE.get(), au.is_null()) {
         let t = Duration::from_nanos((timestamp_s * 1e9).round() as u64);
+        headset_logs(|h| { h.bytes += len as u64; h.sent += 1; });
         b.samples.lock().unwrap().frame(t.as_nanos() as u64);
         if let Some(ctx) = b.ctx.read().unwrap().as_ref() { ctx.send_video_nal(t, std::slice::from_raw_parts(au, len).to_vec(), is_idr); }
     }

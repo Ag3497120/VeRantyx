@@ -179,5 +179,18 @@
   "Report: it ran": "Signaler : ça a marché",
   "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "Ouvre un formulaire GitHub rempli avec le jeu, ce Mac et la fréquence d'images ; rien de personnel. Vous appuyez sur Envoyer.",
   "Send the missing functions": "Envoyer les fonctions manquantes",
-  "Opens a GitHub form with the names of the functions only. You press Submit.": "Ouvre un formulaire GitHub avec uniquement les noms des fonctions. Vous appuyez sur Envoyer."
+  "Opens a GitHub form with the names of the functions only. You press Submit.": "Ouvre un formulaire GitHub avec uniquement les noms des fonctions. Vous appuyez sur Envoyer.",
+  "choose the quality Recommended (Headset page)": "choisissez la qualité Recommandé (page Casque)",
+  "connect the headset with a USB cable": "branchez le casque avec un câble USB",
+  "put the Mac on Ethernet (a cable to the router)": "reliez le Mac en Ethernet (un câble vers le routeur)",
+  "have the headset on the router's 5 or 6 GHz band with 80 MHz channels or wider, near the router": "connectez le casque à la bande 5 ou 6 GHz du routeur avec des canaux de 80 MHz ou plus, près du routeur",
+  "The headset shows %@ of the %@ frames a second the Mac makes: the stream is held up on the way.": "Le casque affiche %1$@ des %2$@ images par seconde que produit le Mac : le flux est retenu en chemin.",
+  "Each frame spends %@ ms on the network to the headset: the stream is held up on the way.": "Chaque image passe %@ ms sur le réseau jusqu’au casque : le flux est retardé en chemin.",
+  "Video is lost on the way to the headset.": "De la vidéo se perd en chemin vers le casque.",
+  "%@ Try: %@.": "%@ Essayez : %@.",
+  "; ": " ; ",
+  "fps in the headset, %@ ms": "fps dans le casque, %@ ms",
+  "fps in the headset": "fps dans le casque",
+  "Frames a second the headset shows, and the time from your movement to the picture, as the headset's ALVR app reports them.": "Images par seconde affichées par le casque et temps entre votre mouvement et l’image, tels que l’app ALVR du casque les indique.",
+  "fps on the Mac": "fps sur le Mac"
 }

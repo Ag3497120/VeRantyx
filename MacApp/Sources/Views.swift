@@ -546,9 +546,22 @@ struct SessionCard: View {
                      active: play.usesLauncher ? false : play.phase == .steamVR, text: T("Game", "ゲーム"))
                 Spacer()
                 if let fps = play.fps, play.running {
+                    // (with ALVR, the Mac's frames and what the headset shows of them, from its own statistics: they
+                    //  differ when the network holds the stream up)
+                    if let shown = play.headsetFPS {
+                        VStack(alignment: .trailing, spacing: 0) {
+                            Text(String(format: "%.0f", shown)).font(.system(size: 30, weight: .bold, design: .rounded)).monospacedDigit()
+                                .foregroundStyle(play.headsetHint == nil ? Color.primary : Color.orange)
+                            Text(play.headsetLatency.map { TF("fps in the headset, %@ ms", "fps（ヘッドセット、%@ ms）", String(format: "%.0f", $0)) }
+                                 ?? T("fps in the headset", "fps（ヘッドセット）"))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        .help(T("Frames a second the headset shows, and the time from your movement to the picture, as the headset's ALVR app reports them.",
+                                "ヘッドセットに表示されている毎秒のフレーム数と、動いてから映像が出るまでの時間（ヘッドセットの ALVR アプリの報告）。"))
+                    }
                     VStack(alignment: .trailing, spacing: 0) {
                         Text(String(format: "%.0f", fps)).font(.system(size: 30, weight: .bold, design: .rounded)).monospacedDigit()
-                        Text("fps").font(.caption).foregroundStyle(.secondary)
+                        Text(play.headsetFPS == nil ? "fps" : T("fps on the Mac", "fps（Mac）")).font(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -565,6 +578,9 @@ struct SessionCard: View {
                         "キーボードとマウスは Windows と同じく使えます。DualSense はゲームの オプション > 操作 でそのプリセットを選んでください。Esc でゲームのメニュー。"),
                       systemImage: "keyboard")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            if let hint = play.headsetHint, play.running {
+                Label(hint, systemImage: "wifi.exclamationmark").foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
             if let problem = play.problem {
                 Label(problem, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)

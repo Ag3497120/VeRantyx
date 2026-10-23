@@ -11,7 +11,10 @@ core, the launch scripts), so the player's Mac needs only macOS and Steam: no Ho
   gathers the Microsoft runtime DLLs from the installers those installs carry (`Sources/Redist.swift`, the same choice
   of files as `tools/vxrt_redist.py`).
 - **Play**: the installed games, with what is known about each (games/*.json), a picture setting, and the session:
-  SteamVR up, the headset connected, the frame rate, the game's log, Stop.
+  SteamVR up, the headset connected, the frame rate, the game's log, Stop. With ALVR, the frame rate the headset
+  shows beside the Mac's, and the latency, from the headset's own statistics (ALVRBridge's `VeRantyx: headset:` line
+  in session_log.txt), with advice when the network holds the stream up (fewer than three quarters of the Mac's
+  frames shown, over 40 ms on the network, or video lost); the "it ran" report carries them too.
 - **Headset**: Meta Quest or Pico through ALVR (Wi-Fi or a USB cable), Apple Vision Pro with the VeRantyx app, or with
   the ALVR app; the steps for each.
 - **Help**: the logs folder, a report form on GitHub filled in with the Mac's facts, Stop everything.

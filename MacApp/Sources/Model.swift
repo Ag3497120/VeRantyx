@@ -304,8 +304,17 @@ struct Job {
         // (loading screens read 0 and start-up benchmarks run far above play, so the range is the middle 80 %)
         let samples = play.fpsSamples.filter { $0 >= 1 }.sorted()
         let minutes = Int(((play.endedAt ?? Date()).timeIntervalSince(play.startedAt) / 60).rounded())
-        let fps = samples.isEmpty ? "" : String(format: "median %.0f fps, mostly %.0f-%.0f, over %d min",
+        var fps = samples.isEmpty ? "" : String(format: "median %.0f fps, mostly %.0f-%.0f, over %d min",
             samples[samples.count / 2], samples[samples.count / 10], samples[samples.count * 9 / 10], max(minutes, 1))
+        // (with ALVR: what the headset showed, from its own statistics, which the Mac's number above does not say)
+        let shown = play.headsetSamples.compactMap(\.fps).sorted(), latency = play.headsetSamples.compactMap(\.latency).sorted()
+        if !shown.isEmpty {
+            fps += (fps.isEmpty ? "" : " on the Mac; ") + String(format: "headset (ALVR): median %.0f fps shown, mostly %.0f-%.0f", shown[shown.count / 2],
+                shown[shown.count / 10], shown[shown.count * 9 / 10])
+            if !latency.isEmpty { fps += String(format: ", latency median %.0f ms", latency[latency.count / 2]) }
+            let losses = play.headsetSamples.map(\.losses).reduce(0, +)
+            if losses > 0 { fps += ", \(losses) video losses" }
+        }
         c.queryItems = [URLQueryItem(name: "template", value: "works.yml"),
                         URLQueryItem(name: "title", value: "[runs] \(game) on \(Mac.chip)\(play.flat ? ", Mac screen" : ", \(headset.rawValue)")"),
                         URLQueryItem(name: "game", value: game),

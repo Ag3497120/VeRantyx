@@ -179,5 +179,18 @@
  "Report: it ran": "Melden: Es lief",
  "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "Öffnet ein GitHub-Formular, ausgefüllt mit dem Spiel, diesem Mac und der Bildrate; nichts Persönliches. Du drückst auf Absenden.",
  "Send the missing functions": "Fehlende Funktionen senden",
- "Opens a GitHub form with the names of the functions only. You press Submit.": "Öffnet ein GitHub-Formular nur mit den Namen der Funktionen. Du drückst auf Absenden."
+ "Opens a GitHub form with the names of the functions only. You press Submit.": "Öffnet ein GitHub-Formular nur mit den Namen der Funktionen. Du drückst auf Absenden.",
+ "choose the quality Recommended (Headset page)": "wähle die Bildeinstellung „Empfohlen“ (Seite Headset)",
+ "connect the headset with a USB cable": "verbinde das Headset mit einem USB-Kabel",
+ "put the Mac on Ethernet (a cable to the router)": "verbinde den Mac per Ethernet (Kabel zum Router)",
+ "have the headset on the router's 5 or 6 GHz band with 80 MHz channels or wider, near the router": "verbinde das Headset mit dem 5- oder 6-GHz-Band des Routers mit 80-MHz-Kanälen oder breiter, nahe am Router",
+ "The headset shows %@ of the %@ frames a second the Mac makes: the stream is held up on the way.": "Das Headset zeigt %1$@ der %2$@ Bilder pro Sekunde, die der Mac erzeugt: Der Stream hängt unterwegs fest.",
+ "Each frame spends %@ ms on the network to the headset: the stream is held up on the way.": "Jedes Bild braucht %@ ms im Netzwerk bis zum Headset: Der Stream wird unterwegs aufgehalten.",
+ "Video is lost on the way to the headset.": "Auf dem Weg zum Headset geht Video verloren.",
+ "%@ Try: %@.": "%@ Versuche: %@.",
+ "; ": "; ",
+ "fps in the headset, %@ ms": "fps im Headset, %@ ms",
+ "fps in the headset": "fps im Headset",
+ "Frames a second the headset shows, and the time from your movement to the picture, as the headset's ALVR app reports them.": "Bilder pro Sekunde, die das Headset zeigt, und die Zeit von deiner Bewegung bis zum Bild, wie die ALVR-App des Headsets sie meldet.",
+ "fps on the Mac": "fps auf dem Mac"
 }

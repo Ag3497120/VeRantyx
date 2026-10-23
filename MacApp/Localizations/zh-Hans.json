@@ -179,5 +179,18 @@
  "Report: it ran": "报告：能运行",
  "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "打开已填好游戏、这台 Mac 和帧率的 GitHub 表单；不含个人信息。由你自己点提交。",
  "Send the missing functions": "发送缺少的函数",
- "Opens a GitHub form with the names of the functions only. You press Submit.": "打开只含函数名称的 GitHub 表单。由你自己点提交。"
+ "Opens a GitHub form with the names of the functions only. You press Submit.": "打开只含函数名称的 GitHub 表单。由你自己点提交。",
+ "choose the quality Recommended (Headset page)": "把画质设为“推荐”（头显页面）",
+ "connect the headset with a USB cable": "用 USB 线连接头显",
+ "put the Mac on Ethernet (a cable to the router)": "让 Mac 使用以太网（用网线连到路由器）",
+ "have the headset on the router's 5 or 6 GHz band with 80 MHz channels or wider, near the router": "让头显连接路由器的 5 GHz 或 6 GHz 频段（信道宽度 80 MHz 或以上），并靠近路由器使用",
+ "The headset shows %@ of the %@ frames a second the Mac makes: the stream is held up on the way.": "Mac 每秒生成 %2$@ 帧，头显上只显示 %1$@ 帧：串流在传输途中受阻。",
+ "Each frame spends %@ ms on the network to the headset: the stream is held up on the way.": "每一帧在传往头显的网络上要花 %@ ms：串流在传输途中延迟。",
+ "Video is lost on the way to the headset.": "传往头显的视频在途中丢失。",
+ "%@ Try: %@.": "%@可以尝试：%@。",
+ "; ": "；",
+ "fps in the headset, %@ ms": "头显 fps，%@ ms",
+ "fps in the headset": "头显 fps",
+ "Frames a second the headset shows, and the time from your movement to the picture, as the headset's ALVR app reports them.": "头显每秒显示的帧数，以及从你移动到画面出现的时间（由头显上的 ALVR App 报告）。",
+ "fps on the Mac": "Mac fps"
 }

@@ -179,5 +179,18 @@
   "Report: it ran": "Relatar: funcionou",
   "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "Abre um formulário do GitHub preenchido com o jogo, este Mac e a taxa de quadros; nada pessoal. Você aperta Enviar.",
   "Send the missing functions": "Enviar as funções que faltam",
-  "Opens a GitHub form with the names of the functions only. You press Submit.": "Abre um formulário do GitHub só com os nomes das funções. Você aperta Enviar."
+  "Opens a GitHub form with the names of the functions only. You press Submit.": "Abre um formulário do GitHub só com os nomes das funções. Você aperta Enviar.",
+  "choose the quality Recommended (Headset page)": "escolha a qualidade Recomendado (página Headset)",
+  "connect the headset with a USB cable": "conecte o headset com um cabo USB",
+  "put the Mac on Ethernet (a cable to the router)": "ligue o Mac por Ethernet (um cabo até o roteador)",
+  "have the headset on the router's 5 or 6 GHz band with 80 MHz channels or wider, near the router": "conecte o headset à banda de 5 ou 6 GHz do roteador com canais de 80 MHz ou mais, perto do roteador",
+  "The headset shows %@ of the %@ frames a second the Mac makes: the stream is held up on the way.": "O headset mostra %1$@ dos %2$@ quadros por segundo que o Mac gera: o stream está travando no caminho.",
+  "Each frame spends %@ ms on the network to the headset: the stream is held up on the way.": "Cada quadro leva %@ ms na rede até o headset: o stream está atrasando no caminho.",
+  "Video is lost on the way to the headset.": "Há vídeo sendo perdido no caminho até o headset.",
+  "%@ Try: %@.": "%@ Tente: %@.",
+  "; ": "; ",
+  "fps in the headset, %@ ms": "fps no headset, %@ ms",
+  "fps in the headset": "fps no headset",
+  "Frames a second the headset shows, and the time from your movement to the picture, as the headset's ALVR app reports them.": "Quadros por segundo que o headset mostra e o tempo do seu movimento até a imagem, conforme o app ALVR do headset informa.",
+  "fps on the Mac": "fps no Mac"
 }

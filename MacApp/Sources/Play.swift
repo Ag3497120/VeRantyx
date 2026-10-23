@@ -50,6 +50,12 @@ enum Quality: String, CaseIterable, Identifiable {
     var phase: Phase = .starting
     var headsetConnected = false
     var fps: Double? = nil
+    /// What an ALVR headset shows, from its own statistics (ALVRBridge's "VeRantyx: headset:" line every 5 s): frames
+    /// a second, and the whole latency from its movement to the picture (nil: none reported yet).
+    var headsetFPS: Double? = nil
+    var headsetLatency: Double? = nil
+    /// Advice when the headset shows far fewer frames than the Mac makes, or late ones: the link is the limit.
+    var headsetHint: String? = nil
     /// A game with its own launcher (Elite Dangerous): the game itself has started (from the launcher's PLAY).
     var gameStarted = false
     var usesLauncher: Bool { known?.launcher == true }
@@ -66,6 +72,11 @@ enum Quality: String, CaseIterable, Identifiable {
     var endedAt: Date? = nil
     /// The frame rates read while the game ran (every second), for the "it ran" report.
     @ObservationIgnored private(set) var fpsSamples: [Double] = []
+    /// The ALVR headset's reports while the game ran (one each 5 s), for the "it ran" report.
+    @ObservationIgnored private(set) var headsetSamples: [HeadsetReport] = []
+    @ObservationIgnored private var lastHeadsetLine = ""
+    @ObservationIgnored private let wired: Bool
+    @ObservationIgnored private let quality: Quality
     @ObservationIgnored private var stopping = false
 
     @ObservationIgnored private var process = Process()
@@ -80,6 +91,8 @@ enum Quality: String, CaseIterable, Identifiable {
         self.title = title
         self.appID = appID
         self.headset = headset
+        self.wired = wired
+        self.quality = quality
         self.known = known
         self.flat = flat
         let scripts = Paths.runtime.appendingPathComponent("scripts")
@@ -160,6 +173,7 @@ enum Quality: String, CaseIterable, Identifiable {
         phase = .ended
         endedAt = Date()
         headsetConnected = false
+        headsetHint = nil
         missingFunctions = fresh(gameLog) ? Play.missingFunctions(in: gameLog) : []
         guard !stopping, problem == nil else { return }
         // (the game ended by itself: what its own last lines say; a child's, such as SteamVR's vrwebhelper, which
@@ -214,6 +228,7 @@ enum Quality: String, CaseIterable, Identifiable {
             let lastStream = log.range(of: "VeRantyx: ", options: .backwards)?.lowerBound
             let lastGone = log.range(of: "Client disconnected", options: .backwards)?.lowerBound
             headsetConnected = fresh && lastStream != nil && (lastGone == nil || lastStream! > lastGone!)
+            readHeadset(log)
         }
         let launcher = Play.tail(launcherLog, 6000)
         if let hint = Play.hint(launcher) { problem = hint }   // (the scripts' own messages)
@@ -224,6 +239,57 @@ enum Quality: String, CaseIterable, Identifiable {
             ? T("First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.",
                 "このヘッドセットで初めての起動です。ヘッドセットで ALVR を開いて接続してください。接続すると SteamVR が始まり、両目の映像がずれずに表示されます。")
             : launcherNotice
+    }
+
+    /// The newest "VeRantyx: headset:" line: what the headset shows, against the frames the Mac makes.
+    private func readHeadset(_ log: String) {
+        guard headsetConnected, let line = log.split(separator: "\n").last(where: { $0.contains("VeRantyx: headset: ") }),
+              let report = HeadsetReport(line) else {
+            headsetFPS = nil; headsetLatency = nil; headsetHint = nil
+            return
+        }
+        headsetFPS = report.fps
+        headsetLatency = report.latency
+        guard String(line) != lastHeadsetLine else { return }
+        lastHeadsetLine = String(line)
+        guard usesLauncher ? gameStarted : phase == .playing else { return }
+        headsetSamples.append(report)
+        headsetHint = Play.headsetHint(headsetSamples.suffix(3), mac: fps, headset: headset, wired: wired, quality: quality)
+    }
+
+    /// Advice from the last three headset reports (15 s: one slow moment, a level loading, is not the link), when the
+    /// headset shows under three quarters of the Mac's frames, or they spend over 40 ms on the network (ALVR's estimate:
+    /// what is left of the whole latency after the Mac's and the headset's parts; some 20 ms over a home Wi-Fi), or it
+    /// loses video (nil: it is fine). The whole latency is no measure of the link here: the Mac's part (the game, the
+    /// encoder) is much of it.
+    nonisolated static func headsetHint(_ recent: ArraySlice<HeadsetReport>, mac: Double?, headset: Headset, wired: Bool, quality: Quality) -> String? {
+        guard recent.count == 3, let mac, mac >= 20 else { return nil }
+        let shown = recent.compactMap(\.fps).sorted()
+        let network = recent.compactMap(\.network).sorted()
+        let fewer = shown.count == 3 && shown[1] < mac * 0.75
+        let late = network.count == 3 && network[1] > 40
+        let lossy = recent.map(\.losses).reduce(0, +) >= 6
+        guard fewer || late || lossy else { return nil }
+        var steps: [String] = []
+        if quality == .sharp { steps.append(T("choose the quality Recommended (Headset page)", "画質を「おすすめ」にする（ヘッドセットのページ）")) }
+        if headset == .quest && !wired { steps.append(T("connect the headset with a USB cable", "ヘッドセットを USB ケーブルでつなぐ")) }
+        if !wired {
+            steps.append(T("put the Mac on Ethernet (a cable to the router)", "Mac を有線 LAN（ルーターへのケーブル）にする"))
+            steps.append(T("have the headset on the router's 5 or 6 GHz band with 80 MHz channels or wider, near the router",
+                           "ヘッドセットをルーターの 5 GHz か 6 GHz（チャンネル幅 80 MHz 以上）につなぎ、ルーターの近くで使う"))
+        }
+        let what: String
+        if fewer {
+            what = TF("The headset shows %@ of the %@ frames a second the Mac makes: the stream is held up on the way.",
+                      "Mac が毎秒 %2$@ フレーム作っても、ヘッドセットに表示されるのは %1$@ フレームです。途中の通信で詰まっています。",
+                      String(format: "%.0f", shown[1]), String(format: "%.0f", mac))
+        } else if late {
+            what = TF("Each frame spends %@ ms on the network to the headset: the stream is held up on the way.",
+                      "1 フレームがヘッドセットまでの通信に %@ ms かかっています。途中の通信で遅れています。", String(format: "%.0f", network[1]))
+        } else {
+            what = T("Video is lost on the way to the headset.", "ヘッドセットへの映像が途中で失われています。")
+        }
+        return steps.isEmpty ? what : TF("%@ Try: %@.", "%@試すこと：%@。", what, steps.joined(separator: T("; ", "、")))
     }
 
     /// What the player does in a launcher game's launcher (nil once the game has started).
@@ -250,7 +316,7 @@ enum Quality: String, CaseIterable, Identifiable {
         return found
     }
 
-    nonisolated static func number(in line: Substring, after key: String) -> Double? {
+    nonisolated static func number<S: StringProtocol>(in line: S, after key: String) -> Double? {
         guard let r = line.range(of: key) else { return nil }
         return Double(line[r.upperBound...].prefix { $0.isNumber || $0 == "." })
     }
@@ -279,5 +345,25 @@ enum Quality: String, CaseIterable, Identifiable {
             return T("The game called a Windows function VXRuntime does not have yet. Please report it (Help > Report a problem).", "ゲームが VXRuntime にまだない Windows の機能を呼びました。報告してください（ヘルプ > 問題を報告）。")
         }
         return nil
+    }
+}
+
+/// One of ALVRBridge's reports of what the headset shows (ALVRBridge/src/lib.rs, HeadsetLog): "VeRantyx: headset: 58.9
+/// fps shown, latency 70 ms (Mac 20 ms, network 9 ms, decode 5 ms, headset 30 ms), 0 video losses (IDRs asked for),
+/// 38.0 Mbps sent", or "0.0 fps shown, ..." or "no statistics from the client yet, ..." (a client that sends none).
+struct HeadsetReport: Equatable {
+    var fps: Double?
+    var latency: Double?
+    var network: Double?
+    var losses: Int
+
+    init?(_ line: Substring) {
+        guard let r = line.range(of: "VeRantyx: headset: ") else { return nil }
+        let text = line[r.upperBound...]
+        fps = text.contains(" fps shown") ? Double(text.prefix { $0.isNumber || $0 == "." }) : nil
+        latency = Play.number(in: text, after: "latency ")
+        network = Play.number(in: text, after: "network ")
+        losses = text.range(of: " video losses").map { Int(text[..<$0.lowerBound].split(separator: " ").last ?? "") ?? 0 } ?? 0
+        if fps == nil && !text.hasPrefix("no statistics") { return nil }
     }
 }

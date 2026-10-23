@@ -3712,10 +3712,12 @@ name = "verantyx_alvr_bridge"
 version = "0.1.0"
 dependencies = [
  "alvr_common",
+ "alvr_events",
  "alvr_filesystem",
  "alvr_packets",
  "alvr_server_core",
  "alvr_session",
+ "chrono",
  "serde_json",
 ]
 

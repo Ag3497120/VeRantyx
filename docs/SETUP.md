@@ -167,7 +167,7 @@ display rate for frame rate; the encoder then adapts on its own:
 |---|---|---|
 | `VERANTYX_RENDER_TARGET_SCALE` | profile | SteamVR render resolution (area scale, like SteamVR's custom resolution). Applied at the next SteamVR start |
 | `VERANTYX_DISPLAY_HZ` | profile | Virtual display refresh. The game's frame rate quantizes to whole display frames (60 Hz: 60, 30, 20, 15 fps), and the compositor costs CPU per display frame |
-| `VERANTYX_BITRATE_MBPS` | profile | HEVC bitrate ceiling; `VERANTYX_BITRATE_MIN_MBPS` (40 % of it) is the floor, `VERANTYX_ADAPTIVE_BITRATE=0` fixes it |
+| `VERANTYX_BITRATE_MBPS` | profile | HEVC bitrate ceiling (2-300); `VERANTYX_BITRATE_MIN_MBPS` (40 % of it) is the floor, `VERANTYX_ADAPTIVE_BITRATE=0` fixes it. Lowered when the headset loses frames, and with ALVR also when they spend over 80 ms on the network |
 | `VERANTYX_STREAM_WIDTH` x `VERANTYX_STREAM_HEIGHT` | profile | Pixel budget for both eyes; the aspect follows the headset's frustum |
 | `VERANTYX_SEND_PACING_MBPS` | 60 | UDP burst pacing |
 | `VERANTYX_KEYFRAME_INTERVAL` | 3 | Seconds between safety keyframes |

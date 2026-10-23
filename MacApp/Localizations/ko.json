@@ -179,5 +179,18 @@
  "Report: it ran": "보고: 실행됨",
  "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "게임, 이 Mac, 프레임 레이트가 채워진 GitHub 양식을 엽니다. 개인 정보는 없습니다. 제출은 직접 누르세요.",
  "Send the missing functions": "부족한 함수 보내기",
- "Opens a GitHub form with the names of the functions only. You press Submit.": "함수 이름만 적힌 GitHub 양식을 엽니다. 제출은 직접 누르세요."
+ "Opens a GitHub form with the names of the functions only. You press Submit.": "함수 이름만 적힌 GitHub 양식을 엽니다. 제출은 직접 누르세요.",
+ "choose the quality Recommended (Headset page)": "화질을 권장으로 선택(헤드셋 페이지)",
+ "connect the headset with a USB cable": "헤드셋을 USB 케이블로 연결",
+ "put the Mac on Ethernet (a cable to the router)": "Mac을 이더넷(라우터까지 케이블)으로 연결",
+ "have the headset on the router's 5 or 6 GHz band with 80 MHz channels or wider, near the router": "헤드셋을 라우터의 5 또는 6 GHz 대역(채널 폭 80 MHz 이상)에 연결하고 라우터 가까이에서 사용",
+ "The headset shows %@ of the %@ frames a second the Mac makes: the stream is held up on the way.": "Mac은 초당 %2$@프레임을 만들지만 헤드셋에는 %1$@프레임만 표시됩니다. 전송 도중에 막히고 있습니다.",
+ "Each frame spends %@ ms on the network to the headset: the stream is held up on the way.": "각 프레임이 헤드셋까지 네트워크에서 %@ ms 걸립니다. 전송 도중에 지연되고 있습니다.",
+ "Video is lost on the way to the headset.": "헤드셋으로 가는 도중에 영상이 손실되고 있습니다.",
+ "%@ Try: %@.": "%@ 시도해 볼 것: %@.",
+ "; ": ", ",
+ "fps in the headset, %@ ms": "헤드셋 fps, %@ ms",
+ "fps in the headset": "헤드셋 fps",
+ "Frames a second the headset shows, and the time from your movement to the picture, as the headset's ALVR app reports them.": "헤드셋에 표시되는 초당 프레임 수와, 움직인 뒤 영상이 나오기까지의 시간(헤드셋 ALVR 앱의 보고).",
+ "fps on the Mac": "Mac fps"
 }

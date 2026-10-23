@@ -416,7 +416,8 @@ func environmentDouble(_ name: String, default fallback: Double, range: ClosedRa
 // IDRs are several times larger than predicted frames. Sending one every 0.5 s
 // made a visible hitch twice a second; lost frames already request an IDR.
 let keyFrameIntervalSeconds = environmentDouble("VERANTYX_KEYFRAME_INTERVAL", default: 3.0, range: 0.5...30)
-let videoBitrate = Int32(environmentDouble("VERANTYX_BITRATE_MBPS", default: 20, range: 2...80) * 1_000_000)
+// (up to 300: the app's Sharper preset for ALVR asks for 100, which a ceiling of 80 turned into the default 20)
+let videoBitrate = Int32(environmentDouble("VERANTYX_BITRATE_MBPS", default: 20, range: 2...300) * 1_000_000)
 // ALVR (VERANTYX_ALVR=1): ALVR's streaming core (ALVRBridge/, its library loaded at run time from VERANTYX_ALVR_LIB)
 // takes the frames as well, for the ALVR client apps (Quest, Pico, the Vision Pro's "ALVR"); their poses and buttons
 // go into SharedHands as the Vision Pro app's do, so the driver sees no difference. Each frame goes with the time of
@@ -431,6 +432,7 @@ struct ALVRBridge {
     let restartNeeded: @convention(c) () -> Bool
     let ipd: (@convention(c) () -> Float)?                              // (a library from before it had one: nil)
     let haptics: (@convention(c) (UInt32, Float, Float, Float) -> Void)?
+    let linkTrouble: (@convention(c) () -> UInt32)?                    // (ALVRBridge's loss events for adaptiveBitrate)
 }
 let alvrMode = ProcessInfo.processInfo.environment["VERANTYX_ALVR"] == "1"
 func loadALVRBridge() -> ALVRBridge? {
@@ -447,7 +449,8 @@ func loadALVRBridge() -> ALVRBridge? {
     else { print("ALVR: \(path) lacks the bridge's functions"); return nil }
     let bridge = ALVRBridge(start: start, input: input, connected: connected, takeIDR: takeIDR, setConfig: setConfig, send: send, restartNeeded: restartNeeded,
                             ipd: fn("vx_alvr_ipd", (@convention(c) () -> Float).self),
-                            haptics: fn("vx_alvr_haptics", (@convention(c) (UInt32, Float, Float, Float) -> Void).self))
+                            haptics: fn("vx_alvr_haptics", (@convention(c) (UInt32, Float, Float, Float) -> Void).self),
+                            linkTrouble: fn("vx_alvr_link_trouble", (@convention(c) () -> UInt32).self))
     guard bridge.start(nil) else { print("ALVR: the streaming core did not start"); return nil }
     print("ALVR: streaming core started (\(path)); open an ALVR client on this network")
     return bridge
@@ -963,6 +966,9 @@ func reportDiagnosticsIfDue() {
         adaptiveBitrate.update(
             localLossEvents: (current.errors - lastDiagnostics.errors) + (current.drops - lastDiagnostics.drops),
             elapsed: elapsed, session: compressionSession)
+    } else if let alvr, alvr.connected(), let linkTrouble = alvr.linkTrouble {
+        // (an ALVR headset: what its statistics say of the link, ALVRBridge's vx_alvr_link_trouble)
+        adaptiveBitrate.update(localLossEvents: Int(linkTrouble()), elapsed: elapsed, session: compressionSession)
     }
     if let compressionSession, captureFPS > 0 {
         VTSessionSetProperty(compressionSession, key: kVTCompressionPropertyKey_ExpectedFrameRate,

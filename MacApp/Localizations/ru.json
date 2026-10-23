@@ -179,5 +179,18 @@
  "Report: it ran": "Сообщить: запустилось",
  "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "Открывает форму GitHub, заполненную игрой, этим Mac и частотой кадров; ничего личного. Отправляете вы сами.",
  "Send the missing functions": "Отправить недостающие функции",
- "Opens a GitHub form with the names of the functions only. You press Submit.": "Открывает форму GitHub только с именами функций. Отправляете вы сами."
+ "Opens a GitHub form with the names of the functions only. You press Submit.": "Открывает форму GitHub только с именами функций. Отправляете вы сами.",
+ "choose the quality Recommended (Headset page)": "выберите качество «Рекомендуемое» (страница «Гарнитура»)",
+ "connect the headset with a USB cable": "подключите гарнитуру USB-кабелем",
+ "put the Mac on Ethernet (a cable to the router)": "подключите Mac по Ethernet (кабелем к роутеру)",
+ "have the headset on the router's 5 or 6 GHz band with 80 MHz channels or wider, near the router": "подключите гарнитуру к диапазону 5 или 6 ГГц роутера с шириной канала 80 МГц или больше, рядом с роутером",
+ "The headset shows %@ of the %@ frames a second the Mac makes: the stream is held up on the way.": "Гарнитура показывает %1$@ из %2$@ кадров в секунду, которые делает Mac: поток задерживается в пути.",
+ "Each frame spends %@ ms on the network to the headset: the stream is held up on the way.": "Каждый кадр идёт по сети до гарнитуры %@ мс: поток задерживается в пути.",
+ "Video is lost on the way to the headset.": "По пути к гарнитуре теряется видео.",
+ "%@ Try: %@.": "%@ Попробуйте: %@.",
+ "; ": "; ",
+ "fps in the headset, %@ ms": "fps в гарнитуре, %@ мс",
+ "fps in the headset": "fps в гарнитуре",
+ "Frames a second the headset shows, and the time from your movement to the picture, as the headset's ALVR app reports them.": "Кадры в секунду, которые показывает гарнитура, и время от вашего движения до изображения — по данным приложения ALVR на гарнитуре.",
+ "fps on the Mac": "fps на Mac"
 }

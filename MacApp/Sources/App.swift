@@ -7,6 +7,9 @@
 //   VeRantyx --snapshot <folder>           saves pictures of each page of the window (scrolled: <page>-2.png, ...)
 //   VeRantyx --report                      saves the logs as a report does and prints the form's link (opens nothing)
 //   VeRantyx --missing-functions <log>     prints the missing Windows functions a game log names, as the report sends them
+//   VeRantyx --headset-report <session_log.txt> [Mac fps]
+//                                          prints ALVR's headset reports as the app reads them, and the advice it would
+//                                          show for a Quest over Wi-Fi at Recommended (the Mac's fps: 60)
 import AppKit
 import SwiftUI
 
@@ -36,6 +39,20 @@ enum Entry {
         }
         if let i = a.firstIndex(of: "--missing-functions"), i + 1 < a.count {
             for name in Play.missingFunctions(in: URL(fileURLWithPath: a[i + 1])) { print(name) }
+            exit(0)
+        }
+        if let i = a.firstIndex(of: "--headset-report"), i + 1 < a.count {
+            let mac = i + 2 < a.count ? Double(a[i + 2]) ?? 60 : 60
+            let text = (try? String(contentsOfFile: a[i + 1], encoding: .utf8)) ?? ""
+            var reports: [HeadsetReport] = []
+            for line in text.split(separator: "\n") {
+                guard let r = HeadsetReport(line) else { continue }
+                reports.append(r)
+                let fps = r.fps.map { String(format: "%.1f fps", $0) } ?? "-"
+                let latency = r.latency.map { String(format: "%.0f ms", $0) } ?? "-", network = r.network.map { String(format: "%.0f ms", $0) } ?? "-"
+                print("\(line.prefix(12)) \(fps), latency \(latency), network \(network), losses \(r.losses)")
+                if let hint = Play.headsetHint(reports.suffix(3), mac: mac, headset: .quest, wired: false, quality: .standard) { print("    advice: \(hint)") }
+            }
             exit(0)
         }
         if let i = a.firstIndex(of: "--play"), i + 1 < a.count {

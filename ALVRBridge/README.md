@@ -40,6 +40,16 @@ go per hand into the map's tail (SharedHaptic at 336: seq, duration, frequency, 
 (`vx_alvr_haptics`) and ALVR sends it to the headset's controller, scaled by its haptics settings. Whether a
 controller then shakes needs a headset with vibrating controllers (Quest, Pico): not checked yet.
 
+What the headset shows: the ALVR client reports each frame it shows (its own times, and the whole latency from the
+tracking sample to its display); ALVR's statistics turn them into events that only its dashboard would read (its log
+gets an empty `[GRAPH]` line per frame). There is no dashboard here, so the bridge has its own logger, writing
+session_log.txt as ALVR's does, which counts them: every 5 s a `VeRantyx: headset:` line says how many frames a second
+the headset showed, the mean latency split into the Mac's part (from the sample's arrival to the frame's encoding:
+the game, SteamVR, the encoder), the network (ALVR's estimate: what is left), decoding, and the headset's own part
+(waiting to be shown, its compositor), the video lost (IDRs asked for: ALVR 20's lost-packet count only counts an old
+client's reports), and the Mbps sent. VeRantyx for Mac shows the headset's frame rate beside the Mac's, which only says
+what reached the encoder. `VERANTYX_ALVR_PROTOCOL=udp` streams over UDP (ALVR's default) instead of TCP.
+
 ## Build and run
 
 ```bash
