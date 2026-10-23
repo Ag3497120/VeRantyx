@@ -41,6 +41,7 @@ releases: games and SteamVR come from your own Steam account. No anti-cheat is e
 
 | Date | What changed |
 |---|---|
+| Oct 23 | **VeRantyx for Mac 0.2.1**: Direct3D 11 games use far less CPU per draw (Alyx busy scene 42-47 → 60 fps, M1 Max); ALVR no longer stuck at "os error 11" after a reconnect (#6); one-click "it ran" and "missing functions" reports after a play; the Wine-derived unwinder replaced ([notice](THIRD_PARTY_NOTICES.md)) |
 | Oct 22 | **VeRantyx for Mac 0.2.0**: Elite Dangerous with two buttons, **On this Mac** and **Headset**; the Mac shows its frame rate while you play |
 | Oct 22 | **The Lab: controllers work** (any headset): SteamVR now sees The Lab's controller bindings (a Windows pipe call answered wrongly, #2) |
 | Oct 22 | ALVR over Wi-Fi: socket buffers fixed at 4 MB, which ended 270-800 ms frame delay spikes (#4); a new headset's first connection no longer shows double vision (#2, #4) |
