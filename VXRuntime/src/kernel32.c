@@ -402,7 +402,8 @@ static WINAPI BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX *m) {
     vm_statistics64_data_t vs; mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     uint64_t avail = total / 2;
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &count) == KERN_SUCCESS)
-        avail = ((uint64_t)vs.free_count + vs.inactive_count + vs.purgeable_count) * vm_page_size;
+        avail = ((uint64_t)vs.free_count + vs.inactive_count + vs.purgeable_count) * vm_kernel_page_size;   // (the kernel's pages: 16 KB, also under Rosetta)
+    if (avail > total) avail = total;                  // (purgeable pages are also counted as active or inactive)
     m->load = total ? (DWORD)(100 - avail * 100 / total) : 0;
     m->total_phys = total; m->avail_phys = avail;
     m->total_page = total * 2; m->avail_page = avail + total;
