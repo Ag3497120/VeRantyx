@@ -1313,5 +1313,6 @@ VKFN void VKAPI_CALL vkGetPrivateData(VkDevice dev, VkObjectType type, uint64_t 
 }
 
 #ifdef __aarch64__
+#include "vx.h"   // (vx_low, vx_unlow_at for the thunks)
 #include "thunks/vk_device.m.inc"
 #endif

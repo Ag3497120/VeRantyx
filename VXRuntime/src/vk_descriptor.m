@@ -454,5 +454,6 @@ void vk_push_set_write(struct VkDescriptorSet_T *s, uint32_t n, const VkWriteDes
 }
 
 #ifdef __aarch64__
+#include "vx.h"   // (vx_low, vx_unlow_at for the thunks)
 #include "thunks/vk_descriptor.m.inc"
 #endif

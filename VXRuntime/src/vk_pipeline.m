@@ -642,5 +642,6 @@ VKFN void VKAPI_CALL vkDestroyFramebuffer(VkDevice dev, VkFramebuffer fb, const 
 }
 
 #ifdef __aarch64__
+#include "vx.h"   // (vx_low, vx_unlow_at for the thunks)
 #include "thunks/vk_pipeline.m.inc"
 #endif

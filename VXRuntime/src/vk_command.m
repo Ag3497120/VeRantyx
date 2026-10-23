@@ -1476,5 +1476,6 @@ void vk_mark_queries_available(VkQueryPool pool) {
 }
 
 #ifdef __aarch64__
+#include "vx.h"   // (vx_low, vx_unlow_at for the thunks)
 #include "thunks/vk_command.m.inc"
 #endif

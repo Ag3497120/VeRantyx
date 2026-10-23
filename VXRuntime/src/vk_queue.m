@@ -340,5 +340,6 @@ VKFN VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice dev, VkQueryPool p, uint
 }
 
 #ifdef __aarch64__
+#include "vx.h"   // (vx_low, vx_unlow_at for the thunks)
 #include "thunks/vk_queue.m.inc"
 #endif
