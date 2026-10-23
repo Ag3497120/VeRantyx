@@ -987,7 +987,7 @@ static WINAPI DWORD SleepEx(DWORD ms, BOOL alertable) {
 // ---- handles -----------------------------------------------------------------------------------------------------------------
 static WINAPI BOOL CloseHandle(HANDLE h) {
     intptr_t v = (intptr_t)h;
-    if (v == -1 || v == -2) return 1;
+    if (v <= -1 && v >= -6) return 1;                              // process, thread and token pseudo-handles (-4..-6: tokens)
     pthread_mutex_lock(&g_lock);
     int i = handle_index(h);
     vx_object *o = i >= 0 ? g_handles[i] : NULL;

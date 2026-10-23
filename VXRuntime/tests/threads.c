@@ -210,6 +210,8 @@ int main(void) {
     if (WaitForSingleObject(wt, 5000) != WAIT_OBJECT_0) ok = 0;
     GetExitCodeThread(wt, &wcode);
     int fib = fibers_ok(), sus = suspend_ok(), walk = stack_walk_ok(), pk = packed_ok(), run = stack_run_ok();
+    // Closing a pseudo-handle (process, thread, and the token ones Chromium closes: -4..-6) is a no-op that succeeds.
+    for (INT_PTR h = -1; h >= -6; h--) if (!CloseHandle((HANDLE)h)) { printf("CloseHandle(%d) failed\n", (int)h); ok = 0; }
     ok = ok && counter == 40000 && interlocked == 40000 && sems == 4 && wcode == 77 && per_thread == 7 && fib && sus && walk && pk && run;
     printf("threads: counter=%ld interlocked=%ld semaphores=%d condvar=%lu main_tls=%d fibers=%s suspend+apc=%s stack=%s packed locks=%s stack runs=%s (%d stops inside) -> %s\n",
            counter, interlocked, sems, wcode, per_thread, fib ? "ok" : "bad", sus ? "ok" : "bad", walk ? "ok" : "bad", pk ? "ok" : "bad", run ? "ok" : "bad", stack_run_inside, ok ? "ok" : "FAILED");
