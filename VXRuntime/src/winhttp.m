@@ -795,6 +795,7 @@ static WINAPI BOOL WinHttpSetOption(HANDLE handle, DWORD option, void *buffer, D
 }
 
 static WINAPI BOOL WinHttpCloseHandle(HANDLE handle) {
+    if (vx_winhttp_proxy_close(handle)) return YES;                  // a proxy resolver; else its callback hears HANDLE_CLOSING (winhttp_proxy.m)
     winhttp_handle *h = handle;
     if (!h || h->kind < WH_SESSION || h->kind > WH_REQUEST) { vx_set_last_error(12018); return NO; }
     free(h->agent); free(h->proxy); free(h->proxy_bypass); free(h->host); free(h->verb); free(h->path); free(h->headers);

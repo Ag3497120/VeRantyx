@@ -1148,6 +1148,10 @@ int main(int argc, char **argv, char **envp) {
     vx_opengl_init();
     vx_net_init();
     vx_mm_init();
+    vx_midi_init();
+    vx_iphlp_init();
+    vx_winsock_nsp_init();
+    vx_winhttp_proxy_init();
     vx_com_init();
     vx_input_init();
     vx_audio_init();
