@@ -101,7 +101,7 @@ cd "$GAME_DIR"
 # Keep the optional control socket scoped to the game. SteamVR is already running in separate VXRuntime
 # processes, and sharing the same Unix socket path would let those processes replace each other's endpoint.
 GAME_ENV=("VXRT_ROOT=$VXRT_VR_ROOT" "VXRT_OVERLAY=$OVERLAY" "VXRT_DLL_PATH=$VXRT_DLL_DIRS"
-    "VXRT_STEAM_BRIDGE=1" "VXRT_DEBUGGER=1" "VXRT_DEBUG_OUTPUT=1" "VXRT_LOG_TIME=1")
+    "VXRT_STEAM_BRIDGE=1" "VXRT_DEBUGGER=${VXRT_DEBUGGER:-1}" "VXRT_DEBUG_OUTPUT=1" "VXRT_LOG_TIME=1")
 # Played in the headset, the game's window seldom stays the Mac's frontmost one; told it is in the background, a game
 # stops reading its controllers (and keys). Flat, it is the window the player uses: it takes the Mac's focus.
 if [[ "${VXRT_FLAT:-0}" == 1 ]]; then GAME_ENV+=("VXRT_STAY_ACTIVE=${VXRT_STAY_ACTIVE:-0}")

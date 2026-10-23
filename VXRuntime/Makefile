@@ -33,13 +33,17 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe
+       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/game_imports.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
 	$(MINGW) -O1 -nostdlib -e start -o $@ $< -lkernel32
 
 build/hello_crt.exe: tests/hello_crt.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+build/game_imports.exe: tests/game_imports.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
@@ -1007,6 +1011,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/hello_k32.exe
 	$(VXRT) build/smc.exe
 	$(VXRT) build/hello_crt.exe one "two words"
+	$(VXRT) build/game_imports.exe
 	$(VXRT) build/threads.exe
 	$(VXRT) build/cxx_exceptions.exe
 	$(VXRT) build/hw_exceptions.exe

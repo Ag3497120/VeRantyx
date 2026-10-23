@@ -609,6 +609,7 @@ static WINAPI int vx_snprintf(char *buf, size_t n, const char *fmt, ...) {
     vx_va_end(ap);
     return r;
 }
+static WINAPI int vx_vsprintf(char *buf, const char *fmt, const char *ap) { return vx_format(buf, (size_t)1 << 30, fmt, ap); }
 static WINAPI int vx_sprintf(char *buf, const char *fmt, ...) {
     vx_va_list ap;
     vx_va_start(ap, fmt);
@@ -1037,7 +1038,7 @@ static const vx_export ucrt[] = {
     { "_finite", (void *)vx_finite }, { "_clearfp", (void *)vx_clearfp }, { "_statusfp", (void *)vx_statusfp },
     { "_controlfp", (void *)vx_controlfp }, { "_controlfp_s", (void *)vx_controlfp_s }, { "_fpclass", (void *)vx_fpclass },
     { "_stricmp", (void *)vx_stricmp }, { "_strnicmp", (void *)vx_strnicmp }, { "_vsnprintf", (void *)vx_vsnprintf },
-    { "_snprintf", (void *)vx_snprintf }, { "sprintf", (void *)vx_sprintf },
+    { "_snprintf", (void *)vx_snprintf }, { "sprintf", (void *)vx_sprintf }, { "vsprintf", (void *)vx_vsprintf },
     { "_aligned_malloc", (void *)vx_aligned_malloc }, { "_aligned_free", (void *)vx_aligned_free },
     { "_aligned_realloc", (void *)vx_aligned_realloc }, { "_aligned_msize", (void *)vx_aligned_msize },
     { "_lock", (void *)vx_lock }, { "_unlock", (void *)vx_unlock }, { "__dllonexit", (void *)vx_dllonexit },

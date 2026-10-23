@@ -1044,10 +1044,26 @@ static WINAPI DWORD EventWriteTransfer(uint64_t h, const void *d, const void *a,
     (void)h; (void)d; (void)a; (void)r; (void)n; (void)data; return 0;
 }
 static WINAPI BOOL EventEnabled(uint64_t h, const void *d) { (void)h; (void)d; return 0; }
+// Classic (WPP) providers register too, and are never enabled: no session asks for their events.
+static WINAPI DWORD RegisterTraceGuidsW(void *cb, void *ctx, const void *guid, DWORD n, uint8_t *regs, const void *mof,
+                                        const void *res, uint64_t *h) {
+    (void)cb; (void)ctx; (void)guid; (void)mof; (void)res;
+    for (DWORD i = 0; regs && i < n; i++) *(void **)(regs + 16 * i + 8) = (void *)(uintptr_t)(i + 1);   // RegHandle
+    *h = 1;
+    return 0;
+}
+static WINAPI DWORD UnregisterTraceGuids(uint64_t h) { (void)h; return 0; }
+static WINAPI uint64_t GetTraceLoggerHandle(void *buf) { (void)buf; vx_set_last_error(6); return (uint64_t)-1; }
+static WINAPI uint8_t GetTraceEnableLevel(uint64_t h) { (void)h; return 0; }
+static WINAPI DWORD GetTraceEnableFlags(uint64_t h) { (void)h; return 0; }
+static WINAPI DWORD TraceMessage(uint64_t h, DWORD flags, const void *guid, uint16_t number) { (void)h; (void)flags; (void)guid; (void)number; return 0; }
+static WINAPI DWORD TraceEvent(uint64_t h, void *header) { (void)h; (void)header; return 0; }
 static const vx_export advapi_misc[] = {
     VX_EXPORT(InitializeSecurityDescriptor), VX_EXPORT(SetSecurityDescriptorDacl), VX_EXPORT(AllocateAndInitializeSid),
     VX_EXPORT(FreeSid), VX_EXPORT(CheckTokenMembership), VX_EXPORT(EventRegister), VX_EXPORT(EventUnregister),
-    VX_EXPORT(EventWrite), VX_EXPORT(EventWriteTransfer), VX_EXPORT(EventEnabled), VX_EXPORT(GetUserNameA), VX_EXPORT(GetUserNameW),
+    VX_EXPORT(EventWrite), VX_EXPORT(EventWriteTransfer), VX_EXPORT(EventEnabled), VX_EXPORT(RegisterTraceGuidsW),
+    { "RegisterTraceGuidsA", (void *)RegisterTraceGuidsW }, VX_EXPORT(UnregisterTraceGuids), VX_EXPORT(GetTraceLoggerHandle),
+    VX_EXPORT(GetTraceEnableLevel), VX_EXPORT(GetTraceEnableFlags), VX_EXPORT(TraceMessage), VX_EXPORT(TraceEvent), VX_EXPORT(GetUserNameA), VX_EXPORT(GetUserNameW),
 };
 
 static const vx_export shell32[] = { VX_EXPORT(ShellExecuteA), VX_EXPORT(ShellExecuteW), VX_EXPORT(ShellExecuteExA), VX_EXPORT(ShellExecuteExW) };
