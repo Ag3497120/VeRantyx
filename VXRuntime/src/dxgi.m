@@ -54,8 +54,9 @@ static d3d_object *factory_new(void) {
 }
 static WINAPI HRESULT factory_qi(void *this, const GUID *iid, void **out) {
     static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIFactory, &IID_IDXGIFactory1, &IID_IDXGIFactory2,
-                                         &IID_IDXGIFactory3, &IID_IDXGIFactory4 };
-    return query(this, iid, out, known, 7);
+                                         &IID_IDXGIFactory3, &IID_IDXGIFactory4, &IID_IDXGIFactory5, &IID_IDXGIFactory6,
+                                         &IID_IDXGIFactory7 };
+    return query(this, iid, out, known, 10);
 }
 static WINAPI HRESULT factory_get_parent(void *this, const GUID *iid, void **out) { (void)this; (void)iid; *out = NULL; return E_NOINTERFACE; }
 static d3d_object *adapter_new(d3d_object *factory);
@@ -76,6 +77,33 @@ static WINAPI HRESULT factory_enum_by_luid(void *this, uint64_t luid, const GUID
     return hr;
 }
 static WINAPI HRESULT factory_enum_warp(void *this, const GUID *iid, void **out) { (void)this; (void)iid; *out = NULL; return DXGI_ERROR_NOT_FOUND; }
+// IDXGIFactory5: DXGI_FEATURE_PRESENT_ALLOW_TEARING (a BOOL). Presents with sync interval 0 do not wait for the
+// display (CAMetalLayer.displaySyncEnabled off), which is what the tearing flag asks for.
+static WINAPI HRESULT factory_check_feature(void *this, uint32_t feature, void *data, uint32_t size) {
+    (void)this;
+    if (feature != 0 || !data || size != 4) return E_INVALIDARG;
+    *(int32_t *)data = 1;
+    return S_OK;
+}
+// IDXGIFactory6: there is one adapter whatever the preference (unspecified, minimum power, high performance).
+static WINAPI HRESULT factory_enum_by_preference(void *this, uint32_t i, uint32_t preference, const GUID *iid, void **out) {
+    if (!out) return E_INVALIDARG;
+    *out = NULL;
+    if (preference > 2) return E_INVALIDARG;
+    if (i) return DXGI_ERROR_NOT_FOUND;
+    d3d_object *a = adapter_new(this);
+    HRESULT hr = call_qi(a, iid, out);
+    d3d_release(a);
+    return hr;
+}
+// IDXGIFactory7: adapters never change.
+static WINAPI HRESULT factory_register_adapters_changed(void *this, HANDLE event, DWORD *cookie) {
+    (void)this; (void)event;
+    if (!cookie) return E_INVALIDARG;
+    *cookie = 1;
+    return S_OK;
+}
+static WINAPI HRESULT factory_unregister_adapters_changed(void *this, DWORD cookie) { (void)this; (void)cookie; return S_OK; }
 static WINAPI uint32_t factory_creation_flags(void *this) { (void)this; return 0; }
 static WINAPI HRESULT factory_make_window_association(void *this, HANDLE w, uint32_t flags) { (void)this; (void)w; (void)flags; return S_OK; }
 static WINAPI HRESULT factory_get_window_association(void *this, HANDLE *w) { (void)this; *w = NULL; return S_OK; }
@@ -104,8 +132,9 @@ static d3d_object *adapter_new(d3d_object *factory) {
 }
 d3d_object *dxgi_adapter_create(void) { return adapter_new(NULL); }
 static WINAPI HRESULT adapter_qi(void *this, const GUID *iid, void **out) {
-    static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIAdapter, &IID_IDXGIAdapter1, &IID_IDXGIAdapter2, &IID_IDXGIAdapter3 };
-    return query(this, iid, out, known, 6);
+    static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIAdapter, &IID_IDXGIAdapter1, &IID_IDXGIAdapter2,
+                                         &IID_IDXGIAdapter3, &IID_IDXGIAdapter4 };
+    return query(this, iid, out, known, 7);
 }
 // DXGI_QUERY_VIDEO_MEMORY_INFO: budget, current usage, available for reservation, current reservation. The local
 // segment is the unified memory Metal lets the GPU use.
@@ -140,7 +169,8 @@ static void adapter_desc(uint8_t *d, int with_flags) {
 }
 static WINAPI HRESULT adapter_get_desc(void *this, uint8_t *d) { (void)this; adapter_desc(d, 0); return S_OK; }
 static WINAPI HRESULT adapter_get_desc1(void *this, uint8_t *d) { (void)this; adapter_desc(d, 1); return S_OK; }
-// DXGI_ADAPTER_DESC2: DESC1, then graphics and compute preemption granularities (DMA buffer, dispatch).
+// DXGI_ADAPTER_DESC2 (and DESC3, the same layout with DXGI_ADAPTER_FLAG3 flags): DESC1, then graphics and compute
+// preemption granularities (DMA buffer, dispatch).
 static WINAPI HRESULT adapter_get_desc2(void *this, uint8_t *d) { (void)this; adapter_desc(d, 1); *(uint32_t *)(d + 312) = 0; *(uint32_t *)(d + 316) = 1; return S_OK; }
 static d3d_object *output_new(d3d_object *adapter);
 static WINAPI HRESULT adapter_enum_outputs(void *this, uint32_t i, void **out) {
@@ -159,8 +189,15 @@ static d3d_object *output_new(d3d_object *adapter) {
     return &o->base;
 }
 static WINAPI HRESULT output_qi(void *this, const GUID *iid, void **out) {
-    static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIOutput };
-    return query(this, iid, out, known, 3);
+    static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIOutput, &IID_IDXGIOutput1, &IID_IDXGIOutput2,
+                                         &IID_IDXGIOutput3, &IID_IDXGIOutput4, &IID_IDXGIOutput5, &IID_IDXGIOutput6 };
+    return query(this, iid, out, known, 9);
+}
+d3d_object *dxgi_output_create(void) {
+    d3d_object *adapter = dxgi_adapter_create();
+    d3d_object *output = output_new(adapter);
+    d3d_release(adapter);
+    return output;
 }
 static int refresh_rate(void) {
     CGDisplayModeRef m = CGDisplayCopyDisplayMode(CGMainDisplayID());
@@ -197,6 +234,64 @@ static WINAPI HRESULT output_get_modes(void *this, uint32_t format, uint32_t fla
 static WINAPI HRESULT output_find_mode(void *this, const uint32_t *want, uint32_t *closest, void *device) {
     (void)this; (void)device;
     current_mode(closest, want ? want[4] : 0);
+    return S_OK;
+}
+// IDXGIOutput1: DXGI_MODE_DESC1 is DXGI_MODE_DESC and a Stereo BOOL.
+static WINAPI HRESULT output_get_modes1(void *this, uint32_t format, uint32_t flags, uint32_t *n, uint32_t *modes) {
+    (void)this; (void)flags;
+    if (!n) return E_INVALIDARG;
+    if (!modes) { *n = 1; return S_OK; }
+    if (*n < 1) return (HRESULT)0x887A0003;                             // DXGI_ERROR_MORE_DATA
+    memset(modes, 0, 32);
+    current_mode(modes, format);
+    *n = 1;
+    return S_OK;
+}
+static WINAPI HRESULT output_find_mode1(void *this, const uint32_t *want, uint32_t *closest, void *device) {
+    (void)this; (void)device;
+    memset(closest, 0, 32);
+    current_mode(closest, want ? want[4] : 0);
+    return S_OK;
+}
+static WINAPI HRESULT output_duplicate(void *this, void *device, void **out) { (void)this; (void)device; if (out) *out = NULL; return DXGI_ERROR_UNSUPPORTED; }
+static WINAPI HRESULT output_duplicate1(void *this, void *device, uint32_t flags, uint32_t n, const uint32_t *formats, void **out) {
+    (void)this; (void)device; (void)flags; (void)n; (void)formats;
+    if (out) *out = NULL;
+    return DXGI_ERROR_UNSUPPORTED;
+}
+// IDXGIOutput2-4: no hardware overlays.
+static WINAPI int output_supports_overlays(void *this) { (void)this; return 0; }
+static WINAPI HRESULT output_check_overlay(void *this, uint32_t format, void *device, uint32_t *flags) {
+    (void)this; (void)format; (void)device;
+    if (!flags) return E_INVALIDARG;
+    *flags = 0;
+    return S_OK;
+}
+static WINAPI HRESULT output_check_overlay_color_space(void *this, uint32_t format, uint32_t color_space, void *device, uint32_t *flags) {
+    (void)this; (void)format; (void)color_space; (void)device;
+    if (!flags) return E_INVALIDARG;
+    *flags = 0;
+    return S_OK;
+}
+// IDXGIOutput6: DXGI_OUTPUT_DESC1 is DXGI_OUTPUT_DESC, then bits per color, the color space, the primaries, white
+// point and luminances. Frames go out as 8-bit sRGB (G22 P709), so the display reads as an SDR display: programs
+// keep HDR off.
+static WINAPI HRESULT output_get_desc1(void *this, uint8_t *d) {
+    if (!d) return E_INVALIDARG;
+    output_get_desc(this, d);
+    memset(d + 96, 0, 52);
+    *(uint32_t *)(d + 96) = 8;
+    *(uint32_t *)(d + 100) = 0;                                        // DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+    static const float chroma[8] = { 0.64f, 0.33f, 0.30f, 0.60f, 0.15f, 0.06f, 0.3127f, 0.3290f };
+    memcpy(d + 104, chroma, sizeof chroma);
+    const float luminance[3] = { 0.5f, 270.0f, 270.0f };              // min, max, max full frame (nits)
+    memcpy(d + 136, luminance, sizeof luminance);
+    return S_OK;
+}
+static WINAPI HRESULT output_check_hardware_composition(void *this, uint32_t *flags) {
+    (void)this;
+    if (!flags) return E_INVALIDARG;
+    *flags = 0;
     return S_OK;
 }
 static WINAPI HRESULT output_wait_vblank(void *this) { (void)this; usleep(1000000 / refresh_rate()); return S_OK; }
@@ -317,8 +412,8 @@ static WINAPI HRESULT factory_create_swapchain_hwnd(void *this, void *device, HA
 
 static WINAPI HRESULT swapchain_qi(void *this, const GUID *iid, void **out) {
     static const GUID *const known[] = { &IID_IUnknown_, &IID_IDXGIObject, &IID_IDXGIDeviceSubObject, &IID_IDXGISwapChain, &IID_IDXGISwapChain1,
-                                         &IID_IDXGISwapChain2, &IID_IDXGISwapChain3 };
-    return query(this, iid, out, known, 7);
+                                         &IID_IDXGISwapChain2, &IID_IDXGISwapChain3, &IID_IDXGISwapChain4 };
+    return query(this, iid, out, known, 8);
 }
 // IDXGISwapChain2/3: frame latency (presents do not queue up here, so the waitable object is always signalled),
 // source size, color spaces (sRGB only), the current back buffer (there is one).
@@ -334,6 +429,17 @@ static WINAPI HRESULT swapchain_get_source_size(void *this, uint32_t *w, uint32_
 static WINAPI uint32_t swapchain_back_buffer_index(void *this) { (void)this; return 0; }
 static WINAPI HRESULT swapchain_check_color_space(void *this, uint32_t cs, uint32_t *support) { (void)this; *support = cs == 0 ? 1 : 0; return S_OK; }
 static WINAPI HRESULT swapchain_set_color_space(void *this, uint32_t cs) { (void)this; return cs == 0 ? S_OK : E_INVALIDARG; }
+// IDXGISwapChain4: HDR metadata is accepted and unused (the color space stays sRGB).
+HRESULT dxgi_check_hdr_metadata(uint32_t type, uint32_t size, const void *data) {
+    if (type == 0) return size || data ? E_INVALIDARG : S_OK;          // DXGI_HDR_METADATA_TYPE_NONE
+    if (type == 1) return size == 28 && data ? S_OK : E_INVALIDARG;   // DXGI_HDR_METADATA_HDR10
+    if (type == 2) return size == 4 && data ? S_OK : E_INVALIDARG;    // DXGI_HDR_METADATA_HDR10PLUS
+    return E_INVALIDARG;
+}
+static WINAPI HRESULT swapchain_set_hdr_metadata(void *this, uint32_t type, uint32_t size, const void *data) {
+    (void)this;
+    return dxgi_check_hdr_metadata(type, size, data);
+}
 static WINAPI HRESULT swapchain_get_device(void *this, const GUID *iid, void **out) { return call_qi(((swapchain *)this)->dev, iid, out); }
 static WINAPI HRESULT swapchain_get_buffer(void *this, uint32_t index, const GUID *iid, void **out) {
     swapchain *sc = this;
@@ -512,17 +618,25 @@ static void make_tables(void) {
         { "MakeWindowAssociation", (void *)factory_make_window_association }, { "GetWindowAssociation", (void *)factory_get_window_association },
         { "CreateSwapChain", (void *)factory_create_swapchain }, { "CreateSwapChainForHwnd", (void *)factory_create_swapchain_hwnd },
         { "IsCurrent", (void *)factory_is_current }, { "EnumAdapterByLuid", (void *)factory_enum_by_luid },
-        { "EnumWarpAdapter", (void *)factory_enum_warp }, { "GetCreationFlags", (void *)factory_creation_flags }, { "IsWindowedStereoEnabled", (void *)factory_stereo }, { NULL, NULL } };
+        { "EnumWarpAdapter", (void *)factory_enum_warp }, { "GetCreationFlags", (void *)factory_creation_flags }, { "IsWindowedStereoEnabled", (void *)factory_stereo },
+        { "CheckFeatureSupport", (void *)factory_check_feature }, { "EnumAdapterByGpuPreference", (void *)factory_enum_by_preference },
+        { "RegisterAdaptersChangedEvent", (void *)factory_register_adapters_changed },
+        { "UnregisterAdaptersChangedEvent", (void *)factory_unregister_adapters_changed }, { NULL, NULL } };
     static const d3d_method adapter[] = { { "QueryInterface", (void *)adapter_qi }, OBJECT_METHODS, { "GetParent", (void *)child_get_parent },
         { "EnumOutputs", (void *)adapter_enum_outputs }, { "GetDesc", (void *)adapter_get_desc }, { "GetDesc1", (void *)adapter_get_desc1 },
-        { "CheckInterfaceSupport", (void *)adapter_check_interface }, { "GetDesc2", (void *)adapter_get_desc2 },
+        { "CheckInterfaceSupport", (void *)adapter_check_interface }, { "GetDesc2", (void *)adapter_get_desc2 }, { "GetDesc3", (void *)adapter_get_desc2 },
         { "QueryVideoMemoryInfo", (void *)adapter_query_video_memory }, { "SetVideoMemoryReservation", (void *)adapter_set_reservation },
         { "RegisterVideoMemoryBudgetChangeNotificationEvent", (void *)adapter_register_budget_event },
         { "UnregisterVideoMemoryBudgetChangeNotification", (void *)adapter_unregister_budget_event }, { NULL, NULL } };
     static const d3d_method output[] = { { "QueryInterface", (void *)output_qi }, OBJECT_METHODS, { "GetParent", (void *)child_get_parent },
         { "GetDesc", (void *)output_get_desc }, { "GetDisplayModeList", (void *)output_get_modes },
         { "FindClosestMatchingMode", (void *)output_find_mode }, { "WaitForVBlank", (void *)output_wait_vblank },
-        { "TakeOwnership", (void *)output_take_ownership }, { "ReleaseOwnership", (void *)output_release_ownership }, { NULL, NULL } };
+        { "TakeOwnership", (void *)output_take_ownership }, { "ReleaseOwnership", (void *)output_release_ownership },
+        { "GetDisplayModeList1", (void *)output_get_modes1 }, { "FindClosestMatchingMode1", (void *)output_find_mode1 },
+        { "DuplicateOutput", (void *)output_duplicate }, { "DuplicateOutput1", (void *)output_duplicate1 },
+        { "SupportsOverlays", (void *)output_supports_overlays }, { "CheckOverlaySupport", (void *)output_check_overlay },
+        { "CheckOverlayColorSpaceSupport", (void *)output_check_overlay_color_space }, { "GetDesc1", (void *)output_get_desc1 },
+        { "CheckHardwareCompositionSupport", (void *)output_check_hardware_composition }, { NULL, NULL } };
     static const d3d_method sc[] = { { "QueryInterface", (void *)swapchain_qi }, OBJECT_METHODS, { "GetParent", (void *)child_get_parent },
         { "GetDevice", (void *)swapchain_get_device }, { "Present", (void *)swapchain_present }, { "Present1", (void *)swapchain_present1 },
         { "GetBuffer", (void *)swapchain_get_buffer }, { "SetFullscreenState", (void *)swapchain_set_fullscreen },
@@ -534,11 +648,12 @@ static void make_tables(void) {
         { "SetMaximumFrameLatency", (void *)swapchain_set_latency }, { "GetMaximumFrameLatency", (void *)swapchain_get_latency },
         { "GetFrameLatencyWaitableObject", (void *)swapchain_latency_object }, { "SetSourceSize", (void *)swapchain_set_source_size },
         { "GetSourceSize", (void *)swapchain_get_source_size }, { "GetCurrentBackBufferIndex", (void *)swapchain_back_buffer_index },
-        { "CheckColorSpaceSupport", (void *)swapchain_check_color_space }, { "SetColorSpace1", (void *)swapchain_set_color_space }, { NULL, NULL } };
-    g_factory_vtbl = D3D_VTABLE(IDXGIFactory4, factory);
-    g_adapter_vtbl = D3D_VTABLE(IDXGIAdapter3, adapter);
-    g_output_vtbl = D3D_VTABLE(IDXGIOutput, output);
-    g_swapchain_vtbl = D3D_VTABLE(IDXGISwapChain3, sc);
+        { "CheckColorSpaceSupport", (void *)swapchain_check_color_space }, { "SetColorSpace1", (void *)swapchain_set_color_space },
+        { "SetHDRMetaData", (void *)swapchain_set_hdr_metadata }, { NULL, NULL } };
+    g_factory_vtbl = D3D_VTABLE(IDXGIFactory7, factory);
+    g_adapter_vtbl = D3D_VTABLE(IDXGIAdapter4, adapter);
+    g_output_vtbl = D3D_VTABLE(IDXGIOutput6, output);
+    g_swapchain_vtbl = D3D_VTABLE(IDXGISwapChain4, sc);
 }
 
 static const vx_export dxgi[] = { VX_EXPORT(CreateDXGIFactory), VX_EXPORT(CreateDXGIFactory1), VX_EXPORT(CreateDXGIFactory2) };

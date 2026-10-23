@@ -540,3 +540,27 @@ validated before execution. Ordinary command-list `ExecuteIndirect` captures the
 indirect draws use the inherited IA state during replay. Format interpretation stays in the D3D12 input assembler and
 Metal vertex descriptor. Input-layout creation rejects nonzero `InstanceDataStepRate` on per-vertex elements, as required
 by Microsoft's [`D3D12_INPUT_ELEMENT_DESC` contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_input_element_desc).
+
+## What engines call at start-up and per frame
+
+`tests/d3d12_engine.c` walks the sequence Unreal Engine and Unity follow. DXGI exposes `IDXGIFactory5`–`7`
+(`CheckFeatureSupport(PRESENT_ALLOW_TEARING)` is TRUE because a sync-interval-0 present does not wait for the display;
+`EnumAdapterByGpuPreference` returns the one adapter for every preference), `IDXGIAdapter4::GetDesc3`, and
+`IDXGIOutput1`–`6`; `GetDesc1` describes the display as 8-bit SDR (G22/P709), so engines keep HDR off.
+`IDXGISwapChain4::SetHDRMetaData` validates and ignores its metadata. A D3D12 swap chain created with
+`FRAME_LATENCY_WAITABLE_OBJECT` hands out a semaphore holding one count per frame the program may queue
+(`SetMaximumFrameLatency`, 1 by default); each present returns its count when the GPU has drawn it.
+
+`CheckFeatureSupport` answers `D3D12_OPTIONS4` to `OPTIONS18`, `SHADER_CACHE`, `COMMAND_QUEUE_PRIORITY`, `EXISTING_HEAPS`,
+`SERIALIZATION`, `CROSS_NODE`, `DISPLAYABLE` and the protected-session queries at their exact sizes, reporting the
+features as absent (render pass tier 0, no raytracing, mesh shaders, VRS, enhanced barriers or 64-bit atomics), as the
+Windows runtime does on hardware without them. `ID3D12Device2::CreatePipelineState` reads pipeline state streams
+(subobject types 0x00–0x16, D3D12's defaults for the ones left out; view instancing and depth bounds are refused)
+into the classic graphics or compute description. `CreateCommandList1` creates a closed list without an allocator.
+Render passes follow tier 0, the tier on which Windows emulates them: `BeginRenderPass` binds the targets and clears
+those whose beginning access is CLEAR, `EndRenderPass` resolves those whose ending access is RESOLVE (the source in
+`RENDER_TARGET` state, as the API requires). PIX events and markers, `DiscardResource`, `OMSetDepthBounds`,
+`SetSamplePositions` and `SetViewInstanceMask` do nothing; `SetPredication` with a buffer runs the predicated work
+anyway (logged once). `CreatePipelineLibrary` returns `DXGI_ERROR_UNSUPPORTED`, which engines take as "no PSO
+library"; `SetEventOnMultipleFenceCompletion` waits for all or any of its fences.
+Resolve destinations still need the render-target flag here (Metal resolves into render-target textures).

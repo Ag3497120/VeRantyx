@@ -157,6 +157,7 @@ BOOL   vx_handle_close(HANDLE h);
 // An overlapped operation on `file` finished: fills the OVERLAPPED, signals its event, queues the completion packet.
 void   vx_io_completed(HANDLE file, void *overlapped, DWORD bytes, DWORD status);
 void   vx_set_event(HANDLE event);          // SetEvent for threads that are not Windows threads
+void   vx_release_semaphore(HANDLE sem, LONG n);   // ReleaseSemaphore for them (a count past the maximum is dropped)
 
 // Diagnostics (stderr); VXRT_TRACE=1 also logs every implemented call that opts in.
 void vx_log(const char *fmt, ...);

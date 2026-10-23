@@ -338,7 +338,8 @@ enum { C_PSO, C_ROOTSIG, C_HEAPS, C_TABLE, C_CONSTANTS, C_ROOT_VA, C_DISPATCH, C
        C_TOPOLOGY, C_VB, C_IB, C_TARGETS, C_VIEWPORTS, C_SCISSORS, C_CLEAR_RTV, C_CLEAR_DSV, C_CLEAR_UAV, C_DRAW, C_DRAW_INDEXED, C_BLEND_FACTOR, C_STENCIL_REF,
        C_BEGIN_QUERY, C_END_QUERY, C_RESOLVE_QUERY, C_GPU_IR, C_EXECUTE_INDIRECT, C_BUNDLE_BEGIN, C_BUNDLE_END,
        C_WRITE_BUFFER_IMMEDIATE };
-enum { D3D12_TRACK_COPY_BUFFER = 0x100, D3D12_TRACK_COPY_RESOURCE, D3D12_TRACK_COPY_TEXTURE, D3D12_TRACK_RESOLVE };
+enum { D3D12_TRACK_COPY_BUFFER = 0x100, D3D12_TRACK_COPY_RESOURCE, D3D12_TRACK_COPY_TEXTURE, D3D12_TRACK_RESOLVE,
+       D3D12_TRACK_RENDER_PASS_RESOLVE };   // (EndRenderPass resolves: the source stays a render target)
 typedef struct {
     int op;
     uint32_t a, b, c;
@@ -382,6 +383,10 @@ typedef struct {
     gpu_ir_stream gpu_ir;
     int closed;
     int32_t validation_error;
+    // BeginRenderPass: the resolves its ending accesses ask for, carried out by EndRenderPass.
+    struct render_pass_resolve12 *render_pass_resolves;
+    uint32_t render_pass_nresolves;
+    int in_render_pass, render_pass_resolving;
 } list12;
 
 static int list_capture_draw_buffers12(list12 *list, gpu_ir_draw_info *draw);
@@ -405,8 +410,10 @@ static WINAPI HRESULT obj_set_private(void *this, const GUID *g, uint32_t size, 
 static WINAPI HRESULT obj_set_private_iface(void *this, const GUID *g, void *unk) { return d3d_set_private(obj(this), g, sizeof unk, &unk); }
 static WINAPI HRESULT child_get_device(void *this, const GUID *iid, void **out) {
     dev12 *d = ((obj12 *)this)->dev;
-    const GUID *known[] = { &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4, &IID_ID3D12Device5 };
-    return query(d, iid, out, known, 6);
+    const GUID *known[] = { &IID_ID3D12Device, &IID_ID3D12Device1, &IID_ID3D12Device2, &IID_ID3D12Device3, &IID_ID3D12Device4,
+                            &IID_ID3D12Device5, &IID_ID3D12Device6, &IID_ID3D12Device7, &IID_ID3D12Device8, &IID_ID3D12Device9,
+                            &IID_ID3D12Device10 };
+    return query(d, iid, out, known, 11);
 }
 
 #define COMMON_METHODS \
@@ -2393,6 +2400,42 @@ static WINAPI HRESULT fence_set_event(void *this, uint64_t value, HANDLE h) {
 }
 static WINAPI int32_t fence_flags(void *this) { return 0; }
 
+// ID3D12Device1::SetEventOnMultipleFenceCompletion: the event is set when all (flags 0) or any (flags 1) of the
+// fences reach their values; without an event the call waits.
+typedef struct { int32_t left, done; HANDLE event; dispatch_semaphore_t sem; } multi_wait12;
+static void multi_wait_reached12(multi_wait12 *w, int any) {
+    if (any ? __sync_lock_test_and_set(&w->done, 1) != 0 : __sync_sub_and_fetch(&w->left, 1) != 0) return;
+    if (w->event) vx_set_event(w->event);
+    else dispatch_semaphore_signal(w->sem);
+}
+static WINAPI HRESULT dev_set_event_multiple_fences(void *this, void *const *fences, const uint64_t *values, uint32_t n,
+                                                    int32_t flags, HANDLE event) {
+    if ((flags & ~1) || (n && (!fences || !values))) return E_INVALIDARG;
+    for (uint32_t i = 0; i < n; i++)
+        if (!fences[i] || ((d3d_object *)fences[i])->kind != K12_FENCE) return E_INVALIDARG;
+    int any = flags & 1;
+    uint32_t pending = 0;
+    for (uint32_t i = 0; i < n; i++) pending += ((fence12 *)fences[i])->event.signaledValue < values[i];
+    if (!n || (any ? pending < n : !pending)) {                   // already complete
+        if (event) vx_set_event(event);
+        return S_OK;
+    }
+    // (shared by the listeners; small and kept, as a waiting listener may still fire after the event is set)
+    multi_wait12 *w = calloc(1, sizeof *w);
+    if (!w) return E_OUTOFMEMORY;
+    w->left = (int32_t)pending;
+    w->event = event;
+    if (!event) w->sem = dispatch_semaphore_create(0);
+    dispatch_semaphore_t sem = w->sem;
+    for (uint32_t i = 0; i < n; i++) {
+        fence12 *f = fences[i];
+        if (f->event.signaledValue >= values[i]) continue;
+        [f->event notifyListener:f->listener atValue:values[i] block:^(id<MTLSharedEvent> e, uint64_t v) { multi_wait_reached12(w, any); }];
+    }
+    if (!event) dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    return S_OK;
+}
+
 static WINAPI HRESULT dev_create_fence(void *this, uint64_t initial, int32_t flags, const GUID *iid, void **out) {
     if (!out) return E_POINTER;
     *out = NULL;
@@ -2814,6 +2857,10 @@ static void list_clear(list12 *l) {
     memset(l->recording_vertex_buffers, 0, sizeof l->recording_vertex_buffers);
     memset(&l->recording_index_buffer, 0, sizeof l->recording_index_buffer);
     l->n = 0;
+    free(l->render_pass_resolves);
+    l->render_pass_resolves = NULL;
+    l->render_pass_nresolves = 0;
+    l->in_render_pass = 0;
 }
 static void list_destroy(d3d_object *o) {
     list12 *l = (list12 *)o;
@@ -3382,7 +3429,7 @@ static void list_resolve_subresource_region_mode12(list12 *list, void *dst, uint
     cmd12 *command = rec(list, C_GPU_IR);
     command->a = index;
     command->b = UINT32_MAX;
-    command->gfx = D3D12_TRACK_RESOLVE;
+    command->gfx = list->render_pass_resolving ? D3D12_TRACK_RENDER_PASS_RESOLVE : D3D12_TRACK_RESOLVE;
     command->obj = destination; command->obj2 = source;
     command->c = src_subresource; command->off = dst_subresource;
     hold(destination); hold(source);
@@ -4572,6 +4619,99 @@ static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *de
     return hr;
 }
 
+// ID3D12Device2::CreatePipelineState: a stream of subobjects, each a 4-byte type and its structure, aligned to
+// pointer size (the layout of d3dx12's CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT). The stream becomes the classic
+// graphics or compute description, with D3D12's defaults for the subobjects it leaves out.
+typedef struct { size_t size; const void *stream; } PSO_STREAM_DESC;
+static HRESULT pso_stream_parse(const PSO_STREAM_DESC *desc, GFX_PSO_DESC *g, COMPUTE_PSO_DESC *c, int *compute) {
+    // the inner structure's size and alignment by subobject type (0: not accepted here)
+    static const struct { uint8_t size, align; } inner[0x1a] = {
+        [0x00] = { 8, 8 },  [0x01] = { 16, 8 }, [0x02] = { 16, 8 }, [0x03] = { 16, 8 }, [0x04] = { 16, 8 },
+        [0x05] = { 16, 8 }, [0x06] = { 16, 8 }, [0x07] = { 32, 8 }, [0x08] = { 255, 4 }, [0x09] = { 4, 4 },
+        [0x0a] = { 44, 4 }, [0x0b] = { 52, 4 }, [0x0c] = { 16, 8 }, [0x0d] = { 4, 4 },  [0x0e] = { 4, 4 },
+        [0x0f] = { 36, 4 }, [0x10] = { 4, 4 },  [0x11] = { 8, 4 },  [0x12] = { 4, 4 },  [0x13] = { 16, 8 },
+        [0x14] = { 4, 4 },  [0x15] = { 56, 4 }, [0x16] = { 24, 8 } };
+    if (!desc || !desc->stream || !desc->size) return E_INVALIDARG;
+    memset(g, 0, sizeof *g);
+    memset(c, 0, sizeof *c);
+    g->blend.rt[0] = (RT_BLEND){ 0, 0, 2, 1, 1, 2, 1, 1, 4, 0xf, { 0 } };   // ONE, ZERO, ADD; NOOP; all channels
+    for (int i = 1; i < 8; i++) g->blend.rt[i] = g->blend.rt[0];
+    g->sample_mask = UINT32_MAX;
+    g->raster = (RASTER_DESC){ 3, 3, 0, 0, 0, 0, 1, 0, 0, 0, 0 };   // solid, cull back, depth clip
+    g->depth = (DS_DESC){ 1, 1, 2, 0, 0xff, 0xff, { 0, 0 }, { 1, 1, 1, 8 }, { 1, 1, 1, 8 } };   // LESS, write all
+    g->samples = 1;
+    const uint8_t *p = desc->stream, *end = p + desc->size;
+    uint32_t seen = 0;
+    while (p < end) {
+        if (end - p < 4) return E_INVALIDARG;
+        uint32_t type = *(const uint32_t *)p;
+        if (type >= 0x1a || !inner[type].size) {
+            vx_log("D3D12: pipeline state stream subobject %u is not supported", type);
+            return E_INVALIDARG;
+        }
+        if (seen & 1u << type) return E_INVALIDARG;                // each subobject at most once
+        seen |= 1u << type;
+        size_t isize = type == 0x08 ? sizeof(BLEND_DESC) : inner[type].size;
+        const uint8_t *in = p + (inner[type].align == 8 ? 8 : 4);
+        if ((size_t)(end - in) < isize) return E_INVALIDARG;
+        switch (type) {
+        case 0x00: g->root = c->root = *(void *const *)in; break;
+        case 0x01: g->vs = *(const BYTECODE *)in; break;
+        case 0x02: g->ps = *(const BYTECODE *)in; break;
+        case 0x03: g->ds = *(const BYTECODE *)in; break;
+        case 0x04: g->hs = *(const BYTECODE *)in; break;
+        case 0x05: g->gs = *(const BYTECODE *)in; break;
+        case 0x06: c->cs = *(const BYTECODE *)in; break;
+        case 0x07: g->so = *(const SO_DESC *)in; break;
+        case 0x08: g->blend = *(const BLEND_DESC *)in; break;
+        case 0x09: g->sample_mask = *(const uint32_t *)in; break;
+        case 0x0a: g->raster = *(const RASTER_DESC *)in; break;
+        case 0x0b: g->depth = *(const DS_DESC *)in; break;
+        case 0x0c: g->input = *(const IL_DESC *)in; break;
+        case 0x0d: g->strip_cut = *(const int32_t *)in; break;
+        case 0x0e: g->topology_type = *(const int32_t *)in; break;
+        case 0x0f: memcpy(g->rtv_formats, in, 32); g->nrt = *(const uint32_t *)(in + 32); break;
+        case 0x10: g->dsv_format = *(const uint32_t *)in; break;
+        case 0x11: g->samples = ((const uint32_t *)in)[0]; g->quality = ((const uint32_t *)in)[1]; break;
+        case 0x12: g->node = c->node = *(const uint32_t *)in; break;
+        case 0x13:
+            g->cached = c->cached = *(const void *const *)in;
+            g->cached_size = c->cached_size = *(const size_t *)(in + 8);
+            break;
+        case 0x14: g->flags = c->flags = *(const int32_t *)in; break;
+        case 0x15:                                                 // DEPTH_STENCIL1: DEPTH_STENCIL and depth bounds
+            if (seen & 1u << 0x0b) return E_INVALIDARG;
+            memcpy(&g->depth, in, sizeof g->depth);
+            if (*(const int32_t *)(in + 52)) {
+                vx_log("D3D12: depth bounds tests are not supported");
+                return E_INVALIDARG;
+            }
+            break;
+        case 0x16:                                                 // VIEW_INSTANCING (tier 0: one view only)
+            if (*(const uint32_t *)in > 1) { vx_log("D3D12: view instancing is not supported"); return E_INVALIDARG; }
+            break;
+        }
+        if (type == 0x0b && seen & 1u << 0x15) return E_INVALIDARG;
+        size_t next = (size_t)(in - p) + isize;
+        p += (next + 7) & ~(size_t)7;
+    }
+    int graphics = (seen & 0x3e) != 0, is_compute = (seen & 1u << 0x06) != 0;
+    if (graphics == is_compute) return E_INVALIDARG;               // one of VS..GS or CS, not both or neither
+    if (is_compute && (seen & ~((1u << 0x00) | (1u << 0x06) | (1u << 0x12) | (1u << 0x13) | (1u << 0x14))))
+        return E_INVALIDARG;                                       // graphics state in a compute stream
+    *compute = is_compute;
+    return S_OK;
+}
+static WINAPI HRESULT dev_create_pso_stream(void *this, const PSO_STREAM_DESC *desc, const GUID *iid, void **out) {
+    GFX_PSO_DESC graphics;
+    COMPUTE_PSO_DESC compute;
+    int is_compute = 0;
+    if (out) *out = NULL;
+    HRESULT hr = pso_stream_parse(desc, &graphics, &compute, &is_compute);
+    if (hr != S_OK) return hr;
+    return is_compute ? dev_create_compute_pso(this, &compute, iid, out) : dev_create_graphics_pso(this, &graphics, iid, out);
+}
+
 // ---- command lists: graphics recording -----------------------------------------------------------------------------
 
 static WINAPI void list_set_gfx_root(void *this, void *rs) { cmd12 *c = rec(this, C_ROOTSIG); c->obj = rs; c->gfx = 1; hold(rs); }
@@ -4998,6 +5138,103 @@ static WINAPI void list_end_query(void *this, void *heap, int32_t type, uint32_t
 }
 static WINAPI void list_resolve_query(void *this, void *heap, int32_t type, uint32_t start, uint32_t n, void *dst, uint64_t offset) {
     cmd12 *c = rec(this, C_RESOLVE_QUERY); c->obj = heap; hold(heap); c->obj2 = dst; hold(dst); c->a = (uint32_t)type; c->b = start; c->c = n; c->off = offset;
+}
+
+// ---- command lists: what needs no Metal work ---------------------------------------------------------------------------
+
+// PIX events and markers (WinPixEventRuntime calls these in shipping builds too): nothing to record.
+static WINAPI void list_marker(void *this, uint32_t metadata, const void *data, uint32_t size) { }
+static WINAPI void list_end_event(void *this) { }
+// A discard only says the contents need not be kept; keeping them is correct.
+static WINAPI void list_discard_resource(void *this, void *resource, const void *region) { }
+// Predication: the draws and dispatches it would skip still run (the result is the same unless a program counts on
+// side effects of the skipped work; occlusion-predicated objects are hidden by depth anyway).
+static WINAPI void list_set_predication(void *this, void *buffer, uint64_t offset, int32_t op) {
+    static int warned;
+    if (buffer && !warned) { warned = 1; vx_log("D3D12: SetPredication: predicated work is not skipped"); }
+}
+// Depth bounds (OPTIONS2 says unsupported), programmable sample positions (tier 0), view instancing (tier 0):
+// programs that read the capability bits do not depend on these.
+static WINAPI void list_depth_bounds(void *this, float min, float max) { }
+static WINAPI void list_sample_positions(void *this, uint32_t samples, uint32_t pixels, const void *positions) { }
+static WINAPI void list_view_instance_mask(void *this, uint32_t mask) { }
+
+// ---- render passes (ID3D12GraphicsCommandList4) -------------------------------------------------------------------------
+//
+// OPTIONS5 reports render pass tier 0, the tier on which Windows itself emulates the API with the ordinary calls:
+// BeginRenderPass binds the targets and clears those whose beginning access says so; EndRenderPass resolves those
+// whose ending access says so (the clears become Metal load actions, as other clears do).
+
+typedef struct { int32_t type; uint32_t pad; union { struct { void *src, *dst; uint32_t n, pad2; const void *subresources;
+                 uint32_t format; int32_t mode; int32_t preserve_source; } resolve; uint8_t raw[48]; }; } RP_END12;
+typedef struct { int32_t type; union { struct { uint32_t format; float color[4]; } clear; uint8_t raw[20]; }; } RP_BEGIN12;
+typedef struct { size_t view; RP_BEGIN12 begin; RP_END12 end; } RP_RT12;
+typedef struct { size_t view; RP_BEGIN12 depth_begin, stencil_begin; RP_END12 depth_end, stencil_end; } RP_DS12;
+typedef struct { uint32_t src_subresource, dst_subresource, dst_x, dst_y; RECT12 src_rect; } RP_RESOLVE_SUB12;
+_Static_assert(sizeof(RP_RT12) == 88 && sizeof(RP_DS12) == 168 && sizeof(RP_RESOLVE_SUB12) == 32,
+               "D3D12_RENDER_PASS_* ABI layout");
+struct render_pass_resolve12 { void *src, *dst; RP_RESOLVE_SUB12 sub; uint32_t format; int32_t mode; };
+enum { RP_BEGIN_DISCARD, RP_BEGIN_PRESERVE, RP_BEGIN_CLEAR, RP_BEGIN_NO_ACCESS };
+enum { RP_END_DISCARD, RP_END_PRESERVE, RP_END_RESOLVE, RP_END_NO_ACCESS };
+
+static int render_pass_add_resolves12(list12 *list, const RP_END12 *end) {
+    if (end->type != RP_END_RESOLVE) return end->type >= 0 && end->type <= RP_END_NO_ACCESS;
+    if (!end->resolve.src || !end->resolve.dst || (end->resolve.n && !end->resolve.subresources)) return 0;
+    uint32_t n = list->render_pass_nresolves + end->resolve.n;
+    struct render_pass_resolve12 *grown = realloc(list->render_pass_resolves, (n ? n : 1) * sizeof *grown);
+    if (!grown) return 0;
+    list->render_pass_resolves = grown;
+    for (uint32_t i = 0; i < end->resolve.n; i++) {
+        struct render_pass_resolve12 *r = &grown[list->render_pass_nresolves++];
+        r->src = end->resolve.src; r->dst = end->resolve.dst;
+        r->sub = ((const RP_RESOLVE_SUB12 *)end->resolve.subresources)[i];
+        r->format = end->resolve.format; r->mode = end->resolve.mode;
+    }
+    return 1;
+}
+static WINAPI void list_begin_render_pass(void *this, uint32_t n, const RP_RT12 *rts, const RP_DS12 *ds, int32_t flags) {
+    list12 *list = this;
+    if (list->validation_error) return;
+    if (list->in_render_pass || n > 8 || (n && !rts) || (flags & ~7)) { list->validation_error = E_INVALIDARG; return; }
+    list->in_render_pass = 1;
+    list->render_pass_nresolves = 0;
+    size_t views[8];
+    for (uint32_t i = 0; i < n; i++) {
+        views[i] = rts[i].view;
+        if (rts[i].begin.type < 0 || rts[i].begin.type > RP_BEGIN_NO_ACCESS || !render_pass_add_resolves12(list, &rts[i].end)) {
+            list->validation_error = E_INVALIDARG;
+            return;
+        }
+    }
+    int depth = ds && (ds->depth_begin.type != RP_BEGIN_NO_ACCESS || ds->stencil_begin.type != RP_BEGIN_NO_ACCESS);
+    if (ds && (!render_pass_add_resolves12(list, &ds->depth_end) || !render_pass_add_resolves12(list, &ds->stencil_end))) {
+        list->validation_error = E_INVALIDARG;
+        return;
+    }
+    list_targets(list, n, n ? views : NULL, 0, depth ? &ds->view : NULL);
+    for (uint32_t i = 0; i < n; i++)
+        if (rts[i].begin.type == RP_BEGIN_CLEAR) list_clear_rtv(list, rts[i].view, rts[i].begin.clear.color, 0, NULL);
+    if (depth) {
+        int32_t clear = (ds->depth_begin.type == RP_BEGIN_CLEAR ? 1 : 0) | (ds->stencil_begin.type == RP_BEGIN_CLEAR ? 2 : 0);
+        // (D3D12_DEPTH_STENCIL_VALUE: the depth float, then the stencil byte)
+        float depth_value = ds->depth_begin.clear.color[0];
+        uint8_t stencil_value = (uint8_t)(*(const uint32_t *)&ds->stencil_begin.clear.color[1] & 0xff);
+        if (clear) list_clear_dsv(list, ds->view, clear, depth_value, stencil_value, 0, NULL);
+    }
+}
+static WINAPI void list_end_render_pass(void *this) {
+    list12 *list = this;
+    if (list->validation_error) return;
+    if (!list->in_render_pass) { list->validation_error = E_INVALIDARG; return; }
+    list->in_render_pass = 0;
+    list->render_pass_resolving = 1;
+    for (uint32_t i = 0; i < list->render_pass_nresolves && !list->validation_error; i++) {
+        struct render_pass_resolve12 *r = &list->render_pass_resolves[i];
+        list_resolve_subresource_region(list, r->dst, r->sub.dst_subresource, r->sub.dst_x, r->sub.dst_y, r->src,
+                                        r->sub.src_subresource, &r->sub.src_rect, r->format, r->mode);
+    }
+    list->render_pass_resolving = 0;
+    list->render_pass_nresolves = 0;
 }
 
 // ---- command lists: replay into Metal -----------------------------------------------------------------------------
@@ -8359,7 +8596,8 @@ static int queue_command_allowed12(dev12 *device, int32_t queue_type, int32_t li
         (!command->obj || ((command_signature12 *)command->obj)->gfx)) return 0;
     if (queue_type == 2 && command->op == C_EXECUTE_INDIRECT &&
         (!command->obj || ((command_signature12 *)command->obj)->gfx)) return 0;
-    if (command->op == C_GPU_IR && command->b == UINT32_MAX && command->gfx == D3D12_TRACK_RESOLVE &&
+    if (command->op == C_GPU_IR && command->b == UINT32_MAX &&
+        (command->gfx == D3D12_TRACK_RESOLVE || command->gfx == D3D12_TRACK_RENDER_PASS_RESOLVE) &&
         (queue_type != 0 || list_type != 0))
         return 0;
     if (command->op == C_GPU_IR && command->b == 2 && queue_type == 3) return 0; // UAV barriers are not copy-queue work.
@@ -8712,12 +8950,14 @@ static int queue_validate_list_states12(dev12 *device, int32_t queue_type, id<MT
                                                        (uint32_t)command->off2, (uint32_t)command->gfx);
             if (transition_result <= 0) { result = transition_result < 0 ? -1 : 0; break; }
         } else if (command->op == C_GPU_IR && command->b == UINT32_MAX &&
-                   command->gfx >= D3D12_TRACK_COPY_BUFFER && command->gfx <= D3D12_TRACK_RESOLVE) {
-            uint32_t src_state = command->gfx == D3D12_TRACK_RESOLVE ? D3D12_STATE_RESOLVE_SOURCE : D3D12_STATE_COPY_SOURCE;
-            uint32_t dst_state = command->gfx == D3D12_TRACK_RESOLVE ? D3D12_STATE_RESOLVE_DEST : D3D12_STATE_COPY_DEST;
+                   command->gfx >= D3D12_TRACK_COPY_BUFFER && command->gfx <= D3D12_TRACK_RENDER_PASS_RESOLVE) {
+            int resolve = command->gfx == D3D12_TRACK_RESOLVE || command->gfx == D3D12_TRACK_RENDER_PASS_RESOLVE;
+            uint32_t src_state = command->gfx == D3D12_TRACK_RENDER_PASS_RESOLVE ? D3D12_STATE_RENDER_TARGET :
+                                 resolve ? D3D12_STATE_RESOLVE_SOURCE : D3D12_STATE_COPY_SOURCE;
+            uint32_t dst_state = resolve ? D3D12_STATE_RESOLVE_DEST : D3D12_STATE_COPY_DEST;
             uint32_t src_subresource = command->gfx == D3D12_TRACK_COPY_RESOURCE ? D3D12_ALL_SUBRESOURCES : command->c;
             uint32_t dst_subresource = command->gfx == D3D12_TRACK_COPY_RESOURCE ? D3D12_ALL_SUBRESOURCES :
-                                       command->gfx == D3D12_TRACK_RESOLVE ? (uint32_t)command->off :
+                                       resolve ? (uint32_t)command->off :
                                        command->gfx == D3D12_TRACK_COPY_TEXTURE ? (uint32_t)command->off : 0;
             int use_result = state_validate_resource_pair12(device, queue_type, &shadows, &count, &capacity,
                 command->obj, dst_subresource, dst_state, command->obj2, src_subresource, src_state);
@@ -9090,6 +9330,26 @@ static WINAPI HRESULT dev_create_list(void *this, uint32_t node, int32_t type, v
     return hr;
 }
 
+// ID3D12Device4::CreateCommandList1: a list created closed, without an allocator; Reset gives it one.
+static WINAPI HRESULT dev_create_list1(void *this, uint32_t node, int32_t type, int32_t flags, const GUID *iid, void **out) {
+    dev12 *device = this;
+    if (out) *out = NULL;
+    if (type < 0 || type > 3 || flags || node > 1) return E_INVALIDARG;
+    if (!out) return S_FALSE;
+    pthread_mutex_lock(&device->submit_lock);
+    list12 *l = alloc12(sizeof *l, K12_LIST, g_list_vtbl, this);
+    l->base.destroy = list_destroy;
+    l->type = type;
+    l->closed = 1;
+    l->recording_topology = 4;
+    for (uint32_t i = 0; i < 4; i++) l->recording_blend_factor[i] = 1.0f;
+    gpu_ir_stream_init(&l->gpu_ir);
+    pthread_mutex_unlock(&device->submit_lock);
+    HRESULT hr = list_query(l, iid, out);
+    d3d_release(&l->base);
+    return hr;
+}
+
 static WINAPI HRESULT dev_create_heap(void *this, const HEAP_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
     if (!desc) return E_INVALIDARG;
@@ -9157,8 +9417,13 @@ typedef struct {
     res12 *buffers[16];
     CAMetalLayer *layer;
     id<MTLRenderPipelineState> pipeline;
+    // DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT: a semaphore with one count per frame the program may have
+    // queued (SetMaximumFrameLatency, 1 by default); each present gives its count back when the GPU has drawn it.
+    // Without the flag the object is an event that stays signalled.
     HANDLE waitable;
+    uint32_t max_latency, src_width, src_height;
 } swap12;
+enum { SWAP_FLAG_FRAME_LATENCY_WAITABLE = 0x40 };
 
 static const char *g_present12_msl =
     "#include <metal_stdlib>\n"
@@ -9168,9 +9433,9 @@ static const char *g_present12_msl =
     "    float2 p = float2((id << 1) & 2, id & 2);\n"
     "    V o; o.pos = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = p; return o;\n"
     "}\n"
-    "fragment float4 present_fs(V in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+    "fragment float4 present_fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], constant float2 &scale [[buffer(0)]]) {\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
-    "    return float4(t.sample(s, in.uv).rgb, 1);\n"
+    "    return float4(t.sample(s, in.uv * scale).rgb, 1);\n"
     "}\n";
 
 static HRESULT swap_make_buffers(swap12 *sc) {
@@ -9211,7 +9476,13 @@ HRESULT d3d12_swapchain_create(void *factory, void *queue, HANDLE hwnd, uint32_t
     sc->factory = factory; d3d_addref(factory);
     sc->hwnd = hwnd;
     if (!w || !h) { w = win->client_w > 0 ? (uint32_t)win->client_w : 640; h = win->client_h > 0 ? (uint32_t)win->client_h : 480; }
-    sc->width = w; sc->height = h; sc->format = format; sc->count = count; sc->flags = flags;
+    sc->width = sc->src_width = w; sc->height = sc->src_height = h; sc->format = format; sc->count = count; sc->flags = flags;
+    sc->max_latency = 1;
+    if (flags & SWAP_FLAG_FRAME_LATENCY_WAITABLE) {
+        HANDLE (WINAPI *create)(void *, LONG, LONG, const uint16_t *) =
+            (HANDLE (WINAPI *)(void *, LONG, LONG, const uint16_t *))vx_find_export("kernel32.dll", "CreateSemaphoreW");
+        sc->waitable = create(NULL, 1, 16, NULL);
+    }
     MTLPixelFormat lf = d3d_is_srgb(format) ? MTLPixelFormatBGRA8Unorm_sRGB : format == 10 ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
     sc->layer = (__bridge CAMetalLayer *)vx_cocoa_metal_layer(win, (__bridge void *)sc->dev->mtl, (int)lf);
     NSError *err = nil;
@@ -9227,8 +9498,9 @@ HRESULT d3d12_swapchain_create(void *factory, void *queue, HANDLE hwnd, uint32_t
 }
 
 static WINAPI HRESULT swap_query(void *this, const GUID *iid, void **out) {
-    const GUID *k[] = { &IID_IDXGIObject, &IID_IDXGIDeviceSubObject, &IID_IDXGISwapChain, &IID_IDXGISwapChain1, &IID_IDXGISwapChain2, &IID_IDXGISwapChain3 };
-    return query(this, iid, out, k, 6);
+    const GUID *k[] = { &IID_IDXGIObject, &IID_IDXGIDeviceSubObject, &IID_IDXGISwapChain, &IID_IDXGISwapChain1, &IID_IDXGISwapChain2,
+                        &IID_IDXGISwapChain3, &IID_IDXGISwapChain4 };
+    return query(this, iid, out, k, 7);
 }
 static WINAPI HRESULT swap_get_buffer(void *this, uint32_t i, const GUID *iid, void **out) {
     swap12 *sc = this;
@@ -9239,7 +9511,10 @@ static WINAPI uint32_t swap_index(void *this) { return ((swap12 *)this)->index; 
 static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     swap12 *sc = this;
     if (flags & 1) return S_OK;                                    // DXGI_PRESENT_TEST
+    if (sync > 4) return DXGI_ERROR_INVALID_CALL;
     sc->layer.displaySyncEnabled = sync != 0;
+    HANDLE waitable = sc->flags & SWAP_FLAG_FRAME_LATENCY_WAITABLE ? sc->waitable : NULL;
+    int queued = 0;
     pthread_mutex_lock(&sc->dev->submit_lock);
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [sc->layer nextDrawable];
@@ -9252,13 +9527,18 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
             id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
             [enc setRenderPipelineState:sc->pipeline];
             [enc setFragmentTexture:sc->buffers[sc->index]->texture atIndex:0];
+            float scale[2] = { (float)sc->src_width / (float)sc->width, (float)sc->src_height / (float)sc->height };
+            [enc setFragmentBytes:scale length:sizeof scale atIndex:0];
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [enc endEncoding];
             [cb presentDrawable:drawable];
+            if (waitable) [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; vx_release_semaphore(waitable, 1); }];
             [cb commit];
+            queued = 1;
         }
     }
     pthread_mutex_unlock(&sc->dev->submit_lock);
+    if (waitable && !queued) vx_release_semaphore(waitable, 1);
     sc->index = (sc->index + 1) % sc->count;
     sc->presents++;
     return S_OK;
@@ -9270,7 +9550,8 @@ static WINAPI HRESULT swap_resize(void *this, uint32_t count, uint32_t w, uint32
     if (count) sc->count = count > 16 ? 16 : count;
     if (format) sc->format = format;
     if (!w || !h) { w = win && win->client_w > 0 ? (uint32_t)win->client_w : sc->width; h = win && win->client_h > 0 ? (uint32_t)win->client_h : sc->height; }
-    sc->width = w; sc->height = h; sc->flags = flags;
+    sc->width = sc->src_width = w; sc->height = sc->src_height = h;
+    sc->flags = (flags & ~SWAP_FLAG_FRAME_LATENCY_WAITABLE) | (sc->flags & SWAP_FLAG_FRAME_LATENCY_WAITABLE);
     return swap_make_buffers(sc);
 }
 static WINAPI HRESULT swap_resize3(void *this, uint32_t count, uint32_t w, uint32_t h, uint32_t format, uint32_t flags, const uint32_t *masks, void *const *queues) {
@@ -9301,10 +9582,21 @@ static WINAPI HRESULT swap_get_parent(void *this, const GUID *iid, void **out) {
     void *f = ((swap12 *)this)->factory;
     return ((HRESULT (WINAPI *)(void *, const GUID *, void **))(((d3d_object *)f)->vtbl[0]))(f, iid, out);
 }
-static WINAPI HRESULT swap_set_latency(void *this, uint32_t n) { return S_OK; }
-static WINAPI HRESULT swap_get_latency(void *this, uint32_t *n) { *n = 1; return S_OK; }
+static WINAPI HRESULT swap_set_latency(void *this, uint32_t n) {
+    swap12 *sc = this;
+    if (n < 1 || n > 16) return DXGI_ERROR_INVALID_CALL;
+    if (sc->flags & SWAP_FLAG_FRAME_LATENCY_WAITABLE && sc->waitable && n > sc->max_latency)
+        vx_release_semaphore(sc->waitable, (LONG)(n - sc->max_latency));
+    // (a lower limit takes effect as the program's waits use up the counts already given out)
+    sc->max_latency = n;
+    return S_OK;
+}
+static WINAPI HRESULT swap_get_latency(void *this, uint32_t *n) {
+    if (!n) return DXGI_ERROR_INVALID_CALL;
+    *n = ((swap12 *)this)->max_latency;
+    return S_OK;
+}
 static WINAPI HANDLE swap_waitable(void *this) {
-    // (presents do not queue up beyond the GPU's own: the object is always signalled)
     swap12 *sc = this;
     if (!sc->waitable) {
         HANDLE (WINAPI *create)(void *, int, int, const uint16_t *) = (HANDLE (WINAPI *)(void *, int, int, const uint16_t *))vx_find_export("kernel32.dll", "CreateEventW");
@@ -9316,6 +9608,29 @@ static WINAPI HRESULT swap_check_color_space(void *this, uint32_t cs, uint32_t *
 static WINAPI HRESULT swap_set_color_space(void *this, uint32_t cs) { return cs == 0 ? S_OK : E_INVALIDARG; }
 static WINAPI HRESULT swap_last_present(void *this, uint32_t *n) { *n = ((swap12 *)this)->presents; return S_OK; }
 static WINAPI HRESULT swap_frame_stats(void *this, void *stats) { return DXGI_ERROR_FRAME_STATISTICS_DISJOINT; }
+static WINAPI HRESULT swap_get_output(void *this, void **out) {
+    if (!out) return E_INVALIDARG;
+    *out = dxgi_output_create();
+    return S_OK;
+}
+// IDXGISwapChain2 source size: the region of the back buffers presented (scaled to the window).
+static WINAPI HRESULT swap_set_source_size(void *this, uint32_t w, uint32_t h) {
+    swap12 *sc = this;
+    if (!w || !h || w > sc->width || h > sc->height) return E_INVALIDARG;
+    sc->src_width = w; sc->src_height = h;
+    return S_OK;
+}
+static WINAPI HRESULT swap_get_source_size(void *this, uint32_t *w, uint32_t *h) {
+    swap12 *sc = this;
+    if (!w || !h) return E_INVALIDARG;
+    *w = sc->src_width; *h = sc->src_height;
+    return S_OK;
+}
+static WINAPI HRESULT swap_resize_target(void *this, const void *mode) { return S_OK; }
+static WINAPI int32_t swap_mono(void *this) { return 0; }
+static WINAPI HRESULT swap_set_hdr_metadata(void *this, uint32_t type, uint32_t size, const void *data) {
+    return dxgi_check_hdr_metadata(type, size, data);
+}
 
 // ---- the device ---------------------------------------------------------------------------------------------------------
 
@@ -9325,6 +9640,19 @@ static WINAPI HRESULT dev_query(void *this, const GUID *iid, void **out) {
     return query(this, iid, out, k, 12);
 }
 static WINAPI uint32_t dev_node_count(void *this) { return 1; }
+// Pipeline libraries (PSO caches kept by the program) are optional: programs fall back to creating pipelines.
+static WINAPI HRESULT dev_create_pipeline_library(void *this, const void *blob, size_t size, const GUID *iid, void **out) {
+    if (out) *out = NULL;
+    return DXGI_ERROR_UNSUPPORTED;
+}
+// GPU clocks are Metal's to choose; stable-power mode only matters to profiling tools.
+static WINAPI HRESULT dev_set_stable_power_state(void *this, int32_t enable) { return S_OK; }
+static WINAPI HRESULT dev_set_background_processing(void *this, int32_t mode, int32_t measurements, HANDLE event, int32_t *further) {
+    if (further) *further = 0;
+    return S_OK;
+}
+// Serialized driver data (pipeline caches, acceleration structures) is never recognized.
+static WINAPI int32_t dev_check_driver_identifier(void *this, int32_t type, const void *identifier) { return 3; }
 static WINAPI HRESULT dev_removed_reason(void *this) { return S_OK; }
 static uint32_t *residency_counter12(dev12 *device, void *object) {
     if (!device || !object) return NULL;
@@ -9904,6 +10232,59 @@ static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data,
         o[1] = 11;                                                  // D3D12_EXECUTE_INDIRECT_TIER_1_1
         return S_OK;
     }
+    // Later option blocks, answered as the Windows runtime answers on hardware without those features: engines read
+    // them unconditionally at start-up and treat a failed query as "not supported" at best.
+    case 23:                                                       // D3D12_OPTIONS4: MSAA 64 KB alignment, shared-resource tier, native 16-bit ops
+    case 27:                                                       // D3D12_OPTIONS5: tiled tier 3, render pass tier 0 (BeginRenderPass emulated), no raytracing
+    case 30:                                                       // D3D12_OPTIONS6: variable-rate shading
+    case 32:                                                       // D3D12_OPTIONS7: mesh shaders, sampler feedback
+    case 36:                                                       // D3D12_OPTIONS8: unaligned block textures
+    case 37:                                                       // D3D12_OPTIONS9: mesh statistics, 64-bit atomics, wave MMA
+    case 39:                                                       // D3D12_OPTIONS10: VRS combiners
+    case 40:                                                       // D3D12_OPTIONS11: 64-bit atomics on heap resources
+    case 41:                                                       // D3D12_OPTIONS12: enhanced barriers, relaxed format casting
+    case 42:                                                       // D3D12_OPTIONS13: copy pitch, vertex alignment, inverted viewports
+    case 43:                                                       // D3D12_OPTIONS14: advanced texture ops, writable MSAA, stencil masks
+    case 44:                                                       // D3D12_OPTIONS15: triangle fans, strip cut
+    case 45:                                                       // D3D12_OPTIONS16: dynamic depth bias, GPU upload heaps
+    case 46:                                                       // D3D12_OPTIONS17: non-normalized samplers (only 1.2 root signatures), write tracking
+    case 47: {                                                     // D3D12_OPTIONS18: render passes valid
+        static const struct { int32_t feature; uint32_t size; } sizes[] = {
+            { 23, 12 }, { 27, 12 }, { 30, 20 }, { 32, 8 }, { 36, 4 }, { 37, 24 }, { 39, 8 }, { 40, 4 }, { 41, 12 },
+            { 42, 24 }, { 43, 12 }, { 44, 8 }, { 45, 8 }, { 46, 8 }, { 47, 4 } };
+        uint32_t want = 0;
+        for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; i++) if (sizes[i].feature == feature) want = sizes[i].size;
+        if (!data || size != want) return E_INVALIDARG;
+        memset(data, 0, size);
+        if (feature == 41) *(int32_t *)data = -1;                  // D3D12_TRI_STATE_UNKNOWN (no mesh shaders)
+        return S_OK;
+    }
+    case 10:                                                       // PROTECTED_RESOURCE_SESSION_SUPPORT {NodeIndex, Support}
+    case 24:                                                       // SERIALIZATION {NodeIndex, HeapSerializationTier}
+    case 33: {                                                     // PROTECTED_RESOURCE_SESSION_TYPE_COUNT {NodeIndex, Count}
+        uint32_t *o = data;
+        if (!data || size != 8 || o[0] != 0) return E_INVALIDARG;
+        o[1] = 0;
+        return S_OK;
+    }
+    case 19: case 22: {                                            // SHADER_CACHE {SupportFlags}, EXISTING_HEAPS {Supported}
+        // No cached PSO blobs or pipeline libraries (CreatePipelineLibrary reports DXGI_ERROR_UNSUPPORTED).
+        if (!data || size != 4) return E_INVALIDARG;
+        *(uint32_t *)data = 0;
+        return S_OK;
+    }
+    case 25: case 28: {                                            // CROSS_NODE {SharingTier, AtomicShaderInstructions}, DISPLAYABLE
+        if (!data || size != 8) return E_INVALIDARG;
+        memset(data, 0, 8);
+        return S_OK;
+    }
+    case 20: {                                                     // COMMAND_QUEUE_PRIORITY {CommandListType, Priority, Supported}
+        uint32_t *o = data;
+        if (!data || size != 12) return E_INVALIDARG;
+        if (o[0] > 7 || o[0] == 1) return E_INVALIDARG;            // (no bundle queues)
+        o[2] = o[1] == 0 || o[1] == 100;                           // NORMAL and HIGH; not GLOBAL_REALTIME
+        return S_OK;
+    }
     case 18: {                                                     // D3D12_OPTIONS2
         struct options2 { int32_t depth_bounds_test_supported; uint32_t programmable_sample_positions_tier; };
         if (!data || size != sizeof(struct options2)) return E_INVALIDARG;
@@ -10249,6 +10630,11 @@ static void make_tables(void) {
         { "GetNodeCount", (void *)dev_node_count }, { "CreateCommandQueue", (void *)dev_create_queue },
         { "CreateCommandAllocator", (void *)dev_create_allocator }, { "CreateComputePipelineState", (void *)dev_create_compute_pso },
         { "CreateCommandList", (void *)dev_create_list }, { "CheckFeatureSupport", (void *)dev_check_feature },
+        { "CreatePipelineState", (void *)dev_create_pso_stream }, { "CreateCommandList1", (void *)dev_create_list1 },
+        { "SetEventOnMultipleFenceCompletion", (void *)dev_set_event_multiple_fences },
+        { "CreatePipelineLibrary", (void *)dev_create_pipeline_library }, { "SetStablePowerState", (void *)dev_set_stable_power_state },
+        { "SetBackgroundProcessingMode", (void *)dev_set_background_processing },
+        { "CheckDriverMatchingIdentifier", (void *)dev_check_driver_identifier },
         { "CreateDescriptorHeap", (void *)dev_create_heap }, { "GetDescriptorHandleIncrementSize", (void *)dev_increment },
         { "CreateRootSignature", (void *)dev_create_rootsig }, { "CreateConstantBufferView", (void *)dev_create_cbv },
         { "CreateShaderResourceView", (void *)dev_create_srv }, { "CreateUnorderedAccessView", (void *)dev_create_uav },
@@ -10272,7 +10658,8 @@ static void make_tables(void) {
         { "QueryInterface", (void *)queue_query }, COMMON_METHODS, { "ExecuteCommandLists", (void *)queue_execute },
         { "Signal", (void *)queue_signal }, { "Wait", (void *)queue_wait }, { "GetTimestampFrequency", (void *)queue_timestamp_frequency },
         { "GetClockCalibration", (void *)queue_clock_calibration },
-        { "GetDesc", (void *)queue_get_desc }, { NULL, NULL } };
+        { "GetDesc", (void *)queue_get_desc }, { "SetMarker", (void *)list_marker }, { "BeginEvent", (void *)list_marker },
+        { "EndEvent", (void *)list_end_event }, { NULL, NULL } };
     g_queue_vtbl = D3D_VTABLE(ID3D12CommandQueue, queue);
     static const d3d_method allocator[] = { { "QueryInterface", (void *)allocator_query }, COMMON_METHODS, { "Reset", (void *)allocator_reset }, { NULL, NULL } };
     g_allocator_vtbl = D3D_VTABLE(ID3D12CommandAllocator, allocator);
@@ -10300,7 +10687,12 @@ static void make_tables(void) {
         { "OMSetBlendFactor", (void *)list_blend_factor }, { "OMSetStencilRef", (void *)list_stencil_ref },
         { "BeginQuery", (void *)list_begin_query }, { "EndQuery", (void *)list_end_query }, { "ResolveQueryData", (void *)list_resolve_query },
         { "ExecuteIndirect", (void *)list_execute_indirect },
-        { "WriteBufferImmediate", (void *)list_write_buffer_immediate }, { NULL, NULL } };
+        { "WriteBufferImmediate", (void *)list_write_buffer_immediate },
+        { "SetMarker", (void *)list_marker }, { "BeginEvent", (void *)list_marker }, { "EndEvent", (void *)list_end_event },
+        { "DiscardResource", (void *)list_discard_resource }, { "SetPredication", (void *)list_set_predication },
+        { "OMSetDepthBounds", (void *)list_depth_bounds }, { "SetSamplePositions", (void *)list_sample_positions },
+        { "SetViewInstanceMask", (void *)list_view_instance_mask },
+        { "BeginRenderPass", (void *)list_begin_render_pass }, { "EndRenderPass", (void *)list_end_render_pass }, { NULL, NULL } };
     g_list_vtbl = D3D_VTABLE(ID3D12GraphicsCommandList7, list);
     static const d3d_method fence[] = {
         { "QueryInterface", (void *)fence_query }, COMMON_METHODS, { "GetCompletedValue", (void *)fence_completed },
@@ -10346,8 +10738,11 @@ static void make_tables(void) {
         { "GetCurrentBackBufferIndex", (void *)swap_index }, { "SetMaximumFrameLatency", (void *)swap_set_latency },
         { "GetMaximumFrameLatency", (void *)swap_get_latency }, { "GetFrameLatencyWaitableObject", (void *)swap_waitable },
         { "CheckColorSpaceSupport", (void *)swap_check_color_space }, { "SetColorSpace1", (void *)swap_set_color_space },
-        { "GetLastPresentCount", (void *)swap_last_present }, { "GetFrameStatistics", (void *)swap_frame_stats }, { NULL, NULL } };
-    g_swapchain_vtbl = D3D_VTABLE(IDXGISwapChain3, swap);
+        { "GetLastPresentCount", (void *)swap_last_present }, { "GetFrameStatistics", (void *)swap_frame_stats },
+        { "GetContainingOutput", (void *)swap_get_output }, { "SetSourceSize", (void *)swap_set_source_size },
+        { "GetSourceSize", (void *)swap_get_source_size }, { "ResizeTarget", (void *)swap_resize_target },
+        { "IsTemporaryMonoSupported", (void *)swap_mono }, { "SetHDRMetaData", (void *)swap_set_hdr_metadata }, { NULL, NULL } };
+    g_swapchain_vtbl = D3D_VTABLE(IDXGISwapChain4, swap);
 }
 
 static const vx_export d3d12[] = {

@@ -723,6 +723,15 @@ void vx_set_event(HANDLE h) {
     if (o && o->type == OBJ_EVENT) { set_event(o, 1); notify(o); }
     pthread_mutex_unlock(&g_lock);
 }
+void vx_release_semaphore(HANDLE h, LONG n) {
+    pthread_mutex_lock(&g_lock);
+    vx_object *o = lookup(h);
+    if (o && o->type == OBJ_SEMAPHORE && !o->sh && n > 0) {
+        o->count = o->count + n > o->max ? o->max : o->count + n;
+        notify(o);
+    }
+    pthread_mutex_unlock(&g_lock);
+}
 static WINAPI BOOL ResetEvent(HANDLE h) { return modify(h, OBJ_EVENT, set_event, 0); }
 static int release_mutex(vx_object *o, intptr_t tid) {
     if (o->sh) {

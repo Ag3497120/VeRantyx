@@ -185,6 +185,8 @@ void         d3d_flush(d3d_device *dev, int wait);                       // comm
 void         d3d_mark_gpu(d3d_context *c, d3d_object *o);                // a copy recorded now reads or writes o
 d3d_device  *d3d_device_from(void *unknown);                             // an ID3D11Device / IDXGIDevice pointer
 d3d_object  *dxgi_adapter_create(void);                                  // dxgi.m
+d3d_object  *dxgi_output_create(void);                                   // the main display (IDXGIOutput6)
+HRESULT      dxgi_check_hdr_metadata(uint32_t type, uint32_t size, const void *data);
 // Swap chains on Direct3D 12 command queues (d3d12.m): DXGI's factory hands a queue there.
 int     d3d12_is_queue(void *p);
 HRESULT d3d12_swapchain_create(void *factory, void *queue, HANDLE hwnd, uint32_t w, uint32_t h, uint32_t format, uint32_t count, uint32_t flags, void **out);

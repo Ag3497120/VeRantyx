@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Generates src/d3d_tables.h: the method order (vtable layout) and IID of each COM interface this runtime
-# implements, read from MinGW-w64's widl-generated headers (d3d11.h, d3d11_1.h, dxgi.h, dxgi1_2.h, dxgi1_3.h, dxgi1_4.h), and for every method a
+# implements, read from MinGW-w64's widl-generated headers (d3d11.h, d3d11_1.h, dxgi.h, dxgi1_2.h ... dxgi1_6.h), and for every method a
 # stub that reports itself as not implemented (d3d_not_implemented, defined by the includer).
 #   tools/gen_com_tables.py <mingw include dir> > src/d3d_tables.h
 #   tools/gen_com_tables.py <mingw include dir> audio > src/audio_tables.h
@@ -25,9 +25,11 @@ INTERFACES = {
     "dxgi.h": ["IDXGIFactory", "IDXGIFactory1", "IDXGIAdapter", "IDXGIAdapter1", "IDXGIOutput", "IDXGISwapChain",
                "IDXGIDevice", "IDXGIDevice1", "IDXGIObject", "IDXGIDeviceSubObject", "IDXGISurface", "IDXGIResource",
                "IDXGIKeyedMutex"],
-    "dxgi1_2.h": ["IDXGIFactory2", "IDXGISwapChain1", "IDXGIAdapter2", "IDXGIResource1"],
-    "dxgi1_3.h": ["IDXGIFactory3", "IDXGISwapChain2"],
-    "dxgi1_4.h": ["IDXGIAdapter3", "IDXGIFactory4", "IDXGISwapChain3"],
+    "dxgi1_2.h": ["IDXGIFactory2", "IDXGISwapChain1", "IDXGIAdapter2", "IDXGIResource1", "IDXGIOutput1"],
+    "dxgi1_3.h": ["IDXGIFactory3", "IDXGISwapChain2", "IDXGIOutput2", "IDXGIOutput3"],
+    "dxgi1_4.h": ["IDXGIAdapter3", "IDXGIFactory4", "IDXGISwapChain3", "IDXGIOutput4"],
+    "dxgi1_5.h": ["IDXGIFactory5", "IDXGISwapChain4", "IDXGIOutput5"],
+    "dxgi1_6.h": ["IDXGIFactory6", "IDXGIFactory7", "IDXGIAdapter4", "IDXGIOutput6"],
 }
 
 def methods(text, name):
