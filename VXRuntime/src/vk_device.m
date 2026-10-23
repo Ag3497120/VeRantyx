@@ -96,6 +96,8 @@ static const vk_ext g_device_exts[] = {
     { VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, 1, 0 },
     { VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME, 1, 0 },
     { VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, 1, 0 },
+    { VK_EXT_DEBUG_MARKER_EXTENSION_NAME, 4, 0 },
+    { VK_AMD_BUFFER_MARKER_EXTENSION_NAME, 1, 0 },
 };
 
 static VkResult enumerate_exts(const vk_ext *list, uint32_t n, uint32_t *count, VkExtensionProperties *props) {
@@ -209,6 +211,8 @@ VKFN void VKAPI_CALL vkSubmitDebugUtilsMessageEXT(VkInstance inst, VkDebugUtilsM
     (void)inst; (void)sev; (void)types; (void)data;
 }
 VKFN VkResult VKAPI_CALL vkSetDebugUtilsObjectNameEXT(VkDevice dev, const VkDebugUtilsObjectNameInfoEXT *info) { (void)dev; (void)info; return VK_SUCCESS; }
+VKFN VkResult VKAPI_CALL vkDebugMarkerSetObjectNameEXT(VkDevice dev, const VkDebugMarkerObjectNameInfoEXT *info) { (void)dev; (void)info; return VK_SUCCESS; }
+VKFN VkResult VKAPI_CALL vkDebugMarkerSetObjectTagEXT(VkDevice dev, const VkDebugMarkerObjectTagInfoEXT *info) { (void)dev; (void)info; return VK_SUCCESS; }
 VKFN VkResult VKAPI_CALL vkSetDebugUtilsObjectTagEXT(VkDevice dev, const VkDebugUtilsObjectTagInfoEXT *info) { (void)dev; (void)info; return VK_SUCCESS; }
 VKFN void VKAPI_CALL vkQueueBeginDebugUtilsLabelEXT(VkQueue q, const VkDebugUtilsLabelEXT *l) { (void)q; (void)l; }
 VKFN void VKAPI_CALL vkQueueEndDebugUtilsLabelEXT(VkQueue q) { (void)q; }
@@ -686,6 +690,11 @@ VKFN void VKAPI_CALL vkGetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalD
     uint32_t *count, VkSparseImageFormatProperties2 *p) {
     (void)phys; (void)info; (void)p;
     *count = 0;
+}
+VKFN VkResult VKAPI_CALL vkGetPhysicalDeviceFragmentShadingRatesKHR(VkPhysicalDevice phys, uint32_t *count, VkPhysicalDeviceFragmentShadingRateKHR *r) {
+    (void)phys; (void)r;
+    *count = 0;
+    return VK_SUCCESS;
 }
 VKFN VkResult VKAPI_CALL vkGetPhysicalDeviceToolProperties(VkPhysicalDevice phys, uint32_t *count, VkPhysicalDeviceToolProperties *p) {
     (void)phys; (void)p;

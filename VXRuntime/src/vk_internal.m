@@ -302,21 +302,26 @@ static void clear_attachments_impl(vk_enc *e, id<MTLRenderCommandEncoder> r, con
             "vertex V vs(uint vid [[vertex_id]], uint iid [[instance_id]], constant P& p [[buffer(0)]]) {\n"
             "  float2 xy = float2(float((vid << 1) & 2), float(vid & 2));\n"
             "  V o; o.pos = float4(xy * float2(2.0, -2.0) + float2(-1.0, 1.0), p.depth, 1.0); o.layer = p.layer + iid; return o; }\n"
-            "struct O {\n"];
+            ];
+        uint32_t outputs = 0;
+        for (uint32_t i = 0; i < color_count; i++) if (formats[i]) outputs++;
+        if (outputs) [src appendString:@"struct O {\n"];
         for (uint32_t i = 0; i < color_count; i++) {
             if (!formats[i]) continue;
             const vk_format_info *f = vk_format((VkFormat)formats[i]);
             const char *t = f && f->numeric == VKF_UINT ? "uint4" : f && f->numeric == VKF_SINT ? "int4" : "float4";
             [src appendFormat:@"  %s c%u [[color(%u)]];\n", t, i, i];
         }
-        [src appendString:@"  float pad;\n};\nfragment O fs(V in [[stage_in]], constant P& p [[buffer(0)]]) { O o;\n"];
+        // (no color attachment: a fragment function without outputs, the depth/stencil state does the clear)
+        [src appendString:outputs ? @"};\nfragment O fs(V in [[stage_in]], constant P& p [[buffer(0)]]) { O o;\n" :
+                                    @"fragment void fs(V in [[stage_in]], constant P& p [[buffer(0)]]) {\n"];
         for (uint32_t i = 0; i < color_count; i++) {
             if (!formats[i]) continue;
             const vk_format_info *f = vk_format((VkFormat)formats[i]);
             const char *t = f && f->numeric == VKF_UINT ? "uint4" : f && f->numeric == VKF_SINT ? "int4" : "float4";
             [src appendFormat:@"  o.c%u = %s(as_type<%s>(p.c[%u]));\n", i, t, f && f->numeric != VKF_FLOAT ? t : "float4", i];
         }
-        [src appendString:@"  o.pad = 0; return o; }\n"];
+        [src appendString:outputs ? @"  return o; }\n" : @"}\n"];
         NSError *err = nil;
         id<MTLLibrary> lib = [dev->mtl newLibraryWithSource:src options:nil error:&err];
         if (!lib) { vx_log("vulkan: clear shader: %s", err.localizedDescription.UTF8String); return; }

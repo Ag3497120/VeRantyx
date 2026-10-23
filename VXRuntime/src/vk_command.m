@@ -604,6 +604,18 @@ VKFN void VKAPI_CALL vkCmdBeginDebugUtilsLabelEXT(VkCommandBuffer cb, const VkDe
 VKFN void VKAPI_CALL vkCmdEndDebugUtilsLabelEXT(VkCommandBuffer cb) { (void)cb; }
 VKFN void VKAPI_CALL vkCmdInsertDebugUtilsLabelEXT(VkCommandBuffer cb, const VkDebugUtilsLabelEXT *l) { (void)cb; (void)l; }
 VKFN void VKAPI_CALL vkCmdSetDeviceMask(VkCommandBuffer cb, uint32_t mask) { (void)cb; (void)mask; }
+VKFN void VKAPI_CALL vkCmdDebugMarkerBeginEXT(VkCommandBuffer cb, const VkDebugMarkerMarkerInfoEXT *m) { (void)cb; (void)m; }
+VKFN void VKAPI_CALL vkCmdDebugMarkerEndEXT(VkCommandBuffer cb) { (void)cb; }
+VKFN void VKAPI_CALL vkCmdDebugMarkerInsertEXT(VkCommandBuffer cb, const VkDebugMarkerMarkerInfoEXT *m) { (void)cb; (void)m; }
+// Buffer markers (crash breadcrumbs): the value is written in order with the other commands.
+VKFN void VKAPI_CALL vkCmdWriteBufferMarkerAMD(VkCommandBuffer cb, VkPipelineStageFlagBits stage, VkBuffer b, VkDeviceSize offset, uint32_t marker) {
+    (void)stage;
+    vkCmdUpdateBuffer(cb, b, offset, 4, &marker);
+}
+VKFN void VKAPI_CALL vkCmdWriteBufferMarker2AMD(VkCommandBuffer cb, VkPipelineStageFlags2 stage, VkBuffer b, VkDeviceSize offset, uint32_t marker) {
+    (void)stage;
+    vkCmdUpdateBuffer(cb, b, offset, 4, &marker);
+}
 
 // ---- encoding ----------------------------------------------------------------------------------------------------
 void vk_end_encoder(vk_enc *e) {
