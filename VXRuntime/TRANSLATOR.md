@@ -404,7 +404,7 @@ instructions computing all six flags), a candidate for flags computed only when 
 | 2 Integer translator + differential tests | integer and flag instructions match Rosetta on random inputs (2a, done: 154 forms); control flow, blocks, string instructions, RCL/RCR, SHLD/SHRD, atomics with LSE (2b, done: 224 forms and random programs); small PE tests run translated in-process (with phase 4) |
 | 3 SSE, AVX, x87 | every SIMD/FP form in the census matches Rosetta (MXCSR rounding, denormals, NaNs): 3a SSE/SSE2 done (128 forms); 3b AVX/AVX2/FMA/SSE3-4.1/AES done (785 forms with 3a's); 3c MXCSR modes and flags, x87 (with the transcendentals) done |
 | 4 Runtime on ARM64 + execution environment | 4a engine (cache, linking, indirect lookup, return ring, traps, CPUID/RDTSC/XGETBV, ordered mode) done, 1.3-3.1x Rosetta's time on the kernels; then `make check` passes translated; in-process vs. vCPU measured on SteamVR and a game |
-| 5 Games | SteamVR, The Lab (Mono JIT), Earth, Alyx at level `controls` with fps at least Rosetta's — started 2026-10-17: Earth VR runs (57.8 fps, 2026-10-16); The Lab runs its 150 s title scenario at 52.7-56.4 fps (Rosetta 59.4-59.6, 2026-10-17); since 2026-10-23 (be86f36) without Mono's collation error and three runs in a row whole; Alyx needs the vCPU (LuaJIT wants memory below 2 GB) |
+| 5 Games | SteamVR, The Lab (Mono JIT), Earth, Alyx at level `controls` with fps at least Rosetta's — started 2026-10-17: Earth VR runs (57.8 fps, 2026-10-16); The Lab runs its 150 s title scenario at 52.7-56.4 fps (Rosetta 59.4-59.6, 2026-10-17); since 2026-10-23 (be86f36) without Mono's collation error, but Unity's allocator still faults at the title in about a quarter of the runs (below); Alyx needs the vCPU (LuaJIT wants memory below 2 GB) |
 
 Machine code written at run time is allowed here, and only here: the translator's code emitter (AOT cache and JIT).
 Everything else in VXRuntime keeps the rule in AGENTS.md.
@@ -441,6 +441,29 @@ compares its bytes at its start). What it found:
   exit) then went to unrelated code. Now a site is linked only when its own target is where the code came back.
   `tests/smc.c` case 5 (in check-arm64) builds exactly that: A's JNZ to B, B already translated, C changed; before,
   the second call of A skipped B (9 instead of 11).
+
+- Then (2026-10-23/24, 30 more runs of the title scenario on the ARM64 runtime) three more, each with a test:
+  - A write that faulted on a page whose translations were already gone (the page record left, not protected) was
+    taken as another thread's SMC write just handled, and retried: when the page cannot be written at all (memory
+    the program freed), the same instruction was translated again and again as a one-off block (523,747 times in
+    `tests/smc.c` case 6), the translation cache filled up, and after the flush the thread's state was garbage
+    (`arm64: no call of the program's code holds stack 0xbf1ff000bf1ff00`, one run ended there after Unity's
+    DeleteObjects took 20 s). Retried now only when the host page is writable; otherwise it is the program's
+    access violation. The flush report (`engine: N blocks ...; most made: <rip> xN`) names such addresses.
+  - A checked block read its bytes three times (decoded, copied for the check, decoded again to translate): a call
+    site Mono patched in between would put the check of the new bytes in front of code made from the old ones. One
+    copy now, decoded and checked. Found by reading; no run showed it.
+  - Ordered mode left RBP-based accesses plain (taken for the stack frame), but compilers use RBP as a register of
+    their own (UnityPlayer's allocator keeps its heap object there). `tests/order.c`: one thread stores data, then a
+    flag, through RBP; the other loads the flag, then the data: before, 1.0-1.24 million of 40 million reads saw the
+    flag newer than the data; now 0 (as under Rosetta). Only RSP-based accesses stay plain. `make xlat-bench`
+    ordered: no difference (ABBA).
+- Open: in about a quarter of the runs (3 of 8 with all the above, 1 of 6 and 2 of 5 before the last two) Unity's
+  own allocator faults freeing a block at the title scene, always at UnityPlayer.dll+0xdfa4ce with the same 8
+  callers (+0x5920cd, +0x590b36, +0x58bff0, ...), about 30 s in; never under Rosetta. The runs that crash are the
+  ones that stay at 56-60 fps; the others (and Rosetta's, since 2026-10-22) drop to 5-9 fps at that same moment,
+  so that transition has a problem of its own. Blocks of one instruction cannot be tried in a game: the cache fills
+  with them in seconds and the flush, with other threads in translated code, breaks them.
 
 Tools made for it: `XE_MAX_INSNS=n` (blocks of at most n instructions) and `XE_BISECT=bits:value` (with it, only the
 blocks whose first 12 bytes hash to value in their low bits are whole, and are listed: double bits until one block

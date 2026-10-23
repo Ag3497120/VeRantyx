@@ -99,9 +99,11 @@ static int ea_fold(xlat_buf *b, const x86_insn *d, uint64_t next, int size, int3
     return T_ADDR;
 }
 // ModRM's r/m operand: read into t (zero-extended); its address, if memory, stays in T_ADDR for wr_rm.
-// In-process without TSO (b->ordered), accesses that may be shared (not RSP- or RBP-based) are LDAPR / STLR: x86's
-// order for them. (LSE2 lets them be unaligned within 16 bytes; across 16 they would fault: phase 4 measurement only.)
-static int shared_access(const xlat_buf *b, const x86_insn *d) { return b->ordered && d->base != 4 && d->base != 5; }
+// In-process without TSO (b->ordered), accesses that may be shared (not RSP-based) are LDAPR / STLR: x86's order for
+// them. (LSE2 lets them be unaligned within 16 bytes; across 16 they would fault: phase 4 measurement only.) RBP-based
+// ones too: compilers use RBP as a register of their own (UnityPlayer's allocator keeps its heap object there); with
+// plain loads and stores, a flag written after data was seen before it (tests/order.c).
+static int shared_access(const xlat_buf *b, const x86_insn *d) { return b->ordered && d->base != 4; }
 static void rd_rm(xlat_buf *b, const x86_insn *d, int t, int size, uint64_t next) {
     if (d->mod == 3) rd_reg(b, d, t, d->rm, size);
     else { ea(b, d, next, 0); E(b, shared_access(b, d) ? a64_ldapr(size, t, T_ADDR) : a64_ldr(size, t, T_ADDR, 0)); }
@@ -1773,6 +1775,27 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         free(probe.code);
         if (t || is_branch(&ins[n])) { n++; break; }
     }
+    // Code that may change under us (a checked block): its bytes copied once, and the instructions decoded again from
+    // the copy, which the check compares with and the code is made from. Read from memory three times (decoded, the
+    // check's bytes, decoded again to translate), a call site Mono patched in between gave a check of the new bytes in
+    // front of the old code.
+    uint8_t snap[MAXI * 15]; int snapped = 0;
+    if (n && b->check_bytes) {
+        size_t slen = 0;
+        for (int i = 0; i < n; i++) slen += ins[i].len;
+        memcpy(snap, (const uint8_t *)(uintptr_t)rip, slen);
+        int m = 0;
+        for (size_t at = 0; m < n; ) {
+            if (!x86_decode(snap + at, slen - at, &ins[m])) break;
+            at += ins[m].len;
+            xlat_buf probe = { 0 };
+            int t = trap(&probe, &ins[m], rip + at - ins[m].len);
+            free(probe.code);
+            m++;
+            if (t || is_branch(&ins[m - 1])) break;
+        }
+        if (m) { n = m; snapped = 1; }
+    }
     // Live at the end: what the successors read, looked at where the code is mapped (the host pages of this block)
     uint64_t last = rip;
     for (int i = 0; i + 1 < n; i++) last += ins[i].len;
@@ -1786,7 +1809,7 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         while (at < len) {
             int sz = len - at >= 8 ? 8 : len - at >= 4 ? 4 : len - at >= 2 ? 2 : 1;
             uint64_t want = 0;
-            memcpy(&want, (const uint8_t *)(uintptr_t)(rip + at), (size_t)sz);
+            memcpy(&want, snapped ? snap + at : (const uint8_t *)(uintptr_t)(rip + at), (size_t)sz);
             E(b, a64_ld_post(sz, S0, T_ADDR, sz));
             mov_imm(b, S1, want);
             E(b, a64_cmp(S0, S1));
@@ -1875,7 +1898,8 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
     }
     for (int i = 0; i < max_insns; i++) {
         x86_insn d;
-        if (!x86_decode((const uint8_t *)(uintptr_t)rip, 15, &d)) return -1;
+        if (snapped) { if (i >= n) break; d = ins[i]; }                   // (the copy's: what the check compares)
+        else if (!x86_decode((const uint8_t *)(uintptr_t)rip, 15, &d)) return -1;
         b->dead_flags = i < n ? dead[i] : 0;
         b->keep_operands = fuse_k && i == fuse_p;
         imap_mark(b, rip);

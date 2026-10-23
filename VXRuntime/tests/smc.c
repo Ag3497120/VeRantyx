@@ -11,6 +11,13 @@ static int failed;
 #define CHECK(c) do { if (!(c)) { failed++; printf("  failed: %s (line %d)\n", #c, __LINE__); } } while (0)
 
 static void put_mov_ret(unsigned char *p, int v) { p[0] = 0xB8; memcpy(p + 1, &v, 4); p[5] = 0xC3; }
+static unsigned char *g_p6;
+static int g_remapped6;
+static LONG WINAPI remap6(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || g_remapped6) return EXCEPTION_CONTINUE_SEARCH;
+    g_remapped6++;
+    return VirtualAlloc(g_p6, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) == g_p6 ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
 
 int main(void) {
     unsigned char *p = VirtualAlloc(NULL, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -70,7 +77,20 @@ int main(void) {
     int r5c = ((fn1)a5)(1), r5d = ((fn1)a5)(1);                           // A -> B -> C, twice
     CHECK(r5a == 1); CHECK(r5c == 11); CHECK(r5d == 11);
 
-    printf("smc: in place %d/200, with data on the page %d/2000, self-modifying %d/3, reallocated %d/20, linked past a changed block %d %d: %d failed checks -> %s\n",
-           ok1, ok2, ok3, ok4, r5c, r5d, failed, failed ? "FAILED" : "ok");
+    // 6. a write to memory that held translated code and was freed: an access violation for the program (here its
+    //    handler maps the memory again), not a write to code to be retried (the engine had retried it for ever)
+    unsigned char *p6 = VirtualAlloc(NULL, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    put_mov_ret(p6, 66);
+    for (int i = 0; i < 20; i++) { ((fn)p6)(); p6[2048 + i] = (unsigned char)i; }   // (translated, page written often)
+    int r6a = ((fn)p6)();
+    VirtualFree(p6, 0, MEM_RELEASE);
+    g_p6 = p6;
+    PVOID h6 = AddVectoredExceptionHandler(1, remap6);
+    ((volatile unsigned char *)p6)[100] = 7;
+    RemoveVectoredExceptionHandler(h6);
+    CHECK(r6a == 66); CHECK(g_remapped6 == 1); CHECK(p6[100] == 7);
+
+    printf("smc: in place %d/200, with data on the page %d/2000, self-modifying %d/3, reallocated %d/20, linked past a changed block %d %d, written after freed %d: %d failed checks -> %s\n",
+           ok1, ok2, ok3, ok4, r5c, r5d, g_remapped6, failed, failed ? "FAILED" : "ok");
     return failed != 0;
 }

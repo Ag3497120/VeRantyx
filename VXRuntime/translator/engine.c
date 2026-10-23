@@ -7,6 +7,8 @@
 #include "vcpu.h"
 #include "a64.h"
 #include <libkern/OSCacheControl.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/ucontext.h>
@@ -273,6 +275,12 @@ static void add_site(xe *e, uint32_t id, uint32_t *p, int call) {
 // The pages translated code came from are made read-only; a write there (xe_smc_write, from the fault handler)
 // forgets every block made from the page and gives the page back. A page written again and again (data next to
 // code) is left writable after a while, its translations no longer watched.
+static int host_writable(uint64_t addr) {
+    mach_vm_address_t a = addr; mach_vm_size_t size = 0; mach_port_t object = MACH_PORT_NULL;
+    vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    if (mach_vm_region(mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS) return 0;
+    return a <= addr && (info.protection & VM_PROT_WRITE);
+}
 static page_rec *page_at(xe *e, uint64_t page, int make) {
     for (uint32_t i = (uint32_t)((page >> PAGE_BITS) * 0x9E3779B1u) & (PAGES - 1), n = 0; n < PAGES; i = (i + 1) & (PAGES - 1), n++) {
         if (e->pages[i].page == page) return &e->pages[i];
@@ -316,7 +324,10 @@ int xe_smc_write(xe *e, uint64_t addr) {
     pthread_mutex_lock(&e->lock);
     page_rec *r = page_at(e, pg, 0);
     if (!r) { pthread_mutex_unlock(&e->lock); return 0; }
-    if (!r->protected) { pthread_mutex_unlock(&e->lock); return 1; }      // (another thread's write gave it back just now)
+    if (!r->protected) {                                                  // (another thread's write gave it back just now; or
+        pthread_mutex_unlock(&e->lock);                                   //  the page cannot be written at all, freed or read-only:
+        return host_writable(addr);                                       //  the program's access violation, not a retry for ever)
+    }
     for (uint32_t k = 0; k < r->n; k++) forget_block(e, r->ids[k]);
     r->n = 0;
     r->protected = 0;
@@ -343,6 +354,26 @@ void xe_forget(xe *e, uint64_t addr, uint64_t len) {
     pthread_mutex_unlock(&e->lock);
 }
 void xe_set_smc(xe *e, int on) { e->smc = on; }
+
+// Before a flush: the addresses translated most often since the last one (a block made again and again fills the
+// cache with blocks of the same code: code that changes all the time, or a one-off block after each write).
+static int cmp_u64(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
+static void flush_report(xe *e) {
+    uint64_t *r = malloc(e->nblocks * sizeof *r);
+    if (!r) return;
+    size_t n = 0, dead = 0;
+    for (size_t i = 0; i < e->nblocks; i++) { r[n++] = e->blocks[i].rip; dead += e->blocks[i].dead != 0; }
+    qsort(r, n, sizeof *r, cmp_u64);
+    uint64_t top[5] = { 0 }; size_t topn[5] = { 0 };
+    for (size_t i = 0, j; i < n; i = j) {
+        for (j = i; j < n && r[j] == r[i]; j++) {}
+        for (int k = 0; k < 5; k++) if (j - i > topn[k]) { memmove(top + k + 1, top + k, (4 - k) * sizeof *top); memmove(topn + k + 1, topn + k, (4 - k) * sizeof *topn); top[k] = r[i]; topn[k] = j - i; break; }
+    }
+    fprintf(stderr, "[vxrt] engine: %zu blocks (%zu forgotten), %llu pages written; most made:", n, dead, (unsigned long long)e->stats.smc_pages);
+    for (int k = 0; k < 5 && topn[k]; k++) fprintf(stderr, " %#llx x%zu", (unsigned long long)top[k], topn[k]);
+    fprintf(stderr, "\n");
+    free(r);
+}
 
 // The block at rip, translated now if it is not yet: its id (-1: it cannot be). once: the instruction at rip
 // alone, not kept (not found by others, no page watched).
@@ -379,6 +410,7 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
         if (xlat_block_linked(&b, rip, once ? 1 : max, &end) < 0) { free(b.code); free(b.relocs); free(b.imap); return -1; }
     }
     if (e->used + b.n > e->cap || e->nblocks + 1 >= (1u << (MAP_BITS - 1))) {   // (full: start over; nblocks: since the last)
+        flush_report(e);
         xe_flush(e);
         e->stats.flushes++;
         fprintf(stderr, "[vxrt] engine: translation cache full (%zu words, %llu blocks): flushed (%llu)\n", e->used, (unsigned long long)e->stats.blocks, (unsigned long long)e->stats.flushes);

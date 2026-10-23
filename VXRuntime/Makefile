@@ -33,7 +33,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/game_imports.exe
+       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/game_imports.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -86,6 +86,10 @@ build/callbench.exe: tests/callbench.c
 	$(MINGW) -O1 -o $@ $<
 
 build/smc.exe: tests/smc.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+build/order.exe: tests/order.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
@@ -1031,6 +1035,7 @@ runtime-tests: export VXRT_NO_ACTIVATE = 1
 runtime-tests: $(VXRT) tests
 	$(VXRT) build/hello_k32.exe
 	$(VXRT) build/smc.exe
+	$(VXRT) build/order.exe
 	$(VXRT) build/hello_crt.exe one "two words"
 	$(VXRT) build/game_imports.exe
 	$(VXRT) build/threads.exe
