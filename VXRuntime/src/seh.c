@@ -733,7 +733,7 @@ void vx_seh_install_signals(void) {
     int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP };
     for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
 #endif
-    if (vx_trace) signal(SIGABRT, on_abort);
+    signal(SIGABRT, on_abort);                  // (a native abort says where it came from)
 }
 
 // ---- exports -----------------------------------------------------------------------------------------------------------------

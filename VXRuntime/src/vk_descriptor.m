@@ -60,7 +60,7 @@ VKFN VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice dev, const VkDescr
 }
 
 static void layout_release(VkDescriptorSetLayout l) {
-    if (!l || --l->refs) return;
+    if (!l || __atomic_sub_fetch(&l->refs, 1, __ATOMIC_ACQ_REL)) return;   // (pipelines are made on many threads)
     for (uint32_t i = 0; i < l->binding_count; i++) free(l->bindings[i].immutable);
     free(l->bindings);
     free(l);
@@ -100,7 +100,7 @@ VKFN VkResult VKAPI_CALL vkCreatePipelineLayout(VkDevice dev, const VkPipelineLa
     l->set_count = info->setLayoutCount;
     for (uint32_t i = 0; i < info->setLayoutCount; i++) {
         l->sets[i] = info->pSetLayouts[i];
-        if (l->sets[i]) l->sets[i]->refs++;
+        if (l->sets[i]) __atomic_add_fetch(&l->sets[i]->refs, 1, __ATOMIC_RELAXED);
         l->dynamic_base[i] = l->dynamic_count;
         l->dynamic_count += l->sets[i] ? l->sets[i]->dynamic_count : 0;
     }
@@ -121,7 +121,7 @@ VKFN void VKAPI_CALL vkDestroyPipelineLayout(VkDevice dev, VkPipelineLayout l, c
 void vk_pipeline_layout_copy(struct VkPipelineLayout_T *dst, VkPipelineLayout src);
 void vk_pipeline_layout_copy(struct VkPipelineLayout_T *dst, VkPipelineLayout src) {
     *dst = *src;
-    for (uint32_t i = 0; i < dst->set_count; i++) if (dst->sets[i]) dst->sets[i]->refs++;
+    for (uint32_t i = 0; i < dst->set_count; i++) if (dst->sets[i]) __atomic_add_fetch(&dst->sets[i]->refs, 1, __ATOMIC_RELAXED);
 }
 void vk_pipeline_layout_release_copy(struct VkPipelineLayout_T *l);
 void vk_pipeline_layout_release_copy(struct VkPipelineLayout_T *l) {
@@ -255,7 +255,7 @@ VKFN VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice dev, const VkDescript
         struct VkDescriptorSet_T *s = calloc(1, sizeof *s);
         s->pool = p;
         s->layout = l;
-        l->refs++;
+        __atomic_add_fetch(&l->refs, 1, __ATOMIC_RELAXED);
         s->offset = offset;
         s->size = size;
         s->words = (uint64_t *)((uint8_t *)p->buffer.contents + offset);
@@ -434,7 +434,7 @@ struct VkDescriptorSet_T *vk_push_set_new(VkDescriptorSetLayout l, uint64_t *wor
 struct VkDescriptorSet_T *vk_push_set_new(VkDescriptorSetLayout l, uint64_t *words, uint64_t size) {
     struct VkDescriptorSet_T *s = calloc(1, sizeof *s);
     s->layout = l;
-    l->refs++;
+    __atomic_add_fetch(&l->refs, 1, __ATOMIC_RELAXED);
     s->words = words;
     s->size = size;
     return s;

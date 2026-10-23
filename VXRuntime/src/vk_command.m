@@ -425,6 +425,21 @@ VKFN void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingIn
     } else if (p->has_depth) { p->depth.sload = 2; p->depth.sstore = 1; }
 }
 VKFN void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer cb) { record(cb, C_END_PASS, sizeof(cmd)); }
+VKFN void VKAPI_CALL vkCmdEndRendering2KHR(VkCommandBuffer cb, const VkRenderingEndInfoKHR *info) { (void)info; record(cb, C_END_PASS, sizeof(cmd)); }
+// Dynamic rendering local read: the identity mapping of fragment outputs to attachments and of input attachment
+// indices is what Metal does; the commands are taken as that.
+VKFN void VKAPI_CALL vkCmdSetRenderingAttachmentLocations(VkCommandBuffer cb, const VkRenderingAttachmentLocationInfo *info) { (void)cb; (void)info; }
+VKFN void VKAPI_CALL vkCmdSetRenderingInputAttachmentIndices(VkCommandBuffer cb, const VkRenderingInputAttachmentIndexInfo *info) { (void)cb; (void)info; }
+VKFN void VKAPI_CALL vkCmdSetLineStipple(VkCommandBuffer cb, uint32_t factor, uint16_t pattern) { (void)cb; (void)factor; (void)pattern; }
+VKFN void VKAPI_CALL vkCmdPushDescriptorSet2(VkCommandBuffer cb, const VkPushDescriptorSetInfo *info) {
+    if (info->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)
+        push_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, info->layout, info->set, info->descriptorWriteCount, info->pDescriptorWrites, NULL, NULL);
+    if (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+        push_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, info->layout, info->set, info->descriptorWriteCount, info->pDescriptorWrites, NULL, NULL);
+}
+VKFN void VKAPI_CALL vkCmdPushDescriptorSetWithTemplate2(VkCommandBuffer cb, const VkPushDescriptorSetWithTemplateInfo *info) {
+    push_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, info->layout, info->set, 0, NULL, info->descriptorUpdateTemplate, info->pData);
+}
 
 // Copies, blits, clears.
 VKFN void VKAPI_CALL vkCmdCopyBuffer2(VkCommandBuffer cb, const VkCopyBufferInfo2 *info) {

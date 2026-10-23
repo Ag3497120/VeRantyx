@@ -4,6 +4,7 @@
 #include "vx.h"
 #include "ui.h"
 #import <QuartzCore/QuartzCore.h>
+#import <ImageIO/ImageIO.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -226,6 +227,65 @@ VKFN VkResult VKAPI_CALL vkAcquireNextImage2KHR(VkDevice dev, const VkAcquireNex
     return vkAcquireNextImageKHR(dev, info->swapchain, info->timeout, info->semaphore, info->fence, index);
 }
 
+// VXRT_PRESENT_SNAPSHOT=file.png (with VXRT_PRESENT_SNAPSHOT_AT=n, default 300; VXRT_PRESENT_SNAPSHOT_EVERY=k: also
+// every k-th present after it, as file-<n>.png): a presented image as a PNG, to see what a program draws.
+static void snapshot(VkQueue q, VkImage img, uint64_t present) {
+    const char *path = getenv("VXRT_PRESENT_SNAPSHOT");
+    if (!path) return;
+    uint64_t at = getenv("VXRT_PRESENT_SNAPSHOT_AT") ? strtoull(getenv("VXRT_PRESENT_SNAPSHOT_AT"), NULL, 10) : 300;
+    uint64_t every = getenv("VXRT_PRESENT_SNAPSHOT_EVERY") ? strtoull(getenv("VXRT_PRESENT_SNAPSHOT_EVERY"), NULL, 10) : 0;
+    if (present != at && !(every && present > at && (present - at) % every == 0)) return;
+    id<MTLTexture> tex = img->mtl;
+    MTLPixelFormat f = tex.pixelFormat;
+    int bgra = f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB;
+    if (!bgra && f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) { vx_log("vulkan: snapshot of format %d not written", (int)f); return; }
+    NSUInteger w = tex.width, h = tex.height, row = w * 4;
+    id<MTLBuffer> buf = [q->device->mtl newBufferWithLength:row * h options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [q->mtl commandBuffer];
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    [b waitForFence:q->last_fence];
+    [b copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+              toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
+    [b updateFence:q->last_fence];
+    [b endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    char name[1024];
+    if (present == at) snprintf(name, sizeof name, "%s", path);
+    else {
+        const char *dot = strrchr(path, '.');
+        int stem = dot ? (int)(dot - path) : (int)strlen(path);
+        snprintf(name, sizeof name, "%.*s-%llu%s", stem, path, (unsigned long long)present, dot ? dot : "");
+    }
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGBitmapInfo bi = bgra ? (kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst) : (kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast);
+    CGContextRef ctx = CGBitmapContextCreate(buf.contents, w, h, 8, row, cs, bi);
+    CGImageRef im = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:name]];
+    CGImageDestinationRef dst = im ? CGImageDestinationCreateWithURL((__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL) : NULL;
+    if (dst) { CGImageDestinationAddImage(dst, im, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); }
+    if (im) CGImageRelease(im);
+    if (ctx) CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    vx_log("vulkan: present %llu (%lux%lu) written to %s", (unsigned long long)present, (unsigned long)w, (unsigned long)h, name);
+}
+
+// The present rate in the log every 5 seconds with VXRT_TRACE_VULKAN (or VXRT_STATS).
+static void count_present(void) {
+    static uint64_t last, count;
+    static int on = -1;
+    if (on < 0) on = vk_trace() || (getenv("VXRT_STATS") && atoi(getenv("VXRT_STATS")));
+    if (!on) return;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    count++;
+    if (!last) last = now;
+    if (now - last >= 5000000000ull) {
+        vx_log("vulkan: %.1f presents/s", count * 1e9 / (double)(now - last));
+        last = now;
+        count = 0;
+    }
+}
+
 VKFN VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *info) {
     VkResult result = VK_SUCCESS;
     pthread_mutex_lock(&q->lock);
@@ -257,6 +317,9 @@ VKFN VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *in
         [cb commit];
         sc->presented[i] = number;
         sc->present_queue[i] = q;
+        static _Atomic uint64_t presents;
+        snapshot(q, img, atomic_fetch_add(&presents, 1) + 1);
+        count_present();
         VkResult r = sc->retired ? VK_ERROR_OUT_OF_DATE_KHR : VK_SUCCESS;
         if (info->pResults) info->pResults[k] = r;
         if (r) result = r;

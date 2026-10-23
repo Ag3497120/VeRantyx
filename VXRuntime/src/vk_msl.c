@@ -152,7 +152,8 @@ enum {
     D_CENTROID = 1u << 5, D_SAMPLE = 1u << 6, D_NONWRITABLE = 1u << 7, D_NONREADABLE = 1u << 8,
     D_LOCATION = 1u << 9, D_BUILTIN = 1u << 10, D_OFFSET = 1u << 11, D_SET = 1u << 12, D_BINDING = 1u << 13,
     D_SPECID = 1u << 14, D_INDEX = 1u << 15, D_PATCH = 1u << 16, D_INVARIANT = 1u << 17, D_COMPONENT = 1u << 18,
-    D_NONUNIFORM = 1u << 19, D_ARRAYSTRIDE = 1u << 20, D_MATRIXSTRIDE = 1u << 21
+    D_NONUNIFORM = 1u << 19, D_ARRAYSTRIDE = 1u << 20, D_MATRIXSTRIDE = 1u << 21,
+    D_DEPTHCMP = 1u << 22     // (not a decoration: the image is sampled with depth comparisons)
 };
 typedef struct {
     uint32_t deco, builtin, location, component, set, binding, spec_id, index, offset, array_stride, matrix_stride;
@@ -170,6 +171,7 @@ typedef struct {
     uint32_t align;            // P_BUFFER: guaranteed byte alignment of base + offset
     uint32_t matrix_stride;    // P_BUFFER pointing at a matrix (or arrays of them): its layout
     uint8_t row_major, device; // device: writable (SSBO); else constant
+    uint8_t depth;             // P_HANDLE: declared as a depth texture
     uint8_t column_of_row_major; // P_BUFFER: a column vector of a row-major matrix (components matrix_stride apart)
     uint32_t storage;          // storage class
     uint32_t var;              // root variable
@@ -190,6 +192,7 @@ typedef struct {
     int block;                 // labels: block index
     uint8_t used, written;     // variables
     uint8_t is_phi;
+    uint8_t depthtex;          // image values: their texture is declared as a depth texture
 } ent;
 
 typedef struct {
@@ -249,7 +252,7 @@ static void fail(T *t, int rc, const char *f, ...) {
 }
 
 static ent *E(T *t, uint32_t id) {
-    static ent none;
+    static _Thread_local ent none;
     if (id >= t->bound) { fail(t, VKMSL_INVALID, "id %u out of range", id); memset(&none, 0, sizeof none); return &none; }
     return &t->e[id];
 }
@@ -338,7 +341,7 @@ static const char *tname(T *t, uint32_t id) {
 
 // A 4-component vector of the type's scalar (user varyings travel as 4-wide vectors so both stages agree).
 static const char *vec4_of(T *t, uint32_t id) {
-    static char buf[32];
+    static _Thread_local char buf[32];
     snprintf(buf, sizeof buf, "%s4", scalar_name(t, scalar_of(t, id)));
     return buf;
 }
@@ -999,7 +1002,7 @@ static const vkmsl_binding *find_binding(T *t, uint32_t set, uint32_t binding) {
 }
 
 // The MSL texture type for a SPIR-V image type. access: 0 sampled, else 1 read, 2 write, 3 read_write.
-static char *texture_type(T *t, uint32_t image, int access) {
+static char *texture_type(T *t, uint32_t image, int access, int force_depth) {
     const uint32_t *w = tw(t, image);
     if (type_op(t, image) != OpTypeImage) { fail(t, VKMSL_INVALID, "%u is not an image type", image); return xstrdup("texture2d<float>"); }
     uint32_t sampled = w[1], dim = w[2], depth = w[3], arrayed = w[4], ms = w[5];
@@ -1007,7 +1010,7 @@ static char *texture_type(T *t, uint32_t image, int access) {
     if (!st || !strcmp(st, "void")) st = "float";
     if (!strcmp(st, "half")) st = "half";
     const char *acc = access == 1 ? ", access::read" : access == 2 ? ", access::write" : access == 3 ? ", access::read_write" : "";
-    if (depth == 1 && !access && (dim == DIM_2D || dim == DIM_Cube) && !strcmp(st, "float")) {
+    if ((depth == 1 || force_depth) && !access && (dim == DIM_2D || dim == DIM_Cube) && !strcmp(st, "float")) {
         if (dim == DIM_Cube) return xstrdup(arrayed ? "depthcube_array<float>" : "depthcube<float>");
         if (ms) return xstrdup(arrayed ? "depth2d_ms_array<float>" : "depth2d_ms<float>");
         return xstrdup(arrayed ? "depth2d_array<float>" : "depth2d<float>");
@@ -1114,11 +1117,16 @@ static void setup_resource_variable(T *t, uint32_t var) {
     uint32_t image = eop == OpTypeSampledImage ? tw(t, elem)[1] : elem;
     if (type_op(t, image) != OpTypeImage) { fail(t, VKMSL_UNSUPPORTED, "descriptor of type %u", elem); return; }
     int access = 0;
-    if (tw(t, image)[6] == 2) {   // (storage image or storage texel buffer)
+    if (tw(t, image)[6] == 2 && tw(t, image)[2] != DIM_SubpassData) {   // (storage image or storage texel buffer)
         int nr = (v->d.deco & D_NONREADABLE) != 0, nw = (v->d.deco & D_NONWRITABLE) != 0;
         access = nw ? 1 : nr ? 2 : 3;
     }
-    char *tt = texture_type(t, image, access);
+    // (HLSL's SPIR-V declares comparison-sampled textures without Depth: their use decides)
+    const uint32_t *iw = tw(t, image);
+    int depth = !access && (iw[2] == DIM_2D || iw[2] == DIM_Cube) && is_float(t, iw[1]) &&
+                (iw[3] == 1 || (v->d.deco & D_DEPTHCMP));
+    p->depth = (uint8_t)depth;
+    char *tt = texture_type(t, image, access, depth);
     add_dmember(t, set, b->word, count, is_array ? xprintf("array<%s, %u> t%u", tt, count, binding) :
                                                    xprintf("%s t%u", tt, binding));
     free(tt);
@@ -1400,6 +1408,7 @@ static void emit_load(T *t, const uint32_t *w) {
     switch (p->kind) {
     case P_HANDLE:
         e->expr = xstrdup(p->lvalue);
+        e->depthtex = p->depth;
         if (p->base) e->aux = xstrdup(p->base);
         if (p->sample && !strcmp(p->sample, "buffer")) fail(t, VKMSL_UNSUPPORTED, "load of a whole buffer array");
         return;
@@ -1435,6 +1444,7 @@ static void emit_store(T *t, const uint32_t *w) {
 typedef struct {
     uint32_t dim, depth, arrayed, ms, storage, sampled_type;
     const char *tex, *smp;
+    int is_depth;              // declared as a depth texture (depth2d...)
 } imginfo;
 static int image_info(T *t, uint32_t value_id, imginfo *im) {
     uint32_t type = vtype(t, value_id);
@@ -1444,12 +1454,11 @@ static int image_info(T *t, uint32_t value_id, imginfo *im) {
     im->sampled_type = w[1]; im->dim = w[2]; im->depth = w[3]; im->arrayed = w[4]; im->ms = w[5]; im->storage = w[6] == 2;
     im->tex = E(t, value_id)->expr;
     im->smp = E(t, value_id)->aux;
+    im->is_depth = E(t, value_id)->depthtex;
     if (!im->tex) { fail(t, VKMSL_UNSUPPORTED, "image %u has no descriptor", value_id); return 0; }
     return 1;
 }
-static int depth_texture(const imginfo *im) {
-    return im->depth == 1 && !im->storage && (im->dim == DIM_2D || im->dim == DIM_Cube);
-}
+static int depth_texture(const imginfo *im) { return im->is_depth; }
 
 typedef struct { char *bias, *lod, *dx, *dy, *offset, *sample, *minlod, *component; } imops;
 static void imops_free(imops *o) { free(o->bias); free(o->lod); free(o->dx); free(o->dy); free(o->offset); free(o->sample); free(o->minlod); free(o->component); }
@@ -1518,11 +1527,13 @@ static void emit_image(T *t, uint32_t op, const uint32_t *w, uint32_t n) {
     switch (op) {
     case OpSampledImage: {
         ent *e = E(t, id);
+        e->depthtex = E(t, w[2])->depthtex;
         e->expr = xstrdup(E(t, w[2])->expr ? E(t, w[2])->expr : "");
         e->aux = xstrdup(E(t, w[3])->expr ? E(t, w[3])->expr : "");
         return;
     }
     case OpImage:
+        E(t, id)->depthtex = E(t, w[2])->depthtex;
         E(t, id)->expr = xstrdup(E(t, w[2])->expr ? E(t, w[2])->expr : "");
         return;
     case OpImageWrite: {
@@ -2068,7 +2079,12 @@ static void emit_insn(T *t, uint32_t op, const uint32_t *w, uint32_t n) {
     case OpCopyObject: {
         ent *s = E(t, w[2]);
         if (s->ptr) { E(t, w[1])->ptr = copy_ptr(s->ptr); return; }
-        if (opaque_type(t, w[0])) { E(t, w[1])->expr = xstrdup(s->expr ? s->expr : ""); if (s->aux) E(t, w[1])->aux = xstrdup(s->aux); return; }
+        if (opaque_type(t, w[0])) {
+            E(t, w[1])->expr = xstrdup(s->expr ? s->expr : "");
+            E(t, w[1])->depthtex = s->depthtex;
+            if (s->aux) E(t, w[1])->aux = xstrdup(s->aux);
+            return;
+        }
         EMIT("%s = %s;\n", dst(t, w[1]), value(t, w[2]));
         return;
     }
@@ -2574,6 +2590,7 @@ static const char *builtin_param(T *t, uint32_t bi, const char **decl) {
     case BI_LocalInvocationIndex: if (cs) { *decl = "uint spvLocalIndex [[thread_index_in_threadgroup]]"; return "spvLocalIndex"; } break;
     case BI_SubgroupId: if (cs) { *decl = "uint spvSubgroupId [[simdgroup_index_in_threadgroup]]"; return "spvSubgroupId"; } break;
     case BI_NumSubgroups: if (cs) { *decl = "uint spvNumSubgroups [[simdgroups_per_threadgroup]]"; return "spvNumSubgroups"; } break;
+    case BI_ViewIndex: return "0u";   // (multiview: the one view of a pass without a view mask)
     case BI_SubgroupLocalInvocationId: t->uses_subgroup = 1; return "spvSubgroupLane";
     case BI_SubgroupSize: t->uses_subgroup = 1; return "spvSubgroupSize";
     case BI_SubgroupEqMask: t->uses_subgroup = 1; return "spvEqMask";
@@ -2605,6 +2622,26 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
     if (!parse(t)) goto out;
     if (!t->block_count) { fail(t, VKMSL_INVALID, "entry point has no blocks"); goto out; }
 
+    // Images sampled with depth comparisons are depth textures whatever their type says (HLSL compilers leave Depth 0).
+    for (uint32_t i = 0; i < t->block_count; i++) {
+        block *b = &t->blocks[i];
+        for (size_t pos = b->first; pos < b->term;) {
+            uint32_t op = t->w[pos] & 0xffff, n = t->w[pos] >> 16;
+            if ((op == OpImageSampleDrefImplicitLod || op == OpImageSampleDrefExplicitLod || op == OpImageSampleProjDrefImplicitLod ||
+                 op == OpImageSampleProjDrefExplicitLod || op == OpImageDrefGather) && n > 3) {
+                uint32_t id = t->w[pos + 3];
+                for (int guard = 0; guard < 16 && id < t->bound; guard++) {
+                    ent *e = &t->e[id];
+                    if (e->kind == K_VAR) { e->d.deco |= D_DEPTHCMP; break; }
+                    if (e->kind != K_VALUE || e->n < 3) break;
+                    if (e->op == OpSampledImage || e->op == OpLoad || e->op == OpAccessChain || e->op == OpInBoundsAccessChain ||
+                        e->op == OpCopyObject || e->op == OpImage) id = e->w[2];
+                    else break;
+                }
+            }
+            pos += n;
+        }
+    }
     // Every variable gets its pointer form: resources and interface variables are set up on first use below.
     for (uint32_t id = 1; id < t->bound; id++) {
         ent *e = &t->e[id];
