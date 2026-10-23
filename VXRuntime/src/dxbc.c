@@ -1742,8 +1742,8 @@ static int translate_container(const void *code, size_t size, dxbc_shader *out, 
         return -1;
     }
     out->out_regs = out_regs(&g);
-    if (d3d12 && (g.gs || d3d12_slots(&g))) {
-        snprintf(out->error, sizeof out->error, "%s", g.gs ? "geometry shaders are not supported in Direct3D 12 pipelines yet" : g.why);
+    if (d3d12 && d3d12_slots(&g)) {
+        snprintf(out->error, sizeof out->error, "%s", g.why);
         free(g.body.s); free(g.icb);
         return -1;
     }
@@ -1754,13 +1754,13 @@ static int translate_container(const void *code, size_t size, dxbc_shader *out, 
         out->gs_instances = g.gs_instances ? (int)g.gs_instances : 1;
         const char *why = !out->gs_in_verts ? "its input primitive" : g.gs_topology != 5 ? "an output other than triangle strips" :
                           !out->gs_max_tris ? "no triangles" : out->gs_instances > 1 ? "instancing" :
-                          __builtin_popcountll(out->srv_buffers) > DXBC_GS_COUNTS - DXBC_SRV_BUFFER_BASE ? "buffers at the slots the geometry path uses" : NULL;
+                          !d3d12 && __builtin_popcountll(out->srv_buffers) > DXBC_GS_COUNTS - DXBC_SRV_BUFFER_BASE ? "buffers at the slots the geometry path uses" : NULL;
         if (why) { snprintf(out->error, sizeof out->error, "geometry shader with %s is not supported yet", why); free(g.body.s); free(g.icb); return -1; }
         out->msl = compose_gs(&g, out->gs_max_tris);
         out->msl_passthrough = compose_passthrough(&g, out->gs_max_tris);
     } else {
         out->msl = compose(&g);
-        if (out->type == DXBC_VERTEX && !d3d12) out->msl_kernel = compose_vs_kernel(&g);
+        if (out->type == DXBC_VERTEX) out->msl_kernel = compose_vs_kernel(&g);
     }
     free(g.body.s); free(g.icb);
     return 0;

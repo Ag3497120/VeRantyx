@@ -2,7 +2,7 @@
 // compiles the result with Metal, and reports what fails, grouped by message: a robustness check of the translator
 // against real shaders. Nothing is written unless -d is given (failing shaders are then saved there, for study).
 //   build/dxbcscan [-v] [-12] [-d dir] [-s N] files...     (-s N: compile every Nth with Metal; -t N: translate every Nth;
-//                                                          -12: as Direct3D 12 pipelines take them, vertex/pixel/compute)
+//                                                          -12: as Direct3D 12 pipelines take them, vertex/pixel/geometry/compute)
 #import <Metal/Metal.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
         dispatch_apply(g_count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t k) {
             @autoreleasepool {
                 blob *b = &g_blobs[k];
-                if (b->type < 0 || k % tstride || (d3d12 && b->type >= 2 && b->type <= 4)) return;
+                if (b->type < 0 || k % tstride || (d3d12 && b->type >= 3 && b->type <= 4)) return;
                 dxbc_shader sh;
                 NSString *why = nil;
                 if ((d3d12 ? dxbc_translate_d3d12 : dxbc_translate)(b->data, b->size, &sh)) why = [@"translate: " stringByAppendingString:kind(sh.error)];
@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
         for (size_t k = 0; k < g_count; k++) {
             if (g_blobs[k].type == -2) dxil++;
             else if (g_blobs[k].type < 0) none++;
-            else if (!(k % tstride) && !(d3d12 && g_blobs[k].type >= 2 && g_blobs[k].type <= 4)) by_type[g_blobs[k].type & 7]++;
+            else if (!(k % tstride) && !(d3d12 && g_blobs[k].type >= 3 && g_blobs[k].type <= 4)) by_type[g_blobs[k].type & 7]++;
         }
         printf("%zu distinct containers: %d DXIL (shader model 6), %d without code\n", g_count, dxil, none);
         for (int t = 0; t < 6; t++) if (by_type[t]) printf("  %-8s %5d, %5d translate and compile\n", names[t], by_type[t], ok_type[t]);

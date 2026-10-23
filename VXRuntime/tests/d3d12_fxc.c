@@ -355,6 +355,110 @@ static int append_test(void) {
     return 0;
 }
 
+// color_vs -> quad_gs (b0: half size, geometry-visible root constants) -> color_ps: each point becomes a square, and
+// every primitive adds a small blue triangle in the top-left corner (after a strip cut). Drawn twice into a 32x32
+// target: plain, and indexed with a base vertex past a vertex that must not be drawn.
+static int geometry_test(void) {
+    int before = bad;
+    D3D12_SHADER_BYTECODE vs, gs, ps;
+    if (load("color_vs", &vs) || load("quad_gs", &gs) || load("color_ps", &ps)) return 1;
+    D3D12_ROOT_PARAMETER param = { D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS };
+    param.Constants = (D3D12_ROOT_CONSTANTS){ 0, 0, 4 };
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_GEOMETRY;
+    D3D12_ROOT_SIGNATURE_DESC rsd = { 1, &param, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+    ID3D12RootSignature *rs = root_signature(&rsd);
+    if (!rs) return 1;
+    D3D12_INPUT_ELEMENT_DESC il[2] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+    memset(&pd, 0, sizeof pd);
+    pd.pRootSignature = rs; pd.VS = vs; pd.GS = gs; pd.PS = ps;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = 0xFFFFFFFF;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.InputLayout = (D3D12_INPUT_LAYOUT_DESC){ il, 2 };
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+    ID3D12PipelineState *pso;
+    CHECK(ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso));
+
+    D3D12_HEAP_PROPERTIES dh = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 32, 32, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                               D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET };
+    ID3D12Resource *rt;
+    CHECK(ID3D12Device_CreateCommittedResource(dev, &dh, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&rt));
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
+    ID3D12DescriptorHeap *rtvs;
+    CHECK(ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&rtvs));
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(rtvs);
+    ID3D12Device_CreateRenderTargetView(dev, rt, NULL, rtv);
+    // vertices: one never drawn (yellow), then the red and green points; indices 1, 0 drawn with base vertex 1
+    struct { float pos[3]; uint32_t color; } verts[3] = {
+        { { 0, 0.8f, 0 }, 0xff00ffff }, { { -0.5f, 0, 0 }, 0xff0000ff }, { { 0.5f, 0, 0 }, 0xff00ff00 } };
+    uint16_t idx[2] = { 1, 0 };
+    ID3D12Resource *vb = buffer(D3D12_HEAP_TYPE_UPLOAD, sizeof verts, 0, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource *ib = buffer(D3D12_HEAP_TYPE_UPLOAD, 256, 0, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource *readback = buffer(D3D12_HEAP_TYPE_READBACK, 2 * 256 * 32, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (bad > before) return 1;
+    fill(vb, verts, sizeof verts);
+    fill(ib, idx, sizeof idx);
+    D3D12_VERTEX_BUFFER_VIEW vbv = { ID3D12Resource_GetGPUVirtualAddress(vb), sizeof verts, sizeof verts[0] };
+    D3D12_INDEX_BUFFER_VIEW ibv = { ID3D12Resource_GetGPUVirtualAddress(ib), sizeof idx, DXGI_FORMAT_R16_UINT };
+    D3D12_VIEWPORT vp = { 0, 0, 32, 32, 0, 1 };
+    D3D12_RECT sc = { 0, 0, 32, 32 };
+    float black[4] = { 0, 0, 0, 1 }, size[4] = { 0.25f, 0, 0, 0 };
+    for (int pass = 0; pass < 2; pass++) {
+        ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, black, 0, NULL);
+        ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &rtv, FALSE, NULL);
+        ID3D12GraphicsCommandList_SetPipelineState(list, pso);
+        ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rs);
+        ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 4, size, 0);
+        ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+        ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+        ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+        ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
+        if (pass == 0) ID3D12GraphicsCommandList_DrawInstanced(list, 2, 1, 1, 0);
+        else {
+            ID3D12GraphicsCommandList_IASetIndexBuffer(list, &ibv);
+            ID3D12GraphicsCommandList_DrawIndexedInstanced(list, 2, 1, 0, 1, 0);
+        }
+        barrier(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION rb = { readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        rb.PlacedFootprint.Offset = (UINT64)pass * 256 * 32;
+        rb.PlacedFootprint.Footprint = (D3D12_SUBRESOURCE_FOOTPRINT){ DXGI_FORMAT_R8G8B8A8_UNORM, 32, 32, 1, 256 };
+        D3D12_TEXTURE_COPY_LOCATION from = { rt, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &rb, 0, 0, 0, &from, NULL);
+        barrier(rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    if (run()) return 1;
+    uint32_t *px;
+    CHECK(ID3D12Resource_Map(readback, 0, NULL, (void **)&px));
+    int wrong = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        const uint32_t *img = px + pass * 64 * 32;
+        // (x, y) pixel centres in NDC: ((x + 0.5) / 16 - 1, 1 - (y + 0.5) / 16)
+        static const struct { int x, y; uint32_t want; } probe[] = {
+            { 8, 16, 0xff0000ff }, { 5, 13, 0xff0000ff }, { 24, 16, 0xff00ff00 }, { 26, 18, 0xff00ff00 },
+            { 0, 0, 0xffff0000 }, { 16, 16, 0xff000000 }, { 16, 3, 0xff000000 }, { 2, 30, 0xff000000 } };
+        for (size_t k = 0; k < sizeof probe / sizeof probe[0]; k++) {
+            uint32_t got = img[probe[k].y * 64 + probe[k].x];
+            if (got != probe[k].want && wrong++ < 6)
+                printf("geometry (%s): pixel (%d, %d) %08x, want %08x\n", pass ? "indexed" : "plain", probe[k].x, probe[k].y, got, probe[k].want);
+        }
+    }
+    ID3D12Resource_Unmap(readback, 0, NULL);
+    if (wrong) bad++;
+    printf("d3d12 fxc geometry: DXBC vertex -> geometry (squares from points, a cut strip) -> pixel, plain and indexed with a base vertex, %d wrong probes: %s\n",
+           wrong, bad == before ? "ok" : "FAILED");
+    return 0;
+}
+
 int main(void) {
     CHECK(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&dev));
     D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_DIRECT };
@@ -364,5 +468,6 @@ int main(void) {
     if (draw_test()) return 1;
     if (sum_test()) return 1;
     if (append_test()) return 1;
+    if (geometry_test()) return 1;
     return bad ? 1 : 0;
 }

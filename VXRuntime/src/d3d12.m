@@ -349,6 +349,15 @@ typedef struct {
     float bias, bias_slope, bias_clamp;
     int has_depth, has_stencil;
     int depth_enable, depth_write, stencil_enable, stencil_write;
+    // A geometry shader (DXBC; Metal has no such stage): draws run the vertex shader as a kernel over their vertices,
+    // the geometry shader as a kernel over its input primitives, then `render` (its pass-through vertex function and
+    // the pixel shader) draws the triangles it made. The vertex kernels are compiled per index type and strides.
+    id<MTLComputePipelineState> gs_kernel;
+    NSString *gs_vs_source;
+    NSMutableDictionary *gs_vs_kernels;
+    dxil_msl gs;                     // its slots
+    uint32_t gs_in_verts, gs_max_tris, gs_out_regs, gs_vs_out_regs, gs_nattr;
+    struct { uint32_t reg, offset, slot, instanced, step; MTLVertexFormat format; } gs_attr[32];
 } pso12;
 
 typedef struct { d3d_object base; void *data; size_t size; } blob12;
@@ -2599,6 +2608,7 @@ static void pso_destroy(d3d_object *o) {
     p->common_ir_fragment = NULL;
     p->gpu_pipeline = NULL;
     p->compute = nil; p->render = nil; p->depth = nil;
+    p->gs_kernel = nil; p->gs_vs_source = nil; p->gs_vs_kernels = nil;
     release_dev(o);
 }
 static WINAPI HRESULT pso_query(void *this, const GUID *iid, void **out) {
@@ -2619,12 +2629,18 @@ static int root_visibility_allows_shader12(int32_t visibility, int shader_kind) 
     if (visibility == 0) return 1; // D3D12_SHADER_VISIBILITY_ALL
     if (shader_kind == 1) return visibility == 1; // vertex
     if (shader_kind == 0) return visibility == 5; // pixel
+    if (shader_kind == 2) return visibility == 4; // geometry
+    if (shader_kind == 3) return visibility == 2; // hull
+    if (shader_kind == 4) return visibility == 3; // domain
     return 0; // compute shaders use ALL visibility
 }
 
 static uint32_t root_deny_flag_for_shader12(int shader_kind) {
     if (shader_kind == 1) return 0x2u;  // DENY_VERTEX_SHADER_ROOT_ACCESS
     if (shader_kind == 0) return 0x20u; // DENY_PIXEL_SHADER_ROOT_ACCESS
+    if (shader_kind == 2) return 0x10u; // DENY_GEOMETRY_SHADER_ROOT_ACCESS
+    if (shader_kind == 3) return 0x4u;  // DENY_HULL_SHADER_ROOT_ACCESS
+    if (shader_kind == 4) return 0x8u;  // DENY_DOMAIN_SHADER_ROOT_ACCESS
     return 0;                           // D3D12 has no compute-root-access deny flag
 }
 
@@ -2715,6 +2731,7 @@ static MTLCompileOptions *d3d12_shader_compile_options12(dev12 *device, const dx
 
 static int d3d12_is_dxbc_program(const BYTECODE *code);
 static int dxbc_to_msl12(const BYTECODE *code, dxil_msl *out);
+static void dxbc_reflect12(const dxbc_shader *src, dxil_msl *out);
 static WINAPI HRESULT dev_create_compute_pso(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
     int dxbc = d3d12_is_dxbc_program(&desc->cs);
@@ -4434,18 +4451,27 @@ static int dxbc_to_msl12(const BYTECODE *code, dxil_msl *out) {
         pthread_mutex_unlock(&lock);
         return -1;
     }
-    out->stage = s.type;
-    memcpy(out->threads, s.threads, sizeof out->threads);
-    out->nslots = (uint32_t)s.nslots;
-    for (int i = 0; i < s.nslots; i++)
-        out->slots[i] = (dxil_msl_slot){ .cls = s.slots[i].cls, .kind = s.slots[i].kind, .comp = s.slots[i].comp,
-            .has_counter = s.slots[i].counter, .space = 0, .lower = s.slots[i].reg, .count = 1, .stride = s.slots[i].stride,
-            .uav_access = s.slots[i].cls == DXBC_SLOT_UAV ? DXIL_MSL_ACCESS_READ | DXIL_MSL_ACCESS_WRITE : 0 };
+    dxbc_reflect12(&s, out);
+    out->msl = s.msl;
+    s.msl = NULL;
+    dxbc_free(&s);
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+// A DXBC translation's reflection in DXIL's shape (out->msl is left to the caller).
+static void dxbc_reflect12(const dxbc_shader *src, dxil_msl *out) {
+    out->stage = src->type;
+    memcpy(out->threads, src->threads, sizeof out->threads);
+    out->nslots = (uint32_t)src->nslots;
+    for (int i = 0; i < src->nslots; i++)
+        out->slots[i] = (dxil_msl_slot){ .cls = src->slots[i].cls, .kind = src->slots[i].kind, .comp = src->slots[i].comp,
+            .has_counter = src->slots[i].counter, .space = 0, .lower = src->slots[i].reg, .count = 1, .stride = src->slots[i].stride,
+            .uav_access = src->slots[i].cls == DXBC_SLOT_UAV ? DXIL_MSL_ACCESS_READ | DXIL_MSL_ACCESS_WRITE : 0 };
     // signature elements: DXBC component types 1 uint, 2 int, 3 float -> DXIL's 5, 4, 9; the system values engines
     // feed or read as DXIL's semantic kinds (position 3, vertex/instance id 1/2, targets 16, depth 17)
     for (int io = 0; io < 2; io++) {
-        const dxbc_element *e = io ? s.outputs : s.inputs;
-        int n = io ? s.noutputs : s.ninputs;
+        const dxbc_element *e = io ? src->outputs : src->inputs;
+        int n = io ? src->noutputs : src->ninputs;
         dxil_msl_element *dst = io ? out->outputs : out->inputs;
         uint32_t count = 0;
         for (int i = 0; i < n && count < 32; i++) {
@@ -4461,11 +4487,6 @@ static int dxbc_to_msl12(const BYTECODE *code, dxil_msl *out) {
         if (io) out->noutputs = count; else out->ninputs = count;
     }
     out->structured = 1;
-    out->msl = s.msl;
-    s.msl = NULL;
-    dxbc_free(&s);
-    pthread_mutex_unlock(&lock);
-    return 0;
 }
 
 static id<MTLFunction> stage_function(dev12 *d, const BYTECODE *code, dxil_msl *out, const char *what,
@@ -4604,9 +4625,70 @@ static int common_vertex_inputs_bound12(const gpu_ir_shader *shader,
     return 1;
 }
 
+// The geometry path of a pipeline (pso12.gs_kernel): the vertex shader's kernel source and its inputs' layout, the
+// geometry kernel, and the pass-through vertex function the render pipeline draws its triangles with.
+static int gs_pipeline12(dev12 *d, pso12 *p, const GFX_PSO_DESC *desc, MTLRenderPipelineDescriptor *rp) {
+    dxbc_shader *vs = calloc(1, sizeof *vs), *gs = calloc(1, sizeof *gs);
+    int ok = 0;
+    NSError *err = nil;
+    id<MTLLibrary> lib = nil;
+    id<MTLFunction> fn = nil;
+    if (!vs || !gs) goto done;
+    if (dxbc_translate_d3d12(desc->vs.code, desc->vs.size, vs) || !vs->msl_kernel) {
+        vx_log("D3D12: vertex shader before a geometry shader: %s", vs->error[0] ? vs->error : "no kernel form");
+        goto done;
+    }
+    if (dxbc_translate_d3d12(desc->gs.code, desc->gs.size, gs) || gs->type != DXBC_GEOMETRY || !gs->msl || !gs->msl_passthrough) {
+        vx_log("D3D12: geometry shader: %s", gs->error[0] ? gs->error : "not a geometry shader");
+        goto done;
+    }
+    dxbc_reflect12(gs, &p->gs);
+    p->gs_in_verts = (uint32_t)gs->gs_in_verts;
+    p->gs_max_tris = (uint32_t)gs->gs_max_tris;
+    p->gs_out_regs = (uint32_t)gs->out_regs;
+    p->gs_vs_out_regs = vs->out_regs ? (uint32_t)vs->out_regs : 1;
+    p->gs_vs_source = @(vs->msl_kernel);
+    p->gs_vs_kernels = [NSMutableDictionary new];
+    lib = [d->mtl newLibraryWithSource:@(gs->msl) options:nil error:&err];
+    fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+    p->gs_kernel = fn ? [d->mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+    if (!p->gs_kernel) { vx_log("D3D12: geometry kernel: %s\n%s", err.localizedDescription.UTF8String, gs->msl); goto done; }
+    lib = [d->mtl newLibraryWithSource:@(gs->msl_passthrough) options:nil error:&err];
+    rp.vertexFunction = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+    rp.vertexDescriptor = nil;
+    if (!rp.vertexFunction) { vx_log("D3D12: geometry pass-through: %s", err.localizedDescription.UTF8String); goto done; }
+    // the input layout onto the vertex kernel's stage-input attributes (its input registers)
+    uint32_t running[16] = { 0 };
+    const INPUT_ELEMENT *el = desc->input.elements;
+    for (uint32_t i = 0; i < desc->input.n; i++) {
+        const INPUT_ELEMENT *e = &el[i];
+        if (e->slot >= 16) continue;
+        uint32_t off = e->offset == 0xFFFFFFFFu ? running[e->slot] : e->offset;
+        running[e->slot] = off + d3d12_vertex_format_size12(e->format);
+        for (int k = 0; k < vs->ninputs; k++) {
+            const dxbc_element *x = &vs->inputs[k];
+            if (x->sysval || strcasecmp(x->semantic, e->name) || x->index != e->index || p->gs_nattr >= 32) continue;
+            if (e->slot >= 12) { vx_log("D3D12: vertex buffer slot %u before a geometry shader is not supported", e->slot); goto done; }
+            p->gs_attr[p->gs_nattr++] = (__typeof__(p->gs_attr[0])){ x->reg, off, e->slot, e->cls == 1, e->step ? e->step : 1,
+                                                                       vertex_format(e->format) };
+        }
+    }
+    ok = 1;
+done:
+    if (vs) dxbc_free(vs);
+    if (gs) dxbc_free(gs);
+    free(vs); free(gs);
+    return ok;
+}
+
 static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
-    if (desc->hs.size || desc->ds.size || desc->gs.size) { vx_log("D3D12: hull, domain and geometry shaders are not done yet"); return E_NOTIMPL; }
+    if (desc->hs.size || desc->ds.size) { vx_log("D3D12: hull and domain shaders are not done yet"); return E_NOTIMPL; }
+    if (desc->gs.size && (!d3d12_is_dxbc_program(&desc->gs) || !d3d12_is_dxbc_program(&desc->vs))) {
+        vx_log("D3D12: geometry shaders are done for DXBC (fxc) only so far");
+        return E_NOTIMPL;
+    }
+    if (desc->gs.size && desc->so.n) { vx_log("D3D12: stream output is not done yet"); return E_NOTIMPL; }
     if (desc->nrt > 8) return E_INVALIDARG;
     if (desc->raster.conservative < 0 || desc->raster.conservative > 1) return E_INVALIDARG;
     if (desc->raster.forced_samples != 0 && desc->raster.forced_samples != 1 &&
@@ -4730,7 +4812,12 @@ static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *de
         d3d_release(&p->base);
         return E_INVALIDARG;
     }
-    rp.vertexDescriptor = vd;
+    if (desc->gs.size) {
+        if (!gs_pipeline12(d, p, desc, rp) || !shader_root_signature_valid12(d, &p->gs, desc->root)) {
+            d3d_release(&p->base);
+            return E_INVALIDARG;
+        }
+    } else rp.vertexDescriptor = vd;
     for (uint32_t i = 0; i < desc->nrt && i < 8; i++) {
         uint32_t bpp;
         MTLPixelFormat f = d3d_mtl_format(desc->rtv_formats[i], &bpp);
@@ -4767,6 +4854,7 @@ static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *de
     rp.alphaToCoverageEnabled = desc->blend.a2c != 0;
     // D3D12_PRIMITIVE_TOPOLOGY_TYPE: 1 point, 2 line, 3 triangle
     rp.inputPrimitiveTopology = desc->topology_type == 1 ? MTLPrimitiveTopologyClassPoint : desc->topology_type == 2 ? MTLPrimitiveTopologyClassLine : MTLPrimitiveTopologyClassTriangle;
+    if (desc->gs.size) rp.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;   // (the geometry kernel's triangles)
     NSError *err = nil;
     p->render = [d->mtl newRenderPipelineStateWithDescriptor:rp error:&err];
     if (!p->render) { vx_log("D3D12: graphics pipeline: %s", err.localizedDescription.UTF8String); d3d_release(&p->base); return E_INVALIDARG; }
@@ -6731,6 +6819,7 @@ typedef struct {
     res12 *resource[9];              // their API resources, retained by the recorded target commands
     int changed;
     MTLPrimitiveType prim;
+    uint32_t topology;               // the D3D_PRIMITIVE_TOPOLOGY (geometry draws read adjacency and strips from it)
     VBV vb[16];
     IBV ib;
     VIEWPORT vp[10];
@@ -7405,6 +7494,40 @@ static uint32_t gpu_ir_topology_from_metal12(MTLPrimitiveType primitive) {
     }
 }
 
+// The fixed-function state of a draw: pipeline, depth/stencil, rasterizer, blend color, viewports and scissors.
+static void encode_render_state12(id<MTLRenderCommandEncoder> re, pso12 *api_pipeline, gfx_state *g, const float *blend_constants) {
+    [re setRenderPipelineState:api_pipeline->render];
+    [re setDepthStencilState:api_pipeline->depth];
+    [re setCullMode:api_pipeline->cull];
+    [re setFrontFacingWinding:api_pipeline->winding];
+    [re setTriangleFillMode:api_pipeline->fill];
+    [re setDepthClipMode:api_pipeline->clip];
+    [re setDepthBias:api_pipeline->bias slopeScale:api_pipeline->bias_slope clamp:api_pipeline->bias_clamp];
+    [re setStencilReferenceValue:g->stencil_ref];
+    [re setBlendColorRed:blend_constants[0] green:blend_constants[1]
+                    blue:blend_constants[2] alpha:blend_constants[3]];
+    if (g->nvp) {
+        MTLViewport viewports[10];
+        for (uint32_t k = 0; k < g->nvp; k++)
+            viewports[k] = (MTLViewport){ g->vp[k].x, g->vp[k].y, g->vp[k].w, g->vp[k].h,
+                                          g->vp[k].min_depth, g->vp[k].max_depth };
+        [re setViewports:viewports count:g->nvp];
+    }
+    {
+        int32_t width = g->sc[15].right, height = g->sc[15].bottom;
+        uint32_t count = g->nsc ? (g->nsc > 15 ? 15 : g->nsc) : 0;
+        MTLScissorRect scissors[16];
+        for (uint32_t k = 0; k < count; k++) {
+            int32_t x0 = MAX(0, g->sc[k].left), y0 = MAX(0, g->sc[k].top);
+            int32_t x1 = MIN(width, g->sc[k].right), y1 = MIN(height, g->sc[k].bottom);
+            scissors[k] = (MTLScissorRect){ (NSUInteger)x0, (NSUInteger)y0,
+                (NSUInteger)MAX(0, x1 - x0), (NSUInteger)MAX(0, y1 - y0) };
+        }
+        if (!count) { scissors[0] = (MTLScissorRect){ 0, 0, 0, 0 }; count = 1; }
+        [re setScissorRects:scissors count:count];
+    }
+}
+
 static int d3d12_gpu_ir_prepare_draw12(d3d12_draw_context *context, const gpu_ir_pipeline *pipeline,
                                       const gpu_ir_draw_info *draw, uint32_t topology,
                                       const gpu_ir_resource_access *accesses,
@@ -7438,37 +7561,8 @@ static int d3d12_gpu_ir_prepare_draw12(d3d12_draw_context *context, const gpu_ir
     heap12 *heap = context->resource_heap, *sheap = context->sampler_heap;
     scratch *sc = context->scratch_buffer;
 
-    [*re setRenderPipelineState:api_pipeline->render];
-    [*re setDepthStencilState:api_pipeline->depth];
-    [*re setCullMode:api_pipeline->cull];
-    [*re setFrontFacingWinding:api_pipeline->winding];
-    [*re setTriangleFillMode:api_pipeline->fill];
-    [*re setDepthClipMode:api_pipeline->clip];
-    [*re setDepthBias:api_pipeline->bias slopeScale:api_pipeline->bias_slope clamp:api_pipeline->bias_clamp];
-    [*re setStencilReferenceValue:g->stencil_ref];
     const float *blend_constants = draw && draw->has_blend_constants ? draw->blend_constants : g->blend;
-    [*re setBlendColorRed:blend_constants[0] green:blend_constants[1]
-                     blue:blend_constants[2] alpha:blend_constants[3]];
-    if (g->nvp) {
-        MTLViewport viewports[10];
-        for (uint32_t k = 0; k < g->nvp; k++)
-            viewports[k] = (MTLViewport){ g->vp[k].x, g->vp[k].y, g->vp[k].w, g->vp[k].h,
-                                          g->vp[k].min_depth, g->vp[k].max_depth };
-        [*re setViewports:viewports count:g->nvp];
-    }
-    {
-        int32_t width = g->sc[15].right, height = g->sc[15].bottom;
-        uint32_t count = g->nsc ? (g->nsc > 15 ? 15 : g->nsc) : 0;
-        MTLScissorRect scissors[16];
-        for (uint32_t k = 0; k < count; k++) {
-            int32_t x0 = MAX(0, g->sc[k].left), y0 = MAX(0, g->sc[k].top);
-            int32_t x1 = MIN(width, g->sc[k].right), y1 = MIN(height, g->sc[k].bottom);
-            scissors[k] = (MTLScissorRect){ (NSUInteger)x0, (NSUInteger)y0,
-                (NSUInteger)MAX(0, x1 - x0), (NSUInteger)MAX(0, y1 - y0) };
-        }
-        if (!count) { scissors[0] = (MTLScissorRect){ 0, 0, 0, 0 }; count = 1; }
-        [*re setScissorRects:scissors count:count];
-    }
+    encode_render_state12(*re, api_pipeline, g, blend_constants);
     for (uint32_t k = 0; k < 16; k++) {
         if (draw && draw->vertex_buffers_captured) {
             const gpu_ir_vertex_buffer_binding *vertex = NULL;
@@ -7504,6 +7598,162 @@ static int d3d12_gpu_ir_prepare_draw12(d3d12_draw_context *context, const gpu_ir
     *primitive_out = primitive;
     *encoder_out = *re;
     return GPU_IR_OK;
+}
+
+// ---- draws with a geometry shader ------------------------------------------------------------------------------------
+//
+// The vertex shader runs as a kernel over the draw's vertices (Metal fetches them through a stage-input descriptor
+// made from the input layout, indexed draws included), the geometry shader as a kernel over its input primitives, and
+// the triangles it made are drawn with its pass-through vertex function and the pixel shader (as in d3d11_draw.m).
+enum { GS12_VB_BASE = 14 };                    // vertex buffer slot s at Metal buffer 14 + s (DXBC_GS_* above them)
+
+// What a vertex format delivers to a shader: 0 floats (also normalized integers), 1 signed integers, 2 unsigned.
+static int gs12_format_kind(MTLVertexFormat f) {
+    switch (f) {
+    case MTLVertexFormatChar: case MTLVertexFormatChar2: case MTLVertexFormatChar3: case MTLVertexFormatChar4:
+    case MTLVertexFormatShort: case MTLVertexFormatShort2: case MTLVertexFormatShort3: case MTLVertexFormatShort4:
+    case MTLVertexFormatInt: case MTLVertexFormatInt2: case MTLVertexFormatInt3: case MTLVertexFormatInt4: return 1;
+    case MTLVertexFormatUChar: case MTLVertexFormatUChar2: case MTLVertexFormatUChar3: case MTLVertexFormatUChar4:
+    case MTLVertexFormatUShort: case MTLVertexFormatUShort2: case MTLVertexFormatUShort3: case MTLVertexFormatUShort4:
+    case MTLVertexFormatUInt: case MTLVertexFormatUInt2: case MTLVertexFormatUInt3: case MTLVertexFormatUInt4: return 2;
+    default: return 0;
+    }
+}
+// The vertex kernel for an index type (0 none, 1 16-bit, 2 32-bit) and the bound vertex strides.
+static id<MTLComputePipelineState> gs12_vertex_kernel(dev12 *d, pso12 *p, gfx_state *g, int index_type) {
+    NSMutableString *key = [NSMutableString stringWithFormat:@"%d/", index_type];
+    for (uint32_t i = 0; i < p->gs_nattr; i++) [key appendFormat:@"%u,", g->vb[p->gs_attr[i].slot].stride];
+    pthread_mutex_lock(&d->lock);
+    id cached = p->gs_vs_kernels[key];
+    pthread_mutex_unlock(&d->lock);
+    if (cached) return cached == [NSNull null] ? nil : cached;
+    // Compute stage input converts formats only within a kind: the kernel's inputs are declared as the layout's
+    // formats deliver them, as the input assembler would hand their bits over.
+    NSMutableString *source = [p->gs_vs_source mutableCopy];
+    MTLStageInputOutputDescriptor *sd = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+    for (uint32_t i = 0; i < p->gs_nattr; i++) {
+        uint32_t reg = p->gs_attr[i].reg, slot = p->gs_attr[i].slot;
+        int kind = gs12_format_kind(p->gs_attr[i].format);
+        const char *want = kind == 1 ? "int4" : kind == 2 ? "uint4" : "float4";
+        for (int k = 0; k < 3; k++) {
+            static const char *const types[3] = { "float4", "int4", "uint4" };
+            NSString *from = [NSString stringWithFormat:@"    %s v%u [[attribute(%u)]];", types[k], reg, reg];
+            NSString *to = [NSString stringWithFormat:@"    %s v%u [[attribute(%u)]];", want, reg, reg];
+            [source replaceOccurrencesOfString:from withString:to options:0 range:NSMakeRange(0, source.length)];
+        }
+        sd.attributes[reg].format = (MTLAttributeFormat)p->gs_attr[i].format;   // (the same numbering)
+        sd.attributes[reg].offset = p->gs_attr[i].offset;
+        sd.attributes[reg].bufferIndex = GS12_VB_BASE + slot;
+        MTLBufferLayoutDescriptor *layout = sd.layouts[GS12_VB_BASE + slot];
+        uint32_t stride = g->vb[slot].stride;
+        if (!stride) { layout.stepFunction = MTLStepFunctionConstant; layout.stepRate = 0; layout.stride = 16; }
+        else {
+            layout.stride = stride;
+            layout.stepFunction = p->gs_attr[i].instanced ? MTLStepFunctionThreadPositionInGridY :
+                                  index_type ? MTLStepFunctionThreadPositionInGridXIndexed : MTLStepFunctionThreadPositionInGridX;
+            layout.stepRate = p->gs_attr[i].instanced ? p->gs_attr[i].step : 1;
+        }
+    }
+    if (index_type) { sd.indexType = index_type == 2 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16; sd.indexBufferIndex = DXBC_GS_INDEX; }
+    NSError *err = nil;
+    id<MTLLibrary> lib = [d->mtl newLibraryWithSource:source options:nil error:&err];
+    id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+    id<MTLComputePipelineState> kernel = nil;
+    if (fn) {
+        MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
+        cd.computeFunction = fn;
+        cd.stageInputDescriptor = sd;
+        kernel = [d->mtl newComputePipelineStateWithDescriptor:cd options:0 reflection:nil error:&err];
+    }
+    if (!kernel) vx_log("D3D12: vertex kernel before a geometry shader: %s", err.localizedDescription.UTF8String);
+    pthread_mutex_lock(&d->lock);
+    p->gs_vs_kernels[key] = kernel ? (id)kernel : (id)[NSNull null];   // (failures too: no retry per draw)
+    pthread_mutex_unlock(&d->lock);
+    return kernel;
+}
+static void gs12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTLCommandBuffer> cb,
+                      id<MTLComputeCommandEncoder> __strong *ce, id<MTLBlitCommandEncoder> __strong *be,
+                      id<MTLRenderCommandEncoder> __strong *re, NSArray *resident, heap12 *heap, heap12 *sheap,
+                      root_binding *graphics, scratch *sc) {
+    int indexed = c->op == C_DRAW_INDEXED;
+    uint32_t count = c->a, instances = c->b, start = c->c;
+    uint32_t start_instance = indexed ? (uint32_t)c->off2 : (uint32_t)c->off;
+    int32_t base_vertex = indexed ? (int32_t)(int64_t)c->off : 0;
+    uint32_t n = p->gs_in_verts, step, prims;
+    switch (g->topology) {                     // primitives from the input assembler's topology
+    case 1: case 2: case 4: case 10: case 12: step = n; prims = count / n; break;     // lists (with adjacency)
+    case 3: case 5: step = 1; prims = count >= n ? count - (n - 1) : 0; break;         // strips
+    default: vx_log("D3D12: topology %u before a geometry shader is not supported", g->topology); return;
+    }
+    if (!prims || !instances || (indexed && !g->ib.va)) return;
+    int index_type = indexed ? (g->ib.format == 42 ? 2 : 1) : 0;
+    id<MTLComputePipelineState> vk = gs12_vertex_kernel(d, p, g, index_type);
+    if (!vk) return;
+    uint32_t vsn = p->gs_vs_out_regs, gsn = p->gs_out_regs, tris = p->gs_max_tris;
+    NSUInteger lens[3] = { (NSUInteger)count * instances * vsn * 16, (NSUInteger)prims * instances * tris * 3 * gsn * 16,
+                           (NSUInteger)prims * instances * 4 };
+    id<MTLBuffer> bufs[3];
+    for (int k = 0; k < 3; k++)
+        if (!(bufs[k] = [d->mtl newBufferWithLength:MAX(lens[k], (NSUInteger)16) options:MTLResourceStorageModePrivate])) return;
+    id<MTLBuffer> vs_out = bufs[0], gs_out = bufs[1], counts = bufs[2];
+
+    if (*be) { [*be endEncoding]; *be = nil; }
+    close_pass(d, g, cb, re);
+    if (!*ce) {
+        *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        use_resident_compute12(*ce, resident, heap);
+    }
+    // the vertex kernel: thread (x, y) is vertex x of instance y
+    [*ce setComputePipelineState:vk];
+    for (uint32_t i = 0; i < p->gs_nattr; i++) {
+        uint32_t slot = p->gs_attr[i].slot;
+        uint64_t offset = 0;
+        id<MTLBuffer> buffer = g->vb[slot].va ? buffer_at(d, g->vb[slot].va, &offset) : nil;
+        if (!buffer) continue;
+        int64_t first = p->gs_attr[i].instanced ? (int64_t)(start_instance / p->gs_attr[i].step) : indexed ? base_vertex : (int64_t)start;
+        int64_t at = (int64_t)offset + (int64_t)g->vb[slot].stride * first;
+        [*ce setBuffer:buffer offset:(NSUInteger)(at < 0 ? 0 : at) atIndex:GS12_VB_BASE + slot];
+    }
+    if (indexed) {
+        uint64_t offset = 0;
+        id<MTLBuffer> ib = buffer_at(d, g->ib.va, &offset);
+        if (!ib) return;
+        [*ce setBuffer:ib offset:(NSUInteger)(offset + (uint64_t)start * (index_type == 2 ? 4 : 2)) atIndex:DXBC_GS_INDEX];
+    } else [*ce setBuffer:vs_out offset:0 atIndex:DXBC_GS_INDEX];   // (not read)
+    uint64_t root[64 + 2];
+    uint32_t words;
+    stage_root(d, &p->vs, graphics, heap, sheap, sc, root, &words);
+    [*ce setBytes:root length:8 * words atIndex:0];
+    uint32_t vp[8] = { count, indexed ? 0 : start, start_instance, vsn, (uint32_t)index_type, 0, (uint32_t)base_vertex, 0 };
+    [*ce setBytes:vp length:sizeof vp atIndex:DXBC_VS_PARAMS];
+    [*ce setBuffer:vs_out offset:0 atIndex:DXBC_GS_OUT];
+    [*ce dispatchThreads:MTLSizeMake(count, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, vk.maxTotalThreadsPerThreadgroup), 1, 1)];
+    // the geometry kernel: thread (x, y) is input primitive x of instance y
+    [*ce setComputePipelineState:p->gs_kernel];
+    stage_root(d, &p->gs, graphics, heap, sheap, sc, root, &words);
+    [*ce setBytes:root length:8 * words atIndex:0];
+    uint32_t gp[4] = { prims, step, count, vsn };
+    [*ce setBytes:gp length:sizeof gp atIndex:DXBC_GS_PARAMS];
+    [*ce setBuffer:vs_out offset:0 atIndex:DXBC_GS_IN];
+    [*ce setBuffer:gs_out offset:0 atIndex:DXBC_GS_OUT];
+    [*ce setBuffer:counts offset:0 atIndex:DXBC_GS_COUNTS];
+    if (sc->buf) [*ce useResource:sc->buf usage:MTLResourceUsageRead];
+    [*ce dispatchThreads:MTLSizeMake(prims, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, p->gs_kernel.maxTotalThreadsPerThreadgroup), 1, 1)];
+    // the triangles
+    if (!open_render_pass12(d, g, cb, ce, be, re, resident, heap)) { vx_log("D3D12: could not open a render pass for a geometry draw"); return; }
+    encode_render_state12(*re, p, g, g->blend);
+    [*re setVertexBuffer:gs_out offset:0 atIndex:0];
+    [*re setVertexBuffer:counts offset:0 atIndex:1];
+    stage_root(d, &p->ps, graphics, heap, sheap, sc, root, &words);
+    [*re setFragmentBytes:root length:8 * words atIndex:0];
+    if (sc->buf) [*re useResource:sc->buf usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    gpu_ir_access_list12 accesses = { 0 };
+    pthread_mutex_lock(&d->lock);
+    int access_rc = gpu_ir_collect_draw_accesses12(d, p, g, graphics, heap, sheap, &accesses, indexed);
+    pthread_mutex_unlock(&d->lock);
+    if (access_rc == GPU_IR_OK) d3d12_use_render_accesses12(*re, accesses.values, accesses.count);
+    gpu_ir_access_list_release12(&accesses);
+    [*re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)prims * instances * tris * 3];
 }
 
 static int d3d12_gpu_ir_draw(void *opaque, const gpu_ir_pipeline *pipeline, const gpu_ir_draw_info *draw,
@@ -8142,8 +8392,9 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
         case C_TOPOLOGY: {
             // D3D_PRIMITIVE_TOPOLOGY: 1 points, 2 lines, 3 line strip, 4 triangles, 5 triangle strip
             uint32_t t = c->a;
+            g->topology = t;
             g->prim = t == 1 ? MTLPrimitiveTypePoint : t == 2 ? MTLPrimitiveTypeLine : t == 3 ? MTLPrimitiveTypeLineStrip : t == 5 ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle;
-            if (t > 5) vx_log("D3D12: primitive topology %u is not supported", t);
+            if (t > 5 && !(pso && pso->gs_kernel)) vx_log("D3D12: primitive topology %u is not supported", t);
             break;
         }
         case C_VB: for (uint32_t k = 0; k < c->b && c->a + k < 16; k++) memcpy(&g->vb[c->a + k], (VBV *)c->values + k, sizeof(VBV)); break;
@@ -8287,6 +8538,10 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
         }
         case C_DRAW: case C_DRAW_INDEXED: {
             if (!pso || !pso->render) { vx_log("D3D12: a draw without a graphics pipeline state"); break; }
+            if (pso->gs_kernel) {
+                gs12_draw(d, g, pso, c, cb, &ce, &be, &re, resident, heap, sheap, graphics, sc);
+                break;
+            }
             if (!open_render_pass12(d, g, cb, &ce, &be, &re, resident, heap)) {
                 vx_log("D3D12: could not open a render pass for a draw");
                 break;
@@ -8398,6 +8653,11 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             command_signature12 *sig = c->obj;
             res12 *arg_buffer = c->obj2, *count_buffer = c->obj3;
             if (!sig) { vx_log("D3D12: ExecuteIndirect has no command signature"); break; }
+            if (sig->gfx && pso && pso->gs_kernel) {
+                static int told;
+                if (!told++) vx_log("D3D12: ExecuteIndirect draws with a geometry shader are not done yet; skipped");
+                break;
+            }
             root_binding *indirect_root = sig->gfx ? graphics : compute;
             uint32_t indirect_count = c->a;
             if (!sig || !arg_buffer || !arg_buffer->buffer ||

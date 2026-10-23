@@ -75,7 +75,7 @@ typedef struct { uint32_t sizes[48]; uint64_t counters[8]; } dxbc_aux;
 
 // Translates a DXBC container. Returns 0 and fills *out, or -1 with out->error set.
 int  dxbc_translate(const void *code, size_t size, dxbc_shader *out);
-// The same for a Direct3D 12 pipeline (vertex, pixel and compute shaders): resources through out->slots.
+// The same for a Direct3D 12 pipeline (vertex, pixel, geometry and compute shaders): resources through out->slots.
 int  dxbc_translate_d3d12(const void *code, size_t size, dxbc_shader *out);
 void dxbc_free(dxbc_shader *s);
 // The input signature of a container (for input layouts), without translating it.

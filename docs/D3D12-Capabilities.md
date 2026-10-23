@@ -575,8 +575,13 @@ MSL as for Direct3D 11 but takes the resources from the root argument buffer DXI
 and reports them in a `dxil_msl` reflection, so root signatures, descriptor tables, root constants and descriptors,
 static samplers and validation treat both kinds alike. Textures, samplers and typed UAVs are read from the descriptors'
 Metal resource ids, buffers from their GPU addresses (sizes for bounds and `GetDimensions`), append/consume counters
-from the descriptor's counter address. Not yet: geometry, hull and domain stages, a static sample mask with a DXBC pixel
-shader, non-default SRV component mappings, and shader model 5.1 register spaces and resource arrays.
+from the descriptor's counter address. Geometry shaders run as on Direct3D 11 (Metal has no such stage): the vertex
+shader as a kernel over the draw's vertices (a stage-input descriptor from the input layout, compiled per index type and
+vertex strides), the geometry shader as a kernel over its input primitives writing triangles, then the pipeline's render
+state draws those with the geometry shader's pass-through vertex function and the pixel shader; their resources come
+through the root signature by `GEOMETRY` visibility. Not yet: DXIL geometry shaders, hull and domain stages, stream
+output, geometry draws through ExecuteIndirect, a static sample mask with a DXBC pixel shader, non-default SRV component
+mappings, and shader model 5.1 register spaces and resource arrays.
 `build/dxbc2msl -d3d12` and `build/dxbcscan -12` check the translation (223 DXBC shaders from Half-Life: Alyx's and
 SteamVR's DLLs translate and compile); `tests/d3d12_fxc.c` draws and dispatches with the D3D11 test shaders.
 

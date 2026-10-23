@@ -570,7 +570,7 @@ build/d3d12_engine.exe: tests/d3d12_engine.c tests/shaders12/tri_vs.dxil tests/s
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d12 -ldxgi
 
-build/d3d12_fxc.exe: tests/d3d12_fxc.c tests/shaders/tex_vs.dxbc tests/shaders/tex_ps.dxbc tests/shaders/sum_cs.dxbc tests/shaders/append_cs.dxbc
+build/d3d12_fxc.exe: tests/d3d12_fxc.c tests/shaders/tex_vs.dxbc tests/shaders/tex_ps.dxbc tests/shaders/sum_cs.dxbc tests/shaders/append_cs.dxbc tests/shaders/color_vs.dxbc tests/shaders/quad_gs.dxbc tests/shaders/color_ps.dxbc
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d12
 
