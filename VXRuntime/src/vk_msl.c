@@ -161,7 +161,7 @@ typedef struct {
 
 // Where a pointer value points: a local/interface variable (an MSL lvalue), a byte offset into a buffer, or an
 // element of a descriptor array.
-enum { P_LVALUE = 1, P_BUFFER, P_HANDLE, P_IMAGE_TEXEL };
+enum { P_LVALUE = 1, P_BUFFER, P_HANDLE, P_IMAGE_TEXEL, P_OPAQUE };   // (P_OPAQUE: a local variable holding an image or sampler)
 typedef struct {
     int kind;
     uint32_t pointee;          // type id
@@ -193,6 +193,7 @@ typedef struct {
     uint8_t used, written;     // variables
     uint8_t is_phi;
     uint8_t depthtex;          // image values: their texture is declared as a depth texture
+    uint8_t odecl;             // access chains: their offset variable is declared (an inlined function runs it again)
 } ent;
 
 typedef struct {
@@ -205,7 +206,7 @@ typedef struct {
 
 typedef struct { int kind; uint32_t merge, cont, header; int brk_flag; } construct;
 typedef struct { uint32_t set, word, words; char *decl; } dmember;
-enum { C_LOOP = 1, C_SWITCH, C_SELECTION };
+enum { C_LOOP = 1, C_SWITCH, C_SELECTION, C_FUNC };
 
 typedef struct {
     const uint32_t *w;
@@ -240,6 +241,13 @@ typedef struct {
     dmember *dm;
     uint32_t dm_count, dm_cap;
     uint32_t cur_op;
+    uint32_t *fparams;         // function parameters, in order (a function's ent: mbase first, mcount of them)
+    uint32_t fparam_count, fparam_cap;
+    uint32_t entry_block;      // the entry function's first block
+    uint8_t vkernel, gs;       // a vertex shader as a kernel; a geometry shader as a kernel
+    uint32_t gs_in_n, gs_maxt, gs_os, gs_loc, gs_clip, gs_out_prim;   // geometry: vertices in, triangles out per run, slots
+    uint32_t gs_invocations;
+    sb gs_pack;                // geometry: the statements that pack the outputs into spvCur
 } T;
 
 static void fail(T *t, int rc, const char *f, ...) {
@@ -687,14 +695,30 @@ static int parse(T *t) {
         case OpFunction:
             if (argc < 4 || w[1] >= t->bound) { fail(t, VKMSL_INVALID, "function"); return 0; }
             t->e[w[1]].kind = K_FUNC; t->e[w[1]].w = w; t->e[w[1]].n = (uint16_t)argc;
+            t->e[w[1]].block = -1;
+            t->e[w[1]].mbase = t->fparam_count;
+            t->e[w[1]].mcount = 0;
             cur_func = w[1];
-            in_entry = cur_func == t->entry;
+            in_entry = 1;   // (the blocks of every function: calls are inlined)
+            break;
+        case OpFunctionParameter:
+            if (cur_func && argc >= 2) {
+                if (t->fparam_count == t->fparam_cap) {
+                    t->fparam_cap = t->fparam_cap ? t->fparam_cap * 2 : 64;
+                    t->fparams = realloc(t->fparams, t->fparam_cap * sizeof *t->fparams);
+                }
+                t->fparams[t->fparam_count++] = w[1];
+                t->e[cur_func].mcount++;
+            }
             break;
         case OpFunctionEnd: cur_func = 0; in_entry = 0; cur_block = -1; break;
         case OpLabel:
             if (!argc || w[0] >= t->bound) { fail(t, VKMSL_INVALID, "label"); return 0; }
             t->e[w[0]].kind = K_LABEL;
-            if (in_entry) cur_block = add_block(t, w[0], pos + n);
+            if (in_entry) {
+                cur_block = add_block(t, w[0], pos + n);
+                if (cur_func && t->e[cur_func].block < 0) t->e[cur_func].block = cur_block;
+            }
             break;
         case OpSelectionMerge: case OpLoopMerge:
             if (in_entry && cur_block >= 0) {
@@ -737,6 +761,8 @@ static int parse(T *t) {
         pos += n;
     }
     if (!t->entry) { fail(t, VKMSL_INVALID, "no entry point for stage %u", t->opt->stage); return 0; }
+    if (t->e[t->entry].block < 0) { fail(t, VKMSL_INVALID, "entry point without blocks"); return 0; }
+    t->entry_block = (uint32_t)t->e[t->entry].block;
     t->model = want;
     // Second pass: decorations and execution modes (they may name ids defined later).
     for (size_t pos = 5; pos < t->count;) {
@@ -761,6 +787,16 @@ static int parse(T *t) {
             case 17: if (argc >= 5) { t->local_size[0] = w[2]; t->local_size[1] = w[3]; t->local_size[2] = w[4]; } break;
             case 38: if (argc >= 5) { t->local_size_id[0] = w[2]; t->local_size_id[1] = w[3]; t->local_size_id[2] = w[4];
                                       t->has_local_size_id = 1; } break;
+            case 0: t->gs_invocations = w[2]; break;
+            case 19: t->gs_in_n = 1; break;
+            case 20: t->gs_in_n = 2; break;
+            case 21: t->gs_in_n = 4; break;
+            case 22: t->gs_in_n = 3; break;
+            case 23: t->gs_in_n = 6; break;
+            case 26: t->gs_maxt = w[2]; break;   // (OutputVertices: made triangles below)
+            case 27: t->gs_out_prim = 1; break;
+            case 28: t->gs_out_prim = 2; break;
+            case 29: t->gs_out_prim = 3; break;
             case 8: t->origin_lower_left = 1; break;
             case 9: t->early_tests = 1; break;
             case 12: if (!t->depth_mode) t->depth_mode = 1; break;
@@ -1164,6 +1200,48 @@ static char *widen4(T *t, uint32_t type, const char *v) {
     return xprintf("%s(%s, %s, %s, %s)", vec4_of(t, type), v, z, z, z);
 }
 
+// A value as a float4 slot (integers keep their bits), and back.
+static char *to_slot(T *t, uint32_t type, const char *v) {
+    uint32_t s = scalar_of(t, type);
+    char *w = widen4(t, type, v);
+    if (is_float(t, s)) { char *x = xprintf("float4(%s)", w); free(w); return x; }
+    char *x = is_bool(t, s) ? xprintf("float4(%s)", w) : xprintf("as_type<float4>(%s)", w);
+    free(w);
+    return x;
+}
+static char *from_slot(T *t, uint32_t type, const char *slot) {
+    uint32_t s = scalar_of(t, type), n = vec_size(t, type);
+    if (is_float(t, s)) return xprintf("%s(%s%s)", tname(t, type), slot, swizzle_n(n));
+    if (is_bool(t, s)) return xprintf("%s((%s)%s != 0.0f)", tname(t, type), slot, swizzle_n(n));
+    return xprintf("%s(as_type<%s>(%s)%s)", tname(t, type), vec4_of(t, type), slot, swizzle_n(n));
+}
+// Packs (dir 0) or unpacks (dir 1) a user varying's leaves at their locations: slot base + location.
+static void slot_leaves(T *t, uint32_t type, const char *path, uint32_t *loc, sb *out, const char *base, int dir, uint32_t *max_loc) {
+    int op = type_op(t, type);
+    if (op == OpTypeMatrix || op == OpTypeArray) {
+        uint32_t n = op == OpTypeMatrix ? tw(t, type)[2] : array_length(t, type), elem = tw(t, type)[1];
+        for (uint32_t i = 0; i < n; i++) { char *p = xprintf("%s[%u]", path, i); slot_leaves(t, elem, p, loc, out, base, dir, max_loc); free(p); }
+        return;
+    }
+    if (op == OpTypeStruct) {
+        for (uint32_t i = 0; i + 1 < E(t, type)->n; i++) {
+            const decos *m = mdeco(t, type, i);
+            if (m->deco & D_LOCATION) *loc = m->location;
+            char *p = xprintf("%s.m%u", path, i);
+            slot_leaves(t, tw(t, type)[i + 1], p, loc, out, base, dir, max_loc);
+            free(p);
+        }
+        return;
+    }
+    uint32_t L = (*loc)++;
+    if (L + 1 > *max_loc) *max_loc = L + 1;
+    char *slot = xprintf("%s[%u]", base, 1 + L);
+    char *x = dir == 0 ? to_slot(t, type, path) : from_slot(t, type, slot);
+    if (dir == 0) sb_printf(out, "    %s = %s;\n", slot, x);
+    else sb_printf(out, "    %s = %s;\n", path, x);
+    free(x); free(slot);
+}
+
 // Walks a user varying's type, giving each scalar/vector leaf its location: matrices take a location per column,
 // arrays per element, structs per member (a member's own Location wins).
 typedef struct { sb *decl; sb *init; int input; uint32_t deco, index; } leafctx;
@@ -1392,7 +1470,7 @@ static void access_chain(T *t, const uint32_t *w, uint32_t n) {
     else if (!dyn.p && konst == 0) { /* same offset */ }
     else {
         char *name = xprintf("_%uo", id);
-        sb_printf(&t->vars, "    uint %s;\n", name);
+        if (!E(t, id)->odecl) { E(t, id)->odecl = 1; sb_printf(&t->vars, "    uint %s;\n", name); }
         EMIT("%s = %s + %uu%s;\n", name, p->offset, konst, dyn.p ? dyn.p : "");
         free(p->offset);
         p->offset = name;
@@ -1415,6 +1493,12 @@ static void emit_load(T *t, const uint32_t *w) {
     case P_LVALUE:
         EMIT("%s = %s;\n", dst(t, id), p->lvalue);
         return;
+    case P_OPAQUE:
+        e->expr = xstrdup(p->lvalue ? p->lvalue : "");
+        e->aux = p->base ? xstrdup(p->base) : NULL;
+        e->depthtex = p->depth;
+        if (!p->lvalue) fail(t, VKMSL_UNSUPPORTED, "load of local image/sampler %u before any store", p->var);
+        return;
     case P_BUFFER: {
         const char *d = dst(t, id);
         buffer_load_into(t, p, type, d, p->offset, p->align, p->matrix_stride, p->row_major, p->column_of_row_major);
@@ -1429,6 +1513,14 @@ static void emit_store(T *t, const uint32_t *w) {
     pinfo *p = E(t, w[0])->ptr;
     if (!p) { fail(t, VKMSL_UNSUPPORTED, "store to %u (not a known pointer)", w[0]); return; }
     if (p->var) E(t, p->var)->written |= 0x80;
+    if (p->kind == P_OPAQUE) {
+        ent *v = E(t, w[1]);
+        free(p->lvalue); free(p->base);
+        p->lvalue = xstrdup(v->expr ? v->expr : "");
+        p->base = v->aux ? xstrdup(v->aux) : NULL;
+        p->depth = v->depthtex;
+        return;
+    }
     if (p->kind == P_LVALUE) {
         char *whole = xprintf("_%u", p->var);
         if (p->var && E(t, p->var)->kind == K_VAR && !strcmp(p->lvalue, whole)) E(t, p->var)->written = 0xff;
@@ -1980,6 +2072,56 @@ static char *composite_path(T *t, uint32_t type, const uint32_t *idx, uint32_t c
     return p.p ? p.p : xstrdup("");
 }
 
+static void emit_from(T *t, uint32_t label, uint32_t stop);
+static void after_construct(T *t);
+// A call, inlined: arguments into the callee's parameters (pointers alias, values are copied), its body in a
+// do-while that its returns leave, its result in the call's result.
+static void emit_call(T *t, const uint32_t *w, uint32_t n) {
+    ent *f = E(t, w[2]);
+    if (f->kind != K_FUNC || f->block < 0) { fail(t, VKMSL_INVALID, "call of %u", w[2]); return; }
+    for (int i = 0; i < t->depth; i++)
+        if (t->stack[i].kind == C_FUNC && t->stack[i].header == w[2]) { fail(t, VKMSL_INVALID, "recursive call"); return; }
+    if (n - 3 != f->mcount) { fail(t, VKMSL_INVALID, "call with %u arguments for %u parameters", n - 3, f->mcount); return; }
+    for (uint32_t i = 0; i < f->mcount; i++) {
+        uint32_t param = t->fparams[f->mbase + i], arg = w[3 + i];
+        ent *pe = E(t, param), *ae = E(t, arg);
+        if (type_op(t, pe->type) == OpTypePointer) {
+            if (!ae->ptr) { fail(t, VKMSL_UNSUPPORTED, "pointer argument %u", arg); return; }
+            if (pe->ptr) { pinfo *o = pe->ptr; free(o->lvalue); free(o->base); free(o->offset); free(o->coord); free(o->sample); free(o); }
+            pe->ptr = copy_ptr(ae->ptr);
+        } else if (opaque_type(t, pe->type)) {
+            free(pe->expr); free(pe->aux);
+            pe->expr = xstrdup(ae->expr ? ae->expr : "");
+            pe->aux = ae->aux ? xstrdup(ae->aux) : NULL;
+            pe->depthtex = ae->depthtex;
+        } else EMIT("%s = %s;\n", dst(t, param), value(t, arg));
+    }
+    // (the callee's variables with initializers start from them on every call)
+    for (uint32_t b = (uint32_t)f->block; b < t->block_count; b++) {
+        block *bk = &t->blocks[b];
+        if (b > (uint32_t)f->block && E(t, bk->label)->block != (int)b) break;
+        for (size_t pos = bk->first; pos < bk->term;) {
+            uint32_t op = t->w[pos] & 0xffff, nn = t->w[pos] >> 16;
+            if (op == OpVariable && nn > 4) EMIT("_%u = %s;\n", t->w[pos + 2], value(t, t->w[pos + 4]));
+            else if (op != OpVariable && op != OpLine && op != OpNoLine) break;
+            pos += nn;
+        }
+        break;   // (variables are declared in the first block)
+    }
+    if (t->depth >= 63) { fail(t, VKMSL_UNSUPPORTED, "nesting too deep"); return; }
+    int flag = ++t->flag_count;
+    sb_printf(&t->vars, "    bool _rf%d;\n", flag);
+    EMIT("_rf%d = false;\n", flag);
+    t->stack[t->depth++] = (construct){ C_FUNC, w[1], 0, w[2], flag };
+    EMIT("do {\n");
+    t->indent++;
+    emit_from(t, t->blocks[f->block].label, 0);
+    t->indent--;
+    EMIT("} while (false);\n");
+    t->depth--;
+    after_construct(t);
+}
+
 static void emit_insn(T *t, uint32_t op, const uint32_t *w, uint32_t n) {
     t->cur_op = op;
     switch (op) {
@@ -2251,8 +2393,9 @@ static void emit_insn(T *t, uint32_t op, const uint32_t *w, uint32_t n) {
         return;
     case OpIsHelperInvocationEXT: EMIT("%s = simd_is_helper_thread();\n", dst(t, w[1])); return;
     case OpDemoteToHelperInvocation: EMIT("discard_fragment();\n"); t->res->uses_discard = 1; return;
-    case OpFunctionCall: fail(t, VKMSL_UNSUPPORTED, "function calls"); return;
-    case OpEmitVertex: case OpEndPrimitive: fail(t, VKMSL_UNSUPPORTED, "geometry shader output"); return;
+    case OpFunctionCall: emit_call(t, w, n); return;
+    case OpEmitVertex: EMIT("@EMIT@\n"); return;   // (the packing, known once the interface is)
+    case OpEndPrimitive: EMIT("spvStrip = 0u;\n"); return;
     default:
         if ((op >= OpGroupNonUniformElect && op <= OpGroupNonUniformQuadSwap) || op == OpSubgroupBallotKHR ||
             op == OpSubgroupFirstInvocationKHR) { emit_subgroup(t, op, w, n); return; }
@@ -2299,14 +2442,28 @@ static void emit_phis(T *t, uint32_t from, uint32_t to) {
 }
 
 static void emit_from(T *t, uint32_t label, uint32_t stop);
-static void emit_return(T *t) {
-    if (t->model == VKMSL_STAGE_COMPUTE) { EMIT("return;\n"); return; }
-    EMIT("@RET@\n");   // (the output stores, known once the whole body is written)
-}
-
 static int innermost(T *t, int kind) {
     for (int i = t->depth - 1; i >= 0; i--) if (t->stack[i].kind == kind) return i;
     return -1;
+}
+// A return: from an inlined function, out of its do-while (through its loops and switches with its return flag);
+// from the entry point, the stage's outputs and return.
+static void emit_return(T *t) {
+    int F = innermost(t, C_FUNC);
+    if (F >= 0) {
+        int nested = 0;
+        for (int i = F + 1; i < t->depth; i++) nested |= t->stack[i].kind == C_LOOP || t->stack[i].kind == C_SWITCH;
+        if (nested) EMIT("{ _rf%d = true; break; }\n", t->stack[F].brk_flag);
+        else EMIT("break;\n");
+        return;
+    }
+    if (t->model == VKMSL_STAGE_COMPUTE) { EMIT("return;\n"); return; }
+    EMIT("@RET@\n");   // (the output stores, known once the whole body is written)
+}
+// After a loop or switch inside an inlined function: a return from inside it goes on out.
+static void after_construct(T *t) {
+    int F = innermost(t, C_FUNC);
+    if (F >= 0) EMIT("if (_rf%d) break;\n", t->stack[F].brk_flag);
 }
 // A break out of the innermost loop, through any switches inside it (each sets its flag and breaks; the code after
 // that switch breaks on).
@@ -2431,6 +2588,7 @@ static uint32_t emit_terminator(T *t, block *b, uint32_t stop) {
         EMIT("}\n");
         int flag = t->stack[t->depth - 1].brk_flag;
         t->depth--;
+        after_construct(t);
         if (flag) {
             // (cleared as it is acted on, so the switch can run again in an outer loop)
             EMIT("if (_bf%d) {\n", flag);
@@ -2440,7 +2598,13 @@ static uint32_t emit_terminator(T *t, block *b, uint32_t stop) {
         return m;
     }
     case OpReturn: emit_return(t); return 0;
-    case OpReturnValue: fail(t, VKMSL_UNSUPPORTED, "return value from the entry point"); return 0;
+    case OpReturnValue: {
+        int F = innermost(t, C_FUNC);
+        if (F < 0) { fail(t, VKMSL_UNSUPPORTED, "return value from the entry point"); return 0; }
+        EMIT("%s = %s;\n", dst(t, t->stack[F].merge), value(t, w[0]));
+        emit_return(t);
+        return 0;
+    }
     case OpKill: case OpTerminateInvocation:
         t->res->uses_discard = 1;
         EMIT("discard_fragment();\n");
@@ -2470,6 +2634,7 @@ static void emit_from(T *t, uint32_t label, uint32_t stop) {
                 t->indent--;
                 EMIT("}\n");
                 t->depth--;
+                after_construct(t);
                 label = b->merge;
                 continue;
             }
@@ -2494,6 +2659,12 @@ static void setup_variable(T *t, uint32_t var) {
         setup_resource_variable(t, var);
         return;
     case SC_Input: case SC_Output: case SC_Private: case SC_Function: case SC_Workgroup: {
+        if (opaque_type(t, pointee)) {
+            // (a local image/sampler variable: its stores give the expression its loads forward)
+            pinfo *p = new_ptr(t, var, P_OPAQUE);
+            if (p) { p->pointee = pointee; p->storage = sc; p->var = var; }
+            return;
+        }
         pinfo *p = new_ptr(t, var, P_LVALUE);
         if (!p) return;
         p->lvalue = xprintf("_%u", var);
@@ -2565,6 +2736,26 @@ typedef struct { uint32_t var, builtin; const char *path; } bvar;
 // The parameter (and its MSL type) a built-in input comes from, for the entry point's stage.
 static const char *builtin_param(T *t, uint32_t bi, const char **decl) {
     *decl = NULL;
+    if (t->vkernel) {
+        switch (bi) {
+        case BI_VertexIndex:
+            return "(spvGP.indexed ? (spvGP.index16 ? uint(((const device ushort *)spvIdx)[spvTid.x]) : "
+                   "((const device uint *)spvIdx)[spvTid.x]) + uint(spvGP.base_vertex) : spvGP.first + spvTid.x)";
+        case BI_InstanceIndex: return "(spvGP.first_instance + spvTid.y)";
+        case BI_BaseVertex: return "uint(spvGP.indexed ? spvGP.base_vertex : int(spvGP.first))";
+        case BI_BaseInstance: return "spvGP.first_instance";
+        case BI_ViewIndex: return "0u";
+        default: break;
+        }
+    }
+    if (t->gs) {
+        switch (bi) {
+        case BI_InvocationId: return "spvInvocation";
+        case BI_PrimitiveId: return "spvTid.x";
+        case BI_ViewIndex: return "0u";
+        default: break;
+        }
+    }
     int vs = t->model == VKMSL_STAGE_VERTEX, fs = t->model == VKMSL_STAGE_FRAGMENT, cs = t->model == VKMSL_STAGE_COMPUTE;
     switch (bi) {
     case BI_VertexIndex: if (vs) { *decl = "uint spvVertexId [[vertex_id]]"; return "spvVertexId"; } break;
@@ -2610,6 +2801,289 @@ static int cmp_dm(const void *a, const void *b) {
     return x->word < y->word ? -1 : x->word > y->word;
 }
 
+// The interface of a vertex shader run as a kernel (its outputs into slots of spvVOut) and of a geometry shader run as
+// a kernel (its inputs from those slots, its outputs packed by EmitVertex into triangles of spvGOut).
+static void builtin_slots(T *t, uint32_t bi, uint32_t type, const char *path, sb *out, const char *base, uint32_t L, int dir) {
+    // (slot 0 position, L+1 and L+2 clip distances, L+3 point size / layer / viewport index)
+    const char *a = dir == 0 ? "" : path;
+    (void)a;
+    switch (bi) {
+    case BI_Position:
+        if (dir == 0) sb_printf(out, "    %s[0] = %s;\n", base, path); else sb_printf(out, "    %s = %s[0];\n", path, base);
+        break;
+    case BI_PointSize:
+        if (dir == 0) sb_printf(out, "    %s[%u].x = %s;\n", base, L + 3, path); else sb_printf(out, "    %s = %s[%u].x;\n", path, base, L + 3);
+        break;
+    case BI_ClipDistance: {
+        uint32_t n = array_length(t, type);
+        for (uint32_t k = 0; k < n && k < 8; k++) {
+            if (dir == 0) sb_printf(out, "    %s[%u][%u] = %s[%u];\n", base, L + 1 + k / 4, k % 4, path, k);
+            else sb_printf(out, "    %s[%u] = %s[%u][%u];\n", path, k, base, L + 1 + k / 4, k % 4);
+        }
+        if (n > t->gs_clip) t->gs_clip = n;
+        break;
+    }
+    case BI_Layer:
+        if (dir == 0) sb_printf(out, "    %s[%u].y = as_type<float>(uint(%s));\n", base, L + 3, path);
+        else sb_printf(out, "    %s = %s(as_type<uint>(%s[%u].y));\n", path, tname(t, type), base, L + 3);
+        t->res->uses_layer = 1;
+        break;
+    case BI_ViewportIndex:
+        if (dir == 0) sb_printf(out, "    %s[%u].z = as_type<float>(uint(%s));\n", base, L + 3, path);
+        else sb_printf(out, "    %s = %s(as_type<uint>(%s[%u].z));\n", path, tname(t, type), base, L + 3);
+        t->res->uses_viewport_index = 1;
+        break;
+    default: break;   // (cull distances and others: not carried)
+    }
+}
+
+static void kernel_interface(T *t, sb *in_decl, sb *in_init, sb *params, sb *prologue) {
+    // The user locations each side carries.
+    uint32_t out_loc = 0, in_loc = 0;
+    for (uint32_t i = 0; i < t->iface_count; i++) {
+        ent *v = E(t, t->iface[i]);
+        if (v->kind != K_VAR || (v->d.deco & D_BUILTIN)) continue;
+        uint32_t type = tw(t, v->type)[2];
+        if (type_op(t, type) == OpTypeStruct && mdeco(t, type, 0)->deco & D_BUILTIN) continue;
+        if (t->gs && v->w[2] == SC_Input && type_op(t, type) == OpTypeArray) type = tw(t, type)[1];
+        if (type_op(t, type) == OpTypeArray && type_op(t, tw(t, type)[1]) == OpTypeStruct &&
+            mdeco(t, tw(t, type)[1], 0)->deco & D_BUILTIN) continue;
+        uint32_t loc = v->d.location, mx = 0;
+        sb dummy = { 0 };
+        char *path = xprintf("_%u", t->iface[i]);
+        slot_leaves(t, type, path, &loc, &dummy, "x", 0, &mx);
+        free(path); free(dummy.p);
+        if (v->w[2] == SC_Output && mx > out_loc) out_loc = mx;
+        if (v->w[2] == SC_Input && mx > in_loc) in_loc = mx;
+    }
+    if (t->vkernel) {
+        uint32_t L = out_loc, S = L + 4;
+        t->res->vary_locations = L;
+        sb_printf(params, ",\n    uint2 spvTid [[thread_position_in_grid]]");
+        sb_printf(params, ",\n    constant spvGsParams& spvGP [[buffer(%u)]]", VKMSL_GS_PARAMS);
+        sb_printf(params, ",\n    device float4 *spvVOut [[buffer(%u)]]", VKMSL_GS_IN);
+        sb_printf(params, ",\n    const device uchar *spvIdx [[buffer(%u)]]", VKMSL_GS_INDEX);
+        sb_puts(prologue, "    if (spvTid.x >= spvGP.count || spvTid.y >= spvGP.instances) return;\n");
+        sb_printf(&t->ret, "    device float4 *spvV = spvVOut + (spvTid.y * spvGP.count + spvTid.x) * %uu;\n", S);
+        sb_printf(&t->ret, "    for (uint i = 0; i < %uu; i++) spvV[i] = float4(0.0f);\n", S);
+        for (uint32_t i = 0; i < t->iface_count; i++) {
+            uint32_t var = t->iface[i];
+            ent *v = E(t, var);
+            if (v->kind != K_VAR) continue;
+            uint32_t sc = v->w[2], type = tw(t, v->type)[2];
+            int builtin_block = type_op(t, type) == OpTypeStruct && mdeco(t, type, 0)->deco & D_BUILTIN;
+            char *path = xprintf("_%u", var);
+            if (sc == SC_Input) {
+                if (v->d.deco & D_BUILTIN) {
+                    const char *decl;
+                    const char *src = builtin_param(t, v->d.builtin, &decl);
+                    sb_printf(prologue, "    _%u = %s(%s);\n", var, tname(t, type), src);
+                } else {
+                    uint32_t loc = v->d.location;
+                    leafctx c = { in_decl, in_init, 1, v->d.deco, 0 };
+                    varying_leaves(t, &c, type, path, &loc);
+                }
+            } else if (sc == SC_Output) {
+                if (builtin_block) {
+                    for (uint32_t m = 0; m + 1 < E(t, type)->n; m++) {
+                        if (!(v->written & (1u << m))) continue;
+                        char *mp = xprintf("_%u.m%u", var, m);
+                        builtin_slots(t, mdeco(t, type, m)->builtin, tw(t, type)[m + 1], mp, &t->ret, "spvV", L, 0);
+                        free(mp);
+                    }
+                } else if (v->d.deco & D_BUILTIN) builtin_slots(t, v->d.builtin, type, path, &t->ret, "spvV", L, 0);
+                else { uint32_t loc = v->d.location, mx = 0; slot_leaves(t, type, path, &loc, &t->ret, "spvV", 0, &mx); }
+            }
+            free(path);
+        }
+        return;
+    }
+    // Geometry: N vertices in from slots of IS, outputs of OS slots per vertex, up to MAXT triangles per run.
+    uint32_t N = t->gs_in_n, IS = t->opt->vary_slots + 4;
+    t->gs_loc = out_loc;
+    t->gs_os = out_loc + 4;
+    t->res->gs_in_vertices = N;
+    t->res->gs_max_triangles = t->gs_maxt;
+    t->res->gs_out_slots = t->gs_os;
+    t->res->gs_invocations = t->gs_invocations;
+    sb_printf(params, ",\n    uint2 spvTid [[thread_position_in_grid]]");
+    sb_printf(params, ",\n    constant spvGsParams& spvGP [[buffer(%u)]]", VKMSL_GS_PARAMS);
+    sb_printf(params, ",\n    const device float4 *spvGIn [[buffer(%u)]]", VKMSL_GS_IN);
+    sb_printf(params, ",\n    device float4 *spvGOut [[buffer(%u)]]", VKMSL_GS_OUT);
+    sb_printf(params, ",\n    device uint *spvGCount [[buffer(%u)]]", VKMSL_GS_COUNT);
+    sb_puts(prologue,
+        "    if (spvTid.x >= spvGP.prims) return;\n"
+        "    uint spvInstance = spvTid.y / spvGP.invocations, spvInvocation = spvTid.y % spvGP.invocations;\n"
+        "    uint spvRun = spvTid.y * spvGP.prims + spvTid.x;\n"
+        "    uint spvVert[6];\n"
+        "    uint spvP = spvTid.x;\n");
+    // (the primitive's vertices: lists, strips (odd triangles turned back), fans, with adjacency)
+    sb_printf(prologue,
+        "    switch (spvGP.topology) {\n"
+        "    case 0u: spvVert[0] = spvP; break;\n"
+        "    case 1u: spvVert[0] = 2u * spvP; spvVert[1] = 2u * spvP + 1u; break;\n"
+        "    case 2u: spvVert[0] = spvP; spvVert[1] = spvP + 1u; break;\n"
+        "    case 4u: if (spvP & 1u) { spvVert[0] = spvP + 1u; spvVert[1] = spvP; } else { spvVert[0] = spvP; spvVert[1] = spvP + 1u; } spvVert[2] = spvP + 2u; break;\n"
+        "    case 5u: spvVert[0] = spvP + 1u; spvVert[1] = spvP + 2u; spvVert[2] = 0u; break;\n"
+        "    case 6u: for (uint j = 0; j < 4u; j++) spvVert[j] = 4u * spvP + j; break;\n"
+        "    case 7u: for (uint j = 0; j < 4u; j++) spvVert[j] = spvP + j; break;\n"
+        "    case 8u: for (uint j = 0; j < 6u; j++) spvVert[j] = 6u * spvP + j; break;\n"
+        "    default: for (uint j = 0; j < 3u; j++) spvVert[j] = 3u * spvP + j; break;\n"
+        "    }\n"
+        "    for (uint j = 0; j < %uu; j++) spvVert[j] = (spvInstance * spvGP.count + spvVert[j]) * %uu;\n", N, IS);
+    sb_printf(prologue, "    spvArr<float4, %u> spvA, spvB, spvCur;\n    uint spvStrip = 0, spvTris = 0;\n", t->gs_os);
+    sb_printf(&t->ret, "    spvGCount[spvRun] = spvTris;\n");
+    for (uint32_t i = 0; i < t->iface_count; i++) {
+        uint32_t var = t->iface[i];
+        ent *v = E(t, var);
+        if (v->kind != K_VAR) continue;
+        uint32_t sc = v->w[2], type = tw(t, v->type)[2];
+        char *path = xprintf("_%u", var);
+        if (sc == SC_Input) {
+            if (type_op(t, type) != OpTypeArray) {
+                // (per-primitive built-ins: InvocationId, PrimitiveId)
+                const char *decl;
+                const char *src = builtin_param(t, v->d.builtin, &decl);
+                sb_printf(in_init, "    _%u = %s(%s);\n", var, tname(t, type), src);
+            } else {
+                uint32_t elem = tw(t, type)[1];
+                int bblock = type_op(t, elem) == OpTypeStruct && mdeco(t, elem, 0)->deco & D_BUILTIN;
+                for (uint32_t j = 0; j < N; j++) {
+                    char *ep = xprintf("_%u[%u]", var, j), *base = xprintf("(spvGIn + spvVert[%u])", j);
+                    if (bblock) {
+                        for (uint32_t m = 0; m + 1 < E(t, elem)->n; m++) {
+                            char *mp = xprintf("%s.m%u", ep, m);
+                            builtin_slots(t, mdeco(t, elem, m)->builtin, tw(t, elem)[m + 1], mp, in_init, base, t->opt->vary_slots, 1);
+                            free(mp);
+                        }
+                    } else if (v->d.deco & D_BUILTIN) builtin_slots(t, v->d.builtin, elem, ep, in_init, base, t->opt->vary_slots, 1);
+                    else { uint32_t loc = v->d.location, mx = 0; slot_leaves(t, elem, ep, &loc, in_init, base, 1, &mx); }
+                    free(ep); free(base);
+                }
+            }
+        } else if (sc == SC_Output) {
+            int builtin_block = type_op(t, type) == OpTypeStruct && mdeco(t, type, 0)->deco & D_BUILTIN;
+            if (builtin_block) {
+                for (uint32_t m = 0; m + 1 < E(t, type)->n; m++) {
+                    char *mp = xprintf("_%u.m%u", var, m);
+                    builtin_slots(t, mdeco(t, type, m)->builtin, tw(t, type)[m + 1], mp, &t->gs_pack, "spvCur", t->gs_loc, 0);
+                    free(mp);
+                }
+            } else if (v->d.deco & D_BUILTIN) builtin_slots(t, v->d.builtin, type, path, &t->gs_pack, "spvCur", t->gs_loc, 0);
+            else { uint32_t loc = v->d.location, mx = 0; slot_leaves(t, type, path, &loc, &t->gs_pack, "spvCur", 0, &mx); }
+        }
+        free(path);
+    }
+}
+
+// "vkpass": draws a geometry kernel's triangles (vertex id = triangle * 3 + corner, MAXT triangles per run, the
+// unused ones placed off the screen), with the fragment shader's inputs at the geometry outputs' locations.
+static void gs_passthrough(T *t, sb *src) {
+    uint32_t L = t->gs_loc, OS = t->gs_os, MAXT = t->gs_maxt;
+    sb decl = { 0 }, body = { 0 };
+    sb_puts(&decl, "    float4 spvPosition [[position]];\n");
+    for (uint32_t i = 0; i < t->iface_count; i++) {
+        ent *v = E(t, t->iface[i]);
+        if (v->kind != K_VAR || v->w[2] != SC_Output || (v->d.deco & D_BUILTIN)) continue;
+        uint32_t type = tw(t, v->type)[2];
+        if (type_op(t, type) == OpTypeStruct && mdeco(t, type, 0)->deco & D_BUILTIN) continue;
+        // (each location's scalar class, as the fragment shader declares it: float4, int4 or uint4)
+        uint32_t loc = v->d.location, base = loc, mx = 0;
+        sb dummy = { 0 };
+        char *path = xprintf("_%u", t->iface[i]);
+        slot_leaves(t, type, path, &loc, &dummy, "x", 0, &mx);
+        free(path); free(dummy.p);
+        uint32_t s = scalar_of(t, type_op(t, type) == OpTypeArray || type_op(t, type) == OpTypeMatrix ? tw(t, type)[1] : type);
+        const char *v4 = is_float(t, s) || is_bool(t, s) ? "float4" : is_signed(t, s) ? "int4" : "uint4";
+        for (uint32_t l = base; l < mx; l++) {
+            sb_printf(&decl, "    %s v%u [[user(locn%u)]];\n", v4, l, l);
+            if (!strcmp(v4, "float4")) sb_printf(&body, "    o.v%u = v[%u];\n", l, 1 + l);
+            else sb_printf(&body, "    o.v%u = as_type<%s>(v[%u]);\n", l, v4, 1 + l);
+        }
+    }
+    if (t->gs_clip) {
+        sb_printf(&decl, "    float spvClip [[clip_distance]] [%u];\n", t->gs_clip);
+        for (uint32_t k = 0; k < t->gs_clip; k++) sb_printf(&body, "    o.spvClip[%u] = v[%u][%u];\n", k, L + 1 + k / 4, k % 4);
+    }
+    if (t->res->uses_layer) { sb_puts(&decl, "    uint spvLayer [[render_target_array_index]];\n"); sb_printf(&body, "    o.spvLayer = as_type<uint>(v[%u].y);\n", L + 3); }
+    if (t->res->uses_viewport_index) { sb_puts(&decl, "    uint spvViewport [[viewport_array_index]];\n"); sb_printf(&body, "    o.spvViewport = as_type<uint>(v[%u].z);\n", L + 3); }
+    sb_printf(src, "struct spvPassOut {\n%s};\n", decl.p);
+    sb_printf(src, "vertex spvPassOut vkpass(uint vid [[vertex_id]], const device float4 *spvGOut [[buffer(0)]], const device uint *spvGCount [[buffer(1)]]) {\n"
+                   "    uint tri = vid / 3u, run = tri / %uu;\n"
+                   "    const device float4 *v = spvGOut + vid * %uu;\n"
+                   "    spvPassOut o;\n"
+                   "    o.spvPosition = tri - run * %uu < spvGCount[run] ? v[0] : float4(0.0f, 0.0f, -2.0f, 1.0f);\n"
+                   "    o.spvPosition.y = -o.spvPosition.y;\n%s"
+                   "    return o;\n}\n", MAXT, OS, MAXT, body.p ? body.p : "");
+    free(decl.p);
+    free(body.p);
+}
+
+// Finds the resource variables a depth-comparison sample reads, back through loads, copies, sampled-image
+// combinations, local variables (their stores), phis and function parameters (their call sites).
+static void mark_depth_compared(T *t) {
+    uint32_t *work = NULL, nwork = 0, cap = 0;
+    uint8_t *seen = calloc(t->bound, 1);
+#define PUSH(x) do { uint32_t x_ = (x); if (x_ < t->bound && !seen[x_]) { seen[x_] = 1; \
+        if (nwork == cap) { cap = cap ? cap * 2 : 64; work = realloc(work, cap * sizeof *work); } work[nwork++] = x_; } } while (0)
+    for (uint32_t i = 0; i < t->block_count; i++)
+        for (size_t pos = t->blocks[i].first; pos < t->blocks[i].term;) {
+            uint32_t op = t->w[pos] & 0xffff, n = t->w[pos] >> 16;
+            if ((op == OpImageSampleDrefImplicitLod || op == OpImageSampleDrefExplicitLod || op == OpImageSampleProjDrefImplicitLod ||
+                 op == OpImageSampleProjDrefExplicitLod || op == OpImageDrefGather) && n > 3) PUSH(t->w[pos + 3]);
+            pos += n;
+        }
+    while (nwork && seen) {
+        uint32_t id = work[--nwork];
+        ent *e = &t->e[id];
+        if (e->kind == K_VAR) {
+            uint32_t sc = e->w[2];
+            if (sc == SC_UniformConstant) { e->d.deco |= D_DEPTHCMP; continue; }
+            // (a local variable: what is stored into it)
+            for (uint32_t i = 0; i < t->block_count; i++)
+                for (size_t pos = t->blocks[i].first; pos < t->blocks[i].term;) {
+                    uint32_t op = t->w[pos] & 0xffff, n = t->w[pos] >> 16;
+                    if (op == OpStore && n > 2 && t->w[pos + 1] == id) PUSH(t->w[pos + 2]);
+                    pos += n;
+                }
+            continue;
+        }
+        if (e->kind != K_VALUE) continue;
+        switch (e->op) {
+        case OpLoad: case OpSampledImage: case OpImage: case OpCopyObject: case OpAccessChain: case OpInBoundsAccessChain:
+            if (e->n > 2) PUSH(e->w[2]);
+            break;
+        case OpPhi:
+            for (uint32_t k = 2; k + 1 < e->n; k += 2) PUSH(e->w[k]);
+            break;
+        case OpSelect:
+            if (e->n > 4) { PUSH(e->w[3]); PUSH(e->w[4]); }
+            break;
+        case OpFunctionParameter: {
+            // (the arguments of every call of its function)
+            for (uint32_t f = 1; f < t->bound; f++) {
+                ent *fe = &t->e[f];
+                if (fe->kind != K_FUNC) continue;
+                for (uint32_t k = 0; k < fe->mcount; k++) {
+                    if (t->fparams[fe->mbase + k] != id) continue;
+                    for (uint32_t i = 0; i < t->block_count; i++)
+                        for (size_t pos = t->blocks[i].first; pos < t->blocks[i].term;) {
+                            uint32_t op = t->w[pos] & 0xffff, n = t->w[pos] >> 16;
+                            if (op == OpFunctionCall && n > 4 + k && t->w[pos + 3] == f) PUSH(t->w[pos + 4 + k]);
+                            pos += n;
+                        }
+                }
+            }
+            break;
+        }
+        default: break;
+        }
+    }
+#undef PUSH
+    free(work);
+    free(seen);
+}
+
 int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_options *options, vkmsl_result *result) {
     if (!result) return VKMSL_INVALID;
     memset(result, 0, sizeof *result);
@@ -2621,27 +3095,17 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
     t->indent = 1;
     if (!parse(t)) goto out;
     if (!t->block_count) { fail(t, VKMSL_INVALID, "entry point has no blocks"); goto out; }
+    t->vkernel = t->model == VKMSL_STAGE_VERTEX && (options->flags & VKMSL_FLAG_VERTEX_KERNEL);
+    t->gs = t->model == VKMSL_STAGE_GEOMETRY;
+    if (t->gs) {
+        if (t->gs_out_prim != 3) { fail(t, VKMSL_UNSUPPORTED, "geometry shader output other than triangle strips"); goto out; }
+        if (!t->gs_in_n) t->gs_in_n = 3;
+        if (!t->gs_invocations) t->gs_invocations = 1;
+        t->gs_maxt = t->gs_maxt > 2 ? t->gs_maxt - 2 : 1;
+    }
 
     // Images sampled with depth comparisons are depth textures whatever their type says (HLSL compilers leave Depth 0).
-    for (uint32_t i = 0; i < t->block_count; i++) {
-        block *b = &t->blocks[i];
-        for (size_t pos = b->first; pos < b->term;) {
-            uint32_t op = t->w[pos] & 0xffff, n = t->w[pos] >> 16;
-            if ((op == OpImageSampleDrefImplicitLod || op == OpImageSampleDrefExplicitLod || op == OpImageSampleProjDrefImplicitLod ||
-                 op == OpImageSampleProjDrefExplicitLod || op == OpImageDrefGather) && n > 3) {
-                uint32_t id = t->w[pos + 3];
-                for (int guard = 0; guard < 16 && id < t->bound; guard++) {
-                    ent *e = &t->e[id];
-                    if (e->kind == K_VAR) { e->d.deco |= D_DEPTHCMP; break; }
-                    if (e->kind != K_VALUE || e->n < 3) break;
-                    if (e->op == OpSampledImage || e->op == OpLoad || e->op == OpAccessChain || e->op == OpInBoundsAccessChain ||
-                        e->op == OpCopyObject || e->op == OpImage) id = e->w[2];
-                    else break;
-                }
-            }
-            pos += n;
-        }
-    }
+    mark_depth_compared(t);
     // Every variable gets its pointer form: resources and interface variables are set up on first use below.
     for (uint32_t id = 1; id < t->bound; id++) {
         ent *e = &t->e[id];
@@ -2686,14 +3150,15 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
     }
     if (t->rc) goto out;
 
-    emit_from(t, t->blocks[0].label, 0);
+    emit_from(t, t->blocks[t->entry_block].label, 0);
     if (t->rc) goto out;
 
     // ---- the stage interface
     sb in_decl = { 0 }, in_init = { 0 }, out_decl = { 0 }, params = { 0 }, prologue = { 0 };
     const char *ret_type = "void";
     uint32_t clip_count = 0;
-    for (uint32_t i = 0; i < t->iface_count; i++) {
+    if (t->vkernel || t->gs) kernel_interface(t, &in_decl, &in_init, &params, &prologue);
+    for (uint32_t i = 0; i < t->iface_count && !t->vkernel && !t->gs; i++) {
         uint32_t var = t->iface[i];
         ent *v = E(t, var);
         if (v->kind != K_VAR) continue;
@@ -2781,7 +3246,7 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
         }
     }
     result->clip_distances = clip_count;
-    if (t->model == VKMSL_STAGE_VERTEX && !strstr(out_decl.p ? out_decl.p : "", "[[position]]")) {
+    if (t->model == VKMSL_STAGE_VERTEX && !t->vkernel && !strstr(out_decl.p ? out_decl.p : "", "[[position]]")) {
         // (a vertex function must write a position: one that writes none places everything at the origin)
         sb_puts(&out_decl, "    float4 spvPosition [[position]];\n");
         sb_puts(&t->ret, "    spvOut.spvPosition = float4(0.0f);\n");
@@ -2838,10 +3303,13 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
     sb_putn(&src, t->glob.p ? t->glob.p : "", t->glob.n);
 
     snprintf(result->entry_name, sizeof result->entry_name, "vkmain");
-    const char *stage_kw = t->model == VKMSL_STAGE_VERTEX ? "vertex" : t->model == VKMSL_STAGE_FRAGMENT ? "fragment" :
-                           t->model == VKMSL_STAGE_COMPUTE ? "kernel" : NULL;
+    const char *stage_kw = t->vkernel || t->gs ? "kernel" : t->model == VKMSL_STAGE_VERTEX ? "vertex" :
+                           t->model == VKMSL_STAGE_FRAGMENT ? "fragment" : t->model == VKMSL_STAGE_COMPUTE ? "kernel" : NULL;
+    if (t->vkernel || t->gs)
+        sb_puts(&src, "struct spvGsParams { uint count, instances, first, first_instance; int base_vertex; uint indexed, index16, prims;\n"
+                      "    uint topology, invocations, in_slots, out_max_tris; };\n");
     if (!stage_kw) { fail(t, VKMSL_UNSUPPORTED, "stage %u", t->model); goto cleanup; }
-    int has_in = in_decl.n > 0, has_out = out_decl.n > 0 && t->model != VKMSL_STAGE_COMPUTE;
+    int has_in = in_decl.n > 0, has_out = out_decl.n > 0 && t->model != VKMSL_STAGE_COMPUTE && !t->vkernel && !t->gs;
     if (has_in) sb_printf(&src, "struct spvInput {\n%s};\n", in_decl.p);
     if (has_out) { sb_printf(&src, "struct spvOutput {\n%s};\n", out_decl.p); ret_type = "spvOutput"; }
     if (t->model == VKMSL_STAGE_FRAGMENT && t->early_tests) { sb_puts(&src, "[[early_fragment_tests]] "); result->early_fragment_tests = 1; }
@@ -2855,17 +3323,31 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
     sb_putn(&src, prologue.p ? prologue.p : "", prologue.n);
     sb_putn(&src, in_init.p ? in_init.p : "", in_init.n);
     // The body, its returns expanded to the output stores.
-    char *ret = has_out ? xprintf("{\n%s    return spvOut;\n}\n", t->ret.p ? t->ret.p : "") : xstrdup("return;\n");
+    char *ret = has_out ? xprintf("{\n%s    return spvOut;\n}\n", t->ret.p ? t->ret.p : "") :
+                (t->vkernel || t->gs) ? xprintf("{\n%s    return;\n}\n", t->ret.p ? t->ret.p : "") : xstrdup("return;\n");
+    // (a geometry shader's EmitVertex: its outputs into spvCur, a triangle once the strip has three vertices)
+    char *emit = t->gs ? xprintf("{\n    for (uint i = 0; i < %uu; i++) spvCur[i] = float4(0.0f);\n%s"
+        "    if (spvStrip >= 2u && spvTris < %uu) {\n"
+        "        device float4 *o = spvGOut + (spvRun * %uu + spvTris) * %uu;\n"
+        "        bool odd = (spvStrip & 1u) != 0u;\n"
+        "        for (uint i = 0; i < %uu; i++) { o[i] = odd ? spvB[i] : spvA[i]; o[%uu + i] = odd ? spvA[i] : spvB[i]; o[%uu + i] = spvCur[i]; }\n"
+        "        spvTris++;\n    }\n"
+        "    spvA = spvB; spvB = spvCur; spvStrip++;\n}\n", t->gs_os, t->gs_pack.p ? t->gs_pack.p : "", t->gs_maxt, t->gs_maxt,
+        3 * t->gs_os, t->gs_os, t->gs_os, 2 * t->gs_os) : NULL;
     for (const char *p = t->body.p ? t->body.p : ""; *p;) {
-        const char *m = strstr(p, "@RET@\n");
+        const char *m = strstr(p, "@RET@\n"), *e = emit ? strstr(p, "@EMIT@\n") : NULL;
+        if (e && (!m || e < m)) { sb_putn(&src, p, (size_t)(e - p)); sb_puts(&src, emit); p = e + 7; continue; }
         if (!m) { sb_puts(&src, p); break; }
         sb_putn(&src, p, (size_t)(m - p));
         sb_puts(&src, ret);
         p = m + 6;
     }
     free(ret);
-    if (!has_out) sb_puts(&src, "}\n");
+    free(emit);
+    if (t->vkernel || t->gs) { sb_putn(&src, t->ret.p ? t->ret.p : "", t->ret.n); sb_puts(&src, "}\n"); }
+    else if (!has_out) sb_puts(&src, "}\n");
     else { sb_putn(&src, t->ret.p ? t->ret.p : "", t->ret.n); sb_puts(&src, "    return spvOut;\n}\n"); }
+    if (t->gs) gs_passthrough(t, &src);
     if (src.oom || t->body.oom || t->vars.oom) fail(t, VKMSL_OUT_OF_MEMORY, "out of memory");
     if (!t->rc) { result->msl = src.p; result->msl_size = src.n; src.p = NULL; }
 cleanup:
@@ -2879,8 +3361,8 @@ out:
         }
     }
     for (uint32_t i = 0; i < t->dm_count; i++) free(t->dm[i].decl);
-    free(t->dm); free(t->e); free(t->members); free(t->blocks);
-    free(t->pre.p); free(t->glob.p); free(t->vars.p); free(t->body.p); free(t->ret.p);
+    free(t->dm); free(t->e); free(t->members); free(t->blocks); free(t->fparams);
+    free(t->pre.p); free(t->glob.p); free(t->vars.p); free(t->body.p); free(t->ret.p); free(t->gs_pack.p);
     return t->rc;
 }
 
@@ -2931,6 +3413,6 @@ int vkmsl_reflect(const uint32_t *words, size_t word_count, uint32_t stage, vkms
     }
     int rc = t->rc;
     for (uint32_t i = 0; t->e && i < t->bound; i++) { free(t->e[i].expr); free(t->e[i].aux); free(t->e[i].tname); }
-    free(t->e); free(t->members); free(t->blocks); free(t->pre.p); free(t->glob.p);
+    free(t->e); free(t->members); free(t->blocks); free(t->fparams); free(t->pre.p); free(t->glob.p);
     return rc;
 }

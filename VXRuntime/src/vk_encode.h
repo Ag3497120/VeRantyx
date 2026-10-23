@@ -19,6 +19,7 @@ typedef struct {
     VkRect2D area;
     uint32_t layers, view_mask;
     VkQueryPool occlusion;              // the occlusion query pool used in the pass, if any
+    uint8_t has_gs;                     // it draws with a geometry shader (which ends the Metal pass and resumes it)
 } pass_desc;
 
 typedef struct {
@@ -64,6 +65,8 @@ typedef struct vk_enc {
     uint32_t pass_width, pass_height, pass_samples;
     int in_pass;
     int state_dirty;
+    MTLVisibilityResultMode vis_mode;   // (the occlusion query running, set again when a pass resumes)
+    uint64_t vis_offset;
     // Things to do when the command buffer completes.
     VkEvent *events;
     int *event_values;

@@ -75,7 +75,8 @@ int main(int argc, char **argv) {
         word += bindings[i].count * vkmsl_descriptor_words(bindings[i].type);
         (void)dynamic;
     }
-    vkmsl_options options = { .stage = (uint32_t)stage, .bindings = bindings, .binding_count = n };
+    vkmsl_options options = { .stage = (uint32_t)stage, .bindings = bindings, .binding_count = n, .vary_slots = 16 };
+    if (getenv("VKMSL_VERTEX_KERNEL")) options.flags |= VKMSL_FLAG_VERTEX_KERNEL;
     vkmsl_result result;
     int rc = vkmsl_translate(words, count, &options, &result);
     if (rc) {

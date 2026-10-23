@@ -73,6 +73,7 @@ struct VkQueue_T {
     __strong id<MTLSharedEvent> done;   // signaled with each submission's number when it completes
     uint64_t submitted;            // the last submission's number
     __strong id<MTLFence> last_fence;   // (every encoder waits for the one before it: see vk_command.m)
+    __strong id<MTLBuffer> gs_scratch[3];   // geometry draws: vertex outputs, triangles, counts (reused draw to draw)
 };
 
 typedef struct vk_heap_list { __strong id<MTLHeap> *heaps; uint32_t count, cap; pthread_mutex_t lock; uint64_t generation; } vk_heap_list;
@@ -272,6 +273,16 @@ struct VkPipeline_T {
     uint32_t sets_vertex, sets_fragment, sets_compute;   // descriptor sets each stage reads
     uint8_t push_vertex, push_fragment, push_compute, aux_vertex, aux_fragment, aux_compute;
     uint32_t sample_mask;
+    // A geometry shader: the vertex shader as kernels (not indexed, 16- and 32-bit indices), the geometry kernel, and
+    // the render pipeline drawing its triangles ("vkpass" and the fragment shader).
+    __strong id<MTLComputePipelineState> gs_vs[3];
+    __strong id<MTLComputePipelineState> gs_kernel;
+    uint32_t gs_in_vertices, gs_max_tris, gs_out_slots, gs_invocations, gs_in_slots;
+    uint32_t sets_geometry;
+    uint8_t push_geometry, aux_geometry;
+    uint8_t vertex_rate[VKMSL_MAX_VERTEX_BUFFERS];   // 1: per instance
+    uint32_t vertex_divisor[VKMSL_MAX_VERTEX_BUFFERS];
+    VkPrimitiveTopology topology;
 };
 
 // Render passes: attachments and subpasses as given; framebuffers name the views.

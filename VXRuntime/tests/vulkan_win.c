@@ -4,7 +4,8 @@
 // attachment cleared to 0.5 and LESS, a triangle at z 0.8 leaves the clear color and one at z 0.2 draws. With the
 // uniform shaders it also draws through a uniform buffer and push constants: the vertex shader picks a mat4 from the
 // buffer by a pushed index, multiplies and adds a pushed offset; the fragment shader colors with a pushed color
-// times a tint from the same buffer.
+// times a tint from the same buffer. A geometry shader (SPIR-V assembled below) turns a point into a quad with the
+// input color's red and green swapped, drawn in a pass after a plain triangle (the pass is split around it).
 //   vulkan_win.exe <vertex .spv> <fragment .spv> [<uniform vertex .spv> <uniform fragment .spv>]
 //   (build/vulkan_spirv_vertex_fixture.spv, ..._fragment_fixture.spv, ..._uniform_vertex_fixture.spv, ...)
 #include <windows.h>
@@ -75,24 +76,26 @@ static VkRenderPass render_pass_depth(VkDevice device, VkFormat format, VkImageL
 
 static VkPipeline pipeline_full(VkDevice device, VkRenderPass pass, VkPipelineLayout layout, VkShaderModule vs,
                                 VkShaderModule fs, uint32_t width, uint32_t height, int depth_test,
-                                VkFlags cull_mode, VkFrontFace front_face);
+                                VkFlags cull_mode, VkFrontFace front_face, VkShaderModule gs);
 static VkPipeline pipeline(VkDevice device, VkRenderPass pass, VkPipelineLayout layout,
                            VkShaderModule vs, VkShaderModule fs, uint32_t width, uint32_t height) {
-    return pipeline_full(device, pass, layout, vs, fs, width, height, 0, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    return pipeline_full(device, pass, layout, vs, fs, width, height, 0, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0);
 }
 static VkPipeline pipeline_depth(VkDevice device, VkRenderPass pass, VkPipelineLayout layout,
                                  VkShaderModule vs, VkShaderModule fs, uint32_t width, uint32_t height, int depth_test) {
     return pipeline_full(device, pass, layout, vs, fs, width, height, depth_test, VK_CULL_MODE_NONE,
-                         VK_FRONT_FACE_COUNTER_CLOCKWISE);
+                         VK_FRONT_FACE_COUNTER_CLOCKWISE, 0);
 }
 static VkPipeline pipeline_full(VkDevice device, VkRenderPass pass, VkPipelineLayout layout, VkShaderModule vs,
                                 VkShaderModule fs, uint32_t width, uint32_t height, int depth_test,
-                                VkFlags cull_mode, VkFrontFace front_face) {
-    VkPipelineShaderStageCreateInfo stages[2] = {
+                                VkFlags cull_mode, VkFrontFace front_face, VkShaderModule gs) {
+    VkPipelineShaderStageCreateInfo stages[3] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
           .module = vs, .pName = "main" },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
           .module = fs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_GEOMETRY_BIT,
+          .module = gs, .pName = "main" },
     };
     VkVertexInputBindingDescription binding = { 0, 4 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX };
     VkVertexInputAttributeDescription attribute = { 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0 };
@@ -102,7 +105,8 @@ static VkPipeline pipeline_full(VkDevice device, VkRenderPass pass, VkPipelineLa
         .vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &attribute
     };
     VkPipelineInputAssemblyStateCreateInfo assembly = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = gs ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
     };
     VkViewport viewport = { 0, 0, (float)width, (float)height, 0, 1 };
     VkRect2D scissor = { { 0, 0 }, { width, height } };
@@ -127,7 +131,7 @@ static VkPipeline pipeline_full(VkDevice device, VkRenderPass pass, VkPipelineLa
         .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS
     };
     VkGraphicsPipelineCreateInfo info = {
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = stages,
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = gs ? 3 : 2, .pStages = stages,
         .pVertexInputState = &vertex_input, .pInputAssemblyState = &assembly, .pViewportState = &viewport_state,
         .pRasterizationState = &raster, .pMultisampleState = &multisample,
         .pDepthStencilState = depth_test ? &depth_state : NULL, .pColorBlendState = &blend_state,
@@ -135,6 +139,71 @@ static VkPipeline pipeline_full(VkDevice device, VkRenderPass pass, VkPipelineLa
     };
     VkPipeline p = 0;
     return vkCreateGraphicsPipelines(device, 0, 1, &info, NULL, &p) == VK_SUCCESS ? p : 0;
+}
+
+// The geometry shader: points in; a triangle strip of 4 vertices out, the point's position (from gl_in[0], a block
+// in an array as compilers write it) plus (-+0.25, -+0.25), with the location 0 color's red and green swapped.
+static size_t geometry_shader(uint32_t *w) {
+    size_t n = 0;
+#define OP(code, ...) do { const uint32_t o_[] = { __VA_ARGS__ }; w[n++] = ((uint32_t)(1 + sizeof o_ / 4) << 16) | (code); \
+                           memcpy(w + n, o_, sizeof o_); n += sizeof o_ / 4; } while (0)
+    w[n++] = 0x07230203u; w[n++] = 0x00010000u; w[n++] = 0; w[n++] = 60; w[n++] = 0;
+    OP(17, 2);                                       // Capability Geometry
+    OP(14, 0, 1);                                    // Logical GLSL450
+    OP(15, 3, 30, 0x6e69616du, 0, 11, 14, 16, 17);   // EntryPoint Geometry %30 "main" gl_in inColor outPos outColor
+    OP(16, 30, 19);                                  // InputPoints
+    OP(16, 30, 0, 1);                                // Invocations 1
+    OP(16, 30, 29);                                  // OutputTriangleStrip
+    OP(16, 30, 26, 4);                               // OutputVertices 4
+    OP(71, 8, 2);                                    // gl_PerVertex: Block
+    OP(72, 8, 0, 11, 0);                             //   member 0 BuiltIn Position
+    OP(71, 14, 30, 0);                               // inColor Location 0
+    OP(71, 16, 11, 0);                               // outPos BuiltIn Position
+    OP(71, 17, 30, 0);                               // outColor Location 0
+    OP(19, 1);                                       // void
+    OP(33, 2, 1);                                    // void()
+    OP(22, 3, 32);                                   // float
+    OP(23, 4, 3, 4);                                 // vec4
+    OP(21, 5, 32, 0);                                // uint
+    OP(21, 6, 32, 1);                                // int
+    OP(43, 5, 7, 1);                                 // uint 1
+    OP(43, 6, 18, 0);                                // int 0
+    OP(43, 3, 20, 0x3e800000u);                      // 0.25
+    OP(43, 3, 21, 0xbe800000u);                      // -0.25
+    OP(43, 3, 22, 0);                                // 0
+    OP(44, 4, 23, 21, 21, 22, 22);
+    OP(44, 4, 24, 20, 21, 22, 22);
+    OP(44, 4, 25, 21, 20, 22, 22);
+    OP(44, 4, 26, 20, 20, 22, 22);
+    OP(30, 8, 4);                                    // struct gl_PerVertex { vec4 }
+    OP(28, 9, 8, 7);                                 // gl_PerVertex[1]
+    OP(32, 10, 1, 9);                                // Input ptr
+    OP(28, 12, 4, 7);                                // vec4[1]
+    OP(32, 13, 1, 12);
+    OP(32, 15, 3, 4);                                // Output vec4 ptr
+    OP(32, 19, 1, 4);                                // Input vec4 ptr
+    OP(59, 10, 11, 1);
+    OP(59, 13, 14, 1);
+    OP(59, 15, 16, 3);
+    OP(59, 15, 17, 3);
+    OP(54, 1, 30, 0, 2);                             // main
+    OP(248, 31);
+    OP(65, 19, 32, 11, 18, 18);                      // &gl_in[0].gl_Position
+    OP(61, 4, 33, 32);
+    OP(65, 19, 34, 14, 18);                          // &inColor[0]
+    OP(61, 4, 35, 34);
+    OP(79, 4, 36, 35, 35, 1, 0, 2, 3);               // .grba
+    for (uint32_t k = 0; k < 4; k++) {
+        OP(129, 4, 40 + k, 33, 23 + k);
+        OP(62, 16, 40 + k);
+        OP(62, 17, 36);
+        OP(218);                                     // EmitVertex
+    }
+    OP(219);                                         // EndPrimitive
+    OP(253);
+    OP(56);
+#undef OP
+    return n;
 }
 
 static void draw(VkCommandBuffer cmd, VkRenderPass pass, VkFramebuffer fb, VkPipeline p, VkBuffer vertices,
@@ -160,7 +229,7 @@ int main(int argc, char **argv) {
     int presented = 0;
     unsigned char center[4] = { 0 }, corner[4] = { 0 }, depth_center[2][4] = { { 0 } };
     unsigned char near_base[4] = { 0 }, near_apex[4] = { 0 }, culled[3][4] = { { 0 } };
-    unsigned char moved[4][4] = { { 0 } };
+    unsigned char moved[4][4] = { { 0 } }, geometry[5][4] = { { 0 } };
     int uniform_drawn = 0;
 
     const char *instance_extensions[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
@@ -375,7 +444,7 @@ int main(int argc, char **argv) {
     };
     for (int c = 0; c < 3; c++) {
         VkPipeline cull_pipeline = pipeline_full(device, offscreen_pass, layout, vs, fs, W, H, 0,
-                                                 cull_cases[c].cull, cull_cases[c].front);
+                                                 cull_cases[c].cull, cull_cases[c].front, 0);
         CHECK(cull_pipeline);
         CHECK(vkResetFences(device, 1, &fence) == VK_SUCCESS);
         CHECK(vkResetCommandBuffer(cmd, 0) == VK_SUCCESS);
@@ -393,6 +462,74 @@ int main(int argc, char **argv) {
     CHECK(culled[0][0] == 255 && culled[0][2] == 0);    // BACK, CCW fronts: culled, blue
     CHECK(culled[1][0] == 0 && culled[1][2] == 255);    // BACK, CW fronts: drawn, red
     CHECK(culled[2][0] == 0 && culled[2][2] == 255);    // FRONT, CCW fronts: drawn, red
+
+    // 3b. A geometry shader: the triangle (red), then in the same pass the point at the triangle's apex (vertex 2,
+    //     (0, 0.5): firstVertex 2) as a green quad over pixels 24..40 x 40..56. The pass ends and resumes around it:
+    //     the triangle and the clear color stay. Then an indexed draw of vertex 1 through the 16-bit index 0 at
+    //     firstIndex 1 with vertexOffset 1: a quad over 40..56 x 8..24.
+    {
+        const uint16_t indices[2] = { 7, 0 };
+        vb_info.size = sizeof indices;
+        vb_info.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+        VkBuffer index_buffer = 0;
+        CHECK(vkCreateBuffer(device, &vb_info, NULL, &index_buffer) == VK_SUCCESS);
+        vkGetBufferMemoryRequirements(device, index_buffer, &req);
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = memory_type(gpu, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkDeviceMemory index_memory = 0;
+        CHECK(vkAllocateMemory(device, &alloc, NULL, &index_memory) == VK_SUCCESS);
+        CHECK(vkBindBufferMemory(device, index_buffer, index_memory, 0) == VK_SUCCESS);
+        CHECK(vkMapMemory(device, index_memory, 0, sizeof indices, 0, &mapped) == VK_SUCCESS);
+        memcpy(mapped, indices, sizeof indices);
+        vkUnmapMemory(device, index_memory);
+        static uint32_t gs_words[256];
+        VkShaderModuleCreateInfo gs_info = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        gs_info.codeSize = geometry_shader(gs_words) * 4;
+        gs_info.pCode = gs_words;
+        VkShaderModule gs = 0;
+        CHECK(vkCreateShaderModule(device, &gs_info, NULL, &gs) == VK_SUCCESS);
+        VkPipeline gs_pipeline = pipeline_full(device, offscreen_pass, layout, vs, fs, W, H, 0, VK_CULL_MODE_NONE,
+                                               VK_FRONT_FACE_COUNTER_CLOCKWISE, gs);
+        CHECK(gs_pipeline);
+        CHECK(vkResetFences(device, 1, &fence) == VK_SUCCESS);
+        CHECK(vkResetCommandBuffer(cmd, 0) == VK_SUCCESS);
+        CHECK(vkBeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
+        VkClearValue blue = { .color = { .float32 = { 0, 0, 1, 1 } } };
+        VkRenderPassBeginInfo gs_begin = {
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = offscreen_pass, .framebuffer = offscreen_fb,
+            .renderArea = { { 0, 0 }, { W, H } }, .clearValueCount = 1, .pClearValues = &blue
+        };
+        vkCmdBeginRenderPass(cmd, &gs_begin, VK_SUBPASS_CONTENTS_INLINE);
+        VkDeviceSize zero = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, offscreen_pipeline);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gs_pipeline);
+        vkCmdDraw(cmd, 1, 1, 2, 0);
+        vkCmdBindIndexBuffer(cmd, index_buffer, 0, VK_INDEX_TYPE_UINT16);
+        vkCmdDrawIndexed(cmd, 1, 1, 1, 1, 0);
+        vkCmdEndRenderPass(cmd);
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &region);
+        CHECK(vkEndCommandBuffer(cmd) == VK_SUCCESS);
+        CHECK(vkQueueSubmit(queue, 1, &submit, fence) == VK_SUCCESS);
+        CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS);
+        CHECK(vkMapMemory(device, rb_memory, 0, W * H * 4, 0, &mapped) == VK_SUCCESS);
+        memcpy(geometry[0], (unsigned char *)mapped + (50 * W + 32) * 4, 4);   // the quad
+        memcpy(geometry[1], (unsigned char *)mapped + (30 * W + 32) * 4, 4);   // the triangle
+        memcpy(geometry[2], (unsigned char *)mapped + (4 * W + 4) * 4, 4);     // the clear color
+        memcpy(geometry[3], (unsigned char *)mapped + (14 * W + 32) * 4, 4);   // (where an upside-down quad would be)
+        memcpy(geometry[4], (unsigned char *)mapped + (12 * W + 48) * 4, 4);   // the indexed quad
+        vkUnmapMemory(device, rb_memory);
+        vkDestroyPipeline(device, gs_pipeline, NULL);
+        vkDestroyShaderModule(device, gs, NULL);
+        vkDestroyBuffer(device, index_buffer, NULL);
+        vkFreeMemory(device, index_memory, NULL);
+    }
+    CHECK(geometry[0][0] == 0 && geometry[0][1] == 255 && geometry[0][2] == 0);   // green
+    CHECK(geometry[1][0] == 0 && geometry[1][1] == 0 && geometry[1][2] == 255);   // red
+    CHECK(geometry[2][0] == 255 && geometry[2][1] == 0 && geometry[2][2] == 0);   // blue
+    CHECK(geometry[3][1] == 0);
+    CHECK(geometry[4][0] == 0 && geometry[4][1] == 255 && geometry[4][2] == 0);
 
     // 4. A uniform buffer and push constants. The block holds a tint and two matrices (std140: 16 + 2 x 64 bytes);
     //    the pushed index picks the second, a translation by +0.5 in x, and the pushed offset adds +0.25 in y, so the
@@ -596,6 +733,7 @@ done:
            "(z 0.8 alone: %02x%02x%02x, then z 0.2: %02x%02x%02x), culling (back/ccw %s, back/cw %s, front/ccw %s), "
            "uniform mat4 picked by a pushed index and pushed colors (%s: %02x%02x%02x moved, %02x%02x%02x left, "
            "%02x%02x%02x pushed again), "
+           "geometry shader quads %02x%02x%02x, indexed %02x%02x%02x (triangle %02x%02x%02x, clear %02x%02x%02x kept), "
            "%d frames presented: %s\n",
            center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2], corner[3],
            near_base[2] == 255 && near_apex[0] == 255 ? "yes" : "NO",
@@ -603,7 +741,9 @@ done:
            depth_center[1][2], culled[0][0] == 255 ? "culled" : "DRAWN", culled[1][2] == 255 ? "drawn" : "CULLED",
            culled[2][2] == 255 ? "drawn" : "CULLED", uniform_drawn ? "drawn" : "NOT DRAWN",
            moved[0][0], moved[0][1], moved[0][2], moved[1][0], moved[1][1], moved[1][2],
-           moved[3][0], moved[3][1], moved[3][2], presented,
+           moved[3][0], moved[3][1], moved[3][2], geometry[0][0], geometry[0][1], geometry[0][2],
+           geometry[4][0], geometry[4][1], geometry[4][2],
+           geometry[1][0], geometry[1][1], geometry[1][2], geometry[2][0], geometry[2][1], geometry[2][2], presented,
            bad ? "FAILED" : "ok");
     return bad ? 1 : 0;
 }

@@ -687,10 +687,11 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
             if (f->numeric == VKF_UINT) c.clearColor = MTLClearColorMake(a->clear.color.uint32[0], a->clear.color.uint32[1], a->clear.color.uint32[2], a->clear.color.uint32[3]);
             else c.clearColor = MTLClearColorMake(a->clear.color.int32[0], a->clear.color.int32[1], a->clear.color.int32[2], a->clear.color.int32[3]);
         }
+        // (a pass that a geometry draw ends and resumes keeps everything: each part resolves what it has drawn so far)
         if (a->resolve && a->resolve->mtl) {
             c.resolveTexture = a->resolve->mtl;
-            c.storeAction = a->store == 0 ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionMultisampleResolve;
-        } else c.storeAction = a->store == 0 ? MTLStoreActionStore : MTLStoreActionDontCare;
+            c.storeAction = a->store == 0 || p->has_gs ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionMultisampleResolve;
+        } else c.storeAction = a->store == 0 || p->has_gs ? MTLStoreActionStore : MTLStoreActionDontCare;
         if (!w) { w = a->view->width; h = a->view->height; samples = (uint32_t)a->view->mtl.sampleCount; }
     }
     if (p->depth.view && p->depth.view->mtl) {
@@ -702,10 +703,10 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
             d.depthAttachment.texture = t;
             d.depthAttachment.loadAction = mtl_load(a->load);
             d.depthAttachment.clearDepth = a->clear.depthStencil.depth;
-            d.depthAttachment.storeAction = a->store == 0 ? MTLStoreActionStore : MTLStoreActionDontCare;
+            d.depthAttachment.storeAction = a->store == 0 || p->has_gs ? MTLStoreActionStore : MTLStoreActionDontCare;
             if (a->resolve && a->resolve->mtl) {
                 d.depthAttachment.resolveTexture = a->resolve->mtl;
-                d.depthAttachment.storeAction = a->store == 0 ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionMultisampleResolve;
+                d.depthAttachment.storeAction = a->store == 0 || p->has_gs ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionMultisampleResolve;
                 d.depthAttachment.depthResolveFilter = a->resolve_mode == VK_RESOLVE_MODE_MIN_BIT ? MTLMultisampleDepthResolveFilterMin :
                     a->resolve_mode == VK_RESOLVE_MODE_MAX_BIT ? MTLMultisampleDepthResolveFilterMax : MTLMultisampleDepthResolveFilterSample0;
             }
@@ -714,7 +715,7 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
             d.stencilAttachment.texture = t;
             d.stencilAttachment.loadAction = mtl_load(a->sload);
             d.stencilAttachment.clearStencil = a->clear.depthStencil.stencil;
-            d.stencilAttachment.storeAction = a->sstore == 0 ? MTLStoreActionStore : MTLStoreActionDontCare;
+            d.stencilAttachment.storeAction = a->sstore == 0 || p->has_gs ? MTLStoreActionStore : MTLStoreActionDontCare;
         }
         if (!w) { w = a->view->width; h = a->view->height; samples = (uint32_t)t.sampleCount; }
     }
@@ -732,6 +733,7 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
     e->pass_samples = samples;
     e->in_pass = 1;
     e->state_dirty = 1;
+    e->vis_mode = MTLVisibilityResultModeDisabled;
 }
 
 static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
@@ -739,46 +741,50 @@ static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
     bindings_state *b = &e->gb;
     uint32_t aux[256];
     uint32_t naux = 0;
+    // (with a geometry shader the render pipeline's vertex function is "vkpass": the shaders' sets go to the kernels)
+    uint32_t sets_vertex = pl->gs_kernel ? 0 : pl->sets_vertex;
+    uint8_t aux_vertex = pl->gs_kernel ? 0 : pl->aux_vertex, push_vertex = pl->gs_kernel ? 0 : pl->push_vertex;
     for (uint32_t s = 0; s < VKMSL_MAX_SETS; s++) {
         uint32_t mask = 1u << s;
-        if (!((pl->sets_vertex | pl->sets_fragment) & mask)) continue;
+        if (!((sets_vertex | pl->sets_fragment) & mask)) continue;
         struct VkDescriptorSet_T *ds = b->push[s] ? b->push[s] : b->sets[s];
         if (!ds) continue;
         if (b->push[s]) {
-            if (pl->sets_vertex & mask) [r setVertexBytes:ds->words length:ds->size atIndex:s];
+            if (sets_vertex & mask) [r setVertexBytes:ds->words length:ds->size atIndex:s];
             if (pl->sets_fragment & mask) [r setFragmentBytes:ds->words length:ds->size atIndex:s];
         } else {
-            if (pl->sets_vertex & mask) [r setVertexBuffer:ds->pool->buffer offset:ds->offset atIndex:s];
+            if (sets_vertex & mask) [r setVertexBuffer:ds->pool->buffer offset:ds->offset atIndex:s];
             if (pl->sets_fragment & mask) [r setFragmentBuffer:ds->pool->buffer offset:ds->offset atIndex:s];
         }
     }
-    if (pl->aux_vertex || pl->aux_fragment) {
+    if (aux_vertex || pl->aux_fragment) {
         for (uint32_t s = 0; s < pl->layout.set_count; s++)
             for (uint32_t k = 0; k < b->dyn_count[s] && pl->layout.dynamic_base[s] + k < 256; k++) {
                 aux[pl->layout.dynamic_base[s] + k] = b->dyn[s][k];
                 if (pl->layout.dynamic_base[s] + k + 1 > naux) naux = pl->layout.dynamic_base[s] + k + 1;
             }
         if (!naux) { aux[0] = 0; naux = 1; }
-        if (pl->aux_vertex) [r setVertexBytes:aux length:naux * 4 atIndex:VKMSL_AUX_BUFFER];
+        if (aux_vertex) [r setVertexBytes:aux length:naux * 4 atIndex:VKMSL_AUX_BUFFER];
         if (pl->aux_fragment) [r setFragmentBytes:aux length:naux * 4 atIndex:VKMSL_AUX_BUFFER];
     }
     uint32_t push_size = pl->layout.push_size ? (pl->layout.push_size + 15) & ~15u : 16;
     if (push_size > sizeof e->push) push_size = sizeof e->push;
-    if (pl->push_vertex) [r setVertexBytes:e->push length:push_size atIndex:VKMSL_PUSH_BUFFER];
+    if (push_vertex) [r setVertexBytes:e->push length:push_size atIndex:VKMSL_PUSH_BUFFER];
     if (pl->push_fragment) [r setFragmentBytes:e->push length:push_size atIndex:VKMSL_PUSH_BUFFER];
 }
 
-static void bind_sets_compute(vk_enc *e, const struct VkPipeline_T *pl) {
+// A compute stage's sets, dynamic offsets and push constants: the compute pipeline's, or a geometry draw's kernels'
+// (from the graphics bind point).
+static void bind_sets_kernel(vk_enc *e, const struct VkPipeline_T *pl, const bindings_state *b, uint32_t sets, int aux, int push) {
     id<MTLComputeCommandEncoder> c = e->compute;
-    bindings_state *b = &e->cb_;
     for (uint32_t s = 0; s < VKMSL_MAX_SETS; s++) {
-        if (!(pl->sets_compute & (1u << s))) continue;
+        if (!(sets & (1u << s))) continue;
         struct VkDescriptorSet_T *ds = b->push[s] ? b->push[s] : b->sets[s];
         if (!ds) continue;
         if (b->push[s]) [c setBytes:ds->words length:ds->size atIndex:s];
         else [c setBuffer:ds->pool->buffer offset:ds->offset atIndex:s];
     }
-    if (pl->aux_compute) {
+    if (aux) {
         uint32_t aux[256], naux = 1;
         aux[0] = 0;
         for (uint32_t s = 0; s < pl->layout.set_count; s++)
@@ -790,7 +796,10 @@ static void bind_sets_compute(vk_enc *e, const struct VkPipeline_T *pl) {
     }
     uint32_t push_size = pl->layout.push_size ? (pl->layout.push_size + 15) & ~15u : 16;
     if (push_size > sizeof e->push) push_size = sizeof e->push;
-    if (pl->push_compute) [c setBytes:e->push length:push_size atIndex:VKMSL_PUSH_BUFFER];
+    if (push) [c setBytes:e->push length:push_size atIndex:VKMSL_PUSH_BUFFER];
+}
+static void bind_sets_compute(vk_enc *e, const struct VkPipeline_T *pl) {
+    bind_sets_kernel(e, pl, &e->cb_, pl->sets_compute, pl->aux_compute, pl->push_compute);
 }
 
 static MTLViewport mtl_viewport(VkViewport v) {
@@ -870,7 +879,7 @@ static int prepare_draw(vk_enc *e) {
     if (!e->render || !p || !p->render) return 0;
     if (e->state_dirty) apply_render_state(e);
     bind_sets_render(e, p);
-    for (uint32_t b = 0; b < VKMSL_MAX_VERTEX_BUFFERS; b++) {
+    for (uint32_t b = 0; b < VKMSL_MAX_VERTEX_BUFFERS && !p->gs_kernel; b++) {
         if (!(p->vertex_bindings & (1u << b))) continue;
         VkBuffer vb = e->vb[b];
         id<MTLBuffer> mb = vb && vb->mtl ? vb->mtl : e->dev->zero_buffer;
@@ -893,6 +902,103 @@ static MTLPrimitiveType current_primitive(vk_enc *e) {
     case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: return MTLPrimitiveTypeTriangleStrip;
     default: return MTLPrimitiveTypeTriangle;
     }
+}
+
+// ---- geometry shaders ----
+// A draw with a geometry shader ends the Metal render pass, runs the vertex shader as a kernel over the draw's
+// vertices and instances (outputs to slots), the geometry shader as a kernel over its primitives (triangles out),
+// and resumes the pass to draw those triangles with "vkpass" and the fragment shader.
+static uint32_t gs_primitives(VkPrimitiveTopology t, uint32_t n) {
+    switch (t) {
+    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return n;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return n / 2;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return n > 1 ? n - 1 : 0;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN: return n > 2 ? n - 2 : 0;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY: return n / 4;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY: return n > 3 ? n - 3 : 0;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY: return n / 6;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: return n / 3;
+    default: return 0;   // (triangle strips with adjacency, patches)
+    }
+}
+static id<MTLBuffer> gs_scratch(vk_enc *e, int which, uint64_t size) {
+    // (one buffer of each kind per queue, larger when a draw needs it: the encoders before keep the old one alive)
+    id<MTLBuffer> b = e->queue->gs_scratch[which];
+    if (!b || b.length < size) {
+        uint64_t n = 1u << 20;
+        while (n < size) n *= 2;
+        b = [e->dev->mtl newBufferWithLength:n options:MTLResourceStorageModePrivate];
+        e->queue->gs_scratch[which] = b;
+    }
+    return b;
+}
+static void gs_draw(vk_enc *e, const c_draw *c, int indexed) {
+    struct VkPipeline_T *p = e->gp;
+    VkPrimitiveTopology topo = (p->dynamic & VK_DYN_TOPOLOGY) ? e->topology : p->topology;
+    uint32_t prims = gs_primitives(topo, c->count);
+    if (!prims || !p->gs_max_tris || (indexed && (!e->ib || !e->ib->mtl))) return;
+    int i16 = indexed && e->ib_type == VK_INDEX_TYPE_UINT16;
+    uint64_t runs = (uint64_t)prims * c->instances * p->gs_invocations;
+    uint64_t vsize = (uint64_t)c->count * c->instances * p->gs_in_slots * 16;
+    uint64_t tsize = runs * p->gs_max_tris * 3 * p->gs_out_slots * 16;
+    if (vsize > (1ull << 31) || tsize > (1ull << 31)) { TRACE("geometry draw of %llu runs skipped", (unsigned long long)runs); return; }
+    id<MTLBuffer> vout = gs_scratch(e, 0, vsize), tris = gs_scratch(e, 1, tsize), counts = gs_scratch(e, 2, runs * 4);
+    vkmsl_gs_params gp = { c->count, c->instances, c->first, c->first_instance, c->vertex_offset, (uint32_t)indexed, (uint32_t)i16,
+                           prims, (uint32_t)topo, p->gs_invocations, p->gs_in_slots, p->gs_max_tris };
+    pass_desc resume = e->pass;
+    for (uint32_t i = 0; i < resume.color_count; i++) resume.colors[i].load = 0;
+    resume.depth.load = resume.depth.sload = 0;
+    MTLVisibilityResultMode vis = e->vis_mode;
+    uint64_t vis_offset = e->vis_offset;
+
+    id<MTLComputeCommandEncoder> ce = compute_encoder(e);
+    // The vertex shader: its vertex buffers start at the draw's first vertex (or base vertex) and first instance.
+    [ce setComputePipelineState:p->gs_vs[indexed ? (i16 ? 1 : 2) : 0]];
+    bind_sets_kernel(e, p, &e->gb, p->sets_vertex, p->aux_vertex, p->push_vertex);
+    for (uint32_t b = 0; b < VKMSL_MAX_VERTEX_BUFFERS; b++) {
+        if (!(p->vertex_bindings & (1u << b))) continue;
+        VkBuffer vb = e->vb[b];
+        uint64_t stride = (p->dynamic & VK_DYN_STRIDE) && e->vb_stride[b] ? e->vb_stride[b] : p->vertex_strides[b];
+        int64_t first = p->vertex_rate[b] ? (p->vertex_divisor[b] ? c->first_instance / p->vertex_divisor[b] : 0) :
+                        indexed ? c->vertex_offset : (int64_t)c->first;
+        int64_t off = vb && vb->mtl ? (int64_t)(vb->offset + e->vb_offset[b]) + first * (int64_t)stride : 0;
+        if (off < 0) {
+            // (the kernel's stage input starts at the buffer offset: a negative vertexOffset before the binding's
+            //  start cannot be expressed)
+            static int once;
+            if (!once++) vx_log("vulkan: a geometry draw's vertexOffset %d reaches before its vertex buffer (not supported)", c->vertex_offset);
+            off = 0;
+        }
+        id<MTLBuffer> mb = vb && vb->mtl ? vb->mtl : e->dev->zero_buffer;
+        if (p->dynamic & VK_DYN_STRIDE) [ce setBuffer:mb offset:(NSUInteger)off attributeStride:stride atIndex:VKMSL_VERTEX_BUFFER + b];
+        else [ce setBuffer:mb offset:(NSUInteger)off atIndex:VKMSL_VERTEX_BUFFER + b];
+    }
+    if (indexed) [ce setBuffer:e->ib->mtl offset:e->ib->offset + e->ib_offset + (uint64_t)c->first * (i16 ? 2 : 4) atIndex:VKMSL_GS_INDEX];
+    else [ce setBuffer:e->dev->zero_buffer offset:0 atIndex:VKMSL_GS_INDEX];
+    [ce setBytes:&gp length:sizeof gp atIndex:VKMSL_GS_PARAMS];
+    [ce setBuffer:vout offset:0 atIndex:VKMSL_GS_IN];
+    if (p->vertex_bindings) [ce setStageInRegion:MTLRegionMake2D(0, 0, c->count, c->instances)];
+    NSUInteger w = p->gs_vs[0].threadExecutionWidth;
+    [ce dispatchThreads:MTLSizeMake(c->count, c->instances, 1) threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+    // The geometry shader over the primitives (y: instance and invocation).
+    [ce setComputePipelineState:p->gs_kernel];
+    bind_sets_kernel(e, p, &e->gb, p->sets_geometry, p->aux_geometry, p->push_geometry);
+    [ce setBytes:&gp length:sizeof gp atIndex:VKMSL_GS_PARAMS];
+    [ce setBuffer:vout offset:0 atIndex:VKMSL_GS_IN];
+    [ce setBuffer:tris offset:0 atIndex:VKMSL_GS_OUT];
+    [ce setBuffer:counts offset:0 atIndex:VKMSL_GS_COUNT];
+    w = p->gs_kernel.threadExecutionWidth;
+    [ce dispatchThreads:MTLSizeMake(prims, c->instances * p->gs_invocations, 1) threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+    // The pass again, drawing the triangles.
+    begin_render(e, &resume);
+    if (vis != MTLVisibilityResultModeDisabled) {
+        [e->render setVisibilityResultMode:vis offset:vis_offset];
+        e->vis_mode = vis; e->vis_offset = vis_offset;
+    }
+    if (!prepare_draw(e)) return;
+    [e->render setVertexBuffer:tris offset:0 atIndex:0];
+    [e->render setVertexBuffer:counts offset:0 atIndex:1];
+    [e->render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)(runs * p->gs_max_tris * 3)];
 }
 
 static void bind_sets(vk_enc *e, const c_bind_sets *c) {
@@ -1028,6 +1134,27 @@ static VkQueryPool pass_occlusion_pool(const uint8_t *from, const vk_chunk *chun
     return NULL;
 }
 
+// Looks ahead in a pass for draws with a geometry shader (they end and resume the Metal pass: it stores everything).
+static int pass_has_gs(const uint8_t *from, const vk_chunk *chunk, VkPipeline gp) {
+    for (const vk_chunk *c = chunk; c; c = c->next) {
+        const uint8_t *p = c == chunk ? from : c->data;
+        while (p < c->data + c->used) {
+            const cmd *h = (const cmd *)p;
+            if (h->op == C_END_PASS) return 0;
+            if (h->op == C_BIND_PIPELINE && ((const c_bind_pipeline *)h)->point == VK_PIPELINE_BIND_POINT_GRAPHICS) gp = ((const c_bind_pipeline *)h)->pipeline;
+            if ((h->op == C_DRAW || h->op == C_DRAW_INDEXED) && gp && gp->gs_kernel) return 1;
+            if (h->op == C_EXECUTE) {
+                const c_execute *x = (const c_execute *)h;
+                const VkCommandBuffer *list = (const VkCommandBuffer *)(x + 1);
+                for (uint32_t i = 0; i < x->count; i++)
+                    if (list[i]->first && pass_has_gs(list[i]->first->data, list[i]->first, gp)) return 1;
+            }
+            p += h->size;
+        }
+    }
+    return 0;
+}
+
 static void encode_list(vk_enc *e, VkCommandBuffer cb) {
     for (vk_chunk *chunk = cb->first; chunk; chunk = chunk->next) {
         for (size_t pos = 0; pos < chunk->used;) {
@@ -1109,6 +1236,7 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
             }
             case C_DRAW: case C_DRAW_INDEXED: {
                 c_draw *c = (c_draw *)h;
+                if (c->count && c->instances && e->render && e->gp && e->gp->gs_kernel) { gs_draw(e, c, h->op == C_DRAW_INDEXED); break; }
                 if (!c->count || !c->instances || !prepare_draw(e)) break;
                 MTLPrimitiveType pt = current_primitive(e);
                 if (h->op == C_DRAW)
@@ -1124,6 +1252,11 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
             }
             case C_DRAW_INDIRECT: {
                 c_draw_indirect *c = (c_draw_indirect *)h;
+                if (e->gp && e->gp->gs_kernel) {
+                    static int once;
+                    if (!once++) vx_log("vulkan: indirect draws with a geometry shader are not supported (skipped)");
+                    break;
+                }
                 if (!prepare_draw(e) || !c->buffer->mtl) break;
                 MTLPrimitiveType pt = current_primitive(e);
                 uint32_t draws = c->draws;
@@ -1166,6 +1299,7 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
             case C_BEGIN_PASS: {
                 c_begin_pass *c = (c_begin_pass *)h;
                 c->pass.occlusion = pass_occlusion_pool((uint8_t *)h + h->size, chunk);
+                c->pass.has_gs = (uint8_t)pass_has_gs((uint8_t *)h + h->size, chunk, e->gp);
                 begin_render(e, &c->pass);
                 break;
             }
@@ -1232,14 +1366,19 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
             }
             case C_BEGIN_QUERY: {
                 c_query *c = (c_query *)h;
-                if (c->pool->type == VK_QUERY_TYPE_OCCLUSION && e->render && e->pass.occlusion == c->pool)
-                    [e->render setVisibilityResultMode:(c->flags & VK_QUERY_CONTROL_PRECISE_BIT) ? MTLVisibilityResultModeCounting :
-                                                       MTLVisibilityResultModeBoolean offset:c->query * 8];
+                if (c->pool->type == VK_QUERY_TYPE_OCCLUSION && e->render && e->pass.occlusion == c->pool) {
+                    e->vis_mode = (c->flags & VK_QUERY_CONTROL_PRECISE_BIT) ? MTLVisibilityResultModeCounting : MTLVisibilityResultModeBoolean;
+                    e->vis_offset = c->query * 8;
+                    [e->render setVisibilityResultMode:e->vis_mode offset:e->vis_offset];
+                }
                 break;
             }
             case C_END_QUERY: {
                 c_query *c = (c_query *)h;
-                if (c->pool->type == VK_QUERY_TYPE_OCCLUSION && e->render) [e->render setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+                if (c->pool->type == VK_QUERY_TYPE_OCCLUSION && e->render) {
+                    [e->render setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+                    e->vis_mode = MTLVisibilityResultModeDisabled;
+                }
                 if (c->query < c->pool->count) c->pool->available[c->query] = 2;   // (available when the command buffer completes)
                 break;
             }
