@@ -423,12 +423,29 @@ compares its bytes at its start). What it found:
 - With that, Unity's heap came apart about 40 s in (List.EnsureCapacity on a null list, allocator headers garbage).
   Bisected over the translator's commits (b3b2368 applied to each): add02ef's self-linked sites, only in checked
   blocks. Not linked there now (eff0df3); why the two together break is not found yet.
-- Left: Mono reports its collation tailoring table broken for the invariant culture (a managed check in
-  Mono.Globalization.Unicode.SimpleCollator; not with Rosetta), and one run of two ended early. The forms are
+- Mono reported its collation tailoring table broken for the invariant culture (a managed check in
+  Mono.Globalization.Unicode.SimpleCollator; not with Rosetta), and one run of two ended early. The forms were
   identical to Rosetta in the ordered mode too (difftest DT_ORDERED, now part of translator-check), and random
-  programs as well, so the cause is in something those do not cover.
+  programs as well: the cause was in the engine's linking, which those do not reach (2026-10-23).
+  The table itself is right (mscorlib's `collation.tailoring.bin`: the invariant culture's 223 chars are
+  replacements, `3, from, 0, to..., 0`); the parse went wrong at char 17, the end of the third (ß -> "ss"): the loop
+  `while (tarr[l] != 0) l++` (Mono's JIT: `add [rbp-40h], 1; ...; movzx eax, word [rax]; test eax, eax; jne`) left
+  one char early. Reproduced without SteamVR by a small program that loads The Lab's mono-2.0-bdwgc.dll and calls
+  String.Equals(a, b, InvariantCultureIgnoreCase) (half a second; on this runtime it then also stopped at Mono's
+  assertion `tls_offsets [key]`, a consequence: the exception path wanted TLS slot 0). Blocks of 1-3 instructions
+  (`XE_MAX_INSNS`) made it pass, and `XE_BISECT` found the one block that broke it whole: that loop, one checked
+  block jumping to itself. Translated right; what went wrong was the link: the link stub keeps the site it came from
+  in ctx->link and goes on through the lookup when the target is translated already, so the site stays in ctx->link
+  while the code runs on; when it next came back to C from a checked block that found its bytes changed (S1 = that
+  block, frequent in Mono's JIT code), the engine linked the old site to that block. The loop's back edge (or its
+  exit) then went to unrelated code. Now a site is linked only when its own target is where the code came back.
+  `tests/smc.c` case 5 (in check-arm64) builds exactly that: A's JNZ to B, B already translated, C changed; before,
+  the second call of A skipped B (9 instead of 11).
 
-Tools made for it: `VXRT_TRACE_FAULTS=1` logs each fault with RSP, the stack's range and the code addresses above RSP
+Tools made for it: `XE_MAX_INSNS=n` (blocks of at most n instructions) and `XE_BISECT=bits:value` (with it, only the
+blocks whose first 12 bytes hash to value in their low bits are whole, and are listed: double bits until one block
+is left); XE_DUMP also writes each block's x86 bytes (an `x86` line: JIT code is gone or different later).
+`VXRT_TRACE_FAULTS=1` logs each fault with RSP, the stack's range and the code addresses above RSP
 (module+offset, or JIT code); `VXRT_TRACE_FAULTS_DUMP=<file>` writes the 8 KB of x86 code around RIP and the stack's
 last 4 KB (a disassembler takes the code as `.byte` lines assembled for x86_64 and `llvm-objdump --start-address`).
 

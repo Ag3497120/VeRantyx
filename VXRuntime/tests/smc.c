@@ -49,7 +49,28 @@ int main(void) {
     }
     CHECK(ok4 == 20);
 
-    printf("smc: in place %d/200, with data on the page %d/2000, self-modifying %d/3, reallocated %d/20: %d failed checks -> %s\n",
-           ok1, ok2, ok3, ok4, failed, failed ? "FAILED" : "ok");
+    // 5. a jump reaching its translated target through the lookup (not linked yet), then a block found changed: the
+    //    engine went back to C from that block's check while it still had the jump's site as the one to link, and
+    //    linked the jump to the changed block. On a page written often (its blocks check their bytes: Mono's JIT).
+    //    A: mov eax, 1; test ecx, ecx; jnz B; ret    B: add eax, 2; jmp C    C: add eax, 4; ret  (then add eax, 8)
+    unsigned char *p5 = VirtualAlloc(NULL, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    unsigned char *a5 = p5, *b5 = p5 + 64, *c5 = p5 + 128;
+    volatile int *data5 = (volatile int *)(p5 + 8192);
+    unsigned char ca[] = { 0xB8, 1, 0, 0, 0, 0x85, 0xC9, 0x0F, 0x85, 0, 0, 0, 0, 0xC3 };
+    int rel = (int)(b5 - (a5 + 13)); memcpy(ca + 9, &rel, 4);
+    unsigned char cb[] = { 0x83, 0xC0, 0x02, 0xE9, 0, 0, 0, 0 };
+    rel = (int)(c5 - (b5 + 8)); memcpy(cb + 4, &rel, 4);
+    unsigned char cc[] = { 0x83, 0xC0, 0x04, 0xC3 };
+    memcpy(a5, ca, sizeof ca); memcpy(b5, cb, sizeof cb); memcpy(c5, cc, sizeof cc);
+    typedef int (*fn1)(int);
+    for (int i = 0; i < 40; i++) { ((fn1)a5)(0); data5[i] = i; }        // (the page written often: checked blocks)
+    int r5a = ((fn1)a5)(0);                                               // A, its JNZ not taken yet
+    ((fn)b5)();                                                           // B and C translated
+    c5[2] = 0x08;                                                         // C changed
+    int r5c = ((fn1)a5)(1), r5d = ((fn1)a5)(1);                           // A -> B -> C, twice
+    CHECK(r5a == 1); CHECK(r5c == 11); CHECK(r5d == 11);
+
+    printf("smc: in place %d/200, with data on the page %d/2000, self-modifying %d/3, reallocated %d/20, linked past a changed block %d %d: %d failed checks -> %s\n",
+           ok1, ok2, ok3, ok4, r5c, r5d, failed, failed ? "FAILED" : "ok");
     return failed != 0;
 }

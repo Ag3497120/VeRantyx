@@ -362,7 +362,21 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
             page_rec *r = page_at(e, rip & ~(uint64_t)(PAGE - 1), 0), *r2 = page_at(e, (rip + 1024) & ~(uint64_t)(PAGE - 1), 0);
             b.check_bytes = (r && r->unprotected) || (r2 && r2->unprotected);
         }
-        if (xlat_block_linked(&b, rip, once ? 1 : 64, &end) < 0) { free(b.code); free(b.relocs); free(b.imap); return -1; }
+        int max = 64;                                                     // (bisecting: XE_MAX_INSNS=n makes blocks of at most n
+        static int small = -1; static const char *only;                  //  instructions; with XE_BISECT=bits:value only blocks
+        if (small < 0) { const char *m = getenv("XE_MAX_INSNS"); small = m && atoi(m) > 0 && atoi(m) < 64 ? atoi(m) : 0; only = getenv("XE_BISECT"); }
+        if (small) {                                                      //  whose first bytes hash to it keep 64, and are listed)
+            max = small;
+            if (only && strchr(only, ':')) {
+                uint32_t h = 2166136261u;
+                for (uint64_t a = rip; a < rip + 12 && ((a ^ rip) & ~0xFFFull) == 0; a++) h = (h ^ *(const uint8_t *)(uintptr_t)a) * 16777619u;
+                int nbits = atoi(only);
+                if ((h & ((1u << nbits) - 1)) == (uint32_t)strtoul(strchr(only, ':') + 1, NULL, 0)) {
+                    max = 64; fprintf(stderr, "[vxrt] engine: bisect: block %#llx (hash %08x) whole\n", (unsigned long long)rip, h);
+                }
+            }
+        }
+        if (xlat_block_linked(&b, rip, once ? 1 : max, &end) < 0) { free(b.code); free(b.relocs); free(b.imap); return -1; }
     }
     if (e->used + b.n > e->cap || e->nblocks + 1 >= (1u << (MAP_BITS - 1))) {   // (full: start over; nblocks: since the last)
         xe_flush(e);
@@ -403,6 +417,8 @@ static int64_t block_ex(xe *e, uint64_t rip, uint64_t stop, int once) {
     if (dump) {
         fprintf(dump, "block %llx-%llx at %p:", (unsigned long long)rip, (unsigned long long)end, (void *)at);
         for (size_t i = 0; i < b.n; i++) fprintf(dump, " %08x", at[i]);
+        fprintf(dump, "\nx86");                                           // (and the bytes it was made from: JIT code changes)
+        if (!thunk) for (uint64_t a = rip; a < end; a++) fprintf(dump, " %02x", *(const uint8_t *)(uintptr_t)a);
         fprintf(dump, "\n"); fflush(dump);
     }
     e->used += b.n;
@@ -456,10 +472,14 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
         uint64_t host = e->blocks[id].host;
         if (c->link) {                                                    // (patch the site that came here: a call's stays BL)
             // (only while it still goes to a link stub: two threads can leave through one site, and the second
-            //  would take the first one's BL to the block for a jump's site)
+            //  would take the first one's BL to the block for a jump's site. And only when its target is where the
+            //  code came back: when the lookup finds the target, the site stays in ctx->link while the code runs on,
+            //  and the code may come back from elsewhere, a checked block that found its bytes changed; linked to
+            //  that block, the site went to unrelated code: Mono's loops in The Lab, its collation table broken)
             uint32_t *p = (uint32_t *)(uintptr_t)c->link, *to = p + ((int32_t)(*p << 6) >> 6);
-            if ((*p & 0xFC000000u) == 0x94000000u && (to == e->link_call || to == e->link)) {
-                int call = to == e->link_call;
+            int call = to == e->link_call;
+            uint64_t target = call ? ((uint64_t)p[4] | (uint64_t)p[5] << 32) : ((uint64_t)p[1] | (uint64_t)p[2] << 32);
+            if ((*p & 0xFC000000u) == 0x94000000u && (to == e->link_call || to == e->link) && target == c->rip) {
                 int32_t words = (int32_t)((uint32_t *)(uintptr_t)host - p);
                 writable(1); *p = call ? a64_bl(words) : a64_b(words); writable(0);
                 add_site(e, (uint32_t)id, p, call);

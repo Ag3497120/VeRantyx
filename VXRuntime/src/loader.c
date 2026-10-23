@@ -720,7 +720,7 @@ static void *(WINAPI *g_ovr_get_interface)(const char *, int *);
 static ovr_wait_fn g_ovr_wait; static ovr_submit_fn g_ovr_submit; static ovr_handoff_fn g_ovr_handoff;
 static int ovr_note(unsigned *count, int error) { unsigned n = __sync_add_and_fetch(count, 1); return n <= 20 || error || n % 1000 == 0 ? (int)n : 0; }
 
-#ifdef __x86_64__
+#if defined(__x86_64__) && !defined(VX_ABI_SCAN)   // (x86 only: tools/vx_abi_scan.py makes no ARM64 thunks for these)
 // The compositor's other methods (8 to 39, those that point into vrclient) are counted by thunks that only bump a
 // counter and jump on, whatever their arguments; the counts are logged with every 200th WaitGetPoses.
 static volatile int g_ovr_counts[40];
@@ -772,7 +772,7 @@ static void ovr_patch_rest(void **vtbl, void *any_method) {
     if (getenv("VXRT_OPENVR_NO_SKYBOX") && g_ovr_orig[12]) vtbl[12] = (void *)ovr_skip_skybox;   // (014: SetSkyboxOverride)
 }
 
-#ifdef __x86_64__
+#if defined(__x86_64__) && !defined(VX_ABI_SCAN)
 // IVROverlay: FindOverlay (0) and CreateOverlay (1) are logged with their keys; the rest (2 to 89) are counted.
 static volatile int g_ovl_counts[90];
 static void *g_ovl_orig[90];
@@ -931,11 +931,12 @@ static void ovr_log_counts(void) {
 #else
 static void ovr_patch_rest(void **vtbl, void *any_method) { (void)vtbl; (void)any_method; }
 static void ovr_log_counts(void) {}
+static void ovl_patch(void **vtbl) { (void)vtbl; }
 #endif
 static WINAPI int ovr_wait(void *this, void *render, uint32_t nrender, void *game, uint32_t ngame) {
     static unsigned count;
     int r = g_ovr_wait(this, render, nrender, game, ngame);
-#ifdef __x86_64__
+#if defined(__x86_64__) && !defined(VX_ABI_SCAN)
     g_ovr_this = this;
 #endif
     int n = ovr_note(&count, r);
