@@ -523,10 +523,12 @@ static void render_pass_uses(struct VkRenderPass_T *rp) {
     for (uint32_t a = 0; a < rp->attachment_count; a++) { rp->first_use[a] = UINT32_MAX; rp->last_use[a] = 0; }
     for (uint32_t s = 0; s < rp->subpass_count; s++) {
         const vk_subpass *sp = &rp->subpasses[s];
-        uint32_t used[20], n = 0;
+        uint32_t used[32], n = 0;
         for (uint32_t i = 0; i < sp->color_count; i++) { used[n++] = sp->colors[i]; used[n++] = sp->resolves[i]; }
         used[n++] = sp->depth;
         used[n++] = sp->depth_resolve;
+        // (an input attachment read in a later subpass keeps what the earlier ones wrote: stored, whatever its storeOp)
+        for (uint32_t i = 0; i < sp->input_count && i < 8; i++) used[n++] = sp->inputs[i];
         for (uint32_t i = 0; i < n; i++) {
             uint32_t a = used[i];
             if (a == VK_ATTACHMENT_UNUSED || a >= rp->attachment_count) continue;

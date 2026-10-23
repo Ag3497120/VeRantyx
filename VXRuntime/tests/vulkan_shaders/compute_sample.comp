@@ -1,0 +1,21 @@
+// Sampling formats and samplers: a BC1 block, sRGB, B10G11R11, the last level of a blitted mip chain, a depth
+// texture with a comparison sampler and a repeating nearest sampler.
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D bc1;
+layout(set = 0, binding = 1) uniform sampler2D srgb;
+layout(set = 0, binding = 2) uniform sampler2D packedf;
+layout(set = 0, binding = 3) uniform sampler2D mips;
+layout(set = 0, binding = 4) uniform sampler2DShadow shadow;
+layout(set = 0, binding = 5) uniform sampler2D repeating;
+layout(std430, set = 0, binding = 6) buffer Out { vec4 r[]; };
+
+void main() {
+    r[0] = textureLod(bc1, vec2(0.125, 0.5), 0.0);
+    r[1] = textureLod(bc1, vec2(0.875, 0.5), 0.0);
+    r[2] = textureLod(srgb, vec2(0.25, 0.25), 0.0);
+    r[3] = textureLod(packedf, vec2(0.25, 0.25), 0.0);
+    r[4] = textureLod(mips, vec2(0.5), 3.0);
+    r[5] = vec4(textureLod(shadow, vec3(0.5, 0.5, 0.25), 0.0), textureLod(shadow, vec3(0.5, 0.5, 0.75), 0.0), 0.0, 0.0);
+    r[6] = textureLod(repeating, vec2(1.25, 0.5), 0.0);
+}

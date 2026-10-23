@@ -2,6 +2,10 @@
 // memory is placement heaps, descriptor sets are Metal 3 argument buffers written by vkUpdateDescriptorSets, shaders
 // are translated by vk_msl.c, and command buffers record into a compact list of their own that vkQueueSubmit encodes
 // into a Metal command buffer (Vulkan command buffers are reusable and recorded on any thread; Metal's are neither).
+// Why commands go straight to Metal rather than through the common GPU IR: the cost per draw. Recording every draw in
+// the GPU IR (descriptor snapshots, resource objects) was what 506c510 took out of Direct3D 11 (~11 us of CPU per
+// draw, the render thread the frame-rate limit). Why shaders have a translator of their own is a separate decision,
+// not about speed (vk_msl.h).
 #ifndef VX_VK_IMPL_H
 #define VX_VK_IMPL_H
 #include "vulkan/vulkan_core.h"

@@ -1,0 +1,40 @@
+// Storage buffers (std430 structs, a runtime array after a header), push constants, specialization constants (the
+// workgroup size and a scale), shared memory and a barrier, function calls with an inout parameter, a loop with
+// continue and break, a switch, a subgroup sum and an atomic counter.
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const int SCALE = 1;
+struct Item { vec2 v; uint id; float w; };
+layout(std430, set = 0, binding = 0) readonly buffer In { Item items[]; };
+layout(std430, set = 0, binding = 1) buffer Out { uint counter; uint pad0, pad1, pad2; vec4 results[]; };
+layout(push_constant) uniform PC { float bias; uint count; } pc;
+shared float partial[64];
+
+float weigh(Item it, inout uint hits) {
+    float s = 0.0;
+    for (int i = 0; i < 4; i++) {
+        if (i == 2) continue;
+        s += it.v.x * float(i) - it.v.y;
+        if (s > 1000.0) break;
+    }
+    switch (it.id % 3u) {
+    case 0u: s += 1.0; hits++; break;
+    case 1u: s *= 2.0; break;
+    default: s -= 0.5; break;
+    }
+    return s * it.w;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint hits = 0u;
+    float s = i < pc.count ? weigh(items[i], hits) * float(SCALE) + pc.bias : 0.0;
+    partial[gl_LocalInvocationID.x] = s;
+    barrier();
+    float neighbour = partial[gl_LocalInvocationID.x ^ 1u];
+    float lanes = subgroupAdd(1.0);
+    if (hits > 0u) atomicAdd(counter, 1u);
+    if (i < pc.count) results[i] = vec4(s, neighbour, lanes == float(gl_SubgroupSize) ? 1.0 : 0.0, float(hits));
+}

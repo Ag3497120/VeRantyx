@@ -33,7 +33,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/game_imports.exe
+       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -563,6 +563,15 @@ build/vulkan-1.def: build/vxrt
 build/libvulkan-1.a: build/vulkan-1.def
 	x86_64-w64-mingw32-dlltool -d $< -l $@ -m i386:x86-64
 
+build/vulkan_shaders.exe: tests/vulkan_shaders.c $(wildcard tests/vulkan_shaders/*.h) build/libvulkan-1.a third_party/vulkan/vulkan/vulkan_core.h
+	$(MINGW) -O1 -Wall -Ithird_party/vulkan -o $@ $< -Lbuild -lvulkan-1
+
+# The SPIR-V of tests/vulkan_shaders/* is committed (as C arrays): after changing a shader there, run this (needs
+# glslang); the tests themselves need no shader compiler.
+vulkan-test-shaders:
+	cd tests/vulkan_shaders && for f in *.comp *.vert *.frag *.geom; do \
+		glslang -V --target-env vulkan1.2 --vn spv_$$(echo $$f | tr . _) -o $$f.h $$f > /dev/null || exit 1; done
+
 build/vulkan_features.exe: tests/vulkan_features.c build/libvulkan-1.a third_party/vulkan/vulkan/vulkan_core.h
 	$(MINGW) -O1 -Wall -Ithird_party/vulkan -o $@ $< -Lbuild -lvulkan-1
 
@@ -1071,6 +1080,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/d3d12_fxc.exe
 	$(VXRT) build/d3d11on12.exe
 	$(VXRT) build/vulkan_features.exe
+	$(VXRT) build/vulkan_shaders.exe
 	$(VXRT) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv \
 		build/vulkan_spirv_uniform_vertex_fixture.spv build/vulkan_spirv_uniform_fragment_fixture.spv
 	$(VXRT) build/input.exe
@@ -1104,4 +1114,4 @@ build/d3d12_bench.exe: tests/d3d12_bench.c tests/shaders/tex_vs.dxbc tests/shade
 clean:
 	rm -rf build
 
-.PHONY: vr-check all tests check bench d3d12-bench clean shaders translator-check
+.PHONY: vr-check all tests check bench d3d12-bench clean shaders translator-check vulkan-test-shaders

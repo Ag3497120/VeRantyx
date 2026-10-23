@@ -232,6 +232,7 @@ static void fill_features(VkPhysicalDevice phys, VkPhysicalDeviceFeatures *f) {
     f->shaderStorageBufferArrayDynamicIndexing = 1; f->shaderStorageImageArrayDynamicIndexing = 1;
     f->shaderClipDistance = 1; f->shaderInt16 = 1; f->shaderInt64 = 1; f->shaderResourceMinLod = 1;
     f->inheritedQueries = 1;
+    f->geometryShader = 1;   // (as kernels: vk_command.m)
 }
 static void fill_features11(VkPhysicalDeviceVulkan11Features *f) {
     f->storageBuffer16BitAccess = 1; f->uniformAndStorageBuffer16BitAccess = 1; f->storagePushConstant16 = 1;

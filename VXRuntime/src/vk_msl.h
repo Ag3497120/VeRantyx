@@ -1,6 +1,10 @@
 // SPIR-V → Metal Shading Language, directly (as dxbc.c does for DXBC), for the Vulkan front end.
 // It reads the SPIR-V that GLSL and HLSL compilers produce for real games (structured control flow, phis, images,
 // buffers of any std140/std430 layout, subgroup operations) and writes one MSL entry point.
+// Why directly and not SPIR-V -> common GPU IR -> MSL (a shader is translated once, so this is not about speed):
+// coverage of the SPIR-V games produce (the shared path translated none of a 400-module sample of a game's shaders),
+// MSL being close to SPIR-V's structured form (a direct translation stays small and readable), and the Direct3D 12
+// work changing the common IR at the same time (no conflicts between the two).
 //
 // Resource model (the Vulkan front end binds the same way):
 //   descriptor set s      -> [[buffer(s)]], an argument buffer of 8-byte words (Metal 3 resource IDs and GPU

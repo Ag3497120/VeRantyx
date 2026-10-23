@@ -71,7 +71,7 @@ enum {
     OpLoad = 61, OpStore = 62, OpCopyMemory = 63, OpAccessChain = 65, OpInBoundsAccessChain = 66,
     OpArrayLength = 68, OpDecorate = 71, OpMemberDecorate = 72, OpDecorationGroup = 73, OpGroupDecorate = 74,
     OpGroupMemberDecorate = 75, OpVectorExtractDynamic = 77, OpVectorInsertDynamic = 78, OpVectorShuffle = 79,
-    OpCompositeConstruct = 80, OpCompositeExtract = 81, OpCompositeInsert = 82, OpCopyObject = 83,
+    OpCompositeConstruct = 80, OpCompositeExtract = 81, OpCompositeInsert = 82, OpCopyObject = 83, OpCopyLogical = 400,
     OpTranspose = 84, OpSampledImage = 86, OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88,
     OpImageSampleDrefImplicitLod = 89, OpImageSampleDrefExplicitLod = 90, OpImageSampleProjImplicitLod = 91,
     OpImageSampleProjExplicitLod = 92, OpImageSampleProjDrefImplicitLod = 93, OpImageSampleProjDrefExplicitLod = 94,
@@ -1316,6 +1316,31 @@ static void declare(T *t, uint32_t id) {
 }
 static const char *dst(T *t, uint32_t id) { declare(t, id); return value(t, id); }
 
+// OpCopyLogical: a value of one struct or array type into another of the same shape (a buffer's laid-out struct
+// passed as a function's plain one), member by member.
+static void copy_logical(T *t, const char *d, uint32_t dt, const char *src, uint32_t st, int depth) {
+    if (dt == st || (type_op(t, dt) != OpTypeStruct && type_op(t, dt) != OpTypeArray) || type_op(t, dt) != type_op(t, st)) {
+        EMIT("%s = %s;\n", d, src);
+        return;
+    }
+    ent *de = E(t, dt), *se = E(t, st);
+    if (type_op(t, dt) == OpTypeStruct) {
+        for (uint32_t i = 1; i < de->n && i < se->n; i++) {
+            char *dm = xprintf("%s.m%u", d, i - 1), *sm = xprintf("(%s).m%u", src, i - 1);
+            copy_logical(t, dm, de->w[i], sm, se->w[i], depth);
+            free(dm); free(sm);
+        }
+        return;
+    }
+    int ok = 1;
+    uint32_t n = const_u32(t, de->w[2], &ok);
+    EMIT("for (uint _cl%d = 0; _cl%d < %uu; _cl%d++) {\n", depth, depth, n, depth);
+    char *dm = xprintf("%s[_cl%d]", d, depth), *sm = xprintf("(%s)[_cl%d]", src, depth);
+    copy_logical(t, dm, de->w[1], sm, se->w[1], depth + 1);
+    free(dm); free(sm);
+    EMIT("}\n");
+}
+
 // The same-shape type with the given integer signedness, as an MSL name.
 static char *int_type(T *t, uint32_t type, int s) {
     uint32_t n = vec_size(t, type), w = scalar_width(t, type);
@@ -2218,6 +2243,7 @@ static void emit_insn(T *t, uint32_t op, const uint32_t *w, uint32_t n) {
         free(i);
         return;
     }
+    case OpCopyLogical: copy_logical(t, dst(t, w[1]), w[0], value(t, w[2]), vtype(t, w[2]), 0); return;
     case OpCopyObject: {
         ent *s = E(t, w[2]);
         if (s->ptr) { E(t, w[1])->ptr = copy_ptr(s->ptr); return; }
