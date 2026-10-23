@@ -30,6 +30,7 @@ INTERFACES = {
     "dxgi1_4.h": ["IDXGIAdapter3", "IDXGIFactory4", "IDXGISwapChain3", "IDXGIOutput4"],
     "dxgi1_5.h": ["IDXGIFactory5", "IDXGISwapChain4", "IDXGIOutput5"],
     "dxgi1_6.h": ["IDXGIFactory6", "IDXGIFactory7", "IDXGIAdapter4", "IDXGIOutput6"],
+    "d3d11on12.h": ["ID3D11On12Device", "ID3D11On12Device1", "ID3D11On12Device2"],
 }
 
 def methods(text, name):

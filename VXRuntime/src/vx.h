@@ -187,6 +187,7 @@ void vx_mm_init(void);                 // winmm, imm32 (mm.c)
 void vx_d3d11_init(void);              // Direct3D 11 on Metal (d3d11.m)
 void vx_d3d9_init(void);               // IDirect3D9: adapters and display modes (d3d9.m)
 void vx_dxgi_init(void);               // DXGI (dxgi.m)
+void vx_d3d11on12_init(void);          // D3D11On12CreateDevice (d3d11on12.m)
 void vx_d3d12_init(void);              // Direct3D 12 on Metal (d3d12.m)
 void vx_vulkan_init(void);             // Vulkan 1.0 bootstrap; Vulkan GPU objects are added with their Metal backend
 void vx_input_init(void);              // XInput (input.m)

@@ -593,3 +593,14 @@ what Metal's hazard tracking follows (`VXRT_D3D12_NO_RESIDENCY_SET=1` restores t
 Root constants and root descriptors go to 1 MB scratch chunks kept in a pool. Command allocators are judged idle by
 a per-queue timeline event (as fences are), not by Metal's later completion handlers, which made `Reset` fail right
 after the program's fence said the GPU was done.
+
+## D3D11On12 (SteamVR's path for Direct3D 12 games)
+
+SteamVR's `vrclient` submits a Direct3D 12 game's eye textures through `D3D11On12CreateDevice` and
+`ID3D11On12Device::CreateWrappedResource`. `src/d3d11on12.m` makes an ordinary Direct3D 11 device whose Metal command
+queue is the given Direct3D 12 queue's, so its work is ordered after the Direct3D 12 work submitted before it and before
+the work submitted after its Flush, as D3D11On12 promises. Wrapped 2D textures and buffers are Direct3D 11 objects on
+the Direct3D 12 resource's Metal object; `ReleaseWrappedResources` sets the resource's tracked Direct3D 12 state to the
+wrap's output state. `ID3D11On12Device1::GetD3D12Device` works; `UnwrapUnderlyingResource` and wrapped 1D/3D textures
+do not yet. `tests/d3d11on12.c` checks both orderings and the state hand-back without waits in between. Not yet run
+with SteamVR and a Direct3D 12 game.

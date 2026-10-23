@@ -9694,6 +9694,32 @@ static void swap_destroy(d3d_object *o) {
 }
 
 int d3d12_is_queue(void *p) { return p && ((d3d_object *)p)->vtbl == g_queue_vtbl; }
+void *d3d12_queue_metal(void *queue) { return d3d12_is_queue(queue) ? (__bridge void *)((queue12 *)queue)->mtl_queue : NULL; }
+void *d3d12_device_of(void *p) {
+    if (!p) return NULL;
+    if (((d3d_object *)p)->vtbl == g_device_vtbl) return p;
+    return d3d12_is_queue(p) ? ((queue12 *)p)->dev : NULL;
+}
+int d3d12_resource_info_get(void *resource, d3d12_resource_info *out) {
+    res12 *r = resource;
+    if (!r || r->base.vtbl != g_resource_vtbl || !out) return 0;
+    *out = (d3d12_resource_info){ r->desc.Dimension, r->desc.Width, r->desc.Height, r->desc.DepthOrArraySize, r->desc.MipLevels,
+                                  r->desc.Format, r->desc.SampleCount, r->desc.SampleQuality, r->desc.Flags,
+                                  (__bridge void *)r->texture, (__bridge void *)r->buffer };
+    return 1;
+}
+void d3d12_resource_force_state(void *resource, uint32_t state) {
+    res12 *r = resource;
+    if (!r || r->base.vtbl != g_resource_vtbl) return;
+    pthread_mutex_lock(&r->dev->lock);
+    state_overrides_free12(r->state_overrides);
+    r->state_overrides = NULL;
+    state_pending_free12(r->pending_transitions);
+    r->pending_transitions = NULL;
+    r->initial_state = state;
+    r->initial_promoted = 0;
+    pthread_mutex_unlock(&r->dev->lock);
+}
 
 HRESULT d3d12_swapchain_create(void *factory, void *queue, HANDLE hwnd, uint32_t w, uint32_t h, uint32_t format, uint32_t count, uint32_t flags, void **out) {
     queue12 *q = queue;

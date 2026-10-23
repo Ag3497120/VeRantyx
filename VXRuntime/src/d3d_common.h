@@ -84,6 +84,7 @@ struct d3d_device {
     void *slices;                    // chunks small renamed buffers are carved from (d3d11.m)
     volatile uint64_t gpu_end_seq[64], gpu_end_ns[64];   // when the GPU finished recent command buffers (by sequence
                                                          // number, host clock ns): timestamp queries (d3d11_draw.m)
+    d3d_object *on12;                // D3D11On12 devices: the ID3D11On12Device object (d3d11on12.m), else NULL
 };
 uint64_t d3d_gpu_end_ns(d3d_device *dev, uint64_t seq);  // that time, or 0 if not known (d3d11.m)
 int d3d_apple_family(void *mtl_device);   // d3d11.m
@@ -189,5 +190,15 @@ d3d_object  *dxgi_output_create(void);                                   // the 
 HRESULT      dxgi_check_hdr_metadata(uint32_t type, uint32_t size, const void *data);
 // Swap chains on Direct3D 12 command queues (d3d12.m): DXGI's factory hands a queue there.
 int     d3d12_is_queue(void *p);
+// D3D11On12 (d3d11on12.m) on D3D12's objects (d3d12.m): a queue's Metal queue (id<MTLCommandQueue>, not retained),
+// the device a queue or device pointer is (NULL if neither), a resource's description and Metal object, and its
+// tracked state set to one state for every subresource (what a wrapped resource is in after D3D11 used it).
+void   *d3d12_queue_metal(void *queue);
+void   *d3d12_device_of(void *device_or_queue);
+typedef struct { int32_t dimension; uint64_t width; uint32_t height; uint16_t depth_or_array, mips; uint32_t format, samples, quality; int32_t flags; void *texture, *buffer; } d3d12_resource_info;
+int     d3d12_resource_info_get(void *resource, d3d12_resource_info *out);
+void    d3d12_resource_force_state(void *resource, uint32_t state);
+HRESULT d3d11on12_query(d3d_device *dev, const GUID *iid, void **out);   // ID3D11On12Device* of a D3D11On12 device
+void    d3d11on12_destroy(d3d_device *dev);
 HRESULT d3d12_swapchain_create(void *factory, void *queue, HANDLE hwnd, uint32_t w, uint32_t h, uint32_t format, uint32_t count, uint32_t flags, void **out);
 #endif

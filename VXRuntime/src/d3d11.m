@@ -1562,6 +1562,7 @@ static WINAPI HRESULT device_qi(void *this, const GUID *iid, void **out) {
     if (d3d_same_guid(iid, &IID_IDXGIObject) || d3d_same_guid(iid, &IID_IDXGIDevice) || d3d_same_guid(iid, &IID_IDXGIDevice1)) {
         d3d_addref(&d->base); *out = &d->base.vtbl2; return S_OK;
     }
+    if (d->on12) return d3d11on12_query(d, iid, out);
     *out = NULL;
     return E_NOINTERFACE;
 }
@@ -1726,6 +1727,7 @@ static void device_destroy(d3d_object *o) {
     d->context->dev = NULL;
     d3d_release(d->context);
     if (d->adapter) d3d_release(d->adapter);
+    if (d->on12) d3d11on12_destroy(d);
     CFBridgingRelease(d->queue);
     CFBridgingRelease(d->mtl);
 }

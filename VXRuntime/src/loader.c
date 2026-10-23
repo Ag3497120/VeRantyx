@@ -1155,6 +1155,7 @@ int main(int argc, char **argv, char **envp) {
     vx_d3d11_init();
     vx_dxgi_init();
     vx_d3d12_init();
+    vx_d3d11on12_init();
     vx_vulkan_init();
     vx_d3d9_init();
     vx_vcruntime_init();
