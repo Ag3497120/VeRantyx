@@ -1,7 +1,7 @@
 // What a frame of a Direct3D 12 game costs the CPU here: a shader-visible heap of game size (Unreal Engine keeps
 // 500 000 to 1 000 000 descriptors), a thousand textures in it, 40 render passes of 25 textured draws and 20 compute
 // dispatches a frame, all with fxc's shaders. Prints milliseconds per frame (recording, submission and the GPU's
-// work, waited for); not part of `make check` (`make d3d12-bench`).
+// work, waited for; ExecuteCommandLists alone is the CPU's replay into Metal); not part of `make check` (`make d3d12-bench`).
 //   d3d12_bench.exe [descriptors] [frames]
 #define COBJMACROS
 #define WIDL_C_INLINE_WRAPPERS
@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
     CHECK(ID3D12Device_CreateFence(dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence));
     LARGE_INTEGER freq, t0, t1, r0, r1;
     QueryPerformanceFrequency(&freq);
-    double record_ms = 0, total_ms = 0, best = 1e9;
+    double record_ms = 0, submit_ms = 0, total_ms = 0, best = 1e9;
     for (UINT f = 0; f <= frames; f++) {
         QueryPerformanceCounter(&t0);
         CHECK(ID3D12CommandAllocator_Reset(alloc));
@@ -183,15 +183,16 @@ int main(int argc, char **argv) {
         CHECK(ID3D12GraphicsCommandList_Close(list));
         QueryPerformanceCounter(&r1);
         ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
+        QueryPerformanceCounter(&r0);
         ID3D12CommandQueue_Signal(queue, fence, f + 1);
         ID3D12Fence_SetEventOnCompletion(fence, f + 1, NULL);
         QueryPerformanceCounter(&t1);
         double rec = (double)(r1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
         double all = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
-        if (f) { record_ms += rec; total_ms += all; if (all < best) best = all; }   // (frame 0 compiles pipelines)
-        (void)r0;
+        double sub = (double)(r0.QuadPart - r1.QuadPart) * 1000.0 / (double)freq.QuadPart;
+        if (f) { record_ms += rec; submit_ms += sub; total_ms += all; if (all < best) best = all; }   // (frame 0 compiles pipelines)
     }
-    printf("d3d12 bench: %u descriptors, %d textures, %d passes x %d draws + %d dispatches: recording %.2f ms, frame %.2f ms (best %.2f) over %u frames\n",
-           descriptors, TEXTURES, PASSES, DRAWS, DISPATCHES, record_ms / frames, total_ms / frames, best, frames);
+    printf("d3d12 bench: %u descriptors, %d textures, %d passes x %d draws + %d dispatches: recording %.2f ms, ExecuteCommandLists %.2f ms, frame %.2f ms (best %.2f) over %u frames\n",
+           descriptors, TEXTURES, PASSES, DRAWS, DISPATCHES, record_ms / frames, submit_ms / frames, total_ms / frames, best, frames);
     return 0;
 }

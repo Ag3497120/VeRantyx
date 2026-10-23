@@ -196,6 +196,15 @@ struct dev12 {
     void **bufs;                     // the buffers (res12), for a GPU address's buffer (vertex and index buffers)
     uint32_t nbufs, capbufs;
     id<MTLComputePipelineState> occ_sum;   // adds a render pass's occlusion counts into a query heap (made when first needed)
+    NSMutableArray *scratch_pool;    // scratch chunks no command buffer uses any more (scratch_lock)
+    pthread_mutex_t scratch_lock;
+    // macOS 15 and later: every resource's memory (placed resources: their heap's) in one residency set the device's
+    // queues carry, instead of each encoder declaring every resource and descriptor-heap texture (2000 useResource
+    // entries per render pass in a modest scene). Draws and dispatches still declare what their bindings name, which
+    // is what Metal's hazard tracking follows. (lock)
+    id residency;                    // id<MTLResidencySet>, or nil
+    NSCountedSet *resident_allocations;
+    int residency_dirty;
 };
 
 typedef struct {
@@ -203,6 +212,8 @@ typedef struct {
     dev12 *dev;
     Q_DESC desc;
     id<MTLCommandQueue> mtl_queue;
+    id<MTLSharedEvent> timeline;     // counts the executed command buffers the GPU has finished (submit_lock)
+    uint64_t timeline_value;
 } queue12;
 typedef struct {
     d3d_object base;
@@ -211,6 +222,8 @@ typedef struct {
     uint32_t recording_lists;
     uint32_t in_flight; // accessed atomically so completion callbacks never wait on submit_lock
     uint64_t generation;
+    id<MTLSharedEvent> last_timeline;    // (submit_lock) where the newest list from this allocator went: its queue's
+    uint64_t last_value;                 // timeline, and the value that queue reaches when the GPU has run it
 } allocator12;
 
 typedef struct {
@@ -233,6 +246,12 @@ typedef struct {
     res12 **target_resource;         // RTV/DSV descriptor owner, retained for API-state validation
     uint32_t *target_subresource;
     uint32_t *target_flags;
+    // The distinct textures its descriptors name, counted as descriptors are written (texture_lock): what an encoder
+    // makes resident for shaders that reach them through the heap. A game's heap holds 500 000 to 1 000 000
+    // descriptors, so encoders must not walk it.
+    pthread_mutex_t texture_lock;
+    NSCountedSet *textures;
+    NSArray *texture_list;           // textures as an array, rebuilt when it changed
 } heap12;
 
 struct res12 {
@@ -943,6 +962,36 @@ static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int
 
 static void gpu12_release_mtl_object(void *object) { (void)CFBridgingRelease(object); }
 
+// The residency set (dev12.residency): resources counted by allocation, the set committed before a submission.
+static void residency_add12(dev12 *d, id<MTLResource> resource) {   // (d->lock)
+    if (!d->residency || !resource) return;
+    if (@available(macOS 15.0, *)) {
+        id<MTLAllocation> allocation = resource.heap ? (id<MTLAllocation>)resource.heap : (id<MTLAllocation>)resource;
+        if (![d->resident_allocations countForObject:allocation]) {
+            [(id<MTLResidencySet>)d->residency addAllocation:allocation];
+            d->residency_dirty = 1;
+        }
+        [d->resident_allocations addObject:allocation];
+    }
+}
+static void residency_remove12(dev12 *d, id<MTLResource> resource) {   // (d->lock)
+    if (!d->residency || !resource) return;
+    if (@available(macOS 15.0, *)) {
+        id<MTLAllocation> allocation = resource.heap ? (id<MTLAllocation>)resource.heap : (id<MTLAllocation>)resource;
+        if (![d->resident_allocations countForObject:allocation]) return;
+        [d->resident_allocations removeObject:allocation];
+        if (![d->resident_allocations countForObject:allocation]) {
+            [(id<MTLResidencySet>)d->residency removeAllocation:allocation];
+            d->residency_dirty = 1;
+        }
+    }
+}
+static void residency_commit12(dev12 *d) {   // (d->lock)
+    if (!d->residency || !d->residency_dirty) return;
+    if (@available(macOS 15.0, *)) [(id<MTLResidencySet>)d->residency commit];
+    d->residency_dirty = 0;
+}
+
 static void res_destroy(d3d_object *o) {
     res12 *r = (res12 *)o;
     dev12 *d = r->dev;
@@ -950,6 +999,7 @@ static void res_destroy(d3d_object *o) {
     for (uint32_t i = 0; r->buffer && i < d->nbufs; i++) if (d->bufs[i] == r) { d->bufs[i] = d->bufs[--d->nbufs]; break; }
     if (r->buffer) [d->resources removeObjectIdenticalTo:r->buffer];
     if (r->texture) [d->resources removeObjectIdenticalTo:r->texture];
+    residency_remove12(d, r->buffer ? (id<MTLResource>)r->buffer : (id<MTLResource>)r->texture);
     pthread_mutex_unlock(&d->lock);
     gpu_ir_resource_release(r->gpu_buffer);
     r->gpu_buffer = NULL;
@@ -1424,6 +1474,7 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
     }
     pthread_mutex_lock(&d->lock);
     [d->resources addObject:r->buffer ? (id)r->buffer : (id)r->texture];
+    residency_add12(d, r->buffer ? (id<MTLResource>)r->buffer : (id<MTLResource>)r->texture);
     if (r->buffer) {
         if (d->nbufs == d->capbufs) { d->capbufs = d->capbufs ? d->capbufs * 2 : 256; d->bufs = realloc(d->bufs, d->capbufs * sizeof *d->bufs); }
         d->bufs[d->nbufs++] = r;
@@ -1795,11 +1846,77 @@ static pthread_mutex_t g_heaps_lock = PTHREAD_MUTEX_INITIALIZER;
 static heap12 *g_heaps[4096];
 static uint32_t g_nheaps;
 
+// Sets the Metal object a descriptor stands for, keeping the heap's set of textures.
+static void heap_keep12(heap12 *h, uint32_t i, id object) {
+    id old = h->keep[i];
+    if (old == object) return;
+    h->keep[i] = object;
+    if (!h->textures) return;
+    int old_texture = old && [old conformsToProtocol:@protocol(MTLTexture)];
+    int new_texture = object && [object conformsToProtocol:@protocol(MTLTexture)];
+    if (!old_texture && !new_texture) return;
+    pthread_mutex_lock(&h->texture_lock);
+    if (old_texture) [h->textures removeObject:old];
+    if (new_texture) [h->textures addObject:object];
+    h->texture_list = nil;
+    pthread_mutex_unlock(&h->texture_lock);
+}
+// The heap's textures (the array is the caller's: later writes do not change it).
+static NSArray *heap_textures12(heap12 *h) {
+    if (!h || !h->textures) return nil;
+    pthread_mutex_lock(&h->texture_lock);
+    if (!h->texture_list) h->texture_list = h->textures.allObjects;
+    NSArray *list = h->texture_list;
+    pthread_mutex_unlock(&h->texture_lock);
+    return list;
+}
+// Residency for an encoder: every resource of the device (shaders reach buffers through GPU addresses) and the
+// textures of the bound resource heap, each list in one call.
+// What a replay passes for "resident" when the device's residency set covers every resource and heap texture.
+static NSArray *resident_by_set12(void) {
+    static NSArray *sentinel;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ sentinel = [NSArray new]; });
+    return sentinel;
+}
+static void use_list_render12(id<MTLRenderCommandEncoder> re, NSArray *list) {
+    NSUInteger n = list.count;
+    if (!n) return;
+    __unsafe_unretained id<MTLResource> *objects = (__unsafe_unretained id<MTLResource> *)malloc(n * sizeof *objects);
+    if (!objects) return;
+    [list getObjects:objects range:NSMakeRange(0, n)];
+    [re useResources:objects count:n usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    free(objects);
+}
+static void use_list_compute12(id<MTLComputeCommandEncoder> ce, NSArray *list) {
+    NSUInteger n = list.count;
+    if (!n) return;
+    __unsafe_unretained id<MTLResource> *objects = (__unsafe_unretained id<MTLResource> *)malloc(n * sizeof *objects);
+    if (!objects) return;
+    [list getObjects:objects range:NSMakeRange(0, n)];
+    [ce useResources:objects count:n usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+    free(objects);
+}
+static void use_resident_compute12(id<MTLComputeCommandEncoder> ce, NSArray *resident, heap12 *heap) {
+    if (resident == resident_by_set12()) return;                   // (the device's residency set covers both)
+    use_list_compute12(ce, resident);
+    use_list_compute12(ce, heap_textures12(heap));
+}
+
 static void heap_destroy(d3d_object *o) {
     heap12 *h = (heap12 *)o;
+    if (h->gpu && h->dev) {
+        pthread_mutex_lock(&h->dev->lock);
+        [h->dev->resources removeObjectIdenticalTo:h->gpu];
+        residency_remove12(h->dev, h->gpu);
+        pthread_mutex_unlock(&h->dev->lock);
+    }
     pthread_mutex_lock(&g_heaps_lock);
     for (uint32_t i = 0; i < g_nheaps; i++) if (g_heaps[i] == h) { g_heaps[i] = g_heaps[--g_nheaps]; break; }
     pthread_mutex_unlock(&g_heaps_lock);
+    h->textures = nil;
+    h->texture_list = nil;
+    pthread_mutex_destroy(&h->texture_lock);
     for (uint32_t i = 0; i < h->desc.NumDescriptors; i++) {
         if (h->keep) h->keep[i] = nil;
         if (h->buffer_view) gpu_ir_buffer_view_release(h->buffer_view[i]);
@@ -1907,7 +2024,7 @@ static void put_desc(size_t cpu, const VxDesc *v, id keep, int32_t descriptor_cl
     heap12 *h = heap_at(cpu, &i);
     if (!h) { vx_log("D3D12: a descriptor written outside any heap (%#zx)", cpu); return; }
     memcpy(h->cpu + 32 * (size_t)i, v, 32);
-    h->keep[i] = keep;
+    heap_keep12(h, i, keep);
     if (h->descriptor_kind) h->descriptor_kind[i] = descriptor_class >= DXIL_SRV && descriptor_class <= DXIL_SAMPLER
         ? (uint8_t)(descriptor_class + 1) : 0;
     if (h->buffer_view && h->buffer_view[i]) {
@@ -2345,7 +2462,7 @@ static WINAPI void dev_copy_simple(void *this, uint32_t n, size_t dst, size_t sr
         heap12 *sh = heap_at(src + 32 * (size_t)k, &si), *dh = heap_at(dst + 32 * (size_t)k, &di);
         if (!sh || !dh) continue;
         memcpy(dh->cpu + 32 * (size_t)di, sh->cpu + 32 * (size_t)si, 32);
-        dh->keep[di] = sh->keep[si];
+        heap_keep12(dh, di, sh->keep[si]);
         if (dh->descriptor_kind) dh->descriptor_kind[di] = sh->descriptor_kind ? sh->descriptor_kind[si] : 0;
         gpu_ir_buffer_view *view_ref = sh->buffer_view ? sh->buffer_view[si] : NULL;
         if (view_ref) gpu_ir_buffer_view_retain(view_ref);
@@ -5315,16 +5432,37 @@ typedef struct {
     uint64_t table[64];
 } root_state;
 
-// Small per-execution memory for root descriptors and constants the shaders read through pointers.
-typedef struct { id<MTLBuffer> buf; size_t used; } scratch;
+// Small per-execution memory for root descriptors and constants the shaders read through pointers: chunks of
+// 1 MB taken from the device's pool and given back when the command buffer completes (a new Metal buffer per
+// execution cost more than the draws: every first write to its pages faulted).
+enum { SCRATCH_CHUNK = 1 << 20, SCRATCH_POOL_MAX = 32 };
+typedef struct { id<MTLBuffer> buf; size_t used; NSMutableArray *bufs; } scratch;
+static id<MTLBuffer> scratch_chunk(dev12 *d, size_t size) {
+    id<MTLBuffer> chunk = nil;
+    if (size <= SCRATCH_CHUNK) {
+        pthread_mutex_lock(&d->scratch_lock);
+        chunk = d->scratch_pool.lastObject;
+        if (chunk) [d->scratch_pool removeLastObject];
+        pthread_mutex_unlock(&d->scratch_lock);
+    }
+    return chunk ?: [d->mtl newBufferWithLength:MAX((size_t)SCRATCH_CHUNK, size) options:MTLResourceStorageModeShared];
+}
+// The chunks of an execution the GPU is done with.
+static void scratch_recycle(dev12 *d, NSArray *chunks) {
+    pthread_mutex_lock(&d->scratch_lock);
+    for (id<MTLBuffer> chunk in chunks)
+        if (chunk.length == SCRATCH_CHUNK && d->scratch_pool.count < SCRATCH_POOL_MAX) [d->scratch_pool addObject:chunk];
+    pthread_mutex_unlock(&d->scratch_lock);
+}
 static int scratch_alloc(dev12 *d, scratch *s, size_t n, size_t *offset) {
     if (!d || !s || !offset || n > SIZE_MAX - 31) return 0;
     size_t aligned = (n + 31) & ~(size_t)31;
     if (aligned > SIZE_MAX / 2) return 0;
     if (!s->buf || s->used > s->buf.length || aligned > s->buf.length - s->used) {
-        size_t capacity = MAX((size_t)65536, aligned * 2);
-        id<MTLBuffer> replacement = [d->mtl newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+        id<MTLBuffer> replacement = scratch_chunk(d, aligned);
         if (!replacement) return 0;
+        if (!s->bufs) s->bufs = [NSMutableArray new];
+        [s->bufs addObject:replacement];
         s->buf = replacement;
         s->used = 0;
     }
@@ -6707,10 +6845,9 @@ static void end_encoders(id<MTLComputeCommandEncoder> __strong *ce, id<MTLBlitCo
 }
 
 static void make_resident_render(id<MTLRenderCommandEncoder> re, NSArray *resident, heap12 *heap) {
-    for (id<MTLResource> res in resident) [re useResource:res usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
-    for (heap12 *h = heap; h; h = NULL)
-        for (uint32_t k = 0; k < h->desc.NumDescriptors; k++)
-            if ([h->keep[k] conformsToProtocol:@protocol(MTLTexture)]) [re useResource:h->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    if (resident == resident_by_set12()) return;                   // (the device's residency set covers both)
+    use_list_render12(re, resident);
+    use_list_render12(re, heap_textures12(heap));
 }
 
 static int open_render_pass12(dev12 *device, gfx_state *g, id<MTLCommandBuffer> command_buffer,
@@ -7145,11 +7282,7 @@ static int d3d12_gpu_ir_dispatch(void *opaque, const gpu_ir_pipeline *pipeline,
     if (!*ce) {
         *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
         // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
-        for (id<MTLResource> res in resident) [*ce useResource:res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-        for (heap12 *heap = context->resource_heap; heap; heap = NULL)
-            for (uint32_t k = 0; k < heap->desc.NumDescriptors; k++)
-                if ([heap->keep[k] conformsToProtocol:@protocol(MTLTexture)])
-                    [*ce useResource:heap->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        use_resident_compute12(*ce, resident, context->resource_heap);
     }
 
     int access_result = d3d12_use_compute_accesses12(*ce, accesses, access_count);
@@ -7220,11 +7353,7 @@ static int d3d12_gpu_ir_dispatch_indirect(void *opaque, const gpu_ir_pipeline *p
     if (!*ce) {
         *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
         // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
-        for (id<MTLResource> res in resident) [*ce useResource:res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-        for (heap12 *heap = context->resource_heap; heap; heap = NULL)
-            for (uint32_t k = 0; k < heap->desc.NumDescriptors; k++)
-                if ([heap->keep[k] conformsToProtocol:@protocol(MTLTexture)])
-                    [*ce useResource:heap->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        use_resident_compute12(*ce, resident, context->resource_heap);
     }
 
     int access_result = d3d12_use_compute_accesses12(*ce, accesses, access_count);
@@ -7515,11 +7644,7 @@ static int d3d12_gpu_ir_dispatch_indirect_range(void *opaque, const gpu_ir_pipel
     if (!*compute_encoder) {
         *compute_encoder = [command_buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
         // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
-        for (id<MTLResource> res in resident) [*compute_encoder useResource:res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-        for (heap12 *heap = context->resource_heap; heap; heap = NULL)
-            for (uint32_t k = 0; k < heap->desc.NumDescriptors; k++)
-                if ([heap->keep[k] conformsToProtocol:@protocol(MTLTexture)])
-                    [*compute_encoder useResource:heap->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        use_resident_compute12(*compute_encoder, resident, context->resource_heap);
     }
     if (!*compute_encoder) return GPU_IR_UNSUPPORTED;
     int access_result = d3d12_use_compute_accesses12(*compute_encoder, accesses, access_count);
@@ -7984,7 +8109,9 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
     NSMutableArray<id<MTLBuffer>> *indirect_staging_buffers = [NSMutableArray array];
     int replay_failed = 0;
     pthread_mutex_lock(&d->lock);
-    NSArray *resident = [d->resources copy];
+    // (with a residency set, encoders declare nothing beyond what draws and dispatches bind)
+    residency_commit12(d);
+    NSArray *resident = d->residency ? resident_by_set12() : [d->resources copy];
     pthread_mutex_unlock(&d->lock);
     for (uint32_t i = 0; i < command_count; i++) {
         cmd12 *c = &commands[i];
@@ -8245,10 +8372,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
                 // (what the shaders reach through pointers and argument buffers must be resident: every resource
                 //  of the device, and the texture views the bound heaps' descriptors name)
-                for (id<MTLResource> res in resident) [ce useResource:res usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-                for (heap12 *h2 = heap; h2; h2 = NULL)
-                    for (uint32_t k = 0; k < h2->desc.NumDescriptors; k++)
-                        if ([h2->keep[k] conformsToProtocol:@protocol(MTLTexture)]) [ce useResource:h2->keep[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+                use_resident_compute12(ce, resident, heap);
             }
             [ce setComputePipelineState:pso->compute];
             uint64_t root[64 + 2];
@@ -8591,6 +8715,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
 
 static void queue_destroy(d3d_object *o) {
     ((queue12 *)o)->mtl_queue = nil;
+    ((queue12 *)o)->timeline = nil;
     release_dev(o);
 }
 static WINAPI HRESULT queue_query(void *this, const GUID *iid, void **out) {
@@ -9265,18 +9390,21 @@ static WINAPI void queue_execute(void *this, uint32_t n, void *const *lists) {
             continue;
         }
         id<MTLCommandBuffer> cb = [q->mtl_queue commandBuffer];
-        scratch sc = { nil, 0 };
+        scratch sc = { nil, 0, nil };
         if (!replay(d, q->mtl_queue, q->desc.Type, l, &shadows, &state_count, &cb, &sc)) {
             queue_discard_list_states12(shadows, state_count);
             continue;
         }
         // (the scratch memory lives until the GPU is done with it: held by the handler; Metal holds the rest)
-        id<MTLBuffer> held = sc.buf;
+        NSArray *held = sc.bufs;
         allocator12 *command_allocator = l->allocator;
         __atomic_add_fetch(&command_allocator->in_flight, 1, __ATOMIC_RELEASE);
+        [cb encodeSignalEvent:q->timeline value:++q->timeline_value];
+        command_allocator->last_timeline = q->timeline;
+        command_allocator->last_value = q->timeline_value;
         d3d_addref(&command_allocator->base);
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            (void)held;
+            if (held) scratch_recycle(d, held);
             if (done.status == MTLCommandBufferStatusError)
                 vx_log("D3D12: Metal command buffer failed: %s",
                        done.error.localizedDescription.UTF8String ?: "unknown Metal error");
@@ -9357,7 +9485,9 @@ static WINAPI HRESULT dev_create_queue(void *this, const Q_DESC *desc, const GUI
     q->base.destroy = queue_destroy;
     q->desc = *desc;
     q->mtl_queue = [d->mtl newCommandQueue];
-    if (!q->mtl_queue) { d3d_release(&q->base); return E_FAIL; }
+    q->timeline = [d->mtl newSharedEvent];
+    if (d->residency) if (@available(macOS 15.0, *)) [q->mtl_queue addResidencySet:(id<MTLResidencySet>)d->residency];
+    if (!q->mtl_queue || !q->timeline) { d3d_release(&q->base); return E_FAIL; }
     HRESULT hr = queue_query(q, iid, out);
     d3d_release(&q->base);
     return hr;
@@ -9373,7 +9503,11 @@ static WINAPI HRESULT allocator_reset(void *this) {
     allocator12 *allocator = this;
     pthread_mutex_lock(&allocator->dev->submit_lock);
     HRESULT hr = S_OK;
-    if (allocator->recording_lists || __atomic_load_n(&allocator->in_flight, __ATOMIC_ACQUIRE) ||
+    // A program resets an allocator once its fence says the GPU is done. Metal runs the completion handlers that count
+    // the allocator's command buffers down later (they lag the shared events fences are), so the GPU's progress is
+    // read from the queue's timeline, which advances as fences do.
+    int gpu_done = allocator->last_timeline && allocator->last_timeline.signaledValue >= allocator->last_value;
+    if (allocator->recording_lists || (!gpu_done && __atomic_load_n(&allocator->in_flight, __ATOMIC_ACQUIRE)) ||
         allocator->generation == UINT64_MAX) {
         hr = E_FAIL;
     } else {
@@ -9382,10 +9516,14 @@ static WINAPI HRESULT allocator_reset(void *this) {
     pthread_mutex_unlock(&allocator->dev->submit_lock);
     return hr;
 }
+static void allocator_destroy(d3d_object *o) {
+    ((allocator12 *)o)->last_timeline = nil;
+    release_dev(o);
+}
 static WINAPI HRESULT dev_create_allocator(void *this, int32_t type, const GUID *iid, void **out) {
     if (type < 0 || type > 3) return E_INVALIDARG;
     allocator12 *a = alloc12(sizeof *a, K12_ALLOCATOR, g_allocator_vtbl, this);
-    a->base.destroy = release_dev;
+    a->base.destroy = allocator_destroy;
     a->type = type;
     a->generation = 1;
     HRESULT hr = allocator_query(a, iid, out);
@@ -9463,11 +9601,14 @@ static WINAPI HRESULT dev_create_heap(void *this, const HEAP_DESC *desc, const G
         memset(h->cpu, 0, size);
         pthread_mutex_lock(&d->lock);
         [d->resources addObject:h->gpu];
+        residency_add12(d, h->gpu);
         pthread_mutex_unlock(&d->lock);
     } else {
         h->cpu = calloc(1, size);
     }
     h->keep = (__strong id *)calloc(count, sizeof(id));
+    pthread_mutex_init(&h->texture_lock, NULL);
+    if (desc->Type == 0) h->textures = [NSCountedSet new];
     h->descriptor_kind = calloc(count, sizeof(*h->descriptor_kind));
     h->buffer_view = calloc(count, sizeof(*h->buffer_view));
     h->shader_view = calloc(count, sizeof(*h->shader_view));
@@ -10641,11 +10782,15 @@ static void device_destroy(d3d_object *o) {
     d->cpu_transfer_queue = nil;
     pthread_mutex_destroy(&d->submit_lock);
     pthread_mutex_destroy(&d->format_lock);
+    pthread_mutex_destroy(&d->scratch_lock);
+    d->scratch_pool = nil;
     pthread_mutex_destroy(&d->lock);
     d->format_probe_library = nil;
     d->format_probe_vertex = nil;
     d->format_probe_fragment = nil;
     d->resources = nil;
+    d->residency = nil;
+    d->resident_allocations = nil;
     d->pso_cache = nil;
     d->mtl = nil;
 }
@@ -10673,6 +10818,8 @@ static WINAPI HRESULT D3D12CreateDevice(void *adapter, int32_t min_level, const 
     pthread_mutex_init(&d->lock, NULL);
     pthread_mutex_init(&d->submit_lock, NULL);
     pthread_mutex_init(&d->format_lock, NULL);
+    pthread_mutex_init(&d->scratch_lock, NULL);
+    d->scratch_pool = [NSMutableArray new];
     d->common_metal = gpu_ir_metal_device_create_for_metal_device((__bridge void *)mtl);
     d->cpu_transfer_queue = [mtl newCommandQueue];
     if (!d->common_metal || !d->cpu_transfer_queue) {
@@ -10681,6 +10828,14 @@ static WINAPI HRESULT D3D12CreateDevice(void *adapter, int32_t min_level, const 
     }
     d->typed_uav_load_additional_formats = d3d12_probe_typed_uav_load_additional_set(d);
     d->resources = [NSMutableArray new];
+    if (@available(macOS 15.0, *)) {
+        if (!getenv("VXRT_D3D12_NO_RESIDENCY_SET")) {
+            MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+            rd.label = @"VXRuntime D3D12 resources";
+            d->residency = [mtl newResidencySetWithDescriptor:rd error:nil];
+            d->resident_allocations = [NSCountedSet new];
+        }
+    }
     d->pso_cache = [NSMutableDictionary new];
     HRESULT hr = dev_query(d, iid, out);
     d3d_release(&d->base);

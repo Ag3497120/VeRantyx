@@ -582,3 +582,14 @@ SteamVR's DLLs translate and compile); `tests/d3d12_fxc.c` draws and dispatches 
 Root parameters and static samplers are matched to a shader by register and space and by `ShaderVisibility`: a
 graphics stage sees ALL and its own parameters (vertex and pixel shaders of one pipeline commonly use the same
 register, b0 of each stage, for different parameters); compute shaders see every parameter.
+
+## Replay cost at game scale
+
+`make d3d12-bench` (`tests/d3d12_bench.c`) records a frame of 40 render passes of 25 textured draws and 20 dispatches
+over a thousand textures in a shader-visible heap of game size. Every resource's memory is in one `MTLResidencySet`
+(macOS 15 and later; placed resources count their heap) that the device's queues carry, so encoders no longer declare
+every resource and walk the descriptor heap; draws and dispatches still declare what their bindings name, which is
+what Metal's hazard tracking follows (`VXRT_D3D12_NO_RESIDENCY_SET=1` restores the old per-encoder declarations).
+Root constants and root descriptors go to 1 MB scratch chunks kept in a pool. Command allocators are judged idle by
+a per-queue timeline event (as fences are), not by Metal's later completion handlers, which made `Reset` fail right
+after the program's fence said the GPU was done.
