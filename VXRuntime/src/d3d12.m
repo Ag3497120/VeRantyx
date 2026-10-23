@@ -1279,6 +1279,8 @@ static uint32_t bytes_per(uint32_t format) { uint32_t b = 0; d3d_mtl_format(form
 static int d3d12_texture_atomic_format_supported(id<MTLDevice> mtl, uint32_t format);
 
 // The Metal texture a D3D12 texture description stands for (nil: a format it has no Metal counterpart for).
+static BOOL d3d12_color_resolve_float_format(MTLPixelFormat format);
+static BOOL d3d12_color_resolve_format_supported(MTLPixelFormat format);
 static MTLTextureDescriptor *texture_descriptor(dev12 *d, const RES_DESC *desc) {
     uint32_t bpp = 0;
     MTLPixelFormat fmt = d3d_mtl_format(desc->Format, &bpp);
@@ -1310,6 +1312,11 @@ static MTLTextureDescriptor *texture_descriptor(dev12 *d, const RES_DESC *desc) 
     if ((desc->Flags & 0x4) && desc->SampleCount <= 1 && d3d12_texture_atomic_format_supported(d->mtl, desc->Format))
         td.usage |= MTLTextureUsageShaderAtomic;
     if (desc->Flags & 0x3) td.usage |= MTLTextureUsageRenderTarget;             // ALLOW_RENDER_TARGET, ALLOW_DEPTH_STENCIL
+    // Any single-sample 2D color texture may be a ResolveSubresource destination in D3D12 (no flag asks for it);
+    // Metal resolves only into render-target textures.
+    if (desc->Dimension == 3 && desc->SampleCount <= 1 &&
+        (d3d12_color_resolve_float_format(td.pixelFormat) || d3d12_color_resolve_format_supported(td.pixelFormat)))
+        td.usage |= MTLTextureUsageRenderTarget;
     td.storageMode = MTLStorageModePrivate;
     return td;
 }
@@ -3479,7 +3486,8 @@ static void list_resolve_subresource_region_mode12(list12 *list, void *dst, uint
     int flags_valid = depth_format
         ? destination && source && (source->desc.Flags & 0x2) && (destination->desc.Flags & 0x2) &&
           d3d12_depth_resolve_supported12(list->dev)
-        : destination && source && (source->desc.Flags & 0x1) && (destination->desc.Flags & 0x1) &&
+        : destination && source && (source->desc.Flags & 0x1) && destination->texture &&
+          (destination->texture.usage & MTLTextureUsageRenderTarget) &&
           !(source->desc.Flags & 0x2) && !(destination->desc.Flags & 0x2);
     if (!mode_valid || !flags_valid || !destination || !source || source->dev != list->dev ||
         destination->dev != list->dev || !source->gpu_texture || !destination->gpu_texture || source == destination ||

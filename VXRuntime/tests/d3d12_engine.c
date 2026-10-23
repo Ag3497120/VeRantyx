@@ -267,7 +267,8 @@ static int render_pass_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
     D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 32, 32, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 4, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET };
     ID3D12Resource *msaa, *resolved;
     CHECK(ID3D12Device_CreateCommittedResource(dev, &dh, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&msaa));
-    td.SampleDesc.Count = 1;                                        // (resolve destinations need the render-target flag here)
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_NONE;                            // (a resolve destination needs no flag)
     CHECK(ID3D12Device_CreateCommittedResource(dev, &dh, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RESOLVE_DEST, NULL, &IID_ID3D12Resource, (void **)&resolved));
     D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1 };
     ID3D12DescriptorHeap *rtvs;

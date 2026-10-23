@@ -563,7 +563,8 @@ those whose beginning access is CLEAR, `EndRenderPass` resolves those whose endi
 `SetSamplePositions` and `SetViewInstanceMask` do nothing; `SetPredication` with a buffer runs the predicated work
 anyway (logged once). `CreatePipelineLibrary` returns `DXGI_ERROR_UNSUPPORTED`, which engines take as "no PSO
 library"; `SetEventOnMultipleFenceCompletion` waits for all or any of its fences.
-Resolve destinations still need the render-target flag here (Metal resolves into render-target textures).
+Single-sample 2D color textures of the resolvable formats are made with Metal's render-target usage whatever their
+flags, so any of them can be a resolve destination, as in D3D12 (Metal resolves only into render-target textures).
 
 ## fxc's shaders (DXBC) in Direct3D 12 pipelines
 
