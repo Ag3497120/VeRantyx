@@ -12,6 +12,13 @@ All code in this repository was written for VeRantyx, with these exceptions:
   `alvr/server_openvr/cpp/alvr_server/Controller.cpp`), Copyright (c)
   2018-2019 polygraphene, 2020-2024 alvr-org, MIT license (full text in the
   file).
+- `VXRuntime/third_party/vulkan/` holds the Khronos Group's Vulkan API headers,
+  Copyright 2015-2026 The Khronos Group Inc., unchanged except for VXRuntime's
+  own `vk_platform.h`: `vulkan/vulkan_core.h` (SPDX-License-Identifier:
+  Apache-2.0 OR MIT, used under the MIT license) and the video codec headers it
+  includes, `vk_video/*.h` (Apache-2.0,
+  https://www.apache.org/licenses/LICENSE-2.0). They give VXRuntime's Vulkan
+  implementation the exact layout of every Vulkan structure and enumerant.
 - `NativeARM/klepton-patches/` is a patch set against Klepton
   (https://github.com/shinyquagsire23/Klepton, MIT, by ShinyQuagsire); the
   files under `klepton-patches/runtime/` are new files added to it.

@@ -83,7 +83,7 @@ def where(cur):
     return line.value, col.value
 
 def scan(path, index):
-    args = [b"-target", b"x86_64-apple-macos14", b"-isysroot", SDK.encode(), b"-fobjc-arc", b"-Isrc", b"-Wno-everything", b"-DVX_ABI_SCAN"]
+    args = [b"-target", b"x86_64-apple-macos14", b"-isysroot", SDK.encode(), b"-fobjc-arc", b"-Isrc", b"-Ithird_party/vulkan", b"-Wno-everything", b"-DVX_ABI_SCAN"]
     if path.endswith(".m"): args = [b"-x", b"objective-c"] + args
     argv = (C.c_char_p * len(args))(*args)
     tu = parseTU(index, path.encode(), argv, len(args), None, 0, 0x200)   # (KeepGoing)
