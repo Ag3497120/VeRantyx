@@ -564,3 +564,21 @@ those whose beginning access is CLEAR, `EndRenderPass` resolves those whose endi
 anyway (logged once). `CreatePipelineLibrary` returns `DXGI_ERROR_UNSUPPORTED`, which engines take as "no PSO
 library"; `SetEventOnMultipleFenceCompletion` waits for all or any of its fences.
 Resolve destinations still need the render-target flag here (Metal resolves into render-target textures).
+
+## fxc's shaders (DXBC) in Direct3D 12 pipelines
+
+Unreal Engine 4 and Unity compile HLSL with fxc for Direct3D 12 by default, so their pipelines carry DXBC (shader model
+4 and 5), not DXIL. Graphics and compute pipelines accept both: `dxbc_translate_d3d12` (`src/dxbc.c`) emits the same
+MSL as for Direct3D 11 but takes the resources from the root argument buffer DXIL shaders use (`VxRoot` at
+`[[buffer(0)]]`, one slot per declared register in DXIL's order: SRVs, UAVs, constant buffers, samplers, space 0),
+and reports them in a `dxil_msl` reflection, so root signatures, descriptor tables, root constants and descriptors,
+static samplers and validation treat both kinds alike. Textures, samplers and typed UAVs are read from the descriptors'
+Metal resource ids, buffers from their GPU addresses (sizes for bounds and `GetDimensions`), append/consume counters
+from the descriptor's counter address. Not yet: geometry, hull and domain stages, a static sample mask with a DXBC pixel
+shader, non-default SRV component mappings, and shader model 5.1 register spaces and resource arrays.
+`build/dxbc2msl -d3d12` and `build/dxbcscan -12` check the translation (223 DXBC shaders from Half-Life: Alyx's and
+SteamVR's DLLs translate and compile); `tests/d3d12_fxc.c` draws and dispatches with the D3D11 test shaders.
+
+Root parameters and static samplers are matched to a shader by register and space and by `ShaderVisibility`: a
+graphics stage sees ALL and its own parameters (vertex and pixel shaders of one pipeline commonly use the same
+register, b0 of each stage, for different parameters); compute shaders see every parameter.

@@ -33,7 +33,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/game_imports.exe
+       build/window.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/game_imports.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -570,6 +570,10 @@ build/d3d12_engine.exe: tests/d3d12_engine.c tests/shaders12/tri_vs.dxil tests/s
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d12 -ldxgi
 
+build/d3d12_fxc.exe: tests/d3d12_fxc.c tests/shaders/tex_vs.dxbc tests/shaders/tex_ps.dxbc tests/shaders/sum_cs.dxbc tests/shaders/append_cs.dxbc
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -ld3d12
+
 build/d3d12_view_test: src/d3d12_view.h src/gpu_ir.h tests/d3d12_view.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ tests/d3d12_view.c
@@ -1046,6 +1050,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/compute.exe
 	$(VXRT) build/d3d12.exe
 	$(VXRT) build/d3d12_engine.exe
+	$(VXRT) build/d3d12_fxc.exe
 	$(VXRT) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv \
 		build/vulkan_spirv_uniform_vertex_fixture.spv build/vulkan_spirv_uniform_fragment_fixture.spv
 	$(VXRT) build/input.exe
@@ -1066,7 +1071,17 @@ bench: export VXRT_NO_ACTIVATE = 1
 bench: build/vxrt build/drawbench.exe
 	build/vxrt build/drawbench.exe
 
+# CPU and GPU cost of a Direct3D 12 frame with a game-sized descriptor heap (numbers only, not a test).
+d3d12-bench: export VXRT_ROOT = build/root
+d3d12-bench: export VXRT_NO_ACTIVATE = 1
+d3d12-bench: build/vxrt build/d3d12_bench.exe
+	build/vxrt build/d3d12_bench.exe 500000 20
+
+build/d3d12_bench.exe: tests/d3d12_bench.c tests/shaders/tex_vs.dxbc tests/shaders/tex_ps.dxbc tests/shaders/sum_cs.dxbc
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -ld3d12
+
 clean:
 	rm -rf build
 
-.PHONY: vr-check all tests check bench clean shaders translator-check
+.PHONY: vr-check all tests check bench d3d12-bench clean shaders translator-check

@@ -1,7 +1,8 @@
 // Finds the DXBC containers embedded in files (DLLs, executables, shader caches), translates each distinct one and
 // compiles the result with Metal, and reports what fails, grouped by message: a robustness check of the translator
 // against real shaders. Nothing is written unless -d is given (failing shaders are then saved there, for study).
-//   build/dxbcscan [-v] [-d dir] [-s N] files...     (-s N: compile every Nth with Metal; -t N: translate every Nth)
+//   build/dxbcscan [-v] [-12] [-d dir] [-s N] files...     (-s N: compile every Nth with Metal; -t N: translate every Nth;
+//                                                          -12: as Direct3D 12 pipelines take them, vertex/pixel/compute)
 #import <Metal/Metal.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
@@ -82,11 +83,13 @@ static NSString *first_error(NSString *log) {
 int main(int argc, char **argv) {
     @autoreleasepool {
         int verbose = 0;
+        __block int d3d12 = 0;
         __block size_t stride = 1, tstride = 1;
         const char *dump = NULL;
         int i = 1;
         for (; i < argc && argv[i][0] == '-'; i++) {
             if (!strcmp(argv[i], "-v")) verbose = 1;
+            else if (!strcmp(argv[i], "-12")) d3d12 = 1;
             else if (!strcmp(argv[i], "-d") && i + 1 < argc) dump = argv[++i];
             else if (!strcmp(argv[i], "-s") && i + 1 < argc) stride = (size_t)atol(argv[++i]) ?: 1;
             else if (!strcmp(argv[i], "-t") && i + 1 < argc) tstride = (size_t)atol(argv[++i]) ?: 1;
@@ -103,10 +106,10 @@ int main(int argc, char **argv) {
         dispatch_apply(g_count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t k) {
             @autoreleasepool {
                 blob *b = &g_blobs[k];
-                if (b->type < 0 || k % tstride) return;
+                if (b->type < 0 || k % tstride || (d3d12 && b->type >= 2 && b->type <= 4)) return;
                 dxbc_shader sh;
                 NSString *why = nil;
-                if (dxbc_translate(b->data, b->size, &sh)) why = [@"translate: " stringByAppendingString:kind(sh.error)];
+                if ((d3d12 ? dxbc_translate_d3d12 : dxbc_translate)(b->data, b->size, &sh)) why = [@"translate: " stringByAppendingString:kind(sh.error)];
                 else if (k % stride) dxbc_free(&sh);
                 else {
                     NSError *err = nil;
@@ -126,7 +129,7 @@ int main(int argc, char **argv) {
         for (size_t k = 0; k < g_count; k++) {
             if (g_blobs[k].type == -2) dxil++;
             else if (g_blobs[k].type < 0) none++;
-            else if (!(k % tstride)) by_type[g_blobs[k].type & 7]++;
+            else if (!(k % tstride) && !(d3d12 && g_blobs[k].type >= 2 && g_blobs[k].type <= 4)) by_type[g_blobs[k].type & 7]++;
         }
         printf("%zu distinct containers: %d DXIL (shader model 6), %d without code\n", g_count, dxil, none);
         for (int t = 0; t < 6; t++) if (by_type[t]) printf("  %-8s %5d, %5d translate and compile\n", names[t], by_type[t], ok_type[t]);

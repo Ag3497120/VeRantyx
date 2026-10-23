@@ -1705,7 +1705,9 @@ static int valid_descriptor_value(const gpu_ir_pipeline_layout *layout, gpu_ir_d
         break;
     default: return 0;
     }
-    if (value->auxiliary_resource && binding.kind != GPU_IR_DESCRIPTOR_STORAGE_BUFFER) return 0;
+    // (a counter: storage buffers, and D3D12's general UAV bindings when the bound resource is a buffer)
+    if (value->auxiliary_resource && binding.kind != GPU_IR_DESCRIPTOR_STORAGE_BUFFER &&
+        !(binding.kind == GPU_IR_DESCRIPTOR_STORAGE_RESOURCE && gpu_ir_resource_is_buffer(resource))) return 0;
 
     if (gpu_ir_resource_is_buffer(resource) && !value->buffer_view) {
         uint64_t size = gpu_ir_buffer_size(resource);

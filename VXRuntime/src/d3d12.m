@@ -25,6 +25,7 @@
 #include "d3d12_view.h"
 #include "dxil_msl.h"
 #include "dxil_ir.h"
+#include "dxbc.h"
 #include "gpu_ir.h"
 #include "gpu_ir_metal.h"
 #include "gpu_ir_msl.h"
@@ -1874,7 +1875,10 @@ static int heap_uav_views_match12(const heap12 *cpu_heap, uint32_t cpu_index,
     VxDesc cpu_desc, gpu_desc;
     memcpy(&cpu_desc, cpu_heap->cpu + 32ull * cpu_index, sizeof cpu_desc);
     memcpy(&gpu_desc, gpu_heap->cpu + 32ull * gpu_index, sizeof gpu_desc);
-    if (cpu_desc.va != gpu_desc.va || cpu_desc.res != gpu_desc.res || cpu_desc.size != gpu_desc.size || cpu_desc.stride != gpu_desc.stride ||
+    // (res: the Metal texture view each CreateUnorderedAccessView made, different objects for the same view unless the
+    // descriptor was copied; it must agree only where it is the counter's address)
+    if (cpu_desc.va != gpu_desc.va || ((cpu_desc.flags & DXIL_MSL_DESC_HAS_COUNTER) && cpu_desc.res != gpu_desc.res) ||
+        cpu_desc.size != gpu_desc.size || cpu_desc.stride != gpu_desc.stride ||
         cpu_desc.fmt != gpu_desc.fmt || cpu_desc.flags != gpu_desc.flags) return 0;
     gpu_ir_buffer_view *cpu_buffer_view = cpu_heap->buffer_view ? cpu_heap->buffer_view[cpu_index] : NULL;
     gpu_ir_buffer_view *gpu_buffer_view = gpu_heap->buffer_view ? gpu_heap->buffer_view[gpu_index] : NULL;
@@ -2585,20 +2589,29 @@ static MTLCompileOptions *d3d12_shader_compile_options12(dev12 *device, const dx
     return options;
 }
 
+static int d3d12_is_dxbc_program(const BYTECODE *code);
+static int dxbc_to_msl12(const BYTECODE *code, dxil_msl *out);
 static WINAPI HRESULT dev_create_compute_pso(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
+    int dxbc = d3d12_is_dxbc_program(&desc->cs);
     dxil_module m;
-    if (dxil_read(desc->cs.code, desc->cs.size, &m)) { vx_log("D3D12: compute shader: %s", m.error); return E_INVALIDARG; }
+    if (!dxbc && dxil_read(desc->cs.code, desc->cs.size, &m)) { vx_log("D3D12: compute shader: %s", m.error); return E_INVALIDARG; }
     pso12 *p = alloc12(sizeof *p, K12_PSO, g_pso_vtbl, d);
     p->base.destroy = pso_destroy;
-    int rc = dxil_to_msl(&m, &p->msl);
     gpu_ir_shader *common_shader = NULL;
-    if (!rc) {
-        int ir_rc = dxil_build_gpu_ir_shader(&m, DXIL_IR_ENTRY_FUNCTION, &common_shader);
-        if (ir_rc != GPU_IR_OK && ir_rc != GPU_IR_UNSUPPORTED)
-            vx_log("D3D12: compute shader common-IR lowering returned %d; retaining direct DXIL translation", ir_rc);
+    int rc;
+    if (dxbc) {
+        rc = dxbc_to_msl12(&desc->cs, &p->msl);
+        if (!rc && p->msl.stage != 5) { snprintf(p->msl.error, sizeof p->msl.error, "not a compute shader"); rc = -1; }
+    } else {
+        rc = dxil_to_msl(&m, &p->msl);
+        if (!rc) {
+            int ir_rc = dxil_build_gpu_ir_shader(&m, DXIL_IR_ENTRY_FUNCTION, &common_shader);
+            if (ir_rc != GPU_IR_OK && ir_rc != GPU_IR_UNSUPPORTED)
+                vx_log("D3D12: compute shader common-IR lowering returned %d; retaining direct DXIL translation", ir_rc);
+        }
+        dxil_free(&m);
     }
-    dxil_free(&m);
     if (rc) { vx_log("D3D12: compute shader not translated: %s", p->msl.error); d3d_release(&p->base); return E_INVALIDARG; }
     if (p->msl.uses_min_lod_clamp && !d3d12_metal_min_lod_clamp_supported(d->mtl)) {
         vx_log("D3D12: shader-level min-LOD sampling needs Metal Mac2/Apple6 support");
@@ -4278,13 +4291,70 @@ static uint32_t d3d12_vertex_format_size12(uint32_t format) {
     }
 }
 
+// DXBC (shader model 4 and 5: what fxc compiles, and what Unreal Engine 4 and Unity give Direct3D 12 by default)
+// translated into the descriptor ABI of DXIL shaders, with a reflection of the same shape, so root signatures,
+// descriptor tables and validation treat both alike.
+static int d3d12_is_dxbc_program(const BYTECODE *code) {
+    return code && code->code && dxbc_program_type(code->code, code->size) >= 0;
+}
+static int dxbc_to_msl12(const BYTECODE *code, dxil_msl *out) {
+    static dxbc_shader s;                                          // (large: kept off the stack, under its own lock)
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    memset(out, 0, sizeof *out);
+    pthread_mutex_lock(&lock);
+    int rc = dxbc_translate_d3d12(code->code, code->size, &s);
+    if (rc) {
+        snprintf(out->error, sizeof out->error, "%s", s.error);
+        dxbc_free(&s);
+        pthread_mutex_unlock(&lock);
+        return -1;
+    }
+    out->stage = s.type;
+    memcpy(out->threads, s.threads, sizeof out->threads);
+    out->nslots = (uint32_t)s.nslots;
+    for (int i = 0; i < s.nslots; i++)
+        out->slots[i] = (dxil_msl_slot){ .cls = s.slots[i].cls, .kind = s.slots[i].kind, .comp = s.slots[i].comp,
+            .has_counter = s.slots[i].counter, .space = 0, .lower = s.slots[i].reg, .count = 1, .stride = s.slots[i].stride,
+            .uav_access = s.slots[i].cls == DXBC_SLOT_UAV ? DXIL_MSL_ACCESS_READ | DXIL_MSL_ACCESS_WRITE : 0 };
+    // signature elements: DXBC component types 1 uint, 2 int, 3 float -> DXIL's 5, 4, 9; the system values engines
+    // feed or read as DXIL's semantic kinds (position 3, vertex/instance id 1/2, targets 16, depth 17)
+    for (int io = 0; io < 2; io++) {
+        const dxbc_element *e = io ? s.outputs : s.inputs;
+        int n = io ? s.noutputs : s.ninputs;
+        dxil_msl_element *dst = io ? out->outputs : out->inputs;
+        uint32_t count = 0;
+        for (int i = 0; i < n && count < 32; i++) {
+            dxil_msl_element *x = &dst[count++];
+            snprintf(x->name, sizeof x->name, "%s", e[i].semantic);
+            x->index = e[i].index;
+            x->kind = e[i].sysval == 1 ? 3 : e[i].sysval == 6 ? 1 : e[i].sysval == 8 ? 2 :
+                      !strncasecmp(e[i].semantic, "SV_Target", 9) ? 16 : !strncasecmp(e[i].semantic, "SV_Depth", 8) ? 17 : 0;
+            x->comp = e[i].component_type == 1 ? 5 : e[i].component_type == 2 ? 4 : 9;
+            x->cols = (uint8_t)__builtin_popcount(e[i].mask);
+            x->attribute = e[i].reg;
+        }
+        if (io) out->noutputs = count; else out->ninputs = count;
+    }
+    out->structured = 1;
+    out->msl = s.msl;
+    s.msl = NULL;
+    dxbc_free(&s);
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+
 static id<MTLFunction> stage_function(dev12 *d, const BYTECODE *code, dxil_msl *out, const char *what,
                                       uint32_t sample_mask) {
-    dxil_module m;
-    if (dxil_read(code->code, code->size, &m)) { vx_log("D3D12: %s: %s", what, m.error); return nil; }
-    int rc = dxil_to_msl_with_sample_mask(&m, sample_mask, out);
-    dxil_free(&m);
-    if (rc) { vx_log("D3D12: %s not translated: %s", what, out->error); return nil; }
+    if (d3d12_is_dxbc_program(code)) {
+        if (sample_mask != UINT32_MAX) { vx_log("D3D12: %s: a sample mask with a DXBC pixel shader is not supported yet", what); return nil; }
+        if (dxbc_to_msl12(code, out)) { vx_log("D3D12: %s (DXBC) not translated: %s", what, out->error); return nil; }
+    } else {
+        dxil_module m;
+        if (dxil_read(code->code, code->size, &m)) { vx_log("D3D12: %s: %s", what, m.error); return nil; }
+        int rc = dxil_to_msl_with_sample_mask(&m, sample_mask, out);
+        dxil_free(&m);
+        if (rc) { vx_log("D3D12: %s not translated: %s", what, out->error); return nil; }
+    }
     if (out->uses_min_lod_clamp && !d3d12_metal_min_lod_clamp_supported(d->mtl)) {
         vx_log("D3D12: %s uses shader-level min-LOD sampling, which needs Metal Mac2/Apple6 support", what);
         dxil_msl_free(out);
@@ -5803,10 +5873,20 @@ static int d3d12_gpu_ir_barrier(void *context, const gpu_ir_barrier_desc *barrie
 }
 
 // The pointer the shader's slot reads its descriptors through, from the root signature and the root arguments.
-static uint64_t resolve_slot(dev12 *d, const rootsig12 *rs, const root_state *st, const dxil_msl_slot *s, scratch *sc, NSMutableArray *used_bufs) {
+// Whether a root parameter or static sampler of this D3D12_SHADER_VISIBILITY reaches a shader of this DXIL stage kind
+// (0 pixel, 1 vertex, 2 geometry, 3 hull, 4 domain, 5 compute). Compute shaders see every parameter; graphics stages
+// only ALL and their own: the vertex and pixel shaders of one pipeline often use the same register for different
+// parameters (b0 of each stage).
+static int root_visible12(int32_t visibility, int stage) {
+    static const int32_t own[] = { 5, 1, 4, 2, 3 };
+    return stage == 5 || visibility == 0 || (stage >= 0 && stage < 5 && visibility == own[stage]);
+}
+
+static uint64_t resolve_slot(dev12 *d, const rootsig12 *rs, const root_state *st, const dxil_msl_slot *s, int stage, scratch *sc, NSMutableArray *used_bufs) {
     if (!rs) return 0;
     for (uint32_t i = 0; i < rs->nparams; i++) {
         const param12 *p = &rs->params[i];
+        if (!root_visible12(p->visibility, stage)) continue;
         if (p->type == 0) {
             for (uint32_t k = 0; k < p->nranges; k++) {
                 const range12 *g = &p->ranges[k];
@@ -5829,7 +5909,8 @@ static uint64_t resolve_slot(dev12 *d, const rootsig12 *rs, const root_state *st
     }
     if (s->cls == DXIL_SAMPLER) {
         for (uint32_t i = 0; i < rs->nsamplers; i++) {
-            if (rs->samplers[i].reg != s->lower || rs->samplers[i].space != s->space) continue;
+            if (rs->samplers[i].reg != s->lower || rs->samplers[i].space != s->space ||
+                !root_visible12(rs->samplers[i].visibility, stage)) continue;
             VxDesc v = { 0, resource_id((id<MTLResource>)rs->samplers[i].state), 0, 0, 0, 0 };
             return scratch_put(d, sc, &v, sizeof v);
         }
@@ -5860,7 +5941,7 @@ typedef struct {
 static void stage_root(dev12 *d, const dxil_msl *msl, root_binding *rb, heap12 *heap, heap12 *sheap, scratch *sc, uint64_t *root, uint32_t *words) {
     uint32_t n = msl->nslots ? msl->nslots : 1;
     memset(root, 0, 8 * (n + 2));
-    for (uint32_t k = 0; k < msl->nslots; k++) root[k] = resolve_slot(d, rb->rs, &rb->st, &msl->slots[k], sc, nil);
+    for (uint32_t k = 0; k < msl->nslots; k++) root[k] = resolve_slot(d, rb->rs, &rb->st, &msl->slots[k], msl->stage, sc, nil);
     root[n] = heap && heap->gpu ? heap->gpu.gpuAddress : 0;
     root[n + 1] = sheap && sheap->gpu ? sheap->gpu.gpuAddress : 0;
     *words = n + 2;
@@ -5869,7 +5950,7 @@ static void stage_root(dev12 *d, const dxil_msl *msl, root_binding *rb, heap12 *
 // Resolve one reflected shader register to its root parameter. Return 1 for a descriptor location, 2 for
 // root constants/static samplers (no resource state to check), 0 when the application has not bound it, and -1
 // for an invalid root-table range.
-static int state_root_slot12(const rootsig12 *root, const root_state *state, const dxil_msl_slot *slot,
+static int state_root_slot12(const rootsig12 *root, const root_state *state, const dxil_msl_slot *slot, int stage,
                              uint64_t *descriptor_va, uint64_t *root_va, const range12 **matched_range) {
     *descriptor_va = 0;
     *root_va = 0;
@@ -5877,6 +5958,7 @@ static int state_root_slot12(const rootsig12 *root, const root_state *state, con
     if (!root) return 0;
     for (uint32_t i = 0; i < root->nparams; i++) {
         const param12 *parameter = &root->params[i];
+        if (!root_visible12(parameter->visibility, stage)) continue;
         if (parameter->type == 0) {
             for (uint32_t k = 0; k < parameter->nranges; k++) {
                 const range12 *range = &parameter->ranges[k];
@@ -5901,7 +5983,8 @@ static int state_root_slot12(const rootsig12 *root, const root_state *state, con
     }
     if (slot->cls == DXIL_SAMPLER) {
         for (uint32_t i = 0; i < root->nsamplers; i++)
-            if (root->samplers[i].reg == slot->lower && root->samplers[i].space == slot->space) return 2;
+            if (root->samplers[i].reg == slot->lower && root->samplers[i].space == slot->space &&
+                root_visible12(root->samplers[i].visibility, stage)) return 2;
     }
     return 0;
 }
@@ -6125,7 +6208,7 @@ static int gpu_ir_snapshot_root_bindings12(dev12 *device, const dxil_msl *shader
         const dxil_msl_slot *slot = &shader->slots[i];
         uint64_t descriptor_va, root_va;
         const range12 *range;
-        int slot_result = state_root_slot12(root_binding->rs, &root_binding->st, slot,
+        int slot_result = state_root_slot12(root_binding->rs, &root_binding->st, slot, shader->stage,
                                             &descriptor_va, &root_va, &range);
         if (slot_result < 0) { result = GPU_IR_INVALID; break; }
         if (!slot_result || (slot_result == 2 && slot->cls != DXIL_SAMPLER)) continue;
@@ -6168,7 +6251,7 @@ static int gpu_ir_snapshot_root_bindings12(dev12 *device, const dxil_msl *shader
             element_slot.lower += (uint32_t)element;
             uint64_t element_va, element_root_va;
             const range12 *element_range;
-            int element_result = state_root_slot12(root_binding->rs, &root_binding->st, &element_slot,
+            int element_result = state_root_slot12(root_binding->rs, &root_binding->st, &element_slot, shader->stage,
                 &element_va, &element_root_va, &element_range);
             if (element_result != 1 || element_root_va || !element_range) {
                 result = GPU_IR_INVALID;
@@ -6414,7 +6497,7 @@ static int state_validate_shader_stage12(dev12 *device, int32_t queue_type, reso
         const dxil_msl_slot *slot = &shader->slots[i];
         uint64_t descriptor_va, root_va;
         const range12 *range;
-        int slot_result = state_root_slot12(root, state, slot, &descriptor_va, &root_va, &range);
+        int slot_result = state_root_slot12(root, state, slot, shader->stage, &descriptor_va, &root_va, &range);
         if (slot_result < 0) return 0;
         if (slot_result == 0 || slot_result == 2) continue;
         if (slot->cls == DXIL_SAMPLER) {
@@ -8811,9 +8894,11 @@ static int queue_validate_list_states12(dev12 *device, int32_t queue_type, id<MT
     uint32_t topology = 4;
     int in_bundle = 0;
     int result = 1;
+    uint32_t at = 0;
     pthread_mutex_lock(&device->lock);
     for (uint32_t i = 0; i < list->n; i++) {
         const cmd12 *command = &list->cmds[i];
+        at = i;
         if (!queue_command_allowed12(device, queue_type, list->type, command)) {
             vx_log("D3D12: queue %d rejected command %u at index %u from list type %d",
                    queue_type, command->op, i, list->type);
@@ -9054,6 +9139,11 @@ static int queue_validate_list_states12(dev12 *device, int32_t queue_type, id<MT
     }
     if (result == 1 && in_bundle) result = 0;
     pthread_mutex_unlock(&device->lock);
+    // VXRT_TRACE_D3D12_STATES=1: which recorded command a rejected list stopped at
+    static int trace = -1;
+    if (trace < 0) trace = getenv("VXRT_TRACE_D3D12_STATES") != NULL;
+    if (trace && result == 0 && at < list->n)
+        vx_log("D3D12: state validation stopped at command %u of %u (op %d, gpu-ir kind %u)", at, list->n, list->cmds[at].op, list->cmds[at].gfx);
     if (result == 1) { *out_shadows = shadows; *out_count = count; }
     else {
         for (uint32_t i = 0; i < count; i++) state_shadow_clear12(&shadows[i]);

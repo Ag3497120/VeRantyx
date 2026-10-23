@@ -44,8 +44,15 @@ typedef struct {
     int out_regs;                   // output registers o0..o(n-1) (vertex and geometry shaders)
     int gs_in_verts, gs_max_tris, gs_instances;
     char *msl_kernel, *msl_passthrough;
+    // Direct3D 12 (dxbc_translate_d3d12): the resources come through the root argument buffer DXIL shaders use
+    // (dxil_msl.h: VxRoot at [[buffer(0)]], a pointer per slot to its 32-byte descriptors), one slot per register the
+    // shader declares, in this order: SRVs, UAVs, constant buffers, samplers (register space 0).
+    int d3d12;
+    struct { uint8_t cls, kind, comp, counter; uint32_t reg, stride; } slots[64];   // cls: DXBC_SLOT_*; kind/comp: DXIL's
+    int nslots;
     char error[256];
 } dxbc_shader;
+enum { DXBC_SLOT_SRV, DXBC_SLOT_UAV, DXBC_SLOT_CBV, DXBC_SLOT_SAMPLER };
 
 enum { DXBC_UAV_TYPED = 1, DXBC_UAV_RAW, DXBC_UAV_STRUCTURED };
 // Metal binding indices beyond the Direct3D slot numbers: UAV buffers, raw/structured SRV buffers, UAV
@@ -68,6 +75,8 @@ typedef struct { uint32_t sizes[48]; uint64_t counters[8]; } dxbc_aux;
 
 // Translates a DXBC container. Returns 0 and fills *out, or -1 with out->error set.
 int  dxbc_translate(const void *code, size_t size, dxbc_shader *out);
+// The same for a Direct3D 12 pipeline (vertex, pixel and compute shaders): resources through out->slots.
+int  dxbc_translate_d3d12(const void *code, size_t size, dxbc_shader *out);
 void dxbc_free(dxbc_shader *s);
 // The input signature of a container (for input layouts), without translating it.
 int  dxbc_input_signature(const void *code, size_t size, dxbc_element *elements, int max);

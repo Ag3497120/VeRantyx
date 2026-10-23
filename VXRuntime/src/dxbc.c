@@ -1244,6 +1244,7 @@ static int first_comp(uint8_t mask) { for (int c = 0; c < 4; c++) if (mask & (1 
 // Constant buffers, textures, samplers, buffer SRVs and UAVs as function parameters (shared by all stages).
 static void resource_params(gen *g, text *t) {
     dxbc_shader *sh = g->sh;
+    if (sh->d3d12) { put(t, ", constant VxRoot &vx_root [[buffer(0)]]"); return; }
     for (int i = 0; i < 16; i++) if (sh->cbuffers & (1u << i)) put(t, ", constant float4 *cb%d [[buffer(%d)]]", i, i);
     for (int i = 0; i < 128; i++) {
         if (!(sh->textures[i / 64] & (1ull << (i % 64)))) continue;
@@ -1275,14 +1276,116 @@ static void resource_params(gen *g, text *t) {
     }
     if (sh->uses_sizes) put(t, ", constant uint *vx_sizes [[buffer(%d)]]", DXBC_SIZES_BUFFER);
 }
+static const char *tex_type(gen *g, int i) {
+    switch (g->tex_dim[i]) {
+    case DIM_BUFFER: return "texture_buffer";
+    case DIM_1D: return "texture1d";
+    case DIM_1DARRAY: return "texture1d_array";
+    case DIM_2DMS: return g->tex_cmp[i] ? "depth2d_ms" : "texture2d_ms";
+    case DIM_2DMSARRAY: return g->tex_cmp[i] ? "depth2d_ms_array" : "texture2d_ms_array";
+    case DIM_3D: return "texture3d";
+    case DIM_CUBE: return g->tex_cmp[i] ? "depthcube" : "texturecube";
+    case DIM_CUBEARRAY: return g->tex_cmp[i] ? "depthcube_array" : "texturecube_array";
+    case DIM_2DARRAY: return g->tex_cmp[i] ? "depth2d_array" : "texture2d_array";
+    default: return g->tex_cmp[i] ? "depth2d" : "texture2d";
+    }
+}
+static const char *uav_type(gen *g, int i) {
+    return g->uav_dim[i] == DIM_BUFFER ? "texture_buffer" : g->uav_dim[i] == DIM_1D ? "texture1d" : g->uav_dim[i] == DIM_1DARRAY ? "texture1d_array" :
+           g->uav_dim[i] == DIM_2DARRAY ? "texture2d_array" : g->uav_dim[i] == DIM_3D ? "texture3d" : "texture2d";
+}
+static const char *ret_type(uint8_t ret) { return ret == 3 ? "int" : ret == 4 ? "uint" : "float"; }
+
+// Direct3D 12: the slots, in DXIL's order (SRVs, UAVs, CBVs, samplers), with DXIL's resource kinds and component types.
+static int d3d12_slots(gen *g) {
+    static const uint8_t kinds[] = { [DIM_BUFFER] = 10, [DIM_1D] = 1, [DIM_2D] = 2, [DIM_2DMS] = 3, [DIM_3D] = 4, [DIM_CUBE] = 5,
+                                     [DIM_1DARRAY] = 6, [DIM_2DARRAY] = 7, [DIM_2DMSARRAY] = 8, [DIM_CUBEARRAY] = 9 };
+    dxbc_shader *sh = g->sh;
+    sh->nslots = 0;
+#define SLOT(c, k, cp, r, st, ctr) do { \
+        if (sh->nslots == 64) { snprintf(g->why, sizeof g->why, "more than 64 resources"); return -1; } \
+        sh->slots[sh->nslots++] = (__typeof__(sh->slots[0])){ c, k, cp, ctr, r, st }; } while (0)
+    for (int i = 0; i < 128; i++) {
+        uint8_t comp = g->tex_ret[i] == 3 ? 4 : g->tex_ret[i] == 4 ? 5 : 9;
+        if (sh->textures[i / 64] & (1ull << (i % 64)))
+            SLOT(DXBC_SLOT_SRV, g->tex_dim[i] < sizeof kinds && kinds[g->tex_dim[i]] ? kinds[g->tex_dim[i]] : 2, comp, (uint32_t)i, 0, 0);
+        else if (i < 64 && (sh->srv_buffers & (1ull << i)))
+            SLOT(DXBC_SLOT_SRV, sh->srv_stride[i] ? 12 : 11, 5, (uint32_t)i, sh->srv_stride[i], 0);
+    }
+    for (int i = 0; i < 8; i++) {
+        if (!(sh->uavs & (1u << i))) continue;
+        uint8_t comp = g->uav_ret[i] == 3 ? 4 : g->uav_ret[i] == 4 ? 5 : 9;
+        if (sh->uav_kind[i] == DXBC_UAV_TYPED)
+            SLOT(DXBC_SLOT_UAV, g->uav_dim[i] < sizeof kinds && kinds[g->uav_dim[i]] ? kinds[g->uav_dim[i]] : 2, comp, (uint32_t)i, 0, 0);
+        else
+            SLOT(DXBC_SLOT_UAV, sh->uav_kind[i] == DXBC_UAV_RAW ? 11 : 12, 5, (uint32_t)i, sh->uav_stride[i], (sh->uav_counters >> i) & 1);
+    }
+    for (int i = 0; i < 16; i++) if (sh->cbuffers & (1u << i)) SLOT(DXBC_SLOT_CBV, 13, 9, (uint32_t)i, 0, 0);
+    for (int i = 0; i < 32; i++) if (sh->samplers & (1u << i)) SLOT(DXBC_SLOT_SAMPLER, 14, 0, (uint32_t)i, 0, 0);
+#undef SLOT
+    return 0;
+}
+// Direct3D 12: the descriptor layout (dxil_msl.c's VxDesc) and a view of it per texture type, read from VxRoot.
+static void d3d12_types(gen *g, text *t) {
+    dxbc_shader *sh = g->sh;
+    put(t, "struct VxDesc { ulong va; ulong res; uint size, stride, fmt, flags; };\n");
+    put(t, "struct VxRoot { device const uchar *slot[%d]; device const uchar *heap; device const uchar *samplers; };\n", sh->nslots ? sh->nslots : 1);
+    put(t, "struct VxSampler { ulong va; sampler s; uint size, stride, fmt, flags; };\n");
+    for (int k = 0; k < sh->nslots; k++) {
+        int i = (int)sh->slots[k].reg;
+        if (sh->slots[k].cls == DXBC_SLOT_SRV && sh->slots[k].kind <= 10)
+            put(t, "struct VxView%d { ulong va; %s<%s> t; uint size, stride, fmt, flags; };\n", k, tex_type(g, i), g->tex_cmp[i] ? "float" : ret_type(g->tex_ret[i]));
+        if (sh->slots[k].cls == DXBC_SLOT_UAV && sh->slots[k].kind <= 10)
+            put(t, "struct VxView%d { ulong va; %s<%s, access::%s> t; uint size, stride, fmt, flags; };\n", k, uav_type(g, i),
+                ret_type(g->uav_ret[i]), sh->uav_read[i] ? "read_write" : "write");
+    }
+    put(t, "\n");
+}
+// Direct3D 12: the resources as locals of the names the body uses, and the sizes the D3D11 path passes in a buffer
+// (vx_sizes: bytes of u0..u7, then of the buffer SRVs by rank, float4s of cb0..cb15 at 32; UAV counters apart).
+static void d3d12_locals(gen *g, text *t) {
+    dxbc_shader *sh = g->sh;
+    if (sh->uses_sizes) put(t, "    uint vx_sizes[48] = {};\n");
+    if (sh->uav_counters) put(t, "    device atomic_uint *vx_ctr[8] = {};\n");
+    for (int k = 0; k < sh->nslots; k++) {
+        int i = (int)sh->slots[k].reg, kind = sh->slots[k].kind;
+        put(t, "    device const VxDesc *vx_d%d = (device const VxDesc *)vx_root.slot[%d];\n", k, k);
+        switch (sh->slots[k].cls) {
+        case DXBC_SLOT_SRV:
+            if (kind <= 10) put(t, "    %s<%s> t%d = ((device const VxView%d *)vx_d%d)->t;\n", tex_type(g, i), g->tex_cmp[i] ? "float" : ret_type(g->tex_ret[i]), i, k, k);
+            else {
+                put(t, "    const device uint *t%d = (const device uint *)vx_d%d->va;\n", i, k);
+                if (sh->uses_sizes) put(t, "    vx_sizes[%u] = vx_d%d->size;\n", 8 + (uint32_t)SRV_RANK(g, i), k);
+            }
+            break;
+        case DXBC_SLOT_UAV:
+            if (kind <= 10) put(t, "    %s<%s, access::%s> u%d = ((device const VxView%d *)vx_d%d)->t;\n", uav_type(g, i), ret_type(g->uav_ret[i]),
+                                sh->uav_read[i] ? "read_write" : "write", i, k, k);
+            else put(t, "    device uint *u%d = (device uint *)vx_d%d->va;\n", i, k);
+            if (sh->uses_sizes) put(t, "    vx_sizes[%d] = vx_d%d->size;\n", i, k);
+            if (sh->slots[k].counter) put(t, "    if (vx_d%d->flags & 2u) vx_ctr[%d] = (device atomic_uint *)vx_d%d->res;\n", k, i, k);
+            break;
+        case DXBC_SLOT_CBV:
+            put(t, "    device const float4 *cb%d = (device const float4 *)vx_d%d->va;\n", i, k);
+            if (sh->uses_sizes) put(t, "    vx_sizes[%d] = vx_d%d->size / 16u;\n", DXBC_CB_SIZES + i, k);
+            break;
+        default:
+            put(t, "    sampler s%d = ((device const VxSampler *)vx_d%d)->s;\n", i, k);
+        }
+    }
+}
 static void locals(gen *g, text *t) {
+    if (g->sh->d3d12) d3d12_locals(g, t);
     for (int i = 0; i < g->temps; i++) put(t, "    float4 r%d = 0;\n", i);
     for (int i = 0; i < g->nxt; i++) put(t, "    float4 x%u[%u] = {};\n", g->xt[i].reg, g->xt[i].size);
 }
 
 static void preamble(gen *g, text *t) {
     put(t, "#include <metal_stdlib>\nusing namespace metal;\n\n");
-    if (g->sh->uav_counters)
+    if (g->sh->d3d12) {
+        d3d12_types(g, t);
+        if (g->sh->uav_counters) put(t, "#define vx_counter(u) (vx_ctr[u])\n\n");
+    } else if (g->sh->uav_counters)
         put(t, "struct VxCounters { device atomic_uint *c[8]; };\n#define vx_counter(u) ((*reinterpret_cast<constant VxCounters *>(vx_sizes + 48)).c[u])\n\n");
     if (g->uses_msad)
         put(t, "template <typename T> T vx_msad(T r, T s, T a) {\n"
@@ -1580,8 +1683,9 @@ static int run(gen *g, const uint32_t *p) {
     return r.bad;
 }
 
-int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
+static int translate_container(const void *code, size_t size, dxbc_shader *out, int d3d12) {
     memset(out, 0, sizeof *out);
+    out->d3d12 = d3d12;
     uint32_t len;
     const uint8_t *prog = chunk(code, size, "SHEX", &len);
     if (!prog) prog = chunk(code, size, "SHDR", &len);
@@ -1638,6 +1742,11 @@ int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
         return -1;
     }
     out->out_regs = out_regs(&g);
+    if (d3d12 && (g.gs || d3d12_slots(&g))) {
+        snprintf(out->error, sizeof out->error, "%s", g.gs ? "geometry shaders are not supported in Direct3D 12 pipelines yet" : g.why);
+        free(g.body.s); free(g.icb);
+        return -1;
+    }
     if (g.gs) {
         // Input primitives: point, line, triangle, and with adjacency (6, 7); output: triangle strips (5).
         out->gs_in_verts = g.gs_inprim == 1 ? 1 : g.gs_inprim == 2 ? 2 : g.gs_inprim == 3 ? 3 : g.gs_inprim == 6 ? 4 : g.gs_inprim == 7 ? 6 : 0;
@@ -1651,11 +1760,13 @@ int dxbc_translate(const void *code, size_t size, dxbc_shader *out) {
         out->msl_passthrough = compose_passthrough(&g, out->gs_max_tris);
     } else {
         out->msl = compose(&g);
-        if (out->type == DXBC_VERTEX) out->msl_kernel = compose_vs_kernel(&g);
+        if (out->type == DXBC_VERTEX && !d3d12) out->msl_kernel = compose_vs_kernel(&g);
     }
     free(g.body.s); free(g.icb);
     return 0;
 }
+int dxbc_translate(const void *code, size_t size, dxbc_shader *out) { return translate_container(code, size, out, 0); }
+int dxbc_translate_d3d12(const void *code, size_t size, dxbc_shader *out) { return translate_container(code, size, out, 1); }
 void dxbc_free(dxbc_shader *s) {
     free(s->msl); free(s->msl_kernel); free(s->msl_passthrough);
     s->msl = s->msl_kernel = s->msl_passthrough = NULL;
