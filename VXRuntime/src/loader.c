@@ -1160,6 +1160,8 @@ int main(int argc, char **argv, char **envp) {
     vx_d3d9_init();
     vx_vcruntime_init();
     vx_dotnet_init();
+    vx_sysdlls_init();
+    vx_dbghelp_init();
     vx_extras_init();                            // (last: the tables above come first)
     // VXRT_CONTROL_FOR=<program.exe>: only that program takes the socket; others (a launcher's watchdog) pass it on
     const char *control_for = getenv("VXRT_CONTROL_FOR");
