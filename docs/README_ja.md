@@ -31,6 +31,11 @@ macOS の上に直接実装して渡します。ファイル、レジストリ�
 Windows 版と本物の Windows 版 SteamVR（vrserver、vrcompositor、VeRantyx ドライバー）が Wine なしで Mac 上で動き、
 ゲームは macOS でサインイン済みの Steam クライアントにつながります。
 
+Wine のコードは使っていません。ただし、2026-10-12〜10-23 の版（mac-v0.1.0、mac-v0.2.0 を含む）には、Wine に由来する
+x64 例外アンワインド処理が約 120 行含まれていました。AI エージェントが Wine のコードを再現して書いたもので、監査で
+見つけ、Microsoft の資料だけからクリーンルームで書き直して置き換えました。その部分は MIT ではなく LGPL-2.1 以降で、
+Wine の著作権表示とともに [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) に記載しています。
+
 2026-10-12 に始めました。理由は2つです。Wine 版では Wine 自体がボトルネックで（wineserver、Steam の Chromium、
 二重のグラフィックス変換がすべて CPU に載り、約30fps で CPU 律速）、また Wine の設計が Apple の D3DMetal を
 使えなくしていたためです。vxrt は Windows 版をそのまま動かすので、Linux ARM64 版があるゲーム（SteamVR タイトルでは
@@ -323,3 +328,7 @@ WINEPREFIX="$HOME/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test" STEAMVR_ONLY=1 .
 - 前回のSteamVRはクラッシュ後のセーフモードでVerantyxドライバーを読み込んでいませんでした（`blocked_by_safe_mode`）。起動スクリプトがこのブロックを解除し、セーフモードを無効にします。
 - スクリプトは`rg`（ripgrep）を使わず、macOS標準の`grep -E`で動きます。このMacの`/opt/homebrew/bin`と`/usr/local/bin`には`rg`がなく、`rg`がPATHにない環境では以前のスクリプトはビルド確認やドライバー起動の検出に失敗していました。
 - Windows用DLL（ドライバー、D3D11 proxy、キャプチャproxy、WebHelper shim）は、同じソースから同じバイト列になるようにビルドします（タイムスタンプなし、シンボル除去、固定の作業パス）。インストールは別ファイルに書いてから名前を差し替える方式で、内容が同じなら何もしません。以前は毎回内容の変わるDLLを、SteamVRが読み込み中のファイルへ上書きしていたため、SteamVRを使い回すと不安定になる可能性がありました。Alyxの実行中は、読み込み中のOpenVR DLLを差し替えません。
+
+---
+
+ライセンス: MIT © 2026 Ag3497120。例外は [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) を参照してください（過去の版に含まれていた Wine 由来の LGPL のコード約 120 行を含む）。
