@@ -6,6 +6,7 @@
 //                                          (--flat too: on the Mac's screen, as the "On this Mac" button does)
 //   VeRantyx --snapshot <folder>           saves pictures of each page of the window (scrolled: <page>-2.png, ...)
 //   VeRantyx --report                      saves the logs as a report does and prints the form's link (opens nothing)
+//   VeRantyx --missing-functions <log>     prints the missing Windows functions a game log names, as the report sends them
 import AppKit
 import SwiftUI
 
@@ -32,6 +33,10 @@ enum Entry {
                 exit(0)
             }
             dispatchMain()
+        }
+        if let i = a.firstIndex(of: "--missing-functions"), i + 1 < a.count {
+            for name in Play.missingFunctions(in: URL(fileURLWithPath: a[i + 1])) { print(name) }
+            exit(0)
         }
         if let i = a.firstIndex(of: "--play"), i + 1 < a.count {
             let id = a[i + 1]
@@ -107,6 +112,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if play.running { play.stop() }
         for _ in 0..<40 where play.running { try? await Task.sleep(nanoseconds: 500_000_000) }
         print("ended: phase=\(play.phase) problem=\(play.problem ?? "-") last game log line: \(play.gameLines.last ?? "-")")
+        // (what the session card's report buttons would open)
+        print("fps samples=\(play.fpsSamples.count) missing functions=\(play.missingFunctions.count)")
+        if !play.fpsSamples.isEmpty { print("report: \(model.runsReportURL(play).absoluteString)") }
+        if !play.missingFunctions.isEmpty { print("missing: \(model.missingFunctionsURL(play).absoluteString)") }
         exit(0)
     }
 }

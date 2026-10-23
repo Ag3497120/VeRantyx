@@ -174,5 +174,10 @@
  "Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.": "Tastatur und Maus funktionieren wie unter Windows; für einen DualSense wähle seine Vorlage im Spiel unter Optionen > Steuerung. Esc öffnet das Menü des Spiels.",
  "Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.": "Fliegt auf dem Bildschirm des Mac (im Spiel etwa 60 fps auf einem M1 Max) oder im Headset (30–35 fps); Tastatur, Maus und ein DualSense. Es öffnet seinen eigenen Launcher: Dort anmelden und PLAY drücken.",
  "The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.": "Der eigene Launcher des Spiels öffnet sich: Bediene ihn wie unter Windows. Melde dich an, lass ihn aktualisieren, wenn er danach fragt, und drücke dann einmal PLAY.",
- "Launcher: sign in, PLAY": "Launcher: anmelden, PLAY"
+ "Launcher: sign in, PLAY": "Launcher: anmelden, PLAY",
+ "The game called %@ Windows functions VXRuntime does not have yet.": "Das Spiel hat %@ Windows-Funktionen aufgerufen, die VXRuntime noch nicht hat.",
+ "Report: it ran": "Melden: Es lief",
+ "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "Öffnet ein GitHub-Formular, ausgefüllt mit dem Spiel, diesem Mac und der Bildrate; nichts Persönliches. Du drückst auf Absenden.",
+ "Send the missing functions": "Fehlende Funktionen senden",
+ "Opens a GitHub form with the names of the functions only. You press Submit.": "Öffnet ein GitHub-Formular nur mit den Namen der Funktionen. Du drückst auf Absenden."
 }

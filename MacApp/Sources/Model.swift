@@ -274,7 +274,7 @@ struct Job {
         guard play?.running != true else { return }
         error = nil
         do {
-            play = try Play(title: game.name, exe: game.alyx ? nil : game.exe, headset: headset, wired: wired, quality: quality,
+            play = try Play(title: game.name, appID: game.id, exe: game.alyx ? nil : game.exe, headset: headset, wired: wired, quality: quality,
                             known: game.title, flat: flat && game.title?.flat == true)
         } catch {
             self.error = error.localizedDescription
@@ -294,6 +294,42 @@ struct Job {
 
     /// GitHub's form, filled in: the title says the headset, the Mac and what went wrong (the last play's problem),
     /// so that reports differ at a glance; `logs`, the zip file saved for it (Report.saveLogs).
+    /// "It ran": the GitHub form filled in from a play that has ended (the game, where it was played, this Mac and the
+    /// frame rate the app read); the player only checks it and presses Submit. Nothing personal is in it.
+    func runsReportURL(_ play: Play) -> URL {
+        var c = URLComponents(string: "https://github.com/Ag3497120/VeRantyx/issues/new")!
+        let game = play.appID.map { "\(play.title) (\($0))" } ?? play.title
+        let place = play.flat ? "The Mac's screen" :
+            "\(headset.name)\(headset == .quest && wired ? ", USB cable" : ""), \(quality.name)"
+        // (loading screens read 0 and start-up benchmarks run far above play, so the range is the middle 80 %)
+        let samples = play.fpsSamples.filter { $0 >= 1 }.sorted()
+        let minutes = Int(((play.endedAt ?? Date()).timeIntervalSince(play.startedAt) / 60).rounded())
+        let fps = samples.isEmpty ? "" : String(format: "median %.0f fps, mostly %.0f-%.0f, over %d min",
+            samples[samples.count / 2], samples[samples.count / 10], samples[samples.count * 9 / 10], max(minutes, 1))
+        c.queryItems = [URLQueryItem(name: "template", value: "works.yml"),
+                        URLQueryItem(name: "title", value: "[runs] \(game) on \(Mac.chip)\(play.flat ? ", Mac screen" : ", \(headset.rawValue)")"),
+                        URLQueryItem(name: "game", value: game),
+                        URLQueryItem(name: "mode", value: place),
+                        URLQueryItem(name: "mac", value: "\(Mac.model), \(Mac.chip), \(Mac.memoryGB) GB, macOS \(Mac.macOS), VeRantyx \(AppBuild.description)"),
+                        URLQueryItem(name: "fps", value: fps)]
+        c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")   // (a "+" is a space to GitHub)
+        return c.url!
+    }
+
+    /// The Windows functions a play's game called that VXRuntime lacks, as a GitHub form filled in (names only).
+    func missingFunctionsURL(_ play: Play) -> URL {
+        var c = URLComponents(string: "https://github.com/Ag3497120/VeRantyx/issues/new")!
+        let game = play.appID.map { "\(play.title) (\($0))" } ?? play.title
+        let first = play.missingFunctions.prefix(2).joined(separator: ", ")
+        c.queryItems = [URLQueryItem(name: "template", value: "missing-functions.yml"),
+                        URLQueryItem(name: "title", value: "[missing] \(game): \(first)\(play.missingFunctions.count > 2 ? ", ..." : "")"),
+                        URLQueryItem(name: "game", value: game),
+                        URLQueryItem(name: "functions", value: play.missingFunctions.joined(separator: "\n")),
+                        URLQueryItem(name: "mac", value: "\(Mac.model), \(Mac.chip), \(Mac.memoryGB) GB, macOS \(Mac.macOS), VeRantyx \(AppBuild.description)")]
+        c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        return c.url!
+    }
+
     func reportURL(logs: String? = nil) -> URL {
         var c = URLComponents(string: "https://github.com/Ag3497120/VeRantyx/issues/new")!
         let kind: String

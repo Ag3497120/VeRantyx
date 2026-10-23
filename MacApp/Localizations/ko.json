@@ -174,5 +174,10 @@
  "Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.": "키보드와 마우스는 Windows에서처럼 작동합니다. DualSense는 게임의 옵션 > 조작에서 해당 프리셋을 선택하세요. Esc로 게임 메뉴를 엽니다.",
  "Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.": "Mac 화면(M1 Max에서 게임 중 약 60fps) 또는 헤드셋(30–35fps)에서 비행합니다. 키보드, 마우스, DualSense 지원. 전용 런처가 열리면 로그인하고 PLAY를 누르세요.",
  "The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.": "게임 전용 런처가 열립니다. Windows에서처럼 사용하세요. 로그인하고, 업데이트를 요청하면 끝낸 뒤 PLAY를 한 번 누르세요.",
- "Launcher: sign in, PLAY": "런처: 로그인, PLAY"
+ "Launcher: sign in, PLAY": "런처: 로그인, PLAY",
+ "The game called %@ Windows functions VXRuntime does not have yet.": "게임이 VXRuntime에 아직 없는 Windows 함수 %@개를 호출했습니다.",
+ "Report: it ran": "보고: 실행됨",
+ "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "게임, 이 Mac, 프레임 레이트가 채워진 GitHub 양식을 엽니다. 개인 정보는 없습니다. 제출은 직접 누르세요.",
+ "Send the missing functions": "부족한 함수 보내기",
+ "Opens a GitHub form with the names of the functions only. You press Submit.": "함수 이름만 적힌 GitHub 양식을 엽니다. 제출은 직접 누르세요."
 }

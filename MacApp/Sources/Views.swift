@@ -579,7 +579,31 @@ struct SessionCard: View {
                 .padding(8)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
             }
+            if !play.running && !play.missingFunctions.isEmpty {
+                // (names only, nothing from the game: one click sends what the runtime should implement next)
+                Label(TF("The game called %@ Windows functions VXRuntime does not have yet.",
+                         "ゲームが、VXRuntime にまだない Windows の関数を %@ 個呼びました。", "\(play.missingFunctions.count)"),
+                      systemImage: "puzzlepiece.extension")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             HStack {
+                if !play.running {
+                    // (reports anyone can send: they build the list of games that run, and what to implement next)
+                    if !play.fpsSamples.isEmpty {
+                        Button { NSWorkspace.shared.open(model.runsReportURL(play)) } label: {
+                            Label(T("Report: it ran", "報告：動いた"), systemImage: "checkmark.seal")
+                        }
+                        .help(T("Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.",
+                                "ゲーム、この Mac、fps を記入した GitHub のフォームを開きます。個人情報は含みません。送信はご自身で。"))
+                    }
+                    if !play.missingFunctions.isEmpty {
+                        Button { NSWorkspace.shared.open(model.missingFunctionsURL(play)) } label: {
+                            Label(T("Send the missing functions", "足りない関数を送る"), systemImage: "paperplane")
+                        }
+                        .help(T("Opens a GitHub form with the names of the functions only. You press Submit.",
+                                "関数の名前だけを記入した GitHub のフォームを開きます。送信はご自身で。"))
+                    }
+                }
                 Spacer()
                 if play.running {
                     Button(role: .destructive) { play.stop() } label: { Label(T("Stop", "停止"), systemImage: "stop.fill") }

@@ -174,5 +174,10 @@
  "Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.": "Клавиатура и мышь работают как в Windows; для DualSense выберите его предустановку в игре: Параметры > Управление. Esc открывает меню игры.",
  "Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.": "Летает на экране Mac (около 60 fps в игре на M1 Max) или в шлеме (30–35 fps); клавиатура, мышь и DualSense. Открывает собственный лаунчер: войдите и нажмите в нём PLAY.",
  "The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.": "Откроется лаунчер игры: пользуйтесь им как в Windows. Войдите, дайте ему обновиться, если он попросит, затем один раз нажмите PLAY.",
- "Launcher: sign in, PLAY": "Лаунчер: вход, PLAY"
+ "Launcher: sign in, PLAY": "Лаунчер: вход, PLAY",
+ "The game called %@ Windows functions VXRuntime does not have yet.": "Игра вызвала %@ функций Windows, которых в VXRuntime пока нет.",
+ "Report: it ran": "Сообщить: запустилось",
+ "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "Открывает форму GitHub, заполненную игрой, этим Mac и частотой кадров; ничего личного. Отправляете вы сами.",
+ "Send the missing functions": "Отправить недостающие функции",
+ "Opens a GitHub form with the names of the functions only. You press Submit.": "Открывает форму GitHub только с именами функций. Отправляете вы сами."
 }

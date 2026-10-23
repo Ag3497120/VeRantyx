@@ -174,5 +174,10 @@
  "Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.": "鍵盤和滑鼠的用法與 Windows 相同；使用 DualSense 時，請在遊戲的 選項 > 控制 中選擇其預設。按 Esc 開啟遊戲選單。",
  "Flies on the Mac's screen (about 60 fps in game on an M1 Max) or in the headset (30-35 fps); keyboard, mouse and a DualSense. It opens its own launcher: sign in and press PLAY there.": "可在 Mac 螢幕上飛行（M1 Max 上遊戲中約 60 fps），也可在頭戴裝置中（30–35 fps）；支援鍵盤、滑鼠和 DualSense。會開啟遊戲自己的啟動器：在那裡登入並按 PLAY。",
  "The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.": "會開啟遊戲自己的啟動器：像在 Windows 上一樣使用。登入，如要求更新就先完成更新，然後按一次 PLAY。",
- "Launcher: sign in, PLAY": "啟動器：登入、PLAY"
+ "Launcher: sign in, PLAY": "啟動器：登入、PLAY",
+ "The game called %@ Windows functions VXRuntime does not have yet.": "遊戲呼叫了 %@ 個 VXRuntime 尚未實作的 Windows 函式。",
+ "Report: it ran": "回報：能執行",
+ "Opens a GitHub form filled in with the game, this Mac and the frame rate; nothing personal. You press Submit.": "開啟已填好遊戲、這台 Mac 和影格率的 GitHub 表單；不含個人資訊。由你自己按提交。",
+ "Send the missing functions": "傳送缺少的函式",
+ "Opens a GitHub form with the names of the functions only. You press Submit.": "開啟只含函式名稱的 GitHub 表單。由你自己按提交。"
 }

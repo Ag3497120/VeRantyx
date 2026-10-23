@@ -44,6 +44,7 @@ enum Quality: String, CaseIterable, Identifiable {
     enum Phase: Equatable { case starting, steamVR, playing, stopping, ended }
 
     let title: String
+    let appID: String?
     /// On the Mac's screen, without SteamVR or a headset.
     let flat: Bool
     var phase: Phase = .starting
@@ -59,6 +60,12 @@ enum Quality: String, CaseIterable, Identifiable {
     /// The last problem a play ended with (in the title of a report written after it).
     static var lastProblem: String?
     var startedAt = Date()
+    /// When it ended, the Windows functions the game called that VXRuntime lacks ("DLL!function", as the runtime logs
+    /// them), for a report of names only.
+    var missingFunctions: [String] = []
+    var endedAt: Date? = nil
+    /// The frame rates read while the game ran (every second), for the "it ran" report.
+    @ObservationIgnored private(set) var fpsSamples: [Double] = []
     @ObservationIgnored private var stopping = false
 
     @ObservationIgnored private var process = Process()
@@ -68,8 +75,10 @@ enum Quality: String, CaseIterable, Identifiable {
     @ObservationIgnored private let gameLog: URL
     @ObservationIgnored private let launcherLog = Paths.logs.appendingPathComponent("launcher.log")
 
-    init(title: String, exe: URL?, headset: Headset, wired: Bool, quality: Quality, known: Title? = nil, flat: Bool = false) throws {
+    init(title: String, appID: String? = nil, exe: URL?, headset: Headset, wired: Bool, quality: Quality, known: Title? = nil,
+         flat: Bool = false) throws {
         self.title = title
+        self.appID = appID
         self.headset = headset
         self.known = known
         self.flat = flat
@@ -149,7 +158,9 @@ enum Quality: String, CaseIterable, Identifiable {
         timer?.invalidate()
         poll()
         phase = .ended
+        endedAt = Date()
         headsetConnected = false
+        missingFunctions = fresh(gameLog) ? Play.missingFunctions(in: gameLog) : []
         guard !stopping, problem == nil else { return }
         // (the game ended by itself: what its own last lines say; a child's, such as SteamVR's vrwebhelper, which
         //  cannot run here, are "[vxrt <name>:<pid>]" lines and say nothing about the game)
@@ -165,6 +176,12 @@ enum Quality: String, CaseIterable, Identifiable {
     }
 
     private func poll() {
+        pollStatus()
+        // (a sample a second while the game itself runs: its reported rate changes every 5 s, so this weighs by time)
+        if let fps, running, usesLauncher ? gameStarted : phase == .playing { fpsSamples.append(fps) }
+    }
+
+    private func pollStatus() {
         if phase == .starting && listening(27062) { phase = .steamVR }
         let game = fresh(gameLog) ? Play.tail(gameLog, 8000) : ""
         if (phase == .steamVR || flat && phase == .starting) && !game.isEmpty { phase = .playing }
@@ -214,6 +231,23 @@ enum Quality: String, CaseIterable, Identifiable {
         guard usesLauncher && !gameStarted else { return nil }
         return T("The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.",
                  "ゲーム専用のランチャーが開きます。Windows と同じように操作してください。サインインし、更新を求められたら済ませてから、PLAY を 1 回押します。")
+    }
+
+    /// The Windows functions a game called that VXRuntime lacks, from its log: "DLL!function", each once, in the order
+    /// first called. SteamVR's own helper programs (vrwebhelper and the like) are left out: they are not the game.
+    nonisolated static func missingFunctions(in log: URL) -> [String] {
+        guard let data = FileManager.default.contents(atPath: log.path) else { return [] }
+        let marker = "called an unimplemented function: "
+        let steamVR = ["vrwebhelper", "vrcompositor", "vrserver", "vrmonitor", "vrdashboard", "vrstartup", "vrcmd"]
+        var found: [String] = []
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") where line.contains(marker) {
+            if steamVR.contains(where: { line.contains("[vxrt \($0)") }) { continue }
+            guard let r = line.range(of: marker) else { continue }
+            let name = line[r.upperBound...].prefix { !$0.isWhitespace }
+            if !name.isEmpty && !found.contains(String(name)) { found.append(String(name)) }
+            if found.count == 60 { break }
+        }
+        return found
     }
 
     nonisolated static func number(in line: Substring, after key: String) -> Double? {
