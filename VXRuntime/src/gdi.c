@@ -4,12 +4,15 @@
 // a window's client area (top-down) or a memory bitmap (top-down, or bottom-up for a bottom-up DIB section).
 // Contexts are set up so GDI coordinates (y down) work unchanged; images and text, which Core Graphics draws
 // y-up, are flipped locally. Text goes through Core Text.
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <CoreText/CoreText.h>
 #include "ui.h"
+struct vx_region;
+void vx_region_free(struct vx_region *r);                    // region.c
 
 enum { OBJ_PEN = 1, OBJ_BRUSH = 2, OBJ_DC = 3, OBJ_FONT = 6, OBJ_BITMAP = 7, OBJ_REGION = 8, OBJ_MEMDC = 10 };
 #define GDI_BASE 0x40000
@@ -29,7 +32,7 @@ typedef struct gdi_obj {
     uint32_t text_color, bk_color, dc_brush, dc_pen;
     int bk_mode;
     POINT pos;
-    RECT rgn;                                                 // region: a rectangle
+    struct vx_region *region;                                 // region: its rectangles (region.c)
     vx_texts texts;                                           // bitmap: text drawn on it (ui.h)
 } gdi_obj;
 
@@ -161,8 +164,18 @@ static void free_obj(HANDLE h) {
         if (o->pixels && (void *)o->pixels != (void *)o->bits) free(o->pixels);
         if (o->own_bits) free(o->bits);
     }
+    if (o && o->type == OBJ_REGION) vx_region_free(o->region);
     free(o);
 }
+// Region objects for region.c, which keeps their rectangles: a new one holding r, and the one behind a handle.
+HANDLE vx_gdi_region_new(struct vx_region *r) {
+    gdi_obj *o = calloc(1, sizeof *o);
+    if (!o) return NULL;
+    o->type = OBJ_REGION; o->region = r;
+    HANDLE h = new_obj(o);                                    // (frees o when the table is full)
+    return h;
+}
+struct vx_region *vx_gdi_region(HANDLE h) { gdi_obj *o = obj_of(h, OBJ_REGION); return o ? o->region : NULL; }
 void vx_dc_release(HANDLE h) {
     gdi_obj *d = dc_of(h);
     if (!d) return;
@@ -356,12 +369,6 @@ static WINAPI BOOL RestoreDC(HANDLE h, int n) { (void)h; (void)n; return 1; }
 static WINAPI BOOL SetViewportOrgEx(HANDLE h, int x, int y, POINT *old) { (void)h; (void)x; (void)y; if (old) *old = (POINT){ 0, 0 }; return 1; }
 static WINAPI BOOL SetWindowOrgEx(HANDLE h, int x, int y, POINT *old) { (void)h; (void)x; (void)y; if (old) *old = (POINT){ 0, 0 }; return 1; }
 static WINAPI BOOL GdiFlush(void) { return 1; }
-static WINAPI HANDLE CreateRectRgn(int l, int t, int r, int b) {
-    gdi_obj *o = calloc(1, sizeof *o);
-    o->type = OBJ_REGION; o->rgn = (RECT){ l, t, r, b };
-    return new_obj(o);
-}
-static WINAPI HANDLE CreateRectRgnIndirect(const RECT *r) { return CreateRectRgn(r->left, r->top, r->right, r->bottom); }
 static WINAPI int SelectClipRgn(HANDLE dc, HANDLE rgn) { (void)dc; (void)rgn; return 2; }
 static WINAPI int IntersectClipRect(HANDLE dc, int l, int t, int r, int b) { (void)dc; (void)l; (void)t; (void)r; (void)b; return 2; }
 
@@ -617,10 +624,16 @@ static WINAPI BOOL BitBlt(HANDLE dst, int x, int y, int w, int h, HANDLE src, in
 }
 
 // ---- text ------------------------------------------------------------------------------------------------------------------------
-static CTFontRef ct_font(gdi_obj *dc) {
+// The DC's font at its em size in pixels (*em). LOGFONT's height, as Windows maps it: negative, the character (em)
+// height; positive, the cell height (ascent + descent, which includes the internal leading), so the em is that
+// scaled by the face's own em-to-cell ratio; 0, a default size. GetTextMetrics reports the same numbers back
+// (character height = tmHeight - tmInternalLeading), which programs that derive a font of a wanted height rely on.
+static CTFontRef ct_font_em(gdi_obj *dc, double *em);
+static CTFontRef ct_font(gdi_obj *dc) { double em; return ct_font_em(dc, &em); }
+static CTFontRef ct_font_em(gdi_obj *dc, double *em) {
     gdi_obj *f = obj_of(dc->font, OBJ_FONT);
     int height = f ? f->font_height : 0;
-    double size = height < 0 ? -height : height > 0 ? height * 0.8 : 13;    // positive heights include internal leading
+    double size = height < 0 ? -height : height > 0 ? height : 13;
     CTFontRef font = NULL;
     if (f && f->face[0]) {
         CFStringRef name = CFStringCreateWithCString(NULL, f->face, kCFStringEncodingUTF8);
@@ -633,6 +646,12 @@ static CTFontRef ct_font(gdi_obj *dc) {
             (f->font_weight >= 600 ? kCTFontBoldTrait : 0) | (f->italic ? kCTFontItalicTrait : 0), kCTFontBoldTrait | kCTFontItalicTrait);
         if (styled) { CFRelease(font); font = styled; }
     }
+    double cell = CTFontGetAscent(font) + CTFontGetDescent(font);
+    if (height > 0 && cell > 0 && fabs(cell - size) > 1e-6) {          // the em whose cell is `height` pixels
+        CTFontRef scaled = CTFontCreateCopyWithAttributes(font, size * size / cell, NULL, NULL);
+        if (scaled) { CFRelease(font); font = scaled; size = CTFontGetSize(font); }
+    }
+    *em = size;
     return font;
 }
 static CTLineRef make_line(gdi_obj *dc, const uint16_t *text, int n, CTFontRef font) {
@@ -715,14 +734,20 @@ static WINAPI BOOL GetTextExtentPoint32W(HANDLE h, const uint16_t *s, int n, POI
 static WINAPI BOOL GetTextExtentPoint32A(HANDLE h, const char *s, int n, POINT *size) { int l; uint16_t *w = wide_from(s, n, &l); BOOL r = GetTextExtentPoint32W(h, w, l, size); free(w); return r; }
 // TEXTMETRIC: eleven LONGs (height, ascent, descent, internal/external leading, average/max width, weight,
 // overhang, aspect x/y), then the character fields.
+// The heights are the font's ascent and descent; the internal leading is what of them lies above the em.
 static BOOL text_metrics(HANDLE h, LONG *tm) {
     gdi_obj *dc = dc_of(h);
     if (!dc) return 0;
-    double w, a, d;
+    double w, a, d, em;
     uint16_t x = 'x';
     measure(dc, &x, 1, &w, &a, &d);
+    CTFontRef font = ct_font_em(dc, &em);
+    double ascent = CTFontGetAscent(font), descent = CTFontGetDescent(font), leading = CTFontGetLeading(font);
+    CFRelease(font);
     memset(tm, 0, 44);
-    tm[0] = (LONG)(a + d + 0.5); tm[1] = (LONG)(a + 0.5); tm[2] = (LONG)(d + 0.5);
+    tm[0] = (LONG)lround(ascent + descent); tm[1] = (LONG)lround(ascent); tm[2] = tm[0] - tm[1];
+    tm[3] = tm[0] > (LONG)lround(em) ? tm[0] - (LONG)lround(em) : 0;   // tmInternalLeading
+    tm[4] = (LONG)lround(leading);                                       // tmExternalLeading
     tm[5] = (LONG)(w + 0.5); tm[6] = (LONG)(w * 2 + 0.5);
     gdi_obj *f = obj_of(dc->font, OBJ_FONT);
     tm[7] = f && f->font_weight ? f->font_weight : 400;
@@ -769,7 +794,7 @@ static const vx_export gdi32[] = {
     VX_EXPORT(SetTextColor), VX_EXPORT(GetTextColor), VX_EXPORT(SetBkColor), VX_EXPORT(GetBkColor), VX_EXPORT(SetBkMode), VX_EXPORT(GetBkMode),
     VX_EXPORT(SetDCBrushColor), VX_EXPORT(SetDCPenColor), VX_EXPORT(SetStretchBltMode), VX_EXPORT(SetMapMode), VX_EXPORT(SetTextAlign),
     VX_EXPORT(SaveDC), VX_EXPORT(RestoreDC), VX_EXPORT(SetViewportOrgEx), VX_EXPORT(SetWindowOrgEx), VX_EXPORT(GdiFlush),
-    VX_EXPORT(CreateRectRgn), VX_EXPORT(CreateRectRgnIndirect), VX_EXPORT(SelectClipRgn), VX_EXPORT(IntersectClipRect),
+    VX_EXPORT(SelectClipRgn), VX_EXPORT(IntersectClipRect),
     VX_EXPORT(PatBlt), VX_EXPORT(Rectangle), VX_EXPORT(Ellipse), VX_EXPORT(MoveToEx), VX_EXPORT(LineTo), VX_EXPORT(SetPixel), VX_EXPORT(GetPixel),
     VX_EXPORT(StretchDIBits), VX_EXPORT(SetDIBitsToDevice), VX_EXPORT(StretchBlt), VX_EXPORT(BitBlt),
     VX_EXPORT(TextOutA), VX_EXPORT(TextOutW), VX_EXPORT(ExtTextOutA), VX_EXPORT(ExtTextOutW),

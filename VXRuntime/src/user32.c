@@ -1134,6 +1134,40 @@ static WINAPI int GetClassNameA(HANDLE h, char *buf, int n) {
     if (!w || n <= 0) return 0;
     return (int)vx_return_string_a(w->cls->name, buf, (DWORD)n) < n ? (int)strlen(buf) : 0;
 }
+// The class name, cut to the buffer (n - 1 characters and the terminator); the characters copied.
+static WINAPI int GetClassNameW(HANDLE h, WCHAR *buf, int n) {
+    vx_window *w = vx_window_get(h);
+    if (!w) { vx_set_last_error(1400 /* ERROR_INVALID_WINDOW_HANDLE */); return 0; }
+    if (!buf || n <= 0) { vx_set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */); return 0; }
+    size_t len = vx_utf8_to_utf16(w->cls->name, strlen(w->cls->name), buf, (size_t)n - 1);
+    if (len > (size_t)n - 1) len = (size_t)n - 1;
+    buf[len] = 0;
+    return (int)len;
+}
+// A window's class: its GCL_*/GCLP_* fields. Class extra bytes are not kept (none are ever set here: zero, as
+// RegisterClass makes them); the small icon and the menu name are not kept either.
+static WINAPI uint64_t GetClassLongPtrW(HANDLE h, int index) {
+    vx_window *w = vx_window_get(h);
+    if (!w) { vx_set_last_error(1400); return 0; }
+    vx_class *c = w->cls;
+    switch (index) {
+    case -10: return (uint64_t)(uintptr_t)c->background;      // GCLP_HBRBACKGROUND
+    case -12: return (uint64_t)(uintptr_t)c->cursor;          // GCLP_HCURSOR
+    case -14: return (uint64_t)(uintptr_t)c->icon;            // GCLP_HICON
+    case -16: return (uint64_t)(uintptr_t)c->instance;        // GCLP_HMODULE
+    case -18: return (uint64_t)c->wnd_extra;                  // GCL_CBWNDEXTRA
+    case -20: return (uint64_t)c->cls_extra;                  // GCL_CBCLSEXTRA
+    case -24: return (uint64_t)(uintptr_t)c->proc;            // GCLP_WNDPROC
+    case -26: return c->style;                                // GCL_STYLE
+    case -32: return c->atom;                                 // GCW_ATOM
+    case -8: case -34: return 0;                              // GCLP_MENUNAME, GCLP_HICONSM
+    default:
+        if (index >= 0 && index + 8 <= c->cls_extra) return 0;
+        vx_set_last_error(1413 /* ERROR_INVALID_INDEX */);
+        return 0;
+    }
+}
+static WINAPI DWORD GetClassLongW(HANDLE h, int index) { return (DWORD)GetClassLongPtrW(h, index); }
 
 // ---- titles --------------------------------------------------------------------------------------------------------------------
 static WINAPI BOOL SetWindowTextA(HANDLE h, const char *t) {
@@ -1309,14 +1343,20 @@ static WINAPI int GetSystemMetrics(int i) {
 }
 static WINAPI int GetSystemMetricsForDpi(int i, uint32_t dpi) { (void)dpi; return GetSystemMetrics(i); }
 #define SPI_GETWORKAREA 0x30
+int vx_sysparams(uint32_t action, uint32_t param, void *data, int wide, uint32_t dpi);   // fonts, non-client metrics (sysparams.c)
 static WINAPI BOOL SystemParametersInfoA(uint32_t action, uint32_t param, void *data, uint32_t flags) {
     (void)param; (void)flags;
+    int r = vx_sysparams(action, param, data, 0, 96);
+    if (r >= 0) return r;
     if (action == SPI_GETWORKAREA && data) { vx_virtual_screen(data); ((RECT *)data)->top = 0; return 1; }
     if (action == 0x68 /* SPI_GETWHEELSCROLLLINES */ && data) { *(uint32_t *)data = 3; return 1; }
     if (data && (action & 0xff00) == 0) memset(data, 0, 4);
     return 1;
 }
-static WINAPI BOOL SystemParametersInfoW(uint32_t a, uint32_t p, void *d, uint32_t f) { return SystemParametersInfoA(a, p, d, f); }
+static WINAPI BOOL SystemParametersInfoW(uint32_t a, uint32_t p, void *d, uint32_t f) {
+    int r = vx_sysparams(a, p, d, 1, 96);
+    return r >= 0 ? r : SystemParametersInfoA(a, p, d, f);
+}
 
 // DEVMODE: the A and W layouts differ in the two name fields; the display fields follow them.
 static void fill_devmode(uint8_t *dm, int wide) {
@@ -1628,7 +1668,7 @@ static const vx_export user32[] = {
     VX_EXPORT(SetTimer), VX_EXPORT(KillTimer),
     VX_EXPORT(DefWindowProcA), VX_EXPORT(DefWindowProcW), VX_EXPORT(CallWindowProcA), VX_EXPORT(CallWindowProcW),
     VX_EXPORT(GetWindowLongPtrA), VX_EXPORT(GetWindowLongPtrW), VX_EXPORT(SetWindowLongPtrA), VX_EXPORT(SetWindowLongPtrW),
-    VX_EXPORT(GetWindowLongA), VX_EXPORT(GetWindowLongW), VX_EXPORT(SetWindowLongA), VX_EXPORT(SetWindowLongW), VX_EXPORT(GetClassNameA),
+    VX_EXPORT(GetWindowLongA), VX_EXPORT(GetWindowLongW), VX_EXPORT(SetWindowLongA), VX_EXPORT(SetWindowLongW), VX_EXPORT(GetClassNameA), VX_EXPORT(GetClassNameW), VX_EXPORT(GetClassLongPtrW), VX_EXPORT(GetClassLongW),
     VX_EXPORT(SetWindowTextA), VX_EXPORT(SetWindowTextW), VX_EXPORT(GetWindowTextA), VX_EXPORT(GetWindowTextW),
     VX_EXPORT(GetWindowTextLengthA), VX_EXPORT(GetWindowTextLengthW), VX_EXPORT(FindWindowA), VX_EXPORT(FindWindowW),
     VX_EXPORT(EnumWindows), VX_EXPORT(EnumThreadWindows),

@@ -369,6 +369,7 @@ static WINAPI BOOL ImmSetCompositionWindow(void *imc, void *form) { (void)imc; (
 static WINAPI BOOL ImmNotifyIME(void *imc, DWORD action, DWORD index, DWORD value) { (void)imc; (void)action; (void)index; (void)value; return 1; }
 static WINAPI DWORD ImmGetCandidateListW(void *imc, DWORD index, void *list, DWORD n) { (void)imc; (void)index; (void)list; (void)n; return 0; }
 static WINAPI unsigned ImmGetIMEFileNameA(void *hkl, char *out, unsigned cap) { (void)hkl; if (out && cap) out[0] = 0; return 0; }
+static WINAPI unsigned ImmGetIMEFileNameW(void *hkl, WCHAR *out, unsigned cap) { (void)hkl; if (out && cap) out[0] = 0; return 0; }
 
 // ---- wininet: no internet connections (nothing is downloaded behind the user's back) ------------------------------------------
 #define ERROR_INTERNET_CANNOT_CONNECT 12029
@@ -532,7 +533,7 @@ static const vx_export winmm[] = {
 };
 static const vx_export imm32[] = {
     VX_EXPORT(ImmGetCompositionStringW), VX_EXPORT(ImmSetCompositionStringW), VX_EXPORT(ImmSetCompositionWindow), VX_EXPORT(ImmNotifyIME),
-    VX_EXPORT(ImmGetCandidateListW), VX_EXPORT(ImmGetIMEFileNameA),
+    VX_EXPORT(ImmGetCandidateListW), VX_EXPORT(ImmGetIMEFileNameA), VX_EXPORT(ImmGetIMEFileNameW),
 };
 static const vx_export wininet[] = {
     VX_EXPORT(InternetOpenA), VX_EXPORT(InternetOpenW), VX_EXPORT(InternetOpenUrlA), VX_EXPORT(InternetReadFile),

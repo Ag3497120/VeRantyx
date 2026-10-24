@@ -632,7 +632,14 @@ static WINAPI BOOL FindClose(HANDLE h) {
 // A mapping of a file maps its descriptor; a mapping of the paging file (INVALID_HANDLE_VALUE) is POSIX shared
 // memory, named after a hash of the Windows name ("Local\\" and "Global\\" dropped) so that other processes
 // opening the same name share it.
-typedef struct { int fd; uint64_t size; int writable; char shm[40]; } mapping;   // shm: a name this process created
+typedef struct { int fd; uint64_t size; int writable; char shm[40]; DWORD attributes; } mapping;   // shm: a name this process created
+#define SEC_FILE 0x800000u
+#define SEC_IMAGE 0x1000000u
+#define SEC_RESERVE 0x4000000u
+#define SEC_COMMIT 0x8000000u
+#define SEC_NOCACHE 0x10000000u
+#define SEC_WRITECOMBINE 0x40000000u
+#define SEC_LARGE_PAGES 0x80000000u
 int vx_name_join(const char *object_shm);
 int vx_name_leave(const char *object_shm);
 static void mapping_destroy(void *p) {
@@ -689,6 +696,10 @@ static HANDLE create_mapping(HANDLE file, DWORD protect, uint64_t size, const ch
     mapping *m = malloc(sizeof *m);
     m->fd = fd; m->size = size; m->writable = writable;
     snprintf(m->shm, sizeof m->shm, "%s", created);
+    // The SEC_* attributes NtQuerySection reports (src/section.c): what was asked for, and SEC_FILE for a file's.
+    m->attributes = protect & (SEC_IMAGE | SEC_RESERVE | SEC_COMMIT | SEC_NOCACHE | SEC_WRITECOMBINE | SEC_LARGE_PAGES);
+    if (file != INVALID_HANDLE) m->attributes = (m->attributes & ~(DWORD)(SEC_RESERVE | SEC_COMMIT)) | SEC_FILE;
+    else if (!(m->attributes & (SEC_RESERVE | SEC_COMMIT))) m->attributes |= SEC_COMMIT;   // (the default)
     HANDLE h = vx_handle_new(VX_HANDLE_MAPPING, m, mapping_destroy);
     if (!h) { mapping_destroy(m); vx_set_last_error(4); return NULL; }
     vx_set_last_error(existed ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
@@ -710,6 +721,7 @@ static HANDLE open_mapping(const char *name) {
     struct stat st; fstat(fd, &st);
     mapping *m = malloc(sizeof *m);
     m->fd = fd; m->size = (uint64_t)st.st_size; m->writable = 1;
+    m->attributes = SEC_COMMIT;                                // (named ones are always paging-file memory here)
     snprintf(m->shm, sizeof m->shm, "%s", shm);                // this holder leaves the name when done
     HANDLE h = vx_handle_new(VX_HANDLE_MAPPING, m, mapping_destroy);
     if (!h) mapping_destroy(m);
@@ -730,10 +742,18 @@ void *vx_mapping_from_shm(const char *shm, uint64_t size, void (**destroy)(void 
     if (fd < 0) return NULL;
     mapping *m = malloc(sizeof *m);
     m->fd = fd; m->size = size; m->writable = 1;
+    m->attributes = SEC_COMMIT;
     snprintf(m->shm, sizeof m->shm, "%s", shm);
     vx_name_join(shm);
     *destroy = mapping_destroy;
     return m;
+}
+// For NtQuerySection (src/section.c): a mapping's size and SEC_* attributes; 0 if h is not a mapping.
+int vx_mapping_info(HANDLE h, uint64_t *size, DWORD *attributes) {
+    mapping *m = vx_handle_data(h, VX_HANDLE_MAPPING);
+    if (!m) return 0;
+    *size = m->size; *attributes = m->attributes;
+    return 1;
 }
 static WINAPI HANDLE OpenFileMappingA(DWORD access, BOOL inherit, const char *name) { (void)access; (void)inherit; return open_mapping(name); }
 static WINAPI HANDLE OpenFileMappingW(DWORD access, BOOL inherit, const WCHAR *name) {
