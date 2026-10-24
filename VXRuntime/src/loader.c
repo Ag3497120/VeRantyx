@@ -1170,6 +1170,7 @@ int main(int argc, char **argv, char **envp) {
     vx_msxml_init();
     vx_security_init();                          // (advapi32's security objects: before the tables that follow)
     vx_kernelx_init();                           // (before kernel32.c, desktop.c, client.c, extras.c: replaces stand-ins there)
+    vx_tray_init();                              // (before user32.c, desktop.c, services.c, client.c, extras.c: icons and menus there are stand-ins)
     vx_kernel32_init();
     vx_system_init();
     vx_desktop_init();

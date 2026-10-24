@@ -13,7 +13,9 @@ The runtime opens a Unix socket when started with VXRT_CONTROL=<path> (VXRuntime
                                                                # several requests in one go, each answer on a line
 
 Requests: state, click <hwnd> <x> <y>, click-text <hwnd> <text>, key <hwnd> <vk>, type <hwnd> <text>, close <hwnd>,
-wait-idle [ms]; hwnd 0 is the active window (else the first visible one). Each answer is one line of JSON."""
+wait-idle [ms]; hwnd 0 is the active window (else the first visible one). The notification area and popup menus:
+tray, tray-click <n> [left|right|double|key|menu-key], tray-snapshot <n> <png>, menu, menu-pick <text>, menu-cancel.
+Each answer is one line of JSON."""
 import argparse, json, os, socket, sys, time
 
 

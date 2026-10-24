@@ -1,0 +1,2 @@
+// The made-up icon of tests/tray_ico.py as the program's icon group 1 (tests/tray.c loads it with LoadIcon/LoadImage).
+1 ICON "tray.ico"

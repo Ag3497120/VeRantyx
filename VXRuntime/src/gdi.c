@@ -752,6 +752,58 @@ static WINAPI int DrawTextW(HANDLE h, const uint16_t *s, int n, RECT *r, uint32_
 }
 static WINAPI int DrawTextA(HANDLE h, const char *s, int n, RECT *r, uint32_t fmt) { int l; uint16_t *w = wide_from(s, n, &l); int res = DrawTextW(h, w, l, r, fmt); free(w); return res; }
 
+// ---- bitmaps as plain pixels (icons.c: icons are made of bitmaps and give bitmaps back) ----------------------------------------
+// A bitmap's pixels, top-down BGRA (malloc'd): a 32-bpp bitmap's fourth byte as stored, 0xff for other depths.
+uint32_t *vx_gdi_bitmap_bgra(HANDLE h, int *w, int *hgt, int *bpp) {
+    gdi_obj *b = obj_of(h, OBJ_BITMAP);
+    if (!b) return NULL;
+    *w = b->bw; *hgt = b->bh; *bpp = b->bpp;
+    if (b->bpp == 32) {
+        uint32_t *out = malloc((size_t)b->bw * b->bh * 4);
+        for (int y = 0; y < b->bh; y++) memcpy(out + (size_t)y * b->bw, b->pixels + (size_t)(b->bottom_up ? b->bh - 1 - y : y) * b->bw, (size_t)b->bw * 4);
+        return out;
+    }
+    BITMAPINFOHEADER bi = { 40, b->bw, b->bottom_up ? b->bh : -b->bh, 1, (uint16_t)b->bpp, 0, 0, 0, 0, 0, 0 };
+    int iw, ih;
+    return dib_to_bgrx(&bi, b->bits, b->palette, &iw, &ih);
+}
+// A 32-bpp top-down bitmap holding these pixels, their fourth byte (alpha) kept.
+HANDLE vx_gdi_bitmap_from_bgra(int w, int h, const uint32_t *px) { return make_bitmap(w, h, 32, 0, px, NULL); }
+// A 1-bpp top-down bitmap (a mask: 1 is white) from rows padded to 4 bytes. Not drawable on, like other depths here.
+HANDLE vx_gdi_bitmap_mono(int w, int h, const uint8_t *rows) {
+    HANDLE hb = make_bitmap(w, h, 1, 0, rows, NULL);
+    gdi_obj *b = obj(hb);
+    if (b) { b->palette[0] = 0; b->palette[1] = 0xffffff; }
+    return hb;
+}
+// Draws straight-alpha BGRA pixels (pw x ph, top-down) stretched to (x, y, w, h): blended over what is there, or
+// copied with the alpha left out.
+int vx_gdi_draw_bgra(HANDLE h, int x, int y, int w, int hgt, const uint32_t *px, int pw, int ph, int blend) {
+    gdi_obj *dc = dc_of(h);
+    target t;
+    if (!dc || !px || pw <= 0 || ph <= 0) return 0;
+    CFDataRef data = CFDataCreate(NULL, (const UInt8 *)px, (CFIndex)pw * ph * 4);
+    CGDataProviderRef dp = CGDataProviderCreateWithCFData(data);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGImageRef img = CGImageCreate((size_t)pw, (size_t)ph, 8, 32, (size_t)pw * 4, cs,
+                                   (blend ? kCGImageAlphaFirst : kCGImageAlphaNoneSkipFirst) | kCGBitmapByteOrder32Little, dp, NULL, false, kCGRenderingIntentDefault);
+    CGColorSpaceRelease(cs); CGDataProviderRelease(dp); CFRelease(data);
+    if (!img) return 0;
+    if (lock_target(dc, &t)) {
+        CGContextSaveGState(t.ctx);
+        CGContextSetInterpolationQuality(t.ctx, kCGInterpolationHigh);
+        CGContextSetBlendMode(t.ctx, blend ? kCGBlendModeNormal : kCGBlendModeCopy);
+        CGContextTranslateCTM(t.ctx, 0, y + hgt);                  // (row 0 at the visual top, as draw_image does)
+        CGContextScaleCTM(t.ctx, 1, -1);
+        CGContextDrawImage(t.ctx, CGRectMake(x, 0, w, hgt), img);
+        CGContextRestoreGState(t.ctx);
+        unlock_target(&t);
+    }
+    CGImageRelease(img);
+    texts_painted(dc, (RECT){ x, y, x + w, y + hgt });
+    return 1;
+}
+
 // Pixel formats and OpenGL buffers arrive with opengl32; until then nothing matches.
 // Pixel formats for OpenGL (opengl.c): there is one (RGBA8, depth 24, stencil 8, double-buffered).
 static WINAPI int ChoosePixelFormat(HANDLE dc, const void *pfd) { (void)dc; (void)pfd; return 1; }

@@ -27,6 +27,8 @@ static void ui_ensure(void) {
     pthread_mutex_unlock(&g_ui_lock);
 }
 
+void vx_cocoa_ensure(void) { ui_ensure(); }
+
 static void on_main(dispatch_block_t b) {
     ui_ensure();
     if ([NSThread isMainThread]) b(); else dispatch_sync(dispatch_get_main_queue(), b);

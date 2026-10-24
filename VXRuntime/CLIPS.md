@@ -41,6 +41,16 @@ visible one).
 | `type <hwnd> <text>` | WM_CHAR for each UTF-16 unit of the text |
 | `close <hwnd>` | WM_CLOSE |
 | `wait-idle [ms]` | answers once the program is idle, or after ms (default 2000) with `"idle": false` |
+| `tray` | the program's notification-area icons (`Shell_NotifyIcon`, shown as menu-bar status items: `src/tray.m`): owner window, id, GUID, callback message, version, tip, picture size, whether the menu bar shows it and where |
+| `tray-click <n> [how]` | the n-th of them clicked: `left` (default), `right`, `double`; or chosen with the keyboard: `key`, `menu-key`. A click goes through the status item's button (`performClick`) as a real one does |
+| `tray-snapshot <n> <path>` | the n-th one's picture as the status item has it, at twice its size, as a PNG file |
+| `menu` | the popup menu open now (`TrackPopupMenu`, `src/menus.m`): its items with id, text, enabled, checked, default, separators and submenus |
+| `menu-pick <text>` | its first enabled item whose text contains `<text>` (or `#<id>`) chosen, as a click on it would; waits up to 2 s for a menu to open, answers once `TrackPopupMenu` has returned to the program |
+| `menu-cancel` | the open menu closed without a choice |
+
+A program that lives in the notification area (Steam with `-silent`) is reached this way: `tray`, then
+`tray-click 0 right` (the program usually opens its menu on the right button), `menu`, `menu-pick Exit`.
+`tests/tray.c` with `tests/tray_check.py` does it in `make check`.
 
 ## How it knows
 

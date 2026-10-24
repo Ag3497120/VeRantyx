@@ -12,6 +12,15 @@
 //   close <hwnd>               WM_CLOSE
 //   wait-idle [ms]             answers once the program is idle (user32.c, vx_ui_idle: the actions so far handled and
 //                              painted), or after ms (default 2000) with "idle": false
+//   tray                       the notification-area icons (tray.m): owner window, id, callback message, version, tip,
+//                              picture size, where in the menu bar
+//   tray-click <n> [how]       the n-th of them clicked: left (default), right, double; or chosen with the keyboard: key,
+//                              menu-key. A click goes through the status item's button as a real one does
+//   tray-snapshot <n> <path>   the n-th one's picture as the menu bar has it (twice its size), as a PNG file
+//   menu                       the popup menu open now (TrackPopupMenu, menus.m) and its items
+//   menu-pick <text>           its first enabled item whose text contains <text> (or #<id>) chosen, as a click would
+//                              (waiting up to 2 s for a menu to open)
+//   menu-cancel                the open menu closed without a choice
 // VXRT_CONTROL_LOG=<file>: each request appended with the milliseconds since the socket opened (how an agent worked).
 #include <errno.h>
 #include <pthread.h>
@@ -86,6 +95,26 @@ static void request(int fd, char *line) {
         reply(fd, b);
         return;
     }
+    if (!strcmp(cmd, "tray")) { char *j = vx_tray_state(); reply(fd, j); free(j); return; }
+    if (!strcmp(cmd, "menu")) { char *j = vx_menu_state(); reply(fd, j); free(j); return; }
+    if (!strcmp(cmd, "tray-click")) {
+        char why[160] = "tray-click <index> [left|right|double|key|menu-key]", *n = word(&s), *how = word(&s);
+        if (n && vx_tray_click(atoi(n), how ? how : "left", why, sizeof why)) reply(fd, "{\"ok\":true}"); else reply_err(fd, why);
+        return;
+    }
+    if (!strcmp(cmd, "tray-snapshot")) {
+        char why[160] = "tray-snapshot <index> <path>", *n = word(&s);
+        while (*s == ' ') s++;
+        if (n && *s && vx_tray_snapshot(atoi(n), s, why, sizeof why)) reply(fd, "{\"ok\":true}"); else reply_err(fd, why);
+        return;
+    }
+    if (!strcmp(cmd, "menu-pick") || !strcmp(cmd, "menu-cancel")) {
+        while (*s == ' ') s++;
+        char why[160] = "menu-pick <text>";
+        int pick = cmd[5] == 'p';
+        if ((!pick || *s) && vx_menu_pick(pick ? s : NULL, 2000, why, sizeof why)) reply(fd, "{\"ok\":true}"); else reply_err(fd, why);
+        return;
+    }
     HANDLE h = window_arg(&s);
     if (!h) { reply_err(fd, "no such window"); return; }
     if (!strcmp(cmd, "click")) {
@@ -103,7 +132,7 @@ static void request(int fd, char *line) {
         while (*s == ' ') s++;
         if (!*s || !vx_ui_snapshot(h, s)) { reply_err(fd, "snapshot <hwnd> <path>: not written"); return; }
     } else if (!strcmp(cmd, "close")) vx_window_post(h, WM_CLOSE, 0, 0);
-    else { reply_err(fd, "unknown request (state, windows, snapshot, click, click-text, key, type, close, wait-idle)"); return; }
+    else { reply_err(fd, "unknown request (state, windows, snapshot, click, click-text, key, type, close, wait-idle, tray, tray-click, tray-snapshot, menu, menu-pick, menu-cancel)"); return; }
     reply_ok(fd, h);
 }
 

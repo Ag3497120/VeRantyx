@@ -203,8 +203,6 @@ static WINAPI BOOL SHGetPathFromIDListW(const WCHAR *pidl, WCHAR *out) { if (!pi
 static WINAPI BOOL SHGetPathFromIDListA(const WCHAR *pidl, char *out) { if (!pidl) return 0; vx_utf16_to_utf8(pidl, vx_wcslen(pidl) + 1, out, 260); return 1; }
 static WINAPI uintptr_t SHGetFileInfoA(const char *path, DWORD attrs, void *info, unsigned n, unsigned flags) { (void)path; (void)attrs; (void)flags; if (info) memset(info, 0, n); return 0; }
 static WINAPI unsigned DragQueryFileA(void *drop, unsigned i, char *out, unsigned cap) { (void)drop; (void)i; if (out && cap) out[0] = 0; return 0; }
-static WINAPI BOOL Shell_NotifyIconA(DWORD msg, void *data) { (void)msg; (void)data; return 1; }
-static WINAPI BOOL Shell_NotifyIconW(DWORD msg, void *data) { (void)msg; (void)data; return 1; }
 static WINAPI BOOL PathIsRelativeW(const WCHAR *p) { return !p || !((p[0] == '\\') || (p[0] && p[1] == ':')); }
 static WINAPI BOOL PathIsRelativeA(const char *p) { return !p || !((p[0] == '\\') || (p[0] && p[1] == ':')); }
 static WINAPI BOOL PathIsUNCW(const WCHAR *p) { return p && p[0] == '\\' && p[1] == '\\'; }
@@ -671,7 +669,7 @@ static const vx_export advapi[] = {
 static const vx_export rpcrt4[] = { VX_EXPORT(UuidCreate), VX_EXPORT(UuidToStringA), VX_EXPORT(UuidFromStringA), VX_EXPORT(RpcStringFreeA) };
 static const vx_export shell32[] = {
     VX_EXPORT(CommandLineToArgvW), VX_EXPORT(SHGetSpecialFolderLocation), VX_EXPORT(SHGetPathFromIDListW), VX_EXPORT(SHGetPathFromIDListA),
-    VX_EXPORT(SHGetFileInfoA), VX_EXPORT(DragQueryFileA), VX_EXPORT(Shell_NotifyIconA), VX_EXPORT(Shell_NotifyIconW),
+    VX_EXPORT(SHGetFileInfoA), VX_EXPORT(DragQueryFileA),   // (Shell_NotifyIcon: tray.m)
 };
 static const vx_export shlwapi[] = { VX_EXPORT(PathIsRelativeW), VX_EXPORT(PathIsRelativeA), VX_EXPORT(PathIsUNCW), VX_EXPORT(PathCombineW), VX_EXPORT(SHDeleteKeyA) };
 static const vx_export crt[] = {
