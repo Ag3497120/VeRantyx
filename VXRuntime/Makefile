@@ -3,6 +3,7 @@ CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
 SRC     = src/loader.c src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src/dotnet_baml.c src/dotnet_il.c src/dotnet_exec.c src/dotnet_runtime.c src/dotnet_host.c src/kernel32.c src/kernelx.c src/jobs.c src/ntstatus.c src/system.c src/desktop.c src/winsta.c src/scm.c src/services.c src/security.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/winhttp.m src/winhttp_proxy.m src/iphlp.c src/winsock_nsp.c src/midi.c src/directinput.m src/msxml.c src/extras.c src/context.S src/text.c src/files.c src/registry.c \
           src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/d3d11on12.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d_format.c src/d3d12.m src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/dxil.c src/dxil_msl.c src/dxil_ir.c src/spirv.c src/spirv_ir.c src/vk_msl.c src/vk_format.m src/vk_device.m src/vk_descriptor.m src/vk_pipeline.m src/vk_command.m src/vk_internal.m src/vk_queue.m src/vk_wsi.m src/vk_dispatch.m src/directinput_buffer.c src/directinput_format.c src/input.m src/audio.m src/xaudio2.m src/sysdlls.c src/dbghelp.c src/aes_gcm.c src/dpapi.c src/crypt32.c src/dwrite.m
+SRC    += src/launchargs.c
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
@@ -117,6 +118,12 @@ build/winsta.exe: tests/winsta.c
 build/scm.exe: tests/scm.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
+
+# (VXRT_EXTRA_ARGS: src/launchargs.c)
+tests: build/extra_args.exe
+build/extra_args.exe: tests/extra_args.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lshell32
 
 build/clip.exe: tests/clip.c
 	@mkdir -p build
@@ -1126,6 +1133,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/unwind.exe
 	$(VXRT) build/breakpoint.exe
 	$(VXRT) build/child_stdout.exe
+	VXRT_EXTRA_ARGS='other.exe=--not-me;EXTRA_ARGS.EXE=--first "two words"' $(VXRT) build/extra_args.exe self tail
 	$(VXRT) build/lowmem.exe
 	$(VXRT) build/files.exe
 	rm -rf build/ovtree build/ovshadow && mkdir -p build/ovtree/save && echo old > build/ovtree/save/old.sav && echo orig > build/ovtree/save/same.hl1
