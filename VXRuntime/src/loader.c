@@ -352,9 +352,12 @@ static void *pe_export(const vx_image *m, const char *name, int ordinal, int dep
 static char g_exe_dir[4096];
 static char g_altered_dir[4096];   // LoadLibraryEx(LOAD_WITH_ALTERED_SEARCH_PATH): the DLL's own directory, searched first
 static char g_dll_dir[4096];       // SetDllDirectory: searched after the program's directory (Unity's Plugins folder)
+static DWORD g_search_flags;       // the LOAD_LIBRARY_SEARCH_* flags of the LoadLibraryEx in progress (0: the process's)
 
 // Finds a DLL file: (the altered search directory,) the program's directory, (the SetDllDirectory directory,)
-// C:\windows\system32, the current directory.
+// C:\windows\system32, the current directory. With LOAD_LIBRARY_SEARCH_* flags (LoadLibraryEx's, else
+// SetDefaultDllDirectories', src/kernelx.c) only what they name: the program's directory (0x200), the SetDllDirectory
+// and AddDllDirectory directories (0x400), system32 and VXRT_DLL_PATH (0x800), all three (0x1000); never the current one.
 // Wine's own DLLs (marked "Wine builtin DLL" after the DOS header) need Wine underneath: they are passed over.
 static int wine_builtin(const char *path) {
     char head[0x60] = { 0 };
@@ -383,15 +386,24 @@ static int search_dll(const char *name, char *out, size_t cap) {
     if (preferred_dll(name, out, cap)) return 1;
     char file[256];
     snprintf(file, sizeof file, "%s%s", name, strchr(name, '.') ? "" : ".dll");
-    char dirs[5][4096];
+    DWORD flags = g_search_flags ? g_search_flags : vx_dll_default_search();
+    if (flags & 0x1000) flags |= 0xe00;                          // LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+    int app = !flags || (flags & 0x200), user = !flags || (flags & 0x400), sys = !flags || (flags & 0x800);
+    char dirs[5][4096] = { { 0 } };
     snprintf(dirs[0], sizeof dirs[0], "%s", g_altered_dir);
-    snprintf(dirs[1], sizeof dirs[1], "%s", g_exe_dir);
-    snprintf(dirs[2], sizeof dirs[2], "%s", g_dll_dir);
-    snprintf(dirs[3], sizeof dirs[3], "%s/drive_c/windows/system32", vx_root());
+    if (app) snprintf(dirs[1], sizeof dirs[1], "%s", g_exe_dir);
+    if (user) snprintf(dirs[2], sizeof dirs[2], "%s", g_dll_dir);
+    if (sys) snprintf(dirs[3], sizeof dirs[3], "%s/drive_c/windows/system32", vx_root());
     char cwd[4096];
     vx_get_cwd(cwd, sizeof cwd);
-    if (!vx_unix_path(cwd, dirs[4], sizeof dirs[4])) dirs[4][0] = 0;
+    if (flags || !vx_unix_path(cwd, dirs[4], sizeof dirs[4])) dirs[4][0] = 0;
     for (int i = 0; i < 5; i++) {
+        char dir[4096];
+        for (int k = 0; i == 3 && (flags & 0x400) && vx_dll_user_directory(k, dir, sizeof dir); k++) {   // AddDllDirectory's
+            struct stat st;
+            snprintf(out, cap, "%s/%s", dir, file);
+            if (!stat(out, &st) && S_ISREG(st.st_mode)) return 1;
+        }
         if (!dirs[i][0]) continue;
         snprintf(out, cap, "%s/%s", dirs[i], file);
         char shadow[4096];
@@ -401,7 +413,7 @@ static int search_dll(const char *name, char *out, size_t cap) {
     }
     // VXRT_DLL_PATH: more Mac directories (colon-separated) holding the user's own Windows DLLs, for example the
     // Visual C++ runtime a Windows installation already has.
-    const char *extra = getenv("VXRT_DLL_PATH");
+    const char *extra = sys ? getenv("VXRT_DLL_PATH") : NULL;
     while (extra && *extra) {
         const char *colon = strchr(extra, ':');
         size_t n = colon ? (size_t)(colon - extra) : strlen(extra);
@@ -578,7 +590,19 @@ static vx_image *load_pe(const char *path, int is_main) {
 
 // ---- module API (kernel32) -----------------------------------------------------------------------------------------------
 #define LOAD_WITH_ALTERED_SEARCH_PATH 0x8
+#define LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR 0x100            // (its dependencies: the DLL's own directory first, too)
+static void *load_library_searching(const char *name, DWORD flags);
+// The call's search flags hold while it loads the DLL and what it imports (LoadLibrary from a DllMain meanwhile: its own).
 static void *load_library(const char *name, DWORD flags) {
+    pthread_mutex_lock(&g_loader_lock);
+    DWORD saved = g_search_flags;
+    g_search_flags = flags & 0x1f00;
+    void *h = load_library_searching(name, flags);
+    g_search_flags = saved;
+    pthread_mutex_unlock(&g_loader_lock);
+    return h;
+}
+static void *load_library_searching(const char *name, DWORD flags) {
     if (vx_trace) vx_log("LoadLibrary %s", name);
     pthread_mutex_lock(&g_loader_lock);
     vx_image *m = NULL;
@@ -597,7 +621,7 @@ static void *load_library(const char *name, DWORD flags) {
         if (vx_unix_path(name, path, sizeof path)) {
             m = image_by_name(name);
             snprintf(saved, sizeof saved, "%s", g_altered_dir);
-            if (flags & LOAD_WITH_ALTERED_SEARCH_PATH) {
+            if (flags & (LOAD_WITH_ALTERED_SEARCH_PATH | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR)) {
                 snprintf(g_altered_dir, sizeof g_altered_dir, "%s", path);
                 char *slash = strrchr(g_altered_dir, '/');
                 if (slash) *slash = 0;
@@ -1128,6 +1152,7 @@ int main(int argc, char **argv, char **envp) {
     vx_winhttp_init();
     vx_directinput_init();
     vx_msxml_init();
+    vx_kernelx_init();                           // (before kernel32.c, desktop.c, client.c, extras.c: replaces stand-ins there)
     vx_kernel32_init();
     vx_system_init();
     vx_desktop_init();

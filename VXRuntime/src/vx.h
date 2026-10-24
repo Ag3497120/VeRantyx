@@ -78,7 +78,15 @@ void vx_msxml_init(void);                    // msxml.c: MSXML DOMDocument throu
 typedef struct { DWORD lcid; const char *name, *english, *abbrev, *iso639, *iso3166; } vx_locale;   // desktop.c
 const vx_locale *vx_locale_by_lcid(DWORD lcid);              // NULL when unknown; 0 and the default LCIDs give the user's
 const vx_locale *vx_locale_by_name(const char *name);        // "en-GB" (any case); NULL or "" give the user's
+const vx_locale *vx_locale_at(int i);                        // the i-th locale there is, NULL past the last
 void vx_extras_init(void);                   // extras.c: smaller functions more programs need
+void vx_kernelx_init(void);                  // kernelx.c: kernel32/ntdll the Windows Steam client needs (jobs.c, ntstatus.c)
+void vx_jobs_init(void);
+enum { VX_HANDLE_JOB = 0x4a01, VX_HANDLE_VOLUME_SEARCH = 0x5601 };   // (their handle kinds)
+DWORD vx_ntstatus_to_win32(uint32_t status);        // RtlNtStatusToDosError (ntstatus.c)
+uint32_t vx_win32_to_ntstatus(DWORD error);         // the status an error usually comes from
+DWORD vx_dll_default_search(void);                  // SetDefaultDllDirectories' flags (0: none), for the loader
+int vx_dll_user_directory(int i, char *out, size_t cap);   // AddDllDirectory's i-th directory (Unix path), 0 past the last
 void vx_opengl_init(void);                   // opengl.c: opengl32.dll on macOS's OpenGL
 int vx_gl_describe_pixel_format(void *pfd, uint32_t size);   // (gdi32's pixel-format calls and SwapBuffers)
 int vx_gl_swap(void);
@@ -158,6 +166,9 @@ BOOL   vx_handle_close(HANDLE h);
 void   vx_io_completed(HANDLE file, void *overlapped, DWORD bytes, DWORD status);
 void   vx_set_event(HANDLE event);          // SetEvent for threads that are not Windows threads
 void   vx_release_semaphore(HANDLE sem, LONG n);   // ReleaseSemaphore for them (a count past the maximum is dropped)
+// A handle's object as NtQueryObject describes it (sync.c): see there. vx_handle_count: the handles of the table.
+int    vx_handle_object(HANDLE h, const void **id, const char **type, int *kind, char *name, size_t cap, DWORD *handles);
+DWORD  vx_handle_count(void);
 
 // Diagnostics (stderr); VXRT_TRACE=1 also logs every implemented call that opts in.
 void vx_log(const char *fmt, ...);

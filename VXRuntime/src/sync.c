@@ -79,6 +79,7 @@ static void notify(vx_object *o) {                              // g_lock held: 
 #define MAX_HANDLES (LOW_HANDLES + (1 << 20))
 static vx_object *g_handles[MAX_HANDLES];
 static int g_free_hint;              // no free slot below it
+static int g_handle_top;             // past the highest slot ever used (vx_handle_object counts below it)
 static vx_object g_never;            // what the pseudo handles of the current process/thread wait on
 
 DWORD vx_current_tid(void) { uint64_t t; pthread_threadid_np(NULL, &t); return (DWORD)t; }
@@ -88,6 +89,7 @@ static HANDLE new_handle(vx_object *o) {
     for (int i = g_free_hint; i < MAX_HANDLES; i++)
         if (!g_handles[i]) {
             g_handles[i] = o; o->refs++; g_free_hint = i + 1;
+            if (i >= g_handle_top) g_handle_top = i + 1;
             return (HANDLE)(intptr_t)(i < LOW_HANDLES ? HANDLE_BASE + i * 4 : HIGH_HANDLE_BASE + (i - LOW_HANDLES) * 4);
         }
     static int told;                              // what fills the table (a leak shows as one kind)
@@ -1022,6 +1024,36 @@ void *vx_handle_data(HANDLE h, int kind) {
     void *d = o && o->type == OBJ_OTHER && o->kind == kind ? o->data : NULL;
     pthread_mutex_unlock(&g_lock);
     return d;
+}
+// What NtQueryObject tells about a handle (src/kernelx.c): its object (an identity only), the Windows type of this
+// file's objects ("Event", ...; NULL for another module's, whose kind is given), the name it was created with and the
+// number of handles to it. 0 if h is no handle of the table (GetCurrentThread's counts as one).
+int vx_handle_object(HANDLE h, const void **id, const char **type, int *kind, char *name, size_t cap, DWORD *handles) {
+    static const char *const types[] = { NULL, "Thread", "Event", "Mutant", "Semaphore", NULL, "IoCompletion", "Process" };
+    pthread_mutex_lock(&g_lock);
+    vx_object *o = (intptr_t)h == -2 ? self_object() : lookup(h);
+    if (o) {
+        if (id) *id = o;
+        if (type) *type = o->type >= OBJ_THREAD && o->type <= OBJ_PROCESS ? types[o->type] : NULL;
+        if (kind) *kind = o->type == OBJ_OTHER ? o->kind : 0;
+        if (name && cap) snprintf(name, cap, "%s", o->name ? o->name : "");
+        if (handles) {
+            DWORD n = 0;
+            for (int i = 0; i < g_handle_top; i++) n += g_handles[i] == o;
+            for (int i = 0; i < INJECT_COUNT; i++) n += g_injected[i] == o;
+            *handles = n;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return o != NULL;
+}
+DWORD vx_handle_count(void) {                    // the table's handles (GetProcessHandleCount)
+    pthread_mutex_lock(&g_lock);
+    DWORD n = 0;
+    for (int i = 0; i < g_handle_top; i++) n += g_handles[i] != NULL;
+    for (int i = 0; i < INJECT_COUNT; i++) n += g_injected[i] != NULL;
+    pthread_mutex_unlock(&g_lock);
+    return n;
 }
 
 // ---- handles given to other processes ------------------------------------------------------------------------------------

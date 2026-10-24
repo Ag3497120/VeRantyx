@@ -74,6 +74,7 @@ const vx_locale *vx_locale_by_name(const char *name) {
     if (!strcasecmp(name, "!x-sys-default-locale")) return &g_locales[0];
     return NULL;
 }
+const vx_locale *vx_locale_at(int i) { return i >= 0 && i < (int)(sizeof g_locales / sizeof g_locales[0]) ? &g_locales[i] : NULL; }
 // LOCALE_* values programs ask for: names from the table above, the rest (number and date formats) as English (United States).
 static const char *locale_value(const vx_locale *l, DWORD type, char *scratch) {
     if (!l) l = &g_locales[0];
