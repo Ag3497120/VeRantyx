@@ -1,4 +1,5 @@
 // kernel32: the Windows core API, implemented directly on macOS.
+#include <errno.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <sched.h>
@@ -45,17 +46,24 @@ static WINAPI HANDLE GetStdHandle(DWORD which) {
 }
 
 int vx_pipe_write(HANDLE h, const void *buf, DWORD n, DWORD *written, void *ov, BOOL *ok);
+DWORD vx_file_io_error(int fd, int e);                             // files.c
 static WINAPI BOOL WriteFile(HANDLE h, const void *buf, DWORD n, DWORD *written, void *overlapped) {
     BOOL piped;
     if (vx_pipe_write(h, buf, n, written, overlapped, &piped)) return piped;
     int fd = vx_handle_fd(h);
     if (fd < 0) { vx_set_last_error(6 /* ERROR_INVALID_HANDLE */); return 0; }
-    // OVERLAPPED: the transfer happens at its offset, at once, and completes like asynchronous I/O would.
+    // OVERLAPPED: the transfer happens at its offset, at once, and completes like asynchronous I/O would; the file
+    // pointer then follows the bytes written, as a synchronous handle's does (ReadFile in files.c alike). An offset of
+    // 0xFFFFFFFF:0xFFFFFFFF writes at the end of the file.
     const DWORD *o = overlapped;
-    ssize_t r = o && fd > 2 ? pwrite(fd, buf, n, (off_t)o[4] | (off_t)o[5] << 32) : write(fd, buf, n);
+    off_t at = o ? (off_t)o[4] | (off_t)o[5] << 32 : 0;
+    if (o && fd > 2 && o[4] == 0xffffffffu && o[5] == 0xffffffffu) { struct stat st; at = fstat(fd, &st) ? 0 : st.st_size; }
+    ssize_t r = o && fd > 2 ? pwrite(fd, buf, n, at) : write(fd, buf, n);
     if (written) *written = r > 0 ? (DWORD)r : 0;
-    if (r >= 0 && overlapped) vx_io_completed(h, overlapped, (DWORD)r, 0);
-    return r >= 0;
+    if (r < 0) { vx_set_last_error(vx_file_io_error(fd, errno)); return 0; }
+    if (o && fd > 2) lseek(fd, at + r, SEEK_SET);
+    if (overlapped) vx_io_completed(h, overlapped, (DWORD)r, 0);
+    return 1;
 }
 
 static WINAPI BOOL WriteConsoleA(HANDLE h, const void *buf, DWORD n, DWORD *written, void *reserved) {

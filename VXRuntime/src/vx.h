@@ -195,6 +195,9 @@ void vx_seh_init(void);                // exceptions (seh.c)
 void vx_seh_install_signals(void);     // CPU faults become Windows exceptions
 void vx_text_init(void);               // code pages, environment (text.c)
 void vx_files_init(void);              // files and paths (files.c)
+void vx_filestate_init(void);          // byte-range locks, deleting on close, SetFileInformationByHandle (filestate.c)
+void vx_file_closing(HANDLE h);        // before a file handle's descriptor is closed: its locks go, a doomed file is deleted
+void vx_file_delete_on_close(HANDLE h, const char *unix_path, int on);
 void vx_registry_init(void);           // advapi32 registry (registry.c)
 void vx_user32_init(void);             // windows and messages (user32.c, cocoa.m)
 void vx_winsta_init(void);             // window stations, desktops, power notifications, DPI awareness (winsta.c)

@@ -5,6 +5,7 @@ SRC     = src/loader.c src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src
           src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/d3d11on12.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d_format.c src/d3d12.m src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/dxil.c src/dxil_msl.c src/dxil_ir.c src/spirv.c src/spirv_ir.c src/vk_msl.c src/vk_format.m src/vk_device.m src/vk_descriptor.m src/vk_pipeline.m src/vk_command.m src/vk_internal.m src/vk_queue.m src/vk_wsi.m src/vk_dispatch.m src/directinput_buffer.c src/directinput_format.c src/input.m src/audio.m src/xaudio2.m src/sysdlls.c src/dbghelp.c src/aes_gcm.c src/dpapi.c src/crypt32.c src/dwrite.m src/osinfo.c src/pointer.c src/regnotify.c src/section.c src/shlpath.c src/wevtapi.c src/ktime.c src/power.c src/sysparams.c src/dwmapi.c src/winmisc.c src/region.c
 SRC    += src/launchargs.c
 SRC    += src/handlexfer.c
+SRC    += src/filestate.c
 SRC    += src/icons.c src/menus.m src/tray.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
@@ -37,7 +38,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
        build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/kernelx.exe build/jobs.exe build/security.exe \
-       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe
+       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/dbfiles.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -734,6 +735,12 @@ build/files.exe: tests/files.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
+# A database engine's file calls (SQLite's documented patterns: locks near 1 GiB, OVERLAPPED offsets, a mapped
+# database, a -shm file, deleting on close): src/filestate.c, src/files.c.
+build/dbfiles.exe: tests/dbfiles.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $<
+
 build/vxdll.dll: tests/vxdll.cpp
 	@mkdir -p build
 	$(MINGWXX) -O1 -shared -static -o $@ $< -Wl,--out-implib,build/libvxdll.a
@@ -1174,6 +1181,7 @@ runtime-tests: $(VXRT) tests
 	rm -rf build/ovtree build/ovshadow && mkdir -p build/ovtree/save && echo old > build/ovtree/save/old.sav && echo orig > build/ovtree/save/same.hl1
 	VXRT_OVERLAY=$(CURDIR)/build/ovtree:$(CURDIR)/build/ovshadow $(VXRT) build/files.exe overlay 'Z:$(subst /,\,$(CURDIR))\build\ovtree'
 	test "$$(cat build/ovtree/save/same.hl1)" = orig && test ! -e build/ovtree/save/a.hl1
+	$(VXRT) build/dbfiles.exe
 	$(VXRT) build/dll_test.exe
 	$(VXRT) build/net.exe
 	$(VXRT) build/winhttp.exe

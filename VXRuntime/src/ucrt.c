@@ -1116,7 +1116,7 @@ static int open_path(const char *path, int oflag, int mode) {
 static WINAPI int ms_open(const char *path, int oflag, int mode) { return open_path(path, oflag, mode); }
 static WINAPI int ms_wopen(const WCHAR *path, int oflag, int mode) { char *p = vx_utf8_dup(path); int fd = open_path(p, oflag, mode); free(p); return fd; }
 static WINAPI int ms_wsopen(const WCHAR *path, int oflag, int share, int mode) { (void)share; return ms_wopen(path, oflag, mode); }
-static WINAPI int ms_close(int fd) { return fd > 2 ? close(fd) : 0; }
+static WINAPI int ms_close(int fd) { if (fd > 2) vx_file_closing((HANDLE)(intptr_t)(0x10000 + fd)); return fd > 2 ? close(fd) : 0; }
 static WINAPI int ms_write(int fd, const void *p, unsigned n) { return write_all(fd, p, n) ? -1 : (int)n; }
 static WINAPI int64_t ms_lseeki64(int fd, int64_t off, int whence) { return lseek(fd, off, whence); }
 static WINAPI int ms_isatty(int fd) { return isatty(fd); }

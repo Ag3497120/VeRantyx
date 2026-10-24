@@ -243,6 +243,7 @@ static WINAPI DWORD GetSystemDirectoryW(WCHAR *buf, DWORD cap) { return vx_retur
 #define FILE_WRITE_DATA  0x2u
 #define FILE_APPEND_DATA 0x4u
 #define INVALID_HANDLE   ((HANDLE)(intptr_t)-1)
+#define FILE_FLAG_DELETE_ON_CLOSE 0x04000000u
 
 HANDLE vx_pipe_open(const char *name, DWORD flags);
 int vx_is_pipe_name(const char *name);
@@ -288,8 +289,10 @@ static HANDLE create_file(const char *name, DWORD access, DWORD disposition, DWO
     }
     if (fd >= 0x10000) { close(fd); vx_set_last_error(4); return INVALID_HANDLE; }   // (handles 0x10000 + fd)
     if (trace && trace_opens_all()) vx_log("CreateFile(%s, access %#x, disposition %u): %s, handle %#x", name, access, disposition, writes ? "for writing" : "opened", 0x10000 + fd);
+    HANDLE h = (HANDLE)(intptr_t)(0x10000 + fd);
+    if (attrs & FILE_FLAG_DELETE_ON_CLOSE) vx_file_delete_on_close(h, path, 1);   // (SQLite's temporary files; src/filestate.c)
     vx_set_last_error(existed && (disposition == 2 || disposition == 4) ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
-    return (HANDLE)(intptr_t)(0x10000 + fd);
+    return h;
 }
 static WINAPI HANDLE CreateFileA(const char *name, DWORD access, DWORD share, void *sa, DWORD disposition, DWORD flags, HANDLE tmpl) {
     (void)share; (void)sa; (void)tmpl;
@@ -307,16 +310,25 @@ static WINAPI HANDLE CreateFileW(const WCHAR *name, DWORD access, DWORD share, v
 // (synchronously).
 typedef struct { uint64_t internal, internal_high; DWORD offset, offset_high; HANDLE event; } OVERLAPPED;
 
+// The error for a failed read or write: a handle opened without that access is ERROR_ACCESS_DENIED on Windows (the
+// descriptor's EBADF here).
+DWORD vx_file_io_error(int fd, int e) { return e == EBADF && fcntl(fd, F_GETFL) >= 0 ? 5 /* ERROR_ACCESS_DENIED */ : vx_error_from_errno(e); }
+
+// With an OVERLAPPED the read is at its offset; the file pointer of a synchronous handle then follows the bytes read, as
+// without one (ReadFile's documentation; this runtime's handles are all synchronous). At or past the end of the file
+// that read fails with ERROR_HANDLE_EOF; one that crosses it is short (SQLite fills the rest with zeros itself).
 static WINAPI BOOL ReadFile(HANDLE h, void *buf, DWORD n, DWORD *got, OVERLAPPED *ov) {
     BOOL piped;
     if (vx_pipe_read(h, buf, n, got, ov, &piped)) return piped;
     int fd = vx_handle_fd(h);
     if (fd < 0) { vx_set_last_error(6); return 0; }
-    ssize_t r = ov ? pread(fd, buf, n, (off_t)ov->offset | (off_t)ov->offset_high << 32) : read(fd, buf, n);
-    if (r < 0) { set_error_from_errno(); if (got) *got = 0; return 0; }
+    off_t at = ov ? (off_t)ov->offset | (off_t)ov->offset_high << 32 : 0;
+    ssize_t r = ov ? pread(fd, buf, n, at) : read(fd, buf, n);
+    if (r < 0) { vx_set_last_error(vx_file_io_error(fd, errno)); if (got) *got = 0; return 0; }
     if (got) *got = (DWORD)r;
     if (ov) {
         if (!r && n) { vx_io_completed(h, ov, 0, 38 /* ERROR_HANDLE_EOF */); vx_set_last_error(38); return 0; }
+        if (fd > 2) lseek(fd, at + r, SEEK_SET);
         vx_io_completed(h, ov, (DWORD)r, 0);
     }
     return 1;
@@ -344,6 +356,7 @@ static WINAPI DWORD GetFileSize(HANDLE h, DWORD *high) {
     struct stat st; int fd = vx_handle_fd(h);
     if (fd < 0 || fstat(fd, &st)) { vx_set_last_error(6); return 0xffffffffu; }
     if (high) *high = (DWORD)((uint64_t)st.st_size >> 32);
+    if ((DWORD)st.st_size == 0xffffffffu) vx_set_last_error(0);   // (INVALID_FILE_SIZE as a size: NO_ERROR tells it apart)
     return (DWORD)st.st_size;
 }
 static WINAPI BOOL GetFileSizeEx(HANDLE h, int64_t *size) {
@@ -352,13 +365,26 @@ static WINAPI BOOL GetFileSizeEx(HANDLE h, int64_t *size) {
     *size = st.st_size;
     return 1;
 }
+// Both need a handle opened for writing (ERROR_ACCESS_DENIED otherwise).
+static int read_only_file(int fd) { struct stat st; return (fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY && !fstat(fd, &st) && S_ISREG(st.st_mode); }
 static WINAPI BOOL SetEndOfFile(HANDLE h) {
     int fd = vx_handle_fd(h);
-    off_t pos = fd < 0 ? -1 : lseek(fd, 0, SEEK_CUR);
-    if (pos < 0 || ftruncate(fd, pos)) { set_error_from_errno(); return 0; }
+    if (fd < 0) { vx_set_last_error(6); return 0; }
+    off_t pos = lseek(fd, 0, SEEK_CUR);
+    if (pos < 0) { set_error_from_errno(); return 0; }
+    if (read_only_file(fd)) { vx_set_last_error(5); return 0; }
+    if (ftruncate(fd, pos)) { set_error_from_errno(); return 0; }
     return 1;
 }
-static WINAPI BOOL FlushFileBuffers(HANDLE h) { if (vx_is_pipe(h)) return 1; int fd = vx_handle_fd(h); return fd >= 0 && (fd <= 2 || fsync(fd) == 0); }
+static WINAPI BOOL FlushFileBuffers(HANDLE h) {
+    if (vx_is_pipe(h)) return 1;
+    int fd = vx_handle_fd(h);
+    if (fd < 0) { vx_set_last_error(6); return 0; }
+    if (fd <= 2) return 1;
+    if (read_only_file(fd)) { vx_set_last_error(5); return 0; }
+    if (fsync(fd)) { set_error_from_errno(); return 0; }
+    return 1;
+}
 static WINAPI DWORD GetFileType(HANDLE h) {
     if (vx_is_pipe(h)) return 3;                             // FILE_TYPE_PIPE
     struct stat st; int fd = vx_handle_fd(h);
@@ -805,9 +831,22 @@ static WINAPI BOOL UnmapViewOfFile(void *addr) {
     munmap(addr, size);
     return 1;
 }
+// A byte count of 0 flushes from addr to the end of its view (Microsoft's documentation). SQLite, with its database
+// mapped (Chromium's profile databases), flushes that way at every commit: when this failed, each commit failed and
+// was rolled back (steamwebhelper: "Failed to set up eq_classes table", an empty "Web Data", "Profile error occurred").
 static WINAPI BOOL FlushViewOfFile(void *addr, size_t n) {
-    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)4095;
-    return msync((void *)page, n + ((uintptr_t)addr - page), MS_SYNC) == 0;
+    uintptr_t start = (uintptr_t)addr, end = 0;
+    pthread_mutex_lock(&g_views_lock);
+    for (int i = 0; i < g_view_count && !end; i++) {
+        uintptr_t a = (uintptr_t)g_views[i].addr, b = a + g_views[i].size;
+        if (start >= a && start < b) end = n && n <= b - start ? start + n : b;
+    }
+    pthread_mutex_unlock(&g_views_lock);
+    if (!end) { vx_set_last_error(487 /* ERROR_INVALID_ADDRESS */); return 0; }   // not in a view of a mapping
+    uintptr_t page = (uintptr_t)getpagesize();
+    start &= ~(page - 1);
+    if (msync((void *)start, end - start, MS_SYNC)) { set_error_from_errno(); return 0; }
+    return 1;
 }
 
 static const vx_export files_k32[] = {
@@ -838,6 +877,7 @@ static void make_dirs(const char *rel) {
 
 void vx_files_init(void) {
     overlay_init();
+    vx_filestate_init();
     const char *root = getenv("VXRT_ROOT");
     if (root && *root) {
         if (root[0] == '/') snprintf(g_root, sizeof g_root, "%s", root);

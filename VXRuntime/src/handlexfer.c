@@ -109,7 +109,7 @@ static void serve_one(int c) {
         if (fd >= 0) {
             r.kind = 4; r.error = 0;
             send_with_fd(c, &r, sizeof r, fd);
-            if (q.close_source && fd > 2) close(fd);
+            if (q.close_source && fd > 2) { vx_file_closing(h); close(fd); }
             return;
         }
         HANDLE given = q.from_pid > 0 ? vx_give_to_process(q.from_pid, h) : NULL;

@@ -82,6 +82,15 @@ comes from `VXRT_EXTRA_ARGS` (`src/launchargs.c`), so neither Steam's files nor 
 `steamwebhelper.exe` shim are involved. Where it stops today: the web helper ends at a Chromium check about half a
 second in, so there is no sign-in window yet.
 
+The web helper's profile (`C:\users\vxrt\AppData\Local\Steam\htmlcache`) keeps its data in SQLite databases (`Web
+Data`, `Affiliation Database`, `History`, ...). SQLite maps a database and, at every commit, flushes the whole view
+(`FlushViewOfFile` with a byte count of 0); until 2026-10-24 that failed here, so every commit after a database's
+first was rolled back, `Web Data` stayed empty and Chromium showed "Profile error occurred". `tests/dbfiles.c` checks
+the file calls of SQLite's documented patterns against Microsoft's documentation: byte-range locks of two connections
+at the bytes near 1 GiB (`src/filestate.c`, real locks within a process now), reads and writes at OVERLAPPED offsets,
+the -journal and -shm files, a mapped database, deleting on close. With an empty profile and the registry of an
+earlier run, the web helper also needs `RegDeleteKeyExW` (it stopped at a breakpoint without it).
+
 "Steam Service Error" at start: Steam looks for the Steam Client Service (`bin/SteamService.exe`, a 32-bit
 Windows service). Valve's own text in that window: it "helps Steam install or update games, enables anti-cheat
 detection in some titles and assists with other system level tasks", and installing it needs administrator rights;

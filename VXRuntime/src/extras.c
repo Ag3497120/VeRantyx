@@ -33,11 +33,6 @@ static WINAPI BOOL GetDiskFreeSpaceW(const WCHAR *root, DWORD *sectors_per_clust
     if (clusters) *clusters = (DWORD)(total > 0xffffffffu ? 0xffffffffu : total);
     return 1;
 }
-// File locks: one program per file here; locking always succeeds.
-static WINAPI BOOL LockFile(HANDLE f, DWORD a, DWORD b, DWORD c, DWORD d) { (void)f; (void)a; (void)b; (void)c; (void)d; return 1; }
-static WINAPI BOOL UnlockFile(HANDLE f, DWORD a, DWORD b, DWORD c, DWORD d) { (void)f; (void)a; (void)b; (void)c; (void)d; return 1; }
-static WINAPI BOOL LockFileEx(HANDLE f, DWORD flags, DWORD r, DWORD lo, DWORD hi, void *ov) { (void)f; (void)flags; (void)r; (void)lo; (void)hi; (void)ov; return 1; }
-static WINAPI BOOL UnlockFileEx(HANDLE f, DWORD r, DWORD lo, DWORD hi, void *ov) { (void)f; (void)r; (void)lo; (void)hi; (void)ov; return 1; }
 static WINAPI size_t HeapCompact(HANDLE heap, DWORD flags) { (void)heap; (void)flags; return 1u << 20; }
 // The preferred UI languages: "en-US" (a double-NUL-terminated list).
 static WINAPI BOOL GetUserPreferredUILanguages(DWORD flags, DWORD *count, WCHAR *buf, DWORD *len) {
@@ -663,7 +658,7 @@ static const vx_export ws2_32_more[] = { VX_EXPORT(WSASendDisconnect) };
 static const vx_export hid_more[] = { VX_EXPORT(HidP_SetUsageValue), VX_EXPORT(HidP_SetUsages) };
 
 static const vx_export kernel32[] = {
-    VX_EXPORT(GetDiskFreeSpaceW), VX_EXPORT(LockFile), VX_EXPORT(UnlockFile), VX_EXPORT(LockFileEx), VX_EXPORT(UnlockFileEx),
+    VX_EXPORT(GetDiskFreeSpaceW),
     VX_EXPORT(HeapCompact), VX_EXPORT(GetUserPreferredUILanguages), VX_EXPORT(GetThreadPreferredUILanguages), VX_EXPORT(GetGeoInfoA),
 };
 static const vx_export ucrtbase[] = {

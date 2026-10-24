@@ -496,11 +496,7 @@ static WINAPI BOOL GetFileInformationByHandleEx(HANDLE h, int cls, uint8_t *out,
     vx_set_last_error(87);
     return 0;
 }
-static WINAPI BOOL SetFileInformationByHandle(HANDLE h, int cls, const void *in, DWORD size) {
-    (void)in; (void)size;
-    if (vx_handle_fd(h) < 0) { vx_set_last_error(6); return 0; }
-    return cls == 0 || cls == 4;                                  // basic info, disposition: accepted
-}
+// (SetFileInformationByHandle: src/filestate.c)
 static WINAPI DWORD GetLongPathNameW(const WCHAR *in, WCHAR *out, DWORD cap) {
     size_t n = vx_wcslen(in);
     if (!out || cap <= n) return (DWORD)n + 1;
@@ -695,7 +691,7 @@ static const vx_export k32[] = {
     VX_EXPORT(ChangeTimerQueueTimer), VX_EXPORT(DeleteTimerQueueTimer), VX_EXPORT(RegisterWaitForSingleObject),
     VX_EXPORT(UnregisterWait), VX_EXPORT(UnregisterWaitEx), VX_EXPORT(CreateWaitableTimerW), VX_EXPORT(OpenWaitableTimerA), VX_EXPORT(OpenWaitableTimerW), VX_EXPORT(CreateWaitableTimerA),
     VX_EXPORT(CreateWaitableTimerExW), VX_EXPORT(SetWaitableTimer), VX_EXPORT(SetWaitableTimerEx), VX_EXPORT(CancelWaitableTimer),
-    VX_EXPORT(GetFileInformationByHandleEx), VX_EXPORT(SetFileInformationByHandle), VX_EXPORT(GetLongPathNameW),
+    VX_EXPORT(GetFileInformationByHandleEx), VX_EXPORT(GetLongPathNameW),
     VX_EXPORT(GetLongPathNameA), VX_EXPORT(CreateSymbolicLinkW), VX_EXPORT(AreFileApisANSI),
     VX_EXPORT(CreateToolhelp32Snapshot), { "Thread32First", (void *)toolhelp_none }, { "Thread32Next", (void *)toolhelp_none },
     { "Module32First", (void *)toolhelp_none }, { "Module32Next", (void *)toolhelp_none }, { "Module32FirstW", (void *)toolhelp_none },
