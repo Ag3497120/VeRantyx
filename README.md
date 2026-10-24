@@ -1,5 +1,12 @@
 # VeRantyx — native: Valve's ARM64 Half-Life: Alyx on macOS
 
+> [!IMPORTANT]
+> **Looking for VeRantyx to play? This branch is an old experiment and is not updated.**
+> **[Download VeRantyx for Mac](https://github.com/Ag3497120/VeRantyx/releases/latest)** (free, signed and
+> notarized; no Terminal) and read [`main`](https://github.com/Ag3497120/VeRantyx#readme). "Native" here means
+> Valve's Linux ARM64 build of Half-Life: Alyx run directly on macOS; it covers Alyx only and needs Terminal. The
+> current version runs the Windows builds of Alyx, Elite Dangerous, The Lab and more, at 60 fps in Alyx.
+
 > **This is the `native` branch, kept as it was on 2026-10-11.** The current version of VeRantyx, which runs the
 > Windows build of Alyx and other SteamVR games without Wine, is on [`main`](https://github.com/Ag3497120/VeRantyx#readme)
 > (with a no-Terminal Mac app). Other versions: [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) ·
