@@ -1,7 +1,9 @@
 // Small system DLLs that Chromium (the Windows Steam client's steamwebhelper/libcef.dll) links, answered the way a
 // Windows machine without the matching services answers, from Microsoft's documentation of each function:
-//   userenv       environment blocks for new processes, AppContainer profiles (registered, not enforced: nothing here
-//                 starts a process inside an AppContainer), group-policy sections and notifications (policy never changes)
+//   userenv       environment blocks for new processes, AppContainer profiles (registered only: no process can be
+//                 started inside one, because UpdateProcThreadAttribute in src/extras.c refuses the AppContainer
+//                 attributes with ERROR_NOT_SUPPORTED, so such a launch fails instead of running unconfined),
+//                 group-policy sections and notifications (policy never changes)
 //   winspool.drv  a machine with no printers (and no default printer)
 //   dhcpcsvc      the options the Mac's own DHCP client received, for the one adapter iphlpapi reports
 //   secur32       the account's name; no LSA and no security packages, so nothing is ever authenticated here
@@ -163,6 +165,8 @@ static WINAPI BOOL DestroyEnvironmentBlock(void *block) {
 // S-1-15-2-x1..x7 (SECURITY_APP_PACKAGE_AUTHORITY, SECURITY_APP_PACKAGE_BASE_RID, 7 more RIDs) derived from the name
 // alone: the RIDs are the first 28 bytes of SHA-256 of the lowercased name in UTF-16LE, which is what Windows is
 // reported to use (not compared with a Windows machine here). Names: up to 64 characters of [-_. A-Za-z0-9].
+// A profile and its SID are only names: a process asking to be started inside the container fails when the attribute
+// is set (UpdateProcThreadAttribute, src/extras.c), since nothing here could confine it.
 #define TYPE_HKEY_CURRENT_USER ((void *)(uintptr_t)0x80000001u)
 static size_t container_name_length(const WCHAR *name) {
     if (!name) return 0;

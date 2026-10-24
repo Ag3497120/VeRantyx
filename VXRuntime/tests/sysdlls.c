@@ -1,6 +1,7 @@
 // userenv, winspool.drv, dhcpcsvc, secur32 and the oleaut32 functions Chromium imports by ordinal (src/sysdlls.c):
-// environment blocks, AppContainer SIDs and profiles, policy sections, a machine without printers, DHCP options,
-// account names, no LSA and no security packages, variant conversions. Made-up names and values only.
+// environment blocks, AppContainer SIDs and profiles (and no launch inside one), policy sections, a machine without
+// printers, DHCP options, account names, no LSA and no security packages, variant conversions. Made-up names and
+// values only.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winsock2.h>
@@ -108,6 +109,33 @@ static void test_app_container(void) {
     CHECK(CreateAppContainerProfile(L"bad\\name", L"x", L"y", NULL, 0, &other) == E_INVALIDARG);
     for (PSID *p = (PSID[]){ sid, lower, made, again, sixty_four }, *end = p + 5; p < end; p++) if (*p) FreeSid(*p);
     if (other && other != sid) FreeSid(other);
+}
+
+// A profile exists, but no process can be started inside an AppContainer here: asking for one fails when the attribute
+// is set (ERROR_NOT_SUPPORTED), so a sandbox learns it before any launch instead of starting a child with all of the
+// user's rights while believing it isolated.
+static void test_app_container_launch(void) {
+    PSID sid = NULL;
+    CHECK(DeriveAppContainerSidFromAppContainerName(L"VXRT.Test.Container_3", &sid) == S_OK && sid);
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(NULL, 3, 0, &size);
+    LPPROC_THREAD_ATTRIBUTE_LIST list = size ? HeapAlloc(GetProcessHeap(), 0, size) : NULL;
+    CHECK(list && InitializeProcThreadAttributeList(list, 3, 0, &size));
+    if (list) {
+        SECURITY_CAPABILITIES caps = { sid, NULL, 0, 0 };
+        SetLastError(0);
+        CHECK(!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &caps, sizeof caps, NULL, NULL));
+        CHECK(GetLastError() == ERROR_NOT_SUPPORTED);
+        DWORD less_privileged = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;     // the LPAC form
+        SetLastError(0);
+        CHECK(!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, &less_privileged, sizeof less_privileged, NULL, NULL));
+        CHECK(GetLastError() == ERROR_NOT_SUPPORTED);
+        HANDLE parent = GetCurrentProcess();             // an attribute that confines nothing is still taken
+        CHECK(UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &parent, sizeof parent, NULL, NULL));
+        DeleteProcThreadAttributeList(list);
+        HeapFree(GetProcessHeap(), 0, list);
+    }
+    if (sid) FreeSid(sid);
 }
 
 static volatile LONG g_first_left, g_second_saw_left;
@@ -303,6 +331,7 @@ static void test_oleaut32(void) {
 int main(void) {
     test_environment();
     test_app_container();
+    test_app_container_launch();
     test_policy();
     test_printers();
     test_dhcp();
