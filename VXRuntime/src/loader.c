@@ -1217,6 +1217,7 @@ int main(int argc, char **argv, char **envp) {
     vx_system_init();
     vx_region_init();                            // (before desktop.c and client.c: replaces their region stand-ins)
     vx_version_init();
+    vx_present_init();                           // (before desktop.c, client.c, user32.c, gdi.c, dwmapi.c: replaces stand-ins there)
     vx_desktop_init();
     vx_winsta_init();
     vx_scm_init();

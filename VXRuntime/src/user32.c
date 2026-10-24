@@ -355,7 +355,7 @@ static int next_message(vx_queue *q, MSG *out, HANDLE hwnd, uint32_t min, uint32
         pthread_mutex_lock(&g_win_lock);
         for (int i = 0; i < g_window_next; i++) {
             vx_window *w = g_windows[i];
-            if (w && !w->destroyed && w->tid == q->tid && w->invalid && w->visible && (!hwnd || hwnd == w->hwnd)) {
+            if (w && !w->destroyed && w->tid == q->tid && w->invalid && w->visible && vx_window_wants_paint(w) && (!hwnd || hwnd == w->hwnd)) {
                 *out = (MSG){ w->hwnd, WM_PAINT, 0, 0, tick_ms(), { 0, 0 }, 0 };
                 pthread_mutex_unlock(&g_win_lock);
                 return 1;                                  // stays until the window is validated (BeginPaint)
@@ -520,6 +520,7 @@ static HANDLE create_window(DWORD exstyle, const char *class_name, const char *t
     w->id = (int64_t)(intptr_t)menu; w->enabled = !(style & WS_DISABLED);
     w->tid = vx_current_tid(); w->queue = my_queue();
     w->extra_size = c->wnd_extra; w->extra = calloc(1, c->wnd_extra > 0 ? c->wnd_extra : 1);
+    w->layer_alpha = 255;
     set_title(w, title);
     RECT screen; vx_virtual_screen(&screen);
     if (cx == CW_USEDEFAULT) { cx = (screen.right - screen.left) * 3 / 4; cy = (screen.bottom - screen.top) * 3 / 4; }
@@ -585,6 +586,8 @@ static WINAPI BOOL DestroyWindow(HANDLE hwnd) {
     vx_cocoa_destroy(w);
     w->destroyed = 1;                                 // the slot is never reused, so stale handles stay invalid
     vx_texts_free(&w->texts);
+    vx_present_window_gone(w);
+    if (w->style & WS_CHILD) { vx_window *top = vx_window_top(w); if (top != w) vx_cocoa_redraw(top); }
     if (g_focus == hwnd) g_focus = NULL;
     if (g_active == hwnd) g_active = NULL;
     if (g_capture == hwnd) g_capture = NULL;
@@ -602,9 +605,10 @@ WINAPI BOOL vx_ShowWindow(HANDLE hwnd, int cmd) {
     if (vx_trace && show != was) vx_log("ShowWindow %p \"%s\" %d: %s", hwnd, w->title ? w->title : "", cmd, show ? "shown" : "hidden");
     if (show != was) call_proc(w, WM_SHOWWINDOW, show, 0);
     w->visible = show;
-    if (show) { w->invalid = 1; w->erase = 1; }
+    if (show) vx_window_invalidate(w, NULL, 1);
     if (cmd == 0) w->style &= ~WS_VISIBLE; else w->style |= WS_VISIBLE;
     vx_cocoa_show(w, cmd);
+    if ((w->style & WS_CHILD) && show != was) vx_cocoa_redraw(vx_window_top(w));
     return was;
 }
 static WINAPI BOOL ShowWindowAsync(HANDLE hwnd, int cmd) { return vx_ShowWindow(hwnd, cmd); }
@@ -635,9 +639,8 @@ void vx_window_resized(vx_window *w, int cw, int ch) {
     w->client_w = cw; w->client_h = ch;
     pthread_mutex_unlock(&w->lock);
     if (changed && had) {
-        w->invalid = 1; w->erase = 1;
+        vx_window_invalidate(w, NULL, 1);
         vx_window_post(w->hwnd, WM_SIZE, w->minimized ? 1 : 0, MAKELPARAM(cw, ch));
-        if (w->queue) { pthread_mutex_lock(&w->queue->lock); pthread_cond_broadcast(&w->queue->cond); pthread_mutex_unlock(&w->queue->lock); }
     }
 }
 void vx_window_moved(vx_window *w, RECT frame) {
@@ -667,9 +670,44 @@ void vx_window_shown_inactive(vx_window *w) { if (stay_active() && !g_active) vx
 void vx_window_minimized(vx_window *w, int minimized) {
     w->minimized = minimized;
     vx_window_post(w->hwnd, WM_SIZE, minimized ? 1 /* SIZE_MINIMIZED */ : 0, MAKELPARAM(w->client_w, w->client_h));
-    if (!minimized) { w->invalid = 1; vx_window_post(w->hwnd, 0 /* WM_NULL: wake the queue */, 0, 0); }
+    if (!minimized) vx_window_invalidate(w, NULL, 0);
 }
-void vx_request_redraw(vx_window *w) { vx_cocoa_redraw(w); }
+
+// ---- for present.c and cocoa.m --------------------------------------------------------------------------------------------------
+vx_window *vx_window_top(vx_window *w) {
+    for (int n = 0; w && n < 64 && (w->style & WS_CHILD); n++) {
+        vx_window *p = vx_window_get(w->parent);
+        if (!p) break;
+        w = p;
+    }
+    return w;
+}
+// A window's children (visible ones only, or all) in the order they were made: the first is at the bottom.
+int vx_window_children(vx_window *parent, vx_window **out, int cap, int visible_only) {
+    int n = 0;
+    pthread_mutex_lock(&g_win_lock);
+    for (int i = 0; i < g_window_next && n < cap; i++) {
+        vx_window *w = g_windows[i];
+        if (w && !w->destroyed && (w->style & WS_CHILD) && w->parent == parent->hwnd && (!visible_only || w->visible)) out[n++] = w;
+    }
+    pthread_mutex_unlock(&g_win_lock);
+    return n;
+}
+int vx_window_all(vx_window **out, int cap) {
+    int n = 0;
+    pthread_mutex_lock(&g_win_lock);
+    for (int i = 0; i < g_window_next && n < cap; i++) if (g_windows[i] && !g_windows[i]->destroyed) out[n++] = g_windows[i];
+    pthread_mutex_unlock(&g_win_lock);
+    return n;
+}
+// A window that UpdateLayeredWindow draws gets no WM_PAINT (Microsoft's documentation of layered windows).
+int vx_window_wants_paint(vx_window *w) { return !((w->exstyle & WS_EX_LAYERED) && w->layered == 2); }
+void vx_window_wake(vx_window *w) {
+    if (!w->queue) return;
+    pthread_mutex_lock(&w->queue->lock);
+    pthread_cond_broadcast(&w->queue->cond);
+    pthread_mutex_unlock(&w->queue->lock);
+}
 
 // ---- keyboard ------------------------------------------------------------------------------------------------------------------
 // Mac key codes to Windows virtual keys and set-1 scan codes (0x100 marks an extended key).
@@ -1028,21 +1066,40 @@ static WINAPI BOOL GetClientRect(HANDLE h, RECT *r) {
     pthread_mutex_unlock(&w->lock);
     return 1;
 }
+// The client area of a top-level window sits at the bottom of its frame (the title bar is on top, no side borders); a
+// child window's rectangle is kept in its parent's client coordinates, and it has no frame.
+void vx_window_screen_origin(vx_window *w, POINT *o) {
+    POINT at = { 0, 0 };
+    for (int n = 0; w && n < 64; n++) {
+        pthread_mutex_lock(&w->lock);
+        RECT r = w->rect; int ch = w->client_h;
+        pthread_mutex_unlock(&w->lock);
+        vx_window *parent = (w->style & WS_CHILD) ? vx_window_get(w->parent) : NULL;
+        if (!parent) { at.x += r.left; at.y += r.bottom - ch; break; }
+        at.x += r.left; at.y += r.top;
+        w = parent;
+    }
+    *o = at;
+}
+static void client_origin(vx_window *w, POINT *o) { vx_window_screen_origin(w, o); }
+// A window's rectangle on the screen (a child's moved by where its parent's client area is).
+static RECT screen_rect(vx_window *w) {
+    pthread_mutex_lock(&w->lock);
+    RECT r = w->rect;
+    pthread_mutex_unlock(&w->lock);
+    vx_window *parent = (w->style & WS_CHILD) ? vx_window_get(w->parent) : NULL;
+    if (parent) {
+        POINT o; vx_window_screen_origin(parent, &o);
+        r = (RECT){ r.left + o.x, r.top + o.y, r.right + o.x, r.bottom + o.y };
+    }
+    return r;
+}
 static WINAPI BOOL GetWindowRect(HANDLE h, RECT *r) {
     if (h == HWND_DESKTOP_VALUE) return vx_virtual_screen(r);
     vx_window *w = vx_window_get(h);
     if (!w) { vx_set_last_error(1400); return 0; }
-    pthread_mutex_lock(&w->lock);
-    *r = w->rect;
-    pthread_mutex_unlock(&w->lock);
+    *r = screen_rect(w);
     return 1;
-}
-// The client area sits at the bottom of the frame (the title bar is on top, no side borders).
-static void client_origin(vx_window *w, POINT *o) {
-    pthread_mutex_lock(&w->lock);
-    o->x = w->rect.left;
-    o->y = w->rect.bottom - w->client_h;
-    pthread_mutex_unlock(&w->lock);
 }
 static WINAPI BOOL ClientToScreen(HANDLE h, POINT *p) {
     vx_window *w = vx_window_get(h);
@@ -1057,9 +1114,7 @@ static WINAPI BOOL ClientToScreen(HANDLE h, POINT *p) {
 // Elsewhere (another program's window, the desktop): NULL.
 static int window_takes_point(vx_window *w, POINT p) {
     if (!w || w->destroyed || !w->visible || !w->enabled) return 0;
-    pthread_mutex_lock(&w->lock);
-    RECT r = w->rect;
-    pthread_mutex_unlock(&w->lock);
+    RECT r = screen_rect(w);
     return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
 }
 static HANDLE window_from_point(POINT p) {
@@ -1136,7 +1191,7 @@ static WINAPI BOOL SetWindowPos(HANDLE h, HANDLE after, int x, int y, int cx, in
     if (!(flags & SWP_NOSIZE)) { r.right = r.left + cx; r.bottom = r.top + cy; }
     w->rect = r;
     pthread_mutex_unlock(&w->lock);
-    if (w->style & WS_CHILD) vx_window_resized(w, r.right - r.left, r.bottom - r.top);
+    if (w->style & WS_CHILD) { vx_window_resized(w, r.right - r.left, r.bottom - r.top); vx_cocoa_redraw(vx_window_top(w)); }
     else vx_cocoa_set_frame(w);
     if (flags & SWP_SHOWWINDOW) vx_ShowWindow(h, flags & SWP_NOACTIVATE ? 8 : 5);
     if (flags & SWP_HIDEWINDOW) vx_ShowWindow(h, 0);
@@ -1200,7 +1255,7 @@ static int64_t set_long(HANDLE h, int index, int64_t value, int size) {
         if ((before ^ w->style) & (WS_CAPTION | WS_THICKFRAME | WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX)) vx_cocoa_set_style(w);
         return old;
     }
-    case GWL_EXSTYLE: w->exstyle = (DWORD)value; return old;
+    case GWL_EXSTYLE: { DWORD before = w->exstyle; w->exstyle = (DWORD)value; vx_present_exstyle(w, before); return old; }
     case GWLP_USERDATA: w->userdata = value; return old;
     }
     if (index < 0 || index + size > w->extra_size) { vx_set_last_error(1413); return 0; }
@@ -1320,66 +1375,14 @@ static WINAPI BOOL EnumThreadWindows(DWORD tid, WNDENUMPROC fn, LPARAM lp) {
     return 1;
 }
 
-// ---- painting ------------------------------------------------------------------------------------------------------------------
-// PAINTSTRUCT: hdc, fErase, rcPaint, fRestore, fIncUpdate, rgbReserved[32].
-typedef struct { HANDLE hdc; BOOL erase; RECT paint; BOOL restore, inc_update; uint8_t reserved[32]; } PAINTSTRUCT;
-static WINAPI HANDLE BeginPaint(HANDLE h, PAINTSTRUCT *ps) {
-    vx_window *w = vx_window_get(h);
-    if (!w) return NULL;
-    int erase = w->erase;
-    w->invalid = 0; w->erase = 0;
-    memset(ps, 0, sizeof *ps);
-    ps->hdc = vx_dc_for_window(w);
-    ps->paint = (RECT){ 0, 0, w->client_w, w->client_h };
-    ps->erase = erase && !vx_send_message(h, WM_ERASEBKGND, (WPARAM)ps->hdc, 0);
-    return ps->hdc;
-}
-static WINAPI BOOL EndPaint(HANDLE h, const PAINTSTRUCT *ps) { (void)h; vx_dc_release(ps->hdc); return 1; }
-static WINAPI BOOL InvalidateRect(HANDLE h, const RECT *r, BOOL erase) {
-    (void)r;
-    if (!h) {
-        for (int i = 0; i < g_window_next; i++) if (g_windows[i] && !g_windows[i]->destroyed) InvalidateRect(g_windows[i]->hwnd, NULL, erase);
-        return 1;
-    }
-    vx_window *w = vx_window_get(h);
-    if (!w) return 0;
-    w->invalid = 1;
-    if (erase) w->erase = 1;
-    pthread_mutex_lock(&w->queue->lock);
-    pthread_cond_broadcast(&w->queue->cond);
-    pthread_mutex_unlock(&w->queue->lock);
-    return 1;
-}
-static WINAPI BOOL InvalidateRgn(HANDLE h, HANDLE rgn, BOOL erase) { (void)rgn; return InvalidateRect(h, NULL, erase); }
-static WINAPI BOOL ValidateRect(HANDLE h, const RECT *r) { (void)r; vx_window *w = vx_window_get(h); if (w) w->invalid = 0; return w != NULL; }
-static WINAPI BOOL GetUpdateRect(HANDLE h, RECT *r, BOOL erase) {
-    (void)erase;
-    vx_window *w = vx_window_get(h);
-    if (!w || !w->invalid) { if (r) *r = (RECT){ 0, 0, 0, 0 }; return 0; }
-    if (r) *r = (RECT){ 0, 0, w->client_w, w->client_h };
-    return 1;
-}
-static WINAPI BOOL UpdateWindow(HANDLE h) {
-    vx_window *w = vx_window_get(h);
-    if (!w) return 0;
-    if (w->invalid && w->visible) vx_send_message(h, WM_PAINT, 0, 0);
-    return 1;
-}
-static WINAPI BOOL RedrawWindow(HANDLE h, const RECT *r, HANDLE rgn, uint32_t flags) {
-    (void)rgn;
-    InvalidateRect(h, r, (flags & 0x4) != 0);       // RDW_ERASE
-    if (flags & 0x100) UpdateWindow(h);             // RDW_UPDATENOW
-    return 1;
-}
-
 // ---- the default window procedure ----------------------------------------------------------------------------------------------
 static LRESULT def_window_proc(HANDLE h, uint32_t msg, WPARAM wp, LPARAM lp, int unicode) {
     vx_window *w = vx_window_get(h);
     switch (msg) {
     case WM_NCCREATE: return 1;
     case WM_CLOSE: DestroyWindow(h); return 0;
-    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(h, &ps); EndPaint(h, &ps); return 0; }
-    case WM_ERASEBKGND: if (w && w->cls->background) { vx_fill_client(w, w->cls->background); return 1; } return 0;
+    case WM_PAINT: return vx_default_paint(h);
+    case WM_ERASEBKGND: return w && w->cls->background ? vx_fill_client(w, (HANDLE)wp, w->cls->background) : 0;   // (wParam: the DC)
     case WM_SETTEXT:
         if (unicode) SetWindowTextW(h, (const WCHAR *)lp); else SetWindowTextA(h, (const char *)lp);
         return 1;
@@ -1661,7 +1664,7 @@ int vx_ui_idle(void) {
         pthread_mutex_lock(&g_win_lock);
         for (int i = 0; i < g_window_next; i++) {
             vx_window *w = g_windows[i];
-            if (w && !w->destroyed && w->tid == q->tid) { owns = 1; unpainted |= w->invalid && w->visible; }
+            if (w && !w->destroyed && w->tid == q->tid) { owns = 1; unpainted |= w->invalid && w->visible && vx_window_wants_paint(w); }
         }
         pthread_mutex_unlock(&g_win_lock);
         if (!owns) continue;
@@ -1710,11 +1713,7 @@ int vx_ui_snapshot(HANDLE hwnd, const char *png) {
     CGImageRef img = w->ctx ? CGBitmapContextCreateImage(w->ctx) : NULL;
     pthread_mutex_unlock(&w->lock);
     if (!img) return 0;
-    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)png, (CFIndex)strlen(png), false);
-    CGImageDestinationRef d = url ? CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL) : NULL;
-    int ok = 0;
-    if (d) { CGImageDestinationAddImage(d, img, NULL); ok = CGImageDestinationFinalize(d); CFRelease(d); }
-    if (url) CFRelease(url);
+    int ok = vx_png_write(img, png);
     CGImageRelease(img);
     return ok;
 }
@@ -1764,7 +1763,7 @@ static const vx_export user32[] = {
     VX_EXPORT(RegisterClassExA), VX_EXPORT(RegisterClassExW), VX_EXPORT(RegisterClassA), VX_EXPORT(RegisterClassW),
     VX_EXPORT(UnregisterClassA), VX_EXPORT(UnregisterClassW), VX_EXPORT(GetClassInfoExA), VX_EXPORT(GetClassInfoExW), VX_EXPORT(GetClassInfoA), VX_EXPORT(GetClassInfoW),
     VX_EXPORT(CreateWindowExA), VX_EXPORT(CreateWindowExW), VX_EXPORT(DestroyWindow),
-    { "ShowWindow", (void *)vx_ShowWindow }, VX_EXPORT(ShowWindowAsync), VX_EXPORT(UpdateWindow),
+    { "ShowWindow", (void *)vx_ShowWindow }, VX_EXPORT(ShowWindowAsync),
     VX_EXPORT(SendMessageA), VX_EXPORT(SendMessageW), VX_EXPORT(SendMessageTimeoutA), VX_EXPORT(SendMessageTimeoutW),
     VX_EXPORT(PostMessageA), VX_EXPORT(PostMessageW), VX_EXPORT(SendNotifyMessageA), VX_EXPORT(SendNotifyMessageW),
     VX_EXPORT(PostThreadMessageA), VX_EXPORT(PostThreadMessageW), VX_EXPORT(PostQuitMessage),
@@ -1785,8 +1784,6 @@ static const vx_export user32[] = {
     VX_EXPORT(GetClientRect), VX_EXPORT(GetWindowRect), VX_EXPORT(ClientToScreen), VX_EXPORT(ScreenToClient), VX_EXPORT(MapWindowPoints),
     VX_EXPORT(SetWindowPos), VX_EXPORT(MoveWindow), VX_EXPORT(AdjustWindowRect), VX_EXPORT(AdjustWindowRectEx),
     VX_EXPORT(AdjustWindowRectExForDpi), VX_EXPORT(GetWindowPlacement),
-    VX_EXPORT(BeginPaint), VX_EXPORT(EndPaint), VX_EXPORT(InvalidateRect), VX_EXPORT(InvalidateRgn), VX_EXPORT(ValidateRect),
-    VX_EXPORT(GetUpdateRect), VX_EXPORT(RedrawWindow),
     VX_EXPORT(GetKeyState), VX_EXPORT(GetAsyncKeyState), VX_EXPORT(GetKeyboardState), VX_EXPORT(MapVirtualKeyA), VX_EXPORT(MapVirtualKeyW),
     VX_EXPORT(MapVirtualKeyExA), VX_EXPORT(MapVirtualKeyExW), VX_EXPORT(GetKeyboardLayout), VX_EXPORT(GetKeyboardType), VX_EXPORT(GetKeyNameTextA),
     VX_EXPORT(GetCursorPos), VX_EXPORT(SetCursorPos), VX_EXPORT(WindowFromPoint), VX_EXPORT(ShowCursor), VX_EXPORT(SetCursor), VX_EXPORT(GetCursor),

@@ -4,7 +4,9 @@
 //   state                      the windows: class, title, client size and origin on the screen, the text drawn in each
 //                              and where; the active window, the focus; whether the program is idle
 //   windows                    the same without the text (what a screenshot-only agent may know: tools/vxrt_screen.py)
-//   snapshot <hwnd> <path>     the window's client area as a PNG file
+//   snapshot <hwnd> <path>     the window's client area as a PNG file (what GDI drew into it)
+//   snapshot-view <hwnd> <path>  what its Mac window shows of it (the committed picture, its child windows, alpha),
+//                              at the window's backing scale, as a PNG file; answers the scale and the size in pixels
 //   click <hwnd> <x> <y>       a left click at client coordinates (hwnd 0: the active window, else the first visible one)
 //   click-text <hwnd> <text>   a click on the middle of the first drawn text that contains <text> (hwnd 0: any window)
 //   key <hwnd> <vk>            a key pressed and let go (a virtual-key code, decimal or 0x..; no WM_CHAR: see type)
@@ -131,8 +133,15 @@ static void request(int fd, char *line) {
     } else if (!strcmp(cmd, "snapshot")) {
         while (*s == ' ') s++;
         if (!*s || !vx_ui_snapshot(h, s)) { reply_err(fd, "snapshot <hwnd> <path>: not written"); return; }
+    } else if (!strcmp(cmd, "snapshot-view")) {
+        while (*s == ' ') s++;
+        char info[200] = "", b[320];
+        if (!*s || !vx_ui_snapshot_view(h, s, info, sizeof info)) { reply_err(fd, "snapshot-view <hwnd> <path>: not written (no Mac window shows it)"); return; }
+        snprintf(b, sizeof b, "{\"ok\":true,\"hwnd\":%lld,%s}", (long long)(intptr_t)h, info);
+        reply(fd, b);
+        return;
     } else if (!strcmp(cmd, "close")) vx_window_post(h, WM_CLOSE, 0, 0);
-    else { reply_err(fd, "unknown request (state, windows, snapshot, click, click-text, key, type, close, wait-idle, tray, tray-click, tray-snapshot, menu, menu-pick, menu-cancel)"); return; }
+    else { reply_err(fd, "unknown request (state, windows, snapshot, snapshot-view, click, click-text, key, type, close, wait-idle, tray, tray-click, tray-snapshot, menu, menu-pick, menu-cancel)"); return; }
     reply_ok(fd, h);
 }
 

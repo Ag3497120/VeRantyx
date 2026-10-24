@@ -5,8 +5,8 @@
 // A region is kept the way Windows describes it in RGNDATA: rectangles that do not overlap, sorted top to bottom and
 // left to right, in bands (rectangles of a band share their top and bottom), with neighbouring bands that have the
 // same horizontal spans merged. That form is unique, so two regions are equal when their lists are. The region
-// objects live in gdi.c's handle table (vx_gdi_region_new / vx_gdi_region); drawing is not clipped by them yet
-// (SelectClipRgn records the clip region, src/gdi.c).
+// objects live in gdi.c's handle table (vx_gdi_region_new / vx_gdi_region); a DC's clip region (gdi.c) and a window's
+// update region (present.c) are regions too.
 #include <stdlib.h>
 #include <string.h>
 #include "ui.h"
@@ -15,9 +15,6 @@ enum { ERROR_RGN = 0, NULLREGION = 1, SIMPLEREGION = 2, COMPLEXREGION = 3 };
 enum { RGN_AND = 1, RGN_OR = 2, RGN_XOR = 3, RGN_DIFF = 4, RGN_COPY = 5 };
 enum { ERROR_INVALID_HANDLE = 6, ERROR_INVALID_PARAMETER = 87 };
 
-typedef struct vx_region { int n, cap; RECT *r; } vx_region;
-HANDLE vx_gdi_region_new(vx_region *r);                   // gdi.c: a region object holding r (NULL if none could be made)
-vx_region *vx_gdi_region(HANDLE h);                       // gdi.c: a region object's region, NULL if h is none
 
 static void add(vx_region *g, LONG l, LONG t, LONG r, LONG b) {
     if (g->n == g->cap) { g->cap = g->cap ? g->cap * 2 : 8; g->r = realloc(g->r, (size_t)g->cap * sizeof *g->r); }
@@ -42,6 +39,7 @@ static RECT box_of(const vx_region *g) {
     for (int i = 0; i < g->n; i++) {
         if (!i) { b = g->r[0]; continue; }
         if (g->r[i].left < b.left) b.left = g->r[i].left;
+        if (g->r[i].top < b.top) b.top = g->r[i].top;
         if (g->r[i].right > b.right) b.right = g->r[i].right;
         if (g->r[i].bottom > b.bottom) b.bottom = g->r[i].bottom;
     }
@@ -100,6 +98,18 @@ static void combine(vx_region *out, const vx_region *a, const vx_region *b, int 
     *out = r;
 }
 
+// For the rest of the runtime (ui.h): update regions, clip regions (gdi.c, present.c).
+void vx_region_set_rect(vx_region *g, LONG l, LONG t, LONG r, LONG b) { set_rect(g, l, t, r, b); }
+int vx_region_combine(vx_region *out, const vx_region *a, const vx_region *b, int mode) {
+    if (mode == RGN_COPY) vx_region_copy(out, a); else combine(out, a, b, mode);
+    return type_of(out);
+}
+void vx_region_offset(vx_region *g, int dx, int dy) {
+    for (int i = 0; i < g->n; i++) { g->r[i].left += dx; g->r[i].right += dx; g->r[i].top += dy; g->r[i].bottom += dy; }
+}
+RECT vx_region_box(const vx_region *g) { return box_of(g); }
+int vx_region_type(const vx_region *g) { return type_of(g); }
+
 // ---- gdi32 -----------------------------------------------------------------------------------------------------------------
 static vx_region *region_of(HANDLE h) {
     vx_region *g = vx_gdi_region(h);
@@ -144,7 +154,7 @@ static WINAPI int GetRgnBox(HANDLE h, RECT *box) {
 static WINAPI int OffsetRgn(HANDLE h, int dx, int dy) {
     vx_region *g = region_of(h);
     if (!g) return ERROR_RGN;
-    for (int i = 0; i < g->n; i++) { g->r[i].left += dx; g->r[i].right += dx; g->r[i].top += dy; g->r[i].bottom += dy; }
+    vx_region_offset(g, dx, dy);
     return type_of(g);
 }
 static WINAPI BOOL PtInRegion(HANDLE h, int x, int y) {

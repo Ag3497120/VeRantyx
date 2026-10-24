@@ -8,6 +8,7 @@ SRC    += src/handlexfer.c
 SRC    += src/version.c
 SRC    += src/filestate.c
 SRC    += src/icons.c src/menus.m src/tray.m
+SRC    += src/present.c
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
@@ -132,6 +133,12 @@ build/extra_args.exe: tests/extra_args.c
 build/clip.exe: tests/clip.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lgdi32
+
+# GDI to the screen (tests/present.c, driven by tests/present_check.py): made-up gradients through every path.
+tests: build/present.exe
+build/present.exe: tests/present.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lgdi32 -lmsimg32 -ldwmapi
 
 # The notification area (tests/tray.c, driven by tests/tray_check.py): a made-up icon file, also the program's resources,
 # and made-up DLLs for ExtractIconEx (tests/tray_pe.py writes build/tray_pe_*.dll).
@@ -1241,6 +1248,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/winsta.exe
 	$(VXRT) build/scm.exe
 	python3 tests/clip_check.py $(VXRT)
+	python3 tests/present_check.py $(VXRT)
 	python3 tests/shoplist_check.py $(VXRT)
 	python3 tests/tray_check.py $(VXRT)
 	$(VXRT) build/d3d11.exe
