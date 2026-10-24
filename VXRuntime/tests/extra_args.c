@@ -2,7 +2,8 @@
 // this program with  VXRT_EXTRA_ARGS='other.exe=--not-me;EXTRA_ARGS.EXE=--first "two words"'  and the arguments
 // "self tail". The entry naming this program (case ignored) puts its arguments right after the program's name, in
 // argv and in GetCommandLineW; the other entry does nothing. A child this program starts with CreateProcess, as
-// steam.exe starts the web helper, gets them the same way. All arguments are made up for the test.
+// steam.exe starts the web helper, gets them the same way. And CommandLineToArgvW through the API set the web helper
+// names (api-ms-win-downlevel-shell32-l1-1-0) is shell32's. All arguments are made up for the test.
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +26,9 @@ static void expect(int argc, char **argv, const char *mode, const char *last) {
     wchar_t **args = CommandLineToArgvW(cmd, &n);
     CHECK(args != NULL && n == 5 && !wcscmp(args[2], L"two words"));
     LocalFree(args);
+    // (the web helper finds CommandLineToArgvW through an API set, by name: it is shell32's)
+    HMODULE set = LoadLibraryA("api-ms-win-downlevel-shell32-l1-1-0.dll");
+    CHECK(set != NULL && GetProcAddress(set, "CommandLineToArgvW") == GetProcAddress(GetModuleHandleA("shell32.dll"), "CommandLineToArgvW"));
 }
 
 int main(int argc, char **argv) {

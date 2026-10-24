@@ -69,6 +69,7 @@ static const char *canonical_dll(const char *dll) {
     if (!strncasecmp(dll, "api-ms-win-ntuser-", 18) || !strncasecmp(dll, "ext-ms-win-ntuser-", 18)) return "user32.dll";
     if (!strncasecmp(dll, "api-ms-win-shcore-", 18)) return "shcore.dll";
     if (!strncasecmp(dll, "api-ms-win-service-", 19)) return "sechost.dll";
+    if (!strncasecmp(dll, "api-ms-win-downlevel-shell32-", 29)) return "shell32.dll";   // (CommandLineToArgvW: Steam's web helper)
     if (!strncasecmp(dll, "api-ms-win-", 11)) return "kernelbase.dll";
     return dll;
 }
