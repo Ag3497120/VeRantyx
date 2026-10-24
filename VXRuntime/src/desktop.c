@@ -200,15 +200,7 @@ static WINAPI void FreeLibraryAndExitThread(void *module, DWORD code) {
     for (;;) pause();
 }
 static WINAPI void *DelayLoadFailureHook(const char *dll, const char *proc) { (void)dll; (void)proc; return NULL; }
-// Anonymous pipes: a Unix pipe; the handles are file handles (0x10000 + descriptor, as files.c makes them).
-static WINAPI BOOL CreatePipe(HANDLE *rd, HANDLE *wr, void *sa, DWORD size) {
-    (void)sa; (void)size;
-    int fds[2];
-    if (pipe(fds)) { vx_set_last_error(8); return 0; }
-    fcntl(fds[0], F_SETFD, FD_CLOEXEC); fcntl(fds[1], F_SETFD, FD_CLOEXEC);
-    *rd = (HANDLE)(intptr_t)(0x10000 + fds[0]); *wr = (HANDLE)(intptr_t)(0x10000 + fds[1]);
-    return 1;
-}
+// (CreatePipe: src/inherit.c)
 // Debugging other processes: not possible here.
 static WINAPI BOOL WaitForDebugEvent(void *ev, DWORD ms) { (void)ev; (void)ms; vx_set_last_error(121); return 0; }
 static WINAPI BOOL ContinueDebugEvent(DWORD pid, DWORD tid, DWORD status) { (void)pid; (void)tid; (void)status; vx_set_last_error(87); return 0; }
@@ -463,7 +455,7 @@ static const vx_export k32[] = {
     VX_EXPORT(GlobalUnlock), VX_EXPORT(GlobalSize), VX_EXPORT(SetThreadExecutionState), VX_EXPORT(GetSystemPowerStatus),
     VX_EXPORT(GetProcessPriorityBoost), VX_EXPORT(SetProcessPriorityBoost), VX_EXPORT(DosDateTimeToFileTime), VX_EXPORT(SetFileTime),
     VX_EXPORT(ReadProcessMemory), VX_EXPORT(VirtualQueryEx), VX_EXPORT(FreeLibraryAndExitThread), VX_EXPORT(DelayLoadFailureHook),
-    VX_EXPORT(CreatePipe), VX_EXPORT(WaitForDebugEvent), VX_EXPORT(ContinueDebugEvent),
+    VX_EXPORT(WaitForDebugEvent), VX_EXPORT(ContinueDebugEvent),
     VX_EXPORT(AttachConsole), VX_EXPORT(FillConsoleOutputAttribute), VX_EXPORT(FillConsoleOutputCharacterA),
     VX_EXPORT(WriteConsoleOutputCharacterA), VX_EXPORT(GetConsoleScreenBufferInfoEx), VX_EXPORT(SetConsoleScreenBufferInfoEx),
     VX_EXPORT(GetNumberOfConsoleInputEvents), VX_EXPORT(ReadConsoleInputA),

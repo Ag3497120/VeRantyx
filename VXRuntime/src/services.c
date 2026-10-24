@@ -507,8 +507,7 @@ static WINAPI BOOL FlushInstructionCache(HANDLE p, const void *addr, size_t n) {
 static WINAPI BOOL RtlAddFunctionTable(void *table, DWORD count, uint64_t base) { (void)table; (void)count; (void)base; return 1; }
 static WINAPI BOOL RtlDeleteFunctionTable(void *table) { (void)table; return 1; }
 static WINAPI BOOL RtlInstallFunctionTableCallback(uint64_t id, uint64_t base, DWORD len, void *cb, void *ctx, const WCHAR *dll) { (void)id; (void)base; (void)len; (void)cb; (void)ctx; (void)dll; return 1; }
-static WINAPI BOOL SetHandleInformation(HANDLE h, DWORD mask, DWORD flags) { (void)h; (void)mask; (void)flags; return 1; }
-static WINAPI BOOL GetHandleInformation(HANDLE h, DWORD *flags) { (void)h; *flags = 0; return 1; }
+// (SetHandleInformation, GetHandleInformation: src/inherit.c)
 static WINAPI BOOL SetSystemTime(const void *st) { (void)st; vx_set_last_error(1314); return 0; }
 static WINAPI DWORD SignalObjectAndWait(HANDLE signal, HANDLE wait, DWORD ms, BOOL alertable) {
     (void)alertable;
@@ -647,7 +646,7 @@ static const vx_export k32[] = {
     VX_EXPORT(HeapLock), VX_EXPORT(HeapUnlock), VX_EXPORT(HeapWalk), VX_EXPORT(HeapQueryInformation), VX_EXPORT(GetProcessHeaps),
     VX_EXPORT(LocalReAlloc), VX_EXPORT(QueryThreadCycleTime), VX_EXPORT(DebugBreak), VX_EXPORT(FatalAppExitA),
     VX_EXPORT(FlushInstructionCache), VX_EXPORT(RtlAddFunctionTable), VX_EXPORT(RtlDeleteFunctionTable),
-    VX_EXPORT(RtlInstallFunctionTableCallback), VX_EXPORT(SetHandleInformation), VX_EXPORT(GetHandleInformation),
+    VX_EXPORT(RtlInstallFunctionTableCallback),
     VX_EXPORT(SetSystemTime), VX_EXPORT(SignalObjectAndWait), VX_EXPORT(ReadDirectoryChangesW),
     VX_EXPORT(CopyFileExW), VX_EXPORT(GetPrivateProfileIntW),
     VX_EXPORT(GetPrivateProfileIntA), VX_EXPORT(GetPrivateProfileSectionW), VX_EXPORT(PeekConsoleInputA), VX_EXPORT(ReadConsoleInputW),

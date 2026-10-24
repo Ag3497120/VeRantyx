@@ -7,6 +7,7 @@ SRC    += src/launchargs.c
 SRC    += src/handlexfer.c
 SRC    += src/version.c
 SRC    += src/filestate.c
+SRC    += src/inherit.c
 SRC    += src/icons.c src/menus.m src/tray.m
 SRC    += src/present.c
 MINGW   = x86_64-w64-mingw32-gcc
@@ -95,6 +96,12 @@ build/breakpoint.exe: tests/breakpoint.c
 build/child_stdout.exe: tests/child_stdout.c
 	@mkdir -p build
 	$(MINGW) -O1 -static -o $@ $<
+
+# Pipe ends inherited by a child as asked (CreatePipe's attributes, SetHandleInformation): src/inherit.c.
+tests: build/inherit.exe
+build/inherit.exe: tests/inherit.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -static -o $@ $<
 
 build/cxx_exceptions.exe: tests/cxx_exceptions.cpp
 	@mkdir -p build
@@ -1204,6 +1211,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/unwind.exe
 	$(VXRT) build/breakpoint.exe
 	$(VXRT) build/child_stdout.exe
+	$(VXRT) build/inherit.exe
 	VXRT_EXTRA_ARGS='other.exe=--not-me;EXTRA_ARGS.EXE=--first "two words"' $(VXRT) build/extra_args.exe self tail
 	$(VXRT) build/lowmem.exe
 	$(VXRT) build/files.exe
