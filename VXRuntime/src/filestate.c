@@ -118,22 +118,26 @@ static WINAPI BOOL UnlockFile(HANDLE h, DWORD off_low, DWORD off_high, DWORD len
 // ---- deleting on close ----------------------------------------------------------------------------------------------------
 // The file or (empty) directory, by its Mac path, goes when the handle is closed, if that path still names the same
 // file then. (Windows waits for the last handle to the file; other handles here keep reading and writing it after the
-// name is gone.)
+// name is gone.) Under VXRT_OVERLAY's tree the original stays, as DeleteFileW leaves it (AGENTS.md: Valve's and the
+// games' files are never changed): only the overlay's copy of the name goes, when there is one (vx_overlay_deletable,
+// files.c). That is decided here, again when the handle is closed, and for POSIX semantics.
+#define VX_PATH_CAP 4096                                             // (files.c's Mac paths)
 void vx_file_delete_on_close(HANDLE h, const char *unix_path, int on) {
-    doomed *gone = NULL;
+    char target[VX_PATH_CAP];
+    struct stat st;
+    int fd = vx_handle_fd(h);
+    doomed *d = NULL, *gone = NULL;
+    if (on && unix_path && fd >= 0 && vx_overlay_deletable(unix_path, target, sizeof target) &&
+        !(strcmp(target, unix_path) ? stat(target, &st) : fstat(fd, &st))) {   // (the overlay's copy: that file's identity)
+        size_t n = strlen(target) + 1;
+        d = malloc(sizeof *d + n);
+        d->owner = h; d->dev = st.st_dev; d->ino = st.st_ino; d->dir = S_ISDIR(st.st_mode);
+        memcpy(d->path, target, n);
+    }
     pthread_mutex_lock(&g_mutex);
     for (doomed **p = &g_doomed; *p; p = &(*p)->next)
         if ((*p)->owner == h) { gone = *p; *p = gone->next; __atomic_sub_fetch(&g_entries, 1, __ATOMIC_RELEASE); break; }
-    struct stat st;
-    int fd = vx_handle_fd(h);
-    if (on && unix_path && fd >= 0 && !fstat(fd, &st)) {
-        size_t n = strlen(unix_path) + 1;
-        doomed *d = malloc(sizeof *d + n);
-        d->owner = h; d->dev = st.st_dev; d->ino = st.st_ino; d->dir = S_ISDIR(st.st_mode);
-        memcpy(d->path, unix_path, n);
-        d->next = g_doomed; g_doomed = d;
-        __atomic_add_fetch(&g_entries, 1, __ATOMIC_RELEASE);
-    }
+    if (d) { d->next = g_doomed; g_doomed = d; __atomic_add_fetch(&g_entries, 1, __ATOMIC_RELEASE); }
     pthread_mutex_unlock(&g_mutex);
     free(gone);
 }
@@ -158,7 +162,9 @@ void vx_file_closing(HANDLE h) {
         doomed *d = gone;
         gone = d->next;
         struct stat st;
-        if (!stat(d->path, &st) && st.st_dev == d->dev && st.st_ino == d->ino) { if (d->dir) rmdir(d->path); else unlink(d->path); }
+        char target[VX_PATH_CAP];
+        if (vx_overlay_deletable(d->path, target, sizeof target) && !strcmp(target, d->path) &&   // (never an original)
+            !stat(d->path, &st) && st.st_dev == d->dev && st.st_ino == d->ino) { if (d->dir) rmdir(d->path); else unlink(d->path); }
         free(d);
     }
 }
@@ -190,8 +196,13 @@ static WINAPI BOOL SetFileInformationByHandle(HANDLE h, int cls, const void *in,
         if (fcntl(fd, F_GETPATH, path)) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
         if ((flags & FILE_DISPOSITION_FLAG_DELETE) && (flags & FILE_DISPOSITION_FLAG_POSIX_SEMANTICS)) {
             struct stat st;                                        // the name goes now; the handle still works
+            char target[VX_PATH_CAP];
             vx_file_delete_on_close(h, NULL, 0);
-            if (fstat(fd, &st) || (S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path))) { vx_set_last_error(vx_error_from_errno(errno)); return 0; }
+            if (!vx_overlay_deletable(path, target, sizeof target)) return 1;   // an overlaid original stays (DeleteFileW's answer)
+            if ((strcmp(target, path) ? lstat(target, &st) : fstat(fd, &st)) || (S_ISDIR(st.st_mode) ? rmdir(target) : unlink(target))) {
+                vx_set_last_error(vx_error_from_errno(errno));
+                return 0;
+            }
             return 1;
         }
         vx_file_delete_on_close(h, path, (flags & FILE_DISPOSITION_FLAG_DELETE) != 0);

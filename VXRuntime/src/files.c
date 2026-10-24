@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -114,6 +115,39 @@ int vx_overlay_file(const char *unix_path, char *out, size_t cap) {
     snprintf(out, cap, "%s", shadow);
     return 1;
 }
+// Deleting by a Mac path keeps the overlaid tree too (DeleteFileW and RemoveDirectoryW below leave an original): under
+// the tree only the overlay's copy of the name may go. The path is checked as given and as the file system resolves
+// it, since a handle's own name for its file (F_GETPATH) is the resolved one (/private/tmp for /tmp, symbolic links
+// followed; overlay_init resolves the tree's and the overlay's names too). The overlay's own files are not originals
+// (it may sit inside the tree). Returns 1 with out set to what may be deleted (the path itself outside the tree, the
+// overlay's copy under it), 0 when nothing may be.
+static char g_ov_tree_real[MAX_PATH_LEN], g_ov_shadow_real[MAX_PATH_LEN];
+static size_t path_under(const char *path, const char *dir) {   // the length of dir when path is dir or below it
+    size_t n = strlen(dir);
+    return n && !strncasecmp(path, dir, n) && (!path[n] || path[n] == '/') ? n : 0;
+}
+static size_t longer(size_t a, size_t b) { return a > b ? a : b; }
+static int in_original_tree(const char *path, char *shadow, size_t cap) {
+    size_t tree = longer(path_under(path, g_ov_tree), path_under(path, g_ov_tree_real));
+    size_t ov = longer(path_under(path, g_ov_shadow), path_under(path, g_ov_shadow_real));
+    if (!tree || ov > tree) return 0;                             // (in the overlay, inside the tree)
+    int k = snprintf(shadow, cap, "%s%s", g_ov_shadow, path + tree);
+    if (k < 0 || (size_t)k >= cap) *shadow = 0;                   // (no copy can have that name)
+    return 1;
+}
+int vx_overlay_deletable(const char *unix_path, char *out, size_t cap) {
+    char real[PATH_MAX], shadow[MAX_PATH_LEN];
+    struct stat st;
+    int k;
+    if (g_ov_len && (in_original_tree(unix_path, shadow, sizeof shadow) || (realpath(unix_path, real) && in_original_tree(real, shadow, sizeof shadow)))) {
+        if (!*shadow || lstat(shadow, &st)) return 0;             // the original alone: it stays
+        k = snprintf(out, cap, "%s", shadow);
+    } else {
+        k = snprintf(out, cap, "%s", unix_path);
+    }
+    return k >= 0 && (size_t)k < cap;
+}
+
 static void make_parent_dirs(const char *path) {
     char p[MAX_PATH_LEN];
     snprintf(p, sizeof p, "%s", path);
@@ -135,6 +169,9 @@ static void overlay_init(void) {
     while (strlen(g_ov_tree) > 1 && g_ov_tree[strlen(g_ov_tree) - 1] == '/') g_ov_tree[strlen(g_ov_tree) - 1] = 0;
     g_ov_len = strlen(g_ov_tree);
     mkdir(g_ov_shadow, 0777);
+    char r[PATH_MAX];
+    if (realpath(g_ov_tree, r)) snprintf(g_ov_tree_real, sizeof g_ov_tree_real, "%s", r);
+    if (realpath(g_ov_shadow, r)) snprintf(g_ov_shadow_real, sizeof g_ov_shadow_real, "%s", r);
 }
 
 // Windows path -> Mac path. Returns 0 (with the last error set) for paths outside the mapped drives.

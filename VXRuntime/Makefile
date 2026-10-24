@@ -1182,6 +1182,13 @@ runtime-tests: $(VXRT) tests
 	VXRT_OVERLAY=$(CURDIR)/build/ovtree:$(CURDIR)/build/ovshadow $(VXRT) build/files.exe overlay 'Z:$(subst /,\,$(CURDIR))\build\ovtree'
 	test "$$(cat build/ovtree/save/same.hl1)" = orig && test ! -e build/ovtree/save/a.hl1
 	$(VXRT) build/dbfiles.exe
+	for via in dbov dbovlink; do \
+	  rm -rf build/dbov build/dbovlink build/dbovshadow && mkdir -p build/dbov/keep && ln -s dbov build/dbovlink && \
+	  for f in a b c d e; do echo orig > build/dbov/$$f.db; done && \
+	  VXRT_OVERLAY=$(CURDIR)/build/$$via:$(CURDIR)/build/dbovshadow $(VXRT) build/dbfiles.exe overlay "Z:$(subst /,\,$(CURDIR))\\build\\$$via" && \
+	  for f in a b c d e; do test "$$(cat build/dbov/$$f.db)" = orig || exit 1; test ! -e build/dbovshadow/$$f.db || exit 1; done && \
+	  test -d build/dbov/keep && test ! -e build/dbovshadow/new.db || exit 1; \
+	done
 	$(VXRT) build/dll_test.exe
 	$(VXRT) build/net.exe
 	$(VXRT) build/winhttp.exe

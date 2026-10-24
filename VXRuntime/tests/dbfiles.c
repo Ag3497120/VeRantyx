@@ -394,7 +394,85 @@ static void test_helpers(void) {
     }
 }
 
-int main(void) {
+// ---- "dbfiles.exe overlay <tree>": run with VXRT_OVERLAY=<tree>:<overlay>, the tree holding a.db .. e.db ("orig") and
+// the folder keep. An overlaid tree stays as it is (writes go to the overlay; DeleteFileW leaves an original): deleting
+// on close, by disposition or with POSIX semantics removes the overlay's copy of a file, never the original. The
+// Makefile looks at the originals afterwards, and runs this once more with the tree named through a symbolic link
+// (the name a handle reports for its file is the resolved one).
+static BOOL holds(const char *path, const char *text) {
+    char buf[32];
+    DWORD got = 0;
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    BOOL ok = h != INVALID_HANDLE_VALUE && ReadFile(h, buf, sizeof buf, &got, NULL) && got >= strlen(text) && !memcmp(buf, text, strlen(text));
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    return ok;
+}
+static void change(const char *path) {
+    DWORD put = 0;
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE && WriteFile(h, "changed", 7, &put, NULL) && put == 7);
+    CloseHandle(h);
+    CHECK(holds(path, "changed"));
+}
+static int overlay_test(const char *tree) {
+    char p[MAX_PATH];
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    FILE_DISPOSITION_INFO yes = { TRUE };
+    FILE_DISPOSITION_INFO_EX posix = { FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
+    // An original opened to read with FILE_FLAG_DELETE_ON_CLOSE: closing it leaves it.
+    snprintf(p, sizeof p, "%s\\a.db", tree);
+    HANDLE h = CreateFileA(p, GENERIC_READ, share, NULL, OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    CloseHandle(h);
+    CHECK(holds(p, "orig"));
+    // FileDispositionInfo on an original: accepted (as DeleteFileW is), the file stays.
+    snprintf(p, sizeof p, "%s\\b.db", tree);
+    h = CreateFileA(p, GENERIC_READ | DELETE, share, NULL, OPEN_EXISTING, 0, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE && SetFileInformationByHandle(h, FileDispositionInfo, &yes, sizeof yes));
+    CloseHandle(h);
+    CHECK(holds(p, "orig"));
+    // FileDispositionInfoEx with POSIX semantics (the name goes at once): the original stays.
+    snprintf(p, sizeof p, "%s\\c.db", tree);
+    h = CreateFileA(p, GENERIC_READ | DELETE, share, NULL, OPEN_EXISTING, 0, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE && SetFileInformationByHandle(h, FileDispositionInfoEx, &posix, sizeof posix) && holds(p, "orig"));
+    CloseHandle(h);
+    CHECK(holds(p, "orig"));
+    // A file changed (the overlay has a copy), then opened with FILE_FLAG_DELETE_ON_CLOSE: the copy goes, the original
+    // is what the name shows again.
+    snprintf(p, sizeof p, "%s\\d.db", tree);
+    change(p);
+    h = CreateFileA(p, GENERIC_READ, share, NULL, OPEN_EXISTING, FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    CloseHandle(h);
+    CHECK(holds(p, "orig"));
+    // An original open, then changed through another handle, then deleted with POSIX semantics on the first: the copy
+    // goes at once, the original stays.
+    snprintf(p, sizeof p, "%s\\e.db", tree);
+    h = CreateFileA(p, GENERIC_READ | DELETE, share, NULL, OPEN_EXISTING, 0, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    change(p);
+    CHECK(SetFileInformationByHandle(h, FileDispositionInfoEx, &posix, sizeof posix) && holds(p, "orig"));
+    CloseHandle(h);
+    CHECK(holds(p, "orig"));
+    // A new file under the tree (it is in the overlay only) goes on close as anywhere else.
+    snprintf(p, sizeof p, "%s\\new.db", tree);
+    h = CreateFileA(p, GENERIC_READ | GENERIC_WRITE, share, NULL, CREATE_ALWAYS, FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE && GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES);
+    CloseHandle(h);
+    CHECK(GetFileAttributesA(p) == INVALID_FILE_ATTRIBUTES);
+    // An original (empty) folder opened with FILE_FLAG_DELETE_ON_CLOSE stays.
+    snprintf(p, sizeof p, "%s\\keep", tree);
+    h = CreateFileA(p, GENERIC_READ | DELETE, share, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    CloseHandle(h);
+    DWORD attrs = GetFileAttributesA(p);
+    CHECK(attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY));
+    printf("deleting under an overlaid tree: %d failed checks -> %s\n", failures, failures ? "FAILED" : "ok");
+    return failures != 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 2 && !strcmp(argv[1], "overlay")) return overlay_test(argv[2]);
     CreateDirectoryW(DIR_W, NULL);
     CHECK(GetFileAttributesW(DIR_W) & FILE_ATTRIBUTE_DIRECTORY);
     test_io();

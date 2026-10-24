@@ -88,7 +88,9 @@ Data`, `Affiliation Database`, `History`, ...). SQLite maps a database and, at e
 first was rolled back, `Web Data` stayed empty and Chromium showed "Profile error occurred". `tests/dbfiles.c` checks
 the file calls of SQLite's documented patterns against Microsoft's documentation: byte-range locks of two connections
 at the bytes near 1 GiB (`src/filestate.c`, real locks within a process now), reads and writes at OVERLAPPED offsets,
-the -journal and -shm files, a mapped database, deleting on close. With an empty profile and the registry of an
+the -journal and -shm files, a mapped database, deleting on close. Deleting on close or by disposition keeps a
+`VXRT_OVERLAY` tree as `DeleteFileW` does: only the overlay's copy of a file goes, never the original (`dbfiles.exe
+overlay`, also with the tree named through a symbolic link). With an empty profile and the registry of an
 earlier run, the web helper also needs `RegDeleteKeyExW` (it stopped at a breakpoint without it).
 
 "Steam Service Error" at start: Steam looks for the Steam Client Service (`bin/SteamService.exe`, a 32-bit
