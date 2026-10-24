@@ -78,6 +78,7 @@ static const char *canonical_dll(const char *dll) {
     if (!strncasecmp(dll, "api-ms-win-ntuser-", 18) || !strncasecmp(dll, "ext-ms-win-ntuser-", 18)) return "user32.dll";
     if (!strncasecmp(dll, "api-ms-win-shcore-", 18)) return "shcore.dll";
     if (!strncasecmp(dll, "api-ms-win-service-", 19)) return "sechost.dll";
+    if (!strncasecmp(dll, "api-ms-win-power-", 17)) return "powrprof.dll";
     if (!strncasecmp(dll, "api-ms-win-", 11)) return "kernelbase.dll";
     return dll;
 }
@@ -1226,6 +1227,13 @@ int main(int argc, char **argv, char **envp) {
     vx_pointer_init();
     vx_regnotify_init();                         // (after sync.c's DuplicateHandle and CloseHandle)
     vx_section_init();
+    vx_shlpath_init();
+    vx_wevtapi_init();
+    vx_ktime_init();
+    vx_power_init();
+    vx_dwmapi_init();
+    vx_winmisc_init();
+    vx_sysparams_init();                         // (after user32.c's GetSystemMetricsForDpi)
     vx_extras_init();                            // (last: the tables above come first)
     // VXRT_CONTROL_FOR=<program.exe>: only that program takes the socket; others (a launcher's watchdog) pass it on
     const char *control_for = getenv("VXRT_CONTROL_FOR");

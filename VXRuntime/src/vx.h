@@ -225,6 +225,13 @@ void vx_osinfo_init(void);             // shlwapi's IsOS (osinfo.c)
 void vx_pointer_init(void);            // touch and pointer input: a Mac with no touch screen or pen (pointer.c)
 void vx_regnotify_init(void);          // RegNotifyChangeKeyValue (regnotify.c)
 void vx_section_init(void);            // NtQuerySection (section.c)
+void vx_wevtapi_init(void);            // the Windows Event Log query API: no log here, empty channels (wevtapi.c)
+void vx_ktime_init(void);              // interrupt-time clocks: QueryUnbiasedInterruptTimePrecise, ... (ktime.c)
+void vx_power_init(void);              // powrprof: power information and plans of a desktop on AC power (power.c)
+void vx_sysparams_init(void);          // SystemParametersInfo's UI fonts and non-client metrics (sysparams.c)
+void vx_dwmapi_init(void);             // the Desktop Window Manager API for windows macOS frames (dwmapi.c)
+void vx_winmisc_init(void);            // smaller user32 functions: IsChild, DeferWindowPos, GetLastInputInfo, ... (winmisc.c)
+void vx_shlpath_init(void);            // shlwapi path strings: PathFindFileName, PathMatchSpec, ... (shlpath.c)
 void vx_dbghelp_init(void);            // dbghelp: StackWalk64, symbols from export tables (dbghelp.c; after seh)
 
 // Text (text.c). Counts are in code units; the converters return the length needed and write at most cap units.

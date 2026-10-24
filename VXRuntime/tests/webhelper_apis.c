@@ -8,6 +8,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
@@ -51,6 +52,43 @@ static void test_isos(void) {
     CHECK(!!is_os(OS_TERMINALCLIENT) == !!GetSystemMetrics(SM_REMOTESESSION));
     BOOL wow = TRUE;
     CHECK(IsWow64Process(GetCurrentProcess(), &wow) && !!wow == !!is_os(OS_WOW6432));
+}
+
+enum { PMSF_NORMAL = 0, PMSF_MULTIPLE = 1, PMSF_DONT_STRIP_SPACES = 0x10000 };
+// ---- shlwapi path strings ---------------------------------------------------------------------------------------------
+static void test_paths(void) {
+    HMODULE shlwapi = LoadLibraryA("shlwapi.dll");
+    LPWSTR (WINAPI *find_name)(LPCWSTR) = (LPWSTR (WINAPI *)(LPCWSTR))GetProcAddress(shlwapi, "PathFindFileNameW");
+    LPWSTR (WINAPI *find_ext)(LPCWSTR) = (LPWSTR (WINAPI *)(LPCWSTR))GetProcAddress(shlwapi, "PathFindExtensionW");
+    void (WINAPI *remove_ext)(LPWSTR) = (void (WINAPI *)(LPWSTR))GetProcAddress(shlwapi, "PathRemoveExtensionW");
+    BOOL (WINAPI *match)(LPCWSTR, LPCWSTR) = (BOOL (WINAPI *)(LPCWSTR, LPCWSTR))GetProcAddress(shlwapi, "PathMatchSpecW");
+    BOOL (WINAPI *match_a)(LPCSTR, LPCSTR) = (BOOL (WINAPI *)(LPCSTR, LPCSTR))GetProcAddress(shlwapi, "PathMatchSpecA");
+    HRESULT (WINAPI *match_ex)(LPCWSTR, LPCWSTR, DWORD) = (HRESULT (WINAPI *)(LPCWSTR, LPCWSTR, DWORD))GetProcAddress(shlwapi, "PathMatchSpecExW");
+    LPSTR (WINAPI *find_ext_a)(LPCSTR) = (LPSTR (WINAPI *)(LPCSTR))GetProcAddress(shlwapi, "PathFindExtensionA");
+    CHECK(find_name && find_ext && remove_ext && match && match_a && match_ex && find_ext_a);
+    if (!find_name || !find_ext || !remove_ext || !match || !match_a || !match_ex || !find_ext_a) return;
+    const WCHAR *p = L"C:\\made up\\dir.d\\file.name.txt";
+    CHECK(!wcscmp(find_name(p), L"file.name.txt") && !wcscmp(find_ext(p), L".txt"));
+    CHECK(!wcscmp(find_name(L"C:\\dir\\sub\\"), L"sub\\") && !wcscmp(find_name(L"c:file"), L"file"));
+    CHECK(!wcscmp(find_name(L"plain"), L"plain") && !wcscmp(find_name(L"a/b"), L"b"));
+    const WCHAR *no_ext = L"C:\\dir.d\\file";
+    CHECK(find_ext(no_ext) == no_ext + wcslen(no_ext));                   // the terminating NUL
+    CHECK(!strcmp(find_ext_a("x\\y.tar.gz"), ".gz"));
+    WCHAR buf[64];
+    wcscpy(buf, L"C:\\dir\\file.txt");
+    remove_ext(buf);
+    CHECK(!wcscmp(buf, L"C:\\dir\\file"));
+    wcscpy(buf, L"C:\\dir.d\\file");
+    remove_ext(buf);
+    CHECK(!wcscmp(buf, L"C:\\dir.d\\file"));
+    CHECK(match(L"C:\\dir\\File.TXT", L"*.txt") && !match(L"file.txt", L"*.exe"));
+    CHECK(match(L"file.txt", L"*.exe; *.txt") && match(L"file.txt", L"*.exe;*.TXT"));
+    CHECK(match(L"noext", L"*.*") && match(L"a.b", L"?.?") && !match(L"ab.b", L"?.?"));
+    CHECK(match(L"anything", L"*") && !match(L"anything", L"") && match_a("Setup.EXE", "*.exe"));
+    CHECK(match_ex(L"file.txt", L"*.exe; *.txt", PMSF_MULTIPLE) == S_OK);
+    CHECK(match_ex(L"file.txt", L"*.exe; *.txt", PMSF_NORMAL) == S_FALSE);   // one pattern: the ";" is a character
+    CHECK(match_ex(L"file.txt", L" *.txt", PMSF_NORMAL) == S_OK && match_ex(L"file.txt", L" *.txt", PMSF_DONT_STRIP_SPACES) == S_FALSE);
+    CHECK(match_ex(L"file.txt", L"*", 0x40) == E_INVALIDARG);
 }
 
 // ---- downlevel API sets --------------------------------------------------------------------------------------------------
@@ -127,6 +165,11 @@ static void test_pointer(void) {
     CHECK(!CloseTouchInputHandle((HTOUCHINPUT)(ULONG_PTR)0x1234) && GetLastError() == ERROR_INVALID_HANDLE);
     DestroyWindow(w);
     CHECK(!IsTouchWindow(w, NULL));                                     // gone with the window
+
+    // The keyboard layout (US English) has no IME, so no IME file name.
+    UINT (WINAPI *ime_file)(HKL, LPWSTR, UINT) = (UINT (WINAPI *)(HKL, LPWSTR, UINT))GetProcAddress(LoadLibraryA("imm32.dll"), "ImmGetIMEFileNameW");
+    WCHAR ime[64] = L"x";
+    CHECK(ime_file && ime_file(GetKeyboardLayout(0), ime, 64) == 0 && ime[0] == 0 && ime_file(GetKeyboardLayout(0), NULL, 0) == 0);
 }
 
 // ---- RegNotifyChangeKeyValue -------------------------------------------------------------------------------------------------
@@ -324,12 +367,321 @@ static void test_section(void) {
     CHECK(query((HANDLE)(ULONG_PTR)0x7ff4, 0, &b, sizeof b, NULL) == (LONG)0xC0000008);   // STATUS_INVALID_HANDLE
 }
 
+// ---- wevtapi: no Windows event log here ---------------------------------------------------------------------------------
+typedef HANDLE (WINAPI *evt_query_fn)(HANDLE, LPCWSTR, LPCWSTR, DWORD);
+typedef BOOL (WINAPI *evt_next_fn)(HANDLE, DWORD, HANDLE *, DWORD, DWORD, DWORD *);
+typedef HANDLE (WINAPI *evt_context_fn)(DWORD, LPCWSTR *, DWORD);
+typedef BOOL (WINAPI *evt_render_fn)(HANDLE, HANDLE, DWORD, DWORD, void *, DWORD *, DWORD *);
+typedef BOOL (WINAPI *evt_close_fn)(HANDLE);
+static void test_wevtapi(void) {
+    HMODULE m = LoadLibraryA("wevtapi.dll");
+    CHECK(m != NULL);
+    if (!m) return;
+    evt_query_fn query = (evt_query_fn)GetProcAddress(m, "EvtQuery");
+    evt_next_fn next = (evt_next_fn)GetProcAddress(m, "EvtNext");
+    evt_context_fn context = (evt_context_fn)GetProcAddress(m, "EvtCreateRenderContext");
+    evt_render_fn render = (evt_render_fn)GetProcAddress(m, "EvtRender");
+    evt_close_fn close = (evt_close_fn)GetProcAddress(m, "EvtClose");
+    CHECK(query && next && context && render && close);
+    if (!query || !next || !context || !render || !close) return;
+    HANDLE q = query(NULL, L"application", L"*[System[(Level=2)]]", 1 | 0x200);   // channel path, newest first
+    CHECK(q != NULL);
+    HANDLE events[4] = { 0 };
+    DWORD got = 99;
+    SetLastError(0);
+    CHECK(!next(q, 4, events, INFINITE, 0, &got) && GetLastError() == ERROR_NO_MORE_ITEMS && got == 0);
+    CHECK(close(q));
+    SetLastError(0);
+    CHECK(!close(q) && GetLastError() == ERROR_INVALID_HANDLE);                    // closed already
+    CHECK(!next(q, 4, events, 0, 0, &got) && GetLastError() == ERROR_INVALID_HANDLE);
+    SetLastError(0);
+    CHECK(!query(NULL, L"Made-Up-Channel/Operational", NULL, 1) && GetLastError() == 15007);   // ERROR_EVT_CHANNEL_NOT_FOUND
+    CHECK(!query(NULL, L"Security", NULL, 1) && GetLastError() == ERROR_ACCESS_DENIED);
+    CHECK(!query(NULL, L"C:\\made-up.evtx", NULL, 2) && GetLastError() == ERROR_NOT_SUPPORTED);
+    CHECK(!query((HANDLE)(ULONG_PTR)0x1234, L"System", NULL, 1) && GetLastError() == ERROR_INVALID_HANDLE);
+    const WCHAR *xml = L"<QueryList><Query Id='0' Path='System'><Select Path='System'>*</Select>"
+                       L"<Select Path=\"Made-Up/Debug\">*</Select></Query></QueryList>";
+    SetLastError(0);
+    CHECK(!query(NULL, NULL, xml, 1) && GetLastError() == 15007);
+    q = query(NULL, NULL, xml, 1 | 0x1000);                                         // EvtQueryTolerateQueryErrors
+    CHECK(q != NULL && close(q));
+    LPCWSTR paths[] = { L"Event/System/TimeCreated/@SystemTime" };
+    HANDLE c = context(1, paths, 0);
+    HANDLE sys = context(0, NULL, 1);
+    CHECK(c && sys && !context(0, NULL, 0) && !context(1, paths, 1));
+    char buf[64];
+    DWORD used = 9, count = 9;
+    SetLastError(0);
+    CHECK(!render(c, (HANDLE)(ULONG_PTR)0x1234, 0, sizeof buf, buf, &used, &count) && GetLastError() == ERROR_INVALID_HANDLE);
+    CHECK(close(c) && close(sys));
+}
+
+// ---- interrupt time -------------------------------------------------------------------------------------------------------
+static void test_interrupt_time(void) {
+    HMODULE set = LoadLibraryA("api-ms-win-core-realtime-l1-1-1.dll");
+    void (WINAPI *unbiased_precise)(PULONGLONG) = (void (WINAPI *)(PULONGLONG))GetProcAddress(set, "QueryUnbiasedInterruptTimePrecise");
+    void (WINAPI *precise)(PULONGLONG) = (void (WINAPI *)(PULONGLONG))GetProcAddress(set, "QueryInterruptTimePrecise");
+    void (WINAPI *coarse)(PULONGLONG) = (void (WINAPI *)(PULONGLONG))GetProcAddress(set, "QueryInterruptTime");
+    BOOL (WINAPI *unbiased)(PULONGLONG) = (BOOL (WINAPI *)(PULONGLONG))GetProcAddress(LoadLibraryA("kernel32.dll"), "QueryUnbiasedInterruptTime");
+    CHECK(unbiased_precise && precise && coarse && unbiased);
+    if (!unbiased_precise || !precise || !coarse || !unbiased) return;
+    ULONGLONG u0, u1, i0, i1, c, ub;
+    LARGE_INTEGER qpc0, qpc1, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&qpc0);
+    unbiased_precise(&u0);
+    precise(&i0);
+    QueryPerformanceCounter(&qpc1);
+    Sleep(30);
+    unbiased_precise(&u1);
+    precise(&i1);
+    coarse(&c);
+    CHECK(unbiased(&ub) && ub >= u1);
+    CHECK(i0 >= u0 && i1 >= u1);                                       // interrupt time also counts time asleep
+    CHECK(u1 - u0 >= 290000 && u1 - u0 < 50000000);                    // 30 ms in 100 ns units (generous above)
+    CHECK(i1 - i0 >= 290000 && c >= i1);
+    // the same clock as QueryPerformanceCounter: the counter in 100 ns units, within a millisecond
+    ULONGLONG q = (ULONGLONG)((qpc0.QuadPart / 2 + qpc1.QuadPart / 2) / (freq.QuadPart / 10000000));
+    CHECK(q > u0 ? q - u0 < 10000 : u0 - q < 10000);
+    CHECK(!unbiased(NULL) && GetLastError() == ERROR_INVALID_PARAMETER);
+}
+
+// ---- power information ----------------------------------------------------------------------------------------------------
+typedef struct { ULONG Number, MaxMhz, CurrentMhz, MhzLimit, MaxIdleState, CurrentIdleState; } PROCESSOR_POWER;
+static void test_power(void) {
+    HMODULE base = LoadLibraryA("api-ms-win-power-base-l1-1-0.dll"), setting = LoadLibraryA("api-ms-win-power-setting-l1-1-0.dll");
+    LONG (WINAPI *info)(int, void *, ULONG, void *, ULONG) = (LONG (WINAPI *)(int, void *, ULONG, void *, ULONG))GetProcAddress(base, "CallNtPowerInformation");
+    int (WINAPI *role)(ULONG) = (int (WINAPI *)(ULONG))GetProcAddress(base, "PowerDeterminePlatformRoleEx");
+    DWORD (WINAPI *active)(HKEY, GUID **) = (DWORD (WINAPI *)(HKEY, GUID **))GetProcAddress(setting, "PowerGetActiveScheme");
+    DWORD (WINAPI *read_ac)(HKEY, const GUID *, const GUID *, const GUID *, PULONG, LPBYTE, LPDWORD) =
+        (DWORD (WINAPI *)(HKEY, const GUID *, const GUID *, const GUID *, PULONG, LPBYTE, LPDWORD))GetProcAddress(setting, "PowerReadACValue");
+    CHECK(info && role && active && read_ac);
+    CHECK(GetProcAddress(LoadLibraryA("powrprof.dll"), "CallNtPowerInformation") == (FARPROC)info);
+    if (!info || !role || !active || !read_ac) return;
+    // the same machine GetSystemPowerStatus describes: AC power, no battery
+    SYSTEM_POWER_STATUS ps;
+    CHECK(GetSystemPowerStatus(&ps) && ps.ACLineStatus == 1 && (ps.BatteryFlag & 128));
+    SYSTEM_BATTERY_STATE bs;
+    memset(&bs, 0x55, sizeof bs);
+    CHECK(sizeof bs == 32 && info(SystemBatteryState, NULL, 0, &bs, sizeof bs) == 0);
+    CHECK(bs.AcOnLine && !bs.BatteryPresent && !bs.Charging && !bs.Discharging && bs.MaxCapacity == 0);
+    CHECK(info(SystemBatteryState, NULL, 0, &bs, 16) == (LONG)0xC0000023);   // STATUS_BUFFER_TOO_SMALL
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    PROCESSOR_POWER cpus[256];
+    CHECK(si.dwNumberOfProcessors <= 256 && info(ProcessorInformation, NULL, 0, cpus, si.dwNumberOfProcessors * sizeof *cpus) == 0);
+    CHECK(cpus[0].Number == 0 && cpus[0].MaxMhz > 0 && cpus[0].CurrentMhz <= cpus[0].MaxMhz);
+    CHECK(cpus[si.dwNumberOfProcessors - 1].Number == si.dwNumberOfProcessors - 1);
+    CHECK(info(ProcessorInformation, NULL, 0, cpus, (si.dwNumberOfProcessors - 1) * sizeof *cpus) == (LONG)0xC0000023);
+    CHECK(info(SystemPowerCapabilities, NULL, 0, cpus, sizeof cpus) != 0);         // not provided
+    CHECK(role(POWER_PLATFORM_ROLE_V2) == PlatformRoleDesktop && role(99) == PlatformRoleUnspecified);
+    GUID *scheme = NULL;
+    static const GUID balanced = { 0x381b4222, 0xf694, 0x41f0, { 0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e } };
+    CHECK(active(NULL, &scheme) == 0 && scheme && !memcmp(scheme, &balanced, sizeof balanced));
+    ULONG type = 0; BYTE value[8]; DWORD size = sizeof value;
+    CHECK(read_ac(NULL, scheme, &balanced, &balanced, &type, value, &size) == ERROR_FILE_NOT_FOUND);
+    if (scheme) CHECK(LocalFree(scheme) == NULL);
+}
+
+// ---- GDI font heights: LOGFONT's height as Windows maps it, reported back by GetTextMetrics -------------------------------
+static void test_font_heights(void) {
+    HDC dc = CreateCompatibleDC(NULL);
+    CHECK(dc != NULL);
+    static const WCHAR *faces[] = { L"Arial", L"Segoe UI", L"" };
+    for (int f = 0; f < 3; f++)
+        for (int h = 8; h <= 40; h += 7) {
+            LOGFONTW lf = { 0 };
+            wcscpy(lf.lfFaceName, faces[f]);
+            lf.lfHeight = -h;                                        // the character (em) height
+            HFONT font = CreateFontIndirectW(&lf);
+            HGDIOBJ old = SelectObject(dc, font);
+            TEXTMETRICW tm;
+            CHECK(GetTextMetricsW(dc, &tm));
+            CHECK(tm.tmHeight - tm.tmInternalLeading == h && tm.tmAscent + tm.tmDescent == tm.tmHeight);
+            LOGFONTW back;
+            CHECK(GetObjectW(font, sizeof back, &back) == sizeof back && back.lfHeight == -h);
+            SelectObject(dc, old);
+            DeleteObject(font);
+            lf.lfHeight = h;                                         // the cell height
+            font = CreateFontIndirectW(&lf);
+            old = SelectObject(dc, font);
+            CHECK(GetTextMetricsW(dc, &tm) && tm.tmHeight == h && tm.tmInternalLeading >= 0 && tm.tmInternalLeading < h);
+            SelectObject(dc, old);
+            DeleteObject(font);
+        }
+    DeleteDC(dc);
+}
+
+// ---- SystemParametersInfo's UI fonts ------------------------------------------------------------------------------------------
+static void test_ui_fonts(void) {
+    NONCLIENTMETRICSW ncm;
+    memset(&ncm, 0x55, sizeof ncm);
+    ncm.cbSize = sizeof ncm;
+    CHECK(sizeof ncm == 504 && SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0));
+    CHECK(ncm.cbSize == sizeof ncm && ncm.lfMessageFont.lfHeight == -12 && ncm.lfMessageFont.lfWeight == FW_NORMAL);
+    CHECK(!wcscmp(ncm.lfMessageFont.lfFaceName, L"Arial") && !wcscmp(ncm.lfCaptionFont.lfFaceName, L"Arial"));
+    CHECK(!wcscmp(ncm.lfMenuFont.lfFaceName, L"Arial") && !wcscmp(ncm.lfStatusFont.lfFaceName, L"Arial") && !wcscmp(ncm.lfSmCaptionFont.lfFaceName, L"Arial"));
+    CHECK(ncm.iScrollWidth == GetSystemMetrics(SM_CXVSCROLL) && ncm.iCaptionHeight == GetSystemMetrics(SM_CYSIZE));
+    CHECK(ncm.iPaddedBorderWidth == GetSystemMetrics(SM_CXPADDEDBORDER) && ncm.iMenuHeight == GetSystemMetrics(SM_CYMENUSIZE));
+    ncm.cbSize = sizeof ncm - 4;                                       // without iPaddedBorderWidth (before Vista)
+    ncm.iPaddedBorderWidth = 77;
+    CHECK(SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, &ncm, 0) && ncm.iPaddedBorderWidth == 77 && ncm.lfMessageFont.lfHeight == -12);
+    ncm.cbSize = 100;
+    SetLastError(0);
+    CHECK(!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, 100, &ncm, 0) && GetLastError() == ERROR_INVALID_PARAMETER);
+    NONCLIENTMETRICSA ncma = { sizeof ncma };
+    CHECK(sizeof ncma == 344 && SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof ncma, &ncma, 0));
+    CHECK(!strcmp(ncma.lfMessageFont.lfFaceName, "Arial") && ncma.lfMessageFont.lfHeight == -12);
+    LOGFONTW icon;
+    CHECK(SystemParametersInfoW(SPI_GETICONTITLELOGFONT, sizeof icon, &icon, 0) && !wcscmp(icon.lfFaceName, L"Arial"));
+    BOOL (WINAPI *for_dpi)(UINT, UINT, PVOID, UINT, UINT) = (BOOL (WINAPI *)(UINT, UINT, PVOID, UINT, UINT))GetProcAddress(GetModuleHandleA("user32.dll"), "SystemParametersInfoForDpi");
+    CHECK(for_dpi != NULL);
+    if (for_dpi) {
+        ncm.cbSize = sizeof ncm;
+        CHECK(for_dpi(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0, 192) && ncm.lfMessageFont.lfHeight == -24);
+        CHECK(for_dpi(SPI_GETICONTITLELOGFONT, sizeof icon, &icon, 0, 144) && icon.lfHeight == -18);
+        SetLastError(0);
+        CHECK(!for_dpi(SPI_GETWORKAREA, 0, &icon, 0, 96) && GetLastError() == ERROR_INVALID_PARAMETER);   // only the three
+    }
+    // the message font is a usable GDI font of 12 pixels' character height
+    HDC dc = CreateCompatibleDC(NULL);
+    HFONT f = CreateFontIndirectW(&ncm.lfMessageFont);
+    ncm.cbSize = sizeof ncm;
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+    DeleteObject(f);
+    f = CreateFontIndirectW(&ncm.lfMessageFont);
+    HGDIOBJ old = SelectObject(dc, f);
+    TEXTMETRICW tm;
+    CHECK(GetTextMetricsW(dc, &tm) && tm.tmHeight - tm.tmInternalLeading == 12);
+    SelectObject(dc, old);
+    DeleteObject(f);
+    DeleteDC(dc);
+}
+
+// ---- dwmapi ----------------------------------------------------------------------------------------------------------------
+typedef struct { UINT32 num, den; } RATIO;
+static void test_dwmapi(void) {
+    HMODULE m = LoadLibraryA("dwmapi.dll");
+    CHECK(m != NULL);
+    if (!m) return;
+    HRESULT (WINAPI *enabled)(BOOL *) = (HRESULT (WINAPI *)(BOOL *))GetProcAddress(m, "DwmIsCompositionEnabled");
+    HRESULT (WINAPI *extend)(HWND, const void *) = (HRESULT (WINAPI *)(HWND, const void *))GetProcAddress(m, "DwmExtendFrameIntoClientArea");
+    BOOL (WINAPI *def)(HWND, UINT, WPARAM, LPARAM, LRESULT *) = (BOOL (WINAPI *)(HWND, UINT, WPARAM, LPARAM, LRESULT *))GetProcAddress(m, "DwmDefWindowProc");
+    HRESULT (WINAPI *get)(HWND, DWORD, void *, DWORD) = (HRESULT (WINAPI *)(HWND, DWORD, void *, DWORD))GetProcAddress(m, "DwmGetWindowAttribute");
+    HRESULT (WINAPI *set)(HWND, DWORD, const void *, DWORD) = (HRESULT (WINAPI *)(HWND, DWORD, const void *, DWORD))GetProcAddress(m, "DwmSetWindowAttribute");
+    HRESULT (WINAPI *timing)(HWND, void *) = (HRESULT (WINAPI *)(HWND, void *))GetProcAddress(m, "DwmGetCompositionTimingInfo");
+    CHECK(enabled && extend && def && get && set && timing);
+    if (!enabled || !extend || !def || !get || !set || !timing) return;
+    BOOL on = FALSE;
+    CHECK(enabled(&on) == S_OK && on);
+    WNDCLASSW wc = { 0 };
+    wc.lpfnWndProc = DefWindowProcW; wc.hInstance = GetModuleHandleW(NULL); wc.lpszClassName = L"VxrtDwmTest";
+    RegisterClassW(&wc);
+    HWND w = CreateWindowExW(0, L"VxrtDwmTest", L"dwm test", WS_OVERLAPPEDWINDOW, 10, 20, 300, 200, NULL, NULL, wc.hInstance, NULL);
+    CHECK(w != NULL);
+    int margins[4] = { -1, -1, -1, -1 };
+    CHECK(extend(w, margins) == S_OK && extend((HWND)(ULONG_PTR)0x7ff0, margins) == (HRESULT)0x80070006);
+    LRESULT r = 99;
+    CHECK(!def(w, WM_NCHITTEST, 0, 0, &r) && r == 0);
+    RECT frame, wr;
+    CHECK(get(w, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, &frame, sizeof frame) == S_OK && GetWindowRect(w, &wr));
+    CHECK(!memcmp(&frame, &wr, sizeof wr));
+    DWORD cloaked = 7;
+    CHECK(get(w, 14 /* DWMWA_CLOAKED */, &cloaked, sizeof cloaked) == S_OK && cloaked == 0);
+    CHECK(get(w, 14, &cloaked, 2) == E_INVALIDARG && get(w, 2 /* set-only */, &cloaked, 4) == E_INVALIDARG);
+    BOOL dark = TRUE;
+    CHECK(set(w, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark) == S_OK);
+    DWORD corner = 2;
+    CHECK(set(w, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE, Windows 11 */, &corner, sizeof corner) == E_INVALIDARG);
+    DestroyWindow(w);
+    unsigned char t[292];
+    memset(t, 0, sizeof t);
+    *(UINT32 *)t = sizeof t;
+    CHECK(timing(NULL, t) == S_OK);
+    RATIO rate; ULONGLONG period, vblank, count;
+    memcpy(&rate, t + 4, 8); memcpy(&period, t + 12, 8); memcpy(&vblank, t + 28, 8); memcpy(&count, t + 36, 8);
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&freq);
+    double hz = (double)rate.num / rate.den;
+    CHECK(rate.den && hz >= 24 && hz <= 500);
+    CHECK(period > 0 && fabs((double)period / freq.QuadPart - 1 / hz) < 1e-4);   // one refresh, on the QPC clock
+    CHECK(vblank <= (ULONGLONG)now.QuadPart && (ULONGLONG)now.QuadPart - vblank < 2 * period + freq.QuadPart / 10 && count > 0);
+    *(UINT32 *)t = 100;
+    CHECK(timing(NULL, t) == E_INVALIDARG);
+}
+
+// ---- smaller user32 functions -----------------------------------------------------------------------------------------------
+static void test_user32_more(void) {
+    WNDCLASSW wc = { 0 };
+    wc.lpfnWndProc = DefWindowProcW; wc.hInstance = GetModuleHandleW(NULL); wc.lpszClassName = L"VxrtMoreTest";
+    wc.style = CS_HREDRAW | CS_VREDRAW; wc.cbWndExtra = 16; wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    ATOM atom = RegisterClassW(&wc);
+    CHECK(atom != 0);
+    HWND top = CreateWindowExW(0, L"VxrtMoreTest", L"top", WS_OVERLAPPEDWINDOW, 0, 0, 300, 200, NULL, NULL, wc.hInstance, NULL);
+    HWND child = CreateWindowExW(0, L"VxrtMoreTest", L"child", WS_CHILD, 0, 0, 50, 50, top, NULL, wc.hInstance, NULL);
+    HWND grandchild = CreateWindowExW(0, L"VxrtMoreTest", L"grandchild", WS_CHILD, 0, 0, 10, 10, child, NULL, wc.hInstance, NULL);
+    HWND owned = CreateWindowExW(0, L"VxrtMoreTest", L"owned", WS_POPUP, 0, 0, 10, 10, top, NULL, wc.hInstance, NULL);
+    CHECK(top && child && grandchild && owned);
+    CHECK(IsChild(top, child) && IsChild(top, grandchild) && IsChild(child, grandchild));
+    CHECK(!IsChild(child, top) && !IsChild(top, top) && !IsChild(top, owned));   // an owned pop-up is no child
+    WCHAR name[64];
+    CHECK(GetClassNameW(child, name, 64) == 12 && !wcscmp(name, L"VxrtMoreTest"));
+    CHECK(GetClassNameW(child, name, 5) == 4 && !wcscmp(name, L"Vxrt"));          // cut to the buffer
+    CHECK(GetClassNameW((HWND)(ULONG_PTR)0x7ff0, name, 64) == 0);
+    CHECK(GetClassLongPtrW(top, GCW_ATOM) == atom && GetClassLongPtrW(top, GCL_STYLE) == (CS_HREDRAW | CS_VREDRAW));
+    CHECK(GetClassLongPtrW(top, GCL_CBWNDEXTRA) == 16 && GetClassLongPtrW(top, GCLP_WNDPROC) == (ULONG_PTR)DefWindowProcW);
+    CHECK(GetClassLongPtrW(top, GCLP_HBRBACKGROUND) == (ULONG_PTR)(COLOR_WINDOW + 1) && GetClassLongPtrW(top, GCLP_HMODULE) == (ULONG_PTR)wc.hInstance);
+    SetLastError(0);
+    CHECK(GetClassLongPtrW(top, 8) == 0 && GetLastError() == ERROR_INVALID_INDEX);
+    HRGN rgn = CreateRectRgn(0, 0, 1, 1);
+    RECT box;
+    CHECK(GetWindowRgn(top, rgn) == ERROR && GetWindowRgnBox(top, &box) == ERROR);   // windows are their rectangles here
+    DeleteObject(rgn);
+
+    HDWP dwp = BeginDeferWindowPos(2);
+    CHECK(dwp != NULL);
+    dwp = DeferWindowPos(dwp, child, NULL, 5, 6, 40, 30, SWP_NOZORDER | SWP_NOACTIVATE);
+    CHECK(dwp != NULL);
+    dwp = DeferWindowPos(dwp, owned, NULL, 0, 0, 77, 33, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    RECT before;
+    GetWindowRect(owned, &before);
+    CHECK(dwp && before.right - before.left == 10);                    // nothing moves before EndDeferWindowPos
+    CHECK(EndDeferWindowPos(dwp));
+    RECT cr, orr;
+    GetClientRect(child, &cr); GetWindowRect(owned, &orr);
+    CHECK(cr.right == 40 && cr.bottom == 30 && orr.right - orr.left == 77 && orr.bottom - orr.top == 33);
+    dwp = BeginDeferWindowPos(1);
+    CHECK(DeferWindowPos(dwp, (HWND)(ULONG_PTR)0x7ff0, NULL, 0, 0, 1, 1, 0) == NULL && GetLastError() == ERROR_INVALID_WINDOW_HANDLE);
+    NotifyWinEvent(EVENT_OBJECT_FOCUS, top, OBJID_CLIENT, CHILDID_SELF);
+    DestroyWindow(owned); DestroyWindow(grandchild); DestroyWindow(child); DestroyWindow(top);
+
+    RECT r = { 10, 20, 30, 40 }, s = { 10, 20, 30, 40 };
+    CHECK(EqualRect(&r, &s) && InflateRect(&r, 2, -3) && r.left == 8 && r.top == 23 && r.right == 32 && r.bottom == 37 && !EqualRect(&r, &s));
+    WCHAR text[] = L"made-up \u00e9t\u00e9 x";
+    CHECK(CharUpperW(text) == text && !wcscmp(text, L"MADE-UP \u00c9T\u00c9 X"));
+    CHECK((WCHAR)(ULONG_PTR)CharUpperW((LPWSTR)(ULONG_PTR)L'q') == L'Q');
+    const WCHAR pair[] = { 'a', 0xd83d, 0xde00, 'b', 0 };
+    CHECK(CharNextW(pair) == pair + 1 && CharNextW(pair + 1) == pair + 3 && CharNextW(pair + 4) == pair + 4);
+    LASTINPUTINFO li = { sizeof li };
+    CHECK(GetLastInputInfo(&li) && li.dwTime <= GetTickCount());
+    li.cbSize = 4;
+    CHECK(!GetLastInputInfo(&li));
+}
+
 int main(void) {
     test_isos();
+    test_paths();
     test_downlevel();
     test_pointer();
     test_regnotify();
     test_section();
+    test_wevtapi();
+    test_interrupt_time();
+    test_power();
+    test_font_heights();
+    test_ui_fonts();
+    test_dwmapi();
+    test_user32_more();
     if (failures) { printf("webhelper_apis: %d checks failed\n", failures); return 1; }
     printf("webhelper_apis: all checks passed\n");
     return 0;
