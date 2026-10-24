@@ -61,8 +61,17 @@ void vx_register_module(const char *dll, const vx_export *exports, size_t count)
     else vx_log("too many export tables: %s is left out", dll);
 }
 
-// API sets resolve to the DLL that implements them.
+// API sets resolve to the DLL that implements them. The "downlevel" sets (api-ms-win-downlevel-<dll>-l1-1-0, which
+// programs built for Windows 7 and later link) are named after the DLL they stand for.
 static const char *canonical_dll(const char *dll) {
+    if (!strncasecmp(dll, "api-ms-win-downlevel-", 21)) {
+        static const char *const downlevel[] = { "advapi32.dll", "kernel32.dll", "normaliz.dll", "ole32.dll", "oleaut32.dll",
+                                                 "shell32.dll", "shlwapi.dll", "user32.dll", "version.dll" };
+        for (size_t i = 0; i < sizeof downlevel / sizeof *downlevel; i++) {
+            size_t n = strlen(downlevel[i]) - 4;
+            if (!strncasecmp(dll + 21, downlevel[i], n) && dll[21 + n] == '-') return downlevel[i];
+        }
+    }
     if (!strncasecmp(dll, "api-ms-win-crt-", 15)) return "ucrtbase.dll";
     if (!strncasecmp(dll, "api-ms-win-core-", 16)) return "kernel32.dll";
     if (!strncasecmp(dll, "api-ms-win-security-", 20) || !strncasecmp(dll, "api-ms-win-eventing-", 20)) return "advapi32.dll";
@@ -1213,6 +1222,10 @@ int main(int argc, char **argv, char **envp) {
     vx_dotnet_init();
     vx_sysdlls_init();
     vx_dbghelp_init();
+    vx_osinfo_init();
+    vx_pointer_init();
+    vx_regnotify_init();                         // (after sync.c's DuplicateHandle and CloseHandle)
+    vx_section_init();
     vx_extras_init();                            // (last: the tables above come first)
     // VXRT_CONTROL_FOR=<program.exe>: only that program takes the socket; others (a launcher's watchdog) pass it on
     const char *control_for = getenv("VXRT_CONTROL_FOR");

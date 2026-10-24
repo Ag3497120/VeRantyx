@@ -221,6 +221,10 @@ void vx_dwrite_init(void);             // DirectWrite on CoreText (dwrite.m)
 void vx_com_init(void);                // ole32, oleaut32 (com.c)
 void vx_vcruntime_init(void);          // vcruntime140, MSVC C++ exceptions (vcruntime.c; after seh and ucrt)
 void vx_sysdlls_init(void);            // userenv, winspool, dhcpcsvc, secur32 names/LSA, oleaut32 ordinals (sysdlls.c; after COM)
+void vx_osinfo_init(void);             // shlwapi's IsOS (osinfo.c)
+void vx_pointer_init(void);            // touch and pointer input: a Mac with no touch screen or pen (pointer.c)
+void vx_regnotify_init(void);          // RegNotifyChangeKeyValue (regnotify.c)
+void vx_section_init(void);            // NtQuerySection (section.c)
 void vx_dbghelp_init(void);            // dbghelp: StackWalk64, symbols from export tables (dbghelp.c; after seh)
 
 // Text (text.c). Counts are in code units; the converters return the length needed and write at most cap units.

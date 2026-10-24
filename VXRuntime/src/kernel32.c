@@ -194,19 +194,27 @@ static WINAPI void GetLocalTime(uint16_t *st) { system_time(st, 1); }
 static WINAPI void GetSystemTime(uint16_t *st) { system_time(st, 0); }
 
 // The Windows version programs see: Windows 10 22H2 (10.0.19045). GetVersion packs major, minor and build.
+// OSVERSIONINFOEX adds the service pack (none), the suite mask (VER_SUITE_SINGLEUSERTS: one interactive session, as
+// on every workstation not in application-server mode) and the product type (VER_NT_WORKSTATION, as
+// VerifyVersionInfo below and shlwapi's IsOS in osinfo.c answer).
 typedef struct { DWORD size, major, minor, build, platform; char csd[128]; } OSVERSIONINFOA;
 typedef struct { DWORD size, major, minor, build, platform; WCHAR csd[128]; } OSVERSIONINFOW;
 static WINAPI DWORD GetVersion(void) { return 10u | (0u << 8) | (19045u << 16); }
+static void version_ex(uint8_t *ex) {                               // wServicePackMajor/Minor, wSuiteMask, wProductType, wReserved
+    memset(ex, 0, 8);
+    ex[4] = 0x00; ex[5] = 0x01;                                     // wSuiteMask 0x0100 (little-endian)
+    ex[6] = 1;
+}
 static WINAPI BOOL GetVersionExA(OSVERSIONINFOA *v) {
     v->major = 10; v->minor = 0; v->build = 19045; v->platform = 2;   // VER_PLATFORM_WIN32_NT
     v->csd[0] = 0;
-    if (v->size >= sizeof *v + 8) memset((char *)v + sizeof *v, 0, 8);       // OSVERSIONINFOEX: service pack, suite, type
+    if (v->size >= sizeof *v + 8) version_ex((uint8_t *)v + sizeof *v);
     return 1;
 }
 static WINAPI BOOL GetVersionExW(OSVERSIONINFOW *v) {
     v->major = 10; v->minor = 0; v->build = 19045; v->platform = 2;
     v->csd[0] = 0;
-    if (v->size >= sizeof *v + 8) memset((char *)v + sizeof *v, 0, 8);
+    if (v->size >= sizeof *v + 8) version_ex((uint8_t *)v + sizeof *v);
     return 1;
 }
 

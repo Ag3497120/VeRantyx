@@ -23,7 +23,7 @@ enum { REG_SZ = 1, REG_EXPAND_SZ = 2, REG_BINARY = 3, REG_DWORD = 4, REG_MULTI_S
 static int is_string(DWORD type) { return type == REG_SZ || type == REG_EXPAND_SZ || type == REG_MULTI_SZ; }
 
 typedef struct reg_value { char *name; DWORD type, size; uint8_t *data; struct reg_value *next; } reg_value;
-typedef struct reg_key { char *name; struct reg_key *parent, *children, *next; reg_value *values; } reg_key;
+typedef struct reg_key { char *name; struct reg_key *parent, *children, *next; reg_value *values; int deleted; } reg_key;
 
 static const char *g_root_names[] = { "HKEY_CLASSES_ROOT", "HKEY_CURRENT_USER", "HKEY_LOCAL_MACHINE", "HKEY_USERS",
                                       "HKEY_PERFORMANCE_DATA", "HKEY_CURRENT_CONFIG" };
@@ -48,6 +48,27 @@ static reg_key *key_of(void *hkey) {
 }
 static void *new_hkey(reg_key *k) { reg_handle *h = malloc(sizeof *h); h->magic = REG_MAGIC; h->key = k; return h; }
 
+// Change notifications (RegNotifyChangeKeyValue, src/regnotify.c), told with g_reg_lock held: a key's subkeys
+// (REG_NOTIFY_CHANGE_NAME) or values (_LAST_SET) changed, a key was deleted, a key handle is being closed.
+void vx_regnotify_changed(const void *key, DWORD what);
+void vx_regnotify_closed(const void *hkey);
+enum { CHANGED_NAME = 1, CHANGED_VALUES = 4, CHANGED_DELETED = 0x80000000u };
+static void load(void);
+// For regnotify.c: the key a handle stands for (loading the registry first), whether it was deleted; and whether a
+// key is another or below it (g_reg_lock held, as it is while vx_regnotify_changed runs).
+const void *vx_reg_node(void *hkey, int *deleted) {
+    pthread_mutex_lock(&g_reg_lock);
+    load();
+    reg_key *k = key_of(hkey);
+    if (k && deleted) *deleted = k->deleted;
+    pthread_mutex_unlock(&g_reg_lock);
+    return k;
+}
+int vx_reg_within(const void *node, const void *ancestor) {
+    for (const reg_key *k = node; k; k = k->parent) if (k == ancestor) return 1;
+    return 0;
+}
+
 static reg_key *child(reg_key *k, const char *name, size_t n, int create) {
     reg_key **link = &k->children;
     for (; *link; link = &(*link)->next) {
@@ -61,6 +82,7 @@ static reg_key *child(reg_key *k, const char *name, size_t n, int create) {
     c->parent = k;
     c->next = *link;
     *link = c;
+    vx_regnotify_changed(k, CHANGED_NAME);
     return c;
 }
 static reg_key *walk(reg_key *k, const char *path, int create) {
@@ -252,6 +274,9 @@ static WINAPI LONG RegCloseKey(void *hkey) {
     uint32_t low = (uint32_t)(uint64_t)hkey;
     if (low >= 0x80000000u && low < 0x80000000u + NROOTS) return ERROR_SUCCESS;
     if (!key_of(hkey)) return ERROR_INVALID_HANDLE;
+    pthread_mutex_lock(&g_reg_lock);
+    vx_regnotify_closed(hkey);                                     // (its pending notifications are signalled)
+    pthread_mutex_unlock(&g_reg_lock);
     ((reg_handle *)hkey)->magic = 0;
     free(hkey);
     return ERROR_SUCCESS;
@@ -268,6 +293,9 @@ static LONG delete_key(void *hkey, const char *sub) {
         reg_key **link = &k->parent->children;
         while (*link != k) link = &(*link)->next;
         *link = k->next;
+        k->deleted = 1;
+        vx_regnotify_changed(k, CHANGED_DELETED);
+        vx_regnotify_changed(k->parent, CHANGED_NAME);
         save();
     }
     pthread_mutex_unlock(&g_reg_lock);
@@ -292,6 +320,7 @@ static LONG set(void *hkey, const char *name, DWORD type, const void *data, DWOR
         } else {
             set_value(k, name, type, data, size);
         }
+        vx_regnotify_changed(k, CHANGED_VALUES);
         save();
     }
     pthread_mutex_unlock(&g_reg_lock);
@@ -373,7 +402,7 @@ static LONG delete_value(void *hkey, const char *name) {
     load();
     reg_key *k = key_of(hkey);
     reg_value **slot = k ? find_value(k, name) : NULL, *v = slot ? *slot : NULL;
-    if (v) { *slot = v->next; free(v->name); free(v->data); free(v); save(); }
+    if (v) { *slot = v->next; free(v->name); free(v->data); free(v); vx_regnotify_changed(k, CHANGED_VALUES); save(); }
     pthread_mutex_unlock(&g_reg_lock);
     return !k ? ERROR_INVALID_HANDLE : !v ? ERROR_FILE_NOT_FOUND : ERROR_SUCCESS;
 }
@@ -506,6 +535,7 @@ static WINAPI DWORD NtDeleteKey(void *hkey) {
     DWORD st = STATUS_INVALID_HANDLE;
     if (k && k->parent) {                                          // unlinked, as delete_key does
         for (reg_key **c = &k->parent->children; *c; c = &(*c)->next) if (*c == k) { *c = k->next; break; }
+        if (!k->deleted) { k->deleted = 1; vx_regnotify_changed(k, CHANGED_DELETED); vx_regnotify_changed(k->parent, CHANGED_NAME); }
         save();
         st = STATUS_SUCCESS;
     }
