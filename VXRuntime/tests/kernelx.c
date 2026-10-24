@@ -379,8 +379,9 @@ static void test_ntdll(void) {
     group("ntdll", before);
 }
 
-// Last: SetDefaultDllDirectories changes how this process finds DLLs from then on. kx_a/b/c.dll are copies of the
-// test plugin (build/vxplugin.dll) in a directory of their own, which only AddDllDirectory puts in the search.
+// Last: SetDefaultDllDirectories changes how this process finds DLLs from then on. kx_a/b/c/d.dll are copies of the
+// test plugin (build/vxplugin.dll, beside this program) in a directory of their own, which only AddDllDirectory or
+// the current directory puts in the search.
 static void test_dll_directories(void) {
     int before = failures;
     GET(kernel32, BOOL (WINAPI *)(DWORD), SetDefaultDllDirectories);
@@ -391,10 +392,31 @@ static void test_dll_directories(void) {
     strcpy(plugin, exe); strcpy(strrchr(plugin, '\\') + 1, "vxplugin.dll");
     snprintf(dir, sizeof dir, "%skx_dlls", g_temp);
     CreateDirectoryA(dir, NULL);
-    const char *names[] = { "kx_a.dll", "kx_b.dll", "kx_c.dll" };
-    for (int i = 0; i < 3; i++) { snprintf(copy, sizeof copy, "%s\\%s", dir, names[i]); CHECK(CopyFileA(plugin, copy, FALSE)); }
+    const char *names[] = { "kx_a.dll", "kx_b.dll", "kx_c.dll", "kx_d.dll" };
+    for (int i = 0; i < 4; i++) { snprintf(copy, sizeof copy, "%s\\%s", dir, names[i]); CHECK(CopyFileA(plugin, copy, FALSE)); }
     WCHAR wdir[MAX_PATH];
     MultiByteToWideChar(CP_ACP, 0, dir, -1, wdir, MAX_PATH);
+
+    // system32 only (LOAD_LIBRARY_SEARCH_SYSTEM32, or _SYSTEM32_NO_FORWARDER): neither the program's directory (where
+    // vxplugin.dll is) nor the current one (kx_d.dll), which the standard search has
+    GetCurrentDirectoryA(sizeof cwd, cwd);
+    CHECK(SetCurrentDirectoryA(dir));
+    const DWORD system32_only[] = { LOAD_LIBRARY_SEARCH_SYSTEM32, 0x4000 /* LOAD_LIBRARY_SEARCH_SYSTEM32_NO_FORWARDER */ };
+    for (int i = 0; i < 2; i++) {
+        SetLastError(0); CHECK(!LoadLibraryExA("vxplugin.dll", NULL, system32_only[i]) && GetLastError() == ERROR_MOD_NOT_FOUND);
+        SetLastError(0); CHECK(!LoadLibraryExA("kx_d.dll", NULL, system32_only[i]) && GetLastError() == ERROR_MOD_NOT_FOUND);
+        CHECK(LoadLibraryExA("kernel32.dll", NULL, system32_only[i]) != NULL);    // (the system's own DLLs are there)
+    }
+    CHECK(LoadLibraryExA("kx_d.dll", NULL, 0) != NULL);                          // the standard search looks here
+    SetCurrentDirectoryA(cwd);
+    // LOAD_WITH_ALTERED_SEARCH_PATH goes with no LOAD_LIBRARY_SEARCH_* flag; LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR needs a full path
+    snprintf(copy, sizeof copy, "%s\\kx_d.dll", dir);
+    SetLastError(0); CHECK(!LoadLibraryExA(copy, NULL, LOAD_WITH_ALTERED_SEARCH_PATH | LOAD_LIBRARY_SEARCH_SYSTEM32) && GetLastError() == ERROR_INVALID_PARAMETER);
+    SetLastError(0); CHECK(!LoadLibraryExA(copy, NULL, LOAD_WITH_ALTERED_SEARCH_PATH | 0x4000) && GetLastError() == ERROR_INVALID_PARAMETER);
+    SetLastError(0); CHECK(!LoadLibraryExA("kx_d.dll", NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR) && GetLastError() == ERROR_INVALID_PARAMETER);
+    SetLastError(0); CHECK(!LoadLibraryExA("kx_dlls\\kx_d.dll", NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR) && GetLastError() == ERROR_INVALID_PARAMETER);
+    CHECK(LoadLibraryExA(copy, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) != NULL);
+    CHECK(LoadLibraryExA(copy, NULL, LOAD_WITH_ALTERED_SEARCH_PATH) != NULL);
 
     SetLastError(0); CHECK(!SetDefaultDllDirectories(0) && GetLastError() == ERROR_INVALID_PARAMETER);
     SetLastError(0); CHECK(!SetDefaultDllDirectories(0x8) && GetLastError() == ERROR_INVALID_PARAMETER);
@@ -410,7 +432,6 @@ static void test_dll_directories(void) {
     CHECK(LoadLibraryA("kernel32.dll") != NULL);                                 // (the system's DLLs as before)
     CHECK(RemoveDllDirectory(cookie));
     SetLastError(0); CHECK(!RemoveDllDirectory(cookie) && GetLastError() == ERROR_INVALID_PARAMETER);
-    GetCurrentDirectoryA(sizeof cwd, cwd);
     CHECK(SetCurrentDirectoryA(dir));
     CHECK(!LoadLibraryA("kx_c.dll"));                                            // nor the current directory, with search flags
     SetCurrentDirectoryA(cwd);

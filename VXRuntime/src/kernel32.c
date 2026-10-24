@@ -83,6 +83,7 @@ static WINAPI void ExitProcess(DWORD code) {
         vx_log("ExitProcess(%u) from %s+%#llx", code, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)VX_RETURN_ADDRESS() - m->base) : 0ull);
     }
     vx_profile_finish();
+    vx_jobs_process_exit();
     fflush(stdout); fflush(stderr); _exit((int)code);
 }
 int vx_process_info(HANDLE h, DWORD *code);

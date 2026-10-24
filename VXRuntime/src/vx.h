@@ -82,6 +82,8 @@ const vx_locale *vx_locale_at(int i);                        // the i-th locale 
 void vx_extras_init(void);                   // extras.c: smaller functions more programs need
 void vx_kernelx_init(void);                  // kernelx.c: kernel32/ntdll the Windows Steam client needs (jobs.c, ntstatus.c)
 void vx_jobs_init(void);
+void vx_jobs_process_exit(void);             // jobs.c: this process ends: its KILL_ON_JOB_CLOSE jobs end their processes
+int vx_jobs_watchdog(void);                  // jobs.c: "vxrt --vxrt-job-watchdog" (main), which does that for any end
 enum { VX_HANDLE_JOB = 0x4a01, VX_HANDLE_VOLUME_SEARCH = 0x5601 };   // (their handle kinds)
 DWORD vx_ntstatus_to_win32(uint32_t status);        // RtlNtStatusToDosError (ntstatus.c)
 uint32_t vx_win32_to_ntstatus(DWORD error);         // the status an error usually comes from

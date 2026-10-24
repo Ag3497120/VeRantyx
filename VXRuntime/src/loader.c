@@ -593,10 +593,23 @@ static vx_image *load_pe(const char *path, int is_main) {
 #define LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR 0x100            // (its dependencies: the DLL's own directory first, too)
 static void *load_library_searching(const char *name, DWORD flags);
 // The call's search flags hold while it loads the DLL and what it imports (LoadLibrary from a DllMain meanwhile: its own).
+// LOAD_LIBRARY_SEARCH_SYSTEM32_NO_FORWARDER (0x4000) searches system32 as LOAD_LIBRARY_SEARCH_SYSTEM32 does (never the
+// standard search). LoadLibraryEx refuses LOAD_WITH_ALTERED_SEARCH_PATH with any LOAD_LIBRARY_SEARCH_* flag, and
+// LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR for a name that is not a fully qualified path (ERROR_INVALID_PARAMETER).
+static int fully_qualified(const char *name) {
+    int sep0 = name[0] == '\\' || name[0] == '/', sep1 = name[0] && (name[1] == '\\' || name[1] == '/');
+    int letter = (name[0] | 0x20) >= 'a' && (name[0] | 0x20) <= 'z';
+    return (sep0 && sep1) || (letter && name[1] == ':' && (name[2] == '\\' || name[2] == '/'));   // (UNC, or drive and root)
+}
 static void *load_library(const char *name, DWORD flags) {
+    if (!name || ((flags & LOAD_WITH_ALTERED_SEARCH_PATH) && (flags & 0x5f00)) ||
+        ((flags & LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR) && !fully_qualified(name))) {
+        vx_set_last_error(87);
+        return NULL;
+    }
     pthread_mutex_lock(&g_loader_lock);
     DWORD saved = g_search_flags;
-    g_search_flags = flags & 0x1f00;
+    g_search_flags = (flags & 0x1f00) | (flags & 0x4000 ? 0x800 : 0);
     void *h = load_library_searching(name, flags);
     g_search_flags = saved;
     pthread_mutex_unlock(&g_loader_lock);
@@ -1137,6 +1150,7 @@ static void make_process_parameters(const char *exe) {
 
 int main(int argc, char **argv, char **envp) {
     if (argc < 2) { fprintf(stderr, "usage: vxrt program.exe [args...]\n"); return 2; }
+    if (argc == 2 && !strcmp(argv[1], "--vxrt-job-watchdog")) return vx_jobs_watchdog();   // (src/jobs.c)
     vx_trace = getenv("VXRT_TRACE") && *getenv("VXRT_TRACE") == '1';
     // Windows programs keep thousands of handles open; macOS gives a process 256 descriptors (Google Earth VR ran
     // out while reading its tours): as many as the system allows.
