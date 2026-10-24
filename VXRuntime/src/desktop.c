@@ -286,7 +286,6 @@ static WINAPI intptr_t GetMessageExtraInfo(void) { return 0; }
 static WINAPI void *GetTopWindow(void *wnd) { (void)wnd; return NULL; }
 static WINAPI BOOL FlashWindow(void *wnd, BOOL invert) { (void)wnd; (void)invert; return 0; }
 static WINAPI BOOL FlashWindowEx(void *info) { (void)info; return 0; }
-static WINAPI BOOL SetLayeredWindowAttributes(void *wnd, DWORD key, uint8_t alpha, DWORD flags) { (void)wnd; (void)key; (void)alpha; (void)flags; return 1; }
 static WINAPI int SetWindowRgn(void *wnd, void *rgn, BOOL redraw) { (void)wnd; (void)rgn; (void)redraw; return 1; }
 static WINAPI DWORD WaitForInputIdle(HANDLE p, DWORD ms) { (void)p; (void)ms; return 0; }
 static WINAPI int ToUnicode(DWORD vk, DWORD scan, const uint8_t *state, WCHAR *out, int cap, DWORD flags) {
@@ -338,7 +337,6 @@ static WINAPI BOOL GetDeviceGammaRamp(void *dc, uint16_t *ramp) {
 static WINAPI BOOL SetDeviceGammaRamp(void *dc, const uint16_t *ramp) { (void)dc; (void)ramp; return 0; }
 static WINAPI int GetPixelFormat(void *dc) { (void)dc; return 0; }
 static WINAPI int CombineRgn(void *dst, void *a, void *b, int mode) { (void)dst; (void)a; (void)b; (void)mode; return 1; }   // NULLREGION
-static WINAPI int GetDIBits(void *dc, void *bm, unsigned start, unsigned lines, void *bits, void *info, unsigned usage) { (void)dc; (void)bm; (void)start; (void)lines; (void)bits; (void)info; (void)usage; return 0; }
 
 // ---- shell32 -----------------------------------------------------------------------------------------------------------------
 static WINAPI unsigned ExtractIconExW(const WCHAR *file, int i, void **large, void **small, unsigned n) { (void)file; (void)i; (void)n; if (large) *large = NULL; if (small) *small = NULL; return 0; }
@@ -499,7 +497,7 @@ static const vx_export user32[] = {
     VX_EXPORT(EnableMenuItem), VX_EXPORT(SetMenuItemInfoA), VX_EXPORT(SetMenuItemInfoW), VX_EXPORT(GetMenuItemCount),
     VX_EXPORT(TrackPopupMenu), VX_EXPORT(SetPropW), VX_EXPORT(GetPropW), VX_EXPORT(RemovePropW), VX_EXPORT(SetPropA), VX_EXPORT(GetPropA), VX_EXPORT(RemovePropA),
     VX_EXPORT(IsRectEmpty), VX_EXPORT(GetMessageExtraInfo), VX_EXPORT(GetTopWindow), VX_EXPORT(FlashWindow),
-    VX_EXPORT(FlashWindowEx), VX_EXPORT(SetLayeredWindowAttributes), VX_EXPORT(SetWindowRgn), VX_EXPORT(WaitForInputIdle),
+    VX_EXPORT(FlashWindowEx), VX_EXPORT(SetWindowRgn), VX_EXPORT(WaitForInputIdle),
     VX_EXPORT(ToUnicode), VX_EXPORT(RegisterDeviceNotificationW), VX_EXPORT(RegisterDeviceNotificationA),
     VX_EXPORT(UnregisterDeviceNotification), VX_EXPORT(EmptyClipboard), VX_EXPORT(GetClipboardData), VX_EXPORT(SetClipboardData),
     VX_EXPORT(GetClipboardSequenceNumber), VX_EXPORT(IsClipboardFormatAvailable), VX_EXPORT(CreateIconIndirect),
@@ -508,7 +506,7 @@ static const vx_export user32[] = {
     VX_EXPORT(GetDlgItemInt), VX_EXPORT(SetDlgItemInt), VX_EXPORT(GetDlgItemTextA), VX_EXPORT(SetDlgItemTextA),
 };
 static const vx_export gdi32[] = {
-    VX_EXPORT(GetDeviceGammaRamp), VX_EXPORT(SetDeviceGammaRamp), VX_EXPORT(GetPixelFormat), VX_EXPORT(CombineRgn), VX_EXPORT(GetDIBits),
+    VX_EXPORT(GetDeviceGammaRamp), VX_EXPORT(SetDeviceGammaRamp), VX_EXPORT(GetPixelFormat), VX_EXPORT(CombineRgn),
 };
 static const vx_export shell32[] = {
     VX_EXPORT(ExtractIconExW), VX_EXPORT(ExtractIconExA), VX_EXPORT(DragAcceptFiles), VX_EXPORT(DragFinish), VX_EXPORT(DragQueryFileW),

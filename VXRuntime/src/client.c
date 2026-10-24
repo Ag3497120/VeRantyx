@@ -414,7 +414,7 @@ static WINAPI BOOL SetRectRgn(HANDLE rgn, int l, int t, int r, int b) { (void)rg
 static int g_imc;
 static WINAPI HANDLE ImmCreateContext(void) { return &g_imc; }
 static WINAPI BOOL ImmDestroyContext(HANDLE imc) { (void)imc; return 1; }
-static WINAPI BOOL msimg_ok(void) { return 1; }                   // AlphaBlend, GradientFill, TransparentBlt: nothing drawn
+static WINAPI BOOL msimg_ok(void) { return 1; }                   // GradientFill: nothing drawn (AlphaBlend, TransparentBlt: present.c)
 static WINAPI uintptr_t SHAppBarMessage(DWORD msg, void *data) { (void)msg; (void)data; return 0; }
 static WINAPI HANDLE CopyImage(HANDLE h, unsigned type, int cx, int cy, unsigned flags) { (void)type; (void)cx; (void)cy; (void)flags; return h; }
 static WINAPI BOOL caret_ok(void) { return 1; }                   // CreateCaret, DestroyCaret, SetCaretPos, ShowCaret, HideCaret
@@ -544,7 +544,7 @@ static const vx_export usp10[] = {
     { "ScriptTextOut", (void *)usp_fails }, { "ScriptBreak", (void *)usp_fails }, VX_EXPORT(ScriptFreeCache),
 };
 static const vx_export shlwapi[] = { VX_EXPORT(PathFileExistsW), VX_EXPORT(PathRemoveFileSpecW) };
-static const vx_export msimg32[] = { { "AlphaBlend", (void *)msimg_ok }, { "GradientFill", (void *)msimg_ok }, { "TransparentBlt", (void *)msimg_ok } };
+static const vx_export msimg32[] = { { "GradientFill", (void *)msimg_ok } };
 static const vx_export comdlg32[] = {
     VX_EXPORT(GetOpenFileNameW), { "GetSaveFileNameW", (void *)GetOpenFileNameW }, { "GetOpenFileNameA", (void *)GetOpenFileNameW },
     { "GetSaveFileNameA", (void *)GetOpenFileNameW }, VX_EXPORT(CommDlgExtendedError),

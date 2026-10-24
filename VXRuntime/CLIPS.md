@@ -34,7 +34,8 @@ visible one).
 |---|---|
 | `state` | windows (hwnd, parent, class, title, visible, enabled, client size, origin on the screen), the text drawn in each with its box (client coordinates), the active window, the focus, `idle` |
 | `windows` | the same without the text |
-| `snapshot <hwnd> <path>` | the client area's pixels as a PNG file |
+| `snapshot <hwnd> <path>` | the client area's pixels as a PNG file (the bitmap GDI draws into) |
+| `snapshot-view <hwnd> <path>` | what the Mac shows of the client area, as a PNG file at the window's backing scale: the window server's pixels of the window (converted back to sRGB, with the window's own alpha) when it can be asked, else Core Animation's rendering of the window's layers; with child windows in front and layered windows' transparency. Answers `source` (`window-server` or `layers`), `scale`, `width`, `height` (pixels), `window_alpha`, `opaque` |
 | `click <hwnd> <x> <y>` | WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP at client coordinates |
 | `click-text <hwnd> <text>` | the same at the middle of the first drawn text containing `<text>` (hwnd 0: any window) |
 | `key <hwnd> <vk>` | WM_KEYDOWN, WM_KEYUP (no WM_CHAR: use `type`) |
