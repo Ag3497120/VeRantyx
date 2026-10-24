@@ -1,5 +1,10 @@
 // winhttp.dll: synchronous HTTP(S) requests for Windows programs, on NSURLSession. Handles follow the WinHTTP
 // session -> connection -> request shape. Responses are buffered so WinHttpReadData can return them in caller chunks.
+//
+// A session may be opened with WINHTTP_FLAG_ASYNC: the proxy resolver (winhttp_proxy.m) takes only such a session, as
+// documented. Requests in it would have to complete through status callbacks, which this file does not do yet, so
+// WinHttpConnect, WinHttpOpenRequest and WinHttpSendRequest refuse an asynchronous handle with ERROR_NOT_SUPPORTED
+// rather than run the request synchronously behind the program's back.
 #import <Foundation/Foundation.h>
 #import <CFNetwork/CFNetwork.h>
 #import <SystemConfiguration/SystemConfiguration.h>
@@ -23,6 +28,8 @@ enum {
     ERROR_NOT_ENOUGH_MEMORY = 8
 };
 #define WINHTTP_FLAG_SECURE 0x00800000u
+#define WINHTTP_FLAG_ASYNC 0x10000000u
+#define ERROR_NOT_SUPPORTED 50
 #define WINHTTP_QUERY_STATUS_CODE 19u
 #define WINHTTP_QUERY_STATUS_TEXT 20u
 #define WINHTTP_QUERY_RAW_HEADERS 21u
@@ -68,6 +75,7 @@ typedef struct {
     uint32_t timeout_ms, connect_timeout_ms, send_timeout_ms;
     int sent, received;
     int no_redirect;                 // WINHTTP_OPTION_REDIRECT_POLICY_NEVER: a 3xx is the response (its Location header included)
+    int async;                       // opened with WINHTTP_FLAG_ASYNC (a session), or made under such a session
 } winhttp_handle;
 
 // NSURLSession follows redirects on its own; a request that must not (WinHTTP's redirect policy "never", which
@@ -330,6 +338,19 @@ static BOOL valid_handle(HANDLE handle, uint32_t kind) {
     return YES;
 }
 
+// Requests of an asynchronous session are not done yet (see the top of this file): refused, not run synchronously.
+static BOOL refuse_async(const winhttp_handle *h) {
+    if (!h->async) return NO;
+    vx_set_last_error(ERROR_NOT_SUPPORTED);
+    return YES;
+}
+
+// For winhttp_proxy.m's WinHttpCreateProxyResolver: 1 when handle is a session opened with WINHTTP_FLAG_ASYNC.
+int vx_winhttp_session_async(HANDLE handle) {
+    const winhttp_handle *h = handle;
+    return h && h->kind == WH_SESSION && h->async;
+}
+
 static void append_bytes(uint8_t **buffer, size_t *size, const void *data, size_t length) {
     if (!length) return;
     if (!data || length > SIZE_MAX - *size) return;
@@ -469,10 +490,6 @@ static BOOL perform_request(winhttp_handle *h) {
 
 static WINAPI HANDLE WinHttpOpen(const WCHAR *agent, DWORD access_type, const WCHAR *proxy,
                                  const WCHAR *bypass, DWORD flags) {
-    if (flags & 0x10000000u /* WINHTTP_FLAG_ASYNC */) {
-        vx_set_last_error(50 /* ERROR_NOT_SUPPORTED */);
-        return NULL;
-    }
     if ((access_type != WH_ACCESS_DEFAULT_PROXY && access_type != WH_ACCESS_NO_PROXY &&
          access_type != WH_ACCESS_NAMED_PROXY && access_type != WH_ACCESS_AUTOMATIC_PROXY) ||
         (access_type == WH_ACCESS_NAMED_PROXY && (!proxy || !valid_proxy_list(string_w(proxy))))) {
@@ -482,6 +499,7 @@ static WINAPI HANDLE WinHttpOpen(const WCHAR *agent, DWORD access_type, const WC
     winhttp_handle *h = calloc(1, sizeof *h);
     if (!h) { vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     h->kind = WH_SESSION;
+    h->async = (flags & WINHTTP_FLAG_ASYNC) != 0;   // (also part of WINHTTP_FLAG_SECURE_DEFAULTS)
     h->access_type = access_type;
     h->agent = utf8_copy(string_w(agent));
     // WinHttpOpen ignores proxy and bypass strings for every access type except NAMED_PROXY.
@@ -504,11 +522,13 @@ static WINAPI HANDLE WinHttpConnect(HANDLE session, const WCHAR *server, uint16_
         return NULL;
     }
     winhttp_handle *parent = session;
+    if (refuse_async(parent)) return NULL;
     NSString *host = string_w(server);
     if (!host.length || !host.UTF8String) { vx_set_last_error(87); return NULL; }
     winhttp_handle *h = calloc(1, sizeof *h);
     if (!h) { vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     h->kind = WH_CONNECTION;
+    h->async = parent->async;
     h->host = utf8_copy(host);
     h->port = port;
     h->agent = copy_string(parent->agent);
@@ -533,6 +553,7 @@ static WINAPI HANDLE WinHttpOpenRequest(HANDLE connection, const WCHAR *verb, co
     (void)version; (void)referrer;
     if (!valid_handle(connection, WH_CONNECTION)) return NULL;
     winhttp_handle *parent = connection;
+    if (refuse_async(parent)) return NULL;
     NSString *path = string_w(object);
     if (!path.length) path = @"/";
     if (![path hasPrefix:@"/"] && ![path hasPrefix:@"http://"] && ![path hasPrefix:@"https://"])
@@ -540,6 +561,7 @@ static WINAPI HANDLE WinHttpOpenRequest(HANDLE connection, const WCHAR *verb, co
     winhttp_handle *h = calloc(1, sizeof *h);
     if (!h) { vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     h->kind = WH_REQUEST;
+    h->async = parent->async;
     h->host = copy_string(parent->host);
     h->port = parent->port;
     h->secure = (flags & WINHTTP_FLAG_SECURE) != 0;
@@ -585,6 +607,7 @@ static WINAPI BOOL WinHttpSendRequest(HANDLE request, const WCHAR *headers, DWOR
     (void)context;
     if (!valid_handle(request, WH_REQUEST) || request == NULL) return NO;
     winhttp_handle *h = request;
+    if (refuse_async(h)) return NO;
     if (h->sent || optional_length > total_length || (optional_length && !optional)) {
         vx_set_last_error(87 /* ERROR_INVALID_PARAMETER */);
         return NO;
@@ -790,11 +813,12 @@ static WINAPI BOOL WinHttpSetOption(HANDLE handle, DWORD option, void *buffer, D
     case WINHTTP_OPTION_CONNECT_TIMEOUT: h->connect_timeout_ms = timeout; h->timeout_ms = timeout; return YES;
     case WINHTTP_OPTION_SEND_TIMEOUT: h->send_timeout_ms = timeout; h->timeout_ms = timeout; return YES;
     case WINHTTP_OPTION_RECEIVE_TIMEOUT: h->timeout_ms = timeout; return YES;
-    default: vx_set_last_error(50 /* ERROR_NOT_SUPPORTED */); return NO;
+    default: vx_set_last_error(ERROR_NOT_SUPPORTED); return NO;
     }
 }
 
 static WINAPI BOOL WinHttpCloseHandle(HANDLE handle) {
+    if (vx_winhttp_proxy_close(handle)) return YES;                  // a proxy resolver; else its callback hears HANDLE_CLOSING (winhttp_proxy.m)
     winhttp_handle *h = handle;
     if (!h || h->kind < WH_SESSION || h->kind > WH_REQUEST) { vx_set_last_error(12018); return NO; }
     free(h->agent); free(h->proxy); free(h->proxy_bypass); free(h->host); free(h->verb); free(h->path); free(h->headers);
