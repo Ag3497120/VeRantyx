@@ -38,6 +38,7 @@ VXRT_PROFILE=report.txt ...                # sampling profiler through Rosetta: 
 VXRT_GPU_TIMESTAMPS=1 ...                  # timestamp queries are the GPU's end times (default: the CPU's, on the same clock)
 VXRT_FLUSH_DRAWS=100 ...                   # send recorded work to the GPU every 100 draws, between render passes (default: off)
 VXRT_EAGER_CLEARS=1 ...                    # clears as passes of their own (default: folded into the next render pass's load action)
+VXRT_EXTRA_ARGS='helper.exe=--a --b' ...   # helper.exe, wherever in the process tree it starts, gets --a --b after its name
 ```
 
 Half-Life: Alyx without Wine: `scripts/launch_vxrt_alyx.sh` (repository root; Steam running on the Mac and signed
@@ -47,6 +48,47 @@ arguments go to the game. The first start compiles the game's shaders (a few min
 SteamVR without Wine: `scripts/launch_vxrt_steamvr.sh` (repository root) runs vrserver, vrcompositor and the VeRantyx
 driver on vxrt next to the HEVC encoder, using the Wine prefix's SteamVR read-only. Measured on 2026-10-12 without a
 headset: the driver captures and the encoder encodes 59-60 frames a second (the Vision Pro side is untested).
+
+### The Windows Steam client (research, not working yet)
+
+For games whose executable is wrapped in Steam's DRM (SteamStub): the wrapper is answered by a real Windows Steam
+you are signed in to, running on the same "machine" (the same `VXRT_ROOT` registry and VXRuntime's named objects).
+Every other game keeps using the Mac Steam client through the bridge (`VXRT_STEAM_BRIDGE=1`). How it is meant to be used:
+
+1. Windows Steam lives in a VXRuntime root of its own, `~/Verantyx_VR_Drive/vxrt_wsteam` (`VXRT_WSTEAM_ROOT`), at
+   `drive_c/Program Files (x86)/Steam`, never in the Wine prefix. Installing it there (Valve's installer on
+   VXRuntime) is a later step: it downloads Steam from Valve, so it waits for your go-ahead.
+2. `scripts/launch_vxrt_windows_steam.sh [<Windows Steam folder>]` (`VXRT_WSTEAM_SILENT=1` for `-silent`) starts it,
+   log in `~/Library/Logs/VeRantyx/vxrt-windows-steam.log`. You sign in yourself, in Steam's own window: VeRantyx
+   never asks for, reads or keeps your password; Steam keeps its saved login itself, as on Windows (what it protects
+   with DPAPI is protected less here: see below). The script refuses a Wine prefix, a 32-bit `steam.exe` and a second
+   Windows Steam on VXRuntime (named objects are shared by every root), sets no `VXRT_STEAM_BRIDGE`, and writes only
+   its log.
+3. A SteamStub game then starts with the same `VXRT_ROOT` and without `VXRT_STEAM_BRIDGE` while Steam runs (the game
+   launch scripts do not do this yet).
+
+How the web helper (Chromium) is started, checked on 2026-10-24 against the command line `steam.exe` gave
+`steamwebhelper.exe`: Steam's own `-cef-disable-gpu` adds `--disable-gpu --disable-gpu-compositing`,
+`-cef-disable-gpu-compositing` only the latter, `-cef-disable-sandbox` and `-no-cef-sandbox` add `--no-sandbox`;
+`-cef-single-process` and `-cef-in-process-gpu`, named in older lists, add nothing in this client (2026-09-03 build).
+`--single-process`, which Chromium needs here because its child processes are handed handles between processes,
+comes from `VXRT_EXTRA_ARGS` (`src/launchargs.c`), so neither Steam's files nor the Wine version's
+`steamwebhelper.exe` shim are involved. Where it stops today: the web helper ends at a Chromium check about half a
+second in, so there is no sign-in window yet.
+
+"Steam Service Error" at start: Steam looks for the Steam Client Service (`bin/SteamService.exe`, a 32-bit
+Windows service). Valve's own text in that window: it "helps Steam install or update games, enables anti-cheat
+detection in some titles and assists with other system level tasks", and installing it needs administrator rights;
+the choices are *Install Service* and *Cancel*. Here it cannot be installed: VXRuntime runs no 32-bit programs and
+its service manager has no services and lets nobody create one (`src/scm.c`). Choose *Cancel* (or close the window),
+the window's own way on: the Wine version's Steam ran without the service, and on VXRuntime (2026-10-24, seen through Command Clips)
+the window opens, `steam.exe` carries on while it is open, and after it was closed (WM_CLOSE) Steam went on without
+asking again. Its buttons could not be clicked in that test: Steam's VGUI draws its text far too large here (the log
+has `Win32Font.cpp ... Couldn't get string length`) and no button showed. What it is for on Windows: tasks that need
+administrator rights there. Valve's window names installing and updating games and anti-cheat in some games;
+Valve's install-script documentation has Steam do parts of a game's first-run setup as administrator
+(`HKEY_LOCAL_MACHINE` keys, programs to run, firewall exceptions), which may not happen without it. Valve documents
+no Steam option that turns the check off.
 
 `C:\` is `$VXRT_ROOT/drive_c` (default `~/.vxrt/drive_c`, created on first run with `C:\windows\system32` and
 `C:\windows\temp`); `Z:\` is the whole Mac file system. The registry lives in `$VXRT_ROOT/registry.txt`.
