@@ -33,6 +33,7 @@
 #   (drive_c/windows, drive_c/users); in the Steam folder, what Steam itself writes there (its updates, logs, config,
 #   web cache), as on Windows; and this script's log, ~/Library/Logs/VeRantyx/vxrt-windows-steam.log (the last
 #   start's: .prev.log).
+# - Steam restarting itself (after it has updated itself): the steam.exe it starts runs on, and the script waits for it.
 # - VXRT_WSTEAM_DRY_RUN=1: only the checks; prints what it would start, starts and creates nothing.
 #
 # "Steam Service Error" at start: the Steam Client Service (bin/SteamService.exe, a 32-bit Windows service) cannot
@@ -146,7 +147,8 @@ if [[ "${VXRT_WSTEAM_DRY_RUN:-0}" == 1 ]]; then
 fi
 
 [[ -x "$VXRT" ]] || { echo "No VXRuntime build at $VXRT: make -C VXRuntime" >&2; exit 1; }
-running="$(pgrep -f 'vxrt(-arm64)? (.*/)?[Ss][Tt][Ee][Aa][Mm]\.[Ee][Xx][Ee]( |$)' || true)"
+STEAM_EXE_PATTERN='vxrt(-arm64)? (.*/)?[Ss][Tt][Ee][Aa][Mm]\.[Ee][Xx][Ee]( |$)'
+running="$(pgrep -f "$STEAM_EXE_PATTERN" || true)"
 if [[ -n "$running" ]]; then
     echo "Windows Steam is already running on VXRuntime (process $(echo $running)); quit it first." >&2
     exit 1
@@ -168,7 +170,8 @@ cleanup() {
         kill -KILL -- "-$STEAM_PID" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM   # (the script ends there: cleanup on EXIT)
 cd "$STEAM_DIR"
 set -m
 env -u VXRT_STEAM_BRIDGE "${ENV[@]}" "$VXRT" steam.exe "${STEAM_ARGS[@]}" "$@" >"$LOG" 2>&1 &
@@ -177,3 +180,10 @@ set +m
 status=0
 wait "$STEAM_PID" || status=$?
 echo "steam.exe exited ($status; log: $LOG)"
+# Steam starts itself again and ends (after it has installed an update of itself, or when asked to restart): the
+# steam.exe it started is in this process group, and this script now waits for that one, as long as there is one.
+while next="$(pgrep -g "$STEAM_PID" -f "$STEAM_EXE_PATTERN" | head -n 1)" && [[ -n "$next" ]]; do
+    echo "steam.exe started steam.exe again (process $next); waiting for that one"
+    while kill -0 "$next" 2>/dev/null; do sleep 1; done
+    echo "steam.exe (process $next) ended"
+done

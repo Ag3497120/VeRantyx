@@ -79,12 +79,29 @@ How the web helper (Chromium) is started, checked on 2026-10-24 against the comm
 `-cef-single-process` and `-cef-in-process-gpu`, named in older lists, add nothing in this client (2026-09-03 build).
 `--single-process`, which Chromium needs here because its child processes are handed handles between processes,
 comes from `VXRT_EXTRA_ARGS` (`src/launchargs.c`), so neither Steam's files nor the Wine version's
-`steamwebhelper.exe` shim are involved. Where it stops today (2026-10-25, client build 2026-09-03): `steam.exe` runs
-on (past Steam's SteamVR check, 88 s of 88 in every run since `OpenThread` finds every running thread; before, it
-ended itself about 10 s in: tier0 freed the main thread's data when it could not open it) and the web helper creates
+`steamwebhelper.exe` shim are involved. Where it stops today (2026-10-25, client 1792618285 of 2026-10-21): `steam.exe`
+runs on (past Steam's SteamVR check, 88 s of 88 in every run since `OpenThread` finds every running thread; before, it
+ended itself about 10 s in: tier0 freed the main thread's data when it could not open it), loads `steamclient64.dll`
+once the Steam Service Error box is closed (its connectivity test passes, logged off), and the web helper creates
 Steam's shared JS context (`logs/steamui_html.txt`: `BrowserReady`), but draws nothing: its GPU contexts all fail
-(`Failed to create shared context for virtualization`), and it often ends itself some 20 s later, after which
+(`Failed to create shared context for virtualization`), and it ends itself some 20 s later, after which
 `steam.exe` starts it again. There is no sign-in window yet.
+
+Steam updates itself here as on Windows (2026-10-25: from the 2026-09-03 client, 1788652215, to 1792618285, Valve's
+download, with the user's go-ahead). The bootstrapper checks at once when the last run did not end cleanly (its
+`.crash` file is still there: "Checking for update on startup"); after a clean end it checks from its background loop
+about two minutes in, so a shorter run never checks. It saves the downloaded manifest through the C runtime opened for
+reading and writing in text mode, which seeks to 1 byte before the end of the new, empty file to look for a CTRL+Z:
+that has to fail with `ERROR_NEGATIVE_SEEK` (SetFilePointer's documentation). It failed with `ERROR_INVALID_PARAMETER`
+here, so the C runtime gave up on the file, Steam logged `Error: Failed to save package manifest.` and never installed
+the update (`tests/updater_files.c`). Installing, it extracts the packages over its own files (images are read into
+memory here, so replacing a loaded DLL or the running `steam.exe` is safe), starts `steam.exe` again with its command
+line and ends with exit code 42. The new process gets that command line word for word, as on Windows (it got the Mac
+path of the program before: `VXRT_COMMAND_LINE`, `src/loader.c`), and the launch script waits for it (it stopped
+Steam's whole process group when the first `steam.exe` ended). The October client imports
+`SetCurrentProcessExplicitAppUserModelID` (it stopped at once without it) and Transactional NTFS's
+`DeleteFileTransactedW`/`MoveFileTransactedW`, which fail here as for a handle that is not a transaction: there is no
+`KtmW32.dll`, which Steam loads itself before it uses them.
 
 The web helper's profile (`C:\users\vxrt\AppData\Local\Steam\htmlcache`) keeps its data in SQLite databases (`Web
 Data`, `Affiliation Database`, `History`, ...). SQLite maps a database and, at every commit, flushes the whole view

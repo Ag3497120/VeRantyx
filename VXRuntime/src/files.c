@@ -371,12 +371,35 @@ static WINAPI BOOL ReadFile(HANDLE h, void *buf, DWORD n, DWORD *got, OVERLAPPED
     return 1;
 }
 
+// Moves a file pointer as SetFilePointer(Ex) do: a new position before the start of the file fails with
+// ERROR_NEGATIVE_SEEK and leaves the pointer where it was (SetFilePointer's documentation). The C runtime relies on
+// that error: opening a file for reading and writing in text mode, it looks at the last byte (a CTRL+Z to remove) by
+// seeking to 1 byte before the end, and only ERROR_NEGATIVE_SEEK tells it the file is merely empty; any other error
+// closes the file and the open fails (Steam's updater: "Failed to save package manifest", so it never updated).
+static int seek_file(int fd, int64_t dist, DWORD method, off_t *pos) {
+    off_t base;
+    struct stat st;
+    switch (method) {
+    case 0: base = 0; break;                                                   // FILE_BEGIN
+    case 1: base = lseek(fd, 0, SEEK_CUR); break;                              // FILE_CURRENT
+    case 2: base = fstat(fd, &st) ? -1 : st.st_size; break;                    // FILE_END
+    default: vx_set_last_error(87); return 0;
+    }
+    if (base < 0) { set_error_from_errno(); return 0; }
+    int64_t to;
+    if (__builtin_add_overflow((int64_t)base, dist, &to)) { vx_set_last_error(87); return 0; }
+    if (to < 0) { vx_set_last_error(131 /* ERROR_NEGATIVE_SEEK */); return 0; }
+    off_t at = lseek(fd, (off_t)to, SEEK_SET);
+    if (at < 0) { set_error_from_errno(); return 0; }
+    *pos = at;
+    return 1;
+}
 static WINAPI DWORD SetFilePointer(HANDLE h, LONG low, LONG *high, DWORD method) {
     int fd = vx_handle_fd(h);
     if (fd < 0) { vx_set_last_error(6); return 0xffffffffu; }
-    off_t dist = high ? (off_t)(((uint64_t)(uint32_t)*high << 32) | (uint32_t)low) : (off_t)low;
-    off_t pos = lseek(fd, dist, method == 0 ? SEEK_SET : method == 1 ? SEEK_CUR : SEEK_END);
-    if (pos < 0) { set_error_from_errno(); return 0xffffffffu; }
+    int64_t dist = high ? (int64_t)(((uint64_t)(uint32_t)*high << 32) | (uint32_t)low) : (int64_t)low;
+    off_t pos;
+    if (!seek_file(fd, dist, method, &pos)) return 0xffffffffu;
     if (high) *high = (LONG)(pos >> 32);
     vx_set_last_error(0);
     return (DWORD)pos;
@@ -384,8 +407,8 @@ static WINAPI DWORD SetFilePointer(HANDLE h, LONG low, LONG *high, DWORD method)
 static WINAPI BOOL SetFilePointerEx(HANDLE h, int64_t dist, int64_t *newpos, DWORD method) {
     int fd = vx_handle_fd(h);
     if (fd < 0) { vx_set_last_error(6); return 0; }
-    off_t pos = lseek(fd, dist, method == 0 ? SEEK_SET : method == 1 ? SEEK_CUR : SEEK_END);
-    if (pos < 0) { set_error_from_errno(); return 0; }
+    off_t pos;
+    if (!seek_file(fd, dist, method, &pos)) return 0;
     if (newpos) *newpos = pos;
     return 1;
 }

@@ -1286,23 +1286,45 @@ int main(int argc, char **argv, char **envp) {
         return 0;
     }
 
-    vx_extra_args(&argc, &argv);                   // (VXRT_EXTRA_ARGS: a launcher's arguments for this program, launchargs.c)
+    char *added = vx_extra_args(&argc, &argv);     // (VXRT_EXTRA_ARGS: a launcher's arguments for this program, launchargs.c)
     void vx_handle_server_start(void);
     vx_handle_server_start();                      // (handles other processes take from this one, or give it: handlexfer.c)
     vx_proc.argc = argc - 1;
     vx_proc.argv = argv + 1;
     vx_profile_start();                            // (after argv: VXRT_PROFILE_FOR names the program)
-    vx_proc.envp = envp;
-    size_t len = 1;
-    for (int i = 1; i < argc; i++) len += strlen(argv[i]) + 3;
-    vx_proc.command_line = calloc(1, len);
-    for (int i = 1; i < argc; i++) {
-        int quote = strchr(argv[i], ' ') != NULL;
-        if (i > 1) strcat(vx_proc.command_line, " ");
-        if (quote) strcat(vx_proc.command_line, "\"");
-        strcat(vx_proc.command_line, argv[i]);
-        if (quote) strcat(vx_proc.command_line, "\"");
+    // A program another one started (CreateProcess, kernel32.c) has the command line that one gave, word for word, as on
+    // Windows (VXRT_COMMAND_LINE, taken out of this process's environment): its own name as the starter wrote it (a
+    // Windows path, not where vxrt found the file), its quotes and backslashes untouched. Steam starting itself again
+    // after an update passed "C:\...\steam.exe" and got the Mac path back. VXRT_EXTRA_ARGS's go after the name.
+    const char *given = getenv("VXRT_COMMAND_LINE");
+    if (given) {
+        const char *p = given;
+        if (*p == '"') { p++; while (*p && *p != '"') p++; if (*p) p++; }
+        else while (*p && *p != ' ' && *p != '\t') p++;
+        size_t head = (size_t)(p - given);
+        vx_proc.command_line = malloc(strlen(given) + (added ? strlen(added) + 1 : 0) + 1);
+        memcpy(vx_proc.command_line, given, head);
+        vx_proc.command_line[head] = 0;
+        if (added) { strcat(vx_proc.command_line, " "); strcat(vx_proc.command_line, added); }
+        strcat(vx_proc.command_line, p);
+        unsetenv("VXRT_COMMAND_LINE");
+        int k = 0;                                 // (and out of the environment block the program sees)
+        for (int i = 0; envp[i]; i++) if (strncmp(envp[i], "VXRT_COMMAND_LINE=", 18)) envp[k++] = envp[i];
+        envp[k] = NULL;
+    } else {
+        size_t len = 1;
+        for (int i = 1; i < argc; i++) len += strlen(argv[i]) + 3;
+        vx_proc.command_line = calloc(1, len);
+        for (int i = 1; i < argc; i++) {
+            int quote = strchr(argv[i], ' ') != NULL;
+            if (i > 1) strcat(vx_proc.command_line, " ");
+            if (quote) strcat(vx_proc.command_line, "\"");
+            strcat(vx_proc.command_line, argv[i]);
+            if (quote) strcat(vx_proc.command_line, "\"");
+        }
     }
+    free(added);
+    vx_proc.envp = envp;
     vx_proc.command_line_w = vx_utf16_dup(vx_proc.command_line);
 
     g_peb = calloc(1, PEB_SIZE);

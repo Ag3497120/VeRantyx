@@ -38,10 +38,11 @@ static void split_into(const char *s, size_t n, char **out, int *count) {
     }
 }
 
-// argv[0] is vxrt, argv[1] the program; on a match *argv becomes a new array with the arguments after argv[1].
-void vx_extra_args(int *argc, char ***argv) {
+// argv[0] is vxrt, argv[1] the program; on a match *argv becomes a new array with the arguments after argv[1], and the
+// result is those arguments as command-line text (for a command line given word for word: loader.c), else NULL.
+char *vx_extra_args(int *argc, char ***argv) {
     const char *spec = getenv("VXRT_EXTRA_ARGS");
-    if (!spec || !*spec || *argc < 2) return;
+    if (!spec || !*spec || *argc < 2) return NULL;
     const char *program = (*argv)[1], *base = program;
     for (const char *p = program; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
     size_t room = strlen(spec) / 2 + 2;                     // (no more pieces than that)
@@ -55,7 +56,7 @@ void vx_extra_args(int *argc, char ***argv) {
             split_into(eq + 1, len - (size_t)(eq + 1 - entry), added, &n);
         entry += len + (end ? 1 : 0);
     }
-    if (!n) { free(added); return; }
+    if (!n) { free(added); return NULL; }
     char **out = calloc((size_t)*argc + (size_t)n + 1, sizeof *out);
     out[0] = (*argv)[0]; out[1] = (*argv)[1];
     size_t shown_len = 1;
@@ -73,5 +74,6 @@ void vx_extra_args(int *argc, char ***argv) {
     *argv = out;
     vx_proc.argc = *argc - 1; vx_proc.argv = out + 1;      // (vx_log names a child from it; loader.c sets the same)
     vx_log("VXRT_EXTRA_ARGS: %s runs with %s added after its name", base, shown);
-    free(shown); free(added);
+    free(added);
+    return shown;
 }
