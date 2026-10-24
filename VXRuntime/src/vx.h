@@ -172,7 +172,8 @@ void *vx_trace_wrap(const char *dll, const char *name, void *fn);   // VXRT_TRAC
 void vx_client_init(void);             // what desktop clients use: certificate stores, bcrypt random, comctl32 (client.c)
 void vx_steambridge_init(void);
 void vx_services_init(void);           // resources, command lines, random numbers, psapi, C runtime extras (services.c)
-void vx_system_init(void);             // processor topology, thread pool, tokens, shell folders (system.c)
+void vx_system_init(void);             // processor topology, thread pool, shell folders (system.c)
+void vx_security_init(void);           // SIDs, ACLs, security descriptors, SDDL, tokens, AccessCheck (security.c)
 void vx_ucrt_init(void);
 void vx_sync_init(void);               // threads and kernel objects (sync.c)
 void vx_seh_init(void);                // exceptions (seh.c)

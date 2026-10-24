@@ -1023,6 +1023,17 @@ void *vx_handle_data(HANDLE h, int kind) {
     pthread_mutex_unlock(&g_lock);
     return d;
 }
+// The type of the object behind a handle, by Windows' names for object types; NULL for none of these (security.c:
+// what full access to it is).
+const char *vx_object_type(HANDLE h) {
+    static const char *const names[] = { [OBJ_THREAD] = "Thread", [OBJ_EVENT] = "Event", [OBJ_MUTEX] = "Mutant",
+                                         [OBJ_SEMAPHORE] = "Semaphore", [OBJ_PORT] = "IoCompletion", [OBJ_PROCESS] = "Process" };
+    pthread_mutex_lock(&g_lock);
+    vx_object *o = lookup(h);
+    int type = o ? o->type : 0;
+    pthread_mutex_unlock(&g_lock);
+    return type > 0 && type < (int)(sizeof names / sizeof *names) ? names[type] : NULL;
+}
 
 // ---- handles given to other processes ------------------------------------------------------------------------------------
 // DuplicateHandle into another process: the object becomes shareable (an unnamed event, mutex or semaphore gets a

@@ -1,7 +1,7 @@
 # vxrt: the VeRantyx Windows runtime. An x86-64 macOS binary; Rosetta 2 runs it and the Windows program together.
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
-SRC     = src/loader.c src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src/dotnet_baml.c src/dotnet_il.c src/dotnet_exec.c src/dotnet_runtime.c src/dotnet_host.c src/kernel32.c src/system.c src/desktop.c src/winsta.c src/scm.c src/services.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/winhttp.m src/directinput.m src/msxml.c src/extras.c src/context.S src/text.c src/files.c src/registry.c \
+SRC     = src/loader.c src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src/dotnet_baml.c src/dotnet_il.c src/dotnet_exec.c src/dotnet_runtime.c src/dotnet_host.c src/kernel32.c src/system.c src/desktop.c src/winsta.c src/scm.c src/services.c src/security.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/winhttp.m src/directinput.m src/msxml.c src/extras.c src/context.S src/text.c src/files.c src/registry.c \
           src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/d3d11on12.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d_format.c src/d3d12.m src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/dxil.c src/dxil_msl.c src/dxil_ir.c src/spirv.c src/spirv_ir.c src/vk_msl.c src/vk_format.m src/vk_device.m src/vk_descriptor.m src/vk_pipeline.m src/vk_command.m src/vk_internal.m src/vk_queue.m src/vk_wsi.m src/vk_dispatch.m src/directinput_buffer.c src/directinput_format.c src/input.m src/audio.m src/xaudio2.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
@@ -33,7 +33,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe
+       build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/security.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -44,6 +44,10 @@ build/hello_crt.exe: tests/hello_crt.c
 	$(MINGW) -O1 -o $@ $<
 
 build/game_imports.exe: tests/game_imports.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+build/security.exe: tests/security.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
@@ -1055,6 +1059,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/order.exe
 	$(VXRT) build/hello_crt.exe one "two words"
 	$(VXRT) build/game_imports.exe
+	$(VXRT) build/security.exe
 	$(VXRT) build/threads.exe
 	$(VXRT) build/cxx_exceptions.exe
 	$(VXRT) build/hw_exceptions.exe

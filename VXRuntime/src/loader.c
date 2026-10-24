@@ -1130,6 +1130,7 @@ int main(int argc, char **argv, char **envp) {
     vx_winhttp_init();
     vx_directinput_init();
     vx_msxml_init();
+    vx_security_init();                          // (advapi32's security objects: before the tables that follow)
     vx_kernel32_init();
     vx_system_init();
     vx_desktop_init();

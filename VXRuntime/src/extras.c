@@ -127,7 +127,6 @@ static WINAPI int32_t CreateStreamOnHGlobal(HANDLE global, BOOL release, void **
 // ---- avrt, advapi32 -----------------------------------------------------------------------------------------------------
 static WINAPI HANDLE AvSetMmThreadCharacteristicsW(const WCHAR *task, DWORD *index) { (void)task; if (index) *index = 1; return (HANDLE)1; }
 static WINAPI BOOL AvRevertMmThreadCharacteristics(HANDLE h) { (void)h; return 1; }
-static WINAPI DWORD SetEntriesInAclW(uint32_t n, void *entries, void *old, void **acl) { (void)n; (void)entries; (void)old; if (acl) *acl = NULL; return 0; }
 static WINAPI BOOL SetFileSecurityW(const WCHAR *file, DWORD info, void *sd) { (void)file; (void)info; (void)sd; return 1; }
 
 // ---- ws2_32 by ordinal: lookups that find nothing -----------------------------------------------------------------------
@@ -632,7 +631,7 @@ static const vx_export user32[] = { VX_EXPORT(CreateDialogParamW), VX_EXPORT(Set
 static const vx_export winmm[] = { VX_EXPORT(waveInStop) };
 static const vx_export ole32[] = { VX_EXPORT(CreateStreamOnHGlobal) };
 static const vx_export avrt[] = { VX_EXPORT(AvSetMmThreadCharacteristicsW), VX_EXPORT(AvRevertMmThreadCharacteristics) };
-static const vx_export advapi32[] = { VX_EXPORT(SetEntriesInAclW), VX_EXPORT(SetFileSecurityW) };
+static const vx_export advapi32[] = { VX_EXPORT(SetFileSecurityW) };
 static const vx_export ws2_32[] = {
     { "gethostbyaddr", (void *)ws_gethostbyaddr }, { "#51", (void *)ws_gethostbyaddr }, { "getservbyname", (void *)ws_getservbyname },
     { "#55", (void *)ws_getservbyname }, { "getservbyport", (void *)ws_getservbyport }, { "#56", (void *)ws_getservbyport },
