@@ -11,6 +11,8 @@
 #include <strings.h>
 #include <CoreText/CoreText.h>
 #include "ui.h"
+struct vx_region;
+void vx_region_free(struct vx_region *r);                    // region.c
 
 enum { OBJ_PEN = 1, OBJ_BRUSH = 2, OBJ_DC = 3, OBJ_FONT = 6, OBJ_BITMAP = 7, OBJ_REGION = 8, OBJ_MEMDC = 10 };
 #define GDI_BASE 0x40000
@@ -30,7 +32,7 @@ typedef struct gdi_obj {
     uint32_t text_color, bk_color, dc_brush, dc_pen;
     int bk_mode;
     POINT pos;
-    RECT rgn;                                                 // region: a rectangle
+    struct vx_region *region;                                 // region: its rectangles (region.c)
     vx_texts texts;                                           // bitmap: text drawn on it (ui.h)
 } gdi_obj;
 
@@ -162,8 +164,18 @@ static void free_obj(HANDLE h) {
         if (o->pixels && (void *)o->pixels != (void *)o->bits) free(o->pixels);
         if (o->own_bits) free(o->bits);
     }
+    if (o && o->type == OBJ_REGION) vx_region_free(o->region);
     free(o);
 }
+// Region objects for region.c, which keeps their rectangles: a new one holding r, and the one behind a handle.
+HANDLE vx_gdi_region_new(struct vx_region *r) {
+    gdi_obj *o = calloc(1, sizeof *o);
+    if (!o) return NULL;
+    o->type = OBJ_REGION; o->region = r;
+    HANDLE h = new_obj(o);                                    // (frees o when the table is full)
+    return h;
+}
+struct vx_region *vx_gdi_region(HANDLE h) { gdi_obj *o = obj_of(h, OBJ_REGION); return o ? o->region : NULL; }
 void vx_dc_release(HANDLE h) {
     gdi_obj *d = dc_of(h);
     if (!d) return;
@@ -357,12 +369,6 @@ static WINAPI BOOL RestoreDC(HANDLE h, int n) { (void)h; (void)n; return 1; }
 static WINAPI BOOL SetViewportOrgEx(HANDLE h, int x, int y, POINT *old) { (void)h; (void)x; (void)y; if (old) *old = (POINT){ 0, 0 }; return 1; }
 static WINAPI BOOL SetWindowOrgEx(HANDLE h, int x, int y, POINT *old) { (void)h; (void)x; (void)y; if (old) *old = (POINT){ 0, 0 }; return 1; }
 static WINAPI BOOL GdiFlush(void) { return 1; }
-static WINAPI HANDLE CreateRectRgn(int l, int t, int r, int b) {
-    gdi_obj *o = calloc(1, sizeof *o);
-    o->type = OBJ_REGION; o->rgn = (RECT){ l, t, r, b };
-    return new_obj(o);
-}
-static WINAPI HANDLE CreateRectRgnIndirect(const RECT *r) { return CreateRectRgn(r->left, r->top, r->right, r->bottom); }
 static WINAPI int SelectClipRgn(HANDLE dc, HANDLE rgn) { (void)dc; (void)rgn; return 2; }
 static WINAPI int IntersectClipRect(HANDLE dc, int l, int t, int r, int b) { (void)dc; (void)l; (void)t; (void)r; (void)b; return 2; }
 
@@ -788,7 +794,7 @@ static const vx_export gdi32[] = {
     VX_EXPORT(SetTextColor), VX_EXPORT(GetTextColor), VX_EXPORT(SetBkColor), VX_EXPORT(GetBkColor), VX_EXPORT(SetBkMode), VX_EXPORT(GetBkMode),
     VX_EXPORT(SetDCBrushColor), VX_EXPORT(SetDCPenColor), VX_EXPORT(SetStretchBltMode), VX_EXPORT(SetMapMode), VX_EXPORT(SetTextAlign),
     VX_EXPORT(SaveDC), VX_EXPORT(RestoreDC), VX_EXPORT(SetViewportOrgEx), VX_EXPORT(SetWindowOrgEx), VX_EXPORT(GdiFlush),
-    VX_EXPORT(CreateRectRgn), VX_EXPORT(CreateRectRgnIndirect), VX_EXPORT(SelectClipRgn), VX_EXPORT(IntersectClipRect),
+    VX_EXPORT(SelectClipRgn), VX_EXPORT(IntersectClipRect),
     VX_EXPORT(PatBlt), VX_EXPORT(Rectangle), VX_EXPORT(Ellipse), VX_EXPORT(MoveToEx), VX_EXPORT(LineTo), VX_EXPORT(SetPixel), VX_EXPORT(GetPixel),
     VX_EXPORT(StretchDIBits), VX_EXPORT(SetDIBitsToDevice), VX_EXPORT(StretchBlt), VX_EXPORT(BitBlt),
     VX_EXPORT(TextOutA), VX_EXPORT(TextOutW), VX_EXPORT(ExtTextOutA), VX_EXPORT(ExtTextOutW),

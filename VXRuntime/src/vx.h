@@ -231,6 +231,7 @@ void vx_power_init(void);              // powrprof: power information and plans 
 void vx_sysparams_init(void);          // SystemParametersInfo's UI fonts and non-client metrics (sysparams.c)
 void vx_dwmapi_init(void);             // the Desktop Window Manager API for windows macOS frames (dwmapi.c)
 void vx_winmisc_init(void);            // smaller user32 functions: IsChild, DeferWindowPos, GetLastInputInfo, ... (winmisc.c)
+void vx_region_init(void);             // GDI regions: rectangles combined, compared, listed (region.c)
 void vx_shlpath_init(void);            // shlwapi path strings: PathFindFileName, PathMatchSpec, ... (shlpath.c)
 void vx_dbghelp_init(void);            // dbghelp: StackWalk64, symbols from export tables (dbghelp.c; after seh)
 

@@ -10,6 +10,7 @@
 #include <shellapi.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -668,6 +669,67 @@ static void test_user32_more(void) {
     CHECK(!GetLastInputInfo(&li));
 }
 
+// ---- GDI regions ------------------------------------------------------------------------------------------------------------
+static int region_rects(HRGN r, RECT *out, int cap) {           // the rectangles GetRegionData lists, -1 on failure
+    DWORD need = GetRegionData(r, 0, NULL);
+    if (need < sizeof(RGNDATAHEADER)) return -1;
+    RGNDATA *d = malloc(need);
+    if (GetRegionData(r, need, d) != need || d->rdh.dwSize != sizeof(RGNDATAHEADER) || d->rdh.iType != RDH_RECTANGLES) { free(d); return -1; }
+    int n = (int)d->rdh.nCount;
+    for (int i = 0; i < n && i < cap; i++) out[i] = ((RECT *)d->Buffer)[i];
+    free(d);
+    return n;
+}
+static int rect_is(RECT r, LONG l, LONG t, LONG rr, LONG b) { return r.left == l && r.top == t && r.right == rr && r.bottom == b; }
+static void test_regions(void) {
+    HRGN a = CreateRectRgn(10, 10, 30, 30), b = CreateRectRgn(20, 20, 40, 40), d = CreateRectRgn(0, 0, 0, 0);
+    RECT rs[8], box;
+    CHECK(CombineRgn(d, a, b, RGN_OR) == COMPLEXREGION);
+    CHECK(region_rects(d, rs, 8) == 3 && rect_is(rs[0], 10, 10, 30, 20) && rect_is(rs[1], 10, 20, 40, 30) && rect_is(rs[2], 20, 30, 40, 40));
+    CHECK(GetRgnBox(d, &box) == COMPLEXREGION && rect_is(box, 10, 10, 40, 40));
+    HRGN e = CreateRectRgn(0, 0, 0, 0);
+    CHECK(CombineRgn(e, b, a, RGN_OR) == COMPLEXREGION && EqualRgn(d, e));              // the same either way round
+    CHECK(CombineRgn(d, a, b, RGN_AND) == SIMPLEREGION && GetRgnBox(d, &box) == SIMPLEREGION && rect_is(box, 20, 20, 30, 30));
+    CHECK(CombineRgn(d, a, b, RGN_XOR) == COMPLEXREGION && PtInRegion(d, 15, 15) && !PtInRegion(d, 25, 25) && PtInRegion(d, 35, 35));
+    CHECK(!PtInRegion(d, 30, 15) && PtInRegion(d, 29, 15));                            // right and bottom edges are outside
+    CHECK(CombineRgn(d, a, b, RGN_DIFF) == COMPLEXREGION && region_rects(d, rs, 8) == 2 && rect_is(rs[0], 10, 10, 30, 20) && rect_is(rs[1], 10, 20, 20, 30));
+    CHECK(CombineRgn(d, b, NULL, RGN_COPY) == SIMPLEREGION && EqualRgn(d, b));
+    CHECK(CombineRgn(d, d, a, RGN_OR) == COMPLEXREGION && EqualRgn(d, e));              // the destination as a source
+    // two halves are one rectangle (neighbouring bands with the same spans are merged)
+    HRGN top = CreateRectRgn(0, 0, 10, 5), bottom = CreateRectRgn(0, 5, 10, 10), whole = CreateRectRgn(0, 0, 10, 10);
+    CHECK(CombineRgn(d, top, bottom, RGN_OR) == SIMPLEREGION && EqualRgn(d, whole));
+    HRGN left = CreateRectRgn(0, 0, 5, 10), right = CreateRectRgn(5, 0, 10, 10);
+    CHECK(CombineRgn(d, left, right, RGN_OR) == SIMPLEREGION && EqualRgn(d, whole));
+    CHECK(CombineRgn(d, whole, whole, RGN_DIFF) == NULLREGION && GetRgnBox(d, &box) == NULLREGION && rect_is(box, 0, 0, 0, 0));
+    HRGN empty = CreateRectRgn(5, 5, 5, 20);
+    CHECK(GetRgnBox(empty, &box) == NULLREGION && EqualRgn(empty, d) && !EqualRgn(empty, whole));
+    HRGN swapped = CreateRectRgn(30, 30, 10, 10);                                         // put in order
+    CHECK(EqualRgn(swapped, a));
+    CHECK(SetRectRgn(swapped, 1, 2, 3, 4) && GetRgnBox(swapped, &box) == SIMPLEREGION && rect_is(box, 1, 2, 3, 4));
+    CHECK(OffsetRgn(e, 5, -5) == COMPLEXREGION && GetRgnBox(e, &box) && rect_is(box, 15, 5, 45, 35));
+    RECT probe1 = { 0, 0, 11, 11 }, probe2 = { 31, 11, 39, 19 };
+    CHECK(RectInRegion(a, &probe1) && !RectInRegion(b, &probe2));
+    // through RGNDATA and back, as it is and moved
+    DWORD need = GetRegionData(e, 0, NULL);
+    CHECK(need == sizeof(RGNDATAHEADER) + 3 * sizeof(RECT) && GetRegionData(e, need - 1, (RGNDATA *)rs) == 0);
+    RGNDATA *data = malloc(need);
+    CHECK(GetRegionData(e, need, data) == need && rect_is(data->rdh.rcBound, 15, 5, 45, 35));
+    HRGN back = ExtCreateRegion(NULL, need, data);
+    CHECK(back && EqualRgn(back, e));
+    XFORM move = { 1, 0, 0, 1, -5, 5 };
+    HRGN moved = ExtCreateRegion(&move, need, data);
+    CombineRgn(d, a, b, RGN_OR);
+    CHECK(moved && EqualRgn(moved, d));
+    XFORM turn = { 0, 1, -1, 0, 0, 0 };
+    CHECK(ExtCreateRegion(&turn, need, data) == NULL);                                   // rotation: not kept here
+    free(data);
+    HRGN bogus = (HRGN)(ULONG_PTR)0x7ff4;
+    CHECK(CombineRgn(d, bogus, a, RGN_OR) == ERROR && EqualRgn(bogus, a) == ERROR && GetRgnBox(bogus, &box) == ERROR);
+    CHECK(CombineRgn(d, a, b, 9) == ERROR);
+    HGDIOBJ all[] = { a, b, d, e, top, bottom, whole, left, right, empty, swapped, back, moved };
+    for (size_t i = 0; i < sizeof all / sizeof *all; i++) CHECK(DeleteObject(all[i]));
+}
+
 int main(void) {
     test_isos();
     test_paths();
@@ -682,6 +744,7 @@ int main(void) {
     test_ui_fonts();
     test_dwmapi();
     test_user32_more();
+    test_regions();
     if (failures) { printf("webhelper_apis: %d checks failed\n", failures); return 1; }
     printf("webhelper_apis: all checks passed\n");
     return 0;
