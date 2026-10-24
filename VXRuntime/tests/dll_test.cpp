@@ -47,6 +47,20 @@ int main() {
     calls = (int (*)(void))GetProcAddress(plugin, "plugin_calls");
     CHECK(plugin && calls && calls() == 1);
     FreeLibrary(plugin);
+    // Loaded and freed many times over (SDL does so with libusb-1.0.dll in Steam): each load fresh, past the runtime's
+    // table of 256 images, and at the same place (the unloaded copy's).
+    HMODULE first = nullptr; int fresh = 0, same_place = 0, loads = 0;
+    for (int i = 0; i < 400; i++) {
+        HMODULE p = LoadLibraryA("vxplugin.dll");
+        if (!p) break;
+        loads++;
+        if (!first) first = p;
+        if (p == first) same_place++;
+        auto c = (int (*)(void))GetProcAddress(p, "plugin_calls");
+        if (c && c() == 1) fresh++;
+        FreeLibrary(p);
+    }
+    CHECK(loads == 400 && fresh == 400 && same_place == 400);
     CHECK(GetModuleHandleA("vxdll.dll") == dll);                   // (imported: never unloaded)
     FreeLibrary(dll);
     CHECK(GetModuleHandleA("vxdll.dll") == dll);

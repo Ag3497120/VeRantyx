@@ -51,6 +51,35 @@ typedef struct packet { DWORD bytes, status; uint64_t key; void *overlapped; str
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_changed = PTHREAD_COND_INITIALIZER;     // suspended threads and completion ports wait on this
+// Who holds g_lock (NULL: no one, or a thread waiting on a condition with it released). SuspendThread's signal does
+// not stop a thread that holds it: the suspender's next calls (ResumeThread, GetThreadId; Chromium's sampling profiler
+// suspends its main thread many times a second) need it, and a thread stopped in PostQueuedCompletionStatus with it
+// held left Steam's web helper with every thread waiting for g_lock. Such a thread is signalled again until it is
+// stopped outside (the lock is held for short stretches only).
+static pthread_t g_lock_owner;
+static inline void glock(void) { pthread_mutex_lock(&g_lock); __atomic_store_n(&g_lock_owner, pthread_self(), __ATOMIC_RELEASE); }
+static inline void gunlock(void) { __atomic_store_n(&g_lock_owner, (pthread_t)NULL, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_lock); }
+static inline int gwait(pthread_cond_t *c) {
+    __atomic_store_n(&g_lock_owner, (pthread_t)NULL, __ATOMIC_RELEASE);
+    int r = pthread_cond_wait(c, &g_lock);
+    __atomic_store_n(&g_lock_owner, pthread_self(), __ATOMIC_RELEASE);
+    return r;
+}
+static inline int gtimedwait(pthread_cond_t *c, const struct timespec *t) {
+    __atomic_store_n(&g_lock_owner, (pthread_t)NULL, __ATOMIC_RELEASE);
+    int r = pthread_cond_timedwait(c, &g_lock, t);
+    __atomic_store_n(&g_lock_owner, pthread_self(), __ATOMIC_RELEASE);
+    return r;
+}
+// Whether the thread a signal interrupted may hold g_lock: not when the lock is free (it is taken and given back at
+// once) or held by another thread; else yes, also in the moment it takes or gives it (the owner not written yet).
+static int may_hold_g_lock(void) {
+    pthread_t o = __atomic_load_n(&g_lock_owner, __ATOMIC_ACQUIRE);
+    if (o && o != pthread_self()) return 0;
+    if (!pthread_mutex_trylock(&g_lock)) { pthread_mutex_unlock(&g_lock); return 0; }
+    o = __atomic_load_n(&g_lock_owner, __ATOMIC_ACQUIRE);
+    return !(o && o != pthread_self());
+}
 
 // A thread waiting in WaitForMultipleObjects sleeps on its own condition variable and is listed on each object it
 // waits for; a change to an object wakes only that object's waiters (a semaphore released for a job system's
@@ -290,10 +319,10 @@ static void *thread_main(void *p) {
     vx_x86_stack_size = t->stack;                 // (the program's stack: as large as the thread's own, see CreateThread)
 #endif
     vx_thread_attach();
-    pthread_mutex_lock(&g_lock);              // also waits until CreateThread has filled in the object
-    while (t->suspended) pthread_cond_wait(&g_changed, &g_lock);
+    glock();              // also waits until CreateThread has filled in the object
+    while (t->suspended) gwait(&g_changed);
     t->started = 1;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     vx_notify_thread(2 /* DLL_THREAD_ATTACH */);
     jmp_buf exit_jump;
     t_exit_jump = &exit_jump;
@@ -304,12 +333,12 @@ static void *thread_main(void *p) {
     vx_notify_thread(3 /* DLL_THREAD_DETACH */);
     fls_thread_exit();
     vx_thread_detach();
-    pthread_mutex_lock(&g_lock);
+    glock();
     t->done = 1; t->exit_code = code;
     t_self = NULL;
     notify(t);
     unref(t);
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return NULL;
 }
 
@@ -328,18 +357,18 @@ static WINAPI HANDLE CreateThread(void *sa, size_t stack, DWORD (WINAPI *start)(
     pthread_attr_setstacksize(&a, size);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_attr_set_qos_class_np(&a, QOS_CLASS_USER_INITIATED, 0);   // performance cores unless asked otherwise
-    pthread_mutex_lock(&g_lock);
+    glock();
     HANDLE h = new_handle(t);
     if (!h || pthread_create(&t->pthread, &a, thread_main, t)) {
         if (h) { int k = handle_index(h); g_handles[k] = NULL; if (k < g_free_hint) g_free_hint = k; }
-        pthread_mutex_unlock(&g_lock);
+        gunlock();
         free(t); pthread_attr_destroy(&a);
         vx_set_last_error(8 /* ERROR_NOT_ENOUGH_MEMORY */);
         return NULL;
     }
     uint64_t id; pthread_threadid_np(t->pthread, &id);
     t->tid = (DWORD)id;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     pthread_attr_destroy(&a);
     if (tid) *tid = t->tid;
     return h;
@@ -369,18 +398,18 @@ static vx_object *thread_object(HANDLE h) {       // with g_lock held
 }
 
 static WINAPI BOOL GetExitCodeThread(HANDLE h, DWORD *code) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *t = thread_object(h);
     if (t) *code = t->done ? t->exit_code : STILL_ACTIVE;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (!t) vx_set_last_error(6 /* ERROR_INVALID_HANDLE */);
     return t != NULL;
 }
 static WINAPI DWORD GetThreadId(HANDLE h) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *t = thread_object(h);
     DWORD id = t ? t->tid : 0;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return id;
 }
 // Suspending a running thread (garbage collectors stop the world this way: Unity's Mono): SIGUSR2 makes it save its
@@ -393,8 +422,8 @@ static WINAPI DWORD GetThreadId(HANDLE h) {
 void vx_context_from_signal(void *out, const void *uc);                 // seh.c
 static void park(vx_object *t) {                                        // (t->context saved: stopped till resumed)
     for (;;) {
-        __atomic_store_n(&t->stop_seen, __atomic_load_n(&t->stop_asked, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
-        __atomic_store_n(&t->parked, 1, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&t->parked, 1, __ATOMIC_SEQ_CST);              // (before stop_seen: SuspendThread returns on it,
+        __atomic_store_n(&t->stop_seen, __atomic_load_n(&t->stop_asked, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);   //  and GetThreadContext wants parked)
         semaphore_signal(t->parked_sem);
         while (__atomic_load_n(&t->suspended, __ATOMIC_SEQ_CST) &&
                __atomic_load_n(&t->stop_asked, __ATOMIC_SEQ_CST) == __atomic_load_n(&t->stop_seen, __ATOMIC_SEQ_CST))
@@ -420,6 +449,7 @@ static void on_suspend_signal(int sig, siginfo_t *si, void *uc) {
     (void)sig; (void)si;
     vx_object *t = t_self;
     if (!t || !t->context || !__atomic_load_n(&t->suspended, __ATOMIC_SEQ_CST)) return;   // (a stop already seen)
+    if (may_hold_g_lock()) return;                                      // (SuspendThread signals again)
 #ifdef __aarch64__
     if (vx_arm64_interrupt()) return;                                   // (in the vCPU guest: it stops as it leaves)
 #endif
@@ -441,17 +471,17 @@ static void suspend_signal_install(void) {
     pthread_once(&once, suspend_signal_setup);
 }
 static WINAPI DWORD ResumeThread(HANDLE h) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *t = thread_object(h);
     DWORD prev = t ? t->suspended : (DWORD)-1;
     if (t && t->suspended && !__atomic_sub_fetch(&t->suspended, 1, __ATOMIC_ACQ_REL) && t->started && t->resume_sem)
         semaphore_signal(t->resume_sem);
     pthread_cond_broadcast(&g_changed);
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return prev;
 }
 static WINAPI DWORD SuspendThread(HANDLE h) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *t = thread_object(h);
     DWORD prev = (DWORD)-1;
     int stop = 0;
@@ -468,15 +498,25 @@ static WINAPI DWORD SuspendThread(HANDLE h) {
             stop = 1;
         }
     }
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (prev == (DWORD)-1) { vx_set_last_error(6); return prev; }
     if (stop) {
         suspend_signal_install();
         if (t == t_self) {                             // suspending oneself: wait here until resumed
             while (__atomic_load_n(&t->suspended, __ATOMIC_ACQUIRE)) semaphore_wait(t->resume_sem);
         } else if (__atomic_load_n(&t->parked, __ATOMIC_SEQ_CST) || !pthread_kill(t->pthread, SIGUSR2)) {
-            while (__atomic_load_n(&t->stop_seen, __ATOMIC_SEQ_CST) < asked)   // (the context is saved once it is
-                semaphore_wait(t->parked_sem);                                 //  parked; still parked: it sees this one)
+            // (the context is saved once it is parked; still parked: it sees this one.) Every millisecond until it says
+            // it has: a thread that held g_lock when the signal came did not stop, and is signalled again; one still
+            // parked from the last stop is woken to look again (it may have looked between this call's two counts,
+            // suspended and stop_asked, and gone back to sleep for good).
+            while (__atomic_load_n(&t->stop_seen, __ATOMIC_SEQ_CST) < asked) {
+                mach_timespec_t ms1 = { 0, 1000000 };
+                if (semaphore_timedwait(t->parked_sem, ms1) != KERN_OPERATION_TIMED_OUT ||
+                    __atomic_load_n(&t->stop_seen, __ATOMIC_SEQ_CST) >= asked) continue;
+                if (__atomic_load_n(&t->done, __ATOMIC_SEQ_CST)) break;
+                if (__atomic_load_n(&t->parked, __ATOMIC_SEQ_CST)) semaphore_signal(t->resume_sem);
+                else pthread_kill(t->pthread, SIGUSR2);
+            }
         }
     }
     return prev;
@@ -499,10 +539,10 @@ static qos_class_t qos_for(int p) {
     return p >= 2 ? QOS_CLASS_USER_INTERACTIVE : p >= 0 ? QOS_CLASS_USER_INITIATED : p > -15 ? QOS_CLASS_UTILITY : QOS_CLASS_BACKGROUND;
 }
 static WINAPI int GetThreadPriority(HANDLE h) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *t = thread_object(h);
     int p = t ? t->priority : 0;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return p;
 }
 // THREAD_MODE_BACKGROUND_BEGIN and _END are modes, not priorities: the thread's own resource priorities go to the
@@ -511,24 +551,24 @@ static WINAPI int GetThreadPriority(HANDLE h) {
 #define THREAD_MODE_BACKGROUND_BEGIN 0x10000
 #define THREAD_MODE_BACKGROUND_END 0x20000
 static BOOL background_mode(HANDLE h, int begin) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *t = thread_object(h);
     DWORD err = !t ? 6 : t != self_object() ? 87 : begin == t->background ? (begin ? 400 : 401) : 0;
     int p = t ? t->priority : 0;
     if (!err) t->background = begin;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (err) { vx_set_last_error(err); return 0; }
     pthread_set_qos_class_self_np(begin ? QOS_CLASS_BACKGROUND : qos_for(p), 0);
     return 1;
 }
 static WINAPI BOOL SetThreadPriority(HANDLE h, int p) {
     if (p == THREAD_MODE_BACKGROUND_BEGIN || p == THREAD_MODE_BACKGROUND_END) return background_mode(h, p == THREAD_MODE_BACKGROUND_BEGIN);
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *t = thread_object(h);
     int self = t && t == self_object(), raise = t && p > t->priority, background = t && t->background;
     pthread_t pt = t ? t->pthread : 0;
     if (t) t->priority = p;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (!t) { vx_set_last_error(6); return 0; }
     if (self && !background) pthread_set_qos_class_self_np(qos_for(p), 0);   // (in background mode until it ends)
     else if (!self && raise && pt) pthread_override_qos_class_start_np(pt, qos_for(p), 0);
@@ -547,13 +587,13 @@ static WINAPI uint64_t SetThreadAffinityMask(HANDLE h, uint64_t m) { (void)h; (v
 
 static WINAPI HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid) {
     (void)access; (void)inherit;
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *t = NULL;
     for (int i = 0; i < MAX_HANDLES && !t; i++)
         if (g_handles[i] && g_handles[i]->type == OBJ_THREAD && g_handles[i]->tid == tid) t = g_handles[i];
     if (!t && tid == vx_current_tid()) t = self_object();
     HANDLE h = t ? new_handle(t) : NULL;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (!t) vx_set_last_error(87);
     return h;
 }
@@ -582,32 +622,32 @@ static void *watch_process(void *arg) {
     } else {
         while (!kill(w->pid, 0) || errno != ESRCH) usleep(100000);
     }
-    pthread_mutex_lock(&g_lock);
+    glock();
     for (int i = 0; i < g_nwatched; i++) if (g_watched[i].o == w->o) { g_watched[i] = g_watched[--g_nwatched]; break; }
     w->o->done = 1; w->o->exit_code = code;
     notify(w->o);
     unref(w->o);
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     free(w);
     return NULL;
 }
 // A handle to a process (two, when `second` is asked for: the "thread" of a new process waits the same way).
 HANDLE vx_process_handle(int pid, int child, HANDLE *second) {
     if (!child && !second) {                                     // already watched: another handle to that object
-        pthread_mutex_lock(&g_lock);
+        glock();
         HANDLE h = NULL;
         for (int i = 0; i < g_nwatched && !h; i++) if (g_watched[i].pid == pid && !g_watched[i].o->done) h = new_handle(g_watched[i].o);
-        pthread_mutex_unlock(&g_lock);
+        gunlock();
         if (h) return h;
     }
     vx_object *o = new_object(OBJ_PROCESS);
     o->tid = (DWORD)pid;
-    pthread_mutex_lock(&g_lock);
+    glock();
     HANDLE h = new_handle(o);
     if (second) *second = new_handle(o);
     o->refs++;                                                    // the watcher's
     if (!child && g_nwatched < 256) g_watched[g_nwatched++] = (typeof(g_watched[0])){ pid, o };
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     process_watch *w = malloc(sizeof *w);
     w->o = o; w->pid = pid; w->child = child;
     pthread_t t; pthread_attr_t a;
@@ -618,11 +658,11 @@ HANDLE vx_process_handle(int pid, int child, HANDLE *second) {
 }
 // The process ID and exit code behind a process handle (-1 for none).
 int vx_process_info(HANDLE h, DWORD *code) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = lookup(h);
     int pid = o && o->type == OBJ_PROCESS ? (int)o->tid : -1;
     if (pid >= 0 && code) *code = o->done ? o->exit_code : STILL_ACTIVE;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return pid;
 }
 static WINAPI HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid) {
@@ -637,7 +677,7 @@ static WINAPI HANDLE OpenProcess(DWORD access, BOOL inherit, DWORD pid) {
 static const char *type_name(int t) { return t == OBJ_EVENT ? "event" : t == OBJ_MUTEX ? "mutex" : t == OBJ_SEMAPHORE ? "semaphore" : "object"; }
 static HANDLE create_named(vx_object *o, const char *name) {
     if (vx_trace && name && *name) vx_log("create %s %s", type_name(o->type), name);
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *existing = name && *name ? find_named(name, o->type) : NULL;
     int shared_existed = 0;
     if (existing) { free(o); o = existing; }
@@ -652,14 +692,14 @@ static HANDLE create_named(vx_object *o, const char *name) {
         g_named[g_named_count++] = o;
     }
     HANDLE h = new_handle(o);
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (!h) { if (!existing) free(o); vx_set_last_error(4 /* ERROR_TOO_MANY_OPEN_FILES */); return NULL; }
     vx_set_last_error(existing || shared_existed ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
     return h;
 }
 static HANDLE open_named(const char *name, int type) {
     if (vx_trace && name) vx_log("open %s %s", type_name(type), name);
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = name ? find_named(name, type) : NULL;
     if (!o && name && *name && g_named_count < 1024) {             // another process's
         int existed;
@@ -671,7 +711,7 @@ static HANDLE open_named(const char *name, int type) {
         }
     }
     HANDLE h = o ? new_handle(o) : NULL;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (!o) vx_set_last_error(2 /* ERROR_FILE_NOT_FOUND */);
     return h;
 }
@@ -721,11 +761,11 @@ static WINAPI HANDLE OpenSemaphoreW(DWORD access, BOOL inherit, const WCHAR *nam
 
 // Runs `change` on the object of type `type` behind h, with the lock held, and wakes the waiters.
 static BOOL modify(HANDLE h, int type, int (*change)(vx_object *, intptr_t), intptr_t arg) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = lookup(h);
     int r = o && o->type == type ? change(o, arg) : 6 /* ERROR_INVALID_HANDLE */;
     if (!r) notify(o);
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (r) vx_set_last_error((DWORD)r);
     return r == 0;
 }
@@ -737,19 +777,19 @@ static int set_event(vx_object *o, intptr_t v) {
 static WINAPI BOOL SetEvent(HANDLE h) { return modify(h, OBJ_EVENT, set_event, 1); }
 // For threads that are not Windows threads (Core Audio's): signals an event without touching a TEB.
 void vx_set_event(HANDLE h) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = lookup(h);
     if (o && o->type == OBJ_EVENT) { set_event(o, 1); notify(o); }
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
 }
 void vx_release_semaphore(HANDLE h, LONG n) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = lookup(h);
     if (o && o->type == OBJ_SEMAPHORE && !o->sh && n > 0) {
         o->count = o->count + n > o->max ? o->max : o->count + n;
         notify(o);
     }
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
 }
 static WINAPI BOOL ResetEvent(HANDLE h) { return modify(h, OBJ_EVENT, set_event, 0); }
 static int release_mutex(vx_object *o, intptr_t tid) {
@@ -768,7 +808,7 @@ static int release_mutex(vx_object *o, intptr_t tid) {
 static WINAPI BOOL ReleaseMutex(HANDLE h) { return modify(h, OBJ_MUTEX, release_mutex, vx_current_tid()); }
 
 static WINAPI BOOL ReleaseSemaphore(HANDLE h, LONG n, LONG *previous) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = lookup(h);
     DWORD err = !o || o->type != OBJ_SEMAPHORE ? 6 : 0;
     if (!err && o->sh) {
@@ -785,7 +825,7 @@ static WINAPI BOOL ReleaseSemaphore(HANDLE h, LONG n, LONG *previous) {
             notify(o);
         }
     }
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (err) vx_set_last_error(err);
     return !err;
 }
@@ -850,12 +890,12 @@ static WINAPI DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, 
     DWORD r = wait_objects(n, hs, all, ms);
     uint64_t d = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
     if (d > 300000) {
-        pthread_mutex_lock(&g_lock);
+        glock();
         vx_object *o = n ? lookup(hs[0]) : NULL;
         int type = o ? o->type : 0;
         char name[96];
         snprintf(name, sizeof name, "%s", o && o->name ? o->name : "");
-        pthread_mutex_unlock(&g_lock);
+        gunlock();
         char from[160] = ""; size_t len = 0;                 // the program's return addresses on the stack
         uint64_t *sp = __builtin_frame_address(0);
         for (int i = 0, found = 0; i < 400 && found < 4; i++) {
@@ -875,12 +915,12 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
     struct timespec deadline;
     if (ms != INFINITE) deadline_after(&deadline, ms);
     vx_object *objs[64];
-    pthread_mutex_lock(&g_lock);
+    glock();
     int shared = 0;
     for (DWORD i = 0; i < n; i++) {
         objs[i] = lookup(hs[i]);
         if (!objs[i] && ((intptr_t)hs[i] == -1 || (intptr_t)hs[i] == -2)) objs[i] = &g_never;
-        if (!objs[i]) { pthread_mutex_unlock(&g_lock); vx_set_last_error(6); return WAIT_FAILED; }
+        if (!objs[i]) { gunlock(); vx_set_last_error(6); return WAIT_FAILED; }
         if (objs[i]->sh) shared = 1;
     }
     DWORD result;
@@ -917,8 +957,8 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
         if (alert) alert->alert_waiter = w;
         if (!shared) {
             int timed_out = 0;
-            if (ms == INFINITE) pthread_cond_wait(&w->cv, &g_lock);
-            else timed_out = pthread_cond_timedwait(&w->cv, &g_lock, &deadline) == ETIMEDOUT;
+            if (ms == INFINITE) gwait(&w->cv);
+            else timed_out = gtimedwait(&w->cv, &deadline) == ETIMEDOUT;
             if (alert) alert->alert_waiter = NULL;
             for (DWORD k = 0; k < n; k++) unwatch(objs[k], w);
             if (timed_out) { result = WAIT_TIMEOUT; break; }
@@ -934,10 +974,10 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
                     int64_t d = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000ll + (deadline.tv_nsec - now.tv_nsec);
                     if (d < (int64_t)left_ns) left_ns = d > 0 ? (uint64_t)d : 1;
                 }
-                pthread_mutex_unlock(&g_lock);
+                gunlock();
                 os_sync_wait_on_address_with_timeout((void *)&objs[0]->sh->seq, seen, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED,
                                                      OS_CLOCK_MACH_ABSOLUTE_TIME, left_ns);
-                pthread_mutex_lock(&g_lock);
+                glock();
                 slept = 1;
             }
         }
@@ -945,12 +985,12 @@ static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
             struct timespec slice = now;
             slice.tv_nsec += 1000000;
             if (slice.tv_nsec >= 1000000000) { slice.tv_sec++; slice.tv_nsec -= 1000000000; }
-            pthread_cond_timedwait(&w->cv, &g_lock, &slice);
+            gtimedwait(&w->cv, &slice);
         }
         if (alert) alert->alert_waiter = NULL;
         for (DWORD k = 0; k < n; k++) unwatch(objs[k], w);
     }
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return result;
 }
 
@@ -961,22 +1001,22 @@ static WINAPI DWORD QueueUserAPC(void (WINAPI *fn)(uintptr_t), HANDLE h, uintptr
     if (!fn) { vx_set_last_error(87); return 0; }
     apc *a = malloc(sizeof *a);
     a->fn = fn; a->data = data; a->next = NULL;
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *t = thread_object(h);
-    if (!t || t->done) { pthread_mutex_unlock(&g_lock); free(a); vx_set_last_error(6); return 0; }
+    if (!t || t->done) { gunlock(); free(a); vx_set_last_error(6); return 0; }
     apc **tail = &t->apcs;
     while (*tail) tail = &(*tail)->next;
     *tail = a;
     if (t->alert_waiter) pthread_cond_broadcast(&t->alert_waiter->cv);
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return 1;
 }
 static void run_apcs(void) {                        // (on the thread whose APCs they are, outside the lock)
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *t = self_object();
     apc *list = t->apcs;
     t->apcs = NULL;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     while (list) { apc *next = list->next; list->fn(list->data); free(list); list = next; }
 }
 static DWORD alertable_wait(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
@@ -1007,7 +1047,7 @@ static WINAPI DWORD SleepEx(DWORD ms, BOOL alertable) {
 static WINAPI BOOL CloseHandle(HANDLE h) {
     intptr_t v = (intptr_t)h;
     if (v <= -1 && v >= -6) return 1;                              // process, thread and token pseudo-handles (-4..-6: tokens)
-    pthread_mutex_lock(&g_lock);
+    glock();
     int i = handle_index(h);
     vx_object *o = i >= 0 ? g_handles[i] : NULL;
     if (o) { g_handles[i] = NULL; if (i < g_free_hint) g_free_hint = i; unref(o); }
@@ -1015,7 +1055,7 @@ static WINAPI BOOL CloseHandle(HANDLE h) {
     if (!o && (intptr_t)h >= INJECT_BASE && k < INJECT_COUNT && !(((intptr_t)h - INJECT_BASE) % 4) && g_injected[k]) {
         o = g_injected[k]; g_injected[k] = NULL; unref(o);
     }
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (o) return 1;
     int fd = vx_handle_fd(h);
     if (fd > 2) { close(fd); return 1; }
@@ -1029,17 +1069,17 @@ BOOL vx_handle_close(HANDLE h) { return CloseHandle(h); }
 HANDLE vx_handle_new(int kind, void *data, void (*destroy)(void *)) {
     vx_object *o = new_object(OBJ_OTHER);
     o->kind = kind; o->data = data; o->destroy = destroy;
-    pthread_mutex_lock(&g_lock);
+    glock();
     HANDLE h = new_handle(o);
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (!h) free(o);
     return h;
 }
 void *vx_handle_data(HANDLE h, int kind) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = lookup(h);
     void *d = o && o->type == OBJ_OTHER && o->kind == kind ? o->data : NULL;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return d;
 }
 // The type of the object behind a handle, by Windows' names for object types; NULL for none of these (security.c:
@@ -1047,10 +1087,10 @@ void *vx_handle_data(HANDLE h, int kind) {
 const char *vx_object_type(HANDLE h) {
     static const char *const names[] = { [OBJ_THREAD] = "Thread", [OBJ_EVENT] = "Event", [OBJ_MUTEX] = "Mutant",
                                          [OBJ_SEMAPHORE] = "Semaphore", [OBJ_PORT] = "IoCompletion", [OBJ_PROCESS] = "Process" };
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = lookup(h);
     int type = o ? o->type : 0;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return type > 0 && type < (int)(sizeof names / sizeof *names) ? names[type] : NULL;
 }
 // What NtQueryObject tells about a handle (src/kernelx.c): its object (an identity only), the Windows type of this
@@ -1058,7 +1098,7 @@ const char *vx_object_type(HANDLE h) {
 // number of handles to it. 0 if h is no handle of the table (GetCurrentThread's counts as one).
 int vx_handle_object(HANDLE h, const void **id, const char **type, int *kind, char *name, size_t cap, DWORD *handles) {
     static const char *const types[] = { NULL, "Thread", "Event", "Mutant", "Semaphore", NULL, "IoCompletion", "Process" };
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = (intptr_t)h == -2 ? self_object() : lookup(h);
     if (o) {
         if (id) *id = o;
@@ -1072,15 +1112,15 @@ int vx_handle_object(HANDLE h, const void **id, const char **type, int *kind, ch
             *handles = n;
         }
     }
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return o != NULL;
 }
 DWORD vx_handle_count(void) {                    // the table's handles (GetProcessHandleCount)
-    pthread_mutex_lock(&g_lock);
+    glock();
     DWORD n = 0;
     for (int i = 0; i < g_handle_top; i++) n += g_handles[i] != NULL;
     for (int i = 0; i < INJECT_COUNT; i++) n += g_injected[i] != NULL;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return n;
 }
 
@@ -1131,9 +1171,9 @@ static vx_object *injected(HANDLE h) {                           // with g_lock 
         o = new_object(OBJ_OTHER);
         o->kind = VX_HANDLE_MAPPING; o->data = data; o->destroy = destroy;
     } else if (e.kind == 3) {
-        pthread_mutex_unlock(&g_lock);
+        gunlock();
         HANDLE ph = vx_process_handle((int)e.size, 0, NULL);
-        pthread_mutex_lock(&g_lock);
+        glock();
         int i = handle_index(ph);
         o = i >= 0 ? g_handles[i] : NULL;
         if (o) { o->refs++; g_handles[i] = NULL; if (i < g_free_hint) g_free_hint = i; unref(o); }      // keep the object, drop the extra handle
@@ -1165,21 +1205,21 @@ static int make_shareable(vx_object *o) {
 }
 static HANDLE give_to_process(int pid, HANDLE src) {
     inbox_entry e = { 0 };
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = lookup(src);
     if (o && (o->type == OBJ_EVENT || o->type == OBJ_MUTEX || o->type == OBJ_SEMAPHORE) && make_shareable(o)) {
         e.kind = 1; e.type = o->type; snprintf(e.name, sizeof e.name, "%s", o->name);
     } else if (o && o->type == OBJ_PROCESS) {
         e.kind = 3; e.size = o->tid;
     } else if (o && o->type == OBJ_OTHER && o->kind == VX_HANDLE_MAPPING) {
-        pthread_mutex_unlock(&g_lock);
+        gunlock();
         if (!vx_mapping_shm(src, e.name, sizeof e.name, &e.size)) { vx_set_last_error(50); return NULL; }
         e.kind = 2;
-        pthread_mutex_lock(&g_lock);
+        glock();
     } else if ((intptr_t)src == -1) {
         e.kind = 3; e.size = (uint64_t)getpid();
     }
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (!e.kind) { vx_log("DuplicateHandle: handle %p cannot go to another process yet", src); vx_set_last_error(50); return NULL; }
     if (e.kind == 1) {                                             // held for the other process until it takes it
         char shm[40];
@@ -1211,10 +1251,10 @@ static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_pr
         return 1;
     }
     if ((intptr_t)src == -1) { *dst = src; return 1; }
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = (intptr_t)src == -2 ? self_object() : lookup(src);
     HANDLE h = o ? new_handle(o) : NULL;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (!o) {
         int fd = vx_handle_fd(src);
         if (fd < 0) { vx_set_last_error(6); return 0; }
@@ -1514,11 +1554,11 @@ static fls_callback g_fls_callbacks[MAX_FLS];
 static uint8_t g_fls_used[MAX_FLS];
 static __thread void *t_fls[MAX_FLS];
 static WINAPI DWORD FlsAlloc(fls_callback cb) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     DWORD i = 0;
     while (i < MAX_FLS && g_fls_used[i]) i++;
     if (i < MAX_FLS) { g_fls_used[i] = 1; g_fls_callbacks[i] = cb; }
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (i == MAX_FLS) { vx_set_last_error(8); return 0xffffffffu; }   // FLS_OUT_OF_INDEXES
     return i;
 }
@@ -1583,14 +1623,14 @@ static void post_packet(vx_object *port, DWORD bytes, uint64_t key, void *ov, DW
 
 static WINAPI HANDLE CreateIoCompletionPort(HANDLE file, HANDLE existing, uint64_t key, DWORD threads) {
     (void)threads;
-    pthread_mutex_lock(&g_lock);
+    glock();
     HANDLE port = existing;
     if (!existing) {
         vx_object *o = new_object(OBJ_PORT);
         port = new_handle(o);
-        if (!port) { free(o); pthread_mutex_unlock(&g_lock); vx_set_last_error(4); return NULL; }
+        if (!port) { free(o); gunlock(); vx_set_last_error(4); return NULL; }
     } else if (!lookup(existing) || lookup(existing)->type != OBJ_PORT) {
-        pthread_mutex_unlock(&g_lock); vx_set_last_error(87); return NULL;
+        gunlock(); vx_set_last_error(87); return NULL;
     }
     if (file != (HANDLE)(intptr_t)-1) {
         int i = 0;
@@ -1598,14 +1638,14 @@ static WINAPI HANDLE CreateIoCompletionPort(HANDLE file, HANDLE existing, uint64
         if (i == g_assoc_count && g_assoc_count < 1024) g_assoc_count++;
         if (i < 1024) g_assoc[i] = (association){ file, port, key, 0 };
     }
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return port;
 }
 #define FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 1
 static WINAPI BOOL SetFileCompletionNotificationModes(HANDLE file, uint8_t flags) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     for (int i = 0; i < g_assoc_count; i++) if (g_assoc[i].handle == file) g_assoc[i].skip_on_success = flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return 1;
 }
 // Called by the file and socket functions when an overlapped operation completes. OVERLAPPED: Internal (status),
@@ -1615,7 +1655,7 @@ void vx_io_completed(HANDLE file, void *ov, DWORD bytes, DWORD status) {
     uint64_t *o = ov;
     o[0] = status; o[1] = bytes;
     HANDLE event = *(HANDLE *)((uint8_t *)ov + 24);
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *e = lookup((HANDLE)((uintptr_t)event & ~(uintptr_t)1));
     if (e && e->type == OBJ_EVENT) { e->signaled = 1; notify(e); }
     if (!((uintptr_t)event & 1)) {
@@ -1627,13 +1667,13 @@ void vx_io_completed(HANDLE file, void *ov, DWORD bytes, DWORD status) {
         }
     }
     pthread_cond_broadcast(&g_changed);
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
 }
 static WINAPI BOOL PostQueuedCompletionStatus(HANDLE port, DWORD bytes, uint64_t key, void *ov) {
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = lookup(port);
     if (o && o->type == OBJ_PORT) post_packet(o, bytes, key, ov, 0);
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     if (!o || o->type != OBJ_PORT) { vx_set_last_error(6); return 0; }
     return 1;
 }
@@ -1643,9 +1683,9 @@ static int take_packets(HANDLE port, packet *out, int max, DWORD ms, DWORD *err)
     if (ms != INFINITE) deadline_after(&deadline, ms);
     int n = 0;
     *err = 0;
-    pthread_mutex_lock(&g_lock);
+    glock();
     vx_object *o = lookup(port);
-    if (!o || o->type != OBJ_PORT) { pthread_mutex_unlock(&g_lock); *err = 6; return 0; }
+    if (!o || o->type != OBJ_PORT) { gunlock(); *err = 6; return 0; }
     o->refs++;                                               // the port stays alive while waited on
     for (;;) {
         while (n < max && o->packets) {
@@ -1657,11 +1697,11 @@ static int take_packets(HANDLE port, packet *out, int max, DWORD ms, DWORD *err)
         if (n) break;
         if (o->closed) { *err = 735; break; }               // ERROR_ABANDONED_WAIT_0
         if (ms == 0) { *err = 258; break; }                  // WAIT_TIMEOUT
-        if (ms == INFINITE) pthread_cond_wait(&g_changed, &g_lock);
-        else if (pthread_cond_timedwait(&g_changed, &g_lock, &deadline) == ETIMEDOUT) { *err = 258; break; }
+        if (ms == INFINITE) gwait(&g_changed);
+        else if (gtimedwait(&g_changed, &deadline) == ETIMEDOUT) { *err = 258; break; }
     }
     unref(o);
-    pthread_mutex_unlock(&g_lock);
+    gunlock();
     return n;
 }
 static WINAPI BOOL GetQueuedCompletionStatus(HANDLE port, DWORD *bytes, uint64_t *key, void **ov, DWORD ms) {

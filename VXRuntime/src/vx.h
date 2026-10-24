@@ -100,7 +100,7 @@ void vx_profile_finish(void);                // writes the report now (ExitProce
 enum {
     TEB_EXCEPTION_LIST = 0x00, TEB_STACK_BASE = 0x08, TEB_STACK_LIMIT = 0x10, TEB_SELF = 0x30,
     TEB_CLIENT_ID = 0x40, TEB_TLS_POINTER = 0x58, TEB_PEB = 0x60, TEB_LAST_ERROR = 0x68,
-    TEB_TLS_SLOTS = 0x1480, TEB_SIZE = 0x2000,
+    TEB_TLS_SLOTS = 0x1480, TEB_TLS_EXPANSION = 0x1780, TEB_SIZE = 0x2000,
 };
 enum { PEB_IMAGE_BASE = 0x10, PEB_PROCESS_HEAP = 0x30, PEB_SIZE = 0x1000 };
 uint8_t *vx_teb(void);                 // this thread's TEB (creates it on first use)

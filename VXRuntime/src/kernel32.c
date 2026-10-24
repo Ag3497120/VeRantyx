@@ -548,24 +548,46 @@ static WINAPI void GetSystemTimeAsFileTime(uint64_t *ft) {
 }
 static WINAPI void GetSystemTimePreciseAsFileTime(uint64_t *ft) { GetSystemTimeAsFileTime(ft); }
 
-// ---- TLS slots (TEB + 0x1480, 64 of them) --------------------------------------------------------------------------------
-static uint64_t g_tls_used;
+// ---- TLS slots: 64 in the TEB (+0x1480) and, as on Windows since Windows 2000, 1024 more (TLS_EXPANSION_SLOTS) in a
+// block the TEB points to (+0x1780, TlsExpansionSlots), made for a thread when it first stores a value there.
+// Valve's tier0 stops with "Out of thread local storage!" when TlsAlloc fails: Steam's client takes more than 64.
+#define TLS_MINIMUM_AVAILABLE 64
+#define TLS_EXPANSION_SLOTS 1024
+#define TLS_INDEXES (TLS_MINIMUM_AVAILABLE + TLS_EXPANSION_SLOTS)
+static uint64_t g_tls_used[TLS_INDEXES / 64];
 static WINAPI DWORD TlsAlloc(void) {
-    for (DWORD i = 0; i < 64; i++)
-        if (!(__sync_fetch_and_or(&g_tls_used, 1ull << i) & (1ull << i))) return i;
+    for (DWORD i = 0; i < TLS_INDEXES; i++)
+        if (!(__sync_fetch_and_or(&g_tls_used[i / 64], 1ull << (i % 64)) & (1ull << (i % 64)))) return i;
+    vx_set_last_error(8 /* ERROR_NOT_ENOUGH_MEMORY */);
     return 0xffffffffu;   // TLS_OUT_OF_INDEXES
 }
-static WINAPI BOOL TlsFree(DWORD i) { if (i >= 64) return 0; __sync_fetch_and_and(&g_tls_used, ~(1ull << i)); return 1; }
+static WINAPI BOOL TlsFree(DWORD i) {
+    if (i >= TLS_INDEXES || !(g_tls_used[i / 64] & (1ull << (i % 64)))) { vx_set_last_error(87); return 0; }
+    __sync_fetch_and_and(&g_tls_used[i / 64], ~(1ull << (i % 64)));
+    return 1;
+}
+static void **tls_expansion(int make) {
+    void ***slot = (void ***)(vx_teb() + TEB_TLS_EXPANSION);
+    if (!*slot && make) *slot = calloc(TLS_EXPANSION_SLOTS, sizeof(void *));
+    return *slot;
+}
 static WINAPI void *TlsGetValue(DWORD i) {
-    if (i >= 64) { vx_set_last_error(87); return NULL; }
+    if (i >= TLS_INDEXES) { vx_set_last_error(87); return NULL; }
     vx_set_last_error(0);
+    if (i >= TLS_MINIMUM_AVAILABLE) { void **x = tls_expansion(0); return x ? x[i - TLS_MINIMUM_AVAILABLE] : NULL; }
     return ((void **)(vx_teb() + TEB_TLS_SLOTS))[i];
 }
 // The value is also put at gs:0x1480 + 8i, where the slot is on Windows: code compiled for Windows reads it there
 // directly (Mono's JIT does: Unity games read a garbage slot and recursed on NullReferenceExceptions until the stack
 // ran out). On macOS that is a TSD slot pthread keys reach only after some 400 of them exist.
 static WINAPI BOOL TlsSetValue(DWORD i, void *v) {
-    if (i >= 64) { vx_set_last_error(87); return 0; }
+    if (i >= TLS_INDEXES) { vx_set_last_error(87); return 0; }
+    if (i >= TLS_MINIMUM_AVAILABLE) {
+        void **x = tls_expansion(1);
+        if (!x) { vx_set_last_error(8); return 0; }
+        x[i - TLS_MINIMUM_AVAILABLE] = v;
+        return 1;
+    }
     ((void **)(vx_teb() + TEB_TLS_SLOTS))[i] = v;
 #ifndef __aarch64__
     __asm__ volatile("movq %0, %%gs:(%1)" :: "r"(v), "r"((uint64_t)TEB_TLS_SLOTS + 8ull * i) : "memory");

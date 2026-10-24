@@ -154,7 +154,14 @@ static vx_queue *queue_of_thread(DWORD tid) {
     return q;
 }
 
+// A click from Command Clips (vx_ui_click) is where the program sees the pointer for a moment, as a real click puts
+// it there: programs that hit-test with GetCursorPos and WindowFromPoint rather than the message's coordinates (Steam's
+// vgui) find the window and the place clicked. The Mac's own pointer does not move.
+static struct { int on; POINT pt; DWORD until; } g_clip_cursor;
+#define CLIP_CURSOR_MS 1000
+static DWORD tick_ms(void);
 static void cursor_pos(POINT *p) {
+    if (__atomic_load_n(&g_clip_cursor.on, __ATOMIC_ACQUIRE) && (int32_t)(g_clip_cursor.until - tick_ms()) > 0) { *p = g_clip_cursor.pt; return; }
     CGEventRef e = CGEventCreate(NULL);
     CGPoint c = e ? CGEventGetLocation(e) : CGPointZero;
     if (e) CFRelease(e);
@@ -1025,6 +1032,42 @@ static WINAPI BOOL ClientToScreen(HANDLE h, POINT *p) {
     p->x += o.x; p->y += o.y;
     return 1;
 }
+// WindowFromPoint: the visible, enabled window of this process under a point on the screen, its deepest such child
+// (Microsoft's documentation: hidden and disabled windows are not retrieved). The active window first when the point
+// is in it, then the newest top-level window (VXRuntime keeps no z-order: an owned popup is made after its owner).
+// Elsewhere (another program's window, the desktop): NULL.
+static int window_takes_point(vx_window *w, POINT p) {
+    if (!w || w->destroyed || !w->visible || !w->enabled) return 0;
+    pthread_mutex_lock(&w->lock);
+    RECT r = w->rect;
+    pthread_mutex_unlock(&w->lock);
+    return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+}
+static HANDLE window_from_point(POINT p) {
+    pthread_mutex_lock(&g_win_lock);
+    vx_window *top = NULL;
+    vx_window *a = g_active ? vx_window_get(g_active) : NULL;
+    if (a && !(a->style & WS_CHILD) && window_takes_point(a, p)) top = a;
+    for (int i = g_window_next - 1; i >= 0 && !top; i--) {
+        vx_window *w = g_windows[i];
+        if (w && !(w->style & WS_CHILD) && window_takes_point(w, p)) top = w;
+    }
+    // down through the children (their rectangles as GetWindowRect has them)
+    for (int deeper = top != NULL; deeper; ) {
+        deeper = 0;
+        for (int i = g_window_next - 1; i >= 0; i--) {
+            vx_window *w = g_windows[i];
+            if (w && (w->style & WS_CHILD) && w->parent == top->hwnd && window_takes_point(w, p)) { top = w; deeper = 1; break; }
+        }
+    }
+    HANDLE h = top ? top->hwnd : NULL;
+    pthread_mutex_unlock(&g_win_lock);
+    return h;
+}
+static WINAPI HANDLE WindowFromPoint(int64_t packed) {
+    POINT p = { (LONG)(int32_t)(uint32_t)packed, (LONG)(int32_t)(uint32_t)((uint64_t)packed >> 32) };
+    return window_from_point(p);
+}
 static WINAPI BOOL ScreenToClient(HANDLE h, POINT *p) {
     vx_window *w = vx_window_get(h);
     if (!w) return 0;
@@ -1046,12 +1089,30 @@ static WINAPI int MapWindowPoints(HANDLE from, HANDLE to, POINT *pts, uint32_t n
 #define SWP_NOACTIVATE 0x10
 #define SWP_SHOWWINDOW 0x40
 #define SWP_HIDEWINDOW 0x80
+#define SWP_NOSENDCHANGING 0x400
+#define WM_WINDOWPOSCHANGING 0x46
+typedef struct { HANDLE hwnd, after; int x, y, cx, cy; uint32_t flags; } WINDOWPOS;
 static WINAPI BOOL SetWindowPos(HANDLE h, HANDLE after, int x, int y, int cx, int cy, uint32_t flags) {
-    (void)after;
     vx_window *w = vx_window_get(h);
     if (!w) { vx_set_last_error(1400); return 0; }
+    // As on Windows, the window procedure hears of the change: WM_WINDOWPOSCHANGING before (it may alter the position
+    // and size asked for), WM_WINDOWPOSCHANGED after, with the window's new place. Steam's vgui windows make their
+    // back buffer the new size there (without it the Steam Service Error box was drawn from a stale 128x66 buffer).
+    // Only from the window's own thread: another thread's window is not made to wait (a game's render thread moving
+    // its window while the window's thread waits for it would never return).
+    int own = w->tid == vx_current_tid();
     pthread_mutex_lock(&w->lock);
     RECT r = w->rect;
+    pthread_mutex_unlock(&w->lock);
+    WINDOWPOS wp = { h, after, flags & SWP_NOMOVE ? r.left : x, flags & SWP_NOMOVE ? r.top : y,
+                     flags & SWP_NOSIZE ? r.right - r.left : cx, flags & SWP_NOSIZE ? r.bottom - r.top : cy, flags };
+    if (own && !(flags & SWP_NOSENDCHANGING)) {
+        call_proc(w, WM_WINDOWPOSCHANGING, 0, (LPARAM)&wp);
+        if (!vx_window_get(h)) return 1;                        // (destroyed by it)
+        x = wp.x; y = wp.y; cx = wp.cx; cy = wp.cy;
+    }
+    pthread_mutex_lock(&w->lock);
+    r = w->rect;
     if (!(flags & SWP_NOMOVE)) { r.right += x - r.left; r.bottom += y - r.top; r.left = x; r.top = y; }
     if (!(flags & SWP_NOSIZE)) { r.right = r.left + cx; r.bottom = r.top + cy; }
     w->rect = r;
@@ -1060,6 +1121,13 @@ static WINAPI BOOL SetWindowPos(HANDLE h, HANDLE after, int x, int y, int cx, in
     else vx_cocoa_set_frame(w);
     if (flags & SWP_SHOWWINDOW) vx_ShowWindow(h, flags & SWP_NOACTIVATE ? 8 : 5);
     if (flags & SWP_HIDEWINDOW) vx_ShowWindow(h, 0);
+    if (own && vx_window_get(h)) {
+        pthread_mutex_lock(&w->lock);
+        r = w->rect;
+        pthread_mutex_unlock(&w->lock);
+        wp = (WINDOWPOS){ h, after, r.left, r.top, r.right - r.left, r.bottom - r.top, flags };
+        call_proc(w, WM_WINDOWPOSCHANGED, 0, (LPARAM)&wp);
+    }
     return 1;
 }
 static WINAPI BOOL MoveWindow(HANDLE h, int x, int y, int cx, int cy, BOOL repaint) { (void)repaint; return SetWindowPos(h, NULL, x, y, cx, cy, 0); }
@@ -1634,9 +1702,27 @@ int vx_ui_snapshot(HANDLE hwnd, const char *png) {
 void vx_ui_click(HANDLE hwnd, int x, int y) {
     vx_window *w = vx_window_get(hwnd);
     if (!w) return;
+    POINT o; client_origin(w, &o);
+    g_clip_cursor.pt = (POINT){ o.x + x, o.y + y };
+    g_clip_cursor.until = tick_ms() + CLIP_CURSOR_MS;
+    __atomic_store_n(&g_clip_cursor.on, 1, __ATOMIC_RELEASE);
+    // As a click does on Windows, it makes the window's top-level window the active one (the Mac's frontmost app
+    // stays as it is). Programs that take mouse input only while one of their windows is in front (vgui asks
+    // GetForegroundWindow each frame) need that.
+    vx_window *top = w;
+    for (int n = 0; n < 64 && (top->style & WS_CHILD) && vx_window_get(top->parent); n++) top = vx_window_get(top->parent);
+    if (g_active != top->hwnd) {
+        vx_window *was = g_active ? vx_window_get(g_active) : NULL;
+        if (was) vx_window_activated(was, 0);
+        vx_window_activated(top, 1);
+    }
+    // The pointer arrives first and the button follows a moment later, as a hand does: programs that look for the
+    // control under the pointer once per frame (vgui) then press the one it is on.
     LPARAM at = (LPARAM)((uint32_t)(uint16_t)x | (uint32_t)(uint16_t)y << 16);
     queue_post(w->queue, hwnd, WM_MOUSEMOVE, 0, at);
+    usleep(150000);
     queue_post(w->queue, hwnd, WM_LBUTTONDOWN, 1 /* MK_LBUTTON */, at);
+    usleep(50000);
     queue_post(w->queue, hwnd, WM_LBUTTONUP, 0, at);
 }
 void vx_ui_key(HANDLE hwnd, int vk) {
@@ -1684,7 +1770,7 @@ static const vx_export user32[] = {
     VX_EXPORT(GetUpdateRect), VX_EXPORT(RedrawWindow),
     VX_EXPORT(GetKeyState), VX_EXPORT(GetAsyncKeyState), VX_EXPORT(GetKeyboardState), VX_EXPORT(MapVirtualKeyA), VX_EXPORT(MapVirtualKeyW),
     VX_EXPORT(MapVirtualKeyExA), VX_EXPORT(MapVirtualKeyExW), VX_EXPORT(GetKeyboardLayout), VX_EXPORT(GetKeyboardType), VX_EXPORT(GetKeyNameTextA),
-    VX_EXPORT(GetCursorPos), VX_EXPORT(SetCursorPos), VX_EXPORT(ShowCursor), VX_EXPORT(SetCursor), VX_EXPORT(GetCursor),
+    VX_EXPORT(GetCursorPos), VX_EXPORT(SetCursorPos), VX_EXPORT(WindowFromPoint), VX_EXPORT(ShowCursor), VX_EXPORT(SetCursor), VX_EXPORT(GetCursor),
     VX_EXPORT(LoadCursorA), VX_EXPORT(LoadCursorW), VX_EXPORT(LoadIconA), VX_EXPORT(LoadIconW), VX_EXPORT(LoadImageA), VX_EXPORT(LoadImageW),
     VX_EXPORT(DestroyCursor), VX_EXPORT(DestroyIcon), VX_EXPORT(ClipCursor), VX_EXPORT(GetClipCursor),
     VX_EXPORT(SetCapture), VX_EXPORT(ReleaseCapture), VX_EXPORT(GetCapture), VX_EXPORT(TrackMouseEvent), VX_EXPORT(GetDoubleClickTime),

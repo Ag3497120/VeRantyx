@@ -1,9 +1,12 @@
 // Command Clips (src/control.c): a small window that tests/clip_check.py drives without looking at the screen. It
 // draws, through a memory DC and BitBlt as most programs double-buffer, a counter, a "[ Add ]" button that a click
 // increments it with, the characters typed, and takes R (the key) to reset the counter. It exits on WM_CLOSE.
+// A click also has to look like one to programs that hit-test the pointer themselves (Steam's vgui): at the press,
+// GetCursorPos is the clicked place, WindowFromPoint there is this window and it is the foreground window
+// ("pointer=" in the exit line counts the presses where all three held).
 #include <windows.h>
 #include <stdio.h>
-static int count;
+static int count, pointer_ok, presses;
 static char typed[64];
 
 static void paint(HWND h) {
@@ -34,6 +37,11 @@ static LRESULT CALLBACK proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_PAINT: paint(h); return 0;
     case WM_LBUTTONDOWN: {
         int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+        POINT at; GetCursorPos(&at);
+        HWND under = WindowFromPoint(at);
+        ScreenToClient(h, &at);
+        presses++;
+        if (at.x == x && at.y == y && under == h && GetForegroundWindow() == h) pointer_ok++;
         if (x >= 20 && x < 120 && y >= 60 && y < 90) { count++; InvalidateRect(h, NULL, FALSE); }
         return 0;
     }
@@ -56,6 +64,6 @@ int main(void) {
     if (!h) { printf("clip: no window\n"); return 1; }
     MSG msg;
     while (GetMessageA(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageA(&msg); }
-    printf("clip: count=%d typed=%s\n", count, typed);
+    printf("clip: count=%d typed=%s pointer=%d/%d\n", count, typed, pointer_ok, presses);
     return 0;
 }

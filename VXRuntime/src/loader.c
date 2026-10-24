@@ -288,6 +288,7 @@ void vx_thread_detach(void) {
     void **tls = *(void ***)(teb + TEB_TLS_POINTER);
     for (int i = 0; i < MAX_TLS_MODULES; i++) free(tls[i]);
     free(tls);
+    free(*(void **)(teb + TEB_TLS_EXPANSION));                // (TlsSetValue's slots past the 64th)
     pthread_setspecific(g_teb_key, NULL);
 #ifdef __aarch64__
     void vx_arm64_thread_exit(void);
@@ -509,8 +510,23 @@ static vx_image *load_pe(const char *path, int is_main) {
     pe_dir dirs[16];
     for (uint32_t i = 0; i < 16; i++) dirs[i] = (pe_dir){ pe.directories[i].rva, pe.directories[i].size };
 
+    // A DLL loaded again after its last FreeLibrary (SDL's libusb-1.0.dll in Steam: loaded, found wanting, freed, a few
+    // times a second) gets a fresh copy where the last one was, and that one's place in the table: the table would
+    // otherwise fill up ("too many images" within a minute) and the memory grow with every load. On Windows the
+    // unloaded copy is unmapped; here the same file's pages come back at the same addresses, so code of it still
+    // running on another thread finds the same instructions.
+    int reuse = -1;
+    if (!is_main) {
+        char *real = realpath(path, NULL);
+        for (int i = 0; real && i < g_image_count; i++) {
+            const vx_image *o = g_images[i];
+            if (o->unloaded && !o->pinned && o->is_dll && o->size == image_size && o->unix_path && !strcmp(o->unix_path, real)) { reuse = i; break; }
+        }
+        free(real);
+    }
     // Map at the preferred base when free, anywhere otherwise (then relocate).
-    uint8_t *base = mmap((void *)pref_base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    uint8_t *base = reuse >= 0 ? mmap(g_images[reuse]->base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0)
+                               : mmap((void *)pref_base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (base == MAP_FAILED) { vx_log("cannot map %u bytes", image_size); free(file); return NULL; }
     memcpy(base, file, headers_size);
     const pe_section *sec = (const pe_section *)(file + section_table_offset);
@@ -558,17 +574,30 @@ static vx_image *load_pe(const char *path, int is_main) {
         vx_proc.image_size = image_size;
         *(void **)(g_peb + PEB_IMAGE_BASE) = base;
     }
-    if (g_image_count == MAX_IMAGES) { vx_log("too many images"); return NULL; }
-    g_images[g_image_count] = m;
-    __atomic_store_n(&g_image_count, g_image_count + 1, __ATOMIC_RELEASE);   // visible before imports load (cycles)
-    if (vx_trace) vx_log("%s mapped at %p", m->name, base);
+    DWORD reused_tls = ~0u;
+    if (reuse >= 0) {
+        reused_tls = g_images[reuse]->tls_index;
+        // (the old entry itself is kept, not freed: a thread unwinding through that code may still hold it)
+        __atomic_store_n(&g_images[reuse], m, __ATOMIC_RELEASE);
+    } else {
+        if (g_image_count == MAX_IMAGES) { vx_log("too many images"); return NULL; }
+        g_images[g_image_count] = m;
+        __atomic_store_n(&g_image_count, g_image_count + 1, __ATOMIC_RELEASE);   // visible before imports load (cycles)
+    }
+    if (vx_trace) vx_log("%s mapped at %p%s", m->name, base, reuse >= 0 ? " (again, where its unloaded copy was)" : "");
 
-    // TLS: an index for this image and a block on every thread that exists already.
+    // TLS: an index for this image (its unloaded copy's, when it had one) and a block on every thread that exists
+    // already.
     if (m->tls_rva) {
-        m->tls_index = g_next_tls_index++;
+        if (reused_tls == ~0u && g_next_tls_index >= MAX_TLS_MODULES) { vx_log("%s: too many images with TLS", m->name); return NULL; }
+        m->tls_index = reused_tls != ~0u ? reused_tls : g_next_tls_index++;
         *(uint32_t *)rd64(base + m->tls_rva + 16) = m->tls_index;
         pthread_mutex_lock(&g_tebs_lock);
-        for (int i = 0; i < g_teb_count; i++) (*(void ***)(g_tebs[i] + TEB_TLS_POINTER))[m->tls_index] = tls_block(m);
+        for (int i = 0; i < g_teb_count; i++) {
+            void **slot = &(*(void ***)(g_tebs[i] + TEB_TLS_POINTER))[m->tls_index];
+            free(*slot);
+            *slot = tls_block(m);
+        }
         pthread_mutex_unlock(&g_tebs_lock);
     }
 

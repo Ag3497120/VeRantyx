@@ -418,7 +418,12 @@ static WINAPI BOOL msimg_ok(void) { return 1; }                   // AlphaBlend,
 static WINAPI uintptr_t SHAppBarMessage(DWORD msg, void *data) { (void)msg; (void)data; return 0; }
 static WINAPI HANDLE CopyImage(HANDLE h, unsigned type, int cx, int cy, unsigned flags) { (void)type; (void)cx; (void)cy; (void)flags; return h; }
 static WINAPI BOOL caret_ok(void) { return 1; }                   // CreateCaret, DestroyCaret, SetCaretPos, ShowCaret, HideCaret
-static WINAPI uint16_t GetClassWord(HANDLE w, int index) { (void)w; (void)index; return 0; }
+// GetClassWord: GCW_ATOM (-32), the class's atom (Steam's vgui asks it of the window under the pointer to know its own
+// windows); other indexes as GetClassLongPtrW answers them (the extra class bytes: 0).
+static WINAPI uint16_t GetClassWord(HANDLE w, int index) {
+    uint64_t (WINAPI *get)(HANDLE, int) = (uint64_t (WINAPI *)(HANDLE, int))vx_find_export("user32.dll", "GetClassLongPtrW");
+    return get ? (uint16_t)get(w, index) : 0;
+}
 static WINAPI BOOL OffsetRect(RECT *r, int dx, int dy) { if (!r) return 0; r->left += dx; r->right += dx; r->top += dy; r->bottom += dy; return 1; }
 static WINAPI BOOL GetOpenFileNameW(void *ofn) { (void)ofn; return 0; }   // cancelled
 static WINAPI DWORD CommDlgExtendedError(void) { return 0; }

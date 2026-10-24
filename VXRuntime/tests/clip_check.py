@@ -37,7 +37,7 @@ def main():
         check(not c.click_text("nothing like this")["ok"], "click-text on text that is not there")
         c.close()
         out, _ = p.communicate(timeout=20)
-        check(p.returncode == 0 and "count=0 typed=hi there" in out, f"exit {p.returncode}: {out.strip()[-300:]}")
+        check(p.returncode == 0 and "count=0 typed=hi there pointer=3/3" in out, f"exit {p.returncode}: {out.strip()[-300:]}")
     except Exception as e:
         failures.append(repr(e)); print("clip:", repr(e))
         p.kill()

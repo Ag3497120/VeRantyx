@@ -283,7 +283,6 @@ static WINAPI HANDLE GetPropA(void *wnd, const char *name) { WCHAR *w = (uintptr
 static WINAPI HANDLE RemovePropA(void *wnd, const char *name) { WCHAR *w = (uintptr_t)name < 0x10000 ? (WCHAR *)name : vx_utf16_dup(name); HANDLE r = RemovePropW(wnd, w); if ((uintptr_t)name >= 0x10000) free(w); return r; }
 static WINAPI BOOL IsRectEmpty(const RECT *r) { return !r || r->right <= r->left || r->bottom <= r->top; }
 static WINAPI intptr_t GetMessageExtraInfo(void) { return 0; }
-static WINAPI void *WindowFromPoint(int64_t pt) { (void)pt; return NULL; }
 static WINAPI void *GetTopWindow(void *wnd) { (void)wnd; return NULL; }
 static WINAPI BOOL FlashWindow(void *wnd, BOOL invert) { (void)wnd; (void)invert; return 0; }
 static WINAPI BOOL FlashWindowEx(void *info) { (void)info; return 0; }
@@ -499,7 +498,7 @@ static const vx_export user32[] = {
     VX_EXPORT(InsertMenuItemA), VX_EXPORT(InsertMenuItemW), VX_EXPORT(AppendMenuA), VX_EXPORT(AppendMenuW), VX_EXPORT(CheckMenuItem),
     VX_EXPORT(EnableMenuItem), VX_EXPORT(SetMenuItemInfoA), VX_EXPORT(SetMenuItemInfoW), VX_EXPORT(GetMenuItemCount),
     VX_EXPORT(TrackPopupMenu), VX_EXPORT(SetPropW), VX_EXPORT(GetPropW), VX_EXPORT(RemovePropW), VX_EXPORT(SetPropA), VX_EXPORT(GetPropA), VX_EXPORT(RemovePropA),
-    VX_EXPORT(IsRectEmpty), VX_EXPORT(GetMessageExtraInfo), VX_EXPORT(WindowFromPoint), VX_EXPORT(GetTopWindow), VX_EXPORT(FlashWindow),
+    VX_EXPORT(IsRectEmpty), VX_EXPORT(GetMessageExtraInfo), VX_EXPORT(GetTopWindow), VX_EXPORT(FlashWindow),
     VX_EXPORT(FlashWindowEx), VX_EXPORT(SetLayeredWindowAttributes), VX_EXPORT(SetWindowRgn), VX_EXPORT(WaitForInputIdle),
     VX_EXPORT(ToUnicode), VX_EXPORT(RegisterDeviceNotificationW), VX_EXPORT(RegisterDeviceNotificationA),
     VX_EXPORT(UnregisterDeviceNotification), VX_EXPORT(EmptyClipboard), VX_EXPORT(GetClipboardData), VX_EXPORT(SetClipboardData),
