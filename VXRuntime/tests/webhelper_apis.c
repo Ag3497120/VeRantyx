@@ -72,6 +72,11 @@ static void test_paths(void) {
     CHECK(!wcscmp(find_name(p), L"file.name.txt") && !wcscmp(find_ext(p), L".txt"));
     CHECK(!wcscmp(find_name(L"C:\\dir\\sub\\"), L"sub\\") && !wcscmp(find_name(L"c:file"), L"file"));
     CHECK(!wcscmp(find_name(L"plain"), L"plain") && !wcscmp(find_name(L"a/b"), L"b"));
+    const WCHAR *root = L"C:\\", *seps = L"\\\\", *empty = L"";
+    CHECK(find_name(root) == root && find_name(seps) == seps && find_name(empty) == empty);   // no component: whole
+    CHECK(!wcscmp(find_name(L"x\\made\\up//"), L"up//") && !wcscmp(find_name(L"d:\\top"), L"top"));
+    LPSTR (WINAPI *find_name_a)(LPCSTR) = (LPSTR (WINAPI *)(LPCSTR))GetProcAddress(shlwapi, "PathFindFileNameA");
+    CHECK(find_name_a && !strcmp(find_name_a("made\\up\\name.bin"), "name.bin"));
     const WCHAR *no_ext = L"C:\\dir.d\\file";
     CHECK(find_ext(no_ext) == no_ext + wcslen(no_ext));                   // the terminating NUL
     CHECK(!strcmp(find_ext_a("x\\y.tar.gz"), ".gz"));

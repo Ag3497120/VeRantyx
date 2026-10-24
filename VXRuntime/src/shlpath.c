@@ -11,14 +11,21 @@ enum { PMSF_NORMAL = 0, PMSF_MULTIPLE = 1, PMSF_DONT_STRIP_SPACES = 0x10000 };
 
 // The same code for the A (bytes) and W (UTF-16) forms: CH is the character type.
 #define DEFINE_PATH_FUNCTIONS(SUFFIX, CH)                                                                                \
-/* The last component: after the last \, / or drive colon that is followed by more than separators ("c:\a\b\" ->  */ \
-/* "b\"); the whole string when there is none. */                                                                     \
+/* The last component. Microsoft's page documents "c:\path\file" -> "file" and that the whole string comes back   */ \
+/* when there is no separator. Separators here are \, / and a drive's colon (Windows accepts / in paths; "c:file" */ \
+/* names "file" on drive c:). Separators at the end are not a component of their own, so the component before   */ \
+/* them is returned with them still attached ("C:\dir\sub\" -> "sub\"); a path that is all separators (or "C:\") */ \
+/* comes back whole. Scanned from the end. */                                                                         \
+static int is_sep##SUFFIX(CH c) { return c == '\\' || c == '/'; }                                                      \
 static WINAPI CH *PathFindFileName##SUFFIX(const CH *path) {                                                          \
     if (!path) return NULL;                                                                                            \
-    const CH *last = path;                                                                                             \
-    for (const CH *p = path; *p; p++)                                                                                  \
-        if ((*p == '\\' || *p == '/' || *p == ':') && p[1] && p[1] != '\\' && p[1] != '/') last = p + 1;            \
-    return (CH *)last;                                                                                                 \
+    const CH *end = path;                                                                                              \
+    while (*end) end++;                                                                                                \
+    while (end > path && is_sep##SUFFIX(end[-1])) end--;           /* drop the trailing separators */                  \
+    const CH *start = end;                                                                                             \
+    while (start > path && !is_sep##SUFFIX(start[-1]) && start[-1] != ':') start--;                                    \
+    if (start == end) return (CH *)path;                           /* no component left: "\\", "C:\" */                \
+    return (CH *)start;                                                                                                \
 }                                                                                                                      \
 /* The "." that starts the last component's extension, else the terminating NUL. */                                   \
 static WINAPI CH *PathFindExtension##SUFFIX(const CH *path) {                                                         \
