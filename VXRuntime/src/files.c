@@ -568,6 +568,21 @@ static WINAPI BOOL MoveFileExW(const WCHAR *from, const WCHAR *to, DWORD flags) 
 }
 static WINAPI BOOL MoveFileA(const char *from, const char *to) { return MoveFileExA(from, to, 0); }
 static WINAPI BOOL MoveFileW(const WCHAR *from, const WCHAR *to) { return MoveFileExW(from, to, 0); }
+// Transactional NTFS (TxF): there is no kernel transaction manager here (no KtmW32.dll, so no CreateTransaction), so
+// no handle is a transaction and these fail as for one that is not (ERROR_INVALID_HANDLE). steam.exe imports them
+// since its October 2026 client and loads KtmW32.dll itself before it uses them.
+static WINAPI BOOL DeleteFileTransactedW(const WCHAR *name, HANDLE transaction) {
+    (void)name;
+    vx_log("DeleteFileTransactedW(transaction %p): no transactions here", transaction);
+    vx_set_last_error(6);
+    return 0;
+}
+static WINAPI BOOL MoveFileTransactedW(const WCHAR *from, const WCHAR *to, void *progress, void *data, DWORD flags, HANDLE transaction) {
+    (void)from; (void)to; (void)progress; (void)data; (void)flags;
+    vx_log("MoveFileTransactedW(transaction %p): no transactions here", transaction);
+    vx_set_last_error(6);
+    return 0;
+}
 
 static WINAPI BOOL CopyFileA(const char *from, const char *to, BOOL fail_if_exists) {
     char a[MAX_PATH_LEN], b[MAX_PATH_LEN];
@@ -954,7 +969,7 @@ static const vx_export files_k32[] = {
     VX_EXPORT(GetFileAttributesExA), VX_EXPORT(GetFileAttributesExW),
     VX_EXPORT(CreateDirectoryA), VX_EXPORT(CreateDirectoryW), VX_EXPORT(RemoveDirectoryA), VX_EXPORT(RemoveDirectoryW),
     VX_EXPORT(DeleteFileA), VX_EXPORT(DeleteFileW), VX_EXPORT(MoveFileA), VX_EXPORT(MoveFileW), VX_EXPORT(MoveFileExA),
-    VX_EXPORT(MoveFileExW), VX_EXPORT(CopyFileA), VX_EXPORT(CopyFileW),
+    VX_EXPORT(MoveFileExW), VX_EXPORT(CopyFileA), VX_EXPORT(CopyFileW), VX_EXPORT(DeleteFileTransactedW), VX_EXPORT(MoveFileTransactedW),
     VX_EXPORT(FindFirstFileA), VX_EXPORT(FindFirstFileW), VX_EXPORT(FindFirstFileExA), VX_EXPORT(FindFirstFileExW),
     VX_EXPORT(FindNextFileA), VX_EXPORT(FindNextFileW), VX_EXPORT(FindClose),
 };
