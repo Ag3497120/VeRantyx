@@ -14,8 +14,8 @@
 //   PKCS #7, PKCS #12, serialized, ...) do not open, rather than open empty.
 // - WinVerifyTrust never returns 0 for a verification: Authenticode is not checked here, so a file with a signature is
 //   TRUST_E_SUBJECT_NOT_TRUSTED (one without is TRUST_E_NOSIGNATURE); there are no catalogs (CryptCATAdmin*).
-// These tables are registered before client.c's and extras.c's stand-ins for the same functions (loader.c): they
-// replace them.
+// These tables are registered before client.c's and extras.c's (loader.c), whose old stand-ins for these functions
+// (stores that held nothing, a WinVerifyTrust without a check) are gone.
 #include <CommonCrypto/CommonDigest.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>

@@ -4,9 +4,9 @@
 // (the loader's search, src/loader.c, asks this file), time zone conversions with a given zone, Windows Error
 // Reporting registrations, NtQueryObject, NtWriteFile and NTSTATUS codes (src/ntstatus.c). Job objects: src/jobs.c.
 //
-// Its tables are registered first (src/loader.c): where an older stand-in elsewhere has the same name (job objects in
-// desktop.c, DLL directories in extras.c, volume paths in client.c, SystemTimeToTzSpecificLocalTime in kernel32.c),
-// the one here is the one programs get.
+// Its tables are registered first (src/loader.c), before kernel32.c, desktop.c, client.c and extras.c, whose older
+// stand-ins for these functions (job objects, DLL directories, volume paths, SystemTimeToTzSpecificLocalTime) are gone:
+// the loader takes the first table that has a name.
 #include <ctype.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>

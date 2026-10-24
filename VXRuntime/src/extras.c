@@ -531,8 +531,6 @@ static WINAPI BOOL CryptGetProvParam(uintptr_t prov, DWORD param, uint8_t *data,
 static WINAPI BOOL CryptGetUserKey(uintptr_t prov, DWORD spec, uintptr_t *key) { (void)prov; (void)spec; if (key) *key = 0; vx_set_last_error(0x8009000D); return 0; }
 static WINAPI BOOL CryptSetHashParam(uintptr_t hash, DWORD param, const uint8_t *data, DWORD flags) { (void)hash; (void)param; (void)data; (void)flags; vx_set_last_error(0x80090017); return 0; }
 static WINAPI BOOL CryptSignHashW(uintptr_t hash, DWORD spec, const WCHAR *description, DWORD flags, uint8_t *signature, DWORD *length) { (void)hash; (void)spec; (void)description; (void)flags; (void)signature; (void)length; vx_set_last_error(0x8009000D); return 0; }
-static WINAPI BOOL CertGetCertificateContextProperty(const void *context, DWORD property, void *data, DWORD *length) { (void)context; (void)property; (void)data; (void)length; vx_set_last_error(0x80092004); return 0; }
-static WINAPI DWORD CertGetNameStringW(const void *context, DWORD type, DWORD flags, void *parameter, WCHAR *name, DWORD length) { (void)context; (void)type; (void)flags; (void)parameter; if (name && length) name[0] = 0; return 1; }
 static WINAPI BOOL CryptMsgGetParam(void *message, DWORD type, DWORD index, void *data, DWORD *length) { (void)message; (void)type; (void)index; (void)data; (void)length; vx_set_last_error(0x80092004); return 0; }
 static WINAPI BOOL CryptQueryObject(DWORD object_type, const void *object, DWORD expected, DWORD flags, DWORD *encoding, DWORD *content, DWORD *format, void **store, void **message, const void **context) {
     (void)object_type; (void)object; (void)expected; (void)flags; (void)encoding; (void)content; (void)format;
@@ -540,7 +538,6 @@ static WINAPI BOOL CryptQueryObject(DWORD object_type, const void *object, DWORD
     vx_set_last_error(0x80092009); return 0;                                    // CRYPT_E_NO_MATCH
 }
 static WINAPI int32_t CompleteAuthToken(void *context, void *token) { (void)context; (void)token; return (int32_t)0x80090302; }   // SEC_E_UNSUPPORTED_FUNCTION
-static WINAPI int32_t WinVerifyTrust(HANDLE hwnd, void *action, void *data) { (void)hwnd; (void)action; (void)data; return (int32_t)0x800B0100; }   // TRUST_E_NOSIGNATURE
 static WINAPI DWORD ldap_unavailable(void) { return 0x51; }                       // LDAP_SERVER_DOWN, for every wldap32 ordinal
 static uint8_t ws_tcp_name[] = "tcp", ws_udp_name[] = "udp";
 static char *ws_no_alias[] = { NULL };
@@ -552,9 +549,8 @@ static WINAPI void *ws_getprotobyname(const char *name) {
 }
 static const vx_export advapi32_ed[] = { VX_EXPORT(CredReadW), VX_EXPORT(CredWriteW), VX_EXPORT(CredDeleteW), VX_EXPORT(CredFree), VX_EXPORT(CryptDecrypt), VX_EXPORT(CryptEnumProvidersW),
                                          VX_EXPORT(CryptExportKey), VX_EXPORT(CryptGetProvParam), VX_EXPORT(CryptGetUserKey), VX_EXPORT(CryptSetHashParam), VX_EXPORT(CryptSignHashW) };
-static const vx_export crypt32_ed[] = { VX_EXPORT(CertGetCertificateContextProperty), VX_EXPORT(CertGetNameStringW), VX_EXPORT(CryptMsgGetParam), VX_EXPORT(CryptQueryObject) };
+static const vx_export crypt32_ed[] = { VX_EXPORT(CryptMsgGetParam), VX_EXPORT(CryptQueryObject) };   // (certificates and WinVerifyTrust: crypt32.c)
 static const vx_export secur32_ed[] = { VX_EXPORT(CompleteAuthToken) };
-static const vx_export wintrust_ed[] = { VX_EXPORT(WinVerifyTrust) };
 static const vx_export wldap32_ed[] = { { "#27", (void *)ldap_unavailable }, { "#30", (void *)ldap_unavailable }, { "#32", (void *)ldap_unavailable }, { "#33", (void *)ldap_unavailable },
                                         { "#35", (void *)ldap_unavailable }, { "#41", (void *)ldap_unavailable }, { "#46", (void *)ldap_unavailable }, { "#50", (void *)ldap_unavailable },
                                         { "#60", (void *)ldap_unavailable }, { "#79", (void *)ldap_unavailable }, { "#143", (void *)ldap_unavailable }, { "#200", (void *)ldap_unavailable },
@@ -568,11 +564,9 @@ static WINAPI BOOL GetProcessMitigationPolicy(HANDLE process, int policy, void *
 }
 static WINAPI BOOL SetProcessMitigationPolicy(int policy, void *buffer, size_t length) { (void)policy; (void)buffer; (void)length; return 1; }
 // looked up by name at start-up and called unchecked: thread information classes are accepted (ThreadHideFromDebugger
-// included: there is no debugger to hide from), DLL directories are remembered as a cookie, the newer allocation and
-// temp-path entry points forward to the older ones
+// included: there is no debugger to hide from), the newer allocation and temp-path entry points forward to the older
+// ones (DLL directories: kernelx.c)
 static WINAPI int32_t NtSetInformationThread(HANDLE thread, int class_, const void *information, DWORD length) { (void)thread; (void)class_; (void)information; (void)length; return 0; }
-static WINAPI void *AddDllDirectory(const WCHAR *directory) { (void)directory; static int cookie; return &cookie; }
-static WINAPI BOOL RemoveDllDirectory(void *cookie) { (void)cookie; return 1; }
 static WINAPI DWORD GetTempPath2W(DWORD length, WCHAR *buffer) {
     DWORD (WINAPI *temp_path)(DWORD, WCHAR *) = (DWORD (WINAPI *)(DWORD, WCHAR *))vx_find_export("kernel32.dll", "GetTempPathW");
     return temp_path ? temp_path(length, buffer) : 0;
@@ -597,7 +591,7 @@ static WINAPI BOOL GetVolumeNameForVolumeMountPointW(const WCHAR *mount_point, W
     return 1;
 }
 static const vx_export ntdll_ed[] = { VX_EXPORT(NtSetInformationThread) };
-static const vx_export kernel32_ed[] = { VX_EXPORT(GetVolumeNameForVolumeMountPointA), VX_EXPORT(GetVolumeNameForVolumeMountPointW), VX_EXPORT(AddDllDirectory), VX_EXPORT(RemoveDllDirectory), VX_EXPORT(GetTempPath2W), VX_EXPORT(VirtualAlloc2), VX_EXPORT(GetProcessMitigationPolicy), VX_EXPORT(SetProcessMitigationPolicy), VX_EXPORT(NormalizeString), VX_EXPORT(SearchPathW), VX_EXPORT(VirtualUnlock), VX_EXPORT(GetFinalPathNameByHandleW) };
+static const vx_export kernel32_ed[] = { VX_EXPORT(GetVolumeNameForVolumeMountPointA), VX_EXPORT(GetVolumeNameForVolumeMountPointW), VX_EXPORT(GetTempPath2W), VX_EXPORT(VirtualAlloc2), VX_EXPORT(GetProcessMitigationPolicy), VX_EXPORT(SetProcessMitigationPolicy), VX_EXPORT(NormalizeString), VX_EXPORT(SearchPathW), VX_EXPORT(VirtualUnlock), VX_EXPORT(GetFinalPathNameByHandleW) };
 static const vx_export user32_ed[] = { VX_EXPORT(ToAsciiEx), VX_EXPORT(UnloadKeyboardLayout), VX_EXPORT(RegisterHotKey), VX_EXPORT(UnregisterHotKey) };
 static const vx_export gdi32_ed[] = { VX_EXPORT(ExtEscape) };
 static const vx_export iphlpapi_ed[] = { VX_EXPORT(GetBestRoute), VX_EXPORT(GetBestInterface), VX_EXPORT(GetAdaptersAddresses), VX_EXPORT(GetIpAddrTable), VX_EXPORT(GetNetworkParams) };
@@ -665,7 +659,7 @@ void vx_extras_init(void) {
     MORE("kernel32.dll", kernel32_ed); MORE("kernelbase.dll", kernel32_ed); MORE("user32.dll", user32_ed); MORE("gdi32.dll", gdi32_ed);
     MORE("iphlpapi.dll", iphlpapi_ed); MORE("setupapi.dll", setupapi_ed); MORE("dbghelp.dll", dbghelp_ed); MORE("normaliz.dll", normaliz_ed);
     MORE("ws2_32.dll", ws2_32_ed); MORE("ws2_32.dll", ws2_32_proto); MORE("advapi32.dll", advapi32_ed); MORE("crypt32.dll", crypt32_ed);
-    MORE("secur32.dll", secur32_ed); MORE("wintrust.dll", wintrust_ed); MORE("wldap32.dll", wldap32_ed); MORE("ntdll.dll", ntdll_ed);
+    MORE("secur32.dll", secur32_ed); MORE("wldap32.dll", wldap32_ed); MORE("ntdll.dll", ntdll_ed);
 #undef MORE
 }
 

@@ -512,13 +512,6 @@ static WINAPI BOOL FileTimeToLocalFileTime(const DWORD *in, DWORD *out) {
     out[0] = (DWORD)t; out[1] = (DWORD)(t >> 32);
     return 1;
 }
-static WINAPI BOOL SystemTimeToTzSpecificLocalTime(const void *tz, const uint16_t *utc, uint16_t *local) {
-    (void)tz;
-    DWORD ft[2];
-    SystemTimeToFileTime(utc, ft);
-    uint64_t t = filetime_of(ft);
-    return systemtime_from_unix((int64_t)(t / 10000000ull) - 11644473600ll, utc[7], local, 1);
-}
 // TIME_ZONE_INFORMATION: bias, standard name/date/bias, daylight name/date/bias. No transition rules yet.
 typedef struct { LONG bias; WCHAR std_name[32]; uint16_t std_date[8]; LONG std_bias; WCHAR dst_name[32]; uint16_t dst_date[8]; LONG dst_bias; } TIME_ZONE_INFORMATION;
 static WINAPI DWORD GetTimeZoneInformation(TIME_ZONE_INFORMATION *tz) {
@@ -1019,7 +1012,7 @@ static const vx_export k32[] = {
     VX_EXPORT(RtlCaptureStackBackTrace), VX_EXPORT(CreateProcessA), VX_EXPORT(CreateProcessW), VX_EXPORT(WinExec),
     VX_EXPORT(GlobalMemoryStatusEx), VX_EXPORT(GetComputerNameA), VX_EXPORT(GetComputerNameW), VX_EXPORT(GetComputerNameExA),
     VX_EXPORT(GetComputerNameExW), VX_EXPORT(FileTimeToSystemTime), VX_EXPORT(SystemTimeToFileTime), VX_EXPORT(FileTimeToLocalFileTime),
-    VX_EXPORT(SystemTimeToTzSpecificLocalTime), VX_EXPORT(GetTimeZoneInformation),
+    VX_EXPORT(GetTimeZoneInformation),                                     // (SystemTimeToTzSpecificLocalTime: kernelx.c)
     VX_EXPORT(VerSetConditionMask), VX_EXPORT(VerifyVersionInfoA), VX_EXPORT(VerifyVersionInfoW),
     VX_EXPORT(GetConsoleScreenBufferInfo), VX_EXPORT(SetConsoleTextAttribute), VX_EXPORT(SetConsoleTitleA), VX_EXPORT(SetConsoleTitleW),
     VX_EXPORT(GetConsoleWindow), VX_EXPORT(AllocConsole), VX_EXPORT(FreeConsole), VX_EXPORT(SetConsoleCtrlHandler), VX_EXPORT(GetConsoleCP),
