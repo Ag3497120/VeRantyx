@@ -62,8 +62,13 @@ Every other game keeps using the Mac Steam client through the bridge (`VXRT_STEA
    log in `~/Library/Logs/VeRantyx/vxrt-windows-steam.log`. You sign in yourself, in Steam's own window: VeRantyx
    never asks for, reads or keeps your password; Steam keeps its saved login itself, as on Windows (what it protects
    with DPAPI is protected less here: see below). The script refuses a Wine prefix, a 32-bit `steam.exe` and a second
-   Windows Steam on VXRuntime (named objects are shared by every root), sets no `VXRT_STEAM_BRIDGE`, and writes only
-   its log.
+   Windows Steam on VXRuntime (named objects are shared by every root), and sets no `VXRT_STEAM_BRIDGE`. It follows
+   symbolic links to where the folder and the root really are, so a Steam folder, a `drive_c`, a root or a game
+   folder linked in from a Wine prefix is refused too, as is a `steam.exe` that is itself a link: copy them in (on
+   APFS `cp -c -R` makes a copy that takes no extra space). What gets written: the root, if it is not there yet; in
+   it, VXRuntime's `registry.txt`, `dpapi/` and its C: drive (`drive_c/windows`, `drive_c/users`); in the Steam
+   folder, whatever Steam itself writes there (its updates, logs, config, web cache), as on Windows; and the script's
+   log. `VXRT_WSTEAM_DRY_RUN=1` runs only the checks and prints what it would start.
 3. A SteamStub game then starts with the same `VXRT_ROOT` and without `VXRT_STEAM_BRIDGE` while Steam runs (the game
    launch scripts do not do this yet).
 

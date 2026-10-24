@@ -1024,6 +1024,7 @@ check: all build/vkmsl build/x86dec_test build/x86dec_check build/ref_x86 build/
 	python3 ../tools/vxrt_games.py check
 	python3 ../tests/vxrt_run_profile_test.py
 	python3 ../tests/vxrt_doctor_pe_test.py
+	bash ../tests/launch_vxrt_windows_steam_test.sh
 	python3 ../tools/vxrt_agents.py check
 	python3 ../tools/vxrt_tune.py --selftest
 	python3 ../tools/vxrt_playtest.py --selftest
