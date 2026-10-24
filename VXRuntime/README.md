@@ -88,9 +88,15 @@ Steam's shared JS context (`logs/steamui_html.txt`: `BrowserReady`), but draws n
 `steam.exe` starts it again. There is no sign-in window yet.
 
 Steam updates itself here as on Windows (2026-10-25: from the 2026-09-03 client, 1788652215, to 1792618285, Valve's
-download, with the user's go-ahead). The bootstrapper checks at once when the last run did not end cleanly (its
-`.crash` file is still there: "Checking for update on startup"); after a clean end it checks from its background loop
-about two minutes in, so a shorter run never checks. It saves the downloaded manifest through the C runtime opened for
+download). Those runs were made in `~/Verantyx_VR_Drive/vxrt_wsteam` itself, not in a copy, two of them with
+`-forcesteamupdate -forcepackagedownload` (Steam downloads its packages again and reinstalls them over its files);
+whether the user's approval covered that is not recorded yet and is to be confirmed with them. Trying changes, run
+Steam in an APFS copy of the root instead (`cp -c -R ~/Verantyx_VR_Drive/vxrt_wsteam <scratch>/wsteam_root`, then
+`VXRT_WSTEAM_ROOT=<scratch>/wsteam_root scripts/launch_vxrt_windows_steam.sh`), so whatever Steam writes (logs, web
+cache, its own updates) lands in the copy, and without those two options: Steam's own update check is enough. The
+bootstrapper checks at once when the last run did not end cleanly (its `.crash` file is still there: "Checking for
+update on startup"); after a clean end it checks from its background loop about two minutes in, so a shorter run
+never checks. It saves the downloaded manifest through the C runtime opened for
 reading and writing in text mode, which seeks to 1 byte before the end of the new, empty file to look for a CTRL+Z:
 that has to fail with `ERROR_NEGATIVE_SEEK` (SetFilePointer's documentation). It failed with `ERROR_INVALID_PARAMETER`
 here, so the C runtime gave up on the file, Steam logged `Error: Failed to save package manifest.` and never installed
