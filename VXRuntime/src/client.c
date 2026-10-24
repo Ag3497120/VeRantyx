@@ -202,7 +202,6 @@ static WINAPI LONG RegDeleteKeyValueW(HANDLE key, const WCHAR *sub, const WCHAR 
     if (k != key) close_key(k);
     return r;
 }
-static WINAPI BOOL QueryServiceStatus(HANDLE svc, DWORD *status) { (void)svc; (void)status; vx_set_last_error(6); return 0; }
 
 // ---- more user32 ------------------------------------------------------------------------------------------------------------------
 typedef struct { LONG left, top, right, bottom; } RECT;
@@ -614,7 +613,7 @@ static const vx_export opengl32[] = {
     { "glPopMatrix", (void *)gl_ignored }, { "glVertexPointer", (void *)gl_ignored }, { "glTexCoordPointer", (void *)gl_ignored },
     { "glColorPointer", (void *)gl_ignored }, { "glDrawArrays", (void *)gl_ignored }, { "glColor4f", (void *)gl_ignored },
 };
-static const vx_export advapi32[] = { VX_EXPORT(RegSetKeyValueW), VX_EXPORT(RegDeleteKeyValueW), VX_EXPORT(QueryServiceStatus) };
+static const vx_export advapi32[] = { VX_EXPORT(RegSetKeyValueW), VX_EXPORT(RegDeleteKeyValueW) };
 static const vx_export user32[] = {
     VX_EXPORT(SetClassLongPtrW), { "SetClassLongPtrA", (void *)SetClassLongPtrW }, VX_EXPORT(SetRectEmpty), VX_EXPORT(PtInRect),
     VX_EXPORT(IntersectRect), VX_EXPORT(UnionRect), VX_EXPORT(AttachThreadInput),

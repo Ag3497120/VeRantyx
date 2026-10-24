@@ -606,12 +606,7 @@ static WINAPI int wsprintfW(WCHAR *buf, const WCHAR *fmt, ...) {
     return n;
 }
 static WINAPI int wvsprintfW(WCHAR *buf, const WCHAR *fmt, const char *ap) { return vx_format_w(buf, 1025, fmt, ap); }
-// ---- services and security (advapi32): no service manager; SIDs and ACLs as plain memory -----------------------------------
-static WINAPI HANDLE OpenSCManagerA(const char *machine, const char *db, DWORD access) { (void)machine; (void)db; (void)access; vx_set_last_error(5); return NULL; }
-static WINAPI HANDLE OpenSCManagerW(const WCHAR *machine, const WCHAR *db, DWORD access) { (void)machine; (void)db; (void)access; vx_set_last_error(5); return NULL; }
-static WINAPI HANDLE OpenServiceA(HANDLE scm, const char *name, DWORD access) { (void)scm; (void)name; (void)access; vx_set_last_error(1060); return NULL; }
-static WINAPI BOOL service_none(void) { vx_set_last_error(6); return 0; }
-static WINAPI BOOL CloseServiceHandle(HANDLE h) { (void)h; return 1; }
+// ---- security (advapi32): SIDs and ACLs as plain memory (the service manager: scm.c) ---------------------------------------
 // A SID: revision, sub-authority count, 6-byte identifier authority, sub-authorities.
 static WINAPI DWORD GetLengthSid(const uint8_t *sid) { return 8 + 4 * (DWORD)sid[1]; }
 static WINAPI BOOL IsValidSid(const uint8_t *sid) { return sid && sid[0] == 1 && sid[1] <= 15; }
@@ -709,10 +704,7 @@ static const vx_export advapi[] = {
     VX_EXPORT(CryptReleaseContext), VX_EXPORT(RegisterEventSourceW), VX_EXPORT(RegisterEventSourceA), VX_EXPORT(DeregisterEventSource),
     VX_EXPORT(ReportEventW), VX_EXPORT(EventSetInformation), VX_EXPORT(AdjustTokenPrivileges), VX_EXPORT(LookupPrivilegeValueW),
     VX_EXPORT(LookupPrivilegeValueA), VX_EXPORT(EqualSid), VX_EXPORT(LookupAccountSidA), VX_EXPORT(GetNamedSecurityInfoA),
-    VX_EXPORT(RegConnectRegistryA), VX_EXPORT(OpenSCManagerA), VX_EXPORT(OpenSCManagerW), VX_EXPORT(OpenServiceA),
-    VX_EXPORT(CloseServiceHandle), { "OpenServiceW", (void *)OpenServiceA }, { "StartServiceA", (void *)service_none },
-    { "StartServiceW", (void *)service_none }, { "ControlService", (void *)service_none }, { "QueryServiceStatusEx", (void *)service_none },
-    { "QueryServiceConfigA", (void *)service_none }, { "QueryServiceConfigW", (void *)service_none },
+    VX_EXPORT(RegConnectRegistryA),
     VX_EXPORT(GetLengthSid), VX_EXPORT(IsValidSid), VX_EXPORT(CopySid), VX_EXPORT(CreateWellKnownSid), VX_EXPORT(ConvertStringSidToSidA),
     VX_EXPORT(InitializeAcl), VX_EXPORT(AddAccessAllowedAce), VX_EXPORT(ConvertStringSecurityDescriptorToSecurityDescriptorW),
     VX_EXPORT(EventWriteString),

@@ -68,6 +68,7 @@ static const char *canonical_dll(const char *dll) {
     if (!strncasecmp(dll, "api-ms-win-security-", 20) || !strncasecmp(dll, "api-ms-win-eventing-", 20)) return "advapi32.dll";
     if (!strncasecmp(dll, "api-ms-win-ntuser-", 18) || !strncasecmp(dll, "ext-ms-win-ntuser-", 18)) return "user32.dll";
     if (!strncasecmp(dll, "api-ms-win-shcore-", 18)) return "shcore.dll";
+    if (!strncasecmp(dll, "api-ms-win-service-", 19)) return "sechost.dll";
     if (!strncasecmp(dll, "api-ms-win-", 11)) return "kernelbase.dll";
     return dll;
 }
@@ -1133,6 +1134,7 @@ int main(int argc, char **argv, char **envp) {
     vx_system_init();
     vx_desktop_init();
     vx_winsta_init();
+    vx_scm_init();
     vx_services_init();
     vx_client_init();
     vx_steambridge_init();
