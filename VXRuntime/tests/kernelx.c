@@ -1,11 +1,13 @@
 // kernel32 and ntdll functions the Windows Steam client imports (src/kernelx.c): serial ports, memory notifications
-// and hints, threads started "remotely", thread and process information, locales, volumes and DOS devices, time zones,
-// Windows Error Reporting, NtQueryObject, NtWriteFile, NTSTATUS codes, DLL directories. Made-up data only.
+// and hints (DiscardVirtualMemory on private memory only), threads started "remotely", thread and process information
+// (background processing mode), locales, volumes and DOS devices, time zones, Windows Error Reporting, NtQueryObject,
+// NtWriteFile, NTSTATUS codes, DLL directories, and the computer's names (kernel32.c). Made-up data only.
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+#include <wctype.h>
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("check failed (line %d): %s\n", __LINE__, #c); failures++; } } while (0)
 static HMODULE kernel32, ntdll;
@@ -483,6 +485,45 @@ static void test_dll_directories(void) {
     group("DLL directories", before);
 }
 
+// The computer's names (the Mac's host name, compared only with itself): the NetBIOS name is the DNS host name cut to
+// MAX_COMPUTERNAME_LENGTH and in upper case, the DNS forms are whole, and the buffer errors are the documented ones
+// (ERROR_BUFFER_OVERFLOW for GetComputerName, ERROR_MORE_DATA for GetComputerNameEx).
+static void test_computer_names(void) {
+    int before = failures;
+    WCHAR netbios[64], dns[300], domain[300], full[600], again[600];
+    DWORD n = 64, nd = 300, nm = 300, nf = 600, k;
+    CHECK(GetComputerNameW(netbios, &n) && n == wcslen(netbios) && n >= 1 && n <= MAX_COMPUTERNAME_LENGTH);
+    CHECK(GetComputerNameExW(ComputerNameDnsHostname, dns, &nd) && nd == wcslen(dns) && nd >= n);
+    CHECK(GetComputerNameExW(ComputerNameDnsDomain, domain, &nm) && nm == wcslen(domain));
+    CHECK(GetComputerNameExW(ComputerNameDnsFullyQualified, full, &nf) && nf == wcslen(full));
+    WCHAR want[600];
+    wcscpy(want, dns);
+    if (nm) { wcscat(want, L"."); wcscat(want, domain); }
+    CHECK(!wcscmp(full, want));
+    int same = 1;                                                             // (ASCII host names: what macOS allows)
+    for (DWORD i = 0; i < n; i++) same &= dns[i] < 0x80 && netbios[i] == (WCHAR)towupper(dns[i]);
+    CHECK(same && n == (nd > MAX_COMPUTERNAME_LENGTH ? MAX_COMPUTERNAME_LENGTH : nd));
+    printf("kernelx: (a DNS host name of %lu characters, NetBIOS name of %lu)\n", nd, n);
+    static const COMPUTER_NAME_FORMAT pairs[][2] = { { ComputerNameNetBIOS, ComputerNamePhysicalNetBIOS },
+        { ComputerNameDnsHostname, ComputerNamePhysicalDnsHostname }, { ComputerNameDnsDomain, ComputerNamePhysicalDnsDomain },
+        { ComputerNameDnsFullyQualified, ComputerNamePhysicalDnsFullyQualified } };
+    const WCHAR *expect[] = { netbios, dns, domain, full };
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 2; j++) { k = 600; CHECK(GetComputerNameExW(pairs[i][j], again, &k) && !wcscmp(again, expect[i]) && k == wcslen(again)); }
+    char a[64]; DWORD na = 64;
+    CHECK(GetComputerNameA(a, &na) && na == n);
+    for (DWORD i = 0; i < na; i++) CHECK((WCHAR)(BYTE)a[i] == netbios[i]);
+    char dns_a[300]; DWORD nda = 300;
+    CHECK(GetComputerNameExA(ComputerNameDnsHostname, dns_a, &nda) && nda == nd);
+    // a buffer too small
+    k = n; SetLastError(0); CHECK(!GetComputerNameW(again, &k) && GetLastError() == ERROR_BUFFER_OVERFLOW && k == n + 1);
+    k = 0; SetLastError(0); CHECK(!GetComputerNameA(NULL, &k) && GetLastError() == ERROR_BUFFER_OVERFLOW && k == n + 1);
+    k = nd; SetLastError(0); CHECK(!GetComputerNameExW(ComputerNameDnsHostname, again, &k) && GetLastError() == ERROR_MORE_DATA && k == nd + 1);
+    k = 0; SetLastError(0); CHECK(!GetComputerNameExW(ComputerNameDnsFullyQualified, NULL, &k) && GetLastError() == ERROR_MORE_DATA && k == nf + 1);
+    k = 600; SetLastError(0); CHECK(!GetComputerNameExW(ComputerNameMax, again, &k) && GetLastError() == ERROR_INVALID_PARAMETER);
+    group("computer names", before);
+}
+
 int main(void) {
     kernel32 = GetModuleHandleA("kernel32.dll");
     ntdll = GetModuleHandleA("ntdll.dll");
@@ -496,6 +537,7 @@ int main(void) {
     test_time_zones();
     test_ntdll();
     test_dll_directories();
+    test_computer_names();
     printf("kernelx: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }
