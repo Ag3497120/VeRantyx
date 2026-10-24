@@ -25,6 +25,7 @@ VXRT_DLL_PATH=/prefix/drive_c/windows/system32 ...   # also loads DLLs (the VC++
 VXRT_TRACE_PIPES=1 ...                     # every named-pipe message, with its first bytes
 VXRT_TRACE_NAMES=1 ...                     # processes joining and leaving named objects and mappings
 VXRT_TRACE_CALLS=200 ...                   # every call into the runtime (arguments, result, last error), 200 per function
+VXRT_TRACE_CALLS_ONLY=CreateFileW,LockFileEx ...   # with VXRT_TRACE_CALLS: only these functions (a browser's file calls)
 VXRT_PRESENT_SNAPSHOT=f.png VXRT_PRESENT_SNAPSHOT_AT=300 ...   # the 300th present's back buffer as a PNG
 VXRT_TRACE_KEYED=1 VXRT_SHARED_SNAPSHOT=f.png ...              # keyed mutex traffic; shared textures as PNGs at a ReleaseSync
 VXRT_TRACE_DRAWS=trigger VXRT_DRAW_SNAPSHOT=<ps hash>:prefix ... # 300 draws after the trigger file appears; a pixel shader's inputs as PNGs
@@ -84,6 +85,17 @@ ended itself about 10 s in: tier0 freed the main thread's data when it could not
 Steam's shared JS context (`logs/steamui_html.txt`: `BrowserReady`), but draws nothing: its GPU contexts all fail
 (`Failed to create shared context for virtualization`), and it often ends itself some 20 s later, after which
 `steam.exe` starts it again. There is no sign-in window yet.
+
+The web helper's profile (`C:\users\vxrt\AppData\Local\Steam\htmlcache`) keeps its data in SQLite databases (`Web
+Data`, `Affiliation Database`, `History`, ...). SQLite maps a database and, at every commit, flushes the whole view
+(`FlushViewOfFile` with a byte count of 0); until 2026-10-24 that failed here, so every commit after a database's
+first was rolled back, `Web Data` stayed empty and Chromium showed "Profile error occurred". `tests/dbfiles.c` checks
+the file calls of SQLite's documented patterns against Microsoft's documentation: byte-range locks of two connections
+at the bytes near 1 GiB (`src/filestate.c`, real locks within a process now), reads and writes at OVERLAPPED offsets,
+the -journal and -shm files, a mapped database, deleting on close. Deleting on close or by disposition keeps a
+`VXRT_OVERLAY` tree as `DeleteFileW` does: only the overlay's copy of a file goes, never the original (`dbfiles.exe
+overlay`, also with the tree named through a symbolic link). With an empty profile and the registry of an
+earlier run, the web helper also needs `RegDeleteKeyExW` (it stopped at a breakpoint without it).
 
 "Steam Service Error" at start: Steam looks for the Steam Client Service (`bin/SteamService.exe`, a 32-bit
 Windows service). Valve's own text in that window: it "helps Steam install or update games, enables anti-cheat

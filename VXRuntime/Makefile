@@ -6,6 +6,7 @@ SRC     = src/loader.c src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src
 SRC    += src/launchargs.c
 SRC    += src/handlexfer.c
 SRC    += src/version.c
+SRC    += src/filestate.c
 SRC    += src/icons.c src/menus.m src/tray.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
@@ -38,7 +39,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
        build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/kernelx.exe build/jobs.exe build/security.exe \
-       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/open_thread.exe build/version_info.exe build/section_access.exe
+       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/open_thread.exe build/version_info.exe build/section_access.exe build/dbfiles.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -756,6 +757,12 @@ build/files.exe: tests/files.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
+# A database engine's file calls (SQLite's documented patterns: locks near 1 GiB, OVERLAPPED offsets, a mapped
+# database, a -shm file, deleting on close): src/filestate.c, src/files.c.
+build/dbfiles.exe: tests/dbfiles.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $<
+
 build/vxdll.dll: tests/vxdll.cpp
 	@mkdir -p build
 	$(MINGWXX) -O1 -shared -static -o $@ $< -Wl,--out-implib,build/libvxdll.a
@@ -1196,6 +1203,14 @@ runtime-tests: $(VXRT) tests
 	rm -rf build/ovtree build/ovshadow && mkdir -p build/ovtree/save && echo old > build/ovtree/save/old.sav && echo orig > build/ovtree/save/same.hl1
 	VXRT_OVERLAY=$(CURDIR)/build/ovtree:$(CURDIR)/build/ovshadow $(VXRT) build/files.exe overlay 'Z:$(subst /,\,$(CURDIR))\build\ovtree'
 	test "$$(cat build/ovtree/save/same.hl1)" = orig && test ! -e build/ovtree/save/a.hl1
+	$(VXRT) build/dbfiles.exe
+	for via in dbov dbovlink; do \
+	  rm -rf build/dbov build/dbovlink build/dbovshadow && mkdir -p build/dbov/keep && ln -s dbov build/dbovlink && \
+	  for f in a b c d e; do echo orig > build/dbov/$$f.db; done && \
+	  VXRT_OVERLAY=$(CURDIR)/build/$$via:$(CURDIR)/build/dbovshadow $(VXRT) build/dbfiles.exe overlay "Z:$(subst /,\,$(CURDIR))\\build\\$$via" && \
+	  for f in a b c d e; do test "$$(cat build/dbov/$$f.db)" = orig || exit 1; test ! -e build/dbovshadow/$$f.db || exit 1; done && \
+	  test -d build/dbov/keep && test ! -e build/dbovshadow/new.db || exit 1; \
+	done
 	$(VXRT) build/dll_test.exe
 	$(VXRT) build/net.exe
 	$(VXRT) build/winhttp.exe

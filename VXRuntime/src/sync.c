@@ -1103,7 +1103,7 @@ static WINAPI BOOL CloseHandle(HANDLE h) {
     gunlock();
     if (o) return 1;
     int fd = vx_handle_fd(h);
-    if (fd > 2) { close(fd); return 1; }
+    if (fd > 2) { vx_file_closing(h); close(fd); return 1; }   // (its byte-range locks go, a doomed file is deleted)
     if (fd >= 0) return 1;
     vx_set_last_error(6);
     return 0;

@@ -71,6 +71,7 @@ typedef struct {
 const vx_image *vx_image_at(uint64_t pc);    // the image containing an address, or NULL
 int vx_image_list(const vx_image **out, int cap);   // the loaded images (all of them is the return value)
 int vx_overlay_file(const char *unix_path, char *out, size_t cap);   // files.c: VXRT_OVERLAY's copy of a file, if any
+int vx_overlay_deletable(const char *unix_path, char *out, size_t cap);   // files.c: what deleting a path may remove (never an overlaid original)
 void vx_wininet_init(void);                  // wininet.m: HTTP and HTTPS on NSURLSession
 void vx_winhttp_init(void);                  // winhttp.m: synchronous WinHTTP request handles on NSURLSession
 void vx_directinput_init(void);              // directinput.m: DirectInput 8 HID joystick/gamepad polling
@@ -205,6 +206,9 @@ void vx_seh_init(void);                // exceptions (seh.c)
 void vx_seh_install_signals(void);     // CPU faults become Windows exceptions
 void vx_text_init(void);               // code pages, environment (text.c)
 void vx_files_init(void);              // files and paths (files.c)
+void vx_filestate_init(void);          // byte-range locks, deleting on close, SetFileInformationByHandle (filestate.c)
+void vx_file_closing(HANDLE h);        // before a file handle's descriptor is closed: its locks go, a doomed file is deleted
+void vx_file_delete_on_close(HANDLE h, const char *unix_path, int on);
 void vx_registry_init(void);           // advapi32 registry (registry.c)
 void vx_user32_init(void);             // windows and messages (user32.c, cocoa.m)
 void vx_winsta_init(void);             // window stations, desktops, power notifications, DPI awareness (winsta.c)

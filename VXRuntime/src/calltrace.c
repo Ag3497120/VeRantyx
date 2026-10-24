@@ -1,4 +1,5 @@
-// VXRT_TRACE_CALLS=N (VXRT_TRACE_CALLS_FOR=<program.exe> limits it to one program): every call from Windows code into this runtime's functions is logged with its first four
+// VXRT_TRACE_CALLS=N (VXRT_TRACE_CALLS_FOR=<program.exe> limits it to one program, VXRT_TRACE_CALLS_ONLY=<name>,<name>...
+// to these functions): every call from Windows code into this runtime's functions is logged with its first four
 // arguments, and its return value and last error, up to N times per function (200 for N < 10). Imports and
 // GetProcAddress results go through a trampoline (context.S); functions that capture or switch stacks (setjmp,
 // unwinding, fibers, thread and process exits) are left alone. A debugging aid: the return addresses it swaps
@@ -58,7 +59,19 @@ static int left_alone(const char *name) {
     };
     for (size_t i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++)
         if (!strncmp(name, prefixes[i], strlen(prefixes[i]))) return 1;
-    return 0;
+    // VXRT_TRACE_CALLS_ONLY: a few functions of a busy program (a browser's file calls), the rest left alone
+    static const char *only;
+    if (!only) { only = getenv("VXRT_TRACE_CALLS_ONLY"); if (!only) only = ""; }
+    if (!*only) return 0;
+    size_t n = strlen(name);
+    for (const char *p = only; *p; ) {
+        const char *e = strchr(p, ',');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len == n && !strncmp(p, name, n)) return 0;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 1;
 }
 // The trampoline for a function (the function itself when it is left alone or the table is full).
 void *vx_trace_wrap(const char *dll, const char *name, void *fn) {
