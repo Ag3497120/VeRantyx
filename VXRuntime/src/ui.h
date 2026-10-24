@@ -90,7 +90,27 @@ void   vx_fill_client(vx_window *w, HANDLE brush);        // WM_ERASEBKGND's def
 void   vx_gdi_init(void);
 uint32_t vx_sys_color(int index);                         // COLORREF of a COLOR_* index
 
+// gdi.c, for icons.c: bitmaps as plain pixels (top-down BGRA; see there)
+uint32_t *vx_gdi_bitmap_bgra(HANDLE bitmap, int *w, int *h, int *bpp);   // malloc'd; NULL if not a bitmap
+HANDLE vx_gdi_bitmap_from_bgra(int w, int h, const uint32_t *px);
+HANDLE vx_gdi_bitmap_mono(int w, int h, const uint8_t *rows);
+int    vx_gdi_draw_bgra(HANDLE dc, int x, int y, int w, int h, const uint32_t *px, int pw, int ph, int blend);
+
+// icons.c: icons and cursors with their pictures (straight-alpha BGRA, top-down)
+typedef struct { int w, h; uint32_t *px; } vx_icon_image;
+int  vx_icon_images(HANDLE icon, vx_icon_image *out, int cap);   // its picture, then larger sizes of it; 0: no pixels
+void vx_icon_images_free(vx_icon_image *v, int n);
+
+// menus.m and tray.m, for user32.c and control.c (Command Clips)
+char *vx_menu_state(void);                                  // the popup menu open now, as JSON (malloc'd)
+int   vx_menu_pick(const char *text, int wait_ms, char *why, size_t cap);   // as a click on its first enabled item with text
+void  vx_tray_window_destroyed(HANDLE hwnd);                // the window's notification-area icons go with it
+char *vx_tray_state(void);                                  // the notification-area icons, as JSON (malloc'd)
+int   vx_tray_click(int index, const char *how, char *why, size_t cap);   // as a click on one (left, right, double, key, menu-key)
+int   vx_tray_snapshot(int index, const char *png, char *why, size_t cap);   // its picture in the menu bar, into a PNG file
+
 // cocoa.m (each returns after the main thread has done it)
+void vx_cocoa_ensure(void);                               // AppKit runs on the main thread (starts it if needed)
 void vx_cocoa_create(vx_window *w);
 void vx_cocoa_destroy(vx_window *w);
 void vx_cocoa_show(vx_window *w, int cmd);                // SW_* command

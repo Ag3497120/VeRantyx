@@ -554,6 +554,7 @@ static WINAPI BOOL DestroyWindow(HANDLE hwnd) {
         if (g_windows[i] && !g_windows[i]->destroyed && g_windows[i]->parent == hwnd) { pthread_mutex_unlock(&g_win_lock); DestroyWindow(g_windows[i]->hwnd); pthread_mutex_lock(&g_win_lock); }
     pthread_mutex_unlock(&g_win_lock);
     call_proc(w, WM_NCDESTROY, 0, 0);
+    vx_tray_window_destroyed(hwnd);                   // (its notification-area icons go with it: tray.m)
     kill_timer(w->queue, hwnd, 0, 1);
     vx_cocoa_destroy(w);
     w->destroyed = 1;                                 // the slot is never reused, so stale handles stay invalid

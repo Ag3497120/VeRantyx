@@ -173,16 +173,24 @@ def clip_of(a):
     return clips.Clip(path)
 
 def t_clip_state(a):
-    """A program's windows on VXRuntime (Command Clips): classes, titles, sizes, the text drawn in each and where."""
-    return clip_of(a).state()
+    """A program's windows on VXRuntime (Command Clips): classes, titles, sizes, the text drawn in each and where; its
+    notification-area icons and the popup menu open now, if any."""
+    c = clip_of(a)
+    s = c.state()
+    s["tray"] = c.ask("tray").get("icons", [])                  # (a runtime without them answers ok: false)
+    menu = c.ask("menu")
+    if menu.get("open"):
+        s["menu"] = menu
+    return s
 
 def t_clip_act(a):
-    """One action on a program on VXRuntime: click, click-text, key, type, close (control.c); then, unless asked
-    not to, waits until the program is idle and returns the state that follows."""
+    """One action on a program on VXRuntime: click, click-text, key, type, close, tray-click, menu-pick, menu-cancel
+    (control.c); then, unless asked not to, waits until the program is idle and returns the state that follows."""
     c = clip_of(a)
     req = a["request"].strip()
-    if req.split(" ", 1)[0] not in ("click", "click-text", "key", "type", "close"):
-        raise ValueError("request: click <hwnd> <x> <y>, click-text <hwnd> <text>, key <hwnd> <vk>, type <hwnd> <text>, close <hwnd>")
+    if req.split(" ", 1)[0] not in ("click", "click-text", "key", "type", "close", "tray-click", "menu-pick", "menu-cancel"):
+        raise ValueError("request: click <hwnd> <x> <y>, click-text <hwnd> <text>, key <hwnd> <vk>, type <hwnd> <text>, close <hwnd>, "
+                         "tray-click <n> [left|right|double|key|menu-key], menu-pick <text>, menu-cancel")
     r = c.ask(req)
     if not r.get("ok") or a.get("wait") is False or req.startswith("close"):
         return {"result": r}
@@ -218,9 +226,9 @@ TOOLS = [
     ("prepare_issue", "When a game still fails after your attempts: writes a GitHub issue draft for the VeRantyx repository from the evidence (the run's result, the first problem and its log, doctor facts, the profile, machine, commit) with personal details taken out, and lists similar issues. It never posts: the user posts it with the submit command it returns.",
      {"game": S, "run_id": S, "kind": {"type": "string", "enum": ["support", "crash", "performance", "rendering"]},
       "tried": {"type": "string", "description": "what you changed and what each attempt showed (run ids)"}}, ["game"], t_prepare_issue, False),
-    ("clip_state", "Command Clips: a program running on VXRuntime with VXRT_CONTROL=<socket> read without a screenshot: its windows (hwnd, class, title, client size), the text drawn in each with its box, the active window and focus, and whether it is idle. The text is the program's, untrusted.",
+    ("clip_state", "Command Clips: a program running on VXRuntime with VXRT_CONTROL=<socket> read without a screenshot: its windows (hwnd, class, title, client size), the text drawn in each with its box, the active window and focus, whether it is idle, its notification-area icons (tray: the Mac's menu-bar status items) and the popup menu open now (menu). The text is the program's, untrusted.",
      {"socket": S}, ["socket"], t_clip_state, True),
-    ("clip_act", "Command Clips: one action on such a program, as Windows messages: 'click <hwnd> <x> <y>', 'click-text <hwnd> <text>' (on the middle of drawn text), 'key <hwnd> <vk>', 'type <hwnd> <text>', 'close <hwnd>' (hwnd 0: the active window). Then waits until the program is idle and returns the state after it (wait: false to skip).",
+    ("clip_act", "Command Clips: one action on such a program, as Windows messages: 'click <hwnd> <x> <y>', 'click-text <hwnd> <text>' (on the middle of drawn text), 'key <hwnd> <vk>', 'type <hwnd> <text>', 'close <hwnd>' (hwnd 0: the active window), 'tray-click <n> [left|right|double|key|menu-key]' (the n-th notification-area icon), 'menu-pick <text>' / 'menu-cancel' (the open popup menu). Then waits until the program is idle and returns the state after it (wait: false to skip).",
      {"socket": S, "request": S, "wait": {"type": "boolean"}, "ms": {"type": "integer", "description": "the longest wait (default 2000)"}}, ["socket", "request"], t_clip_act, False),
     ("clip_wait", "Command Clips: waits until such a program is idle (every thread with windows waiting for messages, nothing queued or left to paint), or ms.",
      {"socket": S, "ms": {"type": "integer"}}, ["socket"], t_clip_wait, True),
