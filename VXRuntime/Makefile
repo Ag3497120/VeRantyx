@@ -123,11 +123,15 @@ build/clip.exe: tests/clip.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lgdi32
 
-# The notification area (tests/tray.c, driven by tests/tray_check.py): a made-up icon file, also the program's resources.
-tests: build/tray.exe
+# The notification area (tests/tray.c, driven by tests/tray_check.py): a made-up icon file, also the program's resources,
+# and made-up DLLs for ExtractIconEx (tests/tray_pe.py writes build/tray_pe_*.dll).
+tests: build/tray.exe build/tray_pe.stamp
 build/tray.ico: tests/tray_ico.py
 	@mkdir -p build
 	python3 tests/tray_ico.py $@
+build/tray_pe.stamp: tests/tray_pe.py tests/tray_ico.py
+	@mkdir -p build
+	python3 tests/tray_pe.py build && touch $@
 build/tray_res.o: tests/tray.rc build/tray.ico
 	x86_64-w64-mingw32-windres -I build -i $< -o $@
 build/tray.exe: tests/tray.c build/tray_res.o

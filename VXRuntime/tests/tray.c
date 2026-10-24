@@ -1,6 +1,8 @@
 // The notification area on VXRuntime (src/tray.m, menus.m, icons.c), with made-up data only:
-//   icons from bitmaps (CreateIconIndirect), from icon resource bits, from an .ico file and from the program's own
-//   resources (tests/tray_ico.py, tests/tray.rc), drawn back with DrawIconEx and taken apart with GetIconInfo;
+//   icons from bitmaps (CreateIconIndirect), from icon resource bits (the program's buffers, refilled, and its own
+//   RT_ICON resource, shared), from an .ico file and from the program's own resources (tests/tray_ico.py,
+//   tests/tray.rc), drawn back with DrawIconEx and taken apart with GetIconInfo; ExtractIconEx of made-up DLLs whose
+//   resources are in the headers or in no section (tests/tray_pe.py, next to the .ico file);
 //   the menu functions; Shell_NotifyIcon adding, changing and deleting icons of both structure forms (W and A);
 //   the callback messages of clicks in the forms of version 4 and version 0, and TrackPopupMenu from them.
 // The clicks and the menu choices come from tests/tray_check.py through Command Clips (VXRT_CONTROL); this program
@@ -55,6 +57,38 @@ static int close_to(DWORD p, DWORD want) {
     return 1;
 }
 #define WHITE 0xffffff
+
+// ExtractIconEx of the made-up DLLs of tests/tray_pe.py (next to the .ico file), whose resources are where a file may
+// have them: the one icon group's picture (16x16, blue, its outer ring clear) or no icon, and nothing read outside the file.
+static void pe_file(const WCHAR *ico_path, const WCHAR *name, WCHAR *out) {
+    wcscpy(out, ico_path);
+    WCHAR *slash = wcsrchr(out, L'\\');
+    wcscpy(slash ? slash + 1 : out, name);
+}
+static void check_extract(const WCHAR *ico_path) {
+    WCHAR path[MAX_PATH];
+    HICON large = NULL, small = NULL;
+    pe_file(ico_path, L"tray_pe_hdr.dll", path);                  // in the header area, in no section: there
+    UINT count = ExtractIconExW(path, -1, NULL, NULL, 0), got = ExtractIconExW(path, 0, &large, &small, 1);
+    CHECK(count == 1 && got == 1 && icon_width(large) == 32 && icon_width(small) == 16, "ExtractIconEx of resources in the headers: %u %u %p %p", count, got, (void *)large, (void *)small);
+    if (large && small)
+        CHECK(close_to(drawn(large, 32, 16, 16), 0x0000ff) && drawn(large, 32, 0, 0) == WHITE && close_to(drawn(small, 16, 8, 8), 0x0000ff) && drawn(small, 16, 0, 0) == WHITE,
+              "the icon in the headers drawn: %06lx %06lx %06lx %06lx", drawn(large, 32, 16, 16), drawn(large, 32, 0, 0), drawn(small, 16, 8, 8), drawn(small, 16, 0, 0));
+    DestroyIcon(large); DestroyIcon(small);
+    static const struct { const WCHAR *name; UINT groups; } none[] = {
+        { L"tray_pe_nosec.dll", 0 },                              // the directory in no section, past the headers
+        { L"tray_pe_nodata.dll", 1 },                             // the group's data in no section
+        { L"tray_pe_zero.dll", 1 },                               // the group's name and data entry at offset 0
+    };
+    for (int i = 0; i < 3; i++) {
+        pe_file(ico_path, none[i].name, path);
+        large = small = NULL;
+        count = ExtractIconExW(path, -1, NULL, NULL, 0);
+        got = ExtractIconExW(path, 0, &large, &small, 1);
+        CHECK(count == none[i].groups && got == 0 && !large && !small, "ExtractIconEx of made-up DLL %d: %u groups, %u extracted", i, count, got);
+    }
+}
+
 static void check_icons(const WCHAR *ico_path) {
     // From bitmaps: an orange disc in a 32-bpp DIB with alpha, a 1-bpp mask of zeros.
     BITMAPINFO bi = { { sizeof(BITMAPINFOHEADER), 32, -32, 1, 32, BI_RGB } };
@@ -86,6 +120,39 @@ static void check_icons(const WCHAR *ico_path) {
     HICON yellow32 = CreateIconFromResourceEx(res, sizeof res, TRUE, 0x00030000, 32, 32, 0);
     CHECK(icon_width(yellow32) == 32, "CreateIconFromResourceEx scaled: %d", icon_width(yellow32));
     CHECK(!CreateIconFromResourceEx(res, sizeof res, TRUE, 0x00010000, 0, 0, 0), "a version below 2.0 is refused");
+
+    // CreateIconFromResource (LR_SHARED) of bits in the program's own buffers, filled anew between the calls (here
+    // the stack, and a static buffer in the program's image): each call is an icon of what the buffer holds then,
+    // which DestroyIcon frees.
+    static BYTE static_res[sizeof res];
+    BYTE *buffers[2] = { res, static_res };
+    for (int b = 0; b < 2; b++) {
+        BYTE *buf = buffers[b];
+        if (buf != res) memcpy(buf, res, sizeof res);
+        DWORD *bpal = (DWORD *)(buf + 40);
+        bpal[1] = 0x00ffff00;                                    // yellow
+        HICON first = CreateIconFromResource(buf, sizeof res, TRUE, 0x00030000);
+        bpal[1] = 0x000000ff;                                    // blue
+        HICON second = CreateIconFromResource(buf, sizeof res, TRUE, 0x00030000);
+        CHECK(first && second && first != second, "CreateIconFromResource of a refilled %s buffer: %p %p", b ? "static" : "stack", (void *)first, (void *)second);
+        CHECK(icon_width(first) == 32 && close_to(drawn(first, 32, 24, 16), 0xffff00) && close_to(drawn(second, 32, 24, 16), 0x0000ff),
+              "the pictures of a refilled %s buffer: %06lx %06lx", b ? "static" : "stack", drawn(first, 32, 24, 16), drawn(second, 32, 24, 16));
+        CHECK(DestroyIcon(first) && !DestroyIcon(first) && DestroyIcon(second) && !DestroyIcon(second), "icons of the program's bits are freed");
+    }
+    pal[1] = 0x00ffff00;
+
+    // CreateIconFromResource of a module's RT_ICON resource (tray.rc's icon 1, the file's 16x16) is shared: the same
+    // handle each time, kept by DestroyIcon. Without LR_SHARED a new icon each time.
+    HMODULE self_module = GetModuleHandleW(NULL);
+    HRSRC one = FindResourceW(self_module, MAKEINTRESOURCEW(1), (LPCWSTR)RT_ICON);
+    BYTE *one_bits = one ? LockResource(LoadResource(self_module, one)) : NULL;
+    DWORD one_size = one ? SizeofResource(self_module, one) : 0;
+    HICON s1 = one_bits ? CreateIconFromResource(one_bits, one_size, TRUE, 0x00030000) : NULL;
+    HICON s2 = one_bits ? CreateIconFromResource(one_bits, one_size, TRUE, 0x00030000) : NULL;
+    CHECK(s1 && s1 == s2 && icon_width(s1) == 32 && close_to(drawn(s1, 32, 16, 16), 0x0000ff), "CreateIconFromResource of a resource: %p %p", (void *)s1, (void *)s2);
+    CHECK(DestroyIcon(s1) && CreateIconFromResource(one_bits, one_size, TRUE, 0x00030000) == s1 && icon_width(s1) == 32, "a shared icon of a resource stays");
+    HICON e1 = CreateIconFromResourceEx(one_bits, one_size, TRUE, 0x00030000, 0, 0, 0), e2 = CreateIconFromResourceEx(one_bits, one_size, TRUE, 0x00030000, 0, 0, 0);
+    CHECK(e1 && e2 && e1 != e2 && e1 != s1 && icon_width(e1) == 16 && DestroyIcon(e1) && !DestroyIcon(e1) && DestroyIcon(e2), "CreateIconFromResourceEx of a resource without LR_SHARED");
 
     // From the .ico file: the entry for the size asked for, or the nearest larger one scaled.
     HICON f16 = LoadImageW(NULL, ico_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
@@ -121,6 +188,7 @@ static void check_icons(const WCHAR *ico_path) {
     CHECK(ExtractIconExW(exe, -1, NULL, NULL, 0) == 1 && ExtractIconExW(ico_path, -1, NULL, NULL, 0) == 1, "ExtractIconEx counts");
     CHECK(ExtractIconExW(exe, 0, &large, &small, 1) == 1 && icon_width(large) == 32 && icon_width(small) == 16, "ExtractIconEx of the program");
     CHECK(ExtractIconExW(L"C:\\no such file.exe", -1, NULL, NULL, 0) == 0, "ExtractIconEx of a missing file");
+    check_extract(ico_path);
 
     // Copies and destruction.
     HICON copy = CopyIcon(f48);

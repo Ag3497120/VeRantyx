@@ -34,8 +34,9 @@ typedef struct {
     int is_icon, hot_x, hot_y, shared;
     image img;                                  // the picture the handle stands for
     image more[6]; int nmore;                   // larger sizes of it (from an icon file or group)
-    const void *key; uintptr_t key_name; int key_w, key_h;   // LR_SHARED: what it was loaded from
+    int key_kind; const void *key; uintptr_t key_name; int key_w, key_h;   // LR_SHARED: what it was loaded from
 } icon;
+enum { SHARED_GROUP = 1, SHARED_BITS = 2 };     // key_kind: LoadImage of an icon group / CreateIconFromResource(Ex)
 
 static icon *g_icons[MAX_ICONS];
 static int g_icon_next, g_icon_top;             // top: past the highest slot ever used (find_shared looks below it)
@@ -52,16 +53,18 @@ static void free_icon(icon *ic) {
     for (int i = 0; i < ic->nmore; i++) free(ic->more[i].px);
     free(ic);
 }
+static HANDLE add_locked(icon *ic) {            // (g_icon_lock held) NULL when the table is full
+    int i = g_icon_next;
+    for (int k = 0; k < MAX_ICONS && g_icons[i]; k++) i = (i + 1) % MAX_ICONS;
+    if (g_icons[i]) return NULL;
+    g_icons[i] = ic; g_icon_next = (i + 1) % MAX_ICONS;
+    if (i >= g_icon_top) g_icon_top = i + 1;
+    return (HANDLE)(uintptr_t)(ICON_BASE + i * 4);
+}
 static HANDLE new_icon(icon *ic) {
     if (!ic) return NULL;
     pthread_mutex_lock(&g_icon_lock);
-    int i = g_icon_next;
-    for (int k = 0; k < MAX_ICONS && g_icons[i]; k++) i = (i + 1) % MAX_ICONS;
-    HANDLE h = NULL;
-    if (!g_icons[i]) {
-        g_icons[i] = ic; g_icon_next = (i + 1) % MAX_ICONS; h = (HANDLE)(uintptr_t)(ICON_BASE + i * 4);
-        if (i >= g_icon_top) g_icon_top = i + 1;
-    }
+    HANDLE h = add_locked(ic);
     pthread_mutex_unlock(&g_icon_lock);
     if (!h) { free_icon(ic); vx_set_last_error(8); }
     return h;
@@ -210,19 +213,27 @@ typedef struct {
     const uint8_t *base; size_t size;           // the mapping or the file's bytes
     int file;                                   // RVAs go through the section table
     const uint8_t *sections; int nsec;
+    uint32_t headers;                           // SizeOfHeaders: the headers are mapped at the image's start too
     const uint8_t *root; uint32_t root_size;    // the resource directory
 } pe_view;
+// len bytes at an RVA, or NULL unless all of them are there. In a file an RVA goes through the section table; one in
+// no section is either in the headers (which the loader maps at RVA 0, so the file offset is the RVA) or nowhere.
+// Bytes of a section past its raw data are zeros in memory but not in the file: also NULL.
 static const uint8_t *pe_at(const pe_view *v, uint32_t rva, uint32_t len) {
     uint64_t off = rva;
     if (v->file) {
-        off = UINT64_MAX;
-        for (int i = 0; i < v->nsec; i++) {
+        int found = 0;
+        for (int i = 0; i < v->nsec && !found; i++) {
             const uint8_t *s = v->sections + 40 * i;
             uint32_t vsize = *(const uint32_t *)(s + 8), va = *(const uint32_t *)(s + 12), raw = *(const uint32_t *)(s + 16), rawoff = *(const uint32_t *)(s + 20);
-            if (rva >= va && rva < va + (vsize > raw ? vsize : raw)) { if (rva - va + (uint64_t)len > raw) return NULL; off = (uint64_t)rawoff + rva - va; break; }
+            if (rva < va || rva - va >= (vsize > raw ? vsize : raw)) continue;
+            if ((uint64_t)(rva - va) + len > raw) return NULL;
+            off = (uint64_t)rawoff + (rva - va); found = 1;
         }
+        if (!found && (uint64_t)rva + len > v->headers) return NULL;
     }
-    return off + len <= v->size ? v->base + off : NULL;
+    if (off > v->size || len > v->size - off) return NULL;
+    return v->base + off;
 }
 static int pe_open(pe_view *v, const uint8_t *base, size_t size, int file) {
     memset(v, 0, sizeof *v);
@@ -235,7 +246,9 @@ static int pe_open(pe_view *v, const uint8_t *base, size_t size, int file) {
     int wide = *(const uint16_t *)opt == 0x20b;
     const uint8_t *dirs = opt + (wide ? 112 : 96);
     v->sections = opt + opt_size; v->nsec = nsec;
+    v->headers = *(const uint32_t *)(opt + 60);
     if ((uint64_t)(v->sections - base) + 40ull * nsec > size) return 0;
+    if (*(const uint32_t *)(dirs - 4) < 3) return 0;                 // NumberOfRvaAndSizes: no resource directory
     uint32_t rva = *(const uint32_t *)(dirs + 2 * 8), n = *(const uint32_t *)(dirs + 2 * 8 + 4);
     if (!rva || n < 16) return 0;
     v->root = pe_at(v, rva, n);
@@ -368,21 +381,34 @@ static icon *icon_from_ico(const uint8_t *p, size_t size, int want_icon, int cx,
 
 static int desired(int v, uint32_t flags) { return v ? v : flags & LR_DEFAULTSIZE ? SYSTEM_ICON_SIZE : 0; }
 
-// LR_SHARED: the same resource loaded again is the same handle.
-static HANDLE find_shared(const void *key, uintptr_t name, int w, int h) {
-    HANDLE r = NULL;
-    pthread_mutex_lock(&g_icon_lock);
-    for (int i = 0; i < g_icon_top && !r; i++) {
+// LR_SHARED: the same resource of a module loaded again is the same handle. Shared icons are never freed (DestroyIcon
+// leaves them: per its documentation a shared icon stays valid while its module is loaded), so only a module's
+// resources are shared, of which there are only as many as the modules have.
+static HANDLE find_locked(int kind, const void *key, uintptr_t name, int w, int h) {   // (g_icon_lock held)
+    for (int i = 0; i < g_icon_top; i++) {
         icon *ic = g_icons[i];
-        if (ic && ic->shared && ic->key == key && ic->key_name == name && ic->key_w == w && ic->key_h == h) r = (HANDLE)(uintptr_t)(ICON_BASE + i * 4);
+        if (ic && ic->shared && ic->key_kind == kind && ic->key == key && ic->key_name == name && ic->key_w == w && ic->key_h == h)
+            return (HANDLE)(uintptr_t)(ICON_BASE + i * 4);
     }
+    return NULL;
+}
+static HANDLE find_shared(int kind, const void *key, uintptr_t name, int w, int h) {
+    pthread_mutex_lock(&g_icon_lock);
+    HANDLE r = find_locked(kind, key, name, w, h);
     pthread_mutex_unlock(&g_icon_lock);
     return r;
 }
-static HANDLE keep(icon *ic, uint32_t flags, const void *key, uintptr_t name, int w, int h) {
+// The new icon's handle; with LR_SHARED the one shared under that key (another thread may have made it meanwhile).
+static HANDLE keep(icon *ic, uint32_t flags, int kind, const void *key, uintptr_t name, int w, int h) {
     if (!ic) return NULL;
-    if (flags & LR_SHARED) { ic->shared = 1; ic->key = key; ic->key_name = name; ic->key_w = w; ic->key_h = h; }
-    return new_icon(ic);
+    if (!(flags & LR_SHARED)) return new_icon(ic);
+    ic->shared = 1; ic->key_kind = kind; ic->key = key; ic->key_name = name; ic->key_w = w; ic->key_h = h;
+    pthread_mutex_lock(&g_icon_lock);
+    HANDLE had = find_locked(kind, key, name, w, h), r = had ? had : add_locked(ic);
+    pthread_mutex_unlock(&g_icon_lock);
+    if (had || !r) free_icon(ic);
+    if (!r) vx_set_last_error(8);
+    return r;
 }
 // A name's identity for the shared cache: the id, or a hash of the string (case-blind).
 static uintptr_t name_key(const WCHAR *name) {
@@ -431,10 +457,39 @@ static WINAPI HANDLE CreateIconIndirect(const ICONINFO *ii) {
     return new_icon(ic);
 }
 
+// The RT_ICON (is_icon) or RT_CURSOR resource of a loaded module that `bits` is, as the module and the resource's
+// place in it (offset << 32 | size); 0 for bits anywhere else. Only those are shared: a buffer the program fills (on
+// its heap or stack, or a static one in its own image) may hold another picture at the next call.
+static int resource_of(const uint8_t *bits, DWORD size, int is_icon, const void **module, uintptr_t *where) {
+    const vx_image *im = vx_image_at((uint64_t)(uintptr_t)bits);
+    pe_view v;
+    if (!im || !pe_open(&v, im->base, im->size, 0)) return 0;
+    const WCHAR *by_index = (const WCHAR *)(intptr_t)-1;
+    const uint8_t *types = rsrc_dir(&v, 0);
+    const uint8_t *names = types ? subdir(&v, rsrc_entry(&v, types, (const WCHAR *)(uintptr_t)(is_icon ? RT_ICON : RT_CURSOR), 0)) : NULL;
+    for (int i = 0; names && i < rsrc_count(names); i++) {
+        const uint8_t *langs = subdir(&v, rsrc_entry(&v, names, by_index, i));
+        for (int j = 0; langs && j < rsrc_count(langs); j++) {
+            const uint32_t *l = rsrc_entry(&v, langs, by_index, j);
+            if (!l || (l[1] & 0x80000000u) || (l[1] & 0x7fffffffu) + 16 > v.root_size) continue;
+            const uint32_t *data = (const uint32_t *)(v.root + (l[1] & 0x7fffffffu));
+            if (size <= data[1] && pe_at(&v, data[0], data[1]) == bits) {
+                *module = im->base;
+                *where = (uintptr_t)(bits - im->base) << 32 | size;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static WINAPI HANDLE CreateIconFromResourceEx(const uint8_t *bits, DWORD size, BOOL is_icon, DWORD ver, int cx, int cy, DWORD flags) {
     if (!bits || ver < 0x20000 || ver > 0x30000 || size < (is_icon ? 40u : 44u)) { vx_set_last_error(ERROR_INVALID_PARAMETER); return NULL; }
     int w = cx ? cx : flags & LR_DEFAULTSIZE ? SYSTEM_ICON_SIZE : 0, h = cy ? cy : flags & LR_DEFAULTSIZE ? SYSTEM_ICON_SIZE : 0;
-    HANDLE shared = flags & LR_SHARED ? find_shared(bits, size, w, h) : NULL;
+    const void *module = NULL;
+    uintptr_t where = 0;
+    if ((flags & LR_SHARED) && !resource_of(bits, size, is_icon != 0, &module, &where)) flags &= ~(DWORD)LR_SHARED;   // (a new icon, freed by DestroyIcon)
+    HANDLE shared = flags & LR_SHARED ? find_shared(SHARED_BITS, module, where, w, h) : NULL;
     if (shared) return shared;
     image im;
     const uint8_t *p = is_icon ? bits : bits + 4;
@@ -445,7 +500,7 @@ static WINAPI HANDLE CreateIconFromResourceEx(const uint8_t *bits, DWORD size, B
     if (!ic->img.px) { free(ic); vx_set_last_error(ERROR_INVALID_PARAMETER); return NULL; }
     ic->hot_x = is_icon ? ic->img.w / 2 : *(const uint16_t *)bits * ic->img.w / im.w;
     ic->hot_y = is_icon ? ic->img.h / 2 : *(const uint16_t *)(bits + 2) * ic->img.h / im.h;
-    return keep(ic, flags, bits, size, w, h);
+    return keep(ic, flags, SHARED_BITS, module, where, w, h);
 }
 // "Equivalent to CreateIconFromResourceEx(bits, size, icon, ver, 0, 0, LR_DEFAULTSIZE | LR_SHARED)" (its documentation).
 static WINAPI HANDLE CreateIconFromResource(const uint8_t *bits, DWORD size, BOOL is_icon, DWORD ver) {
@@ -479,14 +534,14 @@ static WINAPI HANDLE LoadImageW(HANDLE module, const WCHAR *name, uint32_t type,
     }
     if (!module) return system_icon((uintptr_t)name);
     uintptr_t key = name_key(name);
-    HANDLE shared = flags & LR_SHARED ? find_shared(module, key, w, h) : NULL;
+    HANDLE shared = flags & LR_SHARED ? find_shared(SHARED_GROUP, module, key, w, h) : NULL;
     if (shared) return shared;
     pe_view v;
     uint32_t len;
     const uint8_t *group;
     if (!module_view(module, &v)) return vx_image_at((uint64_t)(uintptr_t)module) ? NULL : system_icon((uintptr_t)name);   // (a built-in DLL: a stand-in)
     if (!(group = rsrc_find(&v, RT_GROUP_ICON, name, &len))) return NULL;
-    return keep(icon_from_group(&v, group, len, w, h), flags, module, key, w, h);
+    return keep(icon_from_group(&v, group, len, w, h), flags, SHARED_GROUP, module, key, w, h);
 }
 static WCHAR *wide_name(const char *s) { return (uintptr_t)s < 0x10000 ? (WCHAR *)(uintptr_t)s : vx_utf16_dup(s); }
 static void free_name(const char *s, WCHAR *w) { if ((uintptr_t)s >= 0x10000) free(w); }
