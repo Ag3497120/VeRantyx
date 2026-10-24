@@ -176,6 +176,11 @@ DWORD  vx_handle_count(void);
 void vx_log(const char *fmt, ...);
 void vx_control_start(const char *path);       // control.c: VXRT_CONTROL, the socket Command Clips talk to
 extern int vx_trace;
+// The program's return addresses on a stack from sp up to top, and on the stack of its call now running (seh.c);
+// the calls VXRT_TRACE_CALLS_RING kept, before `why` (calltrace.c).
+void vx_log_stack_scan(const uint64_t *sp, uint64_t top, int max);
+void vx_log_caller_stack(int max);
+void vx_trace_ring_dump(const char *why);
 
 // Module registration entry points (one per source file).
 void vx_kernel32_init(void);
