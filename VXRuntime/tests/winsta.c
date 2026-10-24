@@ -1,6 +1,7 @@
 // The session around the windows, as Chromium's sandbox and Steam's web helper use it: window stations and desktops
 // (the process's WinSta0\Default, a window station made without a name, a desktop made in it, their names, flags and
-// lifetimes), power notifications, DPI awareness (user32 and shcore through its API set) and SetCoalescableTimer.
+// lifetimes, the rights each handle was opened with, the windows each desktop lists), power notifications, DPI
+// awareness (user32 and shcore through its API set) and SetCoalescableTimer.
 // Newer functions are looked up by name, as the programs do. All names are made up for the test.
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
@@ -131,6 +132,103 @@ static void stations_and_desktops(void) {
     CHECK(!OpenWindowStationW(alt_name, FALSE, WINSTA_ENUMDESKTOPS) && GetLastError() == ERROR_FILE_NOT_FOUND);
 }
 
+// What EnumDesktopWindows showed.
+static HWND g_seen[32];
+static int g_seen_count;
+static BOOL CALLBACK collect(HWND w, LPARAM lp) { (void)lp; if (g_seen_count < 32) g_seen[g_seen_count++] = w; return TRUE; }
+static int seen(HWND w) { for (int i = 0; i < g_seen_count; i++) if (g_seen[i] == w) return 1; return 0; }
+static int enumerate(HDESK desk) { g_seen_count = 0; return EnumDesktopWindows(desk, collect, 0); }
+
+static HANDLE g_window_made, g_window_done;
+static HWND g_alt_window;
+static DWORD WINAPI window_on_alternate_desktop(void *desk) {
+    // A thread on the other desktop makes a window there; it destroys it and goes back before it ends.
+    HDESK home = GetThreadDesktop(GetCurrentThreadId());
+    if (!SetThreadDesktop((HDESK)desk)) return 1;
+    g_alt_window = CreateWindowExA(0, "STATIC", "vx alternate", WS_POPUP, 0, 0, 10, 10, NULL, NULL, NULL, NULL);
+    SetEvent(g_window_made);
+    WaitForSingleObject(g_window_done, 5000);
+    if (!g_alt_window || !DestroyWindow(g_alt_window)) return 2;
+    return SetThreadDesktop(home) ? 0 : 3;
+}
+
+// A handle can do only what it was opened for, and a desktop's windows are its own.
+static void access_and_windows(void) {
+    HWINSTA ws = GetProcessWindowStation();
+    HDESK desk = GetThreadDesktop(GetCurrentThreadId());
+    HWND w = CreateWindowExA(0, "STATIC", "vx enum", WS_POPUP, 0, 0, 10, 10, NULL, NULL, NULL, NULL);
+    CHECK(w != NULL);
+
+    // EnumDesktopWindows: NULL is the thread's desktop; a handle needs DESKTOP_READOBJECTS (GENERIC_READ has it).
+    CHECK(enumerate(NULL) && seen(w));
+    CHECK(enumerate(desk) && seen(w));
+    HDESK reader = OpenDesktopW(L"Default", 0, FALSE, DESKTOP_READOBJECTS);
+    CHECK(reader && enumerate(reader) && seen(w));
+    HDESK generic_reader = OpenDesktopW(L"Default", 0, FALSE, GENERIC_READ);
+    CHECK(generic_reader && enumerate(generic_reader) && seen(w) && CloseDesktop(generic_reader));
+    HDESK switcher = OpenDesktopW(L"Default", 0, FALSE, DESKTOP_SWITCHDESKTOP);
+    CHECK(switcher != NULL);
+    SetLastError(0);
+    CHECK(!enumerate(switcher) && GetLastError() == ERROR_ACCESS_DENIED && !g_seen_count);
+    SetLastError(0);
+    CHECK(!enumerate((HDESK)ws) && GetLastError() == ERROR_INVALID_HANDLE && !g_seen_count);
+    SetLastError(0);
+    CHECK(!enumerate((HDESK)(INT_PTR)0x1234) && GetLastError() == ERROR_INVALID_HANDLE && !g_seen_count);
+
+    // SwitchDesktop needs DESKTOP_SWITCHDESKTOP (GENERIC_EXECUTE has it).
+    SetLastError(0);
+    CHECK(!SwitchDesktop(reader) && GetLastError() == ERROR_ACCESS_DENIED);
+    CHECK(SwitchDesktop(switcher));
+    HDESK executer = OpenDesktopW(L"Default", 0, FALSE, GENERIC_EXECUTE);
+    CHECK(executer && SwitchDesktop(executer) && CloseDesktop(executer));
+    CHECK(SwitchDesktop(desk));                                    // (the process's own handles have every right)
+
+    // Flags are written only through a handle that may: DESKTOP_WRITEOBJECTS, WINSTA_WRITEATTRIBUTES (or GENERIC_WRITE).
+    USEROBJECTFLAGS before = { 0 }, after = { 0 }, changed;
+    DWORD need = 0;
+    CHECK(GetUserObjectInformationW(desk, UOI_FLAGS, &before, sizeof before, &need));
+    changed = before; changed.dwFlags ^= DF_ALLOWOTHERACCOUNTHOOK;
+    SetLastError(0);
+    CHECK(!SetUserObjectInformationW(reader, UOI_FLAGS, &changed, sizeof changed) && GetLastError() == ERROR_ACCESS_DENIED);
+    CHECK(GetUserObjectInformationW(desk, UOI_FLAGS, &after, sizeof after, &need) && after.dwFlags == before.dwFlags);
+    HDESK writer = OpenDesktopW(L"Default", 0, FALSE, GENERIC_WRITE);
+    CHECK(writer && SetUserObjectInformationW(writer, UOI_FLAGS, &changed, sizeof changed));
+    CHECK(GetUserObjectInformationW(desk, UOI_FLAGS, &after, sizeof after, &need) && after.dwFlags == changed.dwFlags);
+    CHECK(SetUserObjectInformationW(writer, UOI_FLAGS, &before, sizeof before) && CloseDesktop(writer));
+    HWINSTA ws_reader = OpenWindowStationW(L"WinSta0", FALSE, WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES);
+    USEROBJECTFLAGS station = { 0 }, hidden;
+    CHECK(ws_reader && GetUserObjectInformationW(ws_reader, UOI_FLAGS, &station, sizeof station, &need) && (station.dwFlags & WSF_VISIBLE));
+    hidden = station; hidden.dwFlags = 0;
+    SetLastError(0);
+    CHECK(!SetUserObjectInformationW(ws_reader, UOI_FLAGS, &hidden, sizeof hidden) && GetLastError() == ERROR_ACCESS_DENIED);
+    CHECK(GetUserObjectInformationW(ws, UOI_FLAGS, &station, sizeof station, &need) && (station.dwFlags & WSF_VISIBLE));
+    CHECK(CloseWindowStation(ws_reader));
+    HWINSTA ws_writer = OpenWindowStationW(L"WinSta0", FALSE, WINSTA_WRITEATTRIBUTES);
+    CHECK(ws_writer && SetUserObjectInformationW(ws_writer, UOI_FLAGS, &station, sizeof station) && CloseWindowStation(ws_writer));
+
+    // A desktop made in another window station: it shows the windows its threads make there, and only those.
+    HWINSTA alt = CreateWindowStationW(NULL, 0, WINSTA_ALL_ACCESS, NULL);
+    CHECK(alt && SetProcessWindowStation(alt));
+    HDESK alt_desk = CreateDesktopW(L"vx_enum_desktop", NULL, NULL, 0, GENERIC_ALL, NULL);
+    CHECK(SetProcessWindowStation(ws));
+    CHECK(alt_desk && enumerate(alt_desk) && !g_seen_count);
+    g_window_made = CreateEventA(NULL, TRUE, FALSE, NULL); g_window_done = CreateEventA(NULL, TRUE, FALSE, NULL);
+    HANDLE t = CreateThread(NULL, 0, window_on_alternate_desktop, alt_desk, 0, NULL);
+    DWORD code = 9;
+    CHECK(WaitForSingleObject(g_window_made, 5000) == WAIT_OBJECT_0 && g_alt_window != NULL);
+    CHECK(enumerate(alt_desk) && g_seen_count == 1 && seen(g_alt_window));
+    CHECK(enumerate(desk) && seen(w) && !seen(g_alt_window));
+    CHECK(enumerate(NULL) && seen(w) && !seen(g_alt_window));
+    SetEvent(g_window_done);
+    WaitForSingleObject(t, 5000);
+    CHECK(GetExitCodeThread(t, &code) && code == 0);
+    CloseHandle(t); CloseHandle(g_window_made); CloseHandle(g_window_done);
+    CHECK(enumerate(alt_desk) && !g_seen_count);
+    CHECK(CloseDesktop(alt_desk) && CloseWindowStation(alt));
+    CHECK(CloseDesktop(reader) && CloseDesktop(switcher));
+    DestroyWindow(w);
+}
+
 static void power_notifications(HWND hwnd) {
     HMODULE user32 = GetModuleHandleA("user32.dll");
     HPOWERNOTIFY (WINAPI *reg_suspend)(HANDLE, DWORD) = (void *)GetProcAddress(user32, "RegisterSuspendResumeNotification");
@@ -238,6 +336,7 @@ static void coalescable_timer(void) {
 
 int main(void) {
     stations_and_desktops();
+    access_and_windows();
     HWND w = CreateWindowExA(0, "STATIC", "vx power", WS_POPUP, 0, 0, 10, 10, NULL, NULL, NULL, NULL);
     power_notifications(w);
     DestroyWindow(w);

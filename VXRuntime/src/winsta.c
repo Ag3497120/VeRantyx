@@ -6,6 +6,14 @@
 // on the Mac's one screen, whichever desktop their thread is on. Each object goes when its last handle closes, as on
 // Windows (WinSta0 and Default stay).
 //
+// No isolation, on purpose. On Windows another window station or desktop is a security boundary (no messages or hooks
+// across desktops; no clipboard or input in a window station that is not interactive). Here windows, hooks, the
+// clipboard (the Mac's pasteboard) and input are shared whatever the desktop, a security descriptor given at creation
+// is not applied, and CreateProcess does not put a child on STARTUPINFO's lpDesktop. Making them still succeeds, as
+// steamwebhelper (Chromium) stops when it cannot; the first one made says in the log, always, that it isolates
+// nothing (README.md, "Known risks"). What is kept as on Windows: each handle's access rights (the calls that change
+// an object or read its windows check them), and EnumDesktopWindows lists only the windows of that desktop's threads.
+//
 // The process is an ordinary user's (system.c's token): it may not name a window station it creates.
 #include <pthread.h>
 #include <stdio.h>
@@ -36,7 +44,68 @@ struct uobj {
     int refs;                       // its handles' data, its desktops, one for WinSta0 and Default
     uobj *next;
 };
-typedef struct { uobj *o; BOOL inherit; } uhandle;      // the data of one handle (and of its duplicates)
+// The data of one handle (and of its duplicates, which share it: a duplicate has the original's rights, whatever it
+// asked for, so never more than the original).
+typedef struct { uobj *o; BOOL inherit; DWORD access; } uhandle;
+
+// Access rights (learn.microsoft.com, "Window Station Security and Access Rights", "Desktop Security and Access
+// Rights"). A handle has the rights it was opened with, generic rights mapped to the object's own; MAXIMUM_ALLOWED
+// (and the handles the process starts with) has them all. Nothing refuses a right when a handle is opened (the
+// objects' owner is this process's user), but a call needing a right the handle lacks fails with ERROR_ACCESS_DENIED.
+#define READ_CONTROL_               0x00020000u
+#define STANDARD_RIGHTS_REQUIRED_   0x000f0000u
+#define MAXIMUM_ALLOWED_            0x02000000u
+#define GENERIC_ALL_                0x10000000u
+#define GENERIC_EXECUTE_            0x20000000u
+#define GENERIC_WRITE_              0x40000000u
+#define GENERIC_READ_               0x80000000u
+#define WINSTA_ENUMDESKTOPS_        0x0001u
+#define WINSTA_READATTRIBUTES_      0x0002u
+#define WINSTA_ACCESSCLIPBOARD_     0x0004u
+#define WINSTA_CREATEDESKTOP_       0x0008u
+#define WINSTA_WRITEATTRIBUTES_     0x0010u
+#define WINSTA_ACCESSGLOBALATOMS_   0x0020u
+#define WINSTA_EXITWINDOWS_         0x0040u
+#define WINSTA_ENUMERATE_           0x0100u
+#define WINSTA_READSCREEN_          0x0200u
+#define WINSTA_ALL_ACCESS_          0x037fu
+#define DESKTOP_READOBJECTS_        0x0001u
+#define DESKTOP_CREATEWINDOW_       0x0002u
+#define DESKTOP_CREATEMENU_         0x0004u
+#define DESKTOP_HOOKCONTROL_        0x0008u
+#define DESKTOP_JOURNALRECORD_      0x0010u
+#define DESKTOP_JOURNALPLAYBACK_    0x0020u
+#define DESKTOP_ENUMERATE_          0x0040u
+#define DESKTOP_WRITEOBJECTS_       0x0080u
+#define DESKTOP_SWITCHDESKTOP_      0x0100u
+#define DESKTOP_ALL_                0x01ffu
+static DWORD granted(int desktop, DWORD want) {
+    static const DWORD generic[2][4] = {                        // GENERIC_READ, _WRITE, _EXECUTE, _ALL
+        { WINSTA_ENUMDESKTOPS_ | WINSTA_ENUMERATE_ | WINSTA_READATTRIBUTES_ | WINSTA_READSCREEN_ | READ_CONTROL_,
+          WINSTA_ACCESSCLIPBOARD_ | WINSTA_CREATEDESKTOP_ | WINSTA_WRITEATTRIBUTES_ | READ_CONTROL_,
+          WINSTA_ACCESSGLOBALATOMS_ | WINSTA_EXITWINDOWS_ | READ_CONTROL_,
+          WINSTA_ALL_ACCESS_ | STANDARD_RIGHTS_REQUIRED_ },
+        { DESKTOP_ENUMERATE_ | DESKTOP_READOBJECTS_ | READ_CONTROL_,
+          DESKTOP_CREATEMENU_ | DESKTOP_CREATEWINDOW_ | DESKTOP_HOOKCONTROL_ | DESKTOP_JOURNALPLAYBACK_ |
+              DESKTOP_JOURNALRECORD_ | DESKTOP_WRITEOBJECTS_ | READ_CONTROL_,
+          DESKTOP_SWITCHDESKTOP_ | READ_CONTROL_,
+          DESKTOP_ALL_ | STANDARD_RIGHTS_REQUIRED_ },
+    };
+    const DWORD *g = generic[desktop ? 1 : 0], valid = g[3];
+    if (want & MAXIMUM_ALLOWED_) return valid;
+    DWORD r = want & valid;
+    if (want & GENERIC_READ_) r |= g[0];
+    if (want & GENERIC_WRITE_) r |= g[1];
+    if (want & GENERIC_EXECUTE_) r |= g[2];
+    if (want & GENERIC_ALL_) r |= g[3];
+    return r;
+}
+// Whether the handle may do what needs `right`; ERROR_ACCESS_DENIED if not.
+static int allowed(const uhandle *u, DWORD right) {
+    if ((u->access & right) == right) return 1;
+    vx_set_last_error(ERROR_ACCESS_DENIED);
+    return 0;
+}
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static uobj *g_objects;
@@ -45,7 +114,9 @@ static uobj g_default = { 1, "Default", &g_winsta0, 1 /* DF_ALLOWOTHERACCOUNTHOO
 static HANDLE g_process_station;    // SetProcessWindowStation's (first: a handle to WinSta0)
 static HANDLE g_initial_desktop;    // every thread's until it calls SetThreadDesktop
 static __thread HANDLE t_desktop;
-static struct { DWORD tid; HANDLE desk; } g_thread_desktops[64];   // what GetThreadDesktop tells of other threads
+// What GetThreadDesktop tells of other threads, and which desktop a thread's windows are on (each entry holds a
+// reference on its desktop: the object stays while a thread is on it, whatever happens to the handle).
+static struct { DWORD tid; HANDLE desk; uobj *o; } g_thread_desktops[64];
 
 // Releases a reference; the last one unlinks and frees the object (never WinSta0 or Default). Called with g_lock.
 static void release(uobj *o) {
@@ -64,10 +135,10 @@ static void handle_destroy(void *data) {
     pthread_mutex_unlock(&g_lock);
     free(u);
 }
-// A new handle to o, which the caller holds a reference on for it.
-static HANDLE new_handle(uobj *o, BOOL inherit) {
+// A new handle to o with the rights asked for, which the caller holds a reference on for it.
+static HANDLE new_handle(uobj *o, BOOL inherit, DWORD access) {
     uhandle *u = calloc(1, sizeof *u);
-    u->o = o; u->inherit = inherit;
+    u->o = o; u->inherit = inherit; u->access = granted(o->desktop, access);
     HANDLE h = vx_handle_new(o->desktop ? VX_HANDLE_DESKTOP : VX_HANDLE_WINSTA, u, handle_destroy);
     if (!h) { pthread_mutex_lock(&g_lock); release(o); pthread_mutex_unlock(&g_lock); free(u); vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); }
     return h;
@@ -77,8 +148,8 @@ static uhandle *handle_of(HANDLE h, int desktop) { return vx_handle_data(h, desk
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static void make_initial(void) {
     g_winsta0.next = &g_default; g_objects = &g_winsta0;
-    g_winsta0.refs++; g_process_station = new_handle(&g_winsta0, 0);
-    g_default.refs++; g_initial_desktop = new_handle(&g_default, 0);
+    g_winsta0.refs++; g_process_station = new_handle(&g_winsta0, 0, MAXIMUM_ALLOWED_);
+    g_default.refs++; g_initial_desktop = new_handle(&g_default, 0, MAXIMUM_ALLOWED_);
 }
 static void initial(void) { pthread_once(&g_once, make_initial); }
 
@@ -95,8 +166,19 @@ static uobj *current_station(void) {
 }
 static HANDLE thread_desktop(void) { initial(); return t_desktop ? t_desktop : g_initial_desktop; }
 
+// The first window station or desktop a program makes is said in the log (not only when tracing): a program that
+// makes one expects what it puts there to be kept apart, and nothing here is (see the top of this file).
+static int g_isolation_noted;
+static void note_no_isolation(int desktop, const char *name, const char *station) {
+    if (__atomic_exchange_n(&g_isolation_noted, 1, __ATOMIC_ACQ_REL)) return;
+    vx_log("winsta: %s \"%s%s%s\" made: it isolates nothing here (windows, hooks, clipboard and input are shared with "
+           "every desktop, its security descriptor is not applied, child processes are not put on it); a sandbox "
+           "relying on it is not in force", desktop ? "desktop" : "window station", station ? station : "",
+           station ? "\\" : "", name);
+}
+
 // Creates the named object or opens it ("create_only": it must not exist yet). NULL with the last error set.
-static HANDLE create(int desktop, const char *name, uobj *station, DWORD flags, int create_only, BOOL inherit) {
+static HANDLE create(int desktop, const char *name, uobj *station, DWORD flags, int create_only, BOOL inherit, DWORD access) {
     pthread_mutex_lock(&g_lock);
     uobj *o = find(desktop, name, station);
     int existed = o != NULL;
@@ -109,18 +191,19 @@ static HANDLE create(int desktop, const char *name, uobj *station, DWORD flags, 
     }
     o->refs++;
     pthread_mutex_unlock(&g_lock);
-    HANDLE h = new_handle(o, inherit);
+    HANDLE h = new_handle(o, inherit, access);
+    if (h && !existed) note_no_isolation(desktop, name, station ? station->name : NULL);
     if (h) vx_set_last_error(existed ? ERROR_ALREADY_EXISTS : 0);
     return h;
 }
-static HANDLE open_named(int desktop, const char *name, uobj *station, BOOL inherit) {
+static HANDLE open_named(int desktop, const char *name, uobj *station, BOOL inherit, DWORD access) {
     if (!name) { vx_set_last_error(ERROR_INVALID_PARAMETER); return NULL; }
     pthread_mutex_lock(&g_lock);
     uobj *o = find(desktop, name, station);
     if (o) o->refs++;
     pthread_mutex_unlock(&g_lock);
     if (!o) { vx_set_last_error(ERROR_FILE_NOT_FOUND); return NULL; }
-    return new_handle(o, inherit);
+    return new_handle(o, inherit, access);
 }
 // SECURITY_ATTRIBUTES (x64): nLength, lpSecurityDescriptor, bInheritHandle.
 static BOOL inherit_of(const uint8_t *sa) { return sa && *(const BOOL *)(sa + 16); }
@@ -128,16 +211,15 @@ static BOOL inherit_of(const uint8_t *sa) { return sa && *(const BOOL *)(sa + 16
 // CreateWindowStation: only an administrator may name it; without a name it is the logon session's
 // ("Service-0x<high>-<low>$", the session's LUID: 0:0 for system.c's token).
 static WINAPI HANDLE CreateWindowStationA(const char *name, DWORD flags, DWORD access, const uint8_t *sa) {
-    (void)access;
     if (name && *name) { vx_set_last_error(ERROR_ACCESS_DENIED); return NULL; }
     initial();
-    return create(0, "Service-0x0-0$", NULL, 0, flags & 1 /* CWF_CREATE_ONLY */, inherit_of(sa));
+    return create(0, "Service-0x0-0$", NULL, 0, flags & 1 /* CWF_CREATE_ONLY */, inherit_of(sa), access);
 }
 static WINAPI HANDLE CreateWindowStationW(const WCHAR *name, DWORD flags, DWORD access, const uint8_t *sa) {
     if (name && *name) { vx_set_last_error(ERROR_ACCESS_DENIED); return NULL; }
     return CreateWindowStationA(NULL, flags, access, sa);
 }
-static WINAPI HANDLE OpenWindowStationA(const char *name, BOOL inherit, DWORD access) { (void)access; initial(); return open_named(0, name, NULL, inherit); }
+static WINAPI HANDLE OpenWindowStationA(const char *name, BOOL inherit, DWORD access) { initial(); return open_named(0, name, NULL, inherit, access); }
 static WINAPI HANDLE OpenWindowStationW(const WCHAR *name, BOOL inherit, DWORD access) {
     char *n = vx_utf8_dup(name);
     HANDLE h = OpenWindowStationA(n, inherit, access);
@@ -160,10 +242,9 @@ static WINAPI BOOL CloseWindowStation(HANDLE h) {
 
 // Desktops are made and opened in the process's window station.
 static WINAPI HANDLE CreateDesktopA(const char *name, const char *device, void *mode, DWORD flags, DWORD access, const uint8_t *sa) {
-    (void)access;
     if (device || mode) { vx_set_last_error(ERROR_INVALID_PARAMETER); return NULL; }
     if (!valid_name(name)) { vx_set_last_error(ERROR_INVALID_NAME); return NULL; }
-    return create(1, name, current_station(), flags & 1 /* DF_ALLOWOTHERACCOUNTHOOK */, 0, inherit_of(sa));
+    return create(1, name, current_station(), flags & 1 /* DF_ALLOWOTHERACCOUNTHOOK */, 0, inherit_of(sa), access);
 }
 static WINAPI HANDLE CreateDesktopW(const WCHAR *name, const WCHAR *device, void *mode, DWORD flags, DWORD access, const uint8_t *sa) {
     if (device || mode) { vx_set_last_error(ERROR_INVALID_PARAMETER); return NULL; }
@@ -176,7 +257,7 @@ static WINAPI HANDLE CreateDesktopExW(const WCHAR *name, const WCHAR *device, vo
     (void)heap_kb; (void)reserved;
     return CreateDesktopW(name, device, mode, flags, access, sa);
 }
-static WINAPI HANDLE OpenDesktopA(const char *name, DWORD flags, BOOL inherit, DWORD access) { (void)flags; (void)access; return open_named(1, name, current_station(), inherit); }
+static WINAPI HANDLE OpenDesktopA(const char *name, DWORD flags, BOOL inherit, DWORD access) { (void)flags; return open_named(1, name, current_station(), inherit, access); }
 static WINAPI HANDLE OpenDesktopW(const WCHAR *name, DWORD flags, BOOL inherit, DWORD access) {
     char *n = vx_utf8_dup(name);
     HANDLE h = OpenDesktopA(n, flags, inherit, access);
@@ -186,12 +267,12 @@ static WINAPI HANDLE OpenDesktopW(const WCHAR *name, DWORD flags, BOOL inherit, 
 // The desktop receiving the user's input: WinSta0's Default (a new handle the caller closes). Its name matters:
 // SteamVR's compositor shows its "display locked" colour unless the input desktop is Default.
 static WINAPI HANDLE OpenInputDesktop(DWORD flags, BOOL inherit, DWORD access) {
-    (void)flags; (void)access;
+    (void)flags;
     initial();
     pthread_mutex_lock(&g_lock);
     g_default.refs++;
     pthread_mutex_unlock(&g_lock);
-    return new_handle(&g_default, inherit);
+    return new_handle(&g_default, inherit, access);
 }
 static WINAPI HANDLE GetThreadDesktop(DWORD tid) {
     if (!tid) { vx_set_last_error(ERROR_INVALID_PARAMETER); return NULL; }
@@ -211,8 +292,14 @@ static void forget_thread(void *value) {
     DWORD tid = (DWORD)(uintptr_t)value;
     pthread_mutex_lock(&g_lock);
     for (size_t i = 0; i < sizeof g_thread_desktops / sizeof *g_thread_desktops; i++)
-        if (g_thread_desktops[i].tid == tid) g_thread_desktops[i].tid = 0;
+        if (g_thread_desktops[i].tid == tid) { g_thread_desktops[i].tid = 0; release(g_thread_desktops[i].o); g_thread_desktops[i].o = NULL; }
     pthread_mutex_unlock(&g_lock);
+}
+// The desktop a thread is on: its entry, else Default, where every thread starts. Called with g_lock.
+static uobj *thread_object(DWORD tid) {
+    for (size_t i = 0; i < sizeof g_thread_desktops / sizeof *g_thread_desktops; i++)
+        if (g_thread_desktops[i].tid == tid) return g_thread_desktops[i].o;
+    return &g_default;
 }
 static void make_desk_key(void) { pthread_key_create(&g_desk_key, forget_thread); }
 static WINAPI BOOL count_window(HANDLE hwnd, LPARAM n) { (void)hwnd; ++*(int *)(intptr_t)n; return 0; }
@@ -232,7 +319,11 @@ static WINAPI BOOL SetThreadDesktop(HANDLE h) {
     size_t i = 0, n = sizeof g_thread_desktops / sizeof *g_thread_desktops, free_slot = n;
     for (; i < n && g_thread_desktops[i].tid != tid; i++) if (!g_thread_desktops[i].tid && free_slot == n) free_slot = i;
     if (i == n) i = free_slot;
-    if (i < n) { g_thread_desktops[i].tid = tid; g_thread_desktops[i].desk = h; }
+    if (i < n) {
+        u->o->refs++;
+        if (g_thread_desktops[i].tid) release(g_thread_desktops[i].o);
+        g_thread_desktops[i].tid = tid; g_thread_desktops[i].desk = h; g_thread_desktops[i].o = u->o;
+    }
     pthread_mutex_unlock(&g_lock);
     pthread_once(&g_desk_key_once, make_desk_key);
     pthread_setspecific(g_desk_key, (void *)(uintptr_t)tid);
@@ -252,8 +343,41 @@ static WINAPI BOOL CloseDesktop(HANDLE h) {
 static WINAPI BOOL SwitchDesktop(HANDLE h) {
     uhandle *u = handle_of(h, 1);
     if (!u) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
+    if (!allowed(u, DESKTOP_SWITCHDESKTOP_)) return 0;
     if (u->o != &g_default) { vx_set_last_error(ERROR_ACCESS_DENIED); return 0; }   // the Mac shows only the one
     return 1;
+}
+
+// EnumDesktopWindows: the top-level windows on a desktop (NULL: the calling thread's), through a handle that may read
+// it (DESKTOP_READOBJECTS). A window is on the desktop its thread was on when it made it; a thread with windows cannot
+// move (SetThreadDesktop), so that is the thread's desktop now. Windows on other desktops are not shown.
+typedef BOOL (WINAPI *WNDENUMPROC)(HANDLE, LPARAM);
+typedef struct { uobj *o; WNDENUMPROC fn; LPARAM lp; } desktop_enum;
+static WINAPI BOOL on_desktop(HANDLE hwnd, LPARAM lp) {
+    desktop_enum *e = (desktop_enum *)(intptr_t)lp;
+    vx_window *w = vx_window_get(hwnd);
+    if (!w) return 1;
+    pthread_mutex_lock(&g_lock);
+    int here = thread_object(w->tid) == e->o;
+    pthread_mutex_unlock(&g_lock);
+    return here ? e->fn(hwnd, e->lp) : 1;
+}
+static WINAPI BOOL EnumDesktopWindows(HANDLE h, WNDENUMPROC fn, LPARAM lp) {
+    if (!fn) { vx_set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    uhandle *u = h ? handle_of(h, 1) : handle_of(thread_desktop(), 1);
+    if (h && !u) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
+    if (h && !allowed(u, DESKTOP_READOBJECTS_)) return 0;
+    desktop_enum e = { u ? u->o : NULL, fn, lp };
+    pthread_mutex_lock(&g_lock);
+    if (!e.o) e.o = thread_object(vx_current_tid());
+    e.o->refs++;                                                   // (it stays while its windows are listed)
+    pthread_mutex_unlock(&g_lock);
+    BOOL (WINAPI *each)(WNDENUMPROC, LPARAM) = (BOOL (WINAPI *)(WNDENUMPROC, LPARAM))vx_find_export("user32.dll", "EnumWindows");
+    BOOL ok = each(on_desktop, (LPARAM)(intptr_t)&e);
+    pthread_mutex_lock(&g_lock);
+    release(e.o);
+    pthread_mutex_unlock(&g_lock);
+    return ok;
 }
 
 // GetUserObjectInformation: UOI_FLAGS (USEROBJECTFLAGS: fInherit, fReserved, dwFlags), UOI_NAME, UOI_TYPE,
@@ -309,6 +433,7 @@ static WINAPI BOOL SetUserObjectInformationW(HANDLE h, int index, const void *in
     if (!u) u = handle_of(h, 1);
     if (!u) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
     if (index != 1 || !in || n < 12) { vx_set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    if (!allowed(u, u->o->desktop ? DESKTOP_WRITEOBJECTS_ : WINSTA_WRITEATTRIBUTES_)) return 0;
     u->inherit = ((const DWORD *)in)[0] != 0;
     pthread_mutex_lock(&g_lock);
     u->o->flags = ((const DWORD *)in)[2];
@@ -437,6 +562,7 @@ static const vx_export user32[] = {
     VX_EXPORT(GetProcessWindowStation), VX_EXPORT(SetProcessWindowStation), VX_EXPORT(CloseWindowStation),
     VX_EXPORT(CreateDesktopA), VX_EXPORT(CreateDesktopW), VX_EXPORT(CreateDesktopExW), VX_EXPORT(OpenDesktopA), VX_EXPORT(OpenDesktopW),
     VX_EXPORT(OpenInputDesktop), VX_EXPORT(GetThreadDesktop), VX_EXPORT(SetThreadDesktop), VX_EXPORT(CloseDesktop), VX_EXPORT(SwitchDesktop),
+    VX_EXPORT(EnumDesktopWindows),
     VX_EXPORT(GetUserObjectInformationW), VX_EXPORT(GetUserObjectInformationA), VX_EXPORT(SetUserObjectInformationW),
     VX_EXPORT(SetUserObjectInformationA),
     VX_EXPORT(RegisterSuspendResumeNotification), VX_EXPORT(UnregisterSuspendResumeNotification),

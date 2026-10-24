@@ -228,11 +228,6 @@ static WINAPI BOOL UnionRect(RECT *out, const RECT *a, const RECT *b) {
     return 1;
 }
 static WINAPI BOOL AttachThreadInput(DWORD a, DWORD b, BOOL on) { (void)a; (void)b; (void)on; return 1; }
-static WINAPI BOOL EnumDesktopWindows(HANDLE desk, void *fn, intptr_t param) {
-    (void)desk;
-    BOOL (WINAPI *each)(void *, intptr_t) = (BOOL (WINAPI *)(void *, intptr_t))vx_find_export("user32.dll", "EnumWindows");
-    return each(fn, param);
-}
 static WINAPI BOOL ExitWindowsEx(DWORD flags, DWORD reason) { (void)flags; (void)reason; vx_set_last_error(5); return 0; }
 static WINAPI uint64_t GetClassLongPtrA(HANDLE wnd, int index) { (void)wnd; (void)index; return 0; }
 static WINAPI int GetClipboardFormatNameA(DWORD fmt, char *out, int cap) { (void)fmt; if (out && cap) out[0] = 0; return 0; }
@@ -617,7 +612,7 @@ static const vx_export advapi32[] = { VX_EXPORT(RegSetKeyValueW), VX_EXPORT(RegD
 static const vx_export user32[] = {
     VX_EXPORT(SetClassLongPtrW), { "SetClassLongPtrA", (void *)SetClassLongPtrW }, VX_EXPORT(SetRectEmpty), VX_EXPORT(PtInRect),
     VX_EXPORT(IntersectRect), VX_EXPORT(UnionRect), VX_EXPORT(AttachThreadInput),
-    VX_EXPORT(EnumDesktopWindows), VX_EXPORT(ExitWindowsEx), VX_EXPORT(GetClassLongPtrA),
+    VX_EXPORT(ExitWindowsEx), VX_EXPORT(GetClassLongPtrA),
     VX_EXPORT(GetClipboardFormatNameA), VX_EXPORT(EnumClipboardFormats), VX_EXPORT(RegisterClipboardFormatW),
     { "RegisterClipboardFormatA", (void *)RegisterClipboardFormatW }, VX_EXPORT(GetCursorInfo), VX_EXPORT(GetMessagePos),
     VX_EXPORT(GetShellWindow), VX_EXPORT(IsWindowUnicode), VX_EXPORT(MapDialogRect), VX_EXPORT(SetParent), VX_EXPORT(SetWinEventHook),
