@@ -37,7 +37,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
        build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/kernelx.exe build/jobs.exe build/security.exe \
-       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe
+       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/open_thread.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -193,6 +193,12 @@ build/steam_client_ui.exe: tests/steam_client_ui.c
 # DuplicateHandle between processes both ways: pipe ends and events taken from and given to another process
 # (src/handlexfer.c): Steam's process pipes.
 build/handle_xfer.exe: tests/handle_xfer.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+# OpenThread by ID for any running thread (the main thread; one whose CreateThread handle was closed) (src/sync.c):
+# Valve's tier0 freed the data of Steam's main thread when it could not open it.
+build/open_thread.exe: tests/open_thread.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
@@ -1197,6 +1203,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/webhelper_apis.exe
 	$(VXRT) build/steam_client_ui.exe
 	$(VXRT) build/handle_xfer.exe
+	$(VXRT) build/open_thread.exe
 	$(VXRT) build/window.exe
 	$(VXRT) build/winsta.exe
 	$(VXRT) build/scm.exe

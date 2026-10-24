@@ -277,11 +277,13 @@ void vx_thread_attach(void) {
     pthread_mutex_unlock(&g_tebs_lock);
     pthread_setspecific(g_teb_key, teb);
     set_gs_slots(teb);
+    vx_thread_live(1);                                         // (OpenThread finds it by its ID from now on: sync.c)
 }
 
 void vx_thread_detach(void) {
     uint8_t *teb = pthread_getspecific(g_teb_key);
     if (!teb) return;
+    vx_thread_live(0);
     pthread_mutex_lock(&g_tebs_lock);
     for (int i = 0; i < g_teb_count; i++) if (g_tebs[i] == teb) { g_tebs[i] = g_tebs[--g_teb_count]; break; }
     pthread_mutex_unlock(&g_tebs_lock);

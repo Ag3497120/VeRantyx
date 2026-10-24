@@ -105,6 +105,7 @@ enum {
 enum { PEB_IMAGE_BASE = 0x10, PEB_PROCESS_HEAP = 0x30, PEB_SIZE = 0x1000 };
 uint8_t *vx_teb(void);                 // this thread's TEB (creates it on first use)
 void     vx_thread_attach(void);       // TEB + gs slots + TLS for the calling thread
+void     vx_thread_live(int alive);    // sync.c: the calling thread joins (1) or leaves (0) the threads OpenThread finds
 #ifdef __aarch64__
 extern __thread size_t vx_x86_stack_size;   // the x86 stack vx_thread_attach makes (0: 1 MB)
 void vx_arm64_init(void);

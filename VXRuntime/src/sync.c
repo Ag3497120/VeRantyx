@@ -312,6 +312,49 @@ static vx_object *self_object(void) {
     return t_self;
 }
 
+// Every running thread, by ID. OpenThread opens any thread of the process that exists, whether or not a handle to it
+// is open (on Windows the ID names the thread until it has ended and its last handle is closed): the main thread,
+// which no CreateThread made, and a thread whose CreateThread handle was closed at once used to fail with
+// ERROR_INVALID_PARAMETER. Valve's tier0 checks the threads it keeps data for that way, from each new thread, and frees
+// the data of a thread it cannot open: Steam's main thread lost its coroutine manager and crashed at its next yield.
+// A thread is listed from CreateThread (or, for one no CreateThread made, from when it attaches: loader.c's
+// vx_thread_attach) until it detaches.
+static pthread_mutex_t g_live_lock = PTHREAD_MUTEX_INITIALIZER;   // (taken alone, or inside g_lock)
+static vx_object **g_live;
+static int g_live_n, g_live_cap;
+static void live_add(vx_object *t) {
+    pthread_mutex_lock(&g_live_lock);
+    int i = 0;
+    while (i < g_live_n && g_live[i] != t) i++;
+    if (i == g_live_n) {
+        if (g_live_n == g_live_cap) { g_live_cap = g_live_cap ? g_live_cap * 2 : 64; g_live = realloc(g_live, (size_t)g_live_cap * sizeof *g_live); }
+        g_live[g_live_n++] = t;
+    }
+    pthread_mutex_unlock(&g_live_lock);
+}
+void vx_thread_live(int alive) {
+    vx_object *t = self_object();                  // (a CreateThread thread's own object: thread_main set t_self)
+    if (alive) { live_add(t); return; }
+    pthread_mutex_lock(&g_live_lock);
+    for (int i = 0; i < g_live_n; i++) if (g_live[i] == t) { g_live[i] = g_live[--g_live_n]; break; }
+    pthread_mutex_unlock(&g_live_lock);
+    if (!t->start) {                               // a thread no CreateThread made: its object ends with it
+        glock();
+        t->done = 1;
+        notify(t);
+        t_self = NULL;
+        unref(t);
+        gunlock();
+    }
+}
+static vx_object *live_thread(DWORD tid) {         // with g_lock held (which keeps a found object from being freed)
+    vx_object *t = NULL;
+    pthread_mutex_lock(&g_live_lock);
+    for (int i = 0; i < g_live_n && !t; i++) if (g_live[i]->tid == tid) t = g_live[i];
+    pthread_mutex_unlock(&g_live_lock);
+    return t;
+}
+
 static void *thread_main(void *p) {
     vx_object *t = p;
     t_self = t;
@@ -368,6 +411,7 @@ static WINAPI HANDLE CreateThread(void *sa, size_t stack, DWORD (WINAPI *start)(
     }
     uint64_t id; pthread_threadid_np(t->pthread, &id);
     t->tid = (DWORD)id;
+    live_add(t);                               // (before the thread can run, let alone end: it waits for g_lock first)
     gunlock();
     pthread_attr_destroy(&a);
     if (tid) *tid = t->tid;
@@ -588,8 +632,8 @@ static WINAPI uint64_t SetThreadAffinityMask(HANDLE h, uint64_t m) { (void)h; (v
 static WINAPI HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid) {
     (void)access; (void)inherit;
     glock();
-    vx_object *t = NULL;
-    for (int i = 0; i < MAX_HANDLES && !t; i++)
+    vx_object *t = tid ? live_thread(tid) : NULL;
+    for (int i = 0; i < MAX_HANDLES && !t && tid; i++)            // one that has ended but still has a handle open
         if (g_handles[i] && g_handles[i]->type == OBJ_THREAD && g_handles[i]->tid == tid) t = g_handles[i];
     if (!t && tid == vx_current_tid()) t = self_object();
     HANDLE h = t ? new_handle(t) : NULL;
