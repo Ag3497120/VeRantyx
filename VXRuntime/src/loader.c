@@ -1132,6 +1132,8 @@ int main(int argc, char **argv, char **envp) {
     vx_system_init();
     vx_desktop_init();
     vx_services_init();
+    vx_crypt32_init();                           // (before client.c's and extras.c's stand-ins for the same functions)
+    vx_dpapi_init();
     vx_client_init();
     vx_steambridge_init();
     vx_pipes_init();
