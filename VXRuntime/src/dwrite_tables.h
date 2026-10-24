@@ -109,14 +109,145 @@ static const GUID IID_IDWriteGdiInterop = { 0x1edd9491, 0x9853, 0x4299, { 0x89, 
 static const GUID IID_IDWriteFontFileLoader = { 0x727cad4e, 0xd6af, 0x4c9e, { 0x8a, 0x08, 0xd6, 0x95, 0xb1, 0x1c, 0xaa, 0x49 } };
 static const GUID IID_IDWriteFontCollectionLoader = { 0xcca920e4, 0x52f0, 0x492b, { 0xbf, 0xa8, 0x29, 0xc7, 0x2e, 0xe0, 0xa4, 0x68 } };
 static const GUID IID_IDWriteFontFileEnumerator = { 0x72755049, 0x5ff7, 0x435d, { 0x83, 0x48, 0x4b, 0xe9, 0x7c, 0xfa, 0x6c, 0x7c } };
-static const GUID IID_IDWriteTextAnalysisSource = { 0x688e1a58, 0x5094, 0x47c8, { 0xad, 0xc8, 0xfb, 0xce, 0xa6, 0x0a, 0xe9, 0x2b } };
+static const char *const vt_IDWriteTextFormat[] = { "QueryInterface", "AddRef", "Release", "SetTextAlignment", "SetParagraphAlignment", "SetWordWrapping", "SetReadingDirection", "SetFlowDirection", "SetIncrementalTabStop", "SetTrimming", "SetLineSpacing", "GetTextAlignment", "GetParagraphAlignment", "GetWordWrapping", "GetReadingDirection", "GetFlowDirection", "GetIncrementalTabStop", "GetTrimming", "GetLineSpacing", "GetFontCollection", "GetFontFamilyNameLength", "GetFontFamilyName", "GetFontWeight", "GetFontStyle", "GetFontStretch", "GetFontSize", "GetLocaleNameLength", "GetLocaleName" };
+static WINAPI HRESULT stub_IDWriteTextFormat_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::AddRef"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::Release"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_SetTextAlignment(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::SetTextAlignment"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_SetParagraphAlignment(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::SetParagraphAlignment"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_SetWordWrapping(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::SetWordWrapping"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_SetReadingDirection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::SetReadingDirection"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_SetFlowDirection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::SetFlowDirection"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_SetIncrementalTabStop(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::SetIncrementalTabStop"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_SetTrimming(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::SetTrimming"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_SetLineSpacing(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::SetLineSpacing"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetTextAlignment(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetTextAlignment"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetParagraphAlignment(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetParagraphAlignment"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetWordWrapping(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetWordWrapping"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetReadingDirection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetReadingDirection"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetFlowDirection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetFlowDirection"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetIncrementalTabStop(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetIncrementalTabStop"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetTrimming(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetTrimming"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetLineSpacing(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetLineSpacing"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetFontCollection"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetFontFamilyNameLength(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetFontFamilyNameLength"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetFontFamilyName(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetFontFamilyName"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetFontWeight(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetFontWeight"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetFontStyle(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetFontStyle"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetFontStretch(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetFontStretch"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetFontSize(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetFontSize"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetLocaleNameLength(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetLocaleNameLength"); }
+static WINAPI HRESULT stub_IDWriteTextFormat_GetLocaleName(void *self) { (void)self; return d3d_not_implemented("IDWriteTextFormat::GetLocaleName"); }
+static void *const vtstub_IDWriteTextFormat[] = { (void *)stub_IDWriteTextFormat_QueryInterface, (void *)stub_IDWriteTextFormat_AddRef, (void *)stub_IDWriteTextFormat_Release, (void *)stub_IDWriteTextFormat_SetTextAlignment, (void *)stub_IDWriteTextFormat_SetParagraphAlignment, (void *)stub_IDWriteTextFormat_SetWordWrapping, (void *)stub_IDWriteTextFormat_SetReadingDirection, (void *)stub_IDWriteTextFormat_SetFlowDirection, (void *)stub_IDWriteTextFormat_SetIncrementalTabStop, (void *)stub_IDWriteTextFormat_SetTrimming, (void *)stub_IDWriteTextFormat_SetLineSpacing, (void *)stub_IDWriteTextFormat_GetTextAlignment, (void *)stub_IDWriteTextFormat_GetParagraphAlignment, (void *)stub_IDWriteTextFormat_GetWordWrapping, (void *)stub_IDWriteTextFormat_GetReadingDirection, (void *)stub_IDWriteTextFormat_GetFlowDirection, (void *)stub_IDWriteTextFormat_GetIncrementalTabStop, (void *)stub_IDWriteTextFormat_GetTrimming, (void *)stub_IDWriteTextFormat_GetLineSpacing, (void *)stub_IDWriteTextFormat_GetFontCollection, (void *)stub_IDWriteTextFormat_GetFontFamilyNameLength, (void *)stub_IDWriteTextFormat_GetFontFamilyName, (void *)stub_IDWriteTextFormat_GetFontWeight, (void *)stub_IDWriteTextFormat_GetFontStyle, (void *)stub_IDWriteTextFormat_GetFontStretch, (void *)stub_IDWriteTextFormat_GetFontSize, (void *)stub_IDWriteTextFormat_GetLocaleNameLength, (void *)stub_IDWriteTextFormat_GetLocaleName };
+#define VT_COUNT_IDWriteTextFormat 28
 static const GUID IID_IDWriteTextFormat = { 0x9c906818, 0x31d7, 0x4fd3, { 0xa1, 0x51, 0x7c, 0x5e, 0x22, 0x5d, 0xb5, 0x5a } };
+static const char *const vt_IDWriteTextLayout[] = { "QueryInterface", "AddRef", "Release", "SetTextAlignment", "SetParagraphAlignment", "SetWordWrapping", "SetReadingDirection", "SetFlowDirection", "SetIncrementalTabStop", "SetTrimming", "SetLineSpacing", "GetTextAlignment", "GetParagraphAlignment", "GetWordWrapping", "GetReadingDirection", "GetFlowDirection", "GetIncrementalTabStop", "GetTrimming", "GetLineSpacing", "GetFontCollection", "GetFontFamilyNameLength", "GetFontFamilyName", "GetFontWeight", "GetFontStyle", "GetFontStretch", "GetFontSize", "GetLocaleNameLength", "GetLocaleName", "SetMaxWidth", "SetMaxHeight", "SetFontCollection", "SetFontFamilyName", "SetFontWeight", "SetFontStyle", "SetFontStretch", "SetFontSize", "SetUnderline", "SetStrikethrough", "SetDrawingEffect", "SetInlineObject", "SetTypography", "SetLocaleName", "GetMaxWidth", "GetMaxHeight", "IDWriteTextLayout_GetFontCollection", "IDWriteTextLayout_GetFontFamilyNameLength", "IDWriteTextLayout_GetFontFamilyName", "IDWriteTextLayout_GetFontWeight", "IDWriteTextLayout_GetFontStyle", "IDWriteTextLayout_GetFontStretch", "IDWriteTextLayout_GetFontSize", "GetUnderline", "GetStrikethrough", "GetDrawingEffect", "GetInlineObject", "GetTypography", "IDWriteTextLayout_GetLocaleNameLength", "IDWriteTextLayout_GetLocaleName", "Draw", "GetLineMetrics", "GetMetrics", "GetOverhangMetrics", "GetClusterMetrics", "DetermineMinWidth", "HitTestPoint", "HitTestTextPosition", "HitTestTextRange" };
+static WINAPI HRESULT stub_IDWriteTextLayout_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::AddRef"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::Release"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetTextAlignment(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetTextAlignment"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetParagraphAlignment(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetParagraphAlignment"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetWordWrapping(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetWordWrapping"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetReadingDirection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetReadingDirection"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetFlowDirection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetFlowDirection"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetIncrementalTabStop(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetIncrementalTabStop"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetTrimming(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetTrimming"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetLineSpacing(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetLineSpacing"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetTextAlignment(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetTextAlignment"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetParagraphAlignment(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetParagraphAlignment"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetWordWrapping(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetWordWrapping"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetReadingDirection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetReadingDirection"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetFlowDirection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetFlowDirection"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetIncrementalTabStop(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetIncrementalTabStop"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetTrimming(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetTrimming"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetLineSpacing(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetLineSpacing"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetFontCollection"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetFontFamilyNameLength(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetFontFamilyNameLength"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetFontFamilyName(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetFontFamilyName"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetFontWeight(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetFontWeight"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetFontStyle(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetFontStyle"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetFontStretch(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetFontStretch"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetFontSize(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetFontSize"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetLocaleNameLength(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetLocaleNameLength"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetLocaleName(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetLocaleName"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetMaxWidth(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetMaxWidth"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetMaxHeight(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetMaxHeight"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetFontCollection"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetFontFamilyName(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetFontFamilyName"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetFontWeight(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetFontWeight"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetFontStyle(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetFontStyle"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetFontStretch(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetFontStretch"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetFontSize(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetFontSize"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetUnderline(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetUnderline"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetStrikethrough(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetStrikethrough"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetDrawingEffect(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetDrawingEffect"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetInlineObject(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetInlineObject"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetTypography(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetTypography"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_SetLocaleName(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::SetLocaleName"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetMaxWidth(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetMaxWidth"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetMaxHeight(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetMaxHeight"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_IDWriteTextLayout_GetFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::IDWriteTextLayout_GetFontCollection"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_IDWriteTextLayout_GetFontFamilyNameLength(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::IDWriteTextLayout_GetFontFamilyNameLength"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_IDWriteTextLayout_GetFontFamilyName(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::IDWriteTextLayout_GetFontFamilyName"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_IDWriteTextLayout_GetFontWeight(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::IDWriteTextLayout_GetFontWeight"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_IDWriteTextLayout_GetFontStyle(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::IDWriteTextLayout_GetFontStyle"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_IDWriteTextLayout_GetFontStretch(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::IDWriteTextLayout_GetFontStretch"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_IDWriteTextLayout_GetFontSize(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::IDWriteTextLayout_GetFontSize"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetUnderline(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetUnderline"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetStrikethrough(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetStrikethrough"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetDrawingEffect(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetDrawingEffect"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetInlineObject(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetInlineObject"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetTypography(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetTypography"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_IDWriteTextLayout_GetLocaleNameLength(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::IDWriteTextLayout_GetLocaleNameLength"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_IDWriteTextLayout_GetLocaleName(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::IDWriteTextLayout_GetLocaleName"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_Draw(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::Draw"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetLineMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetLineMetrics"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetMetrics"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetOverhangMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetOverhangMetrics"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_GetClusterMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::GetClusterMetrics"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_DetermineMinWidth(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::DetermineMinWidth"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_HitTestPoint(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::HitTestPoint"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_HitTestTextPosition(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::HitTestTextPosition"); }
+static WINAPI HRESULT stub_IDWriteTextLayout_HitTestTextRange(void *self) { (void)self; return d3d_not_implemented("IDWriteTextLayout::HitTestTextRange"); }
+static void *const vtstub_IDWriteTextLayout[] = { (void *)stub_IDWriteTextLayout_QueryInterface, (void *)stub_IDWriteTextLayout_AddRef, (void *)stub_IDWriteTextLayout_Release, (void *)stub_IDWriteTextLayout_SetTextAlignment, (void *)stub_IDWriteTextLayout_SetParagraphAlignment, (void *)stub_IDWriteTextLayout_SetWordWrapping, (void *)stub_IDWriteTextLayout_SetReadingDirection, (void *)stub_IDWriteTextLayout_SetFlowDirection, (void *)stub_IDWriteTextLayout_SetIncrementalTabStop, (void *)stub_IDWriteTextLayout_SetTrimming, (void *)stub_IDWriteTextLayout_SetLineSpacing, (void *)stub_IDWriteTextLayout_GetTextAlignment, (void *)stub_IDWriteTextLayout_GetParagraphAlignment, (void *)stub_IDWriteTextLayout_GetWordWrapping, (void *)stub_IDWriteTextLayout_GetReadingDirection, (void *)stub_IDWriteTextLayout_GetFlowDirection, (void *)stub_IDWriteTextLayout_GetIncrementalTabStop, (void *)stub_IDWriteTextLayout_GetTrimming, (void *)stub_IDWriteTextLayout_GetLineSpacing, (void *)stub_IDWriteTextLayout_GetFontCollection, (void *)stub_IDWriteTextLayout_GetFontFamilyNameLength, (void *)stub_IDWriteTextLayout_GetFontFamilyName, (void *)stub_IDWriteTextLayout_GetFontWeight, (void *)stub_IDWriteTextLayout_GetFontStyle, (void *)stub_IDWriteTextLayout_GetFontStretch, (void *)stub_IDWriteTextLayout_GetFontSize, (void *)stub_IDWriteTextLayout_GetLocaleNameLength, (void *)stub_IDWriteTextLayout_GetLocaleName, (void *)stub_IDWriteTextLayout_SetMaxWidth, (void *)stub_IDWriteTextLayout_SetMaxHeight, (void *)stub_IDWriteTextLayout_SetFontCollection, (void *)stub_IDWriteTextLayout_SetFontFamilyName, (void *)stub_IDWriteTextLayout_SetFontWeight, (void *)stub_IDWriteTextLayout_SetFontStyle, (void *)stub_IDWriteTextLayout_SetFontStretch, (void *)stub_IDWriteTextLayout_SetFontSize, (void *)stub_IDWriteTextLayout_SetUnderline, (void *)stub_IDWriteTextLayout_SetStrikethrough, (void *)stub_IDWriteTextLayout_SetDrawingEffect, (void *)stub_IDWriteTextLayout_SetInlineObject, (void *)stub_IDWriteTextLayout_SetTypography, (void *)stub_IDWriteTextLayout_SetLocaleName, (void *)stub_IDWriteTextLayout_GetMaxWidth, (void *)stub_IDWriteTextLayout_GetMaxHeight, (void *)stub_IDWriteTextLayout_IDWriteTextLayout_GetFontCollection, (void *)stub_IDWriteTextLayout_IDWriteTextLayout_GetFontFamilyNameLength, (void *)stub_IDWriteTextLayout_IDWriteTextLayout_GetFontFamilyName, (void *)stub_IDWriteTextLayout_IDWriteTextLayout_GetFontWeight, (void *)stub_IDWriteTextLayout_IDWriteTextLayout_GetFontStyle, (void *)stub_IDWriteTextLayout_IDWriteTextLayout_GetFontStretch, (void *)stub_IDWriteTextLayout_IDWriteTextLayout_GetFontSize, (void *)stub_IDWriteTextLayout_GetUnderline, (void *)stub_IDWriteTextLayout_GetStrikethrough, (void *)stub_IDWriteTextLayout_GetDrawingEffect, (void *)stub_IDWriteTextLayout_GetInlineObject, (void *)stub_IDWriteTextLayout_GetTypography, (void *)stub_IDWriteTextLayout_IDWriteTextLayout_GetLocaleNameLength, (void *)stub_IDWriteTextLayout_IDWriteTextLayout_GetLocaleName, (void *)stub_IDWriteTextLayout_Draw, (void *)stub_IDWriteTextLayout_GetLineMetrics, (void *)stub_IDWriteTextLayout_GetMetrics, (void *)stub_IDWriteTextLayout_GetOverhangMetrics, (void *)stub_IDWriteTextLayout_GetClusterMetrics, (void *)stub_IDWriteTextLayout_DetermineMinWidth, (void *)stub_IDWriteTextLayout_HitTestPoint, (void *)stub_IDWriteTextLayout_HitTestTextPosition, (void *)stub_IDWriteTextLayout_HitTestTextRange };
+#define VT_COUNT_IDWriteTextLayout 67
 static const GUID IID_IDWriteTextLayout = { 0x53737037, 0x6d14, 0x410b, { 0x9b, 0xfe, 0x0b, 0x18, 0x2b, 0xb7, 0x09, 0x61 } };
+static const char *const vt_IDWriteTypography[] = { "QueryInterface", "AddRef", "Release", "AddFontFeature", "GetFontFeatureCount", "GetFontFeature" };
+static WINAPI HRESULT stub_IDWriteTypography_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteTypography::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteTypography_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteTypography::AddRef"); }
+static WINAPI HRESULT stub_IDWriteTypography_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteTypography::Release"); }
+static WINAPI HRESULT stub_IDWriteTypography_AddFontFeature(void *self) { (void)self; return d3d_not_implemented("IDWriteTypography::AddFontFeature"); }
+static WINAPI HRESULT stub_IDWriteTypography_GetFontFeatureCount(void *self) { (void)self; return d3d_not_implemented("IDWriteTypography::GetFontFeatureCount"); }
+static WINAPI HRESULT stub_IDWriteTypography_GetFontFeature(void *self) { (void)self; return d3d_not_implemented("IDWriteTypography::GetFontFeature"); }
+static void *const vtstub_IDWriteTypography[] = { (void *)stub_IDWriteTypography_QueryInterface, (void *)stub_IDWriteTypography_AddRef, (void *)stub_IDWriteTypography_Release, (void *)stub_IDWriteTypography_AddFontFeature, (void *)stub_IDWriteTypography_GetFontFeatureCount, (void *)stub_IDWriteTypography_GetFontFeature };
+#define VT_COUNT_IDWriteTypography 6
+static const GUID IID_IDWriteTypography = { 0x55f1112b, 0x1dc2, 0x4b3c, { 0x95, 0x41, 0xf4, 0x68, 0x94, 0xed, 0x85, 0xb6 } };
+static const char *const vt_IDWriteBitmapRenderTarget[] = { "QueryInterface", "AddRef", "Release", "DrawGlyphRun", "GetMemoryDC", "GetPixelsPerDip", "SetPixelsPerDip", "GetCurrentTransform", "SetCurrentTransform", "GetSize", "Resize" };
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::AddRef"); }
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::Release"); }
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_DrawGlyphRun(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::DrawGlyphRun"); }
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_GetMemoryDC(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::GetMemoryDC"); }
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_GetPixelsPerDip(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::GetPixelsPerDip"); }
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_SetPixelsPerDip(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::SetPixelsPerDip"); }
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_GetCurrentTransform(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::GetCurrentTransform"); }
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_SetCurrentTransform(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::SetCurrentTransform"); }
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_GetSize(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::GetSize"); }
+static WINAPI HRESULT stub_IDWriteBitmapRenderTarget_Resize(void *self) { (void)self; return d3d_not_implemented("IDWriteBitmapRenderTarget::Resize"); }
+static void *const vtstub_IDWriteBitmapRenderTarget[] = { (void *)stub_IDWriteBitmapRenderTarget_QueryInterface, (void *)stub_IDWriteBitmapRenderTarget_AddRef, (void *)stub_IDWriteBitmapRenderTarget_Release, (void *)stub_IDWriteBitmapRenderTarget_DrawGlyphRun, (void *)stub_IDWriteBitmapRenderTarget_GetMemoryDC, (void *)stub_IDWriteBitmapRenderTarget_GetPixelsPerDip, (void *)stub_IDWriteBitmapRenderTarget_SetPixelsPerDip, (void *)stub_IDWriteBitmapRenderTarget_GetCurrentTransform, (void *)stub_IDWriteBitmapRenderTarget_SetCurrentTransform, (void *)stub_IDWriteBitmapRenderTarget_GetSize, (void *)stub_IDWriteBitmapRenderTarget_Resize };
+#define VT_COUNT_IDWriteBitmapRenderTarget 11
+static const GUID IID_IDWriteBitmapRenderTarget = { 0x5e5a32a3, 0x8dff, 0x4773, { 0x9f, 0xf6, 0x06, 0x96, 0xea, 0xb7, 0x72, 0x67 } };
+static const GUID IID_IDWriteTextAnalysisSource = { 0x688e1a58, 0x5094, 0x47c8, { 0xad, 0xc8, 0xfb, 0xce, 0xa6, 0x0a, 0xe9, 0x2b } };
 static const GUID IID_IDWriteTextAnalyzer = { 0xb7e6163e, 0x7f46, 0x43b4, { 0x84, 0xb3, 0xe4, 0xe6, 0x24, 0x9c, 0x36, 0x5d } };
+static const GUID IID_IDWriteTextRenderer = { 0xef8a8135, 0x5cc6, 0x45fe, { 0x88, 0x25, 0xc5, 0xa0, 0x72, 0x4e, 0xb8, 0x19 } };
+static const GUID IID_IDWritePixelSnapping = { 0xeaf3a2da, 0xecf4, 0x4d24, { 0xb6, 0x44, 0xb3, 0x4f, 0x68, 0x42, 0x02, 0x4b } };
+static const GUID IID_IDWriteInlineObject = { 0x8339fde3, 0x106f, 0x47ab, { 0x83, 0x73, 0x1c, 0x62, 0x95, 0xeb, 0x10, 0xb3 } };
 static const GUID IID_IDWriteFactory1 = { 0x30572f99, 0xdac6, 0x41db, { 0xa1, 0x6e, 0x04, 0x86, 0x30, 0x7e, 0x60, 0x6a } };
 static const GUID IID_IDWriteFontFace1 = { 0xa71efdb4, 0x9fdb, 0x4838, { 0xad, 0x90, 0xcf, 0xc3, 0xbe, 0x8c, 0x3d, 0xaf } };
 static const GUID IID_IDWriteFont1 = { 0xacd16696, 0x8c14, 0x4f5d, { 0x87, 0x7e, 0xfe, 0x3f, 0xc1, 0xd3, 0x27, 0x38 } };
 static const GUID IID_IDWriteRenderingParams1 = { 0x94413cf4, 0xa6fc, 0x4248, { 0x8b, 0x50, 0x66, 0x74, 0x34, 0x8f, 0xca, 0xd3 } };
+static const GUID IID_IDWriteTextLayout1 = { 0x9064d822, 0x80a7, 0x465c, { 0xa9, 0x86, 0xdf, 0x65, 0xf7, 0x8b, 0x8f, 0xeb } };
+static const GUID IID_IDWriteBitmapRenderTarget1 = { 0x791e8298, 0x3ef3, 0x4230, { 0x98, 0x80, 0xc9, 0xbd, 0xec, 0xc4, 0x20, 0x64 } };
 static const char *const vt_IDWriteFactory2[] = { "QueryInterface", "AddRef", "Release", "GetSystemFontCollection", "CreateCustomFontCollection", "RegisterFontCollectionLoader", "UnregisterFontCollectionLoader", "CreateFontFileReference", "CreateCustomFontFileReference", "CreateFontFace", "CreateRenderingParams", "CreateMonitorRenderingParams", "CreateCustomRenderingParams", "RegisterFontFileLoader", "UnregisterFontFileLoader", "CreateTextFormat", "CreateTypography", "GetGdiInterop", "CreateTextLayout", "CreateGdiCompatibleTextLayout", "CreateEllipsisTrimmingSign", "CreateTextAnalyzer", "CreateNumberSubstitution", "CreateGlyphRunAnalysis", "GetEudcFontCollection", "IDWriteFactory1_CreateCustomRenderingParams", "GetSystemFontFallback", "CreateFontFallbackBuilder", "TranslateColorGlyphRun", "IDWriteFactory2_CreateCustomRenderingParams", "IDWriteFactory2_CreateGlyphRunAnalysis" };
 static WINAPI HRESULT stub_IDWriteFactory2_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::QueryInterface"); }
 static WINAPI HRESULT stub_IDWriteFactory2_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::AddRef"); }
@@ -236,6 +367,8 @@ static WINAPI HRESULT stub_IDWriteFontFallback_MapCharacters(void *self) { (void
 static void *const vtstub_IDWriteFontFallback[] = { (void *)stub_IDWriteFontFallback_QueryInterface, (void *)stub_IDWriteFontFallback_AddRef, (void *)stub_IDWriteFontFallback_Release, (void *)stub_IDWriteFontFallback_MapCharacters };
 #define VT_COUNT_IDWriteFontFallback 4
 static const GUID IID_IDWriteFontFallback = { 0xefa008f9, 0xf7a1, 0x48bf, { 0xb0, 0x5c, 0xf2, 0x24, 0x71, 0x3c, 0xc0, 0xff } };
+static const GUID IID_IDWriteTextFormat1 = { 0x5f174b49, 0x0d8b, 0x4cfb, { 0x8b, 0xca, 0xf1, 0xcc, 0xe9, 0xd0, 0x6c, 0x67 } };
+static const GUID IID_IDWriteTextLayout2 = { 0x1093c18f, 0x8d5e, 0x43f0, { 0xb0, 0x64, 0x09, 0x17, 0x31, 0x1b, 0x52, 0x5e } };
 static const GUID IID_IDWriteFactory3 = { 0x9a1b41c3, 0xd3bb, 0x466a, { 0x87, 0xfc, 0xfe, 0x67, 0x55, 0x6a, 0x3b, 0x65 } };
 static const GUID IID_IDWriteFactory4 = { 0x4b0b5bd3, 0x0797, 0x4549, { 0x8a, 0xc5, 0xfe, 0x91, 0x5c, 0xc5, 0x38, 0x56 } };
 static const GUID IID_IDWriteFactory5 = { 0x958db99a, 0xbe2a, 0x4f09, { 0xaf, 0x7d, 0x65, 0x18, 0x98, 0x03, 0xd1, 0xd3 } };

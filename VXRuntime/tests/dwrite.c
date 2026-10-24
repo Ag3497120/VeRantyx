@@ -1,7 +1,8 @@
 // DirectWrite on CoreText (src/dwrite.m): the factory and the system font collection (families, names, matching),
 // font faces (glyphs, metrics, tables, files through the local loader), a font given through a loader of the
 // program's own (a custom font file and a custom collection), font fallback for made-up Latin, Japanese and emoji
-// text, glyph outlines into a geometry sink, and glyph runs rasterized into alpha textures.
+// text, glyph outlines into a geometry sink, glyph runs rasterized into alpha textures, and text formats and layouts
+// (measured, wrapped, hit-tested, drawn through a renderer into a GDI bitmap render target).
 #define COBJMACROS
 #include <windows.h>
 #include <initguid.h>
@@ -131,6 +132,34 @@ static HRESULT WINAPI ol_enum(IDWriteFontCollectionLoader *l, IDWriteFactory *f,
 }
 static IDWriteFontCollectionLoaderVtbl ol_vtbl = { ol_qi, ol_ref, ol_ref, ol_enum };
 
+// ---- a text renderer: records the glyph runs, and draws them into a bitmap render target when it is the context ------------
+typedef struct { IDWriteTextRenderer iface; int runs, glyphs, faces; IDWriteFontFace *face[8]; float first_x, first_y, last_x; UINT32 positions; } renderer;
+static HRESULT WINAPI r_qi(IDWriteTextRenderer *r, REFIID iid, void **out) { (void)iid; *out = r; return S_OK; }
+static ULONG WINAPI r_ref(IDWriteTextRenderer *r) { (void)r; return 1; }
+static HRESULT WINAPI r_snap(IDWriteTextRenderer *r, void *ctx, BOOL *off) { (void)r; (void)ctx; *off = FALSE; return S_OK; }
+static HRESULT WINAPI r_transform(IDWriteTextRenderer *r, void *ctx, DWRITE_MATRIX *m) { (void)r; (void)ctx; DWRITE_MATRIX id = { 1, 0, 0, 1, 0, 0 }; *m = id; return S_OK; }
+static HRESULT WINAPI r_ppd(IDWriteTextRenderer *r, void *ctx, FLOAT *ppd) { (void)r; (void)ctx; *ppd = 1.0f; return S_OK; }
+static HRESULT WINAPI r_run(IDWriteTextRenderer *ri, void *ctx, FLOAT x, FLOAT y, DWRITE_MEASURING_MODE mode, const DWRITE_GLYPH_RUN *run,
+                            const DWRITE_GLYPH_RUN_DESCRIPTION *desc, IUnknown *effect) {
+    renderer *r = (renderer *)ri;
+    (void)effect;
+    if (!r->runs) { r->first_x = x; r->first_y = y; }
+    r->last_x = x;
+    r->runs++; r->glyphs += run->glyphCount; r->positions += desc->stringLength;
+    int known = 0;
+    for (int i = 0; i < r->faces; i++) known |= r->face[i] == run->fontFace;
+    if (!known && r->faces < 8) r->face[r->faces++] = run->fontFace;
+    if (ctx) {
+        RECT box;
+        IDWriteBitmapRenderTarget_DrawGlyphRun((IDWriteBitmapRenderTarget *)ctx, x, y, mode, run, NULL, RGB(255, 255, 255), &box);
+    }
+    return S_OK;
+}
+static HRESULT WINAPI r_line(IDWriteTextRenderer *r, void *ctx, FLOAT x, FLOAT y, const DWRITE_UNDERLINE *u, IUnknown *e) { (void)r; (void)ctx; (void)x; (void)y; (void)u; (void)e; return S_OK; }
+static HRESULT WINAPI r_strike(IDWriteTextRenderer *r, void *ctx, FLOAT x, FLOAT y, const DWRITE_STRIKETHROUGH *u, IUnknown *e) { (void)r; (void)ctx; (void)x; (void)y; (void)u; (void)e; return S_OK; }
+static HRESULT WINAPI r_inline(IDWriteTextRenderer *r, void *ctx, FLOAT x, FLOAT y, IDWriteInlineObject *o, BOOL s, BOOL rtl, IUnknown *e) { (void)r; (void)ctx; (void)x; (void)y; (void)o; (void)s; (void)rtl; (void)e; return E_NOTIMPL; }
+static IDWriteTextRendererVtbl renderer_vtbl = { r_qi, r_ref, r_ref, r_snap, r_transform, r_ppd, r_run, r_line, r_strike, r_inline };
+
 static IDWriteFontFace *face_of(IDWriteFontCollection *c, const WCHAR *family, DWRITE_FONT_WEIGHT w, DWRITE_FONT_STYLE st, IDWriteFont **font_out) {
     UINT32 i; BOOL exists = FALSE;
     if (FAILED(IDWriteFontCollection_FindFamilyName(c, family, &i, &exists)) || !exists) return NULL;
@@ -187,7 +216,46 @@ static int raster(IDWriteFactory2 *f2, IDWriteFactory *f, IDWriteFontFace *face,
     return covered;
 }
 
+// Four threads at once through what is made on first use: the system collection, family order, faces, rasterizing.
+static volatile LONG thread_failures, thread_glyphs;
+static DWORD WINAPI worker(void *arg) {
+    int me = (int)(INT_PTR)arg;
+    IDWriteFactory *f = NULL; IDWriteFontCollection *c = NULL;
+    if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory, (IUnknown **)&f)) || FAILED(IDWriteFactory_GetSystemFontCollection(f, &c, FALSE))) {
+        InterlockedIncrement(&thread_failures); return 1;
+    }
+    UINT32 n = IDWriteFontCollection_GetFontFamilyCount(c);
+    for (UINT32 i = (UINT32)me; i < n; i += 9) {
+        IDWriteFontFamily *fam = NULL; IDWriteFont *font = NULL; IDWriteFontFace *face = NULL;
+        if (FAILED(IDWriteFontCollection_GetFontFamily(c, i, &fam))) { InterlockedIncrement(&thread_failures); continue; }
+        if (SUCCEEDED(IDWriteFontFamily_GetFirstMatchingFont(fam, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, &font)) &&
+            SUCCEEDED(IDWriteFont_CreateFontFace(font, &face))) {
+            UINT32 cp = 'a'; UINT16 g = 0; DWRITE_GLYPH_METRICS gm;
+            IDWriteFontFace_GetGlyphIndices(face, &cp, 1, &g);
+            IDWriteFontFace_GetDesignGlyphMetrics(face, &g, 1, &gm, FALSE);
+            DWRITE_GLYPH_RUN run = { face, 20.0f, 1, &g, NULL, NULL, FALSE, 0 };
+            IDWriteGlyphRunAnalysis *a = NULL;
+            if (g && SUCCEEDED(IDWriteFactory_CreateGlyphRunAnalysis(f, &run, 1.0f, NULL, DWRITE_RENDERING_MODE_NATURAL, DWRITE_MEASURING_MODE_NATURAL, 0, 0, &a))) {
+                RECT r; IDWriteGlyphRunAnalysis_GetAlphaTextureBounds(a, DWRITE_TEXTURE_CLEARTYPE_3x1, &r);
+                if (r.right > r.left) InterlockedIncrement(&thread_glyphs);
+                IDWriteGlyphRunAnalysis_Release(a);
+            }
+        } else InterlockedIncrement(&thread_failures);
+        if (face) IDWriteFontFace_Release(face);
+        if (font) IDWriteFont_Release(font);
+        IDWriteFontFamily_Release(fam);
+    }
+    IDWriteFontCollection_Release(c);
+    IDWriteFactory_Release(f);
+    return 0;
+}
+
 int main(void) {
+    HANDLE threads[4];
+    for (int i = 0; i < 4; i++) threads[i] = CreateThread(NULL, 0, worker, (void *)(INT_PTR)i, 0, NULL);
+    WaitForMultipleObjects(4, threads, TRUE, 120000);
+    for (int i = 0; i < 4; i++) CloseHandle(threads[i]);
+    CHECK(thread_failures == 0 && thread_glyphs > 50);
     IDWriteFactory *f = NULL;
     IUnknown *unk = NULL;
     CHECK(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory3, &unk) == E_NOINTERFACE && !unk);
@@ -528,6 +596,131 @@ int main(void) {
         IDWriteRenderingParams_Release(rp);
     }
     CHECK(IDWriteFactory_CreateCustomRenderingParams(f, -1.0f, 1.0f, 0.5f, DWRITE_PIXEL_GEOMETRY_RGB, DWRITE_RENDERING_MODE_NATURAL, &rp) == E_INVALIDARG);
+
+    // Text formats and layouts: "Hello world" in Helvetica at 16 DIPs.
+    IDWriteTextFormat *fmt = NULL;
+    CHECK(IDWriteFactory_CreateTextFormat(f, L"Helvetica", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 0.0f, L"en-us", &fmt) == E_INVALIDARG && !fmt);
+    CHECK(SUCCEEDED(IDWriteFactory_CreateTextFormat(f, L"Helvetica", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"en-us", &fmt)) && fmt);
+    if (fmt) {
+        WCHAR fam[32];
+        CHECK(IDWriteTextFormat_GetFontSize(fmt) == 16.0f && IDWriteTextFormat_GetFontFamilyNameLength(fmt) == 9);
+        CHECK(SUCCEEDED(IDWriteTextFormat_GetFontFamilyName(fmt, fam, 32)) && !wcscmp(fam, L"Helvetica"));
+        CHECK(IDWriteTextFormat_GetFontFamilyName(fmt, fam, 9) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
+        CHECK(IDWriteTextFormat_GetWordWrapping(fmt) == DWRITE_WORD_WRAPPING_WRAP && IDWriteTextFormat_GetTextAlignment(fmt) == DWRITE_TEXT_ALIGNMENT_LEADING);
+        static const WCHAR text[] = L"Hello world";
+        UINT32 cps[11]; UINT16 tg[11]; DWRITE_GLYPH_METRICS tm[11];
+        for (int i = 0; i < 11; i++) cps[i] = text[i];
+        IDWriteFontFace_GetGlyphIndices(face, cps, 11, tg);
+        IDWriteFontFace_GetDesignGlyphMetrics(face, tg, 11, tm, FALSE);
+        float k = 16.0f / m.designUnitsPerEm, hello = 0, world = 0, all = 0;
+        for (int i = 0; i < 11; i++) { all += tm[i].advanceWidth * k; if (i < 5) hello += tm[i].advanceWidth * k; if (i > 5) world += tm[i].advanceWidth * k; }
+        IDWriteTextLayout *lay = NULL;
+        CHECK(SUCCEEDED(IDWriteFactory_CreateTextLayout(f, text, 11, fmt, 1000.0f, 100.0f, &lay)) && lay);
+        if (lay) {
+            DWRITE_TEXT_METRICS tmx;
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetMetrics(lay, &tmx)));
+            CHECK(tmx.lineCount == 1 && fabsf(tmx.width - all) < 0.01f && fabsf(tmx.widthIncludingTrailingWhitespace - all) < 0.01f);
+            float line_h = (m.ascent + m.descent + m.lineGap) * k;
+            CHECK(fabsf(tmx.height - line_h) < 0.01f && tmx.left == 0 && tmx.top == 0 && tmx.layoutWidth == 1000.0f);
+            DWRITE_LINE_METRICS lm[2]; UINT32 nl = 0;
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetLineMetrics(lay, lm, 2, &nl)) && nl == 1 && lm[0].length == 11 && fabsf(lm[0].baseline - m.ascent * k) < 0.01f);
+            DWRITE_CLUSTER_METRICS cm[11]; UINT32 nc = 0;
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetClusterMetrics(lay, cm, 11, &nc)) && nc == 11 && cm[5].isWhitespace && cm[5].canWrapLineAfter && !cm[0].isWhitespace);
+            FLOAT px, py; DWRITE_HIT_TEST_METRICS hm;
+            CHECK(SUCCEEDED(IDWriteTextLayout_HitTestTextPosition(lay, 6, FALSE, &px, &py, &hm)) && fabsf(px - (hello + tm[5].advanceWidth * k)) < 0.01f && hm.textPosition == 6);
+            BOOL trailing, inside;
+            CHECK(SUCCEEDED(IDWriteTextLayout_HitTestPoint(lay, px + 0.5f, 5.0f, &trailing, &inside, &hm)) && inside && !trailing && hm.textPosition == 6);
+            FLOAT minw = 0;
+            CHECK(SUCCEEDED(IDWriteTextLayout_DetermineMinWidth(lay, &minw)) && fabsf(minw - (hello > world ? hello : world)) < 0.01f);
+            renderer r = { { &renderer_vtbl } };
+            CHECK(SUCCEEDED(IDWriteTextLayout_Draw(lay, NULL, &r.iface, 10.0f, 20.25f)));
+            CHECK(r.runs >= 1 && r.glyphs == 11 && r.positions == 11 && r.faces == 1 && r.face[0] == face);
+            CHECK(r.first_x == 10.0f && r.first_y == roundf(20.25f + m.ascent * k));     // the baseline on a whole pixel
+            // narrower: "Hello " and "world" on two lines
+            CHECK(SUCCEEDED(IDWriteTextLayout_SetMaxWidth(lay, all - 5.0f)));
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetMetrics(lay, &tmx)) && tmx.lineCount == 2);
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetLineMetrics(lay, lm, 2, &nl)) && nl == 2 && lm[0].length == 6 && lm[0].trailingWhitespaceLength == 1 && lm[1].length == 5);
+            CHECK(fabsf(tmx.width - (hello > world ? hello : world)) < 0.01f && fabsf(tmx.height - 2 * line_h) < 0.02f);
+            CHECK(IDWriteTextLayout_GetLineMetrics(lay, lm, 1, &nl) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && nl == 2);
+            CHECK(SUCCEEDED(IDWriteTextLayout_SetTextAlignment(lay, DWRITE_TEXT_ALIGNMENT_TRAILING)) && SUCCEEDED(IDWriteTextLayout_GetMetrics(lay, &tmx)) && tmx.left > 0);
+            // a range in a bigger size
+            CHECK(SUCCEEDED(IDWriteTextLayout_SetMaxWidth(lay, 1000.0f)) && SUCCEEDED(IDWriteTextLayout_SetTextAlignment(lay, DWRITE_TEXT_ALIGNMENT_LEADING)));
+            DWRITE_TEXT_RANGE first5 = { 0, 5 }, got;
+            CHECK(SUCCEEDED(IDWriteTextLayout_SetFontSize(lay, 32.0f, first5)));
+            FLOAT size = 0;
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetFontSize(lay, 2, &size, &got)) && size == 32.0f && got.startPosition == 0 && got.length == 5);
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetMetrics(lay, &tmx)) && fabsf(tmx.width - (all + hello)) < 0.02f && tmx.height > 1.9f * line_h);
+            IDWriteTypography *typo = NULL;
+            CHECK(SUCCEEDED(IDWriteFactory_CreateTypography(f, &typo)) && typo);
+            if (typo) {
+                DWRITE_FONT_FEATURE feat = { DWRITE_FONT_FEATURE_TAG_KERNING, 0 }, back;
+                CHECK(SUCCEEDED(IDWriteTypography_AddFontFeature(typo, feat)) && IDWriteTypography_GetFontFeatureCount(typo) == 1);
+                CHECK(SUCCEEDED(IDWriteTypography_GetFontFeature(typo, 0, &back)) && back.nameTag == DWRITE_FONT_FEATURE_TAG_KERNING);
+                CHECK(SUCCEEDED(IDWriteTextLayout_SetTypography(lay, typo, first5)));
+                IDWriteTypography_Release(typo);
+            }
+            IDWriteTextLayout_Release(lay);
+        }
+        // lines from newlines, and text in two fonts (Japanese after Latin: fallback)
+        CHECK(SUCCEEDED(IDWriteFactory_CreateTextLayout(f, L"ab\ncd\n", 6, fmt, 1000.0f, 100.0f, &lay)) && lay);
+        if (lay) {
+            DWRITE_LINE_METRICS lm[4]; UINT32 nl = 0;
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetLineMetrics(lay, lm, 4, &nl)) && nl == 3 && lm[0].length == 3 && lm[0].newlineLength == 1 && lm[2].length == 0);
+            IDWriteTextLayout_Release(lay);
+        }
+        CHECK(SUCCEEDED(IDWriteFactory_CreateTextLayout(f, L"Hi \u65e5\u672c", 5, fmt, 1000.0f, 100.0f, &lay)) && lay);
+        if (lay) {
+            renderer r = { { &renderer_vtbl } };
+            CHECK(SUCCEEDED(IDWriteTextLayout_Draw(lay, NULL, &r.iface, 0.0f, 0.0f)) && r.runs == 2 && r.faces == 2 && r.glyphs == 5 && r.last_x > r.first_x);
+            IDWriteTextLayout_Release(lay);
+        }
+        // GDI-compatible: whole-pixel advances; drawn into a bitmap render target
+        CHECK(SUCCEEDED(IDWriteFactory_CreateGdiCompatibleTextLayout(f, text, 11, fmt, 1000.0f, 100.0f, 1.0f, NULL, FALSE, &lay)) && lay);
+        IDWriteGdiInterop *gi2 = NULL;
+        IDWriteFactory_GetGdiInterop(f, &gi2);
+        IDWriteBitmapRenderTarget *target = NULL;
+        CHECK(gi2 && SUCCEEDED(IDWriteGdiInterop_CreateBitmapRenderTarget(gi2, NULL, 200, 40, &target)) && target);
+        if (lay && target) {
+            DWRITE_TEXT_METRICS tmx;
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetMetrics(lay, &tmx)) && tmx.width == floorf(tmx.width) && fabsf(tmx.width - all) < 6.0f);
+            SIZE sz;
+            CHECK(SUCCEEDED(IDWriteBitmapRenderTarget_GetSize(target, &sz)) && sz.cx == 200 && sz.cy == 40);
+            HDC dc = IDWriteBitmapRenderTarget_GetMemoryDC(target);
+            CHECK(dc != NULL && IDWriteBitmapRenderTarget_GetPixelsPerDip(target) == 1.0f);
+            renderer r = { { &renderer_vtbl } };
+            CHECK(SUCCEEDED(IDWriteTextLayout_Draw(lay, target, &r.iface, 4.0f, 8.0f)));
+            int lit = 0, outside = 0;
+            for (int y = 0; y < 40; y++)
+                for (int x = 0; x < 200; x++) {
+                    COLORREF c = GetPixel(dc, x, y);
+                    if (c && c != CLR_INVALID) { lit++; if (x < 4 || x > 4 + tmx.width + 2 || y < 8 || y > 8 + tmx.height + 1) outside++; }
+                }
+            CHECK(lit > 100 && outside == 0);
+            // what programs do next: BitBlt the target's memory DC elsewhere, pixel for pixel
+            BITMAPINFO bmi = { { sizeof(BITMAPINFOHEADER), 200, 40, 1, 32, BI_RGB, 0, 0, 0, 0, 0 } };   // (bottom-up)
+            void *bits = NULL;
+            HDC copy = CreateCompatibleDC(NULL);
+            HBITMAP cb = CreateDIBSection(copy, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+            HGDIOBJ old = SelectObject(copy, cb);
+            CHECK(BitBlt(copy, 0, 0, 200, 40, dc, 0, 0, SRCCOPY));
+            int same = 1;
+            for (int y = 0; y < 40 && same; y++)
+                for (int x = 0; x < 200 && same; x++) {
+                    DWORD px = ((DWORD *)bits)[(39 - y) * 200 + x] & 0xFFFFFF;
+                    COLORREF c = GetPixel(dc, x, y);
+                    same = px == ((c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16 & 0xFF));
+                    if (!same) printf("dwrite: render target copy differs at %d,%d: %06lx vs %06lx\n", x, y, (unsigned long)px, (unsigned long)c);
+                }
+            CHECK(same);
+            SelectObject(copy, old); DeleteObject(cb); DeleteDC(copy);
+            CHECK(SUCCEEDED(IDWriteBitmapRenderTarget_Resize(target, 300, 50)) && SUCCEEDED(IDWriteBitmapRenderTarget_GetSize(target, &sz)) && sz.cx == 300);
+            printf("dwrite: \"Hello world\" drawn into the render target lights %d pixels\n", lit);
+        }
+        if (target) IDWriteBitmapRenderTarget_Release(target);
+        if (gi2) IDWriteGdiInterop_Release(gi2);
+        if (lay) IDWriteTextLayout_Release(lay);
+        IDWriteTextFormat_Release(fmt);
+    }
 
     // GDI interop: a LOGFONT and back.
     IDWriteGdiInterop *gdi = NULL;

@@ -616,7 +616,7 @@ build/xaudio2.exe: tests/xaudio2.c
 
 build/dwrite.exe: tests/dwrite.c
 	@mkdir -p build
-	$(MINGW) -O1 -o $@ $< -ldwrite -lm
+	$(MINGW) -O1 -o $@ $< -ldwrite -lgdi32 -lm
 
 build/shared.exe: tests/shared.c
 	@mkdir -p build
