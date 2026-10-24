@@ -217,6 +217,7 @@ void vx_vulkan_init(void);             // Vulkan 1.0 bootstrap; Vulkan GPU objec
 void vx_input_init(void);              // XInput (input.m)
 void vx_audio_init(void);              // WASAPI on Core Audio (audio.m; after COM)
 void vx_xaudio2_init(void);            // XAudio2 2.8/2.9 on Core Audio (xaudio2.m)
+void vx_dwrite_init(void);             // DirectWrite on CoreText (dwrite.m)
 void vx_com_init(void);                // ole32, oleaut32 (com.c)
 void vx_vcruntime_init(void);          // vcruntime140, MSVC C++ exceptions (vcruntime.c; after seh and ucrt)
 void vx_sysdlls_init(void);            // userenv, winspool, dhcpcsvc, secur32 names/LSA, oleaut32 ordinals (sysdlls.c; after COM)
