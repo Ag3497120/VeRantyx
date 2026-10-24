@@ -457,6 +457,7 @@ static void __attribute__((noreturn)) dispatch(EXCEPTION_RECORD *rec, CONTEXT *c
         RtlVirtualUnwind(0, base, walk.rip, fn, &walk, &data, &frame, NULL);
         if (!walk.rip) break;
     }
+    vx_jobs_process_exit();
     fflush(stdout);
     _exit((int)rec->code);
 }
