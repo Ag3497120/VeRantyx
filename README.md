@@ -1,5 +1,12 @@
 # VeRantyx — wine: Half-Life: Alyx and SteamVR under Wine
 
+> [!IMPORTANT]
+> **Looking for VeRantyx to play? This branch is an old version and is not updated.**
+> **[Download VeRantyx for Mac](https://github.com/Ag3497120/VeRantyx/releases/latest)** (free, signed and
+> notarized; no Terminal) and read [`main`](https://github.com/Ag3497120/VeRantyx#readme). This version needs Wine and
+> Terminal and reaches about 30 fps in Alyx; the current one runs Alyx, Elite Dangerous, The Lab and more on its own
+> runtime, at 60 fps in Alyx.
+
 > **This is the `wine` branch, kept as it was on 2026-10-10.** The current version of VeRantyx, which runs the Windows
 > build of Alyx and other SteamVR games on its own runtime instead of Wine (60 fps where this version reaches ~30), is
 > on [`main`](https://github.com/Ag3497120/VeRantyx#readme) (with a no-Terminal Mac app). Other versions:
