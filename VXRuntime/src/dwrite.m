@@ -70,7 +70,9 @@ typedef struct { LONG height, width, escapement, orientation, weight; uint8_t it
 typedef struct { float x, y; } point_2f;
 
 static const GUID IID_IUnknown_ = { 0, 0, 0, { 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
-static pthread_mutex_t g_lock;                       // (recursive) collections, families, faces made on demand
+// (recursive) collections, families, faces made on demand. The program's code (its loaders and streams, any Release
+// that may be its last) never runs under it: that code may wait for threads of the program's that are in DirectWrite.
+static pthread_mutex_t g_lock;
 static void lock(void) { pthread_mutex_lock(&g_lock); }
 // Made once on demand, read without the lock: set last (release), read first (acquire).
 #define READY(p) __atomic_load_n(&(p), __ATOMIC_ACQUIRE)
@@ -360,40 +362,50 @@ static int key_path(const void *key, uint32_t size, char *out, size_t cap) {
     win[l] = 0;
     return vx_unix_path(win, out, cap);
 }
-// The bytes of a file (0 if they cannot be had).
+// A file of the program's loader, read through it whole (NULL if it cannot be). Called without the lock: the
+// loader and its streams are the program's code, which may wait for threads of its own that are in DirectWrite.
+static CFDataRef custom_read(dw_file *f) {
+    // IDWriteFontFileLoader::CreateStreamFromKey (3); IDWriteFontFileStream::ReadFileFragment (3),
+    // ReleaseFileFragment (4), GetFileSize (5)
+    void *stream = NULL;
+    CFDataRef bytes = NULL;
+    HRESULT hr = ((HRESULT (WINAPI *)(void *, const void *, uint32_t, void **))SLOT(f->loader, 3))(f->loader, f->key, f->key_size, &stream);
+    uint64_t n = 0;
+    if (hr >= 0 && stream && ((HRESULT (WINAPI *)(void *, uint64_t *))SLOT(stream, 5))(stream, &n) >= 0 && n && n < (1ull << 31)) {
+        const void *p = NULL; void *ctx = NULL;
+        if (((HRESULT (WINAPI *)(void *, const void **, uint64_t, uint64_t, void **))SLOT(stream, 3))(stream, &p, 0, n, &ctx) >= 0 && p) {
+            bytes = CFDataCreate(NULL, VX_LOW(p), (CFIndex)n);
+            ((void (WINAPI *)(void *, void *))SLOT(stream, 4))(stream, ctx);
+        }
+    }
+    if (stream) com_release(stream);
+    TR("read %llu bytes of a font file through the program's loader (%s)", (unsigned long long)n, bytes ? "ok" : "failed");
+    return bytes;
+}
+// The bytes of a file (0 if they cannot be had). A local file is mapped, a program's file read once: two threads
+// that read it at the same time each read it, and the bytes of the first to finish are kept.
 static int file_bytes(dw_file *f, const uint8_t **data, size_t *size) {
     if (f->kind == F_LOCAL) {
-        if (!f->map) f->map = map_file(f->unix_path);
-        if (!f->map) return 0;
-        *data = f->map->base; *size = f->map->size;
+        mapping *m = READY(f->map);
+        if (!m && (m = map_file(f->unix_path))) PUBLISH(f->map, m);
+        if (!m) return 0;
+        *data = m->base; *size = m->size;
         return 1;
     }
-    lock();
-    if (!f->bytes && f->kind == F_CUSTOM) {
-        // IDWriteFontFileLoader::CreateStreamFromKey (3); IDWriteFontFileStream::ReadFileFragment (3),
-        // ReleaseFileFragment (4), GetFileSize (5)
-        void *stream = NULL;
-        HRESULT hr = ((HRESULT (WINAPI *)(void *, const void *, uint32_t, void **))SLOT(f->loader, 3))(f->loader, f->key, f->key_size, &stream);
-        uint64_t n = 0;
-        if (hr >= 0 && stream && ((HRESULT (WINAPI *)(void *, uint64_t *))SLOT(stream, 5))(stream, &n) >= 0 && n && n < (1ull << 31)) {
-            const void *p = NULL; void *ctx = NULL;
-            if (((HRESULT (WINAPI *)(void *, const void **, uint64_t, uint64_t, void **))SLOT(stream, 3))(stream, &p, 0, n, &ctx) >= 0 && p) {
-                f->bytes = CFDataCreate(NULL, VX_LOW(p), (CFIndex)n);
-                ((void (WINAPI *)(void *, void *))SLOT(stream, 4))(stream, ctx);
-            }
-        }
-        if (stream) com_release(stream);
-        TR("read %llu bytes of a font file through the program's loader (%s)", (unsigned long long)n, f->bytes ? "ok" : "failed");
+    CFDataRef b = READY(f->bytes);
+    if (!b && f->kind == F_CUSTOM && (b = custom_read(f))) {
+        CFDataRef none = NULL;
+        if (!__atomic_compare_exchange_n(&f->bytes, &none, b, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { CFRelease(b); b = none; }
     }
-    unlock();
-    if (!f->bytes) return 0;
-    *data = CFDataGetBytePtr(f->bytes); *size = (size_t)CFDataGetLength(f->bytes);
+    if (!b) return 0;
+    *data = CFDataGetBytePtr(b); *size = (size_t)CFDataGetLength(b);
     return 1;
 }
 static CFDataRef file_cfdata(dw_file *f) {           // the bytes as CFData (retained), for CoreGraphics
     const uint8_t *d; size_t n;
     if (!file_bytes(f, &d, &n)) return NULL;
-    if (f->bytes) return CFRetain(f->bytes);
+    CFDataRef b = READY(f->bytes);
+    if (b) return CFRetain(b);
     return CFDataCreateWithBytesNoCopy(NULL, d, (CFIndex)n, kCFAllocatorNull);   // (mapped for good)
 }
 static WINAPI HRESULT file_GetReferenceKey(void *this, const void **key, uint32_t *size) {
@@ -849,24 +861,27 @@ static void font_props(dw_font *ft) {
     ft->weight = weight; ft->stretch = stretch; ft->style = style;
     PUBLISH(ft->props, 1);
 }
-// The face of a font, made the first time it is asked for.
+// The face of a font, made the first time it is asked for. It is made outside the lock (a simulated font of a
+// program's file makes its face from that file); when two threads make it at once, the first one kept is the face.
 static dw_face *font_face(dw_font *ft) {
     dw_face *made = READY(ft->face);
     if (made) return made;
-    lock();
-    if (!ft->face) {
-        dw_face *f = NULL;
-        if (ft->desc) f = face_from_descriptor(ft->desc, ft->sims);
-        else if (ft->base) {
-            dw_face *b = font_face(ft->base);
-            if (b && b->file) face_from_file(b->file, b->index, ft->sims, &f);
-            else if (b && ft->base->desc) f = face_from_descriptor(ft->base->desc, ft->sims);
-        }
-        if (f) f->font = ft;
-        PUBLISH(ft->face, f);
+    dw_face *f = NULL;
+    if (ft->desc) f = face_from_descriptor(ft->desc, ft->sims);
+    else if (ft->base) {
+        dw_face *b = font_face(ft->base);
+        dw_file *file = NULL;
+        uint32_t index = 0;
+        if (b) { lock(); if ((file = b->file)) { dw_addref(file); index = b->index; } unlock(); }
+        if (file) { face_from_file(file, index, ft->sims, &f); dw_release(file); }
+        else if (b && ft->base->desc) f = face_from_descriptor(ft->base->desc, ft->sims);
     }
+    lock();
+    made = ft->face;
+    if (!made && f) { f->font = ft; PUBLISH(ft->face, f); made = f; f = NULL; }
     unlock();
-    return ft->face;
+    if (f) dw_release(f);                     // another thread's was kept
+    return made;
 }
 static dw_font *font_new(dw_family *fam, CTFontDescriptorRef desc, dw_face *face) {
     dw_font *ft = dw_new(sizeof *ft, g_font_vtbl, g_font_iids, "IDWriteFont", NULL);
@@ -888,14 +903,21 @@ static dw_family *family_new(dw_collection *c, CFStringRef name, int visible) {
     if (visible) c->visible = c->count;
     return fam;
 }
+// The faces are let go after the lock: the last reference to a program's font file calls its loader's Release.
 static void collection_destroy(dw_obj *o) {
     dw_collection *c = (dw_collection *)o;
+    dw_face **faces = NULL;
+    uint32_t nfaces = 0, cap = 0;
     lock();
     for (uint32_t i = 0; i < c->count; i++) {
         dw_family *fam = c->families[i];
         for (uint32_t j = 0; j < fam->count + (uint32_t)fam->nsimulated; j++) {
             dw_font *ft = j < fam->count ? fam->fonts[j] : fam->simulated[j - fam->count];
-            if (ft->face) { ft->face->font = NULL; dw_release(ft->face); }
+            if (ft->face) {
+                ft->face->font = NULL;
+                if (nfaces == cap) { cap = cap ? cap * 2 : 16; faces = realloc(faces, cap * sizeof *faces); }
+                faces[nfaces++] = ft->face;
+            }
             if (ft->desc) CFRelease(ft->desc);
             free(ft);
         }
@@ -904,7 +926,8 @@ static void collection_destroy(dw_obj *o) {
     }
     for (uint32_t i = 0; i < c->naliases; i++) free(c->aliases[i].name);
     unlock();
-    free(c->aliases); free(c->families); free(c);
+    for (uint32_t i = 0; i < nfaces; i++) dw_release(faces[i]);
+    free(faces); free(c->aliases); free(c->families); free(c);
 }
 static dw_collection *collection_new(int system, uint32_t cap) {
     dw_collection *c = dw_new(sizeof *c, g_collection_vtbl, g_collection_iids, "IDWriteFontCollection", system ? NULL : collection_destroy);
@@ -2508,9 +2531,10 @@ static int attrs_equal(const text_attrs *a, const text_attrs *b) {
            a->style == b->style && a->stretch == b->stretch && a->size == b->size && a->underline == b->underline && a->strike == b->strike &&
            a->effect == b->effect && a->typography == b->typography;
 }
+// (on a copy that holds no references: the attribute set it was copied from, and the caller, keep the objects)
 static void attrs_change(text_attrs *a, int what, const void *v) {
     switch (what) {
-    case A_COLL: { dw_collection *c = *(dw_collection *const *)v; dw_addref(c); dw_release(a->coll); a->coll = c; break; }
+    case A_COLL: a->coll = *(dw_collection *const *)v; break;
     case A_FAMILY: memset(a->family, 0, sizeof a->family); wcs_copy(a->family, 128, v); break;
     case A_LOCALE: memset(a->locale, 0, sizeof a->locale); wcs_copy(a->locale, 86, v); break;
     case A_WEIGHT: a->weight = *(const uint32_t *)v; break;
@@ -2519,16 +2543,19 @@ static void attrs_change(text_attrs *a, int what, const void *v) {
     case A_SIZE: a->size = *(const float *)v; break;
     case A_UNDERLINE: a->underline = *(const int32_t *)v != 0; break;
     case A_STRIKE: a->strike = *(const int32_t *)v != 0; break;
-    case A_EFFECT: { void *e = *(void *const *)v; if (e) com_addref(e); if (a->effect) com_release(a->effect); a->effect = e; break; }
-    case A_TYPOGRAPHY: { void *t = *(void *const *)v; if (t) dw_addref(t); if (a->typography) dw_release(a->typography); a->typography = t; break; }
+    case A_EFFECT: a->effect = *(void *const *)v; break;
+    case A_TYPOGRAPHY: a->typography = *(void *const *)v; break;
     }
 }
+// The index of an attribute set equal to *a, added when there is none. A new set takes its references to our
+// objects here; the reference to the program's drawing effect is the caller's to take (outside the lock).
 static uint16_t attrs_index(dw_layout *l, const text_attrs *a) {
     for (uint32_t i = 0; i < l->nattrs; i++) if (attrs_equal(&l->attrs[i], a)) return (uint16_t)i;
     l->attrs = realloc(l->attrs, (l->nattrs + 1) * sizeof *l->attrs);
     l->primary = realloc(l->primary, (l->nattrs + 1) * sizeof *l->primary);
     l->attrs[l->nattrs] = *a;
-    attrs_hold(&l->attrs[l->nattrs]);
+    if (a->coll) dw_addref(a->coll);
+    if (a->typography) dw_addref(a->typography);
     l->primary[l->nattrs] = NULL;
     return (uint16_t)l->nattrs++;
 }
@@ -2538,16 +2565,21 @@ static HRESULT layout_set(void *this, int what, const void *v, text_range r) {
     uint32_t end = r.length > l->len - r.start ? l->len : r.start + r.length;
     lock();
     if (l->nattrs >= 60000) { unlock(); return E_OUTOFMEMORY; }
+    uint32_t first_new = l->nattrs;
     for (uint32_t i = r.start; i < end; i++) {
         text_attrs a = l->attrs[l->attr_of[i]];
-        // (a copy holding no references of its own: attrs_change swaps references in it, so take them first)
-        attrs_hold(&a);
         attrs_change(&a, what, v);
         l->attr_of[i] = attrs_index(l, &a);
-        attrs_drop(&a);
     }
+    // The new sets' drawing effects get their AddRef after the lock (no program code runs under it); until then the
+    // caller's reference, or the set a new one was copied from, keeps each alive.
+    uint32_t neffects = 0;
+    void **effects = l->nattrs > first_new ? malloc((l->nattrs - first_new) * sizeof *effects) : NULL;
+    for (uint32_t i = first_new; i < l->nattrs; i++) if (l->attrs[i].effect) effects[neffects++] = l->attrs[i].effect;
     l->dirty = 1;
     unlock();
+    for (uint32_t i = 0; i < neffects; i++) com_addref(effects[i]);
+    free(effects);
     return S_OK;
 }
 static WINAPI HRESULT layout_SetMaxWidth(void *this, float w) { if (w < 0) return E_INVALIDARG; ((dw_layout *)this)->max_w = w; layout_dirty(this); return S_OK; }
@@ -2647,6 +2679,7 @@ static HRESULT layout_new(const WCHAR *text, uint32_t len, void *format, float w
     l->m = m ? *m : (matrix){ 1, 0, 0, 1, 0, 0 };
     l->attr_of = calloc(len + 1, sizeof *l->attr_of);
     attrs_index(l, &l->f.a);
+    if (l->attrs[0].effect) com_addref(l->attrs[0].effect);
     l->dirty = 1;
     if (g_trace) { char *s = vx_utf8_dup(l->text); TR("IDWriteFactory::Create%sTextLayout(\"%.40s\", %.0f x %.0f)", gdi ? "GdiCompatible" : "", s, w, h); free(s); }
     *out = l;
@@ -2765,10 +2798,12 @@ static void factory_destroy(dw_obj *o) {
 static int loader_index(void **list, int n, void *l) { for (int i = 0; i < n; i++) if (list[i] == l) return i; return -1; }
 static HRESULT loader_register(void **list, int *n, void *l) {
     if (!l) return E_INVALIDARG;
+    com_addref(l);                       // (the program's AddRef before the lock, given back when it is not registered)
     lock();
     HRESULT hr = loader_index(list, *n, l) >= 0 ? DWRITE_E_ALREADYREGISTERED : *n >= 64 ? E_OUTOFMEMORY : S_OK;
-    if (hr == S_OK) { com_addref(l); list[(*n)++] = l; }
+    if (hr == S_OK) list[(*n)++] = l;
     unlock();
+    if (hr != S_OK) com_release(l);
     return hr;
 }
 static HRESULT loader_unregister(void **list, int *n, void *l) {
@@ -2790,7 +2825,7 @@ static WINAPI HRESULT factory_GetSystemFontCollection(void *this, void **out, in
     *out = c;
     return S_OK;
 }
-static void collection_add_face(dw_collection *c, dw_face *f) {
+static int collection_add_face(dw_collection *c, dw_face *f) {        // 0: not added (the caller releases the face)
     CFStringRef name = CTFontCopyFamilyName(f->ct);
     if (!name) name = CFStringCreateWithCString(NULL, f->ps[0] ? f->ps : "Unknown", kCFStringEncodingUTF8);
     dw_family *fam = family_named(c, name, c->count);
@@ -2800,7 +2835,9 @@ static void collection_add_face(dw_collection *c, dw_face *f) {
     }
     if (!fam) fam = family_new(c, name, 1);
     CFRelease(name);
-    if (fam) font_new(fam, NULL, f); else dw_release(f);
+    if (!fam) return 0;
+    font_new(fam, NULL, f);
+    return 1;
 }
 static WINAPI HRESULT factory_CreateCustomFontCollection(void *this, void *loader, const void *key, uint32_t key_size, void **out) {
     dw_factory *fac = this;
@@ -2830,7 +2867,11 @@ static WINAPI HRESULT factory_CreateCustomFontCollection(void *this, void *loade
             uint32_t faces = file_bytes(file, &d, &n) ? sfnt_faces(d, n, &type) : 0;
             for (uint32_t i = 0; i < faces; i++) {
                 dw_face *f;
-                if (face_from_file(file, i, 0, &f) >= 0) { lock(); collection_add_face(c, f); unlock(); }
+                if (face_from_file(file, i, 0, &f) < 0) continue;
+                lock();
+                int added = collection_add_face(c, f);
+                unlock();
+                if (!added) dw_release(f);
             }
         }
         com_release(file);

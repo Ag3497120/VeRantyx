@@ -2,7 +2,9 @@
 // font faces (glyphs, metrics, tables, files through the local loader), a font given through a loader of the
 // program's own (a custom font file and a custom collection), font fallback for made-up Latin, Japanese and emoji
 // text, glyph outlines into a geometry sink, glyph runs rasterized into alpha textures, and text formats and layouts
-// (measured, wrapped, hit-tested, drawn through a renderer into a GDI bitmap render target).
+// (measured, wrapped, hit-tested, drawn through a renderer into a GDI bitmap render target). The program's code that
+// DirectWrite calls (a font file loader and its streams, a drawing effect's AddRef and Release) waits for a thread of
+// the program's own that calls DirectWrite: it gets in (DirectWrite does not call the program holding a lock).
 #define COBJMACROS
 #include <windows.h>
 #include <initguid.h>
@@ -79,32 +81,76 @@ static HRESULT WINAPI sk_close(sink *s) { (void)s; return S_OK; }
 static const sink_vtbl sink_v = { sk_qi, sk_ref, sk_ref, sk_fill, sk_flags, sk_begin, sk_lines, sk_beziers, sk_end, sk_close };
 static void sink_init(sink *s) { memset(s, 0, sizeof *s); s->vtbl = &sink_v; s->x0 = s->y0 = 1e9f; s->x1 = s->y1 = -1e9f; }
 
+// ---- the program's code called by DirectWrite, waiting for a thread of the program's that calls DirectWrite -------------
+// (as a browser's font loader may wait for another of its threads). The thread asks for the font of a face, which
+// DirectWrite answers under its lock; the program's code waits up to 3 seconds for it.
+static IDWriteFontCollection *probe_coll;
+static IDWriteFontFace *probe_face;
+static volatile LONG probe_calls, probe_stuck;
+static HANDLE probe_threads[64];
+static volatile LONG nprobe_threads;
+static DWORD WINAPI probe_thread(void *arg) {
+    (void)arg;
+    IDWriteFont *font = NULL;
+    if (SUCCEEDED(IDWriteFontCollection_GetFontFromFontFace(probe_coll, probe_face, &font)) && font) IDWriteFont_Release(font);
+    return 0;
+}
+static void probe(void) {
+    if (!probe_coll || probe_stuck) return;           // (one stuck thread is enough to fail: no more waits)
+    HANDLE t = CreateThread(NULL, 0, probe_thread, NULL, 0, NULL);
+    if (!t) { InterlockedIncrement(&probe_stuck); return; }
+    InterlockedIncrement(&probe_calls);
+    if (WaitForSingleObject(t, 3000) != WAIT_OBJECT_0) InterlockedIncrement(&probe_stuck);
+    LONG i = InterlockedIncrement(&nprobe_threads) - 1;
+    if (i < 64) probe_threads[i] = t; else { WaitForSingleObject(t, 10000); CloseHandle(t); }
+}
+static void probe_finish(void) {                    // the threads that were not waited for to the end
+    for (LONG i = 0; i < nprobe_threads && i < 64; i++) { WaitForSingleObject(probe_threads[i], 10000); CloseHandle(probe_threads[i]); }
+    nprobe_threads = 0;
+}
+
+// a drawing effect (any IUnknown of the program's)
+typedef struct { IUnknown iface; LONG refs; int probing; } effect;
+static HRESULT WINAPI fx_qi(IUnknown *u, REFIID iid, void **out) { (void)iid; *out = u; IUnknown_AddRef(u); return S_OK; }
+static ULONG WINAPI fx_addref(IUnknown *u) { effect *e = (effect *)u; if (e->probing) probe(); return InterlockedIncrement(&e->refs); }
+static ULONG WINAPI fx_release(IUnknown *u) { effect *e = (effect *)u; if (e->probing) probe(); return InterlockedDecrement(&e->refs); }
+static IUnknownVtbl fx_vtbl = { fx_qi, fx_addref, fx_release };
+
 // ---- a font file loader of the program's own: a font's bytes in memory ------------------------------------------------------
-typedef struct { IDWriteFontFileStream iface; LONG refs; const BYTE *data; UINT64 size; } mem_stream;
+typedef struct { IDWriteFontFileStream iface; LONG refs; const BYTE *data; UINT64 size; int probing; } mem_stream;
 static HRESULT WINAPI ms_qi(IDWriteFontFileStream *s, REFIID iid, void **out) { (void)iid; *out = s; IDWriteFontFileStream_AddRef(s); return S_OK; }
 static ULONG WINAPI ms_addref(IDWriteFontFileStream *s) { return InterlockedIncrement(&((mem_stream *)s)->refs); }
-static ULONG WINAPI ms_release(IDWriteFontFileStream *s) { LONG r = InterlockedDecrement(&((mem_stream *)s)->refs); if (!r) HeapFree(GetProcessHeap(), 0, s); return r; }
+static ULONG WINAPI ms_release(IDWriteFontFileStream *s) {
+    mem_stream *m = (mem_stream *)s;
+    if (m->probing) probe();
+    LONG r = InterlockedDecrement(&m->refs);
+    if (!r) HeapFree(GetProcessHeap(), 0, s);
+    return r;
+}
 static int fragments_out;
 static HRESULT WINAPI ms_read(IDWriteFontFileStream *s, const void **start, UINT64 off, UINT64 n, void **ctx) {
     mem_stream *m = (mem_stream *)s;
+    if (m->probing) probe();
     if (off > m->size || n > m->size - off) return E_FAIL;
     *start = m->data + off; *ctx = (void *)1; fragments_out++;
     return S_OK;
 }
-static void WINAPI ms_release_fragment(IDWriteFontFileStream *s, void *ctx) { (void)s; if (ctx == (void *)1) fragments_out--; }
-static HRESULT WINAPI ms_size(IDWriteFontFileStream *s, UINT64 *n) { *n = ((mem_stream *)s)->size; return S_OK; }
+static void WINAPI ms_release_fragment(IDWriteFontFileStream *s, void *ctx) { if (((mem_stream *)s)->probing) probe(); if (ctx == (void *)1) fragments_out--; }
+static HRESULT WINAPI ms_size(IDWriteFontFileStream *s, UINT64 *n) { if (((mem_stream *)s)->probing) probe(); *n = ((mem_stream *)s)->size; return S_OK; }
 static HRESULT WINAPI ms_time(IDWriteFontFileStream *s, UINT64 *t) { (void)s; *t = 0; return E_NOTIMPL; }
 static IDWriteFontFileStreamVtbl ms_vtbl = { ms_qi, ms_addref, ms_release, ms_read, ms_release_fragment, ms_size, ms_time };
 
-typedef struct { IDWriteFontFileLoader iface; LONG refs; const BYTE *data; UINT64 size; int streams; } mem_loader;
+// (probing: its streams wait for a probe in each method; probe_release: its Release does)
+typedef struct { IDWriteFontFileLoader iface; LONG refs; const BYTE *data; UINT64 size; int streams, probing, probe_release; } mem_loader;
 static HRESULT WINAPI ml_qi(IDWriteFontFileLoader *l, REFIID iid, void **out) { (void)iid; *out = l; return S_OK; }
 static ULONG WINAPI ml_addref(IDWriteFontFileLoader *l) { return InterlockedIncrement(&((mem_loader *)l)->refs); }
-static ULONG WINAPI ml_release(IDWriteFontFileLoader *l) { return InterlockedDecrement(&((mem_loader *)l)->refs); }
+static ULONG WINAPI ml_release(IDWriteFontFileLoader *l) { if (((mem_loader *)l)->probe_release) probe(); return InterlockedDecrement(&((mem_loader *)l)->refs); }
 static HRESULT WINAPI ml_stream(IDWriteFontFileLoader *l, const void *key, UINT32 n, IDWriteFontFileStream **out) {
     mem_loader *m = (mem_loader *)l;
+    if (m->probing) probe();
     if (n != 4 || memcmp(key, "MEM1", 4)) return E_INVALIDARG;
     mem_stream *s = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *s);
-    s->iface.lpVtbl = &ms_vtbl; s->refs = 1; s->data = m->data; s->size = m->size;
+    s->iface.lpVtbl = &ms_vtbl; s->refs = 1; s->data = m->data; s->size = m->size; s->probing = m->probing;
     m->streams++;
     *out = &s->iface;
     return S_OK;
@@ -304,6 +350,7 @@ int main(void) {
     IDWriteFontFace *face = face_of(sys, L"helvetica", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, &font);
     CHECK(face && font);
     if (!face) { printf("dwrite: no Helvetica face -> FAILED\n"); return 1; }
+    probe_coll = sys; probe_face = face;
     CHECK(IDWriteFont_GetWeight(font) == DWRITE_FONT_WEIGHT_NORMAL && IDWriteFont_GetStyle(font) == DWRITE_FONT_STYLE_NORMAL && IDWriteFont_GetSimulations(font) == 0);
     DWRITE_FONT_METRICS m;
     IDWriteFontFace_GetMetrics(face, &m);
@@ -466,6 +513,46 @@ int main(void) {
         }
         CHECK(SUCCEEDED(IDWriteFactory_UnregisterFontFileLoader(f, &ml.iface)));
         CHECK(ml.refs == 1);
+
+        // The loader called without DirectWrite's lock: new files read for Analyze, CreateFontFace and a custom
+        // collection (CreateStreamFromKey, GetFileSize, ReadFileFragment, ReleaseFileFragment, the stream's Release),
+        // and the loader's Release when a collection that held the last references to its file goes.
+        mem_loader pl = { { &ml_vtbl }, 1, bytes, nbytes, 0, 1, 0 };
+        IDWriteFontFile *pf[3] = { NULL, NULL, NULL };
+        CHECK(SUCCEEDED(IDWriteFactory_RegisterFontFileLoader(f, &pl.iface)));
+        for (int i = 0; i < 3; i++) CHECK(SUCCEEDED(IDWriteFactory_CreateCustomFontFileReference(f, "MEM1", 4, &pl.iface, &pf[i])) && pf[i]);
+        if (pf[0] && pf[1] && pf[2]) {
+            BOOL supported = FALSE; DWRITE_FONT_FILE_TYPE ftype; DWRITE_FONT_FACE_TYPE fctype; UINT32 nfaces = 0;
+            probe_calls = probe_stuck = 0;
+            CHECK(SUCCEEDED(IDWriteFontFile_Analyze(pf[0], &supported, &ftype, &fctype, &nfaces)) && supported && nfaces >= 1);
+            CHECK(probe_calls >= 5 && probe_stuck == 0);
+            IDWriteFontFace *pface = NULL;
+            probe_calls = probe_stuck = 0;
+            CHECK(SUCCEEDED(IDWriteFactory_CreateFontFace(f, fctype, 1, &pf[1], IDWriteFontFace_GetIndex(face), DWRITE_FONT_SIMULATIONS_NONE, &pface)) && pface);
+            CHECK(probe_calls >= 5 && probe_stuck == 0);
+            if (pface) { CHECK(glyph(pface, 'H') == gi[0]); IDWriteFontFace_Release(pface); }
+            one_loader pcl = { { &ol_vtbl }, pf[2] };
+            IDWriteFontCollection *pc = NULL;
+            CHECK(SUCCEEDED(IDWriteFactory_RegisterFontCollectionLoader(f, &pcl.iface)));
+            probe_calls = probe_stuck = 0;
+            CHECK(SUCCEEDED(IDWriteFactory_CreateCustomFontCollection(f, &pcl.iface, "p", 1, &pc)) && pc);
+            CHECK(probe_calls >= 5 && probe_stuck == 0);
+            IDWriteFactory_UnregisterFontCollectionLoader(f, &pcl.iface);
+            IDWriteFontFile_Release(pf[2]);            // the collection's faces hold the file now
+            pf[2] = NULL;
+            if (pc) {
+                CHECK(IDWriteFontCollection_GetFontFamilyCount(pc) >= 1);
+                LONG before = pl.refs;
+                pl.probe_release = 1; probe_calls = probe_stuck = 0;
+                IDWriteFontCollection_Release(pc);
+                pl.probe_release = 0;
+                CHECK(pl.refs == before - 1 && probe_calls >= 1 && probe_stuck == 0);
+            }
+        }
+        for (int i = 0; i < 3; i++) if (pf[i]) IDWriteFontFile_Release(pf[i]);
+        CHECK(SUCCEEDED(IDWriteFactory_UnregisterFontFileLoader(f, &pl.iface)));
+        CHECK(pl.refs == 1 && fragments_out == 0);
+        probe_finish();
         free(bytes);
     }
 
@@ -672,7 +759,21 @@ int main(void) {
                 CHECK(SUCCEEDED(IDWriteTextLayout_SetTypography(lay, typo, first5)));
                 IDWriteTypography_Release(typo);
             }
+            // a drawing effect: the layout holds it (its AddRef called without DirectWrite's lock) until it goes
+            effect fx = { { &fx_vtbl }, 1, 1 };
+            probe_calls = probe_stuck = 0;
+            CHECK(SUCCEEDED(IDWriteTextLayout_SetDrawingEffect(lay, &fx.iface, first5)));
+            CHECK(fx.refs > 1 && probe_calls >= 1 && probe_stuck == 0);
+            fx.probing = 0;
+            IUnknown *back_fx = NULL;
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetDrawingEffect(lay, 2, &back_fx, &got)) && back_fx == &fx.iface && got.startPosition == 0 && got.length == 5);
+            if (back_fx) IUnknown_Release(back_fx);
+            CHECK(SUCCEEDED(IDWriteTextLayout_GetDrawingEffect(lay, 7, &back_fx, &got)) && !back_fx);
+            renderer fr = { { &renderer_vtbl } };
+            CHECK(SUCCEEDED(IDWriteTextLayout_Draw(lay, NULL, &fr.iface, 0.0f, 0.0f)) && fr.glyphs == 11);
             IDWriteTextLayout_Release(lay);
+            CHECK(fx.refs == 1);
+            probe_finish();
         }
         // lines from newlines, and text in two fonts (Japanese after Latin: fallback)
         CHECK(SUCCEEDED(IDWriteFactory_CreateTextLayout(f, L"ab\ncd\n", 6, fmt, 1000.0f, 100.0f, &lay)) && lay);
