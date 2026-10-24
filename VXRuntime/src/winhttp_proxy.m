@@ -7,8 +7,8 @@
 // auto-detection (WPAD) finds a PAC file only where CFNetwork reports one for the URL. The answer is the PAC's list:
 // proxies and DIRECT entries, in order.
 //
-// WinHTTP wants the resolver's session opened with WINHTTP_FLAG_ASYNC; winhttp.m opens synchronous sessions only (it
-// refuses the flag), and the resolver is asynchronous by itself, so any session is taken.
+// As documented, the resolver is made from a session opened with WINHTTP_FLAG_ASYNC (winhttp.m marks such sessions);
+// any other session is the wrong kind of handle for it.
 #import <Foundation/Foundation.h>
 #import <CFNetwork/CFNetwork.h>
 #import <SystemConfiguration/SystemConfiguration.h>
@@ -244,7 +244,10 @@ static WINAPI DWORD WinHttpCreateProxyResolver(HANDLE session, HANDLE *out) {
     *out = NULL;
     if (!session) return ERROR_INVALID_HANDLE;
     pthread_mutex_lock(&g_lock);
-    if (!winhttp_handle(session) || *(const uint32_t *)session != WH_SESSION) { pthread_mutex_unlock(&g_lock); return ERROR_WINHTTP_INCORRECT_HANDLE_TYPE; }
+    if (!winhttp_handle(session) || *(const uint32_t *)session != WH_SESSION || !vx_winhttp_session_async(session)) {
+        pthread_mutex_unlock(&g_lock);
+        return ERROR_WINHTTP_INCORRECT_HANDLE_TYPE;                 // (a synchronous session included)
+    }
     resolver *r = calloc(1, sizeof *r);
     if (!r) { pthread_mutex_unlock(&g_lock); return ERROR_NOT_ENOUGH_MEMORY; }
     r->kind = RESOLVER_KIND;

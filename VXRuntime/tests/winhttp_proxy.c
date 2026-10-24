@@ -1,7 +1,8 @@
 // WinHttpCrackUrl per its documentation, status callbacks, and the proxy resolver of Windows 8 against PAC files this
 // test serves itself on 127.0.0.1 (made-up proxies under .test): a list of proxies and DIRECT, a script that does
 // not run, one that cannot be downloaded, one that never arrives while the resolver is closed (cancelled), and the
-// Mac's static settings. Nothing leaves this computer.
+// Mac's static settings. The resolver's session is an asynchronous one (WINHTTP_FLAG_ASYNC), as documented; a
+// synchronous session is refused. Nothing leaves this computer.
 #define _WIN32_WINNT 0x0A00                                      // (Windows 10: the Vista and Windows 8 declarations)
 #include <winsock2.h>
 #include <windows.h>
@@ -9,6 +10,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+
+#define SECURE_DEFAULTS 0x30000000u                              // WINHTTP_FLAG_SECURE_DEFAULTS (not in MinGW's winhttp.h)
 
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("check failed (line %d): %s\n", __LINE__, #c); failures++; } } while (0)
@@ -185,9 +188,26 @@ int main(void) {
     done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     closing_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
-    // ---- callbacks: the previous one comes back; the session's goes to its resolver
-    HINTERNET session = WinHttpOpen(L"vxrt proxy resolver test", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    // ---- the resolver's session is opened with WINHTTP_FLAG_ASYNC, as documented; a synchronous one is the wrong kind
+    HINTERNET sync_session = WinHttpOpen(L"vxrt proxy resolver test", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    CHECK(sync_session != NULL);
+    HINTERNET from_sync = (HINTERNET)1;
+    CHECK(WinHttpCreateProxyResolver(sync_session, &from_sync) == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE && from_sync == NULL);
+    CHECK(WinHttpCloseHandle(sync_session));
+    HINTERNET session = WinHttpOpen(L"vxrt proxy resolver test", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
     CHECK(session != NULL);
+    // requests in an asynchronous session are refused (not run synchronously) until VXRuntime completes them by callback
+    SetLastError(0);
+    CHECK(WinHttpConnect(session, L"127.0.0.1", 80, 0) == NULL && GetLastError() == ERROR_NOT_SUPPORTED);
+    // WINHTTP_FLAG_SECURE_DEFAULTS sets WINHTTP_FLAG_ASYNC too (WinHttpOpen's documentation): such a session is taken
+    HINTERNET secure_session = WinHttpOpen(L"vxrt proxy resolver test", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, SECURE_DEFAULTS);
+    CHECK(secure_session != NULL);
+    HINTERNET from_secure = NULL;
+    CHECK(WinHttpCreateProxyResolver(secure_session, &from_secure) == ERROR_SUCCESS && from_secure);
+    CHECK(WinHttpCloseHandle(from_secure));
+    CHECK(WinHttpCloseHandle(secure_session));
+
+    // ---- callbacks: the previous one comes back; the session's goes to its resolver
     DWORD flags = WINHTTP_CALLBACK_FLAG_REQUEST_ERROR | WINHTTP_CALLBACK_FLAG_GETPROXYFORURL_COMPLETE | WINHTTP_CALLBACK_FLAG_HANDLES;
     CHECK(WinHttpSetStatusCallback(session, other_status, flags, 0) == NULL);
     CHECK(WinHttpSetStatusCallback(session, status, flags, 0) == other_status);
@@ -281,6 +301,6 @@ int main(void) {
     closesocket(listener);
     WSACleanup();
     if (failures) { printf("winhttp_proxy: %d checks failed\n", failures); return 1; }
-    puts("winhttp_proxy: WinHttpCrackUrl, status callbacks, PAC resolution (list, DIRECT, bad, unreachable, cancelled), static settings: ok");
+    puts("winhttp_proxy: WinHttpCrackUrl, async session, status callbacks, PAC resolution (list, DIRECT, bad, unreachable, cancelled), static settings: ok");
     return 0;
 }

@@ -312,6 +312,13 @@ static WINAPI DWORD IpRenewAddress(const uint8_t *adapter) { return dhcp_lease(a
 // completes the pending NotifyAddrChange requests, an IPv4 route added, removed or changed the NotifyRouteChange ones.
 // A request is an OVERLAPPED that completes like a file's (its event signalled, GetOverlappedResult answers), or a
 // call without one that waits for the next change.
+//
+// A request's completion (Internal, InternalHigh, its event) is written with g_ip_lock held, by the routing thread and
+// by CancelIPChangeNotify alike, in the same step that takes it off the list: a request is either listed (pending) or
+// complete, never in between. So when CancelIPChangeNotify finds nothing, the completion is already written and the
+// program may free the OVERLAPPED and close its event, as on Windows; and a new request on the same OVERLAPPED cannot
+// be completed by the change that ended the one before. (vx_io_completed takes only sync.c's lock and runs no program
+// code, so g_ip_lock, then that lock, is safe; notify_change's ResetEvent takes them in the same order.)
 enum { VX_HANDLE_IPNOTIFY = 0x4950 };
 typedef struct ip_wait { void *ov; int route; struct ip_wait *next; } ip_wait;
 static pthread_mutex_t g_ip_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -324,20 +331,15 @@ static int g_ip_monitor;                                            // 1 running
 static void ip_changed(int route) {
     pthread_mutex_lock(&g_ip_lock);
     g_ip_generation[route]++;
-    ip_wait *done = NULL, **link = &g_ip_waits;
-    while (*link) {
+    for (ip_wait **link = &g_ip_waits; *link; ) {
         ip_wait *w = *link;
-        if (w->route == route) { *link = w->next; w->next = done; done = w; }
-        else link = &w->next;
+        if (w->route != route) { link = &w->next; continue; }
+        *link = w->next;
+        vx_io_completed(g_ip_file, w->ov, 0, NO_ERROR);           // (still under g_ip_lock: see above)
+        free(w);
     }
     pthread_cond_broadcast(&g_ip_changed);
     pthread_mutex_unlock(&g_ip_lock);
-    while (done) {
-        ip_wait *next = done->next;
-        vx_io_completed(g_ip_file, done->ov, 0, NO_ERROR);
-        free(done);
-        done = next;
-    }
 }
 // A routing message's addresses follow its header, each rounded up to 4 bytes (route(4)); the one of `which` (RTAX_*).
 static const struct sockaddr *message_address(const uint8_t *addresses, const uint8_t *end, int present, int which) {
@@ -420,15 +422,16 @@ static DWORD notify_change(HANDLE *handle, void *ov, int route) {
 }
 static WINAPI DWORD NotifyAddrChange(HANDLE *handle, void *overlapped) { return notify_change(handle, overlapped, 0); }
 static WINAPI DWORD NotifyRouteChange(HANDLE *handle, void *overlapped) { return notify_change(handle, overlapped, 1); }
-// The request ends as a cancelled I/O does: ERROR_OPERATION_ABORTED, its event signalled.
+// The request ends as a cancelled I/O does: ERROR_OPERATION_ABORTED, its event signalled. One that is not listed has
+// already completed (its completion written), or never was a request: ERROR_NOT_FOUND.
 static WINAPI BOOL CancelIPChangeNotify(void *overlapped) {
     pthread_mutex_lock(&g_ip_lock);
     ip_wait *found = NULL, **link = &g_ip_waits;
     for (; *link; link = &(*link)->next)
         if ((*link)->ov == overlapped) { found = *link; *link = found->next; break; }
+    if (found) vx_io_completed(g_ip_file, overlapped, 0, ERROR_OPERATION_ABORTED);   // (under g_ip_lock: see above)
     pthread_mutex_unlock(&g_ip_lock);
     if (!found) { vx_set_last_error(ERROR_NOT_FOUND); return 0; }
-    vx_io_completed(g_ip_file, overlapped, 0, ERROR_OPERATION_ABORTED);
     free(found);
     return 1;
 }

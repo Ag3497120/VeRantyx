@@ -896,6 +896,12 @@ build/directinput_format_test: src/directinput_format.c src/directinput_format.h
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ src/directinput_format.c tests/directinput_format.c
 
+# iphlpapi's change notifications when a change completes a request that is being cancelled or started again on the same
+# OVERLAPPED: a Mac program that includes src/iphlp.c, since a real change cannot be made on demand without privileges.
+build/iphlp_notify_test: tests/iphlp_notify.c src/iphlp.c src/vx.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/iphlp_notify.c -framework CoreFoundation -framework SystemConfiguration
+
 build/pe_test: src/pe.c src/pe.h tests/pe.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ src/pe.c tests/pe.c
@@ -930,6 +936,7 @@ build/vulkan_test: build/vulkan_spirv_graphics_separate_image_sampler_implicit_f
 
 check: export VXRT_ROOT = build/root
 check: export VXRT_NO_ACTIVATE = 1
+check: build/iphlp_notify_test
 check: build/vulkan_spirv_atomic_compare_exchange_fixture.spv
 check: build/vulkan_spirv_atomic_rmw_fixture.spv
 check: build/spirv_graphics_separate_image_sampler.air
@@ -1035,6 +1042,7 @@ check: all build/vkmsl build/x86dec_test build/x86dec_check build/ref_x86 build/
 	python3 ../tools/spirv_check.py --translator build/spirv2msl --compile build/vulkan_spirv_dynamic_nonuniform_sampled_image_array_fixture.spv
 	build/directinput_buffer_test
 	build/directinput_format_test
+	build/iphlp_notify_test
 	build/d3d_format_test
 	build/d3d12_view_test
 	build/pe_test

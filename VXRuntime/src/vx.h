@@ -189,6 +189,7 @@ void vx_iphlp_init(void);              // iphlpapi: interface table, IPv4 adapte
 void vx_winsock_nsp_init(void);        // ws2_32's protocol and name-space catalogs, DNS lookups (winsock_nsp.c)
 void vx_winhttp_proxy_init(void);      // WinHttpCrackUrl, status callbacks, the proxy resolver (winhttp_proxy.m)
 int vx_winhttp_proxy_close(HANDLE h);  // (winhttp.m's WinHttpCloseHandle: 1 when h was a resolver, closed there)
+int vx_winhttp_session_async(HANDLE h); // (winhttp.m: 1 for a session opened with WINHTTP_FLAG_ASYNC; the resolver's)
 void vx_d3d11_init(void);              // Direct3D 11 on Metal (d3d11.m)
 void vx_d3d9_init(void);               // IDirect3D9: adapters and display modes (d3d9.m)
 void vx_dxgi_init(void);               // DXGI (dxgi.m)
