@@ -517,10 +517,32 @@ int main(int argc, char **argv) {
     CHECK(ImpersonateLoggedOnUser(tok) && OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &x) &&
           GetTokenInformation(x, TokenImpersonationLevel, &level, sizeof level, &n) && level == SecurityImpersonation);
     CloseHandle(x); RevertToSelf();
+    // the anonymous logon is not in Everyone unless "Let Everyone permissions apply to anonymous users" is on (off by
+    // default; the test's own registry, the value removed again)
+    HKEY lsa = NULL;
+    CHECK(RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Lsa", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &lsa, NULL) == ERROR_SUCCESS);
+    RegDeleteValueW(lsa, L"EveryoneIncludesAnonymous");
+    PSID anonymous = sid_of(L"AN"), network = sid_of(L"NU");
     CHECK(ImpersonateAnonymousToken(GetCurrentThread()));
     tu = token_info(GetCurrentThreadToken(), TokenUser);
     CHECK(tu && sid_is(tu->User.Sid, L"S-1-5-7"));
+    member = 2; CHECK(CheckTokenMembership(NULL, anonymous, &member) && member);
+    member = 2; CHECK(CheckTokenMembership(NULL, network, &member) && member);
+    member = 2; CHECK(CheckTokenMembership(NULL, world, &member) && !member);
+    member = 2; CHECK(CheckTokenMembership(NULL, users, &member) && !member);
     free(tu); RevertToSelf();
+    DWORD policy_on = 1, policy_off = 0;
+    CHECK(RegSetValueExW(lsa, L"EveryoneIncludesAnonymous", 0, REG_DWORD, (BYTE *)&policy_on, sizeof policy_on) == ERROR_SUCCESS);
+    CHECK(ImpersonateAnonymousToken(GetCurrentThread()));
+    member = 2; CHECK(CheckTokenMembership(NULL, world, &member) && member);
+    RevertToSelf();
+    CHECK(RegSetValueExW(lsa, L"EveryoneIncludesAnonymous", 0, REG_DWORD, (BYTE *)&policy_off, sizeof policy_off) == ERROR_SUCCESS);
+    CHECK(ImpersonateAnonymousToken(GetCurrentThread()));
+    member = 2; CHECK(CheckTokenMembership(NULL, world, &member) && !member);
+    RevertToSelf();
+    RegDeleteValueW(lsa, L"EveryoneIncludesAnonymous");
+    RegCloseKey(lsa);
+    LocalFree(anonymous); LocalFree(network);
     WaitForSingleObject(th, INFINITE); CloseHandle(th); CloseHandle(mine);
 
     // membership: enabled groups only, and on a restricted token its restricting SIDs too

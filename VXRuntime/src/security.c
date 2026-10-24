@@ -2416,16 +2416,28 @@ static WINAPI BOOL ImpersonateLoggedOnUser(HANDLE h) {
     if (t->type == TOKEN_PRIMARY) { token *c = impersonation_copy(t, SECURITY_IMPERSONATION); token_unref(t); t = c; }
     return impersonate(vx_current_tid(), t);
 }
-// The anonymous logon: ANONYMOUS LOGON as the user, in Everyone and NETWORK, untrusted integrity, no privileges.
+// "Network access: Let Everyone permissions apply to anonymous users" (HKLM\SYSTEM\CurrentControlSet\Control\Lsa,
+// EveryoneIncludesAnonymous): off unless set to a nonzero DWORD, as Windows has it by default. Read at each use (a
+// change to the policy needs no restart).
+static int everyone_includes_anonymous(void) {
+    LONG (WINAPI *get)(HANDLE, const char *, const char *, DWORD, DWORD *, void *, DWORD *) =
+        (LONG (WINAPI *)(HANDLE, const char *, const char *, DWORD, DWORD *, void *, DWORD *))vx_find_export("advapi32.dll", "RegGetValueA");
+    DWORD value = 0, size = sizeof value;
+    return get && !get((HANDLE)(intptr_t)(int32_t)0x80000002 /* HKEY_LOCAL_MACHINE */, "SYSTEM\\CurrentControlSet\\Control\\Lsa",
+                       "EveryoneIncludesAnonymous", 0x10 /* RRF_RT_REG_DWORD */, NULL, &value, &size) && value;
+}
+// The anonymous logon: ANONYMOUS LOGON as the user, in NETWORK, untrusted integrity, no privileges; in Everyone only
+// when the policy above says so (by default, Everyone's permissions do not apply to anonymous users).
 static WINAPI BOOL ImpersonateAnonymousToken(HANDLE thread) {
     int foreign;
     DWORD tid = thread_id_of(thread, &foreign);
     if (!tid) return no_thread(foreign, "ImpersonateAnonymousToken");
+    int everyone = everyone_includes_anonymous();
     token *t = token_new();
     uint8_t s[SID_MAX];
     t->type = TOKEN_IMPERSONATION; t->level = SECURITY_IMPERSONATION;
     sid_of(t->user.sid, 5, 1, 7);
-    sid_of(s, 1, 1, 0); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON);
+    if (everyone) { sid_of(s, 1, 1, 0); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON); }
     sid_of(s, 5, 1, 2); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON);
     sid_of(s, 16, 1, 0); add_sid_attr(&t->groups, &t->ngroups, s, SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED);
     memcpy(t->owner, t->user.sid, SID_MAX); memcpy(t->primary, t->user.sid, SID_MAX);
