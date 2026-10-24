@@ -1,7 +1,8 @@
 // kernel32 and ntdll functions the Windows Steam client imports (src/kernelx.c): serial ports, memory notifications
 // and hints (DiscardVirtualMemory on private memory only), threads started "remotely", thread and process information
 // (background processing mode), locales, volumes and DOS devices, time zones, Windows Error Reporting, NtQueryObject,
-// NtWriteFile, NTSTATUS codes, DLL directories, and the computer's names (kernel32.c). Made-up data only.
+// NtWriteFile, NTSTATUS codes, DLL directories, the computer's names (kernel32.c) and process mitigation policies
+// (extras.c). Made-up data only.
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <stdio.h>
@@ -524,6 +525,52 @@ static void test_computer_names(void) {
     group("computer names", before);
 }
 
+// Process mitigation policies (src/extras.c): the runtime enforces none, so each reads as off, and turning one on is
+// refused with ERROR_NOT_SUPPORTED, never reported applied (Chromium's sandbox sets several); asking for everything off
+// succeeds (it is so already). A wrong size, no buffer, or ProcessMitigationOptionsMask (not a policy to set) is
+// ERROR_INVALID_PARAMETER.
+static void test_mitigations(void) {
+    int before = failures;
+    GET(kernel32, BOOL (WINAPI *)(PROCESS_MITIGATION_POLICY, PVOID, SIZE_T), SetProcessMitigationPolicy);
+    GET(kernel32, BOOL (WINAPI *)(HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T), GetProcessMitigationPolicy);
+    PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dynamic = { 0 }, now;
+    dynamic.ProhibitDynamicCode = 1;
+    SetLastError(0);
+    CHECK(!SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &dynamic, sizeof dynamic) && GetLastError() == ERROR_NOT_SUPPORTED);
+    now.Flags = 0xffffffff;
+    CHECK(GetProcessMitigationPolicy(GetCurrentProcess(), ProcessDynamicCodePolicy, &now, sizeof now) && now.Flags == 0);
+    PROCESS_MITIGATION_IMAGE_LOAD_POLICY image = { 0 };
+    image.NoRemoteImages = 1; image.NoLowMandatoryLabelImages = 1;
+    SetLastError(0);
+    CHECK(!SetProcessMitigationPolicy(ProcessImageLoadPolicy, &image, sizeof image) && GetLastError() == ERROR_NOT_SUPPORTED);
+    PROCESS_MITIGATION_DEP_POLICY dep = { 0 };
+    dep.Enable = 1; dep.Permanent = TRUE;
+    SetLastError(0);
+    CHECK(!SetProcessMitigationPolicy(ProcessDEPPolicy, &dep, sizeof dep) && GetLastError() == ERROR_NOT_SUPPORTED);
+    // every policy, every flag on: refused, and still off afterwards
+    for (int p = 0; p < MaxProcessMitigationPolicy; p++) {
+        if (p == ProcessMitigationOptionsMask) continue;
+        BYTE all[8] = { 0xff, 0xff, 0xff, 0xff }, got[8];
+        SIZE_T size = p == ProcessDEPPolicy ? sizeof(PROCESS_MITIGATION_DEP_POLICY) : sizeof(DWORD);
+        SetLastError(0);
+        CHECK(!SetProcessMitigationPolicy((PROCESS_MITIGATION_POLICY)p, all, size) && GetLastError() == ERROR_NOT_SUPPORTED);
+        memset(got, 0xaa, sizeof got);
+        CHECK(GetProcessMitigationPolicy(GetCurrentProcess(), (PROCESS_MITIGATION_POLICY)p, got, size) && !memcmp(got, "\0\0\0\0\0\0\0\0", size));
+    }
+    // everything off: nothing to do
+    PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dynamic_off = { 0 };
+    PROCESS_MITIGATION_DEP_POLICY dep_off = { 0 };
+    CHECK(SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &dynamic_off, sizeof dynamic_off));
+    CHECK(SetProcessMitigationPolicy(ProcessDEPPolicy, &dep_off, sizeof dep_off));
+    // malformed requests
+    ULONG64 mask[2] = { 0 };
+    SetLastError(0); CHECK(!SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &dynamic, sizeof dynamic + 4) && GetLastError() == ERROR_INVALID_PARAMETER);
+    SetLastError(0); CHECK(!SetProcessMitigationPolicy(ProcessDEPPolicy, &dep, sizeof(DWORD)) && GetLastError() == ERROR_INVALID_PARAMETER);
+    SetLastError(0); CHECK(!SetProcessMitigationPolicy(ProcessDynamicCodePolicy, NULL, sizeof dynamic) && GetLastError() == ERROR_INVALID_PARAMETER);
+    SetLastError(0); CHECK(!SetProcessMitigationPolicy(ProcessMitigationOptionsMask, mask, sizeof mask) && GetLastError() == ERROR_INVALID_PARAMETER);
+    group("mitigation policies", before);
+}
+
 int main(void) {
     kernel32 = GetModuleHandleA("kernel32.dll");
     ntdll = GetModuleHandleA("ntdll.dll");
@@ -538,6 +585,7 @@ int main(void) {
     test_ntdll();
     test_dll_directories();
     test_computer_names();
+    test_mitigations();
     printf("kernelx: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }

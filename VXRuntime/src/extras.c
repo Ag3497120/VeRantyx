@@ -556,17 +556,61 @@ static const vx_export wldap32_ed[] = { { "#27", (void *)ldap_unavailable }, { "
                                         { "#60", (void *)ldap_unavailable }, { "#79", (void *)ldap_unavailable }, { "#143", (void *)ldap_unavailable }, { "#200", (void *)ldap_unavailable },
                                         { "#211", (void *)ldap_unavailable }, { "#301", (void *)ldap_unavailable } };
 static const vx_export ws2_32_proto[] = { { "getprotobyname", (void *)ws_getprotobyname }, { "#53", (void *)ws_getprotobyname } };
-// process mitigation policies (looked up with GetProcAddress and called without a check): nothing is enabled
+// Process mitigation policies (PROCESS_MITIGATION_POLICY; looked up with GetProcAddress). This runtime enforces none of
+// them (DEP, ASLR, dynamic code, strict handle checks, system calls, extension points, CFG, signatures, fonts, image
+// loads, payload, child processes, side channels, shadow stacks, redirection trust, pointer authentication, SEHOP), so
+// GetProcessMitigationPolicy reports each one off and SetProcessMitigationPolicy refuses to turn one on, with
+// ERROR_NOT_SUPPORTED, rather than report it applied: Chromium's sandbox sets several of them, and none of it is in
+// force here (README.md, Known risks). A request that turns everything off asks for what is already so, and succeeds.
+enum { MITIGATION_DEP = 0, MITIGATION_OPTIONS_MASK = 5 };   // ProcessDEPPolicy, ProcessMitigationOptionsMask
 static WINAPI BOOL GetProcessMitigationPolicy(HANDLE process, int policy, void *buffer, size_t length) {
     (void)process; (void)policy;
     if (buffer && length) memset(buffer, 0, length);
     return 1;
 }
-static WINAPI BOOL SetProcessMitigationPolicy(int policy, void *buffer, size_t length) { (void)policy; (void)buffer; (void)length; return 1; }
-// looked up by name at start-up and called unchecked: thread information classes are accepted (ThreadHideFromDebugger
-// included: there is no debugger to hide from), the newer allocation and temp-path entry points forward to the older
-// ones (DLL directories: kernelx.c)
-static WINAPI int32_t NtSetInformationThread(HANDLE thread, int class_, const void *information, DWORD length) { (void)thread; (void)class_; (void)information; (void)length; return 0; }
+static WINAPI BOOL SetProcessMitigationPolicy(int policy, void *buffer, size_t length) {
+    // PROCESS_MITIGATION_DEP_POLICY is its flags and the BOOLEAN Permanent (8 bytes); every other policy is its flags
+    // (a DWORD). ProcessMitigationOptionsMask only reports which options exist: it is not a policy to set.
+    size_t need = policy == MITIGATION_DEP ? 8 : 4;
+    if (policy < 0 || policy == MITIGATION_OPTIONS_MASK || !buffer || length != need) { vx_set_last_error(87); return 0; }   // ERROR_INVALID_PARAMETER
+    DWORD flags;
+    memcpy(&flags, buffer, sizeof flags);
+    if (!flags) return 1;
+    static uint64_t logged;                                                       // (policies refused so far, one bit each)
+    uint64_t bit = 1ull << (policy < 63 ? policy : 63);
+    if (!(__atomic_fetch_or(&logged, bit, __ATOMIC_RELAXED) & bit))
+        vx_log("SetProcessMitigationPolicy: policy %d (flags 0x%x) asks for a mitigation this runtime does not enforce: refused "
+               "(ERROR_NOT_SUPPORTED)", policy, (unsigned)flags);
+    vx_set_last_error(50);                                                        // ERROR_NOT_SUPPORTED
+    return 0;
+}
+// NtSetInformationThread (looked up by name at start-up). ThreadImpersonationToken (5) is SetThreadToken for the thread
+// the handle names (security.c's token model: OpenThreadToken sees the token afterwards; NULL reverts to the process
+// token). ThreadHideFromDebugger (0x11) has nothing to do: no debugger attaches to a vxrt process (DebugActiveProcess is
+// refused, client.c). Any other class is not carried out here and is refused with STATUS_NOT_SUPPORTED (logged once
+// per class) rather than reported done. Like every Nt call, it leaves the thread's last error as it was.
+static WINAPI int32_t NtSetInformationThread(HANDLE thread, int class_, const void *information, DWORD length) {
+    if (class_ == 5) {                                                            // ThreadImpersonationToken: a HANDLE
+        if (length != sizeof(HANDLE)) return (int32_t)0xc0000004;                 // STATUS_INFO_LENGTH_MISMATCH
+        if (!information) return (int32_t)0xc0000005;                             // STATUS_ACCESS_VIOLATION
+        BOOL (WINAPI *set_thread_token)(HANDLE *, HANDLE) = (BOOL (WINAPI *)(HANDLE *, HANDLE))vx_find_export("advapi32.dll", "SetThreadToken");
+        if (!set_thread_token) return (int32_t)0xc00000bb;                        // STATUS_NOT_SUPPORTED
+        HANDLE token;
+        memcpy(&token, information, sizeof token);
+        DWORD saved = vx_get_last_error();
+        DWORD error = set_thread_token(&thread, token) ? 0 : vx_get_last_error();
+        vx_set_last_error(saved);
+        return (int32_t)vx_win32_to_ntstatus(error);                              // (ERROR_BAD_TOKEN_TYPE: STATUS_BAD_TOKEN_TYPE)
+    }
+    if (class_ == 0x11) return length ? (int32_t)0xc0000004 : 0;                  // ThreadHideFromDebugger: no data
+    static uint64_t logged;                                                       // (classes refused so far, one bit each)
+    uint64_t bit = 1ull << (class_ >= 0 && class_ < 63 ? class_ : 63);
+    if (!(__atomic_fetch_or(&logged, bit, __ATOMIC_RELAXED) & bit))
+        vx_log("NtSetInformationThread: information class %d is not carried out here: refused (STATUS_NOT_SUPPORTED)", class_);
+    return (int32_t)0xc00000bb;                                                   // STATUS_NOT_SUPPORTED
+}
+// looked up by name at start-up and called unchecked: the newer allocation and temp-path entry points forward to the
+// older ones (DLL directories: kernelx.c)
 static WINAPI DWORD GetTempPath2W(DWORD length, WCHAR *buffer) {
     DWORD (WINAPI *temp_path)(DWORD, WCHAR *) = (DWORD (WINAPI *)(DWORD, WCHAR *))vx_find_export("kernel32.dll", "GetTempPathW");
     return temp_path ? temp_path(length, buffer) : 0;

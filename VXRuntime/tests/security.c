@@ -1,8 +1,8 @@
 // advapi32's security objects (src/security.c): SIDs and their strings, ACLs and ACE walking, security descriptors in
-// both layouts and their conversions, SDDL round trips, tokens (restricted, duplicated, impersonating), privileges,
-// AccessCheck, CheckTokenMembership, object and named security, SetEntriesInAcl, and the errors each sets. Made-up
-// data only (the domain S-1-5-21-111-222-333 below is no machine's); the files are the test's own, and the Mac's root
-// folder is only read (and a change to it refused, as it is root's).
+// both layouts and their conversions, SDDL round trips, tokens (restricted, duplicated, impersonating, also through
+// NtSetInformationThread of src/extras.c), privileges, AccessCheck, CheckTokenMembership, object and named security,
+// SetEntriesInAcl, and the errors each sets. Made-up data only (the domain S-1-5-21-111-222-333 below is no machine's);
+// the files are the test's own, and the Mac's root folder is only read (and a change to it refused, as it is root's).
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
@@ -82,6 +82,9 @@ static DWORD check(HANDLE token, const WCHAR *text, DWORD desired, DWORD *err) {
     if (!ok) return 0xffffffff;
     return status ? granted : (granted == 0 ? 0 : 0xbad);
 }
+
+typedef LONG (NTAPI *nt_set_thread_fn)(HANDLE, int, const void *, ULONG);
+static nt_set_thread_fn nt_set_thread;                    // ntdll's NtSetInformationThread (looked up)
 
 static HANDLE g_ready, g_go, g_done;
 static int g_thread_had_token, g_thread_token_before;
@@ -517,6 +520,37 @@ int main(int argc, char **argv) {
     CHECK(ImpersonateLoggedOnUser(tok) && OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &x) &&
           GetTokenInformation(x, TokenImpersonationLevel, &level, sizeof level, &n) && level == SecurityImpersonation);
     CloseHandle(x); RevertToSelf();
+    // NtSetInformationThread(ThreadImpersonationToken) is SetThreadToken by another name: the token is in force
+    // afterwards (OpenThreadToken and the effective token see it), a primary token is refused and changes nothing, NULL
+    // reverts, and the data is exactly one handle. ThreadHideFromDebugger takes no data. A class the runtime does not
+    // carry out is refused (STATUS_NOT_SUPPORTED), never reported done. No Nt call touches the last error.
+    nt_set_thread = (nt_set_thread_fn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationThread");
+    CHECK(nt_set_thread != NULL);
+    if (nt_set_thread) {
+        HANDLE none = NULL, bogus = (HANDLE)(intptr_t)0x1234;
+        LONG priority = THREAD_PRIORITY_LOWEST;
+        DWORD one = 1;
+        SetLastError(4321);
+        CHECK(nt_set_thread(GetCurrentThread(), 5 /* ThreadImpersonationToken */, &imp, sizeof imp) == 0 && GetLastError() == 4321);
+        CHECK(OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &x) && integrity_of(x) == SECURITY_MANDATORY_LOW_RID);
+        CloseHandle(x);
+        CHECK(integrity_of(GetCurrentThreadEffectiveToken()) == SECURITY_MANDATORY_LOW_RID);
+        SetLastError(4321);
+        CHECK(nt_set_thread(GetCurrentThread(), 5, &tok, sizeof tok) == (LONG)0xC00000A8 && GetLastError() == 4321);   // STATUS_BAD_TOKEN_TYPE
+        CHECK(OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &x) && integrity_of(x) == SECURITY_MANDATORY_LOW_RID);
+        CloseHandle(x);
+        CHECK(nt_set_thread(GetCurrentThread(), 5, &none, sizeof none) == 0);
+        CHECK(!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &x) && GetLastError() == ERROR_NO_TOKEN);
+        SetLastError(4321);
+        CHECK(nt_set_thread(GetCurrentThread(), 5, &imp, sizeof(DWORD)) == (LONG)0xC0000004);   // STATUS_INFO_LENGTH_MISMATCH
+        CHECK(nt_set_thread(GetCurrentThread(), 5, NULL, sizeof imp) == (LONG)0xC0000005);      // STATUS_ACCESS_VIOLATION
+        CHECK(nt_set_thread(bogus, 5, &imp, sizeof imp) == (LONG)0xC0000008 && GetLastError() == 4321);   // STATUS_INVALID_HANDLE
+        CHECK(!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &x) && GetLastError() == ERROR_NO_TOKEN);   // none applied
+        CHECK(nt_set_thread(GetCurrentThread(), 0x11 /* ThreadHideFromDebugger */, NULL, 0) == 0);
+        CHECK(nt_set_thread(GetCurrentThread(), 0x11, &one, sizeof one) == (LONG)0xC0000004);
+        CHECK(nt_set_thread(GetCurrentThread(), 2 /* ThreadPriority */, &priority, sizeof priority) == (LONG)0xC00000BB);
+        CHECK(nt_set_thread(GetCurrentThread(), 1000, &priority, sizeof priority) == (LONG)0xC00000BB);
+    }
     // the anonymous logon is not in Everyone unless "Let Everyone permissions apply to anonymous users" is on (off by
     // default; the test's own registry, the value removed again)
     HKEY lsa = NULL;
@@ -883,6 +917,7 @@ int main(int argc, char **argv) {
     CHECK(!SetThreadToken(&pi.hThread, NULL) && GetLastError() == ERROR_NOT_SUPPORTED);
     CHECK(!OpenThreadToken(pi.hThread, TOKEN_QUERY, TRUE, &x) && GetLastError() == ERROR_NOT_SUPPORTED);
     CHECK(!ImpersonateAnonymousToken(pi.hThread) && GetLastError() == ERROR_NOT_SUPPORTED);
+    CHECK(nt_set_thread && nt_set_thread(pi.hThread, 5 /* ThreadImpersonationToken */, &imp, sizeof imp) == (LONG)0xC00000BB);   // STATUS_NOT_SUPPORTED
     ResumeThread(pi.hThread);
     CHECK(WaitForSingleObject(pi.hProcess, 30000) == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &code) && code == 42);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
