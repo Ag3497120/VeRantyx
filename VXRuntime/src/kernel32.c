@@ -420,33 +420,77 @@ static WINAPI BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX *m) {
     return 1;
 }
 
-// Computer and user names come from the Mac.
-static int name_out_a(const char *name, char *buf, DWORD *size, int count_nul_on_success) {
+// Computer and user names come from the Mac. `too_small` is the error for a buffer that is too small (the size
+// needed, with the terminator, back in *size).
+static int name_out_a(const char *name, char *buf, DWORD *size, int count_nul_on_success, DWORD too_small) {
     DWORD n = (DWORD)strlen(name);
-    if (!buf || *size <= n) { *size = n + 1; vx_set_last_error(234 /* ERROR_MORE_DATA */); return 0; }
+    if (!buf || *size <= n) { *size = n + 1; vx_set_last_error(too_small); return 0; }
     memcpy(buf, name, n + 1);
     *size = count_nul_on_success ? n + 1 : n;
     return 1;
 }
-static int name_out_w(const char *name, WCHAR *buf, DWORD *size, int count_nul_on_success) {
+static int name_out_w(const char *name, WCHAR *buf, DWORD *size, int count_nul_on_success, DWORD too_small) {
     DWORD n = (DWORD)vx_utf8_to_utf16(name, strlen(name), NULL, 0);
-    if (!buf || *size <= n) { *size = n + 1; vx_set_last_error(234); return 0; }
+    if (!buf || *size <= n) { *size = n + 1; vx_set_last_error(too_small); return 0; }
     vx_utf8_to_utf16(name, strlen(name), buf, n); buf[n] = 0;
     *size = count_nul_on_success ? n + 1 : n;
     return 1;
 }
-static const char *computer_name(void) {
-    static char host[256];
-    if (!host[0]) { gethostname(host, sizeof host); char *dot = strchr(host, '.'); if (dot) *dot = 0; for (char *c = host; *c; c++) *c = (char)toupper((unsigned char)*c); }
-    return host;
+// The computer's names, from the Mac's host name: the DNS host name is its first label, as macOS has it; the DNS
+// domain the rest, but for mDNS's "local" (a link-local name, no domain assigned to the computer: none, as on a
+// Windows computer without a primary DNS suffix). The NetBIOS name follows the DNS host name the way Windows documents
+// (Computer Names, DnsHostnameToComputerName): at most MAX_COMPUTERNAME_LENGTH (15) bytes of it, in upper case. A
+// longer host name gives a truncated NetBIOS name (GetComputerName); the DNS forms of GetComputerNameEx keep it whole.
+#define MAX_COMPUTERNAME_LENGTH 15
+static char g_dns_host[256], g_dns_domain[256], g_netbios[MAX_COMPUTERNAME_LENGTH + 1];
+static pthread_once_t g_names_once = PTHREAD_ONCE_INIT;
+static void computer_names(void) {
+    char host[256] = "";
+    if (gethostname(host, sizeof host - 1)) host[0] = 0;
+    char *dot = strchr(host, '.');
+    if (dot) {
+        *dot = 0;
+        if (strcasecmp(dot + 1, "local")) snprintf(g_dns_domain, sizeof g_dns_domain, "%s", dot + 1);
+    }
+    snprintf(g_dns_host, sizeof g_dns_host, "%s", host);
+    size_t n = strlen(host);
+    if (n > MAX_COMPUTERNAME_LENGTH) {
+        n = MAX_COMPUTERNAME_LENGTH;
+        while (n && ((unsigned char)host[n] & 0xc0) == 0x80) n--;   // (not inside a character)
+    }
+    for (size_t i = 0; i < n; i++) g_netbios[i] = (char)toupper((unsigned char)host[i]);
+    g_netbios[n] = 0;
 }
-static WINAPI BOOL GetComputerNameA(char *buf, DWORD *size) { return name_out_a(computer_name(), buf, size, 0); }
-static WINAPI BOOL GetComputerNameW(WCHAR *buf, DWORD *size) { return name_out_w(computer_name(), buf, size, 0); }
-static WINAPI BOOL GetComputerNameExA(int fmt, char *buf, DWORD *size) { (void)fmt; return name_out_a(computer_name(), buf, size, 0); }
-static WINAPI BOOL GetComputerNameExW(int fmt, WCHAR *buf, DWORD *size) { (void)fmt; return name_out_w(computer_name(), buf, size, 0); }
+static const char *computer_name(void) { pthread_once(&g_names_once, computer_names); return g_netbios; }
+// COMPUTER_NAME_FORMAT: NetBIOS, DNS host name, DNS domain, fully qualified, then the same four "physical" ones (no
+// cluster here: the same names); NULL for anything else.
+static const char *computer_name_ex(int fmt, char *full, size_t cap) {
+    pthread_once(&g_names_once, computer_names);
+    switch (fmt) {
+    case 0: case 4: return g_netbios;
+    case 1: case 5: return g_dns_host;
+    case 2: case 6: return g_dns_domain;
+    case 3: case 7: snprintf(full, cap, "%s%s%s", g_dns_host, g_dns_domain[0] ? "." : "", g_dns_domain); return full;
+    }
+    return NULL;
+}
+static WINAPI BOOL GetComputerNameA(char *buf, DWORD *size) { return name_out_a(computer_name(), buf, size, 0, 111 /* ERROR_BUFFER_OVERFLOW */); }
+static WINAPI BOOL GetComputerNameW(WCHAR *buf, DWORD *size) { return name_out_w(computer_name(), buf, size, 0, 111); }
+static WINAPI BOOL GetComputerNameExA(int fmt, char *buf, DWORD *size) {
+    char full[520];
+    const char *name = computer_name_ex(fmt, full, sizeof full);
+    if (!name || !size) { vx_set_last_error(87); return 0; }
+    return name_out_a(name, buf, size, 0, 234 /* ERROR_MORE_DATA */);
+}
+static WINAPI BOOL GetComputerNameExW(int fmt, WCHAR *buf, DWORD *size) {
+    char full[520];
+    const char *name = computer_name_ex(fmt, full, sizeof full);
+    if (!name || !size) { vx_set_last_error(87); return 0; }
+    return name_out_w(name, buf, size, 0, 234);
+}
 static const char *user_name(void) { const char *u = getenv("USER"); return u && *u ? u : "vxrt"; }
-static WINAPI BOOL GetUserNameA(char *buf, DWORD *size) { return name_out_a(user_name(), buf, size, 1); }
-static WINAPI BOOL GetUserNameW(WCHAR *buf, DWORD *size) { return name_out_w(user_name(), buf, size, 1); }
+static WINAPI BOOL GetUserNameA(char *buf, DWORD *size) { return name_out_a(user_name(), buf, size, 1, 234); }
+static WINAPI BOOL GetUserNameW(WCHAR *buf, DWORD *size) { return name_out_w(user_name(), buf, size, 1, 234); }
 
 // ---- time conversions -------------------------------------------------------------------------------------------------
 static uint64_t filetime_of(const DWORD *ft) { return (uint64_t)ft[1] << 32 | ft[0]; }
@@ -475,13 +519,6 @@ static WINAPI BOOL FileTimeToLocalFileTime(const DWORD *in, DWORD *out) {
     t += (uint64_t)((int64_t)tm.tm_gmtoff * 10000000ll);
     out[0] = (DWORD)t; out[1] = (DWORD)(t >> 32);
     return 1;
-}
-static WINAPI BOOL SystemTimeToTzSpecificLocalTime(const void *tz, const uint16_t *utc, uint16_t *local) {
-    (void)tz;
-    DWORD ft[2];
-    SystemTimeToFileTime(utc, ft);
-    uint64_t t = filetime_of(ft);
-    return systemtime_from_unix((int64_t)(t / 10000000ull) - 11644473600ll, utc[7], local, 1);
 }
 // TIME_ZONE_INFORMATION: bias, standard name/date/bias, daylight name/date/bias. No transition rules yet.
 typedef struct { LONG bias; WCHAR std_name[32]; uint16_t std_date[8]; LONG std_bias; WCHAR dst_name[32]; uint16_t dst_date[8]; LONG dst_bias; } TIME_ZONE_INFORMATION;
@@ -983,7 +1020,7 @@ static const vx_export k32[] = {
     VX_EXPORT(RtlCaptureStackBackTrace), VX_EXPORT(CreateProcessA), VX_EXPORT(CreateProcessW), VX_EXPORT(WinExec),
     VX_EXPORT(GlobalMemoryStatusEx), VX_EXPORT(GetComputerNameA), VX_EXPORT(GetComputerNameW), VX_EXPORT(GetComputerNameExA),
     VX_EXPORT(GetComputerNameExW), VX_EXPORT(FileTimeToSystemTime), VX_EXPORT(SystemTimeToFileTime), VX_EXPORT(FileTimeToLocalFileTime),
-    VX_EXPORT(SystemTimeToTzSpecificLocalTime), VX_EXPORT(GetTimeZoneInformation),
+    VX_EXPORT(GetTimeZoneInformation),                                     // (SystemTimeToTzSpecificLocalTime: kernelx.c)
     VX_EXPORT(VerSetConditionMask), VX_EXPORT(VerifyVersionInfoA), VX_EXPORT(VerifyVersionInfoW),
     VX_EXPORT(GetConsoleScreenBufferInfo), VX_EXPORT(SetConsoleTextAttribute), VX_EXPORT(SetConsoleTitleA), VX_EXPORT(SetConsoleTitleW),
     VX_EXPORT(GetConsoleWindow), VX_EXPORT(AllocConsole), VX_EXPORT(FreeConsole), VX_EXPORT(SetConsoleCtrlHandler), VX_EXPORT(GetConsoleCP),

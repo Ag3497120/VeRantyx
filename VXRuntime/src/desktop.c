@@ -1,6 +1,6 @@
 // The rest of the Win32 surface games link against (SDL, engines' platform layers, crash reporters) and mostly
-// can do without: window properties, clipboard, dialogs, icons, device notifications, gamma ramps, job objects,
-// pipes, power status, version resources, device enumeration (setupapi), the multimedia wave API (no devices:
+// can do without: window properties, clipboard, dialogs, icons, device notifications, gamma ramps (job objects are
+// jobs.c's), pipes, power status, version resources, device enumeration (setupapi), the multimedia wave API (no devices:
 // programs fall back to WASAPI or XAudio2), WinINet (no connections), IME. Each does what it can honestly do
 // here, or fails the way Windows does when the thing is absent.
 #include "vx.h"
@@ -209,13 +209,6 @@ static WINAPI BOOL CreatePipe(HANDLE *rd, HANDLE *wr, void *sa, DWORD size) {
     *rd = (HANDLE)(intptr_t)(0x10000 + fds[0]); *wr = (HANDLE)(intptr_t)(0x10000 + fds[1]);
     return 1;
 }
-// Job objects: accepted (there are no child processes to manage).
-static int g_job;
-static WINAPI HANDLE CreateJobObjectA(void *sa, const char *name) { (void)sa; (void)name; return &g_job; }
-static WINAPI HANDLE CreateJobObjectW(void *sa, const WCHAR *name) { (void)sa; (void)name; return &g_job; }
-static WINAPI BOOL AssignProcessToJobObject(HANDLE job, HANDLE p) { (void)job; (void)p; return 1; }
-static WINAPI BOOL SetInformationJobObject(HANDLE job, int cls, void *info, DWORD n) { (void)job; (void)cls; (void)info; (void)n; return 1; }
-static WINAPI BOOL QueryInformationJobObject(HANDLE job, int cls, void *info, DWORD n, DWORD *ret) { (void)job; (void)cls; memset(info, 0, n); if (ret) *ret = n; return 1; }
 // Debugging other processes: not possible here.
 static WINAPI BOOL WaitForDebugEvent(void *ev, DWORD ms) { (void)ev; (void)ms; vx_set_last_error(121); return 0; }
 static WINAPI BOOL ContinueDebugEvent(DWORD pid, DWORD tid, DWORD status) { (void)pid; (void)tid; (void)status; vx_set_last_error(87); return 0; }
@@ -481,8 +474,7 @@ static const vx_export k32[] = {
     VX_EXPORT(GlobalUnlock), VX_EXPORT(GlobalSize), VX_EXPORT(SetThreadExecutionState), VX_EXPORT(GetSystemPowerStatus),
     VX_EXPORT(GetProcessPriorityBoost), VX_EXPORT(SetProcessPriorityBoost), VX_EXPORT(DosDateTimeToFileTime), VX_EXPORT(SetFileTime),
     VX_EXPORT(ReadProcessMemory), VX_EXPORT(VirtualQueryEx), VX_EXPORT(FreeLibraryAndExitThread), VX_EXPORT(DelayLoadFailureHook),
-    VX_EXPORT(CreatePipe), VX_EXPORT(CreateJobObjectA), VX_EXPORT(CreateJobObjectW), VX_EXPORT(AssignProcessToJobObject),
-    VX_EXPORT(SetInformationJobObject), VX_EXPORT(QueryInformationJobObject), VX_EXPORT(WaitForDebugEvent), VX_EXPORT(ContinueDebugEvent),
+    VX_EXPORT(CreatePipe), VX_EXPORT(WaitForDebugEvent), VX_EXPORT(ContinueDebugEvent),
     VX_EXPORT(AttachConsole), VX_EXPORT(FillConsoleOutputAttribute), VX_EXPORT(FillConsoleOutputCharacterA),
     VX_EXPORT(WriteConsoleOutputCharacterA), VX_EXPORT(GetConsoleScreenBufferInfoEx), VX_EXPORT(SetConsoleScreenBufferInfoEx),
     VX_EXPORT(GetNumberOfConsoleInputEvents), VX_EXPORT(ReadConsoleInputA),

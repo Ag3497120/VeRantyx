@@ -1169,6 +1169,8 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/winsock_nsp.exe
 	$(VXRT) build/midi.exe
 	$(VXRT) build/crypt32.exe
+	$(VXRT) build/crypt32.exe nomem
+	for k in 2 3 5 7 11 13 23 47 97; do VXRT_TEST_CRYPT32_NOMEM=$$k $(VXRT) build/crypt32.exe nomem || exit 1; done
 	$(VXRT) build/crypt32.exe protect build/dpapi_blob.bin && $(VXRT) build/crypt32.exe unprotect build/dpapi_blob.bin
 	test "$$(stat -f %Lp build/root/dpapi)" = 700 && test "$$(stat -f %Lp build/root/dpapi/user.key)" = 600
 	tmutil isexcluded build/root/dpapi | grep -q '^\[Excluded\]'

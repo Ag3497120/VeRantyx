@@ -22,9 +22,10 @@
 #define RPC_S_SERVER_UNAVAILABLE                1722
 
 // What an authenticated user may ask of the manager: SC_MANAGER_CONNECT, SC_MANAGER_ENUMERATE_SERVICE,
-// SC_MANAGER_QUERY_LOCK_STATUS, READ_CONTROL (STANDARD_RIGHTS_READ), and GENERIC_READ / GENERIC_EXECUTE, which map
-// onto them. MAXIMUM_ALLOWED gives those.
-#define SCM_ALLOWED (0x0001u | 0x0004u | 0x0010u | 0x00020000u | 0x80000000u | 0x20000000u | 0x02000000u)
+// SC_MANAGER_QUERY_LOCK_STATUS, READ_CONTROL (STANDARD_RIGHTS_READ), and GENERIC_READ, which maps onto them.
+// MAXIMUM_ALLOWED gives those. Not GENERIC_EXECUTE: it maps to SC_MANAGER_CONNECT and SC_MANAGER_LOCK, and locking
+// the database is not an authenticated user's right (ERROR_ACCESS_DENIED, as for SC_MANAGER_LOCK itself).
+#define SCM_ALLOWED (0x0001u | 0x0004u | 0x0010u | 0x00020000u | 0x80000000u | 0x02000000u)
 
 typedef struct { DWORD access; } scm;
 static scm *manager(HANDLE h) { return vx_handle_data(h, VX_HANDLE_SC_MANAGER); }

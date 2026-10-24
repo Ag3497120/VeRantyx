@@ -743,7 +743,146 @@ static void test_wintrust(void) {
     CHECK(!WTHelperGetProvSignerFromChain(NULL, 0, FALSE, 0) && !WTHelperGetProvCertFromChain(NULL, 0), "no signer");
 }
 
+// ---- out of memory ----------------------------------------------------------------------------------------------------
+// crypt32.exe nomem, run with VXRT_TEST_CRYPT32_NOMEM=k: every k-th allocation of the runtime's crypt32 fails. Each
+// call must then give its usual answer or fail with ERROR_NOT_ENOUGH_MEMORY (CertGetNameString: the empty string), and
+// a check that ran short of memory never answers "trusted": a name over SSL that is not the certificate's, a chain to
+// a root macOS does not trust or to a root other than the engine's own, a changed signature.
+static int ooms, oom_kinds;
+static struct { const char *what; int answered, short_of_memory; } oom_tally[24];
+static void tally(const char *what, int answered) {
+    int i = 0;
+    while (i < oom_kinds && strcmp(oom_tally[i].what, what)) i++;
+    if (i == oom_kinds && oom_kinds < 24) oom_tally[oom_kinds++].what = what;
+    if (i < 24) { if (answered) oom_tally[i].answered++; else oom_tally[i].short_of_memory++; }
+}
+static int ok_or_oom(int ok, DWORD error, const char *what) {      // error: GetLastError() right after the call
+    tally(what, ok || error != ERROR_NOT_ENOUGH_MEMORY);
+    if (ok) return 1;
+    if (error == ERROR_NOT_ENOUGH_MEMORY) { ooms++; return 0; }
+    CHECK(0, "%s: neither its answer nor ERROR_NOT_ENOUGH_MEMORY (0x%lx)", what, error);
+    return 0;
+}
+static void name_or_empty(const void *ctx, int ansi, const char *what) {
+    WCHAR w[64] = { 0 }; char a[64] = { 0 };
+    SetLastError(0);
+    DWORD n = ansi ? CertGetNameStringA(ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, a, 64) : CertGetNameStringW(ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, w, 64);
+    DWORD e = GetLastError();
+    int right = n == 15 && (ansi ? !strcmp(a, "leaf.vxrt.test") : !wcscmp(w, L"leaf.vxrt.test"));
+    if (!right && n == 1 && !(ansi ? a[0] : w[0])) ok_or_oom(0, e, what);
+    else { tally(what, 1); CHECK(right, "%s: %lu", what, n); }
+}
+static int nomem(void) {
+    FILETIME in_2022 = to_ft(0x1d8754a895c8000ull);
+    CERT_CONTEXT made_leaf = { X509_ASN_ENCODING, (BYTE *)cert_leaf, sizeof cert_leaf, NULL, NULL };   // not crypt32's own
+    CERT_CONTEXT made_root = { X509_ASN_ENCODING, (BYTE *)cert_root, sizeof cert_root, NULL, NULL };
+    BYTE changed[sizeof cert_leaf];
+    memcpy(changed, cert_leaf, sizeof changed);
+    changed[sizeof changed - 1] ^= 0x01;
+    for (int round = 0; round < 40; round++) {
+        for (int i = 0; i < round % 13; i++) {                      // (a different number of allocations before each
+            HCERTSTORE shift = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, 0, NULL);   //  round: the failures fall on
+            if (shift) CertCloseStore(shift, 0);                                       //  different calls)
+        }
+        PCCERT_CONTEXT c = CertCreateCertificateContext(X509_ASN_ENCODING, cert_leaf, sizeof cert_leaf);
+        DWORD e = GetLastError();
+        if (ok_or_oom(c && c->cbCertEncoded == sizeof cert_leaf, e, "CertCreateCertificateContext")) {
+            name_or_empty(c, 0, "CertGetNameStringW");
+            name_or_empty(c, 1, "CertGetNameStringA");
+        }
+        name_or_empty(&made_leaf, 0, "CertGetNameStringW, a context of the program's");
+        BYTE hash[20]; DWORD size = sizeof hash;
+        BOOL got = CertGetCertificateContextProperty(&made_leaf, CERT_SHA1_HASH_PROP_ID, hash, &size);
+        e = GetLastError();
+        ok_or_oom(got && size == 20 && !memcmp(hash, sha1_leaf, 20), e, "CertGetCertificateContextProperty");
+        CERT_BLOB subject = { sizeof cert_leaf, (BYTE *)cert_leaf }, bad = { sizeof changed, changed };
+        got = CryptVerifyCertificateSignatureEx(0, X509_ASN_ENCODING, CRYPT_VERIFY_CERT_SIGN_SUBJECT_BLOB, &subject,
+                                                CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT, (void *)&made_root, 0, NULL);
+        e = GetLastError();
+        ok_or_oom(got, e, "CryptVerifyCertificateSignatureEx");
+        CHECK(!CryptVerifyCertificateSignatureEx(0, X509_ASN_ENCODING, CRYPT_VERIFY_CERT_SIGN_SUBJECT_BLOB, &bad,
+                                                 CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT, (void *)&made_root, 0, NULL), "a changed signature verified");
+
+        // stores: a root added and found by the text of its name
+        HCERTSTORE s = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, 0, NULL);
+        e = GetLastError();
+        int added = 0;
+        if (ok_or_oom(s != NULL, e, "CertOpenStore")) {
+            got = CertAddEncodedCertificateToStore(s, X509_ASN_ENCODING, cert_root, sizeof cert_root, CERT_STORE_ADD_ALWAYS, NULL);
+            e = GetLastError();
+            added = ok_or_oom(got, e, "CertAddEncodedCertificateToStore");
+            PCCERT_CONTEXT found = CertFindCertificateInStore(s, X509_ASN_ENCODING, 0, CERT_FIND_SUBJECT_STR_A, "Test Root", NULL);
+            e = GetLastError();
+            if (added) ok_or_oom(found != NULL, e, "CertFindCertificateInStore");
+            else CHECK(!found, "found in a store it was not added to");
+            CertFreeCertificateContext(found);
+        }
+
+        // chains: through an engine whose only root is the test root, and through one whose only root is another
+        CERT_CHAIN_PARA para = { sizeof para };
+        PCCERT_CHAIN_CONTEXT chain = NULL;
+        if (c) {
+            got = CertGetCertificateChain(NULL, c, &in_2022, s, &para, CERT_CHAIN_DISABLE_AIA, NULL, &chain);
+            e = GetLastError();
+            if (ok_or_oom(got && chain, e, "CertGetCertificateChain (the Mac's roots)"))
+                CHECK(chain->TrustStatus.dwErrorStatus != 0, "a made-up root trusted as the Mac's");
+            CertFreeCertificateChain(chain);
+        }
+        CERT_CHAIN_ENGINE_CONFIG cfg = { sizeof cfg };
+        HCERTCHAINENGINE engine = NULL, other = NULL;
+        cfg.hExclusiveRoot = added ? s : NULL;
+        if (c && added) {
+            got = CertCreateCertificateChainEngine(&cfg, &engine);
+            e = GetLastError();
+            if (ok_or_oom(got && engine, e, "CertCreateCertificateChainEngine")) {
+                chain = NULL;
+                got = CertGetCertificateChain(engine, c, &in_2022, s, &para, CERT_CHAIN_DISABLE_AIA, NULL, &chain);
+                e = GetLastError();
+                for (int i = 0; got && chain && i < 6; i++) {             // (each a few allocations: a few times)
+                    CERT_CHAIN_POLICY_STATUS st = { sizeof st };
+                    SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl = { { sizeof ssl }, AUTHTYPE_SERVER, 0, (WCHAR *)L"evil.vxrt.test" };
+                    CERT_CHAIN_POLICY_PARA pp = { sizeof pp, 0, &ssl };
+                    BOOL checked = CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain, &pp, &st);
+                    e = GetLastError();
+                    if (ok_or_oom(checked, e, "CertVerifyCertificateChainPolicy")) CHECK(st.dwError != 0, "another name accepted over SSL");
+                    else CHECK(st.dwError != 0, "a policy not checked left as passed");
+                }
+                if (!got || !chain) ok_or_oom(0, e, "CertGetCertificateChain (the engine's root)");
+                else tally("CertGetCertificateChain (the engine's root)", 1);
+                CertFreeCertificateChain(chain);
+                CertFreeCertificateChainEngine(engine);
+            }
+        }
+        HCERTSTORE others = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, 0, NULL);
+        if (c && others && CertAddEncodedCertificateToStore(others, X509_ASN_ENCODING, cert_ec, sizeof cert_ec, CERT_STORE_ADD_ALWAYS, NULL)) {
+            cfg.hExclusiveRoot = others;
+            got = CertCreateCertificateChainEngine(&cfg, &other);
+            e = GetLastError();
+            if (ok_or_oom(got && other, e, "CertCreateCertificateChainEngine (another root)")) {
+                chain = NULL;
+                got = CertGetCertificateChain(other, c, &in_2022, s, &para, CERT_CHAIN_DISABLE_AIA, NULL, &chain);
+                e = GetLastError();
+                if (ok_or_oom(got && chain, e, "CertGetCertificateChain (another root)"))
+                    CHECK(chain->TrustStatus.dwErrorStatus != 0, "trusted through a root that is not the engine's");
+                CertFreeCertificateChain(chain);
+                CertFreeCertificateChainEngine(other);
+            }
+        }
+        if (others) CertCloseStore(others, CERT_CLOSE_STORE_FORCE_FLAG);
+        if (s) CertCloseStore(s, CERT_CLOSE_STORE_FORCE_FLAG);
+        CertFreeCertificateContext(c);
+    }
+    char every[16];
+    if (GetEnvironmentVariableA("VXRT_TEST_CRYPT32_NOMEM", every, sizeof every)) CHECK(ooms > 0, "no allocation failed");
+    printf("crypt32 nomem (every %s): %d calls ran out of memory, %s\n", GetEnvironmentVariableA("VXRT_TEST_CRYPT32_NOMEM", every, sizeof every) ? every : "-",
+           ooms, failures ? "FAILED" : "ok");
+    for (int i = 0; i < oom_kinds; i++)
+        printf("  %-50s answered %2d, out of memory %2d\n", oom_tally[i].what, oom_tally[i].answered, oom_tally[i].short_of_memory);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "nomem")) return nomem();
     if (argc == 3) return across_processes(argv[1], argv[2]);
     root = CertCreateCertificateContext(X509_ASN_ENCODING, cert_root, sizeof cert_root);
     leaf = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, cert_leaf, sizeof cert_leaf);

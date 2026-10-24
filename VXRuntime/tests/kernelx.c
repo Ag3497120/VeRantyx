@@ -1,11 +1,14 @@
 // kernel32 and ntdll functions the Windows Steam client imports (src/kernelx.c): serial ports, memory notifications
-// and hints, threads started "remotely", thread and process information, locales, volumes and DOS devices, time zones,
-// Windows Error Reporting, NtQueryObject, NtWriteFile, NTSTATUS codes, DLL directories. Made-up data only.
+// and hints (DiscardVirtualMemory on private memory only), threads started "remotely", thread and process information
+// (background processing mode), locales, volumes and DOS devices, time zones, Windows Error Reporting, NtQueryObject,
+// NtWriteFile, NTSTATUS codes, DLL directories, the computer's names (kernel32.c) and process mitigation policies
+// (extras.c). Made-up data only.
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+#include <wctype.h>
 static int failures;
 #define CHECK(c) do { if (!(c)) { printf("check failed (line %d): %s\n", __LINE__, #c); failures++; } } while (0)
 static HMODULE kernel32, ntdll;
@@ -72,6 +75,36 @@ static void test_memory(void) {
     CHECK(DiscardVirtualMemory(ro, 4096) != ERROR_SUCCESS);                       // only read-write pages
     p[0] = 1; p[65535] = 2;
     CHECK(p[0] == 1 && p[65535] == 2);                                            // still committed
+    // Views of file mappings are not private memory: refused, and their contents stay (another process may share
+    // them; a file's pages are the file's)
+    HANDLE shared = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 65536, NULL);
+    BYTE *view = shared ? MapViewOfFile(shared, FILE_MAP_ALL_ACCESS, 0, 0, 65536) : NULL;
+    CHECK(view != NULL);
+    if (view) {
+        memset(view, 0x6b, 65536);
+        CHECK(DiscardVirtualMemory(view, 65536) == ERROR_INVALID_PARAMETER);
+        CHECK(DiscardVirtualMemory(view + 4096, 4096) == ERROR_INVALID_PARAMETER);
+        CHECK(view[0] == 0x6b && view[4096] == 0x6b && view[65535] == 0x6b);
+        CHECK(UnmapViewOfFile(view));
+    }
+    if (shared) CloseHandle(shared);
+    char backing[MAX_PATH];
+    snprintf(backing, sizeof backing, "%skx_view.bin", g_temp);
+    HANDLE file = CreateFileA(backing, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    HANDLE on_file = file != INVALID_HANDLE_VALUE ? CreateFileMappingA(file, NULL, PAGE_READWRITE, 0, 8192, NULL) : NULL;
+    BYTE *file_view = on_file ? MapViewOfFile(on_file, FILE_MAP_WRITE, 0, 0, 8192) : NULL;
+    CHECK(file_view != NULL);
+    if (file_view) {
+        memset(file_view, 0x3c, 8192);
+        CHECK(DiscardVirtualMemory(file_view, 8192) == ERROR_INVALID_PARAMETER);
+        CHECK(file_view[0] == 0x3c && file_view[8191] == 0x3c);
+        CHECK(UnmapViewOfFile(file_view));
+    }
+    if (on_file) CloseHandle(on_file);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    DeleteFileA(backing);
+    CHECK(DiscardVirtualMemory(p, 65536) == ERROR_SUCCESS);                       // (private memory still is)
+    p[0] = 1; p[65535] = 2;
     range_entry r = { p, 65536 };
     CHECK(PrefetchVirtualMemory(GetCurrentProcess(), 1, &r, 0));
     SetLastError(0); CHECK(!PrefetchVirtualMemory(GetCurrentProcess(), 1, &r, 1) && GetLastError() == ERROR_INVALID_PARAMETER);
@@ -133,6 +166,19 @@ static void test_threads(void) {
     throttling stray = { 1, 0, 1 }; SetLastError(0); CHECK(!SetThreadInformation(GetCurrentThread(), 3, &stray, sizeof stray) && GetLastError() == ERROR_INVALID_PARAMETER);
     LONG absolute = 0; SetLastError(0); CHECK(!SetThreadInformation(GetCurrentThread(), 1, &absolute, sizeof absolute) && GetLastError() == ERROR_INVALID_PARAMETER);
     SetLastError(0); CHECK(!SetThreadInformation(e, 0, &priority, sizeof priority) && GetLastError() == ERROR_INVALID_HANDLE);
+
+    // background processing mode is a mode of the calling thread, not a priority: GetThreadPriority keeps the priority
+    CHECK(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) && GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_ABOVE_NORMAL);
+    CHECK(SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN));
+    CHECK(GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_ABOVE_NORMAL);
+    SetLastError(0); CHECK(!SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) && GetLastError() == ERROR_THREAD_MODE_ALREADY_BACKGROUND);
+    CHECK(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) && GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_BELOW_NORMAL);
+    CHECK(SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) && GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_BELOW_NORMAL);
+    SetLastError(0); CHECK(!SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) && GetLastError() == ERROR_THREAD_MODE_NOT_BACKGROUND);
+    int other = GetThreadPriority(t);                                         // only the calling thread has the mode
+    SetLastError(0); CHECK(!SetThreadPriority(t, THREAD_MODE_BACKGROUND_BEGIN) && GetLastError() == ERROR_INVALID_PARAMETER);
+    CHECK(GetThreadPriority(t) == other && other != THREAD_MODE_BACKGROUND_BEGIN);
+    CHECK(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) && GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_NORMAL);
 
     BYTE context[1024] = { 0 };
     SetLastError(0); CHECK(!Wow64GetThreadContext(GetCurrentThread(), context) && GetLastError() == ERROR_INVALID_FUNCTION);   // no WOW64
@@ -440,6 +486,91 @@ static void test_dll_directories(void) {
     group("DLL directories", before);
 }
 
+// The computer's names (the Mac's host name, compared only with itself): the NetBIOS name is the DNS host name cut to
+// MAX_COMPUTERNAME_LENGTH and in upper case, the DNS forms are whole, and the buffer errors are the documented ones
+// (ERROR_BUFFER_OVERFLOW for GetComputerName, ERROR_MORE_DATA for GetComputerNameEx).
+static void test_computer_names(void) {
+    int before = failures;
+    WCHAR netbios[64], dns[300], domain[300], full[600], again[600];
+    DWORD n = 64, nd = 300, nm = 300, nf = 600, k;
+    CHECK(GetComputerNameW(netbios, &n) && n == wcslen(netbios) && n >= 1 && n <= MAX_COMPUTERNAME_LENGTH);
+    CHECK(GetComputerNameExW(ComputerNameDnsHostname, dns, &nd) && nd == wcslen(dns) && nd >= n);
+    CHECK(GetComputerNameExW(ComputerNameDnsDomain, domain, &nm) && nm == wcslen(domain));
+    CHECK(GetComputerNameExW(ComputerNameDnsFullyQualified, full, &nf) && nf == wcslen(full));
+    WCHAR want[600];
+    wcscpy(want, dns);
+    if (nm) { wcscat(want, L"."); wcscat(want, domain); }
+    CHECK(!wcscmp(full, want));
+    int same = 1;                                                             // (ASCII host names: what macOS allows)
+    for (DWORD i = 0; i < n; i++) same &= dns[i] < 0x80 && netbios[i] == (WCHAR)towupper(dns[i]);
+    CHECK(same && n == (nd > MAX_COMPUTERNAME_LENGTH ? MAX_COMPUTERNAME_LENGTH : nd));
+    printf("kernelx: (a DNS host name of %lu characters, NetBIOS name of %lu)\n", nd, n);
+    static const COMPUTER_NAME_FORMAT pairs[][2] = { { ComputerNameNetBIOS, ComputerNamePhysicalNetBIOS },
+        { ComputerNameDnsHostname, ComputerNamePhysicalDnsHostname }, { ComputerNameDnsDomain, ComputerNamePhysicalDnsDomain },
+        { ComputerNameDnsFullyQualified, ComputerNamePhysicalDnsFullyQualified } };
+    const WCHAR *expect[] = { netbios, dns, domain, full };
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 2; j++) { k = 600; CHECK(GetComputerNameExW(pairs[i][j], again, &k) && !wcscmp(again, expect[i]) && k == wcslen(again)); }
+    char a[64]; DWORD na = 64;
+    CHECK(GetComputerNameA(a, &na) && na == n);
+    for (DWORD i = 0; i < na; i++) CHECK((WCHAR)(BYTE)a[i] == netbios[i]);
+    char dns_a[300]; DWORD nda = 300;
+    CHECK(GetComputerNameExA(ComputerNameDnsHostname, dns_a, &nda) && nda == nd);
+    // a buffer too small
+    k = n; SetLastError(0); CHECK(!GetComputerNameW(again, &k) && GetLastError() == ERROR_BUFFER_OVERFLOW && k == n + 1);
+    k = 0; SetLastError(0); CHECK(!GetComputerNameA(NULL, &k) && GetLastError() == ERROR_BUFFER_OVERFLOW && k == n + 1);
+    k = nd; SetLastError(0); CHECK(!GetComputerNameExW(ComputerNameDnsHostname, again, &k) && GetLastError() == ERROR_MORE_DATA && k == nd + 1);
+    k = 0; SetLastError(0); CHECK(!GetComputerNameExW(ComputerNameDnsFullyQualified, NULL, &k) && GetLastError() == ERROR_MORE_DATA && k == nf + 1);
+    k = 600; SetLastError(0); CHECK(!GetComputerNameExW(ComputerNameMax, again, &k) && GetLastError() == ERROR_INVALID_PARAMETER);
+    group("computer names", before);
+}
+
+// Process mitigation policies (src/extras.c): the runtime enforces none, so each reads as off, and turning one on is
+// refused with ERROR_NOT_SUPPORTED, never reported applied (Chromium's sandbox sets several); asking for everything off
+// succeeds (it is so already). A wrong size, no buffer, or ProcessMitigationOptionsMask (not a policy to set) is
+// ERROR_INVALID_PARAMETER.
+static void test_mitigations(void) {
+    int before = failures;
+    GET(kernel32, BOOL (WINAPI *)(PROCESS_MITIGATION_POLICY, PVOID, SIZE_T), SetProcessMitigationPolicy);
+    GET(kernel32, BOOL (WINAPI *)(HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T), GetProcessMitigationPolicy);
+    PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dynamic = { 0 }, now;
+    dynamic.ProhibitDynamicCode = 1;
+    SetLastError(0);
+    CHECK(!SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &dynamic, sizeof dynamic) && GetLastError() == ERROR_NOT_SUPPORTED);
+    now.Flags = 0xffffffff;
+    CHECK(GetProcessMitigationPolicy(GetCurrentProcess(), ProcessDynamicCodePolicy, &now, sizeof now) && now.Flags == 0);
+    PROCESS_MITIGATION_IMAGE_LOAD_POLICY image = { 0 };
+    image.NoRemoteImages = 1; image.NoLowMandatoryLabelImages = 1;
+    SetLastError(0);
+    CHECK(!SetProcessMitigationPolicy(ProcessImageLoadPolicy, &image, sizeof image) && GetLastError() == ERROR_NOT_SUPPORTED);
+    PROCESS_MITIGATION_DEP_POLICY dep = { 0 };
+    dep.Enable = 1; dep.Permanent = TRUE;
+    SetLastError(0);
+    CHECK(!SetProcessMitigationPolicy(ProcessDEPPolicy, &dep, sizeof dep) && GetLastError() == ERROR_NOT_SUPPORTED);
+    // every policy, every flag on: refused, and still off afterwards
+    for (int p = 0; p < MaxProcessMitigationPolicy; p++) {
+        if (p == ProcessMitigationOptionsMask) continue;
+        BYTE all[8] = { 0xff, 0xff, 0xff, 0xff }, got[8];
+        SIZE_T size = p == ProcessDEPPolicy ? sizeof(PROCESS_MITIGATION_DEP_POLICY) : sizeof(DWORD);
+        SetLastError(0);
+        CHECK(!SetProcessMitigationPolicy((PROCESS_MITIGATION_POLICY)p, all, size) && GetLastError() == ERROR_NOT_SUPPORTED);
+        memset(got, 0xaa, sizeof got);
+        CHECK(GetProcessMitigationPolicy(GetCurrentProcess(), (PROCESS_MITIGATION_POLICY)p, got, size) && !memcmp(got, "\0\0\0\0\0\0\0\0", size));
+    }
+    // everything off: nothing to do
+    PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dynamic_off = { 0 };
+    PROCESS_MITIGATION_DEP_POLICY dep_off = { 0 };
+    CHECK(SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &dynamic_off, sizeof dynamic_off));
+    CHECK(SetProcessMitigationPolicy(ProcessDEPPolicy, &dep_off, sizeof dep_off));
+    // malformed requests
+    ULONG64 mask[2] = { 0 };
+    SetLastError(0); CHECK(!SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &dynamic, sizeof dynamic + 4) && GetLastError() == ERROR_INVALID_PARAMETER);
+    SetLastError(0); CHECK(!SetProcessMitigationPolicy(ProcessDEPPolicy, &dep, sizeof(DWORD)) && GetLastError() == ERROR_INVALID_PARAMETER);
+    SetLastError(0); CHECK(!SetProcessMitigationPolicy(ProcessDynamicCodePolicy, NULL, sizeof dynamic) && GetLastError() == ERROR_INVALID_PARAMETER);
+    SetLastError(0); CHECK(!SetProcessMitigationPolicy(ProcessMitigationOptionsMask, mask, sizeof mask) && GetLastError() == ERROR_INVALID_PARAMETER);
+    group("mitigation policies", before);
+}
+
 int main(void) {
     kernel32 = GetModuleHandleA("kernel32.dll");
     ntdll = GetModuleHandleA("ntdll.dll");
@@ -453,6 +584,8 @@ int main(void) {
     test_time_zones();
     test_ntdll();
     test_dll_directories();
+    test_computer_names();
+    test_mitigations();
     printf("kernelx: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }

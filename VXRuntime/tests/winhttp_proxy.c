@@ -2,7 +2,8 @@
 // test serves itself on 127.0.0.1 (made-up proxies under .test): a list of proxies and DIRECT, a script that does
 // not run, one that cannot be downloaded, one that never arrives while the resolver is closed (cancelled), and the
 // Mac's static settings. The resolver's session is an asynchronous one (WINHTTP_FLAG_ASYNC), as documented; a
-// synchronous session is refused. Nothing leaves this computer.
+// synchronous session is refused. WinHttpGetProxyForUrl gives the same answers at once on either kind of session.
+// Nothing leaves this computer.
 #define _WIN32_WINNT 0x0A00                                      // (Windows 10: the Vista and Windows 8 declarations)
 #include <winsock2.h>
 #include <windows.h>
@@ -271,6 +272,54 @@ int main(void) {
     options.lpszAutoConfigUrl = NULL;
     CHECK(WinHttpGetProxyForUrlEx(resolver, L"http://www.example.test/", &options, 0) == ERROR_INVALID_PARAMETER);
 
+    // ---- WinHttpGetProxyForUrl: the same answers at once, on any session, as a WINHTTP_PROXY_INFO freed with GlobalFree
+    HINTERNET plain = WinHttpOpen(L"vxrt proxy resolver test", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    CHECK(plain != NULL);
+    WINHTTP_PROXY_INFO info;
+    memset(&options, 0, sizeof options);
+    options.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL;
+    options.lpszAutoConfigUrl = pac;
+    memset(&info, 0xcc, sizeof info);
+    CHECK(WinHttpGetProxyForUrl(plain, L"http://www.example.test/page", &options, &info));
+    CHECK(info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY && info.lpszProxy && !info.lpszProxyBypass &&
+          !wcscmp(info.lpszProxy, L"proxy.test:3128;socks=socks.test:1081"));   // (the proxies before DIRECT, in order)
+    if (info.lpszProxy && info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY) {
+        printf("winhttp_proxy: WinHttpGetProxyForUrl gave \"%ls\"\n", info.lpszProxy);
+        CHECK(GlobalFree(info.lpszProxy) == NULL);
+    }
+    memset(&info, 0xcc, sizeof info);
+    CHECK(WinHttpGetProxyForUrl(session, L"https://www.direct.test/", &options, &info) &&   // (an asynchronous session too)
+          info.dwAccessType == WINHTTP_ACCESS_TYPE_NO_PROXY && !info.lpszProxy && !info.lpszProxyBypass);
+    // its failures are WinHttpGetProxyForUrlEx's, as the last error
+    options.lpszAutoConfigUrl = bad;
+    SetLastError(0);
+    CHECK(!WinHttpGetProxyForUrl(plain, L"http://www.example.test/", &options, &info) && GetLastError() == ERROR_WINHTTP_BAD_AUTO_PROXY_SCRIPT);
+    options.lpszAutoConfigUrl = missing;
+    SetLastError(0);
+    CHECK(!WinHttpGetProxyForUrl(plain, L"http://www.example.test/", &options, &info) && GetLastError() == ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT);
+    options.lpszAutoConfigUrl = L"ftp://127.0.0.1/proxy.pac";
+    SetLastError(0);
+    CHECK(!WinHttpGetProxyForUrl(plain, L"http://www.example.test/", &options, &info) && GetLastError() == ERROR_WINHTTP_UNRECOGNIZED_SCHEME);
+    options.lpszAutoConfigUrl = pac;
+    SetLastError(0);
+    CHECK(!WinHttpGetProxyForUrl(plain, L"not a url", &options, &info) && GetLastError() == ERROR_WINHTTP_INVALID_URL);
+    SetLastError(0);
+    CHECK(!WinHttpGetProxyForUrl(resolver, L"http://www.example.test/", &options, &info) && GetLastError() == ERROR_WINHTTP_INCORRECT_HANDLE_TYPE);
+    SetLastError(0);
+    CHECK(!WinHttpGetProxyForUrl(NULL, L"http://www.example.test/", &options, &info) && GetLastError() == ERROR_INVALID_HANDLE);
+    SetLastError(0);
+    CHECK(!WinHttpGetProxyForUrl(plain, L"http://www.example.test/", &options, NULL) && GetLastError() == ERROR_INVALID_PARAMETER);
+    options.lpszAutoConfigUrl = NULL;                                     // CONFIG_URL without the URL
+    SetLastError(0);
+    CHECK(!WinHttpGetProxyForUrl(plain, L"http://www.example.test/", &options, &info) && GetLastError() == ERROR_INVALID_PARAMETER);
+    // the Mac's static settings: whatever they are, a well-formed answer
+    options.dwFlags = WINHTTP_AUTOPROXY_ALLOW_STATIC;
+    memset(&info, 0xcc, sizeof info);
+    CHECK(WinHttpGetProxyForUrl(plain, L"http://www.example.test/", &options, &info) && !info.lpszProxyBypass &&
+          (info.dwAccessType == WINHTTP_ACCESS_TYPE_NO_PROXY ? !info.lpszProxy : info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY && info.lpszProxy && *info.lpszProxy));
+    if (info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY && info.lpszProxy) GlobalFree(info.lpszProxy);
+    CHECK(WinHttpCloseHandle(plain));
+
     // ---- closing: the last notification is HANDLE_CLOSING; afterwards the handle is gone
     closings = 0;
     CHECK(WinHttpCloseHandle(resolver));
@@ -301,6 +350,6 @@ int main(void) {
     closesocket(listener);
     WSACleanup();
     if (failures) { printf("winhttp_proxy: %d checks failed\n", failures); return 1; }
-    puts("winhttp_proxy: WinHttpCrackUrl, async session, status callbacks, PAC resolution (list, DIRECT, bad, unreachable, cancelled), static settings: ok");
+    puts("winhttp_proxy: WinHttpCrackUrl, async session, status callbacks, PAC resolution (list, DIRECT, bad, unreachable, cancelled), static settings, WinHttpGetProxyForUrl: ok");
     return 0;
 }

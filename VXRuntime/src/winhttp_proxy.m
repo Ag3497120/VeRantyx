@@ -1,6 +1,7 @@
-// winhttp.dll beyond winhttp.m's synchronous requests: WinHttpCrackUrl, status callbacks (WinHttpSetStatusCallback)
-// and the asynchronous proxy resolver of Windows 8 (WinHttpCreateProxyResolver, WinHttpGetProxyForUrlEx,
-// WinHttpGetProxyResult, WinHttpFreeProxyResult), which Steam's Chromium imports.
+// winhttp.dll beyond winhttp.m's synchronous requests: WinHttpCrackUrl, status callbacks (WinHttpSetStatusCallback),
+// the asynchronous proxy resolver of Windows 8 (WinHttpCreateProxyResolver, WinHttpGetProxyForUrlEx,
+// WinHttpGetProxyResult, WinHttpFreeProxyResult) and its synchronous predecessor WinHttpGetProxyForUrl, which Steam's
+// Chromium imports.
 //
 // The resolver answers from macOS: a PAC file (WINHTTP_AUTOPROXY_CONFIG_URL, or the Mac's own with ALLOW_AUTOCONFIG)
 // is downloaded and run by CFNetwork, the static settings (ALLOW_STATIC) are the Mac's network proxy settings, and
@@ -397,27 +398,36 @@ static NSURL *url_from(const WCHAR *w) {
     NSURL *url = [NSURL URLWithString:text];
     return url.scheme.length && url.host.length ? url : nil;
 }
-static WINAPI DWORD WinHttpGetProxyForUrlEx(HANDLE handle, const WCHAR *url, const autoproxy_options *options, uintptr_t context) {
-    if (!handle) return ERROR_INVALID_HANDLE;
-    if (!url || !options) return ERROR_INVALID_PARAMETER;
+// What WinHttpGetProxyForUrl and WinHttpGetProxyForUrlEx both check: the options as documented (a method; detection
+// flags exactly with AUTO_DETECT, a PAC URL exactly with CONFIG_URL; the reserved members zero), an http or https PAC
+// URL, and a URL with a scheme and a host. 0 (*target and *config made), or the error.
+static DWORD check_request(const WCHAR *url, const autoproxy_options *options, NSURL *__strong *target, NSURL *__strong *config) {
     DWORD flags = options->flags;
     if (options->reserved || options->reserved_value ||
         !(flags & (AUTOPROXY_AUTO_DETECT | AUTOPROXY_CONFIG_URL | AUTOPROXY_ALLOW_AUTOCONFIG | AUTOPROXY_ALLOW_STATIC)) ||
         ((flags & AUTOPROXY_AUTO_DETECT) ? !options->auto_detect_flags || (options->auto_detect_flags & ~3u) : options->auto_detect_flags != 0) ||
         ((flags & AUTOPROXY_CONFIG_URL) ? !options->auto_config_url : options->auto_config_url != NULL))
         return ERROR_INVALID_PARAMETER;
-    NSURL *target = nil, *config = nil;
     int pac_scheme = 1;
     @autoreleasepool {                                              // (a Windows thread has no pool of its own)
-        target = url_from(url);
+        *target = url_from(url);
         if (flags & AUTOPROXY_CONFIG_URL) {
-            config = url_from(options->auto_config_url);
-            NSString *scheme = config.scheme.lowercaseString;
-            pac_scheme = config && ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]);
+            *config = url_from(options->auto_config_url);
+            NSString *scheme = (*config).scheme.lowercaseString;
+            pac_scheme = *config && ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]);
         }
     }
     if (!pac_scheme) return ERROR_WINHTTP_UNRECOGNIZED_SCHEME;
-    if (!target) return ERROR_WINHTTP_INVALID_URL;
+    if (!*target) return ERROR_WINHTTP_INVALID_URL;
+    return 0;
+}
+static WINAPI DWORD WinHttpGetProxyForUrlEx(HANDLE handle, const WCHAR *url, const autoproxy_options *options, uintptr_t context) {
+    if (!handle) return ERROR_INVALID_HANDLE;
+    if (!url || !options) return ERROR_INVALID_PARAMETER;
+    DWORD flags = options->flags;
+    NSURL *target = nil, *config = nil;
+    DWORD checked = check_request(url, options, &target, &config);
+    if (checked) return checked;
     resolve_job *job = calloc(1, sizeof *job);
     if (!job) return ERROR_NOT_ENOUGH_MEMORY;
     job->target = target; job->config = config; job->flags = flags; job->context = context;
@@ -493,6 +503,75 @@ static WINAPI void WinHttpFreeProxyResult(uint8_t *result) {
     memset(result, 0, 16);
 }
 
+// ---- WinHttpGetProxyForUrl: the same resolution, synchronously ---------------------------------------------------------------
+// On any session (synchronous or not), answered in a WINHTTP_PROXY_INFO: WINHTTP_ACCESS_TYPE_NO_PROXY when the first
+// choice is DIRECT, else WINHTTP_ACCESS_TYPE_NAMED_PROXY with the proxies before the first DIRECT, in order, as a proxy
+// server list ("host:port", "socks=host:port"; ';' between them) and no bypass list. The strings come from the process
+// heap: the caller frees them with GlobalFree (documented). The resolution runs on a thread of its own, as the
+// asynchronous one does (a PAC file is run on that thread's run loop, never on a program's thread).
+typedef struct { DWORD access_type; WCHAR *proxy, *bypass; } proxy_info;           // WINHTTP_PROXY_INFO
+_Static_assert(sizeof(proxy_info) == 24, "WINHTTP_PROXY_INFO");
+enum { ACCESS_TYPE_NO_PROXY = 1, ACCESS_TYPE_NAMED_PROXY = 3 };
+typedef struct { resolver r; NSURL *target, *config; DWORD flags, error; proxy_entry *entries; int count; } sync_job;
+static void *resolve_now(void *arg) {
+    sync_job *job = arg;
+    @autoreleasepool { job->error = resolve(&job->r, job->target, job->flags, job->config, &job->entries, &job->count); }
+    return NULL;
+}
+// The entries as a proxy server list (UTF-16, from the program's heap); NULL when out of memory.
+static WCHAR *server_list(const proxy_entry *entries, int count) {
+    size_t cap = 1;
+    for (int i = 0; i < count && entries[i].proxy; i++) cap += strlen(entries[i].host) + 32;
+    char *text = malloc(cap);
+    if (!text) return NULL;
+    size_t used = 0;
+    text[0] = 0;
+    for (int i = 0; i < count && entries[i].proxy; i++) {
+        const proxy_entry *e = &entries[i];
+        int literal = strchr(e->host, ':') != NULL;                  // (an IPv6 address: in brackets before its port)
+        used += (size_t)snprintf(text + used, cap - used, "%s%s%s%s%s:%u", used ? ";" : "", e->scheme == INTERNET_SCHEME_SOCKS ? "socks=" : "",
+                                 literal ? "[" : "", e->host, literal ? "]" : "", e->port);
+    }
+    size_t units = vx_utf8_to_utf16(text, used, NULL, 0);
+    WCHAR *list = vx_heap_alloc((units + 1) * sizeof *list);
+    if (list) { vx_utf8_to_utf16(text, used, list, units); list[units] = 0; }
+    free(text);
+    return list;
+}
+static WINAPI WINBOOL WinHttpGetProxyForUrl(HANDLE session, const WCHAR *url, const autoproxy_options *options, proxy_info *info) {
+    DWORD e = 0;
+    if (!session) e = ERROR_INVALID_HANDLE;
+    else if (!url || !options || !info) e = ERROR_INVALID_PARAMETER;
+    else {
+        pthread_mutex_lock(&g_lock);
+        if (!winhttp_handle(session) || *(const uint32_t *)session != WH_SESSION) e = ERROR_WINHTTP_INCORRECT_HANDLE_TYPE;
+        pthread_mutex_unlock(&g_lock);
+    }
+    sync_job *job = e ? NULL : calloc(1, sizeof *job);
+    if (!e && !job) e = ERROR_NOT_ENOUGH_MEMORY;
+    if (!e) {
+        NSURL *target = nil, *config = nil;
+        e = check_request(url, options, &target, &config);
+        job->target = target; job->config = config; job->flags = options->flags;
+        job->r.kind = RESOLVER_KIND;                                // (never listed: no handle, nothing closes it)
+    }
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 4 << 20);
+    if (!e && pthread_create(&thread, &attr, resolve_now, job)) e = ERROR_NOT_ENOUGH_MEMORY;
+    else if (!e) { pthread_join(thread, NULL); e = job->error; }
+    pthread_attr_destroy(&attr);
+    WCHAR *list = NULL;
+    if (!e && job->entries[0].proxy && !(list = server_list(job->entries, job->count))) e = ERROR_NOT_ENOUGH_MEMORY;
+    if (job) { free(job->entries); job->target = nil; job->config = nil; free(job); }
+    if (e) { vx_set_last_error(e); return 0; }
+    info->access_type = list ? ACCESS_TYPE_NAMED_PROXY : ACCESS_TYPE_NO_PROXY;
+    info->proxy = list;
+    info->bypass = NULL;
+    return 1;
+}
+
 // From winhttp.m's WinHttpCloseHandle, before it looks at the handle: a resolver is closed here (1); for its own
 // handles the callback slot goes, after the documented last notification, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING (0).
 int vx_winhttp_proxy_close(HANDLE h) {
@@ -523,6 +602,7 @@ int vx_winhttp_proxy_close(HANDLE h) {
 static const vx_export g_winhttp_proxy[] = {
     VX_EXPORT(WinHttpCrackUrl), VX_EXPORT(WinHttpSetStatusCallback), VX_EXPORT(WinHttpCreateProxyResolver),
     VX_EXPORT(WinHttpGetProxyForUrlEx), VX_EXPORT(WinHttpGetProxyResult), VX_EXPORT(WinHttpFreeProxyResult),
+    VX_EXPORT(WinHttpGetProxyForUrl),
 };
 void vx_winhttp_proxy_init(void) {
     vx_register_module("winhttp.dll", g_winhttp_proxy, sizeof g_winhttp_proxy / sizeof g_winhttp_proxy[0]);

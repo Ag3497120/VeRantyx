@@ -1,6 +1,6 @@
-// What desktop clients (the Steam client) use beyond games: product and session queries, certificate stores (empty:
-// no certificate is parsed or verified, so callers take their own fallback), random numbers through bcrypt,
-// common controls, in-memory fonts, and other processes' module names.
+// What desktop clients (the Steam client) use beyond games: product and session queries, base64 and the rest of crypt32
+// refused (certificates, stores and chains are crypt32.c's), random numbers through bcrypt, common controls, in-memory
+// fonts, and other processes' module names.
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,54 +69,6 @@ static WINAPI DWORD GetModuleFileNameExA(HANDLE process, void *module, char *buf
     DWORD r = vx_return_string_a(a, buf, size);
     free(a);
     return r;
-}
-
-// ---- crypt32: certificate stores ------------------------------------------------------------------------------------------------
-// Stores open and close, but hold nothing: certificates are not parsed, and chains are not built.
-#define CRYPT_E_ASN1_BADTAG 0x8009310Bu
-#define CRYPT_E_NOT_FOUND 0x80092004u
-static WINAPI void *CertOpenStore(const char *provider, DWORD encoding, void *prov, DWORD flags, const void *para) {
-    (void)provider; (void)encoding; (void)prov; (void)flags; (void)para;
-    return calloc(1, 64);
-}
-static WINAPI void *CertOpenSystemStoreW(void *prov, const WCHAR *name) { (void)name; return CertOpenStore(NULL, 0, prov, 0, NULL); }
-static WINAPI void *CertOpenSystemStoreA(void *prov, const char *name) { (void)name; return CertOpenStore(NULL, 0, prov, 0, NULL); }
-static WINAPI BOOL CertCloseStore(void *store, DWORD flags) { (void)flags; free(store); return 1; }
-static WINAPI void *CertCreateCertificateContext(DWORD encoding, const uint8_t *data, DWORD size) {
-    (void)encoding; (void)data; (void)size;
-    vx_set_last_error(CRYPT_E_ASN1_BADTAG);
-    return NULL;
-}
-static WINAPI BOOL CertFreeCertificateContext(const void *ctx) { (void)ctx; return 1; }
-static WINAPI BOOL CertAddCertificateContextToStore(void *store, const void *ctx, DWORD how, void **added) {
-    (void)store; (void)ctx; (void)how;
-    if (added) *added = NULL;
-    vx_set_last_error(CRYPT_E_ASN1_BADTAG);
-    return 0;
-}
-static WINAPI BOOL CertAddEncodedCertificateToStore(void *store, DWORD encoding, const uint8_t *data, DWORD size, DWORD how, void **added) {
-    (void)store; (void)encoding; (void)data; (void)size; (void)how;
-    if (added) *added = NULL;
-    vx_set_last_error(CRYPT_E_ASN1_BADTAG);
-    return 0;
-}
-static WINAPI void *CertEnumCertificatesInStore(void *store, const void *prev) { (void)store; (void)prev; vx_set_last_error(CRYPT_E_NOT_FOUND); return NULL; }
-static WINAPI void *CertFindCertificateInStore(void *store, DWORD enc, DWORD flags, DWORD type, const void *para, const void *prev) {
-    (void)store; (void)enc; (void)flags; (void)type; (void)para; (void)prev;
-    vx_set_last_error(CRYPT_E_NOT_FOUND);
-    return NULL;
-}
-static WINAPI BOOL CertGetCertificateChain(void *engine, const void *cert, const void *time, void *store, const void *para, DWORD flags, void *reserved, void **chain) {
-    (void)engine; (void)cert; (void)time; (void)store; (void)para; (void)flags; (void)reserved;
-    if (chain) *chain = NULL;
-    vx_set_last_error(CRYPT_E_NOT_FOUND);
-    return 0;
-}
-static WINAPI void CertFreeCertificateChain(const void *chain) { (void)chain; }
-static WINAPI BOOL CertVerifyCertificateChainPolicy(const char *policy, const void *chain, const void *para, uint32_t *status) {
-    (void)policy; (void)chain; (void)para;
-    if (status) { status[0] = 0; status[1] = 0x800B0109u; }       // dwError: CERT_E_UNTRUSTEDROOT
-    return 1;
 }
 
 // ---- bcrypt: random numbers --------------------------------------------------------------------------------------------------
@@ -462,11 +414,6 @@ static WINAPI BOOL SetRectRgn(HANDLE rgn, int l, int t, int r, int b) { (void)rg
 static int g_imc;
 static WINAPI HANDLE ImmCreateContext(void) { return &g_imc; }
 static WINAPI BOOL ImmDestroyContext(HANDLE imc) { (void)imc; return 1; }
-static WINAPI BOOL GetVolumePathNamesForVolumeNameW(const WCHAR *vol, WCHAR *out, DWORD cap, DWORD *need) {
-    (void)vol; (void)out; (void)cap; if (need) *need = 0;
-    vx_set_last_error(1);
-    return 0;
-}
 static WINAPI BOOL msimg_ok(void) { return 1; }                   // AlphaBlend, GradientFill, TransparentBlt: nothing drawn
 static WINAPI uintptr_t SHAppBarMessage(DWORD msg, void *data) { (void)msg; (void)data; return 0; }
 static WINAPI HANDLE CopyImage(HANDLE h, unsigned type, int cx, int cy, unsigned flags) { (void)type; (void)cx; (void)cy; (void)flags; return h; }
@@ -582,7 +529,7 @@ static const vx_export k32[] = {
     { "DebugActiveProcess", (void *)no_debugging }, { "DebugActiveProcessStop", (void *)no_debugging }, VX_EXPORT(GenerateConsoleCtrlEvent),
     { "K32EnumProcessModules", (void *)EnumProcessModules }, { "K32EnumProcessModulesEx", (void *)EnumProcessModulesEx },
     { "K32GetModuleBaseNameW", (void *)GetModuleBaseNameW }, { "K32GetModuleBaseNameA", (void *)GetModuleBaseNameA },
-    VX_EXPORT(GetVolumePathNamesForVolumeNameW), VX_EXPORT(GetVolumeInformationW), VX_EXPORT(GetPrivateProfileStringW),
+    VX_EXPORT(GetVolumeInformationW), VX_EXPORT(GetPrivateProfileStringW),
     VX_EXPORT(QueueUserWorkItem), { "ReadFileEx", (void *)io_ex_fails }, { "WriteFileEx", (void *)io_ex_fails }, VX_EXPORT(CancelSynchronousIo),
     VX_EXPORT(SetSystemPowerState), VX_EXPORT(WriteConsoleOutputAttribute), VX_EXPORT(VirtualAllocEx), VX_EXPORT(VirtualProtectEx),
     VX_EXPORT(WriteProcessMemory),
@@ -692,15 +639,12 @@ static const vx_export psapi[] = {
     VX_EXPORT(GetModuleFileNameExW), VX_EXPORT(GetModuleFileNameExA), VX_EXPORT(EnumProcessModules), VX_EXPORT(EnumProcessModulesEx),
     VX_EXPORT(GetModuleBaseNameW), VX_EXPORT(GetModuleBaseNameA),
 };
+// (certificates, stores, chains and their policies: crypt32.c)
 static const vx_export crypt32[] = {
-    VX_EXPORT(CertOpenStore), VX_EXPORT(CertOpenSystemStoreW), VX_EXPORT(CertOpenSystemStoreA), VX_EXPORT(CertCloseStore),
-    VX_EXPORT(CertCreateCertificateContext), VX_EXPORT(CertFreeCertificateContext), VX_EXPORT(CertAddCertificateContextToStore),
-    VX_EXPORT(CertAddEncodedCertificateToStore), VX_EXPORT(CertEnumCertificatesInStore), VX_EXPORT(CertFindCertificateInStore),
-    VX_EXPORT(CertGetCertificateChain), VX_EXPORT(CertFreeCertificateChain), VX_EXPORT(CertVerifyCertificateChainPolicy),
     VX_EXPORT(CryptBinaryToStringA), VX_EXPORT(CryptStringToBinaryA), { "CryptEncodeObjectEx", (void *)crypt_refuses },
     { "CryptDecodeObjectEx", (void *)crypt_refuses }, { "CertStrToNameA", (void *)crypt_refuses }, { "CertStrToNameW", (void *)crypt_refuses },
     { "CertSetCertificateContextProperty", (void *)crypt_refuses }, { "CryptHashCertificate2", (void *)crypt_refuses },
-    { "CertCreateSelfSignCertificate", (void *)crypt_refuses_ptr }, { "CertDuplicateCertificateContext", (void *)crypt_refuses_ptr },
+    { "CertCreateSelfSignCertificate", (void *)crypt_refuses_ptr },
 };
 static const vx_export bcrypt[] = {
     VX_EXPORT(BCryptGenRandom), VX_EXPORT(BCryptCloseAlgorithmProvider), { "BCryptOpenAlgorithmProvider", (void *)bcrypt_unsupported },

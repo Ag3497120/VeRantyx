@@ -195,5 +195,7 @@ The Vulkan path includes a dependency-free SPIR-V reader and a narrow Vulkan 1.0
   a process makes says so in its log (`winsta: ... it isolates nothing here`), whatever the trace setting. What is kept as on
   Windows: each window-station and desktop handle's access rights (`SetUserObjectInformation`, `SwitchDesktop` and
   `EnumDesktopWindows` refuse a handle without the right, with `ERROR_ACCESS_DENIED`) and `EnumDesktopWindows` lists
-  only the windows made by threads on that desktop. Run only web content you would trust outside a sandbox.
+  only the windows made by threads on that desktop. Process mitigation policies are not enforced either, and say so:
+  `SetProcessMitigationPolicy` refuses to turn one on with `ERROR_NOT_SUPPORTED` (logged once per policy) and
+  `GetProcessMitigationPolicy` reports each off (`extras.c`). Run only web content you would trust outside a sandbox.
 - **Scale.** The Windows API is thousands of functions; the order of work follows what real programs import.

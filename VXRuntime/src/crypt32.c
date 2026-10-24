@@ -14,8 +14,8 @@
 //   PKCS #7, PKCS #12, serialized, ...) do not open, rather than open empty.
 // - WinVerifyTrust never returns 0 for a verification: Authenticode is not checked here, so a file with a signature is
 //   TRUST_E_SUBJECT_NOT_TRUSTED (one without is TRUST_E_NOSIGNATURE); there are no catalogs (CryptCATAdmin*).
-// These tables are registered before client.c's and extras.c's stand-ins for the same functions (loader.c): they
-// replace them.
+// These tables are registered before client.c's and extras.c's (loader.c), whose old stand-ins for these functions
+// (stores that held nothing, a WinVerifyTrust without a check) are gone.
 #include <CommonCrypto/CommonDigest.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
@@ -34,6 +34,35 @@
 #else
 #define PROG_PTR(p) ((void *)(p))
 #endif
+
+// Every allocation of this file, its own and the Core Foundation and Security objects it makes, is checked: a call
+// that runs out of memory fails (ERROR_NOT_ENOUGH_MEMORY) or, where a check is concerned, judges less trusted, never
+// more. VXRT_TEST_CRYPT32_NOMEM=k makes every k-th of them fail, so that tests/crypt32.c ("nomem") can show it.
+static long g_nomem_every, g_allocs;
+static pthread_once_t g_nomem_once = PTHREAD_ONCE_INIT;
+static void nomem_read(void) { const char *v = getenv("VXRT_TEST_CRYPT32_NOMEM"); g_nomem_every = v ? atol(v) : 0; }
+static int no_memory(void) {
+    pthread_once(&g_nomem_once, nomem_read);
+    return g_nomem_every > 0 && __atomic_add_fetch(&g_allocs, 1, __ATOMIC_RELAXED) % g_nomem_every == 0;
+}
+#define ALLOCATED(x) (no_memory() ? NULL : (x))
+#define malloc(n) ALLOCATED(malloc(n))
+#define calloc(n, size) ALLOCATED(calloc(n, size))
+#define realloc(p, n) ALLOCATED(realloc(p, n))
+#ifdef __aarch64__
+#define vxvm_alloc(n) ALLOCATED(vxvm_alloc(n))
+#define vxvm_zalloc(n) ALLOCATED(vxvm_zalloc(n))
+#endif
+#define CFArrayCreate(...) ALLOCATED(CFArrayCreate(__VA_ARGS__))
+#define CFArrayCreateMutable(...) ALLOCATED(CFArrayCreateMutable(__VA_ARGS__))
+#define CFDataCreate(...) ALLOCATED(CFDataCreate(__VA_ARGS__))
+#define CFDateCreate(...) ALLOCATED(CFDateCreate(__VA_ARGS__))
+#define CFDictionaryCreateMutable(...) ALLOCATED(CFDictionaryCreateMutable(__VA_ARGS__))
+#define CFNumberCreate(...) ALLOCATED(CFNumberCreate(__VA_ARGS__))
+#define CFStringCreateWithCString(...) ALLOCATED(CFStringCreateWithCString(__VA_ARGS__))
+#define SecPolicyCreateBasicX509() ALLOCATED(SecPolicyCreateBasicX509())
+#define SecPolicyCreateRevocation(...) ALLOCATED(SecPolicyCreateRevocation(__VA_ARGS__))
+#define SecPolicyCreateSSL(...) ALLOCATED(SecPolicyCreateSSL(__VA_ARGS__))
 
 // ---- errors and constants (wincrypt.h, wintrust.h, mscat.h) --------------------------------------------------------
 #define ERROR_INVALID_HANDLE 6
@@ -104,6 +133,25 @@ _Static_assert(__builtin_offsetof(cert_info, NotBefore) == 64 && __builtin_offse
 _Static_assert(__builtin_offsetof(cert_context, hCertStore) == 32 && sizeof(cert_context) == 40, "CERT_CONTEXT");
 
 static void *host(const void *p) { return VX_LOW(p); }   // a pointer the program stored in a structure
+
+// Text conversions for this file: NULL when the memory for the copy is not there (callers fail with
+// ERROR_NOT_ENOUGH_MEMORY; text.c's vx_utf8_dup and vx_utf16_dup do not check their allocations).
+static char *utf8_of(const WCHAR *w) {
+    size_t n = vx_wcslen(w), len = vx_utf16_to_utf8(w, n, NULL, 0);
+    char *a = malloc(len + 1);
+    if (!a) return NULL;
+    vx_utf16_to_utf8(w, n, a, len);
+    a[len] = 0;
+    return a;
+}
+static WCHAR *utf16_of(const char *a) {
+    size_t n = strlen(a), len = vx_utf8_to_utf16(a, n, NULL, 0);
+    WCHAR *w = malloc((len + 1) * sizeof *w);
+    if (!w) return NULL;
+    vx_utf8_to_utf16(a, n, w, len);
+    w[len] = 0;
+    return w;
+}
 
 // ---- DER (X.690) reading ------------------------------------------------------------------------------------------
 typedef struct { const uint8_t *p; size_t n; } span;
@@ -928,18 +976,22 @@ static void name_string(const cert *c, DWORD type, DWORD flags, const void *para
     }
 }
 
-// A certificate from a context the program passes: ours, or (made by the program itself) parsed for the call.
-static cert *cert_for_call(const void *ctx, cert **temp) {
+// A certificate from a context the program passes: ours, or (made by the program itself) parsed for the call. NULL
+// with *err E_INVALIDARG (no context, or one without an encoding), ERROR_NOT_ENOUGH_MEMORY, or the DER's error.
+static cert *cert_for_call(const void *ctx, cert **temp, DWORD *err) {
     *temp = NULL;
+    *err = E_INVALIDARG;
     cert *c = cert_of(ctx);
     if (c || !ctx) return c;
     const cert_context *x = ctx;
+    if (!x->pbCertEncoded) return NULL;
     cert *t = calloc(1, sizeof *t);
     uint8_t *der = t ? malloc(x->cbCertEncoded ? x->cbCertEncoded : 1) : NULL;
-    if (!t || !der || !x->pbCertEncoded) { free(t); free(der); return NULL; }
+    if (!t || !der) { free(t); free(der); *err = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
     memcpy(der, host(x->pbCertEncoded), x->cbCertEncoded);
     t->der = der; t->der_n = x->cbCertEncoded;
-    if (parse_cert(t)) { cert_free_memory(t); return NULL; }
+    DWORD e = parse_cert(t);
+    if (e) { cert_free_memory(t); *err = e; return NULL; }
     return *temp = t;
 }
 
@@ -951,14 +1003,20 @@ static DWORD return_w(const wbuf *b, DWORD total, WCHAR *out, DWORD cap) {
     out[cap - 1] = 0;
     return cap;
 }
+// Without the memory to convert, the empty string (1, the documented result of a failure), with the error set.
+static DWORD return_a_empty(char *out, DWORD cap) {
+    if (out && cap) out[0] = 0;
+    vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+    return 1;
+}
 static DWORD return_a(const wbuf *b, DWORD total_w, char *out, DWORD cap) {   // ANSI here is UTF-8 (GetACP)
     size_t units = total_w;                                          // (with the terminators, converted alike)
     WCHAR *w = calloc(units ? units : 1, sizeof *w);
-    if (!w) return 0;
+    if (!w) return return_a_empty(out, cap);
     if (b->n) memcpy(w, b->p, b->n * sizeof *w);
     size_t need = vx_utf16_to_utf8(w, units, NULL, 0);
     char *a = malloc(need ? need : 1);
-    if (!a) { free(w); return 0; }
+    if (!a) { free(w); return return_a_empty(out, cap); }
     vx_utf16_to_utf8(w, units, a, need);
     free(w);
     DWORD r;
@@ -976,11 +1034,12 @@ static DWORD return_a(const wbuf *b, DWORD total_w, char *out, DWORD cap) {   //
 }
 
 static DWORD get_name_string(const void *ctx, DWORD type, DWORD flags, const void *para, wbuf *b) {
-    cert *temp, *c = cert_for_call(ctx, &temp);
+    DWORD err;
+    cert *temp, *c = cert_for_call(ctx, &temp, &err);
     int multi = 0;
     if (c) name_string(c, type, flags, para, b, &multi);
     if (temp) cert_free_memory(temp);
-    if (b->oom) b->n = 0;
+    if ((!c && err == ERROR_NOT_ENOUGH_MEMORY) || b->oom) { b->n = 0; multi = 0; vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); }
     return (DWORD)b->n + 1 + (multi ? 1 : 0);
 }
 static WINAPI DWORD CertGetNameStringW(const void *ctx, DWORD type, DWORD flags, void *para, WCHAR *out, DWORD cap) {
@@ -1001,7 +1060,7 @@ static WINAPI DWORD CertNameToStrW(DWORD encoding, const blob_t *name, DWORD typ
     (void)encoding;
     wbuf b = { 0 };
     if (name && name->pbData) name_to_text((span){ host(name->pbData), name->cbData }, type, &b);
-    if (b.oom) b.n = 0;
+    if (b.oom) { b.n = 0; vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); }
     DWORD r = return_w(&b, (DWORD)b.n + 1, out, cap);
     free(b.p);
     return r;
@@ -1010,7 +1069,7 @@ static WINAPI DWORD CertNameToStrA(DWORD encoding, const blob_t *name, DWORD typ
     (void)encoding;
     wbuf b = { 0 };
     if (name && name->pbData) name_to_text((span){ host(name->pbData), name->cbData }, type, &b);
-    if (b.oom) b.n = 0;
+    if (b.oom) { b.n = 0; vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); }
     DWORD r = return_a(&b, (DWORD)b.n + 1, out, cap);
     free(b.p);
     return r;
@@ -1058,8 +1117,9 @@ static WINAPI cert_ext *CertFindExtension(const char *oid, DWORD count, cert_ext
 
 // ---- key usage ------------------------------------------------------------------------------------------------------
 static WINAPI BOOL CertGetEnhancedKeyUsage(const void *ctx, DWORD flags, void *usage, DWORD *size) {
-    cert *temp, *c = cert_for_call(ctx, &temp);
-    if (!c || !size) { if (temp) cert_free_memory(temp); vx_set_last_error(E_INVALIDARG); return 0; }
+    DWORD why;
+    cert *temp, *c = cert_for_call(ctx, &temp, &why);
+    if (!c || !size) { if (temp) cert_free_memory(temp); vx_set_last_error(c ? E_INVALIDARG : why); return 0; }
     // Only the extension: this runtime keeps no CERT_ENHKEY_USAGE_PROP_ID properties.
     const ext *e = flags & CERT_FIND_PROP_ONLY_ENHKEY_USAGE_FLAG ? NULL : find_ext(c, "2.5.29.37");
     char oids[64][128];
@@ -1129,11 +1189,12 @@ static WINAPI BOOL CertGetIntendedKeyUsage(DWORD encoding, const cert_info *info
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"     // (SHA-1 and MD5 name certificates here; nothing is trusted on them)
 static WINAPI BOOL CertGetCertificateContextProperty(const void *ctx, DWORD prop, void *data, DWORD *size) {
-    cert *temp, *c = cert_for_call(ctx, &temp);
+    DWORD why;
+    cert *temp, *c = cert_for_call(ctx, &temp, &why);
     uint8_t buf[256];
     size_t n = 0;
     DWORD err = 0;
-    if (!c || !size) err = E_INVALIDARG;
+    if (!c || !size) err = c ? E_INVALIDARG : why;
     else switch (prop) {
     case PROP_SHA1: CC_SHA1(c->der, c->der_n, buf); n = 20; break;
     case PROP_MD5: CC_MD5(c->der, c->der_n, buf); n = 16; break;
@@ -1192,6 +1253,7 @@ static int contains_ci(const wbuf *hay, const WCHAR *needle) {     // case-insen
     return 0;
 }
 
+// 1 when c is what the search asks for, 0 when not, -1 when there was no memory to tell.
 static int matches(cert *c, DWORD type, DWORD flags, const void *para) {
     uint8_t h[32];
     switch (type) {
@@ -1209,10 +1271,12 @@ static int matches(cert *c, DWORD type, DWORD flags, const void *para) {
     }
     case CERT_FIND_SUBJECT_STR_A: case CERT_FIND_ISSUER_STR_A: case CERT_FIND_SUBJECT_STR_W: case CERT_FIND_ISSUER_STR_W: {
         if (!para) return 0;
-        WCHAR *needle = type == CERT_FIND_SUBJECT_STR_A || type == CERT_FIND_ISSUER_STR_A ? vx_utf16_dup(para) : NULL;
+        int ansi = type == CERT_FIND_SUBJECT_STR_A || type == CERT_FIND_ISSUER_STR_A;
+        WCHAR *needle = ansi ? utf16_of(para) : NULL;
+        if (ansi && !needle) return -1;
         wbuf text = { 0 };
         name_to_text(type == CERT_FIND_SUBJECT_STR_A || type == CERT_FIND_SUBJECT_STR_W ? c->subject : c->issuer, CERT_SIMPLE_NAME_STR, &text);
-        int r = !text.oom && contains_ci(&text, needle ? needle : para);
+        int r = text.oom ? -1 : contains_ci(&text, needle ? needle : para);
         free(text.p); free(needle);
         return r;
     }
@@ -1267,7 +1331,11 @@ static void *find_in_store(void *h, DWORD flags, DWORD type, const void *para, c
     else {
         int i = 0;
         if (p) { while (i < l.n && l.v[i] != p) i++; i++; }          // (a prev not in this store finds nothing more)
-        for (; i < l.n && !found; i++) if (matches(l.v[i], type, flags, para)) found = l.v[i];
+        for (; i < l.n && !found; i++) {
+            int m = matches(l.v[i], type, flags, para);
+            if (m < 0) { err = ERROR_NOT_ENOUGH_MEMORY; break; }
+            if (m) found = l.v[i];
+        }
         if (found) cert_addref(found);
     }
     free(l.v);
@@ -1352,6 +1420,7 @@ static SecKeyRef public_key(const char *alg_oid, span params, span bits, DWORD u
     *err = NTE_BAD_ALGID;
     if (unused_bits) return NULL;
     CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (!attrs) { *err = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
     CFDictionarySetValue(attrs, kSecAttrKeyClass, kSecAttrKeyClassPublic);
     if (!strcmp(alg_oid, "1.2.840.113549.1.1.1") || !strcmp(alg_oid, "1.2.840.113549.1.1.10")) {
         *is_ec = 0;
@@ -1364,11 +1433,13 @@ static SecKeyRef public_key(const char *alg_oid, span params, span bits, DWORD u
         if (!size || bits.n != 1 + 2 * (size_t)((size + 7) / 8) || bits.p[0] != 4) { CFRelease(attrs); return NULL; }   // uncompressed
         *is_ec = 1;
         CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &size);
+        if (!n) { CFRelease(attrs); *err = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
         CFDictionarySetValue(attrs, kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom);
         CFDictionarySetValue(attrs, kSecAttrKeySizeInBits, n);
         CFRelease(n);
     } else { CFRelease(attrs); return NULL; }
     CFDataRef data = CFDataCreate(NULL, bits.p, (CFIndex)bits.n);
+    if (!data) { CFRelease(attrs); *err = ERROR_NOT_ENOUGH_MEMORY; return NULL; }
     SecKeyRef key = SecKeyCreateWithData(data, attrs, NULL);
     CFRelease(data); CFRelease(attrs);
     *err = key ? 0 : NTE_BAD_PUBLIC_KEY;
@@ -1427,7 +1498,8 @@ static DWORD verify_signature(DWORD subject_type, const void *subject, DWORD iss
         key_bits = (span){ host(k->PublicKey.pbData), k->PublicKey.cbData };
         unused = k->PublicKey.cUnusedBits;
         if (!key_bits.p) return E_INVALIDARG;
-    } else if (issuer_type == CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT && issuer && (ic = cert_for_call(issuer, &temp))) {
+    } else if (issuer_type == CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT && issuer) {
+        if (!(ic = cert_for_call(issuer, &temp, &err))) return err == ERROR_NOT_ENOUGH_MEMORY ? err : E_INVALIDARG;
         if (oid_text(ic->key_alg, key_oid, sizeof key_oid)) { if (temp) cert_free_memory(temp); return CRYPT_E_ASN1_CORRUPT; }
         key_params = ic->key_params; key_bits = ic->key_bits;
         unused = ic->info.SubjectPublicKeyInfo.PublicKey.cUnusedBits;
@@ -1439,9 +1511,10 @@ static DWORD verify_signature(DWORD subject_type, const void *subject, DWORD iss
     if (is_ec_key == is_ec_sig && SecKeyIsAlgorithmSupported(key, kSecKeyOperationTypeVerify, alg)) {
         CFDataRef msg = CFDataCreate(NULL, tbs.whole.p, (CFIndex)tbs.whole.n);
         CFDataRef sg = CFDataCreate(NULL, sig.body.p + 1, (CFIndex)sig.body.n - 1);
-        ok = SecKeyVerifySignature(key, alg, msg, sg, NULL);
-        CFRelease(msg); CFRelease(sg);
-        err = ok ? 0 : NTE_BAD_SIGNATURE;
+        ok = msg && sg && SecKeyVerifySignature(key, alg, msg, sg, NULL);
+        err = !msg || !sg ? ERROR_NOT_ENOUGH_MEMORY : ok ? 0 : NTE_BAD_SIGNATURE;
+        if (msg) CFRelease(msg);
+        if (sg) CFRelease(sg);
     } else err = NTE_BAD_ALGID;
     CFRelease(key);
     return ok ? 0 : err;
@@ -1590,11 +1663,10 @@ static void append_store(CFMutableArrayRef out, store *s, cert_list *held) {
         }
     free(l.v);
 }
-static CFArrayRef store_anchors(void *h) {                            // (under g_lock)
+static CFArrayRef store_anchors(void *h) {                            // (under g_lock; NULL: no memory)
     store *s = store_of(h);
-    if (!s) return NULL;
     CFMutableArrayRef a = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-    append_store(a, s, NULL);
+    if (a && s) append_store(a, s, NULL);
     return a;
 }
 
@@ -1613,12 +1685,20 @@ static WINAPI BOOL CertCreateCertificateChainEngine(const uint8_t *config, void 
     if (exclusive) e->exclusive = store_anchors(exclusive);
     if (restricted_root) e->restricted = store_anchors(restricted_root);
     e->no_fetch = restricted_other != NULL;
-    if ((e->stores = calloc((size_t)nadd + 2, sizeof *e->stores))) {  // (the root stores supply issuers too)
-        for (DWORD i = 0; add && i < nadd; i++) { store *s = store_of(host(add[i])); if (s) { s->refs++; e->stores[e->nstores++] = s; } }
-        store *x = store_of(exclusive), *r = store_of(restricted_root);
-        if (x) { x->refs++; e->stores[e->nstores++] = x; }
-        if (r) { r->refs++; e->stores[e->nstores++] = r; }
+    e->stores = calloc((size_t)nadd + 2, sizeof *e->stores);        // (the root stores supply issuers too)
+    if (!e->stores || (exclusive && !e->exclusive) || (restricted_root && !e->restricted)) {
+        pthread_mutex_unlock(&g_lock);
+        if (e->exclusive) CFRelease(e->exclusive);
+        if (e->restricted) CFRelease(e->restricted);
+        free(e->stores);
+        free(e);
+        vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
     }
+    for (DWORD i = 0; add && i < nadd; i++) { store *s = store_of(host(add[i])); if (s) { s->refs++; e->stores[e->nstores++] = s; } }
+    store *x = store_of(exclusive), *r = store_of(restricted_root);
+    if (x) { x->refs++; e->stores[e->nstores++] = x; }
+    if (r) { r->refs++; e->stores[e->nstores++] = r; }
     pthread_mutex_unlock(&g_lock);
     *out = PROG_PTR(e);
     return 1;
@@ -1775,10 +1855,13 @@ static strong_rules strong_rules_of(const uint8_t *para) {
             r.min_bits[0] = 2048; r.min_bits[1] = 256;
         }
     } else if (choice == 1 && info) {                                // CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE
-        char *sign = vx_utf8_dup(host(*(const WCHAR *const *)((const uint8_t *)info + 8)));
-        char *keys = vx_utf8_dup(host(*(const WCHAR *const *)((const uint8_t *)info + 16)));
-        each_pair(sign, add_sign_pair, &r);
-        each_pair(keys, add_key_bits, &r);
+        const WCHAR *sign_w = host(*(const WCHAR *const *)((const uint8_t *)info + 8));
+        const WCHAR *keys_w = host(*(const WCHAR *const *)((const uint8_t *)info + 16));
+        char *sign = sign_w ? utf8_of(sign_w) : NULL, *keys = keys_w ? utf8_of(keys_w) : NULL;
+        if ((!sign_w || sign) && (!keys_w || keys)) {                // (lists not read for want of memory: nothing strong)
+            each_pair(sign, add_sign_pair, &r);
+            each_pair(keys, add_key_bits, &r);
+        }
         free(sign); free(keys);
     }
     return r;
@@ -1858,24 +1941,35 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
     engine *eng = (uintptr_t)engine_h > 2 && ((engine *)engine_h)->magic == ENGINE_MAGIC ? engine_h : NULL;
     uint64_t at = when ? (uint64_t)when->hi << 32 | when->lo : now_filetime();
     CFDateRef date = cf_date(at);
+    if (!date) { vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
 
     // the end certificate (a context of ours) and every certificate the chain may use
     pthread_mutex_lock(&g_lock);
     cert *leaf = cert_of(ctx);
     store *own = store_new(STORE_MEMORY);
+    DWORD why = own ? CRYPT_E_ASN1_CORRUPT : ERROR_NOT_ENOUGH_MEMORY;
     if (!leaf && own) {                                              // (a context the program made: copied)
         const cert_context *x = ctx;
-        if (x->pbCertEncoded && cert_new(own, host(x->pbCertEncoded), x->cbCertEncoded, &leaf)) leaf = NULL;
+        if (x->pbCertEncoded && (why = cert_new(own, host(x->pbCertEncoded), x->cbCertEncoded, &leaf))) leaf = NULL;
     }
     if (!leaf || !own) {
         if (own) store_release(own);
         pthread_mutex_unlock(&g_lock);
         CFRelease(date);
-        vx_set_last_error(leaf ? ERROR_NOT_ENOUGH_MEMORY : CRYPT_E_ASN1_CORRUPT);
+        vx_set_last_error(why);
+        return 0;
+    }
+    CFMutableArrayRef certs = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    SecPolicyRef basic = certs ? SecPolicyCreateBasicX509() : NULL;
+    if (!basic) {
+        store_release(own);
+        pthread_mutex_unlock(&g_lock);
+        if (certs) CFRelease(certs);
+        CFRelease(date);
+        vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     }
     cert_addref(leaf);
-    CFMutableArrayRef certs = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
     SecCertificateRef first = sec_cert(leaf->der, leaf->der_n);
     if (first) { CFArrayAppendValue(certs, first); CFRelease(first); }
     cert_list candidates = { 0 };                                    // (the possible issuers, held until the end)
@@ -1901,7 +1995,6 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
     if (para_size >= 88) strong = host(*(const uint8_t *const *)(para + 80));
     if (para_size >= 92) strong_flags = *(const DWORD *)(para + 88);
     int fetch = !(flags & (CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL | CERT_CHAIN_DISABLE_AIA)) && !(eng && eng->no_fetch);
-    SecPolicyRef basic = SecPolicyCreateBasicX509();
     CFArrayRef anchors = eng && eng->exclusive ? eng->exclusive : NULL;
     int anchors_only = anchors != NULL;
 
@@ -1914,8 +2007,19 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
     cert **made = calloc((size_t)(n ? n : 1), sizeof *made);
     DWORD *el_err = calloc((size_t)(n ? n : 1), sizeof *el_err);     // each element's errors from the checks below
     pthread_mutex_lock(&g_lock);
-    if (!made || !el_err) {
-        cert_release(leaf);
+    int short_of_memory = !made || !el_err;
+    if (made) made[0] = leaf;
+    for (CFIndex i = 1; i < n && !short_of_memory; i++) {           // (an element left out for want of memory: no chain)
+        CFDataRef d = SecCertificateCopyData((SecCertificateRef)CFArrayGetValueAtIndex(built, i));
+        cert *c = NULL;
+        DWORD e = d ? cert_new(own, CFDataGetBytePtr(d), (DWORD)CFDataGetLength(d), &c) : ERROR_NOT_ENOUGH_MEMORY;
+        if (!e) { cert_addref(c); made[i] = c; }
+        else if (e == ERROR_NOT_ENOUGH_MEMORY) short_of_memory = 1;
+        if (d) CFRelease(d);
+    }
+    if (short_of_memory) {
+        for (CFIndex i = 0; made && i < (n ? n : 1); i++) if (made[i]) cert_release(made[i]);
+        if (!made) cert_release(leaf);
         for (int i = 0; i < candidates.n; i++) cert_release(candidates.v[i]);
         store_release(own);
         pthread_mutex_unlock(&g_lock);
@@ -1924,13 +2028,6 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
         CFRelease(basic); CFRelease(certs); CFRelease(date);
         vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
         return 0;
-    }
-    made[0] = leaf;
-    for (CFIndex i = 1; i < n; i++) {
-        CFDataRef d = SecCertificateCopyData((SecCertificateRef)CFArrayGetValueAtIndex(built, i));
-        cert *c = NULL;
-        if (d && !cert_new(own, CFDataGetBytePtr(d), (DWORD)CFDataGetLength(d), &c)) { cert_addref(c); made[i] = c; }
-        if (d) CFRelease(d);
     }
     pthread_mutex_unlock(&g_lock);
     if (!n) n = 1;
@@ -1953,11 +2050,10 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
         e1 = evaluate(built ? built : certs, basic, eval_date, eng->restricted, 1, 0, NULL, NULL, NULL);
     if (e1) {
         OSStatus e2 = errSecNotTrusted;
-        if (eval_date && built && n) {
+        if (eval_date && built && n) {                               // (no memory for the anchor: not shown good)
             const void *root = CFArrayGetValueAtIndex(built, n - 1);
             CFArrayRef self = CFArrayCreate(NULL, &root, 1, &kCFTypeArrayCallBacks);
-            e2 = evaluate(built, basic, eval_date, self, 1, 0, NULL, NULL, NULL);
-            CFRelease(self);
+            if (self) { e2 = evaluate(built, basic, eval_date, self, 1, 0, NULL, NULL, NULL); CFRelease(self); }
         }
         if (!e2) { if (last_self_issued) root_untrusted = 1; else partial = 1; }
         else err |= TRUST_NOT_SIGNATURE_VALID | TRUST_UNTRUSTED_ROOT;
@@ -2000,12 +2096,13 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
     if (flags & CERT_CHAIN_REVOCATION_FLAGS) {                        // revocation: macOS's check, or "unknown"
         SecPolicyRef rev = SecPolicyCreateRevocation(kSecRevocationUseAnyAvailableMethod);
         const void *both[2] = { basic, rev };
-        CFArrayRef policies = CFArrayCreate(NULL, both, 2, &kCFTypeArrayCallBacks);
-        int checked = 0;
-        OSStatus r = evaluate(built ? built : certs, policies, eval_date ? eval_date : date, anchors, anchors_only, fetch, NULL, &checked, NULL);
+        CFArrayRef policies = rev ? CFArrayCreate(NULL, both, 2, &kCFTypeArrayCallBacks) : NULL;
+        int checked = 0;                                             // (not evaluated for want of memory: unknown)
+        OSStatus r = policies ? evaluate(built ? built : certs, policies, eval_date ? eval_date : date, anchors, anchors_only, fetch, NULL, &checked, NULL) : errSecAllocate;
         if (r == errSecCertificateRevoked) err |= TRUST_REVOKED;
         else if (!checked) err |= TRUST_REVOCATION_UNKNOWN | TRUST_OFFLINE_REVOCATION;
-        CFRelease(policies); CFRelease(rev);
+        if (policies) CFRelease(policies);
+        if (rev) CFRelease(rev);
     }
     CFRelease(basic);
     CFRelease(certs);
@@ -2165,10 +2262,15 @@ static WINAPI BOOL CertVerifyCertificateChainPolicy(const char *policy, const vo
     } else if (id == 4) {                                             // SSL: macOS's SSL policy, with the server's name
         int server = !ssl || *(const DWORD *)(ssl + 4) != 1;          // (AUTHTYPE_CLIENT is 1)
         const WCHAR *name = ssl && !(ignore & POLICY_IGNORE_INVALID_NAME) ? host(*(const WCHAR *const *)(ssl + 16)) : NULL;
-        char *utf8 = name ? vx_utf8_dup(name) : NULL;
+        char *utf8 = name ? utf8_of(name) : NULL;
         CFStringRef host_name = utf8 ? CFStringCreateWithCString(NULL, utf8, kCFStringEncodingUTF8) : NULL;
         free(utf8);
-        SecPolicyRef p = SecPolicyCreateSSL(server, host_name);
+        SecPolicyRef p = !name || host_name ? SecPolicyCreateSSL(server, host_name) : NULL;
+        if (!p) {                                                     // a name that cannot be checked is not let through
+            if (host_name) CFRelease(host_name);
+            vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+            return 0;                                                 // (not checked; dwError stays CERT_E_UNTRUSTEDROOT)
+        }
         // judged as the chain was, with the excused problems taken out: an untrusted root as its own anchor, a time
         // outside the validity replaced by one inside it
         CFArrayRef anchors = ch->anchors;
@@ -2282,7 +2384,7 @@ static WINAPI LONG WinVerifyTrust(HANDLE hwnd, const uint8_t *action, wintrust_d
     if (!f) return (LONG)E_INVALIDARG;
     int fd = f->hFile && f->hFile != (HANDLE)(intptr_t)-1 ? vx_handle_fd(f->hFile) : -1, own = 0;
     if (fd < 0 && f->pcwszFilePath) {
-        char *win = vx_utf8_dup(host(f->pcwszFilePath)), path[4096];
+        char *win = utf8_of(host(f->pcwszFilePath)), path[4096];
         if (win && vx_unix_path(win, path, sizeof path)) { fd = open(path, O_RDONLY | O_CLOEXEC); own = fd >= 0; }
         free(win);
     }
