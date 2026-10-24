@@ -330,31 +330,6 @@ static WINAPI BOOL GetWindowInfo(void *wnd, uint8_t *info) {
 }
 static WINAPI BOOL EnumChildWindows(void *parent, void *fn, intptr_t param) { (void)parent; (void)fn; (void)param; return 1; }
 static WINAPI BOOL GetGUIThreadInfo(DWORD tid, uint8_t *info) { (void)tid; DWORD size = *(DWORD *)info; memset(info + 4, 0, size > 4 ? size - 4 : 0); return 1; }
-static int g_station;
-static WINAPI HANDLE GetProcessWindowStation(void) { return &g_station; }
-static int g_desktop;
-static WINAPI HANDLE GetThreadDesktop(DWORD tid) { (void)tid; return &g_desktop; }   // (the Default desktop: see below)
-// The window station is WinSta0 and every desktop handle is its Default desktop, the input desktop of an unlocked
-// session (SteamVR's compositor checks the input desktop's name, and shows a "display locked" colour otherwise).
-static BOOL user_object_info(HANDLE obj, int index, void *out, DWORD n, DWORD *need, int wide) {
-    if (index == 1) {                                             // UOI_FLAGS: WSF_VISIBLE
-        if (need) *need = 12;
-        if (n < 12 || !out) { vx_set_last_error(122); return 0; }
-        memset(out, 0, 12); ((DWORD *)out)[2] = 1;
-        return 1;
-    }
-    const char *text = NULL;
-    if (index == 2) text = obj == &g_station ? "WinSta0" : "Default";              // UOI_NAME
-    if (index == 3) text = obj == &g_station ? "WindowStation" : "Desktop";        // UOI_TYPE
-    if (!text) { if (need) *need = 0; vx_set_last_error(87); return 0; }
-    DWORD size = (DWORD)(strlen(text) + 1) * (wide ? 2 : 1);
-    if (need) *need = size;
-    if (!out || n < size) { vx_set_last_error(122); return 0; }
-    if (wide) vx_return_string_w(text, out, n / 2); else vx_return_string_a(text, out, n);
-    return 1;
-}
-static WINAPI BOOL GetUserObjectInformationW(HANDLE obj, int index, void *out, DWORD n, DWORD *need) { return user_object_info(obj, index, out, n, need, 1); }
-static WINAPI BOOL GetUserObjectInformationA(HANDLE obj, int index, void *out, DWORD n, DWORD *need) { return user_object_info(obj, index, out, n, need, 0); }
 static int g_icon_copy;
 static WINAPI void *CopyIcon(void *icon) { (void)icon; return &g_icon_copy; }
 static WINAPI BOOL DrawIconEx(void *dc, int x, int y, void *icon, int w, int h, unsigned step, void *brush, unsigned flags) { (void)dc; (void)x; (void)y; (void)icon; (void)w; (void)h; (void)step; (void)brush; (void)flags; return 1; }
@@ -631,12 +606,7 @@ static WINAPI int wsprintfW(WCHAR *buf, const WCHAR *fmt, ...) {
     return n;
 }
 static WINAPI int wvsprintfW(WCHAR *buf, const WCHAR *fmt, const char *ap) { return vx_format_w(buf, 1025, fmt, ap); }
-// ---- services and security (advapi32): no service manager; SIDs and ACLs as plain memory -----------------------------------
-static WINAPI HANDLE OpenSCManagerA(const char *machine, const char *db, DWORD access) { (void)machine; (void)db; (void)access; vx_set_last_error(5); return NULL; }
-static WINAPI HANDLE OpenSCManagerW(const WCHAR *machine, const WCHAR *db, DWORD access) { (void)machine; (void)db; (void)access; vx_set_last_error(5); return NULL; }
-static WINAPI HANDLE OpenServiceA(HANDLE scm, const char *name, DWORD access) { (void)scm; (void)name; (void)access; vx_set_last_error(1060); return NULL; }
-static WINAPI BOOL service_none(void) { vx_set_last_error(6); return 0; }
-static WINAPI BOOL CloseServiceHandle(HANDLE h) { (void)h; return 1; }
+// ---- security (advapi32): SIDs and ACLs as plain memory (the service manager: scm.c) ---------------------------------------
 // A SID: revision, sub-authority count, 6-byte identifier authority, sub-authorities.
 static WINAPI DWORD GetLengthSid(const uint8_t *sid) { return 8 + 4 * (DWORD)sid[1]; }
 static WINAPI BOOL IsValidSid(const uint8_t *sid) { return sid && sid[0] == 1 && sid[1] <= 15; }
@@ -734,10 +704,7 @@ static const vx_export advapi[] = {
     VX_EXPORT(CryptReleaseContext), VX_EXPORT(RegisterEventSourceW), VX_EXPORT(RegisterEventSourceA), VX_EXPORT(DeregisterEventSource),
     VX_EXPORT(ReportEventW), VX_EXPORT(EventSetInformation), VX_EXPORT(AdjustTokenPrivileges), VX_EXPORT(LookupPrivilegeValueW),
     VX_EXPORT(LookupPrivilegeValueA), VX_EXPORT(EqualSid), VX_EXPORT(LookupAccountSidA), VX_EXPORT(GetNamedSecurityInfoA),
-    VX_EXPORT(RegConnectRegistryA), VX_EXPORT(OpenSCManagerA), VX_EXPORT(OpenSCManagerW), VX_EXPORT(OpenServiceA),
-    VX_EXPORT(CloseServiceHandle), { "OpenServiceW", (void *)OpenServiceA }, { "StartServiceA", (void *)service_none },
-    { "StartServiceW", (void *)service_none }, { "ControlService", (void *)service_none }, { "QueryServiceStatusEx", (void *)service_none },
-    { "QueryServiceConfigA", (void *)service_none }, { "QueryServiceConfigW", (void *)service_none },
+    VX_EXPORT(RegConnectRegistryA),
     VX_EXPORT(GetLengthSid), VX_EXPORT(IsValidSid), VX_EXPORT(CopySid), VX_EXPORT(CreateWellKnownSid), VX_EXPORT(ConvertStringSidToSidA),
     VX_EXPORT(InitializeAcl), VX_EXPORT(AddAccessAllowedAce), VX_EXPORT(ConvertStringSecurityDescriptorToSecurityDescriptorW),
     VX_EXPORT(EventWriteString),
@@ -761,7 +728,7 @@ static const vx_export crt[] = {
 static const vx_export user32[] = {
     VX_EXPORT(GetKeyboardLayoutList), VX_EXPORT(LoadKeyboardLayoutA), VX_EXPORT(LoadKeyboardLayoutW), VX_EXPORT(ActivateKeyboardLayout),
     VX_EXPORT(ToUnicodeEx), VX_EXPORT(SetRect), VX_EXPORT(wsprintfW), VX_EXPORT(wvsprintfW), VX_EXPORT(GetWindowInfo), VX_EXPORT(EnumChildWindows), VX_EXPORT(GetGUIThreadInfo),
-    VX_EXPORT(GetProcessWindowStation), VX_EXPORT(GetThreadDesktop), VX_EXPORT(GetUserObjectInformationW), VX_EXPORT(GetUserObjectInformationA), VX_EXPORT(CopyIcon), VX_EXPORT(DrawIconEx), VX_EXPORT(GetIconInfo),
+    VX_EXPORT(CopyIcon), VX_EXPORT(DrawIconEx), VX_EXPORT(GetIconInfo),
 };
 static const vx_export imm32[] = {
     VX_EXPORT(ImmGetConversionStatus), VX_EXPORT(ImmSetConversionStatus), VX_EXPORT(ImmGetProperty), VX_EXPORT(ImmGetVirtualKey),

@@ -568,7 +568,11 @@ WINAPI BOOL vx_ShowWindow(HANDLE hwnd, int cmd) {
     vx_window *w = vx_window_get(hwnd);
     if (!w) return 0;
     BOOL was = w->visible;
+    // Hiding a hidden window changes nothing, and Windows returns at once. Steam hides its hidden windows on every
+    // frame of its main loop: going to AppKit's main thread for each made it wait there for window ordering.
+    if (cmd == 0 && !was) return 0;
     int show = cmd != 0;
+    if (vx_trace && show != was) vx_log("ShowWindow %p \"%s\" %d: %s", hwnd, w->title ? w->title : "", cmd, show ? "shown" : "hidden");
     if (show != was) call_proc(w, WM_SHOWWINDOW, show, 0);
     w->visible = show;
     if (show) { w->invalid = 1; w->erase = 1; }
@@ -1398,11 +1402,7 @@ static WINAPI BOOL EnumDisplayMonitors(HANDLE dc, const RECT *clip, MONITORENUMP
     return 1;
 }
 static WINAPI uint32_t GetDpiForWindow(HANDLE h) { (void)h; return 96; }
-static WINAPI uint32_t GetDpiForSystem(void) { return 96; }
-static WINAPI BOOL SetProcessDPIAware(void) { return 1; }
-static WINAPI BOOL SetProcessDpiAwarenessContext(HANDLE c) { (void)c; return 1; }
-static WINAPI HANDLE SetThreadDpiAwarenessContext(HANDLE c) { (void)c; return (HANDLE)(intptr_t)-1; }
-static WINAPI BOOL IsProcessDPIAware(void) { return 0; }
+static WINAPI uint32_t GetDpiForSystem(void) { return 96; }   // (the awareness: winsta.c)
 
 // ---- message boxes, misc ---------------------------------------------------------------------------------------------------------
 static WINAPI int MessageBoxA(HANDLE owner, const char *text, const char *caption, uint32_t type) {
@@ -1655,8 +1655,7 @@ static const vx_export user32[] = {
     VX_EXPORT(ChangeDisplaySettingsA), VX_EXPORT(ChangeDisplaySettingsW), VX_EXPORT(ChangeDisplaySettingsExA), VX_EXPORT(ChangeDisplaySettingsExW),
     VX_EXPORT(EnumDisplayDevicesA), VX_EXPORT(EnumDisplayDevicesW),
     VX_EXPORT(MonitorFromWindow), VX_EXPORT(MonitorFromPoint), VX_EXPORT(MonitorFromRect), VX_EXPORT(GetMonitorInfoA), VX_EXPORT(GetMonitorInfoW),
-    VX_EXPORT(EnumDisplayMonitors), VX_EXPORT(GetDpiForWindow), VX_EXPORT(GetDpiForSystem), VX_EXPORT(SetProcessDPIAware),
-    VX_EXPORT(SetProcessDpiAwarenessContext), VX_EXPORT(SetThreadDpiAwarenessContext), VX_EXPORT(IsProcessDPIAware),
+    VX_EXPORT(EnumDisplayMonitors), VX_EXPORT(GetDpiForWindow), VX_EXPORT(GetDpiForSystem),
     VX_EXPORT(MessageBoxA), VX_EXPORT(MessageBoxW), VX_EXPORT(MessageBoxExA), VX_EXPORT(MessageBoxExW), VX_EXPORT(MessageBeep),
     VX_EXPORT(RegisterWindowMessageA), VX_EXPORT(RegisterWindowMessageW),
     VX_EXPORT(SetWindowsHookExA), VX_EXPORT(SetWindowsHookExW), VX_EXPORT(UnhookWindowsHookEx), VX_EXPORT(CallNextHookEx),

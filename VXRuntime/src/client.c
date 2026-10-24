@@ -202,7 +202,6 @@ static WINAPI LONG RegDeleteKeyValueW(HANDLE key, const WCHAR *sub, const WCHAR 
     if (k != key) close_key(k);
     return r;
 }
-static WINAPI BOOL QueryServiceStatus(HANDLE svc, DWORD *status) { (void)svc; (void)status; vx_set_last_error(6); return 0; }
 
 // ---- more user32 ------------------------------------------------------------------------------------------------------------------
 typedef struct { LONG left, top, right, bottom; } RECT;
@@ -229,15 +228,6 @@ static WINAPI BOOL UnionRect(RECT *out, const RECT *a, const RECT *b) {
     return 1;
 }
 static WINAPI BOOL AttachThreadInput(DWORD a, DWORD b, BOOL on) { (void)a; (void)b; (void)on; return 1; }
-static int g_desktop;
-static WINAPI HANDLE OpenInputDesktop(DWORD flags, BOOL inherit, DWORD access) { (void)flags; (void)inherit; (void)access; return &g_desktop; }
-static WINAPI HANDLE OpenDesktopA(const char *name, DWORD flags, BOOL inherit, DWORD access) { (void)name; return OpenInputDesktop(flags, inherit, access); }
-static WINAPI BOOL CloseDesktop(HANDLE d) { (void)d; return 1; }
-static WINAPI BOOL EnumDesktopWindows(HANDLE desk, void *fn, intptr_t param) {
-    (void)desk;
-    BOOL (WINAPI *each)(void *, intptr_t) = (BOOL (WINAPI *)(void *, intptr_t))vx_find_export("user32.dll", "EnumWindows");
-    return each(fn, param);
-}
 static WINAPI BOOL ExitWindowsEx(DWORD flags, DWORD reason) { (void)flags; (void)reason; vx_set_last_error(5); return 0; }
 static WINAPI uint64_t GetClassLongPtrA(HANDLE wnd, int index) { (void)wnd; (void)index; return 0; }
 static WINAPI int GetClipboardFormatNameA(DWORD fmt, char *out, int cap) { (void)fmt; if (out && cap) out[0] = 0; return 0; }
@@ -618,11 +608,11 @@ static const vx_export opengl32[] = {
     { "glPopMatrix", (void *)gl_ignored }, { "glVertexPointer", (void *)gl_ignored }, { "glTexCoordPointer", (void *)gl_ignored },
     { "glColorPointer", (void *)gl_ignored }, { "glDrawArrays", (void *)gl_ignored }, { "glColor4f", (void *)gl_ignored },
 };
-static const vx_export advapi32[] = { VX_EXPORT(RegSetKeyValueW), VX_EXPORT(RegDeleteKeyValueW), VX_EXPORT(QueryServiceStatus) };
+static const vx_export advapi32[] = { VX_EXPORT(RegSetKeyValueW), VX_EXPORT(RegDeleteKeyValueW) };
 static const vx_export user32[] = {
     VX_EXPORT(SetClassLongPtrW), { "SetClassLongPtrA", (void *)SetClassLongPtrW }, VX_EXPORT(SetRectEmpty), VX_EXPORT(PtInRect),
-    VX_EXPORT(IntersectRect), VX_EXPORT(UnionRect), VX_EXPORT(AttachThreadInput), VX_EXPORT(OpenInputDesktop), VX_EXPORT(OpenDesktopA),
-    VX_EXPORT(CloseDesktop), VX_EXPORT(EnumDesktopWindows), VX_EXPORT(ExitWindowsEx), VX_EXPORT(GetClassLongPtrA),
+    VX_EXPORT(IntersectRect), VX_EXPORT(UnionRect), VX_EXPORT(AttachThreadInput),
+    VX_EXPORT(ExitWindowsEx), VX_EXPORT(GetClassLongPtrA),
     VX_EXPORT(GetClipboardFormatNameA), VX_EXPORT(EnumClipboardFormats), VX_EXPORT(RegisterClipboardFormatW),
     { "RegisterClipboardFormatA", (void *)RegisterClipboardFormatW }, VX_EXPORT(GetCursorInfo), VX_EXPORT(GetMessagePos),
     VX_EXPORT(GetShellWindow), VX_EXPORT(IsWindowUnicode), VX_EXPORT(MapDialogRect), VX_EXPORT(SetParent), VX_EXPORT(SetWinEventHook),
