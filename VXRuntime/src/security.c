@@ -1,22 +1,26 @@
 // advapi32's security objects: SIDs, ACLs and their ACEs, security descriptors in both layouts, SDDL strings, access
-// tokens with impersonation, AccessCheck, and the security of handles and named objects.
+// tokens with impersonation, privileges, AccessCheck, and the security of handles and named objects.
 //
 // One user, as the rest of the runtime reports it: S-1-5-21-1000-1000-1000-1001, a standard user (in Users, not an
-// administrator) at medium integrity. An object's security descriptor is made up when asked for (owned by that user,
-// a DACL giving the user full access) until a program sets one where it can be kept: on a token, on the process,
-// and on named files, registry keys and kernel objects (in this process's memory). Tokens made from others
-// (duplicates, restricted tokens, impersonation) carry their restrictions as data: AccessCheck and
-// CheckTokenMembership evaluate them, nothing else in the runtime enforces them (macOS's own permissions are what
-// protect the user's files). Layouts are the documented ones (winnt.h: SID, ACL, ACE_HEADER, SECURITY_DESCRIPTOR
-// and SECURITY_DESCRIPTOR_RELATIVE; the struct offsets were checked against the MinGW-w64 headers).
+// administrator) at medium integrity. Tokens made from others (duplicates, restricted tokens, impersonation) carry
+// their restrictions as data: AccessCheck and CheckTokenMembership evaluate them, but nothing on the Mac holds another
+// process to them, so CreateProcessAsUser refuses a token that gives less than the user's own (the child would run
+// with the user's). An object's descriptor says what the Mac really lets each account do to it, and one set on an
+// object takes effect or is refused (see "the security of objects"). Layouts are the documented ones (winnt.h: SID,
+// ACL, ACE_HEADER, SECURITY_DESCRIPTOR and SECURITY_DESCRIPTOR_RELATIVE; the struct offsets were checked against the
+// MinGW-w64 headers).
 #include "vx.h"
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/acl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // Pointers the program keeps in its own structures (an absolute descriptor's parts, TOKEN_USER's SID): HOST reads one,
@@ -32,9 +36,10 @@ enum {
     ERROR_FILE_NOT_FOUND = 2, ERROR_PATH_NOT_FOUND = 3, ERROR_ACCESS_DENIED = 5, ERROR_INVALID_HANDLE = 6,
     ERROR_NOT_ENOUGH_MEMORY = 8, ERROR_BAD_LENGTH = 24, ERROR_NOT_SUPPORTED = 50, ERROR_BAD_NETPATH = 53,
     ERROR_INVALID_PARAMETER = 87, ERROR_INSUFFICIENT_BUFFER = 122, ERROR_INVALID_FLAGS = 1004, ERROR_NO_TOKEN = 1008,
-    ERROR_SERVICE_DOES_NOT_EXIST = 1060, ERROR_NOT_FOUND = 1168, ERROR_INVALID_LABEL = 1299,
+    ERROR_SERVICE_DOES_NOT_EXIST = 1060, ERROR_NOT_FOUND = 1168, ERROR_INVALID_LABEL = 1299, ERROR_NOT_ALL_ASSIGNED = 1300,
     ERROR_UNKNOWN_REVISION = 1305, ERROR_REVISION_MISMATCH = 1306, ERROR_INVALID_OWNER = 1307,
     ERROR_INVALID_PRIMARY_GROUP = 1308, ERROR_NO_IMPERSONATION_TOKEN = 1309, ERROR_NO_SUCH_LOGON_SESSION = 1312,
+    ERROR_NO_SUCH_PRIVILEGE = 1313,
     ERROR_PRIVILEGE_NOT_HELD = 1314, ERROR_NONE_MAPPED = 1332, ERROR_INVALID_ACL = 1336, ERROR_INVALID_SID = 1337,
     ERROR_INVALID_SECURITY_DESCR = 1338, ERROR_ALLOTTED_SPACE_EXCEEDED = 1344, ERROR_BAD_IMPERSONATION_LEVEL = 1346,
     ERROR_BAD_TOKEN_TYPE = 1349, ERROR_GENERIC_NOT_MAPPED = 1360, ERROR_BAD_DESCRIPTOR_FORMAT = 1361,
@@ -72,7 +77,8 @@ enum {
     SE_GROUP_MANDATORY = 0x1, SE_GROUP_ENABLED_BY_DEFAULT = 0x2, SE_GROUP_ENABLED = 0x4, SE_GROUP_OWNER = 0x8,
     SE_GROUP_USE_FOR_DENY_ONLY = 0x10, SE_GROUP_INTEGRITY = 0x20, SE_GROUP_INTEGRITY_ENABLED = 0x40,
     SE_GROUP_LOGON_ID = 0xc0000000u, GROUP_ON = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED,
-    SE_PRIVILEGE_ENABLED_BY_DEFAULT = 0x1, SE_PRIVILEGE_ENABLED = 0x2,
+    SE_PRIVILEGE_ENABLED_BY_DEFAULT = 0x1, SE_PRIVILEGE_ENABLED = 0x2, SE_PRIVILEGE_REMOVED = 0x4,
+    SE_PRIVILEGE_USED_FOR_ACCESS = 0x80000000u, PRIVILEGE_SET_ALL_NECESSARY = 1,
     NO_WRITE_UP = 0x1, NO_READ_UP = 0x2, NO_EXECUTE_UP = 0x4,             // SYSTEM_MANDATORY_LABEL_* policy bits
     TOKEN_PRIMARY = 1, TOKEN_IMPERSONATION = 2,
     SECURITY_ANONYMOUS = 0, SECURITY_IDENTIFICATION = 1, SECURITY_IMPERSONATION = 2, SECURITY_DELEGATION = 3,
@@ -258,7 +264,7 @@ static DWORD acl_end(const uint8_t *a) {                 // (a valid ACL) where 
     for (DWORD i = 0; i < rd16(a + 4); i++) off += rd16(a + off + 2);
     return off;
 }
-static DWORD acl_size(const uint8_t *a) { return (rd16(a + 2) + 3u) & ~3u; }
+static DWORD acl_bytes(const uint8_t *a) { return (rd16(a + 2) + 3u) & ~3u; }
 #define FOR_ACE(a, ace) for (DWORD i_ = 0, o_ = 8; i_ < rd16((a) + 4) && ((ace) = (a) + o_, 1); i_++, o_ += rd16((a) + o_ + 2))
 
 // A growing ACL (SDDL, SetEntriesInAcl, merged labels): ACEs appended, the header written at the end.
@@ -317,7 +323,7 @@ static int sd_valid(const uint8_t *sd, sd_parts *p) {
 }
 static DWORD sd_rel_size(const sd_parts *p) {
     return 20 + (p->owner ? sid_len(p->owner) : 0) + (p->group ? sid_len(p->group) : 0) +
-           (p->sacl ? acl_size(p->sacl) : 0) + (p->dacl ? acl_size(p->dacl) : 0);
+           (p->sacl ? acl_bytes(p->sacl) : 0) + (p->dacl ? acl_bytes(p->dacl) : 0);
 }
 static void sd_rel_write(const sd_parts *p, uint8_t *out) {
     memset(out, 0, sd_rel_size(p));
@@ -330,7 +336,7 @@ static void sd_rel_write(const sd_parts *p, uint8_t *out) {
         DWORD n = i < 2 ? sid_len(part[i]) : rd16(part[i] + 2);
         wr32(out + 4 + 4 * i, off);
         memcpy(out + off, part[i], n);
-        off += i < 2 ? n : acl_size(part[i]);
+        off += i < 2 ? n : acl_bytes(part[i]);
     }
 }
 static uint8_t *sd_rel(const sd_parts *p, DWORD *size, int for_program) {   // malloc'd, or LocalAlloc'd for the program
@@ -341,22 +347,6 @@ static uint8_t *sd_rel(const sd_parts *p, DWORD *size, int for_program) {   // m
     return sd;
 }
 
-// What an object grants its owner by default: full access, as its type spells it.
-static DWORD full_access(int type) {
-    if (type == SE_FILE_OBJECT) return 0x1f01ff;                                 // FILE_ALL_ACCESS
-    if (type == SE_REGISTRY_KEY || type == SE_REGISTRY_WOW64_32KEY || type == SE_REGISTRY_WOW64_64KEY) return 0xf003f;   // KEY_ALL_ACCESS
-    return 0x1fffff;                                                             // every standard and specific right
-}
-// The descriptor an object has until one is set: owned by the user, the user's primary group, a DACL giving the user
-// full access (malloc'd, self-relative).
-static uint8_t *sd_default(int type) {
-    uint8_t user[SID_MAX], group[SID_MAX], acl[8 + 8 + SID_MAX];
-    user_sid(user); sid_of(group, 5, 5, MACHINE_SUBS, NONE_RID);
-    DWORD n = 8 + ace_make(acl + 8, ACCESS_ALLOWED, 0, full_access(type), user, NULL, NULL);
-    acl[0] = 2; acl[1] = 0; wr16(acl + 2, (uint16_t)n); wr16(acl + 4, 1); wr16(acl + 6, 0);
-    sd_parts p = { SE_DACL_PRESENT, user, group, NULL, acl };
-    return sd_rel(&p, NULL, 0);
-}
 // The mandatory label ACEs of a SACL (LABEL_SECURITY_INFORMATION), as a new ACL; NULL if it has none.
 static uint8_t *labels_of(const uint8_t *sacl, int labels) {
     if (!sacl) return NULL;
@@ -645,6 +635,7 @@ typedef struct {
     privilege *privs; int nprivs;
     uint8_t owner[SID_MAX], primary[SID_MAX], *dacl, *sd;
     DWORD session, policy, sandbox_inert, write_restricted, filtered, virt_enabled;
+    DWORD is_restricted;                                  // restricting SIDs apply (even when none is left: then nothing passes)
 } token;
 static token *g_process_token;
 static uint64_t g_luid = 0x10000;
@@ -673,8 +664,8 @@ static token *token_copy(const token *s) {               // (g_lock held) a new 
     if (s->nrestricted) memcpy(t->restricted, s->restricted, (size_t)s->nrestricted * sizeof *t->restricted);
     t->privs = s->nprivs ? malloc((size_t)s->nprivs * sizeof *t->privs) : NULL;
     if (s->nprivs) memcpy(t->privs, s->privs, (size_t)s->nprivs * sizeof *t->privs);
-    t->dacl = s->dacl ? malloc(acl_size(s->dacl)) : NULL;
-    if (s->dacl) memcpy(t->dacl, s->dacl, acl_size(s->dacl));
+    t->dacl = s->dacl ? malloc(acl_bytes(s->dacl)) : NULL;
+    if (s->dacl) memcpy(t->dacl, s->dacl, acl_bytes(s->dacl));
     return t;
 }
 // The user's token as Windows gives a standard user signed in at the console: groups None, Everyone, Users,
@@ -747,12 +738,24 @@ static void thread_token_set(DWORD tid, token *t) {      // (g_lock held) takes 
     g_threads = realloc(g_threads, (size_t)(g_nthreads + 1) * sizeof *g_threads);
     g_threads[g_nthreads++] = (thread_token){ tid, t };
 }
-static DWORD thread_id_of(HANDLE h) {
+int vx_process_info(HANDLE h, DWORD *code);               // sync.c: a process handle's pid (-1 if not one)
+// A thread handle's thread id, 0 if it is none of this process's threads. *foreign: it is another process's thread
+// (CreateProcess's hThread, which here is a second handle to the child process), whose tokens this process cannot
+// see or set: each process keeps its own.
+static DWORD thread_id_of(HANDLE h, int *foreign) {
+    *foreign = 0;
     if ((intptr_t)h == -2) return vx_current_tid();
     DWORD (WINAPI *get)(HANDLE) = (DWORD (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "GetThreadId");
-    return h && get ? get(h) : 0;
+    DWORD tid = h && get ? get(h) : 0;
+    if (!tid && h) { int pid = vx_process_info(h, NULL); *foreign = pid > 0 && pid != getpid(); }
+    return tid;
 }
-int vx_process_info(HANDLE h, DWORD *code);               // sync.c: a process handle's pid (-1 if not one)
+// For a thread handle that is not one: ERROR_INVALID_HANDLE, or ERROR_NOT_SUPPORTED (logged) for another process's.
+static BOOL no_thread(int foreign, const char *fn) {
+    if (foreign) vx_log("%s: a thread of another process: its tokens are that process's own, out of this one's reach (refused)", fn);
+    vx_set_last_error(foreign ? ERROR_NOT_SUPPORTED : ERROR_INVALID_HANDLE);
+    return 0;
+}
 
 static void token_handle_closed(void *t) { token_unref(t); }
 static HANDLE token_handle(token *t) {                    // a new handle holding its own reference
@@ -889,7 +892,7 @@ static DWORD access_of(token *t, const sd_parts *p, DWORD desired, const DWORD *
     int maximum = (desired & MAXIMUM_ALLOWED) != 0;
     DWORD want = desired & ~MAXIMUM_ALLOWED, all = map[3] | want;
     DWORD g = dacl_pass(t, 0, p, want, maximum, all);
-    if (t->nrestricted) {
+    if (t->is_restricted) {
         DWORD r = dacl_pass(t, 1, p, want, maximum, all);
         DWORD writes = map[1] | DELETE_RIGHT | WRITE_DAC | WRITE_OWNER;
         g &= t->write_restricted ? r | ~writes : r;       // WRITE_RESTRICTED: only writing is checked twice
@@ -1068,14 +1071,329 @@ static DWORD entries_in_acl(DWORD n, const uint8_t *entries, const uint8_t *old,
 }
 
 // ---- the security of objects -----------------------------------------------------------------------------------------
-// Kept: a token's own (in the token), the process's, and named objects' (by type and name). Other handles' are made up
-// when asked for and what is set on them is checked and accepted, not kept (a handle value is reused after
-// CloseHandle, which this file does not see).
+// A descriptor reported for an object says what the Mac really lets each account do to it, and a descriptor set on an
+// object either takes effect or is refused: nothing is reported as protected that is not.
+//  - Files and folders: their owner, group and mode bits, read with stat() every time (sd_of_file). A DACL set on one
+//    is carried out with chmod as far as mode bits can carry it: what it takes from the owner, the file's group or
+//    everyone else is taken away; what it would add is not (loosening is let pass, unapplied). When the Mac would
+//    still give someone a right the DACL takes from them (a folder others may write to, a macOS ACL, a file the user
+//    does not own), it is refused and nothing changes.
+//  - Registry keys: all of them live in registry.txt, so other accounts may do what its mode bits let them.
+//  - Kernel objects, tokens, the process and its threads: only this user's processes reach them (this process's
+//    memory, or shared memory only the user may open), and nothing checks a descriptor when one of them opens an
+//    object. A descriptor is accepted (and kept, to be reported back, where there is a place for it: tokens, the
+//    process, named objects) when it leaves the user's own token every right to the object, for then it takes nothing
+//    from anyone who can reach the object; one that would take a right from the user is refused with
+//    ERROR_NOT_SUPPORTED, as nothing could hold anyone to it.
+// The user's own token is the one every process here runs with (token_default): restricted and lower-integrity tokens
+// never leave this process (CreateProcessAsUser refuses them), so apart from the user only other macOS accounts are
+// there to keep out. What is compared for the user: a file's data (reading, writing, appending, running it), every
+// right to other objects but READ_CONTROL, WRITE_DAC (an owner has both on Windows too), WRITE_OWNER and DELETE; a
+// descriptor cannot take those, a file's attributes or its removal (its folder's business on the Mac) from the user
+// here. For other accounts every right is compared but seeing the descriptor. Windows' SYSTEM and administrators
+// have no counterpart a descriptor could keep out (root is not checked by the Mac either).
 typedef struct { int type; char *name; uint8_t *sd; } named_sd;
 static named_sd *g_named;
 static int g_nnamed;
 static uint8_t *g_process_sd;
 
+// GENERIC_READ, _WRITE, _EXECUTE and _ALL for a type (its GENERIC_MAPPING): files' and registry keys' as documented;
+// for kernel objects only GENERIC_ALL is taken to mean more than reading the descriptor, which can only make a
+// descriptor seem to give the user less (and so be refused), never more.
+static const DWORD k_file_map[4] = { 0x120089, 0x120116, 0x1200a0, 0x1f01ff };   // FILE_GENERIC_*, FILE_ALL_ACCESS
+static const DWORD k_key_map[4] = { 0x20019, 0x20006, 0x20019, 0xf003f };        // KEY_READ, KEY_WRITE, KEY_EXECUTE, KEY_ALL_ACCESS
+#define TOKEN_ALL_ACCESS 0xf01ffu
+static void kernel_map(DWORD all, DWORD *map) { map[0] = map[1] = READ_CONTROL; map[2] = READ_CONTROL | SYNCHRONIZE; map[3] = all; }
+static int is_key_type(int type) { return type == SE_REGISTRY_KEY || type == SE_REGISTRY_WOW64_32KEY || type == SE_REGISTRY_WOW64_64KEY; }
+#define USER_KEEPS (~(DWORD)(READ_CONTROL | WRITE_DAC | WRITE_OWNER | DELETE_RIGHT))   // (see above)
+
+// What full access to a kernel object behind a handle is (its type's *_ALL_ACCESS: Microsoft's "Security and Access
+// Rights" page of each type); every standard and specific right (0x1fffff) for a type not known here.
+const char *vx_object_type(HANDLE h);                     // sync.c
+static DWORD kernel_all_access(HANDLE h) {
+    if ((intptr_t)h == -1 || (intptr_t)h == -2) return 0x1fffff;                 // PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS
+    if (vx_handle_data(h, VX_HANDLE_MAPPING)) return 0xf001f;                     // SECTION_ALL_ACCESS
+    const char *k = vx_object_type(h);
+    if (k && (!strcmp(k, "Event") || !strcmp(k, "Semaphore") || !strcmp(k, "IoCompletion"))) return 0x1f0003;
+    if (k && !strcmp(k, "Mutant")) return 0x1f0001;                               // MUTANT_ALL_ACCESS
+    return 0x1fffff;
+}
+
+// A copy of an ACL (malloc'd; NULL for NULL) with each ACE's generic rights mapped, as Windows stores them on an object.
+static uint8_t *acl_mapped(const uint8_t *acl, const DWORD *map) {
+    if (!acl) return NULL;
+    uint8_t *c = calloc(1, acl_bytes(acl)), *ace;
+    memcpy(c, acl, rd16(acl + 2));
+    FOR_ACE(c, ace) if (ace_has_sid(ace[0]) && ace[0] != SYSTEM_MANDATORY_LABEL) {
+        DWORD m = rd32(ace + 4);
+        if (m & GENERIC_READ) m |= map[0];
+        if (m & GENERIC_WRITE) m |= map[1];
+        if (m & GENERIC_EXECUTE) m |= map[2];
+        if (m & GENERIC_ALL) m |= map[3];
+        wr32(ace + 4, m & ~GENERIC_BITS);
+    }
+    return c;
+}
+
+// Another local account (made up: someone else on the Mac), in the groups every local account is in, and `group`.
+#define OTHER_RID 0x7ffffffeu
+static token *token_other(const uint8_t *group) {
+    token *t = token_new();
+    uint8_t s[SID_MAX];
+    t->type = TOKEN_IMPERSONATION; t->level = SECURITY_IMPERSONATION;
+    sid_of(t->user.sid, 5, 5, MACHINE_SUBS, OTHER_RID);
+    sid_of(s, 5, 5, MACHINE_SUBS, NONE_RID); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON);
+    sid_of(s, 1, 1, 0); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON);
+    sid_of(s, 5, 2, 32, 545); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON);
+    sid_of(s, 5, 1, 4); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON);
+    sid_of(s, 2, 1, 0); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON);
+    sid_of(s, 5, 1, 11); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON);
+    sid_of(s, 5, 1, 15); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON);
+    sid_of(s, 5, 1, 113); add_sid_attr(&t->groups, &t->ngroups, s, GROUP_ON);
+    if (group) add_sid_attr(&t->groups, &t->ngroups, group, GROUP_ON);
+    sid_of(s, 16, 1, 8192); add_sid_attr(&t->groups, &t->ngroups, s, SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED);
+    memcpy(t->owner, t->user.sid, SID_MAX);
+    sid_of(t->primary, 5, 5, MACHINE_SUBS, NONE_RID);
+    t->policy = 3;
+    return t;
+}
+// The rights of `rel` that `real` (what the Mac does) gives `t` and `want` (a descriptor asked for) does not: the
+// protection `want` would promise and not have.
+static DWORD taken_from(token *t, const uint8_t *want, const uint8_t *real, const DWORD *map, DWORD rel) {
+    sd_parts w, r;
+    sd_read(want, &w); sd_read(real, &r);
+    return access_of(t, &r, MAXIMUM_ALLOWED, map) & ~access_of(t, &w, MAXIMUM_ALLOWED, map) & rel;
+}
+
+// Whether every directory above `path` lets other accounts through (search permission for the group or the rest).
+static int others_reach(const char *path) {
+    char dir[1100];
+    if (!realpath(path, dir)) snprintf(dir, sizeof dir, "%s", path);
+    for (char *slash; (slash = strrchr(dir, '/')); ) {
+        if (slash == dir) slash[1] = 0; else *slash = 0;
+        struct stat st;
+        if (!stat(dir, &st) && !(st.st_mode & 011)) return 0;
+        if (slash == dir) break;
+    }
+    return 1;
+}
+// What the Mac in effect gives an object nothing checks (malloc'd, self-relative): the user has every right; for
+// registry keys other accounts also what registry.txt's mode bits let them (read it, or rewrite it all).
+static uint8_t *sd_unchecked(int type, DWORD all) {
+    uint8_t user[SID_MAX], group[SID_MAX], world[12], ace[8 + SID_MAX];
+    user_sid(user); sid_of(group, 5, 5, MACHINE_SUBS, NONE_RID); sid_of(world, 1, 1, 0);
+    acl_buf b; ab_init(&b);
+    ace_make(ace, ACCESS_ALLOWED, 0, all, user, NULL, NULL); ab_add(&b, ace);
+    if (is_key_type(type)) {
+        char path[1100]; struct stat st;
+        snprintf(path, sizeof path, "%s/registry.txt", vx_root());
+        DWORD others = 0;
+        if (!stat(path, &st) && others_reach(path)) others = st.st_mode & 022 ? k_key_map[3] : st.st_mode & 044 ? k_key_map[0] : 0;
+        if (others) { ace_make(ace, ACCESS_ALLOWED, 0, others, world, NULL, NULL); ab_add(&b, ace); }
+    }
+    uint8_t *acl = ab_finish(&b);
+    sd_parts p = { SE_DACL_PRESENT, user, group, NULL, acl };
+    uint8_t *sd = sd_rel(&p, NULL, 0);
+    free(acl);
+    return sd;
+}
+// A descriptor for an object nothing checks: `cur` (NULL: what the Mac gives) with the parts `info` names replaced
+// (the DACL's generic rights mapped), into *out (malloc'd) when it takes from the user no right to the object and
+// from other accounts none the Mac gives them; ERROR_NOT_SUPPORTED (logged) when it does.
+static DWORD unchecked_set(int type, DWORD all, const uint8_t *cur, DWORD info, const uint8_t *owner, const uint8_t *group,
+                           const uint8_t *dacl, const uint8_t *sacl, uint8_t **out, const char *fn) {
+    DWORD map[4];
+    if (is_key_type(type)) memcpy(map, k_key_map, sizeof map); else kernel_map(all, map);
+    uint8_t *real = sd_unchecked(type, all), *mapped = info & DACL_SI ? acl_mapped(dacl, map) : NULL;
+    uint8_t *want = sd_merge(cur ? cur : real, info, owner, group, mapped, sacl);
+    token *u = token_default(), *o = token_other(NULL);
+    DWORD from_user = taken_from(u, want, real, map, map[3] & USER_KEEPS), from_others = taken_from(o, want, real, map, map[3] & ~READ_CONTROL);
+    token_free(u); token_free(o); free(real); free(mapped);
+    *out = NULL;
+    if (from_user || from_others) {
+        vx_log("%s: the descriptor would take rights %#x from %s, and nothing here could hold anyone to that: refused", fn,
+               from_user ? from_user : from_others, from_user ? "the user" : "other accounts, who have them");
+        free(want);
+        return ERROR_NOT_SUPPORTED;
+    }
+    *out = want;
+    return 0;
+}
+
+// ---- files ----
+// A file as the Mac protects it: its owner (the user, SYSTEM for root, S-1-22-1-<uid> for another Mac account: SIDs
+// of our own), its group (None, the user's primary group, when the user is in it; S-1-22-2-<gid> otherwise) and its
+// mode bits as ACEs: the owner's bits for the owner (with a deny ACE first for what the group or everyone else may do
+// and the owner may not: Unix gives an owner only the owner's bits), the group's for the group, the rest's for
+// Everyone. DELETE goes to whoever the folder lets remove the file. The allow entries of a macOS ACL on it are shown
+// as granted to Everyone (to whom is not worked out here: shown wider, never narrower).
+enum { F_RD = 0x1, F_WD = 0x2, F_AD = 0x4, F_REA = 0x8, F_WEA = 0x10, F_X = 0x20, F_DC = 0x40, F_RA = 0x80, F_WA = 0x100 };
+#define F_SEEN (READ_CONTROL | SYNCHRONIZE | F_RA)        // what anyone given an ACE may do: see the file's attributes
+typedef struct {
+    struct stat st;
+    int user_delete, owner_delete, others_delete;         // whom the folder lets remove it
+    DWORD acl_allow;                                      // what a macOS ACL on it allows someone
+} file_facts;
+static DWORD macos_acl_allows(const char *path, int fd) {
+    acl_t acl = path ? acl_get_file(path, ACL_TYPE_EXTENDED) : acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+    if (!acl) return 0;
+    static const struct { acl_perm_t perm; DWORD right; } k[] = {
+        { ACL_READ_DATA, F_RD }, { ACL_WRITE_DATA, F_WD }, { ACL_APPEND_DATA, F_AD }, { ACL_READ_EXTATTRIBUTES, F_REA },
+        { ACL_WRITE_EXTATTRIBUTES, F_WEA }, { ACL_EXECUTE, F_X }, { ACL_DELETE_CHILD, F_DC }, { ACL_READ_ATTRIBUTES, F_RA },
+        { ACL_WRITE_ATTRIBUTES, F_WA }, { ACL_DELETE, DELETE_RIGHT }, { ACL_READ_SECURITY, READ_CONTROL },
+        { ACL_WRITE_SECURITY, WRITE_DAC }, { ACL_CHANGE_OWNER, WRITE_OWNER },
+    };
+    DWORD r = 0;
+    acl_entry_t e;
+    for (int id = ACL_FIRST_ENTRY; !acl_get_entry(acl, id, &e); id = ACL_NEXT_ENTRY) {
+        acl_tag_t tag; acl_permset_t ps;
+        if (acl_get_tag_type(e, &tag) || tag != ACL_EXTENDED_ALLOW || acl_get_permset(e, &ps)) continue;
+        for (size_t i = 0; i < COUNT(k); i++) if (acl_get_perm_np(ps, k[i].perm) == 1) r |= k[i].right;
+    }
+    acl_free(acl);
+    return r;
+}
+// path: the file's Mac path; NULL when only its descriptor fd is known (a pipe, a terminal).
+static DWORD file_facts_of(const char *path, int fd, file_facts *f) {
+    memset(f, 0, sizeof *f);
+    if (path ? stat(path, &f->st) : fstat(fd, &f->st)) return vx_error_from_errno(errno);
+    f->acl_allow = macos_acl_allows(path, fd);
+    char parent[1100];
+    struct stat ps;
+    if (!path || strlen(path) >= sizeof parent) return 0;
+    snprintf(parent, sizeof parent, "%s", path);
+    char *slash = strrchr(parent, '/');
+    if (!slash) return 0;
+    if (slash == parent) slash[1] = 0; else *slash = 0;
+    if (stat(parent, &ps)) return 0;
+    uid_t me = getuid();
+    int sticky = (ps.st_mode & S_ISVTX) != 0, open_dir = !sticky && ((ps.st_mode & 030) == 030 || (ps.st_mode & 03) == 03);
+    f->others_delete = open_dir || (ps.st_uid != me && ps.st_uid != f->st.st_uid && ps.st_uid != 0);   // (or the folder's owner)
+    f->owner_delete = ps.st_uid == f->st.st_uid || open_dir;
+    f->user_delete = !access(parent, W_OK | X_OK) && (!sticky || f->st.st_uid == me || ps.st_uid == me);
+    return 0;
+}
+static DWORD unix_rights(int bits, int dir) {             // rwx (4 2 1) as file rights
+    return (bits & 4 ? F_RD | F_REA : 0) | (bits & 2 ? F_WD | F_AD | F_WEA | F_WA | (dir ? F_DC : 0) : 0) | (bits & 1 ? F_X : 0);
+}
+static int mode_bits(DWORD rights) { return (rights & F_RD ? 4 : 0) | (rights & F_WD ? 2 : 0) | (rights & F_X ? 1 : 0); }
+static void mac_owner_sid(uid_t uid, uint8_t *sid) {
+    if (uid == getuid()) user_sid(sid);
+    else if (!uid) sid_of(sid, 5, 1, 18);
+    else sid_of(sid, 22, 2, 1, (DWORD)uid);
+}
+static int user_in_group(gid_t gid) {
+    if (gid == getgid() || gid == getegid()) return 1;
+    gid_t list[1024];
+    int n = getgroups(1024, list);
+    for (int i = 0; i < n; i++) if (list[i] == gid) return 1;
+    return 0;
+}
+static void mac_group_sid(gid_t gid, uint8_t *sid) {
+    if (user_in_group(gid)) sid_of(sid, 5, 5, MACHINE_SUBS, NONE_RID); else sid_of(sid, 22, 2, 2, (DWORD)gid);
+}
+static uint8_t *sd_of_file(const file_facts *f, mode_t mode) {   // malloc'd, self-relative
+    uint8_t owner[SID_MAX], group[SID_MAX], user[SID_MAX], world[12], ace[8 + SID_MAX];
+    int dir = S_ISDIR(f->st.st_mode), mine = f->st.st_uid == getuid();
+    DWORD o = unix_rights(mode >> 6 & 7, dir), g = unix_rights(mode >> 3 & 7, dir), e = unix_rights(mode & 7, dir);
+    DWORD others_delete = f->others_delete ? DELETE_RIGHT : 0;
+    mac_owner_sid(f->st.st_uid, owner); mac_group_sid(f->st.st_gid, group); user_sid(user); sid_of(world, 1, 1, 0);
+    acl_buf b; ab_init(&b);
+    if (mine && ((g | e) & ~(o | F_WA))) { ace_make(ace, ACCESS_DENIED, 0, (g | e) & ~(o | F_WA), user, NULL, NULL); ab_add(&b, ace); }
+    DWORD own = o | F_SEEN | F_WA | WRITE_DAC | ((mine ? f->user_delete : f->owner_delete) ? DELETE_RIGHT : 0);   // (an owner may chmod)
+    ace_make(ace, ACCESS_ALLOWED, 0, own, owner, NULL, NULL); ab_add(&b, ace);
+    if (!mine && f->user_delete) { ace_make(ace, ACCESS_ALLOWED, 0, DELETE_RIGHT, user, NULL, NULL); ab_add(&b, ace); }
+    if (g || others_delete) { ace_make(ace, ACCESS_ALLOWED, 0, g | F_SEEN | others_delete, group, NULL, NULL); ab_add(&b, ace); }
+    if (e || others_delete || f->acl_allow) { ace_make(ace, ACCESS_ALLOWED, 0, e | F_SEEN | others_delete | f->acl_allow, world, NULL, NULL); ab_add(&b, ace); }
+    uint8_t *acl = ab_finish(&b);
+    sd_parts p = { SE_DACL_PRESENT, owner, group, NULL, acl };
+    uint8_t *sd = sd_rel(&p, NULL, 0);
+    free(acl);
+    return sd;
+}
+
+// A file or folder named by a Windows path, or behind a handle (its path asked of macOS, then taken as a name): one
+// way to it for both, so a name and a handle see the same file. has_path 0: only fd (a pipe, a terminal).
+typedef struct { char win[1100], path[1100]; int fd, has_path; } file_ref;
+static DWORD file_by_name(const WCHAR *wname, file_ref *r) {
+    memset(r, 0, sizeof *r);
+    r->fd = -1;
+    DWORD (WINAPI *attrs)(const WCHAR *) = (DWORD (WINAPI *)(const WCHAR *))vx_find_export("kernel32.dll", "GetFileAttributesW");
+    if (!attrs) return ERROR_NOT_SUPPORTED;
+    if (attrs(wname) == 0xffffffffu) { DWORD e = vx_get_last_error(); return e == ERROR_PATH_NOT_FOUND ? e : ERROR_FILE_NOT_FOUND; }
+    vx_utf16_to_utf8(wname, vx_wcslen(wname) + 1, r->win, sizeof r->win);
+    if (!vx_unix_path(r->win, r->path, sizeof r->path)) return ERROR_PATH_NOT_FOUND;
+    r->has_path = 1;
+    return 0;
+}
+static DWORD file_by_handle(HANDLE h, file_ref *r) {
+    memset(r, 0, sizeof *r);
+    if ((r->fd = vx_handle_fd(h)) < 0) return ERROR_INVALID_HANDLE;
+    char mac[1024];                                       // (MAXPATHLEN: what F_GETPATH writes at most)
+    if (fcntl(r->fd, F_GETPATH, mac) != -1) {
+        vx_windows_path(mac, r->win, sizeof r->win);
+        r->has_path = vx_unix_path(r->win, r->path, sizeof r->path);   // (the overlay's copy, if written: as by name)
+    }
+    return 0;
+}
+static DWORD file_get(const file_ref *r, DWORD info, uint8_t **out, DWORD *size) {
+    if (info & SACL_SI) return ERROR_PRIVILEGE_NOT_HELD;
+    file_facts f;
+    DWORD err = file_facts_of(r->has_path ? r->path : NULL, r->fd, &f);
+    if (err) return err;
+    uint8_t *sd = sd_of_file(&f, f.st.st_mode);
+    *out = sd_select(sd, info, size);                     // (no label: the Mac has none, and nothing below medium runs)
+    free(sd);
+    return *out ? 0 : ERROR_NOT_ENOUGH_MEMORY;
+}
+// Setting: the owner only as it is (chown is root's); the primary group and a label (no higher than the user's: what
+// it keeps out runs nowhere here) are taken and not applied, as neither changes who may do what on the Mac; the DACL
+// as the Mac's mode bits can carry it (see above).
+static DWORD file_set(const file_ref *r, DWORD info, const uint8_t *owner, const uint8_t *dacl) {
+    file_facts f;
+    DWORD err = file_facts_of(r->has_path ? r->path : NULL, r->fd, &f);
+    if (err) return err;
+    uint8_t now_owner[SID_MAX], gsid[SID_MAX];
+    mac_owner_sid(f.st.st_uid, now_owner); mac_group_sid(f.st.st_gid, gsid);
+    if ((info & OWNER_SI) && !sid_eq(owner, now_owner)) { vx_log("security of %s: another owner: refused (only root changes owners on the Mac)", r->win); return ERROR_ACCESS_DENIED; }
+    if (!(info & DACL_SI)) return 0;
+    uint8_t *real = sd_of_file(&f, f.st.st_mode), *mapped = acl_mapped(dacl, k_file_map);
+    uint8_t *want = sd_merge(real, DACL_SI, NULL, NULL, mapped, NULL);
+    token *u = token_default(), *og = token_other(gsid), *oo = token_other(NULL);
+    sd_parts w;
+    sd_read(want, &w);
+    int qu = mode_bits(access_of(u, &w, MAXIMUM_ALLOWED, k_file_map)), qg = mode_bits(access_of(og, &w, MAXIMUM_ALLOWED, k_file_map));
+    int qo = mode_bits(access_of(oo, &w, MAXIMUM_ALLOWED, k_file_map));
+    // each class of the mode the bits all its members may have (the user is the owner, or in the group or the rest)
+    int mine = f.st.st_uid == getuid(), in_group = user_in_group(f.st.st_gid);
+    int bits = mine ? qu << 6 | qg << 3 | qo : 7 << 6 | (in_group ? qu & qg : qg) << 3 | (in_group ? qo : qu & qo);
+    mode_t now = f.st.st_mode & 07777, target = (mode_t)(now & (07000 | bits));   // (only taken away, never added)
+    uint8_t *after = sd_of_file(&f, target);
+    const DWORD others = F_RD | F_WD | F_AD | F_REA | F_WEA | F_X | F_DC | F_WA | DELETE_RIGHT | WRITE_DAC | WRITE_OWNER;
+    const char *who = "the user";
+    DWORD lost = taken_from(u, want, after, k_file_map, F_RD | F_WD | F_AD | F_X);
+    if (!lost && (lost = taken_from(og, want, after, k_file_map, others))) who = "the file's group";
+    if (!lost && (lost = taken_from(oo, want, after, k_file_map, others))) who = "everyone else";
+    token_free(u); token_free(og); token_free(oo);
+    free(real); free(mapped); free(want); free(after);
+    if (lost) {
+        vx_log("security of %s: the DACL takes rights %#x from %s, which the Mac's permissions would still give: refused", r->win, lost, who);
+        return ERROR_NOT_SUPPORTED;
+    }
+    if (target == now) return 0;
+    int rc;
+    if (r->has_path) {                                    // under an overlaid tree, the overlay's copy (never the original)
+        char wpath[1100];
+        if (!vx_unix_path_write(r->win, wpath, sizeof wpath, 1)) return ERROR_PATH_NOT_FOUND;
+        if (strcmp(wpath, r->path) && S_ISDIR(f.st.st_mode)) { vx_log("security of %s: a folder of an overlaid tree (its original is not changed): refused", r->win); return ERROR_NOT_SUPPORTED; }
+        rc = chmod(wpath, target);
+    } else rc = fchmod(r->fd, target);
+    if (rc) return vx_error_from_errno(errno);
+    if (vx_trace) vx_log("security of %s: mode %o -> %o", r->win, (unsigned)now, (unsigned)target);
+    return 0;
+}
+
+// ---- handles and names ----
 // The token a handle means, if it is one (pseudo-handles included); no error when not.
 static token *token_if_any(HANDLE h) { DWORD err; return token_get(h, &err); }
 
@@ -1107,59 +1425,56 @@ static DWORD check_settable(DWORD info, const uint8_t *owner, const uint8_t *gro
     pthread_mutex_unlock(&g_lock);
     return err;
 }
+static int is_kernel_type(int type) { return type == SE_KERNEL_OBJECT || type == SE_UNKNOWN_OBJECT_TYPE; }
+static int is_file_handle(HANDLE h, int type) { return type == SE_FILE_OBJECT || (is_kernel_type(type) && vx_handle_fd(h) >= 0); }
 static uint8_t **kept_sd(HANDLE h, int type, token *t) {   // (g_lock held) where a handle's descriptor is kept, if anywhere
     if (t) return &t->sd;
-    return (type == SE_KERNEL_OBJECT || type == SE_UNKNOWN_OBJECT_TYPE) && (intptr_t)h == -1 ? &g_process_sd : NULL;
+    return is_kernel_type(type) && (intptr_t)h == -1 ? &g_process_sd : NULL;
+}
+static DWORD handle_all_access(HANDLE h, int type, token *t) {
+    return t ? TOKEN_ALL_ACCESS : is_key_type(type) ? k_key_map[3] : kernel_all_access(h);
 }
 static DWORD object_get(HANDLE h, int type, DWORD info, uint8_t **out, DWORD *size) {
     if (!h) return ERROR_INVALID_HANDLE;
+    if (is_file_handle(h, type)) { file_ref r; DWORD err = file_by_handle(h, &r); return err ? err : file_get(&r, info, out, size); }
     if (info & SACL_SI) return ERROR_PRIVILEGE_NOT_HELD;
-    if (type == SE_FILE_OBJECT && vx_handle_fd(h) < 0) return ERROR_INVALID_HANDLE;
-    token *t = (type == SE_KERNEL_OBJECT || type == SE_UNKNOWN_OBJECT_TYPE) ? token_if_any(h) : NULL;
+    token *t = is_kernel_type(type) ? token_if_any(h) : NULL;
     if (!t && (intptr_t)h == -5) return ERROR_NO_TOKEN;
+    uint8_t *real = sd_unchecked(type, handle_all_access(h, type, t));
     pthread_mutex_lock(&g_lock);
     uint8_t **kept = kept_sd(h, type, t);
-    uint8_t *made = kept && *kept ? NULL : sd_default(type);
-    *out = sd_select(kept && *kept ? *kept : made, info, size);
+    *out = sd_select(kept && *kept ? *kept : real, info, size);
     pthread_mutex_unlock(&g_lock);
-    free(made);
+    free(real);
     token_unref(t);
     return *out ? 0 : ERROR_NOT_ENOUGH_MEMORY;
 }
 static DWORD object_set(HANDLE h, int type, DWORD info, const uint8_t *owner, const uint8_t *group, const uint8_t *dacl, const uint8_t *sacl) {
     if (!h) return ERROR_INVALID_HANDLE;
-    if (type == SE_FILE_OBJECT && vx_handle_fd(h) < 0) return ERROR_INVALID_HANDLE;
-    DWORD err = check_settable(info, owner, group, dacl, sacl);
-    if (err) return err;
-    token *t = (type == SE_KERNEL_OBJECT || type == SE_UNKNOWN_OBJECT_TYPE) ? token_if_any(h) : NULL;
+    int file = is_file_handle(h, type);
+    file_ref r;
+    DWORD err = file ? file_by_handle(h, &r) : 0;
+    if (err || (err = check_settable(info, owner, group, dacl, sacl))) return err;
+    if (file) return file_set(&r, info, owner, dacl);
+    token *t = is_kernel_type(type) ? token_if_any(h) : NULL;
     if (!t && (intptr_t)h == -5) return ERROR_NO_TOKEN;
     pthread_mutex_lock(&g_lock);
-    uint8_t **kept = kept_sd(h, type, t);
-    if (kept) {
-        uint8_t *cur = *kept ? *kept : sd_default(type);
-        uint8_t *n = sd_merge(cur, info, owner, group, dacl, sacl);
-        if (cur != *kept) free(cur);
-        free(*kept); *kept = n;
-    } else if (vx_trace) vx_log("SetSecurityInfo(%p, type %d, info %#x): checked, not kept", h, type, info);
+    uint8_t **kept = kept_sd(h, type, t), *n;
+    err = unchecked_set(type, handle_all_access(h, type, t), kept ? *kept : NULL, info, owner, group, dacl, sacl, &n, "SetSecurityInfo");
+    if (!err && kept) { free(*kept); *kept = n; }
+    else free(n);                                         // (a handle with nowhere to keep it: it takes nothing from anyone)
     pthread_mutex_unlock(&g_lock);
     token_unref(t);
-    return 0;
+    return err;
 }
 
-// Named objects: the name checked as Windows would open it (a file or directory that exists, a registry key that
-// opens, a kernel object one of the Open* functions finds), the descriptor kept by type and canonical name.
-static DWORD named_key(const WCHAR *wname, int type, char *key, size_t cap) {
+// Named objects other than files: the name checked as Windows would open it (a registry key that opens, a kernel
+// object one of the Open* functions finds; *all: that type's full access), the descriptor kept by type and name.
+static DWORD named_key(const WCHAR *wname, int type, char *key, size_t cap, DWORD *all) {
     if (!wname) return ERROR_INVALID_PARAMETER;
     char name[1024];
     vx_utf16_to_utf8(wname, vx_wcslen(wname) + 1, name, sizeof name);
     switch (type) {
-    case SE_FILE_OBJECT: {
-        DWORD (WINAPI *attrs)(const WCHAR *) = (DWORD (WINAPI *)(const WCHAR *))vx_find_export("kernel32.dll", "GetFileAttributesW");
-        if (!attrs) return ERROR_NOT_SUPPORTED;
-        if (attrs(wname) == 0xffffffffu) { DWORD e = vx_get_last_error(); return e == ERROR_PATH_NOT_FOUND ? e : ERROR_FILE_NOT_FOUND; }
-        if (!vx_full_path(name, key, cap)) return ERROR_PATH_NOT_FOUND;
-        break;
-    }
     case SE_REGISTRY_KEY: case SE_REGISTRY_WOW64_32KEY: case SE_REGISTRY_WOW64_64KEY: {
         static const char *roots[] = { "CLASSES_ROOT", "CURRENT_USER", "MACHINE", "USERS", "", "CURRENT_CONFIG" };
         int root = -1;
@@ -1177,18 +1492,21 @@ static DWORD named_key(const WCHAR *wname, int type, char *key, size_t cap) {
         if (r) return (DWORD)r;
         close(k);
         snprintf(key, cap, "%s", name);
+        *all = k_key_map[3];
         break;
     }
     case SE_KERNEL_OBJECT: {
         static const char *opens[] = { "OpenEventW", "OpenMutexW", "OpenSemaphoreW", "OpenFileMappingW" };
-        int found = 0;
-        for (int i = 0; i < 4 && !found; i++) {
+        static const DWORD alls[] = { 0x1f0003, 0x1f0001, 0x1f0003, 0xf001f };   // EVENT_, MUTANT_, SEMAPHORE_, SECTION_ALL_ACCESS
+        int found = -1;
+        for (int i = 0; i < 4 && found < 0; i++) {
             HANDLE (WINAPI *open)(DWORD, BOOL, const WCHAR *) = (HANDLE (WINAPI *)(DWORD, BOOL, const WCHAR *))vx_find_export("kernel32.dll", opens[i]);
             HANDLE o = open ? open(i == 3 ? 4 /* FILE_MAP_READ */ : SYNCHRONIZE, 0, wname) : NULL;
-            if (o) { vx_handle_close(o); found = 1; }
+            if (o) { vx_handle_close(o); found = i; }
         }
-        if (!found) return ERROR_FILE_NOT_FOUND;
+        if (found < 0) return ERROR_FILE_NOT_FOUND;
         snprintf(key, cap, "%s", name);
+        *all = alls[found];
         break;
     }
     case SE_SERVICE: return ERROR_SERVICE_DOES_NOT_EXIST;   // (no service manager)
@@ -1199,39 +1517,53 @@ static DWORD named_key(const WCHAR *wname, int type, char *key, size_t cap) {
     return 0;
 }
 static named_sd *named_find(int type, const char *key) {   // (g_lock held)
-    int base = type == SE_REGISTRY_WOW64_32KEY || type == SE_REGISTRY_WOW64_64KEY ? SE_REGISTRY_KEY : type;
+    int base = is_key_type(type) ? SE_REGISTRY_KEY : type;
     for (int i = 0; i < g_nnamed; i++) if (g_named[i].type == base && !strcasecmp(g_named[i].name, key)) return &g_named[i];
     return NULL;
 }
 static DWORD named_get(const WCHAR *wname, int type, DWORD info, uint8_t **out, DWORD *size) {
+    if (type == SE_FILE_OBJECT) {
+        file_ref r;
+        DWORD err = wname ? file_by_name(wname, &r) : ERROR_INVALID_PARAMETER;
+        return err ? err : file_get(&r, info, out, size);
+    }
     char key[1100];
-    DWORD err = named_key(wname, type, key, sizeof key);
+    DWORD all, err = named_key(wname, type, key, sizeof key, &all);
     if (err) return err;
     if (info & SACL_SI) return ERROR_PRIVILEGE_NOT_HELD;
+    uint8_t *real = sd_unchecked(type, all);
     pthread_mutex_lock(&g_lock);
     named_sd *n = named_find(type, key);
-    uint8_t *made = n ? NULL : sd_default(type);
-    *out = sd_select(n ? n->sd : made, info, size);
+    *out = sd_select(n ? n->sd : real, info, size);
     pthread_mutex_unlock(&g_lock);
-    free(made);
+    free(real);
     return *out ? 0 : ERROR_NOT_ENOUGH_MEMORY;
 }
 static DWORD named_set(const WCHAR *wname, int type, DWORD info, const uint8_t *owner, const uint8_t *group, const uint8_t *dacl, const uint8_t *sacl) {
+    if (type == SE_FILE_OBJECT) {
+        file_ref r;
+        DWORD err = wname ? file_by_name(wname, &r) : ERROR_INVALID_PARAMETER;
+        if (err || (err = check_settable(info, owner, group, dacl, sacl))) return err;
+        return file_set(&r, info, owner, dacl);
+    }
     char key[1100];
-    DWORD err = named_key(wname, type, key, sizeof key);
+    DWORD all, err = named_key(wname, type, key, sizeof key, &all);
     if (err || (err = check_settable(info, owner, group, dacl, sacl))) return err;
     pthread_mutex_lock(&g_lock);
     named_sd *n = named_find(type, key);
-    if (!n) {
-        g_named = realloc(g_named, (size_t)(g_nnamed + 1) * sizeof *g_named);
-        n = &g_named[g_nnamed++];
-        n->type = type == SE_REGISTRY_WOW64_32KEY || type == SE_REGISTRY_WOW64_64KEY ? SE_REGISTRY_KEY : type;
-        n->name = strdup(key); n->sd = sd_default(type);
+    uint8_t *m;
+    err = unchecked_set(type, all, n ? n->sd : NULL, info, owner, group, dacl, sacl, &m, "SetNamedSecurityInfo");
+    if (!err) {
+        if (!n) {
+            g_named = realloc(g_named, (size_t)(g_nnamed + 1) * sizeof *g_named);
+            n = &g_named[g_nnamed++];
+            n->type = is_key_type(type) ? SE_REGISTRY_KEY : type;
+            n->name = strdup(key); n->sd = NULL;
+        }
+        free(n->sd); n->sd = m;
     }
-    uint8_t *m = sd_merge(n->sd, info, owner, group, dacl, sacl);
-    free(n->sd); n->sd = m;
     pthread_mutex_unlock(&g_lock);
-    return 0;
+    return err;
 }
 // GetSecurityInfo's outputs: pointers into the descriptor it returns (a caller that wants no descriptor gets the parts
 // anyway, in memory it cannot free).
@@ -1599,7 +1931,7 @@ static WINAPI BOOL MakeAbsoluteSD(const uint8_t *rel, uint8_t *abs, DWORD *abs_l
     sd_parts p;
     if (!sd_read(rel, &p)) { vx_set_last_error(ERROR_UNKNOWN_REVISION); return 0; }
     if (!(p.control & SE_SELF_RELATIVE)) { vx_set_last_error(ERROR_BAD_DESCRIPTOR_FORMAT); return 0; }
-    DWORD need[5] = { 40, p.dacl ? acl_size(p.dacl) : 0, p.sacl ? acl_size(p.sacl) : 0, p.owner ? sid_len(p.owner) : 0, p.group ? sid_len(p.group) : 0 };
+    DWORD need[5] = { 40, p.dacl ? acl_bytes(p.dacl) : 0, p.sacl ? acl_bytes(p.sacl) : 0, p.owner ? sid_len(p.owner) : 0, p.group ? sid_len(p.group) : 0 };
     DWORD *have[5] = { abs_len, dacl_len, sacl_len, owner_len, group_len };
     uint8_t *buf[5] = { abs, dacl, sacl, owner, group };
     int small = 0;
@@ -1673,9 +2005,10 @@ static WINAPI BOOL OpenProcessToken(HANDLE process, DWORD access, HANDLE *out) {
 }
 static WINAPI BOOL OpenThreadToken(HANDLE thread, DWORD access, BOOL as_self, HANDLE *out) {
     (void)access; (void)as_self;
-    DWORD tid = thread_id_of(thread);
+    int foreign;
+    DWORD tid = thread_id_of(thread, &foreign);
     *out = NULL;
-    if (!tid) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
+    if (!tid) return no_thread(foreign, "OpenThreadToken");
     pthread_mutex_lock(&g_lock);
     token *t = token_ref(thread_token_of(tid));
     pthread_mutex_unlock(&g_lock);
@@ -1764,7 +2097,7 @@ static WINAPI BOOL GetTokenInformation(HANDLE h, int cls, uint8_t *out, DWORD si
     case 30: b_groups(&b, NULL, 0); break;                                                         // TokenCapabilities: none
     case 31: b_room(&b, 8, 8); break;                                                              // TokenAppContainerSid: none
     case 32: fixed = 1; b_dword(&b, 0); break;                                                     // TokenAppContainerNumber
-    case 40: fixed = 1; b_dword(&b, t->nrestricted > 0); break;                                     // TokenIsRestricted
+    case 40: fixed = 1; b_dword(&b, t->is_restricted != 0); break;                                  // TokenIsRestricted
     default: err = ERROR_INVALID_PARAMETER;
     }
     pthread_mutex_unlock(&g_lock);
@@ -1799,8 +2132,8 @@ static WINAPI BOOL SetTokenInformation(HANDLE h, int cls, const uint8_t *in, DWO
         if (size < 8 || !in) { err = ERROR_BAD_LENGTH; break; }
         if (acl && !acl_ok(acl)) { err = ERROR_INVALID_ACL; break; }
         free(t->dacl);
-        t->dacl = acl ? malloc(acl_size(acl)) : NULL;
-        if (acl) memcpy(t->dacl, acl, acl_size(acl));
+        t->dacl = acl ? malloc(acl_bytes(acl)) : NULL;
+        if (acl) memcpy(t->dacl, acl, acl_bytes(acl));
         break;
     }
     case 24:                                              // TokenVirtualizationEnabled
@@ -1838,11 +2171,23 @@ static token *duplicate(HANDLE h, int type, int level, const uint8_t *sa, DWORD 
     }
     const uint8_t *sd = sa && rd32(sa) >= 16 ? rdptr(sa + 8) : NULL;
     sd_parts p;
+    uint8_t *kept = NULL;
     if (sd && !sd_valid(sd, &p)) { token_unref(s); *err = ERROR_INVALID_SECURITY_DESCR; return NULL; }
+    if (sd) {                                             // the new token's descriptor: what SetSecurityInfo would take
+        uint8_t *audit = p.sacl ? labels_of(p.sacl, 0) : NULL;   // (a SACL's other ACEs need SeSecurityPrivilege)
+        DWORD info = (p.owner ? OWNER_SI : 0) | (p.group ? GROUP_SI : 0) | (p.control & SE_DACL_PRESENT ? DACL_SI : 0) |
+                     (p.sacl ? (rd16(audit + 4) ? SACL_SI : LABEL_SI) : 0);
+        free(audit);
+        if ((*err = check_settable(info, p.owner, p.group, p.dacl, p.sacl))) { token_unref(s); return NULL; }
+        pthread_mutex_lock(&g_lock);
+        *err = unchecked_set(SE_KERNEL_OBJECT, TOKEN_ALL_ACCESS, NULL, info, p.owner, p.group, p.dacl, p.sacl, &kept, "DuplicateTokenEx");
+        pthread_mutex_unlock(&g_lock);
+        if (*err) { token_unref(s); return NULL; }
+    }
     pthread_mutex_lock(&g_lock);
     token *t = token_copy(s);
     t->type = type; t->level = type == TOKEN_IMPERSONATION ? level : 0;
-    if (sd) t->sd = sd_rel(&p, NULL, 0);
+    t->sd = kept;
     pthread_mutex_unlock(&g_lock);
     token_unref(s);
     return t;
@@ -1879,19 +2224,24 @@ static WINAPI BOOL CreateRestrictedToken(HANDLE h, DWORD flags, DWORD ndisable, 
             if (!(t->groups[i].attr & SE_GROUP_INTEGRITY) && sid_eq(sid, t->groups[i].sid))
                 t->groups[i].attr = (t->groups[i].attr & ~(DWORD)(SE_GROUP_ENABLED | SE_GROUP_ENABLED_BY_DEFAULT)) | SE_GROUP_USE_FOR_DENY_ONLY;
     }
-    if (nrestrict) {                                      // restricting SIDs: on a restricted token, only those in both lists
+    // A restricted token made from another gives no more than it: its restricting SIDs are those both lists have (none
+    // in common: none, and the token stays restricted, so the second pass grants nothing), and it is write-restricted
+    // only when both are (a fully restricted token's reads stay checked against its restricting SIDs).
+    if (nrestrict) {
         sid_attr *list = NULL; int n = 0;
         for (DWORD k = 0; k < nrestrict; k++) {
             const uint8_t *sid = rdptr(restrict_sids + 16 * k);
-            int keep = !s->nrestricted, dup = 0;
+            int keep = !s->is_restricted, dup = 0;
             for (int i = 0; i < s->nrestricted && !keep; i++) keep = sid_eq(s->restricted[i].sid, sid);
             for (int i = 0; i < n && !dup; i++) dup = sid_eq(list[i].sid, sid);
             if (keep && !dup) add_sid_attr(&list, &n, sid, GROUP_ON);
         }
         free(t->restricted); t->restricted = list; t->nrestricted = n;
     }
+    int write_only = (flags & 8) != 0;                    // WRITE_RESTRICTED
+    t->write_restricted = write_only && (!s->is_restricted || s->write_restricted);
+    t->is_restricted = s->is_restricted || nrestrict || write_only;   // (once restricted, always)
     if (flags & 2) t->sandbox_inert = 1;
-    if (flags & 8) t->write_restricted = 1;
     t->filtered = 1;
     pthread_mutex_unlock(&g_lock);
     token_unref(s);
@@ -1903,12 +2253,126 @@ static WINAPI BOOL IsTokenRestricted(HANDLE h) {
     DWORD err;
     token *t = token_get(h, &err);
     if (!t) { vx_set_last_error(err); return 0; }
-    BOOL r = t->nrestricted > 0;
+    BOOL r = t->is_restricted != 0;
     token_unref(t);
     vx_set_last_error(0);
     return r;
 }
 static WINAPI BOOL AllocateLocallyUniqueId(DWORD *luid) { uint64_t v = new_luid(); luid[0] = (DWORD)v; luid[1] = (DWORD)(v >> 32); return 1; }
+
+// ---- privileges ----
+// Their names and LUIDs (winnt.h's SE_*_NAME; the LUID's low part is wdm.h's SE_*_PRIVILEGE, its high part 0).
+static const char *const k_privileges[] = {
+    [2] = "SeCreateTokenPrivilege", [3] = "SeAssignPrimaryTokenPrivilege", [4] = "SeLockMemoryPrivilege",
+    [5] = "SeIncreaseQuotaPrivilege", [6] = "SeMachineAccountPrivilege", [7] = "SeTcbPrivilege", [8] = "SeSecurityPrivilege",
+    [9] = "SeTakeOwnershipPrivilege", [10] = "SeLoadDriverPrivilege", [11] = "SeSystemProfilePrivilege",
+    [12] = "SeSystemtimePrivilege", [13] = "SeProfileSingleProcessPrivilege", [14] = "SeIncreaseBasePriorityPrivilege",
+    [15] = "SeCreatePagefilePrivilege", [16] = "SeCreatePermanentPrivilege", [17] = "SeBackupPrivilege",
+    [18] = "SeRestorePrivilege", [19] = "SeShutdownPrivilege", [20] = "SeDebugPrivilege", [21] = "SeAuditPrivilege",
+    [22] = "SeSystemEnvironmentPrivilege", [23] = "SeChangeNotifyPrivilege", [24] = "SeRemoteShutdownPrivilege",
+    [25] = "SeUndockPrivilege", [26] = "SeSyncAgentPrivilege", [27] = "SeEnableDelegationPrivilege",
+    [28] = "SeManageVolumePrivilege", [29] = "SeImpersonatePrivilege", [30] = "SeCreateGlobalPrivilege",
+    [31] = "SeTrustedCredManAccessPrivilege", [32] = "SeRelabelPrivilege", [33] = "SeIncreaseWorkingSetPrivilege",
+    [34] = "SeTimeZonePrivilege", [35] = "SeCreateSymbolicLinkPrivilege", [36] = "SeDelegateSessionUserImpersonatePrivilege",
+};
+static BOOL privilege_value(const char *name, DWORD *luid) {
+    if (!luid) { vx_set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    for (DWORD i = 0; name && i < COUNT(k_privileges); i++)
+        if (k_privileges[i] && !strcasecmp(k_privileges[i], name)) { luid[0] = i; luid[1] = 0; return 1; }
+    vx_set_last_error(ERROR_NO_SUCH_PRIVILEGE);
+    return 0;
+}
+static WINAPI BOOL LookupPrivilegeValueA(const char *sys, const char *name, DWORD *luid) { (void)sys; return privilege_value(name, luid); }
+static WINAPI BOOL LookupPrivilegeValueW(const WCHAR *sys, const WCHAR *name, DWORD *luid) {
+    (void)sys;
+    char a[64] = "";
+    if (name && vx_wcslen(name) < sizeof a) vx_utf16_to_utf8(name, vx_wcslen(name) + 1, a, sizeof a);
+    return privilege_value(name && a[0] ? a : NULL, luid);
+}
+// LookupPrivilegeName: *n is the buffer's size in characters; on return the name's length, or (too small) the size
+// it needs with its terminating zero.
+static BOOL privilege_name(const DWORD *luid, void *out, DWORD *n, int wide) {
+    const char *name = luid && !luid[1] && luid[0] < COUNT(k_privileges) ? k_privileges[luid[0]] : NULL;
+    if (!name) { vx_set_last_error(ERROR_NO_SUCH_PRIVILEGE); return 0; }
+    if (!n) { vx_set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    DWORD len = (DWORD)strlen(name);
+    if (!out || *n <= len) { *n = len + 1; vx_set_last_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
+    if (wide) vx_utf8_to_utf16(name, len + 1, out, len + 1); else memcpy(out, name, len + 1);
+    *n = len;
+    return 1;
+}
+static WINAPI BOOL LookupPrivilegeNameW(const WCHAR *sys, const DWORD *luid, WCHAR *name, DWORD *n) { (void)sys; return privilege_name(luid, name, n, 1); }
+static WINAPI BOOL LookupPrivilegeNameA(const char *sys, const DWORD *luid, char *name, DWORD *n) { (void)sys; return privilege_name(luid, name, n, 0); }
+// AdjustTokenPrivileges: enables, disables or removes privileges the token has (it gives none it lacks: those make
+// the last error ERROR_NOT_ALL_ASSIGNED, with success). The previous state lists the privileges it changed, with
+// their attributes before; when that does not fit, nothing changes and *ret says the size needed.
+static WINAPI BOOL AdjustTokenPrivileges(HANDLE h, BOOL disable_all, const uint8_t *state, DWORD len, uint8_t *prev, DWORD *ret) {
+    if ((!disable_all && !state) || (prev && !ret)) { vx_set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    DWORD err;
+    token *t = token_get(h, &err);
+    if (!t) { vx_set_last_error(err); return 0; }
+    pthread_mutex_lock(&g_lock);
+    DWORD *attr = calloc((size_t)t->nprivs + 1, sizeof *attr), changed = 0;
+    int missing = 0;
+    for (int i = 0; i < t->nprivs; i++) attr[i] = t->privs[i].attr;
+    if (disable_all) for (int i = 0; i < t->nprivs; i++) attr[i] &= ~(DWORD)SE_PRIVILEGE_ENABLED;
+    else
+        for (DWORD k = 0, count = rd32(state); k < count; k++) {
+            const uint8_t *e = state + 4 + 12 * (size_t)k;
+            DWORD low = rd32(e), high = rd32(e + 4), a = rd32(e + 8);
+            int i = 0;
+            while (i < t->nprivs && (high || t->privs[i].luid != low)) i++;
+            if (i == t->nprivs) { missing = 1; continue; }
+            if (a & SE_PRIVILEGE_REMOVED) attr[i] = SE_PRIVILEGE_REMOVED;   // (marks it to go)
+            else if (a & SE_PRIVILEGE_ENABLED) attr[i] |= SE_PRIVILEGE_ENABLED;
+            else attr[i] &= ~(DWORD)SE_PRIVILEGE_ENABLED;
+        }
+    for (int i = 0; i < t->nprivs; i++) changed += attr[i] != t->privs[i].attr;
+    DWORD need = 4 + 12 * changed;
+    if (ret) *ret = need;
+    err = 0;
+    if (prev && len < need) err = ERROR_INSUFFICIENT_BUFFER;
+    else {
+        if (prev) {
+            wr32(prev, changed);
+            for (int i = 0, k = 0; i < t->nprivs; i++)
+                if (attr[i] != t->privs[i].attr) { wr32(prev + 4 + 12 * k, t->privs[i].luid); wr32(prev + 8 + 12 * k, 0); wr32(prev + 12 + 12 * k, t->privs[i].attr); k++; }
+        }
+        int n = 0;
+        for (int i = 0; i < t->nprivs; i++) if (attr[i] != SE_PRIVILEGE_REMOVED) { t->privs[n] = t->privs[i]; t->privs[n++].attr = attr[i]; }
+        t->nprivs = n;
+        if (changed) t->modified = new_luid();
+    }
+    pthread_mutex_unlock(&g_lock);
+    free(attr);
+    token_unref(t);
+    if (err) { vx_set_last_error(err); return 0; }
+    vx_set_last_error(missing ? ERROR_NOT_ALL_ASSIGNED : 0);
+    return 1;
+}
+// PrivilegeCheck: whether a client's (impersonation) token has the privileges of a PRIVILEGE_SET (count, control, then
+// LUID_AND_ATTRIBUTES) enabled, all of them or any one as its control says; each one enabled is marked used.
+static WINAPI BOOL PrivilegeCheck(HANDLE h, uint8_t *set, BOOL *result) {
+    if (!set || !result) { vx_set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    DWORD err;
+    token *t = token_get(h, &err);
+    if (!t) { vx_set_last_error(err); return 0; }
+    if (t->type != TOKEN_IMPERSONATION) { token_unref(t); vx_set_last_error(ERROR_NO_IMPERSONATION_TOKEN); return 0; }
+    if (t->level < SECURITY_IDENTIFICATION) { token_unref(t); vx_set_last_error(ERROR_BAD_IMPERSONATION_LEVEL); return 0; }
+    DWORD count = rd32(set), held = 0;
+    pthread_mutex_lock(&g_lock);
+    for (DWORD k = 0; k < count; k++) {
+        uint8_t *e = set + 8 + 12 * (size_t)k;
+        int on = 0;
+        for (int i = 0; i < t->nprivs && !on; i++) on = !rd32(e + 4) && t->privs[i].luid == rd32(e) && (t->privs[i].attr & SE_PRIVILEGE_ENABLED);
+        wr32(e + 8, on ? rd32(e + 8) | SE_PRIVILEGE_USED_FOR_ACCESS : rd32(e + 8) & ~SE_PRIVILEGE_USED_FOR_ACCESS);
+        held += on;
+    }
+    pthread_mutex_unlock(&g_lock);
+    token_unref(t);
+    *result = rd32(set + 4) & PRIVILEGE_SET_ALL_NECESSARY ? held == count : held > 0;
+    return 1;
+}
 
 // ---- impersonation ----
 static BOOL impersonate(DWORD tid, token *t) {            // takes over a reference to t (NULL: revert)
@@ -1925,8 +2389,9 @@ static token *impersonation_copy(token *s, int level) {  // (g_lock not held)
     return t;
 }
 static WINAPI BOOL SetThreadToken(HANDLE *thread, HANDLE h) {
-    DWORD tid = thread ? thread_id_of(*thread) : vx_current_tid(), err;
-    if (!tid) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
+    int foreign = 0;
+    DWORD tid = thread ? thread_id_of(*thread, &foreign) : vx_current_tid(), err;
+    if (!tid) return no_thread(foreign, "SetThreadToken");
     token *t = NULL;
     if (h) {
         if (!(t = token_get(h, &err))) { vx_set_last_error(err); return 0; }
@@ -1953,8 +2418,9 @@ static WINAPI BOOL ImpersonateLoggedOnUser(HANDLE h) {
 }
 // The anonymous logon: ANONYMOUS LOGON as the user, in Everyone and NETWORK, untrusted integrity, no privileges.
 static WINAPI BOOL ImpersonateAnonymousToken(HANDLE thread) {
-    DWORD tid = thread_id_of(thread);
-    if (!tid) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
+    int foreign;
+    DWORD tid = thread_id_of(thread, &foreign);
+    if (!tid) return no_thread(foreign, "ImpersonateAnonymousToken");
     token *t = token_new();
     uint8_t s[SID_MAX];
     t->type = TOKEN_IMPERSONATION; t->level = SECURITY_IMPERSONATION;
@@ -1971,8 +2437,35 @@ static WINAPI BOOL ImpersonateNamedPipeClient(HANDLE pipe) {
     if (!pipe || !vx_handle_data(pipe, VX_HANDLE_PIPE)) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
     return ImpersonateSelf(SECURITY_IMPERSONATION);
 }
-// CreateProcessAsUser: CreateProcess with a primary token. The child starts with the user's token as every vxrt
-// process does; the token's restrictions are not carried into it.
+// What `t` gives less than the token every process here starts with (token_default), NULL if nothing: another user,
+// restricting SIDs, a group made deny-only or left out, a privilege removed, a lower integrity level.
+static const char *token_weaker(const token *t) {        // (g_lock held)
+    token *d = token_default();
+    const char *why = NULL;
+    if (!sid_eq(t->user.sid, d->user.sid) || (t->user.attr & SE_GROUP_USE_FOR_DENY_ONLY)) why = "another user, or the user deny-only";
+    else if (t->is_restricted) why = t->write_restricted ? "write-restricted" : "restricting SIDs";
+    else if (token_integrity((token *)t) < token_integrity(d)) why = "a lower integrity level";
+    for (int i = 0; i < d->ngroups && !why; i++) {
+        if (d->groups[i].attr & SE_GROUP_INTEGRITY) continue;
+        int on = 0;
+        for (int k = 0; k < t->ngroups && !on; k++)
+            on = sid_eq(t->groups[k].sid, d->groups[i].sid) && (t->groups[k].attr & SE_GROUP_ENABLED) && !(t->groups[k].attr & SE_GROUP_USE_FOR_DENY_ONLY);
+        if (!on) why = "a group deny-only or missing";
+    }
+    for (int i = 0; i < d->nprivs && !why; i++) {          // (one only disabled can be enabled again: not less)
+        int held = 0;
+        for (int k = 0; k < t->nprivs && !held; k++) held = t->privs[k].luid == d->privs[i].luid;
+        if (!held) why = "a privilege removed";
+    }
+    if (!why && t->filtered) why = "made by CreateRestrictedToken";
+    token_free(d);
+    return why;
+}
+// CreateProcessAsUser: CreateProcess with a primary token. Every process here starts with the user's own token and
+// nothing on the Mac would hold the child to less, so a token that gives less (a sandbox's restricted or
+// low-integrity token) is refused rather than silently not applied; the program then knows its child would not be
+// confined (Chromium's sandbox, for one, can be turned off by its own switch, --no-sandbox). A token equal to the
+// user's (a plain duplicate) starts the child.
 typedef BOOL (WINAPI *create_process_fn)(const void *, void *, void *, void *, BOOL, DWORD, void *, const void *, void *, void *);
 static BOOL as_user(HANDLE h, const char *fn, const void *app, void *cmd, void *pa, void *ta, BOOL inherit, DWORD flags, void *env, const void *dir, void *si, void *pi) {
     if (h) {
@@ -1980,12 +2473,19 @@ static BOOL as_user(HANDLE h, const char *fn, const void *app, void *cmd, void *
         token *t = token_get(h, &err);
         if (!t) { vx_set_last_error(err); return 0; }
         int primary = t->type == TOKEN_PRIMARY;
+        pthread_mutex_lock(&g_lock);
+        const char *why = primary ? token_weaker(t) : NULL;
+        pthread_mutex_unlock(&g_lock);
         token_unref(t);
         if (!primary) { vx_set_last_error(ERROR_BAD_TOKEN_TYPE); return 0; }
+        if (why) {
+            vx_log("CreateProcessAsUser%c: the token gives less than the user's own (%s), and the child would run with the user's: refused", fn[13], why);
+            vx_set_last_error(ERROR_NOT_SUPPORTED);
+            return 0;
+        }
     }
     create_process_fn create = (create_process_fn)vx_find_export("kernel32.dll", fn);
     if (!create) { vx_set_last_error(ERROR_NOT_SUPPORTED); return 0; }
-    if (vx_trace) vx_log("%s: as a restricted or duplicated token's user (the child gets the user's token)", fn);
     return create(app, cmd, pa, ta, inherit, flags, env, dir, si, pi);
 }
 static WINAPI BOOL CreateProcessAsUserW(HANDLE h, const WCHAR *app, WCHAR *cmd, void *pa, void *ta, BOOL inherit, DWORD flags, void *env, const WCHAR *dir, void *si, void *pi) {
@@ -2039,7 +2539,7 @@ static WINAPI BOOL CheckTokenMembership(HANDLE h, const uint8_t *sid, BOOL *memb
     int pseudo = (intptr_t)h >= -6 && (intptr_t)h <= -4;   // (the current tokens' pseudo-handles are taken as they are)
     if (h && !pseudo && t->type != TOKEN_IMPERSONATION) { token_unref(t); vx_set_last_error(ERROR_NO_IMPERSONATION_TOKEN); return 0; }
     pthread_mutex_lock(&g_lock);
-    *member = token_has_sid(t, sid, 0, 0) && (!t->nrestricted || token_has_sid(t, sid, 0, 1));
+    *member = token_has_sid(t, sid, 0, 0) && (!t->is_restricted || token_has_sid(t, sid, 0, 1));
     pthread_mutex_unlock(&g_lock);
     token_unref(t);
     return 1;
@@ -2198,7 +2698,8 @@ static const vx_export security_exports[] = {
     VX_EXPORT(ConvertSecurityDescriptorToStringSecurityDescriptorW), VX_EXPORT(ConvertSecurityDescriptorToStringSecurityDescriptorA),
     VX_EXPORT(OpenProcessToken), VX_EXPORT(OpenThreadToken), VX_EXPORT(GetTokenInformation), VX_EXPORT(SetTokenInformation),
     VX_EXPORT(DuplicateTokenEx), VX_EXPORT(DuplicateToken), VX_EXPORT(CreateRestrictedToken), VX_EXPORT(IsTokenRestricted),
-    VX_EXPORT(AllocateLocallyUniqueId), VX_EXPORT(SetThreadToken), VX_EXPORT(RevertToSelf), VX_EXPORT(ImpersonateSelf),
+    VX_EXPORT(AllocateLocallyUniqueId), VX_EXPORT(LookupPrivilegeValueW), VX_EXPORT(LookupPrivilegeValueA), VX_EXPORT(LookupPrivilegeNameW),
+    VX_EXPORT(LookupPrivilegeNameA), VX_EXPORT(AdjustTokenPrivileges), VX_EXPORT(PrivilegeCheck), VX_EXPORT(SetThreadToken), VX_EXPORT(RevertToSelf), VX_EXPORT(ImpersonateSelf),
     VX_EXPORT(ImpersonateLoggedOnUser), VX_EXPORT(ImpersonateAnonymousToken), VX_EXPORT(ImpersonateNamedPipeClient),
     VX_EXPORT(CreateProcessAsUserW), VX_EXPORT(CreateProcessAsUserA), VX_EXPORT(LogonUserW), VX_EXPORT(LogonUserA),
     VX_EXPORT(AccessCheck), VX_EXPORT(CheckTokenMembership),

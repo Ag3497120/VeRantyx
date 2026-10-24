@@ -163,9 +163,6 @@ static WINAPI BOOL ReportEventW(HANDLE h, uint16_t type, uint16_t cat, DWORD id,
     return 1;
 }
 static WINAPI DWORD EventSetInformation(uint64_t reg, int cls, void *info, DWORD n) { (void)reg; (void)cls; (void)info; (void)n; return 0; }
-static WINAPI BOOL AdjustTokenPrivileges(HANDLE t, BOOL all, void *state, DWORD n, void *prev, DWORD *ret) { (void)t; (void)all; (void)state; (void)n; (void)prev; if (ret) *ret = 0; vx_set_last_error(0); return 1; }
-static WINAPI BOOL LookupPrivilegeValueW(const WCHAR *sys, const WCHAR *name, DWORD *luid) { (void)sys; (void)name; luid[0] = 20; luid[1] = 0; return 1; }
-static WINAPI BOOL LookupPrivilegeValueA(const char *sys, const char *name, DWORD *luid) { (void)sys; (void)name; luid[0] = 20; luid[1] = 0; return 1; }
 static WINAPI LONG RegConnectRegistryA(const char *machine, HANDLE key, HANDLE *out) { (void)machine; (void)key; *out = NULL; return 53; }   // ERROR_BAD_NETPATH
 
 // ---- UUIDs (rpcrt4) ------------------------------------------------------------------------------------------------------------
@@ -698,8 +695,7 @@ static const vx_export psapi[] = { VX_EXPORT(GetProcessMemoryInfo), VX_EXPORT(Ge
 static const vx_export advapi[] = {
     VX_EXPORT(SystemFunction036), VX_EXPORT(CryptAcquireContextA), VX_EXPORT(CryptAcquireContextW), VX_EXPORT(CryptGenRandom),
     VX_EXPORT(CryptReleaseContext), VX_EXPORT(RegisterEventSourceW), VX_EXPORT(RegisterEventSourceA), VX_EXPORT(DeregisterEventSource),
-    VX_EXPORT(ReportEventW), VX_EXPORT(EventSetInformation), VX_EXPORT(AdjustTokenPrivileges), VX_EXPORT(LookupPrivilegeValueW),
-    VX_EXPORT(LookupPrivilegeValueA), VX_EXPORT(RegConnectRegistryA), VX_EXPORT(OpenSCManagerA), VX_EXPORT(OpenSCManagerW), VX_EXPORT(OpenServiceA),
+    VX_EXPORT(ReportEventW), VX_EXPORT(EventSetInformation), VX_EXPORT(RegConnectRegistryA), VX_EXPORT(OpenSCManagerA), VX_EXPORT(OpenSCManagerW), VX_EXPORT(OpenServiceA),
     VX_EXPORT(CloseServiceHandle), { "OpenServiceW", (void *)OpenServiceA }, { "StartServiceA", (void *)service_none },
     { "StartServiceW", (void *)service_none }, { "ControlService", (void *)service_none }, { "QueryServiceStatusEx", (void *)service_none },
     { "QueryServiceConfigA", (void *)service_none }, { "QueryServiceConfigW", (void *)service_none },

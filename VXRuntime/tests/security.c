@@ -1,7 +1,8 @@
 // advapi32's security objects (src/security.c): SIDs and their strings, ACLs and ACE walking, security descriptors in
-// both layouts and their conversions, SDDL round trips, tokens (restricted, duplicated, impersonating), AccessCheck,
-// CheckTokenMembership, object and named security, SetEntriesInAcl, and the errors each sets. Made-up data only
-// (the domain S-1-5-21-111-222-333 below is no machine's).
+// both layouts and their conversions, SDDL round trips, tokens (restricted, duplicated, impersonating), privileges,
+// AccessCheck, CheckTokenMembership, object and named security, SetEntriesInAcl, and the errors each sets. Made-up
+// data only (the domain S-1-5-21-111-222-333 below is no machine's); the files are the test's own, and the Mac's root
+// folder is only read (and a change to it refused, as it is root's).
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
@@ -49,6 +50,25 @@ static DWORD integrity_of(HANDLE t) {
     DWORD rid = l ? *GetSidSubAuthority(l->Label.Sid, 0) : 0xffffffff;
     free(l);
     return rid;
+}
+static int privilege_state(HANDLE t, DWORD luid) {    // a privilege's attributes, -1 if the token lacks it
+    TOKEN_PRIVILEGES *tp = token_info(t, TokenPrivileges);
+    int r = -1;
+    for (DWORD i = 0; tp && i < tp->PrivilegeCount; i++) if (tp->Privileges[i].Luid.LowPart == luid && !tp->Privileges[i].Luid.HighPart) r = (int)tp->Privileges[i].Attributes;
+    free(tp);
+    return r;
+}
+static int privilege_on(HANDLE t, DWORD luid) { int a = privilege_state(t, luid); return a >= 0 && (a & SE_PRIVILEGE_ENABLED); }
+static DWORD privilege_count(HANDLE t) { TOKEN_PRIVILEGES *tp = token_info(t, TokenPrivileges); DWORD n = tp ? tp->PrivilegeCount : 0xffffffff; free(tp); return n; }
+// The rights an ACL's allow ACEs give SIDs other than `sid`, and the first allow ACE's for `sid`.
+static DWORD others_get(PACL acl, PSID sid) {
+    DWORD r = 0;
+    for (DWORD i = 0; acl && i < acl->AceCount; i++) { ACE_HEADER *a = ace_at(acl, i); if (a->AceType == ACCESS_ALLOWED_ACE_TYPE && !EqualSid(ace_sid(a), sid)) r |= ace_mask(a); }
+    return r;
+}
+static DWORD sid_gets(PACL acl, PSID sid) {
+    for (DWORD i = 0; acl && i < acl->AceCount; i++) { ACE_HEADER *a = ace_at(acl, i); if (a->AceType == ACCESS_ALLOWED_ACE_TYPE && EqualSid(ace_sid(a), sid)) return ace_mask(a); }
+    return 0;
 }
 static GENERIC_MAPPING map = { 0x1 | READ_CONTROL, 0x2, 0x4, 0xf | STANDARD_RIGHTS_REQUIRED };
 // AccessCheck of `desired` against an SDDL descriptor: the access granted (0 when denied), *err its last error.
@@ -385,12 +405,21 @@ int main(int argc, char **argv) {
     CHECK(DuplicateToken(imp, SecurityIdentification, &ident));
     CHECK(!DuplicateTokenEx(ident, MAXIMUM_ALLOWED, NULL, SecurityIdentification, TokenPrimary, &x) && GetLastError() == ERROR_BAD_IMPERSONATION_LEVEL);
     CHECK(!DuplicateTokenEx(tok, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, (TOKEN_TYPE)7, &x) && GetLastError() == ERROR_INVALID_PARAMETER);
-    SECURITY_ATTRIBUTES sa = { sizeof sa, sddl(L"O:BAD:(A;;GA;;;SY)"), FALSE };
+    // a descriptor for the new token: kept (its generic rights mapped) when it leaves the user every right to it
+    SECURITY_ATTRIBUTES sa = { sizeof sa, sddl(L"O:S-1-5-21-1000-1000-1000-1001D:(A;;GA;;;S-1-5-21-1000-1000-1000-1001)(A;;GR;;;SY)"), FALSE };
     HANDLE dup_sd = NULL;
     CHECK(DuplicateTokenEx(tok, MAXIMUM_ALLOWED, &sa, SecurityAnonymous, TokenPrimary, &dup_sd));
-    PSID o = NULL; PSECURITY_DESCRIPTOR osd = NULL;
-    CHECK(GetSecurityInfo(dup_sd, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &o, NULL, NULL, NULL, &osd) == ERROR_SUCCESS && sid_is(o, L"S-1-5-32-544"));
+    PSID o = NULL; PSECURITY_DESCRIPTOR osd = NULL; PACL od = NULL;
+    CHECK(GetSecurityInfo(dup_sd, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &o, NULL, &od, NULL, &osd) == ERROR_SUCCESS &&
+          sid_is(o, USER) && od && od->AceCount == 2 && ace_mask(ace_at(od, 0)) == TOKEN_ALL_ACCESS);
     LocalFree(osd); LocalFree(sa.lpSecurityDescriptor); CloseHandle(dup_sd);
+    // one that would keep the user out (nothing would hold anyone to it) and an owner the caller cannot give: refused
+    sa.lpSecurityDescriptor = sddl(L"D:(A;;GA;;;SY)");
+    CHECK(!DuplicateTokenEx(tok, MAXIMUM_ALLOWED, &sa, SecurityAnonymous, TokenPrimary, &x) && GetLastError() == ERROR_NOT_SUPPORTED);
+    LocalFree(sa.lpSecurityDescriptor);
+    sa.lpSecurityDescriptor = sddl(L"O:BAD:(A;;GA;;;WD)");
+    CHECK(!DuplicateTokenEx(tok, MAXIMUM_ALLOWED, &sa, SecurityAnonymous, TokenPrimary, &x) && GetLastError() == ERROR_INVALID_OWNER);
+    LocalFree(sa.lpSecurityDescriptor);
 
     // SetTokenInformation: integrity only lowered, owner and group only the token's own SIDs
     TOKEN_MANDATORY_LABEL label = { { low, SE_GROUP_INTEGRITY } };
@@ -451,6 +480,19 @@ int main(int argc, char **argv) {
     SID_AND_ATTRIBUTES bad_disable[1] = { { built, 0 } };
     CHECK(!CreateRestrictedToken(tok, 0, 1, bad_disable, 0, NULL, 0, NULL, &x) && GetLastError() == ERROR_INVALID_SID);
     CHECK(DuplicateTokenEx(rt, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenImpersonation, &rimp));
+    // a restricted token made from a restricted one gives no more than it: no restricting SID in common leaves none,
+    // and the token stays restricted (nothing passes the second check); WRITE_RESTRICTED does not make a fully
+    // restricted token's reads unchecked, and stays only where both were write-restricted
+    HANDLE rt3 = NULL, rimp3 = NULL, rt4 = NULL, rimp4 = NULL;
+    SID_AND_ATTRIBUTES only_users[1] = { { users, 0 } };
+    CHECK(CreateRestrictedToken(rt, 0, 0, NULL, 0, NULL, 1, only_users, &rt3) && IsTokenRestricted(rt3));
+    rs = token_info(rt3, TokenRestrictedSids);
+    CHECK(rs && rs->GroupCount == 0);
+    free(rs);
+    CHECK(GetTokenInformation(rt3, (TOKEN_INFORMATION_CLASS)40 /* TokenIsRestricted */, &dw, sizeof dw, &n) && dw == 1);
+    CHECK(DuplicateTokenEx(rt3, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenImpersonation, &rimp3));
+    CHECK(CreateRestrictedToken(rt, WRITE_RESTRICTED, 0, NULL, 0, NULL, 0, NULL, &rt4) && IsTokenRestricted(rt4) &&
+          DuplicateTokenEx(rt4, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenImpersonation, &rimp4));
 
     // impersonation, per thread
     CHECK(!SetThreadToken(NULL, tok) && GetLastError() == ERROR_BAD_TOKEN_TYPE);
@@ -490,6 +532,54 @@ int main(int argc, char **argv) {
     CHECK(CheckTokenMembership(rimp, users, &member) && !member);
     CHECK(CheckTokenMembership(rimp, auth_users, &member) && !member);
     CHECK(CheckTokenMembership(rimp, restricted_code, &member) && !member);
+    CHECK(CheckTokenMembership(rimp3, world, &member) && !member);    // (rt's restricting SIDs and the new ones: none in common)
+
+    // ---- privileges ----
+    LUID luid;
+    CHECK(LookupPrivilegeValueW(NULL, L"SeChangeNotifyPrivilege", &luid) && luid.LowPart == 23 && luid.HighPart == 0);
+    CHECK(LookupPrivilegeValueA(NULL, "sedebugprivilege", &luid) && luid.LowPart == 20 && luid.HighPart == 0);
+    CHECK(LookupPrivilegeValueW(NULL, L"SeSecurityPrivilege", &luid) && luid.LowPart == 8);
+    CHECK(!LookupPrivilegeValueW(NULL, L"SeNoSuchPrivilege", &luid) && GetLastError() == ERROR_NO_SUCH_PRIVILEGE);
+    WCHAR pname[64]; char aname[64]; DWORD pnl = 64, anl = 64;
+    luid.LowPart = 19; luid.HighPart = 0;
+    CHECK(LookupPrivilegeNameW(NULL, &luid, pname, &pnl) && !wcscmp(pname, L"SeShutdownPrivilege") && pnl == 19);
+    pnl = 4;
+    CHECK(!LookupPrivilegeNameW(NULL, &luid, pname, &pnl) && GetLastError() == ERROR_INSUFFICIENT_BUFFER && pnl == 20);
+    luid.LowPart = 23;
+    CHECK(LookupPrivilegeNameA(NULL, &luid, aname, &anl) && !strcmp(aname, "SeChangeNotifyPrivilege"));
+    luid.LowPart = 99; pnl = 64;
+    CHECK(!LookupPrivilegeNameW(NULL, &luid, pname, &pnl) && GetLastError() == ERROR_NO_SUCH_PRIVILEGE);
+    // AdjustTokenPrivileges changes the token's own (here a duplicate's), and says when it lacks one
+    HANDLE adj = NULL;
+    CHECK(DuplicateTokenEx(tok, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenImpersonation, &adj));
+    struct { DWORD count; LUID_AND_ATTRIBUTES p[2]; } turn_on = { 2, { { { 19, 0 }, SE_PRIVILEGE_ENABLED }, { { 33, 0 }, SE_PRIVILEGE_ENABLED } } };
+    struct { DWORD count; LUID_AND_ATTRIBUTES p[5]; } before; DWORD blen = 0;
+    CHECK(!AdjustTokenPrivileges(adj, FALSE, (TOKEN_PRIVILEGES *)&turn_on, 8, (TOKEN_PRIVILEGES *)&before, &blen) &&
+          GetLastError() == ERROR_INSUFFICIENT_BUFFER && blen == 4 + 2 * 12 && !privilege_on(adj, 19));   // (too small: nothing changed)
+    SetLastError(0xdead);
+    CHECK(AdjustTokenPrivileges(adj, FALSE, (TOKEN_PRIVILEGES *)&turn_on, sizeof before, (TOKEN_PRIVILEGES *)&before, &blen) && GetLastError() == ERROR_SUCCESS);
+    CHECK(before.count == 2 && before.p[0].Luid.LowPart == 19 && before.p[0].Attributes == 0 && before.p[1].Luid.LowPart == 33);
+    CHECK(privilege_on(adj, 19) && privilege_on(adj, 33) && !privilege_on(tok, 19));
+    TOKEN_PRIVILEGES debug = { 1, { { { 20, 0 }, SE_PRIVILEGE_ENABLED } } }, backup = { 1, { { { 17, 0 }, SE_PRIVILEGE_ENABLED } } };
+    CHECK(AdjustTokenPrivileges(adj, FALSE, &debug, 0, NULL, NULL) && GetLastError() == ERROR_NOT_ALL_ASSIGNED && privilege_state(adj, 20) == -1);
+    CHECK(AdjustTokenPrivileges(adj, FALSE, &backup, 0, NULL, NULL) && GetLastError() == ERROR_NOT_ALL_ASSIGNED && privilege_state(adj, 17) == -1);
+    CHECK(AdjustTokenPrivileges(adj, TRUE, NULL, 0, NULL, NULL) && GetLastError() == ERROR_SUCCESS && !privilege_on(adj, 19) && !privilege_on(adj, 23));
+    CHECK(!AdjustTokenPrivileges(adj, FALSE, NULL, 0, NULL, NULL) && GetLastError() == ERROR_INVALID_PARAMETER);
+    TOKEN_PRIVILEGES gone = { 1, { { { 25, 0 }, SE_PRIVILEGE_REMOVED } } };
+    CHECK(AdjustTokenPrivileges(adj, FALSE, &gone, 0, NULL, NULL) && privilege_count(adj) == 4 && privilege_state(adj, 25) == -1);
+    gone.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    CHECK(AdjustTokenPrivileges(adj, FALSE, &gone, 0, NULL, NULL) && GetLastError() == ERROR_NOT_ALL_ASSIGNED);   // (removed for good)
+    CHECK(privilege_count(tok) == 5 && privilege_on(tok, 23));
+    // PrivilegeCheck: all of a set, or any one, enabled in a client's token; the enabled ones marked used
+    TOKEN_PRIVILEGES notify = { 1, { { { 23, 0 }, SE_PRIVILEGE_ENABLED } } };
+    CHECK(AdjustTokenPrivileges(adj, FALSE, &notify, 0, NULL, NULL));
+    struct { DWORD count, control; LUID_AND_ATTRIBUTES p[2]; } wanted = { 2, PRIVILEGE_SET_ALL_NECESSARY, { { { 23, 0 }, 0 }, { { 19, 0 }, 0 } } };
+    BOOL has = 2;
+    CHECK(PrivilegeCheck(adj, (PPRIVILEGE_SET)&wanted, &has) && !has && wanted.p[0].Attributes == SE_PRIVILEGE_USED_FOR_ACCESS && wanted.p[1].Attributes == 0);
+    wanted.control = 0;
+    CHECK(PrivilegeCheck(adj, (PPRIVILEGE_SET)&wanted, &has) && has);
+    CHECK(!PrivilegeCheck(tok, (PPRIVILEGE_SET)&wanted, &has) && GetLastError() == ERROR_NO_IMPERSONATION_TOKEN);
+    CloseHandle(adj);
 
     // ---- AccessCheck ----
     HANDLE med = NULL;
@@ -532,6 +622,15 @@ int main(int argc, char **argv) {
     CHECK(check(wimp, L"O:BAG:BAD:(A;;0x7;;;AU)", 0x5, NULL) == 0x5);   // reading is not checked twice
     CHECK(check(wimp, L"O:BAG:BAD:(A;;0x7;;;AU)", 0x2, NULL) == 0);
     CHECK(check(wimp, L"O:BAG:BAD:(A;;0x7;;;AU)(A;;0x2;;;WR)", 0x2, NULL) == 0x2);
+    CHECK(check(rimp, L"O:BAG:BAD:(A;;0x7;;;WD)", 0x1, NULL) == 0x1);
+    CHECK(check(rimp3, L"O:BAG:BAD:(A;;0x7;;;WD)", 0x1, NULL) == 0);   // restricted with no SIDs left: nothing passes
+    CHECK(check(rimp3, L"O:BAG:BAD:(A;;0x7;;;WD)", MAXIMUM_ALLOWED, NULL) == 0);
+    CHECK(check(rimp4, L"O:BAG:BAD:(A;;0x7;;;AU)", 0x1, NULL) == 0);   // reads still checked against WD and RC
+    CHECK(check(rimp4, L"O:BAG:BAD:(A;;0x7;;;AU)(A;;0x1;;;WD)", 0x1, NULL) == 0x1);
+    HANDLE wr2 = NULL, wimp2 = NULL;
+    CHECK(CreateRestrictedToken(wr, WRITE_RESTRICTED, 0, NULL, 0, NULL, 0, NULL, &wr2) &&
+          DuplicateTokenEx(wr2, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenImpersonation, &wimp2));
+    CHECK(check(wimp2, L"O:BAG:BAD:(A;;0x7;;;AU)", 0x5, NULL) == 0x5 && check(wimp2, L"O:BAG:BAD:(A;;0x7;;;AU)", 0x2, NULL) == 0);
     BYTE ps[8]; DWORD pslen = sizeof ps, granted; BOOL status;
     PSECURITY_DESCRIPTOR osd2 = sddl(obj);
     CHECK(!AccessCheck(osd2, med, 0x1, &map, (PPRIVILEGE_SET)ps, &pslen, &granted, &status) && GetLastError() == ERROR_INSUFFICIENT_BUFFER && pslen == sizeof(PRIVILEGE_SET));
@@ -545,15 +644,25 @@ int main(int argc, char **argv) {
     LocalFree(osd);
     CHECK(GetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, SACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL, &osd) == ERROR_PRIVILEGE_NOT_HELD);
     CHECK(GetSecurityInfo(NULL, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_INVALID_HANDLE);
+    // the process: nothing checks its descriptor when another of the user's processes opens it, so one that would
+    // keep the user from some of its rights is refused; one leaving the user everything is kept
+    PSID system = sid_of(L"SY");
+    BYTE alldaclbuf[64], sysdaclbuf[64], minedaclbuf[64]; PACL alldacl = (PACL)alldaclbuf, sysdacl = (PACL)sysdaclbuf, minedacl = (PACL)minedaclbuf;
+    CHECK(InitializeAcl(alldacl, sizeof alldaclbuf, ACL_REVISION) && AddAccessAllowedAce(alldacl, ACL_REVISION, GENERIC_ALL, world));
+    CHECK(InitializeAcl(sysdacl, sizeof sysdaclbuf, ACL_REVISION) && AddAccessAllowedAce(sysdacl, ACL_REVISION, GENERIC_ALL, system));
+    CHECK(InitializeAcl(minedacl, sizeof minedaclbuf, ACL_REVISION) && AddAccessAllowedAce(minedacl, ACL_REVISION, GENERIC_ALL, user));
     CHECK(InitializeAcl(dacl, sizeof daclbuf, ACL_REVISION) && AddAccessAllowedAce(dacl, ACL_REVISION, 0x1f0003, world));
-    CHECK(SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, NULL, NULL, dacl, NULL) == ERROR_SUCCESS);
+    CHECK(SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, NULL, NULL, dacl, NULL) == ERROR_NOT_SUPPORTED);
+    CHECK(SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, sysdacl, NULL) == ERROR_NOT_SUPPORTED);
+    CHECK(SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, NULL, NULL, alldacl, NULL) == ERROR_SUCCESS);
     CHECK(GetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_SUCCESS);
-    CHECK(got && got->AceCount == 1 && ace_mask(ace_at(got, 0)) == 0x1f0003 && GetSecurityDescriptorControl(osd, &control, &rev) && (control & SE_DACL_PROTECTED));
+    CHECK(got && got->AceCount == 1 && ace_mask(ace_at(got, 0)) == 0x1fffff && EqualSid(ace_sid(ace_at(got, 0)), world) &&
+          GetSecurityDescriptorControl(osd, &control, &rev) && (control & SE_DACL_PROTECTED));   // (GENERIC_ALL mapped: PROCESS_ALL_ACCESS)
     LocalFree(osd);
     CHECK(SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, world, NULL, NULL, NULL) == ERROR_INVALID_OWNER);
     CHECK(SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, SACL_SECURITY_INFORMATION, NULL, NULL, NULL, sacl) == ERROR_PRIVILEGE_NOT_HELD);
     CHECK(SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, (PACL)badacl, NULL) == ERROR_INVALID_ACL);
-    // a token keeps its label
+    // a token keeps its label (a low one takes nothing from the user)
     CHECK(SetSecurityInfo(imp, SE_KERNEL_OBJECT, LABEL_SECURITY_INFORMATION, NULL, NULL, NULL, sacl) == ERROR_SUCCESS);
     PACL got_sacl = NULL;
     CHECK(GetSecurityInfo(imp, SE_KERNEL_OBJECT, LABEL_SECURITY_INFORMATION, NULL, NULL, NULL, &got_sacl, &osd) == ERROR_SUCCESS &&
@@ -562,52 +671,88 @@ int main(int argc, char **argv) {
     BYTE highbuf[28]; PACL high_sacl = (PACL)highbuf; PSID high = sid_of(L"HI");
     CHECK(InitializeAcl(high_sacl, 28, ACL_REVISION) && AddMandatoryAce(high_sacl, ACL_REVISION, 0, 1, high));
     CHECK(SetSecurityInfo(imp, SE_KERNEL_OBJECT, LABEL_SECURITY_INFORMATION, NULL, NULL, NULL, high_sacl) == ERROR_INVALID_LABEL);
-    // a handle whose descriptor is not kept: checked, and made up again when asked for
+    // an event: EVENT_ALL_ACCESS is all there is to it; the handle has nowhere to keep a descriptor, so what the Mac
+    // gives is what is read back
     HANDLE ev = CreateEventW(NULL, TRUE, FALSE, L"Local\\vxsec_event");
     CHECK(SetSecurityInfo(ev, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, dacl, NULL) == ERROR_SUCCESS);
-    CHECK(GetSecurityInfo(ev, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_SUCCESS && got && EqualSid(ace_sid(ace_at(got, 0)), user));
+    CHECK(SetSecurityInfo(ev, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, sysdacl, NULL) == ERROR_NOT_SUPPORTED);
+    CHECK(GetSecurityInfo(ev, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_SUCCESS && got &&
+          EqualSid(ace_sid(ace_at(got, 0)), user) && ace_mask(ace_at(got, 0)) == EVENT_ALL_ACCESS);
     LocalFree(osd);
     CHECK(GetNamedSecurityInfoW(L"Local\\vxsec_event", SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &go, NULL, NULL, NULL, &osd) == ERROR_SUCCESS && sid_is(go, USER));
     LocalFree(osd);
+    CHECK(SetNamedSecurityInfoW(L"Local\\vxsec_event", SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, sysdacl, NULL) == ERROR_NOT_SUPPORTED);
+    CHECK(SetNamedSecurityInfoW(L"Local\\vxsec_event", SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, alldacl, NULL) == ERROR_SUCCESS);
+    CHECK(GetNamedSecurityInfoW(L"Local\\vxsec_event", SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_SUCCESS && got &&
+          got->AceCount == 1 && EqualSid(ace_sid(ace_at(got, 0)), world) && ace_mask(ace_at(got, 0)) == EVENT_ALL_ACCESS);
+    LocalFree(osd);
     CHECK(GetNamedSecurityInfoW(L"Local\\vxsec_none", SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &go, NULL, NULL, NULL, &osd) == ERROR_FILE_NOT_FOUND);
-    // files and registry keys by name
+    CloseHandle(ev);
+    // files: what the Mac's owner and mode bits say, read again each time, by name or by handle alike
     CreateDirectoryW(L"C:\\vxsec", NULL);
     HANDLE f = CreateFileW(L"C:\\vxsec\\a.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     CHECK(f != INVALID_HANDLE_VALUE);
     CHECK(GetSecurityInfo(f, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &go, NULL, NULL, NULL, &osd) == ERROR_SUCCESS && sid_is(go, USER));
     LocalFree(osd);
-    CloseHandle(f);
+    BYTE fsd[256]; DWORD fneed = 0;
+    CHECK(GetKernelObjectSecurity(f, OWNER_SECURITY_INFORMATION, fsd, sizeof fsd, &fneed) && GetSecurityDescriptorOwner(fsd, &got_sid, &defaulted) && EqualSid(got_sid, user));
     CHECK(GetNamedSecurityInfoW(L"C:\\vxsec\\a.txt", SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &go, NULL, &got, NULL, &osd) == ERROR_SUCCESS);
-    CHECK(sid_is(go, USER) && got && ace_mask(ace_at(got, 0)) == FILE_ALL_ACCESS);
+    DWORD mine_rights = sid_gets(got, user);              // a new file: the owner reads and writes it, does not run it, may chmod it
+    CHECK(sid_is(go, USER) && (mine_rights & (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA | WRITE_DAC)) == (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA | WRITE_DAC) &&
+          !(mine_rights & FILE_EXECUTE) && !(mine_rights & WRITE_OWNER));
     LocalFree(osd);
     CHECK(GetNamedSecurityInfoW(L"C:\\vxsec\\missing.txt", SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_FILE_NOT_FOUND);
     CHECK(GetNamedSecurityInfoW(L"C:\\vxsec_nowhere\\a.txt", SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_PATH_NOT_FOUND);
-    CHECK(SetNamedSecurityInfoW(L"C:\\vxsec\\a.txt", SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, dacl, NULL) == ERROR_SUCCESS);
-    CHECK(GetNamedSecurityInfoW(L"c:\\VXSEC\\A.TXT", SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_SUCCESS &&
-          got && got->AceCount == 1 && ace_mask(ace_at(got, 0)) == 0x1f0003);
+    // a DACL mode bits cannot carry (writing but not appending): refused, nothing changes
+    CHECK(SetNamedSecurityInfoW(L"C:\\vxsec\\a.txt", SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, dacl, NULL) == ERROR_NOT_SUPPORTED);
+    // only the user: carried out (the group's and everyone else's bits taken away), seen by name and by handle alike
+    CHECK(SetSecurityInfo(f, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, NULL, NULL, minedacl, NULL) == ERROR_SUCCESS);
+    CHECK(GetNamedSecurityInfoW(L"c:\\VXSEC\\A.TXT", SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_SUCCESS && got &&
+          !(others_get(got, user) & (FILE_READ_DATA | FILE_WRITE_DATA)) && (sid_gets(got, user) & FILE_WRITE_DATA));
     LocalFree(osd);
+    CHECK(GetSecurityInfo(f, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_SUCCESS && got && !(others_get(got, user) & FILE_READ_DATA));
+    LocalFree(osd);
+    // what would give more (everyone everything) is let pass and not carried out; the owner only as it is
+    CHECK(SetNamedSecurityInfoW(L"C:\\vxsec\\a.txt", SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, alldacl, NULL) == ERROR_SUCCESS);
+    CHECK(GetNamedSecurityInfoW(L"C:\\vxsec\\a.txt", SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_SUCCESS && got && !(others_get(got, user) & FILE_READ_DATA));
+    LocalFree(osd);
+    CHECK(SetNamedSecurityInfoW(L"C:\\vxsec\\a.txt", SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, user, NULL, NULL, NULL) == ERROR_SUCCESS);
+    CHECK(SetNamedSecurityInfoW(L"C:\\vxsec\\a.txt", SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, world, NULL, NULL, NULL) == ERROR_INVALID_OWNER);
     CHECK(GetNamedSecurityInfoA("C:\\vxsec\\a.txt", SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &go, NULL, NULL, NULL, &osd) == ERROR_SUCCESS && sid_is(go, USER));
     LocalFree(osd);
-    DWORD fneed = 0;
     CHECK(!GetFileSecurityW(L"C:\\vxsec\\a.txt", DACL_SECURITY_INFORMATION, NULL, 0, &fneed) && GetLastError() == ERROR_INSUFFICIENT_BUFFER && fneed > 20);
-    BYTE fsd[256];
     CHECK(fneed <= sizeof fsd && GetFileSecurityW(L"C:\\vxsec\\a.txt", DACL_SECURITY_INFORMATION, fsd, sizeof fsd, &fneed) && IsValidSecurityDescriptor(fsd));
+    CloseHandle(f);
     DeleteFileW(L"C:\\vxsec\\a.txt"); RemoveDirectoryW(L"C:\\vxsec");
+    // a folder the user does not own (the Mac's root folder, root's: SYSTEM here): read as it is; taking rights from
+    // others there needs its owner (refused, nothing changes), what takes nothing is let pass
+    if (GetNamedSecurityInfoW(L"Z:\\", SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &go, NULL, &got, NULL, &osd) == ERROR_SUCCESS && sid_is(go, L"S-1-5-18")) {
+        CHECK(sid_gets(got, system) & FILE_LIST_DIRECTORY);
+        LocalFree(osd);
+        CHECK(SetNamedSecurityInfoW(L"Z:\\", SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, minedacl, NULL) == ERROR_ACCESS_DENIED);
+        CHECK(SetNamedSecurityInfoW(L"Z:\\", SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL) == ERROR_SUCCESS);   // (a NULL DACL)
+    } else CHECK(!"the root folder reads as root's");
+    // registry keys: one that would keep the user out is refused (nothing checks a key's descriptor when it opens)
     HKEY key;
     CHECK(RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\VXSecTest", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL) == ERROR_SUCCESS);
     RegCloseKey(key);
     CHECK(GetNamedSecurityInfoW(L"CURRENT_USER\\Software\\VXSecTest", SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_SUCCESS &&
-          got && ace_mask(ace_at(got, 0)) == KEY_ALL_ACCESS);
+          got && ace_mask(ace_at(got, 0)) == KEY_ALL_ACCESS && EqualSid(ace_sid(ace_at(got, 0)), user));
     LocalFree(osd);
+    CHECK(SetNamedSecurityInfoW(L"CURRENT_USER\\Software\\VXSecTest", SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, sysdacl, NULL) == ERROR_NOT_SUPPORTED);
+    CHECK(SetNamedSecurityInfoW(L"CURRENT_USER\\Software\\VXSecTest", SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, alldacl, NULL) == ERROR_SUCCESS);
     CHECK(GetNamedSecurityInfoW(L"CURRENT_USER\\Software\\VXSecNone", SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_FILE_NOT_FOUND);
     CHECK(GetNamedSecurityInfoW(L"NOWHERE\\Software", SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION, NULL, NULL, &got, NULL, &osd) == ERROR_INVALID_PARAMETER);
     RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\VXSecTest");
     CHECK(!GetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, NULL, 0, &fneed) && GetLastError() == ERROR_INSUFFICIENT_BUFFER);
     CHECK(GetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, fsd, sizeof fsd, &fneed) && IsValidSecurityDescriptor(fsd));
-    PSECURITY_DESCRIPTOR ksd = sddl(L"D:P(A;;0x1f0003;;;BU)");
+    PSECURITY_DESCRIPTOR ksd = sddl(L"D:P(A;;GA;;;BU)");
     CHECK(SetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, ksd));
     CHECK(GetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, fsd, sizeof fsd, &fneed) && GetSecurityDescriptorControl(fsd, &control, &rev) &&
           (control & SE_DACL_PROTECTED) && GetSecurityDescriptorDacl(fsd, &present, &got_acl, &defaulted) && present && EqualSid(ace_sid(ace_at(got_acl, 0)), users));
+    LocalFree(ksd);
+    ksd = sddl(L"D:P(A;;0x1f0003;;;BU)");
+    CHECK(!SetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, ksd) && GetLastError() == ERROR_NOT_SUPPORTED);
     LocalFree(ksd);
     CHECK(!SetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, badsd) && GetLastError() == ERROR_INVALID_SECURITY_DESCR);
 
@@ -688,11 +833,39 @@ int main(int argc, char **argv) {
     STARTUPINFOW startup = { sizeof startup }; PROCESS_INFORMATION pi;
     CHECK(!CreateProcessAsUserW(imp, NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &pi) && GetLastError() == ERROR_BAD_TOKEN_TYPE);
     DWORD code = 0;
-    CHECK(CreateProcessAsUserW(rt, NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &pi) && WaitForSingleObject(pi.hProcess, 30000) == WAIT_OBJECT_0 &&
+    // a token giving less than the user's own (restricted, lower integrity, a privilege removed): the child would run
+    // with the user's, so it is refused and nothing starts
+    memset(&pi, 0, sizeof pi);
+    CHECK(!CreateProcessAsUserW(rt, NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &pi) && GetLastError() == ERROR_NOT_SUPPORTED && !pi.hProcess);
+    CHECK(!CreateProcessAsUserW(wr, NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &pi) && GetLastError() == ERROR_NOT_SUPPORTED);
+    HANDLE low_primary = NULL, fewer = NULL, plain = NULL;
+    TOKEN_MANDATORY_LABEL to_low = { { low, SE_GROUP_INTEGRITY } };
+    CHECK(DuplicateTokenEx(tok, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &low_primary) &&
+          SetTokenInformation(low_primary, TokenIntegrityLevel, &to_low, sizeof to_low));
+    CHECK(!CreateProcessAsUserW(low_primary, NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &pi) && GetLastError() == ERROR_NOT_SUPPORTED);
+    TOKEN_PRIVILEGES drop = { 1, { { { 19, 0 }, SE_PRIVILEGE_REMOVED } } };
+    CHECK(DuplicateTokenEx(tok, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &fewer) && AdjustTokenPrivileges(fewer, FALSE, &drop, 0, NULL, NULL));
+    CHECK(!CreateProcessAsUserW(fewer, NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &pi) && GetLastError() == ERROR_NOT_SUPPORTED);
+    // the user's own token, duplicated: the child starts, with the user's token
+    CHECK(DuplicateTokenEx(tok, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &plain));
+    CHECK(CreateProcessAsUserW(plain, NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &pi) && WaitForSingleObject(pi.hProcess, 30000) == WAIT_OBJECT_0 &&
           GetExitCodeProcess(pi.hProcess, &code) && code == 42);
-    HANDLE other = NULL;                                  // another process's token: the user's, as it started
+    HANDLE other = NULL;
     CHECK(OpenProcessToken(pi.hProcess, TOKEN_QUERY, &other) && integrity_of(other) == SECURITY_MANDATORY_MEDIUM_RID && !IsTokenRestricted(other));
     CloseHandle(other); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    CloseHandle(low_primary); CloseHandle(fewer); CloseHandle(plain);
+    // CreateProcess's hThread: a thread of another process, whose tokens are its own: refused as such (not as a bad handle)
+    code = 0;
+    CHECK(CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &startup, &pi));
+    CHECK(!SetThreadToken(&pi.hThread, imp) && GetLastError() == ERROR_NOT_SUPPORTED);
+    CHECK(!SetThreadToken(&pi.hThread, NULL) && GetLastError() == ERROR_NOT_SUPPORTED);
+    CHECK(!OpenThreadToken(pi.hThread, TOKEN_QUERY, TRUE, &x) && GetLastError() == ERROR_NOT_SUPPORTED);
+    CHECK(!ImpersonateAnonymousToken(pi.hThread) && GetLastError() == ERROR_NOT_SUPPORTED);
+    ResumeThread(pi.hThread);
+    CHECK(WaitForSingleObject(pi.hProcess, 30000) == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &code) && code == 42);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    HANDLE nothing = (HANDLE)(intptr_t)0x1234;
+    CHECK(!SetThreadToken(&nothing, imp) && GetLastError() == ERROR_INVALID_HANDLE);
     HANDLE logon = (HANDLE)1;
     CHECK(!LogonUserW(L"nobody", L".", L"", LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, &logon) && !logon);   // nothing checks passwords: refused
     CHECK(RegDisablePredefinedCache() == ERROR_SUCCESS);
@@ -700,8 +873,9 @@ int main(int argc, char **argv) {
     CHECK(AllocateLocallyUniqueId(&l1) && AllocateLocallyUniqueId(&l2) && (l1.LowPart != l2.LowPart || l1.HighPart != l2.HighPart));
 
     CHECK(CloseHandle(imp) && CloseHandle(ident) && CloseHandle(rt) && CloseHandle(rt2) && CloseHandle(rimp) && CloseHandle(med) && CloseHandle(wr) && CloseHandle(wimp));
+    CHECK(CloseHandle(rt3) && CloseHandle(rimp3) && CloseHandle(rt4) && CloseHandle(rimp4) && CloseHandle(wr2) && CloseHandle(wimp2));
     CHECK(!GetTokenInformation(imp, TokenType, &type, sizeof type, &n) && GetLastError() == ERROR_INVALID_HANDLE);
     CHECK(CloseHandle(tok));
-    printf("security: SIDs, ACLs, descriptors, SDDL, tokens, impersonation, AccessCheck, object security -> %s\n", failures ? "FAILED" : "ok");
+    printf("security: SIDs, ACLs, descriptors, SDDL, tokens, privileges, impersonation, AccessCheck, object security -> %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }
