@@ -183,8 +183,15 @@ static WINAPI BOOL InitializeProcThreadAttributeList(void *list, DWORD count, DW
     memset(list, 0, need);
     return 1;
 }
+// The attributes that put the new process in an AppContainer (PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, attribute
+// number 9, and PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, 15) are refused with ERROR_NOT_SUPPORTED,
+// whatever the flag bits around the number: nothing here can confine a process that way, and accepting them would
+// start it with all of the user's rights while the caller believes it isolated. The caller learns it before any launch.
 static WINAPI BOOL UpdateProcThreadAttribute(void *list, DWORD flags, uintptr_t attr, void *value, size_t size, void *prev, size_t *ret) {
-    (void)list; (void)flags; (void)attr; (void)value; (void)size; (void)prev; (void)ret; return 1;
+    (void)list; (void)flags; (void)value; (void)size; (void)prev; (void)ret;
+    unsigned number = (unsigned)(attr & 0xffff);
+    if (number == 9 || number == 15) { vx_set_last_error(50 /* ERROR_NOT_SUPPORTED */); return 0; }
+    return 1;
 }
 static WINAPI void DeleteProcThreadAttributeList(void *list) { (void)list; }
 // Hashes (CryptCreateHash on any provider): MD5, SHA-1, SHA-256 through CommonCrypto. Keys and encryption are not

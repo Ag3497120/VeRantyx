@@ -217,6 +217,8 @@ void vx_audio_init(void);              // WASAPI on Core Audio (audio.m; after C
 void vx_xaudio2_init(void);            // XAudio2 2.8/2.9 on Core Audio (xaudio2.m)
 void vx_com_init(void);                // ole32, oleaut32 (com.c)
 void vx_vcruntime_init(void);          // vcruntime140, MSVC C++ exceptions (vcruntime.c; after seh and ucrt)
+void vx_sysdlls_init(void);            // userenv, winspool, dhcpcsvc, secur32 names/LSA, oleaut32 ordinals (sysdlls.c; after COM)
+void vx_dbghelp_init(void);            // dbghelp: StackWalk64, symbols from export tables (dbghelp.c; after seh)
 
 // Text (text.c). Counts are in code units; the converters return the length needed and write at most cap units.
 size_t vx_utf8_to_utf16(const char *s, size_t n, WCHAR *out, size_t cap);
