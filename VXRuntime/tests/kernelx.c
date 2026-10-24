@@ -164,6 +164,19 @@ static void test_threads(void) {
     LONG absolute = 0; SetLastError(0); CHECK(!SetThreadInformation(GetCurrentThread(), 1, &absolute, sizeof absolute) && GetLastError() == ERROR_INVALID_PARAMETER);
     SetLastError(0); CHECK(!SetThreadInformation(e, 0, &priority, sizeof priority) && GetLastError() == ERROR_INVALID_HANDLE);
 
+    // background processing mode is a mode of the calling thread, not a priority: GetThreadPriority keeps the priority
+    CHECK(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) && GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_ABOVE_NORMAL);
+    CHECK(SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN));
+    CHECK(GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_ABOVE_NORMAL);
+    SetLastError(0); CHECK(!SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) && GetLastError() == ERROR_THREAD_MODE_ALREADY_BACKGROUND);
+    CHECK(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) && GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_BELOW_NORMAL);
+    CHECK(SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) && GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_BELOW_NORMAL);
+    SetLastError(0); CHECK(!SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) && GetLastError() == ERROR_THREAD_MODE_NOT_BACKGROUND);
+    int other = GetThreadPriority(t);                                         // only the calling thread has the mode
+    SetLastError(0); CHECK(!SetThreadPriority(t, THREAD_MODE_BACKGROUND_BEGIN) && GetLastError() == ERROR_INVALID_PARAMETER);
+    CHECK(GetThreadPriority(t) == other && other != THREAD_MODE_BACKGROUND_BEGIN);
+    CHECK(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) && GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_NORMAL);
+
     BYTE context[1024] = { 0 };
     SetLastError(0); CHECK(!Wow64GetThreadContext(GetCurrentThread(), context) && GetLastError() == ERROR_INVALID_FUNCTION);   // no WOW64
     SetLastError(0); CHECK(!Wow64GetThreadContext(e, context) && GetLastError() == ERROR_INVALID_HANDLE);

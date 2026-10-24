@@ -33,7 +33,7 @@
 enum { OBJ_THREAD = 1, OBJ_EVENT, OBJ_MUTEX, OBJ_SEMAPHORE, OBJ_OTHER, OBJ_PORT, OBJ_PROCESS };
 typedef struct {
     int type, refs;
-    int done, started, priority; DWORD suspended, exit_code, tid; pthread_t pthread;   // thread
+    int done, started, priority, background; DWORD suspended, exit_code, tid; pthread_t pthread;   // thread
     semaphore_t parked_sem, resume_sem; volatile int parked; uint8_t *context;              // (SuspendThread: see below)
     uint64_t stop_asked, stop_seen;                                                         //  (its stops asked, seen)
     struct apc *apcs; struct waiter *alert_waiter;                                          // (QueueUserAPC: see below)
@@ -505,16 +505,33 @@ static WINAPI int GetThreadPriority(HANDLE h) {
     pthread_mutex_unlock(&g_lock);
     return p;
 }
-static WINAPI BOOL SetThreadPriority(HANDLE h, int p) {
+// THREAD_MODE_BACKGROUND_BEGIN and _END are modes, not priorities: the thread's own resource priorities go to the
+// background class and come back, its priority (GetThreadPriority) stays what it was. Only for the calling thread;
+// beginning twice is ERROR_THREAD_MODE_ALREADY_BACKGROUND, ending outside it ERROR_THREAD_MODE_NOT_BACKGROUND.
+#define THREAD_MODE_BACKGROUND_BEGIN 0x10000
+#define THREAD_MODE_BACKGROUND_END 0x20000
+static BOOL background_mode(HANDLE h, int begin) {
     pthread_mutex_lock(&g_lock);
     vx_object *t = thread_object(h);
-    int self = t && t == self_object(), raise = t && p > t->priority;
+    DWORD err = !t ? 6 : t != self_object() ? 87 : begin == t->background ? (begin ? 400 : 401) : 0;
+    int p = t ? t->priority : 0;
+    if (!err) t->background = begin;
+    pthread_mutex_unlock(&g_lock);
+    if (err) { vx_set_last_error(err); return 0; }
+    pthread_set_qos_class_self_np(begin ? QOS_CLASS_BACKGROUND : qos_for(p), 0);
+    return 1;
+}
+static WINAPI BOOL SetThreadPriority(HANDLE h, int p) {
+    if (p == THREAD_MODE_BACKGROUND_BEGIN || p == THREAD_MODE_BACKGROUND_END) return background_mode(h, p == THREAD_MODE_BACKGROUND_BEGIN);
+    pthread_mutex_lock(&g_lock);
+    vx_object *t = thread_object(h);
+    int self = t && t == self_object(), raise = t && p > t->priority, background = t && t->background;
     pthread_t pt = t ? t->pthread : 0;
     if (t) t->priority = p;
     pthread_mutex_unlock(&g_lock);
     if (!t) { vx_set_last_error(6); return 0; }
-    if (self) pthread_set_qos_class_self_np(qos_for(p), 0);
-    else if (raise && pt) pthread_override_qos_class_start_np(pt, qos_for(p), 0);
+    if (self && !background) pthread_set_qos_class_self_np(qos_for(p), 0);   // (in background mode until it ends)
+    else if (!self && raise && pt) pthread_override_qos_class_start_np(pt, qos_for(p), 0);
     return 1;
 }
 static WINAPI LONG SetThreadDescription(HANDLE h, const WCHAR *d) {   // a thread names itself (for profilers)
