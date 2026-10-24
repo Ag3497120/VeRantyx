@@ -38,7 +38,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
        build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/kernelx.exe build/jobs.exe build/security.exe \
-       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/open_thread.exe build/version_info.exe
+       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/open_thread.exe build/version_info.exe build/section_access.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -211,6 +211,12 @@ build/version_info_res.o: tests/version_info.rc
 build/version_info.exe: tests/version_info.c build/version_info_res.o
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< build/version_info_res.o -lversion
+
+# What a file mapping handle may do (src/sync.c, src/files.c): no more access through DuplicateHandle than its source,
+# views by access. Chromium's read-only shared memory check (Steam's web helper).
+build/section_access.exe: tests/section_access.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
 
 build/dbghelp.exe: tests/dbghelp.c
 	@mkdir -p build
@@ -1215,6 +1221,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/handle_xfer.exe
 	$(VXRT) build/open_thread.exe
 	$(VXRT) build/version_info.exe build/hello_crt.exe
+	$(VXRT) build/section_access.exe
 	$(VXRT) build/window.exe
 	$(VXRT) build/winsta.exe
 	$(VXRT) build/scm.exe

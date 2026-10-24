@@ -165,6 +165,10 @@ enum { VX_HANDLE_FIND = 1, VX_HANDLE_MAPPING, VX_HANDLE_PIPE = 7, VX_HANDLE_WINS
 HANDLE vx_handle_new(int kind, void *data, void (*destroy)(void *));
 void  *vx_handle_data(HANDLE h, int kind);    // NULL unless h is a handle of that kind
 BOOL   vx_handle_close(HANDLE h);
+// The access a handle was granted, where it is recorded (file mapping objects); vx_handle_access: 0 if not recorded.
+void   vx_handle_set_access(HANDLE h, DWORD access);
+int    vx_handle_access(HANDLE h, DWORD *access);
+DWORD  vx_mapping_access(DWORD requested);     // files.c: a file mapping's access rights from FILE_MAP_* / generic ones
 // An overlapped operation on `file` finished: fills the OVERLAPPED, signals its event, queues the completion packet.
 void   vx_io_completed(HANDLE file, void *overlapped, DWORD bytes, DWORD status);
 void   vx_set_event(HANDLE event);          // SetEvent for threads that are not Windows threads

@@ -78,7 +78,7 @@ void *vx_trace_wrap(const char *dll, const char *name, void *fn) {
 // every thread's of the last 300 ms, in time order. A run keeps close to its untraced timing, which logging every
 // call changes enough to hide a race (Steam's main thread losing its data to a new thread's check: src/sync.c).
 #define RING_SIZE 2048
-typedef struct { uint64_t start, a[4], from, result; int index; DWORD err; int returned; } ring_entry;
+typedef struct { uint64_t start, a[7], from, result; int index; DWORD err; int returned; } ring_entry;
 typedef struct { unsigned next; DWORD tid; ring_entry e[RING_SIZE]; } ring;   // (outlives its thread: never freed)
 static __thread ring *t_ring;
 static ring *g_rings[1024];                                                    // every thread's (VXRT_TRACE_CALLS_RING=2)
@@ -100,9 +100,10 @@ static ring_entry *ring_add(void) {
 }
 static void ring_line(DWORD tid, const ring_entry *e) {
     const traced *t = &g_traced[e->index];
-    vx_log("  %llu.%06llu [%u] %s!%s(%#llx, %#llx, %#llx, %#llx) from %p%s%#llx (last error %u)",
+    vx_log("  %llu.%06llu [%u] %s!%s(%#llx, %#llx, %#llx, %#llx | %#llx, %#llx, %#llx) from %p%s%#llx (last error %u)",
            (unsigned long long)(e->start / 1000000000), (unsigned long long)(e->start / 1000 % 1000000), tid, t->dll, t->name,
            (unsigned long long)e->a[0], (unsigned long long)e->a[1], (unsigned long long)e->a[2], (unsigned long long)e->a[3],
+           (unsigned long long)e->a[4], (unsigned long long)e->a[5], (unsigned long long)e->a[6],
            (void *)e->from, e->returned ? " = " : " (no return yet) ", (unsigned long long)e->result, e->err);
 }
 static void ring_dump_all(uint64_t ms) {
@@ -144,19 +145,26 @@ __attribute__((constructor)) static void ring_dump_at(void) {
 }
 void vx_trace_ring_dump(const char *why) {
     const char *e = getenv("VXRT_TRACE_CALLS_RING");
-    if (e && *e == '2') { vx_log("[%u] every thread's calls into the runtime in the 300 ms before %s:", vx_current_tid(), why); ring_dump_all(300); return; }
+    if (e && *e == '2') {                              // (VXRT_TRACE_CALLS_RING_MS: another window than 300 ms)
+        const char *w = getenv("VXRT_TRACE_CALLS_RING_MS");
+        unsigned ms = w && atoi(w) > 0 ? (unsigned)atoi(w) : 300;
+        vx_log("[%u] every thread's calls into the runtime in the %u ms before %s:", vx_current_tid(), ms, why);
+        ring_dump_all(ms);
+        return;
+    }
     if (!t_ring) return;
     unsigned n = t_ring->next < RING_SIZE ? t_ring->next : RING_SIZE;
     vx_log("[%u] the last %u calls into the runtime before %s:", vx_current_tid(), n, why);
     for (unsigned k = t_ring->next - n; k != t_ring->next; k++) ring_line(t_ring->tid, &t_ring->e[k % RING_SIZE]);
 }
-// From vx_trace_enter: args points at the return address; rcx, rdx, r8, r9 were pushed just below it.
+// From vx_trace_enter: args points at the return address; rcx, rdx, r8, r9 were pushed just below it. The ring keeps
+// the next three stack words past the home space too (arguments 5-7 of a function that has them, else the caller's).
 WINAPI void *vx_trace_called(int index, uint64_t *ret) {
     traced *t = &g_traced[index];
     int n = __sync_fetch_and_add(&t->calls, 1);
     if (n < g_limit && ring_on()) {
         ring_entry *e = ring_add();
-        if (e) *e = (ring_entry){ clock_gettime_nsec_np(CLOCK_UPTIME_RAW), { ret[-1], ret[-2], ret[-3], ret[-4] }, *ret, 0, index, 0, 0 };
+        if (e) *e = (ring_entry){ clock_gettime_nsec_np(CLOCK_UPTIME_RAW), { ret[-1], ret[-2], ret[-3], ret[-4], ret[5], ret[6], ret[7] }, *ret, 0, index, 0, 0 };
         if (e && t_depth < 1024) {
             t_frames[t_depth++] = (frame){ *ret, index, (uint64_t)(uintptr_t)e };
             *ret = (uint64_t)(uintptr_t)vx_trace_return;

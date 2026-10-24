@@ -78,8 +78,12 @@ How the web helper (Chromium) is started, checked on 2026-10-24 against the comm
 `-cef-single-process` and `-cef-in-process-gpu`, named in older lists, add nothing in this client (2026-09-03 build).
 `--single-process`, which Chromium needs here because its child processes are handed handles between processes,
 comes from `VXRT_EXTRA_ARGS` (`src/launchargs.c`), so neither Steam's files nor the Wine version's
-`steamwebhelper.exe` shim are involved. Where it stops today: the web helper ends at a Chromium check about half a
-second in, so there is no sign-in window yet.
+`steamwebhelper.exe` shim are involved. Where it stops today (2026-10-25, client build 2026-09-03): `steam.exe` runs
+on (past Steam's SteamVR check, 88 s of 88 in every run since `OpenThread` finds every running thread; before, it
+ended itself about 10 s in: tier0 freed the main thread's data when it could not open it) and the web helper creates
+Steam's shared JS context (`logs/steamui_html.txt`: `BrowserReady`), but draws nothing: its GPU contexts all fail
+(`Failed to create shared context for virtualization`), and it often ends itself some 20 s later, after which
+`steam.exe` starts it again. There is no sign-in window yet.
 
 "Steam Service Error" at start: Steam looks for the Steam Client Service (`bin/SteamService.exe`, a 32-bit
 Windows service). Valve's own text in that window: it "helps Steam install or update games, enables anti-cheat

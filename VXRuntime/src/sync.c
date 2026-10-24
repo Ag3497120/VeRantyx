@@ -107,6 +107,7 @@ static void notify(vx_object *o) {                              // g_lock held: 
 #define HIGH_HANDLE_BASE 0x1000000
 #define MAX_HANDLES (LOW_HANDLES + (1 << 20))
 static vx_object *g_handles[MAX_HANDLES];
+static DWORD g_access[MAX_HANDLES];  // what each handle may do, where it is recorded (see "what a handle may do")
 static int g_free_hint;              // no free slot below it
 static int g_handle_top;             // past the highest slot ever used (vx_handle_object counts below it)
 static vx_object g_never;            // what the pseudo handles of the current process/thread wait on
@@ -117,7 +118,7 @@ DWORD vx_current_tid(void) { uint64_t t; pthread_threadid_np(NULL, &t); return (
 static HANDLE new_handle(vx_object *o) {
     for (int i = g_free_hint; i < MAX_HANDLES; i++)
         if (!g_handles[i]) {
-            g_handles[i] = o; o->refs++; g_free_hint = i + 1;
+            g_handles[i] = o; o->refs++; g_free_hint = i + 1; g_access[i] = 0;
             if (i >= g_handle_top) g_handle_top = i + 1;
             return (HANDLE)(intptr_t)(i < LOW_HANDLES ? HANDLE_BASE + i * 4 : HIGH_HANDLE_BASE + (i - LOW_HANDLES) * 4);
         }
@@ -1280,6 +1281,32 @@ static HANDLE give_to_process(int pid, HANDLE src) {
     if (vx_trace) vx_log("DuplicateHandle: %p to process %d as %#x", src, pid, INJECT_BASE + 4 * k);
     return (HANDLE)(intptr_t)(INJECT_BASE + 4 * k);
 }
+// ---- what a handle may do ---------------------------------------------------------------------------------------------
+// The access a handle was granted, recorded for the kinds of object whose access is checked here: file mapping objects
+// (files.c records it at CreateFileMapping/OpenFileMapping and checks it in MapViewOfFile). 0: not recorded, anything
+// goes (every other handle, and a mapping handle another process gave this one).
+// DuplicateHandle gives the copy the access asked for, or the source's with DUPLICATE_SAME_ACCESS, and cannot give it
+// more than its source has: DuplicateHandle's documentation (a file handle with GENERIC_READ cannot be duplicated to
+// one with GENERIC_READ and GENERIC_WRITE). Chromium makes read-only shared memory so and checks that its read-only
+// handle cannot be duplicated writable (a CHECK: Steam's web helper stopped at it right after its shared JS context
+// was created, every time).
+#define ACCESS_RECORDED 0x80000000u
+#define MAXIMUM_ALLOWED 0x02000000u
+void vx_handle_set_access(HANDLE h, DWORD access) {
+    glock();
+    int i = handle_index(h);
+    if (i >= 0 && g_handles[i]) g_access[i] = access | ACCESS_RECORDED;
+    gunlock();
+}
+int vx_handle_access(HANDLE h, DWORD *access) {
+    glock();
+    int i = handle_index(h);
+    DWORD a = i >= 0 && g_handles[i] ? g_access[i] : 0;
+    gunlock();
+    if (a && access) *access = a & ~ACCESS_RECORDED;
+    return a != 0;
+}
+
 // Giving a handle to another process from outside sync.c (handlexfer.c's server, asked for one of this process's).
 HANDLE vx_give_to_process(int pid, HANDLE src) { return give_to_process(pid, src); }
 HANDLE vx_handle_pull(int pid, HANDLE remote, int close_source);   // handlexfer.c
@@ -1315,7 +1342,21 @@ static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_pr
     if ((intptr_t)src == -1) { *dst = src; return 1; }
     glock();
     vx_object *o = (intptr_t)src == -2 ? self_object() : lookup(src);
+    int si = handle_index(src);
+    DWORD granted = o && si >= 0 ? g_access[si] : 0;          // (recorded: see "what a handle may do")
+    if (granted && !(options & 2 /* DUPLICATE_SAME_ACCESS */)) {
+        DWORD want = access & MAXIMUM_ALLOWED ? granted & ~ACCESS_RECORDED
+                   : o->type == OBJ_OTHER && o->kind == VX_HANDLE_MAPPING ? vx_mapping_access(access) : access;
+        if (want & ~granted & 0xffffu) {                         // (the object's own rights: the standard ones are not enforced here)
+            gunlock();
+            if (options & 1 /* DUPLICATE_CLOSE_SOURCE */) CloseHandle(src);   // (closed whatever the result)
+            vx_set_last_error(5 /* ERROR_ACCESS_DENIED */);
+            return 0;
+        }
+        granted = want | ACCESS_RECORDED;
+    }
     HANDLE h = o ? new_handle(o) : NULL;
+    if (h) g_access[handle_index(h)] = granted;
     gunlock();
     if (!o) {
         int fd = vx_handle_fd(src);
