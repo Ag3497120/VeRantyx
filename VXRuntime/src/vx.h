@@ -150,7 +150,7 @@ DWORD vx_get_last_error(void);
 // Handles: small table; stdio handles are the pseudo values Windows uses.
 int vx_handle_fd(HANDLE h);            // -1 if not a file handle
 // Other kernel objects owned by a module (find handles, ...): `destroy` runs when the last handle closes.
-enum { VX_HANDLE_FIND = 1, VX_HANDLE_MAPPING, VX_HANDLE_PIPE = 7 };
+enum { VX_HANDLE_FIND = 1, VX_HANDLE_MAPPING, VX_HANDLE_PIPE = 7, VX_HANDLE_WINSTA, VX_HANDLE_DESKTOP };
 HANDLE vx_handle_new(int kind, void *data, void (*destroy)(void *));
 void  *vx_handle_data(HANDLE h, int kind);    // NULL unless h is a handle of that kind
 BOOL   vx_handle_close(HANDLE h);
@@ -181,6 +181,7 @@ void vx_text_init(void);               // code pages, environment (text.c)
 void vx_files_init(void);              // files and paths (files.c)
 void vx_registry_init(void);           // advapi32 registry (registry.c)
 void vx_user32_init(void);             // windows and messages (user32.c, cocoa.m)
+void vx_winsta_init(void);             // window stations, desktops, power notifications, DPI awareness (winsta.c)
 void vx_gdi_init(void);                // drawing (gdi.c)
 void vx_net_init(void);                // ws2_32 (net.c)
 void vx_mm_init(void);                 // winmm, imm32 (mm.c)

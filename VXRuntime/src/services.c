@@ -330,31 +330,6 @@ static WINAPI BOOL GetWindowInfo(void *wnd, uint8_t *info) {
 }
 static WINAPI BOOL EnumChildWindows(void *parent, void *fn, intptr_t param) { (void)parent; (void)fn; (void)param; return 1; }
 static WINAPI BOOL GetGUIThreadInfo(DWORD tid, uint8_t *info) { (void)tid; DWORD size = *(DWORD *)info; memset(info + 4, 0, size > 4 ? size - 4 : 0); return 1; }
-static int g_station;
-static WINAPI HANDLE GetProcessWindowStation(void) { return &g_station; }
-static int g_desktop;
-static WINAPI HANDLE GetThreadDesktop(DWORD tid) { (void)tid; return &g_desktop; }   // (the Default desktop: see below)
-// The window station is WinSta0 and every desktop handle is its Default desktop, the input desktop of an unlocked
-// session (SteamVR's compositor checks the input desktop's name, and shows a "display locked" colour otherwise).
-static BOOL user_object_info(HANDLE obj, int index, void *out, DWORD n, DWORD *need, int wide) {
-    if (index == 1) {                                             // UOI_FLAGS: WSF_VISIBLE
-        if (need) *need = 12;
-        if (n < 12 || !out) { vx_set_last_error(122); return 0; }
-        memset(out, 0, 12); ((DWORD *)out)[2] = 1;
-        return 1;
-    }
-    const char *text = NULL;
-    if (index == 2) text = obj == &g_station ? "WinSta0" : "Default";              // UOI_NAME
-    if (index == 3) text = obj == &g_station ? "WindowStation" : "Desktop";        // UOI_TYPE
-    if (!text) { if (need) *need = 0; vx_set_last_error(87); return 0; }
-    DWORD size = (DWORD)(strlen(text) + 1) * (wide ? 2 : 1);
-    if (need) *need = size;
-    if (!out || n < size) { vx_set_last_error(122); return 0; }
-    if (wide) vx_return_string_w(text, out, n / 2); else vx_return_string_a(text, out, n);
-    return 1;
-}
-static WINAPI BOOL GetUserObjectInformationW(HANDLE obj, int index, void *out, DWORD n, DWORD *need) { return user_object_info(obj, index, out, n, need, 1); }
-static WINAPI BOOL GetUserObjectInformationA(HANDLE obj, int index, void *out, DWORD n, DWORD *need) { return user_object_info(obj, index, out, n, need, 0); }
 static int g_icon_copy;
 static WINAPI void *CopyIcon(void *icon) { (void)icon; return &g_icon_copy; }
 static WINAPI BOOL DrawIconEx(void *dc, int x, int y, void *icon, int w, int h, unsigned step, void *brush, unsigned flags) { (void)dc; (void)x; (void)y; (void)icon; (void)w; (void)h; (void)step; (void)brush; (void)flags; return 1; }
@@ -761,7 +736,7 @@ static const vx_export crt[] = {
 static const vx_export user32[] = {
     VX_EXPORT(GetKeyboardLayoutList), VX_EXPORT(LoadKeyboardLayoutA), VX_EXPORT(LoadKeyboardLayoutW), VX_EXPORT(ActivateKeyboardLayout),
     VX_EXPORT(ToUnicodeEx), VX_EXPORT(SetRect), VX_EXPORT(wsprintfW), VX_EXPORT(wvsprintfW), VX_EXPORT(GetWindowInfo), VX_EXPORT(EnumChildWindows), VX_EXPORT(GetGUIThreadInfo),
-    VX_EXPORT(GetProcessWindowStation), VX_EXPORT(GetThreadDesktop), VX_EXPORT(GetUserObjectInformationW), VX_EXPORT(GetUserObjectInformationA), VX_EXPORT(CopyIcon), VX_EXPORT(DrawIconEx), VX_EXPORT(GetIconInfo),
+    VX_EXPORT(CopyIcon), VX_EXPORT(DrawIconEx), VX_EXPORT(GetIconInfo),
 };
 static const vx_export imm32[] = {
     VX_EXPORT(ImmGetConversionStatus), VX_EXPORT(ImmSetConversionStatus), VX_EXPORT(ImmGetProperty), VX_EXPORT(ImmGetVirtualKey),
