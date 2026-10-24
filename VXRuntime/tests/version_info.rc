@@ -1,0 +1,26 @@
+// A made-up version resource for tests/version_info.c (its own file's version, read back with version.dll).
+1 VERSIONINFO
+FILEVERSION 1,2,3,4
+PRODUCTVERSION 5,6,7,8
+FILEFLAGSMASK 0x3f
+FILEFLAGS 0
+FILEOS 0x40004
+FILETYPE 1
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041104B0"
+        BEGIN
+            VALUE "CompanyName", "Example Test Works"
+            VALUE "FileDescription", "Version resource test"
+            VALUE "FileVersion", "1.2.3.4"
+            VALUE "ProductName", "Made-up Product"
+            VALUE "ProductVersion", "5.6.7.8"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x411, 1200
+    END
+END

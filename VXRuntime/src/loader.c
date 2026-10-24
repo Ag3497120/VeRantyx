@@ -96,6 +96,7 @@ static int is_builtin(const char *dll) {
     for (size_t m = 0; m < g_module_count; m++) if (same_dll(g_modules[m].dll, dll)) return 1;
     return 0;
 }
+int vx_is_builtin_dll(const char *dll) { return is_builtin(dll); }
 
 void *vx_find_export(const char *dll, const char *name) {
     dll = canonical_dll(dll);
@@ -1215,6 +1216,7 @@ int main(int argc, char **argv, char **envp) {
     vx_kernel32_init();
     vx_system_init();
     vx_region_init();                            // (before desktop.c and client.c: replaces their region stand-ins)
+    vx_version_init();
     vx_desktop_init();
     vx_winsta_init();
     vx_scm_init();

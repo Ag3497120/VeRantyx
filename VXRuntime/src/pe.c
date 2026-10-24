@@ -153,6 +153,17 @@ static int version_resource_find(const uint8_t *base, uint32_t size, uint32_t di
     return 0;
 }
 
+int vx_pe_version_resource(const uint8_t *data, size_t size, const vx_pe_info *pe, size_t *offset, uint32_t *length) {
+    if (!data || !pe || !offset || !length || !pe->directories[2].rva || pe->directories[2].size < 16) return 0;
+    size_t resource_offset;
+    uint32_t version_rva, version_size;
+    if (!vx_pe_rva_to_file(data, size, pe, pe->directories[2].rva, pe->directories[2].size, &resource_offset) ||
+        !version_resource_find(data + resource_offset, pe->directories[2].size, 0, 0, &version_rva, &version_size) ||
+        !vx_pe_rva_to_file(data, size, pe, version_rva, version_size, offset)) return 0;
+    *length = version_size;
+    return 1;
+}
+
 int vx_pe_version_info_get(const uint8_t *data, size_t size, const vx_pe_info *pe,
                            vx_pe_version_info *out) {
     if (!data || !pe || !out || !pe->directories[2].rva || pe->directories[2].size < 16) return 0;
