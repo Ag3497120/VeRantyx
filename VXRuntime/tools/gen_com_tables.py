@@ -65,24 +65,30 @@ D3D12 = {
     "d3d12sdklayers.h": ["ID3D12Debug", "ID3D12Debug1", "ID3D12Debug2", "ID3D12Debug3", "ID3D12Debug4", "ID3D12Debug5"],
     "d3dcommon.h": ["ID3D10Blob"],
 }
-# DirectWrite (src/dwrite.m): one table per object, its newest version implemented; "?" marks interfaces wanted for
-# their IIDs only (versions not offered: QueryInterface names them in traces and answers E_NOINTERFACE).
+# DirectWrite (src/dwrite.m): one table per object, its newest version implemented (the older versions are there for
+# their IIDs); "?" marks interfaces wanted for their IIDs only (also versions not offered: QueryInterface names them
+# in traces and answers E_NOINTERFACE).
 DWRITE = {
     "dwrite.h": ["?IDWriteFactory", "IDWriteLocalFontFileLoader", "IDWriteFontFileStream", "IDWriteFontFile",
-                 "IDWriteLocalizedStrings", "?IDWriteRenderingParams", "?IDWriteFontFace", "?IDWriteFont", "IDWriteFontList",
-                 "IDWriteFontFamily", "IDWriteFontCollection", "IDWriteGlyphRunAnalysis", "IDWriteGdiInterop",
+                 "IDWriteLocalizedStrings", "?IDWriteRenderingParams", "?IDWriteFontFace", "?IDWriteFont", "?IDWriteFontList",
+                 "?IDWriteFontFamily", "?IDWriteFontCollection", "IDWriteGlyphRunAnalysis", "?IDWriteGdiInterop",
                  "?IDWriteFontFileLoader", "?IDWriteFontCollectionLoader", "?IDWriteFontFileEnumerator",
                  "IDWriteTextFormat", "IDWriteTextLayout", "IDWriteTypography", "IDWriteBitmapRenderTarget",
                  "?IDWriteTextAnalysisSource", "?IDWriteTextAnalyzer", "?IDWriteTextRenderer", "?IDWritePixelSnapping",
-                 "?IDWriteInlineObject"],
+                 "?IDWriteInlineObject", "?IDWriteNumberSubstitution"],
     "dwrite_1.h": ["?IDWriteFactory1", "?IDWriteFontFace1", "?IDWriteFont1", "?IDWriteRenderingParams1", "?IDWriteTextLayout1",
                    "?IDWriteBitmapRenderTarget1"],
-    "dwrite_2.h": ["IDWriteFactory2", "IDWriteFontFace2", "IDWriteFont2", "IDWriteRenderingParams2", "IDWriteFontFallback",
-                   "?IDWriteTextFormat1", "?IDWriteTextLayout2"],
-    "dwrite_3.h": ["?IDWriteFactory3", "?IDWriteFactory4", "?IDWriteFactory5", "?IDWriteFactory6", "?IDWriteFactory7",
-                   "?IDWriteFontFace3", "?IDWriteFontFace4", "?IDWriteFontFace5", "?IDWriteFont3",
-                   "?IDWriteRenderingParams3", "?IDWriteFontCollection1", "?IDWriteFontFamily1", "?IDWriteFontList1",
-                   "?IDWriteFontFallback1", "?IDWriteGdiInterop1", "?IDWriteInMemoryFontFileLoader"],
+    "dwrite_2.h": ["?IDWriteFactory2", "?IDWriteFontFace2", "?IDWriteFont2", "?IDWriteRenderingParams2", "?IDWriteFontFallback",
+                   "?IDWriteTextFormat1", "?IDWriteTextLayout2", "IDWriteFontFallbackBuilder"],
+    "dwrite_3.h": ["?IDWriteFactory3", "?IDWriteFactory4", "?IDWriteFactory5", "?IDWriteFactory6", "IDWriteFactory7",
+                   "?IDWriteFontFace3", "?IDWriteFontFace4", "IDWriteFontFace5", "IDWriteFont3",
+                   "IDWriteRenderingParams3", "?IDWriteFontCollection1", "?IDWriteFontCollection2", "IDWriteFontCollection3",
+                   "?IDWriteFontFamily1", "IDWriteFontFamily2", "?IDWriteFontList1", "IDWriteFontList2",
+                   "IDWriteFontFallback1", "IDWriteGdiInterop1", "IDWriteInMemoryFontFileLoader", "?IDWriteFontSet",
+                   "?IDWriteFontSet1", "?IDWriteFontSet2", "IDWriteFontSet3", "?IDWriteFontFaceReference",
+                   "IDWriteFontFaceReference1", "IDWriteFontResource", "?IDWriteFontSetBuilder", "?IDWriteFontSetBuilder1",
+                   "IDWriteFontSetBuilder2", "IDWriteStringList", "IDWriteFontDownloadQueue", "?IDWriteFontFace6",
+                   "?IDWriteFontSet4", "?IDWriteTextFormat3", "?IDWriteFontDownloadListener"],
 }
 if len(sys.argv) > 2 and sys.argv[2] == "dwrite":
     INTERFACES = DWRITE

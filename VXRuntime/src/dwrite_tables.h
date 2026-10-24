@@ -50,39 +50,8 @@ static const GUID IID_IDWriteLocalizedStrings = { 0x08256209, 0x099a, 0x4b34, { 
 static const GUID IID_IDWriteRenderingParams = { 0x2f0da53a, 0x2add, 0x47cd, { 0x82, 0xee, 0xd9, 0xec, 0x34, 0x68, 0x8e, 0x75 } };
 static const GUID IID_IDWriteFontFace = { 0x5f49804d, 0x7024, 0x4d43, { 0xbf, 0xa9, 0xd2, 0x59, 0x84, 0xf5, 0x38, 0x49 } };
 static const GUID IID_IDWriteFont = { 0xacd16696, 0x8c14, 0x4f5d, { 0x87, 0x7e, 0xfe, 0x3f, 0xc1, 0xd3, 0x27, 0x37 } };
-static const char *const vt_IDWriteFontList[] = { "QueryInterface", "AddRef", "Release", "GetFontCollection", "GetFontCount", "GetFont" };
-static WINAPI HRESULT stub_IDWriteFontList_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList::QueryInterface"); }
-static WINAPI HRESULT stub_IDWriteFontList_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList::AddRef"); }
-static WINAPI HRESULT stub_IDWriteFontList_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList::Release"); }
-static WINAPI HRESULT stub_IDWriteFontList_GetFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList::GetFontCollection"); }
-static WINAPI HRESULT stub_IDWriteFontList_GetFontCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList::GetFontCount"); }
-static WINAPI HRESULT stub_IDWriteFontList_GetFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList::GetFont"); }
-static void *const vtstub_IDWriteFontList[] = { (void *)stub_IDWriteFontList_QueryInterface, (void *)stub_IDWriteFontList_AddRef, (void *)stub_IDWriteFontList_Release, (void *)stub_IDWriteFontList_GetFontCollection, (void *)stub_IDWriteFontList_GetFontCount, (void *)stub_IDWriteFontList_GetFont };
-#define VT_COUNT_IDWriteFontList 6
 static const GUID IID_IDWriteFontList = { 0x1a0d8438, 0x1d97, 0x4ec1, { 0xae, 0xf9, 0xa2, 0xfb, 0x86, 0xed, 0x6a, 0xcb } };
-static const char *const vt_IDWriteFontFamily[] = { "QueryInterface", "AddRef", "Release", "GetFontCollection", "GetFontCount", "GetFont", "GetFamilyNames", "GetFirstMatchingFont", "GetMatchingFonts" };
-static WINAPI HRESULT stub_IDWriteFontFamily_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily::QueryInterface"); }
-static WINAPI HRESULT stub_IDWriteFontFamily_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily::AddRef"); }
-static WINAPI HRESULT stub_IDWriteFontFamily_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily::Release"); }
-static WINAPI HRESULT stub_IDWriteFontFamily_GetFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily::GetFontCollection"); }
-static WINAPI HRESULT stub_IDWriteFontFamily_GetFontCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily::GetFontCount"); }
-static WINAPI HRESULT stub_IDWriteFontFamily_GetFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily::GetFont"); }
-static WINAPI HRESULT stub_IDWriteFontFamily_GetFamilyNames(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily::GetFamilyNames"); }
-static WINAPI HRESULT stub_IDWriteFontFamily_GetFirstMatchingFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily::GetFirstMatchingFont"); }
-static WINAPI HRESULT stub_IDWriteFontFamily_GetMatchingFonts(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily::GetMatchingFonts"); }
-static void *const vtstub_IDWriteFontFamily[] = { (void *)stub_IDWriteFontFamily_QueryInterface, (void *)stub_IDWriteFontFamily_AddRef, (void *)stub_IDWriteFontFamily_Release, (void *)stub_IDWriteFontFamily_GetFontCollection, (void *)stub_IDWriteFontFamily_GetFontCount, (void *)stub_IDWriteFontFamily_GetFont, (void *)stub_IDWriteFontFamily_GetFamilyNames, (void *)stub_IDWriteFontFamily_GetFirstMatchingFont, (void *)stub_IDWriteFontFamily_GetMatchingFonts };
-#define VT_COUNT_IDWriteFontFamily 9
 static const GUID IID_IDWriteFontFamily = { 0xda20d8ef, 0x812a, 0x4c43, { 0x98, 0x02, 0x62, 0xec, 0x4a, 0xbd, 0x7a, 0xdd } };
-static const char *const vt_IDWriteFontCollection[] = { "QueryInterface", "AddRef", "Release", "GetFontFamilyCount", "GetFontFamily", "FindFamilyName", "GetFontFromFontFace" };
-static WINAPI HRESULT stub_IDWriteFontCollection_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection::QueryInterface"); }
-static WINAPI HRESULT stub_IDWriteFontCollection_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection::AddRef"); }
-static WINAPI HRESULT stub_IDWriteFontCollection_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection::Release"); }
-static WINAPI HRESULT stub_IDWriteFontCollection_GetFontFamilyCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection::GetFontFamilyCount"); }
-static WINAPI HRESULT stub_IDWriteFontCollection_GetFontFamily(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection::GetFontFamily"); }
-static WINAPI HRESULT stub_IDWriteFontCollection_FindFamilyName(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection::FindFamilyName"); }
-static WINAPI HRESULT stub_IDWriteFontCollection_GetFontFromFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection::GetFontFromFontFace"); }
-static void *const vtstub_IDWriteFontCollection[] = { (void *)stub_IDWriteFontCollection_QueryInterface, (void *)stub_IDWriteFontCollection_AddRef, (void *)stub_IDWriteFontCollection_Release, (void *)stub_IDWriteFontCollection_GetFontFamilyCount, (void *)stub_IDWriteFontCollection_GetFontFamily, (void *)stub_IDWriteFontCollection_FindFamilyName, (void *)stub_IDWriteFontCollection_GetFontFromFontFace };
-#define VT_COUNT_IDWriteFontCollection 7
 static const GUID IID_IDWriteFontCollection = { 0xa84cee02, 0x3eea, 0x4eee, { 0xa8, 0x27, 0x87, 0xc1, 0xa0, 0x2a, 0x0f, 0xcc } };
 static const char *const vt_IDWriteGlyphRunAnalysis[] = { "QueryInterface", "AddRef", "Release", "GetAlphaTextureBounds", "CreateAlphaTexture", "GetAlphaBlendParams" };
 static WINAPI HRESULT stub_IDWriteGlyphRunAnalysis_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteGlyphRunAnalysis::QueryInterface"); }
@@ -94,17 +63,6 @@ static WINAPI HRESULT stub_IDWriteGlyphRunAnalysis_GetAlphaBlendParams(void *sel
 static void *const vtstub_IDWriteGlyphRunAnalysis[] = { (void *)stub_IDWriteGlyphRunAnalysis_QueryInterface, (void *)stub_IDWriteGlyphRunAnalysis_AddRef, (void *)stub_IDWriteGlyphRunAnalysis_Release, (void *)stub_IDWriteGlyphRunAnalysis_GetAlphaTextureBounds, (void *)stub_IDWriteGlyphRunAnalysis_CreateAlphaTexture, (void *)stub_IDWriteGlyphRunAnalysis_GetAlphaBlendParams };
 #define VT_COUNT_IDWriteGlyphRunAnalysis 6
 static const GUID IID_IDWriteGlyphRunAnalysis = { 0x7d97dbf7, 0xe085, 0x42d4, { 0x81, 0xe3, 0x6a, 0x88, 0x3b, 0xde, 0xd1, 0x18 } };
-static const char *const vt_IDWriteGdiInterop[] = { "QueryInterface", "AddRef", "Release", "CreateFontFromLOGFONT", "ConvertFontToLOGFONT", "ConvertFontFaceToLOGFONT", "CreateFontFaceFromHdc", "CreateBitmapRenderTarget" };
-static WINAPI HRESULT stub_IDWriteGdiInterop_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop::QueryInterface"); }
-static WINAPI HRESULT stub_IDWriteGdiInterop_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop::AddRef"); }
-static WINAPI HRESULT stub_IDWriteGdiInterop_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop::Release"); }
-static WINAPI HRESULT stub_IDWriteGdiInterop_CreateFontFromLOGFONT(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop::CreateFontFromLOGFONT"); }
-static WINAPI HRESULT stub_IDWriteGdiInterop_ConvertFontToLOGFONT(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop::ConvertFontToLOGFONT"); }
-static WINAPI HRESULT stub_IDWriteGdiInterop_ConvertFontFaceToLOGFONT(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop::ConvertFontFaceToLOGFONT"); }
-static WINAPI HRESULT stub_IDWriteGdiInterop_CreateFontFaceFromHdc(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop::CreateFontFaceFromHdc"); }
-static WINAPI HRESULT stub_IDWriteGdiInterop_CreateBitmapRenderTarget(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop::CreateBitmapRenderTarget"); }
-static void *const vtstub_IDWriteGdiInterop[] = { (void *)stub_IDWriteGdiInterop_QueryInterface, (void *)stub_IDWriteGdiInterop_AddRef, (void *)stub_IDWriteGdiInterop_Release, (void *)stub_IDWriteGdiInterop_CreateFontFromLOGFONT, (void *)stub_IDWriteGdiInterop_ConvertFontToLOGFONT, (void *)stub_IDWriteGdiInterop_ConvertFontFaceToLOGFONT, (void *)stub_IDWriteGdiInterop_CreateFontFaceFromHdc, (void *)stub_IDWriteGdiInterop_CreateBitmapRenderTarget };
-#define VT_COUNT_IDWriteGdiInterop 8
 static const GUID IID_IDWriteGdiInterop = { 0x1edd9491, 0x9853, 0x4299, { 0x89, 0x8f, 0x64, 0x32, 0x98, 0x3b, 0x6f, 0x3a } };
 static const GUID IID_IDWriteFontFileLoader = { 0x727cad4e, 0xd6af, 0x4c9e, { 0x8a, 0x08, 0xd6, 0x95, 0xb1, 0x1c, 0xaa, 0x49 } };
 static const GUID IID_IDWriteFontCollectionLoader = { 0xcca920e4, 0x52f0, 0x492b, { 0xbf, 0xa8, 0x29, 0xc7, 0x2e, 0xe0, 0xa4, 0x68 } };
@@ -242,146 +200,414 @@ static const GUID IID_IDWriteTextAnalyzer = { 0xb7e6163e, 0x7f46, 0x43b4, { 0x84
 static const GUID IID_IDWriteTextRenderer = { 0xef8a8135, 0x5cc6, 0x45fe, { 0x88, 0x25, 0xc5, 0xa0, 0x72, 0x4e, 0xb8, 0x19 } };
 static const GUID IID_IDWritePixelSnapping = { 0xeaf3a2da, 0xecf4, 0x4d24, { 0xb6, 0x44, 0xb3, 0x4f, 0x68, 0x42, 0x02, 0x4b } };
 static const GUID IID_IDWriteInlineObject = { 0x8339fde3, 0x106f, 0x47ab, { 0x83, 0x73, 0x1c, 0x62, 0x95, 0xeb, 0x10, 0xb3 } };
+static const GUID IID_IDWriteNumberSubstitution = { 0x14885cc9, 0xbab0, 0x4f90, { 0xb6, 0xed, 0x5c, 0x36, 0x6a, 0x2c, 0xd0, 0x3d } };
 static const GUID IID_IDWriteFactory1 = { 0x30572f99, 0xdac6, 0x41db, { 0xa1, 0x6e, 0x04, 0x86, 0x30, 0x7e, 0x60, 0x6a } };
 static const GUID IID_IDWriteFontFace1 = { 0xa71efdb4, 0x9fdb, 0x4838, { 0xad, 0x90, 0xcf, 0xc3, 0xbe, 0x8c, 0x3d, 0xaf } };
 static const GUID IID_IDWriteFont1 = { 0xacd16696, 0x8c14, 0x4f5d, { 0x87, 0x7e, 0xfe, 0x3f, 0xc1, 0xd3, 0x27, 0x38 } };
 static const GUID IID_IDWriteRenderingParams1 = { 0x94413cf4, 0xa6fc, 0x4248, { 0x8b, 0x50, 0x66, 0x74, 0x34, 0x8f, 0xca, 0xd3 } };
 static const GUID IID_IDWriteTextLayout1 = { 0x9064d822, 0x80a7, 0x465c, { 0xa9, 0x86, 0xdf, 0x65, 0xf7, 0x8b, 0x8f, 0xeb } };
 static const GUID IID_IDWriteBitmapRenderTarget1 = { 0x791e8298, 0x3ef3, 0x4230, { 0x98, 0x80, 0xc9, 0xbd, 0xec, 0xc4, 0x20, 0x64 } };
-static const char *const vt_IDWriteFactory2[] = { "QueryInterface", "AddRef", "Release", "GetSystemFontCollection", "CreateCustomFontCollection", "RegisterFontCollectionLoader", "UnregisterFontCollectionLoader", "CreateFontFileReference", "CreateCustomFontFileReference", "CreateFontFace", "CreateRenderingParams", "CreateMonitorRenderingParams", "CreateCustomRenderingParams", "RegisterFontFileLoader", "UnregisterFontFileLoader", "CreateTextFormat", "CreateTypography", "GetGdiInterop", "CreateTextLayout", "CreateGdiCompatibleTextLayout", "CreateEllipsisTrimmingSign", "CreateTextAnalyzer", "CreateNumberSubstitution", "CreateGlyphRunAnalysis", "GetEudcFontCollection", "IDWriteFactory1_CreateCustomRenderingParams", "GetSystemFontFallback", "CreateFontFallbackBuilder", "TranslateColorGlyphRun", "IDWriteFactory2_CreateCustomRenderingParams", "IDWriteFactory2_CreateGlyphRunAnalysis" };
-static WINAPI HRESULT stub_IDWriteFactory2_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::QueryInterface"); }
-static WINAPI HRESULT stub_IDWriteFactory2_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::AddRef"); }
-static WINAPI HRESULT stub_IDWriteFactory2_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::Release"); }
-static WINAPI HRESULT stub_IDWriteFactory2_GetSystemFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::GetSystemFontCollection"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateCustomFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateCustomFontCollection"); }
-static WINAPI HRESULT stub_IDWriteFactory2_RegisterFontCollectionLoader(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::RegisterFontCollectionLoader"); }
-static WINAPI HRESULT stub_IDWriteFactory2_UnregisterFontCollectionLoader(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::UnregisterFontCollectionLoader"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateFontFileReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateFontFileReference"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateCustomFontFileReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateCustomFontFileReference"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateFontFace"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateRenderingParams"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateMonitorRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateMonitorRenderingParams"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateCustomRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateCustomRenderingParams"); }
-static WINAPI HRESULT stub_IDWriteFactory2_RegisterFontFileLoader(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::RegisterFontFileLoader"); }
-static WINAPI HRESULT stub_IDWriteFactory2_UnregisterFontFileLoader(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::UnregisterFontFileLoader"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateTextFormat(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateTextFormat"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateTypography(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateTypography"); }
-static WINAPI HRESULT stub_IDWriteFactory2_GetGdiInterop(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::GetGdiInterop"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateTextLayout(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateTextLayout"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateGdiCompatibleTextLayout(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateGdiCompatibleTextLayout"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateEllipsisTrimmingSign(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateEllipsisTrimmingSign"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateTextAnalyzer(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateTextAnalyzer"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateNumberSubstitution(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateNumberSubstitution"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateGlyphRunAnalysis(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateGlyphRunAnalysis"); }
-static WINAPI HRESULT stub_IDWriteFactory2_GetEudcFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::GetEudcFontCollection"); }
-static WINAPI HRESULT stub_IDWriteFactory2_IDWriteFactory1_CreateCustomRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::IDWriteFactory1_CreateCustomRenderingParams"); }
-static WINAPI HRESULT stub_IDWriteFactory2_GetSystemFontFallback(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::GetSystemFontFallback"); }
-static WINAPI HRESULT stub_IDWriteFactory2_CreateFontFallbackBuilder(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::CreateFontFallbackBuilder"); }
-static WINAPI HRESULT stub_IDWriteFactory2_TranslateColorGlyphRun(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::TranslateColorGlyphRun"); }
-static WINAPI HRESULT stub_IDWriteFactory2_IDWriteFactory2_CreateCustomRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::IDWriteFactory2_CreateCustomRenderingParams"); }
-static WINAPI HRESULT stub_IDWriteFactory2_IDWriteFactory2_CreateGlyphRunAnalysis(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory2::IDWriteFactory2_CreateGlyphRunAnalysis"); }
-static void *const vtstub_IDWriteFactory2[] = { (void *)stub_IDWriteFactory2_QueryInterface, (void *)stub_IDWriteFactory2_AddRef, (void *)stub_IDWriteFactory2_Release, (void *)stub_IDWriteFactory2_GetSystemFontCollection, (void *)stub_IDWriteFactory2_CreateCustomFontCollection, (void *)stub_IDWriteFactory2_RegisterFontCollectionLoader, (void *)stub_IDWriteFactory2_UnregisterFontCollectionLoader, (void *)stub_IDWriteFactory2_CreateFontFileReference, (void *)stub_IDWriteFactory2_CreateCustomFontFileReference, (void *)stub_IDWriteFactory2_CreateFontFace, (void *)stub_IDWriteFactory2_CreateRenderingParams, (void *)stub_IDWriteFactory2_CreateMonitorRenderingParams, (void *)stub_IDWriteFactory2_CreateCustomRenderingParams, (void *)stub_IDWriteFactory2_RegisterFontFileLoader, (void *)stub_IDWriteFactory2_UnregisterFontFileLoader, (void *)stub_IDWriteFactory2_CreateTextFormat, (void *)stub_IDWriteFactory2_CreateTypography, (void *)stub_IDWriteFactory2_GetGdiInterop, (void *)stub_IDWriteFactory2_CreateTextLayout, (void *)stub_IDWriteFactory2_CreateGdiCompatibleTextLayout, (void *)stub_IDWriteFactory2_CreateEllipsisTrimmingSign, (void *)stub_IDWriteFactory2_CreateTextAnalyzer, (void *)stub_IDWriteFactory2_CreateNumberSubstitution, (void *)stub_IDWriteFactory2_CreateGlyphRunAnalysis, (void *)stub_IDWriteFactory2_GetEudcFontCollection, (void *)stub_IDWriteFactory2_IDWriteFactory1_CreateCustomRenderingParams, (void *)stub_IDWriteFactory2_GetSystemFontFallback, (void *)stub_IDWriteFactory2_CreateFontFallbackBuilder, (void *)stub_IDWriteFactory2_TranslateColorGlyphRun, (void *)stub_IDWriteFactory2_IDWriteFactory2_CreateCustomRenderingParams, (void *)stub_IDWriteFactory2_IDWriteFactory2_CreateGlyphRunAnalysis };
-#define VT_COUNT_IDWriteFactory2 31
 static const GUID IID_IDWriteFactory2 = { 0x0439fc60, 0xca44, 0x4994, { 0x8d, 0xee, 0x3a, 0x9a, 0xf7, 0xb7, 0x32, 0xec } };
-static const char *const vt_IDWriteFontFace2[] = { "QueryInterface", "AddRef", "Release", "GetType", "GetFiles", "GetIndex", "GetSimulations", "IsSymbolFont", "GetMetrics", "GetGlyphCount", "GetDesignGlyphMetrics", "GetGlyphIndices", "TryGetFontTable", "ReleaseFontTable", "GetGlyphRunOutline", "GetRecommendedRenderingMode", "GetGdiCompatibleMetrics", "GetGdiCompatibleGlyphMetrics", "IDWriteFontFace1_GetMetrics", "IDWriteFontFace1_GetGdiCompatibleMetrics", "GetCaretMetrics", "GetUnicodeRanges", "IsMonospacedFont", "GetDesignGlyphAdvances", "GetGdiCompatibleGlyphAdvances", "GetKerningPairAdjustments", "HasKerningPairs", "IDWriteFontFace1_GetRecommendedRenderingMode", "GetVerticalGlyphVariants", "HasVerticalGlyphVariants", "IsColorFont", "GetColorPaletteCount", "GetPaletteEntryCount", "GetPaletteEntries", "IDWriteFontFace2_GetRecommendedRenderingMode" };
-static WINAPI HRESULT stub_IDWriteFontFace2_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::QueryInterface"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::AddRef"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::Release"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetType(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetType"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetFiles(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetFiles"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetIndex(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetIndex"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetSimulations(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetSimulations"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_IsSymbolFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::IsSymbolFont"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetMetrics"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetGlyphCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetGlyphCount"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetDesignGlyphMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetDesignGlyphMetrics"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetGlyphIndices(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetGlyphIndices"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_TryGetFontTable(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::TryGetFontTable"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_ReleaseFontTable(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::ReleaseFontTable"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetGlyphRunOutline(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetGlyphRunOutline"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetRecommendedRenderingMode(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetRecommendedRenderingMode"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetGdiCompatibleMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetGdiCompatibleMetrics"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetGdiCompatibleGlyphMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetGdiCompatibleGlyphMetrics"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_IDWriteFontFace1_GetMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::IDWriteFontFace1_GetMetrics"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_IDWriteFontFace1_GetGdiCompatibleMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::IDWriteFontFace1_GetGdiCompatibleMetrics"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetCaretMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetCaretMetrics"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetUnicodeRanges(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetUnicodeRanges"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_IsMonospacedFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::IsMonospacedFont"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetDesignGlyphAdvances(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetDesignGlyphAdvances"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetGdiCompatibleGlyphAdvances(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetGdiCompatibleGlyphAdvances"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetKerningPairAdjustments(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetKerningPairAdjustments"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_HasKerningPairs(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::HasKerningPairs"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_IDWriteFontFace1_GetRecommendedRenderingMode(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::IDWriteFontFace1_GetRecommendedRenderingMode"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetVerticalGlyphVariants(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetVerticalGlyphVariants"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_HasVerticalGlyphVariants(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::HasVerticalGlyphVariants"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_IsColorFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::IsColorFont"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetColorPaletteCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetColorPaletteCount"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetPaletteEntryCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetPaletteEntryCount"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_GetPaletteEntries(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::GetPaletteEntries"); }
-static WINAPI HRESULT stub_IDWriteFontFace2_IDWriteFontFace2_GetRecommendedRenderingMode(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace2::IDWriteFontFace2_GetRecommendedRenderingMode"); }
-static void *const vtstub_IDWriteFontFace2[] = { (void *)stub_IDWriteFontFace2_QueryInterface, (void *)stub_IDWriteFontFace2_AddRef, (void *)stub_IDWriteFontFace2_Release, (void *)stub_IDWriteFontFace2_GetType, (void *)stub_IDWriteFontFace2_GetFiles, (void *)stub_IDWriteFontFace2_GetIndex, (void *)stub_IDWriteFontFace2_GetSimulations, (void *)stub_IDWriteFontFace2_IsSymbolFont, (void *)stub_IDWriteFontFace2_GetMetrics, (void *)stub_IDWriteFontFace2_GetGlyphCount, (void *)stub_IDWriteFontFace2_GetDesignGlyphMetrics, (void *)stub_IDWriteFontFace2_GetGlyphIndices, (void *)stub_IDWriteFontFace2_TryGetFontTable, (void *)stub_IDWriteFontFace2_ReleaseFontTable, (void *)stub_IDWriteFontFace2_GetGlyphRunOutline, (void *)stub_IDWriteFontFace2_GetRecommendedRenderingMode, (void *)stub_IDWriteFontFace2_GetGdiCompatibleMetrics, (void *)stub_IDWriteFontFace2_GetGdiCompatibleGlyphMetrics, (void *)stub_IDWriteFontFace2_IDWriteFontFace1_GetMetrics, (void *)stub_IDWriteFontFace2_IDWriteFontFace1_GetGdiCompatibleMetrics, (void *)stub_IDWriteFontFace2_GetCaretMetrics, (void *)stub_IDWriteFontFace2_GetUnicodeRanges, (void *)stub_IDWriteFontFace2_IsMonospacedFont, (void *)stub_IDWriteFontFace2_GetDesignGlyphAdvances, (void *)stub_IDWriteFontFace2_GetGdiCompatibleGlyphAdvances, (void *)stub_IDWriteFontFace2_GetKerningPairAdjustments, (void *)stub_IDWriteFontFace2_HasKerningPairs, (void *)stub_IDWriteFontFace2_IDWriteFontFace1_GetRecommendedRenderingMode, (void *)stub_IDWriteFontFace2_GetVerticalGlyphVariants, (void *)stub_IDWriteFontFace2_HasVerticalGlyphVariants, (void *)stub_IDWriteFontFace2_IsColorFont, (void *)stub_IDWriteFontFace2_GetColorPaletteCount, (void *)stub_IDWriteFontFace2_GetPaletteEntryCount, (void *)stub_IDWriteFontFace2_GetPaletteEntries, (void *)stub_IDWriteFontFace2_IDWriteFontFace2_GetRecommendedRenderingMode };
-#define VT_COUNT_IDWriteFontFace2 35
 static const GUID IID_IDWriteFontFace2 = { 0xd8b768ff, 0x64bc, 0x4e66, { 0x98, 0x2b, 0xec, 0x8e, 0x87, 0xf6, 0x93, 0xf7 } };
-static const char *const vt_IDWriteFont2[] = { "QueryInterface", "AddRef", "Release", "GetFontFamily", "GetWeight", "GetStretch", "GetStyle", "IsSymbolFont", "GetFaceNames", "GetInformationalStrings", "GetSimulations", "GetMetrics", "HasCharacter", "CreateFontFace", "IDWriteFont1_GetMetrics", "GetPanose", "GetUnicodeRanges", "IsMonospacedFont", "IsColorFont" };
-static WINAPI HRESULT stub_IDWriteFont2_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::QueryInterface"); }
-static WINAPI HRESULT stub_IDWriteFont2_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::AddRef"); }
-static WINAPI HRESULT stub_IDWriteFont2_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::Release"); }
-static WINAPI HRESULT stub_IDWriteFont2_GetFontFamily(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::GetFontFamily"); }
-static WINAPI HRESULT stub_IDWriteFont2_GetWeight(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::GetWeight"); }
-static WINAPI HRESULT stub_IDWriteFont2_GetStretch(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::GetStretch"); }
-static WINAPI HRESULT stub_IDWriteFont2_GetStyle(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::GetStyle"); }
-static WINAPI HRESULT stub_IDWriteFont2_IsSymbolFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::IsSymbolFont"); }
-static WINAPI HRESULT stub_IDWriteFont2_GetFaceNames(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::GetFaceNames"); }
-static WINAPI HRESULT stub_IDWriteFont2_GetInformationalStrings(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::GetInformationalStrings"); }
-static WINAPI HRESULT stub_IDWriteFont2_GetSimulations(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::GetSimulations"); }
-static WINAPI HRESULT stub_IDWriteFont2_GetMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::GetMetrics"); }
-static WINAPI HRESULT stub_IDWriteFont2_HasCharacter(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::HasCharacter"); }
-static WINAPI HRESULT stub_IDWriteFont2_CreateFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::CreateFontFace"); }
-static WINAPI HRESULT stub_IDWriteFont2_IDWriteFont1_GetMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::IDWriteFont1_GetMetrics"); }
-static WINAPI HRESULT stub_IDWriteFont2_GetPanose(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::GetPanose"); }
-static WINAPI HRESULT stub_IDWriteFont2_GetUnicodeRanges(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::GetUnicodeRanges"); }
-static WINAPI HRESULT stub_IDWriteFont2_IsMonospacedFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::IsMonospacedFont"); }
-static WINAPI HRESULT stub_IDWriteFont2_IsColorFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFont2::IsColorFont"); }
-static void *const vtstub_IDWriteFont2[] = { (void *)stub_IDWriteFont2_QueryInterface, (void *)stub_IDWriteFont2_AddRef, (void *)stub_IDWriteFont2_Release, (void *)stub_IDWriteFont2_GetFontFamily, (void *)stub_IDWriteFont2_GetWeight, (void *)stub_IDWriteFont2_GetStretch, (void *)stub_IDWriteFont2_GetStyle, (void *)stub_IDWriteFont2_IsSymbolFont, (void *)stub_IDWriteFont2_GetFaceNames, (void *)stub_IDWriteFont2_GetInformationalStrings, (void *)stub_IDWriteFont2_GetSimulations, (void *)stub_IDWriteFont2_GetMetrics, (void *)stub_IDWriteFont2_HasCharacter, (void *)stub_IDWriteFont2_CreateFontFace, (void *)stub_IDWriteFont2_IDWriteFont1_GetMetrics, (void *)stub_IDWriteFont2_GetPanose, (void *)stub_IDWriteFont2_GetUnicodeRanges, (void *)stub_IDWriteFont2_IsMonospacedFont, (void *)stub_IDWriteFont2_IsColorFont };
-#define VT_COUNT_IDWriteFont2 19
 static const GUID IID_IDWriteFont2 = { 0x29748ed6, 0x8c9c, 0x4a6a, { 0xbe, 0x0b, 0xd9, 0x12, 0xe8, 0x53, 0x89, 0x44 } };
-static const char *const vt_IDWriteRenderingParams2[] = { "QueryInterface", "AddRef", "Release", "GetGamma", "GetEnhancedContrast", "GetClearTypeLevel", "GetPixelGeometry", "GetRenderingMode", "GetGrayscaleEnhancedContrast", "GetGridFitMode" };
-static WINAPI HRESULT stub_IDWriteRenderingParams2_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams2::QueryInterface"); }
-static WINAPI HRESULT stub_IDWriteRenderingParams2_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams2::AddRef"); }
-static WINAPI HRESULT stub_IDWriteRenderingParams2_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams2::Release"); }
-static WINAPI HRESULT stub_IDWriteRenderingParams2_GetGamma(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams2::GetGamma"); }
-static WINAPI HRESULT stub_IDWriteRenderingParams2_GetEnhancedContrast(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams2::GetEnhancedContrast"); }
-static WINAPI HRESULT stub_IDWriteRenderingParams2_GetClearTypeLevel(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams2::GetClearTypeLevel"); }
-static WINAPI HRESULT stub_IDWriteRenderingParams2_GetPixelGeometry(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams2::GetPixelGeometry"); }
-static WINAPI HRESULT stub_IDWriteRenderingParams2_GetRenderingMode(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams2::GetRenderingMode"); }
-static WINAPI HRESULT stub_IDWriteRenderingParams2_GetGrayscaleEnhancedContrast(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams2::GetGrayscaleEnhancedContrast"); }
-static WINAPI HRESULT stub_IDWriteRenderingParams2_GetGridFitMode(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams2::GetGridFitMode"); }
-static void *const vtstub_IDWriteRenderingParams2[] = { (void *)stub_IDWriteRenderingParams2_QueryInterface, (void *)stub_IDWriteRenderingParams2_AddRef, (void *)stub_IDWriteRenderingParams2_Release, (void *)stub_IDWriteRenderingParams2_GetGamma, (void *)stub_IDWriteRenderingParams2_GetEnhancedContrast, (void *)stub_IDWriteRenderingParams2_GetClearTypeLevel, (void *)stub_IDWriteRenderingParams2_GetPixelGeometry, (void *)stub_IDWriteRenderingParams2_GetRenderingMode, (void *)stub_IDWriteRenderingParams2_GetGrayscaleEnhancedContrast, (void *)stub_IDWriteRenderingParams2_GetGridFitMode };
-#define VT_COUNT_IDWriteRenderingParams2 10
 static const GUID IID_IDWriteRenderingParams2 = { 0xf9d711c3, 0x9777, 0x40ae, { 0x87, 0xe8, 0x3e, 0x5a, 0xf9, 0xbf, 0x09, 0x48 } };
-static const char *const vt_IDWriteFontFallback[] = { "QueryInterface", "AddRef", "Release", "MapCharacters" };
-static WINAPI HRESULT stub_IDWriteFontFallback_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallback::QueryInterface"); }
-static WINAPI HRESULT stub_IDWriteFontFallback_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallback::AddRef"); }
-static WINAPI HRESULT stub_IDWriteFontFallback_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallback::Release"); }
-static WINAPI HRESULT stub_IDWriteFontFallback_MapCharacters(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallback::MapCharacters"); }
-static void *const vtstub_IDWriteFontFallback[] = { (void *)stub_IDWriteFontFallback_QueryInterface, (void *)stub_IDWriteFontFallback_AddRef, (void *)stub_IDWriteFontFallback_Release, (void *)stub_IDWriteFontFallback_MapCharacters };
-#define VT_COUNT_IDWriteFontFallback 4
 static const GUID IID_IDWriteFontFallback = { 0xefa008f9, 0xf7a1, 0x48bf, { 0xb0, 0x5c, 0xf2, 0x24, 0x71, 0x3c, 0xc0, 0xff } };
 static const GUID IID_IDWriteTextFormat1 = { 0x5f174b49, 0x0d8b, 0x4cfb, { 0x8b, 0xca, 0xf1, 0xcc, 0xe9, 0xd0, 0x6c, 0x67 } };
 static const GUID IID_IDWriteTextLayout2 = { 0x1093c18f, 0x8d5e, 0x43f0, { 0xb0, 0x64, 0x09, 0x17, 0x31, 0x1b, 0x52, 0x5e } };
+static const char *const vt_IDWriteFontFallbackBuilder[] = { "QueryInterface", "AddRef", "Release", "AddMapping", "AddMappings", "CreateFontFallback" };
+static WINAPI HRESULT stub_IDWriteFontFallbackBuilder_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallbackBuilder::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontFallbackBuilder_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallbackBuilder::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontFallbackBuilder_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallbackBuilder::Release"); }
+static WINAPI HRESULT stub_IDWriteFontFallbackBuilder_AddMapping(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallbackBuilder::AddMapping"); }
+static WINAPI HRESULT stub_IDWriteFontFallbackBuilder_AddMappings(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallbackBuilder::AddMappings"); }
+static WINAPI HRESULT stub_IDWriteFontFallbackBuilder_CreateFontFallback(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallbackBuilder::CreateFontFallback"); }
+static void *const vtstub_IDWriteFontFallbackBuilder[] = { (void *)stub_IDWriteFontFallbackBuilder_QueryInterface, (void *)stub_IDWriteFontFallbackBuilder_AddRef, (void *)stub_IDWriteFontFallbackBuilder_Release, (void *)stub_IDWriteFontFallbackBuilder_AddMapping, (void *)stub_IDWriteFontFallbackBuilder_AddMappings, (void *)stub_IDWriteFontFallbackBuilder_CreateFontFallback };
+#define VT_COUNT_IDWriteFontFallbackBuilder 6
+static const GUID IID_IDWriteFontFallbackBuilder = { 0xfd882d06, 0x8aba, 0x4fb8, { 0xb8, 0x49, 0x8b, 0xe8, 0xb7, 0x3e, 0x14, 0xde } };
 static const GUID IID_IDWriteFactory3 = { 0x9a1b41c3, 0xd3bb, 0x466a, { 0x87, 0xfc, 0xfe, 0x67, 0x55, 0x6a, 0x3b, 0x65 } };
 static const GUID IID_IDWriteFactory4 = { 0x4b0b5bd3, 0x0797, 0x4549, { 0x8a, 0xc5, 0xfe, 0x91, 0x5c, 0xc5, 0x38, 0x56 } };
 static const GUID IID_IDWriteFactory5 = { 0x958db99a, 0xbe2a, 0x4f09, { 0xaf, 0x7d, 0x65, 0x18, 0x98, 0x03, 0xd1, 0xd3 } };
 static const GUID IID_IDWriteFactory6 = { 0xf3744d80, 0x21f7, 0x42eb, { 0xb3, 0x5d, 0x99, 0x5b, 0xc7, 0x2f, 0xc2, 0x23 } };
+static const char *const vt_IDWriteFactory7[] = { "QueryInterface", "AddRef", "Release", "GetSystemFontCollection", "CreateCustomFontCollection", "RegisterFontCollectionLoader", "UnregisterFontCollectionLoader", "CreateFontFileReference", "CreateCustomFontFileReference", "CreateFontFace", "CreateRenderingParams", "CreateMonitorRenderingParams", "CreateCustomRenderingParams", "RegisterFontFileLoader", "UnregisterFontFileLoader", "CreateTextFormat", "CreateTypography", "GetGdiInterop", "CreateTextLayout", "CreateGdiCompatibleTextLayout", "CreateEllipsisTrimmingSign", "CreateTextAnalyzer", "CreateNumberSubstitution", "CreateGlyphRunAnalysis", "GetEudcFontCollection", "IDWriteFactory1_CreateCustomRenderingParams", "GetSystemFontFallback", "CreateFontFallbackBuilder", "TranslateColorGlyphRun", "IDWriteFactory2_CreateCustomRenderingParams", "IDWriteFactory2_CreateGlyphRunAnalysis", "IDWriteFactory3_CreateGlyphRunAnalysis", "IDWriteFactory3_CreateCustomRenderingParams", "CreateFontFaceReference_", "CreateFontFaceReference", "GetSystemFontSet", "CreateFontSetBuilder", "CreateFontCollectionFromFontSet", "IDWriteFactory3_GetSystemFontCollection", "GetFontDownloadQueue", "IDWriteFactory4_TranslateColorGlyphRun", "ComputeGlyphOrigins_", "ComputeGlyphOrigins", "IDWriteFactory5_CreateFontSetBuilder", "CreateInMemoryFontFileLoader", "CreateHttpFontFileLoader", "AnalyzeContainerType", "UnpackFontFile", "IDWriteFactory6_CreateFontFaceReference", "CreateFontResource", "IDWriteFactory6_GetSystemFontSet", "IDWriteFactory6_GetSystemFontCollection", "IDWriteFactory6_CreateFontCollectionFromFontSet", "IDWriteFactory6_CreateFontSetBuilder", "IDWriteFactory6_CreateTextFormat", "IDWriteFactory7_GetSystemFontSet", "IDWriteFactory7_GetSystemFontCollection" };
+static WINAPI HRESULT stub_IDWriteFactory7_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFactory7_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFactory7_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::Release"); }
+static WINAPI HRESULT stub_IDWriteFactory7_GetSystemFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::GetSystemFontCollection"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateCustomFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateCustomFontCollection"); }
+static WINAPI HRESULT stub_IDWriteFactory7_RegisterFontCollectionLoader(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::RegisterFontCollectionLoader"); }
+static WINAPI HRESULT stub_IDWriteFactory7_UnregisterFontCollectionLoader(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::UnregisterFontCollectionLoader"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateFontFileReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateFontFileReference"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateCustomFontFileReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateCustomFontFileReference"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateFontFace"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateRenderingParams"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateMonitorRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateMonitorRenderingParams"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateCustomRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateCustomRenderingParams"); }
+static WINAPI HRESULT stub_IDWriteFactory7_RegisterFontFileLoader(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::RegisterFontFileLoader"); }
+static WINAPI HRESULT stub_IDWriteFactory7_UnregisterFontFileLoader(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::UnregisterFontFileLoader"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateTextFormat(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateTextFormat"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateTypography(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateTypography"); }
+static WINAPI HRESULT stub_IDWriteFactory7_GetGdiInterop(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::GetGdiInterop"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateTextLayout(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateTextLayout"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateGdiCompatibleTextLayout(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateGdiCompatibleTextLayout"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateEllipsisTrimmingSign(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateEllipsisTrimmingSign"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateTextAnalyzer(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateTextAnalyzer"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateNumberSubstitution(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateNumberSubstitution"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateGlyphRunAnalysis(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateGlyphRunAnalysis"); }
+static WINAPI HRESULT stub_IDWriteFactory7_GetEudcFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::GetEudcFontCollection"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory1_CreateCustomRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory1_CreateCustomRenderingParams"); }
+static WINAPI HRESULT stub_IDWriteFactory7_GetSystemFontFallback(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::GetSystemFontFallback"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateFontFallbackBuilder(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateFontFallbackBuilder"); }
+static WINAPI HRESULT stub_IDWriteFactory7_TranslateColorGlyphRun(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::TranslateColorGlyphRun"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory2_CreateCustomRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory2_CreateCustomRenderingParams"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory2_CreateGlyphRunAnalysis(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory2_CreateGlyphRunAnalysis"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory3_CreateGlyphRunAnalysis(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory3_CreateGlyphRunAnalysis"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory3_CreateCustomRenderingParams(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory3_CreateCustomRenderingParams"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateFontFaceReference_(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateFontFaceReference_"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateFontFaceReference"); }
+static WINAPI HRESULT stub_IDWriteFactory7_GetSystemFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::GetSystemFontSet"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateFontSetBuilder(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateFontSetBuilder"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateFontCollectionFromFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateFontCollectionFromFontSet"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory3_GetSystemFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory3_GetSystemFontCollection"); }
+static WINAPI HRESULT stub_IDWriteFactory7_GetFontDownloadQueue(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::GetFontDownloadQueue"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory4_TranslateColorGlyphRun(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory4_TranslateColorGlyphRun"); }
+static WINAPI HRESULT stub_IDWriteFactory7_ComputeGlyphOrigins_(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::ComputeGlyphOrigins_"); }
+static WINAPI HRESULT stub_IDWriteFactory7_ComputeGlyphOrigins(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::ComputeGlyphOrigins"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory5_CreateFontSetBuilder(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory5_CreateFontSetBuilder"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateInMemoryFontFileLoader(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateInMemoryFontFileLoader"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateHttpFontFileLoader(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateHttpFontFileLoader"); }
+static WINAPI HRESULT stub_IDWriteFactory7_AnalyzeContainerType(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::AnalyzeContainerType"); }
+static WINAPI HRESULT stub_IDWriteFactory7_UnpackFontFile(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::UnpackFontFile"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory6_CreateFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory6_CreateFontFaceReference"); }
+static WINAPI HRESULT stub_IDWriteFactory7_CreateFontResource(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::CreateFontResource"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory6_GetSystemFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory6_GetSystemFontSet"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory6_GetSystemFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory6_GetSystemFontCollection"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory6_CreateFontCollectionFromFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory6_CreateFontCollectionFromFontSet"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory6_CreateFontSetBuilder(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory6_CreateFontSetBuilder"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory6_CreateTextFormat(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory6_CreateTextFormat"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory7_GetSystemFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory7_GetSystemFontSet"); }
+static WINAPI HRESULT stub_IDWriteFactory7_IDWriteFactory7_GetSystemFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFactory7::IDWriteFactory7_GetSystemFontCollection"); }
+static void *const vtstub_IDWriteFactory7[] = { (void *)stub_IDWriteFactory7_QueryInterface, (void *)stub_IDWriteFactory7_AddRef, (void *)stub_IDWriteFactory7_Release, (void *)stub_IDWriteFactory7_GetSystemFontCollection, (void *)stub_IDWriteFactory7_CreateCustomFontCollection, (void *)stub_IDWriteFactory7_RegisterFontCollectionLoader, (void *)stub_IDWriteFactory7_UnregisterFontCollectionLoader, (void *)stub_IDWriteFactory7_CreateFontFileReference, (void *)stub_IDWriteFactory7_CreateCustomFontFileReference, (void *)stub_IDWriteFactory7_CreateFontFace, (void *)stub_IDWriteFactory7_CreateRenderingParams, (void *)stub_IDWriteFactory7_CreateMonitorRenderingParams, (void *)stub_IDWriteFactory7_CreateCustomRenderingParams, (void *)stub_IDWriteFactory7_RegisterFontFileLoader, (void *)stub_IDWriteFactory7_UnregisterFontFileLoader, (void *)stub_IDWriteFactory7_CreateTextFormat, (void *)stub_IDWriteFactory7_CreateTypography, (void *)stub_IDWriteFactory7_GetGdiInterop, (void *)stub_IDWriteFactory7_CreateTextLayout, (void *)stub_IDWriteFactory7_CreateGdiCompatibleTextLayout, (void *)stub_IDWriteFactory7_CreateEllipsisTrimmingSign, (void *)stub_IDWriteFactory7_CreateTextAnalyzer, (void *)stub_IDWriteFactory7_CreateNumberSubstitution, (void *)stub_IDWriteFactory7_CreateGlyphRunAnalysis, (void *)stub_IDWriteFactory7_GetEudcFontCollection, (void *)stub_IDWriteFactory7_IDWriteFactory1_CreateCustomRenderingParams, (void *)stub_IDWriteFactory7_GetSystemFontFallback, (void *)stub_IDWriteFactory7_CreateFontFallbackBuilder, (void *)stub_IDWriteFactory7_TranslateColorGlyphRun, (void *)stub_IDWriteFactory7_IDWriteFactory2_CreateCustomRenderingParams, (void *)stub_IDWriteFactory7_IDWriteFactory2_CreateGlyphRunAnalysis, (void *)stub_IDWriteFactory7_IDWriteFactory3_CreateGlyphRunAnalysis, (void *)stub_IDWriteFactory7_IDWriteFactory3_CreateCustomRenderingParams, (void *)stub_IDWriteFactory7_CreateFontFaceReference_, (void *)stub_IDWriteFactory7_CreateFontFaceReference, (void *)stub_IDWriteFactory7_GetSystemFontSet, (void *)stub_IDWriteFactory7_CreateFontSetBuilder, (void *)stub_IDWriteFactory7_CreateFontCollectionFromFontSet, (void *)stub_IDWriteFactory7_IDWriteFactory3_GetSystemFontCollection, (void *)stub_IDWriteFactory7_GetFontDownloadQueue, (void *)stub_IDWriteFactory7_IDWriteFactory4_TranslateColorGlyphRun, (void *)stub_IDWriteFactory7_ComputeGlyphOrigins_, (void *)stub_IDWriteFactory7_ComputeGlyphOrigins, (void *)stub_IDWriteFactory7_IDWriteFactory5_CreateFontSetBuilder, (void *)stub_IDWriteFactory7_CreateInMemoryFontFileLoader, (void *)stub_IDWriteFactory7_CreateHttpFontFileLoader, (void *)stub_IDWriteFactory7_AnalyzeContainerType, (void *)stub_IDWriteFactory7_UnpackFontFile, (void *)stub_IDWriteFactory7_IDWriteFactory6_CreateFontFaceReference, (void *)stub_IDWriteFactory7_CreateFontResource, (void *)stub_IDWriteFactory7_IDWriteFactory6_GetSystemFontSet, (void *)stub_IDWriteFactory7_IDWriteFactory6_GetSystemFontCollection, (void *)stub_IDWriteFactory7_IDWriteFactory6_CreateFontCollectionFromFontSet, (void *)stub_IDWriteFactory7_IDWriteFactory6_CreateFontSetBuilder, (void *)stub_IDWriteFactory7_IDWriteFactory6_CreateTextFormat, (void *)stub_IDWriteFactory7_IDWriteFactory7_GetSystemFontSet, (void *)stub_IDWriteFactory7_IDWriteFactory7_GetSystemFontCollection };
+#define VT_COUNT_IDWriteFactory7 57
 static const GUID IID_IDWriteFactory7 = { 0x35d0e0b3, 0x9076, 0x4d2e, { 0xa0, 0x16, 0xa9, 0x1b, 0x56, 0x8a, 0x06, 0xb4 } };
 static const GUID IID_IDWriteFontFace3 = { 0xd37d7598, 0x09be, 0x4222, { 0xa2, 0x36, 0x20, 0x81, 0x34, 0x1c, 0xc1, 0xf2 } };
 static const GUID IID_IDWriteFontFace4 = { 0x27f2a904, 0x4eb8, 0x441d, { 0x96, 0x78, 0x05, 0x63, 0xf5, 0x3e, 0x3e, 0x2f } };
+static const char *const vt_IDWriteFontFace5[] = { "QueryInterface", "AddRef", "Release", "GetType", "GetFiles", "GetIndex", "GetSimulations", "IsSymbolFont", "GetMetrics", "GetGlyphCount", "GetDesignGlyphMetrics", "GetGlyphIndices", "TryGetFontTable", "ReleaseFontTable", "GetGlyphRunOutline", "GetRecommendedRenderingMode", "GetGdiCompatibleMetrics", "GetGdiCompatibleGlyphMetrics", "IDWriteFontFace1_GetMetrics", "IDWriteFontFace1_GetGdiCompatibleMetrics", "GetCaretMetrics", "GetUnicodeRanges", "IsMonospacedFont", "GetDesignGlyphAdvances", "GetGdiCompatibleGlyphAdvances", "GetKerningPairAdjustments", "HasKerningPairs", "IDWriteFontFace1_GetRecommendedRenderingMode", "GetVerticalGlyphVariants", "HasVerticalGlyphVariants", "IsColorFont", "GetColorPaletteCount", "GetPaletteEntryCount", "GetPaletteEntries", "IDWriteFontFace2_GetRecommendedRenderingMode", "GetFontFaceReference", "GetPanose", "GetWeight", "GetStretch", "GetStyle", "GetFamilyNames", "GetFaceNames", "GetInformationalStrings", "HasCharacter", "IDWriteFontFace3_GetRecommendedRenderingMode", "IsCharacterLocal", "IsGlyphLocal", "AreCharactersLocal", "AreGlyphsLocal", "GetGlyphImageFormats_", "GetGlyphImageFormats", "GetGlyphImageData", "ReleaseGlyphImageData", "GetFontAxisValueCount", "GetFontAxisValues", "HasVariations", "GetFontResource", "Equals" };
+static WINAPI HRESULT stub_IDWriteFontFace5_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::Release"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetType(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetType"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetFiles(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetFiles"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetIndex(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetIndex"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetSimulations(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetSimulations"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_IsSymbolFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::IsSymbolFont"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetMetrics"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetGlyphCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetGlyphCount"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetDesignGlyphMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetDesignGlyphMetrics"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetGlyphIndices(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetGlyphIndices"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_TryGetFontTable(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::TryGetFontTable"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_ReleaseFontTable(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::ReleaseFontTable"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetGlyphRunOutline(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetGlyphRunOutline"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetRecommendedRenderingMode(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetRecommendedRenderingMode"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetGdiCompatibleMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetGdiCompatibleMetrics"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetGdiCompatibleGlyphMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetGdiCompatibleGlyphMetrics"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_IDWriteFontFace1_GetMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::IDWriteFontFace1_GetMetrics"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_IDWriteFontFace1_GetGdiCompatibleMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::IDWriteFontFace1_GetGdiCompatibleMetrics"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetCaretMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetCaretMetrics"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetUnicodeRanges(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetUnicodeRanges"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_IsMonospacedFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::IsMonospacedFont"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetDesignGlyphAdvances(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetDesignGlyphAdvances"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetGdiCompatibleGlyphAdvances(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetGdiCompatibleGlyphAdvances"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetKerningPairAdjustments(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetKerningPairAdjustments"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_HasKerningPairs(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::HasKerningPairs"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_IDWriteFontFace1_GetRecommendedRenderingMode(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::IDWriteFontFace1_GetRecommendedRenderingMode"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetVerticalGlyphVariants(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetVerticalGlyphVariants"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_HasVerticalGlyphVariants(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::HasVerticalGlyphVariants"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_IsColorFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::IsColorFont"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetColorPaletteCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetColorPaletteCount"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetPaletteEntryCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetPaletteEntryCount"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetPaletteEntries(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetPaletteEntries"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_IDWriteFontFace2_GetRecommendedRenderingMode(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::IDWriteFontFace2_GetRecommendedRenderingMode"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetFontFaceReference"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetPanose(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetPanose"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetWeight(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetWeight"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetStretch(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetStretch"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetStyle(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetStyle"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetFamilyNames(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetFamilyNames"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetFaceNames(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetFaceNames"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetInformationalStrings(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetInformationalStrings"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_HasCharacter(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::HasCharacter"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_IDWriteFontFace3_GetRecommendedRenderingMode(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::IDWriteFontFace3_GetRecommendedRenderingMode"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_IsCharacterLocal(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::IsCharacterLocal"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_IsGlyphLocal(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::IsGlyphLocal"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_AreCharactersLocal(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::AreCharactersLocal"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_AreGlyphsLocal(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::AreGlyphsLocal"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetGlyphImageFormats_(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetGlyphImageFormats_"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetGlyphImageFormats(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetGlyphImageFormats"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetGlyphImageData(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetGlyphImageData"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_ReleaseGlyphImageData(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::ReleaseGlyphImageData"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetFontAxisValueCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetFontAxisValueCount"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetFontAxisValues(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetFontAxisValues"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_HasVariations(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::HasVariations"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_GetFontResource(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::GetFontResource"); }
+static WINAPI HRESULT stub_IDWriteFontFace5_Equals(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFace5::Equals"); }
+static void *const vtstub_IDWriteFontFace5[] = { (void *)stub_IDWriteFontFace5_QueryInterface, (void *)stub_IDWriteFontFace5_AddRef, (void *)stub_IDWriteFontFace5_Release, (void *)stub_IDWriteFontFace5_GetType, (void *)stub_IDWriteFontFace5_GetFiles, (void *)stub_IDWriteFontFace5_GetIndex, (void *)stub_IDWriteFontFace5_GetSimulations, (void *)stub_IDWriteFontFace5_IsSymbolFont, (void *)stub_IDWriteFontFace5_GetMetrics, (void *)stub_IDWriteFontFace5_GetGlyphCount, (void *)stub_IDWriteFontFace5_GetDesignGlyphMetrics, (void *)stub_IDWriteFontFace5_GetGlyphIndices, (void *)stub_IDWriteFontFace5_TryGetFontTable, (void *)stub_IDWriteFontFace5_ReleaseFontTable, (void *)stub_IDWriteFontFace5_GetGlyphRunOutline, (void *)stub_IDWriteFontFace5_GetRecommendedRenderingMode, (void *)stub_IDWriteFontFace5_GetGdiCompatibleMetrics, (void *)stub_IDWriteFontFace5_GetGdiCompatibleGlyphMetrics, (void *)stub_IDWriteFontFace5_IDWriteFontFace1_GetMetrics, (void *)stub_IDWriteFontFace5_IDWriteFontFace1_GetGdiCompatibleMetrics, (void *)stub_IDWriteFontFace5_GetCaretMetrics, (void *)stub_IDWriteFontFace5_GetUnicodeRanges, (void *)stub_IDWriteFontFace5_IsMonospacedFont, (void *)stub_IDWriteFontFace5_GetDesignGlyphAdvances, (void *)stub_IDWriteFontFace5_GetGdiCompatibleGlyphAdvances, (void *)stub_IDWriteFontFace5_GetKerningPairAdjustments, (void *)stub_IDWriteFontFace5_HasKerningPairs, (void *)stub_IDWriteFontFace5_IDWriteFontFace1_GetRecommendedRenderingMode, (void *)stub_IDWriteFontFace5_GetVerticalGlyphVariants, (void *)stub_IDWriteFontFace5_HasVerticalGlyphVariants, (void *)stub_IDWriteFontFace5_IsColorFont, (void *)stub_IDWriteFontFace5_GetColorPaletteCount, (void *)stub_IDWriteFontFace5_GetPaletteEntryCount, (void *)stub_IDWriteFontFace5_GetPaletteEntries, (void *)stub_IDWriteFontFace5_IDWriteFontFace2_GetRecommendedRenderingMode, (void *)stub_IDWriteFontFace5_GetFontFaceReference, (void *)stub_IDWriteFontFace5_GetPanose, (void *)stub_IDWriteFontFace5_GetWeight, (void *)stub_IDWriteFontFace5_GetStretch, (void *)stub_IDWriteFontFace5_GetStyle, (void *)stub_IDWriteFontFace5_GetFamilyNames, (void *)stub_IDWriteFontFace5_GetFaceNames, (void *)stub_IDWriteFontFace5_GetInformationalStrings, (void *)stub_IDWriteFontFace5_HasCharacter, (void *)stub_IDWriteFontFace5_IDWriteFontFace3_GetRecommendedRenderingMode, (void *)stub_IDWriteFontFace5_IsCharacterLocal, (void *)stub_IDWriteFontFace5_IsGlyphLocal, (void *)stub_IDWriteFontFace5_AreCharactersLocal, (void *)stub_IDWriteFontFace5_AreGlyphsLocal, (void *)stub_IDWriteFontFace5_GetGlyphImageFormats_, (void *)stub_IDWriteFontFace5_GetGlyphImageFormats, (void *)stub_IDWriteFontFace5_GetGlyphImageData, (void *)stub_IDWriteFontFace5_ReleaseGlyphImageData, (void *)stub_IDWriteFontFace5_GetFontAxisValueCount, (void *)stub_IDWriteFontFace5_GetFontAxisValues, (void *)stub_IDWriteFontFace5_HasVariations, (void *)stub_IDWriteFontFace5_GetFontResource, (void *)stub_IDWriteFontFace5_Equals };
+#define VT_COUNT_IDWriteFontFace5 58
 static const GUID IID_IDWriteFontFace5 = { 0x98eff3a5, 0xb667, 0x479a, { 0xb1, 0x45, 0xe2, 0xfa, 0x5b, 0x9f, 0xdc, 0x29 } };
+static const char *const vt_IDWriteFont3[] = { "QueryInterface", "AddRef", "Release", "GetFontFamily", "GetWeight", "GetStretch", "GetStyle", "IsSymbolFont", "GetFaceNames", "GetInformationalStrings", "GetSimulations", "GetMetrics", "HasCharacter", "CreateFontFace", "IDWriteFont1_GetMetrics", "GetPanose", "GetUnicodeRanges", "IsMonospacedFont", "IsColorFont", "IDWriteFont3_CreateFontFace", "Equals", "GetFontFaceReference", "IDWriteFont3_HasCharacter", "GetLocality" };
+static WINAPI HRESULT stub_IDWriteFont3_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFont3_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFont3_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::Release"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetFontFamily(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetFontFamily"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetWeight(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetWeight"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetStretch(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetStretch"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetStyle(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetStyle"); }
+static WINAPI HRESULT stub_IDWriteFont3_IsSymbolFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::IsSymbolFont"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetFaceNames(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetFaceNames"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetInformationalStrings(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetInformationalStrings"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetSimulations(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetSimulations"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetMetrics"); }
+static WINAPI HRESULT stub_IDWriteFont3_HasCharacter(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::HasCharacter"); }
+static WINAPI HRESULT stub_IDWriteFont3_CreateFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::CreateFontFace"); }
+static WINAPI HRESULT stub_IDWriteFont3_IDWriteFont1_GetMetrics(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::IDWriteFont1_GetMetrics"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetPanose(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetPanose"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetUnicodeRanges(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetUnicodeRanges"); }
+static WINAPI HRESULT stub_IDWriteFont3_IsMonospacedFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::IsMonospacedFont"); }
+static WINAPI HRESULT stub_IDWriteFont3_IsColorFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::IsColorFont"); }
+static WINAPI HRESULT stub_IDWriteFont3_IDWriteFont3_CreateFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::IDWriteFont3_CreateFontFace"); }
+static WINAPI HRESULT stub_IDWriteFont3_Equals(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::Equals"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetFontFaceReference"); }
+static WINAPI HRESULT stub_IDWriteFont3_IDWriteFont3_HasCharacter(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::IDWriteFont3_HasCharacter"); }
+static WINAPI HRESULT stub_IDWriteFont3_GetLocality(void *self) { (void)self; return d3d_not_implemented("IDWriteFont3::GetLocality"); }
+static void *const vtstub_IDWriteFont3[] = { (void *)stub_IDWriteFont3_QueryInterface, (void *)stub_IDWriteFont3_AddRef, (void *)stub_IDWriteFont3_Release, (void *)stub_IDWriteFont3_GetFontFamily, (void *)stub_IDWriteFont3_GetWeight, (void *)stub_IDWriteFont3_GetStretch, (void *)stub_IDWriteFont3_GetStyle, (void *)stub_IDWriteFont3_IsSymbolFont, (void *)stub_IDWriteFont3_GetFaceNames, (void *)stub_IDWriteFont3_GetInformationalStrings, (void *)stub_IDWriteFont3_GetSimulations, (void *)stub_IDWriteFont3_GetMetrics, (void *)stub_IDWriteFont3_HasCharacter, (void *)stub_IDWriteFont3_CreateFontFace, (void *)stub_IDWriteFont3_IDWriteFont1_GetMetrics, (void *)stub_IDWriteFont3_GetPanose, (void *)stub_IDWriteFont3_GetUnicodeRanges, (void *)stub_IDWriteFont3_IsMonospacedFont, (void *)stub_IDWriteFont3_IsColorFont, (void *)stub_IDWriteFont3_IDWriteFont3_CreateFontFace, (void *)stub_IDWriteFont3_Equals, (void *)stub_IDWriteFont3_GetFontFaceReference, (void *)stub_IDWriteFont3_IDWriteFont3_HasCharacter, (void *)stub_IDWriteFont3_GetLocality };
+#define VT_COUNT_IDWriteFont3 24
 static const GUID IID_IDWriteFont3 = { 0x29748ed6, 0x8c9c, 0x4a6a, { 0xbe, 0x0b, 0xd9, 0x12, 0xe8, 0x53, 0x89, 0x44 } };
+static const char *const vt_IDWriteRenderingParams3[] = { "QueryInterface", "AddRef", "Release", "GetGamma", "GetEnhancedContrast", "GetClearTypeLevel", "GetPixelGeometry", "GetRenderingMode", "GetGrayscaleEnhancedContrast", "GetGridFitMode", "GetRenderingMode1" };
+static WINAPI HRESULT stub_IDWriteRenderingParams3_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteRenderingParams3_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::AddRef"); }
+static WINAPI HRESULT stub_IDWriteRenderingParams3_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::Release"); }
+static WINAPI HRESULT stub_IDWriteRenderingParams3_GetGamma(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::GetGamma"); }
+static WINAPI HRESULT stub_IDWriteRenderingParams3_GetEnhancedContrast(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::GetEnhancedContrast"); }
+static WINAPI HRESULT stub_IDWriteRenderingParams3_GetClearTypeLevel(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::GetClearTypeLevel"); }
+static WINAPI HRESULT stub_IDWriteRenderingParams3_GetPixelGeometry(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::GetPixelGeometry"); }
+static WINAPI HRESULT stub_IDWriteRenderingParams3_GetRenderingMode(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::GetRenderingMode"); }
+static WINAPI HRESULT stub_IDWriteRenderingParams3_GetGrayscaleEnhancedContrast(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::GetGrayscaleEnhancedContrast"); }
+static WINAPI HRESULT stub_IDWriteRenderingParams3_GetGridFitMode(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::GetGridFitMode"); }
+static WINAPI HRESULT stub_IDWriteRenderingParams3_GetRenderingMode1(void *self) { (void)self; return d3d_not_implemented("IDWriteRenderingParams3::GetRenderingMode1"); }
+static void *const vtstub_IDWriteRenderingParams3[] = { (void *)stub_IDWriteRenderingParams3_QueryInterface, (void *)stub_IDWriteRenderingParams3_AddRef, (void *)stub_IDWriteRenderingParams3_Release, (void *)stub_IDWriteRenderingParams3_GetGamma, (void *)stub_IDWriteRenderingParams3_GetEnhancedContrast, (void *)stub_IDWriteRenderingParams3_GetClearTypeLevel, (void *)stub_IDWriteRenderingParams3_GetPixelGeometry, (void *)stub_IDWriteRenderingParams3_GetRenderingMode, (void *)stub_IDWriteRenderingParams3_GetGrayscaleEnhancedContrast, (void *)stub_IDWriteRenderingParams3_GetGridFitMode, (void *)stub_IDWriteRenderingParams3_GetRenderingMode1 };
+#define VT_COUNT_IDWriteRenderingParams3 11
 static const GUID IID_IDWriteRenderingParams3 = { 0xb7924baa, 0x391b, 0x412a, { 0x8c, 0x5c, 0xe4, 0x4c, 0xc2, 0xd8, 0x67, 0xdc } };
 static const GUID IID_IDWriteFontCollection1 = { 0x53585141, 0xd9f8, 0x4095, { 0x83, 0x21, 0xd7, 0x3c, 0xf6, 0xbd, 0x11, 0x6c } };
+static const GUID IID_IDWriteFontCollection2 = { 0x514039c6, 0x4617, 0x4064, { 0xbf, 0x8b, 0x92, 0xea, 0x83, 0xe5, 0x06, 0xe0 } };
+static const char *const vt_IDWriteFontCollection3[] = { "QueryInterface", "AddRef", "Release", "GetFontFamilyCount", "GetFontFamily", "FindFamilyName", "GetFontFromFontFace", "GetFontSet", "IDWriteFontCollection1_GetFontFamily", "IDWriteFontCollection2_GetFontFamily", "GetMatchingFonts", "GetFontFamilyModel", "IDWriteFontCollection2_GetFontSet", "GetExpirationEvent" };
+static WINAPI HRESULT stub_IDWriteFontCollection3_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::Release"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_GetFontFamilyCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::GetFontFamilyCount"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_GetFontFamily(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::GetFontFamily"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_FindFamilyName(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::FindFamilyName"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_GetFontFromFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::GetFontFromFontFace"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_GetFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::GetFontSet"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_IDWriteFontCollection1_GetFontFamily(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::IDWriteFontCollection1_GetFontFamily"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_IDWriteFontCollection2_GetFontFamily(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::IDWriteFontCollection2_GetFontFamily"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_GetMatchingFonts(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::GetMatchingFonts"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_GetFontFamilyModel(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::GetFontFamilyModel"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_IDWriteFontCollection2_GetFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::IDWriteFontCollection2_GetFontSet"); }
+static WINAPI HRESULT stub_IDWriteFontCollection3_GetExpirationEvent(void *self) { (void)self; return d3d_not_implemented("IDWriteFontCollection3::GetExpirationEvent"); }
+static void *const vtstub_IDWriteFontCollection3[] = { (void *)stub_IDWriteFontCollection3_QueryInterface, (void *)stub_IDWriteFontCollection3_AddRef, (void *)stub_IDWriteFontCollection3_Release, (void *)stub_IDWriteFontCollection3_GetFontFamilyCount, (void *)stub_IDWriteFontCollection3_GetFontFamily, (void *)stub_IDWriteFontCollection3_FindFamilyName, (void *)stub_IDWriteFontCollection3_GetFontFromFontFace, (void *)stub_IDWriteFontCollection3_GetFontSet, (void *)stub_IDWriteFontCollection3_IDWriteFontCollection1_GetFontFamily, (void *)stub_IDWriteFontCollection3_IDWriteFontCollection2_GetFontFamily, (void *)stub_IDWriteFontCollection3_GetMatchingFonts, (void *)stub_IDWriteFontCollection3_GetFontFamilyModel, (void *)stub_IDWriteFontCollection3_IDWriteFontCollection2_GetFontSet, (void *)stub_IDWriteFontCollection3_GetExpirationEvent };
+#define VT_COUNT_IDWriteFontCollection3 14
+static const GUID IID_IDWriteFontCollection3 = { 0xa4d055a6, 0xf9e3, 0x4e25, { 0x93, 0xb7, 0x9e, 0x30, 0x9f, 0x3a, 0xf8, 0xe9 } };
 static const GUID IID_IDWriteFontFamily1 = { 0xda20d8ef, 0x812a, 0x4c43, { 0x98, 0x02, 0x62, 0xec, 0x4a, 0xbd, 0x7a, 0xdf } };
+static const char *const vt_IDWriteFontFamily2[] = { "QueryInterface", "AddRef", "Release", "GetFontCollection", "GetFontCount", "GetFont", "GetFamilyNames", "GetFirstMatchingFont", "GetMatchingFonts", "GetFontLocality", "IDWriteFontFamily1_GetFont", "GetFontFaceReference", "IDWriteFontFamily2_GetMatchingFonts", "GetFontSet" };
+static WINAPI HRESULT stub_IDWriteFontFamily2_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::Release"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_GetFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::GetFontCollection"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_GetFontCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::GetFontCount"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_GetFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::GetFont"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_GetFamilyNames(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::GetFamilyNames"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_GetFirstMatchingFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::GetFirstMatchingFont"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_GetMatchingFonts(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::GetMatchingFonts"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_GetFontLocality(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::GetFontLocality"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_IDWriteFontFamily1_GetFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::IDWriteFontFamily1_GetFont"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_GetFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::GetFontFaceReference"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_IDWriteFontFamily2_GetMatchingFonts(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::IDWriteFontFamily2_GetMatchingFonts"); }
+static WINAPI HRESULT stub_IDWriteFontFamily2_GetFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFamily2::GetFontSet"); }
+static void *const vtstub_IDWriteFontFamily2[] = { (void *)stub_IDWriteFontFamily2_QueryInterface, (void *)stub_IDWriteFontFamily2_AddRef, (void *)stub_IDWriteFontFamily2_Release, (void *)stub_IDWriteFontFamily2_GetFontCollection, (void *)stub_IDWriteFontFamily2_GetFontCount, (void *)stub_IDWriteFontFamily2_GetFont, (void *)stub_IDWriteFontFamily2_GetFamilyNames, (void *)stub_IDWriteFontFamily2_GetFirstMatchingFont, (void *)stub_IDWriteFontFamily2_GetMatchingFonts, (void *)stub_IDWriteFontFamily2_GetFontLocality, (void *)stub_IDWriteFontFamily2_IDWriteFontFamily1_GetFont, (void *)stub_IDWriteFontFamily2_GetFontFaceReference, (void *)stub_IDWriteFontFamily2_IDWriteFontFamily2_GetMatchingFonts, (void *)stub_IDWriteFontFamily2_GetFontSet };
+#define VT_COUNT_IDWriteFontFamily2 14
+static const GUID IID_IDWriteFontFamily2 = { 0x3ed49e77, 0xa398, 0x4261, { 0xb9, 0xcf, 0xc1, 0x26, 0xc2, 0x13, 0x1e, 0xf3 } };
 static const GUID IID_IDWriteFontList1 = { 0xda20d8ef, 0x812a, 0x4c43, { 0x98, 0x02, 0x62, 0xec, 0x4a, 0xbd, 0x7a, 0xde } };
+static const char *const vt_IDWriteFontList2[] = { "QueryInterface", "AddRef", "Release", "GetFontCollection", "GetFontCount", "GetFont", "GetFontLocality", "IDWriteFontList1_GetFont", "GetFontFaceReference", "GetFontSet" };
+static WINAPI HRESULT stub_IDWriteFontList2_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList2::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontList2_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList2::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontList2_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList2::Release"); }
+static WINAPI HRESULT stub_IDWriteFontList2_GetFontCollection(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList2::GetFontCollection"); }
+static WINAPI HRESULT stub_IDWriteFontList2_GetFontCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList2::GetFontCount"); }
+static WINAPI HRESULT stub_IDWriteFontList2_GetFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList2::GetFont"); }
+static WINAPI HRESULT stub_IDWriteFontList2_GetFontLocality(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList2::GetFontLocality"); }
+static WINAPI HRESULT stub_IDWriteFontList2_IDWriteFontList1_GetFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList2::IDWriteFontList1_GetFont"); }
+static WINAPI HRESULT stub_IDWriteFontList2_GetFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList2::GetFontFaceReference"); }
+static WINAPI HRESULT stub_IDWriteFontList2_GetFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFontList2::GetFontSet"); }
+static void *const vtstub_IDWriteFontList2[] = { (void *)stub_IDWriteFontList2_QueryInterface, (void *)stub_IDWriteFontList2_AddRef, (void *)stub_IDWriteFontList2_Release, (void *)stub_IDWriteFontList2_GetFontCollection, (void *)stub_IDWriteFontList2_GetFontCount, (void *)stub_IDWriteFontList2_GetFont, (void *)stub_IDWriteFontList2_GetFontLocality, (void *)stub_IDWriteFontList2_IDWriteFontList1_GetFont, (void *)stub_IDWriteFontList2_GetFontFaceReference, (void *)stub_IDWriteFontList2_GetFontSet };
+#define VT_COUNT_IDWriteFontList2 10
+static const GUID IID_IDWriteFontList2 = { 0xc0763a34, 0x77af, 0x445a, { 0xb7, 0x35, 0x08, 0xc3, 0x7b, 0x0a, 0x5b, 0xf5 } };
+static const char *const vt_IDWriteFontFallback1[] = { "QueryInterface", "AddRef", "Release", "MapCharacters", "IDWriteFontFallback1_MapCharacters" };
+static WINAPI HRESULT stub_IDWriteFontFallback1_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallback1::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontFallback1_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallback1::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontFallback1_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallback1::Release"); }
+static WINAPI HRESULT stub_IDWriteFontFallback1_MapCharacters(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallback1::MapCharacters"); }
+static WINAPI HRESULT stub_IDWriteFontFallback1_IDWriteFontFallback1_MapCharacters(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFallback1::IDWriteFontFallback1_MapCharacters"); }
+static void *const vtstub_IDWriteFontFallback1[] = { (void *)stub_IDWriteFontFallback1_QueryInterface, (void *)stub_IDWriteFontFallback1_AddRef, (void *)stub_IDWriteFontFallback1_Release, (void *)stub_IDWriteFontFallback1_MapCharacters, (void *)stub_IDWriteFontFallback1_IDWriteFontFallback1_MapCharacters };
+#define VT_COUNT_IDWriteFontFallback1 5
 static const GUID IID_IDWriteFontFallback1 = { 0x2397599d, 0xdd0d, 0x4681, { 0xbd, 0x6a, 0xf4, 0xf3, 0x1e, 0xaa, 0xde, 0x77 } };
+static const char *const vt_IDWriteGdiInterop1[] = { "QueryInterface", "AddRef", "Release", "CreateFontFromLOGFONT", "ConvertFontToLOGFONT", "ConvertFontFaceToLOGFONT", "CreateFontFaceFromHdc", "CreateBitmapRenderTarget", "IDWriteGdiInterop1_CreateFontFromLOGFONT", "GetFontSignature_", "GetFontSignature", "GetMatchingFontsByLOGFONT" };
+static WINAPI HRESULT stub_IDWriteGdiInterop1_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::AddRef"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::Release"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_CreateFontFromLOGFONT(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::CreateFontFromLOGFONT"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_ConvertFontToLOGFONT(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::ConvertFontToLOGFONT"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_ConvertFontFaceToLOGFONT(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::ConvertFontFaceToLOGFONT"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_CreateFontFaceFromHdc(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::CreateFontFaceFromHdc"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_CreateBitmapRenderTarget(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::CreateBitmapRenderTarget"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_IDWriteGdiInterop1_CreateFontFromLOGFONT(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::IDWriteGdiInterop1_CreateFontFromLOGFONT"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_GetFontSignature_(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::GetFontSignature_"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_GetFontSignature(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::GetFontSignature"); }
+static WINAPI HRESULT stub_IDWriteGdiInterop1_GetMatchingFontsByLOGFONT(void *self) { (void)self; return d3d_not_implemented("IDWriteGdiInterop1::GetMatchingFontsByLOGFONT"); }
+static void *const vtstub_IDWriteGdiInterop1[] = { (void *)stub_IDWriteGdiInterop1_QueryInterface, (void *)stub_IDWriteGdiInterop1_AddRef, (void *)stub_IDWriteGdiInterop1_Release, (void *)stub_IDWriteGdiInterop1_CreateFontFromLOGFONT, (void *)stub_IDWriteGdiInterop1_ConvertFontToLOGFONT, (void *)stub_IDWriteGdiInterop1_ConvertFontFaceToLOGFONT, (void *)stub_IDWriteGdiInterop1_CreateFontFaceFromHdc, (void *)stub_IDWriteGdiInterop1_CreateBitmapRenderTarget, (void *)stub_IDWriteGdiInterop1_IDWriteGdiInterop1_CreateFontFromLOGFONT, (void *)stub_IDWriteGdiInterop1_GetFontSignature_, (void *)stub_IDWriteGdiInterop1_GetFontSignature, (void *)stub_IDWriteGdiInterop1_GetMatchingFontsByLOGFONT };
+#define VT_COUNT_IDWriteGdiInterop1 12
 static const GUID IID_IDWriteGdiInterop1 = { 0x4556be70, 0x3abd, 0x4f70, { 0x90, 0xbe, 0x42, 0x17, 0x80, 0xa6, 0xf5, 0x15 } };
+static const char *const vt_IDWriteInMemoryFontFileLoader[] = { "QueryInterface", "AddRef", "Release", "CreateStreamFromKey", "CreateInMemoryFontFileReference", "GetFileCount" };
+static WINAPI HRESULT stub_IDWriteInMemoryFontFileLoader_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteInMemoryFontFileLoader::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteInMemoryFontFileLoader_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteInMemoryFontFileLoader::AddRef"); }
+static WINAPI HRESULT stub_IDWriteInMemoryFontFileLoader_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteInMemoryFontFileLoader::Release"); }
+static WINAPI HRESULT stub_IDWriteInMemoryFontFileLoader_CreateStreamFromKey(void *self) { (void)self; return d3d_not_implemented("IDWriteInMemoryFontFileLoader::CreateStreamFromKey"); }
+static WINAPI HRESULT stub_IDWriteInMemoryFontFileLoader_CreateInMemoryFontFileReference(void *self) { (void)self; return d3d_not_implemented("IDWriteInMemoryFontFileLoader::CreateInMemoryFontFileReference"); }
+static WINAPI HRESULT stub_IDWriteInMemoryFontFileLoader_GetFileCount(void *self) { (void)self; return d3d_not_implemented("IDWriteInMemoryFontFileLoader::GetFileCount"); }
+static void *const vtstub_IDWriteInMemoryFontFileLoader[] = { (void *)stub_IDWriteInMemoryFontFileLoader_QueryInterface, (void *)stub_IDWriteInMemoryFontFileLoader_AddRef, (void *)stub_IDWriteInMemoryFontFileLoader_Release, (void *)stub_IDWriteInMemoryFontFileLoader_CreateStreamFromKey, (void *)stub_IDWriteInMemoryFontFileLoader_CreateInMemoryFontFileReference, (void *)stub_IDWriteInMemoryFontFileLoader_GetFileCount };
+#define VT_COUNT_IDWriteInMemoryFontFileLoader 6
 static const GUID IID_IDWriteInMemoryFontFileLoader = { 0xdc102f47, 0xa12d, 0x4b1c, { 0x82, 0x2d, 0x9e, 0x11, 0x7e, 0x33, 0x04, 0x3f } };
+static const GUID IID_IDWriteFontSet = { 0x53585141, 0xd9f8, 0x4095, { 0x83, 0x21, 0xd7, 0x3c, 0xf6, 0xbd, 0x11, 0x6b } };
+static const GUID IID_IDWriteFontSet1 = { 0x7e9fda85, 0x6c92, 0x4053, { 0xbc, 0x47, 0x7a, 0xe3, 0x53, 0x0d, 0xb4, 0xd3 } };
+static const GUID IID_IDWriteFontSet2 = { 0xdc7ead19, 0xe54c, 0x43af, { 0xb2, 0xda, 0x4e, 0x2b, 0x79, 0xba, 0x3f, 0x7f } };
+static const char *const vt_IDWriteFontSet3[] = { "QueryInterface", "AddRef", "Release", "GetFontCount", "GetFontFaceReference", "FindFontFaceReference", "FindFontFace", "GetPropertyValues__", "GetPropertyValues_", "GetPropertyValues", "GetPropertyOccurrenceCount", "GetMatchingFonts_", "GetMatchingFonts", "IDWriteFontSet1_GetMatchingFonts", "GetFirstFontResources", "GetFilteredFonts__", "GetFilteredFonts_", "GetFilteredFonts", "GetFilteredFontIndices_", "GetFilteredFontIndices", "GetFontAxisRanges_", "GetFontAxisRanges", "IDWriteFontSet1_GetFontFaceReference", "CreateFontResource", "CreateFontFace", "GetFontLocality", "GetExpirationEvent", "GetFontSourceType", "GetFontSourceNameLength", "GetFontSourceName" };
+static WINAPI HRESULT stub_IDWriteFontSet3_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::Release"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFontCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFontCount"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFontFaceReference"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_FindFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::FindFontFaceReference"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_FindFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::FindFontFace"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetPropertyValues__(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetPropertyValues__"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetPropertyValues_(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetPropertyValues_"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetPropertyValues(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetPropertyValues"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetPropertyOccurrenceCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetPropertyOccurrenceCount"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetMatchingFonts_(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetMatchingFonts_"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetMatchingFonts(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetMatchingFonts"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_IDWriteFontSet1_GetMatchingFonts(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::IDWriteFontSet1_GetMatchingFonts"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFirstFontResources(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFirstFontResources"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFilteredFonts__(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFilteredFonts__"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFilteredFonts_(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFilteredFonts_"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFilteredFonts(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFilteredFonts"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFilteredFontIndices_(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFilteredFontIndices_"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFilteredFontIndices(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFilteredFontIndices"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFontAxisRanges_(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFontAxisRanges_"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFontAxisRanges(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFontAxisRanges"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_IDWriteFontSet1_GetFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::IDWriteFontSet1_GetFontFaceReference"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_CreateFontResource(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::CreateFontResource"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_CreateFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::CreateFontFace"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFontLocality(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFontLocality"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetExpirationEvent(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetExpirationEvent"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFontSourceType(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFontSourceType"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFontSourceNameLength(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFontSourceNameLength"); }
+static WINAPI HRESULT stub_IDWriteFontSet3_GetFontSourceName(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSet3::GetFontSourceName"); }
+static void *const vtstub_IDWriteFontSet3[] = { (void *)stub_IDWriteFontSet3_QueryInterface, (void *)stub_IDWriteFontSet3_AddRef, (void *)stub_IDWriteFontSet3_Release, (void *)stub_IDWriteFontSet3_GetFontCount, (void *)stub_IDWriteFontSet3_GetFontFaceReference, (void *)stub_IDWriteFontSet3_FindFontFaceReference, (void *)stub_IDWriteFontSet3_FindFontFace, (void *)stub_IDWriteFontSet3_GetPropertyValues__, (void *)stub_IDWriteFontSet3_GetPropertyValues_, (void *)stub_IDWriteFontSet3_GetPropertyValues, (void *)stub_IDWriteFontSet3_GetPropertyOccurrenceCount, (void *)stub_IDWriteFontSet3_GetMatchingFonts_, (void *)stub_IDWriteFontSet3_GetMatchingFonts, (void *)stub_IDWriteFontSet3_IDWriteFontSet1_GetMatchingFonts, (void *)stub_IDWriteFontSet3_GetFirstFontResources, (void *)stub_IDWriteFontSet3_GetFilteredFonts__, (void *)stub_IDWriteFontSet3_GetFilteredFonts_, (void *)stub_IDWriteFontSet3_GetFilteredFonts, (void *)stub_IDWriteFontSet3_GetFilteredFontIndices_, (void *)stub_IDWriteFontSet3_GetFilteredFontIndices, (void *)stub_IDWriteFontSet3_GetFontAxisRanges_, (void *)stub_IDWriteFontSet3_GetFontAxisRanges, (void *)stub_IDWriteFontSet3_IDWriteFontSet1_GetFontFaceReference, (void *)stub_IDWriteFontSet3_CreateFontResource, (void *)stub_IDWriteFontSet3_CreateFontFace, (void *)stub_IDWriteFontSet3_GetFontLocality, (void *)stub_IDWriteFontSet3_GetExpirationEvent, (void *)stub_IDWriteFontSet3_GetFontSourceType, (void *)stub_IDWriteFontSet3_GetFontSourceNameLength, (void *)stub_IDWriteFontSet3_GetFontSourceName };
+#define VT_COUNT_IDWriteFontSet3 30
+static const GUID IID_IDWriteFontSet3 = { 0x7c073ef2, 0xa7f4, 0x4045, { 0x8c, 0x32, 0x8a, 0xb8, 0xae, 0x64, 0x0f, 0x90 } };
+static const GUID IID_IDWriteFontFaceReference = { 0x5e7fa7ca, 0xdde3, 0x424c, { 0x89, 0xf0, 0x9f, 0xcd, 0x6f, 0xed, 0x58, 0xcd } };
+static const char *const vt_IDWriteFontFaceReference1[] = { "QueryInterface", "AddRef", "Release", "CreateFontFace", "CreateFontFaceWithSimulations", "Equals", "GetFontFaceIndex", "GetSimulations", "GetFontFile", "GetLocalFileSize", "GetFileSize", "GetFileTime", "GetLocality", "EnqueueFontDownloadRequest", "EnqueueCharacterDownloadRequest", "EnqueueGlyphDownloadRequest", "EnqueueFileFragmentDownloadRequest", "IDWriteFontFaceReference1_CreateFontFace", "GetFontAxisValueCount", "GetFontAxisValues" };
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::Release"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_CreateFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::CreateFontFace"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_CreateFontFaceWithSimulations(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::CreateFontFaceWithSimulations"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_Equals(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::Equals"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_GetFontFaceIndex(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::GetFontFaceIndex"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_GetSimulations(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::GetSimulations"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_GetFontFile(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::GetFontFile"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_GetLocalFileSize(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::GetLocalFileSize"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_GetFileSize(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::GetFileSize"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_GetFileTime(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::GetFileTime"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_GetLocality(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::GetLocality"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_EnqueueFontDownloadRequest(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::EnqueueFontDownloadRequest"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_EnqueueCharacterDownloadRequest(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::EnqueueCharacterDownloadRequest"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_EnqueueGlyphDownloadRequest(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::EnqueueGlyphDownloadRequest"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_EnqueueFileFragmentDownloadRequest(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::EnqueueFileFragmentDownloadRequest"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_IDWriteFontFaceReference1_CreateFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::IDWriteFontFaceReference1_CreateFontFace"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_GetFontAxisValueCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::GetFontAxisValueCount"); }
+static WINAPI HRESULT stub_IDWriteFontFaceReference1_GetFontAxisValues(void *self) { (void)self; return d3d_not_implemented("IDWriteFontFaceReference1::GetFontAxisValues"); }
+static void *const vtstub_IDWriteFontFaceReference1[] = { (void *)stub_IDWriteFontFaceReference1_QueryInterface, (void *)stub_IDWriteFontFaceReference1_AddRef, (void *)stub_IDWriteFontFaceReference1_Release, (void *)stub_IDWriteFontFaceReference1_CreateFontFace, (void *)stub_IDWriteFontFaceReference1_CreateFontFaceWithSimulations, (void *)stub_IDWriteFontFaceReference1_Equals, (void *)stub_IDWriteFontFaceReference1_GetFontFaceIndex, (void *)stub_IDWriteFontFaceReference1_GetSimulations, (void *)stub_IDWriteFontFaceReference1_GetFontFile, (void *)stub_IDWriteFontFaceReference1_GetLocalFileSize, (void *)stub_IDWriteFontFaceReference1_GetFileSize, (void *)stub_IDWriteFontFaceReference1_GetFileTime, (void *)stub_IDWriteFontFaceReference1_GetLocality, (void *)stub_IDWriteFontFaceReference1_EnqueueFontDownloadRequest, (void *)stub_IDWriteFontFaceReference1_EnqueueCharacterDownloadRequest, (void *)stub_IDWriteFontFaceReference1_EnqueueGlyphDownloadRequest, (void *)stub_IDWriteFontFaceReference1_EnqueueFileFragmentDownloadRequest, (void *)stub_IDWriteFontFaceReference1_IDWriteFontFaceReference1_CreateFontFace, (void *)stub_IDWriteFontFaceReference1_GetFontAxisValueCount, (void *)stub_IDWriteFontFaceReference1_GetFontAxisValues };
+#define VT_COUNT_IDWriteFontFaceReference1 20
+static const GUID IID_IDWriteFontFaceReference1 = { 0xc081fe77, 0x2fd1, 0x41ac, { 0xa5, 0xa3, 0x34, 0x98, 0x3c, 0x4b, 0xa6, 0x1a } };
+static const char *const vt_IDWriteFontResource[] = { "QueryInterface", "AddRef", "Release", "GetFontFile", "GetFontFaceIndex", "GetFontAxisCount", "GetDefaultFontAxisValues", "GetFontAxisRanges", "GetFontAxisAttributes", "GetAxisNames", "GetAxisValueNameCount", "GetAxisValueNames", "HasVariations", "CreateFontFace", "CreateFontFaceReference" };
+static WINAPI HRESULT stub_IDWriteFontResource_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontResource_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontResource_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::Release"); }
+static WINAPI HRESULT stub_IDWriteFontResource_GetFontFile(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::GetFontFile"); }
+static WINAPI HRESULT stub_IDWriteFontResource_GetFontFaceIndex(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::GetFontFaceIndex"); }
+static WINAPI HRESULT stub_IDWriteFontResource_GetFontAxisCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::GetFontAxisCount"); }
+static WINAPI HRESULT stub_IDWriteFontResource_GetDefaultFontAxisValues(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::GetDefaultFontAxisValues"); }
+static WINAPI HRESULT stub_IDWriteFontResource_GetFontAxisRanges(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::GetFontAxisRanges"); }
+static WINAPI HRESULT stub_IDWriteFontResource_GetFontAxisAttributes(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::GetFontAxisAttributes"); }
+static WINAPI HRESULT stub_IDWriteFontResource_GetAxisNames(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::GetAxisNames"); }
+static WINAPI HRESULT stub_IDWriteFontResource_GetAxisValueNameCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::GetAxisValueNameCount"); }
+static WINAPI HRESULT stub_IDWriteFontResource_GetAxisValueNames(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::GetAxisValueNames"); }
+static WINAPI HRESULT stub_IDWriteFontResource_HasVariations(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::HasVariations"); }
+static WINAPI HRESULT stub_IDWriteFontResource_CreateFontFace(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::CreateFontFace"); }
+static WINAPI HRESULT stub_IDWriteFontResource_CreateFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFontResource::CreateFontFaceReference"); }
+static void *const vtstub_IDWriteFontResource[] = { (void *)stub_IDWriteFontResource_QueryInterface, (void *)stub_IDWriteFontResource_AddRef, (void *)stub_IDWriteFontResource_Release, (void *)stub_IDWriteFontResource_GetFontFile, (void *)stub_IDWriteFontResource_GetFontFaceIndex, (void *)stub_IDWriteFontResource_GetFontAxisCount, (void *)stub_IDWriteFontResource_GetDefaultFontAxisValues, (void *)stub_IDWriteFontResource_GetFontAxisRanges, (void *)stub_IDWriteFontResource_GetFontAxisAttributes, (void *)stub_IDWriteFontResource_GetAxisNames, (void *)stub_IDWriteFontResource_GetAxisValueNameCount, (void *)stub_IDWriteFontResource_GetAxisValueNames, (void *)stub_IDWriteFontResource_HasVariations, (void *)stub_IDWriteFontResource_CreateFontFace, (void *)stub_IDWriteFontResource_CreateFontFaceReference };
+#define VT_COUNT_IDWriteFontResource 15
+static const GUID IID_IDWriteFontResource = { 0x1f803a76, 0x6871, 0x48e8, { 0x98, 0x7f, 0xb9, 0x75, 0x55, 0x1c, 0x50, 0xf2 } };
+static const GUID IID_IDWriteFontSetBuilder = { 0x2f642afe, 0x9c68, 0x4f40, { 0xb8, 0xbe, 0x45, 0x74, 0x01, 0xaf, 0xcb, 0x3d } };
+static const GUID IID_IDWriteFontSetBuilder1 = { 0x3ff7715f, 0x3cdc, 0x4dc6, { 0x9b, 0x72, 0xec, 0x56, 0x21, 0xdc, 0xca, 0xfd } };
+static const char *const vt_IDWriteFontSetBuilder2[] = { "QueryInterface", "AddRef", "Release", "AddFontFaceReference_", "AddFontFaceReference", "AddFontSet", "CreateFontSet", "AddFontFile", "AddFont", "IDWriteFontSetBuilder2_AddFontFile" };
+static WINAPI HRESULT stub_IDWriteFontSetBuilder2_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSetBuilder2::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontSetBuilder2_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSetBuilder2::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontSetBuilder2_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSetBuilder2::Release"); }
+static WINAPI HRESULT stub_IDWriteFontSetBuilder2_AddFontFaceReference_(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSetBuilder2::AddFontFaceReference_"); }
+static WINAPI HRESULT stub_IDWriteFontSetBuilder2_AddFontFaceReference(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSetBuilder2::AddFontFaceReference"); }
+static WINAPI HRESULT stub_IDWriteFontSetBuilder2_AddFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSetBuilder2::AddFontSet"); }
+static WINAPI HRESULT stub_IDWriteFontSetBuilder2_CreateFontSet(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSetBuilder2::CreateFontSet"); }
+static WINAPI HRESULT stub_IDWriteFontSetBuilder2_AddFontFile(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSetBuilder2::AddFontFile"); }
+static WINAPI HRESULT stub_IDWriteFontSetBuilder2_AddFont(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSetBuilder2::AddFont"); }
+static WINAPI HRESULT stub_IDWriteFontSetBuilder2_IDWriteFontSetBuilder2_AddFontFile(void *self) { (void)self; return d3d_not_implemented("IDWriteFontSetBuilder2::IDWriteFontSetBuilder2_AddFontFile"); }
+static void *const vtstub_IDWriteFontSetBuilder2[] = { (void *)stub_IDWriteFontSetBuilder2_QueryInterface, (void *)stub_IDWriteFontSetBuilder2_AddRef, (void *)stub_IDWriteFontSetBuilder2_Release, (void *)stub_IDWriteFontSetBuilder2_AddFontFaceReference_, (void *)stub_IDWriteFontSetBuilder2_AddFontFaceReference, (void *)stub_IDWriteFontSetBuilder2_AddFontSet, (void *)stub_IDWriteFontSetBuilder2_CreateFontSet, (void *)stub_IDWriteFontSetBuilder2_AddFontFile, (void *)stub_IDWriteFontSetBuilder2_AddFont, (void *)stub_IDWriteFontSetBuilder2_IDWriteFontSetBuilder2_AddFontFile };
+#define VT_COUNT_IDWriteFontSetBuilder2 10
+static const GUID IID_IDWriteFontSetBuilder2 = { 0xee5ba612, 0xb131, 0x463c, { 0x8f, 0x4f, 0x31, 0x89, 0xb9, 0x40, 0x1e, 0x45 } };
+static const char *const vt_IDWriteStringList[] = { "QueryInterface", "AddRef", "Release", "GetCount", "GetLocaleNameLength", "GetLocaleName", "GetStringLength", "GetString" };
+static WINAPI HRESULT stub_IDWriteStringList_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteStringList::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteStringList_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteStringList::AddRef"); }
+static WINAPI HRESULT stub_IDWriteStringList_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteStringList::Release"); }
+static WINAPI HRESULT stub_IDWriteStringList_GetCount(void *self) { (void)self; return d3d_not_implemented("IDWriteStringList::GetCount"); }
+static WINAPI HRESULT stub_IDWriteStringList_GetLocaleNameLength(void *self) { (void)self; return d3d_not_implemented("IDWriteStringList::GetLocaleNameLength"); }
+static WINAPI HRESULT stub_IDWriteStringList_GetLocaleName(void *self) { (void)self; return d3d_not_implemented("IDWriteStringList::GetLocaleName"); }
+static WINAPI HRESULT stub_IDWriteStringList_GetStringLength(void *self) { (void)self; return d3d_not_implemented("IDWriteStringList::GetStringLength"); }
+static WINAPI HRESULT stub_IDWriteStringList_GetString(void *self) { (void)self; return d3d_not_implemented("IDWriteStringList::GetString"); }
+static void *const vtstub_IDWriteStringList[] = { (void *)stub_IDWriteStringList_QueryInterface, (void *)stub_IDWriteStringList_AddRef, (void *)stub_IDWriteStringList_Release, (void *)stub_IDWriteStringList_GetCount, (void *)stub_IDWriteStringList_GetLocaleNameLength, (void *)stub_IDWriteStringList_GetLocaleName, (void *)stub_IDWriteStringList_GetStringLength, (void *)stub_IDWriteStringList_GetString };
+#define VT_COUNT_IDWriteStringList 8
+static const GUID IID_IDWriteStringList = { 0xcfee3140, 0x1157, 0x47ca, { 0x8b, 0x85, 0x31, 0xbf, 0xcf, 0x3f, 0x2d, 0x0e } };
+static const char *const vt_IDWriteFontDownloadQueue[] = { "QueryInterface", "AddRef", "Release", "AddListener", "RemoveListener", "IsEmpty", "BeginDownload", "CancelDownload", "GetGenerationCount" };
+static WINAPI HRESULT stub_IDWriteFontDownloadQueue_QueryInterface(void *self) { (void)self; return d3d_not_implemented("IDWriteFontDownloadQueue::QueryInterface"); }
+static WINAPI HRESULT stub_IDWriteFontDownloadQueue_AddRef(void *self) { (void)self; return d3d_not_implemented("IDWriteFontDownloadQueue::AddRef"); }
+static WINAPI HRESULT stub_IDWriteFontDownloadQueue_Release(void *self) { (void)self; return d3d_not_implemented("IDWriteFontDownloadQueue::Release"); }
+static WINAPI HRESULT stub_IDWriteFontDownloadQueue_AddListener(void *self) { (void)self; return d3d_not_implemented("IDWriteFontDownloadQueue::AddListener"); }
+static WINAPI HRESULT stub_IDWriteFontDownloadQueue_RemoveListener(void *self) { (void)self; return d3d_not_implemented("IDWriteFontDownloadQueue::RemoveListener"); }
+static WINAPI HRESULT stub_IDWriteFontDownloadQueue_IsEmpty(void *self) { (void)self; return d3d_not_implemented("IDWriteFontDownloadQueue::IsEmpty"); }
+static WINAPI HRESULT stub_IDWriteFontDownloadQueue_BeginDownload(void *self) { (void)self; return d3d_not_implemented("IDWriteFontDownloadQueue::BeginDownload"); }
+static WINAPI HRESULT stub_IDWriteFontDownloadQueue_CancelDownload(void *self) { (void)self; return d3d_not_implemented("IDWriteFontDownloadQueue::CancelDownload"); }
+static WINAPI HRESULT stub_IDWriteFontDownloadQueue_GetGenerationCount(void *self) { (void)self; return d3d_not_implemented("IDWriteFontDownloadQueue::GetGenerationCount"); }
+static void *const vtstub_IDWriteFontDownloadQueue[] = { (void *)stub_IDWriteFontDownloadQueue_QueryInterface, (void *)stub_IDWriteFontDownloadQueue_AddRef, (void *)stub_IDWriteFontDownloadQueue_Release, (void *)stub_IDWriteFontDownloadQueue_AddListener, (void *)stub_IDWriteFontDownloadQueue_RemoveListener, (void *)stub_IDWriteFontDownloadQueue_IsEmpty, (void *)stub_IDWriteFontDownloadQueue_BeginDownload, (void *)stub_IDWriteFontDownloadQueue_CancelDownload, (void *)stub_IDWriteFontDownloadQueue_GetGenerationCount };
+#define VT_COUNT_IDWriteFontDownloadQueue 9
+static const GUID IID_IDWriteFontDownloadQueue = { 0xb71e6052, 0x5aea, 0x4fa3, { 0x83, 0x2e, 0xf6, 0x0d, 0x43, 0x1f, 0x7e, 0x91 } };
+static const GUID IID_IDWriteFontFace6 = { 0xc4b1fe1b, 0x6e84, 0x47d5, { 0xb5, 0x4c, 0xa5, 0x97, 0x98, 0x1b, 0x06, 0xad } };
+static const GUID IID_IDWriteFontSet4 = { 0xeec175fc, 0xbea9, 0x4c86, { 0x8b, 0x53, 0xcc, 0xbd, 0xd7, 0xdf, 0x0c, 0x82 } };
+static const GUID IID_IDWriteTextFormat3 = { 0x6d3b5641, 0xe550, 0x430d, { 0xa8, 0x5b, 0xb7, 0xbf, 0x48, 0xa9, 0x34, 0x27 } };
+static const GUID IID_IDWriteFontDownloadListener = { 0xb06fe5b9, 0x43ec, 0x4393, { 0x88, 0x1b, 0xdb, 0xe4, 0xdc, 0x72, 0xfd, 0xa7 } };

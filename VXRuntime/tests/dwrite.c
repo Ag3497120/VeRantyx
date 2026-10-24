@@ -14,6 +14,10 @@
 #include <stdio.h>
 #include <string.h>
 static int failures;
+// A method by its slot's name: MinGW's C macros for a newer interface name the older version's slot, and that name is
+// itself a macro when the older version has the method too (IDWriteFactory7_CreateCustomRenderingParams expands to
+// ->IDWriteFactory3_CreateCustomRenderingParams(...), which expands again).
+#define VCALL(obj, name) ((obj)->lpVtbl->name)
 #define CHECK(c) do { if (!(c)) { printf("check failed (line %d): %s\n", __LINE__, #c); failures++; } } while (0)
 
 static void family_name(IDWriteFontFamily *fam, WCHAR *out, UINT32 cap) {
@@ -179,7 +183,7 @@ static HRESULT WINAPI ol_enum(IDWriteFontCollectionLoader *l, IDWriteFactory *f,
 static IDWriteFontCollectionLoaderVtbl ol_vtbl = { ol_qi, ol_ref, ol_ref, ol_enum };
 
 // ---- a text renderer: records the glyph runs, and draws them into a bitmap render target when it is the context ------------
-typedef struct { IDWriteTextRenderer iface; int runs, glyphs, faces; IDWriteFontFace *face[8]; float first_x, first_y, last_x; UINT32 positions; } renderer;
+typedef struct { IDWriteTextRenderer iface; int runs, glyphs, faces, no_offsets, moved; IDWriteFontFace *face[8]; float first_x, first_y, last_x; UINT32 positions; } renderer;
 static HRESULT WINAPI r_qi(IDWriteTextRenderer *r, REFIID iid, void **out) { (void)iid; *out = r; return S_OK; }
 static ULONG WINAPI r_ref(IDWriteTextRenderer *r) { (void)r; return 1; }
 static HRESULT WINAPI r_snap(IDWriteTextRenderer *r, void *ctx, BOOL *off) { (void)r; (void)ctx; *off = FALSE; return S_OK; }
@@ -192,6 +196,8 @@ static HRESULT WINAPI r_run(IDWriteTextRenderer *ri, void *ctx, FLOAT x, FLOAT y
     if (!r->runs) { r->first_x = x; r->first_y = y; }
     r->last_x = x;
     r->runs++; r->glyphs += run->glyphCount; r->positions += desc->stringLength;
+    if (!run->glyphOffsets) r->no_offsets++;              // (DirectWrite's layouts hand their runs offsets, all 0 here)
+    else for (UINT32 i = 0; i < run->glyphCount; i++) r->moved += run->glyphOffsets[i].advanceOffset != 0 || run->glyphOffsets[i].ascenderOffset != 0;
     int known = 0;
     for (int i = 0; i < r->faces; i++) known |= r->face[i] == run->fontFace;
     if (!known && r->faces < 8) r->face[r->faces++] = run->fontFace;
@@ -302,6 +308,846 @@ static DWORD WINAPI worker(void *arg) {
     return 0;
 }
 
+// ---- the newer versions: IDWriteFactory3..7, IDWriteFontFace3..5, IDWriteFont3, collections, font sets and their
+// builders, font face references and resources, the in-memory loader, WOFF, fallback builders --------------------------------
+typedef struct { IUnknown iface; LONG refs; } counted;          // an owner of bytes, a download listener: the program's
+static HRESULT WINAPI cu_qi(IUnknown *u, REFIID iid, void **out) { (void)iid; *out = u; IUnknown_AddRef(u); return S_OK; }
+static ULONG WINAPI cu_addref(IUnknown *u) { return InterlockedIncrement(&((counted *)u)->refs); }
+static ULONG WINAPI cu_release(IUnknown *u) { return InterlockedDecrement(&((counted *)u)->refs); }
+static IUnknownVtbl cu_vtbl = { cu_qi, cu_addref, cu_release };
+
+static UINT16 rd16(const BYTE *p) { return (UINT16)(p[0] << 8 | p[1]); }
+static UINT32 rd32(const BYTE *p) { return (UINT32)p[0] << 24 | (UINT32)p[1] << 16 | (UINT32)p[2] << 8 | p[3]; }
+static void wr16(BYTE *p, UINT16 v) { p[0] = (BYTE)(v >> 8); p[1] = (BYTE)v; }
+static void wr32(BYTE *p, UINT32 v) { p[0] = (BYTE)(v >> 24); p[1] = (BYTE)(v >> 16); p[2] = (BYTE)(v >> 8); p[3] = (BYTE)v; }
+// A zlib stream (RFC 1950, 1951) of 1 + 258 k copies of a byte: the byte as a literal, then k matches of length 258 at
+// distance 1, in one block with the fixed Huffman codes (written most significant bit first into the LSB-first stream).
+typedef struct { BYTE *p; UINT32 bit; } bitw;
+static void put_bits(bitw *b, UINT32 v, int n) { for (int i = 0; i < n; i++, b->bit++) if (v >> i & 1) b->p[b->bit >> 3] |= (BYTE)(1 << (b->bit & 7)); }
+static void put_code(bitw *b, UINT32 code, int n) { for (int i = n - 1; i >= 0; i--) put_bits(b, code >> i & 1, 1); }
+static UINT32 zlib_run(BYTE *out, BYTE v, UINT32 k) {           // (out: 32 + 2 k bytes)
+    memset(out, 0, 32 + 2 * k);
+    out[0] = 0x78; out[1] = 0x01;
+    bitw b = { out + 2, 0 };
+    put_bits(&b, 1, 1); put_bits(&b, 1, 2);                   // the last block, fixed codes
+    if (v < 144) put_code(&b, 0x30 + v, 8); else put_code(&b, 0x190 + v - 144, 9);
+    for (UINT32 i = 0; i < k; i++) { put_code(&b, 0xC5, 8); put_code(&b, 0, 5); }    // length 258 (285), distance 1 (0)
+    put_code(&b, 0, 7);                                       // end of block (256)
+    UINT32 n = 2 + (b.bit + 7) / 8, a = 1, s = 0;
+    for (UINT32 i = 0; i < 1 + 258 * k; i++) { a = (a + v) % 65521; s = (s + a) % 65521; }
+    wr32(out + n, s << 16 | a);                               // Adler-32
+    return n + 4;
+}
+// A WOFF file's totalSfntSize: the sfnt header and records, and its tables padded to 4 bytes.
+static void woff_set_total(BYTE *w) {
+    UINT16 n = rd16(w + 12);
+    UINT32 t = 12 + 16 * n;
+    for (UINT16 i = 0; i < n; i++) t += (rd32(w + 44 + 20 * i + 12) + 3) & ~3u;
+    wr32(w + 16, t);
+}
+// A WOFF 1.0 file of a single-face font: its tables stored as they are, and a made-up table 'zqzq' of 775 'Q's
+// compressed.
+static BYTE *make_woff(const BYTE *sfnt, UINT32 *size) {
+    UINT16 n = rd16(sfnt + 4);
+    BYTE z[64];
+    UINT32 zn = zlib_run(z, 'Q', 3), total = 44 + 20 * (n + 1) + ((zn + 3) & ~3u);
+    for (UINT16 i = 0; i < n; i++) total += (rd32(sfnt + 12 + 16 * i + 12) + 3) & ~3u;
+    BYTE *w = calloc(1, total);
+    memcpy(w, "wOFF", 4); wr32(w + 4, rd32(sfnt)); wr32(w + 8, total); wr16(w + 12, (UINT16)(n + 1)); wr16(w + 20, 1);
+    UINT32 at = 44 + 20 * (n + 1);
+    for (UINT16 i = 0; i <= n; i++) {
+        BYTE *e = w + 44 + 20 * i;
+        if (i < n) {
+            const BYTE *r = sfnt + 12 + 16 * i;
+            UINT32 len = rd32(r + 12);
+            memcpy(e, r, 4); wr32(e + 4, at); wr32(e + 8, len); wr32(e + 12, len); memcpy(e + 16, r + 4, 4);
+            memcpy(w + at, sfnt + rd32(r + 8), len);
+            at += (len + 3) & ~3u;
+        } else {
+            memcpy(e, "zqzq", 4); wr32(e + 4, at); wr32(e + 8, zn); wr32(e + 12, 775);
+            memcpy(w + at, z, zn);
+        }
+    }
+    woff_set_total(w);
+    *size = total;
+    return w;
+}
+// A made-up WOFF file of count tables (tags 'q', 'z' and the table's number) whose data is a zlib stream of 1 + 258 k
+// 'Q's: one stream all the tables point at (shared), or a copy of it for each. Its totalSfntSize is what the tables add
+// up to (all ones when that does not fit 32 bits).
+static BYTE *make_runs_woff(UINT32 count, UINT32 k, int shared, UINT32 *size) {
+    BYTE *z = malloc(32 + 2 * (size_t)k);
+    UINT32 zn = zlib_run(z, 'Q', k), za = (zn + 3) & ~3u, olen = 1 + 258 * k;
+    UINT32 total = 44 + 20 * count + za * (shared ? 1 : count);
+    BYTE *w = calloc(1, total);
+    memcpy(w, "wOFF", 4); wr32(w + 4, 0x00010000); wr32(w + 8, total); wr16(w + 12, (UINT16)count); wr16(w + 20, 1);
+    UINT64 sfnt = 12 + 16ull * count + (UINT64)count * ((olen + 3) & ~3u);
+    wr32(w + 16, sfnt > 0xFFFFFFFFu ? 0xFFFFFFFFu : (UINT32)sfnt);
+    UINT32 at = 44 + 20 * count;
+    for (UINT32 i = 0; i < count; i++) {
+        BYTE *e = w + 44 + 20 * i;
+        e[0] = 'q'; e[1] = 'z'; e[2] = (BYTE)(i >> 8); e[3] = (BYTE)i;
+        wr32(e + 4, at); wr32(e + 8, zn); wr32(e + 12, olen);
+        if (!shared || !i) memcpy(w + at, z, zn);
+        if (!shared) at += za;
+    }
+    free(z);
+    *size = total;
+    return w;
+}
+// UnpackFontFile (WOFF) of a copy of a WOFF file with one field changed (a u32 at at, or a u16 when wide is 0); a
+// failure that still hands back a stream, or a success without one, counts as E_UNEXPECTED.
+static HRESULT unpack_changed(IDWriteFactory7 *f7, const BYTE *w, UINT32 n, UINT32 at, UINT32 v, int wide) {
+    BYTE *c = malloc(n);
+    memcpy(c, w, n);
+    if (at + (wide ? 4 : 2) <= n) { if (wide) wr32(c + at, v); else wr16(c + at, (UINT16)v); }
+    IDWriteFontFileStream *st = (IDWriteFontFileStream *)(UINT_PTR)1;
+    HRESULT hr = IDWriteFactory7_UnpackFontFile(f7, DWRITE_CONTAINER_TYPE_WOFF, c, n, &st);
+    if (SUCCEEDED(hr)) { if (st && st != (IDWriteFontFileStream *)(UINT_PTR)1) IDWriteFontFileStream_Release(st); else hr = E_UNEXPECTED; }
+    else if (st) hr = E_UNEXPECTED;
+    free(c);
+    return hr;
+}
+static const BYTE *table_of(const BYTE *d, UINT32 n, const char *tag, UINT32 *len) {
+    for (UINT16 i = 0; i < rd16(d + 4) && 12 + 16u * (i + 1) <= n; i++) {
+        const BYTE *r = d + 12 + 16 * i;
+        if (!memcmp(r, tag, 4) && (UINT64)rd32(r + 8) + rd32(r + 12) <= n) { *len = rd32(r + 12); return d + rd32(r + 8); }
+    }
+    return NULL;
+}
+// The bytes of a face's file (through its loader), and the file's type.
+static BYTE *face_bytes(IDWriteFontFace *face, UINT32 *size, DWRITE_FONT_FILE_TYPE *type) {
+    UINT32 n = 1; IDWriteFontFile *file = NULL; BYTE *out = NULL;
+    *size = 0;
+    if (FAILED(IDWriteFontFace_GetFiles(face, &n, &file)) || !file) return NULL;
+    const void *key; UINT32 ks; IDWriteFontFileLoader *ld = NULL; IDWriteFontFileStream *st = NULL;
+    BOOL sup; DWRITE_FONT_FACE_TYPE ft; UINT32 nf;
+    IDWriteFontFile_Analyze(file, &sup, type, &ft, &nf);
+    if (SUCCEEDED(IDWriteFontFile_GetReferenceKey(file, &key, &ks)) && SUCCEEDED(IDWriteFontFile_GetLoader(file, &ld)) &&
+        SUCCEEDED(IDWriteFontFileLoader_CreateStreamFromKey(ld, key, ks, &st))) {
+        UINT64 sz = 0; const void *frag; void *ctx;
+        if (SUCCEEDED(IDWriteFontFileStream_GetFileSize(st, &sz)) && SUCCEEDED(IDWriteFontFileStream_ReadFileFragment(st, &frag, 0, sz, &ctx))) {
+            out = malloc(sz); memcpy(out, frag, sz); *size = (UINT32)sz;
+            IDWriteFontFileStream_ReleaseFileFragment(st, ctx);
+        }
+        IDWriteFontFileStream_Release(st);
+    }
+    if (ld) IDWriteFontFileLoader_Release(ld);
+    IDWriteFontFile_Release(file);
+    return out;
+}
+// A made-up collection ('ttcf', one face) of a single-face font's tables, its face listing extra more records that
+// each name the font's largest table's bytes again (tags 'z', 'z' and the record's number).
+static BYTE *make_ttc(const BYTE *sfnt, UINT32 extra, UINT32 *size) {
+    UINT16 m = rd16(sfnt + 4);
+    UINT32 dir = 16, at = dir + 12 + 16 * (m + extra), total = at, big = 0, big_at = 0;
+    for (UINT16 i = 0; i < m; i++) total += (rd32(sfnt + 12 + 16 * i + 12) + 3) & ~3u;
+    BYTE *w = calloc(1, total);
+    memcpy(w, "ttcf", 4); wr32(w + 4, 0x00010000); wr32(w + 8, 1); wr32(w + 12, dir);
+    memcpy(w + dir, sfnt, 12); wr16(w + dir + 4, (UINT16)(m + extra));
+    for (UINT16 i = 0; i < m; i++) {
+        const BYTE *r = sfnt + 12 + 16 * i;
+        BYTE *e = w + dir + 12 + 16 * i;
+        UINT32 len = rd32(r + 12);
+        memcpy(e, r, 16); wr32(e + 8, at);
+        memcpy(w + at, sfnt + rd32(r + 8), len);
+        if (len > big) { big = len; big_at = at; }
+        at += (len + 3) & ~3u;
+    }
+    for (UINT32 i = 0; i < extra; i++) {
+        BYTE *e = w + dir + 12 + 16 * (m + i);
+        e[0] = 'z'; e[1] = 'z'; e[2] = (BYTE)(i >> 8); e[3] = (BYTE)i;
+        wr32(e + 8, big_at); wr32(e + 12, big);
+    }
+    *size = total;
+    return w;
+}
+static IDWriteFontFace *face_named(IDWriteFontCollection *c, const WCHAR *family) { return face_of(c, family, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, NULL); }
+static void en_name(IDWriteLocalizedStrings *s, WCHAR *out, UINT32 cap) {
+    UINT32 i = 0; BOOL ex = FALSE;
+    out[0] = 0;
+    if (!s) return;
+    IDWriteLocalizedStrings_FindLocaleName(s, L"en-us", &i, &ex);
+    IDWriteLocalizedStrings_GetString(s, ex ? i : 0, out, cap);
+}
+static UINT32 count_fonts(IDWriteFontCollection *c, const WCHAR *family) {
+    UINT32 i; BOOL ex = FALSE; IDWriteFontFamily *fam = NULL;
+    if (FAILED(IDWriteFontCollection_FindFamilyName(c, family, &i, &ex)) || !ex || FAILED(IDWriteFontCollection_GetFontFamily(c, i, &fam))) return 0;
+    UINT32 n = IDWriteFontFamily_GetFontCount(fam);
+    IDWriteFontFamily_Release(fam);
+    return n;
+}
+
+static void newer_versions(IDWriteFactory *f, IDWriteFontCollection *sys, IDWriteFontFace *face, IDWriteFont *font, const UINT16 *gi, const BYTE *bytes, UINT64 nbytes) {
+    // Every factory version is the shared factory.
+    IDWriteFactory7 *f7 = NULL;
+    CHECK(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory7, (IUnknown **)&f7)) && (void *)f7 == (void *)f);
+    const GUID *versions[] = { &IID_IDWriteFactory3, &IID_IDWriteFactory4, &IID_IDWriteFactory5, &IID_IDWriteFactory6 };
+    for (int i = 0; i < 4; i++) { void *x = NULL; CHECK(SUCCEEDED(IDWriteFactory_QueryInterface(f, versions[i], &x)) && x == (void *)f); if (x) IUnknown_Release((IUnknown *)x); }
+    IDWriteFontFace5 *f5 = NULL;
+    CHECK(SUCCEEDED(IDWriteFontFace_QueryInterface(face, &IID_IDWriteFontFace5, (void **)&f5)) && f5);
+    if (!f7 || !f5) { if (f7) IDWriteFactory7_Release(f7); if (f5) IDWriteFontFace5_Release(f5); return; }
+    IDWriteFactory3 *f3 = (IDWriteFactory3 *)f7;
+    WCHAR nm[64];
+
+    // IDWriteFontFace3: properties, names, locality, rendering modes
+    CHECK(IDWriteFontFace5_GetWeight(f5) == IDWriteFont_GetWeight(font) && IDWriteFontFace5_GetStyle(f5) == DWRITE_FONT_STYLE_NORMAL &&
+          IDWriteFontFace5_GetStretch(f5) == DWRITE_FONT_STRETCH_NORMAL);
+    IDWriteLocalizedStrings *names = NULL;
+    CHECK(SUCCEEDED(IDWriteFontFace5_GetFamilyNames(f5, &names)) && names);
+    en_name(names, nm, 64);
+    CHECK(!wcscmp(nm, L"Helvetica"));
+    if (names) IDWriteLocalizedStrings_Release(names);
+    names = NULL;
+    CHECK(SUCCEEDED(IDWriteFontFace5_GetFaceNames(f5, &names)) && names && IDWriteLocalizedStrings_GetCount(names) >= 1);
+    if (names) IDWriteLocalizedStrings_Release(names);
+    BOOL exists = FALSE;
+    names = NULL;
+    CHECK(SUCCEEDED(IDWriteFontFace5_GetInformationalStrings(f5, DWRITE_INFORMATIONAL_STRING_POSTSCRIPT_NAME, &names, &exists)) && exists && names);
+    en_name(names, nm, 64);
+    CHECK(!wcscmp(nm, L"Helvetica"));
+    if (names) IDWriteLocalizedStrings_Release(names);
+    CHECK(IDWriteFontFace5_HasCharacter(f5, 'H') && !IDWriteFontFace5_HasCharacter(f5, 0x0378));
+    CHECK(IDWriteFontFace5_IsCharacterLocal(f5, 'H') && IDWriteFontFace5_IsGlyphLocal(f5, gi[0]));
+    BOOL local = FALSE;
+    CHECK(SUCCEEDED(IDWriteFontFace5_AreCharactersLocal(f5, L"Hello", 5, FALSE, &local)) && local);
+    local = FALSE;
+    CHECK(SUCCEEDED(IDWriteFontFace5_AreGlyphsLocal(f5, gi, 5, FALSE, &local)) && local);
+    DWRITE_PANOSE p1, p2;
+    memset(&p1, 0xEE, sizeof p1); memset(&p2, 0, sizeof p2);
+    IDWriteFontFace5_GetPanose(f5, &p1);
+    IDWriteFont1 *font1 = NULL;
+    if (SUCCEEDED(IDWriteFont_QueryInterface(font, &IID_IDWriteFont1, (void **)&font1)) && font1) { IDWriteFont1_GetPanose(font1, &p2); IDWriteFont1_Release(font1); }
+    CHECK(!memcmp(&p1, &p2, sizeof p1));
+    DWRITE_RENDERING_MODE1 mode1 = 99; DWRITE_GRID_FIT_MODE grid = 99;
+    CHECK(SUCCEEDED(VCALL(f5, IDWriteFontFace3_GetRecommendedRenderingMode)(f5, 300.0f, 96.0f, 96.0f, NULL, FALSE, DWRITE_OUTLINE_THRESHOLD_ANTIALIASED,
+                                                                DWRITE_MEASURING_MODE_NATURAL, NULL, &mode1, &grid)) && mode1 == DWRITE_RENDERING_MODE1_OUTLINE && grid == DWRITE_GRID_FIT_MODE_DISABLED);
+    IDWriteRenderingParams3 *rp3 = NULL;
+    CHECK(SUCCEEDED(VCALL(f7, IDWriteFactory3_CreateCustomRenderingParams)(f7, 1.8f, 0.5f, 1.0f, 0.0f, DWRITE_PIXEL_GEOMETRY_FLAT, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED,
+                                                               DWRITE_GRID_FIT_MODE_DISABLED, &rp3)) && rp3);
+    if (rp3) {
+        CHECK(IDWriteRenderingParams3_GetRenderingMode1(rp3) == DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED);
+        CHECK(IDWriteRenderingParams3_GetRenderingMode(rp3) == DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC);
+        CHECK(SUCCEEDED(VCALL(f5, IDWriteFontFace3_GetRecommendedRenderingMode)(f5, 12.0f, 96.0f, 96.0f, NULL, FALSE, DWRITE_OUTLINE_THRESHOLD_ANTIALIASED,
+                                                                    DWRITE_MEASURING_MODE_NATURAL, (IDWriteRenderingParams *)rp3, &mode1, &grid)) && mode1 == DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED);
+        DWRITE_RENDERING_MODE mode0 = 99;
+        CHECK(SUCCEEDED(IDWriteFontFace_GetRecommendedRenderingMode(face, 12.0f, 1.0f, DWRITE_MEASURING_MODE_NATURAL, (IDWriteRenderingParams *)rp3, &mode0)) &&
+              mode0 == DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC);
+        IDWriteRenderingParams3_Release(rp3);
+    }
+    CHECK(VCALL(f7, IDWriteFactory3_CreateCustomRenderingParams)(f7, 1.8f, 0.5f, 1.0f, 0.0f, DWRITE_PIXEL_GEOMETRY_FLAT, 8, DWRITE_GRID_FIT_MODE_DISABLED, &rp3) == E_INVALIDARG);
+    DWRITE_GLYPH_RUN run = { face, 24.0f, 5, gi, NULL, NULL, FALSE, 0 };
+    IDWriteGlyphRunAnalysis *an = NULL;
+    CHECK(SUCCEEDED(VCALL(f7, IDWriteFactory3_CreateGlyphRunAnalysis)(f7, &run, NULL, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED, DWRITE_MEASURING_MODE_NATURAL,
+                                                          DWRITE_GRID_FIT_MODE_DISABLED, DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE, 0, 20, &an)) && an);
+    if (an) { RECT r; CHECK(SUCCEEDED(IDWriteGlyphRunAnalysis_GetAlphaTextureBounds(an, DWRITE_TEXTURE_ALIASED_1x1, &r)) && r.right - r.left > 40); IDWriteGlyphRunAnalysis_Release(an); }
+
+    // IDWriteFontFace4: outline images only; IDWriteFontFace5: no axes
+    DWRITE_GLYPH_IMAGE_FORMATS formats = IDWriteFontFace5_GetGlyphImageFormats(f5), gformats = 0;
+    CHECK((formats & (DWRITE_GLYPH_IMAGE_FORMATS_TRUETYPE | DWRITE_GLYPH_IMAGE_FORMATS_CFF)) && !(formats & ~3u));
+    CHECK(SUCCEEDED(IDWriteFontFace5_GetGlyphImageFormats_(f5, gi[0], 0, 100, &gformats)) && gformats == formats);
+    DWRITE_GLYPH_IMAGE_DATA img; void *img_ctx = (void *)1;
+    CHECK(FAILED(IDWriteFontFace5_GetGlyphImageData(f5, gi[0], 32, DWRITE_GLYPH_IMAGE_FORMATS_PNG, &img, &img_ctx)) && !img_ctx && !img.imageData);
+    CHECK(IDWriteFontFace5_GetFontAxisValueCount(f5) == 0 && !IDWriteFontFace5_HasVariations(f5));
+    CHECK(SUCCEEDED(IDWriteFontFace5_GetFontAxisValues(f5, NULL, 0)));
+    CHECK(IDWriteFontFace5_IsColorFont(f5) == FALSE && IDWriteFontFace5_GetColorPaletteCount(f5) == 0);
+    IDWriteColorGlyphRunEnumerator1 *layers = (IDWriteColorGlyphRunEnumerator1 *)1;
+    D2D1_POINT_2F origin = { 10.0f, 30.0f };
+    CHECK(VCALL(f7, IDWriteFactory4_TranslateColorGlyphRun)(f7, origin, &run, NULL, DWRITE_GLYPH_IMAGE_FORMATS_COLR | DWRITE_GLYPH_IMAGE_FORMATS_PNG, DWRITE_MEASURING_MODE_NATURAL,
+                                                NULL, 0, &layers) == DWRITE_E_NOCOLOR && !layers);
+
+    // Its resource and reference: the same file and face again
+    IDWriteFontResource *res = NULL;
+    CHECK(SUCCEEDED(IDWriteFontFace5_GetFontResource(f5, &res)) && res);
+    if (res) {
+        CHECK(IDWriteFontResource_GetFontFaceIndex(res) == IDWriteFontFace_GetIndex(face) && IDWriteFontResource_GetFontAxisCount(res) == 0 && !IDWriteFontResource_HasVariations(res));
+        IDWriteFontFace5 *again = NULL;
+        CHECK(SUCCEEDED(IDWriteFontResource_CreateFontFace(res, DWRITE_FONT_SIMULATIONS_NONE, NULL, 0, &again)) && again);
+        if (again) { CHECK(IDWriteFontFace5_Equals(f5, (IDWriteFontFace *)again)); IDWriteFontFace5_Release(again); }
+        CHECK(SUCCEEDED(IDWriteFontResource_CreateFontFace(res, DWRITE_FONT_SIMULATIONS_BOLD, NULL, 0, &again)) && again);
+        if (again) { CHECK(!IDWriteFontFace5_Equals(f5, (IDWriteFontFace *)again) && IDWriteFontFace5_GetSimulations(again) == DWRITE_FONT_SIMULATIONS_BOLD); IDWriteFontFace5_Release(again); }
+        IDWriteLocalizedStrings *axis_names = (IDWriteLocalizedStrings *)1;
+        CHECK(IDWriteFontResource_GetAxisNames(res, 0, &axis_names) == E_INVALIDARG && !axis_names);
+        IDWriteFontResource_Release(res);
+    }
+    IDWriteFontFaceReference *ref = NULL;
+    CHECK(SUCCEEDED(IDWriteFontFace5_GetFontFaceReference(f5, &ref)) && ref);
+    if (ref) {
+        CHECK(IDWriteFontFaceReference_GetFontFaceIndex(ref) == IDWriteFontFace_GetIndex(face) && IDWriteFontFaceReference_GetSimulations(ref) == 0);
+        CHECK(IDWriteFontFaceReference_GetFileSize(ref) == nbytes && IDWriteFontFaceReference_GetLocalFileSize(ref) == nbytes);
+        CHECK(IDWriteFontFaceReference_GetLocality(ref) == DWRITE_LOCALITY_LOCAL && SUCCEEDED(IDWriteFontFaceReference_EnqueueFontDownloadRequest(ref)));
+        FILETIME ft = { 0, 0 };
+        CHECK(SUCCEEDED(IDWriteFontFaceReference_GetFileTime(ref, &ft)) && (ft.dwHighDateTime || ft.dwLowDateTime));
+        IDWriteFontFace3 *rf = NULL;
+        CHECK(SUCCEEDED(IDWriteFontFaceReference_CreateFontFace(ref, &rf)) && (void *)rf == (void *)face);
+        if (rf) IDWriteFontFace3_Release(rf);
+        rf = NULL;
+        CHECK(SUCCEEDED(IDWriteFontFaceReference_CreateFontFaceWithSimulations(ref, DWRITE_FONT_SIMULATIONS_OBLIQUE, &rf)) && rf &&
+              IDWriteFontFace3_GetSimulations(rf) == DWRITE_FONT_SIMULATIONS_OBLIQUE && IDWriteFontFace3_GetStyle(rf) == DWRITE_FONT_STYLE_OBLIQUE);
+        if (rf) IDWriteFontFace3_Release(rf);
+        // the same face of the same file, by its path
+        IDWriteFontFile *file = NULL; UINT32 one = 1;
+        IDWriteFontFace_GetFiles(face, &one, &file);
+        const void *key = NULL; UINT32 ks = 0;
+        if (file) IDWriteFontFile_GetReferenceKey(file, &key, &ks);
+        IDWriteFontFaceReference *by_path = NULL, *by_file = NULL;
+        if (key && ks > 8) {
+            CHECK(SUCCEEDED(IDWriteFactory3_CreateFontFaceReference(f3, (const WCHAR *)((const BYTE *)key + 8), NULL, IDWriteFontFace_GetIndex(face), DWRITE_FONT_SIMULATIONS_NONE, &by_path)) && by_path);
+            if (by_path) { CHECK(IDWriteFontFaceReference_Equals(ref, by_path)); IDWriteFontFaceReference_Release(by_path); }
+        }
+        if (file) {
+            CHECK(SUCCEEDED(IDWriteFactory3_CreateFontFaceReference_(f3, file, IDWriteFontFace_GetIndex(face), DWRITE_FONT_SIMULATIONS_BOLD, &by_file)) && by_file);
+            if (by_file) { CHECK(!IDWriteFontFaceReference_Equals(ref, by_file)); IDWriteFontFaceReference_Release(by_file); }
+            IDWriteFontFile_Release(file);
+        }
+        IDWriteFontFaceReference_Release(ref);
+    }
+
+    // IDWriteFont3, IDWriteFontFamily2, IDWriteFontList2, IDWriteFontCollection3
+    IDWriteFontCollection3 *c3 = NULL;
+    CHECK(SUCCEEDED(IDWriteFontCollection_QueryInterface(sys, &IID_IDWriteFontCollection3, (void **)&c3)) && c3);
+    UINT32 helvetica_fonts = count_fonts(sys, L"Helvetica"), all_fonts = 0;
+    if (c3) {
+        CHECK(IDWriteFontCollection3_GetFontFamilyModel(c3) == DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE);
+        HANDLE expiry = IDWriteFontCollection3_GetExpirationEvent(c3);
+        CHECK(expiry != NULL && WaitForSingleObject(expiry, 0) == WAIT_TIMEOUT);
+        for (UINT32 i = 0; i < IDWriteFontCollection3_GetFontFamilyCount(c3); i++) {
+            IDWriteFontFamily2 *fam = NULL;
+            if (SUCCEEDED(VCALL(c3, IDWriteFontCollection2_GetFontFamily)(c3, i, &fam)) && fam) { all_fonts += IDWriteFontFamily2_GetFontCount(fam); IDWriteFontFamily2_Release(fam); }
+        }
+        DWRITE_FONT_AXIS_VALUE bold = { DWRITE_FONT_AXIS_TAG_WEIGHT, 700.0f };
+        IDWriteFontList2 *list = NULL;
+        CHECK(SUCCEEDED(IDWriteFontCollection3_GetMatchingFonts(c3, L"helvetica", &bold, 1, &list)) && list);
+        if (list) {
+            CHECK(IDWriteFontList2_GetFontCount(list) == helvetica_fonts && helvetica_fonts >= 2);
+            IDWriteFont3 *first = NULL;
+            CHECK(SUCCEEDED(VCALL(list, IDWriteFontList1_GetFont)(list, 0, &first)) && first && IDWriteFont3_GetWeight(first) == DWRITE_FONT_WEIGHT_BOLD);
+            CHECK(IDWriteFontList2_GetFontLocality(list, 0) == DWRITE_LOCALITY_LOCAL);
+            if (first) {
+                CHECK(IDWriteFont3_Equals(first, (IDWriteFont *)first) && !IDWriteFont3_Equals(first, font));
+                CHECK(IDWriteFont3_HasCharacter(first, 'Q') && !IDWriteFont3_HasCharacter(first, 0x0378) && IDWriteFont3_GetLocality(first) == DWRITE_LOCALITY_LOCAL);
+                IDWriteFontFaceReference *fr = NULL;
+                CHECK(SUCCEEDED(IDWriteFont3_GetFontFaceReference(first, &fr)) && fr);
+                if (fr) {
+                    IDWriteFontFace3 *ff = NULL, *ff2 = NULL;
+                    CHECK(SUCCEEDED(IDWriteFontFaceReference_CreateFontFace(fr, &ff)) && ff && SUCCEEDED(IDWriteFont3_CreateFontFace(first, &ff2)) && ff == ff2);
+                    if (ff) IDWriteFontFace3_Release(ff);
+                    if (ff2) IDWriteFontFace3_Release(ff2);
+                    IDWriteFontFaceReference_Release(fr);
+                }
+                IDWriteFont3_Release(first);
+            }
+            IDWriteFontSet1 *ls = NULL;
+            CHECK(SUCCEEDED(IDWriteFontList2_GetFontSet(list, &ls)) && ls && IDWriteFontSet1_GetFontCount(ls) == helvetica_fonts);
+            if (ls) IDWriteFontSet1_Release(ls);
+            IDWriteFontList2_Release(list);
+        }
+        CHECK(SUCCEEDED(IDWriteFontCollection3_GetMatchingFonts(c3, L"No Such Family Xq", NULL, 0, &list)) && list && IDWriteFontList2_GetFontCount(list) == 0);
+        if (list) IDWriteFontList2_Release(list);
+        UINT32 hidx = 0; BOOL hex = FALSE; IDWriteFontFamily2 *hfam = NULL;
+        IDWriteFontCollection3_FindFamilyName(c3, L"Helvetica", &hidx, &hex);
+        if (hex && SUCCEEDED(VCALL(c3, IDWriteFontCollection2_GetFontFamily)(c3, hidx, &hfam)) && hfam) {
+            DWRITE_FONT_AXIS_VALUE italic = { DWRITE_FONT_AXIS_TAG_ITALIC, 1.0f };
+            CHECK(SUCCEEDED(IDWriteFontFamily2_GetMatchingFonts(hfam, &italic, 1, &list)) && list);
+            IDWriteFont3 *first = NULL;
+            if (list && SUCCEEDED(VCALL(list, IDWriteFontList1_GetFont)(list, 0, &first)) && first) {
+                CHECK(IDWriteFont3_GetStyle(first) != DWRITE_FONT_STYLE_NORMAL && IDWriteFont3_GetWeight(first) == DWRITE_FONT_WEIGHT_NORMAL);
+                IDWriteFont3_Release(first);
+            }
+            if (list) IDWriteFontList2_Release(list);
+            CHECK(IDWriteFontFamily2_GetFontLocality(hfam, 0) == DWRITE_LOCALITY_LOCAL);
+            IDWriteFontFaceReference *fr = NULL;
+            CHECK(SUCCEEDED(IDWriteFontFamily2_GetFontFaceReference(hfam, 0, &fr)) && fr);
+            if (fr) IDWriteFontFaceReference_Release(fr);
+            IDWriteFontSet1 *fs = NULL;
+            CHECK(SUCCEEDED(IDWriteFontFamily2_GetFontSet(hfam, &fs)) && fs && IDWriteFontSet1_GetFontCount(fs) == helvetica_fonts);
+            if (fs) IDWriteFontSet1_Release(fs);
+            IDWriteFontFamily2_Release(hfam);
+        }
+    }
+
+    // The system font set: the system collection's fonts
+    IDWriteFontSet3 *set = NULL;
+    CHECK(SUCCEEDED(IDWriteFactory7_GetSystemFontSet(f7, FALSE, (IDWriteFontSet2 **)&set)) && set);
+    IDWriteFontSet *set0 = (IDWriteFontSet *)set;
+    if (set) {
+        CHECK(IDWriteFontSet3_GetFontCount(set) == all_fonts && all_fonts > 100);
+        HANDLE expiry = IDWriteFontSet3_GetExpirationEvent(set);
+        CHECK(expiry != NULL && WaitForSingleObject(expiry, 0) == WAIT_TIMEOUT);
+        UINT32 at = UINT32_MAX; BOOL found = FALSE;
+        CHECK(SUCCEEDED(IDWriteFontSet3_FindFontFace(set, face, &at, &found)) && found && at < all_fonts);
+        if (found) {
+            IDWriteFontFace5 *sf = NULL;
+            CHECK(SUCCEEDED(IDWriteFontSet3_CreateFontFace(set, at, &sf)) && (void *)sf == (void *)face);
+            if (sf) IDWriteFontFace5_Release(sf);
+            IDWriteFontFaceReference1 *sr = NULL;
+            CHECK(SUCCEEDED(VCALL(set, IDWriteFontSet1_GetFontFaceReference)(set, at, &sr)) && sr);
+            if (sr) {
+                UINT32 at2 = UINT32_MAX; BOOL found2 = FALSE;
+                CHECK(SUCCEEDED(IDWriteFontSet3_FindFontFaceReference(set, (IDWriteFontFaceReference *)sr, &at2, &found2)) && found2 && at2 == at);
+                CHECK(IDWriteFontFaceReference1_GetFontAxisValueCount(sr) == 0);
+                IDWriteFontFaceReference1_Release(sr);
+            }
+            IDWriteLocalizedStrings *ps = NULL; BOOL has = FALSE;
+            CHECK(SUCCEEDED(IDWriteFontSet3_GetPropertyValues(set, at, DWRITE_FONT_PROPERTY_ID_POSTSCRIPT_NAME, &has, &ps)) && has && ps);
+            en_name(ps, nm, 64);
+            CHECK(!wcscmp(nm, L"Helvetica"));
+            if (ps) IDWriteLocalizedStrings_Release(ps);
+            CHECK(SUCCEEDED(IDWriteFontSet3_GetPropertyValues(set, at, DWRITE_FONT_PROPERTY_ID_WEIGHT, &has, &ps)) && has && ps);
+            en_name(ps, nm, 64);
+            CHECK(!wcscmp(nm, L"400"));
+            if (ps) IDWriteLocalizedStrings_Release(ps);
+            CHECK(SUCCEEDED(IDWriteFontSet3_GetPropertyValues(set, at, DWRITE_FONT_PROPERTY_ID_SEMANTIC_TAG, &has, &ps)) && !has && !ps);
+            CHECK(IDWriteFontSet3_GetFontSourceType(set, at) == DWRITE_FONT_SOURCE_TYPE_PER_MACHINE && IDWriteFontSet3_GetFontSourceNameLength(set, at) == 0);
+            CHECK(IDWriteFontSet3_GetFontLocality(set, at) == DWRITE_LOCALITY_LOCAL);
+            IDWriteFontResource *sres = NULL;
+            CHECK(SUCCEEDED(IDWriteFontSet3_CreateFontResource(set, at, &sres)) && sres);
+            if (sres) IDWriteFontResource_Release(sres);
+            DWRITE_FONT_AXIS_RANGE ranges[4]; UINT32 nranges = 99;
+            CHECK(SUCCEEDED(IDWriteFontSet3_GetFontAxisRanges_(set, at, ranges, 4, &nranges)) && nranges == 0);
+        }
+        // a family's fonts, nearest a weight first
+        IDWriteFontSet *hs = NULL;
+        CHECK(SUCCEEDED(IDWriteFontSet_GetMatchingFonts_(set0, L"Helvetica", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, &hs)) && hs);
+        if (hs) {
+            CHECK(IDWriteFontSet_GetFontCount(hs) == helvetica_fonts);
+            IDWriteLocalizedStrings *w = NULL; BOOL has = FALSE;
+            CHECK(SUCCEEDED(IDWriteFontSet_GetPropertyValues(hs, 0, DWRITE_FONT_PROPERTY_ID_WEIGHT, &has, &w)) && has);
+            en_name(w, nm, 64);
+            CHECK(!wcscmp(nm, L"700"));
+            if (w) IDWriteLocalizedStrings_Release(w);
+            IDWriteStringList *families = NULL;
+            CHECK(SUCCEEDED(IDWriteFontSet_GetPropertyValues__(hs, DWRITE_FONT_PROPERTY_ID_WEIGHT_STRETCH_STYLE_FAMILY_NAME, &families)) && families);
+            if (families) {
+                UINT32 len = 0;
+                CHECK(IDWriteStringList_GetCount(families) == 1 && SUCCEEDED(IDWriteStringList_GetString(families, 0, nm, 64)) && !wcscmp(nm, L"Helvetica"));
+                CHECK(SUCCEEDED(IDWriteStringList_GetStringLength(families, 0, &len)) && len == 9 && IDWriteStringList_GetString(families, 0, nm, 9) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
+                CHECK(SUCCEEDED(IDWriteStringList_GetLocaleName(families, 0, nm, 64)) && !wcscmp(nm, L"en-us"));
+                IDWriteStringList_Release(families);
+            }
+            IDWriteFontSet_Release(hs);
+        }
+        DWRITE_FONT_PROPERTY fam = { DWRITE_FONT_PROPERTY_ID_WEIGHT_STRETCH_STYLE_FAMILY_NAME, L"HELVETICA", NULL };
+        DWRITE_FONT_PROPERTY both[2] = { fam, { DWRITE_FONT_PROPERTY_ID_WEIGHT, L"700", L"" } };
+        UINT32 occ = 0;
+        CHECK(SUCCEEDED(IDWriteFontSet_GetPropertyOccurrenceCount(set0, &fam, &occ)) && occ == helvetica_fonts);
+        CHECK(SUCCEEDED(IDWriteFontSet_GetMatchingFonts(set0, both, 2, &hs)) && hs && IDWriteFontSet_GetFontCount(hs) >= 1 && IDWriteFontSet_GetFontCount(hs) < helvetica_fonts);
+        if (hs) IDWriteFontSet_Release(hs);
+        UINT32 idx[64], nidx = 0;
+        CHECK(SUCCEEDED(IDWriteFontSet3_GetFilteredFontIndices(set, &fam, 1, FALSE, idx, 64, &nidx)) && nidx == helvetica_fonts);
+        CHECK(IDWriteFontSet3_GetFilteredFontIndices(set, &fam, 1, FALSE, idx, 1, &nidx) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) && nidx == helvetica_fonts);
+        IDWriteFontSet1 *sub = NULL;
+        CHECK(SUCCEEDED(IDWriteFontSet3_GetFilteredFonts__(set, idx, 2, &sub)) && sub && IDWriteFontSet1_GetFontCount(sub) == 2);
+        if (sub) IDWriteFontSet1_Release(sub);
+        DWRITE_FONT_AXIS_RANGE wr = { DWRITE_FONT_AXIS_TAG_WEIGHT, 100.0f, 900.0f };
+        CHECK(SUCCEEDED(IDWriteFontSet3_GetFilteredFonts_(set, &wr, 1, FALSE, &sub)) && sub && IDWriteFontSet1_GetFontCount(sub) == 0);   // (no font has axes)
+        if (sub) IDWriteFontSet1_Release(sub);
+        DWRITE_FONT_AXIS_VALUE wv = { DWRITE_FONT_AXIS_TAG_WEIGHT, 700.0f };
+        CHECK(SUCCEEDED(VCALL(set, IDWriteFontSet1_GetMatchingFonts)(set, &fam, &wv, 1, &sub)) && sub && IDWriteFontSet1_GetFontCount(sub) == helvetica_fonts);
+        if (sub) {
+            IDWriteLocalizedStrings *w = NULL; BOOL has = FALSE;
+            IDWriteFontSet1_GetPropertyValues(sub, 0, DWRITE_FONT_PROPERTY_ID_WEIGHT, &has, &w);
+            en_name(w, nm, 64);
+            CHECK(has && !wcscmp(nm, L"700"));
+            if (w) IDWriteLocalizedStrings_Release(w);
+            IDWriteFontSet1_Release(sub);
+        }
+        // (fewer: the named instances of a variable font are its one face)
+        CHECK(SUCCEEDED(IDWriteFontSet3_GetFirstFontResources(set, &sub)) && sub && IDWriteFontSet1_GetFontCount(sub) >= all_fonts / 2 && IDWriteFontSet1_GetFontCount(sub) <= all_fonts);
+        if (sub) IDWriteFontSet1_Release(sub);
+        IDWriteFontCollection1 *from_set = NULL;
+        CHECK(SUCCEEDED(IDWriteFactory3_CreateFontCollectionFromFontSet(f3, set0, &from_set)) && (void *)from_set == (void *)sys);
+        if (from_set) IDWriteFontCollection1_Release(from_set);
+        // GDI interop by the set: a LOGFONT's fonts
+        IDWriteGdiInterop1 *gdi1 = NULL;
+        IDWriteFactory_GetGdiInterop(f, (IDWriteGdiInterop **)&gdi1);
+        LOGFONTW lf = { 0 };
+        lf.lfWeight = FW_BOLD; wcscpy(lf.lfFaceName, L"Helvetica");
+        if (gdi1) {
+            IDWriteFontSet *byl = NULL;
+            CHECK(SUCCEEDED(IDWriteGdiInterop1_GetMatchingFontsByLOGFONT(gdi1, &lf, set0, &byl)) && byl && IDWriteFontSet_GetFontCount(byl) == helvetica_fonts);
+            if (byl) {
+                IDWriteLocalizedStrings *w = NULL; BOOL has = FALSE;
+                IDWriteFontSet_GetPropertyValues(byl, 0, DWRITE_FONT_PROPERTY_ID_WEIGHT, &has, &w);
+                en_name(w, nm, 64);
+                CHECK(has && !wcscmp(nm, L"700"));
+                if (w) IDWriteLocalizedStrings_Release(w);
+                IDWriteFontSet_Release(byl);
+            }
+            FONTSIGNATURE sig, sig2;
+            memset(&sig, 0xEE, sizeof sig); memset(&sig2, 0, sizeof sig2);
+            CHECK(SUCCEEDED(IDWriteGdiInterop1_GetFontSignature(gdi1, font, &sig)) && (sig.fsUsb[0] & 1));     // Basic Latin
+            CHECK(SUCCEEDED(IDWriteGdiInterop1_GetFontSignature_(gdi1, face, &sig2)) && !memcmp(&sig, &sig2, sizeof sig));
+            IDWriteFont *lfont = NULL;
+            CHECK(SUCCEEDED(IDWriteGdiInterop1_CreateFontFromLOGFONT(gdi1, &lf, NULL, &lfont)) && lfont && IDWriteFont_GetWeight(lfont) == DWRITE_FONT_WEIGHT_BOLD);
+            if (lfont) IDWriteFont_Release(lfont);
+            // the face of the font a DC has selected
+            HDC dc = CreateCompatibleDC(NULL);
+            HFONT hf = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, 0, 0, L"Helvetica");
+            HGDIOBJ old = dc && hf ? SelectObject(dc, hf) : NULL;
+            IDWriteFontFace *dcface = NULL;
+            CHECK(dc && hf && SUCCEEDED(IDWriteGdiInterop1_CreateFontFaceFromHdc(gdi1, dc, &dcface)) && dcface == face);
+            if (dcface) IDWriteFontFace_Release(dcface);
+            if (old) SelectObject(dc, old);
+            if (hf) DeleteObject(hf);
+            if (dc) DeleteDC(dc);
+            IDWriteGdiInterop1_Release(gdi1);
+        }
+    }
+
+    // Kerning pairs from 'kern' (Helvetica: Apple's version; Arial: OpenType's), none where there is no such table
+    static const WCHAR *const kerned[] = { L"Helvetica", L"Arial" };
+    int kern_checked = 0;
+    for (int k = 0; k < 2; k++) {
+        IDWriteFontFace *kf = face_named(sys, kerned[k]);
+        IDWriteFontFace1 *kf1 = NULL;
+        if (kf && SUCCEEDED(IDWriteFontFace_QueryInterface(kf, &IID_IDWriteFontFace1, (void **)&kf1)) && IDWriteFontFace1_HasKerningPairs(kf1)) {
+            UINT32 cps[4] = { 'A', 'V', 'A', 'x' }; UINT16 g[4]; INT32 adj[4] = { 7, 7, 7, 7 };
+            IDWriteFontFace1_GetGlyphIndices(kf1, cps, 4, g);
+            CHECK(SUCCEEDED(IDWriteFontFace1_GetKerningPairAdjustments(kf1, 4, g, adj)));
+            CHECK(adj[0] < 0 && adj[3] == 0);                        // A V closer; the last glyph has nothing after it
+            DWRITE_FONT_METRICS1 km;
+            IDWriteFontFace1_GetMetrics(kf1, &km);
+            printf("dwrite: %ls kerns A-V by %d of %u units per em\n", kerned[k], (int)adj[0], km.designUnitsPerEm);
+            kern_checked++;
+        }
+        if (kf1) IDWriteFontFace1_Release(kf1);
+        if (kf) IDWriteFontFace_Release(kf);
+    }
+    CHECK(kern_checked == 2);
+    // Vertical glyph variants from GSUB 'vert' (a font with them: a corner bracket turns; Latin stays)
+    static const WCHAR *const vertical[] = { L"Arial Unicode MS", L"Hiragino Sans GB", L"Apple SD Gothic Neo" };
+    int vert_checked = 0;
+    for (int v = 0; v < 3 && !vert_checked; v++) {
+        IDWriteFontFace *vf = face_named(sys, vertical[v]);
+        IDWriteFontFace1 *vf1 = NULL;
+        if (vf && SUCCEEDED(IDWriteFontFace_QueryInterface(vf, &IID_IDWriteFontFace1, (void **)&vf1)) && IDWriteFontFace1_HasVerticalGlyphVariants(vf1)) {
+            UINT32 cps[2] = { 0x300C, 'A' }; UINT16 g[2], vg[2];
+            IDWriteFontFace1_GetGlyphIndices(vf1, cps, 2, g);
+            CHECK(g[0] && SUCCEEDED(IDWriteFontFace1_GetVerticalGlyphVariants(vf1, 2, g, vg)) && vg[0] != g[0] && vg[1] == g[1]);
+            vert_checked = 1;
+        }
+        if (vf1) IDWriteFontFace1_Release(vf1);
+        if (vf) IDWriteFontFace_Release(vf);
+    }
+    CHECK(vert_checked);
+    IDWriteFontFace1 *hf1 = NULL;
+    if (SUCCEEDED(IDWriteFontFace_QueryInterface(face, &IID_IDWriteFontFace1, (void **)&hf1))) {
+        UINT16 vg[5];
+        CHECK(!IDWriteFontFace1_HasVerticalGlyphVariants(hf1) && SUCCEEDED(IDWriteFontFace1_GetVerticalGlyphVariants(hf1, 5, gi, vg)) && !memcmp(vg, gi, sizeof vg));
+        IDWriteFontFace1_Release(hf1);
+    }
+
+    // Glyph origins: by the advances, offsets added; leftwards right to left
+    D2D1_POINT_2F org[5];
+    DWRITE_GLYPH_METRICS gm[5];
+    DWRITE_FONT_METRICS fm;
+    IDWriteFontFace_GetMetrics(face, &fm);
+    IDWriteFontFace_GetDesignGlyphMetrics(face, gi, 5, gm, FALSE);
+    CHECK(SUCCEEDED(IDWriteFactory7_ComputeGlyphOrigins_(f7, &run, origin, org)));
+    float x = 10.0f, k = 24.0f / fm.designUnitsPerEm;
+    int ok = 1;
+    for (int i = 0; i < 5; i++) { ok &= fabsf(org[i].x - x) < 0.01f && org[i].y == 30.0f; x += gm[i].advanceWidth * k; }
+    CHECK(ok);
+    DWRITE_GLYPH_OFFSET offs[5] = { { 0, 0 }, { 2.0f, 3.0f }, { 0, 0 }, { 0, 0 }, { 0, 0 } };
+    FLOAT advs[5] = { 10, 10, 10, 10, 10 };
+    DWRITE_GLYPH_RUN rtl = { face, 24.0f, 5, gi, advs, offs, FALSE, 1 };
+    CHECK(SUCCEEDED(IDWriteFactory7_ComputeGlyphOrigins(f7, &rtl, DWRITE_MEASURING_MODE_NATURAL, origin, NULL, org)));
+    CHECK(org[0].x == 0.0f && org[1].x == -12.0f && org[1].y == 27.0f && org[4].x == -40.0f);
+
+    // A builder: a reference with a family name of the set's own, and the faces of a font file in memory
+    IDWriteFontSetBuilder2 *b = NULL;
+    CHECK(SUCCEEDED(VCALL(f7, IDWriteFactory6_CreateFontSetBuilder)(f7, &b)) && b);
+    IDWriteInMemoryFontFileLoader *mem = NULL;
+    CHECK(SUCCEEDED(IDWriteFactory7_CreateInMemoryFontFileLoader(f7, &mem)) && mem);
+    counted owner = { { &cu_vtbl }, 1 };
+    if (b && mem) {
+        CHECK(SUCCEEDED(IDWriteFactory_RegisterFontFileLoader(f, (IDWriteFontFileLoader *)mem)));
+        IDWriteFontFile *mf = NULL, *mf2 = NULL;
+        CHECK(SUCCEEDED(IDWriteInMemoryFontFileLoader_CreateInMemoryFontFileReference(mem, f, bytes, (UINT32)nbytes, &owner.iface, &mf)) && mf && owner.refs == 2);
+        CHECK(IDWriteInMemoryFontFileLoader_GetFileCount(mem) == 1);
+        UINT32 key0 = 0;
+        CHECK(SUCCEEDED(IDWriteFactory_CreateCustomFontFileReference(f, &key0, 4, (IDWriteFontFileLoader *)mem, &mf2)) && mf2);
+        UINT32 key9 = 9;
+        IDWriteFontFile *none = (IDWriteFontFile *)1;
+        CHECK(IDWriteFactory_CreateCustomFontFileReference(f, &key9, 4, (IDWriteFontFileLoader *)mem, &none) == E_INVALIDARG && !none);
+        if (mf && mf2) {
+            BOOL sup = FALSE; DWRITE_FONT_FILE_TYPE ft; DWRITE_FONT_FACE_TYPE fct; UINT32 nfaces = 0;
+            CHECK(SUCCEEDED(IDWriteFontFile_Analyze(mf2, &sup, &ft, &fct, &nfaces)) && sup && nfaces >= 1);
+            IDWriteFontFileLoader *back = NULL;
+            CHECK(SUCCEEDED(IDWriteFontFile_GetLoader(mf, &back)) && (void *)back == (void *)mem);
+            if (back) IDWriteFontFileLoader_Release(back);
+            IDWriteFontFace *mface = NULL;
+            CHECK(SUCCEEDED(IDWriteFactory_CreateFontFace(f, fct, 1, &mf, IDWriteFontFace_GetIndex(face), DWRITE_FONT_SIMULATIONS_NONE, &mface)) && mface);
+            if (mface) { CHECK(glyph(mface, 'H') == gi[0]); IDWriteFontFace_Release(mface); }
+            IDWriteFontFaceReference *href = NULL;
+            IDWriteFontFace5_GetFontFaceReference(f5, &href);
+            DWRITE_FONT_PROPERTY own = { DWRITE_FONT_PROPERTY_ID_WEIGHT_STRETCH_STYLE_FAMILY_NAME, L"Quuxian Sans", L"en-us" };
+            CHECK(href && SUCCEEDED(IDWriteFontSetBuilder2_AddFontFaceReference_(b, href, &own, 1)));
+            CHECK(SUCCEEDED(b->lpVtbl->AddFontFile(b, mf2)));          // (IDWriteFontSetBuilder1's, by the file)
+            if (href) IDWriteFontFaceReference_Release(href);
+            IDWriteFontSet *bs = NULL;
+            CHECK(SUCCEEDED(IDWriteFontSetBuilder2_CreateFontSet(b, &bs)) && bs && IDWriteFontSet_GetFontCount(bs) == 1 + nfaces);
+            if (bs) {
+                UINT32 occ = 0;
+                DWRITE_FONT_PROPERTY q = { DWRITE_FONT_PROPERTY_ID_WEIGHT_STRETCH_STYLE_FAMILY_NAME, L"quuxian sans", NULL };
+                CHECK(SUCCEEDED(IDWriteFontSet_GetPropertyOccurrenceCount(bs, &q, &occ)) && occ == 1);
+                IDWriteFontCollection1 *bc = NULL;
+                CHECK(SUCCEEDED(IDWriteFactory3_CreateFontCollectionFromFontSet(f3, bs, &bc)) && bc && (void *)bc != (void *)sys);
+                if (bc) {
+                    UINT32 at; BOOL ex = FALSE;
+                    CHECK(SUCCEEDED(IDWriteFontCollection1_FindFamilyName(bc, L"Quuxian Sans", &at, &ex)) && ex);
+                    IDWriteFontFace *qf = face_of((IDWriteFontCollection *)bc, L"Quuxian Sans", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, NULL);
+                    IDWriteFontFace5 *qf5 = NULL;
+                    if (qf) IDWriteFontFace_QueryInterface(qf, &IID_IDWriteFontFace5, (void **)&qf5);
+                    CHECK(qf5 && IDWriteFontFace5_Equals(qf5, face));               // Helvetica's face, by another name
+                    if (qf5) IDWriteFontFace5_Release(qf5);
+                    if (qf) IDWriteFontFace_Release(qf);
+                    CHECK(SUCCEEDED(IDWriteFontCollection1_FindFamilyName(bc, L"Helvetica", &at, &ex)) && ex);   // (the file in memory's faces)
+                    IDWriteFontSet *cs = NULL;
+                    CHECK(SUCCEEDED(IDWriteFontCollection1_GetFontSet(bc, &cs)) && cs && IDWriteFontSet_GetFontCount(cs) == 1 + nfaces);
+                    if (cs) IDWriteFontSet_Release(cs);
+                    IDWriteFontCollection1_Release(bc);
+                }
+                IDWriteFontSet_Release(bs);
+            }
+        }
+        if (mf2) IDWriteFontFile_Release(mf2);
+        if (mf) IDWriteFontFile_Release(mf);
+        IDWriteFontSetBuilder2_Release(b); b = NULL;
+        CHECK(SUCCEEDED(IDWriteFactory_UnregisterFontFileLoader(f, (IDWriteFontFileLoader *)mem)));
+        IDWriteInMemoryFontFileLoader_Release(mem); mem = NULL;
+        CHECK(owner.refs == 1);                                       // (the loader and its files gone: the owner let go)
+    }
+    if (b) IDWriteFontSetBuilder2_Release(b);
+    if (mem) IDWriteInMemoryFontFileLoader_Release(mem);
+
+    // WOFF: a single-face font's tables stored, one made-up table compressed; unpacked to the font again
+    BYTE woff2[8] = { 'w', 'O', 'F', '2', 0, 0, 0, 0 };
+    CHECK(IDWriteFactory7_AnalyzeContainerType(f7, woff2, 8) == DWRITE_CONTAINER_TYPE_WOFF2 && IDWriteFactory7_AnalyzeContainerType(f7, bytes, 8) == DWRITE_CONTAINER_TYPE_UNKNOWN);
+    IDWriteFontFace *arial = face_named(sys, L"Arial");
+    UINT32 asize = 0; DWRITE_FONT_FILE_TYPE atype = DWRITE_FONT_FILE_TYPE_UNKNOWN;
+    BYTE *abytes = arial ? face_bytes(arial, &asize, &atype) : NULL;
+    if (abytes && atype == DWRITE_FONT_FILE_TYPE_TRUETYPE) {
+        UINT32 wsize = 0;
+        BYTE *woff = make_woff(abytes, &wsize);
+        CHECK(IDWriteFactory7_AnalyzeContainerType(f7, woff, wsize) == DWRITE_CONTAINER_TYPE_WOFF);
+        IDWriteFontFileStream *st = NULL;
+        CHECK(IDWriteFactory7_UnpackFontFile(f7, DWRITE_CONTAINER_TYPE_WOFF2, woff, wsize, &st) == DWRITE_E_FILEFORMAT && !st);
+        CHECK(SUCCEEDED(IDWriteFactory7_UnpackFontFile(f7, DWRITE_CONTAINER_TYPE_WOFF, woff, wsize, &st)) && st);
+        if (st) {
+            UINT64 n = 0; const void *frag = NULL; void *ctx = NULL;
+            CHECK(SUCCEEDED(IDWriteFontFileStream_GetFileSize(st, &n)) && n > asize && SUCCEEDED(IDWriteFontFileStream_ReadFileFragment(st, &frag, 0, n, &ctx)) && frag);
+            if (frag) {
+                const BYTE *u = frag;
+                UINT32 hl = 0, hl2 = 0, zl = 0;
+                const BYTE *h = table_of(u, (UINT32)n, "head", &hl), *h2 = table_of(abytes, asize, "head", &hl2), *z = table_of(u, (UINT32)n, "zqzq", &zl);
+                CHECK(rd32(u) == rd32(abytes) && rd16(u + 4) == rd16(abytes + 4) + 1);
+                CHECK(h && h2 && hl == hl2 && !memcmp(h, h2, hl));
+                int qs = z && zl == 775;
+                for (UINT32 i = 0; qs && i < zl; i++) qs = z[i] == 'Q';
+                CHECK(qs);
+                // the unpacked font is a font: its face through the in-memory loader maps 'H' as Arial does
+                IDWriteInMemoryFontFileLoader *ml = NULL; IDWriteFontFile *uf = NULL; IDWriteFontFace *uface = NULL;
+                if (SUCCEEDED(IDWriteFactory7_CreateInMemoryFontFileLoader(f7, &ml)) && ml && SUCCEEDED(IDWriteFactory_RegisterFontFileLoader(f, (IDWriteFontFileLoader *)ml)) &&
+                    SUCCEEDED(IDWriteInMemoryFontFileLoader_CreateInMemoryFontFileReference(ml, f, frag, (UINT32)n, NULL, &uf)))
+                    IDWriteFactory_CreateFontFace(f, DWRITE_FONT_FACE_TYPE_TRUETYPE, 1, &uf, 0, DWRITE_FONT_SIMULATIONS_NONE, &uface);
+                CHECK(uface && glyph(uface, 'H') == glyph(arial, 'H') && glyph(uface, 'H') != 0);
+                if (uface) IDWriteFontFace_Release(uface);
+                if (uf) IDWriteFontFile_Release(uf);
+                if (ml) { IDWriteFactory_UnregisterFontFileLoader(f, (IDWriteFontFileLoader *)ml); IDWriteInMemoryFontFileLoader_Release(ml); }
+            }
+            IDWriteFontFileStream_ReleaseFileFragment(st, ctx);
+            IDWriteFontFileStream_Release(st);
+        }
+        // what is not a WOFF file: its header's length not the file's, totalSfntSize not what the tables add up to (or
+        // more than any font needs), the reserved field set, a tag twice, a table's data in the directory
+        UINT32 n0 = rd16(abytes + 4) + 1, dir_end = 44 + 20 * n0;
+        CHECK(unpack_changed(f7, woff, wsize, 8, wsize + 4, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 8, wsize - 4, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 16, rd32(woff + 16) + 4, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 16, rd32(woff + 16) - 4, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 16, 0x7FFFFFFC, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 14, 1, 0) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 44 + 20, rd32(woff + 44), 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 44 + 4, dir_end - 20, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 0, rd32(woff), 1) == S_OK);     // (the copy unchanged: a font)
+        woff[44 + 20 * rd16(abytes + 4) + 8] ^= 0xFF;          // the compressed table's length made wrong: not a font
+        CHECK(IDWriteFactory7_UnpackFontFile(f7, DWRITE_CONTAINER_TYPE_WOFF, woff, wsize, &st) == DWRITE_E_FILEFORMAT && !st);
+        free(woff);
+
+        // a collection whose face lists one table's bytes 64 times more: not a font (it would grow without bound)
+        IDWriteInMemoryFontFileLoader *ml = NULL;
+        if (SUCCEEDED(IDWriteFactory7_CreateInMemoryFontFileLoader(f7, &ml)) && ml && SUCCEEDED(IDWriteFactory_RegisterFontFileLoader(f, (IDWriteFontFileLoader *)ml))) {
+            for (int extra = 0; extra <= 64; extra += 64) {
+                UINT32 tsize = 0;
+                BYTE *ttc = make_ttc(abytes, (UINT32)extra, &tsize);
+                IDWriteFontFile *tf = NULL; IDWriteFontFace *tface = NULL;
+                HRESULT hr = E_FAIL;
+                if (SUCCEEDED(IDWriteInMemoryFontFileLoader_CreateInMemoryFontFileReference(ml, f, ttc, tsize, NULL, &tf)))
+                    hr = IDWriteFactory_CreateFontFace(f, DWRITE_FONT_FACE_TYPE_TRUETYPE_COLLECTION, 1, &tf, 0, DWRITE_FONT_SIMULATIONS_NONE, &tface);
+                if (!extra) CHECK(SUCCEEDED(hr) && tface && glyph(tface, 'H') == glyph(arial, 'H'));
+                else CHECK(hr == DWRITE_E_FILEFORMAT && !tface);
+                if (tface) IDWriteFontFace_Release(tface);
+                if (tf) IDWriteFontFile_Release(tf);
+                free(ttc);
+            }
+            IDWriteFactory_UnregisterFontFileLoader(f, (IDWriteFontFileLoader *)ml);
+        } else CHECK(!"no in-memory loader for a made-up collection");
+        if (ml) IDWriteInMemoryFontFileLoader_Release(ml);
+    } else CHECK(!"no single-face Arial to make a WOFF file of");
+
+    // made-up WOFF files of runs of 'Q': three tables with a copy of the stream each are a font; three or a thousand tables
+    // sharing one stream are not (a stream inflated once per table that names it); 65535 tables sharing a stream that inflates to
+    // 16 MB (a terabyte unpacked), with totalSfntSize as if there were one such table or the most there can be: not a
+    // font, and said at once (nothing inflated)
+    {
+        UINT32 rsize = 0;
+        BYTE *runs = make_runs_woff(3, 3, 0, &rsize);
+        IDWriteFontFileStream *st = NULL;
+        CHECK(SUCCEEDED(IDWriteFactory7_UnpackFontFile(f7, DWRITE_CONTAINER_TYPE_WOFF, runs, rsize, &st)) && st);
+        if (st) {
+            UINT64 n = 0; const void *frag = NULL; void *ctx = NULL;
+            CHECK(SUCCEEDED(IDWriteFontFileStream_GetFileSize(st, &n)) && n == 12 + 16 * 3 + 3 * 776);
+            if (n == 12 + 16 * 3 + 3 * 776 && SUCCEEDED(IDWriteFontFileStream_ReadFileFragment(st, &frag, 0, n, &ctx)) && frag) {
+                const BYTE *u = frag;
+                UINT32 ql = 0;
+                const BYTE *q = table_of(u, (UINT32)n, "qz\0\2", &ql);
+                int qs = rd16(u + 4) == 3 && q && ql == 775;
+                for (UINT32 i = 0; qs && i < ql; i++) qs = q[i] == 'Q';
+                CHECK(qs);
+                IDWriteFontFileStream_ReleaseFileFragment(st, ctx);
+            }
+            IDWriteFontFileStream_Release(st);
+        }
+        free(runs);
+        runs = make_runs_woff(3, 3, 1, &rsize);
+        st = NULL;
+        CHECK(IDWriteFactory7_UnpackFontFile(f7, DWRITE_CONTAINER_TYPE_WOFF, runs, rsize, &st) == DWRITE_E_FILEFORMAT && !st);
+        free(runs);
+        runs = make_runs_woff(1000, 255, 1, &rsize);           // (64 KB each, 64 MB in all: within what a font may be)
+        CHECK(rd32(runs + 16) == 12 + 16 * 1000 + 1000 * 65792);
+        CHECK(unpack_changed(f7, runs, rsize, 0, rd32(runs), 1) == DWRITE_E_FILEFORMAT);
+        free(runs);
+        runs = make_runs_woff(65535, 65536, 1, &rsize);
+        UINT32 one = 12 + 16 * 65535 + ((1 + 258 * 65536 + 3) & ~3u);
+        ULONGLONG t0 = GetTickCount64();
+        CHECK(unpack_changed(f7, runs, rsize, 16, one, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, runs, rsize, 16, rd32(runs + 16), 1) == DWRITE_E_FILEFORMAT);
+        ULONGLONG ms = GetTickCount64() - t0;
+        CHECK(ms < 10000);
+        if (ms >= 10000) printf("a WOFF file of 65535 tables sharing one stream took %llu ms to turn down\n", ms);
+        free(runs);
+    }
+    free(abytes);
+    if (arial) IDWriteFontFace_Release(arial);
+
+    // Fallback: IDWriteFontFallback1 by axis values, and a fallback of the program's own
+    IDWriteFontFallback1 *fb1 = NULL;
+    IDWriteFactory7_GetSystemFontFallback(f7, (IDWriteFontFallback **)&fb1);
+    source jp = { { &src_vtbl }, L"ひらがな", 4 }, latin = { { &src_vtbl }, L"Quiz", 4 }, han = { { &src_vtbl }, L"世", 1 };
+    DWRITE_FONT_AXIS_VALUE normal = { DWRITE_FONT_AXIS_TAG_WEIGHT, 400.0f };
+    if (fb1) {
+        UINT32 mapped = 0; FLOAT scale = 0; IDWriteFontFace5 *mf5 = NULL;
+        CHECK(SUCCEEDED(IDWriteFontFallback1_MapCharacters(fb1, &jp.iface, 0, 4, (IDWriteFontCollection *)sys, L"Helvetica", &normal, 1, &mapped, &scale, &mf5)) &&
+              mf5 && mapped == 4 && scale == 1.0f && glyph((IDWriteFontFace *)mf5, 0x3072));
+        if (mf5) IDWriteFontFace5_Release(mf5);
+        IDWriteFontFallback1_Release(fb1);
+    }
+    IDWriteFontFallbackBuilder *fbb = NULL;
+    CHECK(SUCCEEDED(IDWriteFactory7_CreateFontFallbackBuilder(f7, &fbb)) && fbb);
+    UINT32 hidx = 0; BOOL hex = FALSE;
+    IDWriteFontCollection_FindFamilyName(sys, L"Hiragino Sans", &hidx, &hex);
+    if (fbb && hex) {
+        DWRITE_UNICODE_RANGE kana = { 0x3040, 0x30FF };
+        const WCHAR *targets[2] = { L"No Such Family Xq", L"Hiragino Sans" };
+        CHECK(SUCCEEDED(IDWriteFontFallbackBuilder_AddMapping(fbb, &kana, 1, targets, 2, NULL, NULL, NULL, 1.5f)));
+        CHECK(IDWriteFontFallbackBuilder_AddMapping(fbb, &kana, 1, targets, 2, NULL, NULL, NULL, 0.0f) == E_INVALIDARG);
+        IDWriteFontFallback *own = NULL;
+        CHECK(SUCCEEDED(IDWriteFontFallbackBuilder_CreateFontFallback(fbb, &own)) && own);
+        if (own) {
+            UINT32 mapped = 0; IDWriteFont *mf = NULL; FLOAT scale = 0;
+            CHECK(SUCCEEDED(IDWriteFontFallback_MapCharacters(own, &jp.iface, 0, 4, sys, L"Helvetica", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                                             DWRITE_FONT_STRETCH_NORMAL, &mapped, &mf, &scale)) && mf && mapped == 4 && scale == 1.5f);
+            if (mf) {
+                IDWriteFontFamily *fam = NULL; WCHAR name[64];
+                IDWriteFont_GetFontFamily(mf, &fam);
+                family_name(fam, name, 64);
+                CHECK(!wcscmp(name, L"Hiragino Sans"));
+                if (fam) IDWriteFontFamily_Release(fam);
+                IDWriteFont_Release(mf); mf = NULL;
+            }
+            CHECK(SUCCEEDED(IDWriteFontFallback_MapCharacters(own, &latin.iface, 0, 4, sys, L"Helvetica", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                                             DWRITE_FONT_STRETCH_NORMAL, &mapped, &mf, &scale)) && mf && mapped == 4 && scale == 1.0f);     // the base font
+            if (mf) { IDWriteFont_Release(mf); mf = NULL; }
+            CHECK(SUCCEEDED(IDWriteFontFallback_MapCharacters(own, &han.iface, 0, 1, sys, L"Helvetica", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                                             DWRITE_FONT_STRETCH_NORMAL, &mapped, &mf, &scale)) && !mf && mapped == 1);     // no mapping has it
+            IDWriteFontFallback *sysfb = NULL;
+            IDWriteFactory7_GetSystemFontFallback(f7, &sysfb);
+            IDWriteFontFallbackBuilder *fbb2 = NULL;
+            IDWriteFontFallback *own2 = NULL;
+            if (sysfb && SUCCEEDED(IDWriteFactory7_CreateFontFallbackBuilder(f7, &fbb2)) && fbb2 && SUCCEEDED(IDWriteFontFallbackBuilder_AddMappings(fbb2, own)) &&
+                SUCCEEDED(IDWriteFontFallbackBuilder_AddMappings(fbb2, sysfb)) && SUCCEEDED(IDWriteFontFallbackBuilder_CreateFontFallback(fbb2, &own2)) && own2) {
+                CHECK(SUCCEEDED(IDWriteFontFallback_MapCharacters(own2, &han.iface, 0, 1, sys, L"Helvetica", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                                                 DWRITE_FONT_STRETCH_NORMAL, &mapped, &mf, &scale)) && mf && mapped == 1);     // then the system's
+                if (mf) IDWriteFont_Release(mf);
+            } else CHECK(!"a fallback with the system's after its own");
+            if (own2) IDWriteFontFallback_Release(own2);
+            if (fbb2) IDWriteFontFallbackBuilder_Release(fbb2);
+            if (sysfb) IDWriteFontFallback_Release(sysfb);
+            IDWriteFontFallback_Release(own);
+        }
+    }
+    if (fbb) IDWriteFontFallbackBuilder_Release(fbb);
+
+    // The download queue: always empty; listeners held until removed
+    IDWriteFontDownloadQueue *q = NULL;
+    CHECK(SUCCEEDED(IDWriteFactory7_GetFontDownloadQueue(f7, &q)) && q);
+    if (q) {
+        counted listener = { { &cu_vtbl }, 1 };
+        UINT32 token = 0;
+        CHECK(IDWriteFontDownloadQueue_IsEmpty(q) && IDWriteFontDownloadQueue_BeginDownload(q, NULL) == S_FALSE && IDWriteFontDownloadQueue_GetGenerationCount(q) == 0);
+        CHECK(SUCCEEDED(IDWriteFontDownloadQueue_AddListener(q, (IDWriteFontDownloadListener *)&listener.iface, &token)) && listener.refs == 2);
+        CHECK(SUCCEEDED(IDWriteFontDownloadQueue_RemoveListener(q, token)) && listener.refs == 1 && IDWriteFontDownloadQueue_RemoveListener(q, token) == E_INVALIDARG);
+        IDWriteFontDownloadQueue_Release(q);
+    }
+    IDWriteNumberSubstitution *ns = NULL;
+    CHECK(SUCCEEDED(IDWriteFactory7_CreateNumberSubstitution(f7, DWRITE_NUMBER_SUBSTITUTION_METHOD_NONE, L"en-us", FALSE, &ns)) && ns);
+    if (ns) { IUnknown *u = NULL; CHECK(SUCCEEDED(IDWriteNumberSubstitution_QueryInterface(ns, &IID_IDWriteNumberSubstitution, (void **)&u)) && u); if (u) IUnknown_Release(u); IDWriteNumberSubstitution_Release(ns); }
+
+    // A program's file read for a font set builder without DirectWrite's lock held
+    if (bytes) {
+        mem_loader pl = { { &ml_vtbl }, 1, bytes, nbytes, 0, 1, 0 };
+        IDWriteFontFile *pf = NULL;
+        IDWriteFontSetBuilder2 *pb = NULL;
+        if (SUCCEEDED(IDWriteFactory_RegisterFontFileLoader(f, &pl.iface)) && SUCCEEDED(IDWriteFactory_CreateCustomFontFileReference(f, "MEM1", 4, &pl.iface, &pf)) && pf &&
+            SUCCEEDED(VCALL(f7, IDWriteFactory6_CreateFontSetBuilder)(f7, &pb)) && pb) {
+            probe_calls = probe_stuck = 0;
+            CHECK(SUCCEEDED(pb->lpVtbl->AddFontFile(pb, pf)));
+            CHECK(probe_calls >= 3 && probe_stuck == 0);
+            IDWriteFontFaceReference *pr = NULL;
+            CHECK(SUCCEEDED(IDWriteFactory3_CreateFontFaceReference_(f3, pf, 0, DWRITE_FONT_SIMULATIONS_NONE, &pr)) && pr);
+            if (pr) {
+                FILETIME t;
+                probe_calls = probe_stuck = 0;
+                CHECK(IDWriteFontFaceReference_GetFileTime(pr, &t) == E_NOTIMPL && probe_calls >= 1 && probe_stuck == 0);   // (the test's stream has no time)
+                IDWriteFontFaceReference_Release(pr);
+            }
+        } else CHECK(!"a builder and a program's file");
+        if (pb) IDWriteFontSetBuilder2_Release(pb);
+        if (pf) IDWriteFontFile_Release(pf);
+        IDWriteFactory_UnregisterFontFileLoader(f, &pl.iface);
+        probe_finish();
+    }
+
+    printf("dwrite: newer versions: system font set of %u fonts (Helvetica %u), A-V kerned in %d fonts, vertical variants %s\n",
+           all_fonts, helvetica_fonts, kern_checked, vert_checked ? "found" : "not found");
+    if (c3) IDWriteFontCollection3_Release(c3);
+    if (set) IDWriteFontSet3_Release(set);
+    IDWriteFontFace5_Release(f5);
+    IDWriteFactory7_Release(f7);
+}
+
 int main(void) {
     HANDLE threads[4];
     for (int i = 0; i < 4; i++) threads[i] = CreateThread(NULL, 0, worker, (void *)(INT_PTR)i, 0, NULL);
@@ -310,7 +1156,7 @@ int main(void) {
     CHECK(thread_failures == 0 && thread_glyphs > 50);
     IDWriteFactory *f = NULL;
     IUnknown *unk = NULL;
-    CHECK(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory3, &unk) == E_NOINTERFACE && !unk);
+    CHECK(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory8, &unk) == E_NOINTERFACE && !unk);
     CHECK(SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory, (IUnknown **)&f)) && f);
     if (!f) { printf("dwrite: no factory -> FAILED\n"); return 1; }
     IDWriteFactory *f_again = NULL, *isolated = NULL;
@@ -322,7 +1168,7 @@ int main(void) {
     IDWriteFactory2 *f2 = NULL;
     IUnknown *f3 = (IUnknown *)1;
     CHECK(SUCCEEDED(IDWriteFactory_QueryInterface(f, &IID_IDWriteFactory2, (void **)&f2)) && f2);
-    CHECK(IDWriteFactory_QueryInterface(f, &IID_IDWriteFactory3, (void **)&f3) == E_NOINTERFACE && !f3);
+    CHECK(IDWriteFactory_QueryInterface(f, &IID_IDWriteFactory8, (void **)&f3) == E_NOINTERFACE && !f3);
 
     // The system collection: families with names that find themselves.
     IDWriteFontCollection *sys = NULL;
@@ -392,7 +1238,7 @@ int main(void) {
         IDWriteFontFace1_Release(face1);
     }
     IUnknown *face5 = (IUnknown *)1;
-    CHECK(IDWriteFontFace_QueryInterface(face, &IID_IDWriteFontFace5, (void **)&face5) == E_NOINTERFACE && !face5);
+    CHECK(IDWriteFontFace_QueryInterface(face, &IID_IDWriteFontFace6, (void **)&face5) == E_NOINTERFACE && !face5);
     const void *tdata = NULL; UINT32 tsize = 0; void *tctx = NULL; BOOL texists = FALSE;
     CHECK(SUCCEEDED(IDWriteFontFace_TryGetFontTable(face, DWRITE_MAKE_OPENTYPE_TAG('h', 'e', 'a', 'd'), &tdata, &tsize, &tctx, &texists)));
     CHECK(texists && tsize >= 54 && tdata);
@@ -553,7 +1399,6 @@ int main(void) {
         CHECK(SUCCEEDED(IDWriteFactory_UnregisterFontFileLoader(f, &pl.iface)));
         CHECK(pl.refs == 1 && fragments_out == 0);
         probe_finish();
-        free(bytes);
     }
 
     // Matching: a family with one upright face of normal weight gets bold and oblique simulated.
@@ -735,6 +1580,7 @@ int main(void) {
             renderer r = { { &renderer_vtbl } };
             CHECK(SUCCEEDED(IDWriteTextLayout_Draw(lay, NULL, &r.iface, 10.0f, 20.25f)));
             CHECK(r.runs >= 1 && r.glyphs == 11 && r.positions == 11 && r.faces == 1 && r.face[0] == face);
+            CHECK(r.no_offsets == 0 && r.moved == 0);
             CHECK(r.first_x == 10.0f && r.first_y == roundf(20.25f + m.ascent * k));     // the baseline on a whole pixel
             // narrower: "Hello " and "world" on two lines
             CHECK(SUCCEEDED(IDWriteTextLayout_SetMaxWidth(lay, all - 5.0f)));
@@ -857,6 +1703,8 @@ int main(void) {
         IDWriteGdiInterop_Release(gdi);
     }
 
+    newer_versions(f, sys, face, font, gi, bytes, nbytes);
+    free(bytes);
     if (file) IDWriteFontFile_Release(file);
     IDWriteFontFace_Release(face);
     IDWriteFont_Release(font);
