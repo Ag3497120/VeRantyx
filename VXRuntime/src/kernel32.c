@@ -89,7 +89,12 @@ static WINAPI void ExitProcess(DWORD code) {
 int vx_process_info(HANDLE h, DWORD *code);
 HANDLE vx_process_handle(int pid, int child, HANDLE *second);
 static WINAPI BOOL TerminateProcess(HANDLE h, DWORD code) {
-    if ((intptr_t)h == -1) { ExitProcess(code); return 1; }
+    if ((intptr_t)h == -1) {                                       // (who ends it: ExitProcess below only sees this function)
+        const vx_image *m = vx_image_at((uint64_t)(uintptr_t)VX_RETURN_ADDRESS());
+        vx_log("TerminateProcess(current process, %u) from %s+%#llx", (unsigned)code, m ? m->name : "?",
+               m ? (unsigned long long)((uint8_t *)VX_RETURN_ADDRESS() - m->base) : 0ull);
+        ExitProcess(code); return 1;
+    }
     int pid = vx_process_info(h, NULL);
     if (pid <= 0) { vx_set_last_error(6); return 0; }
     vx_log("TerminateProcess: ending process %d with code %u", pid, (unsigned)code);   // (always: otherwise it just vanishes)

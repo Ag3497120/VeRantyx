@@ -1281,6 +1281,8 @@ int main(int argc, char **argv, char **envp) {
     }
 
     vx_extra_args(&argc, &argv);                   // (VXRT_EXTRA_ARGS: a launcher's arguments for this program, launchargs.c)
+    void vx_handle_server_start(void);
+    vx_handle_server_start();                      // (handles other processes take from this one, or give it: handlexfer.c)
     vx_proc.argc = argc - 1;
     vx_proc.argv = argv + 1;
     vx_profile_start();                            // (after argv: VXRT_PROFILE_FOR names the program)

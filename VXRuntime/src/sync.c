@@ -1236,15 +1236,33 @@ static HANDLE give_to_process(int pid, HANDLE src) {
     if (vx_trace) vx_log("DuplicateHandle: %p to process %d as %#x", src, pid, INJECT_BASE + 4 * k);
     return (HANDLE)(intptr_t)(INJECT_BASE + 4 * k);
 }
+// Giving a handle to another process from outside sync.c (handlexfer.c's server, asked for one of this process's).
+HANDLE vx_give_to_process(int pid, HANDLE src) { return give_to_process(pid, src); }
+HANDLE vx_handle_pull(int pid, HANDLE remote, int close_source);   // handlexfer.c
+HANDLE vx_handle_push_fd(int pid, int fd);
 int vx_process_info(HANDLE h, DWORD *code);
 static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_process, HANDLE *dst, DWORD access, BOOL inherit, DWORD options) {
     (void)access; (void)inherit;
     int src_pid = (intptr_t)src_process == -1 ? getpid() : vx_process_info(src_process, NULL);
     int dst_pid = (intptr_t)dst_process == -1 ? getpid() : vx_process_info(dst_process, NULL);
-    if (src_pid != getpid()) { vx_log("DuplicateHandle from another process is not supported yet"); vx_set_last_error(50); return 0; }
+    if (src_pid != getpid()) {
+        // Out of another process (its handle server, handlexfer.c), into this one; on to a third process from here.
+        if (src_pid <= 0 || !dst) { vx_set_last_error(6); return 0; }
+        HANDLE h = vx_handle_pull(src_pid, src, options & 1 /* DUPLICATE_CLOSE_SOURCE */);
+        if (!h) { vx_log("DuplicateHandle: handle %p of process %d could not be taken", src, src_pid); return 0; }
+        if (dst_pid > 0 && dst_pid != getpid()) {
+            HANDLE there = NULL;
+            BOOL ok = DuplicateHandle((HANDLE)(intptr_t)-1, h, dst_process, &there, access, inherit, 1 /* DUPLICATE_CLOSE_SOURCE */);
+            if (ok) *dst = there;
+            return ok;
+        }
+        *dst = h;
+        return 1;
+    }
     if ((uintptr_t)src >= 0x40000000u && (uintptr_t)src < 0x40004000u) { *dst = src; return 1; }   // a shared resource: the same everywhere
     if (dst_pid > 0 && dst_pid != getpid()) {
-        HANDLE h = give_to_process(dst_pid, src);
+        int fd = vx_handle_fd(src);                               // a descriptor (a pipe end, a file): that process's server
+        HANDLE h = fd >= 0 ? vx_handle_push_fd(dst_pid, fd) : give_to_process(dst_pid, src);
         if (!h) return 0;
         *dst = h;
         if (options & 1 /* DUPLICATE_CLOSE_SOURCE */) CloseHandle(src);
