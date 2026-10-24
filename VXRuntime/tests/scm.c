@@ -24,6 +24,11 @@ int main(void) {
     // What an ordinary user may not do, and what is not there.
     FAILS_WITH(OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS), ERROR_ACCESS_DENIED);
     FAILS_WITH(OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE), ERROR_ACCESS_DENIED);
+    // GENERIC_EXECUTE is SC_MANAGER_CONNECT | SC_MANAGER_LOCK for the manager: the lock is not a user's to take
+    FAILS_WITH(OpenSCManagerW(NULL, NULL, GENERIC_EXECUTE), ERROR_ACCESS_DENIED);
+    FAILS_WITH(OpenSCManagerW(NULL, NULL, SC_MANAGER_LOCK), ERROR_ACCESS_DENIED);
+    SC_HANDLE most = OpenSCManagerW(NULL, NULL, MAXIMUM_ALLOWED);
+    CHECK(most != NULL && CloseServiceHandle(most));
     FAILS_WITH(OpenSCManagerA(NULL, "VxNoSuchDatabase", SC_MANAGER_CONNECT), ERROR_DATABASE_DOES_NOT_EXIST);
     FAILS_WITH(OpenSCManagerW(L"\\\\vx-no-such-machine", NULL, SC_MANAGER_CONNECT), RPC_S_SERVER_UNAVAILABLE);
 
