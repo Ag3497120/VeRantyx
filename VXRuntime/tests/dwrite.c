@@ -338,6 +338,13 @@ static UINT32 zlib_run(BYTE *out, BYTE v, UINT32 k) {           // (out: 32 + 2 
     wr32(out + n, s << 16 | a);                               // Adler-32
     return n + 4;
 }
+// A WOFF file's totalSfntSize: the sfnt header and records, and its tables padded to 4 bytes.
+static void woff_set_total(BYTE *w) {
+    UINT16 n = rd16(w + 12);
+    UINT32 t = 12 + 16 * n;
+    for (UINT16 i = 0; i < n; i++) t += (rd32(w + 44 + 20 * i + 12) + 3) & ~3u;
+    wr32(w + 16, t);
+}
 // A WOFF 1.0 file of a single-face font: its tables stored as they are, and a made-up table 'zqzq' of 775 'Q's
 // compressed.
 static BYTE *make_woff(const BYTE *sfnt, UINT32 *size) {
@@ -361,8 +368,45 @@ static BYTE *make_woff(const BYTE *sfnt, UINT32 *size) {
             memcpy(w + at, z, zn);
         }
     }
+    woff_set_total(w);
     *size = total;
     return w;
+}
+// A made-up WOFF file of count tables (tags 'q', 'z' and the table's number) whose data is a zlib stream of 1 + 258 k
+// 'Q's: one stream all the tables point at (shared), or a copy of it for each. Its totalSfntSize is what the tables add
+// up to (all ones when that does not fit 32 bits).
+static BYTE *make_runs_woff(UINT32 count, UINT32 k, int shared, UINT32 *size) {
+    BYTE *z = malloc(32 + 2 * (size_t)k);
+    UINT32 zn = zlib_run(z, 'Q', k), za = (zn + 3) & ~3u, olen = 1 + 258 * k;
+    UINT32 total = 44 + 20 * count + za * (shared ? 1 : count);
+    BYTE *w = calloc(1, total);
+    memcpy(w, "wOFF", 4); wr32(w + 4, 0x00010000); wr32(w + 8, total); wr16(w + 12, (UINT16)count); wr16(w + 20, 1);
+    UINT64 sfnt = 12 + 16ull * count + (UINT64)count * ((olen + 3) & ~3u);
+    wr32(w + 16, sfnt > 0xFFFFFFFFu ? 0xFFFFFFFFu : (UINT32)sfnt);
+    UINT32 at = 44 + 20 * count;
+    for (UINT32 i = 0; i < count; i++) {
+        BYTE *e = w + 44 + 20 * i;
+        e[0] = 'q'; e[1] = 'z'; e[2] = (BYTE)(i >> 8); e[3] = (BYTE)i;
+        wr32(e + 4, at); wr32(e + 8, zn); wr32(e + 12, olen);
+        if (!shared || !i) memcpy(w + at, z, zn);
+        if (!shared) at += za;
+    }
+    free(z);
+    *size = total;
+    return w;
+}
+// UnpackFontFile (WOFF) of a copy of a WOFF file with one field changed (a u32 at at, or a u16 when wide is 0); a
+// failure that still hands back a stream, or a success without one, counts as E_UNEXPECTED.
+static HRESULT unpack_changed(IDWriteFactory7 *f7, const BYTE *w, UINT32 n, UINT32 at, UINT32 v, int wide) {
+    BYTE *c = malloc(n);
+    memcpy(c, w, n);
+    if (at + (wide ? 4 : 2) <= n) { if (wide) wr32(c + at, v); else wr16(c + at, (UINT16)v); }
+    IDWriteFontFileStream *st = (IDWriteFontFileStream *)(UINT_PTR)1;
+    HRESULT hr = IDWriteFactory7_UnpackFontFile(f7, DWRITE_CONTAINER_TYPE_WOFF, c, n, &st);
+    if (SUCCEEDED(hr)) { if (st && st != (IDWriteFontFileStream *)(UINT_PTR)1) IDWriteFontFileStream_Release(st); else hr = E_UNEXPECTED; }
+    else if (st) hr = E_UNEXPECTED;
+    free(c);
+    return hr;
 }
 static const BYTE *table_of(const BYTE *d, UINT32 n, const char *tag, UINT32 *len) {
     for (UINT16 i = 0; i < rd16(d + 4) && 12 + 16u * (i + 1) <= n; i++) {
@@ -391,6 +435,32 @@ static BYTE *face_bytes(IDWriteFontFace *face, UINT32 *size, DWRITE_FONT_FILE_TY
     if (ld) IDWriteFontFileLoader_Release(ld);
     IDWriteFontFile_Release(file);
     return out;
+}
+// A made-up collection ('ttcf', one face) of a single-face font's tables, its face listing extra more records that
+// each name the font's largest table's bytes again (tags 'z', 'z' and the record's number).
+static BYTE *make_ttc(const BYTE *sfnt, UINT32 extra, UINT32 *size) {
+    UINT16 m = rd16(sfnt + 4);
+    UINT32 dir = 16, at = dir + 12 + 16 * (m + extra), total = at, big = 0, big_at = 0;
+    for (UINT16 i = 0; i < m; i++) total += (rd32(sfnt + 12 + 16 * i + 12) + 3) & ~3u;
+    BYTE *w = calloc(1, total);
+    memcpy(w, "ttcf", 4); wr32(w + 4, 0x00010000); wr32(w + 8, 1); wr32(w + 12, dir);
+    memcpy(w + dir, sfnt, 12); wr16(w + dir + 4, (UINT16)(m + extra));
+    for (UINT16 i = 0; i < m; i++) {
+        const BYTE *r = sfnt + 12 + 16 * i;
+        BYTE *e = w + dir + 12 + 16 * i;
+        UINT32 len = rd32(r + 12);
+        memcpy(e, r, 16); wr32(e + 8, at);
+        memcpy(w + at, sfnt + rd32(r + 8), len);
+        if (len > big) { big = len; big_at = at; }
+        at += (len + 3) & ~3u;
+    }
+    for (UINT32 i = 0; i < extra; i++) {
+        BYTE *e = w + dir + 12 + 16 * (m + i);
+        e[0] = 'z'; e[1] = 'z'; e[2] = (BYTE)(i >> 8); e[3] = (BYTE)i;
+        wr32(e + 8, big_at); wr32(e + 12, big);
+    }
+    *size = total;
+    return w;
 }
 static IDWriteFontFace *face_named(IDWriteFontCollection *c, const WCHAR *family) { return face_of(c, family, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, NULL); }
 static void en_name(IDWriteLocalizedStrings *s, WCHAR *out, UINT32 cap) {
@@ -890,10 +960,85 @@ static void newer_versions(IDWriteFactory *f, IDWriteFontCollection *sys, IDWrit
             IDWriteFontFileStream_ReleaseFileFragment(st, ctx);
             IDWriteFontFileStream_Release(st);
         }
+        // what is not a WOFF file: its header's length not the file's, totalSfntSize not what the tables add up to (or
+        // more than any font needs), the reserved field set, a tag twice, a table's data in the directory
+        UINT32 n0 = rd16(abytes + 4) + 1, dir_end = 44 + 20 * n0;
+        CHECK(unpack_changed(f7, woff, wsize, 8, wsize + 4, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 8, wsize - 4, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 16, rd32(woff + 16) + 4, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 16, rd32(woff + 16) - 4, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 16, 0x7FFFFFFC, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 14, 1, 0) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 44 + 20, rd32(woff + 44), 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 44 + 4, dir_end - 20, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, woff, wsize, 0, rd32(woff), 1) == S_OK);     // (the copy unchanged: a font)
         woff[44 + 20 * rd16(abytes + 4) + 8] ^= 0xFF;          // the compressed table's length made wrong: not a font
         CHECK(IDWriteFactory7_UnpackFontFile(f7, DWRITE_CONTAINER_TYPE_WOFF, woff, wsize, &st) == DWRITE_E_FILEFORMAT && !st);
         free(woff);
+
+        // a collection whose face lists one table's bytes 64 times more: not a font (it would grow without bound)
+        IDWriteInMemoryFontFileLoader *ml = NULL;
+        if (SUCCEEDED(IDWriteFactory7_CreateInMemoryFontFileLoader(f7, &ml)) && ml && SUCCEEDED(IDWriteFactory_RegisterFontFileLoader(f, (IDWriteFontFileLoader *)ml))) {
+            for (int extra = 0; extra <= 64; extra += 64) {
+                UINT32 tsize = 0;
+                BYTE *ttc = make_ttc(abytes, (UINT32)extra, &tsize);
+                IDWriteFontFile *tf = NULL; IDWriteFontFace *tface = NULL;
+                HRESULT hr = E_FAIL;
+                if (SUCCEEDED(IDWriteInMemoryFontFileLoader_CreateInMemoryFontFileReference(ml, f, ttc, tsize, NULL, &tf)))
+                    hr = IDWriteFactory_CreateFontFace(f, DWRITE_FONT_FACE_TYPE_TRUETYPE_COLLECTION, 1, &tf, 0, DWRITE_FONT_SIMULATIONS_NONE, &tface);
+                if (!extra) CHECK(SUCCEEDED(hr) && tface && glyph(tface, 'H') == glyph(arial, 'H'));
+                else CHECK(hr == DWRITE_E_FILEFORMAT && !tface);
+                if (tface) IDWriteFontFace_Release(tface);
+                if (tf) IDWriteFontFile_Release(tf);
+                free(ttc);
+            }
+            IDWriteFactory_UnregisterFontFileLoader(f, (IDWriteFontFileLoader *)ml);
+        } else CHECK(!"no in-memory loader for a made-up collection");
+        if (ml) IDWriteInMemoryFontFileLoader_Release(ml);
     } else CHECK(!"no single-face Arial to make a WOFF file of");
+
+    // made-up WOFF files of runs of 'Q': three tables with a copy of the stream each are a font; three or a thousand tables
+    // sharing one stream are not (a stream inflated once per table that names it); 65535 tables sharing a stream that inflates to
+    // 16 MB (a terabyte unpacked), with totalSfntSize as if there were one such table or the most there can be: not a
+    // font, and said at once (nothing inflated)
+    {
+        UINT32 rsize = 0;
+        BYTE *runs = make_runs_woff(3, 3, 0, &rsize);
+        IDWriteFontFileStream *st = NULL;
+        CHECK(SUCCEEDED(IDWriteFactory7_UnpackFontFile(f7, DWRITE_CONTAINER_TYPE_WOFF, runs, rsize, &st)) && st);
+        if (st) {
+            UINT64 n = 0; const void *frag = NULL; void *ctx = NULL;
+            CHECK(SUCCEEDED(IDWriteFontFileStream_GetFileSize(st, &n)) && n == 12 + 16 * 3 + 3 * 776);
+            if (n == 12 + 16 * 3 + 3 * 776 && SUCCEEDED(IDWriteFontFileStream_ReadFileFragment(st, &frag, 0, n, &ctx)) && frag) {
+                const BYTE *u = frag;
+                UINT32 ql = 0;
+                const BYTE *q = table_of(u, (UINT32)n, "qz\0\2", &ql);
+                int qs = rd16(u + 4) == 3 && q && ql == 775;
+                for (UINT32 i = 0; qs && i < ql; i++) qs = q[i] == 'Q';
+                CHECK(qs);
+                IDWriteFontFileStream_ReleaseFileFragment(st, ctx);
+            }
+            IDWriteFontFileStream_Release(st);
+        }
+        free(runs);
+        runs = make_runs_woff(3, 3, 1, &rsize);
+        st = NULL;
+        CHECK(IDWriteFactory7_UnpackFontFile(f7, DWRITE_CONTAINER_TYPE_WOFF, runs, rsize, &st) == DWRITE_E_FILEFORMAT && !st);
+        free(runs);
+        runs = make_runs_woff(1000, 255, 1, &rsize);           // (64 KB each, 64 MB in all: within what a font may be)
+        CHECK(rd32(runs + 16) == 12 + 16 * 1000 + 1000 * 65792);
+        CHECK(unpack_changed(f7, runs, rsize, 0, rd32(runs), 1) == DWRITE_E_FILEFORMAT);
+        free(runs);
+        runs = make_runs_woff(65535, 65536, 1, &rsize);
+        UINT32 one = 12 + 16 * 65535 + ((1 + 258 * 65536 + 3) & ~3u);
+        ULONGLONG t0 = GetTickCount64();
+        CHECK(unpack_changed(f7, runs, rsize, 16, one, 1) == DWRITE_E_FILEFORMAT);
+        CHECK(unpack_changed(f7, runs, rsize, 16, rd32(runs + 16), 1) == DWRITE_E_FILEFORMAT);
+        ULONGLONG ms = GetTickCount64() - t0;
+        CHECK(ms < 10000);
+        if (ms >= 10000) printf("a WOFF file of 65535 tables sharing one stream took %llu ms to turn down\n", ms);
+        free(runs);
+    }
     free(abytes);
     if (arial) IDWriteFontFace_Release(arial);
 

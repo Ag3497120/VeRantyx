@@ -172,6 +172,7 @@ static WINAPI HRESULT dw_query(void *this, const GUID *iid, void **out) {
 }
 static void *dw_new(size_t size, void **vtbl, const GUID *const *iids, const char *what, void (*destroy)(dw_obj *)) {
     dw_obj *o = calloc(1, size);
+    if (!o) return NULL;
     o->vtbl = vtbl; o->refs = 1; o->iids = iids; o->what = what; o->destroy = destroy;
     return o;
 }
@@ -230,40 +231,64 @@ static int sfnt_table(const uint8_t *d, size_t n, long dir, uint32_t tag, const 
 }
 // A single-face font file from tables (a collection's face, or what CoreText hands out): the bytes, malloc'd.
 typedef struct { uint32_t tag; const uint8_t *data; uint32_t len; } sfnt_part;
-static uint8_t *sfnt_build(uint32_t version, const sfnt_part *t, int count, size_t *size) {
-    size_t total = 12 + 16 * (size_t)count;
-    for (int i = 0; i < count; i++) total += (t[i].len + 3) & ~3u;
-    uint8_t *b = calloc(1, total), *p = b + 12 + 16 * count;
+static uint64_t align4(uint64_t v) { return (v + 3) & ~3ull; }
+// The offset table of an sfnt (OpenType spec): its version, the table count and the binary search fields.
+static void sfnt_header(uint8_t *b, uint32_t version, uint16_t count) {
     int sel = 0;
-    while ((2 << sel) <= count) sel++;
-    uint16_t range = (uint16_t)(16 << sel);
+    while ((2u << sel) <= count) sel++;
+    uint32_t range = count ? 16u << sel : 0, shift = 16u * count - range;
     uint8_t head[12] = { version >> 24, version >> 16, version >> 8, version, count >> 8, count, range >> 8, range, 0, sel,
-                         (uint8_t)((count * 16 - range) >> 8), (uint8_t)(count * 16 - range) };
+                         (uint8_t)(shift >> 8), (uint8_t)shift };
     memcpy(b, head, 12);
+}
+// Table record i for a table whose bytes are already at off (zero padded to 4): tag, checksum, offset, length.
+static void sfnt_record(uint8_t *b, int i, uint32_t tag, uint32_t off, uint32_t len) {
+    uint8_t *r = b + 12 + 16 * i;
+    uint32_t sum = 0;
+    for (uint64_t k = 0; k < align4(len); k += 4) sum += be32(b + off + k);
+    uint32_t fields[4] = { tag, sum, off, len };
+    for (int f = 0; f < 4; f++) { r[4 * f] = fields[f] >> 24; r[4 * f + 1] = fields[f] >> 16; r[4 * f + 2] = fields[f] >> 8; r[4 * f + 3] = fields[f]; }
+}
+// NULL when the memory is not there or the file could not say where its tables are (offsets are 32-bit).
+static uint8_t *sfnt_build(uint32_t version, const sfnt_part *t, int count, size_t *size) {
+    if (count < 0 || count > 0xFFFF) return NULL;
+    uint64_t total = 12 + 16ull * count;
+    for (int i = 0; i < count; i++) total += align4(t[i].len);
+    if (total > UINT32_MAX) return NULL;
+    uint8_t *b = calloc(1, (size_t)total);
+    if (!b) return NULL;
+    sfnt_header(b, version, (uint16_t)count);
+    uint64_t at = 12 + 16ull * count;
     for (int i = 0; i < count; i++) {
-        uint8_t *r = b + 12 + 16 * i;
-        uint32_t sum = 0, off = (uint32_t)(p - b);
-        memcpy(p, t[i].data, t[i].len);
-        for (uint32_t k = 0; k < ((t[i].len + 3) & ~3u); k += 4) sum += be32(p + k);
-        uint32_t fields[4] = { t[i].tag, sum, off, t[i].len };
-        for (int f = 0; f < 4; f++) { r[4 * f] = fields[f] >> 24; r[4 * f + 1] = fields[f] >> 16; r[4 * f + 2] = fields[f] >> 8; r[4 * f + 3] = fields[f]; }
-        p += (t[i].len + 3) & ~3u;
+        if (t[i].len) memcpy(b + at, t[i].data, t[i].len);
+        sfnt_record(b, i, t[i].tag, (uint32_t)at, t[i].len);
+        at += align4(t[i].len);
     }
-    *size = total;
+    *size = (size_t)total;
     return b;
 }
-static uint8_t *sfnt_extract(const uint8_t *d, size_t n, long dir, size_t *size) {
+// One face of a collection as a font file of its own. A face's tables are separate parts of the file, so its records
+// adding up to more bytes than the file has means records sharing data (a font that would grow without bound when
+// rebuilt): not a font.
+static HRESULT sfnt_extract(const uint8_t *d, size_t n, long dir, uint8_t **out, size_t *size) {
+    *out = NULL; *size = 0;
     uint16_t count = be16(d + dir + 4);
     sfnt_part *t = calloc(count ? count : 1, sizeof *t);
+    if (!t) return E_OUTOFMEMORY;
     int k = 0;
+    uint64_t sum = 0;
     for (uint16_t i = 0; i < count; i++) {
         const uint8_t *r = d + dir + 12 + 16 * i;
         uint32_t off = be32(r + 8), l = be32(r + 12);
-        if ((uint64_t)off + l <= n) t[k++] = (sfnt_part){ be32(r), d + off, l };
+        if ((uint64_t)off + l <= n) { t[k++] = (sfnt_part){ be32(r), d + off, l }; sum += l; }
     }
-    uint8_t *b = sfnt_build(be32(d + dir), t, k, size);
+    HRESULT hr = DWRITE_E_FILEFORMAT;
+    if (sum <= n) {
+        *out = sfnt_build(be32(d + dir), t, k, size);
+        hr = *out ? S_OK : E_OUTOFMEMORY;
+    }
     free(t);
-    return b;
+    return hr;
 }
 
 // The 'name' table: the strings of a name ID by language. Windows-platform records (UTF-16BE) with the locale of
@@ -475,6 +500,7 @@ static const GUID *const g_stream_iids[] = { &IID_IDWriteFontFileStream, NULL };
 static void stream_destroy(dw_obj *o) { dw_stream *s = (dw_stream *)o; if (s->holder) dw_release(s->holder); free(s->owned); free(s); }
 static dw_stream *stream_new(const uint8_t *data, size_t size, uint64_t mtime, dw_obj *holder) {
     dw_stream *s = dw_new(sizeof *s, g_stream_vtbl, g_stream_iids, "IDWriteFontFileStream", stream_destroy);
+    if (!s) return NULL;
     s->data = data; s->size = size; s->mtime = mtime; s->holder = holder;
     if (holder) dw_addref(holder);
     return s;
@@ -503,7 +529,7 @@ static WINAPI HRESULT local_CreateStreamFromKey(void *this, const void *key, uin
     if (!m) return DWRITE_E_FILENOTFOUND;
     TR("IDWriteLocalFontFileLoader::CreateStreamFromKey(%s)", path);
     *out = stream_new(m->base, m->size, m->mtime, NULL);
-    return S_OK;
+    return *out ? S_OK : E_OUTOFMEMORY;
 }
 static WINAPI HRESULT local_GetFilePathLengthFromKey(void *this, const void *key, uint32_t size, uint32_t *len) {
     (void)this;
@@ -545,7 +571,7 @@ static WINAPI HRESULT memory_CreateStreamFromKey(void *this, const void *key, ui
     unlock();
     if (!known) return E_INVALIDARG;
     *out = stream_new(CFDataGetBytePtr(f->bytes), (size_t)CFDataGetLength(f->bytes), 0, &f->o);
-    return S_OK;
+    return *out ? S_OK : E_OUTOFMEMORY;
 }
 
 // IDWriteInMemoryFontFileLoader (IDWriteFactory5): bytes the program hands over, copied, or used where they are while
@@ -583,7 +609,7 @@ static WINAPI HRESULT inmem_CreateStreamFromKey(void *this, const void *key, uin
     unlock();
     if (!b) return E_INVALIDARG;
     *out = stream_new(CFDataGetBytePtr(b), (size_t)CFDataGetLength(b), 0, &l->o);
-    return S_OK;
+    return *out ? S_OK : E_OUTOFMEMORY;
 }
 static WINAPI HRESULT inmem_CreateInMemoryFontFileReference(void *this, void *factory, const void *data, uint32_t size, void *owner, void **out) {
     dw_inmem *l = this;
@@ -814,8 +840,11 @@ static HRESULT face_from_file(dw_file *file, uint32_t index, int sims, dw_face *
     if (!faces || dir < 0) return DWRITE_E_FILEFORMAT;
     CFDataRef data;
     if (type == FILE_COLLECTION) {
-        size_t sz; uint8_t *one = sfnt_extract(d, n, dir, &sz);
+        size_t sz; uint8_t *one;
+        HRESULT hr = sfnt_extract(d, n, dir, &one, &sz);
+        if (hr < 0) return hr;
         data = CFDataCreateWithBytesNoCopy(NULL, one, (CFIndex)sz, kCFAllocatorMalloc);
+        if (!data) { free(one); return E_OUTOFMEMORY; }
     } else data = file_cfdata(file);
     if (!data) return DWRITE_E_FILEFORMAT;
     CGDataProviderRef p = CGDataProviderCreateWithCFData(data);
@@ -891,25 +920,35 @@ static dw_file *face_file(dw_face *f) {
         sfnt_part *parts = calloc(n ? (size_t)n : 1, sizeof *parts);
         CFDataRef *keep = calloc(n ? (size_t)n : 1, sizeof *keep);
         int k = 0;
+        if (!parts || !keep) n = 0;
         for (CFIndex i = 0; i < n; i++) {
             uint32_t tag = (uint32_t)(uintptr_t)CFArrayGetValueAtIndex(tags, i);
             CFDataRef d = CTFontCopyTable(f->ct, tag, kCTFontTableOptionNoOptions);
             if (d) { keep[k] = d; parts[k] = (sfnt_part){ tag, CFDataGetBytePtr(d), (uint32_t)CFDataGetLength(d) }; k++; }
         }
-        size_t size;
-        uint8_t *bytes = sfnt_build(f->type == FACE_CFF ? TAG('O', 'T', 'T', 'O') : 0x00010000, parts, k, &size);
+        size_t size = 0;
+        uint8_t *bytes = parts && keep ? sfnt_build(f->type == FACE_CFF ? TAG('O', 'T', 'T', 'O') : 0x00010000, parts, k, &size) : NULL;
         for (int i = 0; i < k; i++) CFRelease(keep[i]);
         free(keep); free(parts);
         if (tags) CFRelease(tags);
-        dw_file *file = dw_new(sizeof *file, g_file_vtbl, g_file_iids, "IDWriteFontFile", NULL);
-        file->kind = F_MEMORY;
-        file->bytes = CFDataCreateWithBytesNoCopy(NULL, bytes, (CFIndex)size, kCFAllocatorMalloc);
-        file->key_size = sizeof(void *);
-        file->key = malloc(sizeof(void *));
-        memcpy(file->key, &file, sizeof(void *));
-        g_memory_files[g_memory_count++] = file;
-        f->file = file;
-        f->index = 0;
+        // (no memory for the tables: the face has no file for now)
+        CFDataRef data = bytes ? CFDataCreateWithBytesNoCopy(NULL, bytes, (CFIndex)size, kCFAllocatorMalloc) : NULL;
+        if (bytes && !data) free(bytes);
+        dw_file *file = data ? dw_new(sizeof *file, g_file_vtbl, g_file_iids, "IDWriteFontFile", NULL) : NULL;
+        void *key = file ? malloc(sizeof(void *)) : NULL;
+        if (key) {
+            file->kind = F_MEMORY;
+            file->bytes = data;
+            file->key_size = sizeof(void *);
+            file->key = key;
+            memcpy(file->key, &file, sizeof(void *));
+            g_memory_files[g_memory_count++] = file;
+            f->file = file;
+            f->index = 0;
+        } else {
+            free(file);
+            if (data) CFRelease(data);
+        }
     }
     unlock();
     return f->file;
@@ -4653,31 +4692,68 @@ static WINAPI uint32_t factory_AnalyzeContainerType(void *this, const void *data
     if (!data || size < 4) return CONTAINER_UNKNOWN;
     return !memcmp(data, "wOFF", 4) ? CONTAINER_WOFF : !memcmp(data, "wOF2", 4) ? CONTAINER_WOFF2 : CONTAINER_UNKNOWN;
 }
-// WOFF 1.0 (W3C): a 44-byte header (signature 'wOFF', the sfnt version, length, u16 table count, u16 reserved, ...)
-// then 20-byte table entries (tag, offset, compressed length, original length, checksum); a table whose compressed
-// length is less than its original length is zlib-compressed.
-static uint8_t *woff_unpack(const uint8_t *d, size_t n, size_t *size) {
-    if (n < 44 || memcmp(d, "wOFF", 4)) return NULL;
-    uint32_t flavor = be32(d + 4);
+// WOFF 1.0 (W3C): a 44-byte header (signature 'wOFF', the sfnt version, the WOFF file's length, u16 table count,
+// u16 reserved (zero), totalSfntSize (the sfnt it unpacks to: header, directory and 4-byte padded tables), version,
+// metadata and private blocks: offset and lengths) then 20-byte table entries (tag, offset, compressed length, original
+// length, checksum); a table whose compressed length is less than its original length is zlib-compressed.
+// Everything is checked before anything is inflated or allocated for the font: the length is the file's, the tables'
+// data lie after the directory and do not overlap, no tag twice, and totalSfntSize is what the tables add up to and at
+// most WOFF_MAX_SFNT, so the font costs at most that much memory however its file is made.
+#define WOFF_MAX_SFNT (128u << 20)
+typedef struct { uint32_t tag, off, clen, olen; } woff_entry;
+static int woff_by_offset(const void *a, const void *b) {
+    const woff_entry *x = a, *y = b;
+    return x->off != y->off ? (x->off < y->off ? -1 : 1) : x->clen != y->clen ? (x->clen < y->clen ? -1 : 1) : 0;
+}
+static int woff_by_tag(const void *a, const void *b) {
+    const woff_entry *x = a, *y = b;
+    return x->tag != y->tag ? (x->tag < y->tag ? -1 : 1) : 0;
+}
+static HRESULT woff_unpack(const uint8_t *d, size_t n, uint8_t **out, size_t *size) {
+    *out = NULL; *size = 0;
+    if (n < 44 || memcmp(d, "wOFF", 4)) return DWRITE_E_FILEFORMAT;
+    uint32_t flavor = be32(d + 4), length = be32(d + 8), total = be32(d + 16);
     uint16_t count = be16(d + 12);
-    if (!count || 44 + 20ull * count > n) return NULL;
-    sfnt_part *parts = calloc(count, sizeof *parts);
-    uint8_t **bufs = calloc(count, sizeof *bufs);
+    uint64_t dir_end = 44 + 20ull * count;
+    if (length != n || be16(d + 14) || !count || dir_end > n || total > WOFF_MAX_SFNT) return DWRITE_E_FILEFORMAT;
+    if ((uint64_t)be32(d + 24) + be32(d + 28) > n || (uint64_t)be32(d + 36) + be32(d + 40) > n) return DWRITE_E_FILEFORMAT;
+    woff_entry *e = malloc(count * sizeof *e);
+    if (!e) return E_OUTOFMEMORY;
+    uint64_t need = 12 + 16ull * count;
     int ok = 1;
     for (uint16_t i = 0; i < count && ok; i++) {
         const uint8_t *r = d + 44 + 20 * i;
-        uint32_t tag = be32(r), off = be32(r + 4), clen = be32(r + 8), olen = be32(r + 12);
-        if ((uint64_t)off + clen > n || clen > olen || olen > (64u << 20)) { ok = 0; break; }
-        if (clen == olen) { parts[i] = (sfnt_part){ tag, d + off, olen }; continue; }
-        uLongf got = olen;
-        bufs[i] = malloc(olen ? olen : 1);
-        if (uncompress(bufs[i], &got, d + off, clen) != Z_OK || got != olen) ok = 0;
-        else parts[i] = (sfnt_part){ tag, bufs[i], olen };
+        e[i] = (woff_entry){ be32(r), be32(r + 4), be32(r + 8), be32(r + 12) };
+        ok = e[i].off >= dir_end && (uint64_t)e[i].off + e[i].clen <= n && e[i].clen <= e[i].olen;
+        need += align4(e[i].olen);
     }
-    uint8_t *out = ok ? sfnt_build(flavor, parts, count, size) : NULL;
-    for (uint16_t i = 0; i < count; i++) free(bufs[i]);
-    free(bufs); free(parts);
-    return out;
+    if (ok && need != total) ok = 0;
+    if (ok) {
+        qsort(e, count, sizeof *e, woff_by_offset);
+        for (uint16_t i = 1; i < count && ok; i++) ok = e[i].off >= (uint64_t)e[i - 1].off + e[i - 1].clen;
+    }
+    if (ok) {
+        qsort(e, count, sizeof *e, woff_by_tag);                // (the sfnt's records in tag order, as OpenType asks)
+        for (uint16_t i = 1; i < count && ok; i++) ok = e[i].tag != e[i - 1].tag;
+    }
+    if (!ok) { free(e); return DWRITE_E_FILEFORMAT; }
+    uint8_t *b = calloc(1, total);
+    if (!b) { free(e); return E_OUTOFMEMORY; }
+    sfnt_header(b, flavor, count);
+    uint64_t at = 12 + 16ull * count;
+    for (uint16_t i = 0; i < count && ok; i++) {
+        if (e[i].clen == e[i].olen) memcpy(b + at, d + e[i].off, e[i].olen);
+        else {
+            uLongf got = e[i].olen;
+            ok = uncompress(b + at, &got, d + e[i].off, e[i].clen) == Z_OK && got == e[i].olen;
+        }
+        if (ok) sfnt_record(b, i, e[i].tag, (uint32_t)at, e[i].olen);
+        at += align4(e[i].olen);
+    }
+    free(e);
+    if (!ok) { free(b); return DWRITE_E_FILEFORMAT; }
+    *out = b; *size = total;
+    return S_OK;
 }
 static WINAPI HRESULT factory_UnpackFontFile(void *this, uint32_t type, const void *data, uint32_t size, void **out) {
     if (!out) return E_INVALIDARG;
@@ -4687,9 +4763,11 @@ static WINAPI HRESULT factory_UnpackFontFile(void *this, uint32_t type, const vo
     if (type == CONTAINER_WOFF2 && actual == CONTAINER_WOFF2) return dw_not_implemented("IDWriteFactory5::UnpackFontFile (WOFF2)");
     if (type != CONTAINER_WOFF || actual != CONTAINER_WOFF) return DWRITE_E_FILEFORMAT;
     size_t n;
-    uint8_t *sfnt = woff_unpack(data, size, &n);
-    if (!sfnt) return DWRITE_E_FILEFORMAT;
+    uint8_t *sfnt;
+    HRESULT hr = woff_unpack(data, size, &sfnt, &n);
+    if (hr < 0) return hr;
     dw_stream *s = stream_new(sfnt, n, 0, NULL);
+    if (!s) { free(sfnt); return E_OUTOFMEMORY; }
     s->owned = sfnt;
     *out = s;
     return S_OK;
