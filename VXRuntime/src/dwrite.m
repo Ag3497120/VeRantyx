@@ -7,14 +7,15 @@
 // metrics, advances and names come from the font's own tables (the OpenType specification), outlines from CoreText,
 // and glyph runs are filled with CoreGraphics into alpha textures. Fonts a program brings (web fonts) come through
 // its own font file loader, read once, and become CGFonts made from their bytes. Font fallback asks CoreText which
-// installed font covers the text (CTFontCreateForStringWithLanguage).
+// installed font covers the text (CTFontCreateForStringWithLanguage). Text formats and layouts (what Steam's own
+// VGUI measures and draws with) lay text out one glyph per character, without shaping; GDI interop's bitmap render
+// target blends glyph runs into a DIB section.
 //
-// Not offered: text formats, layouts and analyzers (IDWriteTextFormat/Layout/Analyzer; Chromium shapes text with
-// HarfBuzz), colour glyphs (TranslateColorGlyphRun answers DWRITE_E_NOCOLOR, so emoji in Apple Color Emoji, which
-// has bitmaps only, draw nothing yet), hinting (CoreText does not hint: grid fitting is always off), ClearType (a
-// 3x1 texture carries the same grayscale coverage in its three subpixels), font sets and IDWriteFactory3 and later
-// (QueryInterface answers E_NOINTERFACE). VXRT_TRACE_DWRITE=1 logs the calls (the first 20 of each method) and the
-// interfaces asked for and not offered.
+// Not offered: text analyzers (IDWriteTextAnalyzer; Chromium shapes text with HarfBuzz), colour glyphs
+// (TranslateColorGlyphRun answers DWRITE_E_NOCOLOR, so emoji in Apple Color Emoji, which has bitmaps only, draw
+// nothing yet), hinting (CoreText does not hint: grid fitting is always off), font sets, and IDWriteFactory3 and
+// later, IDWriteFontFace3 and later, IDWriteFont3 (QueryInterface answers E_NOINTERFACE). VXRT_TRACE_DWRITE=1 logs
+// the calls (the first 20 of each method) and the interfaces asked for and not offered.
 #import <CoreText/CoreText.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <ctype.h>
@@ -1510,7 +1511,7 @@ static WINAPI HRESULT face_GetGlyphRunOutline(void *this, float em, const uint16
     free(s);
     return S_OK;
 }
-// Rendering modes: no hinting and no ClearType here, so the natural modes (outlines from 100 pixels per em up).
+// Rendering modes: no hinting here, so the natural modes (outlines from 100 pixels per em up).
 static int recommended_mode(float pixels, int measuring, void *params);
 static WINAPI HRESULT face_GetRecommendedRenderingMode(void *this, float em, float ppd, uint32_t measuring, void *params, uint32_t *mode) {
     (void)this;
@@ -1671,7 +1672,11 @@ static int recommended_mode(float pixels, int measuring, void *params) {
 }
 
 // ---- IDWriteGlyphRunAnalysis: the run filled into a coverage bitmap once, served as alpha textures -------------------------
-typedef struct { dw_obj o; int aliased, grayscale; RECT bounds; uint8_t *cov; int x0, y0, w, h; float gray_contrast; } dw_analysis;
+// Aliased and grayscale runs: one coverage value per pixel. ClearType runs (antialiased, not grayscale): three per
+// pixel, the run filled at three times the horizontal resolution (DWRITE_TEXTURE_CLEARTYPE_3x1: three bytes per pixel
+// across, one down), each subpixel then averaged with its two neighbours so that a stem on a subpixel boundary does
+// not light a single colour (our choice of filter; DirectWrite's own is not documented).
+typedef struct { dw_obj o; int aliased, grayscale, sub; RECT bounds; uint8_t *cov; int x0, y0, w, h; float gray_contrast; } dw_analysis;
 static const GUID *const g_analysis_iids[] = { &IID_IDWriteGlyphRunAnalysis, NULL };
 static void analysis_destroy(dw_obj *o) { dw_analysis *a = (dw_analysis *)o; free(a->cov); free(a); }
 static HRESULT analysis_new(const glyph_run *run, float ppd, const matrix *m, uint32_t mode, uint32_t aa, float ox, float oy, void **out) {
@@ -1700,20 +1705,22 @@ static HRESULT analysis_new(const glyph_run *run, float ppd, const matrix *m, ui
     dw_analysis *a = dw_new(sizeof *a, g_analysis_vtbl, g_analysis_iids, "IDWriteGlyphRunAnalysis", analysis_destroy);
     a->aliased = mode == MODE_ALIASED;
     a->grayscale = aa == AA_GRAYSCALE;
+    a->sub = a->aliased || a->grayscale ? 1 : 3;
+    int sub = a->sub;
     float bold = f->sims & SIM_BOLD ? run->em * ppd * matrix_scale(m) / 32.0f : 0;
     CGRect box = CGPathGetPathBoundingBox(all);
     if (!CGRectIsEmpty(box) && !CGRectIsNull(box)) {
         int x0 = (int)floor(box.origin.x - bold) - 1, y0 = (int)floor(box.origin.y - bold) - 1;
         int x1 = (int)ceil(box.origin.x + box.size.width + bold) + 1, y1 = (int)ceil(box.origin.y + box.size.height + bold) + 1;
-        if ((int64_t)(x1 - x0) * (y1 - y0) > (64 << 20)) { CGPathRelease(all); dw_release(a); return E_OUTOFMEMORY; }
-        int w = x1 - x0, h = y1 - y0;
-        CGContextRef ctx = CGBitmapContextCreate(NULL, (size_t)w, (size_t)h, 8, 0, NULL, (CGBitmapInfo)kCGImageAlphaOnly);
+        if ((int64_t)(x1 - x0) * (y1 - y0) * sub > (64 << 20)) { CGPathRelease(all); dw_release(a); return E_OUTOFMEMORY; }
+        int w = x1 - x0, h = y1 - y0, ws = w * sub;      // (ws: samples across)
+        CGContextRef ctx = CGBitmapContextCreate(NULL, (size_t)ws, (size_t)h, 8, 0, NULL, (CGBitmapInfo)kCGImageAlphaOnly);
         if (ctx) {
             CGContextSetShouldAntialias(ctx, !a->aliased);
             CGContextSetAllowsAntialiasing(ctx, !a->aliased);
-            // device (x, y down) to the bitmap (its first row is the top one)
+            // device (x, y down) to the bitmap (its first row is the top one; `sub` samples per pixel across)
             CGContextTranslateCTM(ctx, 0, h);
-            CGContextScaleCTM(ctx, 1, -1);
+            CGContextScaleCTM(ctx, sub, -1);
             CGContextTranslateCTM(ctx, -x0, -y0);
             CGContextAddPath(ctx, all);
             CGContextSetGrayFillColor(ctx, 0, 1);
@@ -1721,16 +1728,27 @@ static HRESULT analysis_new(const glyph_run *run, float ppd, const matrix *m, ui
             else CGContextFillPath(ctx);
             const uint8_t *px = CGBitmapContextGetData(ctx);
             size_t stride = CGBitmapContextGetBytesPerRow(ctx);
+            uint8_t *filtered = NULL;
+            if (sub > 1) {                    // each subpixel with its neighbours, (1 1 1) / 3 (the margin keeps the spread inside)
+                filtered = malloc((size_t)ws * h);
+                for (int y = 0; y < h; y++) {
+                    const uint8_t *s = px + (size_t)y * stride;
+                    uint8_t *d = filtered + (size_t)y * ws;
+                    for (int x = 0; x < ws; x++) d[x] = (uint8_t)(((x > 0 ? s[x - 1] : 0) + s[x] + (x + 1 < ws ? s[x + 1] : 0) + 1) / 3);
+                }
+                px = filtered; stride = (size_t)ws;
+            }
             int bx0 = w, by0 = h, bx1 = -1, by1 = -1;
             for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++)
-                    if (px[(size_t)y * stride + x]) { if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; if (y < by0) by0 = y; if (y > by1) by1 = y; }
+                for (int x = 0; x < ws; x++)
+                    if (px[(size_t)y * stride + x]) { int p = x / sub; if (p < bx0) bx0 = p; if (p > bx1) bx1 = p; if (y < by0) by0 = y; if (y > by1) by1 = y; }
             if (bx1 >= 0) {
                 a->x0 = x0 + bx0; a->y0 = y0 + by0; a->w = bx1 - bx0 + 1; a->h = by1 - by0 + 1;
-                a->cov = malloc((size_t)a->w * a->h);
-                for (int y = 0; y < a->h; y++) memcpy(a->cov + (size_t)y * a->w, px + (size_t)(by0 + y) * stride + bx0, (size_t)a->w);
+                a->cov = malloc((size_t)a->w * sub * a->h);
+                for (int y = 0; y < a->h; y++) memcpy(a->cov + (size_t)y * a->w * sub, px + (size_t)(by0 + y) * stride + (size_t)bx0 * sub, (size_t)a->w * sub);
                 a->bounds = (RECT){ a->x0, a->y0, a->x0 + a->w, a->y0 + a->h };
             }
+            free(filtered);
             CGContextRelease(ctx);
         }
     }
@@ -1740,7 +1758,7 @@ static HRESULT analysis_new(const glyph_run *run, float ppd, const matrix *m, ui
     return S_OK;
 }
 // Which textures hold the run: an aliased run the bi-level one, an antialiased run the 3x1 one; a grayscale run
-// both (its one coverage value per pixel is in each).
+// both (its one coverage value per pixel in each, three times over in the 3x1 one).
 static int analysis_serves(dw_analysis *a, uint32_t type) {
     if (type == TEXTURE_ALIASED_1x1) return a->aliased || a->grayscale;
     if (type == TEXTURE_CLEARTYPE_3x1) return !a->aliased;
@@ -1769,9 +1787,9 @@ static WINAPI HRESULT analysis_CreateAlphaTexture(void *this, uint32_t type, con
         for (LONG x = r->left; x < r->right; x++) {
             int sx = x - a->x0;
             if (sx < 0 || sx >= a->w) continue;
-            uint8_t v = a->cov[(size_t)sy * a->w + sx];
+            const uint8_t *v = a->cov + ((size_t)sy * a->w + sx) * a->sub;
             uint8_t *o = out + ((size_t)(y - r->top) * w + (size_t)(x - r->left)) * bpp;
-            for (uint32_t k = 0; k < bpp; k++) o[k] = v;
+            for (uint32_t k = 0; k < bpp; k++) o[k] = v[a->sub > 1 ? k : 0];
         }
     }
     return S_OK;
@@ -2909,7 +2927,8 @@ static WINAPI HRESULT factory_CreateFontFace(void *this, uint32_t type, uint32_t
     *out = f;
     return S_OK;
 }
-// Rendering parameters for this Mac: grayscale (no ClearType level), DirectWrite's usual gamma and contrast.
+// Rendering parameters for this Mac: grayscale (ClearType level 0: a Mac's display has no subpixel order to use),
+// DirectWrite's usual gamma and contrast.
 static WINAPI HRESULT factory_CreateRenderingParams(void *this, void **out) {
     (void)this;
     if (!out) return E_INVALIDARG;
@@ -3148,5 +3167,5 @@ void vx_dwrite_init(void) {
     vx_register_module("dwrite.dll", dwrite_exports, sizeof dwrite_exports / sizeof dwrite_exports[0]);
 }
 #ifdef __aarch64__
-#include "dwrite.m.inc"
+#include "thunks/dwrite.m.inc"
 #endif

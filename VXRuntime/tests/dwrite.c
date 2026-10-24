@@ -172,7 +172,10 @@ static IDWriteFontFace *face_of(IDWriteFontCollection *c, const WCHAR *family, D
 }
 static UINT16 glyph(IDWriteFontFace *f, UINT32 cp) { UINT16 g = 0; IDWriteFontFace_GetGlyphIndices(f, &cp, 1, &g); return g; }
 
-// The pixels with coverage of a glyph run, and the box the outline gives them.
+// The pixels with coverage of a glyph run, and the box the outline gives them. raster_ink: the coverage summed (a
+// pixel's three subpixels as their mean), raster_colour: 3x1 pixels whose subpixels differ.
+static double raster_ink;
+static int raster_colour;
 static int raster(IDWriteFactory2 *f2, IDWriteFactory *f, IDWriteFontFace *face, const UINT16 *g, UINT32 n, float em, DWRITE_RENDERING_MODE mode,
                   int grayscale, DWRITE_TEXTURE_TYPE type, RECT *bounds, int *only_bilevel) {
     DWRITE_GLYPH_RUN run = { face, em, n, g, NULL, NULL, FALSE, 0 };
@@ -185,6 +188,7 @@ static int raster(IDWriteFactory2 *f2, IDWriteFactory *f, IDWriteFontFace *face,
     CHECK(SUCCEEDED(IDWriteGlyphRunAnalysis_GetAlphaTextureBounds(a, type, bounds)));
     int w = bounds->right - bounds->left, h = bounds->bottom - bounds->top, covered = 0, bpp = type == DWRITE_TEXTURE_CLEARTYPE_3x1 ? 3 : 1;
     *only_bilevel = 1;
+    raster_ink = 0; raster_colour = 0;
     if (w > 0 && h > 0) {
         BYTE *buf = malloc((size_t)w * h * bpp);
         CHECK(IDWriteGlyphRunAnalysis_CreateAlphaTexture(a, type, bounds, buf, (UINT32)(w * h * bpp) - 1) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
@@ -193,6 +197,7 @@ static int raster(IDWriteFactory2 *f2, IDWriteFactory *f, IDWriteFontFace *face,
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w * bpp; x++) {
                 BYTE v = buf[(size_t)y * w * bpp + x];
+                raster_ink += v / (double)bpp;
                 if (!v) continue;
                 covered++;
                 if (v != 255) *only_bilevel = 0;
@@ -202,8 +207,9 @@ static int raster(IDWriteFactory2 *f2, IDWriteFactory *f, IDWriteFontFace *face,
                 if (x / bpp == w - 1) right = 1;
             }
         CHECK(top && bottom && left && right);              // the bounds are tight: coverage on each edge
-        if (bpp == 3)                                       // grayscale coverage in each subpixel
-            for (int i = 0; i + 2 < w * h * 3; i += 3) if (buf[i] != buf[i + 1] || buf[i] != buf[i + 2]) { CHECK(!"subpixels differ"); break; }
+        if (bpp == 3)
+            for (int i = 0; i + 2 < w * h * 3; i += 3) raster_colour += buf[i] != buf[i + 1] || buf[i] != buf[i + 2];
+        if (bpp == 3 && grayscale) CHECK(raster_colour == 0);       // grayscale coverage in each subpixel
         free(buf);
     }
     float blend_gamma = 0, blend_contrast = -1, blend_ct = -1;
@@ -566,7 +572,9 @@ int main(void) {
     // Rasterized: "Hello" at 24 DIPs, its baseline at (10, 40).
     RECT r; int bilevel;
     int cov = raster(f2, f, face, gi, 5, 24.0f, DWRITE_RENDERING_MODE_NATURAL, 0, DWRITE_TEXTURE_CLEARTYPE_3x1, &r, &bilevel);
-    CHECK(cov > 50 && !bilevel);
+    double cleartype_ink = raster_ink;
+    int cleartype_colour = raster_colour;
+    CHECK(cov > 50 && !bilevel && raster_colour > 20);              // ClearType: three coverage values per pixel
     CHECK(r.left >= 9 && r.left <= 13 && r.bottom >= 39 && r.bottom <= 42 && r.top < 40 - 14 && r.top > 40 - 24 && r.right > 10 + 40 && r.right < 10 + 24 * 4);
     RECT none;
     CHECK(raster(f2, f, face, gi, 5, 24.0f, DWRITE_RENDERING_MODE_NATURAL, 0, DWRITE_TEXTURE_ALIASED_1x1, &none, &bilevel) == 0 && none.right == none.left);
@@ -576,7 +584,12 @@ int main(void) {
     CHECK(raster(f2, f, face, gi, 5, 24.0f, DWRITE_RENDERING_MODE_ALIASED, 0, DWRITE_TEXTURE_CLEARTYPE_3x1, &none, &bilevel) == 0 && none.right == none.left);
     RECT rg;
     CHECK(raster(f2, f, face, gi, 5, 24.0f, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, 1, DWRITE_TEXTURE_ALIASED_1x1, &rg, &bilevel) > 50 && !bilevel);
-    CHECK(rg.left == r.left && rg.top == r.top && rg.right == r.right && rg.bottom == r.bottom);
+    CHECK(abs(rg.left - r.left) <= 1 && rg.top == r.top && abs(rg.right - r.right) <= 1 && rg.bottom == r.bottom);
+    CHECK(fabs(cleartype_ink - raster_ink) < 0.05 * raster_ink);   // the same ink, spread over subpixels
+    double gray_ink = raster_ink;
+    RECT rg3;
+    CHECK(raster(f2, f, face, gi, 5, 24.0f, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, 1, DWRITE_TEXTURE_CLEARTYPE_3x1, &rg3, &bilevel) > 50 && !bilevel);
+    CHECK(rg3.left == rg.left && rg3.right == rg.right && rg3.top == rg.top && rg3.bottom == rg.bottom);
     UINT16 space = glyph(face, ' ');
     RECT rs;
     CHECK(raster(f2, f, face, &space, 1, 24.0f, DWRITE_RENDERING_MODE_NATURAL, 0, DWRITE_TEXTURE_CLEARTYPE_3x1, &rs, &bilevel) == 0 && rs.right == rs.left);
@@ -749,6 +762,7 @@ int main(void) {
     IDWriteFontCollection_Release(sys);
     IDWriteFactory2_Release(f2);
     IDWriteFactory_Release(f);
-    printf("dwrite: %d families; Hello at 24 DIPs covers %ld x %ld pixels -> %s\n", (int)nfam, r.right - r.left, r.bottom - r.top, failures ? "FAILED" : "ok");
+    printf("dwrite: %d families; Hello at 24 DIPs covers %ld x %ld pixels (ClearType: %d pixels of subpixels apart, ink %.0f vs %.0f grayscale) -> %s\n",
+           (int)nfam, r.right - r.left, r.bottom - r.top, cleartype_colour, cleartype_ink, gray_ink, failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }
