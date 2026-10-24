@@ -185,6 +185,7 @@ static void *map_sized(int fd, size_t size) {
     }
     return MAP_FAILED;
 }
+static __thread int t_die_holding;     // VXRT_TEST_SHLOCK_DIE names this object: end holding its registry's lock
 static name_registry *registry_lock(const char *object_shm) {
     char reg[40];
     snprintf(reg, sizeof reg, "/vxq.%s", object_shm + 1);
@@ -195,16 +196,16 @@ static name_registry *registry_lock(const char *object_shm) {
         int e = errno;
         close(fd);
         if (r == MAP_FAILED) { vx_log("name registry %s: mmap failed (%s)", reg, strerror(e)); return NULL; }
-        while (__atomic_exchange_n(&r->spin, 1, __ATOMIC_ACQUIRE)) sched_yield();
-        if (!r->dead) return r;
-        __atomic_store_n(&r->spin, 0, __ATOMIC_RELEASE);
+        vx_shlock(&r->spin);                                       // (shlock.c: a holder that ended is taken over)
+        if (!r->dead) { if (t_die_holding) _exit(3); return r; }
+        vx_shunlock(&r->spin);
         munmap(r, sizeof *r);
     }
     vx_log("name registry %s: stays dead", reg);
     return NULL;
 }
 static void registry_unlock(name_registry *r) {
-    __atomic_store_n(&r->spin, 0, __ATOMIC_RELEASE);
+    vx_shunlock(&r->spin);
     munmap(r, sizeof *r);
 }
 static int holder_alive(int32_t pid, int me) { return pid == me || !kill(pid, 0) || errno != ESRCH; }
@@ -250,7 +251,9 @@ static shared_state *shared_attach(const char *name, int type, int create, int *
     char shm[40];
     shared_name(name, type, shm, sizeof shm);
     *existed = 0;
+    t_die_holding = vx_shlock_test_name(name);
     int others = vx_name_join(shm);                                // (removes what processes that ended left)
+    t_die_holding = 0;
     if (!others && !create) { vx_name_leave(shm); return NULL; }
     int fd = shm_open(shm, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0) { fd = shm_open(shm, O_RDWR, 0600); if (fd >= 0) *existed = 1; }
@@ -267,8 +270,8 @@ static void shared_detach(shared_state *sh, const char *name, int type) {
     vx_name_leave(shm);
     munmap(sh, 4096);
 }
-static void spin_lock(shared_state *sh) { while (__atomic_exchange_n(&sh->spin, 1, __ATOMIC_ACQUIRE)) sched_yield(); }
-static void spin_unlock(shared_state *sh) { __atomic_store_n(&sh->spin, 0, __ATOMIC_RELEASE); }
+static void spin_lock(shared_state *sh) { vx_shlock(&sh->spin); }
+static void spin_unlock(shared_state *sh) { vx_shunlock(&sh->spin); }
 static void shared_changed(shared_state *sh) {
     __atomic_add_fetch(&sh->seq, 1, __ATOMIC_ACQ_REL);
     if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&sh->seq, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
@@ -1273,10 +1276,10 @@ static HANDLE give_to_process(int pid, HANDLE src) {
     }
     inbox *b = inbox_open(pid);
     if (!b) { vx_set_last_error(8); return NULL; }
-    while (__atomic_exchange_n(&b->spin, 1, __ATOMIC_ACQUIRE)) sched_yield();
+    vx_shlock(&b->spin);
     uint32_t k = b->next++ % INJECT_COUNT;
     b->e[k] = e;
-    __atomic_store_n(&b->spin, 0, __ATOMIC_RELEASE);
+    vx_shunlock(&b->spin);
     munmap(b, sizeof *b);
     if (vx_trace) vx_log("DuplicateHandle: %p to process %d as %#x", src, pid, INJECT_BASE + 4 * k);
     return (HANDLE)(intptr_t)(INJECT_BASE + 4 * k);

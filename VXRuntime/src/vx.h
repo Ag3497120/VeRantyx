@@ -177,6 +177,11 @@ void   vx_release_semaphore(HANDLE sem, LONG n);   // ReleaseSemaphore for them 
 // A handle's object as NtQueryObject describes it (sync.c): see there. vx_handle_count: the handles of the table.
 int    vx_handle_object(HANDLE h, const void **id, const char **type, int *kind, char *name, size_t cap, DWORD *handles);
 DWORD  vx_handle_count(void);
+// Spin locks in memory shared between processes (shlock.c): the word holds the holder's pid, and a lock left by a
+// process that ended holding it is taken over. vx_shlock_test_name: VXRT_TEST_SHLOCK_DIE (tests/shlock.c).
+void   vx_shlock(volatile uint32_t *word);
+void   vx_shunlock(volatile uint32_t *word);
+int    vx_shlock_test_name(const char *name);
 
 // Diagnostics (stderr); VXRT_TRACE=1 also logs every implemented call that opts in.
 void vx_log(const char *fmt, ...);

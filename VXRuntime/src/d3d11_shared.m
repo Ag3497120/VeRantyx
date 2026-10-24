@@ -58,7 +58,7 @@ static shared_table *table(void) {
 static int take_slot(void) {
     shared_table *t = table();
     if (!t) return -1;
-    while (__atomic_exchange_n(&t->spin, 1, __ATOMIC_ACQUIRE)) sched_yield();
+    vx_shlock(&t->spin);
     // Slots are taken in turn, not the lowest free one: a handle freed (or left by a process that ended) is given out
     // again only after all others, as Windows never hands out a released handle at once. Otherwise another process
     // that still knows the old handle (SteamVR's compositor caches the textures it opened) takes the new texture for
@@ -73,7 +73,7 @@ static int take_slot(void) {
         memset(&t->s[found], 0, sizeof t->s[found]); t->s[found].used = 1; t->s[found].creator = getpid();
         t->next = (uint32_t)(found + 1) % SLOTS;
     }
-    __atomic_store_n(&t->spin, 0, __ATOMIC_RELEASE);
+    vx_shunlock(&t->spin);
     return found;
 }
 void d3d_shared_release(int slot) {
