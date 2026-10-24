@@ -34,6 +34,8 @@ def arg(p, i):
     if p["cls"] == "float": return f"vx_arg_f(c, {i})"
     if p["cls"] == "double": return f"vx_arg_d(c, {i})"
     if p["cls"] == "rec8": return f"({{ {p['type']} v_; uint64_t s_ = vx_arg(c, {i}); memcpy(&v_, &s_, sizeof v_); v_; }})"
+    # a record of another size (msxml's VARIANT, 24 bytes): x64 passes a pointer to a copy the caller made
+    if p["cls"].startswith("recref"): return f"(*({p['type']} *)(uintptr_t)vx_low(vx_arg(c, {i})))"
     if p["kind"] in (112, 114): return f"(void *)(uintptr_t)vx_low(vx_arg(c, {i}))"
     if p["cls"] != "int": raise SystemExit(f"cannot pass {p}")
     if p["kind"] == 101: return f"({p['type']})(uintptr_t)vx_low(vx_arg(c, {i}))"
