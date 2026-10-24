@@ -287,7 +287,7 @@ static HANDLE create_file(const char *name, DWORD access, DWORD disposition, DWO
         return INVALID_HANDLE;
     }
     if (fd >= 0x10000) { close(fd); vx_set_last_error(4); return INVALID_HANDLE; }   // (handles 0x10000 + fd)
-    if (trace && trace_opens_all()) vx_log("CreateFile(%s, access %#x, disposition %u): %s", name, access, disposition, writes ? "for writing" : "opened");
+    if (trace && trace_opens_all()) vx_log("CreateFile(%s, access %#x, disposition %u): %s, handle %#x", name, access, disposition, writes ? "for writing" : "opened", 0x10000 + fd);
     vx_set_last_error(existed && (disposition == 2 || disposition == 4) ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
     return (HANDLE)(intptr_t)(0x10000 + fd);
 }

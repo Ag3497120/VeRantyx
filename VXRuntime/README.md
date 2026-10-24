@@ -25,6 +25,7 @@ VXRT_DLL_PATH=/prefix/drive_c/windows/system32 ...   # also loads DLLs (the VC++
 VXRT_TRACE_PIPES=1 ...                     # every named-pipe message, with its first bytes
 VXRT_TRACE_NAMES=1 ...                     # processes joining and leaving named objects and mappings
 VXRT_TRACE_CALLS=200 ...                   # every call into the runtime (arguments, result, last error), 200 per function
+VXRT_TRACE_CALLS_ONLY=CreateFileW,LockFileEx ...   # with VXRT_TRACE_CALLS: only these functions (a browser's file calls)
 VXRT_PRESENT_SNAPSHOT=f.png VXRT_PRESENT_SNAPSHOT_AT=300 ...   # the 300th present's back buffer as a PNG
 VXRT_TRACE_KEYED=1 VXRT_SHARED_SNAPSHOT=f.png ...              # keyed mutex traffic; shared textures as PNGs at a ReleaseSync
 VXRT_TRACE_DRAWS=trigger VXRT_DRAW_SNAPSHOT=<ps hash>:prefix ... # 300 draws after the trigger file appears; a pixel shader's inputs as PNGs
