@@ -139,8 +139,12 @@ static uint8_t *version_block(const char *name, uint32_t *length) {
     if (vx_pe_inspect(data, size, &pe) && vx_pe_version_resource(data, size, &pe, &offset, &len) && len >= 6 &&
         (out = malloc(len))) {
         memcpy(out, data + offset, len);
-        uint16_t wlength = rd16(out);                      // (the resource can be longer than its root block)
-        *length = wlength >= 6 && wlength <= len ? wlength : len;
+        // The root block's wLength is the length (the resource can be longer than its root block). A root that says
+        // it is longer than the resource is no version information: VerQueryValue finds its way and the room for the
+        // ANSI strings by the root's wLength, and the buffer GetFileVersionInfoSize asks for must cover both.
+        uint16_t wlength = rd16(out);
+        if (wlength >= 6 && wlength <= len) *length = wlength;
+        else { free(out); out = NULL; }
     }
     munmap(data, size);
     if (!out) vx_set_last_error(ERROR_RESOURCE_TYPE_NOT_FOUND);
@@ -186,7 +190,11 @@ static WINAPI BOOL GetFileVersionInfoExW(DWORD flags, const WCHAR *f, DWORD h, D
 static WINAPI BOOL GetFileVersionInfoExA(DWORD flags, const char *f, DWORD h, DWORD n, void *d) { (void)flags; (void)h; return get_info(f, n, d); }
 
 // ---- VerQueryValue ---------------------------------------------------------------------------------------------------------------------
-typedef struct { size_t at, end, value, children; uint16_t value_length, type; } vblock;
+// A block as read: value_length is wValueLength as the file has it; value_bytes the value's size in bytes
+// (wValueLength characters for text, bytes otherwise) cut to the block's own end. A wrong wValueLength (a byte count
+// for text, as some resource tools write, or a malformed file) then never reads or writes past the block: everything
+// that uses the value goes by value_bytes.
+typedef struct { size_t at, end, value, value_bytes, children; uint16_t value_length, type; } vblock;
 static int read_block(const uint8_t *b, size_t at, size_t limit, vblock *out) {
     if (at + 6 > limit) return 0;
     uint16_t length = rd16(b + at);
@@ -198,7 +206,9 @@ static int read_block(const uint8_t *b, size_t at, size_t limit, vblock *out) {
     out->value_length = rd16(b + at + 2); out->type = rd16(b + at + 4);
     out->value = align4(c + 2);
     size_t bytes = out->type == 1 ? 2 * (size_t)out->value_length : out->value_length;
-    if (out->value > end || bytes > end - out->value) bytes = out->value <= end ? end - out->value : 0;
+    if (out->value > end) { out->value = end; bytes = 0; }
+    if (bytes > end - out->value) bytes = end - out->value;
+    out->value_bytes = bytes;
     out->children = align4(out->value + bytes);
     if (out->children > end) out->children = end;
     return 1;
@@ -238,28 +248,31 @@ static BOOL query(const void *block, const char *sub, void **out, DWORD *n, int 
     if (out) *out = NULL;
     if (n) *n = 0;
     if (!b || !sub || !out || !find_path(b, sub, &k)) { vx_set_last_error(ERROR_RESOURCE_TYPE_NOT_FOUND); return 0; }
-    if (!k.value_length) { vx_set_last_error(ERROR_RESOURCE_TYPE_NOT_FOUND); return 0; }
-    if (k.type != 1) {                                     // binary: VS_FIXEDFILEINFO, Translation; the length in bytes
+    // The length reported: bytes for binary values (VS_FIXEDFILEINFO, Translation), characters for text; what the
+    // block holds, not more (see vblock).
+    size_t length = k.type == 1 ? k.value_bytes / 2 : k.value_bytes;
+    if (!k.value_length || !length) { vx_set_last_error(ERROR_RESOURCE_TYPE_NOT_FOUND); return 0; }
+    if (k.type != 1 || !ansi) {
         *out = (void *)(b + k.value);
-        if (n) *n = k.value_length;
-        return 1;
-    }
-    if (!ansi) {                                           // text: the length in characters
-        *out = (void *)(b + k.value);
-        if (n) *n = k.value_length;
+        if (n) *n = (DWORD)length;
         return 1;
     }
     size_t area = align4(rd16(b));
     uint32_t magic;
     memcpy(&magic, b + area, 4);
     if (magic != CONVERTED_MAGIC) { vx_set_last_error(ERROR_INSUFFICIENT_BUFFER); return 0; }
-    char *s = (char *)b + area + 2 * k.value;              // (room: 4 bytes per UTF-16 unit; the area starts with the magic)
-    size_t units = k.value_length;
+    // This value's room in the area: twice its bytes in the block, from twice its offset. The value lies inside the
+    // root block (k.value + k.value_bytes <= the root's wLength), so the room lies inside the 2 x wLength bytes
+    // GetFileVersionInfoSize asked for after the block, and no two values' rooms overlap; the magic is before the
+    // first (k.value >= 8). 4 bytes per UTF-16 unit, of which UTF-8 needs at most 3: the NUL always fits.
+    char *s = (char *)b + area + 2 * k.value;
+    size_t room = 2 * k.value_bytes, units = k.value_bytes / 2;
     while (units && rd16(b + k.value + 2 * (units - 1)) == 0) units--;
     WCHAR *w = malloc(2 * (units + 1));
+    if (!w) { vx_set_last_error(8 /* ERROR_NOT_ENOUGH_MEMORY */); return 0; }
     for (size_t i = 0; i < units; i++) w[i] = rd16(b + k.value + 2 * i);
-    size_t len = vx_utf16_to_utf8(w, units, s, 4 * units);
-    if (len > 4 * units) len = 4 * units;
+    size_t len = vx_utf16_to_utf8(w, units, s, room - 1);
+    if (len > room - 1) len = room - 1;
     s[len] = 0;
     free(w);
     *out = s;

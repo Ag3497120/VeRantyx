@@ -787,6 +787,36 @@ static view *g_views; static int g_view_count, g_view_cap;
 static pthread_mutex_t g_views_lock = PTHREAD_MUTEX_INITIALIZER;
 #define FILE_MAP_COPY  0x1
 #define FILE_MAP_WRITE 0x2
+#define FILE_MAP_READ  0x4
+#define FILE_MAP_EXECUTE 0x20
+// Whether a handle with the access `granted` (SECTION_*) may map the view `access` (FILE_MAP_*), as Microsoft's "File
+// Mapping Security and Access Rights" and MapViewOfFile pages put it: FILE_MAP_WRITE "allows mapping of read-only,
+// copy-on-write, or read/write views", and FILE_MAP_WRITE | FILE_MAP_READ and FILE_MAP_ALL_ACCESS are the same as
+// FILE_MAP_WRITE. So a view with the write bit (FILE_MAP_ALL_ACCESS too) needs SECTION_MAP_WRITE; a read-only or
+// copy-on-write one SECTION_MAP_READ or SECTION_MAP_WRITE; FILE_MAP_EXECUTE also SECTION_MAP_EXECUTE.
+static int view_allowed(DWORD access, DWORD granted) {
+    if (access & FILE_MAP_WRITE) { if (!(granted & SECTION_MAP_WRITE)) return 0; }
+    else if (access & (FILE_MAP_READ | FILE_MAP_COPY)) { if (!(granted & (SECTION_MAP_READ | SECTION_MAP_WRITE))) return 0; }
+    if ((access & FILE_MAP_EXECUTE) && !(granted & SECTION_MAP_EXECUTE)) return 0;
+    return 1;
+}
+// A copy-on-write view (FILE_MAP_COPY) of paging-file memory: macOS maps a POSIX shared memory object only shared
+// (MAP_PRIVATE gives EINVAL), so the view is private memory with the object's bytes copied in when it is mapped.
+// (Windows copies a page when the view first writes it; until then this copy does not see later writes through
+// other views.)
+static void *private_copy_view(mapping *m, uint64_t offset, size_t bytes, void *addr) {
+    void *p = mmap(addr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) return MAP_FAILED;
+    size_t have = offset < m->size ? (size_t)(m->size - offset) : 0;
+    if (have > bytes) have = bytes;
+    if (have) {
+        void *src = mmap(NULL, have, PROT_READ, MAP_SHARED, m->fd, (off_t)offset);
+        if (src == MAP_FAILED) { int e = errno; munmap(p, bytes); errno = e; return MAP_FAILED; }
+        memcpy(p, src, have);
+        munmap(src, have);
+    }
+    return p;
+}
 static WINAPI void *MapViewOfFileEx(HANDLE h, DWORD access, DWORD high, DWORD low, size_t bytes, void *addr) {
     mapping *m = vx_handle_data(h, VX_HANDLE_MAPPING);
     if (!m) { vx_set_last_error(6); return NULL; }
@@ -795,13 +825,10 @@ static WINAPI void *MapViewOfFileEx(HANDLE h, DWORD access, DWORD high, DWORD lo
     // FILE_MAP_ALL_ACCESS (0xf001f) contains the FILE_MAP_COPY bit; copy-on-write means FILE_MAP_COPY alone.
     int copy = (access & 0xffff) == FILE_MAP_COPY;
     DWORD granted;                                                 // the handle's access, where recorded (sync.c)
-    if (vx_handle_access(h, &granted)) {
-        DWORD need = copy ? SECTION_MAP_READ : ((access & FILE_MAP_WRITE) ? SECTION_MAP_WRITE : 0) |
-                     ((access & 0x4) ? SECTION_MAP_READ : 0) | ((access & 0x20) ? SECTION_MAP_EXECUTE : 0);
-        if (need & ~granted) { vx_set_last_error(5 /* ERROR_ACCESS_DENIED */); return NULL; }
-    }
+    if (vx_handle_access(h, &granted) && !view_allowed(access, granted)) { vx_set_last_error(5 /* ERROR_ACCESS_DENIED */); return NULL; }
     int prot = PROT_READ | ((access & FILE_MAP_WRITE) || copy ? PROT_WRITE : 0);
     void *p = mmap(addr, bytes, prot, copy ? MAP_PRIVATE : MAP_SHARED, m->fd, (off_t)offset);
+    if (p == MAP_FAILED && copy && errno == EINVAL && m->shm[0]) p = private_copy_view(m, offset, bytes, addr);
     if (p == MAP_FAILED) { set_error_from_errno(); return NULL; }
     pthread_mutex_lock(&g_views_lock);
     if (g_view_count == g_view_cap) { g_view_cap = g_view_cap ? g_view_cap * 2 : 32; g_views = realloc(g_views, g_view_cap * sizeof *g_views); }

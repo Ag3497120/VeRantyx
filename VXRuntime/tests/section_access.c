@@ -1,6 +1,7 @@
 // What a file mapping handle may do (src/sync.c "what a handle may do", src/files.c): DuplicateHandle gives the access
 // asked for (or the source's with DUPLICATE_SAME_ACCESS) and never more than the source has; MapViewOfFile needs the
-// handle's map rights; OpenFileMapping gives the access asked for. Chromium's read-only shared memory: a handle
+// handle's map rights (the write right maps read-only, copy-on-write and read/write views; FILE_MAP_ALL_ACCESS is a
+// write view); OpenFileMapping gives the access asked for. Chromium's read-only shared memory: a handle
 // duplicated with FILE_MAP_READ | SECTION_QUERY must not become writable again (Steam's web helper CHECKs it).
 #include <windows.h>
 #include <stdio.h>
@@ -72,6 +73,44 @@ int main(void) {
     HANDLE opened_rw = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, L"Local\\vxrt-section-access-test");
     void *ok = opened_rw ? MapViewOfFile(opened_rw, FILE_MAP_WRITE, 0, 0, 0) : NULL;
     CHECK(ok != NULL, "a writable view through a FILE_MAP_ALL_ACCESS open failed, error %lu", GetLastError());
+
+    // FILE_MAP_WRITE allows read-only, copy-on-write and read/write views, and FILE_MAP_ALL_ACCESS and
+    // FILE_MAP_READ | FILE_MAP_WRITE are the same as FILE_MAP_WRITE (Microsoft's MapViewOfFile page): a handle opened
+    // or duplicated with FILE_MAP_WRITE alone maps them all.
+    HANDLE write_only = OpenFileMappingW(FILE_MAP_WRITE, FALSE, L"Local\\vxrt-section-access-test");
+    CHECK(write_only != NULL, "OpenFileMapping(FILE_MAP_WRITE) failed, error %lu", GetLastError());
+    HANDLE write_dup = named ? dup(named, FILE_MAP_WRITE, 0) : NULL;
+    CHECK(write_dup != NULL, "DuplicateHandle(FILE_MAP_WRITE) failed, error %lu", GetLastError());
+    static const DWORD write_views[] = { FILE_MAP_READ, FILE_MAP_COPY, FILE_MAP_ALL_ACCESS, FILE_MAP_READ | FILE_MAP_WRITE, FILE_MAP_WRITE };
+    HANDLE write_handles[] = { write_only, write_dup };
+    for (int i = 0; i < 2; i++) {
+        for (unsigned j = 0; write_handles[i] && j < sizeof write_views / sizeof write_views[0]; j++) {
+            SetLastError(0);
+            char *v = MapViewOfFile(write_handles[i], write_views[j], 0, 0, 0);
+            CHECK(v != NULL, "%s handle, view %#lx: error %lu", i ? "FILE_MAP_WRITE duplicated" : "FILE_MAP_WRITE opened",
+                  write_views[j], GetLastError());
+            if (v && j) v[0] = 'x';                     // (each view but the read-only one is writable or copy-on-write)
+            if (v) UnmapViewOfFile(v);
+        }
+    }
+    // A FILE_MAP_READ handle: read-only and copy-on-write views, not write or FILE_MAP_ALL_ACCESS ones.
+    if (ok) strcpy(ok, "made-up named bytes");
+    char *copy = opened ? MapViewOfFile(opened, FILE_MAP_COPY, 0, 0, 0) : NULL;
+    CHECK(copy != NULL, "a copy-on-write view through a FILE_MAP_READ open failed, error %lu", GetLastError());
+    if (copy) {                                                    // the section's bytes; its own writes stay its own
+        CHECK(!strcmp(copy, "made-up named bytes"), "copy-on-write view reads %.20s", copy);
+        copy[0] = 'M';
+        CHECK(!ok || ((char *)ok)[0] == 'm', "a write to a copy-on-write view reached the section");
+        UnmapViewOfFile(copy);
+    }
+    SetLastError(0);
+    bad = opened ? MapViewOfFile(opened, FILE_MAP_ALL_ACCESS, 0, 0, 0) : NULL;
+    CHECK(bad == NULL && GetLastError() == ERROR_ACCESS_DENIED, "a FILE_MAP_ALL_ACCESS view through a FILE_MAP_READ open (%p)", bad);
+    // FILE_MAP_EXECUTE needs the execute right, which FILE_MAP_WRITE does not give.
+    SetLastError(0);
+    bad = write_only ? MapViewOfFile(write_only, FILE_MAP_READ | FILE_MAP_EXECUTE, 0, 0, 0) : NULL;
+    CHECK(bad == NULL && GetLastError() == ERROR_ACCESS_DENIED, "an executable view through a FILE_MAP_WRITE open (%p)", bad);
+    CloseHandle(write_dup); CloseHandle(write_only);
 
     if (ok) UnmapViewOfFile(ok);
     if (pm) UnmapViewOfFile(pm);
