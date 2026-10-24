@@ -4,7 +4,10 @@
 // class with public fields, ProtectedData (a round trip; a wrong entropy is a CryptographicException) and the
 // DateTime constructor, String.Format(string, params object[]), isinst of an array against IEnumerable, and
 // Delegate.Combine / Remove with a multicast Invoke, and a P/Invoke (a DllImport method of this assembly whose DLL
-// and entry point the stubs below hand out: integers and a string marshalled, the result returned). The assembly is built here
+// and entry point the stubs below hand out: integers and a string marshalled, the result returned), a valuetype array
+// whose elements are written and read through ldelema + stfld/ldfld (a fresh element is the struct's zero value), stfld
+// on a null reference (a NullReferenceException the program catches) and ldtoken of an array TypeSpec (typeof(Entry[])).
+// The assembly is built here
 // from bytes (no compiler for it): a class Test with a static int field Count and one static method per case, each
 // returning what the case should leave (or failing with "unhandled managed exception ...").
 #include "dotnet_metadata.h"
@@ -100,6 +103,22 @@ static const uint8_t code_serialize[] = { 0x73, 3, 0, 0, 0x0a, 0x73, 0x19, 0, 0,
 static const uint8_t code_protect[] = { 0x1b, 0x8d, 4, 0, 0, 1, 0x25, 0x16, 0x1f, 0x07, 0x9c, 0x14, 0x16, 0x28, 6, 0, 0, 0x0a,
                                         0x14, 0x16, 0x28, 7, 0, 0, 0x0a, 0x16, 0x91, 0x2a };
 // try { Unprotect(Protect(data), new byte[1]) ; return 1 } catch (Exception) { return 2 }   (another entropy: refused)
+// Entry[] a (Entry a struct { long Quantity; double Time; }): a[2].Quantity = 40; a[2].Time = 1.5; a[3].Quantity = 2;
+// return a[2].Quantity + a[3].Quantity + a[1].Quantity + (a[2].Time == 1.5)         -> 43 (a[1] was never written: 0)
+#define ENTRY_AT(i) 0x02, i, 0x8f, 6, 0, 0, 2                                  /* ldarg.0; ldc.i4.N; ldelema Entry */
+#define R8_1_5 0x23, 0, 0, 0, 0, 0, 0, 0xf8, 0x3f                              /* ldc.r8 1.5 */
+static const uint8_t code_value_array_of[] = { ENTRY_AT(0x18), 0x1f, 40, 0x6a, 0x7d, 4, 0, 0, 4,
+                                               ENTRY_AT(0x18), R8_1_5, 0x7d, 5, 0, 0, 4,
+                                               ENTRY_AT(0x19), 0x18, 0x6a, 0x7d, 4, 0, 0, 4,
+                                               ENTRY_AT(0x18), 0x7b, 4, 0, 0, 4, ENTRY_AT(0x19), 0x7b, 4, 0, 0, 4, 0x58,
+                                               ENTRY_AT(0x17), 0x7b, 4, 0, 0, 4, 0x58,
+                                               ENTRY_AT(0x18), 0x7b, 5, 0, 0, 4, R8_1_5, 0xfe, 0x01, 0x6a, 0x58, 0x69, 0x2a };
+// ValueArrayOf(new Entry[4])
+static const uint8_t code_value_array[] = { 0x1a, 0x8d, 6, 0, 0, 2, 0x28, 28, 0, 0, 6, 0x2a };
+// try { ((Entry)null).Quantity = 1 } catch (Exception) { return 2 } return 1         -> 2
+static const uint8_t code_stfld_null[] = { 0x14, 0x17, 0x6a, 0x7d, 4, 0, 0, 4, 0xde, 0x03, 0x26, 0xde, 0x02, 0x17, 0x2a, 0x18, 0x2a };
+// ldtoken Entry[] (TypeSpec 1); pop; return 1
+static const uint8_t code_typespec_token[] = { 0xd0, 1, 0, 0, 0x1b, 0x26, 0x17, 0x2a };
 static const uint8_t code_entropy[] = { 0x1b, 0x8d, 4, 0, 0, 1, 0x14, 0x16, 0x28, 6, 0, 0, 0x0a, 0x17, 0x8d, 4, 0, 0, 1, 0x16, 0x28, 7, 0, 0, 0x0a,
                                         0x26, 0xde, 0x03, 0x26, 0xde, 0x02, 0x17, 0x2a, 0x18, 0x2a };
 
@@ -130,11 +149,16 @@ static const method methods[] = {
     { "PInvokeSum", code_psum, sizeof code_psum, 1, { { 0 } }, 0 },
     { "Sum", NULL, 0, 1, { { 0 } }, 0 },                                          // the DllImport: no body, MethodDef 23
     { ".ctor", code_impl_ctor, sizeof code_impl_ctor, 0, { { 0 } }, 0 },      // Impl::.ctor, MethodDef 24
-    { ".ctor", code_impl_ctor, sizeof code_impl_ctor, 0, { { 0 } }, 0 },      // Data::.ctor, MethodDef 25 (last)
+    { ".ctor", code_impl_ctor, sizeof code_impl_ctor, 0, { { 0 } }, 0 },      // Data::.ctor, MethodDef 25
+    // the static methods of the struct Entry, from MethodDef 26
+    { "ValueArray", code_value_array, sizeof code_value_array, 1, { { 0 } }, 0 },
+    { "StfldNull", code_stfld_null, sizeof code_stfld_null, 1, { { 0, 0, 10, 10, 3, EXCEPTION_TYPE } }, 1 },
+    { "ValueArrayOf", code_value_array_of, sizeof code_value_array_of, 1, { { 0 } }, 0 },   // MethodDef 28: int32(Entry[])
+    { "TypeSpecToken", code_typespec_token, sizeof code_typespec_token, 1, { { 0 } }, 0 },
 };
 #define NMETHODS (sizeof methods / sizeof methods[0])
 
-static const char strings[] = "\0<Module>\0Fixture\0Test\0Count\0Mark\0Reset\0Catch\0Finally\0Nested\0Thrower\0Cross\0Rethrow\0Uncaught\0Mismatch\0Derived\0Iface\0NotIface\0SerializeData\0DateTimeCtor\0FormatArray\0ArrayEnumerable\0DelegateCombine\0DelegateRemove\0PInvokeSum\0Sum\0fake.dll\0Action\0Delegate\0Invoke\0Combine\0Remove\0IEnumerable\0System.Collections\0Format\0DateTime\0TimeSpan\0Subtract\0get_TotalSeconds\0ProtectRound\0ProtectEntropy\0IGreeter\0Impl\0Data\0Name\0Flag\0.ctor\0System\0Exception\0ArgumentException\0Object\0mscorlib\0Byte\0String\0ProtectedData\0DataProtectionScope\0Protect\0Unprotect\0System.Security.Cryptography\0System.Security\0JavaScriptSerializer\0Serialize\0get_Length\0System.Web.Script.Serialization\0System.Web.Extensions\0";
+static const char strings[] = "\0<Module>\0Fixture\0Test\0Count\0Mark\0Reset\0Catch\0Finally\0Nested\0Thrower\0Cross\0Rethrow\0Uncaught\0Mismatch\0Derived\0Iface\0NotIface\0SerializeData\0DateTimeCtor\0FormatArray\0ArrayEnumerable\0DelegateCombine\0DelegateRemove\0PInvokeSum\0Sum\0fake.dll\0Action\0Delegate\0Invoke\0Combine\0Remove\0IEnumerable\0System.Collections\0Format\0DateTime\0TimeSpan\0Subtract\0get_TotalSeconds\0ProtectRound\0ProtectEntropy\0Entry\0Quantity\0Time\0ValueType\0ValueArray\0ValueArrayOf\0StfldNull\0TypeSpecToken\0IGreeter\0Impl\0Data\0Name\0Flag\0.ctor\0System\0Exception\0ArgumentException\0Object\0mscorlib\0Byte\0String\0ProtectedData\0DataProtectionScope\0Protect\0Unprotect\0System.Security.Cryptography\0System.Security\0JavaScriptSerializer\0Serialize\0get_Length\0System.Web.Script.Serialization\0System.Web.Extensions\0";
 static uint16_t sidx(const char *value) {
     for (const char *entry = strings + 1; *entry || entry < strings + sizeof strings - 1; entry += strlen(entry) + 1)
         if (!strcmp(entry, value)) return (uint16_t)(entry - strings);
@@ -143,7 +167,7 @@ static uint16_t sidx(const char *value) {
 }
 
 static uint8_t *make_assembly(size_t *length) {
-    const size_t size = 0x1800;
+    const size_t size = 0x2000;
     uint8_t *image = calloc(1, size);
     CHECK(image, "allocation failed");
     image[0] = 'M'; image[1] = 'Z'; put32(image + 0x3c, 0x80);
@@ -157,25 +181,25 @@ static uint8_t *make_assembly(size_t *length) {
     put32(section + 8, (uint32_t)size - 0x200); put32(section + 12, 0x1000);
     put32(section + 16, (uint32_t)size - 0x200); put32(section + 20, 0x200);
 
-    // method bodies from file offset 0xa00, 4-aligned; fat headers when there are clauses (or locals), else tiny
+    // method bodies from file offset 0xc00, 4-aligned; fat headers when there are clauses (or locals), else tiny
     uint32_t body_rva[NMETHODS];
-    uint32_t at = 0xa00;
+    uint32_t at = 0xc00;
     for (size_t i = 0; i < NMETHODS; i++) {
         at = align4(at);
         body_rva[i] = 0x1000 + (at - 0x200);
         const method *m = &methods[i];
         if (!m->code) { body_rva[i] = 0; continue; }                 // a P/Invoke has no body
-        if (!m->clause_count) {
-            CHECK(m->length < 64, "tiny body too long");
+        if (!m->clause_count && m->length < 64) {
             image[at++] = (uint8_t)(m->length << 2 | 2);
             memcpy(image + at, m->code, m->length); at += m->length;
         } else {
-            put16(image + at, 0x301b);                       // fat, more sections, init locals, header 3 dwords
+            put16(image + at, m->clause_count ? 0x301b : 0x3013);   // fat, (more sections,) init locals, header 3 dwords
             put16(image + at + 2, 4);                        // max stack
             put32(image + at + 4, m->length);
             put32(image + at + 8, 0);                        // no locals
             at += 12;
             memcpy(image + at, m->code, m->length); at = align4(at + m->length);
+            if (!m->clause_count) continue;
             image[at] = 0x01;                                // an exception table, small format
             image[at + 1] = (uint8_t)(4 + 12 * m->clause_count);
             at += 4;
@@ -187,7 +211,7 @@ static uint8_t *make_assembly(size_t *length) {
             }
         }
     }
-    CHECK(at < 0x1700, "bodies overflow the fixture");
+    CHECK(at < 0x1f00, "bodies overflow the fixture");
 
     uint8_t *cor = image + 0x200;
     put32(cor, 72); put16(cor + 4, 2); put16(cor + 6, 5);
@@ -208,17 +232,21 @@ static uint8_t *make_assembly(size_t *length) {
                                     6, 0, 2, 0x0e, 0x0e, 0x1d, 0x1c,             // 60: static string(string, object[])
                                     5, 0x20, 2, 1, 0x1c, 0x18,                   // 67: instance void(object, native int)
                                     8, 0, 2, 0x12, (13 << 2) | 1, 0x12, (13 << 2) | 1, 0x12, (13 << 2) | 1,     // 73: static Delegate(Delegate, Delegate)
-                                    6, 0, 3, 8, 8, 8, 0x0e };                    // 82: static int32(int32, int32, string)
+                                    6, 0, 3, 8, 8, 8, 0x0e,                      // 82: static int32(int32, int32, string)
+                                    2, 6, 0x0a, 2, 6, 0x0d,                      // 89: field int64; 92: field float64
+                                    3, 0x1d, 0x11, 6 << 2,                       // 95: Entry[] (SZARRAY valuetype TypeDef 6)
+                                    6, 0, 1, 8, 0x1d, 0x11, 6 << 2 };            // 99: static int32(Entry[])
     const uint8_t sig_int = 1, sig_void = 5, sig_ctor = 9, sig_field = 13, sig_field_string = 16, sig_field_bool = 19,
-                  sig_serialize = 22, sig_length = 27, sig_protect = 31, sig_ctor_iii = 42, sig_subtract = 49, sig_total = 56, sig_format = 60, sig_delegate_ctor = 67, sig_combine = 73, sig_sum = 82;
+                  sig_serialize = 22, sig_length = 27, sig_protect = 31, sig_ctor_iii = 42, sig_subtract = 49, sig_total = 56, sig_format = 60, sig_delegate_ctor = 67, sig_combine = 73, sig_sum = 82,
+                  sig_field_long = 89, sig_field_double = 92, spec_entry_array = 95, sig_value_array_of = 99;
 
     uint8_t tb[2048] = { 0 };
     tb[4] = 2; tb[7] = 1;
-    const int present[] = { 0, 1, 2, 4, 6, 9, 10, 26, 28, 32, 35 };
+    const int present[] = { 0, 1, 2, 4, 6, 9, 10, 26, 27, 28, 32, 35 };
     uint64_t valid = 0;
     for (size_t i = 0; i < sizeof present / sizeof present[0]; i++) valid |= 1ull << present[i];
     put64(tb + 8, valid);
-    const uint32_t counts[] = { 1, 13, 5, 3, NMETHODS, 1, 15, 1, 1, 1, 3 };
+    const uint32_t counts[] = { 1, 14, 6, 5, NMETHODS, 1, 15, 1, 1, 1, 1, 3 };
     size_t p = 24;
     for (size_t i = 0; i < sizeof counts / sizeof counts[0]; i++) { put32(tb + p, counts[i]); p += 4; }
     // Module
@@ -237,21 +265,27 @@ static uint8_t *make_assembly(size_t *length) {
     put16(tb + p, 6); put16(tb + p + 2, sidx("IEnumerable")); put16(tb + p + 4, sidx("System.Collections")); p += 6;    // 11
     put16(tb + p, 6); put16(tb + p + 2, sidx("Action")); put16(tb + p + 4, sidx("System")); p += 6;                     // 12
     put16(tb + p, 6); put16(tb + p + 2, sidx("Delegate")); put16(tb + p + 4, sidx("System")); p += 6;                   // 13
+    put16(tb + p, 6); put16(tb + p + 2, sidx("ValueType")); put16(tb + p + 4, sidx("System")); p += 6;                  // 14
     // TypeDef: <Module>, Fixture.Test (all the static methods but the last), Fixture.IGreeter (interface), Fixture.Impl (its .ctor)
     put32(tb + p, 0); put16(tb + p + 4, sidx("<Module>")); put16(tb + p + 6, 0); put16(tb + p + 8, 0); put16(tb + p + 10, 1); put16(tb + p + 12, 1); p += 14;
     put32(tb + p, 1); put16(tb + p + 4, sidx("Test")); put16(tb + p + 6, sidx("Fixture")); put16(tb + p + 8, (3 << 2) | 1); put16(tb + p + 10, 1); put16(tb + p + 12, 1); p += 14;
-    put32(tb + p, 0xa1); put16(tb + p + 4, sidx("IGreeter")); put16(tb + p + 6, sidx("Fixture")); put16(tb + p + 8, 0); put16(tb + p + 10, 2); put16(tb + p + 12, NMETHODS - 1); p += 14;
-    put32(tb + p, 1); put16(tb + p + 4, sidx("Impl")); put16(tb + p + 6, sidx("Fixture")); put16(tb + p + 8, (3 << 2) | 1); put16(tb + p + 10, 2); put16(tb + p + 12, NMETHODS - 1); p += 14;
-    put32(tb + p, 1); put16(tb + p + 4, sidx("Data")); put16(tb + p + 6, sidx("Fixture")); put16(tb + p + 8, (3 << 2) | 1); put16(tb + p + 10, 2); put16(tb + p + 12, NMETHODS); p += 14;
+    put32(tb + p, 0xa1); put16(tb + p + 4, sidx("IGreeter")); put16(tb + p + 6, sidx("Fixture")); put16(tb + p + 8, 0); put16(tb + p + 10, 2); put16(tb + p + 12, 24); p += 14;
+    put32(tb + p, 1); put16(tb + p + 4, sidx("Impl")); put16(tb + p + 6, sidx("Fixture")); put16(tb + p + 8, (3 << 2) | 1); put16(tb + p + 10, 2); put16(tb + p + 12, 24); p += 14;
+    put32(tb + p, 1); put16(tb + p + 4, sidx("Data")); put16(tb + p + 6, sidx("Fixture")); put16(tb + p + 8, (3 << 2) | 1); put16(tb + p + 10, 2); put16(tb + p + 12, 25); p += 14;
+    // Fixture.Entry: a sealed sequential struct (extends System.ValueType, TypeRef 14) with fields 4-5 and methods 26-
+    put32(tb + p, 0x109); put16(tb + p + 4, sidx("Entry")); put16(tb + p + 6, sidx("Fixture")); put16(tb + p + 8, (14 << 2) | 1); put16(tb + p + 10, 4); put16(tb + p + 12, 26); p += 14;
     // Field: public static int Count
     put16(tb + p, 0x16); put16(tb + p + 2, sidx("Count")); put16(tb + p + 4, sig_field); p += 6;
     put16(tb + p, 0x06); put16(tb + p + 2, sidx("Name")); put16(tb + p + 4, sig_field_string); p += 6;       // Data.Name
     put16(tb + p, 0x06); put16(tb + p + 2, sidx("Flag")); put16(tb + p + 4, sig_field_bool); p += 6;         // Data.Flag
+    put16(tb + p, 0x06); put16(tb + p + 2, sidx("Quantity")); put16(tb + p + 4, sig_field_long); p += 6;     // Entry.Quantity
+    put16(tb + p, 0x06); put16(tb + p + 2, sidx("Time")); put16(tb + p + 4, sig_field_double); p += 6;       // Entry.Time
     // MethodDef: public static
     for (size_t i = 0; i < NMETHODS; i++) {
         const int is_ctor = !strcmp(methods[i].name, ".ctor"), is_pinvoke = !methods[i].code;
         put32(tb + p, body_rva[i]); put16(tb + p + 4, 0); put16(tb + p + 6, is_ctor ? 0x1886 : is_pinvoke ? 0x2093 : 0x16);
-        put16(tb + p + 8, sidx(methods[i].name)); put16(tb + p + 10, is_ctor ? sig_ctor : is_pinvoke ? sig_sum : methods[i].returns_int ? sig_int : sig_void); put16(tb + p + 12, 1);
+        put16(tb + p + 8, sidx(methods[i].name)); put16(tb + p + 10, is_ctor ? sig_ctor : is_pinvoke ? sig_sum :
+                                    !strcmp(methods[i].name, "ValueArrayOf") ? sig_value_array_of : methods[i].returns_int ? sig_int : sig_void); put16(tb + p + 12, 1);
         p += 14;
     }
     // InterfaceImpl: Impl (TypeDef 4) implements IGreeter (TypeDef 3: (3 << 2) | 0)
@@ -274,6 +308,7 @@ static uint8_t *make_assembly(size_t *length) {
     put16(tb + p, (13 << 3) | 1); put16(tb + p + 2, sidx("Remove")); put16(tb + p + 4, sig_combine); p += 6;           // 15
     // ModuleRef: fake.dll; ImplMap: Sum (MethodDef 23) -> fake.dll!Sum, winapi + ANSI
     put16(tb + p, sidx("fake.dll")); p += 2;
+    put16(tb + p, spec_entry_array); p += 2;                                                                   // TypeSpec 1: Entry[]
     put16(tb + p, 0x0102); put16(tb + p + 2, (23 << 1) | 1); put16(tb + p + 4, sidx("Sum")); put16(tb + p + 6, 1); p += 8;
     // Assembly, AssemblyRef (mscorlib)
     put32(tb + p, 0); put16(tb + p + 4, 1); put16(tb + p + 18, sidx("Fixture")); p += 22;
@@ -305,7 +340,7 @@ static uint8_t *make_assembly(size_t *length) {
     memset(root + guid_offset, 0x5a, 16);
     memcpy(root + us_offset, user_strings, sizeof user_strings);
     put32(cor + 12, us_offset + (uint32_t)sizeof user_strings);          // the metadata's size
-    CHECK(0x300 + us_offset + sizeof user_strings < 0xa00, "metadata overflows into the bodies");
+    CHECK(0x300 + us_offset + sizeof user_strings < 0xc00, "metadata overflows into the bodies");
     *length = size;
     return image;
 }
@@ -329,6 +364,7 @@ int main(void) {
         { "SerializeData", 1, 26, NULL }, { "ProtectRound", 1, 7, NULL }, { "ProtectEntropy", 1, 2, NULL },
         { "DateTimeCtor", 1, 1, NULL }, { "FormatArray", 1, 12, NULL }, { "ArrayEnumerable", 1, 1, NULL },
         { "DelegateCombine", 1, 2, NULL }, { "DelegateRemove", 1, 1, NULL }, { "PInvokeSum", 1, 13, NULL },
+        { "ValueArray", 1, 43, NULL }, { "StfldNull", 1, 2, NULL }, { "TypeSpecToken", 1, 1, NULL },
     };
     int failed = 0;
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
@@ -343,7 +379,7 @@ int main(void) {
         failed += !good;
     }
     printf("dotnet exceptions: catch, finally on leave and on unwinding, nesting, a call boundary, rethrow, a derived class, "
-           "unhandled and mismatched, isinst against an interface, Serialize of a data class, ProtectedData, DateTime constructor, String.Format with an array, an array as IEnumerable, multicast delegates, P/Invoke: %s\n", failed ? "FAILED" : "ok");
+           "unhandled and mismatched, isinst against an interface, Serialize of a data class, ProtectedData, DateTime constructor, String.Format with an array, an array as IEnumerable, multicast delegates, P/Invoke, a valuetype array through ldelema + stfld/ldfld, stfld on null, ldtoken of an array TypeSpec: %s\n", failed ? "FAILED" : "ok");
     free(image);
     return failed ? 1 : 0;
 }

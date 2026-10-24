@@ -4969,6 +4969,66 @@ static int resolve_field_reference(clr_runtime *rt, clr_module *caller, uint32_t
     return 0;
 }
 
+// A TypeDef that is a value type (ECMA-335 II.13: a class extending System.ValueType; enums are integers here).
+static int type_definition_is_value_type(clr_module *module, uint32_t type_token) {
+    uint32_t extends, rid = type_token & 0x00ffffffu;
+    if (!module || !module->metadata || (type_token >> 24) != 2 || !rid ||
+        !vx_dotnet_column(module->metadata, 2, rid - 1, 3, &extends) || !extends) return 0;
+    uint32_t tag = extends & 3u, parent_rid = extends >> 2;
+    if (!parent_rid || tag > 1) return 0;
+    const char *parent_namespace, *parent_name;
+    return vx_dotnet_type_name(module->metadata, (tag == 0 ? 0x02000000u : 0x01000000u) | parent_rid,
+                               &parent_namespace, &parent_name) &&
+           !strcmp(parent_namespace, "System") && !strcmp(parent_name, "ValueType");
+}
+
+// The instance an ldfld/ldflda/stfld works on (ECMA-335 III.4.10, 4.11, 4.28): an object reference, or a managed pointer
+// to a value-type instance. Value-type instances are objects here, so a pointer to storage that still holds a value
+// type's zero default (an element of a fresh valuetype array reached by ldelema, a struct field never written) gets a
+// zero-initialized instance of the field's declaring type in place, which is what that storage means. A null object
+// reference is the program's NullReferenceException; anything else fails with a diagnostic naming the instruction.
+static clr_object *field_instruction_target(clr_runtime *rt, clr_module *module, clr_value target,
+                                            const clr_field_ref *field, const char *opcode_name) {
+    if (target.kind == V_REF) {
+        if (target.bits) return (clr_object *)(uintptr_t)target.bits;
+        clr_throw(rt, module, "System", "NullReferenceException", "Object reference not set to an instance of an object.");
+        return NULL;
+    }
+    if (target.kind != V_MANAGED_PTR && target.kind != V_FIELD_PTR) {
+        set_error(rt, "%s of field %08x received a value of kind %d, not an object or a managed pointer",
+                  opcode_name, field->token, (int)target.kind);
+        return NULL;
+    }
+    clr_value referenced;
+    if (!target.bits || !managed_pointer_get(rt, target, &referenced)) {
+        if (!rt->error || !rt->error[0])
+            set_error(rt, "%s of field %08x received an unreadable managed pointer", opcode_name, field->token);
+        return NULL;
+    }
+    if (referenced.kind == V_REF && referenced.bits) return (clr_object *)(uintptr_t)referenced.bits;
+    uint32_t owner_token;
+    const char *owner_namespace, *owner_name;
+    if (referenced.bits || !field_owner_type(field->module, field->token, &owner_token) ||
+        !type_definition_is_value_type(field->module, owner_token) ||
+        !vx_dotnet_type_name(field->module->metadata, owner_token, &owner_namespace, &owner_name)) {
+        if (!referenced.bits && referenced.kind == V_REF) {
+            clr_throw(rt, module, "System", "NullReferenceException", "Object reference not set to an instance of an object.");
+            return NULL;
+        }
+        set_error(rt, "%s of field %08x received a managed pointer to a value of kind %d that is not a value-type instance",
+                  opcode_name, field->token, (int)referenced.kind);
+        return NULL;
+    }
+    clr_object *instance = new_object(rt, field->module, owner_token, owner_namespace, owner_name);
+    if (!instance) return NULL;
+    if (!managed_pointer_set(rt, target, (clr_value){ .bits = (uintptr_t)instance, .kind = V_REF })) {
+        if (!rt->error || !rt->error[0])
+            set_error(rt, "%s of field %08x could not initialize the value type its pointer refers to", opcode_name, field->token);
+        return NULL;
+    }
+    return instance;
+}
+
 static int type_init_slot(clr_runtime *rt, clr_module *module, uint32_t type_token,
                           clr_type_init **out) {
     for (uint32_t i = 0; i < module->initialized_type_count; i++) {
@@ -20531,10 +20591,18 @@ eh_resume:
             string->string_data = text; string->string_units = units;
             if (!push(stack, &depth, stack_limit, (clr_value){ .bits = (uintptr_t)string, .kind = V_REF })) goto bad_stack;
         } else if (op == 0x00d0) { // ldtoken TypeDef / TypeRef / TypeSpec
-            uint32_t type_token = read32(ins->operand);
+            // (a TypeSpec need not name a class: typeof(T[]) is an SZARRAY TypeSpec; the handle keeps the token and
+            // what reads it later resolves what it supports, failing with its own diagnostic otherwise)
+            uint32_t type_token = read32(ins->operand), type_spec_blob, type_spec_length;
+            const uint8_t *type_spec;
             const char *type_namespace, *type_name;
-            if (((type_token >> 24) != 1 && (type_token >> 24) != 2 && (type_token >> 24) != 0x1b) ||
-                !vx_dotnet_type_name(module->metadata, type_token, &type_namespace, &type_name)) {
+            int resolved = ((type_token >> 24) == 1 || (type_token >> 24) == 2 || (type_token >> 24) == 0x1b) &&
+                           vx_dotnet_type_name(module->metadata, type_token, &type_namespace, &type_name);
+            if (!resolved && (type_token >> 24) == 0x1b && (type_token & 0x00ffffffu) &&
+                vx_dotnet_column(module->metadata, 27, (type_token & 0x00ffffffu) - 1, 0, &type_spec_blob) &&
+                vx_dotnet_blob(module->metadata, type_spec_blob, &type_spec, &type_spec_length) && type_spec_length)
+                resolved = 1;
+            if (!resolved) {
                 set_error(rt, "unsupported or invalid CIL ldtoken operand %08x in %s.%s",
                           type_token, method.type_name, method.name);
                 goto failed;
@@ -20559,7 +20627,8 @@ eh_resume:
                     set_error(rt, "ldfld references static field token %08x", field_token); goto failed;
                 }
                 clr_object *object;
-                if (!pop(stack, &depth, &a) || !(object = managed_pointer_object(rt, a)) ||
+                if (!pop(stack, &depth, &a)) goto bad_stack;
+                if (!(object = field_instruction_target(rt, module, a, &field, "ldfld")) ||
                     !object_field_get(rt, object,
                                       field.module, field.token, &value) ||
                     !push(stack, &depth, stack_limit, value)) goto failed;
@@ -20568,7 +20637,8 @@ eh_resume:
                     set_error(rt, "ldflda references static field token %08x", field_token); goto failed;
                 }
                 clr_object *object;
-                if (!pop(stack, &depth, &a) || !(object = managed_pointer_object(rt, a))) goto bad_stack;
+                if (!pop(stack, &depth, &a)) goto bad_stack;
+                if (!(object = field_instruction_target(rt, module, a, &field, "ldflda"))) goto failed;
                 value = managed_field_address(rt, object, field.module, field.token);
                 if (!value.bits || !push(stack, &depth, stack_limit, value)) goto failed;
             } else if (op == 0x007d) {
@@ -20576,9 +20646,9 @@ eh_resume:
                     set_error(rt, "stfld references static field token %08x", field_token); goto failed;
                 }
                 clr_object *object;
-                if (!pop(stack, &depth, &value) || !pop(stack, &depth, &a) ||
-                    !(object = managed_pointer_object(rt, a)) || !object_field_set(rt, object,
-                                      field.module, field.token, value)) goto failed;
+                if (!pop(stack, &depth, &value) || !pop(stack, &depth, &a)) goto bad_stack;
+                if (!(object = field_instruction_target(rt, module, a, &field, "stfld")) ||
+                    !object_field_set(rt, object, field.module, field.token, value)) goto failed;
             } else if (op == 0x007e) { // ldsfld
                 if (!(field.flags & 0x0010)) {
                     set_error(rt, "ldsfld references instance field token %08x", field_token); goto failed;
