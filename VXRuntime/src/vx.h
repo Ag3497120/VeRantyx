@@ -234,6 +234,7 @@ void vx_winmisc_init(void);            // smaller user32 functions: IsChild, Def
 void vx_region_init(void);             // GDI regions: rectangles combined, compared, listed (region.c)
 void vx_shlpath_init(void);            // shlwapi path strings: PathFindFileName, PathMatchSpec, ... (shlpath.c)
 void vx_dbghelp_init(void);            // dbghelp: StackWalk64, symbols from export tables (dbghelp.c; after seh)
+void vx_extra_args(int *argc, char ***argv);   // VXRT_EXTRA_ARGS: a launcher's arguments for one program (launchargs.c)
 
 // Text (text.c). Counts are in code units; the converters return the length needed and write at most cap units.
 size_t vx_utf8_to_utf16(const char *s, size_t n, WCHAR *out, size_t cap);
