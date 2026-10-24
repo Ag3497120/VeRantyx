@@ -183,6 +183,8 @@ void vx_desktop_init(void);            // the rest of the Win32 surface games li
 void vx_pipes_init(void);              // named pipes on Unix domain sockets (pipes.c)
 void *vx_trace_wrap(const char *dll, const char *name, void *fn);   // VXRT_TRACE_CALLS (calltrace.c)
 void vx_client_init(void);             // what desktop clients use: certificate stores, bcrypt random, comctl32 (client.c)
+void vx_crypt32_init(void);            // certificates, stores, signatures by macOS; wintrust that trusts nothing unverified (crypt32.c)
+void vx_dpapi_init(void);              // CryptProtectData/Memory with a key of the VXRT_ROOT, AES-256-GCM (dpapi.c)
 void vx_steambridge_init(void);
 void vx_services_init(void);           // resources, command lines, random numbers, psapi, C runtime extras (services.c)
 void vx_system_init(void);             // processor topology, thread pool, shell folders (system.c)

@@ -2,15 +2,15 @@
 CC      = clang
 CFLAGS  = -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0
 SRC     = src/loader.c src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src/dotnet_baml.c src/dotnet_il.c src/dotnet_exec.c src/dotnet_runtime.c src/dotnet_host.c src/kernel32.c src/kernelx.c src/jobs.c src/ntstatus.c src/system.c src/desktop.c src/winsta.c src/scm.c src/services.c src/security.c src/client.c src/steambridge.c src/calltrace.c src/pipes.c src/ucrt.c src/sync.c src/seh.c src/profile.c src/opengl.c src/wininet.m src/winhttp.m src/winhttp_proxy.m src/iphlp.c src/winsock_nsp.c src/midi.c src/directinput.m src/msxml.c src/extras.c src/context.S src/text.c src/files.c src/registry.c \
-          src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/d3d11on12.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d_format.c src/d3d12.m src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/dxil.c src/dxil_msl.c src/dxil_ir.c src/spirv.c src/spirv_ir.c src/vk_msl.c src/vk_format.m src/vk_device.m src/vk_descriptor.m src/vk_pipeline.m src/vk_command.m src/vk_internal.m src/vk_queue.m src/vk_wsi.m src/vk_dispatch.m src/directinput_buffer.c src/directinput_format.c src/input.m src/audio.m src/xaudio2.m src/sysdlls.c src/dbghelp.c
+          src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/d3d11on12.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d_format.c src/d3d12.m src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/dxil.c src/dxil_msl.c src/dxil_ir.c src/spirv.c src/spirv_ir.c src/vk_msl.c src/vk_format.m src/vk_device.m src/vk_descriptor.m src/vk_pipeline.m src/vk_command.m src/vk_internal.m src/vk_queue.m src/vk_wsi.m src/vk_dispatch.m src/directinput_buffer.c src/directinput_format.c src/input.m src/audio.m src/xaudio2.m src/sysdlls.c src/dbghelp.c src/aes_gcm.c src/dpapi.c src/crypt32.c
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
 
-build/vxrt: $(SRC) src/vx.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h
+build/vxrt: $(SRC) src/vx.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h src/aes_gcm.h
 	@mkdir -p build
-	$(CC) $(CFLAGS) -Ithird_party/vulkan -fobjc-arc -o $@.tmp $(SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -Wl,-pagezero_size,0x10000 -licucore -lz && mv -f $@.tmp $@
+	$(CC) $(CFLAGS) -Ithird_party/vulkan -fobjc-arc -o $@.tmp $(SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -Wl,-pagezero_size,0x10000 -licucore -lz && mv -f $@.tmp $@
 
 # The ARM64 build (phase 4, TRANSLATOR.md): the same runtime as ARM64 code, the program run by the translator's
 # engine in the process. Thunks for every ms_abi function come from the sources' C signatures (tools/vx_thunks.py).
@@ -28,13 +28,13 @@ build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
 	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
 build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
-	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -Ithird_party/vulkan -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Hypervisor build/libvxrt_vm.dylib build/guest.o -licucore -lz
+	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -Ithird_party/vulkan -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -framework Hypervisor build/libvxrt_vm.dylib build/guest.o -licucore -lz
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
        build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/kernelx.exe build/jobs.exe build/security.exe \
-       build/sysdlls.exe build/dbghelp.exe
+       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -158,6 +158,11 @@ build/sysdlls.exe: tests/sysdlls.c
 build/dbghelp.exe: tests/dbghelp.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ldbghelp
+
+# crypt32/wintrust with made-up certificates (tests/crypt32_certs.sh made them) and DPAPI
+build/crypt32.exe: tests/crypt32.c tests/crypt32_certs.h
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< -lcrypt32 -lwintrust
 
 build/directinput.exe: tests/directinput.c
 	@mkdir -p build
@@ -936,6 +941,10 @@ build/pe_test: src/pe.c src/pe.h tests/pe.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ src/pe.c tests/pe.c
 
+build/aes_gcm_test: src/aes_gcm.c src/aes_gcm.h tests/aes_gcm.c
+	@mkdir -p build
+	$(HOSTCC) -Isrc -o $@ tests/aes_gcm.c src/aes_gcm.c
+
 build/dotnet_eh_test: src/pe.c src/pe.h src/dotnet_metadata.c src/dotnet_metadata.h src/dotnet_resources.c src/dotnet_resources.h src/dotnet_baml.c src/dotnet_baml.h src/dotnet_il.c src/dotnet_il.h src/dotnet_exec.c src/dotnet_runtime.c src/dotnet_exec.h tests/dotnet_eh.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src/dotnet_baml.c src/dotnet_il.c src/dotnet_exec.c src/dotnet_runtime.c tests/dotnet_eh.c -framework CoreFoundation -framework CoreServices -licucore -lz
@@ -968,6 +977,7 @@ check: export VXRT_ROOT = build/root
 check: export VXRT_NO_ACTIVATE = 1
 check: build/iphlp_notify_test
 check: build/vulkan_spirv_atomic_compare_exchange_fixture.spv
+check: build/aes_gcm_test
 check: build/vulkan_spirv_atomic_rmw_fixture.spv
 check: build/spirv_graphics_separate_image_sampler.air
 check: build/spirv_graphics_sampled_image_implicit.air
@@ -1076,6 +1086,7 @@ check: all build/vkmsl build/x86dec_test build/x86dec_check build/ref_x86 build/
 	build/d3d_format_test
 	build/d3d12_view_test
 	build/pe_test
+	build/aes_gcm_test
 	build/dotnet_metadata_test
 	build/dotnet_eh_test | tail -1
 	build/dotnet_resources_test
@@ -1123,6 +1134,10 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/iphlp.exe
 	$(VXRT) build/winsock_nsp.exe
 	$(VXRT) build/midi.exe
+	$(VXRT) build/crypt32.exe
+	$(VXRT) build/crypt32.exe protect build/dpapi_blob.bin && $(VXRT) build/crypt32.exe unprotect build/dpapi_blob.bin
+	test "$$(stat -f %Lp build/root/dpapi)" = 700 && test "$$(stat -f %Lp build/root/dpapi/user.key)" = 600
+	tmutil isexcluded build/root/dpapi | grep -q '^\[Excluded\]'
 	$(VXRT) build/directinput.exe
 	$(VXRT) build/msvc_eh.exe
 	$(VXRT) build/com.exe
