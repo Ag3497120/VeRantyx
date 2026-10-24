@@ -303,6 +303,10 @@ static LONG delete_key(void *hkey, const char *sub) {
 }
 static WINAPI LONG RegDeleteKeyA(void *hkey, const char *sub) { return delete_key(hkey, sub); }
 static WINAPI LONG RegDeleteKeyW(void *hkey, const WCHAR *sub) { char *a = vx_utf8_dup(sub); LONG r = delete_key(hkey, a); free(a); return r; }
+// RegDeleteKeyEx: the view it names (KEY_WOW64_32KEY / KEY_WOW64_64KEY) is the one registry kept here. (Steam's
+// steamwebhelper looks it up with GetProcAddress; without it, it stopped at a breakpoint right after.)
+static WINAPI LONG RegDeleteKeyExA(void *hkey, const char *sub, DWORD sam, DWORD reserved) { (void)sam; (void)reserved; return delete_key(hkey, sub); }
+static WINAPI LONG RegDeleteKeyExW(void *hkey, const WCHAR *sub, DWORD sam, DWORD reserved) { (void)sam; (void)reserved; return RegDeleteKeyW(hkey, sub); }
 
 // ---- values ---------------------------------------------------------------------------------------------------------------------
 static LONG set(void *hkey, const char *name, DWORD type, const void *data, DWORD size, int ansi) {
@@ -604,6 +608,7 @@ static const vx_export advapi[] = {
     VX_EXPORT(RegOpenKeyExA), VX_EXPORT(RegOpenKeyExW), VX_EXPORT(RegOpenKeyA), VX_EXPORT(RegOpenKeyW),
     VX_EXPORT(RegCreateKeyExA), VX_EXPORT(RegCreateKeyExW), VX_EXPORT(RegCreateKeyA), VX_EXPORT(RegCreateKeyW),
     VX_EXPORT(RegCloseKey), VX_EXPORT(RegFlushKey), VX_EXPORT(RegDeleteKeyA), VX_EXPORT(RegDeleteKeyW),
+    VX_EXPORT(RegDeleteKeyExA), VX_EXPORT(RegDeleteKeyExW),
     VX_EXPORT(RegSetValueExA), VX_EXPORT(RegSetValueExW), VX_EXPORT(RegQueryValueExA), VX_EXPORT(RegQueryValueExW),
     VX_EXPORT(RegGetValueA), VX_EXPORT(RegGetValueW), VX_EXPORT(RegDeleteValueA), VX_EXPORT(RegDeleteValueW),
     VX_EXPORT(RegEnumKeyExA), VX_EXPORT(RegEnumKeyExW), VX_EXPORT(RegEnumValueA), VX_EXPORT(RegEnumValueW),
