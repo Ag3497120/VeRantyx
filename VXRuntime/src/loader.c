@@ -96,6 +96,7 @@ static int is_builtin(const char *dll) {
     for (size_t m = 0; m < g_module_count; m++) if (same_dll(g_modules[m].dll, dll)) return 1;
     return 0;
 }
+int vx_is_builtin_dll(const char *dll) { return is_builtin(dll); }
 
 void *vx_find_export(const char *dll, const char *name) {
     dll = canonical_dll(dll);
@@ -277,11 +278,13 @@ void vx_thread_attach(void) {
     pthread_mutex_unlock(&g_tebs_lock);
     pthread_setspecific(g_teb_key, teb);
     set_gs_slots(teb);
+    vx_thread_live(1);                                         // (OpenThread finds it by its ID from now on: sync.c)
 }
 
 void vx_thread_detach(void) {
     uint8_t *teb = pthread_getspecific(g_teb_key);
     if (!teb) return;
+    vx_thread_live(0);
     pthread_mutex_lock(&g_tebs_lock);
     for (int i = 0; i < g_teb_count; i++) if (g_tebs[i] == teb) { g_tebs[i] = g_tebs[--g_teb_count]; break; }
     pthread_mutex_unlock(&g_tebs_lock);
@@ -1213,6 +1216,7 @@ int main(int argc, char **argv, char **envp) {
     vx_kernel32_init();
     vx_system_init();
     vx_region_init();                            // (before desktop.c and client.c: replaces their region stand-ins)
+    vx_version_init();
     vx_desktop_init();
     vx_winsta_init();
     vx_scm_init();

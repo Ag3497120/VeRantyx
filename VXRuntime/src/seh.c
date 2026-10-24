@@ -402,6 +402,49 @@ static int seh_trace(void) {                       // VXRT_TRACE_SEH=1: every ra
     if (on < 0) { const char *e = getenv("VXRT_TRACE_SEH"); on = e && *e == '1'; }
     return on;
 }
+
+// The program's frames above sp: words on its stack that are return addresses into its images (each just after a
+// call instruction), up to the stack's base. A scan, not an unwind: it needs no unwind data and works where none
+// is to be had (in the runtime's own frames), at the price of stale return addresses left in unused slots.
+void vx_log_stack_scan(const uint64_t *sp, uint64_t top, int max) {
+    for (int i = 0, shown = 0; i < 16384 && shown < max && (uint64_t)(uintptr_t)(sp + i) < top; i++) {
+        const vx_image *f = vx_image_at(sp[i]);
+        const uint8_t *r = (const uint8_t *)(uintptr_t)sp[i];
+        int call = f && sp[i] - 6 > (uint64_t)(uintptr_t)f->base && (r[-5] == 0xe8 || (r[-6] == 0xff && (r[-5] & 0x38) == 0x10) ||
+                                                                   (r[-2] == 0xff && (r[-1] & 0x38) == 0x10) || (r[-3] == 0xff && (r[-2] & 0x38) == 0x10));
+        if (call) { vx_log("  stack: %s+%#llx", f->name, (unsigned long long)(sp[i] - (uint64_t)(uintptr_t)f->base)); shown++; }
+    }
+}
+// ... of the program's call into this runtime now running (TerminateProcess on itself: who asked).
+void vx_log_caller_stack(int max) {
+    uint8_t *teb = vx_teb();
+    if (!teb) return;
+#ifdef __aarch64__
+    const uint64_t *sp = (const uint64_t *)(uintptr_t)vx_x86_ctx()->gpr[4];
+#else
+    const uint64_t *sp = (const uint64_t *)__builtin_frame_address(0);
+#endif
+    uint64_t top = *(uint64_t *)(teb + TEB_STACK_BASE);
+    if ((uint64_t)(uintptr_t)sp < top && top - (uint64_t)(uintptr_t)sp < (256ull << 20)) vx_log_stack_scan(sp, top, max);
+}
+
+// VXRT_TRACE_SEH=1: a CPU fault of the program's code, before its handlers see it (a handler that catches it, writes
+// a dump and ends the process would otherwise leave no trace of the fault).
+static void trace_fault(const EXCEPTION_RECORD *rec, const CONTEXT *ctx) {
+    if (!seh_trace()) return;
+    const vx_image *m = vx_image_at(ctx->rip);
+    vx_log("SEH: exception %#x at %s+%#llx (thread %u, address %#llx%s)", rec->code, m ? m->name : "?",
+           m ? (unsigned long long)(ctx->rip - (uint64_t)(uintptr_t)m->base) : (unsigned long long)ctx->rip,
+           (unsigned)vx_current_tid(), rec->nparams > 1 ? (unsigned long long)rec->info[1] : 0ull,
+           rec->nparams > 1 ? (rec->info[0] ? ", write" : ", read") : "");
+    static const char *const names[16] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
+    char regs[512]; int k = 0;
+    for (int i = 0; i < 16 && k < (int)sizeof regs - 32; i++) k += snprintf(regs + k, sizeof regs - k, " %s=%llx", names[i], (unsigned long long)ctx->gpr[i]);
+    vx_log("  registers:%s", regs);
+    uint8_t *teb = vx_teb();
+    if (teb) vx_log_stack_scan((const uint64_t *)(uintptr_t)ctx->gpr[RSP], *(uint64_t *)(teb + TEB_STACK_BASE), 12);
+    vx_trace_ring_dump("this exception");                       // (VXRT_TRACE_CALLS_RING: the calls before it)
+}
 static void __attribute__((noreturn)) dispatch(EXCEPTION_RECORD *rec, CONTEXT *ctx) {
     vx_entry self = ENTRY(t_entries, ctx);
     ENTRY_SET_AT(self);
@@ -485,6 +528,12 @@ void __attribute__((noreturn)) vx_unwind(uint64_t target_frame, uint64_t target_
     t_entries = &self;
     EXCEPTION_RECORD local = { 0xC0000027 /* STATUS_UNWIND */, 0, NULL, NULL, 0, 0, {0} };
     if (!rec) rec = &local;
+    if (seh_trace() && rec->code != 0xe06d7363) {                // (VXRT_TRACE_SEH=1: unwinds other than C++ catches)
+        const vx_image *m = vx_image_at(captured->rip);
+        vx_log("SEH: unwind %#x to frame %#llx ip %#llx from %s+%#llx (rsp %#llx, thread %u)", rec->code, (unsigned long long)target_frame,
+               (unsigned long long)target_ip, m ? m->name : "?", m ? (unsigned long long)(captured->rip - (uint64_t)(uintptr_t)m->base) : (unsigned long long)captured->rip,
+               (unsigned long long)captured->gpr[RSP], (unsigned)vx_current_tid());
+    }
     rec->flags |= EXCEPTION_UNWINDING;
     if (!target_frame) rec->flags |= EXCEPTION_EXIT_UNWIND;
     CONTEXT out;
@@ -565,7 +614,7 @@ static WINAPI int __C_specific_handler(EXCEPTION_RECORD *rec, uint64_t frame, CO
 
 // ---- CPU faults: macOS signals become Windows exceptions -------------------------------------------------------------------
 #ifndef __aarch64__
-static void signal_dispatch(EXCEPTION_RECORD *rec, CONTEXT *ctx) { dispatch(rec, ctx); }
+static void signal_dispatch(EXCEPTION_RECORD *rec, CONTEXT *ctx) { trace_fault(rec, ctx); dispatch(rec, ctx); }
 #endif
 
 // Signals are handled on a stack of their own, so that a thread that ran out of stack can still be reported.
@@ -593,14 +642,7 @@ static void on_signal(int sig, siginfo_t *si, void *ucv) {
                    *(unsigned long long *)(teb + TEB_STACK_BASE), m ? m->name : "?", m ? (unsigned long long)(ss->__rip - (uint64_t)m->base) : (unsigned long long)ss->__rip,
                    sym ? " in " : "", sym ? sym : "", (unsigned long long)a);
             // The program's frames nearest the fault: return addresses on the stack inside its images.
-            const uint64_t *sp = (const uint64_t *)ss->__rsp;
-            for (int i = 0, shown = 0; i < 16384 && shown < 40 && (uint64_t)(sp + i) < *(uint64_t *)(teb + TEB_STACK_BASE); i++) {
-                const vx_image *f = vx_image_at(sp[i]);
-                const uint8_t *r = (const uint8_t *)sp[i];         // (a return address follows a call instruction)
-                int call = f && sp[i] - 6 > (uint64_t)f->base && (r[-5] == 0xe8 || (r[-6] == 0xff && (r[-5] & 0x38) == 0x10) ||
-                                                                  (r[-2] == 0xff && (r[-1] & 0x38) == 0x10) || (r[-3] == 0xff && (r[-2] & 0x38) == 0x10));
-                if (call) { vx_log("  stack: %s+%#llx", f->name, (unsigned long long)(sp[i] - (uint64_t)f->base)); shown++; }
-            }
+            vx_log_stack_scan((const uint64_t *)ss->__rsp, *(uint64_t *)(teb + TEB_STACK_BASE), 40);
             _exit(128 + sig);
         }
     }
@@ -845,6 +887,7 @@ void __attribute__((noreturn)) vx_seh_fault(DWORD code, DWORD n, const uint64_t 
     CONTEXT c; context_from(&c, x, rip, x->gpr[4]);
     EXCEPTION_RECORD rec = { code, 0, NULL, (void *)(uintptr_t)x->rip, n, 0, {0} };
     if (params) memcpy(rec.info, params, n * 8);
+    trace_fault(&rec, &c);
     dispatch(&rec, &c);
 }
 

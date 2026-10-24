@@ -91,8 +91,10 @@ HANDLE vx_process_handle(int pid, int child, HANDLE *second);
 static WINAPI BOOL TerminateProcess(HANDLE h, DWORD code) {
     if ((intptr_t)h == -1) {                                       // (who ends it: ExitProcess below only sees this function)
         const vx_image *m = vx_image_at((uint64_t)(uintptr_t)VX_RETURN_ADDRESS());
-        vx_log("TerminateProcess(current process, %u) from %s+%#llx", (unsigned)code, m ? m->name : "?",
-               m ? (unsigned long long)((uint8_t *)VX_RETURN_ADDRESS() - m->base) : 0ull);
+        vx_log("TerminateProcess(current process, %u) from %s+%#llx, thread %u", (unsigned)code, m ? m->name : "?",
+               m ? (unsigned long long)((uint8_t *)VX_RETURN_ADDRESS() - m->base) : 0ull, (unsigned)vx_current_tid());
+        vx_log_caller_stack(16);                                   // (the callers above: the return address is often a helper)
+        vx_trace_ring_dump("TerminateProcess");                    // (VXRT_TRACE_CALLS_RING: the calls before it)
         ExitProcess(code); return 1;
     }
     int pid = vx_process_info(h, NULL);

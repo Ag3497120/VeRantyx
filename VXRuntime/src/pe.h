@@ -35,6 +35,9 @@ int vx_pe_inspect(const uint8_t *data, size_t size, vx_pe_info *out);
 int vx_pe_rva_to_file(const uint8_t *data, size_t size, const vx_pe_info *pe,
                       uint32_t rva, uint32_t length, size_t *offset);
 
+// Where the image's RT_VERSION resource (the first name and language) is in the file: its offset and length.
+int vx_pe_version_resource(const uint8_t *data, size_t size, const vx_pe_info *pe, size_t *offset, uint32_t *length);
+
 // Reads the fixed VS_FIXEDFILEINFO fields from an RT_VERSION resource.
 int vx_pe_version_info_get(const uint8_t *data, size_t size, const vx_pe_info *pe,
                            vx_pe_version_info *out);

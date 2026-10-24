@@ -105,6 +105,7 @@ enum {
 enum { PEB_IMAGE_BASE = 0x10, PEB_PROCESS_HEAP = 0x30, PEB_SIZE = 0x1000 };
 uint8_t *vx_teb(void);                 // this thread's TEB (creates it on first use)
 void     vx_thread_attach(void);       // TEB + gs slots + TLS for the calling thread
+void     vx_thread_live(int alive);    // sync.c: the calling thread joins (1) or leaves (0) the threads OpenThread finds
 #ifdef __aarch64__
 extern __thread size_t vx_x86_stack_size;   // the x86 stack vx_thread_attach makes (0: 1 MB)
 void vx_arm64_init(void);
@@ -164,6 +165,10 @@ enum { VX_HANDLE_FIND = 1, VX_HANDLE_MAPPING, VX_HANDLE_PIPE = 7, VX_HANDLE_WINS
 HANDLE vx_handle_new(int kind, void *data, void (*destroy)(void *));
 void  *vx_handle_data(HANDLE h, int kind);    // NULL unless h is a handle of that kind
 BOOL   vx_handle_close(HANDLE h);
+// The access a handle was granted, where it is recorded (file mapping objects); vx_handle_access: 0 if not recorded.
+void   vx_handle_set_access(HANDLE h, DWORD access);
+int    vx_handle_access(HANDLE h, DWORD *access);
+DWORD  vx_mapping_access(DWORD requested);     // files.c: a file mapping's access rights from FILE_MAP_* / generic ones
 // An overlapped operation on `file` finished: fills the OVERLAPPED, signals its event, queues the completion packet.
 void   vx_io_completed(HANDLE file, void *overlapped, DWORD bytes, DWORD status);
 void   vx_set_event(HANDLE event);          // SetEvent for threads that are not Windows threads
@@ -176,6 +181,11 @@ DWORD  vx_handle_count(void);
 void vx_log(const char *fmt, ...);
 void vx_control_start(const char *path);       // control.c: VXRT_CONTROL, the socket Command Clips talk to
 extern int vx_trace;
+// The program's return addresses on a stack from sp up to top, and on the stack of its call now running (seh.c);
+// the calls VXRT_TRACE_CALLS_RING kept, before `why` (calltrace.c).
+void vx_log_stack_scan(const uint64_t *sp, uint64_t top, int max);
+void vx_log_caller_stack(int max);
+void vx_trace_ring_dump(const char *why);
 
 // Module registration entry points (one per source file).
 void vx_kernel32_init(void);
@@ -233,6 +243,7 @@ void vx_sysparams_init(void);          // SystemParametersInfo's UI fonts and no
 void vx_dwmapi_init(void);             // the Desktop Window Manager API for windows macOS frames (dwmapi.c)
 void vx_winmisc_init(void);            // smaller user32 functions: IsChild, DeferWindowPos, GetLastInputInfo, ... (winmisc.c)
 void vx_region_init(void);             // GDI regions: rectangles combined, compared, listed (region.c)
+void vx_version_init(void);            // version.dll: files' version resources, VerQueryValue (version.c)
 void vx_shlpath_init(void);            // shlwapi path strings: PathFindFileName, PathMatchSpec, ... (shlpath.c)
 void vx_dbghelp_init(void);            // dbghelp: StackWalk64, symbols from export tables (dbghelp.c; after seh)
 void vx_extra_args(int *argc, char ***argv);   // VXRT_EXTRA_ARGS: a launcher's arguments for one program (launchargs.c)

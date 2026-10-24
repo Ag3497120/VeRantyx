@@ -658,6 +658,11 @@ static void shm_name(const char *name, char *out, size_t cap) {
 }
 
 #define PAGE_READONLY 0x02
+#define SECTION_QUERY 0x1
+#define SECTION_MAP_WRITE 0x2
+#define SECTION_MAP_READ 0x4
+#define SECTION_MAP_EXECUTE 0x8
+#define SECTION_ALL_ACCESS 0xf001fu
 #define PAGE_WRITECOPY 0x08
 #define PAGE_EXECUTE_READ 0x20
 static HANDLE create_mapping(HANDLE file, DWORD protect, uint64_t size, const char *name) {
@@ -702,6 +707,7 @@ static HANDLE create_mapping(HANDLE file, DWORD protect, uint64_t size, const ch
     else if (!(m->attributes & (SEC_RESERVE | SEC_COMMIT))) m->attributes |= SEC_COMMIT;   // (the default)
     HANDLE h = vx_handle_new(VX_HANDLE_MAPPING, m, mapping_destroy);
     if (!h) { mapping_destroy(m); vx_set_last_error(4); return NULL; }
+    vx_handle_set_access(h, SECTION_ALL_ACCESS);
     vx_set_last_error(existed ? 183 /* ERROR_ALREADY_EXISTS */ : 0);
     return h;
 }
@@ -710,6 +716,17 @@ static WINAPI HANDLE CreateFileMappingA(HANDLE file, void *sa, DWORD protect, DW
 }
 static WINAPI HANDLE CreateFileMappingW(HANDLE file, void *sa, DWORD protect, DWORD high, DWORD low, const WCHAR *name) {
     (void)sa; char *a = vx_utf8_dup(name); HANDLE h = create_mapping(file, protect, (uint64_t)high << 32 | low, a); free(a); return h;
+}
+// A file mapping's access rights (SECTION_*) from what a program asks for: FILE_MAP_* and the generic rights as
+// "File Mapping Security and Access Rights" maps them; FILE_MAP_EXECUTE asks for SECTION_MAP_EXECUTE.
+DWORD vx_mapping_access(DWORD a) {
+    DWORD out = a & 0x00ffffffu & ~0x20u;
+    if (a & 0x20) out |= SECTION_MAP_EXECUTE;                                    // FILE_MAP_EXECUTE
+    if (a & 0x80000000u) out |= 0x20000 | SECTION_QUERY | SECTION_MAP_READ;      // GENERIC_READ
+    if (a & 0x40000000u) out |= 0x20000 | SECTION_MAP_WRITE;                     // GENERIC_WRITE
+    if (a & 0x20000000u) out |= 0x20000 | SECTION_MAP_EXECUTE;                   // GENERIC_EXECUTE
+    if (a & 0x10000000u) out |= SECTION_ALL_ACCESS;                              // GENERIC_ALL
+    return out;
 }
 static HANDLE open_mapping(const char *name) {
     if (vx_trace) vx_log("OpenFileMapping %s", name);
@@ -755,9 +772,13 @@ int vx_mapping_info(HANDLE h, uint64_t *size, DWORD *attributes) {
     *size = m->size; *attributes = m->attributes;
     return 1;
 }
-static WINAPI HANDLE OpenFileMappingA(DWORD access, BOOL inherit, const char *name) { (void)access; (void)inherit; return open_mapping(name); }
+static WINAPI HANDLE OpenFileMappingA(DWORD access, BOOL inherit, const char *name) {
+    (void)inherit; HANDLE h = open_mapping(name);
+    if (h) vx_handle_set_access(h, vx_mapping_access(access));
+    return h;
+}
 static WINAPI HANDLE OpenFileMappingW(DWORD access, BOOL inherit, const WCHAR *name) {
-    (void)access; (void)inherit; char *a = vx_utf8_dup(name); HANDLE h = open_mapping(a); free(a); return h;
+    char *a = vx_utf8_dup(name); HANDLE h = OpenFileMappingA(access, inherit, a); free(a); return h;
 }
 
 // Views, so UnmapViewOfFile knows their sizes.
@@ -766,6 +787,36 @@ static view *g_views; static int g_view_count, g_view_cap;
 static pthread_mutex_t g_views_lock = PTHREAD_MUTEX_INITIALIZER;
 #define FILE_MAP_COPY  0x1
 #define FILE_MAP_WRITE 0x2
+#define FILE_MAP_READ  0x4
+#define FILE_MAP_EXECUTE 0x20
+// Whether a handle with the access `granted` (SECTION_*) may map the view `access` (FILE_MAP_*), as Microsoft's "File
+// Mapping Security and Access Rights" and MapViewOfFile pages put it: FILE_MAP_WRITE "allows mapping of read-only,
+// copy-on-write, or read/write views", and FILE_MAP_WRITE | FILE_MAP_READ and FILE_MAP_ALL_ACCESS are the same as
+// FILE_MAP_WRITE. So a view with the write bit (FILE_MAP_ALL_ACCESS too) needs SECTION_MAP_WRITE; a read-only or
+// copy-on-write one SECTION_MAP_READ or SECTION_MAP_WRITE; FILE_MAP_EXECUTE also SECTION_MAP_EXECUTE.
+static int view_allowed(DWORD access, DWORD granted) {
+    if (access & FILE_MAP_WRITE) { if (!(granted & SECTION_MAP_WRITE)) return 0; }
+    else if (access & (FILE_MAP_READ | FILE_MAP_COPY)) { if (!(granted & (SECTION_MAP_READ | SECTION_MAP_WRITE))) return 0; }
+    if ((access & FILE_MAP_EXECUTE) && !(granted & SECTION_MAP_EXECUTE)) return 0;
+    return 1;
+}
+// A copy-on-write view (FILE_MAP_COPY) of paging-file memory: macOS maps a POSIX shared memory object only shared
+// (MAP_PRIVATE gives EINVAL), so the view is private memory with the object's bytes copied in when it is mapped.
+// (Windows copies a page when the view first writes it; until then this copy does not see later writes through
+// other views.)
+static void *private_copy_view(mapping *m, uint64_t offset, size_t bytes, void *addr) {
+    void *p = mmap(addr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) return MAP_FAILED;
+    size_t have = offset < m->size ? (size_t)(m->size - offset) : 0;
+    if (have > bytes) have = bytes;
+    if (have) {
+        void *src = mmap(NULL, have, PROT_READ, MAP_SHARED, m->fd, (off_t)offset);
+        if (src == MAP_FAILED) { int e = errno; munmap(p, bytes); errno = e; return MAP_FAILED; }
+        memcpy(p, src, have);
+        munmap(src, have);
+    }
+    return p;
+}
 static WINAPI void *MapViewOfFileEx(HANDLE h, DWORD access, DWORD high, DWORD low, size_t bytes, void *addr) {
     mapping *m = vx_handle_data(h, VX_HANDLE_MAPPING);
     if (!m) { vx_set_last_error(6); return NULL; }
@@ -773,8 +824,11 @@ static WINAPI void *MapViewOfFileEx(HANDLE h, DWORD access, DWORD high, DWORD lo
     if (!bytes) bytes = (size_t)(m->size - offset);
     // FILE_MAP_ALL_ACCESS (0xf001f) contains the FILE_MAP_COPY bit; copy-on-write means FILE_MAP_COPY alone.
     int copy = (access & 0xffff) == FILE_MAP_COPY;
+    DWORD granted;                                                 // the handle's access, where recorded (sync.c)
+    if (vx_handle_access(h, &granted) && !view_allowed(access, granted)) { vx_set_last_error(5 /* ERROR_ACCESS_DENIED */); return NULL; }
     int prot = PROT_READ | ((access & FILE_MAP_WRITE) || copy ? PROT_WRITE : 0);
     void *p = mmap(addr, bytes, prot, copy ? MAP_PRIVATE : MAP_SHARED, m->fd, (off_t)offset);
+    if (p == MAP_FAILED && copy && errno == EINVAL && m->shm[0]) p = private_copy_view(m, offset, bytes, addr);
     if (p == MAP_FAILED) { set_error_from_errno(); return NULL; }
     pthread_mutex_lock(&g_views_lock);
     if (g_view_count == g_view_cap) { g_view_cap = g_view_cap ? g_view_cap * 2 : 32; g_views = realloc(g_views, g_view_cap * sizeof *g_views); }

@@ -5,6 +5,7 @@ SRC     = src/loader.c src/pe.c src/dotnet_metadata.c src/dotnet_resources.c src
           src/user32.c src/gdi.c src/control.c src/net.c src/mm.c src/vcruntime.c src/com.c src/cocoa.m src/d3d11.m src/d3d11_draw.m src/d3d11_shared.m src/d3d11on12.m src/dxgi.m src/d3d9.m src/dxbc.c src/d3d_format.c src/d3d12.m src/gpu_ir.c src/gpu_ir_msl.c src/gpu_ir_metal.m src/dxil.c src/dxil_msl.c src/dxil_ir.c src/spirv.c src/spirv_ir.c src/vk_msl.c src/vk_format.m src/vk_device.m src/vk_descriptor.m src/vk_pipeline.m src/vk_command.m src/vk_internal.m src/vk_queue.m src/vk_wsi.m src/vk_dispatch.m src/directinput_buffer.c src/directinput_format.c src/input.m src/audio.m src/xaudio2.m src/sysdlls.c src/dbghelp.c src/aes_gcm.c src/dpapi.c src/crypt32.c src/dwrite.m src/osinfo.c src/pointer.c src/regnotify.c src/section.c src/shlpath.c src/wevtapi.c src/ktime.c src/power.c src/sysparams.c src/dwmapi.c src/winmisc.c src/region.c
 SRC    += src/launchargs.c
 SRC    += src/handlexfer.c
+SRC    += src/version.c
 SRC    += src/icons.c src/menus.m src/tray.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
@@ -37,7 +38,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
        build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/kernelx.exe build/jobs.exe build/security.exe \
-       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe
+       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/open_thread.exe build/version_info.exe build/section_access.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -193,6 +194,27 @@ build/steam_client_ui.exe: tests/steam_client_ui.c
 # DuplicateHandle between processes both ways: pipe ends and events taken from and given to another process
 # (src/handlexfer.c): Steam's process pipes.
 build/handle_xfer.exe: tests/handle_xfer.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+# OpenThread by ID for any running thread (the main thread; one whose CreateThread handle was closed) (src/sync.c):
+# Valve's tier0 freed the data of Steam's main thread when it could not open it.
+build/open_thread.exe: tests/open_thread.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+# version.dll (src/version.c): a file's version resource (this test's own, made-up: tests/version_info.rc), a runtime
+# DLL's made-up one, VerQueryValueA/W. Chromium (Steam's web helper) stopped when kernel32.dll had none.
+build/version_info_res.o: tests/version_info.rc
+	@mkdir -p build
+	x86_64-w64-mingw32-windres -i $< -o $@
+build/version_info.exe: tests/version_info.c build/version_info_res.o
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $< build/version_info_res.o -lversion
+
+# What a file mapping handle may do (src/sync.c, src/files.c): no more access through DuplicateHandle than its source,
+# views by access. Chromium's read-only shared memory check (Steam's web helper).
+build/section_access.exe: tests/section_access.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
@@ -1197,6 +1219,9 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/webhelper_apis.exe
 	$(VXRT) build/steam_client_ui.exe
 	$(VXRT) build/handle_xfer.exe
+	$(VXRT) build/open_thread.exe
+	$(VXRT) build/version_info.exe build/hello_crt.exe
+	$(VXRT) build/section_access.exe
 	$(VXRT) build/window.exe
 	$(VXRT) build/winsta.exe
 	$(VXRT) build/scm.exe

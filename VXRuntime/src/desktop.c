@@ -222,14 +222,6 @@ static WINAPI BOOL SetConsoleScreenBufferInfoEx(HANDLE h, void *info) { (void)h;
 static WINAPI BOOL GetNumberOfConsoleInputEvents(HANDLE h, DWORD *n) { (void)h; *n = 0; return 1; }
 static WINAPI BOOL ReadConsoleInputA(HANDLE h, void *rec, DWORD n, DWORD *got) { (void)h; (void)rec; (void)n; if (got) *got = 0; vx_set_last_error(6); return 0; }
 
-// ---- version.dll: version resources are not read yet ----------------------------------------------------------------------
-static WINAPI DWORD GetFileVersionInfoSizeA(const char *f, DWORD *h) { (void)f; if (h) *h = 0; vx_set_last_error(1813); return 0; }
-static WINAPI DWORD GetFileVersionInfoSizeW(const WCHAR *f, DWORD *h) { (void)f; if (h) *h = 0; vx_set_last_error(1813); return 0; }
-static WINAPI BOOL GetFileVersionInfoA(const char *f, DWORD h, DWORD n, void *d) { (void)f; (void)h; (void)n; (void)d; vx_set_last_error(1813); return 0; }
-static WINAPI BOOL GetFileVersionInfoW(const WCHAR *f, DWORD h, DWORD n, void *d) { (void)f; (void)h; (void)n; (void)d; vx_set_last_error(1813); return 0; }
-static WINAPI BOOL VerQueryValueA(const void *b, const char *s, void **out, DWORD *n) { (void)b; (void)s; *out = NULL; *n = 0; return 0; }
-static WINAPI BOOL VerQueryValueW(const void *b, const WCHAR *s, void **out, DWORD *n) { (void)b; (void)s; *out = NULL; *n = 0; return 0; }
-
 // ---- setupapi: device lists that are empty --------------------------------------------------------------------------------
 // A list is made (an empty one): a program that looks through the HID devices for XInput controllers (Elite Dangerous,
 // before it opens its DirectInput joysticks) took the failure for a broken system and set up no joystick at all.
@@ -478,10 +470,6 @@ static const vx_export k32[] = {
     VX_EXPORT(WriteConsoleOutputCharacterA), VX_EXPORT(GetConsoleScreenBufferInfoEx), VX_EXPORT(SetConsoleScreenBufferInfoEx),
     VX_EXPORT(GetNumberOfConsoleInputEvents), VX_EXPORT(ReadConsoleInputA),
 };
-static const vx_export version[] = {
-    VX_EXPORT(GetFileVersionInfoSizeA), VX_EXPORT(GetFileVersionInfoSizeW), VX_EXPORT(GetFileVersionInfoA), VX_EXPORT(GetFileVersionInfoW),
-    VX_EXPORT(VerQueryValueA), VX_EXPORT(VerQueryValueW),
-};
 static const vx_export setupapi[] = {
     VX_EXPORT(SetupDiGetClassDevsA), VX_EXPORT(SetupDiGetClassDevsW), VX_EXPORT(SetupDiDestroyDeviceInfoList),
     { "SetupDiEnumDeviceInfo", (void *)setupdi_none }, { "SetupDiEnumDeviceInterfaces", (void *)setupdi_none },
@@ -550,7 +538,6 @@ void vx_desktop_init(void) {
     vx_register_module("wtsapi32.dll", wtsapi32, sizeof wtsapi32 / sizeof wtsapi32[0]);
     if (getenv("VXRT_OPENGL") && !strcmp(getenv("VXRT_OPENGL"), "0")) vx_register_module("opengl32.dll", opengl32, sizeof opengl32 / sizeof opengl32[0]);   // (no OpenGL: opengl.c otherwise)
     vx_register_module("kernel32.dll", k32, sizeof k32 / sizeof k32[0]);
-    vx_register_module("version.dll", version, sizeof version / sizeof version[0]);
     vx_register_module("setupapi.dll", setupapi, sizeof setupapi / sizeof setupapi[0]);
     vx_register_module("user32.dll", user32, sizeof user32 / sizeof user32[0]);
     vx_register_module("gdi32.dll", gdi32, sizeof gdi32 / sizeof gdi32[0]);
