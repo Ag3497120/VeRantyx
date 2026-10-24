@@ -520,59 +520,6 @@ static WINAPI BOOL AreFileApisANSI(void) { return 1; }
 static WINAPI HANDLE CreateToolhelp32Snapshot(DWORD flags, DWORD pid) { (void)flags; (void)pid; vx_set_last_error(50); return INVALID_HANDLE; }
 static WINAPI BOOL toolhelp_none(HANDLE h, void *entry) { (void)h; (void)entry; vx_set_last_error(18); return 0; }
 
-// ---- security: the process token can be opened; its information is not available ----------------------------------------
-static WINAPI BOOL OpenProcessToken(HANDLE p, DWORD access, HANDLE *out) { (void)p; (void)access; *out = (HANDLE)(intptr_t)-4; return 1; }
-static WINAPI BOOL OpenThreadToken(HANDLE t, DWORD access, BOOL self, HANDLE *out) { (void)t; (void)access; (void)self; *out = NULL; vx_set_last_error(1008); return 0; }
-// The token describes one ordinary user: S-1-5-21-1000-1000-1000-1001, in Everyone, medium integrity, not elevated.
-// Each answer is laid out as Windows does (pointers into the same buffer); a buffer too small says how much is needed.
-static size_t put_sid(uint8_t *p, const uint32_t *sub, int n, uint8_t authority) {
-    p[0] = 1; p[1] = (uint8_t)n; memset(p + 2, 0, 5); p[7] = authority;
-    memcpy(p + 8, sub, 4 * (size_t)n);
-    return 8 + 4 * (size_t)n;
-}
-static const uint32_t user_sub[] = { 21, 1000, 1000, 1000, 1001 }, everyone_sub[] = { 0 }, medium_sub[] = { 8192 };
-static WINAPI BOOL GetTokenInformation(HANDLE t, int cls, void *out, DWORD size, DWORD *ret) {
-    (void)t;
-    uint8_t buf[256] = { 0 };
-    size_t n;
-    switch (cls) {
-    case 1: case 4: case 5:                                        // TokenUser (SID_AND_ATTRIBUTES), TokenOwner, TokenPrimaryGroup (PSID)
-        n = (cls == 1 ? 16 : 8);
-        n += put_sid(buf + n, user_sub, 5, 5);
-        break;
-    case 2:                                                        // TokenGroups: Everyone
-        *(DWORD *)buf = 1;
-        *(DWORD *)(buf + 16) = 7;                                  // SE_GROUP_MANDATORY | ENABLED_BY_DEFAULT | ENABLED
-        n = 24 + put_sid(buf + 24, everyone_sub, 1, 1);
-        *(void **)(buf + 8) = NULL;                                // patched below, once the destination is known
-        break;
-    case 6: case 31: n = 8; break;                                 // TokenDefaultDacl (no DACL), TokenAppContainerSid (none)
-    case 8: *(DWORD *)buf = 1; n = 4; break;                       // TokenType: TokenPrimary
-    case 10: n = 56; break;                                        // TokenStatistics
-    case 12: *(DWORD *)buf = 1; n = 4; break;                      // TokenSessionId
-    case 18: *(DWORD *)buf = 1; n = 4; break;                      // TokenElevationType: TokenElevationTypeDefault
-    case 20: case 29: case 9: n = 4; break;                        // TokenElevation, TokenIsAppContainer, TokenImpersonationLevel: 0
-    case 25:                                                       // TokenIntegrityLevel: TOKEN_MANDATORY_LABEL, medium
-        *(DWORD *)(buf + 8) = 0x20;                                // SE_GROUP_INTEGRITY
-        n = 16 + put_sid(buf + 16, medium_sub, 1, 16);
-        break;
-    default:
-        if (ret) *ret = 0;
-        vx_set_last_error(87);
-        return 0;
-    }
-    if (ret) *ret = (DWORD)n;
-    if (!out || size < n) { vx_set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */); return 0; }
-    memcpy(out, buf, n);
-    uint8_t *o = out;
-    if (cls == 1 || cls == 4 || cls == 5) *(void **)o = o + (cls == 1 ? 16 : 8);
-    if (cls == 2) *(void **)(o + 8) = o + 24;
-    if (cls == 25) *(void **)o = o + 16;
-    return 1;
-}
-static WINAPI DWORD *GetSidSubAuthority(void *sid, DWORD i) { return (DWORD *)((uint8_t *)sid + 8 + 4 * i); }
-static WINAPI uint8_t *GetSidSubAuthorityCount(void *sid) { return (uint8_t *)sid + 1; }
-
 // ---- processes: no packages, exception policy ---------------------------------------------------------------------------
 static WINAPI LONG GetCurrentPackageId(DWORD *len, void *buf) { (void)len; (void)buf; return 15700; }   // APPMODEL_ERROR_NO_PACKAGE
 static WINAPI LONG GetCurrentPackageFullName(DWORD *len, void *buf) { (void)len; (void)buf; return 15700; }
@@ -759,10 +706,6 @@ static const vx_export k32[] = {
     VX_EXPORT(GetUserDefaultLocaleName), VX_EXPORT(GetSystemDefaultLocaleName), VX_EXPORT(LCIDToLocaleName),
     VX_EXPORT(LocaleNameToLCID), VX_EXPORT(GetLocaleInfoEx), VX_EXPORT(FlsGetValue2),
 };
-static const vx_export advapi[] = {
-    VX_EXPORT(OpenProcessToken), VX_EXPORT(OpenThreadToken), VX_EXPORT(GetTokenInformation),
-    VX_EXPORT(GetSidSubAuthority), VX_EXPORT(GetSidSubAuthorityCount),
-};
 static const vx_export shell[] = {
     VX_EXPORT(SHGetFolderPathW), VX_EXPORT(SHGetFolderPathA), VX_EXPORT(SHGetKnownFolderPath), VX_EXPORT(SHGetSpecialFolderPathW), VX_EXPORT(SHGetSpecialFolderPathA),
 };
@@ -773,7 +716,6 @@ static const vx_export ntdll[] = {
 };
 void vx_system_init(void) {
     vx_register_module("kernel32.dll", k32, sizeof k32 / sizeof k32[0]);
-    vx_register_module("advapi32.dll", advapi, sizeof advapi / sizeof advapi[0]);
     vx_register_module("shell32.dll", shell, sizeof shell / sizeof shell[0]);
     vx_register_module("ntdll.dll", ntdll, sizeof ntdll / sizeof ntdll[0]);
 }

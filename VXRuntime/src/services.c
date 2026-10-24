@@ -166,11 +166,6 @@ static WINAPI DWORD EventSetInformation(uint64_t reg, int cls, void *info, DWORD
 static WINAPI BOOL AdjustTokenPrivileges(HANDLE t, BOOL all, void *state, DWORD n, void *prev, DWORD *ret) { (void)t; (void)all; (void)state; (void)n; (void)prev; if (ret) *ret = 0; vx_set_last_error(0); return 1; }
 static WINAPI BOOL LookupPrivilegeValueW(const WCHAR *sys, const WCHAR *name, DWORD *luid) { (void)sys; (void)name; luid[0] = 20; luid[1] = 0; return 1; }
 static WINAPI BOOL LookupPrivilegeValueA(const char *sys, const char *name, DWORD *luid) { (void)sys; (void)name; luid[0] = 20; luid[1] = 0; return 1; }
-static WINAPI BOOL EqualSid(const uint8_t *a, const uint8_t *b) { return a && b && a[1] == b[1] && !memcmp(a, b, 8 + 4 * (size_t)a[1]); }
-static WINAPI BOOL LookupAccountSidA(const char *sys, void *sid, char *name, DWORD *nn, char *dom, DWORD *dn, int *use) { (void)sys; (void)sid; (void)name; (void)nn; (void)dom; (void)dn; (void)use; vx_set_last_error(1332); return 0; }
-static WINAPI DWORD GetNamedSecurityInfoA(const char *obj, int type, DWORD info, void **owner, void **group, void **dacl, void **sacl, void **sd) {
-    (void)obj; (void)type; (void)info; (void)owner; (void)group; (void)dacl; (void)sacl; if (sd) *sd = NULL; return 50;   // ERROR_NOT_SUPPORTED
-}
 static WINAPI LONG RegConnectRegistryA(const char *machine, HANDLE key, HANDLE *out) { (void)machine; (void)key; *out = NULL; return 53; }   // ERROR_BAD_NETPATH
 
 // ---- UUIDs (rpcrt4) ------------------------------------------------------------------------------------------------------------
@@ -631,41 +626,12 @@ static WINAPI int wsprintfW(WCHAR *buf, const WCHAR *fmt, ...) {
     return n;
 }
 static WINAPI int wvsprintfW(WCHAR *buf, const WCHAR *fmt, const char *ap) { return vx_format_w(buf, 1025, fmt, ap); }
-// ---- services and security (advapi32): no service manager; SIDs and ACLs as plain memory -----------------------------------
+// ---- services (advapi32): no service manager (SIDs, ACLs and the rest of security: security.c) ------------------------------
 static WINAPI HANDLE OpenSCManagerA(const char *machine, const char *db, DWORD access) { (void)machine; (void)db; (void)access; vx_set_last_error(5); return NULL; }
 static WINAPI HANDLE OpenSCManagerW(const WCHAR *machine, const WCHAR *db, DWORD access) { (void)machine; (void)db; (void)access; vx_set_last_error(5); return NULL; }
 static WINAPI HANDLE OpenServiceA(HANDLE scm, const char *name, DWORD access) { (void)scm; (void)name; (void)access; vx_set_last_error(1060); return NULL; }
 static WINAPI BOOL service_none(void) { vx_set_last_error(6); return 0; }
 static WINAPI BOOL CloseServiceHandle(HANDLE h) { (void)h; return 1; }
-// A SID: revision, sub-authority count, 6-byte identifier authority, sub-authorities.
-static WINAPI DWORD GetLengthSid(const uint8_t *sid) { return 8 + 4 * (DWORD)sid[1]; }
-static WINAPI BOOL IsValidSid(const uint8_t *sid) { return sid && sid[0] == 1 && sid[1] <= 15; }
-static WINAPI BOOL CopySid(DWORD n, uint8_t *dst, const uint8_t *src) { DWORD len = GetLengthSid(src); if (n < len) { vx_set_last_error(122); return 0; } memcpy(dst, src, len); return 1; }
-static WINAPI BOOL CreateWellKnownSid(int type, const void *domain, uint8_t *sid, DWORD *size) {
-    (void)domain;
-    if (!size || *size < 16) { if (size) *size = 16; vx_set_last_error(122); return 0; }
-    memset(sid, 0, 16);
-    sid[0] = 1; sid[1] = 1; sid[7] = type == 1 ? 1 : 5;               // World (S-1-1-0) or NT authority
-    *(DWORD *)(sid + 8) = type == 1 ? 0 : type == 26 ? 18 : 11;       // ...: LocalSystem 18, else Authenticated Users 11
-    *size = 12;
-    return 1;
-}
-static WINAPI BOOL ConvertStringSidToSidA(const char *s, void **sid) {
-    (void)s;
-    uint8_t *p = calloc(1, 16);
-    p[0] = 1; p[1] = 1; p[7] = 1;                                      // S-1-1-0
-    *sid = p;
-    return 1;
-}
-static WINAPI BOOL InitializeAcl(uint8_t *acl, DWORD n, DWORD rev) { if (n < 8) return 0; memset(acl, 0, 8); acl[0] = (uint8_t)rev; *(uint16_t *)(acl + 2) = (uint16_t)n; return 1; }
-static WINAPI BOOL AddAccessAllowedAce(uint8_t *acl, DWORD rev, DWORD mask, void *sid) { (void)acl; (void)rev; (void)mask; (void)sid; return 1; }
-static WINAPI BOOL ConvertStringSecurityDescriptorToSecurityDescriptorW(const WCHAR *s, DWORD rev, void **sd, DWORD *size) {
-    (void)s; (void)rev;
-    *sd = calloc(1, 40);
-    ((uint8_t *)*sd)[0] = 1;                                           // an empty self-relative descriptor
-    if (size) *size = 40;
-    return 1;
-}
 // EventWriteString: shown with VXRT_TRACE_EVENTS=1 (programs such as SteamVR write thousands per second).
 static WINAPI DWORD EventWriteString(uint64_t reg, uint8_t level, uint64_t keyword, const WCHAR *s) {
     (void)reg; (void)level; (void)keyword;
@@ -733,13 +699,10 @@ static const vx_export advapi[] = {
     VX_EXPORT(SystemFunction036), VX_EXPORT(CryptAcquireContextA), VX_EXPORT(CryptAcquireContextW), VX_EXPORT(CryptGenRandom),
     VX_EXPORT(CryptReleaseContext), VX_EXPORT(RegisterEventSourceW), VX_EXPORT(RegisterEventSourceA), VX_EXPORT(DeregisterEventSource),
     VX_EXPORT(ReportEventW), VX_EXPORT(EventSetInformation), VX_EXPORT(AdjustTokenPrivileges), VX_EXPORT(LookupPrivilegeValueW),
-    VX_EXPORT(LookupPrivilegeValueA), VX_EXPORT(EqualSid), VX_EXPORT(LookupAccountSidA), VX_EXPORT(GetNamedSecurityInfoA),
-    VX_EXPORT(RegConnectRegistryA), VX_EXPORT(OpenSCManagerA), VX_EXPORT(OpenSCManagerW), VX_EXPORT(OpenServiceA),
+    VX_EXPORT(LookupPrivilegeValueA), VX_EXPORT(RegConnectRegistryA), VX_EXPORT(OpenSCManagerA), VX_EXPORT(OpenSCManagerW), VX_EXPORT(OpenServiceA),
     VX_EXPORT(CloseServiceHandle), { "OpenServiceW", (void *)OpenServiceA }, { "StartServiceA", (void *)service_none },
     { "StartServiceW", (void *)service_none }, { "ControlService", (void *)service_none }, { "QueryServiceStatusEx", (void *)service_none },
     { "QueryServiceConfigA", (void *)service_none }, { "QueryServiceConfigW", (void *)service_none },
-    VX_EXPORT(GetLengthSid), VX_EXPORT(IsValidSid), VX_EXPORT(CopySid), VX_EXPORT(CreateWellKnownSid), VX_EXPORT(ConvertStringSidToSidA),
-    VX_EXPORT(InitializeAcl), VX_EXPORT(AddAccessAllowedAce), VX_EXPORT(ConvertStringSecurityDescriptorToSecurityDescriptorW),
     VX_EXPORT(EventWriteString),
 };
 static const vx_export rpcrt4[] = { VX_EXPORT(UuidCreate), VX_EXPORT(UuidToStringA), VX_EXPORT(UuidFromStringA), VX_EXPORT(RpcStringFreeA) };

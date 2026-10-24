@@ -1026,17 +1026,7 @@ static BOOL shell_execute_ex(uint8_t *info, int wide) {
 }
 static WINAPI BOOL ShellExecuteExA(uint8_t *info) { return shell_execute_ex(info, 0); }
 static WINAPI BOOL ShellExecuteExW(uint8_t *info) { return shell_execute_ex(info, 1); }
-// advapi32: security objects exist but grant nothing special (the user is not an administrator); event tracing
-// accepts and drops events.
-static WINAPI BOOL InitializeSecurityDescriptor(void *sd, DWORD rev) { (void)rev; memset(sd, 0, 40); return 1; }
-static WINAPI BOOL SetSecurityDescriptorDacl(void *sd, BOOL present, void *acl, BOOL defaulted) { (void)sd; (void)present; (void)acl; (void)defaulted; return 1; }
-static WINAPI BOOL AllocateAndInitializeSid(void *auth, uint8_t n, DWORD a0, DWORD a1, DWORD a2, DWORD a3, DWORD a4, DWORD a5, DWORD a6, DWORD a7, void **sid) {
-    (void)auth; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
-    *sid = calloc(1, 8 + 4 * (size_t)n);
-    return *sid != NULL;
-}
-static WINAPI void *FreeSid(void *sid) { free(sid); return NULL; }
-static WINAPI BOOL CheckTokenMembership(HANDLE token, void *sid, BOOL *member) { (void)token; (void)sid; *member = 0; return 1; }
+// advapi32: event tracing accepts and drops events (security objects: security.c).
 static WINAPI DWORD EventRegister(const void *guid, void *cb, void *ctx, uint64_t *h) { (void)guid; (void)cb; (void)ctx; *h = 1; return 0; }
 static WINAPI DWORD EventUnregister(uint64_t h) { (void)h; return 0; }
 static WINAPI DWORD EventWrite(uint64_t h, const void *d, DWORD n, void *data) { (void)h; (void)d; (void)n; (void)data; return 0; }
@@ -1059,8 +1049,7 @@ static WINAPI DWORD GetTraceEnableFlags(uint64_t h) { (void)h; return 0; }
 static WINAPI DWORD TraceMessage(uint64_t h, DWORD flags, const void *guid, uint16_t number) { (void)h; (void)flags; (void)guid; (void)number; return 0; }
 static WINAPI DWORD TraceEvent(uint64_t h, void *header) { (void)h; (void)header; return 0; }
 static const vx_export advapi_misc[] = {
-    VX_EXPORT(InitializeSecurityDescriptor), VX_EXPORT(SetSecurityDescriptorDacl), VX_EXPORT(AllocateAndInitializeSid),
-    VX_EXPORT(FreeSid), VX_EXPORT(CheckTokenMembership), VX_EXPORT(EventRegister), VX_EXPORT(EventUnregister),
+    VX_EXPORT(EventRegister), VX_EXPORT(EventUnregister),
     VX_EXPORT(EventWrite), VX_EXPORT(EventWriteTransfer), VX_EXPORT(EventEnabled), VX_EXPORT(RegisterTraceGuidsW),
     { "RegisterTraceGuidsA", (void *)RegisterTraceGuidsW }, VX_EXPORT(UnregisterTraceGuids), VX_EXPORT(GetTraceLoggerHandle),
     VX_EXPORT(GetTraceEnableLevel), VX_EXPORT(GetTraceEnableFlags), VX_EXPORT(TraceMessage), VX_EXPORT(TraceEvent), VX_EXPORT(GetUserNameA), VX_EXPORT(GetUserNameW),
