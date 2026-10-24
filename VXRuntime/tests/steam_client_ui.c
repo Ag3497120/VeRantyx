@@ -1,6 +1,6 @@
 // What the Windows Steam client (steam.exe, its vgui windows and tier0) needed past its "Steam Service Error" box,
 // each as Microsoft documents it: TlsAlloc past the TEB's 64 slots (the 1024 expansion slots), GetClassWord(GCW_ATOM),
-// WindowFromPoint, and SetWindowPos sending WM_WINDOWPOSCHANGING and WM_WINDOWPOSCHANGED to the window procedure.
+// GetClassInfo, WindowFromPoint, and SetWindowPos sending WM_WINDOWPOSCHANGING and WM_WINDOWPOSCHANGED to the window procedure.
 // And what its web helper (Chromium) does many times a second, sampling its main thread: SuspendThread,
 // GetThreadContext, GetThreadId, ResumeThread while that thread is busy in the runtime's own calls.
 // Made-up class names and values only.
@@ -76,6 +76,12 @@ static void test_windows(void) {
     CHECK(h != NULL);
     if (!h) return;
     CHECK(GetClassWord(h, GCW_ATOM) == atom);
+    WNDCLASSW cw; memset(&cw, 0xcc, sizeof cw);
+    CHECK(GetClassInfoW(wc.hInstance, L"MadeUpVguiLikeClass", &cw) == atom);              // (no Ex: ANGLE's libGLESv2)
+    CHECK(cw.lpfnWndProc == proc && cw.hInstance == wc.hInstance && cw.cbClsExtra == 0 && cw.lpszClassName != NULL);
+    WNDCLASSA ca;
+    CHECK(GetClassInfoA(wc.hInstance, "MadeUpVguiLikeClass", &ca) == atom && ca.lpfnWndProc == proc);
+    CHECK(!GetClassInfoW(wc.hInstance, L"NoSuchMadeUpClass", &cw) && GetLastError() == ERROR_CLASS_DOES_NOT_EXIST);
     CHECK((ATOM)GetClassLongPtrW(h, GCW_ATOM) == atom);
 
     g_changing = g_changed = 0;

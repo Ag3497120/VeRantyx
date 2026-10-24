@@ -110,6 +110,25 @@ static WINAPI BOOL GetClassInfoExW(HANDLE inst, const WCHAR *name, WNDCLASSEX *w
     wc->name = name;
     return r;
 }
+// GetClassInfo (no Ex): WNDCLASS is WNDCLASSEX without cbSize in front and the small icon behind: the same fields at
+// the same offsets from lpfnWndProc on (ANGLE's libGLESv2 and Steam's gldriverquery64 import it).
+static void wndclass_from_ex(void *out, const WNDCLASSEX *ex) {
+    uint8_t *o = out;
+    memcpy(o, &ex->style, 4); memset(o + 4, 0, 4);
+    memcpy(o + 8, (const uint8_t *)ex + 8, 64 - 8 + 8);          // lpfnWndProc .. lpszClassName
+}
+static WINAPI BOOL GetClassInfoA(HANDLE inst, const char *name, void *wc) {
+    WNDCLASSEX ex; memset(&ex, 0, sizeof ex); ex.size = sizeof ex;
+    BOOL r = GetClassInfoExA(inst, name, &ex);
+    if (r && wc) wndclass_from_ex(wc, &ex);
+    return r;
+}
+static WINAPI BOOL GetClassInfoW(HANDLE inst, const WCHAR *name, void *wc) {
+    WNDCLASSEX ex; memset(&ex, 0, sizeof ex); ex.size = sizeof ex;
+    BOOL r = GetClassInfoExW(inst, name, &ex);
+    if (r && wc) wndclass_from_ex(wc, &ex);
+    return r;
+}
 
 // ---- queues ----------------------------------------------------------------------------------------------------------
 typedef struct sent_msg {
@@ -1743,7 +1762,7 @@ void vx_ui_type(HANDLE hwnd, const char *utf8) {
 
 static const vx_export user32[] = {
     VX_EXPORT(RegisterClassExA), VX_EXPORT(RegisterClassExW), VX_EXPORT(RegisterClassA), VX_EXPORT(RegisterClassW),
-    VX_EXPORT(UnregisterClassA), VX_EXPORT(UnregisterClassW), VX_EXPORT(GetClassInfoExA), VX_EXPORT(GetClassInfoExW),
+    VX_EXPORT(UnregisterClassA), VX_EXPORT(UnregisterClassW), VX_EXPORT(GetClassInfoExA), VX_EXPORT(GetClassInfoExW), VX_EXPORT(GetClassInfoA), VX_EXPORT(GetClassInfoW),
     VX_EXPORT(CreateWindowExA), VX_EXPORT(CreateWindowExW), VX_EXPORT(DestroyWindow),
     { "ShowWindow", (void *)vx_ShowWindow }, VX_EXPORT(ShowWindowAsync), VX_EXPORT(UpdateWindow),
     VX_EXPORT(SendMessageA), VX_EXPORT(SendMessageW), VX_EXPORT(SendMessageTimeoutA), VX_EXPORT(SendMessageTimeoutW),
