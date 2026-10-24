@@ -131,15 +131,22 @@ static size_t query(const void *addr, MEMORY_BASIC_INFORMATION *mbi) {
 }
 // The pages stay committed; their contents may go. Only read-write pages can be discarded (as on Windows); the x86
 // build lets macOS take the pages back. (The ARM64 build leaves them: the vCPU maps that memory, src/vm_hooks.c.)
+// Only private memory: a view of a file mapping (a file's pages, or memory another process shares) and an image are
+// refused, as VirtualAlloc's MEM_RESET refuses a range mapped to a file, and left as they are (a failed discard alters
+// nothing, documented). Windows documents no particular code for this: ERROR_INVALID_PARAMETER, as for the protection.
+int vx_in_mapped_view(uintptr_t start, uintptr_t end);   // src/files.c
 static WINAPI DWORD DiscardVirtualMemory(void *addr, size_t size) {
     if (((uintptr_t)addr & 0xfff) || !size || (size & 0xfff)) return 87;          // ERROR_INVALID_PARAMETER
+    if ((uintptr_t)addr + size < (uintptr_t)addr) return 87;
     for (uintptr_t a = (uintptr_t)addr, end = a + size; a < end; ) {
         MEMORY_BASIC_INFORMATION mbi;
         if (!query((void *)a, &mbi) || mbi.state != 0x1000 /* MEM_COMMIT */) return 487;   // ERROR_INVALID_ADDRESS
         if (mbi.protect != 0x04 /* PAGE_READWRITE */) return 87;
+        if (mbi.type != 0x20000 /* MEM_PRIVATE */) return 87;
         if (!mbi.region) break;
         a = (a & ~(uintptr_t)0xfff) + mbi.region;     // (the region's size counts from a's page)
     }
+    if (vx_in_mapped_view((uintptr_t)addr, (uintptr_t)addr + size)) return 87;
 #ifndef __aarch64__
     uintptr_t page = (uintptr_t)getpagesize(), from = ((uintptr_t)addr + page - 1) & ~(page - 1), to = ((uintptr_t)addr + size) & ~(page - 1);
     if (to > from) madvise((void *)from, to - from, MADV_FREE);

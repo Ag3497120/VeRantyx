@@ -763,6 +763,18 @@ static WINAPI void *MapViewOfFileEx(HANDLE h, DWORD access, DWORD high, DWORD lo
     return p;
 }
 static WINAPI void *MapViewOfFile(HANDLE h, DWORD access, DWORD high, DWORD low, size_t bytes) { return MapViewOfFileEx(h, access, high, low, bytes, NULL); }
+// For kernelx.c's DiscardVirtualMemory: 1 when [start, end) touches a view of a file mapping (memory Windows reports
+// as MEM_MAPPED, which VirtualQuery here does not tell apart from private memory).
+int vx_in_mapped_view(uintptr_t start, uintptr_t end) {
+    int found = 0;
+    pthread_mutex_lock(&g_views_lock);
+    for (int i = 0; i < g_view_count && !found; i++) {
+        uintptr_t a = (uintptr_t)g_views[i].addr, b = a + g_views[i].size;
+        found = start < b && a < end;
+    }
+    pthread_mutex_unlock(&g_views_lock);
+    return found;
+}
 static WINAPI BOOL UnmapViewOfFile(void *addr) {
     pthread_mutex_lock(&g_views_lock);
     size_t size = 0;

@@ -72,6 +72,36 @@ static void test_memory(void) {
     CHECK(DiscardVirtualMemory(ro, 4096) != ERROR_SUCCESS);                       // only read-write pages
     p[0] = 1; p[65535] = 2;
     CHECK(p[0] == 1 && p[65535] == 2);                                            // still committed
+    // Views of file mappings are not private memory: refused, and their contents stay (another process may share
+    // them; a file's pages are the file's)
+    HANDLE shared = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 65536, NULL);
+    BYTE *view = shared ? MapViewOfFile(shared, FILE_MAP_ALL_ACCESS, 0, 0, 65536) : NULL;
+    CHECK(view != NULL);
+    if (view) {
+        memset(view, 0x6b, 65536);
+        CHECK(DiscardVirtualMemory(view, 65536) == ERROR_INVALID_PARAMETER);
+        CHECK(DiscardVirtualMemory(view + 4096, 4096) == ERROR_INVALID_PARAMETER);
+        CHECK(view[0] == 0x6b && view[4096] == 0x6b && view[65535] == 0x6b);
+        CHECK(UnmapViewOfFile(view));
+    }
+    if (shared) CloseHandle(shared);
+    char backing[MAX_PATH];
+    snprintf(backing, sizeof backing, "%skx_view.bin", g_temp);
+    HANDLE file = CreateFileA(backing, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    HANDLE on_file = file != INVALID_HANDLE_VALUE ? CreateFileMappingA(file, NULL, PAGE_READWRITE, 0, 8192, NULL) : NULL;
+    BYTE *file_view = on_file ? MapViewOfFile(on_file, FILE_MAP_WRITE, 0, 0, 8192) : NULL;
+    CHECK(file_view != NULL);
+    if (file_view) {
+        memset(file_view, 0x3c, 8192);
+        CHECK(DiscardVirtualMemory(file_view, 8192) == ERROR_INVALID_PARAMETER);
+        CHECK(file_view[0] == 0x3c && file_view[8191] == 0x3c);
+        CHECK(UnmapViewOfFile(file_view));
+    }
+    if (on_file) CloseHandle(on_file);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    DeleteFileA(backing);
+    CHECK(DiscardVirtualMemory(p, 65536) == ERROR_SUCCESS);                       // (private memory still is)
+    p[0] = 1; p[65535] = 2;
     range_entry r = { p, 65536 };
     CHECK(PrefetchVirtualMemory(GetCurrentProcess(), 1, &r, 0));
     SetLastError(0); CHECK(!PrefetchVirtualMemory(GetCurrentProcess(), 1, &r, 1) && GetLastError() == ERROR_INVALID_PARAMETER);
