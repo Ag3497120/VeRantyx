@@ -568,7 +568,11 @@ WINAPI BOOL vx_ShowWindow(HANDLE hwnd, int cmd) {
     vx_window *w = vx_window_get(hwnd);
     if (!w) return 0;
     BOOL was = w->visible;
+    // Hiding a hidden window changes nothing, and Windows returns at once. Steam hides its hidden windows on every
+    // frame of its main loop: going to AppKit's main thread for each made it wait there for window ordering.
+    if (cmd == 0 && !was) return 0;
     int show = cmd != 0;
+    if (vx_trace && show != was) vx_log("ShowWindow %p \"%s\" %d: %s", hwnd, w->title ? w->title : "", cmd, show ? "shown" : "hidden");
     if (show != was) call_proc(w, WM_SHOWWINDOW, show, 0);
     w->visible = show;
     if (show) { w->invalid = 1; w->erase = 1; }

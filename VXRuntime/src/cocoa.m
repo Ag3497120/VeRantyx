@@ -63,7 +63,9 @@ int vx_ui_run_main(int (*program)(void *), void *arg, size_t stack) {
     pthread_mutex_unlock(&g_ui_lock);
     @autoreleasepool {
         [NSApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        // No Dock icon, menu bar or activation until the program shows something (become_regular): a Windows
+        // process whose windows are all hidden has no taskbar button (Steam started with -silent).
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
         static VXAppDelegate *delegate;
         delegate = [VXAppDelegate new];
         NSApp.delegate = delegate;
@@ -73,7 +75,6 @@ int vx_ui_run_main(int (*program)(void *), void *arg, size_t stack) {
         [app_menu addItemWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@"q"];
         app_item.submenu = app_menu;
         NSApp.mainMenu = bar;
-        if (activation_allowed()) dispatch_async(dispatch_get_main_queue(), ^{ [NSApp activateIgnoringOtherApps:YES]; });
     }
     pthread_mutex_lock(&g_ui_lock);
     g_ui_ready = 1;
@@ -274,6 +275,14 @@ static WPARAM mouse_keys(NSEvent *e) {
 // ---- operations requested by user32 -------------------------------------------------------------------------------------
 static NSWindow *native(vx_window *w) { return (__bridge NSWindow *)w->native; }
 
+// The first window shown (or message box): the program becomes an ordinary app with a Dock icon and the menu bar, and
+// takes the Mac's focus unless VXRT_NO_ACTIVATE. Main thread.
+static void become_regular(void) {
+    if (NSApp.activationPolicy == NSApplicationActivationPolicyRegular) return;
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    if (activation_allowed()) [NSApp activateIgnoringOtherApps:YES];
+}
+
 void vx_cocoa_create(vx_window *w) {
     on_main(^{
         NSWindowStyleMask mask = style_mask(w->style);
@@ -331,6 +340,7 @@ void vx_cocoa_show(vx_window *w, int cmd) {
     if (!w->native) return;
     on_main(^{
         NSWindow *win = native(w);
+        if (cmd) become_regular();
         switch (cmd) {
         case 0: [win orderOut:nil]; break;                                       // SW_HIDE
         case 2: case 6: case 7: case 11: [win miniaturize:nil]; break;           // the minimized forms
@@ -345,6 +355,7 @@ void vx_cocoa_show(vx_window *w, int cmd) {
 }
 
 void vx_cocoa_activate(vx_window *w) {
+    if (!w->visible) return;                     // (SetForegroundWindow does not show a hidden window: Steam's -silent)
     if (w->native && !activation_allowed()) { vx_window_shown_inactive(w); return; }
     if (!w->native || !activation_allowed()) return;
     on_main(^{ [native(w) makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; });
@@ -406,6 +417,7 @@ int vx_cocoa_message_box(const char *text, const char *caption, unsigned type) {
         if (k > 6) k = 0;
         int n = 0;
         for (; n < 3 && kinds[k].labels[n]; n++) [a addButtonWithTitle:[NSString stringWithUTF8String:kinds[k].labels[n]]];
+        become_regular();
         if (activation_allowed()) [NSApp activateIgnoringOtherApps:YES];
         NSModalResponse r = [a runModal];
         int index = (int)(r - NSAlertFirstButtonReturn);
