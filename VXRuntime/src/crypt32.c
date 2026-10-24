@@ -5,10 +5,13 @@
 // - CryptVerifyCertificateSignatureEx succeeds only when SecKeyVerifySignature verified the signature with the
 //   issuer's public key. What macOS cannot check (MD5, DSA, unsigned hashes, chains as issuers) is NTE_BAD_ALGID or
 //   E_INVALIDARG, never success.
-// - Chains are built and judged by SecTrust (macOS's roots, or an engine's exclusive roots); their error bits come only
-//   from its evaluations, and a chain context not made here is never reported trusted.
+// - Chains are built and judged by SecTrust (macOS's roots, or an engine's exclusive roots); their error bits come from
+//   its evaluations and from the usages, issuance policies and signature strength the caller asks for, checked here
+//   on every certificate of the chain (what cannot be checked is not met). A chain context not made here is never
+//   reported trusted.
 // - The system stores (ROOT, CA, MY, ...) open empty: no root is trusted through them and there are no private keys
-//   (CryptAcquireCertificatePrivateKey and CertFindChainInStore find none).
+//   (CryptAcquireCertificatePrivateKey and CertFindChainInStore find none). Stores this code cannot read (files,
+//   PKCS #7, PKCS #12, serialized, ...) do not open, rather than open empty.
 // - WinVerifyTrust never returns 0 for a verification: Authenticode is not checked here, so a file with a signature is
 //   TRUST_E_SUBJECT_NOT_TRUSTED (one without is TRUST_E_NOSIGNATURE); there are no catalogs (CryptCATAdmin*).
 // These tables are registered before client.c's and extras.c's stand-ins for the same functions (loader.c): they
@@ -460,22 +463,35 @@ static int contains_store(store *s, store *t, int depth) {
 
 // Memory and collection stores hold what the program adds. The system stores (ROOT, CA, MY, ... in any location) open
 // empty: nothing of this Mac is shown as a Windows root or a personal certificate, and nothing added is saved.
+// The providers that read certificates the program hands over (a message, a file, PKCS #7, PKCS #12, a serialized
+// store, a registry key, a smart card, LDAP) are not implemented: they fail with ERROR_NOT_SUPPORTED rather than open
+// empty, so that a caller never takes a store it could not read for one with nothing in it (a list of certificates to
+// refuse, read as empty, would refuse none). A provider Windows does not have either is ERROR_FILE_NOT_FOUND, the one
+// error CertOpenStore documents as its own.
 static WINAPI void *CertOpenStore(const char *provider, DWORD encoding, uintptr_t prov, DWORD flags, const void *para) {
     (void)encoding; (void)prov; (void)para;
     uintptr_t id = (uintptr_t)provider;
-    int kind;
-    if (id <= 0xffff) {
-        kind = id == 2 ? STORE_MEMORY : id == 11 ? STORE_COLLECTION : 0;
-        if (id == 4 || (id >= 9 && id <= 10) || (id >= 12 && id <= 14)) kind = STORE_SYSTEM;   // registry, system, physical
+    int kind, known;
+    const char *name = id <= 0xffff ? NULL : host(provider);
+    if (!name) {
+        kind = id == 2 ? STORE_MEMORY : id == 11 ? STORE_COLLECTION : (id >= 9 && id <= 10) || (id >= 12 && id <= 14) ? STORE_SYSTEM : 0;
+        known = id >= 1 && id <= 17;                                 // CERT_STORE_PROV_MSG .. CERT_STORE_PROV_PKCS12
     } else {
-        const char *p = host(provider);
-        kind = !strcasecmp(p, "Memory") ? STORE_MEMORY : !strcasecmp(p, "Collection") ? STORE_COLLECTION
-             : !strcasecmp(p, "System") || !strcasecmp(p, "SystemRegistry") || !strcasecmp(p, "Physical") ? STORE_SYSTEM : 0;
+        kind = !strcasecmp(name, "Memory") ? STORE_MEMORY : !strcasecmp(name, "Collection") ? STORE_COLLECTION
+             : !strcasecmp(name, "System") || !strcasecmp(name, "SystemRegistry") || !strcasecmp(name, "Physical") ? STORE_SYSTEM : 0;
+        static const char *const unread[] = { "File", "PKCS7", "PKCS12", "Serialized", "SmartCard", "Ldap" };
+        known = 0;
+        for (size_t i = 0; i < sizeof unread / sizeof unread[0]; i++) if (!strcasecmp(name, unread[i])) known = 1;
     }
-    if (!kind) {                                                     // files, PKCS #7, serialized, LDAP...: not read
-        static int logged;
-        if (!logged++) vx_log("crypt32: CertOpenStore(%s): opened as an empty store", id <= 0xffff ? "provider number" : (const char *)host(provider));
-        kind = STORE_MEMORY;
+    if (!kind) {
+        static uint32_t logged;                                      // (once for each provider number, once for names)
+        uint32_t bit = name ? 1u << 31 : 1u << (id < 31 ? id : 30);
+        if (!(__atomic_fetch_or(&logged, bit, __ATOMIC_RELAXED) & bit)) {
+            if (name) vx_log("crypt32: CertOpenStore(\"%s\"): provider not implemented, the store is not opened", name);
+            else vx_log("crypt32: CertOpenStore(provider %llu): not implemented, the store is not opened", (unsigned long long)id);
+        }
+        vx_set_last_error(known ? ERROR_NOT_SUPPORTED : ERROR_FILE_NOT_FOUND);
+        return NULL;
     }
     if (flags & CERT_STORE_DELETE_FLAG) { vx_set_last_error(0); return NULL; }   // (deleting a store: nothing kept here)
     pthread_mutex_lock(&g_lock);
@@ -1460,8 +1476,13 @@ static WINAPI BOOL CryptVerifyCertificateSignature(uintptr_t prov, DWORD encodin
 //   - validity times are compared here; when one is off, the evaluations above use a time inside every validity
 //     period, so the rest is still checked.
 // Revocation, when asked for, is macOS's check (SecPolicyCreateRevocation); not checked is "status unknown, offline".
+// What CERT_CHAIN_PARA asks of the chain beyond that is checked here on the certificates macOS built it from
+// (chain_allows, chain_strong): the usages asked for against every certificate's extended key usage, the issuance
+// policies asked for against their certificate policies, and with pStrongSignPara the signature and key strength; what
+// is not met (or could not be read) sets CERT_TRUST_IS_NOT_VALID_FOR_USAGE or CERT_TRUST_HAS_WEAK_SIGNATURE.
 // CertVerifyCertificateChainPolicy reports these bits as Windows' errors; its SSL policy is one more SecTrust
-// evaluation with macOS's SSL policy and the server name. A chain context not made here is never reported trusted.
+// evaluation with macOS's SSL policy and the server name, whose details say what failed (a usage alone is excused by
+// IGNORE_WRONG_USAGE, a name never by it). A chain context not made here is never reported trusted.
 typedef struct { DWORD err, info; } trust_status;
 typedef struct { DWORD cbSize; void *pCertContext; trust_status TrustStatus; void *pRevocationInfo, *pIssuanceUsage, *pApplicationUsage;
                  const WCHAR *pwszExtendedErrorInfo; } chain_element;
@@ -1520,11 +1541,13 @@ static CFDateRef cf_date(uint64_t ft) {
 }
 
 // One evaluation: 0 when macOS trusts the certificates (end certificate first) under the policies at the date, else
-// its error. *built receives the chain it built; *revocation_checked whether revocation status was established.
+// its error. *built receives the chain it built; *revocation_checked whether revocation status was established;
+// *details what failed, certificate by certificate (SecTrustCopyResult's "TrustResultDetails"), or NULL.
 static OSStatus evaluate(CFArrayRef certs, CFTypeRef policies, CFDateRef date, CFArrayRef anchors, int anchors_only, int fetch,
-                         CFArrayRef *built, int *revocation_checked) {
+                         CFArrayRef *built, int *revocation_checked, CFArrayRef *details) {
     SecTrustRef trust = NULL;
     if (built) *built = NULL;
+    if (details) *details = NULL;
     if (SecTrustCreateWithCertificates(certs, policies, &trust) != errSecSuccess || !trust) return errSecInternalComponent;
     if (date) SecTrustSetVerifyDate(trust, date);
     SecTrustSetNetworkFetchAllowed(trust, fetch);
@@ -1537,10 +1560,12 @@ static OSStatus evaluate(CFArrayRef certs, CFTypeRef policies, CFDateRef date, C
     }
     if (error) CFRelease(error);
     if (built) *built = SecTrustCopyCertificateChain(trust);
-    if (revocation_checked) {
+    if (revocation_checked || details) {
         CFDictionaryRef r = SecTrustCopyResult(trust);
         CFTypeRef v = r ? CFDictionaryGetValue(r, kSecTrustRevocationChecked) : NULL;
-        *revocation_checked = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
+        if (revocation_checked) *revocation_checked = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
+        CFTypeRef d = r && details ? CFDictionaryGetValue(r, CFSTR("TrustResultDetails")) : NULL;
+        if (d && CFGetTypeID(d) == CFArrayGetTypeID()) *details = CFRetain(d);
         if (r) CFRelease(r);
     }
     CFRelease(trust);
@@ -1638,21 +1663,191 @@ static WINAPI void *CertDuplicateCertificateChain(const void *p) {
     return (void *)p;
 }
 
-// Does the end certificate's extended key usage allow what the caller asks for (CERT_USAGE_MATCH)? No extension: any.
-static int usage_allowed(const cert *c, DWORD match_type, DWORD count, char *const *oids) {
-    const ext *e = find_ext(c, "2.5.29.37");
-    if (!e || !count || !oids) return 1;
-    int found_all = 1, found_any = 0;
-    for (DWORD i = 0; i < count; i++) {
-        const char *want = host(oids[i]);
-        int found = 0;
-        span v = e->value; tlv seq, o; char text[128];
-        if (!want || der_expect(&v, 0x30, &seq)) return 0;
-        for (span s = seq.body; s.n && !found;)
-            found = !der_expect(&s, 0x06, &o) && !oid_text(o.body, text, sizeof text) && (!strcmp(text, want) || !strcmp(text, "2.5.29.37.0"));
-        found_all &= found; found_any |= found;
+// ---- what a chain is good for: usages, issuance policies, strong signatures ---------------------------------------
+// Usages: Windows gives a chain the usages that every certificate in it allows (their intersection; a certificate
+// without the extended key usage extension, or with anyExtendedKeyUsage, allows every usage). macOS's basic policy
+// looks at none of them, so they are compared here, for the whole chain.
+// Issuance policies, as RFC 5280 6.1 takes them, minus what this code does not follow: every certificate below the root
+// must assert the policy asked for in its certificatePolicies (anyPolicy stands for every policy); the root (the last
+// certificate, self-issued, above the end certificate) restricts nothing without the extension, and must assert it too
+// when it has one. A chain with policy mappings anywhere is valid for no policy asked for (mappings are not followed
+// here), and with inhibitAnyPolicy anywhere only policies named explicitly count: both only ever narrow what RFC 5280
+// would accept. A certificate of the chain that did not parse here allows nothing.
+#define OID_EKU "2.5.29.37"
+#define OID_ANY_EKU "2.5.29.37.0"
+#define OID_POLICIES "2.5.29.32"
+#define OID_ANY_POLICY "2.5.29.32.0"
+#define OID_POLICY_MAPPINGS "2.5.29.33"
+#define OID_INHIBIT_ANY_POLICY "2.5.29.54"
+#define TRUST_HAS_WEAK_SIGNATURE 0x00100000
+#define CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG 0x1
+
+// Does the extension's list (OIDs; for certificatePolicies, SEQUENCEs that start with one) name `want`, or `any`?
+// 1 yes, 0 no, -1 it does not parse.
+static int ext_names(const ext *e, int policies, const char *want, const char *any) {
+    span v = e->value; tlv seq, item, o; char text[128];
+    if (der_expect(&v, 0x30, &seq)) return -1;
+    for (span s = seq.body; s.n;) {
+        if (policies) {
+            if (der_expect(&s, 0x30, &item)) return -1;
+            span b = item.body;
+            if (der_expect(&b, 0x06, &o)) return -1;
+        } else if (der_expect(&s, 0x06, &o)) return -1;
+        if (oid_text(o.body, text, sizeof text)) return -1;
+        if (!strcmp(text, want) || (any && !strcmp(text, any))) return 1;
     }
-    return match_type == 1 ? found_any : found_all;                  // USAGE_MATCH_TYPE_OR : _AND
+    return 0;
+}
+
+static int cert_allows(const cert *c, int policies, int root, int any_ok, const char *want) {
+    if (!c || !want) return 0;
+    if (policies && find_ext(c, OID_POLICY_MAPPINGS)) return 0;
+    const ext *e = find_ext(c, policies ? OID_POLICIES : OID_EKU);
+    if (!e) return !policies || root;
+    return ext_names(e, policies, want, any_ok ? (policies ? OID_ANY_POLICY : OID_ANY_EKU) : NULL) == 1;
+}
+
+// Is the chain (certs[0..n-1], end certificate first; certs[n-1] its root when root_last) valid for what CERT_USAGE_MATCH
+// asks (every usage or policy for USAGE_MATCH_TYPE_AND, one of them for _OR)? When not, each certificate that leaves
+// out one of them gets `bit` in el_err.
+static int chain_allows(cert *const *certs, int n, int root_last, int policies, DWORD match_type, DWORD count, char *const *oids,
+                        DWORD *el_err, DWORD bit) {
+    if (!count) return 1;
+    int any_ok = 1, all = 1, some = 0;
+    for (int i = 0; policies && i < n; i++) if (!certs[i] || find_ext(certs[i], OID_INHIBIT_ANY_POLICY)) any_ok = 0;
+    char *missing = calloc((size_t)n, 1);
+    for (DWORD k = 0; k < count; k++) {
+        const char *want = oids ? host(oids[k]) : NULL;
+        int ok = 1;
+        for (int i = 0; i < n; i++)
+            if (!cert_allows(certs[i], policies, root_last && n > 1 && i == n - 1, any_ok, want)) { ok = 0; if (missing) missing[i] = 1; }
+        all &= ok; some |= ok;
+    }
+    int valid = match_type == 1 ? some : all;                        // USAGE_MATCH_TYPE_OR : _AND
+    for (int i = 0; !valid && i < n; i++) if (!missing || missing[i]) el_err[i] |= bit;
+    free(missing);
+    return valid;
+}
+
+// Strong signatures (CERT_CHAIN_PARA.pStrongSignPara): which signature/hash pairs and key sizes count as strong. The
+// two sets Windows names by OID (wincrypt.h): szOID_CERT_STRONG_SIGN_OS_1, SHA-2 hashes with RSA keys from 2048 bits
+// and ECDSA keys from 256; szOID_CERT_STRONG_KEY_OS_1, the same keys with SHA-1 allowed too. Or the caller's own lists
+// (CERT_STRONG_SIGN_SERIALIZED_INFO): "RSA/SHA256;ECDSA/SHA384" and "RSA/2048;ECDSA/256". Any other choice or OID is
+// no rule known here, and nothing is strong under it.
+// Checked: the signature on every certificate but a self-issued root's own (a root is trusted as it is, not for its
+// signature), and the key of every certificate that signs another, and the end certificate's unless
+// CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG. A certificate that fails gets CERT_TRUST_HAS_WEAK_SIGNATURE.
+typedef struct { unsigned pairs; int min_bits[2]; } strong_rules;     // pairs: bit 4 * (RSA 0, ECDSA 1) + (SHA-1 0, SHA-256 1, -384 2, -512 3)
+
+static int name_index(const char *s, size_t n, const char *const *names, int count) {
+    for (int i = 0; i < count; i++) if (strlen(names[i]) == n && !strncasecmp(s, names[i], n)) return i;
+    return -1;
+}
+// "A/B;C/D" pairs; each is handed to `add` as the two parts.
+static void each_pair(const char *list, void (*add)(strong_rules *, const char *, size_t, const char *, size_t), strong_rules *r) {
+    for (const char *p = list; p && *p;) {
+        const char *end = strchr(p, ';'), *slash = strchr(p, '/');
+        if (!end) end = p + strlen(p);
+        if (slash && slash < end) add(r, p, (size_t)(slash - p), slash + 1, (size_t)(end - slash - 1));
+        p = *end ? end + 1 : end;
+    }
+}
+static const char *const key_algs[] = { "RSA", "ECDSA" }, *const hash_algs[] = { "SHA1", "SHA256", "SHA384", "SHA512" };
+static void add_sign_pair(strong_rules *r, const char *a, size_t an, const char *b, size_t bn) {
+    int k = name_index(a, an, key_algs, 2), h = name_index(b, bn, hash_algs, 4);
+    if (k >= 0 && h >= 0) r->pairs |= 1u << (4 * k + h);
+}
+static void add_key_bits(strong_rules *r, const char *a, size_t an, const char *b, size_t bn) {
+    int k = name_index(a, an, key_algs, 2), bits = 0;
+    for (size_t i = 0; i < bn && b[i] >= '0' && b[i] <= '9' && bits < 1000000; i++) bits = bits * 10 + (b[i] - '0');
+    if (k >= 0 && bits > r->min_bits[k]) r->min_bits[k] = bits;
+}
+
+// The rules of a CERT_STRONG_SIGN_PARA; with none known, rules that nothing meets.
+static strong_rules strong_rules_of(const uint8_t *para) {
+    strong_rules r = { 0, { 0, 0 } };
+    DWORD choice = *(const DWORD *)(para + 4);
+    const void *info = host(*(void *const *)(para + 8));
+    if (choice == 2 && info) {                                       // CERT_STRONG_SIGN_OID_INFO_CHOICE
+        int key_os = !strcmp(info, "1.3.6.1.4.1.311.72.2.1");
+        if (key_os || !strcmp(info, "1.3.6.1.4.1.311.72.1.1")) {
+            r.pairs = 0xee | (key_os ? 0x11 : 0);
+            r.min_bits[0] = 2048; r.min_bits[1] = 256;
+        }
+    } else if (choice == 1 && info) {                                // CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE
+        char *sign = vx_utf8_dup(host(*(const WCHAR *const *)((const uint8_t *)info + 8)));
+        char *keys = vx_utf8_dup(host(*(const WCHAR *const *)((const uint8_t *)info + 16)));
+        each_pair(sign, add_sign_pair, &r);
+        each_pair(keys, add_key_bits, &r);
+        free(sign); free(keys);
+    }
+    return r;
+}
+
+// The pair bit of a certificate's signature algorithm (see strong_rules); -1 for one never strong (SHA-224, MD5, DSA...).
+static int signature_pair(const cert *c) {
+    span cur = c->sig_alg, oid, params;
+    int ec;
+    if (parse_alg(&cur, NULL, &oid, &params)) return -1;
+    SecKeyAlgorithm a = signature_algorithm(oid, params, &ec);
+    const SecKeyAlgorithm pairs[3][4] = {
+        { kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA1, kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256,
+          kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA384, kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA512 },
+        { kSecKeyAlgorithmRSASignatureMessagePSSSHA1, kSecKeyAlgorithmRSASignatureMessagePSSSHA256,
+          kSecKeyAlgorithmRSASignatureMessagePSSSHA384, kSecKeyAlgorithmRSASignatureMessagePSSSHA512 },
+        { kSecKeyAlgorithmECDSASignatureMessageX962SHA1, kSecKeyAlgorithmECDSASignatureMessageX962SHA256,
+          kSecKeyAlgorithmECDSASignatureMessageX962SHA384, kSecKeyAlgorithmECDSASignatureMessageX962SHA512 },
+    };
+    for (int k = 0; a && k < 3; k++)
+        for (int h = 0; h < 4; h++) if (a == pairs[k][h]) return 4 * (k == 2) + h;
+    return -1;
+}
+
+// A certificate's key: 0 RSA, 1 EC (P-256/384/521), -1 anything else; *bits its size (the RSA modulus's).
+static int key_strength(const cert *c, int *bits) {
+    char oid[128];
+    *bits = 0;
+    if (oid_text(c->key_alg, oid, sizeof oid) || c->info.SubjectPublicKeyInfo.PublicKey.cUnusedBits) return -1;
+    if (!strcmp(oid, "1.2.840.113549.1.1.1") || !strcmp(oid, "1.2.840.113549.1.1.10")) {
+        span k = c->key_bits; tlv seq, mod;
+        if (der_expect(&k, 0x30, &seq)) return -1;
+        span b = seq.body;
+        if (der_expect(&b, 0x02, &mod)) return -1;
+        const uint8_t *p = mod.body.p;
+        size_t n = mod.body.n;
+        while (n && !*p) { p++; n--; }
+        if (!n || n > 0x10000) return -1;
+        int top = 8;
+        while (top && !(p[0] >> (top - 1))) top--;
+        *bits = (int)(n - 1) * 8 + top;
+        return 0;
+    }
+    if (!strcmp(oid, "1.2.840.10045.2.1")) {
+        span p = c->key_params; tlv o; char curve[64];
+        if (der_expect(&p, 0x06, &o) || oid_text(o.body, curve, sizeof curve)) return -1;
+        *bits = !strcmp(curve, "1.2.840.10045.3.1.7") ? 256 : !strcmp(curve, "1.3.132.0.34") ? 384 : !strcmp(curve, "1.3.132.0.35") ? 521 : 0;
+        return *bits ? 1 : -1;
+    }
+    return -1;
+}
+
+// Is every signature and key of the chain strong under the rules? Weak certificates get the bit in el_err.
+static int chain_strong(cert *const *certs, int n, int root_last, const strong_rules *r, DWORD flags, DWORD *el_err) {
+    int strong = 1;
+    for (int i = 0; i < n; i++) {
+        const cert *c = certs[i];
+        int weak = !c, bits = 0;
+        if (c && !(root_last && i == n - 1)) {
+            int pair = signature_pair(c);
+            if (pair < 0 || !(r->pairs & 1u << pair)) weak = 1;
+        }
+        if (c && (i > 0 || !(flags & CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG))) {
+            int k = key_strength(c, &bits);
+            if (k < 0 || !r->min_bits[k] || bits < r->min_bits[k]) weak = 1;
+        }
+        if (weak) { el_err[i] |= TRUST_HAS_WEAK_SIGNATURE; strong = 0; }
+    }
+    return strong;
 }
 
 static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, const filetime *when, void *additional, const uint8_t *para,
@@ -1689,13 +1884,22 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
     for (int i = 0; eng && i < eng->nstores; i++) append_store(certs, eng->stores[i], &candidates);
     pthread_mutex_unlock(&g_lock);
 
-    DWORD usage_type = 0, usage_n = 0;
-    char *const *usage = NULL;
-    if (para && *(const DWORD *)para >= 32) {                         // CERT_CHAIN_PARA.RequestedUsage
+    // CERT_CHAIN_PARA: RequestedUsage, and with the extra fields RequestedIssuancePolicy, pStrongSignPara, dwStrongSignFlags
+    DWORD para_size = para ? *(const DWORD *)para : 0, usage_type = 0, usage_n = 0, policy_type = 0, policy_n = 0, strong_flags = 0;
+    char *const *usage = NULL, *const *policy = NULL;
+    const uint8_t *strong = NULL;
+    if (para_size >= 32) {
         usage_type = *(const DWORD *)(para + 8);
         usage_n = *(const DWORD *)(para + 16);
         usage = host(*(char *const *const *)(para + 24));
     }
+    if (para_size >= 56) {
+        policy_type = *(const DWORD *)(para + 32);
+        policy_n = *(const DWORD *)(para + 40);
+        policy = host(*(char *const *const *)(para + 48));
+    }
+    if (para_size >= 88) strong = host(*(const uint8_t *const *)(para + 80));
+    if (para_size >= 92) strong_flags = *(const DWORD *)(para + 88);
     int fetch = !(flags & (CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL | CERT_CHAIN_DISABLE_AIA)) && !(eng && eng->no_fetch);
     SecPolicyRef basic = SecPolicyCreateBasicX509();
     CFArrayRef anchors = eng && eng->exclusive ? eng->exclusive : NULL;
@@ -1703,12 +1907,24 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
 
     // 1. the chain macOS builds, and whether the time asked for is inside every certificate's validity
     CFArrayRef built = NULL;
-    OSStatus full = first ? evaluate(certs, basic, date, anchors, anchors_only, fetch, &built, NULL) : errSecInternalComponent;
+    OSStatus full = first ? evaluate(certs, basic, date, anchors, anchors_only, fetch, &built, NULL, NULL) : errSecInternalComponent;
     CFIndex n = built ? CFArrayGetCount(built) : 0;
     uint64_t latest_start = 0, earliest_end = ~0ull;
     DWORD time_bad = 0;
     cert **made = calloc((size_t)(n ? n : 1), sizeof *made);
+    DWORD *el_err = calloc((size_t)(n ? n : 1), sizeof *el_err);     // each element's errors from the checks below
     pthread_mutex_lock(&g_lock);
+    if (!made || !el_err) {
+        cert_release(leaf);
+        for (int i = 0; i < candidates.n; i++) cert_release(candidates.v[i]);
+        store_release(own);
+        pthread_mutex_unlock(&g_lock);
+        free(made); free(el_err); free(candidates.v);
+        if (built) CFRelease(built);
+        CFRelease(basic); CFRelease(certs); CFRelease(date);
+        vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
     made[0] = leaf;
     for (CFIndex i = 1; i < n; i++) {
         CFDataRef d = SecCertificateCopyData((SecCertificateRef)CFArrayGetValueAtIndex(built, i));
@@ -1726,26 +1942,26 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
     }
     CFDateRef relaxed = time_bad && latest_start <= earliest_end ? cf_date(latest_start) : NULL;
 
-    // 2. the error bits, each from an evaluation macOS did (see above)
-    DWORD err = 0;
+    // 2. the error bits, each from an evaluation macOS did (see above), or from what the chain is good for
+    DWORD err = 0, macos_usage = 0;
     int root_untrusted = 0, partial = 0;
     const cert *last = made[n - 1];
     int last_self_issued = last && last->subject.n == last->issuer.n && !memcmp(last->subject.p, last->issuer.p, last->subject.n);
     CFDateRef eval_date = time_bad ? relaxed : date;
-    OSStatus e1 = !eval_date ? errSecCertificateExpired : !time_bad ? full : evaluate(built ? built : certs, basic, eval_date, anchors, anchors_only, 0, NULL, NULL);
+    OSStatus e1 = !eval_date ? errSecCertificateExpired : !time_bad ? full : evaluate(built ? built : certs, basic, eval_date, anchors, anchors_only, 0, NULL, NULL, NULL);
     if (!e1 && eng && eng->restricted)                                 // a restricted root must also be one of the engine's
-        e1 = evaluate(built ? built : certs, basic, eval_date, eng->restricted, 1, 0, NULL, NULL);
+        e1 = evaluate(built ? built : certs, basic, eval_date, eng->restricted, 1, 0, NULL, NULL, NULL);
     if (e1) {
         OSStatus e2 = errSecNotTrusted;
         if (eval_date && built && n) {
             const void *root = CFArrayGetValueAtIndex(built, n - 1);
             CFArrayRef self = CFArrayCreate(NULL, &root, 1, &kCFTypeArrayCallBacks);
-            e2 = evaluate(built, basic, eval_date, self, 1, 0, NULL, NULL);
+            e2 = evaluate(built, basic, eval_date, self, 1, 0, NULL, NULL, NULL);
             CFRelease(self);
         }
         if (!e2) { if (last_self_issued) root_untrusted = 1; else partial = 1; }
         else err |= TRUST_NOT_SIGNATURE_VALID | TRUST_UNTRUSTED_ROOT;
-        if (e1 == errSecInvalidExtendedKeyUsage || e1 == errSecInvalidKeyUsageForPolicy) err |= TRUST_NOT_VALID_FOR_USAGE;
+        if (e1 == errSecInvalidExtendedKeyUsage || e1 == errSecInvalidKeyUsageForPolicy) macos_usage = TRUST_NOT_VALID_FOR_USAGE;
         if (e1 == errSecCertificateRevoked) err |= TRUST_REVOKED;
     }
     if (root_untrusted) err |= TRUST_UNTRUSTED_ROOT;
@@ -1773,13 +1989,20 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
     pthread_mutex_unlock(&g_lock);
     free(candidates.v);
     if (time_bad) err |= TRUST_NOT_TIME_VALID;
-    if (!usage_allowed(leaf, usage_type, usage_n, usage)) err |= TRUST_NOT_VALID_FOR_USAGE;
+    err |= macos_usage;
+    int usage_ok = chain_allows(made, (int)n, last_self_issued, 0, usage_type, usage_n, usage, el_err, TRUST_NOT_VALID_FOR_USAGE);
+    int policy_ok = chain_allows(made, (int)n, last_self_issued, 1, policy_type, policy_n, policy, el_err, TRUST_NOT_VALID_FOR_USAGE);
+    if (!usage_ok || !policy_ok) err |= TRUST_NOT_VALID_FOR_USAGE;
+    if (strong) {
+        strong_rules rules = strong_rules_of(strong);
+        if (!chain_strong(made, (int)n, last_self_issued, &rules, strong_flags, el_err)) err |= TRUST_HAS_WEAK_SIGNATURE;
+    }
     if (flags & CERT_CHAIN_REVOCATION_FLAGS) {                        // revocation: macOS's check, or "unknown"
         SecPolicyRef rev = SecPolicyCreateRevocation(kSecRevocationUseAnyAvailableMethod);
         const void *both[2] = { basic, rev };
         CFArrayRef policies = CFArrayCreate(NULL, both, 2, &kCFTypeArrayCallBacks);
         int checked = 0;
-        OSStatus r = evaluate(built ? built : certs, policies, eval_date ? eval_date : date, anchors, anchors_only, fetch, NULL, &checked);
+        OSStatus r = evaluate(built ? built : certs, policies, eval_date ? eval_date : date, anchors, anchors_only, fetch, NULL, &checked, NULL);
         if (r == errSecCertificateRevoked) err |= TRUST_REVOKED;
         else if (!checked) err |= TRUST_REVOCATION_UNKNOWN | TRUST_OFFLINE_REVOCATION;
         CFRelease(policies); CFRelease(rev);
@@ -1792,7 +2015,7 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
     chain_element *el = ch ? vx_heap_zalloc((size_t)n * sizeof *el) : NULL;
     chain_element **pel = el ? vx_heap_zalloc((size_t)n * sizeof *pel) : NULL;
     if (!ch || !el || !pel) {
-        free(ch); free(el); free(pel);
+        free(ch); free(el); free(pel); free(el_err);
         pthread_mutex_lock(&g_lock);
         for (CFIndex i = 0; i < n; i++) if (made[i]) cert_release(made[i]);
         store_release(own);
@@ -1813,7 +2036,8 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
         if (c->subject.n == c->issuer.n && !memcmp(c->subject.p, c->issuer.p, c->subject.n)) s.info |= TRUST_INFO_SELF_SIGNED;
         if (i + 1 < n && made[i + 1] && made[i + 1]->subject.n == c->issuer.n && !memcmp(made[i + 1]->subject.p, c->issuer.p, c->issuer.n))
             s.info |= TRUST_INFO_NAME_MATCH_ISSUER;
-        if (i == 0) s.err |= err & (TRUST_NOT_VALID_FOR_USAGE | TRUST_REVOKED | TRUST_NOT_SIGNATURE_VALID | TRUST_REVOCATION_UNKNOWN | TRUST_OFFLINE_REVOCATION);
+        if (i == 0) s.err |= macos_usage | (err & (TRUST_REVOKED | TRUST_NOT_SIGNATURE_VALID | TRUST_REVOCATION_UNKNOWN | TRUST_OFFLINE_REVOCATION));
+        s.err |= el_err[i];
         if (i == n - 1) {
             s.err |= err & (TRUST_UNTRUSTED_ROOT | TRUST_PARTIAL_CHAIN);
             if (anchors_only && !e1) s.info |= TRUST_INFO_FROM_EXCLUSIVE;
@@ -1822,6 +2046,7 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
         pel[m] = PROG_PTR(&el[m]);
         made[m++] = c;
     }
+    free(el_err);
     ch->magic = CHAIN_MAGIC; ch->refs = 1;
     ch->el = el; ch->pel = pel; ch->n = m; ch->certs = made; ch->own = own;
     ch->sec_certs = built; ch->date = date; ch->relaxed = relaxed;
@@ -1839,6 +2064,7 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
 #define CERT_E_EXPIRED 0x800B0101u
 #define CERT_E_UNTRUSTEDROOT 0x800B0109u
 #define CERT_E_CHAINING 0x800B010Au
+#define TRUST_E_FAIL 0x800B010Bu
 #define CERT_E_CN_NO_MATCH 0x800B010Fu
 #define CERT_E_WRONG_USAGE 0x800B0110u
 #define TRUST_E_CERT_SIGNATURE 0x80096004u
@@ -1857,19 +2083,63 @@ static WINAPI BOOL CertGetCertificateChain(void *engine_h, const void *ctx, cons
 typedef struct { DWORD cbSize, dwError; LONG lChainIndex, lElementIndex; void *pvExtraPolicyStatus; } policy_status;
 _Static_assert(sizeof(policy_status) == 24, "CERT_CHAIN_POLICY_STATUS");
 
-// The first error of the chain that the flags do not excuse, the ones no flag excuses first.
-static DWORD base_error(DWORD bits, DWORD ignore) {
-    if (bits & TRUST_NOT_SIGNATURE_VALID) return TRUST_E_CERT_SIGNATURE;
-    if (bits & TRUST_REVOKED) return CRYPT_E_REVOKED;
-    if ((bits & TRUST_UNTRUSTED_ROOT) && !(ignore & POLICY_ALLOW_UNKNOWN_CA)) return CERT_E_UNTRUSTEDROOT;
-    if (bits & TRUST_PARTIAL_CHAIN) return CERT_E_CHAINING;          // (nothing above the last certificate was checked)
-    if ((bits & TRUST_NOT_TIME_VALID) && !(ignore & POLICY_IGNORE_NOT_TIME_VALID)) return CERT_E_EXPIRED;
-    if ((bits & TRUST_NOT_VALID_FOR_USAGE) && !(ignore & POLICY_IGNORE_WRONG_USAGE)) return CERT_E_WRONG_USAGE;
-    if ((bits & (TRUST_REVOCATION_UNKNOWN | TRUST_OFFLINE_REVOCATION)) && (ignore & POLICY_IGNORE_ALL_REV_UNKNOWN) != POLICY_IGNORE_ALL_REV_UNKNOWN)
-        return CRYPT_E_REVOCATION_OFFLINE;
-    bits &= ~(DWORD)(TRUST_UNTRUSTED_ROOT | TRUST_PARTIAL_CHAIN | TRUST_NOT_TIME_VALID | TRUST_NOT_VALID_FOR_USAGE | TRUST_REVOCATION_UNKNOWN |
-                     TRUST_OFFLINE_REVOCATION);
-    return bits ? CERT_E_UNTRUSTEDROOT : 0;                           // (any other error: not trusted)
+// The first error of the chain that the flags do not excuse, the ones no flag excuses first; *bit receives the trust
+// bits it stands for (to find the element that has them).
+static DWORD base_error(DWORD bits, DWORD ignore, DWORD *bit) {
+    static const struct { DWORD bits, excused_by, error; } order[] = {
+        { TRUST_NOT_SIGNATURE_VALID | TRUST_HAS_WEAK_SIGNATURE, 0, TRUST_E_CERT_SIGNATURE },
+        { TRUST_REVOKED, 0, CRYPT_E_REVOKED },
+        { TRUST_UNTRUSTED_ROOT, POLICY_ALLOW_UNKNOWN_CA, CERT_E_UNTRUSTEDROOT },
+        { TRUST_PARTIAL_CHAIN, 0, CERT_E_CHAINING },                 // (nothing above the last certificate was checked)
+        { TRUST_NOT_TIME_VALID, POLICY_IGNORE_NOT_TIME_VALID, CERT_E_EXPIRED },
+        { TRUST_NOT_VALID_FOR_USAGE, POLICY_IGNORE_WRONG_USAGE, CERT_E_WRONG_USAGE },
+        { TRUST_REVOCATION_UNKNOWN | TRUST_OFFLINE_REVOCATION, POLICY_IGNORE_ALL_REV_UNKNOWN, CRYPT_E_REVOCATION_OFFLINE },
+    };
+    DWORD known = 0;
+    *bit = 0;
+    for (size_t i = 0; i < sizeof order / sizeof order[0]; i++) {
+        known |= order[i].bits;
+        if ((bits & order[i].bits) && (!order[i].excused_by || (ignore & order[i].excused_by) != order[i].excused_by)) {
+            *bit = order[i].bits;
+            return order[i].error;
+        }
+    }
+    *bit = bits & ~known;
+    return bits & ~known ? CERT_E_UNTRUSTEDROOT : 0;                 // (any other error: not trusted)
+}
+
+// Why macOS's SSL evaluation refused the chain, from its details (SecTrustCopyResult's "TrustResultDetails": for each
+// certificate a dictionary with a key for each check that failed, and "StatusCodes" beside them; observed on macOS 26
+// with made-up certificates: a code-signing certificate for another name has SSLHostname, ExtendedKeyUsage and
+// ServerAuthEKU; a CA limited to e-mail has ExtendedKeyUsage; a SHA-1 signature, SignatureHashAlgorithms). Sorted into
+// the server's name, a key usage, and anything else (SHA-1, certificate transparency, a validity too long, ...); at[]
+// receives the first certificate of each. Without details everything is "anything else": nothing is excused.
+enum { SSL_FAIL_NAME, SSL_FAIL_USAGE, SSL_FAIL_OTHER };
+static unsigned ssl_failures(CFArrayRef details, LONG at[3]) {
+    unsigned found = 0;
+    CFIndex n = details ? CFArrayGetCount(details) : 0;
+    for (CFIndex i = 0; i < n; i++) {
+        CFTypeRef d = CFArrayGetValueAtIndex(details, i);
+        CFIndex k = d && CFGetTypeID(d) == CFDictionaryGetTypeID() ? CFDictionaryGetCount(d) : -1;
+        const void **keys = k > 0 ? malloc((size_t)k * sizeof *keys) : NULL;
+        if (k < 0 || (k > 0 && !keys)) { if (!(found & 1u << SSL_FAIL_OTHER)) at[SSL_FAIL_OTHER] = (LONG)i; found |= 1u << SSL_FAIL_OTHER; continue; }
+        if (keys) CFDictionaryGetKeysAndValues(d, keys, NULL);
+        for (CFIndex j = 0; j < k; j++) {
+            CFTypeRef key = keys[j];
+            int kind = SSL_FAIL_OTHER;
+            if (CFGetTypeID(key) == CFStringGetTypeID()) {
+                if (CFEqual(key, CFSTR("StatusCodes"))) continue;    // (the codes of the failures listed beside it)
+                if (CFEqual(key, CFSTR("SSLHostname"))) kind = SSL_FAIL_NAME;
+                else if (CFEqual(key, CFSTR("ExtendedKeyUsage")) || CFEqual(key, CFSTR("ServerAuthEKU")) || CFEqual(key, CFSTR("KeyUsage")))
+                    kind = SSL_FAIL_USAGE;
+            }
+            if (!(found & 1u << kind)) at[kind] = (LONG)i;
+            found |= 1u << kind;
+        }
+        free(keys);
+    }
+    if (!found) { found = 1u << SSL_FAIL_OTHER; at[SSL_FAIL_OTHER] = 0; }
+    return found;
 }
 
 static WINAPI BOOL CertVerifyCertificateChainPolicy(const char *policy, const void *chain_p, const uint8_t *para, policy_status *status) {
@@ -1879,7 +2149,7 @@ static WINAPI BOOL CertVerifyCertificateChainPolicy(const char *policy, const vo
     chain *ch = (chain *)chain_p;
     if (!ch || ch->magic != CHAIN_MAGIC) return 1;                    // not a chain macOS judged: not trusted
     uintptr_t id = (uintptr_t)policy;
-    DWORD ignore = para ? *(const DWORD *)(para + 4) : 0, bits = ch->pub.TrustStatus.err;
+    DWORD ignore = para ? *(const DWORD *)(para + 4) : 0, bits = ch->pub.TrustStatus.err, bit;
     const uint8_t *ssl = para ? host(*(void *const *)(para + 8)) : NULL;
     DWORD ssl_checks = id == 4 && ssl ? *(const DWORD *)(ssl + 8) : 0;
     if (ssl_checks & SSL_IGNORE_UNKNOWN_CA) ignore |= POLICY_ALLOW_UNKNOWN_CA;
@@ -1887,8 +2157,12 @@ static WINAPI BOOL CertVerifyCertificateChainPolicy(const char *policy, const vo
     if (ssl_checks & SSL_IGNORE_WRONG_USAGE) ignore |= POLICY_IGNORE_WRONG_USAGE;
     if (ssl_checks & SSL_IGNORE_REVOCATION) ignore |= POLICY_IGNORE_ALL_REV_UNKNOWN;
     if (ssl_checks & SSL_IGNORE_CN_INVALID) ignore |= POLICY_IGNORE_INVALID_NAME;
-    DWORD e = base_error(bits, ignore);
-    if (!e && id == 4) {                                              // SSL: macOS's SSL policy, with the server's name
+    DWORD e = base_error(bits, ignore, &bit);
+    LONG element = 0;
+    if (e) {                                                          // the first element that has the error
+        element = bit & (TRUST_UNTRUSTED_ROOT | TRUST_PARTIAL_CHAIN) ? ch->n - 1 : 0;
+        for (int i = 0; i < ch->n; i++) if (ch->el[i].TrustStatus.err & bit) { element = i; break; }
+    } else if (id == 4) {                                             // SSL: macOS's SSL policy, with the server's name
         int server = !ssl || *(const DWORD *)(ssl + 4) != 1;          // (AUTHTYPE_CLIENT is 1)
         const WCHAR *name = ssl && !(ignore & POLICY_IGNORE_INVALID_NAME) ? host(*(const WCHAR *const *)(ssl + 16)) : NULL;
         char *utf8 = name ? vx_utf8_dup(name) : NULL;
@@ -1899,7 +2173,7 @@ static WINAPI BOOL CertVerifyCertificateChainPolicy(const char *policy, const vo
         // outside the validity replaced by one inside it
         CFArrayRef anchors = ch->anchors;
         int only = ch->anchors_only;
-        CFArrayRef self = NULL;
+        CFArrayRef self = NULL, details = NULL;
         CFIndex n = ch->sec_certs ? CFArrayGetCount(ch->sec_certs) : 0;
         if ((bits & TRUST_UNTRUSTED_ROOT) && n) {
             const void *last = CFArrayGetValueAtIndex(ch->sec_certs, n - 1);
@@ -1907,15 +2181,26 @@ static WINAPI BOOL CertVerifyCertificateChainPolicy(const char *policy, const vo
             only = 1;
         }
         CFDateRef date = bits & TRUST_NOT_TIME_VALID ? ch->relaxed : ch->date;
-        OSStatus r = n && date ? evaluate(ch->sec_certs, p, date, anchors, only, 0, NULL, NULL) : errSecNotTrusted;
+        OSStatus r = n && date ? evaluate(ch->sec_certs, p, date, anchors, only, 0, NULL, NULL, &details) : errSecNotTrusted;
         if (self) CFRelease(self);
         CFRelease(p);
         if (host_name) CFRelease(host_name);
-        e = !r ? 0 : r == errSecHostNameMismatch ? CERT_E_CN_NO_MATCH : CERT_E_WRONG_USAGE;   // (macOS's TLS rules: a usage)
-        if (e == CERT_E_WRONG_USAGE && (ignore & POLICY_IGNORE_WRONG_USAGE)) e = 0;   // (the base checks above held)
-    } else if (!e && id != 1 && id != 5) e = CERT_E_UNTRUSTEDROOT;    // Authenticode, NT auth, Microsoft root, EV: not here
+        // Only a usage is excused by IGNORE_WRONG_USAGE: the name is checked all the same (as on Windows), and what else
+        // macOS's TLS rules refuse, or a refusal it does not explain, is excused by no flag.
+        LONG at[3] = { 0, 0, 0 };
+        unsigned fails = r ? ssl_failures(details, at) : 0;
+        if (details) CFRelease(details);
+        int kind = fails & 1u << SSL_FAIL_OTHER ? SSL_FAIL_OTHER
+                 : (fails & 1u << SSL_FAIL_USAGE) && !(ignore & POLICY_IGNORE_WRONG_USAGE) ? SSL_FAIL_USAGE
+                 : fails & 1u << SSL_FAIL_NAME ? SSL_FAIL_NAME : -1;
+        e = kind == SSL_FAIL_OTHER ? TRUST_E_FAIL : kind == SSL_FAIL_USAGE ? CERT_E_WRONG_USAGE : kind == SSL_FAIL_NAME ? CERT_E_CN_NO_MATCH : 0;
+        if (kind >= 0) element = at[kind] < ch->n ? at[kind] : ch->n - 1;
+    } else if (id != 1 && id != 5) {                                  // Authenticode, NT auth, Microsoft root, EV: not here
+        e = CERT_E_UNTRUSTEDROOT;
+        element = ch->n - 1;
+    }
     status->dwError = e;
-    if (e) { status->lChainIndex = 0; status->lElementIndex = e == CERT_E_UNTRUSTEDROOT || e == CERT_E_CHAINING ? (LONG)ch->n - 1 : 0; }
+    if (e) { status->lChainIndex = 0; status->lElementIndex = element; }
     return 1;
 }
 

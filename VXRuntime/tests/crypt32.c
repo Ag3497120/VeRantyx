@@ -1,8 +1,12 @@
 // crypt32 and wintrust with made-up certificates (tests/crypt32_certs.h: a test root, an RSA leaf it signed, a
-// self-signed P-256 one) and made-up names: parsing, names as text, validity, key usages, stores, signatures checked by
-// macOS (and changed ones refused), nothing trusted that was not verified, and DPAPI (round trips, entropy, tampering).
+// self-signed P-256 one, and for the chains a code-signing leaf, a CA limited to e-mail with a TLS leaf, a CA with
+// anyPolicy with a leaf of a made-up policy, a SHA-1 signed leaf) and made-up names: parsing, names as text, validity,
+// key usages, stores, signatures checked by macOS (and changed ones refused), nothing trusted that was not verified
+// (usages through the whole chain, issuance policies, strong signatures, the name even with the usage excused), and
+// DPAPI (round trips, entropy, tampering).
 //   crypt32.exe                  all of it
 //   crypt32.exe protect <file>   writes a DPAPI blob to <file>; "unprotect <file>" opens it in another process
+#define CERT_CHAIN_PARA_HAS_EXTRA_FIELDS                               // (RequestedIssuancePolicy, pStrongSignPara)
 #include <windows.h>
 #include <wincrypt.h>
 #include <dpapi.h>
@@ -12,6 +16,9 @@
 #include <stdio.h>
 #include <string.h>
 #include "crypt32_certs.h"
+#ifndef SECURITY_FLAG_IGNORE_WRONG_USAGE
+#define SECURITY_FLAG_IGNORE_WRONG_USAGE 0x200                        // (wininet.h)
+#endif
 
 static int failures;
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL %s:%d ", __FILE__, __LINE__); printf(__VA_ARGS__); printf(" (error 0x%lx)\n", GetLastError()); failures++; } } while (0)
@@ -239,6 +246,28 @@ static void test_stores(void) {
     sys = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0, CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG, L"CA");
     CHECK(sys && !CertAddEncodedCertificateToStore(sys, X509_ASN_ENCODING, cert_root, sizeof cert_root, CERT_STORE_ADD_ALWAYS, NULL), "read-only");
     CertCloseStore(sys, 0);
+
+    // stores this runtime cannot read do not open (never as empty ones, which a list of certificates to refuse would
+    // then be); a provider that does not exist is ERROR_FILE_NOT_FOUND
+    static const BYTE not_pkcs7[] = { 0x30, 0x03, 0x06, 0x01, 0x2a };     // (made-up bytes)
+    CRYPT_DATA_BLOB p7 = { sizeof not_pkcs7, (BYTE *)not_pkcs7 };
+    SetLastError(0);
+    CHECK(!CertOpenStore(CERT_STORE_PROV_PKCS7, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, 0, &p7) && GetLastError() == ERROR_NOT_SUPPORTED, "PKCS7");
+    SetLastError(0);
+    CHECK(!CertOpenStore(sz_CERT_STORE_PROV_PKCS7, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, 0, &p7) && GetLastError() == ERROR_NOT_SUPPORTED, "\"PKCS7\"");
+    SetLastError(0);
+    CHECK(!CertOpenStore(CERT_STORE_PROV_SERIALIZED, 0, 0, 0, &p7) && GetLastError() == ERROR_NOT_SUPPORTED, "serialized");
+    SetLastError(0);
+    CHECK(!CertOpenStore(CERT_STORE_PROV_PKCS12, 0, 0, 0, &p7) && GetLastError() == ERROR_NOT_SUPPORTED, "PKCS12");
+    SetLastError(0);
+    CHECK(!CertOpenStore(CERT_STORE_PROV_FILENAME_W, X509_ASN_ENCODING, 0, CERT_STORE_READONLY_FLAG, L"C:\\made-up.p7b") &&
+          GetLastError() == ERROR_NOT_SUPPORTED, "file name");
+    SetLastError(0);
+    CHECK(!CertOpenStore(sz_CERT_STORE_PROV_FILENAME_W, X509_ASN_ENCODING, 0, 0, L"C:\\made-up.cer") && GetLastError() == ERROR_NOT_SUPPORTED, "\"File\"");
+    SetLastError(0);
+    CHECK(!CertOpenStore("MadeUpProvider", 0, 0, 0, NULL) && GetLastError() == ERROR_FILE_NOT_FOUND, "no such provider");
+    SetLastError(0);
+    CHECK(!CertOpenStore((LPCSTR)99, 0, 0, 0, NULL) && GetLastError() == ERROR_FILE_NOT_FOUND, "no such provider number");
 }
 
 static void test_signatures(void) {
@@ -296,12 +325,170 @@ static void test_signatures(void) {
 }
 
 // ---- chains: judged by macOS -------------------------------------------------------------------------------------------
-static DWORD policy(PCCERT_CHAIN_CONTEXT chain, LPCSTR which, DWORD flags, const WCHAR *server) {
-    SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl = { { sizeof ssl }, AUTHTYPE_SERVER, 0, (WCHAR *)server };
+static LONG last_element;                                             // lElementIndex of the last policy() with an error
+static DWORD ssl_policy(PCCERT_CHAIN_CONTEXT chain, LPCSTR which, DWORD flags, DWORD checks, const WCHAR *server) {
+    SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl = { { sizeof ssl }, AUTHTYPE_SERVER, checks, (WCHAR *)server };
     CERT_CHAIN_POLICY_PARA para = { sizeof para, flags, which == CERT_CHAIN_POLICY_SSL ? &ssl : NULL };
     CERT_CHAIN_POLICY_STATUS st = { sizeof st, 0xdeadbeef };
     if (!CertVerifyCertificateChainPolicy(which, chain, &para, &st)) return 0xdeadbeef;
+    last_element = st.lElementIndex;
     return st.dwError;
+}
+static DWORD policy(PCCERT_CHAIN_CONTEXT chain, LPCSTR which, DWORD flags, const WCHAR *server) { return ssl_policy(chain, which, flags, 0, server); }
+
+// The chain of one of the made-up certificates (from its DER) through the engine, at 2022-06-01, with the parameters.
+static PCCERT_CHAIN_CONTEXT chain_of(HCERTCHAINENGINE engine, HCERTSTORE extra, const BYTE *der, DWORD n, CERT_CHAIN_PARA *para) {
+    FILETIME in_2022 = to_ft(0x1d8754a895c8000ull);
+    PCCERT_CONTEXT c = CertCreateCertificateContext(X509_ASN_ENCODING, der, n);
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    if (!c || !CertGetCertificateChain(engine, c, &in_2022, extra, para, 0, NULL, &chain)) chain = NULL;
+    CertFreeCertificateContext(c);
+    return chain;
+}
+static DWORD element_error(PCCERT_CHAIN_CONTEXT chain, DWORD i) {
+    return chain && i < chain->rgpChain[0]->cElement ? chain->rgpChain[0]->rgpElement[i]->TrustStatus.dwErrorStatus : 0xdeadbeef;
+}
+#define CHAIN_ERR(chain) ((chain) ? (chain)->TrustStatus.dwErrorStatus : 0xdeadbeef)
+
+// What the chain is for: the usages of every certificate in it (not the end certificate's alone), issuance policies,
+// strong signatures; and over SSL, a name that does not match is never excused with the usage
+static void test_chain_purpose(HCERTCHAINENGINE engine, HCERTSTORE extra) {
+    CERT_CHAIN_PARA none = { sizeof none };
+    PCCERT_CHAIN_CONTEXT ch;
+
+    // a code-signing certificate (no serverAuth) for TLS: the usage alone can be excused, its name cannot
+    ch = chain_of(engine, extra, cert_sign, sizeof cert_sign, &none);
+    CHECK(ch && CHAIN_ERR(ch) == 0, "code-signing chain: 0x%lx", CHAIN_ERR(ch));
+    CHECK(policy(ch, CERT_CHAIN_POLICY_SSL, 0, L"sign.vxrt.test") == (DWORD)CERT_E_WRONG_USAGE, "no serverAuth");
+    CHECK(policy(ch, CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_IGNORE_WRONG_USAGE_FLAG, L"sign.vxrt.test") == 0, "usage excused, right name");
+    CHECK(policy(ch, CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_IGNORE_WRONG_USAGE_FLAG, L"other.vxrt.test") == (DWORD)CERT_E_CN_NO_MATCH &&
+          last_element == 0, "usage excused, another name: still the name (element %ld)", last_element);
+    CHECK(ssl_policy(ch, CERT_CHAIN_POLICY_SSL, 0, SECURITY_FLAG_IGNORE_WRONG_USAGE, L"other.vxrt.test") == (DWORD)CERT_E_CN_NO_MATCH,
+          "SECURITY_FLAG_IGNORE_WRONG_USAGE, another name");
+    CHECK(policy(ch, CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_IGNORE_WRONG_USAGE_FLAG | CERT_CHAIN_POLICY_IGNORE_INVALID_NAME_FLAG,
+                 L"other.vxrt.test") == 0, "both excused");
+    CertFreeCertificateChain(ch);
+    // a TLS certificate for another name, the usage excused: still the name
+    ch = chain_of(engine, extra, cert_leaf, sizeof cert_leaf, &none);
+    CHECK(policy(ch, CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_IGNORE_WRONG_USAGE_FLAG, L"evil.vxrt.test") == (DWORD)CERT_E_CN_NO_MATCH &&
+          ssl_policy(ch, CERT_CHAIN_POLICY_SSL, 0, SECURITY_FLAG_IGNORE_WRONG_USAGE, L"evil.vxrt.test") == (DWORD)CERT_E_CN_NO_MATCH,
+          "serverAuth leaf, another name, usage excused");
+    CertFreeCertificateChain(ch);
+    // what macOS's TLS rules refuse besides name and usage (here a SHA-1 signature) is not a usage: never excused
+    ch = chain_of(engine, extra, cert_sha1, sizeof cert_sha1, &none);
+    DWORD e = policy(ch, CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_IGNORE_WRONG_USAGE_FLAG, L"sha1.vxrt.test");
+    CHECK(e == (DWORD)TRUST_E_FAIL, "SHA-1 over TLS: 0x%lx", e);
+    CertFreeCertificateChain(ch);
+
+    // usages: a CA limited to e-mail limits what it issued, whatever the end certificate says
+    LPSTR server_auth[] = { szOID_PKIX_KP_SERVER_AUTH }, email[] = { szOID_PKIX_KP_EMAIL_PROTECTION },
+          both[] = { szOID_PKIX_KP_SERVER_AUTH, szOID_PKIX_KP_EMAIL_PROTECTION };
+    CERT_CHAIN_PARA para = { sizeof para };
+    para.RequestedUsage.Usage = (CERT_ENHKEY_USAGE){ 1, server_auth };
+    ch = chain_of(engine, extra, cert_mail, sizeof cert_mail, &para);
+    CHECK(ch && ch->rgpChain[0]->cElement == 3 && CHAIN_ERR(ch) == CERT_TRUST_IS_NOT_VALID_FOR_USAGE && element_error(ch, 0) == 0 &&
+          element_error(ch, 1) == CERT_TRUST_IS_NOT_VALID_FOR_USAGE, "serverAuth under an e-mail CA: 0x%lx 0x%lx 0x%lx", CHAIN_ERR(ch),
+          element_error(ch, 0), element_error(ch, 1));
+    CHECK(policy(ch, CERT_CHAIN_POLICY_BASE, 0, NULL) == (DWORD)CERT_E_WRONG_USAGE && last_element == 1 &&
+          policy(ch, CERT_CHAIN_POLICY_BASE, CERT_CHAIN_POLICY_IGNORE_WRONG_USAGE_FLAG, NULL) == 0, "base policy (element %ld)", last_element);
+    CertFreeCertificateChain(ch);
+    para.RequestedUsage.Usage = (CERT_ENHKEY_USAGE){ 1, email };
+    ch = chain_of(engine, extra, cert_mail, sizeof cert_mail, &para);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_IS_NOT_VALID_FOR_USAGE && element_error(ch, 0) == CERT_TRUST_IS_NOT_VALID_FOR_USAGE &&
+          element_error(ch, 1) == 0, "e-mail, the end certificate is for TLS: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    para.RequestedUsage = (CERT_USAGE_MATCH){ USAGE_MATCH_TYPE_OR, { 2, both } };
+    ch = chain_of(engine, extra, cert_mail, sizeof cert_mail, &para);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_IS_NOT_VALID_FOR_USAGE, "either, but no usage is in both: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    ch = chain_of(engine, extra, cert_mail, sizeof cert_mail, &none);
+    CHECK(CHAIN_ERR(ch) == 0 && policy(ch, CERT_CHAIN_POLICY_SSL, 0, L"mail.vxrt.test") == (DWORD)CERT_E_WRONG_USAGE,
+          "no usage asked for; over TLS the CA's usage counts: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    para.RequestedUsage = (CERT_USAGE_MATCH){ USAGE_MATCH_TYPE_AND, { 1, server_auth } };
+    ch = chain_of(engine, extra, cert_leaf, sizeof cert_leaf, &para);
+    CHECK(CHAIN_ERR(ch) == 0, "serverAuth under a root without the extension: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+
+    // issuance policies: asserted by every certificate below the root (anyPolicy for all), or not valid
+    LPSTR p1[] = { "1.3.6.1.4.1.32473.1" }, p2[] = { "1.3.6.1.4.1.32473.2" }, p21[] = { "1.3.6.1.4.1.32473.2", "1.3.6.1.4.1.32473.1" };
+    CERT_CHAIN_PARA pol = { sizeof pol };
+    pol.RequestedIssuancePolicy.Usage = (CERT_ENHKEY_USAGE){ 1, p1 };
+    ch = chain_of(engine, extra, cert_policy, sizeof cert_policy, &pol);
+    CHECK(ch && ch->rgpChain[0]->cElement == 3 && CHAIN_ERR(ch) == 0, "the policy, under anyPolicy: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    pol.RequestedIssuancePolicy.Usage = (CERT_ENHKEY_USAGE){ 1, p2 };
+    ch = chain_of(engine, extra, cert_policy, sizeof cert_policy, &pol);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_IS_NOT_VALID_FOR_USAGE && (element_error(ch, 0) & CERT_TRUST_IS_NOT_VALID_FOR_USAGE) &&
+          policy(ch, CERT_CHAIN_POLICY_BASE, 0, NULL) == (DWORD)CERT_E_WRONG_USAGE, "another policy: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    pol.RequestedIssuancePolicy = (CERT_USAGE_MATCH){ USAGE_MATCH_TYPE_OR, { 2, p21 } };
+    ch = chain_of(engine, extra, cert_policy, sizeof cert_policy, &pol);
+    CHECK(CHAIN_ERR(ch) == 0, "one of two: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    pol.RequestedIssuancePolicy.dwType = USAGE_MATCH_TYPE_AND;
+    ch = chain_of(engine, extra, cert_policy, sizeof cert_policy, &pol);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_IS_NOT_VALID_FOR_USAGE, "both of two: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    pol.RequestedIssuancePolicy.Usage = (CERT_ENHKEY_USAGE){ 1, p1 };
+    ch = chain_of(engine, extra, cert_leaf, sizeof cert_leaf, &pol);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_IS_NOT_VALID_FOR_USAGE && element_error(ch, 0) == CERT_TRUST_IS_NOT_VALID_FOR_USAGE &&
+          element_error(ch, 1) == 0, "an end certificate without policies: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    ch = chain_of(engine, extra, cert_mail, sizeof cert_mail, &pol);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_IS_NOT_VALID_FOR_USAGE, "no policies anywhere: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+
+    // strong signatures: the OS_1 rules (SHA-2, RSA 2048, ECDSA 256), SHA-1 allowed by the "strong key" ones, the
+    // caller's own lists, and the end certificate's key left out when asked
+    CERT_STRONG_SIGN_PARA os1 = CERT_STRONG_SIGN_PARA_OS_1, key_os1 = CERT_STRONG_KEY_PARA_OS_1;
+    CERT_CHAIN_PARA strong = { sizeof strong };
+    strong.pStrongSignPara = &os1;
+    ch = chain_of(engine, extra, cert_leaf, sizeof cert_leaf, &strong);
+    CHECK(CHAIN_ERR(ch) == 0, "RSA 2048 with SHA-256: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    ch = chain_of(engine, extra, cert_mail, sizeof cert_mail, &strong);
+    CHECK(CHAIN_ERR(ch) == 0, "ECDSA P-256 and RSA 2048 with SHA-256: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    ch = chain_of(engine, extra, cert_sha1, sizeof cert_sha1, &strong);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_HAS_WEAK_SIGNATURE && element_error(ch, 0) == CERT_TRUST_HAS_WEAK_SIGNATURE && element_error(ch, 1) == 0 &&
+          policy(ch, CERT_CHAIN_POLICY_BASE, 0xffff, NULL) == (DWORD)TRUST_E_CERT_SIGNATURE, "SHA-1: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    ch = chain_of(engine, extra, cert_sha1, sizeof cert_sha1, &none);
+    CHECK(CHAIN_ERR(ch) == 0, "SHA-1 when nobody asks: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    strong.pStrongSignPara = &key_os1;
+    ch = chain_of(engine, extra, cert_sha1, sizeof cert_sha1, &strong);
+    CHECK(CHAIN_ERR(ch) == 0, "SHA-1 under the strong-key rules: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    CERT_STRONG_SIGN_SERIALIZED_INFO lists = { 0, L"RSA/SHA256;ECDSA/SHA256", L"RSA/2048;ECDSA/384" };
+    CERT_STRONG_SIGN_PARA own = { sizeof own, CERT_STRONG_SIGN_SERIALIZED_INFO_CHOICE };
+    own.pSerializedInfo = &lists;
+    strong.pStrongSignPara = &own;
+    ch = chain_of(engine, extra, cert_sign, sizeof cert_sign, &strong);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_HAS_WEAK_SIGNATURE && element_error(ch, 0) == CERT_TRUST_HAS_WEAK_SIGNATURE, "P-256 end key, 384 asked: 0x%lx",
+          CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    strong.dwStrongSignFlags = CERT_CHAIN_STRONG_SIGN_DISABLE_END_CHECK_FLAG;
+    ch = chain_of(engine, extra, cert_sign, sizeof cert_sign, &strong);
+    CHECK(CHAIN_ERR(ch) == 0, "the end key not checked: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    ch = chain_of(engine, extra, cert_mail, sizeof cert_mail, &strong);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_HAS_WEAK_SIGNATURE && element_error(ch, 1) == CERT_TRUST_HAS_WEAK_SIGNATURE, "a P-256 CA key: 0x%lx",
+          CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    lists.pwszCNGSignHashAlgids = L"ECDSA/SHA256";
+    strong.dwStrongSignFlags = 0;
+    lists.pwszCNGPubKeyMinBitLengths = L"RSA/2048;ECDSA/256";
+    ch = chain_of(engine, extra, cert_sign, sizeof cert_sign, &strong);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_HAS_WEAK_SIGNATURE, "RSA signatures not in the list: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
+    CERT_STRONG_SIGN_PARA unknown = { sizeof unknown, CERT_STRONG_SIGN_OID_INFO_CHOICE };
+    unknown.pszOID = "1.3.6.1.4.1.32473.99";
+    strong.pStrongSignPara = &unknown;
+    ch = chain_of(engine, extra, cert_leaf, sizeof cert_leaf, &strong);
+    CHECK(CHAIN_ERR(ch) == CERT_TRUST_HAS_WEAK_SIGNATURE, "rules not known here: 0x%lx", CHAIN_ERR(ch));
+    CertFreeCertificateChain(ch);
 }
 
 static void test_chains(void) {
@@ -373,6 +560,9 @@ static void test_chains(void) {
           chain ? chain->TrustStatus.dwErrorStatus : 0);
     CertFreeCertificateChain(chain);
     CertFreeCertificateContext(bad);
+    CertAddEncodedCertificateToStore(extra, X509_ASN_ENCODING, cert_mailca, sizeof cert_mailca, CERT_STORE_ADD_ALWAYS, NULL);
+    CertAddEncodedCertificateToStore(extra, X509_ASN_ENCODING, cert_polca, sizeof cert_polca, CERT_STORE_ADD_ALWAYS, NULL);
+    test_chain_purpose(engine, extra);
     CertFreeCertificateChainEngine(engine);
 
     // a chain context not made here is not trusted

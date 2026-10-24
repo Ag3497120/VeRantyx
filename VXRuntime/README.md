@@ -52,6 +52,13 @@ headset: the driver captures and the encoder encodes 59-60 frames a second (the 
 `C:\windows\temp`); `Z:\` is the whole Mac file system. The registry lives in `$VXRT_ROOT/registry.txt`.
 `make check` uses `build/root` so the tests never touch `~/.vxrt`.
 
+What programs keep with DPAPI (`CryptProtectData`: Chromium's and so Steam's cookie key, saved logins) is protected less
+at rest than on Windows. Windows encrypts the key of that data with your logon password; VXRuntime keeps it as 32
+random bytes in `$VXRT_ROOT/dpapi/user.key`, readable only by you (0600 in a 0700 directory, refused otherwise) and left
+out of Time Machine backups, but not encrypted with your Mac password and not in the Keychain. Anyone who can read your
+home folder (a copy of `~/.vxrt`, another administrator of the Mac, the disk of a Mac without FileVault) can open that
+data. Keep FileVault on, and treat `~/.vxrt` like a password store: do not copy or share it.
+
 Windows run on AppKit: the program runs on a thread of its own and the macOS main thread runs AppKit, so a
 program's message loop and window procedures work from any thread. `VXRT_NO_ACTIVATE=1` keeps windows from
 taking focus (used by `make check`); `VXRT_SNAPSHOT=file.png` saves a window's view as it is closed.

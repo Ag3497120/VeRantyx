@@ -1076,6 +1076,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/crypt32.exe
 	$(VXRT) build/crypt32.exe protect build/dpapi_blob.bin && $(VXRT) build/crypt32.exe unprotect build/dpapi_blob.bin
 	test "$$(stat -f %Lp build/root/dpapi)" = 700 && test "$$(stat -f %Lp build/root/dpapi/user.key)" = 600
+	tmutil isexcluded build/root/dpapi | grep -q '^\[Excluded\]'
 	$(VXRT) build/directinput.exe
 	$(VXRT) build/msvc_eh.exe
 	$(VXRT) build/com.exe

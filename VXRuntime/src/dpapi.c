@@ -2,9 +2,15 @@
 // its cookie and password stores this way), CryptProtectMemory / CryptUnprotectMemory hide memory in place.
 //
 // Windows derives the key from the user's logon credentials. Here it is 32 random bytes made on first use in
-// $VXRT_ROOT/dpapi/user.key (mode 0600 in a 0700 directory; never the Keychain), so a blob opens only with the same
-// VXRT_ROOT, as Windows' open only for the same user on the same machine. Any program running as this user can
-// unprotect, as on Windows. Each blob gets its own AES-256-GCM key (aes_gcm.c): HKDF-SHA256 (RFC 5869) of that key
+// $VXRT_ROOT/dpapi/user.key (mode 0600 in a 0700 directory), so a blob opens only with the same VXRT_ROOT, as Windows'
+// open only for the same user on the same machine. Any program running as this user can unprotect, as on Windows.
+// At rest this is weaker than Windows, where the key itself is encrypted with the logon password: whoever can read the
+// home folder offline (a copy of it, another administrator, a disk without FileVault) has the key and the blobs. So the
+// directory is kept out of Time Machine backups (NSURLIsExcludedFromBackupKey; a backup then holds blobs without their
+// key), and VXRuntime/README.md says so to the user. It is not in the Keychain: an item there trusts the code signature
+// of the binary that made it, this runtime is rebuilt (and signed ad hoc) often, so each new binary would have to be
+// allowed by the user again; and the tests would add items to the user's own keychain.
+// Each blob gets its own AES-256-GCM key (aes_gcm.c): HKDF-SHA256 (RFC 5869) of that key
 // with a random salt and, as info, the scope (user or CRYPTPROTECT_LOCAL_MACHINE) and the SHA-256 of the caller's
 // optional entropy, so the wrong entropy fails the tag like a changed byte does.
 //
@@ -13,6 +19,7 @@
 //   | ciphertext of (description size in bytes, u32 little-endian | description, UTF-16 | data) | tag[16]
 #include <CommonCrypto/CommonCrypto.h>
 #include <CommonCrypto/CommonRandom.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <Security/AuthSession.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -72,6 +79,19 @@ static int read_key(int fd, const char *path) {
     return 0;
 }
 
+// Marks the key's directory to be left out of backups (Time Machine honours it), each time the key is loaded, so a
+// directory made before this was done is marked too. A volume that cannot keep the mark gets a log line, not a failure.
+static void exclude_from_backup(const char *dir) {
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)dir, (CFIndex)strlen(dir), true);
+    CFBooleanRef excluded = NULL;
+    int done = url && CFURLCopyResourcePropertyForKey(url, kCFURLIsExcludedFromBackupKey, &excluded, NULL) && excluded &&
+               CFGetTypeID(excluded) == CFBooleanGetTypeID() && CFBooleanGetValue(excluded);
+    if (excluded) CFRelease(excluded);
+    if (!done && (!url || !CFURLSetResourcePropertyForKey(url, kCFURLIsExcludedFromBackupKey, kCFBooleanTrue, NULL)))
+        vx_log("dpapi: could not keep %s out of backups; the key in it may be copied with them", dir);
+    if (url) CFRelease(url);
+}
+
 // The key, made on first use. Two processes starting together race to make it: each writes a temporary file and
 // links it to the name, so the loser reads the winner's whole key, never a half-written one.
 static DWORD load_master(void) {
@@ -85,6 +105,7 @@ static DWORD load_master(void) {
     struct stat ds;
     if (lstat(dir, &ds) || !S_ISDIR(ds.st_mode) || ds.st_uid != geteuid()) { vx_log("dpapi: %s is not this user's directory", dir); goto out; }
     if (ds.st_mode & 077) chmod(dir, 0700);
+    exclude_from_backup(dir);
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0 && errno == ENOENT) {
         uint8_t key[KEY], rnd[8];
