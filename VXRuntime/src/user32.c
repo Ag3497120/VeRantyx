@@ -1382,7 +1382,7 @@ static LRESULT def_window_proc(HANDLE h, uint32_t msg, WPARAM wp, LPARAM lp, int
     case WM_NCCREATE: return 1;
     case WM_CLOSE: DestroyWindow(h); return 0;
     case WM_PAINT: return vx_default_paint(h);
-    case WM_ERASEBKGND: if (w && w->cls->background) { vx_fill_client(w, w->cls->background); return 1; } return 0;
+    case WM_ERASEBKGND: return w && w->cls->background ? vx_fill_client(w, (HANDLE)wp, w->cls->background) : 0;   // (wParam: the DC)
     case WM_SETTEXT:
         if (unicode) SetWindowTextW(h, (const WCHAR *)lp); else SetWindowTextA(h, (const char *)lp);
         return 1;

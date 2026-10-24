@@ -243,18 +243,52 @@ static BOOL dc_blit(HANDLE dst, int xd, int yd, int wd, int hd, HANDLE src, int 
     return 1;
 }
 
-// Whether a ROP3 code uses the source / the pattern (its truth table differs between S = 0 and 1 / P = 0 and 1).
-static int rop_uses_source(uint8_t t) { return ((t >> 2) & 0x33) != (t & 0x33); }
-static int rop_uses_pattern(uint8_t t) { return ((t >> 4) & 0x0f) != (t & 0x0f); }
-static BOOL (WINAPI *g_patblt)(HANDLE, int, int, int, int, DWORD);
-static WINAPI BOOL StretchBlt(HANDLE dst, int xd, int yd, int wd, int hd, HANDLE src, int xs, int ys, int ws, int hs, DWORD rop) {
-    uint8_t t = (uint8_t)(rop >> 16);
-    if (!rop_uses_source(t)) {
-        if (!g_patblt) g_patblt = (BOOL (WINAPI *)(HANDLE, int, int, int, int, DWORD))vx_find_export("gdi32.dll", "PatBlt");
-        return g_patblt ? g_patblt(dst, xd, yd, wd, hd, rop) : 0;
+// Which of its operands a ternary raster operation reads. Microsoft's "Ternary Raster Operations" table lists, for each
+// ROP code, the result for every combination of the brush (P), source (S) and destination (D) bits, and rop3() above
+// evaluates that table. An operand is read when, with the two others held at some value, the table gives different
+// results for that operand 0 and 1: every combination is tried, each operand an all-zero or an all-one word.
+enum { ROP_PATTERN, ROP_SOURCE };
+static int rop_reads(uint8_t code, int operand) {
+    for (int k = 0; k < 4; k++) {
+        uint32_t a = (k & 1) ? ~0u : 0, b = (k & 2) ? ~0u : 0;      // the other operand, and the destination
+        uint32_t off = operand == ROP_SOURCE ? rop3(code, a, 0, b) : rop3(code, 0, a, b);
+        uint32_t on = operand == ROP_SOURCE ? rop3(code, a, ~0u, b) : rop3(code, ~0u, a, b);
+        if (off != on) return 1;
     }
-    blit_op op = { t == 0xCC ? OP_COPY : OP_ROP, t, 0, 255, 0, 0 };
-    if (rop_uses_pattern(t) && !vx_dc_brush_bgrx(dst, &op.pattern)) op.pattern = 0;
+    return 0;
+}
+// A raster operation that reads no source: by the table its result is a function of the brush and the destination
+// alone, so the source DC and rectangle play no part (applications pass NULL for them, as for PatBlt). Applied here
+// from the table like every other code, inside the destination's clip region, to the three color bytes (the fourth,
+// unused in a BI_RGB 32-bpp bitmap, is kept, as PatBlt's DSTINVERT and PATINVERT here keep it); a negative size
+// counts from the other edge as it does for the destination of a blit.
+static BOOL dc_rop_without_source(HANDLE dst, int xd, int yd, int wd, int hd, uint8_t code) {
+    if (!vx_dc_valid(dst)) { vx_set_last_error(ERROR_INVALID_HANDLE); return 0; }
+    uint32_t brush = 0;
+    if (rop_reads(code, ROP_PATTERN) && !vx_dc_brush_bgrx(dst, &brush)) return 1;   // (a null brush: nothing drawn, as PatBlt here)
+    vx_surface d;
+    if (!vx_surface_lock(dst, &d)) return 1;                        // (the screen's DC: nothing to draw on)
+    if (!d.px) { vx_surface_unlock(&d, NULL); return 1; }           // (a bitmap of another depth: nothing to draw on)
+    int fx, fy;
+    RECT dr = norm(xd + d.ox, yd + d.oy, wd, hd, &fx, &fy), changed = { 0, 0, 0, 0 };
+    for (int i = 0; i < pieces(&d); i++) {
+        RECT p = piece(&d, dr, i);
+        if (empty(p)) continue;
+        changed = or_rect(changed, p);
+        for (int y = p.top; y < p.bottom; y++) {
+            uint32_t *row = row_of(&d, y);
+            for (int x = p.left; x < p.right; x++) row[x] = (rop3(code, brush, 0, row[x]) & 0xffffff) | (row[x] & 0xff000000u);
+        }
+    }
+    vx_surface_unlock(&d, empty(changed) ? NULL : &changed);
+    if (!empty(changed)) vx_gdi_forget_texts(dst, changed);
+    return 1;
+}
+static WINAPI BOOL StretchBlt(HANDLE dst, int xd, int yd, int wd, int hd, HANDLE src, int xs, int ys, int ws, int hs, DWORD rop) {
+    uint8_t code = (uint8_t)(rop >> 16);
+    blit_op op = { code == 0xCC ? OP_COPY : OP_ROP, code, 0, 255, 0, 0 };
+    if (!rop_reads(code, ROP_SOURCE)) return dc_rop_without_source(dst, xd, yd, wd, hd, code);
+    if (rop_reads(code, ROP_PATTERN) && !vx_dc_brush_bgrx(dst, &op.pattern)) op.pattern = 0;
     return dc_blit(dst, xd, yd, wd, hd, src, xs, ys, ws, hs, &op);
 }
 static WINAPI BOOL BitBlt(HANDLE dst, int x, int y, int w, int h, HANDLE src, int xs, int ys, DWORD rop) {
@@ -302,7 +336,7 @@ static BOOL dib_to_dc(HANDLE h, RECT dr, int fx, int fy, pixsrc *src, RECT sr, D
     vx_surface d;
     uint8_t t = (uint8_t)(rop >> 16);
     blit_op op = { t == 0xCC ? OP_COPY : OP_ROP, t, 0, 255, 0, 0 };
-    if (rop_uses_pattern(t) && !vx_dc_brush_bgrx(h, &op.pattern)) op.pattern = 0;
+    if (rop_reads(t, ROP_PATTERN) && !vx_dc_brush_bgrx(h, &op.pattern)) op.pattern = 0;
     if (!vx_surface_lock(h, &d)) return vx_dc_valid(h);           // (the screen's DC: nothing to draw on)
     if (!d.px) { vx_surface_unlock(&d, NULL); return 1; }
     dr = (RECT){ dr.left + d.ox, dr.top + d.oy, dr.right + d.ox, dr.bottom + d.oy };
@@ -682,15 +716,16 @@ static WINAPI BOOL GetUpdateRect(HANDLE h, RECT *r, BOOL erase) {
     pthread_mutex_unlock(&w->lock);
     RECT b = g->n ? vx_region_box(g) : (RECT){ 0, 0, 0, 0 };
     int any = g->n > 0;
-    vx_region_free(g);
     if (r) *r = b;
-    if (any && erase && pending) {
+    if (any && erase && pending) {                                  // (a DC clipped to the update region, as BeginPaint's)
         HANDLE dc = vx_dc_for_window(w);
+        vx_dc_set_clip(dc, g);
         w->paint_depth++;
         vx_send_message(h, WM_ERASEBKGND_, (WPARAM)dc, 0);
         w->paint_depth--;
         vx_dc_release(dc);
     }
+    vx_region_free(g);
     return any;
 }
 static WINAPI int GetUpdateRgn(HANDLE h, HANDLE rgn, BOOL erase) {

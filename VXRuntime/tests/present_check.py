@@ -60,6 +60,11 @@ EXPECT = [
 ]
 CHILD_PARENT = [((20, 214), (0, 100, 0)), ((20, 230), (0, 100, 0))]          # under the child, in the parent's bitmap
 CHILD = [((20, 214), (255, 255, 0)), ((20, 230), (255, 128, 0))]                # the child (yellow over orange) on the screen
+# The erase window (DefWindowProc's WM_ERASEBKGND with a class brush): only the three parts invalidated with erasing
+# show the background, the rest keeps the color it was filled with.
+FACE, BACK, MOVED = (180, 90, 60), (40, 80, 150), (60, 150, 60)
+ERASE = [((4, 4), FACE), ((20, 20), BACK), ((44, 20), FACE), ((60, 20), BACK), ((60, 50), FACE),
+         ((100, 20), MOVED), ((100, 56), BACK), ((4, 56), FACE)]
 
 def near(got, want, tol):
     return all(abs(a - b) <= tol for a, b in zip(got, want))
@@ -79,8 +84,8 @@ def main():
         idle = c.wait_idle(20000)
         check(idle["idle"], f"idle after drawing: {idle}")
         wins = {w["title"]: w for w in c.state()["windows"]}
-        main_w, alpha_w, key_w, perf_w = (wins.get(t) for t in ("VX present test", "VX layered alpha", "VX layered key", "VX present perf"))
-        check(all((main_w, alpha_w, key_w, perf_w)), f"the windows: {sorted(wins)}")
+        main_w, alpha_w, key_w, perf_w, erase_w = (wins.get(t) for t in ("VX present test", "VX layered alpha", "VX layered key", "VX present perf", "VX present erase"))
+        check(all((main_w, alpha_w, key_w, perf_w, erase_w)), f"the windows: {sorted(wins)}")
         # what GDI drew: the client bitmap
         png = os.path.join(tmp, "main_bitmap.png")
         check(c.ask(f"snapshot {main_w['hwnd']} {png}")["ok"], "snapshot")
@@ -89,6 +94,13 @@ def main():
         for (x, y), want in EXPECT + CHILD_PARENT:
             got = rows[y][x][:3]
             check(got == want, f"bitmap ({x}, {y}): {got}, not {want}")
+        png = os.path.join(tmp, "erase_bitmap.png")
+        check(c.ask(f"snapshot {erase_w['hwnd']} {png}")["ok"], "snapshot of the erase window")
+        w, h, rows = read_png(png)
+        check((w, h) == (128, 64), f"erase window bitmap size {w}x{h}")
+        for (x, y), want in ERASE:
+            got = rows[y][x][:3]
+            check(got == want, f"erase window bitmap ({x}, {y}): {got}, not {want}")
         # What the Mac windows show. (The window server shows a picture a frame or two after it was handed over; a busy
         # Mac may lag more, so a capture that does not match yet is taken again, twice at most.)
         def main_view():
@@ -144,7 +156,15 @@ def main():
             w, h, rows = read_png(png)
             got = at(rows, r["scale"], 500, 300)
             return r, [] if near(got[:3], (119, 0x20, 136), 8 if r["source"] == "window-server" else 0) else [f"perf window shows {got}"]
-        for view in (main_view, alpha_view, key_view, perf_view):
+        def erase_view():
+            png = os.path.join(tmp, "erase.png")
+            r = c.ask(f"snapshot-view {erase_w['hwnd']} {png}")
+            if not (r.get("ok") and r.get("opaque") is True): return r, [f"erase window: {r}"]
+            tol, scale = (8 if r["source"] == "window-server" else 0), r["scale"]
+            w, h, rows = read_png(png)
+            return r, [f"erase window ({x}, {y}): {at(rows, scale, x, y)}, not {want}" for (x, y), want in ERASE
+                       if not near(at(rows, scale, x, y)[:3], want, tol)]
+        for view in (main_view, alpha_view, key_view, perf_view, erase_view):
             for attempt in range(3):
                 r, bad = view()
                 if not bad: break

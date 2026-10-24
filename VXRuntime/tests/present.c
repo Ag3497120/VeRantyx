@@ -2,8 +2,11 @@
 // presentation uses (BitBlt from top-down and bottom-up DIB sections, a DIB section over a file mapping, StretchBlt,
 // SetDIBitsToDevice in bands, StretchDIBits, AlphaBlend, TransparentBlt, viewport origin and clip region, GetDIBits /
 // SetDIBits, DSTINVERT), WM_PAINT with an update region (BeginPaint's clip, GetUpdateRect / GetUpdateRgn, ValidateRect),
-// ScrollWindowEx, a child window, layered windows (UpdateLayeredWindow with per-pixel alpha, SetLayeredWindowAttributes
-// with a color key and alpha), DwmFlush, and the cost of a 1134x704 frame (BitBlt and ReleaseDC). The program checks
+// ScrollWindowEx, raster operations that read no source (from their truth tables, the source DC NULL), DefWindowProc's
+// WM_ERASEBKGND with a class brush (only the update region erased: InvalidateRect of a part, GetUpdateRect with bErase,
+// ScrollWindowEx with SW_ERASE; a memory DC passed gets the background), a child window, layered windows
+// (UpdateLayeredWindow with per-pixel alpha, SetLayeredWindowAttributes with a color key and alpha), DwmFlush, and the
+// cost of a 1134x704 frame (BitBlt and ReleaseDC). The program checks
 // what GDI drew (GetPixel); tests/present_check.py checks through Command Clips what the Mac windows show, then closes
 // the main window. Alone ("present.exe --alone") it closes itself.
 #include <windows.h>
@@ -170,6 +173,113 @@ static void scroll_test(void) {
     ReleaseDC(g_main, dc);
 }
 
+// Raster operations from their truth tables on a DIB section (made-up colors; the three color bytes compared): those
+// that read no source with a NULL source DC, two that read the source, and SRCCOPY without a source (an error).
+static void rop_test(void) {
+    HDC screen = GetDC(NULL), mem = CreateCompatibleDC(screen), src = CreateCompatibleDC(screen);
+    DWORD *px, *spx;
+    HBITMAP bm = dib(screen, 8, -1, &px), old = SelectObject(mem, bm);
+    HBITMAP sb = dib(screen, 8, -1, &spx), sold = SelectObject(src, sb);
+    for (int i = 0; i < 8; i++) { px[i] = 0xff3c5a96; spx[i] = 0xffa5c3e1; }      // D = (3c, 5a, 96), S = (a5, c3, e1)
+    HBRUSH br = CreateSolidBrush(RGB(0x0f, 0xf0, 0x33)), oldbr = SelectObject(mem, br);   // P = (0f, f0, 33)
+    static const struct { DWORD rop; int with_src; DWORD want; } ops[8] = {
+        { 0x00AA0029, 0, 0x3c5a96 },                                // D (nothing changes)
+        { 0x000A0329, 0, 0x300a84 },                                // DPna: D & ~P
+        { PATCOPY, 0, 0x0ff033 },                                   // P
+        { 0x00FA0089, 0, 0x3ffab7 },                                // DPo: D | P
+        { BLACKNESS, 0, 0x000000 },
+        { WHITENESS, 0, 0xffffff },
+        { MERGECOPY, 1, 0x05c021 },                                 // P & S
+        { SRCINVERT, 1, 0x999977 },                                 // S ^ D
+    };
+    GdiFlush();
+    CHECK(!BitBlt(mem, 0, 0, 1, 1, NULL, 0, 0, SRCCOPY));          // (SRCCOPY reads a source: none given)
+    for (int i = 0; i < 8; i++) {
+        if (i == 4) CHECK(StretchBlt(mem, i, 0, 1, 1, NULL, 0, 0, 0, 0, ops[i].rop));
+        else CHECK(BitBlt(mem, i, 0, 1, 1, ops[i].with_src ? src : NULL, i, 0, ops[i].rop));
+    }
+    GdiFlush();
+    for (int i = 0; i < 8; i++)
+        if ((px[i] & 0xffffff) != ops[i].want) { printf("check failed: ROP %08lx gives %06lx, not %06lx\n", (unsigned long)ops[i].rop, (unsigned long)(px[i] & 0xffffff), (unsigned long)ops[i].want); failures++; }
+    SelectObject(mem, oldbr); DeleteObject(br);
+    SelectObject(src, sold); DeleteObject(sb); DeleteDC(src);
+    SelectObject(mem, old); DeleteObject(bm); DeleteDC(mem); ReleaseDC(NULL, screen);
+}
+
+// WM_ERASEBKGND by DefWindowProc for a class with a background brush: erased through the DC the message carries, so
+// only the update region is. A window filled with one color (made up) gets three parts invalidated with erasing and
+// painted by a WM_PAINT that draws nothing: everything else must keep its color.
+enum { EW = 128, EH = 64 };
+#define C_FACE RGB(180, 90, 60)
+#define C_BACK RGB(40, 80, 150)
+#define C_MOVED RGB(60, 150, 60)
+static HWND g_erase;
+static int g_erase_phase, g_erase_flag = -1;
+static RECT g_erase_paint;
+static const RECT ER_A = { 8, 8, 40, 32 }, ER_B = { 48, 8, 80, 32 }, ER_S = { 88, 0, 128, 64 };
+// The picture the test leaves (drawn again by any later WM_PAINT, clipped to its update region).
+static void erase_picture(HDC dc) {
+    fill(dc, 0, 0, EW, EH, C_FACE);
+    fill(dc, ER_A.left, ER_A.top, ER_A.right, ER_A.bottom, C_BACK);
+    fill(dc, ER_B.left, ER_B.top, ER_B.right, ER_B.bottom, C_BACK);
+    fill(dc, ER_S.left, ER_S.top, ER_S.right, ER_S.bottom - 16, C_MOVED);
+    fill(dc, ER_S.left, ER_S.bottom - 16, ER_S.right, ER_S.bottom, C_BACK);
+}
+static LRESULT CALLBACK erase_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        g_erase_flag = ps.fErase; g_erase_paint = ps.rcPaint;
+        if (g_erase_phase == 0) fill(dc, 0, 0, EW, EH, C_FACE);
+        else if (g_erase_phase == 2) erase_picture(dc);
+        EndPaint(h, &ps);                                           // (phase 1: nothing drawn)
+        return 0;
+    }
+    return DefWindowProcA(h, m, w, l);
+}
+static void erase_test(void) {
+    g_erase = CreateWindowExA(WS_EX_TOOLWINDOW, "VXPresentErase", "VX present erase", WS_POPUP, 420, 320, EW, EH, NULL, NULL, NULL, NULL);
+    ShowWindow(g_erase, SW_SHOWNOACTIVATE);
+    UpdateWindow(g_erase);
+    HDC dc = GetDC(g_erase);
+    fill(dc, 0, 0, EW, EH, C_FACE);
+    ReleaseDC(g_erase, dc);
+    ValidateRect(g_erase, NULL);
+    g_erase_phase = 1;
+    // a part invalidated with erasing: BeginPaint's WM_ERASEBKGND erases that part, and DefWindowProc did the erasing
+    InvalidateRect(g_erase, &ER_A, TRUE);
+    g_erase_flag = -1;
+    UpdateWindow(g_erase);
+    CHECK(g_erase_flag == 0 && EqualRect(&g_erase_paint, &ER_A));
+    // GetUpdateRect with bErase: the pending erasing done there, on the update region only
+    RECT u;
+    InvalidateRect(g_erase, &ER_B, TRUE);
+    CHECK(GetUpdateRect(g_erase, &u, TRUE) && EqualRect(&u, &ER_B));
+    ValidateRect(g_erase, NULL);
+    // ScrollWindowEx with SW_ERASE: the rows uncovered erased, those moved kept
+    dc = GetDC(g_erase);
+    fill(dc, ER_S.left, ER_S.top, ER_S.right, ER_S.bottom, C_MOVED);
+    ReleaseDC(g_erase, dc);
+    CHECK(ScrollWindowEx(g_erase, 0, -16, &ER_S, &ER_S, NULL, NULL, SW_INVALIDATE | SW_ERASE) == SIMPLEREGION);
+    g_erase_flag = -1;
+    UpdateWindow(g_erase);
+    CHECK(g_erase_flag == 0 && g_erase_paint.left == 88 && g_erase_paint.top == 48 && g_erase_paint.right == 128 && g_erase_paint.bottom == 64);
+    // DefWindowProc given a memory DC: the memory bitmap gets the background, the window nothing
+    HDC screen = GetDC(NULL), mem = CreateCompatibleDC(screen);
+    DWORD *px;
+    HBITMAP bm = dib(screen, EW, -EH, &px), old = SelectObject(mem, bm);
+    memset(px, 0, EW * EH * 4);
+    CHECK(DefWindowProcA(g_erase, WM_ERASEBKGND, (WPARAM)mem, 0) != 0);
+    GdiFlush();
+    CHECK((px[0] & 0xffffff) == 0x285096 && (px[EW * EH - 1] & 0xffffff) == 0x285096);   // C_BACK as a pixel
+    SelectObject(mem, old); DeleteObject(bm); DeleteDC(mem); ReleaseDC(NULL, screen);
+    g_erase_phase = 2;
+    dc = GetDC(g_erase);
+    CHECKPX(dc, 4, 4, C_FACE); CHECKPX(dc, 20, 20, C_BACK); CHECKPX(dc, 44, 20, C_FACE); CHECKPX(dc, 60, 20, C_BACK);
+    CHECKPX(dc, 60, 50, C_FACE); CHECKPX(dc, 100, 20, C_MOVED); CHECKPX(dc, 100, 56, C_BACK); CHECKPX(dc, 4, 56, C_FACE);
+    ReleaseDC(g_erase, dc);
+}
+
 static LRESULT CALLBACK main_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_PAINT: {
@@ -200,8 +310,8 @@ static LRESULT CALLBACK key_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcA(h, m, w, l);
 }
 static void pump(void) { MSG msg; while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageA(&msg); } }
-static ATOM klass(const char *name, WNDPROC proc) {
-    WNDCLASSEXA wc = { sizeof wc, 0, proc, 0, 0, GetModuleHandleA(NULL), NULL, LoadCursor(NULL, IDC_ARROW), NULL, NULL, name, NULL };
+static ATOM klass(const char *name, WNDPROC proc, HBRUSH background) {
+    WNDCLASSEXA wc = { sizeof wc, 0, proc, 0, 0, GetModuleHandleA(NULL), NULL, LoadCursor(NULL, IDC_ARROW), background, NULL, name, NULL };
     return RegisterClassExA(&wc);
 }
 
@@ -263,7 +373,8 @@ static double perf(int *frames_out, DWORD *last) {
 
 int main(int argc, char **argv) {
     int alone = argc > 1 && !strcmp(argv[1], "--alone");
-    CHECK(klass("VXPresentMain", main_proc) && klass("VXPresentChild", child_proc) && klass("VXPresentPopup", DefWindowProcA) && klass("VXPresentKey", key_proc));
+    CHECK(klass("VXPresentMain", main_proc, NULL) && klass("VXPresentChild", child_proc, NULL) && klass("VXPresentPopup", DefWindowProcA, NULL) &&
+          klass("VXPresentKey", key_proc, NULL) && klass("VXPresentErase", erase_proc, CreateSolidBrush(C_BACK)));
     RECT r = { 0, 0, W, H };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_main = CreateWindowExA(0, "VXPresentMain", "VX present test", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, NULL, NULL);
@@ -273,6 +384,8 @@ int main(int argc, char **argv) {
     draw_tiles();
     paint_test();
     scroll_test();
+    rop_test();
+    erase_test();
     g_child = CreateWindowExA(0, "VXPresentChild", "", WS_CHILD | WS_VISIBLE, 8, 210, 48, 24, g_main, NULL, NULL, NULL);
     UpdateWindow(g_child);
     POINT o = { 0, 0 }, c = { 0, 0 };
@@ -295,7 +408,7 @@ int main(int argc, char **argv) {
     if (alone) PostMessageA(g_main, WM_CLOSE, 0, 0);
     MSG msg;
     while (GetMessageA(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageA(&msg); }
-    printf("present: 10 tiles, WM_PAINT update region, ScrollWindowEx, child, 2 layered windows; %dx%d frame by BitBlt + ReleaseDC %.0f us (%d frames), DwmFlush %.1f ms; %d failed checks -> %s\n",
+    printf("present: 10 tiles, WM_PAINT update region, ScrollWindowEx, 8 ROP3 codes, WM_ERASEBKGND on the update region, child, 2 layered windows; %dx%d frame by BitBlt + ReleaseDC %.0f us (%d frames), DwmFlush %.1f ms; %d failed checks -> %s\n",
            PW, PH, us, frames, flush_ms, failures, failures ? "FAILED" : "ok");
     return failures;
 }

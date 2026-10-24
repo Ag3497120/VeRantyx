@@ -124,7 +124,7 @@ void vx_window_wake(vx_window *w);                        // its thread's messag
 // gdi.c
 HANDLE vx_dc_for_window(vx_window *w);
 void   vx_dc_release(HANDLE dc);
-void   vx_fill_client(vx_window *w, HANDLE brush);        // WM_ERASEBKGND's default
+int    vx_fill_client(vx_window *w, HANDLE dc, HANDLE brush);   // WM_ERASEBKGND's default, on its DC
 void   vx_gdi_init(void);
 uint32_t vx_sys_color(int index);                         // COLORREF of a COLOR_* index
 

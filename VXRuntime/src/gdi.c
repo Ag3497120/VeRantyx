@@ -751,11 +751,12 @@ static WINAPI int FrameRect(HANDLE h, const RECT *r, HANDLE brush) {
     fill(dc, (RECT){ r->right - 1, r->top, r->right, r->bottom }, color);
     return 1;
 }
-void vx_fill_client(vx_window *w, HANDLE brush) {
-    HANDLE dc = vx_dc_for_window(w);
+// WM_ERASEBKGND's default: the client rectangle filled with the class brush on the DC the message carries (wParam), so
+// that DC's clip region limits it (BeginPaint's: the update region) and a memory DC passed gets the background, not
+// the window. Whether anything was erased (DefWindowProc's answer).
+int vx_fill_client(vx_window *w, HANDLE dc, HANDLE brush) {
     RECT r = { 0, 0, w->client_w, w->client_h };
-    FillRect(dc, &r, brush);
-    vx_dc_release(dc);
+    return FillRect(dc, &r, brush) != 0;
 }
 // Pixels of a device rectangle (inside the clip region) XORed with a value: DSTINVERT, PATINVERT.
 static void xor_rect(gdi_obj *dc, RECT r, uint32_t value) {
