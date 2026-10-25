@@ -1240,6 +1240,7 @@ static WINAPI DWORD SleepEx(DWORD ms, BOOL alertable) {
 }
 
 // ---- handles -----------------------------------------------------------------------------------------------------------------
+static void forget_association(HANDLE h);                          // (I/O completion ports, below)
 static WINAPI BOOL CloseHandle(HANDLE h) {
     intptr_t v = (intptr_t)h;
     if (v <= -1 && v >= -6) return 1;                              // process, thread and token pseudo-handles (-4..-6: tokens)
@@ -1247,6 +1248,7 @@ static WINAPI BOOL CloseHandle(HANDLE h) {
     int i = handle_index(h);
     vx_object *o = i >= 0 ? g_handles[i] : NULL;
     if (o) { g_handles[i] = NULL; if (i < g_free_hint) g_free_hint = i; unref(o); }
+    forget_association(h);                                          // (the number may be given to another file)
     intptr_t k = ((intptr_t)h - INJECT_BASE) / 4;
     if (!o && (intptr_t)h >= INJECT_BASE && k < INJECT_COUNT && !(((intptr_t)h - INJECT_BASE) % 4) && g_injected[k]) {
         o = g_injected[k]; g_injected[k] = NULL; unref(o);
@@ -1868,9 +1870,30 @@ static WINAPI uint16_t QueryDepthSList(slist_header *h) { return (uint16_t)h->de
 // ---- I/O completion ports ---------------------------------------------------------------------------------------------------------
 // A port is a queue of completion packets. I/O here completes at once, so a read or write with an OVERLAPPED on
 // a handle associated with a port posts its packet right away; waiters take packets in order.
-typedef struct { HANDLE handle, port; uint64_t key; int skip_on_success; } association;
+// An association belongs to the handle's file, not to the handle's number: when the handle is closed it is marked
+// closed, and a file opened later that gets the same number has none (CreateIoCompletionPort's documentation: the
+// association lasts as long as the handle). Steam's web helper crashed after every sign-in when a file it read with an
+// OVERLAPPED of its own, synchronously, got the number of a closed one Chromium's disk cache had associated: the
+// read's packet went to that port with the disk cache's key, and its completion handler took the program's OVERLAPPED
+// for its own (libcef.dll, a call through a vtable of 0xaaaaaaaaaaaaaaaa). An operation that was still running when
+// its handle was closed (its OVERLAPPED's Internal still STATUS_PENDING: pipes, sockets) completes to the port it
+// was started on, as an aborted one does on Windows.
+typedef struct { HANDLE handle, port; uint64_t key; int skip_on_success, closed; } association;
 static association g_assoc[1024];
 static int g_assoc_count;
+static void forget_association(HANDLE h) {                          // g_lock held
+    for (int i = 0; i < g_assoc_count; i++) if (g_assoc[i].handle == h) g_assoc[i].closed = 1;
+}
+void vx_io_forget(HANDLE h) { glock(); forget_association(h); gunlock(); }
+static association *find_association(HANDLE h, int closed_too) {      // g_lock held; an open one first
+    association *c = NULL;
+    for (int i = 0; i < g_assoc_count; i++) {
+        if (g_assoc[i].handle != h) continue;
+        if (!g_assoc[i].closed) return &g_assoc[i];
+        if (closed_too) c = &g_assoc[i];
+    }
+    return c;
+}
 
 static void post_packet(vx_object *port, DWORD bytes, uint64_t key, void *ov, DWORD status) {   // g_lock held
     packet *p = calloc(1, sizeof *p);
@@ -1893,10 +1916,12 @@ static WINAPI HANDLE CreateIoCompletionPort(HANDLE file, HANDLE existing, uint64
         gunlock(); vx_set_last_error(87); return NULL;
     }
     if (file != (HANDLE)(intptr_t)-1) {
-        int i = 0;
-        while (i < g_assoc_count && g_assoc[i].handle != file) i++;
-        if (i == g_assoc_count && g_assoc_count < 1024) g_assoc_count++;
-        if (i < 1024) g_assoc[i] = (association){ file, port, key, 0 };
+        association *a = find_association(file, 0);                // (a handle is associated once: replaced here)
+        for (int i = 0; !a && i < g_assoc_count; i++) if (g_assoc[i].closed && g_assoc[i].handle == file) a = &g_assoc[i];
+        for (int i = 0; !a && i < g_assoc_count; i++) if (g_assoc[i].closed) a = &g_assoc[i];
+        if (!a && g_assoc_count < 1024) a = &g_assoc[g_assoc_count++];
+        if (!a) { gunlock(); vx_log("CreateIoCompletionPort: more than 1024 handles associated"); vx_set_last_error(1450); return NULL; }
+        *a = (association){ file, port, key, 0, 0 };
     }
     gunlock();
     return port;
@@ -1904,7 +1929,8 @@ static WINAPI HANDLE CreateIoCompletionPort(HANDLE file, HANDLE existing, uint64
 #define FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 1
 static WINAPI BOOL SetFileCompletionNotificationModes(HANDLE file, uint8_t flags) {
     glock();
-    for (int i = 0; i < g_assoc_count; i++) if (g_assoc[i].handle == file) g_assoc[i].skip_on_success = flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
+    association *a = find_association(file, 0);
+    if (a) a->skip_on_success = flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
     gunlock();
     return 1;
 }
@@ -1913,21 +1939,29 @@ static WINAPI BOOL SetFileCompletionNotificationModes(HANDLE file, uint8_t flags
 void vx_io_completed(HANDLE file, void *ov, DWORD bytes, DWORD status) {
     if (!ov) return;
     uint64_t *o = ov;
+    int was_pending = o[0] == 0x103;                               // STATUS_PENDING: started before now (see association)
     o[0] = status; o[1] = bytes;
     HANDLE event = *(HANDLE *)((uint8_t *)ov + 24);
     glock();
     vx_object *e = lookup((HANDLE)((uintptr_t)event & ~(uintptr_t)1));
     if (e && e->type == OBJ_EVENT) { e->signaled = 1; notify(e); }
-    if (!((uintptr_t)event & 1)) {
-        for (int i = 0; i < g_assoc_count; i++) {
-            if (g_assoc[i].handle != file) continue;
-            vx_object *port = lookup(g_assoc[i].port);
-            if (port && port->type == OBJ_PORT && !(status == 0 && g_assoc[i].skip_on_success)) post_packet(port, bytes, g_assoc[i].key, ov, status);
-            break;
-        }
+    association *a = (uintptr_t)event & 1 ? NULL : find_association(file, was_pending);
+    if (a) {
+        vx_object *port = lookup(a->port);
+        if (port && port->type == OBJ_PORT && !(status == 0 && a->skip_on_success)) post_packet(port, bytes, a->key, ov, status);
     }
     pthread_cond_broadcast(&g_changed);
     gunlock();
+}
+// Microsoft's documentation of ReadFile, WSARecv and I/O completion ports: an operation that fails at once queues no
+// completion packet and gives no other completion indication; one only comes for an operation that succeeded at once
+// or returned ERROR_IO_PENDING. Steam's web helper (Chromium's disk cache) frees an operation's context when the
+// call fails; a packet posted anyway for a read at the end of a file brought its completion handler back to that freed
+// context (libcef.dll, a call through a vtable of 0xaaaaaaaaaaaaaaaa) and the web helper crashed after every sign-in.
+void vx_io_failed(void *ov, DWORD status) {
+    if (!ov) return;
+    uint64_t *o = ov;
+    o[0] = status; o[1] = 0;
 }
 static WINAPI BOOL PostQueuedCompletionStatus(HANDLE port, DWORD bytes, uint64_t key, void *ov) {
     glock();

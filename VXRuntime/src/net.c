@@ -115,6 +115,7 @@ static void select_inherit(SOCKET listening, SOCKET accepted);
 static void select_listening(SOCKET s);
 static WINAPI int closesocket(SOCKET s) {
     select_forget(s);                       // (its WSAEventSelect goes with it: a socket opened later may get the number)
+    vx_io_forget((HANDLE)s);                // (and its completion port association: src/sync.c)
     return close(to_fd(s)) ? fail() : 0;
 }
 static WINAPI int ws_bind(SOCKET s, const void *addr, int len) {
@@ -272,11 +273,11 @@ static int send_msg_control(SOCKET s, const WSABUF *bufs, DWORD n, DWORD *sent, 
     uint8_t control[256] __attribute__((aligned(8)));
     if (ctl && ctl_len) {
         long used = control_in(ctl, ctl_len, control, sizeof control);
-        if (used < 0) { vx_set_last_error(10022 /* WSAEINVAL */); if (ov && !cr) vx_io_completed((HANDLE)s, ov, 0, 10022); return SOCKET_ERROR; }
+        if (used < 0) { vx_set_last_error(10022 /* WSAEINVAL */); if (ov && !cr) vx_io_failed(ov, 10022); return SOCKET_ERROR; }
         m.msg_control = control; m.msg_controllen = (socklen_t)used;
     }
     ssize_t r = sendmsg(to_fd(s), &m, flags_in((int)flags));
-    if (r < 0) { int e = fail(); if (ov && !cr) vx_io_completed((HANDLE)s, ov, 0, vx_get_last_error()); return e; }
+    if (r < 0) { int e = fail(); if (ov && !cr) vx_io_failed(ov, vx_get_last_error()); return e; }
     if (sent) *sent = (DWORD)r;
     if (cr) complete_with_routine(issuing_thread(), cr, ov, (DWORD)r, 0);
     else if (ov) vx_io_completed((HANDLE)s, ov, (DWORD)r, 0);
@@ -331,7 +332,7 @@ static int recv_msg(SOCKET s, WSABUF *bufs, DWORD n, DWORD *got, DWORD *flags, v
         else vx_io_completed((HANDLE)s, ov, (DWORD)r, 0);
         return 0;
     }
-    if (errno != EAGAIN) { int e = fail(); if (!cr) vx_io_completed((HANDLE)s, ov, 0, vx_get_last_error()); return e; }
+    if (errno != EAGAIN) { int e = fail(); if (!cr) vx_io_failed(ov, vx_get_last_error()); return e; }
     pending_recv *p = calloc(1, sizeof *p);
     p->s = s; memcpy(p->iov, iov, sizeof iov); p->n = count; p->ov = ov; p->from = from; p->fromlen = fromlen; p->flags = f;
     p->cr = cr; p->thread = cr ? issuing_thread() : NULL;

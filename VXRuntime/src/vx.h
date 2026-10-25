@@ -173,6 +173,12 @@ int    vx_handle_access(HANDLE h, DWORD *access);
 DWORD  vx_mapping_access(DWORD requested);     // files.c: a file mapping's access rights from FILE_MAP_* / generic ones
 // An overlapped operation on `file` finished: fills the OVERLAPPED, signals its event, queues the completion packet.
 void   vx_io_completed(HANDLE file, void *overlapped, DWORD bytes, DWORD status);
+// An overlapped operation that failed at once (the call returns FALSE / SOCKET_ERROR with an error other than
+// ERROR_IO_PENDING): Internal and InternalHigh get the status, and nothing else happens: no completion packet, no
+// event (src/sync.c).
+void   vx_io_failed(void *overlapped, DWORD status);
+// A handle closed outside CloseHandle (closesocket): its completion port association goes (src/sync.c).
+void   vx_io_forget(HANDLE h);
 void   vx_set_event(HANDLE event);          // SetEvent for threads that are not Windows threads
 void   vx_release_semaphore(HANDLE sem, LONG n);   // ReleaseSemaphore for them (a count past the maximum is dropped)
 // A handle's object as NtQueryObject describes it (sync.c): see there. vx_handle_count: the handles of the table.
@@ -260,6 +266,7 @@ void vx_imagehlp_init(void);           // imagehlp's attribute certificate table
 void vx_ime_init(void);                // imm32: the Mac's input method as Windows programs see one (ime.c)
 void vx_clipboard_init(void);          // the clipboard on the Mac's pasteboard (clipboard.m)
 void vx_spellcheck_init(void);         // the Spell Checking API's factory, with no languages (spellcheck.c)
+void vx_mfplat_init(void);             // Media Foundation and DXVA2 that cannot be started (mfplat.c)
 void vx_a11y_init(void);               // oleacc, UIAutomationCore, uxtheme: no assistive technology, no visual styles (a11y.c)
 void vx_present_init(void);            // GDI to the screen: blits, DIB transfers, painting, layered windows (present.c)
 void vx_inherit_init(void);            // handle inheritance for descriptors: CreatePipe, Set/GetHandleInformation (inherit.c)
