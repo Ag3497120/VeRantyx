@@ -152,6 +152,5 @@ needs the author's permission. Versions published before 2026-10-25 (up to mac-v
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).)
 
 **Why the change:** VeRantyx is built by one person, in their own time. Under MIT, anyone, companies included,
-could take the code and sell it. After this week's events with my GitHub account, I want more say over where this
-work goes. With PolyForm Noncommercial it stays free for everyone who plays, studies or tinkers with it, and
+could take the code and sell it. With PolyForm Noncommercial it stays free for everyone who plays, studies or tinkers with it, and
 commercial use starts with a conversation.
