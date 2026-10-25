@@ -39,8 +39,10 @@ Controller velocities (what the game throws with): ALVR's own, except for Pico, 
 client predicts the controller's pose a whole pipeline latency ahead and sends the difference as the velocity. On a
 Mac that latency is 150-250 ms (some 50-80 ms on a PC), and Half-Life: Alyx threw things as from a cannon with a Pico 4
 Ultra. For those the bridge takes the velocities from the poses themselves (each sample against the one before, over
-the time between them). `VERANTYX_ALVR_VELOCITY=headset` or `=poses` chooses for any headset. The session log says
-which at each connection, and every 5 s the fastest controller speed both ways (`VeRantyx: controllers:`).
+the time between them), after moving each pose back by the lead the client moved it ahead with (its velocity times the
+latency less SteamVR's pipeline, at most `max_prediction_ms`, 100 ms: the client's own rule, worked out here from the
+latencies it reports). `VERANTYX_ALVR_VELOCITY=headset` or `=poses` chooses for any headset. The session log says
+which at each connection, and every 5 s the fastest controller speed both ways and the lead (`VeRantyx: controllers:`).
 
 Vibration: the driver's controllers have a haptic component; the game's vibrations (VREvent_Input_HapticVibration)
 go per hand into the map's tail (SharedHaptic at 336: seq, duration, frequency, amplitude), the encoder passes each on

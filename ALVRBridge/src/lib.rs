@@ -161,9 +161,9 @@ impl SampleLog {
                 self.frames, since.elapsed().as_secs_f32(), self.exact, self.age_ns_sum as f64 / self.frames as f64 / 1e6, self.age_ns_max as f64 / 1e6);
             let line = HEADSET.lock().unwrap().line(since.elapsed().as_secs_f64());
             alvr_common::info!("VeRantyx: headset: {line}");
-            if let Some((sent, poses, from)) = HAND_SPEEDS.lock().unwrap().take() {
-                alvr_common::info!("VeRantyx: controllers: fastest {sent:.1} m/s as the headset sent it, {poses:.1} m/s from the poses (the game gets {})",
-                    if from == VelocitySource::Poses { "the poses'" } else { "the headset's" });
+            if let Some((sent, poses, lead, from)) = HAND_SPEEDS.lock().unwrap().take() {
+                alvr_common::info!("VeRantyx: controllers: fastest {sent:.1} m/s as the headset sent it, {poses:.1} m/s from the poses moved back {:.0} ms (the game gets {})",
+                    lead * 1000.0, if from == VelocitySource::Poses { "the poses'" } else { "the headset's" });
             }
             *self = SampleLog { recent: std::mem::take(&mut self.recent), newest: self.newest, since: Some(std::time::Instant::now()), ..Default::default() };
         }
@@ -223,14 +223,14 @@ impl alvr_common::log::Log for Logger {
         let event_type = (text.starts_with('{') && text.ends_with('}')).then(|| serde_json::from_str::<EventType>(&text).ok()).flatten()
             .unwrap_or_else(|| EventType::Log(alvr_common::LogEntry { severity: alvr_common::LogSeverity::from_log_level(record.level()), content: text }));
         match &event_type {
-            EventType::GraphStatistics(g) => return headset_logs(|h| {
+            EventType::GraphStatistics(g) => return { note_latency(g.total_pipeline_latency_s); headset_logs(|h| {
                 h.frames += 1; h.reported = true;
                 // (Mac: from the tracking sample's arrival to the frame's encoding, which is all "encoder" to ALVR here:
                 //  the bridge does not report present or composed; headset: waiting to be shown, its compositor, vsync)
                 h.total_s += g.total_pipeline_latency_s as f64; h.network_s += g.network_s as f64; h.decode_s += g.decoder_s as f64;
                 h.mac_s += (g.game_time_s + g.server_compositor_s + g.encoder_s) as f64;
                 h.headset_s += (g.decoder_queue_s + g.client_compositor_s + g.vsync_queue_s) as f64;
-            }),
+            }) },
             EventType::StatisticsSummary(_) => return,
             _ => {}
         }
@@ -299,7 +299,12 @@ fn tangents(f: &Fov) -> [f32; 4] { [f.left.tan(), f.right.tan(), f.down.tan(), f
 // throw is far off: Half-Life: Alyx threw things as from a cannon (a Pico 4 Ultra with its controllers, 0.2.2). For
 // those headsets the velocities come from the poses themselves instead: each sample's pose against the one before,
 // over the time between their samples (the client's clock, so samples that arrive together still count right).
-// VERANTYX_ALVR_VELOCITY=headset or =poses chooses for any headset.
+// The poses are not quite the measured ones either: ALVR's client moves each controller pose ahead by its velocity
+// (client_core lib.rs, send_tracking: the average latency less SteamVR's pipeline, steamvr_pipeline_frames frames,
+// at most max_prediction_ms, 100 ms), so their differences would carry that velocity's errors on, times that lead.
+// The same lead is worked out here (client_lead, from the latencies the client reports) and each pose moved back by
+// the velocity it came with (unpredict) before the difference is taken. VERANTYX_ALVR_VELOCITY=headset or =poses
+// chooses for any headset.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VelocitySource { Headset, Poses }
 
@@ -316,8 +321,37 @@ pub fn velocity_source(headsets: &[String], setting: Option<&str>) -> VelocitySo
     if headsets.iter().any(|n| extrapolated(n)) { VelocitySource::Poses } else { VelocitySource::Headset }
 }
 
-/// A hand's velocity from its successive poses (ALVR's, at their sample times in seconds): linear in the tracking
-/// space, angular in the hand's own frame as ALVR sends it (its tracking manager turns it so: SteamVR's convention).
+/// How far ahead ALVR's client moved the controllers' poses, in seconds: its average latency from the tracking sample
+/// to the display less SteamVR's pipeline (steamvr_pipeline_frames at the display rate), at most max_prediction_ms
+/// (client_core statistics.rs, tracker_prediction_offset; lib.rs, send_tracking).
+pub fn client_lead(average_latency_s: f32, pipeline_frames: f32, refresh_hz: f32, max_prediction_ms: u64) -> f32 {
+    let pipeline = if refresh_hz > 0.0 { pipeline_frames / refresh_hz } else { 0.0 };
+    (average_latency_s - pipeline).clamp(0.0, max_prediction_ms as f32 / 1000.0)
+}
+
+/// A controller's pose as ALVR's core hands it on, moved back by the lead the client moved it ahead with (its linear
+/// velocity in the tracking space, its angular one in the controller's frame, as the core turns it).
+pub fn unpredict(m: &DeviceMotion, lead_s: f32) -> (Vec3, Quat) {
+    let turn = m.pose.orientation * m.angular_velocity;                // (in the tracking space)
+    (m.pose.position - m.linear_velocity * lead_s, (Quat::from_scaled_axis(-turn * lead_s) * m.pose.orientation).normalize())
+}
+
+// The latencies the client reports (seconds, one per frame shown: the logger's GraphStatistics), the last
+// statistics_history_size of them as the client averages them, and what the lead is worked out with.
+static LATENCIES: Mutex<std::collections::VecDeque<f32>> = Mutex::new(std::collections::VecDeque::new());
+static LATENCY_WINDOW: AtomicU64 = AtomicU64::new(256);              // (statistics_history_size, set on connecting:
+fn note_latency(seconds: f32) {                                        //  not read here, the logger may run under
+    let window = LATENCY_WINDOW.load(Ordering::Relaxed).max(1) as usize; //  the session's lock)
+    let mut l = LATENCIES.lock().unwrap();
+    l.push_back(seconds);
+    while l.len() > window { l.pop_front(); }
+}
+fn average_latency() -> f32 {
+    let l = LATENCIES.lock().unwrap();
+    if l.is_empty() { 0.0 } else { l.iter().sum::<f32>() / l.len() as f32 }
+}
+
+/// A hand's velocity from its successive poses (at their sample times in seconds), both in the tracking space.
 #[derive(Default)]
 pub struct PoseVelocity {
     last: Option<(f64, Vec3, Quat)>,
@@ -335,7 +369,7 @@ impl PoseVelocity {
 
     pub fn update(&mut self, t: f64, position: Vec3, orientation: Quat) -> (Vec3, Vec3) {
         match self.last {
-            Some((t0, ..)) if t == t0 || (t > t0 && t - t0 < Self::MIN_DT) => return self.output(orientation),
+            Some((t0, ..)) if t == t0 || (t > t0 && t - t0 < Self::MIN_DT) => return self.output(),
             Some((t0, p0, q0)) if t > t0 && t - t0 <= Self::MAX_DT => {
                 let dt = (t - t0) as f32;
                 let linear = (position - p0) / dt;
@@ -348,14 +382,15 @@ impl PoseVelocity {
             _ => { self.linear = Vec3::ZERO; self.angular = Vec3::ZERO; }   // (the first, after a gap, or an older clock)
         }
         self.last = Some((t, position, orientation));
-        self.output(orientation)
+        self.output()
     }
 
-    fn output(&self, orientation: Quat) -> (Vec3, Vec3) { (self.linear, orientation.conjugate() * self.angular) }
+    fn output(&self) -> (Vec3, Vec3) { (self.linear, self.angular) }
 }
 
-// The hands' fastest speeds since the last 5 s report (SampleLog), as the headset sent them and from the poses, m/s.
-static HAND_SPEEDS: Mutex<Option<(f32, f32, VelocitySource)>> = Mutex::new(None);
+// The hands' fastest speeds since the last 5 s report (SampleLog), as the headset sent them and from the poses, m/s,
+// and the client's lead (s).
+static HAND_SPEEDS: Mutex<Option<(f32, f32, f32, VelocitySource)>> = Mutex::new(None);
 
 fn connected_headsets(layout: &alvr_filesystem::Layout) -> Vec<String> {
     fs::read_to_string(layout.session()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -402,6 +437,7 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
     let mut buttons: HashMap<u64, f32> = HashMap::new();
     let mut velocity_from = VelocitySource::Headset;
     let mut pose_velocity = [PoseVelocity::default(), PoseVelocity::default()];
+    let mut lead_settings = (2.1f32, 90.0f32, 100u64);                 // (steamvr_pipeline_frames, display rate, max_prediction_ms)
     while let Ok(e) = receiver.recv() {
         match e {
             ServerCoreEvent::ClientConnected => {
@@ -410,8 +446,13 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
                 let headsets = connected_headsets(&bridge.layout);
                 velocity_from = velocity_source(&headsets, env::var("VERANTYX_ALVR_VELOCITY").ok().as_deref());
                 pose_velocity.iter_mut().for_each(PoseVelocity::reset);
+                let settings = alvr_server_core::settings();
+                lead_settings = (settings.headset.controllers.as_option().map_or(0.0, |c| c.steamvr_pipeline_frames),
+                    openvr_config(&bridge.layout)["refresh_rate"].as_f64().unwrap_or(90.0) as f32, settings.headset.max_prediction_ms);
+                LATENCY_WINDOW.store(settings.connection.statistics_history_size as u64, Ordering::Relaxed);
+                LATENCIES.lock().unwrap().clear();
                 alvr_common::info!("VeRantyx: {:?} connected; the controllers' velocities come from {}", headsets,
-                    if velocity_from == VelocitySource::Poses { "their poses (sample to sample)" } else { "the headset" });
+                    if velocity_from == VelocitySource::Poses { "their poses (sample to sample, moved back by the client's lead)" } else { "the headset" });
             }
             ServerCoreEvent::ClientDisconnected => bridge.connected.store(false, Ordering::SeqCst),
             ServerCoreEvent::RequestIDR => { bridge.idr_requested.store(true, Ordering::SeqCst); headset_logs(|h| h.idr_requests += 1); }
@@ -451,13 +492,16 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
                 };
                 // (a controller's velocities, from its poses when the headset's are a long prediction: velocity_source)
                 {
+                    let lead = client_lead(average_latency(), lead_settings.0, lead_settings.1, lead_settings.2);
                     let mut speeds = HAND_SPEEDS.lock().unwrap();
                     for (i, h) in hands.iter_mut().enumerate() {
                         let Some((m, true)) = h.as_mut() else { pose_velocity[i].reset(); continue };
-                        let (linear, angular) = pose_velocity[i].update(sample_timestamp.as_secs_f64(), m.pose.position, m.pose.orientation);
-                        let s = speeds.get_or_insert((0.0, 0.0, velocity_from));
-                        *s = (s.0.max(m.linear_velocity.length()), s.1.max(linear.length()), velocity_from);
-                        if velocity_from == VelocitySource::Poses { m.linear_velocity = linear; m.angular_velocity = angular; }
+                        let (position, orientation) = unpredict(m, lead);
+                        let (linear, turn) = pose_velocity[i].update(sample_timestamp.as_secs_f64(), position, orientation);
+                        let s = speeds.get_or_insert((0.0, 0.0, 0.0, velocity_from));
+                        *s = (s.0.max(m.linear_velocity.length()), s.1.max(linear.length()), lead, velocity_from);
+                        // (angular in the controller's frame, of the pose SteamVR gets: as ALVR's core hands it on)
+                        if velocity_from == VelocitySource::Poses { m.linear_velocity = linear; m.angular_velocity = m.pose.orientation.conjugate() * turn; }
                     }
                 }
                 let [left, right] = hands.map(|h| matrix(h.map(|(m, _)| m)));
@@ -651,6 +695,56 @@ mod tests {
     }
 
     #[test]
+    fn the_clients_lead() {
+        // 190 ms of latency, 2.1 frames of SteamVR pipeline at 72 Hz (29 ms): 161 ms, but at most 100 ms
+        assert!((client_lead(0.190, 2.1, 72.0, 100) - 0.100).abs() < 1e-6);
+        assert!((client_lead(0.080, 2.1, 72.0, 100) - (0.080 - 2.1 / 72.0)).abs() < 1e-6);
+        assert_eq!(client_lead(0.010, 2.1, 72.0, 100), 0.0);
+        assert_eq!(client_lead(0.0, 2.1, 0.0, 100), 0.0);
+    }
+
+    // What ALVR does to a controller's motion on its way: the client moves the pose ahead by the velocity it sends
+    // (DeviceMotion::predict, send_tracking), the core turns the angular velocity into the controller's frame.
+    fn as_alvr_hands_it_on(position: Vec3, orientation: Quat, linear: Vec3, turn: Vec3, lead: f32) -> DeviceMotion {
+        let sent = DeviceMotion { pose: Pose { orientation, position }, linear_velocity: linear, angular_velocity: turn }
+            .predict(Duration::from_secs(10), Duration::from_secs(10) + Duration::from_secs_f32(lead));
+        DeviceMotion { angular_velocity: sent.pose.orientation.conjugate() * sent.angular_velocity, ..sent }
+    }
+
+    #[test]
+    fn a_pose_moved_back_by_the_clients_lead() {
+        let (position, orientation) = (Vec3::new(0.2, 1.1, -0.4), Quat::from_euler(EulerRot::YXZ, 0.7, -0.3, 0.2));
+        let m = as_alvr_hands_it_on(position, orientation, Vec3::new(3.0, 1.0, -4.0), Vec3::new(2.0, -6.0, 1.0), 0.1);
+        let (p, q) = unpredict(&m, 0.1);
+        assert!(close(p, position, 1e-4), "{p:?}");
+        assert!(q.angle_between(orientation) < 1e-3, "{q:?}");
+    }
+
+    #[test]
+    fn a_throw_with_wrong_velocities_from_the_headset() {
+        // the hand speeds up at 40 m/s² for 0.15 s and stops; the headset's velocity runs 0.1 s ahead of the hand and
+        // twice too fast (as a prediction over the whole latency might), and the client moved each pose ahead by it
+        let (a, release, lead) = (40.0f32, 0.15f64, 0.1f32);
+        let hand = |t: f64| { let tt = t.clamp(0.0, release) as f32; (Vec3::new(0.5 * a * tt * tt, 1.2, -0.3), Vec3::new(a * tt * (t <= release) as u8 as f32, 0.0, 0.0)) };
+        let mut moved_back = PoseVelocity::default();
+        let mut as_sent = PoseVelocity::default();
+        let (mut fastest, mut fastest_as_sent, mut fastest_headset) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..40 {
+            let t = i as f64 * HZ72;
+            let (position, _) = hand(t);
+            let wrong = hand(t + lead as f64).1 * 2.0;
+            let m = as_alvr_hands_it_on(position, Quat::IDENTITY, wrong, Vec3::ZERO, lead);
+            let (p, q) = unpredict(&m, lead);
+            fastest = fastest.max(moved_back.update(t, p, q).0.length());
+            fastest_as_sent = fastest_as_sent.max(as_sent.update(t, m.pose.position, m.pose.orientation).0.length());
+            fastest_headset = fastest_headset.max(m.linear_velocity.length());
+        }
+        assert!(fastest_headset > 11.0, "{fastest_headset}");
+        assert!(fastest_as_sent > 8.0, "the poses as sent carry the wrong velocity on: {fastest_as_sent}");
+        assert!(fastest <= 6.05 && fastest > 4.5, "moved back, they move as the hand did (6 m/s): {fastest}");
+    }
+
+    #[test]
     fn steady_motion_at_uneven_sample_times() {
         // 2 m/s forward (-z) and 0.5 m/s up; the samples' times jitter by a few ms, as a headset's do
         let v = Vec3::new(0.0, 0.5, -2.0);
@@ -717,8 +811,7 @@ mod tests {
             q = Quat::from_scaled_axis(w * t as f32) * rolled;
             out = p.update(t, Vec3::new(0.0, 1.2, -0.3), q);
         }
-        assert!(close(q * out.1, w, 0.01), "back in the world, the turn is about up: {:?}", q * out.1);
-        assert!(close(out.1, q.conjugate() * w, 0.01));
+        assert!(close(out.1, w, 0.01), "the turn is about up: {:?}", out.1);
         assert!(close(out.0, Vec3::ZERO, 1e-4));
     }
 
@@ -735,7 +828,7 @@ mod tests {
             if i % 2 == 1 { q = -q; }
             out = p.update(t, Vec3::ZERO, q).1;
         }
-        assert!(close(q * out, w, 0.05), "{:?}", q * out);
+        assert!(close(out, w, 0.05), "{out:?}");
     }
 
     #[test]
