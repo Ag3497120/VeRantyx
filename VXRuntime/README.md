@@ -86,15 +86,19 @@ runs on (past Steam's SteamVR check, 88 s of 88 in every run since `OpenThread` 
 ended itself about 10 s in: tier0 freed the main thread's data when it could not open it), loads `steamclient64.dll`
 once the Steam Service Error box is closed (its connectivity test passes, logged off), and the web helper creates
 Steam's shared JS context (`logs/steamui_html.txt`: `BrowserReady`; its page loads, `webhelper_js.txt` ends at
-"setting locale: en"). Its GPU side works since 2026-10-25 (without `-cef-disable-gpu`): Steam's ANGLE makes its EGL
-display and GLES 3 contexts on our Direct3D 11 (the screen's DC belongs to the desktop window, IDXGIDevice2-4, the
-adapter's driver version; before, every EGL display type failed and "Failed to create shared context for
-virtualization" came about 100 times a second). It still draws no window: the page's script goes no further and the
-web helper sits idle (a sample shows every thread waiting; `VXRT_WAIT_DUMP` lists only idle pool threads and
-Steam's own waits, no deadlock), and in five runs of eight `steam.exe` decides about 20 s after `BrowserReady` to restart it ("Restart webhelper process, counter 2", then the helper's
-`TerminateProcess(current, 0)`), in the other three it keeps it for the whole run; either way no sign-in window yet. Chromium's
-DevTools server (Steam's `-cef-enable-debugging`) listens on 127.0.0.1:8080 but never answers a request (curl
-connects, then times out; WSAEnumNetworkEvents is never called for its FD_ACCEPT event), which suggests some of the web helper's I/O never reaches its threads (not yet shown).
+"setting locale: en"). With Steam's `-cef-disable-gpu` (the launch script's default) the web helper composites in
+software and draws the "Sign in to Steam" window through GDI. Without it, the GPU side works as far as the EGL
+display since 2026-10-25: Steam's ANGLE makes its EGL display and GLES 3 contexts on our Direct3D 11 (the screen's DC
+belongs to the desktop window, IDXGIDevice2-4, the adapter's driver version; before, every EGL display type failed
+and "Failed to create shared context for virtualization" came about 100 times a second; 0 of them now). The login
+window is created but stays black on that path (run of 2026-10-25, 115 s): `eglCreateWindowSurface` fails with
+`EGL_BAD_ALLOC` (ANGLE: "Could not create additional swap chains or offscreen surfaces, HRESULT: 0x80004005"), and
+`CreateSwapChainForHwnd` on a child window does fail here with E_FAIL (a swap chain needs the window's own Mac
+window, `vx_cocoa_metal_layer`; only top-level windows have one); `steam.exe` restarts the helper twice ("Restart
+webhelper process, counter 2") and then turns GPU acceleration off ("Disabling GPU acceleration: Disabled/
+RuntimeDetect"). Swap chains on child windows are the next step for the GPU path. Seen before stage 2's network
+fixes: Chromium's DevTools server (Steam's `-cef-enable-debugging`) listened on 127.0.0.1:8080 but never answered
+(no WSAEnumNetworkEvents for its FD_ACCEPT event).
 
 Steam updates itself here as on Windows (2026-10-25: from the 2026-09-03 client, 1788652215, to 1792618285, Valve's
 download). Those runs were made in `~/Verantyx_VR_Drive/vxrt_wsteam` itself, not in a copy, two of them with
