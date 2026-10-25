@@ -77,7 +77,8 @@ struct VkQueue_T {
     __strong id<MTLSharedEvent> done;   // signaled with each submission's number when it completes
     uint64_t submitted;            // the last submission's number
     __strong id<MTLFence> last_fence;   // (every encoder waits for the one before it: see vk_command.m)
-    __strong id<MTLBuffer> gs_scratch[3];   // geometry draws: vertex outputs, triangles, counts (reused draw to draw)
+    __strong id<MTLBuffer> gs_scratch[4];   // geometry draws: vertex outputs, triangles, counts; tessellation: vertex
+                                            // outputs, control points, patches, factors (reused draw to draw)
 };
 
 typedef struct vk_heap_list { __strong id<MTLHeap> *heaps; uint32_t count, cap; pthread_mutex_t lock; uint64_t generation; } vk_heap_list;
@@ -108,6 +109,11 @@ struct VkDeviceMemory_T {
     void *map;
     struct VkImage_T *dedicated_image;
     uint32_t handle;                  // an exported Win32 handle, 0 when none
+    // External memory (VK_KHR_external_memory_win32): a dedicated image's texture on a global IOSurface, imported from
+    // a shared handle (Direct3D's, another process's) or made here to be exported; shared_slot is its handle's slot + 1.
+    __strong id<MTLTexture> external;
+    int shared_slot;
+    int keyed_slot;                   // its slot + 1 (imported or exported): the keyed mutex VK_KHR_win32_keyed_mutex takes
 };
 
 struct VkBuffer_T {
@@ -287,6 +293,13 @@ struct VkPipeline_T {
     uint8_t vertex_rate[VKMSL_MAX_VERTEX_BUFFERS];   // 1: per instance
     uint32_t vertex_divisor[VKMSL_MAX_VERTEX_BUFFERS];
     VkPrimitiveTopology topology;
+    uint8_t primitive_restart;            // (input assembly's primitiveRestartEnable)
+    // Tessellation: the vertex shader as gs_vs kernels, the control shader as a kernel, the evaluation shader as the
+    // render pipeline's (post-tessellation) vertex function.
+    __strong id<MTLComputePipelineState> tcs_kernel;
+    uint8_t tess, tess_quad, push_tcs, aux_tcs, push_tes, aux_tes;
+    uint32_t sets_tcs, sets_tes;
+    uint32_t patch_cp, tess_out_vertices, tess_cp_slots, tess_patch_slots;
 };
 
 // Render passes: attachments and subpasses as given; framebuffers name the views.
@@ -394,6 +407,10 @@ id<MTLRenderPipelineState> vk_internal_render(VkDevice device, NSString *vs, NSS
                                               int write_depth);
 void vk_internal_init(VkDevice device);
 int vk_trace(void);
+// 1 the first time a kind of message is asked for with this value (what is not supported is logged once, not per call).
+int vk_log_once(const char *kind, uint32_t value);
+// vx_log, but a message already logged (the same text) is not logged again.
+void vk_log_unique(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // Exported commands (vk_dispatch.c lists them).
 PFN_vkVoidFunction vk_lookup(const char *name, int level);   // level 0 global, 1 instance, 2 device

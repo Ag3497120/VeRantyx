@@ -151,6 +151,28 @@ void *d3d_shared_buffer(d3d_device *dev, const uint32_t desc[6], void **shm, siz
     return b;
 }
 
+// For Vulkan's VK_KHR_external_memory_win32 (vk_device.m): the IOSurface and description behind a shared handle, and a
+// handle for an IOSurface made there, in the same table Direct3D's shared resources are in.
+int vx_shared_texture_find(uintptr_t h, uint32_t *surface, uint32_t desc[TD_COUNT]) {
+    shared_table *t = table();
+    if (!t || h < D3D_SHARED_HANDLE_BASE || (h - D3D_SHARED_HANDLE_BASE) % 4 || (h - D3D_SHARED_HANDLE_BASE) / 4 >= SLOTS) return -1;
+    int s = (int)((h - D3D_SHARED_HANDLE_BASE) / 4);
+    shared_slot *e = &t->s[s];
+    if (__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) != 2 || e->kind != 1) return -1;
+    *surface = e->surface;
+    memcpy(desc, e->desc, sizeof e->desc);
+    return s;
+}
+int vx_shared_texture_add(uint32_t surface, const uint32_t desc[TD_COUNT]) {
+    int s = take_slot();
+    if (s < 0) return -1;
+    shared_slot *e = &table()->s[s];
+    e->kind = 1; e->surface = surface;
+    memcpy(e->desc, desc, sizeof e->desc);
+    __atomic_store_n(&e->used, 2, __ATOMIC_RELEASE);
+    return s;
+}
+
 // OpenSharedResource(1): the resource behind a shared handle, as this device's object.
 HRESULT d3d_open_shared(d3d_device *dev, HANDLE h, const GUID *iid, void **out) {
     uintptr_t v = (uintptr_t)h;
@@ -267,15 +289,10 @@ static void keyed_stats(int why, const struct timespec *start) {
            (unsigned long long)n, (unsigned long long)waits[1], (unsigned long long)(ns[1] / 1000000), (unsigned long long)waits[2],
            (unsigned long long)(ns[2] / 1000000), (unsigned long long)waits[3], (unsigned long long)(ns[3] / 1000000));
 }
-static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
-    if (g_keyed_stats < 0) g_keyed_stats = getenv("VXRT_STATS") != NULL;
-    d3d_texture *t = keyed_of(this);
-    if (!t->shared) return S_OK;
-    // VXRT_KEYED_NO_WAIT=<exe>: that program's AcquireSync never waits (an experiment: whether a wait in it matters)
-    static int no_wait = -1;
-    if (no_wait < 0) { const char *w = getenv("VXRT_KEYED_NO_WAIT"); no_wait = w && vx_proc.argv && vx_proc.argv[0] && strcasestr(vx_proc.argv[0], w); }
-    if (no_wait) return S_OK;
-    shared_slot *e = &table()->s[t->shared - 1];
+// Takes a shared slot's keyed mutex with the key (S_OK), or WAIT_TIMEOUT after ms. why_out: what the first look found
+// missing (1 the GPU, 2 the key, 3 the owner) for the statistics. queue: who releases on the same GPU queue as the caller
+// (its work is in order: not waited for). Direct3D 11's is the process id, Vulkan's its negation (another queue).
+static HRESULT slot_acquire(shared_slot *e, uint64_t key, DWORD ms, int *why_out, int32_t queue) {
     struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
     int why = 0;                                       // what the first look found missing: 1 the GPU, 2 the key, 3 the owner
     int owned = 0;
@@ -286,20 +303,9 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
         // acquires again right after releasing left the compositor without its frames).
         if (!owned && (uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && __atomic_compare_exchange_n(&e->owner, &free_owner, (int32_t)getpid(), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             owned = 1;
-        int gpu_ready = !__atomic_load_n(&e->gpu_pending, __ATOMIC_ACQUIRE) || e->gpu_pid == (int32_t)getpid();   // the releaser's own queue keeps the order
+        int gpu_ready = !__atomic_load_n(&e->gpu_pending, __ATOMIC_ACQUIRE) || e->gpu_pid == queue;   // the releaser's own queue keeps the order
         if (owned && gpu_ready) {
-            vx_profile_held(1);
-            if (g_keyed_stats) { keyed_stats(why, &start); g_acquired[t->shared - 1] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
-            if (getenv("VXRT_TRACE_KEYED")) {
-                char from[160] = ""; size_t len = 0;           // the program's return addresses on the stack
-                uint64_t *sp = __builtin_frame_address(0);
-                for (int i = 0, found = 0; i < 400 && found < 4; i++) {
-                    const vx_image *m = vx_image_at(sp[i]);
-                    if (m) { len += (size_t)snprintf(from + len, sizeof from - len, " %s+%#llx", m->name, (unsigned long long)(sp[i] - (uint64_t)(uintptr_t)m->base)); found++; }
-                }
-                vx_log("keyed mutex slot %d: AcquireSync(%llu) by %d, from%s", t->shared - 1, (unsigned long long)key, (int)getpid(), from);
-                vx_keyed_held++; g_held_since = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            }
+            if (why_out) *why_out = why;
             return S_OK;
         }
         if (!why) why = owned || !gpu_ready ? 1 : (uint64_t)e->key != key ? 2 : 3;
@@ -312,17 +318,44 @@ static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
                 if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&e->released, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
             }
             if (getenv("VXRT_TRACE_KEYED")) vx_log("keyed mutex slot %d: AcquireSync(%llu, %u ms) timed out: released with key %lld, owner %d",
-                                                   t->shared - 1, (unsigned long long)key, (unsigned)ms, (long long)e->key, (int)e->owner);
+                                                   (int)(e - table()->s), (unsigned long long)key, (unsigned)ms, (long long)e->key, (int)e->owner);
             return (HRESULT)0x102;   // WAIT_TIMEOUT
         }
         // Sleep until a release (any process) or 2 ms, then look again.
         uint32_t seen = __atomic_load_n(&e->released, __ATOMIC_ACQUIRE);
-        int gpu_now = !__atomic_load_n(&e->gpu_pending, __ATOMIC_ACQUIRE) || e->gpu_pid == (int32_t)getpid();
+        int gpu_now = !__atomic_load_n(&e->gpu_pending, __ATOMIC_ACQUIRE) || e->gpu_pid == queue;
         if (owned ? gpu_now : (uint64_t)__atomic_load_n(&e->key, __ATOMIC_ACQUIRE) == key && !__atomic_load_n(&e->owner, __ATOMIC_ACQUIRE)) continue;
         if (__builtin_available(macOS 14.4, *))
             os_sync_wait_on_address_with_timeout((void *)&e->released, seen, 4, OS_SYNC_WAIT_ON_ADDRESS_SHARED, OS_CLOCK_MACH_ABSOLUTE_TIME, 2000000);
         else usleep(200);
     }
+}
+static WINAPI HRESULT keyed_acquire(void *this, uint64_t key, DWORD ms) {
+    if (g_keyed_stats < 0) g_keyed_stats = getenv("VXRT_STATS") != NULL;
+    d3d_texture *t = keyed_of(this);
+    if (!t->shared) return S_OK;
+    // VXRT_KEYED_NO_WAIT=<exe>: that program's AcquireSync never waits (an experiment: whether a wait in it matters)
+    static int no_wait = -1;
+    if (no_wait < 0) { const char *w = getenv("VXRT_KEYED_NO_WAIT"); no_wait = w && vx_proc.argv && vx_proc.argv[0] && strcasestr(vx_proc.argv[0], w); }
+    if (no_wait) return S_OK;
+    shared_slot *e = &table()->s[t->shared - 1];
+    struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
+    int why = 0;
+    HRESULT hr = slot_acquire(e, key, ms, &why, (int32_t)getpid());
+    if (hr != S_OK) return hr;
+    vx_profile_held(1);
+    if (g_keyed_stats) { keyed_stats(why, &start); g_acquired[t->shared - 1] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+    if (getenv("VXRT_TRACE_KEYED")) {
+        char from[160] = ""; size_t len = 0;           // the program's return addresses on the stack
+        uint64_t *sp = __builtin_frame_address(0);
+        for (int i = 0, found = 0; i < 400 && found < 4; i++) {
+            const vx_image *m = vx_image_at(sp[i]);
+            if (m) { len += (size_t)snprintf(from + len, sizeof from - len, " %s+%#llx", m->name, (unsigned long long)(sp[i] - (uint64_t)(uintptr_t)m->base)); found++; }
+        }
+        vx_log("keyed mutex slot %d: AcquireSync(%llu) by %d, from%s", t->shared - 1, (unsigned long long)key, (int)getpid(), from);
+        vx_keyed_held++; g_held_since = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    }
+    return S_OK;
 }
 // The release itself: the key and owner are published and other processes waiting in AcquireSync are woken.
 static void publish_release(shared_slot *e, uint64_t key) {
@@ -391,6 +424,29 @@ static WINAPI HRESULT keyed_release_sync(void *this, uint64_t key) {
     if (getenv("VXRT_TRACE_KEYED")) vx_log("keyed mutex slot %d: ReleaseSync(%llu) by %d (owner was %d)", t->shared - 1, (unsigned long long)key, (int)getpid(), (int)e->owner);
     publish_release(e, key);
     return S_OK;
+}
+// For Vulkan's VK_KHR_win32_keyed_mutex (vk_queue.m): a submission takes the slots' mutexes before its work and gives
+// them back after it (as ReleaseSync above: published at once, pending on the GPU until its completion).
+int vx_shared_keyed_acquire(int slot, uint64_t key, uint32_t ms) {
+    shared_table *t = table();
+    if (!t || slot < 0 || slot >= SLOTS) return 0;
+    return slot_acquire(&t->s[slot], key, ms, NULL, -(int32_t)getpid()) == S_OK;
+}
+void vx_shared_keyed_release(int slot, uint64_t key) {
+    shared_table *t = table();
+    if (!t || slot < 0 || slot >= SLOTS) return;
+    shared_slot *e = &t->s[slot];
+    __atomic_store_n(&e->gpu_pid, -(int32_t)getpid(), __ATOMIC_RELEASE);   // (Vulkan's queue: Direct3D here waits for it)
+    __atomic_add_fetch(&e->gpu_pending, 1, __ATOMIC_ACQ_REL);
+    publish_release(e, key);
+}
+void vx_shared_keyed_gpu_done(int slot) {
+    shared_table *t = table();
+    if (!t || slot < 0 || slot >= SLOTS) return;
+    shared_slot *e = &t->s[slot];
+    __atomic_sub_fetch(&e->gpu_pending, 1, __ATOMIC_ACQ_REL);
+    __atomic_add_fetch(&e->released, 1, __ATOMIC_RELEASE);
+    if (__builtin_available(macOS 14.4, *)) os_sync_wake_by_address_all((void *)&e->released, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
 }
 static WINAPI HRESULT keyed_get_device(void *this, const GUID *iid, void **out) {
     d3d_device *d = keyed_of(this)->base.dev;

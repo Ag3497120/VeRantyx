@@ -134,7 +134,8 @@ refuse_wine_tree "VXRT_ROOT" "$ROOT"
 ROOT="$(physical "$ROOT")"
 [[ ! -e "$ROOT" || -d "$ROOT" ]] || { echo "VXRT_ROOT $ROOT is not a folder." >&2; exit 1; }
 
-STEAM_ARGS=(-cef-disable-gpu -cef-disable-sandbox)
+STEAM_ARGS=(-cef-disable-sandbox)
+[[ "${VXRT_WSTEAM_GPU:-0}" == 1 ]] || STEAM_ARGS=(-cef-disable-gpu "${STEAM_ARGS[@]}")
 [[ "${VXRT_WSTEAM_SILENT:-0}" == 1 ]] && STEAM_ARGS+=(-silent)
 WEBHELPER_ARGS="${VXRT_WSTEAM_WEBHELPER_ARGS-"--single-process --disable-software-rasterizer"}"
 ENV=("VXRT_ROOT=$ROOT" "VXRT_DEBUG_OUTPUT=1" "VXRT_LOG_TIME=1")

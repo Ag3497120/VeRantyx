@@ -14,6 +14,21 @@ enum Headset: String, CaseIterable, Identifiable {
         case .visionALVR: return T("Apple Vision Pro: the ALVR app", "Apple Vision Pro：ALVR アプリ")
         }
     }
+    var route: Route { usesALVR ? .alvr : .visionApp }
+}
+
+/// The way to the headset a game takes (chosen on its card, kept per game): the ALVR app on the headset (a Vision
+/// Pro's from the App Store, or a Quest's or Pico's: the Headset page says which), or the VeRantyx app on an Apple
+/// Vision Pro. A game with none chosen follows the Headset page.
+enum Route: String, CaseIterable, Identifiable {
+    case alvr, visionApp
+    var id: String { rawValue }
+    var name: String {
+        switch self {
+        case .alvr: return T("ALVR app", "ALVR アプリ")
+        case .visionApp: return T("VeRantyx app", "VeRantyx アプリ")
+        }
+    }
 }
 
 enum Quality: String, CaseIterable, Identifiable {
@@ -77,15 +92,25 @@ enum Quality: String, CaseIterable, Identifiable {
     @ObservationIgnored private(set) var headsetSamples: [HeadsetReport] = []
     @ObservationIgnored private var lastHeadsetLine = ""
     @ObservationIgnored private let wired: Bool
-    @ObservationIgnored private let quality: Quality
+    /// The picture setting this play started with (the game's way to the headset may take another than the Play page's).
+    @ObservationIgnored let quality: Quality
     @ObservationIgnored private var stopping = false
 
     @ObservationIgnored private var process = Process()
     @ObservationIgnored private var timer: Timer?
-    @ObservationIgnored private let headset: Headset
+    /// The headset this play streams to (the game's own way to it: its card's choice).
+    @ObservationIgnored let headset: Headset
     @ObservationIgnored private let known: Title?
     @ObservationIgnored private let gameLog: URL
-    @ObservationIgnored private let launcherLog = Paths.logs.appendingPathComponent("launcher.log")
+    /// Where this play's part of the game log begins: a Windows Steam game's lines are in Steam's log, which runs on
+    /// from play to play (0: the log is the game's own).
+    @ObservationIgnored private var gameLogStart: UInt64 = 0
+    /// A game Windows Steam starts (No Man's Sky): its lines in Steam's log are "[vxrt <gameExe>:<pid>] ...".
+    var viaWindowsSteam: Bool { known?.windowsSteam == true }
+    @ObservationIgnored private let launcherLog = Paths.logs.appendingPathComponent(Play.dryRun ? "launcher-dry-run.log" : "launcher.log")
+    /// VERANTYX_DRY_RUN=1 (development, `--play ... --dry-run`): the script is not run; what would be run (the script,
+    /// its arguments and the settings given to it) is written to launcher-dry-run.log instead.
+    nonisolated static var dryRun: Bool { ProcessInfo.processInfo.environment["VERANTYX_DRY_RUN"] == "1" }
 
     init(title: String, appID: String? = nil, exe: URL?, headset: Headset, wired: Bool, quality: Quality, known: Title? = nil,
          flat: Bool = false) throws {
@@ -105,11 +130,12 @@ enum Quality: String, CaseIterable, Identifiable {
         env["VXRT_NO_WINE"] = "1"                          // (the app's setup only: never a Wine version's prefix)
         env["VXRT_VR_LOG_DIR"] = Paths.logs.path
         if known?.launcher == true { env["VXRT_MESSAGEBOX"] = "auto" }   // (the launcher's message boxes answer themselves)
+        // (always said, never inherited: launch_vxrt_nms_vr.sh takes ALVR when it is not set)
+        env["VERANTYX_ALVR"] = !flat && headset.usesALVR ? "1" : "0"
         if flat {
             env["VXRT_FLAT"] = "1"                          // (launch_vxrt_game.sh: no SteamVR, the game takes the Mac's focus)
             env["VXRT_STATS"] = "1"                         // (the game's frame rate, "present: N/s", in its log)
         } else if headset.usesALVR {
-            env["VERANTYX_ALVR"] = "1"
             if wired && headset == .quest { env["VERANTYX_ALVR_WIRED"] = "1" }
             if quality == .sharp {
                 // (the game renders more pixels, not only the stream: with ALVR's defaults SteamVR's 0.55 supersampling
@@ -124,7 +150,17 @@ enum Quality: String, CaseIterable, Identifiable {
         }
         if !flat, let proxy = known?.captureProxy { env["VXRT_CAPTURE_PROXY"] = proxy }
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        if let exe {
+        if known?.windowsSteam == true {
+            // The player's Windows Steam starts the game, as its own Play button would (steam.exe -applaunch <id>,
+            // with -HmdEnable 1 for VR; with SteamVR and the encoder in Steam's root first). VXRT_WSTEAM_NO_START:
+            // Steam must be running already, opened and signed in to by the player (the script starts none itself,
+            // so it answers none of its windows).
+            env["VXRT_WSTEAM_NO_START"] = "1"
+            env["VXRT_WSTEAM_LOG"] = Paths.logs.appendingPathComponent("vxrt-windows-steam.log").path
+            process.arguments = [scripts.appendingPathComponent("launch_vxrt_nms_vr.sh").path]
+            gameLog = Paths.logs.appendingPathComponent("vxrt-windows-steam.log")
+            gameLogStart = (try? FileManager.default.attributesOfItem(atPath: gameLog.path)[.size] as? UInt64) ?? 0
+        } else if let exe {
             process.arguments = [scripts.appendingPathComponent("launch_vxrt_game.sh").path, exe.path] + (known?.args ?? []) + (flat ? [] : known?.vrArgs ?? [])
             process.currentDirectoryURL = exe.deletingLastPathComponent()
             gameLog = Paths.logs.appendingPathComponent("vxrt-\(exe.deletingPathExtension().lastPathComponent).log")
@@ -133,6 +169,11 @@ enum Quality: String, CaseIterable, Identifiable {
             gameLog = Paths.logs.appendingPathComponent("vxrt-alyx.log")
         }
         process.environment = env
+        if Play.dryRun {
+            let keys = env.keys.filter { k in ["VERANTYX_", "VXRT_"].contains { k.hasPrefix($0) } && ProcessInfo.processInfo.environment[k] != env[k] }.sorted()
+            let said = (process.arguments ?? []).map { "arg: \($0)" } + keys.map { "env: \($0)=\(env[$0]!)" }
+            process.arguments = ["-c", "printf '%s\\n' \"$@\"", "dry-run"] + said
+        }
         FileManager.default.createFile(atPath: launcherLog.path, contents: nil)
         let out = try FileHandle(forWritingTo: launcherLog)
         process.standardOutput = out
@@ -155,6 +196,11 @@ enum Quality: String, CaseIterable, Identifiable {
         phase = .stopping
         stopping = true
         process.terminate()                               // (the scripts' trap stops SteamVR, the encoder and the game)
+        if viaWindowsSteam, let exe = known?.gameExe {
+            // (launch_vxrt_nms_vr.sh leaves the game to Steam: the game is ended here; Windows Steam keeps running)
+            let pattern = "build/vxrt.*/" + NSRegularExpression.escapedPattern(for: exe) + "( |$)"
+            Task.detached { _ = await run("/usr/bin/pkill", ["-TERM", "-f", pattern]) }
+        }
         let p = process
         DispatchQueue.global().asyncAfter(deadline: .now() + 15) {
             guard p.isRunning else { return }
@@ -173,6 +219,9 @@ enum Quality: String, CaseIterable, Identifiable {
         }
     }
 
+    /// What the dry run said it would run (empty: not a dry run).
+    var dryRunText: String { Play.dryRun ? Play.tail(launcherLog, 20000) : "" }
+
     private func ended(_ status: Int32) {
         timer?.invalidate()
         poll()
@@ -180,11 +229,13 @@ enum Quality: String, CaseIterable, Identifiable {
         endedAt = Date()
         headsetConnected = false
         headsetHint = nil
-        missingFunctions = fresh(gameLog) ? Play.missingFunctions(in: gameLog) : []
+        missingFunctions = !fresh(gameLog) ? [] : viaWindowsSteam ? Play.missingFunctions(inText: gameText(1 << 22)) : Play.missingFunctions(in: gameLog)
         guard !stopping, problem == nil else { return }
         // (the game ended by itself: what its own last lines say; a child's, such as SteamVR's vrwebhelper, which
-        //  cannot run here, are "[vxrt <name>:<pid>]" lines and say nothing about the game)
-        let own = (fresh(gameLog) ? Play.tail(gameLog, 12000) : "").split(separator: "\n").filter { $0.hasPrefix("[vxrt] ") }.suffix(40).joined(separator: "\n")
+        //  cannot run here, are "[vxrt <name>:<pid>]" lines and say nothing about the game; in Windows Steam's log the
+        //  game is such a child, and its lines are those)
+        let own = (fresh(gameLog) ? viaWindowsSteam ? gameText(12000) : Play.tail(gameLog, 12000) : "").split(separator: "\n")
+            .filter { viaWindowsSteam || $0.hasPrefix("[vxrt] ") }.suffix(40).joined(separator: "\n")
         problem = Play.hint(Play.tail(launcherLog, 6000) + "\n" + own)
             ?? T("The game stopped by itself. If it keeps doing so, please report it (Help > Report a problem) with the logs.",
                  "ゲームが自分で終了しました。繰り返す時は、ログを添えて報告してください（ヘルプ > 問題を報告）。")
@@ -201,10 +252,16 @@ enum Quality: String, CaseIterable, Identifiable {
         if let fps, running, usesLauncher ? gameStarted : phase == .playing { fpsSamples.append(fps) }
     }
 
+    /// The game's own lines of this play: in Windows Steam's log, those of the game's process since the play began.
+    private func gameText(_ bytes: Int) -> String {
+        guard viaWindowsSteam, let exe = known?.gameExe else { return Play.tail(gameLog, bytes) }
+        return Play.tail(gameLog, bytes * 4, from: gameLogStart).split(separator: "\n").filter { $0.contains("[vxrt \(exe):") }
+            .joined(separator: "\n").suffix(bytes).description
+    }
+
     private func pollStatus() {
-        if phase == .starting && listening(27062) { phase = .steamVR }
-        let game = fresh(gameLog) ? Play.tail(gameLog, 8000) : ""
-        if (phase == .steamVR || flat && phase == .starting) && !game.isEmpty { phase = .playing }
+        if phase == .starting && !flat && listening(27062) { phase = .steamVR }
+        let game = fresh(gameLog) ? gameText(8000) : ""
         gameLines = Array(game.split(separator: "\n", omittingEmptySubsequences: true).suffix(14).map(String.init))
         if let exe = known?.gameExe, game.contains("[vxrt \(exe):") {
             gameStarted = true
@@ -212,6 +269,7 @@ enum Quality: String, CaseIterable, Identifiable {
                 fps = Play.number(in: line, after: "present: ")
             }
         }
+        if (phase == .steamVR || flat && phase == .starting) && (viaWindowsSteam ? gameStarted : !game.isEmpty) { phase = .playing }
         if flat {
             if let hint = Play.hint(Play.tail(launcherLog, 6000)) { problem = hint }
             notice = launcherNotice
@@ -298,8 +356,12 @@ enum Quality: String, CaseIterable, Identifiable {
         return steps.isEmpty ? what : TF("%@ Try: %@.", "%@試すこと：%@。", what, steps.joined(separator: T("; ", "、")))
     }
 
-    /// What the player does in a launcher game's launcher (nil once the game has started).
+    /// What the player does in a launcher game's launcher, or in Windows Steam (nil once the game has started).
     private var launcherNotice: String? {
+        if viaWindowsSteam && !gameStarted {
+            return T("Windows Steam starts the game. If its window asks you something (an update, the game's agreement), answer it there yourself: VeRantyx presses nothing in Steam for you.",
+                     "Windows 版 Steam がゲームを起動します。Steam のウィンドウで何か聞かれたら（更新、ゲームの利用規約など）、そこでご自身で答えてください。VeRantyx は Steam の中のボタンを代わりに押しません。")
+        }
         guard usesLauncher && !gameStarted else { return nil }
         return T("The game's own launcher opens: use it as on Windows. Sign in, let it update if it asks, then press PLAY once.",
                  "ゲーム専用のランチャーが開きます。Windows と同じように操作してください。サインインし、更新を求められたら済ませてから、PLAY を 1 回押します。")
@@ -309,10 +371,14 @@ enum Quality: String, CaseIterable, Identifiable {
     /// first called. SteamVR's own helper programs (vrwebhelper and the like) are left out: they are not the game.
     nonisolated static func missingFunctions(in log: URL) -> [String] {
         guard let data = FileManager.default.contents(atPath: log.path) else { return [] }
+        return missingFunctions(inText: String(decoding: data, as: UTF8.self))
+    }
+
+    nonisolated static func missingFunctions(inText text: String) -> [String] {
         let marker = "called an unimplemented function: "
         let steamVR = ["vrwebhelper", "vrcompositor", "vrserver", "vrmonitor", "vrdashboard", "vrstartup", "vrcmd"]
         var found: [String] = []
-        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") where line.contains(marker) {
+        for line in text.split(separator: "\n") where line.contains(marker) {
             if steamVR.contains(where: { line.contains("[vxrt \($0)") }) { continue }
             guard let r = line.range(of: marker) else { continue }
             let name = line[r.upperBound...].prefix { !$0.isWhitespace }
@@ -328,11 +394,13 @@ enum Quality: String, CaseIterable, Identifiable {
     }
 
     /// The last bytes of a log file, as text.
-    nonisolated static func tail(_ url: URL, _ bytes: Int) -> String {
+    /// (`from`: not before that offset; a log that has since become shorter, rotated, is read from its start)
+    nonisolated static func tail(_ url: URL, _ bytes: Int, from start: UInt64 = 0) -> String {
         guard let h = try? FileHandle(forReadingFrom: url) else { return "" }
         defer { try? h.close() }
         let end = (try? h.seekToEnd()) ?? 0
-        try? h.seek(toOffset: end > UInt64(bytes) ? end - UInt64(bytes) : 0)
+        let first = start <= end ? start : 0
+        try? h.seek(toOffset: max(first, end > UInt64(bytes) ? end - UInt64(bytes) : 0))
         return String(decoding: (try? h.readToEnd()) ?? Data(), as: UTF8.self)
     }
 
@@ -343,6 +411,21 @@ enum Quality: String, CaseIterable, Identifiable {
         }
         if log.contains("Steam bridge: cannot load") {
             return T("The game could not reach Steam for Mac. Open Steam, let it finish updating, sign in, and try again.", "ゲームが Steam for Mac に接続できませんでした。Steam を開いて更新を終え、サインインしてから、もう一度。")
+        }
+        if log.contains("Windows Steam is not running") {
+            return T("Windows Steam is not running: open it (Play page), sign in in its window yourself, and try again.",
+                     "Windows 版 Steam が起動していません。開いて（プレイのページ）、そのウィンドウでご自身でサインインしてから、もう一度。")
+        }
+        if log.contains("No Windows Steam in") {
+            return T("Windows Steam is not installed on VXRuntime (see the repository: scripts/launch_vxrt_windows_steam.sh).",
+                     "VXRuntime に Windows 版 Steam が入っていません（リポジトリの scripts/launch_vxrt_windows_steam.sh を参照）。")
+        }
+        if log.contains("is not installed in that Steam") {
+            return T("The game is not installed in your Windows Steam: install it there.", "ゲームが Windows 版 Steam に入っていません。そちらでインストールしてください。")
+        }
+        if log.contains("No Man's Sky did not start") {
+            return T("The game did not start. Look at Windows Steam's window: it may be waiting for you (an update, the game's agreement).",
+                     "ゲームが起動しませんでした。Windows 版 Steam のウィンドウを見てください。あなたの操作を待っているかもしれません（更新、ゲームの利用規約など）。")
         }
         if log.contains("SteamVR not found") { return T("SteamVR is not installed yet (Get started).", "SteamVR がまだ入っていません（はじめに）。") }
         if log.contains("No Microsoft runtime DLLs") { return T("The Windows runtime files are missing (Get started).", "Windows のランタイムファイルがありません（はじめに）。") }

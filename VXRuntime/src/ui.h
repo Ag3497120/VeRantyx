@@ -119,6 +119,7 @@ int    vx_ui_idle(void);                                  // every thread with w
 HANDLE vx_ui_window(HANDLE hwnd);                         // hwnd if live; 0: the active window, else the first visible one
 int    vx_ui_find_text(HANDLE hwnd, const char *needle, HANDLE *in, POINT *at);   // the middle of drawn text with needle
 void   vx_ui_click(HANDLE hwnd, int x, int y);            // a left click at client coordinates
+void   vx_ui_click_hold(HANDLE hwnd, int x, int y, int hold_ms);   // the same, the button held down hold_ms
 void   vx_ui_key(HANDLE hwnd, int vk);                    // WM_KEYDOWN, WM_KEYUP (to the focus window inside hwnd)
 void   vx_ui_keys(HANDLE hwnd, const int *vks, int n);    // keys pressed in order, let go in reverse (Ctrl+V)
 void   vx_ui_wheel(HANDLE hwnd, int x, int y, int delta); // WM_MOUSEWHEEL with the pointer at client x, y

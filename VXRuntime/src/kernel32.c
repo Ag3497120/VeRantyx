@@ -20,6 +20,7 @@
 #include <spawn.h>
 #include <sys/stat.h>
 #include <mach-o/dyld.h>
+#include <dlfcn.h>
 #include "vx.h"
 
 #define STD_INPUT_HANDLE  ((DWORD)-10)
@@ -328,6 +329,18 @@ static BOOL verify_version(DWORD major, DWORD minor, DWORD build, DWORD platform
 static WINAPI BOOL VerifyVersionInfoW(const uint8_t *v, DWORD type, uint64_t mask) {
     const DWORD *d = (const DWORD *)v;
     return verify_version(d[1], d[2], d[3], d[4], *(const uint16_t *)(v + 276), *(const uint16_t *)(v + 278), v[282], type, mask);
+}
+// RtlVerifyVersionInfo: the same test on an RTL_OSVERSIONINFOEXW, as an NTSTATUS: STATUS_SUCCESS, or
+// STATUS_REVISION_MISMATCH when the version does not meet it, STATUS_INVALID_PARAMETER for no structure or no test.
+static WINAPI uint32_t RtlVerifyVersionInfo(const uint8_t *v, DWORD type, uint64_t mask) {
+    if (!v || !type || !mask) return 0xC000000D;
+    return VerifyVersionInfoW(v, type, mask) ? 0 : 0xC0000059;
+}
+// RtlGetVersion: GetVersionExW's answer as an NTSTATUS (callers use it to see past compatibility shims).
+static WINAPI uint32_t RtlGetVersion(OSVERSIONINFOW *v) {
+    if (!v) return 0xC000000D;                                       // STATUS_INVALID_PARAMETER
+    GetVersionExW(v);
+    return 0;
 }
 static WINAPI BOOL VerifyVersionInfoA(const uint8_t *v, DWORD type, uint64_t mask) {
     const DWORD *d = (const DWORD *)v;
@@ -818,16 +831,16 @@ static DWORD image_protect(const vx_image *m, uintptr_t a) {
 }
 static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD protect) {
     if (!size) { vx_set_last_error(87); return NULL; }
-    pthread_mutex_lock(&g_vm_lock);
+    VX_NO_STOP_LOCK(&g_vm_lock);
     reservation *r = addr ? find_reservation((uintptr_t)addr) : NULL;
     if (r && !(type & MEM_RESERVE)) {                       // committing inside an existing reservation
         uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff;
         prot_set(start, ((uintptr_t)addr + size + 0xfff) & ~(uintptr_t)0xfff, protect);
         g_va_kind[0]++; valloc_stats(0);
-        pthread_mutex_unlock(&g_vm_lock);
+        VX_NO_STOP_UNLOCK(&g_vm_lock);
         return (void *)((uintptr_t)addr & ~(uintptr_t)0xfff);
     }
-    if (addr && !(type & MEM_RESERVE)) { pthread_mutex_unlock(&g_vm_lock); vx_set_last_error(487 /* ERROR_INVALID_ADDRESS */); return NULL; }
+    if (addr && !(type & MEM_RESERVE)) { VX_NO_STOP_UNLOCK(&g_vm_lock); vx_set_last_error(487 /* ERROR_INVALID_ADDRESS */); return NULL; }
     mach_vm_address_t a = (mach_vm_address_t)addr & ~(mach_vm_address_t)(GRANULARITY - 1);
     mach_vm_size_t len = ((mach_vm_address_t)addr + size - a + 0xfff) & ~(mach_vm_size_t)0xfff;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -840,7 +853,7 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         mach_vm_protect(mach_task_self(), got, mapped_size(len), 0, VX_PROT_RWX);
         res_insert((uintptr_t)got, (size_t)len, protect);
         valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
-        pthread_mutex_unlock(&g_vm_lock);
+        VX_NO_STOP_UNLOCK(&g_vm_lock);
         return (void *)got;
     }
     if (addr) for (int i = g_nspare - 1; i >= 0; i--) {            // the range is free for the program: kept blocks there go
@@ -858,7 +871,7 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         static uint64_t failed;
         if (getenv("VXRT_TRACE_VALLOC") && failed++ < 20)
             valloc_trace(VX_RETURN_ADDRESS(), __builtin_frame_address(0), "(%p, %#zx, %#x) failed", addr, size, type);
-        pthread_mutex_unlock(&g_vm_lock);
+        VX_NO_STOP_UNLOCK(&g_vm_lock);
         vx_set_last_error(addr ? 487 : 8 /* ERROR_NOT_ENOUGH_MEMORY */);
         return NULL;
     }
@@ -870,7 +883,7 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
     if (getenv("VXRT_TRACE_VALLOC") && (dt > 2000000 || (++made & 0x3ff) == 0))
         valloc_trace(VX_RETURN_ADDRESS(), NULL, "(%p, %#zx, %#x) = %#llx in %.2f ms", addr, size, type, (unsigned long long)a, dt / 1e6);
     valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
-    pthread_mutex_unlock(&g_vm_lock);
+    VX_NO_STOP_UNLOCK(&g_vm_lock);
     return (void *)a;
 }
 // A reservation below `limit` (NtAllocateVirtualMemory's ZeroBits: LuaJIT asks for the low 2 GB). vxrt is linked
@@ -882,7 +895,7 @@ static int in_low(uintptr_t a) { return vx_low_base && a - vx_low_base < (1ull <
 static void *low_alloc(size_t size, uintptr_t limit, DWORD protect) {
     static uintptr_t cursor = 0x1000000;
     size_t n = (size + GRANULARITY - 1) / GRANULARITY;
-    pthread_mutex_lock(&g_vm_lock);
+    VX_NO_STOP_LOCK(&g_vm_lock);
     for (int pass = 0; pass < 2; pass++)
         for (uintptr_t g = (pass ? 0x1000000 : cursor) / GRANULARITY, run = 0; (g + 1) * GRANULARITY <= limit; g++) {
             int usable = !vx_low_map[g] && (g < 0x4000 || g > 0x4000);
@@ -895,10 +908,10 @@ static void *low_alloc(size_t size, uintptr_t limit, DWORD protect) {
             memset(vx_low_map + a / GRANULARITY, 1, n);
             res_insert((uintptr_t)host, n * GRANULARITY, protect);
             cursor = a + n * GRANULARITY;
-            pthread_mutex_unlock(&g_vm_lock);
+            VX_NO_STOP_UNLOCK(&g_vm_lock);
             return (void *)(uintptr_t)host;
         }
-    pthread_mutex_unlock(&g_vm_lock);
+    VX_NO_STOP_UNLOCK(&g_vm_lock);
     vx_set_last_error(8);
     return NULL;
 }
@@ -912,7 +925,7 @@ void *vx_virtual_alloc_below(size_t size, uintptr_t limit, DWORD protect) {
 #endif
     static uintptr_t cursor = 0x1000000;
     mach_vm_size_t len = (size + GRANULARITY - 1) & ~(mach_vm_size_t)(GRANULARITY - 1);
-    pthread_mutex_lock(&g_vm_lock);
+    VX_NO_STOP_LOCK(&g_vm_lock);
     for (int pass = 0; pass < 2; pass++) {
         mach_vm_address_t a = pass ? 0x1000000 : cursor;
         while (a + len <= limit) {
@@ -925,7 +938,7 @@ void *vx_virtual_alloc_below(size_t size, uintptr_t limit, DWORD protect) {
                     mach_vm_protect(mach_task_self(), got, len, 0, VX_PROT_RWX);
                     res_insert((uintptr_t)got, (size_t)len, protect);
                     cursor = (uintptr_t)(got + len);
-                    pthread_mutex_unlock(&g_vm_lock);
+                    VX_NO_STOP_UNLOCK(&g_vm_lock);
                     return (void *)got;
                 }
                 a += GRANULARITY;
@@ -934,12 +947,12 @@ void *vx_virtual_alloc_below(size_t size, uintptr_t limit, DWORD protect) {
             a = (region + region_size + GRANULARITY - 1) & ~(mach_vm_address_t)(GRANULARITY - 1);
         }
     }
-    pthread_mutex_unlock(&g_vm_lock);
+    VX_NO_STOP_UNLOCK(&g_vm_lock);
     vx_set_last_error(8);
     return NULL;
 }
 static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
-    pthread_mutex_lock(&g_vm_lock);
+    VX_NO_STOP_LOCK(&g_vm_lock);
     reservation *r = find_reservation((uintptr_t)addr);
     BOOL ok = 0;
     if (r && (type & MEM_RELEASE) && !size && r->base == (uintptr_t)addr) {
@@ -969,20 +982,43 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
         prot_set(start, start + len, 0);
         if (ok) mach_vm_protect(mach_task_self(), a, len, 0, VX_PROT_RWX);
     }
-    pthread_mutex_unlock(&g_vm_lock);
+    VX_NO_STOP_UNLOCK(&g_vm_lock);
     if (!ok) vx_set_last_error(487);
     return ok;
+}
+// Memory that is neither the program's (a reservation, a PE image) nor writable at all: macOS code, this runtime's own
+// functions (GetProcAddress of a built-in DLL gives their addresses). Hooking libraries (the Steam overlay's) make a
+// function's first bytes writable to patch them; that cannot be done here, and saying so beats the fault that the
+// write would be. Mach's maximum protection tells.
+static int never_writable(uintptr_t start, uintptr_t end) {
+    for (mach_vm_address_t a = start; a < end;) {
+        mach_vm_size_t sz = 0; vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
+        mach_vm_address_t at = a;
+        if (mach_vm_region(mach_task_self(), &at, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS || at > a) return 0;
+        if (info.max_protection & VM_PROT_WRITE) return 0;
+        a = at + sz;
+    }
+    return 1;
 }
 static WINAPI BOOL VirtualProtect(void *addr, size_t size, DWORD prot, DWORD *old) {
     uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff, end = ((uintptr_t)addr + (size ? size : 1) + 0xfff) & ~(uintptr_t)0xfff;
     const vx_image *img = vx_image_at(start);
-    pthread_mutex_lock(&g_vm_lock);
+    if (!img && (prot & 0xCC) && never_writable(start, end)) {   // PAGE_READWRITE, WRITECOPY, EXECUTE_READWRITE, EXECUTE_WRITECOPY
+        static int told;                                            // (the first few: a hooking library tries dozens)
+        Dl_info info;
+        int named = dladdr(addr, &info) && info.dli_sname;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8) vx_log("VirtualProtect(%p, %#zx, %#x): %s%s%s cannot be made writable", addr, size, (unsigned)prot,
+               named ? "native code (" : "memory", named ? info.dli_sname : "", named ? ")" : "");
+        vx_set_last_error(487);                                     // ERROR_INVALID_ADDRESS
+        return 0;
+    }
+    VX_NO_STOP_LOCK(&g_vm_lock);
     reservation *r = find_reservation(start);
     DWORD was = prot_get(start);
     if (!was) was = r ? r->protect : img ? image_protect(img, start) : PAGE_EXECUTE_READWRITE;
     if (old) *old = was;
     prot_set(start, end, prot);
-    pthread_mutex_unlock(&g_vm_lock);
+    VX_NO_STOP_UNLOCK(&g_vm_lock);
     return 1;
 }
 typedef struct { void *base, *alloc_base; DWORD alloc_protect; uint16_t partition, pad; size_t region; DWORD state, protect, type, pad2; } MEMORY_BASIC_INFORMATION;
@@ -1009,7 +1045,7 @@ static size_t virtual_query(const void *addr, MEMORY_BASIC_INFORMATION *mbi, siz
     memset(mbi, 0, sizeof *mbi);
     mbi->base = (void *)page;
     const vx_image *img = vx_image_at(page);
-    pthread_mutex_lock(&g_vm_lock);
+    VX_NO_STOP_LOCK(&g_vm_lock);
     reservation *r = find_reservation(page);
     DWORD tracked = prot_get(page);
     if (r) {
@@ -1017,7 +1053,7 @@ static size_t virtual_query(const void *addr, MEMORY_BASIC_INFORMATION *mbi, siz
         if (tracked) mbi->protect = tracked;
         mbi->region = r->base + r->size - page; mbi->state = MEM_COMMIT; mbi->type = MEM_PRIVATE;
     }
-    pthread_mutex_unlock(&g_vm_lock);
+    VX_NO_STOP_UNLOCK(&g_vm_lock);
     if (r) return sizeof *mbi;
     if (img) {
         mbi->alloc_base = img->base; mbi->alloc_protect = 0x80;   // PAGE_EXECUTE_WRITECOPY, as for every image
@@ -1042,9 +1078,9 @@ static size_t virtual_query(const void *addr, MEMORY_BASIC_INFORMATION *mbi, siz
             count = VM_REGION_BASIC_INFO_COUNT_64;
             if (mach_vm_region(mach_task_self(), &n, &nsz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS || n != end) break;
             if (info.protection != prot) break;
-            pthread_mutex_lock(&g_vm_lock);
+            VX_NO_STOP_LOCK(&g_vm_lock);
             reservation *next = find_reservation(n);
-            pthread_mutex_unlock(&g_vm_lock);
+            VX_NO_STOP_UNLOCK(&g_vm_lock);
             if (next) break;
             end = n + nsz;
         }
@@ -1332,7 +1368,10 @@ static const vx_export advapi_misc[] = {
 
 static const vx_export shell32[] = { VX_EXPORT(ShellExecuteA), VX_EXPORT(ShellExecuteW), VX_EXPORT(ShellExecuteExA), VX_EXPORT(ShellExecuteExW) };
 
+static const vx_export ntdll_version[] = { VX_EXPORT(RtlVerifyVersionInfo), VX_EXPORT(RtlGetVersion) };
+
 void vx_kernel32_init(void) {
+    vx_register_module("ntdll.dll", ntdll_version, sizeof ntdll_version / sizeof ntdll_version[0]);
     vx_register_module("advapi32.dll", advapi_misc, sizeof advapi_misc / sizeof advapi_misc[0]);
     vx_register_module("kernelbase.dll", advapi_misc, sizeof advapi_misc / sizeof advapi_misc[0]);
     vx_register_module("shell32.dll", shell32, sizeof shell32 / sizeof shell32[0]);

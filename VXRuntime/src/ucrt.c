@@ -1383,7 +1383,206 @@ static const vx_export ucrt_eos[] = {
     { "_fstat64i32", (void *)ms_fstat64i32 }, { "_stat32i64", (void *)ms_stat32i64 }, { "__stdio_common_vfwprintf", (void *)__stdio_common_vfwprintf },
 };
 
+// ---- what No Man's Sky (NMS.exe) and the libraries it carries import from the UCRT beyond the above ----------------
+// Locale objects (_create_locale): a _locale_t points at two pointers, locinfo and mbcinfo. The CRT headers' inline
+// functions read the start of locinfo directly (__crt_locale_data_public: the ctype table, MB_CUR_MAX and the code
+// page), so that much is laid out as Windows does. Every locale behaves as "C" here, as setlocale already does.
+typedef struct { const uint16_t *pctype; int mb_cur_max; unsigned codepage; } crt_locale_public;
+typedef struct { void *locinfo, *mbcinfo; crt_locale_public data; } crt_locale;
+static crt_locale *new_locale(void) {
+    crt_locale *l = calloc(1, sizeof *l);
+    if (!l) { set_errno(12); return NULL; }
+    l->data.pctype = vx_pctype_func(); l->data.mb_cur_max = 1; l->data.codepage = vx_lc_codepage_func();
+    l->locinfo = &l->data; l->mbcinfo = &l->data;
+    return l;
+}
+static WINAPI void *vx_create_locale(int category, const char *name) {
+    if (category < 0 || category > 5 || !name) return NULL;          // LC_ALL 0 .. LC_TIME 5
+    return new_locale();
+}
+static WINAPI void *vx_wcreate_locale(int category, const WCHAR *name) {
+    if (category < 0 || category > 5 || !name) return NULL;
+    return new_locale();
+}
+static WINAPI void *vx_get_current_locale(void) { return new_locale(); }
+static WINAPI void vx_free_locale(void *l) { free(l); }
+// The _l variants: the locale argument cannot change anything when every locale is "C".
+static void range_errno(void) { if (errno == ERANGE) set_errno(34); }
+static WINAPI int64_t vx_strtoi64_l(const char *s, char **end, int base, void *l) { (void)l; errno = 0; int64_t v = strtoll(s, end, base); range_errno(); return v; }
+static WINAPI uint64_t vx_strtoui64_l(const char *s, char **end, int base, void *l) { (void)l; errno = 0; uint64_t v = strtoull(s, end, base); range_errno(); return v; }
+static WINAPI double vx_strtod_l(const char *s, char **end, void *l) { (void)l; errno = 0; double v = strtod(s, end); range_errno(); return v; }
+static WINAPI int64_t vx_atoi64(const char *s) { return strtoll(s, NULL, 10); }
+// _itoa_s family: EINVAL for no buffer, no room or a radix outside 2..36, ERANGE when the digits do not fit.
+static int radix_s(uint64_t v, int neg, char *buf, size_t size, int radix) {
+    if (!buf || !size) return 22;
+    buf[0] = 0;
+    if (radix < 2 || radix > 36) return 22;
+    char tmp[72];
+    to_radix(v, neg, tmp, radix);
+    if (strlen(tmp) + 1 > size) return 34;
+    memcpy(buf, tmp, strlen(tmp) + 1);
+    return 0;
+}
+static WINAPI int vx_ultoa_s(uint32_t v, char *buf, size_t size, int radix) { return radix_s(v, 0, buf, size, radix); }
+static WINAPI int vx_ui64toa_s(uint64_t v, char *buf, size_t size, int radix) { return radix_s(v, 0, buf, size, radix); }
+static WINAPI int vx_i64toa_s(int64_t v, char *buf, size_t size, int radix) {
+    return radix == 10 && v < 0 ? radix_s((uint64_t)0 - (uint64_t)v, 1, buf, size, radix) : radix_s((uint64_t)v, 0, buf, size, radix);
+}
+// _dpcomp/_fdpcomp: _FP_LT 1, _FP_EQ 2, _FP_GT 4; 0 when either is NaN.
+static WINAPI int vx_dpcomp(double x, double y) { return x < y ? 1 : x == y ? 2 : x > y ? 4 : 0; }
+static WINAPI int vx_fdpcomp(float x, float y) { return x < y ? 1 : x == y ? 2 : x > y ? 4 : 0; }
+// The messages strerror gives for errno 0..42, and "Unknown error" at 43 (_sys_nerr).
+static char *g_sys_errlist[] = {
+    "No error", "Operation not permitted", "No such file or directory", "No such process", "Interrupted function call",
+    "Input/output error", "No such device or address", "Arg list too long", "Exec format error", "Bad file descriptor",
+    "No child processes", "Resource temporarily unavailable", "Not enough space", "Permission denied", "Bad address",
+    "Unknown error", "Resource device", "File exists", "Improper link", "No such device", "Not a directory",
+    "Is a directory", "Invalid argument", "Too many open files in system", "Too many open files",
+    "Inappropriate I/O control operation", "Unknown error", "File too large", "No space left on device", "Invalid seek",
+    "Read-only file system", "Too many links", "Broken pipe", "Domain error", "Result too large", "Unknown error",
+    "Resource deadlock avoided", "Unknown error", "Filename too long", "No locks available", "Function not implemented",
+    "Directory not empty", "Illegal byte sequence", "Unknown error",
+};
+static WINAPI char **vx_sys_errlist(void) { return g_sys_errlist; }
+static WINAPI void vx_wassert(const WCHAR *msg, const WCHAR *file, unsigned line) {
+    char *m = vx_utf8_dup(msg), *f = vx_utf8_dup(file);
+    vx_assert(m ? m : "", f ? f : "", line);
+}
+// system: there is no command interpreter (cmd.exe), so system(NULL) is 0 and a command fails with ENOENT.
+static WINAPI int vx_system(const char *command) {
+    set_errno(2);
+    if (command) vx_log("system(\"%s\"): no command interpreter", command);
+    return command ? -1 : 0;
+}
+static WINAPI char *vx_strupr(char *s) { for (char *p = s; *p; p++) *p = (char)toupper((unsigned char)*p); return s; }
+static WINAPI char *vx_strrev(char *s) {
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n / 2; i++) { char c = s[i]; s[i] = s[n - 1 - i]; s[n - 1 - i] = c; }
+    return s;
+}
+static WINAPI int vx_wcsncpy_s(WCHAR *d, size_t n, const WCHAR *s, size_t count) {
+    if (!d || !n) return 22;
+    if (!s) { d[0] = 0; return count ? 22 : 0; }
+    size_t l = 0;
+    while (l < count && s[l]) l++;
+    if (count == (size_t)-1 && l >= n) { memcpy(d, s, (n - 1) * sizeof(WCHAR)); d[n - 1] = 0; return 80; }   // _TRUNCATE: STRUNCATE
+    if (l >= n) { d[0] = 0; return 34; }
+    memcpy(d, s, l * sizeof(WCHAR)); d[l] = 0;
+    return 0;
+}
+static WINAPI int vx_wcsncat_s(WCHAR *d, size_t n, const WCHAR *s, size_t count) {
+    if (!d || !n) return 22;
+    size_t dl = 0;
+    while (dl < n && d[dl]) dl++;
+    if (dl == n) { d[0] = 0; return 22; }                            // the destination was not terminated
+    if (!s) { if (count) { d[0] = 0; return 22; } return 0; }
+    int r = vx_wcsncpy_s(d + dl, n - dl, s, count);
+    if (r == 34) d[0] = 0;
+    return r;
+}
+static WINAPI int vx_wcscat_s(WCHAR *d, size_t n, const WCHAR *s) {
+    if (!s) { if (d && n) d[0] = 0; return 22; }
+    size_t l = 0; while (s[l]) l++;
+    return vx_wcsncat_s(d, n, s, l);
+}
+// strtok keeps its position per thread; strtok_s and wcstok_s in the caller's context.
+static char *tok(char *s, const char *delim, char **ctx) {
+    if (!s) s = *ctx;
+    if (!s) return NULL;
+    s += strspn(s, delim);
+    if (!*s) { *ctx = s; return NULL; }
+    char *e = s + strcspn(s, delim);
+    if (*e) *e++ = 0;
+    *ctx = e;
+    return s;
+}
+static WINAPI char *vx_strtok(char *s, const char *delim) { static __thread char *ctx; return tok(s, delim, &ctx); }
+static WINAPI char *vx_strtok_s(char *s, const char *delim, char **ctx) {
+    if (!delim || !ctx || (!s && !*ctx)) { set_errno(22); return NULL; }
+    return tok(s, delim, ctx);
+}
+static int wide_in(WCHAR c, const WCHAR *set) { for (; *set; set++) if (*set == c) return 1; return 0; }
+static WINAPI WCHAR *vx_wcstok_s(WCHAR *s, const WCHAR *delim, WCHAR **ctx) {
+    if (!delim || !ctx || (!s && !*ctx)) { set_errno(22); return NULL; }
+    if (!s) s = *ctx;
+    while (*s && wide_in(*s, delim)) s++;
+    if (!*s) { *ctx = s; return NULL; }
+    WCHAR *e = s;
+    while (*e && !wide_in(*e, delim)) e++;
+    if (*e) *e++ = 0;
+    *ctx = e;
+    return s;
+}
+// Times: Windows' struct tm is the nine ints of C's.
+static WINAPI int64_t vx_mkgmtime64(int *t) {
+    struct tm tm = { 0 };
+    memcpy(&tm, t, 36);
+    time_t r = timegm(&tm);
+    if (r == (time_t)-1 || r < 0) return -1;
+    tm.tm_isdst = 0;
+    memcpy(t, &tm, 36);
+    return (int64_t)r;
+}
+static WINAPI double vx_difftime64(int64_t a, int64_t b) { return (double)(a - b); }
+static WINAPI char *vx_asctime(const int *t) {
+    static __thread char buf[26];
+    static const char days[] = "SunMonTueWedThuFriSat", months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    if (!t || t[6] < 0 || t[6] > 6 || t[4] < 0 || t[4] > 11) { set_errno(22); return NULL; }
+    snprintf(buf, sizeof buf, "%.3s %.3s %02d %02d:%02d:%02d %04d\n", days + 3 * t[6], months + 3 * t[4], t[3], t[2], t[1], t[0], t[5] + 1900);
+    return buf;
+}
+// Environment and files, wide and allocating.
+static WINAPI int vx_dupenv_s(char **out, size_t *len, const char *name) {
+    if (!out || !name) return 22;
+    *out = NULL; if (len) *len = 0;
+    const char *v = getenv(name);
+    if (!v) return 0;
+    size_t n = strlen(v) + 1;
+    if (!(*out = vx_heap_alloc(n))) { set_errno(12); return 12; }
+    memcpy(*out, v, n);
+    if (len) *len = n;
+    return 0;
+}
+static WINAPI int vx_wgetenv_s(size_t *len, WCHAR *buf, size_t count, const WCHAR *name) {
+    if (!len || !name || (!buf && count)) return 22;
+    char *n = vx_utf8_dup(name);
+    const char *v = getenv(n);
+    free(n);
+    *len = 0;
+    if (buf && count) buf[0] = 0;
+    if (!v) return 0;
+    WCHAR *w = vx_utf16_dup(v);
+    size_t l = 0; while (w[l]) l++;
+    *len = l + 1;
+    int r = 0;
+    if (buf) { if (l + 1 > count) r = 34; else memcpy(buf, w, (l + 1) * sizeof(WCHAR)); }
+    free(w);
+    return r;
+}
+static WINAPI int vx_waccess(const WCHAR *p, int mode) { char *a = vx_utf8_dup(p); int r = vx_access(a, mode); free(a); return r; }
+static vfn g_quick_exit[64];
+static int g_quick_exit_n;
+static WINAPI int vx_crt_at_quick_exit(vfn f) { if (g_quick_exit_n >= 64) return -1; g_quick_exit[g_quick_exit_n++] = f; return 0; }
+static WINAPI int __stdio_common_vfprintf_s(uint64_t options, vx_file *f, const char *fmt, void *locale, const char *ap) {
+    return __stdio_common_vfprintf(options, f, fmt, locale, ap);
+}
+static const vx_export ucrt_nms[] = {
+    { "_create_locale", (void *)vx_create_locale }, { "_wcreate_locale", (void *)vx_wcreate_locale },
+    { "_get_current_locale", (void *)vx_get_current_locale }, { "_free_locale", (void *)vx_free_locale },
+    { "_strtoi64_l", (void *)vx_strtoi64_l }, { "_strtoui64_l", (void *)vx_strtoui64_l }, { "_strtod_l", (void *)vx_strtod_l },
+    { "_atoi64", (void *)vx_atoi64 }, { "_ultoa_s", (void *)vx_ultoa_s }, { "_i64toa_s", (void *)vx_i64toa_s }, { "_ui64toa_s", (void *)vx_ui64toa_s },
+    { "_dpcomp", (void *)vx_dpcomp }, { "_fdpcomp", (void *)vx_fdpcomp }, { "__sys_errlist", (void *)vx_sys_errlist },
+    { "_wassert", (void *)vx_wassert }, { "system", (void *)vx_system }, { "_strupr", (void *)vx_strupr }, { "_strrev", (void *)vx_strrev },
+    { "wcsncpy_s", (void *)vx_wcsncpy_s }, { "wcsncat_s", (void *)vx_wcsncat_s }, { "wcscat_s", (void *)vx_wcscat_s },
+    { "strtok", (void *)vx_strtok }, { "strtok_s", (void *)vx_strtok_s }, { "wcstok_s", (void *)vx_wcstok_s },
+    { "_mkgmtime64", (void *)vx_mkgmtime64 }, { "_difftime64", (void *)vx_difftime64 }, { "asctime", (void *)vx_asctime },
+    { "_dupenv_s", (void *)vx_dupenv_s }, { "_wgetenv_s", (void *)vx_wgetenv_s }, { "_waccess", (void *)vx_waccess },
+    { "_crt_at_quick_exit", (void *)vx_crt_at_quick_exit }, VX_EXPORT(__stdio_common_vfprintf_s),
+};
+
 void vx_ucrt_init(void) {
+    vx_register_module("ucrtbase.dll", ucrt_nms, sizeof ucrt_nms / sizeof ucrt_nms[0]);
+    vx_register_module("msvcrt.dll", ucrt_nms, sizeof ucrt_nms / sizeof ucrt_nms[0]);
     vx_register_module("ucrtbase.dll", ucrt_eos, sizeof ucrt_eos / sizeof ucrt_eos[0]);
     vx_register_module("msvcrt.dll", ucrt_eos, sizeof ucrt_eos / sizeof ucrt_eos[0]);
     vx_register_module("ucrtbase.dll", ucrt, sizeof ucrt / sizeof ucrt[0]);

@@ -2052,12 +2052,16 @@ int vx_ui_snapshot(HANDLE hwnd, const char *png) {
     CGImageRelease(img);
     return ok;
 }
-void vx_ui_click(HANDLE hwnd, int x, int y) {
+void vx_ui_click(HANDLE hwnd, int x, int y) { vx_ui_click_hold(hwnd, x, y, 50); }
+// hold_ms: how long the button stays down (games that act on a held button: "hold to select").
+void vx_ui_click_hold(HANDLE hwnd, int x, int y, int hold_ms) {
     vx_window *w = vx_window_get(hwnd);
     if (!w) return;
+    if (hold_ms < 0) hold_ms = 0;
+    if (hold_ms > 10000) hold_ms = 10000;
     POINT o; client_origin(w, &o);
     g_clip_cursor.pt = (POINT){ o.x + x, o.y + y };
-    g_clip_cursor.until = tick_ms() + CLIP_CURSOR_MS;
+    g_clip_cursor.until = tick_ms() + CLIP_CURSOR_MS + (DWORD)hold_ms;
     __atomic_store_n(&g_clip_cursor.on, 1, __ATOMIC_RELEASE);
     // As a click does on Windows, it makes the window's top-level window the active one (the Mac's frontmost app
     // stays as it is). Programs that take mouse input only while one of their windows is in front (vgui asks
@@ -2076,7 +2080,7 @@ void vx_ui_click(HANDLE hwnd, int x, int y) {
     vx_mouse_input(top, WM_MOUSEMOVE, 0, at.x, at.y);
     usleep(150000);
     vx_mouse_input(top, WM_LBUTTONDOWN, 1 /* MK_LBUTTON */, at.x, at.y);
-    usleep(50000);
+    usleep((useconds_t)hold_ms * 1000);
     vx_mouse_input(top, WM_LBUTTONUP, 0, at.x, at.y);
 }
 // Keys pressed in order and let go in reverse (vks[0] first: Ctrl, then V), to the focus window when it is hwnd or

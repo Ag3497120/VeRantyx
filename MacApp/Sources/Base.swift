@@ -107,6 +107,10 @@ enum Paths {
         set { UserDefaults.standard.set(newValue.path, forKey: "drive") }
     }
     static var steamLibrary: URL { drive.appendingPathComponent("vxrt_steam") }
+    /// The player's own Windows Steam on VXRuntime, in a root of its own (scripts/launch_vxrt_windows_steam.sh's
+    /// VXRT_WSTEAM_ROOT): games wrapped in Steam's DRM (SteamStub), such as No Man's Sky, start from it.
+    static var windowsSteamRoot: URL { drive.appendingPathComponent("vxrt_wsteam") }
+    static var windowsSteam: URL { windowsSteamRoot.appendingPathComponent("drive_c/Program Files (x86)/Steam") }
     static var redist: URL {                         // (VXRT_REDIST: elsewhere, as for tools/vxrt_redist.py)
         ProcessInfo.processInfo.environment["VXRT_REDIST"].map { URL(fileURLWithPath: $0) } ?? drive.appendingPathComponent("vxrt_redist")
     }
@@ -225,6 +229,23 @@ enum Steam {
     static func open() {
         if let url = appURL { NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) }
         else { NSWorkspace.shared.open(URL(string: "https://store.steampowered.com/about/")!) }
+    }
+}
+
+/// The Windows Steam client on VXRuntime (Paths.windowsSteam). The player installs it and signs in to it in its own
+/// window; the app only starts it (scripts/launch_vxrt_windows_steam.sh) and never presses anything in it: no sign-in,
+/// no agreement, no dialog answered for the player.
+enum WindowsSteam {
+    static var installed: Bool { FileManager.default.fileExists(atPath: Paths.windowsSteam.appendingPathComponent("steam.exe").path) }
+    /// steam.exe on VXRuntime (the script's own pattern for it).
+    static let pattern = "build/vxrt(-arm64)? (.*/)?[Ss][Tt][Ee][Aa][Mm]\\.[Ee][Xx][Ee]( |$)"
+    static func running() async -> Bool { !(await pgrep(pattern)).isEmpty }
+    /// A line of `pgrep -fl` that is Windows Steam itself (steam.exe, or a program from its bin folder: the web
+    /// helper), not a game it started.
+    static func isOwn(_ line: String) -> Bool {
+        let low = line.lowercased()
+        return low.range(of: "build/vxrt(-arm64)? (\\S*/)?steam\\.exe( |$)", options: .regularExpression) != nil
+            || low.contains("/program files (x86)/steam/bin/")
     }
 }
 

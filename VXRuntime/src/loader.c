@@ -22,6 +22,8 @@
 #include "dotnet_host.h"
 #include <sys/resource.h>
 #include <limits.h>
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
 
 vx_process vx_proc;
 int vx_trace;
@@ -73,6 +75,8 @@ static const char *canonical_dll(const char *dll) {
         }
     }
     if (!strncasecmp(dll, "api-ms-win-crt-", 15)) return "ucrtbase.dll";
+    if (!strncasecmp(dll, "api-ms-win-core-version-", 24)) return "version.dll";
+    if (!strncasecmp(dll, "api-ms-win-devices-config-", 26)) return "cfgmgr32.dll";
     if (!strncasecmp(dll, "api-ms-win-core-", 16)) return "kernel32.dll";
     if (!strncasecmp(dll, "api-ms-win-security-", 20) || !strncasecmp(dll, "api-ms-win-eventing-", 20)) return "advapi32.dll";
     if (!strncasecmp(dll, "api-ms-win-ntuser-", 18) || !strncasecmp(dll, "ext-ms-win-ntuser-", 18)) return "user32.dll";
@@ -108,22 +112,101 @@ void *vx_find_export(const char *dll, const char *name) {
     return NULL;
 }
 
-// A module handle for a built-in DLL is a pointer to a stored copy of its name.
-static char g_builtin_names[256][64];
+// A built-in DLL's module handle is a small PE image made for it (Microsoft's PE format): headers and an export
+// directory naming its functions, each exported as a jump to the function. Programs and libraries that read a
+// module's exports themselves rather than through GetProcAddress (NVIDIA Streamline's sl.interposer.dll walks
+// dxgi.dll's to find CreateDXGIFactory1) find them there. GetProcAddress still gives the functions themselves.
+// Data exports (variables) are left out: an export is an RVA into the image, and only code gets a jump.
+// (ARM64 build: the image has headers and an empty export directory; the program's code runs translated there.)
+typedef struct { char name[64]; uint8_t *image; } builtin_module;
+static builtin_module g_builtins[256];
 static int g_builtin_count;
+typedef struct { const char *name; void *fn; size_t order; } builtin_export;
+static int export_order(const void *a, const void *b) {
+    const builtin_export *x = a, *y = b;
+    int c = strcmp(x->name, y->name);
+    return c ? c : (x->order > y->order) - (x->order < y->order);
+}
+static void put16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
+static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+static void put64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
+static uint8_t *make_builtin_image(const char *given) {
+    const char *dll = canonical_dll(given);
+    size_t n = 0, cap = 0;
+    builtin_export *e = NULL;
+#ifndef __aarch64__
+    unsigned long text_size = 0;
+    uint8_t *text = getsegmentdata(&_mh_execute_header, "__TEXT", &text_size);
+    for (size_t m = 0; m < g_module_count; m++) {
+        if (!same_dll(g_modules[m].dll, dll)) continue;
+        for (size_t i = 0; i < g_modules[m].count; i++) {
+            const vx_export *x = &g_modules[m].exports[i];
+            if (!x->name || x->name[0] == '#' || (uint8_t *)x->fn < text || (uint8_t *)x->fn >= text + text_size) continue;
+            if (n == cap) { cap = cap ? cap * 2 : 256; builtin_export *g = realloc(e, cap * sizeof *e); if (!g) break; e = g; }
+            e[n] = (builtin_export){ x->name, x->fn, n }; n++;
+        }
+    }
+    if (n) qsort(e, n, sizeof *e, export_order);
+    size_t k = 0;                                                   // one per name: the first registered, as vx_find_export
+    for (size_t i = 0; i < n; i++) if (!k || strcmp(e[k - 1].name, e[i].name)) e[k++] = e[i];
+    n = k;
+#endif
+    size_t names = strlen(given) + 1;
+    for (size_t i = 0; i < n; i++) names += strlen(e[i].name) + 1;
+    const uint32_t dir = 0x1000, funcs = dir + 40, name_rvas = funcs + 4 * (uint32_t)n, ords = name_rvas + 4 * (uint32_t)n;
+    const uint32_t strings = ords + 2 * (uint32_t)n, dir_end = strings + (uint32_t)names;
+    const uint32_t stubs = (dir_end + 15) & ~15u, size = (stubs + 16 * (uint32_t)n + 0xfff) & ~0xfffu;
+    uint8_t *img = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (img == MAP_FAILED) { free(e); return NULL; }
+    img[0] = 'M'; img[1] = 'Z'; put32(img + 0x3c, 0x40);
+    uint8_t *pe = img + 0x40, *opt = pe + 24, *sec = opt + 0xF0;
+    memcpy(pe, "PE\0\0", 4);
+    put16(pe + 4, 0x8664); put16(pe + 6, 1); put16(pe + 20, 0xF0); put16(pe + 22, 0x2022);   // AMD64, 1 section, DLL
+    put16(opt, 0x20b); put32(opt + 20, 0x1000); put64(opt + 24, (uint64_t)(uintptr_t)img);
+    put32(opt + 32, 0x1000); put32(opt + 36, 0x200); put16(opt + 40, 10); put16(opt + 48, 10);
+    put32(opt + 56, size); put32(opt + 60, 0x1000); put16(opt + 68, 3 /* console */); put16(opt + 70, 0x160);
+    put32(opt + 108, 16); put32(opt + 112, dir); put32(opt + 116, dir_end - dir);   // DataDirectory[0]: exports
+    memcpy(sec, ".text", 5); put32(sec + 8, size - 0x1000); put32(sec + 12, 0x1000); put32(sec + 36, 0x60000020);
+    uint8_t *d = img + dir;
+    char *str = (char *)img + strings;
+    memcpy(str, given, strlen(given) + 1);
+    put32(d + 12, strings); put32(d + 16, 1); put32(d + 20, (uint32_t)n); put32(d + 24, (uint32_t)n);
+    put32(d + 28, funcs); put32(d + 32, name_rvas); put32(d + 36, ords);
+    str += strlen(given) + 1;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t *stub = img + stubs + 16 * i;                       // jmp qword [rip+0], then the address
+        stub[0] = 0xff; stub[1] = 0x25; put32(stub + 2, 0); put64(stub + 6, (uint64_t)(uintptr_t)e[i].fn); stub[14] = stub[15] = 0xcc;
+        put32(img + funcs + 4 * i, stubs + 16 * (uint32_t)i);
+        put32(img + name_rvas + 4 * i, (uint32_t)((uint8_t *)str - img));
+        put16(img + ords + 2 * i, (uint16_t)i);
+        size_t l = strlen(e[i].name) + 1;
+        memcpy(str, e[i].name, l); str += l;
+    }
+    free(e);
+    mprotect(img, size, PROT_READ | PROT_EXEC);
+    return img;
+}
 static void *builtin_handle(const char *name) {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&lock);
     void *h = NULL;
-    for (int i = 0; i < g_builtin_count && !h; i++) if (same_dll(g_builtin_names[i], name)) h = g_builtin_names[i];
-    if (!h && g_builtin_count < 256) { snprintf(g_builtin_names[g_builtin_count], 64, "%s", name); h = g_builtin_names[g_builtin_count++]; }
+    int n = __atomic_load_n(&g_builtin_count, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n && !h; i++) if (same_dll(g_builtins[i].name, name)) h = g_builtins[i].image;
+    if (!h && n < 256) {
+        snprintf(g_builtins[n].name, sizeof g_builtins[n].name, "%s", name);
+        g_builtins[n].image = make_builtin_image(g_builtins[n].name);
+        if ((h = g_builtins[n].image)) __atomic_store_n(&g_builtin_count, n + 1, __ATOMIC_RELEASE);
+    }
     pthread_mutex_unlock(&lock);
     return h;
 }
-static int is_builtin_handle(const void *h) {
-    return (const char *)h >= g_builtin_names[0] && (const char *)h < g_builtin_names[g_builtin_count] &&
-           ((const char *)h - g_builtin_names[0]) % 64 == 0;
+// The DLL name of a built-in module's handle, NULL for anything else.
+static const char *builtin_name(const void *h) {
+    int n = __atomic_load_n(&g_builtin_count, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) if (h && g_builtins[i].image == h) return g_builtins[i].name;
+    return NULL;
 }
+static int is_builtin_handle(const void *h) { return builtin_name(h) != NULL; }
 
 #ifdef __aarch64__
 #define VX_PROT_CODE (PROT_READ | PROT_WRITE)      // (x86 code: read by the translator, never run as it is)
@@ -1074,9 +1157,9 @@ static WINAPI void *GetProcAddress(void *module, const char *name) {
     int builtin = !m && is_builtin_handle(module);
     char by_number[16];
     snprintf(by_number, sizeof by_number, "#%d", ordinal);
-    void *fn = m ? pe_export(m, ordinal ? NULL : name, ordinal, 0) : builtin ? vx_find_export((const char *)module, ordinal ? by_number : name) : NULL;
+    void *fn = m ? pe_export(m, ordinal ? NULL : name, ordinal, 0) : builtin ? vx_find_export(builtin_name(module), ordinal ? by_number : name) : NULL;
     pthread_mutex_unlock(&g_loader_lock);
-    if (fn && builtin) fn = vx_trace_wrap((const char *)module, ordinal ? by_number : name, fn);
+    if (fn && builtin) fn = vx_trace_wrap(builtin_name(module), ordinal ? by_number : name, fn);
     // only the first module asked is wrapped: with the capture proxy that is the proxy, which itself then asks the
     // real openvr_api for the same export; wrapping that too would send the game's calls past the proxy
     if (fn && m && !ordinal && !strcmp(name, "VR_GetGenericInterface") && getenv("VXRT_TRACE_OPENVR")
@@ -1087,7 +1170,7 @@ static WINAPI void *GetProcAddress(void *module, const char *name) {
     if (!fn) vx_set_last_error(m || builtin ? 127 /* ERROR_PROC_NOT_FOUND */ : 6 /* ERROR_INVALID_HANDLE */);
     // a miss on one of the runtime's own modules is logged always: a program that calls the result unchecked
     // crashes at address 0, and the name here is what it wanted
-    if (!fn && (vx_trace || builtin)) vx_log("GetProcAddress(%s, %s) failed", m ? m->name : builtin ? (const char *)module : "?", ordinal ? by_number : name);
+    if (!fn && (vx_trace || builtin)) vx_log("GetProcAddress(%s, %s) failed", m ? m->name : builtin ? builtin_name(module) : "?", ordinal ? by_number : name);
     return fn;
 }
 
@@ -1095,7 +1178,7 @@ static const char *module_path(void *module, char *tmp, size_t cap) {
     vx_image *m = image_by_base(module ? module : vx_proc.image_base);
     if (m) return m->windows_path;
     if (!is_builtin_handle(module)) { vx_set_last_error(126); snprintf(tmp, cap, "%s", ""); return tmp; }
-    snprintf(tmp, cap, "C:\\windows\\system32\\%s", (const char *)module);
+    snprintf(tmp, cap, "C:\\windows\\system32\\%s", builtin_name(module));
     return tmp;
 }
 // GetModuleFileName truncates (and still terminates) when the buffer is too small.
@@ -1220,6 +1303,7 @@ int main(int argc, char **argv, char **envp) {
     vx_tcptable_init();                          // (before client.c: replaces its GetExtendedTcpTable stand-in)
     vx_winprops_init();                          // (shell32's window property stores, propsys, the virtual desktop manager)
     vx_a11y_init();                              // (oleacc, UIAutomationCore, uxtheme)
+    vx_mfplat_init();                            // (Media Foundation, DXVA2: not started)
     vx_imagehlp_init();
     vx_spellcheck_init();
     vx_present_init();                           // (before desktop.c, client.c, user32.c, gdi.c, dwmapi.c: replaces stand-ins there)

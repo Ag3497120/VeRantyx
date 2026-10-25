@@ -134,6 +134,32 @@ static void tp_finish(tp_item *it) {
     if (it->free_context) free(it->context);
     free(it);
 }
+// The callback instance (PTP_CALLBACK_INSTANCE) a callback is given: what its *WhenCallbackReturns calls asked to be
+// done once it returns, and whether DisassociateCurrentThreadFromCallback has already let its item go.
+typedef struct tp_instance {
+    tp_item *item;
+    HANDLE event, semaphore, mutex; LONG release_count;
+    void *critical_section, *module;
+    int disassociated, may_run_long;
+} tp_instance;
+static int g_tp_extra_workers;
+static void *tp_worker(void *arg);
+static void tp_spawn_worker(void) {
+    pthread_t t; pthread_attr_t a;
+    pthread_attr_init(&a); pthread_attr_setstacksize(&a, 4 << 20); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_create(&t, &a, tp_worker, NULL);
+    pthread_attr_destroy(&a);
+}
+static void *k32_fn(const char *name) { return vx_find_export("kernel32.dll", name); }
+// The actions a callback asked for, after it has returned (Microsoft's order: the critical section, the mutex, the
+// semaphore, the event, then the module).
+static void tp_instance_complete(tp_instance *in) {
+    if (in->critical_section) ((void (WINAPI *)(void *))k32_fn("LeaveCriticalSection"))(in->critical_section);
+    if (in->mutex) ((BOOL (WINAPI *)(HANDLE))k32_fn("ReleaseMutex"))(in->mutex);
+    if (in->semaphore) ((BOOL (WINAPI *)(HANDLE, LONG, LONG *))k32_fn("ReleaseSemaphore"))(in->semaphore, in->release_count, NULL);
+    if (in->event) ((BOOL (WINAPI *)(HANDLE))k32_fn("SetEvent"))(in->event);
+    if (in->module) ((BOOL (WINAPI *)(void *))k32_fn("FreeLibrary"))(in->module);
+}
 static void *tp_worker(void *arg) {
     (void)arg;
     vx_thread_attach();
@@ -146,11 +172,14 @@ static void *tp_worker(void *arg) {
         tp_item *it = j->item;
         it->pending--; it->running++;
         pthread_mutex_unlock(&g_tp_lock);
+        tp_instance in = { .item = it };
         // PTP_WORK_CALLBACK / PTP_TIMER_CALLBACK (instance, context, object); PTP_WAIT_CALLBACK adds the result.
-        if (it->kind == 3) ((void (WINAPI *)(void *, void *, void *, DWORD))it->callback)(NULL, it->context, it, j->wait_result);
-        else ((void (WINAPI *)(void *, void *, void *))it->callback)(NULL, it->context, it);
+        if (it->kind == 3) ((void (WINAPI *)(void *, void *, void *, DWORD))it->callback)(&in, it->context, it, j->wait_result);
+        else ((void (WINAPI *)(void *, void *, void *))it->callback)(&in, it->context, it);
         free(j);
+        tp_instance_complete(&in);
         pthread_mutex_lock(&g_tp_lock);
+        if (in.disassociated) continue;          // (the item is no longer this callback's: it may be gone)
         it->running--;
         int finished = it->closed && !it->pending && !it->running;
         pthread_cond_broadcast(&g_tp_done);
@@ -285,11 +314,37 @@ static WINAPI void SetThreadpoolWait(tp_item *w, HANDLE h, const int64_t *timeou
 }
 static WINAPI void WaitForThreadpoolWaitCallbacks(tp_item *w, BOOL cancel) { if (cancel) SetThreadpoolWait(w, NULL, NULL); tp_wait_callbacks(w, cancel); }
 static WINAPI void CloseThreadpoolWait(tp_item *w) { tp_close(w); }
-static WINAPI void FreeLibraryWhenCallbackReturns(void *instance, void *module) { (void)instance; (void)module; }
-static WINAPI void SetEventWhenCallbackReturns(void *instance, HANDLE e) {
-    (void)instance;
-    BOOL (WINAPI *set)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "SetEvent");
-    if (set) set(e);
+// The callback-instance functions (PTP_CALLBACK_INSTANCE): each asks for one action once the callback returns.
+static WINAPI void FreeLibraryWhenCallbackReturns(tp_instance *in, void *module) { if (in) in->module = module; }
+static WINAPI void SetEventWhenCallbackReturns(tp_instance *in, HANDLE e) { if (in) in->event = e; }
+static WINAPI void ReleaseSemaphoreWhenCallbackReturns(tp_instance *in, HANDLE s, DWORD n) { if (in) { in->semaphore = s; in->release_count = (LONG)n; } }
+static WINAPI void ReleaseMutexWhenCallbackReturns(tp_instance *in, HANDLE m) { if (in) in->mutex = m; }
+static WINAPI void LeaveCriticalSectionWhenCallbackReturns(tp_instance *in, void *cs) { if (in) in->critical_section = cs; }
+// CallbackMayRunLong: the pool is told this callback may take a while. Another worker is started so that queued work
+// is not held up behind it; TRUE says one is available. (Once per callback.)
+static WINAPI BOOL CallbackMayRunLong(tp_instance *in) {
+    if (!in) return 0;
+    if (in->may_run_long) return 1;
+    in->may_run_long = 1;
+    pthread_mutex_lock(&g_tp_lock);
+    int spawn = g_tp_extra_workers < 256;
+    if (spawn) g_tp_extra_workers++;
+    pthread_mutex_unlock(&g_tp_lock);
+    if (spawn) tp_spawn_worker();
+    return 1;
+}
+// DisassociateCurrentThreadFromCallback: the callback no longer counts as running for its item, so WaitFor*Callbacks
+// and the close of the item stop waiting for it.
+static WINAPI void DisassociateCurrentThreadFromCallback(tp_instance *in) {
+    if (!in || in->disassociated) return;
+    tp_item *it = in->item;
+    pthread_mutex_lock(&g_tp_lock);
+    in->disassociated = 1;
+    it->running--;
+    int finished = it->closed && !it->pending && !it->running;
+    pthread_cond_broadcast(&g_tp_done);
+    pthread_mutex_unlock(&g_tp_lock);
+    if (finished) tp_finish(it);
 }
 static WINAPI void *CreateThreadpool(void *reserved) { (void)reserved; static int pool; return &pool; }   // the one pool
 static WINAPI void CloseThreadpool(void *pool) { (void)pool; }
@@ -706,7 +761,9 @@ static const vx_export k32[] = {
     VX_EXPORT(SetThreadpoolTimer), VX_EXPORT(IsThreadpoolTimerSet), VX_EXPORT(WaitForThreadpoolTimerCallbacks),
     VX_EXPORT(CloseThreadpoolTimer), VX_EXPORT(CreateThreadpoolWait), VX_EXPORT(SetThreadpoolWait),
     VX_EXPORT(WaitForThreadpoolWaitCallbacks), VX_EXPORT(CloseThreadpoolWait), VX_EXPORT(FreeLibraryWhenCallbackReturns),
-    VX_EXPORT(SetEventWhenCallbackReturns), VX_EXPORT(CreateThreadpool), VX_EXPORT(CloseThreadpool),
+    VX_EXPORT(SetEventWhenCallbackReturns), VX_EXPORT(ReleaseSemaphoreWhenCallbackReturns), VX_EXPORT(ReleaseMutexWhenCallbackReturns),
+    VX_EXPORT(LeaveCriticalSectionWhenCallbackReturns), VX_EXPORT(CallbackMayRunLong), VX_EXPORT(DisassociateCurrentThreadFromCallback),
+    VX_EXPORT(CreateThreadpool), VX_EXPORT(CloseThreadpool),
     VX_EXPORT(SetThreadpoolThreadMaximum), VX_EXPORT(SetThreadpoolThreadMinimum),
     VX_EXPORT(CreateTimerQueue), VX_EXPORT(DeleteTimerQueue), VX_EXPORT(DeleteTimerQueueEx), VX_EXPORT(CreateTimerQueueTimer),
     VX_EXPORT(ChangeTimerQueueTimer), VX_EXPORT(DeleteTimerQueueTimer), VX_EXPORT(RegisterWaitForSingleObject),

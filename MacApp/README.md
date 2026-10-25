@@ -15,6 +15,27 @@ core, the launch scripts), so the player's Mac needs only macOS and Steam: no Ho
   shows beside the Mac's, and the latency, from the headset's own statistics (ALVRBridge's `VeRantyx: headset:` line
   in session_log.txt), with advice when the network holds the stream up (fewer than three quarters of the Mac's
   frames shown, over 40 ms on the network, or video lost); the "it ran" report carries them too.
+- **Each game's way to the headset**: a switch on every game card, next to its Play/Headset button: the ALVR app
+  (Apple Vision Pro's from the App Store, or a Quest's or Pico's, as the Headset page says) or the VeRantyx app on an
+  Apple Vision Pro. Kept per game (the setting `headsetRoutes`); a game with none chosen follows the Headset page. The
+  ALVR app starts the game's script with `VERANTYX_ALVR=1`, the VeRantyx app with `VERANTYX_ALVR=0` and the quality
+  preset (`VXRT_VR_QUALITY`); the card shows the headset and picture setting the game will use.
+- **No Man's Sky** (and other games wrapped in Steam's DRM): started by the player's own Windows Steam on VXRuntime
+  (`~/Verantyx_VR_Drive/vxrt_wsteam`), through `scripts/launch_vxrt_nms_vr.sh` (`VXRT_FLAT=1` on the Mac's screen) with
+  `VXRT_WSTEAM_NO_START=1`. The Play page's Windows Steam card opens that Steam (`scripts/launch_vxrt_windows_steam.sh`);
+  the player signs in in its window and answers its windows (an update, the game's agreement, "Steam Service Error")
+  themselves: the app never signs in, accepts anything or presses a button in Steam for them. Stop ends the game and
+  SteamVR; Windows Steam stays open.
+- **Get and play**: the Play page lists the known games not installed yet, each with "Get and play" (on this Mac,
+  in the headset). The flow: what is missing (the game; SteamVR for the headset), its size and the disk's free
+  space, a yes from the player; then the download the game's own way (`Title.source`): Valve's steamcmd with the
+  player's account (they type the password and Steam Guard code into steamcmd's console themselves), or, for a game
+  Windows Steam starts, Windows Steam itself (`scripts/vxrt_windows_steam_ask.sh -- steam://install/<id>`: Steam shows
+  its own install window, answered by the player, and installs only what the account owns; progress from its app
+  manifest); then the runtime files if none are gathered yet, and the start. Windows Steam has to be running, opened
+  and signed in to by the player (the flow waits, with Continue); installing Windows Steam itself is not done by the
+  app. `VeRantyx --get <id> [--flat] --dry-run` runs the flow answered yes with the downloads and the start only
+  printed.
 - **Headset**: Meta Quest or Pico through ALVR (Wi-Fi or a USB cable), Apple Vision Pro with the VeRantyx app, or with
   the ALVR app; the steps for each.
 - **Help**: the logs folder, a report form on GitHub filled in with the Mac's facts, Stop everything.

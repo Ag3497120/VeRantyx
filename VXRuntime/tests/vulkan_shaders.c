@@ -7,7 +7,11 @@
 //   sampling: BC1, sRGB, B10G11R11, a mip chain made with blits, a depth comparison (D24S8 where the device has it),
 //             a repeating sampler
 //   drawing:  two color targets (sRGB, B10G11R11) at 4x MSAA resolved by dynamic rendering, an input attachment read
-//             in a second subpass, a geometry shader writing gl_Layer of a two-layer target
+//             in a second subpass, a geometry shader writing gl_Layer of a two-layer target, a two-component output
+//             to an RGBA8 target with gl_FragDepth written and no depth attachment; triangle fans (Metal has none)
+//             drawn, indexed (16- and 32-bit, with primitive restart) and indirectly; the viewport's orientation (NDC
+//             y = -1 at the top row) with a positive and a negative (maintenance1) height; image copies between
+//             RG32_UINT and BC1; tessellation (triangle and quad patches, levels 1 and more, both windings culled)
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +28,15 @@
 #include "vulkan_shaders/solid.frag.h"
 #include "vulkan_shaders/subpass.frag.h"
 #include "vulkan_shaders/layer.geom.h"
+#include "vulkan_shaders/narrow.frag.h"
+#include "vulkan_shaders/position.vert.h"
+#include "vulkan_shaders/tess.vert.h"
+#include "vulkan_shaders/tess_tri.tesc.h"
+#include "vulkan_shaders/tess_quad.tesc.h"
+#include "vulkan_shaders/tess_tri_ccw.tese.h"
+#include "vulkan_shaders/tess_tri_cw.tese.h"
+#include "vulkan_shaders/tess_quad_ccw.tese.h"
+#include "vulkan_shaders/tess_quad_cw.tese.h"
 
 static int bad;
 static const char *test = "";
@@ -187,6 +200,10 @@ static VkPipeline compute(VkShaderModule m, VkPipelineLayout layout, const VkSpe
     return p;
 }
 // A pipeline drawing the vertex shader's triangle, for dynamic rendering (colors) or a render pass's subpass.
+// (the input assembly and vertex input of the next pipeline made by graphics(); a triangle list without inputs by default)
+static VkPrimitiveTopology g_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+static VkBool32 g_restart;
+static const VkPipelineVertexInputStateCreateInfo *g_vertex_input;
 static VkPipeline graphics(VkShaderModule vs, VkShaderModule gs, VkShaderModule fs, VkPipelineLayout layout, const VkFormat *colors,
                            uint32_t ncolors, VkSampleCountFlagBits samples, VkRenderPass rp, uint32_t subpass) {
     VkPipelineShaderStageCreateInfo stages[3] = {
@@ -195,7 +212,7 @@ static VkPipeline graphics(VkShaderModule vs, VkShaderModule gs, VkShaderModule 
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_GEOMETRY_BIT, .module = gs, .pName = "main" } };
     VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+                                                  .topology = g_topology, .primitiveRestartEnable = g_restart };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
                                                   .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1 };
@@ -208,7 +225,7 @@ static VkPipeline graphics(VkShaderModule vs, VkShaderModule gs, VkShaderModule 
     VkPipelineRenderingCreateInfo ri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = ncolors,
                                          .pColorAttachmentFormats = colors };
     VkGraphicsPipelineCreateInfo info = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = rp ? NULL : &ri,
-        .stageCount = gs ? 3 : 2, .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp,
+        .stageCount = gs ? 3 : 2, .pStages = stages, .pVertexInputState = g_vertex_input ? g_vertex_input : &vi, .pInputAssemblyState = &ia, .pViewportState = &vp,
         .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = layout,
         .renderPass = rp, .subpass = subpass };
     VkPipeline p = 0;
@@ -624,6 +641,309 @@ static void geometry_layer(void) {
     printf("vulkan_shaders: geometry shader to gl_Layer 1: layer 0 %d %d %d, layer 1 %d %d %d\n", l0[0], l0[1], l0[2], l1[0], l1[1], l1[2]);
 }
 
+// ---- drawing: fewer output components than the target has, FragDepth with no depth attachment ----------------------
+static void narrow_output(void) {
+    test = "narrow output";
+    enum { S = 4 };
+    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    img target = make_image(format, S, S, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    VkImageView view = make_view(target.image, VK_IMAGE_VIEW_TYPE_2D, format, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    VkPipelineLayout pl = pipeline_layout(NULL, 0, 0);
+    VkPipeline p = graphics(MODULE(spv_fullscreen_vert), 0, MODULE(spv_narrow_frag), pl, &format, 1, VK_SAMPLE_COUNT_1_BIT, 0, 0);
+    if (!p) return;
+    buf readback = make_buffer(S * S * 4, 0);
+    VkCommandBuffer cb = begin();
+    to_general(cb, target.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkRenderingAttachmentInfo a = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .color = { .float32 = { 0, 0, 0, 0 } } } };
+    VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { S, S } }, .layerCount = 1,
+                           .colorAttachmentCount = 1, .pColorAttachments = &a };
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    viewport(cb, S, S);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    barrier(cb);
+    to_buffer(cb, target.image, 0, 0, S, S, readback.buffer, 0);
+    submit(cb);
+    const uint8_t *c = readback.map + (2 * S + 1) * 4;
+    CHECK(c[0] >= 63 && c[0] <= 64 && c[1] >= 191 && c[1] <= 192);   // red and green as written (blue, alpha undefined)
+    printf("vulkan_shaders: vec2 to RGBA8 with FragDepth and no depth attachment: %d %d\n", c[0], c[1]);
+}
+
+// ---- drawing: triangle fans, made triangle lists for Metal ---------------------------------------------------------
+// The fan's vertices: a centre and the target's four corners around it (the first again at the end), after two
+// unused ones. Drawn as a fan it covers the whole target; as a list or a strip it would leave parts of it.
+static void fan_case(VkPipeline p, VkImageView view, VkImage image, buf *readback, buf *vb, buf *ib, VkIndexType it, buf *args,
+                     int indexed, uint32_t count, uint32_t first, int32_t offset) {
+    enum { S = 8 };
+    VkCommandBuffer cb = begin();
+    to_general(cb, image, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkRenderingAttachmentInfo a = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .color = { .float32 = { 0, 0, 0, 0 } } } };
+    VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { S, S } }, .layerCount = 1,
+                           .colorAttachmentCount = 1, .pColorAttachments = &a };
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    viewport(cb, S, S);
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cb, 0, 1, &vb->buffer, &zero);
+    if (indexed) vkCmdBindIndexBuffer(cb, ib->buffer, 0, it);
+    if (args) vkCmdDrawIndirect(cb, args->buffer, 0, 1, 16);
+    else if (indexed) vkCmdDrawIndexed(cb, count, 1, first, offset, 0);
+    else vkCmdDraw(cb, count, 1, first, 0);
+    vkCmdEndRendering(cb);
+    barrier(cb);
+    to_buffer(cb, image, 0, 0, S, S, readback->buffer, 0);
+    submit(cb);
+}
+static int fan_covered(const buf *readback, int x, int y) { return rgba(readback->map + (y * 8 + x) * 4, 0, 255, 0, 255); }
+static void triangle_fans(void) {
+    test = "triangle fans";
+    enum { S = 8 };
+    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    img target = make_image(format, S, S, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    VkImageView view = make_view(target.image, VK_IMAGE_VIEW_TYPE_2D, format, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    VkPipelineLayout pl = pipeline_layout(NULL, 0, 0);
+    VkVertexInputBindingDescription bind = { 0, 8, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription attr = { 0, 0, VK_FORMAT_R32G32_SFLOAT, 0 };
+    VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &bind, .vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &attr };
+    g_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; g_vertex_input = &vi;
+    VkPipeline p = graphics(MODULE(spv_position_vert), 0, MODULE(spv_color_frag), pl, &format, 1, VK_SAMPLE_COUNT_1_BIT, 0, 0);
+    g_restart = 1;
+    VkPipeline pr = graphics(MODULE(spv_position_vert), 0, MODULE(spv_color_frag), pl, &format, 1, VK_SAMPLE_COUNT_1_BIT, 0, 0);
+    g_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; g_restart = 0; g_vertex_input = NULL;
+    if (!p || !pr) return;
+    static const float verts[] = { 0.5f, 0.5f, 0.5f, 0.5f, 0, 0, -1, -1, 1, -1, 1, 1, -1, 1, -1, -1 };
+    buf vb = make_buffer(sizeof verts, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    memcpy(vb.map, verts, sizeof verts);
+    buf readback = make_buffer(S * S * 4, 0);
+    int all;
+
+    // 1. Not indexed, from the third vertex.
+    fan_case(p, view, target.image, &readback, &vb, NULL, 0, NULL, 0, 6, 2, 0);
+    all = 1; for (int i = 0; i < S * S; i++) all &= fan_covered(&readback, i % S, i / S);
+    CHECK(all);
+    printf("vulkan_shaders: fan of 6, not indexed: %s\n", all ? "the whole target" : "not all of it");
+
+    // 2. 16-bit indices from the third, with a vertex offset of 2.
+    static const uint16_t i16[] = { 7, 7, 0, 1, 2, 3, 4, 5 };
+    buf ib16 = make_buffer(sizeof i16, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    memcpy(ib16.map, i16, sizeof i16);
+    fan_case(p, view, target.image, &readback, &vb, &ib16, VK_INDEX_TYPE_UINT16, NULL, 1, 6, 2, 2);
+    all = 1; for (int i = 0; i < S * S; i++) all &= fan_covered(&readback, i % S, i / S);
+    CHECK(all);
+
+    // 3. 32-bit indices with primitive restart: two fans, the top and bottom quarters of the target only.
+    static const uint32_t i32[] = { 2, 3, 4, 0xffffffffu, 2, 5, 6 };
+    buf ib32 = make_buffer(sizeof i32, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    memcpy(ib32.map, i32, sizeof i32);
+    fan_case(pr, view, target.image, &readback, &vb, &ib32, VK_INDEX_TYPE_UINT32, NULL, 1, 7, 0, 0);
+    CHECK(fan_covered(&readback, 3, 0)); CHECK(fan_covered(&readback, 4, 7));        // top, bottom
+    CHECK(!fan_covered(&readback, 0, 3)); CHECK(!fan_covered(&readback, 7, 4));      // left, right
+    printf("vulkan_shaders: fans split by primitive restart: top %d bottom %d left %d right %d\n", fan_covered(&readback, 3, 0),
+           fan_covered(&readback, 4, 7), fan_covered(&readback, 0, 3), fan_covered(&readback, 7, 4));
+
+    // 4. Indirect: the arguments of draw 1.
+    buf args = make_buffer(16, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+    const uint32_t a[4] = { 6, 1, 2, 0 };
+    memcpy(args.map, a, sizeof a);
+    fan_case(p, view, target.image, &readback, &vb, NULL, 0, &args, 0, 0, 0, 0);
+    all = 1; for (int i = 0; i < S * S; i++) all &= fan_covered(&readback, i % S, i / S);
+    CHECK(all);
+}
+
+// ---- drawing: which way up -----------------------------------------------------------------------------------------
+// Vulkan's viewport maps NDC y = -1 to its y and y = +1 to y + height (framebuffer rows grow downwards). The upper half
+// of NDC (y from -1 to 0) lands in the top rows with a positive height; with a negative height (y = S, height = -S,
+// VK_KHR_maintenance1 / Vulkan 1.1) the same geometry lands in the bottom rows.
+static void orientation(void) {
+    test = "orientation";
+    enum { S = 8 };
+    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    img target = make_image(format, S, S, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    VkImageView view = make_view(target.image, VK_IMAGE_VIEW_TYPE_2D, format, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    VkPipelineLayout pl = pipeline_layout(NULL, 0, 0);
+    VkVertexInputBindingDescription bind = { 0, 8, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription attr = { 0, 0, VK_FORMAT_R32G32_SFLOAT, 0 };
+    VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &bind, .vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &attr };
+    g_vertex_input = &vi;
+    VkPipeline p = graphics(MODULE(spv_position_vert), 0, MODULE(spv_color_frag), pl, &format, 1, VK_SAMPLE_COUNT_1_BIT, 0, 0);
+    g_vertex_input = NULL;
+    if (!p) return;
+    static const float upper[] = { -1, -1, 1, -1, 1, 0, -1, -1, 1, 0, -1, 0 };   // NDC y from -1 to 0, both triangles
+    buf vb = make_buffer(sizeof upper, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    memcpy(vb.map, upper, sizeof upper);
+    buf readback = make_buffer(S * S * 4, 0);
+    for (int negative = 0; negative < 2; negative++) {
+        VkCommandBuffer cb = begin();
+        to_general(cb, target.image, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkRenderingAttachmentInfo a = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .color = { .float32 = { 0, 0, 0, 0 } } } };
+        VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { S, S } }, .layerCount = 1,
+                               .colorAttachmentCount = 1, .pColorAttachments = &a };
+        vkCmdBeginRendering(cb, &ri);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+        VkViewport v = negative ? (VkViewport){ 0, S, S, -(float)S, 0, 1 } : (VkViewport){ 0, 0, S, S, 0, 1 };
+        VkRect2D sc = { { 0, 0 }, { S, S } };
+        vkCmdSetViewport(cb, 0, 1, &v);
+        vkCmdSetScissor(cb, 0, 1, &sc);
+        VkDeviceSize zero = 0;
+        vkCmdBindVertexBuffers(cb, 0, 1, &vb.buffer, &zero);
+        vkCmdDraw(cb, 6, 1, 0, 0);
+        vkCmdEndRendering(cb);
+        barrier(cb);
+        to_buffer(cb, target.image, 0, 0, S, S, readback.buffer, 0);
+        submit(cb);
+        int top = fan_covered(&readback, 3, 1), bottom = fan_covered(&readback, 3, 6);
+        CHECK(top == !negative); CHECK(bottom == negative);
+        printf("vulkan_shaders: NDC's upper half, %s viewport height: top row %s, bottom row %s\n", negative ? "negative" : "positive",
+               top ? "drawn" : "empty", bottom ? "drawn" : "empty");
+    }
+}
+
+// ---- copies between a compressed and an uncompressed image ---------------------------------------------------------
+// vkCmdCopyImage with size-compatible formats: one RG32_UINT texel is one BC1 block (8 bytes each). A 2x2 RG32_UINT
+// image of made-up values becomes the top-left 2x2 blocks of an 8x8 BC1 image, read back to a buffer; then
+// the BC1 blocks are copied into another RG32_UINT image (the extent in BC1 texels). No Man's Sky copies so.
+static void compressed_copies(void) {
+    test = "compressed copies";
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    img plain = make_image(VK_FORMAT_R32G32_UINT, 2, 2, 1, 1, VK_SAMPLE_COUNT_1_BIT, u);
+    img bc = make_image(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 8, 1, 1, VK_SAMPLE_COUNT_1_BIT, u);
+    img back = make_image(VK_FORMAT_R32G32_UINT, 2, 2, 1, 1, VK_SAMPLE_COUNT_1_BIT, u);
+    buf data = make_buffer(32, 0), out_bc = make_buffer(4 * 8, 0), out_back = make_buffer(32, 0);
+    uint32_t v[8];
+    for (int i = 0; i < 8; i++) v[i] = 0x9e3779b9u * (uint32_t)(i + 1);
+    memcpy(data.map, v, sizeof v);
+    VkCommandBuffer cb = begin();
+    to_general(cb, plain.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    to_general(cb, bc.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    to_general(cb, back.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkBufferImageCopy up = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 2, 2, 1 } };
+    vkCmdCopyBufferToImage(cb, data.buffer, plain.image, VK_IMAGE_LAYOUT_GENERAL, 1, &up);
+    barrier(cb);
+    // RG32 texels (0..1, 0..1) -> BC1 texels (0..7, 0..7): one block per texel
+    VkImageCopy to_bc = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                          .dstOffset = { 0, 0, 0 }, .extent = { 2, 2, 1 } };
+    vkCmdCopyImage(cb, plain.image, VK_IMAGE_LAYOUT_GENERAL, bc.image, VK_IMAGE_LAYOUT_GENERAL, 1, &to_bc);
+    barrier(cb);
+    VkBufferImageCopy down_bc = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 8, 8, 1 } };
+    vkCmdCopyImageToBuffer(cb, bc.image, VK_IMAGE_LAYOUT_GENERAL, out_bc.buffer, 1, &down_bc);
+    // BC1 texels (0..7, 0..7) -> RG32 texels (0..1, 0..1): the extent is the source's, 8x8
+    VkImageCopy from_bc = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                            .extent = { 8, 8, 1 } };
+    vkCmdCopyImage(cb, bc.image, VK_IMAGE_LAYOUT_GENERAL, back.image, VK_IMAGE_LAYOUT_GENERAL, 1, &from_bc);
+    barrier(cb);
+    VkBufferImageCopy down = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 2, 2, 1 } };
+    vkCmdCopyImageToBuffer(cb, back.image, VK_IMAGE_LAYOUT_GENERAL, out_back.buffer, 1, &down);
+    submit(cb);
+    CHECK(memcmp(out_bc.map, v, sizeof v) == 0);       // the four blocks, row by row, are the four texels
+    CHECK(memcmp(out_back.map, v, sizeof v) == 0);
+    printf("vulkan_shaders: RG32_UINT <-> BC1 image copies: %s, %s\n", memcmp(out_bc.map, v, sizeof v) ? "wrong" : "blocks as texels",
+           memcmp(out_back.map, v, sizeof v) ? "wrong" : "back again");
+}
+
+// ---- drawing: tessellation -----------------------------------------------------------------------------------------
+// Triangle patches (equal spacing) and quad patches (fractional odd), the level from a push constant, drawn with back
+// faces culled (front: counter-clockwise). The evaluation shaders bow one edge in with a bump that only tessellated
+// patches show: with level 1 the patch keeps its straight edges. Vulkan's tessellation domain has its origin at the
+// upper left: "ccw" makes triangles counter-clockwise as seen there, so the triangle patch (corners top left, top
+// right, bottom left on the screen; the generated triangles wind the other way to their corners u, v, w) and the quad
+// patch (u to the right, v down) are front-facing with ccw and culled with cw.
+static VkPipeline tess_pipeline(VkShaderModule vs, VkShaderModule tcs, VkShaderModule tes, VkShaderModule fs, VkPipelineLayout layout,
+                                VkFormat format, uint32_t control_points) {
+    VkPipelineShaderStageCreateInfo stages[4] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, .module = tcs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, .module = tes, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main" } };
+    VkVertexInputBindingDescription bind = { 0, 8, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription attr = { 0, 0, VK_FORMAT_R32G32_SFLOAT, 0 };
+    VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &bind, .vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &attr };
+    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                  .topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST };
+    VkPipelineTessellationStateCreateInfo ts = { .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO, .patchControlPoints = control_points };
+    VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_BACK_BIT, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1 };
+    VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = 1 };
+    VkPipelineColorBlendAttachmentState blend = { .colorWriteMask = 0xf };
+    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &blend };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
+    VkPipelineRenderingCreateInfo ri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &format };
+    VkGraphicsPipelineCreateInfo info = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 4, .pStages = stages,
+        .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pTessellationState = &ts, .pViewportState = &vp, .pRasterizationState = &rs,
+        .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = layout };
+    VkPipeline p = 0;
+    CHECK(vkCreateGraphicsPipelines(device, 0, 1, &info, NULL, &p) == VK_SUCCESS);
+    return p;
+}
+static void tess_draw(VkPipeline p, VkPipelineLayout pl, VkImageView view, VkImage image, buf *vb, uint32_t vertices, float level, buf *readback) {
+    enum { S = 16 };
+    VkCommandBuffer cb = begin();
+    to_general(cb, image, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkRenderingAttachmentInfo a = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .color = { .float32 = { 0, 0, 0, 0 } } } };
+    VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { S, S } }, .layerCount = 1,
+                           .colorAttachmentCount = 1, .pColorAttachments = &a };
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    viewport(cb, S, S);
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cb, 0, 1, &vb->buffer, &zero);
+    vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_ALL, 0, 4, &level);
+    vkCmdDraw(cb, vertices, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    barrier(cb);
+    to_buffer(cb, image, 0, 0, S, S, readback->buffer, 0);
+    submit(cb);
+}
+static int tess_px(const buf *readback, int x, int y) { return rgba(readback->map + (y * 16 + x) * 4, 0, 255, 0, 255); }
+static void tessellation(void) {
+    test = "tessellation";
+    enum { S = 16 };
+    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    img target = make_image(format, S, S, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    VkImageView view = make_view(target.image, VK_IMAGE_VIEW_TYPE_2D, format, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    VkPipelineLayout pl = pipeline_layout(NULL, 0, 4);
+    VkShaderModule vs = MODULE(spv_tess_vert), fs = MODULE(spv_color_frag);
+    VkPipeline tri_ccw = tess_pipeline(vs, MODULE(spv_tess_tri_tesc), MODULE(spv_tess_tri_ccw_tese), fs, pl, format, 3);
+    VkPipeline tri_cw = tess_pipeline(vs, MODULE(spv_tess_tri_tesc), MODULE(spv_tess_tri_cw_tese), fs, pl, format, 3);
+    VkPipeline quad_ccw = tess_pipeline(vs, MODULE(spv_tess_quad_tesc), MODULE(spv_tess_quad_ccw_tese), fs, pl, format, 4);
+    VkPipeline quad_cw = tess_pipeline(vs, MODULE(spv_tess_quad_tesc), MODULE(spv_tess_quad_cw_tese), fs, pl, format, 4);
+    if (!tri_ccw || !tri_cw || !quad_ccw || !quad_cw) return;
+    static const float tri[] = { -1, -1, 1, -1, -1, 1 }, quad[] = { -1, -1, 1, -1, 1, 1, -1, 1 };
+    buf tvb = make_buffer(sizeof tri, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT), qvb = make_buffer(sizeof quad, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    memcpy(tvb.map, tri, sizeof tri);
+    memcpy(qvb.map, quad, sizeof quad);
+    buf rb = make_buffer(S * S * 4, 0);
+    // Triangles: (2, 6) inside in every case, (8, 1) near the middle of the top edge (bowed down past it when tessellated).
+    tess_draw(tri_ccw, pl, view, target.image, &tvb, 3, 1.0f, &rb);
+    int t1_in = tess_px(&rb, 2, 6), t1_edge = tess_px(&rb, 8, 1), t1_out = tess_px(&rb, 13, 13);
+    tess_draw(tri_ccw, pl, view, target.image, &tvb, 3, 8.0f, &rb);
+    int t8_in = tess_px(&rb, 2, 6), t8_edge = tess_px(&rb, 8, 1);
+    tess_draw(tri_cw, pl, view, target.image, &tvb, 3, 8.0f, &rb);
+    int tcw_in = tess_px(&rb, 2, 6);
+    CHECK(t1_in && t1_edge && !t1_out); CHECK(t8_in && !t8_edge); CHECK(!tcw_in);
+    printf("vulkan_shaders: tessellated triangle: level 1 inside %d edge %d outside %d, level 8 inside %d edge %d, cw culled %d\n",
+           t1_in, t1_edge, t1_out, t8_in, t8_edge, !tcw_in);
+    // Quads: (8, 12) inside, (8, 1) near the top edge's middle.
+    tess_draw(quad_ccw, pl, view, target.image, &qvb, 4, 1.0f, &rb);
+    int q1_in = tess_px(&rb, 8, 12), q1_edge = tess_px(&rb, 8, 1), q1_corner = tess_px(&rb, 0, 0) && tess_px(&rb, 15, 15);
+    tess_draw(quad_ccw, pl, view, target.image, &qvb, 4, 7.0f, &rb);
+    int q7_in = tess_px(&rb, 8, 12), q7_edge = tess_px(&rb, 8, 1);
+    tess_draw(quad_cw, pl, view, target.image, &qvb, 4, 7.0f, &rb);
+    int qcw_in = tess_px(&rb, 8, 12);
+    CHECK(q1_in && q1_edge && q1_corner); CHECK(q7_in && !q7_edge); CHECK(!qcw_in);
+    printf("vulkan_shaders: tessellated quad: level 1 inside %d edge %d corners %d, level 7 inside %d edge %d, cw culled %d\n",
+           q1_in, q1_edge, q1_corner, q7_in, q7_edge, !qcw_in);
+}
+
 int main(void) {
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vulkan_shaders", .apiVersion = VK_API_VERSION_1_3 };
     VkInstanceCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
@@ -641,7 +961,7 @@ int main(void) {
     VkPhysicalDeviceVulkan12Features e12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &e13,
         .runtimeDescriptorArray = 1, .descriptorBindingPartiallyBound = 1, .shaderSampledImageArrayNonUniformIndexing = 1 };
     VkPhysicalDeviceFeatures2 want = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &e12,
-                                       .features = { .geometryShader = 1, .textureCompressionBC = 1 } };
+                                       .features = { .geometryShader = 1, .tessellationShader = 1, .textureCompressionBC = 1 } };
     VkDeviceCreateInfo di = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &want, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi };
     CHECK(vkCreateDevice(gpu, &di, NULL, &device) == VK_SUCCESS);
     if (bad) { printf("vulkan_shaders: FAILED (no device)\n"); return 1; }
@@ -664,6 +984,11 @@ int main(void) {
     mrt_msaa();
     subpasses();
     geometry_layer();
+    narrow_output();
+    triangle_fans();
+    orientation();
+    compressed_copies();
+    tessellation();
 
     vkDeviceWaitIdle(device);
     vkDestroyDevice(device, NULL);

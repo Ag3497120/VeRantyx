@@ -259,6 +259,8 @@
     { "vkGetImageSubresourceLayout2", (PFN_vkVoidFunction)vkGetImageSubresourceLayout2KHR, 2 },
     { "vkGetImageSubresourceLayout2KHR", (PFN_vkVoidFunction)vkGetImageSubresourceLayout2KHR, 2 },
     { "vkGetInstanceProcAddr", (PFN_vkVoidFunction)vkGetInstanceProcAddr, 0 },
+    { "vkGetMemoryWin32HandleKHR", (PFN_vkVoidFunction)vkGetMemoryWin32HandleKHR, 2 },
+    { "vkGetMemoryWin32HandlePropertiesKHR", (PFN_vkVoidFunction)vkGetMemoryWin32HandlePropertiesKHR, 2 },
     { "vkGetPhysicalDeviceExternalBufferProperties", (PFN_vkVoidFunction)vkGetPhysicalDeviceExternalBufferProperties, 1 },
     { "vkGetPhysicalDeviceExternalBufferPropertiesKHR", (PFN_vkVoidFunction)vkGetPhysicalDeviceExternalBufferProperties, 1 },
     { "vkGetPhysicalDeviceExternalFenceProperties", (PFN_vkVoidFunction)vkGetPhysicalDeviceExternalFenceProperties, 1 },

@@ -742,8 +742,10 @@ static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
     uint32_t aux[256];
     uint32_t naux = 0;
     // (with a geometry shader the render pipeline's vertex function is "vkpass": the shaders' sets go to the kernels)
-    uint32_t sets_vertex = pl->gs_kernel ? 0 : pl->sets_vertex;
-    uint8_t aux_vertex = pl->gs_kernel ? 0 : pl->aux_vertex, push_vertex = pl->gs_kernel ? 0 : pl->push_vertex;
+    // (with tessellation it is the evaluation shader)
+    uint32_t sets_vertex = pl->gs_kernel ? 0 : pl->tess ? pl->sets_tes : pl->sets_vertex;
+    uint8_t aux_vertex = pl->gs_kernel ? 0 : pl->tess ? pl->aux_tes : pl->aux_vertex;
+    uint8_t push_vertex = pl->gs_kernel ? 0 : pl->tess ? pl->push_tes : pl->push_vertex;
     for (uint32_t s = 0; s < VKMSL_MAX_SETS; s++) {
         uint32_t mask = 1u << s;
         if (!((sets_vertex | pl->sets_fragment) & mask)) continue;
@@ -803,8 +805,10 @@ static void bind_sets_compute(vk_enc *e, const struct VkPipeline_T *pl) {
 }
 
 static MTLViewport mtl_viewport(VkViewport v) {
-    // (a negative height, maintenance1's flip, is the same viewport from its other edge)
-    if (v.height < 0) { v.y += v.height; v.height = -v.height; }
+    // Vulkan maps NDC y to y + (1 + ndc.y) * height / 2; the vertex shaders hand Metal -y (vk_msl.c), and Metal maps
+    // that to originY + (1 - ndc.y') * height / 2: the same rows for either sign of the height. So a negative height
+    // (VK_KHR_maintenance1's flip) goes to Metal as it is, which takes it; turning it positive drew the image upside
+    // down.
     return (MTLViewport){ v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth };
 }
 
@@ -879,7 +883,7 @@ static int prepare_draw(vk_enc *e) {
     if (!e->render || !p || !p->render) return 0;
     if (e->state_dirty) apply_render_state(e);
     bind_sets_render(e, p);
-    for (uint32_t b = 0; b < VKMSL_MAX_VERTEX_BUFFERS && !p->gs_kernel; b++) {
+    for (uint32_t b = 0; b < VKMSL_MAX_VERTEX_BUFFERS && !p->gs_kernel && !p->tess; b++) {
         if (!(p->vertex_bindings & (1u << b))) continue;
         VkBuffer vb = e->vb[b];
         id<MTLBuffer> mb = vb && vb->mtl ? vb->mtl : e->dev->zero_buffer;
@@ -902,6 +906,62 @@ static MTLPrimitiveType current_primitive(vk_enc *e) {
     case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: return MTLPrimitiveTypeTriangleStrip;
     default: return MTLPrimitiveTypeTriangle;
     }
+}
+
+// ---- triangle fans ----
+// Metal has no fan topology. The Vulkan spec's fan primitive i is (v[i+1], v[i+2], v[0]): a triangle list of those
+// three indices draws the same triangles with the same winding and provoking vertex. With primitive restart, the
+// all-ones index ends a fan and the next index starts another. Not indexed, the indices are 0..n-1 and the draw's
+// first vertex becomes the base vertex, so gl_VertexIndex is unchanged.
+static uint32_t fan_to_list(const void *src, int index_size, uint32_t count, int restart, uint32_t *out) {
+    uint32_t n = 0, have = 0, hub = 0, prev = 0;
+    uint32_t restart_value = index_size == 2 ? 0xffffu : 0xffffffffu;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t v = !src ? i : index_size == 2 ? ((const uint16_t *)src)[i] : ((const uint32_t *)src)[i];
+        if (src && restart && v == restart_value) { have = 0; continue; }
+        if (have == 0) hub = v;
+        else if (have >= 2) { out[n++] = prev; out[n++] = v; out[n++] = hub; }
+        prev = v; have++;
+    }
+    return n;
+}
+static void *buffer_cpu(VkBuffer b) {                 // (a buffer the CPU can read: host-visible memory)
+    if (!b || !b->mtl || b->mtl.storageMode == MTLStorageModePrivate) return NULL;
+    return b->mtl.contents;
+}
+static int topology_is_fan(vk_enc *e) {
+    struct VkPipeline_T *p = e->gp;
+    return p && ((p->dynamic & VK_DYN_TOPOLOGY) ? e->topology : p->topology) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+}
+static void fan_draw(vk_enc *e, int indexed, uint32_t count, uint32_t instances, uint32_t first, int32_t vertex_offset,
+                     uint32_t first_instance) {
+    if (count < 3 || !instances) return;
+    const void *src = NULL;
+    int index_size = 4;
+    if (indexed) {
+        if (!e->ib || !e->ib->mtl) return;
+        index_size = e->ib_type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+        uint8_t *base = buffer_cpu(e->ib);
+        uint64_t off = e->ib->offset + e->ib_offset + (uint64_t)first * index_size;
+        if (!base || off + (uint64_t)count * index_size > e->ib->mtl.length) {
+            static int once;
+            if (!once++) vx_log("vulkan: an indexed triangle fan from GPU-only memory is not supported (skipped)");
+            return;
+        }
+        src = base + off;
+    }
+    uint64_t max = 3ull * (count - 2);
+    if (max * 4 > (1ull << 30)) return;
+    uint32_t *list = malloc((size_t)max * 4);
+    if (!list) return;
+    uint32_t n = fan_to_list(src, index_size, count, src && (e->primitive_restart_set ? e->primitive_restart : e->gp->primitive_restart), list);
+    if (n) {
+        id<MTLBuffer> ib = [e->dev->mtl newBufferWithBytes:list length:(NSUInteger)n * 4 options:MTLResourceStorageModeShared];
+        if (ib) [e->render drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:n indexType:MTLIndexTypeUInt32 indexBuffer:ib
+                                indexBufferOffset:0 instanceCount:instances baseVertex:indexed ? vertex_offset : (NSInteger)first
+                                     baseInstance:first_instance];
+    }
+    free(list);
 }
 
 // ---- geometry shaders ----
@@ -932,27 +992,13 @@ static id<MTLBuffer> gs_scratch(vk_enc *e, int which, uint64_t size) {
     }
     return b;
 }
-static void gs_draw(vk_enc *e, const c_draw *c, int indexed) {
+// The vertex shader as a kernel (before a geometry or tessellation control shader): each vertex's outputs into slots
+// of vout. Its vertex buffers start at the draw's first vertex (or base vertex) and first instance.
+static void run_vertex_kernel(vk_enc *e, id<MTLComputeCommandEncoder> ce, const c_draw *c, int indexed, id<MTLBuffer> vout,
+                              const vkmsl_gs_params *gpp) {
     struct VkPipeline_T *p = e->gp;
-    VkPrimitiveTopology topo = (p->dynamic & VK_DYN_TOPOLOGY) ? e->topology : p->topology;
-    uint32_t prims = gs_primitives(topo, c->count);
-    if (!prims || !p->gs_max_tris || (indexed && (!e->ib || !e->ib->mtl))) return;
     int i16 = indexed && e->ib_type == VK_INDEX_TYPE_UINT16;
-    uint64_t runs = (uint64_t)prims * c->instances * p->gs_invocations;
-    uint64_t vsize = (uint64_t)c->count * c->instances * p->gs_in_slots * 16;
-    uint64_t tsize = runs * p->gs_max_tris * 3 * p->gs_out_slots * 16;
-    if (vsize > (1ull << 31) || tsize > (1ull << 31)) { TRACE("geometry draw of %llu runs skipped", (unsigned long long)runs); return; }
-    id<MTLBuffer> vout = gs_scratch(e, 0, vsize), tris = gs_scratch(e, 1, tsize), counts = gs_scratch(e, 2, runs * 4);
-    vkmsl_gs_params gp = { c->count, c->instances, c->first, c->first_instance, c->vertex_offset, (uint32_t)indexed, (uint32_t)i16,
-                           prims, (uint32_t)topo, p->gs_invocations, p->gs_in_slots, p->gs_max_tris };
-    pass_desc resume = e->pass;
-    for (uint32_t i = 0; i < resume.color_count; i++) resume.colors[i].load = 0;
-    resume.depth.load = resume.depth.sload = 0;
-    MTLVisibilityResultMode vis = e->vis_mode;
-    uint64_t vis_offset = e->vis_offset;
-
-    id<MTLComputeCommandEncoder> ce = compute_encoder(e);
-    // The vertex shader: its vertex buffers start at the draw's first vertex (or base vertex) and first instance.
+    vkmsl_gs_params gp = *gpp;
     [ce setComputePipelineState:p->gs_vs[indexed ? (i16 ? 1 : 2) : 0]];
     bind_sets_kernel(e, p, &e->gb, p->sets_vertex, p->aux_vertex, p->push_vertex);
     for (uint32_t b = 0; b < VKMSL_MAX_VERTEX_BUFFERS; b++) {
@@ -980,6 +1026,78 @@ static void gs_draw(vk_enc *e, const c_draw *c, int indexed) {
     if (p->vertex_bindings) [ce setStageInRegion:MTLRegionMake2D(0, 0, c->count, c->instances)];
     NSUInteger w = p->gs_vs[0].threadExecutionWidth;
     [ce dispatchThreads:MTLSizeMake(c->count, c->instances, 1) threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
+}
+
+// A draw with tessellation: the vertex shader as a kernel over the draw's vertices; the control shader as a kernel, a
+// threadgroup per patch and instance (its control points, patch values and factors into buffers); then the pass again,
+// Metal's tessellator drawing the patches with the evaluation shader as the vertex function.
+static void tess_draw(vk_enc *e, const c_draw *c, int indexed) {
+    struct VkPipeline_T *p = e->gp;
+    uint32_t pv = p->patch_cp, n = p->tess_out_vertices;
+    uint32_t patches = pv ? c->count / pv : 0;
+    if (!patches || !n || (indexed && (!e->ib || !e->ib->mtl))) return;
+    int i16 = indexed && e->ib_type == VK_INDEX_TYPE_UINT16;
+    uint64_t all = (uint64_t)patches * c->instances, fsize = p->tess_quad ? 12 : 8;
+    uint64_t vsize = (uint64_t)c->count * c->instances * p->gs_in_slots * 16;
+    uint64_t cpsize = all * n * p->tess_cp_slots * 16, psize = all * p->tess_patch_slots * 16;
+    if (vsize > (1ull << 31) || cpsize > (1ull << 31)) { TRACE("tessellation draw of %llu patches skipped", (unsigned long long)all); return; }
+    id<MTLBuffer> vout = gs_scratch(e, 0, vsize), cp = gs_scratch(e, 1, cpsize), pb = gs_scratch(e, 2, psize),
+                  tf = gs_scratch(e, 3, all * fsize);
+    vkmsl_gs_params gp = { c->count, c->instances, c->first, c->first_instance, c->vertex_offset, (uint32_t)indexed, (uint32_t)i16,
+                           0, 0, 1, p->gs_in_slots, 0 };
+    vkmsl_tess_params tp = { c->count, c->instances, patches, pv, n, p->tess_quad, { 0, 0 } };
+    pass_desc resume = e->pass;
+    for (uint32_t i = 0; i < resume.color_count; i++) resume.colors[i].load = 0;
+    resume.depth.load = resume.depth.sload = 0;
+    MTLVisibilityResultMode vis = e->vis_mode;
+    uint64_t vis_offset = e->vis_offset;
+
+    id<MTLComputeCommandEncoder> ce = compute_encoder(e);
+    run_vertex_kernel(e, ce, c, indexed, vout, &gp);
+    [ce setComputePipelineState:p->tcs_kernel];
+    bind_sets_kernel(e, p, &e->gb, p->sets_tcs, p->aux_tcs, p->push_tcs);
+    [ce setBytes:&tp length:sizeof tp atIndex:VKMSL_TESS_PARAMS];
+    [ce setBuffer:vout offset:0 atIndex:VKMSL_TESS_IN];
+    [ce setBuffer:cp offset:0 atIndex:VKMSL_TESS_CP];
+    [ce setBuffer:pb offset:0 atIndex:VKMSL_TESS_PATCH];
+    [ce setBuffer:tf offset:0 atIndex:VKMSL_TESS_FACTORS];
+    [ce dispatchThreadgroups:MTLSizeMake(patches, c->instances, 1) threadsPerThreadgroup:MTLSizeMake(n, 1, 1)];
+    begin_render(e, &resume);
+    if (vis != MTLVisibilityResultModeDisabled) {
+        [e->render setVisibilityResultMode:vis offset:vis_offset];
+        e->vis_mode = vis; e->vis_offset = vis_offset;
+    }
+    if (!prepare_draw(e)) return;
+    [e->render setTessellationFactorBuffer:tf offset:0 instanceStride:(NSUInteger)(patches * fsize)];
+    [e->render setVertexBytes:&tp length:sizeof tp atIndex:VKMSL_TESS_PARAMS];
+    [e->render setVertexBuffer:cp offset:0 atIndex:VKMSL_TESS_IN];
+    [e->render setVertexBuffer:pb offset:0 atIndex:VKMSL_TESS_CP];
+    [e->render drawPatches:n patchStart:0 patchCount:patches patchIndexBuffer:nil patchIndexBufferOffset:0
+             instanceCount:c->instances baseInstance:0];
+}
+
+static void gs_draw(vk_enc *e, const c_draw *c, int indexed) {
+    struct VkPipeline_T *p = e->gp;
+    VkPrimitiveTopology topo = (p->dynamic & VK_DYN_TOPOLOGY) ? e->topology : p->topology;
+    uint32_t prims = gs_primitives(topo, c->count);
+    if (!prims || !p->gs_max_tris || (indexed && (!e->ib || !e->ib->mtl))) return;
+    int i16 = indexed && e->ib_type == VK_INDEX_TYPE_UINT16;
+    uint64_t runs = (uint64_t)prims * c->instances * p->gs_invocations;
+    uint64_t vsize = (uint64_t)c->count * c->instances * p->gs_in_slots * 16;
+    uint64_t tsize = runs * p->gs_max_tris * 3 * p->gs_out_slots * 16;
+    if (vsize > (1ull << 31) || tsize > (1ull << 31)) { TRACE("geometry draw of %llu runs skipped", (unsigned long long)runs); return; }
+    id<MTLBuffer> vout = gs_scratch(e, 0, vsize), tris = gs_scratch(e, 1, tsize), counts = gs_scratch(e, 2, runs * 4);
+    vkmsl_gs_params gp = { c->count, c->instances, c->first, c->first_instance, c->vertex_offset, (uint32_t)indexed, (uint32_t)i16,
+                           prims, (uint32_t)topo, p->gs_invocations, p->gs_in_slots, p->gs_max_tris };
+    pass_desc resume = e->pass;
+    for (uint32_t i = 0; i < resume.color_count; i++) resume.colors[i].load = 0;
+    resume.depth.load = resume.depth.sload = 0;
+    MTLVisibilityResultMode vis = e->vis_mode;
+    uint64_t vis_offset = e->vis_offset;
+
+    id<MTLComputeCommandEncoder> ce = compute_encoder(e);
+    run_vertex_kernel(e, ce, c, indexed, vout, &gp);
+    NSUInteger w;
     // The geometry shader over the primitives (y: instance and invocation).
     [ce setComputePipelineState:p->gs_kernel];
     bind_sets_kernel(e, p, &e->gb, p->sets_geometry, p->aux_geometry, p->push_geometry);
@@ -1060,10 +1178,54 @@ static void copy_buffer_image_encode(vk_enc *e, const c_copy_buffer_image *c) {
     }
 }
 
+// A copy between a compressed and an uncompressed image (or two compressed formats): Vulkan matches one texel of the
+// uncompressed image with one block of the compressed one (their sizes are equal), and the extent is in the source's
+// texels. Metal cannot view one as the other, so the blocks go through a buffer: out of the source, into the
+// destination, each clipped to its level (Metal wants whole blocks inside it).
+static void copy_image_through_buffer(vk_enc *e, id<MTLBlitCommandEncoder> bl, const c_copy_image *c, const VkImageCopy2 *r) {
+    const vk_format_info *sf = c->src->fmt, *df = c->dst->fmt;
+    if (!sf || !df || sf->bytes != df->bytes) { TRACE("image copy between formats of different sizes %d and %d", c->src->format, c->dst->format); return; }
+    uint32_t blocks_w = (r->extent.width + sf->block_w - 1) / sf->block_w, blocks_h = (r->extent.height + sf->block_h - 1) / sf->block_h;
+    uint32_t depth = r->extent.depth ? r->extent.depth : 1;
+    if (!blocks_w || !blocks_h) return;
+    uint64_t bpr = (uint64_t)blocks_w * sf->bytes, bpi = bpr * blocks_h;
+    id<MTLBuffer> tmp = [e->dev->mtl newBufferWithLength:(NSUInteger)(bpi * depth) options:MTLResourceStorageModePrivate];
+    if (!tmp) return;
+    uint32_t layers = r->srcSubresource.layerCount;
+    if (c->src->type == VK_IMAGE_TYPE_3D || c->dst->type == VK_IMAGE_TYPE_3D) layers = 1;
+    int is3d_s = c->src->type == VK_IMAGE_TYPE_3D, is3d_d = c->dst->type == VK_IMAGE_TYPE_3D;
+    // (the region in each image's texels, clipped to its level)
+    MTLSize ss = MTLSizeMake(blocks_w * sf->block_w, blocks_h * sf->block_h, depth), ds = MTLSizeMake(blocks_w * df->block_w, blocks_h * df->block_h, depth);
+    uint32_t slw = c->src->extent.width >> r->srcSubresource.mipLevel, slh = c->src->extent.height >> r->srcSubresource.mipLevel;
+    uint32_t dlw = c->dst->extent.width >> r->dstSubresource.mipLevel, dlh = c->dst->extent.height >> r->dstSubresource.mipLevel;
+    if (!slw) slw = 1;
+    if (!slh) slh = 1;
+    if (!dlw) dlw = 1;
+    if (!dlh) dlh = 1;
+    if (r->srcOffset.x + ss.width > slw) ss.width = slw - r->srcOffset.x;
+    if (r->srcOffset.y + ss.height > slh) ss.height = slh - r->srcOffset.y;
+    if (r->dstOffset.x + ds.width > dlw) ds.width = dlw - r->dstOffset.x;
+    if (r->dstOffset.y + ds.height > dlh) ds.height = dlh - r->dstOffset.y;
+    for (uint32_t l = 0; l < layers; l++) {
+        [bl copyFromTexture:c->src->mtl sourceSlice:r->srcSubresource.baseArrayLayer + l sourceLevel:r->srcSubresource.mipLevel
+               sourceOrigin:MTLOriginMake(r->srcOffset.x, r->srcOffset.y, r->srcOffset.z) sourceSize:ss
+                   toBuffer:tmp destinationOffset:0 destinationBytesPerRow:bpr destinationBytesPerImage:is3d_s ? bpi : 0];
+        [bl copyFromBuffer:tmp sourceOffset:0 sourceBytesPerRow:bpr sourceBytesPerImage:is3d_d ? bpi : 0 sourceSize:ds
+                 toTexture:c->dst->mtl destinationSlice:r->dstSubresource.baseArrayLayer + l destinationLevel:r->dstSubresource.mipLevel
+         destinationOrigin:MTLOriginMake(r->dstOffset.x, r->dstOffset.y, r->dstOffset.z)];
+    }
+}
+
 static void copy_image_encode(vk_enc *e, const c_copy_image *c) {
     id<MTLBlitCommandEncoder> bl = blit_encoder(e);
     if (!c->src->mtl || !c->dst->mtl) return;
     id<MTLTexture> src = c->src->mtl;
+    if (src.pixelFormat != c->dst->mtl.pixelFormat && c->src->fmt && c->dst->fmt &&
+        (c->src->fmt->compressed || c->dst->fmt->compressed)) {
+        const VkImageCopy2 *rs = (const VkImageCopy2 *)(c + 1);
+        for (uint32_t i = 0; i < c->count; i++) copy_image_through_buffer(e, bl, c, &rs[i]);
+        return;
+    }
     if (src.pixelFormat != c->dst->mtl.pixelFormat) {
         // (size-compatible formats: a view of the source in the destination's format)
         src = [src newTextureViewWithPixelFormat:c->dst->mtl.pixelFormat];
@@ -1229,6 +1391,7 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
                     }
                     break;
                 case S_DEPTH_BIAS_ENABLE: e->depth_bias_enable = c->u[0]; break;
+                case S_PRIMITIVE_RESTART: e->primitive_restart = c->u[0] != 0; e->primitive_restart_set = 1; break;
                 default: break;
                 }
                 e->state_dirty = 1;
@@ -1237,7 +1400,9 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
             case C_DRAW: case C_DRAW_INDEXED: {
                 c_draw *c = (c_draw *)h;
                 if (c->count && c->instances && e->render && e->gp && e->gp->gs_kernel) { gs_draw(e, c, h->op == C_DRAW_INDEXED); break; }
+                if (c->count && c->instances && e->render && e->gp && e->gp->tess) { tess_draw(e, c, h->op == C_DRAW_INDEXED); break; }
                 if (!c->count || !c->instances || !prepare_draw(e)) break;
+                if (topology_is_fan(e)) { fan_draw(e, h->op == C_DRAW_INDEXED, c->count, c->instances, c->first, c->vertex_offset, c->first_instance); break; }
                 MTLPrimitiveType pt = current_primitive(e);
                 if (h->op == C_DRAW)
                     [e->render drawPrimitives:pt vertexStart:c->first vertexCount:c->count instanceCount:c->instances baseInstance:c->first_instance];
@@ -1252,9 +1417,9 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
             }
             case C_DRAW_INDIRECT: {
                 c_draw_indirect *c = (c_draw_indirect *)h;
-                if (e->gp && e->gp->gs_kernel) {
-                    static int once;
-                    if (!once++) vx_log("vulkan: indirect draws with a geometry shader are not supported (skipped)");
+                if (e->gp && (e->gp->gs_kernel || e->gp->tess)) {
+                    if (vk_log_once("indirect draw with a geometry or tessellation shader", e->gp->tess))
+                        vx_log("vulkan: indirect draws with a %s shader are not supported (skipped, logged once)", e->gp->tess ? "tessellation" : "geometry");
                     break;
                 }
                 if (!prepare_draw(e) || !c->buffer->mtl) break;
@@ -1266,6 +1431,18 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
                         uint32_t n = *(uint32_t *)((uint8_t *)c->count_buffer->memory->map + c->count_buffer->memory_offset + c->count_offset);
                         if (n < draws) draws = n;
                     }
+                }
+                if (topology_is_fan(e)) {
+                    // (fans: the arguments are read now, when the CPU can read them, and drawn as lists)
+                    uint8_t *args = buffer_cpu(c->buffer);
+                    for (uint32_t i = 0; args && i < draws; i++) {
+                        uint64_t off = c->buffer->offset + c->offset + (uint64_t)i * (c->stride ? c->stride : (c->indexed ? 20 : 16));
+                        if (off + (c->indexed ? 20 : 16) > c->buffer->mtl.length) break;
+                        const uint32_t *a = (const uint32_t *)(args + off);
+                        if (c->indexed) fan_draw(e, 1, a[0], a[1], a[2], (int32_t)a[3], a[4]);
+                        else fan_draw(e, 0, a[0], a[1], a[2], 0, a[3]);
+                    }
+                    break;
                 }
                 for (uint32_t i = 0; i < draws; i++) {
                     uint64_t off = c->buffer->offset + c->offset + (uint64_t)i * (c->stride ? c->stride : (c->indexed ? 20 : 16));

@@ -238,6 +238,8 @@ typedef struct {
     uint8_t set_used[VKMSL_MAX_SETS];
     uint8_t binding_used[256];
     uint8_t uses_subgroup, uses_fragcoord;
+    uint8_t tcs, tes;          // a tessellation control shader as a kernel; an evaluation shader as a post-tessellation vertex function
+    uint32_t tess_domain, tess_spacing, tess_order, tess_out_n;
     dmember *dm;
     uint32_t dm_count, dm_cap;
     uint32_t cur_op;
@@ -791,9 +793,15 @@ static int parse(T *t) {
             case 19: t->gs_in_n = 1; break;
             case 20: t->gs_in_n = 2; break;
             case 21: t->gs_in_n = 4; break;
-            case 22: t->gs_in_n = 3; break;
+            case 22: t->gs_in_n = 3; t->tess_domain = 1; break;
             case 23: t->gs_in_n = 6; break;
-            case 26: t->gs_maxt = w[2]; break;   // (OutputVertices: made triangles below)
+            case 26: t->gs_maxt = w[2]; t->tess_out_n = w[2]; break;   // (OutputVertices: made triangles below)
+            case 1: case 2: case 3: t->tess_spacing = w[1]; break;
+            case 4: t->tess_order = 1; break;
+            case 5: t->tess_order = 2; break;
+            case 10: t->point_mode = 1; break;
+            case 24: t->tess_domain = 2; break;
+            case 25: t->tess_domain = 3; break;
             case 27: t->gs_out_prim = 1; break;
             case 28: t->gs_out_prim = 2; break;
             case 29: t->gs_out_prim = 3; break;
@@ -1290,10 +1298,14 @@ static void varying_leaves(T *t, leafctx *c, uint32_t type, const char *path, ui
         sb_printf(c->init, "    spvOut.v%u = %s;\n", L, wv);
         free(wv);
     } else if (t->model == VKMSL_STAGE_FRAGMENT) {
+        // Always four components: Metal refuses a pipeline whose color output has fewer than the attachment's format
+        // (Vulkan leaves the missing ones undefined); the extra ones go nowhere.
         uint32_t index = c->index;
-        if (index) sb_printf(c->decl, "    %s c%u_1 [[color(%u), index(1)]];\n", tname(t, type), L, L);
-        else sb_printf(c->decl, "    %s c%u [[color(%u)]];\n", tname(t, type), L, L);
-        sb_printf(c->init, "    spvOut.c%u%s = %s;\n", L, index ? "_1" : "", path);
+        if (index) sb_printf(c->decl, "    %s c%u_1 [[color(%u), index(1)]];\n", vec4_of(t, type), L, L);
+        else sb_printf(c->decl, "    %s c%u [[color(%u)]];\n", vec4_of(t, type), L, L);
+        char *wv = widen4(t, type, path);
+        sb_printf(c->init, "    spvOut.c%u%s = %s;\n", L, index ? "_1" : "", wv);
+        free(wv);
         t->res->fragment_outputs |= 1u << (L & 31);
     }
 }
@@ -2393,7 +2405,7 @@ static void emit_insn(T *t, uint32_t op, const uint32_t *w, uint32_t n) {
         uint32_t sem_id = op == OpControlBarrier ? w[2] : w[1];
         int ok = 1;
         uint32_t sem = const_u32(t, sem_id, &ok);
-        if (op == OpMemoryBarrier || t->model != VKMSL_STAGE_COMPUTE) return;   // (no pure fences: see below)
+        if (op == OpMemoryBarrier || (t->model != VKMSL_STAGE_COMPUTE && !t->tcs)) return;   // (no pure fences: see below)
         const char *f = (sem & 0x800) ? "mem_flags::mem_texture | " : "";
         const char *g = (sem & 0x40) ? "mem_flags::mem_device | " : "";
         EMIT("threadgroup_barrier(%s%smem_flags::mem_threadgroup);\n", f, g);
@@ -2697,7 +2709,8 @@ static void setup_variable(T *t, uint32_t var) {
         p->pointee = pointee;
         p->storage = sc;
         p->var = var;
-        if (sc == SC_Workgroup) sb_printf(&t->vars, "    threadgroup %s _%u;\n", tname(t, pointee), var);
+        // (a control shader's outputs are its patch's: every invocation of the threadgroup sees them)
+        if (sc == SC_Workgroup || (sc == SC_Output && t->tcs)) sb_printf(&t->vars, "    threadgroup %s _%u;\n", tname(t, pointee), var);
         else if (v->n > 3) sb_printf(&t->vars, "    %s _%u = %s;\n", tname(t, pointee), var, value(t, v->w[3]));
         else sb_printf(&t->vars, "    %s _%u;\n", tname(t, pointee), var);
         return;
@@ -3045,6 +3058,187 @@ static void gs_passthrough(T *t, sb *src) {
     free(body.p);
 }
 
+// ---- tessellation -------------------------------------------------------------------------------------------------
+enum { BI_TessLevelOuter = 11, BI_TessLevelInner = 12, BI_TessCoord = 13, BI_PatchVertices = 14 };
+// Whether an interface variable is a block of built-ins (gl_PerVertex), or an array of them (gl_in[], gl_out[]).
+static uint32_t builtin_block_of(T *t, uint32_t type) {
+    if (type_op(t, type) == OpTypeArray) type = tw(t, type)[1];
+    return type_op(t, type) == OpTypeStruct && (mdeco(t, type, 0)->deco & D_BUILTIN) ? type : 0;
+}
+// The user locations a variable's leaves take from its first (max_loc: one past the last).
+static uint32_t locations_end(T *t, uint32_t type, uint32_t first) {
+    uint32_t loc = first, mx = 0;
+    sb dummy = { 0 };
+    slot_leaves(t, type, "x", &loc, &dummy, "x", 0, &mx);
+    free(dummy.p);
+    return mx;
+}
+// The control shader: a threadgroup per patch (x) and instance (y), a thread per output control point. Its inputs come
+// from the vertex kernel's slots; its outputs are threadgroup variables, written out when it returns: each thread its
+// control point, thread 0 the patch's outputs and factors.
+// The evaluation shader: Metal's patch id and position in the patch; control points and patch values from the slots.
+static void tess_interface(T *t, sb *in_init, sb *params, sb *prologue) {
+    uint32_t cp_loc = 0, patch_loc = 0;
+    for (uint32_t i = 0; i < t->iface_count; i++) {
+        ent *v = E(t, t->iface[i]);
+        if (v->kind != K_VAR || (v->d.deco & D_BUILTIN)) continue;
+        uint32_t type = tw(t, v->type)[2];
+        if (builtin_block_of(t, type)) continue;
+        int is_out = v->w[2] == SC_Output;
+        if ((t->tcs && !is_out) || (t->tes && is_out)) continue;
+        if (v->d.deco & D_PATCH) { uint32_t e = locations_end(t, type, v->d.location); if (e > patch_loc) patch_loc = e; }
+        else if (type_op(t, type) == OpTypeArray) { uint32_t e = locations_end(t, tw(t, type)[1], v->d.location); if (e > cp_loc) cp_loc = e; }
+    }
+    if (t->tes) { cp_loc = t->opt->tess.cp_locations; patch_loc = t->opt->tess.patch_locations; }
+    uint32_t CS = cp_loc + 4, PS = patch_loc + 2, IS = t->opt->vary_slots + 4;
+    t->res->tess.cp_locations = cp_loc;
+    t->res->tess.patch_locations = patch_loc;
+    if (t->tcs) {
+        uint32_t N = t->tess_out_n;
+        if (!N) { fail(t, VKMSL_UNSUPPORTED, "control shader without OutputVertices"); return; }
+        sb_puts(params, ",\n    uint3 spvTgPos [[threadgroup_position_in_grid]]");
+        sb_puts(params, ",\n    uint3 spvTid3 [[thread_position_in_threadgroup]]");
+        sb_printf(params, ",\n    constant spvTessParams& spvTP [[buffer(%u)]]", VKMSL_TESS_PARAMS);
+        sb_printf(params, ",\n    const device float4 *spvVIn [[buffer(%u)]]", VKMSL_TESS_IN);
+        sb_printf(params, ",\n    device float4 *spvCPOut [[buffer(%u)]]", VKMSL_TESS_CP);
+        sb_printf(params, ",\n    device float4 *spvPOut [[buffer(%u)]]", VKMSL_TESS_PATCH);
+        sb_printf(params, ",\n    device half *spvTF [[buffer(%u)]]", VKMSL_TESS_FACTORS);
+        sb_puts(prologue, "    uint spvTid = spvTid3.x, spvPatch = spvTgPos.x, spvInst = spvTgPos.y, spvPI = spvInst * spvTP.patches + spvPatch;\n");
+        sb_puts(&t->ret, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+        sb_printf(&t->ret, "    device float4 *spvCP = spvCPOut + (spvPI * %uu + spvTid) * %uu;\n", N, CS);
+        sb_printf(&t->ret, "    for (uint i = 0; i < %uu; i++) spvCP[i] = float4(0.0f);\n", CS);
+        sb patch = { 0 };
+        const char *outer = NULL, *inner = NULL;
+        char *outer_s = NULL, *inner_s = NULL;
+        uint32_t outer_n = 0, inner_n = 0;
+        for (uint32_t i = 0; i < t->iface_count; i++) {
+            uint32_t var = t->iface[i];
+            ent *v = E(t, var);
+            if (v->kind != K_VAR) continue;
+            uint32_t sc = v->w[2], type = tw(t, v->type)[2], bb = builtin_block_of(t, type);
+            if (sc == SC_Input) {
+                if (v->d.deco & D_BUILTIN) {
+                    const char *src = v->d.builtin == BI_InvocationId ? "spvTid" : v->d.builtin == BI_PrimitiveId ? "spvPatch" :
+                                      v->d.builtin == BI_PatchVertices ? "spvTP.in_vertices" : NULL;
+                    if (!src) { fail(t, VKMSL_UNSUPPORTED, "control shader built-in input %u", v->d.builtin); continue; }
+                    sb_printf(in_init, "    _%u = %s(%s);\n", var, tname(t, type), src);
+                    continue;
+                }
+                if (type_op(t, type) != OpTypeArray) { fail(t, VKMSL_UNSUPPORTED, "control shader input that is not per vertex"); continue; }
+                uint32_t elem = tw(t, type)[1], len = array_length(t, type);
+                sb_printf(in_init, "    for (uint spvJ = 0; spvJ < min(spvTP.in_vertices, %uu); spvJ++) {\n", len);
+                const char *base = "(spvVIn + (spvInst * spvTP.count + spvPatch * spvTP.in_vertices + spvJ) * %uu)";
+                char *b = xprintf(base, IS), *ep = xprintf("_%u[spvJ]", var);
+                if (bb) {
+                    for (uint32_t m = 0; m + 1 < E(t, bb)->n; m++) {
+                        char *mp = xprintf("%s.m%u", ep, m);
+                        builtin_slots(t, mdeco(t, bb, m)->builtin, tw(t, bb)[m + 1], mp, in_init, b, t->opt->vary_slots, 1);
+                        free(mp);
+                    }
+                } else { uint32_t loc = v->d.location, mx = 0; slot_leaves(t, elem, ep, &loc, in_init, b, 1, &mx); }
+                sb_puts(in_init, "    }\n");
+                free(b); free(ep);
+            } else if (sc == SC_Output) {
+                if (v->d.deco & D_BUILTIN) {
+                    if (v->d.builtin == BI_TessLevelOuter) { outer_s = xprintf("_%u", var); outer = outer_s; outer_n = array_length(t, type); }
+                    else if (v->d.builtin == BI_TessLevelInner) { inner_s = xprintf("_%u", var); inner = inner_s; inner_n = array_length(t, type); }
+                    else fail(t, VKMSL_UNSUPPORTED, "control shader built-in output %u", v->d.builtin);
+                    continue;
+                }
+                if (bb && type_op(t, type) == OpTypeArray) {
+                    for (uint32_t m = 0; m + 1 < E(t, bb)->n; m++) {
+                        char *mp = xprintf("_%u[spvTid].m%u", var, m);
+                        builtin_slots(t, mdeco(t, bb, m)->builtin, tw(t, bb)[m + 1], mp, &t->ret, "spvCP", cp_loc, 0);
+                        free(mp);
+                    }
+                    continue;
+                }
+                if (bb) { fail(t, VKMSL_UNSUPPORTED, "control shader per-patch built-in block"); continue; }
+                if (v->d.deco & D_PATCH) {
+                    uint32_t loc = v->d.location, mx = 0;
+                    char *path = xprintf("_%u", var);
+                    slot_leaves(t, type, path, &loc, &patch, "(spvPO + 1)", 0, &mx);
+                    free(path);
+                } else if (type_op(t, type) == OpTypeArray) {
+                    uint32_t loc = v->d.location, mx = 0;
+                    char *path = xprintf("_%u[spvTid]", var);
+                    slot_leaves(t, tw(t, type)[1], path, &loc, &t->ret, "spvCP", 0, &mx);
+                    free(path);
+                } else fail(t, VKMSL_UNSUPPORTED, "control shader output that is neither per vertex nor per patch");
+            }
+        }
+        // Thread 0: the patch's outputs and its factors (levels not written are 1).
+        sb_printf(&t->ret, "    if (spvTid == 0u) {\n        device float4 *spvPO = spvPOut + spvPI * %uu;\n", PS);
+        sb_puts(&t->ret, "        float4 spvOuter = float4(1.0f), spvInner = float4(1.0f);\n");
+        for (uint32_t k = 0; outer && k < outer_n && k < 4; k++) sb_printf(&t->ret, "        spvOuter[%u] = %s[%u];\n", k, outer, k);
+        for (uint32_t k = 0; inner && k < inner_n && k < 2; k++) sb_printf(&t->ret, "        spvInner[%u] = %s[%u];\n", k, inner, k);
+        sb_puts(&t->ret,
+            "        spvPO[0] = spvOuter; spvPO[1] = spvInner;\n"
+            "        if (spvTP.quad) {\n"
+            "            device half *f = spvTF + spvPI * 6u;\n"
+            "            f[0] = half(spvOuter.x); f[1] = half(spvOuter.y); f[2] = half(spvOuter.z); f[3] = half(spvOuter.w);\n"
+            "            f[4] = half(spvInner.x); f[5] = half(spvInner.y);\n"
+            "        } else {\n"
+            "            device half *f = spvTF + spvPI * 4u;\n"
+            "            f[0] = half(spvOuter.x); f[1] = half(spvOuter.y); f[2] = half(spvOuter.z); f[3] = half(spvInner.x);\n"
+            "        }\n");
+        if (patch.p) sb_putn(&t->ret, patch.p, patch.n);
+        sb_puts(&t->ret, "    }\n");
+        free(patch.p); free(outer_s); free(inner_s);
+        return;
+    }
+    // Evaluation.
+    int quad = t->tess_domain == 2;
+    sb_puts(params, ",\n    uint spvPatchId [[patch_id]]");
+    sb_printf(params, ",\n    %s spvTC [[position_in_patch]]", quad ? "float2" : "float3");
+    sb_puts(params, ",\n    uint spvInstanceId [[instance_id]]");
+    sb_printf(params, ",\n    constant spvTessParams& spvTP [[buffer(%u)]]", VKMSL_TESS_PARAMS);
+    sb_printf(params, ",\n    const device float4 *spvCPIn [[buffer(%u)]]", VKMSL_TESS_IN);
+    sb_printf(params, ",\n    const device float4 *spvPIn [[buffer(%u)]]", VKMSL_TESS_CP);
+    sb_printf(prologue, "    uint spvPI = spvInstanceId * spvTP.patches + spvPatchId;\n    const device float4 *spvPV = spvPIn + spvPI * %uu;\n", PS);
+    for (uint32_t i = 0; i < t->iface_count; i++) {
+        uint32_t var = t->iface[i];
+        ent *v = E(t, var);
+        if (v->kind != K_VAR || v->w[2] != SC_Input) continue;
+        uint32_t type = tw(t, v->type)[2], bb = builtin_block_of(t, type);
+        if (v->d.deco & D_BUILTIN) {
+            switch (v->d.builtin) {
+            case BI_TessCoord: sb_printf(in_init, "    _%u = %s;\n", var, quad ? "float3(spvTC, 0.0f)" : "float3(spvTC)"); break;
+            case BI_PrimitiveId: sb_printf(in_init, "    _%u = %s(spvPatchId);\n", var, tname(t, type)); break;
+            case BI_PatchVertices: sb_printf(in_init, "    _%u = %s(spvTP.out_vertices);\n", var, tname(t, type)); break;
+            case BI_TessLevelOuter:
+                for (uint32_t k = 0; k < array_length(t, type) && k < 4; k++) sb_printf(in_init, "    _%u[%u] = spvPV[0][%u];\n", var, k, k);
+                break;
+            case BI_TessLevelInner:
+                for (uint32_t k = 0; k < array_length(t, type) && k < 2; k++) sb_printf(in_init, "    _%u[%u] = spvPV[1][%u];\n", var, k, k);
+                break;
+            default: fail(t, VKMSL_UNSUPPORTED, "evaluation shader built-in input %u", v->d.builtin);
+            }
+            continue;
+        }
+        if (v->d.deco & D_PATCH) {
+            uint32_t loc = v->d.location, mx = 0;
+            char *path = xprintf("_%u", var);
+            slot_leaves(t, type, path, &loc, in_init, "(spvPV + 1)", 1, &mx);
+            free(path);
+            continue;
+        }
+        if (type_op(t, type) != OpTypeArray) { fail(t, VKMSL_UNSUPPORTED, "evaluation shader input that is neither per vertex nor per patch"); continue; }
+        uint32_t elem = tw(t, type)[1], len = array_length(t, type);
+        sb_printf(in_init, "    for (uint spvJ = 0; spvJ < min(spvTP.out_vertices, %uu); spvJ++) {\n", len);
+        char *b = xprintf("(spvCPIn + (spvPI * spvTP.out_vertices + spvJ) * %uu)", CS), *ep = xprintf("_%u[spvJ]", var);
+        if (bb) {
+            for (uint32_t m = 0; m + 1 < E(t, bb)->n; m++) {
+                char *mp = xprintf("%s.m%u", ep, m);
+                builtin_slots(t, mdeco(t, bb, m)->builtin, tw(t, bb)[m + 1], mp, in_init, b, cp_loc, 1);
+                free(mp);
+            }
+        } else { uint32_t loc = v->d.location, mx = 0; slot_leaves(t, elem, ep, &loc, in_init, b, 1, &mx); }
+        sb_puts(in_init, "    }\n");
+        free(b); free(ep);
+    }
+}
+
 // Finds the resource variables a depth-comparison sample reads, back through loads, copies, sampled-image
 // combinations, local variables (their stores), phis and function parameters (their call sites).
 static void mark_depth_compared(T *t) {
@@ -3123,6 +3317,17 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
     if (!t->block_count) { fail(t, VKMSL_INVALID, "entry point has no blocks"); goto out; }
     t->vkernel = t->model == VKMSL_STAGE_VERTEX && (options->flags & VKMSL_FLAG_VERTEX_KERNEL);
     t->gs = t->model == VKMSL_STAGE_GEOMETRY;
+    t->tcs = t->model == VKMSL_STAGE_TESS_CONTROL;
+    t->tes = t->model == VKMSL_STAGE_TESS_EVALUATION;
+    result->tess = (vkmsl_tess){ t->tess_domain, t->tess_spacing, t->tess_order, t->point_mode, t->tess_out_n, 0, 0 };
+    if (t->tes) {
+        // (the domain may be declared by either shader; the evaluation shader's outputs are a vertex shader's)
+        if (!t->tess_domain) t->tess_domain = options->tess.domain;
+        if (t->tess_domain == 3) { fail(t, VKMSL_UNSUPPORTED, "isoline tessellation"); goto out; }
+        if (t->tess_domain != 1 && t->tess_domain != 2) { fail(t, VKMSL_INVALID, "tessellation without a domain"); goto out; }
+        if (!options->tess.out_vertices) { fail(t, VKMSL_INVALID, "evaluation shader without its control shader"); goto out; }
+        t->model = VKMSL_STAGE_VERTEX;
+    }
     if (t->gs) {
         if (t->gs_out_prim != 3) { fail(t, VKMSL_UNSUPPORTED, "geometry shader output other than triangle strips"); goto out; }
         if (!t->gs_in_n) t->gs_in_n = 3;
@@ -3184,12 +3389,14 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
     const char *ret_type = "void";
     uint32_t clip_count = 0;
     if (t->vkernel || t->gs) kernel_interface(t, &in_decl, &in_init, &params, &prologue);
-    for (uint32_t i = 0; i < t->iface_count && !t->vkernel && !t->gs; i++) {
+    else if (t->tcs || t->tes) tess_interface(t, &in_init, &params, &prologue);
+    for (uint32_t i = 0; i < t->iface_count && !t->vkernel && !t->gs && !t->tcs; i++) {
         uint32_t var = t->iface[i];
         ent *v = E(t, var);
         if (v->kind != K_VAR) continue;
         uint32_t sc = v->w[2], type = tw(t, v->type)[2];
         int builtin_block = type_op(t, type) == OpTypeStruct && mdeco(t, type, 0)->deco & D_BUILTIN;
+        if (sc == SC_Input && t->tes) continue;   // (tess_interface)
         if (sc == SC_Input) {
             if (v->d.deco & D_BUILTIN) {
                 const char *decl;
@@ -3249,7 +3456,9 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
                         default: fail(t, VKMSL_UNSUPPORTED, "vertex built-in output %u", bi);
                         }
                     } else if (t->model == VKMSL_STAGE_FRAGMENT) {
-                        if (bi == BI_FragDepth) {
+                        if (bi == BI_FragDepth && (t->opt->flags & VKMSL_FLAG_NO_DEPTH_ATTACHMENT)) {
+                            // no depth attachment: Vulkan drops the value; Metal refuses a depth output without one
+                        } else if (bi == BI_FragDepth) {
                             const char *mode = t->depth_mode == 2 ? "greater" : t->depth_mode == 3 ? "less" : "any";
                             sb_printf(&out_decl, "    float spvDepth [[depth(%s)]];\n", mode);
                             sb_printf(&t->ret, "    spvOut.spvDepth = %s;\n", src);
@@ -3329,16 +3538,19 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
     sb_putn(&src, t->glob.p ? t->glob.p : "", t->glob.n);
 
     snprintf(result->entry_name, sizeof result->entry_name, "vkmain");
-    const char *stage_kw = t->vkernel || t->gs ? "kernel" : t->model == VKMSL_STAGE_VERTEX ? "vertex" :
+    const char *stage_kw = t->vkernel || t->gs || t->tcs ? "kernel" : t->model == VKMSL_STAGE_VERTEX ? "vertex" :
                            t->model == VKMSL_STAGE_FRAGMENT ? "fragment" : t->model == VKMSL_STAGE_COMPUTE ? "kernel" : NULL;
     if (t->vkernel || t->gs)
         sb_puts(&src, "struct spvGsParams { uint count, instances, first, first_instance; int base_vertex; uint indexed, index16, prims;\n"
                       "    uint topology, invocations, in_slots, out_max_tris; };\n");
+    if (t->tcs || t->tes)
+        sb_puts(&src, "struct spvTessParams { uint count, instances, patches, in_vertices, out_vertices, quad, pad0, pad1; };\n");
     if (!stage_kw) { fail(t, VKMSL_UNSUPPORTED, "stage %u", t->model); goto cleanup; }
-    int has_in = in_decl.n > 0, has_out = out_decl.n > 0 && t->model != VKMSL_STAGE_COMPUTE && !t->vkernel && !t->gs;
+    int has_in = in_decl.n > 0, has_out = out_decl.n > 0 && t->model != VKMSL_STAGE_COMPUTE && !t->vkernel && !t->gs && !t->tcs;
     if (has_in) sb_printf(&src, "struct spvInput {\n%s};\n", in_decl.p);
     if (has_out) { sb_printf(&src, "struct spvOutput {\n%s};\n", out_decl.p); ret_type = "spvOutput"; }
     if (t->model == VKMSL_STAGE_FRAGMENT && t->early_tests) { sb_puts(&src, "[[early_fragment_tests]] "); result->early_fragment_tests = 1; }
+    if (t->tes) sb_printf(&src, "[[patch(%s)]] ", t->tess_domain == 2 ? "quad" : "triangle");
     sb_printf(&src, "%s %s vkmain(", stage_kw, ret_type);
     if (has_in) sb_puts(&params, ",\n    spvInput spvIn [[stage_in]]");
     // (params is a list of ",\n    decl": its first separator is dropped)
@@ -3350,7 +3562,7 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
     sb_putn(&src, in_init.p ? in_init.p : "", in_init.n);
     // The body, its returns expanded to the output stores.
     char *ret = has_out ? xprintf("{\n%s    return spvOut;\n}\n", t->ret.p ? t->ret.p : "") :
-                (t->vkernel || t->gs) ? xprintf("{\n%s    return;\n}\n", t->ret.p ? t->ret.p : "") : xstrdup("return;\n");
+                (t->vkernel || t->gs || t->tcs) ? xprintf("{\n%s    return;\n}\n", t->ret.p ? t->ret.p : "") : xstrdup("return;\n");
     // (a geometry shader's EmitVertex: its outputs into spvCur, a triangle once the strip has three vertices)
     char *emit = t->gs ? xprintf("{\n    for (uint i = 0; i < %uu; i++) spvCur[i] = float4(0.0f);\n%s"
         "    if (spvStrip >= 2u && spvTris < %uu) {\n"
@@ -3370,7 +3582,7 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
     }
     free(ret);
     free(emit);
-    if (t->vkernel || t->gs) { sb_putn(&src, t->ret.p ? t->ret.p : "", t->ret.n); sb_puts(&src, "}\n"); }
+    if (t->vkernel || t->gs || t->tcs) { sb_putn(&src, t->ret.p ? t->ret.p : "", t->ret.n); sb_puts(&src, "}\n"); }
     else if (!has_out) sb_puts(&src, "}\n");
     else { sb_putn(&src, t->ret.p ? t->ret.p : "", t->ret.n); sb_puts(&src, "    return spvOut;\n}\n"); }
     if (t->gs) gs_passthrough(t, &src);

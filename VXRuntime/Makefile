@@ -14,6 +14,7 @@ SRC    += src/shlock.c
 SRC    += src/tcptable.c
 SRC    += src/winprops.c
 SRC    += src/a11y.c
+SRC    += src/mfplat.c
 SRC    += src/imagehlp.c src/spellcheck.c src/ime.c src/clipboard.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
@@ -45,7 +46,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/egl_host.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/kernelx.exe build/jobs.exe build/security.exe \
+       build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/egl_host.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/ucrt_extra.exe build/kernelx.exe build/jobs.exe build/security.exe \
        build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/open_thread.exe build/version_info.exe build/section_access.exe build/dbfiles.exe build/updater_files.exe build/shlock.exe build/net_events.exe build/regwait.exe build/tcptable.exe build/winprops.exe build/a11y.exe build/gdi_xform.exe build/view_align.exe \
        build/client_imports.exe build/hello32.exe build/clipboard.exe build/input_route.exe build/name_reuse.exe
 
@@ -58,6 +59,10 @@ build/hello_crt.exe: tests/hello_crt.c
 	$(MINGW) -O1 -o $@ $<
 
 build/game_imports.exe: tests/game_imports.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+build/ucrt_extra.exe: tests/ucrt_extra.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
@@ -189,6 +194,16 @@ build/shellexec.exe: tests/shellexec.c
 
 # Registered waits and timer-queue timers ended with a completion event, as Chromium's ObjectWatcher does (src/system.c).
 build/regwait.exe: tests/regwait.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $<
+
+# Thread-pool callback instances: the *WhenCallbackReturns actions, CallbackMayRunLong, DisassociateCurrentThreadFromCallback.
+tests: build/tp_callbacks.exe build/fiber_pool.exe
+# Fibers as job systems use them: gs:0x20 read inline, fibers moving between threads.
+build/fiber_pool.exe: tests/fiber_pool.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $<
+build/tp_callbacks.exe: tests/tp_callbacks.c
 	@mkdir -p build
 	$(MINGW) -O1 -Wall -o $@ $<
 
@@ -776,7 +791,7 @@ build/vulkan_shaders.exe: tests/vulkan_shaders.c $(wildcard tests/vulkan_shaders
 # The SPIR-V of tests/vulkan_shaders/* is committed (as C arrays): after changing a shader there, run this (needs
 # glslang); the tests themselves need no shader compiler.
 vulkan-test-shaders:
-	cd tests/vulkan_shaders && for f in *.comp *.vert *.frag *.geom; do \
+	cd tests/vulkan_shaders && for f in *.comp *.vert *.frag *.geom *.tesc *.tese; do \
 		glslang -V --target-env vulkan1.2 --vn spv_$$(echo $$f | tr . _) -o $$f.h $$f > /dev/null || exit 1; done
 
 build/vulkan_features.exe: tests/vulkan_features.c build/libvulkan-1.a third_party/vulkan/vulkan/vulkan_core.h
@@ -824,6 +839,11 @@ build/xaudio2.exe: tests/xaudio2.c
 build/dwrite.exe: tests/dwrite.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ldwrite -lgdi32 -lm
+
+# Vulkan images shared with Direct3D 11 through Win32 handles (VK_KHR_external_memory_win32).
+tests: build/vulkan_external.exe
+build/vulkan_external.exe: tests/vulkan_external.c build/libvulkan-1.a third_party/vulkan/vulkan/vulkan_core.h
+	$(MINGW) -O1 -Wall -Ithird_party/vulkan -o $@ $< -Lbuild -lvulkan-1 -ld3d11 -ldxgi -ldxguid -luuid
 
 build/shared.exe: tests/shared.c
 	@mkdir -p build
@@ -1293,6 +1313,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/order.exe
 	$(VXRT) build/hello_crt.exe one "two words"
 	$(VXRT) build/game_imports.exe
+	$(VXRT) build/ucrt_extra.exe
 	$(VXRT) build/security.exe
 	$(VXRT) build/kernelx.exe
 	$(VXRT) build/jobs.exe
@@ -1324,6 +1345,8 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/net.exe
 	$(VXRT) build/net_events.exe
 	$(VXRT) build/regwait.exe
+	$(VXRT) build/tp_callbacks.exe
+	$(VXRT) build/fiber_pool.exe
 	$(VXRT) build/shellexec.exe
 	$(VXRT) build/file_io_ex.exe
 	$(VXRT) build/tcptable.exe
@@ -1378,6 +1401,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/d3d11on12.exe
 	$(VXRT) build/vulkan_features.exe
 	$(VXRT) build/vulkan_shaders.exe
+	$(VXRT) build/vulkan_external.exe
 	$(VXRT) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv \
 		build/vulkan_spirv_uniform_vertex_fixture.spv build/vulkan_spirv_uniform_fragment_fixture.spv
 	$(VXRT) build/input.exe

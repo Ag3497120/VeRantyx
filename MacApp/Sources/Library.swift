@@ -30,6 +30,19 @@ struct Title: Identifiable, Hashable {
     var launcher = false
     /// The game the launcher starts (its lines in the launcher's log are "[vxrt <name>:<pid>] ...").
     var gameExe: String? = nil
+    /// Started by the player's own Windows Steam on VXRuntime (Paths.windowsSteam; scripts/launch_vxrt_nms_vr.sh),
+    /// which they sign in to themselves: the game's executable is wrapped in Steam's DRM (SteamStub), which only that
+    /// Steam answers. It comes from that Steam's own library, not from steamcmd.
+    var windowsSteam = false
+
+    /// Where the game's Windows files come from, and what it starts with.
+    enum Source {
+        /// Valve's steamcmd on the Mac, with the player's account; started with Mac Steam through the bridge.
+        case steamcmd
+        /// The player's Windows Steam on VXRuntime, which downloads and starts it itself (SteamStub games).
+        case windowsSteam
+    }
+    var source: Source { windowsSteam ? .windowsSteam : .steamcmd }
 
     static func == (a: Title, b: Title) -> Bool { a.id == b.id }
     func hash(into h: inout Hasher) { h.combine(id) }
@@ -52,6 +65,10 @@ struct Title: Identifiable, Hashable {
                          "Mac の画面（M1 Max のゲーム中で約 60 fps）でもヘッドセット（30〜35 fps）でも飛べます。キーボード・マウス・DualSense。専用のランチャーが開くので、そこでサインインして PLAY を押します。"),
               works: false, flat: true, args: ["/steam"], vrArgs: ["/vr"],
               captureProxy: "Products/elite-dangerous-odyssey-64/Openvr/win64/openvr_api.dll", launcher: true, gameExe: "EliteDangerous64.exe"),
+        Title(id: "275850", name: "No Man's Sky", bytes: 33_471_534_235, free: false, exe: "NMS.exe",
+              summary: T("Played on the Mac's screen (the planet's terrain drawn). In the headset, picture and sound checked with both the Vision Pro's VeRantyx app and the ALVR app (hand input through ALVR too); 25-40 fps so far. Started by your own Windows Steam, which you sign in to yourself.",
+                         "Mac の画面で遊べました（惑星の地形まで描画）。ヘッドセットは Vision Pro の VeRantyx アプリと ALVR アプリの両方で映像と音を確認（ALVR では手の入力も）。今のところ 25〜40 fps。あなた自身がサインインした Windows 版 Steam から起動します。"),
+              works: false, flat: true, gameExe: "NMS.exe", windowsSteam: true),
     ]
     static func named(_ id: String) -> Title? { all.first { $0.id == id } }
 }
@@ -107,6 +124,34 @@ enum Library {
             for (id, app) in apps(in: dir) where out[id] == nil { out[id] = (app, folder(app, in: dir) ?? dir) }
         }
         return out
+    }
+
+    /// The games of the player's Windows Steam (Paths.windowsSteam) that start from it (Title.windowsSteam), with
+    /// their folders. Only read: that Steam keeps its library itself.
+    static func windowsSteamGames() -> [String: (app: SteamApp, folder: URL)] {
+        var out: [String: (SteamApp, URL)] = [:]
+        for (id, app) in apps(in: Paths.windowsSteam) where Title.named(id)?.windowsSteam == true {
+            // (only a finished install: Steam writes the manifest when it begins one)
+            if let f = folder(app, in: Paths.windowsSteam), windowsSteamProgress(id)?.done != false { out[id] = (app, f) }
+        }
+        return out
+    }
+
+    /// How far Windows Steam is with installing a game, from its app manifest (nil: none yet): StateFlags 4 is "fully
+    /// installed" (with 2 too when an update waits: still installed); BytesDownloaded of BytesToDownload while it downloads.
+    static func windowsSteamProgress(_ id: String) -> (done: Bool, fraction: Double?)? {
+        let url = Paths.windowsSteam.appendingPathComponent("steamapps/appmanifest_\(id).acf")
+        guard let data = FileManager.default.contents(atPath: url.path) else { return nil }
+        let text = String(decoding: data, as: UTF8.self)
+        func number(_ key: String) -> Double? {
+            guard let re = try? NSRegularExpression(pattern: "\"\(key)\"\\s+\"([0-9]+)\"", options: .caseInsensitive),
+                  let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  let r = Range(m.range(at: 1), in: text) else { return nil }
+            return Double(text[r])
+        }
+        let flags = Int(number("StateFlags") ?? 0)
+        let total = number("BytesToDownload") ?? 0
+        return (flags & 4 != 0, total > 0 ? min(1, (number("BytesDownloaded") ?? 0) / total) : nil)
     }
 
     // MARK: executables

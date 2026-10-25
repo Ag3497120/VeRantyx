@@ -527,6 +527,41 @@ static WINAPI LONG QuerySecurityPackageInfoW(const WCHAR *package, void **info) 
 static WINAPI LONG QuerySecurityPackageInfoA(const char *package, void **info) {
     (void)package; if (info) *info = NULL; return SEC_E_SECPKG_NOT_FOUND;
 }
+// EnumerateSecurityPackages: there are none.
+static WINAPI LONG EnumerateSecurityPackagesW(DWORD *count, void **info) { if (count) *count = 0; if (info) *info = NULL; return 0; }
+static WINAPI LONG EnumerateSecurityPackagesA(DWORD *count, void **info) { if (count) *count = 0; if (info) *info = NULL; return 0; }
+static WINAPI LONG sspi_table_unsupported(void) { return (LONG)0x80090302; }   // SEC_E_UNSUPPORTED_FUNCTION
+// InitSecurityInterface: the SecurityFunctionTable (sspi.h) of this DLL's own functions, the way libcurl's Schannel
+// backend reaches SSPI; with no packages, acquiring credentials fails and the caller reports its connection failed.
+// The table's slots in order, from dwVersion's 8 bytes on; NULL names are reserved slots.
+static const char *const sspi_slots[] = {
+    "EnumerateSecurityPackages%s", "QueryCredentialsAttributes%s", "AcquireCredentialsHandle%s", "FreeCredentialsHandle", NULL,
+    "InitializeSecurityContext%s", "AcceptSecurityContext", "CompleteAuthToken", "DeleteSecurityContext", "ApplyControlToken",
+    "QueryContextAttributes%s", "ImpersonateSecurityContext", "RevertSecurityContext", "MakeSignature", "VerifySignature",
+    "FreeContextBuffer", "QuerySecurityPackageInfo%s", NULL, NULL, "ExportSecurityContext", "ImportSecurityContext%s",
+    "AddCredentials%s", NULL, "QuerySecurityContextToken", "EncryptMessage", "DecryptMessage", "SetContextAttributes%s",
+    "SetCredentialsAttributes%s", "ChangeAccountPassword%s", "QueryContextAttributesEx%s", "QueryCredentialsAttributesEx%s",
+};
+static void *g_sspi_tables[2][1 + sizeof sspi_slots / sizeof sspi_slots[0]];
+static void sspi_fill(void) {
+    for (int w = 0; w < 2; w++) {
+        g_sspi_tables[w][0] = (void *)(uintptr_t)4;                   // dwVersion: SECURITY_SUPPORT_PROVIDER_INTERFACE_VERSION_4
+        for (size_t i = 0; i < sizeof sspi_slots / sizeof sspi_slots[0]; i++) {
+            if (!sspi_slots[i]) continue;
+            char name[64];
+            snprintf(name, sizeof name, sspi_slots[i], w ? "W" : "A");
+            void *fn = vx_find_export("secur32.dll", name);
+            g_sspi_tables[w][1 + i] = fn ? fn : (void *)sspi_table_unsupported;
+        }
+    }
+}
+static void *sspi_table(int wide) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, sspi_fill);
+    return g_sspi_tables[wide];
+}
+static WINAPI void *InitSecurityInterfaceW(void) { return sspi_table(1); }
+static WINAPI void *InitSecurityInterfaceA(void) { return sspi_table(0); }
 
 // ---- oleaut32: what libcef.dll imports by ordinal -------------------------------------------------------------------
 // The ordinals (OLEAUT32's export numbers, a fixed ABI) and their functions: 77 SafeArrayGetVartype, 161 LoadTypeLib,
@@ -679,7 +714,8 @@ static const vx_export secur32[] = {
     VX_EXPORT(GetUserNameExW), VX_EXPORT(GetUserNameExA), VX_EXPORT(LsaConnectUntrusted), VX_EXPORT(LsaRegisterLogonProcess),
     VX_EXPORT(LsaDeregisterLogonProcess), VX_EXPORT(LsaLookupAuthenticationPackage), VX_EXPORT(LsaLogonUser),
     VX_EXPORT(LsaCallAuthenticationPackage), VX_EXPORT(LsaFreeReturnBuffer), VX_EXPORT(QuerySecurityPackageInfoW),
-    VX_EXPORT(QuerySecurityPackageInfoA),
+    VX_EXPORT(QuerySecurityPackageInfoA), VX_EXPORT(EnumerateSecurityPackagesW), VX_EXPORT(EnumerateSecurityPackagesA),
+    VX_EXPORT(InitSecurityInterfaceW), VX_EXPORT(InitSecurityInterfaceA),
 };
 static vx_export oleaut32[] = {
     { "#77", NULL },                               // SafeArrayGetVartype (com.c), filled in below

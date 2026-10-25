@@ -291,7 +291,16 @@ void __attribute__((noreturn)) vx_cxx_throw(void *obj, const throw_info *ti, voi
 
 // ---- helpers ---------------------------------------------------------------------------------------------------------------------
 static WINAPI void std_terminate(void) { terminate_now("called"); }
-static WINAPI int purecall(void) { terminate_now("pure virtual function call"); }
+// _set_purecall_handler: a call of a pure virtual function goes to the program's handler first, if it set one.
+typedef void (WINAPI *purecall_handler)(void);
+static purecall_handler g_purecall_handler;
+static WINAPI purecall_handler set_purecall_handler(purecall_handler h) { return __atomic_exchange_n(&g_purecall_handler, h, __ATOMIC_ACQ_REL); }
+static WINAPI purecall_handler get_purecall_handler(void) { return __atomic_load_n(&g_purecall_handler, __ATOMIC_ACQUIRE); }
+static WINAPI int purecall(void) {
+    purecall_handler h = get_purecall_handler();
+    if (h) h();
+    terminate_now("pure virtual function call");
+}
 // __std_exception_data: the message and whether this copy owns it.
 typedef struct { const char *what; uint8_t do_free; } exception_data;
 static WINAPI void std_exception_copy(const exception_data *from, exception_data *to) {
@@ -411,6 +420,7 @@ static vx_export g_vcruntime[] = {
     { "__CxxFrameHandler4", (void *)CxxFrameHandler4 }, { "__GSHandlerCheck_EH", (void *)GSHandlerCheck_EH },
     { "__GSHandlerCheck", (void *)GSHandlerCheck },
     { "__std_terminate", (void *)std_terminate }, { "_purecall", (void *)purecall },
+    { "_set_purecall_handler", (void *)set_purecall_handler }, { "_get_purecall_handler", (void *)get_purecall_handler },
     { "__std_exception_copy", (void *)std_exception_copy }, { "__std_exception_destroy", (void *)std_exception_destroy },
     { "__std_type_info_compare", (void *)std_type_info_compare }, { "__std_type_info_hash", (void *)std_type_info_hash },
     { "__std_type_info_name", (void *)std_type_info_name }, { "__std_type_info_destroy_list", (void *)std_type_info_destroy_list },

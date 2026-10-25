@@ -85,6 +85,7 @@ Prefer Terminal? `scripts/setup_vxrt.sh` then `scripts/launch_vxrt_alyx.sh` — 
 | **Half-Life: Alyx** | ✅ Playable — played in the headset across level changes and saves | 60 fps at the 3K preset (1440×1620 per eye), MacBook Pro M1 Max |
 | **Google Earth VR** | 🟡 Runs in VR, playtest pending | 56.7 fps, M1 Max |
 | **Elite Dangerous** | 🟡 Flies on the Mac's screen and in the headset (official launcher; keyboard, mouse, DualSense) | flat: about 52-122 fps in game; VR: 30-35 fps at 1700×1372 per eye; M1 Max, Low |
+| **No Man's Sky** | 🟡 Played on the Mac's screen (terrain drawn); in VR, picture and sound checked with both the Vision Pro's VeRantyx app and the ALVR app (hand input through ALVR too). Started by your own Windows Steam on VXRuntime (its DRM wrapper needs that Steam; you sign in yourself) | headset: 25-40 fps so far (not a harness measurement) |
 | **The Lab** | 🟡 Runs in VR (title scene), playtest pending; its controller bindings load since 0.2.0 | 54.0 fps, M1 Max |
 | Other SteamVR games | ⚪ Most still need Windows functions VXRuntime lacks | [games/](games/) has what is known |
 

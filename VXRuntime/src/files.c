@@ -368,7 +368,7 @@ static WINAPI BOOL ReadFile(HANDLE h, void *buf, DWORD n, DWORD *got, OVERLAPPED
     if (r < 0) { vx_set_last_error(vx_file_io_error(fd, errno)); if (got) *got = 0; return 0; }
     if (got) *got = (DWORD)r;
     if (ov) {
-        if (!r && n) { vx_io_completed(h, ov, 0, 38 /* ERROR_HANDLE_EOF */); vx_set_last_error(38); return 0; }
+        if (!r && n) { vx_io_failed(ov, 38 /* ERROR_HANDLE_EOF */); vx_set_last_error(38); return 0; }   // (no packet)
         if (fd > 2) lseek(fd, at + r, SEEK_SET);
         vx_io_completed(h, ov, (DWORD)r, 0);
     }

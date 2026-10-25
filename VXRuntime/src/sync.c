@@ -58,11 +58,13 @@ static pthread_cond_t g_changed = PTHREAD_COND_INITIALIZER;     // suspended thr
 // held left Steam's web helper with every thread waiting for g_lock. Such a thread is signalled again until it is
 // stopped outside (the lock is held for short stretches only).
 static pthread_t g_lock_owner;
+void vx_fiber_slot_refresh(void);   // (fibers, below: after a change of this thread's QoS)
 static inline void glock(void) { pthread_mutex_lock(&g_lock); __atomic_store_n(&g_lock_owner, pthread_self(), __ATOMIC_RELEASE); }
 static inline void gunlock(void) { __atomic_store_n(&g_lock_owner, (pthread_t)NULL, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_lock); }
 // The thread waits in one of the runtime's blocking waits (vx_wait_begin/end): SuspendThread may stop it while the
 // wait is in the kernel, where it holds none of the runtime's locks (on_suspend_signal).
 __thread int vx_in_wait;
+__thread int vx_no_stop;                                         // (vx.h)
 static inline int gwait(pthread_cond_t *c) {
     __atomic_store_n(&g_lock_owner, (pthread_t)NULL, __ATOMIC_RELEASE);
     vx_in_wait++;
@@ -557,13 +559,16 @@ static int pc_native(uintptr_t pc) {
 // A thread is not stopped inside a system library, where it may hold a lock of the C library or malloc that the
 // suspender's next calls need (Chromium's sampling profiler, which suspends threads many times a second, left Steam's
 // web helper with every thread waiting when one was stopped in getenv, in CreateFileMapping's name lookup, while
-// another held g_lock waiting for getenv): only in the program's code, in this runtime's (not holding g_lock), or in
-// one of the runtime's blocking waits, in the kernel. Such a thread is signalled again until it is in one of those.
+// another held g_lock waiting for getenv): only in the program's code, in this runtime's (not holding g_lock, nor a
+// lock counted in vx_no_stop: one stopped in VirtualAlloc holding the address space's lock left Chromium's sampler
+// waiting in VirtualQuery for good), or in one of the runtime's blocking waits, in the kernel. Such a thread is
+// signalled again until it is in one of those.
 static void on_suspend_signal(int sig, siginfo_t *si, void *uc) {
     (void)sig; (void)si;
     vx_object *t = t_self;
     if (!t || !t->context || !__atomic_load_n(&t->suspended, __ATOMIC_SEQ_CST)) return;   // (a stop already seen)
     if (may_hold_g_lock()) return;                                      // (SuspendThread signals again)
+    if (vx_no_stop) return;                                             // (holds a lock the suspender may want: again)
 #ifdef __aarch64__
     if (vx_arm64_interrupt()) return;                                   // (in the vCPU guest: it stops as it leaves)
     uintptr_t pc = (uintptr_t)((const ucontext_t *)uc)->uc_mcontext->__ss.__pc;
@@ -678,6 +683,7 @@ static BOOL background_mode(HANDLE h, int begin) {
     gunlock();
     if (err) { vx_set_last_error(err); return 0; }
     pthread_set_qos_class_self_np(begin ? QOS_CLASS_BACKGROUND : qos_for(p), 0);
+    vx_fiber_slot_refresh();
     return 1;
 }
 static WINAPI BOOL SetThreadPriority(HANDLE h, int p) {
@@ -689,7 +695,7 @@ static WINAPI BOOL SetThreadPriority(HANDLE h, int p) {
     if (t) t->priority = p;
     gunlock();
     if (!t) { vx_set_last_error(6); return 0; }
-    if (self && !background) pthread_set_qos_class_self_np(qos_for(p), 0);   // (in background mode until it ends)
+    if (self && !background) { pthread_set_qos_class_self_np(qos_for(p), 0); vx_fiber_slot_refresh(); }   // (in background mode until it ends)
     else if (!self && raise && pt) pthread_override_qos_class_start_np(pt, qos_for(p), 0);
     return 1;
 }
@@ -1236,6 +1242,7 @@ static WINAPI DWORD SleepEx(DWORD ms, BOOL alertable) {
 }
 
 // ---- handles -----------------------------------------------------------------------------------------------------------------
+static void forget_association(HANDLE h);                          // (I/O completion ports, below)
 static WINAPI BOOL CloseHandle(HANDLE h) {
     intptr_t v = (intptr_t)h;
     if (v <= -1 && v >= -6) return 1;                              // process, thread and token pseudo-handles (-4..-6: tokens)
@@ -1243,6 +1250,7 @@ static WINAPI BOOL CloseHandle(HANDLE h) {
     int i = handle_index(h);
     vx_object *o = i >= 0 ? g_handles[i] : NULL;
     if (o) { g_handles[i] = NULL; if (i < g_free_hint) g_free_hint = i; unref(o); }
+    forget_association(h);                                          // (the number may be given to another file)
     intptr_t k = ((intptr_t)h - INJECT_BASE) / 4;
     if (!o && (intptr_t)h >= INJECT_BASE && k < INJECT_COUNT && !(((intptr_t)h - INJECT_BASE) % 4) && g_injected[k]) {
         o = g_injected[k]; g_injected[k] = NULL; unref(o);
@@ -1663,10 +1671,16 @@ static WINAPI BOOL SleepConditionVariableSRW(uint64_t *cv, void *l, DWORD ms, DW
 
 // ---- fibers ---------------------------------------------------------------------------------------------------------------------
 // A fiber is a stack and the registers to resume it; SwitchToFiber swaps stacks on the same thread (context.S).
-// The fiber running on a thread is in its TEB (FiberData, TEB+0x20), but Windows code that reads it directly
-// (GetCurrentFiber, gs:0x20) would find macOS's QoS slot there instead; so ConvertThreadToFiber on a thread that
-// is a fiber already returns that fiber instead of failing (the programs seen read gs:0x20 only after such a
-// failure), and conversions are counted. Fiber-local storage stays per thread.
+// The fiber running on a thread is in its TEB (FiberData, TEB+0x20). MSVC's GetCurrentFiber and GetFiberData are
+// inline reads of gs:0x20, which on x86-64 macOS is the pthread's TSD slot 4, where libpthread keeps the thread's QoS
+// (pthread_priority_t). So on a thread that is a fiber, the slot holds the running fiber too, set again after the
+// runtime changes the thread's QoS (SetThreadPriority). No Man's Sky's job threads raise their priority and then
+// switch to GetCurrentFiber()'s value: they were given the QoS value 0x10ff (user-interactive) and faulted at 0x110f.
+// What macOS reads from the slot as a priority must stay harmless: fibers are placed at 4 GB-aligned addresses, whose
+// low 32 bits (all of pthread_priority_t's QoS and flag bits) are zero, read as "no QoS". A fiber may be resumed on
+// another thread than the one it left (job systems do so): after a switch the thread is found again.
+// ConvertThreadToFiber on a thread that is a fiber already returns that fiber instead of failing; conversions are
+// counted. Fiber-local storage stays per thread.
 typedef struct vx_fiber {
     void *param;                     // first, as GetFiberData reads it
     void *sp;                        // saved stack pointer while not running
@@ -1681,20 +1695,64 @@ typedef struct vx_fiber {
 #define TEB_FIBER_DATA 0x20
 void vx_fiber_switch(void **save_sp, void *new_sp);
 static vx_fiber **current_fiber_slot(void) { return (vx_fiber **)(vx_teb() + TEB_FIBER_DATA); }
+#ifndef __aarch64__
+// Fiber records at 4 GB-aligned addresses (see above); deleted ones are kept for reuse.
+static vx_fiber *g_fiber_free;
+static uint64_t g_fiber_next = 0x200000000000ull;
+static vx_fiber *fiber_alloc(void) {
+    glock();
+    vx_fiber *f = g_fiber_free;
+    if (f) g_fiber_free = f->param;
+    for (int tries = 0; !f && tries < 4096; tries++) {
+        uint64_t want = g_fiber_next;
+        g_fiber_next += 1ull << 32;
+        if (g_fiber_next >= 0x7f0000000000ull) g_fiber_next = 0x200000000000ull;
+        void *p = mmap((void *)(uintptr_t)want, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) continue;
+        if ((uint64_t)(uintptr_t)p != want) { munmap(p, 16384); continue; }
+        f = p;
+    }
+    gunlock();
+    if (f) memset(f, 0, sizeof *f);
+    return f;
+}
+static void fiber_release(vx_fiber *f) { glock(); f->param = g_fiber_free; g_fiber_free = f; gunlock(); }
+static __thread uint64_t t_qos_slot;              // what slot 4 held before the thread became a fiber
+static __thread int t_qos_saved;
+static void gs_fiber_set(vx_fiber *f) {
+    if (f && !t_qos_saved) { __asm__ volatile("movq %%gs:0x20, %0" : "=r"(t_qos_slot)); t_qos_saved = 1; }
+    uint64_t v = f ? (uint64_t)(uintptr_t)f : t_qos_slot;
+    __asm__ volatile("movq %0, %%gs:0x20" :: "r"(v) : "memory");
+    if (!f) t_qos_saved = 0;
+}
+#else
+static vx_fiber *fiber_alloc(void) { return calloc(1, sizeof(vx_fiber)); }
+static void fiber_release(vx_fiber *f) { free(f); }
+static void gs_fiber_set(vx_fiber *f) { (void)f; }
+#endif
+// After the runtime changed this thread's QoS (which rewrites the slot): the running fiber put back.
+void vx_fiber_slot_refresh(void) {
+#ifndef __aarch64__
+    vx_fiber *f = *current_fiber_slot();
+    if (f) { __asm__ volatile("movq %%gs:0x20, %0" : "=r"(t_qos_slot)); __asm__ volatile("movq %0, %%gs:0x20" :: "r"(f) : "memory"); }
+#endif
+}
 static WINAPI void *ConvertThreadToFiberEx(void *param, DWORD flags) {
     (void)flags;
     vx_fiber **cur = current_fiber_slot();
     if (*cur) { (*cur)->converted++; return *cur; }
-    vx_fiber *f = calloc(1, sizeof *f);
+    vx_fiber *f = fiber_alloc();
+    if (!f) { vx_set_last_error(8); return NULL; }
     f->param = param; f->converted = 1;
     *cur = f;
+    gs_fiber_set(f);
     return f;
 }
 static WINAPI void *ConvertThreadToFiber(void *param) { return ConvertThreadToFiberEx(param, 0); }
 static WINAPI BOOL ConvertFiberToThread(void) {
     vx_fiber **cur = current_fiber_slot();
     if (!*cur) { vx_set_last_error(1280 /* ERROR_ALREADY_THREAD */); return 0; }
-    if (--(*cur)->converted <= 0 && !(*cur)->stack) { free(*cur); *cur = NULL; }
+    if (--(*cur)->converted <= 0 && !(*cur)->stack) { fiber_release(*cur); *cur = NULL; gs_fiber_set(NULL); }
     return 1;
 }
 static WINAPI BOOL IsThreadAFiber(void) { return *current_fiber_slot() != NULL; }
@@ -1716,7 +1774,8 @@ static WINAPI void *CreateFiberEx(uint64_t commit, uint64_t reserve, DWORD flags
     uint8_t *stack = mmap(NULL, size + page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (stack == MAP_FAILED) { vx_set_last_error(8); return NULL; }
     mprotect(stack, page, PROT_NONE);                              // a guard page below the stack
-    vx_fiber *f = calloc(1, sizeof *f);
+    vx_fiber *f = fiber_alloc();
+    if (!f) { munmap(stack, size + page); vx_set_last_error(8); return NULL; }
     f->param = param; f->start = start;
     f->stack = stack; f->stack_size = size + page; f->stack_top = stack + size + page;
     // The frame vx_fiber_switch pops: MXCSR and x87 control word, r15 r14 r13 r12 rbx rbp, then the return
@@ -1784,8 +1843,10 @@ static WINAPI void SwitchToFiber(void *to) {
         *(void **)(teb + 0x10) = f->stack;
     }
     *cur = f;
+    gs_fiber_set(f);
     vx_fiber_switch(&from->sp, f->sp);
-    // Back on this fiber.
+    // Back on this fiber, perhaps on another thread (whose SwitchToFiber made it the current one there).
+    teb = vx_teb();
     if (from->stack) { *(void **)(teb + 8) = from->stack_top; *(void **)(teb + 0x10) = from->stack; }
     else {
         pthread_t self = pthread_self();
@@ -1798,7 +1859,7 @@ static WINAPI void DeleteFiber(void *fiber) {
     if (!f) return;
     if (f == *current_fiber_slot()) ExitThread(0);                 // deleting the running fiber ends the thread
     if (f->stack) munmap(f->stack, f->stack_size);
-    free(f);
+    fiber_release(f);
 }
 
 // ---- fiber-local storage --------------------------------------------------------------------------------------------------------
@@ -1864,9 +1925,30 @@ static WINAPI uint16_t QueryDepthSList(slist_header *h) { return (uint16_t)h->de
 // ---- I/O completion ports ---------------------------------------------------------------------------------------------------------
 // A port is a queue of completion packets. I/O here completes at once, so a read or write with an OVERLAPPED on
 // a handle associated with a port posts its packet right away; waiters take packets in order.
-typedef struct { HANDLE handle, port; uint64_t key; int skip_on_success; } association;
+// An association belongs to the handle's file, not to the handle's number: when the handle is closed it is marked
+// closed, and a file opened later that gets the same number has none (CreateIoCompletionPort's documentation: the
+// association lasts as long as the handle). Steam's web helper crashed after every sign-in when a file it read with an
+// OVERLAPPED of its own, synchronously, got the number of a closed one Chromium's disk cache had associated: the
+// read's packet went to that port with the disk cache's key, and its completion handler took the program's OVERLAPPED
+// for its own (libcef.dll, a call through a vtable of 0xaaaaaaaaaaaaaaaa). An operation that was still running when
+// its handle was closed (its OVERLAPPED's Internal still STATUS_PENDING: pipes, sockets) completes to the port it
+// was started on, as an aborted one does on Windows.
+typedef struct { HANDLE handle, port; uint64_t key; int skip_on_success, closed; } association;
 static association g_assoc[1024];
 static int g_assoc_count;
+static void forget_association(HANDLE h) {                          // g_lock held
+    for (int i = 0; i < g_assoc_count; i++) if (g_assoc[i].handle == h) g_assoc[i].closed = 1;
+}
+void vx_io_forget(HANDLE h) { glock(); forget_association(h); gunlock(); }
+static association *find_association(HANDLE h, int closed_too) {      // g_lock held; an open one first
+    association *c = NULL;
+    for (int i = 0; i < g_assoc_count; i++) {
+        if (g_assoc[i].handle != h) continue;
+        if (!g_assoc[i].closed) return &g_assoc[i];
+        if (closed_too) c = &g_assoc[i];
+    }
+    return c;
+}
 
 static void post_packet(vx_object *port, DWORD bytes, uint64_t key, void *ov, DWORD status) {   // g_lock held
     packet *p = calloc(1, sizeof *p);
@@ -1889,10 +1971,12 @@ static WINAPI HANDLE CreateIoCompletionPort(HANDLE file, HANDLE existing, uint64
         gunlock(); vx_set_last_error(87); return NULL;
     }
     if (file != (HANDLE)(intptr_t)-1) {
-        int i = 0;
-        while (i < g_assoc_count && g_assoc[i].handle != file) i++;
-        if (i == g_assoc_count && g_assoc_count < 1024) g_assoc_count++;
-        if (i < 1024) g_assoc[i] = (association){ file, port, key, 0 };
+        association *a = find_association(file, 0);                // (a handle is associated once: replaced here)
+        for (int i = 0; !a && i < g_assoc_count; i++) if (g_assoc[i].closed && g_assoc[i].handle == file) a = &g_assoc[i];
+        for (int i = 0; !a && i < g_assoc_count; i++) if (g_assoc[i].closed) a = &g_assoc[i];
+        if (!a && g_assoc_count < 1024) a = &g_assoc[g_assoc_count++];
+        if (!a) { gunlock(); vx_log("CreateIoCompletionPort: more than 1024 handles associated"); vx_set_last_error(1450); return NULL; }
+        *a = (association){ file, port, key, 0, 0 };
     }
     gunlock();
     return port;
@@ -1900,7 +1984,8 @@ static WINAPI HANDLE CreateIoCompletionPort(HANDLE file, HANDLE existing, uint64
 #define FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 1
 static WINAPI BOOL SetFileCompletionNotificationModes(HANDLE file, uint8_t flags) {
     glock();
-    for (int i = 0; i < g_assoc_count; i++) if (g_assoc[i].handle == file) g_assoc[i].skip_on_success = flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
+    association *a = find_association(file, 0);
+    if (a) a->skip_on_success = flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
     gunlock();
     return 1;
 }
@@ -1909,21 +1994,29 @@ static WINAPI BOOL SetFileCompletionNotificationModes(HANDLE file, uint8_t flags
 void vx_io_completed(HANDLE file, void *ov, DWORD bytes, DWORD status) {
     if (!ov) return;
     uint64_t *o = ov;
+    int was_pending = o[0] == 0x103;                               // STATUS_PENDING: started before now (see association)
     o[0] = status; o[1] = bytes;
     HANDLE event = *(HANDLE *)((uint8_t *)ov + 24);
     glock();
     vx_object *e = lookup((HANDLE)((uintptr_t)event & ~(uintptr_t)1));
     if (e && e->type == OBJ_EVENT) { e->signaled = 1; notify(e); }
-    if (!((uintptr_t)event & 1)) {
-        for (int i = 0; i < g_assoc_count; i++) {
-            if (g_assoc[i].handle != file) continue;
-            vx_object *port = lookup(g_assoc[i].port);
-            if (port && port->type == OBJ_PORT && !(status == 0 && g_assoc[i].skip_on_success)) post_packet(port, bytes, g_assoc[i].key, ov, status);
-            break;
-        }
+    association *a = (uintptr_t)event & 1 ? NULL : find_association(file, was_pending);
+    if (a) {
+        vx_object *port = lookup(a->port);
+        if (port && port->type == OBJ_PORT && !(status == 0 && a->skip_on_success)) post_packet(port, bytes, a->key, ov, status);
     }
     pthread_cond_broadcast(&g_changed);
     gunlock();
+}
+// Microsoft's documentation of ReadFile, WSARecv and I/O completion ports: an operation that fails at once queues no
+// completion packet and gives no other completion indication; one only comes for an operation that succeeded at once
+// or returned ERROR_IO_PENDING. Steam's web helper (Chromium's disk cache) frees an operation's context when the
+// call fails; a packet posted anyway for a read at the end of a file brought its completion handler back to that freed
+// context (libcef.dll, a call through a vtable of 0xaaaaaaaaaaaaaaaa) and the web helper crashed after every sign-in.
+void vx_io_failed(void *ov, DWORD status) {
+    if (!ov) return;
+    uint64_t *o = ov;
+    o[0] = status; o[1] = 0;
 }
 static WINAPI BOOL PostQueuedCompletionStatus(HANDLE port, DWORD bytes, uint64_t key, void *ov) {
     glock();

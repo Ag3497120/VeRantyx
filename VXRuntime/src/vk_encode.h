@@ -56,6 +56,7 @@ typedef struct vk_enc {
     VkCullModeFlags cull;
     VkFrontFace front;
     VkPrimitiveTopology topology;
+    int primitive_restart, primitive_restart_set;
     int dyn_depth_test, dyn_depth_write, dyn_stencil_test;
     VkCompareOp dyn_depth_compare;
     VkStencilOp dyn_stencil_ops[2][3];

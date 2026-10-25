@@ -2,6 +2,8 @@
 // attachments inside a render pass and of whole images outside one, buffer fills with a 32-bit pattern, query copies.
 #include "vk_impl.h"
 #include "vk_encode.h"
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -423,3 +425,30 @@ VkResult vk_present_blit(VkQueue q, id<MTLCommandBuffer> cb, VkImage img, id<MTL
 #ifdef __aarch64__
 #include "thunks/vk_internal.m.inc"
 #endif
+
+// ---- messages logged once ----------------------------------------------------------------------------------------
+int vk_log_once(const char *kind, uint32_t value) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static struct { const char *kind; uint32_t value; } seen[512];
+    static uint32_t count;
+    int first = 1;
+    pthread_mutex_lock(&lock);
+    for (uint32_t i = 0; i < count; i++)
+        if (seen[i].value == value && !strcmp(seen[i].kind, kind)) { first = 0; break; }
+    if (first) {
+        if (count < 512) { seen[count].kind = kind; seen[count].value = value; count++; }
+        else first = 0;   // (past that many kinds: quiet)
+    }
+    pthread_mutex_unlock(&lock);
+    return first;
+}
+void vk_log_unique(const char *fmt, ...) {
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    uint32_t h = 2166136261u;
+    for (const char *c = msg; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+    if (vk_log_once("message", h)) vx_log("%s", msg);
+}
