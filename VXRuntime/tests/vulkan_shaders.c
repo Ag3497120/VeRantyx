@@ -7,7 +7,8 @@
 //   sampling: BC1, sRGB, B10G11R11, a mip chain made with blits, a depth comparison (D24S8 where the device has it),
 //             a repeating sampler
 //   drawing:  two color targets (sRGB, B10G11R11) at 4x MSAA resolved by dynamic rendering, an input attachment read
-//             in a second subpass, a geometry shader writing gl_Layer of a two-layer target
+//             in a second subpass, a geometry shader writing gl_Layer of a two-layer target, a two-component output
+//             to an RGBA8 target with gl_FragDepth written and no depth attachment
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,7 @@
 #include "vulkan_shaders/solid.frag.h"
 #include "vulkan_shaders/subpass.frag.h"
 #include "vulkan_shaders/layer.geom.h"
+#include "vulkan_shaders/narrow.frag.h"
 
 static int bad;
 static const char *test = "";
@@ -624,6 +626,36 @@ static void geometry_layer(void) {
     printf("vulkan_shaders: geometry shader to gl_Layer 1: layer 0 %d %d %d, layer 1 %d %d %d\n", l0[0], l0[1], l0[2], l1[0], l1[1], l1[2]);
 }
 
+// ---- drawing: fewer output components than the target has, FragDepth with no depth attachment ----------------------
+static void narrow_output(void) {
+    test = "narrow output";
+    enum { S = 4 };
+    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    img target = make_image(format, S, S, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    VkImageView view = make_view(target.image, VK_IMAGE_VIEW_TYPE_2D, format, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    VkPipelineLayout pl = pipeline_layout(NULL, 0, 0);
+    VkPipeline p = graphics(MODULE(spv_fullscreen_vert), 0, MODULE(spv_narrow_frag), pl, &format, 1, VK_SAMPLE_COUNT_1_BIT, 0, 0);
+    if (!p) return;
+    buf readback = make_buffer(S * S * 4, 0);
+    VkCommandBuffer cb = begin();
+    to_general(cb, target.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkRenderingAttachmentInfo a = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .color = { .float32 = { 0, 0, 0, 0 } } } };
+    VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { S, S } }, .layerCount = 1,
+                           .colorAttachmentCount = 1, .pColorAttachments = &a };
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    viewport(cb, S, S);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    barrier(cb);
+    to_buffer(cb, target.image, 0, 0, S, S, readback.buffer, 0);
+    submit(cb);
+    const uint8_t *c = readback.map + (2 * S + 1) * 4;
+    CHECK(c[0] >= 63 && c[0] <= 64 && c[1] >= 191 && c[1] <= 192);   // red and green as written (blue, alpha undefined)
+    printf("vulkan_shaders: vec2 to RGBA8 with FragDepth and no depth attachment: %d %d\n", c[0], c[1]);
+}
+
 int main(void) {
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vulkan_shaders", .apiVersion = VK_API_VERSION_1_3 };
     VkInstanceCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
@@ -664,6 +696,7 @@ int main(void) {
     mrt_msaa();
     subpasses();
     geometry_layer();
+    narrow_output();
 
     vkDeviceWaitIdle(device);
     vkDestroyDevice(device, NULL);

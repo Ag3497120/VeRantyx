@@ -82,7 +82,8 @@ typedef struct {
 enum {
     VKMSL_FLAG_NO_FLIP_Y = 1u << 0,       // keep gl_Position.y (Vulkan's clip y points down, Metal's up: negated)
     VKMSL_FLAG_RASTERIZER_DISCARD = 1u << 1,
-    VKMSL_FLAG_VERTEX_KERNEL = 1u << 2    // a vertex shader as the kernel before a geometry shader
+    VKMSL_FLAG_VERTEX_KERNEL = 1u << 2,   // a vertex shader as the kernel before a geometry shader
+    VKMSL_FLAG_NO_DEPTH_ATTACHMENT = 1u << 3   // fragment shaders: the pass has no depth attachment (FragDepth dropped)
 };
 
 typedef struct {

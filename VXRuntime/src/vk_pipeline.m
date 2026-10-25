@@ -265,7 +265,10 @@ static VkResult create_graphics(VkDevice dev, const VkGraphicsPipelineCreateInfo
         gf = compile_stage(dev, gs, VKMSL_STAGE_GEOMETRY, &p->layout, 0, vr.vary_locations, &gr, &lib, &err);
         if (gf) pass = [lib newFunctionWithName:@"vkpass"];
     }
-    if (vf && (!gs || pass) && fs && !p->rasterizer_discard) ff = compile_stage(dev, fs, VKMSL_STAGE_FRAGMENT, &p->layout, 0, 0, &fr, NULL, &err);
+    attachment_formats pass_formats;
+    formats_of(info, &pass_formats);
+    uint32_t fs_flags = pass_formats.depth == VK_FORMAT_UNDEFINED ? VKMSL_FLAG_NO_DEPTH_ATTACHMENT : 0;
+    if (vf && (!gs || pass) && fs && !p->rasterizer_discard) ff = compile_stage(dev, fs, VKMSL_STAGE_FRAGMENT, &p->layout, fs_flags, 0, &fr, NULL, &err);
     if (!vf || (gs && !pass) || (fs && !p->rasterizer_discard && !ff)) {
         vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr);
         pipeline_free(p);

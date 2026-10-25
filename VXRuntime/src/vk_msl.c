@@ -1290,10 +1290,14 @@ static void varying_leaves(T *t, leafctx *c, uint32_t type, const char *path, ui
         sb_printf(c->init, "    spvOut.v%u = %s;\n", L, wv);
         free(wv);
     } else if (t->model == VKMSL_STAGE_FRAGMENT) {
+        // Always four components: Metal refuses a pipeline whose color output has fewer than the attachment's format
+        // (Vulkan leaves the missing ones undefined); the extra ones go nowhere.
         uint32_t index = c->index;
-        if (index) sb_printf(c->decl, "    %s c%u_1 [[color(%u), index(1)]];\n", tname(t, type), L, L);
-        else sb_printf(c->decl, "    %s c%u [[color(%u)]];\n", tname(t, type), L, L);
-        sb_printf(c->init, "    spvOut.c%u%s = %s;\n", L, index ? "_1" : "", path);
+        if (index) sb_printf(c->decl, "    %s c%u_1 [[color(%u), index(1)]];\n", vec4_of(t, type), L, L);
+        else sb_printf(c->decl, "    %s c%u [[color(%u)]];\n", vec4_of(t, type), L, L);
+        char *wv = widen4(t, type, path);
+        sb_printf(c->init, "    spvOut.c%u%s = %s;\n", L, index ? "_1" : "", wv);
+        free(wv);
         t->res->fragment_outputs |= 1u << (L & 31);
     }
 }
@@ -3249,7 +3253,9 @@ int vkmsl_translate(const uint32_t *words, size_t word_count, const vkmsl_option
                         default: fail(t, VKMSL_UNSUPPORTED, "vertex built-in output %u", bi);
                         }
                     } else if (t->model == VKMSL_STAGE_FRAGMENT) {
-                        if (bi == BI_FragDepth) {
+                        if (bi == BI_FragDepth && (t->opt->flags & VKMSL_FLAG_NO_DEPTH_ATTACHMENT)) {
+                            // no depth attachment: Vulkan drops the value; Metal refuses a depth output without one
+                        } else if (bi == BI_FragDepth) {
                             const char *mode = t->depth_mode == 2 ? "greater" : t->depth_mode == 3 ? "less" : "any";
                             sb_printf(&out_decl, "    float spvDepth [[depth(%s)]];\n", mode);
                             sb_printf(&t->ret, "    spvOut.spvDepth = %s;\n", src);
