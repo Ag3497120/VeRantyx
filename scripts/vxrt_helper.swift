@@ -5,6 +5,8 @@
 //   vxrt-helper vrsettings <SteamVR's steamvr.vrsettings> <the overlay's copy> <no standby 1|0> <render scale> <extra JSON>
 //   vxrt-helper json-get <file> <key.key...>              # a value of a JSON file, printed (nothing, exit 1, if absent)
 //   vxrt-helper webui-standin [page mailbox] [game mailbox]
+//   vxrt-helper webui-replay <prompt file>                # the game's messages to the page, one JSON a line on stdin:
+//                                                         # what the prompt file says after each (a test and a tool)
 //
 // vrsettings: the overlay's copy of SteamVR's settings with the VeRantyx headset as the only driver (the original is
 // never written). webui-standin: stands in for a game's SteamVR web UI, which SteamVR shows in vrwebhelper (Chromium,
@@ -13,7 +15,11 @@
 // secret, so this one comes from that origin), where it opens its own mailbox and tells the game's mailbox it is
 // "ready". Alyx gives up after a minute without that message ("Timed out waiting for response from Mongoose"). This
 // does what the page does at start, once per game (a second "ready" during a level load can leave the game paused);
-// the loading screens themselves are not shown.
+// the loading screens themselves are not shown. What the page would write over the loading screen (show_message:
+// after a level has loaded, Alyx waits, paused, for a trigger pull and says "Press Trigger To Start") goes into the
+// prompt file (VERANTYX_GAME_PROMPT_FILE, set by scripts/launch_vxrt_steamvr.sh), which the encoder draws into both
+// eyes' picture (MacEncoder/HardwareEncoder.swift, GamePromptOverlay); end_loading (the game goes on), the next
+// begin_loading or the game quitting takes it away.
 import Darwin
 import Foundation
 
@@ -101,7 +107,73 @@ func jsonGet(_ a: [String]) {
 
 enum Closed: Error { case closed(String) }
 
-func log(_ text: String) { print("[webui stand-in] \(text)") }
+func log(_ text: String) {
+    let stamp = DateFormatter()
+    stamp.dateFormat = "HH:mm:ss.SSS"
+    print("[webui stand-in] \(stamp.string(from: Date())) \(text)")
+}
+
+/// What the game asks its loading page to show, from the game's messages to the page.
+struct GamePrompt {
+    private(set) var text: String?
+    /// The words for a message the page shows: Alyx's start prompt in plain words (the pull has to last a moment:
+    /// right after a level loads the game sees its input only a few times a second), in Japanese as well on a Mac
+    /// set to Japanese; any other message as it is.
+    static func words(_ message: String, japanese: Bool) -> String {
+        guard message.trimmingCharacters(in: .whitespaces).lowercased() == "press trigger to start" else { return message }
+        return japanese ? "Hold the trigger to start\nトリガーを長押しして開始" : "Hold the trigger to start"
+    }
+    /// Takes one message; true when the text changed.
+    mutating func take(_ message: [String: Any], japanese: Bool) -> Bool {
+        let before = text
+        switch message["type"] as? String {
+        case "show_message":
+            let t = (message["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            text = t.isEmpty ? nil : GamePrompt.words(t, japanese: japanese)
+        case "begin_loading", "end_loading": text = nil
+        default: break
+        }
+        return text != before
+    }
+    mutating func clear() -> Bool { defer { text = nil }; return text != nil }
+}
+
+let japaneseMac = Locale.preferredLanguages.first?.hasPrefix("ja") ?? false
+
+/// The prompt file: the text, written whole (renamed into place), or no file.
+func writePrompt(_ text: String?, to path: String?) {
+    guard let path, !path.isEmpty else { return }
+    if let text {
+        try? Data(text.utf8).write(to: URL(fileURLWithPath: path), options: .atomic)
+    } else {
+        try? FileManager.default.removeItem(atPath: path)
+    }
+}
+
+var gamePrompt = GamePrompt()
+let promptFile = ProcessInfo.processInfo.environment["VERANTYX_GAME_PROMPT_FILE"]
+
+func noteForThePage(_ text: String) {
+    guard let message = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] else { return }
+    if gamePrompt.take(message, japanese: japaneseMac) {
+        writePrompt(gamePrompt.text, to: promptFile)
+        log(gamePrompt.text.map { "prompt shown: \($0.replacingOccurrences(of: "\n", with: " / "))" } ?? "prompt taken away")
+    }
+}
+
+func webuiReplay(_ a: [String]) -> Never {
+    guard a.count == 1 else { fail("usage: vxrt-helper webui-replay <prompt file>") }
+    while let line = readLine() {
+        if line == "gone" {
+            if gamePrompt.clear() { writePrompt(nil, to: a[0]) }
+        } else if let message = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
+                  gamePrompt.take(message, japanese: false) {
+            writePrompt(gamePrompt.text, to: a[0])
+        }
+        print(FileManager.default.contents(atPath: a[0]).map { String(decoding: $0, as: UTF8.self) } ?? "(none)")
+    }
+    exit(0)
+}
 
 final class WebSocket {
     let fd: Int32
@@ -201,6 +273,7 @@ func waitFor(_ s: WebSocket, _ request: String, _ mailbox: String, page: String,
         guard let reply = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] else { continue }
         if (reply["message_id"] as? NSNumber)?.intValue == id { return }
         log("message for the page: \(text.prefix(300))")
+        noteForThePage(text)
     }
 }
 
@@ -220,9 +293,11 @@ func webuiStandin(_ a: [String]) -> Never {
                 // Once per game: the next "ready" waits until this game's mailbox is gone (the game quit).
                 try waitFor(s, "request_mailbox_unavailable_notification", game, page: page, id: id + 1)
                 log("\(game) is gone")
+                if gamePrompt.clear() { writePrompt(nil, to: promptFile); log("prompt taken away (the game quit)") }
                 id += 2
             }
         } catch {
+            if gamePrompt.clear() { writePrompt(nil, to: promptFile); log("prompt taken away (vrserver's web server went away)") }
             sleep(2)
         }
     }
@@ -236,5 +311,6 @@ switch args.first {
 case "vrsettings": vrsettings(Array(args.dropFirst()))
 case "json-get": jsonGet(Array(args.dropFirst()))
 case "webui-standin": webuiStandin(Array(args.dropFirst()))
-default: fail("usage: vxrt-helper vrsettings|json-get|webui-standin ...")
+case "webui-replay": webuiReplay(Array(args.dropFirst()))
+default: fail("usage: vxrt-helper vrsettings|json-get|webui-standin|webui-replay ...")
 }

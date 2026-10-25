@@ -8,6 +8,7 @@ import CoreAudio
 import Metal
 import CoreImage
 import ImageIO
+import CoreText
 
 import simd
 
@@ -734,6 +735,156 @@ func saveHeadsetFrustum(_ tangents: UnsafeRawPointer) {
     if (try? String(contentsOf: path, encoding: .utf8)) == text { return }
     try? text.write(to: path, atomically: true, encoding: .utf8)
     print("ALVR headset eye frustum saved for SteamVR's next start: \(text.trimmingCharacters(in: .whitespacesAndNewlines))")
+}
+
+// MARK: - A game's prompt over the picture
+
+// Half-Life: Alyx writes some things on its loading page, a SteamVR web UI that does not run on VXRuntime (the
+// web UI stand-in answers for it: scripts/vxrt_helper.swift). After a level has loaded the game waits, paused, for a
+// trigger pull and says so there ("Press Trigger To Start"); the player saw a black picture instead. The stand-in
+// writes what the page would show into the prompt file (VERANTYX_GAME_PROMPT_FILE) and takes it away when the game
+// goes on; while there is one, it is drawn here into both eyes' picture, before encoding, so the Vision Pro app and
+// ALVR's clients show it alike. Each eye has it where a point 2 m straight ahead of the head falls in that eye's view
+// (its frustum, from the driver; the eyes' distance from the headset, else 63 mm), so the two eyes agree on its depth.
+final class GamePromptOverlay {
+    static let distance: Float = 2.0
+    let path: String?
+    private(set) var text: String?
+    private var lastCheck: TimeInterval = -.infinity
+    private var image: CGImage?
+    private var imageFor = (0, 0)
+
+    init(path: String?) { self.path = path.flatMap { $0.isEmpty ? nil : $0 } }
+
+    /// Reads the prompt file, four times a second at most; true when the text changed.
+    @discardableResult
+    func poll(now: TimeInterval) -> Bool {
+        guard let path, now - lastCheck >= 0.25 else { return false }
+        lastCheck = now
+        let current = FileManager.default.contents(atPath: path).map { String(decoding: $0, as: UTF8.self) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+        guard current != text else { return false }
+        text = current
+        image = nil
+        print(current.map { "Game prompt drawn into the picture: \($0.replacingOccurrences(of: "\n", with: " / "))" }
+              ?? "Game prompt taken away")
+        return true
+    }
+
+    /// The prompt's centre in each eye (pixels from the frame's top left; left eye in the left half).
+    static func centers(width: Int, height: Int, tangents: [Float]?, ipd: Float) -> [(x: Double, y: Double)] {
+        let eyeWidth = Double(width) / 2
+        return (0..<2).map { eye in
+            guard let t = tangents, t.count == 8 else { return (eyeWidth * (Double(eye) + 0.5), Double(height) / 2) }
+            let (l, r, bottom, top) = (t[eye * 4], t[eye * 4 + 1], t[eye * 4 + 2], t[eye * 4 + 3])
+            // (the left eye sees a point ahead of the head's centre a little to its right; the right eye to its left)
+            let x = (eye == 0 ? 1 : -1) * (ipd / 2) / distance
+            let u = Double((x - l) / (r - l)), v = Double(top / (top - bottom))
+            return (eyeWidth * (Double(eye) + u), Double(height) * v)
+        }
+    }
+
+    /// White text on a dark plate, sized for an eye of eyeWidth x eyeHeight pixels.
+    static func render(_ text: String, eyeWidth: Int, eyeHeight: Int) -> CGImage? {
+        let lines = text.split(separator: "\n").map(String.init)
+        guard !lines.isEmpty else { return nil }
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        func layout(_ size: CGFloat) -> [CTLine] {
+            let font = CTFontCreateWithName("Helvetica Neue Medium" as CFString, size, nil)
+            return lines.map { line in
+                let attributes: [NSAttributedString.Key: Any] = [
+                    NSAttributedString.Key(kCTFontAttributeName as String): font,
+                    NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(colorSpace: space, components: [1, 1, 1, 1])!]
+                return CTLineCreateWithAttributedString(NSAttributedString(string: line, attributes: attributes))
+            }
+        }
+        var size = CGFloat(eyeHeight) * 0.05
+        var ctLines = layout(size)
+        func widest(_ ls: [CTLine]) -> CGFloat { ls.map { CGFloat(CTLineGetTypographicBounds($0, nil, nil, nil)) }.max() ?? 0 }
+        let limit = CGFloat(eyeWidth) * 0.6
+        if widest(ctLines) > limit { size *= limit / widest(ctLines); ctLines = layout(size) }
+        let lineHeight = size * 1.35, pad = size * 0.8
+        let w = Int(ceil(widest(ctLines) + 2 * pad)), h = Int(ceil(lineHeight * CGFloat(lines.count) + 2 * pad - (lineHeight - size)))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(colorSpace: space, components: [0.05, 0.05, 0.08, 0.8])!)
+        ctx.addPath(CGPath(roundedRect: CGRect(x: 0, y: 0, width: w, height: h), cornerWidth: size * 0.6, cornerHeight: size * 0.6, transform: nil))
+        ctx.fillPath()
+        for (i, line) in ctLines.enumerated() {
+            let lineWidth = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+            ctx.textPosition = CGPoint(x: (CGFloat(w) - lineWidth) / 2, y: CGFloat(h) - pad - size * 0.8 - lineHeight * CGFloat(i))
+            CTLineDraw(line, ctx)
+        }
+        return ctx.makeImage()
+    }
+
+    /// Draws the prompt, if there is one, into a BGRA frame (both eyes side by side). True when it drew.
+    @discardableResult
+    func draw(into pb: CVPixelBuffer, tangents: [Float]?, ipd: Float) -> Bool {
+        guard let text else { return false }
+        let width = CVPixelBufferGetWidth(pb), height = CVPixelBufferGetHeight(pb)
+        if image == nil || imageFor != (width, height) {
+            image = GamePromptOverlay.render(text, eyeWidth: width / 2, eyeHeight: height)
+            imageFor = (width, height)
+        }
+        guard let image, CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return false }
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        guard let base = CVPixelBufferGetBaseAddress(pb),
+              let ctx = CGContext(data: base, width: width, height: height, bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(pb), space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return false }
+        let eyeWidth = Double(width) / 2
+        for (eye, c) in GamePromptOverlay.centers(width: width, height: height, tangents: tangents, ipd: ipd).enumerated() {
+            ctx.saveGState()
+            ctx.clip(to: CGRect(x: eyeWidth * Double(eye), y: 0, width: eyeWidth, height: Double(height)))   // (each in its own eye)
+            // (the context's y goes up from the bottom row)
+            ctx.draw(image, in: CGRect(x: c.x - Double(image.width) / 2, y: Double(height) - c.y - Double(image.height) / 2,
+                                       width: Double(image.width), height: Double(image.height)))
+            ctx.restoreGState()
+        }
+        return true
+    }
+}
+let gamePrompt = GamePromptOverlay(path: ProcessInfo.processInfo.environment["VERANTYX_GAME_PROMPT_FILE"])
+
+// VERANTYX_PROMPT_SELFTEST=<png> [VERANTYX_PROMPT_SELFTEST_TEXT, _SIZE=WxH, _TANGENTS="8 numbers"]: draws the prompt
+// into a grey frame with a cross at each eye's straight-ahead point, writes the PNG and exits (nothing else starts).
+if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] {
+    let env = ProcessInfo.processInfo.environment
+    let size = (env["VERANTYX_PROMPT_SELFTEST_SIZE"] ?? "2880x1620").split(separator: "x").compactMap { Int($0) }
+    let tangents = env["VERANTYX_PROMPT_SELFTEST_TANGENTS"].map { $0.split(separator: " ").compactMap { Float($0) } }
+    let (w, h) = (size.count == 2 ? size[0] : 2880, size.count == 2 ? size[1] : 1620)
+    var pb: CVPixelBuffer?
+    CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &pb)
+    guard let pb else { print("no pixel buffer"); exit(1) }
+    CVPixelBufferLockBaseAddress(pb, [])
+    let base = CVPixelBufferGetBaseAddress(pb)!, rowBytes = CVPixelBufferGetBytesPerRow(pb)
+    for y in 0..<h { for x in 0..<w { base.storeBytes(of: UInt32(0xFF30_3030), toByteOffset: y * rowBytes + x * 4, as: UInt32.self) } }
+    for (cx, cy) in GamePromptOverlay.centers(width: w, height: h, tangents: tangents, ipd: 0) {   // (crosses: at infinity)
+        for d in -40...40 {
+            for (x, y) in [(Int(cx) + d, Int(cy)), (Int(cx), Int(cy) + d)] where x >= 0 && x < w && y >= 0 && y < h {
+                base.storeBytes(of: UInt32(0xFFFF2020), toByteOffset: y * rowBytes + x * 4, as: UInt32.self)
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, [])
+    let text = env["VERANTYX_PROMPT_SELFTEST_TEXT"] ?? "Hold the trigger to start"
+    let file = NSTemporaryDirectory() + "verantyx-prompt-selftest-\(getpid()).txt"
+    try? Data(text.utf8).write(to: URL(fileURLWithPath: file))
+    let fromFile = GamePromptOverlay(path: file)
+    fromFile.poll(now: 0)
+    try? FileManager.default.removeItem(atPath: file)
+    let drew = fromFile.draw(into: pb, tangents: tangents, ipd: 0.063)
+    let image = CIImage(cvPixelBuffer: pb)
+    guard drew, let cg = CIContext().createCGImage(image, from: image.extent),
+          let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: out) as CFURL, "public.png" as CFString, 1, nil) else {
+        print("prompt selftest: nothing drawn"); exit(1)
+    }
+    CGImageDestinationAddImage(dest, cg, nil)
+    CGImageDestinationFinalize(dest)
+    let c = GamePromptOverlay.centers(width: w, height: h, tangents: tangents, ipd: 0.063)
+    print(String(format: "prompt selftest: %dx%d, centres (%.1f, %.1f) and (%.1f, %.1f) -> %@", w, h, c[0].x, c[0].y, c[1].x, c[1].y, out))
+    exit(0)
 }
 
 let winePrefix = ProcessInfo.processInfo.environment["WINEPREFIX"]
@@ -1789,6 +1940,14 @@ while isEncoding {
                     encoderInFlightFrames.signal()
                     lastSeq = currentSeq
                     return
+                }
+
+                // (a game's prompt from its loading page, over both eyes: GamePromptOverlay)
+                gamePrompt.poll(now: ProcessInfo.processInfo.systemUptime)
+                if gamePrompt.text != nil {
+                    let ipd = handsMapPtr.load(fromByteOffset: 320, as: UInt32.self) == 0x4450_4956
+                        ? handsMapPtr.load(fromByteOffset: 324, as: Float.self) : 0.063
+                    gamePrompt.draw(into: pb, tangents: readSourceProjection(), ipd: (0.04...0.09).contains(ipd) ? ipd : 0.063)
                 }
 
                 streamSequence &+= 1

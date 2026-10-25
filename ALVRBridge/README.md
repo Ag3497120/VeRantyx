@@ -22,7 +22,10 @@ Wi-Fi dropped) finds ALVR's core stuck in the handshake, and the headset says "C
 11)" (issue #6). ALVR's audio callback reads its session lock on CoreAudio's thread; cpal 0.15.3 never stops a stream
 on a named device, so the last connection's recording runs on, and the next handshake holds that lock for writing
 while it asks CoreAudio about the same device. The bridge sees a client still "Connecting" after 6 s (a handshake takes
-well under one) and the encoder starts again (exit 75, as above); the headset connects some 10 s after it came back.
+well under one) and the encoder starts again (exit 75, as above); the headset connects some 10 s after it came back. That
+check runs on the encoder's ALVR thread, which also passes the game's vibrations on; ALVR's `send_haptics` waits for
+the same lock, so in a game that vibrates the thread stopped at the first vibration and the restart never came (0.3.0,
+a Pico 4 Ultra mid-game). Vibrations now go to the core on a thread of their own (a queue of 64, the rest dropped).
 
 Game audio: macOS cannot record an output device (ALVR records the speakers on Windows), so the encoder makes a
 device ALVR can: an aggregate of the Mac's output and a tap of the Mac's sound, "VeRantyx ALVR game audio", private
@@ -34,6 +37,15 @@ asks to allow the terminal under Screen & System Audio Recording (the tap needs 
 The distance between the headset's eyes (its view transforms) goes to SteamVR as the user's IPD
 (Prop_UserIpdMeters): the encoder writes it after SharedHands in the map's tail ("VIPD"), the driver sets it when it
 differs by half a millimetre. 63 mm until a headset reports one, and with the Vision Pro app.
+
+Controller velocities (what the game throws with): ALVR's own, except for Pico, VIVE and YVR headsets, whose ALVR
+client predicts the controller's pose a whole pipeline latency ahead and sends the difference as the velocity. On a
+Mac that latency is 150-250 ms (some 50-80 ms on a PC), and Half-Life: Alyx threw things as from a cannon with a Pico 4
+Ultra. For those the bridge takes the velocities from the poses themselves (each sample against the one before, over
+the time between them), after moving each pose back by the lead the client moved it ahead with (its velocity times the
+latency less SteamVR's pipeline, at most `max_prediction_ms`, 100 ms: the client's own rule, worked out here from the
+latencies it reports). `VERANTYX_ALVR_VELOCITY=headset` or `=poses` chooses for any headset. The session log says
+which at each connection, and every 5 s the fastest controller speed both ways and the lead (`VeRantyx: controllers:`).
 
 Vibration: the driver's controllers have a haptic component; the game's vibrations (VREvent_Input_HapticVibration)
 go per hand into the map's tail (SharedHaptic at 336: seq, duration, frequency, amplitude), the encoder passes each on
