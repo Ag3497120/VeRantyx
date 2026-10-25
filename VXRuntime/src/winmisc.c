@@ -7,8 +7,15 @@
 //   GetLastInputInfo     the time of the Mac's last keyboard or mouse input, on GetTickCount's clock
 //   BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos   the moves collected, then made with SetWindowPos
 //   NotifyWinEvent       accessibility events: SetWinEventHook (src/client.c) delivers none, so nobody listens
+//   ShutdownBlockReasonCreate / Destroy   the reason a window gives for holding up a shutdown, kept per window and
+//                        only from the window's own thread (ERROR_ACCESS_DENIED otherwise); macOS asks programs about
+//                        logging out its own way, so nothing here shows it
+//   InitializeTouchInjection / InjectTouchInput   synthesized touch input: the arguments are checked as documented, but
+//                        there is no touch input here to inject into (ERROR_NOT_SUPPORTED); the Windows Steam client's
+//                        steamui.dll imports them
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wctype.h>
 #include <xlocale.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -115,10 +122,80 @@ static WINAPI BOOL EndDeferWindowPos(HANDLE h) {
 
 static WINAPI void NotifyWinEvent(DWORD event, HANDLE hwnd, LONG object, LONG child) { (void)event; (void)hwnd; (void)object; (void)child; }
 
+// ---- shutdown block reasons -------------------------------------------------------------------------------------------------
+enum { ERROR_ACCESS_DENIED = 5, ERROR_NOT_SUPPORTED = 50 };
+static struct { HANDLE hwnd; WCHAR *reason; } g_block[64];
+static pthread_mutex_t g_block_lock = PTHREAD_MUTEX_INITIALIZER;
+static vx_window *own_window(HANDLE hwnd) {
+    vx_window *w = vx_window_get(hwnd);
+    if (!w) { vx_set_last_error(ERROR_INVALID_WINDOW_HANDLE); return NULL; }
+    if (w->tid != vx_current_tid()) { vx_set_last_error(ERROR_ACCESS_DENIED); return NULL; }
+    return w;
+}
+static WINAPI BOOL ShutdownBlockReasonDestroy(HANDLE hwnd);
+static WINAPI BOOL ShutdownBlockReasonCreate(HANDLE hwnd, const WCHAR *reason) {
+    if (!own_window(hwnd)) return 0;
+    if (!reason) { vx_set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    size_t n = 0; while (reason[n]) n++;
+    WCHAR *copy = malloc((n + 1) * sizeof *copy);
+    if (!copy) { vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    memcpy(copy, reason, (n + 1) * sizeof *copy);
+    pthread_mutex_lock(&g_block_lock);
+    int slot = -1;
+    for (int i = 0; i < 64; i++) {
+        if (g_block[i].hwnd == hwnd) { slot = i; break; }
+        if (slot < 0 && (!g_block[i].hwnd || !vx_window_get(g_block[i].hwnd))) slot = i;   // (a free one, or a gone window's)
+    }
+    if (slot >= 0) { free(g_block[slot].reason); g_block[slot].hwnd = hwnd; g_block[slot].reason = copy; }
+    pthread_mutex_unlock(&g_block_lock);
+    if (slot < 0) { free(copy); vx_set_last_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
+    return 1;
+}
+static WINAPI BOOL ShutdownBlockReasonDestroy(HANDLE hwnd) {
+    if (!own_window(hwnd)) return 0;
+    pthread_mutex_lock(&g_block_lock);
+    for (int i = 0; i < 64; i++)
+        if (g_block[i].hwnd == hwnd) { free(g_block[i].reason); g_block[i].hwnd = NULL; g_block[i].reason = NULL; }
+    pthread_mutex_unlock(&g_block_lock);
+    return 1;
+}
+// ShutdownBlockReasonQuery: the reason with its terminating null; no buffer: the size it needs, in characters.
+static WINAPI BOOL ShutdownBlockReasonQuery(HANDLE hwnd, WCHAR *out, DWORD *cch) {
+    if (!vx_window_get(hwnd)) { vx_set_last_error(ERROR_INVALID_WINDOW_HANDLE); return 0; }
+    if (!cch) { vx_set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    BOOL ok = 0;
+    pthread_mutex_lock(&g_block_lock);
+    for (int i = 0; i < 64 && !ok; i++) {
+        if (g_block[i].hwnd != hwnd) continue;
+        DWORD n = 0; while (g_block[i].reason[n]) n++;
+        if (!out) { *cch = n + 1; ok = 1; }
+        else if (*cch > n) { memcpy(out, g_block[i].reason, (n + 1) * sizeof *out); ok = 1; }
+        else { *cch = n + 1; vx_set_last_error(122 /* ERROR_INSUFFICIENT_BUFFER */); pthread_mutex_unlock(&g_block_lock); return 0; }
+    }
+    pthread_mutex_unlock(&g_block_lock);
+    if (!ok) vx_set_last_error(1168 /* ERROR_NOT_FOUND */);
+    return ok;
+}
+
+// ---- touch injection --------------------------------------------------------------------------------------------------------
+// InitializeTouchInjection: maxCount 1..MAX_TOUCH_COUNT (256), dwMode TOUCH_FEEDBACK_DEFAULT (1), _INDIRECT (2) or _NONE (3).
+static WINAPI BOOL InitializeTouchInjection(uint32_t max_count, DWORD mode) {
+    if (!max_count || max_count > 256 || mode < 1 || mode > 3) { vx_set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    vx_set_last_error(ERROR_NOT_SUPPORTED);
+    return 0;
+}
+static WINAPI BOOL InjectTouchInput(uint32_t count, const void *contacts) {
+    if (!count || count > 256 || !contacts) { vx_set_last_error(ERROR_INVALID_PARAMETER); return 0; }
+    vx_set_last_error(ERROR_NOT_SUPPORTED);
+    return 0;
+}
+
 static const vx_export user32[] = {
     VX_EXPORT(GetWindowRgn), VX_EXPORT(GetWindowRgnBox), VX_EXPORT(IsChild), VX_EXPORT(InflateRect), VX_EXPORT(EqualRect),
     VX_EXPORT(CharUpperW), VX_EXPORT(CharNextW), VX_EXPORT(GetLastInputInfo), VX_EXPORT(BeginDeferWindowPos),
     VX_EXPORT(DeferWindowPos), VX_EXPORT(EndDeferWindowPos), VX_EXPORT(NotifyWinEvent),
+    VX_EXPORT(ShutdownBlockReasonCreate), VX_EXPORT(ShutdownBlockReasonDestroy), VX_EXPORT(ShutdownBlockReasonQuery),
+    VX_EXPORT(InitializeTouchInjection), VX_EXPORT(InjectTouchInput),
 };
 
 void vx_winmisc_init(void) {

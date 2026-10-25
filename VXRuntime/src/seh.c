@@ -779,9 +779,38 @@ void vx_seh_install_signals(void) {
     signal(SIGABRT, on_abort);                  // (a native abort says where it came from)
 }
 
+// ---- RtlCaptureStackBackTrace ------------------------------------------------------------------------------------------------
+// The return addresses of the program's frames, from where it called (FramesToSkip = 0 starts with the caller's own
+// place), walked with the program's unwind data as an exception walk does. Frames of this runtime between them have
+// none and are passed over (a window procedure's caller is the program's DispatchMessage call). The hash is the sum
+// of the addresses captured (Microsoft: "calculated based on the values of the pointers returned"). Chromium takes
+// its stack traces this way and stopped at a NOTREACHED once the lookup in ntdll failed.
+uint16_t vx_backtrace_from(CONTEXT *start, DWORD skip, DWORD count, void **frames, DWORD *hash) {
+    CONTEXT c = *start;
+    vx_entry *cursor = t_entries;
+    uint8_t *teb = vx_teb();
+    uint64_t base_of_stack = teb ? *(uint64_t *)(teb + TEB_STACK_BASE) : 0;
+    DWORD seen = 0, got = 0, sum = 0;
+    uint64_t last_sp = 0;
+    for (int n = 0; n < 4096 && got < count && got < 0xffff; n++) {
+        uint64_t sp = c.gpr[RSP];
+        if (!c.rip || (base_of_stack && (sp >= base_of_stack || base_of_stack - sp > (1ull << 30))) || (n && sp < last_sp)) break;
+        last_sp = sp;
+        uint64_t image_base;
+        RUNTIME_FUNCTION *fn = next_function(&c, &cursor, 0, &image_base);
+        if (!fn || !c.rip) break;
+        if (seen++ >= skip) { frames[got++] = (void *)(uintptr_t)c.rip; sum += (DWORD)c.rip; }
+        void *data; uint64_t frame;
+        RtlVirtualUnwind(0, image_base, c.rip, fn, &c, &data, &frame, NULL);
+    }
+    if (hash) *hash = sum;
+    return (uint16_t)got;
+}
+
 // ---- exports -----------------------------------------------------------------------------------------------------------------
 void vx_RtlCaptureContext(CONTEXT *);
 void vx_RaiseException(DWORD, DWORD, DWORD, const uint64_t *);
+uint16_t vx_RtlCaptureStackBackTrace(DWORD, DWORD, void **, DWORD *);
 #ifdef __aarch64__
 void vx_RtlUnwindEx(uint64_t, uint64_t, EXCEPTION_RECORD *, uint64_t, CONTEXT *, void *);
 void vx_RtlUnwind(uint64_t, uint64_t, EXCEPTION_RECORD *, uint64_t);
@@ -806,7 +835,12 @@ static const vx_export seh_crt[] = {
     { "__intrinsic_setjmp", (void *)vx_setjmp }, { "_setjmp", (void *)vx_setjmp }, { "longjmp", (void *)vx_longjmp },
 };
 
+static const vx_export seh_backtrace[] = { { "RtlCaptureStackBackTrace", (void *)vx_RtlCaptureStackBackTrace } };
+
 void vx_seh_init(void) {
+    vx_register_module("kernel32.dll", seh_backtrace, 1);
+    vx_register_module("kernelbase.dll", seh_backtrace, 1);
+    vx_register_module("ntdll.dll", seh_backtrace, 1);
     vx_register_module("kernel32.dll", seh_k32, sizeof seh_k32 / sizeof seh_k32[0]);
     vx_register_module("ntdll.dll", seh_k32, sizeof seh_k32 / sizeof seh_k32[0]);
     vx_register_module("ucrtbase.dll", seh_crt, sizeof seh_crt / sizeof seh_crt[0]);
@@ -871,10 +905,16 @@ void vx_RtlUnwindEx(uint64_t frame, uint64_t ip, EXCEPTION_RECORD *rec, uint64_t
 }
 void vx_RtlUnwind(uint64_t frame, uint64_t ip, EXCEPTION_RECORD *rec, uint64_t ret) { CONTEXT c; native_context(&c); vx_unwind(frame, ip, rec, ret, NULL, &c); }
 void vx_CxxThrowException(void *obj, const void *ti) { CONTEXT c; native_context(&c); vx_cxx_throw(obj, ti, &c); }
+static void th_RtlCaptureStackBackTrace(x86_ctx *x) {
+    CONTEXT c; context_at_return(&c, x);
+    x->gpr[0] = vx_backtrace_from(&c, (DWORD)x->gpr[1], (DWORD)x->gpr[2], (void **)(uintptr_t)x->gpr[8], (DWORD *)(uintptr_t)x->gpr[9]);
+}
+uint16_t vx_RtlCaptureStackBackTrace(DWORD skip, DWORD n, void **frames, DWORD *hash) { CONTEXT c; native_context(&c); return vx_backtrace_from(&c, skip, n, frames, hash); }
 static const vx_thunk seh_special[] = {
     { (const void *)vx_RtlCaptureContext, th_RtlCaptureContext }, { (const void *)vx_RaiseException, th_RaiseException },
     { (const void *)vx_RtlUnwindEx, th_RtlUnwindEx }, { (const void *)vx_RtlUnwind, th_RtlUnwind },
     { (const void *)vx_CxxThrowException, th_CxxThrowException },
+    { (const void *)vx_RtlCaptureStackBackTrace, th_RtlCaptureStackBackTrace },
 };
 __attribute__((constructor)) static void seh_special_add(void) { vx_thunks_add(seh_special, sizeof seh_special / sizeof *seh_special); }
 

@@ -167,6 +167,44 @@ _vx_RtlUnwind:
     call _vx_unwind
     ud2
 
+// USHORT RtlCaptureStackBackTrace(ULONG skip, ULONG count, PVOID *frames, PULONG hash)   (ecx, edx, r8, r9)
+//   -> vx_backtrace_from(ctx, skip, count, frames, hash)   (System V; returns here)
+// rsi, rdi and xmm6-xmm15, which the Windows convention keeps and System V does not, come back from the context.
+    .globl _vx_RtlCaptureStackBackTrace
+    .p2align 4
+_vx_RtlCaptureStackBackTrace:
+    subq $FRAME, %rsp
+    leaq 0x10(%rsp), %r11
+    SAVE_GPRS %r11
+    pushfq
+    popq %rax
+    movq %rax, 0x44(%r11)
+    leaq FRAME+8(%rsp), %rax
+    movq %rax, 0x98(%r11)
+    movq FRAME(%rsp), %rax
+    movq %rax, 0xf8(%r11)
+    SAVE_FP %r11
+    movq %r11, %rdi
+    movl %ecx, %esi
+    movq %r8, %rcx
+    movq %r9, %r8
+    call _vx_backtrace_from
+    leaq 0x10(%rsp), %r11
+    movq 0xa8(%r11), %rsi
+    movq 0xb0(%r11), %rdi
+    movdqu 0x200(%r11), %xmm6
+    movdqu 0x210(%r11), %xmm7
+    movdqu 0x220(%r11), %xmm8
+    movdqu 0x230(%r11), %xmm9
+    movdqu 0x240(%r11), %xmm10
+    movdqu 0x250(%r11), %xmm11
+    movdqu 0x260(%r11), %xmm12
+    movdqu 0x270(%r11), %xmm13
+    movdqu 0x280(%r11), %xmm14
+    movdqu 0x290(%r11), %xmm15
+    addq $FRAME, %rsp
+    ret
+
 // void vx_restore_context(const CONTEXT *ctx)   -- System V, rdi = ctx. Resumes execution at ctx->Rip.
 // rip, eflags and rdi are pushed just below the target rsp, then popped as the last step.
     .globl _vx_restore_context

@@ -306,7 +306,7 @@ static WINAPI BOOL DeviceIoControl(HANDLE h, DWORD code, void *in, DWORD nin, vo
 }
 static WINAPI DWORD K32GetMappedFileNameW(HANDLE p, void *addr, WCHAR *buf, DWORD n) { (void)p; (void)addr; (void)buf; (void)n; vx_set_last_error(50); return 0; }
 // Stack traces from Windows code: not collected yet.
-static WINAPI uint16_t RtlCaptureStackBackTrace(DWORD skip, DWORD n, void **frames, DWORD *hash) { (void)skip; (void)n; (void)frames; if (hash) *hash = 0; return 0; }
+// (RtlCaptureStackBackTrace: src/seh.c)
 
 // Starting other processes comes with a later milestone; programs see the failure Windows reports for a
 // missing executable.
@@ -369,6 +369,28 @@ static char **environment_from_block(const void *block, int wide, const char *co
     env[n] = NULL;
     return env;
 }
+// A native 32-bit x86 program (PE32, machine i386, no CLR header): this runtime runs 64-bit code only, so CreateProcess
+// fails as Windows does for an image it cannot run, ERROR_BAD_EXE_FORMAT, before any process is started (the Windows
+// Steam client starts the 32-bit gldriverquery.exe and vulkandriverquery.exe, and carries on without their answers).
+// Managed (.NET) programs, whatever their header says, are left to the loader.
+static int native_32bit_program(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint8_t h[0x200];
+    size_t n = fread(h, 1, sizeof h, f);
+    uint32_t lfanew = n >= 0x40 ? (uint32_t)h[0x3c] | (uint32_t)h[0x3d] << 8 | (uint32_t)h[0x3e] << 16 | (uint32_t)h[0x3f] << 24 : 0;
+    uint8_t pe[24 + 96 + 16 * 8];
+    int r = n >= 0x40 && h[0] == 'M' && h[1] == 'Z' && !fseek(f, (long)lfanew, SEEK_SET) && fread(pe, 1, sizeof pe, f) == sizeof pe &&
+            !memcmp(pe, "PE\0\0", 4) && (pe[4] | pe[5] << 8) == 0x014c && (pe[24] | pe[25] << 8) == 0x10b;
+    if (r) {
+        uint32_t ndirs, clr_size;
+        memcpy(&ndirs, pe + 24 + 92, 4);                       // NumberOfRvaAndSizes; directory 14 is the CLR header
+        memcpy(&clr_size, pe + 24 + 96 + 14 * 8 + 4, 4);
+        if (ndirs > 14 && clr_size) r = 0;
+    }
+    fclose(f);
+    return r;
+}
 // si: the program's STARTUPINFO (A and W share the layout up to hStdError). With STARTF_USESTDHANDLES (0x100) the
 // child's standard handles are the given ones: pipes and files here are descriptors, so they are dup2'd into 0, 1, 2.
 static BOOL create_process(const char *app, const char *cmd, const void *env_block, int wide_env, const char *dir, const void *si, void **pi) {
@@ -378,6 +400,13 @@ static BOOL create_process(const char *app, const char *cmd, const void *env_blo
     if (!find_program(app && *app ? app : argc ? args[0] : "", exe, sizeof exe)) {
         vx_log("CreateProcess: %s not found", app && *app ? app : cmd);
         vx_set_last_error(2);
+        return 0;
+    }
+    if (native_32bit_program(exe)) {
+        vx_log("CreateProcess: %s is a 32-bit x86 program, which this runtime does not run (ERROR_BAD_EXE_FORMAT)", exe);
+        for (int i = 0; i < argc; i++) free(args[i]);
+        free(args);
+        vx_set_last_error(193 /* ERROR_BAD_EXE_FORMAT */);
         return 0;
     }
     char self[1024]; uint32_t len = sizeof self;
@@ -1062,7 +1091,7 @@ static const vx_export k32[] = {
     VX_EXPORT(GetVersion), VX_EXPORT(GetVersionExA), VX_EXPORT(GetVersionExW),
     VX_EXPORT(SetErrorMode), VX_EXPORT(GetErrorMode), VX_EXPORT(GetCurrentProcessorNumber), VX_EXPORT(GetPriorityClass),
     VX_EXPORT(SetPriorityClass), VX_EXPORT(HeapValidate), VX_EXPORT(DeviceIoControl), VX_EXPORT(K32GetMappedFileNameW),
-    VX_EXPORT(RtlCaptureStackBackTrace), VX_EXPORT(CreateProcessA), VX_EXPORT(CreateProcessW), VX_EXPORT(WinExec),
+    VX_EXPORT(CreateProcessA), VX_EXPORT(CreateProcessW), VX_EXPORT(WinExec),
     VX_EXPORT(GlobalMemoryStatusEx), VX_EXPORT(GetComputerNameA), VX_EXPORT(GetComputerNameW), VX_EXPORT(GetComputerNameExA),
     VX_EXPORT(GetComputerNameExW), VX_EXPORT(FileTimeToSystemTime), VX_EXPORT(SystemTimeToFileTime), VX_EXPORT(FileTimeToLocalFileTime),
     VX_EXPORT(GetTimeZoneInformation),                                     // (SystemTimeToTzSpecificLocalTime: kernelx.c)

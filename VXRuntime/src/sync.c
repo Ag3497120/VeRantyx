@@ -59,15 +59,22 @@ static pthread_cond_t g_changed = PTHREAD_COND_INITIALIZER;     // suspended thr
 static pthread_t g_lock_owner;
 static inline void glock(void) { pthread_mutex_lock(&g_lock); __atomic_store_n(&g_lock_owner, pthread_self(), __ATOMIC_RELEASE); }
 static inline void gunlock(void) { __atomic_store_n(&g_lock_owner, (pthread_t)NULL, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_lock); }
+// The thread waits in one of the runtime's blocking waits (vx_wait_begin/end): SuspendThread may stop it while the
+// wait is in the kernel, where it holds none of the runtime's locks (on_suspend_signal).
+__thread int vx_in_wait;
 static inline int gwait(pthread_cond_t *c) {
     __atomic_store_n(&g_lock_owner, (pthread_t)NULL, __ATOMIC_RELEASE);
+    vx_in_wait++;
     int r = pthread_cond_wait(c, &g_lock);
+    vx_in_wait--;
     __atomic_store_n(&g_lock_owner, pthread_self(), __ATOMIC_RELEASE);
     return r;
 }
 static inline int gtimedwait(pthread_cond_t *c, const struct timespec *t) {
     __atomic_store_n(&g_lock_owner, (pthread_t)NULL, __ATOMIC_RELEASE);
+    vx_in_wait++;
     int r = pthread_cond_timedwait(c, &g_lock, t);
+    vx_in_wait--;
     __atomic_store_n(&g_lock_owner, pthread_self(), __ATOMIC_RELEASE);
     return r;
 }
@@ -493,6 +500,44 @@ void vx_thread_park_state(const void *state) {
     park(t);
 }
 #endif
+// Where the system's libraries are: every Mach-O image's segments but this runtime's own (the C library, malloc,
+// dyld, ...), kept as dyld adds them, so the signal handler can tell where a thread is without a lock; and the
+// kernel's system call stubs (libsystem_kernel), where a thread in a blocking wait sits.
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+static struct { uintptr_t lo, hi; } g_native[1024];
+static int g_nnative;
+static uintptr_t g_kernel_lo, g_kernel_hi;
+static void native_image_added(const struct mach_header *mh, intptr_t slide) {
+    const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+    if (h->magic != MH_MAGIC_64 || h->filetype == MH_EXECUTE) return;   // (this runtime: see on_suspend_signal)
+    uintptr_t lo = UINTPTR_MAX, hi = 0;
+    const uint8_t *lc = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++, lc += ((const struct load_command *)lc)->cmdsize) {
+        const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+        if (seg->cmd != LC_SEGMENT_64 || !seg->vmsize || !strcmp(seg->segname, "__PAGEZERO")) continue;
+        uintptr_t a = (uintptr_t)(seg->vmaddr + slide);
+        if (a < lo) lo = a;
+        if (a + seg->vmsize > hi) hi = a + seg->vmsize;
+    }
+    if (hi <= lo) return;
+    uintptr_t syscall_stub = (uintptr_t)write;                         // (libsystem_kernel's, as every system call stub)
+    if (syscall_stub >= lo && syscall_stub < hi) { g_kernel_lo = lo; g_kernel_hi = hi; }
+    int n = __atomic_load_n(&g_nnative, __ATOMIC_ACQUIRE);
+    if (n == 1024) return;
+    g_native[n].lo = lo; g_native[n].hi = hi;
+    __atomic_store_n(&g_nnative, n + 1, __ATOMIC_RELEASE);
+}
+static int pc_native(uintptr_t pc) {
+    int n = __atomic_load_n(&g_nnative, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) if (pc >= g_native[i].lo && pc < g_native[i].hi) return 1;
+    return 0;
+}
+// A thread is not stopped inside a system library, where it may hold a lock of the C library or malloc that the
+// suspender's next calls need (Chromium's sampling profiler, which suspends threads many times a second, left Steam's
+// web helper with every thread waiting when one was stopped in getenv, in CreateFileMapping's name lookup, while
+// another held g_lock waiting for getenv): only in the program's code, in this runtime's (not holding g_lock), or in
+// one of the runtime's blocking waits, in the kernel. Such a thread is signalled again until it is in one of those.
 static void on_suspend_signal(int sig, siginfo_t *si, void *uc) {
     (void)sig; (void)si;
     vx_object *t = t_self;
@@ -500,13 +545,18 @@ static void on_suspend_signal(int sig, siginfo_t *si, void *uc) {
     if (may_hold_g_lock()) return;                                      // (SuspendThread signals again)
 #ifdef __aarch64__
     if (vx_arm64_interrupt()) return;                                   // (in the vCPU guest: it stops as it leaves)
+    uintptr_t pc = (uintptr_t)((const ucontext_t *)uc)->uc_mcontext->__ss.__pc;
+#else
+    uintptr_t pc = (uintptr_t)((const ucontext_t *)uc)->uc_mcontext->__ss.__rip;
 #endif
+    if (pc_native(pc) && !(vx_in_wait && pc >= g_kernel_lo && pc < g_kernel_hi)) return;   // (a system library: signalled again)
     int saved = errno;
     vx_context_from_signal(t->context, uc);
     park(t);
     errno = saved;
 }
 static void suspend_signal_setup(void) {
+    _dyld_register_func_for_add_image(native_image_added);            // (called for every image already there too)
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = on_suspend_signal;
@@ -1087,7 +1137,9 @@ static WINAPI DWORD SleepEx(DWORD ms, BOOL alertable) {
         DWORD r = alertable_wait(1, &never, 0, ms);
         return r == WAIT_IO_COMPLETION ? r : 0;
     }
+    vx_in_wait++;
     if (ms) usleep((useconds_t)ms * 1000); else sched_yield();
+    vx_in_wait--;
     return 0;
 }
 
@@ -1479,8 +1531,10 @@ static int cv_sleep(uint32_t *cv, uint32_t seen, DWORD ms) {   // (32 bits: the 
     wait_queue *q = queue_of(g_cv_queues, cv);
     pthread_mutex_lock(&q->lock);
     while (__atomic_load_n(cv, __ATOMIC_ACQUIRE) == seen) {
-        if (ms == INFINITE) pthread_cond_wait(&q->changed, &q->lock);
-        else if (ms == 0 || pthread_cond_timedwait(&q->changed, &q->lock, &deadline) == ETIMEDOUT) { woken = 0; break; }
+        vx_in_wait++;
+        int r = ms == INFINITE ? pthread_cond_wait(&q->changed, &q->lock) : ms == 0 ? ETIMEDOUT : pthread_cond_timedwait(&q->changed, &q->lock, &deadline);
+        vx_in_wait--;
+        if (ms != INFINITE && r == ETIMEDOUT) { woken = 0; break; }
     }
     pthread_mutex_unlock(&q->lock);
     if (!woken) vx_set_last_error(1460 /* ERROR_TIMEOUT */);
@@ -1864,8 +1918,10 @@ static WINAPI BOOL WaitOnAddress(volatile void *addr, const void *cmp, size_t si
     wait_queue *q = queue_of(g_addr_queues, addr);
     pthread_mutex_lock(&q->lock);
     while (!memcmp((const void *)addr, cmp, size)) {
-        if (ms == INFINITE) pthread_cond_wait(&q->changed, &q->lock);
-        else if (ms == 0 || pthread_cond_timedwait(&q->changed, &q->lock, &deadline) == ETIMEDOUT) { ok = 0; break; }
+        vx_in_wait++;
+        int r = ms == INFINITE ? pthread_cond_wait(&q->changed, &q->lock) : ms == 0 ? ETIMEDOUT : pthread_cond_timedwait(&q->changed, &q->lock, &deadline);
+        vx_in_wait--;
+        if (ms != INFINITE && r == ETIMEDOUT) { ok = 0; break; }
     }
     pthread_mutex_unlock(&q->lock);
     if (!ok) vx_set_last_error(1460);

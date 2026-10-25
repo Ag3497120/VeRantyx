@@ -3,6 +3,7 @@
 // formatting, keyboard layouts and IME state, Direct3D 9 profiling markers, and assorted kernel32 functions.
 #include "vx.h"
 #include <ctype.h>
+#include <errno.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -306,9 +307,7 @@ static WINAPI int ToUnicodeEx(DWORD vk, DWORD scan, const uint8_t *state, WCHAR 
 static WINAPI BOOL ImmGetConversionStatus(void *imc, DWORD *conv, DWORD *sent) { (void)imc; if (conv) *conv = 0; if (sent) *sent = 0; return 1; }
 static WINAPI BOOL ImmSetConversionStatus(void *imc, DWORD conv, DWORD sent) { (void)imc; (void)conv; (void)sent; return 1; }
 static WINAPI DWORD ImmGetProperty(void *hkl, DWORD index) { (void)hkl; (void)index; return 0; }
-static WINAPI unsigned ImmGetVirtualKey(void *wnd) { (void)wnd; return 0; }
 static WINAPI BOOL ImmIsUIMessageA(void *wnd, unsigned msg, uintptr_t w, intptr_t l) { (void)wnd; (void)msg; (void)w; (void)l; return 0; }
-static WINAPI BOOL ImmSetCandidateWindow(void *imc, void *form) { (void)imc; (void)form; return 1; }
 static WINAPI DWORD ImmGetCandidateListCountW(void *imc, DWORD *count) { (void)imc; if (count) *count = 0; return 0; }
 
 // ---- user32 odds and ends ------------------------------------------------------------------------------------------------------
@@ -522,6 +521,26 @@ static WINAPI BOOL RtlDeleteFunctionTable(void *table) { (void)table; return 1; 
 static WINAPI BOOL RtlInstallFunctionTableCallback(uint64_t id, uint64_t base, DWORD len, void *cb, void *ctx, const WCHAR *dll) { (void)id; (void)base; (void)len; (void)cb; (void)ctx; (void)dll; return 1; }
 // (SetHandleInformation, GetHandleInformation: src/inherit.c)
 static WINAPI BOOL SetSystemTime(const void *st) { (void)st; vx_set_last_error(1314); return 0; }
+// SetLocalTime: as for SetSystemTime, a program here does not hold the privilege to set the clock (SE_SYSTEMTIME_NAME):
+// ERROR_PRIVILEGE_NOT_HELD, once the SYSTEMTIME (year, month, day of week, day, hour, minute, second, ms) is a valid one.
+static WINAPI BOOL SetLocalTime(const uint16_t *st) {
+    static const uint8_t days[12] = { 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (!st || st[0] < 1601 || st[0] > 30827 || st[1] < 1 || st[1] > 12 || st[3] < 1 || st[3] > days[st[1] - 1] ||
+        (st[1] == 2 && st[3] == 29 && !(st[0] % 4 == 0 && (st[0] % 100 || st[0] % 400 == 0))) ||
+        st[4] > 23 || st[5] > 59 || st[6] > 59 || st[7] > 999) { vx_set_last_error(87); return 0; }
+    vx_set_last_error(1314);
+    return 0;
+}
+// Beep: a tone of dwFreq hertz (37..32767) for dwDuration ms, synchronously. There is no tone generator here: the
+// Mac's alert sound plays instead, and the call returns after the duration asked for. (The C runtime's _beep.)
+void vx_cocoa_beep(void);
+static WINAPI BOOL Beep(DWORD freq, DWORD ms) {
+    if (freq < 37 || freq > 32767) { vx_set_last_error(87); return 0; }
+    vx_cocoa_beep();
+    struct timespec t = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
+    while (nanosleep(&t, &t) && errno == EINTR) {}
+    return 1;
+}
 static WINAPI DWORD SignalObjectAndWait(HANDLE signal, HANDLE wait, DWORD ms, BOOL alertable) {
     (void)alertable;
     BOOL (WINAPI *set)(HANDLE) = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "SetEvent");
@@ -660,7 +679,7 @@ static const vx_export k32[] = {
     VX_EXPORT(LocalReAlloc), VX_EXPORT(QueryThreadCycleTime), VX_EXPORT(DebugBreak), VX_EXPORT(FatalAppExitA),
     VX_EXPORT(FlushInstructionCache), VX_EXPORT(RtlAddFunctionTable), VX_EXPORT(RtlDeleteFunctionTable),
     VX_EXPORT(RtlInstallFunctionTableCallback),
-    VX_EXPORT(SetSystemTime), VX_EXPORT(SignalObjectAndWait), VX_EXPORT(ReadDirectoryChangesW),
+    VX_EXPORT(SetSystemTime), VX_EXPORT(SetLocalTime), VX_EXPORT(Beep), VX_EXPORT(SignalObjectAndWait), VX_EXPORT(ReadDirectoryChangesW),
     VX_EXPORT(CopyFileExW), VX_EXPORT(GetPrivateProfileIntW),
     VX_EXPORT(GetPrivateProfileIntA), VX_EXPORT(GetPrivateProfileSectionW), VX_EXPORT(PeekConsoleInputA), VX_EXPORT(ReadConsoleInputW),
     VX_EXPORT(FlushConsoleInputBuffer), VX_EXPORT(GetNumaHighestNodeNumber), VX_EXPORT(GetLargePageMinimum),
@@ -700,8 +719,8 @@ static const vx_export user32[] = {
     VX_EXPORT(CopyIcon), VX_EXPORT(DrawIconEx), VX_EXPORT(GetIconInfo),
 };
 static const vx_export imm32[] = {
-    VX_EXPORT(ImmGetConversionStatus), VX_EXPORT(ImmSetConversionStatus), VX_EXPORT(ImmGetProperty), VX_EXPORT(ImmGetVirtualKey),
-    VX_EXPORT(ImmIsUIMessageA), { "ImmIsUIMessageW", (void *)ImmIsUIMessageA }, VX_EXPORT(ImmSetCandidateWindow), VX_EXPORT(ImmGetCandidateListCountW),
+    VX_EXPORT(ImmGetConversionStatus), VX_EXPORT(ImmSetConversionStatus), VX_EXPORT(ImmGetProperty),
+    VX_EXPORT(ImmIsUIMessageA), { "ImmIsUIMessageW", (void *)ImmIsUIMessageA }, VX_EXPORT(ImmGetCandidateListCountW),
 };
 static const vx_export d3d9[] = {
     VX_EXPORT(D3DPERF_BeginEvent), VX_EXPORT(D3DPERF_EndEvent), VX_EXPORT(D3DPERF_SetMarker), VX_EXPORT(D3DPERF_GetStatus),

@@ -104,10 +104,12 @@ static RECT windows_rect(NSRect f) {
     return r;
 }
 
-static NSWindowStyleMask style_mask(DWORD style) {
+// frameless: the program keeps no non-client area (WM_NCCALCSIZE, user32.c), so no title bar; it can still be resized,
+// minimized and made the key window as its style says.
+static NSWindowStyleMask style_mask(DWORD style, int frameless) {
     if ((style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION) return NSWindowStyleMaskBorderless;
     NSWindowStyleMask m = 0;
-    if ((style & WS_CAPTION) == WS_CAPTION) m |= NSWindowStyleMaskTitled;
+    if ((style & WS_CAPTION) == WS_CAPTION && !frameless) m |= NSWindowStyleMaskTitled;
     if (style & WS_SYSMENU) m |= NSWindowStyleMaskClosable;
     if (style & WS_MINIMIZEBOX) m |= NSWindowStyleMaskMiniaturizable;
     if (style & WS_THICKFRAME) m |= NSWindowStyleMaskResizable;
@@ -126,13 +128,32 @@ int vx_cocoa_title_height(void) {
     return h;
 }
 
+// ---- the window ----------------------------------------------------------------------------------------------------------
+// A window without a title bar (frameless, or a popup) takes the keyboard when it is a window a Windows program
+// activates: AppKit's own rule (only titled or resizable windows) would leave the Steam sign-in window deaf to keys.
+@interface VXNSWindow : NSWindow {
+@public
+    vx_window *w;
+}
+@end
+@implementation VXNSWindow
+- (BOOL)canBecomeKeyWindow { return [super canBecomeKeyWindow] || (w && w->frameless); }
+- (BOOL)canBecomeMainWindow { return [super canBecomeMainWindow] || (w && w->frameless); }
+@end
+
 // ---- the view ------------------------------------------------------------------------------------------------------------
-@interface VXView : NSView {
+@interface VXView : NSView <NSTextInputClient> {
 @public
     vx_window *w;
     NSTrackingArea *tracking;
-    CGFloat wheel;                         // accumulated precise scrolling, in WHEEL_DELTA units
+    CGFloat wheel, hwheel;                 // accumulated precise scrolling, in WHEEL_DELTA units
     CGFloat raw_x, raw_y;                  // fractions of raw movement not reported yet
+    NSEvent *last_down;                    // the last left button press (a drag of the window starts from it)
+    // The Mac's input method (NSTextInputClient): its composition (marked text), and while a key is being
+    // interpreted, what it did with it, done in order once the key itself has gone to the program (ime.c).
+    NSString *marked;
+    BOOL in_key;
+    NSMutableArray *ime_steps;             // @[@"m", text, cursor] (composition) or @[@"c", text] (result)
 }
 @end
 
@@ -144,7 +165,7 @@ int vx_cocoa_title_height(void) {
 - (void)updateTrackingAreas {
     if (tracking) [self removeTrackingArea:tracking];
     tracking = [[NSTrackingArea alloc] initWithRect:NSZeroRect
-                                            options:NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect
+                                            options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect
                                               owner:self userInfo:nil];
     [self addTrackingArea:tracking];
     [super updateTrackingAreas];
@@ -161,17 +182,22 @@ static WPARAM mouse_keys(NSEvent *e) {
     if (b & 4) k |= 0x10;
     return k;
 }
-- (LPARAM)pos:(NSEvent *)e {
+// Where the event is on the screen, in Windows' coordinates (the view is the client area). Mouse input goes to the
+// window under it, which may be a child window (user32.c, route_mouse).
+- (POINT)screen:(NSEvent *)e {
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
-    return MAKELPARAM((int)p.x, (int)p.y);
+    POINT o; vx_window_screen_origin(w, &o);
+    return (POINT){ o.x + (LONG)p.x, o.y + (LONG)p.y };
 }
 - (void)button:(NSEvent *)e message:(uint32_t)msg vk:(int)vk down:(int)down {
     vx_mouse_button(vk, down);
     // RI_MOUSE_*_BUTTON_DOWN/UP: left 0x1/0x2, right 0x4/0x8, middle 0x10/0x20.
     int shift = vk == 1 ? 0 : vk == 2 ? 2 : 4;
     vx_raw_mouse(0, 0, (uint16_t)((down ? 1 : 2) << shift), 0);
-    if (down && e.clickCount == 2 && msg == WM_LBUTTONDOWN) msg = WM_LBUTTONDBLCLK;
-    vx_window_post(w->hwnd, msg, mouse_keys(e), [self pos:e]);
+    if (down && e.clickCount == 2) msg += 2;                     // WM_LBUTTONDBLCLK, WM_RBUTTONDBLCLK, WM_MBUTTONDBLCLK
+    if (down && vk == 1) last_down = e;
+    POINT p = [self screen:e];
+    vx_mouse_input(w, msg, mouse_keys(e), p.x, p.y);
 }
 - (void)mouseDown:(NSEvent *)e        { [self button:e message:WM_LBUTTONDOWN vk:1 down:1]; }
 - (void)mouseUp:(NSEvent *)e          { [self button:e message:WM_LBUTTONUP vk:1 down:0]; }
@@ -185,38 +211,103 @@ static WPARAM mouse_keys(NSEvent *e) {
     int dx = (int)raw_x, dy = (int)raw_y;
     raw_x -= dx; raw_y -= dy;
     vx_raw_mouse(dx, dy, 0, 0);
-    vx_window_post(w->hwnd, WM_MOUSEMOVE, mouse_keys(e), [self pos:e]);
+    POINT p = [self screen:e];
+    vx_mouse_input(w, WM_MOUSEMOVE, mouse_keys(e), p.x, p.y);
 }
+- (void)mouseExited:(NSEvent *)e { vx_mouse_exited(w); }
+- (void)mouseEntered:(NSEvent *)e { }
 - (void)mouseDragged:(NSEvent *)e     { [self mouseMoved:e]; }
 - (void)rightMouseDragged:(NSEvent *)e { [self mouseMoved:e]; }
 - (void)otherMouseDragged:(NSEvent *)e { [self mouseMoved:e]; }
 - (void)scrollWheel:(NSEvent *)e {
-    // WHEEL_DELTA (120) per notch; trackpads deliver fractions, accumulated here.
-    wheel += e.hasPreciseScrollingDeltas ? e.scrollingDeltaY * 120.0 / 40.0 : e.scrollingDeltaY * 120.0;
-    int delta = (int)wheel;
-    if (!delta) return;
-    wheel -= delta;
-    vx_raw_mouse(0, 0, 0x400 /* RI_MOUSE_WHEEL */, (int16_t)delta);
-    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
-    NSRect screen = [self.window convertRectToScreen:[self convertRect:NSMakeRect(p.x, p.y, 0, 0) toView:nil]];
-    vx_window_post(w->hwnd, WM_MOUSEWHEEL, (WPARAM)(uint16_t)mouse_keys(e) | ((WPARAM)(uint16_t)(int16_t)delta << 16),
-                   MAKELPARAM((int)screen.origin.x, (int)(main_height() - screen.origin.y)));
+    // WHEEL_DELTA (120) per notch; trackpads deliver fractions, accumulated here. To the focus window, with the
+    // pointer's place on the screen (WM_MOUSEWHEEL; sideways WM_MOUSEHWHEEL, positive to the right).
+    CGFloat scale = e.hasPreciseScrollingDeltas ? 120.0 / 40.0 : 120.0;
+    wheel += e.scrollingDeltaY * scale;
+    hwheel -= e.scrollingDeltaX * scale;
+    int delta = (int)wheel, hdelta = (int)hwheel;
+    wheel -= delta; hwheel -= hdelta;
+    POINT p = [self screen:e];
+    if (delta) {
+        vx_raw_mouse(0, 0, 0x400 /* RI_MOUSE_WHEEL */, (int16_t)delta);
+        vx_mouse_wheel(w, delta, mouse_keys(e), p.x, p.y, 0);
+    }
+    if (hdelta) vx_mouse_wheel(w, hdelta, mouse_keys(e), p.x, p.y, 1);
 }
 
+// A key: WM_KEYDOWN to the focus window with the characters it makes, which TranslateMessage posts as WM_CHAR. For a
+// program that asked for an input context (ime.c), the key first goes to the Mac's input method: if it composed with
+// it, the program gets VK_PROCESSKEY and the composition's WM_IME_* messages instead, as from an IME on Windows.
 - (void)keyDown:(NSEvent *)e {
     int alt = (e.modifierFlags & NSEventModifierFlagOption) != 0;
-    vx_key_event(w, e.keyCode, 1, e.ARepeat, alt);
-    if (e.modifierFlags & NSEventModifierFlagCommand) return;      // Cmd+key belongs to the Mac (menus)
+    if (!(e.modifierFlags & NSEventModifierFlagCommand) && (marked || vx_ime_active(w))) {
+        BOOL had = marked != nil;
+        in_key = YES; ime_steps = [NSMutableArray array];
+        [self interpretKeyEvents:@[ e ]];
+        in_key = NO;
+        NSArray *steps = ime_steps; ime_steps = nil;
+        if (had || marked || steps.count) {
+            vx_key_event_chars(w, e.keyCode, 1, e.ARepeat, alt, NULL, 0, 1);
+            for (NSArray *step in steps) [self imeStep:step];
+            return;
+        }
+    }
+    if (e.modifierFlags & NSEventModifierFlagCommand) { vx_key_event(w, e.keyCode, 1, e.ARepeat, alt); return; }   // Cmd+key: the Mac's (menus)
     NSString *s = e.characters;
-    uint16_t buf[16]; int n = 0;
-    for (NSUInteger i = 0; i < s.length && n < 16; i++) {
+    uint16_t buf[8]; int n = 0;
+    for (NSUInteger i = 0; i < s.length && n < 8; i++) {
         unichar c = [s characterAtIndex:i];
         if (c >= 0xf700 && c <= 0xf8ff) continue;                   // arrows, function keys: no character
         if (c == 0x7f) c = 0x08;                                     // the Mac's Delete is Backspace
         if (c == 0x03) c = 0x0d;                                     // keypad Enter
         buf[n++] = c;
     }
-    if (n) vx_char_event(w, buf, n);
+    vx_key_event_chars(w, e.keyCode, 1, e.ARepeat, alt, buf, n, 0);
+}
+static NSString *plain(id s) { return [s isKindOfClass:[NSAttributedString class]] ? [s string] : s; }
+- (void)imeStep:(NSArray *)step {
+    NSString *t = step[1];
+    NSUInteger n = t.length < 512 ? t.length : 512;
+    unichar buf[512];
+    [t getCharacters:buf range:NSMakeRange(0, n)];
+    if ([step[0] isEqualToString:@"m"]) vx_ime_compose(w, buf, (int)n, [step[2] intValue]);
+    else vx_ime_commit(w, buf, (int)n);
+}
+// NSTextInputClient: the input method's composition and results.
+- (void)insertText:(id)string replacementRange:(NSRange)range {
+    NSString *t = plain(string);
+    BOOL composing = marked != nil;
+    marked = nil;
+    if (in_key) { if (composing || t.length > 1) [ime_steps addObject:@[ @"c", t ]]; return; }   // (a plain key: its characters)
+    if (composing) { [self imeStep:@[ @"c", t ]]; return; }
+    NSUInteger n = t.length < 64 ? t.length : 64;
+    unichar buf[64];
+    [t getCharacters:buf range:NSMakeRange(0, n)];
+    vx_char_event(w, buf, (int)n);                                 // (the character viewer, dictation)
+}
+- (void)setMarkedText:(id)string selectedRange:(NSRange)sel replacementRange:(NSRange)range {
+    NSString *t = plain(string);
+    marked = t.length ? t : nil;
+    NSArray *step = @[ @"m", t, @(sel.location == NSNotFound ? (NSUInteger)t.length : sel.location) ];
+    if (in_key) [ime_steps addObject:step]; else [self imeStep:step];
+}
+- (void)unmarkText {
+    if (!marked) return;
+    NSArray *step = @[ @"c", marked ];
+    marked = nil;
+    if (in_key) [ime_steps addObject:step]; else [self imeStep:step];
+}
+- (NSRange)selectedRange { return marked ? NSMakeRange(marked.length, 0) : NSMakeRange(NSNotFound, 0); }
+- (NSRange)markedRange { return marked ? NSMakeRange(0, marked.length) : NSMakeRange(NSNotFound, 0); }
+- (BOOL)hasMarkedText { return marked != nil; }
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actual { return nil; }
+- (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText { return @[]; }
+- (NSUInteger)characterIndexForPoint:(NSPoint)point { return NSNotFound; }
+- (void)doCommandBySelector:(SEL)selector { }                       // (keys the input method passes on: their WM_KEYDOWN went)
+// Where the candidate list goes: where the program shows its composition, in the Mac's screen coordinates.
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actual {
+    RECT r; vx_ime_caret(w, &r);
+    return NSMakeRect(r.left, main_height() - r.bottom, r.right - r.left, r.bottom - r.top);
 }
 - (void)keyUp:(NSEvent *)e { vx_key_event(w, e.keyCode, 0, 0, (e.modifierFlags & NSEventModifierFlagOption) != 0); }
 - (void)flagsChanged:(NSEvent *)e {
@@ -258,7 +349,11 @@ static WPARAM mouse_keys(NSEvent *e) {
 }
 - (void)windowDidMove:(NSNotification *)n { vx_window_moved(w, windows_rect(((NSWindow *)n.object).frame)); }
 - (void)windowDidBecomeKey:(NSNotification *)n { vx_window_activated(w, 1); }
-- (void)windowDidResignKey:(NSNotification *)n { vx_window_activated(w, 0); }
+- (void)windowDidResignKey:(NSNotification *)n {
+    VXView *v = (VXView *)((NSWindow *)n.object).contentView;
+    if ([v isKindOfClass:[VXView class]] && v->marked) { [v.inputContext discardMarkedText]; v->marked = nil; vx_ime_compose(w, NULL, 0, 0); }
+    vx_window_activated(w, 0);
+}
 - (void)windowDidMiniaturize:(NSNotification *)n { vx_window_minimized(w, 1); }
 - (void)windowDidDeminiaturize:(NSNotification *)n { vx_window_minimized(w, 0); }
 @end
@@ -499,10 +594,11 @@ static void become_regular(void) {
 
 void vx_cocoa_create(vx_window *w) {
     on_main(^{
-        NSWindowStyleMask mask = style_mask(w->style);
+        NSWindowStyleMask mask = style_mask(w->style, w->frameless);
         NSRect frame = cocoa_rect(w->rect);
         NSRect content = [NSWindow contentRectForFrameRect:frame styleMask:mask];
-        NSWindow *win = [[NSWindow alloc] initWithContentRect:content styleMask:mask backing:NSBackingStoreBuffered defer:NO];
+        VXNSWindow *win = [[VXNSWindow alloc] initWithContentRect:content styleMask:mask backing:NSBackingStoreBuffered defer:NO];
+        win->w = w;
         win.releasedWhenClosed = NO;
         win.acceptsMouseMovedEvents = YES;
         win.title = [NSString stringWithUTF8String:w->title ? w->title : ""] ?: @"";
@@ -581,6 +677,28 @@ void vx_cocoa_activate(vx_window *w) {
     on_main(^{ [native(w) makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; });
 }
 
+// The window follows the mouse while its button stays down (a program's own title bar: WM_NCLBUTTONDOWN with HTCAPTION,
+// SC_MOVE), from the press that started it.
+void vx_cocoa_drag(vx_window *w) {
+    if (!w->native) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSWindow *win = native(w);
+        VXView *v = (VXView *)win.contentView;
+        if (![v isKindOfClass:[VXView class]] || !v->last_down || !(NSEvent.pressedMouseButtons & 1)) return;
+        [win performWindowDragWithEvent:v->last_down];
+    });
+}
+// The program ended its composition (ImmNotifyIME): the Mac's input method drops its own.
+void vx_cocoa_ime_cancel(vx_window *w) {
+    if (!w->native) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        VXView *v = (VXView *)native(w).contentView;
+        if (![v isKindOfClass:[VXView class]] || !v->marked) return;
+        v->marked = nil;
+        [v.inputContext discardMarkedText];
+    });
+}
+
 void vx_cocoa_set_title(vx_window *w) {
     if (!w->native) return;
     char *t = strdup(w->title ? w->title : "");
@@ -597,12 +715,15 @@ void vx_cocoa_set_frame(vx_window *w) {
 void vx_cocoa_set_style(vx_window *w) {
     if (!w->native) return;
     DWORD style = w->style;
+    int frameless = w->frameless;
     RECT r = w->rect;
     on_main(^{
         NSWindow *win = native(w);
-        win.styleMask = style_mask(style);
+        win.styleMask = style_mask(style, frameless);
         [win setFrame:cocoa_rect(r) display:YES];
         [win makeFirstResponder:win.contentView];
+        NSSize s = win.contentView.frame.size;                   // (a title bar came or went: the client area with it)
+        vx_window_resized(w, (int)s.width, (int)s.height);
     });
 }
 

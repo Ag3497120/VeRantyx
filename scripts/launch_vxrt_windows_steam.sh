@@ -21,9 +21,12 @@
 #   -cef-disable-gpu (the web helper gets --disable-gpu --disable-gpu-compositing) and -cef-disable-sandbox
 #   (--no-sandbox; Chromium's sandbox could not be in force here anyway, VXRuntime/README.md "Known risks").
 #   -cef-single-process and -cef-in-process-gpu, named in older lists, add nothing in this client.
-# - The web helper's --single-process, which no Steam option sets, comes from VXRuntime (VXRT_EXTRA_ARGS,
-#   VXRuntime/src/launchargs.c): Chromium's child processes need handles passed between processes, not there yet.
-#   VXRT_WSTEAM_WEBHELPER_ARGS replaces it (empty: none).
+# - The web helper's own arguments, which no Steam option sets, come from VXRuntime (VXRT_EXTRA_ARGS,
+#   VXRuntime/src/launchargs.c): --single-process (Chromium's child processes need handles passed between processes,
+#   not there yet) and --disable-software-rasterizer (with the GPU off, Chromium otherwise keeps trying to make GL
+#   contexts for SwiftShader, logs "Failed to create shared context for virtualization", draws nothing and ends
+#   itself; with it, it composites in software through GDI and Steam's sign-in window shows, 2026-10-25).
+#   VXRT_WSTEAM_WEBHELPER_ARGS replaces them (empty: none).
 # - No VXRT_STEAM_BRIDGE (the Mac Steam bridge would stand in for this Steam).
 # - Refuses a Wine prefix: the folder or the root in one, any symbolic link down to three levels in either that leads
 #   into one (that is where VXRuntime and Steam write), and a steam.exe that is itself a symbolic link.
@@ -133,7 +136,7 @@ ROOT="$(physical "$ROOT")"
 
 STEAM_ARGS=(-cef-disable-gpu -cef-disable-sandbox)
 [[ "${VXRT_WSTEAM_SILENT:-0}" == 1 ]] && STEAM_ARGS+=(-silent)
-WEBHELPER_ARGS="${VXRT_WSTEAM_WEBHELPER_ARGS-"--single-process"}"
+WEBHELPER_ARGS="${VXRT_WSTEAM_WEBHELPER_ARGS-"--single-process --disable-software-rasterizer"}"
 ENV=("VXRT_ROOT=$ROOT" "VXRT_DEBUG_OUTPUT=1" "VXRT_LOG_TIME=1")
 [[ -n "$WEBHELPER_ARGS" ]] && ENV+=("VXRT_EXTRA_ARGS=steamwebhelper.exe=$WEBHELPER_ARGS${VXRT_EXTRA_ARGS:+;$VXRT_EXTRA_ARGS}")
 if [[ -f "$VXRT_REDIST/manifest.json" ]]; then ENV+=("VXRT_DLL_PATH=$VXRT_REDIST")

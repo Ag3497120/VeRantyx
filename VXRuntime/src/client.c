@@ -182,13 +182,7 @@ static WINAPI BOOL UnionRect(RECT *out, const RECT *a, const RECT *b) {
 static WINAPI BOOL AttachThreadInput(DWORD a, DWORD b, BOOL on) { (void)a; (void)b; (void)on; return 1; }
 static WINAPI BOOL ExitWindowsEx(DWORD flags, DWORD reason) { (void)flags; (void)reason; vx_set_last_error(5); return 0; }
 static WINAPI uint64_t GetClassLongPtrA(HANDLE wnd, int index) { (void)wnd; (void)index; return 0; }
-static WINAPI int GetClipboardFormatNameA(DWORD fmt, char *out, int cap) { (void)fmt; if (out && cap) out[0] = 0; return 0; }
-static WINAPI DWORD EnumClipboardFormats(DWORD fmt) { (void)fmt; vx_set_last_error(0); return 0; }
-static WINAPI DWORD RegisterClipboardFormatW(const WCHAR *name) {
-    static DWORD next = 0xC100;                                    // a new atom for each call (names are not compared)
-    (void)name;
-    return __sync_fetch_and_add(&next, 1);
-}
+// (clipboard formats: src/clipboard.m)
 static WINAPI BOOL GetCursorInfo(DWORD *info) {
     if (!info || info[0] < 24) return 0;
     BOOL (WINAPI *pos)(LONG *) = (BOOL (WINAPI *)(LONG *))vx_find_export("user32.dll", "GetCursorPos");
@@ -565,8 +559,7 @@ static const vx_export user32[] = {
     VX_EXPORT(SetClassLongPtrW), { "SetClassLongPtrA", (void *)SetClassLongPtrW }, VX_EXPORT(SetRectEmpty), VX_EXPORT(PtInRect),
     VX_EXPORT(IntersectRect), VX_EXPORT(UnionRect), VX_EXPORT(AttachThreadInput),
     VX_EXPORT(ExitWindowsEx), VX_EXPORT(GetClassLongPtrA),
-    VX_EXPORT(GetClipboardFormatNameA), VX_EXPORT(EnumClipboardFormats), VX_EXPORT(RegisterClipboardFormatW),
-    { "RegisterClipboardFormatA", (void *)RegisterClipboardFormatW }, VX_EXPORT(GetCursorInfo), VX_EXPORT(GetMessagePos),
+    VX_EXPORT(GetCursorInfo), VX_EXPORT(GetMessagePos),
     VX_EXPORT(GetShellWindow), VX_EXPORT(IsWindowUnicode), VX_EXPORT(MapDialogRect), VX_EXPORT(SetParent), VX_EXPORT(SetWinEventHook),
     VX_EXPORT(UnhookWinEvent), VX_EXPORT(InsertMenuW), VX_EXPORT(DeleteMenu), VX_EXPORT(GetMenuItemInfoW),
     VX_EXPORT(CreateDialogIndirectParamA), VX_EXPORT(DialogBoxIndirectParamA), VX_EXPORT(CopyImage), { "CreateCaret", (void *)caret_ok },

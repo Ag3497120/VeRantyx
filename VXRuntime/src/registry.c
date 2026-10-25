@@ -308,6 +308,47 @@ static WINAPI LONG RegDeleteKeyW(void *hkey, const WCHAR *sub) { char *a = vx_ut
 static WINAPI LONG RegDeleteKeyExA(void *hkey, const char *sub, DWORD sam, DWORD reserved) { (void)sam; (void)reserved; return delete_key(hkey, sub); }
 static WINAPI LONG RegDeleteKeyExW(void *hkey, const WCHAR *sub, DWORD sam, DWORD reserved) { (void)sam; (void)reserved; return RegDeleteKeyW(hkey, sub); }
 
+// RegDeleteTree (Microsoft's documentation): the key named and everything below it; with no subkey name (NULL or
+// empty), the key's own subkeys and values while the key itself stays. As with RegDeleteKey, deleted keys are
+// unlinked but not freed (open handles may still point at them).
+static void delete_below(reg_key *k) {
+    for (reg_key *c = k->children, *next; c; c = next) {
+        next = c->next;
+        delete_below(c);
+        c->deleted = 1;
+        c->next = NULL;
+        vx_regnotify_changed(c, CHANGED_DELETED);
+    }
+    k->children = NULL;
+    for (reg_value *v = k->values, *next; v; v = next) { next = v->next; free(v->name); free(v->data); free(v); }
+    k->values = NULL;
+    vx_regnotify_changed(k, CHANGED_NAME);
+    vx_regnotify_changed(k, CHANGED_VALUES);
+}
+static LONG delete_tree(void *hkey, const char *sub) {
+    pthread_mutex_lock(&g_reg_lock);
+    load();
+    reg_key *p = key_of(hkey), *k = p ? walk(p, sub, 0) : NULL;
+    int whole = sub && *sub;
+    LONG r = !p ? ERROR_INVALID_HANDLE : !k ? ERROR_FILE_NOT_FOUND : (whole && !k->parent) ? ERROR_ACCESS_DENIED : ERROR_SUCCESS;
+    if (r == ERROR_SUCCESS) {
+        delete_below(k);
+        if (whole) {
+            reg_key **link = &k->parent->children;
+            while (*link != k) link = &(*link)->next;
+            *link = k->next;
+            k->deleted = 1;
+            vx_regnotify_changed(k, CHANGED_DELETED);
+            vx_regnotify_changed(k->parent, CHANGED_NAME);
+        }
+        save();
+    }
+    pthread_mutex_unlock(&g_reg_lock);
+    return r;
+}
+static WINAPI LONG RegDeleteTreeA(void *hkey, const char *sub) { return delete_tree(hkey, sub); }
+static WINAPI LONG RegDeleteTreeW(void *hkey, const WCHAR *sub) { char *a = sub ? vx_utf8_dup(sub) : NULL; LONG r = delete_tree(hkey, a); free(a); return r; }
+
 // ---- values ---------------------------------------------------------------------------------------------------------------------
 static LONG set(void *hkey, const char *name, DWORD type, const void *data, DWORD size, int ansi) {
     pthread_mutex_lock(&g_reg_lock);
@@ -608,7 +649,7 @@ static const vx_export advapi[] = {
     VX_EXPORT(RegOpenKeyExA), VX_EXPORT(RegOpenKeyExW), VX_EXPORT(RegOpenKeyA), VX_EXPORT(RegOpenKeyW),
     VX_EXPORT(RegCreateKeyExA), VX_EXPORT(RegCreateKeyExW), VX_EXPORT(RegCreateKeyA), VX_EXPORT(RegCreateKeyW),
     VX_EXPORT(RegCloseKey), VX_EXPORT(RegFlushKey), VX_EXPORT(RegDeleteKeyA), VX_EXPORT(RegDeleteKeyW),
-    VX_EXPORT(RegDeleteKeyExA), VX_EXPORT(RegDeleteKeyExW),
+    VX_EXPORT(RegDeleteKeyExA), VX_EXPORT(RegDeleteKeyExW), VX_EXPORT(RegDeleteTreeA), VX_EXPORT(RegDeleteTreeW),
     VX_EXPORT(RegSetValueExA), VX_EXPORT(RegSetValueExW), VX_EXPORT(RegQueryValueExA), VX_EXPORT(RegQueryValueExW),
     VX_EXPORT(RegGetValueA), VX_EXPORT(RegGetValueW), VX_EXPORT(RegDeleteValueA), VX_EXPORT(RegDeleteValueW),
     VX_EXPORT(RegEnumKeyExA), VX_EXPORT(RegEnumKeyExW), VX_EXPORT(RegEnumValueA), VX_EXPORT(RegEnumValueW),

@@ -12,10 +12,12 @@ The runtime opens a Unix socket when started with VXRT_CONTROL=<path> (VXRuntime
     tools/vxrt_clip.py --socket /tmp/app.sock do "click 0 150 62" "type 0 eggs" "key 0 13" wait-idle texts
                                                                # several requests in one go, each answer on a line
 
-Requests: state, click <hwnd> <x> <y>, click-text <hwnd> <text>, key <hwnd> <vk>, type <hwnd> <text>, close <hwnd>,
-wait-idle [ms], snapshot <hwnd> <png> (the client bitmap GDI drew into), snapshot-view <hwnd> <png> (what the Mac window
-shows: the committed picture, child windows, alpha, at the backing scale); hwnd 0 is the active window (else the first
-visible one). The notification area and popup menus:
+Requests: state, click <hwnd> <x> <y>, click-text <hwnd> <text>, key <hwnd> <vk>[+<vk>...] (0x11+0x56: Ctrl+V),
+type <hwnd> <text>, wheel <hwnd> <x> <y> <delta>, ime <hwnd> <text> (composed, then committed), clipboard,
+clipboard-set <text>, close <hwnd>, wait-idle [ms], snapshot <hwnd> <png> (the client bitmap GDI drew into),
+snapshot-view <hwnd> <png> (what the Mac window shows: the committed picture, child windows, alpha, at the backing
+scale); hwnd 0 is the active window (else the first visible one). Clicks land where Windows would send them (the child
+window under the point); keys, characters, compositions and the wheel go to the focus window inside hwnd. The notification area and popup menus:
 tray, tray-click <n> [left|right|double|key|menu-key], tray-snapshot <n> <png>, menu, menu-pick <text>, menu-cancel.
 Each answer is one line of JSON."""
 import argparse, json, os, socket, sys, time
@@ -58,6 +60,10 @@ class Clip:
     def click_text(self, text, hwnd=0): return self.ask(f"click-text {hwnd} {text}")
     def key(self, vk, hwnd=0): return self.ask(f"key {hwnd} {vk}")
     def type(self, text, hwnd=0): return self.ask(f"type {hwnd} {text}")
+    def wheel(self, x, y, delta, hwnd=0): return self.ask(f"wheel {hwnd} {x} {y} {delta}")
+    def ime(self, text, hwnd=0): return self.ask(f"ime {hwnd} {text}")
+    def clipboard(self): return self.ask("clipboard")
+    def clipboard_set(self, text): return self.ask(f"clipboard-set {text}")
     def close(self, hwnd=0): return self.ask(f"close {hwnd}")
     def snapshot(self, png, hwnd=0): return self.ask(f"snapshot {hwnd} {png}")
     def snapshot_view(self, png, hwnd=0): return self.ask(f"snapshot-view {hwnd} {png}")

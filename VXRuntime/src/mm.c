@@ -1,5 +1,4 @@
-// winmm (timers; audio and joysticks report no devices until they are implemented) and imm32 (no input method
-// editor: programs get no IME context).
+// winmm (timers; audio and joysticks report no devices until they are implemented).
 #include <mach/mach_time.h>
 #include "vx.h"
 
@@ -32,21 +31,10 @@ static const vx_export winmm[] = {
     VX_EXPORT(PlaySoundA), VX_EXPORT(PlaySoundW),
 };
 
-static WINAPI HANDLE ImmGetContext(HANDLE w) { (void)w; return NULL; }
-static WINAPI BOOL ImmReleaseContext(HANDLE w, HANDLE c) { (void)w; (void)c; return 1; }
-static WINAPI HANDLE ImmAssociateContext(HANDLE w, HANDLE c) { (void)w; (void)c; return NULL; }
-static WINAPI BOOL ImmAssociateContextEx(HANDLE w, HANDLE c, DWORD f) { (void)w; (void)c; (void)f; return 1; }
-static WINAPI BOOL ImmSetOpenStatus(HANDLE c, BOOL o) { (void)c; (void)o; return 1; }
-static WINAPI BOOL ImmGetOpenStatus(HANDLE c) { (void)c; return 0; }
-static WINAPI BOOL ImmDisableIME(DWORD t) { (void)t; return 1; }
-static const vx_export imm32[] = {
-    VX_EXPORT(ImmGetContext), VX_EXPORT(ImmReleaseContext), VX_EXPORT(ImmAssociateContext), VX_EXPORT(ImmAssociateContextEx),
-    VX_EXPORT(ImmSetOpenStatus), VX_EXPORT(ImmGetOpenStatus), VX_EXPORT(ImmDisableIME),
-};
+// (imm32: src/ime.c)
 
 void vx_mm_init(void) {
     vx_register_module("winmm.dll", winmm, sizeof winmm / sizeof winmm[0]);
-    vx_register_module("imm32.dll", imm32, sizeof imm32 / sizeof imm32[0]);
 }
 
 #ifdef __aarch64__

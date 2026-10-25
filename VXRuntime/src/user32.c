@@ -26,6 +26,8 @@ typedef struct { HANDLE hwnd; uint32_t message; WPARAM wparam; LPARAM lparam; DW
 _Static_assert(sizeof(MSG) == 48, "MSG");
 
 WINAPI BOOL vx_ShowWindow(HANDLE hwnd, int cmd);
+static void trace_window(const char *what, vx_window *w);
+static void calc_frame(vx_window *w, int changed, void *pos, RECT old_window, RECT old_client);
 
 static DWORD tick_ms(void) {
     static mach_timebase_info_data_t tb;
@@ -146,6 +148,10 @@ struct vx_queue {
     int quit; WPARAM quit_code;
     vx_timer timers[64]; int ntimers;
     int waiting;                    // its thread waits in GetMessage / WaitMessage / MsgWait... (vx_ui_idle)
+    // The characters a key press makes (the Mac's text input decided them), kept for TranslateMessage: a WM_KEYDOWN
+    // carries PRIV_CHARS | slot in its lPrivate, and TranslateMessage posts them as WM_CHAR (WM_SYSCHAR).
+    struct { HANDLE hwnd; WPARAM vk; uint16_t c[8]; int n; } key_chars[64];
+    unsigned key_next;
     vx_queue *next;
 };
 static vx_queue *g_queues;
@@ -187,17 +193,36 @@ static void cursor_pos(POINT *p) {
     p->x = (LONG)c.x; p->y = (LONG)c.y;
 }
 
-static void queue_post(vx_queue *q, HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp) {
-    MSG m = { hwnd, msg, wp, lp, tick_ms(), { 0, 0 }, 0 };
-    cursor_pos(&m.pt);
+// lPrivate of a posted message, as this runtime marks it (the program sees 0 once it is delivered):
+#define PRIV_ROUTE 0x56580001u      // mouse input that arrived at a top-level window: the window under the point (or the
+                                    // capture) gets it when the thread reads it, as Windows hit-tests (route_mouse)
+#define PRIV_CHARS 0x56590000u      // a key press with characters for TranslateMessage (the queue's key_chars slot below)
+static void queue_post_ex(vx_queue *q, HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp, const POINT *pt, DWORD priv, int front);
+static void queue_post(vx_queue *q, HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp) { queue_post_ex(q, hwnd, msg, wp, lp, NULL, 0, 0); }
+// pt: where the pointer was (NULL: where it is now). front: before every queued message (TranslateMessage's characters
+// come before the key's WM_KEYUP, which is queued already). A pointer move to be routed replaces one still queued
+// behind it, as Windows keeps one WM_MOUSEMOVE.
+static void queue_post_ex(vx_queue *q, HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp, const POINT *pt, DWORD priv, int front) {
+    MSG m = { hwnd, msg, wp, lp, tick_ms(), { 0, 0 }, priv };
+    if (pt) m.pt = *pt; else cursor_pos(&m.pt);
     pthread_mutex_lock(&q->lock);
+    if (priv == PRIV_ROUTE && msg == WM_MOUSEMOVE && q->count) {
+        MSG *last = &q->msgs[(q->head + q->count - 1) % q->cap];
+        if (last->priv == PRIV_ROUTE && last->message == WM_MOUSEMOVE && last->hwnd == hwnd) {
+            *last = m;
+            pthread_cond_broadcast(&q->cond);
+            pthread_mutex_unlock(&q->lock);
+            return;
+        }
+    }
     if (q->count == q->cap) {
         int cap = q->cap ? q->cap * 2 : 64;
         MSG *n = malloc(cap * sizeof *n);
         for (int i = 0; i < q->count; i++) n[i] = q->msgs[(q->head + i) % q->cap];
         free(q->msgs); q->msgs = n; q->cap = cap; q->head = 0;
     }
-    q->msgs[(q->head + q->count++) % q->cap] = m;
+    if (front) { q->head = (q->head + q->cap - 1) % q->cap; q->msgs[q->head] = m; q->count++; }
+    else q->msgs[(q->head + q->count++) % q->cap] = m;
     pthread_cond_broadcast(&q->cond);
     pthread_mutex_unlock(&q->lock);
 }
@@ -387,33 +412,45 @@ static int next_timer_wait(vx_queue *q) {
     }
     return best;
 }
+extern __thread int vx_in_wait;                            // (sync.c: SuspendThread may stop a thread waiting here)
 static void wait_queue(vx_queue *q, int max_ms) {         // q->lock held
     int ms = next_timer_wait(q);
     if (max_ms >= 0 && (ms < 0 || ms > max_ms)) ms = max_ms;
-    if (ms < 0) { pthread_cond_wait(&q->cond, &q->lock); return; }
+    if (ms < 0) { vx_in_wait++; pthread_cond_wait(&q->cond, &q->lock); vx_in_wait--; return; }
     struct timeval tv; gettimeofday(&tv, NULL);
     struct timespec ts = { tv.tv_sec + ms / 1000, (long)tv.tv_usec * 1000 + (long)(ms % 1000) * 1000000 };
     if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+    vx_in_wait++;
     pthread_cond_timedwait(&q->cond, &q->lock, &ts);
+    vx_in_wait--;
 }
 
-static WINAPI BOOL GetMessageA(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max) {
+static int route_mouse(MSG *m, int remove);
+static void thread_key_state(const MSG *m);
+// GetMessage (wait) and PeekMessage: the next message; mouse input is routed to its window now (route_mouse: a window
+// of another thread gets it in its own queue), and the thread's key state follows the input it reads.
+static int fetch(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max, int remove, int wait) {
     vx_queue *q = my_queue();
-    pthread_mutex_lock(&q->lock);
-    while (!next_message(q, out, hwnd, min, max, 1)) { q->waiting = 1; wait_queue(q, -1); q->waiting = 0; }
-    pthread_mutex_unlock(&q->lock);
-    t_last_time = out->time;
+    for (;;) {
+        pthread_mutex_lock(&q->lock);
+        int got;
+        while (!(got = next_message(q, out, hwnd, min, max, remove)) && wait) { q->waiting = 1; wait_queue(q, -1); q->waiting = 0; }
+        pthread_mutex_unlock(&q->lock);
+        if (!got) return 0;
+        if (out->priv == PRIV_ROUTE && !route_mouse(out, remove)) continue;   // (handed to another thread's queue)
+        if (remove) thread_key_state(out);
+        t_last_time = out->time;
+        return 1;
+    }
+}
+static WINAPI BOOL GetMessageA(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max) {
+    fetch(out, hwnd, min, max, 1, 1);
     return out->message != WM_QUIT;
 }
 static WINAPI BOOL GetMessageW(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max) { return GetMessageA(out, hwnd, min, max); }
 #define PM_REMOVE 1
 static WINAPI BOOL PeekMessageA(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max, uint32_t flags) {
-    vx_queue *q = my_queue();
-    pthread_mutex_lock(&q->lock);
-    int r = next_message(q, out, hwnd, min, max, flags & PM_REMOVE);
-    pthread_mutex_unlock(&q->lock);
-    if (r) t_last_time = out->time;
-    return r;
+    return fetch(out, hwnd, min, max, flags & PM_REMOVE, 0);
 }
 static WINAPI BOOL PeekMessageW(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max, uint32_t flags) { return PeekMessageA(out, hwnd, min, max, flags); }
 static WINAPI BOOL WaitMessage(void) {
@@ -462,7 +499,28 @@ static WINAPI DWORD MsgWaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL al
     return MsgWaitForMultipleObjectsEx(n, hs, ms, mask, all ? 1 : 0);
 }
 
-static WINAPI BOOL TranslateMessage(const MSG *m) { return m->message == WM_KEYDOWN || m->message == WM_SYSKEYDOWN; }   // characters arrive as WM_CHAR already
+// TranslateMessage: the characters of a key press, as WM_CHAR (WM_SYSCHAR with Alt), queued to come next. Which
+// characters a key makes is the Mac's to say (its keyboard layout, dead keys, input methods): they came with the key
+// (PRIV_CHARS). Nonzero for every key message, translated or not (Microsoft's documentation).
+static WINAPI BOOL TranslateMessage(const MSG *m) {
+    if (!m) return 0;
+    int down = m->message == WM_KEYDOWN || m->message == WM_SYSKEYDOWN;
+    if (!down && m->message != WM_KEYUP && m->message != WM_SYSKEYUP) return 0;
+    if (!down || (m->priv & 0xffff0000u) != PRIV_CHARS) return 1;
+    vx_queue *q = my_queue();
+    uint16_t c[8]; int n = 0;
+    pthread_mutex_lock(&q->lock);
+    unsigned slot = m->priv & 63;
+    if (q->key_chars[slot].hwnd == m->hwnd && q->key_chars[slot].vk == m->wparam) {
+        n = q->key_chars[slot].n;
+        memcpy(c, q->key_chars[slot].c, sizeof c);
+        q->key_chars[slot].hwnd = NULL;                         // (translated once)
+    }
+    pthread_mutex_unlock(&q->lock);
+    uint32_t msg = m->message == WM_SYSKEYDOWN ? WM_SYSCHAR : WM_CHAR;
+    for (int i = n - 1; i >= 0; i--) queue_post_ex(q, m->hwnd, msg, c[i], m->lparam & 0xffffffff, &m->pt, 0, 1);   // (reversed: each goes in front)
+    return 1;
+}
 typedef void (WINAPI *TIMERPROC)(HANDLE, uint32_t, uint64_t, DWORD);
 static WINAPI LRESULT DispatchMessageA(const MSG *m) {
     if (m->message == WM_TIMER && m->lparam) { ((TIMERPROC)m->lparam)(m->hwnd, WM_TIMER, m->wparam, tick_ms()); return 0; }
@@ -507,6 +565,17 @@ static WINAPI BOOL KillTimer(HANDLE hwnd, uint64_t id) {
 typedef struct { void *params; HANDLE instance, menu, parent; int cy, cx, y, x; LONG style; const void *name, *cls; DWORD exstyle; } CREATESTRUCT;
 
 static void set_title(vx_window *w, const char *t) { free(w->title); w->title = strdup(t ? t : ""); }
+// VXRT_TRACE_WINDOWS=1: where windows are made, moved, sized and restyled, with the rectangles that result (why a
+// window ends up another size than the program asked for).
+static int trace_windows(void) { static int on = -1; if (on < 0) { const char *e = getenv("VXRT_TRACE_WINDOWS"); on = e && *e == '1'; } return on; }
+static void trace_window(const char *what, vx_window *w) {
+    if (!trace_windows() || !w) return;
+    pthread_mutex_lock(&w->lock);
+    RECT r = w->rect; int cw = w->client_w, ch = w->client_h;
+    pthread_mutex_unlock(&w->lock);
+    vx_log("windows: %s %p \"%s\" style %#x ex %#x: rect %d,%d %dx%d, client %dx%d", what, w->hwnd, w->title ? w->title : "",
+           (unsigned)w->style, (unsigned)w->exstyle, (int)r.left, (int)r.top, (int)(r.right - r.left), (int)(r.bottom - r.top), cw, ch);
+}
 
 static HANDLE create_window(DWORD exstyle, const char *class_name, const char *title, DWORD style, int x, int y, int cx, int cy,
                             HANDLE parent, HANDLE menu, HANDLE instance, void *params, const void *raw_title, const void *raw_class) {
@@ -538,8 +607,11 @@ static HANDLE create_window(DWORD exstyle, const char *class_name, const char *t
     } else {
         vx_cocoa_create(w);
     }
+    if (trace_windows()) vx_log("windows: CreateWindow class %s at %d,%d %dx%d", (uintptr_t)class_name < 0x10000 ? "(atom)" : class_name, x, y, cx, cy);
+    trace_window("created", w);
     CREATESTRUCT cs = { params, instance, menu, parent, cy, cx, y, x, (LONG)style, raw_title, raw_class, exstyle };
     if (!call_proc(w, WM_NCCREATE, 0, (LPARAM)&cs)) { vx_cocoa_destroy(w); w->destroyed = 1; return NULL; }
+    calc_frame(w, 0, NULL, w->rect, w->rect);
     if (call_proc(w, WM_CREATE, 0, (LPARAM)&cs) == -1) {
         call_proc(w, WM_NCDESTROY, 0, 0);
         vx_cocoa_destroy(w); w->destroyed = 1;
@@ -638,6 +710,7 @@ void vx_window_resized(vx_window *w, int cw, int ch) {
     int had = w->client_w || w->client_h;
     w->client_w = cw; w->client_h = ch;
     pthread_mutex_unlock(&w->lock);
+    if (changed && !(w->style & WS_CHILD)) trace_window("resized", w);
     if (changed && had) {
         vx_window_invalidate(w, NULL, 1);
         vx_window_post(w->hwnd, WM_SIZE, w->minimized ? 1 : 0, MAKELPARAM(cw, ch));
@@ -655,15 +728,22 @@ void vx_window_moved(vx_window *w, RECT frame) {
 // (Elite Dangerous acquired no DirectInput device, read no XInput pad and took no key).
 static int stay_active(void) { static int on = -1; if (on < 0) { const char *e = getenv("VXRT_STAY_ACTIVE"); on = e && *e == '1'; } return on; }
 static int trace_focus(void) { static int on = -1; if (on < 0) on = getenv("VXRT_TRACE_INPUT") != NULL; return on; }
+static int in_tree(HANDLE h, vx_window *top);
+// Activation: the window becomes the active one and gets the keyboard focus (DefWindowProc's WM_ACTIVATE does the same;
+// a program that keeps the focus in a child window moves it there itself). Deactivation takes the focus from whichever
+// window of it has it, a child window too.
 void vx_window_activated(vx_window *w, int active) {
     if (trace_focus()) vx_log("focus: window %p (%s) %s%s", w->hwnd, w->title ? w->title : "?", active ? "activated" : "deactivated",
                               !active && stay_active() && g_active == w->hwnd ? " (kept active: VXRT_STAY_ACTIVE)" : "");
     if (!active && stay_active() && g_active == w->hwnd) return;
-    if (active) { g_active = g_focus = w->hwnd; }
-    else if (g_active == w->hwnd) { g_active = NULL; if (g_focus == w->hwnd) g_focus = NULL; }
-    vx_window_post(w->hwnd, WM_ACTIVATEAPP, active, 0);
+    if ((active != 0) == (g_active == w->hwnd)) return;      // (already so: Windows sends nothing)
+    HANDLE lost = NULL;
+    if (active) { g_active = w->hwnd; if (!in_tree(g_focus, w)) g_focus = w->hwnd; else active = 2; }
+    else if (g_active == w->hwnd) { g_active = NULL; if (in_tree(g_focus, w)) { lost = g_focus; g_focus = NULL; } }
+    vx_window_post(w->hwnd, WM_ACTIVATEAPP, active != 0, 0);
     vx_window_post(w->hwnd, WM_ACTIVATE, active ? 1 : 0, 0);
-    vx_window_post(w->hwnd, active ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
+    if (active == 1) vx_window_post(w->hwnd, WM_SETFOCUS, 0, 0);
+    else if (lost) vx_window_post(lost, WM_KILLFOCUS, 0, 0);
 }
 // A window shown without taking the Mac's focus (VXRT_NO_ACTIVATE) is still the game's active one with VXRT_STAY_ACTIVE.
 void vx_window_shown_inactive(vx_window *w) { if (stay_active() && !g_active) vx_window_activated(w, 1); }
@@ -733,11 +813,43 @@ static const struct { uint8_t vk; uint16_t scan; } g_keymap[128] = {
     [0x75] = { 0x2E, 0x153 }, [0x76] = { 0x73, 0x3E }, [0x77] = { 0x23, 0x14F }, [0x78] = { 0x71, 0x3C }, [0x79] = { 0x22, 0x151 },
     [0x7A] = { 0x70, 0x3B }, [0x7B] = { 0x25, 0x14B }, [0x7C] = { 0x27, 0x14D }, [0x7D] = { 0x28, 0x150 }, [0x7E] = { 0x26, 0x148 },
 };
-static uint8_t g_keys[256];         // 0x80 down, 0x01 toggled
+static uint8_t g_keys[256];         // 0x80 down, 0x01 toggled: the keyboard and buttons now (GetAsyncKeyState)
 static void raw_key(int scan, int vk, int down);
-static void set_key(int vk, int down) {
-    if (down && !(g_keys[vk] & 0x80)) g_keys[vk] ^= 0x01;
-    g_keys[vk] = (uint8_t)((g_keys[vk] & 0x01) | (down ? 0x80 : 0));
+static void key_set(uint8_t *keys, int vk, int down) {
+    if (down && !(keys[vk] & 0x80)) keys[vk] ^= 0x01;
+    keys[vk] = (uint8_t)((keys[vk] & 0x01) | (down ? 0x80 : 0));
+}
+static void set_key(int vk, int down) { key_set(g_keys, vk, down); }
+// A thread's own key state (GetKeyState, GetKeyboardState, SetKeyboardState): as of the input messages it has read, as
+// on Windows, so a key handler asking for Shift or Ctrl sees them as they were with that key. A thread that has read
+// no input yet sees the keyboard as it is now.
+static __thread uint8_t t_keys[256];
+static __thread int t_keys_own;
+static uint8_t *thread_keys(void) {
+    if (!t_keys_own) { memcpy(t_keys, g_keys, 256); t_keys_own = 1; }
+    return t_keys;
+}
+static void thread_key_state(const MSG *m) {
+    int vk = -1, down = 0;
+    switch (m->message) {
+    case WM_KEYDOWN: case WM_SYSKEYDOWN: vk = (int)(m->wparam & 0xff); down = 1; break;
+    case WM_KEYUP: case WM_SYSKEYUP: vk = (int)(m->wparam & 0xff); break;
+    case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: vk = 1; down = 1; break;
+    case WM_LBUTTONUP: vk = 1; break;
+    case WM_RBUTTONDOWN: case 0x0206: vk = 2; down = 1; break;
+    case WM_RBUTTONUP: vk = 2; break;
+    case WM_MBUTTONDOWN: case 0x0209: vk = 4; down = 1; break;
+    case WM_MBUTTONUP: vk = 4; break;
+    default: return;
+    }
+    if (vk == 0xE5) return;                                   // VK_PROCESSKEY: the key went to the input method
+    uint8_t *k = thread_keys();
+    key_set(k, vk, down);
+    if (vk >= 0xA0 && vk <= 0xA5) key_set(k, 0x10 + (vk - 0xA0) / 2, down || (k[vk ^ 1] & 0x80));   // left/right: the generic key too
+    else if (vk == 0x10 || vk == 0x11 || vk == 0x12) {
+        int left = 0xA0 + (vk - 0x10) * 2, scan_right = vk == 0x10 ? ((m->lparam >> 16) & 0xff) == 0x36 : (m->lparam >> 24) & 1;
+        key_set(k, left + scan_right, down);
+    }
 }
 void vx_mouse_button(int vk, int down) { set_key(vk, down); }
 
@@ -755,7 +867,35 @@ int vx_dinput_mouse_button(int i) {                   // left, right, middle, X1
     static const uint8_t vks[5] = { 0x01, 0x02, 0x04, 0x05, 0x06 };
     return i >= 0 && i < 5 && (g_keys[vks[i]] & 0x80);
 }
-void vx_key_event(vx_window *w, int code, int down, int repeat, int alt) {
+// Keyboard input goes to the window with the focus when it is the given window or inside it (the Mac sends keys to the
+// top-level window, Windows to the focus: Chromium's focus is a child window), else to the window itself.
+static HANDLE keyboard_target(vx_window *w) {
+    HANDLE f = g_focus;
+    return f && in_tree(f, vx_window_top(w)) && vx_window_get(f) ? f : w->hwnd;
+}
+HANDLE vx_keyboard_target(vx_window *w) { return keyboard_target(w); }
+HANDLE vx_focus_window(void) { return g_focus; }
+// A key down with the characters it makes (TranslateMessage posts them), or with VK_PROCESSKEY when the input method
+// took the key (ime: the key's own code still says which key it was in the scan code).
+static void post_key(vx_window *w, uint32_t msg, WPARAM vk, LPARAM lp, const uint16_t *chars, int n) {
+    HANDLE target = keyboard_target(w);
+    vx_window *t = vx_window_get(target);
+    if (!t) return;
+    vx_queue *q = t->queue;
+    DWORD priv = 0;
+    if (n > 0) {
+        pthread_mutex_lock(&q->lock);
+        unsigned slot = q->key_next++ & 63;
+        q->key_chars[slot].hwnd = target; q->key_chars[slot].vk = vk;
+        q->key_chars[slot].n = n < 8 ? n : 8;
+        memcpy(q->key_chars[slot].c, chars, (size_t)q->key_chars[slot].n * 2);
+        pthread_mutex_unlock(&q->lock);
+        priv = PRIV_CHARS | slot;
+    }
+    queue_post_ex(q, target, msg, vk, lp, NULL, priv, 0);
+}
+void vx_key_event(vx_window *w, int code, int down, int repeat, int alt) { vx_key_event_chars(w, code, down, repeat, alt, NULL, 0, 0); }
+void vx_key_event_chars(vx_window *w, int code, int down, int repeat, int alt, const uint16_t *chars, int n, int ime) {
     if (code < 0 || code >= 128 || !g_keymap[code].vk) return;
     int vk = g_keymap[code].vk, scan = g_keymap[code].scan;
     g_dik[(scan & 0x7f) | (scan & 0x100 ? 0x80 : 0)] = down ? 1 : 0;
@@ -766,17 +906,23 @@ void vx_key_event(vx_window *w, int code, int down, int repeat, int alt) {
     if (!down) lp |= (LPARAM)3 << 30;
     else if (repeat) lp |= (LPARAM)1 << 30;
     int sys = alt || vk == 0x12;
-    if (trace_focus() && down) { static volatile int keys; if (__sync_add_and_fetch(&keys, 1) <= 30) vx_log("input: key %#x down to window %p (%s)", vk, w->hwnd, w->title ? w->title : "?"); }
-    vx_window_post(w->hwnd, down ? (sys ? WM_SYSKEYDOWN : WM_KEYDOWN) : (sys ? WM_SYSKEYUP : WM_KEYUP), (WPARAM)vk, lp);
+    if (trace_focus() && down) { static volatile int keys; if (__sync_add_and_fetch(&keys, 1) <= 30) vx_log("input: key %#x down to window %p (%s)", vk, keyboard_target(w), w->title ? w->title : "?"); }
+    uint32_t msg = down ? (sys ? WM_SYSKEYDOWN : WM_KEYDOWN) : (sys ? WM_SYSKEYUP : WM_KEYUP);
+    if (down && ime) vx_ime_key(vk);
+    post_key(w, msg, down && ime ? 0xE5 /* VK_PROCESSKEY */ : (WPARAM)vk, lp, chars, down && !ime ? n : 0);
     raw_key(scan, vk, down);
 }
+// Characters that came without a key (the Mac's character viewer, dictation): WM_CHAR to the focus.
 void vx_char_event(vx_window *w, const uint16_t *chars, int n) {
-    for (int i = 0; i < n; i++) vx_window_post(w->hwnd, WM_CHAR, chars[i], 1);
+    HANDLE target = keyboard_target(w);
+    for (int i = 0; i < n; i++) vx_window_post(target, WM_CHAR, chars[i], 1);
 }
 
-static WINAPI int16_t GetKeyState(int vk) { uint8_t k = g_keys[vk & 0xff]; return (int16_t)((k & 0x80 ? 0x8000 : 0) | (k & 0x01)); }
+static WINAPI int16_t GetKeyState(int vk) { uint8_t k = thread_keys()[vk & 0xff]; return (int16_t)((k & 0x80 ? 0x8000 : 0) | (k & 0x01)); }
 static WINAPI int16_t GetAsyncKeyState(int vk) { return (int16_t)(g_keys[vk & 0xff] & 0x80 ? 0x8000 : 0); }
-static WINAPI BOOL GetKeyboardState(uint8_t *keys) { memcpy(keys, g_keys, 256); return 1; }
+static WINAPI BOOL GetKeyboardState(uint8_t *keys) { if (!keys) { vx_set_last_error(87); return 0; } memcpy(keys, thread_keys(), 256); return 1; }
+// SetKeyboardState: the calling thread's table only, not the keyboard's state (GetAsyncKeyState) or other threads'.
+static WINAPI BOOL SetKeyboardState(const uint8_t *keys) { if (!keys) { vx_set_last_error(87); return 0; } memcpy(thread_keys(), keys, 256); return 1; }
 // MapVirtualKey: 0 VK->scan, 1 scan->VK, 2 VK->char, 3 scan->VK (left/right distinguished).
 static WINAPI uint32_t MapVirtualKeyA(uint32_t code, uint32_t type) {
     for (int i = 0; i < 128; i++) {
@@ -838,7 +984,43 @@ static WINAPI BOOL GetClipCursor(RECT *r) { if (g_clipped) *r = g_clip; else vx_
 static WINAPI HANDLE SetCapture(HANDLE h) { HANDLE o = g_capture; g_capture = h; return o; }
 static WINAPI BOOL ReleaseCapture(void) { g_capture = NULL; return 1; }
 static WINAPI HANDLE GetCapture(void) { return g_capture; }
-static WINAPI BOOL TrackMouseEvent(void *t) { (void)t; return 1; }
+// TrackMouseEvent (TRACKMOUSEEVENT: size, flags, window, hover time): TME_LEAVE posts WM_MOUSELEAVE once the pointer
+// has left the window (at once if it is not over it now); TME_CANCEL ends that, TME_QUERY says what is tracked. Hover
+// tracking (TME_HOVER) is accepted, but no WM_MOUSEHOVER comes.
+typedef struct { DWORD size, flags; HANDLE hwnd; DWORD hover; } TRACKMOUSEEVENT;
+#define TME_HOVER 0x1
+#define TME_LEAVE 0x2
+#define TME_NONCLIENT 0x10
+#define TME_QUERY 0x40000000u
+#define TME_CANCEL 0x80000000u
+#define WM_MOUSELEAVE 0x02A3
+#define WM_NCMOUSELEAVE 0x02A2
+static struct { HANDLE hwnd; DWORD flags; } g_track;
+static pthread_mutex_t g_track_lock = PTHREAD_MUTEX_INITIALIZER;
+static HANDLE window_from_point(POINT p);
+static void mouse_left(HANDLE now_over) {           // the pointer is over now_over (or no window of the tracked one's)
+    pthread_mutex_lock(&g_track_lock);
+    HANDLE h = g_track.hwnd; DWORD f = g_track.flags;
+    if (h && h != now_over && (f & TME_LEAVE)) g_track.hwnd = NULL; else h = NULL;
+    pthread_mutex_unlock(&g_track_lock);
+    if (h) vx_window_post(h, f & TME_NONCLIENT ? WM_NCMOUSELEAVE : WM_MOUSELEAVE, 0, 0);
+}
+static WINAPI BOOL TrackMouseEvent(TRACKMOUSEEVENT *t) {
+    if (!t || t->size != sizeof *t) { vx_set_last_error(87); return 0; }
+    if (t->flags & TME_QUERY) {
+        pthread_mutex_lock(&g_track_lock);
+        t->hwnd = g_track.hwnd; t->flags = g_track.hwnd ? g_track.flags : 0; t->hover = 400;
+        pthread_mutex_unlock(&g_track_lock);
+        return 1;
+    }
+    if (!vx_window_get(t->hwnd)) { vx_set_last_error(1400); return 0; }
+    pthread_mutex_lock(&g_track_lock);
+    if (t->flags & TME_CANCEL) { if (g_track.hwnd == t->hwnd) { g_track.flags &= ~t->flags; if (!(g_track.flags & (TME_LEAVE | TME_HOVER))) g_track.hwnd = NULL; } }
+    else { g_track.hwnd = t->hwnd; g_track.flags = t->flags; }
+    pthread_mutex_unlock(&g_track_lock);
+    if ((t->flags & (TME_LEAVE | TME_CANCEL)) == TME_LEAVE) { POINT p; cursor_pos(&p); mouse_left(window_from_point(p)); }
+    return 1;
+}
 static WINAPI uint32_t GetDoubleClickTime(void) { return 500; }
 
 
@@ -1001,12 +1183,11 @@ static WINAPI uint32_t SendInput(uint32_t n, const uint8_t *inputs, int size) {
             int down = !(flags & 0x2);                                         // KEYEVENTF_KEYUP
             int code = -1;
             for (int k = 0; k < 128 && code < 0; k++) if (g_keymap[k].vk == vk) code = k;
-            if (code >= 0 && w) {
-                vx_key_event(w, code, down, 0, 0);
-                if (down && ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9') || vk == ' ')) {
-                    uint16_t ch = (uint16_t)(vk >= 'A' && vk <= 'Z' && !(g_keys[0x10] & 0x80) ? vk + 32 : vk);
-                    vx_char_event(w, &ch, 1);
-                }
+            if (code >= 0 && w) {                                          // (the character TranslateMessage makes of it)
+                uint16_t ch = 0;
+                if (down && ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9') || vk == ' '))
+                    ch = (uint16_t)(vk >= 'A' && vk <= 'Z' && !(g_keys[0x10] & 0x80) ? vk + 32 : vk);
+                vx_key_event_chars(w, code, down, 0, 0, &ch, ch ? 1 : 0, 0);
             }
         }
     }
@@ -1138,6 +1319,115 @@ static HANDLE window_from_point(POINT p) {
     pthread_mutex_unlock(&g_win_lock);
     return h;
 }
+// ---- mouse input to the window under the pointer ---------------------------------------------------------------------------
+// The Mac delivers mouse events to the top-level window. Windows sends them to the window under the pointer: the
+// deepest visible, enabled child window there goes by its rectangle, and its thread gets the input (PRIV_ROUTE); when
+// that thread reads it, the window is asked WM_NCHITTEST, and one that answers HTTRANSPARENT passes it to the window
+// beneath it (a window of another thread gets it in its own queue and asks there: no thread waits for another).
+// With the mouse captured, the capturing window gets everything. A hit outside the client area (a program's own title
+// bar: HTCAPTION) becomes WM_NC*BUTTON* with the hit-test code and screen coordinates.
+#define HTTRANSPARENT (-1)
+#define HTNOWHERE 0
+#define HTCLIENT 1
+#define HTCAPTION 2
+#define WM_NCMOUSEMOVE 0x00A0
+static int in_tree(HANDLE h, vx_window *top) {
+    vx_window *w = h ? vx_window_get(h) : NULL;
+    for (int n = 0; w && top && n < 64; n++) {
+        if (w == top) return 1;
+        if (!(w->style & WS_CHILD)) return 0;
+        w = vx_window_get(w->parent);
+    }
+    return 0;
+}
+// The deepest visible, enabled descendant of `in` under p (screen), the newest first; `in` itself if none.
+static vx_window *deepest_at(vx_window *in, POINT p) {
+    pthread_mutex_lock(&g_win_lock);
+    for (int deeper = 1; deeper; ) {
+        deeper = 0;
+        for (int i = g_window_next - 1; i >= 0; i--) {
+            vx_window *w = g_windows[i];
+            if (w && (w->style & WS_CHILD) && w->parent == in->hwnd && window_takes_point(w, p)) { in = w; deeper = 1; break; }
+        }
+    }
+    pthread_mutex_unlock(&g_win_lock);
+    return in;
+}
+// After w answered HTTRANSPARENT: an older sibling under p (its deepest window there), else its parent; NULL past top.
+static vx_window *beneath(vx_window *w, POINT p, vx_window *top) {
+    if (w == top) return NULL;
+    vx_window *parent = vx_window_get(w->parent), *found = NULL;
+    if (!parent) return NULL;
+    pthread_mutex_lock(&g_win_lock);
+    int i = 0;
+    while (i < g_window_next && g_windows[i] != w) i++;
+    for (i--; i >= 0 && !found; i--) {
+        vx_window *s = g_windows[i];
+        if (s && (s->style & WS_CHILD) && s->parent == parent->hwnd && window_takes_point(s, p)) found = s;
+    }
+    pthread_mutex_unlock(&g_win_lock);
+    return found ? deepest_at(found, p) : parent;
+}
+static int route_trace(void) { static int on = -1; if (on < 0) on = getenv("VXRT_TRACE_INPUT") != NULL; return on; }
+// m->hwnd: the window to ask first. Returns 0 when the message went to another thread's queue instead (only when it
+// is being removed; a look without removing sees it as the window it is in now gets it).
+static int route_mouse(MSG *m, int remove) {
+    POINT p = m->pt;
+    vx_window *first = vx_window_get(m->hwnd);
+    if (!first) { m->priv = 0; return 1; }
+    vx_window *top = vx_window_top(first), *target = first;
+    LRESULT hit = HTCLIENT;
+    vx_window *cap = g_capture ? vx_window_get(g_capture) : NULL;
+    if (cap) target = cap;
+    else {
+        for (int n = 0; target && n < 64; n++) {
+            if (target->tid != vx_current_tid()) {                  // its own thread asks it
+                if (!remove) break;
+                queue_post_ex(target->queue, target->hwnd, m->message, m->wparam, m->lparam, &m->pt, PRIV_ROUTE, 0);
+                return 0;
+            }
+            hit = call_proc(target, WM_NCHITTEST, 0, MAKELPARAM(p.x, p.y));
+            if (hit != HTTRANSPARENT) break;
+            target = beneath(target, p, top);
+        }
+        if (!target || hit == HTTRANSPARENT) { target = first; hit = HTCLIENT; }
+    }
+    m->priv = 0;
+    if (m->message == WM_MOUSEMOVE) mouse_left(target->hwnd);
+    if (hit == HTCLIENT || hit == HTNOWHERE || hit < 0 || cap) {
+        POINT o; vx_window_screen_origin(target, &o);
+        m->lparam = MAKELPARAM(p.x - o.x, p.y - o.y);
+    } else {
+        m->message = m->message - WM_MOUSEMOVE + WM_NCMOUSEMOVE;      // WM_MOUSEMOVE..WM_MBUTTONDBLCLK -> WM_NC* (0xA0..0xA9)
+        m->wparam = (WPARAM)hit;
+        m->lparam = MAKELPARAM(p.x, p.y);
+    }
+    if (route_trace() && m->message != WM_MOUSEMOVE) vx_log("input: mouse %#x at %d,%d to window %p (hit %lld)", m->message, (int)p.x, (int)p.y, target->hwnd, (long long)hit);
+    m->hwnd = target->hwnd;
+    if (target->tid != vx_current_tid() && remove) {               // another thread's window: its queue has it now
+        queue_post_ex(target->queue, m->hwnd, m->message, m->wparam, m->lparam, &m->pt, 0, 0);
+        return 0;
+    }
+    return 1;
+}
+// From the Mac (cocoa.m) and Command Clips: a mouse message for the top-level window top at a point on the screen.
+void vx_mouse_input(vx_window *top, uint32_t msg, WPARAM keys, int x, int y) {
+    POINT p = { x, y };
+    vx_window *cap = g_capture ? vx_window_get(g_capture) : NULL, *at = cap ? cap : deepest_at(top, p);
+    queue_post_ex(at->queue, at->hwnd, msg, keys, MAKELPARAM(x, y), &p, PRIV_ROUTE, 0);
+}
+// The pointer left the Mac window of top.
+void vx_mouse_exited(vx_window *top) {
+    pthread_mutex_lock(&g_track_lock);
+    HANDLE h = g_track.hwnd;
+    pthread_mutex_unlock(&g_track_lock);
+    if (h && in_tree(h, top)) mouse_left(NULL);
+}
+// The wheel goes to the focus window (Microsoft's documentation of WM_MOUSEWHEEL; DefWindowProc hands it to the
+// parent), with the pointer's place on the screen. horizontal: WM_MOUSEHWHEEL.
+void vx_mouse_wheel(vx_window *top, int delta, WPARAM keys, int x, int y, int horizontal) {
+    vx_window_post(keyboard_target(top), horizontal ? 0x020E : WM_MOUSEWHEEL, (keys & 0xffff) | ((WPARAM)(uint16_t)(int16_t)delta << 16), MAKELPARAM(x, y));
+}
 static WINAPI HANDLE WindowFromPoint(int64_t packed) {
     POINT p = { (LONG)(int32_t)(uint32_t)packed, (LONG)(int32_t)(uint32_t)((uint64_t)packed >> 32) };
     return window_from_point(p);
@@ -1176,8 +1466,10 @@ static WINAPI BOOL SetWindowPos(HANDLE h, HANDLE after, int x, int y, int cx, in
     // its window while the window's thread waits for it would never return).
     int own = w->tid == vx_current_tid();
     pthread_mutex_lock(&w->lock);
-    RECT r = w->rect;
+    RECT r = w->rect, old = r;
+    POINT co; int ocw = w->client_w, och = w->client_h;
     pthread_mutex_unlock(&w->lock);
+    vx_window_screen_origin(w, &co);
     WINDOWPOS wp = { h, after, flags & SWP_NOMOVE ? r.left : x, flags & SWP_NOMOVE ? r.top : y,
                      flags & SWP_NOSIZE ? r.right - r.left : cx, flags & SWP_NOSIZE ? r.bottom - r.top : cy, flags };
     if (own && !(flags & SWP_NOSENDCHANGING)) {
@@ -1193,8 +1485,11 @@ static WINAPI BOOL SetWindowPos(HANDLE h, HANDLE after, int x, int y, int cx, in
     pthread_mutex_unlock(&w->lock);
     if (w->style & WS_CHILD) { vx_window_resized(w, r.right - r.left, r.bottom - r.top); vx_cocoa_redraw(vx_window_top(w)); }
     else vx_cocoa_set_frame(w);
+    if (own && ((flags & 0x20 /* SWP_FRAMECHANGED */) || r.right - r.left != old.right - old.left || r.bottom - r.top != old.bottom - old.top))
+        calc_frame(w, 1, &wp, old, (RECT){ co.x, co.y, co.x + ocw, co.y + och });
     if (flags & SWP_SHOWWINDOW) vx_ShowWindow(h, flags & SWP_NOACTIVATE ? 8 : 5);
     if (flags & SWP_HIDEWINDOW) vx_ShowWindow(h, 0);
+    if (trace_windows()) { vx_log("windows: SetWindowPos %p %d,%d %dx%d flags %#x", h, x, y, cx, cy, flags); trace_window("  now", w); }
     if (own && vx_window_get(h)) {
         pthread_mutex_lock(&w->lock);
         r = w->rect;
@@ -1206,10 +1501,36 @@ static WINAPI BOOL SetWindowPos(HANDLE h, HANDLE after, int x, int y, int cx, in
 }
 static WINAPI BOOL MoveWindow(HANDLE h, int x, int y, int cx, int cy, BOOL repaint) { (void)repaint; return SetWindowPos(h, NULL, x, y, cx, cy, 0); }
 
+// WM_NCCALCSIZE: the client area within the window rectangle. Windows asks the window when it is made and when its
+// frame changes (SetWindowPos with SWP_FRAMECHANGED, or a new size); DefWindowProc leaves a title bar on top when the
+// style has a caption (as AdjustWindowRectEx adds one), no borders. A program that keeps the whole rectangle (SDL and
+// Chromium draw their own frames so) gets a Mac window without a title bar, the same size (Steam's sign-in window was
+// 64 points short: the title bar was taken off twice, once by the Mac window, once by SDL sizing it from that client).
+typedef struct { RECT r[3]; void *pos; } NCCALCSIZE_PARAMS;
+#define WM_NCCALCSIZE 0x0083
+static int captioned(DWORD style) { return (style & WS_CAPTION) == WS_CAPTION && !(style & WS_CHILD); }
+static void calc_frame(vx_window *w, int changed, void *pos, RECT old_window, RECT old_client) {
+    if ((w->style & WS_CHILD) || !w->native || w->tid != vx_current_tid()) return;
+    pthread_mutex_lock(&w->lock);
+    RECT wr = w->rect;
+    pthread_mutex_unlock(&w->lock);
+    RECT client;
+    if (!changed) { client = wr; call_proc(w, WM_NCCALCSIZE, 0, (LPARAM)&client); }
+    else { NCCALCSIZE_PARAMS p = { { wr, old_window, old_client }, pos }; call_proc(w, WM_NCCALCSIZE, 1, (LPARAM)&p); client = p.r[0]; }
+    if (!vx_window_get(w->hwnd)) return;
+    int frameless = captioned(w->style) && client.top <= wr.top;
+    if (frameless == w->frameless) return;
+    w->frameless = frameless;
+    if (trace_windows()) vx_log("windows: %p's WM_NCCALCSIZE: %s", w->hwnd, frameless ? "no title bar (the whole window is client area)" : "a title bar");
+    vx_cocoa_set_style(w);
+}
+
 // Window rectangles from client rectangles: a title bar on top when there is a caption, no borders.
 static WINAPI BOOL AdjustWindowRectEx(RECT *r, DWORD style, BOOL menu, DWORD exstyle) {
     (void)menu; (void)exstyle;
+    LONG top = r->top;
     if ((style & WS_CAPTION) == WS_CAPTION && !(style & WS_CHILD)) r->top -= vx_cocoa_title_height();
+    if (trace_windows()) vx_log("windows: AdjustWindowRectEx style %#x ex %#x: top %d -> %d", (unsigned)style, (unsigned)exstyle, (int)top, (int)r->top);
     return 1;
 }
 static WINAPI BOOL AdjustWindowRect(RECT *r, DWORD style, BOOL menu) { return AdjustWindowRectEx(r, style, menu, 0); }
@@ -1253,6 +1574,7 @@ static int64_t set_long(HANDLE h, int index, int64_t value, int size) {
         DWORD before = w->style;
         w->style = (DWORD)value;
         if ((before ^ w->style) & (WS_CAPTION | WS_THICKFRAME | WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX)) vx_cocoa_set_style(w);
+        if (trace_windows()) { vx_log("windows: style %#x -> %#x", (unsigned)before, (unsigned)w->style); trace_window("  now", w); }
         return old;
     }
     case GWL_EXSTYLE: { DWORD before = w->exstyle; w->exstyle = (DWORD)value; vx_present_exstyle(w, before); return old; }
@@ -1389,7 +1711,22 @@ static LRESULT def_window_proc(HANDLE h, uint32_t msg, WPARAM wp, LPARAM lp, int
     case WM_GETTEXT: return unicode ? GetWindowTextW(h, (WCHAR *)lp, (int)wp) : GetWindowTextA(h, (char *)lp, (int)wp);
     case WM_GETTEXTLENGTH: return unicode ? GetWindowTextLengthW(h) : GetWindowTextLengthA(h);
     case WM_NCHITTEST: return 1;                                       // HTCLIENT
-    case WM_SYSCOMMAND: if ((wp & 0xfff0) == 0xF060) vx_window_post(h, WM_CLOSE, 0, 0); return 0;   // SC_CLOSE
+    case WM_NCCALCSIZE: {                                              // a title bar on top of a captioned top-level window
+        RECT *r = wp ? &((NCCALCSIZE_PARAMS *)lp)->r[0] : (RECT *)lp;
+        if (r && w && captioned(w->style)) r->top += vx_cocoa_title_height();
+        return 0;
+    }
+    case WM_SYSCOMMAND:
+        if ((wp & 0xfff0) == 0xF060) vx_window_post(h, WM_CLOSE, 0, 0);                   // SC_CLOSE
+        else if ((wp & 0xfff0) == 0xF010 && w && !(w->style & WS_CHILD)) vx_cocoa_drag(w); // SC_MOVE: the Mac moves it with the mouse
+        return 0;
+    case 0x00A1:                                                       // WM_NCLBUTTONDOWN on the program's own title bar
+        if (wp == HTCAPTION && w && !(w->style & WS_CHILD)) vx_cocoa_drag(w);
+        return 0;
+    case WM_MOUSEWHEEL: case 0x020E:                                   // (WM_MOUSEHWHEEL) to the parent, as documented
+        return w && (w->style & WS_CHILD) && vx_window_get(w->parent) ? vx_send_message(w->parent, msg, wp, lp) : 0;
+    case 0x010D: case 0x010E: case 0x010F: case 0x0281: case 0x0282: case 0x0286:   // WM_IME_*: the input method's default
+        return vx_ime_default(h, msg, wp, lp, unicode);
     case WM_SYSKEYDOWN: if (wp == 0x73 && (lp & (1 << 29))) vx_window_post(h, WM_CLOSE, 0, 0); return 0;   // Alt+F4
     case WM_ACTIVATE: if (wp & 0xffff) SetFocus(h); return 0;
     case 0x0011: case 0x0016: return 1;                               // WM_QUERYENDSESSION, WM_ENDSESSION
@@ -1574,9 +1911,7 @@ static WINAPI HANDLE GetMenu(HANDLE h) { (void)h; return NULL; }
 static WINAPI BOOL SetMenu(HANDLE h, HANDLE m) { (void)h; (void)m; return 1; }
 static WINAPI BOOL DrawMenuBar(HANDLE h) { (void)h; return 1; }
 static WINAPI HANDLE GetSystemMenu(HANDLE h, BOOL revert) { (void)h; (void)revert; return NULL; }
-static WINAPI BOOL OpenClipboard(HANDLE h) { (void)h; return 0; }
-static WINAPI BOOL CloseClipboard(void) { return 1; }
-static WINAPI BOOL IsClipboardFormatAvailable(uint32_t f) { (void)f; return 0; }
+// (the clipboard: src/clipboard.m)
 
 // wsprintf: a Windows varargs function; the arguments sit in 8-byte slots, as vx_format expects.
 static WINAPI int wvsprintfA(char *buf, const char *fmt, const char *ap) { return vx_format(buf, 1025, fmt, ap); }
@@ -1735,28 +2070,50 @@ void vx_ui_click(HANDLE hwnd, int x, int y) {
         vx_window_activated(top, 1);
     }
     // The pointer arrives first and the button follows a moment later, as a hand does: programs that look for the
-    // control under the pointer once per frame (vgui) then press the one it is on.
-    LPARAM at = (LPARAM)((uint32_t)(uint16_t)x | (uint32_t)(uint16_t)y << 16);
-    queue_post(w->queue, hwnd, WM_MOUSEMOVE, 0, at);
+    // control under the pointer once per frame (vgui) then press the one it is on. Each goes where Windows would send
+    // it: the window under the point (route_mouse), which may be a child window of the one named.
+    POINT at = g_clip_cursor.pt;
+    vx_mouse_input(top, WM_MOUSEMOVE, 0, at.x, at.y);
     usleep(150000);
-    queue_post(w->queue, hwnd, WM_LBUTTONDOWN, 1 /* MK_LBUTTON */, at);
+    vx_mouse_input(top, WM_LBUTTONDOWN, 1 /* MK_LBUTTON */, at.x, at.y);
     usleep(50000);
-    queue_post(w->queue, hwnd, WM_LBUTTONUP, 0, at);
+    vx_mouse_input(top, WM_LBUTTONUP, 0, at.x, at.y);
 }
-void vx_ui_key(HANDLE hwnd, int vk) {
+// Keys pressed in order and let go in reverse (vks[0] first: Ctrl, then V), to the focus window when it is hwnd or
+// inside it. The program's key state follows as it reads them (GetKeyState(VK_CONTROL) with the V). No characters:
+// those are `type`.
+void vx_ui_keys(HANDLE hwnd, const int *vks, int n) {
     vx_window *w = vx_window_get(hwnd);
     if (!w) return;
-    queue_post(w->queue, hwnd, WM_KEYDOWN, (WPARAM)vk, 1);
-    queue_post(w->queue, hwnd, WM_KEYUP, (WPARAM)vk, (LPARAM)(1 | 3u << 30));
+    uint32_t (WINAPI *map)(uint32_t, uint32_t) = (uint32_t (WINAPI *)(uint32_t, uint32_t))MapVirtualKeyA;
+    for (int i = 0; i < n + n; i++) {
+        int k = i < n ? vks[i] : vks[n + n - 1 - i], down = i < n;
+        int alt = 0;
+        for (int j = 0; j < n; j++) if ((vks[j] == 0x12 || vks[j] == 0xA4 || vks[j] == 0xA5) && (down ? j < i : j < n + n - 1 - i)) alt = 1;
+        int sys = alt || k == 0x12 || k == 0xA4 || k == 0xA5;
+        LPARAM lp = 1 | (LPARAM)(map((uint32_t)k, 0) & 0xff) << 16 | (alt ? (LPARAM)1 << 29 : 0) | (down ? 0 : (LPARAM)3 << 30);
+        post_key(w, down ? (sys ? WM_SYSKEYDOWN : WM_KEYDOWN) : (sys ? WM_SYSKEYUP : WM_KEYUP), (WPARAM)k, lp, NULL, 0);
+    }
 }
+void vx_ui_key(HANDLE hwnd, int vk) { vx_ui_keys(hwnd, &vk, 1); }
 void vx_ui_type(HANDLE hwnd, const char *utf8) {
     vx_window *w = vx_window_get(hwnd);
     if (!w) return;
     size_t n = vx_utf8_to_utf16(utf8, strlen(utf8), NULL, 0);
     WCHAR *u = malloc((n + 1) * sizeof *u);
     vx_utf8_to_utf16(utf8, strlen(utf8), u, n);
-    for (size_t i = 0; i < n; i++) queue_post(w->queue, hwnd, WM_CHAR, u[i], 1);
+    vx_char_event(w, u, (int)n);
     free(u);
+}
+// The wheel turned by delta (WHEEL_DELTA 120 a notch; up/away positive) with the pointer at x, y of hwnd's client area.
+void vx_ui_wheel(HANDLE hwnd, int x, int y, int delta) {
+    vx_window *w = vx_window_get(hwnd);
+    if (!w) return;
+    POINT o; client_origin(w, &o);
+    g_clip_cursor.pt = (POINT){ o.x + x, o.y + y };
+    g_clip_cursor.until = tick_ms() + CLIP_CURSOR_MS;
+    __atomic_store_n(&g_clip_cursor.on, 1, __ATOMIC_RELEASE);
+    vx_mouse_wheel(w, delta, 0, o.x + x, o.y + y, 0);
 }
 
 static const vx_export user32[] = {
@@ -1784,7 +2141,7 @@ static const vx_export user32[] = {
     VX_EXPORT(GetClientRect), VX_EXPORT(GetWindowRect), VX_EXPORT(ClientToScreen), VX_EXPORT(ScreenToClient), VX_EXPORT(MapWindowPoints),
     VX_EXPORT(SetWindowPos), VX_EXPORT(MoveWindow), VX_EXPORT(AdjustWindowRect), VX_EXPORT(AdjustWindowRectEx),
     VX_EXPORT(AdjustWindowRectExForDpi), VX_EXPORT(GetWindowPlacement),
-    VX_EXPORT(GetKeyState), VX_EXPORT(GetAsyncKeyState), VX_EXPORT(GetKeyboardState), VX_EXPORT(MapVirtualKeyA), VX_EXPORT(MapVirtualKeyW),
+    VX_EXPORT(GetKeyState), VX_EXPORT(GetAsyncKeyState), VX_EXPORT(GetKeyboardState), VX_EXPORT(SetKeyboardState), VX_EXPORT(MapVirtualKeyA), VX_EXPORT(MapVirtualKeyW),
     VX_EXPORT(MapVirtualKeyExA), VX_EXPORT(MapVirtualKeyExW), VX_EXPORT(GetKeyboardLayout), VX_EXPORT(GetKeyboardType), VX_EXPORT(GetKeyNameTextA),
     VX_EXPORT(GetCursorPos), VX_EXPORT(SetCursorPos), VX_EXPORT(WindowFromPoint), VX_EXPORT(ShowCursor), VX_EXPORT(SetCursor), VX_EXPORT(GetCursor),
     VX_EXPORT(LoadCursorA), VX_EXPORT(LoadCursorW), VX_EXPORT(LoadIconA), VX_EXPORT(LoadIconW), VX_EXPORT(LoadImageA), VX_EXPORT(LoadImageW),
@@ -1803,7 +2160,6 @@ static const vx_export user32[] = {
     VX_EXPORT(RegisterWindowMessageA), VX_EXPORT(RegisterWindowMessageW),
     VX_EXPORT(SetWindowsHookExA), VX_EXPORT(SetWindowsHookExW), VX_EXPORT(UnhookWindowsHookEx), VX_EXPORT(CallNextHookEx),
     VX_EXPORT(GetMenu), VX_EXPORT(SetMenu), VX_EXPORT(DrawMenuBar), VX_EXPORT(GetSystemMenu),
-    VX_EXPORT(OpenClipboard), VX_EXPORT(CloseClipboard), VX_EXPORT(IsClipboardFormatAvailable),
     VX_EXPORT(wvsprintfA), VX_EXPORT(wsprintfA), VX_EXPORT(CharUpperA), VX_EXPORT(CharLowerA), VX_EXPORT(CharNextA),
 };
 
