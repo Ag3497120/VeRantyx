@@ -170,6 +170,19 @@ int main(void) {
     LONG (WINAPI *timer_res)(ULONG, BOOLEAN, ULONG *) = (void *)GetProcAddress(ntdll, "NtSetTimerResolution");
     ULONG cur = 0;
     CHECK(timer_res && timer_res(10000, TRUE, &cur) == 0 && cur == 10000);
+    // InitSecurityInterfaceA, as libcurl's Schannel backend uses it: the table's AcquireCredentialsHandleA (offset 0x18)
+    void **(WINAPI *init_sspi)(void) = (void *)GetProcAddress(LoadLibraryA("secur32.dll"), "InitSecurityInterfaceA");
+    CHECK(init_sspi != NULL);
+    if (init_sspi) {
+        void **table = init_sspi();
+        LONG (WINAPI *enum_packages)(ULONG *, void **) = (void *)table[1];
+        LONG (WINAPI *acquire)(char *, char *, ULONG, void *, void *, void *, void *, void *, void *) = (void *)table[3];
+        ULONG count = 7; void *packages = (void *)1; char unisp[] = "Microsoft Unified Security Protocol Provider";
+        BYTE cred[16], expiry[8];
+        CHECK(table && *(ULONG *)table >= 1 && enum_packages && acquire);
+        CHECK(enum_packages(&count, &packages) == 0 && count == 0);
+        CHECK(acquire(NULL, unisp, 2 /* SECPKG_CRED_OUTBOUND */, NULL, NULL, NULL, NULL, cred, expiry) < 0);
+    }
     printf("game imports: msvcrt vsprintf, classic event tracing, No Man's Sky's -> %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }
