@@ -66,6 +66,49 @@ static WINAPI BOOL WriteFile(HANDLE h, const void *buf, DWORD n, DWORD *written,
     return 1;
 }
 
+// ReadFileEx / WriteFileEx (Microsoft's documentation): asynchronous I/O at the OVERLAPPED's offset whose result
+// comes as a call of the completion routine (error, bytes, OVERLAPPED) on the issuing thread, queued as an APC that
+// runs in its next alertable wait (SleepEx, WaitForSingleObjectEx, WaitForMultipleObjectsEx). The
+// OVERLAPPED's hEvent belongs to the program and is not touched; Internal and InternalHigh get the status and the
+// bytes transferred. Here the transfer itself happens at once. Reading at or past the end fails with ERROR_HANDLE_EOF
+// and queues nothing. Files only (pipes and sockets: ERROR_NOT_SUPPORTED, as before). Steam's content system
+// (steamclient64.dll) imports WriteFileEx.
+typedef struct { void (WINAPI *routine)(DWORD, DWORD, void *); DWORD error, bytes; void *ov; } io_completion;
+static WINAPI void io_completion_apc(uintptr_t data) {
+    io_completion *c = (io_completion *)data;
+    c->routine(c->error, c->bytes, c->ov);
+    free(c);
+}
+static BOOL file_io_ex(HANDLE h, void *buf, DWORD n, void *ov, void *routine, int write) {
+    int fd = vx_handle_fd(h);
+    struct stat st;
+    if (!ov || !routine) { vx_set_last_error(87 /* ERROR_INVALID_PARAMETER */); return 0; }
+    if (fd < 0) { vx_set_last_error(6 /* ERROR_INVALID_HANDLE */); return 0; }
+    if (fd <= 2 || fstat(fd, &st) || !S_ISREG(st.st_mode)) {
+        vx_log("%s on a handle that is not a file is not supported yet", write ? "WriteFileEx" : "ReadFileEx");
+        vx_set_last_error(50 /* ERROR_NOT_SUPPORTED */);
+        return 0;
+    }
+    uint64_t *o = ov;
+    const DWORD *off = ov;
+    off_t at = (off_t)off[4] | (off_t)off[5] << 32;
+    if (write && off[4] == 0xffffffffu && off[5] == 0xffffffffu) at = st.st_size;   // (the end of the file)
+    ssize_t r = write ? pwrite(fd, buf, n, at) : pread(fd, buf, n, at);
+    if (r < 0) { vx_set_last_error(vx_file_io_error(fd, errno)); return 0; }
+    if (!write && !r && n) { vx_set_last_error(38 /* ERROR_HANDLE_EOF */); return 0; }
+    o[0] = 0;                                                        // Internal: STATUS_SUCCESS
+    o[1] = (uint64_t)r;                                              // InternalHigh: bytes transferred
+    static DWORD (WINAPI *queue)(void (WINAPI *)(uintptr_t), HANDLE, uintptr_t);
+    if (!queue) queue = (DWORD (WINAPI *)(void (WINAPI *)(uintptr_t), HANDLE, uintptr_t))vx_find_export("kernel32.dll", "QueueUserAPC");
+    io_completion *c = malloc(sizeof *c);
+    *c = (io_completion){ (void (WINAPI *)(DWORD, DWORD, void *))routine, 0, (DWORD)r, ov };
+    if (!queue(io_completion_apc, (HANDLE)(intptr_t)-2, (uintptr_t)c)) { free(c); return 0; }
+    vx_set_last_error(0);
+    return 1;
+}
+static WINAPI BOOL ReadFileEx(HANDLE h, void *buf, DWORD n, void *ov, void *routine) { return file_io_ex(h, buf, n, ov, routine, 0); }
+static WINAPI BOOL WriteFileEx(HANDLE h, const void *buf, DWORD n, void *ov, void *routine) { return file_io_ex(h, (void *)buf, n, ov, routine, 1); }
+
 static WINAPI BOOL WriteConsoleA(HANDLE h, const void *buf, DWORD n, DWORD *written, void *reserved) {
     return WriteFile(h, buf, n, written, reserved);
 }
@@ -1042,7 +1085,7 @@ static WINAPI void GetSystemInfo(SYSTEM_INFO *si) {
 static WINAPI void GetNativeSystemInfo(SYSTEM_INFO *si) { GetSystemInfo(si); }
 
 static const vx_export k32[] = {
-    VX_EXPORT(GetStdHandle), VX_EXPORT(WriteFile), VX_EXPORT(WriteConsoleA), VX_EXPORT(WriteConsoleW),
+    VX_EXPORT(GetStdHandle), VX_EXPORT(WriteFile), VX_EXPORT(ReadFileEx), VX_EXPORT(WriteFileEx), VX_EXPORT(WriteConsoleA), VX_EXPORT(WriteConsoleW),
     VX_EXPORT(ExitProcess), VX_EXPORT(TerminateProcess),
     VX_EXPORT(GetLastError), VX_EXPORT(SetLastError), VX_EXPORT(IsDebuggerPresent), VX_EXPORT(CheckRemoteDebuggerPresent),
     VX_EXPORT(GetCurrentProcessId), VX_EXPORT(GetCurrentThreadId), VX_EXPORT(GetCurrentProcess), VX_EXPORT(GetCurrentThread),
@@ -1072,49 +1115,160 @@ static const vx_export k32[] = {
     VX_EXPORT(HeapSetInformation), VX_EXPORT(SetHandleCount), VX_EXPORT(GetThreadTimes), VX_EXPORT(GetProcessTimes),
 };
 
-// shell32: programs (.exe) start through CreateProcess; documents and URLs are not opened (that would reach outside
-// the program on the Mac): programs see the "no association" failure.
-static BOOL shell_run(const char *file, const char *params, const char *dir, void **pi) {
-    size_t n = file ? strlen(file) : 0;
-    if (n < 4 || strcasecmp(file + n - 4, ".exe")) return 0;
-    char *cmd = malloc(n + (params ? strlen(params) : 0) + 8);
-    sprintf(cmd, "\"%s\"%s%s", file, params && *params ? " " : "", params && *params ? params : "");
-    BOOL ok = create_process(file, cmd, NULL, 0, dir, NULL, pi);
-    free(cmd);
-    return ok;
+// shell32's ShellExecute(Ex), as Microsoft documents them: a program (.exe, .com) starts through CreateProcess with the
+// parameters after it; a URL (<scheme>:...) or a document (a file there, by its extension's ProgID) runs the command
+// registered for the verb in HKEY_CLASSES_ROOT: <class>\shell\<verb>\command, where the verb not given is the
+// default one (the shell key's default value, else "open"). HKEY_CLASSES_ROOT is the per-user classes
+// (HKCU\Software\Classes) over the machine's (HKLM\Software\Classes); keys a program wrote to HKEY_CLASSES_ROOT
+// itself are kept apart here and looked at last. In the command, %1 and %L are the file or URL, %* the parameters;
+// it starts with CreateProcess. Nothing registered: SE_ERR_NOASSOC (ERROR_NO_ASSOCIATION from ShellExecuteEx), never
+// anything of the Mac's (a URL is not handed to the Mac's browser); a document that is not there: SE_ERR_FNF.
+char *vx_reg_get_string(const char *path, const char *name, int *expand);   // registry.c
+enum { SE_ERR_FNF = 2, SE_ERR_PNF = 3, SE_ERR_ACCESSDENIED = 5, SE_ERR_OOM = 8, SE_ERR_NOASSOC = 31 };
+static const char *const g_class_roots[] = { "HKEY_CURRENT_USER\\Software\\Classes\\", "HKEY_LOCAL_MACHINE\\Software\\Classes\\",
+                                             "HKEY_CLASSES_ROOT\\" };
+// A value of HKEY_CLASSES_ROOT\<key> (malloc'd, environment variables expanded for REG_EXPAND_SZ), the per-user one first.
+static char *class_value(const char *key, const char *name) {
+    for (size_t i = 0; i < sizeof g_class_roots / sizeof g_class_roots[0]; i++) {
+        char path[2048];
+        snprintf(path, sizeof path, "%s%s", g_class_roots[i], key);
+        int expand = 0;
+        char *v = vx_reg_get_string(path, name, &expand);
+        if (!v) continue;
+        if (expand) {
+            DWORD (WINAPI *exp)(const char *, char *, DWORD) = (DWORD (WINAPI *)(const char *, char *, DWORD))vx_find_export("kernel32.dll", "ExpandEnvironmentStringsA");
+            DWORD n = exp ? exp(v, NULL, 0) : 0;
+            if (n) { char *e = malloc(n + 1); if (exp(v, e, n + 1)) { free(v); v = e; } else free(e); }
+        }
+        return v;
+    }
+    return NULL;
 }
-static WINAPI void *ShellExecuteA(void *w, const char *op, const char *file, const char *params, const char *dir, int show) {
-    (void)w; (void)op; (void)show;
-    void *pi[3] = { 0 };
-    if (shell_run(file, params, dir, pi)) { vx_handle_close(pi[0]); vx_handle_close(pi[1]); return (void *)42; }
-    vx_log("ShellExecute(%s) is not supported yet", file ? file : "");
-    return (void *)31;                        // SE_ERR_NOASSOC
+// The command registered for a class and verb (NULL or empty: the default verb).
+static char *class_command(const char *cls, const char *verb) {
+    char key[2048];
+    char *def = NULL;
+    if (!verb || !*verb) {
+        snprintf(key, sizeof key, "%s\\shell", cls);
+        def = class_value(key, "");
+        verb = def && *def ? def : "open";
+    }
+    snprintf(key, sizeof key, "%s\\shell\\%s\\command", cls, verb);
+    free(def);
+    return class_value(key, "");
 }
-static WINAPI void *ShellExecuteW(void *w, const WCHAR *op, const WCHAR *file, const WCHAR *params, const WCHAR *dir, int show) {
-    (void)op;
-    char *f = vx_utf8_dup(file), *p = vx_utf8_dup(params), *d = vx_utf8_dup(dir);
-    void *r = ShellExecuteA(w, NULL, f, p, d, show);
-    free(f); free(p); free(d);
+// "<scheme>:" with a scheme of two or more letters, digits, +, - or . that starts with a letter (one letter is a drive).
+static int url_scheme(const char *f, char *scheme, size_t cap) {
+    size_t n = 0;
+    if (!f || !isalpha((unsigned char)f[0])) return 0;
+    while (isalnum((unsigned char)f[n]) || f[n] == '+' || f[n] == '-' || f[n] == '.') n++;
+    if (n < 2 || f[n] != ':' || n >= cap) return 0;
+    memcpy(scheme, f, n); scheme[n] = 0;
+    return 1;
+}
+// The command line: %1 / %L / %l the target, %* the parameters, %% a %; %2..%9 and %I (no item ID list here) nothing.
+static char *substitute(const char *cmd, const char *target, const char *params) {
+    size_t cap = strlen(cmd) + 1, n = 0;
+    for (const char *c = cmd; *c; c++) if (*c == '%') cap += strlen(target) + (params ? strlen(params) : 0);
+    char *out = malloc(cap);
+    for (const char *c = cmd; *c; c++) {
+        if (c[0] != '%' || !c[1]) { out[n++] = *c; continue; }
+        char k = *++c;
+        const char *put = k == '1' || k == 'L' || k == 'l' ? target : k == '*' ? (params ? params : "") : k == '%' ? "%" :
+                          (k >= '2' && k <= '9') || k == 'I' || k == 'i' ? "" : NULL;
+        if (!put) { out[n++] = '%'; out[n++] = k; continue; }
+        size_t m = strlen(put); memcpy(out + n, put, m); n += m;
+    }
+    out[n] = 0;
+    return out;
+}
+static int se_error_of_last_error(void) {
+    DWORD e = vx_get_last_error();
+    return e == 2 ? SE_ERR_FNF : e == 3 ? SE_ERR_PNF : e == 5 ? SE_ERR_ACCESSDENIED : e == 8 ? SE_ERR_OOM : SE_ERR_FNF;
+}
+// Runs it: > 32 started (pi: process and thread), else the SE_ERR_ code, with the last error ShellExecuteEx reports.
+static int shell_execute_1(const char *verb, const char *file, const char *params, const char *dir, const char *cls, void **pi);
+static int shell_execute(const char *verb, const char *file, const char *params, const char *dir, const char *cls, void **pi) {
+    int r = shell_execute_1(verb, file, params, dir, cls, pi);
+    if (r <= 32 || vx_trace)
+        vx_log("ShellExecute(verb %s, file \"%s\", parameters \"%s\", directory \"%s\") = %d", verb ? verb : "(default)", file ? file : "",
+               params ? params : "", dir ? dir : "", r);
     return r;
 }
-// SHELLEXECUTEINFO: size, mask, window, verb, file, parameters, directory, show, instance, ..., process (at 104).
-static BOOL shell_execute_ex(uint8_t *info, int wide) {
-    char *file = wide ? vx_utf8_dup(*(WCHAR **)(info + 24)) : *(char **)(info + 24);
-    char *params = wide ? vx_utf8_dup(*(WCHAR **)(info + 32)) : *(char **)(info + 32);
-    char *dir = wide ? vx_utf8_dup(*(WCHAR **)(info + 40)) : *(char **)(info + 40);
-    void *pi[3] = { 0 };
-    BOOL ok = shell_run(file, params, dir, pi);
-    if (ok) {
-        if (*(DWORD *)(info + 4) & 0x40) *(HANDLE *)(info + 104) = pi[0]; else vx_handle_close(pi[0]);   // SEE_MASK_NOCLOSEPROCESS
-        vx_handle_close(pi[1]);
-        *(void **)(info + 56) = (void *)42;
-    } else {
-        vx_log("ShellExecuteEx(%s) is not supported yet", file ? file : "");
-        *(void **)(info + 56) = (void *)31;
-        vx_set_last_error(1155);                                      // ERROR_NO_ASSOCIATION
+static int shell_execute_1(const char *verb, const char *file, const char *params, const char *dir, const char *cls, void **pi) {
+    if (!file || !*file) { vx_set_last_error(2); return SE_ERR_FNF; }
+    char scheme[64], *cmd = NULL, *line = NULL;
+    size_t n = strlen(file);
+    int program = !cls && n >= 4 && (!strcasecmp(file + n - 4, ".exe") || !strcasecmp(file + n - 4, ".com")) && !url_scheme(file, scheme, sizeof scheme);
+    if (program && (!verb || !*verb || !strcasecmp(verb, "open") || !strcasecmp(verb, "runas"))) {
+        line = malloc(n + (params ? strlen(params) : 0) + 8);
+        sprintf(line, "\"%s\"%s%s", file, params && *params ? " " : "", params && *params ? params : "");
+        BOOL ok = create_process(file, line, NULL, 0, dir, NULL, pi);
+        free(line);
+        return ok ? 42 : se_error_of_last_error();
     }
-    if (wide) { free(file); free(params); free(dir); }
-    return ok;
+    if (cls) cmd = class_command(cls, verb);
+    else if (url_scheme(file, scheme, sizeof scheme)) cmd = class_command(scheme, verb);
+    else {
+        char win[2048], unix_path[2048];
+        int relative = !(file[0] == '\\' || (file[0] && file[1] == ':'));
+        if (relative && dir && *dir) snprintf(win, sizeof win, "%s\\%s", dir, file);
+        else snprintf(win, sizeof win, "%s", file);
+        struct stat st;
+        if (!vx_unix_path(win, unix_path, sizeof unix_path) || stat(unix_path, &st)) { vx_set_last_error(2); return SE_ERR_FNF; }
+        const char *base = strrchr(file, '\\'), *dot = strrchr(base ? base : file, '.');
+        if (dot && !S_ISDIR(st.st_mode)) {
+            char *progid = class_value(dot, "");
+            if (progid && *progid) cmd = class_command(progid, verb);
+            if (!cmd) cmd = class_command(dot, verb);
+            free(progid);
+        }
+    }
+    if (!cmd) {
+        vx_log("ShellExecute(%s): no application is registered for it", file);
+        vx_set_last_error(1155);                                      // ERROR_NO_ASSOCIATION
+        return SE_ERR_NOASSOC;
+    }
+    line = substitute(cmd, file, params);
+    if (vx_trace) vx_log("ShellExecute(%s): %s", file, line);
+    BOOL ok = create_process(NULL, line, NULL, 0, dir, NULL, pi);
+    free(cmd); free(line);
+    return ok ? 42 : se_error_of_last_error();
+}
+static WINAPI void *ShellExecuteA(void *w, const char *op, const char *file, const char *params, const char *dir, int show) {
+    (void)w; (void)show;
+    void *pi[3] = { 0 };
+    int r = shell_execute(op, file, params, dir, NULL, pi);
+    if (r > 32) { vx_handle_close(pi[0]); vx_handle_close(pi[1]); }
+    return (void *)(intptr_t)r;
+}
+static WINAPI void *ShellExecuteW(void *w, const WCHAR *op, const WCHAR *file, const WCHAR *params, const WCHAR *dir, int show) {
+    char *o = vx_utf8_dup(op), *f = vx_utf8_dup(file), *p = vx_utf8_dup(params), *d = vx_utf8_dup(dir);
+    void *r = ShellExecuteA(w, o, f, p, d, show);
+    free(o); free(f); free(p); free(d);
+    return r;
+}
+// SHELLEXECUTEINFO (64-bit): cbSize, fMask, hwnd, lpVerb (16), lpFile (24), lpParameters (32), lpDirectory (40), nShow,
+// hInstApp (56), lpIDList, lpClass (72), hkeyClass, dwHotKey, hIcon, hProcess (104). SEE_MASK_CLASSNAME (1): lpClass
+// names the class; SEE_MASK_NOCLOSEPROCESS (0x40): hProcess is the process started.
+static BOOL shell_execute_ex(uint8_t *info, int wide) {
+    DWORD mask = *(DWORD *)(info + 4);
+    char *s[5];
+    for (int i = 0; i < 5; i++) {
+        size_t at = i < 4 ? 16 + 8 * (size_t)i : 72;
+        void *v = *(void **)(info + at);
+        s[i] = !v || (i == 4 && !(mask & 1)) ? NULL : wide ? vx_utf8_dup(v) : strdup(v);
+    }
+    void *pi[3] = { 0 };
+    int r = shell_execute(s[0], s[1], s[2], s[3], s[4], pi);
+    if (mask & 0x40) *(HANDLE *)(info + 104) = NULL;
+    if (r > 32) {
+        if (mask & 0x40) *(HANDLE *)(info + 104) = pi[0]; else vx_handle_close(pi[0]);
+        vx_handle_close(pi[1]);
+    }
+    *(void **)(info + 56) = (void *)(intptr_t)r;
+    for (int i = 0; i < 5; i++) free(s[i]);
+    return r > 32;
 }
 static WINAPI BOOL ShellExecuteExA(uint8_t *info) { return shell_execute_ex(info, 0); }
 static WINAPI BOOL ShellExecuteExW(uint8_t *info) { return shell_execute_ex(info, 1); }

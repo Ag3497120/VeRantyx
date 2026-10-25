@@ -173,6 +173,18 @@ build/net.exe: tests/net.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -lws2_32
 
+# ReadFileEx/WriteFileEx: completion routines in alertable waits.
+tests: build/file_io_ex.exe
+build/file_io_ex.exe: tests/file_io_ex.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $<
+
+# ShellExecute(Ex) with classes registered per user, and one process seeing what another saved in the registry.
+tests: build/shellexec.exe
+build/shellexec.exe: tests/shellexec.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $< -lshell32 -ladvapi32
+
 # Registered waits and timer-queue timers ended with a completion event, as Chromium's ObjectWatcher does (src/system.c).
 build/regwait.exe: tests/regwait.c
 	@mkdir -p build
@@ -1281,6 +1293,8 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/net.exe
 	$(VXRT) build/net_events.exe
 	$(VXRT) build/regwait.exe
+	$(VXRT) build/shellexec.exe
+	$(VXRT) build/file_io_ex.exe
 	$(VXRT) build/tcptable.exe
 	$(VXRT) build/winprops.exe
 	$(VXRT) build/a11y.exe
