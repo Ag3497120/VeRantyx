@@ -394,6 +394,11 @@ int main(int argc, char **argv) {
     RECT cr;
     CHECK(GetWindowRect(g_child, &cr) && cr.left == o.x + 8 && cr.top == o.y + 210 && cr.right == o.x + 56);
     CHECK(WindowFromPoint((POINT){ o.x + 20, o.y + 220 }) == g_child);
+    // A child that never paints (no class brush, DefWindowProc), over tile A: the screen keeps showing the parent's
+    // picture there, as Chromium's "Chrome Legacy Window" over its page does (present_check.py checks tile A's view).
+    HWND blank = CreateWindowExA(0, "VXPresentPopup", "", WS_CHILD | WS_VISIBLE, 0, 0, 64, 64, g_main, NULL, NULL, NULL);
+    CHECK(blank != NULL);
+    UpdateWindow(blank);
     layered();
     int frames; DWORD last = 0;
     double us = perf(&frames, &last);

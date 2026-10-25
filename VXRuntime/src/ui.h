@@ -75,6 +75,7 @@ typedef struct vx_window {
     RECT     dirty;                 // drawn since the last commit (device coordinates), when `changed`
     int      changed, paint_depth;  // paint_depth: inside BeginPaint (a DC given back there does not commit)
     uint64_t committed, presented;  // pictures committed / handed to Core Animation
+    int      drawn;                 // GDI has drawn into the client area (a child window that never has shows what is beneath it)
     double   changed_at;            // when the first uncommitted drawing happened (seconds, monotonic)
     int      fallback_pending;      // a late commit of drawing nobody committed is scheduled
     double   shown_at;              // cocoa: when the main thread last handed its pictures to Core Animation

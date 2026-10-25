@@ -534,6 +534,7 @@ static void late_commit(void *p) {
 void vx_present_changed(vx_window *w, const RECT *r) {
     RECT b = r ? and_rect(*r, (RECT){ 0, 0, w->bw, w->bh }) : (RECT){ 0, 0, w->bw, w->bh };
     if (empty(b)) return;
+    w->drawn = 1;
     if (!w->changed) { w->changed = 1; w->dirty = b; w->changed_at = now_s(); }
     else w->dirty = or_rect(w->dirty, b);
     if (!w->fallback_pending) {

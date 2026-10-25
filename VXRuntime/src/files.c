@@ -905,8 +905,25 @@ static int view_allowed(DWORD access, DWORD granted) {
 // (MAP_PRIVATE gives EINVAL), so the view is private memory with the object's bytes copied in when it is mapped.
 // (Windows copies a page when the view first writes it; until then this copy does not see later writes through
 // other views.)
+// Views start on the allocation granularity (64 KB), as on Windows: programs round a view's address down to it.
+// Chromium's shared memory gives UnmapViewOfFile the view's address aligned down to 64 KB; with views on 4 KB pages
+// that named another view (one of Steam's own), which was unmapped under it (steamwebhelper read freed memory and
+// crashed a second after drawing its login window). mmap anywhere a range 64 KB larger, then the view in it, aligned.
+#define VIEW_ALIGN 0x10000
+static void *map_aligned(void *addr, size_t bytes, int prot, int flags, int fd, off_t offset) {
+    if (addr) return mmap(addr, bytes, prot, flags, fd, offset);
+    size_t page = (size_t)getpagesize(), span = (bytes + page - 1) / page * page;
+    uint8_t *r = mmap(NULL, span + VIEW_ALIGN, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (r == MAP_FAILED) return MAP_FAILED;
+    uint8_t *a = (uint8_t *)(((uintptr_t)r + VIEW_ALIGN - 1) & ~(uintptr_t)(VIEW_ALIGN - 1));
+    void *p = mmap(a, bytes, prot, flags | MAP_FIXED, fd, offset);
+    if (p == MAP_FAILED) { int e = errno; munmap(r, span + VIEW_ALIGN); errno = e; return MAP_FAILED; }
+    if (a > r) munmap(r, (size_t)(a - r));                         // (the reservation's ends around the view)
+    if (r + span + VIEW_ALIGN > a + span) munmap(a + span, (size_t)(r + span + VIEW_ALIGN - (a + span)));
+    return p;
+}
 static void *private_copy_view(mapping *m, uint64_t offset, size_t bytes, void *addr) {
-    void *p = mmap(addr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    void *p = map_aligned(addr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) return MAP_FAILED;
     size_t have = offset < m->size ? (size_t)(m->size - offset) : 0;
     if (have > bytes) have = bytes;
@@ -928,7 +945,8 @@ static WINAPI void *MapViewOfFileEx(HANDLE h, DWORD access, DWORD high, DWORD lo
     DWORD granted;                                                 // the handle's access, where recorded (sync.c)
     if (vx_handle_access(h, &granted) && !view_allowed(access, granted)) { vx_set_last_error(5 /* ERROR_ACCESS_DENIED */); return NULL; }
     int prot = PROT_READ | ((access & FILE_MAP_WRITE) || copy ? PROT_WRITE : 0);
-    void *p = mmap(addr, bytes, prot, copy ? MAP_PRIVATE : MAP_SHARED, m->fd, (off_t)offset);
+    if (addr && ((uintptr_t)addr & (VIEW_ALIGN - 1))) { vx_set_last_error(1132 /* ERROR_MAPPED_ALIGNMENT */); return NULL; }
+    void *p = map_aligned(addr, bytes, prot, copy ? MAP_PRIVATE : MAP_SHARED, m->fd, (off_t)offset);
     if (p == MAP_FAILED && copy && errno == EINVAL && m->shm[0]) p = private_copy_view(m, offset, bytes, addr);
     if (p == MAP_FAILED) { set_error_from_errno(); return NULL; }
     pthread_mutex_lock(&g_views_lock);

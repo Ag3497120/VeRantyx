@@ -597,7 +597,7 @@ static const vx_export hid[] = {
     { "HidP_GetUsageValue", (void *)hidp_fails }, { "HidP_GetScaledUsageValue", (void *)hidp_fails },
 };
 static const vx_export iphlpapi[] = {
-    { "GetExtendedTcpTable", (void *)iphlp_unsupported }, { "GetExtendedUdpTable", (void *)iphlp_unsupported },
+    { "GetExtendedUdpTable", (void *)iphlp_unsupported },             // (GetExtendedTcpTable: tcptable.c)
     { "GetAdaptersInfo", (void *)iphlp_unsupported },                   // (GetAdaptersAddresses, GetBestInterface, GetBestRoute: extras.c)
     { "GetIfTable", (void *)iphlp_unsupported },                         // (GetNetworkParams: extras.c; NotifyAddrChange, GetIfEntry2: iphlp.c)
     { "ConvertInterfaceGuidToLuid", (void *)iphlp_not_found },

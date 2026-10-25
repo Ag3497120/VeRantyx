@@ -33,6 +33,7 @@ typedef struct dc_state {
     int bk_mode, map_mode, stretch_mode, graphics_mode;
     POINT pos, vp_org, win_org;
     vx_region *clip;                                          // (a copy)
+    float xform[6]; int rop2, poly_fill, arc_dir;
 } dc_state;
 
 typedef struct gdi_obj {
@@ -47,6 +48,7 @@ typedef struct gdi_obj {
     HANDLE bitmap, brush, pen, font;                          //   or the bitmap selected into a memory DC
     uint32_t text_color, bk_color, dc_brush, dc_pen, text_align;
     int bk_mode, map_mode, stretch_mode, graphics_mode;
+    float xform[6]; int rop2, poly_fill, arc_dir;             //   the world transform (XFORM), ROP2, fill and arc settings
     POINT pos, vp_org, win_org;
     vx_region *clip;                                          //   the clip region (device coordinates), NULL: none
     dc_state *saved; int nsaved;                              //   SaveDC's stack
@@ -284,6 +286,7 @@ static gdi_obj *new_dc(int type, vx_window *w) {
     d->brush = g_stock[0]; d->pen = g_stock[7]; d->font = g_stock[13];
     d->text_color = 0; d->bk_color = 0xFFFFFF; d->bk_mode = OPAQUE_BK; d->dc_brush = 0xFFFFFF; d->dc_pen = 0;
     d->map_mode = 1 /* MM_TEXT */; d->stretch_mode = 1 /* BLACKONWHITE */; d->graphics_mode = 1 /* GM_COMPATIBLE */;
+    d->xform[0] = d->xform[3] = 1; d->rop2 = 13 /* R2_COPYPEN */; d->poly_fill = 1 /* ALTERNATE */; d->arc_dir = 1 /* AD_COUNTERCLOCKWISE */;
     return d;
 }
 HANDLE vx_dc_for_window(vx_window *w) { return new_obj(new_dc(OBJ_DC, w)); }
@@ -673,6 +676,42 @@ static WINAPI uint32_t SetTextAlign(HANDLE h, uint32_t a) { gdi_obj *d = dc_of(h
 static WINAPI uint32_t GetTextAlign(HANDLE h) { gdi_obj *d = dc_of(h); return d ? d->text_align : 0xffffffffu; }
 static WINAPI int SetGraphicsMode(HANDLE h, int m) { gdi_obj *d = dc_of(h); if (!d || m < 1 || m > 2) return 0; int o = d->graphics_mode; d->graphics_mode = m; return o; }
 static WINAPI int GetGraphicsMode(HANDLE h) { gdi_obj *d = dc_of(h); return d ? d->graphics_mode : 0; }
+// The world transform (XFORM: eM11, eM12, eM21, eM22, eDx, eDy): kept per DC as documented - set only in GM_ADVANCED,
+// reset to identity by MWT_IDENTITY, combined by MWT_LEFTMULTIPLY / MWT_RIGHTMULTIPLY. Drawing here uses only the
+// identity: programs (Chromium's skia::InitializeDC) set it to identity on their bitmaps' DCs.
+static void xform_mul(const float *a, const float *b, float *out) {   // out = a * b (a applied first)
+    float r[6] = { a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3], a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3],
+                   a[4] * b[0] + a[5] * b[2] + b[4], a[4] * b[1] + a[5] * b[3] + b[5] };
+    memcpy(out, r, sizeof r);
+}
+static WINAPI BOOL SetWorldTransform(HANDLE h, const float *x) {
+    gdi_obj *d = dc_of(h);
+    if (!d || !x || d->graphics_mode != 2 /* GM_ADVANCED */) { vx_set_last_error(87); return 0; }
+    if (x[0] * x[3] - x[1] * x[2] == 0) { vx_set_last_error(87); return 0; }   // (a singular transform is refused)
+    memcpy(d->xform, x, sizeof d->xform);
+    return 1;
+}
+static WINAPI BOOL GetWorldTransform(HANDLE h, float *x) {
+    gdi_obj *d = dc_of(h);
+    if (!d || !x) { vx_set_last_error(87); return 0; }
+    memcpy(x, d->xform, sizeof d->xform);
+    return 1;
+}
+static WINAPI BOOL ModifyWorldTransform(HANDLE h, const float *x, DWORD mode) {
+    gdi_obj *d = dc_of(h);
+    if (!d || d->graphics_mode != 2) { vx_set_last_error(87); return 0; }
+    static const float identity[6] = { 1, 0, 0, 1, 0, 0 };
+    if (mode == 1 /* MWT_IDENTITY */) { memcpy(d->xform, identity, sizeof d->xform); return 1; }
+    if (!x || (mode != 2 && mode != 3)) { vx_set_last_error(87); return 0; }
+    if (mode == 2) xform_mul(x, d->xform, d->xform);              // MWT_LEFTMULTIPLY: x, then the current
+    else xform_mul(d->xform, x, d->xform);                        // MWT_RIGHTMULTIPLY: the current, then x
+    return 1;
+}
+static WINAPI int SetROP2(HANDLE h, int rop) { gdi_obj *d = dc_of(h); if (!d || rop < 1 || rop > 16) return 0; int o = d->rop2; d->rop2 = rop; return o; }
+static WINAPI int GetROP2(HANDLE h) { gdi_obj *d = dc_of(h); return d ? d->rop2 : 0; }
+static WINAPI int SetPolyFillMode(HANDLE h, int m) { gdi_obj *d = dc_of(h); if (!d || m < 1 || m > 2) return 0; int o = d->poly_fill; d->poly_fill = m; return o; }
+static WINAPI int GetPolyFillMode(HANDLE h) { gdi_obj *d = dc_of(h); return d ? d->poly_fill : 0; }
+static WINAPI int SetArcDirection(HANDLE h, int dir) { gdi_obj *d = dc_of(h); if (!d || dir < 1 || dir > 2) { vx_set_last_error(87); return 0; } int o = d->arc_dir; d->arc_dir = dir; return o; }
 
 // Origins: the viewport origin is in device units, the window origin in logical ones.
 static BOOL set_origin(HANDLE h, int window, int x, int y, POINT *old, int offset) {
@@ -703,7 +742,8 @@ static WINAPI int SaveDC(HANDLE h) {
     d->saved = s;
     s += d->nsaved;
     *s = (dc_state){ d->bitmap, d->brush, d->pen, d->font, d->text_color, d->bk_color, d->dc_brush, d->dc_pen, d->text_align,
-                     d->bk_mode, d->map_mode, d->stretch_mode, d->graphics_mode, d->pos, d->vp_org, d->win_org, NULL };
+                     d->bk_mode, d->map_mode, d->stretch_mode, d->graphics_mode, d->pos, d->vp_org, d->win_org, NULL, { 0 }, 0, 0, 0 };
+    memcpy(s->xform, d->xform, sizeof s->xform); s->rop2 = d->rop2; s->poly_fill = d->poly_fill; s->arc_dir = d->arc_dir;
     if (d->clip) { s->clip = vx_region_new(); vx_region_copy(s->clip, d->clip); }
     return ++d->nsaved;
 }
@@ -717,6 +757,7 @@ static WINAPI BOOL RestoreDC(HANDLE h, int level) {
     d->text_color = s->text_color; d->bk_color = s->bk_color; d->dc_brush = s->dc_brush; d->dc_pen = s->dc_pen; d->text_align = s->text_align;
     d->bk_mode = s->bk_mode; d->map_mode = s->map_mode; d->stretch_mode = s->stretch_mode; d->graphics_mode = s->graphics_mode;
     d->pos = s->pos; d->vp_org = s->vp_org; d->win_org = s->win_org;
+    memcpy(d->xform, s->xform, sizeof d->xform); d->rop2 = s->rop2; d->poly_fill = s->poly_fill; d->arc_dir = s->arc_dir;
     vx_region_free(d->clip);
     d->clip = s->clip; s->clip = NULL;
     for (int k = i + 1; k < d->nsaved; k++) vx_region_free(d->saved[k].clip);
@@ -1130,6 +1171,8 @@ static const vx_export gdi32[] = {
     VX_EXPORT(SetTextColor), VX_EXPORT(GetTextColor), VX_EXPORT(SetBkColor), VX_EXPORT(GetBkColor), VX_EXPORT(SetBkMode), VX_EXPORT(GetBkMode),
     VX_EXPORT(SetDCBrushColor), VX_EXPORT(SetDCPenColor), VX_EXPORT(SetStretchBltMode), VX_EXPORT(GetStretchBltMode),
     VX_EXPORT(SetMapMode), VX_EXPORT(GetMapMode), VX_EXPORT(SetTextAlign), VX_EXPORT(GetTextAlign), VX_EXPORT(SetGraphicsMode), VX_EXPORT(GetGraphicsMode),
+    VX_EXPORT(SetWorldTransform), VX_EXPORT(GetWorldTransform), VX_EXPORT(ModifyWorldTransform), VX_EXPORT(SetROP2), VX_EXPORT(GetROP2),
+    VX_EXPORT(SetPolyFillMode), VX_EXPORT(GetPolyFillMode), VX_EXPORT(SetArcDirection),
     VX_EXPORT(SaveDC), VX_EXPORT(RestoreDC), VX_EXPORT(SetViewportOrgEx), VX_EXPORT(OffsetViewportOrgEx), VX_EXPORT(GetViewportOrgEx),
     VX_EXPORT(SetWindowOrgEx), VX_EXPORT(OffsetWindowOrgEx), VX_EXPORT(GetWindowOrgEx), VX_EXPORT(LPtoDP), VX_EXPORT(DPtoLP),
     VX_EXPORT(GetCurrentPositionEx), VX_EXPORT(GdiFlush),

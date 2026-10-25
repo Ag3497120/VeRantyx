@@ -105,6 +105,9 @@ typedef struct tp_item {
     // waits
     HANDLE handle; uint64_t wait_deadline_ns; int has_deadline;
     struct tp_item *next_timer;
+    // When closed: the event to set once its callbacks have completed (UnregisterWaitEx's and DeleteTimerQueueTimer's
+    // CompletionEvent), and whether the context goes with it (theirs: a callback may still be running with it).
+    HANDLE done_event; int free_context;
 } tp_item;
 typedef struct tp_job { tp_item *item; DWORD wait_result; struct tp_job *next; } tp_job;
 static pthread_mutex_t g_tp_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -120,6 +123,16 @@ static void enqueue(tp_item *it, DWORD result) {               // with the lock 
     g_tp_tail = j;
     it->pending++;
     pthread_cond_signal(&g_tp_work);
+}
+// A closed item whose callbacks have all completed: its completion event set, then it is freed.
+static void tp_finish(tp_item *it) {
+    if (it->done_event) {
+        static BOOL (WINAPI *set)(HANDLE);
+        if (!set) set = (BOOL (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "SetEvent");
+        if (set) set(it->done_event);
+    }
+    if (it->free_context) free(it->context);
+    free(it);
 }
 static void *tp_worker(void *arg) {
     (void)arg;
@@ -139,8 +152,9 @@ static void *tp_worker(void *arg) {
         free(j);
         pthread_mutex_lock(&g_tp_lock);
         it->running--;
-        if (it->closed && !it->pending && !it->running) { free(it); }
+        int finished = it->closed && !it->pending && !it->running;
         pthread_cond_broadcast(&g_tp_done);
+        if (finished) { pthread_mutex_unlock(&g_tp_lock); tp_finish(it); pthread_mutex_lock(&g_tp_lock); }
     }
     return NULL;
 }
@@ -200,26 +214,31 @@ static tp_item *tp_new(int kind, void *cb, void *ctx) {
     pthread_mutex_unlock(&g_tp_lock);
     return it;
 }
+static void tp_cancel_queued(tp_item *it) {                     // with the lock held: drop queued submissions
+    for (tp_job **j = &g_tp_head; *j;) {
+        if ((*j)->item == it) { tp_job *d = *j; *j = d->next; free(d); it->pending--; } else j = &(*j)->next;
+    }
+    g_tp_tail = NULL;
+    for (tp_job *j = g_tp_head; j; j = j->next) g_tp_tail = j;
+}
 static void tp_wait_callbacks(tp_item *it, BOOL cancel) {
     pthread_mutex_lock(&g_tp_lock);
-    if (cancel) {                                                 // drop queued submissions
-        for (tp_job **j = &g_tp_head; *j;) {
-            if ((*j)->item == it) { tp_job *d = *j; *j = d->next; free(d); it->pending--; } else j = &(*j)->next;
-        }
-        g_tp_tail = NULL;
-        for (tp_job *j = g_tp_head; j; j = j->next) g_tp_tail = j;
-    }
+    if (cancel) tp_cancel_queued(it);
     while (it->pending || it->running) pthread_cond_wait(&g_tp_done, &g_tp_lock);
     pthread_mutex_unlock(&g_tp_lock);
 }
-static void tp_close(tp_item *it) {
+// Closes an item: no more callbacks start (queued ones are dropped with `cancel`); `done` is set and the context freed
+// (with `free_context`) once those running have returned - at once when none is.
+static void tp_close_ex(tp_item *it, BOOL cancel, HANDLE done, int free_context) {
     pthread_mutex_lock(&g_tp_lock);
-    it->armed = 0; it->closed = 1;
+    it->armed = 0; it->closed = 1; it->done_event = done; it->free_context = free_context;
+    if (cancel) tp_cancel_queued(it);
     for (tp_item **t = &g_tp_timer_list; *t; t = &(*t)->next_timer) if (*t == it) { *t = it->next_timer; break; }
     int idle = !it->pending && !it->running;
     pthread_mutex_unlock(&g_tp_lock);
-    if (idle) free(it);
+    if (idle) tp_finish(it);
 }
+static void tp_close(tp_item *it) { tp_close_ex(it, 0, NULL, 0); }
 static WINAPI void *CreateThreadpoolWork(void *cb, void *ctx, void *env) { (void)env; return tp_new(1, cb, ctx); }
 static WINAPI void SubmitThreadpoolWork(tp_item *w) { pthread_mutex_lock(&g_tp_lock); enqueue(w, 0); pthread_mutex_unlock(&g_tp_lock); }
 static WINAPI void WaitForThreadpoolWorkCallbacks(tp_item *w, BOOL cancel) { tp_wait_callbacks(w, cancel); }
@@ -304,13 +323,14 @@ static WINAPI BOOL ChangeTimerQueueTimer(HANDLE q, tp_legacy *l, DWORD due, DWOR
     SetThreadpoolTimer(l->item, &when, period, 0);
     return 1;
 }
+// CompletionEvent (`done`): INVALID_HANDLE_VALUE waits for the callbacks running; an event is set once they have
+// returned (at once when none is); NULL neither. The callbacks' context (l) goes with the item, not before.
 static WINAPI BOOL DeleteTimerQueueTimer(HANDLE q, tp_legacy *l, HANDLE done) {
     (void)q;
     if (!l) return 1;
     SetThreadpoolTimer(l->item, NULL, 0, 0);
     if (done == INVALID_HANDLE) WaitForThreadpoolTimerCallbacks(l->item, 1);   // wait for running callbacks
-    CloseThreadpoolTimer(l->item);
-    free(l);
+    tp_close_ex(l->item, 1, done == INVALID_HANDLE ? NULL : done, 1);
     return 1;
 }
 // RegisterWaitForSingleObject: the callback runs when the object is signalled (or the wait times out), and again
@@ -333,12 +353,13 @@ static WINAPI BOOL RegisterWaitForSingleObject(HANDLE *out, HANDLE object, void 
     *out = l;
     return 1;
 }
+// CompletionEvent as DeleteTimerQueueTimer's. Chromium's ObjectWatcher passes an event and waits on it: it was
+// never set, so the thread that stopped watching (a socket's, after its connect or accept event) waited forever.
 static WINAPI BOOL UnregisterWaitEx(tp_legacy *l, HANDLE done) {
-    if (!l) return 0;
+    if (!l) { vx_set_last_error(6 /* ERROR_INVALID_HANDLE */); return 0; }
     SetThreadpoolWait(l->item, NULL, NULL);
     if (done == INVALID_HANDLE) WaitForThreadpoolWaitCallbacks(l->item, 1);
-    CloseThreadpoolWait(l->item);
-    free(l);
+    tp_close_ex(l->item, 1, done == INVALID_HANDLE ? NULL : done, 1);
     return 1;
 }
 static WINAPI BOOL UnregisterWait(tp_legacy *l) { return UnregisterWaitEx(l, NULL); }

@@ -108,16 +108,30 @@ static WINAPI SOCKET ws_socket(int af, int type, int protocol) {
 }
 static WINAPI SOCKET WSASocketA(int af, int type, int protocol, void *info, uint32_t group, DWORD flags) { (void)info; (void)group; (void)flags; return ws_socket(af, type, protocol); }
 static WINAPI SOCKET WSASocketW(int af, int type, int protocol, void *info, uint32_t group, DWORD flags) { (void)info; (void)group; (void)flags; return ws_socket(af, type, protocol); }
-static WINAPI int closesocket(SOCKET s) { return close(to_fd(s)) ? fail() : 0; }
+static void select_forget(SOCKET s);
+static void select_connect_started(SOCKET s);
+static void select_inherit(SOCKET listening, SOCKET accepted);
+static void select_listening(SOCKET s);
+static WINAPI int closesocket(SOCKET s) {
+    select_forget(s);                       // (its WSAEventSelect goes with it: a socket opened later may get the number)
+    return close(to_fd(s)) ? fail() : 0;
+}
 static WINAPI int ws_bind(SOCKET s, const void *addr, int len) {
     struct sockaddr_storage a; socklen_t l = addr_in(addr, len, &a);
     return bind(to_fd(s), (struct sockaddr *)&a, l) ? fail() : 0;
 }
 static WINAPI int ws_connect(SOCKET s, const void *addr, int len) {
     struct sockaddr_storage a; socklen_t l = addr_in(addr, len, &a);
-    return connect(to_fd(s), (struct sockaddr *)&a, l) ? fail() : 0;
+    int r = connect(to_fd(s), (struct sockaddr *)&a, l);
+    // A non-blocking connect completes later: FD_CONNECT then tells how it went (WSAEventSelect below).
+    if ((!r || errno == EINPROGRESS) && (fcntl(to_fd(s), F_GETFL) & O_NONBLOCK)) select_connect_started(s);
+    return r ? fail() : 0;
 }
-static WINAPI int ws_listen(SOCKET s, int backlog) { return listen(to_fd(s), backlog) ? fail() : 0; }
+static WINAPI int ws_listen(SOCKET s, int backlog) {
+    if (listen(to_fd(s), backlog)) return fail();
+    select_listening(s);                    // (macOS has no SO_ACCEPTCONN to ask later)
+    return 0;
+}
 static WINAPI SOCKET ws_accept(SOCKET s, void *addr, int *len) {
     struct sockaddr_storage a; socklen_t l = sizeof a;
     int fd = accept(to_fd(s), (struct sockaddr *)&a, &l);
@@ -125,6 +139,7 @@ static WINAPI SOCKET ws_accept(SOCKET s, void *addr, int *len) {
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
     if (addr && len) addr_out((struct sockaddr *)&a, l, addr, len);
+    select_inherit(s, (SOCKET)fd);          // "the same properties as socket s, including ... WSAEventSelect" (accept)
     return (SOCKET)fd;
 }
 static int flags_in(int f) { return (f & ~8) | ((f & 8) ? MSG_WAITALL : 0); }   // MSG_WAITALL is 8 on Windows
@@ -498,18 +513,96 @@ static WINAPI int WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_len, void *o
 }
 
 // ---- WSAEventSelect: network events as event objects ---------------------------------------------------------------------
-// One thread polls the registered sockets every few milliseconds and sets their events; FD_WRITE is reported when a
-// socket becomes writable (not while it stays so), the others while their condition holds.
+// One thread polls the registered sockets every few milliseconds, records their network events and sets their event
+// objects; WSAEnumNetworkEvents hands the record over (with each event's error code) and clears it. As Microsoft
+// documents them: FD_CONNECT once a connect started on the non-blocking socket has completed, with its result in
+// iErrorCode[FD_CONNECT_BIT] (0, or WSAECONNREFUSED, WSAETIMEDOUT, ...), and FD_WRITE with it when it succeeded;
+// FD_WRITE when a socket becomes writable (not while it stays so); FD_READ and FD_ACCEPT while data or a connection
+// waits; FD_CLOSE once, after the data has been read, with 0 for an orderly close or the error that ended the
+// connection (WSAECONNRESET ...). A socket closed with closesocket is forgotten; one accepted from a registered
+// listening socket starts with the same registration.
 #define FD_READ_BIT 1
 #define FD_WRITE_BIT 2
 #define FD_ACCEPT_BIT 8
 #define FD_CONNECT_BIT 16
 #define FD_CLOSE_BIT 32
-typedef struct { SOCKET s; HANDLE event; LONG mask, pending; int writable, closed; } event_select;
+enum { ERR_CONNECT = 4, ERR_CLOSE = 5 };                          // iErrorCode indexes (FD_CONNECT_BIT, FD_CLOSE_BIT)
+typedef struct { SOCKET s; HANDLE event; LONG mask, pending; int writable, closed, failed; int errors[10]; } event_select;
 static event_select g_selects[256];
 static int g_select_count;
 static pthread_mutex_t g_select_lock = PTHREAD_MUTEX_INITIALIZER;
 static BOOL (WINAPI *g_set_event)(HANDLE), (WINAPI *g_reset_event)(HANDLE);
+// VXRT_TRACE_NET=1: each registration and each network event recorded, with its error codes.
+static int trace_net(void) { static int on = -1; if (on < 0) on = getenv("VXRT_TRACE_NET") && atoi(getenv("VXRT_TRACE_NET")); return on; }
+// By descriptor: sockets with a non-blocking connect started and not yet reported (FD_CONNECT), and listening sockets.
+#define FD_BITS_MAX 65536
+static uint8_t g_connecting[FD_BITS_MAX / 8], g_listening[FD_BITS_MAX / 8];
+static int fd_bit(const uint8_t *bits, int fd) { return fd >= 0 && fd < FD_BITS_MAX && (bits[fd >> 3] >> (fd & 7) & 1); }
+static void set_fd_bit(uint8_t *bits, int fd, int on) {
+    if (fd < 0 || fd >= FD_BITS_MAX) return;
+    if (on) bits[fd >> 3] |= (uint8_t)(1 << (fd & 7)); else bits[fd >> 3] &= (uint8_t)~(1 << (fd & 7));
+}
+static int connecting(int fd) { return fd_bit(g_connecting, fd); }
+static void set_connecting(int fd, int on) { set_fd_bit(g_connecting, fd, on); }
+static void select_listening(SOCKET s) {
+    pthread_mutex_lock(&g_select_lock);
+    set_fd_bit(g_listening, to_fd(s), 1);
+    pthread_mutex_unlock(&g_select_lock);
+}
+static void select_connect_started(SOCKET s) {
+    pthread_mutex_lock(&g_select_lock);
+    set_connecting(to_fd(s), 1);
+    for (int i = 0; i < g_select_count; i++) if (g_selects[i].s == s) { g_selects[i].failed = 0; g_selects[i].closed = 0; }
+    pthread_mutex_unlock(&g_select_lock);
+}
+static void select_forget(SOCKET s) {
+    pthread_mutex_lock(&g_select_lock);
+    set_connecting(to_fd(s), 0);
+    set_fd_bit(g_listening, to_fd(s), 0);
+    for (int i = 0; i < g_select_count; i++) if (g_selects[i].s == s) { g_selects[i] = g_selects[--g_select_count]; break; }
+    pthread_mutex_unlock(&g_select_lock);
+}
+static void select_inherit(SOCKET listening, SOCKET accepted) {
+    pthread_mutex_lock(&g_select_lock);
+    int i = 0;
+    while (i < g_select_count && g_selects[i].s != listening) i++;
+    if (i < g_select_count && g_select_count < 256) {
+        int fd = to_fd(accepted), fl = fcntl(fd, F_GETFL);
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        g_selects[g_select_count++] = (event_select){ .s = accepted, .event = g_selects[i].event, .mask = g_selects[i].mask };
+    }
+    pthread_mutex_unlock(&g_select_lock);
+}
+// What happened on one registered socket, from poll's revents: the events to record (error codes into e).
+static LONG network_events(event_select *e, int fd, short revents) {
+    LONG add = 0;
+    if (connecting(fd)) {
+        if (!(revents & (POLLOUT | POLLERR | POLLHUP))) return 0;   // still connecting
+        int err = 0; socklen_t el = sizeof err;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el)) err = errno;
+        set_connecting(fd, 0);
+        e->errors[ERR_CONNECT] = err ? wsa_error(err) : 0;
+        e->failed = err != 0;
+        add |= FD_CONNECT_BIT;
+        if (err) return add;                                      // (a failed connect: FD_CONNECT alone)
+    }
+    if (e->failed) return add;
+    int listening = fd_bit(g_listening, fd);
+    if (revents & (POLLIN | POLLHUP | POLLERR)) {
+        char c;
+        ssize_t r = listening ? 1 : recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+        int err = r < 0 ? errno : 0;
+        if (r > 0) add |= listening ? FD_ACCEPT_BIT : FD_READ_BIT;
+        else if (r == 0 || (err != EAGAIN && err != EWOULDBLOCK && err != EINTR)) {
+            if (!e->closed) { add |= FD_CLOSE_BIT; e->errors[ERR_CLOSE] = r == 0 ? 0 : wsa_error(err); }
+            e->closed = 1;
+        }
+    }
+    int w = (revents & POLLOUT) != 0 && !e->closed;
+    if (w && !e->writable) add |= FD_WRITE_BIT;
+    e->writable = w;
+    return add;
+}
 static void *select_poller(void *arg) {
     (void)arg;
     for (;;) {
@@ -519,7 +612,7 @@ static void *select_poller(void *arg) {
         for (int i = 0; i < n; i++) {
             fds[i].fd = to_fd(g_selects[i].s);
             fds[i].events = (short)(((g_selects[i].mask & (FD_READ_BIT | FD_ACCEPT_BIT | FD_CLOSE_BIT)) ? POLLIN : 0) |
-                                    ((g_selects[i].mask & (FD_WRITE_BIT | FD_CONNECT_BIT)) ? POLLOUT : 0));
+                                    ((g_selects[i].mask & (FD_WRITE_BIT | FD_CONNECT_BIT)) || connecting(fds[i].fd) ? POLLOUT : 0));
             fds[i].revents = 0;
         }
         pthread_mutex_unlock(&g_select_lock);
@@ -528,18 +621,13 @@ static void *select_poller(void *arg) {
         for (int i = 0; i < n && i < g_select_count; i++) {
             event_select *e = &g_selects[i];
             if (to_fd(e->s) != fds[i].fd) continue;
-            LONG add = 0;
-            if (fds[i].revents & (POLLIN | POLLHUP)) {
-                char c;
-                ssize_t r = (e->mask & FD_ACCEPT_BIT) ? 1 : recv(fds[i].fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
-                if (r == 0 || (fds[i].revents & POLLHUP)) { if (!e->closed) add |= FD_CLOSE_BIT; e->closed = 1; }
-                else if (r > 0) add |= e->mask & (FD_READ_BIT | FD_ACCEPT_BIT);
+            LONG add = network_events(e, fds[i].fd, fds[i].revents) & e->mask;
+            if (add & ~e->pending) {
+                e->pending |= add;
+                if (trace_net()) vx_log("winsock: socket %#llx events %#lx (connect error %d, close error %d) -> event %p",
+                                        (unsigned long long)e->s, (long)add, e->errors[ERR_CONNECT], e->errors[ERR_CLOSE], e->event);
+                g_set_event(e->event);
             }
-            int w = (fds[i].revents & POLLOUT) != 0;
-            if (w && !e->writable) add |= FD_WRITE_BIT | FD_CONNECT_BIT;
-            e->writable = w;
-            add &= e->mask;
-            if (add & ~e->pending) { e->pending |= add; g_set_event(e->event); }
         }
         pthread_mutex_unlock(&g_select_lock);
         usleep(2000);
@@ -557,11 +645,14 @@ static WINAPI int WSAEventSelect(SOCKET s, HANDLE event, LONG mask) {
     int i = 0;
     while (i < g_select_count && g_selects[i].s != s) i++;
     if (!event || !mask) { if (i < g_select_count) g_selects[i] = g_selects[--g_select_count]; }
-    else if (i < 256) {
+    else if (i < 256) {                                           // (the record starts empty: "clears the internal record")
+        int closed = i < g_select_count ? g_selects[i].closed : 0, failed = i < g_select_count ? g_selects[i].failed : 0;
         if (i == g_select_count) g_select_count++;
-        g_selects[i] = (event_select){ s, event, mask, 0, 0, 0 };
+        g_selects[i] = (event_select){ .s = s, .event = event, .mask = mask, .closed = closed, .failed = failed };
     }
     pthread_mutex_unlock(&g_select_lock);
+    if (trace_net()) vx_log("winsock: WSAEventSelect(socket %#llx, event %p, %#lx)%s", (unsigned long long)s, event, (long)mask,
+                            connecting(fd) ? " (connecting)" : "");
     static int started;
     if (!__sync_lock_test_and_set(&started, 1)) { pthread_t t; pthread_create(&t, NULL, select_poller, NULL); pthread_detach(t); }
     return 0;
@@ -570,7 +661,14 @@ typedef struct { LONG events; int errors[10]; } WSANETWORKEVENTS;
 static WINAPI int WSAEnumNetworkEvents(SOCKET s, HANDLE event, WSANETWORKEVENTS *out) {
     memset(out, 0, sizeof *out);
     pthread_mutex_lock(&g_select_lock);
-    for (int i = 0; i < g_select_count; i++) if (g_selects[i].s == s) { out->events = g_selects[i].pending; g_selects[i].pending = 0; break; }
+    for (int i = 0; i < g_select_count; i++)
+        if (g_selects[i].s == s) {
+            out->events = g_selects[i].pending;
+            for (int k = 0; k < 10; k++) if (out->events & (1 << k)) out->errors[k] = g_selects[i].errors[k];
+            g_selects[i].pending = 0;
+            memset(g_selects[i].errors, 0, sizeof g_selects[i].errors);
+            break;
+        }
     pthread_mutex_unlock(&g_select_lock);
     if (event && g_reset_event) g_reset_event(event);
     return 0;

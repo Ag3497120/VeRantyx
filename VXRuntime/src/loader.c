@@ -1217,6 +1217,9 @@ int main(int argc, char **argv, char **envp) {
     vx_system_init();
     vx_region_init();                            // (before desktop.c and client.c: replaces their region stand-ins)
     vx_version_init();
+    vx_tcptable_init();                          // (before client.c: replaces its GetExtendedTcpTable stand-in)
+    vx_winprops_init();                          // (shell32's window property stores, propsys, the virtual desktop manager)
+    vx_a11y_init();                              // (oleacc, UIAutomationCore, uxtheme)
     vx_present_init();                           // (before desktop.c, client.c, user32.c, gdi.c, dwmapi.c: replaces stand-ins there)
     vx_inherit_init();
     vx_desktop_init();
