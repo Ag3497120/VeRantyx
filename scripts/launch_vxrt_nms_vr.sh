@@ -68,16 +68,24 @@ cleanup() {
     [[ -n "${STEAMVR_PID:-}" ]] && { kill -TERM "$STEAMVR_PID" 2>/dev/null || true; wait "$STEAMVR_PID" 2>/dev/null || true; }
 }
 trap cleanup EXIT INT TERM
+# (a SteamVR that has just ended may still hold its web server's port for a moment: the new vrserver then cannot
+#  bind it and ends at once, while the old one's listener made it look up, and the game, finding no SteamVR, started
+#  its own without the VeRantyx driver and ran flat, 2026-10-25)
+for _ in $(seq 1 30); do lsof -nP -iTCP:27062 -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 1; done
+if lsof -nP -iTCP:27062 -sTCP:LISTEN >/dev/null 2>&1; then echo "Port 27062 (SteamVR's) is still in use: $(lsof -nP -iTCP:27062 -sTCP:LISTEN | tail -1)" >&2; exit 1; fi
 VXRT_VR_ROOT="$WSTEAM_ROOT" "$SCRIPT_DIR/launch_vxrt_steamvr.sh" >"$LOG_DIR/vxrt-steamvr-launch.log" 2>&1 &
 STEAMVR_PID=$!
 [[ "$VERANTYX_ALVR" == 1 ]] && echo "SteamVR starting for the ALVR app: open ALVR on the headset (the first time it is awaited before SteamVR starts)"
 waited=0
 while (( waited < 60 )); do
     sleep 1
-    lsof -nP -iTCP:27062 -sTCP:LISTEN >/dev/null 2>&1 && break
+    # (up once our vrserver listens on the port and its compositor has started)
+    listener="$(lsof -nP -t -iTCP:27062 -sTCP:LISTEN 2>/dev/null | head -1)"
+    if [[ -n "$listener" ]] && ps -o command= -p "$listener" | grep -q "vrserver.exe" && pgrep -f "build/vxrt.*vrcompositor.exe" >/dev/null; then break; fi
     [[ -f "$LOG_DIR/alvr-first-connection.wait" ]] || waited=$((waited + 1))
     kill -0 "$STEAMVR_PID" 2>/dev/null || { echo "SteamVR did not start (log: $LOG_DIR/vxrt-steamvr-launch.log)" >&2; exit 1; }
 done
+if ! pgrep -f "build/vxrt.*vrcompositor.exe" >/dev/null; then echo "SteamVR did not come up (log: $LOG_DIR/vxrt-steamvr.log)" >&2; exit 1; fi
 echo "SteamVR is up; starting No Man's Sky in VR through Windows Steam"
 
 # 3. The game, as Steam's VR launch option starts it; then until it exits.
