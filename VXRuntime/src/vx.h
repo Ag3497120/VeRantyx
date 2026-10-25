@@ -166,6 +166,7 @@ enum { VX_HANDLE_FIND = 1, VX_HANDLE_MAPPING, VX_HANDLE_PIPE = 7, VX_HANDLE_WINS
 HANDLE vx_handle_new(int kind, void *data, void (*destroy)(void *));
 void  *vx_handle_data(HANDLE h, int kind);    // NULL unless h is a handle of that kind
 BOOL   vx_handle_close(HANDLE h);
+HANDLE vx_handle_dup(HANDLE h);         // a second handle to h's object in this process (same access), or NULL
 // The access a handle was granted, where it is recorded (file mapping objects); vx_handle_access: 0 if not recorded.
 void   vx_handle_set_access(HANDLE h, DWORD access);
 int    vx_handle_access(HANDLE h, DWORD *access);

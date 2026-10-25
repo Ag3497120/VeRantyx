@@ -1441,6 +1441,10 @@ static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_pr
     if (options & 1 /* DUPLICATE_CLOSE_SOURCE */) CloseHandle(src);
     return h != NULL;
 }
+HANDLE vx_handle_dup(HANDLE h) {
+    HANDLE d = NULL;
+    return DuplicateHandle((HANDLE)(intptr_t)-1, h, (HANDLE)(intptr_t)-1, &d, 0, 0, 2 /* DUPLICATE_SAME_ACCESS */) ? d : NULL;
+}
 
 // ---- critical sections and SRW locks -------------------------------------------------------------------------------------
 // (both builds: the x86 one under Rosetta ran a pthread mutex per section before, which went to the kernel on every

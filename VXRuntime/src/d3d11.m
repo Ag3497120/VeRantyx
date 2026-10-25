@@ -686,8 +686,33 @@ void d3d_flush(d3d_device *dev, int wait) {
     if (t_pool) objc_autoreleasePoolPop(t_pool);
     t_pool = objc_autoreleasePoolPush();
 }
+// EnqueueSetEvent's events. g_events_lock is held from the moment a flush starts sending the immediate context's work
+// until that work is committed and the events waiting for it are queued behind it, and by EnqueueSetEvent while it
+// looks at what is unsent: a call then either sees the work still unsent (and its event waits for this flush), or
+// finds it committed already (and its own command buffer goes after it).
+static pthread_mutex_t g_events_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+// Sets the events (handles of their own, duplicated at the call) and closes those handles once a command buffer
+// committed now has finished: Metal runs one queue's command buffers in order, so everything committed to the queue
+// before it has finished too. Takes over the array.
+static void set_events_when_done(d3d_device *dev, HANDLE *events, uint32_t n) {
+    id<MTLCommandBuffer> marker = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
+    [marker addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        for (uint32_t i = 0; i < n; i++) { vx_set_event(events[i]); vx_handle_close(events[i]); }
+        free(events);
+    }];
+    [marker commit];
+}
+static void events_after_flush(d3d_device *dev) {          // (g_events_lock held)
+    if (!dev->nevents_after_flush) return;
+    HANDLE *events = dev->events_after_flush;
+    uint32_t n = dev->nevents_after_flush;
+    dev->events_after_flush = NULL; dev->nevents_after_flush = dev->events_after_flush_cap = 0;
+    set_events_when_done(dev, events, n);
+}
 static void flush_work(d3d_device *dev, int wait) {
     d3d_context *c = (d3d_context *)dev->context;
+    pthread_mutex_lock(&g_events_lock);
     d3d_end_render(c);
     if (c->nclears) d3d_clears_flush(c);
     if (c->pre) {                                               // (before the work that reads what it made)
@@ -698,6 +723,8 @@ static void flush_work(d3d_device *dev, int wait) {
         [pre commit];
     }
     if (!c->cmd) {
+        events_after_flush(dev);
+        pthread_mutex_unlock(&g_events_lock);
         if (wait) {                                             // still wait for work committed earlier
             id<MTLCommandBuffer> fence = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
             [fence commit];
@@ -723,6 +750,8 @@ static void flush_work(d3d_device *dev, int wait) {
     }];
     d3d_gpu_profile_submit(dev, (__bridge void *)cmd);
     [cmd commit];
+    events_after_flush(dev);
+    pthread_mutex_unlock(&g_events_lock);
     pthread_mutex_lock(&g_recent_lock);
     void *old = g_recent[seq % RECENT];
     g_recent[seq % RECENT] = (void *)CFBridgingRetain(cmd); g_recent_seq[seq % RECENT] = seq; g_recent_dev[seq % RECENT] = dev;
@@ -1751,20 +1780,40 @@ static WINAPI HRESULT dxgidev_reclaim1(void *this, uint32_t n, void *const *res,
     if (results) for (uint32_t i = 0; i < n; i++) results[i] = 0;
     return S_OK;
 }
-// EnqueueSetEvent: returns at once; the event is set once the work submitted so far has finished on the GPU. The
-// immediate context's recorded work is sent first (without waiting) when this thread recorded it; recorded on
-// another thread, it is left to that thread (touching it from here would race with it). Then an empty command buffer
-// goes to the device's queue, after everything committed so far: Metal runs one queue's command buffers in order,
-// so its completion is the moment to set the event.
+// EnqueueSetEvent: returns at once; the event is set once all work submitted before the call, on any thread, has
+// finished on the GPU. The handle is duplicated now and that duplicate is the one set, then closed: the caller may
+// close its handle (and the value be handed to another object) before the GPU is done.
+// Work committed to the device's queue so far: an empty command buffer committed after it sets the event when done
+// (Metal runs one queue's command buffers in order). Work the immediate context has recorded and not sent: sent now
+// when this thread recorded it (or nobody did); recorded on another thread, it is left to that thread (the context
+// has no lock: sending it from here could end its encoder while it encodes), and the event is set once the flush
+// that sends it (Flush, Present, Map, a full command buffer) has it done on the GPU, never before.
 static WINAPI HRESULT dxgidev_enqueue_set_event(void *this, HANDLE event) {
     if (!event) return E_INVALIDARG;
+    HANDLE own = vx_handle_dup(event);
+    if (!own) return E_INVALIDARG;
     d3d_device *dev = (d3d_device *)FROM_VTBL2(this);
     d3d_context *c = (d3d_context *)dev->context;
+    pthread_mutex_lock(&g_events_lock);
+    int unsent = __atomic_load_n(&c->cmd, __ATOMIC_RELAXED) || __atomic_load_n(&c->pre, __ATOMIC_RELAXED) ||
+                 __atomic_load_n(&c->nclears, __ATOMIC_RELAXED);
     uintptr_t rec = __atomic_load_n(&c->recorder, __ATOMIC_RELAXED);
-    if (!rec || rec == (uintptr_t)pthread_self()) d3d_flush(dev, 0);
-    id<MTLCommandBuffer> marker = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
-    [marker addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; vx_set_event(event); }];
-    [marker commit];
+    if (unsent && (!rec || rec == (uintptr_t)pthread_self())) { d3d_flush(dev, 0); unsent = 0; }
+    if (unsent) {
+        if (dev->nevents_after_flush == dev->events_after_flush_cap) {
+            uint32_t cap = dev->events_after_flush_cap ? dev->events_after_flush_cap * 2 : 4;
+            HANDLE *grown = realloc(dev->events_after_flush, cap * sizeof *grown);
+            if (!grown) { pthread_mutex_unlock(&g_events_lock); vx_handle_close(own); return E_OUTOFMEMORY; }
+            dev->events_after_flush = grown; dev->events_after_flush_cap = cap;
+        }
+        dev->events_after_flush[dev->nevents_after_flush++] = own;
+    } else {
+        HANDLE *one = malloc(sizeof *one);
+        if (!one) { pthread_mutex_unlock(&g_events_lock); vx_handle_close(own); return E_OUTOFMEMORY; }
+        *one = own;
+        set_events_when_done(dev, one, 1);
+    }
+    pthread_mutex_unlock(&g_events_lock);
     return S_OK;
 }
 static WINAPI void dxgidev_trim(void *this) { (void)this; }

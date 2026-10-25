@@ -89,15 +89,37 @@ int main(void) {
         CHECK(WaitForSingleObject(ev, 0) == WAIT_TIMEOUT);
         CHECK(WaitForSingleObject(ev, 10000) == WAIT_OBJECT_0);
         CHECK((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart < 1000);
-        // Called on another thread while this one has recorded work: still set (that work is left to this thread).
+        // Called on another thread while this one has recorded copies it has not sent yet: the event is set only once
+        // those copies are done on the GPU, never before. They cannot be done before they are sent, so the event is
+        // still unset half a second later; this thread's Flush sends them, and then it is set.
         for (int i = 0; i < 4; i++) ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)big[i & 1], (ID3D11Resource *)big[!(i & 1)]);
         ResetEvent(ev);
         struct call call = { d3, ev, E_FAIL };
         HANDLE th = CreateThread(NULL, 0, enqueue_thread, &call, 0, NULL);
         CHECK(th && WaitForSingleObject(th, 5000) == WAIT_OBJECT_0 && SUCCEEDED(call.hr));
         if (th) CloseHandle(th);
-        CHECK(WaitForSingleObject(ev, 10000) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(ev, 500) == WAIT_TIMEOUT);
         ID3D11DeviceContext_Flush(ctx);
+        CHECK(WaitForSingleObject(ev, 10000) == WAIT_OBJECT_0);
+
+        // The caller closes its handle right after the call and the next event it makes gets the same handle value
+        // (Windows hands out freed values again): the work's end sets the event the call was given, never the new
+        // one. And no handle is left behind once it has been set.
+        DWORD handles_before = 0, handles_after = 0;
+        CHECK(GetProcessHandleCount(GetCurrentProcess(), &handles_before));
+        for (int i = 0; i < 40; i++) ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)big[i & 1], (ID3D11Resource *)big[!(i & 1)]);
+        HANDLE once = CreateEventA(NULL, TRUE, FALSE, NULL);
+        CHECK(SUCCEEDED(IDXGIDevice3_EnqueueSetEvent(d3, once)));
+        CloseHandle(once);
+        HANDLE reused = CreateEventA(NULL, TRUE, FALSE, NULL);
+        CHECK(reused == once);                             // (what this check needs: the value was handed out again)
+        ResetEvent(ev);
+        CHECK(SUCCEEDED(IDXGIDevice3_EnqueueSetEvent(d3, ev)));   // after the first: everything before it is done
+        CHECK(WaitForSingleObject(ev, 10000) == WAIT_OBJECT_0);
+        Sleep(200);
+        CHECK(WaitForSingleObject(reused, 0) == WAIT_TIMEOUT);
+        CloseHandle(reused);
+        CHECK(GetProcessHandleCount(GetCurrentProcess(), &handles_after) && handles_after == handles_before);
     }
     if (big[0]) ID3D11Buffer_Release(big[0]);
     if (big[1]) ID3D11Buffer_Release(big[1]);

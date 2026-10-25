@@ -86,6 +86,11 @@ struct d3d_device {
     volatile uint64_t gpu_end_seq[64], gpu_end_ns[64];   // when the GPU finished recent command buffers (by sequence
                                                          // number, host clock ns): timestamp queries (d3d11_draw.m)
     d3d_object *on12;                // D3D11On12 devices: the ID3D11On12Device object (d3d11on12.m), else NULL
+    // IDXGIDevice2::EnqueueSetEvent calls made while the immediate context held work recorded by another thread and
+    // not sent yet (d3d11.m): their events (handles duplicated at the call), set once the flush that sends that work
+    // has it done on the GPU.
+    HANDLE *events_after_flush;
+    uint32_t nevents_after_flush, events_after_flush_cap;
 };
 uint64_t d3d_gpu_end_ns(d3d_device *dev, uint64_t seq);  // that time, or 0 if not known (d3d11.m)
 int d3d_apple_family(void *mtl_device);   // d3d11.m
@@ -141,7 +146,7 @@ typedef struct {
     void *pre, *pre_enc;
     // The thread that last recorded work not yet sent (a command buffer, a pending clear, a geometry pre-pass).
     // IDXGIDevice2::EnqueueSetEvent sends that work only when called on this thread: the immediate context is not
-    // free-threaded and has no lock of its own.
+    // free-threaded and has no lock of its own. Called on another thread, its event waits for that work's flush.
     uintptr_t recorder;
 } d3d_context;
 #define D3D_RECORDING(c) __atomic_store_n(&(c)->recorder, (uintptr_t)pthread_self(), __ATOMIC_RELAXED)
