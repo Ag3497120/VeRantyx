@@ -66,8 +66,8 @@ struct Title: Identifiable, Hashable {
               works: false, flat: true, args: ["/steam"], vrArgs: ["/vr"],
               captureProxy: "Products/elite-dangerous-odyssey-64/Openvr/win64/openvr_api.dll", launcher: true, gameExe: "EliteDangerous64.exe"),
         Title(id: "275850", name: "No Man's Sky", bytes: 33_471_534_235, free: false, exe: "NMS.exe",
-              summary: T("Played on the Mac's screen (the planet's terrain drawn). In the headset, picture and sound checked with the Vision Pro's VeRantyx app; ALVR is being checked. Started by your own Windows Steam, which you sign in to yourself.",
-                         "Mac の画面で遊べました（惑星の地形まで描画）。ヘッドセットは Vision Pro の VeRantyx アプリで映像と音を確認、ALVR は確認中。あなた自身がサインインした Windows 版 Steam から起動します。"),
+              summary: T("Played on the Mac's screen (the planet's terrain drawn). In the headset, picture and sound checked with both the Vision Pro's VeRantyx app and the ALVR app (hand input through ALVR too); 25-40 fps so far. Started by your own Windows Steam, which you sign in to yourself.",
+                         "Mac の画面で遊べました（惑星の地形まで描画）。ヘッドセットは Vision Pro の VeRantyx アプリと ALVR アプリの両方で映像と音を確認（ALVR では手の入力も）。今のところ 25〜40 fps。あなた自身がサインインした Windows 版 Steam から起動します。"),
               works: false, flat: true, gameExe: "NMS.exe", windowsSteam: true),
     ]
     static func named(_ id: String) -> Title? { all.first { $0.id == id } }

@@ -192,7 +192,6 @@
  "fps in the headset": "頭戴裝置 fps",
  "Frames a second the headset shows, and the time from your movement to the picture, as the headset's ALVR app reports them.": "頭戴裝置每秒顯示的幀數，以及從你移動到畫面出現的時間（由頭戴裝置上的 ALVR App 回報）。",
  "fps on the Mac": "Mac fps",
- "Played on the Mac's screen (the planet's terrain drawn). In the headset, picture and sound checked with the Vision Pro's VeRantyx app; ALVR is being checked. Started by your own Windows Steam, which you sign in to yourself.": "已在 Mac 螢幕上遊玩（行星地形也能算繪）。頭戴裝置方面，已用 Vision Pro 的 VeRantyx App 確認畫面與聲音；ALVR 仍在確認中。由你自己登入的 Windows 版 Steam 啟動。",
  "This game needs Windows Steam on VXRuntime, which is not installed yet. Installing it is a manual step for now (the repository: VXRuntime/README.md, “The Windows Steam client”).": "此遊戲需要 VXRuntime 上的 Windows 版 Steam，但尚未安裝。目前需要手動安裝（儲存庫中的 VXRuntime/README.md，「The Windows Steam client」）。",
  "Not enough space: about %@ is needed, %@ is free.": "空間不足：大約需要 %@，可用空間為 %@。",
  "Enter your Steam account name first (Get started, step 4).": "請先輸入你的 Steam 帳號名稱（「開始使用」第 4 步）。",
@@ -238,5 +237,6 @@
  "Sign in in Steam's own window yourself. If “Steam Service Error” shows, choose Cancel yourself. VeRantyx never signs in, accepts an agreement or presses a button in Steam for you.": "請在 Steam 自己的視窗中親自登入。如果出現「Steam Service Error」，請自己選擇 Cancel。VeRantyx 絕不會替你登入、同意協議或在 Steam 中按下按鈕。",
  "Open Windows Steam": "打開 Windows 版 Steam",
  "While it runs, only the games it starts can be played here; quit it from its own window for the others.": "它執行期間，這裡只能玩由它啟動的遊戲；要玩其他遊戲，請從它自己的視窗結束它。",
- "Stop ends the game (and SteamVR); Windows Steam stays open.": "「停止」會結束遊戲（及 SteamVR）；Windows 版 Steam 會保持開啟。"
+ "Stop ends the game (and SteamVR); Windows Steam stays open.": "「停止」會結束遊戲（及 SteamVR）；Windows 版 Steam 會保持開啟。",
+ "Played on the Mac's screen (the planet's terrain drawn). In the headset, picture and sound checked with both the Vision Pro's VeRantyx app and the ALVR app (hand input through ALVR too); 25-40 fps so far. Started by your own Windows Steam, which you sign in to yourself.": "已在 Mac 螢幕上遊玩（星球地形可正常繪製）。頭戴裝置中，已用 Vision Pro 的 VeRantyx App 與 ALVR App 確認畫面與聲音（ALVR 下手部輸入也可用）；目前 25–40 fps。由你自己登入的 Windows 版 Steam 啟動。"
 }

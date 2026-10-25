@@ -192,7 +192,6 @@
  "fps in the headset": "fps nel visore",
  "Frames a second the headset shows, and the time from your movement to the picture, as the headset's ALVR app reports them.": "Fotogrammi al secondo mostrati dal visore e tempo dal tuo movimento all'immagine, come li riporta l'app ALVR del visore.",
  "fps on the Mac": "fps sul Mac",
- "Played on the Mac's screen (the planet's terrain drawn). In the headset, picture and sound checked with the Vision Pro's VeRantyx app; ALVR is being checked. Started by your own Windows Steam, which you sign in to yourself.": "Giocato sullo schermo del Mac (con il terreno del pianeta disegnato). Nel visore, immagine e audio verificati con l'app VeRantyx di Vision Pro; ALVR è in fase di verifica. Avviato dal tuo Windows Steam, a cui accedi tu stesso.",
  "This game needs Windows Steam on VXRuntime, which is not installed yet. Installing it is a manual step for now (the repository: VXRuntime/README.md, “The Windows Steam client”).": "Questo gioco richiede Windows Steam su VXRuntime, che non è ancora installato. Per ora l'installazione è un passo manuale (nel repository: VXRuntime/README.md, “The Windows Steam client”).",
  "Not enough space: about %@ is needed, %@ is free.": "Spazio insufficiente: servono circa %@, ci sono %@ liberi.",
  "Enter your Steam account name first (Get started, step 4).": "Inserisci prima il nome dell'account Steam («Per iniziare», passo 4).",
@@ -238,5 +237,6 @@
  "Sign in in Steam's own window yourself. If “Steam Service Error” shows, choose Cancel yourself. VeRantyx never signs in, accepts an agreement or presses a button in Steam for you.": "Accedi tu stesso nella finestra di Steam. Se compare “Steam Service Error”, scegli tu Cancel. VeRantyx non accede mai, non accetta contratti e non preme pulsanti in Steam al posto tuo.",
  "Open Windows Steam": "Apri Windows Steam",
  "While it runs, only the games it starts can be played here; quit it from its own window for the others.": "Mentre è in esecuzione, qui si possono giocare solo i giochi che avvia lui; per gli altri chiudilo dalla sua finestra.",
- "Stop ends the game (and SteamVR); Windows Steam stays open.": "«Ferma» chiude il gioco (e SteamVR); Windows Steam resta aperto."
+ "Stop ends the game (and SteamVR); Windows Steam stays open.": "«Ferma» chiude il gioco (e SteamVR); Windows Steam resta aperto.",
+ "Played on the Mac's screen (the planet's terrain drawn). In the headset, picture and sound checked with both the Vision Pro's VeRantyx app and the ALVR app (hand input through ALVR too); 25-40 fps so far. Started by your own Windows Steam, which you sign in to yourself.": "Giocato sullo schermo del Mac (il terreno del pianeta viene disegnato). Nel visore, immagine e audio verificati sia con l'app VeRantyx sia con l'app ALVR del Vision Pro (con ALVR anche l'input delle mani); per ora 25-40 fps. Avviato dal tuo Windows Steam, a cui accedi tu stesso."
 }

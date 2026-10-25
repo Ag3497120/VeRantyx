@@ -18,8 +18,8 @@
     "state": "partial",
     "level": "runs",
     "summary": {
-      "ja": "本物の Windows 版 Steam（ユーザー自身がサインイン、~/Verantyx_VR_Drive/vxrt_wsteam）を VXRuntime で動かし、そこから起動する（steam.exe -applaunch 275850、VR は -HmdEnable 1。scripts/launch_vxrt_nms_vr.sh）。Mac の画面では惑星の地形まで描画され、ユーザーが遊べた。VR では Vision Pro の VeRantyx アプリで映像と音を確認。ALVR は確認中。fps は未計測。",
-      "en": "Started by the real Windows Steam client on VXRuntime, signed in to by the user (~/Verantyx_VR_Drive/vxrt_wsteam): steam.exe -applaunch 275850, with -HmdEnable 1 for VR (scripts/launch_vxrt_nms_vr.sh). On the Mac's screen it draws the planet's terrain and the user played it. In VR, picture and sound checked in the Vision Pro's VeRantyx app. ALVR is being checked. Frame rates not measured yet."
+      "ja": "本物の Windows 版 Steam（ユーザー自身がサインイン、~/Verantyx_VR_Drive/vxrt_wsteam）を VXRuntime で動かし、そこから起動する（steam.exe -applaunch 275850、VR は -HmdEnable 1。scripts/launch_vxrt_nms_vr.sh）。Mac の画面では惑星の地形まで描画され、ユーザーが遊べた。VR では Vision Pro の VeRantyx アプリと ALVR アプリの両方で映像と音を確認し、ALVR では手の入力も届いた。ヘッドセットでの fps はまだ低め（25〜40）。ハーネスでの計測はまだ。",
+      "en": "Started by the real Windows Steam client on VXRuntime, signed in to by the user (~/Verantyx_VR_Drive/vxrt_wsteam): steam.exe -applaunch 275850, with -HmdEnable 1 for VR (scripts/launch_vxrt_nms_vr.sh). On the Mac's screen it draws the planet's terrain and the user played it. In VR, picture and sound checked with both the Vision Pro's VeRantyx app and the ALVR app; through ALVR the hand input reached the game too. Frame rate in the headset still low (25-40 fps). No harness measurement yet."
     },
     "checked": "2026-10-25",
     "machine": "Apple M1 Max, 32-core GPU"
@@ -27,7 +27,7 @@
   "baselines": {},
   "known_issues": [
     {
-      "summary": "2026-10-25: the SteamStub error below is answered by the real Windows Steam client the user signed in to (VXRuntime/README.md \"The Windows Steam client\"), not by imitating Steam. Started directly with scripts/launch_vxrt_game.sh the game still stops there. In VR through ALVR, not checked yet; no harness run or fps measurement yet.",
+      "summary": "2026-10-25: the SteamStub error below is answered by the real Windows Steam client the user signed in to (VXRuntime/README.md \"The Windows Steam client\"), not by imitating Steam. Started directly with scripts/launch_vxrt_game.sh the game still stops there. Headset frame rate 25-40 fps; no harness run or measurement yet.",
       "since": "2026-10-25"
     },
     {
