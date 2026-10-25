@@ -46,7 +46,7 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
-       build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/egl_host.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/kernelx.exe build/jobs.exe build/security.exe \
+       build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/egl_host.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/ucrt_extra.exe build/kernelx.exe build/jobs.exe build/security.exe \
        build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/open_thread.exe build/version_info.exe build/section_access.exe build/dbfiles.exe build/updater_files.exe build/shlock.exe build/net_events.exe build/regwait.exe build/tcptable.exe build/winprops.exe build/a11y.exe build/gdi_xform.exe build/view_align.exe \
        build/client_imports.exe build/hello32.exe build/clipboard.exe build/input_route.exe build/name_reuse.exe
 
@@ -59,6 +59,10 @@ build/hello_crt.exe: tests/hello_crt.c
 	$(MINGW) -O1 -o $@ $<
 
 build/game_imports.exe: tests/game_imports.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
+build/ucrt_extra.exe: tests/ucrt_extra.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
@@ -1294,6 +1298,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/order.exe
 	$(VXRT) build/hello_crt.exe one "two words"
 	$(VXRT) build/game_imports.exe
+	$(VXRT) build/ucrt_extra.exe
 	$(VXRT) build/security.exe
 	$(VXRT) build/kernelx.exe
 	$(VXRT) build/jobs.exe
