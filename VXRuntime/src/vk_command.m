@@ -803,8 +803,10 @@ static void bind_sets_compute(vk_enc *e, const struct VkPipeline_T *pl) {
 }
 
 static MTLViewport mtl_viewport(VkViewport v) {
-    // (a negative height, maintenance1's flip, is the same viewport from its other edge)
-    if (v.height < 0) { v.y += v.height; v.height = -v.height; }
+    // Vulkan maps NDC y to y + (1 + ndc.y) * height / 2; the vertex shaders hand Metal -y (vk_msl.c), and Metal maps
+    // that to originY + (1 - ndc.y') * height / 2: the same rows for either sign of the height. So a negative height
+    // (VK_KHR_maintenance1's flip) goes to Metal as it is, which takes it; turning it positive drew the image upside
+    // down.
     return (MTLViewport){ v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth };
 }
 

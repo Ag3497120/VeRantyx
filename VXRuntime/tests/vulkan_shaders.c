@@ -9,7 +9,8 @@
 //   drawing:  two color targets (sRGB, B10G11R11) at 4x MSAA resolved by dynamic rendering, an input attachment read
 //             in a second subpass, a geometry shader writing gl_Layer of a two-layer target, a two-component output
 //             to an RGBA8 target with gl_FragDepth written and no depth attachment; triangle fans (Metal has none)
-//             drawn, indexed (16- and 32-bit, with primitive restart) and indirectly
+//             drawn, indexed (16- and 32-bit, with primitive restart) and indirectly; the viewport's orientation (NDC
+//             y = -1 at the top row) with a positive and a negative (maintenance1) height
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -745,6 +746,56 @@ static void triangle_fans(void) {
     CHECK(all);
 }
 
+// ---- drawing: which way up -----------------------------------------------------------------------------------------
+// Vulkan's viewport maps NDC y = -1 to its y and y = +1 to y + height (framebuffer rows grow downwards). The upper half
+// of NDC (y from -1 to 0) lands in the top rows with a positive height; with a negative height (y = S, height = -S,
+// VK_KHR_maintenance1 / Vulkan 1.1) the same geometry lands in the bottom rows.
+static void orientation(void) {
+    test = "orientation";
+    enum { S = 8 };
+    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    img target = make_image(format, S, S, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    VkImageView view = make_view(target.image, VK_IMAGE_VIEW_TYPE_2D, format, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    VkPipelineLayout pl = pipeline_layout(NULL, 0, 0);
+    VkVertexInputBindingDescription bind = { 0, 8, VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription attr = { 0, 0, VK_FORMAT_R32G32_SFLOAT, 0 };
+    VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &bind, .vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &attr };
+    g_vertex_input = &vi;
+    VkPipeline p = graphics(MODULE(spv_position_vert), 0, MODULE(spv_color_frag), pl, &format, 1, VK_SAMPLE_COUNT_1_BIT, 0, 0);
+    g_vertex_input = NULL;
+    if (!p) return;
+    static const float upper[] = { -1, -1, 1, -1, 1, 0, -1, -1, 1, 0, -1, 0 };   // NDC y from -1 to 0, both triangles
+    buf vb = make_buffer(sizeof upper, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    memcpy(vb.map, upper, sizeof upper);
+    buf readback = make_buffer(S * S * 4, 0);
+    for (int negative = 0; negative < 2; negative++) {
+        VkCommandBuffer cb = begin();
+        to_general(cb, target.image, VK_IMAGE_ASPECT_COLOR_BIT);
+        VkRenderingAttachmentInfo a = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .color = { .float32 = { 0, 0, 0, 0 } } } };
+        VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { S, S } }, .layerCount = 1,
+                               .colorAttachmentCount = 1, .pColorAttachments = &a };
+        vkCmdBeginRendering(cb, &ri);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+        VkViewport v = negative ? (VkViewport){ 0, S, S, -(float)S, 0, 1 } : (VkViewport){ 0, 0, S, S, 0, 1 };
+        VkRect2D sc = { { 0, 0 }, { S, S } };
+        vkCmdSetViewport(cb, 0, 1, &v);
+        vkCmdSetScissor(cb, 0, 1, &sc);
+        VkDeviceSize zero = 0;
+        vkCmdBindVertexBuffers(cb, 0, 1, &vb.buffer, &zero);
+        vkCmdDraw(cb, 6, 1, 0, 0);
+        vkCmdEndRendering(cb);
+        barrier(cb);
+        to_buffer(cb, target.image, 0, 0, S, S, readback.buffer, 0);
+        submit(cb);
+        int top = fan_covered(&readback, 3, 1), bottom = fan_covered(&readback, 3, 6);
+        CHECK(top == !negative); CHECK(bottom == negative);
+        printf("vulkan_shaders: NDC's upper half, %s viewport height: top row %s, bottom row %s\n", negative ? "negative" : "positive",
+               top ? "drawn" : "empty", bottom ? "drawn" : "empty");
+    }
+}
+
 int main(void) {
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vulkan_shaders", .apiVersion = VK_API_VERSION_1_3 };
     VkInstanceCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
@@ -787,6 +838,7 @@ int main(void) {
     geometry_layer();
     narrow_output();
     triangle_fans();
+    orientation();
 
     vkDeviceWaitIdle(device);
     vkDestroyDevice(device, NULL);
