@@ -1118,10 +1118,54 @@ static void copy_buffer_image_encode(vk_enc *e, const c_copy_buffer_image *c) {
     }
 }
 
+// A copy between a compressed and an uncompressed image (or two compressed formats): Vulkan matches one texel of the
+// uncompressed image with one block of the compressed one (their sizes are equal), and the extent is in the source's
+// texels. Metal cannot view one as the other, so the blocks go through a buffer: out of the source, into the
+// destination, each clipped to its level (Metal wants whole blocks inside it).
+static void copy_image_through_buffer(vk_enc *e, id<MTLBlitCommandEncoder> bl, const c_copy_image *c, const VkImageCopy2 *r) {
+    const vk_format_info *sf = c->src->fmt, *df = c->dst->fmt;
+    if (!sf || !df || sf->bytes != df->bytes) { TRACE("image copy between formats of different sizes %d and %d", c->src->format, c->dst->format); return; }
+    uint32_t blocks_w = (r->extent.width + sf->block_w - 1) / sf->block_w, blocks_h = (r->extent.height + sf->block_h - 1) / sf->block_h;
+    uint32_t depth = r->extent.depth ? r->extent.depth : 1;
+    if (!blocks_w || !blocks_h) return;
+    uint64_t bpr = (uint64_t)blocks_w * sf->bytes, bpi = bpr * blocks_h;
+    id<MTLBuffer> tmp = [e->dev->mtl newBufferWithLength:(NSUInteger)(bpi * depth) options:MTLResourceStorageModePrivate];
+    if (!tmp) return;
+    uint32_t layers = r->srcSubresource.layerCount;
+    if (c->src->type == VK_IMAGE_TYPE_3D || c->dst->type == VK_IMAGE_TYPE_3D) layers = 1;
+    int is3d_s = c->src->type == VK_IMAGE_TYPE_3D, is3d_d = c->dst->type == VK_IMAGE_TYPE_3D;
+    // (the region in each image's texels, clipped to its level)
+    MTLSize ss = MTLSizeMake(blocks_w * sf->block_w, blocks_h * sf->block_h, depth), ds = MTLSizeMake(blocks_w * df->block_w, blocks_h * df->block_h, depth);
+    uint32_t slw = c->src->extent.width >> r->srcSubresource.mipLevel, slh = c->src->extent.height >> r->srcSubresource.mipLevel;
+    uint32_t dlw = c->dst->extent.width >> r->dstSubresource.mipLevel, dlh = c->dst->extent.height >> r->dstSubresource.mipLevel;
+    if (!slw) slw = 1;
+    if (!slh) slh = 1;
+    if (!dlw) dlw = 1;
+    if (!dlh) dlh = 1;
+    if (r->srcOffset.x + ss.width > slw) ss.width = slw - r->srcOffset.x;
+    if (r->srcOffset.y + ss.height > slh) ss.height = slh - r->srcOffset.y;
+    if (r->dstOffset.x + ds.width > dlw) ds.width = dlw - r->dstOffset.x;
+    if (r->dstOffset.y + ds.height > dlh) ds.height = dlh - r->dstOffset.y;
+    for (uint32_t l = 0; l < layers; l++) {
+        [bl copyFromTexture:c->src->mtl sourceSlice:r->srcSubresource.baseArrayLayer + l sourceLevel:r->srcSubresource.mipLevel
+               sourceOrigin:MTLOriginMake(r->srcOffset.x, r->srcOffset.y, r->srcOffset.z) sourceSize:ss
+                   toBuffer:tmp destinationOffset:0 destinationBytesPerRow:bpr destinationBytesPerImage:is3d_s ? bpi : 0];
+        [bl copyFromBuffer:tmp sourceOffset:0 sourceBytesPerRow:bpr sourceBytesPerImage:is3d_d ? bpi : 0 sourceSize:ds
+                 toTexture:c->dst->mtl destinationSlice:r->dstSubresource.baseArrayLayer + l destinationLevel:r->dstSubresource.mipLevel
+         destinationOrigin:MTLOriginMake(r->dstOffset.x, r->dstOffset.y, r->dstOffset.z)];
+    }
+}
+
 static void copy_image_encode(vk_enc *e, const c_copy_image *c) {
     id<MTLBlitCommandEncoder> bl = blit_encoder(e);
     if (!c->src->mtl || !c->dst->mtl) return;
     id<MTLTexture> src = c->src->mtl;
+    if (src.pixelFormat != c->dst->mtl.pixelFormat && c->src->fmt && c->dst->fmt &&
+        (c->src->fmt->compressed || c->dst->fmt->compressed)) {
+        const VkImageCopy2 *rs = (const VkImageCopy2 *)(c + 1);
+        for (uint32_t i = 0; i < c->count; i++) copy_image_through_buffer(e, bl, c, &rs[i]);
+        return;
+    }
     if (src.pixelFormat != c->dst->mtl.pixelFormat) {
         // (size-compatible formats: a view of the source in the destination's format)
         src = [src newTextureViewWithPixelFormat:c->dst->mtl.pixelFormat];

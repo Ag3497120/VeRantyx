@@ -10,7 +10,8 @@
 //             in a second subpass, a geometry shader writing gl_Layer of a two-layer target, a two-component output
 //             to an RGBA8 target with gl_FragDepth written and no depth attachment; triangle fans (Metal has none)
 //             drawn, indexed (16- and 32-bit, with primitive restart) and indirectly; the viewport's orientation (NDC
-//             y = -1 at the top row) with a positive and a negative (maintenance1) height
+//             y = -1 at the top row) with a positive and a negative (maintenance1) height; image copies between
+//             RG32_UINT and BC1
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -796,6 +797,48 @@ static void orientation(void) {
     }
 }
 
+// ---- copies between a compressed and an uncompressed image ---------------------------------------------------------
+// vkCmdCopyImage with size-compatible formats: one RG32_UINT texel is one BC1 block (8 bytes each). A 2x2 RG32_UINT
+// image of made-up values becomes the top-left 2x2 blocks of an 8x8 BC1 image, read back to a buffer; then
+// the BC1 blocks are copied into another RG32_UINT image (the extent in BC1 texels). No Man's Sky copies so.
+static void compressed_copies(void) {
+    test = "compressed copies";
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    img plain = make_image(VK_FORMAT_R32G32_UINT, 2, 2, 1, 1, VK_SAMPLE_COUNT_1_BIT, u);
+    img bc = make_image(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 8, 1, 1, VK_SAMPLE_COUNT_1_BIT, u);
+    img back = make_image(VK_FORMAT_R32G32_UINT, 2, 2, 1, 1, VK_SAMPLE_COUNT_1_BIT, u);
+    buf data = make_buffer(32, 0), out_bc = make_buffer(4 * 8, 0), out_back = make_buffer(32, 0);
+    uint32_t v[8];
+    for (int i = 0; i < 8; i++) v[i] = 0x9e3779b9u * (uint32_t)(i + 1);
+    memcpy(data.map, v, sizeof v);
+    VkCommandBuffer cb = begin();
+    to_general(cb, plain.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    to_general(cb, bc.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    to_general(cb, back.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkBufferImageCopy up = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 2, 2, 1 } };
+    vkCmdCopyBufferToImage(cb, data.buffer, plain.image, VK_IMAGE_LAYOUT_GENERAL, 1, &up);
+    barrier(cb);
+    // RG32 texels (0..1, 0..1) -> BC1 texels (0..7, 0..7): one block per texel
+    VkImageCopy to_bc = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                          .dstOffset = { 0, 0, 0 }, .extent = { 2, 2, 1 } };
+    vkCmdCopyImage(cb, plain.image, VK_IMAGE_LAYOUT_GENERAL, bc.image, VK_IMAGE_LAYOUT_GENERAL, 1, &to_bc);
+    barrier(cb);
+    VkBufferImageCopy down_bc = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 8, 8, 1 } };
+    vkCmdCopyImageToBuffer(cb, bc.image, VK_IMAGE_LAYOUT_GENERAL, out_bc.buffer, 1, &down_bc);
+    // BC1 texels (0..7, 0..7) -> RG32 texels (0..1, 0..1): the extent is the source's, 8x8
+    VkImageCopy from_bc = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                            .extent = { 8, 8, 1 } };
+    vkCmdCopyImage(cb, bc.image, VK_IMAGE_LAYOUT_GENERAL, back.image, VK_IMAGE_LAYOUT_GENERAL, 1, &from_bc);
+    barrier(cb);
+    VkBufferImageCopy down = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 2, 2, 1 } };
+    vkCmdCopyImageToBuffer(cb, back.image, VK_IMAGE_LAYOUT_GENERAL, out_back.buffer, 1, &down);
+    submit(cb);
+    CHECK(memcmp(out_bc.map, v, sizeof v) == 0);       // the four blocks, row by row, are the four texels
+    CHECK(memcmp(out_back.map, v, sizeof v) == 0);
+    printf("vulkan_shaders: RG32_UINT <-> BC1 image copies: %s, %s\n", memcmp(out_bc.map, v, sizeof v) ? "wrong" : "blocks as texels",
+           memcmp(out_back.map, v, sizeof v) ? "wrong" : "back again");
+}
+
 int main(void) {
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vulkan_shaders", .apiVersion = VK_API_VERSION_1_3 };
     VkInstanceCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
@@ -839,6 +882,7 @@ int main(void) {
     narrow_output();
     triangle_fans();
     orientation();
+    compressed_copies();
 
     vkDeviceWaitIdle(device);
     vkDestroyDevice(device, NULL);
