@@ -53,7 +53,7 @@ cp "$MACAPP"/Localizations/*.json "$APP/Contents/Resources/Localizations/"
 
 # The runtime, laid out as in the repository: the scripts find everything where they look (REPO_ROOT is runtime/).
 mkdir -p "$RT/scripts" "$RT/VXRuntime/build" "$RT/build" "$RT/VRDriver" "$RT/ALVRBridge/target/release" "$RT/games"
-cp "$REPO"/scripts/{launch_vxrt_steamvr.sh,launch_vxrt_alyx.sh,launch_vxrt_game.sh,vxrt_paths.sh,launch_vxrt_windows_steam.sh,launch_vxrt_nms_vr.sh} "$RT/scripts/"
+cp "$REPO"/scripts/{launch_vxrt_steamvr.sh,launch_vxrt_alyx.sh,launch_vxrt_game.sh,vxrt_paths.sh,launch_vxrt_windows_steam.sh,launch_vxrt_nms_vr.sh,vxrt_windows_steam_ask.sh} "$RT/scripts/"
 cp "$REPO/VXRuntime/build/vxrt" "$RT/VXRuntime/build/"
 cp "$OUT/obj/HardwareEncoder" "$OUT/obj/vxrt-helper" "$REPO/build/openvr_api_capture_proxy.dll" "$RT/build/"
 cp "$REPO/VRDriver/driver_verantyx.dll" "$RT/VRDriver/"

@@ -5,7 +5,12 @@
 //   VeRantyx --play <app id> [seconds]     starts a game as the Play button does and reports what the app sees
 //                                          (--flat too: on the Mac's screen, as the "On this Mac" button does;
 //                                          --dry-run: prints the script, arguments and settings it would run, runs none)
+//   VeRantyx --get <app id> [--flat] --dry-run
+//                                          the "Get and play" flow, answered yes, with the downloads and the start only
+//                                          printed (VERANTYX_DRY_RUN): what is missing, the size, what would be run
 //   VeRantyx --snapshot <folder>           saves pictures of each page of the window (scrolled: <page>-2.png, ...)
+//                                          (--snapshot-get <app id>: with the "Get and play" question of that game
+//                                          shown, as its button does; nothing is downloaded)
 //   VeRantyx --report                      saves the logs as a report does and prints the form's link (opens nothing)
 //   VeRantyx --missing-functions <log>     prints the missing Windows functions a game log names, as the report sends them
 //   VeRantyx --headset-report <session_log.txt> [Mac fps]
@@ -55,6 +60,13 @@ enum Entry {
                 if let hint = Play.headsetHint(reports.suffix(3), mac: mac, headset: .quest, wired: false, quality: .standard) { print("    advice: \(hint)") }
             }
             exit(0)
+        }
+        if let i = a.firstIndex(of: "--get"), i + 1 < a.count {
+            guard a.contains("--dry-run") else { print("--get only with --dry-run (it would download)"); exit(2) }
+            setenv("VERANTYX_DRY_RUN", "1", 1)
+            let id = a[i + 1], flat = a.contains("--flat")
+            Task { @MainActor in await Headless.get(id, flat: flat) }
+            RunLoop.main.run()
         }
         if let i = a.firstIndex(of: "--play"), i + 1 < a.count {
             let id = a[i + 1]
@@ -112,6 +124,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Testing without the window
 
 @MainActor enum Headless {
+    static func get(_ id: String, flat: Bool) async {
+        let model = AppModel()
+        await model.refresh()
+        await model.loadLibrary()
+        guard let title = Title.named(id) else { print("\(id): not a known title"); exit(2) }
+        print("drive=\(Paths.drive.path) installed=\(model.isInstalled(id)) steamVR=\(model.steamVR) windowsSteam installed=\(model.windowsSteamInstalled) running=\(model.windowsSteamRunning) account=\(model.account.isEmpty ? "-" : "set")")
+        model.getAndPlay(title, flat: flat)
+        for _ in 0..<50 where model.flow?.stage == .working { try? await Task.sleep(nanoseconds: 100_000_000) }
+        if model.flow?.stage == .confirm { print("asks: \(gigabytes(model.flow!.bytes)), free \(model.flow!.free.map(gigabytes) ?? "?"); answered yes"); await model.confirmFlow() }
+        for _ in 0..<50 where model.play?.running == true { try? await Task.sleep(nanoseconds: 100_000_000) }
+        for line in model.flowLog { print(line) }
+        if let f = model.flow { print("stage: \(f.stage)") }
+        if let play = model.play { print("started (dry run):"); print(play.dryRunText) }
+        exit(0)
+    }
+
     static func play(_ id: String, seconds: Double, flat: Bool = false) async {
         let model = AppModel()
         await model.refresh()
@@ -155,6 +183,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let dir = URL(fileURLWithPath: a[i + 1])
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? await Task.sleep(nanoseconds: 2_500_000_000)
+        if let j = a.firstIndex(of: "--snapshot-get"), j + 1 < a.count, let title = Title.named(a[j + 1]) {
+            model.getAndPlay(title, flat: a.contains("--flat"))
+        }
         for page in Page.allCases {
             model.page = page
             try? await Task.sleep(nanoseconds: 1_200_000_000)

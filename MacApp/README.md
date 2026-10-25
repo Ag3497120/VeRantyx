@@ -26,6 +26,16 @@ core, the launch scripts), so the player's Mac needs only macOS and Steam: no Ho
   the player signs in in its window and answers its windows (an update, the game's agreement, "Steam Service Error")
   themselves: the app never signs in, accepts anything or presses a button in Steam for them. Stop ends the game and
   SteamVR; Windows Steam stays open.
+- **Get and play**: the Play page lists the known games not installed yet, each with "Get and play" (on this Mac,
+  in the headset). The flow: what is missing (the game; SteamVR for the headset), its size and the disk's free
+  space, a yes from the player; then the download the game's own way (`Title.source`): Valve's steamcmd with the
+  player's account (they type the password and Steam Guard code into steamcmd's console themselves), or, for a game
+  Windows Steam starts, Windows Steam itself (`scripts/vxrt_windows_steam_ask.sh -- steam://install/<id>`: Steam shows
+  its own install window, answered by the player, and installs only what the account owns; progress from its app
+  manifest); then the runtime files if none are gathered yet, and the start. Windows Steam has to be running, opened
+  and signed in to by the player (the flow waits, with Continue); installing Windows Steam itself is not done by the
+  app. `VeRantyx --get <id> [--flat] --dry-run` runs the flow answered yes with the downloads and the start only
+  printed.
 - **Headset**: Meta Quest or Pico through ALVR (Wi-Fi or a USB cable), Apple Vision Pro with the VeRantyx app, or with
   the ALVR app; the steps for each.
 - **Help**: the logs folder, a report form on GitHub filled in with the Mac's facts, Stop everything.

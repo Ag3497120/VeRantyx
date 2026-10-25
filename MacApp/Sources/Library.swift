@@ -35,6 +35,15 @@ struct Title: Identifiable, Hashable {
     /// Steam answers. It comes from that Steam's own library, not from steamcmd.
     var windowsSteam = false
 
+    /// Where the game's Windows files come from, and what it starts with.
+    enum Source {
+        /// Valve's steamcmd on the Mac, with the player's account; started with Mac Steam through the bridge.
+        case steamcmd
+        /// The player's Windows Steam on VXRuntime, which downloads and starts it itself (SteamStub games).
+        case windowsSteam
+    }
+    var source: Source { windowsSteam ? .windowsSteam : .steamcmd }
+
     static func == (a: Title, b: Title) -> Bool { a.id == b.id }
     func hash(into h: inout Hasher) { h.combine(id) }
 
@@ -122,9 +131,27 @@ enum Library {
     static func windowsSteamGames() -> [String: (app: SteamApp, folder: URL)] {
         var out: [String: (SteamApp, URL)] = [:]
         for (id, app) in apps(in: Paths.windowsSteam) where Title.named(id)?.windowsSteam == true {
-            if let f = folder(app, in: Paths.windowsSteam) { out[id] = (app, f) }
+            // (only a finished install: Steam writes the manifest when it begins one)
+            if let f = folder(app, in: Paths.windowsSteam), windowsSteamProgress(id)?.done != false { out[id] = (app, f) }
         }
         return out
+    }
+
+    /// How far Windows Steam is with installing a game, from its app manifest (nil: none yet): StateFlags 4 is "fully
+    /// installed" (with 2 too when an update waits: still installed); BytesDownloaded of BytesToDownload while it downloads.
+    static func windowsSteamProgress(_ id: String) -> (done: Bool, fraction: Double?)? {
+        let url = Paths.windowsSteam.appendingPathComponent("steamapps/appmanifest_\(id).acf")
+        guard let data = FileManager.default.contents(atPath: url.path) else { return nil }
+        let text = String(decoding: data, as: UTF8.self)
+        func number(_ key: String) -> Double? {
+            guard let re = try? NSRegularExpression(pattern: "\"\(key)\"\\s+\"([0-9]+)\"", options: .caseInsensitive),
+                  let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  let r = Range(m.range(at: 1), in: text) else { return nil }
+            return Double(text[r])
+        }
+        let flags = Int(number("StateFlags") ?? 0)
+        let total = number("BytesToDownload") ?? 0
+        return (flags & 4 != 0, total > 0 ? min(1, (number("BytesDownloaded") ?? 0) / total) : nil)
     }
 
     // MARK: executables

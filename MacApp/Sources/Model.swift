@@ -127,7 +127,10 @@ struct Job {
         elsewhere = play?.running == true ? [] : await pgrep("[b]uild/vxrt.*\\.exe")
     }
 
-    func reloadLibrary() {
+    func reloadLibrary() { Task { await loadLibrary() } }
+
+    /// The same, finished when the games list is (the get-and-play flow starts the game it has just installed).
+    func loadLibrary() async {
         let installed = Library.installed()
         steamVR = installed[Title.steamVR] != nil
         redistCount = Redist.count
@@ -135,7 +138,7 @@ struct Job {
         // (the games Windows Steam starts: from its own library, where it keeps them)
         for (id, entry) in Library.windowsSteamGames() { found[id] = entry }
         let entries = found
-        Task.detached {
+        let sorted = await Task.detached { () -> [Game] in
             var list: [Game] = []
             for (id, entry) in entries {
                 let title = Title.named(id)
@@ -146,9 +149,9 @@ struct Job {
             // (the titles known to run first, in the app's order; then the others by name)
             let order = Title.all.map(\.id)
             list.sort { (order.firstIndex(of: $0.id) ?? 99, $0.name) < (order.firstIndex(of: $1.id) ?? 99, $1.name) }
-            let sorted = list
-            await MainActor.run { self.games = sorted }
-        }
+            return list
+        }.value
+        games = sorted
     }
 
     func isInstalled(_ id: String) -> Bool { id == Title.steamVR ? steamVR : games.contains { $0.id == id } }
@@ -180,15 +183,26 @@ struct Job {
     /// Downloads the Windows builds of the chosen titles with the user's own Steam account (steamcmd), one at a time,
     /// SteamVR first; then gathers the runtime files.
     func download() async {
+        await download(Title.all.map(\.id).filter { wanted.contains($0) })
+    }
+
+    /// The same for these titles (those not installed yet, and not Windows Steam's); false: not all of them came.
+    @discardableResult func download(_ wanted: [String]) async -> Bool {
         let ids = Title.all.map(\.id).filter { wanted.contains($0) && !isInstalled($0) && Title.named($0)?.windowsSteam != true }
-        guard !ids.isEmpty, !account.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        guard !ids.isEmpty else { return true }
+        guard !account.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
         error = nil
         let need = ids.compactMap { Title.named($0)?.bytes }.reduce(0, +)
         if let free = Mac.freeSpace(drive), free < need + (5 << 30) {
             error = TF("Not enough space: these need about %@, %@ is free on that disk. Choose another place in step 3, or fewer games.",
                        "空き容量が足りません。約 %@ 必要で、そのディスクの空きは %@ です。手順 3 で別の場所を選ぶか、ゲームを減らしてください。",
                        gigabytes(need), gigabytes(free))
-            return
+            return false
+        }
+        if Play.dryRun {
+            // (development: what would be downloaded, nothing fetched)
+            for id in ids { flowNote("dry run: would download \(id) with steamcmd (+login \(account.trimmingCharacters(in: .whitespaces)) +app_update \(id) validate) into \(Paths.steamLibrary.path)") }
+            return false
         }
         do {
             if !SteamCmd.installed {
@@ -237,8 +251,11 @@ struct Job {
         } catch {
             job = nil
             self.error = error.localizedDescription
+            await loadLibrary()
+            return false
         }
-        reloadLibrary()
+        await loadLibrary()
+        return true
     }
 
     /// Asks for a folder with a Steam library (a Windows PC's drive, a CrossOver or Whisky bottle, ...).
@@ -290,24 +307,27 @@ struct Job {
     // MARK: play
 
     /// A game's way to the headset: its card's choice, else the Headset page's.
-    func route(for game: Game) -> Route { routes[game.id].flatMap(Route.init(rawValue:)) ?? headset.route }
+    func route(for game: Game) -> Route { route(forID: game.id) }
+    func route(forID id: String) -> Route { routes[id].flatMap(Route.init(rawValue:)) ?? headset.route }
 
     /// Chooses a game's way to the headset; the Headset page's own is kept as "none chosen" (it then follows that page).
-    func setRoute(_ route: Route, for game: Game) {
-        if route == headset.route { routes.removeValue(forKey: game.id) } else { routes[game.id] = route.rawValue }
+    func setRoute(_ route: Route, forID id: String) {
+        if route == headset.route { routes.removeValue(forKey: id) } else { routes[id] = route.rawValue }
     }
 
     /// The headset a game streams to: the VeRantyx app on a Vision Pro, or ALVR on the headset the Headset page names
     /// (a Vision Pro's ALVR app when that page has the VeRantyx app).
-    func headset(for game: Game) -> Headset {
-        switch route(for: game) {
+    func headset(for game: Game) -> Headset { headset(forID: game.id) }
+    func headset(forID id: String) -> Headset {
+        switch route(forID: id) {
         case .visionApp: return .visionApp
         case .alvr: return headset.usesALVR ? headset : .visionALVR
         }
     }
 
     /// The picture setting for a game: the Play page's, when its way to the headset offers it; else Recommended.
-    func quality(for game: Game) -> Quality { Quality.choices(for: headset(for: game)).contains(quality) ? quality : .standard }
+    func quality(for game: Game) -> Quality { quality(forID: game.id) }
+    func quality(forID id: String) -> Quality { Quality.choices(for: headset(forID: id)).contains(quality) ? quality : .standard }
 
     /// Whether a game can start now, on the Mac's screen or in the headset.
     func canStart(_ game: Game, flat: Bool) -> Bool {
@@ -330,12 +350,7 @@ struct Job {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/bash")
             p.arguments = [Paths.runtime.appendingPathComponent("scripts/launch_vxrt_windows_steam.sh").path]
-            var env = ProcessInfo.processInfo.environment
-            env.removeValue(forKey: "VERANTYX_REPO")
-            env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
-            env["VERANTYX_VR_DRIVE"] = Paths.drive.path
-            env["VXRT_REDIST"] = Paths.redist.path
-            env["VXRT_WSTEAM_LOG"] = Paths.logs.appendingPathComponent("vxrt-windows-steam.log").path
+            var env = windowsSteamEnv()
             env["VXRT_WSTEAM_GPU"] = "1"
             env["VXRT_WSTEAM_WEBHELPER_ARGS"] = "--single-process --disable-gpu-compositing"
             p.environment = env
@@ -351,6 +366,163 @@ struct Job {
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    // MARK: get and play
+
+    /// "Get and play": a known title not installed yet (or SteamVR missing for the headset) is fetched the title's own
+    /// way, after the player has seen the size and the free space and said yes; then the first-time setup (the runtime
+    /// files); then it starts, on the Mac's screen or the way to the headset chosen on its card.
+    struct Flow {
+        enum Stage: Equatable {
+            /// The size and the free space, waiting for the player's yes.
+            case confirm
+            /// Windows Steam has to be opened and signed in to by the player (then Continue).
+            case openWindowsSteam
+            /// Windows Steam installs it (its own install window first, answered by the player); its progress.
+            case windowsSteamInstalling(Double?)
+            /// steamcmd, the runtime files, the start.
+            case working
+            /// Stopped: why, and what the player does.
+            case stopped(String)
+        }
+        var title: Title
+        var flat: Bool
+        var stage: Stage = .confirm
+        /// What steamcmd fetches (SteamVR, the game), and whether Windows Steam installs the game.
+        var steamcmd: [String] = []
+        var windowsSteam = false
+        var bytes: Int64 = 0
+        var free: Int64? = nil
+        /// What it did, step by step (`--get` prints it).
+        var log: [String] = []
+    }
+    var flow: Flow? = nil
+    /// The last flow's steps, kept after it has ended (`--get` prints them).
+    @ObservationIgnored var flowLog: [String] = []
+
+    func flowNote(_ line: String) { flow?.log.append(line); flowLog.append(line) }
+
+    /// The flow's first step: what is missing, and the question (or, with nothing missing, the start).
+    func getAndPlay(_ title: Title, flat: Bool) {
+        guard flow == nil || flow?.stage != .working, play?.running != true else { return }
+        var f = Flow(title: title, flat: flat && title.flat)
+        if !f.flat && !steamVR { f.steamcmd.append(Title.steamVR) }
+        switch title.source {
+        case .steamcmd: if !isInstalled(title.id) { f.steamcmd.append(title.id) }
+        case .windowsSteam: f.windowsSteam = !isInstalled(title.id)
+        }
+        f.bytes = f.steamcmd.compactMap { Title.named($0)?.bytes }.reduce(0, +) + (f.windowsSteam ? title.bytes : 0)
+        f.free = Mac.freeSpace(title.source == .windowsSteam && f.steamcmd.isEmpty ? Paths.windowsSteamRoot : drive) ?? Mac.freeSpace(drive)
+        flow = f
+        flowNote("\(title.name): steamcmd \(f.steamcmd), Windows Steam install \(f.windowsSteam), \(gigabytes(f.bytes)), free \(f.free.map(gigabytes) ?? "?")")
+        if title.source == .windowsSteam && !windowsSteamInstalled {
+            // (installing Windows Steam itself is not done by the app: Valve's installer on VXRuntime is not there yet)
+            stopFlow(T("This game needs Windows Steam on VXRuntime, which is not installed yet. Installing it is a manual step for now (the repository: VXRuntime/README.md, “The Windows Steam client”).",
+                       "このゲームには VXRuntime 上の Windows 版 Steam が必要ですが、まだ入っていません。今のところ導入は手作業です（リポジトリの VXRuntime/README.md「The Windows Steam client」）。"))
+            return
+        }
+        if f.steamcmd.isEmpty && !f.windowsSteam { flow?.stage = .working; Task { await finishFlow() } }
+    }
+
+    private func stopFlow(_ why: String) {
+        flowNote("stopped: \(why)")
+        flow?.stage = .stopped(why)
+    }
+
+    /// The player's yes: fetch, then set up and start.
+    func confirmFlow() async {
+        guard var f = flow, f.stage == .confirm else { return }
+        if let free = f.free, free < f.bytes + (5 << 30) {
+            stopFlow(TF("Not enough space: about %@ is needed, %@ is free.", "空き容量が足りません。約 %@ 必要で、空きは %@ です。", gigabytes(f.bytes), gigabytes(free)))
+            return
+        }
+        if !f.steamcmd.isEmpty && account.trimmingCharacters(in: .whitespaces).isEmpty {
+            stopFlow(T("Enter your Steam account name first (Get started, step 4).", "先に Steam のアカウント名を入れてください（「はじめに」の手順 4）。"))
+            return
+        }
+        f.stage = .working
+        flow = f
+        if !f.steamcmd.isEmpty {
+            flowNote("steamcmd: \(f.steamcmd)")
+            guard await download(f.steamcmd) else {
+                stopFlow(Play.dryRun ? "dry run: nothing downloaded" : error ?? T("The download did not finish.", "ダウンロードが完了しませんでした。"))
+                return
+            }
+        }
+        if f.windowsSteam {
+            await askWindowsSteam()
+        } else {
+            await finishFlow()
+        }
+    }
+
+    /// Windows Steam installs the game: it has to be running (opened and signed in to by the player), then it is asked
+    /// to (steam://install/<id>) and shows its own install window, which the player answers.
+    func askWindowsSteam() async {
+        guard let f = flow else { return }
+        let running = windowsSteamInstalled ? await WindowsSteam.running() : false
+        windowsSteamRunning = running
+        guard windowsSteamRunning || Play.dryRun else {
+            flowNote("waiting: Windows Steam is not running")
+            flow?.stage = .openWindowsSteam
+            return
+        }
+        flow?.stage = .windowsSteamInstalling(nil)
+        let r = await run("/bin/bash", [Paths.runtime.appendingPathComponent("scripts/vxrt_windows_steam_ask.sh").path, "--", "steam://install/\(f.title.id)"],
+                          env: windowsSteamEnv(dryRun: Play.dryRun))
+        flowNote("asked Windows Steam: steam://install/\(f.title.id) (exit \(r.status)) \(r.text.trimmingCharacters(in: .whitespacesAndNewlines))")
+        guard r.status == 0 else { stopFlow(Play.hint(r.text) ?? r.text); return }
+        if Play.dryRun { stopFlow("dry run: would wait for Windows Steam's install"); return }
+        // (until Steam has installed it; the player may take their time in Steam's window, or say no there)
+        for _ in 0..<(6 * 60 * 60 / 2) {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard flow?.title.id == f.title.id else { return }        // (cancelled)
+            if let p = Library.windowsSteamProgress(f.title.id) {
+                flow?.stage = .windowsSteamInstalling(p.fraction)
+                if p.done { flowNote("installed by Windows Steam"); await finishFlow(); return }
+            }
+        }
+        stopFlow(T("Windows Steam has not finished installing it. Look at its window; press Play when it is done.",
+                   "Windows 版 Steam のインストールが終わっていません。Steam のウィンドウを見て、終わったらプレイを押してください。"))
+    }
+
+    /// The first-time setup, then the start.
+    private func finishFlow() async {
+        guard let f = flow else { return }
+        flow?.stage = .working
+        if redistCount == 0 {
+            flowNote("gathering the runtime files")
+            if !Play.dryRun { await collect() }
+        }
+        await loadLibrary()
+        guard let game = games.first(where: { $0.id == f.title.id }) else {
+            stopFlow(TF("%@ is not installed yet.", "%@ はまだ入っていません。", f.title.name)); return
+        }
+        guard canStart(game, flat: f.flat) else {
+            let why = game.viaWindowsSteam && !windowsSteamRunning
+                ? T("It is installed. Open Windows Steam and sign in, then press Play.", "入っています。Windows 版 Steam を開いてサインインしてから、プレイを押してください。")
+                : T("It is installed but cannot start yet: finish what the Play page asks (Steam open, Get started, nothing else running), then press Play.",
+                    "入っていますが、まだ起動できません。プレイのページの案内（Steam を開く、「はじめに」、ほかに動いているものを止める）を済ませてから、プレイを押してください。")
+            stopFlow(why); return
+        }
+        flowNote("start \(game.name) flat=\(f.flat) headset=\(headset(for: game).rawValue)")
+        flow = nil
+        start(game, flat: f.flat)
+    }
+
+    func cancelFlow() { flow = nil }
+
+    /// The settings the Windows Steam scripts are run with (the same places as the app's).
+    private func windowsSteamEnv(dryRun: Bool = false) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "VERANTYX_REPO")
+        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+        env["VERANTYX_VR_DRIVE"] = Paths.drive.path
+        env["VXRT_REDIST"] = Paths.redist.path
+        env["VXRT_WSTEAM_LOG"] = Paths.logs.appendingPathComponent("vxrt-windows-steam.log").path
+        if dryRun { env["VXRT_WSTEAM_DRY_RUN"] = "1" }
+        return env
     }
 
     func start(_ game: Game, flat: Bool = false) {

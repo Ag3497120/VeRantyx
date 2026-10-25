@@ -426,6 +426,7 @@ struct PlayView: View {
                        action: (T("Stop it", "停止する"), { Task { await Play.stopEverything() } }))
             }
             if let play = model.play { SessionCard(play: play) }
+            if model.flow != nil { FlowCard() }
             if model.windowsSteamInstalled || model.games.contains(where: \.viaWindowsSteam) { WindowsSteamCard() }
 
             Card(title: T("Settings for this session", "今回の設定")) {
@@ -447,11 +448,18 @@ struct PlayView: View {
 
             if model.games.isEmpty {
                 Card(title: T("No games yet", "まだゲームがありません")) {
-                    Text(T("Download or copy them in Get started, step 4.", "「はじめに」の手順 4 でダウンロードかコピーをしてください。")).foregroundStyle(.secondary)
+                    Text(T("Get one below, or download or copy them in Get started, step 4.", "下から入手するか、「はじめに」の手順 4 でダウンロードかコピーをしてください。")).foregroundStyle(.secondary)
                 }
             } else {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 14)], spacing: 14) {
                     ForEach(model.games) { GameCard(game: $0) }
+                }
+            }
+            let more = Title.all.filter { $0.id != Title.steamVR && !model.isInstalled($0.id) }
+            if !more.isEmpty {
+                Text(T("Not installed yet", "まだ入っていないゲーム")).font(.title3.weight(.semibold)).padding(.top, 6)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 14)], spacing: 14) {
+                    ForEach(more) { TitleCard(title: $0) }
                 }
             }
         }
@@ -494,7 +502,7 @@ struct GameCard: View {
                                          : TF("Uses %@; VeRantyx does not run games with anti-cheat.", "%@ を使うため、VeRantyx では起動しません。", game.antiCheat.joined(separator: ", "))))
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
-            if game.playable { RoutePicker(game: game) }
+            if game.playable { RoutePicker(id: game.id) }
             if game.flat {
                 // (two ways to play, one above the other and each as wide as the card: side by side, the labels were
                 //  cut short in the narrowest cards)
@@ -536,16 +544,125 @@ struct GameCard: View {
     }
 }
 
+/// A known game that is not installed yet: "Get and play" fetches it its own way (after a yes), then starts it.
+struct TitleCard: View {
+    @Environment(AppModel.self) private var model
+    var title: Title
+    private var busy: Bool { model.play?.running == true || model.job != nil || model.flow != nil }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                Text(title.name).font(.headline).lineLimit(2)
+                Spacer()
+                Chip(text: title.source == .windowsSteam ? T("Windows Steam", "Windows 版 Steam") : "steamcmd", color: .secondary)
+            }
+            Text(title.summary).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            RoutePicker(id: title.id)
+            Text(TF("About %@", "約 %@", gigabytes(title.bytes))).font(.caption).foregroundStyle(.tertiary)
+            VStack(spacing: 6) {
+                if title.flat {
+                    Button { model.getAndPlay(title, flat: true) } label: {
+                        Label(T("Get and play on this Mac", "入手して Mac の画面で"), systemImage: "desktopcomputer").frame(maxWidth: .infinity)
+                    }
+                }
+                Button { model.getAndPlay(title, flat: false) } label: {
+                    Label(T("Get and play in the headset", "入手してヘッドセットで"), systemImage: "arrow.down.circle").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .disabled(busy)
+        }
+        .padding(16)
+        .frame(minHeight: 150, alignment: .top)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .controlBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.primary.opacity(0.08)))
+    }
+}
+
+/// The get-and-play flow: the question (size, free space, how it is fetched), then where it is.
+struct FlowCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        if let f = model.flow {
+            Card(title: TF("Get %@", "%@ を入手", f.title.name)) {
+                switch f.stage {
+                case .confirm:
+                    Text(TF("About %@ to download; %@ free on that disk.", "ダウンロードは約 %@。そのディスクの空きは %@ です。",
+                            gigabytes(f.bytes), f.free.map(gigabytes) ?? "?"))
+                        .fontWeight(.medium)
+                    if !f.steamcmd.isEmpty {
+                        Label(TF("Valve's steamcmd downloads %@ with your Steam account. It asks for your password and Steam Guard code itself, in its console; VeRantyx keeps neither.",
+                                 "Valve の steamcmd が、あなたの Steam アカウントで %@ をダウンロードします。パスワードと Steam Guard コードは steamcmd 自身がコンソールで聞きます。VeRantyx はどちらも保存しません。",
+                                 f.steamcmd.compactMap { Title.named($0)?.name }.joined(separator: ", ")), systemImage: "arrow.down.circle")
+                            .fixedSize(horizontal: false, vertical: true)
+                        if model.account.trimmingCharacters(in: .whitespaces).isEmpty {
+                            TextField(T("Steam account name (not the e-mail)", "Steam のアカウント名（メールアドレスではなく）"), text: $model.account)
+                                .textFieldStyle(.roundedBorder).frame(maxWidth: 300)
+                        }
+                    }
+                    if f.windowsSteam {
+                        Label(T("Your Windows Steam downloads the game: it opens its own install window, where you confirm. It installs only games your account owns; its agreements are yours to answer.",
+                                "あなたの Windows 版 Steam がゲームをダウンロードします。Steam 自身のインストール画面が開くので、そこでご自身で確認します。アカウントが持っているゲームだけが入り、規約への回答もご自身で行います。"),
+                              systemImage: "arrow.down.circle")
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(T("Then the first-time setup (the Windows runtime files) and the start.", "そのあと初回の準備（Windows のランタイムファイル）をして起動します。"))
+                        .font(.callout).foregroundStyle(.secondary)
+                    HStack {
+                        Spacer()
+                        Button(T("Cancel", "キャンセル")) { model.cancelFlow() }
+                        Button(T("Download and play", "ダウンロードして起動")) { Task { await model.confirmFlow() } }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!f.steamcmd.isEmpty && model.account.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                case .openWindowsSteam:
+                    Label(T("Open Windows Steam (the card above) and sign in in its window yourself; then Continue.",
+                            "Windows 版 Steam を開き（上のカード）、そのウィンドウでご自身でサインインしてから「続ける」を押してください。"), systemImage: "person.badge.key")
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Spacer()
+                        Button(T("Cancel", "キャンセル")) { model.cancelFlow() }
+                        Button(T("Continue", "続ける")) { Task { await model.askWindowsSteam() } }
+                            .buttonStyle(.borderedProminent).disabled(!model.windowsSteamRunning)
+                    }
+                case .windowsSteamInstalling(let p):
+                    HStack(spacing: 12) {
+                        if let p { ProgressView(value: p).frame(width: 200); Text(String(format: "%.0f %%", p * 100)).monospacedDigit() }
+                        else { ProgressView().controlSize(.small) }
+                        Text(T("Windows Steam is installing it. Answer its install window there yourself.", "Windows 版 Steam がインストール中です。Steam のインストール画面にはご自身で答えてください。"))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button(T("Cancel", "キャンセル")) { model.cancelFlow() }
+                    }
+                case .working:
+                    HStack {
+                        ProgressView().controlSize(.small)
+                        Text(T("Downloading and setting up…", "ダウンロードと準備をしています…"))
+                        Spacer()
+                    }
+                case .stopped(let why):
+                    Label(why, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    HStack { Spacer(); Button(T("Close", "閉じる")) { model.cancelFlow() } }
+                }
+            }
+        }
+    }
+}
+
 /// A game's way to the headset, on its card next to its Headset (Play) button: the ALVR app (a Vision Pro's, a Quest's
 /// or a Pico's) or the VeRantyx app on an Apple Vision Pro; kept for the game (AppModel.routes).
 struct RoutePicker: View {
     @Environment(AppModel.self) private var model
-    var game: Game
+    var id: String
 
     var body: some View {
-        let headset = model.headset(for: game)
+        let headset = model.headset(forID: id)
         VStack(alignment: .leading, spacing: 3) {
-            Picker(T("Way to the headset", "ヘッドセットへの経路"), selection: Binding(get: { model.route(for: game) }, set: { model.setRoute($0, for: game) })) {
+            Picker(T("Way to the headset", "ヘッドセットへの経路"), selection: Binding(get: { model.route(forID: id) }, set: { model.setRoute($0, forID: id) })) {
                 ForEach(Route.allCases) { Text($0.name).tag($0) }
             }
             .pickerStyle(.segmented)
@@ -553,7 +670,7 @@ struct RoutePicker: View {
             .disabled(model.play?.running == true)
             .help(T("ALVR app: ALVR on the headset (Apple Vision Pro from the App Store, Meta Quest, Pico; the Headset page says which). VeRantyx app: VeRantyx's own app on an Apple Vision Pro (hands and Joy-Con). Kept for this game.",
                     "ALVR アプリ：ヘッドセットの ALVR（App Store の Apple Vision Pro 版、Meta Quest、Pico。どれかはヘッドセットのページで選びます）。VeRantyx アプリ：Apple Vision Pro 用の VeRantyx 自身のアプリ（手と Joy-Con）。このゲーム用に保存されます。"))
-            Text(TF("%@ · %@", "%@ · %@", headset.name, model.quality(for: game).name))
+            Text(TF("%@ · %@", "%@ · %@", headset.name, model.quality(forID: id).name))
                 .font(.caption2).foregroundStyle(.secondary).lineLimit(2).fixedSize(horizontal: false, vertical: true)
         }
     }
