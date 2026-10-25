@@ -379,7 +379,7 @@ struct Job {
             case confirm
             /// Windows Steam has to be opened and signed in to by the player (then Continue).
             case openWindowsSteam
-            /// Windows Steam installs it (its own install window first, answered by the player); its progress.
+            /// Windows Steam installs it (a window it opens of its own is answered there by the player); its progress.
             case windowsSteamInstalling(Double?)
             /// steamcmd, the runtime files, the start.
             case working
@@ -458,7 +458,8 @@ struct Job {
     }
 
     /// Windows Steam installs the game: it has to be running (opened and signed in to by the player), then it is asked
-    /// to (steam://install/<id>) and shows its own install window, which the player answers.
+    /// to (steam://install/<id>) after the player's yes in the app, and starts the download; a window it opens of its
+    /// own (where to install, an agreement) the player answers there. Only games the account owns are installed.
     func askWindowsSteam() async {
         guard let f = flow else { return }
         let running = windowsSteamInstalled ? await WindowsSteam.running() : false

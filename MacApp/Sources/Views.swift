@@ -605,8 +605,8 @@ struct FlowCard: View {
                         }
                     }
                     if f.windowsSteam {
-                        Label(T("Your Windows Steam downloads the game: it opens its own install window, where you confirm. It installs only games your account owns; its agreements are yours to answer.",
-                                "あなたの Windows 版 Steam がゲームをダウンロードします。Steam 自身のインストール画面が開くので、そこでご自身で確認します。アカウントが持っているゲームだけが入り、規約への回答もご自身で行います。"),
+                        Label(T("When you press Download and play, your Windows Steam starts the download. If Steam opens a window of its own (where to install, an agreement), answer it there yourself. Only games your account owns are installed.",
+                                "「ダウンロードして起動」を押すと、Windows 版 Steam がダウンロードを始めます。Steam が自分の窓（インストール先の確認や利用規約など）を出したときは、そこでご自身で答えてください。アカウントが持っているゲームだけが入ります。"),
                               systemImage: "arrow.down.circle")
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -633,7 +633,7 @@ struct FlowCard: View {
                     HStack(spacing: 12) {
                         if let p { ProgressView(value: p).frame(width: 200); Text(String(format: "%.0f %%", p * 100)).monospacedDigit() }
                         else { ProgressView().controlSize(.small) }
-                        Text(T("Windows Steam is installing it. Answer its install window there yourself.", "Windows 版 Steam がインストール中です。Steam のインストール画面にはご自身で答えてください。"))
+                        Text(T("Windows Steam is installing it. If it opens a window of its own, answer it there yourself.", "Windows 版 Steam がインストール中です。Steam が自分の窓を出したときは、そこでご自身で答えてください。"))
                             .fixedSize(horizontal: false, vertical: true)
                         Spacer()
                         Button(T("Cancel", "キャンセル")) { model.cancelFlow() }

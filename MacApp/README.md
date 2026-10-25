@@ -30,8 +30,9 @@ core, the launch scripts), so the player's Mac needs only macOS and Steam: no Ho
   in the headset). The flow: what is missing (the game; SteamVR for the headset), its size and the disk's free
   space, a yes from the player; then the download the game's own way (`Title.source`): Valve's steamcmd with the
   player's account (they type the password and Steam Guard code into steamcmd's console themselves), or, for a game
-  Windows Steam starts, Windows Steam itself (`scripts/vxrt_windows_steam_ask.sh -- steam://install/<id>`: Steam shows
-  its own install window, answered by the player, and installs only what the account owns; progress from its app
+  Windows Steam starts, Windows Steam itself (`scripts/vxrt_windows_steam_ask.sh -- steam://install/<id>`: after the
+  player's yes in the app, Steam starts the download; a window Steam opens of its own (where to install, an
+  agreement) is answered there by the player; only games the account owns are installed; progress from its app
   manifest); then the runtime files if none are gathered yet, and the start. Windows Steam has to be running, opened
   and signed in to by the player (the flow waits, with Continue); installing Windows Steam itself is not done by the
   app. `VeRantyx --get <id> [--flat] --dry-run` runs the flow answered yes with the downloads and the start only

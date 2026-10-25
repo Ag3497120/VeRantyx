@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Hands steam.exe arguments to the Windows Steam already running on VXRuntime, as on Windows: a second steam.exe passes
 # its command line to the running one and ends (VXRuntime/README.md, "Starting a SteamStub game through this Steam").
-# For the Mac app's "get and play": steam://install/<appid> asks that Steam to install a game, and Steam itself then
-# shows its own install window, where you choose and confirm (and it installs only games your account owns).
+# For the Mac app's "get and play": steam://install/<appid> asks that Steam to install a game, and Steam starts the
+# download (the app asked first); a window Steam opens of its own (where to install, an agreement) is yours to answer,
+# and it installs only games your account owns.
 #
 #   scripts/vxrt_windows_steam_ask.sh -- steam://install/275850   # (the form Steam registers for steam:// links)
 #   VXRT_WSTEAM_DRY_RUN=1 scripts/vxrt_windows_steam_ask.sh ...    # only the checks; prints what it would run
