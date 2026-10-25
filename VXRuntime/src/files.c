@@ -371,12 +371,35 @@ static WINAPI BOOL ReadFile(HANDLE h, void *buf, DWORD n, DWORD *got, OVERLAPPED
     return 1;
 }
 
+// Moves a file pointer as SetFilePointer(Ex) do: a new position before the start of the file fails with
+// ERROR_NEGATIVE_SEEK and leaves the pointer where it was (SetFilePointer's documentation). The C runtime relies on
+// that error: opening a file for reading and writing in text mode, it looks at the last byte (a CTRL+Z to remove) by
+// seeking to 1 byte before the end, and only ERROR_NEGATIVE_SEEK tells it the file is merely empty; any other error
+// closes the file and the open fails (Steam's updater: "Failed to save package manifest", so it never updated).
+static int seek_file(int fd, int64_t dist, DWORD method, off_t *pos) {
+    off_t base;
+    struct stat st;
+    switch (method) {
+    case 0: base = 0; break;                                                   // FILE_BEGIN
+    case 1: base = lseek(fd, 0, SEEK_CUR); break;                              // FILE_CURRENT
+    case 2: base = fstat(fd, &st) ? -1 : st.st_size; break;                    // FILE_END
+    default: vx_set_last_error(87); return 0;
+    }
+    if (base < 0) { set_error_from_errno(); return 0; }
+    int64_t to;
+    if (__builtin_add_overflow((int64_t)base, dist, &to)) { vx_set_last_error(87); return 0; }
+    if (to < 0) { vx_set_last_error(131 /* ERROR_NEGATIVE_SEEK */); return 0; }
+    off_t at = lseek(fd, (off_t)to, SEEK_SET);
+    if (at < 0) { set_error_from_errno(); return 0; }
+    *pos = at;
+    return 1;
+}
 static WINAPI DWORD SetFilePointer(HANDLE h, LONG low, LONG *high, DWORD method) {
     int fd = vx_handle_fd(h);
     if (fd < 0) { vx_set_last_error(6); return 0xffffffffu; }
-    off_t dist = high ? (off_t)(((uint64_t)(uint32_t)*high << 32) | (uint32_t)low) : (off_t)low;
-    off_t pos = lseek(fd, dist, method == 0 ? SEEK_SET : method == 1 ? SEEK_CUR : SEEK_END);
-    if (pos < 0) { set_error_from_errno(); return 0xffffffffu; }
+    int64_t dist = high ? (int64_t)(((uint64_t)(uint32_t)*high << 32) | (uint32_t)low) : (int64_t)low;
+    off_t pos;
+    if (!seek_file(fd, dist, method, &pos)) return 0xffffffffu;
     if (high) *high = (LONG)(pos >> 32);
     vx_set_last_error(0);
     return (DWORD)pos;
@@ -384,8 +407,8 @@ static WINAPI DWORD SetFilePointer(HANDLE h, LONG low, LONG *high, DWORD method)
 static WINAPI BOOL SetFilePointerEx(HANDLE h, int64_t dist, int64_t *newpos, DWORD method) {
     int fd = vx_handle_fd(h);
     if (fd < 0) { vx_set_last_error(6); return 0; }
-    off_t pos = lseek(fd, dist, method == 0 ? SEEK_SET : method == 1 ? SEEK_CUR : SEEK_END);
-    if (pos < 0) { set_error_from_errno(); return 0; }
+    off_t pos;
+    if (!seek_file(fd, dist, method, &pos)) return 0;
     if (newpos) *newpos = pos;
     return 1;
 }
@@ -568,6 +591,21 @@ static WINAPI BOOL MoveFileExW(const WCHAR *from, const WCHAR *to, DWORD flags) 
 }
 static WINAPI BOOL MoveFileA(const char *from, const char *to) { return MoveFileExA(from, to, 0); }
 static WINAPI BOOL MoveFileW(const WCHAR *from, const WCHAR *to) { return MoveFileExW(from, to, 0); }
+// Transactional NTFS (TxF): there is no kernel transaction manager here (no KtmW32.dll, so no CreateTransaction), so
+// no handle is a transaction and these fail as for one that is not (ERROR_INVALID_HANDLE). steam.exe imports them
+// since its October 2026 client and loads KtmW32.dll itself before it uses them.
+static WINAPI BOOL DeleteFileTransactedW(const WCHAR *name, HANDLE transaction) {
+    (void)name;
+    vx_log("DeleteFileTransactedW(transaction %p): no transactions here", transaction);
+    vx_set_last_error(6);
+    return 0;
+}
+static WINAPI BOOL MoveFileTransactedW(const WCHAR *from, const WCHAR *to, void *progress, void *data, DWORD flags, HANDLE transaction) {
+    (void)from; (void)to; (void)progress; (void)data; (void)flags;
+    vx_log("MoveFileTransactedW(transaction %p): no transactions here", transaction);
+    vx_set_last_error(6);
+    return 0;
+}
 
 static WINAPI BOOL CopyFileA(const char *from, const char *to, BOOL fail_if_exists) {
     char a[MAX_PATH_LEN], b[MAX_PATH_LEN];
@@ -954,7 +992,7 @@ static const vx_export files_k32[] = {
     VX_EXPORT(GetFileAttributesExA), VX_EXPORT(GetFileAttributesExW),
     VX_EXPORT(CreateDirectoryA), VX_EXPORT(CreateDirectoryW), VX_EXPORT(RemoveDirectoryA), VX_EXPORT(RemoveDirectoryW),
     VX_EXPORT(DeleteFileA), VX_EXPORT(DeleteFileW), VX_EXPORT(MoveFileA), VX_EXPORT(MoveFileW), VX_EXPORT(MoveFileExA),
-    VX_EXPORT(MoveFileExW), VX_EXPORT(CopyFileA), VX_EXPORT(CopyFileW),
+    VX_EXPORT(MoveFileExW), VX_EXPORT(CopyFileA), VX_EXPORT(CopyFileW), VX_EXPORT(DeleteFileTransactedW), VX_EXPORT(MoveFileTransactedW),
     VX_EXPORT(FindFirstFileA), VX_EXPORT(FindFirstFileW), VX_EXPORT(FindFirstFileExA), VX_EXPORT(FindFirstFileExW),
     VX_EXPORT(FindNextFileA), VX_EXPORT(FindNextFileW), VX_EXPORT(FindClose),
 };

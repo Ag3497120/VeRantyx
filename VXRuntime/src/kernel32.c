@@ -344,7 +344,9 @@ static int find_program(const char *name, char *unix_path, size_t cap) {
     }
     return 0;
 }
-static char **environment_from_block(const void *block, int wide) {
+// The child's environment: the block given (else this process's), this runtime's settings, and the command line the
+// child is to have word for word (VXRT_COMMAND_LINE, which the child takes out again: loader.c).
+static char **environment_from_block(const void *block, int wide, const char *command_line) {
     extern char **environ;
     int n = 0, cap = 64;
     char **env = malloc((size_t)cap * sizeof *env);
@@ -354,10 +356,16 @@ static char **environment_from_block(const void *block, int wide) {
     }
     for (char **e = environ; *e; e++) {                           // the runtime's settings, and everything when no block
         if (block && strncmp(*e, "VXRT_", 5) && strncmp(*e, "HOME=", 5) && strncmp(*e, "TMPDIR=", 7)) continue;
+        if (!strncmp(*e, "VXRT_COMMAND_LINE=", 18)) continue;
         if (n + 2 >= cap) env = realloc(env, (size_t)(cap *= 2) * sizeof *env);
         env[n++] = strdup(*e);
     }
+    env = realloc(env, (size_t)(n + 3) * sizeof *env);
     if (!getenv("VXRT_CHILD")) env[n++] = strdup("VXRT_CHILD=1");   // its log lines say which process they are from
+    if (command_line) {
+        env[n] = malloc(strlen(command_line) + 19);
+        strcpy(env[n], "VXRT_COMMAND_LINE="); strcat(env[n++], command_line);
+    }
     env[n] = NULL;
     return env;
 }
@@ -377,7 +385,7 @@ static BOOL create_process(const char *app, const char *cmd, const void *env_blo
     char **argv = calloc((size_t)argc + 3, sizeof *argv);
     argv[0] = self; argv[1] = exe;
     for (int i = 1; i < argc; i++) argv[i + 1] = args[i];
-    char **envp = environment_from_block(env_block, wide_env);
+    char **envp = environment_from_block(env_block, wide_env, cmd && *cmd ? cmd : app);   // (no command line: the program's name is it)
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     char cwd_win[1024], cwd_unix[1024];
