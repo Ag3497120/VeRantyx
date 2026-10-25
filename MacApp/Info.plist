@@ -47,7 +47,7 @@
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>VeRantyx, PolyForm Noncommercial 1.0.0. Not affiliated with Valve, Apple or Meta.</string>
+	<string>VeRantyx, MIT licensed. Not affiliated with Valve, Apple or Meta.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>VeRantyx finds your headset on this network and streams the game to it.</string>
 	<key>NSBonjourServices</key>
