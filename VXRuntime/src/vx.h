@@ -177,6 +177,11 @@ void   vx_release_semaphore(HANDLE sem, LONG n);   // ReleaseSemaphore for them 
 // A handle's object as NtQueryObject describes it (sync.c): see there. vx_handle_count: the handles of the table.
 int    vx_handle_object(HANDLE h, const void **id, const char **type, int *kind, char *name, size_t cap, DWORD *handles);
 DWORD  vx_handle_count(void);
+// Spin locks in memory shared between processes (shlock.c): the word holds the holder's pid, and a lock left by a
+// process that ended holding it is taken over. vx_shlock_test_name: VXRT_TEST_SHLOCK_DIE (tests/shlock.c).
+void   vx_shlock(volatile uint32_t *word);
+void   vx_shunlock(volatile uint32_t *word);
+int    vx_shlock_test_name(const char *name);
 
 // Diagnostics (stderr); VXRT_TRACE=1 also logs every implemented call that opts in.
 void vx_log(const char *fmt, ...);
@@ -248,6 +253,9 @@ void vx_dwmapi_init(void);             // the Desktop Window Manager API for win
 void vx_winmisc_init(void);            // smaller user32 functions: IsChild, DeferWindowPos, GetLastInputInfo, ... (winmisc.c)
 void vx_region_init(void);             // GDI regions: rectangles combined, compared, listed (region.c)
 void vx_version_init(void);            // version.dll: files' version resources, VerQueryValue (version.c)
+void vx_tcptable_init(void);           // iphlpapi's TCP tables with each endpoint's owning process (tcptable.c)
+void vx_winprops_init(void);            // shell32's SHGetPropertyStoreForWindow: each window's property store (winprops.c)
+void vx_a11y_init(void);               // oleacc, UIAutomationCore, uxtheme: no assistive technology, no visual styles (a11y.c)
 void vx_present_init(void);            // GDI to the screen: blits, DIB transfers, painting, layered windows (present.c)
 void vx_inherit_init(void);            // handle inheritance for descriptors: CreatePipe, Set/GetHandleInformation (inherit.c)
 void vx_shlpath_init(void);            // shlwapi path strings: PathFindFileName, PathMatchSpec, ... (shlpath.c)

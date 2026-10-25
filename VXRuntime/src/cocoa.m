@@ -285,7 +285,14 @@ static CALayer *root_layer(vx_window *w) {
 // Main thread: w's committed picture into its layer, its visible children into sublayers at their places (y measured
 // from the top of the parent's client area), stale ones dropped.
 static void present_layer(CALayer *layer, vx_window *w, int depth) {
-    if (w->committed != w->presented || !layer.contents) {
+    // A child window GDI never drew into shows its parent's picture beneath it, as a child that paints nothing does on
+    // Windows (Chromium's "Chrome Legacy Window" covers the whole page and never paints).
+    pthread_mutex_lock(&w->lock);
+    int drawn = w->drawn;
+    pthread_mutex_unlock(&w->lock);
+    if (depth > 0 && !drawn) { layer.contents = nil; layer.opaque = NO; }
+    else if (w->committed != w->presented || !layer.contents) {
+        if (depth > 0) layer.opaque = YES;
         int alpha = 0;
         CGImageRef img = vx_window_front_image(w, &alpha);
         if (img) { layer.contents = (__bridge id)img; CGImageRelease(img); }
