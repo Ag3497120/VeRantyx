@@ -161,6 +161,10 @@ impl SampleLog {
                 self.frames, since.elapsed().as_secs_f32(), self.exact, self.age_ns_sum as f64 / self.frames as f64 / 1e6, self.age_ns_max as f64 / 1e6);
             let line = HEADSET.lock().unwrap().line(since.elapsed().as_secs_f64());
             alvr_common::info!("VeRantyx: headset: {line}");
+            if let Some((sent, poses, from)) = HAND_SPEEDS.lock().unwrap().take() {
+                alvr_common::info!("VeRantyx: controllers: fastest {sent:.1} m/s as the headset sent it, {poses:.1} m/s from the poses (the game gets {})",
+                    if from == VelocitySource::Poses { "the poses'" } else { "the headset's" });
+            }
             *self = SampleLog { recent: std::mem::take(&mut self.recent), newest: self.newest, since: Some(std::time::Instant::now()), ..Default::default() };
         }
     }
@@ -286,6 +290,81 @@ fn hand_motion(ctx: &ServerCoreContext, hand: HandType, t: Duration) -> Option<D
 }
 fn tangents(f: &Fov) -> [f32; 4] { [f.left.tan(), f.right.tan(), f.down.tan(), f.up.tan()] }
 
+// The controllers' velocities, which SteamVR passes to the game (Half-Life: Alyx throws with them). ALVR sends one
+// with each controller pose, but on a Pico, VIVE or YVR headset it is not the runtime's: ALVR's client (client_openxr
+// interaction.rs, get_hand_data) works around those runtimes' velocities by asking for the controller's pose a whole
+// pipeline latency ahead (its average, from the tracking sample to the display) and dividing how far that is from the
+// pose now by that time. A PC with ALVR's SteamVR driver has some 50-80 ms of it; VeRantyx on a Mac has 150-250 ms
+// (the session log's "latency"), and a pose predicted that far ahead of a hand that is speeding up or turning in a
+// throw is far off: Half-Life: Alyx threw things as from a cannon (a Pico 4 Ultra with its controllers, 0.2.2). For
+// those headsets the velocities come from the poses themselves instead: each sample's pose against the one before,
+// over the time between their samples (the client's clock, so samples that arrive together still count right).
+// VERANTYX_ALVR_VELOCITY=headset or =poses chooses for any headset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VelocitySource { Headset, Poses }
+
+/// Which velocities the game gets, for the connected headsets' names (ALVR's display names, which are the platform:
+/// "Pico 4 Ultra", "Quest 3", "Apple Headset") and VERANTYX_ALVR_VELOCITY.
+pub fn velocity_source(headsets: &[String], setting: Option<&str>) -> VelocitySource {
+    match setting.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("headset") => return VelocitySource::Headset,
+        Some("poses") => return VelocitySource::Poses,
+        _ => {}
+    }
+    // (the platforms for which ALVR's client predicts instead: Platform::is_pico, is_vive, is_yvr in alvr_system_info)
+    let extrapolated = |n: &str| ["Pico", "VIVE", "HTC VIVE", "YVR", "Play For Dream"].iter().any(|p| n.starts_with(p));
+    if headsets.iter().any(|n| extrapolated(n)) { VelocitySource::Poses } else { VelocitySource::Headset }
+}
+
+/// A hand's velocity from its successive poses (ALVR's, at their sample times in seconds): linear in the tracking
+/// space, angular in the hand's own frame as ALVR sends it (its tracking manager turns it so: SteamVR's convention).
+#[derive(Default)]
+pub struct PoseVelocity {
+    last: Option<(f64, Vec3, Quat)>,
+    linear: Vec3,
+    angular: Vec3,                                                     // (in the tracking space)
+}
+impl PoseVelocity {
+    const SMOOTHING: f32 = 0.6;                                        // (of each new difference; the poses are smooth)
+    const MIN_DT: f64 = 0.004;                                         // (closer samples: measured against an older one)
+    const MAX_DT: f64 = 0.1;                                           // (a longer gap: the hand was lost, no motion)
+    const MAX_SPEED: f32 = 20.0;                                       // (m/s: faster is a tracking jump, not a hand)
+    const MAX_TURN: f32 = 60.0;                                        // (rad/s)
+
+    pub fn reset(&mut self) { *self = Self::default(); }
+
+    pub fn update(&mut self, t: f64, position: Vec3, orientation: Quat) -> (Vec3, Vec3) {
+        match self.last {
+            Some((t0, ..)) if t == t0 || (t > t0 && t - t0 < Self::MIN_DT) => return self.output(orientation),
+            Some((t0, p0, q0)) if t > t0 && t - t0 <= Self::MAX_DT => {
+                let dt = (t - t0) as f32;
+                let linear = (position - p0) / dt;
+                if linear.is_finite() && linear.length() < Self::MAX_SPEED { self.linear += (linear - self.linear) * Self::SMOOTHING; }
+                let mut turn = (orientation * q0.inverse()).normalize();
+                if turn.w < 0.0 { turn = -turn; }                       // (the shorter way round)
+                let angular = turn.to_scaled_axis() / dt;
+                if angular.is_finite() && angular.length() < Self::MAX_TURN { self.angular += (angular - self.angular) * Self::SMOOTHING; }
+            }
+            _ => { self.linear = Vec3::ZERO; self.angular = Vec3::ZERO; }   // (the first, after a gap, or an older clock)
+        }
+        self.last = Some((t, position, orientation));
+        self.output(orientation)
+    }
+
+    fn output(&self, orientation: Quat) -> (Vec3, Vec3) { (self.linear, orientation.conjugate() * self.angular) }
+}
+
+// The hands' fastest speeds since the last 5 s report (SampleLog), as the headset sent them and from the poses, m/s.
+static HAND_SPEEDS: Mutex<Option<(f32, f32, VelocitySource)>> = Mutex::new(None);
+
+fn connected_headsets(layout: &alvr_filesystem::Layout) -> Vec<String> {
+    fs::read_to_string(layout.session()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|s| s["client_connections"].as_object().map(|c| c.values()
+            .filter(|v| v["connection_state"] == "Streaming")
+            .filter_map(|v| v["display_name"].as_str().map(String::from)).collect()))
+        .unwrap_or_default()
+}
+
 fn apply_buttons(input: &mut VxAlvrInput, values: &HashMap<u64, f32>) {
     let v = |id: u64| values.get(&id).copied().unwrap_or(0.0);
     let bit = |id: u64, b: u32| if v(id) > 0.5 { 1u32 << b } else { 0 };
@@ -321,11 +400,18 @@ fn run(bridge: Arc<Bridge>) {
 
 fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>) {
     let mut buttons: HashMap<u64, f32> = HashMap::new();
+    let mut velocity_from = VelocitySource::Headset;
+    let mut pose_velocity = [PoseVelocity::default(), PoseVelocity::default()];
     while let Ok(e) = receiver.recv() {
         match e {
             ServerCoreEvent::ClientConnected => {
                 bridge.connected.store(true, Ordering::SeqCst); bridge.idr_requested.store(true, Ordering::SeqCst);
                 headset_logs(|h| *h = HeadsetLog::default());
+                let headsets = connected_headsets(&bridge.layout);
+                velocity_from = velocity_source(&headsets, env::var("VERANTYX_ALVR_VELOCITY").ok().as_deref());
+                pose_velocity.iter_mut().for_each(PoseVelocity::reset);
+                alvr_common::info!("VeRantyx: {:?} connected; the controllers' velocities come from {}", headsets,
+                    if velocity_from == VelocitySource::Poses { "their poses (sample to sample)" } else { "the headset" });
             }
             ServerCoreEvent::ClientDisconnected => bridge.connected.store(false, Ordering::SeqCst),
             ServerCoreEvent::RequestIDR => { bridge.idr_requested.store(true, Ordering::SeqCst); headset_logs(|h| h.idr_requests += 1); }
@@ -356,14 +442,25 @@ fn events(bridge: &Bridge, receiver: std::sync::mpsc::Receiver<ServerCoreEvent>)
                 bridge.seq.fetch_add(1, Ordering::SeqCst);
             }
             ServerCoreEvent::Tracking { sample_timestamp } => {
-                let (head, left, right) = {
+                let (head, mut hands) = {
                     let guard = bridge.ctx.read().unwrap();
                     let Some(ctx) = guard.as_ref() else { continue };
                     let t = sample_timestamp;
-                    (matrix(ctx.get_device_motion(*HEAD_ID, t)),
-                     matrix(ctx.get_device_motion(*HAND_LEFT_ID, t).or_else(|| hand_motion(ctx, HandType::Left, t))),
-                     matrix(ctx.get_device_motion(*HAND_RIGHT_ID, t).or_else(|| hand_motion(ctx, HandType::Right, t))))
+                    let hand = |id: u64, h: HandType| ctx.get_device_motion(id, t).map(|m| (m, true)).or_else(|| hand_motion(ctx, h, t).map(|m| (m, false)));
+                    (matrix(ctx.get_device_motion(*HEAD_ID, t)), [hand(*HAND_LEFT_ID, HandType::Left), hand(*HAND_RIGHT_ID, HandType::Right)])
                 };
+                // (a controller's velocities, from its poses when the headset's are a long prediction: velocity_source)
+                {
+                    let mut speeds = HAND_SPEEDS.lock().unwrap();
+                    for (i, h) in hands.iter_mut().enumerate() {
+                        let Some((m, true)) = h.as_mut() else { pose_velocity[i].reset(); continue };
+                        let (linear, angular) = pose_velocity[i].update(sample_timestamp.as_secs_f64(), m.pose.position, m.pose.orientation);
+                        let s = speeds.get_or_insert((0.0, 0.0, velocity_from));
+                        *s = (s.0.max(m.linear_velocity.length()), s.1.max(linear.length()), velocity_from);
+                        if velocity_from == VelocitySource::Poses { m.linear_velocity = linear; m.angular_velocity = angular; }
+                    }
+                }
+                let [left, right] = hands.map(|h| matrix(h.map(|(m, _)| m)));
                 bridge.samples.lock().unwrap().sample(sample_timestamp.as_nanos() as u64);
                 let mut i = bridge.input.lock().unwrap();
                 i.timestamp_s = sample_timestamp.as_secs_f64();
@@ -513,5 +610,147 @@ pub unsafe extern "C" fn vx_alvr_send(timestamp_s: f64, au: *const u8, len: usiz
         headset_logs(|h| { h.bytes += len as u64; h.sent += 1; });
         b.samples.lock().unwrap().frame(t.as_nanos() as u64);
         if let Some(ctx) = b.ctx.read().unwrap().as_ref() { ctx.send_video_nal(t, std::slice::from_raw_parts(au, len).to_vec(), is_idr); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HZ72: f64 = 1.0 / 72.0;
+
+    fn close(a: Vec3, b: Vec3, tolerance: f32) -> bool { (a - b).length() <= tolerance }
+
+    #[test]
+    fn velocities_from_poses_for_the_headsets_alvr_extrapolates() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(velocity_source(&names(&["Pico 4 Ultra"]), None), VelocitySource::Poses);
+        assert_eq!(velocity_source(&names(&["Pico (unknown)"]), None), VelocitySource::Poses);
+        assert_eq!(velocity_source(&names(&["VIVE Focus Vision"]), None), VelocitySource::Poses);
+        assert_eq!(velocity_source(&names(&["YVR"]), None), VelocitySource::Poses);
+        assert_eq!(velocity_source(&names(&["Quest 3"]), None), VelocitySource::Headset);
+        assert_eq!(velocity_source(&names(&["Apple Headset"]), None), VelocitySource::Headset);
+        assert_eq!(velocity_source(&[], None), VelocitySource::Headset);
+        assert_eq!(velocity_source(&names(&["Pico 4 Ultra"]), Some("headset")), VelocitySource::Headset);
+        assert_eq!(velocity_source(&names(&["Quest 3"]), Some(" Poses ")), VelocitySource::Poses);
+        assert_eq!(velocity_source(&names(&["Pico 4"]), Some("auto")), VelocitySource::Poses);
+    }
+
+    #[test]
+    fn the_streaming_headsets_name_from_the_session() {
+        let dir = std::env::temp_dir().join(format!("vx-alvr-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let l = layout(Some(dir.clone()));
+        fs::write(l.session(), r#"{"client_connections": {
+            "a.client.alvr": {"display_name": "Quest 3", "connection_state": "Disconnected"},
+            "b.client.alvr": {"display_name": "Pico 4 Ultra", "connection_state": "Streaming"}}}"#).unwrap();
+        let headsets = connected_headsets(&l);
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!(headsets, vec!["Pico 4 Ultra".to_string()]);
+        assert_eq!(velocity_source(&headsets, None), VelocitySource::Poses);
+    }
+
+    #[test]
+    fn steady_motion_at_uneven_sample_times() {
+        // 2 m/s forward (-z) and 0.5 m/s up; the samples' times jitter by a few ms, as a headset's do
+        let v = Vec3::new(0.0, 0.5, -2.0);
+        let jitter = [0.0, 0.004, -0.003, 0.002, -0.004, 0.003];
+        let mut p = PoseVelocity::default();
+        let mut out = Vec3::ZERO;
+        for i in 0..40 {
+            let t = 100.0 + i as f64 * HZ72 + jitter[i % jitter.len()];
+            out = p.update(t, Vec3::new(0.2, 1.2, -0.3) + v * (t - 100.0) as f32, Quat::IDENTITY).0;
+        }
+        assert!(close(out, v, 0.01), "{out:?}");
+    }
+
+    #[test]
+    fn repeated_and_close_samples() {
+        // ALVR can hand over the same sample again, or one that came only just after the last (a bunched stream)
+        let v = Vec3::new(1.5, 0.0, 0.0);
+        let mut p = PoseVelocity::default();
+        let mut out = Vec3::ZERO;
+        for i in 0..40 {
+            let t = i as f64 * HZ72;
+            out = p.update(t, v * t as f32, Quat::IDENTITY).0;
+        }
+        assert!(close(out, v, 0.01), "{out:?}");
+        // the same sample again changes nothing; one 2 ms later is measured against the older one
+        let t = 40.0 * HZ72;
+        let again = p.update(39.0 * HZ72, v * (39.0 * HZ72) as f32, Quat::IDENTITY).0;
+        assert!(close(again, v, 0.01));
+        let soon = p.update(39.0 * HZ72 + 0.002, v * (39.0 * HZ72 + 0.002) as f32 + Vec3::new(0.05, 0.0, 0.0), Quat::IDENTITY).0;
+        assert!(close(soon, v, 0.01), "a sample 2 ms after the last is not divided by 2 ms: {soon:?}");
+        let next = p.update(t, v * t as f32, Quat::IDENTITY).0;
+        assert!(close(next, v, 0.01), "{next:?}");
+    }
+
+    #[test]
+    fn a_throw_reads_as_the_hand_moved() {
+        // the hand speeds up at 40 m/s² for 0.15 s (to 6 m/s) and stops: the estimate follows within a sample or two
+        let mut p = PoseVelocity::default();
+        let (a, release) = (40.0f32, 0.15f64);
+        let mut fastest = 0.0f32;
+        let mut at_release = 0.0f32;
+        for i in 0..30 {
+            let t = i as f64 * HZ72;
+            let tt = t.min(release) as f32;
+            let x = 0.5 * a * tt * tt;
+            let v = p.update(t, Vec3::new(x, 1.2, -0.3), Quat::IDENTITY).0.length();
+            fastest = fastest.max(v);
+            if t <= release { at_release = v; }
+        }
+        assert!(fastest <= 6.0 + 0.05, "never faster than the hand was: {fastest}");
+        assert!(at_release > 4.5, "close to the hand's speed at the release: {at_release}");
+    }
+
+    #[test]
+    fn turning_in_the_hands_frame() {
+        // the hand, rolled a quarter turn about its forward axis, turns about the world's up axis at 5 rad/s
+        let rolled = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let w = Vec3::new(0.0, 5.0, 0.0);
+        let mut p = PoseVelocity::default();
+        let mut out = (Vec3::ZERO, Vec3::ZERO);
+        let mut q = rolled;
+        for i in 0..40 {
+            let t = i as f64 * HZ72;
+            q = Quat::from_scaled_axis(w * t as f32) * rolled;
+            out = p.update(t, Vec3::new(0.0, 1.2, -0.3), q);
+        }
+        assert!(close(q * out.1, w, 0.01), "back in the world, the turn is about up: {:?}", q * out.1);
+        assert!(close(out.1, q.conjugate() * w, 0.01));
+        assert!(close(out.0, Vec3::ZERO, 1e-4));
+    }
+
+    #[test]
+    fn a_fast_wrist_flick_is_not_wrapped() {
+        // 20 rad/s (a sharp flick), and a quaternion that flips sign between samples (the same rotation)
+        let w = Vec3::new(20.0, 0.0, 0.0);
+        let mut p = PoseVelocity::default();
+        let mut out = Vec3::ZERO;
+        let mut q = Quat::IDENTITY;
+        for i in 0..20 {
+            let t = i as f64 * HZ72;
+            q = Quat::from_scaled_axis(w * t as f32);
+            if i % 2 == 1 { q = -q; }
+            out = p.update(t, Vec3::ZERO, q).1;
+        }
+        assert!(close(q * out, w, 0.05), "{:?}", q * out);
+    }
+
+    #[test]
+    fn tracking_jumps_and_gaps() {
+        let mut p = PoseVelocity::default();
+        for i in 0..20 { p.update(i as f64 * HZ72, Vec3::new(1.0 * (i as f64 * HZ72) as f32, 0.0, 0.0), Quat::IDENTITY); }
+        // a 0.5 m jump in one sample (36 m/s) is not motion
+        let t = 20.0 * HZ72;
+        let jumped = p.update(t, Vec3::new(t as f32 + 0.5, 0.0, 0.0), Quat::IDENTITY).0;
+        assert!(close(jumped, Vec3::new(1.0, 0.0, 0.0), 0.01), "{jumped:?}");
+        // after 0.3 s without samples, no motion until two new samples
+        assert_eq!(p.update(t + 0.3, Vec3::new(5.0, 0.0, 0.0), Quat::IDENTITY).0, Vec3::ZERO);
+        let after = p.update(t + 0.3 + HZ72, Vec3::new(5.0, 0.0, 0.0), Quat::IDENTITY).0;
+        assert_eq!(after, Vec3::ZERO);
+        // an older time (a new connection's clock) starts over
+        assert_eq!(p.update(1.0, Vec3::new(9.0, 0.0, 0.0), Quat::IDENTITY).0, Vec3::ZERO);
     }
 }

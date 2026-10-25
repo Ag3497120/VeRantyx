@@ -35,6 +35,13 @@ The distance between the headset's eyes (its view transforms) goes to SteamVR as
 (Prop_UserIpdMeters): the encoder writes it after SharedHands in the map's tail ("VIPD"), the driver sets it when it
 differs by half a millimetre. 63 mm until a headset reports one, and with the Vision Pro app.
 
+Controller velocities (what the game throws with): ALVR's own, except for Pico, VIVE and YVR headsets, whose ALVR
+client predicts the controller's pose a whole pipeline latency ahead and sends the difference as the velocity. On a
+Mac that latency is 150-250 ms (some 50-80 ms on a PC), and Half-Life: Alyx threw things as from a cannon with a Pico 4
+Ultra. For those the bridge takes the velocities from the poses themselves (each sample against the one before, over
+the time between them). `VERANTYX_ALVR_VELOCITY=headset` or `=poses` chooses for any headset. The session log says
+which at each connection, and every 5 s the fastest controller speed both ways (`VeRantyx: controllers:`).
+
 Vibration: the driver's controllers have a haptic component; the game's vibrations (VREvent_Input_HapticVibration)
 go per hand into the map's tail (SharedHaptic at 336: seq, duration, frequency, amplitude), the encoder passes each on
 (`vx_alvr_haptics`) and ALVR sends it to the headset's controller, scaled by its haptics settings. Whether a
