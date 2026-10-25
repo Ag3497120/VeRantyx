@@ -31,6 +31,8 @@ VXRT_TRACE_KEYED=1 VXRT_SHARED_SNAPSHOT=f.png ...              # keyed mutex tra
 VXRT_TRACE_DRAWS=trigger VXRT_DRAW_SNAPSHOT=<ps hash>:prefix ... # 300 draws after the trigger file appears; a pixel shader's inputs as PNGs
 VXRT_STEAM_BRIDGE=1 VXRT_TRACE_STEAM=1 ... # Windows games use the Mac Steam client (log: interfaces, first calls, callbacks)
 VXRT_TRACE_TEXTURES=1 ...                  # every Direct3D texture made
+VXRT_TRACE_QI=1 ...                        # each interface a Direct3D/DXGI object was asked for and does not have
+VXRT_WAIT_DUMP=15,30 ...                   # at 15 and 30 s: the threads waiting for over 3 s, for what, from where
 VXRT_SYNC_SHADERS=1 ...                    # compile each shader before CreateXShader returns (not in the background)
 VXRT_STATS=1 ...                           # keyed mutex waits and hold times, Map waits, GPU busy time, every few seconds
 VXRT_LOG_TIME=1 ...                        # log lines carry the time of day (the same clock in every process)
@@ -83,9 +85,16 @@ comes from `VXRT_EXTRA_ARGS` (`src/launchargs.c`), so neither Steam's files nor 
 runs on (past Steam's SteamVR check, 88 s of 88 in every run since `OpenThread` finds every running thread; before, it
 ended itself about 10 s in: tier0 freed the main thread's data when it could not open it), loads `steamclient64.dll`
 once the Steam Service Error box is closed (its connectivity test passes, logged off), and the web helper creates
-Steam's shared JS context (`logs/steamui_html.txt`: `BrowserReady`), but draws nothing: its GPU contexts all fail
-(`Failed to create shared context for virtualization`), and it ends itself some 20 s later, after which
-`steam.exe` starts it again. There is no sign-in window yet.
+Steam's shared JS context (`logs/steamui_html.txt`: `BrowserReady`; its page loads, `webhelper_js.txt` ends at
+"setting locale: en"). Its GPU side works since 2026-10-25 (without `-cef-disable-gpu`): Steam's ANGLE makes its EGL
+display and GLES 3 contexts on our Direct3D 11 (the screen's DC belongs to the desktop window, IDXGIDevice2-4, the
+adapter's driver version; before, every EGL display type failed and "Failed to create shared context for
+virtualization" came about 100 times a second). It still draws no window: the page's script goes no further and the
+web helper sits idle (a sample shows every thread waiting; `VXRT_WAIT_DUMP` lists only idle pool threads and
+Steam's own waits, no deadlock), and in five runs of eight `steam.exe` decides about 20 s after `BrowserReady` to restart it ("Restart webhelper process, counter 2", then the helper's
+`TerminateProcess(current, 0)`), in the other three it keeps it for the whole run; either way no sign-in window yet. Chromium's
+DevTools server (Steam's `-cef-enable-debugging`) listens on 127.0.0.1:8080 but never answers a request (curl
+connects, then times out; WSAEnumNetworkEvents is never called for its FD_ACCEPT event), which suggests some of the web helper's I/O never reaches its threads (not yet shown).
 
 Steam updates itself here as on Windows (2026-10-25: from the 2026-09-03 client, 1788652215, to 1792618285, Valve's
 download). Those runs were made in `~/Verantyx_VR_Drive/vxrt_wsteam` itself, not in a copy, two of them with
