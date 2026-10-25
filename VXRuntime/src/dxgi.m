@@ -24,7 +24,8 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *const 
     for (int i = 0; i < n; i++)
         if (d3d_same_guid(iid, known[i])) { d3d_addref(self_of(this)); *out = this; return S_OK; }
     *out = NULL;
-    return E_NOINTERFACE;
+    int k = self_of(this)->kind;
+    return d3d_no_interface(k == K_FACTORY ? "DXGI factory" : k == K_ADAPTER ? "DXGI adapter" : k == K_OUTPUT ? "DXGI output" : k == K_SWAPCHAIN ? "swap chain" : "DXGI object", iid);
 }
 static WINAPI uint32_t obj_addref(void *this) { return d3d_addref(self_of(this)); }
 static WINAPI uint32_t obj_release(void *this) { return d3d_release(self_of(this)); }
@@ -178,7 +179,19 @@ static WINAPI HRESULT adapter_enum_outputs(void *this, uint32_t i, void **out) {
     *out = output_new(this);
     return S_OK;
 }
-static WINAPI HRESULT adapter_check_interface(void *this, const GUID *iid, int64_t *version) { (void)this; (void)iid; (void)version; return DXGI_ERROR_UNSUPPORTED; }
+// CheckInterfaceSupport answers only for the Direct3D 10 device interfaces (IDXGIDevice, ID3D10Device, ID3D10Device1),
+// with the user-mode driver's version (HighPart: product and version, LowPart: subversion and build); it is
+// DXGI_ERROR_UNSUPPORTED for every other interface, Direct3D 11's included. Chromium's ANGLE asks with IDXGIDevice for
+// the driver version and logged "Error querying driver version from DXGI Adapter" on every display it made.
+static WINAPI HRESULT adapter_check_interface(void *this, const GUID *iid, int64_t *version) {
+    (void)this;
+    static const GUID d3d10 = { 0x9b7e4c0f, 0x342c, 0x4106, { 0xa1, 0x9f, 0x4f, 0x27, 0x04, 0xf6, 0x89, 0xf0 } };
+    static const GUID d3d10_1 = { 0x9b7e4c8f, 0x342c, 0x4106, { 0xa1, 0x9f, 0x4f, 0x27, 0x04, 0xf6, 0x89, 0xf0 } };
+    if (!iid || !(d3d_same_guid(iid, &IID_IDXGIDevice) || d3d_same_guid(iid, &d3d10) || d3d_same_guid(iid, &d3d10_1)))
+        return DXGI_ERROR_UNSUPPORTED;
+    if (version) *version = (int64_t)((10ull << 48) | (0ull << 32) | (19041ull << 16) | 1);   // 10.0.19041.1
+    return S_OK;
+}
 
 // ---- the output (the main display) ------------------------------------------------------------------------------------------
 static d3d_object *output_new(d3d_object *adapter) {

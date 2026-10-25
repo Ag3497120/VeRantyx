@@ -26,10 +26,10 @@ INTERFACES = {
     "dxgi.h": ["IDXGIFactory", "IDXGIFactory1", "IDXGIAdapter", "IDXGIAdapter1", "IDXGIOutput", "IDXGISwapChain",
                "IDXGIDevice", "IDXGIDevice1", "IDXGIObject", "IDXGIDeviceSubObject", "IDXGISurface", "IDXGIResource",
                "IDXGIKeyedMutex"],
-    "dxgi1_2.h": ["IDXGIFactory2", "IDXGISwapChain1", "IDXGIAdapter2", "IDXGIResource1", "IDXGIOutput1"],
-    "dxgi1_3.h": ["IDXGIFactory3", "IDXGISwapChain2", "IDXGIOutput2", "IDXGIOutput3"],
+    "dxgi1_2.h": ["IDXGIFactory2", "IDXGISwapChain1", "IDXGIAdapter2", "IDXGIResource1", "IDXGIOutput1", "IDXGIDevice2"],
+    "dxgi1_3.h": ["IDXGIFactory3", "IDXGISwapChain2", "IDXGIOutput2", "IDXGIOutput3", "IDXGIDevice3"],
     "dxgi1_4.h": ["IDXGIAdapter3", "IDXGIFactory4", "IDXGISwapChain3", "IDXGIOutput4"],
-    "dxgi1_5.h": ["IDXGIFactory5", "IDXGISwapChain4", "IDXGIOutput5"],
+    "dxgi1_5.h": ["IDXGIFactory5", "IDXGISwapChain4", "IDXGIOutput5", "IDXGIDevice4"],
     "dxgi1_6.h": ["IDXGIFactory6", "IDXGIFactory7", "IDXGIAdapter4", "IDXGIOutput6"],
     "d3d11on12.h": ["ID3D11On12Device", "ID3D11On12Device1", "ID3D11On12Device2"],
 }

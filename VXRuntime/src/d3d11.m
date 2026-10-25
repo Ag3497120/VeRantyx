@@ -28,6 +28,19 @@ HRESULT d3d_not_implemented(const char *what) {
     if (!known) vx_log("Direct3D: %s is not implemented yet", what);
     return E_NOTIMPL;
 }
+// QueryInterface for an interface an object does not have. VXRT_TRACE_QI=1 logs which (once per object kind and IID):
+// what a program asks for and does not get is often why it gives up on Direct3D.
+HRESULT d3d_no_interface(const char *what, const GUID *iid) {
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_TRACE_QI") != NULL;
+    if (on && iid) {
+        char key[96];
+        snprintf(key, sizeof key, "%s QueryInterface {%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}", what, iid->d1, iid->d2, iid->d3,
+                 iid->d4[0], iid->d4[1], iid->d4[2], iid->d4[3], iid->d4[4], iid->d4[5], iid->d4[6], iid->d4[7]);
+        d3d_not_implemented(key);
+    }
+    return E_NOINTERFACE;
+}
 void **d3d_vtable(const char *const *names, void *const *stubs, int count, const d3d_method *impl) {
     void **vt = calloc((size_t)count, sizeof(void *));
     for (int i = 0; i < count; i++) {
@@ -195,7 +208,9 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *const 
     for (int i = 0; i < n; i++)
         if (d3d_same_guid(iid, known[i])) { d3d_addref(self_of(this)); *out = this; return S_OK; }
     *out = NULL;
-    return E_NOINTERFACE;
+    static const char *const kinds[] = { "device", "context", "texture", "buffer", "render target view", "depth stencil view",
+                                         "shader resource view", "swap chain", "factory", "adapter", "output", "shader", "layout", "state", "UAV" };
+    return d3d_no_interface(kinds[self_of(this)->kind % 15], iid);
 }
 
 // ---- textures -------------------------------------------------------------------------------------------------------------------
@@ -1559,12 +1574,13 @@ static WINAPI HRESULT device_qi(void *this, const GUID *iid, void **out) {
     d3d_device *d = dev_of(this);
     if (!out) return E_POINTER;
     if (d3d_same_guid(iid, &IID_IUnknown_) || d3d_same_guid(iid, &IID_ID3D11Device) || d3d_same_guid(iid, &IID_ID3D11Device1)) { d3d_addref(&d->base); *out = &d->base.vtbl; return S_OK; }
-    if (d3d_same_guid(iid, &IID_IDXGIObject) || d3d_same_guid(iid, &IID_IDXGIDevice) || d3d_same_guid(iid, &IID_IDXGIDevice1)) {
+    if (d3d_same_guid(iid, &IID_IDXGIObject) || d3d_same_guid(iid, &IID_IDXGIDevice) || d3d_same_guid(iid, &IID_IDXGIDevice1) ||
+        d3d_same_guid(iid, &IID_IDXGIDevice2) || d3d_same_guid(iid, &IID_IDXGIDevice3) || d3d_same_guid(iid, &IID_IDXGIDevice4)) {
         d3d_addref(&d->base); *out = &d->base.vtbl2; return S_OK;
     }
     if (d->on12) return d3d11on12_query(d, iid, out);
     *out = NULL;
-    return E_NOINTERFACE;
+    return d3d_no_interface("device", iid);
 }
 static WINAPI uint32_t device_addref(void *this) { return d3d_addref(this); }
 static WINAPI uint32_t device_release(void *this) { return d3d_release(this); }
@@ -1686,7 +1702,7 @@ static WINAPI HRESULT device_get_private(void *this, const GUID *g, uint32_t *si
 static WINAPI HRESULT device_set_private(void *this, const GUID *g, uint32_t size, const void *data) { return d3d_set_private(this, g, size, data); }
 static WINAPI HRESULT device_set_private_interface(void *this, const GUID *g, void *unk) { (void)unk; return d3d_set_private(this, g, 0, NULL); }
 
-// The device seen as an IDXGIDevice1.
+// The device seen as an IDXGIDevice4.
 static WINAPI HRESULT dxgidev_qi(void *this, const GUID *iid, void **out) { return device_qi(FROM_VTBL2(this), iid, out); }
 static WINAPI uint32_t dxgidev_addref(void *this) { return d3d_addref(FROM_VTBL2(this)); }
 static WINAPI uint32_t dxgidev_release(void *this) { return d3d_release(FROM_VTBL2(this)); }
@@ -1709,6 +1725,38 @@ static WINAPI HRESULT dxgidev_get_latency(void *this, uint32_t *n) { *n = ((d3d_
 static WINAPI HRESULT dxgidev_set_priority(void *this, int p) { (void)this; (void)p; return S_OK; }
 static WINAPI HRESULT dxgidev_get_priority(void *this, int *p) { (void)this; *p = 0; return S_OK; }
 static WINAPI HRESULT dxgidev_residency(void *this, void *const *res, uint32_t *status, uint32_t n) { (void)this; (void)res; for (uint32_t i = 0; i < n; i++) status[i] = 1; return S_OK; }
+// IDXGIDevice2..4 (DXGI 1.2, 1.3, 1.5): offering resources lets the system drop their contents under memory pressure;
+// nothing is dropped here, so every reclaimed resource still has its contents (ReclaimResources: discarded FALSE,
+// ReclaimResources1: DXGI_RECLAIM_RESOURCE_RESULT_OK). Trim frees driver caches: Metal has none to give back.
+static WINAPI HRESULT dxgidev_offer(void *this, uint32_t n, void *const *res, uint32_t priority) {
+    (void)this;
+    if (n && !res) return E_INVALIDARG;
+    return priority >= 1 && priority <= 3 ? S_OK : E_INVALIDARG;            // DXGI_OFFER_RESOURCE_PRIORITY_LOW..HIGH
+}
+static WINAPI HRESULT dxgidev_offer1(void *this, uint32_t n, void *const *res, uint32_t priority, uint32_t flags) {
+    (void)flags;
+    return dxgidev_offer(this, n, res, priority);
+}
+static WINAPI HRESULT dxgidev_reclaim(void *this, uint32_t n, void *const *res, int32_t *discarded) {
+    (void)this;
+    if (n && !res) return E_INVALIDARG;
+    if (discarded) for (uint32_t i = 0; i < n; i++) discarded[i] = 0;
+    return S_OK;
+}
+static WINAPI HRESULT dxgidev_reclaim1(void *this, uint32_t n, void *const *res, uint32_t *results) {
+    (void)this;
+    if (n && !res) return E_INVALIDARG;
+    if (results) for (uint32_t i = 0; i < n; i++) results[i] = 0;
+    return S_OK;
+}
+// EnqueueSetEvent: the event is set once the work submitted so far has finished on the GPU.
+static WINAPI HRESULT dxgidev_enqueue_set_event(void *this, HANDLE event) {
+    if (!event) return E_INVALIDARG;
+    d3d_flush((d3d_device *)FROM_VTBL2(this), 1);
+    vx_set_event(event);
+    return S_OK;
+}
+static WINAPI void dxgidev_trim(void *this) { (void)this; }
 static WINAPI HRESULT dxgidev_get_private(void *this, const GUID *g, uint32_t *size, void *data) { return d3d_get_private(FROM_VTBL2(this), g, size, data); }
 static WINAPI HRESULT dxgidev_set_private(void *this, const GUID *g, uint32_t size, const void *data) { return d3d_set_private(FROM_VTBL2(this), g, size, data); }
 
@@ -1780,7 +1828,10 @@ static void make_tables(void) {
         { "SetMaximumFrameLatency", (void *)dxgidev_set_latency }, { "GetMaximumFrameLatency", (void *)dxgidev_get_latency },
         { "SetGPUThreadPriority", (void *)dxgidev_set_priority }, { "GetGPUThreadPriority", (void *)dxgidev_get_priority },
         { "QueryResourceResidency", (void *)dxgidev_residency }, { "GetPrivateData", (void *)dxgidev_get_private },
-        { "SetPrivateData", (void *)dxgidev_set_private }, { NULL, NULL } };
+        { "SetPrivateData", (void *)dxgidev_set_private }, { "OfferResources", (void *)dxgidev_offer },
+        { "ReclaimResources", (void *)dxgidev_reclaim }, { "EnqueueSetEvent", (void *)dxgidev_enqueue_set_event },
+        { "Trim", (void *)dxgidev_trim }, { "OfferResources1", (void *)dxgidev_offer1 }, { "ReclaimResources1", (void *)dxgidev_reclaim1 },
+        { NULL, NULL } };
     g_texture_vtbl = D3D_VTABLE(ID3D11Texture2D, texture);
     g_texture1d_vtbl = D3D_VTABLE(ID3D11Texture1D, texture1d);
     g_texture3d_vtbl = D3D_VTABLE(ID3D11Texture3D, texture3d);
@@ -1790,7 +1841,7 @@ static void make_tables(void) {
     g_srv_vtbl = D3D_VTABLE(ID3D11ShaderResourceView, srv);
     g_context_vtbl = D3D_VTABLE(ID3D11DeviceContext1, context);   // the 11.1 interfaces: their new methods report themselves
     g_device_vtbl = D3D_VTABLE(ID3D11Device1, device);
-    g_dxgidev_vtbl = D3D_VTABLE(IDXGIDevice1, dxgidev);
+    g_dxgidev_vtbl = D3D_VTABLE(IDXGIDevice4, dxgidev);
     d3d_draw_init();
     D3D_VTABLE_OVERRIDE(g_device_vtbl, ID3D11Device, d3d_draw_device_methods);
     D3D_VTABLE_OVERRIDE(g_context_vtbl, ID3D11DeviceContext, d3d_draw_context_methods);

@@ -35,7 +35,7 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface)
         d3d_addref(self_of(this)); *out = this; return S_OK;
     }
     *out = NULL;
-    return E_NOINTERFACE;
+    return d3d_no_interface("pipeline object", iid);
 }
 
 // ---- shaders ------------------------------------------------------------------------------------------------------------

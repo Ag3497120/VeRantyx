@@ -2,7 +2,7 @@
 //
 // Every Direct3D object is a COM object: a pointer to a method table laid out like its interface (see
 // d3d_tables.h), then the object's state. An object may expose a second interface through a second table
-// pointer (the device is also an IDXGIDevice1). Methods are called with `this` pointing at the table pointer.
+// pointer (the device is also an IDXGIDevice4). Methods are called with `this` pointing at the table pointer.
 #ifndef VX_D3D_COMMON_H
 #define VX_D3D_COMMON_H
 #import <Metal/Metal.h>
@@ -14,6 +14,7 @@
 typedef int32_t HRESULT;
 typedef struct { DWORD d1; uint16_t d2, d3; uint8_t d4[8]; } GUID;
 HRESULT d3d_not_implemented(const char *what);    // reports a method once, returns E_NOTIMPL
+HRESULT d3d_no_interface(const char *what, const GUID *iid);   // E_NOINTERFACE; VXRT_TRACE_QI=1 logs the interface asked for
 
 #define S_OK 0
 #define S_FALSE 1
@@ -73,7 +74,7 @@ int            d3d_copy_format_block(uint32_t dxgi, uint32_t *block_width, uint3
 enum { TD_WIDTH, TD_HEIGHT, TD_MIPS, TD_ARRAY, TD_FORMAT, TD_SAMPLES, TD_QUALITY, TD_USAGE, TD_BIND, TD_CPU, TD_MISC, TD_COUNT };
 
 struct d3d_device {
-    d3d_object base;                 // ID3D11Device, and IDXGIDevice1 through vtbl2
+    d3d_object base;                 // ID3D11Device, and IDXGIDevice4 through vtbl2
     void *mtl;                       // id<MTLDevice> (retained)
     void *queue;                     // id<MTLCommandQueue> (retained)
     d3d_object *context;             // the immediate context
