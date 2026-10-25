@@ -117,7 +117,8 @@ static void test_windows(void) {
 
 // ---- suspending a thread that is busy in the runtime (it posts completion packets, sets events, makes named mappings) ----
 // The sampler makes a named event while the thread is stopped: a thread stopped in the middle of making a named object
-// (with the name registry's or the C library's lock held) left Steam's web helper with every thread waiting.
+// (with the name registry's or the C library's lock held) left Steam's web helper with every thread waiting; so did one
+// stopped in VirtualAlloc with the address space's lock held while the sampler asked VirtualQuery about the stack.
 static volatile LONG g_stop_busy, g_busy_rounds;
 static DWORD WINAPI busy_in_runtime(void *port) {
     HANDLE e = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -127,6 +128,8 @@ static DWORD WINAPI busy_in_runtime(void *port) {
         SetEvent(e); ResetEvent(e);
         HANDLE m = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096, "vxrt-test made-up mapping");
         if (m) CloseHandle(m);
+        void *v = VirtualAlloc(NULL, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);   // (with the address space's lock)
+        if (v) VirtualFree(v, 0, MEM_RELEASE);
     }
     CloseHandle(e);
     return 0;
@@ -146,6 +149,8 @@ static DWORD WINAPI sampler(void *arg) {
         if (named) CloseHandle(named);
         if (GetThreadId(g_busy) != id) return 4;
         if (!got) { printf("GetThreadContext: %lu\n", GetLastError()); return 5; }
+        MEMORY_BASIC_INFORMATION mbi;                               // (Chromium's sampler asks about the stack it walks)
+        if (!VirtualQuery((void *)c.Rsp, &mbi, sizeof mbi)) return 6;
         if (!c.Rip) return 2;
         if (ResumeThread(g_busy) != 1) return 3;
         InterlockedIncrement(&g_samples);

@@ -63,6 +63,7 @@ static inline void gunlock(void) { __atomic_store_n(&g_lock_owner, (pthread_t)NU
 // The thread waits in one of the runtime's blocking waits (vx_wait_begin/end): SuspendThread may stop it while the
 // wait is in the kernel, where it holds none of the runtime's locks (on_suspend_signal).
 __thread int vx_in_wait;
+__thread int vx_no_stop;                                         // (vx.h)
 static inline int gwait(pthread_cond_t *c) {
     __atomic_store_n(&g_lock_owner, (pthread_t)NULL, __ATOMIC_RELEASE);
     vx_in_wait++;
@@ -557,13 +558,16 @@ static int pc_native(uintptr_t pc) {
 // A thread is not stopped inside a system library, where it may hold a lock of the C library or malloc that the
 // suspender's next calls need (Chromium's sampling profiler, which suspends threads many times a second, left Steam's
 // web helper with every thread waiting when one was stopped in getenv, in CreateFileMapping's name lookup, while
-// another held g_lock waiting for getenv): only in the program's code, in this runtime's (not holding g_lock), or in
-// one of the runtime's blocking waits, in the kernel. Such a thread is signalled again until it is in one of those.
+// another held g_lock waiting for getenv): only in the program's code, in this runtime's (not holding g_lock, nor a
+// lock counted in vx_no_stop: one stopped in VirtualAlloc holding the address space's lock left Chromium's sampler
+// waiting in VirtualQuery for good), or in one of the runtime's blocking waits, in the kernel. Such a thread is
+// signalled again until it is in one of those.
 static void on_suspend_signal(int sig, siginfo_t *si, void *uc) {
     (void)sig; (void)si;
     vx_object *t = t_self;
     if (!t || !t->context || !__atomic_load_n(&t->suspended, __ATOMIC_SEQ_CST)) return;   // (a stop already seen)
     if (may_hold_g_lock()) return;                                      // (SuspendThread signals again)
+    if (vx_no_stop) return;                                             // (holds a lock the suspender may want: again)
 #ifdef __aarch64__
     if (vx_arm64_interrupt()) return;                                   // (in the vCPU guest: it stops as it leaves)
     uintptr_t pc = (uintptr_t)((const ucontext_t *)uc)->uc_mcontext->__ss.__pc;

@@ -289,4 +289,9 @@ DWORD vx_error_from_errno(int e);
 
 // Formatting with a Windows va_list (a pointer to 8-byte argument slots).
 int vx_format(char *out, size_t cap, const char *fmt, const char *ap);
+// A thread holding one of the runtime's locks that a suspender's own calls take (VirtualQuery's address space, ...)
+// is not stopped by SuspendThread until it lets go (src/sync.c, on_suspend_signal): counted per thread.
+extern __thread int vx_no_stop;
+#define VX_NO_STOP_LOCK(m) do { vx_no_stop++; pthread_mutex_lock(m); } while (0)
+#define VX_NO_STOP_UNLOCK(m) do { pthread_mutex_unlock(m); vx_no_stop--; } while (0)
 #endif
