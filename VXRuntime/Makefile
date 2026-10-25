@@ -14,6 +14,7 @@ SRC    += src/shlock.c
 SRC    += src/tcptable.c
 SRC    += src/winprops.c
 SRC    += src/a11y.c
+SRC    += src/imagehlp.c src/spellcheck.c src/ime.c src/clipboard.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
@@ -45,7 +46,8 @@ build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/g
 tests: build/hello_k32.exe build/hello_crt.exe build/threads.exe build/cxx_exceptions.exe build/hw_exceptions.exe build/seh_try.exe build/unwind.exe build/breakpoint.exe build/child_stdout.exe \
        build/files.exe build/dll_test.exe build/vxplugin.dll build/dllprobe.exe \
        build/window.exe build/winsta.exe build/scm.exe build/net.exe build/winhttp.exe build/winhttp_proxy.exe build/iphlp.exe build/winsock_nsp.exe build/midi.exe build/directinput.exe build/msvc_eh.exe build/com.exe build/msxml.exe build/vxcom.dll build/iocp.exe build/d3d11.exe build/gl.exe build/hlslc.exe build/dxbc2msl build/draw.exe build/compute.exe build/d3d12.exe build/d3d12_engine.exe build/d3d12_fxc.exe build/d3d11on12.exe build/input.exe build/audio.exe build/xaudio2.exe build/dwrite.exe build/dxbcscan build/pipes.exe build/ipc.exe build/shared.exe build/steam.exe build/smc.exe build/order.exe build/lowmem.exe build/clip.exe build/shoplist.exe build/vulkan_win.exe build/vulkan_features.exe build/vulkan_shaders.exe build/game_imports.exe build/kernelx.exe build/jobs.exe build/security.exe \
-       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/open_thread.exe build/version_info.exe build/section_access.exe build/dbfiles.exe build/updater_files.exe build/shlock.exe build/net_events.exe build/regwait.exe build/tcptable.exe build/winprops.exe build/a11y.exe build/gdi_xform.exe build/view_align.exe
+       build/sysdlls.exe build/dbghelp.exe build/crypt32.exe build/webhelper_apis.exe build/steam_client_ui.exe build/handle_xfer.exe build/open_thread.exe build/version_info.exe build/section_access.exe build/dbfiles.exe build/updater_files.exe build/shlock.exe build/net_events.exe build/regwait.exe build/tcptable.exe build/winprops.exe build/a11y.exe build/gdi_xform.exe build/view_align.exe \
+       build/client_imports.exe build/hello32.exe build/clipboard.exe build/input_route.exe
 
 build/hello_k32.exe: tests/hello_k32.c
 	@mkdir -p build
@@ -197,6 +199,26 @@ build/a11y.exe: tests/a11y.c
 build/winprops.exe: tests/winprops.c
 	@mkdir -p build
 	$(MINGW) -O1 -Wall -o $@ $< -lshell32 -lole32 -luser32 -luuid
+
+# The Windows Steam client's sign-in imports (imagehlp certificates, RegDeleteTree, the event log, WSASendMsg, shutdown
+# reasons, touch injection, SHOpenWithDialog, RtlCaptureStackBackTrace, ...) and CreateProcess of a 32-bit program
+# (build/hello32.exe, built for i386, is refused with ERROR_BAD_EXE_FORMAT).
+build/client_imports.exe: tests/client_imports.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -D_WIN32_WINNT=0x0A00 -o $@ $< -limagehlp -lws2_32 -ladvapi32 -lshell32 -lole32 -luser32
+build/hello32.exe: tests/hello32.c
+	@mkdir -p build
+	i686-w64-mingw32-gcc -O1 -o $@ $<
+
+# The clipboard on a pasteboard of the test's own (src/clipboard.m).
+build/clipboard.exe: tests/clipboard.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $< -luser32
+
+# Input through child windows (tests/input_route_check.py drives it through Command Clips).
+build/input_route.exe: tests/input_route.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $< -limm32 -lgdi32
 
 # GetExtendedTcpTable: a loopback connection's rows with this process as their owner (src/tcptable.c).
 build/tcptable.exe: tests/tcptable.c
@@ -1284,6 +1306,8 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/tcptable.exe
 	$(VXRT) build/winprops.exe
 	$(VXRT) build/a11y.exe
+	$(VXRT) build/client_imports.exe build/hello32.exe
+	VXRT_PASTEBOARD=vxrt-check $(VXRT) build/clipboard.exe
 	$(VXRT) build/gdi_xform.exe
 	$(VXRT) build/view_align.exe
 	$(VXRT) build/winhttp.exe
@@ -1316,6 +1340,7 @@ runtime-tests: $(VXRT) tests
 	python3 tests/clip_check.py $(VXRT)
 	python3 tests/present_check.py $(VXRT)
 	python3 tests/shoplist_check.py $(VXRT)
+	python3 tests/input_route_check.py $(VXRT)
 	python3 tests/tray_check.py $(VXRT)
 	$(VXRT) build/d3d11.exe
 	$(VXRT) build/gl.exe

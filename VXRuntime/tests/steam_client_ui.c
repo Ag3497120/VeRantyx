@@ -115,7 +115,9 @@ static void test_windows(void) {
     CHECK(WindowFromPoint(inside) != h);
 }
 
-// ---- suspending a thread that is busy in the runtime (it posts completion packets and sets events) ---------------------
+// ---- suspending a thread that is busy in the runtime (it posts completion packets, sets events, makes named mappings) ----
+// The sampler makes a named event while the thread is stopped: a thread stopped in the middle of making a named object
+// (with the name registry's or the C library's lock held) left Steam's web helper with every thread waiting.
 static volatile LONG g_stop_busy, g_busy_rounds;
 static DWORD WINAPI busy_in_runtime(void *port) {
     HANDLE e = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -123,6 +125,8 @@ static DWORD WINAPI busy_in_runtime(void *port) {
         InterlockedIncrement(&g_busy_rounds);
         PostQueuedCompletionStatus((HANDLE)port, 1, 2, NULL);
         SetEvent(e); ResetEvent(e);
+        HANDLE m = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 4096, "vxrt-test made-up mapping");
+        if (m) CloseHandle(m);
     }
     CloseHandle(e);
     return 0;
@@ -132,12 +136,14 @@ static volatile LONG g_samples;
 static DWORD WINAPI sampler(void *arg) {
     (void)arg;
     DWORD id = GetThreadId(g_busy);
-    for (int i = 0; i < 2000; i++) {
+    for (int i = 0; i < 20000; i++) {
         if (SuspendThread(g_busy) == (DWORD)-1) return 1;
         CONTEXT c; c.ContextFlags = CONTEXT_FULL;
         BOOL got = GetThreadContext(g_busy, &c);
         BOOL boost = FALSE;
         GetThreadPriorityBoost(g_busy, &boost);                     // (what Chromium's profiler calls meanwhile)
+        HANDLE named = CreateEventA(NULL, FALSE, FALSE, "vxrt-test made-up event");
+        if (named) CloseHandle(named);
         if (GetThreadId(g_busy) != id) return 4;
         if (!got) { printf("GetThreadContext: %lu\n", GetLastError()); return 5; }
         if (!c.Rip) return 2;
@@ -158,7 +164,7 @@ static void test_suspend_busy(void) {
     if (r != WAIT_OBJECT_0) { printf("check failed: sampling a busy thread stuck after %ld samples\n", g_samples); fflush(stdout); ExitProcess(1); }
     GetExitCodeThread(s, &code);
     if (code) printf("sampler: code %lu after %ld samples\n", code, g_samples);
-    CHECK(code == 0 && g_samples == 2000);
+    CHECK(code == 0 && g_samples == 20000);
     g_stop_busy = 1;
     CHECK(WaitForSingleObject(g_busy, 10000) == WAIT_OBJECT_0);
     CloseHandle(s); CloseHandle(g_busy); CloseHandle(port);

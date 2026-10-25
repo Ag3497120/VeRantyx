@@ -36,10 +36,13 @@ visible one).
 | `windows` | the same without the text |
 | `snapshot <hwnd> <path>` | the client area's pixels as a PNG file (the bitmap GDI draws into) |
 | `snapshot-view <hwnd> <path>` | what the Mac shows of the client area, as a PNG file at the window's backing scale: the window server's pixels of the window (converted back to sRGB, with the window's own alpha) when it can be asked, else Core Animation's rendering of the window's layers; with child windows in front and layered windows' transparency. Answers `source` (`window-server` or `layers`), `scale`, `width`, `height` (pixels), `window_alpha`, `opaque` |
-| `click <hwnd> <x> <y>` | WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP at client coordinates |
+| `click <hwnd> <x> <y>` | WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP at client coordinates of hwnd, delivered as Windows delivers the mouse: to the child window under the point (one answering WM_NCHITTEST with HTTRANSPARENT passes it to the window beneath), in its coordinates, or to the window that captured the mouse |
 | `click-text <hwnd> <text>` | the same at the middle of the first drawn text containing `<text>` (hwnd 0: any window) |
-| `key <hwnd> <vk>` | WM_KEYDOWN, WM_KEYUP (no WM_CHAR: use `type`) |
-| `type <hwnd> <text>` | WM_CHAR for each UTF-16 unit of the text |
+| `key <hwnd> <vk>[+<vk>...]` | WM_KEYDOWN, WM_KEYUP: the keys pressed in order and let go in reverse (`0x11+0x56` is Ctrl+V), to the focus window when it is hwnd or inside it; the program's key state (GetKeyState) follows as it reads them (no WM_CHAR: use `type`) |
+| `type <hwnd> <text>` | WM_CHAR for each UTF-16 unit of the text, to the focus window when it is inside hwnd |
+| `wheel <hwnd> <x> <y> <delta>` | WM_MOUSEWHEEL (120 a notch, positive away from the user) with the pointer at client x, y, to the focus window (DefWindowProc hands it to the parent) |
+| `ime <hwnd> <text>` | the text composed in the input method and committed: WM_IME_STARTCOMPOSITION, WM_IME_COMPOSITION (the composition, then the result: ImmGetCompositionString reads them), WM_IME_ENDCOMPOSITION, to the focus window (`src/ime.c`) |
+| `clipboard` / `clipboard-set <text>` | the clipboard's text, or text put on it as another program's copy would (`src/clipboard.m`; `VXRT_PASTEBOARD=<name>` makes it a pasteboard of that name, not the Mac's own) |
 | `close <hwnd>` | WM_CLOSE |
 | `wait-idle [ms]` | answers once the program is idle, or after ms (default 2000) with `"idle": false` |
 | `tray` | the program's notification-area icons (`Shell_NotifyIcon`, shown as menu-bar status items: `src/tray.m`): owner window, id, GUID, callback message, version, tip, picture size, whether the menu bar shows it and where |
@@ -69,7 +72,7 @@ A program that lives in the notification area (Steam with `-silent`) is reached 
 
 - Text drawn with Direct3D, OpenGL or DirectWrite is not seen; only GDI's.
 - There are no standard controls (BUTTON, EDIT ...) in VXRuntime yet, so no control tree: windows and drawn text.
-- Clicks go to the window given (not the child under the point).
+- Keys are virtual-key codes without the Mac's text input: `type` gives characters, `ime` a composition.
 
 ## Demo: an AI agent doing a task it was not shown how to do (M2)
 
@@ -105,5 +108,8 @@ opened on the other display; the runtime now centers a window with an owner over
 `tests/clip.c` (a counter, a button drawn into a memory DC and blitted, typed text, R to reset), driven only through
 the socket by `tests/clip_check.py`, in `make check` (x86 build under Rosetta) and `make check-arm64`; on the MacBook
 Air M5 also with `VXRT_VCPU=1`. `tests/shoplist_check.py` does the shopping list as a fixed script (14 actions,
-both windows, the saved file checked) in the same runs. From a click to idle with the new text: 2.6 ms (M1 Max),
+both windows, the saved file checked) in the same runs. `tests/input_route_check.py` drives `tests/input_route.c`, a window with
+child windows (one answering HTTRANSPARENT), through the top-level window only: clicks land in the child under the
+point and are captured, keys, Ctrl+V and Ctrl+C with the clipboard (a pasteboard of the test's own), compositions and
+the wheel reach the focus window. From a click to idle with the new text: 2.6 ms (M1 Max),
 3.1 ms (M5), most of it the 1 ms polling of `wait-idle`.

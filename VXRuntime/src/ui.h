@@ -85,6 +85,7 @@ typedef struct vx_window {
     uint8_t  layer_alpha;           // constant alpha (LWA_ALPHA, or the BLENDFUNCTION's SourceConstantAlpha)
     uint32_t layer_key;             // color key (COLORREF)
     DWORD    layer_flags;           // LWA_* (layered 1) or ULW_* (layered 2), and AC_SRC_ALPHA << 8 for per-pixel alpha
+    int      frameless;             // its WM_NCCALCSIZE made the whole window its client area: a Mac window without a title bar
 } vx_window;
 
 // user32.c
@@ -97,7 +98,13 @@ void vx_window_activated(vx_window *w, int active);
 void   vx_window_shown_inactive(vx_window *w);              // shown without the Mac's focus: active for the game with VXRT_STAY_ACTIVE
 void vx_window_minimized(vx_window *w, int minimized);
 void vx_key_event(vx_window *w, int mac_keycode, int down, int repeat, int alt);
+// A key with the characters it makes (TranslateMessage posts them as WM_CHAR); ime: the input method took the key
+// (WM_KEYDOWN carries VK_PROCESSKEY, its WM_IME_* messages come from ime.c). Keys go to the focus window (user32.c).
+void vx_key_event_chars(vx_window *w, int mac_keycode, int down, int repeat, int alt, const uint16_t *chars, int n, int ime);
 void vx_char_event(vx_window *w, const uint16_t *chars, int n);
+void vx_mouse_input(vx_window *top, uint32_t msg, WPARAM keys, int x, int y);   // at a screen point: to the window under it
+void vx_mouse_wheel(vx_window *top, int delta, WPARAM keys, int x, int y, int horizontal);   // to the focus window
+void vx_mouse_exited(vx_window *top);                    // the pointer left the Mac window (WM_MOUSELEAVE)
 void vx_mouse_button(int vk, int down);                   // VK_LBUTTON etc. state for GetKeyState
 void vx_raw_mouse(int dx, int dy, uint16_t button_flags, int16_t wheel);   // WM_INPUT for raw-input programs
 LRESULT vx_send_message(HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp);
@@ -111,7 +118,9 @@ int    vx_ui_idle(void);                                  // every thread with w
 HANDLE vx_ui_window(HANDLE hwnd);                         // hwnd if live; 0: the active window, else the first visible one
 int    vx_ui_find_text(HANDLE hwnd, const char *needle, HANDLE *in, POINT *at);   // the middle of drawn text with needle
 void   vx_ui_click(HANDLE hwnd, int x, int y);            // a left click at client coordinates
-void   vx_ui_key(HANDLE hwnd, int vk);                    // WM_KEYDOWN, WM_KEYUP
+void   vx_ui_key(HANDLE hwnd, int vk);                    // WM_KEYDOWN, WM_KEYUP (to the focus window inside hwnd)
+void   vx_ui_keys(HANDLE hwnd, const int *vks, int n);    // keys pressed in order, let go in reverse (Ctrl+V)
+void   vx_ui_wheel(HANDLE hwnd, int x, int y, int delta); // WM_MOUSEWHEEL with the pointer at client x, y
 void   vx_ui_type(HANDLE hwnd, const char *utf8);         // WM_CHAR for each UTF-16 unit
 
 // user32.c, for present.c and cocoa.m
@@ -204,6 +213,23 @@ int  vx_cocoa_snapshot_view(vx_window *w, const char *png, char *info, size_t ca
 double vx_cocoa_refresh_period(void);                     // the main display's frame time (seconds)
 void vx_cocoa_window_gone(vx_window *w);                  // a child window's layer goes (asynchronous)
 void vx_cocoa_activate(vx_window *w);
+void vx_cocoa_drag(vx_window *w);                         // the window follows the mouse while its button is down (HTCAPTION)
+
+// ime.c: the input method (imm32) between the Mac's text input and Windows programs
+LRESULT vx_ime_default(HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp, int unicode);   // DefWindowProc's WM_IME_*
+int  vx_ime_active(vx_window *w);                         // the Mac's input method composes for this window's focus
+void vx_ime_compose(vx_window *w, const uint16_t *s, int n, int cursor);   // the composition so far (marked text)
+void vx_ime_commit(vx_window *w, const uint16_t *s, int n);                 // the composition's result
+void vx_ime_caret(vx_window *w, RECT *screen);             // where the program shows the composition (for the Mac's candidates)
+int  vx_ui_ime(HANDLE hwnd, const char *compose, const char *result);       // Command Clips: compose, then commit
+void vx_ime_key(int vk);                                  // the key the input method took (ImmGetVirtualKey)
+void vx_cocoa_ime_cancel(vx_window *top);                 // cocoa.m: the Mac's input method drops its composition
+HANDLE vx_keyboard_target(vx_window *w);                  // user32.c: the focus window if it is w or inside it, else w
+HANDLE vx_focus_window(void);                             // user32.c: GetFocus's
+
+// clipboard.m
+int  vx_ui_clipboard_get(char *out, size_t cap);          // Command Clips: the clipboard's text (UTF-8); 0 if none
+int  vx_ui_clipboard_set(const char *utf8);
 int  vx_cocoa_message_box(const char *text, const char *caption, unsigned type);
 void vx_cocoa_beep(void);
 int  vx_cocoa_title_height(void);

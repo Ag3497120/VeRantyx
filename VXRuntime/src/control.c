@@ -9,8 +9,15 @@
 //                              at the window's backing scale, as a PNG file; answers the scale and the size in pixels
 //   click <hwnd> <x> <y>       a left click at client coordinates (hwnd 0: the active window, else the first visible one)
 //   click-text <hwnd> <text>   a click on the middle of the first drawn text that contains <text> (hwnd 0: any window)
-//   key <hwnd> <vk>            a key pressed and let go (a virtual-key code, decimal or 0x..; no WM_CHAR: see type)
-//   type <hwnd> <text>         the characters of <text> (UTF-8) as WM_CHAR
+//   key <hwnd> <vk>[+<vk>...]  keys pressed in order and let go in reverse (virtual-key codes, decimal or 0x..: 0x11+0x56
+//                              is Ctrl+V), to the focus window when it is hwnd or inside it; no WM_CHAR: see type
+//   type <hwnd> <text>         the characters of <text> (UTF-8) as WM_CHAR, to the focus window when it is inside hwnd
+//   wheel <hwnd> <x> <y> <delta>  the mouse wheel turned (120 a notch, positive away from the user) with the pointer at
+//                              client x, y: WM_MOUSEWHEEL to the focus window, as Windows sends it
+//   ime <hwnd> <text>          <text> composed in the input method, then committed: WM_IME_STARTCOMPOSITION,
+//                              WM_IME_COMPOSITION (the composition, then the result), WM_IME_ENDCOMPOSITION (ime.c)
+//   clipboard                  the clipboard's text; clipboard-set <text>: the clipboard holds <text> (as another
+//                              program's copy would leave it)
 //   close <hwnd>               WM_CLOSE
 //   wait-idle [ms]             answers once the program is idle (user32.c, vx_ui_idle: the actions so far handled and
 //                              painted), or after ms (default 2000) with "idle": false
@@ -117,6 +124,24 @@ static void request(int fd, char *line) {
         if ((!pick || *s) && vx_menu_pick(pick ? s : NULL, 2000, why, sizeof why)) reply(fd, "{\"ok\":true}"); else reply_err(fd, why);
         return;
     }
+    if (!strcmp(cmd, "clipboard")) {
+        char text[4096], b[4096 * 6 + 64];
+        if (!vx_ui_clipboard_get(text, sizeof text)) { reply(fd, "{\"ok\":true,\"text\":null}"); return; }
+        size_t k = (size_t)snprintf(b, sizeof b, "{\"ok\":true,\"text\":\"");
+        for (const unsigned char *c = (const unsigned char *)text; *c && k + 8 < sizeof b; c++) {
+            if (*c == '"' || *c == '\\') { b[k++] = '\\'; b[k++] = (char)*c; }
+            else if (*c < 0x20) k += (size_t)snprintf(b + k, sizeof b - k, "\\u%04x", *c);
+            else b[k++] = (char)*c;
+        }
+        snprintf(b + k, sizeof b - k, "\"}");
+        reply(fd, b);
+        return;
+    }
+    if (!strcmp(cmd, "clipboard-set")) {
+        while (*s == ' ') s++;
+        if (vx_ui_clipboard_set(s)) reply(fd, "{\"ok\":true}"); else reply_err(fd, "clipboard-set <text>: the clipboard could not be set");
+        return;
+    }
     HANDLE h = window_arg(&s);
     if (!h) { reply_err(fd, "no such window"); return; }
     if (!strcmp(cmd, "click")) {
@@ -125,8 +150,24 @@ static void request(int fd, char *line) {
         vx_ui_click(h, atoi(x), atoi(y));
     } else if (!strcmp(cmd, "key")) {
         char *k = word(&s);
-        if (!k) { reply_err(fd, "key <hwnd> <vk>"); return; }
-        vx_ui_key(h, (int)strtol(k, NULL, 0));
+        if (!k) { reply_err(fd, "key <hwnd> <vk>[+<vk>...]"); return; }
+        int vks[8], n = 0;
+        for (char *p = k; *p && n < 8; ) {
+            char *end;
+            long v = strtol(p, &end, 0);
+            if (end == p || v <= 0 || v > 0xfe) { reply_err(fd, "key <hwnd> <vk>[+<vk>...]: a virtual-key code is 1..0xfe"); return; }
+            vks[n++] = (int)v;
+            p = *end == '+' ? end + 1 : end;
+            if (*end && *end != '+') { reply_err(fd, "key <hwnd> <vk>[+<vk>...]"); return; }
+        }
+        vx_ui_keys(h, vks, n);
+    } else if (!strcmp(cmd, "wheel")) {
+        char *x = word(&s), *y = word(&s), *d = word(&s);
+        if (!x || !y || !d) { reply_err(fd, "wheel <hwnd> <x> <y> <delta>"); return; }
+        vx_ui_wheel(h, atoi(x), atoi(y), atoi(d));
+    } else if (!strcmp(cmd, "ime")) {
+        while (*s == ' ') s++;
+        if (!*s || !vx_ui_ime(h, s, s)) { reply_err(fd, "ime <hwnd> <text>: no window to compose in"); return; }
     } else if (!strcmp(cmd, "type")) {
         while (*s == ' ') s++;
         vx_ui_type(h, s);
@@ -141,7 +182,7 @@ static void request(int fd, char *line) {
         reply(fd, b);
         return;
     } else if (!strcmp(cmd, "close")) vx_window_post(h, WM_CLOSE, 0, 0);
-    else { reply_err(fd, "unknown request (state, windows, snapshot, snapshot-view, click, click-text, key, type, close, wait-idle, tray, tray-click, tray-snapshot, menu, menu-pick, menu-cancel)"); return; }
+    else { reply_err(fd, "unknown request (state, windows, snapshot, snapshot-view, click, click-text, key, type, wheel, ime, clipboard, clipboard-set, close, wait-idle, tray, tray-click, tray-snapshot, menu, menu-pick, menu-cancel)"); return; }
     reply_ok(fd, h);
 }
 

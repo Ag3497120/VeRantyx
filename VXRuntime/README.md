@@ -77,15 +77,39 @@ How the web helper (Chromium) is started, checked on 2026-10-24 against the comm
 `steamwebhelper.exe`: Steam's own `-cef-disable-gpu` adds `--disable-gpu --disable-gpu-compositing`,
 `-cef-disable-gpu-compositing` only the latter, `-cef-disable-sandbox` and `-no-cef-sandbox` add `--no-sandbox`;
 `-cef-single-process` and `-cef-in-process-gpu`, named in older lists, add nothing in this client (2026-09-03 build).
-`--single-process`, which Chromium needs here because its child processes are handed handles between processes,
-comes from `VXRT_EXTRA_ARGS` (`src/launchargs.c`), so neither Steam's files nor the Wine version's
-`steamwebhelper.exe` shim are involved. Where it stops today (2026-10-25, client 1792618285 of 2026-10-21): `steam.exe`
-runs on (past Steam's SteamVR check, 88 s of 88 in every run since `OpenThread` finds every running thread; before, it
-ended itself about 10 s in: tier0 freed the main thread's data when it could not open it), loads `steamclient64.dll`
-once the Steam Service Error box is closed (its connectivity test passes, logged off), and the web helper creates
-Steam's shared JS context (`logs/steamui_html.txt`: `BrowserReady`), but draws nothing: its GPU contexts all fail
-(`Failed to create shared context for virtualization`), and it ends itself some 20 s later, after which
-`steam.exe` starts it again. There is no sign-in window yet.
+The web helper's own `--single-process` (Chromium's child processes would be handed handles between processes, not
+there yet) and `--disable-software-rasterizer` (with the GPU off, Chromium otherwise keeps trying to make GL contexts,
+logs `Failed to create shared context for virtualization`, draws nothing and ends itself some 20 s later) come from
+`VXRT_EXTRA_ARGS` (`src/launchargs.c`), the launch script's default (`VXRT_WSTEAM_WEBHELPER_ARGS` replaces them), so
+neither Steam's files nor the Wine version's `steamwebhelper.exe` shim are involved. With them Chromium composites in
+software through GDI, and Steam's sign-in window shows (2026-10-25, client 1792618285 of 2026-10-21): an SDL window
+"Sign in to Steam" holding CEF's `CefBrowserWindow`, Chromium's `Chrome_WidgetWin_1` and its "Chrome Legacy Window",
+with the account name and password fields, Remember me, Sign In and the QR code panel, 700x440 as Steam asks. (It was
+700x376: SDL makes the window with a caption style and takes the whole window as its client area in WM_NCCALCSIZE,
+which vxrt did not send, so the Mac window kept a title bar and SDL, sizing the window from that client area, took the
+title bar off a second time; `src/user32.c` sends WM_NCCALCSIZE now and such a window has no Mac title bar.)
+
+Input to the sign-in window (2026-10-25, checked through Command Clips on an APFS copy of the root, with made-up text
+only, nobody signed in): clicks land in the child window under the pointer, as Windows hit-tests (here Chromium's
+legacy window, then its widget once it captures the mouse); keys, characters and compositions go to the focus window;
+TranslateMessage makes WM_CHAR of the characters the Mac's keyboard gave a key; typing in the account name field shows
+the text, Backspace and Ctrl+A then Backspace clear it, Ctrl+V pastes the clipboard's text, an input-method
+composition (`ime`) is committed into the field. What Chromium needed on the way: `SetKeyboardState` (Backspace ended
+it: a delay-load failure), `NtQueryObject` telling a file opened for reading that it may only read (a CHECK ended it on
+the first character typed: it hands a read-only file on and verifies the handle's access), the Spell Checking API's
+factory (with no languages), `RtlCaptureStackBackTrace` in ntdll, and a clipboard (`src/clipboard.m`, the Mac's
+pasteboard) and an input method (`src/ime.c`, the Mac's) as Windows programs see them. Its page also froze for good in about
+two runs of five, some 10 s after the window appeared: Chromium's sampling profiler suspends threads many times a
+second, and a thread suspended inside the C library (getenv, in a named object's lookup) kept that library's lock
+while another thread held g_lock waiting for it; a thread is now stopped only in the program's code, the runtime's
+own (not holding g_lock) or one of its blocking waits (`src/sync.c`; no freeze in the 7 runs since, and
+`tests/steam_client_ui.c` samples a thread making named objects 20,000 times: the build before stalled in 3 of 4
+runs). The imports Steam's DLLs had
+without an implementation are there (`tests/client_imports.c`): imagehlp's certificate table, `RegDeleteTreeA`, the
+classic event log (no records), `WSASendMsg`, touch injection (none here: `ERROR_NOT_SUPPORTED`),
+`ShutdownBlockReasonCreate`, `SHOpenWithDialog` (no such dialog here), `Beep`, `SetLocalTime` (no privilege). The 32-bit
+`gldriverquery.exe` and `vulkandriverquery.exe` Steam starts are refused by CreateProcess with `ERROR_BAD_EXE_FORMAT`
+before any process starts (Steam logs "Failed to launch executable" and goes on; it uses the 64-bit ones' answers).
 
 Steam updates itself here as on Windows (2026-10-25: from the 2026-09-03 client, 1788652215, to 1792618285, Valve's
 download). Those runs were made in `~/Verantyx_VR_Drive/vxrt_wsteam` itself, not in a copy, two of them with

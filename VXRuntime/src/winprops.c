@@ -241,7 +241,20 @@ static WINAPI BOOL SetWindowPlacement(HANDLE wnd, const uint8_t *wp) {
 // GetGuiResources: the counts of GDI and USER objects a process holds; not kept per process (0, as for a failure).
 static WINAPI DWORD GetGuiResources(HANDLE process, DWORD flags) { (void)process; (void)flags; return 0; }
 
-static const vx_export shell32[] = { VX_EXPORT(SHGetPropertyStoreForWindow), VX_EXPORT(SHCreateItemFromParsingName) };
+// SHOpenWithDialog: Windows' "Open with" dialog, where the user picks a program for a file (OPENASINFO: the file, a
+// class, OAIF_* flags). There is no such dialog for Windows programs here, and a Mac application cannot be offered as
+// one: the call fails as for a shell without it (HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)), after the documented
+// argument checks. The Windows Steam client's vgui2_s.dll imports it.
+typedef struct { const WCHAR *file, *cls; DWORD flags; } OPENASINFO;
+static WINAPI HRESULT SHOpenWithDialog(HANDLE parent, const OPENASINFO *info) {
+    (void)parent;
+    if (!info || !info->file) return E_INVALIDARG;
+    char *f = vx_utf8_dup(info->file);
+    vx_log("SHOpenWithDialog(%s, flags %#x): there is no \"Open with\" dialog here", f, (unsigned)info->flags);
+    free(f);
+    return (HRESULT)0x80070032;
+}
+static const vx_export shell32[] = { VX_EXPORT(SHGetPropertyStoreForWindow), VX_EXPORT(SHCreateItemFromParsingName), VX_EXPORT(SHOpenWithDialog) };
 static const vx_export user32[] = { VX_EXPORT(SetWindowPlacement), VX_EXPORT(GetGuiResources) };
 static const vx_export propsys[] = { VX_EXPORT(PSCreateMemoryPropertyStore), VX_EXPORT(PSGetPropertyKeyFromName), VX_EXPORT(InitPropVariantFromCLSID) };
 void vx_winprops_init(void) {
@@ -250,3 +263,7 @@ void vx_winprops_init(void) {
     vx_register_module("propsys.dll", propsys, sizeof propsys / sizeof propsys[0]);
     vx_com_register_class(&CLSID_VirtualDesktopManager, create_vdm);
 }
+
+#ifdef __aarch64__
+#include "thunks/winprops.c.inc"
+#endif

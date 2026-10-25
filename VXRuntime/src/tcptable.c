@@ -185,3 +185,7 @@ static WINAPI DWORD GetTcpTable2(void *table, DWORD *size, BOOL order) {
 
 static const vx_export iphlpapi[] = { VX_EXPORT(GetExtendedTcpTable), VX_EXPORT(GetTcpTable), VX_EXPORT(GetTcpTable2) };
 void vx_tcptable_init(void) { vx_register_module("iphlpapi.dll", iphlpapi, sizeof iphlpapi / sizeof iphlpapi[0]); }
+
+#ifdef __aarch64__
+#include "thunks/tcptable.c.inc"
+#endif

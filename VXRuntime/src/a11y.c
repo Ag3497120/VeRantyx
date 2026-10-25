@@ -102,3 +102,7 @@ void vx_a11y_init(void) {
     vx_register_module("uiautomationcore.dll", uiautomationcore, sizeof uiautomationcore / sizeof uiautomationcore[0]);
     vx_register_module("uxtheme.dll", uxtheme, sizeof uxtheme / sizeof uxtheme[0]);
 }
+
+#ifdef __aarch64__
+#include "thunks/a11y.c.inc"
+#endif

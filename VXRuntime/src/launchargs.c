@@ -11,10 +11,11 @@
 // what it added.
 //
 // The Windows Steam launcher (scripts/launch_vxrt_windows_steam.sh) uses it for steamwebhelper.exe's
-// --single-process, which no Steam client option sets (2026-10-24: -cef-single-process and -cef-in-process-gpu add
-// nothing to the webhelper's command line; the client's own -cef-disable-gpu and -cef-disable-sandbox do their part).
-// Chromium's renderer, GPU and utility processes talk Mojo over handles the browser process hands them, which vxrt
-// cannot pass between processes yet.
+// --single-process and --disable-software-rasterizer, which no Steam client option sets (2026-10-24:
+// -cef-single-process and -cef-in-process-gpu add nothing to the webhelper's command line; the client's own
+// -cef-disable-gpu and -cef-disable-sandbox do their part). Chromium's renderer, GPU and utility processes talk Mojo
+// over handles the browser process hands them, which vxrt cannot pass between processes yet; without a software
+// rasterizer to fall back to, Chromium composites in software through GDI (2026-10-25: the sign-in window shows).
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>

@@ -4,6 +4,7 @@
 // Windows, 30 on macOS), fd_set (a count and an array of sockets), hostent and addrinfo layouts, socket option
 // values (SO_RCVTIMEO in milliseconds, linger), MSG_WAITALL, ioctlsocket, and error codes (WSAE*, 10000 + n).
 // Sockets never raise SIGPIPE (SO_NOSIGPIPE).
+#define __APPLE_USE_RFC_3542                                          // (IPV6_PKTINFO as RFC 3542 has it, as Windows does)
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -223,16 +224,66 @@ static void complete_with_routine(HANDLE thread, void *cr, void *ov, DWORD bytes
     if (!queue(completion_apc, thread, (uintptr_t)c)) free(c);
     close(thread);
 }
-static int send_msg(SOCKET s, const WSABUF *bufs, DWORD n, DWORD *sent, DWORD flags, const void *to, int tolen, void *ov, void *cr) {
+// Ancillary data of WSASendMsg (WSACMSGHDR: a SIZE_T length, level, type, the data 8-byte aligned after it) into BSD
+// control messages. What can be sent: the source address and interface (IP_PKTINFO, IPV6_PKTINFO), the TOS / traffic
+// class byte; anything else is refused (WSAEINVAL) and named in the log. Returns the bytes used of out, -1 if refused.
+enum { WIN_IP_TOS = 3, WIN_IP_PKTINFO = 19, WIN_IPV6_PKTINFO = 19, WIN_IPV6_TCLASS = 39 };
+static long control_in(const uint8_t *in, size_t len, uint8_t *out, size_t cap) {
+    size_t at = 0, used = 0;
+    while (at + 16 <= len) {
+        uint64_t clen; int level, type;
+        memcpy(&clen, in + at, 8); memcpy(&level, in + at + 8, 4); memcpy(&type, in + at + 12, 4);
+        if (clen < 16 || at + clen > len) return -1;
+        const uint8_t *data = in + at + 16;
+        size_t dlen = (size_t)clen - 16;
+        struct cmsghdr *c = (struct cmsghdr *)(out + used);
+        size_t room = cap - used;
+        if (level == IPPROTO_IP && type == WIN_IP_PKTINFO && dlen >= 8 && room >= CMSG_SPACE(sizeof(struct in_pktinfo))) {
+            struct in_pktinfo pi = { 0 };                          // IN_PKTINFO: the source address, then the interface
+            memcpy(&pi.ipi_spec_dst, data, 4); memcpy(&pi.ipi_ifindex, data + 4, 4);
+            c->cmsg_level = IPPROTO_IP; c->cmsg_type = IP_PKTINFO; c->cmsg_len = CMSG_LEN(sizeof pi);
+            memcpy(CMSG_DATA(c), &pi, sizeof pi);
+            used += CMSG_SPACE(sizeof pi);
+        } else if (level == IPPROTO_IPV6 && type == WIN_IPV6_PKTINFO && dlen >= 20 && room >= CMSG_SPACE(sizeof(struct in6_pktinfo))) {
+            struct in6_pktinfo pi;                                 // the same layout on both
+            memcpy(&pi, data, sizeof pi);
+            c->cmsg_level = IPPROTO_IPV6; c->cmsg_type = IPV6_PKTINFO; c->cmsg_len = CMSG_LEN(sizeof pi);
+            memcpy(CMSG_DATA(c), &pi, sizeof pi);
+            used += CMSG_SPACE(sizeof pi);
+        } else if (((level == IPPROTO_IP && type == WIN_IP_TOS) || (level == IPPROTO_IPV6 && type == WIN_IPV6_TCLASS)) && dlen >= 4 &&
+                   room >= CMSG_SPACE(sizeof(int))) {
+            int v; memcpy(&v, data, 4);
+            c->cmsg_level = level; c->cmsg_type = level == IPPROTO_IP ? IP_TOS : IPV6_TCLASS; c->cmsg_len = CMSG_LEN(sizeof v);
+            memcpy(CMSG_DATA(c), &v, sizeof v);
+            used += CMSG_SPACE(sizeof v);
+        } else {
+            vx_log("winsock: WSASendMsg: control message level %d type %d (%zu bytes) is not supported", level, type, dlen);
+            return -1;
+        }
+        at += (size_t)(clen + 7) & ~(size_t)7;
+    }
+    return (long)used;
+}
+static int send_msg_control(SOCKET s, const WSABUF *bufs, DWORD n, DWORD *sent, DWORD flags, const void *to, int tolen,
+                            const void *ctl, size_t ctl_len, void *ov, void *cr) {
     struct iovec iov[64];
     struct sockaddr_storage a; socklen_t l = to ? addr_in(to, tolen, &a) : 0;
     struct msghdr m = { to ? &a : NULL, l, iov, load_iov(iov, bufs, n), NULL, 0, 0 };
+    uint8_t control[256] __attribute__((aligned(8)));
+    if (ctl && ctl_len) {
+        long used = control_in(ctl, ctl_len, control, sizeof control);
+        if (used < 0) { vx_set_last_error(10022 /* WSAEINVAL */); if (ov && !cr) vx_io_completed((HANDLE)s, ov, 0, 10022); return SOCKET_ERROR; }
+        m.msg_control = control; m.msg_controllen = (socklen_t)used;
+    }
     ssize_t r = sendmsg(to_fd(s), &m, flags_in((int)flags));
     if (r < 0) { int e = fail(); if (ov && !cr) vx_io_completed((HANDLE)s, ov, 0, vx_get_last_error()); return e; }
     if (sent) *sent = (DWORD)r;
     if (cr) complete_with_routine(issuing_thread(), cr, ov, (DWORD)r, 0);
     else if (ov) vx_io_completed((HANDLE)s, ov, (DWORD)r, 0);
     return 0;
+}
+static int send_msg(SOCKET s, const WSABUF *bufs, DWORD n, DWORD *sent, DWORD flags, const void *to, int tolen, void *ov, void *cr) {
+    return send_msg_control(s, bufs, n, sent, flags, to, tolen, NULL, 0, ov, cr);
 }
 typedef struct { SOCKET s; struct iovec iov[64]; int n; void *ov; void *from; int *fromlen; int flags; void *cr; HANDLE thread; } pending_recv;
 static ssize_t recv_now(SOCKET s, struct iovec *iov, int n, int flags, void *from, int *fromlen) {
@@ -302,6 +353,13 @@ static WINAPI int WSASend(SOCKET s, WSABUF *bufs, DWORD n, DWORD *sent, DWORD fl
 }
 static WINAPI int WSASendTo(SOCKET s, WSABUF *bufs, DWORD n, DWORD *sent, DWORD flags, const void *to, int tolen, void *ov, void *cr) {
     return send_msg(s, bufs, n, sent, flags, to, tolen, ov, cr);
+}
+// WSASendMsg: WSAMSG is the address and its length, the buffers and their count, the control data (a WSABUF) and flags;
+// dwFlags of the call are the send flags (the WSAMSG's own dwFlags are not used for sending).
+typedef struct { const void *name; int namelen; WSABUF *bufs; DWORD count; WSABUF control; DWORD flags; } WSAMSG;
+static WINAPI int WSASendMsg(SOCKET s, WSAMSG *msg, DWORD flags, DWORD *sent, void *ov, void *cr) {
+    if (!msg) { vx_set_last_error(10014 /* WSAEFAULT */); return SOCKET_ERROR; }
+    return send_msg_control(s, msg->bufs, msg->count, sent, flags, msg->name, msg->namelen, msg->control.buf, msg->control.len, ov, cr);
 }
 static WINAPI int WSARecv(SOCKET s, WSABUF *bufs, DWORD n, DWORD *got, DWORD *flags, void *ov, void *cr) {
     return recv_msg(s, bufs, n, got, flags, NULL, NULL, ov, cr);
@@ -484,6 +542,7 @@ static void *extension_function(const uint8_t *guid) {
     if (d1 == 0x7fda2e11) return (void *)DisconnectEx;
     if (d1 == 0xb5367df2) return (void *)GetAcceptExSockaddrs;
     if (d1 == 0xb5367df1) return (void *)AcceptEx;
+    if (d1 == 0xa441e712) return (void *)WSASendMsg;                 // WSAID_WSASENDMSG
     return NULL;
 }
 #define SIO_GET_EXTENSION_FUNCTION_POINTER 0xC8000006u
@@ -800,7 +859,7 @@ static const vx_export ws2[] = {
     NET("socket", ws_socket), VX_EXPORT(WSASocketA), VX_EXPORT(WSASocketW), VX_EXPORT(closesocket), NET("bind", ws_bind),
     NET("connect", ws_connect), NET("listen", ws_listen), NET("accept", ws_accept), NET("send", ws_send), NET("recv", ws_recv),
     NET("sendto", ws_sendto), NET("recvfrom", ws_recvfrom), NET("shutdown", ws_shutdown), NET("getsockname", ws_getsockname),
-    NET("getpeername", ws_getpeername), VX_EXPORT(WSASend), VX_EXPORT(WSARecv), VX_EXPORT(WSASendTo), VX_EXPORT(WSARecvFrom),
+    NET("getpeername", ws_getpeername), VX_EXPORT(WSASend), VX_EXPORT(WSARecv), VX_EXPORT(WSASendTo), VX_EXPORT(WSASendMsg), VX_EXPORT(WSARecvFrom),
     VX_EXPORT(WSAIoctl), VX_EXPORT(GetAcceptExSockaddrs), NET("#1142", GetAcceptExSockaddrs), VX_EXPORT(AcceptEx), NET("#1141", AcceptEx),
     VX_EXPORT(WSAEventSelect), VX_EXPORT(WSAEnumNetworkEvents), VX_EXPORT(WSACreateEvent), VX_EXPORT(WSACloseEvent), VX_EXPORT(WSASetEvent),
     VX_EXPORT(WSAResetEvent), VX_EXPORT(WSAWaitForMultipleEvents), NET("setsockopt", ws_setsockopt),

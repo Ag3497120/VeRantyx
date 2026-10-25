@@ -3,6 +3,7 @@
 // jobs.c's), pipes, power status, version resources, device enumeration (setupapi), the multimedia wave API (no devices:
 // programs fall back to WASAPI or XAudio2), WinINet (no connections), IME. Each does what it can honestly do
 // here, or fails the way Windows does when the thing is absent.
+#include <malloc/malloc.h>
 #include "vx.h"
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -155,7 +156,7 @@ static WINAPI void *GlobalAlloc(DWORD flags, size_t n) { return flags & 0x40 ? v
 static WINAPI void *GlobalFree(void *p) { free(p); return NULL; }
 static WINAPI void *GlobalLock(void *p) { return p; }
 static WINAPI BOOL GlobalUnlock(void *p) { (void)p; return 1; }
-static WINAPI size_t GlobalSize(void *p) { (void)p; return 0; }
+static WINAPI size_t GlobalSize(void *p) { return p ? malloc_size(p) : 0; }   // (the block's size, rounded up as the heap gives it)
 static WINAPI DWORD SetThreadExecutionState(DWORD flags) { static DWORD previous = 0x80000000u; DWORD r = previous; previous = flags; return r; }
 // SYSTEM_POWER_STATUS: AC line, battery flag, percent, system status, lifetime, full lifetime.
 static WINAPI BOOL GetSystemPowerStatus(uint8_t *s) { memset(s, 0, 12); s[0] = 1; s[1] = 128; s[2] = 255; *(DWORD *)(s + 4) = *(DWORD *)(s + 8) = 0xffffffffu; return 1; }
@@ -290,11 +291,6 @@ static WINAPI HANDLE RegisterDeviceNotificationW(HANDLE recipient, void *filter,
 static WINAPI HANDLE RegisterDeviceNotificationA(HANDLE recipient, void *filter, DWORD flags) { (void)recipient; (void)filter; (void)flags; return &g_device_notification; }
 static WINAPI BOOL UnregisterDeviceNotification(HANDLE h) { (void)h; return 1; }
 // The clipboard: empty, and nothing can be put on it yet.
-static WINAPI BOOL EmptyClipboard(void) { return 1; }
-static WINAPI HANDLE GetClipboardData(DWORD format) { (void)format; vx_set_last_error(1418); return NULL; }
-static WINAPI HANDLE SetClipboardData(DWORD format, HANDLE data) { (void)format; (void)data; vx_set_last_error(1418); return NULL; }
-static WINAPI DWORD GetClipboardSequenceNumber(void) { return 0; }
-static WINAPI BOOL IsClipboardFormatAvailable(DWORD format) { (void)format; return 0; }
 // Icons from memory: an opaque object (the window keeps the default icon).
 static int g_icon;
 static WINAPI void *CreateIconIndirect(void *info) { (void)info; return &g_icon; }
@@ -337,10 +333,7 @@ static WINAPI unsigned wave_caps(uintptr_t id, void *caps, unsigned n) { (void)i
 static WINAPI unsigned waveOutGetErrorTextW(unsigned err, WCHAR *out, unsigned cap) { (void)err; vx_return_string_w("No sound device", out, cap); return 0; }
 
 // ---- imm32 extras ------------------------------------------------------------------------------------------------------------
-static WINAPI LONG ImmGetCompositionStringW(void *imc, DWORD index, void *buf, DWORD n) { (void)imc; (void)index; (void)buf; (void)n; return 0; }
-static WINAPI BOOL ImmSetCompositionStringW(void *imc, DWORD index, const void *a, DWORD an, const void *b, DWORD bn) { (void)imc; (void)index; (void)a; (void)an; (void)b; (void)bn; return 0; }
-static WINAPI BOOL ImmSetCompositionWindow(void *imc, void *form) { (void)imc; (void)form; return 1; }
-static WINAPI BOOL ImmNotifyIME(void *imc, DWORD action, DWORD index, DWORD value) { (void)imc; (void)action; (void)index; (void)value; return 1; }
+// (the composition: src/ime.c)
 static WINAPI DWORD ImmGetCandidateListW(void *imc, DWORD index, void *list, DWORD n) { (void)imc; (void)index; (void)list; (void)n; return 0; }
 static WINAPI unsigned ImmGetIMEFileNameA(void *hkl, char *out, unsigned cap) { (void)hkl; if (out && cap) out[0] = 0; return 0; }
 static WINAPI unsigned ImmGetIMEFileNameW(void *hkl, WCHAR *out, unsigned cap) { (void)hkl; if (out && cap) out[0] = 0; return 0; }
@@ -479,8 +472,7 @@ static const vx_export user32[] = {
     VX_EXPORT(IsRectEmpty), VX_EXPORT(GetMessageExtraInfo), VX_EXPORT(GetTopWindow), VX_EXPORT(FlashWindow),
     VX_EXPORT(FlashWindowEx), VX_EXPORT(SetWindowRgn), VX_EXPORT(WaitForInputIdle),
     VX_EXPORT(ToUnicode), VX_EXPORT(RegisterDeviceNotificationW), VX_EXPORT(RegisterDeviceNotificationA),
-    VX_EXPORT(UnregisterDeviceNotification), VX_EXPORT(EmptyClipboard), VX_EXPORT(GetClipboardData), VX_EXPORT(SetClipboardData),
-    VX_EXPORT(GetClipboardSequenceNumber), VX_EXPORT(IsClipboardFormatAvailable), VX_EXPORT(CreateIconIndirect),
+    VX_EXPORT(UnregisterDeviceNotification), VX_EXPORT(CreateIconIndirect),
     VX_EXPORT(CreateIconFromResource), VX_EXPORT(CreateIconFromResourceEx), VX_EXPORT(DestroyIcon), VX_EXPORT(DialogBoxParamA),
     VX_EXPORT(DialogBoxParamW), VX_EXPORT(DialogBoxIndirectParamW), VX_EXPORT(EndDialog), VX_EXPORT(GetDlgItem),
     VX_EXPORT(GetDlgItemInt), VX_EXPORT(SetDlgItemInt), VX_EXPORT(GetDlgItemTextA), VX_EXPORT(SetDlgItemTextA),
@@ -501,7 +493,6 @@ static const vx_export winmm[] = {
     { "waveInStart", (void *)wave_none }, { "waveInReset", (void *)wave_none },
 };
 static const vx_export imm32[] = {
-    VX_EXPORT(ImmGetCompositionStringW), VX_EXPORT(ImmSetCompositionStringW), VX_EXPORT(ImmSetCompositionWindow), VX_EXPORT(ImmNotifyIME),
     VX_EXPORT(ImmGetCandidateListW), VX_EXPORT(ImmGetIMEFileNameA), VX_EXPORT(ImmGetIMEFileNameW),
 };
 static const vx_export wininet[] = {

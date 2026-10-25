@@ -723,7 +723,10 @@ static int describe(HANDLE h, object_facts *f) {
     if (v == -1) { f->type = "Process"; f->access = 0x1fffff; f->handles = 1; return 1; }
     int fd = vx_handle_fd(h);
     if (fd >= 0) {                                    // a file: \Device\HarddiskVolumeN\path (QueryDosDevice's devices)
-        f->type = "File"; f->access = 0x1f01ff; f->handles = 1;
+        // the access it was opened with, as Windows grants what CreateFile asked for: reading (FILE_GENERIC_READ),
+        // writing (FILE_GENERIC_WRITE) or both. Chromium checks that a file it hands on as read-only cannot be written.
+        int mode = fd > 2 ? fcntl(fd, F_GETFL) & O_ACCMODE : O_RDWR;
+        f->type = "File"; f->access = mode == O_RDONLY ? 0x120089 : mode == O_WRONLY ? 0x120116 : 0x12019f; f->handles = 1;
         char unix_path[1024], win[1100];
         if (fd > 2 && !fcntl(fd, F_GETPATH, unix_path)) {
             vx_windows_path(unix_path, win, sizeof win);
