@@ -1007,7 +1007,78 @@ static WINAPI DWORD WaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, 
     }
     return r;
 }
+// VXRT_WAIT_DUMP=<s1>[,<s2>...]: at those seconds after the first wait, the log lists the threads that have been
+// waiting for over 3 seconds: the thread's name, what it waits for (the first object's type and name, the timeout)
+// and the program's return addresses on its stack. A thread blocked for good (a deadlock, a wake-up that never came)
+// shows up there.
+typedef struct wait_note { DWORD tid, n, ms; uint64_t since; int type; char name[96], from[200]; struct wait_note *next; } wait_note;
+static wait_note *g_wait_notes;
+static pthread_mutex_t g_wait_notes_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_wait_dump = -1;
+static __thread wait_note *t_wait_note;
+static void *wait_dumper(void *arg) {
+    char *p = arg;
+    uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    while (*p) {
+        double at = strtod(p, &p);
+        while (*p == ',') p++;
+        uint64_t when = start + (uint64_t)(at * 1e9), now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (when > now) usleep((useconds_t)((when - now) / 1000));
+        now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        pthread_mutex_lock(&g_wait_notes_lock);
+        for (wait_note *w = g_wait_notes; w; w = w->next)
+            if (w->since && now - w->since > 3000000000ull)
+                vx_log("wait dump at %.0f s: thread %u waiting %.1f s for %u object(s), first of type %d '%s' (timeout %d), from%s",
+                       at, (unsigned)w->tid, (now - w->since) / 1e9, (unsigned)w->n, w->type, w->name, (int)w->ms, w->from);
+        pthread_mutex_unlock(&g_wait_notes_lock);
+        if (!at) break;
+    }
+    return NULL;
+}
+static void wait_note_begin(DWORD n, DWORD ms, vx_object *first) {
+    if (!t_wait_note) {
+        wait_note *w = calloc(1, sizeof *w);
+        w->tid = vx_current_tid();
+        pthread_mutex_lock(&g_wait_notes_lock);
+        w->next = g_wait_notes; g_wait_notes = w;
+        pthread_mutex_unlock(&g_wait_notes_lock);
+        t_wait_note = w;
+    }
+    wait_note *w = t_wait_note;
+    char tname[48] = "";
+    pthread_getname_np(pthread_self(), tname, sizeof tname);
+    char from[200] = ""; size_t len = 0;
+    uint64_t *sp = __builtin_frame_address(0);
+    for (int i = 0, found = 0; i < 600 && found < 5 && len < sizeof from; i++) {
+        const vx_image *m = vx_image_at(sp[i]);
+        if (!m) continue;
+        len += (size_t)snprintf(from + len, sizeof from - len, " %s+%#llx", m->name, (unsigned long long)(sp[i] - (uint64_t)(uintptr_t)m->base));
+        found++;
+    }
+    pthread_mutex_lock(&g_wait_notes_lock);
+    w->n = n; w->ms = ms; w->type = first ? first->type : 0;
+    snprintf(w->name, sizeof w->name, "%s', thread '%s", first && first->name ? first->name : "", tname);
+    memcpy(w->from, from, sizeof from);
+    w->since = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    pthread_mutex_unlock(&g_wait_notes_lock);
+}
+static DWORD wait_objects_inner(DWORD n, const HANDLE *hs, BOOL all, DWORD ms);
 static DWORD wait_objects(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
+    if (g_wait_dump < 0) {
+        const char *e = getenv("VXRT_WAIT_DUMP");
+        g_wait_dump = e && *e;
+        if (g_wait_dump) { pthread_t t; pthread_create(&t, NULL, wait_dumper, strdup(e)); pthread_detach(t); }
+    }
+    if (!g_wait_dump || ms == 0 || !n || n > 64) return wait_objects_inner(n, hs, all, ms);
+    glock();
+    vx_object *first = lookup(hs[0]);
+    gunlock();
+    wait_note_begin(n, ms, first);
+    DWORD r = wait_objects_inner(n, hs, all, ms);
+    t_wait_note->since = 0;
+    return r;
+}
+static DWORD wait_objects_inner(DWORD n, const HANDLE *hs, BOOL all, DWORD ms) {
     if (!n || n > 64) { vx_set_last_error(87); return WAIT_FAILED; }
     DWORD tid = vx_current_tid();
     struct timespec deadline;
@@ -1421,6 +1492,10 @@ static WINAPI BOOL DuplicateHandle(HANDLE src_process, HANDLE src, HANDLE dst_pr
     *dst = h;
     if (options & 1 /* DUPLICATE_CLOSE_SOURCE */) CloseHandle(src);
     return h != NULL;
+}
+HANDLE vx_handle_dup(HANDLE h) {
+    HANDLE d = NULL;
+    return DuplicateHandle((HANDLE)(intptr_t)-1, h, (HANDLE)(intptr_t)-1, &d, 0, 0, 2 /* DUPLICATE_SAME_ACCESS */) ? d : NULL;
 }
 
 // ---- critical sections and SRW locks -------------------------------------------------------------------------------------

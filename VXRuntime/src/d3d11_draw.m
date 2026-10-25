@@ -35,7 +35,7 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *iface)
         d3d_addref(self_of(this)); *out = this; return S_OK;
     }
     *out = NULL;
-    return E_NOINTERFACE;
+    return d3d_no_interface("pipeline object", iid);
 }
 
 // ---- shaders ------------------------------------------------------------------------------------------------------------
@@ -2409,6 +2409,7 @@ static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t
         if (!c->pre) {
             id<MTLCommandBuffer> pre = [(__bridge id<MTLCommandQueue>)c->base.dev->queue commandBuffer];
             c->pre = (void *)CFBridgingRetain(pre);
+            D3D_RECORDING(c);
             c->pre_enc = (void *)CFBridgingRetain([pre computeCommandEncoder]);
         }
         enc = (__bridge id<MTLComputeCommandEncoder>)c->pre_enc;

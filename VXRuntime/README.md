@@ -31,6 +31,8 @@ VXRT_TRACE_KEYED=1 VXRT_SHARED_SNAPSHOT=f.png ...              # keyed mutex tra
 VXRT_TRACE_DRAWS=trigger VXRT_DRAW_SNAPSHOT=<ps hash>:prefix ... # 300 draws after the trigger file appears; a pixel shader's inputs as PNGs
 VXRT_STEAM_BRIDGE=1 VXRT_TRACE_STEAM=1 ... # Windows games use the Mac Steam client (log: interfaces, first calls, callbacks)
 VXRT_TRACE_TEXTURES=1 ...                  # every Direct3D texture made
+VXRT_TRACE_QI=1 ...                        # each interface a Direct3D/DXGI object was asked for and does not have
+VXRT_WAIT_DUMP=15,30 ...                   # at 15 and 30 s: the threads waiting for over 3 s, for what, from where
 VXRT_SYNC_SHADERS=1 ...                    # compile each shader before CreateXShader returns (not in the background)
 VXRT_STATS=1 ...                           # keyed mutex waits and hold times, Map waits, GPU busy time, every few seconds
 VXRT_LOG_TIME=1 ...                        # log lines carry the time of day (the same clock in every process)
@@ -110,6 +112,27 @@ classic event log (no records), `WSASendMsg`, touch injection (none here: `ERROR
 `ShutdownBlockReasonCreate`, `SHOpenWithDialog` (no such dialog here), `Beep`, `SetLocalTime` (no privilege). The 32-bit
 `gldriverquery.exe` and `vulkandriverquery.exe` Steam starts are refused by CreateProcess with `ERROR_BAD_EXE_FORMAT`
 before any process starts (Steam logs "Failed to launch executable" and goes on; it uses the 64-bit ones' answers).
+
+GPU path (stage3/angle): `--single-process`, which Chromium needs here because its child processes are handed handles between processes,
+comes from `VXRT_EXTRA_ARGS` (`src/launchargs.c`), so neither Steam's files nor the Wine version's
+`steamwebhelper.exe` shim are involved. Where it stops today (2026-10-25, client 1792618285 of 2026-10-21): `steam.exe`
+runs on (past Steam's SteamVR check, 88 s of 88 in every run since `OpenThread` finds every running thread; before, it
+ended itself about 10 s in: tier0 freed the main thread's data when it could not open it), loads `steamclient64.dll`
+once the Steam Service Error box is closed (its connectivity test passes, logged off), and the web helper creates
+Steam's shared JS context (`logs/steamui_html.txt`: `BrowserReady`; its page loads, `webhelper_js.txt` ends at
+"setting locale: en"). With Steam's `-cef-disable-gpu` (the launch script's default) the web helper composites in
+software and draws the "Sign in to Steam" window through GDI. Without it, the GPU side works as far as the EGL
+display since 2026-10-25: Steam's ANGLE makes its EGL display and GLES 3 contexts on our Direct3D 11 (the screen's DC
+belongs to the desktop window, IDXGIDevice2-4, the adapter's driver version; before, every EGL display type failed
+and "Failed to create shared context for virtualization" came about 100 times a second; 0 of them now). The login
+window is created but stays black on that path (run of 2026-10-25, 115 s): `eglCreateWindowSurface` fails with
+`EGL_BAD_ALLOC` (ANGLE: "Could not create additional swap chains or offscreen surfaces, HRESULT: 0x80004005"), and
+`CreateSwapChainForHwnd` on a child window does fail here with E_FAIL (a swap chain needs the window's own Mac
+window, `vx_cocoa_metal_layer`; only top-level windows have one); `steam.exe` restarts the helper twice ("Restart
+webhelper process, counter 2") and then turns GPU acceleration off ("Disabling GPU acceleration: Disabled/
+RuntimeDetect"). Swap chains on child windows are the next step for the GPU path. Seen before stage 2's network
+fixes: Chromium's DevTools server (Steam's `-cef-enable-debugging`) listened on 127.0.0.1:8080 but never answered
+(no WSAEnumNetworkEvents for its FD_ACCEPT event).
 
 Steam updates itself here as on Windows (2026-10-25: from the 2026-09-03 client, 1788652215, to 1792618285, Valve's
 download). Those runs were made in `~/Verantyx_VR_Drive/vxrt_wsteam` itself, not in a copy, two of them with

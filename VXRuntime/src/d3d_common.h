@@ -2,7 +2,7 @@
 //
 // Every Direct3D object is a COM object: a pointer to a method table laid out like its interface (see
 // d3d_tables.h), then the object's state. An object may expose a second interface through a second table
-// pointer (the device is also an IDXGIDevice1). Methods are called with `this` pointing at the table pointer.
+// pointer (the device is also an IDXGIDevice4). Methods are called with `this` pointing at the table pointer.
 #ifndef VX_D3D_COMMON_H
 #define VX_D3D_COMMON_H
 #import <Metal/Metal.h>
@@ -14,6 +14,7 @@
 typedef int32_t HRESULT;
 typedef struct { DWORD d1; uint16_t d2, d3; uint8_t d4[8]; } GUID;
 HRESULT d3d_not_implemented(const char *what);    // reports a method once, returns E_NOTIMPL
+HRESULT d3d_no_interface(const char *what, const GUID *iid);   // E_NOINTERFACE; VXRT_TRACE_QI=1 logs the interface asked for
 
 #define S_OK 0
 #define S_FALSE 1
@@ -73,7 +74,7 @@ int            d3d_copy_format_block(uint32_t dxgi, uint32_t *block_width, uint3
 enum { TD_WIDTH, TD_HEIGHT, TD_MIPS, TD_ARRAY, TD_FORMAT, TD_SAMPLES, TD_QUALITY, TD_USAGE, TD_BIND, TD_CPU, TD_MISC, TD_COUNT };
 
 struct d3d_device {
-    d3d_object base;                 // ID3D11Device, and IDXGIDevice1 through vtbl2
+    d3d_object base;                 // ID3D11Device, and IDXGIDevice4 through vtbl2
     void *mtl;                       // id<MTLDevice> (retained)
     void *queue;                     // id<MTLCommandQueue> (retained)
     d3d_object *context;             // the immediate context
@@ -85,6 +86,11 @@ struct d3d_device {
     volatile uint64_t gpu_end_seq[64], gpu_end_ns[64];   // when the GPU finished recent command buffers (by sequence
                                                          // number, host clock ns): timestamp queries (d3d11_draw.m)
     d3d_object *on12;                // D3D11On12 devices: the ID3D11On12Device object (d3d11on12.m), else NULL
+    // IDXGIDevice2::EnqueueSetEvent calls made while the immediate context held work recorded by another thread and
+    // not sent yet (d3d11.m): their events (handles duplicated at the call), set once the flush that sends that work
+    // has it done on the GPU.
+    HANDLE *events_after_flush;
+    uint32_t nevents_after_flush, events_after_flush_cap;
 };
 uint64_t d3d_gpu_end_ns(d3d_device *dev, uint64_t seq);  // that time, or 0 if not known (d3d11.m)
 int d3d_apple_family(void *mtl_device);   // d3d11.m
@@ -138,7 +144,12 @@ typedef struct {
     // Geometry-shader kernels whose inputs the CPU wrote run in a command buffer of their own (pre, with one open
     // compute encoder pre_enc), committed before cmd: the render pass in progress need not end for them.
     void *pre, *pre_enc;
+    // The thread that last recorded work not yet sent (a command buffer, a pending clear, a geometry pre-pass).
+    // IDXGIDevice2::EnqueueSetEvent sends that work only when called on this thread: the immediate context is not
+    // free-threaded and has no lock of its own. Called on another thread, its event waits for that work's flush.
+    uintptr_t recorder;
 } d3d_context;
+#define D3D_RECORDING(c) __atomic_store_n(&(c)->recorder, (uintptr_t)pthread_self(), __ATOMIC_RELAXED)
 void d3d_clears_flush(d3d_context *c);                                   // does the pending clears as passes of their own
 int d3d_same_target(const d3d_view *a, const d3d_view *b);              // d3d11.m: the same subresource, as the same format
 int d3d_pass_dump_begin(void);                                            // VXRT_PASS_DUMP: whether to list this pass

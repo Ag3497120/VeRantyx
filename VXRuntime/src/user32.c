@@ -20,7 +20,7 @@
 #define CW_USEDEFAULT ((int)0x80000000)
 #define HWND_BASE     0x30000
 #define MAX_WINDOWS   16384
-#define HWND_DESKTOP_VALUE ((HANDLE)(intptr_t)0x10010)
+#define HWND_DESKTOP_VALUE VX_HWND_DESKTOP
 
 typedef struct { HANDLE hwnd; uint32_t message; WPARAM wparam; LPARAM lparam; DWORD time; POINT pt; DWORD priv; } MSG;
 _Static_assert(sizeof(MSG) == 48, "MSG");

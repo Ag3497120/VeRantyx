@@ -28,6 +28,19 @@ HRESULT d3d_not_implemented(const char *what) {
     if (!known) vx_log("Direct3D: %s is not implemented yet", what);
     return E_NOTIMPL;
 }
+// QueryInterface for an interface an object does not have. VXRT_TRACE_QI=1 logs which (once per object kind and IID):
+// what a program asks for and does not get is often why it gives up on Direct3D.
+HRESULT d3d_no_interface(const char *what, const GUID *iid) {
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_TRACE_QI") != NULL;
+    if (on && iid) {
+        char key[96];
+        snprintf(key, sizeof key, "%s QueryInterface {%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}", what, iid->d1, iid->d2, iid->d3,
+                 iid->d4[0], iid->d4[1], iid->d4[2], iid->d4[3], iid->d4[4], iid->d4[5], iid->d4[6], iid->d4[7]);
+        d3d_not_implemented(key);
+    }
+    return E_NOINTERFACE;
+}
 void **d3d_vtable(const char *const *names, void *const *stubs, int count, const d3d_method *impl) {
     void **vt = calloc((size_t)count, sizeof(void *));
     for (int i = 0; i < count; i++) {
@@ -195,7 +208,9 @@ static HRESULT query(void *this, const GUID *iid, void **out, const GUID *const 
     for (int i = 0; i < n; i++)
         if (d3d_same_guid(iid, known[i])) { d3d_addref(self_of(this)); *out = this; return S_OK; }
     *out = NULL;
-    return E_NOINTERFACE;
+    static const char *const kinds[] = { "device", "context", "texture", "buffer", "render target view", "depth stencil view",
+                                         "shader resource view", "swap chain", "factory", "adapter", "output", "shader", "layout", "state", "UAV" };
+    return d3d_no_interface(kinds[self_of(this)->kind % 15], iid);
 }
 
 // ---- textures -------------------------------------------------------------------------------------------------------------------
@@ -497,7 +512,7 @@ static d3d_view *make_view(d3d_device *dev, int kind, void **vtbl, d3d_object *r
 
 // ---- the immediate context ----------------------------------------------------------------------------------------------------------
 static id<MTLCommandBuffer> raw_cmd(d3d_context *c) {
-    if (!c->cmd) c->cmd = (void *)CFBridgingRetain([(__bridge id<MTLCommandQueue>)c->base.dev->queue commandBuffer]);
+    if (!c->cmd) { c->cmd = (void *)CFBridgingRetain([(__bridge id<MTLCommandQueue>)c->base.dev->queue commandBuffer]); D3D_RECORDING(c); }
     return (__bridge id<MTLCommandBuffer>)c->cmd;
 }
 // The command buffer to encode into; clears still pending go first (whatever comes may read their targets).
@@ -671,8 +686,33 @@ void d3d_flush(d3d_device *dev, int wait) {
     if (t_pool) objc_autoreleasePoolPop(t_pool);
     t_pool = objc_autoreleasePoolPush();
 }
+// EnqueueSetEvent's events. g_events_lock is held from the moment a flush starts sending the immediate context's work
+// until that work is committed and the events waiting for it are queued behind it, and by EnqueueSetEvent while it
+// looks at what is unsent: a call then either sees the work still unsent (and its event waits for this flush), or
+// finds it committed already (and its own command buffer goes after it).
+static pthread_mutex_t g_events_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+// Sets the events (handles of their own, duplicated at the call) and closes those handles once a command buffer
+// committed now has finished: Metal runs one queue's command buffers in order, so everything committed to the queue
+// before it has finished too. Takes over the array.
+static void set_events_when_done(d3d_device *dev, HANDLE *events, uint32_t n) {
+    id<MTLCommandBuffer> marker = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
+    [marker addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        for (uint32_t i = 0; i < n; i++) { vx_set_event(events[i]); vx_handle_close(events[i]); }
+        free(events);
+    }];
+    [marker commit];
+}
+static void events_after_flush(d3d_device *dev) {          // (g_events_lock held)
+    if (!dev->nevents_after_flush) return;
+    HANDLE *events = dev->events_after_flush;
+    uint32_t n = dev->nevents_after_flush;
+    dev->events_after_flush = NULL; dev->nevents_after_flush = dev->events_after_flush_cap = 0;
+    set_events_when_done(dev, events, n);
+}
 static void flush_work(d3d_device *dev, int wait) {
     d3d_context *c = (d3d_context *)dev->context;
+    pthread_mutex_lock(&g_events_lock);
     d3d_end_render(c);
     if (c->nclears) d3d_clears_flush(c);
     if (c->pre) {                                               // (before the work that reads what it made)
@@ -683,6 +723,8 @@ static void flush_work(d3d_device *dev, int wait) {
         [pre commit];
     }
     if (!c->cmd) {
+        events_after_flush(dev);
+        pthread_mutex_unlock(&g_events_lock);
         if (wait) {                                             // still wait for work committed earlier
             id<MTLCommandBuffer> fence = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
             [fence commit];
@@ -708,6 +750,8 @@ static void flush_work(d3d_device *dev, int wait) {
     }];
     d3d_gpu_profile_submit(dev, (__bridge void *)cmd);
     [cmd commit];
+    events_after_flush(dev);
+    pthread_mutex_unlock(&g_events_lock);
     pthread_mutex_lock(&g_recent_lock);
     void *old = g_recent[seq % RECENT];
     g_recent[seq % RECENT] = (void *)CFBridgingRetain(cmd); g_recent_seq[seq % RECENT] = seq; g_recent_dev[seq % RECENT] = dev;
@@ -861,6 +905,7 @@ static void clear_later(d3d_context *c, d3d_view *v, const float *color, int dep
         return;
     }
     if (c->nclears == 9) d3d_clears_flush(c);
+    D3D_RECORDING(c);
     d3d_pending_clear *p = &c->clears[c->nclears++];
     memset(p, 0, sizeof *p);
     p->v = v; d3d_addref(&v->base);
@@ -886,6 +931,7 @@ static void discard_later(d3d_context *c, d3d_view *v, d3d_object *res) {
     if ((v ? v->resource : res)->kind != K_TEXTURE) return;
     if (c->nclears == 9) d3d_clears_flush(c);
     d3d_end_render(c);
+    D3D_RECORDING(c);
     d3d_pending_clear *p = &c->clears[c->nclears++];
     memset(p, 0, sizeof *p);
     p->discard = 1; p->v = v; p->res = v ? NULL : res;
@@ -1559,12 +1605,13 @@ static WINAPI HRESULT device_qi(void *this, const GUID *iid, void **out) {
     d3d_device *d = dev_of(this);
     if (!out) return E_POINTER;
     if (d3d_same_guid(iid, &IID_IUnknown_) || d3d_same_guid(iid, &IID_ID3D11Device) || d3d_same_guid(iid, &IID_ID3D11Device1)) { d3d_addref(&d->base); *out = &d->base.vtbl; return S_OK; }
-    if (d3d_same_guid(iid, &IID_IDXGIObject) || d3d_same_guid(iid, &IID_IDXGIDevice) || d3d_same_guid(iid, &IID_IDXGIDevice1)) {
+    if (d3d_same_guid(iid, &IID_IDXGIObject) || d3d_same_guid(iid, &IID_IDXGIDevice) || d3d_same_guid(iid, &IID_IDXGIDevice1) ||
+        d3d_same_guid(iid, &IID_IDXGIDevice2) || d3d_same_guid(iid, &IID_IDXGIDevice3) || d3d_same_guid(iid, &IID_IDXGIDevice4)) {
         d3d_addref(&d->base); *out = &d->base.vtbl2; return S_OK;
     }
     if (d->on12) return d3d11on12_query(d, iid, out);
     *out = NULL;
-    return E_NOINTERFACE;
+    return d3d_no_interface("device", iid);
 }
 static WINAPI uint32_t device_addref(void *this) { return d3d_addref(this); }
 static WINAPI uint32_t device_release(void *this) { return d3d_release(this); }
@@ -1686,7 +1733,7 @@ static WINAPI HRESULT device_get_private(void *this, const GUID *g, uint32_t *si
 static WINAPI HRESULT device_set_private(void *this, const GUID *g, uint32_t size, const void *data) { return d3d_set_private(this, g, size, data); }
 static WINAPI HRESULT device_set_private_interface(void *this, const GUID *g, void *unk) { (void)unk; return d3d_set_private(this, g, 0, NULL); }
 
-// The device seen as an IDXGIDevice1.
+// The device seen as an IDXGIDevice4.
 static WINAPI HRESULT dxgidev_qi(void *this, const GUID *iid, void **out) { return device_qi(FROM_VTBL2(this), iid, out); }
 static WINAPI uint32_t dxgidev_addref(void *this) { return d3d_addref(FROM_VTBL2(this)); }
 static WINAPI uint32_t dxgidev_release(void *this) { return d3d_release(FROM_VTBL2(this)); }
@@ -1709,6 +1756,67 @@ static WINAPI HRESULT dxgidev_get_latency(void *this, uint32_t *n) { *n = ((d3d_
 static WINAPI HRESULT dxgidev_set_priority(void *this, int p) { (void)this; (void)p; return S_OK; }
 static WINAPI HRESULT dxgidev_get_priority(void *this, int *p) { (void)this; *p = 0; return S_OK; }
 static WINAPI HRESULT dxgidev_residency(void *this, void *const *res, uint32_t *status, uint32_t n) { (void)this; (void)res; for (uint32_t i = 0; i < n; i++) status[i] = 1; return S_OK; }
+// IDXGIDevice2..4 (DXGI 1.2, 1.3, 1.5): offering resources lets the system drop their contents under memory pressure;
+// nothing is dropped here, so every reclaimed resource still has its contents (ReclaimResources: discarded FALSE,
+// ReclaimResources1: DXGI_RECLAIM_RESOURCE_RESULT_OK). Trim frees driver caches: Metal has none to give back.
+static WINAPI HRESULT dxgidev_offer(void *this, uint32_t n, void *const *res, uint32_t priority) {
+    (void)this;
+    if (n && !res) return E_INVALIDARG;
+    return priority >= 1 && priority <= 3 ? S_OK : E_INVALIDARG;            // DXGI_OFFER_RESOURCE_PRIORITY_LOW..HIGH
+}
+static WINAPI HRESULT dxgidev_offer1(void *this, uint32_t n, void *const *res, uint32_t priority, uint32_t flags) {
+    (void)flags;
+    return dxgidev_offer(this, n, res, priority);
+}
+static WINAPI HRESULT dxgidev_reclaim(void *this, uint32_t n, void *const *res, int32_t *discarded) {
+    (void)this;
+    if (n && !res) return E_INVALIDARG;
+    if (discarded) for (uint32_t i = 0; i < n; i++) discarded[i] = 0;
+    return S_OK;
+}
+static WINAPI HRESULT dxgidev_reclaim1(void *this, uint32_t n, void *const *res, uint32_t *results) {
+    (void)this;
+    if (n && !res) return E_INVALIDARG;
+    if (results) for (uint32_t i = 0; i < n; i++) results[i] = 0;
+    return S_OK;
+}
+// EnqueueSetEvent: returns at once; the event is set once all work submitted before the call, on any thread, has
+// finished on the GPU. The handle is duplicated now and that duplicate is the one set, then closed: the caller may
+// close its handle (and the value be handed to another object) before the GPU is done.
+// Work committed to the device's queue so far: an empty command buffer committed after it sets the event when done
+// (Metal runs one queue's command buffers in order). Work the immediate context has recorded and not sent: sent now
+// when this thread recorded it (or nobody did); recorded on another thread, it is left to that thread (the context
+// has no lock: sending it from here could end its encoder while it encodes), and the event is set once the flush
+// that sends it (Flush, Present, Map, a full command buffer) has it done on the GPU, never before.
+static WINAPI HRESULT dxgidev_enqueue_set_event(void *this, HANDLE event) {
+    if (!event) return E_INVALIDARG;
+    HANDLE own = vx_handle_dup(event);
+    if (!own) return E_INVALIDARG;
+    d3d_device *dev = (d3d_device *)FROM_VTBL2(this);
+    d3d_context *c = (d3d_context *)dev->context;
+    pthread_mutex_lock(&g_events_lock);
+    int unsent = __atomic_load_n(&c->cmd, __ATOMIC_RELAXED) || __atomic_load_n(&c->pre, __ATOMIC_RELAXED) ||
+                 __atomic_load_n(&c->nclears, __ATOMIC_RELAXED);
+    uintptr_t rec = __atomic_load_n(&c->recorder, __ATOMIC_RELAXED);
+    if (unsent && (!rec || rec == (uintptr_t)pthread_self())) { d3d_flush(dev, 0); unsent = 0; }
+    if (unsent) {
+        if (dev->nevents_after_flush == dev->events_after_flush_cap) {
+            uint32_t cap = dev->events_after_flush_cap ? dev->events_after_flush_cap * 2 : 4;
+            HANDLE *grown = realloc(dev->events_after_flush, cap * sizeof *grown);
+            if (!grown) { pthread_mutex_unlock(&g_events_lock); vx_handle_close(own); return E_OUTOFMEMORY; }
+            dev->events_after_flush = grown; dev->events_after_flush_cap = cap;
+        }
+        dev->events_after_flush[dev->nevents_after_flush++] = own;
+    } else {
+        HANDLE *one = malloc(sizeof *one);
+        if (!one) { pthread_mutex_unlock(&g_events_lock); vx_handle_close(own); return E_OUTOFMEMORY; }
+        *one = own;
+        set_events_when_done(dev, one, 1);
+    }
+    pthread_mutex_unlock(&g_events_lock);
+    return S_OK;
+}
+static WINAPI void dxgidev_trim(void *this) { (void)this; }
 static WINAPI HRESULT dxgidev_get_private(void *this, const GUID *g, uint32_t *size, void *data) { return d3d_get_private(FROM_VTBL2(this), g, size, data); }
 static WINAPI HRESULT dxgidev_set_private(void *this, const GUID *g, uint32_t size, const void *data) { return d3d_set_private(FROM_VTBL2(this), g, size, data); }
 
@@ -1780,7 +1888,10 @@ static void make_tables(void) {
         { "SetMaximumFrameLatency", (void *)dxgidev_set_latency }, { "GetMaximumFrameLatency", (void *)dxgidev_get_latency },
         { "SetGPUThreadPriority", (void *)dxgidev_set_priority }, { "GetGPUThreadPriority", (void *)dxgidev_get_priority },
         { "QueryResourceResidency", (void *)dxgidev_residency }, { "GetPrivateData", (void *)dxgidev_get_private },
-        { "SetPrivateData", (void *)dxgidev_set_private }, { NULL, NULL } };
+        { "SetPrivateData", (void *)dxgidev_set_private }, { "OfferResources", (void *)dxgidev_offer },
+        { "ReclaimResources", (void *)dxgidev_reclaim }, { "EnqueueSetEvent", (void *)dxgidev_enqueue_set_event },
+        { "Trim", (void *)dxgidev_trim }, { "OfferResources1", (void *)dxgidev_offer1 }, { "ReclaimResources1", (void *)dxgidev_reclaim1 },
+        { NULL, NULL } };
     g_texture_vtbl = D3D_VTABLE(ID3D11Texture2D, texture);
     g_texture1d_vtbl = D3D_VTABLE(ID3D11Texture1D, texture1d);
     g_texture3d_vtbl = D3D_VTABLE(ID3D11Texture3D, texture3d);
@@ -1790,7 +1901,7 @@ static void make_tables(void) {
     g_srv_vtbl = D3D_VTABLE(ID3D11ShaderResourceView, srv);
     g_context_vtbl = D3D_VTABLE(ID3D11DeviceContext1, context);   // the 11.1 interfaces: their new methods report themselves
     g_device_vtbl = D3D_VTABLE(ID3D11Device1, device);
-    g_dxgidev_vtbl = D3D_VTABLE(IDXGIDevice1, dxgidev);
+    g_dxgidev_vtbl = D3D_VTABLE(IDXGIDevice4, dxgidev);
     d3d_draw_init();
     D3D_VTABLE_OVERRIDE(g_device_vtbl, ID3D11Device, d3d_draw_device_methods);
     D3D_VTABLE_OVERRIDE(g_context_vtbl, ID3D11DeviceContext, d3d_draw_context_methods);

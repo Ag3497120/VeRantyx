@@ -109,6 +109,7 @@ void vx_mouse_button(int vk, int down);                   // VK_LBUTTON etc. sta
 void vx_raw_mouse(int dx, int dy, uint16_t button_flags, int16_t wheel);   // WM_INPUT for raw-input programs
 LRESULT vx_send_message(HANDLE hwnd, uint32_t msg, WPARAM wp, LPARAM lp);
 int vx_virtual_screen(RECT *r);                           // main display, Windows coordinates
+#define VX_HWND_DESKTOP ((HANDLE)(intptr_t)0x10010)        // GetDesktopWindow(): the screen's window (user32.c, gdi.c)
 
 // user32.c, for control.c (Command Clips)
 char  *vx_ui_state(int texts);                            // the windows (and their text) as JSON (malloc'd)

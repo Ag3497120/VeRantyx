@@ -45,6 +45,7 @@ typedef struct gdi_obj {
     uint32_t palette[256], masks[3];
     int dib; HANDLE section; DWORD offset; void *view;        //   a DIB section; its file mapping's view (unmapped with it)
     vx_window *w;                                             // DC: a window's client area,
+    int screen;                                               //   or the screen's (the desktop window's: GetDC(NULL)),
     HANDLE bitmap, brush, pen, font;                          //   or the bitmap selected into a memory DC
     uint32_t text_color, bk_color, dc_brush, dc_pen, text_align;
     int bk_mode, map_mode, stretch_mode, graphics_mode;
@@ -334,8 +335,11 @@ void vx_dc_release(HANDLE h) {
     if (w) vx_present_dc_released(w);
 }
 
+// The screen's DC (no window, or the desktop window): answers questions, draws nothing. It is the desktop window's DC,
+// so WindowFromDC gives that window (Chromium's ANGLE takes GetDC(NULL) as its EGL native display and refuses a DC
+// that WindowFromDC finds no window for: eglGetPlatformDisplay gave EGL_NO_DISPLAY, and Steam's web helper had no GL).
 static WINAPI HANDLE GetDC(HANDLE hwnd) {
-    if (!hwnd) return new_obj(new_dc(OBJ_DC, NULL));          // the screen: answers questions, draws nothing
+    if (!hwnd || hwnd == VX_HWND_DESKTOP) { gdi_obj *d = new_dc(OBJ_DC, NULL); d->screen = 1; return new_obj(d); }
     vx_window *w = vx_window_get(hwnd);
     return w ? vx_dc_for_window(w) : NULL;
 }
@@ -383,8 +387,9 @@ static WINAPI HANDLE CreateCompatibleDC(HANDLE dc) {
     d->bitmap = g_default_bitmap;
     return new_obj(d);
 }
-static WINAPI HANDLE CreateDCA(const char *drv, const char *dev, const char *out, const void *dm) { (void)drv; (void)dev; (void)out; (void)dm; return GetDC(NULL); }
-static WINAPI HANDLE CreateDCW(const WCHAR *drv, const WCHAR *dev, const WCHAR *out, const void *dm) { (void)drv; (void)dev; (void)out; (void)dm; return GetDC(NULL); }
+// A display DC: the screen's, but no window's (WindowFromDC gives none).
+static WINAPI HANDLE CreateDCA(const char *drv, const char *dev, const char *out, const void *dm) { (void)drv; (void)dev; (void)out; (void)dm; return new_obj(new_dc(OBJ_DC, NULL)); }
+static WINAPI HANDLE CreateDCW(const WCHAR *drv, const WCHAR *dev, const WCHAR *out, const void *dm) { (void)drv; (void)dev; (void)out; (void)dm; return new_obj(new_dc(OBJ_DC, NULL)); }
 static WINAPI BOOL DeleteDC(HANDLE h) {
     gdi_obj *d = dc_of(h);
     if (!d) return 0;
@@ -393,7 +398,7 @@ static WINAPI BOOL DeleteDC(HANDLE h) {
     if (w) vx_present_dc_released(w);
     return 1;
 }
-static WINAPI HANDLE WindowFromDC(HANDLE h) { gdi_obj *d = dc_of(h); return d && d->w ? d->w->hwnd : NULL; }
+static WINAPI HANDLE WindowFromDC(HANDLE h) { gdi_obj *d = dc_of(h); return !d ? NULL : d->w ? d->w->hwnd : d->screen ? VX_HWND_DESKTOP : NULL; }
 
 static WINAPI int GetDeviceCaps(HANDLE h, int index) {
     (void)h;
