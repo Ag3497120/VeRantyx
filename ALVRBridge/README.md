@@ -22,7 +22,10 @@ Wi-Fi dropped) finds ALVR's core stuck in the handshake, and the headset says "C
 11)" (issue #6). ALVR's audio callback reads its session lock on CoreAudio's thread; cpal 0.15.3 never stops a stream
 on a named device, so the last connection's recording runs on, and the next handshake holds that lock for writing
 while it asks CoreAudio about the same device. The bridge sees a client still "Connecting" after 6 s (a handshake takes
-well under one) and the encoder starts again (exit 75, as above); the headset connects some 10 s after it came back.
+well under one) and the encoder starts again (exit 75, as above); the headset connects some 10 s after it came back. That
+check runs on the encoder's ALVR thread, which also passes the game's vibrations on; ALVR's `send_haptics` waits for
+the same lock, so in a game that vibrates the thread stopped at the first vibration and the restart never came (0.3.0,
+a Pico 4 Ultra mid-game). Vibrations now go to the core on a thread of their own (a queue of 64, the rest dropped).
 
 Game audio: macOS cannot record an output device (ALVR records the speakers on Windows), so the encoder makes a
 device ALVR can: an aggregate of the Mac's output and a tap of the Mac's sound, "VeRantyx ALVR game audio", private

@@ -616,10 +616,29 @@ pub extern "C" fn vx_alvr_refresh_hz() -> f32 {
         .and_then(|s| s["openvr_config"]["refresh_rate"].as_f64()).unwrap_or(0.0) as f32
 }
 
-/// A vibration the game asked for (hand 0 left, 1 right), to the headset's controller through ALVR, which scales it
-/// by its haptics settings (on by default).
-#[no_mangle]
-pub extern "C" fn vx_alvr_haptics(hand: u32, duration_s: f32, frequency: f32, amplitude: f32) {
+// Vibrations go to ALVR's core on a thread of their own. ALVR's send_haptics reads the session's lock, which a hung
+// handshake holds for writing for good (issue #6, HANDSHAKE_HUNG): called on the encoder's ALVR thread, the first
+// vibration the game asked for while a headset reconnected stopped that thread, which is also the one that asks
+// vx_alvr_restart_needed, so the encoder never started again and the headset stayed at "Try again (os error 11)"
+// (a Pico 4 Ultra tester, 0.3.0, leaving and reopening ALVR in the middle of Half-Life: Alyx). Now they queue (64
+// at most; more are dropped while the core cannot take them) and the caller never waits.
+pub struct Queue<T: Send + 'static> { sender: std::sync::mpsc::SyncSender<T>, dropped: AtomicU64 }
+impl<T: Send + 'static> Queue<T> {
+    pub fn new(capacity: usize, mut take: impl FnMut(T) + Send + 'static) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<T>(capacity);
+        thread::spawn(move || { while let Ok(item) = receiver.recv() { take(item) } });
+        Queue { sender, dropped: AtomicU64::new(0) }
+    }
+    /// Never waits; false (and counted) when the queue is full.
+    pub fn push(&self, item: T) -> bool {
+        let ok = self.sender.try_send(item).is_ok();
+        if !ok { self.dropped.fetch_add(1, Ordering::Relaxed); }
+        ok
+    }
+    pub fn dropped(&self) -> u64 { self.dropped.load(Ordering::Relaxed) }
+}
+
+fn send_haptics(hand: u32, duration_s: f32, frequency: f32, amplitude: f32) {
     static PULSES: AtomicU64 = AtomicU64::new(0);
     let Some(b) = BRIDGE.get() else { return };
     let guard = b.ctx.read().unwrap();
@@ -629,6 +648,17 @@ pub extern "C" fn vx_alvr_haptics(hand: u32, duration_s: f32, frequency: f32, am
     let n = PULSES.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 3 || n % 500 == 0 {
         alvr_common::info!("VeRantyx: vibration #{n} to the {} hand: {duration_s:.3} s, {frequency:.0} Hz, amplitude {amplitude:.2}", if hand == 0 { "left" } else { "right" });
+    }
+}
+
+/// A vibration the game asked for (hand 0 left, 1 right), to the headset's controller through ALVR, which scales it
+/// by its haptics settings (on by default). Never waits (Queue).
+#[no_mangle]
+pub extern "C" fn vx_alvr_haptics(hand: u32, duration_s: f32, frequency: f32, amplitude: f32) {
+    static HAPTICS: OnceLock<Queue<(u32, f32, f32, f32)>> = OnceLock::new();
+    let queue = HAPTICS.get_or_init(|| Queue::new(64, |(h, d, f, a)| send_haptics(h, d, f, a)));
+    if !queue.push((hand, duration_s, frequency, amplitude)) && queue.dropped() % 100 == 1 {
+        eprintln!("ALVR: {} vibrations dropped: ALVR's core is not taking them (a headset's handshake may hang)", queue.dropped());
     }
 }
 
@@ -742,6 +772,24 @@ mod tests {
         assert!(fastest_headset > 11.0, "{fastest_headset}");
         assert!(fastest_as_sent > 8.0, "the poses as sent carry the wrong velocity on: {fastest_as_sent}");
         assert!(fastest <= 6.05 && fastest > 4.5, "moved back, they move as the hand did (6 m/s): {fastest}");
+    }
+
+    #[test]
+    fn a_queue_that_never_waits() {
+        // the taker stuck (as ALVR's send_haptics is behind a hung handshake's lock): pushing still returns at once
+        let (stuck_tx, stuck_rx) = std::sync::mpsc::channel::<()>();
+        let stuck = Mutex::new(stuck_rx);
+        let (took_tx, took_rx) = std::sync::mpsc::channel::<u32>();
+        let q = Queue::new(4, move |n: u32| { took_tx.send(n).ok(); stuck.lock().unwrap().recv().ok(); });
+        let started = std::time::Instant::now();
+        let pushed = (0..100).filter(|&n| q.push(n)).count();
+        assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
+        assert!((4..=5).contains(&pushed), "{pushed} (the taker holds one, the queue four)");
+        assert_eq!(q.dropped(), 100 - pushed as u64);
+        assert_eq!(took_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 0);
+        for _ in 0..pushed { stuck_tx.send(()).unwrap(); }            // (unstuck: the queued ones go on, in order)
+        let rest: Vec<u32> = (1..pushed).map(|_| took_rx.recv_timeout(Duration::from_secs(1)).unwrap()).collect();
+        assert_eq!(rest, (1..pushed as u32).collect::<Vec<_>>());
     }
 
     #[test]
