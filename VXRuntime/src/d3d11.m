@@ -512,7 +512,7 @@ static d3d_view *make_view(d3d_device *dev, int kind, void **vtbl, d3d_object *r
 
 // ---- the immediate context ----------------------------------------------------------------------------------------------------------
 static id<MTLCommandBuffer> raw_cmd(d3d_context *c) {
-    if (!c->cmd) c->cmd = (void *)CFBridgingRetain([(__bridge id<MTLCommandQueue>)c->base.dev->queue commandBuffer]);
+    if (!c->cmd) { c->cmd = (void *)CFBridgingRetain([(__bridge id<MTLCommandQueue>)c->base.dev->queue commandBuffer]); D3D_RECORDING(c); }
     return (__bridge id<MTLCommandBuffer>)c->cmd;
 }
 // The command buffer to encode into; clears still pending go first (whatever comes may read their targets).
@@ -876,6 +876,7 @@ static void clear_later(d3d_context *c, d3d_view *v, const float *color, int dep
         return;
     }
     if (c->nclears == 9) d3d_clears_flush(c);
+    D3D_RECORDING(c);
     d3d_pending_clear *p = &c->clears[c->nclears++];
     memset(p, 0, sizeof *p);
     p->v = v; d3d_addref(&v->base);
@@ -901,6 +902,7 @@ static void discard_later(d3d_context *c, d3d_view *v, d3d_object *res) {
     if ((v ? v->resource : res)->kind != K_TEXTURE) return;
     if (c->nclears == 9) d3d_clears_flush(c);
     d3d_end_render(c);
+    D3D_RECORDING(c);
     d3d_pending_clear *p = &c->clears[c->nclears++];
     memset(p, 0, sizeof *p);
     p->discard = 1; p->v = v; p->res = v ? NULL : res;
@@ -1749,11 +1751,20 @@ static WINAPI HRESULT dxgidev_reclaim1(void *this, uint32_t n, void *const *res,
     if (results) for (uint32_t i = 0; i < n; i++) results[i] = 0;
     return S_OK;
 }
-// EnqueueSetEvent: the event is set once the work submitted so far has finished on the GPU.
+// EnqueueSetEvent: returns at once; the event is set once the work submitted so far has finished on the GPU. The
+// immediate context's recorded work is sent first (without waiting) when this thread recorded it; recorded on
+// another thread, it is left to that thread (touching it from here would race with it). Then an empty command buffer
+// goes to the device's queue, after everything committed so far: Metal runs one queue's command buffers in order,
+// so its completion is the moment to set the event.
 static WINAPI HRESULT dxgidev_enqueue_set_event(void *this, HANDLE event) {
     if (!event) return E_INVALIDARG;
-    d3d_flush((d3d_device *)FROM_VTBL2(this), 1);
-    vx_set_event(event);
+    d3d_device *dev = (d3d_device *)FROM_VTBL2(this);
+    d3d_context *c = (d3d_context *)dev->context;
+    uintptr_t rec = __atomic_load_n(&c->recorder, __ATOMIC_RELAXED);
+    if (!rec || rec == (uintptr_t)pthread_self()) d3d_flush(dev, 0);
+    id<MTLCommandBuffer> marker = [(__bridge id<MTLCommandQueue>)dev->queue commandBuffer];
+    [marker addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; vx_set_event(event); }];
+    [marker commit];
     return S_OK;
 }
 static WINAPI void dxgidev_trim(void *this) { (void)this; }

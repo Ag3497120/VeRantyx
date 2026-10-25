@@ -139,7 +139,12 @@ typedef struct {
     // Geometry-shader kernels whose inputs the CPU wrote run in a command buffer of their own (pre, with one open
     // compute encoder pre_enc), committed before cmd: the render pass in progress need not end for them.
     void *pre, *pre_enc;
+    // The thread that last recorded work not yet sent (a command buffer, a pending clear, a geometry pre-pass).
+    // IDXGIDevice2::EnqueueSetEvent sends that work only when called on this thread: the immediate context is not
+    // free-threaded and has no lock of its own.
+    uintptr_t recorder;
 } d3d_context;
+#define D3D_RECORDING(c) __atomic_store_n(&(c)->recorder, (uintptr_t)pthread_self(), __ATOMIC_RELAXED)
 void d3d_clears_flush(d3d_context *c);                                   // does the pending clears as passes of their own
 int d3d_same_target(const d3d_view *a, const d3d_view *b);              // d3d11.m: the same subresource, as the same format
 int d3d_pass_dump_begin(void);                                            // VXRT_PASS_DUMP: whether to list this pass

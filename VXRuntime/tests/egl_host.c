@@ -11,6 +11,9 @@ static int failures;
 
 static const GUID IID_ID3D10Device_ = { 0x9b7e4c0f, 0x342c, 0x4106, { 0xa1, 0x9f, 0x4f, 0x27, 0x04, 0xf6, 0x89, 0xf0 } };
 
+struct call { IDXGIDevice3 *d; HANDLE ev; HRESULT hr; };
+static DWORD WINAPI enqueue_thread(void *p) { struct call *c = p; c->hr = IDXGIDevice3_EnqueueSetEvent(c->d, c->ev); return 0; }
+
 int main(void) {
     // The screen's DC is the desktop window's; a display DC made with CreateDC belongs to no window.
     HDC screen = GetDC(NULL);
@@ -72,6 +75,32 @@ int main(void) {
     CHECK(IDXGIDevice3_EnqueueSetEvent(d3, NULL) == E_INVALIDARG);
     CHECK(SUCCEEDED(IDXGIDevice3_EnqueueSetEvent(d3, ev)));
     CHECK(WaitForSingleObject(ev, 5000) == WAIT_OBJECT_0);
+    // It returns at once, not when the GPU is done: with copies of 2 x 64 MB (tens of milliseconds of GPU work)
+    // still pending, the event is not yet set when the call returns, and is set later.
+    D3D11_BUFFER_DESC bigd = { 64u << 20, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0, 0 };
+    ID3D11Buffer *big[2] = { NULL, NULL };
+    CHECK(SUCCEEDED(ID3D11Device_CreateBuffer(dev, &bigd, NULL, &big[0])) && SUCCEEDED(ID3D11Device_CreateBuffer(dev, &bigd, NULL, &big[1])));
+    if (big[0] && big[1]) {
+        for (int i = 0; i < 160; i++) ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)big[i & 1], (ID3D11Resource *)big[!(i & 1)]);
+        ResetEvent(ev);
+        LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        CHECK(SUCCEEDED(IDXGIDevice3_EnqueueSetEvent(d3, ev)));
+        QueryPerformanceCounter(&t1);
+        CHECK(WaitForSingleObject(ev, 0) == WAIT_TIMEOUT);
+        CHECK(WaitForSingleObject(ev, 10000) == WAIT_OBJECT_0);
+        CHECK((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart < 1000);
+        // Called on another thread while this one has recorded work: still set (that work is left to this thread).
+        for (int i = 0; i < 4; i++) ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)big[i & 1], (ID3D11Resource *)big[!(i & 1)]);
+        ResetEvent(ev);
+        struct call call = { d3, ev, E_FAIL };
+        HANDLE th = CreateThread(NULL, 0, enqueue_thread, &call, 0, NULL);
+        CHECK(th && WaitForSingleObject(th, 5000) == WAIT_OBJECT_0 && SUCCEEDED(call.hr));
+        if (th) CloseHandle(th);
+        CHECK(WaitForSingleObject(ev, 10000) == WAIT_OBJECT_0);
+        ID3D11DeviceContext_Flush(ctx);
+    }
+    if (big[0]) ID3D11Buffer_Release(big[0]);
+    if (big[1]) ID3D11Buffer_Release(big[1]);
     IDXGIDevice3_Trim(d3);
     CloseHandle(ev);
 
