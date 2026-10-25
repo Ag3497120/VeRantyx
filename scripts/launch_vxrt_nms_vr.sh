@@ -96,7 +96,7 @@ waited=0
 while (( waited < 60 )); do
     sleep 1
     # (up once our vrserver listens on the port and its compositor has started)
-    listener="$(lsof -nP -t -iTCP:27062 -sTCP:LISTEN 2>/dev/null | head -1)"
+    listener="$(lsof -nP -t -iTCP:27062 -sTCP:LISTEN 2>/dev/null | head -1 || true)"
     if [[ -n "$listener" ]] && ps -o command= -p "$listener" | grep -q "vrserver.exe" && pgrep -f "build/vxrt.*vrcompositor.exe" >/dev/null; then break; fi
     [[ -f "$LOG_DIR/alvr-first-connection.wait" ]] || waited=$((waited + 1))
     kill -0 "$STEAMVR_PID" 2>/dev/null || { echo "SteamVR did not start (log: $LOG_DIR/vxrt-steamvr-launch.log)" >&2; exit 1; }
