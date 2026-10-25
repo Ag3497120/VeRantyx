@@ -178,6 +178,10 @@ static void overlay_init(void) {
 static int trace_opens_all(void) { static int on = -1; if (on < 0) { const char *e = getenv("VXRT_TRACE_FILES"); on = e && *e == '2'; } return on; }
 int vx_unix_path(const char *win, char *out, size_t cap) {
     char full[MAX_PATH_LEN];
+    // An empty name is no path (it is not the current directory): GetFileAttributes(""), CreateFile("") and the like
+    // fail. (Steam's API reads the launcher's path from a game's appmanifest .acf, which can have none, and starts
+    // that only when GetFileAttributesW finds it; "" being found, a game asked ShellExecute to run "".)
+    if (!win || !*win) { vx_set_last_error(3 /* ERROR_PATH_NOT_FOUND */); return 0; }
     if (!strcasecmp(win, "NUL")) { snprintf(out, cap, "/dev/null"); return 1; }
     if (!vx_full_path(win, full, sizeof full)) { vx_set_last_error(206 /* ERROR_FILENAME_EXCED_RANGE */); return 0; }
     const char *rest = full + 2;              // "\a\b" or "\"

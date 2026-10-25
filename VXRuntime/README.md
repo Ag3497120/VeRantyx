@@ -24,6 +24,7 @@ VXRT_TRACE=1 VXRT_DEBUGGER=1 ...           # programs that log to a debugger (Ou
 VXRT_DLL_PATH=/prefix/drive_c/windows/system32 ...   # also loads DLLs (the VC++ runtime) from a Windows installation
 VXRT_TRACE_PIPES=1 ...                     # every named-pipe message, with its first bytes
 VXRT_TRACE_NAMES=1 ...                     # processes joining and leaving named objects and mappings
+VXRT_TRACE_REG=1 ...                       # every registry key opened or created and every value set, with its full path
 VXRT_TRACE_CALLS=200 ...                   # every call into the runtime (arguments, result, last error), 200 per function
 VXRT_TRACE_CALLS_ONLY=CreateFileW,LockFileEx ...   # with VXRT_TRACE_CALLS: only these functions (a browser's file calls)
 VXRT_PRESENT_SNAPSHOT=f.png VXRT_PRESENT_SNAPSHOT_AT=300 ...   # the 300th present's back buffer as a PNG
@@ -183,6 +184,31 @@ administrator rights there. Valve's window names installing and updating games a
 Valve's install-script documentation has Steam do parts of a game's first-run setup as administrator
 (`HKEY_LOCAL_MACHINE` keys, programs to run, firewall exceptions), which may not happen without it. Valve documents
 no Steam option that turns the check off.
+
+Starting a SteamStub game through this Steam (No Man's Sky, app 275850, 2026-10-25, the user signed in): started
+directly, the game's Steam API reads the launcher's path from its `appmanifest_275850.acf` (`LauncherPath`; the
+manifest copied in from another library had none), and when that is not there it takes `InstallPath` from
+`HKLM\Software\Valve\Steam` and runs `steam.exe steam://run/275850//` through `ShellExecuteW`, then ends itself with
+exit code 53. A second `steam.exe` hands its command line to the running one by writing it to
+`HKLM\Software\Valve\Steam\TempAppCmdLine` and setting a named event; the running one reads the value. So every
+process of a root now shares one registry (`src/registry.c`: before each call a process takes in what another saved
+to `registry.txt`, merged into its own tree; changes are made under a lock of `registry.lock`; `VXRT_TRACE_REG=1`
+logs every key opened or created and every value set). With that, both ways reach Steam (`logs/console_log.txt`:
+`ExecCommandLine: "steam.exe -applaunch 275850"`, and from the game `ExecuteSteamURL: "steam://run/275850//"`), and
+Steam then stops at `LaunchApp changed task to ShowEula ... waiting for user response`: the game's EULA, a page of
+Steam's web UI, which does not draw here yet (the web helper ends with an access violation in libcef and is started
+again), and which only the user may accept. `ShellExecute(Ex)` follows Microsoft's documentation (`src/kernel32.c`,
+`tests/shellexec.c`): programs, and URLs and documents by the command registered for the verb under
+`HKEY_CLASSES_ROOT` (per user over per machine); nothing registered is `SE_ERR_NOASSOC`, never the Mac's browser. The
+`steam://` protocol itself is not registered here: on Windows the Steam Client Service registers it
+(`bin/steamservice.dll`: `HKCR\steam`, `"<steam.exe>" -- "%1"`), and that 32-bit service cannot run (see "Steam Service
+Error" above); Steam's own `steam.exe` does not write it. Also: `GetFileAttributes("")` and the other calls given an
+empty path fail now (an empty name was taken as the current directory, so the game "found" the missing launcher path
+and asked `ShellExecute` to run ""), and `ReadFileEx`/`WriteFileEx` work for files (completion routines run in
+alertable waits; `tests/file_io_ex.c`): Steam's content system imports `WriteFileEx`, and its download of Steamworks
+Common Redistributables (228980, which No Man's Sky needs) had stopped with "Disk write failure" at offset 4194304
+of `vcredist_x86.exe`; whether that was the cause is not yet confirmed (Steam has paused that download and has not
+tried again since).
 
 `C:\` is `$VXRT_ROOT/drive_c` (default `~/.vxrt/drive_c`, created on first run with `C:\windows\system32` and
 `C:\windows\temp`); `Z:\` is the whole Mac file system. The registry lives in `$VXRT_ROOT/registry.txt`.

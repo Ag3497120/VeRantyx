@@ -467,7 +467,6 @@ static WINAPI BOOL QueueUserWorkItem(DWORD (WINAPI *fn)(void *), void *ctx, DWOR
     w->fn = fn; w->ctx = ctx;
     return submit((void *)run_work_item, w, NULL);
 }
-static WINAPI BOOL io_ex_fails(void) { vx_set_last_error(50); return 0; }   // ReadFileEx/WriteFileEx (completion routines): not supported
 static WINAPI BOOL CancelSynchronousIo(HANDLE t) { (void)t; vx_set_last_error(1168 /* ERROR_NOT_FOUND */); return 0; }
 static WINAPI BOOL SetSystemPowerState(BOOL suspend, BOOL force) { (void)suspend; (void)force; vx_set_last_error(5); return 0; }
 static WINAPI BOOL WriteConsoleOutputAttribute(HANDLE h, const uint16_t *a, DWORD n, DWORD pos, DWORD *written) { (void)h; (void)a; (void)pos; if (written) *written = n; return 1; }
@@ -529,7 +528,7 @@ static const vx_export k32[] = {
     { "K32EnumProcessModules", (void *)EnumProcessModules }, { "K32EnumProcessModulesEx", (void *)EnumProcessModulesEx },
     { "K32GetModuleBaseNameW", (void *)GetModuleBaseNameW }, { "K32GetModuleBaseNameA", (void *)GetModuleBaseNameA },
     VX_EXPORT(GetVolumeInformationW), VX_EXPORT(GetPrivateProfileStringW),
-    VX_EXPORT(QueueUserWorkItem), { "ReadFileEx", (void *)io_ex_fails }, { "WriteFileEx", (void *)io_ex_fails }, VX_EXPORT(CancelSynchronousIo),
+    VX_EXPORT(QueueUserWorkItem), VX_EXPORT(CancelSynchronousIo),
     VX_EXPORT(SetSystemPowerState), VX_EXPORT(WriteConsoleOutputAttribute), VX_EXPORT(VirtualAllocEx), VX_EXPORT(VirtualProtectEx),
     VX_EXPORT(WriteProcessMemory),
 };

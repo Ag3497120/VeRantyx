@@ -5,7 +5,19 @@
 // registry.txt has one line per key and per value, meant for the runtime rather than people:
 //   key HKEY_CURRENT_USER\Software\Example
 //   value <type> <name in hex or -> <data in hex or ->
+//
+// One registry for every process of a root, as on Windows: each process keeps its copy in memory and, before each
+// call, takes in what other processes saved since (registry.txt replaced: another inode, time or size), merged into
+// its tree so open handles stay valid (keys gone from the file become deleted keys). Changes are made under an
+// exclusive lock of $VXRT_ROOT/registry.lock, after taking in the file, so two processes' changes do not undo each
+// other. (Steam's second steam.exe hands its command line to the running one in HKLM\Software\Valve\Steam, then
+// sets an event: the running one has to see the value.)
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +42,8 @@ static const char *g_root_names[] = { "HKEY_CLASSES_ROOT", "HKEY_CURRENT_USER", 
 #define NROOTS 6
 static reg_key g_roots[NROOTS];
 static pthread_mutex_t g_reg_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
-static int g_loaded;
+static int g_loaded, g_quiet;                                   // g_quiet: building a tree nobody has handles to
+static struct { dev_t dev; ino_t ino; struct timespec mtime; off_t size; int valid; } g_stamp;   // the file last read or written
 
 // An open key is a heap object pointing at its node; predefined keys are 0x80000000 + n (sign-extended).
 typedef struct { uint32_t magic; reg_key *key; } reg_handle;
@@ -54,14 +67,14 @@ void vx_regnotify_changed(const void *key, DWORD what);
 void vx_regnotify_closed(const void *hkey);
 enum { CHANGED_NAME = 1, CHANGED_VALUES = 4, CHANGED_DELETED = 0x80000000u };
 static void load(void);
+static void read_begin(void), read_end(void);
 // For regnotify.c: the key a handle stands for (loading the registry first), whether it was deleted; and whether a
 // key is another or below it (g_reg_lock held, as it is while vx_regnotify_changed runs).
 const void *vx_reg_node(void *hkey, int *deleted) {
-    pthread_mutex_lock(&g_reg_lock);
-    load();
+    read_begin();
     reg_key *k = key_of(hkey);
     if (k && deleted) *deleted = k->deleted;
-    pthread_mutex_unlock(&g_reg_lock);
+    read_end();
     return k;
 }
 int vx_reg_within(const void *node, const void *ancestor) {
@@ -82,7 +95,7 @@ static reg_key *child(reg_key *k, const char *name, size_t n, int create) {
     c->parent = k;
     c->next = *link;
     *link = c;
-    vx_regnotify_changed(k, CHANGED_NAME);
+    if (!g_quiet) vx_regnotify_changed(k, CHANGED_NAME);
     return c;
 }
 static reg_key *walk(reg_key *k, const char *path, int create) {
@@ -143,7 +156,9 @@ static void save(void) {
             save_key(f, c, path, n);
         }
     fclose(f);
-    rename(tmp, file);
+    if (rename(tmp, file)) return;
+    struct stat st;
+    if (!stat(file, &st)) { g_stamp.dev = st.st_dev; g_stamp.ino = st.st_ino; g_stamp.mtime = st.st_mtimespec; g_stamp.size = st.st_size; g_stamp.valid = 1; }
 }
 
 static void set_value(reg_key *k, const char *name, DWORD type, const void *data, DWORD size);
@@ -188,14 +203,15 @@ void vx_reg_put(const char *path, const char *name, DWORD type, const void *data
         if (!strncmp(path, g_root_names[i], n) && path[n] == '\\') { set_value(walk(&g_roots[i], path + n + 1, 1), name, type, data, size); return; }
     }
 }
-static void load(void) {
-    if (g_loaded) return;
-    g_loaded = 1;
-    for (int i = 0; i < NROOTS; i++) g_roots[i].name = (char *)g_root_names[i];
-    char file[4200];
-    snprintf(file, sizeof file, "%s/registry.txt", vx_root());
-    FILE *f = fopen(file, "r");
-    if (!f) { defaults(); ensure_machine_guid(); vx_steam_registry(); save(); return; }
+static int stamp_is(const struct stat *st) {
+    return g_stamp.valid && g_stamp.dev == st->st_dev && g_stamp.ino == st->st_ino && g_stamp.size == st->st_size &&
+           g_stamp.mtime.tv_sec == st->st_mtimespec.tv_sec && g_stamp.mtime.tv_nsec == st->st_mtimespec.tv_nsec;
+}
+static void stamp_set(const struct stat *st) {
+    g_stamp.dev = st->st_dev; g_stamp.ino = st->st_ino; g_stamp.mtime = st->st_mtimespec; g_stamp.size = st->st_size; g_stamp.valid = 1;
+}
+// Reads registry.txt into the trees under roots.
+static void parse(FILE *f, reg_key *roots) {
     size_t cap = 1 << 16;
     char *line = malloc(cap);
     uint8_t *buf = malloc(cap);
@@ -207,7 +223,7 @@ static void load(void) {
             k = NULL;
             for (int i = 0; i < NROOTS; i++)
                 if (!strncmp(path, g_root_names[i], sep ? (size_t)(sep - path) : strlen(path)) && strlen(g_root_names[i]) == (sep ? (size_t)(sep - path) : strlen(path)))
-                    k = walk(&g_roots[i], sep, 1);
+                    k = walk(&roots[i], sep, 1);
         } else if (!strncmp(line, "value ", 6) && k) {
             unsigned type; char *p = line + 6;
             if (sscanf(p, "%u", &type) != 1) continue;
@@ -222,6 +238,18 @@ static void load(void) {
         }
     }
     free(line); free(buf);
+}
+static void load(void) {
+    if (g_loaded) return;
+    g_loaded = 1;
+    for (int i = 0; i < NROOTS; i++) g_roots[i].name = (char *)g_root_names[i];
+    char file[4200];
+    snprintf(file, sizeof file, "%s/registry.txt", vx_root());
+    FILE *f = fopen(file, "r");
+    if (!f) { defaults(); ensure_machine_guid(); vx_steam_registry(); save(); return; }
+    struct stat st;
+    if (!fstat(fileno(f), &st)) stamp_set(&st);
+    parse(f, g_roots);
     fclose(f);
     reg_value *had = *find_value(walk(&g_roots[2], "Software\\Microsoft\\Cryptography", 1), "MachineGuid");
     ensure_machine_guid();
@@ -238,10 +266,97 @@ static void set_value(reg_key *k, const char *name, DWORD type, const void *data
     if (size) memcpy(v->data, data, size);
 }
 
+// VXRT_TRACE_REG=1: every key opened or created and every value set, with the key's full path and the result.
+static int trace_reg(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("VXRT_TRACE_REG"); on = e && *e && *e != '0'; }
+    return on;
+}
+static const char *key_path(const reg_key *k, char *buf, size_t cap) {
+    if (!k) { snprintf(buf, cap, "?"); return buf; }
+    if (!k->parent) { snprintf(buf, cap, "%s", k->name); return buf; }
+    key_path(k->parent, buf, cap);
+    size_t n = strlen(buf);
+    snprintf(buf + n, cap > n ? cap - n : 0, "\\%s", k->name);
+    return buf;
+}
+
+// ---- other processes' changes -------------------------------------------------------------------------------------------
+static void free_tree(reg_key *k) {
+    for (reg_key *c = k->children, *n; c; c = n) { n = c->next; free_tree(c); free(c->name); free(c); }
+    for (reg_value *v = k->values, *n; v; v = n) { n = v->next; free(v->name); free(v->data); free(v); }
+    k->children = NULL; k->values = NULL;
+}
+static void mark_deleted(reg_key *k) {
+    for (reg_key *c = k->children; c; c = c->next) mark_deleted(c);
+    if (!k->deleted) { k->deleted = 1; vx_regnotify_changed(k, CHANGED_DELETED); }
+}
+static int same_values(const reg_value *a, const reg_value *b) {
+    for (; a && b; a = a->next, b = b->next)
+        if (strcasecmp(a->name, b->name) || a->type != b->type || a->size != b->size || memcmp(a->data, b->data, a->size)) return 0;
+    return !a && !b;
+}
+// Makes mem what disk is (disk's values are moved over; disk is freed by the caller).
+static void merge(reg_key *mem, reg_key *disk) {
+    if (!same_values(mem->values, disk->values)) {
+        for (reg_value *v = mem->values, *n; v; v = n) { n = v->next; free(v->name); free(v->data); free(v); }
+        mem->values = disk->values; disk->values = NULL;
+        vx_regnotify_changed(mem, CHANGED_VALUES);
+    }
+    for (reg_key *d = disk->children; d; d = d->next) merge(child(mem, d->name, strlen(d->name), 1), d);
+    for (reg_key **link = &mem->children; *link;) {
+        reg_key *c = *link;
+        if (child(disk, c->name, strlen(c->name), 0)) { link = &c->next; continue; }
+        *link = c->next;                                    // deleted by another process (not freed: handles)
+        mark_deleted(c);
+        vx_regnotify_changed(mem, CHANGED_NAME);
+    }
+}
+// Takes in registry.txt when another process replaced it (g_reg_lock held).
+static void sync_from_file(void) {
+    if (!g_loaded) { load(); return; }
+    char file[4200];
+    snprintf(file, sizeof file, "%s/registry.txt", vx_root());
+    struct stat st;
+    if (stat(file, &st) || stamp_is(&st)) return;
+    FILE *f = fopen(file, "r");
+    if (!f) return;
+    if (fstat(fileno(f), &st)) { fclose(f); return; }
+    reg_key disk[NROOTS];
+    memset(disk, 0, sizeof disk);
+    g_quiet = 1;
+    parse(f, disk);
+    g_quiet = 0;
+    fclose(f);
+    stamp_set(&st);
+    for (int i = 0; i < NROOTS; i++) { merge(&g_roots[i], &disk[i]); free_tree(&disk[i]); }
+    vx_steam_registry();                                    // (the bridge's values for this process, kept in memory)
+}
+// A call that only reads: g_reg_lock, then what other processes saved.
+static void read_begin(void) { pthread_mutex_lock(&g_reg_lock); sync_from_file(); }
+static void read_end(void) { pthread_mutex_unlock(&g_reg_lock); }
+// A call that may change the registry: also registry.lock, held until the change is saved.
+static int g_lock_fd = -1, g_lock_depth;
+static void write_begin(void) {
+    pthread_mutex_lock(&g_reg_lock);
+    if (g_lock_depth++ == 0) {
+        if (g_lock_fd < 0) {
+            char file[4200];
+            snprintf(file, sizeof file, "%s/registry.lock", vx_root());
+            g_lock_fd = open(file, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        }
+        if (g_lock_fd >= 0) while (flock(g_lock_fd, LOCK_EX) && errno == EINTR) {}
+    }
+    sync_from_file();
+}
+static void write_end(void) {
+    if (--g_lock_depth == 0 && g_lock_fd >= 0) flock(g_lock_fd, LOCK_UN);
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
 // ---- opening and creating keys ----------------------------------------------------------------------------------------------
 static LONG open_key(void *parent, const char *sub, void **out, int create, DWORD *disposition) {
-    pthread_mutex_lock(&g_reg_lock);
-    load();
+    if (create) write_begin(); else read_begin();
     reg_key *p = key_of(parent), *k = NULL;
     LONG r = ERROR_INVALID_HANDLE;
     if (p) {
@@ -251,7 +366,8 @@ static LONG open_key(void *parent, const char *sub, void **out, int create, DWOR
         else r = ERROR_FILE_NOT_FOUND;
         if (disposition) *disposition = existed ? 2 /* REG_OPENED_EXISTING_KEY */ : 1 /* REG_CREATED_NEW_KEY */;
     }
-    pthread_mutex_unlock(&g_reg_lock);
+    if (trace_reg()) { char b[1024]; vx_log("registry: %s %s\\%s -> %ld", create ? "create" : "open", key_path(p, b, sizeof b), sub ? sub : "", (long)r); }
+    if (create) write_end(); else read_end();
     return r;
 }
 static WINAPI LONG RegOpenKeyExA(void *hkey, const char *sub, DWORD opts, DWORD sam, void **out) { (void)opts; (void)sam; return open_key(hkey, sub, out, 0, NULL); }
@@ -285,8 +401,7 @@ static WINAPI LONG RegFlushKey(void *hkey) { (void)hkey; return ERROR_SUCCESS; }
 
 // Deleted keys are unlinked but not freed: open handles may still point at them.
 static LONG delete_key(void *hkey, const char *sub) {
-    pthread_mutex_lock(&g_reg_lock);
-    load();
+    write_begin();
     reg_key *p = key_of(hkey), *k = p ? walk(p, sub, 0) : NULL;
     LONG r = !p ? ERROR_INVALID_HANDLE : !k ? ERROR_FILE_NOT_FOUND : (k->children || !k->parent) ? ERROR_ACCESS_DENIED : ERROR_SUCCESS;
     if (r == ERROR_SUCCESS) {
@@ -298,7 +413,7 @@ static LONG delete_key(void *hkey, const char *sub) {
         vx_regnotify_changed(k->parent, CHANGED_NAME);
         save();
     }
-    pthread_mutex_unlock(&g_reg_lock);
+    write_end();
     return r;
 }
 static WINAPI LONG RegDeleteKeyA(void *hkey, const char *sub) { return delete_key(hkey, sub); }
@@ -351,8 +466,7 @@ static WINAPI LONG RegDeleteTreeW(void *hkey, const WCHAR *sub) { char *a = sub 
 
 // ---- values ---------------------------------------------------------------------------------------------------------------------
 static LONG set(void *hkey, const char *name, DWORD type, const void *data, DWORD size, int ansi) {
-    pthread_mutex_lock(&g_reg_lock);
-    load();
+    write_begin();
     reg_key *k = key_of(hkey);
     if (k) {
         if (ansi && is_string(type)) {
@@ -368,7 +482,8 @@ static LONG set(void *hkey, const char *name, DWORD type, const void *data, DWOR
         vx_regnotify_changed(k, CHANGED_VALUES);
         save();
     }
-    pthread_mutex_unlock(&g_reg_lock);
+    if (trace_reg()) { char b[1024]; vx_log("registry: set %s [%s] type %u size %u", key_path(k, b, sizeof b), name ? name : "", type, size); }
+    write_end();
     return k ? ERROR_SUCCESS : ERROR_INVALID_HANDLE;
 }
 static WINAPI LONG RegSetValueExA(void *hkey, const char *name, DWORD reserved, DWORD type, const uint8_t *data, DWORD size) {
@@ -403,12 +518,11 @@ static LONG copy_out(const reg_value *v, DWORD *type, uint8_t *data, DWORD *size
     return r;
 }
 static LONG query(void *hkey, const char *name, DWORD *type, uint8_t *data, DWORD *size, int ansi) {
-    pthread_mutex_lock(&g_reg_lock);
-    load();
+    read_begin();
     reg_key *k = key_of(hkey);
     reg_value *v = k ? *find_value(k, name) : NULL;
     LONG r = !k ? ERROR_INVALID_HANDLE : !v ? ERROR_FILE_NOT_FOUND : copy_out(v, type, data, size, ansi);
-    pthread_mutex_unlock(&g_reg_lock);
+    read_end();
     return r;
 }
 static WINAPI LONG RegQueryValueExA(void *hkey, const char *name, DWORD *reserved, DWORD *type, uint8_t *data, DWORD *size) {
@@ -443,12 +557,11 @@ static WINAPI LONG RegGetValueW(void *hkey, const WCHAR *sub, const WCHAR *name,
 }
 
 static LONG delete_value(void *hkey, const char *name) {
-    pthread_mutex_lock(&g_reg_lock);
-    load();
+    write_begin();
     reg_key *k = key_of(hkey);
     reg_value **slot = k ? find_value(k, name) : NULL, *v = slot ? *slot : NULL;
     if (v) { *slot = v->next; free(v->name); free(v->data); free(v); vx_regnotify_changed(k, CHANGED_VALUES); save(); }
-    pthread_mutex_unlock(&g_reg_lock);
+    write_end();
     return !k ? ERROR_INVALID_HANDLE : !v ? ERROR_FILE_NOT_FOUND : ERROR_SUCCESS;
 }
 static WINAPI LONG RegDeleteValueA(void *hkey, const char *name) { return delete_value(hkey, name); }
@@ -465,12 +578,11 @@ static LONG name_out(const char *name, void *buf, DWORD *cch, int ansi) {
     return ERROR_SUCCESS;
 }
 static LONG enum_key(void *hkey, DWORD index, void *name, DWORD *cch, int ansi) {
-    pthread_mutex_lock(&g_reg_lock);
-    load();
+    read_begin();
     reg_key *k = key_of(hkey), *c = k ? k->children : NULL;
     for (DWORD i = 0; c && i < index; i++) c = c->next;
     LONG r = !k ? ERROR_INVALID_HANDLE : !c ? ERROR_NO_MORE_ITEMS : name_out(c->name, name, cch, ansi);
-    pthread_mutex_unlock(&g_reg_lock);
+    read_end();
     return r;
 }
 static WINAPI LONG RegEnumKeyExA(void *hkey, DWORD index, char *name, DWORD *cch, DWORD *res, char *cls, DWORD *ccls, void *t) {
@@ -482,14 +594,13 @@ static WINAPI LONG RegEnumKeyExW(void *hkey, DWORD index, WCHAR *name, DWORD *cc
     return enum_key(hkey, index, name, cch, 0);
 }
 static LONG enum_value(void *hkey, DWORD index, void *name, DWORD *cch, DWORD *type, uint8_t *data, DWORD *size, int ansi) {
-    pthread_mutex_lock(&g_reg_lock);
-    load();
+    read_begin();
     reg_key *k = key_of(hkey);
     reg_value *v = k ? k->values : NULL;
     for (DWORD i = 0; v && i < index; i++) v = v->next;
     LONG r = !k ? ERROR_INVALID_HANDLE : !v ? ERROR_NO_MORE_ITEMS : name_out(v->name, name, cch, ansi);
     if (r == ERROR_SUCCESS) r = copy_out(v, type, data, size, ansi);
-    pthread_mutex_unlock(&g_reg_lock);
+    read_end();
     return r;
 }
 static WINAPI LONG RegEnumValueA(void *hkey, DWORD index, char *name, DWORD *cch, DWORD *res, DWORD *type, uint8_t *data, DWORD *size) {
@@ -499,15 +610,14 @@ static WINAPI LONG RegEnumValueW(void *hkey, DWORD index, WCHAR *name, DWORD *cc
     (void)res; return enum_value(hkey, index, name, cch, type, data, size, 0);
 }
 static LONG query_info(void *hkey, DWORD *subkeys, DWORD *max_subkey, DWORD *values, DWORD *max_name, DWORD *max_data) {
-    pthread_mutex_lock(&g_reg_lock);
-    load();
+    read_begin();
     reg_key *k = key_of(hkey);
     DWORD ns = 0, ms = 0, nv = 0, mn = 0, md = 0;
     if (k) {
         for (reg_key *c = k->children; c; c = c->next) { ns++; if (strlen(c->name) > ms) ms = (DWORD)strlen(c->name); }
         for (reg_value *v = k->values; v; v = v->next) { nv++; if (strlen(v->name) > mn) mn = (DWORD)strlen(v->name); if (v->size > md) md = v->size; }
     }
-    pthread_mutex_unlock(&g_reg_lock);
+    read_end();
     if (subkeys) *subkeys = ns;
     if (max_subkey) *max_subkey = ms;
     if (values) *values = nv;
@@ -575,7 +685,7 @@ static WINAPI DWORD NtCreateKey(void **out, DWORD access, const OBJECT_ATTRIBUTE
     return nt_open(out, oa, 1, disposition);
 }
 static WINAPI DWORD NtDeleteKey(void *hkey) {
-    pthread_mutex_lock(&g_reg_lock);
+    write_begin();
     reg_key *k = key_of(hkey);
     DWORD st = STATUS_INVALID_HANDLE;
     if (k && k->parent) {                                          // unlinked, as delete_key does
@@ -584,7 +694,7 @@ static WINAPI DWORD NtDeleteKey(void *hkey) {
         save();
         st = STATUS_SUCCESS;
     }
-    pthread_mutex_unlock(&g_reg_lock);
+    write_end();
     return st;
 }
 static WINAPI DWORD NtSetValueKey(void *hkey, const UNICODE_STRING *name, DWORD title, DWORD type, const void *data, DWORD size) {
@@ -631,6 +741,30 @@ static WINAPI DWORD RtlFormatCurrentUserKeyPath(UNICODE_STRING *out) {
     out->length = (uint16_t)(vx_wcslen(w) * 2);
     out->max = (uint16_t)(out->length + 2);
     return STATUS_SUCCESS;
+}
+// For shell32's ShellExecute (kernel32.c): a string value (REG_SZ or REG_EXPAND_SZ, *expand set for the latter) of the
+// key a full path names ("HKEY_CURRENT_USER\\Software\\Classes\\..."), in UTF-8, malloc'd; NULL when there is none.
+char *vx_reg_get_string(const char *path, const char *name, int *expand) {
+    char *out = NULL;
+    read_begin();
+    for (int i = 0; i < NROOTS; i++) {
+        size_t n = strlen(g_root_names[i]);
+        if (strncasecmp(path, g_root_names[i], n) || (path[n] && path[n] != '\\')) continue;
+        reg_key *k = walk(&g_roots[i], path + n, 0);
+        reg_value *v = k ? *find_value(k, name) : NULL;
+        if (v && (v->type == REG_SZ || v->type == REG_EXPAND_SZ)) {
+            size_t chars = v->size / 2;
+            while (chars && ((const WCHAR *)v->data)[chars - 1] == 0) chars--;
+            size_t m = vx_utf16_to_utf8((const WCHAR *)v->data, chars, NULL, 0);
+            out = malloc(m + 1);
+            vx_utf16_to_utf8((const WCHAR *)v->data, chars, out, m);
+            out[m] = 0;
+            if (expand) *expand = v->type == REG_EXPAND_SZ;
+        }
+        break;
+    }
+    read_end();
+    return out;
 }
 // NtClose of a registry key (heap pointers, unlike kernel handles, are above 4 GB).
 int vx_reg_close(void *hkey) {
