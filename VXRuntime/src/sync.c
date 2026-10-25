@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <libproc.h>
 #include "vx.h"
 
 #define INFINITE      0xffffffffu
@@ -173,12 +174,16 @@ static void shared_name(const char *name, int type, char *out, size_t cap) {
     for (const char *c = name; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
     snprintf(out, cap, "/vxo.%016llx", (unsigned long long)h);
 }
-// Who holds a name: a registry of process IDs beside each named object or mapping ("/vxq.<hash>"). A name whose
+// Who holds a name: a registry of process IDs beside each named object or mapping ("/vxr.<hash>"). A name whose
 // holders have all ended (killed, crashed) is gone, as on Windows, even though its shared memory is still there.
 // The object's shared memory is created and removed only under the registry's lock, so two processes never end up
 // with different memory under one name. A registry removed by its last holder is marked dead first: a process that
 // opened it just before waits for the lock, sees the mark, and opens the new one.
-typedef struct { volatile uint32_t spin, dead; int32_t pids[1000]; } name_registry;
+// A holder is a process ID and that process's start time: a process ID macOS gives out again (it wraps at 99999)
+// is not the holder that ended. SteamVR's vrserver names an event after its own process ID; a vrserver killed days
+// before with the same ID had left its hold, which counted as this one's, so the event "already existed" and
+// vrserver waited for its own namespace server for good (about 1 run in 6 of the VR harness).
+typedef struct { volatile uint32_t spin, dead; int32_t pids[1000]; uint64_t starts[1000]; } name_registry;
 // Maps shared memory that another process may have just created: a new object is empty until its creator sizes it
 // (whoever sizes it first wins; macOS sizes shared memory once), and mapping an empty one fails.
 static void *map_sized(int fd, size_t size) {
@@ -195,7 +200,7 @@ static void *map_sized(int fd, size_t size) {
 static __thread int t_die_holding;     // VXRT_TEST_SHLOCK_DIE names this object: end holding its registry's lock
 static name_registry *registry_lock(const char *object_shm) {
     char reg[40];
-    snprintf(reg, sizeof reg, "/vxq.%s", object_shm + 1);
+    snprintf(reg, sizeof reg, "/vxr.%s", object_shm + 1);   // (vxr: with start times; vxq had process IDs only)
     for (int tries = 0; tries < 100; tries++) {
         int fd = shm_open(reg, O_RDWR | O_CREAT, 0600);
         if (fd < 0) { vx_log("name registry %s: shm_open failed (%s)", reg, strerror(errno)); return NULL; }
@@ -215,7 +220,23 @@ static void registry_unlock(name_registry *r) {
     vx_shunlock(&r->spin);
     munmap(r, sizeof *r);
 }
-static int holder_alive(int32_t pid, int me) { return pid == me || !kill(pid, 0) || errno != ESRCH; }
+static uint64_t process_start(int pid) {                  // microseconds since 1970, 0 when it cannot be told
+    struct proc_bsdinfo bi;
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof bi) != (int)sizeof bi) return 0;
+    return (uint64_t)bi.pbi_start_tvsec * 1000000u + bi.pbi_start_tvusec;
+}
+static uint64_t my_start(void) {
+    static uint64_t start;
+    if (!start) start = process_start(getpid());
+    return start;
+}
+static int holder_alive(const name_registry *r, int i, int me) {
+    int32_t pid = r->pids[i];
+    if (pid == me) return r->starts[i] == my_start();
+    if (kill(pid, 0) && errno == ESRCH) return 0;
+    uint64_t now = process_start(pid);
+    return !now || !r->starts[i] || now == r->starts[i];   // (another process now under that ID: ended)
+}
 // Joins a name; returns how many holds of it there were (this process's earlier ones included) by live processes.
 // With none, memory left under the name by processes that ended is removed.
 int vx_name_join(const char *object_shm) {
@@ -223,11 +244,11 @@ int vx_name_join(const char *object_shm) {
     if (!r) return 0;
     int others = 0, me = getpid(), free_slot = -1;
     for (int i = 0; i < 1000; i++) {
-        if (r->pids[i] && !holder_alive(r->pids[i], me)) r->pids[i] = 0;   // ended
+        if (r->pids[i] && !holder_alive(r, i, me)) r->pids[i] = 0;   // ended
         if (!r->pids[i]) { if (free_slot < 0) free_slot = i; }
         else others++;
     }
-    if (free_slot >= 0) r->pids[free_slot] = me;
+    if (free_slot >= 0) { r->pids[free_slot] = me; r->starts[free_slot] = my_start(); }
     if (!others) shm_unlink(object_shm);
     if (getenv("VXRT_TRACE_NAMES")) vx_log("[%d] join %s: %d holds before", me, object_shm, others);
     registry_unlock(r);
@@ -239,11 +260,11 @@ int vx_name_leave(const char *object_shm) {
     if (!r) return 1;
     int me = getpid(), left = 0, removed = 0;
     for (int i = 0; i < 1000; i++) {
-        if (r->pids[i] == me && !removed) { r->pids[i] = 0; removed = 1; continue; }
-        if (r->pids[i] && holder_alive(r->pids[i], me)) left++;
+        if (r->pids[i] == me && r->starts[i] == my_start() && !removed) { r->pids[i] = 0; removed = 1; continue; }
+        if (r->pids[i] && holder_alive(r, i, me)) left++;
     }
     if (!left) {
-        char reg[40]; snprintf(reg, sizeof reg, "/vxq.%s", object_shm + 1);
+        char reg[40]; snprintf(reg, sizeof reg, "/vxr.%s", object_shm + 1);
         r->dead = 1;
         shm_unlink(object_shm);
         shm_unlink(reg);
