@@ -162,6 +162,8 @@ static MTLPrimitiveType primitive(VkPrimitiveTopology t, int *ok) {
     case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return MTLPrimitiveTypeLineStrip;
     case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: return MTLPrimitiveTypeTriangle;
     case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: return MTLPrimitiveTypeTriangleStrip;
+    // Metal has no fans: their draws are made triangle lists, with indices built when they are encoded (vk_command.m).
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN: return MTLPrimitiveTypeTriangle;
     default: *ok = 0; return MTLPrimitiveTypeTriangle;
     }
 }
@@ -407,6 +409,7 @@ static VkResult create_graphics(VkDevice dev, const VkGraphicsPipelineCreateInfo
     const VkPipelineInputAssemblyStateCreateInfo *ia = info->pInputAssemblyState;
     int ok = 1;
     p->topology = ia ? ia->topology : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    p->primitive_restart = ia && ia->primitiveRestartEnable;
     if (gs) p->primitive = MTLPrimitiveTypeTriangle;   // (the geometry kernel's strips, as triangles)
     else {
         p->primitive = primitive(p->topology, &ok);

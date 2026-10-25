@@ -904,6 +904,62 @@ static MTLPrimitiveType current_primitive(vk_enc *e) {
     }
 }
 
+// ---- triangle fans ----
+// Metal has no fan topology. The Vulkan spec's fan primitive i is (v[i+1], v[i+2], v[0]): a triangle list of those
+// three indices draws the same triangles with the same winding and provoking vertex. With primitive restart, the
+// all-ones index ends a fan and the next index starts another. Not indexed, the indices are 0..n-1 and the draw's
+// first vertex becomes the base vertex, so gl_VertexIndex is unchanged.
+static uint32_t fan_to_list(const void *src, int index_size, uint32_t count, int restart, uint32_t *out) {
+    uint32_t n = 0, have = 0, hub = 0, prev = 0;
+    uint32_t restart_value = index_size == 2 ? 0xffffu : 0xffffffffu;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t v = !src ? i : index_size == 2 ? ((const uint16_t *)src)[i] : ((const uint32_t *)src)[i];
+        if (src && restart && v == restart_value) { have = 0; continue; }
+        if (have == 0) hub = v;
+        else if (have >= 2) { out[n++] = prev; out[n++] = v; out[n++] = hub; }
+        prev = v; have++;
+    }
+    return n;
+}
+static void *buffer_cpu(VkBuffer b) {                 // (a buffer the CPU can read: host-visible memory)
+    if (!b || !b->mtl || b->mtl.storageMode == MTLStorageModePrivate) return NULL;
+    return b->mtl.contents;
+}
+static int topology_is_fan(vk_enc *e) {
+    struct VkPipeline_T *p = e->gp;
+    return p && ((p->dynamic & VK_DYN_TOPOLOGY) ? e->topology : p->topology) == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+}
+static void fan_draw(vk_enc *e, int indexed, uint32_t count, uint32_t instances, uint32_t first, int32_t vertex_offset,
+                     uint32_t first_instance) {
+    if (count < 3 || !instances) return;
+    const void *src = NULL;
+    int index_size = 4;
+    if (indexed) {
+        if (!e->ib || !e->ib->mtl) return;
+        index_size = e->ib_type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+        uint8_t *base = buffer_cpu(e->ib);
+        uint64_t off = e->ib->offset + e->ib_offset + (uint64_t)first * index_size;
+        if (!base || off + (uint64_t)count * index_size > e->ib->mtl.length) {
+            static int once;
+            if (!once++) vx_log("vulkan: an indexed triangle fan from GPU-only memory is not supported (skipped)");
+            return;
+        }
+        src = base + off;
+    }
+    uint64_t max = 3ull * (count - 2);
+    if (max * 4 > (1ull << 30)) return;
+    uint32_t *list = malloc((size_t)max * 4);
+    if (!list) return;
+    uint32_t n = fan_to_list(src, index_size, count, src && (e->primitive_restart_set ? e->primitive_restart : e->gp->primitive_restart), list);
+    if (n) {
+        id<MTLBuffer> ib = [e->dev->mtl newBufferWithBytes:list length:(NSUInteger)n * 4 options:MTLResourceStorageModeShared];
+        if (ib) [e->render drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:n indexType:MTLIndexTypeUInt32 indexBuffer:ib
+                                indexBufferOffset:0 instanceCount:instances baseVertex:indexed ? vertex_offset : (NSInteger)first
+                                     baseInstance:first_instance];
+    }
+    free(list);
+}
+
 // ---- geometry shaders ----
 // A draw with a geometry shader ends the Metal render pass, runs the vertex shader as a kernel over the draw's
 // vertices and instances (outputs to slots), the geometry shader as a kernel over its primitives (triangles out),
@@ -1229,6 +1285,7 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
                     }
                     break;
                 case S_DEPTH_BIAS_ENABLE: e->depth_bias_enable = c->u[0]; break;
+                case S_PRIMITIVE_RESTART: e->primitive_restart = c->u[0] != 0; e->primitive_restart_set = 1; break;
                 default: break;
                 }
                 e->state_dirty = 1;
@@ -1238,6 +1295,7 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
                 c_draw *c = (c_draw *)h;
                 if (c->count && c->instances && e->render && e->gp && e->gp->gs_kernel) { gs_draw(e, c, h->op == C_DRAW_INDEXED); break; }
                 if (!c->count || !c->instances || !prepare_draw(e)) break;
+                if (topology_is_fan(e)) { fan_draw(e, h->op == C_DRAW_INDEXED, c->count, c->instances, c->first, c->vertex_offset, c->first_instance); break; }
                 MTLPrimitiveType pt = current_primitive(e);
                 if (h->op == C_DRAW)
                     [e->render drawPrimitives:pt vertexStart:c->first vertexCount:c->count instanceCount:c->instances baseInstance:c->first_instance];
@@ -1266,6 +1324,18 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
                         uint32_t n = *(uint32_t *)((uint8_t *)c->count_buffer->memory->map + c->count_buffer->memory_offset + c->count_offset);
                         if (n < draws) draws = n;
                     }
+                }
+                if (topology_is_fan(e)) {
+                    // (fans: the arguments are read now, when the CPU can read them, and drawn as lists)
+                    uint8_t *args = buffer_cpu(c->buffer);
+                    for (uint32_t i = 0; args && i < draws; i++) {
+                        uint64_t off = c->buffer->offset + c->offset + (uint64_t)i * (c->stride ? c->stride : (c->indexed ? 20 : 16));
+                        if (off + (c->indexed ? 20 : 16) > c->buffer->mtl.length) break;
+                        const uint32_t *a = (const uint32_t *)(args + off);
+                        if (c->indexed) fan_draw(e, 1, a[0], a[1], a[2], (int32_t)a[3], a[4]);
+                        else fan_draw(e, 0, a[0], a[1], a[2], 0, a[3]);
+                    }
+                    break;
                 }
                 for (uint32_t i = 0; i < draws; i++) {
                     uint64_t off = c->buffer->offset + c->offset + (uint64_t)i * (c->stride ? c->stride : (c->indexed ? 20 : 16));

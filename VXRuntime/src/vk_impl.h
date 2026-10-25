@@ -287,6 +287,7 @@ struct VkPipeline_T {
     uint8_t vertex_rate[VKMSL_MAX_VERTEX_BUFFERS];   // 1: per instance
     uint32_t vertex_divisor[VKMSL_MAX_VERTEX_BUFFERS];
     VkPrimitiveTopology topology;
+    uint8_t primitive_restart;            // (input assembly's primitiveRestartEnable)
 };
 
 // Render passes: attachments and subpasses as given; framebuffers name the views.
