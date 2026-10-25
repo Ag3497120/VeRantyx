@@ -7,6 +7,9 @@
 #   scripts/launch_vxrt_nms_vr.sh                  # the ALVR app on the headset (App Store "ALVR", default)
 #   VERANTYX_ALVR=0 scripts/launch_vxrt_nms_vr.sh  # the VeRantyx Vision Pro app instead
 #   VXRT_VR_QUALITY=3k ...                         # a VeRantyx quality preset (scripts/launch_vxrt_steamvr.sh)
+#   VXRT_FLAT=1 scripts/launch_vxrt_nms_vr.sh      # on the Mac's screen: no SteamVR, steam.exe -applaunch 275850
+#   VXRT_WSTEAM_NO_START=1 ...                     # Windows Steam must be running already (the Mac app: the player
+#                                                  # opened it and signed in; nothing is started or clicked here)
 #
 # What it does, until No Man's Sky exits or Ctrl-C:
 # 1. Windows Steam: used if it runs already, else started (scripts/launch_vxrt_windows_steam.sh; its "Steam Service
@@ -37,13 +40,14 @@ export VERANTYX_ALVR="${VERANTYX_ALVR:-1}"
 if pgrep -f "build/vxrt.*(vrserver|vrcompositor)" >/dev/null; then echo "SteamVR on VXRuntime is already running" >&2; exit 1; fi
 if pgrep -if "build/vxrt.*No Man's Sky/Binaries/NMS.exe" >/dev/null; then echo "No Man's Sky is already running" >&2; exit 1; fi
 mkdir -p "$LOG_DIR"
-make -C "$REPO_ROOT/VXRuntime" build/vxrt >/dev/null
+[[ -f "$REPO_ROOT/VXRuntime/Makefile" ]] && make -C "$REPO_ROOT/VXRuntime" build/vxrt >/dev/null   # (the Mac app's runtime has none)
 
 steam_cmd() { (cd "$STEAM_DIR" && env -u VXRT_STEAM_BRIDGE VXRT_ROOT="$WSTEAM_ROOT" VXRT_DLL_PATH="$VXRT_REDIST" "$VXRT" steam.exe "$@") >/dev/null 2>&1; }
 
 # 1. Windows Steam.
 STEAM_PID=""
 if ! pgrep -f "build/vxrt steam.exe" >/dev/null; then
+    [[ "${VXRT_WSTEAM_NO_START:-0}" == 1 ]] && { echo "Windows Steam is not running: open it and sign in first" >&2; exit 1; }
     echo "Starting Windows Steam (signs in with its saved login)"
     VXRT_CONTROL="$STEAM_SOCKET" VXRT_CONTROL_FOR=steam.exe VXRT_WSTEAM_GPU="${VXRT_WSTEAM_GPU:-1}" \
         VXRT_WSTEAM_WEBHELPER_ARGS="${VXRT_WSTEAM_WEBHELPER_ARGS:---single-process --disable-gpu-compositing}" \
@@ -61,6 +65,18 @@ except Exception: print("")' || true)"
         if [[ -n "$hwnd" ]]; then python3 "$REPO_ROOT/tools/vxrt_clip.py" --socket "$STEAM_SOCKET" click "$hwnd" 525 120 >/dev/null || true; break; fi
     done
     sleep "${VXRT_WSTEAM_SIGNIN_WAIT:-30}"                    # (Steam signs in before it takes -applaunch)
+fi
+
+# On the Mac's screen: the game as Steam's own Play starts it, without SteamVR; then until it exits.
+if [[ "${VXRT_FLAT:-0}" == 1 ]]; then
+    echo "Starting No Man's Sky on the Mac's screen through Windows Steam"
+    steam_cmd -applaunch "$APP_ID"
+    for _ in $(seq 1 120); do pgrep -if "build/vxrt.*No Man's Sky/Binaries/NMS.exe" >/dev/null && break; sleep 1; done
+    pgrep -if "build/vxrt.*No Man's Sky/Binaries/NMS.exe" >/dev/null || { echo "No Man's Sky did not start (log: ~/Library/Logs/VeRantyx/vxrt-windows-steam.log)" >&2; exit 1; }
+    echo "No Man's Sky is running (log: ~/Library/Logs/VeRantyx/vxrt-windows-steam.log); quit the game from its menu"
+    while pgrep -if "build/vxrt.*No Man's Sky/Binaries/NMS.exe" >/dev/null; do sleep 2; done
+    echo "No Man's Sky exited"
+    exit 0
 fi
 
 # 2. SteamVR and the encoder, in Steam's root.

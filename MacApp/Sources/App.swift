@@ -3,7 +3,8 @@
 // Also, for testing without the window (development):
 //   VeRantyx --collect-redist              gathers the runtime DLLs as the app does (VXRT_REDIST: elsewhere)
 //   VeRantyx --play <app id> [seconds]     starts a game as the Play button does and reports what the app sees
-//                                          (--flat too: on the Mac's screen, as the "On this Mac" button does)
+//                                          (--flat too: on the Mac's screen, as the "On this Mac" button does;
+//                                          --dry-run: prints the script, arguments and settings it would run, runs none)
 //   VeRantyx --snapshot <folder>           saves pictures of each page of the window (scrolled: <page>-2.png, ...)
 //   VeRantyx --report                      saves the logs as a report does and prints the form's link (opens nothing)
 //   VeRantyx --missing-functions <log>     prints the missing Windows functions a game log names, as the report sends them
@@ -59,6 +60,7 @@ enum Entry {
             let id = a[i + 1]
             let seconds = i + 2 < a.count ? Double(a[i + 2]) ?? 90 : 90
             let flat = a.contains("--flat")
+            if a.contains("--dry-run") { setenv("VERANTYX_DRY_RUN", "1", 1) }
             Task { @MainActor in await Headless.play(id, seconds: seconds, flat: flat) }
             RunLoop.main.run()                            // (the run loop, not dispatchMain: the app's timers need it)
         }
@@ -116,9 +118,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for _ in 0..<50 where model.games.isEmpty { try? await Task.sleep(nanoseconds: 200_000_000) }
         print("ready=\(model.ready) rosetta=\(model.rosetta ?? false) steam=\(model.steamRunning) steamVR=\(model.steamVR) dlls=\(model.redistCount) games=\(model.games.map(\.id))")
         guard let game = model.games.first(where: { $0.id == id }) else { print("\(id): not installed"); exit(2) }
-        print("start \(game.name): exe=\(game.exe?.path ?? "(own launcher)") headset=\(model.headset.rawValue) quality=\(model.quality.rawValue) flat=\(flat)")
+        print("start \(game.name): exe=\(game.exe?.path ?? "(own launcher)") headset=\(model.headset(for: game).rawValue) quality=\(model.quality(for: game).rawValue) flat=\(flat)")
         model.start(game, flat: flat)
         guard let play = model.play else { print("did not start: \(model.error ?? "")"); exit(1) }
+        if Play.dryRun { for _ in 0..<20 where play.running { try? await Task.sleep(nanoseconds: 100_000_000) }; print(play.dryRunText); exit(0) }
         let began = Date()
         while Date().timeIntervalSince(began) < seconds && play.running {
             try? await Task.sleep(nanoseconds: 5_000_000_000)

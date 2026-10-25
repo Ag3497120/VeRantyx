@@ -15,6 +15,8 @@ struct Game: Identifiable, Hashable {
     var alyx: Bool { id == "546560" }
     var playable: Bool { antiCheat.isEmpty && (alyx || exe != nil) }
     var flat: Bool { title?.flat == true }
+    /// Started by the player's own Windows Steam (No Man's Sky), not with Mac Steam's bridge.
+    var viaWindowsSteam: Bool { title?.windowsSteam == true }
 }
 
 enum Page: String, CaseIterable, Identifiable {
@@ -51,6 +53,10 @@ struct Job {
     var rosetta: Bool? = nil
     var steamInstalled = false
     var steamRunning = false
+    /// The player's Windows Steam on VXRuntime (WindowsSteam), for the games it starts.
+    var windowsSteamInstalled = false
+    var windowsSteamRunning = false
+    @ObservationIgnored private var windowsSteamProcess: Process? = nil
     var freeBytes: Int64? = nil
     var drive = Paths.drive
 
@@ -78,8 +84,15 @@ struct Job {
     var quality: Quality = Quality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .standard {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
     }
+    /// Each game's way to the headset, chosen on its card (Route's raw value by app id); a game not in it follows the
+    /// Headset page. Kept in the setting "headsetRoutes".
+    var routes: [String: String] = (UserDefaults.standard.dictionary(forKey: "headsetRoutes") as? [String: String]) ?? [:] {
+        didSet { UserDefaults.standard.set(routes, forKey: "headsetRoutes") }
+    }
     var play: Play? = nil
     var elsewhere: [String] = []          // VXRuntime programs running that the app did not start (the scripts')
+    /// The same without the player's Windows Steam itself (steam.exe and its web helper), which runs on between plays.
+    var elsewhereBesidesWindowsSteam: [String] { elsewhere.filter { !WindowsSteam.isOwn($0) } }
 
     init() {
         Task { await refresh() }
@@ -107,6 +120,9 @@ struct Job {
     func refreshLight() async {
         steamInstalled = Steam.installed
         steamRunning = await Steam.running()
+        windowsSteamInstalled = WindowsSteam.installed
+        let wsteam = windowsSteamInstalled ? await WindowsSteam.running() : false
+        windowsSteamRunning = wsteam
         freeBytes = Mac.freeSpace(drive)
         elsewhere = play?.running == true ? [] : await pgrep("[b]uild/vxrt.*\\.exe")
     }
@@ -115,10 +131,13 @@ struct Job {
         let installed = Library.installed()
         steamVR = installed[Title.steamVR] != nil
         redistCount = Redist.count
-        let found = installed.filter { $0.key != Title.steamVR && $0.key != "228980" }
+        var found = installed.filter { $0.key != Title.steamVR && $0.key != "228980" && Title.named($0.key)?.windowsSteam != true }
+        // (the games Windows Steam starts: from its own library, where it keeps them)
+        for (id, entry) in Library.windowsSteamGames() { found[id] = entry }
+        let entries = found
         Task.detached {
             var list: [Game] = []
-            for (id, entry) in found {
+            for (id, entry) in entries {
                 let title = Title.named(id)
                 let scan = Library.scan(entry.folder, name: entry.app.name, exe: title?.exe)
                 list.append(Game(id: id, name: entry.app.name.isEmpty ? (title?.name ?? id) : entry.app.name, folder: entry.folder,
@@ -161,7 +180,7 @@ struct Job {
     /// Downloads the Windows builds of the chosen titles with the user's own Steam account (steamcmd), one at a time,
     /// SteamVR first; then gathers the runtime files.
     func download() async {
-        let ids = Title.all.map(\.id).filter { wanted.contains($0) && !isInstalled($0) }
+        let ids = Title.all.map(\.id).filter { wanted.contains($0) && !isInstalled($0) && Title.named($0)?.windowsSteam != true }
         guard !ids.isEmpty, !account.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         error = nil
         let need = ids.compactMap { Title.named($0)?.bytes }.reduce(0, +)
@@ -270,12 +289,76 @@ struct Job {
 
     // MARK: play
 
+    /// A game's way to the headset: its card's choice, else the Headset page's.
+    func route(for game: Game) -> Route { routes[game.id].flatMap(Route.init(rawValue:)) ?? headset.route }
+
+    /// Chooses a game's way to the headset; the Headset page's own is kept as "none chosen" (it then follows that page).
+    func setRoute(_ route: Route, for game: Game) {
+        if route == headset.route { routes.removeValue(forKey: game.id) } else { routes[game.id] = route.rawValue }
+    }
+
+    /// The headset a game streams to: the VeRantyx app on a Vision Pro, or ALVR on the headset the Headset page names
+    /// (a Vision Pro's ALVR app when that page has the VeRantyx app).
+    func headset(for game: Game) -> Headset {
+        switch route(for: game) {
+        case .visionApp: return .visionApp
+        case .alvr: return headset.usesALVR ? headset : .visionALVR
+        }
+    }
+
+    /// The picture setting for a game: the Play page's, when its way to the headset offers it; else Recommended.
+    func quality(for game: Game) -> Quality { Quality.choices(for: headset(for: game)).contains(quality) ? quality : .standard }
+
+    /// Whether a game can start now, on the Mac's screen or in the headset.
+    func canStart(_ game: Game, flat: Bool) -> Bool {
+        guard game.playable, play?.running != true, !(flat && !game.flat) else { return false }
+        if game.viaWindowsSteam {
+            // (Windows Steam, opened and signed in to by the player, instead of Mac Steam; SteamVR only for the headset)
+            return appleSilicon && rosetta == true && redistCount > 0 && windowsSteamRunning && elsewhereBesidesWindowsSteam.isEmpty && (flat || steamVR)
+        }
+        return ready && steamRunning && elsewhere.isEmpty
+    }
+
+    /// Starts the player's Windows Steam (scripts/launch_vxrt_windows_steam.sh, with the settings
+    /// scripts/launch_vxrt_nms_vr.sh starts it with). Its window opens; the player signs in there and answers its
+    /// windows (such as "Steam Service Error": Cancel) themselves. It runs on after the app quits; it is quit from its
+    /// own window.
+    func openWindowsSteam() {
+        guard windowsSteamInstalled, !windowsSteamRunning, windowsSteamProcess?.isRunning != true else { return }
+        do {
+            try FileManager.default.createDirectory(at: Paths.logs, withIntermediateDirectories: true)
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = [Paths.runtime.appendingPathComponent("scripts/launch_vxrt_windows_steam.sh").path]
+            var env = ProcessInfo.processInfo.environment
+            env.removeValue(forKey: "VERANTYX_REPO")
+            env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+            env["VERANTYX_VR_DRIVE"] = Paths.drive.path
+            env["VXRT_REDIST"] = Paths.redist.path
+            env["VXRT_WSTEAM_LOG"] = Paths.logs.appendingPathComponent("vxrt-windows-steam.log").path
+            env["VXRT_WSTEAM_GPU"] = "1"
+            env["VXRT_WSTEAM_WEBHELPER_ARGS"] = "--single-process --disable-gpu-compositing"
+            p.environment = env
+            let log = Paths.logs.appendingPathComponent("vxrt-windows-steam-launch.log")
+            FileManager.default.createFile(atPath: log.path, contents: nil)
+            let out = try FileHandle(forWritingTo: log)
+            p.standardOutput = out
+            p.standardError = out
+            p.standardInput = FileHandle.nullDevice
+            try p.run()
+            windowsSteamProcess = p
+            windowsSteamRunning = true
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
     func start(_ game: Game, flat: Bool = false) {
         guard play?.running != true else { return }
         error = nil
         do {
-            play = try Play(title: game.name, appID: game.id, exe: game.alyx ? nil : game.exe, headset: headset, wired: wired, quality: quality,
-                            known: game.title, flat: flat && game.title?.flat == true)
+            play = try Play(title: game.name, appID: game.id, exe: game.alyx ? nil : game.exe, headset: headset(for: game), wired: wired,
+                            quality: quality(for: game), known: game.title, flat: flat && game.title?.flat == true)
         } catch {
             self.error = error.localizedDescription
         }
@@ -300,7 +383,7 @@ struct Job {
         var c = URLComponents(string: "https://github.com/Ag3497120/VeRantyx/issues/new")!
         let game = play.appID.map { "\(play.title) (\($0))" } ?? play.title
         let place = play.flat ? "The Mac's screen" :
-            "\(headset.name)\(headset == .quest && wired ? ", USB cable" : ""), \(quality.name)"
+            "\(play.headset.name)\(play.headset == .quest && wired ? ", USB cable" : ""), \(play.quality.name)"
         // (loading screens read 0 and start-up benchmarks run far above play, so the range is the middle 80 %)
         let samples = play.fpsSamples.filter { $0 >= 1 }.sorted()
         let minutes = Int(((play.endedAt ?? Date()).timeIntervalSince(play.startedAt) / 60).rounded())
@@ -316,7 +399,7 @@ struct Job {
             if losses > 0 { fps += ", \(losses) video losses" }
         }
         c.queryItems = [URLQueryItem(name: "template", value: "works.yml"),
-                        URLQueryItem(name: "title", value: "[runs] \(game) on \(Mac.chip)\(play.flat ? ", Mac screen" : ", \(headset.rawValue)")"),
+                        URLQueryItem(name: "title", value: "[runs] \(game) on \(Mac.chip)\(play.flat ? ", Mac screen" : ", \(play.headset.rawValue)")"),
                         URLQueryItem(name: "game", value: game),
                         URLQueryItem(name: "mode", value: place),
                         URLQueryItem(name: "mac", value: "\(Mac.model), \(Mac.chip), \(Mac.memoryGB) GB, macOS \(Mac.macOS), VeRantyx \(AppBuild.description)"),
@@ -342,6 +425,8 @@ struct Job {
     func reportURL(logs: String? = nil) -> URL {
         var c = URLComponents(string: "https://github.com/Ag3497120/VeRantyx/issues/new")!
         let kind: String
+        let headset = play?.headset ?? headset             // (the last play's: its game may take another way)
+        let quality = play?.quality ?? quality
         switch headset {
         case .quest: kind = "[ALVR] Quest/Pico"
         case .visionALVR: kind = "[ALVR] Vision Pro"

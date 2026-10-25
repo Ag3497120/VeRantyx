@@ -214,6 +214,9 @@ struct SetupView: View {
                         HStack(spacing: 10) {
                             if model.isInstalled(t.id) {
                                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).frame(width: 18)
+                            } else if t.windowsSteam {
+                                // (not steamcmd's: it comes from the player's own Windows Steam)
+                                Image(systemName: "circle.dashed").foregroundStyle(.secondary).frame(width: 18)
                             } else {
                                 Toggle("", isOn: Binding(get: { model.wanted.contains(t.id) || t.id == Title.steamVR },
                                                          set: { if $0 { model.wanted.insert(t.id) } else if t.id != Title.steamVR { model.wanted.remove(t.id) } }))
@@ -226,9 +229,14 @@ struct SetupView: View {
                                     if t.free { Chip(text: T("Free", "無料"), color: .blue) }
                                 }
                                 Text(t.summary).font(.caption).foregroundStyle(.secondary)
+                                if t.windowsSteam && !model.isInstalled(t.id) {
+                                    Text(T("Install it in your Windows Steam (on VXRuntime), signed in to by you; it is not downloaded here.",
+                                           "あなたがサインインした Windows 版 Steam（VXRuntime 上）でインストールします。ここではダウンロードしません。"))
+                                        .font(.caption).foregroundStyle(.orange)
+                                }
                             }
                             Spacer()
-                            Text(model.isInstalled(t.id) ? T("Installed", "インストール済み") : gigabytes(t.bytes)).font(.callout).foregroundStyle(.secondary)
+                            Text(model.isInstalled(t.id) ? (t.windowsSteam ? T("In Windows Steam", "Windows 版 Steam に導入済み") : T("Installed", "インストール済み")) : gigabytes(t.bytes)).font(.callout).foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -314,7 +322,7 @@ struct ImportSheet: View {
             .padding(22)
             .frame(width: 560)
             .onAppear {
-                chosen = Set(choice.apps.map(\.id).filter { (Title.named($0) != nil) && !model.isInstalled($0) })
+                chosen = Set(choice.apps.map(\.id).filter { Title.named($0).map { !$0.windowsSteam } == true && !model.isInstalled($0) })
             }
         }
     }
@@ -413,11 +421,12 @@ struct PlayView: View {
             } else if !model.steamRunning {
                 Banner(icon: "exclamationmark.triangle", text: T("Open Steam and sign in: the games need it.", "Steam を開いてサインインしてください。ゲームに必要です。"), action: (T("Open Steam", "Steam を開く"), { Steam.open() }))
             }
-            if !model.elsewhere.isEmpty {
+            if !model.elsewhereBesidesWindowsSteam.isEmpty {
                 Banner(icon: "terminal", text: T("A game or SteamVR started elsewhere (Terminal) is running.", "別の場所（ターミナル）で起動したゲームか SteamVR が動いています。"),
                        action: (T("Stop it", "停止する"), { Task { await Play.stopEverything() } }))
             }
             if let play = model.play { SessionCard(play: play) }
+            if model.windowsSteamInstalled || model.games.contains(where: \.viaWindowsSteam) { WindowsSteamCard() }
 
             Card(title: T("Settings for this session", "今回の設定")) {
                 HStack {
@@ -431,6 +440,9 @@ struct PlayView: View {
                 }
                 .pickerStyle(.segmented)
                 Text(model.quality.detail).font(.callout).foregroundStyle(.secondary)
+                Text(T("Each game can take its own way to the headset: the ALVR app or the VeRantyx app, chosen on its card and kept for it.",
+                       "ゲームごとにヘッドセットへの経路（ALVR アプリか VeRantyx アプリ）を選べます。各カードで選び、ゲームごとに保存されます。"))
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
 
             if model.games.isEmpty {
@@ -465,7 +477,6 @@ struct Banner: View {
 struct GameCard: View {
     @Environment(AppModel.self) private var model
     var game: Game
-    private var canStart: Bool { game.playable && model.ready && model.steamRunning && model.play?.running != true && model.elsewhere.isEmpty }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -483,6 +494,7 @@ struct GameCard: View {
                                          : TF("Uses %@; VeRantyx does not run games with anti-cheat.", "%@ を使うため、VeRantyx では起動しません。", game.antiCheat.joined(separator: ", "))))
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
+            if game.playable { RoutePicker(game: game) }
             if game.flat {
                 // (two ways to play, one above the other and each as wide as the card: side by side, the labels were
                 //  cut short in the narrowest cards)
@@ -494,14 +506,15 @@ struct GameCard: View {
                         Label(T("On this Mac", "Mac の画面で"), systemImage: "desktopcomputer").frame(maxWidth: .infinity)
                     }
                     .help(T("Plays in a window on this Mac, without a headset or SteamVR.", "ヘッドセットも SteamVR も使わず、この Mac のウィンドウで遊びます。"))
+                    .disabled(!model.canStart(game, flat: true))
                     Button {
                         model.start(game)
                     } label: {
                         Label(T("Headset", "ヘッドセット"), systemImage: "visionpro").frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(!model.canStart(game, flat: false))
                 }
-                .disabled(!canStart)
             } else {
                 HStack {
                     Text(gigabytes(game.bytes)).font(.caption).foregroundStyle(.tertiary)
@@ -512,7 +525,7 @@ struct GameCard: View {
                         Label(T("Play", "プレイ"), systemImage: "play.fill").frame(minWidth: 70)
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!canStart)
+                    .disabled(!model.canStart(game, flat: false))
                 }
             }
         }
@@ -520,6 +533,58 @@ struct GameCard: View {
         .frame(minHeight: 150, alignment: .top)
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .controlBackgroundColor)))
         .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.primary.opacity(0.08)))
+    }
+}
+
+/// A game's way to the headset, on its card next to its Headset (Play) button: the ALVR app (a Vision Pro's, a Quest's
+/// or a Pico's) or the VeRantyx app on an Apple Vision Pro; kept for the game (AppModel.routes).
+struct RoutePicker: View {
+    @Environment(AppModel.self) private var model
+    var game: Game
+
+    var body: some View {
+        let headset = model.headset(for: game)
+        VStack(alignment: .leading, spacing: 3) {
+            Picker(T("Way to the headset", "ヘッドセットへの経路"), selection: Binding(get: { model.route(for: game) }, set: { model.setRoute($0, for: game) })) {
+                ForEach(Route.allCases) { Text($0.name).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(model.play?.running == true)
+            .help(T("ALVR app: ALVR on the headset (Apple Vision Pro from the App Store, Meta Quest, Pico; the Headset page says which). VeRantyx app: VeRantyx's own app on an Apple Vision Pro (hands and Joy-Con). Kept for this game.",
+                    "ALVR アプリ：ヘッドセットの ALVR（App Store の Apple Vision Pro 版、Meta Quest、Pico。どれかはヘッドセットのページで選びます）。VeRantyx アプリ：Apple Vision Pro 用の VeRantyx 自身のアプリ（手と Joy-Con）。このゲーム用に保存されます。"))
+            Text(TF("%@ · %@", "%@ · %@", headset.name, model.quality(for: game).name))
+                .font(.caption2).foregroundStyle(.secondary).lineLimit(2).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// The player's Windows Steam on VXRuntime, for the games it starts (No Man's Sky): whether it runs, and a button
+/// that opens it. Signing in and every window of Steam's are the player's own to answer.
+struct WindowsSteamCard: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Card(title: T("Windows Steam (for No Man's Sky)", "Windows 版 Steam（No Man's Sky 用）")) {
+            Check(ok: model.windowsSteamInstalled, text: T("Installed on VXRuntime", "VXRuntime に導入済み"),
+                  note: model.windowsSteamInstalled ? nil : T("Install Windows Steam into its own VXRuntime root first (the repository: scripts/launch_vxrt_windows_steam.sh).",
+                                                                "先に Windows 版 Steam を専用の VXRuntime のルートに入れてください（リポジトリの scripts/launch_vxrt_windows_steam.sh）。"))
+            if model.windowsSteamInstalled {
+                Check(ok: model.windowsSteamRunning, text: model.windowsSteamRunning ? T("Running", "起動中") : T("Not running", "起動していません"),
+                      note: T("Sign in in Steam's own window yourself. If “Steam Service Error” shows, choose Cancel yourself. VeRantyx never signs in, accepts an agreement or presses a button in Steam for you.",
+                              "Steam のウィンドウでご自身でサインインしてください。「Steam Service Error」が出たら、ご自身で Cancel を選びます。VeRantyx が代わりにサインインしたり、規約に同意したり、Steam のボタンを押したりすることはありません。")) {
+                    if !model.windowsSteamRunning {
+                        Button(T("Open Windows Steam", "Windows 版 Steam を開く")) { model.openWindowsSteam() }
+                            .disabled(!model.elsewhereBesidesWindowsSteam.isEmpty || model.play?.running == true)
+                    }
+                }
+                if model.windowsSteamRunning {
+                    Text(T("While it runs, only the games it starts can be played here; quit it from its own window for the others.",
+                           "起動中は、ここで遊べるのはこの Steam から起動するゲームだけです。ほかのゲームは、Steam をそのウィンドウから終了してから。"))
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
     }
 }
 
@@ -570,10 +635,14 @@ struct SessionCard: View {
                        "初回はゲームのシェーダをコンパイルするため、数分かかることがあります。2 回目からは速くなります。"))
                     .font(.callout).foregroundStyle(.secondary)
             }
+            if play.viaWindowsSteam && play.running {
+                Text(T("Stop ends the game (and SteamVR); Windows Steam stays open.", "停止するとゲーム（と SteamVR）が終わります。Windows 版 Steam は開いたままです。"))
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             if let notice = play.notice {
                 Label(notice, systemImage: play.usesLauncher ? "macwindow" : "visionpro").foregroundStyle(.blue).fixedSize(horizontal: false, vertical: true)
             }
-            if play.flat && play.gameStarted && play.running {
+            if play.flat && play.usesLauncher && play.gameStarted && play.running {
                 Label(T("Keyboard and mouse work as in Windows; for a DualSense, choose its preset in the game's Options > Controls. Esc opens the game's menu.",
                         "キーボードとマウスは Windows と同じく使えます。DualSense はゲームの オプション > 操作 でそのプリセットを選んでください。Esc でゲームのメニュー。"),
                       systemImage: "keyboard")

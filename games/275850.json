@@ -15,17 +15,21 @@
     }
   },
   "status": {
-    "state": "broken",
-    "level": "starts",
+    "state": "partial",
+    "level": "runs",
     "summary": {
-      "ja": "Steam の DRM ラッパー（SteamStub、NMS.exe の .bind 部）が Windows 版 Steam クライアントの共有メモリ Local\\SteamStart_SharedMemFile を探し、無いので「Application load error 3:0000065558」で止まる。ゲーム本体のコードと Vulkan には届いていない。",
-      "en": "Steam's DRM wrapper (SteamStub, the .bind section of NMS.exe) looks for the Windows Steam client's shared memory Local\\SteamStart_SharedMemFile and stops with \"Application load error 3:0000065558\" without it. The game's own code and Vulkan are not reached."
+      "ja": "本物の Windows 版 Steam（ユーザー自身がサインイン、~/Verantyx_VR_Drive/vxrt_wsteam）を VXRuntime で動かし、そこから起動する（steam.exe -applaunch 275850、VR は -HmdEnable 1。scripts/launch_vxrt_nms_vr.sh）。Mac の画面では惑星の地形まで描画され、ユーザーが遊べた。VR では Vision Pro の VeRantyx アプリで映像と音を確認。ALVR は確認中。fps は未計測。",
+      "en": "Started by the real Windows Steam client on VXRuntime, signed in to by the user (~/Verantyx_VR_Drive/vxrt_wsteam): steam.exe -applaunch 275850, with -HmdEnable 1 for VR (scripts/launch_vxrt_nms_vr.sh). On the Mac's screen it draws the planet's terrain and the user played it. In VR, picture and sound checked in the Vision Pro's VeRantyx app. ALVR is being checked. Frame rates not measured yet."
     },
-    "checked": "2026-10-23",
+    "checked": "2026-10-25",
     "machine": "Apple M1 Max, 32-core GPU"
   },
   "baselines": {},
   "known_issues": [
+    {
+      "summary": "2026-10-25: the SteamStub error below is answered by the real Windows Steam client the user signed in to (VXRuntime/README.md \"The Windows Steam client\"), not by imitating Steam. Started directly with scripts/launch_vxrt_game.sh the game still stops there. In VR through ALVR, not checked yet; no harness run or fps measurement yet.",
+      "since": "2026-10-25"
+    },
     {
       "summary": "Flat runs on 2026-10-23 (scripts/launch_vxrt_game.sh with VXRT_FLAT=1, buildid 25732212): the SteamStub stub first needed msvcrt.dll!vsprintf (an int3 loop at NMS.exe+0x76e60ec when GetProcAddress failed) and RegisterTraceGuidsW; with both, steam_api64's SteamAPI_Init loads the Steam bridge (SteamClient017/014 created), then the stub opens the event and file mapping Local\\SteamStart_SharedMemFile of a Windows Steam client, finds none and shows \"Steam Error: Application load error 3:0000065558\". Answering that Windows Steam client protocol ourselves would mean imitating Steam's DRM, which the rules forbid (AGENTS.md).",
       "since": "2026-10-23"

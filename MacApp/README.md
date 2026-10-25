@@ -15,6 +15,17 @@ core, the launch scripts), so the player's Mac needs only macOS and Steam: no Ho
   shows beside the Mac's, and the latency, from the headset's own statistics (ALVRBridge's `VeRantyx: headset:` line
   in session_log.txt), with advice when the network holds the stream up (fewer than three quarters of the Mac's
   frames shown, over 40 ms on the network, or video lost); the "it ran" report carries them too.
+- **Each game's way to the headset**: a switch on every game card, next to its Play/Headset button: the ALVR app
+  (Apple Vision Pro's from the App Store, or a Quest's or Pico's, as the Headset page says) or the VeRantyx app on an
+  Apple Vision Pro. Kept per game (the setting `headsetRoutes`); a game with none chosen follows the Headset page. The
+  ALVR app starts the game's script with `VERANTYX_ALVR=1`, the VeRantyx app with `VERANTYX_ALVR=0` and the quality
+  preset (`VXRT_VR_QUALITY`); the card shows the headset and picture setting the game will use.
+- **No Man's Sky** (and other games wrapped in Steam's DRM): started by the player's own Windows Steam on VXRuntime
+  (`~/Verantyx_VR_Drive/vxrt_wsteam`), through `scripts/launch_vxrt_nms_vr.sh` (`VXRT_FLAT=1` on the Mac's screen) with
+  `VXRT_WSTEAM_NO_START=1`. The Play page's Windows Steam card opens that Steam (`scripts/launch_vxrt_windows_steam.sh`);
+  the player signs in in its window and answers its windows (an update, the game's agreement, "Steam Service Error")
+  themselves: the app never signs in, accepts anything or presses a button in Steam for them. Stop ends the game and
+  SteamVR; Windows Steam stays open.
 - **Headset**: Meta Quest or Pico through ALVR (Wi-Fi or a USB cable), Apple Vision Pro with the VeRantyx app, or with
   the ALVR app; the steps for each.
 - **Help**: the logs folder, a report form on GitHub filled in with the Mac's facts, Stop everything.
