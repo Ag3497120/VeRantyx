@@ -233,6 +233,7 @@ static void fill_features(VkPhysicalDevice phys, VkPhysicalDeviceFeatures *f) {
     f->shaderClipDistance = 1; f->shaderInt16 = 1; f->shaderInt64 = 1; f->shaderResourceMinLod = 1;
     f->inheritedQueries = 1;
     f->geometryShader = 1;   // (as kernels: vk_command.m)
+    f->tessellationShader = 1;   // (the control shader as a kernel, Metal's tessellator: vk_command.m)
 }
 static void fill_features11(VkPhysicalDeviceVulkan11Features *f) {
     f->storageBuffer16BitAccess = 1; f->uniformAndStorageBuffer16BitAccess = 1; f->storagePushConstant16 = 1;
@@ -383,6 +384,10 @@ static void fill_limits(VkPhysicalDevice phys, VkPhysicalDeviceLimits *l) {
     l->maxDescriptorSetStorageImages = 500000; l->maxDescriptorSetInputAttachments = 8;
     l->maxVertexInputAttributes = 31; l->maxVertexInputBindings = VKMSL_MAX_VERTEX_BUFFERS;
     l->maxVertexInputAttributeOffset = 2047; l->maxVertexInputBindingStride = 2048;
+    l->maxTessellationGenerationLevel = 64; l->maxTessellationPatchSize = 32;
+    l->maxTessellationControlPerVertexInputComponents = 124; l->maxTessellationControlPerVertexOutputComponents = 124;
+    l->maxTessellationControlPerPatchOutputComponents = 120; l->maxTessellationControlTotalOutputComponents = 4096;
+    l->maxTessellationEvaluationInputComponents = 124; l->maxTessellationEvaluationOutputComponents = 124;
     l->maxVertexOutputComponents = 124; l->maxFragmentInputComponents = 124; l->maxFragmentOutputAttachments = 8;
     l->maxFragmentDualSrcAttachments = 1; l->maxFragmentCombinedOutputResources = 1000000;
     l->maxComputeSharedMemorySize = (uint32_t)phys->mtl.maxThreadgroupMemoryLength;

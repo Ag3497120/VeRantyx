@@ -62,7 +62,7 @@ VKFN VkResult VKAPI_CALL vkMergePipelineCaches(VkDevice dev, VkPipelineCache dst
 // ---- shader translation and compilation --------------------------------------------------------------------------
 static id<MTLFunction> compile_stage(VkDevice dev, const VkPipelineShaderStageCreateInfo *stage, uint32_t vkmsl_stage,
                                      const struct VkPipelineLayout_T *layout, uint32_t flags, uint32_t vary_slots,
-                                     vkmsl_result *res, id<MTLLibrary> *lib_out, VkResult *err) {
+                                     vkmsl_result *res, id<MTLLibrary> *lib_out, VkResult *err, const vkmsl_tess *tess) {
     VkShaderModule m = stage->module;
     const VkShaderModuleCreateInfo *inline_code = vk_find_struct(stage->pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
     const uint32_t *code = m ? m->code : inline_code ? inline_code->pCode : NULL;
@@ -80,11 +80,13 @@ static id<MTLFunction> compile_stage(VkDevice dev, const VkPipelineShaderStageCr
     }
     vkmsl_options o = { .stage = vkmsl_stage, .entry = stage->pName, .bindings = bindings, .binding_count = nb,
                         .specs = specs, .spec_count = ns, .flags = flags, .vary_slots = vary_slots };
+    if (tess) o.tess = *tess;
     int rc = vkmsl_translate(code, words, &o, res);
     if (rc) {
-        vx_log("vulkan: %s shader \"%s\" not translated: %s", vkmsl_stage == VKMSL_STAGE_VERTEX ? "vertex" :
+        vk_log_unique("vulkan: %s shader \"%s\" not translated: %s", vkmsl_stage == VKMSL_STAGE_VERTEX ? "vertex" :
                vkmsl_stage == VKMSL_STAGE_FRAGMENT ? "fragment" : vkmsl_stage == VKMSL_STAGE_COMPUTE ? "compute" :
-               vkmsl_stage == VKMSL_STAGE_GEOMETRY ? "geometry" : "other",
+               vkmsl_stage == VKMSL_STAGE_GEOMETRY ? "geometry" : vkmsl_stage == VKMSL_STAGE_TESS_CONTROL ? "tessellation control" :
+               vkmsl_stage == VKMSL_STAGE_TESS_EVALUATION ? "tessellation evaluation" : "other",
                stage->pName, res->error);
         *err = VK_ERROR_INITIALIZATION_FAILED;
         return nil;
@@ -101,7 +103,7 @@ static id<MTLFunction> compile_stage(VkDevice dev, const VkPipelineShaderStageCr
         NSError *e = nil;
         lib = [dev->mtl newLibraryWithSource:src options:opts error:&e];
         if (!lib) {
-            vx_log("vulkan: shader \"%s\" did not compile: %s", stage->pName, e.localizedDescription.UTF8String);
+            vk_log_unique("vulkan: shader \"%s\" did not compile: %s", stage->pName, e.localizedDescription.UTF8String);
             if (vk_trace()) vx_log("%s", res->msl);
             *err = VK_ERROR_INITIALIZATION_FAILED;
             return nil;
@@ -164,6 +166,7 @@ static MTLPrimitiveType primitive(VkPrimitiveTopology t, int *ok) {
     case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: return MTLPrimitiveTypeTriangleStrip;
     // Metal has no fans: their draws are made triangle lists, with indices built when they are encoded (vk_command.m).
     case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN: return MTLPrimitiveTypeTriangle;
+    case VK_PRIMITIVE_TOPOLOGY_PATCH_LIST: return MTLPrimitiveTypeTriangle;   // (with tessellation: Metal's triangles)
     default: *ok = 0; return MTLPrimitiveTypeTriangle;
     }
 }
@@ -205,6 +208,7 @@ static void pipeline_free(struct VkPipeline_T *p) {
     p->render = nil; p->compute = nil; p->depth_stencil = nil;
     for (int i = 0; i < 3; i++) p->gs_vs[i] = nil;
     p->gs_kernel = nil;
+    p->tcs_kernel = nil;
     vk_pipeline_layout_release_copy(&p->layout);
     free(p);
 }
@@ -245,58 +249,113 @@ static VkResult create_graphics(VkDevice dev, const VkGraphicsPipelineCreateInfo
         }
     }
     // Stages.
-    const VkPipelineShaderStageCreateInfo *vs = NULL, *fs = NULL, *gs = NULL;
+    const VkPipelineShaderStageCreateInfo *vs = NULL, *fs = NULL, *gs = NULL, *tcs = NULL, *tes = NULL;
     for (uint32_t i = 0; i < info->stageCount; i++) {
         const VkPipelineShaderStageCreateInfo *s = &info->pStages[i];
         if (s->stage == VK_SHADER_STAGE_VERTEX_BIT) vs = s;
         else if (s->stage == VK_SHADER_STAGE_FRAGMENT_BIT) fs = s;
         else if (s->stage == VK_SHADER_STAGE_GEOMETRY_BIT) gs = s;
-        else { vx_log("vulkan: shader stage 0x%x is not supported", s->stage); pipeline_free(p); return VK_ERROR_FEATURE_NOT_PRESENT; }
+        else if (s->stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT) tcs = s;
+        else if (s->stage == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) tes = s;
+        else {
+            if (vk_log_once("shader stage", s->stage)) vx_log("vulkan: shader stage 0x%x is not supported (logged once)", s->stage);
+            pipeline_free(p);
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
     }
-    if (!vs) { pipeline_free(p); return VK_ERROR_FEATURE_NOT_PRESENT; }
+    if (!vs || (!tcs != !tes) || (tcs && gs)) {
+        if (vs && tcs && gs && vk_log_once("tessellation with a geometry shader", 0))
+            vx_log("vulkan: tessellation with a geometry shader is not supported (logged once)");
+        pipeline_free(p);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    int tess = tcs != NULL;
     const VkPipelineRasterizationStateCreateInfo *rs = info->pRasterizationState;
     p->rasterizer_discard = rs && rs->rasterizerDiscardEnable;
     VkResult err = VK_SUCCESS;
-    vkmsl_result vr, fr, gr;
+    vkmsl_result vr, fr, gr, cr, er;
     memset(&fr, 0, sizeof fr);
     memset(&gr, 0, sizeof gr);
-    id<MTLFunction> vf = compile_stage(dev, vs, VKMSL_STAGE_VERTEX, &p->layout, gs ? VKMSL_FLAG_VERTEX_KERNEL : 0, 0, &vr, NULL, &err);
-    id<MTLFunction> ff = nil, gf = nil, pass = nil;
+    memset(&cr, 0, sizeof cr);
+    memset(&er, 0, sizeof er);
+    id<MTLFunction> vf = compile_stage(dev, vs, VKMSL_STAGE_VERTEX, &p->layout, gs || tess ? VKMSL_FLAG_VERTEX_KERNEL : 0, 0, &vr, NULL, &err, NULL);
+    id<MTLFunction> ff = nil, gf = nil, pass = nil, cf = nil, ef = nil;
     if (vf && gs) {
         id<MTLLibrary> lib = nil;
-        gf = compile_stage(dev, gs, VKMSL_STAGE_GEOMETRY, &p->layout, 0, vr.vary_locations, &gr, &lib, &err);
+        gf = compile_stage(dev, gs, VKMSL_STAGE_GEOMETRY, &p->layout, 0, vr.vary_locations, &gr, &lib, &err, NULL);
         if (gf) pass = [lib newFunctionWithName:@"vkpass"];
     }
+    vkmsl_tess tmodes = { 0 };
+    if (vf && tess) {
+        cf = compile_stage(dev, tcs, VKMSL_STAGE_TESS_CONTROL, &p->layout, 0, vr.vary_locations, &cr, NULL, &err, NULL);
+        if (cf) {
+            // (the evaluation shader is given what the control shader declares and writes; modes from either)
+            ef = compile_stage(dev, tes, VKMSL_STAGE_TESS_EVALUATION, &p->layout, 0, 0, &er, NULL, &err, &cr.tess);
+            tmodes = er.tess;
+            if (!tmodes.domain) tmodes.domain = cr.tess.domain;
+            if (!tmodes.spacing) tmodes.spacing = cr.tess.spacing;
+            if (!tmodes.order) tmodes.order = cr.tess.order;
+            tmodes.point_mode |= cr.tess.point_mode;
+        }
+        if (!ef) pass = nil;
+    }
+    if (tess) pass = ef;   // (the render pipeline's vertex function)
     attachment_formats pass_formats;
     formats_of(info, &pass_formats);
     uint32_t fs_flags = pass_formats.depth == VK_FORMAT_UNDEFINED ? VKMSL_FLAG_NO_DEPTH_ATTACHMENT : 0;
-    if (vf && (!gs || pass) && fs && !p->rasterizer_discard) ff = compile_stage(dev, fs, VKMSL_STAGE_FRAGMENT, &p->layout, fs_flags, 0, &fr, NULL, &err);
-    if (!vf || (gs && !pass) || (fs && !p->rasterizer_discard && !ff)) {
-        vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr);
+    if (vf && (!(gs || tess) || pass) && fs && !p->rasterizer_discard) ff = compile_stage(dev, fs, VKMSL_STAGE_FRAGMENT, &p->layout, fs_flags, 0, &fr, NULL, &err, NULL);
+    if (!vf || ((gs || tess) && !pass) || (fs && !p->rasterizer_discard && !ff)) {
+        vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr); vkmsl_result_free(&cr); vkmsl_result_free(&er);
         pipeline_free(p);
         return err ? err : VK_ERROR_INITIALIZATION_FAILED;
     }
     p->sets_vertex = vr.sets_used; p->sets_fragment = fr.sets_used; p->sets_geometry = gr.sets_used;
     p->push_vertex = vr.uses_push_constants; p->push_fragment = fr.uses_push_constants; p->push_geometry = gr.uses_push_constants;
     p->aux_vertex = vr.uses_aux; p->aux_fragment = fr.uses_aux; p->aux_geometry = gr.uses_aux;
+    p->sets_tcs = cr.sets_used; p->push_tcs = cr.uses_push_constants; p->aux_tcs = cr.uses_aux;
+    p->sets_tes = er.sets_used; p->push_tes = er.uses_push_constants; p->aux_tes = er.uses_aux;
 
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = gs ? pass : vf;
+    d.vertexFunction = gs || tess ? pass : vf;
+    if (tess) {
+        // Metal's tessellator, with the factors the control kernel writes (half precision, per patch and instance).
+        p->tess = 1;
+        p->tess_quad = tmodes.domain == 2;
+        p->patch_cp = info->pTessellationState ? info->pTessellationState->patchControlPoints : 0;
+        p->tess_out_vertices = cr.tess.out_vertices;
+        p->tess_cp_slots = cr.tess.cp_locations + 4;
+        p->tess_patch_slots = cr.tess.patch_locations + 2;
+        d.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+        d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatchAndPerInstance;
+        d.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+        d.tessellationFactorScaleEnabled = NO;
+        d.tessellationPartitionMode = tmodes.spacing == 2 ? MTLTessellationPartitionModeFractionalEven :
+                                      tmodes.spacing == 3 ? MTLTessellationPartitionModeFractionalOdd : MTLTessellationPartitionModeInteger;
+        d.maxTessellationFactor = 64;
+        // Vulkan's domain has its origin at the upper left: its counter-clockwise is Metal's clockwise (tests/vulkan_shaders.c).
+        d.tessellationOutputWindingOrder = tmodes.order == 1 ? MTLWindingCounterClockwise : MTLWindingClockwise;
+        if (tmodes.point_mode && vk_log_once("tessellation point mode", 0))
+            vx_log("vulkan: tessellation in point mode is drawn as triangles (logged once)");
+    }
     d.fragmentFunction = ff;
     // Vertex input.
     const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
-    MTLStageInputOutputDescriptor *sd = gs ? [MTLStageInputOutputDescriptor stageInputOutputDescriptor] : nil;
+    int vkernel = gs || tess;   // (the vertex shader as kernels)
+    MTLStageInputOutputDescriptor *sd = vkernel ? [MTLStageInputOutputDescriptor stageInputOutputDescriptor] : nil;
     const VkPipelineVertexInputDivisorStateCreateInfoEXT *div = vi ? vk_find_struct(vi->pNext, VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT) : NULL;
     for (uint32_t i = 0; vi && i < vi->vertexAttributeDescriptionCount; i++) {
         const VkVertexInputAttributeDescription *a = &vi->pVertexAttributeDescriptions[i];
         if (a->location >= 31 || !(vr.vertex_inputs & (1u << a->location))) continue;
         const vk_format_info *f = vk_format(a->format);
-        if (!f || f->vertex == MTLVertexFormatInvalid) { vx_log("vulkan: vertex format %d is not supported", a->format); continue; }
+        if (!f || f->vertex == MTLVertexFormatInvalid) {
+            if (vk_log_once("vertex format", a->format)) vx_log("vulkan: vertex format %d is not supported (logged once)", a->format);
+            continue;
+        }
         vd.attributes[a->location].format = f->vertex;
         vd.attributes[a->location].offset = a->offset;
         vd.attributes[a->location].bufferIndex = VKMSL_VERTEX_BUFFER + a->binding;
-        if (gs) {
+        if (vkernel) {
             sd.attributes[a->location].format = (MTLAttributeFormat)f->vertex;   // (the same values)
             sd.attributes[a->location].offset = a->offset;
             sd.attributes[a->location].bufferIndex = VKMSL_VERTEX_BUFFER + a->binding;
@@ -321,7 +380,7 @@ static VkResult create_graphics(VkDevice dev, const VkGraphicsPipelineCreateInfo
                     else { l.stepFunction = MTLVertexStepFunctionConstant; l.stepRate = 0; }
                 }
         } else l.stepFunction = MTLVertexStepFunctionPerVertex;
-        if (gs) {
+        if (vkernel) {
             // (the vertex kernel's threads: x the vertex, y the instance; the first vertex and instance are buffer offsets)
             MTLBufferLayoutDescriptor *k = sd.layouts[VKMSL_VERTEX_BUFFER + b->binding];
             k.stride = l.stride;
@@ -332,7 +391,7 @@ static VkResult create_graphics(VkDevice dev, const VkGraphicsPipelineCreateInfo
             else k.stepFunction = MTLStepFunctionThreadPositionInGridX;
         }
     }
-    if (!gs) d.vertexDescriptor = vd;
+    if (!vkernel) d.vertexDescriptor = vd;
     else {
         // The vertex shader as kernels: not indexed, 16-bit and 32-bit indices (the stage input fetches through them).
         for (int k = 0; k < 3; k++) {
@@ -350,25 +409,37 @@ static VkResult create_graphics(VkDevice dev, const VkGraphicsPipelineCreateInfo
             NSError *e = nil;
             p->gs_vs[k] = [dev->mtl newComputePipelineStateWithDescriptor:cd options:0 reflection:nil error:&e];
             if (!p->gs_vs[k]) {
-                vx_log("vulkan: vertex kernel failed: %s", e.localizedDescription.UTF8String);
-                vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr);
+                vk_log_unique("vulkan: vertex kernel failed: %s", e.localizedDescription.UTF8String);
+                vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr); vkmsl_result_free(&cr); vkmsl_result_free(&er);
                 pipeline_free(p);
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
         }
         NSError *e = nil;
+        if (tess) {
+            p->tcs_kernel = [dev->mtl newComputePipelineStateWithFunction:cf error:&e];
+            if (!p->tcs_kernel || p->tcs_kernel.maxTotalThreadsPerThreadgroup < p->tess_out_vertices) {
+                vk_log_unique("vulkan: tessellation control kernel failed: %s", e ? e.localizedDescription.UTF8String : "too many control points");
+                vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr); vkmsl_result_free(&cr); vkmsl_result_free(&er);
+                pipeline_free(p);
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            p->gs_in_slots = vr.vary_locations + 4;
+        } else
         p->gs_kernel = [dev->mtl newComputePipelineStateWithFunction:gf error:&e];
-        if (!p->gs_kernel) {
-            vx_log("vulkan: geometry kernel failed: %s", e.localizedDescription.UTF8String);
-            vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr);
+        if (!tess && !p->gs_kernel) {
+            vk_log_unique("vulkan: geometry kernel failed: %s", e.localizedDescription.UTF8String);
+            vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr); vkmsl_result_free(&cr); vkmsl_result_free(&er);
             pipeline_free(p);
             return VK_ERROR_INITIALIZATION_FAILED;
         }
+        if (!tess) {
         p->gs_in_vertices = gr.gs_in_vertices;
         p->gs_max_tris = gr.gs_max_triangles;
         p->gs_out_slots = gr.gs_out_slots;
         p->gs_invocations = gr.gs_invocations ? gr.gs_invocations : 1;
         p->gs_in_slots = vr.vary_locations + 4;
+        }
     }
     // Attachments.
     attachment_formats af;
@@ -410,22 +481,22 @@ static VkResult create_graphics(VkDevice dev, const VkGraphicsPipelineCreateInfo
     int ok = 1;
     p->topology = ia ? ia->topology : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     p->primitive_restart = ia && ia->primitiveRestartEnable;
-    if (gs) p->primitive = MTLPrimitiveTypeTriangle;   // (the geometry kernel's strips, as triangles)
+    if (gs || tess) p->primitive = MTLPrimitiveTypeTriangle;   // (the geometry kernel's strips, the tessellator's triangles)
     else {
         p->primitive = primitive(p->topology, &ok);
-        if (!ok) { vx_log("vulkan: topology %d is not supported", ia->topology); }
+        if (!ok && vk_log_once("topology", ia->topology)) vx_log("vulkan: topology %d is not supported (logged once)", ia->topology);
     }
     if (vr.uses_layer || gr.uses_layer || (p->dynamic & VK_DYN_TOPOLOGY)) d.inputPrimitiveTopology = topology_class(p->primitive);
     NSError *e = nil;
     p->render = [dev->mtl newRenderPipelineStateWithDescriptor:d error:&e];
     if (!p->render) {
-        vx_log("vulkan: render pipeline failed: %s", e.localizedDescription.UTF8String);
-        if (vk_trace()) { vx_log("%s", vr.msl); if (gr.msl) vx_log("%s", gr.msl); if (fr.msl) vx_log("%s", fr.msl); }
-        vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr);
+        vk_log_unique("vulkan: render pipeline failed: %s", e.localizedDescription.UTF8String);
+        if (vk_trace()) { vx_log("%s", vr.msl); if (gr.msl) vx_log("%s", gr.msl); if (er.msl) vx_log("%s", er.msl); if (fr.msl) vx_log("%s", fr.msl); }
+        vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr); vkmsl_result_free(&cr); vkmsl_result_free(&er);
         pipeline_free(p);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr);
+    vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr); vkmsl_result_free(&cr); vkmsl_result_free(&er);
     // Fixed state.
     if (rs) {
         p->cull = rs->cullMode == VK_CULL_MODE_FRONT_BIT ? MTLCullModeFront : rs->cullMode == VK_CULL_MODE_BACK_BIT ? MTLCullModeBack :
@@ -480,7 +551,7 @@ VKFN VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dev, VkPipelineCache 
         if (info->layout) vk_pipeline_layout_copy(&p->layout, info->layout);
         VkResult err = VK_SUCCESS;
         vkmsl_result cr;
-        id<MTLFunction> f = compile_stage(dev, &info->stage, VKMSL_STAGE_COMPUTE, &p->layout, 0, 0, &cr, NULL, &err);
+        id<MTLFunction> f = compile_stage(dev, &info->stage, VKMSL_STAGE_COMPUTE, &p->layout, 0, 0, &cr, NULL, &err, NULL);
         if (!f) { pipeline_free(p); result = err; continue; }
         p->threads = MTLSizeMake(cr.workgroup_size[0], cr.workgroup_size[1], cr.workgroup_size[2]);
         p->sets_compute = cr.sets_used;
@@ -490,7 +561,7 @@ VKFN VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dev, VkPipelineCache 
         NSError *e = nil;
         p->compute = [dev->mtl newComputePipelineStateWithFunction:f error:&e];
         if (!p->compute) {
-            vx_log("vulkan: compute pipeline failed: %s", e.localizedDescription.UTF8String);
+            vk_log_unique("vulkan: compute pipeline failed: %s", e.localizedDescription.UTF8String);
             pipeline_free(p);
             result = VK_ERROR_INITIALIZATION_FAILED;
             continue;

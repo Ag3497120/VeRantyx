@@ -200,12 +200,12 @@ VkResult vk_queue_submit_internal(VkQueue q, uint32_t n, const VkSubmitInfo2 *su
             VkFence f = fence;
             [mcb addCompletedHandler:^(id<MTLCommandBuffer> done) {
                 if (done.status == MTLCommandBufferStatusError)
-                    vx_log("vulkan: GPU work failed: %s", done.error.localizedDescription.UTF8String);
+                    vk_log_unique("vulkan: GPU work failed: %s", done.error.localizedDescription.UTF8String);
                 fence_signal(f);
             }];
         } else if (vk_trace()) {
             [mcb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-                if (done.status == MTLCommandBufferStatusError) vx_log("vulkan: GPU work failed: %s", done.error.localizedDescription.UTF8String);
+                if (done.status == MTLCommandBufferStatusError) vk_log_unique("vulkan: GPU work failed: %s", done.error.localizedDescription.UTF8String);
             }];
         }
         [mcb commit];

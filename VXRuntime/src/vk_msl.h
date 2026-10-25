@@ -41,6 +41,31 @@ typedef struct {
     uint32_t topology, invocations, in_slots, out_max_tris;   // topology: VkPrimitiveTopology of the draw
 } vkmsl_gs_params;
 #define VKMSL_NO_DYNAMIC 0xffffffffu
+// Tessellation (vk_command.m): the vertex shader as the same kernel as above (outputs into slots, read by the control
+// shader), the tessellation control shader as a kernel with a threadgroup per patch and a thread per output control
+// point (its outputs: each control point's slots, each patch's slots, and the patch's tessellation factors in Metal's
+// half-precision layout), and the evaluation shader as a post-tessellation vertex function reading those slots.
+// Per control point: slot 0 position, 1 + location, then clip distances and point size as above. Per patch: slot 0
+// the outer levels, slot 1 the inner levels, 2 + location the patch outputs.
+#define VKMSL_TESS_PARAMS 10u          // vkmsl_tess_params
+#define VKMSL_TESS_IN 11u              // control shader: the vertex kernel's slots; evaluation: the control points
+#define VKMSL_TESS_CP 12u              // control shader: the control points out; evaluation: the patches
+#define VKMSL_TESS_PATCH 13u           // control shader: the patches out
+#define VKMSL_TESS_FACTORS 30u         // control shader: the factors out (Metal's MTL*TessellationFactorsHalf)
+typedef struct {
+    uint32_t count, instances, patches;         // the draw's vertices, its instances, and patches (count / in_vertices)
+    uint32_t in_vertices, out_vertices;         // patchControlPoints; the control shader's OutputVertices
+    uint32_t quad;                              // the domain: 0 triangles, 1 quads
+    uint32_t pad[2];
+} vkmsl_tess_params;
+// A stage's tessellation execution modes (0: not declared), and what the control shader writes.
+typedef struct {
+    uint32_t domain;                      // 1 triangles, 2 quads, 3 isolines
+    uint32_t spacing;                     // 1 equal, 2 fractional even, 3 fractional odd
+    uint32_t order;                       // 1 clockwise, 2 counter-clockwise
+    uint32_t point_mode, out_vertices;
+    uint32_t cp_locations, patch_locations;   // control shaders: user locations per control point and per patch
+} vkmsl_tess;
 
 // Words in a set's argument buffer per descriptor of a Vulkan descriptor type (VkDescriptorType values).
 uint32_t vkmsl_descriptor_words(uint32_t vk_descriptor_type);
@@ -76,7 +101,8 @@ typedef struct {
     // as uint and converted in the shader. Bits: 1 float, 2 int, 3 uint.
     uint8_t vertex_input_class[32];
     uint32_t flags;                       // VKMSL_FLAG_*
-    uint32_t vary_slots;                  // geometry shaders: the user locations the vertex kernel wrote (its vary_locations)
+    uint32_t vary_slots;                  // geometry and tessellation control shaders: the user locations the vertex kernel wrote
+    vkmsl_tess tess;                      // evaluation shaders: the control shader's (its modes and what it writes)
 } vkmsl_options;
 
 enum {
@@ -99,6 +125,7 @@ typedef struct {
     uint32_t clip_distances;              // number written
     uint32_t vary_locations;              // vertex kernels: user locations written (slots 1..n)
     uint32_t gs_in_vertices, gs_max_triangles, gs_out_slots, gs_invocations;   // geometry shaders
+    vkmsl_tess tess;                      // tessellation shaders: their modes; control shaders what they write
     char error[256];                      // why translation failed
 } vkmsl_result;
 

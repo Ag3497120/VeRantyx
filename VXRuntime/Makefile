@@ -791,7 +791,7 @@ build/vulkan_shaders.exe: tests/vulkan_shaders.c $(wildcard tests/vulkan_shaders
 # The SPIR-V of tests/vulkan_shaders/* is committed (as C arrays): after changing a shader there, run this (needs
 # glslang); the tests themselves need no shader compiler.
 vulkan-test-shaders:
-	cd tests/vulkan_shaders && for f in *.comp *.vert *.frag *.geom; do \
+	cd tests/vulkan_shaders && for f in *.comp *.vert *.frag *.geom *.tesc *.tese; do \
 		glslang -V --target-env vulkan1.2 --vn spv_$$(echo $$f | tr . _) -o $$f.h $$f > /dev/null || exit 1; done
 
 build/vulkan_features.exe: tests/vulkan_features.c build/libvulkan-1.a third_party/vulkan/vulkan/vulkan_core.h
