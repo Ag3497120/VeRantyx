@@ -1220,6 +1220,7 @@ int main(int argc, char **argv, char **envp) {
     vx_tcptable_init();                          // (before client.c: replaces its GetExtendedTcpTable stand-in)
     vx_winprops_init();                          // (shell32's window property stores, propsys, the virtual desktop manager)
     vx_a11y_init();                              // (oleacc, UIAutomationCore, uxtheme)
+    vx_mfplat_init();                            // (Media Foundation, DXVA2: not started)
     vx_imagehlp_init();
     vx_spellcheck_init();
     vx_present_init();                           // (before desktop.c, client.c, user32.c, gdi.c, dwmapi.c: replaces stand-ins there)

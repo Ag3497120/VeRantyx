@@ -14,6 +14,7 @@ SRC    += src/shlock.c
 SRC    += src/tcptable.c
 SRC    += src/winprops.c
 SRC    += src/a11y.c
+SRC    += src/mfplat.c
 SRC    += src/imagehlp.c src/spellcheck.c src/ime.c src/clipboard.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
