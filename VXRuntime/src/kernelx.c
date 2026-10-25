@@ -315,6 +315,8 @@ static WINAPI BOOL SetThreadInformation(HANDLE h, int cls, void *info, DWORD siz
         qos_class_t q = qos_for_priority(priority((HANDLE)(intptr_t)-2));
         if (throttled && q != QOS_CLASS_BACKGROUND) q = QOS_CLASS_UTILITY;
         pthread_set_qos_class_self_np(q, 0);
+        void vx_fiber_slot_refresh(void);
+        vx_fiber_slot_refresh();   // (sync.c: the slot also holds the running fiber)
     }
     return 1;
 }

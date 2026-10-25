@@ -198,7 +198,11 @@ build/regwait.exe: tests/regwait.c
 	$(MINGW) -O1 -Wall -o $@ $<
 
 # Thread-pool callback instances: the *WhenCallbackReturns actions, CallbackMayRunLong, DisassociateCurrentThreadFromCallback.
-tests: build/tp_callbacks.exe
+tests: build/tp_callbacks.exe build/fiber_pool.exe
+# Fibers as job systems use them: gs:0x20 read inline, fibers moving between threads.
+build/fiber_pool.exe: tests/fiber_pool.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $<
 build/tp_callbacks.exe: tests/tp_callbacks.c
 	@mkdir -p build
 	$(MINGW) -O1 -Wall -o $@ $<
@@ -1337,6 +1341,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/net_events.exe
 	$(VXRT) build/regwait.exe
 	$(VXRT) build/tp_callbacks.exe
+	$(VXRT) build/fiber_pool.exe
 	$(VXRT) build/shellexec.exe
 	$(VXRT) build/file_io_ex.exe
 	$(VXRT) build/tcptable.exe

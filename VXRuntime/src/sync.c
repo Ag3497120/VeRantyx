@@ -58,6 +58,7 @@ static pthread_cond_t g_changed = PTHREAD_COND_INITIALIZER;     // suspended thr
 // held left Steam's web helper with every thread waiting for g_lock. Such a thread is signalled again until it is
 // stopped outside (the lock is held for short stretches only).
 static pthread_t g_lock_owner;
+void vx_fiber_slot_refresh(void);   // (fibers, below: after a change of this thread's QoS)
 static inline void glock(void) { pthread_mutex_lock(&g_lock); __atomic_store_n(&g_lock_owner, pthread_self(), __ATOMIC_RELEASE); }
 static inline void gunlock(void) { __atomic_store_n(&g_lock_owner, (pthread_t)NULL, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_lock); }
 // The thread waits in one of the runtime's blocking waits (vx_wait_begin/end): SuspendThread may stop it while the
@@ -682,6 +683,7 @@ static BOOL background_mode(HANDLE h, int begin) {
     gunlock();
     if (err) { vx_set_last_error(err); return 0; }
     pthread_set_qos_class_self_np(begin ? QOS_CLASS_BACKGROUND : qos_for(p), 0);
+    vx_fiber_slot_refresh();
     return 1;
 }
 static WINAPI BOOL SetThreadPriority(HANDLE h, int p) {
@@ -693,7 +695,7 @@ static WINAPI BOOL SetThreadPriority(HANDLE h, int p) {
     if (t) t->priority = p;
     gunlock();
     if (!t) { vx_set_last_error(6); return 0; }
-    if (self && !background) pthread_set_qos_class_self_np(qos_for(p), 0);   // (in background mode until it ends)
+    if (self && !background) { pthread_set_qos_class_self_np(qos_for(p), 0); vx_fiber_slot_refresh(); }   // (in background mode until it ends)
     else if (!self && raise && pt) pthread_override_qos_class_start_np(pt, qos_for(p), 0);
     return 1;
 }
@@ -1669,10 +1671,16 @@ static WINAPI BOOL SleepConditionVariableSRW(uint64_t *cv, void *l, DWORD ms, DW
 
 // ---- fibers ---------------------------------------------------------------------------------------------------------------------
 // A fiber is a stack and the registers to resume it; SwitchToFiber swaps stacks on the same thread (context.S).
-// The fiber running on a thread is in its TEB (FiberData, TEB+0x20), but Windows code that reads it directly
-// (GetCurrentFiber, gs:0x20) would find macOS's QoS slot there instead; so ConvertThreadToFiber on a thread that
-// is a fiber already returns that fiber instead of failing (the programs seen read gs:0x20 only after such a
-// failure), and conversions are counted. Fiber-local storage stays per thread.
+// The fiber running on a thread is in its TEB (FiberData, TEB+0x20). MSVC's GetCurrentFiber and GetFiberData are
+// inline reads of gs:0x20, which on x86-64 macOS is the pthread's TSD slot 4, where libpthread keeps the thread's QoS
+// (pthread_priority_t). So on a thread that is a fiber, the slot holds the running fiber too, set again after the
+// runtime changes the thread's QoS (SetThreadPriority). No Man's Sky's job threads raise their priority and then
+// switch to GetCurrentFiber()'s value: they were given the QoS value 0x10ff (user-interactive) and faulted at 0x110f.
+// What macOS reads from the slot as a priority must stay harmless: fibers are placed at 4 GB-aligned addresses, whose
+// low 32 bits (all of pthread_priority_t's QoS and flag bits) are zero, read as "no QoS". A fiber may be resumed on
+// another thread than the one it left (job systems do so): after a switch the thread is found again.
+// ConvertThreadToFiber on a thread that is a fiber already returns that fiber instead of failing; conversions are
+// counted. Fiber-local storage stays per thread.
 typedef struct vx_fiber {
     void *param;                     // first, as GetFiberData reads it
     void *sp;                        // saved stack pointer while not running
@@ -1687,20 +1695,64 @@ typedef struct vx_fiber {
 #define TEB_FIBER_DATA 0x20
 void vx_fiber_switch(void **save_sp, void *new_sp);
 static vx_fiber **current_fiber_slot(void) { return (vx_fiber **)(vx_teb() + TEB_FIBER_DATA); }
+#ifndef __aarch64__
+// Fiber records at 4 GB-aligned addresses (see above); deleted ones are kept for reuse.
+static vx_fiber *g_fiber_free;
+static uint64_t g_fiber_next = 0x200000000000ull;
+static vx_fiber *fiber_alloc(void) {
+    glock();
+    vx_fiber *f = g_fiber_free;
+    if (f) g_fiber_free = f->param;
+    for (int tries = 0; !f && tries < 4096; tries++) {
+        uint64_t want = g_fiber_next;
+        g_fiber_next += 1ull << 32;
+        if (g_fiber_next >= 0x7f0000000000ull) g_fiber_next = 0x200000000000ull;
+        void *p = mmap((void *)(uintptr_t)want, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) continue;
+        if ((uint64_t)(uintptr_t)p != want) { munmap(p, 16384); continue; }
+        f = p;
+    }
+    gunlock();
+    if (f) memset(f, 0, sizeof *f);
+    return f;
+}
+static void fiber_release(vx_fiber *f) { glock(); f->param = g_fiber_free; g_fiber_free = f; gunlock(); }
+static __thread uint64_t t_qos_slot;              // what slot 4 held before the thread became a fiber
+static __thread int t_qos_saved;
+static void gs_fiber_set(vx_fiber *f) {
+    if (f && !t_qos_saved) { __asm__ volatile("movq %%gs:0x20, %0" : "=r"(t_qos_slot)); t_qos_saved = 1; }
+    uint64_t v = f ? (uint64_t)(uintptr_t)f : t_qos_slot;
+    __asm__ volatile("movq %0, %%gs:0x20" :: "r"(v) : "memory");
+    if (!f) t_qos_saved = 0;
+}
+#else
+static vx_fiber *fiber_alloc(void) { return calloc(1, sizeof(vx_fiber)); }
+static void fiber_release(vx_fiber *f) { free(f); }
+static void gs_fiber_set(vx_fiber *f) { (void)f; }
+#endif
+// After the runtime changed this thread's QoS (which rewrites the slot): the running fiber put back.
+void vx_fiber_slot_refresh(void) {
+#ifndef __aarch64__
+    vx_fiber *f = *current_fiber_slot();
+    if (f) { __asm__ volatile("movq %%gs:0x20, %0" : "=r"(t_qos_slot)); __asm__ volatile("movq %0, %%gs:0x20" :: "r"(f) : "memory"); }
+#endif
+}
 static WINAPI void *ConvertThreadToFiberEx(void *param, DWORD flags) {
     (void)flags;
     vx_fiber **cur = current_fiber_slot();
     if (*cur) { (*cur)->converted++; return *cur; }
-    vx_fiber *f = calloc(1, sizeof *f);
+    vx_fiber *f = fiber_alloc();
+    if (!f) { vx_set_last_error(8); return NULL; }
     f->param = param; f->converted = 1;
     *cur = f;
+    gs_fiber_set(f);
     return f;
 }
 static WINAPI void *ConvertThreadToFiber(void *param) { return ConvertThreadToFiberEx(param, 0); }
 static WINAPI BOOL ConvertFiberToThread(void) {
     vx_fiber **cur = current_fiber_slot();
     if (!*cur) { vx_set_last_error(1280 /* ERROR_ALREADY_THREAD */); return 0; }
-    if (--(*cur)->converted <= 0 && !(*cur)->stack) { free(*cur); *cur = NULL; }
+    if (--(*cur)->converted <= 0 && !(*cur)->stack) { fiber_release(*cur); *cur = NULL; gs_fiber_set(NULL); }
     return 1;
 }
 static WINAPI BOOL IsThreadAFiber(void) { return *current_fiber_slot() != NULL; }
@@ -1722,7 +1774,8 @@ static WINAPI void *CreateFiberEx(uint64_t commit, uint64_t reserve, DWORD flags
     uint8_t *stack = mmap(NULL, size + page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (stack == MAP_FAILED) { vx_set_last_error(8); return NULL; }
     mprotect(stack, page, PROT_NONE);                              // a guard page below the stack
-    vx_fiber *f = calloc(1, sizeof *f);
+    vx_fiber *f = fiber_alloc();
+    if (!f) { munmap(stack, size + page); vx_set_last_error(8); return NULL; }
     f->param = param; f->start = start;
     f->stack = stack; f->stack_size = size + page; f->stack_top = stack + size + page;
     // The frame vx_fiber_switch pops: MXCSR and x87 control word, r15 r14 r13 r12 rbx rbp, then the return
@@ -1790,8 +1843,10 @@ static WINAPI void SwitchToFiber(void *to) {
         *(void **)(teb + 0x10) = f->stack;
     }
     *cur = f;
+    gs_fiber_set(f);
     vx_fiber_switch(&from->sp, f->sp);
-    // Back on this fiber.
+    // Back on this fiber, perhaps on another thread (whose SwitchToFiber made it the current one there).
+    teb = vx_teb();
     if (from->stack) { *(void **)(teb + 8) = from->stack_top; *(void **)(teb + 0x10) = from->stack; }
     else {
         pthread_t self = pthread_self();
@@ -1804,7 +1859,7 @@ static WINAPI void DeleteFiber(void *fiber) {
     if (!f) return;
     if (f == *current_fiber_slot()) ExitThread(0);                 // deleting the running fiber ends the thread
     if (f->stack) munmap(f->stack, f->stack_size);
-    free(f);
+    fiber_release(f);
 }
 
 // ---- fiber-local storage --------------------------------------------------------------------------------------------------------
