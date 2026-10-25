@@ -9,7 +9,7 @@ or an ALVR headset. Some also play on the Mac's own screen.</p>
   <a href="https://github.com/Ag3497120/VeRantyx/releases/latest"><img alt="Download VeRantyx for Mac" src="https://img.shields.io/github/v/release/Ag3497120/VeRantyx?label=VeRantyx%20for%20Mac&logo=apple"></a>
   <img alt="Apple silicon, macOS 14.2+" src="https://img.shields.io/badge/macOS-14.2%2B%20%C2%B7%20Apple%20silicon-black">
   <img alt="Headsets" src="https://img.shields.io/badge/headsets-Vision%20Pro%20%C2%B7%20ALVR-blue">
-  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/Ag3497120/VeRantyx"></a>
+  <a href="LICENSE"><img alt="PolyForm Noncommercial 1.0.0" src="https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue"></a>
 </p>
 
 <p align="center">
@@ -100,7 +100,7 @@ worked around).
 
 ## Under the hood
 
-Everything below is in this repository, MIT licensed, and was written for this project (with the exceptions listed in
+Everything below is in this repository, under the PolyForm Noncommercial License 1.0.0, and was written for this project (with the exceptions listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 
 - **VXRuntime — a Windows runtime written from scratch for Apple silicon.** No Wine, no wineserver: a PE loader and
@@ -143,5 +143,10 @@ Mac only. Licenses: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Not affili
 Meta, Nintendo, Sony, ALVR, Glovebox or Klepton.
 
 **Help wanted:** a Quest or Pico report (works or not), and game profiles with harness runs as evidence
-([games/README.md](games/README.md)). MIT © 2026 Ag3497120 (earlier versions contained about 120 lines of
-Wine-derived LGPL code: see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+([games/README.md](games/README.md)).
+
+**License:** © 2026 Ag3497120, [PolyForm Noncommercial 1.0.0](LICENSE) from 2026-10-25: free to use, change and
+share for any noncommercial purpose (personal use, study, research, hobby projects, non-profits); commercial use
+needs the author's permission. Versions published before 2026-10-25 (up to mac-v0.2.2) stay under the MIT License.
+(Earlier versions contained about 120 lines of Wine-derived LGPL code: see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).)

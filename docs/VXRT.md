@@ -298,7 +298,7 @@ plays PC VR games from an Apple Silicon Mac, but takes a different route. From i
 | Input | Vision Pro app: hand tracking + Joy-Con (buttons, sticks, triggers, inertial sensors); ALVR: the headset's controllers or hands, vibration passed on (not felt yet: no Quest); DirectInput 8 enumerates HID game controllers and supports immediate state, buffered object changes and polled event notification | VR controllers through ALVR: 6DoF, buttons, sticks, haptics |
 | Audio | Core Audio process tap, no extra driver (also to ALVR) | BlackHole virtual audio device |
 | Games checked | Half-Life: Alyx, The Lab, Google Earth VR | Half-Life: Alyx, Beat Saber, Minecraft (Vivecraft) and more, per its author |
-| Source | MIT, full source | Binaries only, 7-day trial then license key |
+| Source | Full source, PolyForm Noncommercial 1.0.0 (MIT up to mac-v0.2.2) | Binaries only, 7-day trial then license key |
 
 Running SteamVR keeps SteamVR Input (the game's own controller bindings), chaperone and the dashboard working, at the
 cost of `vrserver`/`vrcompositor` CPU time; MoltenVR's design avoids that cost but needs OpenComposite to cover each

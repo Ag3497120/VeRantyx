@@ -4,7 +4,7 @@
 name = "verantyx_alvr_bridge"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
