@@ -197,6 +197,12 @@ build/regwait.exe: tests/regwait.c
 	@mkdir -p build
 	$(MINGW) -O1 -Wall -o $@ $<
 
+# Thread-pool callback instances: the *WhenCallbackReturns actions, CallbackMayRunLong, DisassociateCurrentThreadFromCallback.
+tests: build/tp_callbacks.exe
+build/tp_callbacks.exe: tests/tp_callbacks.c
+	@mkdir -p build
+	$(MINGW) -O1 -Wall -o $@ $<
+
 # Views of file mappings on the 64 KB allocation granularity (src/files.c).
 build/view_align.exe: tests/view_align.c
 	@mkdir -p build
@@ -1330,6 +1336,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/net.exe
 	$(VXRT) build/net_events.exe
 	$(VXRT) build/regwait.exe
+	$(VXRT) build/tp_callbacks.exe
 	$(VXRT) build/shellexec.exe
 	$(VXRT) build/file_io_ex.exe
 	$(VXRT) build/tcptable.exe
