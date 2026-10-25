@@ -12,6 +12,7 @@
 //   key <hwnd> <vk>[+<vk>...]  keys pressed in order and let go in reverse (virtual-key codes, decimal or 0x..: 0x11+0x56
 //                              is Ctrl+V), to the focus window when it is hwnd or inside it; no WM_CHAR: see type
 //   type <hwnd> <text>         the characters of <text> (UTF-8) as WM_CHAR, to the focus window when it is inside hwnd
+//   pointer <hwnd> <x> <y>     the pointer moved to client x, y, no button (WM_MOUSEMOVE; GetCursorPos for a second)
 //   wheel <hwnd> <x> <y> <delta>  the mouse wheel turned (120 a notch, positive away from the user) with the pointer at
 //                              client x, y: WM_MOUSEWHEEL to the focus window, as Windows sends it
 //   ime <hwnd> <text>          <text> composed in the input method, then committed: WM_IME_STARTCOMPOSITION,
@@ -161,6 +162,10 @@ static void request(int fd, char *line) {
             if (*end && *end != '+') { reply_err(fd, "key <hwnd> <vk>[+<vk>...]"); return; }
         }
         vx_ui_keys(h, vks, n);
+    } else if (!strcmp(cmd, "pointer")) {
+        char *x = word(&s), *y = word(&s);
+        if (!x || !y) { reply_err(fd, "pointer <hwnd> <x> <y>"); return; }
+        vx_ui_pointer(h, atoi(x), atoi(y));
     } else if (!strcmp(cmd, "wheel")) {
         char *x = word(&s), *y = word(&s), *d = word(&s);
         if (!x || !y || !d) { reply_err(fd, "wheel <hwnd> <x> <y> <delta>"); return; }

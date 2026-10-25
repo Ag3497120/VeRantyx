@@ -942,6 +942,57 @@ static void tessellation(void) {
     CHECK(q1_in && q1_edge && q1_corner); CHECK(q7_in && !q7_edge); CHECK(!qcw_in);
     printf("vulkan_shaders: tessellated quad: level 1 inside %d edge %d corners %d, level 7 inside %d edge %d, cw culled %d\n",
            q1_in, q1_edge, q1_corner, q7_in, q7_edge, !qcw_in);
+
+    // Several tessellation draws in one pass, with other state between them (the runtime runs their kernels before the
+    // pass, each into its own place: vk_command.m, hoist_tessellation): the left half a triangle at level 8 (its top
+    // edge bowed in), the right half a quad at level 1 (straight edges), each with its own vertex buffer, push
+    // constant and viewport.
+    VkCommandBuffer cb = begin();
+    to_general(cb, target.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkRenderingAttachmentInfo a = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .color = { .float32 = { 0, 0, 0, 0 } } } };
+    VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { S, S } }, .layerCount = 1,
+                           .colorAttachmentCount = 1, .pColorAttachments = &a };
+    vkCmdBeginRendering(cb, &ri);
+    VkDeviceSize zero = 0;
+    VkViewport left = { 0, 0, S / 2, S, 0, 1 }, right = { S / 2, 0, S / 2, S, 0, 1 };
+    VkRect2D all = { { 0, 0 }, { S, S } };
+    vkCmdSetScissor(cb, 0, 1, &all);
+    float eight = 8.0f, one = 1.0f;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, tri_ccw);
+    vkCmdSetViewport(cb, 0, 1, &left);
+    vkCmdBindVertexBuffers(cb, 0, 1, &tvb.buffer, &zero);
+    vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_ALL, 0, 4, &eight);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, quad_ccw);
+    vkCmdSetViewport(cb, 0, 1, &right);
+    vkCmdBindVertexBuffers(cb, 0, 1, &qvb.buffer, &zero);
+    vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_ALL, 0, 4, &one);
+    vkCmdDraw(cb, 4, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    barrier(cb);
+    to_buffer(cb, target.image, 0, 0, S, S, rb.buffer, 0);
+    submit(cb);
+    // (left: the triangle's inside at (1, 6), its bowed top edge's middle (4, 1) empty, outside (6, 13) empty;
+    //  right: the quad's top edge's middle (12, 1) and its corners (8, 0), (15, 15) drawn)
+    int l_in = tess_px(&rb, 1, 6), l_edge = tess_px(&rb, 4, 1), l_out = tess_px(&rb, 6, 13);
+    int r_edge = tess_px(&rb, 12, 1), r_corners = tess_px(&rb, 8, 0) && tess_px(&rb, 15, 15);
+    CHECK(l_in && !l_edge && !l_out); CHECK(r_edge && r_corners);
+    printf("vulkan_shaders: two tessellation draws in one pass: triangle inside %d edge %d outside %d, quad edge %d corners %d\n",
+           l_in, l_edge, l_out, r_edge, r_corners);
+
+    // Two patches in one draw (the control shader's kernel runs several patches in a threadgroup: VKMSL_TCS_PATCHES):
+    // the left and the right half each a triangle, each patch's own top edge bowed at level 8, straight at level 1.
+    static const float two[] = { -1, -1, 0, -1, -1, 1,   0, -1, 1, -1, 0, 1 };
+    buf twovb = make_buffer(sizeof two, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    memcpy(twovb.map, two, sizeof two);
+    tess_draw(tri_ccw, pl, view, target.image, &twovb, 6, 8.0f, &rb);
+    int a8_in = tess_px(&rb, 1, 6), a8_edge = tess_px(&rb, 4, 1), b8_in = tess_px(&rb, 9, 6), b8_edge = tess_px(&rb, 12, 1);
+    tess_draw(tri_ccw, pl, view, target.image, &twovb, 6, 1.0f, &rb);
+    int a1_edge = tess_px(&rb, 4, 1), b1_edge = tess_px(&rb, 12, 1);
+    CHECK(a8_in && b8_in && !a8_edge && !b8_edge); CHECK(a1_edge && b1_edge);
+    printf("vulkan_shaders: two patches in one draw: level 8 inside %d %d edge %d %d, level 1 edge %d %d\n",
+           a8_in, b8_in, a8_edge, b8_edge, a1_edge, b1_edge);
 }
 
 int main(void) {

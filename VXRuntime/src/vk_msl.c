@@ -2688,6 +2688,9 @@ static void emit_from(T *t, uint32_t label, uint32_t stop) {
 }
 
 // ---- variables --------------------------------------------------------------------------------------------------
+static uint32_t tcs_patches(const T *t) {      // (a control shader's patches a threadgroup: VKMSL_TCS_PATCHES)
+    return (t->opt->flags & VKMSL_FLAG_TCS_ONE_PATCH) ? 1u : VKMSL_TCS_PATCHES(t->tess_out_n);
+}
 static void setup_variable(T *t, uint32_t var) {
     ent *v = E(t, var);
     if (v->ptr || v->kind != K_VAR) return;
@@ -2710,7 +2713,9 @@ static void setup_variable(T *t, uint32_t var) {
         p->storage = sc;
         p->var = var;
         // (a control shader's outputs are its patch's: every invocation of the threadgroup sees them)
-        if (sc == SC_Workgroup || (sc == SC_Output && t->tcs)) sb_printf(&t->vars, "    threadgroup %s _%u;\n", tname(t, pointee), var);
+        // (a control shader's: one per patch of the threadgroup, the thread's patch's by a reference: tess_interface)
+        if (sc == SC_Output && t->tcs) sb_printf(&t->vars, "    threadgroup %s spvTG_%u[%uu];\n", tname(t, pointee), var, tcs_patches(t));
+        else if (sc == SC_Workgroup) sb_printf(&t->vars, "    threadgroup %s _%u;\n", tname(t, pointee), var);
         else if (v->n > 3) sb_printf(&t->vars, "    %s _%u = %s;\n", tname(t, pointee), var, value(t, v->w[3]));
         else sb_printf(&t->vars, "    %s _%u;\n", tname(t, pointee), var);
         return;
@@ -3103,8 +3108,18 @@ static void tess_interface(T *t, sb *in_init, sb *params, sb *prologue) {
         sb_printf(params, ",\n    device float4 *spvCPOut [[buffer(%u)]]", VKMSL_TESS_CP);
         sb_printf(params, ",\n    device float4 *spvPOut [[buffer(%u)]]", VKMSL_TESS_PATCH);
         sb_printf(params, ",\n    device half *spvTF [[buffer(%u)]]", VKMSL_TESS_FACTORS);
-        sb_puts(prologue, "    uint spvTid = spvTid3.x, spvPatch = spvTgPos.x, spvInst = spvTgPos.y, spvPI = spvInst * spvTP.patches + spvPatch;\n");
-        sb_puts(&t->ret, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+        // (VKMSL_TCS_PATCHES patches a threadgroup: spvLP the thread's; past the last patch a thread computes the last
+        //  one's again and writes nothing, and takes part in the barriers)
+        uint32_t P = tcs_patches(t);
+        sb_printf(prologue, "    uint spvTid = spvTid3.x %% %uu, spvLP = spvTid3.x / %uu, spvPatchAt = spvTgPos.x * %uu + spvLP;\n", N, N, P);
+        sb_puts(prologue, "    bool spvLive = spvPatchAt < spvTP.patches;\n"
+                          "    uint spvPatch = spvLive ? spvPatchAt : spvTP.patches - 1u, spvInst = spvTgPos.y, spvPI = spvInst * spvTP.patches + spvPatch;\n");
+        for (uint32_t i = 0; i < t->iface_count; i++) {
+            ent *v = E(t, t->iface[i]);
+            if (v->kind == K_VAR && v->w[2] == SC_Output)
+                sb_printf(prologue, "    threadgroup %s &_%u = spvTG_%u[spvLP];\n", tname(t, tw(t, v->type)[2]), t->iface[i], t->iface[i]);
+        }
+        sb_puts(&t->ret, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n    if (spvLive) {\n");
         sb_printf(&t->ret, "    device float4 *spvCP = spvCPOut + (spvPI * %uu + spvTid) * %uu;\n", N, CS);
         sb_printf(&t->ret, "    for (uint i = 0; i < %uu; i++) spvCP[i] = float4(0.0f);\n", CS);
         sb patch = { 0 };
@@ -3183,7 +3198,7 @@ static void tess_interface(T *t, sb *in_init, sb *params, sb *prologue) {
             "            f[0] = half(spvOuter.x); f[1] = half(spvOuter.y); f[2] = half(spvOuter.z); f[3] = half(spvInner.x);\n"
             "        }\n");
         if (patch.p) sb_putn(&t->ret, patch.p, patch.n);
-        sb_puts(&t->ret, "    }\n");
+        sb_puts(&t->ret, "    }\n    }\n");
         free(patch.p); free(outer_s); free(inner_s);
         return;
     }

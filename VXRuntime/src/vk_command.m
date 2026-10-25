@@ -51,6 +51,7 @@ typedef struct { cmd h; VkQueryPool pool; uint32_t query, count; VkQueryControlF
 typedef struct { cmd h; VkQueryPool pool; uint32_t first, count; VkBuffer dst; uint64_t offset, stride; VkQueryResultFlags flags; } c_copy_queries;
 typedef struct { cmd h; uint32_t count; } c_execute;                          // + VkCommandBuffer[]
 typedef struct { cmd h; VkPipelineBindPoint point; uint32_t set; struct VkDescriptorSet_T *data; } c_push_set;
+typedef struct { cmd h; uint64_t dst; } c_barrier;                            // the stages that wait (all its barriers')
 
 static void *record(VkCommandBuffer cb, uint32_t op, size_t size) {
     size = (size + 7) & ~(size_t)7;
@@ -328,6 +329,7 @@ static void record_subpass(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb
     p->area = area;
     p->layers = fb ? fb->layers : 1;
     p->view_mask = sp->view_mask;
+    p->dep_dst = rp->dep_dst ? rp->dep_dst[index] : ~0ull;
     p->color_count = sp->color_count;
     for (uint32_t i = 0; i < sp->color_count; i++) {
         uint32_t a = sp->colors[i];
@@ -556,10 +558,21 @@ VKFN void VKAPI_CALL vkCmdUpdateBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceS
 // are set when the command buffer completes.
 VKFN void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep,
     uint32_t nm, const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {
-    (void)src; (void)dst; (void)dep; (void)nm; (void)m; (void)nb; (void)b; (void)ni; (void)im;
-    record(cb, C_BARRIER, sizeof(cmd));
+    (void)src; (void)dep; (void)nm; (void)m; (void)nb; (void)b; (void)ni; (void)im;
+    c_barrier *c = record(cb, C_BARRIER, sizeof *c);
+    if (c) c->dst = dst;
 }
-VKFN void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *info) { (void)info; record(cb, C_BARRIER, sizeof(cmd)); }
+static uint64_t dependency_dst(const VkDependencyInfo *d) {
+    uint64_t dst = 0;
+    for (uint32_t i = 0; d && i < d->memoryBarrierCount; i++) dst |= d->pMemoryBarriers[i].dstStageMask;
+    for (uint32_t i = 0; d && i < d->bufferMemoryBarrierCount; i++) dst |= d->pBufferMemoryBarriers[i].dstStageMask;
+    for (uint32_t i = 0; d && i < d->imageMemoryBarrierCount; i++) dst |= d->pImageMemoryBarriers[i].dstStageMask;
+    return d ? dst : ~0ull;
+}
+VKFN void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *info) {
+    c_barrier *c = record(cb, C_BARRIER, sizeof *c);
+    if (c) c->dst = dependency_dst(info);
+}
 VKFN void VKAPI_CALL vkCmdSetEvent(VkCommandBuffer cb, VkEvent e, VkPipelineStageFlags s) {
     (void)s;
     c_event *c = record(cb, C_SET_EVENT, sizeof *c);
@@ -574,12 +587,14 @@ VKFN void VKAPI_CALL vkCmdResetEvent(VkCommandBuffer cb, VkEvent e, VkPipelineSt
 VKFN void VKAPI_CALL vkCmdResetEvent2(VkCommandBuffer cb, VkEvent e, VkPipelineStageFlags2 s) { (void)s; vkCmdResetEvent(cb, e, 0); }
 VKFN void VKAPI_CALL vkCmdWaitEvents(VkCommandBuffer cb, uint32_t n, const VkEvent *e, VkPipelineStageFlags s, VkPipelineStageFlags d,
     uint32_t nm, const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *b, uint32_t ni, const VkImageMemoryBarrier *im) {
-    (void)n; (void)e; (void)s; (void)d; (void)nm; (void)m; (void)nb; (void)b; (void)ni; (void)im;
-    record(cb, C_BARRIER, sizeof(cmd));
+    (void)n; (void)e; (void)s; (void)nm; (void)m; (void)nb; (void)b; (void)ni; (void)im;
+    c_barrier *c = record(cb, C_BARRIER, sizeof *c);
+    if (c) c->dst = d;
 }
 VKFN void VKAPI_CALL vkCmdWaitEvents2(VkCommandBuffer cb, uint32_t n, const VkEvent *e, const VkDependencyInfo *d) {
-    (void)n; (void)e; (void)d;
-    record(cb, C_BARRIER, sizeof(cmd));
+    (void)n; (void)e;
+    c_barrier *c = record(cb, C_BARRIER, sizeof *c);
+    if (c) c->dst = dependency_dst(d);
 }
 
 // Queries.
@@ -633,19 +648,144 @@ VKFN void VKAPI_CALL vkCmdWriteBufferMarker2AMD(VkCommandBuffer cb, VkPipelineSt
 }
 
 // ---- encoding ----------------------------------------------------------------------------------------------------
+
+// ---- VXRT_GPU_PROFILE ------------------------------------------------------------------------------------------------
+// VXRT_GPU_PROFILE=1: the GPU time of each Metal encoder (render pass: start of its vertex stage to end of its fragment
+// stage; compute and blit: the encoder), summed by what it is (a render pass by its size, attachment formats, load and
+// store actions; "resumed" for a pass a geometry or tessellation draw ended and began again; a compute encoder by why
+// it was opened), the costliest every 5 seconds per frame. A pass's time is how far it moved the end of the GPU's work
+// (the next pass's vertices start while the last one still shades).
+#define VKPROF_SAMPLES 4096                         // (two per encoder; Metal allows 32 KB of timestamps)
+typedef struct { char sig[112]; uint32_t draws; } vkprof_name;
+static id<MTLCounterSampleBuffer> g_vkprof_buf;
+static vkprof_name g_vkprof_names[VKPROF_SAMPLES / 2];
+static uint32_t g_vkprof_next;
+static int g_vkprof_on = -1;
+static pthread_mutex_t g_vkprof_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct { char sig[112]; double ns; uint64_t n, draws; } vkprof_sum;
+static vkprof_sum g_vkprof_sums[512];
+static int g_vkprof_nsums;
+static uint64_t g_vkprof_since, g_vkprof_frames;
+static double g_vkprof_gaps;
+static int vkprof_on(VkDevice dev) {
+    if (g_vkprof_on >= 0) return g_vkprof_on;
+    g_vkprof_on = 0;
+    if (!getenv("VXRT_GPU_PROFILE") || !atoi(getenv("VXRT_GPU_PROFILE"))) return 0;
+    id<MTLDevice> d = dev->mtl;
+    if (![d supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { vx_log("vulkan GPU profile: no stage-boundary counters"); return 0; }
+    id<MTLCounterSet> ts = nil;
+    for (id<MTLCounterSet> set in d.counterSets) if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = set;
+    if (!ts) { vx_log("vulkan GPU profile: no timestamp counters"); return 0; }
+    MTLCounterSampleBufferDescriptor *bd = [MTLCounterSampleBufferDescriptor new];
+    bd.counterSet = ts; bd.storageMode = MTLStorageModeShared; bd.sampleCount = VKPROF_SAMPLES;
+    NSError *err = nil;
+    g_vkprof_buf = [d newCounterSampleBufferWithDescriptor:bd error:&err];
+    if (!g_vkprof_buf) { vx_log("vulkan GPU profile: %s", err.localizedDescription.UTF8String); return 0; }
+    g_vkprof_on = 1;
+    return 1;
+}
+static uint32_t vkprof_take(vk_enc *e, const char *sig) {   // (submissions are serialized by the queue's lock)
+    uint32_t i = g_vkprof_next;
+    g_vkprof_next = (g_vkprof_next + 2) % VKPROF_SAMPLES;
+    snprintf(g_vkprof_names[i / 2].sig, sizeof g_vkprof_names[0].sig, "%s", sig);
+    g_vkprof_names[i / 2].draws = 0;
+    e->prof_sample = (int)i;
+    e->prof_draws = 0;
+    return i;
+}
+static void vkprof_end(vk_enc *e) {
+    if (e->prof_sample >= 0) g_vkprof_names[e->prof_sample / 2].draws = e->prof_draws;
+    e->prof_sample = -1;
+}
+void vk_gpu_profile_frame(void);
+void vk_gpu_profile_frame(void) { if (g_vkprof_on > 0) __atomic_fetch_add(&g_vkprof_frames, 1, __ATOMIC_RELAXED); }
+static void vkprof_add(const vkprof_name *n, double ns) {
+    for (int i = 0; i < g_vkprof_nsums; i++)
+        if (!strcmp(g_vkprof_sums[i].sig, n->sig)) { g_vkprof_sums[i].ns += ns; g_vkprof_sums[i].n++; g_vkprof_sums[i].draws += n->draws; return; }
+    if (g_vkprof_nsums < 512) {
+        vkprof_sum *s = &g_vkprof_sums[g_vkprof_nsums++];
+        snprintf(s->sig, sizeof s->sig, "%s", n->sig); s->ns = ns; s->n = 1; s->draws = n->draws;
+    }
+}
+static int vkprof_by_ns(const void *a, const void *b) { double x = ((const vkprof_sum *)a)->ns, y = ((const vkprof_sum *)b)->ns; return x < y ? 1 : x > y ? -1 : 0; }
+static void vkprof_submit(vk_enc *e) {
+    if (g_vkprof_on <= 0) return;
+    uint32_t first = e->prof_first, end = g_vkprof_next;
+    if (first == end) return;
+    uint32_t count = (end - first + VKPROF_SAMPLES) % VKPROF_SAMPLES;
+    vkprof_name *names = malloc((count / 2 + 1) * sizeof *names);
+    for (uint32_t k = 0; k < count; k += 2) names[k / 2] = g_vkprof_names[((first + k) % VKPROF_SAMPLES) / 2];
+    [e->cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        pthread_mutex_lock(&g_vkprof_lock);
+        uint64_t last_end = 0;
+        for (uint32_t k = 0; k < count; k += 2) {
+            uint32_t s = (first + k) % VKPROF_SAMPLES;
+            NSData *data = [g_vkprof_buf resolveCounterRange:NSMakeRange(s, 2)];
+            if (data.length < 2 * sizeof(MTLCounterResultTimestamp)) continue;
+            const MTLCounterResultTimestamp *t = data.bytes;
+            if (t[0].timestamp == MTLCounterErrorValue || t[1].timestamp == MTLCounterErrorValue || t[1].timestamp < t[0].timestamp) continue;
+            uint64_t from = MAX(t[0].timestamp, last_end);
+            if (last_end && t[0].timestamp > last_end) g_vkprof_gaps += (double)(t[0].timestamp - last_end);   // (the GPU idle between them)
+            vkprof_add(&names[k / 2], t[1].timestamp > from ? (double)(t[1].timestamp - from) : 0);
+            last_end = MAX(last_end, t[1].timestamp);
+        }
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (!g_vkprof_since) g_vkprof_since = now;
+        uint64_t frames = __atomic_load_n(&g_vkprof_frames, __ATOMIC_RELAXED);
+        if (now - g_vkprof_since >= 5000000000ull && frames) {
+            double total = 0, f = (double)frames;
+            qsort(g_vkprof_sums, (size_t)g_vkprof_nsums, sizeof *g_vkprof_sums, vkprof_by_ns);
+            for (int i = 0; i < g_vkprof_nsums; i++) total += g_vkprof_sums[i].ns;
+            vx_log("vulkan GPU profile: %.2f ms of encoders per frame, %.2f ms between encoders of a command buffer (%llu frames)",
+                   total / 1e6 / f, g_vkprof_gaps / 1e6 / f, (unsigned long long)frames);
+            g_vkprof_gaps = 0;
+            for (int i = 0; i < g_vkprof_nsums && i < 24; i++)
+                vx_log("   %6.2f ms/frame %6.1f/frame %7.1f draws/frame  %s", g_vkprof_sums[i].ns / 1e6 / f, g_vkprof_sums[i].n / f,
+                       g_vkprof_sums[i].draws / f, g_vkprof_sums[i].sig);
+            g_vkprof_nsums = 0; g_vkprof_since = now;
+            __atomic_store_n(&g_vkprof_frames, 0, __ATOMIC_RELAXED);
+        }
+        pthread_mutex_unlock(&g_vkprof_lock);
+        free(names);
+    }];
+}
+static const char *load_letter(MTLLoadAction a) { return a == MTLLoadActionClear ? "C" : a == MTLLoadActionLoad ? "L" : "-"; }
+static const char *store_letter(MTLStoreAction a) {
+    return a == MTLStoreActionStore ? "S" : a == MTLStoreActionMultisampleResolve ? "R" : a == MTLStoreActionStoreAndMultisampleResolve ? "SR" : "-";
+}
+// "pass 1512x982x1 c[70:CS 71:L-] d[260:CS]": size, samples, each attachment's Metal format with its load and store.
+static void vkprof_render_sig(MTLRenderPassDescriptor *d, uint32_t w, uint32_t h, uint32_t samples, int resumed, char *out, size_t size) {
+    int n = snprintf(out, size, "%spass %ux%ux%u c[", resumed ? "resumed " : "", w, h, samples);
+    for (int i = 0; i < 8 && n < (int)size; i++) {
+        MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i];
+        if (!c.texture) continue;
+        n += snprintf(out + n, size - (size_t)n, "%s%lu:%s%s", out[n - 1] == '[' ? "" : " ", (unsigned long)c.texture.pixelFormat,
+                      load_letter(c.loadAction), store_letter(c.storeAction));
+    }
+    if (n < (int)size) n += snprintf(out + n, size - (size_t)n, "]");
+    if (d.depthAttachment.texture && n < (int)size)
+        n += snprintf(out + n, size - (size_t)n, " d[%lu:%s%s]", (unsigned long)d.depthAttachment.texture.pixelFormat,
+                      load_letter(d.depthAttachment.loadAction), store_letter(d.depthAttachment.storeAction));
+    if (d.stencilAttachment.texture && n < (int)size)
+        snprintf(out + n, size - (size_t)n, " s[%s%s]", load_letter(d.stencilAttachment.loadAction), store_letter(d.stencilAttachment.storeAction));
+}
 void vk_end_encoder(vk_enc *e) {
+    if (g_vkprof_on > 0) vkprof_end(e);
     if (e->render) { [e->render updateFence:e->fence afterStages:MTLRenderStageFragment]; [e->render endEncoding]; e->render = nil; }
     if (e->compute) { [e->compute updateFence:e->fence]; [e->compute endEncoding]; e->compute = nil; }
     if (e->blit) { [e->blit updateFence:e->fence]; [e->blit endEncoding]; e->blit = nil; }
 }
 
 static void use_heaps_render(vk_enc *e) {
+    if (e->no_use_heaps) return;                          // (the queue's residency set has them)
     vk_heap_list *l = &e->dev->heaps;
     pthread_mutex_lock(&l->lock);
     if (l->count) [e->render useHeaps:l->heaps count:l->count stages:MTLRenderStageVertex | MTLRenderStageFragment];
     pthread_mutex_unlock(&l->lock);
 }
 static void use_heaps_compute(vk_enc *e) {
+    if (e->no_use_heaps) return;
     vk_heap_list *l = &e->dev->heaps;
     pthread_mutex_lock(&l->lock);
     if (l->count) [e->compute useHeaps:l->heaps count:l->count];
@@ -655,7 +795,20 @@ static void use_heaps_compute(vk_enc *e) {
 static id<MTLComputeCommandEncoder> compute_encoder(vk_enc *e) {
     if (e->compute) return e->compute;
     vk_end_encoder(e);
-    e->compute = [e->cb computeCommandEncoder];
+    if (vkprof_on(e->dev)) {
+        MTLComputePassDescriptor *cd = [MTLComputePassDescriptor computePassDescriptor];
+        if (e->compute_concurrent) cd.dispatchType = MTLDispatchTypeConcurrent;
+        char sig[64];
+        snprintf(sig, sizeof sig, "compute %s", e->prof_tag ? e->prof_tag : "dispatch");
+        uint32_t i = vkprof_take(e, sig);
+        cd.sampleBufferAttachments[0].sampleBuffer = g_vkprof_buf;
+        cd.sampleBufferAttachments[0].startOfEncoderSampleIndex = i;
+        cd.sampleBufferAttachments[0].endOfEncoderSampleIndex = i + 1;
+        e->compute = [e->cb computeCommandEncoderWithDescriptor:cd];
+    } else if (e->compute_concurrent) e->compute = [e->cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+    else e->compute = [e->cb computeCommandEncoder];
+    e->wait_dst = 0;
+    VK_STAT(VKS_ENCODERS, 1);
     [e->compute waitForFence:e->fence];
     use_heaps_compute(e);
     return e->compute;
@@ -663,13 +816,23 @@ static id<MTLComputeCommandEncoder> compute_encoder(vk_enc *e) {
 static id<MTLBlitCommandEncoder> blit_encoder(vk_enc *e) {
     if (e->blit) return e->blit;
     vk_end_encoder(e);
-    e->blit = [e->cb blitCommandEncoder];
+    if (vkprof_on(e->dev)) {
+        MTLBlitPassDescriptor *bd = [MTLBlitPassDescriptor blitPassDescriptor];
+        uint32_t i = vkprof_take(e, "blit");
+        bd.sampleBufferAttachments[0].sampleBuffer = g_vkprof_buf;
+        bd.sampleBufferAttachments[0].startOfEncoderSampleIndex = i;
+        bd.sampleBufferAttachments[0].endOfEncoderSampleIndex = i + 1;
+        e->blit = [e->cb blitCommandEncoderWithDescriptor:bd];
+    } else e->blit = [e->cb blitCommandEncoder];
+    e->wait_dst = 0;
+    VK_STAT(VKS_ENCODERS, 1);
     [e->blit waitForFence:e->fence];
     return e->blit;
 }
 
 static MTLLoadAction mtl_load(uint8_t l) { return l == 1 ? MTLLoadActionClear : l == 0 ? MTLLoadActionLoad : MTLLoadActionDontCare; }
 
+static void rc_start(vk_enc *e);
 static void begin_render(vk_enc *e, const pass_desc *p) {
     vk_end_encoder(e);
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -724,8 +887,29 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
     d.renderTargetHeight = h;
     if (p->layers > 1) d.renderTargetArrayLength = p->layers;
     if (p->occlusion) d.visibilityResultBuffer = p->occlusion->results;
+    if (vkprof_on(e->dev)) {
+        char sig[112];
+        vkprof_render_sig(d, w, h, samples, e->prof_tag != NULL, sig, sizeof sig);
+        uint32_t i = vkprof_take(e, sig);
+        d.sampleBufferAttachments[0].sampleBuffer = g_vkprof_buf;
+        d.sampleBufferAttachments[0].startOfVertexSampleIndex = i;
+        d.sampleBufferAttachments[0].endOfVertexSampleIndex = MTLCounterDontSample;
+        d.sampleBufferAttachments[0].startOfFragmentSampleIndex = MTLCounterDontSample;
+        d.sampleBufferAttachments[0].endOfFragmentSampleIndex = i + 1;
+    }
     e->render = [e->cb renderCommandEncoderWithDescriptor:d];
-    [e->render waitForFence:e->fence beforeStages:MTLRenderStageVertex];
+    rc_start(e);
+    VK_STAT(VKS_ENCODERS, 1);
+    VK_STAT(VKS_PASSES, 1);
+    // (VXRT_VK_FRAGMENT_WAIT, on by default: the pass's vertices may start while the work before it still runs, unless
+    //  a barrier or its render pass's dependency makes stages before rasterization wait; the tiles it loads and the
+    //  textures it samples wait at its fragment stage. No Man's Sky, 2026-10-26: 157 encoders a frame, each waiting
+    //  for the one before at its start, left the GPU idle 5 ms a frame between them.)
+    int vertex_wait = e->vertex_wait || ((e->wait_dst | p->dep_dst) & VK_PRE_RASTER_STAGES) || !vk_option("FRAGMENT_WAIT", 1);
+    [e->render waitForFence:e->fence beforeStages:vertex_wait ? MTLRenderStageVertex : MTLRenderStageFragment];
+    if (vertex_wait) VK_STAT(VKS_VERTEX_WAITS, 1);
+    e->wait_dst = 0;
+    e->vertex_wait = 0;
     use_heaps_render(e);
     e->pass = *p;
     e->pass_width = w;
@@ -735,6 +919,36 @@ static void begin_render(vk_enc *e, const pass_desc *p) {
     e->state_dirty = 1;
     e->vis_mode = MTLVisibilityResultModeDisabled;
 }
+
+// ---- the render encoder's state, sent once (VXRT_VK_ENCODE_CACHE, on by default) ----------------------------------
+// No Man's Sky binds a pipeline, its sets and push constants for nearly each of its 2,200 draws a frame; Metal calls
+// cost microseconds each here (the runtime runs under Rosetta), and most of them repeat what the encoder has. e->rc
+// says what it has; begin_render empties it, and so does drawing with the runtime's own shaders (clears).
+static void rc_vbuf(vk_enc *e, id<MTLBuffer> b, uint64_t off, uint32_t i) {
+    if (e->rc.valid && i < 32 && e->rc.vbuf[i] == b && e->rc.voff[i] == off) return;
+    [e->render setVertexBuffer:b offset:off atIndex:i];
+    if (i < 32) { e->rc.vbuf[i] = b; e->rc.voff[i] = off; }
+}
+static void rc_fbuf(vk_enc *e, id<MTLBuffer> b, uint64_t off, uint32_t i) {
+    if (e->rc.valid && i < 32 && e->rc.fbuf[i] == b && e->rc.foff[i] == off) return;
+    [e->render setFragmentBuffer:b offset:off atIndex:i];
+    if (i < 32) { e->rc.fbuf[i] = b; e->rc.foff[i] = off; }
+}
+// Bytes at index i (k: 0 push constants, 1 dynamic offsets: the two indices whose bytes change from draw to draw).
+static void rc_vbytes(vk_enc *e, const void *p, uint32_t len, uint32_t i, int k) {
+    if (e->rc.valid && e->rc.vbuf[i] == nil && e->rc.vbytes_len[k] == len && !memcmp(e->rc.vbytes[k], p, len)) return;
+    [e->render setVertexBytes:p length:len atIndex:i];
+    e->rc.vbuf[i] = nil;
+    if (len <= sizeof e->rc.vbytes[k]) { memcpy(e->rc.vbytes[k], p, len); e->rc.vbytes_len[k] = len; } else e->rc.vbytes_len[k] = 0;
+}
+static void rc_fbytes(vk_enc *e, const void *p, uint32_t len, uint32_t i, int k) {
+    if (e->rc.valid && e->rc.fbuf[i] == nil && e->rc.fbytes_len[k] == len && !memcmp(e->rc.fbytes[k], p, len)) return;
+    [e->render setFragmentBytes:p length:len atIndex:i];
+    e->rc.fbuf[i] = nil;
+    if (len <= sizeof e->rc.fbytes[k]) { memcpy(e->rc.fbytes[k], p, len); e->rc.fbytes_len[k] = len; } else e->rc.fbytes_len[k] = 0;
+}
+static void rc_forget(vk_enc *e) { memset(&e->rc, 0, sizeof e->rc); }   // (nothing known: everything is sent again)
+static void rc_start(vk_enc *e) { rc_forget(e); e->rc.valid = vk_option("ENCODE_CACHE", 1); }
 
 static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
     id<MTLRenderCommandEncoder> r = e->render;
@@ -752,11 +966,11 @@ static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
         struct VkDescriptorSet_T *ds = b->push[s] ? b->push[s] : b->sets[s];
         if (!ds) continue;
         if (b->push[s]) {
-            if (sets_vertex & mask) [r setVertexBytes:ds->words length:ds->size atIndex:s];
-            if (pl->sets_fragment & mask) [r setFragmentBytes:ds->words length:ds->size atIndex:s];
+            if (sets_vertex & mask) { [r setVertexBytes:ds->words length:ds->size atIndex:s]; e->rc.vbuf[s] = nil; e->rc.voff[s] = ~0ull; }
+            if (pl->sets_fragment & mask) { [r setFragmentBytes:ds->words length:ds->size atIndex:s]; e->rc.fbuf[s] = nil; e->rc.foff[s] = ~0ull; }
         } else {
-            if (sets_vertex & mask) [r setVertexBuffer:ds->pool->buffer offset:ds->offset atIndex:s];
-            if (pl->sets_fragment & mask) [r setFragmentBuffer:ds->pool->buffer offset:ds->offset atIndex:s];
+            if (sets_vertex & mask) rc_vbuf(e, ds->pool->buffer, ds->offset, s);
+            if (pl->sets_fragment & mask) rc_fbuf(e, ds->pool->buffer, ds->offset, s);
         }
     }
     if (aux_vertex || pl->aux_fragment) {
@@ -766,13 +980,13 @@ static void bind_sets_render(vk_enc *e, const struct VkPipeline_T *pl) {
                 if (pl->layout.dynamic_base[s] + k + 1 > naux) naux = pl->layout.dynamic_base[s] + k + 1;
             }
         if (!naux) { aux[0] = 0; naux = 1; }
-        if (aux_vertex) [r setVertexBytes:aux length:naux * 4 atIndex:VKMSL_AUX_BUFFER];
-        if (pl->aux_fragment) [r setFragmentBytes:aux length:naux * 4 atIndex:VKMSL_AUX_BUFFER];
+        if (aux_vertex) rc_vbytes(e, aux, naux * 4, VKMSL_AUX_BUFFER, 1);
+        if (pl->aux_fragment) rc_fbytes(e, aux, naux * 4, VKMSL_AUX_BUFFER, 1);
     }
     uint32_t push_size = pl->layout.push_size ? (pl->layout.push_size + 15) & ~15u : 16;
     if (push_size > sizeof e->push) push_size = sizeof e->push;
-    if (push_vertex) [r setVertexBytes:e->push length:push_size atIndex:VKMSL_PUSH_BUFFER];
-    if (pl->push_fragment) [r setFragmentBytes:e->push length:push_size atIndex:VKMSL_PUSH_BUFFER];
+    if (push_vertex) rc_vbytes(e, e->push, push_size, VKMSL_PUSH_BUFFER, 0);
+    if (pl->push_fragment) rc_fbytes(e, e->push, push_size, VKMSL_PUSH_BUFFER, 0);
 }
 
 // A compute stage's sets, dynamic offsets and push constants: the compute pipeline's, or a geometry draw's kernels'
@@ -816,12 +1030,17 @@ static void apply_render_state(vk_enc *e) {
     struct VkPipeline_T *p = e->gp;
     id<MTLRenderCommandEncoder> r = e->render;
     if (!p || !r) return;
-    [r setRenderPipelineState:p->render];
+    int known = e->rc.valid;
+    if (!known || e->rc.pipeline != p->render) { [r setRenderPipelineState:p->render]; e->rc.pipeline = p->render; }
     // Viewports and scissors (Metal needs scissors inside the render target).
     uint32_t nv = e->viewport_count ? e->viewport_count : 1;
     MTLViewport vps[16];
     for (uint32_t i = 0; i < nv && i < 16; i++) vps[i] = mtl_viewport(e->viewports[i]);
-    if (nv == 1) [r setViewport:vps[0]]; else [r setViewports:vps count:nv];
+    if (nv > 16) nv = 16;
+    if (!known || e->rc.nviewports != nv || memcmp(e->rc.viewports, vps, nv * sizeof vps[0])) {
+        if (nv == 1) [r setViewport:vps[0]]; else [r setViewports:vps count:nv];
+        memcpy(e->rc.viewports, vps, nv * sizeof vps[0]); e->rc.nviewports = nv;
+    }
     uint32_t ns = e->scissor_count ? e->scissor_count : 1;
     MTLScissorRect sc[16];
     for (uint32_t i = 0; i < ns && i < 16; i++) {
@@ -834,21 +1053,38 @@ static void apply_render_state(vk_enc *e) {
         if (y > y2) y = y2;
         sc[i] = (MTLScissorRect){ (NSUInteger)x, (NSUInteger)y, (NSUInteger)(x2 - x), (NSUInteger)(y2 - y) };
     }
-    if (ns == 1) [r setScissorRect:sc[0]]; else [r setScissorRects:sc count:ns];
+    if (ns > 16) ns = 16;
+    if (!known || e->rc.nscissors != ns || memcmp(e->rc.scissors, sc, ns * sizeof sc[0])) {
+        if (ns == 1) [r setScissorRect:sc[0]]; else [r setScissorRects:sc count:ns];
+        memcpy(e->rc.scissors, sc, ns * sizeof sc[0]); e->rc.nscissors = ns;
+    }
     MTLCullMode cull = e->cull == VK_CULL_MODE_FRONT_BIT ? MTLCullModeFront : e->cull == VK_CULL_MODE_BACK_BIT ? MTLCullModeBack : MTLCullModeNone;
-    [r setCullMode:cull];
-    [r setFrontFacingWinding:e->front == VK_FRONT_FACE_COUNTER_CLOCKWISE ? MTLWindingCounterClockwise : MTLWindingClockwise];
-    [r setTriangleFillMode:p->fill];
-    [r setDepthClipMode:p->depth_clip];
-    if (e->depth_bias_enable) [r setDepthBias:e->depth_bias[0] slopeScale:e->depth_bias[1] clamp:e->depth_bias[2]];
-    else [r setDepthBias:0 slopeScale:0 clamp:0];
-    [r setBlendColorRed:e->blend[0] green:e->blend[1] blue:e->blend[2] alpha:e->blend[3]];
-    [r setStencilFrontReferenceValue:e->stencil_ref[0] backReferenceValue:e->stencil_ref[1]];
+    MTLWinding winding = e->front == VK_FRONT_FACE_COUNTER_CLOCKWISE ? MTLWindingCounterClockwise : MTLWindingClockwise;
+    // (each kept as one more than its value: 0 is "not sent yet")
+    if (!known || e->rc.cull != (int)cull + 1) { [r setCullMode:cull]; e->rc.cull = (int)cull + 1; }
+    if (!known || e->rc.winding != (int)winding + 1) { [r setFrontFacingWinding:winding]; e->rc.winding = (int)winding + 1; }
+    if (!known || e->rc.fill != (int)p->fill + 1) { [r setTriangleFillMode:p->fill]; e->rc.fill = (int)p->fill + 1; }
+    if (!known || e->rc.clip != (int)p->depth_clip + 1) { [r setDepthClipMode:p->depth_clip]; e->rc.clip = (int)p->depth_clip + 1; }
+    float bias[3] = { 0, 0, 0 };
+    if (e->depth_bias_enable) memcpy(bias, e->depth_bias, sizeof bias);
+    if (!known || !e->rc.have_bias || memcmp(e->rc.bias, bias, sizeof bias)) {
+        [r setDepthBias:bias[0] slopeScale:bias[1] clamp:bias[2]];
+        memcpy(e->rc.bias, bias, sizeof bias); e->rc.have_bias = 1;
+    }
+    if (!known || !e->rc.have_blend || memcmp(e->rc.blend, e->blend, sizeof e->blend)) {
+        [r setBlendColorRed:e->blend[0] green:e->blend[1] blue:e->blend[2] alpha:e->blend[3]];
+        memcpy(e->rc.blend, e->blend, sizeof e->blend); e->rc.have_blend = 1;
+    }
+    if (!known || !e->rc.have_sref || memcmp(e->rc.sref, e->stencil_ref, sizeof e->rc.sref)) {
+        [r setStencilFrontReferenceValue:e->stencil_ref[0] backReferenceValue:e->stencil_ref[1]];
+        memcpy(e->rc.sref, e->stencil_ref, sizeof e->rc.sref); e->rc.have_sref = 1;
+    }
     // Depth/stencil state: the pipeline's, or one made for the dynamic states.
     uint32_t dsd = p->dynamic & (VK_DYN_DEPTH_TEST | VK_DYN_DEPTH_WRITE | VK_DYN_DEPTH_COMPARE | VK_DYN_STENCIL_TEST | VK_DYN_STENCIL_OP |
                                  VK_DYN_STENCIL_COMPARE | VK_DYN_STENCIL_WRITE);
-    if (!dsd) [r setDepthStencilState:p->depth_stencil];
-    else {
+    if (!dsd) {
+        if (!known || e->rc.depth_stencil != p->depth_stencil) { [r setDepthStencilState:p->depth_stencil]; e->rc.depth_stencil = p->depth_stencil; }
+    } else {
         VkPipelineDepthStencilStateCreateInfo ds = p->ds;
         if (p->dynamic & VK_DYN_DEPTH_TEST) ds.depthTestEnable = e->dyn_depth_test;
         if (p->dynamic & VK_DYN_DEPTH_WRITE) ds.depthWriteEnable = e->dyn_depth_write;
@@ -861,7 +1097,8 @@ static void apply_render_state(vk_enc *e) {
             ds.back.failOp = e->dyn_stencil_ops[1][0]; ds.back.passOp = e->dyn_stencil_ops[1][1]; ds.back.depthFailOp = e->dyn_stencil_ops[1][2];
             ds.front.compareOp = e->dyn_stencil_compare_op[0]; ds.back.compareOp = e->dyn_stencil_compare_op[1];
         }
-        [r setDepthStencilState:vk_depth_stencil_state(e->dev, &ds, e->pass.has_depth, e->pass.has_stencil)];
+        id<MTLDepthStencilState> st = vk_depth_stencil_state(e->dev, &ds, e->pass.has_depth, e->pass.has_stencil);
+        if (!known || e->rc.depth_stencil != st) { [r setDepthStencilState:st]; e->rc.depth_stencil = st; }
     }
     e->state_dirty = 0;
 }
@@ -891,7 +1128,8 @@ static int prepare_draw(vk_enc *e) {
         if (p->dynamic & VK_DYN_STRIDE) {
             uint64_t stride = e->vb_stride[b] ? e->vb_stride[b] : p->vertex_strides[b];
             [e->render setVertexBuffer:mb offset:off attributeStride:stride atIndex:VKMSL_VERTEX_BUFFER + b];
-        } else [e->render setVertexBuffer:mb offset:off atIndex:VKMSL_VERTEX_BUFFER + b];
+            e->rc.vbuf[VKMSL_VERTEX_BUFFER + b] = nil; e->rc.voff[VKMSL_VERTEX_BUFFER + b] = ~0ull;
+        } else rc_vbuf(e, mb, off, VKMSL_VERTEX_BUFFER + b);
     }
     return !p->rasterizer_discard || 1;
 }
@@ -956,10 +1194,21 @@ static void fan_draw(vk_enc *e, int indexed, uint32_t count, uint32_t instances,
     if (!list) return;
     uint32_t n = fan_to_list(src, index_size, count, src && (e->primitive_restart_set ? e->primitive_restart : e->gp->primitive_restart), list);
     if (n) {
-        id<MTLBuffer> ib = [e->dev->mtl newBufferWithBytes:list length:(NSUInteger)n * 4 options:MTLResourceStorageModeShared];
-        if (ib) [e->render drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:n indexType:MTLIndexTypeUInt32 indexBuffer:ib
-                                indexBufferOffset:0 instanceCount:instances baseVertex:indexed ? vertex_offset : (NSInteger)first
-                                     baseInstance:first_instance];
+        // (the indices go into the command buffer's fan buffer, a new one when it is full: a buffer per draw cost
+        //  more than the draw, No Man's Sky draws some fans each frame)
+        uint64_t bytes = (uint64_t)n * 4, at = (e->fan_used + 255) & ~255ull;
+        if (!e->fan_buf || at + bytes > e->fan_buf.length) {
+            id<MTLBuffer> b = [e->dev->mtl newBufferWithLength:(NSUInteger)(bytes > (1u << 20) ? bytes : (1u << 20)) options:MTLResourceStorageModeShared];
+            if (b) [e->cb addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; (void)b; }];   // (kept until the GPU is done)
+            e->fan_buf = b; at = 0;
+        }
+        if (e->fan_buf) {
+            memcpy((uint8_t *)e->fan_buf.contents + at, list, (size_t)bytes);
+            e->fan_used = at + bytes;
+            [e->render drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:n indexType:MTLIndexTypeUInt32 indexBuffer:e->fan_buf
+                           indexBufferOffset:(NSUInteger)at instanceCount:instances baseVertex:indexed ? vertex_offset : (NSInteger)first
+                                baseInstance:first_instance];
+        }
     }
     free(list);
 }
@@ -995,7 +1244,7 @@ static id<MTLBuffer> gs_scratch(vk_enc *e, int which, uint64_t size) {
 // The vertex shader as a kernel (before a geometry or tessellation control shader): each vertex's outputs into slots
 // of vout. Its vertex buffers start at the draw's first vertex (or base vertex) and first instance.
 static void run_vertex_kernel(vk_enc *e, id<MTLComputeCommandEncoder> ce, const c_draw *c, int indexed, id<MTLBuffer> vout,
-                              const vkmsl_gs_params *gpp) {
+                              uint64_t vout_offset, const vkmsl_gs_params *gpp) {
     struct VkPipeline_T *p = e->gp;
     int i16 = indexed && e->ib_type == VK_INDEX_TYPE_UINT16;
     vkmsl_gs_params gp = *gpp;
@@ -1022,7 +1271,7 @@ static void run_vertex_kernel(vk_enc *e, id<MTLComputeCommandEncoder> ce, const 
     if (indexed) [ce setBuffer:e->ib->mtl offset:e->ib->offset + e->ib_offset + (uint64_t)c->first * (i16 ? 2 : 4) atIndex:VKMSL_GS_INDEX];
     else [ce setBuffer:e->dev->zero_buffer offset:0 atIndex:VKMSL_GS_INDEX];
     [ce setBytes:&gp length:sizeof gp atIndex:VKMSL_GS_PARAMS];
-    [ce setBuffer:vout offset:0 atIndex:VKMSL_GS_IN];
+    [ce setBuffer:vout offset:vout_offset atIndex:VKMSL_GS_IN];
     if (p->vertex_bindings) [ce setStageInRegion:MTLRegionMake2D(0, 0, c->count, c->instances)];
     NSUInteger w = p->gs_vs[0].threadExecutionWidth;
     [ce dispatchThreads:MTLSizeMake(c->count, c->instances, 1) threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
@@ -1031,49 +1280,237 @@ static void run_vertex_kernel(vk_enc *e, id<MTLComputeCommandEncoder> ce, const 
 // A draw with tessellation: the vertex shader as a kernel over the draw's vertices; the control shader as a kernel, a
 // threadgroup per patch and instance (its control points, patch values and factors into buffers); then the pass again,
 // Metal's tessellator drawing the patches with the evaluation shader as the vertex function.
-static void tess_draw(vk_enc *e, const c_draw *c, int indexed) {
+typedef struct { uint64_t patches, all, fsize, vsize, cpsize, psize; uint32_t n; } tess_sizes;
+static int tess_sizes_of(vk_enc *e, const c_draw *c, int indexed, tess_sizes *t) {
     struct VkPipeline_T *p = e->gp;
-    uint32_t pv = p->patch_cp, n = p->tess_out_vertices;
-    uint32_t patches = pv ? c->count / pv : 0;
-    if (!patches || !n || (indexed && (!e->ib || !e->ib->mtl))) return;
+    uint32_t pv = p->patch_cp;
+    t->n = p->tess_out_vertices;
+    t->patches = pv ? c->count / pv : 0;
+    if (!t->patches || !t->n || (indexed && (!e->ib || !e->ib->mtl))) return 0;
+    t->all = t->patches * c->instances;
+    t->fsize = p->tess_quad ? 12 : 8;
+    t->vsize = (uint64_t)c->count * c->instances * p->gs_in_slots * 16;
+    t->cpsize = t->all * t->n * p->tess_cp_slots * 16;
+    t->psize = t->all * p->tess_patch_slots * 16;
+    if (t->vsize > (1ull << 31) || t->cpsize > (1ull << 31)) { TRACE("tessellation draw of %llu patches skipped", (unsigned long long)t->all); return 0; }
+    return 1;
+}
+// The draw's vertex and control kernels into ce, their results at the offsets given in the queue's scratch buffers.
+// phase: 1 the vertex kernel, 2 the control kernel (which reads what the vertex kernel wrote), 3 both.
+static void tess_kernels(vk_enc *e, id<MTLComputeCommandEncoder> ce, const c_draw *c, int indexed, const tess_sizes *t,
+                         uint64_t vo, uint64_t co, uint64_t po, uint64_t fo, int phase) {
+    struct VkPipeline_T *p = e->gp;
     int i16 = indexed && e->ib_type == VK_INDEX_TYPE_UINT16;
-    uint64_t all = (uint64_t)patches * c->instances, fsize = p->tess_quad ? 12 : 8;
-    uint64_t vsize = (uint64_t)c->count * c->instances * p->gs_in_slots * 16;
-    uint64_t cpsize = all * n * p->tess_cp_slots * 16, psize = all * p->tess_patch_slots * 16;
-    if (vsize > (1ull << 31) || cpsize > (1ull << 31)) { TRACE("tessellation draw of %llu patches skipped", (unsigned long long)all); return; }
-    id<MTLBuffer> vout = gs_scratch(e, 0, vsize), cp = gs_scratch(e, 1, cpsize), pb = gs_scratch(e, 2, psize),
-                  tf = gs_scratch(e, 3, all * fsize);
+    id<MTLBuffer> vout = e->queue->gs_scratch[0], cp = e->queue->gs_scratch[1], pb = e->queue->gs_scratch[2], tf = e->queue->gs_scratch[3];
     vkmsl_gs_params gp = { c->count, c->instances, c->first, c->first_instance, c->vertex_offset, (uint32_t)indexed, (uint32_t)i16,
                            0, 0, 1, p->gs_in_slots, 0 };
-    vkmsl_tess_params tp = { c->count, c->instances, patches, pv, n, p->tess_quad, { 0, 0 } };
-    pass_desc resume = e->pass;
-    for (uint32_t i = 0; i < resume.color_count; i++) resume.colors[i].load = 0;
-    resume.depth.load = resume.depth.sload = 0;
-    MTLVisibilityResultMode vis = e->vis_mode;
-    uint64_t vis_offset = e->vis_offset;
-
-    id<MTLComputeCommandEncoder> ce = compute_encoder(e);
-    run_vertex_kernel(e, ce, c, indexed, vout, &gp);
-    [ce setComputePipelineState:p->tcs_kernel];
+    vkmsl_tess_params tp = { c->count, c->instances, (uint32_t)t->patches, p->patch_cp, t->n, p->tess_quad, { 0, 0 } };
+    if (phase & 1) run_vertex_kernel(e, ce, c, indexed, vout, vo, &gp);
+    if (!(phase & 2)) return;
+    VK_STAT(VKS_TESS_VERTS, (uint64_t)c->count * c->instances);
+    VK_STAT(VKS_TESS_PATCHES, t->all);
+    VK_STAT(VKS_TESS_CP, t->all * t->n);
+    int one = p->tcs_kernel_one && !vk_option("TCS_PACK", 1);
+    [ce setComputePipelineState:one ? p->tcs_kernel_one : p->tcs_kernel];
     bind_sets_kernel(e, p, &e->gb, p->sets_tcs, p->aux_tcs, p->push_tcs);
     [ce setBytes:&tp length:sizeof tp atIndex:VKMSL_TESS_PARAMS];
-    [ce setBuffer:vout offset:0 atIndex:VKMSL_TESS_IN];
-    [ce setBuffer:cp offset:0 atIndex:VKMSL_TESS_CP];
-    [ce setBuffer:pb offset:0 atIndex:VKMSL_TESS_PATCH];
-    [ce setBuffer:tf offset:0 atIndex:VKMSL_TESS_FACTORS];
-    [ce dispatchThreadgroups:MTLSizeMake(patches, c->instances, 1) threadsPerThreadgroup:MTLSizeMake(n, 1, 1)];
-    begin_render(e, &resume);
-    if (vis != MTLVisibilityResultModeDisabled) {
-        [e->render setVisibilityResultMode:vis offset:vis_offset];
-        e->vis_mode = vis; e->vis_offset = vis_offset;
+    [ce setBuffer:vout offset:vo atIndex:VKMSL_TESS_IN];
+    [ce setBuffer:cp offset:co atIndex:VKMSL_TESS_CP];
+    [ce setBuffer:pb offset:po atIndex:VKMSL_TESS_PATCH];
+    [ce setBuffer:tf offset:fo atIndex:VKMSL_TESS_FACTORS];
+    uint64_t per = one ? 1 : VKMSL_TCS_PATCHES(t->n);
+    [ce dispatchThreadgroups:MTLSizeMake((t->patches + per - 1) / per, c->instances, 1) threadsPerThreadgroup:MTLSizeMake(per * t->n, 1, 1)];
+}
+static void tess_draw(vk_enc *e, const c_draw *c, int indexed) {
+    struct VkPipeline_T *p = e->gp;
+    int hoisted = e->tess_pre_next < e->tess_pre_count;
+    uint64_t co = 0, po = 0, fo = 0;
+    if (hoisted) {
+        // (its kernels ran before the pass: hoist_tessellation)
+        uint32_t k = e->tess_pre_next++;
+        if (!e->tess_pre[k].valid) return;
+        co = e->tess_pre[k].cp; po = e->tess_pre[k].pb; fo = e->tess_pre[k].tf;
+    }
+    tess_sizes t;
+    if (!tess_sizes_of(e, c, indexed, &t)) return;
+    vkmsl_tess_params tp = { c->count, c->instances, (uint32_t)t.patches, p->patch_cp, t.n, p->tess_quad, { 0, 0 } };
+    if (!hoisted) {
+        gs_scratch(e, 0, t.vsize); gs_scratch(e, 1, t.cpsize); gs_scratch(e, 2, t.psize); gs_scratch(e, 3, t.all * t.fsize);
+        pass_desc resume = e->pass;
+        for (uint32_t i = 0; i < resume.color_count; i++) resume.colors[i].load = 0;
+        resume.depth.load = resume.depth.sload = 0;
+        MTLVisibilityResultMode vis = e->vis_mode;
+        uint64_t vis_offset = e->vis_offset;
+        e->prof_tag = "tessellation";
+        tess_kernels(e, compute_encoder(e), c, indexed, &t, 0, 0, 0, 0, 3);
+        e->vertex_wait = 1;
+        begin_render(e, &resume);
+        e->prof_tag = NULL;
+        if (vis != MTLVisibilityResultModeDisabled) {
+            [e->render setVisibilityResultMode:vis offset:vis_offset];
+            e->vis_mode = vis; e->vis_offset = vis_offset;
+        }
     }
     if (!prepare_draw(e)) return;
-    [e->render setTessellationFactorBuffer:tf offset:0 instanceStride:(NSUInteger)(patches * fsize)];
+    [e->render setTessellationFactorBuffer:e->queue->gs_scratch[3] offset:fo instanceStride:(NSUInteger)(t.patches * t.fsize)];
     [e->render setVertexBytes:&tp length:sizeof tp atIndex:VKMSL_TESS_PARAMS];
-    [e->render setVertexBuffer:cp offset:0 atIndex:VKMSL_TESS_IN];
-    [e->render setVertexBuffer:pb offset:0 atIndex:VKMSL_TESS_CP];
-    [e->render drawPatches:n patchStart:0 patchCount:patches patchIndexBuffer:nil patchIndexBufferOffset:0
+    e->rc.vbuf[VKMSL_TESS_PARAMS] = nil; e->rc.voff[VKMSL_TESS_PARAMS] = ~0ull;
+    rc_vbuf(e, e->queue->gs_scratch[1], co, VKMSL_TESS_IN);
+    rc_vbuf(e, e->queue->gs_scratch[2], po, VKMSL_TESS_CP);
+    [e->render drawPatches:t.n patchStart:0 patchCount:(NSUInteger)t.patches patchIndexBuffer:nil patchIndexBufferOffset:0
              instanceCount:c->instances baseInstance:0];
+}
+
+// Hoisting (VXRT_VK_HOIST_TESS, on by default): a pass's tessellation draws have their vertex and control kernels run
+// together in one compute encoder before the pass begins, each into its own part of the scratch buffers, so the pass
+// runs through instead of ending and loading all its attachments again for each such draw (No Man's Sky's terrain:
+// 35 draws a frame in its 7-target G-buffer pass, 2026-10-26: 4.6 ms of the GPU's time in resumed passes and 5.4 ms
+// in 35 compute encoders, each waiting for the one before). Done when the kernels can only read what was there before
+// the pass: no barrier inside it (a self-dependency: a draw may read what one before it wrote) and no secondary command
+// buffers. Walks the pass's commands twice with the binding state they set (restored after): sizes, then kernels.
+typedef struct {
+    VkPipeline gp; bindings_state gb; uint8_t push[256];
+    VkBuffer vb[VKMSL_MAX_VERTEX_BUFFERS]; uint64_t vb_offset[VKMSL_MAX_VERTEX_BUFFERS], vb_stride[VKMSL_MAX_VERTEX_BUFFERS];
+    VkBuffer ib; uint64_t ib_offset; VkIndexType ib_type;
+} draw_state;
+static void state_save(const vk_enc *e, draw_state *s) {
+    s->gp = e->gp; s->gb = e->gb; memcpy(s->push, e->push, sizeof s->push);
+    memcpy(s->vb, e->vb, sizeof s->vb); memcpy(s->vb_offset, e->vb_offset, sizeof s->vb_offset); memcpy(s->vb_stride, e->vb_stride, sizeof s->vb_stride);
+    s->ib = e->ib; s->ib_offset = e->ib_offset; s->ib_type = e->ib_type;
+}
+static void state_restore(vk_enc *e, const draw_state *s) {
+    e->gp = s->gp; e->gb = s->gb; memcpy(e->push, s->push, sizeof s->push);
+    memcpy(e->vb, s->vb, sizeof s->vb); memcpy(e->vb_offset, s->vb_offset, sizeof s->vb_offset); memcpy(e->vb_stride, s->vb_stride, sizeof s->vb_stride);
+    e->ib = s->ib; e->ib_offset = s->ib_offset; e->ib_type = s->ib_type;
+}
+static void bind_sets(vk_enc *e, const c_bind_sets *c);
+// One walk over the pass: 1, or below 0 when it cannot be hoisted (a barrier that vertex or tessellation work waits
+// for, a geometry draw, no end of the pass, too many draws). With ce nil, sizes: each draw's parts placed after the
+// ones before (total[4]); with ce, the kernels into it at those places. Secondary command buffers the pass executes
+// are walked in their turn (their draws come in that order; each starts with no bindings of its own, as encode_list
+// takes them: the state goes on).
+#define HOIST_WAITS (0x2ull | 0x4ull | 0x8ull | 0x10ull | 0x20ull | 0x8000ull | 0x10000ull | 0x1000000000ull | 0x2000000000ull | 0x4000000000ull)
+static int hoist_list(vk_enc *e, const uint8_t *from, const vk_chunk *chunk, int secondary, id<MTLComputeCommandEncoder> ce,
+                      uint64_t total[4], uint32_t *k, int *gs) {
+    for (const vk_chunk *ch = chunk; ch; ch = ch->next) {
+        const uint8_t *p = ch == chunk ? from : ch->data;
+        while (p < ch->data + ch->used) {
+            const cmd *h = (const cmd *)p;
+            p += h->size;
+            switch (h->op) {
+            case C_END_PASS: return 1;
+            case C_BARRIER: if (((const c_barrier *)h)->dst & HOIST_WAITS) return -1; break;
+            case C_EXECUTE: {
+                const c_execute *x = (const c_execute *)h;
+                const VkCommandBuffer *list = (const VkCommandBuffer *)(x + 1);
+                for (uint32_t i = 0; i < x->count; i++) {
+                    if (!list[i]->first) continue;
+                    int r = hoist_list(e, list[i]->first->data, list[i]->first, 1, ce, total, k, gs);
+                    if (r < 0) return r;
+                }
+                break;
+            }
+            case C_BIND_PIPELINE: {
+                const c_bind_pipeline *c = (const c_bind_pipeline *)h;
+                if (c->point == VK_PIPELINE_BIND_POINT_GRAPHICS) e->gp = c->pipeline;
+                break;
+            }
+            case C_BIND_SETS: if (((const c_bind_sets *)h)->point == VK_PIPELINE_BIND_POINT_GRAPHICS) bind_sets(e, (const c_bind_sets *)h); break;
+            case C_PUSH_SET: {
+                const c_push_set *c = (const c_push_set *)h;
+                if (c->point != VK_PIPELINE_BIND_POINT_COMPUTE && c->set < VKMSL_MAX_SETS) { e->gb.push[c->set] = c->data; e->gb.sets[c->set] = NULL; }
+                break;
+            }
+            case C_PUSH_CONSTANTS: {
+                const c_push *c = (const c_push *)h;
+                if (c->offset + c->size <= sizeof e->push) memcpy(e->push + c->offset, c + 1, c->size);
+                break;
+            }
+            case C_BIND_VERTEX: {
+                const c_bind_vertex *c = (const c_bind_vertex *)h;
+                const VkBuffer *b = (const VkBuffer *)(c + 1);
+                const uint64_t *o = (const uint64_t *)(b + c->count), *s = o + c->count;
+                for (uint32_t i = 0; i < c->count && c->first + i < VKMSL_MAX_VERTEX_BUFFERS; i++) {
+                    e->vb[c->first + i] = b[i];
+                    e->vb_offset[c->first + i] = o[i];
+                    if (c->has_strides) e->vb_stride[c->first + i] = s[i];
+                }
+                break;
+            }
+            case C_BIND_INDEX: {
+                const c_bind_index *c = (const c_bind_index *)h;
+                e->ib = c->buffer; e->ib_offset = c->offset; e->ib_type = c->type;
+                break;
+            }
+            case C_DRAW: case C_DRAW_INDEXED: {
+                const c_draw *c = (const c_draw *)h;
+                // (a geometry draw uses the same scratch buffers in the pass, from their start: not hoisted)
+                if (c->count && c->instances && e->gp && e->gp->gs_kernel) { *gs = 1; break; }
+                if (!c->count || !c->instances || !e->gp || !e->gp->tess) break;
+                if (*k >= 256) return -5;
+                tess_sizes t;
+                int indexed = h->op == C_DRAW_INDEXED;
+                uint32_t i = (*k)++;
+                if (!ce) {
+                    e->tess_pre[i].valid = (uint8_t)tess_sizes_of(e, c, indexed, &t);
+                    if (e->tess_pre[i].valid) {
+                        uint64_t part[4] = { t.vsize, t.cpsize, t.psize, t.all * t.fsize };
+                        uint64_t *at[4] = { &e->tess_pre[i].vout, &e->tess_pre[i].cp, &e->tess_pre[i].pb, &e->tess_pre[i].tf };
+                        for (int w = 0; w < 4; w++) { *at[w] = total[w]; total[w] += (part[w] + 255) & ~255ull; }
+                    }
+                } else if (e->tess_pre[i].valid && tess_sizes_of(e, c, indexed, &t))
+                    tess_kernels(e, ce, c, indexed, &t, e->tess_pre[i].vout, e->tess_pre[i].cp, e->tess_pre[i].pb, e->tess_pre[i].tf, e->hoist_phase);
+                break;
+            }
+            default: break;
+            }
+        }
+    }
+    return secondary ? 0 : -4;                             // (a primary: no end of the pass in this command buffer)
+}
+static int hoist_walk(vk_enc *e, const uint8_t *from, const vk_chunk *chunk, id<MTLComputeCommandEncoder> ce, uint64_t total[4]) {
+    uint32_t k = 0;
+    int gs = 0;
+    int r = hoist_list(e, from, chunk, 0, ce, total, &k, &gs);
+    if (!ce) e->tess_pre_count = k;
+    return !k ? 0 : r > 0 && gs ? -3 : r;                 // (0: no tessellation draws)
+}
+static void hoist_tessellation(vk_enc *e, const uint8_t *from, const vk_chunk *chunk) {
+    e->tess_pre_count = e->tess_pre_next = 0;
+    if (!vk_option("HOIST_TESS", 1)) return;
+    draw_state saved;
+    state_save(e, &saved);
+    uint64_t total[4] = { 0, 0, 0, 0 };
+    int ok = hoist_walk(e, from, chunk, nil, total);
+    state_restore(e, &saved);
+    uint32_t valid = 0;
+    for (uint32_t k = 0; ok > 0 && k < e->tess_pre_count; k++) valid += e->tess_pre[k].valid;
+    if (ok < 0 && vk_log_once("tessellation not hoisted", (uint32_t)-ok))
+        vx_log("vulkan: a pass's tessellation kernels not run before it: %s (logged once)", ok == -1 ? "a barrier in the pass that vertex work waits for" :
+               ok == -3 ? "a geometry draw" : ok == -4 ? "its end in another command buffer" : "too many draws");
+    if (ok <= 0 || !valid) { e->tess_pre_count = 0; return; }
+    static int told;
+    if (!told++) vx_log("vulkan: tessellation kernels run before their pass (%u draws in the first)", valid);
+    for (int w = 0; w < 4; w++) gs_scratch(e, w, total[w] ? total[w] : 1);
+    vk_end_encoder(e);                                     // (an encoder of its own: the GPU profile names it)
+    e->prof_tag = "tessellation (before the pass)";
+    // (VXRT_VK_TESS_CONCURRENT, on by default: the draws' kernels are independent of each other: every vertex kernel at
+    //  once, then every control kernel at once, rather than 70 small dispatches one after another)
+    int together = vk_option("TESS_CONCURRENT", 1);
+    e->compute_concurrent = together;
+    id<MTLComputeCommandEncoder> ce = compute_encoder(e);
+    e->compute_concurrent = 0;
+    e->prof_tag = NULL;
+    if (together) {
+        e->hoist_phase = 1;
+        hoist_walk(e, from, chunk, ce, total);
+        state_restore(e, &saved);
+        [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        e->hoist_phase = 2;
+    } else e->hoist_phase = 3;
+    hoist_walk(e, from, chunk, ce, total);
+    state_restore(e, &saved);
+    e->vertex_wait = 1;                                    // (the pass's vertex stage reads what the kernels wrote)
 }
 
 static void gs_draw(vk_enc *e, const c_draw *c, int indexed) {
@@ -1095,8 +1532,9 @@ static void gs_draw(vk_enc *e, const c_draw *c, int indexed) {
     MTLVisibilityResultMode vis = e->vis_mode;
     uint64_t vis_offset = e->vis_offset;
 
+    e->prof_tag = "geometry";
     id<MTLComputeCommandEncoder> ce = compute_encoder(e);
-    run_vertex_kernel(e, ce, c, indexed, vout, &gp);
+    run_vertex_kernel(e, ce, c, indexed, vout, 0, &gp);
     NSUInteger w;
     // The geometry shader over the primitives (y: instance and invocation).
     [ce setComputePipelineState:p->gs_kernel];
@@ -1108,14 +1546,16 @@ static void gs_draw(vk_enc *e, const c_draw *c, int indexed) {
     w = p->gs_kernel.threadExecutionWidth;
     [ce dispatchThreads:MTLSizeMake(prims, c->instances * p->gs_invocations, 1) threadsPerThreadgroup:MTLSizeMake(w, 1, 1)];
     // The pass again, drawing the triangles.
+    e->vertex_wait = 1;
     begin_render(e, &resume);
+    e->prof_tag = NULL;
     if (vis != MTLVisibilityResultModeDisabled) {
         [e->render setVisibilityResultMode:vis offset:vis_offset];
         e->vis_mode = vis; e->vis_offset = vis_offset;
     }
     if (!prepare_draw(e)) return;
-    [e->render setVertexBuffer:tris offset:0 atIndex:0];
-    [e->render setVertexBuffer:counts offset:0 atIndex:1];
+    rc_vbuf(e, tris, 0, 0);
+    rc_vbuf(e, counts, 0, 1);
     [e->render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)(runs * p->gs_max_tris * 3)];
 }
 
@@ -1399,6 +1839,9 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
             }
             case C_DRAW: case C_DRAW_INDEXED: {
                 c_draw *c = (c_draw *)h;
+                VK_STAT(VKS_DRAWS, 1);
+                e->prof_draws++;
+                if (c->count && c->instances && e->render && e->gp && (e->gp->gs_kernel || e->gp->tess)) VK_STAT(VKS_GS_TESS, 1);
                 if (c->count && c->instances && e->render && e->gp && e->gp->gs_kernel) { gs_draw(e, c, h->op == C_DRAW_INDEXED); break; }
                 if (c->count && c->instances && e->render && e->gp && e->gp->tess) { tess_draw(e, c, h->op == C_DRAW_INDEXED); break; }
                 if (!c->count || !c->instances || !prepare_draw(e)) break;
@@ -1417,6 +1860,8 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
             }
             case C_DRAW_INDIRECT: {
                 c_draw_indirect *c = (c_draw_indirect *)h;
+                VK_STAT(VKS_INDIRECT, 1);
+                e->prof_draws++;
                 if (e->gp && (e->gp->gs_kernel || e->gp->tess)) {
                     if (vk_log_once("indirect draw with a geometry or tessellation shader", e->gp->tess))
                         vx_log("vulkan: indirect draws with a %s shader are not supported (skipped, logged once)", e->gp->tess ? "tessellation" : "geometry");
@@ -1457,6 +1902,8 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
             }
             case C_DISPATCH: case C_DISPATCH_INDIRECT: {
                 struct VkPipeline_T *p = e->cp;
+                VK_STAT(VKS_DISPATCHES, 1);
+                e->prof_draws++;
                 if (!p || !p->compute) break;
                 id<MTLComputeCommandEncoder> ce = compute_encoder(e);
                 [ce setComputePipelineState:p->compute];
@@ -1477,12 +1924,14 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
                 c_begin_pass *c = (c_begin_pass *)h;
                 c->pass.occlusion = pass_occlusion_pool((uint8_t *)h + h->size, chunk);
                 c->pass.has_gs = (uint8_t)pass_has_gs((uint8_t *)h + h->size, chunk, e->gp);
+                hoist_tessellation(e, (uint8_t *)h + h->size, chunk);
                 begin_render(e, &c->pass);
                 break;
             }
             case C_END_PASS:
                 vk_end_encoder(e);
                 e->in_pass = 0;
+                e->tess_pre_count = e->tess_pre_next = 0;
                 break;
             case C_COPY_BUFFER: {
                 c_copy_buffer *c = (c_copy_buffer *)h;
@@ -1490,9 +1939,11 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
                 id<MTLBlitCommandEncoder> bl = blit_encoder(e);
                 const VkBufferCopy2 *r = (const VkBufferCopy2 *)(c + 1);
                 for (uint32_t i = 0; i < c->count; i++)
-                    if (r[i].size)
+                    if (r[i].size) {
+                        VK_STAT(VKS_COPY_BYTES, r[i].size);
                         [bl copyFromBuffer:c->src->mtl sourceOffset:c->src->offset + r[i].srcOffset toBuffer:c->dst->mtl
                          destinationOffset:c->dst->offset + r[i].dstOffset size:r[i].size];
+                    }
                 break;
             }
             case C_COPY_BUFFER_IMAGE: copy_buffer_image_encode(e, (c_copy_buffer_image *)h); break;
@@ -1515,6 +1966,9 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
                 const VkClearAttachment *a = (const VkClearAttachment *)(c + 1);
                 vk_internal_clear_attachments(e, c->attachments, a, c->rects, (const VkClearRect *)(a + c->attachments));
                 e->state_dirty = 1;
+                int on = e->rc.valid;
+                rc_forget(e);                              // (it drew with shaders and state of its own)
+                e->rc.valid = on;
                 break;
             }
             case C_FILL_BUFFER: {
@@ -1524,12 +1978,13 @@ static void encode_list(vk_enc *e, VkCommandBuffer cb) {
             }
             case C_UPDATE_BUFFER: {
                 c_update *c = (c_update *)h;
+                VK_STAT(VKS_UPDATE_BYTES, c->size);
                 if (!c->buffer->mtl) break;
                 id<MTLBuffer> tmp = [e->dev->mtl newBufferWithBytes:c + 1 length:c->size options:MTLResourceStorageModeShared];
                 [blit_encoder(e) copyFromBuffer:tmp sourceOffset:0 toBuffer:c->buffer->mtl destinationOffset:c->buffer->offset + c->offset size:c->size];
                 break;
             }
-            case C_BARRIER: break;
+            case C_BARRIER: VK_STAT(VKS_BARRIERS, 1); if (e->in_pass) VK_STAT(VKS_BARRIERS_IN_PASS, 1); e->wait_dst |= ((c_barrier *)h)->dst; break;
             case C_SET_EVENT: {
                 c_event *c = (c_event *)h;
                 if (e->event_count == e->event_cap) {
@@ -1607,6 +2062,10 @@ void vk_encode(VkQueue q, id<MTLCommandBuffer> mcb, const VkCommandBuffer *cbs, 
     e->cb = mcb;
     if (!q->last_fence) q->last_fence = [q->device->mtl newFence];
     e->fence = q->last_fence;
+    vk_residency_commit(q->device);
+    int no_use_heaps = vk_residency_on(q->device);
+    uint32_t first_sample = g_vkprof_next;
+    e->prof_sample = -1;
     for (uint32_t i = 0; i < n; i++) {
         // (each command buffer starts from no state: Vulkan does not carry state between them)
         VkDevice dev = e->dev;
@@ -1620,9 +2079,15 @@ void vk_encode(VkQueue q, id<MTLCommandBuffer> mcb, const VkCommandBuffer *cbs, 
         e->events = ev; e->event_values = evv; e->event_count = evn; e->event_cap = evc;
         e->timestamps = ts; e->timestamp_count = tsn; e->timestamp_cap = tsc;
         e->front = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        e->wait_dst = ~0ull;                               // (the first pass of a command buffer: what came before is not known)
+        e->no_use_heaps = no_use_heaps;
+        e->prof_sample = -1;
+        e->prof_first = first_sample;
         encode_list(e, cbs[i]);
         vk_end_encoder(e);
     }
+    e->prof_first = first_sample;
+    vkprof_submit(e);
     // Completion: events set, timestamps written (on the CPU: the time the work finished).
     uint32_t evn = e->event_count, tsn = e->timestamp_count;
     VkEvent *events = e->events;

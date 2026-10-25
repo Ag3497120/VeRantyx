@@ -20,6 +20,7 @@ typedef struct {
     uint32_t layers, view_mask;
     VkQueryPool occlusion;              // the occlusion query pool used in the pass, if any
     uint8_t has_gs;                     // it draws with a geometry shader (which ends the Metal pass and resumes it)
+    uint64_t dep_dst;                   // the stages its render pass's dependencies into it make wait
 } pass_desc;
 
 typedef struct {
@@ -74,6 +75,43 @@ typedef struct vk_enc {
     uint32_t event_count, event_cap;
     struct { VkQueryPool pool; uint32_t query; } *timestamps;
     uint32_t timestamp_count, timestamp_cap;
+    // VXRT_GPU_PROFILE (vk_command.m): the open encoder's timestamp samples (-1: none), its draws, what a compute
+    // encoder is opened for.
+    int prof_sample;
+    uint32_t prof_draws;
+    const char *prof_tag;
+    uint32_t prof_first;                // (this command buffer's first sample)
+    // The pass's tessellation draws whose kernels already ran before the pass began (vk_command.m, hoist_tessellation):
+    // where each draw's results are in the queue's scratch buffers, in the order of the draws.
+    struct { uint64_t vout, cp, pb, tf; uint8_t valid; } tess_pre[256];
+    uint32_t tess_pre_count, tess_pre_next;
+    // The stages the barriers since the last encoder began make wait (begin_render: a render pass waits for the work
+    // before it at its vertex stage only when they include stages before rasterization), and a render pass that must
+    // wait there anyway (after the runtime's own kernels whose results its vertex stage reads).
+    uint64_t wait_dst;
+    int vertex_wait;
+    int no_use_heaps;
+    int compute_concurrent;             // (the next compute encoder: dispatches that may run together, hoist_tessellation)
+    int hoist_phase;
+    __unsafe_unretained id<MTLBuffer> fan_buf;   // (triangle fans' indices: one buffer a command buffer, the Metal command buffer keeps it)
+    uint64_t fan_used;                    // (hoist_walk: 1 the vertex kernels, 2 the control kernels, 3 both)                   // (the device's residency set holds the heaps: vk_residency_on)
+    // What the open render encoder has been given (vk_command.m, VXRT_VK_ENCODE_CACHE): the same again is not sent.
+    // valid 0: nothing known (a new encoder, or one that code of its own drew with: clears).
+    struct {
+        int valid;
+        __unsafe_unretained id<MTLRenderPipelineState> pipeline;
+        __unsafe_unretained id<MTLDepthStencilState> depth_stencil;
+        __unsafe_unretained id<MTLBuffer> vbuf[32], fbuf[32];   // (nil: bytes or unknown)
+        uint64_t voff[32], foff[32];
+        uint32_t vbytes_len[2], fbytes_len[2];                    // push constants [0], dynamic offsets [1]
+        uint8_t vbytes[2][1024], fbytes[2][1024];
+        MTLViewport viewports[16]; uint32_t nviewports;
+        MTLScissorRect scissors[16]; uint32_t nscissors;
+        int cull, winding, fill, clip;
+        float bias[3], blend[4];
+        uint32_t sref[2];
+        int have_bias, have_blend, have_sref;
+    } rc;
 } vk_enc;
 
 void vk_end_encoder(vk_enc *e);

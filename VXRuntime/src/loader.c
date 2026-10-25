@@ -1278,6 +1278,7 @@ static void make_process_parameters(const char *exe) {
 int main(int argc, char **argv, char **envp) {
     if (argc < 2) { fprintf(stderr, "usage: vxrt program.exe [args...]\n"); return 2; }
     if (argc == 2 && !strcmp(argv[1], "--vxrt-job-watchdog")) return vx_jobs_watchdog();   // (src/jobs.c)
+    vx_program_env(argv[1]);                     // (first: the settings it gives are read below and in every init)
     vx_trace = getenv("VXRT_TRACE") && *getenv("VXRT_TRACE") == '1';
     // Windows programs keep thousands of handles open; macOS gives a process 256 descriptors (Google Earth VR ran
     // out while reading its tours): as many as the system allows.

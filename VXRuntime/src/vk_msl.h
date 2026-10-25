@@ -52,6 +52,11 @@ typedef struct {
 #define VKMSL_TESS_CP 12u              // control shader: the control points out; evaluation: the patches
 #define VKMSL_TESS_PATCH 13u           // control shader: the patches out
 #define VKMSL_TESS_FACTORS 30u         // control shader: the factors out (Metal's MTL*TessellationFactorsHalf)
+// Patches per threadgroup of the control shader's kernel (n: its output vertices): a SIMD-group's 32 threads hold
+// several patches (a threadgroup of 4 threads used an eighth of each; No Man's Sky's terrain: 100,000 patches a frame).
+// Each patch's outputs are threadgroup arrays of this many; the dispatch is ceil(patches / this) by instances
+// threadgroups of this times n threads.
+#define VKMSL_TCS_PATCHES(n) ((n) && (n) <= 32u ? 32u / (n) : 1u)
 typedef struct {
     uint32_t count, instances, patches;         // the draw's vertices, its instances, and patches (count / in_vertices)
     uint32_t in_vertices, out_vertices;         // patchControlPoints; the control shader's OutputVertices
@@ -109,7 +114,8 @@ enum {
     VKMSL_FLAG_NO_FLIP_Y = 1u << 0,       // keep gl_Position.y (Vulkan's clip y points down, Metal's up: negated)
     VKMSL_FLAG_RASTERIZER_DISCARD = 1u << 1,
     VKMSL_FLAG_VERTEX_KERNEL = 1u << 2,   // a vertex shader as the kernel before a geometry shader
-    VKMSL_FLAG_NO_DEPTH_ATTACHMENT = 1u << 3   // fragment shaders: the pass has no depth attachment (FragDepth dropped)
+    VKMSL_FLAG_NO_DEPTH_ATTACHMENT = 1u << 3,  // fragment shaders: the pass has no depth attachment (FragDepth dropped)
+    VKMSL_FLAG_TCS_ONE_PATCH = 1u << 4    // control shaders: a patch a threadgroup (not VKMSL_TCS_PATCHES: to compare them)
 };
 
 typedef struct {

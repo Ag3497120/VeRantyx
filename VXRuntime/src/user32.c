@@ -949,7 +949,16 @@ static WINAPI int GetKeyNameTextA(LONG lp, char *buf, int n) {
 
 // ---- mouse and cursor -------------------------------------------------------------------------------------------------------------
 static WINAPI BOOL GetCursorPos(POINT *p) { cursor_pos(p); return 1; }
-static WINAPI BOOL SetCursorPos(int x, int y) { CGWarpMouseCursorPosition(CGPointMake(x, y)); CGAssociateMouseAndMouseCursorPosition(1); return 1; }
+// (while a Command Clips click holds the pointer where it clicked, the program moves that pointer, not the Mac's: games
+//  that re-centre the pointer after reading each movement, No Man's Sky, then see one movement per click and the Mac's
+//  pointer stays where its user has it)
+static WINAPI BOOL SetCursorPos(int x, int y) {
+    if (__atomic_load_n(&g_clip_cursor.on, __ATOMIC_ACQUIRE) && (int32_t)(g_clip_cursor.until - tick_ms()) > 0) {
+        g_clip_cursor.pt = (POINT){ x, y };
+        return 1;
+    }
+    CGWarpMouseCursorPosition(CGPointMake(x, y)); CGAssociateMouseAndMouseCursorPosition(1); return 1;
+}
 static int g_cursor_count;
 static RECT g_clip; static int g_clipped;
 static void update_mouse_mode(void);
@@ -2053,6 +2062,20 @@ int vx_ui_snapshot(HANDLE hwnd, const char *png) {
     return ok;
 }
 void vx_ui_click(HANDLE hwnd, int x, int y) { vx_ui_click_hold(hwnd, x, y, 50); }
+// The pointer moved to client x, y without a button (WM_MOUSEMOVE there; GetCursorPos says so for a second), as a hand
+// moving the mouse: a game's own pointer or camera follows.
+void vx_ui_pointer(HANDLE hwnd, int x, int y) {
+    vx_window *w = vx_window_get(hwnd);
+    if (!w) return;
+    POINT o; client_origin(w, &o);
+    g_clip_cursor.pt = (POINT){ o.x + x, o.y + y };
+    g_clip_cursor.until = tick_ms() + CLIP_CURSOR_MS;
+    __atomic_store_n(&g_clip_cursor.on, 1, __ATOMIC_RELEASE);
+    vx_window *top = w;
+    for (int n = 0; n < 64 && (top->style & WS_CHILD) && vx_window_get(top->parent); n++) top = vx_window_get(top->parent);
+    POINT at = g_clip_cursor.pt;
+    vx_mouse_input(top, WM_MOUSEMOVE, 0, at.x, at.y);
+}
 // hold_ms: how long the button stays down (games that act on a held button: "hold to select").
 void vx_ui_click_hold(HANDLE hwnd, int x, int y, int hold_ms) {
     vx_window *w = vx_window_get(hwnd);

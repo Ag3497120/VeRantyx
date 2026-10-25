@@ -142,6 +142,12 @@ build/scm.exe: tests/scm.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $<
 
+# (<VXRT_ROOT>/program_env.txt: src/launchargs.c)
+tests: build/program_env.exe
+build/program_env.exe: tests/program_env.c
+	@mkdir -p build
+	$(MINGW) -O1 -o $@ $<
+
 # (VXRT_EXTRA_ARGS: src/launchargs.c)
 tests: build/extra_args.exe
 build/extra_args.exe: tests/extra_args.c
@@ -1326,6 +1332,8 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/child_stdout.exe
 	$(VXRT) build/inherit.exe
 	VXRT_EXTRA_ARGS='other.exe=--not-me;EXTRA_ARGS.EXE=--first "two words"' $(VXRT) build/extra_args.exe self tail
+	mkdir -p build/root && printf '# a comment\nother.exe VXRT_TEST_PROGRAM_ENV_OTHER=1\nPROGRAM_ENV.EXE VXRT_TEST_PROGRAM_ENV="two words" VXRT_TEST_PROGRAM_ENV_B=1\n' > build/root/program_env.txt
+	$(VXRT) build/program_env.exe; s=$$?; rm -f build/root/program_env.txt; exit $$s
 	$(VXRT) build/lowmem.exe
 	$(VXRT) build/files.exe
 	rm -rf build/ovtree build/ovshadow && mkdir -p build/ovtree/save && echo old > build/ovtree/save/old.sav && echo orig > build/ovtree/save/same.hl1

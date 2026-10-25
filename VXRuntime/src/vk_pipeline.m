@@ -81,7 +81,9 @@ static id<MTLFunction> compile_stage(VkDevice dev, const VkPipelineShaderStageCr
     vkmsl_options o = { .stage = vkmsl_stage, .entry = stage->pName, .bindings = bindings, .binding_count = nb,
                         .specs = specs, .spec_count = ns, .flags = flags, .vary_slots = vary_slots };
     if (tess) o.tess = *tess;
+    VK_STAT_T0(t_translate);
     int rc = vkmsl_translate(code, words, &o, res);
+    VK_STAT_NS(VKS_TRANSLATE_NS, t_translate);
     if (rc) {
         vk_log_unique("vulkan: %s shader \"%s\" not translated: %s", vkmsl_stage == VKMSL_STAGE_VERTEX ? "vertex" :
                vkmsl_stage == VKMSL_STAGE_FRAGMENT ? "fragment" : vkmsl_stage == VKMSL_STAGE_COMPUTE ? "compute" :
@@ -101,7 +103,10 @@ static id<MTLFunction> compile_stage(VkDevice dev, const VkPipelineShaderStageCr
         MTLCompileOptions *opts = [MTLCompileOptions new];
         opts.languageVersion = MTLLanguageVersion3_1;
         NSError *e = nil;
+        VK_STAT_T0(t_compile);
         lib = [dev->mtl newLibraryWithSource:src options:opts error:&e];
+        VK_STAT(VKS_MSL_COMPILES, 1);
+        VK_STAT_NS(VKS_MSL_COMPILE_NS, t_compile);
         if (!lib) {
             vk_log_unique("vulkan: shader \"%s\" did not compile: %s", stage->pName, e.localizedDescription.UTF8String);
             if (vk_trace()) vx_log("%s", res->msl);
@@ -111,7 +116,7 @@ static id<MTLFunction> compile_stage(VkDevice dev, const VkPipelineShaderStageCr
         pthread_mutex_lock(&dev->internal_lock);
         dev->internal_pipelines[src] = lib;
         pthread_mutex_unlock(&dev->internal_lock);
-    }
+    } else VK_STAT(VKS_MSL_CACHED, 1);
     if (lib_out) *lib_out = lib;
     return [lib newFunctionWithName:@"vkmain"];
 }
@@ -143,7 +148,42 @@ static MTLStencilDescriptor *stencil_desc(const VkStencilOpState *s) {
     return d;
 }
 id<MTLDepthStencilState> vk_depth_stencil_state(VkDevice dev, const VkPipelineDepthStencilStateCreateInfo *ds, int has_depth, int has_stencil);
+// (made once for each combination: the encoder asks for one at every draw whose pipeline has dynamic depth or stencil
+//  states, and making one costs microseconds; a few dozen combinations a game uses)
+typedef struct {
+    VkDevice dev;
+    uint32_t depth_test, depth_write, compare, stencil_test, has_depth, has_stencil;
+    VkStencilOpState front, back;
+} ds_key;
+#define DS_CACHE 1024
+static ds_key g_ds_keys[DS_CACHE];
+static __strong id<MTLDepthStencilState> g_ds_states[DS_CACHE];
+static pthread_mutex_t g_ds_lock = PTHREAD_MUTEX_INITIALIZER;
+static id<MTLDepthStencilState> make_depth_stencil_state(VkDevice dev, const VkPipelineDepthStencilStateCreateInfo *ds, int has_depth, int has_stencil);
 id<MTLDepthStencilState> vk_depth_stencil_state(VkDevice dev, const VkPipelineDepthStencilStateCreateInfo *ds, int has_depth, int has_stencil) {
+    if (!ds) return make_depth_stencil_state(dev, ds, has_depth, has_stencil);
+    ds_key k;
+    memset(&k, 0, sizeof k);
+    k.dev = dev; k.has_depth = has_depth != 0; k.has_stencil = has_stencil != 0;
+    if (k.has_depth && ds->depthTestEnable) { k.depth_test = 1; k.depth_write = ds->depthWriteEnable != 0; k.compare = ds->depthCompareOp; }
+    if (k.has_stencil && ds->stencilTestEnable) { k.stencil_test = 1; k.front = ds->front; k.back = ds->back; }
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < sizeof k; i++) h = (h ^ ((const uint8_t *)&k)[i]) * 1099511628211ull;
+    pthread_mutex_lock(&g_ds_lock);
+    for (uint32_t n = 0; n < 8; n++) {
+        uint32_t i = (uint32_t)(h + n) % DS_CACHE;
+        if (g_ds_states[i] && !memcmp(&g_ds_keys[i], &k, sizeof k)) { id<MTLDepthStencilState> st = g_ds_states[i]; pthread_mutex_unlock(&g_ds_lock); return st; }
+        if (!g_ds_states[i]) {
+            id<MTLDepthStencilState> st = make_depth_stencil_state(dev, ds, has_depth, has_stencil);
+            g_ds_keys[i] = k; g_ds_states[i] = st;
+            pthread_mutex_unlock(&g_ds_lock);
+            return st;
+        }
+    }
+    pthread_mutex_unlock(&g_ds_lock);
+    return make_depth_stencil_state(dev, ds, has_depth, has_stencil);   // (the table is full there)
+}
+static id<MTLDepthStencilState> make_depth_stencil_state(VkDevice dev, const VkPipelineDepthStencilStateCreateInfo *ds, int has_depth, int has_stencil) {
     MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
     if (ds && has_depth && ds->depthTestEnable) {
         d.depthCompareFunction = vk_compare(ds->depthCompareOp);
@@ -209,6 +249,7 @@ static void pipeline_free(struct VkPipeline_T *p) {
     for (int i = 0; i < 3; i++) p->gs_vs[i] = nil;
     p->gs_kernel = nil;
     p->tcs_kernel = nil;
+    p->tcs_kernel_one = nil;
     vk_pipeline_layout_release_copy(&p->layout);
     free(p);
 }
@@ -418,13 +459,21 @@ static VkResult create_graphics(VkDevice dev, const VkGraphicsPipelineCreateInfo
         NSError *e = nil;
         if (tess) {
             p->tcs_kernel = [dev->mtl newComputePipelineStateWithFunction:cf error:&e];
-            if (!p->tcs_kernel || p->tcs_kernel.maxTotalThreadsPerThreadgroup < p->tess_out_vertices) {
+            if (!p->tcs_kernel || p->tcs_kernel.maxTotalThreadsPerThreadgroup < VKMSL_TCS_PATCHES(p->tess_out_vertices) * p->tess_out_vertices) {
                 vk_log_unique("vulkan: tessellation control kernel failed: %s", e ? e.localizedDescription.UTF8String : "too many control points");
                 vkmsl_result_free(&vr); vkmsl_result_free(&fr); vkmsl_result_free(&gr); vkmsl_result_free(&cr); vkmsl_result_free(&er);
                 pipeline_free(p);
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
             p->gs_in_slots = vr.vary_locations + 4;
+            if (vk_option("TCS_AB", 0)) {                 // (a patch a threadgroup as well: VXRT_VK_LIVE's TCS_PACK=0 uses it)
+                vkmsl_result one;
+                memset(&one, 0, sizeof one);
+                VkResult err1 = VK_SUCCESS;
+                id<MTLFunction> f1 = compile_stage(dev, tcs, VKMSL_STAGE_TESS_CONTROL, &p->layout, VKMSL_FLAG_TCS_ONE_PATCH, vr.vary_locations, &one, NULL, &err1, NULL);
+                if (f1) p->tcs_kernel_one = [dev->mtl newComputePipelineStateWithFunction:f1 error:&e];
+                vkmsl_result_free(&one);
+            }
         } else
         p->gs_kernel = [dev->mtl newComputePipelineStateWithFunction:gf error:&e];
         if (!tess && !p->gs_kernel) {
@@ -531,7 +580,10 @@ VKFN VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dev, VkPipelineCache
     for (uint32_t i = 0; i < n; i++) {
         out[i] = VK_NULL_HANDLE;
         @autoreleasepool {
+            VK_STAT_T0(t);
             VkResult r = create_graphics(dev, &infos[i], &out[i]);
+            VK_STAT(VKS_GFX_PIPES, 1);
+            VK_STAT_NS(VKS_GFX_PIPE_NS, t);
             if (r != VK_SUCCESS) result = r;
         }
     }
@@ -544,6 +596,8 @@ VKFN VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dev, VkPipelineCache 
     VkResult result = VK_SUCCESS;
     for (uint32_t i = 0; i < n; i++) @autoreleasepool {
         out[i] = VK_NULL_HANDLE;
+        VK_STAT(VKS_COMP_PIPES, 1);
+        VK_STAT_T0(t_comp);
         const VkComputePipelineCreateInfo *info = &infos[i];
         struct VkPipeline_T *p = calloc(1, sizeof *p);
         if (!p) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -567,6 +621,7 @@ VKFN VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dev, VkPipelineCache 
             continue;
         }
         out[i] = p;
+        VK_STAT_NS(VKS_COMP_PIPE_NS, t_comp);
     }
     return result;
 }
@@ -631,6 +686,12 @@ VKFN VkResult VKAPI_CALL vkCreateRenderPass2(VkDevice dev, const VkRenderPassCre
         subpass_from(&rp->subpasses[i], &info->pSubpasses[i], dr ? dr->pDepthStencilResolveAttachment : NULL,
                      dr ? dr->depthResolveMode : 0, dr ? dr->stencilResolveMode : 0);
     }
+    rp->dep_dst = calloc(info->subpassCount ? info->subpassCount : 1, sizeof *rp->dep_dst);
+    for (uint32_t i = 0; i < info->dependencyCount; i++) {
+        const VkSubpassDependency2 *d = &info->pDependencies[i];
+        const VkMemoryBarrier2 *b2 = vk_find_struct(d->pNext, VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);   // (synchronization2's masks)
+        if (d->dstSubpass < info->subpassCount) rp->dep_dst[d->dstSubpass] |= b2 ? b2->dstStageMask : d->dstStageMask;
+    }
     render_pass_uses(rp);
     *out = rp;
     return VK_SUCCESS;
@@ -676,17 +737,23 @@ VKFN VkResult VKAPI_CALL vkCreateRenderPass(VkDevice dev, const VkRenderPassCrea
     }
     const VkRenderPassMultiviewCreateInfo *mv = vk_find_struct(info->pNext, VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO);
     for (uint32_t i = 0; mv && i < mv->subpassCount && i < info->subpassCount; i++) subs[i].viewMask = mv->pViewMasks[i];
+    VkSubpassDependency2 *deps = calloc(info->dependencyCount + 1, sizeof *deps);
+    for (uint32_t i = 0; i < info->dependencyCount; i++) {
+        const VkSubpassDependency *d = &info->pDependencies[i];
+        deps[i] = (VkSubpassDependency2){ VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2, NULL, d->srcSubpass, d->dstSubpass, d->srcStageMask,
+                                          d->dstStageMask, d->srcAccessMask, d->dstAccessMask, d->dependencyFlags, 0 };
+    }
     VkRenderPassCreateInfo2 i2 = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2, NULL, info->flags, info->attachmentCount, atts,
-                                   info->subpassCount, subs, 0, NULL, 0, NULL };
+                                   info->subpassCount, subs, info->dependencyCount, deps, 0, NULL };
     VkResult res = vkCreateRenderPass2(dev, &i2, alloc, out);
-    free(atts); free(subs); free(refs);
+    free(atts); free(subs); free(refs); free(deps);
     return res;
 }
 
 VKFN void VKAPI_CALL vkDestroyRenderPass(VkDevice dev, VkRenderPass rp, const VkAllocationCallbacks *alloc) {
     (void)dev; (void)alloc;
     if (!rp) return;
-    free(rp->attachments); free(rp->subpasses); free(rp->first_use); free(rp->last_use);
+    free(rp->attachments); free(rp->subpasses); free(rp->first_use); free(rp->last_use); free(rp->dep_dst);
     free(rp);
 }
 VKFN void VKAPI_CALL vkGetRenderAreaGranularity(VkDevice dev, VkRenderPass rp, VkExtent2D *g) {
