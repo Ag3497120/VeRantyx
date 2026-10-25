@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <time.h>
 
 #ifndef WINAPI
 #define WINAPI __attribute__((ms_abi))
@@ -81,7 +82,16 @@ struct VkQueue_T {
                                             // outputs, control points, patches, factors (reused draw to draw)
 };
 
-typedef struct vk_heap_list { __strong id<MTLHeap> *heaps; uint32_t count, cap; pthread_mutex_t lock; uint64_t generation; } vk_heap_list;
+typedef struct vk_heap_list {
+    __strong id<MTLHeap> *heaps; uint32_t count, cap; pthread_mutex_t lock; uint64_t generation;
+    // macOS 15 and later: the heaps also in one residency set every queue has (id<MTLResidencySet>), committed before a
+    // submission when it changed; the encoders then need no useHeaps (vk_command.m: 150 render passes a frame each
+    // listing every heap was a quarter of No Man's Sky's encoding time, 2026-10-26).
+    __strong id residency;
+    int residency_dirty;
+} vk_heap_list;
+void vk_residency_commit(VkDevice dev);   // (before a submission: the set as the heaps are now)
+int vk_residency_on(VkDevice dev);         // (the encoders may leave the heaps out)
 
 struct VkDevice_T {
     VK_LOADER_DATA_WORD;
@@ -297,6 +307,7 @@ struct VkPipeline_T {
     // Tessellation: the vertex shader as gs_vs kernels, the control shader as a kernel, the evaluation shader as the
     // render pipeline's (post-tessellation) vertex function.
     __strong id<MTLComputePipelineState> tcs_kernel;
+    __strong id<MTLComputePipelineState> tcs_kernel_one;   // (VXRT_VK_TCS_AB=1: the same with a patch a threadgroup, to compare)
     uint8_t tess, tess_quad, push_tcs, aux_tcs, push_tes, aux_tes;
     uint32_t sets_tcs, sets_tes;
     uint32_t patch_cp, tess_out_vertices, tess_cp_slots, tess_patch_slots;
@@ -320,7 +331,12 @@ struct VkRenderPass_T {
     uint32_t subpass_count;
     vk_subpass *subpasses;
     uint32_t *first_use, *last_use;     // per attachment: the subpasses that load and store it
+    uint64_t *dep_dst;                  // per subpass: the stages its dependencies make wait (VkSubpassDependency2 dstStageMask)
 };
+// The stages of a draw before rasterization (pipeline stage bits, Vulkan 1.0 and synchronization2): a dependency that
+// makes them wait needs the previous work done before a render pass's vertex stage; others before its fragment stage.
+#define VK_PRE_RASTER_STAGES (0x2ull | 0x4ull | 0x8ull | 0x10ull | 0x20ull | 0x40ull | 0x8000ull | 0x10000ull | \
+                              0x1000000000ull | 0x2000000000ull | 0x4000000000ull)
 
 struct VkFramebuffer_T {
     uint32_t width, height, layers;
@@ -411,6 +427,30 @@ int vk_trace(void);
 int vk_log_once(const char *kind, uint32_t value);
 // vx_log, but a message already logged (the same text) is not logged again.
 void vk_log_unique(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+// ---- VXRT_STATS: what a Vulkan program's frames cost (vk_queue.m writes them to the log every 5 seconds) ----------
+enum {
+    VKS_SUBMITS, VKS_CMDBUFS, VKS_MTL_CBS, VKS_SUBMIT_NS, VKS_ENCODE_NS, VKS_KEYED_NS,
+    VKS_PRESENTS, VKS_PRESENT_NS, VKS_DRAWABLE_NS, VKS_ACQUIRES, VKS_ACQUIRE_NS,
+    VKS_FENCE_WAITS, VKS_FENCE_NS, VKS_SEM_WAITS, VKS_SEM_NS, VKS_IDLE_WAITS, VKS_IDLE_NS, VKS_QUERY_IDLE,
+    VKS_GFX_PIPES, VKS_GFX_PIPE_NS, VKS_COMP_PIPES, VKS_COMP_PIPE_NS, VKS_TRANSLATE_NS, VKS_MSL_COMPILES, VKS_MSL_COMPILE_NS,
+    VKS_MSL_CACHED, VKS_DESC_UPDATES, VKS_DESC_WRITES, VKS_DESC_TEMPLATES, VKS_DESC_ALLOCS,
+    VKS_BUFFERS, VKS_IMAGES, VKS_VIEWS, VKS_ALLOCS, VKS_ALLOC_BYTES, VKS_MAPS,
+    VKS_DRAWS, VKS_INDIRECT, VKS_DISPATCHES, VKS_PASSES, VKS_ENCODERS, VKS_COPY_BYTES, VKS_UPDATE_BYTES, VKS_GS_TESS,
+    VKS_TESS_VERTS, VKS_TESS_PATCHES, VKS_TESS_CP, VKS_BARRIERS, VKS_BARRIERS_IN_PASS, VKS_VERTEX_WAITS, VKS_GPU_NS, VKS_COUNT
+};
+extern _Atomic uint64_t vk_stats[VKS_COUNT];
+int vk_stats_on(void);
+static inline uint64_t vk_now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+#define VK_STAT(i, n) do { if (vk_stats_on()) atomic_fetch_add_explicit(&vk_stats[i], (uint64_t)(n), memory_order_relaxed); } while (0)
+// (a stretch of time: VK_STAT_T0(x); ... VK_STAT_NS(VKS_..., x);)
+#define VK_STAT_T0(t) uint64_t t = vk_stats_on() ? vk_now_ns() : 0
+#define VK_STAT_NS(i, t) do { if (t) atomic_fetch_add_explicit(&vk_stats[i], vk_now_ns() - (t), memory_order_relaxed); } while (0)
+void vk_stats_frame(void);
+void vk_stats_gpu(id<MTLCommandBuffer> mcb);   // (its GPU time counted when it completes)
+// A tuning switch: VXRT_VK_<name> (0 or 1), else the default. VXRT_VK_LIVE=<file> (lines <name>=0|1) overrides it while
+// the program runs (read again every second): one run can measure both settings alternately (vk_queue.m).
+int vk_option(const char *name, int dflt);   // (each present: the 5-second report, frame times)
 
 // Exported commands (vk_dispatch.c lists them).
 PFN_vkVoidFunction vk_lookup(const char *name, int level);   // level 0 global, 1 instance, 2 device

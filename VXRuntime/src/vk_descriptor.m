@@ -233,6 +233,7 @@ VKFN VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice dev, const VkDescript
     const VkDescriptorSetVariableDescriptorCountAllocateInfo *var =
         vk_find_struct(info->pNext, VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO);
     for (uint32_t i = 0; i < info->descriptorSetCount; i++) out[i] = VK_NULL_HANDLE;
+    VK_STAT(VKS_DESC_ALLOCS, info->descriptorSetCount);
     pthread_mutex_lock(&p->lock);
     for (uint32_t i = 0; i < info->descriptorSetCount; i++) {
         VkDescriptorSetLayout l = info->pSetLayouts[i];
@@ -355,6 +356,8 @@ static const vk_set_binding *walk_next(walk *wk) {
 VKFN void VKAPI_CALL vkUpdateDescriptorSets(VkDevice dev, uint32_t write_count, const VkWriteDescriptorSet *writes,
                                             uint32_t copy_count, const VkCopyDescriptorSet *copies) {
     (void)dev;
+    VK_STAT(VKS_DESC_UPDATES, 1);
+    VK_STAT(VKS_DESC_WRITES, write_count + copy_count);
     for (uint32_t i = 0; i < write_count; i++) {
         const VkWriteDescriptorSet *wr = &writes[i];
         struct VkDescriptorSet_T *s = wr->dstSet;
@@ -426,6 +429,7 @@ void vk_apply_template(struct VkDescriptorSet_T *s, VkDescriptorUpdateTemplate t
 }
 VKFN void VKAPI_CALL vkUpdateDescriptorSetWithTemplate(VkDevice dev, VkDescriptorSet s, VkDescriptorUpdateTemplate t, const void *data) {
     (void)dev;
+    VK_STAT(VKS_DESC_TEMPLATES, 1);
     vk_apply_template(s, t, data);
 }
 

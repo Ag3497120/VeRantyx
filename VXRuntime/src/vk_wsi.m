@@ -11,6 +11,7 @@
 
 MTLTextureUsage vk_texture_usage(const vk_format_info *f, VkImageUsageFlags usage, VkImageCreateFlags flags);
 VkResult vk_present_blit(VkQueue q, id<MTLCommandBuffer> cb, VkImage img, id<MTLTexture> target);
+void vk_gpu_profile_frame(void);   // (vk_command.m)
 #define TRACE(...) do { if (vk_trace()) vx_log("vulkan: " __VA_ARGS__); } while (0)
 
 static vx_window *top_window(void *hwnd) {
@@ -208,12 +209,15 @@ VKFN VkResult VKAPI_CALL vkAcquireNextImageKHR(VkDevice dev, VkSwapchainKHR swap
     uint32_t i = sc->next;
     // The image is free once its last present's copy has run.
     VkQueue q = sc->present_queue[i];
+    VK_STAT(VKS_ACQUIRES, 1);
     if (q && sc->presented[i] && q->done.signaledValue < sc->presented[i]) {
+        VK_STAT_T0(t_wait);
         uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         while (q->done.signaledValue < sc->presented[i]) {
             if (timeout != UINT64_MAX && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start > timeout) return timeout ? VK_TIMEOUT : VK_NOT_READY;
             usleep(200);
         }
+        VK_STAT_NS(VKS_ACQUIRE_NS, t_wait);
     }
     sc->next = (i + 1) % sc->count;
     *index = i;
@@ -288,18 +292,23 @@ static void count_present(void) {
 
 VKFN VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *info) {
     VkResult result = VK_SUCCESS;
+    VK_STAT_T0(t_present);
     pthread_mutex_lock(&q->lock);
     for (uint32_t k = 0; k < info->swapchainCount; k++) @autoreleasepool {
         vk_swapchain *sc = (vk_swapchain *)info->pSwapchains[k];
         uint32_t i = info->pImageIndices[k];
         VkImage img = &sc->images[i];
         id<MTLCommandBuffer> cb = [q->mtl commandBuffer];
+        VK_STAT(VKS_MTL_CBS, 1);
+        vk_stats_gpu(cb);
         for (uint32_t w = 0; w < info->waitSemaphoreCount; w++) {
             VkSemaphore s = info->pWaitSemaphores[w];
             uint64_t v = atomic_load(&s->value);
             if (v) [cb encodeWaitForEvent:s->event value:v];
         }
+        VK_STAT_T0(t_drawable);
         id<CAMetalDrawable> drawable = [sc->surface->layer nextDrawable];
+        VK_STAT_NS(VKS_DRAWABLE_NS, t_drawable);
         if (drawable) {
             if (drawable.texture.pixelFormat == img->mtl.pixelFormat && drawable.texture.width == img->mtl.width &&
                 drawable.texture.height == img->mtl.height) {
@@ -325,6 +334,10 @@ VKFN VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *in
         if (r) result = r;
     }
     pthread_mutex_unlock(&q->lock);
+    VK_STAT(VKS_PRESENTS, 1);
+    VK_STAT_NS(VKS_PRESENT_NS, t_present);
+    vk_stats_frame();
+    vk_gpu_profile_frame();
     return result;
 }
 

@@ -772,14 +772,24 @@ void vk_device_add_heap(VkDevice dev, id<MTLHeap> heap) {
     }
     l->heaps[l->count++] = heap;
     l->generation++;
+    if (@available(macOS 15.0, *)) if (l->residency) { [(id<MTLResidencySet>)l->residency addAllocation:heap]; l->residency_dirty = 1; }
     pthread_mutex_unlock(&l->lock);
 }
+void vk_residency_commit(VkDevice dev) {
+    vk_heap_list *l = &dev->heaps;
+    if (!l->residency || !__atomic_load_n(&l->residency_dirty, __ATOMIC_RELAXED)) return;
+    pthread_mutex_lock(&l->lock);
+    if (@available(macOS 15.0, *)) if (l->residency_dirty) { [(id<MTLResidencySet>)l->residency commit]; l->residency_dirty = 0; }
+    pthread_mutex_unlock(&l->lock);
+}
+int vk_residency_on(VkDevice dev) { return dev->heaps.residency != nil && vk_option("RESIDENCY_SET", 1); }
 void vk_device_remove_heap(VkDevice dev, id<MTLHeap> heap) {
     vk_heap_list *l = &dev->heaps;
     pthread_mutex_lock(&l->lock);
     for (uint32_t i = 0; i < l->count; i++)
         if (l->heaps[i] == heap) { l->heaps[i] = l->heaps[l->count - 1]; l->heaps[--l->count] = nil; break; }
     l->generation++;
+    if (@available(macOS 15.0, *)) if (l->residency) { [(id<MTLResidencySet>)l->residency removeAllocation:heap]; l->residency_dirty = 1; }
     pthread_mutex_unlock(&l->lock);
 }
 
@@ -805,6 +815,13 @@ VKFN VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice phys, const VkDeviceCre
     if (f2) dev->features = f2->features;
     pthread_mutex_init(&dev->heaps.lock, NULL);
     pthread_mutex_init(&dev->internal_lock, NULL);
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+        rd.label = @"vxrt vulkan heaps";
+        NSError *err = nil;
+        dev->heaps.residency = [dev->mtl newResidencySetWithDescriptor:rd error:&err];
+        if (!dev->heaps.residency) TRACE("no residency set: %s", err.localizedDescription.UTF8String);
+    }
     uint32_t queues = 0;
     for (uint32_t i = 0; i < info->queueCreateInfoCount; i++)
         if (info->pQueueCreateInfos[i].queueFamilyIndex == 0) queues += info->pQueueCreateInfos[i].queueCount;
@@ -817,6 +834,7 @@ VKFN VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice phys, const VkDeviceCre
         q->index = i;
         q->mtl = [dev->mtl newCommandQueueWithMaxCommandBufferCount:256];
         q->done = [dev->mtl newSharedEvent];
+        if (@available(macOS 15.0, *)) if (dev->heaps.residency) [q->mtl addResidencySet:(id<MTLResidencySet>)dev->heaps.residency];
         pthread_mutex_init(&q->lock, NULL);
     }
     dev->queue_count = queues;
@@ -969,6 +987,8 @@ VKFN VkResult VKAPI_CALL vkAllocateMemory(VkDevice dev, const VkMemoryAllocateIn
     (void)alloc;
     *out = VK_NULL_HANDLE;
     if (info->memoryTypeIndex >= VK_MEMTYPE_COUNT) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    VK_STAT(VKS_ALLOCS, 1);
+    VK_STAT(VKS_ALLOC_BYTES, info->allocationSize);
     const VkImportMemoryWin32HandleInfoKHR *imp = vk_find_struct(info->pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR);
     const VkExportMemoryAllocateInfo *exp = vk_find_struct(info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
     if ((imp && imp->handleType) || (exp && exp->handleTypes)) return external_memory(dev, info, imp, exp, out);
@@ -1017,6 +1037,7 @@ VKFN void VKAPI_CALL vkFreeMemory(VkDevice dev, VkDeviceMemory mem, const VkAllo
 
 VKFN VkResult VKAPI_CALL vkMapMemory(VkDevice dev, VkDeviceMemory mem, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void **data) {
     (void)dev; (void)size; (void)flags;
+    VK_STAT(VKS_MAPS, 1);
     if (!mem->map) return VK_ERROR_MEMORY_MAP_FAILED;
     *data = (uint8_t *)mem->map + offset;
     return VK_SUCCESS;
@@ -1039,6 +1060,7 @@ static uint64_t buffer_alignment(VkDevice dev, uint64_t size) {
 
 VKFN VkResult VKAPI_CALL vkCreateBuffer(VkDevice dev, const VkBufferCreateInfo *info, const VkAllocationCallbacks *alloc, VkBuffer *out) {
     (void)dev; (void)alloc;
+    VK_STAT(VKS_BUFFERS, 1);
     struct VkBuffer_T *b = calloc(1, sizeof *b);
     if (!b) return VK_ERROR_OUT_OF_HOST_MEMORY;
     b->size = info->size;
@@ -1127,6 +1149,7 @@ VKFN VkResult VKAPI_CALL vkCreateImage(VkDevice dev, const VkImageCreateInfo *in
     (void)alloc;
     const vk_format_info *f = vk_format(info->format);
     if (!f || f->mtl == MTLPixelFormatInvalid) { TRACE("image format %d unsupported", info->format); return VK_ERROR_FORMAT_NOT_SUPPORTED; }
+    VK_STAT(VKS_IMAGES, 1);
     struct VkImage_T *img = calloc(1, sizeof *img);
     if (!img) return VK_ERROR_OUT_OF_HOST_MEMORY;
     img->type = info->imageType;
@@ -1278,6 +1301,7 @@ static MTLTextureType view_type(VkImageViewType t, uint32_t samples) {
 VKFN VkResult VKAPI_CALL vkCreateImageView(VkDevice dev, const VkImageViewCreateInfo *info, const VkAllocationCallbacks *alloc, VkImageView *out) {
     (void)dev; (void)alloc;
     VkImage img = info->image;
+    VK_STAT(VKS_VIEWS, 1);
     struct VkImageView_T *v = calloc(1, sizeof *v);
     if (!v) return VK_ERROR_OUT_OF_HOST_MEMORY;
     v->image = img;

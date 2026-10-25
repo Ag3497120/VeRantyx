@@ -78,3 +78,50 @@ char *vx_extra_args(int *argc, char ***argv) {
     free(added);
     return shown;
 }
+
+// <VXRT_ROOT>/program_env.txt: environment settings for one program, applied when that program starts, however it
+// was started. A game that a running launcher (Windows Steam) starts gets that launcher's environment, which was fixed
+// when the launcher started; measuring a game (VXRT_STATS, VXRT_PROFILE, MTL_HUD_ENABLED, ...) then needs no restart of
+// the launcher and changes nothing in the game's or the launcher's files. One line per program:
+//
+//   # comment
+//   NMS.exe VXRT_STATS=1 VXRT_PROFILE=/tmp/nms.prof
+//
+// The program by file name (any folder, case ignored); the settings separated by spaces, double quotes keeping spaces
+// in one value. They replace what the environment had. A child of that program inherits them as any setting. Each
+// process changed says so in the log. The root as files.c finds it: VXRT_ROOT, else ~/.vxrt.
+#include <stdio.h>
+void vx_program_env(const char *program) {
+    char path[4096];
+    const char *root = getenv("VXRT_ROOT");
+    if (root && *root) snprintf(path, sizeof path, "%s/program_env.txt", root);
+    else snprintf(path, sizeof path, "%s/.vxrt/program_env.txt", getenv("HOME") ? getenv("HOME") : "/tmp");
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    const char *base = program;
+    for (const char *p = program; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+    char line[4096];
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strcspn(line, "\r\n");
+        line[n] = 0;
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#') continue;
+        char *name_end = p;
+        while (*name_end && *name_end != ' ' && *name_end != '\t') name_end++;
+        if ((size_t)(name_end - p) != strlen(base) || strncasecmp(p, base, strlen(base))) continue;
+        char *pieces[sizeof line / 2 + 1];
+        int count = 0;
+        split_into(name_end, strlen(name_end), pieces, &count);   // (at most one piece per two bytes: fits)
+        for (int i = 0; i < count; i++) {
+            char *eq = strchr(pieces[i], '=');
+            if (eq && eq != pieces[i]) {
+                *eq = 0;
+                setenv(pieces[i], eq + 1, 1);
+                vx_log("program_env.txt: %s runs with %s=%s", base, pieces[i], eq + 1);
+            }
+            free(pieces[i]);
+        }
+    }
+    fclose(f);
+}
