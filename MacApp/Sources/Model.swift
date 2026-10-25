@@ -124,7 +124,7 @@ struct Job {
         let wsteam = windowsSteamInstalled ? await WindowsSteam.running() : false
         windowsSteamRunning = wsteam
         freeBytes = Mac.freeSpace(drive)
-        elsewhere = play?.running == true ? [] : await pgrep("[b]uild/vxrt.*\\.exe")
+        elsewhere = play?.running == true ? [] : await pgrep("[b]uild/vxrt.*\\.[Ee][Xx][Ee]")   // (Steam starts games by upper-case paths)
     }
 
     func reloadLibrary() { Task { await loadLibrary() } }

@@ -197,9 +197,10 @@ enum Quality: String, CaseIterable, Identifiable {
         stopping = true
         process.terminate()                               // (the scripts' trap stops SteamVR, the encoder and the game)
         if viaWindowsSteam, let exe = known?.gameExe {
-            // (launch_vxrt_nms_vr.sh leaves the game to Steam: the game is ended here; Windows Steam keeps running)
+            // (launch_vxrt_nms_vr.sh leaves the game to Steam: the game is ended here; Windows Steam keeps running.
+            //  Steam starts it by an upper-case path, ".../BINARIES/NMS.EXE": the match ignores case)
             let pattern = "build/vxrt.*/" + NSRegularExpression.escapedPattern(for: exe) + "( |$)"
-            Task.detached { _ = await run("/usr/bin/pkill", ["-TERM", "-f", pattern]) }
+            Task.detached { _ = await run("/usr/bin/pkill", ["-TERM", "-i", "-f", pattern]) }
         }
         let p = process
         DispatchQueue.global().asyncAfter(deadline: .now() + 15) {
