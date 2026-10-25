@@ -145,9 +145,9 @@ static void request(int fd, char *line) {
     HANDLE h = window_arg(&s);
     if (!h) { reply_err(fd, "no such window"); return; }
     if (!strcmp(cmd, "click")) {
-        char *x = word(&s), *y = word(&s);
-        if (!x || !y) { reply_err(fd, "click <hwnd> <x> <y>"); return; }
-        vx_ui_click(h, atoi(x), atoi(y));
+        char *x = word(&s), *y = word(&s), *hold = word(&s);
+        if (!x || !y) { reply_err(fd, "click <hwnd> <x> <y> [hold ms]"); return; }
+        vx_ui_click_hold(h, atoi(x), atoi(y), hold ? atoi(hold) : 50);
     } else if (!strcmp(cmd, "key")) {
         char *k = word(&s);
         if (!k) { reply_err(fd, "key <hwnd> <vk>[+<vk>...]"); return; }
