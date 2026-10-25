@@ -34,11 +34,9 @@
 		<string>_verantyxvr._udp</string>
 	</array>
 	<key>NSHandsTrackingUsageDescription</key>
-	<string>Your hands move the game's hands and controllers, and hand gestures press its buttons.</string>
+	<string>Your hands move the game's hands and controllers, and hand gestures press its buttons. Hand positions are sent only to your own Mac.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Receives the game's picture and sound from your Mac on the same Wi-Fi network.</string>
-	<key>NSWorldSensingUsageDescription</key>
-	<string>Your head position is sent to the game on your Mac so the picture follows your head.</string>
+	<string>Finds VeRantyx on your Mac nearby, over Wi-Fi or a direct connection, to receive the game's picture and sound and to send back your head, hand and controller movements.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationPreferredDefaultSceneSessionRole</key>

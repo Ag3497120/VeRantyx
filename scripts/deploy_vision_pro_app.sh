@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT="$REPO_ROOT/VisionProClient/VisionSpatialTools/VisionSpatialTools.xcodeproj"
 SCHEME="${SCHEME:-VisionSpatialTools}"
-BUNDLE_ID="${BUNDLE_ID:-marimokodai.VisionSpatialTools}"
+BUNDLE_ID="${BUNDLE_ID:-marimokodai.VeRantyx.vision}"
 # First paired Apple Vision Pro unless DEVICE_ID is given.
 DEVICE_ID="${DEVICE_ID:-$(xcrun devicectl list devices 2>/dev/null | grep -i 'Vision Pro' | grep -oE '[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}' | head -1)}"
 if [[ -z "$DEVICE_ID" ]]; then
