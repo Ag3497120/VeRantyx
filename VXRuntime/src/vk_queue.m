@@ -166,6 +166,10 @@ VKFN VkResult VKAPI_CALL vkWaitSemaphores(VkDevice dev, const VkSemaphoreWaitInf
     return VK_SUCCESS;
 }
 
+int vx_shared_keyed_acquire(int slot, uint64_t key, uint32_t ms);   // d3d11_shared.m
+void vx_shared_keyed_release(int slot, uint64_t key);
+void vx_shared_keyed_gpu_done(int slot);
+
 // ---- submission --------------------------------------------------------------------------------------------------
 VkResult vk_queue_submit_internal(VkQueue q, uint32_t n, const VkSubmitInfo2 *submits, VkFence fence) {
     pthread_mutex_lock(&q->lock);
@@ -176,8 +180,17 @@ VkResult vk_queue_submit_internal(VkQueue q, uint32_t n, const VkSubmitInfo2 *su
     }
     for (uint32_t i = 0; i < n || (i == 0 && n == 0); i++) @autoreleasepool {
         id<MTLCommandBuffer> mcb = [q->mtl commandBuffer];
+        const VkWin32KeyedMutexAcquireReleaseInfoKHR *km = NULL;
         if (n) {
             const VkSubmitInfo2 *s = &submits[i];
+            // VK_KHR_win32_keyed_mutex: the shared images' mutexes are taken before the work (the CPU waits here, where
+            // Windows lets the GPU wait) and given back after it (d3d11_shared.m).
+            km = vk_find_struct(s->pNext, VK_STRUCTURE_TYPE_WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR);
+            for (uint32_t k = 0; km && k < km->acquireCount; k++) {
+                VkDeviceMemory m = km->pAcquireSyncs[k];
+                if (m && m->keyed_slot && !vx_shared_keyed_acquire(m->keyed_slot - 1, km->pAcquireKeys[k], km->pAcquireTimeouts ? km->pAcquireTimeouts[k] : 0xffffffffu))
+                    TRACE("keyed mutex of slot %d not acquired with key %llu", m->keyed_slot - 1, (unsigned long long)km->pAcquireKeys[k]);
+            }
             for (uint32_t k = 0; k < s->waitSemaphoreInfoCount; k++) {
                 VkSemaphore sem = s->pWaitSemaphoreInfos[k].semaphore;
                 uint64_t v = sem->timeline ? s->pWaitSemaphoreInfos[k].value : atomic_load(&sem->value);
@@ -208,6 +221,19 @@ VkResult vk_queue_submit_internal(VkQueue q, uint32_t n, const VkSubmitInfo2 *su
                 if (done.status == MTLCommandBufferStatusError) vk_log_unique("vulkan: GPU work failed: %s", done.error.localizedDescription.UTF8String);
             }];
         }
+        int released[64], nr = 0;
+        for (uint32_t k = 0; km && k < km->releaseCount && nr < 64; k++) {
+            VkDeviceMemory m = km->pReleaseSyncs[k];
+            if (!m || !m->keyed_slot) continue;
+            released[nr++] = m->keyed_slot - 1;
+            vx_shared_keyed_release(m->keyed_slot - 1, km->pReleaseKeys[k]);
+        }
+        if (nr) {
+            int *slots = malloc(sizeof(int) * (size_t)nr);
+            memcpy(slots, released, sizeof(int) * (size_t)nr);
+            int count = nr;
+            [mcb addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; for (int k = 0; k < count; k++) vx_shared_keyed_gpu_done(slots[k]); free(slots); }];
+        }
         [mcb commit];
         if (n == 0) break;
     }
@@ -236,7 +262,9 @@ VKFN VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo
     for (uint32_t i = 0; i < n; i++) {
         const VkSubmitInfo *s = &submits[i];
         const VkTimelineSemaphoreSubmitInfo *tl = vk_find_struct(s->pNext, VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO);
-        s2[i] = (VkSubmitInfo2){ VK_STRUCTURE_TYPE_SUBMIT_INFO_2, NULL, 0, s->waitSemaphoreCount, w + wi, s->commandBufferCount, c + ci,
+        // (the keyed mutexes of VK_KHR_win32_keyed_mutex go along: VkSubmitInfo2 takes the same structure)
+        s2[i] = (VkSubmitInfo2){ VK_STRUCTURE_TYPE_SUBMIT_INFO_2, vk_find_struct(s->pNext, VK_STRUCTURE_TYPE_WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR),
+                                 0, s->waitSemaphoreCount, w + wi, s->commandBufferCount, c + ci,
                                  s->signalSemaphoreCount, NULL };
         for (uint32_t k = 0; k < s->waitSemaphoreCount; k++, wi++)
             w[wi] = (VkSemaphoreSubmitInfo){ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, s->pWaitSemaphores[k],

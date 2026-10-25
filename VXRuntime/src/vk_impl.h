@@ -109,6 +109,11 @@ struct VkDeviceMemory_T {
     void *map;
     struct VkImage_T *dedicated_image;
     uint32_t handle;                  // an exported Win32 handle, 0 when none
+    // External memory (VK_KHR_external_memory_win32): a dedicated image's texture on a global IOSurface, imported from
+    // a shared handle (Direct3D's, another process's) or made here to be exported; shared_slot is its handle's slot + 1.
+    __strong id<MTLTexture> external;
+    int shared_slot;
+    int keyed_slot;                   // its slot + 1 (imported or exported): the keyed mutex VK_KHR_win32_keyed_mutex takes
 };
 
 struct VkBuffer_T {

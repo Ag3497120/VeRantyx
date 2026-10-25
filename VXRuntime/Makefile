@@ -840,6 +840,11 @@ build/dwrite.exe: tests/dwrite.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ldwrite -lgdi32 -lm
 
+# Vulkan images shared with Direct3D 11 through Win32 handles (VK_KHR_external_memory_win32).
+tests: build/vulkan_external.exe
+build/vulkan_external.exe: tests/vulkan_external.c build/libvulkan-1.a third_party/vulkan/vulkan/vulkan_core.h
+	$(MINGW) -O1 -Wall -Ithird_party/vulkan -o $@ $< -Lbuild -lvulkan-1 -ld3d11 -ldxgi -ldxguid -luuid
+
 build/shared.exe: tests/shared.c
 	@mkdir -p build
 	$(MINGW) -O1 -o $@ $< -ld3d11 -ldxgi -ldxguid -luuid
@@ -1396,6 +1401,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/d3d11on12.exe
 	$(VXRT) build/vulkan_features.exe
 	$(VXRT) build/vulkan_shaders.exe
+	$(VXRT) build/vulkan_external.exe
 	$(VXRT) build/vulkan_win.exe build/vulkan_spirv_vertex_fixture.spv build/vulkan_spirv_fragment_fixture.spv \
 		build/vulkan_spirv_uniform_vertex_fixture.spv build/vulkan_spirv_uniform_fragment_fixture.spv
 	$(VXRT) build/input.exe

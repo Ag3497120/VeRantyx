@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#import <IOSurface/IOSurface.h>
 
 int vk_trace(void) {
     static int on = -1;
@@ -22,6 +23,9 @@ void *vk_find_struct_mut(void *chain, VkStructureType type) {
 }
 
 uint32_t vk_api_version(void) { return VK_MAKE_API_VERSION(0, 1, 3, 280); }
+
+#define VK_WIN32_IMAGE_HANDLES (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT | \
+    VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT)
 
 // ---- instance ----------------------------------------------------------------------------------------------------
 typedef struct { const char *name; uint32_t version, bit; } vk_ext;
@@ -86,6 +90,8 @@ static const vk_ext g_device_exts[] = {
     { VK_KHR_SPIRV_1_4_EXTENSION_NAME, 1, 0 },
     { VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME, 4, 0 },
     { VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, 1, 0 },
+    { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, 1, 0 },
+    { VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME, 1, 0 },
     { VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, 1, 0 },
     { VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME, 1, 0 },
     { VK_EXT_SEPARATE_STENCIL_USAGE_EXTENSION_NAME, 1, 0 },
@@ -514,7 +520,11 @@ VKFN void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysicalDevice phys, VkPhy
             VkPhysicalDeviceIDProperties *p = (void *)s;
             device_uuid(phys, p->deviceUUID);
             memcpy(p->driverUUID, "VXRuntime-Metal", 15);
-            p->deviceLUIDValid = 0;
+            // (the LUID DXGI gives the adapter: SteamVR's client finds the Vulkan device of the headset's adapter by it)
+            uint32_t luid[2] = { 0x5658, 0 };
+            memcpy(p->deviceLUID, luid, sizeof luid);
+            p->deviceNodeMask = 1;
+            p->deviceLUIDValid = 1;
             break;
         }
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES: {
@@ -684,7 +694,21 @@ VKFN VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDev
     VkResult r = vkGetPhysicalDeviceImageFormatProperties(phys, info->format, info->type, info->tiling, info->usage, info->flags,
                                                            &p->imageFormatProperties);
     VkExternalImageFormatProperties *ext = vk_find_struct_mut(p->pNext, VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
-    if (ext) memset(&ext->externalMemoryProperties, 0, sizeof ext->externalMemoryProperties);
+    if (ext) {
+        memset(&ext->externalMemoryProperties, 0, sizeof ext->externalMemoryProperties);
+        // Win32 handles of 2D single-sample images, one level: shared through IOSurfaces (Direct3D 11's shared textures).
+        const VkPhysicalDeviceExternalImageFormatInfo *x = vk_find_struct(info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+        if (r == VK_SUCCESS && x && (x->handleType & VK_WIN32_IMAGE_HANDLES) && info->type == VK_IMAGE_TYPE_2D &&
+            info->tiling == VK_IMAGE_TILING_OPTIMAL) {
+            ext->externalMemoryProperties.externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT |
+                VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+            ext->externalMemoryProperties.exportFromImportedHandleTypes = VK_WIN32_IMAGE_HANDLES;
+            ext->externalMemoryProperties.compatibleHandleTypes = VK_WIN32_IMAGE_HANDLES;
+            p->imageFormatProperties.maxMipLevels = 1;
+            p->imageFormatProperties.maxArrayLayers = 1;
+            p->imageFormatProperties.sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        } else if (x && x->handleType) r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
     return r;
 }
 VKFN void VKAPI_CALL vkGetPhysicalDeviceSparseImageFormatProperties(VkPhysicalDevice phys, VkFormat format, VkImageType type,
@@ -832,10 +856,122 @@ VKFN void VKAPI_CALL vkGetDeviceQueue2(VkDevice dev, const VkDeviceQueueInfo2 *i
 }
 
 // ---- memory ------------------------------------------------------------------------------------------------------
+// ---- external memory (VK_KHR_external_memory_win32) ---------------------------------------------------------------
+// A dedicated image's memory as a texture on a global IOSurface, the way Direct3D 11 shares textures between processes
+// (d3d11_shared.m): imported from a shared handle (the surface opened as this image's texture), or made here and given a
+// handle (vkGetMemoryWin32HandleKHR) that Direct3D's OpenSharedResource or another Vulkan device imports. SteamVR's
+// client shares a Vulkan game's eye images with its compositor this way.
+enum { TD_WIDTH, TD_HEIGHT, TD_MIPS, TD_ARRAY, TD_FORMAT, TD_SAMPLES, TD_QUALITY, TD_USAGE, TD_BIND, TD_CPU, TD_MISC, TD_COUNT };
+int vx_shared_texture_find(uintptr_t h, uint32_t *surface, uint32_t desc[TD_COUNT]);
+int vx_shared_texture_add(uint32_t surface, const uint32_t desc[TD_COUNT]);
+#define VX_SHARED_HANDLE_BASE 0x40000000u
+static uint32_t dxgi_format_of(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: return 28;
+    case VK_FORMAT_R8G8B8A8_SRGB: return 29;
+    case VK_FORMAT_B8G8R8A8_UNORM: return 87;
+    case VK_FORMAT_B8G8R8A8_SRGB: return 91;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return 10;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return 24;
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return 26;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return 2;
+    case VK_FORMAT_R16G16B16A16_UNORM: return 11;
+    case VK_FORMAT_R32_SFLOAT: return 41;
+    case VK_FORMAT_D32_SFLOAT: return 40;
+    default: return 0;
+    }
+}
+static id<MTLTexture> surface_texture(VkDevice dev, VkImage img, IOSurfaceRef surface) {
+    MTLTextureDescriptor *d = [img->desc copy];
+    d.storageMode = MTLStorageModeShared;
+    d.mipmapLevelCount = 1;
+    d.usage |= MTLTextureUsagePixelFormatView;
+    return [dev->mtl newTextureWithDescriptor:d iosurface:surface plane:0];
+}
+static VkResult external_memory(VkDevice dev, const VkMemoryAllocateInfo *info, const VkImportMemoryWin32HandleInfoKHR *imp,
+                                const VkExportMemoryAllocateInfo *exp, VkDeviceMemory *out) {
+    const VkMemoryDedicatedAllocateInfo *ded = vk_find_struct(info->pNext, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+    VkImage img = ded ? ded->image : VK_NULL_HANDLE;
+    if (!img || img->type != VK_IMAGE_TYPE_2D || img->samples > 1 || img->mips != 1 || img->layers != 1 ||
+        img->tiling != VK_IMAGE_TILING_OPTIMAL) {
+        if (vk_log_once("external memory that is not a dedicated 2D image", 0))
+            vx_log("vulkan: external memory that is not a dedicated single 2D image is not supported (logged once)");
+        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    }
+    id<MTLTexture> tex = nil;
+    int slot = -1, keyed = 0;
+    if (imp && imp->handleType) {
+        uint32_t sid = 0, desc[TD_COUNT];
+        slot = imp->handle ? vx_shared_texture_find((uintptr_t)imp->handle, &sid, desc) : -1;
+        IOSurfaceRef surface = slot >= 0 ? IOSurfaceLookup(sid) : NULL;
+        if (!surface) { TRACE("import of handle %p (type %#x) failed", imp->handle, imp->handleType); return VK_ERROR_INVALID_EXTERNAL_HANDLE; }
+        if (desc[TD_WIDTH] < img->extent.width || desc[TD_HEIGHT] < img->extent.height)
+            TRACE("imported surface %ux%u for an image of %ux%u", desc[TD_WIDTH], desc[TD_HEIGHT], img->extent.width, img->extent.height);
+        tex = surface_texture(dev, img, surface);
+        CFRelease(surface);
+        keyed = slot + 1;
+        slot = -1;                                                 // (the slot stays its creator's)
+    } else {
+        uint32_t bpp = img->fmt->bytes, dxgi = dxgi_format_of(img->format);
+        if (!dxgi || img->fmt->compressed) {
+            if (vk_log_once("export of image format", img->format)) vx_log("vulkan: export of an image of format %d is not supported (logged once)", img->format);
+            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        }
+        NSDictionary *props = @{ (id)kIOSurfaceWidth: @(img->extent.width), (id)kIOSurfaceHeight: @(img->extent.height),
+                                 (id)kIOSurfaceBytesPerElement: @(bpp),
+                                 (id)kIOSurfaceBytesPerRow: @(IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, img->extent.width * bpp)),
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                                 (id)kIOSurfaceIsGlobal: @YES };
+#pragma clang diagnostic pop
+        IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        if (!surface) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        tex = surface_texture(dev, img, surface);
+        uint32_t desc[TD_COUNT] = { 0 };
+        desc[TD_WIDTH] = img->extent.width; desc[TD_HEIGHT] = img->extent.height; desc[TD_MIPS] = 1; desc[TD_ARRAY] = 1;
+        desc[TD_FORMAT] = dxgi; desc[TD_SAMPLES] = 1;
+        desc[TD_BIND] = 0x8 | 0x20;                                // D3D11_BIND_SHADER_RESOURCE | RENDER_TARGET
+        desc[TD_MISC] = 0x2;                                       // D3D11_RESOURCE_MISC_SHARED
+        if (tex) slot = vx_shared_texture_add(IOSurfaceGetID(surface), desc);
+        keyed = slot + 1;
+        CFRelease(surface);
+        if (tex && slot < 0) tex = nil;
+    }
+    if (!tex) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    struct VkDeviceMemory_T *m = calloc(1, sizeof *m);
+    if (!m) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    m->size = info->allocationSize;
+    m->type = VK_MEMTYPE_DEVICE;
+    m->dedicated_image = img;
+    m->external = tex;
+    m->shared_slot = slot + 1;
+    m->keyed_slot = keyed;
+    *out = m;
+    return VK_SUCCESS;
+}
+VKFN VkResult VKAPI_CALL vkGetMemoryWin32HandleKHR(VkDevice dev, const VkMemoryGetWin32HandleInfoKHR *info, void **handle) {
+    (void)dev;
+    VkDeviceMemory m = info->memory;
+    if (!m || !m->shared_slot) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    *handle = (void *)(uintptr_t)(VX_SHARED_HANDLE_BASE + 4u * (uint32_t)(m->shared_slot - 1));   // (the same in every process)
+    return VK_SUCCESS;
+}
+VKFN VkResult VKAPI_CALL vkGetMemoryWin32HandlePropertiesKHR(VkDevice dev, VkExternalMemoryHandleTypeFlagBits type, void *handle,
+                                                            VkMemoryWin32HandlePropertiesKHR *p) {
+    (void)dev;
+    uint32_t sid, desc[TD_COUNT];
+    if (!(type & VK_WIN32_IMAGE_HANDLES) || vx_shared_texture_find((uintptr_t)handle, &sid, desc) < 0) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    p->memoryTypeBits = 1u << VK_MEMTYPE_DEVICE;
+    return VK_SUCCESS;
+}
+
 VKFN VkResult VKAPI_CALL vkAllocateMemory(VkDevice dev, const VkMemoryAllocateInfo *info, const VkAllocationCallbacks *alloc, VkDeviceMemory *out) {
     (void)alloc;
     *out = VK_NULL_HANDLE;
     if (info->memoryTypeIndex >= VK_MEMTYPE_COUNT) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    const VkImportMemoryWin32HandleInfoKHR *imp = vk_find_struct(info->pNext, VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR);
+    const VkExportMemoryAllocateInfo *exp = vk_find_struct(info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+    if ((imp && imp->handleType) || (exp && exp->handleTypes)) return external_memory(dev, info, imp, exp, out);
     uint64_t size = (info->allocationSize + 65535) & ~65535ull;
     if (!size) size = 65536;
     MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
@@ -866,6 +1002,13 @@ VKFN VkResult VKAPI_CALL vkAllocateMemory(VkDevice dev, const VkMemoryAllocateIn
 VKFN void VKAPI_CALL vkFreeMemory(VkDevice dev, VkDeviceMemory mem, const VkAllocationCallbacks *alloc) {
     (void)alloc;
     if (!mem) return;
+    if (mem->external) {
+        void d3d_shared_release(int slot);
+        if (mem->shared_slot) d3d_shared_release(mem->shared_slot - 1);
+        mem->external = nil;
+        free(mem);
+        return;
+    }
     vk_device_remove_heap(dev, mem->heap);
     mem->backing = nil;
     mem->heap = nil;
@@ -1069,7 +1212,8 @@ static VkResult bind_image(VkDevice dev, VkImage img, VkDeviceMemory mem, uint64
     (void)dev;
     img->memory = mem;
     img->memory_offset = offset;
-    if (img->tiling == VK_IMAGE_TILING_LINEAR) {
+    if (mem->external) img->mtl = mem->external;               // (external memory: the image's own texture)
+    else if (img->tiling == VK_IMAGE_TILING_LINEAR) {
         if (!mem->backing) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         img->mtl = [mem->backing newTextureWithDescriptor:img->desc offset:offset bytesPerRow:img->row_pitch];
     } else {
