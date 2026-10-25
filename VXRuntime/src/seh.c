@@ -651,7 +651,11 @@ static void on_signal(int sig, siginfo_t *si, void *ucv) {
     uint64_t ret = 0;
     int bad_call = !pc_in_image(ss->__rip) && (sig == SIGSEGV || sig == SIGBUS) && (ss->__rip < 4096 || (uint64_t)si->si_addr == ss->__rip) &&
                    ss->__rsp && pc_in_image(ret = *(uint64_t *)ss->__rsp);
-    if (bad_call) vx_log("the program called %#llx from %#llx", (unsigned long long)ss->__rip, (unsigned long long)ret);
+    if (bad_call) {
+        const vx_image *caller = vx_image_at(ret);
+        vx_log("the program called %#llx from %#llx (%s+%#llx)", (unsigned long long)ss->__rip, (unsigned long long)ret,
+               caller ? caller->name : "?", caller ? (unsigned long long)(ret - (uint64_t)caller->base) : 0ull);
+    }
     if (!pc_in_image(ss->__rip) && !bad_call) {
         // A fault in this runtime or in macOS code is a bug here, not the program's exception.
         // Print where (this runtime's frames) and exit at once rather than waiting for a macOS crash report.
@@ -669,6 +673,10 @@ static void on_signal(int sig, siginfo_t *si, void *ucv) {
             if (fp[0] <= (uint64_t)fp) break;
         }
         backtrace_symbols_fd(frames, n, 2);
+        for (int i = 0; i < n; i++) {                                // (the program's frames, which macOS cannot name)
+            const vx_image *m = vx_image_at((uint64_t)frames[i]);
+            if (m) vx_log("  frame %d: %s+%#llx", i, m->name, (unsigned long long)((uint64_t)frames[i] - (uint64_t)m->base));
+        }
         _exit(128 + sig);
     }
     // Build the record and context in a frame on the faulting thread's own stack, below its red zone, and make

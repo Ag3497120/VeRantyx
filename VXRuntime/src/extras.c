@@ -681,6 +681,220 @@ static const vx_export gdiplus[] = {
     VX_EXPORT(GdipCloneImage), VX_EXPORT(GdipDisposeImage), VX_EXPORT(GdipGetImageWidth), VX_EXPORT(GdipGetImageHeight),
     VX_EXPORT(GdipCreateFromHDC), VX_EXPORT(GdipDeleteGraphics), VX_EXPORT(GdipDrawImageRectI),
 };
+// ---- No Man's Sky (NMS.exe) imports: thread's process, US keyboard mapping, shlwapi/shell32 path calls, text tests -----
+static WINAPI DWORD GetProcessIdOfThread(HANDLE thread) {
+    DWORD (WINAPI *id)(HANDLE) = (DWORD (WINAPI *)(HANDLE))vx_find_export("kernel32.dll", "GetThreadId");
+    if (!id || !id(thread)) { vx_set_last_error(6); return 0; }    // ERROR_INVALID_HANDLE
+    return (DWORD)getpid();                                         // (a thread handle here is one of this process's)
+}
+// VkKeyScanA: the virtual key and shift state (high byte: 1 Shift) that type a character, on the US layout.
+static WINAPI short VkKeyScanA(char ch) {
+    static const char shifted_digits[] = ")!@#$%^&*(";
+    static const struct { char plain, shift; uint8_t vk; } oem[] = {
+        { ';', ':', 0xBA }, { '=', '+', 0xBB }, { ',', '<', 0xBC }, { '-', '_', 0xBD }, { '.', '>', 0xBE }, { '/', '?', 0xBF },
+        { '`', '~', 0xC0 }, { '[', '{', 0xDB }, { '\\', '|', 0xDC }, { ']', '}', 0xDD }, { '\'', '"', 0xDE },
+    };
+    unsigned char c = (unsigned char)ch;
+    if (c >= 'a' && c <= 'z') return (short)(c - 32);
+    if (c >= 'A' && c <= 'Z') return (short)(0x100 | c);
+    if (c >= '0' && c <= '9') return (short)c;
+    for (int i = 0; i < 10; i++) if (c == (unsigned char)shifted_digits[i]) return (short)(0x100 | ('0' + i));
+    for (size_t i = 0; i < sizeof oem / sizeof oem[0]; i++) {
+        if (c == (unsigned char)oem[i].plain) return oem[i].vk;
+        if (c == (unsigned char)oem[i].shift) return (short)(0x100 | oem[i].vk);
+    }
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\b' || c == 0x1b) return (short)c;   // VK_SPACE, TAB, RETURN, BACK, ESCAPE
+    return -1;
+}
+// ToAscii: ToUnicode's character, as a byte (only characters below 0x80 come out of the US mapping here).
+static WINAPI int ToAscii(unsigned vk, unsigned scan, const uint8_t *state, uint16_t *out, unsigned flags) {
+    int (WINAPI *to)(DWORD, DWORD, const uint8_t *, WCHAR *, int, DWORD) = (int (WINAPI *)(DWORD, DWORD, const uint8_t *, WCHAR *, int, DWORD))vx_find_export("user32.dll", "ToUnicode");
+    WCHAR w[2] = { 0 };
+    int n = to ? to(vk, scan, state, w, 2, flags) : 0;
+    if (n <= 0 || w[0] >= 0x80) return 0;
+    if (out) *out = (uint16_t)w[0];
+    return 1;
+}
+// DragQueryPoint: no drop objects exist here (DragQueryFile names no files), so there is no point to give.
+static WINAPI BOOL DragQueryPoint(void *drop, int32_t *pt) { (void)drop; if (pt) { pt[0] = 0; pt[1] = 0; } return 0; }
+// PathAppendW: more is added to path (MAX_PATH characters) with one backslash between them.
+static WINAPI BOOL PathAppendW(WCHAR *path, const WCHAR *more) {
+    if (!path || !more) return 0;
+    while (*more == '\\') more++;
+    size_t n = vx_wcslen(path), m = vx_wcslen(more);
+    int sep = n && path[n - 1] != '\\' && m;
+    if (n + sep + m + 1 > 260) return 0;
+    if (sep) path[n++] = '\\';
+    memcpy(path + n, more, (m + 1) * sizeof(WCHAR));
+    return 1;
+}
+// PathStripToRootW: what is left is the root: "C:\", "\" or "\\server\share". FALSE when the path has none.
+static WINAPI BOOL PathStripToRootW(WCHAR *path) {
+    if (!path) return 0;
+    size_t keep;
+    if (path[0] && path[1] == ':') keep = path[2] == '\\' ? 3 : 2;
+    else if (path[0] == '\\' && path[1] == '\\') {
+        keep = 2;
+        for (int parts = 0; path[keep] && parts < 2; keep++) if (path[keep] == '\\' && ++parts == 2) break;
+    } else if (path[0] == '\\') keep = 1;
+    else return 0;
+    path[keep] = 0;
+    return 1;
+}
+// PathMakePrettyW: a path written all in capitals becomes lowercase; TRUE when it was changed.
+static WINAPI BOOL PathMakePrettyW(WCHAR *path) {
+    if (!path || !*path) return 0;
+    for (const WCHAR *p = path; *p; p++) if (*p >= 'a' && *p <= 'z') return 0;
+    for (WCHAR *p = path; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+    return 1;
+}
+// SHCreateDirectoryEx: every missing directory of a full path. ERROR_ALREADY_EXISTS when the last one was there,
+// ERROR_BAD_PATHNAME for a relative path.
+static WINAPI int SHCreateDirectoryExW(void *wnd, const WCHAR *path, void *sa) {
+    (void)wnd;
+    BOOL (WINAPI *mk)(const WCHAR *, void *) = (BOOL (WINAPI *)(const WCHAR *, void *))vx_find_export("kernel32.dll", "CreateDirectoryW");
+    DWORD (WINAPI *attrs)(const WCHAR *) = (DWORD (WINAPI *)(const WCHAR *))vx_find_export("kernel32.dll", "GetFileAttributesW");
+    if (!path || !*path) return 161;
+    if (!(path[0] == '\\' || (path[0] && path[1] == ':' && path[2] == '\\'))) return 161;   // ERROR_BAD_PATHNAME
+    size_t n = vx_wcslen(path);
+    if (n >= 248) return 206;                                         // ERROR_FILENAME_EXCED_RANGE
+    WCHAR part[260];
+    memcpy(part, path, (n + 1) * sizeof(WCHAR));
+    while (n > 3 && part[n - 1] == '\\') part[--n] = 0;
+    DWORD a = attrs(part);
+    if (a != 0xFFFFFFFF) return 183;                                  // ERROR_ALREADY_EXISTS (a file of that name too)
+    size_t start = path[1] == ':' ? 3 : 2;
+    for (size_t i = start; i <= n; i++) {
+        if (part[i] != '\\' && part[i]) continue;
+        WCHAR c = part[i]; part[i] = 0;
+        if (attrs(part) == 0xFFFFFFFF && !mk(part, i == n ? sa : NULL)) { DWORD e = vx_get_last_error(); part[i] = c; return e ? (int)e : 3; }
+        part[i] = c;
+    }
+    return 0;
+}
+static WINAPI int SHCreateDirectoryExA(void *wnd, const char *path, void *sa) {
+    WCHAR *w = path ? vx_utf16_dup(path) : NULL;
+    int r = SHCreateDirectoryExW(wnd, w, sa);
+    free(w);
+    return r;
+}
+// IsTextUnicode: the tests asked for (all when result is NULL) on a buffer: byte order marks, 16-bit ASCII (every
+// high byte zero) and the statistical test (most high bytes zero). Results are the tests that matched.
+#define TU_ASCII16 0x1
+#define TU_STATISTICS 0x2
+#define TU_SIGNATURE 0x8
+#define TU_REVERSE_SIGNATURE 0x80
+static WINAPI BOOL IsTextUnicode(const void *buf, int len, int *result) {
+    int tests = result ? *result : 0xFFFF, found = 0;
+    const uint8_t *b = buf;
+    if (!b || len < 2) { if (result) *result = 0; return 0; }
+    if ((tests & TU_SIGNATURE) && b[0] == 0xFF && b[1] == 0xFE) found |= TU_SIGNATURE;
+    if ((tests & TU_REVERSE_SIGNATURE) && b[0] == 0xFE && b[1] == 0xFF) found |= TU_REVERSE_SIGNATURE;
+    int chars = len / 2, high_zero = 0;
+    for (int i = 0; i < chars; i++) high_zero += b[2 * i + 1] == 0;
+    if ((tests & TU_ASCII16) && high_zero == chars) found |= TU_ASCII16;
+    if ((tests & TU_STATISTICS) && high_zero * 4 >= chars * 3) found |= TU_STATISTICS;
+    if (result) *result = found;
+    return (found & (TU_ASCII16 | TU_STATISTICS | TU_SIGNATURE)) && !(found & TU_REVERSE_SIGNATURE);
+}
+// PFXImportCertStore: PKCS #12 files are not read here.
+static WINAPI void *PFXImportCertStore(void *blob, const WCHAR *password, DWORD flags) {
+    (void)blob; (void)password; (void)flags;
+    vx_log("PFXImportCertStore: PKCS #12 import is not supported");
+    vx_set_last_error(120);                                           // ERROR_CALL_NOT_IMPLEMENTED
+    return NULL;
+}
+static const vx_export kernel32_nms[] = { VX_EXPORT(GetProcessIdOfThread) };
+static const vx_export user32_nms[] = { VX_EXPORT(VkKeyScanA), VX_EXPORT(ToAscii) };
+static const vx_export shell32_nms[] = { VX_EXPORT(DragQueryPoint), VX_EXPORT(SHCreateDirectoryExW), VX_EXPORT(SHCreateDirectoryExA) };
+static const vx_export shlwapi_nms[] = { VX_EXPORT(PathAppendW), VX_EXPORT(PathStripToRootW), VX_EXPORT(PathMakePrettyW) };
+static const vx_export advapi32_nms[] = { VX_EXPORT(IsTextUnicode) };
+static const vx_export crypt32_nms[] = { VX_EXPORT(PFXImportCertStore) };
+
+// GetSystemWindowsDirectory: the shared Windows directory, the same as GetWindowsDirectory on one machine.
+static WINAPI uint32_t GetSystemWindowsDirectoryW(WCHAR *buf, uint32_t cap) { return vx_return_string_w("C:\\windows", buf, cap); }
+static WINAPI uint32_t GetSystemWindowsDirectoryA(char *buf, uint32_t cap) { return vx_return_string_a("C:\\windows", buf, cap); }
+// VkKeyScanEx: the US layout whatever keyboard layout is named (as VkKeyScanA; no key types a character above 0x7F).
+static WINAPI short VkKeyScanExW(WCHAR ch, void *layout) { (void)layout; return ch < 0x80 ? VkKeyScanA((char)ch) : -1; }
+static WINAPI short VkKeyScanExA(char ch, void *layout) { (void)layout; return (unsigned char)ch < 0x80 ? VkKeyScanA(ch) : -1; }
+// cfgmgr32: the device tree has no nodes here (devices are found through their own APIs: DXGI, HID, ...). Locating
+// one fails with CR_NO_SUCH_DEVNODE, a node handle is CR_INVALID_DEVNODE, and device ID lists are empty.
+#define CR_SUCCESS 0
+#define CR_OUT_OF_MEMORY 0x02
+#define CR_INVALID_POINTER 0x03
+#define CR_INVALID_FLAG 0x04
+#define CR_INVALID_DEVNODE 0x05
+#define CR_NO_SUCH_DEVNODE 0x0D
+#define CR_BUFFER_SMALL 0x1A
+static WINAPI DWORD CM_Locate_DevNodeW(DWORD *node, const WCHAR *id, DWORD flags) { (void)id; (void)flags; if (!node) return CR_INVALID_POINTER; *node = 0; return CR_NO_SUCH_DEVNODE; }
+static WINAPI DWORD CM_Locate_DevNodeA(DWORD *node, const char *id, DWORD flags) { (void)id; (void)flags; if (!node) return CR_INVALID_POINTER; *node = 0; return CR_NO_SUCH_DEVNODE; }
+static WINAPI DWORD CM_Get_Parent(DWORD *out, DWORD node, DWORD flags) { (void)node; (void)flags; if (!out) return CR_INVALID_POINTER; *out = 0; return CR_INVALID_DEVNODE; }
+static WINAPI DWORD CM_Get_Device_IDW(DWORD node, WCHAR *buf, DWORD len, DWORD flags) { (void)node; (void)flags; if (buf && len) buf[0] = 0; return CR_INVALID_DEVNODE; }
+static WINAPI DWORD CM_Get_Device_IDA(DWORD node, char *buf, DWORD len, DWORD flags) { (void)node; (void)flags; if (buf && len) buf[0] = 0; return CR_INVALID_DEVNODE; }
+static WINAPI DWORD CM_Get_DevNode_Status(DWORD *status, DWORD *problem, DWORD node, DWORD flags) {
+    (void)node; (void)flags;
+    if (!status || !problem) return CR_INVALID_POINTER;
+    *status = 0; *problem = 0;
+    return CR_INVALID_DEVNODE;
+}
+static WINAPI DWORD CM_Get_DevNode_Registry_PropertyW(DWORD node, DWORD prop, DWORD *type, void *buf, DWORD *len, DWORD flags) { (void)node; (void)prop; (void)type; (void)buf; (void)len; (void)flags; return CR_INVALID_DEVNODE; }
+static WINAPI DWORD CM_Get_DevNode_PropertyW(DWORD node, const void *key, DWORD *type, void *buf, DWORD *len, DWORD flags) { (void)node; (void)key; (void)type; (void)buf; (void)len; (void)flags; return CR_INVALID_DEVNODE; }
+static WINAPI DWORD CM_Open_DevNode_Key(DWORD node, DWORD sam, DWORD profile, DWORD disposition, HANDLE *key, DWORD flags) { (void)node; (void)sam; (void)profile; (void)disposition; (void)flags; if (key) *key = (HANDLE)(intptr_t)-1; return CR_INVALID_DEVNODE; }
+static WINAPI DWORD CM_Get_Device_ID_List_SizeW(DWORD *len, const WCHAR *filter, DWORD flags) { (void)filter; (void)flags; if (!len) return CR_INVALID_POINTER; *len = 2; return CR_SUCCESS; }
+static WINAPI DWORD CM_Get_Device_ID_ListW(const WCHAR *filter, WCHAR *buf, DWORD len, DWORD flags) {
+    (void)filter; (void)flags;
+    if (!buf) return CR_INVALID_POINTER;
+    if (len < 2) return CR_BUFFER_SMALL;
+    buf[0] = buf[1] = 0;                                              // an empty list: its terminating second NUL
+    return CR_SUCCESS;
+}
+static WINAPI DWORD CM_MapCrToWin32Err(DWORD cr, DWORD fallback) {
+    switch (cr) {
+    case CR_SUCCESS: return 0;
+    case CR_OUT_OF_MEMORY: return 8;                                  // ERROR_NOT_ENOUGH_MEMORY
+    case CR_INVALID_POINTER: return 1784;                             // ERROR_INVALID_USER_BUFFER
+    case CR_INVALID_FLAG: return 1004;                                // ERROR_INVALID_FLAGS
+    case CR_BUFFER_SMALL: return 122;                                 // ERROR_INSUFFICIENT_BUFFER
+    default: return fallback;
+    }
+}
+static const vx_export kernel32_nms2[] = { VX_EXPORT(GetSystemWindowsDirectoryW), VX_EXPORT(GetSystemWindowsDirectoryA) };
+static const vx_export user32_nms2[] = { VX_EXPORT(VkKeyScanExW), VX_EXPORT(VkKeyScanExA) };
+static const vx_export cfgmgr32[] = {
+    VX_EXPORT(CM_Locate_DevNodeW), VX_EXPORT(CM_Locate_DevNodeA), VX_EXPORT(CM_Get_Parent), { "CM_Get_Child", (void *)CM_Get_Parent },
+    { "CM_Get_Sibling", (void *)CM_Get_Parent }, VX_EXPORT(CM_Get_Device_IDW), VX_EXPORT(CM_Get_Device_IDA), VX_EXPORT(CM_Get_DevNode_Status),
+    VX_EXPORT(CM_Get_DevNode_Registry_PropertyW), VX_EXPORT(CM_Get_DevNode_PropertyW), VX_EXPORT(CM_Open_DevNode_Key),
+    VX_EXPORT(CM_Get_Device_ID_List_SizeW), VX_EXPORT(CM_Get_Device_ID_ListW), VX_EXPORT(CM_MapCrToWin32Err),
+};
+
+// The system timer's resolution (100 ns units): 15.625 ms by default, 0.5 ms the finest. Timers here are precise
+// whatever is asked (as timeBeginPeriod), so this only keeps the number a program set.
+static uint32_t g_timer_resolution = 156250;
+static WINAPI uint32_t NtQueryTimerResolution(uint32_t *coarsest, uint32_t *finest, uint32_t *current) {
+    if (!coarsest || !finest || !current) return 0xC0000005;          // STATUS_ACCESS_VIOLATION
+    *coarsest = 156250; *finest = 5000; *current = __atomic_load_n(&g_timer_resolution, __ATOMIC_RELAXED);
+    return 0;
+}
+static WINAPI uint32_t NtSetTimerResolution(uint32_t desired, uint8_t set, uint32_t *current) {
+    uint32_t r = !set ? 156250 : desired < 5000 ? 5000 : desired > 156250 ? 156250 : desired;
+    __atomic_store_n(&g_timer_resolution, r, __ATOMIC_RELAXED);
+    if (current) *current = r;
+    return 0;
+}
+// Message filters (UIPI between integrity levels): every process here runs at one level, so nothing is filtered.
+static WINAPI BOOL ChangeWindowMessageFilterEx(void *wnd, uint32_t msg, DWORD action, void *status) {
+    (void)wnd; (void)msg; (void)action;
+    if (status && *(DWORD *)status >= 8) ((DWORD *)status)[1] = 0;     // CHANGEFILTERSTRUCT.ExtStatus: MSGFLTINFO_NONE
+    return 1;
+}
+static WINAPI BOOL ChangeWindowMessageFilter(uint32_t msg, DWORD flag) { (void)msg; (void)flag; return 1; }
+// DwmEnableBlurBehindWindow: windows are not blurred behind here; S_OK, as when composition shows them plainly.
+static WINAPI int32_t DwmEnableBlurBehindWindow(void *wnd, const void *blur) { (void)wnd; return blur ? 0 : (int32_t)0x80070057; }
+static const vx_export ntdll_nms[] = { VX_EXPORT(NtQueryTimerResolution), VX_EXPORT(NtSetTimerResolution),
+                                       { "ZwQueryTimerResolution", (void *)NtQueryTimerResolution }, { "ZwSetTimerResolution", (void *)NtSetTimerResolution } };
+static const vx_export user32_nms3[] = { VX_EXPORT(ChangeWindowMessageFilterEx), VX_EXPORT(ChangeWindowMessageFilter) };
+static const vx_export dwmapi_nms[] = { VX_EXPORT(DwmEnableBlurBehindWindow) };
+
 void vx_extras_init(void) {
     vx_register_module("kernel32.dll", kernel32, sizeof kernel32 / sizeof kernel32[0]);
     vx_register_module("ucrtbase.dll", ucrtbase, sizeof ucrtbase / sizeof ucrtbase[0]);
@@ -692,6 +906,11 @@ void vx_extras_init(void) {
     vx_register_module("ws2_32.dll", ws2_32, sizeof ws2_32 / sizeof ws2_32[0]);
     vx_register_module("gdiplus.dll", gdiplus, sizeof gdiplus / sizeof gdiplus[0]);
 #define MORE(dll, t) vx_register_module(dll, t, sizeof t / sizeof t[0])
+    MORE("kernel32.dll", kernel32_nms); MORE("kernelbase.dll", kernel32_nms); MORE("user32.dll", user32_nms); MORE("shell32.dll", shell32_nms);
+    MORE("kernel32.dll", kernel32_nms2); MORE("kernelbase.dll", kernel32_nms2); MORE("user32.dll", user32_nms2);
+    MORE("ntdll.dll", ntdll_nms); MORE("user32.dll", user32_nms3); MORE("dwmapi.dll", dwmapi_nms);
+    MORE("cfgmgr32.dll", cfgmgr32); MORE("setupapi.dll", cfgmgr32);
+    MORE("shlwapi.dll", shlwapi_nms); MORE("advapi32.dll", advapi32_nms); MORE("crypt32.dll", crypt32_nms);
     MORE("kernel32.dll", kernel32_more); MORE("kernelbase.dll", kernel32_more); MORE("user32.dll", user32_more);
     MORE("advapi32.dll", advapi32_more); MORE("shlwapi.dll", shlwapi_more); MORE("shell32.dll", shell32_more);
     MORE("winmm.dll", winmm_more); MORE("ws2_32.dll", ws2_32_more); MORE("hid.dll", hid_more);

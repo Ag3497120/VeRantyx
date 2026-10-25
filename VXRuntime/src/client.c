@@ -631,7 +631,7 @@ static WINAPI LONG TaskDialogIndirect(const uint8_t *config, int *button, int *r
     return 0;
 }
 static const vx_export comctl32[] = { VX_EXPORT(InitCommonControlsEx), VX_EXPORT(InitCommonControls), { "#17", (void *)InitCommonControls },
-                                      VX_EXPORT(TaskDialogIndirect) };
+                                      VX_EXPORT(TaskDialogIndirect), { "#345", (void *)TaskDialogIndirect } };
 static const vx_export psapi[] = {
     VX_EXPORT(GetModuleFileNameExW), VX_EXPORT(GetModuleFileNameExA), VX_EXPORT(EnumProcessModules), VX_EXPORT(EnumProcessModulesEx),
     VX_EXPORT(GetModuleBaseNameW), VX_EXPORT(GetModuleBaseNameA),

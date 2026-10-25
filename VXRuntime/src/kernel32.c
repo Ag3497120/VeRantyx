@@ -20,6 +20,7 @@
 #include <spawn.h>
 #include <sys/stat.h>
 #include <mach-o/dyld.h>
+#include <dlfcn.h>
 #include "vx.h"
 
 #define STD_INPUT_HANDLE  ((DWORD)-10)
@@ -328,6 +329,18 @@ static BOOL verify_version(DWORD major, DWORD minor, DWORD build, DWORD platform
 static WINAPI BOOL VerifyVersionInfoW(const uint8_t *v, DWORD type, uint64_t mask) {
     const DWORD *d = (const DWORD *)v;
     return verify_version(d[1], d[2], d[3], d[4], *(const uint16_t *)(v + 276), *(const uint16_t *)(v + 278), v[282], type, mask);
+}
+// RtlVerifyVersionInfo: the same test on an RTL_OSVERSIONINFOEXW, as an NTSTATUS: STATUS_SUCCESS, or
+// STATUS_REVISION_MISMATCH when the version does not meet it, STATUS_INVALID_PARAMETER for no structure or no test.
+static WINAPI uint32_t RtlVerifyVersionInfo(const uint8_t *v, DWORD type, uint64_t mask) {
+    if (!v || !type || !mask) return 0xC000000D;
+    return VerifyVersionInfoW(v, type, mask) ? 0 : 0xC0000059;
+}
+// RtlGetVersion: GetVersionExW's answer as an NTSTATUS (callers use it to see past compatibility shims).
+static WINAPI uint32_t RtlGetVersion(OSVERSIONINFOW *v) {
+    if (!v) return 0xC000000D;                                       // STATUS_INVALID_PARAMETER
+    GetVersionExW(v);
+    return 0;
 }
 static WINAPI BOOL VerifyVersionInfoA(const uint8_t *v, DWORD type, uint64_t mask) {
     const DWORD *d = (const DWORD *)v;
@@ -973,9 +986,32 @@ static WINAPI BOOL VirtualFree(void *addr, size_t size, DWORD type) {
     if (!ok) vx_set_last_error(487);
     return ok;
 }
+// Memory that is neither the program's (a reservation, a PE image) nor writable at all: macOS code, this runtime's own
+// functions (GetProcAddress of a built-in DLL gives their addresses). Hooking libraries (the Steam overlay's) make a
+// function's first bytes writable to patch them; that cannot be done here, and saying so beats the fault that the
+// write would be. Mach's maximum protection tells.
+static int never_writable(uintptr_t start, uintptr_t end) {
+    for (mach_vm_address_t a = start; a < end;) {
+        mach_vm_size_t sz = 0; vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
+        mach_vm_address_t at = a;
+        if (mach_vm_region(mach_task_self(), &at, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS || at > a) return 0;
+        if (info.max_protection & VM_PROT_WRITE) return 0;
+        a = at + sz;
+    }
+    return 1;
+}
 static WINAPI BOOL VirtualProtect(void *addr, size_t size, DWORD prot, DWORD *old) {
     uintptr_t start = (uintptr_t)addr & ~(uintptr_t)0xfff, end = ((uintptr_t)addr + (size ? size : 1) + 0xfff) & ~(uintptr_t)0xfff;
     const vx_image *img = vx_image_at(start);
+    if (!img && (prot & 0xCC) && never_writable(start, end)) {   // PAGE_READWRITE, WRITECOPY, EXECUTE_READWRITE, EXECUTE_WRITECOPY
+        static int told;                                            // (the first few: a hooking library tries dozens)
+        Dl_info info;
+        int named = dladdr(addr, &info) && info.dli_sname;
+        if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 8) vx_log("VirtualProtect(%p, %#zx, %#x): %s%s%s cannot be made writable", addr, size, (unsigned)prot,
+               named ? "native code (" : "memory", named ? info.dli_sname : "", named ? ")" : "");
+        vx_set_last_error(487);                                     // ERROR_INVALID_ADDRESS
+        return 0;
+    }
     VX_NO_STOP_LOCK(&g_vm_lock);
     reservation *r = find_reservation(start);
     DWORD was = prot_get(start);
@@ -1332,7 +1368,10 @@ static const vx_export advapi_misc[] = {
 
 static const vx_export shell32[] = { VX_EXPORT(ShellExecuteA), VX_EXPORT(ShellExecuteW), VX_EXPORT(ShellExecuteExA), VX_EXPORT(ShellExecuteExW) };
 
+static const vx_export ntdll_version[] = { VX_EXPORT(RtlVerifyVersionInfo), VX_EXPORT(RtlGetVersion) };
+
 void vx_kernel32_init(void) {
+    vx_register_module("ntdll.dll", ntdll_version, sizeof ntdll_version / sizeof ntdll_version[0]);
     vx_register_module("advapi32.dll", advapi_misc, sizeof advapi_misc / sizeof advapi_misc[0]);
     vx_register_module("kernelbase.dll", advapi_misc, sizeof advapi_misc / sizeof advapi_misc[0]);
     vx_register_module("shell32.dll", shell32, sizeof shell32 / sizeof shell32[0]);
