@@ -47,7 +47,12 @@ typedef struct {
     int mode;
     const dxil_msl *gs_from;    // (mode 2) the vertex kernel whose outputs are the inputs
     uint32_t gs_inprim, gs_maxvert, gs_topology, gs_instances;
-    int16_t gs_slot[64][4];     // (mode 2) input element id, row -> the vertex kernel's output slot
+    int16_t gs_slot[64][4];     // (modes 2-4) input element id, row -> the vertex kernel's output slot
+    // tessellation: 3 hull control-point phase, 4 hull patch-constant phase, 5 domain shader
+    const dxil_function *fn;    // the function to translate (the patch-constant one for mode 4)
+    const dxil_md *cpsig, *pcsig;   // output control points, patch constants (hull); patch constants (domain)
+    const dxil_msl *hs_from;    // (mode 5) the hull shader whose outputs are read
+    int16_t pc_slot[64][4];     // (mode 5) patch-constant element id, row -> the hull's patch slot
     // per value
     uint32_t nvals;
     handle_info *handles;       // by local index: the resource a handle value stands for
@@ -516,6 +521,18 @@ static const dxil_md *signature_element(const dxil_md *sig, tr *t, uint32_t id) 
     return NULL;
 }
 
+// An element row's slot: its place among the signature's rows, in element order (how the kernels lay rows out).
+static int sig_slot(tr *t, const dxil_md *sig, uint32_t id, uint32_t row) {
+    int slot = 0;
+    for (uint32_t i = 0; sig && i < sig->n; i++) {
+        const dxil_md *e = dxil_md_op(t->m, sig, i);
+        int rows = md_i(t, e, 6, 1);
+        if (md_i(t, e, 0, -1) == (int)id) return row < (uint32_t)rows ? slot + (int)row : -1;
+        slot += rows;
+    }
+    return -1;
+}
+
 static const char *md_str(tr *t, const dxil_md *node, uint32_t i) {
     const dxil_md *s = dxil_md_op(t->m, node, i);
     return s && s->kind == DXM_STRING ? s->str : "";
@@ -528,6 +545,7 @@ static void read_signatures(tr *t) {
     const dxil_md *sigs = dxil_md_op(t->m, ep, 2);
     t->insig = dxil_md_op(t->m, sigs, 0);
     t->outsig = dxil_md_op(t->m, sigs, 1);
+    t->pcsig = dxil_md_op(t->m, sigs, 2);
     const dxil_md *props = dxil_md_op(t->m, ep, 4);
     t->out->threads[0] = t->out->threads[1] = t->out->threads[2] = 1;
     for (uint32_t i = 0; props && i + 1 < props->n; i += 2) {
@@ -540,6 +558,28 @@ static void read_signatures(tr *t) {
         if (tag == 4) {                                            // NumThreads
             const dxil_md *n = dxil_md_op(t->m, props, i + 1);
             for (int k = 0; k < 3; k++) t->out->threads[k] = (uint32_t)md_i(t, n, k, 1);
+        }
+        if (tag == 2) {                                            // DSState: domain, input control points
+            const dxil_md *n = dxil_md_op(t->m, props, i + 1);
+            t->out->tess_domain = (uint32_t)md_i(t, n, 0, 0);
+            t->out->tess_in_cp = (uint32_t)md_i(t, n, 1, 0);
+        }
+        if (tag == 3) {                                            // HSState: patch-constant function, in/out control points, domain, partitioning, output, max factor
+            const dxil_md *n = dxil_md_op(t->m, props, i + 1);
+            const dxil_md *fv = dxil_md_op(t->m, n, 0);
+            if (fv && fv->kind == DXM_VALUE && t->mode == 4)
+                for (uint32_t k = 0; k < t->m->nfunctions; k++) if (t->m->functions[k].value == fv->value) t->fn = &t->m->functions[k];
+            t->out->tess_in_cp = (uint32_t)md_i(t, n, 1, 0);
+            t->out->tess_out_cp = (uint32_t)md_i(t, n, 2, 0);
+            t->out->tess_domain = (uint32_t)md_i(t, n, 3, 0);
+            t->out->tess_partitioning = (uint32_t)md_i(t, n, 4, 0);
+            t->out->tess_output = (uint32_t)md_i(t, n, 5, 0);
+            const dxil_md *mf = dxil_md_op(t->m, n, 6);
+            t->out->tess_max_factor = 64.0f;
+            if (mf && mf->kind == DXM_VALUE) {
+                const dxil_value *v = &t->m->values[mf->value];
+                if (v->kind == DXV_CONST_FLOAT && v->u.f >= 1.0 && v->u.f <= 64.0) t->out->tess_max_factor = (float)v->u.f;
+            }
         }
         if (tag == 1) {                                            // GSState: input primitive, max vertices, streams, topology, instances
             const dxil_md *n = dxil_md_op(t->m, props, i + 1);
@@ -931,8 +971,9 @@ static void call(tr *t, const dxil_inst *in) {
         if (kind == 13) { t->need_front = 1; line(t, "%s = %s(vx_front);", r, tn); return; }
         if (kind == 12) { t->need_sample_id = 1; line(t, "%s = %s(vx_sample);", r, tn); return; }
         if (kind == 10 && t->mode == 2) { line(t, "%s = %s(vx_tid.x);", r, tn); return; }
+        if (kind == 10 && t->mode >= 3) { line(t, "%s = %s(vx_pid);", r, tn); return; }
         if (kind == 10) { t->need_prim = 1; line(t, "%s = %s(vx_prim);", r, tn); return; }
-        if (t->mode == 2) {                                        // a vertex of the input primitive, from the vertex kernel
+        if (t->mode >= 2) {                                        // a vertex of the input primitive / patch (VXV: the kernel's)
             int okv;
             uint32_t vertex = (uint32_t)const_int(t, in->ops[5], &okv);
             int slot = id < 64 && row < 4 ? t->gs_slot[id][row] : -1;
@@ -1642,7 +1683,51 @@ static void call(tr *t, const dxil_inst *in) {
         return;
     }
     case 100: line(t, "%s = 0u;", r); return;                     // GSInstanceID (one instance)
+    case 103: {                                                    // LoadOutputControlPoint(id, row, col, index): the patch-constant phase
+        int ok, okr, okc, oki;
+        uint32_t id = (uint32_t)const_int(t, in->ops[2], &ok), row = (uint32_t)const_int(t, in->ops[3], &okr);
+        uint32_t col = (uint32_t)const_int(t, in->ops[4], &okc), index = (uint32_t)const_int(t, in->ops[5], &oki);
+        int slot = t->mode == 4 && okr ? sig_slot(t, t->cpsig, id, row) : -1;
+        if (slot < 0) { err(t, "an output control point read outside a patch-constant function or by a row chosen at run time"); return; }
+        char at[96];
+        if (oki) snprintf(at, sizeof at, "VXO(%u, %d)[%u]", index, slot, okc ? col : 0);
+        else { char v[96]; ref(t, in->ops[5], v, sizeof v); snprintf(at, sizeof at, "VXO(uint(%s), %d)[%u]", v, slot, okc ? col : 0); }
+        if (fp) line(t, "%s = %s(%s);", r, tn, at); else line(t, "%s = %s(as_type<uint>(%s));", r, tn, at);
+        return;
+    }
+    case 104: {                                                    // LoadPatchConstant(id, row, col): a domain shader
+        int ok, okr, okc;
+        uint32_t id = (uint32_t)const_int(t, in->ops[2], &ok), row = (uint32_t)const_int(t, in->ops[3], &okr), col = (uint32_t)const_int(t, in->ops[4], &okc);
+        if (t->mode != 5 || !okr) { err(t, "a patch-constant read outside a domain shader or by a row chosen at run time"); return; }
+        int slot = id < 64 && row < 4 ? t->pc_slot[id][row] : -1;
+        if (slot < 0) { line(t, "%s = %s(0);", r, tn); return; }
+        if (fp) line(t, "%s = %s(vx_pc[%d][%u]);", r, tn, slot, okc ? col : 0);
+        else line(t, "%s = %s(as_type<uint>(vx_pc[%d][%u]));", r, tn, slot, okc ? col : 0);
+        return;
+    }
+    case 105: {                                                    // DomainLocation(component)
+        int okc;
+        uint32_t col = (uint32_t)const_int(t, in->ops[2], &okc);
+        if (t->mode != 5) { err(t, "DomainLocation outside a domain shader"); return; }
+        line(t, "%s = vx_dl[%u];", r, okc ? col : 0);
+        return;
+    }
+    case 106: {                                                    // StorePatchConstant(id, row, col, value): as StoreOutput
+        if (t->mode != 4) { err(t, "a patch constant stored outside a patch-constant function"); return; }
+        int ok, okc, okr;
+        uint32_t id = (uint32_t)const_int(t, in->ops[2], &ok), row = (uint32_t)const_int(t, in->ops[3], &okr), col = (uint32_t)const_int(t, in->ops[4], &okc);
+        const dxil_md *e = signature_element(t->outsig, t, id);
+        if (!e || !okr) { err(t, "patch constant %u is not in the signature", id); return; }
+        char et[32], base[16];
+        element_type(t, e, et, sizeof et);
+        snprintf(base, sizeof base, "%.*s", (int)strcspn(et, "0123456789"), et);
+        if (md_i(t, e, 7, 4) <= 1) line(t, "vx_out.o%u_%u = %s(%s);", id, row, base, a[3]);
+        else line(t, "vx_out.o%u_%u[%u] = %s(%s);", id, row, okc ? col : 0, base, a[3]);
+        return;
+    }
+    case 107: line(t, "%s = vx_cpid;", r); return;                // OutputControlPointID
     case 108:                                                      // PrimitiveID
+        if (t->mode >= 3) { line(t, "%s = %s(vx_pid);", r, tn); return; }
         if (t->mode == 2) { line(t, "%s = %s(vx_tid.x);", r, tn); return; }
         t->need_prim = 1;
         line(t, "%s = %s(vx_prim);", r, tn);
@@ -2772,7 +2857,7 @@ static const char *interp(int mode, int is_int) {
 static void io_structs_kernel(tr *t, sb *s);
 static void io_structs(tr *t, sb *s) {
     int stage = t->out->stage;
-    if (t->mode == 2) { io_structs_kernel(t, s); return; }
+    if (t->mode >= 2 && t->mode <= 4) { io_structs_kernel(t, s); return; }
     // inputs
     if (stage == 0 || stage == 1) {
         put(s, "struct VxIn {\n");
@@ -2804,15 +2889,17 @@ static void io_structs(tr *t, sb *s) {
         if (!any) put(s, stage == 1 ? "    float vx_unused;\n" : "    float vx_unused [[user(VX_UNUSED)]];\n");   // (a vertex shader without inputs takes no stage_in)
         put(s, "};\n");
     }
-    // outputs
+    // outputs (a domain shader's as a vertex shader's)
+    if (stage == 4) stage = 1;
     if (stage == 0 || stage == 1) {
         put(s, "struct VxOut {\n");
         int any = 0;
-        int has_coverage = 0;
+        int has_coverage = 0, has_position = 0;
         for (uint32_t i = 0; t->outsig && i < t->outsig->n; i++) {
             const dxil_md *e = dxil_md_op(t->m, t->outsig, i);
             int id = md_i(t, e, 0, 0), kind = md_i(t, e, 3, 0), rows = md_i(t, e, 6, 1), comp = md_i(t, e, 2, 9);
             if (stage == 0 && kind == 14) has_coverage = 1;
+            if (kind == 3) has_position = 1;
             char et[32];
             element_type(t, e, et, sizeof et);
             for (int r = 0; r < rows; r++) {
@@ -2842,7 +2929,8 @@ static void io_structs(tr *t, sb *s) {
             }
         }
         if (!any && stage == 0) put(s, "    float4 vx_unused [[color(0)]];\n");
-        if (!any && stage == 1) put(s, t->mode == 1 ? "    float4 vx_pos;\n" : "    float4 vx_pos [[position]];\n");
+        // (a vertex shader feeding a hull or geometry shader may have no SV_Position; Metal's vertex function needs one)
+        if (stage == 1 && !has_position) put(s, t->mode == 1 ? "    float4 vx_pos;\n" : "    float4 vx_pos [[position]];\n");
         if (stage == 0 && t->apply_sample_mask && !has_coverage)
             put(s, "    uint vx_sample_mask [[sample_mask]];\n");
         put(s, "};\n");
@@ -2919,7 +3007,8 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
     t.m = m;
     t.out = out;
     t.mode = mode;
-    t.gs_from = vs;
+    t.gs_from = mode == 5 ? NULL : vs;
+    t.hs_from = mode == 5 ? vs : NULL;
     t.sample_mask = sample_mask;
     t.apply_sample_mask = sample_mask != UINT32_MAX;
     const dxil_function *f = NULL;
@@ -2934,16 +3023,56 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
     if (mode == 1 && out->stage != 1) { snprintf(out->error, sizeof out->error, "not a vertex shader"); return -1; }
     if (mode == 2 && out->stage != 2) { snprintf(out->error, sizeof out->error, "not a geometry shader"); return -1; }
     if (out->stage == 2 && mode != 2) { snprintf(out->error, sizeof out->error, "a geometry shader needs its vertex shader (geometry pipeline)"); return -1; }
-    if (out->stage != 0 && out->stage != 1 && out->stage != 2 && out->stage != 5) { snprintf(out->error, sizeof out->error, "shader kind %d is not done yet", out->stage); return -1; }
+    if ((mode == 3 || mode == 4) != (out->stage == 3)) { snprintf(out->error, sizeof out->error, "a hull shader needs its vertex shader (tessellation pipeline)"); return -1; }
+    if ((mode == 5) != (out->stage == 4)) { snprintf(out->error, sizeof out->error, "a domain shader needs its hull shader (tessellation pipeline)"); return -1; }
+    if (out->stage < 0 || out->stage > 5) { snprintf(out->error, sizeof out->error, "shader kind %d is not done yet", out->stage); return -1; }
+    read_signatures(&t);                                           // (first: the shader flags decide type names)
+    if (mode == 3) t.cpsig = t.outsig;
+    if (mode == 4) {                                               // the patch-constant function, writing the patch constants
+        if (!t.fn) { snprintf(out->error, sizeof out->error, "a hull shader without a patch-constant function"); return -1; }
+        f = t.fn;
+        t.cpsig = t.outsig;
+        t.outsig = t.pcsig;
+    }
     t.f = f;
     t.nvals = f->nlocals;
     t.handles = calloc(t.nvals + 1, sizeof *t.handles);
     t.is_handle = calloc(t.nvals + 1, 1);
     t.ptr_space = calloc(t.nvals + 1, 1);
     t.declared_types = calloc(m->ntypes + 1, 1);
-    read_signatures(&t);                                           // (first: the shader flags decide type names)
     read_resources(&t);
     analyze_uav_accesses(&t);
+    if (mode >= 3) {
+        // inputs: the vertex kernel's (hull) or the hull's control points (domain) of the same semantic; a domain
+        // shader's patch constants likewise from the hull's
+        const dxil_msl_element *from = mode == 5 ? (vs ? vs->outputs : NULL) : (vs ? vs->outputs : NULL);
+        uint32_t nfrom = vs ? vs->noutputs : 0;
+        memset(t.gs_slot, 0xff, sizeof t.gs_slot);
+        memset(t.pc_slot, 0xff, sizeof t.pc_slot);
+        for (int pass = 0; pass < (mode == 5 ? 2 : 1); pass++) {
+            const dxil_md *sig = pass ? t.pcsig : t.insig;
+            const dxil_msl_element *src = pass ? vs->patch : from;
+            uint32_t nsrc = pass ? vs->npatch : nfrom;
+            for (uint32_t i = 0; sig && i < sig->n; i++) {
+                const dxil_md *e = dxil_md_op(m, sig, i);
+                int id = md_i(&t, e, 0, 0), rows = md_i(&t, e, 6, 1);
+                for (int r = 0; r < rows && r < 4 && id < 64; r++) {
+                    uint32_t index = (uint32_t)md_i(&t, dxil_md_op(m, e, 4), r, r);
+                    for (uint32_t k = 0; src && k < nsrc; k++)
+                        if (!strcasecmp(src[k].name, md_str(&t, e, 1)) && src[k].index == index) {
+                            if (pass) t.pc_slot[id][r] = (int16_t)k; else t.gs_slot[id][r] = (int16_t)k;
+                            break;
+                        }
+                }
+            }
+        }
+        if (mode == 5 && vs) {
+            out->tess_domain = vs->tess_domain;
+            out->tess_out_cp = vs->tess_out_cp;
+        }
+        if (out->tess_domain != 2 && out->tess_domain != 3) { snprintf(out->error, sizeof out->error, "isoline tessellation is not done yet"); goto done; }
+        if (mode != 5 && out->tess_output != 3 && out->tess_output != 4) { snprintf(out->error, sizeof out->error, "point or line tessellation output is not done yet"); goto done; }
+    }
     if (mode == 2) {
         // D3D_PRIMITIVE: 1 point, 2 line, 3 triangle, 6 line with adjacency, 7 triangle with adjacency
         out->gs_in_verts = t.gs_inprim == 1 ? 1 : t.gs_inprim == 2 ? 2 : t.gs_inprim == 3 ? 3 : t.gs_inprim == 6 ? 4 : t.gs_inprim == 7 ? 6 : 0;
@@ -3003,14 +3132,59 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
         sb file = { 0 }, io = { 0 }, gl = { 0 }, glocal = { 0 };
         declare_globals(&t, &gl, &glocal);
         io_structs(&t, &io);
-        put(&file, "%s", PRELUDE);
+        if (mode == 3 || mode == 4) {
+            // a hull phase: a function in a namespace of its own (the hull kernel calls both; PRELUDE and VxRoot are
+            // the kernel's)
+            if (glocal.s || t.need_lane || t.need_lanes) { snprintf(out->error, sizeof out->error, "a hull shader with groupshared memory or wave operations"); t.failed = 1; }
+            put(&file, "namespace %s {\n", mode == 3 ? "vx_cp" : "vx_pc");
+        } else {
+            put(&file, "%s", PRELUDE);
+            put(&file, "struct VxRoot { device const uchar *slot[%u]; device const uchar *heap; device const uchar *samplers; };\n", out->nslots ? out->nslots : 1);
+        }
         put(&file, "%s", t.prelude.s ? t.prelude.s : "");
-        put(&file, "struct VxRoot { device const uchar *slot[%u]; device const uchar *heap; device const uchar *samplers; };\n", out->nslots ? out->nslots : 1);
         put(&file, "%s", t.types.s ? t.types.s : "");
         put(&file, "%s", gl.s ? gl.s : "");
         put(&file, "%s", io.s ? io.s : "");
         int stage = out->stage;
-        if (mode == 1) {
+        if (mode == 3 || mode == 4) {
+            int n = (int)out->noutputs;
+            out->io_slots = n ? (uint32_t)n : 1;
+            int ncp = 0;
+            for (uint32_t i = 0; t.cpsig && i < t.cpsig->n; i++) ncp += md_i(&t, dxil_md_op(m, t.cpsig, i), 6, 1);
+            put(&file, "#define VXV(k, r) vx_hs_in[(k) * vx_hp[0].z + (r)]\n");
+            put(&file, "#define VXO(k, r) vx_cp_outs[(k) * %d + (r)]\n", ncp ? ncp : 1);
+            put(&file, "#define VX_RETURN do {");
+            uint32_t slot = 0;
+            int edges = -1, inside = -1, edge_rows = 0, inside_rows = 0;
+            for (uint32_t i = 0; t.outsig && i < t.outsig->n; i++) {
+                const dxil_md *e = dxil_md_op(m, t.outsig, i);
+                int id = md_i(&t, e, 0, 0), rows = md_i(&t, e, 6, 1), kind = md_i(&t, e, 3, 0);
+                if (mode == 4 && kind == 25) { edges = id; edge_rows = rows; }
+                if (mode == 4 && kind == 26) { inside = id; inside_rows = rows; }
+                for (int r = 0; r < rows; r++) { put(&file, " vx_dst[%u] = ", slot++); slot_store(&t, &file, e, id, r); put(&file, ";"); }
+            }
+            if (mode == 4) {
+                // Metal's MTLTriangleTessellationFactorsHalf {edge[3], inside} / MTLQuadTessellationFactorsHalf {edge[4],
+                // inside[2]}: D3D's SV_TessFactor and SV_InsideTessFactor in the same order
+                int quad = out->tess_domain == 3, ne = quad ? 4 : 3, ni = quad ? 2 : 1;
+                for (int k = 0; k < ne; k++)
+                    if (edges >= 0 && k < edge_rows) put(&file, " vx_f[%d] = half(vx_out.o%d_%d);", k, edges, k);
+                    else put(&file, " vx_f[%d] = half(0);", k);
+                for (int k = 0; k < ni; k++)
+                    if (inside >= 0 && k < inside_rows) put(&file, " vx_f[%d] = half(vx_out.o%d_%d);", ne + k, inside, k);
+                    else put(&file, " vx_f[%d] = half(0);", ne + k);
+            }
+            put(&file, " return; } while (0)\n");
+            if (mode == 3)
+                put(&file, "static void run(constant VxRoot &vx_root, const device float4 *vx_hs_in, constant uint4 *vx_hp, uint vx_cpid, uint vx_pid, device float4 *vx_dst");
+            else
+                put(&file, "static void run(constant VxRoot &vx_root, const device float4 *vx_hs_in, const device float4 *vx_cp_outs, constant uint4 *vx_hp, uint vx_pid, device float4 *vx_dst, device half *vx_f");
+        } else if (mode == 5) {
+            put(&file, "#define VXV(k, r) vx_cps[(k) * vx_dp.y + (r)]\n#define VX_RETURN return vx_out\n");
+            put(&file, "[[patch(%s)]] vertex VxOut vx_main(uint vx_pid0 [[patch_id]], %s vx_dl [[position_in_patch]], const device float4 *vx_cpb [[buffer(%d)]], "
+                       "const device float4 *vx_pcb [[buffer(%d)]], constant uint4 &vx_dp [[buffer(%d)]], constant VxRoot &vx_root [[buffer(0)]]",
+                out->tess_domain == 3 ? "quad" : "triangle", out->tess_domain == 3 ? "float2" : "float3", DXIL_DS_CP, DXIL_DS_PC, DXIL_DS_PARAMS);
+        } else if (mode == 1) {
             int n = (int)out->noutputs;
             out->io_slots = n ? (uint32_t)n : 1;
             put(&file, "#define VX_RETURN do { device float4 *vx_o = vx_vs_out + (vx_tid.y * vx_vp[0].x + vx_tid.x) * %u;", out->io_slots);
@@ -3069,6 +3243,11 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
         put(&file, ") {\n");
         if (stage != 5) put(&file, "    VxOut vx_out = {};\n");
         if (stage == 1 && !out->ninputs) put(&file, "    VxIn vx_in = {}; (void)vx_in;\n");
+        if (mode == 5) {
+            put(&file, "    uint vx_pid = vx_pid0 %% max(vx_dp.z, 1u);\n");
+            put(&file, "    const device float4 *vx_cps = vx_cpb + vx_pid0 * vx_dp.x * vx_dp.y;\n");
+            put(&file, "    const device float4 *vx_pc = vx_pcb + vx_pid0 * vx_dp.w; (void)vx_pc; (void)vx_pid;\n");
+        }
         if (mode == 1) {
             put(&file, "    if (vx_tid.x >= vx_vp[0].x) return;\n");
             put(&file, "    uint vx_vid = vx_vp[1].x == 2 ? reinterpret_cast<const device uint *>(vx_ib)[vx_vp[1].y + vx_tid.x] + vx_vp[1].z :\n"
@@ -3084,6 +3263,7 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
         put(&file, "%s", t.decls.s ? t.decls.s : "");
         put(&file, "%s", t.body.s ? t.body.s : "");
         put(&file, "}\n");
+        if (mode == 3 || mode == 4) put(&file, "#undef VXV\n#undef VXO\n#undef VX_RETURN\n}\n");
         out->msl = file.s;
         free(io.s); free(gl.s); free(glocal.s);
         if (mode == 2) {
@@ -3146,6 +3326,45 @@ int dxil_to_msl_vertex_kernel(const dxil_module *m, dxil_msl *out) {
 }
 int dxil_to_msl_geometry(const dxil_module *m, const dxil_msl *vs, dxil_msl *out) {
     return translate(m, UINT32_MAX, 2, vs, out);
+}
+
+// The hull kernel: both phases (each translated into a namespace of its own) and the kernel calling them per patch.
+int dxil_to_msl_hull(const dxil_module *m, const dxil_msl *vs, dxil_msl *out) {
+    dxil_msl pc;
+    if (translate(m, UINT32_MAX, 3, vs, out)) return -1;
+    if (translate(m, UINT32_MAX, 4, vs, &pc)) {
+        snprintf(out->error, sizeof out->error, "patch-constant function: %s", pc.error);
+        dxil_msl_free(out);
+        return -1;
+    }
+    out->npatch = pc.noutputs;
+    memcpy(out->patch, pc.outputs, sizeof out->patch);
+    if (pc.nslots > out->nslots) out->nslots = pc.nslots;
+    out->uses_heap |= pc.uses_heap;
+    out->uses_sampler_heap |= pc.uses_sampler_heap;
+    uint32_t ncp = out->io_slots, npc = pc.io_slots, in_cp = out->tess_in_cp, out_cp = out->tess_out_cp;
+    uint32_t fstride = out->tess_domain == 3 ? 6 : 4;
+    sb file = { 0 };
+    put(&file, "%s", PRELUDE);
+    put(&file, "struct VxRoot { device const uchar *slot[%u]; device const uchar *heap; device const uchar *samplers; };\n", out->nslots ? out->nslots : 1);
+    put(&file, "%s%s", out->msl, pc.msl);
+    put(&file, "kernel void vx_main(uint2 vx_tid [[thread_position_in_grid]], const device float4 *vx_in [[buffer(%d)]], device float4 *vx_cp [[buffer(%d)]], "
+               "device float4 *vx_pcb [[buffer(%d)]], device half *vx_factors [[buffer(%d)]], constant uint4 *vx_hp [[buffer(%d)]], "
+               "constant VxRoot &vx_root [[buffer(0)]]) {\n", DXIL_HS_IN, DXIL_HS_CP, DXIL_HS_PC, DXIL_HS_FACTORS, DXIL_HS_PARAMS);
+    put(&file, "    if (vx_tid.x >= vx_hp[0].x) return;\n");
+    put(&file, "    uint vx_patch = vx_tid.y * vx_hp[0].x + vx_tid.x;\n");
+    put(&file, "    const device float4 *vx_hs_in = vx_in + (vx_tid.y * vx_hp[0].y + vx_tid.x * %uu) * vx_hp[0].z;\n", in_cp);
+    put(&file, "    device float4 *vx_cps = vx_cp + vx_patch * %uu;\n", out_cp * ncp);
+    put(&file, "    for (uint vx_i = 0; vx_i < %uu; vx_i++) vx_cp::run(vx_root, vx_hs_in, vx_hp, vx_i, vx_tid.x, vx_cps + vx_i * %uu);\n", out_cp, ncp);
+    put(&file, "    vx_pc::run(vx_root, vx_hs_in, vx_cps, vx_hp, vx_tid.x, vx_pcb + vx_patch * %uu, vx_factors + vx_patch * %uu);\n}\n", npc, fstride);
+    free(out->msl);
+    out->msl = file.s;
+    dxil_msl_free(&pc);
+    return 0;
+}
+
+int dxil_to_msl_domain(const dxil_module *m, const dxil_msl *hs, dxil_msl *out) {
+    return translate(m, UINT32_MAX, 5, hs, out);
 }
 
 void dxil_msl_free(dxil_msl *out) {

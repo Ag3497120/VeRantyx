@@ -20,7 +20,7 @@
 // (tiled resources tier 2, feature level 12_0) are Metal 4 placement-sparse resources whose tiles UpdateTileMappings
 // maps onto the D3D12 heaps' Metal placement heaps; pipeline libraries keep pipelines by name and description.
 // Not done yet: 3D (tier 3) tiles, protected resource sessions, sampler feedback, ray/mesh dispatch,
-// hull/domain stages, full typed-buffer format coverage, atomics outside R32 integer resources supported by
+// DXBC hull/domain stages, full typed-buffer format coverage, atomics outside R32 integer resources supported by
 // the active Metal GPU, structured-buffer UAV clears, and ExecuteIndirect bundle signatures that change root or IA
 // state or use a count buffer.
 #include "d3d_common.h"
@@ -372,6 +372,12 @@ typedef struct {
     uint32_t gs_in_verts, gs_max_tris, gs_out_regs, gs_vs_out_regs, gs_nattr;
     struct { uint32_t reg, offset, slot, instanced, step; MTLVertexFormat format; } gs_attr[32];
     uint64_t desc_hash;              // of the description it was made from (pipeline libraries, cached blobs)
+    // Tessellation (DXIL): the vertex shader as a kernel (gs_vs_source, gs_attr: as for geometry), the hull shader as a
+    // kernel per patch writing control points, patch constants and Metal's tessellation factors, and `render` drawing
+    // the patches with the domain shader as its post-tessellation vertex function.
+    id<MTLComputePipelineState> hs_kernel;
+    dxil_msl hs, ds;                 // their slots
+    uint32_t tess_in_cp, tess_out_cp, hs_cp_slots, hs_pc_slots, tess_domain;
 } pso12;
 
 typedef struct { d3d_object base; void *data; size_t size; } blob12;
@@ -3013,6 +3019,7 @@ static void pso_destroy(d3d_object *o) {
     p->gpu_pipeline = NULL;
     p->compute = nil; p->render = nil; p->depth = nil;
     p->gs_kernel = nil; p->gs_vs_source = nil; p->gs_vs_kernels = nil;
+    p->hs_kernel = nil;
     release_dev(o);
 }
 static WINAPI HRESULT pso_query(void *this, const GUID *iid, void **out) {
@@ -5208,9 +5215,91 @@ done:
     return ok;
 }
 
+// Tessellation (DXIL): the vertex kernel, the hull kernel and the domain shader as the render pipeline's
+// post-tessellation vertex function, with the hull shader's partitioning, winding and maximum factor.
+static int tess_pipeline_dxil12(dev12 *d, pso12 *p, const GFX_PSO_DESC *desc, MTLRenderPipelineDescriptor *rp) {
+    dxil_module vm, hm, dm;
+    dxil_msl vk;
+    int ok = 0, have_vm = 0, have_hm = 0, have_dm = 0, have_vk = 0;
+    NSError *err = nil;
+    id<MTLLibrary> lib = nil;
+    id<MTLFunction> fn = nil;
+    uint32_t running[16] = { 0 };
+    const INPUT_ELEMENT *el = desc->input.elements;
+    memset(&vk, 0, sizeof vk);
+    if (dxil_read(desc->vs.code, desc->vs.size, &vm)) { vx_log("D3D12: vertex shader before a hull shader: %s", vm.error); goto done; }
+    have_vm = 1;
+    if (dxil_read(desc->hs.code, desc->hs.size, &hm)) { vx_log("D3D12: hull shader: %s", hm.error); goto done; }
+    have_hm = 1;
+    if (dxil_read(desc->ds.code, desc->ds.size, &dm)) { vx_log("D3D12: domain shader: %s", dm.error); goto done; }
+    have_dm = 1;
+    if (dxil_to_msl_vertex_kernel(&vm, &vk)) { vx_log("D3D12: vertex kernel before a hull shader: %s", vk.error); goto done; }
+    have_vk = 1;
+    dxil_msl_free(&p->hs);
+    dxil_msl_free(&p->ds);
+    if (dxil_to_msl_hull(&hm, &vk, &p->hs)) { vx_log("D3D12: hull shader: %s", p->hs.error); goto done; }
+    if (dxil_to_msl_domain(&dm, &p->hs, &p->ds)) { vx_log("D3D12: domain shader: %s", p->ds.error); goto done; }
+    p->tess_in_cp = p->hs.tess_in_cp;
+    p->tess_out_cp = p->hs.tess_out_cp;
+    p->hs_cp_slots = p->hs.io_slots;
+    p->hs_pc_slots = p->hs.npatch ? p->hs.npatch : 1;
+    p->tess_domain = p->hs.tess_domain;
+    p->gs_vs_out_regs = vk.io_slots ? vk.io_slots : 1;
+    p->gs_vs_source = @(vk.msl);
+    p->gs_vs_kernels = [NSMutableDictionary new];
+    lib = [d->mtl newLibraryWithSource:@(p->hs.msl) options:nil error:&err];
+    fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+    p->hs_kernel = fn ? [d->mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+    if (!p->hs_kernel) { vx_log("D3D12: hull kernel: %s\n%s", err.localizedDescription.UTF8String, p->hs.msl); goto done; }
+    lib = [d->mtl newLibraryWithSource:@(p->ds.msl) options:nil error:&err];
+    rp.vertexFunction = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+    rp.vertexDescriptor = nil;
+    if (!rp.vertexFunction) { vx_log("D3D12: domain shader: %s\n%s", err.localizedDescription.UTF8String, p->ds.msl); goto done; }
+    static const MTLTessellationPartitionMode partition[5] = { MTLTessellationPartitionModeInteger, MTLTessellationPartitionModeInteger,
+        MTLTessellationPartitionModePow2, MTLTessellationPartitionModeFractionalOdd, MTLTessellationPartitionModeFractionalEven };
+    rp.tessellationPartitionMode = partition[p->hs.tess_partitioning <= 4 ? p->hs.tess_partitioning : 0];
+    rp.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+    rp.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+    rp.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeNone;
+    rp.tessellationOutputWindingOrder = p->hs.tess_output == 4 ? MTLWindingCounterClockwise : MTLWindingClockwise;
+    // (Metal's maximum is 64 on Apple GPUs, and even for fractional-even partitioning)
+    uint32_t max_factor = (uint32_t)ceilf(p->hs.tess_max_factor);
+    if (max_factor > 64) max_factor = 64;
+    if (max_factor < 2) max_factor = 2;
+    if (max_factor & 1) max_factor++;
+    rp.maxTessellationFactor = max_factor;
+    for (uint32_t i = 0; i < desc->input.n; i++) {
+        const INPUT_ELEMENT *e = &el[i];
+        if (e->slot >= 16) continue;
+        uint32_t off = e->offset == 0xFFFFFFFFu ? running[e->slot] : e->offset;
+        running[e->slot] = off + d3d12_vertex_format_size12(e->format);
+        for (uint32_t k = 0; k < vk.ninputs; k++) {
+            const dxil_msl_element *x = &vk.inputs[k];
+            if (strcasecmp(x->name, e->name) || x->index != e->index || p->gs_nattr >= 32) continue;
+            if (e->slot >= 12) { vx_log("D3D12: vertex buffer slot %u before a hull shader is not supported", e->slot); goto done; }
+            p->gs_attr[p->gs_nattr++] = (__typeof__(p->gs_attr[0])){ x->attribute, off, e->slot, e->cls == 1, e->step ? e->step : 1,
+                                                                       vertex_format(e->format) };
+        }
+    }
+    ok = 1;
+done:
+    free(p->hs.msl); p->hs.msl = NULL;                             // (compiled; the slots stay for binding)
+    free(p->ds.msl); p->ds.msl = NULL;
+    if (have_vk) dxil_msl_free(&vk);
+    if (have_vm) dxil_free(&vm);
+    if (have_hm) dxil_free(&hm);
+    if (have_dm) dxil_free(&dm);
+    return ok;
+}
+
 static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
-    if (desc->hs.size || desc->ds.size) { vx_log("D3D12: hull and domain shaders are not done yet"); return E_NOTIMPL; }
+    if ((desc->hs.size != 0) != (desc->ds.size != 0)) return E_INVALIDARG;
+    if (desc->hs.size && (d3d12_is_dxbc_program(&desc->hs) || d3d12_is_dxbc_program(&desc->ds) || d3d12_is_dxbc_program(&desc->vs))) {
+        vx_log("D3D12: hull and domain shaders are done for DXIL only so far");
+        return E_NOTIMPL;
+    }
+    if (desc->hs.size && desc->gs.size) { vx_log("D3D12: a geometry shader after tessellation is not done yet"); return E_NOTIMPL; }
     if (desc->gs.size && d3d12_is_dxbc_program(&desc->gs) != d3d12_is_dxbc_program(&desc->vs)) {
         vx_log("D3D12: a geometry shader and a vertex shader of different shader models (DXBC and DXIL)");
         return E_NOTIMPL;
@@ -5342,6 +5431,12 @@ static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const
     if (desc->gs.size) {
         int gs_ok = d3d12_is_dxbc_program(&desc->gs) ? gs_pipeline12(d, p, desc, rp) : gs_pipeline_dxil12(d, p, desc, rp);
         if (!gs_ok || !shader_root_signature_valid12(d, &p->gs, desc->root)) {
+            d3d_release(&p->base);
+            return E_INVALIDARG;
+        }
+    } else if (desc->hs.size) {
+        if (!tess_pipeline_dxil12(d, p, desc, rp) || !shader_root_signature_valid12(d, &p->hs, desc->root) ||
+            !shader_root_signature_valid12(d, &p->ds, desc->root)) {
             d3d_release(&p->base);
             return E_INVALIDARG;
         }
@@ -8541,6 +8636,100 @@ static void gs12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTLCo
     [*re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)prims * instances * tris * 3];
 }
 
+// Draws with tessellation: the vertex kernel over the control points (as for geometry), the hull kernel over the
+// patches (control points, patch constants, tessellation factors), then the patches with the domain shader.
+static void tess12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTLCommandBuffer> cb,
+                        id<MTLComputeCommandEncoder> __strong *ce, id<MTLBlitCommandEncoder> __strong *be,
+                        id<MTLRenderCommandEncoder> __strong *re, NSArray *resident, heap12 *heap, heap12 *sheap,
+                        root_binding *graphics, scratch *sc) {
+    int indexed = c->op == C_DRAW_INDEXED;
+    uint32_t count = c->a, instances = c->b, start = c->c;
+    uint32_t start_instance = indexed ? (uint32_t)c->off2 : (uint32_t)c->off;
+    int32_t base_vertex = indexed ? (int32_t)(int64_t)c->off : 0;
+    uint32_t n = p->tess_in_cp;
+    if (g->topology < 33 || g->topology > 64 || g->topology - 32 != n) {
+        vx_log("D3D12: topology %u for a hull shader of %u control points", g->topology, n);
+        return;
+    }
+    uint32_t patches = count / n;
+    if (!patches || !instances || (indexed && !g->ib.va)) return;
+    int index_type = indexed ? (g->ib.format == 42 ? 2 : 1) : 0;
+    id<MTLComputePipelineState> vk = gs12_vertex_kernel(d, p, g, index_type);
+    if (!vk) return;
+    uint32_t vsn = p->gs_vs_out_regs, total = patches * instances;
+    uint32_t fstride = p->tess_domain == 3 ? 12 : 8;               // (bytes of a patch's half factors)
+    NSUInteger lens[4] = { (NSUInteger)count * instances * vsn * 16, (NSUInteger)total * p->tess_out_cp * p->hs_cp_slots * 16,
+                           (NSUInteger)total * p->hs_pc_slots * 16, (NSUInteger)total * fstride };
+    id<MTLBuffer> bufs[4];
+    for (int k = 0; k < 4; k++)
+        if (!(bufs[k] = [d->mtl newBufferWithLength:MAX(lens[k], (NSUInteger)16) options:MTLResourceStorageModePrivate])) return;
+    id<MTLBuffer> vs_out = bufs[0], cp_out = bufs[1], pc_out = bufs[2], factors = bufs[3];
+
+    if (*be) { [*be endEncoding]; *be = nil; }
+    close_pass(d, g, cb, re);
+    if (!*ce) {
+        *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        use_resident_compute12(*ce, resident, heap);
+    }
+    // the vertex kernel: thread (x, y) is vertex x of instance y
+    [*ce setComputePipelineState:vk];
+    for (uint32_t i = 0; i < p->gs_nattr; i++) {
+        uint32_t slot = p->gs_attr[i].slot;
+        uint64_t offset = 0;
+        id<MTLBuffer> buffer = g->vb[slot].va ? buffer_at(d, g->vb[slot].va, &offset) : nil;
+        if (!buffer) continue;
+        int64_t first = p->gs_attr[i].instanced ? (int64_t)(start_instance / p->gs_attr[i].step) : indexed ? base_vertex : (int64_t)start;
+        int64_t at = (int64_t)offset + (int64_t)g->vb[slot].stride * first;
+        [*ce setBuffer:buffer offset:(NSUInteger)(at < 0 ? 0 : at) atIndex:GS12_VB_BASE + slot];
+    }
+    if (indexed) {
+        uint64_t offset = 0;
+        id<MTLBuffer> ib = buffer_at(d, g->ib.va, &offset);
+        if (!ib) return;
+        [*ce setBuffer:ib offset:(NSUInteger)(offset + (uint64_t)start * (index_type == 2 ? 4 : 2)) atIndex:DXBC_GS_INDEX];
+    } else [*ce setBuffer:vs_out offset:0 atIndex:DXBC_GS_INDEX];   // (not read)
+    uint64_t root[64 + 2];
+    uint32_t words;
+    stage_root(d, &p->vs, graphics, heap, sheap, sc, root, &words);
+    [*ce setBytes:root length:8 * words atIndex:0];
+    uint32_t vp[8] = { count, indexed ? 0 : start, start_instance, vsn, (uint32_t)index_type, 0, (uint32_t)base_vertex, 0 };
+    [*ce setBytes:vp length:sizeof vp atIndex:DXBC_VS_PARAMS];
+    [*ce setBuffer:vs_out offset:0 atIndex:DXBC_GS_OUT];
+    [*ce dispatchThreads:MTLSizeMake(count, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, vk.maxTotalThreadsPerThreadgroup), 1, 1)];
+    // the hull kernel: thread (x, y) is patch x of instance y
+    [*ce setComputePipelineState:p->hs_kernel];
+    stage_root(d, &p->hs, graphics, heap, sheap, sc, root, &words);
+    [*ce setBytes:root length:8 * words atIndex:0];
+    uint32_t hp[4] = { patches, count, vsn, 0 };
+    [*ce setBytes:hp length:sizeof hp atIndex:DXIL_HS_PARAMS];
+    [*ce setBuffer:vs_out offset:0 atIndex:DXIL_HS_IN];
+    [*ce setBuffer:cp_out offset:0 atIndex:DXIL_HS_CP];
+    [*ce setBuffer:pc_out offset:0 atIndex:DXIL_HS_PC];
+    [*ce setBuffer:factors offset:0 atIndex:DXIL_HS_FACTORS];
+    if (sc->buf) [*ce useResource:sc->buf usage:MTLResourceUsageRead];
+    [*ce dispatchThreads:MTLSizeMake(patches, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, p->hs_kernel.maxTotalThreadsPerThreadgroup), 1, 1)];
+    // the patches
+    if (!open_render_pass12(d, g, cb, ce, be, re, resident, heap)) { vx_log("D3D12: could not open a render pass for a tessellated draw"); return; }
+    encode_render_state12(*re, p, g, g->blend);
+    [*re setTessellationFactorBuffer:factors offset:0 instanceStride:0];
+    [*re setVertexBuffer:cp_out offset:0 atIndex:DXIL_DS_CP];
+    [*re setVertexBuffer:pc_out offset:0 atIndex:DXIL_DS_PC];
+    uint32_t dp[4] = { p->tess_out_cp, p->hs_cp_slots, patches, p->hs_pc_slots };
+    [*re setVertexBytes:dp length:sizeof dp atIndex:DXIL_DS_PARAMS];
+    stage_root(d, &p->ds, graphics, heap, sheap, sc, root, &words);
+    [*re setVertexBytes:root length:8 * words atIndex:0];
+    stage_root(d, &p->ps, graphics, heap, sheap, sc, root, &words);
+    [*re setFragmentBytes:root length:8 * words atIndex:0];
+    if (sc->buf) [*re useResource:sc->buf usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    gpu_ir_access_list12 accesses = { 0 };
+    pthread_mutex_lock(&d->lock);
+    int access_rc = gpu_ir_collect_draw_accesses12(d, p, g, graphics, heap, sheap, &accesses, indexed);
+    pthread_mutex_unlock(&d->lock);
+    if (access_rc == GPU_IR_OK) d3d12_use_render_accesses12(*re, accesses.values, accesses.count);
+    gpu_ir_access_list_release12(&accesses);
+    [*re drawPatches:0 patchStart:0 patchCount:total patchIndexBuffer:nil patchIndexBufferOffset:0 instanceCount:1 baseInstance:0];
+}
+
 static int d3d12_gpu_ir_draw(void *opaque, const gpu_ir_pipeline *pipeline, const gpu_ir_draw_info *draw,
                              const gpu_ir_resource_access *accesses, uint32_t access_count) {
     d3d12_draw_context *context = opaque;
@@ -9179,7 +9368,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             uint32_t t = c->a;
             g->topology = t;
             g->prim = t == 1 ? MTLPrimitiveTypePoint : t == 2 ? MTLPrimitiveTypeLine : t == 3 ? MTLPrimitiveTypeLineStrip : t == 5 ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle;
-            if (t > 5 && !(pso && pso->gs_kernel)) vx_log("D3D12: primitive topology %u is not supported", t);
+            if (t > 5 && !(pso && pso->gs_kernel) && !(t >= 33 && t <= 64)) vx_log("D3D12: primitive topology %u is not supported", t);
             break;
         }
         case C_VB: for (uint32_t k = 0; k < c->b && c->a + k < 16; k++) memcpy(&g->vb[c->a + k], (VBV *)c->values + k, sizeof(VBV)); break;
@@ -9325,6 +9514,10 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             if (!pso || !pso->render) { vx_log("D3D12: a draw without a graphics pipeline state"); break; }
             if (pso->gs_kernel) {
                 gs12_draw(d, g, pso, c, cb, &ce, &be, &re, resident, heap, sheap, graphics, sc);
+                break;
+            }
+            if (pso->hs_kernel) {
+                tess12_draw(d, g, pso, c, cb, &ce, &be, &re, resident, heap, sheap, graphics, sc);
                 break;
             }
             if (!open_render_pass12(d, g, cb, &ce, &be, &re, resident, heap)) {
@@ -10174,7 +10367,8 @@ static int queue_validate_list_states12(dev12 *device, int32_t queue_type, id<MT
             if (use_result <= 0) { result = use_result < 0 ? -1 : 0; break; }
         } else if ((command->op == C_DRAW && command->a && command->b) ||
                    (command->op == C_DRAW_INDEXED && command->a && command->b)) {
-            if (!topology || topology > 5) { result = 0; break; }
+            // (lists and strips; with adjacency for geometry shaders; patch lists of 1-32 control points)
+            if (!topology || (topology > 5 && topology < 10) || (topology > 13 && topology < 33) || topology > 64) { result = 0; break; }
             int use_result = queue_validate_graphics_draw12(device, queue_type, &shadows, &count, &capacity,
                 vertex_buffers, &index_buffer, pipeline, &graphics, resource_heap, sampler_heap, targets,
                 target_count, target_subresources, target_flags, command->op == C_DRAW_INDEXED);

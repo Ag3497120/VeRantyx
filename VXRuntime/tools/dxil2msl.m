@@ -2,6 +2,8 @@
 //   build/dxil2msl [-p] file.dxil...      (-p: print the MSL)
 //   build/dxil2msl -vs vs.dxil gs.dxil... (geometry shaders after the vertex shader they follow: the vertex kernel,
 //                                          the geometry kernel and its pass-through function are compiled)
+//   build/dxil2msl -vs vs.dxil -hs hs.dxil ds.dxil   (a domain shader after its hull and vertex shaders: the vertex and
+//                                          hull kernels and the post-tessellation vertex function are compiled)
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,11 +33,38 @@ static int compile(id<MTLDevice> dev, const char *what, const char *source) {
 
 int main(int argc, char **argv) {
     int print = 0, bad = 0, n = 0, compiled = 0, skipped = 0;
-    const char *vs_path = NULL;
+    const char *vs_path = NULL, *hs_path = NULL;
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p")) { print = 1; continue; }
         if (!strcmp(argv[i], "-vs") && i + 1 < argc) { vs_path = argv[++i]; continue; }
+        if (!strcmp(argv[i], "-hs") && i + 1 < argc) { hs_path = argv[++i]; continue; }
+        if (vs_path && hs_path) {                                  // a domain shader after its hull and vertex shaders
+            long vsize = 0, hsize = 0, dsize = 0;
+            unsigned char *vdata = slurp(vs_path, &vsize), *hdata = slurp(hs_path, &hsize), *ddata = slurp(argv[i], &dsize);
+            dxil_module vm, hm, dm;
+            dxil_msl vk, hk, dk;
+            n++;
+            int ok = vdata && hdata && ddata && !dxil_read(vdata, vsize, &vm);
+            if (ok && dxil_read(hdata, hsize, &hm)) { printf("%s: %s\n", hs_path, hm.error); dxil_free(&vm); ok = 0; }
+            if (ok && dxil_read(ddata, dsize, &dm)) { printf("%s: %s\n", argv[i], dm.error); dxil_free(&vm); dxil_free(&hm); ok = 0; }
+            if (ok) {
+                if (dxil_to_msl_vertex_kernel(&vm, &vk)) { printf("%s: vertex kernel: %s\n", vs_path, vk.error); ok = 0; }
+                else if (dxil_to_msl_hull(&hm, &vk, &hk)) { printf("%s: %s\n", hs_path, hk.error); ok = 0; dxil_msl_free(&vk); }
+                else if (dxil_to_msl_domain(&dm, &hk, &dk)) { printf("%s: %s\n", argv[i], dk.error); ok = 0; dxil_msl_free(&vk); dxil_msl_free(&hk); }
+                else {
+                    if (print) printf("%s\n%s\n%s", vk.msl, hk.msl, dk.msl);
+                    ok = compile(dev, vs_path, vk.msl) & compile(dev, hs_path, hk.msl) & compile(dev, argv[i], dk.msl);
+                    if (ok) printf("%s: hull kernel (%u in, %u out control points, %u patch constants, domain %u), vertex kernel and domain function compiled\n",
+                                   argv[i], hk.tess_in_cp, hk.tess_out_cp, hk.npatch, hk.tess_domain);
+                    dxil_msl_free(&vk); dxil_msl_free(&hk); dxil_msl_free(&dk);
+                }
+                dxil_free(&vm); dxil_free(&hm); dxil_free(&dm);
+            }
+            if (ok) compiled++; else bad++;
+            free(vdata); free(hdata); free(ddata);
+            continue;
+        }
         if (vs_path) {                                             // a geometry shader after its vertex shader
             long vsize = 0, gsize = 0;
             unsigned char *vdata = slurp(vs_path, &vsize), *gdata = slurp(argv[i], &gsize);
