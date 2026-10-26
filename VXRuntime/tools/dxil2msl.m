@@ -1,16 +1,65 @@
 // Translates DXIL containers to Metal Shading Language (src/dxil_msl.c) and compiles each with Metal:
 //   build/dxil2msl [-p] file.dxil...      (-p: print the MSL)
+//   build/dxil2msl -vs vs.dxil gs.dxil... (geometry shaders after the vertex shader they follow: the vertex kernel,
+//                                          the geometry kernel and its pass-through function are compiled)
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../src/dxil_msl.h"
 
+static unsigned char *slurp(const char *path, long *size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    *size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char *data = malloc(*size);
+    fread(data, 1, *size, f);
+    fclose(f);
+    return data;
+}
+
+static int compile(id<MTLDevice> dev, const char *what, const char *source) {
+    MTLCompileOptions *opt = [MTLCompileOptions new];
+    opt.languageVersion = MTLLanguageVersion3_1;
+    NSError *err = nil;
+    if ([dev newLibraryWithSource:@(source) options:opt error:&err]) return 1;
+    printf("%s: Metal: %s\n", what, err.localizedDescription.UTF8String);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int print = 0, bad = 0, n = 0, compiled = 0, skipped = 0;
+    const char *vs_path = NULL;
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p")) { print = 1; continue; }
+        if (!strcmp(argv[i], "-vs") && i + 1 < argc) { vs_path = argv[++i]; continue; }
+        if (vs_path) {                                             // a geometry shader after its vertex shader
+            long vsize = 0, gsize = 0;
+            unsigned char *vdata = slurp(vs_path, &vsize), *gdata = slurp(argv[i], &gsize);
+            dxil_module vm, gm;
+            dxil_msl vk, gk;
+            n++;
+            if (!vdata || !gdata || dxil_read(vdata, vsize, &vm)) { printf("%s: cannot read %s\n", argv[i], vs_path); bad++; free(vdata); free(gdata); continue; }
+            if (dxil_read(gdata, gsize, &gm)) { printf("%s: %s\n", argv[i], gm.error); bad++; dxil_free(&vm); free(vdata); free(gdata); continue; }
+            int ok = !dxil_to_msl_vertex_kernel(&vm, &vk);
+            if (!ok) printf("%s: vertex kernel: %s\n", vs_path, vk.error);
+            else if (dxil_to_msl_geometry(&gm, &vk, &gk)) { printf("%s: %s\n", argv[i], gk.error); ok = 0; }
+            else {
+                if (print) printf("%s\n%s\n%s", vk.msl, gk.msl, gk.msl_passthrough);
+                ok = compile(dev, vs_path, vk.msl) & compile(dev, argv[i], gk.msl) & compile(dev, argv[i], gk.msl_passthrough);
+                if (ok) printf("%s: geometry kernel (%u in, %u triangles, %u outputs), vertex kernel and pass-through compiled\n",
+                               argv[i], gk.gs_in_verts, gk.gs_max_tris, gk.io_slots);
+                dxil_msl_free(&gk);
+            }
+            if (ok) compiled++; else bad++;
+            dxil_msl_free(&vk);
+            dxil_free(&vm); dxil_free(&gm);
+            free(vdata); free(gdata);
+            continue;
+        }
         FILE *f = fopen(argv[i], "rb");
         if (!f) { perror(argv[i]); bad++; continue; }
         fseek(f, 0, SEEK_END);

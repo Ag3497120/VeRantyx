@@ -20,7 +20,7 @@
 // (tiled resources tier 2, feature level 12_0) are Metal 4 placement-sparse resources whose tiles UpdateTileMappings
 // maps onto the D3D12 heaps' Metal placement heaps; pipeline libraries keep pipelines by name and description.
 // Not done yet: CopyTiles, 3D (tier 3) tiles, protected resource sessions, sampler feedback, ray/mesh dispatch,
-// DXIL geometry and hull/domain stages, full typed-buffer format coverage, atomics outside R32 integer resources supported by
+// hull/domain stages, full typed-buffer format coverage, atomics outside R32 integer resources supported by
 // the active Metal GPU, structured-buffer UAV clears, and ExecuteIndirect bundle signatures that change root or IA
 // state or use a count buffer.
 #include "d3d_common.h"
@@ -5086,11 +5086,73 @@ done:
     return ok;
 }
 
+_Static_assert(DXIL_GS_COUNTS == DXBC_GS_COUNTS && DXIL_GS_INDEX == DXBC_GS_INDEX && DXIL_GS_PARAMS == DXBC_GS_PARAMS &&
+               DXIL_VS_PARAMS == DXBC_VS_PARAMS && DXIL_GS_IN == DXBC_GS_IN && DXIL_GS_OUT == DXBC_GS_OUT,
+               "the DXIL and DXBC geometry kernels share one draw path");
+
+// The same for DXIL: the vertex shader as a kernel (dxil_to_msl_vertex_kernel), the geometry kernel reading its
+// outputs by semantic and its pass-through vertex function (dxil_to_msl_geometry).
+static int gs_pipeline_dxil12(dev12 *d, pso12 *p, const GFX_PSO_DESC *desc, MTLRenderPipelineDescriptor *rp) {
+    dxil_module vm, gm;
+    dxil_msl vk;
+    int ok = 0, have_vm = 0, have_gm = 0, have_vk = 0;
+    NSError *err = nil;
+    id<MTLLibrary> lib = nil;
+    id<MTLFunction> fn = nil;
+    uint32_t running[16] = { 0 };
+    const INPUT_ELEMENT *el = desc->input.elements;
+    memset(&vk, 0, sizeof vk);
+    if (dxil_read(desc->vs.code, desc->vs.size, &vm)) { vx_log("D3D12: vertex shader before a geometry shader: %s", vm.error); goto done; }
+    have_vm = 1;
+    if (dxil_read(desc->gs.code, desc->gs.size, &gm)) { vx_log("D3D12: geometry shader: %s", gm.error); goto done; }
+    have_gm = 1;
+    if (dxil_to_msl_vertex_kernel(&vm, &vk)) { vx_log("D3D12: vertex kernel before a geometry shader: %s", vk.error); goto done; }
+    have_vk = 1;
+    dxil_msl_free(&p->gs);
+    if (dxil_to_msl_geometry(&gm, &vk, &p->gs)) { vx_log("D3D12: geometry shader: %s", p->gs.error); goto done; }
+    p->gs_in_verts = p->gs.gs_in_verts;
+    p->gs_max_tris = p->gs.gs_max_tris;
+    p->gs_out_regs = p->gs.io_slots;
+    p->gs_vs_out_regs = vk.io_slots ? vk.io_slots : 1;
+    p->gs_vs_source = @(vk.msl);
+    p->gs_vs_kernels = [NSMutableDictionary new];
+    lib = [d->mtl newLibraryWithSource:@(p->gs.msl) options:nil error:&err];
+    fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+    p->gs_kernel = fn ? [d->mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+    if (!p->gs_kernel) { vx_log("D3D12: geometry kernel: %s\n%s", err.localizedDescription.UTF8String, p->gs.msl); goto done; }
+    lib = [d->mtl newLibraryWithSource:@(p->gs.msl_passthrough) options:nil error:&err];
+    rp.vertexFunction = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+    rp.vertexDescriptor = nil;
+    if (!rp.vertexFunction) { vx_log("D3D12: geometry pass-through: %s", err.localizedDescription.UTF8String); goto done; }
+    // the input layout onto the vertex kernel's stage-input attributes (by semantic, as the vertex function's)
+    for (uint32_t i = 0; i < desc->input.n; i++) {
+        const INPUT_ELEMENT *e = &el[i];
+        if (e->slot >= 16) continue;
+        uint32_t off = e->offset == 0xFFFFFFFFu ? running[e->slot] : e->offset;
+        running[e->slot] = off + d3d12_vertex_format_size12(e->format);
+        for (uint32_t k = 0; k < vk.ninputs; k++) {
+            const dxil_msl_element *x = &vk.inputs[k];
+            if (strcasecmp(x->name, e->name) || x->index != e->index || p->gs_nattr >= 32) continue;
+            if (e->slot >= 12) { vx_log("D3D12: vertex buffer slot %u before a geometry shader is not supported", e->slot); goto done; }
+            p->gs_attr[p->gs_nattr++] = (__typeof__(p->gs_attr[0])){ x->attribute, off, e->slot, e->cls == 1, e->step ? e->step : 1,
+                                                                       vertex_format(e->format) };
+        }
+    }
+    ok = 1;
+done:
+    free(p->gs.msl); p->gs.msl = NULL;                             // (compiled; the slots stay for binding)
+    free(p->gs.msl_passthrough); p->gs.msl_passthrough = NULL;
+    if (have_vk) dxil_msl_free(&vk);
+    if (have_vm) dxil_free(&vm);
+    if (have_gm) dxil_free(&gm);
+    return ok;
+}
+
 static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
     if (desc->hs.size || desc->ds.size) { vx_log("D3D12: hull and domain shaders are not done yet"); return E_NOTIMPL; }
-    if (desc->gs.size && (!d3d12_is_dxbc_program(&desc->gs) || !d3d12_is_dxbc_program(&desc->vs))) {
-        vx_log("D3D12: geometry shaders are done for DXBC (fxc) only so far");
+    if (desc->gs.size && d3d12_is_dxbc_program(&desc->gs) != d3d12_is_dxbc_program(&desc->vs)) {
+        vx_log("D3D12: a geometry shader and a vertex shader of different shader models (DXBC and DXIL)");
         return E_NOTIMPL;
     }
     if (desc->gs.size && desc->so.n) { vx_log("D3D12: stream output is not done yet"); return E_NOTIMPL; }
@@ -5218,7 +5280,8 @@ static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const
         return E_INVALIDARG;
     }
     if (desc->gs.size) {
-        if (!gs_pipeline12(d, p, desc, rp) || !shader_root_signature_valid12(d, &p->gs, desc->root)) {
+        int gs_ok = d3d12_is_dxbc_program(&desc->gs) ? gs_pipeline12(d, p, desc, rp) : gs_pipeline_dxil12(d, p, desc, rp);
+        if (!gs_ok || !shader_root_signature_valid12(d, &p->gs, desc->root)) {
             d3d_release(&p->base);
             return E_INVALIDARG;
         }

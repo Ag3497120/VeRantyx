@@ -21,12 +21,14 @@ static ID3D12CommandAllocator *alloc;
 static ID3D12GraphicsCommandList *list;
 
 static int load(const char *name, D3D12_SHADER_BYTECODE *bc) {
-    static unsigned char store[8][65536];
+    static unsigned char store[16][65536];
     static int used;
     char path[128];
-    snprintf(path, sizeof path, "tests/shaders/%s.dxbc", name);
+    // ("12/name": a DXIL shader of tests/shaders12)
+    if (!strncmp(name, "12/", 3)) snprintf(path, sizeof path, "tests/shaders12/%s.dxil", name + 3);
+    else snprintf(path, sizeof path, "tests/shaders/%s.dxbc", name);
     FILE *f = fopen(path, "rb");
-    if (!f || used == 8) { printf("%s not found (run from VXRuntime)\n", path); return -1; }
+    if (!f || used == 16) { printf("%s not found (run from VXRuntime)\n", path); return -1; }
     bc->pShaderBytecode = store[used];
     bc->BytecodeLength = fread(store[used++], 1, sizeof store[0], f);
     fclose(f);
@@ -358,10 +360,12 @@ static int append_test(void) {
 // color_vs -> quad_gs (b0: half size, geometry-visible root constants) -> color_ps: each point becomes a square, and
 // every primitive adds a small blue triangle in the top-left corner (after a strip cut). Drawn twice into a 32x32
 // target: plain, and indexed with a base vertex past a vertex that must not be drawn.
-static int geometry_test(void) {
+// The same with the shaders compiled to DXIL (tests/shaders12/passcolor_vs, quad_gs, passcolor_ps: the same sources).
+static int geometry_test(int dxil) {
     int before = bad;
     D3D12_SHADER_BYTECODE vs, gs, ps;
-    if (load("color_vs", &vs) || load("quad_gs", &gs) || load("color_ps", &ps)) return 1;
+    if (load(dxil ? "12/passcolor_vs" : "color_vs", &vs) || load(dxil ? "12/quad_gs" : "quad_gs", &gs) ||
+        load(dxil ? "12/passcolor_ps" : "color_ps", &ps)) return 1;
     D3D12_ROOT_PARAMETER param = { D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS };
     param.Constants = (D3D12_ROOT_CONSTANTS){ 0, 0, 4 };
     param.ShaderVisibility = D3D12_SHADER_VISIBILITY_GEOMETRY;
@@ -454,8 +458,8 @@ static int geometry_test(void) {
     }
     ID3D12Resource_Unmap(readback, 0, NULL);
     if (wrong) bad++;
-    printf("d3d12 fxc geometry: DXBC vertex -> geometry (squares from points, a cut strip) -> pixel, plain and indexed with a base vertex, %d wrong probes: %s\n",
-           wrong, bad == before ? "ok" : "FAILED");
+    printf("d3d12 %s geometry: %s vertex -> geometry (squares from points, a cut strip) -> pixel, plain and indexed with a base vertex, %d wrong probes: %s\n",
+           dxil ? "dxc" : "fxc", dxil ? "DXIL" : "DXBC", wrong, bad == before ? "ok" : "FAILED");
     return 0;
 }
 
@@ -468,6 +472,7 @@ int main(void) {
     if (draw_test()) return 1;
     if (sum_test()) return 1;
     if (append_test()) return 1;
-    if (geometry_test()) return 1;
+    if (geometry_test(0)) return 1;
+    if (geometry_test(1)) return 1;
     return bad ? 1 : 0;
 }

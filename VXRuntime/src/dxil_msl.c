@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 // ---- text ---------------------------------------------------------------------------------------------------------
 
@@ -39,6 +40,11 @@ typedef struct {
     // what the body needed
     int need_lane, need_lanes, need_vid, need_iid, need_front, need_sample_id, need_prim, need_tid, need_gid, need_ltid, need_lidx;
     int need_coverage;
+    // geometry pipelines: 0 a stage function, 1 the vertex shader as a kernel, 2 a geometry shader as a kernel
+    int mode;
+    const dxil_msl *gs_from;    // (mode 2) the vertex kernel whose outputs are the inputs
+    uint32_t gs_inprim, gs_maxvert, gs_topology, gs_instances;
+    int16_t gs_slot[64][4];     // (mode 2) input element id, row -> the vertex kernel's output slot
     // per value
     uint32_t nvals;
     handle_info *handles;       // by local index: the resource a handle value stands for
@@ -528,6 +534,13 @@ static void read_signatures(tr *t) {
             const dxil_md *n = dxil_md_op(t->m, props, i + 1);
             for (int k = 0; k < 3; k++) t->out->threads[k] = (uint32_t)md_i(t, n, k, 1);
         }
+        if (tag == 1) {                                            // GSState: input primitive, max vertices, streams, topology, instances
+            const dxil_md *n = dxil_md_op(t->m, props, i + 1);
+            t->gs_inprim = (uint32_t)md_i(t, n, 0, 0);
+            t->gs_maxvert = (uint32_t)md_i(t, n, 1, 0);
+            t->gs_topology = (uint32_t)md_i(t, n, 3, 0);
+            t->gs_instances = (uint32_t)md_i(t, n, 4, 1);
+        }
     }
 }
 
@@ -910,7 +923,20 @@ static void call(tr *t, const dxil_inst *in) {
         if (kind == 2) { t->need_iid = 1; line(t, "%s = %s(vx_iid);", r, tn); return; }
         if (kind == 13) { t->need_front = 1; line(t, "%s = %s(vx_front);", r, tn); return; }
         if (kind == 12) { t->need_sample_id = 1; line(t, "%s = %s(vx_sample);", r, tn); return; }
+        if (kind == 10 && t->mode == 2) { line(t, "%s = %s(vx_tid.x);", r, tn); return; }
         if (kind == 10) { t->need_prim = 1; line(t, "%s = %s(vx_prim);", r, tn); return; }
+        if (t->mode == 2) {                                        // a vertex of the input primitive, from the vertex kernel
+            int okv;
+            uint32_t vertex = (uint32_t)const_int(t, in->ops[5], &okv);
+            int slot = id < 64 && row < 4 ? t->gs_slot[id][row] : -1;
+            if (slot < 0) { line(t, "%s = %s(0);", r, tn); return; }   // (not written by the vertex shader: undefined, zero)
+            char at[96];
+            if (okv) snprintf(at, sizeof at, "VXV(%u, %d)[%u]", vertex, slot, okc ? col : 0);
+            else { char v[96]; ref(t, in->ops[5], v, sizeof v); snprintf(at, sizeof at, "VXV(uint(%s), %d)[%u]", v, slot, okc ? col : 0); }
+            if (fp) line(t, "%s = %s(%s);", r, tn, at);
+            else line(t, "%s = %s(as_type<uint>(%s));", r, tn, at);
+            return;
+        }
         if (cols <= 1) line(t, "%s = %s(vx_in.i%u_%u);", r, tn, id, row);
         else line(t, "%s = %s(vx_in.i%u_%u[%u]);", r, tn, id, row, okc ? col : 0);
         return;
@@ -1599,6 +1625,20 @@ static void call(tr *t, const dxil_inst *in) {
         return;
     }
     case 96: t->need_lidx = 1; line(t, "%s = vx_lidx;", r); return;
+    case 97: case 98: case 99: {                                   // EmitStream, CutStream, EmitThenCutStream(stream)
+        if (t->mode != 2) { err(t, "a stream operation outside a geometry shader"); return; }
+        int ok;
+        if (const_int(t, in->ops[2], &ok) != 0 || !ok) { err(t, "geometry output to a stream other than 0"); return; }
+        if (op != 98) line(t, "VX_EMIT;");
+        if (op != 97) line(t, "VX_CUT;");
+        return;
+    }
+    case 100: line(t, "%s = 0u;", r); return;                     // GSInstanceID (one instance)
+    case 108:                                                      // PrimitiveID
+        if (t->mode == 2) { line(t, "%s = %s(vx_tid.x);", r, tn); return; }
+        t->need_prim = 1;
+        line(t, "%s = %s(vx_prim);", r, tn);
+        return;
     case 90:                                                       // SampleIndex
         if (t->out->stage != 0) { err(t, "SampleIndex outside a pixel shader"); return; }
         t->need_sample_id = 1;
@@ -2388,7 +2428,7 @@ static void ret_line(tr *t) {
         }
         if (!found) line(t, "vx_out.vx_sample_mask = 0x%08xu;", t->sample_mask);
     }
-    line(t, stage == 5 ? "return;" : "return vx_out;");
+    line(t, t->mode ? "VX_RETURN;" : stage == 5 ? "return;" : "return vx_out;");
 }
 
 // The state machine: every block a case of a switch in a loop.
@@ -2425,7 +2465,7 @@ static void emit_machine(tr *t) {
         t->indent--;
         line(t, "}");
     }
-    line(t, "default: %s", t->out->stage == 5 ? "return;" : "return vx_out;");
+    line(t, "default: %s", t->mode ? "VX_RETURN;" : t->out->stage == 5 ? "return;" : "return vx_out;");
     line(t, "}");
     t->indent--;
     line(t, "}");
@@ -2721,8 +2761,10 @@ static const char *interp(int mode, int is_int) {
     return "";
 }
 
+static void io_structs_kernel(tr *t, sb *s);
 static void io_structs(tr *t, sb *s) {
     int stage = t->out->stage;
+    if (t->mode == 2) { io_structs_kernel(t, s); return; }
     // inputs
     if (stage == 0 || stage == 1) {
         put(s, "struct VxIn {\n");
@@ -2774,7 +2816,8 @@ static void io_structs(tr *t, sb *s) {
                     x->index = (uint32_t)md_i(t, dxil_md_op(t->m, e, 4), r, r);
                     x->kind = (uint8_t)kind; x->comp = (uint8_t)comp; x->cols = (uint8_t)md_i(t, e, 7, 4);
                 }
-                if (stage == 1) {
+                if (stage == 1 && t->mode == 1) put(s, "    %s o%d_%d;\n", et, id, r);   // (a kernel's: no attributes)
+                else if (stage == 1) {
                     if (kind == 3) put(s, "    float4 o%d_%d [[position]];\n", id, r);
                     else if (kind == 4) put(s, "    uint o%d_%d [[render_target_array_index]];\n", id, r);
                     else if (kind == 5) put(s, "    uint o%d_%d [[viewport_array_index]];\n", id, r);
@@ -2791,11 +2834,47 @@ static void io_structs(tr *t, sb *s) {
             }
         }
         if (!any && stage == 0) put(s, "    float4 vx_unused [[color(0)]];\n");
-        if (!any && stage == 1) put(s, "    float4 vx_pos [[position]];\n");
+        if (!any && stage == 1) put(s, t->mode == 1 ? "    float4 vx_pos;\n" : "    float4 vx_pos [[position]];\n");
         if (stage == 0 && t->apply_sample_mask && !has_coverage)
             put(s, "    uint vx_sample_mask [[sample_mask]];\n");
         put(s, "};\n");
     }
+}
+
+// A geometry kernel's outputs: plain fields (no attributes), recorded in outputs[] in slot order.
+static void io_structs_kernel(tr *t, sb *s) {
+    put(s, "struct VxOut {\n");
+    int any = 0;
+    for (uint32_t i = 0; t->outsig && i < t->outsig->n; i++) {
+        const dxil_md *e = dxil_md_op(t->m, t->outsig, i);
+        int id = md_i(t, e, 0, 0), kind = md_i(t, e, 3, 0), rows = md_i(t, e, 6, 1), comp = md_i(t, e, 2, 9);
+        char et[32];
+        element_type(t, e, et, sizeof et);
+        for (int r = 0; r < rows; r++) {
+            if (t->out->noutputs < 32) {
+                dxil_msl_element *x = &t->out->outputs[t->out->noutputs++];
+                snprintf(x->name, sizeof x->name, "%s", md_str(t, e, 1));
+                x->index = (uint32_t)md_i(t, dxil_md_op(t->m, e, 4), r, r);
+                x->kind = (uint8_t)kind; x->comp = (uint8_t)comp; x->cols = (uint8_t)md_i(t, e, 7, 4);
+            }
+            put(s, "    %s o%d_%d;\n", et, id, r);
+            any = 1;
+        }
+    }
+    if (!any) put(s, "    float4 vx_pos;\n");
+    put(s, "};\n");
+}
+
+// One output row as a float4 of bits (what the vertex and geometry kernels write), and back.
+static void slot_store(tr *t, sb *s, const dxil_md *e, int id, int r) {
+    int comp = md_i(t, e, 2, 9), cols = md_i(t, e, 7, 4);
+    int is_float_comp = comp == 8 || comp == 9;
+    const char *v4 = is_float_comp ? "float4" : "uint4";
+    static const char *const pad[5] = { "", ", 0, 0, 0", ", 0, 0", ", 0", "" };
+    if (cols < 1) cols = 1;
+    if (cols > 4) cols = 4;
+    if (is_float_comp) put(s, "float4(float%s(vx_out.o%d_%d)%s)", cols == 1 ? "" : cols == 2 ? "2" : cols == 3 ? "3" : "4", id, r, pad[cols]);
+    else put(s, "as_type<float4>(%s(uint%s(vx_out.o%d_%d)%s))", v4, cols == 1 ? "" : cols == 2 ? "2" : cols == 3 ? "3" : "4", id, r, pad[cols]);
 }
 
 static const char *PRELUDE =
@@ -2825,12 +2904,14 @@ static const char *PRELUDE =
     "static inline ulong4 vx_ld64x4(device const VxDesc *h, uint off) { return ulong4(vx_ld64(h, off), vx_ld64(h, off + 8), vx_ld64(h, off + 16), vx_ld64(h, off + 24)); }\n"
     "static inline void vx_st64(device const VxDesc *h, uint off, ulong v) { vx_st(h, off, uint(v)); vx_st(h, off + 4, uint(v >> 32)); }\n";
 
-int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxil_msl *out) {
+static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const dxil_msl *vs, dxil_msl *out) {
     memset(out, 0, sizeof *out);
     out->stage = (int)m->shader_kind;
     tr t = { 0 };
     t.m = m;
     t.out = out;
+    t.mode = mode;
+    t.gs_from = vs;
     t.sample_mask = sample_mask;
     t.apply_sample_mask = sample_mask != UINT32_MAX;
     const dxil_function *f = NULL;
@@ -2842,7 +2923,10 @@ int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxi
     }
     if (!f) for (uint32_t i = 0; i < m->nfunctions; i++) if (!m->functions[i].is_declaration) { f = &m->functions[i]; break; }
     if (!f) { snprintf(out->error, sizeof out->error, "no function with a body"); return -1; }
-    if (out->stage != 0 && out->stage != 1 && out->stage != 5) { snprintf(out->error, sizeof out->error, "shader kind %d is not done yet", out->stage); return -1; }
+    if (mode == 1 && out->stage != 1) { snprintf(out->error, sizeof out->error, "not a vertex shader"); return -1; }
+    if (mode == 2 && out->stage != 2) { snprintf(out->error, sizeof out->error, "not a geometry shader"); return -1; }
+    if (out->stage == 2 && mode != 2) { snprintf(out->error, sizeof out->error, "a geometry shader needs its vertex shader (geometry pipeline)"); return -1; }
+    if (out->stage != 0 && out->stage != 1 && out->stage != 2 && out->stage != 5) { snprintf(out->error, sizeof out->error, "shader kind %d is not done yet", out->stage); return -1; }
     t.f = f;
     t.nvals = f->nlocals;
     t.handles = calloc(t.nvals + 1, sizeof *t.handles);
@@ -2852,6 +2936,25 @@ int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxi
     read_resources(&t);
     analyze_uav_accesses(&t);
     read_signatures(&t);
+    if (mode == 2) {
+        // D3D_PRIMITIVE: 1 point, 2 line, 3 triangle, 6 line with adjacency, 7 triangle with adjacency
+        out->gs_in_verts = t.gs_inprim == 1 ? 1 : t.gs_inprim == 2 ? 2 : t.gs_inprim == 3 ? 3 : t.gs_inprim == 6 ? 4 : t.gs_inprim == 7 ? 6 : 0;
+        out->gs_max_tris = t.gs_maxvert > 2 ? t.gs_maxvert - 2 : 0;
+        const char *why = !out->gs_in_verts ? "its input primitive" : t.gs_topology != 5 ? "an output other than triangle strips" :
+                          !out->gs_max_tris ? "no triangles" : t.gs_instances > 1 ? "instancing" : NULL;
+        if (why) { snprintf(out->error, sizeof out->error, "geometry shader with %s is not done yet", why); goto done; }
+        // its inputs: the vertex kernel's output slots of the same semantic
+        memset(t.gs_slot, 0xff, sizeof t.gs_slot);
+        for (uint32_t i = 0; t.insig && i < t.insig->n; i++) {
+            const dxil_md *e = dxil_md_op(m, t.insig, i);
+            int id = md_i(&t, e, 0, 0), rows = md_i(&t, e, 6, 1);
+            for (int r = 0; r < rows && r < 4 && id < 64; r++) {
+                uint32_t index = (uint32_t)md_i(&t, dxil_md_op(m, e, 4), r, r);
+                for (uint32_t k = 0; vs && k < vs->noutputs; k++)
+                    if (!strcasecmp(vs->outputs[k].name, md_str(&t, e, 1)) && vs->outputs[k].index == index) { t.gs_slot[id][r] = (int16_t)k; break; }
+            }
+        }
+    }
     // blocks
     t.nb = f->nblocks ? f->nblocks : 1;
     t.term = calloc(t.nb, sizeof *t.term);
@@ -2899,7 +3002,44 @@ int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxi
         put(&file, "%s", gl.s ? gl.s : "");
         put(&file, "%s", io.s ? io.s : "");
         int stage = out->stage;
-        if (stage == 5) {
+        if (mode == 1) {
+            int n = (int)out->noutputs;
+            out->io_slots = n ? (uint32_t)n : 1;
+            put(&file, "#define VX_RETURN do { device float4 *vx_o = vx_vs_out + (vx_tid.y * vx_vp[0].x + vx_tid.x) * %u;", out->io_slots);
+            uint32_t slot = 0;
+            for (uint32_t i = 0; t.outsig && i < t.outsig->n; i++) {
+                const dxil_md *e = dxil_md_op(m, t.outsig, i);
+                int id = md_i(&t, e, 0, 0), rows = md_i(&t, e, 6, 1);
+                for (int r = 0; r < rows; r++) { put(&file, " vx_o[%u] = ", slot++); slot_store(&t, &file, e, id, r); put(&file, ";"); }
+            }
+            put(&file, " return; } while (0)\n");
+            put(&file, "kernel void vx_main(%suint2 vx_tid [[thread_position_in_grid]], device float4 *vx_vs_out [[buffer(%d)]], "
+                       "constant uint4 *vx_vp [[buffer(%d)]], const device uchar *vx_ib [[buffer(%d)]], constant VxRoot &vx_root [[buffer(0)]]",
+                out->ninputs ? "VxIn vx_in [[stage_in]], " : "", DXIL_GS_OUT, DXIL_VS_PARAMS, DXIL_GS_INDEX);
+        } else if (mode == 2) {
+            int n = (int)out->noutputs;
+            out->io_slots = n ? (uint32_t)n : 1;
+            put(&file, "#define NOUT %u\n#define MAXTRI %u\n", out->io_slots, out->gs_max_tris);
+            put(&file, "#define VXV(k, r) vx_gs_in[(vx_first + (k)) * vx_gp[0].w + (r)]\n");
+            put(&file, "#define VX_EMIT do { float4 vx_c[NOUT] = {");
+            uint32_t slot = 0;
+            for (uint32_t i = 0; t.outsig && i < t.outsig->n; i++) {
+                const dxil_md *e = dxil_md_op(m, t.outsig, i);
+                int id = md_i(&t, e, 0, 0), rows = md_i(&t, e, 6, 1);
+                for (int r = 0; r < rows; r++) { put(&file, "%s ", slot++ ? "," : ""); slot_store(&t, &file, e, id, r); }
+            }
+            if (!slot) put(&file, " float4(0)");
+            put(&file, " }; \\\n    if (vx_n >= 2 && vx_tri < MAXTRI) { device float4 *vx_t = vx_dst + vx_tri * 3 * NOUT; bool vx_odd = (vx_n & 1) != 0; \\\n"
+                       "        for (int vx_k = 0; vx_k < NOUT; vx_k++) { vx_t[vx_k] = vx_odd ? vx_s2[vx_k] : vx_s1[vx_k]; vx_t[NOUT + vx_k] = vx_odd ? vx_s1[vx_k] : vx_s2[vx_k]; vx_t[2 * NOUT + vx_k] = vx_c[vx_k]; } \\\n"
+                       "        vx_tri++; } \\\n"
+                       "    for (int vx_k = 0; vx_k < NOUT; vx_k++) { vx_s1[vx_k] = vx_s2[vx_k]; vx_s2[vx_k] = vx_c[vx_k]; } \\\n"
+                       "    vx_n++; } while (0)\n");
+            put(&file, "#define VX_CUT vx_n = 0\n");
+            put(&file, "#define VX_RETURN do { vx_counts[vx_tid.y * vx_gp[0].x + vx_tid.x] = vx_tri; return; } while (0)\n");
+            put(&file, "kernel void vx_main(uint2 vx_tid [[thread_position_in_grid]], const device float4 *vx_gs_in [[buffer(%d)]], "
+                       "device float4 *vx_gs_out [[buffer(%d)]], constant uint4 *vx_gp [[buffer(%d)]], device uint *vx_counts [[buffer(%d)]], "
+                       "constant VxRoot &vx_root [[buffer(0)]]", DXIL_GS_IN, DXIL_GS_OUT, DXIL_GS_PARAMS, DXIL_GS_COUNTS);
+        } else if (stage == 5) {
             put(&file, "kernel void vx_main(constant VxRoot &vx_root [[buffer(0)]]");
             if (t.need_tid) put(&file, ", uint3 vx_tid [[thread_position_in_grid]]");
             if (t.need_gid) put(&file, ", uint3 vx_gid [[threadgroup_position_in_grid]]");
@@ -2921,24 +3061,86 @@ int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxi
         put(&file, ") {\n");
         if (stage != 5) put(&file, "    VxOut vx_out = {};\n");
         if (stage == 1 && !out->ninputs) put(&file, "    VxIn vx_in = {}; (void)vx_in;\n");
-        if (t.need_iid) put(&file, "    uint vx_iid = vx_iid0 - vx_base_instance;   // (D3D's SV_InstanceID leaves out StartInstanceLocation)\n");
+        if (mode == 1) {
+            put(&file, "    if (vx_tid.x >= vx_vp[0].x) return;\n");
+            put(&file, "    uint vx_vid = vx_vp[1].x == 2 ? reinterpret_cast<const device uint *>(vx_ib)[vx_vp[1].y + vx_tid.x] + vx_vp[1].z :\n"
+                       "                  vx_vp[1].x == 1 ? uint(reinterpret_cast<const device ushort *>(vx_ib)[vx_vp[1].y + vx_tid.x]) + vx_vp[1].z : vx_vp[0].y + vx_tid.x;\n");
+            put(&file, "    uint vx_iid = vx_tid.y; (void)vx_vid; (void)vx_iid;\n");
+        } else if (mode == 2) {
+            put(&file, "    if (vx_tid.x >= vx_gp[0].x) return;\n");
+            put(&file, "    uint vx_first = vx_tid.x * vx_gp[0].y + vx_tid.y * vx_gp[0].z;\n");
+            put(&file, "    device float4 *vx_dst = vx_gs_out + (vx_tid.y * vx_gp[0].x + vx_tid.x) * (MAXTRI * 3 * NOUT);\n");
+            put(&file, "    float4 vx_s1[NOUT], vx_s2[NOUT];\n    uint vx_n = 0, vx_tri = 0;\n");
+        } else if (t.need_iid) put(&file, "    uint vx_iid = vx_iid0 - vx_base_instance;   // (D3D's SV_InstanceID leaves out StartInstanceLocation)\n");
         put(&file, "%s", glocal.s ? glocal.s : "");
         put(&file, "%s", t.decls.s ? t.decls.s : "");
         put(&file, "%s", t.body.s ? t.body.s : "");
         put(&file, "}\n");
         out->msl = file.s;
         free(io.s); free(gl.s); free(glocal.s);
+        if (mode == 2) {
+            // the pass-through vertex function: vertex v of the triangles is NOUT float4s; a triangle past the count
+            // its primitive made is degenerate (zero: clipped)
+            sb pt = { 0 };
+            put(&pt, "#include <metal_stdlib>\nusing namespace metal;\nstruct VxOut {\n");
+            sb fill = { 0 };
+            uint32_t slot = 0;
+            for (uint32_t i = 0; t.outsig && i < t.outsig->n && !t.failed; i++) {
+                const dxil_md *e = dxil_md_op(m, t.outsig, i);
+                int id = md_i(&t, e, 0, 0), kind = md_i(&t, e, 3, 0), rows = md_i(&t, e, 6, 1), comp = md_i(&t, e, 2, 9), cols = md_i(&t, e, 7, 4);
+                char et[32];
+                element_type(&t, e, et, sizeof et);
+                static const char *const sw[5] = { ".x", ".x", ".xy", ".xyz", "" };
+                for (int r = 0; r < rows; r++, slot++) {
+                    char sem[64];
+                    semantic_attr(&t, e, (uint32_t)r, sem, sizeof sem);
+                    if (kind == 3) put(&pt, "    float4 o%d_%d [[position]];\n", id, r);
+                    else if (kind == 4) put(&pt, "    uint o%d_%d [[render_target_array_index]];\n", id, r);
+                    else if (kind == 5) put(&pt, "    uint o%d_%d [[viewport_array_index]];\n", id, r);
+                    else if (kind == 6 || kind == 7) { snprintf(out->error, sizeof out->error, "geometry clip or cull distances are not done yet"); t.failed = 1; break; }
+                    else put(&pt, "    %s o%d_%d [[user(%s)]];\n", et, id, r, sem);
+                    int f = comp == 8 || comp == 9;
+                    const char *x = sw[cols < 1 ? 1 : cols > 4 ? 4 : cols];
+                    if (kind == 4 || kind == 5) put(&fill, "        o.o%d_%d = as_type<uint4>(p[%u]).x;\n", id, r, slot);
+                    else if (f) put(&fill, "        o.o%d_%d = %s(p[%u]%s);\n", id, r, et, slot, x);
+                    else put(&fill, "        o.o%d_%d = %s(as_type<uint4>(p[%u])%s);\n", id, r, et, slot, x);
+                }
+            }
+            put(&pt, "%s};\n", slot ? "" : "    float4 vx_pos [[position]];\n");
+            put(&pt, "vertex VxOut vx_main(uint vx_vid [[vertex_id]], const device float4 *vx_v [[buffer(0)]], const device uint *vx_counts [[buffer(1)]]) {\n"
+                     "    VxOut o = {};\n    if ((vx_vid / 3) %% %u < vx_counts[vx_vid / %u]) {\n        const device float4 *p = vx_v + vx_vid * %u;\n%s    }\n    return o;\n}\n",
+                out->gs_max_tris, 3 * out->gs_max_tris, out->io_slots, fill.s ? fill.s : "");
+            free(fill.s);
+            out->msl_passthrough = pt.s;
+        }
     }
 done:
     free(t.body.s); free(t.decls.s); free(t.prelude.s); free(t.types.s);
     free(t.handles); free(t.is_handle); free(t.ptr_space); free(t.declared_types);
     free(t.term); free(t.first); free(t.idom); free(t.ipdom); free(t.rpo_index); free(t.loop_header_of); free(t.loop_exit); free(t.emitted); free(t.loops);
-    if (t.failed || !out->msl) { if (!out->error[0]) snprintf(out->error, sizeof out->error, "translation failed"); free(out->msl); out->msl = NULL; return -1; }
+    if (t.failed || !out->msl || (mode == 2 && !out->msl_passthrough)) {
+        if (!out->error[0]) snprintf(out->error, sizeof out->error, "translation failed");
+        free(out->msl); out->msl = NULL;
+        free(out->msl_passthrough); out->msl_passthrough = NULL;
+        return -1;
+    }
     return 0;
 }
 
+int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxil_msl *out) {
+    return translate(m, sample_mask, 0, NULL, out);
+}
 int dxil_to_msl(const dxil_module *m, dxil_msl *out) {
-    return dxil_to_msl_with_sample_mask(m, UINT32_MAX, out);
+    return translate(m, UINT32_MAX, 0, NULL, out);
+}
+int dxil_to_msl_vertex_kernel(const dxil_module *m, dxil_msl *out) {
+    return translate(m, UINT32_MAX, 1, NULL, out);
+}
+int dxil_to_msl_geometry(const dxil_module *m, const dxil_msl *vs, dxil_msl *out) {
+    return translate(m, UINT32_MAX, 2, vs, out);
 }
 
-void dxil_msl_free(dxil_msl *out) { free(out->msl); out->msl = NULL; }
+void dxil_msl_free(dxil_msl *out) {
+    free(out->msl); out->msl = NULL;
+    free(out->msl_passthrough); out->msl_passthrough = NULL;
+}

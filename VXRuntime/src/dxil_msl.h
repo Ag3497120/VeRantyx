@@ -62,7 +62,23 @@ typedef struct {
     int structured;          // 1: the control flow came out as if/else and loops; 0: as a state machine
     char *msl;               // the source, entry point "vx_main"
     char error[256];
+    // Geometry pipelines (Metal has no geometry stage; d3d12.m draws them as in the DXBC path): the vertex shader as
+    // a kernel writing each vertex's outputs (one float4 of bits per output row, in outputs[] order) and the geometry
+    // shader as a kernel turning its triangle strips into triangles, drawn by msl_passthrough.
+    char *msl_passthrough;   // geometry: the vertex function drawing the kernel's triangles
+    uint32_t io_slots;       // vertex kernel / geometry kernel: float4s written per vertex
+    uint32_t gs_in_verts, gs_max_tris;
 } dxil_msl;
+
+// Buffer indices of the geometry kernels, the same as the DXBC path's (dxbc.h DXBC_GS_*).
+enum { DXIL_GS_COUNTS = 26, DXIL_GS_INDEX = 27, DXIL_GS_PARAMS = 27, DXIL_VS_PARAMS = 28, DXIL_GS_IN = 28, DXIL_GS_OUT = 29 };
+// The vertex shader as a kernel (msl): thread (x, y) is vertex x of instance y; stage-input attributes as the vertex
+// function's, outputs to buffer DXIL_GS_OUT. vp[0]: vertices, first vertex, base instance; vp[1]: indices (0 none,
+// 1 16-bit, 2 32-bit), first index, base vertex (the index buffer at DXIL_GS_INDEX).
+int dxil_to_msl_vertex_kernel(const dxil_module *m, dxil_msl *out);
+// A geometry shader (triangle-strip output) as a kernel (msl) whose inputs are the vertex kernel `vs` wrote, matched
+// by semantic, and its pass-through vertex function (msl_passthrough).
+int dxil_to_msl_geometry(const dxil_module *m, const dxil_msl *vs, dxil_msl *out);
 
 int dxil_to_msl(const dxil_module *m, dxil_msl *out);
 // Apply the D3D12 PSO's static sample mask to fragment coverage. UINT32_MAX is a no-op.
