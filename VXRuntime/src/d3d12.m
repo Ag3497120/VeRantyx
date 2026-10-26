@@ -10431,9 +10431,19 @@ static WINAPI void queue_execute(void *this, uint32_t n, void *const *lists) {
         int state_result = queue_validate_list_states12(d, q->desc.Type, q->mtl_queue, l,
             NULL, 0, &shadows, &state_count);
         if (state_result != 1) {
-            if (state_result < 0) vx_log("D3D12: could not allocate resource-state validation data; skipping command list");
-            else vx_log("D3D12: command list has an invalid transition or resource-use state; skipping it");
-            continue;
+            // VXRT_D3D12_LENIENT_STATES=1: run such a list anyway, as Windows does without its debug layer (Metal tracks
+            // the hazards itself); its transitions are then not recorded.
+            static int lenient = -1, told;
+            if (lenient < 0) lenient = getenv("VXRT_D3D12_LENIENT_STATES") != NULL;
+            if (state_result == 0 && lenient) {
+                if (told++ % 1000 == 0) vx_log("D3D12: command list has an invalid transition or resource-use state; run anyway (%d so far)", told);
+                shadows = NULL;
+                state_count = 0;
+            } else {
+                if (state_result < 0) vx_log("D3D12: could not allocate resource-state validation data; skipping command list");
+                else vx_log("D3D12: command list has an invalid transition or resource-use state; skipping it");
+                continue;
+            }
         }
         if (state_count > UINT32_MAX - batch_touched_count ||
             !queue_batch_touched_reserve12(&batch_touched, &batch_touched_capacity,
