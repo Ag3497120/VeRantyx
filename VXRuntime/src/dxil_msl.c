@@ -40,6 +40,9 @@ typedef struct {
     // what the body needed
     int need_lane, need_lanes, need_vid, need_iid, need_front, need_sample_id, need_prim, need_tid, need_gid, need_ltid, need_lidx;
     int need_coverage;
+    // Minimum precision (min16float without -enable-16bit-types): DXIL's half values are kept as float, as desktop
+    // GPUs keep them, so that a shader tested there gets its 32-bit results; native 16-bit types stay half.
+    int native16;
     // geometry pipelines: 0 a stage function, 1 the vertex shader as a kernel, 2 a geometry shader as a kernel
     int mode;
     const dxil_msl *gs_from;    // (mode 2) the vertex kernel whose outputs are the inputs
@@ -172,7 +175,7 @@ static void type_name(tr *t, uint32_t id, char *out, size_t cap) {
     if (!y) { snprintf(out, cap, "uint"); return; }
     switch (y->kind) {
     case DXT_VOID: snprintf(out, cap, "void"); return;
-    case DXT_HALF: snprintf(out, cap, "half"); return;
+    case DXT_HALF: snprintf(out, cap, t->native16 ? "half" : "float"); return;
     case DXT_FLOAT: snprintf(out, cap, "float"); return;
     case DXT_DOUBLE: snprintf(out, cap, "float"); return;      // (Metal has no double: float, as the GPU would do)
     case DXT_INT:
@@ -257,7 +260,7 @@ static void ref(tr *t, uint32_t id, char *out, size_t cap) {
     }
     case DXV_CONST_FLOAT: {
         const dxil_type *y = ty(t, v->type);
-        float_literal(v->u.f, y && y->kind == DXT_HALF, out, cap);
+        float_literal(v->u.f, y && y->kind == DXT_HALF && t->native16, out, cap);
         return;
     }
     case DXV_CONST_NULL: case DXV_CONST_UNDEF: {
@@ -530,6 +533,10 @@ static void read_signatures(tr *t) {
     for (uint32_t i = 0; props && i + 1 < props->n; i += 2) {
         int64_t tag;
         if (!dxil_md_int(t->m, dxil_md_op(t->m, props, i), &tag)) continue;
+        if (tag == 0) {                                            // ShaderFlags: 0x800000 UseNativeLowPrecision
+            int64_t flags = 0;
+            if (dxil_md_int(t->m, dxil_md_op(t->m, props, i + 1), &flags)) t->native16 = (flags & 0x800000) != 0;
+        }
         if (tag == 4) {                                            // NumThreads
             const dxil_md *n = dxil_md_op(t->m, props, i + 1);
             for (int k = 0; k < 3; k++) t->out->threads[k] = (uint32_t)md_i(t, n, k, 1);
@@ -548,7 +555,7 @@ static void read_signatures(tr *t) {
 static void element_type(tr *t, const dxil_md *e, char *out, size_t cap) {
     int comp = md_i(t, e, 2, 9), cols = md_i(t, e, 7, 4);
     const char *base = comp == 1 ? "bool" : comp == 2 ? "short" : comp == 3 ? "ushort" : comp == 4 ? "int" : comp == 5 ? "uint"
-                     : comp == 8 ? "half" : "float";
+                     : comp == 8 && t->native16 ? "half" : "float";
     if (cols <= 1) snprintf(out, cap, "%s", base);
     else snprintf(out, cap, "%s%d", base, cols);
 }
@@ -1054,7 +1061,8 @@ static void call(tr *t, const dxil_inst *in) {
     }
     case 59: {                                                     // CBufferLoadLegacy(handle, row)
         const dxil_type *y = ty(t, in->type);
-        int f32 = y && y->count && is_float(t, y->members[0]) && ty(t, y->members[0])->kind == DXT_FLOAT;
+        // (CBufRet.f32, and CBufRet.f16 of a minimum-precision shader: four 32-bit floats a row, each made half)
+        int f32 = y && y->count == 4 && is_float(t, y->members[0]);
         int h16 = y && y->count == 8;
         int w64 = y && y->count == 2 && int_bits(t, y->members[0]) == 64;
         if (h16 || w64) {
@@ -2933,9 +2941,9 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
     t.is_handle = calloc(t.nvals + 1, 1);
     t.ptr_space = calloc(t.nvals + 1, 1);
     t.declared_types = calloc(m->ntypes + 1, 1);
+    read_signatures(&t);                                           // (first: the shader flags decide type names)
     read_resources(&t);
     analyze_uav_accesses(&t);
-    read_signatures(&t);
     if (mode == 2) {
         // D3D_PRIMITIVE: 1 point, 2 line, 3 triangle, 6 line with adjacency, 7 triangle with adjacency
         out->gs_in_verts = t.gs_inprim == 1 ? 1 : t.gs_inprim == 2 ? 2 : t.gs_inprim == 3 ? 3 : t.gs_inprim == 6 ? 4 : t.gs_inprim == 7 ? 6 : 0;
