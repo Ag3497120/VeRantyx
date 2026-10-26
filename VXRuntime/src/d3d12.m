@@ -3020,8 +3020,21 @@ static WINAPI HRESULT fence_query(void *this, const GUID *iid, void **out) {
 }
 static WINAPI uint64_t fence_completed(void *this) { return ((fence12 *)this)->event.signaledValue; }
 static WINAPI HRESULT fence_signal(void *this, uint64_t v) { ((fence12 *)this)->event.signaledValue = v; return S_OK; }
+// VXRT_D3D12_TRACE_FENCES=1: a wait (the program's on the CPU, or a queue's on the GPU) still short of its value 5 s
+// later is logged, with the value the fence has: what a program stops at when the GPU never gets there.
+static int trace_fences12(void) { static int on = -1; if (on < 0) on = getenv("VXRT_D3D12_TRACE_FENCES") != NULL; return on; }
+static void fence_watch12(fence12 *f, uint64_t value, const char *who, void *queue) {
+    if (!trace_fences12() || f->event.signaledValue >= value) return;
+    id<MTLSharedEvent> ev = f->event;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        uint64_t now = ev.signaledValue;
+        if (now < value) vx_log("D3D12: fence %p: %s%s%p waits for %llu, 5 s later it is at %llu", (void *)f, who, queue ? " " : "",
+                                queue, (unsigned long long)value, (unsigned long long)now);
+    });
+}
 static WINAPI HRESULT fence_set_event(void *this, uint64_t value, HANDLE h) {
     fence12 *f = this;
+    fence_watch12(f, value, h ? "the program (event)" : "the program (blocking)", NULL);
     if (f->event.signaledValue >= value) { if (h) vx_set_event(h); return S_OK; }
     if (!h) {                                                      // (no event: wait here)
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -4246,6 +4259,18 @@ static int list_record_gpu_texture_copy(list12 *list, res12 *dst, const COPY_LOC
         depth = src_location->footprint.depth;
     }
     if (!width || !height || !depth) return 1;
+    // A block-compressed region at a mip's edge is given in whole blocks (a 2x2 mip copied as one 4x4 block, a
+    // 4-texel-wide footprint row): it ends at the mip's edge, as Metal wants it.
+    const gpu_ir_texture_desc *edges[2] = { dst_texture ? gpu_ir_texture_description(ir_dst) : NULL,
+                                            src_texture ? gpu_ir_texture_description(ir_src) : NULL };
+    const gpu_ir_texture_location *at[2] = { &dst_loc, &src_loc };
+    for (int k = 0; k < 2; k++) {
+        const gpu_ir_texture_desc *t = edges[k];
+        if (!t || t->block_width <= 1) continue;
+        uint32_t mw = gpu_ir_mip_extent(t->width, at[k]->mip_level), mh = gpu_ir_mip_extent(t->height, at[k]->mip_level);
+        if (at[k]->origin_x < mw && at[k]->origin_x + width > mw && at[k]->origin_x + width - mw < t->block_width) width = mw - at[k]->origin_x;
+        if (at[k]->origin_y < mh && at[k]->origin_y + height > mh && at[k]->origin_y + height - mh < t->block_height) height = mh - at[k]->origin_y;
+    }
 
     uint32_t index = GPU_IR_NO_COMMAND;
     int rc = gpu_ir_record_copy_texture(&list->gpu_ir, ir_src, &src_loc, ir_dst, &dst_loc,
@@ -7847,6 +7872,12 @@ typedef struct {
     queryheap12 *pass_heap;          // the open pass's heap (NULL: it counts nothing)
     id<MTLBuffer> pass_vis;
     uint32_t npass, pass_q[64];      // the queries the open pass counted: index | 1 << 30 begun in it | 1 << 31 binary
+    // The last draw's resource accesses and what they were collected from: a draw with the same pipeline, root
+    // tables and descriptors, heaps, vertex/index buffers and targets reuses them (collecting them was most of the
+    // replay's time in a game: thousands of draws a frame with the same bindings).
+    uint64_t access_key;
+    gpu_ir_access_list12 access_cache;
+    int access_cached;
 } gfx_state;
 
 static int gpu_ir_collect_draw_accesses12(dev12 *device, pso12 *pipeline, gfx_state *graphics,
@@ -7893,6 +7924,36 @@ static int gpu_ir_collect_draw_accesses12(dev12 *device, pso12 *pipeline, gfx_st
         if (rc != GPU_IR_OK) return rc;
     }
     return GPU_IR_OK;
+}
+
+static int gpu_ir_access_list_copy12(const gpu_ir_access_list12 *from, gpu_ir_access_list12 *to) {
+    memset(to, 0, sizeof *to);
+    if (!from->count) return GPU_IR_OK;
+    to->values = malloc(from->count * sizeof *to->values);
+    if (!to->values) return GPU_IR_INVALID;
+    memcpy(to->values, from->values, from->count * sizeof *to->values);
+    for (uint32_t i = 0; i < from->count; i++) gpu_ir_resource_retain(to->values[i].resource);
+    to->count = to->capacity = from->count;
+    return GPU_IR_OK;
+}
+static int gpu_ir_collect_draw_accesses_cached12(dev12 *device, pso12 *pipeline, gfx_state *graphics,
+                                                 root_binding *root, heap12 *resource_heap, heap12 *sampler_heap,
+                                                 gpu_ir_access_list12 *list, int indexed) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    const void *ptrs[5] = { pipeline, root ? root->rs : NULL, resource_heap, sampler_heap, (void *)(intptr_t)indexed };
+    h = fnv1a12(h, ptrs, sizeof ptrs);
+    if (root) { h = fnv1a12(h, root->st.table, sizeof root->st.table); h = fnv1a12(h, root->st.root_va, sizeof root->st.root_va); }
+    h = fnv1a12(h, graphics->vb, sizeof graphics->vb);
+    if (indexed) h = fnv1a12(h, &graphics->ib, sizeof graphics->ib);
+    h = fnv1a12(h, graphics->resource, sizeof graphics->resource);
+    if (graphics->access_cached && graphics->access_key == h) return gpu_ir_access_list_copy12(&graphics->access_cache, list);
+    int rc = gpu_ir_collect_draw_accesses12(device, pipeline, graphics, root, resource_heap, sampler_heap, list, indexed);
+    if (graphics->access_cached) { gpu_ir_access_list_release12(&graphics->access_cache); graphics->access_cached = 0; }
+    if (rc == GPU_IR_OK && gpu_ir_access_list_copy12(list, &graphics->access_cache) == GPU_IR_OK) {
+        graphics->access_key = h;
+        graphics->access_cached = 1;
+    }
+    return rc;
 }
 
 static void pass_query(gfx_state *g) {
@@ -7994,8 +8055,10 @@ static int open_render_pass12(dev12 *device, gfx_state *g, id<MTLCommandBuffer> 
         if (!width) { width = (uint32_t)texture.width; height = (uint32_t)texture.height; }
     }
     if (!width && g->nvp) {
-        descriptor.renderTargetWidth = (NSUInteger)(g->vp[0].x + g->vp[0].w);
-        descriptor.renderTargetHeight = (NSUInteger)(g->vp[0].y + g->vp[0].h);
+        // (from the viewport: kept within Metal's 16384 and at least 1)
+        float rw = g->vp[0].x + g->vp[0].w, rh = g->vp[0].y + g->vp[0].h;
+        descriptor.renderTargetWidth = (NSUInteger)(rw >= 1 ? (rw <= 16384 ? rw : 16384) : 1);
+        descriptor.renderTargetHeight = (NSUInteger)(rh >= 1 ? (rh <= 16384 ? rh : 16384) : 1);
         descriptor.defaultRasterSampleCount = 1;
     }
     if (g->occ) {
@@ -9474,7 +9537,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
     gfx_state *g = calloc(1, sizeof *g);
     if (!compute || !graphics || !g) {
         vx_log("D3D12: could not allocate command-list replay state");
-        free(commands); free(compute); free(graphics); free(g);
+        if (g->access_cached) gpu_ir_access_list_release12(&g->access_cache); free(commands); free(compute); free(graphics); free(g);
         return 0;
     }
     g->prim = MTLPrimitiveTypeTriangle;
@@ -9691,7 +9754,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             }
             gpu_ir_access_list12 accesses = { 0 };
             pthread_mutex_lock(&d->lock);
-            int access_rc = gpu_ir_collect_draw_accesses12(d, pso, g, graphics, heap, sheap, &accesses, draw.indexed);
+            int access_rc = gpu_ir_collect_draw_accesses_cached12(d, pso, g, graphics, heap, sheap, &accesses, draw.indexed);
             pthread_mutex_unlock(&d->lock);
             int rc;
             if (access_rc == GPU_IR_OK) {
@@ -10089,7 +10152,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
     if (replay_failed) {
         close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
         free(indirect_overrides);
-        free(commands); free(compute); free(graphics); free(g);
+        if (g->access_cached) gpu_ir_access_list_release12(&g->access_cache); free(commands); free(compute); free(graphics); free(g);
         *command_buffer = cb;
         return 0;
     }
@@ -10098,6 +10161,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
     free(commands);
     free(compute);
     free(graphics);
+    if (g->access_cached) gpu_ir_access_list_release12(&g->access_cache);
     free(g);
     *command_buffer = cb;
     return 1;
@@ -10858,6 +10922,11 @@ static WINAPI HRESULT queue_signal(void *this, void *fence, uint64_t v) {
         return E_FAIL;
     }
     [cb encodeSignalEvent:fence_object->event value:v];
+    if (trace_fences12()) {
+        static volatile int n;
+        if (__sync_add_and_fetch(&n, 1) <= 40) vx_log("D3D12: queue %p (type %d) signals fence %p = %llu (now %llu)", (void *)q, (int)q->desc.Type,
+                                                      fence, (unsigned long long)v, (unsigned long long)fence_object->event.signaledValue);
+    }
     [cb commit];
     pthread_mutex_unlock(&q->dev->submit_lock);
     return S_OK;
@@ -10873,6 +10942,7 @@ static WINAPI HRESULT queue_wait(void *this, void *fence, uint64_t v) {
         pthread_mutex_unlock(&q->dev->submit_lock);
         return E_FAIL;
     }
+    fence_watch12(fence_object, v, "queue", q);
     [cb encodeWaitForEvent:fence_object->event value:v];
     [cb commit];
     pthread_mutex_unlock(&q->dev->submit_lock);

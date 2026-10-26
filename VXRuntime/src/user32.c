@@ -449,8 +449,21 @@ static WINAPI BOOL GetMessageA(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max
 }
 static WINAPI BOOL GetMessageW(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max) { return GetMessageA(out, hwnd, min, max); }
 #define PM_REMOVE 1
+static int trace_focus(void);
 static WINAPI BOOL PeekMessageA(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max, uint32_t flags) {
-    return fetch(out, hwnd, min, max, flags & PM_REMOVE, 0);
+    // PM_QS_SENDMESSAGE alone (0x400000: messages another thread sent, waiting for an answer) asks for none of the
+    // posted, input, paint or timer messages; here sends are made directly, so nothing waits. (Cyberpunk 2077 polls
+    // so between frames: answering with its pending WM_PAINT, not removed, kept its game thread in that loop.)
+    uint32_t qs = flags >> 16;
+    if (qs && !(qs & ~0x40u)) return 0;
+    BOOL r = fetch(out, hwnd, min, max, flags & PM_REMOVE, 0);
+    if (trace_focus() && r) {                                      // (which messages a busy message loop keeps getting)
+        static volatile int n;
+        int k = __sync_add_and_fetch(&n, 1);
+        if (k % 20000 == 0) vx_log("input: PeekMessage #%d: message %#x to %p (filter %#x-%#x, flags %#x)", k, out ? out->message : 0,
+                                   out ? out->hwnd : NULL, min, max, flags);
+    }
+    return r;
 }
 static WINAPI BOOL PeekMessageW(MSG *out, HANDLE hwnd, uint32_t min, uint32_t max, uint32_t flags) { return PeekMessageA(out, hwnd, min, max, flags); }
 static WINAPI BOOL WaitMessage(void) {
@@ -918,9 +931,10 @@ void vx_char_event(vx_window *w, const uint16_t *chars, int n) {
     for (int i = 0; i < n; i++) vx_window_post(target, WM_CHAR, chars[i], 1);
 }
 
-static WINAPI int16_t GetKeyState(int vk) { uint8_t k = thread_keys()[vk & 0xff]; return (int16_t)((k & 0x80 ? 0x8000 : 0) | (k & 0x01)); }
-static WINAPI int16_t GetAsyncKeyState(int vk) { return (int16_t)(g_keys[vk & 0xff] & 0x80 ? 0x8000 : 0); }
-static WINAPI BOOL GetKeyboardState(uint8_t *keys) { if (!keys) { vx_set_last_error(87); return 0; } memcpy(keys, thread_keys(), 256); return 1; }
+#define TRACE_KEYS(name) if (trace_focus()) { static volatile int n; int c = __sync_add_and_fetch(&n, 1); if (c <= 5 || c % 20000 == 0) vx_log("input: %s(%#x) #%d", name, vk, c); }
+static WINAPI int16_t GetKeyState(int vk) { TRACE_KEYS("GetKeyState") uint8_t k = thread_keys()[vk & 0xff]; return (int16_t)((k & 0x80 ? 0x8000 : 0) | (k & 0x01)); }
+static WINAPI int16_t GetAsyncKeyState(int vk) { TRACE_KEYS("GetAsyncKeyState") return (int16_t)(g_keys[vk & 0xff] & 0x80 ? 0x8000 : 0); }
+static WINAPI BOOL GetKeyboardState(uint8_t *keys) { int vk = 0; TRACE_KEYS("GetKeyboardState") if (!keys) { vx_set_last_error(87); return 0; } memcpy(keys, thread_keys(), 256); return 1; }
 // SetKeyboardState: the calling thread's table only, not the keyboard's state (GetAsyncKeyState) or other threads'.
 static WINAPI BOOL SetKeyboardState(const uint8_t *keys) { if (!keys) { vx_set_last_error(87); return 0; } memcpy(thread_keys(), keys, 256); return 1; }
 // MapVirtualKey: 0 VK->scan, 1 scan->VK, 2 VK->char, 3 scan->VK (left/right distinguished).
@@ -1054,6 +1068,7 @@ static WINAPI BOOL RegisterRawInputDevices(const RAWINPUTDEVICE *d, uint32_t n, 
     for (uint32_t i = 0; i < n; i++) {
         if (d[i].page != 1) continue;                               // generic desktop controls
         int remove = (d[i].flags & RIDEV_REMOVE) != 0;
+        if (trace_focus()) vx_log("input: raw input device page %u usage %u flags %#x target %p", d[i].page, d[i].usage, d[i].flags, d[i].target);
         if (d[i].usage == 2) { g_raw_mouse = d[i]; g_raw_has_mouse = !remove; }
         if (d[i].usage == 6) { g_raw_keyboard = d[i]; g_raw_has_keyboard = !remove; }
     }
@@ -1077,6 +1092,7 @@ static HANDLE raw_target(const RAWINPUTDEVICE *reg) {
 }
 static void post_raw(const RAWINPUTDEVICE *reg, const uint8_t *record, uint32_t size) {
     HANDLE target = raw_target(reg);
+    if (trace_focus()) { static volatile int n; if (__sync_add_and_fetch(&n, 1) <= 20) vx_log("input: WM_INPUT (%u bytes) to %p", size, target); }
     if (!target) return;
     pthread_mutex_lock(&g_raw_lock);
     uint32_t i = g_raw_next++ % RAW_RING;
@@ -1110,6 +1126,7 @@ static void raw_key(int scan, int vk, int down) {
 #define RID_HEADER 0x10000005
 static WINAPI uint32_t GetRawInputData(HANDLE h, uint32_t cmd, void *data, uint32_t *size, uint32_t header_size) {
     uint32_t i = (uint32_t)((uintptr_t)h - 0x60000);
+    if (trace_focus()) { static volatile int n; if (__sync_add_and_fetch(&n, 1) <= 20) vx_log("input: GetRawInputData(%p, %#x, %p, %u, %u)", h, cmd, data, size ? *size : 0, header_size); }
     if (i >= RAW_RING || header_size != 24) { vx_set_last_error(6); return (uint32_t)-1; }
     pthread_mutex_lock(&g_raw_lock);
     uint32_t need = cmd == RID_HEADER ? 24 : g_raw[i].size;
@@ -2118,8 +2135,22 @@ void vx_ui_keys(HANDLE hwnd, const int *vks, int n) {
         int alt = 0;
         for (int j = 0; j < n; j++) if ((vks[j] == 0x12 || vks[j] == 0xA4 || vks[j] == 0xA5) && (down ? j < i : j < n + n - 1 - i)) alt = 1;
         int sys = alt || k == 0x12 || k == 0xA4 || k == 0xA5;
-        LPARAM lp = 1 | (LPARAM)(map((uint32_t)k, 0) & 0xff) << 16 | (alt ? (LPARAM)1 << 29 : 0) | (down ? 0 : (LPARAM)3 << 30);
+        int scan = (int)(map((uint32_t)k, 0) & 0xff);
+        LPARAM lp = 1 | (LPARAM)scan << 16 | (alt ? (LPARAM)1 << 29 : 0) | (down ? 0 : (LPARAM)3 << 30);
+        // (held 100 ms between the presses and the releases so a game polling once a frame sees it down)
+        if (i == n) usleep(100000);
+        // A key the Mac keyboard has goes the way a key on it does (key state, DirectInput, raw input, WM_CHAR for
+        // the space); others as messages alone.
+        int code = -1;
+        for (int c = 0; c < 128; c++) if (g_keymap[c].vk == k) { code = c; break; }
+        if (code >= 0) {
+            uint16_t ch = k == 0x20 ? ' ' : k == 0x0D ? '\r' : 0;
+            vx_key_event_chars(w, code, down, 0, alt, ch ? &ch : NULL, ch ? 1 : 0, 0);
+            continue;
+        }
+        set_key(k, down);
         post_key(w, down ? (sys ? WM_SYSKEYDOWN : WM_KEYDOWN) : (sys ? WM_SYSKEYUP : WM_KEYUP), (WPARAM)k, lp, NULL, 0);
+        raw_key(scan, k, down);
     }
 }
 void vx_ui_key(HANDLE hwnd, int vk) { vx_ui_keys(hwnd, &vk, 1); }

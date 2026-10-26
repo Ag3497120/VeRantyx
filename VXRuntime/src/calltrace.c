@@ -140,21 +140,42 @@ static void ring_dump_all(uint64_t ms) {
 }
 // VXRT_TRACE_CALLS_RING_AT=<seconds>: at that time after the start, each thread's last calls (a call that has not
 // returned is where the thread waits): what a hung program is doing.
-static void *ring_dump_later(void *arg) {
-    sleep((unsigned)(uintptr_t)arg);
+static void ring_dump_last(unsigned seconds) {
     int n = g_ring_count < 1024 ? g_ring_count : 1024;
-    vx_log("each thread's last calls into the runtime, %u s after the start:", (unsigned)(uintptr_t)arg);
+    vx_log("each thread's last calls into the runtime, %u s after the start:", seconds);
     for (int i = 0; i < n; i++) {
         ring *r = __atomic_load_n(&g_rings[i], __ATOMIC_ACQUIRE);
         unsigned next = r ? r->next : 0, have = next < 12 ? next : 12;
         for (unsigned k = next - have; k != next; k++) ring_line(r->tid, &r->e[k % RING_SIZE]);
     }
+}
+static void *ring_dump_later(void *arg) {
+    sleep((unsigned)(uintptr_t)arg);
+    ring_dump_last((unsigned)(uintptr_t)arg);
+    return NULL;
+}
+// VXRT_TRACE_CALLS_RING_FILE=<path>: the same each time <path> appears (it is removed): a program that hangs only
+// after what someone does in it.
+void vx_trace_ring_dump(const char *why);
+static void *ring_dump_on_file(void *arg) {
+    const char *path = arg;
+    for (unsigned t = 0;; t++) {
+        sleep(1);
+        if (!vx_trace_calls_on() || access(path, F_OK)) continue;      // (a process traced: not its helpers)
+        unlink(path);
+        const char *e = getenv("VXRT_TRACE_CALLS_RING");
+        if (e && *e == '2') vx_trace_ring_dump("the dump was asked for");     // (every thread's, in time order)
+        else ring_dump_last(t);
+    }
     return NULL;
 }
 __attribute__((constructor)) static void ring_dump_at(void) {
+    pthread_t th;
+    const char *f = getenv("VXRT_TRACE_CALLS_RING_FILE");
+    if (f && *f) { pthread_create(&th, NULL, ring_dump_on_file, (void *)f); pthread_detach(th); }
     const char *e = getenv("VXRT_TRACE_CALLS_RING_AT");
     if (!e || atoi(e) <= 0) return;
-    pthread_t th; pthread_create(&th, NULL, ring_dump_later, (void *)(uintptr_t)atoi(e)); pthread_detach(th);
+    pthread_create(&th, NULL, ring_dump_later, (void *)(uintptr_t)atoi(e)); pthread_detach(th);
 }
 void vx_trace_ring_dump(const char *why) {
     const char *e = getenv("VXRT_TRACE_CALLS_RING");
