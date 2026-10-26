@@ -624,7 +624,9 @@ static vx_image *load_pe(const char *path, int is_main) {
 
     int64_t delta = (int64_t)((uint64_t)base - pref_base);
     if (delta) {
-        if (!dirs[5].size) { vx_log("%s: loaded away from its base and has no relocations", path); return NULL; }
+        // (no relocation directory: nothing to fix up, as Windows takes it, unless the file says its relocations
+        // were stripped; resource-only DLLs such as ICU's data DLL are built so)
+        if (!dirs[5].size && (characteristics & 0x0001)) { vx_log("%s: loaded away from its base and has no relocations", path); return NULL; }
         for (uint8_t *b = base + dirs[5].va; b < base + dirs[5].va + dirs[5].size;) {
             uint32_t page = rd32(b), block = rd32(b + 4);
             if (!block) break;

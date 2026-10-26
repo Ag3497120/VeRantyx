@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "vx.h"
+#include <pthread.h>
 
 #define CXX_EXCEPTION       0xE06D7363u
 #define CXX_MAGIC           0x19930520u
@@ -263,14 +264,213 @@ static WINAPI int CxxFrameHandler3(EXCEPTION_RECORD *rec, uint64_t frame, void *
 // __GSHandlerCheck_EH: the same tables after a stack-cookie check (cookies are not verified here).
 static WINAPI int GSHandlerCheck_EH(EXCEPTION_RECORD *rec, uint64_t frame, void *ctx, DISPATCHER_CONTEXT *dc) { return CxxFrameHandler3(rec, frame, ctx, dc); }
 static WINAPI int GSHandlerCheck(EXCEPTION_RECORD *rec, uint64_t frame, void *ctx, DISPATCHER_CONTEXT *dc) { (void)rec; (void)frame; (void)ctx; (void)dc; return ExceptionContinueSearch; }
-// FH4 (the compressed tables of Visual Studio 2019 and later) is the next step; stop clearly rather than skip
-// destructors silently.
+// ---- __CxxFrameHandler4 -------------------------------------------------------------------------------------------------------
+// The compressed tables of Visual Studio 2019 and later ("FH4"), as found in the binaries: a header byte (1 the
+// function is a catch funclet, 2 its IP-to-state map is split by code segment, 4 BBT flags follow, 8 an unwind map,
+// 16 a try-block map), then 32-bit RVAs of the unwind map, the try-block map and the IP-to-state map, and for a catch
+// funclet the offset in its frame where the parent function's frame is kept. Counts and most numbers are compressed:
+// the low bits of the first byte give the length (x0: 1 byte, 7 bits; x01: 2 bytes, 14 bits; x011: 3 bytes; x0111:
+// 4 bytes, 28 bits; 1111: 5 bytes, the 32 bits after). IP-to-state entries are deltas from the function's start and
+// the state plus one. An unwind entry is (offset back to the entry of the state it falls to << 2 | type) - 0 nothing,
+// 1 a destructor on an object in the frame, 2 a destructor on the object a frame slot points to, 3 an unwind funclet -
+// with the action's RVA and the object's frame offset where they apply. Each table is decoded once into the FH3-like
+// form below, and the FH3 logic runs over it.
+static uint32_t fh4_u(const uint8_t **p) {
+    const uint8_t *b = *p;
+    uint32_t v;
+    if (!(b[0] & 1)) { v = b[0] >> 1; *p += 1; }
+    else if ((b[0] & 3) == 1) { v = (uint32_t)(b[0] | b[1] << 8) >> 2; *p += 2; }
+    else if ((b[0] & 7) == 3) { v = (uint32_t)(b[0] | b[1] << 8 | b[2] << 16) >> 3; *p += 3; }
+    else if ((b[0] & 15) == 7) { v = ((uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24) >> 4; *p += 4; }
+    else { v = (uint32_t)b[1] | (uint32_t)b[2] << 8 | (uint32_t)b[3] << 16 | (uint32_t)b[4] << 24; *p += 5; }
+    return v;
+}
+static int32_t fh4_rva(const uint8_t **p) { int32_t v; memcpy(&v, *p, 4); *p += 4; return v; }
+typedef struct { int to_state; uint8_t type; int32_t action; uint32_t object; } fh4_unwind;
+typedef struct { handler_entry h; int ncont; uint64_t cont[2]; } fh4_handler;   // (h.frame unused: FH4 keeps it per funclet)
+typedef struct { int low, high, catch_high, n; fh4_handler *handlers; } fh4_try;
+typedef struct { uint32_t ip; int state; } fh4_ip;
+typedef struct fh4_info {
+    const uint8_t *key; uint64_t start;  // the table and the start of the code it covers
+    int is_catch; uint32_t frame_slot;
+    int nuw, ntry, nip;
+    fh4_unwind *uw;
+    fh4_try *tries;
+    fh4_ip *ips;
+    struct fh4_info *next;
+} fh4_info;
+static fh4_info *g_fh4;
+static pthread_mutex_t g_fh4_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static fh4_info *fh4_decode(uint64_t base, const uint8_t *key, uint64_t start) {
+    fh4_info *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    f->key = key; f->start = start;
+    const uint8_t *p = key;
+    uint8_t header = *p++;
+    int32_t uw_rva = 0, try_rva = 0, ip_rva;
+    if (header & 4) (void)fh4_u(&p);                              // BBT flags
+    if (header & 8) uw_rva = fh4_rva(&p);
+    if (header & 16) try_rva = fh4_rva(&p);
+    ip_rva = fh4_rva(&p);
+    f->is_catch = header & 1;
+    if (header & 1) f->frame_slot = fh4_u(&p);
+    if (uw_rva) {                                                  // the unwind map: entries found by their place
+        const uint8_t *q = AT(base, uw_rva);
+        f->nuw = (int)fh4_u(&q);
+        f->uw = calloc((size_t)f->nuw + 1, sizeof *f->uw);
+        uint32_t *at = calloc((size_t)f->nuw + 1, sizeof *at), *back = calloc((size_t)f->nuw + 1, sizeof *back);
+        const uint8_t *first = q;
+        for (int i = 0; i < f->nuw; i++) {
+            at[i] = (uint32_t)(q - first);
+            uint32_t v = fh4_u(&q);
+            f->uw[i].type = v & 3;
+            back[i] = v >> 2;
+            if (f->uw[i].type == 1 || f->uw[i].type == 2) { f->uw[i].action = fh4_rva(&q); f->uw[i].object = fh4_u(&q); }
+            else if (f->uw[i].type == 3) f->uw[i].action = fh4_rva(&q);
+        }
+        for (int i = 0; i < f->nuw; i++) {
+            f->uw[i].to_state = -1;
+            if (!back[i] || back[i] > at[i]) continue;             // (before the first entry: no state)
+            for (int k = 0; k < i; k++) if (at[k] == at[i] - back[i]) { f->uw[i].to_state = k; break; }
+        }
+        free(at); free(back);
+    }
+    if (try_rva) {
+        const uint8_t *q = AT(base, try_rva);
+        f->ntry = (int)fh4_u(&q);
+        f->tries = calloc((size_t)f->ntry + 1, sizeof *f->tries);
+        for (int i = 0; i < f->ntry; i++) {
+            fh4_try *t = &f->tries[i];
+            t->low = (int)fh4_u(&q); t->high = (int)fh4_u(&q); t->catch_high = (int)fh4_u(&q);
+            const uint8_t *h = AT(base, fh4_rva(&q));
+            t->n = (int)fh4_u(&h);
+            t->handlers = calloc((size_t)t->n + 1, sizeof *t->handlers);
+            for (int k = 0; k < t->n; k++) {
+                fh4_handler *e = &t->handlers[k];
+                uint8_t hh = *h++;
+                if (hh & 1) e->h.adjectives = fh4_u(&h);
+                if (hh & 2) e->h.type = fh4_rva(&h);
+                if (hh & 4) e->h.catch_obj = (int)fh4_u(&h);
+                e->h.handler = fh4_rva(&h);
+                e->ncont = (hh >> 4) & 3;
+                if (e->ncont > 2) e->ncont = 2;
+                for (int c = 0; c < e->ncont; c++)
+                    e->cont[c] = (hh & 8) ? (uint64_t)AT(base, fh4_rva(&h)) : start + fh4_u(&h);
+            }
+        }
+    }
+    const uint8_t *q = AT(base, ip_rva);
+    if (header & 2) {                                              // one map per code segment: this one's
+        uint32_t n = fh4_u(&q);
+        const uint8_t *map = NULL;
+        for (uint32_t i = 0; i < n; i++) {
+            int32_t seg = fh4_rva(&q), disp = fh4_rva(&q);
+            if ((uint64_t)AT(base, seg) == start) map = AT(base, disp);
+        }
+        q = map;
+    }
+    if (q) {
+        f->nip = (int)fh4_u(&q);
+        f->ips = calloc((size_t)f->nip + 1, sizeof *f->ips);
+        uint32_t ip = 0;
+        for (int i = 0; i < f->nip; i++) { ip += fh4_u(&q); f->ips[i].ip = ip; f->ips[i].state = (int)fh4_u(&q) - 1; }
+    }
+    return f;
+}
+static fh4_info *fh4_get(DISPATCHER_CONTEXT *dc) {
+    const uint8_t *key = AT(dc->image_base, *(const DWORD *)dc->handler_data);
+    uint64_t start = dc->image_base + dc->function->begin;
+    pthread_mutex_lock(&g_fh4_lock);
+    fh4_info *f = g_fh4;
+    while (f && (f->key != key || f->start != start)) f = f->next;
+    if (!f && (f = fh4_decode(dc->image_base, key, start))) { f->next = g_fh4; g_fh4 = f; }
+    pthread_mutex_unlock(&g_fh4_lock);
+    return f;
+}
+static int fh4_state(const fh4_info *f, uint64_t pc) {
+    uint64_t at = pc - f->start;
+    int state = -1;
+    for (int i = 0; i < f->nip && f->ips[i].ip <= at; i++) state = f->ips[i].state;
+    return state;
+}
+static void fh4_unwind_states(const fh4_info *f, uint64_t base, uint64_t frame, int state, int target) {
+    while (state > target && state < f->nuw) {
+        const fh4_unwind *u = &f->uw[state];
+        if (u->type == 1) ((void (WINAPI *)(void *))AT(base, u->action))((void *)(frame + u->object));
+        else if (u->type == 2) ((void (WINAPI *)(void *))AT(base, u->action))(*(void **)(frame + u->object));
+        else if (u->type == 3) ((void (WINAPI *)(uint64_t, uint64_t))AT(base, u->action))(0, frame);
+        state = u->to_state;
+    }
+}
+enum { P4_HANDLER = P_HANDLER, P4_TRY = P_TRY };
+static WINAPI void *call_catch4(EXCEPTION_RECORD *rec) {
+    uint64_t frame = rec->info[P_FRAME], base = rec->info[P_BASE], pc = rec->info[P_PC];
+    const fh4_info *f = (const fh4_info *)rec->info[P_FUNCINFO];
+    const fh4_handler *h = (const fh4_handler *)rec->info[P4_HANDLER];
+    const fh4_try *t = (const fh4_try *)rec->info[P4_TRY];
+    if (vx_trace) vx_log("FH4 catch: frame %#llx funclet %#x try %d..%d", (unsigned long long)frame, h->h.handler, t->low, t->high);
+    fh4_unwind_states(f, base, frame, fh4_state(f, pc), t->low - 1);
+    handled self = { (void *)rec->info[P_OBJECT], (const throw_info *)rec->info[P_INFO], rec->info[P_INFO_BASE], 0, rec, t_handled };
+    t_handled = &self;
+    uint64_t r = (uint64_t)((void *(WINAPI *)(uint64_t, uint64_t))AT(base, h->h.handler))(frame, frame);
+    t_handled = self.next;
+    if (!self.rethrown) destroy_object(self.object, self.info, self.info_base);
+    // (with continuation addresses in the table, the funclet returns which of them)
+    if (h->ncont && r < (uint64_t)h->ncont) r = h->cont[r];
+    return (void *)r;
+}
 static WINAPI int CxxFrameHandler4(EXCEPTION_RECORD *rec, uint64_t frame, void *ctx, DISPATCHER_CONTEXT *dc) {
-    (void)frame; (void)ctx; (void)dc;
-    if (rec->flags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND) || rec->code == CXX_EXCEPTION)
-        terminate_now("__CxxFrameHandler4 (Visual Studio 2019+ exception tables) is not implemented yet");
+    (void)ctx;
+    fh4_info *f = fh4_get(dc);
+    if (!f) return ExceptionContinueSearch;
+    uint64_t base = dc->image_base, fn_frame = frame;
+    const fh4_try *in_catch = NULL;
+    if (f->is_catch) {                                             // a catch funclet: its function's frame, its try block
+        fn_frame = *(uint64_t *)(frame + f->frame_slot);
+        for (int i = 0; i < f->ntry && !in_catch; i++)
+            for (int k = 0; k < f->tries[i].n; k++)
+                if ((uint32_t)f->tries[i].handlers[k].h.handler == dc->function->begin) { in_catch = &f->tries[i]; break; }
+    }
+    int state = fh4_state(f, dc->control_pc);
+    if (rec->flags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)) {
+        if ((rec->flags & EXCEPTION_TARGET_UNWIND) && rec->code == STATUS_UNWIND_CONSOLIDATE) return ExceptionContinueSearch;
+        if (vx_trace) vx_log("FH4 unwind: pc %#llx state %d", (unsigned long long)(dc->control_pc - base), state);
+        fh4_unwind_states(f, base, fn_frame, state, in_catch ? in_catch->high : -1);
+        return ExceptionContinueSearch;
+    }
+    if (rec->code != CXX_EXCEPTION || rec->nparams < 3 || (rec->info[0] & ~3u) != (CXX_MAGIC & ~3u)) return ExceptionContinueSearch;
+    void *obj = (void *)rec->info[1];
+    const throw_info *ti = (const throw_info *)rec->info[2];
+    uint64_t tbase = rec->nparams >= 4 ? rec->info[3] : 0;
+    if (!ti) return ExceptionContinueSearch;
+    if (vx_trace) vx_log("FH4 search: pc %#llx state %d%s", (unsigned long long)(dc->control_pc - base), state, in_catch ? " (in a catch)" : "");
+    for (int i = 0; i < f->ntry; i++) {
+        const fh4_try *t = &f->tries[i];
+        if (state < t->low || state > t->high) continue;
+        if (in_catch && (t->low <= in_catch->high || t->high > in_catch->catch_high)) continue;
+        for (int k = 0; k < t->n; k++) {
+            const catchable_type *ct = match(&t->handlers[k].h, base, ti, tbase);
+            if (!ct) continue;
+            build_catch_object(&t->handlers[k].h, fn_frame, obj, ct, tbase);
+            EXCEPTION_RECORD unwind = { STATUS_UNWIND_CONSOLIDATE, EXCEPTION_NONCONTINUABLE, rec, rec->address, P_COUNT, 0, { 0 } };
+            unwind.info[P_CALLBACK] = (uint64_t)call_catch4;
+            unwind.info[P_FRAME] = fn_frame;
+            unwind.info[P_FUNCINFO] = (uint64_t)f;
+            unwind.info[P4_HANDLER] = (uint64_t)&t->handlers[k];
+            unwind.info[P4_TRY] = (uint64_t)t;
+            unwind.info[P_BASE] = base;
+            unwind.info[P_PC] = dc->control_pc;
+            unwind.info[P_OBJECT] = (uint64_t)obj;
+            unwind.info[P_INFO] = (uint64_t)ti;
+            unwind.info[P_INFO_BASE] = tbase;
+            unwind.info[P_IN_FUNCLET] = in_catch != NULL;
+            rtl_unwind_ex(frame, dc->control_pc, &unwind, 0, NULL, dc->history_table);   // does not return
+        }
+    }
     return ExceptionContinueSearch;
 }
+static WINAPI int GSHandlerCheck_EH4(EXCEPTION_RECORD *rec, uint64_t frame, void *ctx, DISPATCHER_CONTEXT *dc) { return CxxFrameHandler4(rec, frame, ctx, dc); }
 
 // ---- throwing ------------------------------------------------------------------------------------------------------------------
 void vx_raise(DWORD code, DWORD flags, DWORD n, const uint64_t *args, void *ctx) __attribute__((noreturn));
@@ -417,7 +617,7 @@ static vx_export g_vcruntime[] = {
     { "_CxxThrowException", (void *)vx_CxxThrowException }, { "__CxxFrameHandler3", (void *)CxxFrameHandler3 },
     { "__CxxFrameHandler", (void *)CxxFrameHandler3 },              // msvcrt.dll's name for the same tables
     { "??1type_info@@UEAA@XZ", (void *)type_info_destructor }, { "?terminate@@YAXXZ", (void *)std_terminate },
-    { "__CxxFrameHandler4", (void *)CxxFrameHandler4 }, { "__GSHandlerCheck_EH", (void *)GSHandlerCheck_EH },
+    { "__CxxFrameHandler4", (void *)CxxFrameHandler4 }, { "__GSHandlerCheck_EH", (void *)GSHandlerCheck_EH }, { "__GSHandlerCheck_EH4", (void *)GSHandlerCheck_EH4 },
     { "__GSHandlerCheck", (void *)GSHandlerCheck },
     { "__std_terminate", (void *)std_terminate }, { "_purecall", (void *)purecall },
     { "_set_purecall_handler", (void *)set_purecall_handler }, { "_get_purecall_handler", (void *)get_purecall_handler },

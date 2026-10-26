@@ -143,7 +143,9 @@ static WINAPI HRESULT adapter_query_video_memory(void *this, uint32_t node, uint
     (void)this; (void)node;
     memset(info, 0, 32);
     if (group == 0) {
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        static id<MTLDevice> dev;                                  // (engines ask every frame: made once)
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ dev = MTLCreateSystemDefaultDevice(); });
         info[0] = dev.recommendedMaxWorkingSetSize;
         info[1] = dev.currentAllocatedSize;
         info[2] = info[0] / 2;

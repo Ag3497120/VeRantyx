@@ -798,6 +798,16 @@ static WINAPI int __stdio_common_vswprintf(uint64_t options, WCHAR *buf, size_t 
 static WINAPI int __stdio_common_vswprintf_s(uint64_t options, WCHAR *buf, size_t count, const WCHAR *fmt, void *locale, const char *ap) {
     return __stdio_common_vswprintf(options, buf, count, fmt, locale, ap);
 }
+// _vsnwprintf_s: at most `count` characters (_TRUNCATE, SIZE_MAX: as many as fit) into a buffer of `size`, always
+// terminated; -1 when the text was cut short.
+static WINAPI int __stdio_common_vsnwprintf_s(uint64_t options, WCHAR *buf, size_t size, size_t count, const WCHAR *fmt, void *locale, const char *ap) {
+    (void)options; (void)locale;
+    if (!buf || !size) return -1;
+    size_t limit = count == (size_t)-1 || count >= size ? size : count + 1;
+    int n = vx_format_w(buf, limit, fmt, ap);
+    if (n < 0 || (size_t)n >= limit) { buf[limit - 1] = 0; return -1; }
+    return n;
+}
 
 // ---- stat, time conversion, scanf, strings, process start-up odds and ends -------------------------------------------------
 // struct _stat64 (56 bytes): dev, ino, mode, nlink, uid, gid, rdev, size, atime, mtime, ctime; _stat64i32 has a
@@ -1029,7 +1039,7 @@ static const vx_export ucrt[] = {
     { "_W_Getdays", (void *)vx_W_Getdays }, { "_W_Getmonths", (void *)vx_W_Getmonths }, { "_Gettnames", (void *)vx_Gettnames },
     { "_W_Gettnames", (void *)vx_Gettnames }, { "_Strftime", (void *)vx_Strftime }, { "_Wcsftime", (void *)vx_Wcsftime },
     { "_vsnwprintf", (void *)vx_vsnwprintf }, { "_snwprintf", (void *)vx_snwprintf }, VX_EXPORT(__stdio_common_vswprintf),
-    VX_EXPORT(__stdio_common_vswprintf_s),
+    VX_EXPORT(__stdio_common_vswprintf_s), VX_EXPORT(__stdio_common_vsnwprintf_s),
     { "_onexit", (void *)vx_onexit }, { "_amsg_exit", (void *)vx_amsg_exit }, { "_XcptFilter", (void *)vx_XcptFilter },
     { "_strtoui64", (void *)vx_strtoui64 }, { "_strtoi64", (void *)vx_strtoi64 }, { "isxdigit", (void *)vx_isxdigit },
     { "isalnum", (void *)vx_isalnum }, { "isupper", (void *)vx_isupper }, { "islower", (void *)vx_islower },
