@@ -1136,7 +1136,35 @@ static MTLSamplerAddressMode address_mode(int32_t m, int normalized_coordinates,
     }
 }
 
+static id<MTLSamplerState> make_sampler_new12(dev12 *d, int32_t filter, int32_t u, int32_t v, int32_t w,
+    float bias, uint32_t aniso, int32_t cmp, const float border[4], float min_lod, float max_lod,
+    int normalized_coordinates);
+// Sampler states by description, shared: a game writes sampler descriptors by the thousand (each made a new Metal
+// sampler state, the one a descriptor held freed when the descriptor was overwritten - while command buffers in
+// flight could still use it - and Metal allows only so many with argument-buffer support).
 static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int32_t v, int32_t w,
+    float bias, uint32_t aniso, int32_t cmp, const float border[4], float min_lod, float max_lod,
+    int normalized_coordinates) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static NSMutableDictionary<NSData *, id<MTLSamplerState>> *cache;
+    struct { void *dev; int32_t filter, u, v, w; float bias; uint32_t aniso; int32_t cmp; float border[4], min_lod, max_lod; int norm; } key;
+    memset(&key, 0, sizeof key);
+    key.dev = d; key.filter = filter; key.u = u; key.v = v; key.w = w; key.bias = bias; key.aniso = aniso; key.cmp = cmp;
+    memcpy(key.border, border, sizeof key.border); key.min_lod = min_lod; key.max_lod = max_lod; key.norm = normalized_coordinates;
+    NSData *k = [NSData dataWithBytes:&key length:sizeof key];
+    pthread_mutex_lock(&lock);
+    if (!cache) cache = [NSMutableDictionary new];
+    id<MTLSamplerState> st = cache[k];
+    pthread_mutex_unlock(&lock);
+    if (st) return st;
+    st = make_sampler_new12(d, filter, u, v, w, bias, aniso, cmp, border, min_lod, max_lod, normalized_coordinates);
+    if (!st) return nil;
+    pthread_mutex_lock(&lock);
+    if (cache[k]) st = cache[k]; else cache[k] = st;
+    pthread_mutex_unlock(&lock);
+    return st;
+}
+static id<MTLSamplerState> make_sampler_new12(dev12 *d, int32_t filter, int32_t u, int32_t v, int32_t w,
     float bias, uint32_t aniso, int32_t cmp, const float border[4], float min_lod, float max_lod,
     int normalized_coordinates) {
     MTLSamplerDescriptor *s = [MTLSamplerDescriptor new];
@@ -1231,7 +1259,9 @@ static void residency_add12(dev12 *d, id<MTLResource> resource) {   // (d->lock)
 static void residency_remove12(dev12 *d, id<MTLResource> resource) {   // (d->lock)
     if (resource) residency_remove_allocation12(d, resource.heap ? (id)resource.heap : (id)resource);
 }
+static void grave_settle12(dev12 *d);
 static void residency_commit12(dev12 *d) {   // (d->lock)
+    grave_settle12(d);
     if (d->residency) residency_settle12(d);
     if (!d->residency || !d->residency_dirty) return;
     if (@available(macOS 15.0, *)) [(id<MTLResidencySet>)d->residency commit];
@@ -2595,10 +2625,41 @@ static heap12 *g_heaps[4096];
 static uint32_t g_nheaps;
 
 // Sets the Metal object a descriptor stands for, keeping the heap's set of textures.
+// What a shader-visible descriptor held (a texture view, a sampler state) stays alive until the GPU has finished what
+// was submitted when the descriptor was overwritten: command buffers in flight may still read it through the heap.
+static pthread_mutex_t g_grave_lock12 = PTHREAD_MUTEX_INITIALIZER;
+static NSMutableArray *g_grave12;                        // @[ object, NSData of the queues' timeline values ]
+static void grave_bury12(dev12 *d, id old) {
+    if (!d || !old) return;
+    uint64_t at[16];
+    for (int i = 0; i < 16; i++) at[i] = d->queues[i] ? __atomic_load_n(&((queue12 *)d->queues[i])->timeline_value, __ATOMIC_ACQUIRE) : 0;
+    pthread_mutex_lock(&g_grave_lock12);
+    if (!g_grave12) g_grave12 = [NSMutableArray new];
+    [g_grave12 addObject:@[ old, [NSData dataWithBytes:at length:sizeof at] ]];
+    pthread_mutex_unlock(&g_grave_lock12);
+}
+static void grave_settle12(dev12 *d) {
+    pthread_mutex_lock(&g_grave_lock12);
+    if (g_grave12.count) {
+        NSMutableIndexSet *done = [NSMutableIndexSet indexSet];
+        [g_grave12 enumerateObjectsUsingBlock:^(NSArray *entry, NSUInteger k, BOOL *stop) {
+            (void)stop;
+            const uint64_t *at = ((NSData *)entry[1]).bytes;
+            for (int i = 0; i < 16; i++) {
+                queue12 *q = d->queues[i];
+                if (q && q->timeline && q->timeline.signaledValue < at[i]) return;
+            }
+            [done addIndex:k];
+        }];
+        [g_grave12 removeObjectsAtIndexes:done];
+    }
+    pthread_mutex_unlock(&g_grave_lock12);
+}
 static void heap_keep12(heap12 *h, uint32_t i, id object) {
     id old = h->keep[i];
     if (old == object) return;
     h->keep[i] = object;
+    if (old && h->gpu) grave_bury12(h->dev, old);
     if (!h->textures) return;
     int old_texture = old && [old conformsToProtocol:@protocol(MTLTexture)];
     int new_texture = object && [object conformsToProtocol:@protocol(MTLTexture)];
@@ -2647,9 +2708,27 @@ static void use_list_compute12(id<MTLComputeCommandEncoder> ce, NSArray *list) {
 }
 // (With the residency set the heap's textures are still declared once an encoder: draws and dispatches do not name
 // what an unbounded descriptor range reaches, so Metal's hazard tracking learns of them here.)
+// The bound heap's textures are declared to an encoder (useResource) only once a shader that can reach any of them
+// runs in it: one with an unbounded or large descriptor array, or SM 6.6 heap indexing. Every other shader's
+// bindings are declared draw by draw (their access lists); declaring a heap of thousands of textures to every
+// encoder cost more than the draws. (serials: which encoder of this thread was declared to)
+static __thread uint64_t t_ce_serial12, t_ce_heap_serial12, t_re_serial12, t_re_heap_serial12;
+static int msl_wide12(const dxil_msl *m) {
+    if (!m) return 0;
+    if (m->uses_heap) return 1;
+    for (uint32_t i = 0; i < m->nslots; i++)
+        if (m->slots[i].cls != DXIL_SAMPLER && (m->slots[i].count == UINT32_MAX || m->slots[i].count > 64)) return 1;
+    return 0;
+}
 static void use_resident_compute12(id<MTLComputeCommandEncoder> ce, NSArray *resident, heap12 *heap) {
+    (void)heap;
     if (resident != resident_by_set12()) use_list_compute12(ce, resident);
+    t_ce_serial12++;
+}
+static void heap_textures_compute12(id<MTLComputeCommandEncoder> ce, heap12 *heap, int wide) {
+    if (!ce || !wide || t_ce_heap_serial12 == t_ce_serial12) return;
     use_list_compute12(ce, heap_textures12(heap));
+    t_ce_heap_serial12 = t_ce_serial12;
 }
 
 static void heap_destroy(d3d_object *o) {
@@ -8637,8 +8716,14 @@ static int gpu_errors12(void) {
     return on;
 }
 static void make_resident_render(id<MTLRenderCommandEncoder> re, NSArray *resident, heap12 *heap) {
+    (void)heap;
     if (resident != resident_by_set12()) use_list_render12(re, resident);   // (else the residency set has them)
-    use_list_render12(re, heap_textures12(heap));                  // (as for compute: unbounded ranges)
+    t_re_serial12++;
+}
+static void heap_textures_render12(id<MTLRenderCommandEncoder> re, heap12 *heap, int wide) {
+    if (!re || !wide || t_re_heap_serial12 == t_re_serial12) return;
+    use_list_render12(re, heap_textures12(heap));                  // (as for compute)
+    t_re_heap_serial12 = t_re_serial12;
 }
 
 static int open_render_pass12(dev12 *device, gfx_state *g, id<MTLCommandBuffer> command_buffer,
@@ -9089,6 +9174,7 @@ static int d3d12_gpu_ir_dispatch(void *opaque, const gpu_ir_pipeline *pipeline,
         // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
         use_resident_compute12(*ce, resident, context->resource_heap);
     }
+    heap_textures_compute12(*ce, context->resource_heap, msl_wide12(&context->api_pipeline->msl));
 
     int access_result = d3d12_use_compute_accesses12(*ce, accesses, access_count);
     if (access_result != GPU_IR_OK) return access_result;
@@ -9160,6 +9246,7 @@ static int d3d12_gpu_ir_dispatch_indirect(void *opaque, const gpu_ir_pipeline *p
         // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
         use_resident_compute12(*ce, resident, context->resource_heap);
     }
+    heap_textures_compute12(*ce, context->resource_heap, msl_wide12(&context->api_pipeline->msl));
 
     int access_result = d3d12_use_compute_accesses12(*ce, accesses, access_count);
     if (access_result != GPU_IR_OK) return access_result;
@@ -9256,6 +9343,7 @@ static int d3d12_gpu_ir_prepare_draw12(d3d12_draw_context *context, const gpu_ir
     }
     id<MTLRenderCommandEncoder> __strong *re = (id<MTLRenderCommandEncoder> __strong *)context->render_encoder;
     if (!re || !*re) return GPU_IR_INVALID;
+    heap_textures_render12(*re, context->resource_heap, msl_wide12(&api_pipeline->vs) || msl_wide12(&api_pipeline->ps));
     int mapping_result = d3d12_shader_component_mapping_read12(context->device, &api_pipeline->vs,
         GPU_IR_STAGE_VERTEX, context->graphics_root, context->resource_heap, context->sampler_heap);
     if (mapping_result != GPU_IR_OK) return mapping_result;
@@ -9410,6 +9498,7 @@ static void gs12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTLCo
     if (!*ce) {
         *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
         use_resident_compute12(*ce, resident, heap);
+        heap_textures_compute12(*ce, heap, 1);
     }
     // the vertex kernel: thread (x, y) is vertex x of instance y
     [*ce setComputePipelineState:vk];
@@ -9449,6 +9538,7 @@ static void gs12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTLCo
     [*ce dispatchThreads:MTLSizeMake(prims, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, p->gs_kernel.maxTotalThreadsPerThreadgroup), 1, 1)];
     // the triangles
     if (!open_render_pass12(d, g, cb, ce, be, re, resident, heap)) { vx_log("D3D12: could not open a render pass for a geometry draw"); return; }
+    heap_textures_render12(*re, heap, 1);
     encode_render_state12(*re, p, g, g->blend);
     [*re setVertexBuffer:gs_out offset:0 atIndex:0];
     [*re setVertexBuffer:counts offset:0 atIndex:1];
@@ -9498,6 +9588,7 @@ static void tess12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTL
     if (!*ce) {
         *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
         use_resident_compute12(*ce, resident, heap);
+        heap_textures_compute12(*ce, heap, 1);
     }
     // the vertex kernel: thread (x, y) is vertex x of instance y
     [*ce setComputePipelineState:vk];
@@ -9538,6 +9629,7 @@ static void tess12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTL
     [*ce dispatchThreads:MTLSizeMake(patches, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, p->hs_kernel.maxTotalThreadsPerThreadgroup), 1, 1)];
     // the patches
     if (!open_render_pass12(d, g, cb, ce, be, re, resident, heap)) { vx_log("D3D12: could not open a render pass for a tessellated draw"); return; }
+    heap_textures_render12(*re, heap, 1);
     encode_render_state12(*re, p, g, g->blend);
     [*re setTessellationFactorBuffer:factors offset:0 instanceStride:0];
     [*re setVertexBuffer:cp_out offset:0 atIndex:DXIL_DS_CP];
@@ -9705,6 +9797,7 @@ static int d3d12_gpu_ir_dispatch_indirect_range(void *opaque, const gpu_ir_pipel
         *compute_encoder = [command_buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
         // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
         use_resident_compute12(*compute_encoder, resident, context->resource_heap);
+        heap_textures_compute12(*compute_encoder, context->resource_heap, 1);   // (indirect: as before)
     }
     if (!*compute_encoder) return GPU_IR_UNSUPPORTED;
     int access_result = d3d12_use_compute_accesses12(*compute_encoder, accesses, access_count);
@@ -10278,6 +10371,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             g->changed = 1;
             break;
         case C_CLEAR_UAV: {
+            cb_log12('u', 0, c->a ? 1 : 2, 0, 0);
             uint32_t descriptor_index = 0;
             heap12 *descriptor_heap = heap_gpu_descriptor(c->va, &descriptor_index);
             gpu_ir_buffer_view *buffer_view = descriptor_heap && descriptor_heap->buffer_view &&
@@ -10324,6 +10418,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             break;
         }
         case C_CLEAR_RTV: case C_CLEAR_DSV: {
+            cb_log12(c->op == C_CLEAR_RTV ? 'r' : 'd', 0, 0, 0, 0);
             // Clears are common IR operations so later API front ends can share attachment semantics and backend hooks.
             close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
             d3d12_clear_context12 context = { d, (__bridge void *)cb };
@@ -10468,6 +10563,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 //  of the device, and the texture views the bound heaps' descriptors name)
                 use_resident_compute12(ce, resident, heap);
             }
+            heap_textures_compute12(ce, heap, msl_wide12(&pso->msl));
             [ce setComputePipelineState:pso->compute];
             uint64_t root[64 + 2];
             uint32_t words;
@@ -10752,6 +10848,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
         case C_GPU_IR: {
             close_pass(d, g, cb, &re);
             uint32_t kind = gpu_ir_command_kind(&l->gpu_ir, c->a);
+            if (kind != GPU_IR_COMMAND_BARRIER) cb_log12('g', 0, kind + 1, 0, 0);
             if (kind == GPU_IR_COMMAND_BARRIER || kind == GPU_IR_COMMAND_RESOLVE_TEXTURE) end_encoders(&ce, &be, &re);
             else {
                 if (ce) { [ce endEncoding]; ce = nil; }
