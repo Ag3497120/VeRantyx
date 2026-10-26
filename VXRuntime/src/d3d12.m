@@ -503,6 +503,28 @@ static uint64_t msl_dump12(const char *msl) {
     }
     return h;
 }
+// VXRT_D3D12_MSL_OVERRIDE=<folder>: a shader whose <bytecode hash>.metal is there runs that source instead of its
+// translation (same slots: an edited copy of the translation), to look into what a shader computes.
+static void msl_override12(const BYTECODE *code, dxil_msl *out) {
+    const char *dir = getenv("VXRT_D3D12_MSL_OVERRIDE");
+    if (!dir || !code || !code->code) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%016llx.metal", dir,
+             (unsigned long long)fnv1a12(0xcbf29ce484222325ull, code->code, code->size));
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *text = n > 0 ? malloc((size_t)n + 1) : NULL;
+    if (text && fread(text, 1, (size_t)n, f) == (size_t)n) {
+        text[n] = 0;
+        free(out->msl);
+        out->msl = text;
+        vx_log("D3D12: shader %s replaced by the source in the override folder", path);
+    } else free(text);
+    fclose(f);
+}
 static uint64_t code_dump12(const void *code, size_t size) {
     if (!code || !size) return 0;
     uint64_t h = fnv1a12(0xcbf29ce484222325ull, code, size);
@@ -532,6 +554,16 @@ static double frame_stats_ms12(void) {
     static double ms = -1;
     if (ms < 0) { const char *e = getenv("VXRT_D3D12_FRAME_STATS"); ms = !e ? 0 : atof(e) > 1 ? atof(e) : 50; }
     return ms;
+}
+// What a command buffer ran (pipeline bytecode hashes, in order), for the log when it fails.
+static __thread char t_cb_log12[1024];
+static __thread int t_cb_len12;
+static void cb_log_reset12(void) { t_cb_log12[0] = 0; t_cb_len12 = 0; }
+static void cb_log12(char kind, uint64_t hash, uint32_t x, uint32_t y, uint32_t z) {
+    if (t_cb_len12 > (int)sizeof t_cb_log12 - 48) return;
+    t_cb_len12 += snprintf(t_cb_log12 + t_cb_len12, sizeof t_cb_log12 - t_cb_len12, "%c%08llx", kind, (unsigned long long)(hash >> 32));
+    if (x) t_cb_len12 += snprintf(t_cb_log12 + t_cb_len12, sizeof t_cb_log12 - t_cb_len12, "(%u,%u,%u)", x, y, z);
+    t_cb_len12 += snprintf(t_cb_log12 + t_cb_len12, sizeof t_cb_log12 - t_cb_len12, " ");
 }
 static uint64_t fs_now12(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 #define FS_ADD12(field, v) do { if (frame_stats_ms12() > 0) __atomic_fetch_add(&g_fs12.field, (uint64_t)(v), __ATOMIC_RELAXED); } while (0)
@@ -3366,6 +3398,13 @@ static MTLCompileOptions *d3d12_shader_compile_options12(dev12 *device, const dx
         }
     } else options.languageVersion = MTLLanguageVersion3_1;
     if (supports_min_lod) options.preprocessorMacros = @{ @"VXRT_HAS_MIN_LOD_CLAMP": @1 };
+    // VXRT_D3D12_SAFE_MATH=1: Metal's safe math (IEEE NaN and infinity) instead of fast math, to compare.
+    static int fast = -1;
+    if (fast < 0) { const char *e = getenv("VXRT_D3D12_SAFE_MATH"); fast = !(e && *e == '1'); }
+    if (!fast) {
+        if (@available(macOS 15.0, *)) options.mathMode = MTLMathModeSafe;
+        else options.fastMathEnabled = NO;
+    }
     return options;
 }
 
@@ -3394,6 +3433,7 @@ static HRESULT create_compute_pso12(void *this, const COMPUTE_PSO_DESC *desc, co
         if (!rc && p->msl.stage != 5) { snprintf(p->msl.error, sizeof p->msl.error, "not a compute shader"); rc = -1; }
     } else {
         rc = dxil_to_msl(&m, &p->msl);
+        if (!rc) msl_override12(&desc->cs, &p->msl);
         if (!rc) {
             int ir_rc = no_common_ir12(1) ? GPU_IR_UNSUPPORTED : dxil_build_gpu_ir_shader(&m, DXIL_IR_ENTRY_FUNCTION, &common_shader);
             if (ir_rc != GPU_IR_OK && ir_rc != GPU_IR_UNSUPPORTED)
@@ -5224,6 +5264,7 @@ static id<MTLFunction> stage_function_dual(dev12 *d, const BYTECODE *code, dxil_
         int rc = dxil_to_msl_pixel(&m, sample_mask, dual_source, out);
         dxil_free(&m);
         if (rc) { vx_log("D3D12: %s not translated: %s", what, out->error); return nil; }
+        msl_override12(code, out);
     }
     if (out->uses_min_lod_clamp && !d3d12_metal_min_lod_clamp_supported(d->mtl)) {
         vx_log("D3D12: %s uses shader-level min-LOD sampling, which needs Metal Mac2/Apple6 support", what);
@@ -10120,6 +10161,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 break;
             }
             pass_dump_draw12(pso);
+            if (!t_cb_len12 || t_cb_log12[t_cb_len12 - 10] != 'p') cb_log12('p', pso->ps_code, 0, 0, 0);
             d3d12_draw_context context = {
                 .device = d, .render_encoder = &re, .graphics_state = g, .api_pipeline = pso,
                 .resource_heap = heap, .sampler_heap = sheap, .graphics_root = graphics, .scratch_buffer = sc
@@ -10169,6 +10211,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
         }
         case C_DISPATCH: {
             if (!pso || !pso->compute) { vx_log("D3D12: Dispatch without a compute pipeline state"); break; }
+            cb_log12('c', pso->cs_code, c->a, c->b, c->c);
             int mapping_result = d3d12_shader_component_mapping_read12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
                                                                         compute, heap, sheap);
             if (mapping_result != GPU_IR_OK) {
@@ -11269,12 +11312,14 @@ static void queue_execute_(void *this, uint32_t n, void *const *lists) {
             cb = [q->mtl_queue commandBufferWithDescriptor:cd];
         } else cb = [q->mtl_queue commandBuffer];
         scratch sc = { nil, 0, nil };
+        cb_log_reset12();
         if (!replay(d, q->mtl_queue, q->desc.Type, l, &shadows, &state_count, &cb, &sc)) {
             queue_discard_list_states12(shadows, state_count);
             continue;
         }
         // (the scratch memory lives until the GPU is done with it: held by the handler; Metal holds the rest)
         NSArray *held = sc.bufs;
+        char *what_ran = strdup(t_cb_log12);                   // (named when the command buffer fails)
         allocator12 *command_allocator = l->allocator;
         __atomic_add_fetch(&command_allocator->in_flight, 1, __ATOMIC_RELEASE);
         [cb encodeSignalEvent:q->timeline value:++q->timeline_value];
@@ -11283,9 +11328,12 @@ static void queue_execute_(void *this, uint32_t n, void *const *lists) {
         d3d_addref(&command_allocator->base);
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
             if (held) scratch_recycle(d, held);
+            char *ran = what_ran;
+            if (done.status != MTLCommandBufferStatusError) { free(ran); ran = NULL; }
             if (done.status == MTLCommandBufferStatusError) {
-                vx_log("D3D12: Metal command buffer failed: %s",
-                       done.error.localizedDescription.UTF8String ?: "unknown Metal error");
+                vx_log("D3D12: Metal command buffer failed: %s (it ran: %s)",
+                       done.error.localizedDescription.UTF8String ?: "unknown Metal error", ran ? ran : "?");
+                free(ran);
                 NSArray *infos = done.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
                 for (id<MTLCommandBufferEncoderInfo> info in infos)
                     if (info.errorState == MTLCommandEncoderErrorStateFaulted)

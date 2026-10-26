@@ -2770,11 +2770,14 @@ static int emit_image_write(const gpu_ir_shader *shader, const gpu_ir_shader_ins
         int rc = builder_appendf(body, "    if ");
         if (rc == GPU_IR_OK) rc = emit_descriptor_bounds_condition(body, image);
         if (rc == GPU_IR_OK)
-            rc = builder_appendf(body, " %s.write(%s, uint2(%s));\n",
+            rc = builder_appendf(body, " if (all(uint2(%s) < uint2(%s.get_width(), %s.get_height()))) %s.write(%s, uint2(%s));\n",
+                coordinate->expression, image->expression, image->expression,
                 image->expression, texel->expression, coordinate->expression);
         return rc;
     }
-    return builder_appendf(body, "    %s.write(%s, uint2(%s));\n",
+    // (outside the image the store does nothing, as D3D12 and Vulkan have it; Metal leaves it undefined)
+    return builder_appendf(body, "    if (all(uint2(%s) < uint2(%s.get_width(), %s.get_height()))) %s.write(%s, uint2(%s));\n",
+                           coordinate->expression, image->expression, image->expression,
                            image->expression, texel->expression, coordinate->expression);
 }
 

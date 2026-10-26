@@ -1459,12 +1459,22 @@ static void call(tr *t, const dxil_inst *in) {
         coords(t, in, 3, h->kind, "uint", c, sizeof c, layer, sizeof layer);
         int ints = h->comp == 4 || h->comp == 5 || h->comp == 2 || h->comp == 3;
         const char *vt = h->comp == 4 || h->comp == 2 ? "int4" : ints ? "uint4" : h->comp == 8 ? "half4" : "float4";
+        // (a store outside the texture does nothing in D3D12; in Metal it is undefined - on Apple GPUs a fault that
+        //  ends the command buffer as "Insufficient Memory")
         if (h->kind == 4 && h->cls == DXIL_UAV) {
-            line(t, "if (uint(%s) < %s->size) %s.write(%s(%s, %s, %s, %s), uint3(uint(%s), uint(%s), uint(%s) + %s->stride));",
-                 a[3], a[0], tex, vt, a[4], a[5], a[6], a[7], a[1], a[2], a[3], a[0]);
+            line(t, "if (uint(%s) < %s->size && uint(%s) < %s.get_width() && uint(%s) < %s.get_height()) %s.write(%s(%s, %s, %s, %s), uint3(uint(%s), uint(%s), uint(%s) + %s->stride));",
+                 a[3], a[0], a[1], tex, a[2], tex, tex, vt, a[4], a[5], a[6], a[7], a[1], a[2], a[3], a[0]);
             return;
         }
-        line(t, "%s.write(%s(%s, %s, %s, %s), %s%s);", tex, vt, a[4], a[5], a[6], a[7], c, layer);
+        char inside[512] = "true";
+        if (h->kind == 1) snprintf(inside, sizeof inside, "uint(%s) < %s.get_width()", a[1], tex);
+        else if (h->kind == 6) snprintf(inside, sizeof inside, "uint(%s) < %s.get_width() && uint(%s) < %s.get_array_size()", a[1], tex, a[2], tex);
+        else if (h->kind == 2) snprintf(inside, sizeof inside, "uint(%s) < %s.get_width() && uint(%s) < %s.get_height()", a[1], tex, a[2], tex);
+        else if (h->kind == 7) snprintf(inside, sizeof inside, "uint(%s) < %s.get_width() && uint(%s) < %s.get_height() && uint(%s) < %s.get_array_size()",
+                                        a[1], tex, a[2], tex, a[3], tex);
+        else if (h->kind == 4) snprintf(inside, sizeof inside, "uint(%s) < %s.get_width() && uint(%s) < %s.get_height() && uint(%s) < %s.get_depth()",
+                                        a[1], tex, a[2], tex, a[3], tex);
+        line(t, "if (%s) %s.write(%s(%s, %s, %s, %s), %s%s);", inside, tex, vt, a[4], a[5], a[6], a[7], c, layer);
         return;
     }
     case 68: case 139: {                                           // BufferLoad(res, index, wot), RawBufferLoad(res, index, offset, mask, align)
