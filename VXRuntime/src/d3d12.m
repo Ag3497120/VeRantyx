@@ -186,6 +186,8 @@ struct dev12 {
     id<MTLDevice> mtl;
     NSMutableArray *resources;       // every live buffer and texture (made resident for each command buffer)
     pthread_mutex_t lock;
+    volatile int nonidentity_srv;    // an SRV with a non-identity component mapping was made (the per-draw check of
+                                     // comparison sampling over such views is skipped until then)
     pthread_mutex_t submit_lock;     // preserves queue submission and tracked state order across calling threads
     pthread_mutex_t format_lock;
     uint32_t format_support1[256], format_support2[256];
@@ -198,7 +200,8 @@ struct dev12 {
     id<MTLCommandQueue> cpu_transfer_queue; // synchronous opaque-layout resource access
     id<MTLComputePipelineState> indirect_args_filter; // applies ExecuteIndirect count-buffer limits on the GPU
     void **bufs;                     // the buffers (res12), for a GPU address's buffer (vertex and index buffers)
-    uint32_t nbufs, capbufs;
+    uint32_t nbufs, capbufs;         // bufs: sorted by GPU address (bufs_find12)
+    uint64_t maxbuflen;              // the longest buffer's length (how far back a lookup looks)
     id<MTLComputePipelineState> occ_sum;   // adds a render pass's occlusion counts into a query heap (made when first needed)
     NSMutableArray *scratch_pool;    // scratch chunks no command buffer uses any more (scratch_lock)
     pthread_mutex_t scratch_lock;
@@ -373,6 +376,8 @@ typedef struct {
     uint32_t gs_in_verts, gs_max_tris, gs_out_regs, gs_vs_out_regs, gs_nattr;
     struct { uint32_t reg, offset, slot, instanced, step; MTLVertexFormat format; } gs_attr[32];
     uint64_t desc_hash;              // of the description it was made from (pipeline libraries, cached blobs)
+    uint64_t vs_code, ps_code, cs_code;  // hashes of the shaders' bytecode (VXRT_D3D12_PASS_DUMP names them; with
+                                     // VXRT_D3D12_SHADER_DUMP the bytecode is written as <hash>.dxil)
     // Tessellation (DXIL): the vertex shader as a kernel (gs_vs_source, gs_attr: as for geometry), the hull shader as a
     // kernel per patch writing control points, patch constants and Metal's tessellation factors, and `render` drawing
     // the patches with the domain shader as its post-tessellation vertex function.
@@ -498,10 +503,71 @@ static uint64_t msl_dump12(const char *msl) {
     }
     return h;
 }
+static uint64_t code_dump12(const void *code, size_t size) {
+    if (!code || !size) return 0;
+    uint64_t h = fnv1a12(0xcbf29ce484222325ull, code, size);
+    const char *dir = getenv("VXRT_D3D12_SHADER_DUMP");
+    if (dir) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%016llx.dxil", dir, (unsigned long long)h);
+        if (access(path, F_OK)) { FILE *f = fopen(path, "wb"); if (f) { fwrite(code, 1, size, f); fclose(f); } }
+    }
+    return h;
+}
 static double msl_clock12(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
 static void msl_timed12(const char *what, uint64_t hash, double start) {
     double t = msl_clock12() - start;
     if (t > 2.0) vx_log("D3D12: %s %016llx took %.1f s to compile", what, (unsigned long long)hash, t);
+}
+
+// VXRT_D3D12_FRAME_STATS=<ms> (default 50 when set to 1): each present that came more than <ms> after the last is
+// logged with what the runtime did in between (every thread's): pipeline states made and the time in them, shader
+// translation and Metal compiles, ExecuteCommandLists (and the time waiting for the submission lock), CPU fence
+// waits, the wait for a drawable, and the draws and dispatches skipped. Every 300 presents a summary of the same.
+typedef struct {
+    uint64_t pso_n, pso_ns, compile_n, compile_ns, exec_n, exec_ns, lock_ns, wait_ns, drawable_ns, skipped, sync_n, sync_ns;
+} frame_stats12;
+static frame_stats12 g_fs12, g_fs12_sum;
+static double frame_stats_ms12(void) {
+    static double ms = -1;
+    if (ms < 0) { const char *e = getenv("VXRT_D3D12_FRAME_STATS"); ms = !e ? 0 : atof(e) > 1 ? atof(e) : 50; }
+    return ms;
+}
+static uint64_t fs_now12(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+#define FS_ADD12(field, v) do { if (frame_stats_ms12() > 0) __atomic_fetch_add(&g_fs12.field, (uint64_t)(v), __ATOMIC_RELAXED); } while (0)
+static void frame_stats_present12(uint32_t presents) {
+    double limit = frame_stats_ms12();
+    if (limit <= 0) return;
+    static uint64_t last;
+    uint64_t now = fs_now12(), gap = last ? now - last : 0;
+    last = now;
+    frame_stats12 f;
+    #define TAKE12(x) f.x = __atomic_exchange_n(&g_fs12.x, 0, __ATOMIC_ACQ_REL); __atomic_fetch_add(&g_fs12_sum.x, f.x, __ATOMIC_RELAXED)
+    TAKE12(pso_n); TAKE12(pso_ns); TAKE12(compile_n); TAKE12(compile_ns); TAKE12(exec_n); TAKE12(exec_ns);
+    TAKE12(lock_ns); TAKE12(wait_ns); TAKE12(drawable_ns); TAKE12(skipped); TAKE12(sync_n); TAKE12(sync_ns);
+    #undef TAKE12
+    if (gap / 1e6 > limit)
+        vx_log("D3D12: frame %u took %.1f ms: %llu pipeline states (%.1f ms), %llu compiles (%.1f ms), %llu executes (%.1f ms, "
+               "%.1f ms of it for the submission lock), fence waits %.1f ms, drawable %.1f ms, %llu draws skipped, %llu GPU round trips (%.1f ms)",
+               presents, gap / 1e6, (unsigned long long)f.pso_n, f.pso_ns / 1e6, (unsigned long long)f.compile_n, f.compile_ns / 1e6,
+               (unsigned long long)f.exec_n, f.exec_ns / 1e6, f.lock_ns / 1e6, f.wait_ns / 1e6, f.drawable_ns / 1e6,
+               (unsigned long long)f.skipped, (unsigned long long)f.sync_n, f.sync_ns / 1e6);
+    static uint64_t window_start;
+    if (!window_start) window_start = now;
+    if (presents % 300 == 0) {
+        frame_stats12 t;
+        #define SUM12(x) t.x = __atomic_exchange_n(&g_fs12_sum.x, 0, __ATOMIC_ACQ_REL)
+        SUM12(pso_n); SUM12(pso_ns); SUM12(compile_n); SUM12(compile_ns); SUM12(exec_n); SUM12(exec_ns);
+        SUM12(lock_ns); SUM12(wait_ns); SUM12(drawable_ns); SUM12(skipped); SUM12(sync_n); SUM12(sync_ns);
+        #undef SUM12
+        double span = (now - window_start) / 1e6;
+        window_start = now;
+        vx_log("D3D12: last 300 presents in %.0f ms (%.1f fps): %llu pipeline states (%.0f ms), %llu compiles (%.0f ms), "
+               "%llu executes (%.0f ms, lock %.0f ms), fence waits %.0f ms, drawable %.0f ms, %llu draws skipped, %llu GPU round trips (%.0f ms)",
+               span, span > 0 ? 300000.0 / span : 0, (unsigned long long)t.pso_n, t.pso_ns / 1e6, (unsigned long long)t.compile_n,
+               t.compile_ns / 1e6, (unsigned long long)t.exec_n, t.exec_ns / 1e6, t.lock_ns / 1e6, t.wait_ns / 1e6,
+               t.drawable_ns / 1e6, (unsigned long long)t.skipped, (unsigned long long)t.sync_n, t.sync_ns / 1e6);
+    }
 }
 
 // Metal's compiler can take without end over a very large shader (a 34 000-line state machine in a game's upscaler
@@ -513,7 +579,14 @@ static double compile_timeout12(void) {
     if (t < 0) { const char *e = getenv("VXRT_D3D12_COMPILE_TIMEOUT"); t = e && atof(e) > 0 ? atof(e) : 30.0; }
     return t;
 }
+static id<MTLLibrary> library_with_timeout12_(id<MTLDevice> mtl, NSString *source, MTLCompileOptions *options, NSError **error);
 static id<MTLLibrary> library_with_timeout12(id<MTLDevice> mtl, NSString *source, MTLCompileOptions *options, NSError **error) {
+    uint64_t t0 = fs_now12();
+    id<MTLLibrary> lib = library_with_timeout12_(mtl, source, options, error);
+    FS_ADD12(compile_n, 1); FS_ADD12(compile_ns, fs_now12() - t0);
+    return lib;
+}
+static id<MTLLibrary> library_with_timeout12_(id<MTLDevice> mtl, NSString *source, MTLCompileOptions *options, NSError **error) {
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     __block id<MTLLibrary> result = nil;
     __block NSError *failure = nil;
@@ -1102,11 +1175,45 @@ static void residency_commit12(dev12 *d) {   // (d->lock)
     d->residency_dirty = 0;
 }
 
+// The buffers by GPU address: the first index whose buffer starts after va (device lock held).
+static uint32_t bufs_upper12(dev12 *d, uint64_t va) {
+    uint32_t lo = 0, hi = d->nbufs;
+    while (lo < hi) { uint32_t mid = (lo + hi) / 2; if (((res12 *)d->bufs[mid])->buffer.gpuAddress <= va) lo = mid + 1; else hi = mid; }
+    return lo;
+}
+// The buffer holding [va, va + size) (placed buffers may overlap: one that holds it), or NULL. Device lock held.
+static res12 *bufs_find12(dev12 *d, uint64_t va, uint64_t size) {
+    for (uint32_t i = bufs_upper12(d, va); i-- > 0; ) {
+        res12 *r = d->bufs[i];
+        uint64_t base = r->buffer.gpuAddress, length = r->buffer.length;
+        if (va - base > d->maxbuflen) break;                      // (no buffer starting this early reaches va)
+        if (va - base <= length && size <= length - (va - base)) return r;
+    }
+    return NULL;
+}
+static void bufs_insert12(dev12 *d, res12 *r) {
+    if (d->nbufs == d->capbufs) { d->capbufs = d->capbufs ? d->capbufs * 2 : 256; d->bufs = realloc(d->bufs, d->capbufs * sizeof *d->bufs); }
+    uint32_t at = bufs_upper12(d, r->buffer.gpuAddress);
+    memmove(&d->bufs[at + 1], &d->bufs[at], (d->nbufs - at) * sizeof *d->bufs);
+    d->bufs[at] = r;
+    d->nbufs++;
+    if (r->buffer.length > d->maxbuflen) d->maxbuflen = r->buffer.length;
+}
+static void bufs_remove12(dev12 *d, res12 *r) {
+    for (uint32_t i = bufs_upper12(d, r->buffer.gpuAddress); i-- > 0; ) {
+        if (d->bufs[i] != r) { if (((res12 *)d->bufs[i])->buffer.gpuAddress != r->buffer.gpuAddress) break; continue; }
+        memmove(&d->bufs[i], &d->bufs[i + 1], (d->nbufs - i - 1) * sizeof *d->bufs);
+        d->nbufs--;
+        return;
+    }
+    for (uint32_t i = 0; i < d->nbufs; i++)                        // (not where its address says: anywhere)
+        if (d->bufs[i] == r) { memmove(&d->bufs[i], &d->bufs[i + 1], (d->nbufs - i - 1) * sizeof *d->bufs); d->nbufs--; return; }
+}
 static void res_destroy(d3d_object *o) {
     res12 *r = (res12 *)o;
     dev12 *d = r->dev;
     pthread_mutex_lock(&d->lock);
-    for (uint32_t i = 0; r->buffer && i < d->nbufs; i++) if (d->bufs[i] == r) { d->bufs[i] = d->bufs[--d->nbufs]; break; }
+    if (r->buffer) bufs_remove12(d, r);
     if (r->buffer) [d->resources removeObjectIdenticalTo:r->buffer];
     if (r->texture) [d->resources removeObjectIdenticalTo:r->texture];
     residency_remove12(d, r->buffer ? (id<MTLResource>)r->buffer : (id<MTLResource>)r->texture);
@@ -1320,7 +1427,7 @@ static HRESULT res_texture_transfer12(res12 *resource, uint32_t subresource, con
             }
             [blit endEncoding];
             [command_buffer commit];
-            [command_buffer waitUntilCompleted];
+            { uint64_t sync_t0 = fs_now12(); [command_buffer waitUntilCompleted]; FS_ADD12(sync_n, 1); FS_ADD12(sync_ns, fs_now12() - sync_t0); }
             if (command_buffer.status != MTLCommandBufferStatusCompleted) {
                 vx_log("D3D12: CPU texture transfer failed: %s",
                        command_buffer.error.localizedDescription.UTF8String ?: "unknown Metal error");
@@ -1716,8 +1823,7 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
     // M1 Max, macOS 26. Its pages are resident through their heaps, which are in the set.)
     if (!reserved) residency_add12(d, r->buffer ? (id<MTLResource>)r->buffer : (id<MTLResource>)r->texture);
     if (r->buffer) {
-        if (d->nbufs == d->capbufs) { d->capbufs = d->capbufs ? d->capbufs * 2 : 256; d->bufs = realloc(d->bufs, d->capbufs * sizeof *d->bufs); }
-        d->bufs[d->nbufs++] = r;
+        bufs_insert12(d, r);
     }
     pthread_mutex_unlock(&d->lock);
     if (!out) { d3d_release(&r->base); return S_FALSE; }
@@ -2638,7 +2744,9 @@ static id<MTLTexture> texture_view(res12 *r, uint32_t format, MTLTextureType typ
     int depth_src = src == MTLPixelFormatDepth16Unorm || src == MTLPixelFormatDepth32Float ||
                     src == MTLPixelFormatDepth32Float_Stencil8 || src == MTLPixelFormatDepth24Unorm_Stencil8;
     if (depth_src && fmt != src) {
-        int stencil = format == 47 || format == 118 || format == 117 || format == 46;   // X24_G8 / X32_G8 views (and typeless)
+        // (the stencil views: X32_TYPELESS_G8X24_UINT 22, X24_TYPELESS_G8_UINT 47 - R32_FLOAT_X8X24 21 and
+        //  R24_UNORM_X8 46 are the depth's)
+        int stencil = format == 22 || format == 47 || format == 118 || format == 117;
         if (stencil && src == MTLPixelFormatDepth32Float_Stencil8) fmt = MTLPixelFormatX32_Stencil8;
         else if (stencil && src == MTLPixelFormatDepth24Unorm_Stencil8) fmt = MTLPixelFormatX24_Stencil8;
         else if (!stencil || (fmt != MTLPixelFormatX32_Stencil8 && fmt != MTLPixelFormatX24_Stencil8)) fmt = src;
@@ -2801,9 +2909,28 @@ static WINAPI void dev_create_srv(void *this, void *resource, const SRV_DESC *de
     float resource_min_lod = 0.0f;
     uint32_t raw_component_mapping = desc ? desc->mapping : 0x1688u;
     uint32_t component_mapping = 0;
+    int stencil_swizzle = 0;
+    // A stencil view: Metal reads the stencil in .r, D3D12 in .g (X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT: R
+    // and B read 0, A 1). The view's mapping is composed with that, as a swizzle the shader applies.
+    if (desc && (desc->format == 22 || desc->format == 47) && r && r->texture &&
+        (r->texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || r->texture.pixelFormat == MTLPixelFormatDepth24Unorm_Stencil8) &&
+        (raw_component_mapping & (1u << 12)) && !(raw_component_mapping & ~0x1fffu)) {
+        static const uint32_t to_metal[6] = { 4, 0, 4, 5, 4, 5 };     // D3D12 source selector -> where Metal has it
+        uint32_t composed = 1u << 12;
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t sel = (raw_component_mapping >> (c * 3)) & 7u;
+            composed |= (sel <= 5 ? to_metal[sel] : sel) << (c * 3);
+        }
+        raw_component_mapping = composed;
+        stencil_swizzle = 1;
+    }
     int mapping_valid = !desc || d3d12_normalize_srv_component_mapping12(raw_component_mapping, &component_mapping);
     int texture_view_valid = mapping_valid;
     if (!mapping_valid) vx_log("D3D12: invalid SRV Shader4ComponentMapping; descriptor left null");
+    if (mapping_valid && component_mapping && !stencil_swizzle && !((dev12 *)this)->nonidentity_srv) {
+        ((dev12 *)this)->nonidentity_srv = 1;
+        vx_log("D3D12: an SRV with component mapping %#x: comparison sampling is checked at each draw from now on", raw_component_mapping);
+    }
     if (r && (r->desc.Flags & 0x8)) {
         vx_log("D3D12: DENY_SHADER_RESOURCE resource cannot create an SRV; descriptor left null");
     } else if (r && r->buffer) {
@@ -3039,7 +3166,9 @@ static WINAPI HRESULT fence_set_event(void *this, uint64_t value, HANDLE h) {
     if (!h) {                                                      // (no event: wait here)
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [f->event notifyListener:f->listener atValue:value block:^(id<MTLSharedEvent> e, uint64_t v) { dispatch_semaphore_signal(sem); }];
+        uint64_t t0 = fs_now12();
         dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        FS_ADD12(wait_ns, fs_now12() - t0);
         return S_OK;
     }
     [f->event notifyListener:f->listener atValue:value block:^(id<MTLSharedEvent> e, uint64_t v) { vx_set_event(h); }];
@@ -3243,6 +3372,13 @@ static MTLCompileOptions *d3d12_shader_compile_options12(dev12 *device, const dx
 static int d3d12_is_dxbc_program(const BYTECODE *code);
 static int dxbc_to_msl12(const BYTECODE *code, dxil_msl *out);
 static void dxbc_reflect12(const dxbc_shader *src, dxil_msl *out);
+// VXRT_D3D12_NO_COMMON_IR=<mask>: shaders translated directly instead of through the common IR - 1 compute, 2 pixel,
+// 4 vertex (to tell one translation's mistake from the other's).
+static int no_common_ir12(int what) {
+    static int mask = -1;
+    if (mask < 0) { const char *e = getenv("VXRT_D3D12_NO_COMMON_IR"); mask = e ? atoi(e) : 0; }
+    return (mask & what) != 0;
+}
 static HRESULT create_compute_pso12(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
     int dxbc = d3d12_is_dxbc_program(&desc->cs);
@@ -3250,6 +3386,7 @@ static HRESULT create_compute_pso12(void *this, const COMPUTE_PSO_DESC *desc, co
     if (!dxbc && dxil_read(desc->cs.code, desc->cs.size, &m)) { vx_log("D3D12: compute shader: %s", m.error); return E_INVALIDARG; }
     pso12 *p = alloc12(sizeof *p, K12_PSO, g_pso_vtbl, d);
     p->base.destroy = pso_destroy;
+    p->cs_code = code_dump12(desc->cs.code, desc->cs.size);
     gpu_ir_shader *common_shader = NULL;
     int rc;
     if (dxbc) {
@@ -3258,7 +3395,7 @@ static HRESULT create_compute_pso12(void *this, const COMPUTE_PSO_DESC *desc, co
     } else {
         rc = dxil_to_msl(&m, &p->msl);
         if (!rc) {
-            int ir_rc = dxil_build_gpu_ir_shader(&m, DXIL_IR_ENTRY_FUNCTION, &common_shader);
+            int ir_rc = no_common_ir12(1) ? GPU_IR_UNSUPPORTED : dxil_build_gpu_ir_shader(&m, DXIL_IR_ENTRY_FUNCTION, &common_shader);
             if (ir_rc != GPU_IR_OK && ir_rc != GPU_IR_UNSUPPORTED)
                 vx_log("D3D12: compute shader common-IR lowering returned %d; retaining direct DXIL translation", ir_rc);
         }
@@ -4717,13 +4854,7 @@ static int state_validate_resource_use_desc12(dev12 *device, int32_t queue_type,
 }
 static res12 *state_resource_for_gpu_range_locked12(dev12 *device, uint64_t va, uint64_t size) {
     if (!va || !size || size > UINT64_MAX - va) return NULL;
-    for (uint32_t i = 0; i < device->nbufs; i++) {
-        res12 *resource = device->bufs[i];
-        if (!resource || !resource->buffer) continue;
-        uint64_t base = resource->buffer.gpuAddress, length = resource->buffer.length;
-        if (va >= base && va - base <= length && size <= length - (va - base)) return resource;
-    }
-    return NULL;
+    return bufs_find12(device, va, size);
 }
 
 static WINAPI void list_barrier(void *this, uint32_t n, const void *barriers) {
@@ -5460,6 +5591,8 @@ static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const
     }
     pso12 *p = alloc12(sizeof *p, K12_PSO, g_pso_vtbl, d);
     p->base.destroy = pso_destroy;
+    p->vs_code = code_dump12(desc->vs.code, desc->vs.size);
+    p->ps_code = code_dump12(desc->ps.code, desc->ps.size);
     MTLRenderPipelineDescriptor *rp = [MTLRenderPipelineDescriptor new];
     rp.vertexFunction = stage_function(d, &desc->vs, &p->vs, "vertex shader", UINT32_MAX);
     if (desc->ps.size) {
@@ -5470,7 +5603,7 @@ static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const
                                   (b0->src_a >= 16 && b0->src_a <= 19) || (b0->dst_a >= 16 && b0->dst_a <= 19));
         rp.fragmentFunction = stage_function_dual(d, &desc->ps, &p->ps, "pixel shader", desc->sample_mask, dual);
         if (!rp.fragmentFunction) { d3d_release(&p->base); return E_INVALIDARG; }
-        if (desc->sample_mask == UINT32_MAX && desc->nrt == 1) {
+        if (desc->sample_mask == UINT32_MAX && desc->nrt == 1 && !no_common_ir12(2)) {
             gpu_ir_shader *common_shader = NULL;
             id<MTLFunction> common_function = common_fragment_stage_function12(d, &desc->ps, &p->ps,
                                                                                &common_shader);
@@ -5552,7 +5685,7 @@ static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const
         }
     }
     gpu_ir_shader *common_vertex_shader = NULL;
-    id<MTLFunction> common_vertex_function = common_vertex_stage_function12(d, &desc->vs, &p->vs,
+    id<MTLFunction> common_vertex_function = no_common_ir12(4) ? nil : common_vertex_stage_function12(d, &desc->vs, &p->vs,
                                                                             &common_vertex_shader);
     if (common_vertex_function && common_vertex_inputs_bound12(common_vertex_shader, &common_vertex_input, &p->vs)) {
         rp.vertexFunction = common_vertex_function;
@@ -7180,11 +7313,8 @@ static uint64_t resolve_slot(dev12 *d, const rootsig12 *rs, const root_state *st
 static id<MTLBuffer> buffer_at(dev12 *d, uint64_t va, uint64_t *off) {
     pthread_mutex_lock(&d->lock);
     id<MTLBuffer> found = nil;
-    for (uint32_t i = 0; i < d->nbufs; i++) {
-        res12 *r = d->bufs[i];
-        uint64_t base = r->buffer.gpuAddress;
-        if (va >= base && va < base + r->buffer.length) { found = r->buffer; *off = va - base; break; }
-    }
+    res12 *r = va ? bufs_find12(d, va, 1) : NULL;
+    if (r) { found = r->buffer; *off = va - r->buffer.gpuAddress; }
     pthread_mutex_unlock(&d->lock);
     return found;
 }
@@ -7460,8 +7590,8 @@ static int gpu_ir_snapshot_root_bindings12(dev12 *device, const dxil_msl *shader
     gpu_ir_descriptor_state **out_state) {
     return gpu_ir_snapshot_root_bindings12_ex(device, shader, stage, root_binding, resource_heap, sampler_heap, out_state, 0);
 }
-// bounded_only: unbounded ranges (bindless arrays reaching hundreds of thousands of descriptors) are left out; what
-// they reach is declared once an encoder (the heap's textures) instead of at every draw.
+// bounded_only: unbounded ranges (bindless arrays reaching hundreds of thousands of descriptors) and bounded arrays of
+// more than 64 are left out; what they reach is declared once an encoder (the heap's textures) instead of at every draw.
 static int gpu_ir_snapshot_root_bindings12_ex(dev12 *device, const dxil_msl *shader, uint32_t stage,
     root_binding *root_binding, heap12 *resource_heap, heap12 *sampler_heap,
     gpu_ir_descriptor_state **out_state, int bounded_only) {
@@ -7506,7 +7636,9 @@ static int gpu_ir_snapshot_root_bindings12_ex(dev12 *device, const dxil_msl *sha
         uint64_t heap_available = heap->desc.NumDescriptors - first;
         uint64_t range_available = range->count == UINT32_MAX ? UINT64_MAX :
             (uint64_t)range->count - (slot->lower - range->base);
-        if (bounded_only && slot->count == UINT32_MAX && slot->cls != DXIL_SAMPLER) continue;
+        // (so are large bounded arrays: a Texture2D t[2048] walked at every draw cost Cyberpunk 2077's character
+        //  creator 2.6 s a frame)
+        if (bounded_only && slot->cls != DXIL_SAMPLER && (slot->count == UINT32_MAX || slot->count > 64)) continue;
         uint64_t elements = slot->count == UINT32_MAX ? MIN(heap_available, range_available) :
             (slot->count ? slot->count : 1);
         if (!elements || elements > heap_available || elements > range_available) {
@@ -7550,7 +7682,7 @@ static int gpu_ir_snapshot_root_bindings12_ex(dev12 *device, const dxil_msl *sha
 
 static int d3d12_shader_component_mapping_read12(dev12 *device, const dxil_msl *shader, uint32_t stage,
     root_binding *root, heap12 *resource_heap, heap12 *sampler_heap) {
-    if (!device || !shader || !shader->uses_component_mapping_unsupported_read) return GPU_IR_OK;
+    if (!device || !shader || !shader->uses_component_mapping_unsupported_read || !device->nonidentity_srv) return GPU_IR_OK;
     int mapped = 0;
     if (shader->nslots) {
         gpu_ir_descriptor_state *bindings = NULL;
@@ -7985,10 +8117,263 @@ static id<MTLComputePipelineState> occ_sum_pipeline(dev12 *d) {
 }
 
 // Ends the open render pass, adding what its occlusion queries counted into their heap.
+
+// ---- VXRT_D3D12_PASS_DUMP=<folder>: one frame's passes as pictures ------------------------------------------------
+// When <folder>/now appears (it is removed), the frame after the next present is taken apart: each render pass's
+// color and depth attachments as it leaves them, and each texture a dispatch writes, are written as PNGs
+// (<frame>-<nnnn>-<what>.png: float formats tone-mapped x/(1+x), NaN and infinity magenta, depth as grey) and a line
+// per pass and dispatch names its shaders (their bytecode hashes; VXRT_D3D12_SHADER_DUMP writes the bytecode).
+static const char *pass_dump_dir12(void) {
+    static const char *dir = (const char *)-1;
+    if (dir == (const char *)-1) { dir = getenv("VXRT_D3D12_PASS_DUMP"); if (dir && !*dir) dir = NULL; }
+    return dir;
+}
+static volatile int g_dump_armed12;                 // 1 while the frame being dumped is recorded
+static volatile int g_dump_frame12, g_dump_seq12;
+static __thread void *t_pass_tex12[9];               // (retained: CFBridgingRetain)
+static __thread int t_pass_id12, t_pass_draws12, t_pass_npso12;
+static __thread uint64_t t_pass_pso12[24][2];
+static __thread void *t_pass_srv12[32];                // (VXRT_D3D12_PASS_DUMP_PS=<hash>: that pixel shader's textures)
+static __thread int t_pass_nsrv12;
+static __thread void *t_pass_buf12[16];                // (and the small buffers it reads: their first floats logged)
+static __thread int t_pass_nbuf12;
+static int pass_dump_ps12(uint64_t ps) {            // (a comma-separated list of hashes, or "all")
+    const char *e = getenv("VXRT_D3D12_PASS_DUMP_PS");
+    if (!e || !ps) return 0;
+    if (!strcmp(e, "all")) return 1;
+    for (const char *c = e; *c; ) {
+        char *end;
+        uint64_t h = strtoull(c, &end, 16);
+        if (h == ps) return 1;
+        if (end == c) break;
+        c = *end == ',' ? end + 1 : end;
+    }
+    return 0;
+}
+static void pass_dump_present12(void) {
+    const char *dir = pass_dump_dir12();
+    if (!dir) return;
+    if (g_dump_armed12) { g_dump_armed12 = 0; vx_log("D3D12: pass dump %d done (%d pictures)", g_dump_frame12, g_dump_seq12); return; }
+    char path[1024];
+    snprintf(path, sizeof path, "%s/now", dir);
+    if (access(path, F_OK)) return;
+    unlink(path);
+    g_dump_frame12++;
+    g_dump_seq12 = 0;
+    g_dump_armed12 = 1;
+    vx_log("D3D12: pass dump %d: the next frame's passes go to %s", g_dump_frame12, dir);
+}
+static id<MTLComputePipelineState> pass_dump_pipeline12(id<MTLDevice> mtl, int depth) {
+    static id<MTLComputePipelineState> p[3];
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (!p[depth]) {
+        NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void vx_dump(texture2d<float, access::read> t [[texture(0)]], device uchar4 *out [[buffer(0)]],\n"
+            "                    constant uint4 &k [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {\n"
+            "  if (g.x >= k.x || g.y >= k.y) return;\n"
+            "  float4 v = t.read(g); bool bad = any(isnan(v)) || any(isinf(v));\n"
+            "  if (k.z) v = v / (1.0f + abs(v));\n"
+            "  float4 c = clamp(v, 0.0f, 1.0f);\n"
+            "  if (k.w == 1) c = float4(c.r, c.r, c.r, 1); else if (k.w == 2) c = float4(c.r, c.g, 0, 1);\n"
+            "  out[g.y * k.x + g.x] = bad ? uchar4(255, 0, 255, 255) : uchar4(uchar(c.b * 255), uchar(c.g * 255), uchar(c.r * 255), 255);\n"
+            "}\n"
+            "kernel void vx_dump_depth(depth2d<float, access::read> t [[texture(0)]], device uchar4 *out [[buffer(0)]],\n"
+            "                    constant uint4 &k [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {\n"
+            "  if (g.x >= k.x || g.y >= k.y) return;\n"
+            "  float d = t.read(g); float v = isnan(d) ? 0 : pow(clamp(d, 0.0f, 1.0f), 0.25f);\n"
+            "  uchar u = uchar(v * 255); out[g.y * k.x + g.x] = uchar4(u, u, u, 255);\n"
+            "}\n"
+            "kernel void vx_dump_stencil(texture2d<uint, access::read> t [[texture(0)]], device uchar4 *out [[buffer(0)]],\n"
+            "                    constant uint4 &k [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {\n"
+            "  if (g.x >= k.x || g.y >= k.y) return;\n"
+            "  uint v = t.read(g).r & 255u;\n"
+            "  out[g.y * k.x + g.x] = v ? uchar4(uchar((v * 151u) & 255u), uchar((v * 91u) & 255u), uchar(64u + (v & 3u) * 60u), 255) : uchar4(0, 0, 0, 255);\n"
+            "}\n";
+        NSError *err = nil;
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:src options:nil error:&err];
+        id<MTLFunction> fn = [lib newFunctionWithName:depth == 2 ? @"vx_dump_stencil" : depth ? @"vx_dump_depth" : @"vx_dump"];
+        p[depth] = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+        if (!p[depth]) vx_log("D3D12: pass dump kernel: %s", err.localizedDescription.UTF8String);
+    }
+    pthread_mutex_unlock(&lock);
+    return p[depth];
+}
+static int pass_dump_format12(MTLPixelFormat f, int *hdr, int *chan, int *depth) {
+    *hdr = 0; *chan = 0; *depth = 0;
+    switch (f) {
+    case MTLPixelFormatDepth32Float: case MTLPixelFormatDepth16Unorm: case MTLPixelFormatDepth32Float_Stencil8: *depth = 1; return 1;
+    case MTLPixelFormatX32_Stencil8: *depth = 2; return 1;
+    case MTLPixelFormatR16Float: case MTLPixelFormatR32Float: *hdr = 1; *chan = 1; return 1;
+    case MTLPixelFormatRG16Float: case MTLPixelFormatRG32Float: *hdr = 1; *chan = 2; return 1;
+    case MTLPixelFormatRGBA16Float: case MTLPixelFormatRGBA32Float: case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float: *hdr = 1; return 1;
+    case MTLPixelFormatR8Unorm: case MTLPixelFormatR16Unorm: case MTLPixelFormatR8Snorm: case MTLPixelFormatR16Snorm: *chan = 1; return 1;
+    case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG8Snorm: case MTLPixelFormatRG16Snorm: *chan = 2; return 1;
+    case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatBGR10A2Unorm: case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA8Snorm:
+    case MTLPixelFormatRGBA16Snorm: return 1;
+    default: return 0;
+    }
+}
+// Encodes the copy of `t` (mip 0, slice 0) into a new compute encoder of `cb` (or `into`), the PNG written when the
+// command buffer completes.
+static void pass_dump_texture12(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> into, id<MTLTexture> t, const char *what) {
+    if (!t || t.sampleCount > 1) return;
+    int hdr, chan, depth;
+    if (!pass_dump_format12(t.pixelFormat, &hdr, &chan, &depth)) return;
+    id<MTLTexture> view = t;
+    if (t.textureType != MTLTextureType2D || t.mipmapLevelCount > 1) {
+        if (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray && t.textureType != MTLTextureTypeCube) return;
+        if (!(t.usage & MTLTextureUsagePixelFormatView) && t.textureType != MTLTextureType2D) { /* (views of the same format are allowed) */ }
+        view = [t newTextureViewWithPixelFormat:t.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+        if (!view) return;
+    }
+    id<MTLComputePipelineState> pipe = pass_dump_pipeline12(cb.device, depth);
+    if (!pipe) return;
+    uint32_t w = (uint32_t)view.width, h = (uint32_t)view.height;
+    id<MTLBuffer> out = [cb.device newBufferWithLength:(NSUInteger)w * h * 4 options:MTLResourceStorageModeShared];
+    if (!out) return;
+    id<MTLComputeCommandEncoder> e = into ? into : [cb computeCommandEncoder];
+    if (into) [e memoryBarrierWithScope:MTLBarrierScopeTextures | MTLBarrierScopeBuffers];
+    [e setComputePipelineState:pipe];
+    [e setTexture:view atIndex:0];
+    [e setBuffer:out offset:0 atIndex:0];
+    uint32_t k[4] = { w, h, (uint32_t)hdr, (uint32_t)chan };
+    [e setBytes:k length:sizeof k atIndex:1];
+    [e useResource:view usage:MTLResourceUsageRead];
+    [e dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    if (!into) [e endEncoding];
+    else [e memoryBarrierWithScope:MTLBarrierScopeTextures | MTLBarrierScopeBuffers];
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%d-%04d-%s-fmt%lu.png", pass_dump_dir12(), g_dump_frame12, __sync_add_and_fetch(&g_dump_seq12, 1), what,
+             (unsigned long)t.pixelFormat);
+    NSString *file = @(path);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(out.contents, w, h, 8, w * 4, cs, kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
+        CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+        CGImageDestinationRef dst = img ? CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:file], CFSTR("public.png"), 1, NULL) : NULL;
+        if (dst) { CGImageDestinationAddImage(dst, img, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); }
+        if (img) CGImageRelease(img);
+        if (ctx) CGContextRelease(ctx);
+        CGColorSpaceRelease(cs);
+    }];
+}
+static void pass_dump_opened12(MTLRenderPassDescriptor *descriptor) {
+    if (!g_dump_armed12) return;
+    for (int k = 0; k < 9; k++) if (t_pass_tex12[k]) { CFBridgingRelease(t_pass_tex12[k]); t_pass_tex12[k] = NULL; }
+    for (int k = 0; k < 8; k++) if (descriptor.colorAttachments[k].texture) t_pass_tex12[k] = (void *)CFBridgingRetain(descriptor.colorAttachments[k].texture);
+    if (descriptor.depthAttachment.texture) t_pass_tex12[8] = (void *)CFBridgingRetain(descriptor.depthAttachment.texture);
+    t_pass_id12 = __sync_add_and_fetch(&g_dump_seq12, 1);
+    t_pass_draws12 = 0;
+    t_pass_npso12 = 0;
+}
+static void pass_dump_draw12(const pso12 *p) {
+    if (!g_dump_armed12 || !t_pass_id12 || !p) return;
+    t_pass_draws12++;
+    for (int i = 0; i < t_pass_npso12; i++) if (t_pass_pso12[i][0] == p->vs_code && t_pass_pso12[i][1] == p->ps_code) return;
+    if (t_pass_npso12 < 24) { t_pass_pso12[t_pass_npso12][0] = p->vs_code; t_pass_pso12[t_pass_npso12][1] = p->ps_code; t_pass_npso12++; }
+}
+static void pass_dump_srvs12(const pso12 *p, const gpu_ir_resource_access *a, uint32_t n) {
+    if (!g_dump_armed12 || !t_pass_id12 || !p || !pass_dump_ps12(p->ps_code)) return;
+    for (uint32_t i = 0; i < n && t_pass_nsrv12 < 32; i++) {
+        if (!(a[i].access_mask & GPU_IR_ACCESS_SHADER_READ)) continue;
+        id obj = (__bridge id)gpu_ir_backend_object(a[i].resource);
+        if ([obj conformsToProtocol:@protocol(MTLBuffer)] && ((id<MTLBuffer>)obj).length <= 4096) {
+            int dup = 0;
+            for (int k = 0; k < t_pass_nbuf12; k++) if (t_pass_buf12[k] == (__bridge void *)obj) dup = 1;
+            if (!dup && t_pass_nbuf12 < 16) t_pass_buf12[t_pass_nbuf12++] = (void *)CFBridgingRetain(obj);
+            continue;
+        }
+        if (![obj conformsToProtocol:@protocol(MTLTexture)]) continue;
+        int dup = 0;
+        for (int k = 0; k < t_pass_nsrv12; k++) if (t_pass_srv12[k] == (__bridge void *)obj) dup = 1;
+        if (!dup) t_pass_srv12[t_pass_nsrv12++] = (void *)CFBridgingRetain(obj);
+    }
+}
+static void pass_dump_closed12(id<MTLCommandBuffer> cb) {
+    if (!t_pass_id12) return;
+    int pass = t_pass_id12;
+    t_pass_id12 = 0;
+    for (int k = 0; k < t_pass_nsrv12; k++) {
+        id<MTLTexture> t = (id<MTLTexture>)CFBridgingRelease(t_pass_srv12[k]);
+        t_pass_srv12[k] = NULL;
+        if (!g_dump_armed12) continue;
+        vx_log("D3D12: pass dump %d: pass %d reads texture %d: %lux%lu fmt %lu type %lu mips %lu", g_dump_frame12, pass, k,
+               (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, (unsigned long)t.textureType,
+               (unsigned long)t.mipmapLevelCount);
+        char what[64];
+        snprintf(what, sizeof what, "pass%d-srv%d", pass, k);
+        pass_dump_texture12(cb, nil, t, what);
+    }
+    t_pass_nsrv12 = 0;
+    for (int k = 0; k < t_pass_nbuf12; k++) {
+        id<MTLBuffer> b = (id<MTLBuffer>)CFBridgingRelease(t_pass_buf12[k]);
+        t_pass_buf12[k] = NULL;
+        if (!g_dump_armed12 || !b) continue;
+        NSUInteger len = b.length;
+        id<MTLBuffer> copy = [cb.device newBufferWithLength:len options:MTLResourceStorageModeShared];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromBuffer:b sourceOffset:0 toBuffer:copy destinationOffset:0 size:len];
+        [blit endEncoding];
+        int frame = g_dump_frame12, kk = k;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)done;
+            const float *f = copy.contents;
+            char line[1024]; int n = snprintf(line, sizeof line, "D3D12: pass dump %d: pass %d buffer %d (%lu bytes):", frame, pass, kk, (unsigned long)len);
+            for (NSUInteger j = 0; j < len / 4 && j < 24 && n < (int)sizeof line; j++) n += snprintf(line + n, sizeof line - n, " %g", f[j]);
+            vx_log("%s", line);
+        }];
+    }
+    t_pass_nbuf12 = 0;
+    id<MTLTexture> tex[9];
+    for (int k = 0; k < 9; k++) { tex[k] = t_pass_tex12[k] ? (id<MTLTexture>)CFBridgingRelease(t_pass_tex12[k]) : nil; t_pass_tex12[k] = NULL; }
+    if (!g_dump_armed12) return;
+    char line[2048];
+    int n = snprintf(line, sizeof line, "D3D12: pass dump %d: pass %d, %d draws:", g_dump_frame12, pass, t_pass_draws12);
+    for (int k = 0; k < 9; k++) {
+        id<MTLTexture> t = tex[k];
+        if (!t) continue;
+        if (n < (int)sizeof line) n += snprintf(line + n, sizeof line - n, " %s%d %lux%lu fmt %lu", k == 8 ? "depth" : "c", k == 8 ? 0 : k,
+                                                (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat);
+    }
+    for (int i = 0; i < t_pass_npso12 && n < (int)sizeof line; i++)
+        n += snprintf(line + n, sizeof line - n, " [vs %016llx ps %016llx]", (unsigned long long)t_pass_pso12[i][0], (unsigned long long)t_pass_pso12[i][1]);
+    vx_log("%s", line);
+    for (int k = 0; k < 9; k++) {
+        if (!tex[k]) continue;
+        char what[64];
+        snprintf(what, sizeof what, "pass%d-%s%d", pass, k == 8 ? "depth" : "c", k == 8 ? 0 : k);
+        pass_dump_texture12(cb, nil, tex[k], what);
+        if (k == 8 && tex[k].pixelFormat == MTLPixelFormatDepth32Float_Stencil8 && tex[k].mipmapLevelCount == 1 && tex[k].textureType == MTLTextureType2D) {
+            id<MTLTexture> sv = [tex[k] newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+            snprintf(what, sizeof what, "pass%d-stencil", pass);
+            if (sv) pass_dump_texture12(cb, nil, sv, what);
+        }
+    }
+}
+static void pass_dump_dispatch12(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> ce, const pso12 *p,
+                                 const gpu_ir_resource_access *a, uint32_t n, uint32_t x, uint32_t y, uint32_t z) {
+    int step = __sync_add_and_fetch(&g_dump_seq12, 1);
+    vx_log("D3D12: pass dump %d: dispatch %d %ux%ux%u of cs %016llx", g_dump_frame12, step, x, y, z, (unsigned long long)(p ? p->cs_code : 0));
+    if (!ce) return;
+    int shown = 0;
+    for (uint32_t i = 0; i < n && shown < 4; i++) {
+        if (!(a[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
+        id obj = (__bridge id)gpu_ir_backend_object(a[i].resource);
+        if (![obj conformsToProtocol:@protocol(MTLTexture)]) continue;
+        char what[64];
+        snprintf(what, sizeof what, "dispatch%d-cs%016llx-u%u", step, (unsigned long long)(p ? p->cs_code : 0), i);
+        pass_dump_texture12(cb, ce, (id<MTLTexture>)obj, what);
+        shown++;
+    }
+}
 static void close_pass(dev12 *d, gfx_state *g, id<MTLCommandBuffer> cb, id<MTLRenderCommandEncoder> __strong *re) {
     if (!*re) return;
     [*re endEncoding];
     *re = nil;
+    pass_dump_closed12(cb);
     g->changed = 1;
     if (g->pass_heap && g->npass) {
         id<MTLComputePipelineState> p = occ_sum_pipeline(d);
@@ -8070,6 +8455,7 @@ static int open_render_pass12(dev12 *device, gfx_state *g, id<MTLCommandBuffer> 
     }
     *render_encoder = [command_buffer renderCommandEncoderWithDescriptor:descriptor];
     if (!*render_encoder) { g->pass_heap = NULL; g->pass_vis = nil; return 0; }
+    pass_dump_opened12(descriptor);
     if (gpu_errors12()) {                                          // (named for VXRT_D3D12_GPU_ERRORS reports)
         NSMutableString *name = [NSMutableString stringWithFormat:@"pass %lux%lu samples %lu:", (unsigned long)descriptor.renderTargetWidth,
                                  (unsigned long)descriptor.renderTargetHeight, (unsigned long)descriptor.defaultRasterSampleCount];
@@ -9396,7 +9782,7 @@ static int d3d12_indirect_preflight_gpu_records12(id<MTLCommandQueue> queue, con
     }
     [blit endEncoding];
     [command_buffer commit];
-    [command_buffer waitUntilCompleted];
+    { uint64_t sync_t0 = fs_now12(); [command_buffer waitUntilCompleted]; FS_ADD12(sync_n, 1); FS_ADD12(sync_ns, fs_now12() - sync_t0); }
     if (command_buffer.status != MTLCommandBufferStatusCompleted || !staging.contents) return 0;
 
     uint32_t available = command->a;
@@ -9464,7 +9850,7 @@ static int d3d12_indirect_gpu_records12(dev12 *device, id<MTLCommandQueue> queue
     [*blit_encoder endEncoding];
     *blit_encoder = nil;
     [current commit];
-    [current waitUntilCompleted];
+    { uint64_t sync_t0 = fs_now12(); [current waitUntilCompleted]; FS_ADD12(sync_n, 1); FS_ADD12(sync_ns, fs_now12() - sync_t0); }
     if (current.status != MTLCommandBufferStatusCompleted) {
         vx_log("D3D12: Metal command buffer failed while staging ExecuteIndirect records: %s",
                current.error.localizedDescription.UTF8String ?: "unknown Metal error");
@@ -9733,6 +10119,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 vx_log("D3D12: could not open a render pass for a draw");
                 break;
             }
+            pass_dump_draw12(pso);
             d3d12_draw_context context = {
                 .device = d, .render_encoder = &re, .graphics_state = g, .api_pipeline = pso,
                 .resource_heap = heap, .sampler_heap = sheap, .graphics_root = graphics, .scratch_buffer = sc
@@ -9775,15 +10162,23 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 if (c->gpu_ir_recorded) rc = gpu_ir_execute(&l->gpu_ir, c->gpu_ir_index, &backend);
                 else rc = d3d12_gpu_ir_draw(&context, pso->gpu_pipeline, &draw, NULL, 0);
             }
+            if (g_dump_armed12) pass_dump_srvs12(pso, accesses.values, accesses.count);
             gpu_ir_access_list_release12(&accesses);
-            if (rc != GPU_IR_OK) vx_log("D3D12: common GPU IR draw failed (error %d)", rc);
+            if (rc != GPU_IR_OK) { FS_ADD12(skipped, 1); vx_log("D3D12: common GPU IR draw failed (error %d)", rc); }
             break;
         }
         case C_DISPATCH: {
             if (!pso || !pso->compute) { vx_log("D3D12: Dispatch without a compute pipeline state"); break; }
             int mapping_result = d3d12_shader_component_mapping_read12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
                                                                         compute, heap, sheap);
-            if (mapping_result != GPU_IR_OK) break;
+            if (mapping_result != GPU_IR_OK) {
+                FS_ADD12(skipped, 1);
+                static volatile int told;
+                if (__sync_add_and_fetch(&told, 1) <= 20)
+                    vx_log("D3D12: dispatch of pipeline %016llx skipped: its component mapping could not be read (error %d)",
+                           (unsigned long long)pso->desc_hash, mapping_result);
+                break;
+            }
             if (c->gpu_ir_recorded || c->gpu_ir_transient) {
                 d3d12_dispatch_context context = {
                     .device = d, .command_buffer = (__bridge void *)cb,
@@ -9812,8 +10207,9 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                     if (c->gpu_ir_recorded) rc = gpu_ir_execute(&l->gpu_ir, c->gpu_ir_index, &backend);
                     else rc = d3d12_gpu_ir_dispatch(&context, pso->gpu_pipeline, c->a, c->b, c->c, NULL, 0);
                 }
+                if (g_dump_armed12) pass_dump_dispatch12(cb, ce, pso, accesses.values, accesses.count, c->a, c->b, c->c);
                 gpu_ir_access_list_release12(&accesses);
-                if (rc != GPU_IR_OK) vx_log("D3D12: common GPU IR dispatch failed (error %d)", rc);
+                if (rc != GPU_IR_OK) { FS_ADD12(skipped, 1); } if (rc != GPU_IR_OK) vx_log("D3D12: common GPU IR dispatch failed (error %d)", rc);
                 break;
             }
             if (be) { [be endEncoding]; be = nil; }
@@ -9831,6 +10227,8 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             [ce setBytes:root length:8 * words atIndex:0];
             if (sc->buf) [ce useResource:sc->buf usage:MTLResourceUsageRead];
             [ce dispatchThreadgroups:MTLSizeMake(c->a, c->b, c->c) threadsPerThreadgroup:MTLSizeMake(pso->msl.threads[0], pso->msl.threads[1], pso->msl.threads[2])];
+            if (g_dump_armed12) vx_log("D3D12: pass dump %d: dispatch %ux%ux%u of cs %016llx (direct path, its writes not shown)", g_dump_frame12,
+                                       c->a, c->b, c->c, (unsigned long long)pso->cs_code);
             // (the next dispatch sees this one's writes, as D3D12's UAV barriers promise; resources reached through
             //  argument buffers are not tracked by Metal)
             [ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
@@ -10812,13 +11210,21 @@ static void queue_decay_batch_states12(dev12 *device, res12 *const *resources, u
     pthread_mutex_unlock(&device->lock);
 }
 
+static void queue_execute_(void *this, uint32_t n, void *const *lists);
 static WINAPI void queue_execute(void *this, uint32_t n, void *const *lists) {
+    uint64_t t0 = fs_now12();
+    queue_execute_(this, n, lists);
+    FS_ADD12(exec_n, 1); FS_ADD12(exec_ns, fs_now12() - t0);
+}
+static void queue_execute_(void *this, uint32_t n, void *const *lists) {
     queue12 *q = this;
     dev12 *d = q->dev;
     if (n && !lists) return;
     res12 **batch_touched = NULL;
     uint32_t batch_touched_count = 0, batch_touched_capacity = 0;
+    uint64_t lock_t0 = fs_now12();
     pthread_mutex_lock(&d->submit_lock);
+    FS_ADD12(lock_ns, fs_now12() - lock_t0);
     for (uint32_t i = 0; i < n; i++) {
         list12 *l = lists[i];
         if (!l || l->dev != d) continue;
@@ -11317,10 +11723,14 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     sc->layer.displaySyncEnabled = sync != 0;
     HANDLE waitable = sc->flags & SWAP_FLAG_FRAME_LATENCY_WAITABLE ? sc->waitable : NULL;
     int queued = 0;
-    pthread_mutex_lock(&sc->dev->submit_lock);
-    swap_snapshot12(sc);
     @autoreleasepool {
+        // (the drawable is waited for before the submission lock: a wait for the display holds up no other thread's
+        //  ExecuteCommandLists)
+        uint64_t t0 = fs_now12();
         id<CAMetalDrawable> drawable = [sc->layer nextDrawable];
+        FS_ADD12(drawable_ns, fs_now12() - t0);
+        pthread_mutex_lock(&sc->dev->submit_lock);
+        swap_snapshot12(sc);
         if (drawable) {
             id<MTLCommandBuffer> cb = [sc->queue->mtl_queue commandBuffer];
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -11344,6 +11754,8 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     if (waitable && !queued) vx_release_semaphore(waitable, 1);
     sc->index = (sc->index + 1) % sc->count;
     sc->presents++;
+    frame_stats_present12(sc->presents);
+    pass_dump_present12();
     return S_OK;
 }
 static WINAPI HRESULT swap_present1(void *this, uint32_t sync, uint32_t flags, const void *params) { return swap_present(this, sync, flags); }
@@ -12469,13 +12881,31 @@ static WINAPI HRESULT D3D12SerializeVersionedRootSignature(const VERSIONED_RS_DE
 static WINAPI HRESULT D3D12EnableExperimentalFeatures(uint32_t n, const GUID *iids, void *configs, uint32_t *sizes) { return E_NOINTERFACE; }
 static WINAPI HRESULT D3D12GetInterface(const GUID *clsid, const GUID *iid, void **out) { if (out) *out = NULL; return E_NOINTERFACE; }
 
+static WINAPI HRESULT dev_create_compute_pso_timed(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
+    uint64_t t0 = fs_now12();
+    HRESULT hr = dev_create_compute_pso(this, desc, iid, out);
+    FS_ADD12(pso_n, 1); FS_ADD12(pso_ns, fs_now12() - t0);
+    return hr;
+}
+static WINAPI HRESULT dev_create_graphics_pso_timed(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
+    uint64_t t0 = fs_now12();
+    HRESULT hr = dev_create_graphics_pso(this, desc, iid, out);
+    FS_ADD12(pso_n, 1); FS_ADD12(pso_ns, fs_now12() - t0);
+    return hr;
+}
+static WINAPI HRESULT dev_create_pso_stream_timed(void *this, const PSO_STREAM_DESC *desc, const GUID *iid, void **out) {
+    uint64_t t0 = fs_now12();
+    HRESULT hr = dev_create_pso_stream(this, desc, iid, out);
+    FS_ADD12(pso_n, 1); FS_ADD12(pso_ns, fs_now12() - t0);
+    return hr;
+}
 static void make_tables(void) {
     static const d3d_method device[] = {
         { "QueryInterface", (void *)dev_query }, COMMON_METHODS,
         { "GetNodeCount", (void *)dev_node_count }, { "CreateCommandQueue", (void *)dev_create_queue },
-        { "CreateCommandAllocator", (void *)dev_create_allocator }, { "CreateComputePipelineState", (void *)dev_create_compute_pso },
+        { "CreateCommandAllocator", (void *)dev_create_allocator }, { "CreateComputePipelineState", (void *)dev_create_compute_pso_timed },
         { "CreateCommandList", (void *)dev_create_list }, { "CheckFeatureSupport", (void *)dev_check_feature },
-        { "CreatePipelineState", (void *)dev_create_pso_stream }, { "CreateCommandList1", (void *)dev_create_list1 },
+        { "CreatePipelineState", (void *)dev_create_pso_stream_timed }, { "CreateCommandList1", (void *)dev_create_list1 },
         { "SetEventOnMultipleFenceCompletion", (void *)dev_set_event_multiple_fences },
         { "CreatePipelineLibrary", (void *)dev_create_pipeline_library }, { "SetStablePowerState", (void *)dev_set_stable_power_state },
         { "SetBackgroundProcessingMode", (void *)dev_set_background_processing },
@@ -12489,7 +12919,7 @@ static void make_tables(void) {
         { "GetCopyableFootprints", (void *)dev_footprints }, { "MakeResident", (void *)dev_make_resident },
         { "Evict", (void *)dev_evict }, { "SetResidencyPriority", (void *)dev_set_residency_priority },
         { "EnqueueMakeResident", (void *)dev_enqueue_make_resident }, { "GetAdapterLuid", (void *)dev_adapter_luid },
-        { "CreateGraphicsPipelineState", (void *)dev_create_graphics_pso }, { "CreateRenderTargetView", (void *)dev_create_rtv },
+        { "CreateGraphicsPipelineState", (void *)dev_create_graphics_pso_timed }, { "CreateRenderTargetView", (void *)dev_create_rtv },
         { "CreateDepthStencilView", (void *)dev_create_dsv }, { "CreateHeap", (void *)dev_create_memheap },
         { "CreateHeap1", (void *)dev_create_memheap1 }, { "CreatePlacedResource", (void *)dev_create_placed },
         { "CreatePlacedResource1", (void *)dev_create_placed1 }, { "CreateCommandSignature", (void *)dev_create_command_signature },

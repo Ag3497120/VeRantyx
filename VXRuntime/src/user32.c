@@ -2078,6 +2078,20 @@ int vx_ui_snapshot(HANDLE hwnd, const char *png) {
     CGImageRelease(img);
     return ok;
 }
+// Raw movement from the last point Command Clips put the pointer at (else the client area's centre) to client x, y:
+// a game drawing its own pointer from raw mouse input follows it there, as it would a hand on the mouse.
+static void ui_raw_move_to(vx_window *w, int x, int y) {
+    static int have; static POINT last;
+    if (!have) { last.x = w->client_w / 2; last.y = w->client_h / 2; have = 1; }
+    int dx = x - last.x, dy = y - last.y;
+    for (int i = 0; i < 8 && (dx || dy); i++) {                   // (in steps, as a hand moves)
+        int sx = dx / (8 - i), sy = dy / (8 - i);
+        vx_raw_mouse(sx, sy, 0, 0);
+        dx -= sx; dy -= sy;
+        usleep(10000);
+    }
+    last.x = x; last.y = y;
+}
 void vx_ui_click(HANDLE hwnd, int x, int y) { vx_ui_click_hold(hwnd, x, y, 50); }
 // The pointer moved to client x, y without a button (WM_MOUSEMOVE there; GetCursorPos says so for a second), as a hand
 // moving the mouse: a game's own pointer or camera follows.
@@ -2091,6 +2105,7 @@ void vx_ui_pointer(HANDLE hwnd, int x, int y) {
     vx_window *top = w;
     for (int n = 0; n < 64 && (top->style & WS_CHILD) && vx_window_get(top->parent); n++) top = vx_window_get(top->parent);
     POINT at = g_clip_cursor.pt;
+    ui_raw_move_to(w, x, y);
     vx_mouse_input(top, WM_MOUSEMOVE, 0, at.x, at.y);
 }
 // hold_ms: how long the button stays down (games that act on a held button: "hold to select").
@@ -2117,10 +2132,16 @@ void vx_ui_click_hold(HANDLE hwnd, int x, int y, int hold_ms) {
     // control under the pointer once per frame (vgui) then press the one it is on. Each goes where Windows would send
     // it: the window under the point (route_mouse), which may be a child window of the one named.
     POINT at = g_clip_cursor.pt;
+    ui_raw_move_to(w, x, y);
     vx_mouse_input(top, WM_MOUSEMOVE, 0, at.x, at.y);
     usleep(150000);
+    // (the button also as the mouse reports it: key state and raw input, which games with their own pointer read)
+    vx_mouse_button(1, 1);
+    vx_raw_mouse(0, 0, 0x0001 /* RI_MOUSE_LEFT_BUTTON_DOWN */, 0);
     vx_mouse_input(top, WM_LBUTTONDOWN, 1 /* MK_LBUTTON */, at.x, at.y);
-    usleep((useconds_t)hold_ms * 1000);
+    usleep((useconds_t)(hold_ms < 100 ? 100 : hold_ms) * 1000);
+    vx_mouse_button(1, 0);
+    vx_raw_mouse(0, 0, 0x0002 /* RI_MOUSE_LEFT_BUTTON_UP */, 0);
     vx_mouse_input(top, WM_LBUTTONUP, 0, at.x, at.y);
 }
 // Keys pressed in order and let go in reverse (vks[0] first: Ctrl, then V), to the focus window when it is hwnd or
