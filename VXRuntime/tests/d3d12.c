@@ -5878,6 +5878,135 @@ static int texture_load_msaa_common_test(ID3D12Device *dev, ID3D12CommandQueue *
     return failed;
 }
 
+// (exactly representable normal values only)
+static UINT16 half_bits(float f) {
+    UINT32 u;
+    memcpy(&u, &f, 4);
+    UINT32 sign = (u >> 16) & 0x8000u, exponent = ((u >> 23) & 0xffu) - 127 + 15, mantissa = (u >> 13) & 0x3ffu;
+    return (UINT16)(sign | (exponent << 10) | mantissa);
+}
+
+// Native 16-bit types (SM 6.2): half and int16 arithmetic, 16-bit raw and structured loads and stores.
+static int half_operations_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
+    enum { N = 8 };
+    unsigned char code[8192];
+    size_t code_size = 0;
+    if (load("tests/shaders12/half_ops_cs.dxil", code, sizeof code, &code_size)) return 1;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS4 o4 = { 0 };
+    CHECK(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS4, &o4, sizeof o4));
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {
+        { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 },
+        { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND },
+    };
+    D3D12_ROOT_PARAMETER parameter = { D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE };
+    parameter.DescriptorTable.NumDescriptorRanges = 2;
+    parameter.DescriptorTable.pDescriptorRanges = ranges;
+    D3D12_ROOT_SIGNATURE_DESC root_desc = { 1, &parameter, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+    ID3DBlob *blob = NULL, *errors = NULL;
+    CHECK(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors));
+    ID3D12RootSignature *root = NULL;
+    CHECK(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob),
+                                           &IID_ID3D12RootSignature, (void **)&root));
+    ID3D10Blob_Release(blob);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc = { root, { code, code_size } };
+    ID3D12PipelineState *pipeline = NULL;
+    CHECK(ID3D12Device_CreateComputePipelineState(dev, &pipeline_desc, &IID_ID3D12PipelineState, (void **)&pipeline));
+
+    ID3D12Resource *input = buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 256, 0, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource *out[3] = {
+        buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        buffer(dev, D3D12_HEAP_TYPE_DEFAULT, N * 8 * 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        buffer(dev, D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) };
+    ID3D12Resource *readback = buffer(dev, D3D12_HEAP_TYPE_READBACK, 1024, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!input || !out[0] || !out[1] || !out[2] || !readback) return 1;
+    UINT16 *in16;
+    CHECK(ID3D12Resource_Map(input, 0, NULL, (void **)&in16));
+    for (int i = 0; i < N; i++) in16[i] = half_bits(0.5f * (float)(i + 1));
+    ID3D12Resource_Unmap(input, 0, NULL);
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    ID3D12DescriptorHeap *heap = NULL;
+    CHECK(ID3D12Device_CreateDescriptorHeap(dev, &heap_desc, &IID_ID3D12DescriptorHeap, (void **)&heap));
+    UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(heap);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = { DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING };
+    srv.Buffer.NumElements = 64;
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    ID3D12Device_CreateShaderResourceView(dev, input, &srv, cpu);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC raw = { DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER };
+    raw.Buffer.NumElements = 64;
+    raw.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    cpu.ptr += inc;
+    ID3D12Device_CreateUnorderedAccessView(dev, out[0], NULL, &raw, cpu);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC words = { DXGI_FORMAT_UNKNOWN, D3D12_UAV_DIMENSION_BUFFER };
+    words.Buffer.NumElements = N * 8;
+    words.Buffer.StructureByteStride = 4;
+    cpu.ptr += inc;
+    ID3D12Device_CreateUnorderedAccessView(dev, out[1], NULL, &words, cpu);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC halves = { DXGI_FORMAT_UNKNOWN, D3D12_UAV_DIMENSION_BUFFER };
+    halves.Buffer.NumElements = 128;
+    halves.Buffer.StructureByteStride = 2;
+    cpu.ptr += inc;
+    ID3D12Device_CreateUnorderedAccessView(dev, out[2], NULL, &halves, cpu);
+
+    ID3D12CommandAllocator *allocator = NULL;
+    CHECK(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&allocator));
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    ID3D12DescriptorHeap *heaps[] = { heap };
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, heaps);
+    ID3D12GraphicsCommandList_SetPipelineState(list, pipeline);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, root);
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 0, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(heap));
+    ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
+    for (int k = 0; k < 3; k++) {
+        D3D12_RESOURCE_BARRIER transition = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
+        transition.Transition = (D3D12_RESOURCE_TRANSITION_BARRIER){ out[k], D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE };
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &transition);
+    }
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, readback, 0, out[0], 0, 256);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, readback, 256, out[1], 0, N * 8 * 4);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, readback, 768, out[2], 0, 256);
+    CHECK(ID3D12GraphicsCommandList_Close(list));
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+    wait_queue(dev, queue);
+
+    unsigned char *bytes;
+    CHECK(ID3D12Resource_Map(readback, 0, NULL, (void **)&bytes));
+    const UINT16 *raw_out = (const UINT16 *)bytes, *half_out = (const UINT16 *)(bytes + 768);
+    const UINT *results = (const UINT *)(bytes + 256);
+    int wrong = 0;
+    for (int i = 0; i < N; i++) {
+        float a = 0.5f * (float)(i + 1), b = 1.25f, s = a * a + b * b + (a * b - 0.5f), mn = a < b ? a : b;
+        int si = i - 4;
+        UINT ui = ((UINT)i * 5000u) & 0xffffu, sf, mf;
+        memcpy(&sf, &s, 4);
+        memcpy(&mf, &mn, 4);
+        UINT want[8] = { sf, (UINT)(si * -3), ui >> 3, ui, half_bits(a), (UINT)(si < 0 ? (si > -2 ? si : -2) : (si < 2 ? si : 2)),
+                         mf, half_bits(a * 3.0f) };
+        for (int k = 0; k < 8; k++)
+            if (results[i * 8 + k] != want[k]) { if (wrong++ < 6) printf("half ops[%d][%d] = %#x, want %#x\n", i, k, results[i * 8 + k], want[k]); }
+        if (raw_out[i] != (UINT16)ui) { if (wrong++ < 6) printf("16-bit raw store[%d] = %#x, want %#x\n", i, raw_out[i], ui); }
+        if (half_out[i] != half_bits(a * 2.0f)) { if (wrong++ < 6) printf("half structured store[%d] = %#x, want %#x\n", i, half_out[i], half_bits(a * 2.0f)); }
+    }
+    if (raw_out[N] || half_out[N]) { wrong++; printf("16-bit stores wrote past their element (%#x %#x)\n", raw_out[N], half_out[N]); }
+    ID3D12Resource_Unmap(readback, 0, NULL);
+    if (!o4.Native16BitShaderOpsSupported) { wrong++; puts("OPTIONS4 does not report native 16-bit shader ops"); }
+    printf("d3d12 native 16-bit types: half/int16 arithmetic and conversions, 16-bit raw and structured loads and stores: %s\n",
+           wrong ? "FAILED" : "ok");
+    ID3D12GraphicsCommandList_Release(list);
+    ID3D12CommandAllocator_Release(allocator);
+    ID3D12DescriptorHeap_Release(heap);
+    for (int k = 0; k < 3; k++) ID3D12Resource_Release(out[k]);
+    ID3D12Resource_Release(input);
+    ID3D12Resource_Release(readback);
+    ID3D12PipelineState_Release(pipeline);
+    ID3D12RootSignature_Release(root);
+    return wrong != 0;
+}
+
 static int wave_operations_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
     enum { thread_count = 33, values_per_lane = 33, result_count = thread_count * values_per_lane };
     unsigned char code[8192];
@@ -7524,6 +7653,7 @@ int main(void) {
     if (residency_test(dev, queue)) return 1;
     if (tiled_resource_test(dev, queue)) return 1;
     if (pipeline_library_test(dev)) return 1;
+    if (half_operations_test(dev, queue)) return 1;
     if (copy_queue_test(dev, copy_timestamps_supported)) return 1;
     if (attachment_state_test(dev, queue)) return 1;
     if (rect_clear_test(dev, queue)) return 1;

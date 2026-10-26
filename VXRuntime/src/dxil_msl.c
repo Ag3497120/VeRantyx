@@ -38,6 +38,7 @@ typedef struct {
     int indent;
     // what the body needed
     int need_lane, need_lanes, need_vid, need_iid, need_front, need_sample_id, need_prim, need_tid, need_gid, need_ltid, need_lidx;
+    int need_coverage;
     // per value
     uint32_t nvals;
     handle_info *handles;       // by local index: the resource a handle value stands for
@@ -197,6 +198,16 @@ static int is_float(tr *t, uint32_t id) {
     const dxil_type *y = ty(t, id);
     if (y && y->kind == DXT_VECTOR) y = ty(t, y->elem);
     return y && is_float_kind(y->kind);
+}
+// Bytes of a scalar (or a vector's element) type in memory: 2 for half and 16-bit integers, 8 for 64-bit ones.
+static int elem_bytes(tr *t, uint32_t id) {
+    const dxil_type *y = ty(t, id);
+    if (y && y->kind == DXT_VECTOR) y = ty(t, y->elem);
+    if (!y) return 4;
+    if (y->kind == DXT_HALF) return 2;
+    if (y->kind == DXT_DOUBLE) return 8;
+    if (y->kind == DXT_INT) return y->bits <= 16 ? 2 : y->bits == 64 ? 8 : 4;
+    return 4;
 }
 static const char *signed_name(int bits) { return bits <= 8 ? "char" : bits <= 16 ? "short" : bits <= 32 ? "int" : "long"; }
 
@@ -976,10 +987,13 @@ static void call(tr *t, const dxil_inst *in) {
             snprintf(index, sizeof index, "%s", a[2]);
         } else {
             const dxil_value *bind = val(t, in->ops[2]);           // ResBind { lower, upper, space, class }
-            if (!bind || bind->kind != DXV_CONST_AGGREGATE || bind->u.list.n < 4) { err(t, "createHandleFromBinding without a constant binding"); return; }
+            // (zeroinitializer: t0 in space 0, an SRV)
+            int zero = bind && bind->kind == DXV_CONST_NULL;
+            if (!bind || (!zero && (bind->kind != DXV_CONST_AGGREGATE || bind->u.list.n < 4))) { err(t, "createHandleFromBinding without a constant binding"); return; }
             int ok;
-            uint32_t lower = (uint32_t)const_int(t, bind->u.list.ids[0], &ok), space = (uint32_t)const_int(t, bind->u.list.ids[2], &ok);
-            int cls = (int)const_int(t, bind->u.list.ids[3], &ok);
+            uint32_t lower = zero ? 0 : (uint32_t)const_int(t, bind->u.list.ids[0], &ok);
+            uint32_t space = zero ? 0 : (uint32_t)const_int(t, bind->u.list.ids[2], &ok);
+            int cls = zero ? 0 : (int)const_int(t, bind->u.list.ids[3], &ok);
             slot = slot_by_binding(t, cls, space, lower);
             snprintf(index, sizeof index, "%s", a[1]);
         }
@@ -1016,7 +1030,27 @@ static void call(tr *t, const dxil_inst *in) {
         const dxil_type *y = ty(t, in->type);
         int f32 = y && y->count && is_float(t, y->members[0]) && ty(t, y->members[0])->kind == DXT_FLOAT;
         int h16 = y && y->count == 8;
-        if (h16) { err(t, "16-bit constant buffer loads"); return; }
+        int w64 = y && y->count == 2 && int_bits(t, y->members[0]) == 64;
+        if (h16 || w64) {
+            // CBufRet.i16/f16: eight 16-bit values of the 16-byte row, low half of each word first (native 16-bit
+            // types, SM 6.2); CBufRet.i64: two 64-bit integers.
+            char tn[96], r[32], mt[32];
+            type_name(t, in->type, tn, sizeof tn);
+            type_name(t, y->members[0], mt, sizeof mt);
+            ref(t, in->result, r, sizeof r);
+            int half_type = is_float(t, y->members[0]);
+            if (h16)
+                line(t, "{ uint4 vx_w = as_type<uint4>(vx_cb(%s, uint(%s))); ushort2 vx_a = as_type<ushort2>(vx_w.x), vx_b = as_type<ushort2>(vx_w.y), "
+                        "vx_c = as_type<ushort2>(vx_w.z), vx_d = as_type<ushort2>(vx_w.w); %s = %s{ %s(vx_a.x), %s(vx_a.y), %s(vx_b.x), %s(vx_b.y), "
+                        "%s(vx_c.x), %s(vx_c.y), %s(vx_d.x), %s(vx_d.y) }; }", a[0], a[1], r, tn,
+                     half_type ? "as_type<half>" : mt, half_type ? "as_type<half>" : mt, half_type ? "as_type<half>" : mt,
+                     half_type ? "as_type<half>" : mt, half_type ? "as_type<half>" : mt, half_type ? "as_type<half>" : mt,
+                     half_type ? "as_type<half>" : mt, half_type ? "as_type<half>" : mt);
+            else
+                line(t, "{ uint4 vx_w = as_type<uint4>(vx_cb(%s, uint(%s))); %s = %s{ %s(ulong(vx_w.x) | (ulong(vx_w.y) << 32)), "
+                        "%s(ulong(vx_w.z) | (ulong(vx_w.w) << 32)) }; }", a[0], a[1], r, tn, mt, mt);
+            return;
+        }
         char vec[160];
         snprintf(vec, sizeof vec, "vx_cb(%s, uint(%s))", a[0], a[1]);
         if (f32) resret(t, in, vec, 0);
@@ -1050,7 +1084,7 @@ static void call(tr *t, const dxil_inst *in) {
             return;
         }
         if (op == 64 || op == 65) {
-            if (t->out->stage != 0) { err(t, "comparison sampling outside a pixel shader"); return; }
+            if (op == 64 && t->out->stage != 0) { err(t, "comparison sampling with derivatives outside a pixel shader"); return; }
             if (h->cls != DXIL_SRV || (h->kind != 2 && h->kind != 7 && h->kind != 5 && h->kind != 9)) {
                 err(t, "comparison sampling supports 2D, 2D-array, cube, and cube-array depth textures"); return;
             }
@@ -1371,9 +1405,14 @@ static void call(tr *t, const dxil_inst *in) {
             char addr[256];
             if (bk == 2 && !(op == 139 && is_undef(t, in->ops[4]))) snprintf(addr, sizeof addr, "uint(%s) * %s->stride + uint(%s)", a[1], a[0], a[2]);
             else snprintf(addr, sizeof addr, "uint(%s)", a[1]);
-            snprintf(e, sizeof e, "vx_ld4(%s, %s)", a[0], addr);
-            int f = in->result != UINT32_MAX && ty(t, in->type) && ty(t, in->type)->count && is_float(t, ty(t, in->type)->members[0]);
-            if (f) { char e2[420]; snprintf(e2, sizeof e2, "as_type<float4>(%s)", e); snprintf(e, sizeof e, "%s", e2); }
+            const dxil_type *rt = in->result != UINT32_MAX ? ty(t, in->type) : NULL;
+            uint32_t elem = rt && rt->count ? rt->members[0] : 0;
+            int f = elem && is_float(t, elem);
+            int bytes = elem_bytes(t, elem);
+            // (raw and structured elements of 16 or 64 bits, SM 6.2 native 16-bit types and SM 6.0 int64)
+            snprintf(e, sizeof e, "%s(%s, %s)", bytes == 2 ? "vx_ld16x4" : bytes == 8 ? "vx_ld64x4" : "vx_ld4", a[0], addr);
+            if (bytes == 8 && f) { err(t, "64-bit floating-point buffer loads"); return; }
+            if (f) { char e2[420]; snprintf(e2, sizeof e2, "as_type<%s>(%s)", bytes == 2 ? "half4" : "float4", e); snprintf(e, sizeof e, "%s", e2); }
             resret_component_mapping(t, in, e, h->cls == DXIL_SRV ? a[0] : NULL, 1);
         }
         return;
@@ -1398,8 +1437,15 @@ static void call(tr *t, const dxil_inst *in) {
         else snprintf(addr, sizeof addr, "uint(%s)", a[1]);
         for (int k = 0; k < 4; k++) {
             if (!(mask & (1 << k))) continue;
-            int f = is_float(t, val(t, in->ops[5 + k]) ? val(t, in->ops[5 + k])->type : 0);
-            line(t, "vx_st(%s, %s + %du, %s);", a[0], addr, 4 * k, f ? (snprintf(a[11], 96, "as_type<uint>(%s)", a[3 + k]), a[11]) : a[3 + k]);
+            uint32_t vt = val(t, in->ops[5 + k]) ? val(t, in->ops[5 + k])->type : 0;
+            int f = is_float(t, vt), bytes = elem_bytes(t, vt);
+            if (bytes == 2)
+                line(t, "vx_st16(%s, %s + %du, as_type<ushort>(%s));", a[0], addr, 2 * k, a[3 + k]);
+            else if (bytes == 8) {
+                if (f) { err(t, "64-bit floating-point buffer stores"); return; }
+                line(t, "vx_st64(%s, %s + %du, ulong(%s));", a[0], addr, 8 * k, a[3 + k]);
+            } else
+                line(t, "vx_st(%s, %s + %du, %s);", a[0], addr, 4 * k, f ? (snprintf(a[11], 96, "as_type<uint>(%s)", a[3 + k]), a[11]) : a[3 + k]);
         }
         return;
     }
@@ -1553,6 +1599,73 @@ static void call(tr *t, const dxil_inst *in) {
         return;
     }
     case 96: t->need_lidx = 1; line(t, "%s = vx_lidx;", r); return;
+    case 90:                                                       // SampleIndex
+        if (t->out->stage != 0) { err(t, "SampleIndex outside a pixel shader"); return; }
+        t->need_sample_id = 1;
+        line(t, "%s = %s(vx_sample);", r, tn);
+        return;
+    case 91:                                                       // Coverage
+        if (t->out->stage != 0) { err(t, "Coverage outside a pixel shader"); return; }
+        t->need_coverage = 1;
+        line(t, "%s = %s(vx_coverage);", r, tn);
+        return;
+    case 92: line(t, "%s = %s(0);", r, tn); return;               // InnerCoverage (no conservative rasterization)
+    case 221:                                                      // IsHelperLane (SM 6.6)
+        line(t, "%s = %s;", r, t->out->stage == 0 ? "simd_is_helper_thread()" : "false");
+        return;
+    case 81: {                                                     // CalculateLOD(handle, sampler, c0, c1, c2, clamped)
+        handle_info *h = hinfo(t, in->ops[2]);
+        if (!h || t->out->stage != 0 || h->kind == 1 || h->kind == 6 || h->kind == 3 || h->kind == 8) {
+            err(t, "CalculateLOD outside a pixel shader or on a 1D or multisampled texture");
+            return;
+        }
+        int ok;
+        int clamped = (int)const_int(t, in->ops[7], &ok);
+        if (!ok) { err(t, "CalculateLOD with a dynamic clamp flag"); return; }
+        char tex[160], smp[160], c[256], layer[128];
+        tex_of(t, in->ops[2], 0, tex, sizeof tex);
+        tex_of(t, in->ops[3], 0, smp, sizeof smp);
+        coords(t, in, 4, h->kind, "float", c, sizeof c, layer, sizeof layer);
+        line(t, "%s = %s.%s(%s, %s);", r, tex, clamped ? "calculate_clamped_lod" : "calculate_unclamped_lod", smp, c);
+        return;
+    }
+    case 162:                                                      // Dot2AddHalf(acc, ax, ay, bx, by)
+        line(t, "%s = %s + float(%s) * float(%s) + float(%s) * float(%s);", r, a[0], a[1], a[3], a[2], a[4]);
+        return;
+    case 163: case 164: {                                          // Dot4AddI8Packed / Dot4AddU8Packed(acc, a, b)
+        const char *v = op == 163 ? "char4" : "uchar4", *w = op == 163 ? "int4" : "uint4";
+        line(t, "{ %s vx_a = %s(as_type<%s>(uint(%s))), vx_b = %s(as_type<%s>(uint(%s))), vx_p = vx_a * vx_b; "
+                "%s = %s(%s(%s) + vx_p.x + vx_p.y + vx_p.z + vx_p.w); }",
+             w, w, v, a[1], w, v, a[2], r, tn, op == 163 ? "int" : "uint", a[0]);
+        return;
+    }
+    case 219: {                                                    // Unpack4x8(mode 0 unsigned / 1 signed, packed)
+        int ok;
+        int mode = (int)const_int(t, in->ops[2], &ok);
+        const dxil_type *y = ty(t, in->type);
+        if (!ok || !y || y->count < 4) { err(t, "Unpack4x8 with a dynamic mode"); return; }
+        char mt[32];
+        type_name(t, y->members[0], mt, sizeof mt);
+        line(t, "{ %s vx_u = as_type<%s>(uint(%s)); %s = %s{ %s(vx_u.x), %s(vx_u.y), %s(vx_u.z), %s(vx_u.w) }; }",
+             mode ? "char4" : "uchar4", mode ? "char4" : "uchar4", a[1], r, tn, mt, mt, mt, mt);
+        return;
+    }
+    case 220: {                                                    // Pack4x8(mode 0 trunc, 1 unsigned clamp, 2 signed clamp, x, y, z, w)
+        int ok;
+        int mode = (int)const_int(t, in->ops[2], &ok);
+        if (!ok) { err(t, "Pack4x8 with a dynamic mode"); return; }
+        int bits = int_bits(t, val(t, in->ops[3]) ? val(t, in->ops[3])->type : 0);
+        const char *sn = signed_name(bits);
+        if (mode == 1)
+            line(t, "%s = as_type<uint>(uchar4(clamp(int4(as_type<%s>(%s), as_type<%s>(%s), as_type<%s>(%s), as_type<%s>(%s)), 0, 255)));",
+                 r, sn, a[1], sn, a[2], sn, a[3], sn, a[4]);
+        else if (mode == 2)
+            line(t, "%s = as_type<uint>(char4(clamp(int4(as_type<%s>(%s), as_type<%s>(%s), as_type<%s>(%s), as_type<%s>(%s)), -128, 127)));",
+                 r, sn, a[1], sn, a[2], sn, a[3], sn, a[4]);
+        else
+            line(t, "%s = as_type<uint>(uchar4(uchar(%s), uchar(%s), uchar(%s), uchar(%s)));", r, a[1], a[2], a[3], a[4]);
+        return;
+    }
     case 110: {                                                    // WaveIsFirstLane: helpers do not precede active pixel lanes
         const dxil_type *result_type = ty(t, in->type);
         if (in->n != 2 || in->result == UINT32_MAX || !result_type ||
@@ -2704,7 +2817,13 @@ static const char *PRELUDE =
     "static inline float4 vx_cb(device const VxDesc *h, uint row) { return row * 16 < h->size ? ((device const float4 *)h->va)[row] : float4(0); }\n"
     "static inline uint vx_ld(device const VxDesc *h, uint off) { return off + 4 <= h->size ? *(device const uint *)(h->va + off) : 0u; }\n"
     "static inline uint4 vx_ld4(device const VxDesc *h, uint off) { return uint4(vx_ld(h, off), vx_ld(h, off + 4), vx_ld(h, off + 8), vx_ld(h, off + 12)); }\n"
-    "static inline void vx_st(device const VxDesc *h, uint off, uint v) { if (off + 4 <= h->size) *(device uint *)(h->va + off) = v; }\n";
+    "static inline void vx_st(device const VxDesc *h, uint off, uint v) { if (off + 4 <= h->size) *(device uint *)(h->va + off) = v; }\n"
+    "static inline ushort vx_ld16(device const VxDesc *h, uint off) { return off + 2 <= h->size ? *(device const ushort *)(h->va + off) : ushort(0); }\n"
+    "static inline ushort4 vx_ld16x4(device const VxDesc *h, uint off) { return ushort4(vx_ld16(h, off), vx_ld16(h, off + 2), vx_ld16(h, off + 4), vx_ld16(h, off + 6)); }\n"
+    "static inline void vx_st16(device const VxDesc *h, uint off, ushort v) { if (off + 2 <= h->size) *(device ushort *)(h->va + off) = v; }\n"
+    "static inline ulong vx_ld64(device const VxDesc *h, uint off) { return ulong(vx_ld(h, off)) | (ulong(vx_ld(h, off + 4)) << 32); }\n"
+    "static inline ulong4 vx_ld64x4(device const VxDesc *h, uint off) { return ulong4(vx_ld64(h, off), vx_ld64(h, off + 8), vx_ld64(h, off + 16), vx_ld64(h, off + 24)); }\n"
+    "static inline void vx_st64(device const VxDesc *h, uint off, ulong v) { vx_st(h, off, uint(v)); vx_st(h, off + 4, uint(v >> 32)); }\n";
 
 int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxil_msl *out) {
     memset(out, 0, sizeof *out);
@@ -2794,6 +2913,7 @@ int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxi
             put(&file, "fragment VxOut vx_main(VxIn vx_in [[stage_in]], constant VxRoot &vx_root [[buffer(0)]]");
             if (t.need_front) put(&file, ", bool vx_front [[front_facing]]");
             if (t.need_sample_id) put(&file, ", uint vx_sample [[sample_id]]");
+            if (t.need_coverage) put(&file, ", uint vx_coverage [[sample_mask]]");
             if (t.need_prim) put(&file, ", uint vx_prim [[primitive_id]]");
         }
         if (t.need_lane) put(&file, ", uint vx_lane [[thread_index_in_simdgroup]]");

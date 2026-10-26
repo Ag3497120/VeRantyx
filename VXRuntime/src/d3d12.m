@@ -11426,7 +11426,7 @@ static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data,
     }
     // Later option blocks, answered as the Windows runtime answers on hardware without those features: engines read
     // them unconditionally at start-up and treat a failed query as "not supported" at best.
-    case 23:                                                       // D3D12_OPTIONS4: MSAA 64 KB alignment, shared-resource tier, native 16-bit ops
+    case 23:                                                       // D3D12_OPTIONS4: MSAA 64 KB alignment, shared-resource tier, native 16-bit ops (yes)
     case 27:                                                       // D3D12_OPTIONS5: tiled tier 3, render pass tier 0 (BeginRenderPass emulated), no raytracing
     case 30:                                                       // D3D12_OPTIONS6: variable-rate shading
     case 32:                                                       // D3D12_OPTIONS7: mesh shaders, sampler feedback
@@ -11449,6 +11449,9 @@ static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data,
         if (!data || size != want) return E_INVALIDARG;
         memset(data, 0, size);
         if (feature == 41) *(int32_t *)data = -1;                  // D3D12_TRI_STATE_UNKNOWN (no mesh shaders)
+        // OPTIONS4.Native16BitShaderOpsSupported: half and 16-bit integers are Metal's half/short/ushort, 16-bit
+        // buffer elements and constant-buffer rows are read and written as such (dxil_msl.c).
+        if (feature == 23) ((int32_t *)data)[2] = 1;
         return S_OK;
     }
     case 10:                                                       // PROTECTED_RESOURCE_SESSION_SUPPORT {NodeIndex, Support}
