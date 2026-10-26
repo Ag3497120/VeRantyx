@@ -24,6 +24,7 @@
 // the active Metal GPU, structured-buffer UAV clears, and ExecuteIndirect bundle signatures that change root or IA
 // state or use a count buffer.
 #include "d3d_common.h"
+#import <ImageIO/ImageIO.h>
 #include "d3d12_view.h"
 #include "dxil_msl.h"
 #include "dxil_ir.h"
@@ -482,6 +483,70 @@ static uint64_t fnv1a12(uint64_t h, const void *data, size_t size) {
     const uint8_t *p = data;
     for (size_t i = 0; p && i < size; i++) { h ^= p[i]; h *= 0x100000001b3ull; }
     return h;
+}
+
+// VXRT_D3D12_SHADER_DUMP=folder: each translated shader is written there before Metal compiles it (named by a hash
+// of its source, so one Metal takes long over is on disk while it does); compiles over 2 s are logged in any case.
+static uint64_t msl_dump12(const char *msl) {
+    uint64_t h = fnv1a12(0xcbf29ce484222325ull, msl, strlen(msl));
+    const char *dir = getenv("VXRT_D3D12_SHADER_DUMP");
+    if (dir) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%016llx.metal", dir, (unsigned long long)h);
+        FILE *f = fopen(path, "w");
+        if (f) { fputs(msl, f); fclose(f); }
+    }
+    return h;
+}
+static double msl_clock12(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
+static void msl_timed12(const char *what, uint64_t hash, double start) {
+    double t = msl_clock12() - start;
+    if (t > 2.0) vx_log("D3D12: %s %016llx took %.1f s to compile", what, (unsigned long long)hash, t);
+}
+
+// Metal's compiler can take without end over a very large shader (a 34 000-line state machine in a game's upscaler
+// kept MTLCompilerService busy for over 10 minutes): libraries and compute pipelines are compiled asynchronously and
+// given up after VXRT_D3D12_COMPILE_TIMEOUT seconds (default 30), the pipeline creation then failing as on a driver
+// that cannot make it. (Metal finishes such a compile in the background.)
+static double compile_timeout12(void) {
+    static double t = -1;
+    if (t < 0) { const char *e = getenv("VXRT_D3D12_COMPILE_TIMEOUT"); t = e && atof(e) > 0 ? atof(e) : 30.0; }
+    return t;
+}
+static id<MTLLibrary> library_with_timeout12(id<MTLDevice> mtl, NSString *source, MTLCompileOptions *options, NSError **error) {
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block id<MTLLibrary> result = nil;
+    __block NSError *failure = nil;
+    __block int finished = 0;
+    NSObject *lock = [NSObject new];
+    [mtl newLibraryWithSource:source options:options completionHandler:^(id<MTLLibrary> library, NSError *e) {
+        @synchronized (lock) { result = library; failure = e; finished = 1; }
+        dispatch_semaphore_signal(done);
+    }];
+    long late = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(compile_timeout12() * 1e9)));
+    @synchronized (lock) {
+        if (late || !finished) { if (error) *error = [NSError errorWithDomain:@"VXRuntime" code:1 userInfo:@{ NSLocalizedDescriptionKey: @"Metal took too long to compile it" }]; return nil; }
+        if (error) *error = failure;
+        return result;
+    }
+}
+static id<MTLComputePipelineState> compute_pipeline_with_timeout12(id<MTLDevice> mtl, id<MTLFunction> fn, NSError **error) {
+    if (!fn) return nil;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block id<MTLComputePipelineState> result = nil;
+    __block NSError *failure = nil;
+    __block int finished = 0;
+    NSObject *lock = [NSObject new];
+    [mtl newComputePipelineStateWithFunction:fn completionHandler:^(id<MTLComputePipelineState> state, NSError *e) {
+        @synchronized (lock) { result = state; failure = e; finished = 1; }
+        dispatch_semaphore_signal(done);
+    }];
+    long late = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(compile_timeout12() * 1e9)));
+    @synchronized (lock) {
+        if (late || !finished) { if (error) *error = [NSError errorWithDomain:@"VXRuntime" code:1 userInfo:@{ NSLocalizedDescriptionKey: @"Metal took too long to compile it" }]; return nil; }
+        if (error) *error = failure;
+        return result;
+    }
 }
 
 // ---- blobs (ID3DBlob) ---------------------------------------------------------------------------------------------
@@ -1914,6 +1979,12 @@ static WINAPI HRESULT dev_create_memheap(void *this, const MEMHEAP_DESC *desc, c
     // (any heap may back reserved resources' tiles: placement-sparse pages of 64 KiB)
     if (d->tiled_tier) if (@available(macOS 26.0, *)) hd.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
     id<MTLHeap> h = [d->mtl newHeapWithDescriptor:hd];
+    if (vx_trace || getenv("VXRT_D3D12_TRACE_MEMORY")) {
+        static uint64_t total;
+        total += desc->SizeInBytes;
+        vx_log("D3D12: heap of %llu MB (type %d, flags %#x): %llu MB in heaps", (unsigned long long)(desc->SizeInBytes >> 20),
+               desc->Properties.Type, desc->Flags, (unsigned long long)(total >> 20));
+    }
     if (!h) { vx_log("D3D12: a heap of %llu bytes could not be made", (unsigned long long)desc->SizeInBytes); return E_OUTOFMEMORY; }
     if (!out) return S_FALSE;
     memheap12 *m = alloc12(sizeof *m, K12_MEMHEAP, g_memheap_vtbl, d);
@@ -1991,6 +2062,9 @@ static HRESULT create_reserved12(dev12 *d, const RES_DESC *desc, int32_t state, 
         return E_INVALIDARG;
     if (desc->Alignment && desc->Alignment != TILE_BYTES12) return E_INVALIDARG;
     HEAP_PROPS hp = { 1, 0, 0, 1, 1 };                            // (reserved resources have no heap of their own)
+    if (vx_trace || getenv("VXRT_D3D12_TRACE_MEMORY"))
+        vx_log("D3D12: reserved %s %llux%ux%u format %u mips %u", desc->Dimension == 1 ? "buffer" : "texture",
+               (unsigned long long)desc->Width, desc->Height, desc->DepthOrArraySize, desc->Format, desc->MipLevels);
     return create_resource(d, &hp, 0, desc, state, clear, NULL, 0, 1, iid, out);
 }
 static WINAPI HRESULT dev_create_reserved(void *this, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
@@ -2323,9 +2397,10 @@ static void use_list_compute12(id<MTLComputeCommandEncoder> ce, NSArray *list) {
     [ce useResources:objects count:n usage:MTLResourceUsageRead | MTLResourceUsageWrite];
     free(objects);
 }
+// (With the residency set the heap's textures are still declared once an encoder: draws and dispatches do not name
+// what an unbounded descriptor range reaches, so Metal's hazard tracking learns of them here.)
 static void use_resident_compute12(id<MTLComputeCommandEncoder> ce, NSArray *resident, heap12 *heap) {
-    if (resident == resident_by_set12()) return;                   // (the device's residency set covers both)
-    use_list_compute12(ce, resident);
+    if (resident != resident_by_set12()) use_list_compute12(ce, resident);
     use_list_compute12(ce, heap_textures12(heap));
 }
 
@@ -2556,6 +2631,18 @@ static id<MTLTexture> texture_view(res12 *r, uint32_t format, MTLTextureType typ
     // texture view, so preserve the allocation's depth pixel format for that compatible view.
     if (format == 41 && r->texture.pixelFormat == MTLPixelFormatDepth32Float) fmt = MTLPixelFormatDepth32Float;
     if (fmt == MTLPixelFormatInvalid) fmt = r->texture.pixelFormat;
+    // Metal makes no colour views of depth textures (D16 read as R16_UNORM, D32 as R32_FLOAT, ...) and stops the
+    // process over one: such a view is the depth texture's own format, which shaders read in .r as D3D12's do;
+    // the stencil of a depth-stencil texture is its X32_Stencil8 / X24_Stencil8 view.
+    MTLPixelFormat src = r->texture.pixelFormat;
+    int depth_src = src == MTLPixelFormatDepth16Unorm || src == MTLPixelFormatDepth32Float ||
+                    src == MTLPixelFormatDepth32Float_Stencil8 || src == MTLPixelFormatDepth24Unorm_Stencil8;
+    if (depth_src && fmt != src) {
+        int stencil = format == 47 || format == 118 || format == 117 || format == 46;   // X24_G8 / X32_G8 views (and typeless)
+        if (stencil && src == MTLPixelFormatDepth32Float_Stencil8) fmt = MTLPixelFormatX32_Stencil8;
+        else if (stencil && src == MTLPixelFormatDepth24Unorm_Stencil8) fmt = MTLPixelFormatX24_Stencil8;
+        else if (!stencil || (fmt != MTLPixelFormatX32_Stencil8 && fmt != MTLPixelFormatX24_Stencil8)) fmt = src;
+    }
     uint32_t total_mips = (uint32_t)r->texture.mipmapLevelCount;
     if (mip >= total_mips) return nil;
     if (mips == 0 || mips == 0xFFFFFFFFu) mips = total_mips - mip;
@@ -3188,8 +3275,11 @@ static HRESULT create_compute_pso12(void *this, const COMPUTE_PSO_DESC *desc, co
             return E_NOTIMPL;
         }
         NSError *err = nil;
-        id<MTLLibrary> lib = [d->mtl newLibraryWithSource:src options:opt error:&err];
-        if (lib) p->compute = [d->mtl newComputePipelineStateWithFunction:[lib newFunctionWithName:@"vx_main"] error:&err];
+        uint64_t hash = msl_dump12(p->msl.msl);
+        double started = msl_clock12();
+        id<MTLLibrary> lib = library_with_timeout12(d->mtl, src, opt, &err);
+        if (lib) p->compute = compute_pipeline_with_timeout12(d->mtl, [lib newFunctionWithName:@"vx_main"], &err);
+        msl_timed12("compute shader", hash, started);
         if (!p->compute) {
             vx_log("D3D12: compute shader did not compile: %s\n%s", err.localizedDescription.UTF8String, p->msl.msl);
             d3d_release(&p->base);
@@ -4961,15 +5051,21 @@ static void dxbc_reflect12(const dxbc_shader *src, dxil_msl *out) {
     out->structured = 1;
 }
 
+static id<MTLFunction> stage_function_dual(dev12 *d, const BYTECODE *code, dxil_msl *out, const char *what,
+                                           uint32_t sample_mask, int dual_source);
 static id<MTLFunction> stage_function(dev12 *d, const BYTECODE *code, dxil_msl *out, const char *what,
                                       uint32_t sample_mask) {
+    return stage_function_dual(d, code, out, what, sample_mask, 0);
+}
+static id<MTLFunction> stage_function_dual(dev12 *d, const BYTECODE *code, dxil_msl *out, const char *what,
+                                           uint32_t sample_mask, int dual_source) {
     if (d3d12_is_dxbc_program(code)) {
         if (sample_mask != UINT32_MAX) { vx_log("D3D12: %s: a sample mask with a DXBC pixel shader is not supported yet", what); return nil; }
         if (dxbc_to_msl12(code, out)) { vx_log("D3D12: %s (DXBC) not translated: %s", what, out->error); return nil; }
     } else {
         dxil_module m;
         if (dxil_read(code->code, code->size, &m)) { vx_log("D3D12: %s: %s", what, m.error); return nil; }
-        int rc = dxil_to_msl_with_sample_mask(&m, sample_mask, out);
+        int rc = dxil_to_msl_pixel(&m, sample_mask, dual_source, out);
         dxil_free(&m);
         if (rc) { vx_log("D3D12: %s not translated: %s", what, out->error); return nil; }
     }
@@ -4984,7 +5080,10 @@ static id<MTLFunction> stage_function(dev12 *d, const BYTECODE *code, dxil_msl *
         return nil;
     }
     NSError *err = nil;
-    id<MTLLibrary> lib = [d->mtl newLibraryWithSource:@(out->msl) options:opt error:&err];
+    uint64_t hash = msl_dump12(out->msl);
+    double started = msl_clock12();
+    id<MTLLibrary> lib = library_with_timeout12(d->mtl, @(out->msl), opt, &err);
+    msl_timed12(what, hash, started);
     if (!lib) { vx_log("D3D12: %s did not compile: %s\n%s", what, err.localizedDescription.UTF8String, out->msl); return nil; }
     dxil_msl_free(out);
     return [lib newFunctionWithName:@"vx_main"];
@@ -5314,12 +5413,20 @@ static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const
         vx_log("D3D12: conservative rasterization and forced sample count are not supported by the Metal raster path");
         return E_NOTIMPL;
     }
+    // Output-merger logic ops (required from feature level 11_1 on, so engines use them): Metal has none. NOOP keeps
+    // the target (writes masked off); the others draw as COPY, which is what most uses of them amount to.
+    GFX_PSO_DESC adjusted;
     for (uint32_t i = 0; i < desc->nrt; i++) {
         const RT_BLEND *b = &desc->blend.rt[desc->blend.independent ? i : 0];
         if (b->logic_enable && (b->enable || desc->blend.independent)) return E_INVALIDARG;
         if (b->logic_enable) {
-            vx_log("D3D12: render-target logic operations are not supported by the Metal raster path");
-            return E_NOTIMPL;
+            static int told;
+            if (!told++) vx_log("D3D12: render-target logic operation %d drawn as %s (Metal has no logic operations)",
+                                b->logic_op, b->logic_op == 4 ? "no write" : "a copy");
+            if (desc != &adjusted) { adjusted = *desc; desc = &adjusted; }
+            uint32_t k = desc->blend.independent ? i : 0;
+            adjusted.blend.rt[k].logic_enable = 0;
+            if (b->logic_op == 4) adjusted.blend.rt[k].mask = 0;   // D3D12_LOGIC_OP_NOOP
         }
     }
     if (desc->sample_mask != UINT32_MAX && !desc->ps.size) {
@@ -5331,7 +5438,12 @@ static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const
     MTLRenderPipelineDescriptor *rp = [MTLRenderPipelineDescriptor new];
     rp.vertexFunction = stage_function(d, &desc->vs, &p->vs, "vertex shader", UINT32_MAX);
     if (desc->ps.size) {
-        rp.fragmentFunction = stage_function(d, &desc->ps, &p->ps, "pixel shader", desc->sample_mask);
+        // (D3D12_BLEND_SRC1_COLOR ... INV_SRC1_ALPHA: the shader's second output blends into target 0; Metal allows
+        // that with one render target only)
+        const RT_BLEND *b0 = &desc->blend.rt[0];
+        int dual = desc->nrt <= 1 && b0->enable && ((b0->src >= 16 && b0->src <= 19) || (b0->dst >= 16 && b0->dst <= 19) ||
+                                  (b0->src_a >= 16 && b0->src_a <= 19) || (b0->dst_a >= 16 && b0->dst_a <= 19));
+        rp.fragmentFunction = stage_function_dual(d, &desc->ps, &p->ps, "pixel shader", desc->sample_mask, dual);
         if (!rp.fragmentFunction) { d3d_release(&p->base); return E_INVALIDARG; }
         if (desc->sample_mask == UINT32_MAX && desc->nrt == 1) {
             gpu_ir_shader *common_shader = NULL;
@@ -5447,11 +5559,16 @@ static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const
         rp.colorAttachments[i].pixelFormat = f;
         const RT_BLEND *b = &desc->blend.rt[desc->blend.independent ? i : 0];
         rp.colorAttachments[i].blendingEnabled = b->enable != 0;
-        rp.colorAttachments[i].sourceRGBBlendFactor = blend_factor(b->src);
-        rp.colorAttachments[i].destinationRGBBlendFactor = blend_factor(b->dst);
+        // Second-source factors work for target 0 of a single-target pipeline only (in D3D12 too); elsewhere they
+        // are read as the first source's, rather than Metal refusing the pipeline.
+        int single = desc->nrt <= 1 && i == 0;
+#define SRC1_AS12(f) (!single && (f) >= 16 && (f) <= 19 ? (f) - 13 : (f))   // SRC1_COLOR 16 -> SRC_COLOR 3 ...
+        rp.colorAttachments[i].sourceRGBBlendFactor = blend_factor(SRC1_AS12(b->src));
+        rp.colorAttachments[i].destinationRGBBlendFactor = blend_factor(SRC1_AS12(b->dst));
         rp.colorAttachments[i].rgbBlendOperation = blend_op(b->op);
-        rp.colorAttachments[i].sourceAlphaBlendFactor = blend_factor(b->src_a);
-        rp.colorAttachments[i].destinationAlphaBlendFactor = blend_factor(b->dst_a);
+        rp.colorAttachments[i].sourceAlphaBlendFactor = blend_factor(SRC1_AS12(b->src_a));
+        rp.colorAttachments[i].destinationAlphaBlendFactor = blend_factor(SRC1_AS12(b->dst_a));
+#undef SRC1_AS12
         rp.colorAttachments[i].alphaBlendOperation = blend_op(b->op_a);
         MTLColorWriteMask m = 0;
         if (b->mask & 1) m |= MTLColorWriteMaskRed;
@@ -5479,6 +5596,7 @@ static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const
     rp.inputPrimitiveTopology = desc->topology_type == 1 ? MTLPrimitiveTopologyClassPoint : desc->topology_type == 2 ? MTLPrimitiveTopologyClassLine : MTLPrimitiveTopologyClassTriangle;
     if (desc->gs.size) rp.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;   // (the geometry kernel's triangles)
     NSError *err = nil;
+    // (synchronously: the asynchronous form stops the process over a descriptor Metal finds invalid)
     p->render = [d->mtl newRenderPipelineStateWithDescriptor:rp error:&err];
     if (!p->render) { vx_log("D3D12: graphics pipeline: %s", err.localizedDescription.UTF8String); d3d_release(&p->base); return E_INVALIDARG; }
     MTLDepthStencilDescriptor *ds = [MTLDepthStencilDescriptor new];
@@ -7309,9 +7427,19 @@ static int gpu_ir_descriptor_value_for_slot12(dev12 *device, const rootsig12 *ro
     return GPU_IR_OK;
 }
 
+static int gpu_ir_snapshot_root_bindings12_ex(dev12 *device, const dxil_msl *shader, uint32_t stage,
+    root_binding *root_binding, heap12 *resource_heap, heap12 *sampler_heap,
+    gpu_ir_descriptor_state **out_state, int bounded_only);
 static int gpu_ir_snapshot_root_bindings12(dev12 *device, const dxil_msl *shader, uint32_t stage,
     root_binding *root_binding, heap12 *resource_heap, heap12 *sampler_heap,
     gpu_ir_descriptor_state **out_state) {
+    return gpu_ir_snapshot_root_bindings12_ex(device, shader, stage, root_binding, resource_heap, sampler_heap, out_state, 0);
+}
+// bounded_only: unbounded ranges (bindless arrays reaching hundreds of thousands of descriptors) are left out; what
+// they reach is declared once an encoder (the heap's textures) instead of at every draw.
+static int gpu_ir_snapshot_root_bindings12_ex(dev12 *device, const dxil_msl *shader, uint32_t stage,
+    root_binding *root_binding, heap12 *resource_heap, heap12 *sampler_heap,
+    gpu_ir_descriptor_state **out_state, int bounded_only) {
     if (!out_state) return GPU_IR_INVALID;
     *out_state = NULL;
     if (!shader) return GPU_IR_OK;
@@ -7353,6 +7481,7 @@ static int gpu_ir_snapshot_root_bindings12(dev12 *device, const dxil_msl *shader
         uint64_t heap_available = heap->desc.NumDescriptors - first;
         uint64_t range_available = range->count == UINT32_MAX ? UINT64_MAX :
             (uint64_t)range->count - (slot->lower - range->base);
+        if (bounded_only && slot->count == UINT32_MAX && slot->cls != DXIL_SAMPLER) continue;
         uint64_t elements = slot->count == UINT32_MAX ? MIN(heap_available, range_available) :
             (slot->count ? slot->count : 1);
         if (!elements || elements > heap_available || elements > range_available) {
@@ -7479,8 +7608,8 @@ static int gpu_ir_collect_shader_accesses12(dev12 *device, const dxil_msl *shade
         return GPU_IR_INVALID;
 
     gpu_ir_descriptor_state *bindings = NULL;
-    int binding_result = gpu_ir_snapshot_root_bindings12(device, shader, stage, root, resource_heap,
-                                                         sampler_heap, &bindings);
+    int binding_result = gpu_ir_snapshot_root_bindings12_ex(device, shader, stage, root, resource_heap,
+                                                            sampler_heap, &bindings, 1);
     if (binding_result != GPU_IR_OK) return binding_result;
     for (uint32_t i = 0; i < gpu_ir_descriptor_state_value_count(bindings); i++) {
         gpu_ir_descriptor_value value;
@@ -7504,7 +7633,9 @@ static int gpu_ir_collect_shader_accesses12(dev12 *device, const dxil_msl *shade
     gpu_ir_descriptor_state_release(bindings);
 
     // Direct ResourceDescriptorHeap indexing is data-dependent. Match residency/useResource access to the DXIL class.
-    if (shader->uses_heap) {
+    // (A game's heap of a million descriptors walked at every draw cost more than the draws: past 4096 descriptors
+    // what the heap holds is declared once an encoder instead, make_resident_render / use_resident_compute12.)
+    if (shader->uses_heap && resource_heap->desc.NumDescriptors <= 4096) {
         uint32_t classes = shader->heap_resource_classes;
         if (!classes) classes = 1u << DXIL_SRV; // CreateHandleFromHeap defaults to an SRV absent AnnotateHandle.
         for (uint32_t i = 0; i < resource_heap->desc.NumDescriptors; i++) {
@@ -7821,10 +7952,14 @@ static void end_encoders(id<MTLComputeCommandEncoder> __strong *ce, id<MTLBlitCo
     if (*re) { [*re endEncoding]; *re = nil; }
 }
 
+static int gpu_errors12(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_D3D12_GPU_ERRORS") != NULL;
+    return on;
+}
 static void make_resident_render(id<MTLRenderCommandEncoder> re, NSArray *resident, heap12 *heap) {
-    if (resident == resident_by_set12()) return;                   // (the device's residency set covers both)
-    use_list_render12(re, resident);
-    use_list_render12(re, heap_textures12(heap));
+    if (resident != resident_by_set12()) use_list_render12(re, resident);   // (else the residency set has them)
+    use_list_render12(re, heap_textures12(heap));                  // (as for compute: unbounded ranges)
 }
 
 static int open_render_pass12(dev12 *device, gfx_state *g, id<MTLCommandBuffer> command_buffer,
@@ -7872,6 +8007,17 @@ static int open_render_pass12(dev12 *device, gfx_state *g, id<MTLCommandBuffer> 
     }
     *render_encoder = [command_buffer renderCommandEncoderWithDescriptor:descriptor];
     if (!*render_encoder) { g->pass_heap = NULL; g->pass_vis = nil; return 0; }
+    if (gpu_errors12()) {                                          // (named for VXRT_D3D12_GPU_ERRORS reports)
+        NSMutableString *name = [NSMutableString stringWithFormat:@"pass %lux%lu samples %lu:", (unsigned long)descriptor.renderTargetWidth,
+                                 (unsigned long)descriptor.renderTargetHeight, (unsigned long)descriptor.defaultRasterSampleCount];
+        for (int k = 0; k < 8; k++) {
+            id<MTLTexture> t = descriptor.colorAttachments[k].texture;
+            if (t) [name appendFormat:@" c%d %lux%lu fmt %lu x%lu", k, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, (unsigned long)t.sampleCount];
+        }
+        id<MTLTexture> dt = descriptor.depthAttachment.texture;
+        if (dt) [name appendFormat:@" depth %lux%lu fmt %lu", (unsigned long)dt.width, (unsigned long)dt.height, (unsigned long)dt.pixelFormat];
+        (*render_encoder).label = name;
+    }
     make_resident_render(*render_encoder, resident, resource_heap);
     if (g->occ_on) { [*render_encoder setVisibilityResultMode:MTLVisibilityResultModeCounting offset:8 * g->occ_index]; pass_query(g); }
     g->changed = 0;
@@ -10646,7 +10792,12 @@ static WINAPI void queue_execute(void *this, uint32_t n, void *const *lists) {
             queue_discard_list_states12(shadows, state_count);
             continue;
         }
-        id<MTLCommandBuffer> cb = [q->mtl_queue commandBuffer];
+        id<MTLCommandBuffer> cb;
+        if (gpu_errors12()) {
+            MTLCommandBufferDescriptor *cd = [MTLCommandBufferDescriptor new];
+            cd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            cb = [q->mtl_queue commandBufferWithDescriptor:cd];
+        } else cb = [q->mtl_queue commandBuffer];
         scratch sc = { nil, 0, nil };
         if (!replay(d, q->mtl_queue, q->desc.Type, l, &shadows, &state_count, &cb, &sc)) {
             queue_discard_list_states12(shadows, state_count);
@@ -10662,9 +10813,25 @@ static WINAPI void queue_execute(void *this, uint32_t n, void *const *lists) {
         d3d_addref(&command_allocator->base);
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
             if (held) scratch_recycle(d, held);
-            if (done.status == MTLCommandBufferStatusError)
+            if (done.status == MTLCommandBufferStatusError) {
                 vx_log("D3D12: Metal command buffer failed: %s",
                        done.error.localizedDescription.UTF8String ?: "unknown Metal error");
+                NSArray *infos = done.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+                for (id<MTLCommandBufferEncoderInfo> info in infos)
+                    if (info.errorState == MTLCommandEncoderErrorStateFaulted)
+                        vx_log("D3D12:   faulted encoder: %s", info.label.UTF8String ?: "(compute or blit)");
+                static int told;
+                if (!told++) {
+                    uint64_t resident = 0, count = 0;
+                    if (@available(macOS 15.0, *)) if (d->residency) {
+                        resident = [(id<MTLResidencySet>)d->residency allocatedSize];
+                        count = [(id<MTLResidencySet>)d->residency allocationCount];
+                    }
+                    vx_log("D3D12: GPU memory: %llu MB allocated, %llu MB recommended working set, residency set %llu allocations %llu MB",
+                           (unsigned long long)(d->mtl.currentAllocatedSize >> 20), (unsigned long long)(d->mtl.recommendedMaxWorkingSetSize >> 20),
+                           (unsigned long long)count, (unsigned long long)(resident >> 20));
+                }
+            }
             __atomic_fetch_sub(&command_allocator->in_flight, 1, __ATOMIC_ACQ_REL);
             d3d_release(&command_allocator->base);
         }];
@@ -11022,6 +11189,57 @@ static WINAPI HRESULT swap_get_buffer(void *this, uint32_t i, const GUID *iid, v
     return res_query(sc->buffers[i], iid, out);
 }
 static WINAPI uint32_t swap_index(void *this) { return ((swap12 *)this)->index; }
+// VXRT_PRESENT_SNAPSHOT=file.png (VXRT_PRESENT_SNAPSHOT_EVERY=n, default 300): every n-th present's picture, as the
+// window shows it, written to that file (to see what a program draws without a screen capture); the log notes
+// the presents every 300.
+static void swap_snapshot12(swap12 *sc) {
+    static const char *path;
+    static int every = -1;
+    if (every < 0) {
+        path = getenv("VXRT_PRESENT_SNAPSHOT");
+        every = getenv("VXRT_PRESENT_SNAPSHOT_EVERY") ? atoi(getenv("VXRT_PRESENT_SNAPSHOT_EVERY")) : 300;
+        if (every < 1) every = 300;
+    }
+    if (sc->presents % 300 == 0) vx_log("D3D12: %u presents (%ux%u)", sc->presents, sc->width, sc->height);
+    if (!path || sc->presents % (uint32_t)every) return;
+    @autoreleasepool {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                      width:sc->width height:sc->height mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> target = [sc->dev->mtl newTextureWithDescriptor:td];
+        id<MTLBuffer> out = [sc->dev->mtl newBufferWithLength:(NSUInteger)sc->width * sc->height * 4 options:MTLResourceStorageModeShared];
+        if (!target || !out || sc->layer.pixelFormat != MTLPixelFormatBGRA8Unorm) return;
+        id<MTLCommandBuffer> cb = [sc->queue->mtl_queue commandBuffer];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = target;
+        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:sc->pipeline];
+        [enc setFragmentTexture:sc->buffers[sc->index]->texture atIndex:0];
+        float scale[2] = { (float)sc->src_width / (float)sc->width, (float)sc->src_height / (float)sc->height };
+        [enc setFragmentBytes:scale length:sizeof scale atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(sc->width, sc->height, 1)
+                     toBuffer:out destinationOffset:0 destinationBytesPerRow:sc->width * 4 destinationBytesPerImage:(NSUInteger)sc->width * sc->height * 4];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(out.contents, sc->width, sc->height, 8, sc->width * 4, cs,
+                                                 kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
+        CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+        NSURL *url = [NSURL fileURLWithPath:@(path)];
+        CGImageDestinationRef dst = img ? CGImageDestinationCreateWithURL((__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL) : NULL;
+        if (dst) { CGImageDestinationAddImage(dst, img, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); }
+        if (img) CGImageRelease(img);
+        if (ctx) CGContextRelease(ctx);
+        CGColorSpaceRelease(cs);
+    }
+}
 static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     swap12 *sc = this;
     if (flags & 1) return S_OK;                                    // DXGI_PRESENT_TEST
@@ -11030,6 +11248,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     HANDLE waitable = sc->flags & SWAP_FLAG_FRAME_LATENCY_WAITABLE ? sc->waitable : NULL;
     int queued = 0;
     pthread_mutex_lock(&sc->dev->submit_lock);
+    swap_snapshot12(sc);
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [sc->layer nextDrawable];
         if (drawable) {

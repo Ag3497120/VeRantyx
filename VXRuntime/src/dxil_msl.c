@@ -43,6 +43,7 @@ typedef struct {
     // Minimum precision (min16float without -enable-16bit-types): DXIL's half values are kept as float, as desktop
     // GPUs keep them, so that a shader tested there gets its 32-bit results; native 16-bit types stay half.
     int native16;
+    int dual_source;            // pixel shader for dual-source blending: SV_Target1 is color(0) index(1)
     // geometry pipelines: 0 a stage function, 1 the vertex shader as a kernel, 2 a geometry shader as a kernel
     int mode;
     const dxil_msl *gs_from;    // (mode 2) the vertex kernel whose outputs are the inputs
@@ -277,14 +278,15 @@ static void ref(tr *t, uint32_t id, char *out, size_t cap) {
         snprintf(out, cap, "%s(0)", tn);
         return;
     }
-    case DXV_GLOBAL: snprintf(out, cap, "g%u", v->u.index); return;
+    case DXV_GLOBAL: snprintf(out, cap, "(&g%u)", v->u.index); return;   // (a global's value is its address)
     case DXV_CONST_EXPR: {
         // (getelementptr into a global, a cast of one: the address written out)
         if (v->u.expr.op == DXI_CAST && v->u.expr.n == 1) { ref(t, v->u.expr.ops[0], out, cap); return; }
         if (v->u.expr.op == DXI_GEP && v->u.expr.n >= 2) {
             char base[64], path[256];
-            ref(t, v->u.expr.ops[1], base, sizeof base);
             const dxil_value *bv = val(t, v->u.expr.ops[1]);
+            if (bv && bv->kind == DXV_GLOBAL) snprintf(base, sizeof base, "g%u", bv->u.index);   // (the object itself)
+            else { char p[64]; ref(t, v->u.expr.ops[1], p, sizeof p); snprintf(base, sizeof base, "(*%s)", p); }
             uint32_t tid = v->u.expr.ops[0];
             if (tid == UINT32_MAX && bv && bv->kind == DXV_GLOBAL) tid = t->m->globals[bv->u.index].type;
             snprintf(path, sizeof path, "(%s)", base);
@@ -603,7 +605,7 @@ static void element_type(tr *t, const dxil_md *e, char *out, size_t cap) {
 // ---- handles ------------------------------------------------------------------------------------------------------
 
 static const char *tex_type(int kind, int comp, uint8_t access, int depth) {
-    static char out[96];
+    static __thread char out[96];                                   // (pipelines are made on many threads at once)
     const char *c = comp == 4 || comp == 2 ? "int" : comp == 5 || comp == 3 ? "uint" : comp == 8 ? "half" : "float";
     const char *dim = depth ? kind == 2 ? "depth2d" : kind == 7 ? "depth2d_array" :
                                kind == 5 ? "depthcube" : kind == 9 ? "depthcube_array" : "depth2d"
@@ -950,6 +952,9 @@ static void emit_texture_atomic_minmax(tr *t, const char *tex, const char *coord
 static void call(tr *t, const dxil_inst *in) {
     int op = dxil_dxop(t->m, t->f, in);
     const char *callee = dxil_value_name(t->m, in->ops[0]);
+    // (lifetime markers and other hints the optimizer left carry no meaning for the translation)
+    if (op < 0 && callee && (!strncmp(callee, "llvm.lifetime.", 14) || !strncmp(callee, "llvm.invariant.", 15) ||
+                             !strcmp(callee, "llvm.donothing") || !strncmp(callee, "llvm.dbg.", 9))) return;
     if (op < 0) { err(t, "a call to %s", callee ? callee : "?"); return; }
     char a[12][96], r[32] = "", tn[96] = "";
     args(t, in, 2, in->n > 2 ? (in->n - 2 < 12 ? in->n - 2 : 12) : 0, a);
@@ -1000,7 +1005,8 @@ static void call(tr *t, const dxil_inst *in) {
         // (the element's own type: float for SV_Target, uint for an integer output)
         char base[16];
         snprintf(base, sizeof base, "%.*s", (int)strcspn(et, "0123456789"), et);
-        if (cols <= 1) line(t, "vx_out.o%u_%u = %s(%s);", id, row, base, a[3]);
+        int padded = t->out->stage == 0 && t->mode == 0 && md_i(t, e, 3, 0) == 16;   // (a render target: four components)
+        if (cols <= 1 && !padded) line(t, "vx_out.o%u_%u = %s(%s);", id, row, base, a[3]);
         else line(t, "vx_out.o%u_%u[%u] = %s(%s);", id, row, okc ? col : 0, base, a[3]);
         return;
     }
@@ -1347,20 +1353,23 @@ static void call(tr *t, const dxil_inst *in) {
             line(t, "{");
             t->indent++;
             line(t, "uint %s = vx_desc_component_selector((device const VxDesc *)%s, %uu);", selector, a[0], channel);
-            line(t, "float4 %s = float4(0.0f);", gathered);
+            const char *gt = h->comp == 4 || h->comp == 2 ? "int4" : h->comp == 5 || h->comp == 3 ? "uint4" : "float4";
+            int gf = gt[0] == 'f';
+            const char *zero = gf ? "0.0f" : "0", *one = gf ? "1.0f" : "1";
+            line(t, "%s %s = %s(%s);", gt, gathered, gt, zero);
             line(t, "switch (%s) {", selector);
             t->indent++;
             for (uint32_t component = 0; component < 4; component++) {
-                if (h->kind == 2 || h->kind == 7)
+                if (h->kind == 2 || h->kind == 7)                   // (Metal wants the offset before the component)
                     line(t, "case %uu: %s = %s.gather(%s, %s%s%s, %s); break;", component, gathered,
-                         tex, smp, c, layer, off, components[component]);
+                         tex, smp, c, layer, off[0] ? off : ", int2(0)", components[component]);
                 else
                     line(t, "case %uu: %s = %s.gather(%s, %s%s, %s); break;", component, gathered,
                          tex, smp, c, layer, components[component]);
             }
-            line(t, "case 4u: %s = float4(0.0f); break;", gathered);
-            line(t, "case 5u: %s = float4(1.0f); break;", gathered);
-            line(t, "default: %s = float4(0.0f); break;", gathered);
+            line(t, "case 4u: %s = %s(%s); break;", gathered, gt, zero);
+            line(t, "case 5u: %s = %s(%s); break;", gathered, gt, one);
+            line(t, "default: %s = %s(%s); break;", gathered, gt, zero);
             t->indent--;
             line(t, "}");
             resret(t, in, gathered, 1);
@@ -1529,14 +1538,18 @@ static void call(tr *t, const dxil_inst *in) {
         const dxil_value *delta = in->n == 4 ? val(t, in->ops[3]) : NULL;
         const dxil_type *delta_type = delta ? ty(t, delta->type) : NULL;
         if (in->n != 4 || !h || h->cls != DXIL_UAV || h->kind != 12 ||
-            (!h->has_counter && !h->heap) || !delta_type || delta_type->kind != DXT_INT || delta_type->bits != 8 ||
-            in->result != UINT32_MAX) {
+            (!h->has_counter && !h->heap) || !delta_type || delta_type->kind != DXT_INT || delta_type->bits != 8) {
             err(t, "a counter update on a handle without a structured UAV counter");
             return;
         }
         t->out->uses_counters = 1;
-        line(t, "if ((%s->flags & %uu) != 0u) atomic_fetch_add_explicit((device atomic_uint *)%s->res, uint(int(as_type<char>(%s))), memory_order_relaxed);",
-             a[0], DXIL_MSL_DESC_HAS_COUNTER, a[0], a[1]);
+        // (IncrementCounter gives the count before, DecrementCounter the count after)
+        if (in->result != UINT32_MAX)
+            line(t, "%s = (%s->flags & %uu) != 0u ? uint(int(atomic_fetch_add_explicit((device atomic_uint *)%s->res, uint(int(as_type<char>(%s))), memory_order_relaxed)) + min(int(as_type<char>(%s)), 0)) : 0u;",
+                 r, a[0], DXIL_MSL_DESC_HAS_COUNTER, a[0], a[1], a[1]);
+        else
+            line(t, "if ((%s->flags & %uu) != 0u) atomic_fetch_add_explicit((device atomic_uint *)%s->res, uint(int(as_type<char>(%s))), memory_order_relaxed);",
+                 a[0], DXIL_MSL_DESC_HAS_COUNTER, a[0], a[1]);
         return;
     }
     case 78: case 79: {                                            // AtomicBinOp(h, op, c0, c1, c2, v), AtomicCompareExchange(h, c0, c1, c2, cmp, v)
@@ -2324,7 +2337,18 @@ static void inst(tr *t, const dxil_inst *in) {
         case 5: line(t, "%s = %s(%s);", r, tn, a[0]); return;                          // uitofp
         case 6: line(t, "%s = %s(as_type<%s>(%s));", r, tn, signed_name(sbits), a[0]); return;   // sitofp
         case 7: case 8: line(t, "%s = %s(%s);", r, tn, a[0]); return;                  // fptrunc, fpext
-        case 11: line(t, "%s = as_type<%s>(%s);", r, tn, a[0]); return;                // bitcast
+        case 11: {                                                                      // bitcast
+            const dxil_type *dt = ty(t, in->type);
+            if (dt && dt->kind == DXT_POINTER) {                                        // (a pointer as another type's)
+                char et[96];
+                type_name(t, dt->elem, et, sizeof et);
+                uint8_t sp = space_of(t, in->ops[0]);
+                line(t, "%s = (%s %s *)(%s);", r, sp == 2 ? "threadgroup" : sp == 3 ? "constant" : sp == 4 ? "device" : "thread", et, a[0]);
+                return;
+            }
+            line(t, "%s = as_type<%s>(%s);", r, tn, a[0]);
+            return;
+        }
         }
         err(t, "cast %u", in->sub);
         return;
@@ -2417,10 +2441,12 @@ static void inst(tr *t, const dxil_inst *in) {
         char base[96], first[96];
         ref(t, in->ops[1], base, sizeof base);
         ref(t, in->ops[2], first, sizeof first);
+        { const dxil_value *gv = val(t, in->ops[1]); if (gv && gv->kind == DXV_GLOBAL) snprintf(base, sizeof base, "g%u", gv->u.index); }
         int ok;
         int64_t f0 = const_int(t, in->ops[2], &ok);
         const dxil_value *bv = val(t, in->ops[1]);
-        int base_is_object = bv && (bv->kind == DXV_GLOBAL || (bv->kind == DXV_INST && t->f->insts[bv->u.index].op == DXI_ALLOCA));
+        // (a global is declared as the object; an alloca as a pointer to its object, vx_a#)
+        int base_is_object = bv && bv->kind == DXV_GLOBAL;
         if (base_is_object && ok && f0 == 0) snprintf(path, sizeof path, "(%s)", base);
         else snprintf(path, sizeof path, "(%s%s)[%s]", base_is_object ? "&" : "", base, first);
         for (uint32_t i = 3; i < in->n; i++) {
@@ -2789,6 +2815,7 @@ static void declare_values(tr *t) {
             type_name(t, et, tn, sizeof tn);
             int space = y->bits == 3 ? 2 : 1;
             if (in->op == DXI_GEP && in->n > 1) space = space_of(t, in->ops[1]);
+            if (in->op == DXI_CAST && in->n > 0) space = space_of(t, in->ops[0]);
             t->ptr_space[l] = (uint8_t)space;
             put(&t->decls, "    %s %s *v%u = nullptr;\n", space == 2 ? "threadgroup" : space == 3 ? "constant" : "thread", tn, l);
             continue;
@@ -2918,7 +2945,15 @@ static void io_structs(tr *t, sb *s) {
                     else if (kind == 5) put(s, "    uint o%d_%d [[viewport_array_index]];\n", id, r);
                     else put(s, "    %s o%d_%d [[user(%s)]];\n", et, id, r, sem);
                 } else {
-                    if (kind == 16) put(s, "    %s o%d_%d [[color(%d)]];\n", et, id, r, md_i(t, dxil_md_op(t->m, e, 4), r, r));
+                    if (kind == 16) {
+                        // (four components whatever the shader writes: Metal wants as many as the format has; D3D
+                        // leaves the rest undefined)
+                        char base[16];
+                        snprintf(base, sizeof base, "%.*s", (int)strcspn(et, "0123456789"), et);
+                        int target = md_i(t, dxil_md_op(t->m, e, 4), r, r);
+                        if (t->dual_source && target == 1) put(s, "    %s4 o%d_%d [[color(0), index(1)]];\n", base, id, r);
+                        else put(s, "    %s4 o%d_%d [[color(%d)]];\n", base, id, r, target);
+                    }
                     else if (kind == 17 || kind == 18 || kind == 19) put(s, "    float o%d_%d [[depth(%s)]];\n", id, r, kind == 18 ? "less" : kind == 19 ? "greater" : "any");
                     else if (kind == 14) put(s, "    uint o%d_%d [[sample_mask]];\n", id, r);
                     else if (kind == 20) put(s, "    uint o%d_%d [[stencil]];\n", id, r);
@@ -3000,13 +3035,14 @@ static const char *PRELUDE =
     "static inline ulong4 vx_ld64x4(device const VxDesc *h, uint off) { return ulong4(vx_ld64(h, off), vx_ld64(h, off + 8), vx_ld64(h, off + 16), vx_ld64(h, off + 24)); }\n"
     "static inline void vx_st64(device const VxDesc *h, uint off, ulong v) { vx_st(h, off, uint(v)); vx_st(h, off + 4, uint(v >> 32)); }\n";
 
-static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const dxil_msl *vs, dxil_msl *out) {
+static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const dxil_msl *vs, dxil_msl *out, int dual_source) {
     memset(out, 0, sizeof *out);
     out->stage = (int)m->shader_kind;
     tr t = { 0 };
     t.m = m;
     t.out = out;
     t.mode = mode;
+    t.dual_source = dual_source;
     t.gs_from = mode == 5 ? NULL : vs;
     t.hs_from = mode == 5 ? vs : NULL;
     t.sample_mask = sample_mask;
@@ -3238,9 +3274,13 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
             if (t.need_coverage) put(&file, ", uint vx_coverage [[sample_mask]]");
             if (t.need_prim) put(&file, ", uint vx_prim [[primitive_id]]");
         }
-        if (t.need_lane) put(&file, ", uint vx_lane [[thread_index_in_simdgroup]]");
-        if (t.need_lanes) put(&file, ", uint vx_lanes [[threads_per_simdgroup]]");
+        // (a vertex function cannot take the SIMD lane attributes: its lane among the active ones, Apple's 32 wide)
+        int vertex_fn = stage == 1 && mode == 0;
+        if (t.need_lane && !vertex_fn) put(&file, ", uint vx_lane [[thread_index_in_simdgroup]]");
+        if (t.need_lanes && !vertex_fn) put(&file, ", uint vx_lanes [[threads_per_simdgroup]]");
         put(&file, ") {\n");
+        if (t.need_lane && vertex_fn) put(&file, "    uint vx_lane = simd_prefix_exclusive_sum(1u);\n");
+        if (t.need_lanes && vertex_fn) put(&file, "    uint vx_lanes = 32u;\n");
         if (stage != 5) put(&file, "    VxOut vx_out = {};\n");
         if (stage == 1 && !out->ninputs) put(&file, "    VxIn vx_in = {}; (void)vx_in;\n");
         if (mode == 5) {
@@ -3316,23 +3356,26 @@ done:
 }
 
 int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxil_msl *out) {
-    return translate(m, sample_mask, 0, NULL, out);
+    return translate(m, sample_mask, 0, NULL, out, 0);
+}
+int dxil_to_msl_pixel(const dxil_module *m, uint32_t sample_mask, int dual_source, dxil_msl *out) {
+    return translate(m, sample_mask, 0, NULL, out, dual_source);
 }
 int dxil_to_msl(const dxil_module *m, dxil_msl *out) {
-    return translate(m, UINT32_MAX, 0, NULL, out);
+    return translate(m, UINT32_MAX, 0, NULL, out, 0);
 }
 int dxil_to_msl_vertex_kernel(const dxil_module *m, dxil_msl *out) {
-    return translate(m, UINT32_MAX, 1, NULL, out);
+    return translate(m, UINT32_MAX, 1, NULL, out, 0);
 }
 int dxil_to_msl_geometry(const dxil_module *m, const dxil_msl *vs, dxil_msl *out) {
-    return translate(m, UINT32_MAX, 2, vs, out);
+    return translate(m, UINT32_MAX, 2, vs, out, 0);
 }
 
 // The hull kernel: both phases (each translated into a namespace of its own) and the kernel calling them per patch.
 int dxil_to_msl_hull(const dxil_module *m, const dxil_msl *vs, dxil_msl *out) {
     dxil_msl pc;
-    if (translate(m, UINT32_MAX, 3, vs, out)) return -1;
-    if (translate(m, UINT32_MAX, 4, vs, &pc)) {
+    if (translate(m, UINT32_MAX, 3, vs, out, 0)) return -1;
+    if (translate(m, UINT32_MAX, 4, vs, &pc, 0)) {
         snprintf(out->error, sizeof out->error, "patch-constant function: %s", pc.error);
         dxil_msl_free(out);
         return -1;
@@ -3364,7 +3407,7 @@ int dxil_to_msl_hull(const dxil_module *m, const dxil_msl *vs, dxil_msl *out) {
 }
 
 int dxil_to_msl_domain(const dxil_module *m, const dxil_msl *hs, dxil_msl *out) {
-    return translate(m, UINT32_MAX, 5, hs, out);
+    return translate(m, UINT32_MAX, 5, hs, out, 0);
 }
 
 void dxil_msl_free(dxil_msl *out) {

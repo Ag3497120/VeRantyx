@@ -101,6 +101,8 @@ int dxil_to_msl_hull(const dxil_module *m, const dxil_msl *vs, dxil_msl *out);
 int dxil_to_msl_domain(const dxil_module *m, const dxil_msl *hs, dxil_msl *out);
 
 int dxil_to_msl(const dxil_module *m, dxil_msl *out);
+// A pixel shader for a pipeline that blends with the second source (SRC1 factors): SV_Target1 as color(0) index(1).
+int dxil_to_msl_pixel(const dxil_module *m, uint32_t sample_mask, int dual_source, dxil_msl *out);
 // Apply the D3D12 PSO's static sample mask to fragment coverage. UINT32_MAX is a no-op.
 int dxil_to_msl_with_sample_mask(const dxil_module *m, uint32_t sample_mask, dxil_msl *out);
 void dxil_msl_free(dxil_msl *out);

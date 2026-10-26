@@ -503,10 +503,11 @@ static int graphics_pso_state_test(ID3D12Device *dev) {
     elements[0].InstanceDataStepRate = 0;
     if (pso) { ID3D12PipelineState_Release(pso); pso = NULL; }
 
+    // (logic ops, required from feature level 11_1 on, are drawn approximately: the pipeline is made)
     desc.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
     desc.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_AND;
     hr = ID3D12Device_CreateGraphicsPipelineState(dev, &desc, &IID_ID3D12PipelineState, (void **)&pso);
-    failed |= hr != E_NOTIMPL || pso != NULL;
+    failed |= hr != S_OK || pso == NULL;
     if (pso) { ID3D12PipelineState_Release(pso); pso = NULL; }
 
     desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
@@ -538,7 +539,7 @@ static int graphics_pso_state_test(ID3D12Device *dev) {
     if (pso) ID3D12PipelineState_Release(pso);
 
     ID3D12RootSignature_Release(root);
-    printf("d3d12 graphics PSO: static sample mask compiles; unsupported logic/conservative/forced-sample states are rejected: %s\n",
+    printf("d3d12 graphics PSO: static sample mask compiles; logic ops approximated; unsupported conservative/forced-sample states are rejected: %s\n",
            failed ? "FAILED" : "ok");
     return failed;
 }
