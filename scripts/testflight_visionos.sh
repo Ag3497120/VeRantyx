@@ -7,11 +7,12 @@
 #
 # Before the first --export / --upload (once, by the account holder):
 #   1. App Store Connect > Apps > "+" > New App: platform visionOS, bundle ID
-#      marimokodai.VisionSpatialTools (VERANTYX_BUNDLE_ID to change it), SKU of your choice.
+#      marimokodai.VeRantyx.vision (VERANTYX_BUNDLE_ID to change it), SKU of your choice.
 #   2. Xcode > Settings > Accounts: the Apple ID of team 7YNW843VY6 is signed in.
 #      The first export creates an Apple Distribution certificate in that account.
 #
-# Every run gets a new build number (UTC yyyymmddHHMM), which App Store Connect requires.
+# Every run gets a new build number (UTC yyyymmddHHMM), which App Store Connect requires;
+# VERANTYX_BUILD sets one by hand (for example 1 for the first upload of a version).
 # VERANTYX_TEAM overrides the team, VERANTYX_VERSION the version shown in TestFlight.
 set -euo pipefail
 
@@ -21,9 +22,9 @@ PROJECT="$REPO_ROOT/VisionProClient/VisionSpatialTools/VisionSpatialTools.xcodep
 OUT="$REPO_ROOT/build/testflight"
 ARCHIVE="$OUT/VeRantyx.xcarchive"
 TEAM="${VERANTYX_TEAM:-7YNW843VY6}"
-BUNDLE_ID="${VERANTYX_BUNDLE_ID:-marimokodai.VisionSpatialTools}"
-VERSION="${VERANTYX_VERSION:-1.0}"
-BUILD_NUMBER="$(date -u +%Y%m%d%H%M)"
+BUNDLE_ID="${VERANTYX_BUNDLE_ID:-marimokodai.VeRantyx.vision}"
+VERSION="${VERANTYX_VERSION:-0.3.0}"
+BUILD_NUMBER="${VERANTYX_BUILD:-$(date -u +%Y%m%d%H%M)}"
 MODE="${1:-}"
 
 case "$MODE" in

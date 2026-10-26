@@ -10,7 +10,7 @@ TestFlight app.
 ## Once
 
 1. **App Store Connect > Apps > + > New App**: platform visionOS, name (for example "VeRantyx"), bundle ID
-   `marimokodai.VisionSpatialTools` (or set `VERANTYX_BUNDLE_ID` and register your own), any SKU.
+   `marimokodai.VeRantyx.vision` (or set `VERANTYX_BUNDLE_ID` and register your own), any SKU.
 2. **Xcode > Settings > Accounts**: the team's Apple ID is signed in. The first export creates an Apple
    Distribution certificate in that account.
 3. **TestFlight > Test Information**: a beta description, a feedback email, and a privacy policy URL (needed for
