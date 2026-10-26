@@ -213,6 +213,12 @@ struct dev12 {
     id residency;                    // id<MTLResidencySet>, or nil
     NSCountedSet *resident_allocations;
     int residency_dirty;
+    // Allocations no resource names any more leave the set only once the GPU has finished what was submitted before
+    // (their memory too stays until then): the set is the queues', so a removal committed while command buffers that
+    // reach the allocation through argument buffers still run takes it from under them - a GPU fault Metal reports
+    // as "Insufficient Memory". Each entry: the allocation and each queue's timeline value at the removal. (lock)
+    NSMutableArray *residency_pending;
+    void *queues[16];                // queue12, for their timelines (lock)
     int tiled_tier;                  // D3D12_TILED_RESOURCES_TIER: 2 with Metal placement sparse (macOS 26), else 0
     id tile_queue;                   // id<MTL4CommandQueue> carrying UpdateTileMappings (made when first needed)
 };
@@ -548,7 +554,7 @@ static void msl_timed12(const char *what, uint64_t hash, double start) {
 // translation and Metal compiles, ExecuteCommandLists (and the time waiting for the submission lock), CPU fence
 // waits, the wait for a drawable, and the draws and dispatches skipped. Every 300 presents a summary of the same.
 typedef struct {
-    uint64_t pso_n, pso_ns, compile_n, compile_ns, exec_n, exec_ns, lock_ns, wait_ns, drawable_ns, skipped, sync_n, sync_ns;
+    uint64_t pso_n, pso_ns, compile_n, compile_ns, exec_n, exec_ns, lock_ns, wait_ns, drawable_ns, skipped, sync_n, sync_ns, gpu_ns;
 } frame_stats12;
 static frame_stats12 g_fs12, g_fs12_sum;
 static double frame_stats_ms12(void) {
@@ -577,13 +583,13 @@ static void frame_stats_present12(uint32_t presents) {
     frame_stats12 f;
     #define TAKE12(x) f.x = __atomic_exchange_n(&g_fs12.x, 0, __ATOMIC_ACQ_REL); __atomic_fetch_add(&g_fs12_sum.x, f.x, __ATOMIC_RELAXED)
     TAKE12(pso_n); TAKE12(pso_ns); TAKE12(compile_n); TAKE12(compile_ns); TAKE12(exec_n); TAKE12(exec_ns);
-    TAKE12(lock_ns); TAKE12(wait_ns); TAKE12(drawable_ns); TAKE12(skipped); TAKE12(sync_n); TAKE12(sync_ns);
+    TAKE12(lock_ns); TAKE12(wait_ns); TAKE12(drawable_ns); TAKE12(skipped); TAKE12(sync_n); TAKE12(sync_ns); TAKE12(gpu_ns);
     #undef TAKE12
     if (gap / 1e6 > limit)
         vx_log("D3D12: frame %u took %.1f ms: %llu pipeline states (%.1f ms), %llu compiles (%.1f ms), %llu executes (%.1f ms, "
-               "%.1f ms of it for the submission lock), fence waits %.1f ms, drawable %.1f ms, %llu draws skipped, %llu GPU round trips (%.1f ms)",
+               "%.1f ms of it for the submission lock), GPU %.1f ms, fence waits %.1f ms, drawable %.1f ms, %llu draws skipped, %llu GPU round trips (%.1f ms)",
                presents, gap / 1e6, (unsigned long long)f.pso_n, f.pso_ns / 1e6, (unsigned long long)f.compile_n, f.compile_ns / 1e6,
-               (unsigned long long)f.exec_n, f.exec_ns / 1e6, f.lock_ns / 1e6, f.wait_ns / 1e6, f.drawable_ns / 1e6,
+               (unsigned long long)f.exec_n, f.exec_ns / 1e6, f.lock_ns / 1e6, f.gpu_ns / 1e6, f.wait_ns / 1e6, f.drawable_ns / 1e6,
                (unsigned long long)f.skipped, (unsigned long long)f.sync_n, f.sync_ns / 1e6);
     static uint64_t window_start;
     if (!window_start) window_start = now;
@@ -591,14 +597,14 @@ static void frame_stats_present12(uint32_t presents) {
         frame_stats12 t;
         #define SUM12(x) t.x = __atomic_exchange_n(&g_fs12_sum.x, 0, __ATOMIC_ACQ_REL)
         SUM12(pso_n); SUM12(pso_ns); SUM12(compile_n); SUM12(compile_ns); SUM12(exec_n); SUM12(exec_ns);
-        SUM12(lock_ns); SUM12(wait_ns); SUM12(drawable_ns); SUM12(skipped); SUM12(sync_n); SUM12(sync_ns);
+        SUM12(lock_ns); SUM12(wait_ns); SUM12(drawable_ns); SUM12(skipped); SUM12(sync_n); SUM12(sync_ns); SUM12(gpu_ns);
         #undef SUM12
         double span = (now - window_start) / 1e6;
         window_start = now;
         vx_log("D3D12: last 300 presents in %.0f ms (%.1f fps): %llu pipeline states (%.0f ms), %llu compiles (%.0f ms), "
-               "%llu executes (%.0f ms, lock %.0f ms), fence waits %.0f ms, drawable %.0f ms, %llu draws skipped, %llu GPU round trips (%.0f ms)",
+               "%llu executes (%.0f ms, lock %.0f ms), GPU %.0f ms, fence waits %.0f ms, drawable %.0f ms, %llu draws skipped, %llu GPU round trips (%.0f ms)",
                span, span > 0 ? 300000.0 / span : 0, (unsigned long long)t.pso_n, t.pso_ns / 1e6, (unsigned long long)t.compile_n,
-               t.compile_ns / 1e6, (unsigned long long)t.exec_n, t.exec_ns / 1e6, t.lock_ns / 1e6, t.wait_ns / 1e6,
+               t.compile_ns / 1e6, (unsigned long long)t.exec_n, t.exec_ns / 1e6, t.lock_ns / 1e6, t.gpu_ns / 1e6, t.wait_ns / 1e6,
                t.drawable_ns / 1e6, (unsigned long long)t.skipped, (unsigned long long)t.sync_n, t.sync_ns / 1e6);
     }
 }
@@ -1191,9 +1197,32 @@ static void residency_remove_allocation12(dev12 *d, id allocation) {   // (d->lo
         if (![d->resident_allocations countForObject:allocation]) return;
         [d->resident_allocations removeObject:allocation];
         if (![d->resident_allocations countForObject:allocation]) {
-            [(id<MTLResidencySet>)d->residency removeAllocation:(id<MTLAllocation>)allocation];
-            d->residency_dirty = 1;
+            uint64_t at[16];
+            for (int i = 0; i < 16; i++) at[i] = d->queues[i] ? __atomic_load_n(&((queue12 *)d->queues[i])->timeline_value, __ATOMIC_ACQUIRE) : 0;
+            if (!d->residency_pending) d->residency_pending = [NSMutableArray new];
+            [d->residency_pending addObject:@[ allocation, [NSData dataWithBytes:at length:sizeof at] ]];
         }
+    }
+}
+// (before a submission: the pending removals the GPU is done with leave the set)
+static void residency_settle12(dev12 *d) {   // (d->lock)
+    if (!d->residency_pending.count) return;
+    if (@available(macOS 15.0, *)) {
+        NSMutableIndexSet *done = [NSMutableIndexSet indexSet];
+        [d->residency_pending enumerateObjectsUsingBlock:^(NSArray *entry, NSUInteger k, BOOL *stop) {
+            (void)stop;
+            const uint64_t *at = ((NSData *)entry[1]).bytes;
+            for (int i = 0; i < 16; i++) {
+                queue12 *q = d->queues[i];
+                if (q && q->timeline && q->timeline.signaledValue < at[i]) return;
+            }
+            [done addIndex:k];
+            if (![d->resident_allocations countForObject:entry[0]]) {
+                [(id<MTLResidencySet>)d->residency removeAllocation:(id<MTLAllocation>)entry[0]];
+                d->residency_dirty = 1;
+            }
+        }];
+        [d->residency_pending removeObjectsAtIndexes:done];
     }
 }
 static void residency_add12(dev12 *d, id<MTLResource> resource) {   // (d->lock)
@@ -1203,6 +1232,7 @@ static void residency_remove12(dev12 *d, id<MTLResource> resource) {   // (d->lo
     if (resource) residency_remove_allocation12(d, resource.heap ? (id)resource.heap : (id)resource);
 }
 static void residency_commit12(dev12 *d) {   // (d->lock)
+    if (d->residency) residency_settle12(d);
     if (!d->residency || !d->residency_dirty) return;
     if (@available(macOS 15.0, *)) [(id<MTLResidencySet>)d->residency commit];
     d->residency_dirty = 0;
@@ -6173,6 +6203,8 @@ static WINAPI HRESULT plib_store(void *this, const uint16_t *name, void *state) 
     pthread_mutex_unlock(&l->lock);
     return hr;
 }
+static WINAPI HRESULT dev_create_graphics_pso_timed(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out);
+static WINAPI HRESULT dev_create_compute_pso_timed(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out);
 static HRESULT plib_load12(plib12 *l, const uint16_t *name, const GFX_PSO_DESC *graphics, const COMPUTE_PSO_DESC *compute,
                            const GUID *iid, void **out) {
     if (out) *out = NULL;
@@ -6181,16 +6213,22 @@ static HRESULT plib_load12(plib12 *l, const uint16_t *name, const GFX_PSO_DESC *
     pthread_mutex_lock(&l->lock);
     plib_entry12 *e = plib_find12(l, name);
     HRESULT hr = E_INVALIDARG;
-    if (e && e->hash == hash && e->compute == (compute != NULL)) {
-        if (!e->pso) {
-            void *made = NULL;
-            hr = graphics ? dev_create_graphics_pso(l->dev, graphics, &IID_ID3D12PipelineState, &made)
-                          : dev_create_compute_pso(l->dev, compute, &IID_ID3D12PipelineState, &made);
-            if (hr >= 0) e->pso = made;                      // (the library's reference)
-        }
-        if (e->pso) hr = pso_query(e->pso, iid, out);
-    }
+    int wanted = e && e->hash == hash && e->compute == (compute != NULL);
+    if (wanted && e->pso) hr = pso_query(e->pso, iid, out);
     pthread_mutex_unlock(&l->lock);
+    if (!wanted || *out) return hr;
+    // (made outside the library's lock: games load pipeline states from many threads at once, and making one -
+    //  translating and compiling its shaders - takes from milliseconds to seconds)
+    void *made = NULL;
+    hr = graphics ? dev_create_graphics_pso_timed(l->dev, graphics, &IID_ID3D12PipelineState, &made)
+                  : dev_create_compute_pso_timed(l->dev, compute, &IID_ID3D12PipelineState, &made);
+    if (hr < 0) return hr;
+    pthread_mutex_lock(&l->lock);
+    e = plib_find12(l, name);                                     // (the entry may have moved, or been made meanwhile)
+    if (e && e->hash == hash && !e->pso) { e->pso = made; made = NULL; }   // (the library's reference)
+    hr = e && e->pso ? pso_query(e->pso, iid, out) : pso_query(made, iid, out);
+    pthread_mutex_unlock(&l->lock);
+    if (made) d3d_release(&((pso12 *)made)->base);
     return hr;
 }
 static WINAPI HRESULT plib_load_graphics(void *this, const uint16_t *name, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
@@ -10790,6 +10828,8 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
 // ---- queues -----------------------------------------------------------------------------------------------------------
 
 static void queue_destroy(d3d_object *o) {
+    dev12 *qd = ((queue12 *)o)->dev;
+    if (qd) { pthread_mutex_lock(&qd->lock); for (int i = 0; i < 16; i++) if (qd->queues[i] == o) qd->queues[i] = NULL; pthread_mutex_unlock(&qd->lock); }
     ((queue12 *)o)->mtl_queue = nil;
     ((queue12 *)o)->timeline = nil;
     release_dev(o);
@@ -11507,6 +11547,7 @@ static void queue_execute_(void *this, uint32_t n, void *const *lists) {
         d3d_addref(&command_allocator->base);
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
             if (held) scratch_recycle(d, held);
+            if (done.GPUEndTime > done.GPUStartTime) FS_ADD12(gpu_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9));
             char *ran = what_ran;
             if (done.status != MTLCommandBufferStatusError) { free(ran); ran = NULL; }
             if (done.status == MTLCommandBufferStatusError) {
@@ -11615,6 +11656,9 @@ static WINAPI HRESULT dev_create_queue(void *this, const Q_DESC *desc, const GUI
     q->timeline = [d->mtl newSharedEvent];
     if (d->residency) if (@available(macOS 15.0, *)) [q->mtl_queue addResidencySet:(id<MTLResidencySet>)d->residency];
     if (!q->mtl_queue || !q->timeline) { d3d_release(&q->base); return E_FAIL; }
+    pthread_mutex_lock(&d->lock);
+    for (int i = 0; i < 16; i++) if (!d->queues[i]) { d->queues[i] = q; break; }
+    pthread_mutex_unlock(&d->lock);
     HRESULT hr = queue_query(q, iid, out);
     d3d_release(&q->base);
     return hr;
@@ -13029,6 +13073,7 @@ static void device_destroy(d3d_object *o) {
     d->resources = nil;
     d->residency = nil;
     d->resident_allocations = nil;
+    d->residency_pending = nil;
     d->pso_cache = nil;
     d->mtl = nil;
 }
