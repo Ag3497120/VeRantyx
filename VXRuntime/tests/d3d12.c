@@ -545,6 +545,11 @@ static int graphics_pso_state_test(ID3D12Device *dev) {
 
 // Feature queries must describe the backend's actual limits so an application can select a valid shader path.
 static int feature_test(ID3D12Device *dev, BOOL *copy_timestamps_supported) {
+    // 12_0 is offered exactly when tiled resources tier 2 is (Metal placement-sparse resources, macOS 26).
+    D3D12_FEATURE_DATA_D3D12_OPTIONS tier_options = { 0 };
+    CHECK(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &tier_options, sizeof tier_options));
+    D3D_FEATURE_LEVEL want_max = tier_options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2 ?
+        D3D_FEATURE_LEVEL_12_0 : D3D_FEATURE_LEVEL_11_1;
     D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_12_1,
         D3D_FEATURE_LEVEL_11_1,
@@ -556,7 +561,7 @@ static int feature_test(ID3D12Device *dev, BOOL *copy_timestamps_supported) {
                                                                   &feature_levels, sizeof feature_levels);
     D3D_FEATURE_LEVEL all_levels_max = feature_levels.MaxSupportedFeatureLevel;
     int feature_levels_ok = feature_levels_hr == S_OK &&
-                            all_levels_max == D3D_FEATURE_LEVEL_11_1;
+                            all_levels_max == want_max;
 
     D3D_FEATURE_LEVEL sparse_levels[] = { D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_11_1 };
     feature_levels = (D3D12_FEATURE_DATA_FEATURE_LEVELS){ 2, sparse_levels, 0x12345678 };
@@ -581,8 +586,12 @@ static int feature_test(ID3D12Device *dev, BOOL *copy_timestamps_supported) {
                                                                        &feature_levels, sizeof feature_levels);
     feature_levels_ok &= empty_feature_levels_hr == E_INVALIDARG && null_feature_levels_hr == E_INVALIDARG;
     ID3D12Device *too_high_level_device = NULL;
-    HRESULT too_high_level_hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_12_0, &IID_ID3D12Device,
+    HRESULT too_high_level_hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_12_1, &IID_ID3D12Device,
                                                    (void **)&too_high_level_device);
+    ID3D12Device *level12_device = NULL;
+    HRESULT level12_hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_12_0, &IID_ID3D12Device, (void **)&level12_device);
+    if (level12_device) ID3D12Device_Release(level12_device);
+    feature_levels_ok &= want_max == D3D_FEATURE_LEVEL_12_0 ? level12_hr == S_OK : level12_hr == DXGI_ERROR_UNSUPPORTED;
     if (too_high_level_device) ID3D12Device_Release(too_high_level_device);
     feature_levels_ok &= too_high_level_hr == DXGI_ERROR_UNSUPPORTED && !too_high_level_device;
     ID3D12Device *invalid_level_device = NULL;
@@ -885,9 +894,11 @@ static int feature_test(ID3D12Device *dev, BOOL *copy_timestamps_supported) {
              (architecture.CacheCoherentUMA == FALSE || architecture.CacheCoherentUMA == TRUE) &&
              (!architecture.CacheCoherentUMA || architecture.UMA) && !architecture1.IsolatedMMU &&
              invalid_architecture_hr == E_INVALIDARG && options_queries_ok &&
-             options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED &&
+             (options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED ||
+              options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_2) &&
              !options.StandardSwizzle64KBSupported && options.ResourceHeapTier == D3D12_RESOURCE_HEAP_TIER_2 &&
-             !options1.WaveOps && !options1.WaveLaneCountMin && !options1.WaveLaneCountMax && !options1.TotalLaneCount &&
+             options1.WaveOps && options1.WaveLaneCountMin == 32 && options1.WaveLaneCountMax == 32 &&
+             options1.TotalLaneCount >= 32 &&
              options1.ExpandedComputeResourceStates && options1.Int64ShaderOps &&
              gpu_va.MaxGPUVirtualAddressBitsPerResource == options.MaxGPUVirtualAddressBitsPerResource &&
              gpu_va.MaxGPUVirtualAddressBitsPerProcess >= gpu_va.MaxGPUVirtualAddressBitsPerResource &&
@@ -1186,7 +1197,10 @@ static int allocation_info_alignment_test(ID3D12Device *dev) {
              volume_over_tile_limit_info.SizeInBytes == UINT64_MAX &&
              rt_info.SizeInBytes == UINT64_MAX && buffer_info.SizeInBytes == UINT64_MAX &&
              row_major_texture_info.SizeInBytes == UINT64_MAX &&
-             undefined_swizzle_info.SizeInBytes == UINT64_MAX && standard_swizzle_info.SizeInBytes == UINT64_MAX &&
+             // (64KB_UNDEFINED_SWIZZLE, the reserved-texture layout, is a 64 KiB-aligned driver layout; the standard
+             // swizzle is not offered)
+             undefined_swizzle_info.SizeInBytes != UINT64_MAX && undefined_swizzle_info.Alignment == 65536 &&
+             standard_swizzle_info.SizeInBytes == UINT64_MAX &&
              invalid_buffer_layout_info.SizeInBytes == UINT64_MAX && FAILED(create_invalid) &&
              create_unsupported_layout == E_INVALIDARG && SUCCEEDED(qi) &&
              mixed_info.SizeInBytes != UINT64_MAX && mixed_info.Alignment == D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
@@ -7214,6 +7228,267 @@ static int present_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
     return 0;
 }
 
+// Tiled resources tier 2: reserved buffers and textures read zeros where no tile is mapped, tiles mapped to the same
+// heap tile alias, CopyTileMappings carries mappings to another resource, and GetResourceTiling gives D3D12's
+// standard 64 KiB tile shapes with the small mips packed.
+static int run_copy(ID3D12Device *dev, ID3D12CommandQueue *queue, ID3D12Resource *dst, UINT64 dst_offset,
+                    ID3D12Resource *src, UINT64 src_offset, UINT64 size) {
+    ID3D12CommandAllocator *alloc;
+    ID3D12GraphicsCommandList *list;
+    CHECK(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc));
+    CHECK(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, dst, dst_offset, src, src_offset, size);
+    CHECK(ID3D12GraphicsCommandList_Close(list));
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+    wait_queue(dev, queue);
+    ID3D12GraphicsCommandList_Release(list);
+    ID3D12CommandAllocator_Release(alloc);
+    return 0;
+}
+
+static int tiled_resource_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options = { 0 };
+    CHECK(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof options));
+    if (options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2) {
+        puts("d3d12 tiled resources: not offered on this Mac (Metal placement sparse needs macOS 26): ok");
+        return 0;
+    }
+    int failed = 0;
+    enum { TILE = 65536 };
+    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 4 * TILE, 1, 1, 1, DXGI_FORMAT_UNKNOWN, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE };
+    ID3D12Resource *reserved = NULL, *reserved2 = NULL, *texture = NULL;
+    CHECK(ID3D12Device_CreateReservedResource(dev, &bd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&reserved));
+    CHECK(ID3D12Device_CreateReservedResource(dev, &bd, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&reserved2));
+    D3D12_HEAP_DESC hd = { 16 * TILE, { D3D12_HEAP_TYPE_DEFAULT }, 0, D3D12_HEAP_FLAG_NONE };
+    ID3D12Heap *heap = NULL;
+    CHECK(ID3D12Device_CreateHeap(dev, &hd, &IID_ID3D12Heap, (void **)&heap));
+
+    UINT total = 0, nsub = 1;
+    D3D12_PACKED_MIP_INFO packed;
+    D3D12_TILE_SHAPE shape;
+    D3D12_SUBRESOURCE_TILING sub;
+    ID3D12Device_GetResourceTiling(dev, reserved, &total, &packed, &shape, &nsub, 0, &sub);
+    if (total != 4 || shape.WidthInTexels != TILE || nsub != 1 || sub.WidthInTiles != 4) {
+        printf("tiled buffer tiling: %u tiles, shape %u, %u subresources of %u tiles\n", total, shape.WidthInTexels, nsub, sub.WidthInTiles);
+        failed = 1;
+    }
+
+    // tile 1 and tile 2 of the buffer both onto heap tile 3
+    D3D12_TILED_RESOURCE_COORDINATE start = { 1, 0, 0, 0 };
+    D3D12_TILE_REGION_SIZE two = { 2, FALSE, 0, 0, 0 };
+    D3D12_TILE_RANGE_FLAGS flags[2] = { D3D12_TILE_RANGE_FLAG_NONE, D3D12_TILE_RANGE_FLAG_NONE };
+    UINT starts[2] = { 3, 3 }, counts[2] = { 1, 1 };
+    ID3D12CommandQueue_UpdateTileMappings(queue, reserved, 1, &start, &two, heap, 2, flags, starts, counts, D3D12_TILE_MAPPING_FLAG_NONE);
+
+    ID3D12Resource *upload = buffer(dev, D3D12_HEAP_TYPE_UPLOAD, TILE, 0, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource *readback = buffer(dev, D3D12_HEAP_TYPE_READBACK, 4 * TILE, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!upload || !readback) return 1;
+    unsigned char *p;
+    CHECK(ID3D12Resource_Map(upload, 0, NULL, (void **)&p));
+    memset(p, 0x5a, TILE);
+    ID3D12Resource_Unmap(upload, 0, NULL);
+    if (run_copy(dev, queue, reserved, TILE, upload, 0, TILE)) return 1;          // writes tile 1 (heap tile 3)
+    if (run_copy(dev, queue, readback, 0, reserved, 0, 4 * TILE)) return 1;
+    CHECK(ID3D12Resource_Map(readback, 0, NULL, (void **)&p));
+    unsigned got[4] = { p[0], p[TILE + 100], p[2 * TILE + 100], p[3 * TILE + 5] };
+    ID3D12Resource_Unmap(readback, 0, NULL);
+    if (got[0] || got[1] != 0x5a || got[2] != 0x5a || got[3]) {
+        printf("tiled buffer: tiles read %#x %#x %#x %#x, want 0 0x5a 0x5a (aliased) 0\n", got[0], got[1], got[2], got[3]);
+        failed = 1;
+    }
+
+    // CopyTileMappings: reserved tile 1 -> reserved2 tile 0; then reserved's tile 1 unmapped (tile 2 keeps the alias)
+    D3D12_TILED_RESOURCE_COORDINATE dst0 = { 0, 0, 0, 0 };
+    D3D12_TILE_REGION_SIZE one = { 1, FALSE, 0, 0, 0 };
+    ID3D12CommandQueue_CopyTileMappings(queue, reserved2, &dst0, reserved, &start, &one, D3D12_TILE_MAPPING_FLAG_NONE);
+    D3D12_TILE_RANGE_FLAGS null_flag = D3D12_TILE_RANGE_FLAG_NULL;
+    ID3D12CommandQueue_UpdateTileMappings(queue, reserved, 1, &start, &one, NULL, 1, &null_flag, NULL, NULL, D3D12_TILE_MAPPING_FLAG_NONE);
+    if (run_copy(dev, queue, readback, 0, reserved2, 0, TILE)) return 1;
+    CHECK(ID3D12Resource_Map(readback, 0, NULL, (void **)&p));
+    memset(p + TILE, 0x33, 2 * TILE);                               // (what the copy must overwrite)
+    ID3D12Resource_Unmap(readback, 0, NULL);
+    if (run_copy(dev, queue, readback, TILE, reserved, TILE, 2 * TILE)) return 1;
+    CHECK(ID3D12Resource_Map(readback, 0, NULL, (void **)&p));
+    unsigned copied = p[7], unmapped = p[TILE + 7], kept = p[2 * TILE + 7];
+    ID3D12Resource_Unmap(readback, 0, NULL);
+    if (copied != 0x5a || unmapped || kept != 0x5a) {
+        printf("tiled buffer: copied mapping reads %#x, unmapped tile %#x, other alias %#x\n", copied, unmapped, kept);
+        failed = 1;
+    }
+
+    // a 512x512 RGBA8 texture, full mip chain: 128x128 tiles, mips 0-2 standard (16 + 4 + 1 tiles), 3-9 packed
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 512, 512, 1, 0, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, D3D12_RESOURCE_FLAG_NONE };
+    CHECK(ID3D12Device_CreateReservedResource(dev, &td, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&texture));
+    D3D12_SUBRESOURCE_TILING subs[10];
+    nsub = 10;
+    ID3D12Device_GetResourceTiling(dev, texture, &total, &packed, &shape, &nsub, 0, subs);
+    int tiling_ok = shape.WidthInTexels == 128 && shape.HeightInTexels == 128 && packed.NumStandardMips == 3 &&
+        packed.NumPackedMips == 7 && packed.NumTilesForPackedMips >= 1 && packed.StartTileIndexInOverallResource == 21 &&
+        total == 21 + packed.NumTilesForPackedMips && nsub == 10 && subs[0].WidthInTiles == 4 && subs[0].HeightInTiles == 4 &&
+        subs[1].WidthInTiles == 2 && subs[1].StartTileIndexInOverallResource == 16 && subs[2].StartTileIndexInOverallResource == 20 &&
+        subs[3].StartTileIndexInOverallResource == D3D12_PACKED_TILE;
+    if (!tiling_ok) {
+        printf("tiled texture tiling: shape %ux%u, mips %u+%u (%u packed tiles at %u), %u tiles, sub0 %ux%u sub1 at %u sub3 at %#x\n",
+               shape.WidthInTexels, shape.HeightInTexels, packed.NumStandardMips, packed.NumPackedMips, packed.NumTilesForPackedMips,
+               packed.StartTileIndexInOverallResource, total, subs[0].WidthInTiles, subs[0].HeightInTiles,
+               subs[1].StartTileIndexInOverallResource, subs[3].StartTileIndexInOverallResource);
+        failed = 1;
+    }
+    // mip 1's tile (1, 0) and the packed mips mapped; mip 1 is filled and read back whole
+    D3D12_TILED_RESOURCE_COORDINATE coords[2] = { { 1, 0, 0, 1 }, { 0, 0, 0, 3 } };
+    D3D12_TILE_REGION_SIZE sizes[2] = { { 1, TRUE, 1, 1, 1 }, { 1, FALSE, 0, 0, 0 } };
+    UINT tstarts[2] = { 5, 6 }, tcounts[2] = { 1, 1 };
+    ID3D12CommandQueue_UpdateTileMappings(queue, texture, 2, coords, sizes, heap, 2, NULL, tstarts, tcounts, D3D12_TILE_MAPPING_FLAG_NONE);
+    ID3D12Resource *tex_upload = buffer(dev, D3D12_HEAP_TYPE_UPLOAD, 256 * 1024, 0, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource *tex_readback = buffer(dev, D3D12_HEAP_TYPE_READBACK, 256 * 1024 + 64 * 256, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!tex_upload || !tex_readback) return 1;
+    CHECK(ID3D12Resource_Map(tex_upload, 0, NULL, (void **)&p));
+    memset(p, 0x77, 256 * 1024);
+    ID3D12Resource_Unmap(tex_upload, 0, NULL);
+    ID3D12CommandAllocator *alloc;
+    ID3D12GraphicsCommandList *list;
+    CHECK(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc));
+    CHECK(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    D3D12_TEXTURE_COPY_LOCATION up = { tex_upload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+    up.PlacedFootprint.Footprint = (D3D12_SUBRESOURCE_FOOTPRINT){ DXGI_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, 1024 };
+    D3D12_TEXTURE_COPY_LOCATION mip1 = { texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    mip1.SubresourceIndex = 1;
+    D3D12_TEXTURE_COPY_LOCATION mip3 = { texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+    mip3.SubresourceIndex = 3;
+    D3D12_TEXTURE_COPY_LOCATION up3 = up;
+    up3.PlacedFootprint.Footprint = (D3D12_SUBRESOURCE_FOOTPRINT){ DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 256 };
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &mip1, 0, 0, 0, &up, NULL);
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &mip3, 0, 0, 0, &up3, NULL);
+    D3D12_RESOURCE_BARRIER to_source = { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
+    to_source.Transition = (D3D12_RESOURCE_TRANSITION_BARRIER){ texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE };
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &to_source);
+    D3D12_TEXTURE_COPY_LOCATION back = { tex_readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+    back.PlacedFootprint.Footprint = up.PlacedFootprint.Footprint;
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &back, 0, 0, 0, &mip1, NULL);
+    D3D12_TEXTURE_COPY_LOCATION back3 = back;
+    back3.PlacedFootprint.Offset = 256 * 1024;
+    back3.PlacedFootprint.Footprint = up3.PlacedFootprint.Footprint;
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &back3, 0, 0, 0, &mip3, NULL);
+    CHECK(ID3D12GraphicsCommandList_Close(list));
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+    wait_queue(dev, queue);
+    CHECK(ID3D12Resource_Map(tex_readback, 0, NULL, (void **)&p));
+    unsigned unmapped_tile = p[10 * 1024 + 40], mapped_tile = p[10 * 1024 + 130 * 4], lower = p[200 * 1024 + 130 * 4],
+             tail = p[256 * 1024 + 20 * 256 + 8];
+    ID3D12Resource_Unmap(tex_readback, 0, NULL);
+    if (unmapped_tile || mapped_tile != 0x77 || lower || tail != 0x77) {
+        printf("tiled texture: mip 1 tile (0,0) %#x, (1,0) %#x, (1,1) %#x, packed mip 3 %#x\n", unmapped_tile, mapped_tile, lower, tail);
+        failed = 1;
+    }
+    // (not tier 3: no reserved 3D textures; reserved textures need the undefined-swizzle layout)
+    D3D12_RESOURCE_DESC bad3d = td;
+    bad3d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    bad3d.DepthOrArraySize = 4;
+    ID3D12Resource *refused = NULL;
+    HRESULT hr3d = ID3D12Device_CreateReservedResource(dev, &bad3d, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&refused);
+    D3D12_RESOURCE_DESC bad_layout = td;
+    bad_layout.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    HRESULT hr_layout = ID3D12Device_CreateReservedResource(dev, &bad_layout, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&refused);
+    if (hr3d != E_INVALIDARG || hr_layout != E_INVALIDARG) { printf("tiled: 3D %#lx, unknown layout %#lx accepted\n", (unsigned long)hr3d, (unsigned long)hr_layout); failed = 1; }
+
+    ID3D12GraphicsCommandList_Release(list);
+    ID3D12CommandAllocator_Release(alloc);
+    ID3D12Resource_Release(tex_upload);
+    ID3D12Resource_Release(tex_readback);
+    ID3D12Resource_Release(texture);
+    ID3D12Resource_Release(upload);
+    ID3D12Resource_Release(readback);
+    ID3D12Resource_Release(reserved);
+    ID3D12Resource_Release(reserved2);
+    ID3D12Heap_Release(heap);
+    printf("d3d12 tiled resources tier 2: unmapped tiles read zero, aliased and copied mappings, standard and packed mips: %s\n",
+           failed ? "FAILED" : "ok");
+    return failed;
+}
+
+// Pipeline libraries: pipelines stored by name come back for an equal description, a serialized library made into a
+// new one makes them again, and wrong names, descriptions and blobs are refused as on Windows.
+static int pipeline_library_test(ID3D12Device *dev) {
+    static unsigned char code[4096], other[4096];
+    size_t code_size = 0, other_size = 0;
+    if (load("tests/shaders12/typed_buffer_cs.dxil", code, sizeof code, &code_size) ||
+        load("tests/shaders12/typed_sint_buffer_cs.dxil", other, sizeof other, &other_size)) return 1;
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {
+        { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 },
+        { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND },
+    };
+    D3D12_ROOT_PARAMETER param = { D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE };
+    param.DescriptorTable.NumDescriptorRanges = 2;
+    param.DescriptorTable.pDescriptorRanges = ranges;
+    D3D12_ROOT_SIGNATURE_DESC rs_desc = { 1, &param, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+    ID3DBlob *rs_blob = NULL, *errors = NULL;
+    CHECK(D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &errors));
+    ID3D12RootSignature *root = NULL;
+    CHECK(ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(rs_blob), ID3D10Blob_GetBufferSize(rs_blob),
+                                           &IID_ID3D12RootSignature, (void **)&root));
+    ID3D10Blob_Release(rs_blob);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc = { root, { code, code_size } }, desc2 = { root, { other, other_size } };
+    ID3D12PipelineState *pso = NULL;
+    CHECK(ID3D12Device_CreateComputePipelineState(dev, &desc, &IID_ID3D12PipelineState, (void **)&pso));
+
+    D3D12_FEATURE_DATA_SHADER_CACHE cache = { 0 };
+    CHECK(ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_SHADER_CACHE, &cache, sizeof cache));
+    ID3D10Blob *cached = NULL;
+    CHECK(ID3D12PipelineState_GetCachedBlob(pso, &cached));
+    int failed = !(cache.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_LIBRARY) || !cached || !ID3D10Blob_GetBufferSize(cached);
+    if (cached) ID3D10Blob_Release(cached);
+
+    ID3D12Device1 *dev1 = NULL;
+    CHECK(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device1, (void **)&dev1));
+    ID3D12PipelineLibrary1 *lib = NULL, *lib2 = NULL;
+    CHECK(ID3D12Device1_CreatePipelineLibrary(dev1, NULL, 0, &IID_ID3D12PipelineLibrary1, (void **)&lib));
+    HRESULT store = ID3D12PipelineLibrary1_StorePipeline(lib, L"typed", pso);
+    HRESULT again = ID3D12PipelineLibrary1_StorePipeline(lib, L"typed", pso);
+    ID3D12PipelineState *loaded = NULL, *missing = NULL, *mismatched = NULL;
+    HRESULT load = ID3D12PipelineLibrary1_LoadComputePipeline(lib, L"typed", &desc, &IID_ID3D12PipelineState, (void **)&loaded);
+    HRESULT load_missing = ID3D12PipelineLibrary1_LoadComputePipeline(lib, L"other", &desc, &IID_ID3D12PipelineState, (void **)&missing);
+    HRESULT load_mismatch = ID3D12PipelineLibrary1_LoadComputePipeline(lib, L"typed", &desc2, &IID_ID3D12PipelineState, (void **)&mismatched);
+    failed |= store != S_OK || again != E_INVALIDARG || load != S_OK || loaded != pso || load_missing != E_INVALIDARG ||
+              missing || load_mismatch != E_INVALIDARG || mismatched;
+    if (loaded) ID3D12PipelineState_Release(loaded);
+
+    SIZE_T size = ID3D12PipelineLibrary1_GetSerializedSize(lib);
+    unsigned char *data = malloc(size);
+    HRESULT short_hr = ID3D12PipelineLibrary1_Serialize(lib, data, size - 1);
+    CHECK(ID3D12PipelineLibrary1_Serialize(lib, data, size));
+    CHECK(ID3D12Device1_CreatePipelineLibrary(dev1, data, size, &IID_ID3D12PipelineLibrary1, (void **)&lib2));
+    ID3D12PipelineState *remade = NULL;
+    HRESULT remake = ID3D12PipelineLibrary1_LoadComputePipeline(lib2, L"typed", &desc, &IID_ID3D12PipelineState, (void **)&remade);
+    HRESULT restore = ID3D12PipelineLibrary1_StorePipeline(lib2, L"typed", pso);
+    failed |= short_hr != E_INVALIDARG || remake != S_OK || !remade || remade == pso || restore != E_INVALIDARG;
+    if (remade) ID3D12PipelineState_Release(remade);
+    data[12] ^= 0xff;                                             // another adapter's library
+    ID3D12PipelineLibrary1 *refused = NULL;
+    HRESULT other_adapter = ID3D12Device1_CreatePipelineLibrary(dev1, data, size, &IID_ID3D12PipelineLibrary1, (void **)&refused);
+    data[0] ^= 0xff;                                              // not a library
+    HRESULT garbage = ID3D12Device1_CreatePipelineLibrary(dev1, data, size, &IID_ID3D12PipelineLibrary1, (void **)&refused);
+    failed |= other_adapter != D3D12_ERROR_ADAPTER_NOT_FOUND || garbage != E_INVALIDARG || refused;
+    free(data);
+    if (failed)
+        printf("pipeline library: cache flags %#x, store %#lx/%#lx, load %#lx (same %d), missing %#lx, mismatch %#lx, short %#lx, "
+               "remake %#lx, restore %#lx, other adapter %#lx, garbage %#lx\n", cache.SupportFlags, (unsigned long)store,
+               (unsigned long)again, (unsigned long)load, loaded == pso, (unsigned long)load_missing, (unsigned long)load_mismatch,
+               (unsigned long)short_hr, (unsigned long)remake, (unsigned long)restore, (unsigned long)other_adapter, (unsigned long)garbage);
+    ID3D12PipelineLibrary1_Release(lib2);
+    ID3D12PipelineLibrary1_Release(lib);
+    ID3D12Device1_Release(dev1);
+    ID3D12PipelineState_Release(pso);
+    ID3D12RootSignature_Release(root);
+    printf("d3d12 pipeline library: store, load by name and description, serialize and remake, refused blobs: %s\n",
+           failed ? "FAILED" : "ok");
+    return failed;
+}
+
 int main(void) {
     FILE *f = fopen("tests/shaders12/sum_cs.dxil", "rb");
     if (!f) { printf("tests/shaders12/sum_cs.dxil not found (run from VXRuntime)\n"); return 1; }
@@ -7247,6 +7522,8 @@ int main(void) {
     if (resource_state_validation_test(dev)) return 1;
     if (resource_flags_validation_test(dev)) return 1;
     if (residency_test(dev, queue)) return 1;
+    if (tiled_resource_test(dev, queue)) return 1;
+    if (pipeline_library_test(dev)) return 1;
     if (copy_queue_test(dev, copy_timestamps_supported)) return 1;
     if (attachment_state_test(dev, queue)) return 1;
     if (rect_clear_test(dev, queue)) return 1;

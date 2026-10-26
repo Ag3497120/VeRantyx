@@ -164,12 +164,13 @@ static int feature_test(ID3D12Device *dev) {
     }
     ID3D12Device1 *dev1;
     CHECK(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device1, (void **)&dev1));
-    ID3D12PipelineLibrary *library = (ID3D12PipelineLibrary *)1;
+    ID3D12PipelineLibrary *library = NULL;
     HRESULT hr = ID3D12Device1_CreatePipelineLibrary(dev1, NULL, 0, &IID_ID3D12PipelineLibrary, (void **)&library);
-    EXPECT(hr == DXGI_ERROR_UNSUPPORTED && !library, "CreatePipelineLibrary: %#lx", (unsigned long)hr);
+    EXPECT(hr == S_OK && library, "CreatePipelineLibrary: %#lx", (unsigned long)hr);
+    if (library) ID3D12PipelineLibrary_Release(library);
     ID3D12Device1_Release(dev1);
     CHECK(ID3D12Device_SetStablePowerState(dev, TRUE));
-    printf("d3d12 engine features: OPTIONS4-18 and the other start-up blocks answered at their exact sizes, render pass tier 0, no mesh/raytracing/enhanced barriers, Device1-9, no pipeline library: %s\n",
+    printf("d3d12 engine features: OPTIONS4-18 and the other start-up blocks answered at their exact sizes, render pass tier 0, no mesh/raytracing/enhanced barriers, Device1-9, an empty pipeline library: %s\n",
            bad == before ? "ok" : "FAILED");
     return 0;
 }

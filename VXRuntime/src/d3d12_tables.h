@@ -1612,6 +1612,41 @@ static WINAPI HRESULT stub_ID3D12VersionedRootSignatureDeserializer_GetUnconvert
 static void *const vtstub_ID3D12VersionedRootSignatureDeserializer[] = { (void *)stub_ID3D12VersionedRootSignatureDeserializer_QueryInterface, (void *)stub_ID3D12VersionedRootSignatureDeserializer_AddRef, (void *)stub_ID3D12VersionedRootSignatureDeserializer_Release, (void *)stub_ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion, (void *)stub_ID3D12VersionedRootSignatureDeserializer_GetUnconvertedRootSignatureDesc };
 #define VT_COUNT_ID3D12VersionedRootSignatureDeserializer 5
 static const GUID IID_ID3D12VersionedRootSignatureDeserializer = { 0x7f91ce67, 0x090c, 0x4bb7, { 0xb7, 0x8e, 0xed, 0x8f, 0xf2, 0xe3, 0x1d, 0xa0 } };
+static const char *const vt_ID3D12PipelineLibrary[] = { "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName", "GetDevice", "StorePipeline", "LoadGraphicsPipeline", "LoadComputePipeline", "GetSerializedSize", "Serialize" };
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::AddRef"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_Release(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::Release"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::SetPrivateDataInterface"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_SetName(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::SetName"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::GetDevice"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_StorePipeline(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::StorePipeline"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_LoadGraphicsPipeline(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::LoadGraphicsPipeline"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_LoadComputePipeline(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::LoadComputePipeline"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_GetSerializedSize(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::GetSerializedSize"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary_Serialize(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary::Serialize"); }
+static void *const vtstub_ID3D12PipelineLibrary[] = { (void *)stub_ID3D12PipelineLibrary_QueryInterface, (void *)stub_ID3D12PipelineLibrary_AddRef, (void *)stub_ID3D12PipelineLibrary_Release, (void *)stub_ID3D12PipelineLibrary_GetPrivateData, (void *)stub_ID3D12PipelineLibrary_SetPrivateData, (void *)stub_ID3D12PipelineLibrary_SetPrivateDataInterface, (void *)stub_ID3D12PipelineLibrary_SetName, (void *)stub_ID3D12PipelineLibrary_GetDevice, (void *)stub_ID3D12PipelineLibrary_StorePipeline, (void *)stub_ID3D12PipelineLibrary_LoadGraphicsPipeline, (void *)stub_ID3D12PipelineLibrary_LoadComputePipeline, (void *)stub_ID3D12PipelineLibrary_GetSerializedSize, (void *)stub_ID3D12PipelineLibrary_Serialize };
+#define VT_COUNT_ID3D12PipelineLibrary 13
+static const GUID IID_ID3D12PipelineLibrary = { 0xc64226a8, 0x9201, 0x46af, { 0xb4, 0xcc, 0x53, 0xfb, 0x9f, 0xf7, 0x41, 0x4f } };
+static const char *const vt_ID3D12PipelineLibrary1[] = { "QueryInterface", "AddRef", "Release", "GetPrivateData", "SetPrivateData", "SetPrivateDataInterface", "SetName", "GetDevice", "StorePipeline", "LoadGraphicsPipeline", "LoadComputePipeline", "GetSerializedSize", "Serialize", "LoadPipeline" };
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::QueryInterface"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::AddRef"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_Release(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::Release"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_GetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::GetPrivateData"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_SetPrivateData(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::SetPrivateData"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_SetPrivateDataInterface(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::SetPrivateDataInterface"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_SetName(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::SetName"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_GetDevice(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::GetDevice"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_StorePipeline(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::StorePipeline"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_LoadGraphicsPipeline(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::LoadGraphicsPipeline"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_LoadComputePipeline(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::LoadComputePipeline"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_GetSerializedSize(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::GetSerializedSize"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_Serialize(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::Serialize"); }
+static WINAPI HRESULT stub_ID3D12PipelineLibrary1_LoadPipeline(void *self) { (void)self; return d3d_not_implemented("ID3D12PipelineLibrary1::LoadPipeline"); }
+static void *const vtstub_ID3D12PipelineLibrary1[] = { (void *)stub_ID3D12PipelineLibrary1_QueryInterface, (void *)stub_ID3D12PipelineLibrary1_AddRef, (void *)stub_ID3D12PipelineLibrary1_Release, (void *)stub_ID3D12PipelineLibrary1_GetPrivateData, (void *)stub_ID3D12PipelineLibrary1_SetPrivateData, (void *)stub_ID3D12PipelineLibrary1_SetPrivateDataInterface, (void *)stub_ID3D12PipelineLibrary1_SetName, (void *)stub_ID3D12PipelineLibrary1_GetDevice, (void *)stub_ID3D12PipelineLibrary1_StorePipeline, (void *)stub_ID3D12PipelineLibrary1_LoadGraphicsPipeline, (void *)stub_ID3D12PipelineLibrary1_LoadComputePipeline, (void *)stub_ID3D12PipelineLibrary1_GetSerializedSize, (void *)stub_ID3D12PipelineLibrary1_Serialize, (void *)stub_ID3D12PipelineLibrary1_LoadPipeline };
+#define VT_COUNT_ID3D12PipelineLibrary1 14
+static const GUID IID_ID3D12PipelineLibrary1 = { 0x80eabf42, 0x2568, 0x4e5e, { 0xbd, 0x82, 0xc3, 0x7f, 0x86, 0x96, 0x1d, 0xc3 } };
 static const char *const vt_ID3D12Debug[] = { "QueryInterface", "AddRef", "Release", "EnableDebugLayer" };
 static WINAPI HRESULT stub_ID3D12Debug_QueryInterface(void *self) { (void)self; return d3d_not_implemented("ID3D12Debug::QueryInterface"); }
 static WINAPI HRESULT stub_ID3D12Debug_AddRef(void *self) { (void)self; return d3d_not_implemented("ID3D12Debug::AddRef"); }

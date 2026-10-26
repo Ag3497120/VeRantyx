@@ -16,9 +16,11 @@
 // single-operation ExecuteIndirect draw signatures without count buffers or root/IA updates. WriteBufferImmediate
 // records aligned 32-bit writes on direct, compute, and copy lists through ordered Metal blit operations.
 // Opaque-layout textures support Map plus synchronous WriteToSubresource/ReadFromSubresource transfers in COMMON state
-// for single-sample, single-plane formats through shared Metal staging buffers and blit commands.
-// Not done yet: reserved resources, protected resource sessions, sampler feedback, ray/mesh dispatch,
-// geometry/hull/domain stages, full typed-buffer format coverage, atomics outside R32 integer resources supported by
+// for single-sample, single-plane formats through shared Metal staging buffers and blit commands. Reserved resources
+// (tiled resources tier 2, feature level 12_0) are Metal 4 placement-sparse resources whose tiles UpdateTileMappings
+// maps onto the D3D12 heaps' Metal placement heaps; pipeline libraries keep pipelines by name and description.
+// Not done yet: CopyTiles, 3D (tier 3) tiles, protected resource sessions, sampler feedback, ray/mesh dispatch,
+// DXIL geometry and hull/domain stages, full typed-buffer format coverage, atomics outside R32 integer resources supported by
 // the active Metal GPU, structured-buffer UAV clears, and ExecuteIndirect bundle signatures that change root or IA
 // state or use a count buffer.
 #include "d3d_common.h"
@@ -37,9 +39,9 @@
 #include "d3d_tables.h"                                            // (IDXGISwapChain3, for swap chains on D3D12 queues)
 #pragma clang diagnostic pop
 
-enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG, K12_MEMHEAP, K12_QUERYHEAP, K12_COMMAND_SIGNATURE };
+enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG, K12_MEMHEAP, K12_QUERYHEAP, K12_COMMAND_SIGNATURE, K12_PIPELINE_LIBRARY };
 #define D3D12_ALL_SUBRESOURCES UINT32_MAX
-enum { D3D12_LAYOUT_UNKNOWN12 = 0, D3D12_LAYOUT_ROW_MAJOR12 = 1 };
+enum { D3D12_LAYOUT_UNKNOWN12 = 0, D3D12_LAYOUT_ROW_MAJOR12 = 1, D3D12_LAYOUT_64KB_UNDEFINED_SWIZZLE12 = 2 };
 enum { D3D12_RESOLVE_MODE_MIN12 = 1, D3D12_RESOLVE_MODE_MAX12 = 2, D3D12_RESOLVE_MODE_AVERAGE12 = 3 };
 enum {
     D3D12_STATE_VERTEX_CONSTANT = 0x00000001u,
@@ -68,6 +70,7 @@ enum {
 
 static const GUID IID_IUnknown_ = { 0, 0, 0, { 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } };
 static void **g_swapchain_vtbl;
+static void **g_plib_vtbl;
 static void **g_device_vtbl, **g_queue_vtbl, **g_allocator_vtbl, **g_list_vtbl, **g_fence_vtbl, **g_heap_vtbl, **g_rootsig_vtbl,
             **g_pso_vtbl, **g_resource_vtbl, **g_blob_vtbl, **g_debug_vtbl, **g_memheap_vtbl, **g_queryheap_vtbl, **g_command_signature_vtbl;
 static pthread_once_t g_tables_once = PTHREAD_ONCE_INIT;
@@ -205,6 +208,8 @@ struct dev12 {
     id residency;                    // id<MTLResidencySet>, or nil
     NSCountedSet *resident_allocations;
     int residency_dirty;
+    int tiled_tier;                  // D3D12_TILED_RESOURCES_TIER: 2 with Metal placement sparse (macOS 26), else 0
+    id tile_queue;                   // id<MTL4CommandQueue> carrying UpdateTileMappings (made when first needed)
 };
 
 typedef struct {
@@ -273,6 +278,13 @@ struct res12 {
     uint32_t initial_promoted;
     res_state_override12 *state_overrides;
     res_state_pending12 *pending_transitions;
+    // Reserved (tiled) resources: Metal placement-sparse buffers and textures with 64 KiB pages, mapped onto the
+    // Metal placement heaps of D3D12 heaps. Each tile's current mapping is kept for CopyTileMappings; a mapped heap
+    // is held until its tiles are remapped or the resource is destroyed.
+    uint8_t reserved;
+    uint32_t tile_count;
+    memheap12 **tile_heaps;
+    uint32_t *tile_offsets;
 };
 
 // A heap (ID3D12Heap) for placed resources: a Metal placement heap, so resources placed at the same offset share
@@ -319,6 +331,7 @@ typedef struct {
     param12 *params;
     static_sampler12 *samplers;
     gpu_ir_pipeline_layout *gpu_layout;
+    uint64_t blob_hash;              // of its serialized form (pipeline libraries match descriptions by content)
 } rootsig12;
 
 typedef struct { uint32_t type, payload_offset, size, a, b, c; } command_argument12;
@@ -358,6 +371,7 @@ typedef struct {
     dxil_msl gs;                     // its slots
     uint32_t gs_in_verts, gs_max_tris, gs_out_regs, gs_vs_out_regs, gs_nattr;
     struct { uint32_t reg, offset, slot, instanced, step; MTLVertexFormat format; } gs_attr[32];
+    uint64_t desc_hash;              // of the description it was made from (pipeline libraries, cached blobs)
 } pso12;
 
 typedef struct { d3d_object base; void *data; size_t size; } blob12;
@@ -457,6 +471,12 @@ static void *alloc12(size_t size, int kind, void **vtbl, dev12 *dev) {
     return o;
 }
 static void release_dev(d3d_object *o) { dev12 *d = ((obj12 *)o)->dev; if (d) d3d_release(&d->base); }
+
+static uint64_t fnv1a12(uint64_t h, const void *data, size_t size) {
+    const uint8_t *p = data;
+    for (size_t i = 0; p && i < size; i++) { h ^= p[i]; h *= 0x100000001b3ull; }
+    return h;
+}
 
 // ---- blobs (ID3DBlob) ---------------------------------------------------------------------------------------------
 
@@ -957,7 +977,13 @@ static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int
         if (@available(macOS 26.0, *))
             if ([d->mtl supportsFamily:MTLGPUFamilyApple10]) s.lodBias = bias;
     }
-    if (filter & 0x80) {
+    // bits 7-8: the reduction, 0 standard, 1 comparison, 2 minimum, 3 maximum (tiled resources tier 2)
+    uint32_t reduction = ((uint32_t)filter >> 7) & 3;
+    if (reduction >= 2) {
+        if (@available(macOS 26.0, *))
+            s.reductionMode = reduction == 2 ? MTLSamplerReductionModeMinimum : MTLSamplerReductionModeMaximum;
+    }
+    if (reduction == 1) {
         static const MTLCompareFunction f[] = { MTLCompareFunctionNever, MTLCompareFunctionNever, MTLCompareFunctionLess, MTLCompareFunctionEqual,
                                                 MTLCompareFunctionLessEqual, MTLCompareFunctionGreater, MTLCompareFunctionNotEqual,
                                                 MTLCompareFunctionGreaterEqual, MTLCompareFunctionAlways };
@@ -972,28 +998,32 @@ static id<MTLSamplerState> make_sampler(dev12 *d, int32_t filter, int32_t u, int
 static void gpu12_release_mtl_object(void *object) { (void)CFBridgingRelease(object); }
 
 // The residency set (dev12.residency): resources counted by allocation, the set committed before a submission.
-static void residency_add12(dev12 *d, id<MTLResource> resource) {   // (d->lock)
-    if (!d->residency || !resource) return;
+static void residency_add_allocation12(dev12 *d, id allocation) {   // (d->lock)
+    if (!d->residency || !allocation) return;
     if (@available(macOS 15.0, *)) {
-        id<MTLAllocation> allocation = resource.heap ? (id<MTLAllocation>)resource.heap : (id<MTLAllocation>)resource;
         if (![d->resident_allocations countForObject:allocation]) {
-            [(id<MTLResidencySet>)d->residency addAllocation:allocation];
+            [(id<MTLResidencySet>)d->residency addAllocation:(id<MTLAllocation>)allocation];
             d->residency_dirty = 1;
         }
         [d->resident_allocations addObject:allocation];
     }
 }
-static void residency_remove12(dev12 *d, id<MTLResource> resource) {   // (d->lock)
-    if (!d->residency || !resource) return;
+static void residency_remove_allocation12(dev12 *d, id allocation) {   // (d->lock)
+    if (!d->residency || !allocation) return;
     if (@available(macOS 15.0, *)) {
-        id<MTLAllocation> allocation = resource.heap ? (id<MTLAllocation>)resource.heap : (id<MTLAllocation>)resource;
         if (![d->resident_allocations countForObject:allocation]) return;
         [d->resident_allocations removeObject:allocation];
         if (![d->resident_allocations countForObject:allocation]) {
-            [(id<MTLResidencySet>)d->residency removeAllocation:allocation];
+            [(id<MTLResidencySet>)d->residency removeAllocation:(id<MTLAllocation>)allocation];
             d->residency_dirty = 1;
         }
     }
+}
+static void residency_add12(dev12 *d, id<MTLResource> resource) {   // (d->lock)
+    if (resource) residency_add_allocation12(d, resource.heap ? (id)resource.heap : (id)resource);
+}
+static void residency_remove12(dev12 *d, id<MTLResource> resource) {   // (d->lock)
+    if (resource) residency_remove_allocation12(d, resource.heap ? (id)resource.heap : (id)resource);
 }
 static void residency_commit12(dev12 *d) {   // (d->lock)
     if (!d->residency || !d->residency_dirty) return;
@@ -1030,6 +1060,12 @@ static void res_destroy(d3d_object *o) {
         d3d_release(&r->owner_heap->base);
         r->owner_heap = NULL;
     }
+    for (uint32_t i = 0; r->tile_heaps && i < r->tile_count; i++)
+        if (r->tile_heaps[i]) d3d_release(&r->tile_heaps[i]->base);
+    free(r->tile_heaps);
+    free(r->tile_offsets);
+    r->tile_heaps = NULL;
+    r->tile_offsets = NULL;
     r->buffer = nil;
     r->texture = nil;
     release_dev(o);
@@ -1398,9 +1434,104 @@ static int d3d12_resource_initial_state_valid12(const RES_DESC *desc, uint32_t s
     return 1;
 }
 
+// ---- tiled (reserved) resources --------------------------------------------------------------------------------------
+// D3D12's tile order (D3D12_SUBRESOURCE_TILING): for each array slice, the tiles of its standard mips one after the
+// other (X, then Y), then the slice's packed mips. Metal's placement-sparse textures use the same 64 KiB tile shapes
+// as D3D12's standard 2D shapes (128x128 for 32 bpp, 512x256 texels for BC1...) and keep a mip tail from
+// firstMipmapInTail on, addressed by tile index in X, which is what D3D12 calls packed mips.
+
+#define TILE_BYTES12 65536u
+typedef struct {
+    uint32_t shape[3];               // standard tile shape, texels (or bytes for buffers)
+    uint32_t mips, slices, std_mips, packed_mips, packed_tiles;
+    uint32_t per_slice, total;
+    uint32_t mip_start[16];          // the first tile of each standard mip within its slice
+    uint32_t mip_tiles[16][2];       // width and height of each standard mip, tiles
+} tiling12;
+
+static int tiling12_get(const res12 *r, tiling12 *t) {
+    memset(t, 0, sizeof *t);
+    if (!r || !r->reserved) return 0;
+    if (r->buffer) {
+        t->shape[0] = TILE_BYTES12; t->shape[1] = t->shape[2] = 1;
+        t->mips = t->slices = t->std_mips = 1;
+        t->mip_tiles[0][0] = (uint32_t)((r->desc.Width + TILE_BYTES12 - 1) / TILE_BYTES12);
+        t->mip_tiles[0][1] = 1;
+        t->per_slice = t->total = t->mip_tiles[0][0];
+        return 1;
+    }
+    id<MTLTexture> tex = r->texture;
+    if (!tex) return 0;
+    if (@available(macOS 26.0, *)) {
+        MTLSize s = [r->dev->mtl sparseTileSizeWithTextureType:tex.textureType pixelFormat:tex.pixelFormat
+                                                  sampleCount:tex.sampleCount sparsePageSize:MTLSparsePageSize64];
+        if (!s.width || !s.height) return 0;
+        t->shape[0] = (uint32_t)s.width; t->shape[1] = (uint32_t)s.height; t->shape[2] = s.depth ? (uint32_t)s.depth : 1;
+        t->mips = (uint32_t)tex.mipmapLevelCount;
+        t->slices = (uint32_t)tex.arrayLength;
+        if (t->mips > 16) return 0;
+        t->std_mips = tex.firstMipmapInTail < t->mips ? (uint32_t)tex.firstMipmapInTail : t->mips;
+        t->packed_mips = t->mips - t->std_mips;
+        t->packed_tiles = t->packed_mips ? (uint32_t)((tex.tailSizeInBytes + TILE_BYTES12 - 1) / TILE_BYTES12) : 0;
+        if (t->packed_mips && !t->packed_tiles) t->packed_tiles = 1;
+        uint32_t at = 0;
+        for (uint32_t m = 0; m < t->std_mips; m++) {
+            uint64_t w = tex.width >> m, h = tex.height >> m;
+            if (!w) w = 1;
+            if (!h) h = 1;
+            t->mip_start[m] = at;
+            t->mip_tiles[m][0] = (uint32_t)((w + t->shape[0] - 1) / t->shape[0]);
+            t->mip_tiles[m][1] = (uint32_t)((h + t->shape[1] - 1) / t->shape[1]);
+            at += t->mip_tiles[m][0] * t->mip_tiles[m][1];
+        }
+        t->per_slice = at + t->packed_tiles;
+        t->total = t->per_slice * t->slices;
+        return 1;
+    }
+    return 0;
+}
+
+// D3D12_TILED_RESOURCE_COORDINATE -> the resource's tile index, or UINT32_MAX when outside the resource.
+static uint32_t tiling12_index(const tiling12 *t, uint32_t x, uint32_t y, uint32_t z, uint32_t subresource) {
+    uint32_t mip = subresource % t->mips, slice = subresource / t->mips;
+    if (slice >= t->slices || z) return UINT32_MAX;
+    if (mip >= t->std_mips) {
+        if (y || x >= t->packed_tiles) return UINT32_MAX;
+        return slice * t->per_slice + (t->per_slice - t->packed_tiles) + x;
+    }
+    if (x >= t->mip_tiles[mip][0] || y >= t->mip_tiles[mip][1]) return UINT32_MAX;
+    return slice * t->per_slice + t->mip_start[mip] + y * t->mip_tiles[mip][0] + x;
+}
+
+// The resource's tile index -> Metal's addressing (mip, slice, tile x, y; the tail by tile index in x).
+static void tiling12_locate(const tiling12 *t, uint32_t index, uint32_t *mip, uint32_t *slice, uint32_t *x, uint32_t *y) {
+    *slice = index / t->per_slice;
+    uint32_t i = index % t->per_slice;
+    uint32_t standard = t->per_slice - t->packed_tiles;
+    if (i >= standard) { *mip = t->std_mips; *x = i - standard; *y = 0; return; }
+    uint32_t m = 0;
+    while (m + 1 < t->std_mips && t->mip_start[m + 1] <= i) m++;
+    i -= t->mip_start[m];
+    *mip = m;
+    *x = i % t->mip_tiles[m][0];
+    *y = i / t->mip_tiles[m][0];
+}
+
+static int d3d12_tiled_tier_probe12(id<MTLDevice> mtl) {
+    if (getenv("VXRT_D3D12_NO_TILED") || getenv("VXRT_D3D12_NO_RESIDENCY_SET")) return 0;
+    if (@available(macOS 26.0, *)) {
+        @autoreleasepool {
+            id<MTLBuffer> probe = [mtl newBufferWithLength:TILE_BYTES12 options:MTLResourceStorageModePrivate
+                                   placementSparsePageSize:MTLSparsePageSize64];
+            if (probe && [mtl sparseTileSizeInBytesForSparsePageSize:MTLSparsePageSize64] == TILE_BYTES12) return 2;
+        }
+    }
+    return 0;
+}
+
 // A committed resource (heap nil) or one placed in a heap at an offset.
 static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t initial_state,
-                               const void *clear, memheap12 *in, uint64_t offset, const GUID *iid, void **out) {
+                               const void *clear, memheap12 *in, uint64_t offset, int reserved, const GUID *iid, void **out) {
     const uint32_t generic_read = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX | D3D12_STATE_NON_PIXEL_SHADER |
         D3D12_STATE_PIXEL_SHADER | D3D12_STATE_INDIRECT | D3D12_STATE_COPY_SOURCE;
     uint64_t required_alignment = 0;
@@ -1426,7 +1557,11 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
     r->initial_promoted = 0;
     if (desc->Dimension == 1) {                                    // D3D12_RESOURCE_DIMENSION_BUFFER
         NSUInteger len = desc->Width ? desc->Width : 1;
-        if (in) r->buffer = [in->heap newBufferWithLength:len options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked offset:offset];
+        if (reserved) {
+            if (@available(macOS 26.0, *))
+                r->buffer = [d->mtl newBufferWithLength:(len + 0xffff) & ~(NSUInteger)0xffff
+                                                options:MTLResourceStorageModePrivate placementSparsePageSize:MTLSparsePageSize64];
+        } else if (in) r->buffer = [in->heap newBufferWithLength:len options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked offset:offset];
         else r->buffer = [d->mtl newBufferWithLength:len options:MTLResourceStorageModeShared];
         if (!r->buffer) { d3d_release(&r->base); return in ? E_INVALIDARG : E_OUTOFMEMORY; }
         void *backend = (void *)CFBridgingRetain(r->buffer);
@@ -1436,14 +1571,21 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
             d3d_release(&r->base);
             return E_OUTOFMEMORY;
         }
-        vx_guest_forget(r->buffer.contents, r->buffer.length);
-        if (!in && hp->Type != 2) memset(r->buffer.contents, 0, r->buffer.length);   // (default and readback heaps start zeroed)
+        if (r->buffer.contents) {                                  // (reserved buffers are GPU-only)
+            vx_guest_forget(r->buffer.contents, r->buffer.length);
+            if (!in && hp->Type != 2) memset(r->buffer.contents, 0, r->buffer.length);
+        }   // (default and readback heaps start zeroed)
     } else {
         MTLTextureDescriptor *td = texture_descriptor(d, desc);
         if (!td) { d3d_release(&r->base); return E_INVALIDARG; }
         int texture_exception = 0;
         @try {
-            if (in) {
+            if (reserved) {
+                if (@available(macOS 26.0, *)) {
+                    td.placementSparsePageSize = MTLSparsePageSize64;
+                    r->texture = [d->mtl newTextureWithDescriptor:td];
+                }
+            } else if (in) {
                 td.storageMode = in->heap.storageMode;
                 td.hazardTrackingMode = MTLHazardTrackingModeTracked;
                 r->texture = [in->heap newTextureWithDescriptor:td offset:offset];
@@ -1488,9 +1630,20 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
             return E_OUTOFMEMORY;
         }
     }
+    if (reserved) {
+        tiling12 t;
+        r->reserved = 1;
+        if (!tiling12_get(r, &t) || !t.total) { d3d_release(&r->base); return E_INVALIDARG; }
+        r->tile_count = t.total;
+        r->tile_heaps = calloc(t.total, sizeof *r->tile_heaps);
+        r->tile_offsets = calloc(t.total, sizeof *r->tile_offsets);
+        if (!r->tile_heaps || !r->tile_offsets) { d3d_release(&r->base); return E_OUTOFMEMORY; }
+    }
     pthread_mutex_lock(&d->lock);
     [d->resources addObject:r->buffer ? (id)r->buffer : (id)r->texture];
-    residency_add12(d, r->buffer ? (id<MTLResource>)r->buffer : (id<MTLResource>)r->texture);
+    // (A placement-sparse resource in a committed residency set keeps reading pages unmapped since: measured on
+    // M1 Max, macOS 26. Its pages are resident through their heaps, which are in the set.)
+    if (!reserved) residency_add12(d, r->buffer ? (id<MTLResource>)r->buffer : (id<MTLResource>)r->texture);
     if (r->buffer) {
         if (d->nbufs == d->capbufs) { d->capbufs = d->capbufs ? d->capbufs * 2 : 256; d->bufs = realloc(d->bufs, d->capbufs * sizeof *d->bufs); }
         d->bufs[d->nbufs++] = r;
@@ -1503,12 +1656,21 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
 }
 
 static HRESULT create_committed(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
-    return create_resource(d, hp, heap_flags, desc, state, clear, NULL, 0, iid, out);
+    return create_resource(d, hp, heap_flags, desc, state, clear, NULL, 0, 0, iid, out);
 }
 
 // ---- heaps and placed resources -----------------------------------------------------------------------------------
 
-static void memheap_destroy(d3d_object *o) { ((memheap12 *)o)->heap = nil; release_dev(o); }
+static void memheap_destroy(d3d_object *o) {
+    memheap12 *m = (memheap12 *)o;
+    if (m->dev && m->dev->tiled_tier && m->heap) {
+        pthread_mutex_lock(&m->dev->lock);
+        residency_remove_allocation12(m->dev, m->heap);
+        pthread_mutex_unlock(&m->dev->lock);
+    }
+    m->heap = nil;
+    release_dev(o);
+}
 static WINAPI HRESULT memheap_query(void *this, const GUID *iid, void **out) {
     const GUID *k[] = { &IID_ID3D12Heap, &IID_ID3D12Heap1, &IID_ID3D12Pageable, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
     return query(this, iid, out, k, 5);
@@ -1634,8 +1796,11 @@ static int resource_alignment12(const RES_DESC *desc, uint64_t *alignment) {
         !resource_flags_valid12(desc)) return 0;
     // Buffers expose linear bytes; texture layouts other than UNKNOWN need row-major, tiled, or swizzle
     // support that this Metal backend does not advertise.
+    // 64KB_UNDEFINED_SWIZZLE (the layout of reserved textures, also allowed for placed and committed ones) leaves the
+    // layout to the driver, as UNKNOWN does.
     if ((desc->Dimension == 1 && desc->Layout != D3D12_LAYOUT_ROW_MAJOR12) ||
-        (desc->Dimension >= 2 && desc->Dimension <= 4 && desc->Layout != D3D12_LAYOUT_UNKNOWN12)) return 0;
+        (desc->Dimension >= 2 && desc->Dimension <= 4 && desc->Layout != D3D12_LAYOUT_UNKNOWN12 &&
+         desc->Layout != D3D12_LAYOUT_64KB_UNDEFINED_SWIZZLE12)) return 0;
     if (desc->SampleCount > 16) return 0;
     if (desc->SampleCount > 1 &&
         ((desc->SampleCount & (desc->SampleCount - 1)) || desc->Dimension != 3 || desc->MipLevels != 1 ||
@@ -1740,6 +1905,8 @@ static WINAPI HRESULT dev_create_memheap(void *this, const MEMHEAP_DESC *desc, c
     int tex_only = (desc->Flags & 0x4) != 0;                       // D3D12_HEAP_FLAG_DENY_BUFFERS
     hd.storageMode = tex_only && desc->Properties.Type != 2 && desc->Properties.Type != 3 ? MTLStorageModePrivate : MTLStorageModeShared;
     hd.hazardTrackingMode = MTLHazardTrackingModeTracked;
+    // (any heap may back reserved resources' tiles: placement-sparse pages of 64 KiB)
+    if (d->tiled_tier) if (@available(macOS 26.0, *)) hd.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
     id<MTLHeap> h = [d->mtl newHeapWithDescriptor:hd];
     if (!h) { vx_log("D3D12: a heap of %llu bytes could not be made", (unsigned long long)desc->SizeInBytes); return E_OUTOFMEMORY; }
     if (!out) return S_FALSE;
@@ -1750,6 +1917,11 @@ static WINAPI HRESULT dev_create_memheap(void *this, const MEMHEAP_DESC *desc, c
     m->residency_priority = VX12_RESIDENCY_PRIORITY_NORMAL;
     if (!m->desc.Alignment) m->desc.Alignment = 64u << 10;
     m->heap = h;
+    if (d->tiled_tier) {                                           // (tiles mapped from it are reached through no resource of its own)
+        pthread_mutex_lock(&d->lock);
+        residency_add_allocation12(d, h);
+        pthread_mutex_unlock(&d->lock);
+    }
     HRESULT hr = memheap_query(m, iid, out);
     d3d_release(&m->base);
     return hr;
@@ -1787,7 +1959,7 @@ static WINAPI HRESULT dev_create_placed(void *this, void *heap, uint64_t offset,
         return E_INVALIDARG;
     }
     if (desc->Dimension == 1 && m->heap.storageMode != MTLStorageModeShared) return E_INVALIDARG;
-    return create_resource(this, &m->desc.Properties, m->desc.Flags, desc, state, clear, m, offset, iid, out);
+    return create_resource(this, &m->desc.Properties, m->desc.Flags, desc, state, clear, m, offset, 0, iid, out);
 }
 static WINAPI HRESULT dev_create_placed1(void *this, void *heap, uint64_t offset, const RES_DESC1 *desc1,
                                          int32_t state, const void *clear, const GUID *iid, void **out) {
@@ -1798,6 +1970,238 @@ static WINAPI HRESULT dev_create_placed1(void *this, void *heap, uint64_t offset
         return DXGI_ERROR_UNSUPPORTED;
     }
     return dev_create_placed(this, heap, offset, &desc1->resource, state, clear, iid, out);
+}
+
+// ---- reserved resources and tile mappings ---------------------------------------------------------------------------
+
+static HRESULT create_reserved12(dev12 *d, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
+    if (out) *out = NULL;
+    if (!desc) return E_INVALIDARG;
+    // Tier 2: buffers and single-sample 2D textures (arrays too) in the 64KB_UNDEFINED_SWIZZLE layout; 3D tiles
+    // (tier 3) and multisampled tiles are not offered.
+    if (d->tiled_tier < 2) return E_INVALIDARG;
+    if (desc->Dimension == 1 ? desc->Layout != D3D12_LAYOUT_ROW_MAJOR12 :
+        desc->Dimension != 3 || desc->Layout != D3D12_LAYOUT_64KB_UNDEFINED_SWIZZLE12 || desc->SampleCount != 1)
+        return E_INVALIDARG;
+    if (desc->Alignment && desc->Alignment != TILE_BYTES12) return E_INVALIDARG;
+    HEAP_PROPS hp = { 1, 0, 0, 1, 1 };                            // (reserved resources have no heap of their own)
+    return create_resource(d, &hp, 0, desc, state, clear, NULL, 0, 1, iid, out);
+}
+static WINAPI HRESULT dev_create_reserved(void *this, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
+    return create_reserved12(this, desc, state, clear, iid, out);
+}
+static WINAPI HRESULT dev_create_reserved1(void *this, const RES_DESC *desc, int32_t state, const void *clear,
+                                           void *protected_session, const GUID *iid, void **out) {
+    if (protected_session) { if (out) *out = NULL; return DXGI_ERROR_UNSUPPORTED; }
+    return create_reserved12(this, desc, state, clear, iid, out);
+}
+
+// GetResourceTiling(resource, *NumTilesForEntireResource, *PackedMipDesc, *StandardTileShapeForNonPackedMips,
+// *NumSubresourceTilings (in: how many wanted, out: how many written), FirstSubresourceTilingToGet, *SubresourceTilings)
+typedef struct { uint8_t NumStandardMips, NumPackedMips; uint32_t NumTilesForPackedMips, StartTileIndexInOverallResource; } PACKED_MIP_INFO12;
+typedef struct { uint32_t WidthInTexels, HeightInTexels, DepthInTexels; } TILE_SHAPE12;
+typedef struct { uint32_t WidthInTiles; uint16_t HeightInTiles, DepthInTiles; uint32_t StartTileIndexInOverallResource; } SUBRESOURCE_TILING12;
+static WINAPI void dev_get_resource_tiling(void *this, void *resource, uint32_t *total, PACKED_MIP_INFO12 *packed,
+                                           TILE_SHAPE12 *shape, uint32_t *count, uint32_t first, SUBRESOURCE_TILING12 *tilings) {
+    res12 *r = resource;
+    tiling12 t;
+    if (!r || r->base.kind != K12_RESOURCE || !tiling12_get(r, &t)) {
+        // (not a reserved resource: no tiles)
+        if (total) *total = 0;
+        if (packed) memset(packed, 0, sizeof *packed);
+        if (shape) memset(shape, 0, sizeof *shape);
+        if (count) *count = 0;
+        return;
+    }
+    if (total) *total = t.total;
+    if (packed) {
+        packed->NumStandardMips = (uint8_t)t.std_mips;
+        packed->NumPackedMips = (uint8_t)t.packed_mips;
+        packed->NumTilesForPackedMips = t.packed_tiles;
+        packed->StartTileIndexInOverallResource = t.per_slice - t.packed_tiles;
+    }
+    if (shape) { shape->WidthInTexels = t.shape[0]; shape->HeightInTexels = t.shape[1]; shape->DepthInTexels = t.shape[2]; }
+    if (count) {
+        uint32_t subresources = t.mips * t.slices, n = 0;
+        for (uint32_t i = first; i < subresources && n < *count; i++, n++) {
+            uint32_t mip = i % t.mips, slice = i / t.mips;
+            if (!tilings) continue;
+            if (mip >= t.std_mips) tilings[n] = (SUBRESOURCE_TILING12){ 0, 0, 0, 0xffffffffu };   // D3D12_PACKED_TILE
+            else tilings[n] = (SUBRESOURCE_TILING12){ t.mip_tiles[mip][0], (uint16_t)t.mip_tiles[mip][1], 1,
+                                                      slice * t.per_slice + t.mip_start[mip] };
+        }
+        *count = n;
+    }
+}
+
+typedef struct { uint32_t X, Y, Z, Subresource; } TILE_COORD12;               // D3D12_TILED_RESOURCE_COORDINATE
+typedef struct { uint32_t NumTiles; int32_t UseBox; uint32_t Width; uint16_t Height, Depth; } TILE_REGION12;   // D3D12_TILE_REGION_SIZE
+
+// The tile indices one region names, in D3D12's order: a box walks X, Y, Z within one subresource; otherwise
+// NumTiles tiles from the start coordinate on in the resource's tile order. Returns how many were appended, or -1.
+static int tiling12_region(const tiling12 *t, const TILE_COORD12 *start, const TILE_REGION12 *size,
+                           uint32_t **list, uint32_t *n, uint32_t *cap) {
+    TILE_REGION12 one = { 1, 0, 1, 1, 1 };
+    if (!size) size = &one;
+    uint32_t first = tiling12_index(t, start->X, start->Y, start->Z, start->Subresource);
+    if (first == UINT32_MAX) return -1;
+    uint32_t want = size->NumTiles;
+    if (size->UseBox) {
+        if ((uint64_t)size->Width * size->Height * size->Depth != size->NumTiles || size->Depth != 1) return -1;
+    } else if ((uint64_t)first + want > t->total) return -1;
+    if (*n + (uint64_t)want > *cap) {
+        uint32_t c = *cap ? *cap : 64;
+        while (c < *n + (uint64_t)want) c *= 2;
+        uint32_t *grown = realloc(*list, (size_t)c * sizeof **list);
+        if (!grown) return -1;
+        *list = grown;
+        *cap = c;
+    }
+    if (!size->UseBox) {
+        for (uint32_t i = 0; i < want; i++) (*list)[(*n)++] = first + i;
+        return (int)want;
+    }
+    for (uint32_t y = 0; y < size->Height; y++)
+        for (uint32_t x = 0; x < size->Width; x++) {
+            uint32_t index = tiling12_index(t, start->X + x, start->Y + y, start->Z, start->Subresource);
+            if (index == UINT32_MAX) return -1;
+            (*list)[(*n)++] = index;
+        }
+    return (int)want;
+}
+
+// Applies new mappings (heap NULL: unmapped) to tiles of one resource on the Metal 4 queue, ordered with the D3D12
+// queue's work: the mapping waits for what the queue was given before and what it is given afterwards waits for it.
+static void tile_mappings_apply12(queue12 *q, res12 *r, const tiling12 *t, const uint32_t *tiles,
+                                  memheap12 *const *heaps, const uint32_t *offsets, uint32_t n) {   // (submit_lock)
+    dev12 *d = q->dev;
+    if (@available(macOS 26.0, *)) {
+        if (!d->tile_queue) d->tile_queue = [d->mtl newMTL4CommandQueue];
+        id<MTL4CommandQueue> tq = d->tile_queue;
+        if (!tq) { vx_log("D3D12: no Metal 4 queue for tile mappings"); return; }
+        id<MTLCommandBuffer> before = [q->mtl_queue commandBuffer];
+        uint64_t ready = ++q->timeline_value;
+        [before encodeSignalEvent:q->timeline value:ready];
+        [before commit];
+        [tq waitForEvent:q->timeline value:ready];
+        // Runs of tiles sharing a heap go in one call (Metal takes one heap per call); an unmap names the heap the
+        // tile was mapped from (Metal ignores one given no heap), and a tile mapped nowhere needs none.
+        for (uint32_t i = 0; i < n;) {
+            memheap12 *heap = heaps[i] ? heaps[i] : r->tile_heaps[tiles[i]];
+            int map = heaps[i] != NULL;
+            uint32_t j = i;
+            while (j < n && (heaps[j] != NULL) == map && (heaps[j] ? heaps[j] : r->tile_heaps[tiles[j]]) == heap) j++;
+            if (!heap) { i = j; continue; }
+            MTLSparseTextureMappingMode mode = map ? MTLSparseTextureMappingModeMap : MTLSparseTextureMappingModeUnmap;
+            if (r->buffer) {
+                MTL4UpdateSparseBufferMappingOperation *ops = calloc(j - i, sizeof *ops);
+                for (uint32_t k = i; k < j; k++)
+                    ops[k - i] = (MTL4UpdateSparseBufferMappingOperation){ mode, NSMakeRange(tiles[k], 1), map ? offsets[k] : 0 };
+                [tq updateBufferMappings:r->buffer heap:heap->heap operations:ops count:j - i];
+                free(ops);
+            } else {
+                MTL4UpdateSparseTextureMappingOperation *ops = calloc(j - i, sizeof *ops);
+                for (uint32_t k = i; k < j; k++) {
+                    uint32_t mip, slice, x, y;
+                    tiling12_locate(t, tiles[k], &mip, &slice, &x, &y);
+                    ops[k - i] = (MTL4UpdateSparseTextureMappingOperation){ mode, MTLRegionMake2D(x, y, 1, 1), mip, slice,
+                                                                           map ? offsets[k] : 0 };
+                }
+                [tq updateTextureMappings:r->texture heap:heap->heap operations:ops count:j - i];
+                free(ops);
+            }
+            i = j;
+        }
+        uint64_t mapped = ++q->timeline_value;
+        [tq signalEvent:q->timeline value:mapped];
+        id<MTLCommandBuffer> after = [q->mtl_queue commandBuffer];
+        [after encodeWaitForEvent:q->timeline value:mapped];
+        [after commit];
+    }
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t i = tiles[k];
+        if (heaps[k]) d3d_addref(&heaps[k]->base);
+        if (r->tile_heaps[i]) d3d_release(&r->tile_heaps[i]->base);
+        r->tile_heaps[i] = heaps[k];
+        r->tile_offsets[i] = heaps[k] ? offsets[k] : 0;
+    }
+}
+
+enum { TILE_RANGE_NULL12 = 1, TILE_RANGE_SKIP12 = 2, TILE_RANGE_REUSE_SINGLE_TILE12 = 4 };
+
+static WINAPI void queue_update_tile_mappings(void *this, void *resource, uint32_t nregions, const TILE_COORD12 *coords,
+                                              const TILE_REGION12 *sizes, void *heap, uint32_t nranges,
+                                              const int32_t *range_flags, const uint32_t *heap_starts,
+                                              const uint32_t *range_counts, int32_t flags) {
+    queue12 *q = this;
+    res12 *r = resource;
+    memheap12 *m = heap;
+    tiling12 t;
+    if (!r || r->base.kind != K12_RESOURCE || !tiling12_get(r, &t) || (m && m->base.kind != K12_MEMHEAP)) {
+        vx_log("D3D12: UpdateTileMappings on something that is not a reserved resource");
+        return;
+    }
+    uint32_t *tiles = NULL, ntiles = 0, cap = 0;
+    TILE_COORD12 origin = { 0, 0, 0, 0 };
+    if (!nregions) {                                               // (no regions: the whole resource)
+        TILE_REGION12 all = { t.total, 0, 0, 0, 0 };
+        if (tiling12_region(&t, &origin, &all, &tiles, &ntiles, &cap) < 0) goto bad;
+    }
+    for (uint32_t i = 0; i < nregions; i++)
+        if (tiling12_region(&t, coords ? &coords[i] : &origin, sizes ? &sizes[i] : NULL, &tiles, &ntiles, &cap) < 0) goto bad;
+    memheap12 **heaps = calloc(ntiles ? ntiles : 1, sizeof *heaps);
+    uint32_t *offsets = calloc(ntiles ? ntiles : 1, sizeof *offsets), *which = calloc(ntiles ? ntiles : 1, sizeof *which);
+    uint32_t napply = 0, k = 0;
+    uint64_t heap_tiles = m ? m->desc.SizeInBytes / TILE_BYTES12 : 0;
+    for (uint32_t range = 0; range < nranges && k < ntiles; range++) {
+        int32_t f = range_flags ? range_flags[range] : 0;
+        // (no counts: one range covers every tile named; otherwise one tile a range)
+        uint32_t count = range_counts ? range_counts[range] : nranges == 1 ? ntiles : 1;
+        uint32_t start = heap_starts ? heap_starts[range] : 0;
+        for (uint32_t c = 0; c < count && k < ntiles; c++, k++) {
+            if (f & TILE_RANGE_SKIP12) continue;
+            memheap12 *target = (f & TILE_RANGE_NULL12) ? NULL : m;
+            uint32_t offset = (f & TILE_RANGE_REUSE_SINGLE_TILE12) ? start : start + c;
+            if (target && (!heap_starts || offset >= heap_tiles)) {
+                vx_log("D3D12: UpdateTileMappings range beyond its heap (tile %u of %llu)", offset, (unsigned long long)heap_tiles);
+                target = NULL;
+            }
+            which[napply] = tiles[k];
+            heaps[napply] = target;
+            offsets[napply++] = offset;
+        }
+    }
+    pthread_mutex_lock(&q->dev->submit_lock);
+    tile_mappings_apply12(q, r, &t, which, heaps, offsets, napply);
+    pthread_mutex_unlock(&q->dev->submit_lock);
+    free(heaps); free(offsets); free(which); free(tiles);
+    return;
+bad:
+    vx_log("D3D12: UpdateTileMappings region outside the resource; ignored");
+    free(tiles);
+}
+
+static WINAPI void queue_copy_tile_mappings(void *this, void *dst_resource, const TILE_COORD12 *dst_start, void *src_resource,
+                                            const TILE_COORD12 *src_start, const TILE_REGION12 *size, int32_t flags) {
+    queue12 *q = this;
+    res12 *dst = dst_resource, *src = src_resource;
+    tiling12 dt, st;
+    if (!dst || !src || dst->base.kind != K12_RESOURCE || src->base.kind != K12_RESOURCE || !dst_start || !src_start ||
+        !tiling12_get(dst, &dt) || !tiling12_get(src, &st)) { vx_log("D3D12: CopyTileMappings between non-reserved resources"); return; }
+    uint32_t *dtiles = NULL, *stiles = NULL, dn = 0, sn = 0, dcap = 0, scap = 0;
+    if (tiling12_region(&dt, dst_start, size, &dtiles, &dn, &dcap) < 0 ||
+        tiling12_region(&st, src_start, size, &stiles, &sn, &scap) < 0 || dn != sn) {
+        vx_log("D3D12: CopyTileMappings region outside a resource; ignored");
+        free(dtiles); free(stiles);
+        return;
+    }
+    memheap12 **heaps = calloc(dn ? dn : 1, sizeof *heaps);
+    uint32_t *offsets = calloc(dn ? dn : 1, sizeof *offsets);
+    pthread_mutex_lock(&q->dev->submit_lock);
+    for (uint32_t i = 0; i < dn; i++) { heaps[i] = src->tile_heaps[stiles[i]]; offsets[i] = src->tile_offsets[stiles[i]]; }
+    tile_mappings_apply12(q, dst, &dt, dtiles, heaps, offsets, dn);
+    pthread_mutex_unlock(&q->dev->submit_lock);
+    free(heaps); free(offsets); free(dtiles); free(stiles);
 }
 
 // ---- query heaps -----------------------------------------------------------------------------------------------------
@@ -2732,7 +3136,7 @@ static MTLCompileOptions *d3d12_shader_compile_options12(dev12 *device, const dx
 static int d3d12_is_dxbc_program(const BYTECODE *code);
 static int dxbc_to_msl12(const BYTECODE *code, dxil_msl *out);
 static void dxbc_reflect12(const dxbc_shader *src, dxil_msl *out);
-static WINAPI HRESULT dev_create_compute_pso(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
+static HRESULT create_compute_pso12(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
     int dxbc = d3d12_is_dxbc_program(&desc->cs);
     dxil_module m;
@@ -2846,6 +3250,7 @@ static WINAPI HRESULT dev_create_rootsig(void *this, uint32_t node, const void *
     rootsig12 *r = alloc12(sizeof *r, K12_ROOTSIG, g_rootsig_vtbl, d);
     r->base.destroy = rootsig_destroy;
     HRESULT hr = parse_rootsig(d, data, size, r);
+    r->blob_hash = fnv1a12(0xcbf29ce484222325ull, data, size);
     if (hr == S_OK) hr = rootsig_query(r, iid, out);
     d3d_release(&r->base);
     return hr;
@@ -4681,7 +5086,7 @@ done:
     return ok;
 }
 
-static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
+static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
     dev12 *d = this;
     if (desc->hs.size || desc->ds.size) { vx_log("D3D12: hull and domain shaders are not done yet"); return E_NOTIMPL; }
     if (desc->gs.size && (!d3d12_is_dxbc_program(&desc->gs) || !d3d12_is_dxbc_program(&desc->vs))) {
@@ -4985,6 +5390,263 @@ static HRESULT pso_stream_parse(const PSO_STREAM_DESC *desc, GFX_PSO_DESC *g, CO
     *compute = is_compute;
     return S_OK;
 }
+
+// ---- pipeline descriptions by content, cached blobs and pipeline libraries ----------------------------------------
+// A pipeline library (ID3D12PipelineLibrary1) holds the pipelines a program stored by name; serialized, it keeps each
+// name with a hash of the description the pipeline was made from, and a library made from that blob in a later run
+// makes a pipeline again when it is loaded by its name and an equal description (Metal keeps its own cache of the
+// compiled shaders, so that is quick). A loaded description that differs is E_INVALIDARG, as on Windows.
+
+static uint64_t root_hash12(void *root) {
+    rootsig12 *r = root;
+    return r && r->base.kind == K12_ROOTSIG ? r->blob_hash : 0;
+}
+static uint64_t compute_desc_hash12(const COMPUTE_PSO_DESC *d) {
+    uint64_t h = fnv1a12(0xcbf29ce484222325ull, "compute", 7), r = root_hash12(d->root);
+    h = fnv1a12(h, &r, sizeof r);
+    h = fnv1a12(h, d->cs.code, d->cs.size);
+    return fnv1a12(h, &d->flags, sizeof d->flags);
+}
+static uint64_t graphics_desc_hash12(const GFX_PSO_DESC *d) {
+    uint64_t h = fnv1a12(0xcbf29ce484222325ull, "graphics", 8), r = root_hash12(d->root);
+    h = fnv1a12(h, &r, sizeof r);
+    const BYTECODE *code[5] = { &d->vs, &d->ps, &d->ds, &d->hs, &d->gs };
+    for (int i = 0; i < 5; i++) { h = fnv1a12(h, &code[i]->size, sizeof code[i]->size); h = fnv1a12(h, code[i]->code, code[i]->size); }
+    h = fnv1a12(h, &d->blend, sizeof d->blend);
+    h = fnv1a12(h, &d->sample_mask, sizeof d->sample_mask);
+    h = fnv1a12(h, &d->raster, sizeof d->raster);
+    h = fnv1a12(h, &d->depth, sizeof d->depth);
+    const INPUT_ELEMENT *e = d->input.elements;
+    for (uint32_t i = 0; e && i < d->input.n; i++) {
+        if (e[i].name) h = fnv1a12(h, e[i].name, strlen(e[i].name));
+        h = fnv1a12(h, &e[i].index, sizeof e[i] - offsetof(INPUT_ELEMENT, index));
+    }
+    h = fnv1a12(h, &d->so.n, sizeof d->so.n);
+    h = fnv1a12(h, &d->strip_cut, offsetof(GFX_PSO_DESC, cached) - offsetof(GFX_PSO_DESC, strip_cut));
+    return fnv1a12(h, &d->flags, sizeof d->flags);
+}
+
+// (CachedPSO in a description is accepted and not needed: the pipeline is made from the description.)
+static WINAPI HRESULT dev_create_compute_pso(void *this, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
+    if (!desc) return E_INVALIDARG;
+    HRESULT hr = create_compute_pso12(this, desc, iid, out);
+    if (hr >= 0 && out && *out) ((pso12 *)*out)->desc_hash = compute_desc_hash12(desc);
+    return hr;
+}
+static WINAPI HRESULT dev_create_graphics_pso(void *this, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
+    if (!desc) return E_INVALIDARG;
+    HRESULT hr = create_graphics_pso12(this, desc, iid, out);
+    if (hr >= 0 && out && *out) ((pso12 *)*out)->desc_hash = graphics_desc_hash12(desc);
+    return hr;
+}
+
+static const char pso_blob_magic12[8] = { 'V', 'X', 'R', 'T', 'P', 'S', 'O', '1' };
+static WINAPI HRESULT pso_cached_blob(void *this, void **out) {
+    pso12 *p = this;
+    if (!out) return E_INVALIDARG;
+    uint8_t data[16];
+    memcpy(data, pso_blob_magic12, 8);
+    memcpy(data + 8, &p->desc_hash, 8);
+    *out = blob_new(data, sizeof data);
+    return *out ? S_OK : E_OUTOFMEMORY;
+}
+
+typedef struct {
+    uint16_t *name;                  // UTF-16, NUL-terminated
+    uint32_t name_len;
+    uint64_t hash;
+    int compute;
+    pso12 *pso;                      // NULL for an entry read from a blob and not loaded yet
+} plib_entry12;
+typedef struct {
+    d3d_object base; dev12 *dev;
+    pthread_mutex_t lock;
+    plib_entry12 *entries;
+    uint32_t n, cap;
+} plib12;
+
+#define D3D12_ERROR_ADAPTER_NOT_FOUND12 ((HRESULT)0x887E0001)
+#define D3D12_ERROR_DRIVER_VERSION_MISMATCH12 ((HRESULT)0x887E0002)
+static const char plib_magic12[8] = { 'V', 'X', 'R', 'T', 'P', 'L', 'I', 'B' };
+enum { PLIB_VERSION12 = 1 };
+
+static uint64_t plib_adapter12(dev12 *d) {             // (the blob is for this runtime on this GPU)
+    uint64_t id = d->mtl.registryID;
+    const char *name = d->mtl.name.UTF8String;
+    return fnv1a12(fnv1a12(0xcbf29ce484222325ull, &id, sizeof id), name, name ? strlen(name) : 0);
+}
+static uint32_t wide_len12(const uint16_t *s) { uint32_t n = 0; while (s[n]) n++; return n; }
+static plib_entry12 *plib_find12(plib12 *l, const uint16_t *name) {
+    uint32_t len = wide_len12(name);
+    for (uint32_t i = 0; i < l->n; i++)
+        if (l->entries[i].name_len == len && !memcmp(l->entries[i].name, name, len * 2)) return &l->entries[i];
+    return NULL;
+}
+static plib_entry12 *plib_add12(plib12 *l, const uint16_t *name, uint32_t len, uint64_t hash, int compute) {
+    if (l->n == l->cap) {
+        uint32_t cap = l->cap ? l->cap * 2 : 64;
+        plib_entry12 *grown = realloc(l->entries, cap * sizeof *grown);
+        if (!grown) return NULL;
+        l->entries = grown;
+        l->cap = cap;
+    }
+    plib_entry12 *e = &l->entries[l->n];
+    e->name = malloc((len + 1) * 2);
+    if (!e->name) return NULL;
+    memcpy(e->name, name, len * 2);
+    e->name[len] = 0;
+    e->name_len = len;
+    e->hash = hash;
+    e->compute = compute;
+    e->pso = NULL;
+    l->n++;
+    return e;
+}
+static void plib_destroy(d3d_object *o) {
+    plib12 *l = (plib12 *)o;
+    for (uint32_t i = 0; i < l->n; i++) {
+        free(l->entries[i].name);
+        if (l->entries[i].pso) d3d_release(&l->entries[i].pso->base);
+    }
+    free(l->entries);
+    pthread_mutex_destroy(&l->lock);
+    release_dev(o);
+}
+static WINAPI HRESULT plib_query(void *this, const GUID *iid, void **out) {
+    const GUID *k[] = { &IID_ID3D12PipelineLibrary, &IID_ID3D12PipelineLibrary1, &IID_ID3D12DeviceChild, &IID_ID3D12Object };
+    return query(this, iid, out, k, 4);
+}
+static WINAPI HRESULT plib_store(void *this, const uint16_t *name, void *state) {
+    plib12 *l = this;
+    pso12 *p = state;
+    if (!name || !p || p->base.kind != K12_PSO) return E_INVALIDARG;
+    pthread_mutex_lock(&l->lock);
+    HRESULT hr = E_INVALIDARG;                                     // (a name already stored)
+    if (!plib_find12(l, name)) {
+        plib_entry12 *e = plib_add12(l, name, wide_len12(name), p->desc_hash, p->compute != nil && !p->render);
+        if (e) { e->pso = p; d3d_addref(&p->base); hr = S_OK; }
+        else hr = E_OUTOFMEMORY;
+    }
+    pthread_mutex_unlock(&l->lock);
+    return hr;
+}
+static HRESULT plib_load12(plib12 *l, const uint16_t *name, const GFX_PSO_DESC *graphics, const COMPUTE_PSO_DESC *compute,
+                           const GUID *iid, void **out) {
+    if (out) *out = NULL;
+    if (!name || !out || (!graphics && !compute)) return E_INVALIDARG;
+    uint64_t hash = graphics ? graphics_desc_hash12(graphics) : compute_desc_hash12(compute);
+    pthread_mutex_lock(&l->lock);
+    plib_entry12 *e = plib_find12(l, name);
+    HRESULT hr = E_INVALIDARG;
+    if (e && e->hash == hash && e->compute == (compute != NULL)) {
+        if (!e->pso) {
+            void *made = NULL;
+            hr = graphics ? dev_create_graphics_pso(l->dev, graphics, &IID_ID3D12PipelineState, &made)
+                          : dev_create_compute_pso(l->dev, compute, &IID_ID3D12PipelineState, &made);
+            if (hr >= 0) e->pso = made;                      // (the library's reference)
+        }
+        if (e->pso) hr = pso_query(e->pso, iid, out);
+    }
+    pthread_mutex_unlock(&l->lock);
+    return hr;
+}
+static WINAPI HRESULT plib_load_graphics(void *this, const uint16_t *name, const GFX_PSO_DESC *desc, const GUID *iid, void **out) {
+    return plib_load12(this, name, desc, NULL, iid, out);
+}
+static WINAPI HRESULT plib_load_compute(void *this, const uint16_t *name, const COMPUTE_PSO_DESC *desc, const GUID *iid, void **out) {
+    return plib_load12(this, name, NULL, desc, iid, out);
+}
+static HRESULT pso_stream_parse(const PSO_STREAM_DESC *desc, GFX_PSO_DESC *g, COMPUTE_PSO_DESC *c, int *compute);
+static WINAPI HRESULT plib_load_stream(void *this, const uint16_t *name, const PSO_STREAM_DESC *desc, const GUID *iid, void **out) {
+    GFX_PSO_DESC graphics;
+    COMPUTE_PSO_DESC compute;
+    int is_compute = 0;
+    if (out) *out = NULL;
+    HRESULT hr = pso_stream_parse(desc, &graphics, &compute, &is_compute);
+    if (hr != S_OK) return hr;
+    return plib_load12(this, name, is_compute ? NULL : &graphics, is_compute ? &compute : NULL, iid, out);
+}
+static size_t plib_size12(plib12 *l) {
+    size_t n = 8 + 4 + 8 + 4;
+    for (uint32_t i = 0; i < l->n; i++) n += 4 + 8 + 4 + (size_t)l->entries[i].name_len * 2;
+    return n;
+}
+static WINAPI size_t plib_serialized_size(void *this) {
+    plib12 *l = this;
+    pthread_mutex_lock(&l->lock);
+    size_t n = plib_size12(l);
+    pthread_mutex_unlock(&l->lock);
+    return n;
+}
+static WINAPI HRESULT plib_serialize(void *this, void *data, size_t size) {
+    plib12 *l = this;
+    pthread_mutex_lock(&l->lock);
+    size_t need = plib_size12(l);
+    if (!data || size < need) { pthread_mutex_unlock(&l->lock); return E_INVALIDARG; }
+    uint8_t *p = data;
+    uint32_t version = PLIB_VERSION12;
+    uint64_t adapter = plib_adapter12(l->dev);
+    memcpy(p, plib_magic12, 8); p += 8;
+    memcpy(p, &version, 4); p += 4;
+    memcpy(p, &adapter, 8); p += 8;
+    memcpy(p, &l->n, 4); p += 4;
+    for (uint32_t i = 0; i < l->n; i++) {
+        plib_entry12 *e = &l->entries[i];
+        uint32_t compute = (uint32_t)e->compute;
+        memcpy(p, &e->name_len, 4); p += 4;
+        memcpy(p, &e->hash, 8); p += 8;
+        memcpy(p, &compute, 4); p += 4;
+        memcpy(p, e->name, (size_t)e->name_len * 2); p += (size_t)e->name_len * 2;
+    }
+    pthread_mutex_unlock(&l->lock);
+    return S_OK;
+}
+
+static WINAPI HRESULT dev_create_pipeline_library(void *this, const void *blob, size_t size, const GUID *iid, void **out) {
+    dev12 *d = this;
+    if (out) *out = NULL;
+    if (size && !blob) return E_INVALIDARG;
+    const uint8_t *p = blob, *end = p + size;
+    uint32_t count = 0;
+    if (size) {
+        uint32_t version;
+        uint64_t adapter;
+        if (size < 24 || memcmp(p, plib_magic12, 8)) return E_INVALIDARG;
+        memcpy(&version, p + 8, 4);
+        memcpy(&adapter, p + 12, 8);
+        memcpy(&count, p + 20, 4);
+        if (version != PLIB_VERSION12) return D3D12_ERROR_DRIVER_VERSION_MISMATCH12;
+        if (adapter != plib_adapter12(d)) return D3D12_ERROR_ADAPTER_NOT_FOUND12;
+        p += 24;
+    }
+    if (!out) return S_FALSE;
+    plib12 *l = alloc12(sizeof *l, K12_PIPELINE_LIBRARY, g_plib_vtbl, d);
+    l->base.destroy = plib_destroy;
+    pthread_mutex_init(&l->lock, NULL);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t len, compute;
+        uint64_t hash;
+        if (end - p < 16) goto bad;
+        memcpy(&len, p, 4); memcpy(&hash, p + 4, 8); memcpy(&compute, p + 12, 4);
+        p += 16;
+        if ((size_t)(end - p) < (size_t)len * 2) goto bad;
+        uint16_t *name = malloc(((size_t)len + 1) * 2);
+        if (!name) goto bad;
+        memcpy(name, p, (size_t)len * 2);
+        name[len] = 0;
+        p += (size_t)len * 2;
+        plib_entry12 *e = plib_find12(l, name) ? NULL : plib_add12(l, name, len, hash, compute != 0);
+        free(name);
+        if (!e) goto bad;
+    }
+    HRESULT hr = plib_query(l, iid, out);
+    d3d_release(&l->base);
+    return hr;
+bad:
+    d3d_release(&l->base);
+    return E_INVALIDARG;
+}
+
 static WINAPI HRESULT dev_create_pso_stream(void *this, const PSO_STREAM_DESC *desc, const GUID *iid, void **out) {
     GFX_PSO_DESC graphics;
     COMPUTE_PSO_DESC compute;
@@ -10165,11 +10827,6 @@ static WINAPI HRESULT dev_query(void *this, const GUID *iid, void **out) {
     return query(this, iid, out, k, 12);
 }
 static WINAPI uint32_t dev_node_count(void *this) { return 1; }
-// Pipeline libraries (PSO caches kept by the program) are optional: programs fall back to creating pipelines.
-static WINAPI HRESULT dev_create_pipeline_library(void *this, const void *blob, size_t size, const GUID *iid, void **out) {
-    if (out) *out = NULL;
-    return DXGI_ERROR_UNSUPPORTED;
-}
 // GPU clocks are Metal's to choose; stable-power mode only matters to profiling tools.
 static WINAPI HRESULT dev_set_stable_power_state(void *this, int32_t enable) { return S_OK; }
 static WINAPI HRESULT dev_set_background_processing(void *this, int32_t mode, int32_t measurements, HANDLE event, int32_t *further) {
@@ -10637,6 +11294,13 @@ static int d3d12_feature_level_known12(int32_t level) {
 }
 
 // D3D12_FEATURE: only what tells a program what it may use.
+// 12_0 needs resource binding tier 2, tiled resources tier 2 (with min/max filtering) and typed UAV loads of the
+// additional formats; 12_1 adds conservative rasterization and rasterizer-ordered views, which Metal does not give.
+// Output-merger logic ops (asked by 11_1) are not offered either, as since 11_1 was first reported.
+static int32_t d3d12_max_feature_level12(dev12 *d) {
+    return d->tiled_tier >= 2 && d->typed_uav_load_additional_formats ? 0xc000 : 0xb100;
+}
+
 static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data, uint32_t size) {
     dev12 *device = this;
     switch (feature) {
@@ -10655,6 +11319,7 @@ static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data,
         memset(o, 0, sizeof *o);
         // DXIL double types are lowered to float; Metal does not implement D3D12 logic ops or the swizzle layout.
         o->resource_binding_tier = 3;                              // descriptor heaps and dynamically indexed ranges
+        o->tiled_resources_tier = (uint32_t)device->tiled_tier;   // Metal placement-sparse resources
         o->ps_stencil_ref = 1;                                     // pixel output [[stencil]] and OM stencil reference
         o->typed_uav_load_additional_formats = device->typed_uav_load_additional_formats;
         o->max_gpu_va_bits_per_resource = 40;
@@ -10676,11 +11341,9 @@ static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data,
     case 2: {                                                      // FEATURE_LEVELS {NumFeatureLevels, pFeatureLevelsRequested, MaxSupportedFeatureLevel}
         struct { uint32_t n; uint32_t pad; const int32_t *levels; int32_t max; } *f = data;
         if (!data || size != sizeof *f || !f->n || !f->levels) return E_INVALIDARG;
-        int32_t best = 0;
-        // D3D12 12_0 requires tiled resources tier 2, min/max filters, and output-merger logic operations.
-        // VXRuntime reports tiled resources and logic operations unsupported, so it must not advertise 12_0.
+        int32_t best = 0, max = d3d12_max_feature_level12(device);
         for (uint32_t i = 0; i < f->n; i++)
-            if (d3d12_feature_level_known12(f->levels[i]) && f->levels[i] <= 0xb100 && f->levels[i] > best)
+            if (d3d12_feature_level_known12(f->levels[i]) && f->levels[i] <= max && f->levels[i] > best)
                 best = f->levels[i];
         f->max = best;
         return S_OK;
@@ -10742,8 +11405,12 @@ static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data,
         if (!data || size != sizeof(struct options1)) return E_INVALIDARG;
         struct options1 *o = data;
         memset(o, 0, sizeof *o);
-        // The translator implements only part of the wave intrinsic set, so expose no WaveOps yet. Metal tracks
+        // Every Shader Model 6.0 wave and quad intrinsic is translated to Metal SIMD-group functions; Apple GPUs run
+        // SIMD groups of 32 threads. (TotalLaneCount is informational: an estimate for these GPUs.) Metal tracks
         // resource transitions; only advertise shader int64 arithmetic on GPU families that support it.
+        o->wave_ops = 1;
+        o->wave_lane_count_min = o->wave_lane_count_max = 32;
+        o->total_lane_count = 32 * 128;
         o->expanded_compute_resource_states = 1;
         o->int64_shader_ops = d3d12_int64_shader_ops_supported12(device);
         return S_OK;
@@ -10793,9 +11460,9 @@ static WINAPI HRESULT dev_check_feature(void *this, int32_t feature, void *data,
         return S_OK;
     }
     case 19: case 22: {                                            // SHADER_CACHE {SupportFlags}, EXISTING_HEAPS {Supported}
-        // No cached PSO blobs or pipeline libraries (CreatePipelineLibrary reports DXGI_ERROR_UNSUPPORTED).
+        // SHADER_CACHE: SINGLE_PSO (GetCachedBlob) and LIBRARY (ID3D12PipelineLibrary); no existing heaps.
         if (!data || size != 4) return E_INVALIDARG;
-        *(uint32_t *)data = 0;
+        *(uint32_t *)data = feature == 19 ? 0x1u | 0x2u : 0;
         return S_OK;
     }
     case 25: case 28: {                                            // CROSS_NODE {SharingTier, AtomicShaderInstructions}, DISPLAYABLE
@@ -11102,10 +11769,9 @@ static WINAPI void debug_noop(void *this) { }
 static WINAPI HRESULT D3D12CreateDevice(void *adapter, int32_t min_level, const GUID *iid, void **out) {
     pthread_once(&g_tables_once, make_tables);
     if (min_level && !d3d12_feature_level_known12(min_level)) return E_INVALIDARG;
-    if (min_level > 0xb100) return DXGI_ERROR_UNSUPPORTED;          // highest advertised feature level is 11_1
+    if (min_level > 0xc000) return DXGI_ERROR_UNSUPPORTED;          // highest feature level offered is 12_0
     id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
     if (!mtl) return E_FAIL;
-    if (!out) return S_FALSE;                                      // (a check that a device could be made)
     dev12 *d = d3d_alloc(sizeof *d, K12_DEVICE, g_device_vtbl, NULL);
     d->base.destroy = device_destroy;
     d->mtl = mtl;
@@ -11131,6 +11797,9 @@ static WINAPI HRESULT D3D12CreateDevice(void *adapter, int32_t min_level, const 
         }
     }
     d->pso_cache = [NSMutableDictionary new];
+    if (d->residency) d->tiled_tier = d3d12_tiled_tier_probe12(mtl);
+    if (min_level > d3d12_max_feature_level12(d)) { d3d_release(&d->base); return DXGI_ERROR_UNSUPPORTED; }
+    if (!out) { d3d_release(&d->base); return S_FALSE; }          // (a check that a device could be made)
     HRESULT hr = dev_query(d, iid, out);
     d3d_release(&d->base);
     return hr;
@@ -11191,10 +11860,13 @@ static void make_tables(void) {
         { "GetCustomHeapProperties", (void *)dev_custom_heap_properties },
         { "GetResourceAllocationInfo1", (void *)dev_allocation_info1 }, { "CreateQueryHeap", (void *)dev_create_query_heap },
         { "CreateCommittedResource1", (void *)dev_create_committed1 }, { "CreateCommittedResource2", (void *)dev_create_committed2 },
+        { "CreateReservedResource", (void *)dev_create_reserved }, { "CreateReservedResource1", (void *)dev_create_reserved1 },
+        { "GetResourceTiling", (void *)dev_get_resource_tiling },
         { NULL, NULL } };
     g_device_vtbl = D3D_VTABLE(ID3D12Device10, device);
     static const d3d_method queue[] = {
         { "QueryInterface", (void *)queue_query }, COMMON_METHODS, { "ExecuteCommandLists", (void *)queue_execute },
+        { "UpdateTileMappings", (void *)queue_update_tile_mappings }, { "CopyTileMappings", (void *)queue_copy_tile_mappings },
         { "Signal", (void *)queue_signal }, { "Wait", (void *)queue_wait }, { "GetTimestampFrequency", (void *)queue_timestamp_frequency },
         { "GetClockCalibration", (void *)queue_clock_calibration },
         { "GetDesc", (void *)queue_get_desc }, { "SetMarker", (void *)list_marker }, { "BeginEvent", (void *)list_marker },
@@ -11243,8 +11915,15 @@ static void make_tables(void) {
     g_heap_vtbl = D3D_VTABLE(ID3D12DescriptorHeap, heap);
     static const d3d_method rootsig[] = { { "QueryInterface", (void *)rootsig_query }, COMMON_METHODS, { NULL, NULL } };
     g_rootsig_vtbl = D3D_VTABLE(ID3D12RootSignature, rootsig);
-    static const d3d_method pso[] = { { "QueryInterface", (void *)pso_query }, COMMON_METHODS, { NULL, NULL } };
+    static const d3d_method pso[] = { { "QueryInterface", (void *)pso_query }, COMMON_METHODS,
+                                      { "GetCachedBlob", (void *)pso_cached_blob }, { NULL, NULL } };
     g_pso_vtbl = D3D_VTABLE(ID3D12PipelineState, pso);
+    static const d3d_method plib[] = {
+        { "QueryInterface", (void *)plib_query }, COMMON_METHODS, { "StorePipeline", (void *)plib_store },
+        { "LoadGraphicsPipeline", (void *)plib_load_graphics }, { "LoadComputePipeline", (void *)plib_load_compute },
+        { "GetSerializedSize", (void *)plib_serialized_size }, { "Serialize", (void *)plib_serialize },
+        { "LoadPipeline", (void *)plib_load_stream }, { NULL, NULL } };
+    g_plib_vtbl = D3D_VTABLE(ID3D12PipelineLibrary1, plib);
     static const d3d_method resource[] = {
         { "QueryInterface", (void *)res_query }, COMMON_METHODS, { "Map", (void *)res_map }, { "Unmap", (void *)res_unmap },
         { "WriteToSubresource", (void *)res_write_to_subresource },
