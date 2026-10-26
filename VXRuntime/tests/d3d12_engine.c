@@ -169,8 +169,35 @@ static int feature_test(ID3D12Device *dev) {
     EXPECT(hr == S_OK && library, "CreatePipelineLibrary: %#lx", (unsigned long)hr);
     if (library) ID3D12PipelineLibrary_Release(library);
     ID3D12Device1_Release(dev1);
+    // Device8/9 forms: GetCopyableFootprints1 and GetResourceAllocationInfo2 agree with the D3D12_RESOURCE_DESC forms
+    ID3D12Device9 *dev9;
+    CHECK(ID3D12Device_QueryInterface(dev, &IID_ID3D12Device9, (void **)&dev9));
+    D3D12_RESOURCE_DESC1 tex1 = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 100, 60, 3, 4, DXGI_FORMAT_BC1_UNORM, { 1, 0 },
+                                  D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE };
+    D3D12_RESOURCE_DESC tex = { tex1.Dimension, 0, 100, 60, 3, 4, DXGI_FORMAT_BC1_UNORM, { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                D3D12_RESOURCE_FLAG_NONE };
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT f0[12], f1[12];
+    memset(f0, 0, sizeof f0);
+    memset(f1, 0, sizeof f1);
+    UINT64 total0 = 0, total1 = 0;
+    ID3D12Device_GetCopyableFootprints(dev, &tex, 0, 12, 0, f0, NULL, NULL, &total0);
+    ID3D12Device9_GetCopyableFootprints1(dev9, &tex1, 0, 12, 0, f1, NULL, NULL, &total1);
+    D3D12_RESOURCE_ALLOCATION_INFO a0 = ID3D12Device_GetResourceAllocationInfo(dev, 0, 1, &tex);
+    D3D12_RESOURCE_ALLOCATION_INFO1 each;
+    D3D12_RESOURCE_ALLOCATION_INFO a1 = ID3D12Device9_GetResourceAllocationInfo2(dev9, 0, 1, &tex1, &each);
+    EXPECT(total0 == total1 && total0 != UINT64_MAX && !memcmp(f0, f1, sizeof f0) && a0.SizeInBytes == a1.SizeInBytes &&
+           a0.Alignment == a1.Alignment && each.SizeInBytes == a0.SizeInBytes,
+           "Device8 footprints/allocation info: totals %llu %llu, sizes %llu %llu %llu", (unsigned long long)total0,
+           (unsigned long long)total1, (unsigned long long)a0.SizeInBytes, (unsigned long long)a1.SizeInBytes,
+           (unsigned long long)each.SizeInBytes);
+    D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_COMPUTE };
+    ID3D12CommandQueue *q1 = NULL;
+    EXPECT(ID3D12Device9_CreateCommandQueue1(dev9, &qd, &IID_ID3D12CommandQueue, &IID_ID3D12CommandQueue, (void **)&q1) == S_OK && q1,
+           "CreateCommandQueue1");
+    if (q1) ID3D12CommandQueue_Release(q1);
+    ID3D12Device9_Release(dev9);
     CHECK(ID3D12Device_SetStablePowerState(dev, TRUE));
-    printf("d3d12 engine features: OPTIONS4-18 and the other start-up blocks answered at their exact sizes, render pass tier 0, no mesh/raytracing/enhanced barriers, Device1-9, an empty pipeline library: %s\n",
+    printf("d3d12 engine features: OPTIONS4-18 and the other start-up blocks answered at their exact sizes, render pass tier 0, no mesh/raytracing/enhanced barriers, Device1-9 (Device8/9 forms of footprints, allocation info, queues), an empty pipeline library: %s\n",
            bad == before ? "ok" : "FAILED");
     return 0;
 }

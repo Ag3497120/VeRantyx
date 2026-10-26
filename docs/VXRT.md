@@ -251,10 +251,13 @@ Direct3D 12 game runs yet**; what exists is checked by test programs that run on
 | Swap chains | DXGI swap chains on D3D12 queues, presenting to a window | Three frames presented, back-buffer indices as on Windows |
 | Heaps | Heaps and placed (aliased) resources, sampled textures, 2D and 1D-array SRV `GetDimensions` | Texture values and dimensions: 0 of 4096 pixels wrong in each readback |
 | Query heaps | Occlusion, binary occlusion and timestamp queries; resolve and queue clock calibration | `tests/d3d12.c`: counts span pass splits and timestamps fall within calibration bounds |
+| Tiled resources (tier 2), feature level 12_0 | Reserved buffers and 2D textures as Metal 4 placement-sparse resources (64 KiB pages, D3D12's standard tile shapes, the mip tail as packed mips), `UpdateTileMappings`/`CopyTileMappings` on an MTL4 queue ordered with the D3D12 queue, min/max sampler reductions (macOS 26) | `tests/d3d12.c`: unmapped tiles read zero, two tiles on one heap tile alias, copied and unmapped mappings, standard and packed mips of a reserved texture |
+| Native 16-bit types, SM 6.2-6.6 intrinsics | `half`/16-bit integer arithmetic, 16-bit raw/structured elements and constant-buffer rows, `CalculateLOD`, `SV_SampleIndex`, `SV_Coverage`, `IsHelperLane`, 8-bit pack/unpack, `dot4add`/`dot2add`; WaveOps reported (32 lanes) | `half_ops_cs` runs on the GPU bit-exact; `sm66_misc_ps` and `cmp_level_zero_cs` translate and compile |
+| Pipeline libraries | `ID3D12PipelineLibrary1` (by name and description, serialized and made again in a new library), `GetCachedBlob` | `tests/d3d12.c`: store/load, mismatched names and descriptions, serialize and remake, refused blobs |
 
 Not yet: comparison sampling outside 2D and 2D-array depth textures, gather, runtime coverage for `GetDimensions` resource kinds beyond 2D and 1D-array SRVs,
-texture atomics, reserved resources, ExecuteIndirect tier 1.1 incrementing constants, raytracing and mesh dispatch,
-hull/domain/geometry shaders. ExecuteIndirect count buffers and signatures that change root arguments or IA views still
+texture atomics, `CopyTiles` and 3D (tier 3) tiles, raytracing and mesh dispatch, enhanced barriers,
+hull/domain shaders and DXIL geometry shaders (DXBC ones run). ExecuteIndirect count buffers and signatures that change root arguments or IA views still
 wait for earlier GPU work and read shared argument buffers on the CPU. No game has been run on D3D12; these results are
 from standalone programs and shader tests. See [the ExecuteIndirect implementation notes](D3D12-ExecuteIndirect.md).
 

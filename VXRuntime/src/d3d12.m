@@ -11715,6 +11715,24 @@ invalid:
     d3d12_footprints_invalid(n, layouts, rows, row_bytes, total);
 }
 
+// Device8/9 forms of earlier methods: D3D12_RESOURCE_DESC1 (its sampler-feedback mip region unused here) and a queue
+// creator id (only for tools telling queues apart).
+static WINAPI void dev_footprints1(void *this, const RES_DESC1 *desc, uint32_t first, uint32_t n, uint64_t base,
+                                   FOOTPRINT *layouts, uint32_t *rows, uint64_t *row_bytes, uint64_t *total) {
+    dev_footprints(this, desc ? &desc->resource : NULL, first, n, base, layouts, rows, row_bytes, total);
+}
+static WINAPI ALLOC_INFO *dev_allocation_info2(void *this, ALLOC_INFO *out, uint32_t mask, uint32_t n, const RES_DESC1 *descs, ALLOC_INFO *each) {
+    RES_DESC *plain = calloc(n ? n : 1, sizeof *plain);
+    if (!plain) { *out = (ALLOC_INFO){ UINT64_MAX, 0 }; return out; }
+    for (uint32_t i = 0; i < n; i++) plain[i] = descs[i].resource;
+    dev_allocation_info1(this, out, mask, n, plain, each);
+    free(plain);
+    return out;
+}
+static WINAPI HRESULT dev_create_queue1(void *this, const Q_DESC *desc, const GUID *creator, const GUID *iid, void **out) {
+    return dev_create_queue(this, desc, iid, out);
+}
+
 static WINAPI HRESULT dev_create_committed(void *this, const HEAP_PROPS *hp, int32_t flags, const RES_DESC *desc, int32_t state, const void *clear, const GUID *iid, void **out) {
     return create_committed(this, hp, flags, desc, state, clear, iid, out);
 }
@@ -11865,6 +11883,8 @@ static void make_tables(void) {
         { "CreateCommittedResource1", (void *)dev_create_committed1 }, { "CreateCommittedResource2", (void *)dev_create_committed2 },
         { "CreateReservedResource", (void *)dev_create_reserved }, { "CreateReservedResource1", (void *)dev_create_reserved1 },
         { "GetResourceTiling", (void *)dev_get_resource_tiling },
+        { "GetCopyableFootprints1", (void *)dev_footprints1 }, { "GetResourceAllocationInfo2", (void *)dev_allocation_info2 },
+        { "CreateCommandQueue1", (void *)dev_create_queue1 },
         { NULL, NULL } };
     g_device_vtbl = D3D_VTABLE(ID3D12Device10, device);
     static const d3d_method queue[] = {
