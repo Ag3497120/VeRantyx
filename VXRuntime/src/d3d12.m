@@ -19,7 +19,7 @@
 // for single-sample, single-plane formats through shared Metal staging buffers and blit commands. Reserved resources
 // (tiled resources tier 2, feature level 12_0) are Metal 4 placement-sparse resources whose tiles UpdateTileMappings
 // maps onto the D3D12 heaps' Metal placement heaps; pipeline libraries keep pipelines by name and description.
-// Not done yet: CopyTiles, 3D (tier 3) tiles, protected resource sessions, sampler feedback, ray/mesh dispatch,
+// Not done yet: 3D (tier 3) tiles, protected resource sessions, sampler feedback, ray/mesh dispatch,
 // hull/domain stages, full typed-buffer format coverage, atomics outside R32 integer resources supported by
 // the active Metal GPU, structured-buffer UAV clears, and ExecuteIndirect bundle signatures that change root or IA
 // state or use a count buffer.
@@ -4181,6 +4181,66 @@ static WINAPI void list_copy_texture(void *this, const COPY_LOC *dst, uint32_t x
     c->a = x; c->b = y; c->c = z;
     if (box) { c->box = *box; c->has_box = 1; }
     hold(dst->res); hold(src->res);
+}
+
+// CopyTiles(tiled resource, start, size, buffer, offset, flags): whole tiles between a reserved resource and a buffer
+// where each tile is 64 KiB, its texels row after row (flags: 2 buffer to resource, 4 resource to buffer). Standard
+// tiles become ordinary copies; the packed mips' tiles have no defined layout on Windows either and are copied as
+// each packed mip's texels, row after row, from the start of the packed tiles.
+static WINAPI void list_copy_tiles(void *this, void *resource, const TILE_COORD12 *start, const TILE_REGION12 *size,
+                                   void *buffer, uint64_t offset, int32_t flags) {
+    res12 *r = resource, *b = buffer;
+    tiling12 t;
+    int to_resource = (flags & 2) != 0;
+    if (!r || !b || r->base.kind != K12_RESOURCE || b->base.kind != K12_RESOURCE || !b->buffer || !start ||
+        !tiling12_get(r, &t) || ((flags & 6) != 2 && (flags & 6) != 4)) { vx_log("D3D12: CopyTiles with invalid arguments"); return; }
+    uint32_t *tiles = NULL, n = 0, cap = 0;
+    if (tiling12_region(&t, start, size, &tiles, &n, &cap) < 0) { vx_log("D3D12: CopyTiles region outside the resource"); free(tiles); return; }
+    for (uint32_t k = 0; k < n; k++) {
+        uint64_t at = offset + (uint64_t)k * TILE_BYTES12;
+        if (r->buffer) {
+            uint64_t from = (uint64_t)tiles[k] * TILE_BYTES12;
+            uint64_t bytes = r->desc.Width > from ? MIN((uint64_t)TILE_BYTES12, r->desc.Width - from) : 0;
+            if (!bytes) continue;
+            if (to_resource) list_copy_buffer(this, r, from, b, at, bytes);
+            else list_copy_buffer(this, b, at, r, from, bytes);
+            continue;
+        }
+        uint32_t mip, slice, x, y;
+        tiling12_locate(&t, tiles[k], &mip, &slice, &x, &y);
+        uint32_t bw = 1, bh = 1, bpb = 0;
+        if (!d3d_copy_format_block(r->desc.Format, &bw, &bh, &bpb) || !bpb) continue;
+        uint32_t mips = t.mips;
+        if (mip >= t.std_mips) {                                   // a packed tile: the packed mips' texels, in order
+            if (x) continue;                                       // (the first packed tile holds them all here)
+            uint64_t cursor = at;
+            for (uint32_t m = t.std_mips; m < mips; m++) {
+                uint32_t w = MAX(1u, (uint32_t)(r->desc.Width >> m)), h = MAX(1u, r->desc.Height >> m);
+                uint32_t pitch = (uint32_t)((((w + bw - 1) / bw) * bpb + 255) & ~255u);
+                COPY_LOC tex = { .res = r, .type = 0 }, lin = { .res = b, .type = 1 };
+                tex.subresource = m + slice * mips;
+                lin.footprint = (FOOTPRINT){ cursor, r->desc.Format, (w + bw - 1) / bw * bw, (h + bh - 1) / bh * bh, 1, pitch };
+                if (to_resource) list_copy_texture(this, &tex, 0, 0, 0, &lin, NULL);
+                else list_copy_texture(this, &lin, 0, 0, 0, &tex, NULL);
+                cursor += (uint64_t)pitch * ((h + bh - 1) / bh);
+                cursor = (cursor + 511) & ~(uint64_t)511;
+            }
+            continue;
+        }
+        uint32_t w = MAX(1u, (uint32_t)(r->desc.Width >> mip)), h = MAX(1u, r->desc.Height >> mip);
+        uint32_t x0 = x * t.shape[0], y0 = y * t.shape[1];
+        uint32_t x1 = MIN(x0 + t.shape[0], (w + bw - 1) / bw * bw), y1 = MIN(y0 + t.shape[1], (h + bh - 1) / bh * bh);
+        uint32_t pitch = t.shape[0] / bw * bpb;                    // (a tile's row: 256 to 1024 bytes)
+        COPY_LOC tex = { .res = r, .type = 0 }, lin = { .res = b, .type = 1 };
+        tex.subresource = mip + slice * mips;
+        lin.footprint = (FOOTPRINT){ at, r->desc.Format, x1 - x0, y1 - y0, 1, pitch };
+        if (to_resource) list_copy_texture(this, &tex, x0, y0, 0, &lin, NULL);
+        else {
+            BOX box = { x0, y0, 0, x1, y1, 1 };
+            list_copy_texture(this, &lin, 0, 0, 0, &tex, &box);
+        }
+    }
+    free(tiles);
 }
 static int d3d12_barrier_state_access(uint32_t state, uint32_t *access) {
     const uint32_t known = D3D12_STATE_VERTEX_CONSTANT | D3D12_STATE_INDEX | D3D12_STATE_RENDER_TARGET |
@@ -11983,7 +12043,7 @@ static void make_tables(void) {
         { "DrawInstanced", (void *)list_draw }, { "DrawIndexedInstanced", (void *)list_draw_indexed },
         { "OMSetBlendFactor", (void *)list_blend_factor }, { "OMSetStencilRef", (void *)list_stencil_ref },
         { "BeginQuery", (void *)list_begin_query }, { "EndQuery", (void *)list_end_query }, { "ResolveQueryData", (void *)list_resolve_query },
-        { "ExecuteIndirect", (void *)list_execute_indirect },
+        { "ExecuteIndirect", (void *)list_execute_indirect }, { "CopyTiles", (void *)list_copy_tiles },
         { "WriteBufferImmediate", (void *)list_write_buffer_immediate },
         { "SetMarker", (void *)list_marker }, { "BeginEvent", (void *)list_marker }, { "EndEvent", (void *)list_end_event },
         { "DiscardResource", (void *)list_discard_resource }, { "SetPredication", (void *)list_set_predication },

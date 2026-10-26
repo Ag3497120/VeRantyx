@@ -7514,6 +7514,39 @@ static int tiled_resource_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
         printf("tiled texture: mip 1 tile (0,0) %#x, (1,0) %#x, (1,1) %#x, packed mip 3 %#x\n", unmapped_tile, mapped_tile, lower, tail);
         failed = 1;
     }
+    // CopyTiles: a 64 KiB tile of mip 0 (tile (0, 0), mapped now) from a buffer, row after row, and back
+    {
+        D3D12_TILED_RESOURCE_COORDINATE t00 = { 0, 0, 0, 0 };
+        D3D12_TILE_REGION_SIZE one_tile = { 1, FALSE, 0, 0, 0 };
+        UINT seven = 7;
+        ID3D12CommandQueue_UpdateTileMappings(queue, texture, 1, &t00, &one_tile, heap, 1, NULL, &seven, NULL, D3D12_TILE_MAPPING_FLAG_NONE);
+        ID3D12Resource *tile_in = buffer(dev, D3D12_HEAP_TYPE_UPLOAD, TILE, 0, D3D12_RESOURCE_STATE_GENERIC_READ);
+        ID3D12Resource *tile_out = buffer(dev, D3D12_HEAP_TYPE_READBACK, TILE, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!tile_in || !tile_out) return 1;
+        CHECK(ID3D12Resource_Map(tile_in, 0, NULL, (void **)&p));
+        for (int i = 0; i < TILE; i++) p[i] = (unsigned char)(i * 7 + (i >> 9));
+        ID3D12Resource_Unmap(tile_in, 0, NULL);
+        CHECK(ID3D12CommandAllocator_Reset(alloc));
+        CHECK(ID3D12GraphicsCommandList_Reset(list, alloc, NULL));
+        D3D12_RESOURCE_BARRIER to_dest = to_source;
+        to_dest.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        to_dest.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &to_dest);
+        ID3D12GraphicsCommandList_CopyTiles(list, texture, &t00, &one_tile, tile_in, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &to_source);
+        ID3D12GraphicsCommandList_CopyTiles(list, texture, &t00, &one_tile, tile_out, 0, D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+        CHECK(ID3D12GraphicsCommandList_Close(list));
+        ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+        wait_queue(dev, queue);
+        unsigned char *q;
+        CHECK(ID3D12Resource_Map(tile_out, 0, NULL, (void **)&q));
+        int differ = 0;
+        for (int i = 0; i < TILE; i++) if (q[i] != (unsigned char)(i * 7 + (i >> 9))) { differ = i + 1; break; }
+        ID3D12Resource_Unmap(tile_out, 0, NULL);
+        if (differ) { printf("tiled texture: CopyTiles round trip differs at byte %d\n", differ - 1); failed = 1; }
+        ID3D12Resource_Release(tile_in);
+        ID3D12Resource_Release(tile_out);
+    }
     // (not tier 3: no reserved 3D textures; reserved textures need the undefined-swizzle layout)
     D3D12_RESOURCE_DESC bad3d = td;
     bad3d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
@@ -7535,7 +7568,7 @@ static int tiled_resource_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
     ID3D12Resource_Release(reserved);
     ID3D12Resource_Release(reserved2);
     ID3D12Heap_Release(heap);
-    printf("d3d12 tiled resources tier 2: unmapped tiles read zero, aliased and copied mappings, standard and packed mips: %s\n",
+    printf("d3d12 tiled resources tier 2: unmapped tiles read zero, aliased and copied mappings, standard and packed mips, CopyTiles: %s\n",
            failed ? "FAILED" : "ok");
     return failed;
 }

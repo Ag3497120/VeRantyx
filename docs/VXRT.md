@@ -257,7 +257,7 @@ Direct3D 12 game runs yet**; what exists is checked by test programs that run on
 | Pipeline libraries | `ID3D12PipelineLibrary1` (by name and description, serialized and made again in a new library), `GetCachedBlob` | `tests/d3d12.c`: store/load, mismatched names and descriptions, serialize and remake, refused blobs |
 
 Not yet: comparison sampling outside 2D and 2D-array depth textures, gather, runtime coverage for `GetDimensions` resource kinds beyond 2D and 1D-array SRVs,
-texture atomics, `CopyTiles` and 3D (tier 3) tiles, raytracing and mesh dispatch, enhanced barriers,
+texture atomics, 3D (tier 3) tiles, raytracing and mesh dispatch, enhanced barriers,
 hull/domain shaders, geometry shaders with outputs other than triangle strips, instancing or clip distances. ExecuteIndirect count buffers and signatures that change root arguments or IA views still
 wait for earlier GPU work and read shared argument buffers on the CPU. No game has been run on D3D12; these results are
 from standalone programs and shader tests. See [the ExecuteIndirect implementation notes](D3D12-ExecuteIndirect.md).
