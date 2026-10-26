@@ -1500,9 +1500,11 @@ static void call(tr *t, const dxil_inst *in) {
             if (bk == 2 && !(op == 139 && is_undef(t, in->ops[4]))) snprintf(addr, sizeof addr, "uint(%s) * %s->stride + uint(%s)", a[1], a[0], a[2]);
             else snprintf(addr, sizeof addr, "uint(%s)", a[1]);
             const dxil_type *rt = in->result != UINT32_MAX ? ty(t, in->type) : NULL;
-            uint32_t elem = rt && rt->count ? rt->members[0] : 0;
-            int f = elem && is_float(t, elem);
-            int bytes = elem_bytes(t, elem);
+            // (type id 0 is a type like any other - often float, the module's first)
+            int has_elem = rt && rt->count;
+            uint32_t elem = has_elem ? rt->members[0] : 0;
+            int f = has_elem && is_float(t, elem);
+            int bytes = has_elem ? elem_bytes(t, elem) : 4;
             // (raw and structured elements of 16 or 64 bits, SM 6.2 native 16-bit types and SM 6.0 int64)
             snprintf(e, sizeof e, "%s(%s, %s)", bytes == 2 ? "vx_ld16x4" : bytes == 8 ? "vx_ld64x4" : "vx_ld4", a[0], addr);
             if (bytes == 8 && f) { err(t, "64-bit floating-point buffer loads"); return; }
