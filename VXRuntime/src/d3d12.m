@@ -90,6 +90,7 @@ _Static_assert(__builtin_offsetof(RES_DESC1, sampler_feedback_mip_region) == siz
                "D3D12_RESOURCE_DESC1 mip-region ABI layout");
 static int resource_alignment12(const RES_DESC *desc, uint64_t *alignment);
 static int d3d12_resolve_typeless(uint32_t format);
+static int no_shared_3d12(void);
 typedef struct { const void *code; size_t size; } BYTECODE;
 typedef struct { void *root; BYTECODE cs; uint32_t node; const void *cached; size_t cached_size; int32_t flags; } COMPUTE_PSO_DESC;
 typedef struct { uint64_t location; uint32_t size; } CBV_DESC;
@@ -1336,6 +1337,31 @@ static void trace_writer12(const char *what, uint64_t hash, const gpu_ir_resourc
         }
     }
 }
+// VXRT_D3D12_TRACE_CS=<hash,...>: those compute shaders' dispatches log what they reach (first 4 dispatches each run)
+static int trace_cs12(uint64_t hash) {
+    const char *e = getenv("VXRT_D3D12_TRACE_CS");
+    if (!e) return 0;
+    char key[24]; snprintf(key, sizeof key, "%016llx", (unsigned long long)hash);
+    return strstr(e, key) != NULL;
+}
+static void trace_cs_accesses12(uint64_t hash, uint32_t x, uint32_t y, uint32_t z, const gpu_ir_resource_access *a, uint32_t n) {
+    static volatile int told;
+    if (__sync_add_and_fetch(&told, 1) > 16) return;
+    vx_log("D3D12: dispatch %ux%ux%u of cs %016llx reaches %u resources:", x, y, z, (unsigned long long)hash, n);
+    for (uint32_t k = 0; k < n; k++) {
+        id obj = (__bridge id)gpu_ir_backend_object(a[k].resource);
+        if ([obj conformsToProtocol:@protocol(MTLTexture)]) {
+            id<MTLTexture> t = obj;
+            vx_log("D3D12:   texture %lux%lux%lu type %lu fmt %lu mips %lu usage %#lx storage %lu heap %p offset %lu alloc %lu, access %#x",
+                   (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth, (unsigned long)t.textureType, (unsigned long)t.pixelFormat,
+                   (unsigned long)t.mipmapLevelCount, (unsigned long)t.usage, (unsigned long)t.storageMode, (__bridge void *)t.heap, (unsigned long)t.heapOffset,
+                   (unsigned long)t.allocatedSize, a[k].access_mask);
+        } else if ([obj conformsToProtocol:@protocol(MTLBuffer)]) {
+            id<MTLBuffer> b = obj;
+            vx_log("D3D12:   buffer %lu bytes at %#llx, access %#x", (unsigned long)b.length, (unsigned long long)b.gpuAddress, a[k].access_mask);
+        }
+    }
+}
 // VXRT_D3D12_TRACE_LEN=<bytes>: Map and CopyBufferRegion of buffers that long are logged (where a buffer's data
 // comes from).
 static uint64_t trace_len12(void) { static long long n = -1; if (n < 0) { const char *e = getenv("VXRT_D3D12_TRACE_LEN"); n = e ? atoll(e) : 0; } return (uint64_t)n; }
@@ -1845,11 +1871,11 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
                     td.placementSparsePageSize = MTLSparsePageSize64;
                     r->texture = [d->mtl newTextureWithDescriptor:td];
                 }
-            } else if (in) {
+            } else if (in && !(in->heap.storageMode == MTLStorageModeShared && td.textureType == MTLTextureType3D && no_shared_3d12())) {
                 td.storageMode = in->heap.storageMode;
                 td.hazardTrackingMode = MTLHazardTrackingModeTracked;
                 r->texture = [in->heap newTextureWithDescriptor:td offset:offset];
-            } else r->texture = [d->mtl newTextureWithDescriptor:td];
+            } else r->texture = [d->mtl newTextureWithDescriptor:td];   // (a 3D texture in a CPU-visible heap: its own memory)
         } @catch (NSException *exception) {
             texture_exception = 1;
             vx_log("D3D12: Metal rejected texture resource: %s",
@@ -2087,6 +2113,10 @@ static int align_up_resource12(uint64_t value, uint64_t alignment, uint64_t *res
     return 1;
 }
 
+// A 3D texture placed in a heap of shared (CPU-visible) memory - D3D12's heaps for buffers and textures alike are made
+// so - faults the GPU when a shader writes it ("Insufficient Memory", Cyberpunk 2077's volumetric fog): it gets
+// memory of its own instead (VXRT_D3D12_SHARED_3D=1 keeps it in the heap).
+static int no_shared_3d12(void) { static int v = -1; if (v < 0) { const char *e = getenv("VXRT_D3D12_SHARED_3D"); v = !(e && *e == '1'); } return v; }
 static ALLOC_INFO allocation_info(dev12 *d, const RES_DESC *desc) {
     uint64_t requested_alignment = 0;
     if (!resource_alignment12(desc, &requested_alignment)) return (ALLOC_INFO){ UINT64_MAX, 0 };
@@ -10376,6 +10406,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                     else rc = d3d12_gpu_ir_dispatch(&context, pso->gpu_pipeline, c->a, c->b, c->c, NULL, 0);
                 }
                 if (g_dump_armed12) pass_dump_dispatch12(cb, ce, pso, accesses.values, accesses.count, c->a, c->b, c->c);
+                if (trace_cs12(pso->cs_code)) trace_cs_accesses12(pso->cs_code, c->a, c->b, c->c, accesses.values, accesses.count);
                 if (trace_len12())                                 // (VXRT_D3D12_TRACE_LEN: who writes buffers that long)
                     for (uint32_t k = 0; k < accesses.count; k++) {
                         if (!(accesses.values[k].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
@@ -10408,11 +10439,14 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             [ce dispatchThreadgroups:MTLSizeMake(c->a, c->b, c->c) threadsPerThreadgroup:MTLSizeMake(pso->msl.threads[0], pso->msl.threads[1], pso->msl.threads[2])];
             if (g_dump_armed12) vx_log("D3D12: pass dump %d: dispatch %ux%ux%u of cs %016llx (direct path, its writes not shown)", g_dump_frame12,
                                        c->a, c->b, c->c, (unsigned long long)pso->cs_code);
-            if (trace_len12()) {
+            if (trace_len12() || trace_cs12(pso->cs_code)) {
                 gpu_ir_access_list12 acc = { 0 };
                 pthread_mutex_lock(&d->lock);
                 if (gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE, compute, heap, sheap, &acc) == GPU_IR_OK)
-                    trace_writer12("direct dispatch of cs", pso->cs_code, acc.values, acc.count);
+                {
+                    if (trace_len12()) trace_writer12("direct dispatch of cs", pso->cs_code, acc.values, acc.count);
+                    if (trace_cs12(pso->cs_code)) trace_cs_accesses12(pso->cs_code, c->a, c->b, c->c, acc.values, acc.count);
+                }
                 pthread_mutex_unlock(&d->lock);
                 gpu_ir_access_list_release12(&acc);
             }
