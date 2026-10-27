@@ -2733,8 +2733,17 @@ static void use_resident_compute12(id<MTLComputeCommandEncoder> ce, NSArray *res
     if (resident != resident_by_set12()) use_list_compute12(ce, resident);
     t_ce_serial12++;
 }
+// With the device's residency set holding every texture's memory, the heap's textures are not declared at all (a
+// declaration of thousands per encoder cost Cyberpunk 2077's first scene 100 ms a frame on the CPU, and as much in
+// Metal's submission); VXRT_D3D12_HEAP_USE=1 declares them as before.
+static int g_residency_set_active12;
+static int no_heap_use12(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VXRT_D3D12_HEAP_USE"); v = !(e && *e == '1'); }
+    return v && g_residency_set_active12;
+}
 static void heap_textures_compute12(id<MTLComputeCommandEncoder> ce, heap12 *heap, int wide) {
-    if (!ce || !wide || t_ce_heap_serial12 == t_ce_serial12) return;
+    if (!ce || !wide || t_ce_heap_serial12 == t_ce_serial12 || no_heap_use12()) return;
     use_list_compute12(ce, heap_textures12(heap));
     t_ce_heap_serial12 = t_ce_serial12;
 }
@@ -8892,7 +8901,7 @@ static void make_resident_render(id<MTLRenderCommandEncoder> re, NSArray *reside
     t_re_serial12++;
 }
 static void heap_textures_render12(id<MTLRenderCommandEncoder> re, heap12 *heap, int wide) {
-    if (!re || !wide || t_re_heap_serial12 == t_re_serial12) return;
+    if (!re || !wide || t_re_heap_serial12 == t_re_serial12 || no_heap_use12()) return;
     use_list_render12(re, heap_textures12(heap));                  // (as for compute)
     t_re_heap_serial12 = t_re_serial12;
 }
@@ -13480,6 +13489,7 @@ static WINAPI HRESULT D3D12CreateDevice(void *adapter, int32_t min_level, const 
             rd.label = @"VXRuntime D3D12 resources";
             d->residency = [mtl newResidencySetWithDescriptor:rd error:nil];
             d->resident_allocations = [NSCountedSet new];
+            g_residency_set_active12 = 1;
         }
     }
     d->pso_cache = [NSMutableDictionary new];
