@@ -2788,9 +2788,12 @@ static int emit_region(tr *t, uint32_t b, int stop) {
         // Blocks between here and the merge that several arms reach (a condition of && and ||: if (a || b && c) X;):
         // the arms set a flag where they would go to one, and each is emitted once after them, under its flag.
         uint32_t joins[16], njoins = 0;
-        if (merge >= 0 && !getenv("DXIL_NO_JOINS"))
+        // (no merge: the arms end in return, break or continue, and so does each join after them)
+        if (!getenv("DXIL_NO_JOINS"))
             for (uint32_t x = 0; x < t->nb && njoins < 16; x++) {
-                if ((int)x == merge || x == b || t->npred[x] < 2 || t->emitted[x] || t->flag[x] >= 0 || t->ipdom[x] != merge) continue;
+                if ((int)x == merge || x == b || t->npred[x] < 2 || t->emitted[x] || t->flag[x] >= 0) continue;
+                if (merge >= 0 ? t->ipdom[x] != merge : (t->nloops && t->loops[t->nloops - 1] == x)) continue;
+                if (stop >= 0 && merge < 0) continue;              // (an enclosing region's end: not across it)
                 if (t->loop_header_of[x] == (int)x || !dominates(t, b, x)) continue;
                 if (t->nloops && !in_loop(t, t->loops[t->nloops - 1], x)) continue;
                 int inner = 0;                                     // (not inside a loop the branch is outside of)
@@ -2855,7 +2858,7 @@ static int emit_region(tr *t, uint32_t b, int stop) {
             t->flag[x] = -1;
             line(t, "if (vx_f%d) {", f);
             t->indent++;
-            if (emit_region(t, x, merge)) return -1;
+            if (emit_region(t, x, merge >= 0 ? merge : stop)) return -1;
             t->indent--;
             line(t, "}");
         }
@@ -3238,6 +3241,18 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
         }
     dominators(&t, 0, t.idom);
     dominators(&t, 1, t.ipdom);
+    {   // (a block that reaches the exit only through return tails, as a loop whose only way out returns: as if no tails)
+        int *plain = calloc(t.nb + 1, sizeof(int)), any = 0;
+        for (uint32_t b = 0; b < t.nb; b++) if (t.ipdom[b] < 0) any = 1;
+        if (any) {
+            uint8_t *tail = t.tail;
+            t.tail = NULL;
+            dominators(&t, 1, plain);
+            t.tail = tail;
+            for (uint32_t b = 0; b < t.nb; b++) if (t.ipdom[b] < 0) t.ipdom[b] = plain[b];
+        }
+        free(plain);
+    }
     t.indent = 1;
     int structured = find_loops(&t) && emit_region(&t, 0, -1) == 0 && !t.failed;
     if (!structured && getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: fallback (blocks %u)\n", t.nb);

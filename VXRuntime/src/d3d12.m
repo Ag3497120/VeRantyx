@@ -205,6 +205,7 @@ struct dev12 {
     void **bufs;                     // the buffers (res12), for a GPU address's buffer (vertex and index buffers)
     uint32_t nbufs, capbufs;         // bufs: sorted by GPU address (bufs_find12)
     uint64_t maxbuflen;              // the longest buffer's length (how far back a lookup looks)
+    pthread_rwlock_t bufs_lock;      // bufs: written with the device lock and this, read with either
     id<MTLComputePipelineState> occ_sum;   // adds a render pass's occlusion counts into a query heap (made when first needed)
     NSMutableArray *scratch_pool;    // scratch chunks no command buffer uses any more (scratch_lock)
     pthread_mutex_t scratch_lock;
@@ -1293,14 +1294,16 @@ static res12 *bufs_find12(dev12 *d, uint64_t va, uint64_t size) {
     return NULL;
 }
 static void bufs_insert12(dev12 *d, res12 *r) {
+    pthread_rwlock_wrlock(&d->bufs_lock);
     if (d->nbufs == d->capbufs) { d->capbufs = d->capbufs ? d->capbufs * 2 : 256; d->bufs = realloc(d->bufs, d->capbufs * sizeof *d->bufs); }
     uint32_t at = bufs_upper12(d, r->buffer.gpuAddress);
     memmove(&d->bufs[at + 1], &d->bufs[at], (d->nbufs - at) * sizeof *d->bufs);
     d->bufs[at] = r;
     d->nbufs++;
     if (r->buffer.length > d->maxbuflen) d->maxbuflen = r->buffer.length;
+    pthread_rwlock_unlock(&d->bufs_lock);
 }
-static void bufs_remove12(dev12 *d, res12 *r) {
+static void bufs_remove_locked12(dev12 *d, res12 *r) {
     for (uint32_t i = bufs_upper12(d, r->buffer.gpuAddress); i-- > 0; ) {
         if (d->bufs[i] != r) { if (((res12 *)d->bufs[i])->buffer.gpuAddress != r->buffer.gpuAddress) break; continue; }
         memmove(&d->bufs[i], &d->bufs[i + 1], (d->nbufs - i - 1) * sizeof *d->bufs);
@@ -1309,6 +1312,11 @@ static void bufs_remove12(dev12 *d, res12 *r) {
     }
     for (uint32_t i = 0; i < d->nbufs; i++)                        // (not where its address says: anywhere)
         if (d->bufs[i] == r) { memmove(&d->bufs[i], &d->bufs[i + 1], (d->nbufs - i - 1) * sizeof *d->bufs); d->nbufs--; return; }
+}
+static void bufs_remove12(dev12 *d, res12 *r) {
+    pthread_rwlock_wrlock(&d->bufs_lock);
+    bufs_remove_locked12(d, r);
+    pthread_rwlock_unlock(&d->bufs_lock);
 }
 static void res_destroy(d3d_object *o) {
     res12 *r = (res12 *)o;
@@ -6533,8 +6541,8 @@ static gpu_ir_resource *list_capture_gpu_buffer12(list12 *list, uint64_t va, uin
         }
     }
     dev12 *device = list->dev;
-    pthread_mutex_lock(&device->lock);
-    res12 *resource = state_resource_for_gpu_range_locked12(device, va, size);
+    pthread_rwlock_rdlock(&device->bufs_lock);                    // (not the device lock: recording threads share this)
+    res12 *resource = bufs_find12(device, va, size);
     gpu_ir_resource *buffer = resource ? resource->gpu_buffer : NULL;
     uint64_t base = 0;
     if (buffer) {
@@ -6544,7 +6552,7 @@ static gpu_ir_resource *list_capture_gpu_buffer12(list12 *list, uint64_t va, uin
             buffer = NULL;
         else gpu_ir_resource_retain(buffer);
     }
-    pthread_mutex_unlock(&device->lock);
+    pthread_rwlock_unlock(&device->bufs_lock);
     if (buffer) {
         __typeof__(list->vb_cache[0]) *e = &list->vb_cache[list->vb_cache_next++ & 7];
         if (e->buffer) gpu_ir_resource_release(e->buffer);
@@ -8371,10 +8379,15 @@ typedef struct {
     // The last draw's resource accesses and what they were collected from: a draw with the same pipeline, root
     // tables and descriptors, heaps, vertex/index buffers and targets reuses them (collecting them was most of the
     // replay's time in a game: thousands of draws a frame with the same bindings).
-    uint64_t access_key;
-    gpu_ir_access_list12 access_cache;
-    int access_cached;
+    // (several: draws alternate between a few binding sets)
+    uint64_t access_key[8];
+    gpu_ir_access_list12 access_cache[8];
+    uint8_t access_cached[8];
+    uint32_t access_next;
 } gfx_state;
+static void gfx_access_cache_release12(gfx_state *g) {
+    for (int i = 0; i < 8; i++) if (g->access_cached[i]) { gpu_ir_access_list_release12(&g->access_cache[i]); g->access_cached[i] = 0; }
+}
 
 static int gpu_ir_collect_draw_accesses12(dev12 *device, pso12 *pipeline, gfx_state *graphics,
                                           root_binding *root, heap12 *resource_heap, heap12 *sampler_heap,
@@ -8442,12 +8455,14 @@ static int gpu_ir_collect_draw_accesses_cached12(dev12 *device, pso12 *pipeline,
     h = fnv1a12(h, graphics->vb, sizeof graphics->vb);
     if (indexed) h = fnv1a12(h, &graphics->ib, sizeof graphics->ib);
     h = fnv1a12(h, graphics->resource, sizeof graphics->resource);
-    if (graphics->access_cached && graphics->access_key == h) return gpu_ir_access_list_copy12(&graphics->access_cache, list);
+    for (int i = 0; i < 8; i++)
+        if (graphics->access_cached[i] && graphics->access_key[i] == h) return gpu_ir_access_list_copy12(&graphics->access_cache[i], list);
     int rc = gpu_ir_collect_draw_accesses12(device, pipeline, graphics, root, resource_heap, sampler_heap, list, indexed);
-    if (graphics->access_cached) { gpu_ir_access_list_release12(&graphics->access_cache); graphics->access_cached = 0; }
-    if (rc == GPU_IR_OK && gpu_ir_access_list_copy12(list, &graphics->access_cache) == GPU_IR_OK) {
-        graphics->access_key = h;
-        graphics->access_cached = 1;
+    uint32_t k = graphics->access_next++ & 7;
+    if (graphics->access_cached[k]) { gpu_ir_access_list_release12(&graphics->access_cache[k]); graphics->access_cached[k] = 0; }
+    if (rc == GPU_IR_OK && gpu_ir_access_list_copy12(list, &graphics->access_cache[k]) == GPU_IR_OK) {
+        graphics->access_key[k] = h;
+        graphics->access_cached[k] = 1;
     }
     return rc;
 }
@@ -10509,7 +10524,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
     gfx_state *g = calloc(1, sizeof *g);
     if (!compute || !graphics || !g) {
         vx_log("D3D12: could not allocate command-list replay state");
-        if (g->access_cached) gpu_ir_access_list_release12(&g->access_cache); free(commands); free(compute); free(graphics); free(g);
+        gfx_access_cache_release12(g); free(commands); free(compute); free(graphics); free(g);
         return 0;
     }
     g->prim = MTLPrimitiveTypeTriangle;
@@ -11215,7 +11230,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
     if (replay_failed) {
         close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
         free(indirect_overrides);
-        if (g->access_cached) gpu_ir_access_list_release12(&g->access_cache); free(commands); free(compute); free(graphics); free(g);
+        gfx_access_cache_release12(g); free(commands); free(compute); free(graphics); free(g);
         *command_buffer = cb;
         return 0;
     }
@@ -11224,7 +11239,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
     free(commands);
     free(compute);
     free(graphics);
-    if (g->access_cached) gpu_ir_access_list_release12(&g->access_cache);
+    gfx_access_cache_release12(g);
     free(g);
     *command_buffer = cb;
     return 1;
@@ -13515,6 +13530,7 @@ static WINAPI HRESULT D3D12CreateDevice(void *adapter, int32_t min_level, const 
     d->base.destroy = device_destroy;
     d->mtl = mtl;
     pthread_mutex_init(&d->lock, NULL);
+    pthread_rwlock_init(&d->bufs_lock, NULL);
     pthread_mutex_init(&d->submit_lock, NULL);
     pthread_mutex_init(&d->alloc_lock, NULL);
     pthread_mutex_init(&d->format_lock, NULL);
