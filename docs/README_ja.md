@@ -6,9 +6,28 @@ VR コントローラーは要りません。ゲームの動かし方が違う3�
 
 | 版 | ゲームの動かし方 | 状態 |
 |---|---|---|
-| vxrt版 | Windows 版のゲームと本物の Windows 版 SteamVR を、このリポジトリで一から書いた Windows ランタイム VXRuntime で動かす（Wine なし、Direct3D 11 → Metal） | 最新（2026-10-12〜14）。ヘッドセットでレベルをまたいでプレイ済み。M1 Max で 3K プリセット60fps。The Lab と Google Earth VR も動作 |
-| ネイティブ版 | Valve の Linux ARM64 版 Alyx を、改造した Klepton と自作の glibc 層・OpenVR ランタイムで macOS 上でそのまま動かす | 2026-10-11。60fps、20分以上プレイ |
+| vxrt版 | Windows 版のゲームと本物の Windows 版 SteamVR を、このリポジトリで一から書いた Windows ランタイム VXRuntime で動かす（Wine なし、Direct3D 11 / Vulkan → Metal） | 最新（2026-10-12〜、毎日更新）。Alyx は M1 Max で 3K プリセット60fps。Elite Dangerous、No Man's Sky、The Lab、Google Earth VR も動作。Direct3D 12 は開発中 |
+| ネイティブ版 | Valve の Linux ARM64 版 Alyx を、改造した Klepton と自作の glibc 層・OpenVR ランタイムで macOS 上でそのまま動かす | 2026-10-11 から休止中（コードは main の `NativeARM/` にもある） |
 | Wine版 | Windows 版のゲームと SteamVR を Wine 11 + DXVK → MoltenVK で動かす | 2026-10-10 から安定。約30fps |
+
+## 最新の状況（2026-10-27）
+
+- **入手**：VeRantyx for Mac は [GitHub のリリース](https://github.com/Ag3497120/VeRantyx/releases/latest) と [verantyx.ai](https://verantyx.ai) にあります（同じ署名・公証済みのアプリ）。最新は 0.3.1 です。
+- **動くゲーム**：
+
+| ゲーム | 状態 | 数字 |
+|---|---|---|
+| Half-Life: Alyx | ✅ ヘッドセットでプレイ済み | 3K プリセット（片目 1440×1620）で 60fps、M1 Max |
+| Elite Dangerous | 🟡 公式ランチャーから、Mac の画面とヘッドセットで | VR：片目 1700×1372 で 30〜35fps |
+| No Man's Sky | 🟡 自分の Windows 版 Steam（VXRuntime の上で動く。サインインは自分で）から起動。Mac の画面と、Vision Pro の VeRantyx アプリと ALVR アプリで映像と音を確認 | Mac の画面：45.7fps（1512×982、Medium、0.3.1）。ヘッドセット：0.3.1 より前に 25〜40fps |
+| The Lab | 🟡 VR で動くが、測ったのはタイトルの場面だけ。ミニゲームは未最適化 | タイトルの場面 54.0fps |
+| Google Earth VR | 🟡 VR で動作 | 56.7fps |
+| Cyberpunk 2077 | 🧪 Direct3D 12、`d3d12-games` ブランチで開発中。ロゴ、冒頭の動画、タイトル、キャラクター作成まで正しく描画。まだ遊べない | キャラクター作成は約 5〜7fps |
+
+- **ヘッドセット**：Apple Vision Pro（VeRantyx アプリ、または App Store の ALVR アプリ）。Quest 1・Quest 3・Pico 4 Ultra はテスターがプレイ済み（私自身は未確認）。
+- **0.3 の新機能**：No Man's Sky、ゲームごとに ALVR アプリか VeRantyx アプリかを選べる、「入手してプレイ」（持っているゲームをダウンロードして起動）、Pico と Quest のテスターの報告にもとづく修正（投げる速さ、再接続、Alyx の読み込み後の黒い画面）。
+- **GitHub**：アカウントが自動の判定で 10月24日から27日まで非表示になっていました。今は元に戻っています。
+- 英語の [README](../README.md) の「Updates」に、日ごとの変更があります。
 
 ![vxrt版: Windows 版の Half-Life: Alyx と SteamVR を VXRuntime（Wine なし）で MacBook Pro 上で動かし、Apple Vision Pro で遊んでいるところ](media/vxrt-highlight.gif)
 
