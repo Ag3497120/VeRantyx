@@ -10,6 +10,7 @@ or an ALVR headset. Some also play on the Mac's own screen.</p>
   <img alt="Apple silicon, macOS 14.2+" src="https://img.shields.io/badge/macOS-14.2%2B%20%C2%B7%20Apple%20silicon-black">
   <img alt="Headsets" src="https://img.shields.io/badge/headsets-Vision%20Pro%20%C2%B7%20ALVR-blue">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/Ag3497120/VeRantyx"></a>
+  <a href="https://discord.gg/h2znwYJt3"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white"></a>
 </p>
 
 <p align="center">
@@ -39,6 +40,7 @@ releases: games and SteamVR come from your own Steam account. No anti-cheat is e
   <a href="#updates">Updates</a> ·
   <a href="#under-the-hood">Under the hood</a> ·
   <a href="#branches">Branches</a> ·
+  <a href="https://discord.gg/h2znwYJt3">Discord</a> ·
   <a href="docs/README_ja.md">日本語</a>
 </p>
 
@@ -47,6 +49,7 @@ releases: games and SteamVR come from your own Steam account. No anti-cheat is e
 | Date | What changed |
 |---|---|
 | Oct 27 | **Direct3D 12, first real game**: Cyberpunk 2077 (D3D12 only) gets through its logos, intro video and title to character creation, characters lit correctly; all 20,937 of its non-ray-tracing shaders translate and compile; the stall-heavy CPU side of `ExecuteCommandLists` cut by about half in a synthetic test. Branch [`d3d12-games`](https://github.com/Ag3497120/VeRantyx/tree/d3d12-games), not in the app yet |
+| Oct 27 | **[Discord server](https://discord.gg/h2znwYJt3)** opened: setup help, game reports, new versions |
 | Oct 27 | My GitHub account is visible again after being hidden by an automated check from Oct 24; the app and the source were served from [verantyx.ai](https://verantyx.ai) meanwhile |
 | Oct 26 | **VeRantyx for Mac 0.3.1**: No Man's Sky on the Mac's screen 32.5 → 45.7 fps (tessellation in fewer GPU passes, memory kept resident once); Pico, VIVE and YVR controller speed taken from the hand poses (thrown objects flew as from a cannon); ALVR reconnect mid-game no longer blocked by vibrations (#6 again); Alyx's "Press Trigger To Start" drawn into the picture after a load, where players saw black |
 | Oct 25 | **VeRantyx for Mac 0.3.0**: **No Man's Sky** — its DRM needs the real Windows Steam client, so that client now runs on VXRuntime and starts the game (you sign in yourself); Vulkan, tessellation and Vulkan ↔ Direct3D 11 shared textures for SteamVR; ALVR app or VeRantyx app per game; "Get and play" |
@@ -69,6 +72,9 @@ The fastest way to grow the list of games and headsets is your report, whether i
 **[Report a game or headset →](https://github.com/Ag3497120/VeRantyx/issues/new/choose)** (in the app: Help >
 Report a problem; it attaches the logs with your user name and Steam ID taken out). Quest and Pico are tested by
 players only so far.
+
+Questions, or want to share what you got running? **[Join the Discord →](https://discord.gg/h2znwYJt3)** (#setup-help for installing and
+connecting, #game-reports for one post per game).
 
 ## Get started
 

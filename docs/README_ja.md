@@ -26,6 +26,7 @@ VR コントローラーは要りません。ゲームの動かし方が違う3�
 
 - **ヘッドセット**：Apple Vision Pro（VeRantyx アプリ、または App Store の ALVR アプリ）。Quest 1・Quest 3・Pico 4 Ultra はテスターがプレイ済み（私自身は未確認）。
 - **0.3 の新機能**：No Man's Sky、ゲームごとに ALVR アプリか VeRantyx アプリかを選べる、「入手してプレイ」（持っているゲームをダウンロードして起動）、Pico と Quest のテスターの報告にもとづく修正（投げる速さ、再接続、Alyx の読み込み後の黒い画面）。
+- **Discord**：質問や、動いたゲーム・動かなかったゲームの報告は [Discord](https://discord.gg/h2znwYJt3) でも受け付けています（導入と接続は #setup-help、ゲームの報告は #game-reports）。
 - **GitHub**：アカウントが自動の判定で 10月24日から27日まで非表示になっていました。今は元に戻っています。
 - 英語の [README](../README.md) の「Updates」に、日ごとの変更があります。
 
