@@ -69,6 +69,7 @@ typedef struct {
     uint32_t *term;             // the terminator instruction of each block
     uint32_t *first;            // the first instruction of each block
     int *idom, *ipdom, *rpo_index, *loop_header_of, *loop_exit;
+    uint8_t *tail;                         // (small blocks that return: copied into each place that jumps to them)
     uint8_t *emitted;
     uint32_t *loops;            // innermost loop stack while emitting: header blocks
     uint32_t nloops;
@@ -2609,6 +2610,11 @@ static void dominators(tr *t, int post, int *dom) {
     uint32_t (*pred)[64] = calloc(n, sizeof *pred), *np = calloc(n, sizeof *np);
     for (uint32_t b = 0; b < t->nb; b++) {
         uint32_t s[64], k = nsucc(t, b, s);
+        if (post && t->tail) {                                     // (a jump to a return tail is a return: not a path)
+            uint32_t k2 = 0;
+            for (uint32_t i = 0; i < k; i++) if (!t->tail[s[i]]) s[k2++] = s[i];
+            k = k2;
+        }
         if (k == 0) s[k++] = exitn;
         for (uint32_t i = 0; i < k; i++) {
             uint32_t from = post ? s[i] : b, to = post ? b : s[i];
@@ -2673,8 +2679,8 @@ static int find_loops(tr *t) {
             if (!in_loop(t, h, b)) continue;
             uint32_t s[64], k = nsucc(t, b, s);
             for (uint32_t i = 0; i < k; i++) {
-                if (in_loop(t, h, s[i])) continue;
-                if (exit >= 0 && exit != (int)s[i]) return 0;      // (several exits)
+                if (in_loop(t, h, s[i]) || t->tail[s[i]]) continue;  // (a return tail: a return, not an exit)
+                if (exit >= 0 && exit != (int)s[i]) { if (getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: loop %u exits %d and %u\n", h, exit, s[i]); return 0; }      // (several exits)
                 exit = (int)s[i];
             }
         }
@@ -2715,7 +2721,7 @@ static int emit_edge(tr *t, uint32_t from, uint32_t to, int stop) {
         if (to == h) { line(t, "continue;"); return 0; }
         if ((int)to == t->loop_exit[h]) { line(t, "break;"); return 0; }
         for (uint32_t i = 0; i + 1 < t->nloops; i++)               // (out of an outer loop: not without labels)
-            if (to == t->loops[i] || (int)to == t->loop_exit[t->loops[i]]) return -1;
+            if (to == t->loops[i] || (int)to == t->loop_exit[t->loops[i]]) { if (getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: %u->%u leaves outer loop\n", from, to); return -1; }
     }
     if ((int)to == stop) return 0;
     return emit_region(t, to, stop);
@@ -2730,7 +2736,7 @@ static int emit_region(tr *t, uint32_t b, int stop) {
         int open = 0;
         for (uint32_t i = 0; i < t->nloops; i++) if (t->loops[i] == b) open = 1;
         if (header && !open) {
-            if (t->emitted[b]) return -1;
+            if (t->emitted[b]) { if (getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: loop %u twice\n", b); return -1; }
             int exit = t->loop_exit[b];
             line(t, "while (true) {");
             t->indent++;
@@ -2744,7 +2750,7 @@ static int emit_region(tr *t, uint32_t b, int stop) {
             b = (uint32_t)exit;
             continue;
         }
-        if (t->emitted[b]) return -1;
+        if (t->emitted[b] && !t->tail[b]) { if (getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: block %u twice (stop %d)\n", b, stop); return -1; }
         t->emitted[b] = 1;
         block_body(t, b);
         const dxil_inst *in = &t->f->insts[t->term[b]];
@@ -3161,10 +3167,17 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
     t.loop_exit = calloc(t.nb + 1, sizeof(int));
     t.emitted = calloc(t.nb + 1, 1);
     t.loops = calloc(t.nb + 1, sizeof(uint32_t));
+    t.tail = calloc(t.nb + 1, 1);
+    if (!getenv("DXIL_NO_TAILS"))
+        for (uint32_t b = 0; b < t.nb; b++) {
+            uint32_t s[64];
+            if (b && nsucc(&t, b, s) == 0 && t.term[b] - t.first[b] < 8) t.tail[b] = 1;
+        }
     dominators(&t, 0, t.idom);
     dominators(&t, 1, t.ipdom);
     t.indent = 1;
     int structured = find_loops(&t) && emit_region(&t, 0, -1) == 0 && !t.failed;
+    if (!structured && getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: fallback (blocks %u)\n", t.nb);
     if (!structured && !t.failed) {
         free(t.body.s);
         memset(&t.body, 0, sizeof t.body);
@@ -3357,7 +3370,7 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
 done:
     free(t.body.s); free(t.decls.s); free(t.prelude.s); free(t.types.s);
     free(t.handles); free(t.is_handle); free(t.ptr_space); free(t.declared_types);
-    free(t.term); free(t.first); free(t.idom); free(t.ipdom); free(t.rpo_index); free(t.loop_header_of); free(t.loop_exit); free(t.emitted); free(t.loops);
+    free(t.term); free(t.first); free(t.idom); free(t.ipdom); free(t.tail); free(t.rpo_index); free(t.loop_header_of); free(t.loop_exit); free(t.emitted); free(t.loops);
     if (t.failed || !out->msl || (mode == 2 && !out->msl_passthrough)) {
         if (!out->error[0]) snprintf(out->error, sizeof out->error, "translation failed");
         free(out->msl); out->msl = NULL;
