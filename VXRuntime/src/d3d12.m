@@ -226,6 +226,7 @@ struct dev12 {
     id tile_queue;                   // id<MTL4CommandQueue> carrying UpdateTileMappings (made when first needed)
 };
 
+struct qjob12;
 typedef struct {
     d3d_object base;
     dev12 *dev;
@@ -233,13 +234,24 @@ typedef struct {
     id<MTLCommandQueue> mtl_queue;
     id<MTLSharedEvent> timeline;     // counts the executed command buffers the GPU has finished (submit_lock)
     uint64_t timeline_value;
+    // VXRT_D3D12_ASYNC_SUBMIT: ExecuteCommandLists, Signal, Wait and Present go to this queue's own thread in order
+    // (the replay into Metal off the program's thread); anything else on the queue waits for it to be idle first.
+    int async;
+    pthread_t worker;
+    pthread_mutex_t jlock;
+    pthread_cond_t jcond, jidle;
+    struct qjob12 *jhead, *jtail;
+    int jbusy, jstop;
+    int replays;                     // (jlock) VXRT_D3D12_PARALLEL_REPLAY: lists being replayed on the pool
 } queue12;
+static void queue_drain12(queue12 *q);
 typedef struct {
     d3d_object base;
     dev12 *dev;
     int32_t type;
     uint32_t recording_lists;
     uint32_t in_flight; // accessed atomically so completion callbacks never wait on submit_lock
+    uint32_t queued;    // (atomic) lists of it submitted to a queue's thread and not yet replayed
     uint64_t generation;
     id<MTLSharedEvent> last_timeline;    // (submit_lock) where the newest list from this allocator went: its queue's
     uint64_t last_value;                 // timeline, and the value that queue reaches when the GPU has run it
@@ -445,6 +457,7 @@ typedef struct {
     float recording_blend_factor[4];
     VBV recording_vertex_buffers[16];
     IBV recording_index_buffer;
+    uint32_t pending;                // submissions not yet replayed by a queue's thread (atomic): Reset waits for them
     // the buffers vertex and index views found (base GPU address, length, the buffer, retained) while recording:
     // the device's registry, behind its lock, only on a miss (a recording list's buffers stay alive)
     struct { uint64_t base, len; gpu_ir_resource *buffer; } vb_cache[8];
@@ -562,6 +575,7 @@ static void msl_timed12(const char *what, uint64_t hash, double start) {
 // waits, the wait for a drawable, and the draws and dispatches skipped. Every 300 presents a summary of the same.
 typedef struct {
     uint64_t pso_n, pso_ns, compile_n, compile_ns, exec_n, exec_ns, lock_ns, wait_ns, drawable_ns, skipped, sync_n, sync_ns, gpu_ns;
+    uint64_t replay_ns;              // (VXRT_D3D12_ASYNC_SUBMIT: the queue threads' replay)
 } frame_stats12;
 static frame_stats12 g_fs12, g_fs12_sum;
 static double frame_stats_ms12(void) {
@@ -592,14 +606,14 @@ static void frame_stats_present12(uint32_t presents) {
     frame_stats12 f;
     #define TAKE12(x) f.x = __atomic_exchange_n(&g_fs12.x, 0, __ATOMIC_ACQ_REL); __atomic_fetch_add(&g_fs12_sum.x, f.x, __ATOMIC_RELAXED)
     TAKE12(pso_n); TAKE12(pso_ns); TAKE12(compile_n); TAKE12(compile_ns); TAKE12(exec_n); TAKE12(exec_ns);
-    TAKE12(lock_ns); TAKE12(wait_ns); TAKE12(drawable_ns); TAKE12(skipped); TAKE12(sync_n); TAKE12(sync_ns); TAKE12(gpu_ns);
+    TAKE12(lock_ns); TAKE12(wait_ns); TAKE12(drawable_ns); TAKE12(skipped); TAKE12(sync_n); TAKE12(sync_ns); TAKE12(gpu_ns); TAKE12(replay_ns);
     #undef TAKE12
     if (gap / 1e6 > limit)
         vx_log("D3D12: frame %u took %.1f ms: %llu pipeline states (%.1f ms), %llu compiles (%.1f ms), %llu executes (%.1f ms, "
-               "%.1f ms of it for the submission lock), GPU %.1f ms, fence waits %.1f ms, drawable %.1f ms, %llu draws skipped, %llu GPU round trips (%.1f ms)",
+               "%.1f ms of it for the submission lock), GPU %.1f ms, fence waits %.1f ms, drawable %.1f ms, %llu draws skipped, %llu GPU round trips (%.1f ms), replay on queue threads %.1f ms",
                presents, gap / 1e6, (unsigned long long)f.pso_n, f.pso_ns / 1e6, (unsigned long long)f.compile_n, f.compile_ns / 1e6,
                (unsigned long long)f.exec_n, f.exec_ns / 1e6, f.lock_ns / 1e6, f.gpu_ns / 1e6, f.wait_ns / 1e6, f.drawable_ns / 1e6,
-               (unsigned long long)f.skipped, (unsigned long long)f.sync_n, f.sync_ns / 1e6);
+               (unsigned long long)f.skipped, (unsigned long long)f.sync_n, f.sync_ns / 1e6, f.replay_ns / 1e6);
     static uint64_t window_start;
     if (!window_start) window_start = now;
     if (presents % 300 == 0) {
@@ -2507,6 +2521,7 @@ static WINAPI void queue_update_tile_mappings(void *this, void *resource, uint32
                                               const TILE_REGION12 *sizes, void *heap, uint32_t nranges,
                                               const int32_t *range_flags, const uint32_t *heap_starts,
                                               const uint32_t *range_counts, int32_t flags) {
+    queue_drain12((queue12 *)this);
     queue12 *q = this;
     res12 *r = resource;
     memheap12 *m = heap;
@@ -2557,6 +2572,7 @@ bad:
 
 static WINAPI void queue_copy_tile_mappings(void *this, void *dst_resource, const TILE_COORD12 *dst_start, void *src_resource,
                                             const TILE_COORD12 *src_start, const TILE_REGION12 *size, int32_t flags) {
+    queue_drain12((queue12 *)this);
     queue12 *q = this;
     res12 *dst = dst_resource, *src = src_resource;
     tiling12 dt, st;
@@ -4082,8 +4098,12 @@ static WINAPI HRESULT list_close(void *this) {
     pthread_mutex_unlock(&l->dev->alloc_lock);
     return hr;
 }
+static void list_wait_replayed12(list12 *l) {
+    while (__atomic_load_n(&l->pending, __ATOMIC_ACQUIRE)) usleep(50);
+}
 static WINAPI HRESULT list_reset(void *this, void *allocator, void *pso) {
     list12 *l = this;
+    list_wait_replayed12(l);
     allocator12 *next_allocator = allocator;
     pthread_mutex_lock(&l->dev->alloc_lock);
     if (!l->closed) {
@@ -10756,9 +10776,9 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 draw.first_vertex = c->c;
             }
             gpu_ir_access_list12 accesses = { 0 };
-            pthread_mutex_lock(&d->lock);
+            pthread_rwlock_rdlock(&d->bufs_lock);   // (collection looks buffers up by address: their registry's lock)
             int access_rc = gpu_ir_collect_draw_accesses_cached12(d, pso, g, graphics, heap, sheap, &accesses, draw.indexed);
-            pthread_mutex_unlock(&d->lock);
+            pthread_rwlock_unlock(&d->bufs_lock);
             int rc;
             if (access_rc == GPU_IR_OK) {
                 if (c->gpu_ir_recorded)
@@ -10808,10 +10828,10 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 };
                 gpu_ir_backend backend = { .context = &context, .dispatch = d3d12_gpu_ir_dispatch };
                 gpu_ir_access_list12 accesses = { 0 };
-                pthread_mutex_lock(&d->lock);
+                pthread_rwlock_rdlock(&d->bufs_lock);   // (collection looks buffers up by address: their registry's lock)
                 int access_rc = gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
                                                                   compute, heap, sheap, &accesses);
-                pthread_mutex_unlock(&d->lock);
+                pthread_rwlock_unlock(&d->bufs_lock);
                 int rc;
                 if (access_rc == GPU_IR_OK) {
                     if (c->gpu_ir_recorded)
@@ -10863,13 +10883,13 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                                        c->a, c->b, c->c, (unsigned long long)pso->cs_code);
             if (trace_len12() || trace_cs12(pso->cs_code)) {
                 gpu_ir_access_list12 acc = { 0 };
-                pthread_mutex_lock(&d->lock);
+                pthread_rwlock_rdlock(&d->bufs_lock);   // (collection looks buffers up by address: their registry's lock)
                 if (gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE, compute, heap, sheap, &acc) == GPU_IR_OK)
                 {
                     if (trace_len12()) trace_writer12("direct dispatch of cs", pso->cs_code, acc.values, acc.count);
                     if (trace_cs12(pso->cs_code)) trace_cs_accesses12(pso->cs_code, c->a, c->b, c->c, acc.values, acc.count);
                 }
-                pthread_mutex_unlock(&d->lock);
+                pthread_rwlock_unlock(&d->bufs_lock);
                 gpu_ir_access_list_release12(&acc);
             }
             // (the next dispatch sees this one's writes, as D3D12's UAV barriers promise; resources reached through
@@ -10922,11 +10942,11 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 gpu_ir_backend backend = { .context = &context,
                     .dispatch_indirect_range = d3d12_gpu_ir_dispatch_indirect_range };
                 gpu_ir_access_list12 accesses = { 0 };
-                pthread_mutex_lock(&d->lock);
+                pthread_rwlock_rdlock(&d->bufs_lock);   // (collection looks buffers up by address: their registry's lock)
                 int access_rc = gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
                                                                   indirect_root, heap, sheap, &accesses);
                 if (trace_len12()) trace_writer12("indirect dispatch of cs", pso->cs_code, accesses.values, accesses.count);
-                pthread_mutex_unlock(&d->lock);
+                pthread_rwlock_unlock(&d->bufs_lock);
                 int rc = access_rc == GPU_IR_OK ?
                     gpu_ir_execute_with_accesses(&l->gpu_ir, c->gpu_ir_index, &backend,
                                                  accesses.values, accesses.count) : access_rc;
@@ -10962,9 +10982,9 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 };
                 gpu_ir_backend backend = { .context = &context, .draw_indirect = d3d12_gpu_ir_draw_indirect };
                 gpu_ir_access_list12 accesses = { 0 };
-                pthread_mutex_lock(&d->lock);
+                pthread_rwlock_rdlock(&d->bufs_lock);   // (collection looks buffers up by address: their registry's lock)
                 int access_rc = gpu_ir_collect_draw_accesses12(d, pso, g, graphics, heap, sheap, &accesses, indexed);
-                pthread_mutex_unlock(&d->lock);
+                pthread_rwlock_unlock(&d->bufs_lock);
                 int rc = access_rc == GPU_IR_OK ?
                     gpu_ir_execute_with_accesses(&l->gpu_ir, c->gpu_ir_index, &backend,
                                                  accesses.values, accesses.count) : access_rc;
@@ -11257,7 +11277,9 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
 
 // ---- queues -----------------------------------------------------------------------------------------------------------
 
+static void queue_async_stop12(queue12 *q);
 static void queue_destroy(d3d_object *o) {
+    queue_async_stop12((queue12 *)o);
     dev12 *qd = ((queue12 *)o)->dev;
     if (qd) { pthread_mutex_lock(&qd->lock); for (int i = 0; i < 16; i++) if (qd->queues[i] == o) qd->queues[i] = NULL; pthread_mutex_unlock(&qd->lock); }
     ((queue12 *)o)->mtl_queue = nil;
@@ -11903,11 +11925,252 @@ static void queue_decay_batch_states12(dev12 *device, res12 *const *resources, u
 }
 
 static void queue_execute_(void *this, uint32_t n, void *const *lists);
+// ---- a queue's own thread (VXRT_D3D12_ASYNC_SUBMIT) ----------------------------------------------------------------
+typedef struct qjob12 {
+    struct qjob12 *next;
+    void (*run)(queue12 *q, struct qjob12 *j);
+    uint32_t n;
+    void **objs;                       // ExecuteCommandLists: the lists (each referenced, pending counted)
+    void *obj;                         // Signal/Wait: the fence; Present: the swap chain (referenced)
+    uint64_t value;
+    void *drawable, *texture;          // Present (CFBridgingRetain)
+    uint32_t index;
+    HANDLE waitable;
+} qjob12;
+static int async_submit12(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VXRT_D3D12_ASYNC_SUBMIT"); v = e && *e == '1'; }
+    return v;
+}
+static void *queue_worker12(void *arg) {
+    queue12 *q = arg;
+    pthread_setname_np("d3d12 queue");
+    pthread_mutex_lock(&q->jlock);
+    for (;;) {
+        while (!q->jhead && !q->jstop) pthread_cond_wait(&q->jcond, &q->jlock);
+        if (!q->jhead) break;
+        qjob12 *j = q->jhead;
+        q->jhead = j->next;
+        if (!q->jhead) q->jtail = NULL;
+        q->jbusy = 1;
+        pthread_mutex_unlock(&q->jlock);
+        @autoreleasepool { j->run(q, j); }
+        free(j->objs);
+        free(j);
+        pthread_mutex_lock(&q->jlock);
+        q->jbusy = 0;
+        if (!q->jhead && !q->replays) pthread_cond_broadcast(&q->jidle);
+    }
+    pthread_mutex_unlock(&q->jlock);
+    return NULL;
+}
+static void queue_post12(queue12 *q, qjob12 *j) {
+    pthread_mutex_lock(&q->jlock);
+    if (q->jtail) q->jtail->next = j; else q->jhead = j;
+    q->jtail = j;
+    pthread_cond_signal(&q->jcond);
+    pthread_mutex_unlock(&q->jlock);
+}
+// (what bypasses the queue's thread waits until it has done everything posted)
+static void queue_drain12(queue12 *q) {
+    if (!q || !q->async) return;
+    pthread_mutex_lock(&q->jlock);
+    while (q->jhead || q->jbusy || q->replays) pthread_cond_wait(&q->jidle, &q->jlock);
+    pthread_mutex_unlock(&q->jlock);
+}
+static void queue_async_start12(queue12 *q) {
+    if (!async_submit12()) return;
+    pthread_mutex_init(&q->jlock, NULL);
+    pthread_cond_init(&q->jcond, NULL);
+    pthread_cond_init(&q->jidle, NULL);
+    if (pthread_create(&q->worker, NULL, queue_worker12, q) == 0) q->async = 1;
+}
+static void queue_async_stop12(queue12 *q) {
+    if (!q->async) return;
+    queue_drain12(q);
+    pthread_mutex_lock(&q->jlock);
+    q->jstop = 1;
+    pthread_cond_signal(&q->jcond);
+    pthread_mutex_unlock(&q->jlock);
+    pthread_join(q->worker, NULL);
+    q->async = 0;
+}
+// (a job's last references go from another thread: a swap chain or queue destroyed on the queue's own thread would
+//  wait for that thread)
+static void release_elsewhere12(d3d_object *o) {
+    if (!o) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ d3d_release(o); });
+}
+// VXRT_D3D12_PARALLEL_REPLAY=1 (with VXRT_D3D12_ASYNC_SUBMIT): each list gets its command buffer enqueued in
+// submission order on the queue's thread, which goes on at once; the replay into it and its commit run on a pool of
+// threads (Metal runs enqueued command buffers in their enqueued order whenever they are committed). Lists are not
+// state-validated there (as VXRT_D3D12_LENIENT_STATES after its first 1000 failures).
+static int parallel_replay12(void) {
+    static int v = -1;
+    // (only with VXRT_D3D12_LENIENT_STATES: lists that must be rejected for their states are found serially)
+    if (v < 0) { const char *e = getenv("VXRT_D3D12_PARALLEL_REPLAY"); v = e && *e == '1' && getenv("VXRT_D3D12_LENIENT_STATES"); }
+    return v;
+}
+static void list_submit_replayed12(dev12 *d, queue12 *q, allocator12 *command_allocator, id<MTLCommandBuffer> cb,
+                                   scratch sc, uint64_t value);
+static void job_execute_parallel12(queue12 *q, qjob12 *j) {
+    static dispatch_queue_t pool;
+    static dispatch_semaphore_t slots;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        pool = dispatch_queue_create("d3d12 replay", DISPATCH_QUEUE_CONCURRENT);
+        const char *e = getenv("VXRT_D3D12_REPLAY_THREADS");
+        slots = dispatch_semaphore_create(e && atoi(e) > 0 ? atoi(e) : 4);
+    });
+    dev12 *d = q->dev;
+    static int status_only = -1;
+    if (status_only < 0) { const char *e = getenv("VXRT_D3D12_ENCODER_STATUS"); status_only = !(e && *e == '0'); }
+    for (uint32_t i = 0; i < j->n; i++) {
+        list12 *l = j->objs[i];
+        allocator12 *queued_allocator = j->objs[j->n + i];
+        if (!l) continue;
+        pthread_mutex_lock(&d->alloc_lock);
+        int list_stale = l->dev != d || !l->closed || !l->allocator || l->allocator->generation != l->allocator_generation;
+        allocator12 *a = l->allocator;
+        pthread_mutex_unlock(&d->alloc_lock);
+        int unsupported = !list_stale && !queue_supports_list_type12(q->desc.Type, l->type);
+        if (list_stale || unsupported) {
+            vx_log(list_stale ? "D3D12: open command list or command list invalidated by allocator reset; skipping it" :
+                                "D3D12: bundle or unsupported command-list type cannot be submitted directly; skipping it");
+            if (queued_allocator) { __atomic_sub_fetch(&queued_allocator->queued, 1, __ATOMIC_RELEASE); release_elsewhere12(&queued_allocator->base); }
+            __atomic_sub_fetch(&l->pending, 1, __ATOMIC_RELEASE);
+            release_elsewhere12(&l->base);
+            continue;
+        }
+        id<MTLCommandBuffer> cb;
+        if (gpu_errors12() || status_only) {
+            MTLCommandBufferDescriptor *cd = [MTLCommandBufferDescriptor new];
+            cd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            cb = [q->mtl_queue commandBufferWithDescriptor:cd];
+        } else cb = [q->mtl_queue commandBuffer];
+        [cb enqueue];
+        __atomic_add_fetch(&a->in_flight, 1, __ATOMIC_RELEASE);
+        d3d_addref(&a->base);
+        uint64_t value = ++q->timeline_value;
+        pthread_mutex_lock(&d->alloc_lock);
+        a->last_timeline = q->timeline;
+        a->last_value = value;
+        pthread_mutex_unlock(&d->alloc_lock);
+        pthread_mutex_lock(&q->jlock);
+        q->replays++;
+        pthread_mutex_unlock(&q->jlock);
+        dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
+        dispatch_async(pool, ^{
+            @autoreleasepool {
+                uint64_t t0 = fs_now12();
+                __block id<MTLCommandBuffer> c = cb;
+                id<MTLCommandBuffer> c2 = c;
+                scratch sc = { nil, 0, nil };
+                resource_state_shadow12 *shadows = NULL;
+                uint32_t state_count = 0;
+                cb_log_reset12();
+                replay(d, q->mtl_queue, q->desc.Type, l, &shadows, &state_count, &c2, &sc);
+                queue_discard_list_states12(shadows, state_count);
+                list_submit_replayed12(d, q, a, c2, sc, value);
+                FS_ADD12(replay_ns, fs_now12() - t0);
+            }
+            if (queued_allocator) { __atomic_sub_fetch(&queued_allocator->queued, 1, __ATOMIC_RELEASE); d3d_release(&queued_allocator->base); }
+            __atomic_sub_fetch(&l->pending, 1, __ATOMIC_RELEASE);
+            d3d_release(&l->base);
+            dispatch_semaphore_signal(slots);
+            pthread_mutex_lock(&q->jlock);
+            if (!--q->replays && !q->jhead && !q->jbusy) pthread_cond_broadcast(&q->jidle);
+            pthread_mutex_unlock(&q->jlock);
+        });
+    }
+}
+static void job_execute12(queue12 *q, qjob12 *j) {
+    if (parallel_replay12()) { job_execute_parallel12(q, j); return; }
+    uint64_t t0 = fs_now12();
+    queue_execute_(q, j->n, j->objs);
+    FS_ADD12(replay_ns, fs_now12() - t0);
+    for (uint32_t i = 0; i < j->n; i++) {
+        list12 *l = j->objs[i];
+        if (!l) continue;
+        allocator12 *a = j->objs[j->n + i];
+        if (a) { __atomic_sub_fetch(&a->queued, 1, __ATOMIC_RELEASE); release_elsewhere12(&a->base); }
+        __atomic_sub_fetch(&l->pending, 1, __ATOMIC_RELEASE);
+        release_elsewhere12(&l->base);
+    }
+}
+
 static WINAPI void queue_execute(void *this, uint32_t n, void *const *lists) {
     uint64_t t0 = fs_now12();
-    queue_execute_(this, n, lists);
+    queue12 *q = this;
+    if (q->async && n && lists) {
+        qjob12 *j = calloc(1, sizeof *j);
+        j->run = job_execute12;
+        j->n = n;
+        j->objs = calloc(2 * (size_t)n, sizeof *j->objs);         // (the lists, then their allocators)
+        for (uint32_t i = 0; i < n; i++) {
+            list12 *l = lists[i];
+            j->objs[i] = l;
+            if (!l) continue;
+            d3d_addref(&l->base);
+            __atomic_add_fetch(&l->pending, 1, __ATOMIC_ACQ_REL);
+            pthread_mutex_lock(&q->dev->alloc_lock);
+            allocator12 *a = l->allocator;
+            if (a) { d3d_addref(&a->base); __atomic_add_fetch(&a->queued, 1, __ATOMIC_ACQ_REL); }
+            pthread_mutex_unlock(&q->dev->alloc_lock);
+            j->objs[n + i] = a;
+        }
+        queue_post12(q, j);
+    } else queue_execute_(this, n, lists);
     FS_ADD12(exec_n, 1); FS_ADD12(exec_ns, fs_now12() - t0);
 }
+// After a list's replay: the queue's timeline signal, the handler that frees what the GPU used, and the commit.
+// value 0: the next timeline value, counted in flight on the list's allocator here; else counted already.
+static void list_submit_replayed12(dev12 *d, queue12 *q, allocator12 *command_allocator, id<MTLCommandBuffer> cb,
+                                   scratch sc, uint64_t value) {
+    // (the scratch memory lives until the GPU is done with it: held by the handler; Metal holds the rest)
+    NSArray *held = sc.bufs;
+    char *what_ran = strdup(t_cb_log12);                   // (named when the command buffer fails)
+    if (!value) {                                              // (in order here; else given when it was enqueued)
+        __atomic_add_fetch(&command_allocator->in_flight, 1, __ATOMIC_RELEASE);
+        value = ++q->timeline_value;
+        pthread_mutex_lock(&d->alloc_lock);
+        command_allocator->last_timeline = q->timeline;
+        command_allocator->last_value = value;
+        pthread_mutex_unlock(&d->alloc_lock);
+        d3d_addref(&command_allocator->base);
+    }
+    [cb encodeSignalEvent:q->timeline value:value];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (held) scratch_recycle(d, held);
+        if (done.GPUEndTime > done.GPUStartTime) FS_ADD12(gpu_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9));
+        char *ran = what_ran;
+        if (done.status != MTLCommandBufferStatusError) { free(ran); ran = NULL; }
+        if (done.status == MTLCommandBufferStatusError) {
+            vx_log("D3D12: Metal command buffer failed: %s (it ran: %s)",
+                   done.error.localizedDescription.UTF8String ?: "unknown Metal error", ran ? ran : "?");
+            free(ran);
+            NSArray *infos = done.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+            for (id<MTLCommandBufferEncoderInfo> info in infos)
+                if (info.errorState == MTLCommandEncoderErrorStateFaulted)
+                    vx_log("D3D12:   faulted encoder: %s", info.label.UTF8String ?: "(compute or blit)");
+            static int told;
+            if (!told++) {
+                uint64_t resident = 0, count = 0;
+                if (@available(macOS 15.0, *)) if (d->residency) {
+                    resident = [(id<MTLResidencySet>)d->residency allocatedSize];
+                    count = [(id<MTLResidencySet>)d->residency allocationCount];
+                }
+                vx_log("D3D12: GPU memory: %llu MB allocated, %llu MB recommended working set, residency set %llu allocations %llu MB",
+                       (unsigned long long)(d->mtl.currentAllocatedSize >> 20), (unsigned long long)(d->mtl.recommendedMaxWorkingSetSize >> 20),
+                       (unsigned long long)count, (unsigned long long)(resident >> 20));
+            }
+        }
+        __atomic_fetch_sub(&command_allocator->in_flight, 1, __ATOMIC_ACQ_REL);
+        d3d_release(&command_allocator->base);
+    }];
+    [cb commit];
+}
+
 static void queue_execute_(void *this, uint32_t n, void *const *lists) {
     queue12 *q = this;
     dev12 *d = q->dev;
@@ -11967,57 +12230,20 @@ static void queue_execute_(void *this, uint32_t n, void *const *lists) {
         // is not found yet. VXRT_D3D12_ENCODER_STATUS=0 turns it off.
         static int status_only = -1;
         if (status_only < 0) { const char *e = getenv("VXRT_D3D12_ENCODER_STATUS"); status_only = !(e && *e == '0'); }
+        if (q->async) pthread_mutex_unlock(&d->submit_lock);         // (this may wait for the GPU: not with the lock held)
         if (gpu_errors12() || status_only) {
             MTLCommandBufferDescriptor *cd = [MTLCommandBufferDescriptor new];
             cd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
             cb = [q->mtl_queue commandBufferWithDescriptor:cd];
         } else cb = [q->mtl_queue commandBuffer];
+        if (q->async) pthread_mutex_lock(&d->submit_lock);
         scratch sc = { nil, 0, nil };
         cb_log_reset12();
         if (!replay(d, q->mtl_queue, q->desc.Type, l, &shadows, &state_count, &cb, &sc)) {
             queue_discard_list_states12(shadows, state_count);
             continue;
         }
-        // (the scratch memory lives until the GPU is done with it: held by the handler; Metal holds the rest)
-        NSArray *held = sc.bufs;
-        char *what_ran = strdup(t_cb_log12);                   // (named when the command buffer fails)
-        allocator12 *command_allocator = l->allocator;
-        __atomic_add_fetch(&command_allocator->in_flight, 1, __ATOMIC_RELEASE);
-        [cb encodeSignalEvent:q->timeline value:++q->timeline_value];
-        pthread_mutex_lock(&d->alloc_lock);
-        command_allocator->last_timeline = q->timeline;
-        command_allocator->last_value = q->timeline_value;
-        pthread_mutex_unlock(&d->alloc_lock);
-        d3d_addref(&command_allocator->base);
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            if (held) scratch_recycle(d, held);
-            if (done.GPUEndTime > done.GPUStartTime) FS_ADD12(gpu_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9));
-            char *ran = what_ran;
-            if (done.status != MTLCommandBufferStatusError) { free(ran); ran = NULL; }
-            if (done.status == MTLCommandBufferStatusError) {
-                vx_log("D3D12: Metal command buffer failed: %s (it ran: %s)",
-                       done.error.localizedDescription.UTF8String ?: "unknown Metal error", ran ? ran : "?");
-                free(ran);
-                NSArray *infos = done.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
-                for (id<MTLCommandBufferEncoderInfo> info in infos)
-                    if (info.errorState == MTLCommandEncoderErrorStateFaulted)
-                        vx_log("D3D12:   faulted encoder: %s", info.label.UTF8String ?: "(compute or blit)");
-                static int told;
-                if (!told++) {
-                    uint64_t resident = 0, count = 0;
-                    if (@available(macOS 15.0, *)) if (d->residency) {
-                        resident = [(id<MTLResidencySet>)d->residency allocatedSize];
-                        count = [(id<MTLResidencySet>)d->residency allocationCount];
-                    }
-                    vx_log("D3D12: GPU memory: %llu MB allocated, %llu MB recommended working set, residency set %llu allocations %llu MB",
-                           (unsigned long long)(d->mtl.currentAllocatedSize >> 20), (unsigned long long)(d->mtl.recommendedMaxWorkingSetSize >> 20),
-                           (unsigned long long)count, (unsigned long long)(resident >> 20));
-                }
-            }
-            __atomic_fetch_sub(&command_allocator->in_flight, 1, __ATOMIC_ACQ_REL);
-            d3d_release(&command_allocator->base);
-        }];
-        [cb commit];
+        list_submit_replayed12(d, q, l->allocator, cb, sc, 0);
         for (uint32_t j = 0; j < state_count; j++) batch_touched[batch_touched_count++] = shadows[j].resource;
         queue_commit_list_states12(d, shadows, state_count);
     }
@@ -12028,17 +12254,31 @@ static void queue_execute_(void *this, uint32_t n, void *const *lists) {
     pthread_mutex_unlock(&d->submit_lock);
 }
 
+static HRESULT queue_signal_now12(queue12 *q, fence12 *fence_object, uint64_t v);
+static HRESULT queue_wait_now12(queue12 *q, fence12 *fence_object, uint64_t v);
+static void job_signal12(queue12 *q, qjob12 *j) { queue_signal_now12(q, j->obj, j->value); release_elsewhere12(&((fence12 *)j->obj)->base); }
+static void job_wait12(queue12 *q, qjob12 *j) { queue_wait_now12(q, j->obj, j->value); release_elsewhere12(&((fence12 *)j->obj)->base); }
 static WINAPI HRESULT queue_signal(void *this, void *fence, uint64_t v) {
     queue12 *q = this;
     fence12 *fence_object = fence;
     if (!fence_object || fence_object->base.kind != K12_FENCE || fence_object->dev != q->dev ||
         !fence_object->event) return E_INVALIDARG;
-    pthread_mutex_lock(&q->dev->submit_lock);
-    id<MTLCommandBuffer> cb = [q->mtl_queue commandBuffer];
-    if (!cb) {
-        pthread_mutex_unlock(&q->dev->submit_lock);
-        return E_FAIL;
+    if (q->async) {
+        qjob12 *j = calloc(1, sizeof *j);
+        j->run = job_signal12;
+        j->obj = fence_object;
+        j->value = v;
+        d3d_addref(&fence_object->base);
+        queue_post12(q, j);
+        return S_OK;
     }
+    return queue_signal_now12(q, fence_object, v);
+}
+static HRESULT queue_signal_now12(queue12 *q, fence12 *fence_object, uint64_t v) {
+    void *fence = fence_object;
+    id<MTLCommandBuffer> cb = [q->mtl_queue commandBuffer];       // (before the lock: this may wait for the GPU)
+    if (!cb) return E_FAIL;
+    pthread_mutex_lock(&q->dev->submit_lock);
     [cb encodeSignalEvent:fence_object->event value:v];
     if (trace_fences12()) {
         static volatile int n;
@@ -12054,12 +12294,21 @@ static WINAPI HRESULT queue_wait(void *this, void *fence, uint64_t v) {
     fence12 *fence_object = fence;
     if (!fence_object || fence_object->base.kind != K12_FENCE || fence_object->dev != q->dev ||
         !fence_object->event) return E_INVALIDARG;
-    pthread_mutex_lock(&q->dev->submit_lock);
-    id<MTLCommandBuffer> cb = [q->mtl_queue commandBuffer];
-    if (!cb) {
-        pthread_mutex_unlock(&q->dev->submit_lock);
-        return E_FAIL;
+    if (q->async) {
+        qjob12 *j = calloc(1, sizeof *j);
+        j->run = job_wait12;
+        j->obj = fence_object;
+        j->value = v;
+        d3d_addref(&fence_object->base);
+        queue_post12(q, j);
+        return S_OK;
     }
+    return queue_wait_now12(q, fence_object, v);
+}
+static HRESULT queue_wait_now12(queue12 *q, fence12 *fence_object, uint64_t v) {
+    id<MTLCommandBuffer> cb = [q->mtl_queue commandBuffer];       // (before the lock: this may wait for the GPU)
+    if (!cb) return E_FAIL;
+    pthread_mutex_lock(&q->dev->submit_lock);
     fence_watch12(fence_object, v, "queue", q);
     [cb encodeWaitForEvent:fence_object->event value:v];
     [cb commit];
@@ -12096,10 +12345,14 @@ static WINAPI HRESULT dev_create_queue(void *this, const Q_DESC *desc, const GUI
     queue12 *q = alloc12(sizeof *q, K12_QUEUE, g_queue_vtbl, d);
     q->base.destroy = queue_destroy;
     q->desc = *desc;
-    q->mtl_queue = [d->mtl newCommandQueue];
+    // (Metal's default of 64 command buffers in flight blocks the next commandBuffer call until one completes: a
+    //  queue's thread holding the submission lock there, while the GPU waits for another queue to signal, would wait
+    //  for ever)
+    q->mtl_queue = async_submit12() ? [d->mtl newCommandQueueWithMaxCommandBufferCount:1024] : [d->mtl newCommandQueue];
     q->timeline = [d->mtl newSharedEvent];
     if (d->residency) if (@available(macOS 15.0, *)) [q->mtl_queue addResidencySet:(id<MTLResidencySet>)d->residency];
     if (!q->mtl_queue || !q->timeline) { d3d_release(&q->base); return E_FAIL; }
+    queue_async_start12(q);
     pthread_mutex_lock(&d->lock);
     for (int i = 0; i < 16; i++) if (!d->queues[i]) { d->queues[i] = q; break; }
     pthread_mutex_unlock(&d->lock);
@@ -12123,6 +12376,7 @@ static WINAPI HRESULT allocator_reset(void *this) {
     // read from the queue's timeline, which advances as fences do.
     int gpu_done = allocator->last_timeline && allocator->last_timeline.signaledValue >= allocator->last_value;
     if (allocator->recording_lists || (!gpu_done && __atomic_load_n(&allocator->in_flight, __ATOMIC_ACQUIRE)) ||
+        __atomic_load_n(&allocator->queued, __ATOMIC_ACQUIRE) ||
         allocator->generation == UINT64_MAX) {
         hr = E_FAIL;
     } else {
@@ -12300,6 +12554,7 @@ static HRESULT swap_make_buffers(swap12 *sc) {
 
 static void swap_destroy(d3d_object *o) {
     swap12 *sc = (swap12 *)o;
+    queue_drain12(sc->queue);
     for (uint32_t i = 0; i < 16; i++) if (sc->buffers[i]) d3d_release(&sc->buffers[i]->base);
     sc->layer = nil;
     sc->pipeline = nil;
@@ -12309,7 +12564,12 @@ static void swap_destroy(d3d_object *o) {
 }
 
 int d3d12_is_queue(void *p) { return p && ((d3d_object *)p)->vtbl == g_queue_vtbl; }
-void *d3d12_queue_metal(void *queue) { return d3d12_is_queue(queue) ? (__bridge void *)((queue12 *)queue)->mtl_queue : NULL; }
+// (a queue another API submits to directly, as D3D11On12 does, keeps its order only without its own thread)
+void *d3d12_queue_metal(void *queue) {
+    if (!d3d12_is_queue(queue)) return NULL;
+    queue_async_stop12((queue12 *)queue);
+    return (__bridge void *)((queue12 *)queue)->mtl_queue;
+}
 void *d3d12_device_of(void *p) {
     if (!p) return NULL;
     if (((d3d_object *)p)->vtbl == g_device_vtbl) return p;
@@ -12383,7 +12643,7 @@ static WINAPI uint32_t swap_index(void *this) { return ((swap12 *)this)->index; 
 // VXRT_PRESENT_SNAPSHOT=file.png (VXRT_PRESENT_SNAPSHOT_EVERY=n, default 300): every n-th present's picture, as the
 // window shows it, written to that file (to see what a program draws without a screen capture); the log notes
 // the presents every 300.
-static void swap_snapshot12(swap12 *sc) {
+static void swap_snapshot12(swap12 *sc, uint32_t index) {
     static const char *path;
     static int every = -1;
     if (every < 0) {
@@ -12408,7 +12668,7 @@ static void swap_snapshot12(swap12 *sc) {
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         [enc setRenderPipelineState:sc->pipeline];
-        [enc setFragmentTexture:sc->buffers[sc->index]->texture atIndex:0];
+        [enc setFragmentTexture:sc->buffers[index]->texture atIndex:0];
         float scale[2] = { (float)sc->src_width / (float)sc->width, (float)sc->src_height / (float)sc->height };
         [enc setFragmentBytes:scale length:sizeof scale atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -12431,30 +12691,21 @@ static void swap_snapshot12(swap12 *sc) {
         CGColorSpaceRelease(cs);
     }
 }
-static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
-    swap12 *sc = this;
-    if (flags & 1) return S_OK;                                    // DXGI_PRESENT_TEST
-    if (sync > 4) return DXGI_ERROR_INVALID_CALL;
-    sc->layer.displaySyncEnabled = sync != 0;
-    HANDLE waitable = sc->flags & SWAP_FLAG_FRAME_LATENCY_WAITABLE ? sc->waitable : NULL;
+// (the copy of the back buffer into the drawable, and the present: on the queue's thread with VXRT_D3D12_ASYNC_SUBMIT)
+static void swap_present_now12(swap12 *sc, uint32_t index, id<CAMetalDrawable> drawable, HANDLE waitable) {
     int queued = 0;
+    id<MTLCommandBuffer> cb = drawable ? [sc->queue->mtl_queue commandBuffer] : nil;   // (before the lock: may wait)
+    pthread_mutex_lock(&sc->dev->submit_lock);
     @autoreleasepool {
-        // (the drawable is waited for before the submission lock: a wait for the display holds up no other thread's
-        //  ExecuteCommandLists)
-        uint64_t t0 = fs_now12();
-        id<CAMetalDrawable> drawable = [sc->layer nextDrawable];
-        FS_ADD12(drawable_ns, fs_now12() - t0);
-        pthread_mutex_lock(&sc->dev->submit_lock);
-        swap_snapshot12(sc);
-        if (drawable) {
-            id<MTLCommandBuffer> cb = [sc->queue->mtl_queue commandBuffer];
+        swap_snapshot12(sc, index);
+        if (drawable && cb) {
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture = drawable.texture;
             rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
             [enc setRenderPipelineState:sc->pipeline];
-            [enc setFragmentTexture:sc->buffers[sc->index]->texture atIndex:0];
+            [enc setFragmentTexture:sc->buffers[index]->texture atIndex:0];
             float scale[2] = { (float)sc->src_width / (float)sc->width, (float)sc->src_height / (float)sc->height };
             [enc setFragmentBytes:scale length:sizeof scale atIndex:0];
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -12467,6 +12718,36 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     }
     pthread_mutex_unlock(&sc->dev->submit_lock);
     if (waitable && !queued) vx_release_semaphore(waitable, 1);
+}
+static void job_present12(queue12 *q, qjob12 *j) {
+    swap12 *sc = j->obj;
+    id<CAMetalDrawable> drawable = j->drawable ? CFBridgingRelease(j->drawable) : nil;
+    swap_present_now12(sc, j->index, drawable, j->waitable);
+    release_elsewhere12(&sc->base);
+}
+static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
+    swap12 *sc = this;
+    if (flags & 1) return S_OK;                                    // DXGI_PRESENT_TEST
+    if (sync > 4) return DXGI_ERROR_INVALID_CALL;
+    sc->layer.displaySyncEnabled = sync != 0;
+    HANDLE waitable = sc->flags & SWAP_FLAG_FRAME_LATENCY_WAITABLE ? sc->waitable : NULL;
+    @autoreleasepool {
+        // (the drawable is waited for before the submission lock: a wait for the display holds up no other thread's
+        //  ExecuteCommandLists)
+        uint64_t t0 = fs_now12();
+        id<CAMetalDrawable> drawable = [sc->layer nextDrawable];
+        FS_ADD12(drawable_ns, fs_now12() - t0);
+        if (sc->queue->async) {
+            qjob12 *j = calloc(1, sizeof *j);
+            j->run = job_present12;
+            j->obj = sc;
+            j->index = sc->index;
+            j->drawable = drawable ? (void *)CFBridgingRetain(drawable) : NULL;
+            j->waitable = waitable;
+            d3d_addref(&sc->base);
+            queue_post12(sc->queue, j);
+        } else swap_present_now12(sc, sc->index, drawable, waitable);
+    }
     sc->index = (sc->index + 1) % sc->count;
     sc->presents++;
     frame_stats_present12(sc->presents);
@@ -12478,6 +12759,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
 static WINAPI HRESULT swap_present1(void *this, uint32_t sync, uint32_t flags, const void *params) { return swap_present(this, sync, flags); }
 static WINAPI HRESULT swap_resize(void *this, uint32_t count, uint32_t w, uint32_t h, uint32_t format, uint32_t flags) {
     swap12 *sc = this;
+    queue_drain12(sc->queue);
     vx_window *win = vx_window_get(sc->hwnd);
     if (count) sc->count = count > 16 ? 16 : count;
     if (format) sc->format = format;
