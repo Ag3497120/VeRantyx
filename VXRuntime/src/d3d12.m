@@ -190,6 +190,8 @@ struct dev12 {
     volatile int nonidentity_srv;    // an SRV with a non-identity component mapping was made (the per-draw check of
                                      // comparison sampling over such views is skipped until then)
     pthread_mutex_t submit_lock;     // preserves queue submission and tracked state order across calling threads
+    pthread_mutex_t alloc_lock;      // command lists' and allocators' recording state (Close, Reset, an allocator's
+                                     // progress): not the submission lock, which a replay holds for its whole length
     pthread_mutex_t format_lock;
     uint32_t format_support1[256], format_support2[256];
     uint8_t format_support_valid[256];
@@ -2630,30 +2632,34 @@ static uint32_t g_nheaps;
 // What a shader-visible descriptor held (a texture view, a sampler state) stays alive until the GPU has finished what
 // was submitted when the descriptor was overwritten: command buffers in flight may still read it through the heap.
 static pthread_mutex_t g_grave_lock12 = PTHREAD_MUTEX_INITIALIZER;
-static NSMutableArray *g_grave12;                        // @[ object, NSData of the queues' timeline values ]
+static NSMutableArray *g_grave_open12;                   // what was buried since the last submission
+static NSMutableArray *g_grave_bins12;                   // @[ objects, NSData of the queues' timeline values ]
 static void grave_bury12(dev12 *d, id old) {
     if (!d || !old) return;
-    uint64_t at[16];
-    for (int i = 0; i < 16; i++) at[i] = d->queues[i] ? __atomic_load_n(&((queue12 *)d->queues[i])->timeline_value, __ATOMIC_ACQUIRE) : 0;
     pthread_mutex_lock(&g_grave_lock12);
-    if (!g_grave12) g_grave12 = [NSMutableArray new];
-    [g_grave12 addObject:@[ old, [NSData dataWithBytes:at length:sizeof at] ]];
+    if (!g_grave_open12) g_grave_open12 = [NSMutableArray new];
+    [g_grave_open12 addObject:old];
     pthread_mutex_unlock(&g_grave_lock12);
 }
+// (at each submission: what was buried since closes with the queues' values now; bins the GPU has passed go)
 static void grave_settle12(dev12 *d) {
     pthread_mutex_lock(&g_grave_lock12);
-    if (g_grave12.count) {
-        NSMutableIndexSet *done = [NSMutableIndexSet indexSet];
-        [g_grave12 enumerateObjectsUsingBlock:^(NSArray *entry, NSUInteger k, BOOL *stop) {
-            (void)stop;
-            const uint64_t *at = ((NSData *)entry[1]).bytes;
-            for (int i = 0; i < 16; i++) {
-                queue12 *q = d->queues[i];
-                if (q && q->timeline && q->timeline.signaledValue < at[i]) return;
-            }
-            [done addIndex:k];
-        }];
-        [g_grave12 removeObjectsAtIndexes:done];
+    if (g_grave_open12.count) {
+        uint64_t at[16];
+        for (int i = 0; i < 16; i++) at[i] = d->queues[i] ? __atomic_load_n(&((queue12 *)d->queues[i])->timeline_value, __ATOMIC_ACQUIRE) : 0;
+        if (!g_grave_bins12) g_grave_bins12 = [NSMutableArray new];
+        [g_grave_bins12 addObject:@[ g_grave_open12, [NSData dataWithBytes:at length:sizeof at] ]];
+        g_grave_open12 = [NSMutableArray new];
+    }
+    while (g_grave_bins12.count) {
+        const uint64_t *at = ((NSData *)g_grave_bins12[0][1]).bytes;
+        int passed = 1;
+        for (int i = 0; i < 16 && passed; i++) {
+            queue12 *q = d->queues[i];
+            if (q && q->timeline && q->timeline.signaledValue < at[i]) passed = 0;
+        }
+        if (!passed) break;
+        [g_grave_bins12 removeObjectAtIndex:0];
     }
     pthread_mutex_unlock(&g_grave_lock12);
 }
@@ -3922,11 +3928,11 @@ static void list_clear(list12 *l) {
 }
 static void list_destroy(d3d_object *o) {
     list12 *l = (list12 *)o;
-    pthread_mutex_lock(&l->dev->submit_lock);
+    pthread_mutex_lock(&l->dev->alloc_lock);
     list_allocator_stop_recording12(l);
     allocator12 *allocator = l->allocator;
     l->allocator = NULL;
-    pthread_mutex_unlock(&l->dev->submit_lock);
+    pthread_mutex_unlock(&l->dev->alloc_lock);
     if (allocator) d3d_release(&allocator->base);
     list_clear(l);
     gpu_ir_stream_destroy(&l->gpu_ir);
@@ -4011,34 +4017,34 @@ static int list_reserve12(list12 *list, uint32_t additional) {
 }
 static WINAPI HRESULT list_close(void *this) {
     list12 *l = this;
-    pthread_mutex_lock(&l->dev->submit_lock);
+    pthread_mutex_lock(&l->dev->alloc_lock);
     if (l->closed) {
-        pthread_mutex_unlock(&l->dev->submit_lock);
+        pthread_mutex_unlock(&l->dev->alloc_lock);
         return E_FAIL;
     }
     l->closed = 1;
     list_allocator_stop_recording12(l);
     if (l->type == 1 && !list_bundle_commands_valid12(l)) l->validation_error = E_INVALIDARG;
     HRESULT hr = l->validation_error ? l->validation_error : S_OK;
-    pthread_mutex_unlock(&l->dev->submit_lock);
+    pthread_mutex_unlock(&l->dev->alloc_lock);
     return hr;
 }
 static WINAPI HRESULT list_reset(void *this, void *allocator, void *pso) {
     list12 *l = this;
     allocator12 *next_allocator = allocator;
-    pthread_mutex_lock(&l->dev->submit_lock);
+    pthread_mutex_lock(&l->dev->alloc_lock);
     if (!l->closed) {
-        pthread_mutex_unlock(&l->dev->submit_lock);
+        pthread_mutex_unlock(&l->dev->alloc_lock);
         return E_FAIL;
     }
     if (l->validation_error) {
         HRESULT hr = l->validation_error;
-        pthread_mutex_unlock(&l->dev->submit_lock);
+        pthread_mutex_unlock(&l->dev->alloc_lock);
         return hr;
     }
     if (!next_allocator || next_allocator->base.kind != K12_ALLOCATOR || next_allocator->dev != l->dev ||
         next_allocator->type != l->type || next_allocator->recording_lists) {
-        pthread_mutex_unlock(&l->dev->submit_lock);
+        pthread_mutex_unlock(&l->dev->alloc_lock);
         return E_INVALIDARG;
     }
     list_clear(l);
@@ -4062,7 +4068,7 @@ static WINAPI HRESULT list_reset(void *this, void *allocator, void *pso) {
         hold(pso);
         l->recording_pso = ((d3d_object *)pso)->kind == K12_PSO ? (pso12 *)pso : NULL;
     }
-    pthread_mutex_unlock(&l->dev->submit_lock);
+    pthread_mutex_unlock(&l->dev->alloc_lock);
     return S_OK;
 }
 static WINAPI void list_set_pso(void *this, void *pso) {
@@ -11835,7 +11841,10 @@ static void queue_execute_(void *this, uint32_t n, void *const *lists) {
     for (uint32_t i = 0; i < n; i++) {
         list12 *l = lists[i];
         if (!l || l->dev != d) continue;
-        if (!l->closed || !l->allocator || l->allocator->generation != l->allocator_generation) {
+        pthread_mutex_lock(&d->alloc_lock);
+        int list_stale = !l->closed || !l->allocator || l->allocator->generation != l->allocator_generation;
+        pthread_mutex_unlock(&d->alloc_lock);
+        if (list_stale) {
             vx_log("D3D12: open command list or command list invalidated by allocator reset; skipping it");
             continue;
         }
@@ -11893,8 +11902,10 @@ static void queue_execute_(void *this, uint32_t n, void *const *lists) {
         allocator12 *command_allocator = l->allocator;
         __atomic_add_fetch(&command_allocator->in_flight, 1, __ATOMIC_RELEASE);
         [cb encodeSignalEvent:q->timeline value:++q->timeline_value];
+        pthread_mutex_lock(&d->alloc_lock);
         command_allocator->last_timeline = q->timeline;
         command_allocator->last_value = q->timeline_value;
+        pthread_mutex_unlock(&d->alloc_lock);
         d3d_addref(&command_allocator->base);
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
             if (held) scratch_recycle(d, held);
@@ -12023,7 +12034,7 @@ static WINAPI HRESULT allocator_query(void *this, const GUID *iid, void **out) {
 }
 static WINAPI HRESULT allocator_reset(void *this) {
     allocator12 *allocator = this;
-    pthread_mutex_lock(&allocator->dev->submit_lock);
+    pthread_mutex_lock(&allocator->dev->alloc_lock);
     HRESULT hr = S_OK;
     // A program resets an allocator once its fence says the GPU is done. Metal runs the completion handlers that count
     // the allocator's command buffers down later (they lag the shared events fences are), so the GPU's progress is
@@ -12035,7 +12046,7 @@ static WINAPI HRESULT allocator_reset(void *this) {
     } else {
         allocator->generation++;
     }
-    pthread_mutex_unlock(&allocator->dev->submit_lock);
+    pthread_mutex_unlock(&allocator->dev->alloc_lock);
     return hr;
 }
 static void allocator_destroy(d3d_object *o) {
@@ -12057,9 +12068,9 @@ static WINAPI HRESULT dev_create_list(void *this, uint32_t node, int32_t type, v
     allocator12 *command_allocator = allocator;
     if (type < 0 || type > 3 || !command_allocator || command_allocator->base.kind != K12_ALLOCATOR ||
         command_allocator->dev != device || command_allocator->type != type) return E_INVALIDARG;
-    pthread_mutex_lock(&device->submit_lock);
+    pthread_mutex_lock(&device->alloc_lock);
     if (command_allocator->recording_lists) {
-        pthread_mutex_unlock(&device->submit_lock);
+        pthread_mutex_unlock(&device->alloc_lock);
         return E_INVALIDARG;
     }
     list12 *l = alloc12(sizeof *l, K12_LIST, g_list_vtbl, this);
@@ -12074,7 +12085,7 @@ static WINAPI HRESULT dev_create_list(void *this, uint32_t node, int32_t type, v
     for (uint32_t i = 0; i < 4; i++) l->recording_blend_factor[i] = 1.0f;
     gpu_ir_stream_init(&l->gpu_ir);
     if (pso) list_set_pso(l, pso);
-    pthread_mutex_unlock(&device->submit_lock);
+    pthread_mutex_unlock(&device->alloc_lock);
     HRESULT hr = list_query(l, iid, out);
     d3d_release(&l->base);
     return hr;
@@ -13451,6 +13462,7 @@ static WINAPI HRESULT D3D12CreateDevice(void *adapter, int32_t min_level, const 
     d->mtl = mtl;
     pthread_mutex_init(&d->lock, NULL);
     pthread_mutex_init(&d->submit_lock, NULL);
+    pthread_mutex_init(&d->alloc_lock, NULL);
     pthread_mutex_init(&d->format_lock, NULL);
     pthread_mutex_init(&d->scratch_lock, NULL);
     d->scratch_pool = [NSMutableArray new];
