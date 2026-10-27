@@ -2647,12 +2647,19 @@ static uint64_t g_heaps_gen12 = 1;                         // (changes with ever
 static pthread_mutex_t g_grave_lock12 = PTHREAD_MUTEX_INITIALIZER;
 static NSMutableArray *g_grave_open12;                   // what was buried since the last submission
 static NSMutableArray *g_grave_bins12;                   // @[ objects, NSData of the queues' timeline values ]
+// (each thread gathers 64 before taking the lock: a later bin only keeps them longer)
+static __thread void *t_grave12;                   // NSMutableArray, CFBridgingRetain
 static void grave_bury12(dev12 *d, id old) {
     if (!d || !old) return;
+    if (!t_grave12) t_grave12 = (void *)CFBridgingRetain([NSMutableArray new]);
+    NSMutableArray *mine = (__bridge NSMutableArray *)t_grave12;
+    [mine addObject:old];
+    if (mine.count < 64) return;
     pthread_mutex_lock(&g_grave_lock12);
     if (!g_grave_open12) g_grave_open12 = [NSMutableArray new];
-    [g_grave_open12 addObject:old];
+    [g_grave_open12 addObjectsFromArray:mine];
     pthread_mutex_unlock(&g_grave_lock12);
+    [mine removeAllObjects];
 }
 // (at each submission: what was buried since closes with the queues' values now; bins the GPU has passed go)
 static void grave_settle12(dev12 *d) {
@@ -11923,13 +11930,16 @@ static void queue_execute_(void *this, uint32_t n, void *const *lists) {
         }
         resource_state_shadow12 *shadows = NULL;
         uint32_t state_count = 0;
-        int state_result = queue_validate_list_states12(d, q->desc.Type, q->mtl_queue, l,
-            NULL, 0, &shadows, &state_count);
+        // VXRT_D3D12_LENIENT_STATES=1: run such a list anyway, as Windows does without its debug layer (Metal tracks
+        // the hazards itself); its transitions are then not recorded. Once 1000 lists have failed, the states are
+        // not tracked well enough to be worth validating: lists run without (it was a tenth of the replay's time in
+        // Cyberpunk 2077, whose lists nearly all fail); VXRT_D3D12_VALIDATE_STATES=1 keeps validating.
+        static int lenient = -1, told, keep_validating = -1;
+        if (lenient < 0) lenient = getenv("VXRT_D3D12_LENIENT_STATES") != NULL;
+        if (keep_validating < 0) keep_validating = getenv("VXRT_D3D12_VALIDATE_STATES") != NULL;
+        int state_result = lenient && told >= 1000 && !keep_validating ? 1 :
+            queue_validate_list_states12(d, q->desc.Type, q->mtl_queue, l, NULL, 0, &shadows, &state_count);
         if (state_result != 1) {
-            // VXRT_D3D12_LENIENT_STATES=1: run such a list anyway, as Windows does without its debug layer (Metal tracks
-            // the hazards itself); its transitions are then not recorded.
-            static int lenient = -1, told;
-            if (lenient < 0) lenient = getenv("VXRT_D3D12_LENIENT_STATES") != NULL;
             if (state_result == 0 && lenient) {
                 if (told++ % 1000 == 0) vx_log("D3D12: command list has an invalid transition or resource-use state; run anyway (%d so far)", told);
                 shadows = NULL;
