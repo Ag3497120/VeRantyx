@@ -399,7 +399,7 @@ typedef struct { d3d_object base; void *data; size_t size; } blob12;
 enum { C_PSO, C_ROOTSIG, C_HEAPS, C_TABLE, C_CONSTANTS, C_ROOT_VA, C_DISPATCH, C_COPY_RESOURCE, C_COPY_TEXTURE,
        C_TOPOLOGY, C_VB, C_IB, C_TARGETS, C_VIEWPORTS, C_SCISSORS, C_CLEAR_RTV, C_CLEAR_DSV, C_CLEAR_UAV, C_DRAW, C_DRAW_INDEXED, C_BLEND_FACTOR, C_STENCIL_REF,
        C_BEGIN_QUERY, C_END_QUERY, C_RESOLVE_QUERY, C_GPU_IR, C_EXECUTE_INDIRECT, C_BUNDLE_BEGIN, C_BUNDLE_END,
-       C_WRITE_BUFFER_IMMEDIATE };
+       C_WRITE_BUFFER_IMMEDIATE, C_DISCARD };
 enum { D3D12_TRACK_COPY_BUFFER = 0x100, D3D12_TRACK_COPY_RESOURCE, D3D12_TRACK_COPY_TEXTURE, D3D12_TRACK_RESOLVE,
        D3D12_TRACK_RENDER_PASS_RESOLVE };   // (EndRenderPass resolves: the source stays a render target)
 typedef struct {
@@ -6874,7 +6874,17 @@ static WINAPI void list_resolve_query(void *this, void *heap, int32_t type, uint
 static WINAPI void list_marker(void *this, uint32_t metadata, const void *data, uint32_t size) { }
 static WINAPI void list_end_event(void *this) { }
 // A discard only says the contents need not be kept; keeping them is correct.
-static WINAPI void list_discard_resource(void *this, void *resource, const void *region) { }
+// DiscardResource: what the resource holds becomes undefined. A render target or depth texture is cleared to zero here:
+// placed resources share their heap's memory, and Cyberpunk 2077's temporal history, discarded on first use, kept
+// whatever bytes another resource had left there - NaN that then never left the history (a black picture).
+static WINAPI void list_discard_resource(void *this, void *resource, const void *region) {
+    res12 *r = resource;
+    (void)region;
+    if (!r || !r->texture || !(r->desc.Flags & 0x3)) return;     // ALLOW_RENDER_TARGET, ALLOW_DEPTH_STENCIL
+    if (r->texture.textureType == MTLTextureType3D) return;
+    cmd12 *c = rec(this, C_DISCARD);
+    c->obj = r;
+}
 // Predication: the draws and dispatches it would skip still run (the result is the same unless a program counts on
 // side effects of the skipped work; occlusion-predicated objects are hidden by depth anyway).
 static WINAPI void list_set_predication(void *this, void *buffer, uint64_t offset, int32_t op) {
@@ -8234,6 +8244,10 @@ static int state_validate_shader_stage12(dev12 *device, int32_t queue_type, reso
             if (elements > range_available) return 0;
         }
         if (elements > available) return 0;
+        // (an unbounded or large array is not walked descriptor by descriptor at every draw - a bindless range of a
+        //  million descriptors made a frame of Cyberpunk 2077's loading screen take 8.6 s; what it reaches is not
+        //  checked against its resources' states)
+        if (slot->count == UINT32_MAX || elements > 64) continue;
         for (uint64_t element = 0; element < elements; element++) {
             uint32_t descriptor_index = (uint32_t)(first + element);
             if (min_lod_incompatible_access && slot->cls == DXIL_SRV && descriptor_has_min_lod12(heap, descriptor_index)) {
@@ -8247,7 +8261,7 @@ static int state_validate_shader_stage12(dev12 *device, int32_t queue_type, reso
     }
     // ResourceDescriptorHeap indexes are data-dependent, so check every live descriptor of each class used by DXIL.
     // This can include entries the dynamic index never selects, but avoids accepting a reachable bad D3D12 state.
-    if (shader->uses_heap) {
+    if (shader->uses_heap && resource_heap->desc.NumDescriptors <= 4096) {   // (as for the resource accesses)
         uint32_t classes = shader->heap_resource_classes;
         if (!classes) classes = 1u << DXIL_SRV;
         for (uint32_t index = 0; index < resource_heap->desc.NumDescriptors; index++) {
@@ -8694,6 +8708,18 @@ static void pass_dump_dispatch12(id<MTLCommandBuffer> cb, id<MTLComputeCommandEn
     vx_log("D3D12: pass dump %d: dispatch %d %ux%ux%u of cs %016llx", g_dump_frame12, step, x, y, z, (unsigned long long)(p ? p->cs_code : 0));
     if (!ce) return;
     int shown = 0;
+    // (VXRT_D3D12_PASS_DUMP_PS also names compute shaders whose inputs are wanted: every texture they read)
+    if (p && pass_dump_ps12(p->cs_code))
+        for (uint32_t i = 0; i < n; i++) {
+            if (!(a[i].access_mask & GPU_IR_ACCESS_SHADER_READ) || (a[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
+            id obj = (__bridge id)gpu_ir_backend_object(a[i].resource);
+            if (![obj conformsToProtocol:@protocol(MTLTexture)]) continue;
+            id<MTLTexture> t = obj;
+            char what[96];
+            snprintf(what, sizeof what, "dispatch%d-cs%016llx-in%u-%lux%lu", step, (unsigned long long)p->cs_code, i,
+                     (unsigned long)t.width, (unsigned long)t.height);
+            pass_dump_texture12(cb, ce, t, what);
+        }
     for (uint32_t i = 0; i < n && shown < 4; i++) {
         if (!(a[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
         id obj = (__bridge id)gpu_ir_backend_object(a[i].resource);
@@ -11013,6 +11039,38 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             if (!replay_insert(&commands, &command_count, i + 1, generated, generated_count))
                 vx_log("D3D12: could not insert expanded ExecuteIndirect commands");
             free(generated);
+            break;
+        }
+        case C_DISCARD: {
+            res12 *r = c->obj;
+            id<MTLTexture> t = r ? r->texture : nil;
+            if (!t) break;
+            close_pass(d, g, cb, &re);
+            end_encoders(&ce, &be, &re);
+            MTLPixelFormat f = t.pixelFormat;
+            int depth = f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float_Stencil8;
+            int stencil = f == MTLPixelFormatDepth32Float_Stencil8;
+            NSUInteger slices = t.textureType == MTLTextureTypeCube ? 6 : t.textureType == MTLTextureTypeCubeArray ? 6 * t.arrayLength : t.arrayLength;
+            for (NSUInteger mip = 0; mip < t.mipmapLevelCount && mip < 16; mip++)
+                for (NSUInteger slice = 0; slice < slices && slice < 64; slice++) {
+                    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                    if (depth) {
+                        rp.depthAttachment.texture = t; rp.depthAttachment.level = mip; rp.depthAttachment.slice = slice;
+                        rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.clearDepth = 0;
+                        rp.depthAttachment.storeAction = MTLStoreActionStore;
+                        if (stencil) {
+                            rp.stencilAttachment.texture = t; rp.stencilAttachment.level = mip; rp.stencilAttachment.slice = slice;
+                            rp.stencilAttachment.loadAction = MTLLoadActionClear; rp.stencilAttachment.clearStencil = 0;
+                            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+                        }
+                    } else {
+                        rp.colorAttachments[0].texture = t; rp.colorAttachments[0].level = mip; rp.colorAttachments[0].slice = slice;
+                        rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+                        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    }
+                    id<MTLRenderCommandEncoder> clear = [cb renderCommandEncoderWithDescriptor:rp];
+                    [clear endEncoding];
+                }
             break;
         }
         case C_WRITE_BUFFER_IMMEDIATE: {
