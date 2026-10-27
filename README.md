@@ -14,8 +14,8 @@ or an ALVR headset. Some also play on the Mac's own screen.</p>
 </p>
 
 <p align="center">
-  <a href="https://youtu.be/qF09ETv1TpU"><img src="docs/media/vxrt-highlight.gif" width="720" alt="Half-Life: Alyx (Windows build) with the real Windows SteamVR on VXRuntime, on a MacBook Pro, played in Apple Vision Pro with hand tracking and Joy-Con"></a><br>
-  <sub>Half-Life: Alyx, Windows build, on a MacBook Pro M1 Max, no Wine. 3K preset, played in Vision Pro with hands + Joy-Con. <a href="https://youtu.be/qF09ETv1TpU">Full 4-minute unedited recording</a>.</sub>
+  <a href="#what-runs"><img src="docs/media/games-highlight.gif" width="720" alt="No Man's Sky, Elite Dangerous and Half-Life: Alyx, Windows builds running on VXRuntime on a MacBook Pro, played in Apple Vision Pro"></a><br>
+  <sub>No Man's Sky, Elite Dangerous and Half-Life: Alyx, Windows builds, each on a MacBook Pro M1 Max, no Wine, played in Vision Pro. <a href="https://youtu.be/qF09ETv1TpU">Full 4-minute unedited Alyx recording</a>.</sub>
 </p>
 
 > **New in 0.3 (Oct 25-26):** No Man's Sky, on the Mac's screen and in VR, started by your own Windows Steam; ALVR

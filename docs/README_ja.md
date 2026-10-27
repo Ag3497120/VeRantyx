@@ -30,7 +30,7 @@ VR コントローラーは要りません。ゲームの動かし方が違う3�
 - **GitHub**：アカウントが自動の判定で 10月24日から27日まで非表示になっていました。今は元に戻っています。
 - 英語の [README](../README.md) の「Updates」に、日ごとの変更があります。
 
-![vxrt版: Windows 版の Half-Life: Alyx と SteamVR を VXRuntime（Wine なし）で MacBook Pro 上で動かし、Apple Vision Pro で遊んでいるところ](media/vxrt-highlight.gif)
+![No Man's Sky、Elite Dangerous、Half-Life: Alyx の Windows 版を VXRuntime（Wine なし）で MacBook Pro 上で動かし、Apple Vision Pro で遊んでいるところ](media/games-highlight.gif)
 
 [![vxrt版 — YouTube で無編集の全編を見る](media/vxrt-poster.jpg)](https://youtu.be/qF09ETv1TpU)
 
