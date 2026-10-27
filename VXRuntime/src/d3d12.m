@@ -566,7 +566,9 @@ static double frame_stats_ms12(void) {
 static __thread char t_cb_log12[1024];
 static __thread int t_cb_len12;
 static void cb_log_reset12(void) { t_cb_log12[0] = 0; t_cb_len12 = 0; }
+static void prof_note12(char kind, uint64_t hash);
 static void cb_log12(char kind, uint64_t hash, uint32_t x, uint32_t y, uint32_t z) {
+    prof_note12(kind, hash);
     if (t_cb_len12 > (int)sizeof t_cb_log12 - 48) return;
     t_cb_len12 += snprintf(t_cb_log12 + t_cb_len12, sizeof t_cb_log12 - t_cb_len12, "%c%08llx", kind, (unsigned long long)(hash >> 32));
     if (x) t_cb_len12 += snprintf(t_cb_log12 + t_cb_len12, sizeof t_cb_log12 - t_cb_len12, "(%u,%u,%u)", x, y, z);
@@ -2847,10 +2849,31 @@ static WINAPI size_t *heap_cpu_start(void *this, size_t *out) { *out = (size_t)(
 static WINAPI uint64_t *heap_gpu_start(void *this, uint64_t *out) { heap12 *h = this; *out = h->gpu ? h->gpu.gpuAddress : 0; return out; }
 
 // Writes a descriptor and holds the Metal object it names.
+// VXRT_D3D12_TRACE_RESIDENCY=1: a texture written into a descriptor whose memory is not in the residency set is logged
+static void trace_residency_desc12(heap12 *h, id keep) {
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_D3D12_TRACE_RESIDENCY") != NULL;
+    if (!on || !keep || ![keep conformsToProtocol:@protocol(MTLTexture)]) return;
+    id<MTLTexture> t = keep;
+    while (t.parentTexture) t = t.parentTexture;
+    dev12 *d = h->dev;
+    if (!d || !d->residency) return;
+    id allocation = t.heap ? (id)t.heap : (id)t;
+    pthread_mutex_lock(&d->lock);
+    NSUInteger n = [d->resident_allocations countForObject:allocation];
+    pthread_mutex_unlock(&d->lock);
+    if (n) return;
+    static volatile int told;
+    if (__sync_add_and_fetch(&told, 1) <= 40)
+        vx_log("D3D12: descriptor of a texture outside the residency set: %lux%lux%lu fmt %lu type %lu storage %lu heap %p sparse %d",
+               (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth, (unsigned long)t.pixelFormat, (unsigned long)t.textureType,
+               (unsigned long)t.storageMode, (__bridge void *)t.heap, (int)t.isSparse);
+}
 static void put_desc(size_t cpu, const VxDesc *v, id keep, int32_t descriptor_class) {
     uint32_t i;
     heap12 *h = heap_at(cpu, &i);
     if (!h) { vx_log("D3D12: a descriptor written outside any heap (%#zx)", cpu); return; }
+    trace_residency_desc12(h, keep);
     memcpy(h->cpu + 32 * (size_t)i, v, 32);
     heap_keep12(h, i, keep);
     if (h->descriptor_kind) h->descriptor_kind[i] = descriptor_class >= DXIL_SRV && descriptor_class <= DXIL_SAMPLER
@@ -8681,6 +8704,121 @@ static void pass_dump_dispatch12(id<MTLCommandBuffer> cb, id<MTLComputeCommandEn
         shown++;
     }
 }
+
+// ---- VXRT_D3D12_GPU_PROFILE=<folder>: one frame's encoders timed on the GPU ---------------------------------------
+// When <folder>/prof appears (it is removed), every render pass and compute encoder of the next frame gets GPU
+// timestamps at its start and end (Metal stage-boundary counters); a second later the encoders are logged longest
+// first, with the shaders they ran (bytecode hashes) - which pass the GPU spends a frame on.
+static id<MTLCounterSampleBuffer> g_prof_buf12;
+static volatile int g_prof_armed12, g_prof_next12, g_prof_frame12;
+static char *g_prof_label12[2048];
+static __thread char *t_prof_label12;
+static __thread size_t t_prof_len12;
+static const char *gpu_profile_dir12(void) {
+    static const char *dir = (const char *)-1;
+    if (dir == (const char *)-1) { dir = getenv("VXRT_D3D12_GPU_PROFILE"); if (dir && !*dir) dir = NULL; }
+    return dir;
+}
+// The pair of sample indices for a new encoder (or -1), its label started.
+static int prof_begin12(id<MTLDevice> mtl, char kind) {
+    if (!g_prof_armed12 || !g_prof_buf12) return -1;
+    int k = __sync_fetch_and_add(&g_prof_next12, 2);
+    if (k + 1 >= 4096) return -1;
+    char *label = calloc(1, 512);
+    if (label) { label[0] = kind; label[1] = ':'; }
+    g_prof_label12[k / 2] = label;
+    t_prof_label12 = label;
+    t_prof_len12 = label ? 2 : 0;
+    (void)mtl;
+    return k;
+}
+static void prof_note12(char kind, uint64_t hash) {
+    if (!g_prof_armed12 || !t_prof_label12 || t_prof_len12 > 480) return;
+    t_prof_len12 += snprintf(t_prof_label12 + t_prof_len12, 512 - t_prof_len12, " %c%08llx", kind, (unsigned long long)(hash >> 32));
+}
+static id<MTLComputeCommandEncoder> new_compute12(id<MTLCommandBuffer> cb) {
+    int k = prof_begin12(cb.device, 'C');
+    if (k < 0) return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
+    pd.dispatchType = MTLDispatchTypeSerial;
+    pd.sampleBufferAttachments[0].sampleBuffer = g_prof_buf12;
+    pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = (NSUInteger)k;
+    pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = (NSUInteger)k + 1;
+    return [cb computeCommandEncoderWithDescriptor:pd];
+}
+static void prof_render_pass12(MTLRenderPassDescriptor *descriptor, id<MTLDevice> mtl) {
+    int k = prof_begin12(mtl, 'R');
+    if (k < 0) return;
+    descriptor.sampleBufferAttachments[0].sampleBuffer = g_prof_buf12;
+    descriptor.sampleBufferAttachments[0].startOfVertexSampleIndex = (NSUInteger)k;
+    descriptor.sampleBufferAttachments[0].endOfVertexSampleIndex = MTLCounterDontSample;
+    descriptor.sampleBufferAttachments[0].startOfFragmentSampleIndex = MTLCounterDontSample;
+    descriptor.sampleBufferAttachments[0].endOfFragmentSampleIndex = (NSUInteger)k + 1;
+}
+static void prof_present12(id<MTLDevice> mtl) {
+    const char *dir = gpu_profile_dir12();
+    if (!dir) return;
+    if (g_prof_armed12) {
+        g_prof_armed12 = 0;
+        int n = g_prof_next12, frame = g_prof_frame12;
+        id<MTLCounterSampleBuffer> buf = g_prof_buf12;
+        MTLTimestamp c0, g0, c1, g1;
+        [mtl sampleTimestamps:&c0 gpuTimestamp:&g0];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            MTLTimestamp cc1, gg1;
+            [mtl sampleTimestamps:&cc1 gpuTimestamp:&gg1];
+            double ns_per_tick = gg1 > g0 ? (double)(cc1 - c0) / (double)(gg1 - g0) : 1.0;
+            NSData *data = [buf resolveCounterRange:NSMakeRange(0, (NSUInteger)n)];
+            const MTLCounterResultTimestamp *t = data.bytes;
+            struct { double ms, start; int k; } rows[2048];
+            int m = 0;
+            double total = 0;
+            uint64_t first = UINT64_MAX;
+            for (int k = 0; k + 1 < n && data; k += 2)
+                if (t[k].timestamp && t[k].timestamp != MTLCounterErrorValue && t[k].timestamp < first) first = t[k].timestamp;
+            for (int k = 0; k + 1 < n && data && m < 2048; k += 2) {
+                uint64_t a = t[k].timestamp, b = t[k + 1].timestamp;
+                if (!a || !b || a == MTLCounterErrorValue || b == MTLCounterErrorValue || b < a) continue;
+                rows[m].ms = (double)(b - a) * ns_per_tick / 1e6; rows[m].start = (double)(a - first) * ns_per_tick / 1e6;
+                rows[m].k = k / 2; total += rows[m].ms; m++;
+            }
+            // (the timeline, in start order: a file next to the trigger)
+            char tl[1024];
+            snprintf(tl, sizeof tl, "%s/timeline-%d.txt", gpu_profile_dir12(), frame);
+            FILE *tf = fopen(tl, "w");
+            if (tf) {
+                for (int i = 0; i < m; i++) for (int j = i + 1; j < m; j++) if (rows[j].start < rows[i].start) { __typeof__(rows[0]) x = rows[i]; rows[i] = rows[j]; rows[j] = x; }
+                for (int i = 0; i < m; i++) fprintf(tf, "%9.3f %8.3f %s\n", rows[i].start, rows[i].ms, g_prof_label12[rows[i].k] ? g_prof_label12[rows[i].k] : "?");
+                fclose(tf);
+            }
+            for (int i = 0; i < m; i++) for (int j = i + 1; j < m; j++) if (rows[j].ms > rows[i].ms) { __typeof__(rows[0]) x = rows[i]; rows[i] = rows[j]; rows[j] = x; }
+            vx_log("D3D12: GPU profile %d: %d encoders timed, %.1f ms in all (encoders may overlap)", frame, m, total);
+            for (int i = 0; i < m && i < 40; i++)
+                vx_log("D3D12: GPU profile %d: %6.2f ms %s", frame, rows[i].ms, g_prof_label12[rows[i].k] ? g_prof_label12[rows[i].k] : "?");
+            for (int i = 0; i < 2048; i++) { free(g_prof_label12[i]); g_prof_label12[i] = NULL; }
+        });
+        (void)c1; (void)g1;
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof path, "%s/prof", dir);
+    if (access(path, F_OK)) return;
+    unlink(path);
+    if (!g_prof_buf12) {
+        id<MTLCounterSet> ts = nil;
+        for (id<MTLCounterSet> cs in mtl.counterSets) if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = cs;
+        if (!ts || ![mtl supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) { vx_log("D3D12: no GPU timestamps at stage boundaries"); return; }
+        MTLCounterSampleBufferDescriptor *sd = [MTLCounterSampleBufferDescriptor new];
+        sd.counterSet = ts; sd.storageMode = MTLStorageModeShared; sd.sampleCount = 4096;
+        NSError *err = nil;
+        g_prof_buf12 = [mtl newCounterSampleBufferWithDescriptor:sd error:&err];
+        if (!g_prof_buf12) { vx_log("D3D12: GPU profile: %s", err.localizedDescription.UTF8String); return; }
+    }
+    g_prof_next12 = 0;
+    g_prof_frame12++;
+    g_prof_armed12 = 1;
+    vx_log("D3D12: GPU profile %d: timing the next frame's encoders", g_prof_frame12);
+}
 static void close_pass(dev12 *d, gfx_state *g, id<MTLCommandBuffer> cb, id<MTLRenderCommandEncoder> __strong *re) {
     if (!*re) return;
     [*re endEncoding];
@@ -8771,6 +8909,7 @@ static int open_render_pass12(dev12 *device, gfx_state *g, id<MTLCommandBuffer> 
         memset(g->pass_vis.contents, 0, g->pass_vis.length);
         descriptor.visibilityResultBuffer = g->pass_vis;
     }
+    prof_render_pass12(descriptor, device->mtl);
     *render_encoder = [command_buffer renderCommandEncoderWithDescriptor:descriptor];
     if (!*render_encoder) { g->pass_heap = NULL; g->pass_vis = nil; return 0; }
     pass_dump_opened12(descriptor);
@@ -9170,7 +9309,7 @@ static int d3d12_gpu_ir_dispatch(void *opaque, const gpu_ir_pipeline *pipeline,
     if (*be) { [*be endEncoding]; *be = nil; }
     close_pass(device, g, cb, re);
     if (!*ce) {
-        *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        *ce = new_compute12(cb);
         // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
         use_resident_compute12(*ce, resident, context->resource_heap);
     }
@@ -9239,10 +9378,18 @@ static int d3d12_gpu_ir_dispatch_indirect(void *opaque, const gpu_ir_pipeline *p
     if (!argument_buffer || !metal_pipeline || argument_offset > argument_buffer.length ||
         12 > argument_buffer.length - argument_offset) return GPU_IR_INVALID;
 
+    id<MTLBuffer> traced_args = nil;
+    if (getenv("VXRT_D3D12_TRACE_INDIRECT")) {                    // (the arguments as the dispatch reads them)
+        if (*ce) { [*ce endEncoding]; *ce = nil; }
+        close_pass(device, g, cb, re);
+        if (!*be) *be = [cb blitCommandEncoder];
+        traced_args = [device->mtl newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        [*be copyFromBuffer:argument_buffer sourceOffset:(NSUInteger)argument_offset toBuffer:traced_args destinationOffset:0 size:12];
+    }
     if (*be) { [*be endEncoding]; *be = nil; }
     close_pass(device, g, cb, re);
     if (!*ce) {
-        *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        *ce = new_compute12(cb);
         // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
         use_resident_compute12(*ce, resident, context->resource_heap);
     }
@@ -9258,6 +9405,26 @@ static int d3d12_gpu_ir_dispatch_indirect(void *opaque, const gpu_ir_pipeline *p
                context->sampler_heap, context->scratch_buffer, root, &words);
     [*ce setBytes:root length:8 * words atIndex:0];
     if (context->scratch_buffer->buf) [*ce useResource:context->scratch_buffer->buf usage:MTLResourceUsageRead];
+    if (getenv("VXRT_D3D12_TRACE_INDIRECT")) {                    // (the sizes the GPU chose, read once it is done)
+        id<MTLBuffer> ab = traced_args ? traced_args : argument_buffer;
+        uint64_t off = traced_args ? 0 : argument_offset, hash = api_pipeline->cs_code;
+        uint32_t tg0 = info->threadgroup_size[0], tg1 = info->threadgroup_size[1], tg2 = info->threadgroup_size[2];
+        [(__bridge id<MTLCommandBuffer>)context->command_buffer addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)done;
+            static uint64_t hs[256]; static int cnt[256], nh;
+            static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+            const uint32_t *w = ab.contents ? (const uint32_t *)((const uint8_t *)ab.contents + off) : NULL;
+            int show = 0;
+            pthread_mutex_lock(&m);
+            int k = 0;
+            while (k < nh && hs[k] != hash) k++;
+            if (k == nh && nh < 256) { hs[nh] = hash; cnt[nh] = 0; nh++; }
+            if (k < 256 && cnt[k]++ % 50 == 0) show = 1;
+            pthread_mutex_unlock(&m);
+            if (w && show)
+                vx_log("D3D12: indirect dispatch of cs %016llx: %u x %u x %u groups of %u x %u x %u", (unsigned long long)hash, w[0], w[1], w[2], tg0, tg1, tg2);
+        }];
+    }
     [*ce dispatchThreadgroupsWithIndirectBuffer:argument_buffer indirectBufferOffset:(NSUInteger)argument_offset
                          threadsPerThreadgroup:MTLSizeMake(info->threadgroup_size[0], info->threadgroup_size[1],
                                                             info->threadgroup_size[2])];
@@ -9496,7 +9663,7 @@ static void gs12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTLCo
     if (*be) { [*be endEncoding]; *be = nil; }
     close_pass(d, g, cb, re);
     if (!*ce) {
-        *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        *ce = new_compute12(cb);
         use_resident_compute12(*ce, resident, heap);
         heap_textures_compute12(*ce, heap, 1);
     }
@@ -9586,7 +9753,7 @@ static void tess12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTL
     if (*be) { [*be endEncoding]; *be = nil; }
     close_pass(d, g, cb, re);
     if (!*ce) {
-        *ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        *ce = new_compute12(cb);
         use_resident_compute12(*ce, resident, heap);
         heap_textures_compute12(*ce, heap, 1);
     }
@@ -9794,7 +9961,7 @@ static int d3d12_gpu_ir_dispatch_indirect_range(void *opaque, const gpu_ir_pipel
     close_pass(device, context->graphics_state, command_buffer, render_encoder);
     if (*blit_encoder) { [*blit_encoder endEncoding]; *blit_encoder = nil; }
     if (!*compute_encoder) {
-        *compute_encoder = [command_buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        *compute_encoder = new_compute12(command_buffer);
         // Descriptor-table resources are accessed indirectly, so keep the complete visible set resident.
         use_resident_compute12(*compute_encoder, resident, context->resource_heap);
         heap_textures_compute12(*compute_encoder, context->resource_heap, 1);   // (indirect: as before)
@@ -9828,6 +9995,12 @@ static int d3d12_gpu_ir_dispatch_indirect_range(void *opaque, const gpu_ir_pipel
     [*compute_encoder setComputePipelineState:metal_pipeline];
     [*compute_encoder setBytes:root length:8 * words atIndex:0];
     [*compute_encoder useResource:scratch_buffer->buf usage:MTLResourceUsageRead];
+    if (getenv("VXRT_D3D12_TRACE_INDIRECT")) {
+        static volatile int told;
+        if (__sync_add_and_fetch(&told, 1) <= 60)
+            vx_log("D3D12: indirect dispatch range of cs %016llx: up to %u records, stride %u", (unsigned long long)api_pipeline->cs_code,
+                   dispatch->dispatch_count, dispatch->stride);
+    }
     for (uint32_t i = 0; i < dispatch->dispatch_count; i++) {
         NSUInteger offset = output_offset + (NSUInteger)i * 12;
         [*compute_encoder dispatchThreadgroupsWithIndirectBuffer:scratch_buffer->buf indirectBufferOffset:offset
@@ -9887,7 +10060,7 @@ static int d3d12_gpu_ir_draw_indirect(void *opaque, const gpu_ir_pipeline *pipel
         close_pass(device, context->graphics_state, command_buffer, render_encoder);
         if (*blit_encoder) { [*blit_encoder endEncoding]; *blit_encoder = nil; }
         if (!*compute_encoder)
-            *compute_encoder = [command_buffer computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+            *compute_encoder = new_compute12(command_buffer);
         if (!*compute_encoder) return GPU_IR_UNSUPPORTED;
         [*compute_encoder useResource:argument_buffer usage:MTLResourceUsageRead];
         [*compute_encoder useResource:count_buffer usage:MTLResourceUsageRead];
@@ -10410,7 +10583,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 break;
             }
             if (be) { [be endEncoding]; be = nil; }
-            if (!ce) ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+            if (!ce) ce = new_compute12(cb);
             if (!ce || !d3d12_clear_uav_encode12(d, cb, &ce, c, heap)) {
                 vx_log("D3D12: could not execute ClearUnorderedAccessView%s", c->a ? "Float" : "Uint");
                 replay_failed = 1;
@@ -10436,10 +10609,12 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
         case C_DRAW: case C_DRAW_INDEXED: {
             if (!pso || !pso->render) { vx_log("D3D12: a draw without a graphics pipeline state"); break; }
             if (pso->gs_kernel) {
+                cb_log12('G', pso->ps_code, 0, 0, 0);
                 gs12_draw(d, g, pso, c, cb, &ce, &be, &re, resident, heap, sheap, graphics, sc);
                 break;
             }
             if (pso->hs_kernel) {
+                cb_log12('T', pso->ps_code, 0, 0, 0);
                 tess12_draw(d, g, pso, c, cb, &ce, &be, &re, resident, heap, sheap, graphics, sc);
                 break;
             }
@@ -10498,6 +10673,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             break;
         }
         case C_DISPATCH: {
+            if (g_prof_armed12 && ce) { [ce endEncoding]; ce = nil; }   // (GPU profile: a compute encoder per dispatch)
             if (!pso || !pso->compute) { vx_log("D3D12: Dispatch without a compute pipeline state"); break; }
             cb_log12('c', pso->cs_code, c->a, c->b, c->c);
             int mapping_result = d3d12_shader_component_mapping_read12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
@@ -10558,7 +10734,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             if (be) { [be endEncoding]; be = nil; }
             close_pass(d, g, cb, &re);
             if (!ce) {
-                ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+                ce = new_compute12(cb);
                 // (what the shaders reach through pointers and argument buffers must be resident: every resource
                 //  of the device, and the texture views the bound heaps' descriptors name)
                 use_resident_compute12(ce, resident, heap);
@@ -10590,7 +10766,9 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             break;
         }
         case C_EXECUTE_INDIRECT: {
+            if (g_prof_armed12 && ce) { [ce endEncoding]; ce = nil; }   // (GPU profile: a compute encoder per dispatch)
             command_signature12 *sig = c->obj;
+            cb_log12(sig && sig->gfx ? 'I' : 'i', pso ? (sig && sig->gfx ? pso->ps_code : pso->cs_code) : 0, c->a, 0, 0);
             res12 *arg_buffer = c->obj2, *count_buffer = c->obj3;
             if (!sig) { vx_log("D3D12: ExecuteIndirect has no command signature"); break; }
             if (sig->gfx && pso && pso->gs_kernel) {
@@ -10600,6 +10778,17 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             }
             root_binding *indirect_root = sig->gfx ? graphics : compute;
             uint32_t indirect_count = c->a;
+            if (getenv("VXRT_D3D12_TRACE_INDIRECT")) {
+                static uint64_t seen[256]; static int nseen;
+                uint64_t key = (pso ? pso->cs_code ^ pso->ps_code : 0) ^ ((uint64_t)c->a << 1) ^ (count_buffer ? 1 : 0);
+                int dup = 0;
+                for (int k = 0; k < nseen; k++) if (seen[k] == key) dup = 1;
+                if (!dup && nseen < 256) seen[nseen++] = key;
+                if (!dup)
+                    vx_log("D3D12: ExecuteIndirect %s of %016llx: max %u, count buffer %d, signature %u args (first type %d), payload %u, root %d, recorded %d",
+                           sig->gfx ? "draw" : "dispatch", pso ? (unsigned long long)(sig->gfx ? pso->ps_code : pso->cs_code) : 0ull, c->a,
+                           count_buffer != NULL, sig->count, sig->count ? sig->args[0].type : -1, sig->payload_size, sig->root != NULL, c->gpu_ir_recorded);
+            }
             if (!sig || !arg_buffer || !arg_buffer->buffer ||
                 (sig->root && indirect_root->rs != sig->root)) {
                 vx_log("D3D12: ExecuteIndirect has an invalid command signature, argument buffer, or root signature");
@@ -11622,7 +11811,13 @@ static void queue_execute_(void *this, uint32_t n, void *const *lists) {
             continue;
         }
         id<MTLCommandBuffer> cb;
-        if (gpu_errors12()) {
+        // Command buffers report encoder status (MTLCommandBufferErrorOptionEncoderExecutionStatus): without it,
+        // Cyberpunk 2077's intro faulted the GPU ("Insufficient Memory", every later submission ignored) in 4 of 5
+        // runs, with it in none of 11 - the driver keeps the encoders of such a command buffer apart. The cause behind
+        // is not found yet. VXRT_D3D12_ENCODER_STATUS=0 turns it off.
+        static int status_only = -1;
+        if (status_only < 0) { const char *e = getenv("VXRT_D3D12_ENCODER_STATUS"); status_only = !(e && *e == '0'); }
+        if (gpu_errors12() || status_only) {
             MTLCommandBufferDescriptor *cd = [MTLCommandBufferDescriptor new];
             cd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
             cb = [q->mtl_queue commandBufferWithDescriptor:cd];
@@ -12125,6 +12320,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     frame_stats_present12(sc->presents);
     pass_dump_present12();
     watch_present12(sc->presents);
+    prof_present12(sc->dev->mtl);
     return S_OK;
 }
 static WINAPI HRESULT swap_present1(void *this, uint32_t sync, uint32_t flags, const void *params) { return swap_present(this, sync, flags); }
