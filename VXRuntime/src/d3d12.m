@@ -6883,6 +6883,7 @@ static WINAPI void list_discard_resource(void *this, void *resource, const void 
     if (!r || !r->texture || !(r->desc.Flags & 0x3)) return;     // ALLOW_RENDER_TARGET, ALLOW_DEPTH_STENCIL
     if (r->texture.textureType == MTLTextureType3D) return;
     cmd12 *c = rec(this, C_DISCARD);
+    d3d_addref(&r->base);                                         // (the list's reference: list_clear releases it)
     c->obj = r;
 }
 // Predication: the draws and dispatches it would skip still run (the result is the same unless a program counts on
