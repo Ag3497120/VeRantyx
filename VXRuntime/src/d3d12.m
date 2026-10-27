@@ -444,6 +444,10 @@ typedef struct {
     float recording_blend_factor[4];
     VBV recording_vertex_buffers[16];
     IBV recording_index_buffer;
+    // the buffers vertex and index views found (base GPU address, length, the buffer, retained) while recording:
+    // the device's registry, behind its lock, only on a miss (a recording list's buffers stay alive)
+    struct { uint64_t base, len; gpu_ir_resource *buffer; } vb_cache[8];
+    uint32_t vb_cache_next;
     gpu_ir_stream gpu_ir;
     int closed;
     int32_t validation_error;
@@ -2627,6 +2631,7 @@ typedef struct { uint64_t va, res; uint32_t size, stride, fmt, flags; } VxDesc; 
 static pthread_mutex_t g_heaps_lock = PTHREAD_MUTEX_INITIALIZER;
 static heap12 *g_heaps[4096];
 static uint32_t g_nheaps;
+static uint64_t g_heaps_gen12 = 1;                         // (changes with every heap added or removed)
 
 // Sets the Metal object a descriptor stands for, keeping the heap's set of textures.
 // What a shader-visible descriptor held (a texture view, a sampler state) stays alive until the GPU has finished what
@@ -2651,6 +2656,7 @@ static void grave_settle12(dev12 *d) {
         [g_grave_bins12 addObject:@[ g_grave_open12, [NSData dataWithBytes:at length:sizeof at] ]];
         g_grave_open12 = [NSMutableArray new];
     }
+    NSMutableArray *gone = nil;                                    // (released after the lock: a bin can hold thousands)
     while (g_grave_bins12.count) {
         const uint64_t *at = ((NSData *)g_grave_bins12[0][1]).bytes;
         int passed = 1;
@@ -2659,16 +2665,25 @@ static void grave_settle12(dev12 *d) {
             if (q && q->timeline && q->timeline.signaledValue < at[i]) passed = 0;
         }
         if (!passed) break;
+        if (!gone) gone = [NSMutableArray new];
+        [gone addObject:g_grave_bins12[0]];
         [g_grave_bins12 removeObjectAtIndex:0];
     }
     pthread_mutex_unlock(&g_grave_lock12);
+    gone = nil;
+}
+static int g_residency_set_active12;
+static int no_heap_use12(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VXRT_D3D12_HEAP_USE"); v = !(e && *e == '1'); }
+    return v && g_residency_set_active12;
 }
 static void heap_keep12(heap12 *h, uint32_t i, id object) {
     id old = h->keep[i];
     if (old == object) return;
     h->keep[i] = object;
     if (old && h->gpu) grave_bury12(h->dev, old);
-    if (!h->textures) return;
+    if (!h->textures || no_heap_use12()) return;                   // (the heap's textures are never declared)
     int old_texture = old && [old conformsToProtocol:@protocol(MTLTexture)];
     int new_texture = object && [object conformsToProtocol:@protocol(MTLTexture)];
     if (!old_texture && !new_texture) return;
@@ -2736,12 +2751,6 @@ static void use_resident_compute12(id<MTLComputeCommandEncoder> ce, NSArray *res
 // With the device's residency set holding every texture's memory, the heap's textures are not declared at all (a
 // declaration of thousands per encoder cost Cyberpunk 2077's first scene 100 ms a frame on the CPU, and as much in
 // Metal's submission); VXRT_D3D12_HEAP_USE=1 declares them as before.
-static int g_residency_set_active12;
-static int no_heap_use12(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("VXRT_D3D12_HEAP_USE"); v = !(e && *e == '1'); }
-    return v && g_residency_set_active12;
-}
 static void heap_textures_compute12(id<MTLComputeCommandEncoder> ce, heap12 *heap, int wide) {
     if (!ce || !wide || t_ce_heap_serial12 == t_ce_serial12 || no_heap_use12()) return;
     use_list_compute12(ce, heap_textures12(heap));
@@ -2758,6 +2767,7 @@ static void heap_destroy(d3d_object *o) {
     }
     pthread_mutex_lock(&g_heaps_lock);
     for (uint32_t i = 0; i < g_nheaps; i++) if (g_heaps[i] == h) { g_heaps[i] = g_heaps[--g_nheaps]; break; }
+    __atomic_add_fetch(&g_heaps_gen12, 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_heaps_lock);
     h->textures = nil;
     h->texture_list = nil;
@@ -2782,14 +2792,31 @@ static void heap_destroy(d3d_object *o) {
 }
 
 // The heap and descriptor index of a CPU descriptor handle.
+// (each thread keeps the last heaps it found, good while no heap has come or gone since: no lock, no search)
+static __thread struct { uint64_t gen; size_t lo, hi; heap12 *h; } t_heap_at12[4];
+static __thread uint32_t t_heap_at_next12;
 static heap12 *heap_at(size_t cpu, uint32_t *index) {
+    uint64_t gen = __atomic_load_n(&g_heaps_gen12, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < 4; i++)
+        if (t_heap_at12[i].gen == gen && cpu >= t_heap_at12[i].lo && cpu < t_heap_at12[i].hi) {
+            *index = (uint32_t)((cpu - t_heap_at12[i].lo) / 32);
+            return t_heap_at12[i].h;
+        }
     pthread_mutex_lock(&g_heaps_lock);
+    gen = g_heaps_gen12;
     heap12 *found = NULL;
     for (uint32_t i = 0; i < g_nheaps; i++) {
         heap12 *h = g_heaps[i];
         if (cpu >= (size_t)h->cpu && cpu < (size_t)h->cpu + 32 * (size_t)h->desc.NumDescriptors) { found = h; *index = (uint32_t)((cpu - (size_t)h->cpu) / 32); break; }
     }
     pthread_mutex_unlock(&g_heaps_lock);
+    if (found) {
+        uint32_t k = t_heap_at_next12++ & 3;
+        t_heap_at12[k].gen = gen;
+        t_heap_at12[k].lo = (size_t)found->cpu;
+        t_heap_at12[k].hi = (size_t)found->cpu + 32 * (size_t)found->desc.NumDescriptors;
+        t_heap_at12[k].h = found;
+    }
     return found;
 }
 
@@ -3909,6 +3936,8 @@ static void list_allocator_stop_recording12(list12 *list) {
     list->allocator_recording = 0;
 }
 static void list_clear(list12 *l) {
+    for (uint32_t i = 0; i < 8; i++) if (l->vb_cache[i].buffer) gpu_ir_resource_release(l->vb_cache[i].buffer);
+    memset(l->vb_cache, 0, sizeof l->vb_cache);
     for (uint32_t i = 0; i < l->n; i++) {
         cmd12 *c = &l->cmds[i];
         free(c->rects);
@@ -6495,17 +6524,33 @@ static WINAPI void list_ib(void *this, const IBV *view) {
 static gpu_ir_resource *list_capture_gpu_buffer12(list12 *list, uint64_t va, uint32_t size,
                                                    uint64_t *offset) {
     if (!list || !va || !size || !offset) return NULL;
+    for (uint32_t i = 0; i < 8; i++) {
+        __typeof__(list->vb_cache[0]) *e = &list->vb_cache[i];
+        if (e->buffer && va >= e->base && va - e->base <= e->len && size <= e->len - (va - e->base)) {
+            *offset = va - e->base;
+            gpu_ir_resource_retain(e->buffer);
+            return e->buffer;
+        }
+    }
     dev12 *device = list->dev;
     pthread_mutex_lock(&device->lock);
     res12 *resource = state_resource_for_gpu_range_locked12(device, va, size);
     gpu_ir_resource *buffer = resource ? resource->gpu_buffer : NULL;
+    uint64_t base = 0;
     if (buffer) {
-        *offset = va - resource->buffer.gpuAddress;
+        base = resource->buffer.gpuAddress;
+        *offset = va - base;
         if (*offset > gpu_ir_buffer_size(buffer) || size > gpu_ir_buffer_size(buffer) - *offset)
             buffer = NULL;
         else gpu_ir_resource_retain(buffer);
     }
     pthread_mutex_unlock(&device->lock);
+    if (buffer) {
+        __typeof__(list->vb_cache[0]) *e = &list->vb_cache[list->vb_cache_next++ & 7];
+        if (e->buffer) gpu_ir_resource_release(e->buffer);
+        gpu_ir_resource_retain(buffer);
+        *e = (__typeof__(*e)){ base, gpu_ir_buffer_size(buffer), buffer };
+    }
     return buffer;
 }
 
@@ -12163,7 +12208,7 @@ static WINAPI HRESULT dev_create_heap(void *this, const HEAP_DESC *desc, const G
     }
     pthread_mutex_lock(&g_heaps_lock);
     int registered = g_nheaps < 4096;
-    if (registered) g_heaps[g_nheaps++] = h;
+    if (registered) { g_heaps[g_nheaps++] = h; __atomic_add_fetch(&g_heaps_gen12, 1, __ATOMIC_RELEASE); }
     pthread_mutex_unlock(&g_heaps_lock);
     if (!registered) { d3d_release(&h->base); return E_OUTOFMEMORY; }
     HRESULT hr = heap_query(h, iid, out);

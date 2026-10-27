@@ -71,6 +71,9 @@ typedef struct {
     int *idom, *ipdom, *rpo_index, *loop_header_of, *loop_exit;
     uint8_t *tail;                         // (small blocks that return: copied into each place that jumps to them)
     uint8_t *emitted;
+    uint32_t *npred;            // predecessors of each block
+    int *flag;                  // a block reached from several arms of a branch: its flag while the arms are emitted, else -1
+    uint32_t nflags;
     uint32_t *loops;            // innermost loop stack while emitting: header blocks
     uint32_t nloops;
     char views[64][32];
@@ -2664,6 +2667,16 @@ static int dominates(tr *t, uint32_t a, uint32_t b) {
 
 static int in_loop(tr *t, uint32_t header, uint32_t b);
 
+// Where every path from a and from b meets (their nearest common post-dominator), -1 if only at the exit.
+static int common_pdom(tr *t, int a, int b) {
+    uint8_t *on = calloc(t->nb + 1, 1);
+    for (int x = a, n = 0; x >= 0 && x < (int)t->nb && n <= (int)t->nb; x = t->ipdom[x], n++) { on[x] = 1; if (t->ipdom[x] == x) break; }
+    int meet = -1;
+    for (int x = b, n = 0; x >= 0 && x < (int)t->nb && n <= (int)t->nb; x = t->ipdom[x], n++) { if (on[x]) { meet = x; break; } if (t->ipdom[x] == x) break; }
+    free(on);
+    return meet;
+}
+
 // Natural loops: a back edge u -> h (h dominates u). Each header's exit: the one block outside the loop that a block
 // inside branches to (DXC's structured loops have one); none or several: not structurable here.
 static int find_loops(tr *t) {
@@ -2680,7 +2693,16 @@ static int find_loops(tr *t) {
             uint32_t s[64], k = nsucc(t, b, s);
             for (uint32_t i = 0; i < k; i++) {
                 if (in_loop(t, h, s[i]) || t->tail[s[i]]) continue;  // (a return tail: a return, not an exit)
-                if (exit >= 0 && exit != (int)s[i]) { if (getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: loop %u exits %d and %u\n", h, exit, s[i]); return 0; }      // (several exits)
+                if (exit >= 0 && exit != (int)s[i]) {
+                    // several exits: the loop ends where they all meet (each other exit is emitted inside, then break)
+                    int meet = common_pdom(t, exit, (int)s[i]);
+                    if (meet < 0 || getenv("DXIL_NO_MULTI_EXIT")) {
+                        if (getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: loop %u exits %d and %u\n", h, exit, s[i]);
+                        return 0;
+                    }
+                    exit = meet;
+                    continue;
+                }
                 exit = (int)s[i];
             }
         }
@@ -2724,6 +2746,7 @@ static int emit_edge(tr *t, uint32_t from, uint32_t to, int stop) {
             if (to == t->loops[i] || (int)to == t->loop_exit[t->loops[i]]) { if (getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: %u->%u leaves outer loop\n", from, to); return -1; }
     }
     if ((int)to == stop) return 0;
+    if (t->flag[to] >= 0) { line(t, "vx_f%d = true;", t->flag[to]); return 0; }
     return emit_region(t, to, stop);
 }
 
@@ -2732,6 +2755,7 @@ static int emit_region(tr *t, uint32_t b, int stop) {
     while (!t->failed) {
         if ((int)b == stop) return 0;
         if (b >= t->nb) return -1;
+        if (t->flag[b] >= 0) { line(t, "vx_f%d = true;", t->flag[b]); return 0; }   // (a join the branch emits later)
         int header = t->loop_header_of[b] == (int)b;
         int open = 0;
         for (uint32_t i = 0; i < t->nloops; i++) if (t->loops[i] == b) open = 1;
@@ -2761,6 +2785,28 @@ static int emit_region(tr *t, uint32_t b, int stop) {
         if (merge == (int)t->nb) merge = -1;                       // (they meet only at the exit: each arm returns)
         if (t->nloops && merge >= 0 && !in_loop(t, t->loops[t->nloops - 1], (uint32_t)merge)) merge = -1;   // (they meet past the loop)
         int stop_here = merge >= 0 ? merge : stop;
+        // Blocks between here and the merge that several arms reach (a condition of && and ||: if (a || b && c) X;):
+        // the arms set a flag where they would go to one, and each is emitted once after them, under its flag.
+        uint32_t joins[16], njoins = 0;
+        if (merge >= 0 && !getenv("DXIL_NO_JOINS"))
+            for (uint32_t x = 0; x < t->nb && njoins < 16; x++) {
+                if ((int)x == merge || x == b || t->npred[x] < 2 || t->emitted[x] || t->flag[x] >= 0 || t->ipdom[x] != merge) continue;
+                if (t->loop_header_of[x] == (int)x || !dominates(t, b, x)) continue;
+                if (t->nloops && !in_loop(t, t->loops[t->nloops - 1], x)) continue;
+                int inner = 0;                                     // (not inside a loop the branch is outside of)
+                for (uint32_t h = 0; h < t->nb && !inner; h++)
+                    if (t->loop_header_of[h] == (int)h && in_loop(t, h, x) && !in_loop(t, h, b)) inner = 1;
+                if (inner) continue;
+                joins[njoins++] = x;
+            }
+        for (uint32_t i = 1; i < njoins; i++)                      // (in reverse post order: a join may lead to a later one)
+            for (uint32_t j = i; j > 0 && t->rpo_index[joins[j]] < t->rpo_index[joins[j - 1]]; j--) {
+                uint32_t k = joins[j]; joins[j] = joins[j - 1]; joins[j - 1] = k;
+            }
+        for (uint32_t i = 0; i < njoins; i++) {
+            t->flag[joins[i]] = (int)t->nflags++;
+            line(t, "bool vx_f%d = false;", t->flag[joins[i]]);
+        }
         char c[96];
         if (in->op == DXI_BR) {
             ref(t, in->ops[2], c, sizeof c);
@@ -2802,6 +2848,16 @@ static int emit_region(tr *t, uint32_t b, int stop) {
             if (emit_edge(t, b, in->ops[1], stop_here)) return -1;
             t->indent -= !first;
             if (!first) line(t, "}");
+        }
+        for (uint32_t i = 0; i < njoins; i++) {
+            uint32_t x = joins[i];
+            int f = t->flag[x];
+            t->flag[x] = -1;
+            line(t, "if (vx_f%d) {", f);
+            t->indent++;
+            if (emit_region(t, x, merge)) return -1;
+            t->indent--;
+            line(t, "}");
         }
         if (merge < 0) return 0;                                   // (nothing after: the arms ended the region)
         b = (uint32_t)merge;
@@ -3167,6 +3223,13 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
     t.loop_exit = calloc(t.nb + 1, sizeof(int));
     t.emitted = calloc(t.nb + 1, 1);
     t.loops = calloc(t.nb + 1, sizeof(uint32_t));
+    t.npred = calloc(t.nb + 1, sizeof *t.npred);
+    t.flag = malloc((t.nb + 1) * sizeof *t.flag);
+    for (uint32_t b = 0; b <= t.nb; b++) t.flag[b] = -1;
+    for (uint32_t b = 0; b < t.nb; b++) {
+        uint32_t s[64], k = nsucc(&t, b, s);
+        for (uint32_t i = 0; i < k; i++) if (s[i] < t.nb) t.npred[s[i]]++;
+    }
     t.tail = calloc(t.nb + 1, 1);
     if (!getenv("DXIL_NO_TAILS"))
         for (uint32_t b = 0; b < t.nb; b++) {
@@ -3182,6 +3245,7 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
         free(t.body.s);
         memset(&t.body, 0, sizeof t.body);
         memset(t.emitted, 0, t.nb);
+        for (uint32_t b = 0; b <= t.nb; b++) t.flag[b] = -1;
         t.nloops = 0;
         t.indent = 1;
         emit_machine(&t);
@@ -3370,7 +3434,7 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
 done:
     free(t.body.s); free(t.decls.s); free(t.prelude.s); free(t.types.s);
     free(t.handles); free(t.is_handle); free(t.ptr_space); free(t.declared_types);
-    free(t.term); free(t.first); free(t.idom); free(t.ipdom); free(t.tail); free(t.rpo_index); free(t.loop_header_of); free(t.loop_exit); free(t.emitted); free(t.loops);
+    free(t.term); free(t.first); free(t.idom); free(t.ipdom); free(t.tail); free(t.npred); free(t.flag); free(t.rpo_index); free(t.loop_header_of); free(t.loop_exit); free(t.emitted); free(t.loops);
     if (t.failed || !out->msl || (mode == 2 && !out->msl_passthrough)) {
         if (!out->error[0]) snprintf(out->error, sizeof out->error, "translation failed");
         free(out->msl); out->msl = NULL;
