@@ -7960,6 +7960,8 @@ static int gpu_ir_descriptor_value_for_slot12(dev12 *device, const rootsig12 *ro
 static int gpu_ir_snapshot_root_bindings12_ex(dev12 *device, const dxil_msl *shader, uint32_t stage,
     root_binding *root_binding, heap12 *resource_heap, heap12 *sampler_heap,
     gpu_ir_descriptor_state **out_state, int bounded_only);
+// (set: the next snapshot on this thread hands over its values, the caller discards each and frees the array)
+static __thread gpu_ir_descriptor_values12 *t_raw_values12;
 static int gpu_ir_snapshot_root_bindings12(dev12 *device, const dxil_msl *shader, uint32_t stage,
     root_binding *root_binding, heap12 *resource_heap, heap12 *sampler_heap,
     gpu_ir_descriptor_state **out_state) {
@@ -8043,6 +8045,10 @@ static int gpu_ir_snapshot_root_bindings12_ex(dev12 *device, const dxil_msl *sha
         if (result != GPU_IR_OK) break;
     }
     int state_created = 0;
+    if (result == GPU_IR_OK && t_raw_values12) {                   // (the values themselves: no state made)
+        *t_raw_values12 = values;
+        return result;
+    }
     if (result == GPU_IR_OK) {
         gpu_ir_descriptor_state_desc desc = { .values = values.values, .value_count = values.count };
         *out_state = gpu_ir_descriptor_state_create(root_binding->rs->gpu_layout, &desc);
@@ -8140,29 +8146,26 @@ static int gpu_ir_collect_shader_accesses12(dev12 *device, const dxil_msl *shade
         return GPU_IR_INVALID;
 
     gpu_ir_descriptor_state *bindings = NULL;
+    gpu_ir_descriptor_values12 raw = { 0 };
+    t_raw_values12 = &raw;
     int binding_result = gpu_ir_snapshot_root_bindings12_ex(device, shader, stage, root, resource_heap,
                                                             sampler_heap, &bindings, 1);
+    t_raw_values12 = NULL;
     if (binding_result != GPU_IR_OK) return binding_result;
-    for (uint32_t i = 0; i < gpu_ir_descriptor_state_value_count(bindings); i++) {
-        gpu_ir_descriptor_value value;
-        if (gpu_ir_descriptor_state_value_at(bindings, i, &value) != GPU_IR_OK) {
-            gpu_ir_descriptor_state_release(bindings);
-            return GPU_IR_INVALID;
-        }
-        const gpu_ir_resource *resource = value.resource ? value.resource :
-            gpu_ir_buffer_view_resource(value.buffer_view);
-        if (!resource) continue; // samplers and explicit null descriptors do not name resource accesses.
-        int rc = gpu_ir_access_add_resource12(list, (gpu_ir_resource *)resource,
-                                              value.stage_mask, value.access_mask);
-        if (rc == GPU_IR_OK && value.auxiliary_resource)
-            rc = gpu_ir_access_add_resource12(list, value.auxiliary_resource, value.stage_mask,
-                                              value.auxiliary_access_mask);
-        if (rc != GPU_IR_OK) {
-            gpu_ir_descriptor_state_release(bindings);
-            return rc;
-        }
+    int rc = GPU_IR_OK;
+    for (uint32_t i = 0; i < raw.count; i++) {
+        const gpu_ir_descriptor_value *value = &raw.values[i];
+        const gpu_ir_resource *resource = value->resource ? value->resource :
+            gpu_ir_buffer_view_resource(value->buffer_view);
+        if (!resource || rc != GPU_IR_OK) continue; // samplers and explicit null descriptors do not name resource accesses.
+        rc = gpu_ir_access_add_resource12(list, (gpu_ir_resource *)resource, value->stage_mask, value->access_mask);
+        if (rc == GPU_IR_OK && value->auxiliary_resource)
+            rc = gpu_ir_access_add_resource12(list, value->auxiliary_resource, value->stage_mask,
+                                              value->auxiliary_access_mask);
     }
-    gpu_ir_descriptor_state_release(bindings);
+    for (uint32_t i = 0; i < raw.count; i++) gpu_ir_descriptor_value_discard12(&raw.values[i]);
+    free(raw.values);
+    if (rc != GPU_IR_OK) return rc;
 
     // Direct ResourceDescriptorHeap indexing is data-dependent. Match residency/useResource access to the DXIL class.
     // (A game's heap of a million descriptors walked at every draw cost more than the draws: past 4096 descriptors
