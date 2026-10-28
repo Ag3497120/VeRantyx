@@ -22,11 +22,18 @@
 #   (--no-sandbox; Chromium's sandbox could not be in force here anyway, VXRuntime/README.md "Known risks").
 #   -cef-single-process and -cef-in-process-gpu, named in older lists, add nothing in this client.
 # - The web helper's own arguments, which no Steam option sets, come from VXRuntime (VXRT_EXTRA_ARGS,
-#   VXRuntime/src/launchargs.c): --single-process (Chromium's child processes need handles passed between processes,
-#   not there yet) and --disable-software-rasterizer (with the GPU off, Chromium otherwise keeps trying to make GL
-#   contexts for SwiftShader, logs "Failed to create shared context for virtualization", draws nothing and ends
-#   itself; with it, it composites in software through GDI and Steam's sign-in window shows, 2026-10-25).
-#   VXRT_WSTEAM_WEBHELPER_ARGS replaces them (empty: none).
+#   VXRuntime/src/launchargs.c). By default the GPU stays on (no -cef-disable-gpu) and the web helper gets
+#   --single-process (Chromium's child processes need handles passed between processes, not there yet) and
+#   --disable-gpu-compositing: ANGLE on D3D11 rasterizes, GDI composites. This is what the Mac app and
+#   launch_vxrt_nms_vr.sh start it with, and what ran signed in for hours with games (2026-10-25..28).
+#   VXRT_WSTEAM_GPU=0 turns the GPU off (-cef-disable-gpu, and --single-process --disable-software-rasterizer;
+#   without the latter Chromium keeps trying to make GL contexts for SwiftShader, logs "Failed to create shared
+#   context for virtualization", draws nothing and ends itself). Only the sign-in window lives with that: once
+#   signed in, the first raster/GL context Steam's UI asks for (some seconds after steam.exe runs
+#   gldriverquery64.exe / vulkandriverquery64.exe, e.g. around a game launch) ends the web helper with
+#   "FATAL:gles2_cmd_decoder.cc Validating command decoder is not supported" (int3 at libcef.dll+0x691ae98), and
+#   Steam restarts it every ~10 s for ever (2026-10-28).
+#   VXRT_WSTEAM_WEBHELPER_ARGS replaces the web helper arguments (empty: none).
 # - No VXRT_STEAM_BRIDGE (the Mac Steam bridge would stand in for this Steam).
 # - Refuses a Wine prefix: the folder or the root in one, any symbolic link down to three levels in either that leads
 #   into one (that is where VXRuntime and Steam write), and a steam.exe that is itself a symbolic link.
@@ -135,9 +142,10 @@ ROOT="$(physical "$ROOT")"
 [[ ! -e "$ROOT" || -d "$ROOT" ]] || { echo "VXRT_ROOT $ROOT is not a folder." >&2; exit 1; }
 
 STEAM_ARGS=(-cef-disable-sandbox)
-[[ "${VXRT_WSTEAM_GPU:-0}" == 1 ]] || STEAM_ARGS=(-cef-disable-gpu "${STEAM_ARGS[@]}")
+if [[ "${VXRT_WSTEAM_GPU:-1}" == 1 ]]; then DEFAULT_WEBHELPER_ARGS="--single-process --disable-gpu-compositing"
+else STEAM_ARGS=(-cef-disable-gpu "${STEAM_ARGS[@]}"); DEFAULT_WEBHELPER_ARGS="--single-process --disable-software-rasterizer"; fi
 [[ "${VXRT_WSTEAM_SILENT:-0}" == 1 ]] && STEAM_ARGS+=(-silent)
-WEBHELPER_ARGS="${VXRT_WSTEAM_WEBHELPER_ARGS-"--single-process --disable-software-rasterizer"}"
+WEBHELPER_ARGS="${VXRT_WSTEAM_WEBHELPER_ARGS-$DEFAULT_WEBHELPER_ARGS}"
 ENV=("VXRT_ROOT=$ROOT" "VXRT_DEBUG_OUTPUT=1" "VXRT_LOG_TIME=1")
 [[ -n "$WEBHELPER_ARGS" ]] && ENV+=("VXRT_EXTRA_ARGS=steamwebhelper.exe=$WEBHELPER_ARGS${VXRT_EXTRA_ARGS:+;$VXRT_EXTRA_ARGS}")
 if [[ -f "$VXRT_REDIST/manifest.json" ]]; then ENV+=("VXRT_DLL_PATH=$VXRT_REDIST")

@@ -96,6 +96,14 @@ with the account name and password fields, Remember me, Sign In and the QR code 
 which vxrt did not send, so the Mac window kept a title bar and SDL, sizing the window from that client area, took the
 title bar off a second time; `src/user32.c` sends WM_NCCALCSIZE now and such a window has no Mac title bar.)
 
+Signed in, the GPU has to stay on: with `-cef-disable-gpu` and `--disable-software-rasterizer` the first raster/GL
+context Steam's UI asks for (some seconds after `steam.exe` runs `gldriverquery64.exe` / `vulkandriverquery64.exe`,
+e.g. around a game launch) ends the web helper with `FATAL:gles2_cmd_decoder.cc Validating command decoder is not
+supported` (int3 at `libcef.dll+0x691ae98`), and Steam restarts it every ~10 s for ever (2026-10-28). So the launch
+script's default is the GPU on (no `-cef-disable-gpu`) with `--single-process --disable-gpu-compositing`: ANGLE on
+D3D11 rasterizes, GDI composites; the Mac app and `launch_vxrt_nms_vr.sh` start it the same way.
+`VXRT_WSTEAM_GPU=0` gives the GPU-off arguments above.
+
 Input to the sign-in window (2026-10-25, checked through Command Clips on an APFS copy of the root, with made-up text
 only, nobody signed in): clicks land in the child window under the pointer, as Windows hit-tests (here Chromium's
 legacy window, then its widget once it captures the mouse); keys, characters and compositions go to the focus window;
