@@ -2,8 +2,11 @@
 //
 // VXRT_STEREO=1 turns it on (off: nothing here runs). Knobs, read once:
 //   VXRT_STEREO_SEP=2.0      disparity at infinity between the eyes, % of the width (2 % of a 3 m screen ~ the IPD)
-//   VXRT_STEREO_POP=0.4      the largest pop-out (in front of the screen), as a fraction of SEP
-//   VXRT_STEREO_CONV=1.0     the screen plane's distance, relative to the median depth of the picture's centre
+//   VXRT_STEREO_POP=0.4      the pop-out of the depth range's near end (in front of the screen), as a fraction of
+//                            SEP; nearer than that is still linear down to twice it (then clamped: the search range)
+//   VXRT_STEREO_CONV=1.0     the screen plane's distance, relative to where the depth range fit puts it (below)
+//   VXRT_STEREO_NEAR=0.98    the depth range fit: this percentile of the picture's inverse depth (the near end)
+//                            gets the largest pop-out, the screen plane at (1+POP) times its distance
 //   VXRT_STEREO_WINDOW=sbs   what the Mac window shows: sbs (both eyes squeezed side by side), anaglyph (red/cyan),
 //                            left, right, flat (the game's picture)
 //   VXRT_STEREO_STREAM=<file>|1   both eyes side by side (full width each, BGRA8) into the Mac encoder's shared frame
@@ -23,10 +26,13 @@
 //
 // Disparity without the projection matrix: with reversed Z and an infinite far plane d = n/z, so inverse depth is
 // d itself (standard Z: 1 - d, ~n/z for far >> near), and disparity(z) = S * (1 - z_c/z) = S * (1 - d/d_c), d_c the
-// inverse depth on the screen plane (the median of the centre, smoothed over frames). Far: +S (the right eye's
+// inverse depth on the screen plane (from the near end of the picture's depth, smoothed over frames: the nearest 2 %
+// at -POP*S, so the mapping is linear - a clamp inside the scene made a crease in every plane crossing it, and with
+// the median of the centre the screen plane was the far wall of a bar and 36 % of it clamped). Far: +S (the right eye's
 // image to the right: behind the screen), clamped to -POP*S in front.
 //
-// The pass (one command buffer, its GPU time measured): 1. st_conv: d_c (median of 16x16 samples of the centre);
+// The pass (one command buffer, its GPU time measured): 1. st_conv: the near end of the depth range (98th
+// percentile of 16x16 samples of the picture), d_c = it / (1 + POP);
 // 2. st_inv: the depth (at the upscaler's render size) to the picture's size, edge-aware: bilinear within a
 // surface, across a depth edge the sample whose colour matches the pixel's (joint bilateral, picking not blending,
 // so no pixels float between the depths); 3. st_eye: each eye by a backward parallax search per row (a row segment
@@ -63,13 +69,14 @@ static const char *g_stereo_msl =
     "    d = clamp(d, 0.0f, 1.0f);\n"
     "    return p.reversed ? d : 1.0f - d;\n"
     "}\n"
-    // 1: the screen plane's inverse depth, the pct-th of 16x16 samples over the centre (half the width and height),
-    //    sorted in threadgroup memory; smoothed over frames in state[0] (state[1]: this frame's)
+    // 1: the near end of the depth range: the pct-th (0.95) of 16x16 samples over the whole picture, sorted in
+    //    threadgroup memory; smoothed over frames in state[0] (state[1]: this frame's). It is put at the largest
+    //    pop-out, so disparity stays linear in inverse depth (planes stay planar) for all but the nearest 2 %
     "kernel void st_conv(device const uchar *dep [[buffer(0)]], constant SP &p [[buffer(1)]], device float *state [[buffer(2)]],\n"
     "                    uint i [[thread_index_in_threadgroup]]) {\n"
     "    threadgroup float v[256];\n"
     "    uint gx = i & 15, gy = i >> 4;\n"
-    "    uint2 q = uint2(p.dw / 4 + (gx * 2 + 1) * p.dw / 64, p.dh / 4 + (gy * 2 + 1) * p.dh / 64);\n"
+    "    uint2 q = uint2((gx * 2 + 1) * p.dw / 32, (gy * 2 + 1) * p.dh / 32);\n"
     "    v[i] = inv_of(dep, p, min(q, uint2(p.dw - 1, p.dh - 1)));\n"
     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
     "    for (uint k = 2; k <= 256; k <<= 1)\n"
@@ -102,7 +109,14 @@ static const char *g_stereo_msl =
     "    float wb[4] = { (1 - f.x) * (1 - f.y), f.x * (1 - f.y), (1 - f.x) * f.y, f.x * f.y };\n"
     "    float d[4], lo = 2, hi = -1, r = 0;\n"
     "    for (int k = 0; k < 4; k++) { d[k] = inv_of(dep, p, uint2(c[k])); lo = min(lo, d[k]); hi = max(hi, d[k]); r += wb[k] * d[k]; }\n"
-    "    if (hi - lo > 0.04f * hi) {\n"
+        // (a depth edge between the samples, not a steep plane: the middle step of each axis against its neighbours'
+    //  steps - a plane, however steep, has equal steps in d; a spread test alone made a near floor terraces)
+"    float ex = inv_of(dep, p, uint2(clamp(i0 + int2(-1, 0), int2(0), lim))), fx = inv_of(dep, p, uint2(clamp(i0 + int2(2, 0), int2(0), lim)));\n"
+"    float ey = inv_of(dep, p, uint2(clamp(i0 + int2(0, -1), int2(0), lim))), fy = inv_of(dep, p, uint2(clamp(i0 + int2(0, 2), int2(0), lim)));\n"
+"    float mx = d[1] - d[0], ox = 0.5f * ((d[0] - ex) + (fx - d[1])), my = d[2] - d[0], oy = 0.5f * ((d[0] - ey) + (fy - d[2]));\n"
+"    bool edge = abs(mx - ox) > 0.02f * hi + 0.5f * abs(ox) || abs(my - oy) > 0.02f * hi + 0.5f * abs(oy) ||\n"
+"                abs(d[3] - d[2] - d[1] + d[0]) > 0.02f * hi + 0.5f * (abs(mx) + abs(my));\n"
+"    if (edge) {\n"
     "        float3 cp = col.read(g).rgb;\n"
     "        float best = -1;\n"
     "        for (int k = 0; k < 4; k++) {\n"
@@ -124,14 +138,14 @@ static const char *g_stereo_msl =
     "    threadgroup float T[TG + 2 * RMAX + 2];\n"
     "    threadgroup float I[TG + 2 * RMAX + 2];\n"
     "    float s = g.z == 0 ? -0.5f : 0.5f;\n"
-    "    float inv_c = max(state[0] / p.conv, 1e-7f);\n"
-    "    int R = min(int(ceil(p.S * 0.5f)) + 2, RMAX);\n"
+    "    float inv_c = max(state[0] / ((1.0f + p.pop) * p.conv), 1e-7f);\n"
+    "    int R = min(int(ceil(max(p.S, 2.0f * p.pop * p.S) * 0.5f)) + 2, RMAX);\n"
     "    int W = int(p.w), y = int(min(g.y, p.h - 1));\n"
     "    int x0 = int(tg.x) * TG - R, n = TG + 2 * R + 1;\n"
     "    for (int k = int(t); k < n; k += TG) {\n"
     "        int xs = clamp(x0 + k, 0, W - 1);\n"
     "        float v = inv.read(uint2(xs, y)).r;\n"
-    "        T[k] = float(x0 + k) + s * clamp(p.S * (1.0f - v / inv_c), -p.pop * p.S, p.S);\n"
+    "        T[k] = float(x0 + k) + s * clamp(p.S * (1.0f - v / inv_c), -2.0f * p.pop * p.S, p.S);\n"
     "        I[k] = v;\n"
     "    }\n"
     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -155,7 +169,11 @@ static const char *g_stereo_msl =
     "    float4 c;\n"
     "    if (bx >= 0) c = mix(col.read(uint2(bx, y)), col.read(uint2(min(bx + 1, W - 1), y)), a);\n"
     "    else if (gx >= 0) c = col.read(uint2(gx, y));\n"
-    "    else c = col.read(uint2(g.x, y));\n"
+    "    else {\n"
+    "        float v = inv.read(uint2(g.x, y)).r;\n"
+    "        int xs = int(rint(x - s * clamp(p.S * (1.0f - v / inv_c), -2.0f * p.pop * p.S, p.S)));\n"
+    "        c = col.read(uint2(clamp(xs, 0, W - 1), y));\n"
+    "    }\n"
     "    if (g.z == 0) outL.write(c, g.xy); else outR.write(c, g.xy);\n"
     "}\n"
     // 4: the window's picture: 1 both eyes squeezed side by side, 2 red/cyan anaglyph, 3 left, 4 right
@@ -190,7 +208,7 @@ typedef struct { uint32_t w, h, dw, dh, dfmt, reversed, layout, encode; float S,
 
 // ---- configuration ----
 static struct {
-    float sep, pop, conv;
+    float sep, pop, conv, near;
     int window;                       // 0 flat, 1 sbs, 2 anaglyph, 3 left, 4 right
     char stream[1024], shot[1024];
     int stats;
@@ -211,6 +229,7 @@ int vx_stereo_on(void) {
         g_cfg.sep = env_float("VXRT_STEREO_SEP", 2.0f, 0.0f, 10.0f) / 100.0f;
         g_cfg.pop = env_float("VXRT_STEREO_POP", 0.4f, 0.0f, 1.0f);
         g_cfg.conv = env_float("VXRT_STEREO_CONV", 1.0f, 0.05f, 20.0f);
+        g_cfg.near = env_float("VXRT_STEREO_NEAR", 0.98f, 0.5f, 1.0f);
         const char *w = getenv("VXRT_STEREO_WINDOW");
         g_cfg.window = !w || !*w || !strcmp(w, "sbs") ? 1 : !strcmp(w, "anaglyph") ? 2 : !strcmp(w, "left") ? 3 :
                        !strcmp(w, "right") ? 4 : 0;
@@ -454,9 +473,9 @@ void *vx_stereo_present(void *queuep, void *backp, uint32_t w, uint32_t h) {
     // reversed Z: GREATER / GREATER_EQUAL on the depth writes (LESS / LESS_EQUAL: standard; neither: reversed, as
     // modern engines draw)
     uint32_t rev = (dfuncs & ((1u << 5) | (1u << 7))) || !(dfuncs & ((1u << 2) | (1u << 4)));
-    float S = fminf(g_cfg.sep * (float)w, 2.0f * (160 - 3));
+    float S = fminf(g_cfg.sep * (float)w, 2.0f * (160 - 3) / fmaxf(1.0f, 2.0f * g_cfg.pop));
     stereo_params p = { w, h, dw, dh, dfmt == MTLPixelFormatDepth16Unorm, rev, (uint32_t)g_cfg.window, (uint32_t)linear_format(back.pixelFormat),
-                        S, g_cfg.pop, g_cfg.conv, 0.5f, 0.2f, 0, 0, 0 };
+                        S, g_cfg.pop, g_cfg.conv, g_cfg.near, 0.2f, 0, 0, 0 };
     if (!valid || S <= 0) valid = 0;
     // snapshots asked for: <shot>/now
     if (g_cfg.shot[0] && !g_shot_left) {

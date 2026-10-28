@@ -103,12 +103,12 @@ static int synthetic(void) {
             }
     printf("%s: flat frame (the depth not chosen yet): %d pixels differ from the picture\n", diff ? "FAIL" : "ok", diff);
     fails += diff != 0;
-    // frames 2..: stereo (the convergence settles on the square's depth: it fills the centre)
+    // frames 2..: stereo (the depth range fit: the square, a quarter of the picture, is the near end: -POP*S)
     for (int k = 0; k < 40; k++) frame(color, depth, W, H);
     px = published(&w2, &h);
     // the background's stripe edges on the row above the square: where does the left eye's red->blue edge near
-    // x = 64 land, and the right eye's? expected: disparity S*(1 - 0.01/0.05) = 0.8 * 2 % * 640 = 10.24 px, half each way
-    float S = 0.02f * W, expect = 0.5f * S * (1 - 0.01f / 0.05f);
+    // x = 64 land, and the right eye's? expected: disparity S*(1 - 0.01*1.4/0.05) = 0.72 * 2 % * 640 = 9.2 px, half each way
+    float S = 0.02f * W, expect = 0.5f * S * (1 - 0.01f * 1.4f / 0.05f), sq_shift = 0.5f * 0.4f * S;
     uint32_t y = H / 8;
     int edge[2] = { -1, -1 };
     for (int e = 0; e < 2; e++)
@@ -122,7 +122,7 @@ static int synthetic(void) {
     if (edge[0] < 0 || edge[1] < 0 || fabsf(edge[0] - (orig - expect)) > 1.5f || fabsf(edge[1] - (orig + expect)) > 1.5f) {
         printf("FAIL: background disparity\n"); fails++;
     } else printf("ok: the background is behind the screen (left eye left, right eye right)\n");
-    // the square's left edge (screen plane): unmoved in both eyes
+    // the square's left edge (the near end: in front of the screen, -0.4*S): the left eye's to the right, the right's left
     y = H / 2;
     int sq[2] = { -1, -1 };
     for (int e = 0; e < 2; e++)
@@ -130,15 +130,60 @@ static int synthetic(void) {
             const uint8_t *a = px + ((size_t)y * 2 * W + e * W + x) * 4;
             if (a[1] > 150) sq[e] = (int)x;
         }
-    printf("%s: square's edge at %d / %d (picture %u)\n", abs(sq[0] - (int)W / 4) <= 1 && abs(sq[1] - (int)W / 4) <= 1 ? "ok" : "FAIL",
-           sq[0], sq[1], W / 4);
-    fails += !(abs(sq[0] - (int)W / 4) <= 1 && abs(sq[1] - (int)W / 4) <= 1);
+    int sq_ok = fabsf(sq[0] - (W / 4 + sq_shift)) <= 1.5f && fabsf(sq[1] - (W / 4 - sq_shift)) <= 1.5f;
+    printf("%s: square's edge at %d / %d (expected %.1f / %.1f: in front of the screen)\n", sq_ok ? "ok" : "FAIL", sq[0], sq[1],
+           W / 4 + sq_shift, W / 4 - sq_shift);
+    fails += !sq_ok;
     // every pixel filled with colour from the picture (no black from an unfilled hole)
     int black = 0;
     for (uint32_t k = 0; k < 2 * W * H; k++) { const uint8_t *a = px + k * 4; if (a[0] < 30 && a[1] < 30 && a[2] < 30) black++; }
     printf("%s: %d unfilled pixels\n", black ? "FAIL" : "ok", black);
     fails += black != 0;
     return fails;
+}
+
+
+// A tilted plane (a floor seen from above it): d = n/z is affine in screen space for any plane, so its disparity must
+// be an exact linear ramp - any curve in the mapping (a clamp, a soft compression, linear z) makes it bulge. Depth at
+// a third of the size (an upscaler's Ultra Performance), d rising from 0.002 at the top to 0.032 at the bottom (and a
+// little across). The picture is a sawtooth (red = 8 x mod 256) whose value tells each eye pixel's source position;
+// each row's shift is the mean over the row, disparity = right eye's shift - left eye's.
+static int plane(void) {
+    const uint32_t W = 640, H = 400, DW = 213, DH = 133;
+    uint8_t *rgba = malloc(W * H * 4);
+    for (uint32_t y = 0; y < H; y++)
+        for (uint32_t x = 0; x < W; x++) { uint8_t *p = rgba + (y * W + x) * 4; p[0] = (uint8_t)(x * 8); p[1] = 128; p[2] = 128; p[3] = 255; }
+    float *d = malloc(DW * DH * 4);
+    for (uint32_t y = 0; y < DH; y++)
+        for (uint32_t x = 0; x < DW; x++) d[y * DW + x] = 0.002f + 0.030f * y / (DH - 1) + 0.004f * x / (DW - 1);
+    id<MTLTexture> color = color_texture(rgba, W, H), depth = depth_texture(d, DW, DH);
+    for (int k = 0; k < 40; k++) frame(color, depth, W, H);
+    uint32_t w2, h;
+    const uint8_t *px = published(&w2, &h);
+    double sy = 0, syy = 0, sv = 0, syv = 0, n = 0, disp[400];
+    for (uint32_t y = 0; y < H; y++) {
+        double sh[2] = { 0, 0 };
+        for (int e = 0; e < 2; e++) {
+            double sum = 0; int cnt = 0;
+            for (uint32_t x = 40; x < W - 40; x++) {
+                const uint8_t *a = px + ((size_t)y * 2 * W + e * W + x) * 4;
+                double src = a[2] / 8.0;                              // (source x mod 32)
+                double shift = fmod(x - src + 64.0 + 16.0, 32.0) - 16.0;
+                if (fabs(shift) < 12) { sum += shift; cnt++; }
+            }
+            sh[e] = cnt ? sum / cnt : 0;
+        }
+        disp[y] = sh[1] - sh[0];
+        if (y >= 8 && y < H - 16) { sy += y; syy += (double)y * y; sv += disp[y]; syv += y * disp[y]; n++; }
+    }
+    double b = (n * syv - sy * sv) / (n * syy - sy * sy), a = (sv - b * sy) / n, worst = 0;
+    int at = 0;
+    for (uint32_t y = 8; y < H - 16; y++) if (fabs(disp[y] - (a + b * y)) > worst) { worst = fabs(disp[y] - (a + b * y)); at = (int)y; }
+    printf("tilted plane: disparity %.2f px at the top, %.2f at the bottom; off a straight line by %.3f px at most (row %d)\n",
+           disp[8], disp[H - 17], worst, at);
+    int ok = worst < 0.2 && b < 0;
+    printf("%s: the plane stays planar (disparity linear in d)\n", ok ? "ok" : "FAIL");
+    return !ok;
 }
 
 static int dumped(int argc, char **argv) {
@@ -190,7 +235,7 @@ int main(int argc, char **argv) {
         ftruncate(fd, 64 + 2 * (88 + 4096ull * 4096 * 8) + 312 + 1024);
         map = mmap(NULL, 64 + 2 * (88 + 4096ull * 4096 * 8) + 312 + 1024, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
-        int r = argc >= 6 ? dumped(argc, argv) : synthetic();
+        int r = argc >= 6 ? dumped(argc, argv) : synthetic() + plane();
         if (!given || !*given) unlink(stream);
         printf("%s\n", r ? "stereo_test: FAILED" : "stereo_test: ok");
         return r != 0;
