@@ -202,7 +202,9 @@ static const char *g_npu_msl =
     "    if (still) { o.write(float4(0, 0, 1, 1), g); return; }\n"
     "    float2 sz = float2(e.w, e.h), uv = (float2(p0) + 1) / sz, k = float2(e.sx, e.sy);\n"
     "    float2 m = -fb.sample(s, uv, level(0)).xy * k;\n"                // (the backward flow points from B to A)
+    "    if (any(isnan(m)) || any(isinf(m)) || length(m) > 0.5 * max(e.w, e.h)) { o.write(float4(0, 0, 0, 0), g); return; }\n"
     // an overlay over a moving scene (HUD, subtitles): B matches A where it is better than where the motion says
+    // (z 0.7: held only where neighbours say so too, a single dark block that matches by chance is not)
     "    if (length(m) > 1) {\n"
     "        float e0 = 0, e1 = 0;\n"
     "        for (int y = 0; y <= 1; y++) for (int x = 0; x <= 1; x++) {\n"
@@ -211,7 +213,7 @@ static const char *g_npu_msl =
     "            e0 += dot(abs(c - a.read(q).rgb), 1);\n"
     "            e1 += dot(abs(c - a.sample(s, (float2(q) + 0.5 - m) / sz, level(0)).rgb), 1);\n"
     "        }\n"
-    "        if (e0 < 0.5 * e1 && e1 > 0.45) { o.write(float4(0, 0, 1, 1), g); return; }\n"
+    "        if (e0 < 0.5 * e1 && e1 > 0.45) { o.write(float4(m, 0.7, 1), g); return; }\n"
     "    }\n"
     // where it was in A, and the forward flow there: back where it started, or the flows disagree (something covered
     // it in one of the frames); a pixel that came in over the frame's edge has nothing to compare with
@@ -219,23 +221,25 @@ static const char *g_npu_msl =
     "    float ok = 1;\n"
     "    if (all(ua >= 0) && all(ua <= 1)) {\n"
     "        float2 f = ff.sample(s, ua, level(0)).xy * k;\n"
-    "        ok = length(f - m) <= e.fb + e.fbk * length(m) ? 1 : 0;\n"
+    "        ok = all(isfinite(f)) && length(f - m) <= e.fb + e.fbk * length(m) ? 1 : 0;\n"
     "    }\n"
     "    o.write(float4(m, 0, ok), g);\n"
     "}\n"
     // still, or the edge of something still (an overlay's antialiased rim, which would otherwise move off as a ghost)
     "static bool held(texture2d<float> mm, uint2 p) {\n"
     "    uint2 hi = uint2(mm.get_width(), mm.get_height()) - 1;\n"
-    "    if (mm.read(p).z > 0.5) return true;\n"
-    "    float n = mm.read(uint2(max(int(p.x) - 1, 0), p.y)).z + mm.read(uint2(min(p.x + 1, hi.x), p.y)).z +\n"
-    "              mm.read(uint2(p.x, max(int(p.y) - 1, 0))).z + mm.read(uint2(p.x, min(p.y + 1, hi.y))).z;\n"
-    "    return n >= 3;\n"
+    "    float z = mm.read(p).z;\n"
+    "    if (z > 0.9) return true;\n"
+    "    float4 n = float4(mm.read(uint2(max(int(p.x) - 1, 0), p.y)).z, mm.read(uint2(min(p.x + 1, hi.x), p.y)).z,\n"
+    "                      mm.read(uint2(p.x, max(int(p.y) - 1, 0))).z, mm.read(uint2(p.x, min(p.y + 1, hi.y))).z);\n"
+    "    if (z > 0.5) return dot(float4(n > 0.5), 1) >= 2;\n"          // (an overlay block among others)
+    "    return dot(float4(n > 0.5), 1) >= 3;\n"                        // (the rim of something held)
     "}\n"
     "kernel void npu_race_splat(texture2d<float> mm [[texture(0)]], device atomic_uint *key [[buffer(0)]], constant R &e [[buffer(1)]],\n"
     "                           uint2 g [[thread_position_in_grid]]) {\n"
     "    if (g.x >= e.kw || g.y >= e.kh) return;\n"
     "    float4 v = mm.read(g);\n"
-    "    if (v.w < 0.5 || (v.z < 0.5 && held(mm, g))) return;\n"      // (the flows disagree: it lands nowhere, the place is filled as a hole is)
+    "    if (v.w < 0.5 || v.z > 0.9 || held(mm, g)) return;\n"    // (held: drawn as B; the flows disagree: it lands nowhere, filled as a hole is)
     "    int2 t = int2(round(float2(g) + e.t * v.xy / 2));\n"
     "    if (any(t < 0) || t.x >= int(e.kw) || t.y >= int(e.kh)) return;\n"
     "    uint mq = min(uint(length(v.xy) * 4), (1u << (32 - e.idx_bits)) - 1);\n"
@@ -261,8 +265,9 @@ static const char *g_npu_msl =
     "            }\n"
     "        k = best == 0xffffffffu ? 0 : best;\n"
     "    }\n"
-    "    float2 m = 0;\n"
-    "    if (k) { uint i = (k & mask) - 1; m = mm.read(uint2(i % e.kw, i / e.kw)).xy; }\n"
+    // (nothing landed near: its own flow, however unsure; never a zero motion standing still in a moving scene)
+    "    float2 m = k ? mm.read(uint2(((k & mask) - 1) % e.kw, ((k & mask) - 1) / e.kw)).xy : mm.read(g).xy;\n"
+    "    if (!all(isfinite(m))) m = 0;\n"
     "    o.write(float4(m, 0, 0), g);\n"
     "}\n"
     "fragment float4 npu_race_fs(V in [[stage_in]], texture2d<float> b [[texture(0)]], texture2d<float> rm [[texture(1)]],\n"
@@ -330,6 +335,7 @@ static struct {
     uint32_t seq, next_dst;
     int busy;                      // a request that missed its time is still running
     volatile int race_flow;        // race's flow queue is using the helper
+    volatile int race_noflow, race_nowarp;
     // statistics (every 5 s)
     double stat_t0;
     uint32_t frames, real, interp, missed, skipped, dropped, failed;
@@ -366,8 +372,15 @@ static int switched_on(void) {
                 if (!strcmp(word, "extrapolate") && g.flow_ok) mode = NPU_MODE_FLOW, race = 0;
                 if (!strcmp(word, "race") && g.flow_ok) {
                     mode = NPU_MODE_FLOW, race = 1;
-                    float hz = 0;                                  // ("race 60": the refresh rate used, from then on)
-                    if (fscanf(f, "%f", &hz) == 1 && hz != race_hz(-1)) { race_hz(hz); race_stop(); }
+                    // ("race 60": predictions' rate; "noflow", "nowarp": no optical flow / no predictions shown, to
+                    //  measure what each costs)
+                    char opt[32];
+                    g.race_noflow = g.race_nowarp = 0;
+                    while (fscanf(f, "%31s", opt) == 1) {
+                        if (!strcmp(opt, "noflow")) g.race_noflow = 1;
+                        else if (!strcmp(opt, "nowarp")) g.race_nowarp = 1;
+                        else if (atof(opt) != race_hz(-1)) race_hz((float)atof(opt));
+                    }
                 }
                 if (!strcmp(word, "interpolate") && g.interp_ok) mode = NPU_MODE_INTERPOLATE, race = 0;
             }
@@ -940,7 +953,8 @@ static struct {
     float flow_px;                                 // its motion, frame pixels an interval (98th percentile)
     uint32_t mm_b_seq, mm_flow_seq;                // what the motion map was made from
     // statistics (every 5 s, the tick's thread; frames, superseded: the handlers')
-    uint32_t frames, real, gen, still, held, stale, nflow, ngpu, nlat, nt, npres;
+    uint32_t frames, real, gen, still, held, evened, stale, nflow, ngpu, nlat, nt, npres;
+    int even;
     float flow_ms[512], gpu_ms[512], lat[512], ts[512];
     double pres[1024];
     double stat_t0;
@@ -1098,7 +1112,11 @@ static void handle_race(VXNpuSet *S, uint32_t slot, int has_in, double t) {
     R.has_in = has_in ? R.has_in | bit((int)slot) : R.has_in & ~bit((int)slot);
     R.a = prev; R.b = (int)slot; R.b_seq++;
     // (a game at the refresh rate gets no predicted frames: no flow wanted)
-    if (prev >= 0 && has_in && (R.has_in & bit(prev)) && R.interval > R.period * 1.2) {
+    // (and not every frame's: a flow takes 20-50 ms of the Neural Engine and some of the GPU; a frame or two older is
+    //  as good while the motion is slow)
+    uint32_t every = R.flow_px > 8 ? 1 : R.flow_px < 1 ? 3 : 2;
+    if (prev >= 0 && has_in && (R.has_in & bit(prev)) && R.interval > R.period * 1.2 && !g.race_noflow &&
+        (!R.flow_seq || R.b_seq - R.flow_bseq >= every)) {
         R.want_a = prev; R.want_b = (int)slot; R.want_bseq = R.b_seq;
         flow_kick(S);
     }
@@ -1142,17 +1160,17 @@ static void race_stats(double now) {
         float gpu = pct(R.gpu_ms, ngpu, 0.5f);
         vx_log("NPU mode (race): game %.1f fps, window %.1f fps on screen (%u real + %u predicted presented = %.0f%% predicted, "
                "%u not shown: replaced in the same refresh); refreshes without a new frame: %u (the scene still), %u (nothing to "
-               "predict from); %.1f Hz refresh; steps on screen in refreshes 1:%u 2:%u 3:%u 4:%u 5:%u 6+:%u (%u steps); optical "
+               "predict from), %u (a real frame due: even steps); %.1f Hz refresh; steps on screen in refreshes 1:%u 2:%u 3:%u 4:%u 5:%u 6+:%u (%u steps); optical "
                "flow %.1f ms median (%u), motion %.1f px an interval, %u%% of the predicted frames on the previous pair's flow; "
                "prediction on the GPU %.2f ms median, %.2f ms p95 (%.1f%% of the GPU's time), t %.2f median; real frames on "
                "screen %.1f ms after they were ready (median, %.1f ms p95)",
                frames / dt, shown / dt, R.real, R.gen, R.real + R.gen ? 100.0 * R.gen / (R.real + R.gen) : 0, gone, R.still,
-               R.held, 1 / R.period, hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], shown ? shown - 1 : 0,
+               R.held, R.evened, 1 / R.period, hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], shown ? shown - 1 : 0,
                pct(fl, nfl, 0.5f), nfl, R.flow_px, R.gen ? 100 * R.stale / R.gen : 0, gpu, pct(R.gpu_ms, ngpu, 0.95f),
                100.0 * gpu * R.gen / 1000 / dt, pct(R.ts, R.nt, 0.5f), pct(R.lat, nlat, 0.5f), pct(R.lat, nlat, 0.95f));
     }
     R.stat_t0 = now;
-    R.real = R.gen = R.still = R.held = R.stale = R.nt = 0;
+    R.real = R.gen = R.still = R.held = R.evened = R.stale = R.nt = 0;
     __atomic_store_n(&R.ngpu, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&R.nlat, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&R.npres, 0, __ATOMIC_RELEASE);
@@ -1181,7 +1199,10 @@ static void race_tick(double tick, double period) {
                  R.b_seq - R.flow_bseq <= 3;                       // (a flow up to 3 frames old: it may take longer than a frame)
         // how far on: B was presented at tb (and will be on screen as long after it as this one)
         double t = ok ? (now - R.tb) / R.interval : 0;
-        if (!ok || t <= 0 || t > R.max_t + 1e-3) { R.held++; os_unfair_lock_unlock(&R.lock); }
+        // (even steps: no prediction a refresh before the next real frame is due; it would leave a 1-refresh step)
+        double due = R.last_t + R.interval - now;
+        if (!ok || t <= 0 || t > R.max_t + 1e-3 || g.race_nowarp) { R.held++; os_unfair_lock_unlock(&R.lock); }
+        else if (R.even && due > 0 && due < R.period) { R.evened++; os_unfair_lock_unlock(&R.lock); }
         else if ((t - R.shown_t) * R.flow_px < R.min_px) { R.still++; os_unfair_lock_unlock(&R.lock); }
         else {
             int slot = R.b, a = R.a, fresh = R.flow_bseq == R.b_seq;
@@ -1249,6 +1270,7 @@ static void race_start(CAMetalLayer *layer) {
         R.margin = (m ? atof(m) : 4) / 1000;
         R.max_t = x ? atof(x) : 1.25;
         R.min_px = px ? atof(px) : 0.3;
+        R.even = !getenv("VXRT_NPU_RACE_EVEN") || atoi(getenv("VXRT_NPU_RACE_EVEN"));
         if (hz && !R.hz) R.hz = (float)atof(hz);
     }
     NSScreen *screen = nil;

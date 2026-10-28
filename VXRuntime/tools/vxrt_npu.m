@@ -256,6 +256,23 @@ static int selftest(void) API_AVAILABLE(macos(26.0)) {
     return 0;
 }
 
+// --bench W H N: N optical flows of W x H frames (moved blocks), the time each took (to choose the flow's size)
+static int bench(uint32_t w, uint32_t h, int n) API_AVAILABLE(macos(26.0)) {
+    npu_init_req q = { NPU_OP_INIT, w, h, 1, 2, 1, NPU_MODE_FLOW };
+    npu_init_reply r = { 0 };
+    NpuTiles *T = flow_create(&q, &r);
+    if (!T) { printf("vxrt-npu bench: no optical flow at %ux%u\n", w, h); return 1; }
+    fill_blocks(T->src[0][0], 0, 0);
+    fill_blocks(T->src[1][0], 6, 3);
+    double ms[1000];
+    if (n > 1000) n = 1000;
+    for (int i = 0; i < n; i++) { double t0 = now_ms(); flow_run(T, 0, 1, 0, i * 2); ms[i] = now_ms() - t0; }
+    for (int i = 1; i < n; i++) for (int j = i; j > 0 && ms[j] < ms[j - 1]; j--) { double x = ms[j]; ms[j] = ms[j - 1]; ms[j - 1] = x; }
+    printf("vxrt-npu bench: %ux%u (flow %ux%u): %.1f ms median, %.1f ms min, %.1f ms p95 over %d\n", w, h, r.flow_w, r.flow_h,
+           ms[n / 2], ms[0], ms[(int)(n * 0.95)], n);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     g_err = stderr;
     if (argc < 2) {
@@ -273,6 +290,7 @@ int main(int argc, char **argv) {
             }
             if (argc > 1 && !strcmp(argv[1], "--check")) return 0;
             if (argc > 1 && !strcmp(argv[1], "--selftest")) return selftest();
+            if (argc > 4 && !strcmp(argv[1], "--bench")) return bench((uint32_t)atoi(argv[2]), (uint32_t)atoi(argv[3]), atoi(argv[4]));
             NpuTiles *T = nil;
             for (;;) {
                 uint32_t op;
