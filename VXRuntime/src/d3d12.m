@@ -12059,9 +12059,15 @@ typedef struct qjob12 {
     uint32_t index;
     HANDLE waitable;
 } qjob12;
+// (on unless the variable is 0)
+static int env_on12(const char *name) {
+    const char *e = getenv(name);
+    return !(e && *e == '0');
+}
+// VXRT_D3D12_ASYNC_SUBMIT=0 turns the queue threads off (ExecuteCommandLists replays on the calling thread).
 static int async_submit12(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("VXRT_D3D12_ASYNC_SUBMIT"); v = e && *e == '1'; }
+    if (v < 0) v = env_on12("VXRT_D3D12_ASYNC_SUBMIT");
     return v;
 }
 static void *queue_worker12(void *arg) {
@@ -12123,14 +12129,21 @@ static void release_elsewhere12(d3d_object *o) {
     if (!o) return;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ d3d_release(o); });
 }
-// VXRT_D3D12_PARALLEL_REPLAY=1 (with VXRT_D3D12_ASYNC_SUBMIT): each list gets its command buffer enqueued in
+// VXRT_D3D12_LENIENT_STATES=1: lists with invalid transitions or resource states run (as on Windows without the debug
+// layer) instead of being rejected as the conformance tests expect; off unless set.
+static int lenient_states12(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VXRT_D3D12_LENIENT_STATES"); v = e && *e != '0'; }
+    return v;
+}
+// VXRT_D3D12_PARALLEL_REPLAY (on unless 0; with the queue threads and lenient states): each list gets its command buffer enqueued in
 // submission order on the queue's thread, which goes on at once; the replay into it and its commit run on a pool of
 // threads (Metal runs enqueued command buffers in their enqueued order whenever they are committed). Lists are not
 // state-validated there (as VXRT_D3D12_LENIENT_STATES after its first 1000 failures).
 static int parallel_replay12(void) {
     static int v = -1;
     // (only with VXRT_D3D12_LENIENT_STATES: lists that must be rejected for their states are found serially)
-    if (v < 0) { const char *e = getenv("VXRT_D3D12_PARALLEL_REPLAY"); v = e && *e == '1' && getenv("VXRT_D3D12_LENIENT_STATES"); }
+    if (v < 0) v = env_on12("VXRT_D3D12_PARALLEL_REPLAY") && lenient_states12();
     return v;
 }
 // VXRT_D3D12_CB_TRACE=<file>: when <file>.now appears (it is removed), the next 600 command buffers of every queue are
@@ -12205,8 +12218,11 @@ static void job_execute_parallel12(queue12 *q, qjob12 *j) {
     static dispatch_semaphore_t slots;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        // (VXRT_D3D12_REPLAY_THREADS, default all but two of the CPU's cores, at most 8: Cyberpunk 2077's first scene
+        //  went 96 -> 64 ms a frame with 8 on an M1 Max)
         const char *e = getenv("VXRT_D3D12_REPLAY_THREADS");
-        int n = e && atoi(e) > 0 ? atoi(e) : 4;
+        long cores = sysconf(_SC_NPROCESSORS_ONLN);
+        int n = e && atoi(e) > 0 ? atoi(e) : cores - 2 > 8 ? 8 : cores - 2 < 2 ? 2 : (int)cores - 2;
         slots = dispatch_semaphore_create(n);
         for (int i = 0; i < n; i++) {
             pthread_t t;
@@ -12407,12 +12423,12 @@ static void queue_execute_(void *this, uint32_t n, void *const *lists) {
         }
         resource_state_shadow12 *shadows = NULL;
         uint32_t state_count = 0;
-        // VXRT_D3D12_LENIENT_STATES=1: run such a list anyway, as Windows does without its debug layer (Metal tracks
+        // Lenient states (VXRT_D3D12_LENIENT_STATES=1): run such a list anyway, as Windows does without its debug layer (Metal tracks
         // the hazards itself); its transitions are then not recorded. Once 1000 lists have failed, the states are
         // not tracked well enough to be worth validating: lists run without (it was a tenth of the replay's time in
         // Cyberpunk 2077, whose lists nearly all fail); VXRT_D3D12_VALIDATE_STATES=1 keeps validating.
         static int lenient = -1, told, keep_validating = -1;
-        if (lenient < 0) lenient = getenv("VXRT_D3D12_LENIENT_STATES") != NULL;
+        if (lenient < 0) lenient = lenient_states12();
         if (keep_validating < 0) keep_validating = getenv("VXRT_D3D12_VALIDATE_STATES") != NULL;
         int state_result = lenient && told >= 1000 && !keep_validating ? 1 :
             queue_validate_list_states12(d, q->desc.Type, q->mtl_queue, l, NULL, 0, &shadows, &state_count);
