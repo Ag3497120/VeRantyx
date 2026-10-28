@@ -32,6 +32,7 @@
 #include "gpu_ir.h"
 #include "gpu_ir_metal.h"
 #include "gpu_ir_msl.h"
+#include "stereo.h"
 #include <float.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -8878,22 +8879,30 @@ static const char *stereo_dir12(void) {
     if (dir == (const char *)-1) { dir = getenv("VXRT_D3D12_STEREO_DUMP"); if (dir && !*dir) dir = NULL; }
     return dir;
 }
+static __thread uint32_t t_st_writes12;
+static int g_st_live12 = -1;                         // (VXRT_STEREO=1: stereo.m takes the scene's depth at each pass end)
+static int stereo_watch12(void) {
+    if (g_st_live12 < 0) g_st_live12 = vx_stereo_on();
+    return g_st_armed12 || g_st_live12;
+}
 static void stereo_opened12(MTLRenderPassDescriptor *descriptor) {
-    if (!g_st_armed12) return;
+    if (!stereo_watch12()) return;
     if (t_st_depth12) { CFBridgingRelease(t_st_depth12); t_st_depth12 = NULL; }
     id<MTLTexture> t = descriptor.depthAttachment.texture;
     if (t) t_st_depth12 = (void *)CFBridgingRetain(t);
-    t_st_draws12 = 0; t_st_funcs12 = 0;
+    t_st_draws12 = 0; t_st_funcs12 = 0; t_st_writes12 = 0;
 }
 static void stereo_draw12(const pso12 *p) {
-    if (!g_st_armed12 || !t_st_depth12 || !p || !p->depth_enable) return;
+    if (!t_st_depth12 || !p || !p->depth_enable) return;
     t_st_draws12++;
+    if (p->depth_write) t_st_writes12++;
     if (p->depth_write && p->depth_func > 0 && p->depth_func < 32) t_st_funcs12 |= 1u << p->depth_func;
 }
 static void stereo_closed12(id<MTLCommandBuffer> cb) {
     if (!t_st_depth12) return;
     id<MTLTexture> t = (id<MTLTexture>)CFBridgingRelease(t_st_depth12);
     t_st_depth12 = NULL;
+    if (g_st_live12 > 0) vx_stereo_depth_pass((__bridge void *)cb, (__bridge void *)t, t_st_draws12, t_st_writes12, t_st_funcs12);
     if (!g_st_armed12 || !t_st_draws12 || t.sampleCount > 1 || t.textureType != MTLTextureType2D) return;
     MTLPixelFormat f = t.pixelFormat;
     uint32_t bpp = f == MTLPixelFormatDepth16Unorm ? 2 : 4;
@@ -12954,10 +12963,16 @@ static void swap_present_now12(swap12 *sc, uint32_t index, id<CAMetalDrawable> d
             rp.colorAttachments[0].texture = drawable.texture;
             rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLTexture> shown = sc->buffers[index]->texture;
+            float scale[2] = { (float)sc->src_width / (float)sc->width, (float)sc->src_height / (float)sc->height };
+            if (vx_stereo_on()) {                                  // (VXRT_STEREO: its pass committed first, the window shows its picture)
+                id<MTLTexture> st = (__bridge id<MTLTexture>)vx_stereo_present((__bridge void *)sc->queue->mtl_queue, (__bridge void *)shown,
+                                                                              sc->src_width, sc->src_height);
+                if (st) { shown = st; scale[0] = scale[1] = 1; }
+            }
             id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
             [enc setRenderPipelineState:sc->pipeline];
-            [enc setFragmentTexture:sc->buffers[index]->texture atIndex:0];
-            float scale[2] = { (float)sc->src_width / (float)sc->width, (float)sc->src_height / (float)sc->height };
+            [enc setFragmentTexture:shown atIndex:0];
             [enc setFragmentBytes:scale length:sizeof scale atIndex:0];
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [enc endEncoding];
