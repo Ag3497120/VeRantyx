@@ -2787,12 +2787,21 @@ static int emit_region(tr *t, uint32_t b, int stop) {
         int stop_here = merge >= 0 ? merge : stop;
         // Blocks between here and the merge that several arms reach (a condition of && and ||: if (a || b && c) X;):
         // the arms set a flag where they would go to one, and each is emitted once after them, under its flag.
-        uint32_t joins[16], njoins = 0;
+        uint32_t joins[16], njoins = 0, arm[64], narm = nsucc(t, b, arm);
         // (no merge: the arms end in return, break or continue, and so does each join after them)
         if (!getenv("DXIL_NO_JOINS"))
             for (uint32_t x = 0; x < t->nb && njoins < 16; x++) {
                 if ((int)x == merge || x == b || t->npred[x] < 2 || t->emitted[x] || t->flag[x] >= 0) continue;
-                if (merge >= 0 ? t->ipdom[x] != merge : (t->nloops && t->loops[t->nloops - 1] == x)) continue;
+                // (with a merge: a block that leads straight to it, or one that no single arm dominates - several arms
+                //  reach it on their way to the merge: in `if (a) { if (b) continue; } X; ... latch`, X)
+                int shared = merge >= 0 && !getenv("DXIL_NO_INNER_JOINS");
+                for (uint32_t i = 0; i < narm && shared; i++) if (arm[i] < t->nb && arm[i] != x && dominates(t, arm[i], x)) shared = 0;
+                if (shared) {                                      // (and on the way: the merge post-dominates it)
+                    int y = (int)x, n = 0;
+                    while (y >= 0 && y < (int)t->nb && y != merge && t->ipdom[y] != y && n++ <= (int)t->nb) y = t->ipdom[y];
+                    shared = y == merge;
+                }
+                if (merge >= 0 ? t->ipdom[x] != merge && !shared : (t->nloops && t->loops[t->nloops - 1] == x)) continue;
                 if (stop >= 0 && merge < 0) continue;              // (an enclosing region's end: not across it)
                 if (t->loop_header_of[x] == (int)x || !dominates(t, b, x)) continue;
                 if (t->nloops && !in_loop(t, t->loops[t->nloops - 1], x)) continue;
@@ -2800,6 +2809,7 @@ static int emit_region(tr *t, uint32_t b, int stop) {
                 for (uint32_t h = 0; h < t->nb && !inner; h++)
                     if (t->loop_header_of[h] == (int)h && in_loop(t, h, x) && !in_loop(t, h, b)) inner = 1;
                 if (inner) continue;
+                if (getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: %u joins at %u (merge %d)\n", b, x, merge);
                 joins[njoins++] = x;
             }
         for (uint32_t i = 1; i < njoins; i++)                      // (in reverse post order: a join may lead to a later one)
@@ -3255,7 +3265,16 @@ static int translate(const dxil_module *m, uint32_t sample_mask, int mode, const
     }
     t.indent = 1;
     int structured = find_loops(&t) && emit_region(&t, 0, -1) == 0 && !t.failed;
-    if (!structured && getenv("DXIL_STRUCT_DEBUG")) fprintf(stderr, "struct: fallback (blocks %u)\n", t.nb);
+    if (!structured && getenv("DXIL_STRUCT_DEBUG")) {
+        fprintf(stderr, "struct: fallback (blocks %u)\n", t.nb);
+        for (uint32_t b = 0; b < t.nb; b++) {                      // (the graph: successors, dominators, loops)
+            uint32_t s[64], k = nsucc(&t, b, s);
+            fprintf(stderr, "struct: %u ->", b);
+            for (uint32_t i = 0; i < k; i++) fprintf(stderr, " %u", s[i]);
+            fprintf(stderr, "  idom %d ipdom %d loop %d exit %d%s\n", t.idom[b], t.ipdom[b], t.loop_header_of[b],
+                    t.loop_exit[b], t.tail[b] ? " tail" : "");
+        }
+    }
     if (!structured && !t.failed) {
         free(t.body.s);
         memset(&t.body, 0, sizeof t.body);
