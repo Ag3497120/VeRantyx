@@ -27,9 +27,9 @@
 // of A -> B. t is at most VXRT_NPU_RACE_MAX (default 1.25; past it the window keeps what it shows), and a refresh is
 // left alone when the scene moved less than VXRT_NPU_RACE_MIN_PX (default 0.3) pixels since the last frame shown.
 // Predictions come at most every other refresh of a 100 Hz+ display (even steps of 2 refreshes, 60 a second at
-// 120 Hz, half the GPU's work of every refresh; VXRT_NPU_RACE_HZ sets another rate). The flow is made once per real
-// frame on the Neural Engine (in the background, newest pair first; until it comes, a flow up to 6 frames old and its
-// motion map go on with B); each prediction costs only a GPU warp at half resolution (2x2 blocks): the motion map,
+// 120 Hz, half the GPU's work of every refresh; VXRT_NPU_RACE_HZ sets another rate). The flow is made every 3rd real
+// frame (every 2nd, or every one, as the scene moves faster) on the Neural Engine, which VideoToolbox helps with the GPU
+// (in the background, newest pair first; a flow up to 6 frames old and its motion map go on with B); each prediction costs only a GPU warp at half resolution (2x2 blocks): the motion map,
 // once per flow, at B's blocks, with no motion where A and B are equal or where B matches A better unmoved than moved
 // (HUD and subtitles over a moving scene, and their rims), and blocks whose forward and backward flows disagree
 // (occlusions) left out; then a splat (fastest wins), each block's motion (holes, from disocclusions and the blocks
