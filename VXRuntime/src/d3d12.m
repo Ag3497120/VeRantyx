@@ -261,6 +261,8 @@ typedef struct {
     d3d_object base; dev12 *dev;
     id<MTLSharedEvent> event;
     MTLSharedEventListener *listener;
+    uint64_t posted;                 // (diagnostics) the last value a queue Signal call asked for, and when it ran
+    uint64_t posted_ran;
 } fence12;
 
 typedef struct {
@@ -576,6 +578,7 @@ static void msl_timed12(const char *what, uint64_t hash, double start) {
 typedef struct {
     uint64_t pso_n, pso_ns, compile_n, compile_ns, exec_n, exec_ns, lock_ns, wait_ns, drawable_ns, skipped, sync_n, sync_ns, gpu_ns;
     uint64_t replay_ns;              // (VXRT_D3D12_ASYNC_SUBMIT: the queue threads' replay)
+    uint64_t busy_ns, replay_max_ns; // the GPU's busy time (command buffers' spans merged), the longest list replay
 } frame_stats12;
 static frame_stats12 g_fs12, g_fs12_sum;
 static double frame_stats_ms12(void) {
@@ -606,14 +609,15 @@ static void frame_stats_present12(uint32_t presents) {
     frame_stats12 f;
     #define TAKE12(x) f.x = __atomic_exchange_n(&g_fs12.x, 0, __ATOMIC_ACQ_REL); __atomic_fetch_add(&g_fs12_sum.x, f.x, __ATOMIC_RELAXED)
     TAKE12(pso_n); TAKE12(pso_ns); TAKE12(compile_n); TAKE12(compile_ns); TAKE12(exec_n); TAKE12(exec_ns);
-    TAKE12(lock_ns); TAKE12(wait_ns); TAKE12(drawable_ns); TAKE12(skipped); TAKE12(sync_n); TAKE12(sync_ns); TAKE12(gpu_ns); TAKE12(replay_ns);
+    TAKE12(lock_ns); TAKE12(wait_ns); TAKE12(drawable_ns); TAKE12(skipped); TAKE12(sync_n); TAKE12(sync_ns); TAKE12(gpu_ns); TAKE12(replay_ns); TAKE12(busy_ns); TAKE12(replay_max_ns);
     #undef TAKE12
     if (gap / 1e6 > limit)
         vx_log("D3D12: frame %u took %.1f ms: %llu pipeline states (%.1f ms), %llu compiles (%.1f ms), %llu executes (%.1f ms, "
-               "%.1f ms of it for the submission lock), GPU %.1f ms, fence waits %.1f ms, drawable %.1f ms, %llu draws skipped, %llu GPU round trips (%.1f ms), replay on queue threads %.1f ms",
+               "%.1f ms of it for the submission lock), GPU %.1f ms, fence waits %.1f ms, drawable %.1f ms, %llu draws skipped, %llu GPU round trips (%.1f ms), replay on queue threads %.1f ms (longest list %.1f), GPU busy %.1f ms",
                presents, gap / 1e6, (unsigned long long)f.pso_n, f.pso_ns / 1e6, (unsigned long long)f.compile_n, f.compile_ns / 1e6,
                (unsigned long long)f.exec_n, f.exec_ns / 1e6, f.lock_ns / 1e6, f.gpu_ns / 1e6, f.wait_ns / 1e6, f.drawable_ns / 1e6,
-               (unsigned long long)f.skipped, (unsigned long long)f.sync_n, f.sync_ns / 1e6, f.replay_ns / 1e6);
+               (unsigned long long)f.skipped, (unsigned long long)f.sync_n, f.sync_ns / 1e6, f.replay_ns / 1e6,
+               f.replay_max_ns / 1e6, f.busy_ns / 1e6);
     static uint64_t window_start;
     if (!window_start) window_start = now;
     if (presents % 300 == 0) {
@@ -7842,6 +7846,9 @@ static int gpu_ir_descriptor_value_append12(gpu_ir_descriptor_values12 *list,
     return GPU_IR_OK;
 }
 
+// (set: the next snapshot on this thread hands over its values, the caller discards each and frees the array)
+static __thread gpu_ir_descriptor_values12 *t_raw_values12;
+// (only the resources matter then: samplers are skipped and no Metal object is retained for the value)
 static int gpu_ir_descriptor_value_for_slot12(dev12 *device, const rootsig12 *root,
     const root_state *state, const dxil_msl_slot *slot, uint32_t stage, heap12 *resource_heap,
     heap12 *sampler_heap, const range12 *range, uint32_t array_element,
@@ -7948,7 +7955,7 @@ static int gpu_ir_descriptor_value_for_slot12(dev12 *device, const rootsig12 *ro
         res12 *resource = shader_view->resource;
         out->resource = resource->gpu_buffer ? resource->gpu_buffer : resource->gpu_texture;
         if (!out->resource) return GPU_IR_INVALID;
-        if (heap->keep && heap->keep[index]) {
+        if (heap->keep && heap->keep[index] && !t_raw_values12) {
             out->backend_object = (void *)CFBridgingRetain(heap->keep[index]);
             out->backend_release = gpu12_release_mtl_object;
         }
@@ -7980,8 +7987,7 @@ static int gpu_ir_descriptor_value_for_slot12(dev12 *device, const rootsig12 *ro
 static int gpu_ir_snapshot_root_bindings12_ex(dev12 *device, const dxil_msl *shader, uint32_t stage,
     root_binding *root_binding, heap12 *resource_heap, heap12 *sampler_heap,
     gpu_ir_descriptor_state **out_state, int bounded_only);
-// (set: the next snapshot on this thread hands over its values, the caller discards each and frees the array)
-static __thread gpu_ir_descriptor_values12 *t_raw_values12;
+
 static int gpu_ir_snapshot_root_bindings12(dev12 *device, const dxil_msl *shader, uint32_t stage,
     root_binding *root_binding, heap12 *resource_heap, heap12 *sampler_heap,
     gpu_ir_descriptor_state **out_state) {
@@ -8000,6 +8006,7 @@ static int gpu_ir_snapshot_root_bindings12_ex(dev12 *device, const dxil_msl *sha
     int result = GPU_IR_OK;
     for (uint32_t i = 0; i < shader->nslots; i++) {
         const dxil_msl_slot *slot = &shader->slots[i];
+        if (t_raw_values12 && slot->cls == DXIL_SAMPLER) continue;  // (accesses only: samplers name no resource)
         uint64_t descriptor_va, root_va;
         const range12 *range;
         int slot_result = state_root_slot12(root_binding->rs, &root_binding->st, slot, shader->stage,
@@ -8042,17 +8049,23 @@ static int gpu_ir_snapshot_root_bindings12_ex(dev12 *device, const dxil_msl *sha
             result = GPU_IR_INVALID;
             break;
         }
+        uint64_t element_va = 0, element_root_va = 0;
+        const range12 *element_range = NULL;
         for (uint64_t element = 0; element < elements; element++) {
             if (element > UINT32_MAX - slot->lower) { result = GPU_IR_RANGE; break; }
             dxil_msl_slot element_slot = *slot;
             element_slot.lower += (uint32_t)element;
-            uint64_t element_va, element_root_va;
-            const range12 *element_range;
-            int element_result = state_root_slot12(root_binding->rs, &root_binding->st, &element_slot, shader->stage,
-                &element_va, &element_root_va, &element_range);
-            if (element_result != 1 || element_root_va || !element_range) {
-                result = GPU_IR_INVALID;
-                break;
+            // (the next element of the same range is the next descriptor: the root signature is walked once a range)
+            if (element && element_range && (element_range->count == UINT32_MAX ||
+                                             element_slot.lower - element_range->base < element_range->count)) {
+                element_va += 32;
+            } else {
+                int element_result = state_root_slot12(root_binding->rs, &root_binding->st, &element_slot, shader->stage,
+                    &element_va, &element_root_va, &element_range);
+                if (element_result != 1 || element_root_va || !element_range) {
+                    result = GPU_IR_INVALID;
+                    break;
+                }
             }
             gpu_ir_descriptor_value value;
             result = gpu_ir_descriptor_value_for_slot12(device, root_binding->rs, &root_binding->st,
@@ -8478,6 +8491,11 @@ static int gpu_ir_access_list_copy12(const gpu_ir_access_list12 *from, gpu_ir_ac
 static int gpu_ir_collect_draw_accesses_cached12(dev12 *device, pso12 *pipeline, gfx_state *graphics,
                                                  root_binding *root, heap12 *resource_heap, heap12 *sampler_heap,
                                                  gpu_ir_access_list12 *list, int indexed) {
+    // (Cyberpunk 2077's draws never repeat a key - root constant buffers and tables move every draw - so the cache
+    //  only cost its copies there: VXRT_D3D12_ACCESS_CACHE=1 keeps it)
+    static int on = -1;
+    if (on < 0) on = getenv("VXRT_D3D12_ACCESS_CACHE") && *getenv("VXRT_D3D12_ACCESS_CACHE") == '1';
+    if (!on) return gpu_ir_collect_draw_accesses12(device, pipeline, graphics, root, resource_heap, sampler_heap, list, indexed);
     uint64_t h = 0xcbf29ce484222325ull;
     const void *ptrs[5] = { pipeline, root ? root->rs : NULL, resource_heap, sampler_heap, (void *)(intptr_t)indexed };
     h = fnv1a12(h, ptrs, sizeof ptrs);
@@ -9094,12 +9112,43 @@ static MTLRenderStages d3d12_metal_stages12(uint32_t stage_mask) {
     return stages ? stages : MTLRenderStageVertex | MTLRenderStageFragment;
 }
 
+// What an encoder has been told it uses (useResource holds for the rest of the encoder): each thread remembers it for
+// its current encoder of each kind, so the draws after the first that bind the same resources declare nothing new.
+typedef struct { void *resource; uint64_t epoch; uint32_t usage, stages; } use_seen12;
+static __thread use_seen12 t_use_seen12[2][2048];
+static __thread uint64_t t_use_epoch12[2];
+static __thread void *t_use_encoder12[2];
+static __thread uint64_t t_use_serial12[2];
+static int use_needed12(int kind, void *encoder, uint64_t serial, void *resource, uint32_t *usage, uint32_t *stages) {
+    static int off = -1;
+    if (off < 0) off = getenv("VXRT_D3D12_USE_DEDUP") && *getenv("VXRT_D3D12_USE_DEDUP") == '0';
+    if (off) return 1;
+    if (t_use_encoder12[kind] != encoder || t_use_serial12[kind] != serial) {
+        t_use_encoder12[kind] = encoder;
+        t_use_serial12[kind] = serial;
+        t_use_epoch12[kind]++;
+    }
+    uint64_t epoch = t_use_epoch12[kind];
+    uint32_t h = (uint32_t)(((uintptr_t)resource >> 4) * 2654435761u) & 2047;
+    for (int probe = 0; probe < 8; probe++) {
+        use_seen12 *e = &t_use_seen12[kind][(h + probe) & 2047];
+        if (e->epoch != epoch) { *e = (use_seen12){ resource, epoch, *usage, *stages }; return 1; }
+        if (e->resource != resource) continue;
+        if ((e->usage | *usage) == e->usage && (e->stages | *stages) == e->stages) return 0;
+        e->usage |= *usage; e->stages |= *stages;
+        *usage = e->usage; *stages = e->stages;
+        return 1;
+    }
+    return 1;                                                      // (table crowded: declare it again)
+}
 static int d3d12_use_compute_accesses12(id<MTLComputeCommandEncoder> encoder,
                                        const gpu_ir_resource_access *accesses, uint32_t count) {
     for (uint32_t i = 0; i < count; i++) {
         id<MTLResource> resource = (__bridge id<MTLResource>)gpu_ir_backend_object(accesses[i].resource);
         if (!resource) return GPU_IR_INVALID;
-        [encoder useResource:resource usage:d3d12_metal_usage12(accesses[i].access_mask)];
+        uint32_t usage = (uint32_t)d3d12_metal_usage12(accesses[i].access_mask), stages = 0;
+        if (!use_needed12(0, (__bridge void *)encoder, t_ce_serial12, (__bridge void *)resource, &usage, &stages)) continue;
+        [encoder useResource:resource usage:(MTLResourceUsage)usage];
     }
     return GPU_IR_OK;
 }
@@ -9415,8 +9464,10 @@ static int d3d12_use_render_accesses12(id<MTLRenderCommandEncoder> encoder,
     for (uint32_t i = 0; i < count; i++) {
         id<MTLResource> resource = (__bridge id<MTLResource>)gpu_ir_backend_object(accesses[i].resource);
         if (!resource) return GPU_IR_INVALID;
-        [encoder useResource:resource usage:d3d12_metal_usage12(accesses[i].access_mask)
-                      stages:d3d12_metal_stages12(accesses[i].stage_mask)];
+        uint32_t usage = (uint32_t)d3d12_metal_usage12(accesses[i].access_mask);
+        uint32_t stages = (uint32_t)d3d12_metal_stages12(accesses[i].stage_mask);
+        if (!use_needed12(1, (__bridge void *)encoder, t_re_serial12, (__bridge void *)resource, &usage, &stages)) continue;
+        [encoder useResource:resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages];
     }
     return GPU_IR_OK;
 }
@@ -12013,14 +12064,50 @@ static int parallel_replay12(void) {
 }
 static void list_submit_replayed12(dev12 *d, queue12 *q, allocator12 *command_allocator, id<MTLCommandBuffer> cb,
                                    scratch sc, uint64_t value);
+// (our own threads: GCD started fewer than were asked for under Rosetta, the rest of the slots waiting)
+typedef struct replay_task12 { struct replay_task12 *next; void *run; } replay_task12;   // (run: CFBridgingRetain of the block)
+static pthread_mutex_t g_rpool_lock12 = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_rpool_cond12 = PTHREAD_COND_INITIALIZER;
+static replay_task12 *g_rpool_head12, *g_rpool_tail12;
+static void *replay_thread12(void *arg) {
+    (void)arg;
+    pthread_setname_np("d3d12 replay");
+    for (;;) {
+        pthread_mutex_lock(&g_rpool_lock12);
+        while (!g_rpool_head12) pthread_cond_wait(&g_rpool_cond12, &g_rpool_lock12);
+        replay_task12 *t = g_rpool_head12;
+        g_rpool_head12 = t->next;
+        if (!g_rpool_head12) g_rpool_tail12 = NULL;
+        pthread_mutex_unlock(&g_rpool_lock12);
+        @autoreleasepool { void (^run)(void) = CFBridgingRelease(t->run); run(); }
+        free(t);
+    }
+    return NULL;
+}
+static void replay_pool_post12(void (^run)(void)) {
+    replay_task12 *t = calloc(1, sizeof *t);
+    t->run = (void *)CFBridgingRetain([run copy]);
+    pthread_mutex_lock(&g_rpool_lock12);
+    if (g_rpool_tail12) g_rpool_tail12->next = t; else g_rpool_head12 = t;
+    g_rpool_tail12 = t;
+    pthread_cond_signal(&g_rpool_cond12);
+    pthread_mutex_unlock(&g_rpool_lock12);
+}
 static void job_execute_parallel12(queue12 *q, qjob12 *j) {
-    static dispatch_queue_t pool;
     static dispatch_semaphore_t slots;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        pool = dispatch_queue_create("d3d12 replay", DISPATCH_QUEUE_CONCURRENT);
         const char *e = getenv("VXRT_D3D12_REPLAY_THREADS");
-        slots = dispatch_semaphore_create(e && atoi(e) > 0 ? atoi(e) : 4);
+        int n = e && atoi(e) > 0 ? atoi(e) : 4;
+        slots = dispatch_semaphore_create(n);
+        for (int i = 0; i < n; i++) {
+            pthread_t t;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 8 << 20);
+            if (pthread_create(&t, &attr, replay_thread12, NULL) == 0) pthread_detach(t);
+            pthread_attr_destroy(&attr);
+        }
     });
     dev12 *d = q->dev;
     static int status_only = -1;
@@ -12060,7 +12147,7 @@ static void job_execute_parallel12(queue12 *q, qjob12 *j) {
         q->replays++;
         pthread_mutex_unlock(&q->jlock);
         dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
-        dispatch_async(pool, ^{
+        replay_pool_post12(^{
             @autoreleasepool {
                 uint64_t t0 = fs_now12();
                 __block id<MTLCommandBuffer> c = cb;
@@ -12072,7 +12159,10 @@ static void job_execute_parallel12(queue12 *q, qjob12 *j) {
                 replay(d, q->mtl_queue, q->desc.Type, l, &shadows, &state_count, &c2, &sc);
                 queue_discard_list_states12(shadows, state_count);
                 list_submit_replayed12(d, q, a, c2, sc, value);
-                FS_ADD12(replay_ns, fs_now12() - t0);
+                uint64_t took = fs_now12() - t0;
+                FS_ADD12(replay_ns, took);
+                for (uint64_t m = __atomic_load_n(&g_fs12.replay_max_ns, __ATOMIC_RELAXED);
+                     took > m && !__atomic_compare_exchange_n(&g_fs12.replay_max_ns, &m, took, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED); ) {}
             }
             if (queued_allocator) { __atomic_sub_fetch(&queued_allocator->queued, 1, __ATOMIC_RELEASE); d3d_release(&queued_allocator->base); }
             __atomic_sub_fetch(&l->pending, 1, __ATOMIC_RELEASE);
@@ -12142,7 +12232,17 @@ static void list_submit_replayed12(dev12 *d, queue12 *q, allocator12 *command_al
     [cb encodeSignalEvent:q->timeline value:value];
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         if (held) scratch_recycle(d, held);
-        if (done.GPUEndTime > done.GPUStartTime) FS_ADD12(gpu_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9));
+        if (done.GPUEndTime > done.GPUStartTime) {
+            FS_ADD12(gpu_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9));
+            // (busy: each span past the end of those before it - command buffers complete about in order)
+            static double busy_end;
+            static pthread_mutex_t busy_lock = PTHREAD_MUTEX_INITIALIZER;
+            pthread_mutex_lock(&busy_lock);
+            double from = done.GPUStartTime > busy_end ? done.GPUStartTime : busy_end;
+            if (done.GPUEndTime > from) FS_ADD12(busy_ns, (uint64_t)((done.GPUEndTime - from) * 1e9));
+            if (done.GPUEndTime > busy_end) busy_end = done.GPUEndTime;
+            pthread_mutex_unlock(&busy_lock);
+        }
         char *ran = what_ran;
         if (done.status != MTLCommandBufferStatusError) { free(ran); ran = NULL; }
         if (done.status == MTLCommandBufferStatusError) {
@@ -12263,6 +12363,7 @@ static WINAPI HRESULT queue_signal(void *this, void *fence, uint64_t v) {
     fence12 *fence_object = fence;
     if (!fence_object || fence_object->base.kind != K12_FENCE || fence_object->dev != q->dev ||
         !fence_object->event) return E_INVALIDARG;
+    __atomic_store_n(&fence_object->posted, v, __ATOMIC_RELAXED);
     if (q->async) {
         qjob12 *j = calloc(1, sizeof *j);
         j->run = job_signal12;
@@ -12280,6 +12381,16 @@ static HRESULT queue_signal_now12(queue12 *q, fence12 *fence_object, uint64_t v)
     if (!cb) return E_FAIL;
     pthread_mutex_lock(&q->dev->submit_lock);
     [cb encodeSignalEvent:fence_object->event value:v];
+    __atomic_store_n(&fence_object->posted_ran, v, __ATOMIC_RELAXED);
+    {
+        int type = (int)q->desc.Type;
+        void *fp = fence_object;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if (done.status == MTLCommandBufferStatusError)
+                vx_log("D3D12: a queue (type %d) signal of fence %p = %llu failed (%s)", type, fp, (unsigned long long)v,
+                       done.error.localizedDescription.UTF8String ?: "?");
+        }];
+    }
     if (trace_fences12()) {
         static volatile int n;
         if (__sync_add_and_fetch(&n, 1) <= 40) vx_log("D3D12: queue %p (type %d) signals fence %p = %llu (now %llu)", (void *)q, (int)q->desc.Type,
@@ -12311,6 +12422,17 @@ static HRESULT queue_wait_now12(queue12 *q, fence12 *fence_object, uint64_t v) {
     pthread_mutex_lock(&q->dev->submit_lock);
     fence_watch12(fence_object, v, "queue", q);
     [cb encodeWaitForEvent:fence_object->event value:v];
+    {
+        id<MTLSharedEvent> ev = fence_object->event;
+        int type = (int)q->desc.Type;
+        fence12 *fp = fence_object;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if (done.status == MTLCommandBufferStatusError)
+                vx_log("D3D12: a queue (type %d) wait for fence %p >= %llu failed (%s); the fence is at %llu, the last Signal call asked for %llu, the last committed %llu",
+                       type, (void *)fp, (unsigned long long)v, done.error.localizedDescription.UTF8String ?: "?", (unsigned long long)ev.signaledValue,
+                       (unsigned long long)fp->posted, (unsigned long long)fp->posted_ran);
+        }];
+    }
     [cb commit];
     pthread_mutex_unlock(&q->dev->submit_lock);
     return S_OK;
@@ -12695,9 +12817,11 @@ static void swap_snapshot12(swap12 *sc, uint32_t index) {
 static void swap_present_now12(swap12 *sc, uint32_t index, id<CAMetalDrawable> drawable, HANDLE waitable) {
     int queued = 0;
     id<MTLCommandBuffer> cb = drawable ? [sc->queue->mtl_queue commandBuffer] : nil;   // (before the lock: may wait)
+    // (the snapshot waits for the GPU: not with the submission lock held, which another queue's Signal the GPU may be
+    //  waiting for needs)
+    swap_snapshot12(sc, index);
     pthread_mutex_lock(&sc->dev->submit_lock);
     @autoreleasepool {
-        swap_snapshot12(sc, index);
         if (drawable && cb) {
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture = drawable.texture;
