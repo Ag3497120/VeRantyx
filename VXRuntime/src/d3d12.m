@@ -593,9 +593,12 @@ static __thread int t_cb_len12;
 static void cb_log_reset12(void) { t_cb_log12[0] = 0; t_cb_len12 = 0; }
 // VXRT_D3D12_SKIP=<file>: draws and dispatches whose shader (pixel shader for draws, compute shader for dispatches)
 // is listed in <file> (the 8 hex digits the logs print, one per line; reread at each present when it changes) are
-// left out: what a pass costs the frame, measured in one session by editing the file (the picture breaks).
+// left out: what a pass costs the frame, measured in one session by editing the file (the picture breaks). Lines *p,
+// *c, *i, *I, *g leave out every draw, dispatch, indirect dispatch, indirect draw, copy.
 static volatile uint32_t g_skip12[64];
 static volatile int g_skip_count12;
+static volatile int g_census12;
+static volatile int g_no_dispatch_barrier12;   // (a line "!dbarrier": no memory barrier after each dispatch, to compare)               // (a line "?" in the file: presents left to count shaders' uses)
 static const char *skip_path12(void) {
     static const char *p = (const char *)-1;
     if (p == (const char *)-1) { p = getenv("VXRT_D3D12_SKIP"); if (p && !*p) p = NULL; }
@@ -606,24 +609,52 @@ static void skip_poll12(void) {
     if (!p) return;
     static struct timespec seen;
     struct stat st;
-    if (stat(p, &st)) { g_skip_count12 = 0; seen.tv_sec = 0; return; }
+    if (stat(p, &st)) { g_skip_count12 = 0; g_no_dispatch_barrier12 = 0; seen.tv_sec = 0; return; }
     if (st.st_mtimespec.tv_sec == seen.tv_sec && st.st_mtimespec.tv_nsec == seen.tv_nsec) return;
     seen = st.st_mtimespec;
     FILE *f = fopen(p, "r");
-    int n = 0;
+    int n = 0, nodbar = 0;
     char line[128];
     while (f && n < 64 && fgets(line, sizeof line, f)) {
         char *end;
+        if (line[0] == '?') { if (!g_census12) g_census12 = 31; continue; }
+        if (!strncmp(line, "!dbarrier", 9)) { nodbar = 1; continue; }
+        if (line[0] == '*') { g_skip12[n++] = 0x80000000u | (uint8_t)line[1]; continue; }   // (*p every draw, *c every dispatch, *i every indirect one, *I indirect draws, *g copies)
         unsigned long v = strtoul(line, &end, 16);
         if (end != line) g_skip12[n++] = (uint32_t)v;
     }
     if (f) fclose(f);
     g_skip_count12 = n;
+    g_no_dispatch_barrier12 = nodbar;
     vx_log("D3D12: %d shaders skipped (VXRT_D3D12_SKIP)", n);
 }
-static int skipped_shader12(uint64_t hash) {
+// (a line "?": the next 30 presents' draws and dispatches are counted per shader and logged, most first)
+static struct { uint64_t hash; char kind; volatile uint32_t n; } g_census_tab12[1024];
+static void census12(uint64_t hash, char kind) {
+    uint32_t i = (uint32_t)(hash ^ (hash >> 29) ^ (uint64_t)kind) & 1023;
+    for (int probe = 0; probe < 1024; probe++, i = (i + 1) & 1023) {
+        if (g_census_tab12[i].hash == hash && g_census_tab12[i].kind == kind) { __atomic_add_fetch(&g_census_tab12[i].n, 1, __ATOMIC_RELAXED); return; }
+        if (!g_census_tab12[i].kind && __sync_bool_compare_and_swap(&g_census_tab12[i].kind, 0, kind)) {
+            g_census_tab12[i].hash = hash;
+            __atomic_add_fetch(&g_census_tab12[i].n, 1, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+}
+static void census_present12(void) {
+    if (!g_census12 || --g_census12) return;
+    int order[1024], m = 0;
+    for (int i = 0; i < 1024; i++) if (g_census_tab12[i].kind) order[m++] = i;
+    for (int i = 0; i < m; i++) for (int j = i + 1; j < m; j++) if (g_census_tab12[order[j]].n > g_census_tab12[order[i]].n) { int t = order[i]; order[i] = order[j]; order[j] = t; }
+    vx_log("D3D12: census: %d shaders over 30 presents", m);
+    for (int i = 0; i < m && i < 200; i++)
+        vx_log("D3D12: census: %c%08llx %u", g_census_tab12[order[i]].kind, (unsigned long long)(g_census_tab12[order[i]].hash >> 32), g_census_tab12[order[i]].n);
+    memset(g_census_tab12, 0, sizeof g_census_tab12);
+}
+static int skipped_shader12(uint64_t hash, char kind) {
+    if (g_census12) census12(hash, kind);
     int n = g_skip_count12;
-    for (int i = 0; i < n; i++) if (g_skip12[i] == (uint32_t)(hash >> 32)) return 1;
+    for (int i = 0; i < n; i++) if (g_skip12[i] == (uint32_t)(hash >> 32) || g_skip12[i] == (0x80000000u | (uint8_t)kind)) return 1;
     return 0;
 }
 static void prof_note12(char kind, uint64_t hash);
@@ -9567,7 +9598,7 @@ static int d3d12_gpu_ir_dispatch(void *opaque, const gpu_ir_pipeline *pipeline,
     [*ce dispatchThreadgroups:MTLSizeMake(group_count_x, group_count_y, group_count_z)
         threadsPerThreadgroup:MTLSizeMake(info->threadgroup_size[0], info->threadgroup_size[1], info->threadgroup_size[2])];
     // D3D12 UAV ordering is retained here until common resource-access records can express shader hazards.
-    [*ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+    if (!g_no_dispatch_barrier12) [*ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
     return GPU_IR_OK;
 }
 
@@ -9648,7 +9679,7 @@ static int d3d12_gpu_ir_dispatch_indirect(void *opaque, const gpu_ir_pipeline *p
                          threadsPerThreadgroup:MTLSizeMake(info->threadgroup_size[0], info->threadgroup_size[1],
                                                             info->threadgroup_size[2])];
     // Keep the same ordering point as a direct dispatch until common resource accesses model UAV hazards.
-    [*ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+    if (!g_no_dispatch_barrier12) [*ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
     return GPU_IR_OK;
 }
 
@@ -10841,7 +10872,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 vx_log("D3D12: could not open a render pass for a draw");
                 break;
             }
-            if (g_skip_count12 && skipped_shader12(pso->ps_code)) break;
+            if ((g_skip_count12 || g_census12) && skipped_shader12(pso->ps_code, 'p')) break;
             pass_dump_draw12(pso);
             if (!t_cb_len12 || t_cb_log12[t_cb_len12 - 10] != 'p') cb_log12('p', pso->ps_code, 0, 0, 0);
             d3d12_draw_context context = {
@@ -10895,7 +10926,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
         case C_DISPATCH: {
             if (g_prof_armed12 && ce) { [ce endEncoding]; ce = nil; }   // (GPU profile: a compute encoder per dispatch)
             if (!pso || !pso->compute) { vx_log("D3D12: Dispatch without a compute pipeline state"); break; }
-            if (g_skip_count12 && skipped_shader12(pso->cs_code)) break;
+            if ((g_skip_count12 || g_census12) && skipped_shader12(pso->cs_code, 'c')) break;
             cb_log12('c', pso->cs_code, c->a, c->b, c->c);
             int mapping_result = d3d12_shader_component_mapping_read12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
                                                                         compute, heap, sheap);
@@ -10983,13 +11014,13 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             }
             // (the next dispatch sees this one's writes, as D3D12's UAV barriers promise; resources reached through
             //  argument buffers are not tracked by Metal)
-            [ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+            if (!g_no_dispatch_barrier12) [ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
             break;
         }
         case C_EXECUTE_INDIRECT: {
             if (g_prof_armed12 && ce) { [ce endEncoding]; ce = nil; }   // (GPU profile: a compute encoder per dispatch)
             command_signature12 *sig = c->obj;
-            if (g_skip_count12 && pso && skipped_shader12(sig && sig->gfx ? pso->ps_code : pso->cs_code)) break;
+            if (g_skip_count12 && pso && skipped_shader12(sig && sig->gfx ? pso->ps_code : pso->cs_code, sig && sig->gfx ? 'I' : 'i')) break;
             cb_log12(sig && sig->gfx ? 'I' : 'i', pso ? (sig && sig->gfx ? pso->ps_code : pso->cs_code) : 0, c->a, 0, 0);
             res12 *arg_buffer = c->obj2, *count_buffer = c->obj3;
             if (!sig) { vx_log("D3D12: ExecuteIndirect has no command signature"); break; }
@@ -11291,6 +11322,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
         case C_GPU_IR: {
             close_pass(d, g, cb, &re);
             uint32_t kind = gpu_ir_command_kind(&l->gpu_ir, c->a);
+            if (g_skip_count12 && kind != GPU_IR_COMMAND_BARRIER && skipped_shader12(0, 'g')) break;
             if (kind != GPU_IR_COMMAND_BARRIER) cb_log12('g', 0, kind + 1, 0, 0);
             if (kind == GPU_IR_COMMAND_BARRIER || kind == GPU_IR_COMMAND_RESOLVE_TEXTURE) end_encoders(&ce, &be, &re);
             else {
@@ -12959,6 +12991,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     frame_stats_present12(sc->presents);
     cb_trace_poll12();
     skip_poll12();
+    census_present12();
     pass_dump_present12();
     watch_present12(sc->presents);
     prof_present12(sc->dev->mtl);
