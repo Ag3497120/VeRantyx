@@ -28,7 +28,7 @@
 // left alone when the scene moved less than VXRT_NPU_RACE_MIN_PX (default 0.3) pixels since the last frame shown.
 // Predictions come at most every other refresh of a 100 Hz+ display (even steps of 2 refreshes, 60 a second at
 // 120 Hz, half the GPU's work of every refresh; VXRT_NPU_RACE_HZ sets another rate). The flow is made once per real
-// frame on the Neural Engine (in the background, newest pair first; until it comes, a flow up to 3 frames old and its
+// frame on the Neural Engine (in the background, newest pair first; until it comes, a flow up to 6 frames old and its
 // motion map go on with B); each prediction costs only a GPU warp at half resolution (2x2 blocks): the motion map,
 // once per flow, at B's blocks, with no motion where A and B are equal or where B matches A better unmoved than moved
 // (HUD and subtitles over a moving scene, and their rims), and blocks whose forward and backward flows disagree
@@ -954,7 +954,7 @@ static struct {
     uint32_t mm_b_seq, mm_flow_seq;                // what the motion map was made from
     // statistics (every 5 s, the tick's thread; frames, superseded: the handlers')
     uint32_t frames, real, gen, still, held, evened, stale, nflow, ngpu, nlat, nt, npres;
-    int even;
+    double even;                   // no prediction this many refreshes before a real frame is due
     float flow_ms[512], gpu_ms[512], lat[512], ts[512];
     double pres[1024];
     double stat_t0;
@@ -1114,7 +1114,8 @@ static void handle_race(VXNpuSet *S, uint32_t slot, int has_in, double t) {
     // (a game at the refresh rate gets no predicted frames: no flow wanted)
     // (and not every frame's: a flow takes 20-50 ms of the Neural Engine and some of the GPU; a frame or two older is
     //  as good while the motion is slow)
-    uint32_t every = R.flow_px > 8 ? 1 : R.flow_px < 1 ? 3 : 2;
+    // (measured, 31-35 fps real: the flow every 2nd frame cost 6.5% of the game's frame rate)
+    uint32_t every = R.flow_px > 16 ? 1 : R.flow_px > 6 ? 2 : 3;
     if (prev >= 0 && has_in && (R.has_in & bit(prev)) && R.interval > R.period * 1.2 && !g.race_noflow &&
         (!R.flow_seq || R.b_seq - R.flow_bseq >= every)) {
         R.want_a = prev; R.want_b = (int)slot; R.want_bseq = R.b_seq;
@@ -1196,13 +1197,14 @@ static void race_tick(double tick, double period) {
         os_unfair_lock_lock(&R.lock);
         VXNpuSet *S = R.set;
         int ok = S && S->mm && R.b >= 0 && R.a >= 0 && R.flow_seq && R.interval > 0 &&
-                 R.b_seq - R.flow_bseq <= 3;                       // (a flow up to 3 frames old: it may take longer than a frame)
+                 R.b_seq - R.flow_bseq <= 6;                       // (a flow a few frames old: one every 3rd frame, taking 2)
         // how far on: B was presented at tb (and will be on screen as long after it as this one)
         double t = ok ? (now - R.tb) / R.interval : 0;
-        // (even steps: no prediction a refresh before the next real frame is due; it would leave a 1-refresh step)
+        // (even steps: no prediction VXRT_NPU_RACE_EVEN (1.5) refreshes before the next real frame is due; it would leave a
+        //  1-refresh step)
         double due = R.last_t + R.interval - now;
         if (!ok || t <= 0 || t > R.max_t + 1e-3 || g.race_nowarp) { R.held++; os_unfair_lock_unlock(&R.lock); }
-        else if (R.even && due > 0 && due < R.period) { R.evened++; os_unfair_lock_unlock(&R.lock); }
+        else if (due > 0 && due < R.even * R.period) { R.evened++; os_unfair_lock_unlock(&R.lock); }
         else if ((t - R.shown_t) * R.flow_px < R.min_px) { R.still++; os_unfair_lock_unlock(&R.lock); }
         else {
             int slot = R.b, a = R.a, fresh = R.flow_bseq == R.b_seq;
@@ -1270,7 +1272,7 @@ static void race_start(CAMetalLayer *layer) {
         R.margin = (m ? atof(m) : 4) / 1000;
         R.max_t = x ? atof(x) : 1.25;
         R.min_px = px ? atof(px) : 0.3;
-        R.even = !getenv("VXRT_NPU_RACE_EVEN") || atoi(getenv("VXRT_NPU_RACE_EVEN"));
+        R.even = getenv("VXRT_NPU_RACE_EVEN") ? atof(getenv("VXRT_NPU_RACE_EVEN")) : 1.5;
         if (hz && !R.hz) R.hz = (float)atof(hz);
     }
     NSScreen *screen = nil;
