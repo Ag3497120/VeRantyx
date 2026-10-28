@@ -32,6 +32,7 @@
 #include "gpu_ir.h"
 #include "gpu_ir_metal.h"
 #include "gpu_ir_msl.h"
+#include "npu_interp.h"
 #include <float.h>
 #include <sys/stat.h>
 #pragma clang diagnostic push
@@ -12944,14 +12945,18 @@ static void swap_snapshot12(swap12 *sc, uint32_t index) {
 }
 // (the copy of the back buffer into the drawable, and the present: on the queue's thread with VXRT_D3D12_ASYNC_SUBMIT)
 static void swap_present_now12(swap12 *sc, uint32_t index, id<CAMetalDrawable> drawable, HANDLE waitable) {
-    int queued = 0;
-    id<MTLCommandBuffer> cb = drawable ? [sc->queue->mtl_queue commandBuffer] : nil;   // (before the lock: may wait)
+    int queued = 0, npu = npu_interp_on((__bridge void *)sc->layer);   // (VXRT_NPU_INTERP: npu_interp.m shows it)
+    id<MTLCommandBuffer> cb = drawable || npu ? [sc->queue->mtl_queue commandBuffer] : nil;   // (before the lock: may wait)
     // (the snapshot waits for the GPU: not with the submission lock held, which another queue's Signal the GPU may be
     //  waiting for needs)
     swap_snapshot12(sc, index);
     pthread_mutex_lock(&sc->dev->submit_lock);
     @autoreleasepool {
-        if (drawable && cb) {
+        if (npu && cb) {
+            npu_interp_frame((__bridge void *)sc->layer, (__bridge void *)cb, (__bridge void *)sc->buffers[index]->texture,
+                             sc->src_width, sc->src_height, waitable);
+            queued = 1;
+        } else if (drawable && cb) {
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture = drawable.texture;
             rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -12989,7 +12994,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
         // (the drawable is waited for before the submission lock: a wait for the display holds up no other thread's
         //  ExecuteCommandLists)
         uint64_t t0 = fs_now12();
-        id<CAMetalDrawable> drawable = [sc->layer nextDrawable];
+        id<CAMetalDrawable> drawable = npu_interp_on((__bridge void *)sc->layer) ? nil : [sc->layer nextDrawable];
         FS_ADD12(drawable_ns, fs_now12() - t0);
         if (sc->queue->async) {
             qjob12 *j = calloc(1, sizeof *j);
