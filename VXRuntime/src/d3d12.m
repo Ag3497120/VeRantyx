@@ -33,6 +33,7 @@
 #include "gpu_ir_metal.h"
 #include "gpu_ir_msl.h"
 #include <float.h>
+#include <sys/stat.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -590,6 +591,41 @@ static double frame_stats_ms12(void) {
 static __thread char t_cb_log12[1024];
 static __thread int t_cb_len12;
 static void cb_log_reset12(void) { t_cb_log12[0] = 0; t_cb_len12 = 0; }
+// VXRT_D3D12_SKIP=<file>: draws and dispatches whose shader (pixel shader for draws, compute shader for dispatches)
+// is listed in <file> (the 8 hex digits the logs print, one per line; reread at each present when it changes) are
+// left out: what a pass costs the frame, measured in one session by editing the file (the picture breaks).
+static volatile uint32_t g_skip12[64];
+static volatile int g_skip_count12;
+static const char *skip_path12(void) {
+    static const char *p = (const char *)-1;
+    if (p == (const char *)-1) { p = getenv("VXRT_D3D12_SKIP"); if (p && !*p) p = NULL; }
+    return p;
+}
+static void skip_poll12(void) {
+    const char *p = skip_path12();
+    if (!p) return;
+    static struct timespec seen;
+    struct stat st;
+    if (stat(p, &st)) { g_skip_count12 = 0; seen.tv_sec = 0; return; }
+    if (st.st_mtimespec.tv_sec == seen.tv_sec && st.st_mtimespec.tv_nsec == seen.tv_nsec) return;
+    seen = st.st_mtimespec;
+    FILE *f = fopen(p, "r");
+    int n = 0;
+    char line[128];
+    while (f && n < 64 && fgets(line, sizeof line, f)) {
+        char *end;
+        unsigned long v = strtoul(line, &end, 16);
+        if (end != line) g_skip12[n++] = (uint32_t)v;
+    }
+    if (f) fclose(f);
+    g_skip_count12 = n;
+    vx_log("D3D12: %d shaders skipped (VXRT_D3D12_SKIP)", n);
+}
+static int skipped_shader12(uint64_t hash) {
+    int n = g_skip_count12;
+    for (int i = 0; i < n; i++) if (g_skip12[i] == (uint32_t)(hash >> 32)) return 1;
+    return 0;
+}
 static void prof_note12(char kind, uint64_t hash);
 static void cb_log12(char kind, uint64_t hash, uint32_t x, uint32_t y, uint32_t z) {
     prof_note12(kind, hash);
@@ -10805,6 +10841,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 vx_log("D3D12: could not open a render pass for a draw");
                 break;
             }
+            if (g_skip_count12 && skipped_shader12(pso->ps_code)) break;
             pass_dump_draw12(pso);
             if (!t_cb_len12 || t_cb_log12[t_cb_len12 - 10] != 'p') cb_log12('p', pso->ps_code, 0, 0, 0);
             d3d12_draw_context context = {
@@ -10858,6 +10895,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
         case C_DISPATCH: {
             if (g_prof_armed12 && ce) { [ce endEncoding]; ce = nil; }   // (GPU profile: a compute encoder per dispatch)
             if (!pso || !pso->compute) { vx_log("D3D12: Dispatch without a compute pipeline state"); break; }
+            if (g_skip_count12 && skipped_shader12(pso->cs_code)) break;
             cb_log12('c', pso->cs_code, c->a, c->b, c->c);
             int mapping_result = d3d12_shader_component_mapping_read12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
                                                                         compute, heap, sheap);
@@ -10951,6 +10989,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
         case C_EXECUTE_INDIRECT: {
             if (g_prof_armed12 && ce) { [ce endEncoding]; ce = nil; }   // (GPU profile: a compute encoder per dispatch)
             command_signature12 *sig = c->obj;
+            if (g_skip_count12 && pso && skipped_shader12(sig && sig->gfx ? pso->ps_code : pso->cs_code)) break;
             cb_log12(sig && sig->gfx ? 'I' : 'i', pso ? (sig && sig->gfx ? pso->ps_code : pso->cs_code) : 0, c->a, 0, 0);
             res12 *arg_buffer = c->obj2, *count_buffer = c->obj3;
             if (!sig) { vx_log("D3D12: ExecuteIndirect has no command signature"); break; }
@@ -12062,6 +12101,43 @@ static int parallel_replay12(void) {
     if (v < 0) { const char *e = getenv("VXRT_D3D12_PARALLEL_REPLAY"); v = e && *e == '1' && getenv("VXRT_D3D12_LENIENT_STATES"); }
     return v;
 }
+// VXRT_D3D12_CB_TRACE=<file>: when <file>.now appears (it is removed), the next 600 command buffers of every queue are
+// written to <file> as they complete: queue type, what (L list with its timeline value and the longest-running
+// commands' log, S signal / W wait with fence and value, P present), when it was enqueued and committed on the CPU and
+// when the GPU ran it (seconds, one clock): to find where the GPU stands idle and what it waited for.
+static const char *cb_trace_path12(void) {
+    static const char *p = (const char *)-1;
+    if (p == (const char *)-1) { p = getenv("VXRT_D3D12_CB_TRACE"); if (p && !*p) p = NULL; }
+    return p;
+}
+static volatile int g_cb_trace_left12;
+static __thread double t_cb_enq12;            // (when the list's command buffer was enqueued, if it was)
+static void cb_trace_poll12(void) {                    // (at each present)
+    const char *p = cb_trace_path12();
+    if (!p || g_cb_trace_left12) return;
+    char now[1024];
+    snprintf(now, sizeof now, "%s.now", p);
+    if (access(now, F_OK) == 0) { unlink(now); unlink(p); g_cb_trace_left12 = 600; }
+}
+static void cb_trace12(id<MTLCommandBuffer> cb, int type, char kind, const void *what, uint64_t value, double enq, const char *log) {
+    if (!cb_trace_path12() || __atomic_load_n(&g_cb_trace_left12, __ATOMIC_RELAXED) <= 0) return;
+    if (__atomic_sub_fetch(&g_cb_trace_left12, 1, __ATOMIC_RELAXED) < 0) return;
+    double commit = CACurrentMediaTime();
+    char *l = log ? strndup(log, 160) : NULL;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&lk);
+        FILE *f = fopen(cb_trace_path12(), "a");
+        if (f) {
+            fprintf(f, "%d %c %p %llu enq %.6f commit %.6f gpu %.6f %.6f %s\n", type, kind, what, (unsigned long long)value,
+                    enq ? enq : commit, commit, done.GPUStartTime, done.GPUEndTime, l ? l : "");
+            fclose(f);
+        }
+        pthread_mutex_unlock(&lk);
+        free(l);
+    }];
+}
+
 static void list_submit_replayed12(dev12 *d, queue12 *q, allocator12 *command_allocator, id<MTLCommandBuffer> cb,
                                    scratch sc, uint64_t value);
 // (our own threads: GCD started fewer than were asked for under Rosetta, the rest of the slots waiting)
@@ -12136,6 +12212,7 @@ static void job_execute_parallel12(queue12 *q, qjob12 *j) {
             cb = [q->mtl_queue commandBufferWithDescriptor:cd];
         } else cb = [q->mtl_queue commandBuffer];
         [cb enqueue];
+        double enq_time = cb_trace_path12() ? CACurrentMediaTime() : 0;
         __atomic_add_fetch(&a->in_flight, 1, __ATOMIC_RELEASE);
         d3d_addref(&a->base);
         uint64_t value = ++q->timeline_value;
@@ -12156,6 +12233,7 @@ static void job_execute_parallel12(queue12 *q, qjob12 *j) {
                 resource_state_shadow12 *shadows = NULL;
                 uint32_t state_count = 0;
                 cb_log_reset12();
+                t_cb_enq12 = enq_time;
                 replay(d, q->mtl_queue, q->desc.Type, l, &shadows, &state_count, &c2, &sc);
                 queue_discard_list_states12(shadows, state_count);
                 list_submit_replayed12(d, q, a, c2, sc, value);
@@ -12268,6 +12346,7 @@ static void list_submit_replayed12(dev12 *d, queue12 *q, allocator12 *command_al
         __atomic_fetch_sub(&command_allocator->in_flight, 1, __ATOMIC_ACQ_REL);
         d3d_release(&command_allocator->base);
     }];
+    cb_trace12(cb, (int)q->desc.Type, 'L', NULL, value, t_cb_enq12, what_ran);
     [cb commit];
 }
 
@@ -12396,6 +12475,7 @@ static HRESULT queue_signal_now12(queue12 *q, fence12 *fence_object, uint64_t v)
         if (__sync_add_and_fetch(&n, 1) <= 40) vx_log("D3D12: queue %p (type %d) signals fence %p = %llu (now %llu)", (void *)q, (int)q->desc.Type,
                                                       fence, (unsigned long long)v, (unsigned long long)fence_object->event.signaledValue);
     }
+    cb_trace12(cb, (int)q->desc.Type, 'S', fence, v, 0, NULL);
     [cb commit];
     pthread_mutex_unlock(&q->dev->submit_lock);
     return S_OK;
@@ -12433,6 +12513,7 @@ static HRESULT queue_wait_now12(queue12 *q, fence12 *fence_object, uint64_t v) {
                        (unsigned long long)fp->posted, (unsigned long long)fp->posted_ran);
         }];
     }
+    cb_trace12(cb, (int)q->desc.Type, 'W', fence_object, v, 0, NULL);
     [cb commit];
     pthread_mutex_unlock(&q->dev->submit_lock);
     return S_OK;
@@ -12836,6 +12917,7 @@ static void swap_present_now12(swap12 *sc, uint32_t index, id<CAMetalDrawable> d
             [enc endEncoding];
             [cb presentDrawable:drawable];
             if (waitable) [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; vx_release_semaphore(waitable, 1); }];
+            cb_trace12(cb, (int)sc->queue->desc.Type, 'P', sc, sc->presents, 0, NULL);
             [cb commit];
             queued = 1;
         }
@@ -12875,6 +12957,8 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     sc->index = (sc->index + 1) % sc->count;
     sc->presents++;
     frame_stats_present12(sc->presents);
+    cb_trace_poll12();
+    skip_poll12();
     pass_dump_present12();
     watch_present12(sc->presents);
     prof_present12(sc->dev->mtl);
