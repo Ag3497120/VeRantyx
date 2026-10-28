@@ -3,7 +3,7 @@
 #pragma once
 #include <stdint.h>
 
-enum { NPU_FD = 3, NPU_MAX_TILES = 4, NPU_MAX_SLOTS = 6, NPU_OP_INIT = 1, NPU_OP_PROC = 2 };
+enum { NPU_FD = 3, NPU_MAX_TILES = 4, NPU_MAX_SLOTS = 8, NPU_OP_INIT = 1, NPU_OP_PROC = 2 };
 enum { NPU_MODE_INTERPOLATE = 1, NPU_MODE_FLOW = 2 };
 
 // INIT, mode NPU_MODE_INTERPOLATE: one frame interpolation session per tile of tile_w x tile_h (width a multiple of
