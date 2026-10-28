@@ -713,10 +713,84 @@ static double compile_timeout12(void) {
     return t;
 }
 static id<MTLLibrary> library_with_timeout12_(id<MTLDevice> mtl, NSString *source, MTLCompileOptions *options, NSError **error);
+// The compiled shaders kept on disk (VXRT_D3D12_SHADER_CACHE=<folder>, default ~/Library/Caches/VXRuntime/metallib;
+// 0: none). Metal caches the GPU code of a library, not the compile of its source, and a game's large shaders take
+// seconds to tens of seconds there each start (Cyberpunk 2077's 634912c2: 20-30 s, with its engine watchdog ending
+// the game at 120 s of loading). A shader whose source took over 0.2 s is compiled again in the background by the
+// offline compiler (xcrun metal, when it is there) into <folder>/<hash of source and options>.metallib, which the
+// next start loads instead.
+static const char *shader_cache_dir12(void) {
+    static char dir[1024];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("VXRT_D3D12_SHADER_CACHE");
+        if (e && !strcmp(e, "0")) return;
+        if (e && *e) snprintf(dir, sizeof dir, "%s", e);
+        else if (getenv("HOME")) snprintf(dir, sizeof dir, "%s/Library/Caches/VXRuntime/metallib", getenv("HOME"));
+        if (*dir) [[NSFileManager defaultManager] createDirectoryAtPath:@(dir) withIntermediateDirectories:YES attributes:nil error:nil];
+    });
+    return *dir ? dir : NULL;
+}
+static uint64_t shader_cache_key12(NSString *source, MTLCompileOptions *options, int *std32, int *min_lod, int *safe) {
+    const char *src = source.UTF8String;
+    *std32 = options.languageVersion == MTLLanguageVersion3_2;
+    *min_lod = options.preprocessorMacros[@"VXRT_HAS_MIN_LOD_CLAMP"] != nil;
+    *safe = !options.fastMathEnabled;
+    if (@available(macOS 15.0, *)) *safe = options.mathMode == MTLMathModeSafe;
+    uint64_t h = fnv1a12(0xcbf29ce484222325ull, src, src ? strlen(src) : 0);
+    uint8_t flags[4] = { 2 /* (the key's version) */, (uint8_t)*std32, (uint8_t)*min_lod, (uint8_t)*safe };
+    return fnv1a12(h, flags, sizeof flags);
+}
+static void shader_cache_store12(NSString *source, uint64_t key, int std32, int min_lod, int safe) {
+    const char *dir = shader_cache_dir12();
+    if (!dir) return;
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("vxrt.metallib", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    NSString *text = [source copy];
+    char base[1200];
+    snprintf(base, sizeof base, "%s/%016llx", dir, (unsigned long long)key);
+    NSString *b = @(base);
+    dispatch_async(q, ^{
+        NSString *metal = [b stringByAppendingString:@".metal"], *tmp = [b stringByAppendingString:@".tmp.metallib"];
+        if (![text writeToFile:metal atomically:YES encoding:NSUTF8StringEncoding error:nil]) return;
+        NSMutableArray *args = [NSMutableArray arrayWithObjects:@"-sdk", @"macosx", @"metal", std32 ? @"-std=metal3.2" : @"-std=metal3.1", nil];
+        if (min_lod) [args addObject:@"-DVXRT_HAS_MIN_LOD_CLAMP=1"];
+        if (safe) [args addObject:@"-fno-fast-math"];
+        [args addObjectsFromArray:@[ @"-w", @"-o", tmp, metal ]];
+        NSTask *task = [NSTask new];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/xcrun"];
+        task.arguments = args;
+        task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+        task.standardError = [NSFileHandle fileHandleWithNullDevice];
+        NSError *e = nil;
+        if ([task launchAndReturnError:&e]) {
+            [task waitUntilExit];
+            if (task.terminationStatus == 0) rename(tmp.UTF8String, [b stringByAppendingString:@".metallib"].UTF8String);
+            else unlink(tmp.UTF8String);
+        }
+        unlink(metal.UTF8String);
+    });
+}
 static id<MTLLibrary> library_with_timeout12(id<MTLDevice> mtl, NSString *source, MTLCompileOptions *options, NSError **error) {
     uint64_t t0 = fs_now12();
+    int std32 = 0, min_lod = 0, safe = 0;
+    uint64_t key = 0;
+    const char *dir = shader_cache_dir12();
+    if (dir) {
+        key = shader_cache_key12(source, options, &std32, &min_lod, &safe);
+        char path[1200];
+        snprintf(path, sizeof path, "%s/%016llx.metallib", dir, (unsigned long long)key);
+        if (access(path, R_OK) == 0) {
+            id<MTLLibrary> lib = [mtl newLibraryWithURL:[NSURL fileURLWithPath:@(path)] error:nil];
+            if (lib) { FS_ADD12(compile_n, 1); FS_ADD12(compile_ns, fs_now12() - t0); return lib; }
+            unlink(path);                                          // (unreadable: compiled again)
+        }
+    }
     id<MTLLibrary> lib = library_with_timeout12_(mtl, source, options, error);
-    FS_ADD12(compile_n, 1); FS_ADD12(compile_ns, fs_now12() - t0);
+    uint64_t took = fs_now12() - t0;
+    FS_ADD12(compile_n, 1); FS_ADD12(compile_ns, took);
+    if (dir && took > 200000000ull) shader_cache_store12(source, key, std32, min_lod, safe);
     return lib;
 }
 static id<MTLLibrary> library_with_timeout12_(id<MTLDevice> mtl, NSString *source, MTLCompileOptions *options, NSError **error) {
