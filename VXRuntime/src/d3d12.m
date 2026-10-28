@@ -597,8 +597,10 @@ static void cb_log_reset12(void) { t_cb_log12[0] = 0; t_cb_len12 = 0; }
 // *c, *i, *I, *g leave out every draw, dispatch, indirect dispatch, indirect draw, copy.
 static volatile uint32_t g_skip12[64];
 static volatile int g_skip_count12;
-static volatile int g_census12;
-static volatile int g_no_dispatch_barrier12;   // (a line "!dbarrier": no memory barrier after each dispatch, to compare)               // (a line "?" in the file: presents left to count shaders' uses)
+static volatile int g_census12;                // (a line "?" in the file: presents left to count shaders' uses)
+// (a line "!dbarrier": no memory barrier after each dispatch; "!concurrent": that, and compute encoders of concurrent
+//  dispatches - D3D12 orders dispatches only at its barriers, which end the encoder - to compare)
+static volatile int g_no_dispatch_barrier12;
 static const char *skip_path12(void) {
     static const char *p = (const char *)-1;
     if (p == (const char *)-1) { p = getenv("VXRT_D3D12_SKIP"); if (p && !*p) p = NULL; }
@@ -618,7 +620,8 @@ static void skip_poll12(void) {
     while (f && n < 64 && fgets(line, sizeof line, f)) {
         char *end;
         if (line[0] == '?') { if (!g_census12) g_census12 = 31; continue; }
-        if (!strncmp(line, "!dbarrier", 9)) { nodbar = 1; continue; }
+        if (!strncmp(line, "!dbarrier", 9)) { nodbar |= 1; continue; }
+        if (!strncmp(line, "!concurrent", 11)) { nodbar |= 3; continue; }
         if (line[0] == '*') { g_skip12[n++] = 0x80000000u | (uint8_t)line[1]; continue; }   // (*p every draw, *c every dispatch, *i every indirect one, *I indirect draws, *g copies)
         unsigned long v = strtoul(line, &end, 16);
         if (end != line) g_skip12[n++] = (uint32_t)v;
@@ -9029,7 +9032,7 @@ static void prof_note12(char kind, uint64_t hash) {
 }
 static id<MTLComputeCommandEncoder> new_compute12(id<MTLCommandBuffer> cb) {
     int k = prof_begin12(cb.device, 'C');
-    if (k < 0) return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    if (k < 0) return [cb computeCommandEncoderWithDispatchType:(g_no_dispatch_barrier12 & 2) ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
     MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
     pd.dispatchType = MTLDispatchTypeSerial;
     pd.sampleBufferAttachments[0].sampleBuffer = g_prof_buf12;
