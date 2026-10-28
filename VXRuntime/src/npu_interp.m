@@ -28,7 +28,7 @@
 // left alone when the scene moved less than VXRT_NPU_RACE_MIN_PX (default 0.3) pixels since the last frame shown.
 // Predictions come at most every other refresh of a 100 Hz+ display (even steps of 2 refreshes, 60 a second at
 // 120 Hz, half the GPU's work of every refresh; VXRT_NPU_RACE_HZ sets another rate). The flow is made once per real
-// frame on the Neural Engine (in the background, newest pair first; until it comes, the previous pair's flow and
+// frame on the Neural Engine (in the background, newest pair first; until it comes, a flow up to 3 frames old and its
 // motion map go on with B); each prediction costs only a GPU warp at half resolution (2x2 blocks): the motion map,
 // once per flow, at B's blocks, with no motion where A and B are equal or where B matches A better unmoved than moved
 // (HUD and subtitles over a moving scene, and their rims), and blocks whose forward and backward flows disagree
@@ -936,6 +936,7 @@ static struct {
     double shown_at, shown_t;      // when the last frame (real or not) was presented, and how far on from B
     int want_a, want_b, run_a, run_b, flow_busy;   // the flow's pairs (waiting, running)
     int flow_dst, flow_b; uint32_t flow_seq;       // the newest flow done: its dst slot, its pair's B, a count
+    uint32_t want_bseq, flow_bseq;                 // which B (b_seq) the waiting pair and the newest flow end at
     float flow_px;                                 // its motion, frame pixels an interval (98th percentile)
     uint32_t mm_b_seq, mm_flow_seq;                // what the motion map was made from
     // statistics (every 5 s, the tick's thread; frames, superseded: the handlers')
@@ -1011,6 +1012,7 @@ static float flow_motion(VXNpuSet *S, uint32_t d) {
 static void flow_kick(VXNpuSet *S) {
     if (R.flow_busy || R.want_b < 0 || !S->ready || S->sock < 0 || !g.race) return;
     int a = R.want_a, b = R.want_b;
+    uint32_t bseq = R.want_bseq;
     R.want_a = R.want_b = -1;
     R.run_a = a; R.run_b = b; R.flow_busy = 1; g.race_flow = 1;
     uint32_t d = (uint32_t)(R.flow_dst + 1) % NDST;
@@ -1029,7 +1031,7 @@ static void flow_kick(VXNpuSet *S) {
         R.flow_busy = 0; g.race_flow = 0;
         R.run_a = R.run_b = -1;
         if (R.set == S && ok && r.status == 0) {
-            R.flow_dst = (int)d; R.flow_b = b; R.flow_seq++; R.flow_px = px;
+            R.flow_dst = (int)d; R.flow_b = b; R.flow_seq++; R.flow_px = px; R.flow_bseq = bseq;
             if (R.nflow < 512) R.flow_ms[R.nflow++] = (float)((now_s() - t0) * 1000);
         }
         if (R.set == S) flow_kick(S);
@@ -1097,7 +1099,7 @@ static void handle_race(VXNpuSet *S, uint32_t slot, int has_in, double t) {
     R.a = prev; R.b = (int)slot; R.b_seq++;
     // (a game at the refresh rate gets no predicted frames: no flow wanted)
     if (prev >= 0 && has_in && (R.has_in & bit(prev)) && R.interval > R.period * 1.2) {
-        R.want_a = prev; R.want_b = (int)slot;
+        R.want_a = prev; R.want_b = (int)slot; R.want_bseq = R.b_seq;
         flow_kick(S);
     }
     os_unfair_lock_unlock(&R.lock);
@@ -1175,13 +1177,14 @@ static void race_tick(double tick, double period) {
     if (R.shown_at < tick && now - R.shown_at >= gap - 0.002) {
         os_unfair_lock_lock(&R.lock);
         VXNpuSet *S = R.set;
-        int ok = S && S->mm && R.b >= 0 && R.a >= 0 && R.flow_seq && R.interval > 0 && (R.flow_b == R.b || R.flow_b == R.a);
+        int ok = S && S->mm && R.b >= 0 && R.a >= 0 && R.flow_seq && R.interval > 0 &&
+                 R.b_seq - R.flow_bseq <= 3;                       // (a flow up to 3 frames old: it may take longer than a frame)
         // how far on: B was presented at tb (and will be on screen as long after it as this one)
         double t = ok ? (now - R.tb) / R.interval : 0;
         if (!ok || t <= 0 || t > R.max_t + 1e-3) { R.held++; os_unfair_lock_unlock(&R.lock); }
         else if ((t - R.shown_t) * R.flow_px < R.min_px) { R.still++; os_unfair_lock_unlock(&R.lock); }
         else {
-            int slot = R.b, a = R.a, fresh = R.flow_b == R.b;
+            int slot = R.b, a = R.a, fresh = R.flow_bseq == R.b_seq;
             uint32_t d = (uint32_t)R.flow_dst;
             // (once per flow: a previous pair's flow goes on with the motion map made with it, from A's pixels)
             int new_mm = R.mm_flow_seq != R.flow_seq;
