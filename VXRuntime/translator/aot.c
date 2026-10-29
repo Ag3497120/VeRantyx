@@ -42,14 +42,42 @@ int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash) {
     }
     if (g_nmod == MAX_MODULES) return -1;
     g_mod[g_nmod++] = d;
-    vx_log("aot: %s: %llu blocks, %llu C functions, %llu KB of code for the image at %#llx", path, (unsigned long long)d->nblocks,
-           (unsigned long long)d->ncfns, (unsigned long long)((d->code_end - d->code) >> 10), (unsigned long long)base);
+    vx_log("aot: %s: %llu blocks, %llu C functions, %llu KB of code for the image at %#llx (part %d of %d: %#llx-%#llx)", path,
+           (unsigned long long)d->nblocks, (unsigned long long)d->ncfns, (unsigned long long)((d->code_end - d->code) >> 10),
+           (unsigned long long)base, d->part, d->nparts, (unsigned long long)d->part_lo, (unsigned long long)d->part_hi);
     return 0;
+}
+
+static const xa_block *block_at(const xa_desc *d, uint64_t rip);
+int xa_link(uint64_t hash) {
+    const xa_desc *part[MAX_MODULES] = { 0 };
+    int n = 0, total = 0;
+    for (int i = 0; i < g_nmod; i++)
+        if (g_mod[i]->file_hash == hash && g_mod[i]->part < MAX_MODULES) { part[g_mod[i]->part] = g_mod[i]; total = g_mod[i]->nparts; n++; }
+    if (total <= 1) return n;
+    for (int p = 0; p < total && p < MAX_MODULES; p++) {
+        const xa_desc *d = part[p];
+        if (!d) { vx_log("aot: part %d of the image with hash %016llx is missing: its addresses go to the translator", p, (unsigned long long)hash); continue; }
+        for (int q = 0; q < total && q < MAX_MODULES; q++) d->plk[q] = part[q] ? (uint64_t)(uintptr_t)part[q]->lookup : 0;
+        uint64_t linked = 0;
+        for (uint64_t k = 0; k < d->nx; k++) {
+            uint64_t rip = d->xrip[k];
+            for (int q = 0; q < total && q < MAX_MODULES; q++) {
+                const xa_desc *e = part[q];
+                if (!e || rip < e->part_lo || rip >= e->part_hi) continue;
+                const xa_block *b = block_at(e, rip);
+                if (b) { d->xslot[k] = (uint64_t)(uintptr_t)(e->code + b->off); linked++; }
+                break;
+            }
+        }
+        if (linked != d->nx) vx_log("aot: part %d: %llu of %llu branches to other parts linked", p, (unsigned long long)linked, (unsigned long long)d->nx);
+    }
+    return n;
 }
 
 static const xa_desc *module_for(uint64_t rip) {
     for (int i = 0; i < g_nmod; i++)
-        if (rip - g_mod[i]->image_base < g_mod[i]->image_size) return g_mod[i];
+        if (rip >= g_mod[i]->part_lo && rip < g_mod[i]->part_hi) return g_mod[i];
     return NULL;
 }
 static const xa_block *block_at(const xa_desc *d, uint64_t rip) {

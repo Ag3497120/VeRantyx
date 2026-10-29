@@ -7,7 +7,7 @@
 #include "xlat.h"
 #include "engine.h"
 
-enum { XA_MAGIC = 0x52435856u /* "VXCR" */, XA_VERSION = 1 };
+enum { XA_MAGIC = 0x52435856u /* "VXCR" */, XA_VERSION = 2 };
 enum { XA_ORDERED = 1, XA_AFP = 2, XA_ROUTE_A = 4 };
 typedef struct { uint64_t rip; int64_t off; } xa_block;               // a block's x86 address and its code (from code)
 typedef struct { uint32_t off; int32_t sp; uint64_t rip; } xa_imap;   // host code offset -> x86 instruction (rip 0: none)
@@ -21,6 +21,12 @@ typedef struct {
     const xa_imap *imap; uint64_t nimap;             // sorted by off
     uint64_t *ext; uint64_t next;                    // host addresses the code loads (XA_HELPER ...), set by xa_load
     const xa_cfn *cfns; uint64_t ncfns;              // route A (not built: RECOMP.md): sorted by rip
+    // Parts (version 2): an image with more code than B/BL reach (±128 MB) is split into dylibs, each for the x86
+    // addresses [part_lo, part_hi) (one part: the whole image). xa_link fills the slots once all parts are loaded.
+    uint64_t part_lo, part_hi; int32_t part, nparts;
+    const void *lookup;                              // this part's lookup stub (x17: the x86 address)
+    uint64_t *plk;                                   // [nparts]: each part's lookup (0: not loaded, the exit)
+    const uint64_t *xrip; uint64_t *xslot; uint64_t nx;  // other parts' blocks this part branches to, and their code
 } xa_desc;
 
 // The generator and the loader agree on the file: FNV-1a 64 of the PE file's bytes.
@@ -32,6 +38,8 @@ static inline uint64_t xa_hash(const uint8_t *p, uint64_t n) {
 #ifdef __aarch64__
 // Loads a module for the image mapped at base (its file's bytes: hash); 0 when it is used.
 int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash);
+// The parts of the image with this hash branch to each other (after all of them are loaded); the number linked.
+int xa_link(uint64_t hash);
 int xa_any(void);
 // Runs the program from ctx->rip until stop like xe_run: in a module's code when the address is one of its blocks,
 // a native function (find) called from here, anything else on the engine (counted: the fallback; VXRT_AOT_STRICT=1

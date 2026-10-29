@@ -696,7 +696,16 @@ static vx_image *load_pe(const char *path, int is_main) {
         lower[k] = 0;
         snprintf(mod, sizeof mod, "%s/%s-%016llx.dylib", getenv("VXRT_AOT_DIR"), lower, (unsigned long long)aot_hash);
         if (!access(mod, R_OK)) xa_load(mod, (uint64_t)(uintptr_t)base, image_size, aot_hash);
-        else if (vx_trace) vx_log("aot: no module %s", mod);
+        else {
+            // (a large image's module comes in parts: <name>-<hash>.p<k>.dylib)
+            int parts = 0;
+            for (;; parts++) {
+                snprintf(mod, sizeof mod, "%s/%s-%016llx.p%d.dylib", getenv("VXRT_AOT_DIR"), lower, (unsigned long long)aot_hash, parts);
+                if (access(mod, R_OK) || xa_load(mod, (uint64_t)(uintptr_t)base, image_size, aot_hash)) break;
+            }
+            if (parts) xa_link(aot_hash);
+            else if (vx_trace) vx_log("aot: no module %s", mod);
+        }
     }
 #endif
 

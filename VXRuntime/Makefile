@@ -59,6 +59,9 @@ aot-suite: build/vxrt build/vxrt-arm64 build/vxrt-aot build/recomp/suite.exe
 	build/vxrt-aot gen build/recomp/suite.exe build/recomp/suite_b.s
 	clang -arch arm64 -dynamiclib -o build/aot/$$(build/vxrt-aot name build/recomp/suite.exe) build/recomp/suite_b.s
 	tools/aot_compare.sh build/recomp/suite.exe
+	@# the same split into parts of 20 KB (a large image's dylibs, branching to each other through veneers)
+	VXRT_AOT_PART_MB=0.02 tools/aot_build.sh build/recomp/suite.exe build/aotp > /dev/null
+	AOT_DIR=build/aotp tools/aot_compare.sh build/recomp/suite.exe
 # Code that runs inside the vCPU guest (translator/guest.c): no calls, no globals, no stack protector.
 GUEST_CFLAGS = -arch arm64 -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-stack-check -mmacosx-version-min=14.0 -Itranslator
 build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator/xvheap.h

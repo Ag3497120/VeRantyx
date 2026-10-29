@@ -494,38 +494,164 @@ static void gen_blocks(const image *im, uint64_t stop) {
 static int64_t block_index(uint64_t rip) { size_t s = bmap_find(rip); return g_bmap[2 * s] == rip && g_bmap[2 * s + 1] ? (int64_t)g_bmap[2 * s + 1] - 1 : -1; }
 static int cmp_blk(const void *a, const void *b) { uint64_t x = ((const tblock *)a)->rip, y = ((const tblock *)b)->rip; return x < y ? -1 : x > y; }
 
-// Words of generated code with the translator's sites (b->relocs, in order) made into branches to this module's stubs
-// and blocks, and its host addresses into loads from the module's table. rip: a block's (labels for each x86
-// instruction's first word, for the imap), or 0 for a stub.
-static void emit_code(FILE *o, const xlat_buf *b, uint64_t rip) {
-    size_t ri = 0, mi = 0;
-    for (size_t k = 0; k < b->n; k++) {
-        while (rip && mi < b->nimap && b->imap[mi].at == k) { fprintf(o, "LI%llx_%zu:\n", (unsigned long long)rip, mi); mi++; }
-        while (ri < b->nrelocs && b->relocs[ri].at < k) ri++;
-        if (ri < b->nrelocs && b->relocs[ri].at == k) {
-            uint32_t kind = b->relocs[ri].kind; const uint32_t *p = b->code + k;
-            if (kind == XR_LINK) {
-                uint64_t to = (uint64_t)p[1] | (uint64_t)p[2] << 32;
-                if (block_index(to) >= 0) fprintf(o, "\tb LB%llx\n", (unsigned long long)to);
-                else fprintf(o, "\tbl Lmiss_link\n");
-            } else if (kind == XR_CALL) {
-                uint64_t to = (uint64_t)p[4] | (uint64_t)p[5] << 32;
-                if (block_index(to) >= 0) fprintf(o, "\tbl LB%llx\n", (unsigned long long)to);
-                else fprintf(o, "\tbl Lmiss_call\n");
-            } else if (kind == XR_LOOKUP) fprintf(o, "\tb _vxaot_lookup\n");
-            else if (kind == XR_LOOKUP_CALL) fprintf(o, "\tbl _vxaot_lookup\n");
-            else if (kind == XR_EXIT) fprintf(o, "\tb Lexit\n");
-            else if (kind == XR_FLAGS) fprintf(o, "\tbl Lflags\n");
-            else if (kind == XR_ABS) {
-                int which = (int)(p[0] >> 5), reg = (int)(p[0] & 31);
-                fprintf(o, "\tadrp x%d, _vxaot_ext%d@PAGE\n\tldr x%d, [x%d, _vxaot_ext%d@PAGEOFF]\n\tnop\n\tnop\n", reg, which, reg, reg, which);
-                k += 3;
-            } else die("unknown site kind %u", kind);
-            ri++;
-            continue;
-        }
-        fprintf(o, "\t.inst 0x%08x\n", b->code[k]);
+// Parts: a module's code must reach its own blocks with B/BL (±128 MB), so an image with more code than that is
+// split into parts, each a dylib of its own covering a range of x86 addresses (blocks in address order). A branch to a
+// block in another part goes through a veneer here that loads the block's host address from a slot (xa_load fills
+// it); the lookup sends an address of another part's range to that part's lookup (its address in a slot too).
+static int *g_part;                                         // block index -> part
+static uint64_t *g_part_lo; static int g_nparts;            // each part's first x86 address (part 0: the image's base)
+static int g_cur;                                           // the part being written
+typedef struct { uint64_t *rip; size_t n, cap; uint64_t *set; size_t setcap; } xrefs;
+static xrefs g_x;
+static void xref_add(uint64_t rip) {
+    size_t mask = g_x.setcap - 1, i = (size_t)((rip * 0x9E3779B97F4A7C15ull) >> 20) & mask;
+    while (g_x.set[i] && g_x.set[i] != rip) i = (i + 1) & mask;
+    if (g_x.set[i]) return;
+    g_x.set[i] = rip;
+    if (g_x.n == g_x.cap) { g_x.cap = g_x.cap ? 2 * g_x.cap : 4096; g_x.rip = realloc(g_x.rip, g_x.cap * sizeof *g_x.rip); }
+    g_x.rip[g_x.n++] = rip;
+}
+// The words: runs of plain words in .inst lines of 8 (the file is several GB for a large image otherwise).
+static void emit_words(FILE *o, const uint32_t *w, size_t n) {
+    for (size_t i = 0; i < n; i += 8) {
+        fprintf(o, "\t.inst 0x%08x", w[i]);
+        for (size_t j = i + 1; j < n && j < i + 8; j++) fprintf(o, ",0x%08x", w[j]);
+        fputc('\n', o);
     }
+}
+static void emit_branch(FILE *o, const char *op, uint64_t to, const char *miss) {
+    int64_t k = block_index(to);
+    if (k < 0) fprintf(o, "\tbl %s\n", miss);
+    else if (g_part[k] == g_cur) fprintf(o, "\t%s LB%llx\n", op, (unsigned long long)to);
+    else { xref_add(to); fprintf(o, "\t%s LV%llx\n", op, (unsigned long long)to); }
+}
+static void emit_code2(FILE *o, const xlat_buf *b, uint64_t rip) {
+    size_t ri = 0, mi = 0, run = 0;
+    for (size_t k = 0; k <= b->n; k++) {
+        int site = 0, label = rip && mi < b->nimap && b->imap[mi].at == k;
+        while (ri < b->nrelocs && b->relocs[ri].at < k) ri++;
+        if (k < b->n && ri < b->nrelocs && b->relocs[ri].at == k) site = 1;
+        if (site || label || k == b->n) { emit_words(o, b->code + run, k - run); run = k; }
+        if (k == b->n) break;
+        while (rip && mi < b->nimap && b->imap[mi].at == k) { fprintf(o, "LI%llx_%zu:\n", (unsigned long long)rip, mi); mi++; }
+        if (!site) continue;
+        uint32_t kind = b->relocs[ri].kind; const uint32_t *p = b->code + k;
+        if (kind == XR_LINK) emit_branch(o, "b", (uint64_t)p[1] | (uint64_t)p[2] << 32, "Lmiss_link");
+        else if (kind == XR_CALL) emit_branch(o, "bl", (uint64_t)p[4] | (uint64_t)p[5] << 32, "Lmiss_call");
+        else if (kind == XR_LOOKUP) fprintf(o, "\tb Llookup\n");
+        else if (kind == XR_LOOKUP_CALL) fprintf(o, "\tbl Llookup\n");
+        else if (kind == XR_EXIT) fprintf(o, "\tb Lexit\n");
+        else if (kind == XR_FLAGS) fprintf(o, "\tbl Lflags\n");
+        else if (kind == XR_ABS) {
+            int which = (int)(p[0] >> 5), reg = (int)(p[0] & 31);
+            fprintf(o, "\tadrp x%d, Lext%d@PAGE\n\tldr x%d, [x%d, Lext%d@PAGEOFF]\n\tnop\n\tnop\n", reg, which, reg, reg, which);
+            k += 3;
+        } else die("unknown site kind %u", kind);
+        ri++;
+        run = k + 1;
+    }
+}
+static void mov64(FILE *o, int reg, uint64_t v) {
+    fprintf(o, "\tmovz x%d, #%#llx\n", reg, (unsigned long long)(v & 0xffff));
+    for (int s = 16; s < 64; s += 16) if ((v >> s) & 0xffff) fprintf(o, "\tmovk x%d, #%#llx, lsl #%d\n", reg, (unsigned long long)((v >> s) & 0xffff), s);
+}
+
+static void write_part(const image *im, FILE *o, size_t first, size_t end, uint64_t stop) {
+    (void)stop;
+    size_t nb = end - first;
+    g_x.n = 0; g_x.setcap = 1024; while (g_x.setcap < 4 * nb + 1024) g_x.setcap <<= 1;
+    free(g_x.set); g_x.set = calloc(g_x.setcap, sizeof *g_x.set);
+    uint64_t lo = g_part_lo[g_cur], hi = g_cur + 1 < g_nparts ? g_part_lo[g_cur + 1] : im->base + im->size;
+    fprintf(o, "// Generated by vxrt-aot gen from %s (hash %016llx): route B, the translator's code for %zu blocks (part %d of %d,"
+               " %#llx-%#llx).\n// Not to be shared: it is the program's code, translated (RECOMP.md).\n",
+            im->name, (unsigned long long)im->hash, nb, g_cur, g_nparts, (unsigned long long)lo, (unsigned long long)hi);
+    fprintf(o, "\t.section __TEXT,__text,regular,pure_instructions\n\t.p2align 4\nLcode:\nLenter:\n");
+    xlat_buf s = { 0 }; s.aot = 1;
+    xlat_prologue(&s);
+    emit_code2(o, &s, 0);
+    free(s.code); free(s.relocs); memset(&s, 0, sizeof s); s.aot = 1;
+    fprintf(o, "\tldr x16, [x28, #%d]\n\tbr x16\n", CTX_ENTRY);
+    fprintf(o, "Lexit:\n\t.inst 0x%08x\n\tbl Lflags\n\tstr x17, [x28, #%d]\n", 0x36180000u | 2u << 5 | 27, CTX_RIP);
+    xlat_epilogue(&s);
+    emit_code2(o, &s, 0);
+    free(s.code); free(s.relocs); memset(&s, 0, sizeof s); s.aot = 1;
+    fprintf(o, "Lexit_unlinked:\n\tstr xzr, [x28, #%d]\n\tb Lexit\n", CTX_LINK);
+    fprintf(o, "Lmiss_link:\n\tldr x17, [x30]\n\tb Lexit_unlinked\n");
+    fprintf(o, "Lmiss_call:\n\tldr x17, [x30, #12]\n\tb Lexit_unlinked\n");
+    // lookup: x17 the target. Outside this part's range: the part whose range has it (its lookup from a slot), or the
+    // exit; inside: its block from the table (open addressing, probing forward to an empty entry).
+    size_t tsize = 16; while (tsize < 2 * nb) tsize <<= 1;
+    fprintf(o, "Llookup:\n\tstr xzr, [x28, #%d]\n", CTX_LINK);
+    if (g_nparts > 1) {
+        mov64(o, 16, im->base + im->size); fprintf(o, "\tcmp x17, x16\n\tb.hs Lexit\n");
+        for (int p = g_nparts - 1; p >= 0; p--) {
+            mov64(o, 16, g_part_lo[p]); fprintf(o, "\tcmp x17, x16\n\tb.hs Lpart%d\n", p);
+        }
+        fprintf(o, "\tb Lexit\n");
+        for (int p = 0; p < g_nparts; p++) {
+            if (p == g_cur) continue;
+            fprintf(o, "Lpart%d:\n\tadrp x16, Lplk@PAGE\n\tadd x16, x16, Lplk@PAGEOFF\n\tldr x16, [x16, #%d]\n\tcbz x16, Lexit\n\tbr x16\n", p, 8 * p);
+        }
+        fprintf(o, "Lpart%d:\n", g_cur);
+    }
+    fprintf(o, "\teor x16, x17, x17, lsr #14\n\teor x16, x16, x17, lsr #29\n\tand x16, x16, #%#llx\n"
+               "\tadrp x30, Ltable@PAGE\n\tadd x30, x30, Ltable@PAGEOFF\n\tadd x30, x30, x16, lsl #4\n"
+               "1:\n\tldp x22, x16, [x30], #16\n\tcmp x22, x17\n\tb.eq 2f\n\tcbnz x22, 1b\n\tb Lexit\n"
+               "2:\n\tadrp x30, Lcode@PAGE\n\tadd x30, x30, Lcode@PAGEOFF\n\tadd x16, x30, x16\n\tbr x16\n",
+            (unsigned long long)(tsize - 1));
+    fprintf(o, "Lflags:\n");
+    xlat_flags_stub(&s);
+    emit_code2(o, &s, 0);
+    free(s.code); free(s.relocs);
+    for (size_t i = first; i < end; i++) {
+        tblock *t = &g_blocks[i];
+        fprintf(o, "LB%llx:\n", (unsigned long long)t->rip);
+        emit_code2(o, &t->b, t->rip);
+        fprintf(o, "LE%llx:\n", (unsigned long long)t->rip);
+    }
+    // veneers to other parts' blocks: their host address from the slot (until it is filled: the exit with the address)
+    for (size_t k = 0; k < g_x.n; k++)
+        fprintf(o, "LV%llx:\n\tadrp x16, LX%llx@PAGE\n\tldr x16, [x16, LX%llx@PAGEOFF]\n\tbr x16\n", (unsigned long long)g_x.rip[k],
+                (unsigned long long)g_x.rip[k], (unsigned long long)g_x.rip[k]);
+    for (size_t k = 0; k < g_x.n; k++) { fprintf(o, "LW%llx:\n", (unsigned long long)g_x.rip[k]); mov64(o, 17, g_x.rip[k]); fprintf(o, "\tb Lexit_unlinked\n"); }
+    fprintf(o, "Lcode_end:\n\t.p2align 4\nLtable:\n");
+    size_t tcap = tsize + nb + 1;
+    uint64_t *tab = calloc(tcap, sizeof *tab);
+    size_t tused = 0;
+    for (size_t i = first; i < end; i++) {
+        uint64_t rip = g_blocks[i].rip;
+        size_t k = (size_t)((rip ^ rip >> 14 ^ rip >> 29) & (tsize - 1));
+        while (tab[k]) k++;
+        tab[k] = i + 1; if (k + 1 > tused) tused = k + 1;
+    }
+    for (size_t k = 0; k <= tused && k < tcap; k++) {
+        if (tab[k]) fprintf(o, "\t.quad %#llx, LB%llx - Lcode\n", (unsigned long long)g_blocks[tab[k] - 1].rip, (unsigned long long)g_blocks[tab[k] - 1].rip);
+        else fprintf(o, "\t.quad 0, 0\n");
+    }
+    free(tab);
+    fprintf(o, "\t.p2align 3\nLblocks:\n");
+    for (size_t i = first; i < end; i++) fprintf(o, "\t.quad %#llx, LB%llx - Lcode\n", (unsigned long long)g_blocks[i].rip, (unsigned long long)g_blocks[i].rip);
+    fprintf(o, "Limap:\n");
+    size_t nimap = 0;
+    for (size_t i = first; i < end; i++) {
+        tblock *t = &g_blocks[i];
+        for (size_t mi = 0; mi < t->b.nimap; mi++, nimap++)
+            fprintf(o, "\t.long LI%llx_%zu - Lcode, %d\n\t.quad %#llx\n", (unsigned long long)t->rip, mi, t->b.imap[mi].sp, (unsigned long long)t->b.imap[mi].rip);
+        fprintf(o, "\t.long LE%llx - Lcode, 0\n\t.quad 0\n", (unsigned long long)t->rip); nimap++;
+    }
+    fprintf(o, "Lxrip:\n");
+    for (size_t k = 0; k < g_x.n; k++) fprintf(o, "\t.quad %#llx\n", (unsigned long long)g_x.rip[k]);
+    fprintf(o, "\t.quad 0\n\t.section __DATA,__data\n\t.p2align 3\n");
+    for (int k = 0; k < XA_NABS; k++) fprintf(o, "Lext%d:\n\t.quad 0\n", k);
+    fprintf(o, "Lplk:\n"); for (int p = 0; p < g_nparts; p++) fprintf(o, "\t.quad 0\n");
+    fprintf(o, "Lxslot:\n");
+    for (size_t k = 0; k < g_x.n; k++) fprintf(o, "LX%llx:\n\t.quad LW%llx\n", (unsigned long long)g_x.rip[k], (unsigned long long)g_x.rip[k]);
+    fprintf(o, "\t.quad 0\n\t.globl _vxrt_aot_module\n_vxrt_aot_module:\n\t.long %#x, %d\n\t.quad %#llx, %#x, %#llx, %d\n"
+               "\t.quad Lcode, Lcode_end, Lenter\n\t.quad Lblocks, %zu\n\t.quad Limap, %zu\n"
+               "\t.quad Lext0, %d\n\t.quad 0, 0\n"
+               "\t.quad %#llx, %#llx\n\t.long %d, %d\n\t.quad Llookup, Lplk\n\t.quad Lxrip, Lxslot, %zu\n",
+            XA_MAGIC, XA_VERSION, (unsigned long long)im->base, im->size, (unsigned long long)im->hash, XA_ORDERED, nb, nimap, XA_NABS,
+            (unsigned long long)lo, (unsigned long long)hi, g_cur, g_nparts, g_x.n);
 }
 
 static int gen(const image *im, const char *out) {
@@ -535,79 +661,39 @@ static int gen(const image *im, const char *out) {
     const uint64_t stop = 0xFFFFFFFFFFFF0000ull;               // (src/arm64.c's X86_RETURN, as the engine is given it)
     clock_t t0 = clock();
     gen_blocks(im, stop);
-    FILE *o = fopen(out, "w");
-    if (!o) die("cannot write %s", out);
-    fprintf(o, "// Generated by vxrt-aot gen from %s (hash %016llx): route B, the translator's code for %zu blocks. Not to be shared:\n"
-               "// it is the program's code, translated (RECOMP.md).\n", im->name, (unsigned long long)im->hash, g_nblocks);
-    fprintf(o, "\t.section __TEXT,__text,regular,pure_instructions\n\t.p2align 4\n_vxaot_code:\n_vxaot_enter:\n");
-    xlat_buf s = { 0 }; s.aot = 1;
-    xlat_prologue(&s);
-    emit_code(o, &s, 0);
-    free(s.code); free(s.relocs); memset(&s, 0, sizeof s); s.aot = 1;
-    fprintf(o, "\tldr x16, [x28, #%d]\n\tbr x16\n", CTX_ENTRY);
-    fprintf(o, "Lexit:\n\t.inst 0x%08x\n\tbl Lflags\n\tstr x17, [x28, #%d]\n", 0x36180000u | 2u << 5 | 27, CTX_RIP);
-    xlat_epilogue(&s);
-    emit_code(o, &s, 0);
-    free(s.code); free(s.relocs); memset(&s, 0, sizeof s); s.aot = 1;
-    fprintf(o, "Lexit_unlinked:\n\tstr xzr, [x28, #%d]\n\tb Lexit\n", CTX_LINK);
-    fprintf(o, "Lmiss_link:\n\tldr x17, [x30]\n\tb Lexit_unlinked\n");
-    fprintf(o, "Lmiss_call:\n\tldr x17, [x30, #12]\n\tb Lexit_unlinked\n");
-    // lookup: x17 the target; its block from the table (open addressing, probing forward to an empty entry)
-    size_t tsize = 16; while (tsize < 2 * g_nblocks) tsize <<= 1;
-    int tbits = 0; while ((1ull << tbits) < tsize) tbits++;
-    fprintf(o, "_vxaot_lookup:\n\tstr xzr, [x28, #%d]\n\teor x16, x17, x17, lsr #14\n\teor x16, x16, x17, lsr #29\n\tand x16, x16, #%#llx\n"
-               "\tadrp x30, _vxaot_table@PAGE\n\tadd x30, x30, _vxaot_table@PAGEOFF\n\tadd x30, x30, x16, lsl #4\n"
-               "1:\n\tldp x22, x16, [x30], #16\n\tcmp x22, x17\n\tb.eq 2f\n\tcbnz x22, 1b\n\tb Lexit\n"
-               "2:\n\tadrp x30, _vxaot_code@PAGE\n\tadd x30, x30, _vxaot_code@PAGEOFF\n\tadd x16, x30, x16\n\tbr x16\n",
-            CTX_LINK, (unsigned long long)(tsize - 1));
-    fprintf(o, "Lflags:\n");
-    xlat_flags_stub(&s);
-    emit_code(o, &s, 0);
-    free(s.code); free(s.relocs);
-    // the blocks, in address order, and where each x86 instruction's code starts
     qsort(g_blocks, g_nblocks, sizeof *g_blocks, cmp_blk);
     for (size_t i = 0; i < g_nblocks; i++) { size_t sl = bmap_find(g_blocks[i].rip); g_bmap[2 * sl + 1] = i + 1; }
+    // parts: at most VXRT_AOT_PART_MB of code each (default 96: room for the veneers and stubs within 128 MB)
+    uint64_t limit = (uint64_t)(getenv("VXRT_AOT_PART_MB") ? atof(getenv("VXRT_AOT_PART_MB")) * (1 << 20) : 96.0 * (1 << 20));
+    if (limit < 4096) limit = 4096;
+    g_part = malloc((g_nblocks + 1) * sizeof *g_part);
+    size_t *starts = malloc((g_nblocks + 2) * sizeof *starts);
+    g_part_lo = malloc((g_nblocks + 2) * sizeof *g_part_lo);
+    uint64_t bytes = 0; g_nparts = 1; starts[0] = 0; g_part_lo[0] = im->base;
     for (size_t i = 0; i < g_nblocks; i++) {
-        tblock *t = &g_blocks[i];
-        fprintf(o, "LB%llx:\n", (unsigned long long)t->rip);
-        emit_code(o, &t->b, t->rip);
-        fprintf(o, "LE%llx:\n", (unsigned long long)t->rip);
+        uint64_t sz = 4 * (uint64_t)g_blocks[i].n + 32;           // (+ a veneer, a miss stub: the worst case)
+        if (bytes + sz > limit && i > starts[g_nparts - 1]) { starts[g_nparts] = i; g_part_lo[g_nparts] = g_blocks[i].rip; g_nparts++; bytes = 0; }
+        bytes += sz;
+        g_part[i] = g_nparts - 1;
     }
-    fprintf(o, "_vxaot_code_end:\n\t.p2align 4\n_vxaot_table:\n");
-    size_t tcap = tsize + g_nblocks + 1;
-    uint64_t *tab = calloc(tcap, sizeof *tab);
-    size_t tused = 0;
-    for (size_t i = 0; i < g_nblocks; i++) {
-        uint64_t rip = g_blocks[i].rip;
-        size_t k = (size_t)((rip ^ rip >> 14 ^ rip >> 29) & (tsize - 1));
-        while (tab[k]) k++;
-        tab[k] = i + 1; if (k + 1 > tused) tused = k + 1;
+    starts[g_nparts] = g_nblocks;
+    char path[4096];
+    size_t ol = strlen(out); int has_s = ol > 2 && !strcmp(out + ol - 2, ".s");
+    for (g_cur = 0; g_cur < g_nparts; g_cur++) {
+        if (g_nparts == 1) snprintf(path, sizeof path, "%s", out);
+        else snprintf(path, sizeof path, "%.*s.p%d.s", (int)(has_s ? ol - 2 : ol), out, g_cur);
+        FILE *o = fopen(path, "w");
+        if (!o) die("cannot write %s", path);
+        static char buf[1 << 22]; setvbuf(o, buf, _IOFBF, sizeof buf);
+        write_part(im, o, starts[g_cur], starts[g_cur + 1], stop);
+        if (fclose(o)) die("cannot write %s", path);
+        printf("%s\n", path);
     }
-    for (size_t k = 0; k <= tused && k < tcap; k++) {
-        if (tab[k]) fprintf(o, "\t.quad %#llx, LB%llx - _vxaot_code\n", (unsigned long long)g_blocks[tab[k] - 1].rip, (unsigned long long)g_blocks[tab[k] - 1].rip);
-        else fprintf(o, "\t.quad 0, 0\n");
-    }
-    fprintf(o, "\t.p2align 3\n_vxaot_blocks:\n");
-    for (size_t i = 0; i < g_nblocks; i++) fprintf(o, "\t.quad %#llx, LB%llx - _vxaot_code\n", (unsigned long long)g_blocks[i].rip, (unsigned long long)g_blocks[i].rip);
-    fprintf(o, "_vxaot_imap:\n");
-    size_t nimap = 0;
-    for (size_t i = 0; i < g_nblocks; i++) {
-        tblock *t = &g_blocks[i];
-        for (size_t mi = 0; mi < t->b.nimap; mi++, nimap++)
-            fprintf(o, "\t.long LI%llx_%zu - _vxaot_code, %d\n\t.quad %#llx\n", (unsigned long long)t->rip, mi, t->b.imap[mi].sp, (unsigned long long)t->b.imap[mi].rip);
-        fprintf(o, "\t.long LE%llx - _vxaot_code, 0\n\t.quad 0\n", (unsigned long long)t->rip); nimap++;
-    }
-    fprintf(o, "\t.section __DATA,__data\n\t.p2align 3\n");
-    for (int k = 0; k < XA_NABS; k++) fprintf(o, "_vxaot_ext%d:\n\t.quad 0\n", k);
-    fprintf(o, "\t.globl _vxrt_aot_module\n_vxrt_aot_module:\n\t.long %#x, %d\n\t.quad %#llx, %#x, %#llx, %d\n"
-               "\t.quad _vxaot_code, _vxaot_code_end, _vxaot_enter\n\t.quad _vxaot_blocks, %zu\n\t.quad _vxaot_imap, %zu\n"
-               "\t.quad _vxaot_ext0, %d\n\t.quad 0, 0\n",
-            XA_MAGIC, XA_VERSION, (unsigned long long)im->base, im->size, (unsigned long long)im->hash, XA_ORDERED, g_nblocks, nimap, XA_NABS);
-    fclose(o);
     double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
     uint64_t words = 0; for (size_t i = 0; i < g_nblocks; i++) words += g_blocks[i].n;
-    fprintf(stderr, "vxrt-aot: %s: %zu blocks, %llu ARM64 words, %llu blocks the translator refused, %.2f s; module name %s-%016llx.dylib\n",
-            im->name, g_nblocks, (unsigned long long)words, (unsigned long long)g_failed, secs, im->name, (unsigned long long)im->hash);
+    fprintf(stderr, "vxrt-aot: %s: %zu blocks, %llu ARM64 words in %d part%s, %llu blocks the translator refused, %.2f s; module name %s-%016llx%s.dylib\n",
+            im->name, g_nblocks, (unsigned long long)words, g_nparts, g_nparts > 1 ? "s" : "", (unsigned long long)g_failed, secs, im->name,
+            (unsigned long long)im->hash, g_nparts > 1 ? ".p<k>" : "");
     return 0;
 }
 

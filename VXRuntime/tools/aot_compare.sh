@@ -8,7 +8,7 @@ exe=$1; shift
 n=$(basename "$exe" .exe)
 ROSETTA_ADVERTISE_AVX=1 build/vxrt "$exe" "$@" > $O/$n.rosetta 2>&1
 build/vxrt-arm64 "$exe" "$@" > $O/$n.jit 2>&1
-VXRT_AOT_STRICT=1 VXRT_AOT_DIR=$PWD/build/aot build/vxrt-arm64 "$exe" "$@" > $O/$n.aotb 2>&1
+VXRT_AOT_STRICT=1 VXRT_AOT_DIR=$PWD/${AOT_DIR:-build/aot} build/vxrt-arm64 "$exe" "$@" > $O/$n.aotb 2>&1
 status=0
 for k in rosetta jit aotb; do grep -v -E "^(info:|time:|\[vxrt\])" $O/$n.$k > $O/$n.$k.cmp; done
 for k in jit aotb; do
