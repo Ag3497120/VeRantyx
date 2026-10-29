@@ -457,7 +457,7 @@ typedef struct {
     uint64_t allocator_generation;
     int allocator_recording;
     cmd12 *cmds;
-    uint32_t n, cap;
+    uint32_t n, cap, small_resets;
     pso12 *recording_pso;
     uint32_t recording_topology;
     int recording_topology_set;
@@ -4201,6 +4201,19 @@ static void list_clear(list12 *l) {
         for (int k = 0; k < 9; k++) if (c->resource[k]) d3d_release(&c->resource[k]->base);
     }
     gpu_ir_stream_clear(&l->gpu_ir);
+    // (a list that used under a quarter of its commands' array at 8 resets in a row gets half of it back: lists
+    //  that once recorded a loading screen's thousands keep 712 bytes for each)
+    if (l->cap > 256 && l->n < l->cap / 4) {
+        if (++l->small_resets >= 8) {
+            uint32_t cap = l->cap / 2;
+            cmd12 *smaller = realloc(l->cmds, (size_t)cap * sizeof *l->cmds);
+            if (smaller) {
+                __atomic_sub_fetch(&g_cmd_bytes12, (uint64_t)(l->cap - cap) * sizeof *l->cmds, __ATOMIC_RELAXED);
+                l->cmds = smaller; l->cap = cap;
+            }
+            l->small_resets = 0;
+        }
+    } else l->small_resets = 0;
     l->recording_pso = NULL;
     l->recording_topology = 4; // D3D12 triangle list; matches the replay state's initial topology.
     l->recording_topology_set = 0;
@@ -6572,7 +6585,7 @@ typedef struct {
     d3d_object base; dev12 *dev;
     pthread_mutex_t lock;
     plib_entry12 *entries;
-    uint32_t n, cap;
+    uint32_t n, cap, small_resets;
 } plib12;
 
 #define D3D12_ERROR_ADAPTER_NOT_FOUND12 ((HRESULT)0x887E0001)
@@ -13274,6 +13287,20 @@ static void mem_report12(dev12 *d) {
                tb[placed][0] / 1048576.0, (unsigned long long)tn[placed][0], tb[placed][1] / 1048576.0, (unsigned long long)tn[placed][1],
                tb[placed][2] / 1048576.0, (unsigned long long)tn[placed][2], tb[placed][3] / 1048576.0, (unsigned long long)tn[placed][3],
                bb[placed] / 1048576.0, (unsigned long long)bn[placed], placed ? "" : " (downscaled ones count at their new size)");
+    {   // (committed buffers by heap type: default, upload, readback, custom)
+        uint64_t hb[5] = { 0 }, hn[5] = { 0 };
+        pthread_rwlock_rdlock(&d->bufs_lock);
+        for (uint32_t i = 0; i < d->nbufs; i++) {
+            res12 *b = d->bufs[i];
+            if (b->owner_heap || b->reserved) continue;
+            int t = b->heap.Type >= 1 && b->heap.Type <= 4 ? b->heap.Type : 0;
+            hb[t] += b->buffer.allocatedSize; hn[t]++;
+        }
+        pthread_rwlock_unlock(&d->bufs_lock);
+        vx_log("D3D12: memory: committed buffers: default %.0f MB (%llu), upload %.0f MB (%llu), readback %.0f MB (%llu), custom %.0f MB (%llu)",
+               hb[1] / 1048576.0, (unsigned long long)hn[1], hb[2] / 1048576.0, (unsigned long long)hn[2],
+               hb[3] / 1048576.0, (unsigned long long)hn[3], hb[4] / 1048576.0, (unsigned long long)hn[4]);
+    }
     if (__atomic_load_n(&g_tex_drop_count12, __ATOMIC_RELAXED))
         vx_log("D3D12: memory: VXRT_D3D12_TEX_DOWNSCALE made %llu textures (%.0f MB as made, all time), %llu copies to or from "
                "left-out mips dropped", (unsigned long long)g_tex_drop_count12, g_tex_drop_bytes12 / 1048576.0,
@@ -13301,6 +13328,23 @@ static void mem_report12(dev12 *d) {
            __atomic_load_n(&g_replay_copy_peak12, __ATOMIC_RELAXED) / 1048576.0,
            __atomic_load_n(&gpu_ir_stream_bytes, __ATOMIC_RELAXED) / 1048576.0, gpu_ir_command_size());
     if (vx_heap_report(heap, sizeof heap)) vx_log("D3D12: memory: the game's heap blocks (HeapAlloc, malloc, new): %s", heap);
+}
+// malloc keeps the pages of freed blocks (most in its medium size class, 1.3 GB of dirty pages for 0.5 GB in use in
+// Cyberpunk) until memory runs short: every 300 presents they are given back, off the present's thread
+// (VXRT_MALLOC_RELIEF=0: not).
+static void malloc_relief12(uint32_t presents) {
+    static int on = -1;
+    static volatile int busy;
+    if (on < 0) on = !getenv("VXRT_MALLOC_RELIEF") || atoi(getenv("VXRT_MALLOC_RELIEF")) != 0;
+    if (!on || presents % 300 || !__sync_bool_compare_and_swap(&busy, 0, 1)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        uint64_t t0 = fs_now12();
+        size_t freed = malloc_zone_pressure_relief(NULL, 0);
+        static int told;
+        if (told++ < 3 || getenv("VXRT_MALLOC_RELIEF_LOG"))
+            vx_log("D3D12: malloc gave back %.0f MB of freed blocks' pages (%.1f ms)", freed / 1048576.0, (fs_now12() - t0) / 1e6);
+        busy = 0;
+    });
 }
 static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     swap12 *sc = this;
@@ -13330,6 +13374,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     frame_stats_present12(sc->presents);
     cb_trace_poll12();
     if (g_mem_report12) { g_mem_report12 = 0; mem_report12(sc->dev); }
+    malloc_relief12(sc->presents);
     skip_poll12();
     census_present12();
     pass_dump_present12();
