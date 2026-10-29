@@ -9308,11 +9308,14 @@ typedef struct {
 } fsr_consts12;
 static int fsr_parse12(const uint32_t *w, uint32_t nwords, fsr_consts12 *o) {
     const float *f = (const float *)w;
+    // (FSR 2.0 as Cyberpunk 2077 has it, seen by the NPU track: render, display, luma mip size, mip level, frame index,
+    //  1/display, jitter, device-to-view depth x4, depth clip and lock uv scales, 1/render, motion vector scale,
+    //  downscale, pre-exposure, tan(FOV/2), jitter cancellation, jitter phase count)
     static const struct { int layout, display, frame, frame_float, d2v, jitter, mvs, pre, tan, jpc, words, mip; } L[4] = {
         { 22, 4, 11, 0, 12, 16, 18, 24, 26, 27, 28, 10 },
         { 31, 4, 31, 1, 12, 16, 20, -1, 26, 27, 32, -1 },
         { 21, 2, 9, 0, 10, 14, 16, 22, 24, 25, 26, 8 },
-        { 20, 2, 9, 0, 14, 12, 24, 28, 29, -1, 30, 8 },
+        { 20, 2, 7, 0, 12, 10, 22, 26, 27, 30, 31, 6 },
     };
     if (nwords < 26 || w[0] < 16 || w[1] < 16 || w[0] > 16384 || w[1] > 16384) return 0;
     for (int k = 0; k < 4; k++) {
@@ -9379,7 +9382,7 @@ static struct {
     volatile int rev, ae, hdr, sync, reset_next;
     struct { uint64_t cs; int8_t fsr; uint8_t misses; } seen[1024];
     // this frame (FSR2's frame index)
-    double frame_key; float frame_jx, frame_jy; int have_frame, nseq, replacing, encoded, fails;
+    double frame_key, prev_index; float frame_jx, frame_jy; int have_frame, nseq, replacing, encoded, fails;
     uint64_t seq[48];
     void *last_writes[8]; int nlast;
     void *cand[24]; int cand_n[24], ncand;
@@ -9575,6 +9578,7 @@ static int mfx_dispatch12(dev12 *d, gfx_state *g, pso12 *pso, root_binding *comp
     pthread_mutex_lock(&M12.lock);
     if (!M12.have_frame || c.frame_index != M12.frame_key || c.jitter[0] != M12.frame_jx || c.jitter[1] != M12.frame_jy) {
         mfx_frame_end12();
+        M12.prev_index = M12.have_frame ? M12.frame_key : -1;
         M12.have_frame = 1; M12.frame_key = c.frame_index; M12.frame_jx = c.jitter[0]; M12.frame_jy = c.jitter[1];
         M12.nseq = 0; M12.nlast = 0; M12.ncand = 0; M12.encoded = 0;
         M12.replacing = M12.learned && M12.mode;
@@ -9637,7 +9641,7 @@ static int mfx_dispatch12(dev12 *d, gfx_state *g, pso12 *pso, root_binding *comp
                     c.render[0], c.render[1], c.display[0], c.display[1],
                     c.jitter[0] * M12.jx, c.jitter[1] * M12.jy,
                     c.mvs[0] * (float)c.render[0] * M12.mx, c.mvs[1] * (float)c.render[1] * M12.my,
-                    c.pre_exposure, c.frame_index == 0 || M12.reset_next, M12.rev, M12.ae, M12.hdr, M12.sync
+                    c.pre_exposure, c.frame_index < M12.prev_index || M12.reset_next, M12.rev, M12.ae, M12.hdr, M12.sync
                 };
                 char why[512]; int note = 0;
                 if (vxu_encode((__bridge void *)cb, mode, &f, why, sizeof why, &note)) {
