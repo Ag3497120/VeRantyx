@@ -13155,14 +13155,30 @@ static void mem_report12(dev12 *d) {
     pthread_mutex_lock(&d->lock);
     NSArray *all = [d->resources copy];
     pthread_mutex_unlock(&d->lock);
+    // (what the textures are: [committed, placed] x [render/depth target, UAV, sampled with mips at least 1024 wide,
+    //  other sampled]; and buffers, committed and placed)
+    uint64_t tb[2][4] = { { 0 } }, tn[2][4] = { { 0 } }, bb[2] = { 0 }, bn[2] = { 0 };
     for (id<MTLResource> r in all) {
         count++;
         if ([dgpu containsObject:r]) continue;
         id<MTLHeap> hp = r.heap;
+        int placed = hp != nil;
+        if ([r conformsToProtocol:@protocol(MTLTexture)]) {
+            id<MTLTexture> t = (id<MTLTexture>)r;
+            int k = t.usage & MTLTextureUsageRenderTarget ? 0 : t.usage & MTLTextureUsageShaderWrite ? 1 :
+                    t.mipmapLevelCount > 1 && MAX(t.width, t.height) >= 1024 ? 2 : 3;
+            tb[placed][k] += r.allocatedSize; tn[placed][k]++;
+        } else if ([r conformsToProtocol:@protocol(MTLBuffer)]) { bb[placed] += r.allocatedSize; bn[placed]++; }
         if (hp) { if (![seen containsObject:hp]) { [seen addObject:hp]; heaps += hp.size; } }
         else if ([r conformsToProtocol:@protocol(MTLTexture)] || [r conformsToProtocol:@protocol(MTLBuffer)]) committed += r.allocatedSize;
         else other += r.allocatedSize;
     }
+    for (int placed = 0; placed < 2; placed++)
+        vx_log("D3D12: memory: %s textures: targets %.0f MB (%llu), UAVs %.0f MB (%llu), sampled with mips >=1024 %.0f MB (%llu), "
+               "other sampled %.0f MB (%llu); buffers %.0f MB (%llu)%s", placed ? "placed" : "committed",
+               tb[placed][0] / 1048576.0, (unsigned long long)tn[placed][0], tb[placed][1] / 1048576.0, (unsigned long long)tn[placed][1],
+               tb[placed][2] / 1048576.0, (unsigned long long)tn[placed][2], tb[placed][3] / 1048576.0, (unsigned long long)tn[placed][3],
+               bb[placed] / 1048576.0, (unsigned long long)bn[placed], placed ? "" : " (downscaled ones count at their new size)");
     uint64_t keys = 0, npso = 0;
     pthread_mutex_lock(&d->lock);
     for (NSString *k in d->pso_cache) { keys += [k lengthOfBytesUsingEncoding:NSUTF8StringEncoding]; npso++; }
