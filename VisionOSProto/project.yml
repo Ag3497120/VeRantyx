@@ -1,0 +1,31 @@
+name: VisionOSProto
+options:
+  bundleIdPrefix: marimokodai
+  deploymentTarget:
+    visionOS: "26.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: 7YNW843VY6
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    XROS_DEPLOYMENT_TARGET: "26.0"
+    TARGETED_DEVICE_FAMILY: "7"
+    SUPPORTED_PLATFORMS: "xros xrsimulator"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  VisionOSProto:
+    type: application
+    platform: visionOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: marimokodai.VisionOSProto
+        PRODUCT_NAME: VisionOSProto
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: "VX Proto"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UIFileSharingEnabled: YES
+        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
+        CODE_SIGN_ENTITLEMENTS: Sources/VisionOSProto.entitlements
