@@ -33,6 +33,7 @@
 #include "gpu_ir_metal.h"
 #include "gpu_ir_msl.h"
 #include "npu_interp.h"
+#include "stereo.h"
 #include <float.h>
 #include <sys/stat.h>
 #pragma clang diagnostic push
@@ -392,6 +393,7 @@ typedef struct {
     float bias, bias_slope, bias_clamp;
     int has_depth, has_stencil;
     int depth_enable, depth_write, stencil_enable, stencil_write;
+    int depth_func;                  // (D3D12_COMPARISON_FUNC while depth_enable: VXRT_D3D12_STEREO_DUMP tells reversed Z by it)
     // A geometry shader (DXBC; Metal has no such stage): draws run the vertex shader as a kernel over their vertices,
     // the geometry shader as a kernel over its input primitives, then `render` (its pass-through vertex function and
     // the pixel shader) draws the triangles it made. The vertex kernels are compiled per index type and strides.
@@ -6250,6 +6252,7 @@ static HRESULT create_graphics_pso12(void *this, const GFX_PSO_DESC *desc, const
     }
     p->depth_enable = p->has_depth && desc->depth.depth_enable;
     p->depth_write = p->depth_enable && desc->depth.depth_write;
+    p->depth_func = p->depth_enable ? desc->depth.depth_func : 0;
     p->stencil_enable = p->has_stencil && desc->depth.stencil_enable;
     p->stencil_write = p->stencil_enable && desc->depth.write_mask &&
         (desc->depth.front.fail != 1 || desc->depth.front.depth_fail != 1 || desc->depth.front.pass != 1 ||
@@ -8997,6 +9000,78 @@ static void pass_dump_dispatch12(id<MTLCommandBuffer> cb, id<MTLComputeCommandEn
     }
 }
 
+// ---- VXRT_D3D12_STEREO_DUMP=<folder>: frames for depth-based stereo (back buffer and the scene's depth) ------------
+// When <folder>/now appears (holding a frame count, default 1; it is removed), each of the next frames writes the back
+// buffer as presented (<frame>-color.png) and every depth attachment its render passes drew into, as the frame's last
+// pass on it left it (<frame>-depth<k>-<w>x<h>.f32: 32-bit floats row by row; D16 as 16-bit), and a line in
+// <folder>/frames.txt per frame: each depth's passes, depth-tested draws, the compare functions of the draws that
+// wrote it (a bit per D3D12_COMPARISON_FUNC: 0x20/0x80 GREATER/GREATER_EQUAL means reversed Z) and the one taken as
+// the scene's: the most depth-tested draws among those of the back buffer's aspect (shadow maps and the like are
+// not). Copied at the end of each pass, so a depth the frame later aliases or discards is still the scene's.
+// An experiment toward stereo 3D from flat games (synthesised offline from these files); it waits for the GPU.
+typedef struct { void *tex, *buf; uint32_t w, h, bpp, passes, draws, funcs; MTLPixelFormat fmt; } stereo_slot12;
+static stereo_slot12 g_st_slot12[8];
+static int g_st_nslot12;
+static volatile int g_st_armed12, g_st_left12, g_st_frame12;
+static pthread_mutex_t g_st_lock12 = PTHREAD_MUTEX_INITIALIZER;
+static __thread void *t_st_depth12;                  // (retained: the open pass's depth attachment)
+static __thread uint32_t t_st_draws12, t_st_funcs12;
+static const char *stereo_dir12(void) {
+    static const char *dir = (const char *)-1;
+    if (dir == (const char *)-1) { dir = getenv("VXRT_D3D12_STEREO_DUMP"); if (dir && !*dir) dir = NULL; }
+    return dir;
+}
+static __thread uint32_t t_st_writes12;
+static int g_st_live12 = -1;                         // (VXRT_STEREO=1: stereo.m takes the scene's depth at each pass end)
+static int stereo_watch12(void) {
+    if (g_st_live12 < 0) g_st_live12 = vx_stereo_on();
+    return g_st_armed12 || g_st_live12;
+}
+static void stereo_opened12(MTLRenderPassDescriptor *descriptor) {
+    if (!stereo_watch12()) return;
+    if (t_st_depth12) { CFBridgingRelease(t_st_depth12); t_st_depth12 = NULL; }
+    id<MTLTexture> t = descriptor.depthAttachment.texture;
+    if (t) t_st_depth12 = (void *)CFBridgingRetain(t);
+    t_st_draws12 = 0; t_st_funcs12 = 0; t_st_writes12 = 0;
+}
+static void stereo_draw12(const pso12 *p) {
+    if (!t_st_depth12 || !p || !p->depth_enable) return;
+    t_st_draws12++;
+    if (p->depth_write) t_st_writes12++;
+    if (p->depth_write && p->depth_func > 0 && p->depth_func < 32) t_st_funcs12 |= 1u << p->depth_func;
+}
+static void stereo_closed12(id<MTLCommandBuffer> cb) {
+    if (!t_st_depth12) return;
+    id<MTLTexture> t = (id<MTLTexture>)CFBridgingRelease(t_st_depth12);
+    t_st_depth12 = NULL;
+    if (g_st_live12 > 0) vx_stereo_depth_pass((__bridge void *)cb, (__bridge void *)t, t_st_draws12, t_st_writes12, t_st_funcs12);
+    if (!g_st_armed12 || !t_st_draws12 || t.sampleCount > 1 || t.textureType != MTLTextureType2D) return;
+    MTLPixelFormat f = t.pixelFormat;
+    uint32_t bpp = f == MTLPixelFormatDepth16Unorm ? 2 : 4;
+    if (f != MTLPixelFormatDepth16Unorm && f != MTLPixelFormatDepth32Float && f != MTLPixelFormatDepth32Float_Stencil8) return;
+    uint32_t w = (uint32_t)t.width, h = (uint32_t)t.height;
+    pthread_mutex_lock(&g_st_lock12);
+    stereo_slot12 *s = NULL;
+    for (int k = 0; k < g_st_nslot12; k++) if (g_st_slot12[k].tex == (__bridge void *)t) s = &g_st_slot12[k];
+    if (!s && g_st_armed12 && g_st_nslot12 < 8) {
+        id<MTLBuffer> b = [cb.device newBufferWithLength:(NSUInteger)w * h * bpp options:MTLResourceStorageModeShared];
+        if (b) {
+            s = &g_st_slot12[g_st_nslot12++];
+            *s = (stereo_slot12){ (void *)CFBridgingRetain(t), (void *)CFBridgingRetain(b), w, h, bpp, 0, 0, 0, f };
+        }
+    }
+    if (s) {
+        s->passes++; s->draws += t_st_draws12; s->funcs |= t_st_funcs12;
+        id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+        [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                  toBuffer:(__bridge id<MTLBuffer>)s->buf destinationOffset:0 destinationBytesPerRow:(NSUInteger)w * bpp
+                  destinationBytesPerImage:(NSUInteger)w * h * bpp
+                   options:f == MTLPixelFormatDepth32Float_Stencil8 ? MTLBlitOptionDepthFromDepthStencil : MTLBlitOptionNone];
+        [b endEncoding];
+    }
+    pthread_mutex_unlock(&g_st_lock12);
+}
+
 // ---- VXRT_D3D12_GPU_PROFILE=<folder>: one frame's encoders timed on the GPU ---------------------------------------
 // When <folder>/prof appears (it is removed), every render pass and compute encoder of the next frame gets GPU
 // timestamps at its start and end (Metal stage-boundary counters); a second later the encoders are logged longest
@@ -9116,6 +9191,7 @@ static void close_pass(dev12 *d, gfx_state *g, id<MTLCommandBuffer> cb, id<MTLRe
     [*re endEncoding];
     *re = nil;
     pass_dump_closed12(cb);
+    stereo_closed12(cb);
     g->changed = 1;
     if (g->pass_heap && g->npass) {
         id<MTLComputePipelineState> p = occ_sum_pipeline(d);
@@ -9205,6 +9281,7 @@ static int open_render_pass12(dev12 *device, gfx_state *g, id<MTLCommandBuffer> 
     *render_encoder = [command_buffer renderCommandEncoderWithDescriptor:descriptor];
     if (!*render_encoder) { g->pass_heap = NULL; g->pass_vis = nil; return 0; }
     pass_dump_opened12(descriptor);
+    stereo_opened12(descriptor);
     if (gpu_errors12()) {                                          // (named for VXRT_D3D12_GPU_ERRORS reports)
         NSMutableString *name = [NSMutableString stringWithFormat:@"pass %lux%lu samples %lu:", (unsigned long)descriptor.renderTargetWidth,
                                  (unsigned long)descriptor.renderTargetHeight, (unsigned long)descriptor.defaultRasterSampleCount];
@@ -10949,6 +11026,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             }
             if ((g_skip_count12 || g_census12) && skipped_shader12(pso->ps_code, 'p')) break;
             pass_dump_draw12(pso);
+            stereo_draw12(pso);
             if (!t_cb_len12 || t_cb_log12[t_cb_len12 - 10] != 'p') cb_log12('p', pso->ps_code, 0, 0, 0);
             d3d12_draw_context context = {
                 .device = d, .render_encoder = &re, .graphics_state = g, .api_pipeline = pso,
@@ -12969,24 +13047,18 @@ static WINAPI uint32_t swap_index(void *this) { return ((swap12 *)this)->index; 
 // VXRT_PRESENT_SNAPSHOT=file.png (VXRT_PRESENT_SNAPSHOT_EVERY=n, default 300): every n-th present's picture, as the
 // window shows it, written to that file (to see what a program draws without a screen capture); the log notes
 // the presents every 300.
-static void swap_snapshot12(swap12 *sc, uint32_t index) {
-    static const char *path;
-    static int every = -1;
-    if (every < 0) {
-        path = getenv("VXRT_PRESENT_SNAPSHOT");
-        every = getenv("VXRT_PRESENT_SNAPSHOT_EVERY") ? atoi(getenv("VXRT_PRESENT_SNAPSHOT_EVERY")) : 300;
-        if (every < 1) every = 300;
-    }
-    if (sc->presents % 300 == 0) vx_log("D3D12: %u presents (%ux%u)", sc->presents, sc->width, sc->height);
-    if (!path || sc->presents % (uint32_t)every) return;
+// (the back buffer `index` as the window shows it, written to `path` as a PNG; waits for the GPU)
+static void swap_write_png12(swap12 *sc, uint32_t index, const char *path) {
     @autoreleasepool {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+        MTLPixelFormat lf = sc->layer.pixelFormat;
+        if (lf != MTLPixelFormatBGRA8Unorm && lf != MTLPixelFormatBGRA8Unorm_sRGB) return;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:lf
                                                                                       width:sc->width height:sc->height mipmapped:NO];
         td.usage = MTLTextureUsageRenderTarget;
         td.storageMode = MTLStorageModePrivate;
         id<MTLTexture> target = [sc->dev->mtl newTextureWithDescriptor:td];
         id<MTLBuffer> out = [sc->dev->mtl newBufferWithLength:(NSUInteger)sc->width * sc->height * 4 options:MTLResourceStorageModeShared];
-        if (!target || !out || sc->layer.pixelFormat != MTLPixelFormatBGRA8Unorm) return;
+        if (!target || !out) return;
         id<MTLCommandBuffer> cb = [sc->queue->mtl_queue commandBuffer];
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = target;
@@ -13017,6 +13089,69 @@ static void swap_snapshot12(swap12 *sc, uint32_t index) {
         CGColorSpaceRelease(cs);
     }
 }
+static void swap_snapshot12(swap12 *sc, uint32_t index) {
+    static const char *path;
+    static int every = -1;
+    if (every < 0) {
+        path = getenv("VXRT_PRESENT_SNAPSHOT");
+        every = getenv("VXRT_PRESENT_SNAPSHOT_EVERY") ? atoi(getenv("VXRT_PRESENT_SNAPSHOT_EVERY")) : 300;
+        if (every < 1) every = 300;
+    }
+    if (sc->presents % 300 == 0) vx_log("D3D12: %u presents (%ux%u)", sc->presents, sc->width, sc->height);
+    if (!path || sc->presents % (uint32_t)every) return;
+    swap_write_png12(sc, index, path);
+}
+// (VXRT_D3D12_STEREO_DUMP at a present: the frame collected ends here - its back buffer and depths written - and the
+//  next one is armed while frames are left or <folder>/now appears)
+static void stereo_present12(swap12 *sc, uint32_t index) {
+    const char *dir = stereo_dir12();
+    if (!dir) return;
+    char path[1024];
+    if (g_st_armed12) {
+        pthread_mutex_lock(&g_st_lock12);
+        g_st_armed12 = 0;
+        pthread_mutex_unlock(&g_st_lock12);
+        int frame = g_st_frame12;
+        snprintf(path, sizeof path, "%s/%04d-color.png", dir, frame);
+        swap_write_png12(sc, index, path);                         // (also waits for the frame's copies on this queue)
+        // the scene's depth: the most depth-tested draws among the depths of the back buffer's aspect
+        double aspect = (double)sc->src_width / (sc->src_height ? sc->src_height : 1);
+        int pick = -1;
+        for (int k = 0; k < g_st_nslot12; k++) {
+            stereo_slot12 *s = &g_st_slot12[k];
+            double a = (double)s->w / (s->h ? s->h : 1);
+            if (fabs(a / aspect - 1.0) > 0.03 || s->w < 128) continue;
+            if (pick < 0 || s->draws > g_st_slot12[pick].draws) pick = k;
+        }
+        snprintf(path, sizeof path, "%s/frames.txt", dir);
+        FILE *log = fopen(path, "a");
+        if (log) fprintf(log, "frame %d present %u back %ux%u scene %d", frame, sc->presents, sc->src_width, sc->src_height, pick);
+        for (int k = 0; k < g_st_nslot12; k++) {
+            stereo_slot12 *s = &g_st_slot12[k];
+            id<MTLBuffer> b = (id<MTLBuffer>)CFBridgingRelease(s->buf);
+            CFBridgingRelease(s->tex);
+            if (log) fprintf(log, " | depth%d %ux%u fmt %lu passes %u draws %u funcs %#x", k, s->w, s->h, (unsigned long)s->fmt, s->passes, s->draws, s->funcs);
+            snprintf(path, sizeof path, "%s/%04d-depth%d-%ux%u.%s", dir, frame, k, s->w, s->h, s->bpp == 2 ? "u16" : "f32");
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(b.contents, 1, b.length, f); fclose(f); }
+        }
+        if (log) { fputc('\n', log); fclose(log); }
+        vx_log("D3D12: stereo dump %d: %d depths, the scene's %d", frame, g_st_nslot12, pick);
+        g_st_nslot12 = 0;
+        if (g_st_left12 > 0) g_st_left12--;
+    } else {
+        snprintf(path, sizeof path, "%s/now", dir);
+        FILE *f = fopen(path, "r");
+        if (!f) return;
+        int n = 0;
+        if (fscanf(f, "%d", &n) != 1 || n < 1) n = 1;
+        fclose(f);
+        unlink(path);
+        g_st_left12 = n;
+        vx_log("D3D12: stereo dump: the next %d frames go to %s", n, dir);
+    }
+    if (g_st_left12 > 0) { g_st_frame12++; g_st_armed12 = 1; }
+}
 // (the copy of the back buffer into the drawable, and the present: on the queue's thread with VXRT_D3D12_ASYNC_SUBMIT)
 static void swap_present_now12(swap12 *sc, uint32_t index, id<CAMetalDrawable> drawable, HANDLE waitable) {
     int queued = 0, npu = npu_interp_on((__bridge void *)sc->layer);   // (VXRT_NPU_INTERP: npu_interp.m shows it)
@@ -13024,6 +13159,7 @@ static void swap_present_now12(swap12 *sc, uint32_t index, id<CAMetalDrawable> d
     // (the snapshot waits for the GPU: not with the submission lock held, which another queue's Signal the GPU may be
     //  waiting for needs)
     swap_snapshot12(sc, index);
+    stereo_present12(sc, index);
     pthread_mutex_lock(&sc->dev->submit_lock);
     @autoreleasepool {
         if (npu && cb) {
@@ -13035,10 +13171,16 @@ static void swap_present_now12(swap12 *sc, uint32_t index, id<CAMetalDrawable> d
             rp.colorAttachments[0].texture = drawable.texture;
             rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLTexture> shown = sc->buffers[index]->texture;
+            float scale[2] = { (float)sc->src_width / (float)sc->width, (float)sc->src_height / (float)sc->height };
+            if (vx_stereo_on()) {                                  // (VXRT_STEREO: its pass committed first, the window shows its picture)
+                id<MTLTexture> st = (__bridge id<MTLTexture>)vx_stereo_present((__bridge void *)sc->queue->mtl_queue, (__bridge void *)shown,
+                                                                              sc->src_width, sc->src_height);
+                if (st) { shown = st; scale[0] = scale[1] = 1; }
+            }
             id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
             [enc setRenderPipelineState:sc->pipeline];
-            [enc setFragmentTexture:sc->buffers[index]->texture atIndex:0];
-            float scale[2] = { (float)sc->src_width / (float)sc->width, (float)sc->src_height / (float)sc->height };
+            [enc setFragmentTexture:shown atIndex:0];
             [enc setFragmentBytes:scale length:sizeof scale atIndex:0];
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [enc endEncoding];

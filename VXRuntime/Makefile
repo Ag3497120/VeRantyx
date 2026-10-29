@@ -10,6 +10,7 @@ SRC    += src/filestate.c
 SRC    += src/inherit.c
 SRC    += src/icons.c src/menus.m src/tray.m
 SRC    += src/present.c
+SRC    += src/stereo.m
 SRC    += src/shlock.c
 SRC    += src/tcptable.c
 SRC    += src/winprops.c
@@ -22,7 +23,7 @@ MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt build/vxrt-npu tests
 
-build/vxrt: $(SRC) src/vx.h src/npu_interp.h src/npu_proto.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h src/aes_gcm.h
+build/vxrt: $(SRC) src/vx.h src/npu_interp.h src/npu_proto.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/stereo.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h src/aes_gcm.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Ithird_party/vulkan -fobjc-arc -o $@.tmp $(SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -Wl,-pagezero_size,0x10000 -licucore -lz && mv -f $@.tmp $@
 
@@ -47,7 +48,7 @@ build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator
 build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
 	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
-build/vxrt-arm64: $(ARM64_SRC) src/npu_interp.h src/npu_proto.h build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
+build/vxrt-arm64: $(ARM64_SRC) src/npu_interp.h src/npu_proto.h build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/stereo.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
 	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -Ithird_party/vulkan -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -framework Hypervisor build/libvxrt_vm.dylib build/guest.o -licucore -lz
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
@@ -1154,6 +1155,11 @@ build/pe_test: src/pe.c src/pe.h tests/pe.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ src/pe.c tests/pe.c
 
+# stereo.m's DIBR pass on the GPU (tests/stereo.m): a made-up scene, or a dumped game frame
+build/stereo_test: src/stereo.m src/stereo.h tests/stereo.m
+	@mkdir -p build
+	$(HOSTCC) -fobjc-arc -Isrc -o $@ tests/stereo.m src/stereo.m -framework Foundation -framework Metal -framework CoreGraphics -framework ImageIO
+
 build/aes_gcm_test: src/aes_gcm.c src/aes_gcm.h tests/aes_gcm.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ tests/aes_gcm.c src/aes_gcm.c
@@ -1191,6 +1197,7 @@ check: export VXRT_NO_ACTIVATE = 1
 check: build/iphlp_notify_test
 check: build/vulkan_spirv_atomic_compare_exchange_fixture.spv
 check: build/aes_gcm_test
+check: build/stereo_test
 check: build/vulkan_spirv_atomic_rmw_fixture.spv
 check: build/spirv_graphics_separate_image_sampler.air
 check: build/spirv_graphics_sampled_image_implicit.air
@@ -1301,6 +1308,7 @@ check: all build/vkmsl build/x86dec_test build/x86dec_check build/ref_x86 build/
 	build/d3d12_view_test
 	build/pe_test
 	build/aes_gcm_test
+	build/stereo_test
 	build/dotnet_metadata_test
 	build/dotnet_eh_test | tail -1
 	build/dotnet_resources_test
