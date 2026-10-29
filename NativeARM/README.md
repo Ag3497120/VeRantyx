@@ -131,8 +131,10 @@ requirement: SteamCMD's Linux `app_update 546560 -beta public validate` checks
 existing files and requests missing or changed content. A completion marker
 and missing-file-only seeding preserve Steam-updated files on retry. Steam's
 transient downloading/temp/workshop directories are not copied. Windows files
-are never modified. The final native version is prepared from the validated
-working copy; the working copy stays available for future updates.
+are never modified. Symbolic links inside the Windows installation are omitted
+from the seed, including cyclic, broken and external links; Steam validation
+supplies any missing depot files. The final native version is prepared from the
+validated working copy; the working copy stays available for future updates.
 
 Download size and additional disk requirements depend on the actual changes.
 SteamPipe uses deltas, but large pack-file changes can still require substantial

@@ -38,10 +38,66 @@ import Darwin
         put(UInt32(0x44504956), NativeIPC.hands + 320); put(Float(0.064), NativeIPC.hands + 324)
         put(sequence, 20)
     }
+    static func seedLinks(_ root: URL) throws {
+        let source = root.appendingPathComponent("linked-source"), outside = root.appendingPathComponent("linked-source-outside")
+        let asset = "game/hlvr/pak01_dir.vpk", win64 = "game/hlvr/bin/win64"
+        try write(Data("assets".utf8), source.appendingPathComponent(asset))
+        try write(Data("Windows binary".utf8), source.appendingPathComponent(win64 + "/client.dll"))
+        try write(Data("outside".utf8), outside.appendingPathComponent("private-file"))
+        let links = [win64 + "/win64": ".", win64 + "/self": "self", win64 + "/first": "second", win64 + "/second": "first",
+                     "game/hlvr/escape": outside.path, "game/hlvr/escape-file": outside.appendingPathComponent("private-file").path,
+                     "game/hlvr/dangling": "missing", "game/hlvr/asset-alias": "pak01_dir.vpk", "game/alias": "hlvr"]
+        for (relative, destination) in links { try fm.createSymbolicLink(atPath: source.appendingPathComponent(relative).path, withDestinationPath: destination) }
+        for cloneOnly in [true, false] {
+            let cache = NativeContentCache(root: root.appendingPathComponent(cloneOnly ? "linked-clone" : "linked-copy"))
+            try cache.seed(from: source, cloneOnly: cloneOnly)
+            try check(cache.seeded, "seed with symbolic links completes")
+            try check(String(contentsOf: cache.root.appendingPathComponent(asset), encoding: .utf8) == "assets", "ordinary content is seeded")
+            try check(String(contentsOf: cache.root.appendingPathComponent(win64 + "/client.dll"), encoding: .utf8) == "Windows binary", "ordinary Windows files are seeded")
+            for relative in links.keys {
+                var st = stat()
+                try check(lstat(cache.root.appendingPathComponent(relative).path, &st) != 0 && errno == ENOENT, "source link is omitted: " + relative)
+            }
+        }
+        for (relative, destination) in links {
+            try check(fm.destinationOfSymbolicLink(atPath: source.appendingPathComponent(relative).path) == destination, "source link is unchanged: " + relative)
+        }
+        try check(String(contentsOf: outside.appendingPathComponent("private-file"), encoding: .utf8) == "outside", "external link target is unchanged")
+        let alias = root.appendingPathComponent("linked-install")
+        try fm.createSymbolicLink(at: alias, withDestinationURL: source)
+        let cache = NativeContentCache(root: root.appendingPathComponent("aliased-install-copy"))
+        try cache.seed(from: alias, cloneOnly: true)
+        try check(String(contentsOf: cache.root.appendingPathComponent(asset), encoding: .utf8) == "assets", "installation root may itself be a link")
+    }
+    static func mergeLinks(_ root: URL) throws {
+        let source = root.appendingPathComponent("merge-links"), directory = source.appendingPathComponent("game")
+        try write(Data("content".utf8), directory.appendingPathComponent("file"))
+        let alias = directory.appendingPathComponent("alias")
+        try fm.createSymbolicLink(atPath: alias.path, withDestinationPath: "file")
+        let secondAlias = source.appendingPathComponent("alias")
+        try fm.createSymbolicLink(atPath: secondAlias.path, withDestinationPath: "game")
+        let output = root.appendingPathComponent("merged-links")
+        try NativeFiles.merge(source, into: output)
+        try check(String(contentsOf: output.appendingPathComponent("game/alias"), encoding: .utf8) == "content", "merge resolves an internal file link")
+        try check(String(contentsOf: output.appendingPathComponent("alias/alias"), encoding: .utf8) == "content", "merge permits repeated directories on separate branches")
+        let cycle = directory.appendingPathComponent("cycle")
+        for destination in [".", "cycle", "missing"] {
+            try fm.createSymbolicLink(atPath: cycle.path, withDestinationPath: destination)
+            do {
+                try NativeFiles.merge(source, into: root.appendingPathComponent("invalid-merge-" + UUID().uuidString))
+                throw NativeFailure("FAIL: merge accepted cyclic or broken link")
+            } catch let error as NativeFailure {
+                try check(error.text.contains("symbolic link") && error.text.contains(cycle.path), "merge identifies the invalid link")
+            }
+            try fm.removeItem(at: cycle)
+        }
+    }
     static func main() throws {
         let root = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("swift-" + UUID().uuidString)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
+        try seedLinks(root)
+        try mergeLinks(root)
         let library = root.appendingPathComponent("lib.so.2")
         try write(elf("libguest.so.7"), library)
         try check(ELF.soname(library) == "libguest.so.7", "ELF SONAME")

@@ -125,6 +125,13 @@ import Foundation
         try fm.createDirectory(at: common.appendingPathComponent("game/hlvr"), withIntermediateDirectories: true)
         let oldAssets = Data("old Windows assets".utf8)
         try oldAssets.write(to: common.appendingPathComponent("game/hlvr/pak01_dir.vpk"))
+        let win64 = common.appendingPathComponent("game/hlvr/bin/win64")
+        try fm.createDirectory(at: win64, withIntermediateDirectories: true)
+        try fm.createSymbolicLink(atPath: win64.appendingPathComponent("win64").path, withDestinationPath: ".")
+        let outside = root.appendingPathComponent("outside-install")
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data("external data".utf8).write(to: outside.appendingPathComponent("private-file"))
+        try fm.createSymbolicLink(at: common.appendingPathComponent("game/hlvr/external"), withDestinationURL: outside)
         let oldManifest = "\"AppState\" { \"appid\" \"546560\" \"name\" \"Half-Life: Alyx\" \"installdir\" \"Half-Life Alyx\" \"StateFlags\" \"4\" \"InstalledDepots\" { \"546561\" { \"manifest\" \"old\" } } }"
         try oldManifest.write(to: windowsACF, atomically: true, encoding: .utf8)
         let client = layout.downloads.appendingPathComponent("steamcmd")
@@ -174,12 +181,20 @@ import Foundation
         guard try Data(contentsOf: common.appendingPathComponent("game/hlvr/pak01_dir.vpk")) == oldAssets,
               try String(contentsOf: windowsACF, encoding: .utf8) == oldManifest,
               model.isInstalled(alyx.id, backend: .vxrt), model.isInstalled(alyx.id, backend: .nativeARM64) else { throw NativeFailure("Native content update changed Windows data or installation state") }
+        let prepared = layout.versionRoot(try layout.installation()).appendingPathComponent("game-root")
+        for relative in ["game/hlvr/bin/win64/win64", "game/hlvr/external"] {
+            guard !fm.fileExists(atPath: target.appendingPathComponent(relative).path),
+                  !fm.fileExists(atPath: prepared.appendingPathComponent(relative).path) else { throw NativeFailure("Windows symbolic links reached the native installation") }
+        }
+        guard try fm.destinationOfSymbolicLink(atPath: win64.appendingPathComponent("win64").path) == ".",
+              try fm.destinationOfSymbolicLink(atPath: common.appendingPathComponent("game/hlvr/external").path) == outside.path,
+              try String(contentsOf: outside.appendingPathComponent("private-file"), encoding: .utf8) == "external data" else { throw NativeFailure("Native preparation changed a source link or its external target") }
         let completed = try Data(contentsOf: layout.manifest)
         try Data().write(to: client.appendingPathComponent("reject-update"))
         guard !(await model.downloadNative()), try Data(contentsOf: layout.manifest) == completed,
               try Data(contentsOf: common.appendingPathComponent("game/hlvr/pak01_dir.vpk")) == oldAssets else { throw NativeFailure("Failed retry published an incomplete installation") }
         print("App model: global runtime, migration, mixed installs, shared quality, readiness, navigation and Windows regression checks passed")
         print("App integration: PTY metadata / Unicode / output drain, synthetic Debian archive and FPS statistics passed")
-        print("Native installer: old-manifest reuse, fake Linux validation, original preservation, no autoplay and failed-retry publication checks passed")
+        print("Native installer: old-manifest reuse, symbolic-link omission, fake Linux validation, original preservation, no autoplay and failed-retry publication checks passed")
     }
 }

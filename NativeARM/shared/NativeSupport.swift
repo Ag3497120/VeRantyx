@@ -80,20 +80,20 @@ struct NativeContentCache {
         if completed { return }
         var files = 0
         let skipped = Set(["steamapps/downloading", "steamapps/temp", "steamapps/workshop"])
-        func copy(_ file: URL, _ relative: String, depth: Int = 0) throws {
+        func copy(_ file: URL, _ relative: String) throws {
             try Task.checkCancellation()
-            guard depth < 128 else { throw NativeFailure("Too many nested links in native content source") }
             if skipped.contains(relative) { return }
             let target = relative.isEmpty ? root : root.appendingPathComponent(relative)
             if !relative.isEmpty { try NativeFiles.requireInside(target, root) }
             let values = try file.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey])
             if values.isSymbolicLink == true {
-                try NativeFiles.requireInside(file, source!)
-                try copy(file.resolvingSymlinksInPath(), relative, depth: depth + 1)
+                // Windows installs may contain cycles or links outside the game. Steam
+                // validates this independent seed and downloads any missing depot files.
+                return
             } else if values.isDirectory == true {
                 try NativeFiles.ownedDirectory(target)
                 for entry in try fm.contentsOfDirectory(at: file, includingPropertiesForKeys: nil) {
-                    try copy(entry, relative.isEmpty ? entry.lastPathComponent : relative + "/" + entry.lastPathComponent, depth: depth + 1)
+                    try copy(entry, relative.isEmpty ? entry.lastPathComponent : relative + "/" + entry.lastPathComponent)
                 }
             } else if values.isRegularFile == true {
                 var st = stat()
@@ -109,7 +109,7 @@ struct NativeContentCache {
                 files += 1
             } else { throw NativeFailure("Unsupported file in native content source: \(file.path)") }
         }
-        if let source { try copy(source, "") }
+        if let source { try copy(source.resolvingSymlinksInPath(), "") }
         try Task.checkCancellation()
         try JSONEncoder().encode(Seed(source: source?.path, files: files)).write(to: receipt, options: .atomic)
     }
@@ -154,17 +154,25 @@ enum NativeFiles {
     }
     /// Clone regular files on APFS; never follow a source symlink outside the downloaded tree.
     static func merge(_ source: URL, into target: URL, sourceRoot: URL? = nil) throws {
+        try merge(source, into: target, sourceRoot: sourceRoot ?? source, ancestors: [])
+    }
+    private static func merge(_ source: URL, into target: URL, sourceRoot root: URL, ancestors: Set<String>) throws {
         try Task.checkCancellation()
-        let fm = FileManager.default, root = sourceRoot ?? source
+        let fm = FileManager.default
+        var ancestors = ancestors
+        ancestors.insert(source.standardizedFileURL.path)
         let v = try source.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey, .isRegularFileKey])
         if v.isSymbolicLink == true {
             try requireInside(source, root)
-            try merge(source.resolvingSymlinksInPath(), into: target, sourceRoot: root)
+            let resolved = source.resolvingSymlinksInPath().standardizedFileURL
+            guard resolved != source.standardizedFileURL else { throw NativeFailure("Cannot resolve symbolic link in native content source: \(source.path)") }
+            guard !ancestors.contains(resolved.path) else { throw NativeFailure("Cyclic symbolic link in native content source: \(source.path)") }
+            try merge(resolved, into: target, sourceRoot: root, ancestors: ancestors)
         } else if v.isDirectory == true {
             if fm.fileExists(atPath: target.path) { try requireInside(target, target.deletingLastPathComponent()) }
             try fm.createDirectory(at: target, withIntermediateDirectories: true)
             for entry in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
-                try merge(entry, into: target.appendingPathComponent(entry.lastPathComponent), sourceRoot: root)
+                try merge(entry, into: target.appendingPathComponent(entry.lastPathComponent), sourceRoot: root, ancestors: ancestors)
             }
         } else if v.isRegularFile == true {
             if fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
