@@ -1829,7 +1829,7 @@ static void race_tick_paced(double tick) {
         }
     }
     pthread_mutex_unlock(&R.present);
-    if (done) snapshot(S, (uint32_t)a, 0, (uint32_t)slot);
+    if (done && a >= 0) snapshot(S, (uint32_t)a, 0, (uint32_t)slot);   // (A: the snapshot's first picture)
     race_stats(now_s());
 }
 
@@ -1892,7 +1892,7 @@ static void race_tick(double tick, double period) {
         }
     }
     pthread_mutex_unlock(&R.present);
-    if (done) snapshot(snap_s, (uint32_t)snap_a, 0, (uint32_t)snap_b);   // (not holding up real frames)
+    if (done && snap_a >= 0) snapshot(snap_s, (uint32_t)snap_a, 0, (uint32_t)snap_b);   // (not holding up real frames)
     race_stats(now_s());
 }
 
