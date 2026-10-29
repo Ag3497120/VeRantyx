@@ -203,6 +203,11 @@ static void jump_table(uint64_t site) {
         if (d.map == X86_MAP_1 && (op == 0x63 || op == 0x8B) && is_mem(&d) && d.reg == reg && esize == 0 && d.scale == 4 - 0 && d.index != 0xFF) {
             esize = 4; sign = op == 0x63; idx = d.index; load_base = d.base; disp = d.disp; continue;
         }
+        if (d.map == X86_MAP_1 && (op == 0x63 || op == 0x8B) && is_mem(&d) && have_add && d.reg == add_reg && esize == 0 && d.scale == 4 && d.index != 0xFF) {
+            // (the entry loaded into the ADD's other register, added to the base in the jump's: `mov eax, [r9 + r8*4 + d];
+            //  add r9, rax; jmp r9`, the CRT's memset; from here on the base is the jump register's)
+            esize = 4; sign = op == 0x63; idx = d.index; load_base = d.base; disp = d.disp; add_reg = reg; continue;
+        }
         if (d.map == X86_MAP_1 && op == 0x8B && is_mem(&d) && d.reg == reg && esize == 0 && d.scale == 8 && d.index != 0xFF && d.base == 0xFF) {
             esize = 8; idx = d.index; disp = d.disp; table = (int64_t)(int32_t)d.disp; continue;    // jmp through absolute pointers
         }
@@ -234,6 +239,13 @@ static void jump_table(uint64_t site) {
         if (table < 0 && load_base >= 0 && load_base < 16 && last[load_base] >= 0) table = last[load_base] + disp;
         if (!add_base && add_reg >= 0 && add_reg < 16 && last[add_reg] >= 0) add_base = last[add_reg];
     }
+    if (esize == 4 && have_add && add_reg == load_base && (table < 0 || add_base == 0)) {
+        // (one register both indexes the table and is added to its entries, its LEA not found: an image-relative table,
+        //  `mov r11d, [r10 + r11*4 + rva]; add r11, r10` with r10 the image base, as the CRT's memcpy / memset have)
+        uint64_t ea = G->base + (uint64_t)(int64_t)disp;
+        if (in_image(G, ea) && in_image(G, ea + 3) && exec_va(G, G->base + r32(G->mem + (ea - G->base)))) { table = (int64_t)ea; add_base = (int64_t)G->base; }
+    }
+    if (getenv("VXRT_AOT_JTDEBUG")) fprintf(stderr, "jt %#llx esize %d have_add %d add_reg %d table %#llx add_base %#llx bound %lld load_base %d\n", (unsigned long long)site, esize, have_add, add_reg, (unsigned long long)table, (unsigned long long)add_base, (long long)bound, load_base);
     if (esize == 4 && (!have_add || table < 0 || add_base == 0)) return;
     if (esize == 0 || table < 0) return;
     g_tables++;
@@ -601,6 +613,18 @@ static int analyze(const image *im, const char *addresses, int quiet) {
     roots(addresses);
     descend();
     double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
+    if (getenv("VXRT_AOT_CHECK")) {                    // a run's misses (VXRT_AOT_MISSES): which of this image's the analysis
+        FILE *f = fopen(getenv("VXRT_AOT_CHECK"), "r");  //  does not find as block leaders by itself
+        char line[256]; unsigned in = 0, out = 0;
+        while (f && fgets(line, sizeof line, f)) {
+            uint64_t a = strtoull(line, NULL, 16);
+            if (!exec_va(im, a)) continue;
+            in++;
+            if (!(g_mark[a - im->base] & M_LEADER)) { out++; fprintf(stderr, "vxrt-aot: not found: %s", line); }
+        }
+        if (f) fclose(f);
+        fprintf(stderr, "vxrt-aot: %s: %u of %u listed addresses not found\n", im->name, out, in);
+    }
     if (quiet) return 0;
     printf("%s: base %#llx, %u bytes, hash %016llx\n", im->name, (unsigned long long)im->base, im->size, (unsigned long long)im->hash);
     printf("roots (found / not reached from earlier roots):\n");
