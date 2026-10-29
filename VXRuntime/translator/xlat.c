@@ -44,6 +44,12 @@ static void mov_imm(xlat_buf *b, int d, uint64_t v) {
     }
     if (first) E(b, a64_movz(d, 0, 0));
 }
+static void reloc(xlat_buf *b, uint32_t kind);
+// A host address into register d: an immediate, or ahead of time (b->aot) a site the generator fills (XR_ABS).
+static void mov_abs(xlat_buf *b, int d, uint64_t v, int which) {
+    if (!b->aot) { mov_imm(b, d, v); return; }
+    reloc(b, XR_ABS); E(b, XA_ABS_WORD(which, d)); E(b, 0); E(b, 0); E(b, 0);
+}
 
 // ---- operands ---------------------------------------------------------------------------------------------------------------
 static int bits(int size) { return size * 8; }
@@ -117,9 +123,10 @@ static void rd_rm_ro(xlat_buf *b, const x86_insn *d, int t, int size, uint64_t n
 // Locked accesses to memory that is not naturally aligned (x86 allows them; ARM atomics fault on them) go through one
 // lock shared by all translated code: taken with SWPAL, released with STLR. x25 holds its address meanwhile.
 static uint64_t xlat_split_lock;
+uint64_t *xlat_split_lock_addr(void) { return &xlat_split_lock; }
 enum { X_LOCK = 25 };
 static void split_lock_take(xlat_buf *b) {
-    mov_imm(b, X_LOCK, (uint64_t)(uintptr_t)&xlat_split_lock);
+    mov_abs(b, X_LOCK, (uint64_t)(uintptr_t)&xlat_split_lock, XA_SPLIT_LOCK);
     E(b, a64_movz(S1, 1, 0)); E(b, a64_swpal(8, S1, S1, X_LOCK)); E(b, a64_cbnz(S1, -2));
 }
 static void split_lock_give(xlat_buf *b) { E(b, a64_stlr(XZR, X_LOCK)); }
@@ -250,7 +257,7 @@ static void call_helper_r(xlat_buf *b, uint32_t op, int op_reg, int val) {
     E(b, a64_str(8, XF, XC, CTX_FLAGS));
     if (op_reg < 0) { mov_imm(b, S0, op); E(b, a64_str(8, S0, XC, CTX_HELPER_OP)); }
     E(b, a64_mov(0, XC));
-    mov_imm(b, S0, (uint64_t)(uintptr_t)xlat_helper);
+    mov_abs(b, S0, (uint64_t)(uintptr_t)xlat_helper, XA_HELPER);
     E(b, b->vcpu ? a64_hvc(XV_HVC_HELPER) : a64_blr(S0));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));
@@ -1999,7 +2006,7 @@ void xlat_prologue(xlat_buf *b) {
     E(b, a64_stp(25, 26, SP, 64)); E(b, a64_stp(27, 28, SP, 80));
     E(b, a64_stpd(8, 9, SP, 96)); E(b, a64_stpd(10, 11, SP, 112)); E(b, a64_stpd(12, 13, SP, 128)); E(b, a64_stpd(14, 15, SP, 144));
     E(b, a64_mov(XC, 0));
-    mov_imm(b, XP, (uint64_t)(uintptr_t)xlat_parity);
+    mov_abs(b, XP, (uint64_t)(uintptr_t)xlat_parity, XA_PARITY);
     E(b, a64_ldr(8, XF, XC, CTX_FLAGS));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldp(r, r + 1, XC, r * 8));
     for (int r = 0; r < 16; r += 2) E(b, a64_ldpq(r, r + 1, XC, CTX_XMM + r * 16));

@@ -15,6 +15,7 @@
 #include "arm64.h"
 #include "../translator/engine.h"
 #include "../translator/vcpu.h"
+#include "../translator/aot.h"
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -31,6 +32,12 @@
 
 __thread const char *vx_va_slots;
 static xe *g_engine;
+// Translated code is the engine's or a statically recompiled module's (translator/aot.c): where a host pc is in it.
+static int code_owns(uint64_t pc) { return xe_owns(g_engine, pc) || xa_owns(pc); }
+static uint64_t code_rip_sp_at(uint64_t pc, int64_t *sp) {
+    if (xe_owns(g_engine, pc)) return xe_rip_sp_at(g_engine, pc, sp);
+    return xa_rip_sp_at(pc, sp);
+}
 uint64_t vx_low_base;                                         // (vx.h: the vCPU's memory below 4 GB)
 uint8_t vx_low_map[1 << 16] __attribute__((aligned(64))) = { 0 };
 enum { X86_RETURN = 0xFFFFFFFFFFFF0000ull };                // where x86 code called from here returns to (never code)
@@ -172,7 +179,7 @@ uint64_t vx_x86_call(uint64_t fn, int n, const uint64_t *args) {
     uint64_t fpcr = read_fpcr();
     if (setjmp(l.jb)) { t_level = &l; write_fpcr(fpcr); xv_set_depth(l.xv_depth); }   // (resumed in this level: the
                                                                                      //  context is the handler's)
-    int r = xe_run(g_engine, c, X86_RETURN);
+    int r = xa_any() ? xa_run(g_engine, c, X86_RETURN, vx_thunk_find) : xe_run(g_engine, c, X86_RETURN);
     if (r) engine_fault(c, r);
     t_level = l.outer;
     if (l.seh) vx_seh_level_end(l.seh);
@@ -260,9 +267,9 @@ int vx_arm64_state_at(const void *ucv, void *outv) {
     if (!t_ctx) return 0;
     *out = *t_ctx;
     const _STRUCT_ARM_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
-    if (xe_owns(g_engine, ss->__pc)) {
+    if (code_owns(ss->__pc)) {
         int64_t sp;
-        uint64_t rip = xe_rip_sp_at(g_engine, ss->__pc, &sp);
+        uint64_t rip = code_rip_sp_at(ss->__pc, &sp);
         for (int i = 0; i < 16; i++) { out->gpr[i] = ss->__x[i]; memcpy(out->xmm[i], &uc->uc_mcontext->__ns.__v[i], 16); }
         out->gpr[4] += (uint64_t)sp;                          // (pushes and pops not applied to x4 yet)
         out->flags = xlat_flags_resolve(ss->__x[27], t_ctx);   // (pending flags: computed)
@@ -312,14 +319,14 @@ static void __attribute__((noreturn)) smc_restart(void) {
 static void state_from_signal(x86_ctx *c, const ucontext_t *uc, uint64_t rip) {
     const _STRUCT_ARM_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
     int64_t sp;
-    xe_rip_sp_at(g_engine, ss->__pc, &sp);
+    code_rip_sp_at(ss->__pc, &sp);
     for (int i = 0; i < 16; i++) { c->gpr[i] = ss->__x[i]; memcpy(c->xmm[i], &uc->uc_mcontext->__ns.__v[i], 16); }
     c->gpr[4] += (uint64_t)sp;                                // (pushes and pops not applied to x4 yet)
     c->flags = xlat_flags_resolve(ss->__x[27], c); c->ras = ss->__fp; c->rip = rip;
 }
 void vx_code_freed(void *addr, size_t len) { xe_forget(g_engine, (uint64_t)(uintptr_t)addr, len); }
 uint64_t vx_arm64_x86_pc(uint64_t pc) {
-    uint64_t rip = xe_owns(g_engine, pc) ? xe_rip_at(g_engine, pc) : 0;
+    uint64_t rip = code_owns(pc) ? code_rip_sp_at(pc, NULL) : 0;
     return rip ? rip : pc;
 }
 static void on_fault(int sig, siginfo_t *si, void *ucv) {
@@ -327,6 +334,7 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
     _STRUCT_ARM_THREAD_STATE64 *ss = &uc->uc_mcontext->__ss;
     uint64_t pc = ss->__pc;
     if ((sig == SIGSEGV || sig == SIGBUS) && xe_fix_split(g_engine, uc)) return;   // (ordered access across 16 bytes)
+    if ((sig == SIGSEGV || sig == SIGBUS) && xa_fix_split(uc)) return;              // (the same in a recompiled module)
     // A write to a page whose code was translated (SMC). A permission fault on a readable page is a write, whatever
     // WnR says (LSE atomics, XCHG's SWPAL, may fault with WnR 0).
     uint64_t esr = uc->uc_mcontext->__es.__esr;
@@ -337,12 +345,12 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
         return;                                               // (native code: the write again, now allowed)
     }
     // An instruction fetch from a page that is not executable (native code always is): a call into x86 code.
-    if ((sig == SIGSEGV || sig == SIGBUS) && (uint64_t)(uintptr_t)si->si_addr == pc && !xe_owns(g_engine, pc)) {
+    if ((sig == SIGSEGV || sig == SIGBUS) && (uint64_t)(uintptr_t)si->si_addr == pc && !code_owns(pc)) {
         ss->__x[9] = pc;                                      // a call into x86 code: on through the engine
         ss->__pc = (uint64_t)(uintptr_t)vx_cb_tramp;
         return;
     }
-    uint64_t rip = xe_owns(g_engine, pc) ? xe_rip_at(g_engine, pc) : 0;
+    uint64_t rip = code_owns(pc) ? code_rip_sp_at(pc, NULL) : 0;
     if (rip && t_ctx && (sig == SIGSEGV || sig == SIGBUS) && getenv("VXRT_TRACE_FAULTS")) {   // (with the module, RSP and the thread's stack: a stack overflow shows as an address just below its limit)
         const vx_image *m = vx_image_at(rip); uint8_t *teb = vx_teb();
         vx_log("arm64: fault at x86 %#llx (%s+%#llx, host %#llx), address %p, ESR %#llx, rsp %#llx, stack %p-%p",
@@ -350,7 +358,7 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
                (unsigned long long)pc, si->si_addr, (unsigned long long)esr, (unsigned long long)ss->__x[4],
                *(void **)(teb + TEB_STACK_LIMIT), *(void **)(teb + TEB_STACK_BASE));
         // (and the words above RSP that look like code addresses: a recursion shows its return addresses repeating)
-        int64_t sp_delta; xe_rip_sp_at(g_engine, pc, &sp_delta);
+        int64_t sp_delta; code_rip_sp_at(pc, &sp_delta);
         uint64_t from = ss->__x[4] + (uint64_t)sp_delta, limit = (uint64_t)(uintptr_t)*(void **)(teb + TEB_STACK_LIMIT);
         const uint64_t *w = (const uint64_t *)(uintptr_t)(from < limit ? limit : from);   // (below the limit: unmapped)
         char line[1024]; size_t k = 0;
@@ -382,7 +390,7 @@ static void on_fault(int sig, siginfo_t *si, void *ucv) {
         ss->__lr = 0;
         return;
     }
-    if (xe_owns(g_engine, pc))
+    if (code_owns(pc))
         vx_log("arm64: signal %d in translated code (host pc %#llx, no x86 instruction there, address %p)", sig, (unsigned long long)pc, si->si_addr);
     else
         vx_log("signal %d at %#llx (address %p) in this runtime; native backtrace:", sig, (unsigned long long)pc, si->si_addr);
@@ -420,6 +428,7 @@ void vx_arm64_init(void) {
     else g_engine = xe_new(!getenv("VXRT_ORDERED") || atoi(getenv("VXRT_ORDERED")) != 0);
     if (!g_engine) { fprintf(stderr, "vxrt: cannot map the translation cache\n"); exit(1); }
     xe_set_native(g_engine, vx_thunk_find);
+    xe_set_foreign(g_engine, xa_owns_rip);                          // (recompiled modules' code: theirs, not translated again)
     xe_set_smc(g_engine, 1);
     vx_thunks_override(g_special, sizeof g_special / sizeof *g_special);
     void vx_sync_arm64_init(void);

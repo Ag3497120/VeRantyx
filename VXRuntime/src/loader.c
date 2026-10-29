@@ -16,9 +16,13 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <pthread.h>
 #include "vx.h"
 #include "pe.h"
+#ifdef __aarch64__
+#include "../translator/aot.h"
+#endif
 #include "dotnet_host.h"
 #include <sys/resource.h>
 #include <limits.h>
@@ -620,6 +624,11 @@ static vx_image *load_pe(const char *path, int is_main) {
         uint32_t n = sec[i].raw_size < sec[i].vsize || !sec[i].vsize ? sec[i].raw_size : sec[i].vsize;
         if (n) memcpy(base + sec[i].va, file + sec[i].raw_ptr, n);
     }
+#ifdef __aarch64__
+    // VXRT_AOT_DIR: statically recompiled code for this file, if there is some (translator/aot.c, RECOMP.md): a module
+    // named after the file and its bytes' hash, made for it at this base
+    uint64_t aot_hash = getenv("VXRT_AOT_DIR") ? xa_hash(file, (uint64_t)len) : 0;
+#endif
     free(file);
 
     int64_t delta = (int64_t)((uint64_t)base - pref_base);
@@ -673,6 +682,17 @@ static vx_image *load_pe(const char *path, int is_main) {
         __atomic_store_n(&g_image_count, g_image_count + 1, __ATOMIC_RELEASE);   // visible before imports load (cycles)
     }
     if (vx_trace) vx_log("%s mapped at %p%s", m->name, base, reuse >= 0 ? " (again, where its unloaded copy was)" : "");
+#ifdef __aarch64__
+    if (aot_hash) {
+        char lower[sizeof m->name], mod[4096];
+        size_t k = 0;
+        for (; m->name[k] && k + 1 < sizeof lower; k++) lower[k] = (char)tolower((unsigned char)m->name[k]);
+        lower[k] = 0;
+        snprintf(mod, sizeof mod, "%s/%s-%016llx.dylib", getenv("VXRT_AOT_DIR"), lower, (unsigned long long)aot_hash);
+        if (!access(mod, R_OK)) xa_load(mod, (uint64_t)(uintptr_t)base, image_size, aot_hash);
+        else if (vx_trace) vx_log("aot: no module %s", mod);
+    }
+#endif
 
     // TLS: an index for this image (its unloaded copy's, when it had one) and a block on every thread that exists
     // already.

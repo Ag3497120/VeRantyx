@@ -77,6 +77,7 @@ typedef struct {
     int lazy_flags;              // xlat_block_linked: the engine has a pending-flags stub (XR_FLAGS sites call it)
     int lazy_record;             //   this instruction's flags are recorded, not computed (flags_arith)
     int lazy_done;               //   (flags_arith did record them)
+    int aot;                     // made ahead of time (translator/aot.c): host addresses as XR_ABS sites, not immediates
     int vcpu;                    // the code runs in a Hypervisor.framework guest (vcpu.c): calls of host code are HVC #2
                                  //   (xlat_helper) and #3 (a native function: its thunk in S0)             // xlat_block_linked: compare the block's x86 bytes first (code on a page written often)
     // xlat_block_linked: rarely taken code (the NaN fixes) goes after the block, out of the straight path
@@ -108,7 +109,13 @@ int xlat_block(xlat_buf *b, uint64_t rip, int max_insns);
 // block's last instruction. Returns 0, or -1 if an instruction is not supported (yet).
 enum { XR_LINK = 1, XR_LOOKUP, XR_EXIT,        // sites: BL link stub (then the target as 8 bytes), B lookup stub, B exit stub,
        XR_CALL, XR_LOOKUP_CALL,                 //   BL call-link stub (the return's site, then the target), BL lookup stub,
-       XR_FLAGS };                              //   BL the pending-flags stub (xlat_flags_stub)
+       XR_FLAGS,                                //   BL the pending-flags stub (xlat_flags_stub),
+       XR_ABS };                                //   (b->aot only) a host address: 4 words, the first XA_ABS_WORD(which, reg)
+// Host addresses the code holds (b->aot: the static recompiler, translator/aot.c, puts loads from its module's table
+// there): which one, and the register it goes to.
+enum { XA_HELPER = 0, XA_SPLIT_LOCK, XA_PARITY, XA_NABS };
+#define XA_ABS_WORD(which, reg) ((uint32_t)(which) << 5 | (uint32_t)(reg))
+uint64_t *xlat_split_lock_addr(void);
 // The pending-flags stub (engine.c makes one): computes the flags a record describes into x27 (x16, x17 kept).
 void xlat_flags_stub(xlat_buf *b);
 int xlat_block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end);

@@ -49,6 +49,7 @@ struct xe {
     int vcpu;                       // xe_new_vcpu: the code runs in a Hypervisor.framework guest (vcpu.c)
     uint32_t *vectors;              //   its exception vectors (each HVC #0x10 + n)
     int ordered;
+    int (*foreign)(uint64_t rip);    // xe_set_foreign: code the static recompiler's modules own
     xe_stats stats;
 };
 
@@ -158,6 +159,7 @@ uint64_t xe_ring_new(xe *e) {
     return (uint64_t)(uintptr_t)r;
 }
 void xe_set_native(xe *e, void (*(*find)(uint64_t))(x86_ctx *)) { e->native = find; }
+void xe_set_foreign(xe *e, int (*owns)(uint64_t)) { e->foreign = owns; }
 void xe_set_guest(xe *e, int (*find)(uint64_t, uint64_t *, const void **)) { e->guest = find; }
 // A table entry, both words at once (with LSE2 an aligned STP is single-copy atomic): another thread's lookup stub
 // sees the old entry or the new one.
@@ -491,6 +493,7 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
     for (;;) {
         if (c->fault) return (int)c->fault;
         if (c->rip == stop) return 0;
+        if (e->foreign && !c->single && e->foreign(c->rip)) { c->link = 0; return XE_FOREIGN; }   // (its runner goes on)
         if (e->vcpu && !(c->rip >> 32)) {                                 // (the guest's low memory is the host's elsewhere)
             fprintf(stderr, "[vxrt] engine: code below 4 GB (%#llx) is not run in the vCPU yet\n", (unsigned long long)c->rip);
             return -2;
