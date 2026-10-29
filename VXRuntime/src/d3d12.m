@@ -13557,12 +13557,12 @@ static void mem_report12(dev12 *d) {
     if (vx_heap_report(heap, sizeof heap)) vx_log("D3D12: memory: the game's heap blocks (HeapAlloc, malloc, new): %s", heap);
 }
 // malloc keeps the pages of freed blocks (most in its medium size class, 1.3 GB of dirty pages for 0.5 GB in use in
-// Cyberpunk) until memory runs short: every 300 presents they are given back, off the present's thread
-// (VXRT_MALLOC_RELIEF=0: not).
+// Cyberpunk) until memory runs short. VXRT_MALLOC_RELIEF=1: every 300 presents malloc_zone_pressure_relief, off the
+// present's thread (measured in Cyberpunk: it gave back 0 MB, 10-38 ms each, so it is off by default).
 static void malloc_relief12(uint32_t presents) {
     static int on = -1;
     static volatile int busy;
-    if (on < 0) on = !getenv("VXRT_MALLOC_RELIEF") || atoi(getenv("VXRT_MALLOC_RELIEF")) != 0;
+    if (on < 0) on = getenv("VXRT_MALLOC_RELIEF") && atoi(getenv("VXRT_MALLOC_RELIEF")) != 0;
     if (!on || presents % 300 || !__sync_bool_compare_and_swap(&busy, 0, 1)) return;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         uint64_t t0 = fs_now12();
