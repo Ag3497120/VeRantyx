@@ -1819,6 +1819,9 @@ int gpu_ir_descriptor_state_find(const gpu_ir_descriptor_state *state, uint32_t 
     return found ? GPU_IR_OK : GPU_IR_NOT_FOUND;
 }
 
+uint64_t gpu_ir_stream_bytes;
+size_t gpu_ir_command_size(void) { return sizeof(gpu_ir_command); }
+
 void gpu_ir_stream_init(gpu_ir_stream *s) { if (s) *s = (gpu_ir_stream){ 0 }; }
 
 void gpu_ir_stream_clear(gpu_ir_stream *s) {
@@ -1849,6 +1852,7 @@ void gpu_ir_stream_clear(gpu_ir_stream *s) {
 void gpu_ir_stream_destroy(gpu_ir_stream *s) {
     if (!s) return;
     gpu_ir_stream_clear(s);
+    __atomic_sub_fetch(&gpu_ir_stream_bytes, (uint64_t)s->capacity * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
     free(s->commands);
     *s = (gpu_ir_stream){ 0 };
 }
@@ -1862,6 +1866,7 @@ static gpu_ir_command *stream_append_command(gpu_ir_stream *s, uint32_t op) {
         if (capacity < s->capacity || (size_t)capacity > SIZE_MAX / sizeof(gpu_ir_command)) return NULL;
         gpu_ir_command *commands = realloc(s->commands, (size_t)capacity * sizeof *commands);
         if (!commands) return NULL;
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(capacity - s->capacity) * sizeof *commands, __ATOMIC_RELAXED);
         s->commands = commands;
         s->capacity = capacity;
     }
@@ -2045,6 +2050,7 @@ int gpu_ir_record_copy_buffer(gpu_ir_stream *s, gpu_ir_resource *src, uint64_t s
         if (cap < s->capacity || (size_t)cap > SIZE_MAX / sizeof(gpu_ir_command)) return GPU_IR_OUT_OF_MEMORY;
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) return GPU_IR_OUT_OF_MEMORY;
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
@@ -2079,6 +2085,7 @@ int gpu_ir_record_update_buffer(gpu_ir_stream *s, gpu_ir_resource *dst, uint64_t
             free(owned_data);
             return GPU_IR_OUT_OF_MEMORY;
         }
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(capacity - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = commands;
         s->capacity = capacity;
     }
@@ -2114,6 +2121,7 @@ int gpu_ir_record_fill_buffer_pattern(gpu_ir_stream *s, gpu_ir_resource *dst, ui
             return GPU_IR_OUT_OF_MEMORY;
         gpu_ir_command *commands = realloc(s->commands, (size_t)capacity * sizeof *commands);
         if (!commands) return GPU_IR_OUT_OF_MEMORY;
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(capacity - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = commands;
         s->capacity = capacity;
     }
@@ -2149,6 +2157,7 @@ int gpu_ir_record_copy_resource(gpu_ir_stream *s, gpu_ir_resource *src, gpu_ir_r
         if (cap < s->capacity || (size_t)cap > SIZE_MAX / sizeof(gpu_ir_command)) return GPU_IR_OUT_OF_MEMORY;
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) return GPU_IR_OUT_OF_MEMORY;
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
@@ -2255,6 +2264,7 @@ int gpu_ir_record_copy_texture(gpu_ir_stream *s, gpu_ir_resource *src,
         if (cap < s->capacity || (size_t)cap > SIZE_MAX / sizeof(gpu_ir_command)) return GPU_IR_OUT_OF_MEMORY;
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) return GPU_IR_OUT_OF_MEMORY;
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
@@ -2299,6 +2309,7 @@ int gpu_ir_record_resolve_texture_region(gpu_ir_stream *s, gpu_ir_resource *src,
         if (cap < s->capacity || (size_t)cap > SIZE_MAX / sizeof(gpu_ir_command)) return GPU_IR_OUT_OF_MEMORY;
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) return GPU_IR_OUT_OF_MEMORY;
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
@@ -2396,6 +2407,7 @@ int gpu_ir_record_barrier(gpu_ir_stream *s, const gpu_ir_barrier_desc *barrier, 
         if (cap < s->capacity || (size_t)cap > SIZE_MAX / sizeof(gpu_ir_command)) return GPU_IR_OUT_OF_MEMORY;
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) return GPU_IR_OUT_OF_MEMORY;
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
@@ -2438,6 +2450,7 @@ int gpu_ir_record_dispatch_with_accesses(gpu_ir_stream *s, gpu_ir_pipeline *pipe
         }
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) { release_resource_accesses(access_copy, access_count); return GPU_IR_OUT_OF_MEMORY; }
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
@@ -2482,6 +2495,7 @@ int gpu_ir_record_dispatch_indirect_with_accesses(gpu_ir_stream *s, gpu_ir_pipel
         }
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) { release_resource_accesses(access_copy, access_count); return GPU_IR_OUT_OF_MEMORY; }
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
@@ -2562,6 +2576,7 @@ int gpu_ir_record_dispatch_indirect_range_counted_with_accesses(gpu_ir_stream *s
         }
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) { release_resource_accesses(access_copy, access_count); return GPU_IR_OUT_OF_MEMORY; }
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
@@ -2655,6 +2670,7 @@ int gpu_ir_record_draw_with_accesses(gpu_ir_stream *s, gpu_ir_pipeline *pipeline
         }
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) { release_resource_accesses(access_copy, access_count); return GPU_IR_OUT_OF_MEMORY; }
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
@@ -2771,6 +2787,7 @@ int gpu_ir_record_draw_indirect_counted_with_accesses(gpu_ir_stream *s, gpu_ir_p
         }
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) { release_resource_accesses(access_copy, access_count); return GPU_IR_OUT_OF_MEMORY; }
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
@@ -2799,6 +2816,7 @@ int gpu_ir_record_bind_descriptor_state(gpu_ir_stream *s, gpu_ir_descriptor_stat
         if (cap < s->capacity || (size_t)cap > SIZE_MAX / sizeof(gpu_ir_command)) return GPU_IR_OUT_OF_MEMORY;
         gpu_ir_command *cmds = realloc(s->commands, (size_t)cap * sizeof *cmds);
         if (!cmds) return GPU_IR_OUT_OF_MEMORY;
+        __atomic_add_fetch(&gpu_ir_stream_bytes, (uint64_t)(cap - s->capacity) * sizeof(gpu_ir_command), __ATOMIC_RELAXED);
         s->commands = cmds;
         s->capacity = cap;
     }
