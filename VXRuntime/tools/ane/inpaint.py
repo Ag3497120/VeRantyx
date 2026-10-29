@@ -81,7 +81,10 @@ def ring_fill(img, m):
 
 
 class Tiny(nn.Module):
-    """A 3-level U-Net, 16/32/48 channels (about 70k weights): small enough for the ANE at a frame's block grid."""
+    """A 3-level U-Net, 16/32/48 channels (about 100k weights), small enough for the ANE at a frame's block grid. Its
+    input is the warp core's own result (holes ring-filled) and the mask; it learns a correction of the hole pixels
+    only, starting at zero (so at worst it is the ring fill). ANE-friendly: x2 nearest upsampling on sizes divisible
+    by 4 (an arbitrary-size bilinear resize does not compile for the ANE)."""
     def __init__(s, c=16):
         super().__init__()
         s.e0 = nn.Sequential(nn.Conv2d(4, c, 3, padding=1), nn.ReLU(), nn.Conv2d(c, c, 3, padding=1), nn.ReLU())
@@ -90,15 +93,15 @@ class Tiny(nn.Module):
                              nn.Conv2d(3 * c, 3 * c, 3, padding=4, dilation=4), nn.ReLU())
         s.d1 = nn.Sequential(nn.Conv2d(3 * c + 2 * c, 2 * c, 3, padding=1), nn.ReLU())
         s.d0 = nn.Sequential(nn.Conv2d(2 * c + c, c, 3, padding=1), nn.ReLU(), nn.Conv2d(c, 3, 3, padding=1))
+        nn.init.zeros_(s.d0[2].weight); nn.init.zeros_(s.d0[2].bias)
+        s.up = nn.Upsample(scale_factor=2, mode='nearest')
 
-    def forward(s, x):                                             # x: RGB with holes zeroed, then the mask (N, 4, H, W)
+    def forward(s, x):                                             # x: RGB ring-filled, then the mask (N, 4, H, W), H, W % 4 == 0
         a = s.e0(x); b = s.e1(a); c = s.e2(b)
-        u = F.interpolate(c, size=b.shape[2:], mode='bilinear', align_corners=False)
-        u = s.d1(torch.cat([u, b], 1))
-        u = F.interpolate(u, size=a.shape[2:], mode='bilinear', align_corners=False)
-        y = torch.sigmoid(s.d0(torch.cat([u, a], 1)))
+        u = s.d1(torch.cat([s.up(c), b], 1))
+        y = s.d0(torch.cat([s.up(u), a], 1))
         m = x[:, 3:4]
-        return x[:, :3] * (1 - m) + y * m                          # (only the holes change)
+        return torch.clamp(x[:, :3] + y * m, 0, 1)                 # (only the holes change)
 
 
 def batch(frames, rng, n, size):
@@ -111,7 +114,7 @@ def batch(frames, rng, n, size):
         if rng.random() < 0.5:
             img = img[:, ::-1]
         m = holes(size, size, rng)
-        xs.append(np.concatenate([img * (1 - m[..., None]), m[..., None]], 2)); ys.append(img)
+        xs.append(np.concatenate([ring_fill(img * (1 - m[..., None]), m), m[..., None]], 2)); ys.append(img)
     t = lambda a: torch.from_numpy(np.ascontiguousarray(np.stack(a))).permute(0, 3, 1, 2)
     return t(xs), t(ys)
 
@@ -154,11 +157,12 @@ def main():
     pn, pr = [], []
     with torch.no_grad():
         for f in te:
+            f = f[:f.shape[0] // 4 * 4, :f.shape[1] // 4 * 4]
             h, w = f.shape[:2]
             m = holes(h, w, rng)
-            x = np.concatenate([f * (1 - m[..., None]), m[..., None]], 2)
-            o = net(torch.from_numpy(x).permute(2, 0, 1)[None])[0].permute(1, 2, 0).numpy()
             r = ring_fill(f * (1 - m[..., None]), m)
+            x = np.concatenate([r, m[..., None]], 2).astype(np.float32)
+            o = net(torch.from_numpy(x).permute(2, 0, 1)[None])[0].permute(1, 2, 0).numpy()
             sel = m > 0.5
             pn.append(psnr(o[sel], f[sel])); pr.append(psnr(r[sel], f[sel]))
     print(f'test ({len(te)} frames, holes only): net {np.mean(pn):.2f} dB, ring fill (the core\'s) {np.mean(pr):.2f} dB, '
@@ -166,7 +170,7 @@ def main():
     torch.save(net.state_dict(), os.path.join(a.out, 'inpaint_tiny.pt'))
     # Core ML: fixed sizes (the warp core's block grid for a 1512x982 window: 756x492; Vision Pro's eye at half: 960x912)
     import coremltools as ct
-    for (H, W) in ((492, 756), (912, 960)):
+    for (H, W) in ((488, 756), (912, 960)):
         ex = torch.zeros(1, 4, H, W)
         tm = torch.jit.trace(net, ex)
         ml = ct.convert(tm, inputs=[ct.TensorType(name='x', shape=ex.shape)], outputs=[ct.TensorType(name='y')],
@@ -182,7 +186,7 @@ def main():
             for _ in range(20):
                 t1 = time.perf_counter(); m.predict(x); ts.append((time.perf_counter() - t1) * 1000)
             ts.sort()
-            print(f'Core ML {W}x{H} fp16, {name}: {ts[len(ts) // 2]:.2f} ms median, {ts[-2]:.2f} ms p95 (20 runs, Python call included)')
+            print(f'Core ML {W}x{H} fp16, {name}: {ts[len(ts) // 2]:.2f} ms median, {ts[-2]:.2f} ms p95 (20 runs, Python call included)', flush=True)
 
 
 if __name__ == '__main__':
