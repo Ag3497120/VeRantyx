@@ -639,7 +639,33 @@ static size_t bmap_find(uint64_t rip) {
     return i;
 }
 enum { X86_RETURN_STOP = 0 };
+// VXRT_AOT_SPLITS=<file>: x86 addresses (hex, one a line; the runtime writes them, translator/aot.c) whose ordered
+// access crossed 16 bytes in a run: those get DMB, a plain access, DMB instead of LDAPR / STLR, which fault there
+static uint64_t *g_split; static size_t g_splitcap, g_nsplit;
+static int split_at(uint64_t rip) {
+    if (!g_nsplit) return 0;
+    size_t i = (size_t)((rip * 0x9E3779B97F4A7C15ull) >> 20) & (g_splitcap - 1);
+    while (g_split[i]) { if (g_split[i] == rip) return 1; i = (i + 1) & (g_splitcap - 1); }
+    return 0;
+}
+static void read_splits(void) {
+    const char *f = getenv("VXRT_AOT_SPLITS");
+    FILE *in = f ? fopen(f, "r") : NULL;
+    if (!in) return;
+    g_splitcap = 1 << 16; g_split = calloc(g_splitcap, sizeof *g_split);
+    char line[64];
+    while (fgets(line, sizeof line, in) && g_nsplit < g_splitcap / 2) {
+        uint64_t rip = strtoull(line, NULL, 16);
+        if (!rip || split_at(rip)) continue;
+        size_t i = (size_t)((rip * 0x9E3779B97F4A7C15ull) >> 20) & (g_splitcap - 1);
+        while (g_split[i]) i = (i + 1) & (g_splitcap - 1);
+        g_split[i] = rip; g_nsplit++;
+    }
+    fclose(in);
+    fprintf(stderr, "vxrt-aot: %zu instructions with accesses across 16 bytes (%s)\n", g_nsplit, f);
+}
 static void gen_blocks(const image *im, uint64_t stop) {
+    read_splits();
     g_bcap = 1 << 16;
     while (g_bcap < 4 * (size_t)g_insns) g_bcap <<= 1;
     g_bmap = calloc(2 * g_bcap, sizeof *g_bmap);
@@ -653,7 +679,7 @@ static void gen_blocks(const image *im, uint64_t stop) {
         if (g_bmap[2 * slot]) continue;
         g_bmap[2 * slot] = rip;
         xlat_buf b = { 0 };
-        b.ordered = 1; b.stop = stop; b.lazy_flags = 1; b.aot = 1;
+        b.ordered = 1; b.stop = stop; b.lazy_flags = 1; b.aot = 1; b.plain = split_at;
         uint64_t end = rip + 1;
         if (xlat_block_linked(&b, rip, 64, &end) < 0) {
             g_failed++; g_failed_unique++;

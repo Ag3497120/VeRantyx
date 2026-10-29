@@ -110,8 +110,11 @@ static int ea_fold(xlat_buf *b, const x86_insn *d, uint64_t next, int size, int3
 // ones too: compilers use RBP as a register of their own (UnityPlayer's allocator keeps its heap object there); with
 // plain loads and stores, a flag written after data was seen before it (tests/order.c).
 static int shared_access(const xlat_buf *b, const x86_insn *d) { return b->ordered && d->base != 4; }
+// (an ordered access the profile says crosses 16 bytes: DMB ISH, plain, DMB ISH; xlat_buf.plain)
+static int split_plain(const xlat_buf *b, const x86_insn *d) { return shared_access(b, d) && b->plain && b->plain(b->cur_rip); }
 static void rd_rm(xlat_buf *b, const x86_insn *d, int t, int size, uint64_t next) {
     if (d->mod == 3) rd_reg(b, d, t, d->rm, size);
+    else if (split_plain(b, d)) { ea(b, d, next, 0); E(b, 0xD5033BBFu); E(b, a64_ldr(size, t, T_ADDR, 0)); E(b, 0xD5033BBFu); }
     else { ea(b, d, next, 0); E(b, shared_access(b, d) ? a64_ldapr(size, t, T_ADDR) : a64_ldr(size, t, T_ADDR, 0)); }
 }
 // The same for an operand only read (nothing after counts on T_ADDR): the displacement in the load when it fits.
@@ -155,6 +158,7 @@ static void wr_rm(xlat_buf *b, const x86_insn *d, int t, int size) {
             patch_b(b, done);
         }
     }
+    else if (split_plain(b, d)) { E(b, 0xD5033BBFu); E(b, a64_str(size, t, T_ADDR, 0)); E(b, 0xD5033BBFu); }
     else E(b, shared_access(b, d) ? a64_stlr_sz(size, t, T_ADDR) : a64_str(size, t, T_ADDR, 0));
 }
 
@@ -1511,6 +1515,7 @@ static int mem_compare(xlat_buf *b, const x86_insn *d, uint64_t next, int cc, in
 static void imap_mark(xlat_buf *b, uint64_t rip) {                      // (from here on: rip's code, RSP = x4 + sp_delta)
     if (b->nimap == b->cimap) { b->cimap = b->cimap ? 2 * b->cimap : 64; b->imap = realloc(b->imap, b->cimap * sizeof *b->imap); }
     b->imap[b->nimap].at = (uint32_t)b->n; b->imap[b->nimap].sp = b->sp_delta; b->imap[b->nimap++].rip = rip;
+    b->cur_rip = rip;
 }
 static void sp_apply(xlat_buf *b, int64_t by) {                          // x4 += by
     if (by > 0 && by < 4096) E(b, a64_addi(4, 4, (uint32_t)by));

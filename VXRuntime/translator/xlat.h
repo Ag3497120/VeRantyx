@@ -78,6 +78,8 @@ typedef struct {
     int lazy_record;             //   this instruction's flags are recorded, not computed (flags_arith)
     int lazy_done;               //   (flags_arith did record them)
     int aot;                     // made ahead of time (translator/aot.c): host addresses as XR_ABS sites, not immediates
+    int (*plain)(uint64_t rip);  // aot: instructions whose ordered access may cross 16 bytes (a profile, VXRT_AOT_SPLITS):
+    uint64_t cur_rip;            //   DMB, a plain access, DMB, as the engine patches them (LDAPR / STLR fault there)
     int vcpu;                    // the code runs in a Hypervisor.framework guest (vcpu.c): calls of host code are HVC #2
                                  //   (xlat_helper) and #3 (a native function: its thunk in S0)             // xlat_block_linked: compare the block's x86 bytes first (code on a page written often)
     // xlat_block_linked: rarely taken code (the NaN fixes) goes after the block, out of the straight path
