@@ -100,10 +100,10 @@ static const char *import_at(uint64_t slot) { for (int i = 0; i < g_nimp; i++) i
 
 // ---- stage 0: roots and recursive descent --------------------------------------------------------------------------
 enum { M_CODE = 1, M_LEADER = 2, M_FUNC = 4, M_SEEN = 8, M_TABLE = 16 };
-enum { R_ENTRY, R_EXPORT, R_TLS, R_PDATA, R_HANDLER, R_RELOC, R_RVA, R_SCOPE, R_LANDING, R_FH3, R_LIST, R_CALL, R_LEA, R_IMM, R_TABLE, R_BRANCH, R_NKINDS };
+enum { R_ENTRY, R_EXPORT, R_TLS, R_PDATA, R_HANDLER, R_RELOC, R_RVA, R_SCOPE, R_LANDING, R_FH3, R_FH4, R_LIST, R_CALL, R_LEA, R_IMM, R_TABLE, R_BRANCH, R_NKINDS };
 static const char *root_names[R_NKINDS] = { "entry", "exports", "TLS callbacks", ".pdata", "exception handlers", "relocated pointers",
     "image-relative (RVA) references to aligned code", "__C_specific_handler scopes",
-    "GCC landing pads", "__CxxFrameHandler3 funclets", "address list", "direct call targets", "lea [rip] into code", "imm64 into code", "jump table targets", "direct branch targets" };
+    "GCC landing pads", "__CxxFrameHandler3 funclets", "__CxxFrameHandler4 funclets, continuations", "address list", "direct call targets", "lea [rip] into code", "imm64 into code", "jump table targets", "direct branch targets" };
 static uint8_t *g_len, *g_mark;                 // per image byte: instruction length at a start; marks
 static uint64_t g_roots[R_NKINDS], g_roots_new[R_NKINDS];
 static uint64_t *g_work; static size_t g_nwork, g_cwork;
@@ -291,6 +291,128 @@ static const char *handler_name(uint64_t va) {
     if (d.map == X86_MAP_1 && d.opcode == 0xFF && (d.reg & 7) == 4 && d.rip_relative) return import_at(va + d.len + (uint64_t)(int64_t)d.disp);
     return NULL;
 }
+// The handlers' data, parsed by kind. live 0: only checked (a statically linked handler is recognized by the shape of
+// all its functions' data, below); 1: its code addresses are roots. Each returns whether the data has that shape.
+static int rd_ok(uint32_t rva, uint32_t n) { return rva && (uint64_t)rva + n <= G->size; }
+static int code_rva(uint32_t rva) { return rva && exec_rva(G, rva); }
+static int scope_table(uint32_t data, int live) {
+    // __C_specific_handler (also __GSHandlerCheck_SEH's first part): count, then {begin, end, handler or filter, target}
+    if (!rd_ok(data, 4)) return 0;
+    uint32_t n = r32(G->mem + data);
+    if (!n || n > 256 || !rd_ok(data, 4 + 16 * n)) return 0;
+    for (uint32_t k = 0; k < n; k++) {
+        const uint8_t *e = G->mem + data + 4 + 16 * k;
+        uint32_t b = r32(e), en = r32(e + 4), filter = r32(e + 8), target = r32(e + 12);
+        if (!code_rva(b) || !code_rva(en - 1) || en <= b || en - b > (1u << 24)) return 0;
+        if (filter > 1 && !code_rva(filter)) return 0;
+        if (target && !code_rva(target)) return 0;
+        if (!target && filter <= 1) return 0;                     // (a __finally has its handler there)
+    }
+    if (live) for (uint32_t k = 0; k < n; k++) {
+        const uint8_t *e = G->mem + data + 4 + 16 * k;
+        uint32_t filter = r32(e + 8), target = r32(e + 12);
+        if (filter > 1) push(G->base + filter, R_SCOPE);
+        if (target) push(G->base + target, R_SCOPE);
+        g_scopes++;
+    }
+    return 1;
+}
+// __CxxFrameHandler4's FuncInfo4 (ehdata4_export.h): compressed unsigned numbers, int32 displacements (RVAs).
+typedef struct { const uint8_t *p, *end; int bad; } rd4;
+static uint32_t u4(rd4 *r) {
+    if (r->p >= r->end) { r->bad = 1; return 0; }
+    uint8_t b = r->p[0];
+    int len = !(b & 1) ? 1 : (b & 3) == 1 ? 2 : (b & 7) == 3 ? 3 : (b & 15) == 7 ? 4 : 5;
+    if (r->p + len > r->end) { r->bad = 1; return 0; }
+    uint32_t v;
+    if (len == 5) v = r32(r->p + 1);
+    else { v = 0; for (int i = len - 1; i >= 0; i--) v = v << 8 | r->p[i]; v >>= len; }
+    r->p += len;
+    return v;
+}
+static uint32_t i4(rd4 *r) { if (r->p + 4 > r->end) { r->bad = 1; return 0; } uint32_t v = r32(r->p); r->p += 4; return v; }
+static rd4 at4(uint32_t rva) { rd4 r = { G->mem + rva, G->mem + G->size, !rd_ok(rva, 1) }; return r; }
+static int fh4(uint32_t data, uint32_t func, int live) {
+    if (!rd_ok(data, 4)) return 0;
+    uint32_t fi = r32(G->mem + data);
+    if (!rd_ok(fi, 1) || exec_rva(G, fi)) return 0;
+    rd4 r = at4(fi);
+    uint8_t h = *r.p++;
+    int is_catch = h & 1, bbt = h & 4, has_uw = h & 8, has_try = h & 16;
+    if (h & 0x80) return 0;                                       // (h & 2, separated code: the IP-to-state maps differ, not read)
+    if (bbt) u4(&r);
+    uint32_t uw = has_uw ? i4(&r) : 0, tb = has_try ? i4(&r) : 0, ip = i4(&r);
+    if (is_catch) u4(&r);
+    if (r.bad || (has_uw && !rd_ok(uw, 1)) || (has_try && !rd_ok(tb, 1)) || !rd_ok(ip, 1) || exec_rva(G, ip)) return 0;
+    uint32_t roots[4096]; int nr = 0;
+    if (has_uw) {
+        rd4 u = at4(uw);
+        uint32_t n = u4(&u);
+        if (n > 100000) return 0;
+        for (uint32_t k = 0; k < n && !u.bad; k++) {
+            uint32_t t = u4(&u), type = t & 3;
+            if (type) { uint32_t a = i4(&u); if (!code_rva(a)) return 0; if (nr < 4096) roots[nr++] = a; }
+            if (type == 1 || type == 2) u4(&u);
+        }
+        if (u.bad) return 0;
+    }
+    if (has_try) {
+        rd4 t = at4(tb);
+        uint32_t n = u4(&t);
+        if (n > 10000) return 0;
+        for (uint32_t k = 0; k < n && !t.bad; k++) {
+            u4(&t); u4(&t); u4(&t);
+            uint32_t ha = i4(&t);
+            if (t.bad || !rd_ok(ha, 1)) return 0;
+            rd4 c = at4(ha);
+            uint32_t nh = u4(&c);
+            if (nh > 256) return 0;
+            for (uint32_t j = 0; j < nh && !c.bad; j++) {
+                uint8_t hh = *c.p++;
+                if (hh & 0xC0) return 0;
+                if (hh & 1) u4(&c);                                  // adjectives
+                if (hh & 2) i4(&c);                                  // type descriptor
+                if (hh & 4) u4(&c);                                  // catch object's frame offset
+                uint32_t fn = i4(&c);
+                if (!code_rva(fn)) return 0;
+                if (nr < 4096) roots[nr++] = fn;
+                for (int q = 0; q < ((hh >> 4) & 3); q++) {          // continuations: RVAs, or offsets from the function
+                    uint32_t a = (hh & 8) ? i4(&c) : func + u4(&c);
+                    if (c.bad || !code_rva(a)) return 0;
+                    if (nr < 4096) roots[nr++] = a;
+                }
+            }
+            if (c.bad) return 0;
+        }
+        if (t.bad) return 0;
+    }
+    if (live) { for (int k = 0; k < nr; k++) push(G->base + roots[k], R_FH4); g_fh4++; }
+    return 1;
+}
+static int fh3(uint32_t data, int live) {
+    if (!rd_ok(data, 4)) return 0;
+    uint32_t f = r32(G->mem + data);
+    if (!rd_ok(f, 40)) return 0;
+    const uint8_t *fi = G->mem + f;
+    uint32_t magic = r32(fi);
+    if (magic < 0x19930520 || magic > 0x19930522) return 0;
+    uint32_t nunwind = r32(fi + 4), unwind = r32(fi + 8), ntry = r32(fi + 12), tries = r32(fi + 16);
+    if ((nunwind && !rd_ok(unwind, 8 * nunwind)) || (ntry && !rd_ok(tries, 20 * ntry))) return 0;
+    if (!live) return 1;
+    for (uint32_t k = 0; k < nunwind && k < 4096; k++) { uint32_t a = r32(G->mem + unwind + 8 * k + 4); if (code_rva(a)) push(G->base + a, R_FH3); }
+    for (uint32_t t = 0; t < ntry && t < 1024; t++) {
+        const uint8_t *tb = G->mem + tries + 20 * t;
+        uint32_t ncatch = r32(tb + 12), arr = r32(tb + 16);
+        for (uint32_t c = 0; c < ncatch && c < 64 && rd_ok(arr, 20 * (c + 1)); c++) { uint32_t h = r32(G->mem + arr + 20 * c + 12); if (code_rva(h)) push(G->base + h, R_FH3); }
+    }
+    g_fh3++;
+    return 1;
+}
+// Handlers without an imported name (a statically linked CRT, as Cyberpunk's): each kept with its functions' data until
+// all .pdata is read, then recognized by shape: the kind whose parse fits (nearly) all of the handler's functions.
+typedef struct { uint32_t handler, begin, data; } hsite;
+static hsite *g_hs; static size_t g_nhs, g_chs;
+static uint64_t g_shape[5];                                    // handlers recognized: C scopes, FH4, FH3, GCC, none
 static void exception_data(uint32_t begin, uint32_t uw) {
     const uint8_t *u = G->mem + uw;
     uint8_t flags = u[0] >> 3, ncodes = u[2];
@@ -299,16 +421,8 @@ static void exception_data(uint32_t begin, uint32_t uw) {
     uint32_t handler = r32(G->mem + at), data = at + 4;
     push(G->base + handler, R_HANDLER);                         // (the runtime calls it: a root of its own)
     const char *name = handler_name(G->base + handler);
-    if (name && !strcmp(name, "__C_specific_handler")) {
-        uint32_t n = r32(G->mem + data);
-        for (uint32_t k = 0; k < n && k < 1024; k++) {
-            const uint8_t *e = G->mem + data + 4 + 16 * k;
-            uint32_t filter = r32(e + 8), target = r32(e + 12);
-            if (filter > 1) push(G->base + filter, R_SCOPE);
-            if (target) push(G->base + target, R_SCOPE);
-            g_scopes++;
-        }
-    } else if (name && !strcmp(name, "__gxx_personality_seh0")) {
+    if (name && !strcmp(name, "__C_specific_handler")) scope_table(data, 1);
+    else if (name && !strcmp(name, "__gxx_personality_seh0")) {
         const uint8_t *p = G->mem + r32(G->mem + data);
         uint8_t lpenc = *p++;
         uint64_t lpstart = G->base + begin;
@@ -324,18 +438,39 @@ static void exception_data(uint32_t begin, uint32_t uw) {
             uleb(&p);
             if (lp) { push(lpstart + lp, R_LANDING); g_lsda++; }
         }
-    } else if (name && (!strcmp(name, "__CxxFrameHandler3") || !strcmp(name, "__CxxFrameHandler"))) {
-        const uint8_t *fi = G->mem + r32(G->mem + data);
-        uint32_t nunwind = r32(fi + 4), unwind = r32(fi + 8), ntry = r32(fi + 12), tries = r32(fi + 16);
-        for (uint32_t k = 0; k < nunwind && k < 4096; k++) { uint32_t a = r32(G->mem + unwind + 8 * k + 4); if (a) push(G->base + a, R_FH3); }
-        for (uint32_t t = 0; t < ntry && t < 1024; t++) {
-            const uint8_t *tb = G->mem + tries + 20 * t;
-            uint32_t ncatch = r32(tb + 12), arr = r32(tb + 16);
-            for (uint32_t c = 0; c < ncatch && c < 64; c++) { uint32_t h = r32(G->mem + arr + 20 * c + 12); if (h) push(G->base + h, R_FH3); }
+    } else if (name && (!strcmp(name, "__CxxFrameHandler3") || !strcmp(name, "__CxxFrameHandler"))) fh3(data, 1);
+    else if (name && !strcmp(name, "__CxxFrameHandler4")) fh4(data, begin, 1);
+    else {
+        if (g_nhs == g_chs) { g_chs = g_chs ? 2 * g_chs : 4096; g_hs = realloc(g_hs, g_chs * sizeof *g_hs); }
+        g_hs[g_nhs++] = (hsite){ handler, begin, data };
+    }
+}
+static int cmp_hs(const void *a, const void *b) { uint32_t x = ((const hsite *)a)->handler, y = ((const hsite *)b)->handler; return x < y ? -1 : x > y; }
+static void handlers_by_shape(void) {
+    qsort(g_hs, g_nhs, sizeof *g_hs, cmp_hs);
+    for (size_t i = 0; i < g_nhs;) {
+        size_t j = i; while (j < g_nhs && g_hs[j].handler == g_hs[i].handler) j++;
+        size_t n = j - i, c = 0, f4 = 0, f3 = 0;
+        for (size_t k = i; k < j; k++) { c += scope_table(g_hs[k].data, 0); f4 += fh4(g_hs[k].data, g_hs[k].begin, 0); f3 += fh3(g_hs[k].data, 0); }
+        // (most of them: a function's data the parse rejects is still read where it can be; ties go to the stricter FH4)
+        int kind = 4; size_t best = 0;
+        if (f4 > best) { kind = 1; best = f4; }
+        if (f3 > best) { kind = 2; best = f3; }
+        if (c > best) { kind = 0; best = c; }
+        if (best * 10 < n * 9) kind = 4;
+        if (getenv("VXRT_AOT_HANDLERS"))
+            fprintf(stderr, "handler %#llx: %zu functions; shapes: C scopes %zu, FH4 %zu, FH3 %zu -> %s\n", (unsigned long long)(G->base + g_hs[i].handler),
+                    n, c, f4, f3, (const char *[]){ "C scopes", "FH4", "FH3", "GCC", "none" }[kind]);
+        for (size_t k = i; k < j; k++) {
+            if (kind == 0) scope_table(g_hs[k].data, 1);
+            else if (kind == 1) fh4(g_hs[k].data, g_hs[k].begin, 1);
+            else if (kind == 2) fh3(g_hs[k].data, 1);
+            else g_other_handlers++;
         }
-        g_fh3++;
-    } else if (name && !strcmp(name, "__CxxFrameHandler4")) g_fh4++;
-    else g_other_handlers++;
+        g_shape[kind]++;
+        i = j;
+    }
+    g_nhs = 0;
 }
 
 static uint64_t g_npdata, g_pdata_chained;
@@ -362,6 +497,7 @@ static void roots(const char *addresses) {
         push(G->base + b, R_PDATA);
         exception_data(b, uw);
     }
+    handlers_by_shape();
     if (G->dir_size[5]) {                                                   // base relocations: pointers into code
         for (const uint8_t *b = G->mem + G->dir_rva[5]; b < G->mem + G->dir_rva[5] + G->dir_size[5];) {
             uint32_t page = r32(b), size = r32(b + 4);
@@ -438,8 +574,10 @@ static int analyze(const image *im, const char *addresses, int quiet) {
     printf("indirect: %llu calls, %llu jmp [mem], %llu jmp reg; jump tables %llu (%llu without a bound found), %llu entries\n",
            (unsigned long long)g_call_ind, (unsigned long long)g_jmp_mem, (unsigned long long)g_jmp_reg, (unsigned long long)g_tables,
            (unsigned long long)g_unbounded, (unsigned long long)g_table_entries);
-    printf("handlers: %llu C scopes, %llu GCC landing pads, %llu FH3 functions, %llu FH4 functions (continuations not read), %llu others\n",
-           (unsigned long long)g_scopes, (unsigned long long)g_lsda, (unsigned long long)g_fh3, (unsigned long long)g_fh4, (unsigned long long)g_other_handlers);
+    printf("handlers: %llu C scopes, %llu GCC landing pads, %llu FH3 functions, %llu FH4 functions, %llu others; handlers without a name"
+           " recognized by shape: %llu C, %llu FH4, %llu FH3, %llu not\n",
+           (unsigned long long)g_scopes, (unsigned long long)g_lsda, (unsigned long long)g_fh3, (unsigned long long)g_fh4, (unsigned long long)g_other_handlers,
+           (unsigned long long)g_shape[0], (unsigned long long)g_shape[1], (unsigned long long)g_shape[2], (unsigned long long)g_shape[4]);
     printf(".pdata: %llu entries (%llu chained)\n", (unsigned long long)g_npdata, (unsigned long long)g_pdata_chained);
     printf("code sections: %llu bytes: %.2f%% instructions, %.2f%% jump tables, %.2f%% padding (CC/90/00), %.2f%% unexplained\n",
            (unsigned long long)xbytes, 100.0 * (double)code / (double)xbytes, 100.0 * (double)table / (double)xbytes,
