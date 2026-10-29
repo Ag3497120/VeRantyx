@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ucontext.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __aarch64__
@@ -22,8 +23,9 @@ void vx_log(const char *fmt, ...);
 enum { MAX_MODULES = 64 };
 static const xa_desc *g_mod[MAX_MODULES];
 static int g_nmod;
-static uint64_t g_fallback, g_fallback_rips, g_native, g_entries, g_cfn_calls, g_stubs;
+static uint64_t g_fallback, g_fallback_rips, g_native, g_entries, g_cfn_calls, g_stubs, g_splits;
 int vx_builtin_stub(uint64_t rip, uint64_t *target);   // (src/loader.c)
+const char *vx_image_name_at(uint64_t pc);            // (src/loader.c: an image's name with the offset, or NULL)
 static int g_strict = -1;
 int xa_any(void) { return g_nmod > 0; }
 
@@ -163,6 +165,27 @@ uint64_t xa_rip_sp_at(uint64_t pc, int64_t *sp) {
     return 0;
 }
 
+// VXRT_AOT_SPLITS=<file>: the x86 instructions whose ordered access crossed 16 bytes (each a signal here, where the
+// engine patches its code once), written with each report for vxrt-aot to give those instructions plain accesses between barriers
+enum { NSPLIT = 1 << 14 };
+static uint64_t g_split_rip[NSPLIT];
+static void note_split(uint64_t rip) {
+    if (!rip) return;
+    uint32_t i = (uint32_t)((rip * 0x9E3779B97F4A7C15ull) >> 50);
+    for (int k = 0; k < 32; k++, i = (i + 1) & (NSPLIT - 1)) {
+        uint64_t v = __atomic_load_n(&g_split_rip[i], __ATOMIC_RELAXED);
+        if (v == rip) return;
+        if (!v && __atomic_compare_exchange_n(&g_split_rip[i], &v, rip, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+        if (v == rip) return;
+    }
+}
+static void write_splits(void) {
+    const char *f = getenv("VXRT_AOT_SPLITS");
+    FILE *o = f ? fopen(f, "w") : NULL;          // (the whole set each time: reports come every 10 s)
+    if (!o) return;
+    for (int i = 0; i < NSPLIT; i++) if (g_split_rip[i]) fprintf(o, "%#llx\n", (unsigned long long)g_split_rip[i]);
+    fclose(o);
+}
 // An LDAPR / STLR across 16 bytes faults (the engine patches its own code: engine.c); a module's code cannot be
 // written, so the access is made here, between barriers, and the code goes on after it.
 int xa_fix_split(void *uc_) {
@@ -187,26 +210,37 @@ int xa_fix_split(void *uc_) {
     }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     uc->uc_mcontext->__ss.__pc = pc + 4;
+    __atomic_fetch_add(&g_splits, 1, __ATOMIC_RELAXED);
+    if (getenv("VXRT_AOT_SPLITS")) note_split(xa_rip_sp_at(pc, NULL));
     return 1;
 }
 
 static void note_fallback(uint64_t rip) {
-    enum { SEEN = 4096 };
+    enum { SEEN = 1 << 16 };                                  // (full: the addresses past it are counted, not listed)
     static uint64_t seen[SEEN]; static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     __atomic_fetch_add(&g_fallback, 1, __ATOMIC_RELAXED);
     pthread_mutex_lock(&lock);
-    uint32_t i = (uint32_t)((rip * 0x9E3779B97F4A7C15ull) >> 52);
-    while (seen[i] && seen[i] != rip) i = (i + 1) & (SEEN - 1);
+    uint32_t i = (uint32_t)((rip * 0x9E3779B97F4A7C15ull) >> 48);
+    int probes = 0;
+    while (seen[i] && seen[i] != rip && probes++ < 64) i = (i + 1) & (SEEN - 1);
     if (!seen[i]) {
         seen[i] = rip; g_fallback_rips++;
         if (g_fallback_rips <= 32 || getenv("VXRT_AOT_TRACE")) {
             const xa_desc *d = module_for(rip);
-            vx_log("aot: fallback to the translator at %#llx%s", (unsigned long long)rip, d ? " (in a recompiled image: a block the generator did not find)" : "");
+            const char *img = vx_image_name_at(rip);
+            vx_log("aot: fallback to the translator at %#llx (%s)%s", (unsigned long long)rip, img ? img : "no image",
+                   d ? ": in a recompiled image, a block the generator did not find" : "");
         }
     }
     pthread_mutex_unlock(&lock);
 }
 
+void xa_report(void);
+static void xa_tick(void) {                                  // (every 4M entries: the counters each 10 s)
+    static uint64_t last; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec;
+    if (now - last >= 10) { last = now; xa_report(); }
+}
 int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx *)) {
     if (g_strict < 0) g_strict = getenv("VXRT_AOT_STRICT") && atoi(getenv("VXRT_AOT_STRICT"));
     for (;;) {
@@ -219,7 +253,7 @@ int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx
             if (fn) { g_cfn_calls++; fn(c); continue; }   // (route A: back with the next RIP)
             const xa_block *b = block_at(d, rip);
             if (b) {
-                g_entries++;
+                if (!(++g_entries & ((1u << 22) - 1))) xa_tick();
                 c->entry = (uint64_t)(uintptr_t)(d->code + b->off);
                 c->link = 0;
                 d->enter(c);
@@ -254,8 +288,9 @@ int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx
 
 void xa_report(void) {
     if (!g_nmod) return;
-    vx_log("aot: %llu entries into recompiled code, %llu C function calls, %llu native calls, %llu built-in export stubs followed, %llu fallbacks to the translator (%llu addresses)",
+    vx_log("aot: %llu entries into recompiled code, %llu C function calls, %llu native calls, %llu built-in export stubs followed, %llu fallbacks to the translator (%llu addresses), %llu ordered accesses across 16 bytes",
            (unsigned long long)g_entries, (unsigned long long)g_cfn_calls, (unsigned long long)g_native, (unsigned long long)g_stubs, (unsigned long long)g_fallback,
-           (unsigned long long)g_fallback_rips);
+           (unsigned long long)g_fallback_rips, (unsigned long long)g_splits);
+    write_splits();
 }
 #endif

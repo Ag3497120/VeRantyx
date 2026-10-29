@@ -292,6 +292,14 @@ static DWORD g_next_tls_index;
 
 // Lock-free: images are only ever appended (and never unmapped), so a reader sees a consistent prefix. An unloaded
 // image is still found by address: a thread or a function pointer may still be in it.
+const vx_image *vx_image_at(uint64_t pc);
+const char *vx_image_name_at(uint64_t pc) {
+    static __thread char buf[160];
+    const vx_image *m = vx_image_at(pc);
+    if (!m) return NULL;
+    snprintf(buf, sizeof buf, "%s+%#llx", m->name, (unsigned long long)(pc - (uint64_t)(uintptr_t)m->base));
+    return buf;
+}
 const vx_image *vx_image_at(uint64_t pc) {
     int n = __atomic_load_n(&g_image_count, __ATOMIC_ACQUIRE);
     for (int i = 0; i < n; i++) {
