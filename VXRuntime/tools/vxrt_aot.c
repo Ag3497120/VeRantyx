@@ -25,6 +25,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <unistd.h>
 #include <mach/mach_vm.h>
 #include <time.h>
 
@@ -43,6 +45,7 @@ static uint32_t r32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static uint64_t r64(const void *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 static void die(const char *fmt, ...) { va_list a; va_start(a, fmt); fprintf(stderr, "vxrt-aot: "); vfprintf(stderr, fmt, a); fprintf(stderr, "\n"); va_end(a); exit(1); }
 
+static char **g_argv;
 static void load(image *im, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) die("cannot open %s", path);
@@ -57,6 +60,13 @@ static void load(image *im, const char *path) {
         // (exactly there, never over a mapping: mach_vm_allocate fixed; mmap takes some ranges' hints as no hint)
         mach_vm_address_t a = b;
         if (mach_vm_allocate(mach_task_self(), &a, sz, VM_FLAGS_FIXED) == KERN_SUCCESS) im->mem = (uint8_t *)(uintptr_t)a;
+        else if (!getenv("VXRT_AOT_RESTARTS") || atoi(getenv("VXRT_AOT_RESTARTS")) < 8) {
+            // (the system's randomized regions cover it this time: they fall elsewhere in a new process)
+            char n[8], self[4096]; uint32_t len = sizeof self;
+            snprintf(n, sizeof n, "%d", getenv("VXRT_AOT_RESTARTS") ? atoi(getenv("VXRT_AOT_RESTARTS")) + 1 : 1);
+            setenv("VXRT_AOT_RESTARTS", n, 1);
+            if (!_NSGetExecutablePath(self, &len)) execv(self, g_argv);
+        }
     }
     im->file = malloc(im->len);
     if (fread(im->file, 1, im->len, f) != im->len) die("cannot read %s", path);
@@ -871,6 +881,7 @@ static int gen(const image *im, const char *out) {
 }
 
 int main(int argc, char **argv) {
+    g_argv = argv;
     if (argc < 3) { fprintf(stderr, "usage: vxrt-aot analyze|gen|name <pe> [out] [--addresses file]\n"); return 2; }
     image im = { 0 };
     load(&im, argv[2]);
