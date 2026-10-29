@@ -9385,7 +9385,7 @@ static struct {
     double frame_key, prev_index; float frame_jx, frame_jy; int have_frame, nseq, replacing, encoded, fails;
     uint64_t seq[48];
     void *last_writes[8]; int nlast;
-    void *cand[24]; int cand_n[24], ncand;
+    void *cand[24], *cand_obj[24]; int cand_n[24], ncand;   // (by the texture under the views: views change frame to frame)
     fsr_consts12 c;
     // learnt
     int learned, stable, learned_n;
@@ -9466,7 +9466,7 @@ static void mfx_frame_end12(void) {
     if (M12.replacing) {
         if (M12.encoded) M12.replaced++;
         else {
-            M12.learned = 0; M12.stable = 0; M12.nout_keep = 0; M12.relearns++;
+            M12.learned = 0; M12.stable = 0; M12.nout_keep = 0; M12.nfsr_written = 0; M12.relearns++;
             vx_log("D3D12: MetalFX: FSR2's last dispatch (cs %016llx, %d of them) did not come in a frame (%d came, the last "
                    "cs %016llx): FSR2 back, learning again", (unsigned long long)M12.learned_last, M12.learned_n, M12.nseq,
                    (unsigned long long)M12.seq[M12.nseq - 1]);
@@ -9568,11 +9568,15 @@ static int mfx_dispatch12(dev12 *d, gfx_state *g, pso12 *pso, root_binding *comp
     int ok = gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE, compute, heap, sheap, &acc) == GPU_IR_OK;
     pthread_rwlock_unlock(&d->bufs_lock);
     if (!ok) { gpu_ir_access_list_release12(&acc); return 0; }
-    void *writes[8]; int nw = 0;
+    // (textures are told apart by the one under their views (parentTexture): the bound views are new objects often)
+    void *writes[8], *writes_obj[8]; int nw = 0;
     for (uint32_t i = 0; i < acc.count; i++) {
         if (!(acc.values[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
         id obj = (__bridge id)gpu_ir_backend_object(acc.values[i].resource);
-        if ([obj conformsToProtocol:@protocol(MTLTexture)] && nw < 8) writes[nw++] = (__bridge void *)obj;
+        if (![obj conformsToProtocol:@protocol(MTLTexture)] || nw >= 8) continue;
+        id<MTLTexture> root = obj;
+        while (root.parentTexture) root = root.parentTexture;
+        writes_obj[nw] = (__bridge void *)obj; writes[nw++] = (__bridge void *)root;
     }
     int skip = 0;
     pthread_mutex_lock(&M12.lock);
@@ -9595,26 +9599,28 @@ static int mfx_dispatch12(dev12 *d, gfx_state *g, pso12 *pso, root_binding *comp
             if (!(acc.values[i].access_mask & GPU_IR_ACCESS_SHADER_READ) || (acc.values[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
             id obj = (__bridge id)gpu_ir_backend_object(acc.values[i].resource);
             if (![obj conformsToProtocol:@protocol(MTLTexture)]) continue;
-            id<MTLTexture> t = obj;
-            void *p = (__bridge void *)t;
+            id<MTLTexture> t = obj, root = obj;
+            while (root.parentTexture) root = root.parentTexture;
+            void *p = (__bridge void *)root;
             if (t.textureType != MTLTextureType2D || t.width < c.render[0] || t.height < c.render[1]) continue;
             if (mfx_has12(M12.fsr_written, M12.nfsr_written, p)) continue;
             int k = 0;
             while (k < M12.ncand && M12.cand[k] != p) k++;
             if (k == M12.ncand) { if (k == 24) continue; M12.cand[k] = p; M12.cand_n[k] = 0; M12.ncand++; }
+            M12.cand_obj[k] = (__bridge void *)t;
             M12.cand_n[k]++;
         }
         if (cs == M12.learned_last && !M12.encoded) {
             id<MTLTexture> colour = nil, depth = nil, motion = nil, out = nil;
             int best = 0;
             for (int k = 0; k < M12.ncand; k++) {
-                id<MTLTexture> t = (__bridge id<MTLTexture>)M12.cand[k];
+                id<MTLTexture> t = (__bridge id<MTLTexture>)M12.cand_obj[k];
                 MTLPixelFormat f = t.pixelFormat;
                 if (mfx_motion_fmt12(f)) { if (!motion) motion = t; }
                 else if (mfx_depth_fmt12(f)) { if (!depth || (depth.pixelFormat == MTLPixelFormatR32Float && f != MTLPixelFormatR32Float)) depth = t; }
                 else if (mfx_colour_fmt12(f) && M12.cand_n[k] > best) { colour = t; best = M12.cand_n[k]; }
             }
-            for (int i = 0; i < nw && !out; i++) if (mfx_has12(M12.out_keep, M12.nout_keep, writes[i])) out = (__bridge id<MTLTexture>)writes[i];
+            for (int i = 0; i < nw && !out; i++) if (mfx_has12(M12.out_keep, M12.nout_keep, writes[i])) out = (__bridge id<MTLTexture>)writes_obj[i];
             if (!M12.told_inputs++) {
                 vx_log("D3D12: MetalFX: the first replaced frame's inputs: colour %lux%lu format %lu, depth %lux%lu format %lu, motion "
                        "%lux%lu format %lu, output %lux%lu format %lu (usage %#lx); %d candidates", (unsigned long)colour.width,
@@ -9622,7 +9628,7 @@ static int mfx_dispatch12(dev12 *d, gfx_state *g, pso12 *pso, root_binding *comp
                        (unsigned long)depth.pixelFormat, (unsigned long)motion.width, (unsigned long)motion.height, (unsigned long)motion.pixelFormat,
                        (unsigned long)out.width, (unsigned long)out.height, (unsigned long)out.pixelFormat, (unsigned long)out.usage, M12.ncand);
                 for (int k = 0; k < M12.ncand; k++) {
-                    id<MTLTexture> t = (__bridge id<MTLTexture>)M12.cand[k];
+                    id<MTLTexture> t = (__bridge id<MTLTexture>)M12.cand_obj[k];
                     vx_log("D3D12: MetalFX:   candidate %lux%lu format %lu, read by %d of FSR2's dispatches", (unsigned long)t.width,
                            (unsigned long)t.height, (unsigned long)t.pixelFormat, M12.cand_n[k]);
                 }
