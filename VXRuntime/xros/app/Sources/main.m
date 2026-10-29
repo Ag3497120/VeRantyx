@@ -3,7 +3,7 @@
 //
 //   xcrun devicectl device process launch --device <id> marimokodai.VXRuntimeHost -test d3d12
 //
-// Tests (bundle/exe): d3d12 (default), suite, hello_crt, seh_try, unwind, cxx_exceptions (stops: one address has no
+// Tests (bundle/exe): xros_clear (a swap chain cleared through the hues, 10 s), d3d12 (default), suite, hello_crt, seh_try, unwind, cxx_exceptions (stops: one address has no
 // module), none (only the memory and address-space probes). Documents/host_log.jsonl gets the probes, the
 // available memory every 2 s and the program's exit; Documents/vxrt.log the runtime's log (stderr, this launch).
 #import <UIKit/UIKit.h>

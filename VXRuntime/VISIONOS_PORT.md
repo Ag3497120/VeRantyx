@@ -72,6 +72,7 @@ Each from the bundle, `VXRT_AOT_STRICT=1`, no JIT, modules linked into the app. 
 | unwind.exe | `62 cases, 0 failed -> ok` |
 | suite.exe (tests/recomp) | jump tables, SEH, C++ exceptions, threads (800 000 locked increments, 0 MP violations), TLS, SSE and AVX2/FMA: ok; then D3D11 stops on a simulator-only Metal rule (linear textures need private buffers there) |
 | cxx_exceptions.exe | stops as designed: `0x14000182b has no recompiled code` (a block the generator did not find; on the Mac it is 1 fallback) |
+| xros_clear.exe (tests/xros_clear.c) | `12356 frames in 10.0 s, 12356 presents -> ok`: a 1280×720 D3D12 swap chain on the queue, shown in the app's window through the UIKit `CAMetalLayer` (screenshot: `runs/avp-port/sim/xros_clear.png`). 1236 presents a second: `Present(1)` is not paced there (see wall 11) |
 | d3d12.exe | device, queues, root signatures and bindless validation ok; the first graphics PSO stops on a simulator-only Metal limit (no dynamic vertex strides). The simulator GPU reports no Metal 3, no BC textures, no argument-buffer tier 2: it is not the headset |
 
 So the runtime's CPU side is sound on visionOS frameworks: loading, imports, the thunks, the AOT runner, faults as
@@ -83,7 +84,7 @@ The app installs (`xcrun devicectl device install app`, done twice today). Launc
 unlocked: `devicectl device process launch` waited at "Acquired usage assertion" and timed out three times with
 `passcodeRequired: true`. Run, with the headset on:
 
-    cd VXRuntime && tools/xros_device_run.sh            # none hello_crt seh_try unwind suite cxx_exceptions d3d12
+    cd VXRuntime && tools/xros_device_run.sh            # none xros_clear hello_crt seh_try unwind suite cxx_exceptions d3d12
 
 It prints each test's last lines and leaves `host_log.jsonl` and `<test>.vxrt.log` in
 `~/Verantyx_VR_Drive/wt/runs/avp-port/device/`. What to read there: `va_probe` and `exe_base` (does the Windows
@@ -127,6 +128,9 @@ available of 15744 MB), `metal` (BC compression, Metal 3, argument-buffer tier, 
 8. **MetalFX temporal** is unavailable (spatial only): the game's own FSR2 / XeSS run as compute as they do now.
 9. **Input.** Only touches today. Plan: GameController (already the XInput path; the simulator saw a gamepad),
    a Bluetooth keyboard and mouse through `UIKey` / `GCMouse`.
+11. **Present pacing.** `displaySyncEnabled` does not exist on visionOS, and in the simulator `Present(1)` ran at
+   1236 a second. Plan: pace sync-interval presents on a `CADisplayLink` (90 Hz on the headset), as the NPU race
+   already does, and check `nextDrawable`'s blocking on the device.
 10. **Presentation.** Flat window now; then CompositorServices (VX Proto's hold mode, depth, 90 Hz) once frames come.
 
 ## The game's data on the device (needs the user's yes: about 62 GB)

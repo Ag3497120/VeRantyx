@@ -87,7 +87,9 @@ $(XROS_DIR)/libvxrt.a: $(XROS_OBJ)
 	xcrun -sdk $(XROS_SDK) libtool -static -o $@ $(XROS_OBJ)
 xros-lib: $(XROS_DIR)/libvxrt.a
 # Our own test programs for the app, their modules linked into it (tools/xros_aot.sh), the files they read beside them.
-XROS_TESTS = build/d3d12.exe build/recomp/suite.exe build/hello_crt.exe build/seh_try.exe build/unwind.exe build/cxx_exceptions.exe
+XROS_TESTS = build/xros_clear.exe build/d3d12.exe build/recomp/suite.exe build/hello_crt.exe build/seh_try.exe build/unwind.exe build/cxx_exceptions.exe
+build/xros_clear.exe: tests/xros_clear.c
+	$(MINGW) -O1 -o $@ $< -ld3d12 -ldxgi
 xros-aot-tests: build/vxrt-aot $(XROS_TESTS)
 	XROS_SDK=$(XROS_SDK) XROS_TARGET=$(XROS_TARGET) tools/xros_aot.sh $(XROS_TESTS)
 	rm -rf build/xros/bundle && mkdir -p build/xros/bundle/exe build/xros/bundle/tests/shaders12
