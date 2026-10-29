@@ -1797,7 +1797,9 @@ static void race_tick_paced(double tick) {
     }
     pthread_mutex_lock(&R.present);
     double now = now_s();
-    double gap = R.hz > 0 ? 1 / R.hz : per;                       // (paced: every refresh, unless "race N")
+    // (paced: every refresh up to 100 Hz (Vision Pro's 90), every other one above (120 Hz Macs reached 60 even steps,
+    //  not 120: run20); "race N" or VXRT_NPU_RACE_HZ sets another rate)
+    double gap = R.hz > 0 ? 1 / R.hz : per < 0.01 ? 2 * per : per;
     int kind = -1, slot = -1, a = -1, mv = 0, fresh = 0, new_mm = 0;
     uint32_t d_flow = 0;
     float t = 0;
