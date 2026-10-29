@@ -10,20 +10,28 @@ SRC    += src/filestate.c
 SRC    += src/inherit.c
 SRC    += src/icons.c src/menus.m src/tray.m
 SRC    += src/present.c
+SRC    += src/stereo.m
 SRC    += src/shlock.c
 SRC    += src/tcptable.c
 SRC    += src/winprops.c
 SRC    += src/a11y.c
 SRC    += src/mfplat.c
 SRC    += src/imagehlp.c src/spellcheck.c src/ime.c src/clipboard.m
+SRC    += src/npu_interp.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
-all: build/vxrt tests
+all: build/vxrt build/vxrt-npu tests
 
-build/vxrt: $(SRC) src/vx.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h src/aes_gcm.h
+build/vxrt: $(SRC) src/vx.h src/npu_interp.h src/npu_proto.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/stereo.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h src/aes_gcm.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Ithird_party/vulkan -fobjc-arc -o $@.tmp $(SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -Wl,-pagezero_size,0x10000 -licucore -lz && mv -f $@.tmp $@
+
+# NPU mode's frame interpolator (src/npu_interp.m, VXRT_NPU_INTERP=1): a native arm64 process, since VideoToolbox's
+# frame interpolation is unsupported under Rosetta.
+build/vxrt-npu: tools/vxrt_npu.m src/npu_proto.h
+	@mkdir -p build
+	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0 -fobjc-arc -o $@ tools/vxrt_npu.m -framework Foundation -framework VideoToolbox -framework CoreVideo -framework CoreMedia -framework IOSurface
 
 # The ARM64 build (phase 4, TRANSLATOR.md): the same runtime as ARM64 code, the program run by the translator's
 # engine in the process. Thunks for every ms_abi function come from the sources' C signatures (tools/vx_thunks.py).
@@ -59,7 +67,7 @@ build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator
 build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
 	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
-build/vxrt-arm64: $(ARM64_SRC) build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h translator/aot.h
+build/vxrt-arm64: $(ARM64_SRC) src/npu_interp.h src/npu_proto.h build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/stereo.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h translator/aot.h
 	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -Ithird_party/vulkan -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -framework Hypervisor build/libvxrt_vm.dylib build/guest.o -licucore -lz
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 
@@ -1166,6 +1174,24 @@ build/pe_test: src/pe.c src/pe.h tests/pe.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ src/pe.c tests/pe.c
 
+# stereo.m's DIBR pass on the GPU (tests/stereo.m): a made-up scene, or a dumped game frame
+build/stereo_test: src/stereo.m src/stereo.h tests/stereo.m
+	@mkdir -p build
+	$(HOSTCC) -fobjc-arc -Isrc -o $@ tests/stereo.m src/stereo.m -framework Foundation -framework Metal -framework CoreGraphics -framework ImageIO
+
+# The warp core (src/warp_core.m: prediction from motion vectors, reprojection, stereo eyes in one warp) on synthetic
+# frames; and, when the visionOS SDK is installed, the core compiled for visionOS (it must stay Metal + Foundation).
+build/warp_core_test: src/warp_core.m src/warp_core.h tests/warp_core_test.m
+	@mkdir -p build
+	$(HOSTCC) -arch arm64 -O1 -fobjc-arc -Isrc -o $@ tests/warp_core_test.m src/warp_core.m -framework Foundation -framework Metal
+check: build/warp_core_test xros-check
+xros-check: src/warp_core.m src/warp_core.h
+	@if xcrun --sdk xros --show-sdk-path >/dev/null 2>&1; then \
+	  mkdir -p build && xcrun -sdk xros clang -target arm64-apple-xros2.0 -fobjc-arc -Wall -Wextra -Werror -c -o build/warp_core_xros.o src/warp_core.m && \
+	  echo "xros-check: src/warp_core.m builds for visionOS ($$(xcrun --sdk xros --show-sdk-version))"; \
+	else echo "xros-check: no visionOS SDK, skipped"; fi
+.PHONY: xros-check
+
 build/aes_gcm_test: src/aes_gcm.c src/aes_gcm.h tests/aes_gcm.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ tests/aes_gcm.c src/aes_gcm.c
@@ -1203,6 +1229,7 @@ check: export VXRT_NO_ACTIVATE = 1
 check: build/iphlp_notify_test
 check: build/vulkan_spirv_atomic_compare_exchange_fixture.spv
 check: build/aes_gcm_test
+check: build/stereo_test
 check: build/vulkan_spirv_atomic_rmw_fixture.spv
 check: build/spirv_graphics_separate_image_sampler.air
 check: build/spirv_graphics_sampled_image_implicit.air
@@ -1313,6 +1340,8 @@ check: all build/vkmsl build/x86dec_test build/x86dec_check build/ref_x86 build/
 	build/d3d12_view_test
 	build/pe_test
 	build/aes_gcm_test
+	build/stereo_test
+	build/warp_core_test
 	build/dotnet_metadata_test
 	build/dotnet_eh_test | tail -1
 	build/dotnet_resources_test
@@ -1376,6 +1405,7 @@ runtime-tests: $(VXRT) tests
 	$(VXRT) build/regwait.exe
 	$(VXRT) build/tp_callbacks.exe
 	$(VXRT) build/fiber_pool.exe
+	build/vxrt-npu --selftest 2>/dev/null   # NPU mode's interpolator and optical flow (skipped where unsupported)
 	$(VXRT) build/shellexec.exe
 	$(VXRT) build/file_io_ex.exe
 	$(VXRT) build/tcptable.exe
