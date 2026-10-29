@@ -7,6 +7,8 @@
 #include "aot.h"
 #include <ctype.h>
 #include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -49,6 +51,39 @@ int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash) {
            (unsigned long long)base, d->part, d->nparts, (unsigned long long)d->part_lo, (unsigned long long)d->part_hi);
     return 0;
 }
+
+// The arena: 256 MB at 0xf00000000 (VXRT_AOT_ARENA=<hex>), where modules' images are made for (vxrt-aot with
+// VXRT_AOT_BASE: the exe relocated too), reserved at start. Below 0x1000000000 (a macOS 14 process's end) the system
+// has already placed randomized regions by main (malloc's 128 MB chunks, two 12 GB ones, the runtime's own dylibs near
+// 0x140000000 as ASLR falls); this range is free about 9 times in 10, and main starts again when it is not.
+// An image whose base is in the arena is mapped over the reservation.
+static uint64_t g_arena_lo, g_arena_hi;
+int xa_reserve(void) {
+    if (getenv("VXRT_AOT_MAPDUMP")) {
+        mach_vm_address_t r = 0x100000000ull; mach_vm_size_t rs; vm_region_basic_info_data_64_t info; mach_port_t o;
+        for (;;) {
+            mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            if (mach_vm_region(mach_task_self(), &r, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &o) || r >= 0x1000000000ull) break;
+            if (rs >= (16 << 20)) vx_log("map %#llx-%#llx %llu MB", (unsigned long long)r, (unsigned long long)(r + rs), (unsigned long long)(rs >> 20));
+            r += rs;
+        }
+    }
+    mach_vm_address_t a = getenv("VXRT_AOT_ARENA") ? strtoull(getenv("VXRT_AOT_ARENA"), NULL, 16) : 0xf00000000ull;
+    mach_vm_size_t n = 0x10000000ull;
+    if (mach_vm_allocate(mach_task_self(), &a, n, VM_FLAGS_FIXED) == KERN_SUCCESS) { g_arena_lo = a; g_arena_hi = a + n; return 1; }
+    else {
+        vx_log("aot: the image arena at %#llx is taken: modules there are not used", (unsigned long long)a);
+        mach_vm_address_t r = a; mach_vm_size_t rs; vm_region_basic_info_data_64_t info; mach_port_t o;
+        for (int i = 0; i < 8; i++) {
+            mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            if (mach_vm_region(mach_task_self(), &r, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &o) || r >= a + n) break;
+            vx_log("aot:   %#llx-%#llx is mapped", (unsigned long long)r, (unsigned long long)(r + rs));
+            r += rs;
+        }
+    }
+    return 0;
+}
+int xa_in_arena(uint64_t a, uint64_t n) { return g_arena_hi && a >= g_arena_lo && a + n <= g_arena_hi; }
 
 uint64_t xa_module_base(const char *dir, const char *path, uint64_t hash) {
     const char *slash = strrchr(path, '/');

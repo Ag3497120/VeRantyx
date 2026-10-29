@@ -28,6 +28,7 @@
 #include <sys/resource.h>
 #include <limits.h>
 #include <mach-o/getsect.h>
+#include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach-o/ldsyms.h>
@@ -593,6 +594,17 @@ static int init_dll(vx_image *m) {
     return 1;
 }
 
+#ifdef __aarch64__
+// (the range reserved for images with modules, translator/aot.c: mapped over, where no image is yet)
+static int in_arena(uint64_t a, uint64_t n) {
+    if (!xa_in_arena(a, n)) return 0;
+    for (int i = 0; i < g_image_count; i++)
+        if (a < (uint64_t)(uintptr_t)g_images[i]->base + g_images[i]->size && (uint64_t)(uintptr_t)g_images[i]->base < a + n) return 0;
+    return 1;
+}
+#else
+#define in_arena(a, n) 0
+#endif
 static vx_image *load_pe(const char *path, int is_main) {
     FILE *f = fopen(path, "rb");
     if (!f) { vx_log("cannot open %s: %s", path, strerror(errno)); vx_set_last_error(2); return NULL; }
@@ -649,7 +661,7 @@ static vx_image *load_pe(const char *path, int is_main) {
         if (b && b != pref_base) {
             // (exactly there when free: mmap takes a hint in some ranges as none)
             mach_vm_address_t a = b;
-            if (mach_vm_allocate(mach_task_self(), &a, image_size, VM_FLAGS_FIXED) == KERN_SUCCESS) {
+            if (in_arena(b, image_size) || mach_vm_allocate(mach_task_self(), &a, image_size, VM_FLAGS_FIXED) == KERN_SUCCESS) {
                 want = b;                                        // (reserved: the mapping below replaces it)
             } else vx_log("aot: %s: its module's base %#llx is taken: the module is not used", path, (unsigned long long)b);
         }
@@ -657,7 +669,7 @@ static vx_image *load_pe(const char *path, int is_main) {
 #endif
     // Map at the preferred base when free, anywhere otherwise (then relocate).
     uint8_t *base = reuse >= 0 ? mmap(g_images[reuse]->base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0)
-                               : mmap((void *)want, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON | (want != pref_base ? MAP_FIXED : 0), -1, 0);
+                               : mmap((void *)want, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON | (want != pref_base || in_arena(want, image_size) ? MAP_FIXED : 0), -1, 0);
     if (base == MAP_FAILED) { vx_log("cannot map %u bytes", image_size); free(file); return NULL; }
     memcpy(base, file, headers_size);
     const pe_section *sec = (const pe_section *)(file + section_table_offset);
@@ -1351,6 +1363,19 @@ int main(int argc, char **argv, char **envp) {
     if (argc < 2) { fprintf(stderr, "usage: vxrt program.exe [args...]\n"); return 2; }
     if (argc == 2 && !strcmp(argv[1], "--vxrt-job-watchdog")) return vx_jobs_watchdog();   // (src/jobs.c)
     vx_program_env(argv[1]);                     // (first: the settings it gives are read below and in every init)
+#ifdef __aarch64__
+    // (before anything is mapped where the modules' images go; when the system's randomized regions already cover it,
+    // the program starts again, up to 5 times: they fall elsewhere)
+    if (getenv("VXRT_AOT_DIR") && !xa_reserve()) {
+        int tries = getenv("VXRT_AOT_RESTARTS") ? atoi(getenv("VXRT_AOT_RESTARTS")) : 0;
+        if (tries < 5) {
+            char n[8]; snprintf(n, sizeof n, "%d", tries + 1);
+            setenv("VXRT_AOT_RESTARTS", n, 1);
+            char self[4096]; uint32_t len = sizeof self;
+            if (!_NSGetExecutablePath(self, &len)) execv(self, argv);
+        }
+    }
+#endif
     vx_trace = getenv("VXRT_TRACE") && *getenv("VXRT_TRACE") == '1';
     // Windows programs keep thousands of handles open; macOS gives a process 256 descriptors (Google Earth VR ran
     // out while reading its tours): as many as the system allows.
