@@ -26,6 +26,7 @@ import Foundation
         }
         setenv("VERANTYX_VR_DRIVE", root.appendingPathComponent("drive").path, 1)
         setenv("VERANTYX_REPO", root.appendingPathComponent("runtime").path, 1)
+        setenv("VERANTYX_LOG_DIR", root.appendingPathComponent("logs").path, 1)
         unsetenv("VERANTYX_BACKEND")
         let model = AppModel(savingPreferences: false, refreshAutomatically: false)
         model.headset = .quest; model.routes = [:]; model.chooseBackend(.vxrt)
@@ -193,8 +194,26 @@ import Foundation
         try Data().write(to: client.appendingPathComponent("reject-update"))
         guard !(await model.downloadNative()), try Data(contentsOf: layout.manifest) == completed,
               try Data(contentsOf: common.appendingPathComponent("game/hlvr/pak01_dir.vpk")) == oldAssets else { throw NativeFailure("Failed retry published an incomplete installation") }
+        // A real child exit must clear live notices, including one left by the
+        // final poll after Stop. Dry runs launch only printf, never the game.
+        setenv("VERANTYX_DRY_RUN", "1", 1)
+        defer { unsetenv("VERANTYX_DRY_RUN") }
+        for (phase, notice, timedOut) in [(Play.Phase.steamVR, "Open ALVR and connect", false),
+                                         (.stopping, "Waiting for the game to close normally…", false),
+                                         (.stopping, "The game is still closing", true)] {
+            let play = try Play(title: alyx.name, appID: alyx.id, exe: nil, headset: .quest, wired: false,
+                                quality: .standard, known: alyx, backend: .nativeARM64)
+            play.phase = phase; play.notice = notice; play.nativeQuitTimedOut = timedOut
+            play.headsetConnected = true; play.headsetHint = "Synthetic stream hint"
+            for _ in 0..<100 where play.running { try await Task.sleep(nanoseconds: 50_000_000) }
+            guard !play.running, play.endedAt != nil, play.notice == nil, !play.nativeQuitTimedOut,
+                  !play.headsetConnected, play.headsetHint == nil, play.problem == nil else {
+                throw NativeFailure("Ended session retained a live notice: \(play.notice ?? "-")")
+            }
+        }
         print("App model: global runtime, migration, mixed installs, shared quality, readiness, navigation and Windows regression checks passed")
         print("App integration: PTY metadata / Unicode / output drain, synthetic Debian archive and FPS statistics passed")
+        print("Play lifecycle: child exit clears headset, normal-stop and quit-timeout notices")
         print("Native installer: old-manifest reuse, symbolic-link omission, fake Linux validation, original preservation, no autoplay and failed-retry publication checks passed")
     }
 }

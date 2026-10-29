@@ -846,7 +846,7 @@ struct SessionCard: View {
                 Text(T("Stop ends the game (and SteamVR); Windows Steam stays open.", "停止するとゲーム（と SteamVR）が終わります。Windows 版 Steam は開いたままです。"))
                     .font(.callout).foregroundStyle(.secondary)
             }
-            if let notice = play.notice {
+            if let notice = play.notice, play.running {
                 Label(notice, systemImage: play.usesLauncher ? "macwindow" : "visionpro").foregroundStyle(.blue).fixedSize(horizontal: false, vertical: true)
             }
             if play.flat && play.usesLauncher && play.gameStarted && play.running {

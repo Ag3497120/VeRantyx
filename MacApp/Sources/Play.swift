@@ -284,6 +284,7 @@ enum Quality: String, CaseIterable, Identifiable {
         poll()
         phase = .ended
         nativeQuitTimedOut = false
+        notice = nil
         endedAt = Date()
         if let nativeConfig { try? FileManager.default.removeItem(at: nativeConfig) }
         headsetConnected = false
@@ -310,6 +311,7 @@ enum Quality: String, CaseIterable, Identifiable {
     }
 
     private func poll() {
+        guard running else { return }                    // a timer task queued before exit must not revive the session
         pollStatus()
         // (a sample a second while the game itself runs: its reported rate changes every 5 s, so this weighs by time)
         if let fps, running, usesLauncher ? gameStarted : phase == .playing { fpsSamples.append(fps) }
