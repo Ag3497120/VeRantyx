@@ -23,8 +23,15 @@ the same queue): the motion vectors as they are, depth to R32Float, the scene co
 copies are small (756x491 at Low + FSR2 Performance in a 1512x982 window: 1.5 MB + 1.5 MB).
 
 FSR2's constants are read as FSR 2.1/2.2 or 2.0 lay them out (`fsr2_parse`): display size, tan(vertical FOV/2),
-device-to-view depth (4 floats: `view depth = d2v[1] / (d - d2v[0])`; `d2v[0] < 0.5` means reversed Z), motion
-vector scale (UV units per motion vector unit: B's pixel was at `uv + mv * scale` in the frame before), jitter.
+device-to-view depth, motion vector scale (UV units per motion vector unit: B's pixel was at `uv + mv * scale` in the
+frame before), jitter.
+
+Cyberpunk 2077 (Low + FSR2 Performance, 1512x982 window), measured: FSR2's first pass (cs fe05c67c) reads the game's
+motion vectors (756x491 RG16Float) and depth (756x491 Depth32Float_Stencil8); its constants (a CBV table's entry) are
+FSR 2.0's layout: render 756x491, display 1512x982, luma mip 23x15, 1/display size, jitter [10], device-to-view
+(FLT_EPSILON, -1, 0.1, FLT_EPSILON: reversed infinite, near plane 0.1), motion vector scale (1, 1) [22] (already UV
+units), downscale 0.5 [24], tan(FOV/2) 0.889 [27] (83.3 degrees vertical). Depth: 52% of the frame exactly 0 (the
+sky): reversed. A vote over sample points (which unit and signs match B to A) agrees with FSR2's scale (654 of 672).
 
 ## 2. The warp core (`warp_core.h`)
 
@@ -58,13 +65,23 @@ each real frame's GPU time was (as long as it stays under D).
 
 On Vision Pro: 22.5 real frames a second x 4 = 90 Hz (1 real + 3 predicted); 18 x 5 also fits.
 
-## 4. HUD split ("hud" in the switch file, or `VXRT_NPU_RACE_HUD=1`)
+## 4. HUD split
 
-FSR2's output is the scene before the UI. The prediction warps that alone, then puts B's UI on it unwarped: the UI is
-the final frame minus FSR2's output (zero where there is none; a nearly opaque UI pixel is the final frame's own).
-This only holds when nothing but the UI is drawn after FSR2, so the layer measures it: every 300 frames, the share of
-the final frame equal to FSR2's output within 2/255; below 50% the split stays off (post-processing or another colour
-space after FSR2). Without the split the old guess applies (blocks equal in A and B are held).
+Measured at El Coyote (run18, pass dump of one frame): Cyberpunk's FSR2 output is RG11B10Float at 1512x982, HDR and
+before tonemapping, and the UI is drawn into its own 1512x982 RGBA8 sRGB layer on black (a full-screen pass, then ~26
+draws: minimap, quest text, subtitles, the health icon); one full-screen draw then composites tonemapped scene + UI layer
+into the swap chain's RGBA8 buffer. So:
+
+- "final minus FSR2's output" cannot isolate the UI here (another colour space, post-processing in between); the layer
+  measures it (`hud` in the switch file: share of the final frame equal to FSR2's output, every 300 frames) and found
+  0.0%, so that split stays off by itself.
+- The clean split is the game's own UI layer: capture the colour input of the final composite pass that is a
+  window-size RGBA8 texture drawn by more than one draw this frame (the UI layer), with its alpha. Then
+  `scene = (final - UI.rgb) / (1 - UI.a)` where the UI is not opaque (opaque UI pixels: holes for the warp core's
+  fill), warp the scene alone, and put the newest UI back on unwarped: `out = UI.rgb + (1 - UI.a) * warp(scene)`.
+  No guessing where the HUD is. (Next round; the capture point is a render pass's colour input, not a dispatch's.)
+
+Until then the old guess stays: blocks equal in A and B are held (`VXW_STILL`).
 
 ## 5. The Neural Engine
 
