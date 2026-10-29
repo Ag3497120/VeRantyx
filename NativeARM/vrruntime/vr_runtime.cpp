@@ -19,8 +19,7 @@
 
 namespace vrrt {
 
-bool publish_file(const char *variable, const std::string &text) {
-    const char *path = getenv(variable);
+static bool write_file(const char *path, const std::string &text) {
     if (!path || !*path) return false;
     if (text.empty()) return unlink(path) == 0 || errno == ENOENT;
     std::string temporary = std::string(path) + ".XXXXXX";
@@ -37,6 +36,10 @@ bool publish_file(const char *variable, const std::string &text) {
     bool ok = written == text.size() && closed && rename(temporary.c_str(), path) == 0;
     unlink(temporary.c_str());
     return ok;
+}
+
+bool publish_file(const char *variable, const std::string &text) {
+    return write_file(getenv(variable), text);
 }
 
 // The mailbox announces the input hint before the engine finishes its first
@@ -514,6 +517,17 @@ void wait_next_vsync() {
 
 // ---- events ----
 static uint64_t g_stage_token;
+static bool g_quit_delivered;
+static void quit_status(const char *suffix) {
+    const char *path = getenv("VERANTYX_NATIVE_QUIT_FILE");
+    if (path && *path) write_file((std::string(path) + suffix).c_str(), "1\n");
+}
+void acknowledge_quit() {
+    std::lock_guard<std::mutex> l(g_evmu);
+    if (!g_quit_delivered) return;
+    quit_status(".ack");
+    log("application acknowledged quit");
+}
 void expect_stage_ready(uint64_t token) {
     std::lock_guard<std::mutex> l(g_evmu);
     g_stage_token = token;
@@ -521,6 +535,25 @@ void expect_stage_ready(uint64_t token) {
 void push_event(const vr::VREvent_t &e) { std::lock_guard<std::mutex> l(g_evmu); if (g_events.size() < 256) g_events.push_back(e); }
 bool pop_event(vr::VREvent_t *e) {
     std::lock_guard<std::mutex> l(g_evmu);
+    // A session-private request survives loading and is delivered only once.
+    // Give it priority even when the ordinary input queue is full.
+    if (!g_quit_delivered) {
+        const char *path = getenv("VERANTYX_NATIVE_QUIT_FILE");
+        FILE *f = path && *path ? fopen(path, "r") : nullptr;
+        char request[8] = {};
+        size_t n = f ? fread(request, 1, sizeof request, f) : 0;
+        if (f) fclose(f);
+        if (n == 5 && memcmp(request, "quit\n", 5) == 0) {
+            g_quit_delivered = true;
+            *e = {};
+            e->eventType = vr::VREvent_Quit;
+            e->trackedDeviceIndex = vr::k_unTrackedDeviceIndexInvalid;
+            e->data.process.pid = (uint32_t)getpid();
+            quit_status(".delivered");
+            log("VREvent_Quit delivered; waiting for the application to exit");
+            return true;
+        }
+    }
     if (g_stage_token) {
         const char *path = getenv("VERANTYX_NATIVE_STAGE_FILE");
         FILE *f = path ? fopen((std::string(path) + ".ready").c_str(), "r") : nullptr;

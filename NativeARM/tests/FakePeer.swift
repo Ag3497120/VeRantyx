@@ -2,6 +2,8 @@
 import Foundation
 import Darwin
 
+private var receivedSignal: Int32 = 0
+
 @main enum FakePeer {
     static func main() throws {
         let env = ProcessInfo.processInfo.environment
@@ -15,6 +17,18 @@ import Darwin
             try JSONSerialization.data(withJSONObject: settings).write(to: directory.appendingPathComponent("session.json"), options: .atomic)
         }
         try "\(getpid())".write(toFile: root + "/" + role + ".pid", atomically: true, encoding: .utf8)
+        if role == "parent" {
+            let file = URL(fileURLWithPath: CommandLine.arguments[2])
+            var config = try JSONDecoder().decode(NativeSessionConfig.self, from: Data(contentsOf: file))
+            config.parentPID = getpid()
+            try JSONEncoder().encode(config).write(to: file)
+            let child = Process(); child.executableURL = URL(fileURLWithPath: CommandLine.arguments[1]); child.arguments = ["--session", file.path]
+            child.standardInput = FileHandle.nullDevice; child.standardOutput = FileHandle.nullDevice; child.standardError = FileHandle.nullDevice
+            try child.run()
+            try "\(child.processIdentifier)".write(toFile: root + "/helper.pid", atomically: true, encoding: .utf8)
+            while !FileManager.default.fileExists(atPath: root + "/release-parent") { usleep(20_000) }
+            return
+        }
         if let prompt = env["VERANTYX_GAME_PROMPT_FILE"] {
             try prompt.write(toFile: root + "/" + role + "-prompt-path", atomically: true, encoding: .utf8)
             if role == "host" { try "Synthetic loading prompt".write(toFile: prompt, atomically: true, encoding: .utf8) }
@@ -35,6 +49,28 @@ import Darwin
         }
         if role == "host" {
             try "started".write(toFile: root + "/host-started", atomically: true, encoding: .utf8)
+            if let mode = env["NATIVE_TEST_HOST_MODE"], let request = env["VERANTYX_NATIVE_QUIT_FILE"] {
+                for number in [SIGINT, SIGTERM] { signal(number) { receivedSignal = $0 } }
+                while true {
+                    if receivedSignal != 0 { try "\(receivedSignal)".write(toFile: root + "/host-signal", atomically: true, encoding: .utf8) }
+                    if mode == "slow", FileManager.default.fileExists(atPath: request) {
+                        try Data("1\n".utf8).write(to: URL(fileURLWithPath: request + ".delivered"))
+                        try Data("1\n".utf8).write(to: URL(fileURLWithPath: request + ".ack"))
+                        usleep(400_000)
+                        break
+                    }
+                    if FileManager.default.fileExists(atPath: root + "/release-host") { break }
+                    usleep(20_000)
+                }
+                if receivedSignal != 0 { try "\(receivedSignal)".write(toFile: root + "/host-signal", atomically: true, encoding: .utf8) }
+                guard let frame = env["VERANTYX_SHARED_FRAME"], FileManager.default.fileExists(atPath: frame),
+                      let pid = Int32(try String(contentsOfFile: root + "/encoder.pid", encoding: .utf8)),
+                      env["NATIVE_TEST_ENCODER_FAIL"] == "1" || kill(pid, 0) == 0 else {
+                    throw NativeFailure("Resources disappeared before the game exited")
+                }
+                try "saved".write(toFile: root + "/host-clean-exit", atomically: true, encoding: .utf8)
+                return
+            }
             usleep(300_000)
             try audioSettings(false)
             return
@@ -50,6 +86,7 @@ import Darwin
         func put<T>(_ value: T, _ at: Int) { var v = value; _ = withUnsafeBytes(of: &v) { pwrite(fd, $0.baseAddress, $0.count, off_t(at)) } }
         var sequence: UInt32 = 0
         while true {
+            if env["NATIVE_TEST_ENCODER_FAIL"] == "1", FileManager.default.fileExists(atPath: root + "/host-started") { exit(7) }
             if env["NATIVE_TEST_NO_TRACKING"] != "1" {
                 sequence += 2; put(sequence - 1, 20)
                 for i in 0..<16 { put(Float(i % 5 == 0 ? 1 : 0), NativeIPC.hands + i * 4) }

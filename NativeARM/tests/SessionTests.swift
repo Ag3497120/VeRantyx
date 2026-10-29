@@ -9,7 +9,7 @@ import Darwin
         defer { try? fm.removeItem(at: root) }
         let helper = build.deletingLastPathComponent().appendingPathComponent("native-session")
         let fake = build.appendingPathComponent("fake_peer")
-        for role in ["host", "encoder", "unrelated"] { try fm.createSymbolicLink(at: root.appendingPathComponent(role), withDestinationURL: fake) }
+        for role in ["host", "encoder", "unrelated", "parent"] { try fm.createSymbolicLink(at: root.appendingPathComponent(role), withDestinationURL: fake) }
         func process(_ path: URL, _ args: [String], env: [String: String]) throws -> Process {
             let p = Process(); p.executableURL = path; p.arguments = args; p.environment = env
             p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
@@ -77,6 +77,85 @@ import Darwin
             if mode == "normal", record["encoder_restarts"] as? Int != 1 { throw NativeFailure("ALVR exit 75 was not restarted") }
             if let pidText = try? String(contentsOf: root.appendingPathComponent("encoder.pid")), let pid = Int32(pidText), kill(pid, 0) == 0 { throw NativeFailure("owned encoder survived helper exit") }
         }
-        print("Native session: synthetic tracking, exit 75, timeout, cancel and owned-process cleanup passed")
+        func checkQuit(_ mode: String) throws {
+            let session = root.appendingPathComponent("quit-" + mode)
+            try fm.createDirectory(at: session, withIntermediateDirectories: true)
+            let slow = ["slow", "interrupt", "parent", "encoder-error"].contains(mode)
+            let env = ["NATIVE_TEST_PEER": "1", "NATIVE_TEST_ROOT": session.path,
+                       "NATIVE_TEST_HOST_MODE": slow ? "slow" : "ignore",
+                       "NATIVE_TEST_ENCODER_FAIL": mode == "encoder-error" ? "1" : "0"]
+            let config = NativeSessionConfig(host: root.appendingPathComponent("host"), encoder: root.appendingPathComponent("encoder"),
+                game: root.appendingPathComponent("game"), lib: root.appendingPathComponent("lib"), state: session.appendingPathComponent("state"),
+                logs: session.appendingPathComponent("logs"), alvrLog: session.appendingPathComponent("alvr.log"), environment: env,
+                parentPID: getpid(), waitSeconds: 2, quitWaitSeconds: 0.1, allowForceKill: mode == "configured-force")
+            let file = session.appendingPathComponent("config.json")
+            try JSONEncoder().encode(config).write(to: file)
+            // Older configuration files must continue to default to a 60 s wait
+            // without permitting a forced game shutdown.
+            var legacy = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+            legacy.removeValue(forKey: "quitWaitSeconds"); legacy.removeValue(forKey: "allowForceKill")
+            let decoded = try JSONDecoder().decode(NativeSessionConfig.self, from: JSONSerialization.data(withJSONObject: legacy))
+            guard decoded.quitWaitSeconds == nil, decoded.allowForceKill != true else { throw NativeFailure("Unsafe legacy quit policy") }
+            let p = try process(mode == "parent" ? root.appendingPathComponent("parent") : helper,
+                                mode == "parent" ? [helper.path, file.path] : ["--session", file.path], env: env)
+            defer {
+                try? Data().write(to: session.appendingPathComponent("release-host"))
+                try? Data().write(to: session.appendingPathComponent("release-parent"))
+                try? NativeQuit.request(in: config.logs, force: true)
+                if p.isRunning { p.terminate() }
+                p.waitUntilExit()
+            }
+            func wait(_ condition: () -> Bool) throws {
+                let deadline = ProcessInfo.processInfo.systemUptime + 5
+                while !condition(), ProcessInfo.processInfo.systemUptime < deadline { usleep(10_000) }
+                guard condition() else { throw NativeFailure("Quit test timed out: \(mode)") }
+            }
+            func record() -> [String: Any] {
+                guard let data = try? Data(contentsOf: config.logs.appendingPathComponent("session.json")),
+                      let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+                return value
+            }
+            try wait { fm.fileExists(atPath: session.appendingPathComponent("host-started").path) }
+            if mode == "parent" {
+                try Data().write(to: session.appendingPathComponent("release-parent")); p.waitUntilExit()
+            } else if mode == "interrupt" {
+                guard getpgid(p.processIdentifier) == p.processIdentifier else { throw NativeFailure("Helper has no private process group") }
+                kill(-p.processIdentifier, SIGINT)
+            } else if mode != "encoder-error" { p.terminate() }
+            if !["configured-force", "encoder-error"].contains(mode) {
+                try wait { record()["state"] as? String == "quit_timeout" }
+                guard fm.fileExists(atPath: config.logs.appendingPathComponent("frame.dat").path), unrelated.isRunning else {
+                    throw NativeFailure("Quit timeout released session resources")
+                }
+                let lock = open(config.state.appendingPathComponent("session.lock").path, O_RDWR)
+                guard lock >= 0 else { throw NativeFailure("Session lock disappeared during quit") }
+                let acquired = flock(lock, LOCK_EX | LOCK_NB) == 0; close(lock)
+                guard !acquired else { throw NativeFailure("Session lock released before the game exited") }
+                if mode == "force" { try NativeQuit.request(in: config.logs, force: true) }
+                if mode == "ignore" {
+                    p.terminate(); p.terminate(); usleep(150_000)
+                    guard p.isRunning, !fm.fileExists(atPath: session.appendingPathComponent("host-signal").path) else {
+                        throw NativeFailure("Repeated stop escalated to a game signal")
+                    }
+                    try Data().write(to: session.appendingPathComponent("release-host"))
+                }
+            }
+            try wait { ["stopped", "error"].contains(record()["state"] as? String ?? "") }
+            p.waitUntilExit()
+            let result = record(), forced = ["force", "configured-force"].contains(mode)
+            guard result["host_shutdown"] as? String == (forced ? "forced" : "requested"),
+                  result["host_exit_reason"] as? String == (forced ? "signal" : "exit"),
+                  result["host_exit_code"] as? Int == (forced ? Int(SIGKILL) : 0),
+                  result["quit_timed_out"] as? Bool == true, unrelated.isRunning,
+                  !fm.fileExists(atPath: config.logs.appendingPathComponent("frame.dat").path),
+                  !fm.fileExists(atPath: session.appendingPathComponent("host-signal").path),
+                  forced || fm.fileExists(atPath: session.appendingPathComponent("host-clean-exit").path) else {
+                throw NativeFailure("Incorrect shutdown or lost game cleanup: \(mode), \(result)")
+            }
+            if slow, result["quit_acknowledged"] as? Bool != true { throw NativeFailure("Quit acknowledgement not recorded") }
+            if mode == "encoder-error", result["state"] as? String != "error" { throw NativeFailure("Encoder failure hidden by shutdown state") }
+        }
+        for mode in ["slow", "interrupt", "ignore", "force", "configured-force", "parent", "encoder-error"] { try checkQuit(mode) }
+        print("Native session: tracking, restart, timeout, cancel, slow quit, no escalation, explicit force, parent loss and encoder failure passed")
     }
 }

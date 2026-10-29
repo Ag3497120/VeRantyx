@@ -119,7 +119,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         play.stop()
         Task { @MainActor in
-            for _ in 0..<40 where play.running { try? await Task.sleep(nanoseconds: 500_000_000) }
+            if play.backend == .nativeARM64 {
+                while play.running {
+                    // Return control to the player instead of abandoning a game
+                    // that is still saving, loading or waiting for its own menu.
+                    if play.nativeQuitTimedOut {
+                        sender.reply(toApplicationShouldTerminate: false)
+                        sender.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
+                        sender.activate(ignoringOtherApps: true)
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            } else {
+                for _ in 0..<40 where play.running { try? await Task.sleep(nanoseconds: 500_000_000) }
+            }
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -164,7 +178,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                          play.gameStarted ? 1 : 0, play.problem ?? "-", play.notice ?? "-"))
         }
         if play.running { play.stop() }
-        for _ in 0..<40 where play.running { try? await Task.sleep(nanoseconds: 500_000_000) }
+        if play.backend == .nativeARM64 {
+            while play.running { try? await Task.sleep(nanoseconds: 500_000_000) }
+        } else {
+            for _ in 0..<40 where play.running { try? await Task.sleep(nanoseconds: 500_000_000) }
+        }
         print("ended: phase=\(play.phase) problem=\(play.problem ?? "-") last game log line: \(play.gameLines.last ?? "-")")
         // (what the session card's report buttons would open)
         print("fps samples=\(play.fpsSamples.count) missing functions=\(play.missingFunctions.count)")

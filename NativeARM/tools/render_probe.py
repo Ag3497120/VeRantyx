@@ -14,12 +14,12 @@ import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import struct
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from native_quit import positive_seconds, stop_signals, wait_for_game
 
 REPO = Path(__file__).resolve().parents[2]
 BLOCK = 88 + 4096*4096*8
@@ -28,7 +28,8 @@ SIZE = HANDS + 312 + 1024
 
 
 def digest(path):
-    return hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()
+    with path.open('rb') as source:
+        return hashlib.file_digest(source, 'sha256').hexdigest()
 
 
 def main():
@@ -37,6 +38,10 @@ def main():
     ap.add_argument('--host', type=Path, default=REPO/'NativeARM/build/host/alyx_host')
     ap.add_argument('--map', default='startup')
     ap.add_argument('--seconds', type=int, default=100)
+    ap.add_argument('--quit-timeout', type=positive_seconds, default=60,
+                    help='seconds before reporting a slow quit; continues waiting by default')
+    ap.add_argument('--allow-force-kill', action='store_true',
+                    help='explicitly allow SIGKILL after the normal quit timeout')
     ap.add_argument('--sample', action='store_true', help='sample native stacks across late head turns')
     ap.add_argument('--load', help='save name to copy into the private overlay and load')
     ap.add_argument('--hold-yaw', type=float, help='hold a fixed yaw in radians')
@@ -110,6 +115,8 @@ def main():
         key, value = setting.split('=', 1)
         if not key.startswith(('KL_', 'VERANTYX_', 'MVK_CONFIG_')): raise ValueError(key)
         env[key] = value
+    quit_request = run/'quit.request'
+    env['VERANTYX_NATIVE_QUIT_FILE'] = str(quit_request)
     command = [str(args.host.resolve()), '--libdir', str(source/'lib'), '--game', str(overlay), '--',
                '-vr', '-steam', '-noasserts', '-nopassiveasserts', '-vulkan', '-nowindow',
                '-noautofidelity', '+vr_fidelity_level', '3', '+map', args.map,
@@ -135,12 +142,40 @@ def main():
         from PIL import Image
     profiler = None
     log = run/'alyx_host.log'
-    with frame.open('r+b') as f, mmap.mmap(f.fileno(), SIZE) as shared, log.open('wb') as output:
+    series = run/'frames.json'
+    captured = False
+    def checkpoint(shutdown):
+        nonlocal captured
+        # Collection has ended. Retain the samples even if normal quit takes
+        # indefinitely long; only final, closed logs are hashed into the ledger.
+        if not captured:
+            for ppm,w,h,fmt,data in images:
+                rgb = bytearray(w*h*3)
+                rgb[0::3] = data[2::4] if fmt==87 else data[0::4]
+                rgb[1::3] = data[1::4]
+                rgb[2::3] = data[0::4] if fmt==87 else data[2::4]
+                ppm.write_bytes(f'P6\n{w} {h}\n255\n'.encode()+rgb)
+            for sequence,elapsed,picture in burst_frames:
+                picture.save(run/f'burst-{sequence:06d}.png')
+            series.write_text(json.dumps(samples, indent=2))
+            captured = True
+        (run/'shutdown.json').write_text(json.dumps(shutdown, indent=2)+'\n')
+        (run/'pending.json').write_text(json.dumps(dict(status='waiting_for_game', shutdown=shutdown,
+            samples=series.name, collection_duration_s=measurement_duration), indent=2)+'\n')
+    collection_error = None
+    with stop_signals() as stopped, frame.open('r+b') as f, mmap.mmap(f.fileno(), SIZE) as shared, log.open('wb') as output:
         start = time.monotonic()
         process = subprocess.Popen(command, cwd=overlay, env=env, stdout=output, stderr=subprocess.STDOUT,
                                    start_new_session=True)
+        packet = bytearray(312)
+        def publish_pose():
+            struct.pack_into('<d', packet, 244, time.monotonic())
+            seq = struct.unpack_from('<I', shared, 20)[0]
+            struct.pack_into('<I', shared, 20, seq|1)
+            shared[HANDS:HANDS+312] = packet
+            struct.pack_into('<I', shared, 20, (seq+2)&0xfffffffe)
         try:
-            while process.poll() is None and time.monotonic()-start < args.seconds:
+            while process.poll() is None and not stopped and time.monotonic()-start < args.seconds:
                 elapsed = time.monotonic()-start
                 if args.sample and profiler is None and elapsed >= 40:
                     profiler = subprocess.Popen(['sample',str(process.pid),'40','1','-file',str(run/'head-turn-sample.txt')],
@@ -152,10 +187,7 @@ def main():
                 packet[192:196] = bytes([1,1,0,255 if elapsed%15<.2 else 0])
                 struct.pack_into('<d8f', packet, 244, time.monotonic(), *([-1.2798622,1.2798622,-1.2798622,1.2798622]*2))
                 packet[286] = 1
-                seq = struct.unpack_from('<I', shared, 20)[0]
-                struct.pack_into('<I', shared, 20, seq|1)
-                shared[HANDS:HANDS+312] = packet
-                struct.pack_into('<I', shared, 20, (seq+2)&0xfffffffe)
+                publish_pose()
                 idx = struct.unpack_from('<i', shared)[0]&1
                 offset = 64+idx*BLOCK
                 frame_seq,w,h,fmt = struct.unpack_from('<4I', shared, offset)
@@ -180,26 +212,21 @@ def main():
                                 burst_frames.append((frame_seq,elapsed,picture));burst_last=elapsed
                         samples.append(current); last_seq=frame_seq; last_seen=elapsed
                 time.sleep(.005)
+        except Exception as error:
+            collection_error = f'{type(error).__name__}: {error}'
         finally:
+            measurement_duration = time.monotonic()-start
             natural_exit = process.poll()
-            if natural_exit is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try: process.wait(timeout=10)
-                except subprocess.TimeoutExpired: os.killpg(process.pid,signal.SIGKILL); process.wait()
+            packet[194:196] = bytes(2)
+            shutdown = wait_for_game(process, quit_request, args.quit_timeout, args.allow_force_kill,
+                                     progress=checkpoint, tick=publish_pose)
             if profiler is not None:
                 try: profiler.wait(timeout=5)
                 except subprocess.TimeoutExpired: profiler.terminate(); profiler.wait()
-    # Formatting/writing images on the sampler created artificial gaps in the
-    # first probes. Retain raw snapshots and do that work after stopping play.
-    for ppm,w,h,fmt,data in images:
-        rgb = bytearray(w*h*3)
-        rgb[0::3] = data[2::4] if fmt==87 else data[0::4]
-        rgb[1::3] = data[1::4]
-        rgb[2::3] = data[0::4] if fmt==87 else data[2::4]
-        ppm.write_bytes(f'P6\n{w} {h}\n255\n'.encode()+rgb)
-    for sequence,elapsed,picture in burst_frames:
-        picture.save(run/f'burst-{sequence:06d}.png')
-    series = run/'frames.json'; series.write_text(json.dumps(samples, indent=2))
+    # Retain a closed snapshot even if a guest helper inherited the live log fd.
+    final_log = run/'alyx_host-final.log'
+    shutil.copyfile(log, final_log)
+    log = final_log
     observe('exited_early', natural_exit is not None, log)
     observe('published_frame_samples', len(samples), series)
     observe('last_frame_sequence', last_seq, series)
@@ -216,11 +243,16 @@ def main():
     if (run/'head-turn-sample.txt').exists(): observe('head_turn_cpu_profile','native stacks',run/'head-turn-sample.txt')
     for sequence,elapsed,picture in burst_frames:
         observe('burst_frame',dict(sequence=sequence,t=elapsed),run/f'burst-{sequence:06d}.png')
-    result.update(status='recorded', duration_s=time.monotonic()-start)
+    observe('host_shutdown', shutdown, run/'shutdown.json')
+    result.update(status='error' if collection_error else 'interrupted' if stopped else 'recorded',
+                  duration_s=measurement_duration, total_duration_s=time.monotonic()-start, shutdown=shutdown)
+    if collection_error: result['collection_error'] = collection_error
+    if stopped: result['stop_signal'] = stopped[0]
     save()
+    (run/'pending.json').unlink(missing_ok=True)
     # The evidence is logs, frame samples and images, not another game install.
     shutil.rmtree(overlay)
-    return 0
+    return 1 if collection_error else 128+stopped[0] if stopped else 0
 
 
 if __name__ == '__main__':

@@ -899,6 +899,12 @@ struct SessionCard: View {
                 }
                 Spacer()
                 if play.running {
+                    if play.nativeQuitTimedOut {
+                        Button(role: .destructive) { play.forceNativeStop() } label: {
+                            Label(T("Force stop", "強制終了"), systemImage: "exclamationmark.octagon")
+                        }
+                        .help(T("Ends the game immediately. Unsaved progress may be lost.", "直ちにゲームを終了します。未保存の進行状況は失われる場合があります。"))
+                    }
                     Button(role: .destructive) { play.stop() } label: { Label(T("Stop", "停止"), systemImage: "stop.fill") }
                         .disabled(play.phase == .stopping)
                 } else {

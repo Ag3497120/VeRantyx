@@ -377,6 +377,15 @@ enum NativeIPC {
     }
 }
 
+enum NativeQuit {
+    static let requestName = "quit.request"
+    static let forceName = "force-stop.request"
+    static func request(in directory: URL, force: Bool = false) throws {
+        try Data((force ? "force\n" : "quit\n").utf8).write(
+            to: directory.appendingPathComponent(force ? forceName : requestName), options: .atomic)
+    }
+}
+
 struct NativeSessionConfig: Codable {
     var host: URL
     var encoder: URL
@@ -388,6 +397,9 @@ struct NativeSessionConfig: Codable {
     var environment: [String: String]
     var parentPID: Int32
     var waitSeconds: Double = 300
+    // Optional so configurations from an older app keep the safe defaults.
+    var quitWaitSeconds: Double? = nil
+    var allowForceKill: Bool? = nil
 }
 
 struct NativeFrameRate {

@@ -151,6 +151,7 @@ double seconds_since_vsync();
 // Events (IVRSystem::PollNextEvent).
 void push_event(const vr::VREvent_t &e);
 bool pop_event(vr::VREvent_t *e);
+void acknowledge_quit();
 bool publish_file(const char *variable, const std::string &text);
 void expect_stage_ready(uint64_t token);
 void loading_message(const std::string &message);

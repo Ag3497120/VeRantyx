@@ -355,7 +355,7 @@ public:
     bool ShouldApplicationPause() override { return false; }
     bool ShouldApplicationReduceRenderingWork() override { return false; }
     EVRFirmwareError PerformFirmwareUpdate(TrackedDeviceIndex_t) override { return VRFirmwareError_None; }
-    void AcknowledgeQuit_Exiting() override { vrrt::log("application acknowledged quit"); }
+    void AcknowledgeQuit_Exiting() override { vrrt::acknowledge_quit(); }
     uint32_t GetAppContainerFilePaths(char *buf, uint32_t cap) override { if (buf && cap) buf[0] = 0; return 1; }
     const char *GetRuntimeVersion() override { return "2.15.6"; }
     EVRInitError SetSDKVersion(uint32_t a, uint32_t b, uint32_t c) override { vrrt::log("application SDK version %u.%u.%u", a, b, c); return VRInitError_None; }

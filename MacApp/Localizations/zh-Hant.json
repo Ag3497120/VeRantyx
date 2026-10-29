@@ -269,5 +269,10 @@
  "Downloads and prepares the selected version. Start the game later from Play.": "下載並準備所選版本。稍後從遊玩頁面啟動遊戲。",
  "About %@ of additional space is needed for native preparation; %@ is free. APFS can reuse installed game data. Steam may require more space for changed files.": "原生準備約需 %@ 額外空間；可用 %@。APFS 可以重複利用已安裝的遊戲資料。Steam 可能需要更多空間存放變更的檔案。",
  "Reusing installed Alyx files…": "正在重複利用已安裝的 Alyx 檔案…",
- "Checking existing files and downloading native updates…": "正在檢查現有檔案並下載原生更新…"
+ "Checking existing files and downloading native updates…": "正在檢查現有檔案並下載原生更新…",
+ "Forcing the game to stop…": "正在強制停止遊戲…",
+ "The game is still closing. You can quit in the headset, keep waiting, or choose Force stop.": "遊戲仍在結束中。你可以在頭戴裝置中結束遊戲、繼續等待，或選擇「強制停止」。",
+ "Waiting for the game to close normally…": "正在等待遊戲正常結束…",
+ "Force stop": "強制停止",
+ "Ends the game immediately. Unsaved progress may be lost.": "立即停止遊戲。未儲存的進度可能會遺失。"
 }

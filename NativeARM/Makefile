@@ -14,6 +14,7 @@ check: $(OUT)/runtime_test $(OUT)/async_pipeline $(OUT)/vulkan_compat $(OUT)/sup
 	$(OUT)/vulkan_compat
 	$(OUT)/support_test $(abspath $(OUT))
 	$(OUT)/session_test $(abspath $(OUT))
+	python3 tests/quit_test.py
 
 $(OUT)/support_test: shared/NativeSupport.swift tests/SupportTests.swift
 	@mkdir -p $(OUT)
@@ -54,6 +55,7 @@ check-pipeline-cache: $(OUT)/pipeline_cache_gpu
 check-syntax:
 	$(CXX) $(TEST_FLAGS) -fsyntax-only $(VR)/*.cpp
 	bash -n scripts/launch_native_vr.sh
+	bash -n scripts/run_timeout.sh
 
 check-encoder:
 	@mkdir -p $(SWIFT_CACHE)

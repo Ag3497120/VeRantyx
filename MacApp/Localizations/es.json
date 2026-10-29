@@ -269,5 +269,10 @@
   "Downloads and prepares the selected version. Start the game later from Play.": "Descarga y prepara la versión seleccionada. Inicia el juego más tarde desde Jugar.",
   "About %@ of additional space is needed for native preparation; %@ is free. APFS can reuse installed game data. Steam may require more space for changed files.": "La preparación nativa necesita unos %@ adicionales; hay %@ libres. APFS puede reutilizar datos instalados. Steam puede necesitar más espacio para archivos modificados.",
   "Reusing installed Alyx files…": "Reutilizando los archivos instalados de Alyx…",
-  "Checking existing files and downloading native updates…": "Comprobando archivos existentes y descargando actualizaciones nativas…"
+  "Checking existing files and downloading native updates…": "Comprobando archivos existentes y descargando actualizaciones nativas…",
+  "Forcing the game to stop…": "Forzando el cierre del juego…",
+  "The game is still closing. You can quit in the headset, keep waiting, or choose Force stop.": "El juego aún se está cerrando. Puedes salir desde el visor, seguir esperando o elegir Forzar cierre.",
+  "Waiting for the game to close normally…": "Esperando a que el juego se cierre normalmente…",
+  "Force stop": "Forzar cierre",
+  "Ends the game immediately. Unsaved progress may be lost.": "Cierra el juego inmediatamente. Se puede perder el progreso no guardado."
 }

@@ -69,6 +69,7 @@ enum Quality: String, CaseIterable, Identifiable {
     @ObservationIgnored private(set) var nativeSession: URL?
     @ObservationIgnored private var nativeConfig: URL?
     @ObservationIgnored private var nativeFrameRate = NativeFrameRate()
+    var nativeQuitTimedOut = false
     /// On the Mac's screen, without SteamVR or a headset.
     let flat: Bool
     var phase: Phase = .starting
@@ -237,9 +238,10 @@ enum Quality: String, CaseIterable, Identifiable {
 
     func stop() {
         guard process.isRunning else { return }
+        if backend == .nativeARM64, stopping { return }
         phase = .stopping
         stopping = true
-        process.terminate()                               // (the scripts' trap stops SteamVR, the encoder and the game)
+        process.terminate()                               // native helper requests a cooperative quit; scripts clean up Windows sessions
         if viaWindowsSteam, let exe = known?.gameExe {
             // (launch_vxrt_nms_vr.sh leaves the game to Steam: the game is ended here; Windows Steam keeps running.
             //  Steam starts it by an upper-case path, ".../BINARIES/NMS.EXE": the match ignores case)
@@ -253,6 +255,15 @@ enum Quality: String, CaseIterable, Identifiable {
             kill(p.processIdentifier, SIGKILL)
             Task { await Play.stopEverything() }
         }
+    }
+
+    func forceNativeStop() {
+        guard backend == .nativeARM64, process.isRunning, nativeQuitTimedOut, let nativeSession else { return }
+        do {
+            try NativeQuit.request(in: nativeSession, force: true)
+            nativeQuitTimedOut = false
+            notice = T("Forcing the game to stop…", "ゲームを強制終了しています…")
+        } catch { problem = error.localizedDescription }
     }
 
     /// Stops whatever VeRantyx started and left running (SteamVR on VXRuntime, a game, the encoder).
@@ -272,6 +283,7 @@ enum Quality: String, CaseIterable, Identifiable {
         timer?.invalidate()
         poll()
         phase = .ended
+        nativeQuitTimedOut = false
         endedAt = Date()
         if let nativeConfig { try? FileManager.default.removeItem(at: nativeConfig) }
         headsetConnected = false
@@ -362,8 +374,15 @@ enum Quality: String, CaseIterable, Identifiable {
            let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             switch state["state"] as? String {
             case "waiting": if phase != .stopping { phase = .steamVR }; notice = T("Open ALVR on your Pico / Quest and connect. Waiting for live tracking and both eyes.", "Pico・Quest で ALVR を開いて接続してください。トラッキングと両目のデータを待っています。")
-            case "running": if phase != .stopping { phase = .playing }; gameStarted = true; notice = nil
+            case "running": if phase != .stopping { phase = .playing; notice = nil }; gameStarted = true
             case "reconnecting": notice = T("Reconnecting ALVR…", "ALVR を再接続中…")
+            case "stopping", "quit_timeout":
+                phase = .stopping; stopping = true
+                nativeQuitTimedOut = state["state"] as? String == "quit_timeout"
+                notice = nativeQuitTimedOut ?
+                    T("The game is still closing. You can quit in the headset, keep waiting, or choose Force stop.",
+                      "ゲームの終了を待っています。ヘッドセットで終了するか、そのまま待つか、強制終了を選べます。") :
+                    T("Waiting for the game to close normally…", "ゲームが通常終了するのを待っています…")
             case "error": problem = state["message"] as? String
             default: break
             }

@@ -269,5 +269,10 @@
  "Downloads and prepares the selected version. Start the game later from Play.": "Приложение скачает и подготовит выбранную версию. Запустите игру позже со страницы «Играть».",
  "About %@ of additional space is needed for native preparation; %@ is free. APFS can reuse installed game data. Steam may require more space for changed files.": "Для подготовки native требуется около %@ дополнительного места; свободно %@. На APFS можно использовать установленные данные игры. Steam может потребоваться больше места для изменённых файлов.",
  "Reusing installed Alyx files…": "Используем установленные файлы Alyx…",
- "Checking existing files and downloading native updates…": "Проверяем имеющиеся файлы и докачиваем нативную версию…"
+ "Checking existing files and downloading native updates…": "Проверяем имеющиеся файлы и докачиваем нативную версию…",
+ "Forcing the game to stop…": "Принудительно завершаем игру…",
+ "The game is still closing. You can quit in the headset, keep waiting, or choose Force stop.": "Игра ещё закрывается. Можно выйти из неё в гарнитуре, продолжить ждать или выбрать «Завершить принудительно».",
+ "Waiting for the game to close normally…": "Ждём штатного выхода из игры…",
+ "Force stop": "Завершить принудительно",
+ "Ends the game immediately. Unsaved progress may be lost.": "Немедленно завершает игру. Несохранённый прогресс может быть потерян."
 }

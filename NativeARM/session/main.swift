@@ -7,7 +7,8 @@ import Darwin
 private var nativeStopSignal: Int32 = 0
 
 enum NativeSupervisor {
-    static func stop(_ process: Process?, grace: Double = 5) {
+    // Service cleanup is separate from the game's cooperative quit protocol.
+    static func stopService(_ process: Process?, grace: Double = 5) {
         guard let process, process.isRunning else { return }
         process.terminate()
         let deadline = Date().addingTimeInterval(grace)
@@ -30,6 +31,8 @@ enum NativeSupervisor {
     static func run(_ source: NativeSessionConfig) throws -> Int32 {
         var config = source
         guard config.waitSeconds.isFinite, (1...3600).contains(config.waitSeconds), config.parentPID > 1 else { throw NativeFailure("Invalid session configuration") }
+        let quitWait = config.quitWaitSeconds ?? 60
+        guard quitWait.isFinite, (0.1...3600).contains(quitWait) else { throw NativeFailure("Invalid quit wait time") }
         let fm = FileManager.default
         try fm.createDirectory(at: config.state, withIntermediateDirectories: true)
         let lock = open(config.state.appendingPathComponent("session.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
@@ -50,6 +53,9 @@ enum NativeSupervisor {
         config.environment["VERANTYX_NATIVE_LOADING_FILE"] = loading.path
         let stage = config.logs.appendingPathComponent("loading-stage.json")
         config.environment["VERANTYX_NATIVE_STAGE_FILE"] = stage.path
+        let quit = config.logs.appendingPathComponent(NativeQuit.requestName)
+        let force = config.logs.appendingPathComponent(NativeQuit.forceName)
+        config.environment["VERANTYX_NATIVE_QUIT_FILE"] = quit.path
         config.environment["VERANTYX_NATIVE_GAME_DIR"] = config.game.appendingPathComponent("game/hlvr").path
         config.environment["VERANTYX_OPENVR_ROOT"] = config.state.appendingPathComponent("openvr").path
         config.environment["KL_VK_PIPELINE_ARCHIVE"] = config.state.appendingPathComponent("native-pipelines.bin").path
@@ -67,8 +73,11 @@ enum NativeSupervisor {
         for number in [SIGINT, SIGTERM] { signal(number) { nativeStopSignal = $0 } }
         var record: [String: Any] = ["backend": "nativeARM64", "started_at": ISO8601DateFormatter().string(from: Date()),
                                    "parent_pid": config.parentPID, "quality": config.environment["VERANTYX_NATIVE_QUALITY"] ?? "standard",
+                                   "quit_wait_seconds": quitWait, "allow_force_kill": config.allowForceKill == true,
                                    "unknown": ["headset picture, audio and physical controls require a user playtest", "FPS comparison requires matching scenes and settings"]]
+        var failure: String?
         func event(_ state: String, _ message: String = "") {
+            if state == "error" { failure = message }
             record["state"] = state; record["message"] = message
             if let data = try? JSONSerialization.data(withJSONObject: record, options: [.prettyPrinted, .sortedKeys]) {
                 try? data.write(to: config.logs.appendingPathComponent("session.json"), options: .atomic)
@@ -94,24 +103,15 @@ enum NativeSupervisor {
                 try? snapshot.write(to: config.logs.appendingPathComponent(name.replacingOccurrences(of: ".log", with: "-audio.json")), options: .atomic)
             }
         }
-        defer {
-            stop(host, grace: 10)
-            stop(encoder)
-            try? fm.removeItem(at: prompt)
-            try? fm.removeItem(at: loading)
-            try? fm.removeItem(at: stage)
-            try? fm.removeItem(atPath: stage.path + ".ready")
-            record["encoder_restarts"] = restarts
-            record["ended_at"] = ISO8601DateFormatter().string(from: Date())
-            if let host, !host.isRunning { record["host_exit_code"] = host.terminationStatus }
-            archiveALVR("alvr-session.log")
-            event(record["state"] as? String == "error" ? "error" : "stopped", record["message"] as? String ?? "")
+        func cancelled() -> Bool {
+            nativeStopSignal != 0 || getppid() != config.parentPID ||
+                fm.fileExists(atPath: quit.path) || fm.fileExists(atPath: force.path)
         }
-        func cancelled() -> Bool { nativeStopSignal != 0 || getppid() != config.parentPID }
         func startEncoder() throws -> Process {
             var encoderConfig = config
             // The loading scene draws mailbox text at its authored world position.
             encoderConfig.environment.removeValue(forKey: "VERANTYX_GAME_PROMPT_FILE")
+            encoderConfig.environment.removeValue(forKey: "VERANTYX_NATIVE_QUIT_FILE")
             return try start(config.encoder, [], encoderConfig, log: encoderLog)
         }
         func pollEncoder() throws {
@@ -123,6 +123,68 @@ enum NativeSupervisor {
                 event(host == nil ? "waiting" : "reconnecting", "ALVR settings changed; reconnecting")
                 encoder = try startEncoder()
             } else { throw NativeFailure("Encoder exited (\(current.terminationStatus)); see hardware-encoder.log") }
+        }
+        defer {
+            record["host_shutdown"] = host == nil ? "not_started" : "natural"
+            record["stop_reason"] = failure != nil ? "error" : nativeStopSignal != 0 ? "signal" :
+                getppid() != config.parentPID ? "parent_lost" : "game_exit"
+            if let host {
+                if host.isRunning {
+                    let began = ProcessInfo.processInfo.systemUptime
+                    record["quit_requested_at"] = ISO8601DateFormatter().string(from: Date())
+                    record["host_shutdown"] = "requested"
+                    record["quit_timed_out"] = false
+                    do { try NativeQuit.request(in: config.logs) }
+                    catch { record["quit_request_error"] = error.localizedDescription }
+                    event("stopping", "Waiting for the game to close normally")
+                    var timedOut = false, forced = false
+                    while host.isRunning {
+                        let elapsed = ProcessInfo.processInfo.systemUptime - began
+                        var changed = false
+                        for (key, suffix) in [("quit_delivered", ".delivered"), ("quit_acknowledged", ".ack")] {
+                            let value = fm.fileExists(atPath: quit.path + suffix)
+                            if record[key] as? Bool != value { record[key] = value; changed = true }
+                        }
+                        if !timedOut, elapsed >= quitWait {
+                            timedOut = true; changed = true; record["quit_timed_out"] = true
+                        }
+                        if !forced, fm.fileExists(atPath: force.path) || (timedOut && config.allowForceKill == true) {
+                            // Only the process we started, and only with explicit authorization.
+                            if host.isRunning, kill(host.processIdentifier, SIGKILL) == 0 {
+                                forced = true; changed = true; record["host_shutdown"] = "forced"
+                                record["force_source"] = fm.fileExists(atPath: force.path) ? "user_request" : "configuration"
+                            }
+                        }
+                        if changed {
+                            event(timedOut ? "quit_timeout" : "stopping", forced ? "Force stop requested" : timedOut ?
+                                "The game is still closing. Quit in the headset, keep waiting, or choose Force stop." :
+                                "Waiting for the game to close normally")
+                        }
+                        // Keep tracking and the stream available while the game exits.
+                        if let current = encoder, !current.isRunning, current.terminationStatus == 75 {
+                            archiveALVR("alvr-restart-\(restarts).log")
+                            restarts += 1
+                            encoder = restarts <= 30 ? try? startEncoder() : nil
+                        }
+                        usleep(50_000)
+                    }
+                    host.waitUntilExit()
+                    record["quit_wait_seconds_actual"] = ProcessInfo.processInfo.systemUptime - began
+                    record["quit_delivered"] = fm.fileExists(atPath: quit.path + ".delivered")
+                    record["quit_acknowledged"] = fm.fileExists(atPath: quit.path + ".ack")
+                }
+                record["host_exit_code"] = host.terminationStatus
+                record["host_exit_reason"] = host.terminationReason == .uncaughtSignal ? "signal" : "exit"
+            }
+            stopService(encoder)
+            try? fm.removeItem(at: prompt)
+            try? fm.removeItem(at: loading)
+            try? fm.removeItem(at: stage)
+            try? fm.removeItem(atPath: stage.path + ".ready")
+            record["encoder_restarts"] = restarts
+            record["ended_at"] = ISO8601DateFormatter().string(from: Date())
+            archiveALVR("alvr-session.log")
+            event(failure == nil ? "stopped" : "error", failure ?? "")
         }
         do {
             event("waiting", "Open ALVR on the Pico / Quest and connect")

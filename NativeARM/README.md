@@ -166,8 +166,17 @@ when MinGW is missing, only after Git proves those components' sources match.
 The helper creates a fresh frame map and private OpenVR / Linux Steam service
 paths. It waits for advancing ALVR poses, finite frusta for both eyes and IPD,
 then starts the native engine. Encoder exit 75 restarts only that encoder.
-Stop, timeout and loss of the parent app terminate and reap its own children;
-there are no process-name kills in the native supervisor. An existing VR
+Stop, errors and loss of the parent app request normal game exit through
+OpenVR's `VREvent_Quit`. Delivery and `AcknowledgeQuit_Exiting` are recorded in
+`session.json`. The helper waits 60 seconds before showing a slow-quit notice,
+then continues waiting with its session lock, frame map and encoder intact.
+Repeated Stop / SIGINT / SIGTERM do not escalate. **Force stop** is a separate
+explicit action, offered after the timeout; developer session configurations
+can set `quitWaitSeconds` and opt in with `allowForceKill: true`. Missing fields
+retain the safe defaults. The app also waits for native game exit when closing,
+returning to its window if the quit times out. Only after game exit does the
+helper terminate and reap its encoder; there are no process-name kills in the
+native supervisor. An existing VR
 session blocks Play. The host still uses the real Mac Steam client and licence
 checks. The game's menu, audio, controllers and reconnect behaviour on a real
 Pico remain to be checked by the user.
@@ -198,7 +207,10 @@ The C++ suite uses fake Vulkan and synthetic shared memory. Swift checks cover
 ELF / SONAME parsing, source isolation and persistent settings, Steam metadata
 and download paths, PTY output beyond the visible console buffer, synthetic
 Debian extraction, separate app readiness / mode / quality, frame-rate math,
-and fake-process session restart, timeout, cancellation and owned cleanup.
+and fake-process session restart, timeout, cancellation, cooperative/slow quit,
+parent loss, encoder failure, explicit force and owned cleanup. Python checks
+exercise probe cancellation, collection errors, immutable evidence and the
+timeout wrapper using synthetic hosts only.
 No test starts Steam, Alyx, an ALVR server or the real encoder. The host and
 encoder are compiled and linked, and nested ad-hoc signatures are verified.
 The Windows shader-progress, loading/HEVC loopback, encoder-supervisor,
@@ -566,8 +578,21 @@ clone under `runs/`, replacing mutable cfg/save/cache links with private
 directories. Steam identity and ownership checks remain the real client's. It
 refuses an existing game/SteamVR session, starts no encoder, synthesizes head
 turns, samples coherent shared frames, hashes the retained artifacts, and seals
-its result into the common ledger. It terminates only its own process group.
-The private content clone is disposable; results and images are retained.
+its result into the common ledger. At the end of collection, or on SIGINT /
+SIGTERM, it requests normal exit through the same native OpenVR protocol.
+`--quit-timeout 60` sets when a slow quit is reported; the default continues
+waiting without sending the game a signal. `--allow-force-kill` explicitly
+permits SIGKILL of its owned process group after that wait. The developer
+`scripts/run_timeout.sh` uses the same protocol and flags; a command that does
+not implement it must exit on its own unless force was explicitly enabled.
+
+While waiting, the probe retains its overlay/frame map and checkpoints images,
+`frames.json`, `pending.json` and `shutdown.json`. It keeps the held head pose
+live without synthesizing further trigger presses. Final evidence includes
+the shutdown method, delivery/acknowledgement, wait and exit code, and hashes a
+closed log snapshot (`alyx_host-final.log`). Collection and total duration are
+reported separately. The ledger is sealed and the private overlay removed only
+after game exit; results and images are retained.
 
 The train probe `20261029T084136Z-alyx-native-a1_intro_world_2` and quarantine
 probe `20261029T084312Z-alyx-native-a2_quarantine_entrance` complete without early
@@ -911,3 +936,24 @@ Optional `KL_VK_SHADOW_TRACE=1` logs at most 500 depth-attachment rendering
 begins, including load/store operations and suspended/resumed pass flags.
 `KL_VK_SHADOW_TRACE_AFTER` delays that window in seconds. This is disabled by
 default and does not alter the passes or wait for pipelines.
+
+## Follow-up (2026-10-29): cooperative native shutdown
+
+Probe `20261029T135114Z-alyx-native-startup` completes 25 seconds without early
+exit (`o1`). Its `o16` shutdown observation records `VREvent_Quit` delivery and
+acknowledgement, exit code 0, force disabled and a 0.149 s wait. The frozen
+engine log contains `IVRClientCore::Cleanup` and `Source2Shutdown`; there are
+zero fatal diagnostics (`o12`). This verifies normal exit from the startup
+scenario with the native host. It does not establish headset gameplay or
+behaviour during a real save. No baseline or playtest level changed.
+
+The host inside the delivered app, using that app's MoltenVK, is verified by
+`20261029T135835Z-alyx-native-startup`: 25 seconds without early exit (`o1`),
+zero fatal diagnostics (`o12`), delivered/acknowledged quit, exit code 0 and
+a 0.206 s wait with force disabled (`o16`). Its recorded host SHA-256 matches
+the packaged host.
+
+Offline runtime, supervisor, probe, app and sanitizer checks cover the safe
+default and explicit force on synthetic processes. The full VXRuntime check
+still stops at the previously documented x86-to-ARM64 differential failures
+(`cpuid`, `xgetbv`, gather instructions); Windows runtime sources are unchanged.

@@ -691,6 +691,36 @@ static void test_legacy_input(vrrt::PoseSet p) {
     assert(!vrrt_system()->GetControllerState(1, nullptr, sizeof(VRControllerState_t)));
 }
 
+static void test_quit(const char *framePath) {
+    using namespace vr;
+    std::string request = std::string(framePath) + ".quit";
+    setenv("VERANTYX_NATIVE_QUIT_FILE", request.c_str(), 1);
+    VREvent_t event = {};
+    while (vrrt::pop_event(&event)) {}
+    vrrt_system()->AcknowledgeQuit_Exiting();
+    assert(access((request + ".ack").c_str(), F_OK) != 0);
+    { std::ofstream f(request); f << "partial"; }
+    assert(!vrrt::pop_event(&event));
+    for (int i = 0; i < 256; i++) {
+        VREvent_t input = {}; input.eventType = VREvent_ButtonPress;
+        vrrt::push_event(input);
+    }
+    { std::ofstream f(request); f << "quit\n"; }
+    assert(vrrt_system()->PollNextEvent(&event, sizeof event));
+    assert(event.eventType == VREvent_Quit && event.trackedDeviceIndex == k_unTrackedDeviceIndexInvalid);
+    assert(event.data.process.pid == (uint32_t)getpid() && !event.data.process.bForced);
+    assert(access((request + ".delivered").c_str(), F_OK) == 0);
+    assert(access((request + ".ack").c_str(), F_OK) != 0);
+    vrrt_system()->AcknowledgeQuit_Exiting();
+    assert(access((request + ".ack").c_str(), F_OK) == 0);
+    { std::ofstream f(request); f << "quit\n"; }
+    int remaining = 0;
+    while (vrrt::pop_event(&event)) { assert(event.eventType == VREvent_ButtonPress); remaining++; }
+    assert(remaining == 256); // quit is neither dropped nor repeated, and preserves queued input
+    for (const char *suffix : {"", ".ack", ".delivered"}) unlink((request + suffix).c_str());
+    unsetenv("VERANTYX_NATIVE_QUIT_FILE");
+}
+
 int main(int argc, char **argv) {
     assert(argc == 3);
     if (!strcmp(argv[1], "--without-shared")) {
@@ -711,5 +741,6 @@ int main(int argc, char **argv) {
     test_legacy_input(p);
     test_input(argv[2], p); test_mixed_input_sources(p); test_pose_contention(p);
     test_locomotion(argv[2], p); test_loading_prompt(argv[1]); test_pixels(); test_compositor();
-    puts("NativeARM: shared memory, pose contention, mixed hand/gamepad input, locomotion, binding events, loading prompts, skeleton, haptics and compositor tests passed");
+    test_quit(argv[1]);
+    puts("NativeARM: shared memory, pose contention, mixed hand/gamepad input, locomotion, binding events, loading prompts, skeleton, haptics, compositor and cooperative quit tests passed");
 }
