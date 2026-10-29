@@ -647,6 +647,7 @@ static void gen_blocks(const image *im, uint64_t stop) {
         uint64_t end = rip + 1;
         if (xlat_block_linked(&b, rip, 64, &end) < 0) {
             g_failed++; g_failed_unique++;
+            if (getenv("VXRT_AOT_REFUSED")) fprintf(stderr, "refused %#llx\n", (unsigned long long)rip);
             g_bmap[2 * slot + 1] = 0;
             free(b.code); free(b.relocs); free(b.imap);
             continue;

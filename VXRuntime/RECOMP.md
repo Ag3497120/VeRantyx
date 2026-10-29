@@ -67,10 +67,45 @@ Result on 2026-10-29 (M1 Max):
 - Output identical to Rosetta's (`ROSETTA_ADVERTISE_AVX=1`).
 - 0 fallbacks to the translator.
 
+## Stage 2 (Cyberpunk 2077)
+
+- **Parts.** `vxrt-aot gen` splits an image into parts of `VXRT_AOT_PART_MB` (default 96) MB of code, each a dylib
+  `<name>-<hash>.p<k>.dylib` for a range of x86 addresses. A branch to another part's block goes through a veneer
+  that loads the block's host address from a slot; `xa_link` fills the slots once every part is loaded. Each part's
+  lookup hands an address in another part's range to that part's lookup. `make aot-suite` also runs the suite split
+  into 11 parts.
+- **Assembly.** Words are written as `.inst` runs of 8. The lookup table is a symbol, because ADRP to an `L` label
+  becomes section + addend, and Mach-O addends stop at 8 MB. `tools/aot_build.sh <pe> [dir]` generates and assembles
+  the parts in parallel; the objects stay in `build/aot_s`.
+- **Handlers by shape.** A statically linked CRT has no imported handler names. Each unnamed handler takes the kind
+  (C scope table, FH4, FH3) whose parse fits 90% of its functions. FuncInfo4 is read in full: unwind actions, catch
+  funclets, and continuations (RVAs or offsets from the function).
+- **DLL bases.** DLLs prefer 0x180000000, where macOS on arm64 keeps the shared cache, so a module for the preferred
+  base could never be used. With `VXRT_AOT_BASE=<hex>`, `vxrt-aot` maps and relocates the image there. The runtime
+  reads the module's base before it maps the file and reserves that range exactly (`mach_vm_allocate` fixed). A
+  process built for macOS 14 has its address space end near 0x7c0000000.
+
+Cyberpunk2077.exe (2.3, 66.7 MB):
+
+- 2 808 247 blocks and 275 MB of ARM64 code, in 4 parts.
+- Generation takes 15–57 s and 8.3 GB of memory; assembly with 4 jobs takes 5.5 min.
+- 506 blocks were refused by the translator.
+- The dylibs total 730 MB. The imap, 16 bytes per x86 instruction, is 190 MB of that.
+
+## visionOS: what the modules need there
+
+- **No fallback.** Without JIT, every address has to be in a module (`VXRT_AOT_STRICT=1`), or an interpreter has to
+  run what is not.
+- **Loading.** The modules are dylibs found by `dlopen` on a hash-named path. An app links them, or embeds them as
+  signed frameworks. `vxrt_aot_module` would need a unique name per module and a registry.
+- **Address space.** The DLLs' fixed bases and the 0x140000000 exe base have to fit in the app's address space,
+  which may need the extended-virtual-addressing entitlement. `__PAGEZERO` is 4 GB, so images based below 4 GB
+  must be relocated (they are, with `VXRT_AOT_BASE`).
+- **Memory.** The modules' pages are clean and file-backed. The imap is only read on faults, so it could move to a
+  compressed side file.
+
 ## Known limits
 
-- Modules are made for the image's preferred base. A relocated image does not use its module.
-- Branches within a module must stay within ±128 MB. Cyberpunk's executable would exceed this and needs splitting.
-- `__CxxFrameHandler4` continuation addresses are not read. Handlers linked statically, as in Cyberpunk's CRT, are
-  not recognized by name.
 - In the generated code, writes to code pages are not watched (no SMC).
+- `__CxxFrameHandler4` separated code (`isSeparated`) uses another IP-to-state layout, which is not read. Its
+  funclets are still roots.
