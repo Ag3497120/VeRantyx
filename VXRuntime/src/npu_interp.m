@@ -1151,6 +1151,8 @@ static struct {
     double next_content;           // (the game thread's) the content time of the frame it is making now
     double link_ts;                // the display link's time of the refresh being shown (its vsync)
     double rec_content;            // (the content time of the frame being presented, for recordings)
+    double present_at;             // (paced: the vsync a present is scheduled for, presentDrawable:atTime:; 0 at once)
+    double shown_T;                // (paced: the vsync the last present was for)
     double vsync;                  // a refresh's time (the link's), to start frames on the refresh grid
     double dl, d;                  // the latency (content time to ready, p90 of the last 32), D
     float lring[32]; uint32_t nl;
@@ -1595,7 +1597,8 @@ static int race_present(int kind, VXNpuSet *S, int slot, int a, uint32_t d, int 
             }
             if (rec) { fprintf(rec, " %.6f %.6f\n", pt, content); fclose(rec); }
         }];
-        [cb presentDrawable:drawable];
+        if (R.present_at > 0) [cb presentDrawable:drawable atTime:R.present_at];
+        else [cb presentDrawable:drawable];
         [cb commit];
     }
     return 1;
@@ -1772,7 +1775,9 @@ static void race_stats(double now) {
 static void race_tick_paced(double tick) {
     double per = R.period;
     if (R.link_ts > tick - 2 * per && R.link_ts <= tick + 0.001) tick = R.link_ts;   // (the refresh's own time: the grid)
-    double T = tick + per;
+    // (made a refresh ahead and scheduled for its vsync: the warp's work waits behind the game's on the GPU, and a present
+    //  decided a few ms before its vsync missed it about half the time at El Coyote - a refresh late, a judder step)
+    double T = tick + 2 * per;
     R.vsync = tick;
     // (D: the latency envelope and the decision's margin, rounded up to whole refreshes: content times start on the
     //  refresh grid, so a real frame comes due exactly on a refresh and is shown as it is)
@@ -1781,7 +1786,7 @@ static void race_tick_paced(double tick) {
     if (d >= R.d || !R.d) R.d = d;                                 // (up at once; down a refresh at a time, every 0.5 s)
     else if (d < R.d - 0.5 * per && tick - R.d_down > 0.5) { R.d -= per; R.d_down = tick; }
     d = R.d;
-    double tau = T - d, decide = tick + per - R.margin;
+    double tau = T - d, decide = tick + 0.001;
     for (;;) {                                                     // (until the frame due is in, or the decision's time)
         double now = now_s();
         os_unfair_lock_lock(&R.lock);
@@ -1810,7 +1815,7 @@ static void race_tick_paced(double tick) {
         memmove(R.pq_in, R.pq_in + due + 1, n * sizeof *R.pq_in); memmove(R.pq_scene, R.pq_scene + due + 1, n * sizeof *R.pq_scene);
         R.npq = n;
     }
-    if (S && R.b >= 0 && now - R.shown_at >= gap - 0.002) {
+    if (S && R.b >= 0 && T - R.shown_T >= gap - 0.5 * per) {       // (one present per target vsync, whatever the tick's jitter)
         double ival = R.a >= 0 && R.cb - R.ca > 0.002 ? R.cb - R.ca : R.pace_i;
         t = ival > 0 ? (float)((tau - R.cb) / ival) : 0;
         mv = R.mv_ok && (R.scene & bit(R.b)) && !SC.off && !g.race_nomv && g.wc;
@@ -1834,23 +1839,25 @@ static void race_tick_paced(double tick) {
     }
     os_unfair_lock_unlock(&R.lock);
     int done = 0;
+    R.present_at = T - 0.002;
     if (kind >= 0) R.rec_content = R.cb + t * (R.a >= 0 && R.cb - R.ca > 0.002 ? R.cb - R.ca : R.pace_i);
     if (kind == KIND_REAL) {
         if (race_present(KIND_REAL, S, slot, -1, 0, 0, 0, now)) {
-            R.tb = R.shown_at = now; R.shown_t = 0; R.b_shown = 1;
+            R.tb = R.shown_at = now; R.shown_t = 0; R.b_shown = 1; R.shown_T = T;
             R.real++;
         }
     } else if (kind == KIND_RACE) {
         S->RP.t = t;
         if (mv) warp_params(S, slot, a, t);
         if (race_present(KIND_RACE, S, slot, a, d_flow, new_mm, mv, 0)) {
-            R.shown_at = now; R.shown_t = t; R.b_shown = 1;
+            R.shown_at = now; R.shown_t = t; R.b_shown = 1; R.shown_T = T;
             R.gen++;
             if (!fresh) R.stale++;
             if (R.nt < 512) R.ts[R.nt++] = t;
             done = 1;
         }
     }
+    R.present_at = 0;
     pthread_mutex_unlock(&R.present);
     if (done && a >= 0) snapshot(S, (uint32_t)a, 0, (uint32_t)slot);   // (A: the snapshot's first picture)
     race_stats(now_s());
