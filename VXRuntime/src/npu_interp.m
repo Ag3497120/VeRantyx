@@ -249,6 +249,28 @@ static const char *g_npu_msl =
     "    uint mq = min(uint(max(pr, 0.0)), (1u << (32 - e.idx_bits)) - 1);\n"
     "    atomic_fetch_max_explicit(&key[uint(t.y) * e.kw + uint(t.x)], (mq << e.idx_bits) | (g.y * e.kw + g.x + 1), memory_order_relaxed);\n"
     "}\n"
+    // the HUD apart: how much of the final frame F equals the scene before the UI S (FSR2's output), on a 4-pixel grid:
+    // cnt[0] all, [1] within 2/255, [2] within 8/255
+    "kernel void npu_hud_diff(texture2d<float> f [[texture(0)]], texture2d<float> sc [[texture(1)]], device atomic_uint *cnt [[buffer(0)]],\n"
+    "                         uint2 g [[thread_position_in_grid]]) {\n"
+    "    uint2 q = g * 4;\n"
+    "    if (q.x >= f.get_width() || q.y >= f.get_height()) return;\n"
+    "    float3 d = abs(f.read(q).rgb - sc.read(q).rgb);\n"
+    "    float m = max(d.x, max(d.y, d.z));\n"
+    "    atomic_fetch_add_explicit(&cnt[0], 1, memory_order_relaxed);\n"
+    "    if (m <= 2.0 / 255) atomic_fetch_add_explicit(&cnt[1], 1, memory_order_relaxed);\n"
+    "    if (m <= 8.0 / 255) atomic_fetch_add_explicit(&cnt[2], 1, memory_order_relaxed);\n"
+    "}\n"
+    // the predicted scene (warped S) with the latest UI on it, unwarped: the UI is F - S (zero where there is none); a
+    // pixel the UI covers nearly opaquely (a large difference) is F itself
+    "fragment float4 npu_hud_fs(V in [[stage_in]], texture2d<float> wp [[texture(0)]], texture2d<float> f [[texture(1)]],\n"
+    "                           texture2d<float> sc [[texture(2)]]) {\n"
+    "    uint2 p = min(uint2(in.uv * float2(f.get_width(), f.get_height())), uint2(f.get_width(), f.get_height()) - 1);\n"
+    "    float3 fc = f.read(p).rgb, ui = fc - sc.read(p).rgb, w = wp.read(p).rgb;\n"
+    "    float m = max(abs(ui.x), max(abs(ui.y), abs(ui.z)));\n"
+    "    float3 o = m <= 2.0 / 255 ? w : saturate(w + ui);\n"
+    "    return float4(mix(o, fc, smoothstep(0.25, 0.5, m)), 1);\n"
+    "}\n"
     // the depth as R32Float, from a depth texture or a one-channel float one
     "kernel void npu_depth_from_depth(depth2d<float> d [[texture(0)]], texture2d<float, access::write> o [[texture(1)]], uint2 g [[thread_position_in_grid]]) {\n"
     "    if (g.x < o.get_width() && g.y < o.get_height()) o.write(float4(d.read(g)), g);\n"
@@ -344,6 +366,10 @@ static const char *g_npu_msl =
     vxw_params WP;                 // (the warp core's parameters of the prediction shown last; WA: its A)
     int WA;
     int helper;                    // the optical flow's helper started (race: only when no motion vectors come)
+    id<MTLTexture> scol[NSRC];     // the HUD apart: each frame's scene before the UI (FSR2's output), shud[slot] when taken
+    uint8_t shud[NSRC];
+    id<MTLTexture> hwarp;          // (the warped scene, before the UI goes on it)
+    uint32_t hud_n;
     uint32_t ex_prev, ex_dst;
     IOSurfaceRef surfaces[2 * NSRC * MAXT];
     int sock;
@@ -370,7 +396,10 @@ static struct {
     id<MTLDevice> dev;
     id<MTLCommandQueue> queue;     // the display's
     id<MTLRenderPipelineState> real_ps, interp_ps, real_png_ps, interp_png_ps, extrap_ps, extrap_png_ps, race_ps, race_png_ps;
-    id<MTLComputePipelineState> yuv_ps, flow_in_ps, splat_ps, mm_ps, rsplat_ps, resolve_ps, depth_d_ps, depth_c_ps, calib_ps;
+    id<MTLComputePipelineState> yuv_ps, flow_in_ps, splat_ps, mm_ps, rsplat_ps, resolve_ps, depth_d_ps, depth_c_ps, calib_ps, hud_diff_ps;
+    id<MTLRenderPipelineState> hud_ps[2];          // (the HUD's composite: the layer's format, BGRA8 for recordings)
+    volatile int race_hud;         // ("hud" in the switch file: the scene warped without the UI, the UI composited on top)
+    volatile float hud_eq;         // (the share of the final frame equal to FSR2's output, last measured; -1 none)
     vxw_core *wc;                  // race with the game's motion vectors: the warp core (warp_core.m)
     dispatch_queue_t q, init_q, flow_q;
     uint32_t next_slot;            // (the presenting thread's)
@@ -429,16 +458,19 @@ static int switched_on(void) {
                     //  measure what each costs)
                     char opt[32];
                     g.race_noflow = g.race_nowarp = g.race_nomv = 0;
+                    int hud = 0;
                     g.race_real_cap = 0;
                     g.race_fps = g.real_fps;
                     while (fscanf(f, "%31s", opt) == 1) {
                         if (!strcmp(opt, "noflow")) g.race_noflow = 1;
                         else if (!strcmp(opt, "nowarp")) g.race_nowarp = 1;
                         else if (!strcmp(opt, "nomv")) g.race_nomv = 1;  // (the optical flow even where the game's vectors are)
+                        else if (!strcmp(opt, "hud")) hud = 1;           // (the scene warped without the UI: FSR2's output)
                         else if (!strncmp(opt, "real", 4)) g.race_real_cap = (float)atof(opt + 4);   // ("real15": low fps simulated)
                         else if (!strncmp(opt, "fps", 3)) g.race_fps = (float)atof(opt + 3);        // ("fps20": paced, as VXRT_NPU_REAL_FPS)
                         else if (atof(opt) != race_hz(-1)) race_hz((float)atof(opt));
                     }
+                    g.race_hud = hud || (getenv("VXRT_NPU_RACE_HUD") && atoi(getenv("VXRT_NPU_RACE_HUD")));
                 }
                 if (!strcmp(word, "interpolate") && g.interp_ok) mode = NPU_MODE_INTERPOLATE, race = 0;
             }
@@ -668,6 +700,17 @@ static int setup(CAMetalLayer *layer, id<MTLDevice> dev) {
     g.depth_d_ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"npu_depth_from_depth"] error:&err];
     g.depth_c_ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"npu_depth_from_color"] error:&err];
     g.calib_ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"npu_mv_calib"] error:&err];
+    g.hud_diff_ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"npu_hud_diff"] error:&err];
+    {
+        MTLRenderPipelineDescriptor *hd = [MTLRenderPipelineDescriptor new];
+        hd.vertexFunction = [lib newFunctionWithName:@"npu_vs"];
+        hd.fragmentFunction = [lib newFunctionWithName:@"npu_hud_fs"];
+        hd.colorAttachments[0].pixelFormat = layer.pixelFormat;
+        g.hud_ps[0] = [dev newRenderPipelineStateWithDescriptor:hd error:&err];
+        hd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        g.hud_ps[1] = [dev newRenderPipelineStateWithDescriptor:hd error:&err];
+    }
+    g.hud_eq = -1;
     g.flow_in_ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"npu_to_flow"] error:&err];
     g.splat_ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"npu_splat"] error:&err];
     g.yuv_ps = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"npu_to_yuv"] error:&err];
@@ -682,6 +725,33 @@ static int setup(CAMetalLayer *layer, id<MTLDevice> dev) {
 }
 
 static void draw(id<MTLCommandBuffer> cb, id<MTLTexture> target, int kind, VXNpuSet *S, uint32_t slot, int png) {
+    if (kind == KIND_RACE && S->RP.mvmode && g.race_hud && S->shud[slot] && g.hud_eq >= 0.5f && g.hud_ps[png ? 1 : 0]) {
+        // (the HUD apart: the scene before the UI warped alone (no held blocks: nothing guesses where the HUD is), then
+        //  B's UI, unwarped, on it)
+        if (!S->hwarp) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:S->w height:S->h mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            td.storageMode = MTLStorageModePrivate;
+            S->hwarp = [g.dev newTextureWithDescriptor:td];
+        }
+        vxw_params P = S->WP;
+        P.flags &= ~(uint32_t)VXW_STILL;
+        if (S->hwarp && vxw_encode(g.wc, (__bridge void *)cb, &P, (__bridge void *)S->scol[slot], NULL, (__bridge void *)S->smv[slot],
+                                   (__bridge void *)S->sdp[slot], (__bridge void *)S->hwarp)) {
+            MTLRenderPassDescriptor *hp = [MTLRenderPassDescriptor renderPassDescriptor];
+            hp.colorAttachments[0].texture = target;
+            hp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            hp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> he = [cb renderCommandEncoderWithDescriptor:hp];
+            [he setRenderPipelineState:g.hud_ps[png ? 1 : 0]];
+            [he setFragmentTexture:S->hwarp atIndex:0];
+            [he setFragmentTexture:S->copy[slot] atIndex:1];
+            [he setFragmentTexture:S->scol[slot] atIndex:2];
+            [he drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [he endEncoding];
+            return;
+        }
+    }
     if (kind == KIND_RACE && S->RP.mvmode) {                       // (the game's motion vectors: the warp core, S->WP)
         if (vxw_encode(g.wc, (__bridge void *)cb, &S->WP, (__bridge void *)S->copy[slot], S->WA >= 0 ? (__bridge void *)S->copy[S->WA] : NULL,
                        (__bridge void *)S->smv[slot], (__bridge void *)S->sdp[slot], (__bridge void *)target)) return;
@@ -754,10 +824,32 @@ static FILE *record(id<MTLCommandBuffer> cb, int kind, VXNpuSet *S, uint32_t slo
     char raw[1200];
     snprintf(raw, sizeof raw, "%s/f%05u_%ux%u.bgra", dir, k, w, h);
     NSString *rawpath = @(raw);
+    // (a real frame with the game's motion vectors and depth: those too, as they are (render size): fNNNNN_mv_WxH.rg16f
+    //  or .rg32f, fNNNNN_depth_WxH.r32f - the data to train motion extrapolation or inpainting on)
+    id<MTLBuffer> mvb = nil, dpb = nil;
+    NSString *mvpath = nil, *dppath = nil;
+    id<MTLTexture> smv = slot < NSRC ? S->smv[slot] : nil, sdp = slot < NSRC ? S->sdp[slot] : nil;
+    if (kind == KIND_REAL && slot < NSRC && S->scene[slot] && smv && sdp) {
+        uint32_t bpp = smv.pixelFormat == MTLPixelFormatRG32Float ? 8 : 4, mw = (uint32_t)smv.width, mh = (uint32_t)smv.height;
+        mvb = [g.dev newBufferWithLength:(NSUInteger)mw * mh * bpp options:MTLResourceStorageModeShared];
+        dpb = [g.dev newBufferWithLength:(NSUInteger)sdp.width * sdp.height * 4 options:MTLResourceStorageModeShared];
+        if (mvb && dpb) {
+            id<MTLBlitCommandEncoder> b2 = [cb blitCommandEncoder];
+            [b2 copyFromTexture:smv sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(mw, mh, 1)
+                       toBuffer:mvb destinationOffset:0 destinationBytesPerRow:mw * bpp destinationBytesPerImage:(NSUInteger)mw * mh * bpp];
+            [b2 copyFromTexture:sdp sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(sdp.width, sdp.height, 1)
+                       toBuffer:dpb destinationOffset:0 destinationBytesPerRow:sdp.width * 4 destinationBytesPerImage:sdp.width * sdp.height * 4];
+            [b2 endEncoding];
+            mvpath = [NSString stringWithFormat:@"%s/f%05u_mv_%ux%u.%s", dir, k, mw, mh, bpp == 8 ? "rg32f" : "rg16f"];
+            dppath = [NSString stringWithFormat:@"%s/f%05u_depth_%lux%lu.r32f", dir, k, (unsigned long)sdp.width, (unsigned long)sdp.height];
+        }
+    }
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         (void)done;
         FILE *f = fopen(rawpath.UTF8String, "wb");
         if (f) { fwrite(out.contents, 1, out.length, f); fclose(f); }
+        if (mvpath && (f = fopen(mvpath.UTF8String, "wb"))) { fwrite(mvb.contents, 1, mvb.length, f); fclose(f); }
+        if (dppath && (f = fopen(dppath.UTF8String, "wb"))) { fwrite(dpb.contents, 1, dpb.length, f); fclose(f); }
     }];
     snprintf(path, sizeof path, "%s/f%05u.txt", dir, k);
     FILE *f = fopen(path, "w");
@@ -1092,7 +1184,27 @@ static struct {
     int off, told, ctold, prio, ncand;
     uint32_t consts[32];
     int has_consts;
+    __strong id<MTLTexture> col;   // (the HUD apart: FSR2's output, the scene before the UI)
+    uint64_t col_cs;
+    int col_told;
 } SC = { .lock = OS_UNFAIR_LOCK_INIT };
+
+int npu_interp_wants_scene_color(uint32_t *w, uint32_t *h) {
+    VXNpuSet *S = g.set;
+    if (!g.race_hud || !npu_interp_wants_scene() || !S) return 0;
+    *w = S->w; *h = S->h;
+    return 1;
+}
+
+void npu_interp_scene_color(void *texture, uint64_t cs) {
+    id<MTLTexture> t = (__bridge id<MTLTexture>)texture;
+    os_unfair_lock_lock(&SC.lock);
+    SC.col = t; SC.col_cs = cs;
+    int tell = !SC.col_told++;
+    os_unfair_lock_unlock(&SC.lock);
+    if (tell) vx_log("NPU mode (race, hud): the scene before the UI: FSR2's output %lux%lu format %lu from cs %016llx",
+                     (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, (unsigned long long)cs);
+}
 
 int npu_interp_wants_scene(void) {
     static int off = -1;                                           // (VXRT_NPU_RACE_MV=0: the optical flow only)
@@ -1172,13 +1284,51 @@ void npu_interp_scene(void *mv_, void *dp_, uint64_t cs, const uint32_t *consts)
 // (the game thread, in the present's command buffer) this frame's motion vectors and depth into the slot's textures
 static int scene_capture(id<MTLCommandBuffer> cb, VXNpuSet *S, uint32_t slot) {
     os_unfair_lock_lock(&SC.lock);
-    id<MTLTexture> mv = SC.mv, dp = SC.dp;
-    SC.mv = SC.dp = nil;
+    id<MTLTexture> mv = SC.mv, dp = SC.dp, col = SC.col;
+    SC.mv = SC.dp = SC.col = nil;
     SC.prio = -1;
     S->shas_const[slot] = (uint8_t)SC.has_consts;
     memcpy(S->sconst[slot], SC.consts, sizeof SC.consts);
     os_unfair_lock_unlock(&SC.lock);
     S->scene[slot] = 0;
+    S->shud[slot] = 0;
+    if (col && g.race_hud && col.width == S->w && col.height == S->h) {      // (the HUD apart: the scene before the UI)
+        id<MTLTexture> sc = S->scol[slot];
+        if (!sc || sc.pixelFormat != col.pixelFormat) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:col.pixelFormat width:S->w height:S->h mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            sc = S->scol[slot] = [g.dev newTextureWithDescriptor:td];
+        }
+        if (sc) {
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit copyFromTexture:col sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(S->w, S->h, 1)
+                        toTexture:sc destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+            S->shud[slot] = 1;
+            if (S->hud_n++ % 300 == 0) {                           // (every 300 frames: how much of F is S)
+                id<MTLBuffer> cnt = [g.dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+                memset(cnt.contents, 0, 16);
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:g.hud_diff_ps];
+                [enc setTexture:S->copy[slot] atIndex:0];
+                [enc setTexture:sc atIndex:1];
+                [enc setBuffer:cnt offset:0 atIndex:0];
+                [enc dispatchThreads:MTLSizeMake((S->w + 3) / 4, (S->h + 3) / 4, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+                [enc endEncoding];
+                MTLPixelFormat ff = S->copy[slot].pixelFormat, sf = sc.pixelFormat;
+                [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                    (void)done;
+                    const uint32_t *k = cnt.contents;
+                    g.hud_eq = k[0] ? (float)k[1] / k[0] : -1;
+                    vx_log("NPU mode (race, hud): the final frame (format %lu) equals FSR2's output (format %lu) at %.1f%% of %u points "
+                           "(within 2/255; %.1f%% within 8/255): %s", (unsigned long)ff, (unsigned long)sf, 100.0 * g.hud_eq, k[0],
+                           k[0] ? 100.0 * k[2] / k[0] : 0.0, g.hud_eq >= 0.5f ? "the UI is the difference, the scene warped alone" :
+                           "something more than the UI is drawn after FSR2 (post-processing, another colour space): the HUD not apart");
+                }];
+            }
+        }
+    }
     uint32_t disp[2];
     S->fsr[slot] = S->shas_const[slot] && fsr2_parse(S->sconst[slot], &S->fsr_tan[slot], S->fsr_d2v[slot], S->fsr_mvs[slot], disp) &&
                    isfinite(S->fsr_mvs[slot][0]) && isfinite(S->fsr_mvs[slot][1]) && S->fsr_mvs[slot][0] != 0 && S->fsr_mvs[slot][1] != 0;

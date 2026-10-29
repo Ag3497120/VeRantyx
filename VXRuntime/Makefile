@@ -1171,6 +1171,10 @@ xros-check: src/warp_core.m src/warp_core.h
 	  mkdir -p build && xcrun -sdk xros clang -target arm64-apple-xros2.0 -fobjc-arc -Wall -Wextra -Werror -c -o build/warp_core_xros.o src/warp_core.m && \
 	  echo "xros-check: src/warp_core.m builds for visionOS ($$(xcrun --sdk xros --show-sdk-version))"; \
 	else echo "xros-check: no visionOS SDK, skipped"; fi
+	@if xcrun --sdk xrsimulator --show-sdk-path >/dev/null 2>&1; then \
+	  mkdir -p build && xcrun -sdk xrsimulator clang -target arm64-apple-xros2.0-simulator -fobjc-arc -Wall -Wextra -Werror -c -o build/warp_core_xrsim.o src/warp_core.m && \
+	  echo "xros-check: src/warp_core.m builds for the visionOS simulator ($$(xcrun --sdk xrsimulator --show-sdk-version))"; \
+	else echo "xros-check: no visionOS simulator SDK, skipped"; fi
 .PHONY: xros-check
 
 build/aes_gcm_test: src/aes_gcm.c src/aes_gcm.h tests/aes_gcm.c

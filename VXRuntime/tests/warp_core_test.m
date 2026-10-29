@@ -166,6 +166,7 @@ static int want_mv(int x, int y, float *sx, float *sy, float *layer, void *ctx_)
 }
 // T4: the right eye, S 8 px, screen plane at z 10: the background 3.2 px right, the square 3.2 left (clamped pop-out)
 static int want_eye(int x, int y, float *sx, float *sy, float *layer, void *ctx) {
+    (void)ctx;
     float X = x + 0.5f, Y = y + 0.5f;
     float bg = 0.5f * 8 * (1 - 10.0f / ZBG), fg = 0.5f * fmaxf(8 * (1 - 10.0f / ZFG), -2 * 0.4f * 8);
     int on = in_square(X - fg, Y, 0);
@@ -185,6 +186,67 @@ static int want_hud(int x, int y, float *sx, float *sy, float *layer, void *ctx)
     if (in_square(sxx + 3, Y, 0) != in_square(sxx - 3, Y, 0) || in_square(sxx, Y + 3, 0) != in_square(sxx, Y - 3, 0)) return 0;
     *sx = sxx; *sy = Y; *layer = -1;
     return sxx > 2;
+}
+
+// T6: an eye as CompositorServices gives it: its own texture size (OW x OH), an asymmetric frustum, no motion, and the
+// depth out (dst_near / distance); colour through compute and depth R32Float, then a render pass with Depth32Float
+enum { OW = 240, OH = 200 };
+static const float DT[4] = { 0.7f, 0.9f, 0.5f, 0.4f }, DNEAR = 0.05f;
+static void eye_src(int x, int y, float *sx, float *sy, const vxw_params *p) {
+    float rx = -DT[0] + (x + 0.5f) / OW * (DT[0] + DT[1]), ry = DT[2] - (y + 0.5f) / OH * (DT[2] + DT[3]);
+    *sx = (rx / p->tan_x + 1) * 0.5f * W; *sy = (1 - ry / p->tan_y) * 0.5f * H;
+}
+static void eye_test(vxw_core *c, int render) {
+    vxw_params p = base();
+    p.flags = VXW_POSE;
+    memcpy(p.dst_tan, DT, sizeof DT);
+    p.dst_near = DNEAR;
+    id<MTLTexture> out = tex(MTLPixelFormatRGBA32Float, OW, OH, NULL, 16), od;
+    if (render) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:OW height:OH mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        od = [dev newTextureWithDescriptor:td];
+    } else od = tex(MTLPixelFormatR32Float, OW, OH, NULL, 4);
+    id<MTLBuffer> db = [dev newBufferWithLength:OW * OH * 4 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    if (!vxw_encode_eye(c, (__bridge void *)cb, &p, (__bridge void *)B, NULL, (__bridge void *)MV, (__bridge void *)DEPTH,
+                        (__bridge void *)out, (__bridge void *)od)) { printf("FAIL: eye: nothing encoded\n"); failures++; return; }
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    [bl copyFromTexture:od sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(OW, OH, 1)
+               toBuffer:db destinationOffset:0 destinationBytesPerRow:OW * 4 destinationBytesPerImage:OW * OH * 4];
+    [bl endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    float *o = malloc(OW * OH * 16);
+    [out getBytes:o bytesPerRow:OW * 16 fromRegion:MTLRegionMake2D(0, 0, OW, OH) mipmapLevel:0];
+    const float *d = db.contents;
+    int n = 0, bad = 0, nd = 0, badd = 0, black = 0;
+    float worst = 0;
+    for (int y = 0; y < OH; y++)
+        for (int x = 0; x < OW; x++) {
+            const float *q = o + 4 * (y * OW + x);
+            if (!(q[3] > 0.5f) || !isfinite(q[0])) { black++; continue; }
+            float sx, sy;
+            eye_src(x, y, &sx, &sy, &p);
+            int sq = in_square(sx, sy, 0);
+            if (in_square(sx + 3, sy, 0) != sq || in_square(sx - 3, sy, 0) != sq || in_square(sx, sy + 3, 0) != sq ||
+                in_square(sx, sy - 3, 0) != sq || sx < 3 || sx > W - 3 || sy < 3 || sy > H - 3) continue;
+            float e = hypotf(q[0] * W - sx, q[1] * H - sy);
+            n++;
+            if (e > 1.5f) bad++;
+            if (e > worst) worst = e;
+            float want = DNEAR / (sq ? ZFG : ZBG);
+            nd++;
+            if (fabsf(d[y * OW + x] - want) > 0.02f * want) badd++;
+        }
+    // (equal-depth blocks landing on one output block: the higher index wins, a neighbour's displacement - a few
+    //  pixels at most, 1-2 B pixels off; none further)
+    int ok = n > 1000 && bad * 1000 <= n && worst < 3.5f && badd == 0 && black == 0;
+    printf("%s eye %dx%d, asymmetric frustum, depth out (%s): %d pixels: %d off by > 1.5 px (worst %.2f); depth %d of %d wrong; "
+           "black %d\n", ok ? "ok  " : "FAIL", OW, OH, render ? "render pass, Depth32Float" : "compute, R32Float", n, bad, worst, badd, nd, black);
+    if (!ok) failures++;
+    free(o);
 }
 
 static void bench(vxw_core *c, uint32_t w, uint32_t h, int n, int eyes) {
@@ -284,6 +346,9 @@ int main(int argc, char **argv) {
             check(name, o, want_hud, &tt, 0.35f, 1.0f, 1);
             free(o);
         }
+        scene(6, 0, 0);
+        eye_test(c, 0);
+        eye_test(c, 1);
         bench(c, 1920, 1080, 50, 1);
         bench(c, 1920, 1080, 50, 2);
         vxw_destroy(c);

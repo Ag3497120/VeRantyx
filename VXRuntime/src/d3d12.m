@@ -9132,11 +9132,32 @@ static void npu_scene_note12(dev12 *d, const pso12 *p, root_binding *rb, heap12 
         if (f == MTLPixelFormatRG16Float || f == MTLPixelFormatRG16Snorm || f == MTLPixelFormatRG32Float) { if (!mv) mv = t; }
         else if (f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatR32Float) { if (!dp) dp = t; }
     }
+    static uint32_t mw, mh;                                        // (the motion vectors' size: FSR2's render size)
     if (mv && dp && mv.width == dp.width && mv.height == dp.height) {
         uint32_t consts[32];
         int have = npu_scene_consts12(d, rb, heap, (uint32_t)mv.width, (uint32_t)mv.height, consts);
         npu_interp_scene((__bridge void *)mv, (__bridge void *)dp, p ? p->cs_code : 0, have ? consts : NULL);
+        mw = (uint32_t)mv.width; mh = (uint32_t)mv.height;
+        return;
     }
+    // (the HUD apart: FSR2's output, the upscaled scene before the UI - a colour texture of the window's size written by
+    //  a dispatch with FSR2's constants; the last of a frame is its final pass's)
+    uint32_t ww, wh;
+    if (!mw || !npu_interp_wants_scene_color(&ww, &wh)) return;
+    id<MTLTexture> out = nil;
+    for (uint32_t i = 0; i < n && !out; i++) {
+        if (!(a[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
+        id obj = (__bridge id)gpu_ir_backend_object(a[i].resource);
+        if (![obj conformsToProtocol:@protocol(MTLTexture)]) continue;
+        id<MTLTexture> t = obj;
+        MTLPixelFormat f = t.pixelFormat;
+        if (t.textureType == MTLTextureType2D && t.width == ww && t.height == wh && t.sampleCount == 1 &&
+            (f == MTLPixelFormatRGBA16Float || f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatRGB10A2Unorm ||
+             f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatRGBA32Float || f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm_sRGB))
+            out = t;
+    }
+    uint32_t consts[32];
+    if (out && npu_scene_consts12(d, rb, heap, mw, mh, consts)) npu_interp_scene_color((__bridge void *)out, p ? p->cs_code : 0);
 }
 
 // ---- VXRT_D3D12_GPU_PROFILE=<folder>: one frame's encoders timed on the GPU ---------------------------------------

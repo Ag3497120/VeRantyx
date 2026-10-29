@@ -5,14 +5,17 @@
 #include <string.h>
 #include "warp_core.h"
 
-// (struct W: vxw_params, then the block grid and the key's index bits)
-typedef struct { vxw_params p; uint32_t kw, kh, bits, pad; } vxw_gpu_params;
+// (struct W: vxw_params, then the output's size, B's block grid (the map), the output's block grid (the keys) and the
+//  key's index bits)
+typedef struct { vxw_params p; uint32_t ow, oh, mw, mh, kw, kh, bits, flags2; } vxw_gpu_params;
+enum { VXW2_DEPTH_OUT = 1 };
 
 static const char *g_vxw_msl =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "struct W { uint w, h, flags; float t, sx, sy, tx, ty, za, zb; float rot[9]; float pos[3];\n"
-    "           float eye, S, pop, zc, conv, thr; uint kw, kh, bits, pad; };\n"
+    "           float eye, S, pop, zc, conv, thr; float dt[4]; float dnear;\n"
+    "           uint ow, oh, mw, mh, kw, kh, bits, flags2; };\n"
     // the distance of a depth value (FSR2: view depth = z_a / (d - z_b), its sign the view space's handedness)
     "static float vxw_dist(float d, constant W &p) {\n"
     "    if (p.flags & 16) d = 1 - d;\n"
@@ -25,10 +28,10 @@ static const char *g_vxw_msl =
     "                    texture2d<float> dp [[texture(3)]], texture2d<float, access::write> map [[texture(4)]],\n"
     "                    device atomic_uint *key [[buffer(0)]], constant W &p [[buffer(1)]], device const float *st [[buffer(2)]],\n"
     "                    device atomic_uint *mx [[buffer(3)]], uint2 g [[thread_position_in_grid]]) {\n"
-    "    if (g.x >= p.kw || g.y >= p.kh) return;\n"
+    "    if (g.x >= p.mw || g.y >= p.mh) return;\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
     "    int2 hi = int2(p.w, p.h) - 1, p0 = int2(g) * 2;\n"
-    "    float2 sz = float2(p.w, p.h), pc = float2(p0) + 1, uv = pc / sz;\n"
+    "    float2 sz = float2(p.w, p.h), osz = float2(p.ow, p.oh), pc = float2(p0) + 1, uv = pc / sz;\n"
     "    float2 m = -mv.read(vxw_at(uv, uint2(mv.get_width(), mv.get_height()))).xy * float2(p.sx, p.sy);\n"
     "    if (!all(isfinite(m)) || length(m) > 0.5f * max(sz.x, sz.y)) m = 0;\n"
     // (no motion of its own where A and B are the same around the block, or where B matches A unmoved clearly better
@@ -53,23 +56,26 @@ static const char *g_vxw_msl =
     "        if (still) m = 0;\n"
     "    }\n"
     "    float z = vxw_dist(dp.read(vxw_at(uv, uint2(dp.get_width(), dp.get_height()))).r, p);\n"
-    "    float2 q = pc + p.t * m;\n"
+    // (q: where it lands, in output pixels; the target's frustum: dt (left, right, up, down tangents) or B's own)
+    "    float2 q = (pc + p.t * m) * osz / sz;\n"
     "    if (p.flags & 1) {\n"                                      // (the pose: unprojected, moved, projected)
-    "        float2 ndc = float2(q.x / sz.x * 2 - 1, 1 - q.y / sz.y * 2);\n"
+    "        float2 qb = pc + p.t * m;\n"
+    "        float2 ndc = float2(qb.x / sz.x * 2 - 1, 1 - qb.y / sz.y * 2);\n"
     "        float zz = min(z, 1e6f);\n"
     "        float3 X = float3(ndc.x * p.tx * zz, ndc.y * p.ty * zz, zz);\n"
     "        float3 Y = float3(p.rot[0] * X.x + p.rot[1] * X.y + p.rot[2] * X.z + p.pos[0],\n"
     "                          p.rot[3] * X.x + p.rot[4] * X.y + p.rot[5] * X.z + p.pos[1],\n"
     "                          p.rot[6] * X.x + p.rot[7] * X.y + p.rot[8] * X.z + p.pos[2]);\n"
     "        if (Y.z <= 1e-5f) { map.write(float4(0, 0, z, 0), g); return; }\n"   // (behind the new view: lands nowhere)
-    "        q = float2((Y.x / (Y.z * p.tx) + 1) * 0.5f * sz.x, (1 - Y.y / (Y.z * p.ty)) * 0.5f * sz.y);\n"
+    "        float4 f = p.dt[0] + p.dt[1] > 0 ? float4(p.dt[0], p.dt[1], p.dt[2], p.dt[3]) : float4(p.tx, p.tx, p.ty, p.ty);\n"
+    "        q = float2((Y.x / Y.z + f.x) / (f.x + f.y) * osz.x, (f.z - Y.y / Y.z) / (f.z + f.w) * osz.y);\n"
     "        if (z < 1e6f) z = Y.z;\n"
     "    }\n"
     "    if (p.flags & 2) {\n"                                      // (the eye: stereo.m's disparity, linear in inverse depth)
     "        float iv = p.za / z, ic = (p.flags & 8) ? max(st[0] / ((1 + p.pop) * p.conv), 1e-7f) : p.za / max(p.zc, 1e-6f);\n"
-    "        q.x += p.eye * clamp(p.S * (1 - iv / ic), -2 * p.pop * p.S, p.S);\n"
+    "        q.x += p.eye * clamp(p.S * (1 - iv / ic), -2 * p.pop * p.S, p.S) * osz.x / sz.x;\n"
     "    }\n"
-    "    map.write(float4(q - pc, z, 1), g);\n"
+    "    map.write(float4(q * sz / osz - pc, z, 1), g);\n"     // (the displacement in B's pixels)
     "    atomic_fetch_max_explicit(mx, uint(min(length(m), 4095.0f) * 16), memory_order_relaxed);\n"
     "    int2 tb = int2(floor(q * 0.5f));\n"
     "    if (any(tb < 0) || tb.x >= int(p.kw) || tb.y >= int(p.kh)) return;\n"
@@ -78,7 +84,7 @@ static const char *g_vxw_msl =
     "    float pr = clamp((log2(1 / z) + 40) * (top / 64), 0.0f, top - 1);\n"
     // (flat, an overlay is in front of everything: nothing moving covers the HUD)
     "    if (still && !(p.flags & 3)) pr = top;\n"
-    "    atomic_fetch_max_explicit(&key[uint(tb.y) * p.kw + uint(tb.x)], (uint(pr) << p.bits) | (g.y * p.kw + g.x + 1), memory_order_relaxed);\n"
+    "    atomic_fetch_max_explicit(&key[uint(tb.y) * p.kw + uint(tb.x)], (uint(pr) << p.bits) | (g.y * p.mw + g.x + 1), memory_order_relaxed);\n"
     "}\n"
     // 2: each output block's displacement: the block that won it, or (a hole) the farthest landed in the nearest ring
     "kernel void vxw_resolve(texture2d<float> map [[texture(0)]], texture2d<float, access::write> disp [[texture(1)]],\n"
@@ -97,26 +103,32 @@ static const char *g_vxw_msl =
     "            }\n"
     "        k = best == 0xffffffffu ? 0 : best;\n"
     "    }\n"
-    "    uint2 src = k ? uint2(((k & mask) - 1) % p.kw, ((k & mask) - 1) / p.kw) : g;\n"
+    "    float2 r = float2(p.w, p.h) / float2(p.ow, p.oh), gc = (float2(g) * 2 + 1) * r;\n"   // (the block's centre in B)
+    "    uint2 own = min(uint2(gc * 0.5f), uint2(p.mw, p.mh) - 1);\n"
+    "    uint2 src = k ? uint2(((k & mask) - 1) % p.mw, ((k & mask) - 1) / p.mw) : own;\n"
     "    float4 v = map.read(src);\n"
     "    float2 dsp = v.w > 0 && all(isfinite(v.xy)) ? v.xy : float2(0);\n"
     // (a hole: the background's displacement, unless B there shows something nearer - what moved away and uncovered
     //  it, which would show twice: then the background block's own pixels, stretched over the hole, as stereo.m's gaps)
     "    if (k && !key[g.y * p.kw + g.x]) {\n"
-    "        float2 gc = float2(g) * 2 + 1, sc = gc - dsp;\n"
-    "        uint2 sb = uint2(clamp(int2(floor(sc * 0.5f)), int2(0), int2(p.kw, p.kh) - 1));\n"
+    "        float2 sc = gc - dsp;\n"
+    "        uint2 sb = uint2(clamp(int2(floor(sc * 0.5f)), int2(0), int2(p.mw, p.mh) - 1));\n"
     "        float4 o = map.read(sb);\n"
     "        if (o.z < 0.9f * v.z) dsp = gc - (float2(src) * 2 + 1);\n"
     "    }\n"
-    "    disp.write(float4(dsp, 0, 0), g);\n"
+    "    disp.write(float4(dsp, isfinite(v.z) ? v.z : 1e30f, 0), g);\n"   // (z: the distance there, for the depth out)
     "}\n"
     // 3: each output pixel: B sampled its block's displacement back
+    // (the depth out: reversed infinite, dnear / distance; dnear 0: B's own depth value moved with it)
+    "static float vxw_out_depth(float z, constant W &p) { return p.dnear > 0 ? saturate(p.dnear / z) : (p.za / z + p.zb); }\n"
     "kernel void vxw_gather(texture2d<float> b [[texture(0)]], texture2d<float> disp [[texture(1)]], texture2d<float, access::write> o [[texture(2)]],\n"
-    "                       constant W &p [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {\n"
-    "    if (g.x >= p.w || g.y >= p.h) return;\n"
+    "                       texture2d<float, access::write> od [[texture(3)]], constant W &p [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {\n"
+    "    if (g.x >= p.ow || g.y >= p.oh) return;\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
-    "    float2 v = disp.read(min(g / 2, uint2(p.kw, p.kh) - 1)).xy;\n"
-    "    o.write(float4(b.sample(s, (float2(g) + 0.5f - v) / float2(p.w, p.h), level(0)).rgb, 1), g);\n"
+    "    float4 v = disp.read(min(g / 2, uint2(p.kw, p.kh) - 1));\n"
+    "    float2 pb = (float2(g) + 0.5f) * float2(p.w, p.h) / float2(p.ow, p.oh);\n"
+    "    o.write(float4(b.sample(s, (pb - v.xy) / float2(p.w, p.h), level(0)).rgb, 1), g);\n"
+    "    if (p.flags2 & 1) od.write(float4(vxw_out_depth(v.z, p)), g);\n"
     "}\n"
     "struct VO { float4 pos [[position]]; float2 uv; };\n"
     "vertex VO vxw_vs(uint id [[vertex_id]]) {\n"
@@ -126,9 +138,18 @@ static const char *g_vxw_msl =
     "fragment float4 vxw_gather_fs(VO in [[stage_in]], texture2d<float> b [[texture(0)]], texture2d<float> disp [[texture(1)]],\n"
     "                              constant W &p [[buffer(1)]]) {\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
-    "    uint2 g = min(uint2(in.uv * float2(p.w, p.h)), uint2(p.w, p.h) - 1);\n"
+    "    uint2 g = min(uint2(in.uv * float2(p.ow, p.oh)), uint2(p.ow, p.oh) - 1);\n"
     "    float2 v = disp.read(min(g / 2, uint2(p.kw, p.kh) - 1)).xy;\n"
     "    return float4(b.sample(s, in.uv - v / float2(p.w, p.h)).rgb, 1);\n"
+    "}\n"
+    // (with a depth attachment: the depth out as the fragment's depth)
+    "struct FD { float4 c [[color(0)]]; float d [[depth(any)]]; };\n"
+    "fragment FD vxw_gather_depth_fs(VO in [[stage_in]], texture2d<float> b [[texture(0)]], texture2d<float> disp [[texture(1)]],\n"
+    "                                constant W &p [[buffer(1)]]) {\n"
+    "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+    "    uint2 g = min(uint2(in.uv * float2(p.ow, p.oh)), uint2(p.ow, p.oh) - 1);\n"
+    "    float4 v = disp.read(min(g / 2, uint2(p.kw, p.kh) - 1));\n"
+    "    FD o; o.c = float4(b.sample(s, in.uv - v.xy / float2(p.w, p.h)).rgb, 1); o.d = vxw_out_depth(v.z, p); return o;\n"
     "}\n"
     // the stereo screen plane: the pct-th of 16x16 samples of inverse depth (z_a / z), smoothed in st[0]; st[1] this frame's
     "kernel void vxw_conv(texture2d<float> dp [[texture(0)]], constant W &p [[buffer(1)]], device float *st [[buffer(2)]],\n"
@@ -157,12 +178,14 @@ static const char *g_vxw_msl =
 struct vxw_core {
     __strong id<MTLDevice> dev;
     __strong id<MTLComputePipelineState> map, resolve, gather, conv;
-    __strong id<MTLFunction> vs, fs;
+    __strong id<MTLFunction> vs, fs, fsd;
     __strong id<MTLRenderPipelineState> draw[4];
-    MTLPixelFormat draw_fmt[4];
+    MTLPixelFormat draw_fmt[4][2];
+    __strong id<MTLDepthStencilState> dss;
     __strong id<MTLLibrary> lib;
-    // per frame size
-    uint32_t w, h, kw, kh, bits;
+    __strong id<MTLTexture> dummy;     // (the depth out's binding when there is none)
+    // per frame size (B's: the map) and output size (the keys, the displacements)
+    uint32_t w, h, ow, oh, mw, mh, kw, kh, bits;
     __strong id<MTLTexture> mapt, disp;
     __strong id<MTLBuffer> keys, mx, state;
     _Atomic float last_motion;
@@ -184,8 +207,17 @@ vxw_core *vxw_create(void *mtl_device) {
     c->conv = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"vxw_conv"] error:&err];
     c->vs = [lib newFunctionWithName:@"vxw_vs"];
     c->fs = [lib newFunctionWithName:@"vxw_gather_fs"];
+    c->fsd = [lib newFunctionWithName:@"vxw_gather_depth_fs"];
     c->state = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
-    if (!c->map || !c->resolve || !c->gather || !c->conv || !c->vs || !c->fs || !c->state) {
+    MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+    dd.depthCompareFunction = MTLCompareFunctionAlways;
+    dd.depthWriteEnabled = YES;
+    c->dss = [dev newDepthStencilStateWithDescriptor:dd];
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:1 height:1 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderWrite;
+    td.storageMode = MTLStorageModePrivate;
+    c->dummy = [dev newTextureWithDescriptor:td];
+    if (!c->map || !c->resolve || !c->gather || !c->conv || !c->vs || !c->fs || !c->fsd || !c->state || !c->dss || !c->dummy) {
         NSLog(@"vxw: pipelines: %@", err.localizedDescription);
         vxw_destroy(c);
         return NULL;
@@ -197,57 +229,69 @@ vxw_core *vxw_create(void *mtl_device) {
 
 void vxw_destroy(vxw_core *c) {
     if (!c) return;
-    c->dev = nil; c->lib = nil; c->map = c->resolve = c->gather = c->conv = nil; c->vs = c->fs = nil;
+    c->dev = nil; c->lib = nil; c->map = c->resolve = c->gather = c->conv = nil; c->vs = c->fs = c->fsd = nil;
     for (int k = 0; k < 4; k++) c->draw[k] = nil;
+    c->dss = nil; c->dummy = nil;
     c->mapt = c->disp = nil; c->keys = c->mx = c->state = nil;
     free(c);
 }
 
-static int sized(vxw_core *c, uint32_t w, uint32_t h) {
-    if (c->w == w && c->h == h && c->keys) return 1;
-    uint32_t kw = (w + 1) / 2, kh = (h + 1) / 2, bits = 1;
-    while (bits < 26 && (1u << bits) <= kw * kh) bits++;
-    if ((1u << bits) <= kw * kh) return 0;
-    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:kw height:kh mipmapped:NO];
+static int sized(vxw_core *c, uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
+    if (c->w == w && c->h == h && c->ow == ow && c->oh == oh && c->keys) return 1;
+    uint32_t mw = (w + 1) / 2, mh = (h + 1) / 2, kw = (ow + 1) / 2, kh = (oh + 1) / 2, bits = 1;
+    while (bits < 26 && (1u << bits) <= mw * mh) bits++;
+    if ((1u << bits) <= mw * mh || kw * kh == 0) return 0;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:mw height:mh mipmapped:NO];
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     td.storageMode = MTLStorageModePrivate;
     c->mapt = [c->dev newTextureWithDescriptor:td];
-    td.pixelFormat = MTLPixelFormatRG32Float;
+    td.width = kw; td.height = kh;
     c->disp = [c->dev newTextureWithDescriptor:td];
     c->keys = [c->dev newBufferWithLength:(NSUInteger)kw * kh * 4 options:MTLResourceStorageModePrivate];
     c->mx = [c->dev newBufferWithLength:4 options:MTLResourceStorageModeShared];
     if (!c->mapt || !c->disp || !c->keys || !c->mx) { c->keys = nil; return 0; }
-    c->w = w; c->h = h; c->kw = kw; c->kh = kh; c->bits = bits;
+    c->w = w; c->h = h; c->ow = ow; c->oh = oh; c->mw = mw; c->mh = mh; c->kw = kw; c->kh = kh; c->bits = bits;
     return 1;
 }
 
-static id<MTLRenderPipelineState> draw_pipeline(vxw_core *c, MTLPixelFormat f) {
-    for (int k = 0; k < 4; k++) if (c->draw[k] && c->draw_fmt[k] == f) return c->draw[k];
+static id<MTLRenderPipelineState> draw_pipeline(vxw_core *c, MTLPixelFormat f, MTLPixelFormat df) {
+    for (int k = 0; k < 4; k++) if (c->draw[k] && c->draw_fmt[k][0] == f && c->draw_fmt[k][1] == df) return c->draw[k];
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     pd.vertexFunction = c->vs;
-    pd.fragmentFunction = c->fs;
+    pd.fragmentFunction = df != MTLPixelFormatInvalid ? c->fsd : c->fs;
     pd.colorAttachments[0].pixelFormat = f;
+    pd.depthAttachmentPixelFormat = df;
     NSError *err = nil;
     id<MTLRenderPipelineState> ps = [c->dev newRenderPipelineStateWithDescriptor:pd error:&err];
     if (!ps) return nil;
     int slot = 0;
     for (int k = 0; k < 4; k++) if (!c->draw[k]) { slot = k; break; }
-    c->draw[slot] = ps; c->draw_fmt[slot] = f;
+    c->draw[slot] = ps; c->draw_fmt[slot][0] = f; c->draw_fmt[slot][1] = df;
     return ps;
 }
 
 int vxw_encode(vxw_core *c, void *command_buffer, const vxw_params *p, void *b_, void *a_, void *mv_, void *depth_, void *out_) {
+    return vxw_encode_eye(c, command_buffer, p, b_, a_, mv_, depth_, out_, NULL);
+}
+
+int vxw_encode_eye(vxw_core *c, void *command_buffer, const vxw_params *p, void *b_, void *a_, void *mv_, void *depth_, void *out_,
+                   void *out_depth_) {
     id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)command_buffer;
     id<MTLTexture> b = (__bridge id<MTLTexture>)b_, a = (__bridge id<MTLTexture>)a_, mv = (__bridge id<MTLTexture>)mv_,
-                   depth = (__bridge id<MTLTexture>)depth_, out = (__bridge id<MTLTexture>)out_;
-    if (!c || !cb || !p || !b || !mv || !depth || !out || !p->w || !p->h || !sized(c, p->w, p->h)) return 0;
-    vxw_gpu_params P = { *p, c->kw, c->kh, c->bits, 0 };
+                   depth = (__bridge id<MTLTexture>)depth_, out = (__bridge id<MTLTexture>)out_, od = (__bridge id<MTLTexture>)out_depth_;
+    if (!c || !cb || !p || !b || !mv || !depth || !out || !p->w || !p->h) return 0;
+    uint32_t ow = (uint32_t)out.width, oh = (uint32_t)out.height;
+    if (od && (od.width != ow || od.height != oh)) return 0;
+    if (!sized(c, p->w, p->h, ow, oh)) return 0;
+    MTLPixelFormat df = od ? od.pixelFormat : MTLPixelFormatInvalid;
+    int od_depth = df == MTLPixelFormatDepth32Float || df == MTLPixelFormatDepth16Unorm || df == MTLPixelFormatDepth32Float_Stencil8;
+    vxw_gpu_params P = { *p, ow, oh, c->mw, c->mh, c->kw, c->kh, c->bits, od ? VXW2_DEPTH_OUT : 0 };
     if (!a) { a = b; P.p.flags &= ~(uint32_t)VXW_STILL; }
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
     [blit fillBuffer:c->keys range:NSMakeRange(0, c->keys.length) value:0];
     [blit fillBuffer:c->mx range:NSMakeRange(0, 4) value:0];
     [blit endEncoding];
-    MTLSize blocks = MTLSizeMake(c->kw, c->kh, 1), tg = MTLSizeMake(16, 16, 1);
+    MTLSize tg = MTLSizeMake(16, 16, 1);
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:c->map];
     [enc setTexture:b atIndex:0];
@@ -259,7 +303,7 @@ int vxw_encode(vxw_core *c, void *command_buffer, const vxw_params *p, void *b_,
     [enc setBytes:&P length:sizeof P atIndex:1];
     [enc setBuffer:c->state offset:0 atIndex:2];
     [enc setBuffer:c->mx offset:0 atIndex:3];
-    [enc dispatchThreads:blocks threadsPerThreadgroup:tg];
+    [enc dispatchThreads:MTLSizeMake(c->mw, c->mh, 1) threadsPerThreadgroup:tg];
     [enc endEncoding];
     enc = [cb computeCommandEncoder];                              // (after the map's atomics)
     [enc setComputePipelineState:c->resolve];
@@ -267,25 +311,33 @@ int vxw_encode(vxw_core *c, void *command_buffer, const vxw_params *p, void *b_,
     [enc setTexture:c->disp atIndex:1];
     [enc setBuffer:c->keys offset:0 atIndex:0];
     [enc setBytes:&P length:sizeof P atIndex:1];
-    [enc dispatchThreads:blocks threadsPerThreadgroup:tg];
-    if (out.usage & MTLTextureUsageShaderWrite) {
+    [enc dispatchThreads:MTLSizeMake(c->kw, c->kh, 1) threadsPerThreadgroup:tg];
+    if ((out.usage & MTLTextureUsageShaderWrite) && (!od || (!od_depth && (od.usage & MTLTextureUsageShaderWrite)))) {
         [enc memoryBarrierWithScope:MTLBarrierScopeTextures];
         [enc setComputePipelineState:c->gather];
         [enc setTexture:b atIndex:0];
         [enc setTexture:c->disp atIndex:1];
         [enc setTexture:out atIndex:2];
-        [enc dispatchThreads:MTLSizeMake(p->w, p->h, 1) threadsPerThreadgroup:tg];
+        [enc setTexture:od ? od : c->dummy atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(ow, oh, 1) threadsPerThreadgroup:tg];
         [enc endEncoding];
     } else {
         [enc endEncoding];
-        id<MTLRenderPipelineState> ps = draw_pipeline(c, out.pixelFormat);
+        if (od && !od_depth) return 0;                             // (a colour depth-out needs shader writes)
+        id<MTLRenderPipelineState> ps = draw_pipeline(c, out.pixelFormat, od ? df : MTLPixelFormatInvalid);
         if (!ps) return 0;
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = out;
         rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (od) {
+            rp.depthAttachment.texture = od;
+            rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+            rp.depthAttachment.storeAction = MTLStoreActionStore;
+        }
         id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
         [re setRenderPipelineState:ps];
+        if (od) [re setDepthStencilState:c->dss];
         [re setFragmentTexture:b atIndex:0];
         [re setFragmentTexture:c->disp atIndex:1];
         [re setFragmentBytes:&P length:sizeof P atIndex:1];
@@ -305,7 +357,7 @@ void vxw_encode_conv(vxw_core *c, void *command_buffer, const vxw_params *p, voi
     id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)command_buffer;
     id<MTLTexture> depth = (__bridge id<MTLTexture>)depth_;
     if (!c || !cb || !p || !depth) return;
-    vxw_gpu_params P = { *p, c->kw, c->kh, c->bits, 0 };
+    vxw_gpu_params P = { *p, c->ow, c->oh, c->mw, c->mh, c->kw, c->kh, c->bits, 0 };
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:c->conv];
     [enc setTexture:depth atIndex:0];

@@ -15,4 +15,19 @@ void npu_interp_frame(void *layer, void *command_buffer, void *texture, uint32_t
 // the dispatch that reads both, its upscaler's, with npu_interp_scene: MTLTextures, each frame)
 int npu_interp_wants_scene(void);
 // consts: the dispatch's FSR2 constants (32 words: render size, max render size, display size, ...), or NULL
+//
+// The capture API (stable: the upscaler track (MetalFX) and the visionOS app build on it):
+//   - called from the D3D12 front end's replay, any thread, any number of times a frame; all three are MTLTextures the
+//     game owns, valid until the game's next frame overwrites them (npu_interp.m copies them in the present's command
+//     buffer, which runs after the frame's work on the same queue);
+//   - motion_vectors: two-channel float (RG16Float/RG16Snorm/RG32Float), render size; depth: Depth32Float(_Stencil8),
+//     Depth16Unorm or R32Float, the same size; consts as FSR2 lays out cbFSR2 (2.0, or 2.1/2.2: npu_interp.m's
+//     fsr2_parse reads display size, tan(vertical FOV/2), device-to-view depth, motion vector scale, jitter);
+//   - per frame the best candidate is kept: FSR2's constants found, then a depth texture; the first of those wins
+//     (FSR2's first pass reads the game's own motion vectors and depth; its later ones its dilated copies).
 void npu_interp_scene(void *motion_vectors, void *depth, uint64_t shader, const uint32_t *consts);
+// The HUD apart ("hud" in the switch file): 1 (and the window's size) while the scene's colour before the UI is wanted;
+// then the D3D12 front end passes FSR2's output (a colour texture of that size written by a dispatch with FSR2's
+// constants: the upscaled scene, before any UI) with npu_interp_scene_color, the last of each frame
+int npu_interp_wants_scene_color(uint32_t *w, uint32_t *h);
+void npu_interp_scene_color(void *texture, uint64_t shader);
