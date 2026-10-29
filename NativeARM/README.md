@@ -1019,3 +1019,56 @@ the active -1 EV curve; all observation hashes and the ledger verify, and
 the host hash matches the delivered app. It does not compare the supplied
 viewpoints or validate the picture in a headset. That comparison remains
 required; no measured baseline or playtest level has been changed.
+
+## Status (2026-10-29): isolate native shadow flicker to argument-buffer bindings
+
+The user's screen recording shows large ground shadows appearing and disappearing
+at a nearly unchanged viewpoint. Their latest `s0/quick` now reproduces that
+viewpoint in `a2_quarantine_entrance`. Fixed-head harness captures reproduce the
+same symptom after shader warmup. Synchronous pipeline creation does not remove
+it, and an experimental split of suspended depth passes did not help; that
+experiment was reverted.
+
+Changing only `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS` isolates the affected
+resource-binding path. The native Alyx host now defaults it to `0` before loading
+MoltenVK, and logs the effective mode. An explicit `1` remains available for
+driver comparisons. This selects MoltenVK's direct descriptor bindings; it does
+not disable shadow passes or change game files, quality or the nonblocking
+pipeline policy. The exact internal driver defect is not established by these
+controls; the pipeline-cache dynamic-offset issue in upstream release notes is
+not treated as a proven diagnosis.
+
+Comparison `20261029T155153Z-alyx-native-shadow-comparison` hashes its source
+harness results and every source burst capture. Its rule counts adjacent 512x512
+left-eye images whose mean absolute RGB difference exceeds five code values;
+the retained contact sheet shows the large shadow changes this detects:
+
+| Path and source run | Large changes / adjacent pairs | Claim |
+| --- | --- | --- |
+| Argument buffers, synchronous: `20261029T153856Z-alyx-native-a2_quarantine_entrance` | 123 / 269 | `d1` |
+| Direct bindings, synchronous: `20261029T154256Z-alyx-native-a2_quarantine_entrance` | 0 / 257 | `d2` |
+| Direct bindings, asynchronous: `20261029T154558Z-alyx-native-a2_quarantine_entrance` | 0 / 268 | `d3` |
+| Argument buffers restored, asynchronous: `20261029T154802Z-alyx-native-a2_quarantine_entrance` | 74 / 268 | `d4` |
+| Packaged default, copy of existing user cache: `20261029T154924Z-alyx-native-a2_quarantine_entrance` | 0 / 358 | `d5` |
+
+These are fixed-head image comparisons, not frame-time benchmarks. The packaged
+probe captures after the old archive has finished importing. It has no fatal
+diagnostics (`o22`) or unsupported device-feature errors (`o24`) and acknowledges
+normal quit with exit 0 and force disabled (`o385`). Its host SHA-256 matches the
+signed app. The original user cache's SHA-256 remains unchanged.
+
+Native runtime/syntax and host checks pass. The synthetic MoltenVK regression
+with direct bindings verifies all 16 shadow-depth pixels and persistent shader
+reuse, including a draw while an argument-buffer archive imports. The full
+Windows check still fails on the previously recorded translator differential
+cases; Windows runtime sources are unchanged. A headset retest and other maps
+remain unverified. No gameplay baseline or playtest level changes.
+
+The packaged default is also captured with simulated head turns in
+`20261029T155213Z-alyx-native-a2_quarantine_entrance` (`o21`-`o559`). The settled
+forward, left and right views were inspected without the alternating ground
+shadows. This probe records zero fatal diagnostics (`o17`) and unsupported
+feature errors (`o19`), then exits normally (`o560`). Newly encountered materials
+can still appear progressively during a turn, as specified by the existing
+pipeline policy. These captures remain an isolated diagnostic, not a headset
+playtest or proof of all viewpoints.

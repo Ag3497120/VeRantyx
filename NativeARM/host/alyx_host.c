@@ -155,6 +155,13 @@ int main(int argc, char **argv) {
     // compile over more threads (macOS 13.3+). VERANTYX_MVK_DEFAULTS=0 skips.
     if (!getenv("VERANTYX_MVK_DEFAULTS") || strcmp(getenv("VERANTYX_MVK_DEFAULTS"), "0") != 0)
         setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+    // Argument-buffer bindings flicker sun shadows even with a fixed head and
+    // synchronous pipelines. Direct bindings keep the depth rendering intact.
+    // Retain an explicit override for driver comparisons.
+    setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
+    fprintf(stderr, "  [native] Vulkan resource bindings: %s (MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=%s)\n",
+            strcmp(getenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS"), "0") == 0 ? "direct" : "argument buffers",
+            getenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS"));
     // Compile materials on workers. Pending colour/depth draws appear later,
     // at a stereo frame boundary, without blocking the render thread.
     // VERANTYX_ASYNC_PIPELINES=0 uses synchronous creation instead.
