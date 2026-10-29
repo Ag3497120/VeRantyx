@@ -36,11 +36,33 @@ build/vxrt-npu: tools/vxrt_npu.m src/npu_proto.h
 
 # The ARM64 build (phase 4, TRANSLATOR.md): the same runtime as ARM64 code, the program run by the translator's
 # engine in the process. Thunks for every ms_abi function come from the sources' C signatures (tools/vx_thunks.py).
-ARM64_SRC = $(filter-out src/context.S,$(SRC)) src/arm64.c src/context_arm64.S translator/xlat.c translator/x87.c translator/x86dec.c translator/engine.c translator/vcpu.c
+ARM64_SRC = $(filter-out src/context.S,$(SRC)) src/arm64.c src/context_arm64.S translator/xlat.c translator/x87.c translator/x86dec.c translator/engine.c translator/vcpu.c translator/aot.c
 build/thunks/stamp: $(filter %.c %.m,$(SRC)) src/vx.h tools/vx_thunks.py tools/vx_abi_scan.py
 	@mkdir -p build/thunks
 	python3 tools/vx_thunks.py build/thunks $(filter %.c %.m,$(SRC))
 	@touch $@
+# The static recompiler's tool (RECOMP.md, tools/vxrt_aot.c): native ARM64, built from the translator's sources.
+AOT_TOOL_SRC = tools/vxrt_aot.c translator/xlat.c translator/x87.c translator/x86dec.c
+build/vxrt-aot: $(AOT_TOOL_SRC) translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/x87.h translator/x86dec.h translator/aot.h translator/cpuid_table.h
+	@mkdir -p build
+	$(CC) -arch arm64 -O2 -g -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=14.0 -Itranslator -o $@ $(AOT_TOOL_SRC)
+# Stage 1 (RECOMP.md): tests/recomp/suite.cpp for the MSVC ABI (clang, MinGW's ld, no C runtime), recompiled by route B
+# into build/aot and run with no fallback to the translator, its output compared with Rosetta's: `make aot-suite`.
+build/recomp/suite.exe: tests/recomp/suite.cpp tests/recomp/suite_d3d.c tests/recomp/vcruntime140.def tests/msvc/start.c
+	@mkdir -p build/recomp
+	x86_64-w64-mingw32-dlltool -d tests/recomp/vcruntime140.def -l build/recomp/libvcruntime140.a -m i386:x86-64
+	clang -target x86_64-pc-windows-msvc -O2 -fexceptions -fcxx-exceptions -fms-extensions -c tests/recomp/suite.cpp -o build/recomp/suite.obj
+	clang --target=x86_64-w64-mingw32 -O2 -isystem $(shell $(MINGW) -print-sysroot)/x86_64-w64-mingw32/include -c tests/recomp/suite_d3d.c -o build/recomp/suite_d3d.o
+	clang -target x86_64-pc-windows-msvc -O1 -c tests/msvc/start.c -o build/recomp/start.obj
+	$(MINGW) -nostdlib -e mainCRTStartup -o $@ build/recomp/suite.obj build/recomp/suite_d3d.o build/recomp/start.obj -Lbuild/recomp -lvcruntime140 -lkernel32 -lucrtbase -ld3d11
+aot-suite: build/vxrt build/vxrt-arm64 build/vxrt-aot build/recomp/suite.exe
+	@mkdir -p build/aot
+	build/vxrt-aot gen build/recomp/suite.exe build/recomp/suite_b.s
+	clang -arch arm64 -dynamiclib -o build/aot/$$(build/vxrt-aot name build/recomp/suite.exe) build/recomp/suite_b.s
+	tools/aot_compare.sh build/recomp/suite.exe
+	@# the same split into parts of 20 KB (a large image's dylibs, branching to each other through veneers)
+	VXRT_AOT_PART_MB=0.02 tools/aot_build.sh build/recomp/suite.exe build/aotp > /dev/null
+	AOT_DIR=build/aotp tools/aot_compare.sh build/recomp/suite.exe
 # Code that runs inside the vCPU guest (translator/guest.c): no calls, no globals, no stack protector.
 GUEST_CFLAGS = -arch arm64 -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-stack-check -mmacosx-version-min=14.0 -Itranslator
 build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator/xvheap.h
@@ -49,7 +71,7 @@ build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator
 build/libvxrt_vm.dylib: src/vm_hooks.c translator/xvheap.h
 	@mkdir -p build
 	$(CC) -arch arm64 -O1 -mmacosx-version-min=14.0 -dynamiclib -install_name @executable_path/libvxrt_vm.dylib -Itranslator -o $@ $<
-build/vxrt-arm64: $(ARM64_SRC) src/npu_interp.h src/npu_proto.h build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/stereo.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h
+build/vxrt-arm64: $(ARM64_SRC) src/npu_interp.h src/npu_proto.h build/thunks/stamp build/libvxrt_vm.dylib build/guest.o src/arm64.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/stereo.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h translator/xlat.h translator/xlat_sse.inc translator/a64.h translator/engine.h translator/x87.h translator/cpuid_table.h translator/aot.h
 	$(CC) -arch arm64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -mmacosx-version-min=14.0 -Isrc -Ibuild -Ithird_party/vulkan -fobjc-arc -o $@ $(ARM64_SRC) -framework Cocoa -framework CoreFoundation -framework CoreServices -framework CoreText -framework Metal -framework MetalFX -framework QuartzCore -framework GameController -framework CoreGraphics -framework IOSurface -framework AudioToolbox -framework CoreAudio -framework ImageIO -framework OpenGL -framework IOKit -framework SystemConfiguration -framework CFNetwork -framework Security -framework Hypervisor build/libvxrt_vm.dylib build/guest.o -licucore -lz
 	codesign -s - -f --entitlements translator/hypervisor.entitlements $@
 

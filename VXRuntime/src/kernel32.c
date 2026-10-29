@@ -136,6 +136,9 @@ static WINAPI void ExitProcess(DWORD code) {
     }
     vx_profile_finish();
     vx_jobs_process_exit();
+#ifdef __aarch64__
+    { void xa_report(void); xa_report(); }                       // (statically recompiled code: how much ran, src/arm64.c)
+#endif
     fflush(stdout); fflush(stderr); _exit((int)code);
 }
 int vx_process_info(HANDLE h, DWORD *code);

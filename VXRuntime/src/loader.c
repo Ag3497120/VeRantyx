@@ -16,13 +16,21 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <pthread.h>
 #include "vx.h"
 #include "pe.h"
+#ifdef __aarch64__
+#include "../translator/aot.h"
+#include "arm64.h"
+#endif
 #include "dotnet_host.h"
 #include <sys/resource.h>
 #include <limits.h>
 #include <mach-o/getsect.h>
+#include <mach-o/dyld.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach-o/ldsyms.h>
 
 vx_process vx_proc;
@@ -117,7 +125,7 @@ void *vx_find_export(const char *dll, const char *name) {
 // module's exports themselves rather than through GetProcAddress (NVIDIA Streamline's sl.interposer.dll walks
 // dxgi.dll's to find CreateDXGIFactory1) find them there. GetProcAddress still gives the functions themselves.
 // Data exports (variables) are left out: an export is an RVA into the image, and only code gets a jump.
-// (ARM64 build: the image has headers and an empty export directory; the program's code runs translated there.)
+// (ARM64 build: the stubs are x86 code the engine translates; their jumps reach the functions' thunks.)
 typedef struct { char name[64]; uint8_t *image; } builtin_module;
 static builtin_module g_builtins[256];
 static int g_builtin_count;
@@ -134,7 +142,6 @@ static uint8_t *make_builtin_image(const char *given) {
     const char *dll = canonical_dll(given);
     size_t n = 0, cap = 0;
     builtin_export *e = NULL;
-#ifndef __aarch64__
     unsigned long text_size = 0;
     uint8_t *text = getsegmentdata(&_mh_execute_header, "__TEXT", &text_size);
     for (size_t m = 0; m < g_module_count; m++) {
@@ -142,6 +149,9 @@ static uint8_t *make_builtin_image(const char *given) {
         for (size_t i = 0; i < g_modules[m].count; i++) {
             const vx_export *x = &g_modules[m].exports[i];
             if (!x->name || x->name[0] == '#' || (uint8_t *)x->fn < text || (uint8_t *)x->fn >= text + text_size) continue;
+#ifdef __aarch64__
+            if (!vx_thunk_find((uint64_t)(uintptr_t)x->fn)) continue;   // (the stub's jump reaches the function's thunk)
+#endif
             if (n == cap) { cap = cap ? cap * 2 : 256; builtin_export *g = realloc(e, cap * sizeof *e); if (!g) break; e = g; }
             e[n] = (builtin_export){ x->name, x->fn, n }; n++;
         }
@@ -150,7 +160,6 @@ static uint8_t *make_builtin_image(const char *given) {
     size_t k = 0;                                                   // one per name: the first registered, as vx_find_export
     for (size_t i = 0; i < n; i++) if (!k || strcmp(e[k - 1].name, e[i].name)) e[k++] = e[i];
     n = k;
-#endif
     size_t names = strlen(given) + 1;
     for (size_t i = 0; i < n; i++) names += strlen(e[i].name) + 1;
     const uint32_t dir = 0x1000, funcs = dir + 40, name_rvas = funcs + 4 * (uint32_t)n, ords = name_rvas + 4 * (uint32_t)n;
@@ -183,7 +192,11 @@ static uint8_t *make_builtin_image(const char *given) {
         memcpy(str, e[i].name, l); str += l;
     }
     free(e);
+#ifdef __aarch64__
+    mprotect(img, size, PROT_READ);                                 // (x86 code: translated, its pages not executable)
+#else
     mprotect(img, size, PROT_READ | PROT_EXEC);
+#endif
     return img;
 }
 static void *builtin_handle(const char *name) {
@@ -200,6 +213,24 @@ static void *builtin_handle(const char *name) {
     pthread_mutex_unlock(&lock);
     return h;
 }
+#ifdef __aarch64__
+// A built-in module's export stub at rip (jmp qword [rip+0]): its target (the function's thunk), for the recompiled
+// code's runner, which follows it rather than having the engine translate it (translator/aot.c: no JIT on visionOS)
+static uint32_t rd32(const uint8_t *p);
+static uint64_t rd64(const uint8_t *p);
+int vx_builtin_stub(uint64_t rip, uint64_t *target) {
+    int n = __atomic_load_n(&g_builtin_count, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        const uint8_t *img = g_builtins[i].image;
+        if (!img || rip < (uint64_t)(uintptr_t)img || rip - (uint64_t)(uintptr_t)img >= rd32(img + 0x40 + 24 + 56)) continue;
+        const uint8_t *p = (const uint8_t *)(uintptr_t)rip;
+        if (rip + 14 > (uint64_t)(uintptr_t)img + rd32(img + 0x40 + 24 + 56) || p[0] != 0xff || p[1] != 0x25) return 0;
+        *target = rd64(p + 6 + (int32_t)rd32(p + 2));
+        return 1;
+    }
+    return 0;
+}
+#endif
 // The DLL name of a built-in module's handle, NULL for anything else.
 static const char *builtin_name(const void *h) {
     int n = __atomic_load_n(&g_builtin_count, __ATOMIC_ACQUIRE);
@@ -261,6 +292,14 @@ static DWORD g_next_tls_index;
 
 // Lock-free: images are only ever appended (and never unmapped), so a reader sees a consistent prefix. An unloaded
 // image is still found by address: a thread or a function pointer may still be in it.
+const vx_image *vx_image_at(uint64_t pc);
+const char *vx_image_name_at(uint64_t pc) {
+    static __thread char buf[160];
+    const vx_image *m = vx_image_at(pc);
+    if (!m) return NULL;
+    snprintf(buf, sizeof buf, "%s+%#llx", m->name, (unsigned long long)(pc - (uint64_t)(uintptr_t)m->base));
+    return buf;
+}
 const vx_image *vx_image_at(uint64_t pc) {
     int n = __atomic_load_n(&g_image_count, __ATOMIC_ACQUIRE);
     for (int i = 0; i < n; i++) {
@@ -563,6 +602,17 @@ static int init_dll(vx_image *m) {
     return 1;
 }
 
+#ifdef __aarch64__
+// (the range reserved for images with modules, translator/aot.c: mapped over, where no image is yet)
+static int in_arena(uint64_t a, uint64_t n) {
+    if (!xa_in_arena(a, n)) return 0;
+    for (int i = 0; i < g_image_count; i++)
+        if (a < (uint64_t)(uintptr_t)g_images[i]->base + g_images[i]->size && (uint64_t)(uintptr_t)g_images[i]->base < a + n) return 0;
+    return 1;
+}
+#else
+#define in_arena(a, n) 0
+#endif
 static vx_image *load_pe(const char *path, int is_main) {
     FILE *f = fopen(path, "rb");
     if (!f) { vx_log("cannot open %s: %s", path, strerror(errno)); vx_set_last_error(2); return NULL; }
@@ -610,9 +660,24 @@ static vx_image *load_pe(const char *path, int is_main) {
         }
         free(real);
     }
+    uint64_t want = pref_base;
+#ifdef __aarch64__
+    // VXRT_AOT_DIR: a module made for this file at another base (a DLL whose preferred base is in macOS's shared cache,
+    // at 0x180000000) is used where it was made for: the file is mapped there when that is free (translator/aot.c)
+    if (getenv("VXRT_AOT_DIR") && reuse < 0) {
+        uint64_t b = xa_module_base(getenv("VXRT_AOT_DIR"), path, xa_hash(file, (uint64_t)len));
+        if (b && b != pref_base) {
+            // (exactly there when free: mmap takes a hint in some ranges as none)
+            mach_vm_address_t a = b;
+            if (in_arena(b, image_size) || mach_vm_allocate(mach_task_self(), &a, image_size, VM_FLAGS_FIXED) == KERN_SUCCESS) {
+                want = b;                                        // (reserved: the mapping below replaces it)
+            } else vx_log("aot: %s: its module's base %#llx is taken: the module is not used", path, (unsigned long long)b);
+        }
+    }
+#endif
     // Map at the preferred base when free, anywhere otherwise (then relocate).
     uint8_t *base = reuse >= 0 ? mmap(g_images[reuse]->base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0)
-                               : mmap((void *)pref_base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                               : mmap((void *)want, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON | (want != pref_base || in_arena(want, image_size) ? MAP_FIXED : 0), -1, 0);
     if (base == MAP_FAILED) { vx_log("cannot map %u bytes", image_size); free(file); return NULL; }
     memcpy(base, file, headers_size);
     const pe_section *sec = (const pe_section *)(file + section_table_offset);
@@ -620,6 +685,11 @@ static vx_image *load_pe(const char *path, int is_main) {
         uint32_t n = sec[i].raw_size < sec[i].vsize || !sec[i].vsize ? sec[i].raw_size : sec[i].vsize;
         if (n) memcpy(base + sec[i].va, file + sec[i].raw_ptr, n);
     }
+#ifdef __aarch64__
+    // VXRT_AOT_DIR: statically recompiled code for this file, if there is some (translator/aot.c, RECOMP.md): a module
+    // named after the file and its bytes' hash, made for it at this base
+    uint64_t aot_hash = getenv("VXRT_AOT_DIR") ? xa_hash(file, (uint64_t)len) : 0;
+#endif
     free(file);
 
     int64_t delta = (int64_t)((uint64_t)base - pref_base);
@@ -673,6 +743,26 @@ static vx_image *load_pe(const char *path, int is_main) {
         __atomic_store_n(&g_image_count, g_image_count + 1, __ATOMIC_RELEASE);   // visible before imports load (cycles)
     }
     if (vx_trace) vx_log("%s mapped at %p%s", m->name, base, reuse >= 0 ? " (again, where its unloaded copy was)" : "");
+#ifdef __aarch64__
+    if (aot_hash) {
+        char lower[sizeof m->name], mod[4096];
+        size_t k = 0;
+        for (; m->name[k] && k + 1 < sizeof lower; k++) lower[k] = (char)tolower((unsigned char)m->name[k]);
+        lower[k] = 0;
+        snprintf(mod, sizeof mod, "%s/%s-%016llx.dylib", getenv("VXRT_AOT_DIR"), lower, (unsigned long long)aot_hash);
+        if (!access(mod, R_OK)) xa_load(mod, (uint64_t)(uintptr_t)base, image_size, aot_hash);
+        else {
+            // (a large image's module comes in parts: <name>-<hash>.p<k>.dylib)
+            int parts = 0;
+            for (;; parts++) {
+                snprintf(mod, sizeof mod, "%s/%s-%016llx.p%d.dylib", getenv("VXRT_AOT_DIR"), lower, (unsigned long long)aot_hash, parts);
+                if (access(mod, R_OK) || xa_load(mod, (uint64_t)(uintptr_t)base, image_size, aot_hash)) break;
+            }
+            if (parts) xa_link(aot_hash);
+            else if (vx_trace) vx_log("aot: no module %s", mod);
+        }
+    }
+#endif
 
     // TLS: an index for this image (its unloaded copy's, when it had one) and a block on every thread that exists
     // already.
@@ -1281,6 +1371,19 @@ int main(int argc, char **argv, char **envp) {
     if (argc < 2) { fprintf(stderr, "usage: vxrt program.exe [args...]\n"); return 2; }
     if (argc == 2 && !strcmp(argv[1], "--vxrt-job-watchdog")) return vx_jobs_watchdog();   // (src/jobs.c)
     vx_program_env(argv[1]);                     // (first: the settings it gives are read below and in every init)
+#ifdef __aarch64__
+    // (before anything is mapped where the modules' images go; when the system's randomized regions already cover it,
+    // the program starts again, up to 5 times: they fall elsewhere)
+    if (getenv("VXRT_AOT_DIR") && !xa_reserve()) {
+        int tries = getenv("VXRT_AOT_RESTARTS") ? atoi(getenv("VXRT_AOT_RESTARTS")) : 0;
+        if (tries < 5) {
+            char n[8]; snprintf(n, sizeof n, "%d", tries + 1);
+            setenv("VXRT_AOT_RESTARTS", n, 1);
+            char self[4096]; uint32_t len = sizeof self;
+            if (!_NSGetExecutablePath(self, &len)) execv(self, argv);
+        }
+    }
+#endif
     vx_trace = getenv("VXRT_TRACE") && *getenv("VXRT_TRACE") == '1';
     // Windows programs keep thousands of handles open; macOS gives a process 256 descriptors (Google Earth VR ran
     // out while reading its tours): as many as the system allows.
