@@ -9120,6 +9120,61 @@ static int npu_scene_consts12(dev12 *d, root_binding *rb, heap12 *heap, uint32_t
     }
     return 0;
 }
+// (no FSR2 constants with a candidate: each of its constant buffers' first 64 words logged once per shader, and where the
+//  render size (the motion vectors' size) appears in them as two integers or two floats - FSR2's layout, or the game's own)
+static void npu_consts_dump12(dev12 *d, root_binding *rb, heap12 *heap, uint64_t cs, uint32_t mw, uint32_t mh) {
+    static uint64_t done[8];
+    static int ndone;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    int seen = 0;
+    for (int k = 0; k < ndone; k++) if (done[k] == cs) seen = 1;
+    if (seen || ndone >= 8) { pthread_mutex_unlock(&lock); return; }
+    done[ndone++] = cs;
+    pthread_mutex_unlock(&lock);
+    rootsig12 *rs = rb ? rb->rs : NULL;
+    if (!rs) { vx_log("NPU mode (race): cs %016llx: no root signature", (unsigned long long)cs); return; }
+    for (uint32_t i = 0; i < rs->nparams && i < 64; i++) {
+        const param12 *pa = &rs->params[i];
+        const uint32_t *w = NULL; uint32_t nw = 0; char what[96];
+        uint64_t va[8]; int nva = 0;
+        if (pa->type == 1) { w = rb->st.constants[i]; nw = pa->n32 < 64 ? pa->n32 : 64; snprintf(what, sizeof what, "root constants (%u)", pa->n32); }
+        else if (pa->type == 2) va[nva++] = rb->st.root_va[i];
+        else if (pa->type == 0 && heap && heap->gpu && heap->cpu && rb->st.table[i] >= heap->gpu.gpuAddress)
+            for (uint32_t k = 0; k < pa->nranges && nva < 8; k++) {
+                const range12 *r = &pa->ranges[k];
+                if (r->type != 2) continue;
+                for (uint32_t j = 0; j < (r->count == UINT32_MAX ? 1 : r->count) && nva < 8; j++) {
+                    uint64_t at = (rb->st.table[i] - heap->gpu.gpuAddress) / 32 + r->offset + j;
+                    if (at >= heap->desc.NumDescriptors) break;
+                    VxDesc v;
+                    memcpy(&v, heap->cpu + 32 * at, sizeof v);
+                    va[nva++] = v.va;
+                }
+            }
+        for (int k = -1; k < nva; k++) {
+            if (k >= 0) {
+                uint64_t off = 0;
+                id<MTLBuffer> b = va[k] ? buffer_at(d, va[k], &off) : nil;
+                if (!b) { vx_log("NPU mode (race): cs %016llx param %u (type %d) CBV %d at %#llx: no buffer", (unsigned long long)cs, i, pa->type, k, (unsigned long long)va[k]); continue; }
+                if (b.storageMode == MTLStorageModePrivate) { vx_log("NPU mode (race): cs %016llx param %u CBV %d: a private buffer (%lu bytes): not readable", (unsigned long long)cs, i, k, (unsigned long)b.length); continue; }
+                w = (const uint32_t *)((const uint8_t *)b.contents + off);
+                nw = (uint32_t)((b.length - off) / 4 < 64 ? (b.length - off) / 4 : 64);
+                snprintf(what, sizeof what, "param %u (type %d) CBV %d, %lu bytes from %llu", i, pa->type, k, (unsigned long)b.length, (unsigned long long)off);
+            } else if (!w) continue;
+            char hex[64 * 9 + 1] = "", at[256] = "";
+            for (uint32_t j = 0; j < nw; j++) snprintf(hex + 9 * j, 10, "%08x ", w[j]);
+            const float *f = (const float *)w;
+            for (uint32_t j = 0; j + 1 < nw; j++)
+                if ((w[j] == mw && w[j + 1] == mh) || (f[j] == (float)mw && f[j + 1] == (float)mh) ||
+                    (fabsf(f[j] * mw - 1) < 1e-3f && fabsf(f[j + 1] * mh - 1) < 1e-3f))
+                    snprintf(at + strlen(at), sizeof at - strlen(at), " word %u%s", j, w[j] == mw ? " (ints)" : f[j] == (float)mw ? " (floats)" : " (1/size)");
+            vx_log("NPU mode (race): cs %016llx %s: render size %ux%u at:%s; words %s", (unsigned long long)cs, what, mw, mh, *at ? at : " none", hex);
+            if (k < 0) break;
+        }
+    }
+}
+
 static void npu_scene_note12(dev12 *d, const pso12 *p, root_binding *rb, heap12 *heap, const gpu_ir_resource_access *a, uint32_t n) {
     id<MTLTexture> mv = nil, dp = nil;
     for (uint32_t i = 0; i < n; i++) {
@@ -9136,6 +9191,7 @@ static void npu_scene_note12(dev12 *d, const pso12 *p, root_binding *rb, heap12 
     if (mv && dp && mv.width == dp.width && mv.height == dp.height) {
         uint32_t consts[32];
         int have = npu_scene_consts12(d, rb, heap, (uint32_t)mv.width, (uint32_t)mv.height, consts);
+        if (!have) npu_consts_dump12(d, rb, heap, p ? p->cs_code : 0, (uint32_t)mv.width, (uint32_t)mv.height);
         npu_interp_scene((__bridge void *)mv, (__bridge void *)dp, p ? p->cs_code : 0, have ? consts : NULL);
         mw = (uint32_t)mv.width; mh = (uint32_t)mv.height;
         return;
