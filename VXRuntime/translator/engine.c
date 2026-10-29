@@ -18,7 +18,7 @@
 #include <sys/mman.h>
 
 enum { S0 = 16, S1 = 17, T_T = 22, XC = 28, LR = 30 };
-enum { CODE_BYTES = 64 << 20, TABLE_BITS = 16, MAP_BITS = 20 };
+enum { CODE_BYTES = 120 << 20, TABLE_BITS = 16, MAP_BITS = 22 };   // (code: B/BL to the stubs reach 128 MB)
 
 typedef struct { uint64_t rip, host; } entry;
 typedef struct { uint64_t rip, host; uint32_t id; } mentry;      // (map: host 0 with the rip kept, a block gone)
@@ -497,6 +497,12 @@ static int run(xe *e, x86_ctx *c, uint64_t stop) {
         if (e->vcpu && !(c->rip >> 32)) {                                 // (the guest's low memory is the host's elsewhere)
             fprintf(stderr, "[vxrt] engine: code below 4 GB (%#llx) is not run in the vCPU yet\n", (unsigned long long)c->rip);
             return -2;
+        }
+        if (!e->vcpu && !(c->rip >> 32)) {                                // (in-process nothing is mapped below 4 GB: a call
+            static int n;                                                 //  through a null or bad pointer, a fault as on Windows)
+            if (n++ < 8) fprintf(stderr, "[vxrt] engine: code at %#llx (nothing mapped there), return address %#llx\n", (unsigned long long)c->rip, (unsigned long long)(c->gpr[4] >> 32 ? *(const uint64_t *)(uintptr_t)c->gpr[4] : 0));
+            c->fault = X86_FAULT_PF; c->fault_info = c->rip;
+            return X86_FAULT_PF;
         }
         pthread_mutex_lock(&e->lock);
         int once = c->single != 0;

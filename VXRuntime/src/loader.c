@@ -22,6 +22,7 @@
 #include "pe.h"
 #ifdef __aarch64__
 #include "../translator/aot.h"
+#include "arm64.h"
 #endif
 #include "dotnet_host.h"
 #include <sys/resource.h>
@@ -121,7 +122,7 @@ void *vx_find_export(const char *dll, const char *name) {
 // module's exports themselves rather than through GetProcAddress (NVIDIA Streamline's sl.interposer.dll walks
 // dxgi.dll's to find CreateDXGIFactory1) find them there. GetProcAddress still gives the functions themselves.
 // Data exports (variables) are left out: an export is an RVA into the image, and only code gets a jump.
-// (ARM64 build: the image has headers and an empty export directory; the program's code runs translated there.)
+// (ARM64 build: the stubs are x86 code the engine translates; their jumps reach the functions' thunks.)
 typedef struct { char name[64]; uint8_t *image; } builtin_module;
 static builtin_module g_builtins[256];
 static int g_builtin_count;
@@ -138,7 +139,6 @@ static uint8_t *make_builtin_image(const char *given) {
     const char *dll = canonical_dll(given);
     size_t n = 0, cap = 0;
     builtin_export *e = NULL;
-#ifndef __aarch64__
     unsigned long text_size = 0;
     uint8_t *text = getsegmentdata(&_mh_execute_header, "__TEXT", &text_size);
     for (size_t m = 0; m < g_module_count; m++) {
@@ -146,6 +146,9 @@ static uint8_t *make_builtin_image(const char *given) {
         for (size_t i = 0; i < g_modules[m].count; i++) {
             const vx_export *x = &g_modules[m].exports[i];
             if (!x->name || x->name[0] == '#' || (uint8_t *)x->fn < text || (uint8_t *)x->fn >= text + text_size) continue;
+#ifdef __aarch64__
+            if (!vx_thunk_find((uint64_t)(uintptr_t)x->fn)) continue;   // (the stub's jump reaches the function's thunk)
+#endif
             if (n == cap) { cap = cap ? cap * 2 : 256; builtin_export *g = realloc(e, cap * sizeof *e); if (!g) break; e = g; }
             e[n] = (builtin_export){ x->name, x->fn, n }; n++;
         }
@@ -154,7 +157,6 @@ static uint8_t *make_builtin_image(const char *given) {
     size_t k = 0;                                                   // one per name: the first registered, as vx_find_export
     for (size_t i = 0; i < n; i++) if (!k || strcmp(e[k - 1].name, e[i].name)) e[k++] = e[i];
     n = k;
-#endif
     size_t names = strlen(given) + 1;
     for (size_t i = 0; i < n; i++) names += strlen(e[i].name) + 1;
     const uint32_t dir = 0x1000, funcs = dir + 40, name_rvas = funcs + 4 * (uint32_t)n, ords = name_rvas + 4 * (uint32_t)n;
@@ -187,7 +189,11 @@ static uint8_t *make_builtin_image(const char *given) {
         memcpy(str, e[i].name, l); str += l;
     }
     free(e);
+#ifdef __aarch64__
+    mprotect(img, size, PROT_READ);                                 // (x86 code: translated, its pages not executable)
+#else
     mprotect(img, size, PROT_READ | PROT_EXEC);
+#endif
     return img;
 }
 static void *builtin_handle(const char *name) {
