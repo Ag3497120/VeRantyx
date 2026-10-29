@@ -1,0 +1,23 @@
+{
+  "bindings": {
+    "/actions/move": {
+      "sources": [
+        {"path": "/user/hand/left/input/joystick", "mode": "button", "parameters": {"force_input": "position", "click_activate_threshold": "0.5", "click_deactivate_threshold": "0.4"}, "inputs": {"click": {"output": "/actions/move/in/walk"}}},
+        {"path": "/user/hand/left/input/joystick", "mode": "button", "parameters": {"force_input": "position"}, "inputs": {"click": {"output": "/actions/move/in/walkdefault"}}},
+        {"path": "/user/hand/left/input/joystick", "mode": "joystick", "parameters": {"deadzone_pct": "5", "maxzone_pct": "90"}, "inputs": {"position": {"output": "/actions/move/in/direction"}, "click": {"output": "/actions/move/in/stickclick"}}},
+        {"path": "/user/hand/right/input/joystick", "mode": "dpad", "parameters": {"deadzone_pct": "75", "sub_mode": "touch"}, "inputs": {"west": {"output": "/actions/move/in/turnleft"}, "east": {"output": "/actions/move/in/turnright"}}},
+        {"path": "/user/hand/right/input/joystick", "mode": "joystick", "parameters": {"deadzone_pct": "75"}, "inputs": {"position": {"output": "/actions/move/in/continuousturn"}}},
+        {"path": "/user/hand/right/input/joystick", "mode": "dpad", "parameters": {"deadzone_pct": "75", "sub_mode": "click"}, "inputs": {"east": {"output": "/actions/move/in/clickturn"}}}
+      ]
+    },
+    "/actions/buttons": {
+      "sources": [
+        {"path": "/user/hand/left/input/x", "mode": "button", "inputs": {"click": {"output": "/actions/buttons/in/primary"}}},
+        {"path": "/user/hand/right/input/a", "mode": "button", "inputs": {"click": {"output": "/actions/buttons/in/primary"}}},
+        {"path": "/user/hand/left/input/y", "mode": "button", "inputs": {"click": {"output": "/actions/buttons/in/secondary"}}},
+        {"path": "/user/hand/right/input/b", "mode": "button", "inputs": {"click": {"output": "/actions/buttons/in/secondary"}}},
+        {"path": "/user/hand/right/input/a", "mode": "button", "inputs": {"click": {"output": "/actions/buttons/in/ejectclip"}}}
+      ]
+    }
+  }
+}

@@ -1,0 +1,205 @@
+[
+  {
+    "name": "libstdc++6",
+    "version": "14.2.0-19",
+    "url": "https://deb.debian.org/debian/pool/main/g/gcc-14/libstdc++6_14.2.0-19_arm64.deb",
+    "sha256": "6669b0c52a2e7c6af9adfdabce3ff6e286065cdfbc7b85280862b5f799daebee",
+    "bytes": 637536
+  },
+  {
+    "name": "libgcc-s1",
+    "version": "14.2.0-19",
+    "url": "https://deb.debian.org/debian/pool/main/g/gcc-14/libgcc-s1_14.2.0-19_arm64.deb",
+    "sha256": "1108bc87879833d6d9a145f22a4a15cddb34e065b4b5f4b97bee586adbac2851",
+    "bytes": 54104
+  },
+  {
+    "name": "libogg0",
+    "version": "1.3.5-3+b2",
+    "url": "https://deb.debian.org/debian/pool/main/libo/libogg/libogg0_1.3.5-3+b2_arm64.deb",
+    "sha256": "d59a83ab352bf0c16ce9513fdf264f87214813ca8c628c652801ef476ece8286",
+    "bytes": 23580
+  },
+  {
+    "name": "libatomic1",
+    "version": "14.2.0-19",
+    "url": "https://deb.debian.org/debian/pool/main/g/gcc-14/libatomic1_14.2.0-19_arm64.deb",
+    "sha256": "7ccff90234484bf21ae5ecb79d25b6a84b2f4038f65dd139085b2e3a937cd8dc",
+    "bytes": 10128
+  },
+  {
+    "name": "libpcre2-8-0",
+    "version": "10.46-1~deb13u2",
+    "url": "https://deb.debian.org/debian/pool/main/p/pcre2/libpcre2-8-0_10.46-1~deb13u2_arm64.deb",
+    "sha256": "e7d2c997dac145c16457be0fed3d084c98cd030bec7633eec7e5bde6dbb97712",
+    "bytes": 262840
+  },
+  {
+    "name": "libffi8",
+    "version": "3.4.8-2",
+    "url": "https://deb.debian.org/debian/pool/main/libf/libffi/libffi8_3.4.8-2_arm64.deb",
+    "sha256": "d84a783b818f2386627604e64b793eb4ac5bb9ea1ba321a194a1c9c82fe09a01",
+    "bytes": 21260
+  },
+  {
+    "name": "libmount1",
+    "version": "2.41.5-0+deb13u1",
+    "url": "https://deb.debian.org/debian/pool/main/u/util-linux/libmount1_2.41.5-0+deb13u1_arm64.deb",
+    "sha256": "14e2d555459f3c0b1442bb49dd2d266ea202a003198c86f65508a1dbfaa18732",
+    "bytes": 200668
+  },
+  {
+    "name": "libblkid1",
+    "version": "2.41.5-0+deb13u1",
+    "url": "https://deb.debian.org/debian/pool/main/u/util-linux/libblkid1_2.41.5-0+deb13u1_arm64.deb",
+    "sha256": "d7d122b4c7a0a8ae6135a1687c9c4ce80a88f9e498c01998f634dd32caab9016",
+    "bytes": 166472
+  },
+  {
+    "name": "libselinux1",
+    "version": "3.8.1-1",
+    "url": "https://deb.debian.org/debian/pool/main/libs/libselinux/libselinux1_3.8.1-1_arm64.deb",
+    "sha256": "fc13da4c7783b8f4361d92ef1045931f298d1b0ac78ed1a85c2232615f49fc6f",
+    "bytes": 79352
+  },
+  {
+    "name": "libglib2.0-0t64",
+    "version": "2.84.4-3~deb13u5",
+    "url": "https://deb.debian.org/debian/pool/main/g/glib2.0/libglib2.0-0t64_2.84.4-3~deb13u5_arm64.deb",
+    "sha256": "d446f0ea85fb9dc411219ce861e59e5eabe1981c796918771a7d2aa97cc72481",
+    "bytes": 1428508
+  },
+  {
+    "name": "libpng16-16t64",
+    "version": "1.6.48-1+deb13u5",
+    "url": "https://deb.debian.org/debian/pool/main/libp/libpng1.6/libpng16-16t64_1.6.48-1+deb13u5_arm64.deb",
+    "sha256": "11096ad43504ca24e8044bcc89e922d932a2812ff25568613b28d22235190ba5",
+    "bytes": 275192
+  },
+  {
+    "name": "libssl3t64",
+    "version": "3.5.7-1~deb13u2",
+    "url": "https://deb.debian.org/debian/pool/main/o/openssl/libssl3t64_3.5.7-1~deb13u2_arm64.deb",
+    "sha256": "ec131326aa9fa9ec934eca386bc7991f328fe383eaefd3e43bd8901a9199c5ae",
+    "bytes": 2766020
+  },
+  {
+    "name": "libudev1",
+    "version": "257.13-1~deb13u1",
+    "url": "https://deb.debian.org/debian/pool/main/s/systemd/libudev1_257.13-1~deb13u1_arm64.deb",
+    "sha256": "459b1c9c17cc3c586e90d13d2a991715d498c6eed6c046cabf321021167bc380",
+    "bytes": 144536
+  },
+  {
+    "name": "libexpat1",
+    "version": "2.8.3-1~deb13u1",
+    "url": "https://deb.debian.org/debian/pool/main/e/expat/libexpat1_2.8.3-1~deb13u1_arm64.deb",
+    "sha256": "c3248c4beb721c8290e6e34527ae56b1fc965aa6a14982ca602df4458ef0854e",
+    "bytes": 109116
+  },
+  {
+    "name": "libzstd1",
+    "version": "1.5.7+dfsg-1",
+    "url": "https://deb.debian.org/debian/pool/main/libz/libzstd/libzstd1_1.5.7+dfsg-1_arm64.deb",
+    "sha256": "924540bd59fdbfa77a0604360efdaca54411a43daf11c7e002a3c64791b67448",
+    "bytes": 266052
+  },
+  {
+    "name": "libuuid1",
+    "version": "2.41.5-0+deb13u1",
+    "url": "https://deb.debian.org/debian/pool/main/u/util-linux/libuuid1_2.41.5-0+deb13u1_arm64.deb",
+    "sha256": "448ad6b190184dbff24508ef2eda88bd737a5ffc0f9750eb779fcf9885292bea",
+    "bytes": 37648
+  },
+  {
+    "name": "libbz2-1.0",
+    "version": "1.0.8-6",
+    "url": "https://deb.debian.org/debian/pool/main/b/bzip2/libbz2-1.0_1.0.8-6_arm64.deb",
+    "sha256": "3537fe4fc577a60c8a9568873cd577db7ebc135eb8bb1825f18caf8972d9d2f2",
+    "bytes": 37772
+  },
+  {
+    "name": "libdrm2",
+    "version": "2.4.124-2",
+    "url": "https://deb.debian.org/debian/pool/main/libd/libdrm/libdrm2_2.4.124-2_arm64.deb",
+    "sha256": "b535506630bb6a9a616bc07caf3b29915f980d8c3437852fb96ea64fb1a8a3f8",
+    "bytes": 38304
+  },
+  {
+    "name": "libbrotli1",
+    "version": "1.1.0-2+b7",
+    "url": "https://deb.debian.org/debian/pool/main/b/brotli/libbrotli1_1.1.0-2+b7_arm64.deb",
+    "sha256": "10270398c4842e71c72b4081fa1761728b3225d6c8dce7c58d5baafe58a5e18f",
+    "bytes": 307600
+  },
+  {
+    "name": "libfribidi0",
+    "version": "1.0.16-1",
+    "url": "https://deb.debian.org/debian/pool/main/f/fribidi/libfribidi0_1.0.16-1_arm64.deb",
+    "sha256": "5f5bfdf6ef126b0a38f8ebb8751cbbb845fe2cd4e1dd5258d241be243e09897f",
+    "bytes": 26460
+  },
+  {
+    "name": "libpango-1.0-0",
+    "version": "1.56.3-1",
+    "url": "https://deb.debian.org/debian/pool/main/p/pango1.0/libpango-1.0-0_1.56.3-1_arm64.deb",
+    "sha256": "5c5c6061afdff84a76418c9c2cf8bd4f3b6174aa7bf39ddf58bfa7702a59d3f2",
+    "bytes": 212956
+  },
+  {
+    "name": "libfontconfig1",
+    "version": "2.15.0-2.3",
+    "url": "https://deb.debian.org/debian/pool/main/f/fontconfig/libfontconfig1_2.15.0-2.3_arm64.deb",
+    "sha256": "872781cf62926b68c34a4302a3caae334ff8d4d83a2b2477f8fb454460aadc99",
+    "bytes": 387092
+  },
+  {
+    "name": "zlib1g",
+    "version": "1:1.3.dfsg+really1.3.1-1+b1",
+    "url": "https://deb.debian.org/debian/pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_arm64.deb",
+    "sha256": "209aa5cf671e97b9eb0410844fa6df4cae2e75b0c72e7802ab6c8ece13e6ddef",
+    "bytes": 85116
+  },
+  {
+    "name": "libicu76",
+    "version": "76.1-4",
+    "url": "https://deb.debian.org/debian/pool/main/i/icu/libicu76_76.1-4_arm64.deb",
+    "sha256": "62eb15577c881b7d02aa861e3eb860902335630cc8174daf525b48c2fa39298f",
+    "bytes": 9523672
+  },
+  {
+    "name": "libharfbuzz0b",
+    "version": "10.2.0-1+deb13u1",
+    "url": "https://deb.debian.org/debian/pool/main/h/harfbuzz/libharfbuzz0b_10.2.0-1+deb13u1_arm64.deb",
+    "sha256": "3ff928f981b54b491ee12e4cf68558cc5d61c652bdab276cd4c4c3fbbcee16ca",
+    "bytes": 441932
+  },
+  {
+    "name": "libfreetype6",
+    "version": "2.13.3+dfsg-1+deb13u1",
+    "url": "https://deb.debian.org/debian/pool/main/f/freetype/libfreetype6_2.13.3+dfsg-1+deb13u1_arm64.deb",
+    "sha256": "0c426e83f1af816b9a4df9056fd2238463d1cd07969ee640965da9fb6ecaf107",
+    "bytes": 422284
+  },
+  {
+    "name": "libgraphite2-3",
+    "version": "1.3.14-2+deb13u1",
+    "url": "https://deb.debian.org/debian/pool/main/g/graphite2/libgraphite2-3_1.3.14-2+deb13u1_arm64.deb",
+    "sha256": "b0c3414b113de62be1dc28fa2c899ac0856256e2f094d92c36c3275a5053311a",
+    "bytes": 70348
+  },
+  {
+    "name": "libcap2",
+    "version": "1:2.75-10+deb13u1+b3",
+    "url": "https://deb.debian.org/debian/pool/main/libc/libcap2/libcap2_2.75-10+deb13u1+b3_arm64.deb",
+    "sha256": "863aa5b9cdf6f80010b48982d4639126b09a89eeef2c0c5c7be226297c811581",
+    "bytes": 28568
+  },
+  {
+    "name": "libpcre2-32-0",
+    "version": "10.46-1~deb13u2",
+    "url": "https://deb.debian.org/debian/pool/main/p/pcre2/libpcre2-32-0_10.46-1~deb13u2_arm64.deb",
+    "sha256": "76f5f17c0165dcf9d44d601a5fc543221fd374959fb9f23e03d6580ffd0a993e",
+    "bytes": 237624
+  }
+]

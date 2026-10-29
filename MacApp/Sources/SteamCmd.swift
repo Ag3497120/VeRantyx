@@ -8,6 +8,11 @@ import Foundation
 import Observation
 
 enum SteamCmd {
+    static func linuxCommand(script: URL, account: String, installAt: URL? = nil, commands: [String]) -> [String] {
+        var argv = [script.path, "+@sSteamCmdForcePlatformType", "linux"]
+        if let installAt { argv += ["+force_install_dir", installAt.path] }
+        return argv + ["+login", account.trimmingCharacters(in: .whitespaces), "+app_info_update", "1"] + commands + ["+quit"]
+    }
     static let download = URL(string: "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz")!
     /// Homebrew's steamcmd if there is one (it may hold a sign-in already), else the app's own copy.
     static var script: URL {
@@ -18,13 +23,13 @@ enum SteamCmd {
     static var installed: Bool { FileManager.default.isExecutableFile(atPath: script.path) }
 
     /// Downloads steamcmd from Valve into the app's folder and unpacks it (it updates itself on its first run).
-    static func install() async throws {
-        try FileManager.default.createDirectory(at: Paths.steamcmd, withIntermediateDirectories: true)
+    static func install(at destination: URL = Paths.steamcmd) async throws {
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         let (file, response) = try await URLSession.shared.download(from: download)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw Failure(T("steamcmd could not be downloaded from Valve", "Valve から steamcmd をダウンロードできませんでした")) }
-        let r = await run("/usr/bin/tar", ["-xzf", file.path, "-C", Paths.steamcmd.path])
+        let r = await run("/usr/bin/tar", ["-xzf", file.path, "-C", destination.path])
         try? FileManager.default.removeItem(at: file)
-        guard r.status == 0, installed else { throw Failure(r.text) }
+        guard r.status == 0, FileManager.default.isExecutableFile(atPath: destination.appendingPathComponent("steamcmd.sh").path) else { throw Failure(r.text) }
     }
 }
 
@@ -40,6 +45,8 @@ enum SteamCmd {
     var running = false
     var exitStatus: Int32? = nil
     var phoneConfirmation = false         // steamcmd waits for the sign-in to be approved in the Steam Mobile app
+    /// Metadata can be longer than the console's 600 visible lines. Never includes typed input.
+    @ObservationIgnored private(set) var transcript = ""
 
     @ObservationIgnored private var master: Int32 = -1
     @ObservationIgnored private var pid: pid_t = 0
@@ -48,10 +55,11 @@ enum SteamCmd {
     @ObservationIgnored private var waiters: [CheckedContinuation<Int32, Never>] = []
     @ObservationIgnored private var pending = Data()
 
-    func clear() { lines = []; partial = ""; asking = nil; progress = nil; stage = ""; exitStatus = nil; phoneConfirmation = false }
+    func clear() { lines = []; partial = ""; asking = nil; progress = nil; stage = ""; exitStatus = nil; phoneConfirmation = false; transcript = ""; pending = Data() }
 
     /// Starts the program (argv[0] a path) in a new session whose controlling terminal is the pseudo-terminal.
     func start(_ argv: [String], environment: [String: String]) throws {
+        guard !running else { throw Failure("Another download is running") }
         clear()
         var m: Int32 = -1, s: Int32 = -1
         var size = winsize(ws_row: 50, ws_col: 200, ws_xpixel: 0, ws_ypixel: 0)
@@ -76,16 +84,18 @@ enum SteamCmd {
         close(s)
         guard r == 0 else { close(m); throw Failure("\(argv[0]): \(String(cString: strerror(r)))") }
         master = m
+        _ = fcntl(m, F_SETFL, fcntl(m, F_GETFL) | O_NONBLOCK)
         pid = child
         running = true
         let fd = m
-        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .global())
+        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
         src.setEventHandler { [weak self] in
             var buf = [UInt8](repeating: 0, count: 16384)
             let n = read(fd, &buf, buf.count)
+            if n < 0 && (errno == EAGAIN || errno == EINTR) { return }
             if n <= 0 { src.cancel(); return }
             let data = Data(buf[0..<n])
-            Task { @MainActor in self?.take(data) }
+            MainActor.assumeIsolated { self?.take(data) }
         }
         src.setCancelHandler { close(fd) }
         src.resume()
@@ -121,10 +131,24 @@ enum SteamCmd {
         guard running, pid > 0 else { return }
         kill(pid, SIGINT)
         let p = pid
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5) { kill(p, SIGKILL) }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self, running, pid == p else { return }
+            kill(p, SIGKILL)
+        }
     }
 
     private func ended(_ code: Int32) {
+        // The process-exit event can arrive before the final terminal-read event.
+        // Drain it before a caller parses app_info_print or starts the next depot.
+        if master >= 0 {
+            var bytes = [UInt8](repeating: 0, count: 16384)
+            while true {
+                let count = read(master, &bytes, bytes.count)
+                if count <= 0 { break }
+                take(Data(bytes[0..<count]))
+            }
+        }
         running = false
         exitStatus = code
         asking = nil
@@ -149,6 +173,8 @@ enum SteamCmd {
         let text = String(decoding: pending.prefix(cut), as: UTF8.self)
         pending = Data(pending.dropFirst(cut))
         let clean = Console.escape.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
+        transcript += clean
+        if transcript.utf8.count > 16 << 20 { transcript = String(transcript.suffix(8 << 20)) }
         for ch in clean {
             switch ch {
             case "\r\n", "\n": finishLine()

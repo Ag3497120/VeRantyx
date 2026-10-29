@@ -69,6 +69,10 @@ the ones no longer used, and placeholders that differ): run it after changing a 
 
 ## Build
 
+`VERANTYX_APP_BUILD_DIR` selects another output folder, for example
+`VERANTYX_APP_BUILD_DIR="$PWD/build/app-native-fixes" MacApp/build_app.sh`.
+This leaves an app already open from `build/app` in place.
+
 ```bash
 MacApp/build_app.sh                    # build/app/VeRantyx.app and build/app/VeRantyx-<version>.dmg, signed ad hoc
 ```
@@ -121,3 +125,36 @@ VeRantyx.app/Contents/MacOS/VeRantyx -language ko --snapshot <folder>   # the sa
 
 Not checked yet: a real steamcmd sign-in and download through the app (it needs the player's own account), a Quest or
 Pico, copying from another disk.
+
+## Native ARM64 Alyx — 2026-10-27
+
+`MacApp/build_app.sh` now includes the native host, session helper and MoltenVK,
+with pinned build dependencies fetched inside `NativeARM/build`. Locally the
+app and its helpers are signed ad hoc; Apple Developer membership is optional.
+When MinGW is unavailable, a source-matched installed `/Applications/VeRantyx.app`
+can supply the unchanged Windows driver, capture proxy and ALVR bridge. New
+builds record component source and binary SHA-256 fingerprints; subsequent
+rebuilds can reuse the last local bundle even when its app/UI source is modified.
+A clean source revision is accepted for older bundles. Set `VERANTYX_BASE_APP`
+to choose another base explicitly. A source or binary mismatch stops the build;
+it never installs a system toolchain.
+
+Get started has one **Game launch mode** choice: Windows / Native ARM64.
+Supported titles use that preference; Windows-only titles keep Windows with an
+explicit badge. `Title.nativeSupport` declares native adapters so setup and Play
+cards do not identify native games by Alyx's app ID. Setup downloads the selected
+variants, adds Windows dependencies when needed, and never autoplays a game.
+Native uses ALVR for Pico / Quest and its own installation record; it needs no
+Windows SteamVR / Microsoft DLLs. Picture quality appears once in Play and is
+mapped to each runtime's preset. Existing per-Alyx preferences are migrated.
+Install and play entirely through the app. The compiled helper owns its children and waits for real ALVR tracking
+and eye geometry. The session card can record 60-second FPS comparisons.
+
+[Native setup, tests and what the user still needs to check](../NativeARM/README.md).
+No native game or headset verification is implied by a successful build.
+
+Native content reuse (2026-10-27): existing Windows files seed a separate APFS
+working copy; Linux SteamCMD validates and updates it. Different manifest IDs
+no longer force a full-game redownload. Retry preserves updated files. Actual
+network and staging size are determined by Steam; synthetic tests cover source
+isolation, in-place writes, resume and completed-depot validation.

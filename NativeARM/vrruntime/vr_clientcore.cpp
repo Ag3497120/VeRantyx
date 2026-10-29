@@ -9,6 +9,8 @@
 
 vr::IVRSystem *vrrt_system();
 vr::IVRCompositor *vrrt_compositor();
+void vrrt_compositor_shutdown();
+void vrrt_compositor_resume();
 vr::IVRInput *vrrt_input();
 void *vrrt_misc_interface(const char *name);
 
@@ -25,6 +27,8 @@ namespace {
 class ClientCore : public Stub_IVRClientCore {
 public:
     vr::EVRInitError Init(vr::EVRApplicationType eApplicationType, const char *pStartupInfo) override {
+        if (!vrrt::shm_ready()) return vr::VRInitError_Init_Internal;
+        vrrt_compositor_resume();
         vrrt::log("IVRClientCore::Init(app type %d%s%s)", (int)eApplicationType,
                   pStartupInfo && *pStartupInfo ? ", startup info " : "", pStartupInfo ? pStartupInfo : "");
         // The devices exist from the start; tell the application so.
@@ -37,7 +41,7 @@ public:
         }
         return vr::VRInitError_None;
     }
-    void Cleanup() override { vrrt::log("IVRClientCore::Cleanup"); }
+    void Cleanup() override { vrrt_compositor_shutdown(); vrrt::log("IVRClientCore::Cleanup"); }
     vr::EVRInitError IsInterfaceVersionValid(const char *v) override {
         vr::EVRInitError err = vr::VRInitError_None;
         return GetGenericInterface(v, &err) ? vr::VRInitError_None : vr::VRInitError_Init_InterfaceNotFound;

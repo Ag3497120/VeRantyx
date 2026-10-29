@@ -1,0 +1,13 @@
+# Synthetic room with a back wall and floor, facing the tracked head.
+v -3 0 -4
+v 3 0 -4
+v 3 3 -4
+v -3 3 -4
+v -3 0 1
+v 3 0 1
+vt 0 0
+vt 1 0
+vt 1 1
+vt 0 1
+f 1/1 2/2 3/3 4/4
+f 1/1 5/4 6/3 2/2

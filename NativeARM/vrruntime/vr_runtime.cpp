@@ -1,6 +1,7 @@
 // Shared state of the VeRantyx OpenVR runtime: shared memory with the Mac
 // encoder, pose sampling, display pacing, events. See vr_runtime.h.
 #include "vr_runtime.h"
+#include "json_mini.h"
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -18,6 +19,80 @@
 
 namespace vrrt {
 
+bool publish_file(const char *variable, const std::string &text) {
+    const char *path = getenv(variable);
+    if (!path || !*path) return false;
+    if (text.empty()) return unlink(path) == 0 || errno == ENOENT;
+    std::string temporary = std::string(path) + ".XXXXXX";
+    int fd = mkstemp(temporary.data());
+    if (fd < 0) return false;
+    size_t written = 0;
+    while (written < text.size()) {
+        ssize_t n = write(fd, text.data() + written, text.size() - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        written += (size_t)n;
+    }
+    bool closed = close(fd) == 0;
+    bool ok = written == text.size() && closed && rename(temporary.c_str(), path) == 0;
+    unlink(temporary.c_str());
+    return ok;
+}
+
+// The mailbox announces the input hint before the engine finishes its first
+// frame. Only the pause at the end of this load makes that hint actionable.
+static std::mutex g_loading_mu;
+static std::string g_loading, g_loading_prompt;
+static bool g_loading_paused, g_initial_load = true, g_loading_hidden;
+static void publish_loading_locked() {
+    // show_message carries localized text; readiness must not depend on its wording.
+    std::string prompt = g_loading_hidden || !g_loading_paused ? "" : g_loading_prompt;
+    publish_file("VERANTYX_GAME_PROMPT_FILE", prompt);
+    size_t end = g_loading.find_last_of('}');
+    publish_file("VERANTYX_NATIVE_LOADING_FILE", end == std::string::npos ? "" :
+        g_loading.substr(0, end) + ",\"visible\":" + (g_loading_hidden ? "false" : "true") +
+        ",\"messageText\":" + json::quote(prompt) + "}");
+}
+void loading_reset() {
+    std::lock_guard<std::mutex> lock(g_loading_mu);
+    g_loading.clear(); g_loading_prompt.clear(); g_loading_paused = false; g_loading_hidden = false;
+    publish_loading_locked();
+}
+void loading_message(const std::string &message) {
+    json::Value body;
+    if (!json::Parser(message).parse(body)) return;
+    std::lock_guard<std::mutex> lock(g_loading_mu);
+    const std::string type = body["type"].string_or("");
+    if (type == "begin_loading") {
+        g_loading = message; g_loading_prompt.clear(); g_loading_paused = false;
+        g_loading_hidden = g_initial_load && body["mapName"].string_or("") == "startup";
+    } else if (type == "end_loading") {
+        if (!g_loading.empty()) g_initial_load = false;
+        g_loading.clear(); g_loading_prompt.clear(); g_loading_paused = false; g_loading_hidden = false;
+    } else if (type == "show_message") {
+        if (g_loading.empty()) return; // a late hint cannot resurrect a completed load
+        g_loading_prompt = body["text"].string_or("");
+    } else return;
+    publish_loading_locked();
+}
+void loading_log(const char *text) {
+    if (!text || !strstr(text, "paused the game")) return;
+    std::string line(text);
+    const size_t end = line.find_last_not_of("\r\n ");
+    if (end == std::string::npos) return;
+    line.resize(end + 1);
+    auto ends = [&](const char *suffix) {
+        size_t n = strlen(suffix);
+        return line.size() > n && line.compare(line.size() - n, n, suffix) == 0;
+    };
+    const bool paused = ends(" paused the game");
+    if (!paused && !ends(" unpaused the game")) return;
+    std::lock_guard<std::mutex> lock(g_loading_mu);
+    if (g_loading.empty() || g_loading_paused == paused) return;
+    g_loading_paused = paused;
+    publish_loading_locked();
+}
+
 static Config g_cfg;
 Config &config() { return g_cfg; }
 
@@ -28,12 +103,12 @@ static SharedFrame *g_frames[2];
 static uint8_t *g_pixels[2];
 static std::mutex g_mu;
 static PoseSet g_last;
-static bool g_haveLast;
+static std::mutex g_sampleMu;
 static std::deque<vr::VREvent_t> g_events;
 static std::mutex g_evmu;
 static double g_epoch;
-static uint64_t g_frameCounter;
-static double g_lastVsync;
+static std::atomic<uint64_t> g_frameCounter{0};
+static std::atomic<double> g_lastVsync{0};
 static uint32_t g_frameSequence;
 
 void log(const char *fmt, ...) {
@@ -51,28 +126,28 @@ static double env_number(const char *name, double dflt, double lo, double hi) {
     const char *v = getenv(name);
     if (!v || !*v) return dflt;
     char *end = nullptr; double d = strtod(v, &end);
-    if (end == v || !std::isfinite(d) || d < lo || d > hi) return dflt;
+    if (end == v || *end || !std::isfinite(d) || d < lo || d > hi) return dflt;
     return d;
 }
 
-static std::string home() { const char *h = getenv("HOME"); return h ? h : "/tmp"; }
-
 static std::string shm_path() {
     const char *p = getenv("VERANTYX_SHARED_FRAME");
-    if (p && *p) return p;
-    const char *wp = getenv("WINEPREFIX");
-    if (wp && *wp) return std::string(wp) + "/drive_c/vr_shared_frame.dat";
-    return home() + "/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test/drive_c/vr_shared_frame.dat";
+    return p && *p ? p : "";
 }
 
 static bool shm_open_map() {
     if (g_map) return true;
     std::string path = shm_path();
+    if (path.empty()) { log("VERANTYX_SHARED_FRAME is required; start native Alyx from VeRantyx"); return false; }
     int fd = open(path.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) { log("cannot open shared frame file %s: %s", path.c_str(), strerror(errno)); return false; }
     struct stat sb;
-    if (fstat(fd, &sb) == 0 && (size_t)sb.st_size < kSharedMapSize && ftruncate(fd, (off_t)kSharedMapSize) != 0)
-        log("cannot size %s to %zu bytes: %s", path.c_str(), kSharedMapSize, strerror(errno));
+    if (fstat(fd, &sb) != 0 || !S_ISREG(sb.st_mode) ||
+        ((size_t)sb.st_size < kSharedMapSize && ftruncate(fd, (off_t)kSharedMapSize) != 0)) {
+        log("cannot size shared frame file %s: %s", path.c_str(), strerror(errno));
+        close(fd);
+        return false;
+    }
     void *m = mmap(nullptr, kSharedMapSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (m == MAP_FAILED) { log("mmap %s: %s", path.c_str(), strerror(errno)); return false; }
@@ -91,24 +166,65 @@ bool shm_ready() { return g_map != nullptr; }
 uint8_t *shm_base() { return g_map; }
 
 bool read_hands(SharedHands *out) {
-    if (!g_map) return false;
+    if (!g_map || !out) return false;
     for (int attempt = 0; attempt < 64; attempt++) {
         int32_t s1 = __atomic_load_n(&g_hdr->poseSequence, __ATOMIC_ACQUIRE);
-        if (s1 & 1) continue;
-        memcpy(out, g_hands, sizeof *out);
+        if (!s1 || (s1 & 1)) continue;
+        SharedHands snapshot;
+        memcpy(&snapshot, g_hands, sizeof snapshot);
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         int32_t s2 = __atomic_load_n(&g_hdr->poseSequence, __ATOMIC_ACQUIRE);
-        if (s1 == s2) return true;
+        if (s1 == s2) { *out = snapshot; return true; }
     }
-    memcpy(out, g_hands, sizeof *out);
+    return false;                          // never hand a torn pose to the game
+}
+
+float headset_ipd() {
+    if (getenv("VERANTYX_IPD")) return g_cfg.ipd;
+    if (g_map) {
+        const SharedExtras *extras = (const SharedExtras *)(g_map + kExtrasOffset);
+        if (__atomic_load_n(&extras->ipdMagic, __ATOMIC_ACQUIRE) == kIpdMagic) {
+            float ipd = extras->ipdMeters;
+            if (std::isfinite(ipd) && ipd >= 0.04f && ipd <= 0.09f) return ipd;
+        }
+    }
+    return g_cfg.ipd;
+}
+
+struct PendingHaptic { int hand; double at; float duration, frequency, amplitude; };
+static std::deque<PendingHaptic> g_haptics;
+static std::mutex g_hapticMu;
+static void flush_haptics_locked(double now) {
+    for (auto it = g_haptics.begin(); it != g_haptics.end();) {
+        if (it->at > now) { ++it; continue; }
+        SharedHaptic *dst = (SharedHaptic *)(g_map + kHapticsOffset) + it->hand;
+        dst->durationSeconds = it->duration; dst->frequency = it->frequency; dst->amplitude = it->amplitude;
+        uint32_t seq = __atomic_load_n(&dst->sequence, __ATOMIC_RELAXED) + 1u;
+        __atomic_store_n(&dst->sequence, seq ? seq : 1u, __ATOMIC_RELEASE);
+        it = g_haptics.erase(it);
+    }
+}
+bool haptic(int hand, float start, float duration, float frequency, float amplitude) {
+    if (!g_map || hand < 0 || hand > 1 || !std::isfinite(start) || !std::isfinite(duration) ||
+        !std::isfinite(frequency) || !std::isfinite(amplitude) || start < 0 || start > 5 || duration < 0 ||
+        frequency < 0 || amplitude < 0 || amplitude > 1) return false;
+    std::lock_guard<std::mutex> l(g_hapticMu);
+    if (g_haptics.size() >= 64) return false;
+    double now = now_seconds();
+    g_haptics.push_back({ hand, now + start, std::min(duration, 5.f), frequency, amplitude });
+    flush_haptics_locked(now);
     return true;
 }
 
 uint8_t *frame_begin(uint32_t combinedWidth, uint32_t height, uint32_t *writeIndex) {
-    if (!g_map) return nullptr;
-    if ((size_t)combinedWidth * height * 4 > kMaxPixelBytes) return nullptr;
+    if (!g_map || !writeIndex || !combinedWidth || !height || combinedWidth > 8192 || height > 4096) return nullptr;
+    if ((uint64_t)combinedWidth * height * 4 > kMaxPixelBytes) return nullptr;
     uint32_t idx = ((uint32_t)__atomic_load_n(&g_hdr->latestReadyIndex, __ATOMIC_ACQUIRE) & 1u) ^ 1u;
     *writeIndex = idx;
+    // The consumer may still be copying this slot from two frames ago.
+    // Invalidate its sequence before touching any pixel, so it drops that copy.
+    __atomic_store_n(&g_frames[idx]->sequenceNumber, 0u, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     return g_pixels[idx];
 }
 
@@ -131,11 +247,10 @@ void frame_publish(uint32_t idx, uint32_t combinedWidth, uint32_t height, uint32
     publish_effective_tangents();
     SharedFrame *f = g_frames[idx & 1];
     uint32_t seq = ++g_frameSequence; if (seq == 0) seq = ++g_frameSequence;
-    f->sequenceNumber = seq;
     f->width = combinedWidth; f->height = height; f->format = format;
     memcpy(f->renderHeadTransform, renderHeadTransform, sizeof f->renderHeadTransform);
     f->visionTimestamp = visionTimestamp;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&f->sequenceNumber, seq, __ATOMIC_RELEASE);
     __atomic_store_n(&g_hdr->latestReadyIndex, (int32_t)idx, __ATOMIC_RELEASE);
     __atomic_store_n(&g_hdr->captureSourceMode, 2, __ATOMIC_RELEASE);     // game frames
 }
@@ -152,10 +267,11 @@ static void latch_tangents() {
     if (read_hands(&h) && valid_tangents(h.leftTangents) && valid_tangents(h.rightTangents)) {
         memcpy(g_cfg.tangentsLeft, h.leftTangents, sizeof g_cfg.tangentsLeft);
         memcpy(g_cfg.tangentsRight, h.rightTangents, sizeof g_cfg.tangentsRight);
-        source = "live Vision Pro frustum";
+        source = "live headset frustum";
     } else {
-        // The Windows driver saved the headset's frustum beside the prefix.
-        std::string p = home() + "/Verantyx_VR_Drive/SteamVR_Prefix_Wine11_Test/drive_c/vr_verantyx_tangents.txt";
+        // The encoder saves the headset's frustum beside this session's map.
+        std::string framePath = shm_path();
+        std::string p = framePath.substr(0, framePath.find_last_of('/') + 1) + "vr_verantyx_tangents.txt";
         const char *env = getenv("VERANTYX_TANGENTS_FILE");
         if (env && *env) p = env;
         FILE *f = fopen(p.c_str(), "r");
@@ -164,7 +280,7 @@ static void latch_tangents() {
             if (fscanf(f, "%f %f %f %f %f %f %f %f", &t[0], &t[1], &t[2], &t[3], &t[4], &t[5], &t[6], &t[7]) == 8 &&
                 valid_tangents(t) && valid_tangents(t + 4)) {
                 memcpy(g_cfg.tangentsLeft, t, 16); memcpy(g_cfg.tangentsRight, t + 4, 16);
-                source = "Vision Pro frustum saved by a previous session";
+                source = "headset frustum saved beside the shared map";
             }
             fclose(f);
         }
@@ -278,21 +394,44 @@ static float g_heldHead[16];
 static bool g_haveHeldHead;
 
 void sample_poses(PoseSet *out, double predictSeconds) {
+    std::lock_guard<std::mutex> sampleLock(g_sampleMu);
+    { std::lock_guard<std::mutex> l(g_hapticMu); if (g_map) flush_haptics_locked(now_seconds()); }
     (void)predictSeconds;
     memset(out, 0, sizeof *out);
     SharedHands h = {};
-    bool have = read_hands(&h);
+    const bool coherent = read_hands(&h);
+    static SharedHands previousHands;
+    static bool havePreviousHands;
+    if (coherent) { previousHands = h; havePreviousHands = true; }
+    else if (havePreviousHands) h = previousHands;
+    // A writer may be preempted with an odd sequence. Preserve its last whole
+    // packet, including the ALVR pose ID and held buttons; only advancing
+    // timestamps below refresh liveness, so a stalled writer still times out.
+    const bool have = coherent || havePreviousHands;
+    bool validTime = have && std::isfinite(h.visionTimestamp) && h.visionTimestamp > 0;
     double now = now_seconds();
     bool fresh = have && g_presence.update(h.visionTimestamp, h.headTracked != 0 && finite16(h.headTransform), now);
     static double lastInputTs, lastInputAdvance;
-    if (have && std::isfinite(h.visionTimestamp) && h.visionTimestamp > 0) {
+    if (validTime) {
         if (h.visionTimestamp != lastInputTs) { lastInputTs = h.visionTimestamp; lastInputAdvance = now; }
     }
-    const bool inputsFresh = have && lastInputAdvance > 0 && now - lastInputAdvance < 0.5;
+    const bool inputsFresh = validTime && lastInputAdvance > 0 && now - lastInputAdvance < 0.5;
     out->hands = h;
     out->fresh = fresh;
     out->inputsFresh = inputsFresh;
-    out->visionTimestamp = have ? h.visionTimestamp : 0.0;
+    out->visionTimestamp = validTime ? h.visionTimestamp : 0.0;
+    if (!coherent) {
+        static uint64_t misses, reused;
+        static double lastLog;
+        misses++; if (havePreviousHands) reused++;
+        if (misses == 1 || now - lastLog >= 5.0) {
+            lastLog = now;
+            log("pose snapshot unavailable: reads=%llu reused=%llu inputAge=%.1fms inputsFresh=%d timestamp=%.9f",
+                (unsigned long long)misses, (unsigned long long)reused,
+                lastInputAdvance > 0 ? (now - lastInputAdvance) * 1000.0 : -1.0,
+                (int)inputsFresh, out->visionTimestamp);
+        }
+    }
 
     // Head.
     const float *head = nullptr;
@@ -326,8 +465,11 @@ void sample_poses(PoseSet *out, double predictSeconds) {
             p.eTrackingResult = vr::TrackingResult_Running_OK;
             p.bPoseIsValid = true;
             if (h.velocityValid) {
-                const float *lv = hand == 0 ? h.leftVelocity : h.rightVelocity;
-                const float *av = hand == 0 ? h.leftAngularVelocity : h.rightAngularVelocity;
+                // The wire layout starts angular velocities at byte 287.
+                // Taking a float pointer loses the packed-field alignment.
+                float lv[3], av[3];
+                memcpy(lv, hand == 0 ? h.leftVelocity : h.rightVelocity, sizeof lv);
+                memcpy(av, hand == 0 ? h.leftAngularVelocity : h.rightAngularVelocity, sizeof av);
                 for (int i = 0; i < 3; i++) {
                     p.vVelocity.v[i] = std::isfinite(lv[i]) ? lv[i] : 0.f;
                     p.vAngularVelocity.v[i] = std::isfinite(av[i]) ? av[i] : 0.f;
@@ -346,13 +488,13 @@ void sample_poses(PoseSet *out, double predictSeconds) {
     }
 }
 
-const PoseSet &last_poses() { return g_last; }
-void set_last_poses(const PoseSet &p) { std::lock_guard<std::mutex> l(g_mu); g_last = p; g_haveLast = true; }
+PoseSet last_poses() { std::lock_guard<std::mutex> l(g_mu); return g_last; }
+void set_last_poses(const PoseSet &p) { std::lock_guard<std::mutex> l(g_mu); g_last = p; }
 
 // ---- time ----
 double display_period() { return 1.0 / g_cfg.displayHz; }
-uint64_t frame_counter() { return g_frameCounter; }
-double seconds_since_vsync() { return now_seconds() - g_lastVsync; }
+uint64_t frame_counter() { return g_frameCounter.load(std::memory_order_relaxed); }
+double seconds_since_vsync() { return now_seconds() - g_lastVsync.load(std::memory_order_relaxed); }
 
 void wait_next_vsync() {
     const double period = display_period();
@@ -371,9 +513,25 @@ void wait_next_vsync() {
 }
 
 // ---- events ----
+static uint64_t g_stage_token;
+void expect_stage_ready(uint64_t token) {
+    std::lock_guard<std::mutex> l(g_evmu);
+    g_stage_token = token;
+}
 void push_event(const vr::VREvent_t &e) { std::lock_guard<std::mutex> l(g_evmu); if (g_events.size() < 256) g_events.push_back(e); }
 bool pop_event(vr::VREvent_t *e) {
     std::lock_guard<std::mutex> l(g_evmu);
+    if (g_stage_token) {
+        const char *path = getenv("VERANTYX_NATIVE_STAGE_FILE");
+        FILE *f = path ? fopen((std::string(path) + ".ready").c_str(), "r") : nullptr;
+        unsigned long long ready = 0;
+        if (f) { if (fscanf(f, "%llu", &ready) != 1) ready = 0; fclose(f); }
+        if (ready == g_stage_token) {
+            vr::VREvent_t event = {};
+            event.eventType = vr::VREvent_Compositor_StageOverrideReady;
+            g_events.push_back(event); g_stage_token = 0;
+        }
+    }
     if (g_events.empty()) return false;
     *e = g_events.front(); g_events.pop_front(); return true;
 }
@@ -381,3 +539,5 @@ bool pop_event(vr::VREvent_t *e) {
 } // namespace vrrt
 
 extern "C" void vrrt_init(const char *gameDir) { vrrt::init(gameDir); }
+
+extern "C" void vrrt_loading_log(const char *text) { vrrt::loading_log(text); }

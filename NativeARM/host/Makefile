@@ -9,25 +9,29 @@
 KL  ?= ../build/Klepton
 OUT ?= ../build/host
 CC  := clang
+MACOS_MIN ?= 14.2
 
-RUNTIME := $(shell $(MAKE) -s -C $(KL) -f Makefile -f $(CURDIR)/print-runtime.mk print-runtime)
+RUNTIME_ALL := $(shell $(MAKE) -s -C $(KL) -f Makefile -f $(CURDIR)/print-runtime.mk print-runtime)
+# Android menu fonts and Valve's fallback HRTF dataset are unnecessary for this
+# Linux host. Game assets must come from the user's own Steam installation.
+RUNTIME := $(filter-out runtime/media/kl_phonon_hrtf.S runtime/media/kl_menu_font.S,$(RUNTIME_ALL))
 INC := -I$(KL)/runtime -I$(KL)/runtime/jni -I$(KL)/runtime/libc -I$(KL)/runtime/gfx \
        -I$(KL)/runtime/xr -I$(KL)/runtime/media -I$(KL)/runtime/guest -I$(KL)/runtime/diag \
        -I$(KL)/vendor-moltenvk/out/include
-CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(INC)
+CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 -mmacosx-version-min=$(MACOS_MIN) $(INC)
 LDLIBS := -lz -lresolv -liconv -framework AudioToolbox -framework CoreAudio \
           -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
           -framework CoreFoundation -framework AVFoundation -framework Foundation
 
 RT_OBJS   := $(patsubst %,$(OUT)/kl/%.o,$(RUNTIME))
-HOST_SRCS := alyx_host.c kl_glibc.c kl_glibc_va.S kl_enginelog.c kl_sdlshim.c kl_steambridge.c kl_luafix.c kl_sdlaudio.c kl_guestfix.c
+HOST_SRCS := alyx_host.c kl_glibc.c kl_glibc_va.S kl_enginelog.c kl_sdlshim.c kl_steambridge.c kl_luafix.c kl_sdlaudio.c kl_guestfix.c kl_optional_data.S
 HOST_OBJS := $(patsubst %,$(OUT)/%.o,$(HOST_SRCS))
 # The OpenVR runtime (C++): ../vrruntime.
 VRRT_DIR  := ../vrruntime
 VRRT_SRCS := $(notdir $(wildcard $(VRRT_DIR)/*.cpp))
 VRRT_OBJS := $(patsubst %,$(OUT)/vrrt/%.o,$(VRRT_SRCS))
-VRRT_HDRS := $(wildcard $(VRRT_DIR)/*.h) $(wildcard $(VRRT_DIR)/openvr/*.h)
-CXXFLAGS  := -std=c++17 -g -O1 -Wall -Wno-unused-parameter -arch arm64 -I$(VRRT_DIR) -I$(KL)/vendor-moltenvk/out/include
+VRRT_HDRS := $(wildcard $(VRRT_DIR)/*.h) $(wildcard $(VRRT_DIR)/*.inc) $(wildcard $(VRRT_DIR)/openvr/*.h)
+CXXFLAGS  := -std=c++17 -g -O1 -Wall -Wno-unused-parameter -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -I$(VRRT_DIR) -I$(KL)/vendor-moltenvk/out/include
 MVK_DIR   := $(abspath $(KL)/vendor-moltenvk/out/macos)
 HDRS      := $(wildcard $(KL)/runtime/*.h) $(wildcard $(KL)/runtime/*/*.h) $(wildcard *.h)
 
@@ -37,7 +41,7 @@ all: $(OUT)/alyx_host
 # under 4 GB, and vm_map_min is 4 GB anyway — see kl_luafix.c for how Valve's
 # low-2 GB LuaJIT arena is handled instead.)
 $(OUT)/alyx_host: $(RT_OBJS) $(HOST_OBJS) $(VRRT_OBJS)
-	clang++ -arch arm64 -g -o $@ $^ $(LDLIBS)
+	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -g -o $@ $^ $(LDLIBS)
 
 $(OUT)/vrrt/%.o: $(VRRT_DIR)/% $(VRRT_HDRS)
 	@mkdir -p $(dir $@)
@@ -48,6 +52,10 @@ $(OUT)/vrrt/%.o: $(VRRT_DIR)/% $(VRRT_HDRS)
 $(OUT)/kl/%.o: $(KL)/% $(HDRS)
 	@mkdir -p $(dir $@)
 	cd $(KL) && $(CC) $(subst -I$(KL)/,-I,$(CFLAGS)) -w -c -o $(abspath $@) $*
+
+$(OUT)/kl/runtime/gfx/kl_vulkan.c.o: $(KL)/runtime/gfx/kl_vk_async.inc
+$(OUT)/kl/runtime/gfx/kl_vulkan.c.o: $(KL)/runtime/gfx/kl_vk_compat.inc
+$(OUT)/kl/runtime/gfx/kl_vulkan.c.o: $(KL)/runtime/gfx/kl_vk_shadow.inc
 
 $(OUT)/%.o: % $(HDRS)
 	@mkdir -p $(dir $@)
@@ -60,4 +68,14 @@ probe: $(OUT)/alyx_host
 clean:
 	rm -rf $(OUT)
 
-.PHONY: all probe clean
+$(OUT)/host_files.o: ../tests/host_files.c
+	$(CC) $(CFLAGS) -I. -c $< -o $@
+
+$(OUT)/host_files: $(OUT)/host_files.o $(RT_OBJS) $(filter-out $(OUT)/alyx_host.c.o,$(HOST_OBJS)) $(VRRT_OBJS)
+	clang++ -arch arm64 -mmacosx-version-min=$(MACOS_MIN) -o $@ $^ $(LDLIBS)
+
+check: $(OUT)/host_files
+	@mkdir -p $(OUT)/file-test
+	$(OUT)/host_files $(abspath $(OUT)/file-test)
+
+.PHONY: all probe clean check

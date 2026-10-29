@@ -1,0 +1,16 @@
+{
+  "action_sets": [{"name": "/actions/main"}, {"name": "/actions/ui"}],
+  "actions": [
+    {"name": "/actions/main/in/use", "type": "boolean"},
+    {"name": "/actions/main/in/pull", "type": "boolean"},
+    {"name": "/actions/main/in/walk", "type": "vector2"},
+    {"name": "/actions/main/in/teleport", "type": "boolean"},
+    {"name": "/actions/main/in/toggle", "type": "boolean"},
+    {"name": "/actions/main/in/leftpose", "type": "pose"},
+    {"name": "/actions/main/in/hands", "type": "pose"},
+    {"name": "/actions/main/in/leftskeleton", "type": "skeleton"},
+    {"name": "/actions/main/out/haptic", "type": "vibration"},
+    {"name": "/actions/ui/in/select", "type": "boolean"}
+  ],
+  "default_bindings": [{"controller_type": "oculus_touch", "binding_url": "touch.json"}]
+}

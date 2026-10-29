@@ -36,7 +36,7 @@ def patch(relpath, edits):
         print(f"already  {relpath}")
 
 
-for name in ("kl_tls.h", "kl_tls.c", "kl_tls.S", "gfx/kl_vk_async.inc"):
+for name in ("kl_tls.h", "kl_tls.c", "kl_tls.S", "gfx/kl_vk_async.inc", "gfx/kl_vk_compat.inc", "gfx/kl_vk_shadow.inc"):
     src = os.path.join(HERE, "runtime", os.path.basename(name))
     dst = os.path.join(ROOT, "runtime", name)
     if not os.path.exists(dst) or open(src, "rb").read() != open(dst, "rb").read():
@@ -830,13 +830,53 @@ patch("runtime/libc/kl_libc.c", [
 ])
 # ---- kl_vulkan.c: asynchronous graphics pipelines (runtime/gfx/kl_vk_async.inc)
 patch("runtime/gfx/kl_vulkan.c", [
+    ("static void VKAPI_CALL klvk_CmdBeginRendering(VkCommandBuffer cb,\n",
+     '#include "kl_vk_shadow.inc"\n\n', "before", '#include "kl_vk_shadow.inc"'),
+    ("    if (klvk_trace() && ri) {\n", "    klvs_trace_rendering(cb,ri);\n", "before", "klvs_trace_rendering(cb,ri);"),
+    ("static VkResult VKAPI_CALL klvk_EnumerateDeviceExtensionProperties(\n",
+     '#include "kl_vk_compat.inc"\n\n', "before", '#include "kl_vk_compat.inc"'),
+])
+vulkan_path = os.path.join(ROOT, "runtime/gfx/kl_vulkan.c")
+vulkan_source = open(vulkan_path).read()
+extension_start = vulkan_source.index("static VkResult VKAPI_CALL klvk_EnumerateDeviceExtensionProperties(")
+extension_end = vulkan_source.index("static void VKAPI_CALL klvk_GetPhysicalDeviceMemoryProperties2", extension_start)
+extension_body = vulkan_source[extension_start:extension_end]
+if "kvc_enumerate_extensions" not in extension_body:
+    old = "    if (real) return real(pd, layer, count, props);"
+    assert old in extension_body
+    extension_body = extension_body.replace(old, '''    PFN_vkGetPhysicalDeviceFeatures2 features = real_gipa ?
+        (PFN_vkGetPhysicalDeviceFeatures2)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2") : NULL;
+    if (!features && real_gipa) features =
+        (PFN_vkGetPhysicalDeviceFeatures2)real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2KHR");
+    if (real) return kvc_enumerate_extensions(real, features, pd, layer, count, props);''')
+    vulkan_source = vulkan_source[:extension_start] + extension_body + vulkan_source[extension_end:]
+    open(vulkan_path, "w").write(vulkan_source)
+old_cache_call = "if (kva_create(dev, n, use, out, real))"
+if old_cache_call in vulkan_source:
+    open(vulkan_path, "w").write(vulkan_source.replace(old_cache_call, "if (kva_create(dev, cache, n, use, out, real))"))
+    print("updated  runtime/gfx/kl_vulkan.c pipeline cache argument")
+vulkan_source = open(vulkan_path).read()
+for old, new in (
+    ("VkResult r = real ? real(dev, cache, n, use, alloc, out)\n                      : VK_ERROR_INITIALIZATION_FAILED;",
+     "VkResult r = kva_inline_graphics(real, dev, cache, n, use, alloc, out);"),
+    ("VkResult r = real ? real(dev, cache, n, ci, alloc, out)\n                      : VK_ERROR_INITIALIZATION_FAILED;",
+     "VkResult r = kva_inline_compute(real, dev, cache, n, ci, alloc, out);"),
+    ("    VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;\n    if (ci && (r != VK_SUCCESS || klvk_trace())) {",
+     "    VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;\n    if (r == VK_SUCCESS && ci && out) kva_record_pass(*out, ci, NULL);\n    if (ci && (r != VK_SUCCESS || klvk_trace())) {"),
+    ("    VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;\n    if (r == VK_SUCCESS && out && probe_att != VK_ATTACHMENT_UNUSED)",
+     "    VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;\n    if (r == VK_SUCCESS && ci && out) kva_record_pass(*out, NULL, ci);\n    if (r == VK_SUCCESS && out && probe_att != VK_ATTACHMENT_UNUSED)"),
+):
+    if old in vulkan_source:
+        vulkan_source = vulkan_source.replace(old, new, 1)
+open(vulkan_path, "w").write(vulkan_source)
+patch("runtime/gfx/kl_vulkan.c", [
     ("static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,\n",
      "#include \"kl_vk_async.inc\"\n\n", "before", '#include "kl_vk_async.inc"'),
-    ("    double t0 = kl_pipe_ms();\n    VkResult r = real ? real(dev, cache, n, use, alloc, out)\n",
-     "    if (kva_create(dev, n, use, out, real)) { free(mod); free(ias); g_pipe_gfx += n; return VK_SUCCESS; }\n",
-     "before", "if (kva_create(dev, n, use, out, real))"),
+    ("    double t0 = kl_pipe_ms();\n    VkResult r = kva_inline_graphics(real, dev, cache, n, use, alloc, out);",
+     "    if (kva_create(dev, cache, n, use, out, real)) { free(mod); free(ias); g_pipe_gfx += n; return VK_SUCCESS; }\n",
+     "before", "if (kva_create(dev, cache, n, use, out, real))"),
     ("        real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, \"vkCmdBindPipeline\");\n",
-     "    {   // async pipelines: a placeholder still compiling binds nothing (draws skipped)\n"
+     "    {   // async pipelines: pending colour/depth materials defer without waiting\n"
      "        uint64_t b = kva_bind(cb, bindPoint, pipeline);\n"
      "        if (!b && pipeline && kva_of(pipeline)) return;\n"
      "        pipeline = b;\n"
@@ -854,5 +894,9 @@ patch("runtime/gfx/kl_vulkan.c", [
      "    E(DestroyPipeline), E(DestroyShaderModule), E(DestroyPipelineLayout),\n"
      "    E(DestroyRenderPass), E(DestroyDescriptorSetLayout),\n",
      "after", "E(DestroyPipeline), E(DestroyShaderModule)"),
+    ("    E(CreateGraphicsPipelines), E(CreateComputePipelines),\n",
+     "    E(CreatePipelineCache), E(GetPipelineCacheData), E(MergePipelineCaches), E(DestroyPipelineCache),\n",
+     "after", "E(CreatePipelineCache), E(GetPipelineCacheData)"),
+    ("    E(CreatePipelineCache),", "    E(DestroyDevice),\n", "before", "E(DestroyDevice)"),
 ])
 print("done")

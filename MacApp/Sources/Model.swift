@@ -13,7 +13,7 @@ struct Game: Identifiable, Hashable {
     var antiCheat: [String]
     var bytes: Int64
     var alyx: Bool { id == "546560" }
-    var playable: Bool { antiCheat.isEmpty && (alyx || exe != nil) }
+    var playable: Bool { antiCheat.isEmpty && (alyx || title?.nativeSupport != nil || exe != nil) }
     var flat: Bool { title?.flat == true }
     /// Started by the player's own Windows Steam (No Man's Sky), not with Mac Steam's bridge.
     var viaWindowsSteam: Bool { title?.windowsSteam == true }
@@ -47,6 +47,7 @@ struct Job {
 }
 
 @MainActor @Observable final class AppModel {
+    @ObservationIgnored private let savingPreferences: Bool
     var page: Page = .setup
 
     // This Mac
@@ -64,6 +65,17 @@ struct Job {
     var games: [Game] = []
     var steamVR = false
     var redistCount = 0
+    var installedBackends: [String: Set<GameBackend>] = [:]
+    var nativeInstallProblems: [String: String] = [:]
+    var preferredBackend: GameBackend = .vxrt {
+        didSet { if savingPreferences { UserDefaults.standard.set(preferredBackend.rawValue, forKey: "preferredBackend") } }
+    }
+    var setupFocusID: String?
+    var setupDownloading = false
+    @ObservationIgnored private var setupDownloadCancelled = false
+    @ObservationIgnored var nativeDownloadCancelled = false
+    @ObservationIgnored var nativePreparation: Task<Void, Error>?
+    @ObservationIgnored var nativeDownloadTask: Task<Bool, Never>?
 
     // Long jobs
     var job: Job? = nil
@@ -72,29 +84,38 @@ struct Job {
     var showConsole = false
     var importChoice: (library: URL, apps: [SteamApp])? = nil
     var account: String = UserDefaults.standard.string(forKey: "steamAccount") ?? "" {
-        didSet { UserDefaults.standard.set(account, forKey: "steamAccount") }   // (the account name only; never a password)
+        didSet { if savingPreferences { UserDefaults.standard.set(account, forKey: "steamAccount") } }   // (the account name only; never a password)
     }
-    var wanted: Set<String> = [Title.steamVR, "546560"]
+    var wanted: Set<String> = Set(Title.all.filter { $0.id != Title.steamVR }.prefix(1).map(\.id))
 
     // Headset and play
     var headset: Headset = Headset(rawValue: UserDefaults.standard.string(forKey: "headset") ?? "") ?? .quest {
-        didSet { UserDefaults.standard.set(headset.rawValue, forKey: "headset"); if !Quality.choices(for: headset).contains(quality) { quality = .standard } }
+        didSet { if savingPreferences { UserDefaults.standard.set(headset.rawValue, forKey: "headset") }; if !sessionQualityChoices.contains(quality) { quality = .standard } }
     }
-    var wired: Bool = UserDefaults.standard.bool(forKey: "wired") { didSet { UserDefaults.standard.set(wired, forKey: "wired") } }
+    var wired: Bool = UserDefaults.standard.bool(forKey: "wired") { didSet { if savingPreferences { UserDefaults.standard.set(wired, forKey: "wired") } } }
     var quality: Quality = Quality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .standard {
-        didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
+        didSet { if savingPreferences { UserDefaults.standard.set(quality.rawValue, forKey: "quality") } }
     }
     /// Each game's way to the headset, chosen on its card (Route's raw value by app id); a game not in it follows the
     /// Headset page. Kept in the setting "headsetRoutes".
     var routes: [String: String] = (UserDefaults.standard.dictionary(forKey: "headsetRoutes") as? [String: String]) ?? [:] {
-        didSet { UserDefaults.standard.set(routes, forKey: "headsetRoutes") }
+        didSet { if savingPreferences { UserDefaults.standard.set(routes, forKey: "headsetRoutes") } }
     }
     var play: Play? = nil
     var elsewhere: [String] = []          // VXRuntime programs running that the app did not start (the scripts')
     /// The same without the player's Windows Steam itself (steam.exe and its web helper), which runs on between plays.
     var elsewhereBesidesWindowsSteam: [String] { elsewhere.filter { !WindowsSteam.isOwn($0) } }
 
-    init() {
+    init(savingPreferences: Bool = true, refreshAutomatically: Bool = true) {
+        let preferences = LaunchPreferences.load(UserDefaults.standard.dictionaryRepresentation())
+        self.savingPreferences = savingPreferences && !Play.dryRun
+        preferredBackend = preferences.backend
+        quality = preferences.quality
+        if self.savingPreferences {
+            UserDefaults.standard.set(preferences.backend.rawValue, forKey: "preferredBackend")
+            UserDefaults.standard.set(preferences.quality.rawValue, forKey: "quality")
+        }
+        guard refreshAutomatically else { return }
         Task { await refresh() }
         RunLoop.main.add(Timer(timeInterval: 4, repeats: true) { [weak self] _ in Task { @MainActor in await self?.refreshLight() } }, forMode: .common)
     }
@@ -104,9 +125,10 @@ struct Job {
     var appleSilicon: Bool { Mac.appleSilicon }
     var macOSOK: Bool { ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 14, minorVersion: 2, patchVersion: 0)) }
     var gamesInstalled: Bool { !games.isEmpty }
-    var ready: Bool { appleSilicon && rosetta == true && steamInstalled && steamVR && redistCount > 0 }
+    var windowsRuntimeReady: Bool { appleSilicon && macOSOK && rosetta == true && steamInstalled && steamVR && redistCount > 0 }
+    var ready: Bool { setupChecks.allSatisfy { $0 } }
     var setupSteps: (done: Int, of: Int) {
-        let steps = [appleSilicon && macOSOK, rosetta == true, steamInstalled, steamVR && gamesInstalled, redistCount > 0]
+        let steps = setupChecks
         return (steps.filter { $0 }.count, steps.count)
     }
 
@@ -124,7 +146,7 @@ struct Job {
         let wsteam = windowsSteamInstalled ? await WindowsSteam.running() : false
         windowsSteamRunning = wsteam
         freeBytes = Mac.freeSpace(drive)
-        elsewhere = play?.running == true ? [] : await pgrep("[b]uild/vxrt.*\\.[Ee][Xx][Ee]")   // (Steam starts games by upper-case paths)
+        elsewhere = play?.running == true ? [] : await pgrep("[b]uild/vxrt.*\\.[Ee][Xx][Ee]|[a]lyx_host|[n]ative-session --session|[H]ardwareEncoder")
     }
 
     func reloadLibrary() { Task { await loadLibrary() } }
@@ -132,11 +154,27 @@ struct Job {
     /// The same, finished when the games list is (the get-and-play flow starts the game it has just installed).
     func loadLibrary() async {
         let installed = Library.installed()
+        var variants = Dictionary(uniqueKeysWithValues: installed.keys.map { ($0, Set([GameBackend.vxrt])) })
+        var nativeGames: [Game] = []
+        var nativeProblems: [String: String] = [:]
+        for title in Title.all {
+            guard let support = title.nativeSupport else { continue }
+            let layout = support.layout(drive: drive, runtime: Paths.runtime)
+            do {
+                let record = try layout.installation()
+                variants[title.id, default: []].insert(.nativeARM64)
+                nativeGames.append(Game(id: title.id, name: title.name, folder: layout.versionRoot(record).appendingPathComponent("game-root"), exe: nil, title: title, antiCheat: [], bytes: title.bytes))
+            } catch {
+                if FileManager.default.fileExists(atPath: layout.manifest.path) { nativeProblems[title.id] = error.localizedDescription }
+            }
+        }
         steamVR = installed[Title.steamVR] != nil
         redistCount = Redist.count
         var found = installed.filter { $0.key != Title.steamVR && $0.key != "228980" && Title.named($0.key)?.windowsSteam != true }
         // (the games Windows Steam starts: from its own library, where it keeps them)
-        for (id, entry) in Library.windowsSteamGames() { found[id] = entry }
+        for (id, entry) in Library.windowsSteamGames() { found[id] = entry; variants[id, default: []].insert(.vxrt) }
+        installedBackends = variants
+        nativeInstallProblems = nativeProblems
         let entries = found
         let sorted = await Task.detached { () -> [Game] in
             var list: [Game] = []
@@ -152,9 +190,14 @@ struct Job {
             return list
         }.value
         games = sorted
+        for native in nativeGames.reversed() where !games.contains(where: { $0.id == native.id }) { games.insert(native, at: 0) }
     }
 
-    func isInstalled(_ id: String) -> Bool { id == Title.steamVR ? steamVR : games.contains { $0.id == id } }
+    func isInstalled(_ id: String, backend: GameBackend? = nil) -> Bool {
+        let backend = backend ?? self.backend(forID: id)
+        if id == Title.steamVR { return backend == .vxrt && steamVR }
+        return installedBackends[id]?.contains(backend) == true
+    }
 
     // MARK: actions
 
@@ -180,22 +223,39 @@ struct Job {
         Task { await refresh() }
     }
 
-    /// Downloads the Windows builds of the chosen titles with the user's own Steam account (steamcmd), one at a time,
-    /// SteamVR first; then gathers the runtime files.
+    /// The setup button installs selected variants without starting a game.
     func download() async {
-        await download(Title.all.map(\.id).filter { wanted.contains($0) })
+        guard !configurationLocked else { return }
+        let plan = installationPlan(for: wanted)
+        guard !plan.isEmpty else { return }
+        setupDownloading = true
+        setupDownloadCancelled = false
+        defer { setupDownloading = false }
+        let windows = plan.filter { $0.backend == .vxrt }.map(\.id)
+        if !windows.isEmpty { guard await downloadWindows(windows) else { return } }
+        for request in plan where request.backend == .nativeARM64 {
+            guard !setupDownloadCancelled else { return }
+            guard let support = Title.named(request.id)?.nativeSupport else { continue }
+            let task = Task { @MainActor in await support.download(in: self) }
+            nativeDownloadTask = task
+            let completed = await task.value
+            nativeDownloadTask = nil
+            if !completed { return }
+        }
     }
 
+    func cancelSetupDownload() { setupDownloadCancelled = true; cancelNativeDownload() }
+
     /// The same for these titles (those not installed yet, and not Windows Steam's); false: not all of them came.
-    @discardableResult func download(_ wanted: [String]) async -> Bool {
-        let ids = Title.all.map(\.id).filter { wanted.contains($0) && !isInstalled($0) && Title.named($0)?.windowsSteam != true }
+    @discardableResult func downloadWindows(_ wanted: [String]) async -> Bool {
+        let ids = Title.all.map(\.id).filter { wanted.contains($0) && !isInstalled($0, backend: .vxrt) && Title.named($0)?.windowsSteam != true }
         guard !ids.isEmpty else { return true }
         guard !account.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
         error = nil
         let need = ids.compactMap { Title.named($0)?.bytes }.reduce(0, +)
-        if let free = Mac.freeSpace(drive), free < need + (5 << 30) {
-            error = TF("Not enough space: these need about %@, %@ is free on that disk. Choose another place in step 3, or fewer games.",
-                       "空き容量が足りません。約 %@ 必要で、そのディスクの空きは %@ です。手順 3 で別の場所を選ぶか、ゲームを減らしてください。",
+        if !Play.dryRun, let free = Mac.freeSpace(drive), free < need + (5 << 30) {
+            error = TF("Not enough space: these need about %@, %@ is free on that disk. Choose another game folder in Get started, or fewer games.",
+                       "空き容量が足りません。約 %@ 必要で、そのディスクの空きは %@ です。「はじめに」で別の保存先を選ぶか、ゲームを減らしてください。",
                        gigabytes(need), gigabytes(free))
             return false
         }
@@ -277,7 +337,7 @@ struct Job {
     func importApps(_ apps: [SteamApp], from library: URL) async {
         importChoice = nil
         error = nil
-        for app in apps where !isInstalled(app.id) {
+        for app in apps where !isInstalled(app.id, backend: .vxrt) {
             job = Job(title: TF("Copying %@…", "%@ をコピー中…", app.name))
             do {
                 try await Library.importApp(app, from: library) { p in Task { @MainActor in self.job?.progress = p } }
@@ -327,16 +387,22 @@ struct Job {
 
     /// The picture setting for a game: the Play page's, when its way to the headset offers it; else Recommended.
     func quality(for game: Game) -> Quality { quality(forID: game.id) }
-    func quality(forID id: String) -> Quality { Quality.choices(for: headset(forID: id)).contains(quality) ? quality : .standard }
+    func quality(forID id: String) -> Quality {
+        if backend(forID: id) == .nativeARM64 { return quality == .sharp ? .sharp : .standard }
+        return Quality.choices(for: headset(forID: id)).contains(quality) ? quality : .standard
+    }
 
     /// Whether a game can start now, on the Mac's screen or in the headset.
     func canStart(_ game: Game, flat: Bool) -> Bool {
-        guard game.playable, play?.running != true, !(flat && !game.flat) else { return false }
+        guard game.playable, isInstalled(game.id), play?.running != true, job == nil, !setupDownloading, !(flat && !game.flat) else { return false }
+        if backend(forID: game.id) == .nativeARM64 {
+            return appleSilicon && macOSOK && steamRunning && game.title.map { nativeReason(for: $0) == nil } == true && elsewhere.isEmpty && !flat
+        }
         if game.viaWindowsSteam {
             // (Windows Steam, opened and signed in to by the player, instead of Mac Steam; SteamVR only for the headset)
             return appleSilicon && rosetta == true && redistCount > 0 && windowsSteamRunning && elsewhereBesidesWindowsSteam.isEmpty && (flat || steamVR)
         }
-        return ready && steamRunning && elsewhere.isEmpty
+        return windowsRuntimeReady && steamRunning && elsewhere.isEmpty
     }
 
     /// Starts the player's Windows Steam (scripts/launch_vxrt_windows_steam.sh, with the settings
@@ -388,6 +454,8 @@ struct Job {
         }
         var title: Title
         var flat: Bool
+        var backend: GameBackend = .vxrt
+        var startAfterInstall = true
         var stage: Stage = .confirm
         /// What steamcmd fetches (SteamVR, the game), and whether Windows Steam installs the game.
         var steamcmd: [String] = []
@@ -404,9 +472,21 @@ struct Job {
     func flowNote(_ line: String) { flow?.log.append(line); flowLog.append(line) }
 
     /// The flow's first step: what is missing, and the question (or, with nothing missing, the start).
-    func getAndPlay(_ title: Title, flat: Bool) {
-        guard flow == nil || flow?.stage != .working, play?.running != true else { return }
+    func getAndPlay(_ title: Title, flat: Bool, reinstall: Bool = false, startAfterInstall: Bool = true) {
+        guard flow == nil || flow?.stage != .working, play?.running != true, job == nil, !setupDownloading else { return }
         var f = Flow(title: title, flat: flat && title.flat)
+        f.startAfterInstall = startAfterInstall
+        f.backend = backend(forID: title.id)
+        if f.backend == .nativeARM64, let support = title.nativeSupport {
+            f.steamcmd = isInstalled(title.id) && !reinstall ? [] : [title.id]
+            f.bytes = f.steamcmd.isEmpty ? 0 : estimatedBytes(for: title)
+            f.free = Mac.freeSpace(drive)
+            flow = f
+            flowNote("\(title.name): native ARM64 via ALVR; no Windows SteamVR or redistributables")
+            if !support.layout(drive: drive, runtime: Paths.runtime).bundled { stopFlow(nativeReason(for: title) ?? "Native components are missing"); return }
+            if isInstalled(title.id) && !reinstall { flow?.stage = .working; Task { await finishFlow() } }
+            return
+        }
         if !f.flat && !steamVR { f.steamcmd.append(Title.steamVR) }
         switch title.source {
         case .steamcmd: if !isInstalled(title.id) { f.steamcmd.append(title.id) }
@@ -433,19 +513,29 @@ struct Job {
     /// The player's yes: fetch, then set up and start.
     func confirmFlow() async {
         guard var f = flow, f.stage == .confirm else { return }
-        if let free = f.free, free < f.bytes + (5 << 30) {
+        if !Play.dryRun, let free = f.free, free < f.bytes + (5 << 30) {
             stopFlow(TF("Not enough space: about %@ is needed, %@ is free.", "空き容量が足りません。約 %@ 必要で、空きは %@ です。", gigabytes(f.bytes), gigabytes(free)))
             return
         }
-        if !f.steamcmd.isEmpty && account.trimmingCharacters(in: .whitespaces).isEmpty {
-            stopFlow(T("Enter your Steam account name first (Get started, step 4).", "先に Steam のアカウント名を入れてください（「はじめに」の手順 4）。"))
+        if !Play.dryRun && !f.steamcmd.isEmpty && account.trimmingCharacters(in: .whitespaces).isEmpty {
+            stopFlow(T("Enter your Steam account name in Get started → Games first.", "先に「はじめに」→「ゲーム」で Steam アカウント名を入力してください。"))
             return
         }
         f.stage = .working
         flow = f
+        if f.backend == .nativeARM64 {
+            guard let support = f.title.nativeSupport else { return }
+            let task = Task { @MainActor in await support.download(in: self) }
+            nativeDownloadTask = task
+            let downloaded = await task.value
+            nativeDownloadTask = nil
+            guard downloaded else { stopFlow(Play.dryRun ? "dry run: nothing downloaded" : error ?? "Native download did not finish"); return }
+            await finishFlow()
+            return
+        }
         if !f.steamcmd.isEmpty {
             flowNote("steamcmd: \(f.steamcmd)")
-            guard await download(f.steamcmd) else {
+            guard await downloadWindows(f.steamcmd) else {
                 stopFlow(Play.dryRun ? "dry run: nothing downloaded" : error ?? T("The download did not finish.", "ダウンロードが完了しませんでした。"))
                 return
             }
@@ -492,11 +582,12 @@ struct Job {
     private func finishFlow() async {
         guard let f = flow else { return }
         flow?.stage = .working
-        if redistCount == 0 {
+        if f.backend == .vxrt && redistCount == 0 {
             flowNote("gathering the runtime files")
             if !Play.dryRun { await collect() }
         }
         await loadLibrary()
+        if !f.startAfterInstall { flowNote("installation prepared; launch stays in Play"); flow = nil; return }
         guard let game = games.first(where: { $0.id == f.title.id }) else {
             stopFlow(TF("%@ is not installed yet.", "%@ はまだ入っていません。", f.title.name)); return
         }
@@ -512,7 +603,7 @@ struct Job {
         start(game, flat: f.flat)
     }
 
-    func cancelFlow() { flow = nil }
+    func cancelFlow() { if flow?.backend == .nativeARM64 { cancelNativeDownload() }; flow = nil }
 
     /// The settings the Windows Steam scripts are run with (the same places as the app's).
     private func windowsSteamEnv(dryRun: Bool = false) -> [String: String] {
@@ -528,10 +619,12 @@ struct Job {
 
     func start(_ game: Game, flat: Bool = false) {
         guard play?.running != true else { return }
+        if !Play.dryRun, !canStart(game, flat: flat) { error = backend(forID: game.id) == .nativeARM64 ? game.title.flatMap { nativeReason(for: $0) } ?? T("Open Steam and sign in: the games need it.", "Steam を開いてサインインしてください。ゲームに必要です。") : T("Finish Get started first.", "先に「はじめに」を済ませてください。"); return }
         error = nil
         do {
             play = try Play(title: game.name, appID: game.id, exe: game.alyx ? nil : game.exe, headset: headset(for: game), wired: wired,
-                            quality: quality(for: game), known: game.title, flat: flat && game.title?.flat == true)
+                            quality: quality(for: game), known: game.title, flat: flat && game.title?.flat == true,
+                            backend: backend(forID: game.id))
         } catch {
             self.error = error.localizedDescription
         }
@@ -543,6 +636,7 @@ struct Job {
         return """
         VeRantyx app \(AppBuild.description)
         Mac: \(Mac.model), \(Mac.chip), \(Mac.memoryGB) GB, macOS \(Mac.macOS)
+        Preferred game runtime: \(effectivePreference.rawValue)
         Headset: \(headset.rawValue)\(headset == .quest && wired ? " (USB cable)" : ""), quality \(quality.rawValue)
         Installed: \(steamVR ? "SteamVR" : "no SteamVR"), \(games.map(\.name).joined(separator: ", ")); runtime DLLs: \(redistCount)
         """
@@ -554,7 +648,7 @@ struct Job {
     /// frame rate the app read); the player only checks it and presses Submit. Nothing personal is in it.
     func runsReportURL(_ play: Play) -> URL {
         var c = URLComponents(string: "https://github.com/Ag3497120/VeRantyx/issues/new")!
-        let game = play.appID.map { "\(play.title) (\($0))" } ?? play.title
+        let game = (play.appID.map { "\(play.title) (\($0))" } ?? play.title) + " [\(play.backend.rawValue)]"
         let place = play.flat ? "The Mac's screen" :
             "\(play.headset.name)\(play.headset == .quest && wired ? ", USB cable" : ""), \(play.quality.name)"
         // (loading screens read 0 and start-up benchmarks run far above play, so the range is the middle 80 %)
@@ -614,7 +708,7 @@ struct Job {
                         URLQueryItem(name: "title", value: title),
                         URLQueryItem(name: "logs", value: logsText),
                         URLQueryItem(name: "mac", value: "\(Mac.model), \(Mac.chip), \(Mac.memoryGB) GB, macOS \(Mac.macOS), VeRantyx \(AppBuild.description)"),
-                        URLQueryItem(name: "command", value: "VeRantyx app: \(headset.rawValue)\(headset == .quest && wired ? ", USB cable" : ""), \(quality.rawValue)")]
+                        URLQueryItem(name: "command", value: "VeRantyx app: \(play?.backend.rawValue ?? effectivePreference.rawValue), \(headset.rawValue)\(headset == .quest && wired ? ", USB cable" : ""), \(quality.rawValue)")]
         c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")   // (a "+" is a space to GitHub)
         return c.url!
     }

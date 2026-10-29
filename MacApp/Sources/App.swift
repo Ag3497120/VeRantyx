@@ -23,6 +23,10 @@ import SwiftUI
 enum Entry {
     static func main() {
         let a = CommandLine.arguments
+        if let i = a.firstIndex(of: "--backend"), i + 1 < a.count {
+            guard let backend = GameBackend(rawValue: a[i + 1]) else { print("--backend: vxrt or nativeARM64"); exit(2) }
+            setenv("VERANTYX_BACKEND", backend.rawValue, 1)
+        }
         if let i = a.firstIndex(of: "--collect-redist") {
             _ = i
             Task {
@@ -109,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Quitting while a game runs stops it (SteamVR, the encoder and the game with it) first.
     @MainActor func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model, let play = model.play, play.running else {
+            model?.cancelNativeDownload()
             if model?.console.running == true { model?.console.cancel() }
             return .terminateNow
         }
@@ -145,7 +150,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         await model.refresh()
         for _ in 0..<50 where model.games.isEmpty { try? await Task.sleep(nanoseconds: 200_000_000) }
         print("ready=\(model.ready) rosetta=\(model.rosetta ?? false) steam=\(model.steamRunning) steamVR=\(model.steamVR) dlls=\(model.redistCount) games=\(model.games.map(\.id))")
-        guard let game = model.games.first(where: { $0.id == id }) else { print("\(id): not installed"); exit(2) }
+        let placeholder = Play.dryRun ? Title.named(id).map { Game(id: id, name: $0.name, folder: Paths.drive, exe: $0.exe.map { Paths.drive.appendingPathComponent($0) }, title: $0, antiCheat: [], bytes: 0) } : nil
+        guard let game = model.games.first(where: { $0.id == id }) ?? placeholder else { print("\(id): not installed"); exit(2) }
         print("start \(game.name): exe=\(game.exe?.path ?? "(own launcher)") headset=\(model.headset(for: game).rawValue) quality=\(model.quality(for: game).rawValue) flat=\(flat)")
         model.start(game, flat: flat)
         guard let play = model.play else { print("did not start: \(model.error ?? "")"); exit(1) }

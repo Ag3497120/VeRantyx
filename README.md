@@ -48,6 +48,7 @@ releases: games and SteamVR come from your own Steam account. No anti-cheat is e
 
 | Date | What changed |
 |---|---|
+| Oct 27 | **Native ARM64 Alyx in the Mac app**, on `nativeArmRefine`: Windows / Native ARM64 launch mode, a separate installation from the owner's Steam depots, ALVR for Pico / Quest, session supervision, FPS captures and fixes for tracking and controller input ([native notes](NativeARM/README.md)) |
 | Oct 27 | **Direct3D 12, first real game**: Cyberpunk 2077 (D3D12 only) gets through its logos, intro video and title to character creation, characters lit correctly; all 20,937 of its non-ray-tracing shaders translate and compile; the stall-heavy CPU side of `ExecuteCommandLists` cut by about half in a synthetic test. Branch [`d3d12-games`](https://github.com/Ag3497120/VeRantyx/tree/d3d12-games), not in the app yet |
 | Oct 27 | **[Discord server](https://discord.gg/h2znwYJt3)** opened: setup help, game reports, new versions |
 | Oct 27 | My GitHub account is visible again after being hidden by an automated check from Oct 24; the app and the source were served from [verantyx.ai](https://verantyx.ai) meanwhile |
@@ -153,6 +154,7 @@ Everything below is in this repository, MIT licensed, and was written for this p
 |---|---|---|---|
 | **[`main`](https://github.com/Ag3497120/VeRantyx)** = [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) | Windows games + real SteamVR on **VXRuntime** | Players (via the app) and developers | ⭐ Current, developed daily — [full guide](docs/VXRT.md) |
 | [`d3d12-games`](https://github.com/Ag3497120/VeRantyx/tree/d3d12-games) | Direct3D 12 toward real games (Cyberpunk 2077 first) | Developers | 🧪 Work in progress |
+| **`nativeArmRefine`** | Native ARM64 Alyx integrated into the Mac app, with our OpenVR runtime and ALVR | Developers and native Alyx testing | Active work — [native notes](NativeARM/README.md) |
 | [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) | Valve's **Linux ARM64** Alyx runs natively on macOS (patched Klepton + our OpenVR runtime) | Alyx only; the fastest path, no CPU translation | Paused since 2026-10-11 (the code is also in `main` under `NativeARM/`) |
 | [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine) | Windows build + real SteamVR under **Wine 11**, DXVK → MoltenVK | Reference / history | Kept as of 2026-10-10, ~30 fps |
 
