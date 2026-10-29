@@ -106,10 +106,31 @@ Cyberpunk2077.exe (2.3, 66.7 MB):
   `VXRT_AOT_SPLITS` (3 245 instructions) were fed back, 0.27 M signals were left.
 - **Coverage.** The modules cover 31 images: the exe and 30 DLLs, including Steam's, XeSS, Chroma, Aftermath and
   FidelityFX. `VXRT_AOT_MISSES` from a run, given back as `VXRT_AOT_ROOTS`, closes the gaps.
-- **Fallbacks left.** 18 addresses: the exe (7), PhysX (4), REDGalaxy (4), tier0 (2) and the overlay (1).
+- **Fallbacks left.** 18 addresses: the exe (7), PhysX (4), REDGalaxy (4), tier0 (2) and the overlay (1). All were
+  the MSVC CRT's AVX memcpy / memset tails, reached through jump tables of two shapes the analysis now reads: an
+  image-relative table through one register (`mov r11d, [r10 + r11*4 + rva]; add r11, r10`, r10 the image base,
+  whose LEA is not found on the way back) and the entry loaded into the ADD's other register (`mov eax,
+  [r9 + r8*4 + rva]; add r9, rax; jmp r9`). With them, all 238 misses recorded over the runs are found without
+  `VXRT_AOT_ROOTS` (`VXRT_AOT_CHECK=<misses>` on `analyze` lists any that are not); before, 98 were not.
 - **Native calls.** About 5 M a second each leave the module and enter it again; a thread's cache keeps their cost
   down. In game the result matches Rosetta, because El Coyote is GPU-bound at about 48 ms a frame.
 - **Footprint.** 10–11 GB, the same as Rosetta's. The modules' `__TEXT` is 460 MB, clean and file-backed.
+
+### Under the device's constraints (avp-preflight, 2026-10-30; M1 Max, NPU race on)
+
+Modules from static analysis only (no recorded roots; the splits profile kept), `VXRT_AOT_STRICT=1`, ARM64 build,
+MetalFX off (FSR2's own path, as visionOS has no temporal scaler), `VXRT_MEM_LIMITS=6144,8192`:
+
+| Settings | Fallbacks | Main menu | Load after character creation | Mirror | El Coyote |
+|---|---|---|---|---|---|
+| Low, textures High | 0 (4.44 G entries) | 4.8–5.3 GB | 6 GB at 248 s, 8 GB at 252 s | 10.9 GB, 17.6 fps | 11 GB (peak 11.1), 23.5 fps real, 48 shown |
+| + textures Low, `TEX_DOWNSCALE=2` (512), `VXRT_GPU_BUDGET_MB=4096`, `VXRT_DEVICE_MEMORY_MB=16384` | 0 (3.72 G entries) | 4.8 GB | 6 GB at 247 s, 8 GB at 254 s | 9.5 GB, 17.2 fps | 9.45 GB (peak 9.74), 22.9 fps real, 48 shown |
+
+- The Vision Pro gives the app 8188 MB (`os_proc_available_memory` at launch with increased-memory-limit), so both
+  configurations would be ended a few seconds into the load after character creation. The main menu fits.
+- At El Coyote in the lowest configuration: Metal 3.6 GB (IOAccelerator) + 0.8 GB unmapped graphics, the game's own
+  `VM_ALLOCATE` heap 3.4 GB (the same with 16 GB reported: it does not size itself by the memory reported), malloc
+  1.5 GB. About 1.5 GB has to go, and the load's spike with it.
 
 ## visionOS: what the modules need there
 
