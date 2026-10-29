@@ -1150,6 +1150,7 @@ static struct {
     double pace_next, pace_i;      // (the game thread's) the next frame's start, the frames' interval
     double next_content;           // (the game thread's) the content time of the frame it is making now
     double link_ts;                // the display link's time of the refresh being shown (its vsync)
+    double rec_content;            // (the content time of the frame being presented, for recordings)
     double vsync;                  // a refresh's time (the link's), to start frames on the refresh grid
     double dl, d;                  // the latency envelope (content time to ready), D
     int pend, pend_in, pend_scene; // the newest frame ready and not yet due
@@ -1565,6 +1566,7 @@ static int race_present(int kind, VXNpuSet *S, int slot, int a, uint32_t d, int 
         draw(cb, drawable.texture, kind, S, (uint32_t)slot, 0);
         FILE *rec = record(cb, kind, S, (uint32_t)slot, 0);
         uint32_t pi = __atomic_fetch_add(&R.npres, 1, __ATOMIC_RELAXED);
+        double content = R.rec_content;                            // (the content time it shows: recorded as a 5th field)
         [drawable addPresentedHandler:^(id<MTLDrawable> done) {
             double pt = done.presentedTime;
             if (pi < 1024) R.pres[pi] = pt;
@@ -1572,7 +1574,7 @@ static int race_present(int kind, VXNpuSet *S, int slot, int a, uint32_t d, int 
                 uint32_t i = __atomic_fetch_add(&R.nlat, 1, __ATOMIC_RELAXED);
                 if (i < 512) R.lat[i] = (float)((pt - ready) * 1000);
             }
-            if (rec) { fprintf(rec, " %.6f\n", pt); fclose(rec); }
+            if (rec) { fprintf(rec, " %.6f %.6f\n", pt, content); fclose(rec); }
         }];
         [cb presentDrawable:drawable];
         [cb commit];
@@ -1661,6 +1663,7 @@ static void handle_race(VXNpuSet *S, uint32_t slot, int has_in, int has_scene, d
     }
     race_new_b(S, (int)slot, has_in, has_scene, t);
     os_unfair_lock_unlock(&R.lock);
+    R.rec_content = t;
     if (race_present(KIND_REAL, S, (int)slot, -1, 0, 0, 0, t)) {
         double now = now_s();
         R.tb = R.shown_at = now; R.shown_t = 0;
@@ -1789,6 +1792,7 @@ static void race_tick_paced(double tick) {
     }
     os_unfair_lock_unlock(&R.lock);
     int done = 0;
+    if (kind >= 0) R.rec_content = R.cb + t * (R.a >= 0 && R.cb - R.ca > 0.002 ? R.cb - R.ca : R.pace_i);
     if (kind == KIND_REAL) {
         if (race_present(KIND_REAL, S, slot, -1, 0, 0, 0, now)) {
             R.tb = R.shown_at = now; R.shown_t = 0; R.b_shown = 1;
@@ -1856,6 +1860,7 @@ static void race_tick(double tick, double period) {
             if (mv) R.mvgen++;
             os_unfair_lock_unlock(&R.lock);
             S->RP.t = (float)tm;
+            R.rec_content = R.cb + tm * (mv && R.ginterval > 0 ? R.ginterval : R.interval);
             if (mv) warp_params(S, slot, a, (float)tm);
             if (race_present(KIND_RACE, S, slot, a, d, new_mm, mv, 0)) {
                 R.shown_at = now; R.shown_t = t;
