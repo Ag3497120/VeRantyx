@@ -608,7 +608,15 @@ static volatile int g_census12;                // (a line "?" in the file: prese
 static volatile int g_mem_report12;            // (a line "?mem": the memory report at the next present)
 // (a line "!dbarrier": no memory barrier after each dispatch; "!concurrent": that, and compute encoders of concurrent
 //  dispatches - D3D12 orders dispatches only at its barriers, which end the encoder - to compare)
+// Concurrent is the default (D3D12 promises no order between dispatches without a barrier; every barrier ends the
+// encoder): measured on M1 Max in El Coyote, GPU busy 41.2 ms a frame against 44.1-46.4 serial, the picture the same.
+// VXRT_D3D12_CONCURRENT_DISPATCH=0, or a line "!serial" in the skip file: serial encoders, a barrier after each.
 static volatile int g_no_dispatch_barrier12;
+static int g_dispatch_default12;
+__attribute__((constructor)) static void dispatch_default_init12(void) {
+    const char *e = getenv("VXRT_D3D12_CONCURRENT_DISPATCH");
+    g_no_dispatch_barrier12 = g_dispatch_default12 = e && !atoi(e) ? 0 : 3;
+}
 static const char *skip_path12(void) {
     static const char *p = (const char *)-1;
     if (p == (const char *)-1) { p = getenv("VXRT_D3D12_SKIP"); if (p && !*p) p = NULL; }
@@ -619,11 +627,11 @@ static void skip_poll12(void) {
     if (!p) return;
     static struct timespec seen;
     struct stat st;
-    if (stat(p, &st)) { g_skip_count12 = 0; g_no_dispatch_barrier12 = 0; seen.tv_sec = 0; return; }
+    if (stat(p, &st)) { g_skip_count12 = 0; g_no_dispatch_barrier12 = g_dispatch_default12; seen.tv_sec = 0; return; }
     if (st.st_mtimespec.tv_sec == seen.tv_sec && st.st_mtimespec.tv_nsec == seen.tv_nsec) return;
     seen = st.st_mtimespec;
     FILE *f = fopen(p, "r");
-    int n = 0, nodbar = 0;
+    int n = 0, nodbar = g_dispatch_default12;
     char line[128];
     while (f && n < 64 && fgets(line, sizeof line, f)) {
         char *end;
@@ -631,6 +639,7 @@ static void skip_poll12(void) {
         if (line[0] == '?') { if (!g_census12) g_census12 = 31; continue; }
         if (!strncmp(line, "!dbarrier", 9)) { nodbar |= 1; continue; }
         if (!strncmp(line, "!concurrent", 11)) { nodbar |= 3; continue; }
+        if (!strncmp(line, "!serial", 7)) { nodbar = 0; continue; }
         if (line[0] == '*') { g_skip12[n++] = 0x80000000u | (uint8_t)line[1]; continue; }   // (*p every draw, *c every dispatch, *i every indirect one, *I indirect draws, *g copies)
         unsigned long v = strtoul(line, &end, 16);
         if (end != line) g_skip12[n++] = (uint32_t)v;
