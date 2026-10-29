@@ -10,6 +10,9 @@
 //                                         as the engine would, written out as assembly for a module (aot.h)
 //   vxrt-aot name <pe>                    the module's file name the runtime looks for (VXRT_AOT_DIR)
 //
+// VXRT_AOT_BASE=<hex>: the image as loaded at that address (relocated), for a DLL the runtime cannot map at its
+// preferred base; the runtime then maps the file where its module says (src/loader.c).
+//
 // The image is mapped at its preferred base in this process, as the runtime maps it: the translator reads code at the
 // addresses it will run at.
 #include "../translator/xlat.h"
@@ -21,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <time.h>
 
 // ---- the image -----------------------------------------------------------------------------------------------------
@@ -47,10 +52,11 @@ static void load(image *im, const char *path) {
     size_t hn = fread(h, 1, sizeof h, f); fseek(f, 0, SEEK_SET);
     uint32_t hpe = hn >= 0x40 ? r32(h + 0x3c) : 0;
     if (hpe && hpe + 24 + 60 <= hn && !memcmp(h + hpe, "PE\0\0", 4) && r16(h + hpe + 24) == 0x20b) {
-        uint64_t b = r64(h + hpe + 24 + 24); uint32_t sz = r32(h + hpe + 24 + 56);
-        void *m = mmap((void *)(uintptr_t)b, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (m != MAP_FAILED && (uint64_t)(uintptr_t)m != b) munmap(m, sz);
-        else if (m != MAP_FAILED) im->mem = m;
+        uint64_t b = getenv("VXRT_AOT_BASE") ? strtoull(getenv("VXRT_AOT_BASE"), NULL, 16) : r64(h + hpe + 24 + 24);
+        uint32_t sz = r32(h + hpe + 24 + 56);
+        // (exactly there, never over a mapping: mach_vm_allocate fixed; mmap takes some ranges' hints as no hint)
+        mach_vm_address_t a = b;
+        if (mach_vm_allocate(mach_task_self(), &a, sz, VM_FLAGS_FIXED) == KERN_SUCCESS) im->mem = (uint8_t *)(uintptr_t)a;
     }
     im->file = malloc(im->len);
     if (fread(im->file, 1, im->len, f) != im->len) die("cannot read %s", path);
@@ -63,6 +69,8 @@ static void load(image *im, const char *path) {
     uint32_t opt = pe + 24, nsec = r16(d + pe + 6), optsz = r16(d + pe + 20);
     if (r16(d + opt) != 0x20b) die("%s: not PE32+", path);
     im->entry = r32(d + opt + 16); im->base = r64(d + opt + 24); im->size = r32(d + opt + 56);
+    uint64_t pref = im->base;
+    if (getenv("VXRT_AOT_BASE")) im->base = strtoull(getenv("VXRT_AOT_BASE"), NULL, 16);
     uint32_t hdr = r32(d + opt + 60), ndirs = r32(d + opt + 108);
     for (uint32_t i = 0; i < 16 && i < ndirs; i++) { im->dir_rva[i] = r32(d + opt + 112 + 8 * i); im->dir_size[i] = r32(d + opt + 116 + 8 * i); }
     uint32_t so = opt + optsz;
@@ -79,6 +87,21 @@ static void load(image *im, const char *path) {
         uint32_t n = s->raw_size < s->vsize || !s->vsize ? s->raw_size : s->vsize;
         if (n && s->raw_ptr + n <= im->len) memcpy(im->mem + s->va, d + s->raw_ptr, n);
     }
+    // VXRT_AOT_BASE: a module for the image loaded there instead (a DLL whose preferred base the process cannot have:
+    // macOS's shared cache is at 0x180000000), relocated as src/loader.c does it
+    int64_t delta = (int64_t)(im->base - pref);
+    if (delta && im->dir_size[5]) {
+        for (uint8_t *b = im->mem + im->dir_rva[5]; b < im->mem + im->dir_rva[5] + im->dir_size[5];) {
+            uint32_t page = r32(b), block = r32(b + 4);
+            if (!block) break;
+            for (uint32_t k = 8; k < block; k += 2) {
+                uint16_t e = r16(b + k);
+                if ((e >> 12) == 10) { uint64_t *q = (uint64_t *)(im->mem + page + (e & 0xfff)); *q += (uint64_t)delta; }
+                else if ((e >> 12) == 3) { uint32_t *q = (uint32_t *)(im->mem + page + (e & 0xfff)); *q += (uint32_t)delta; }
+            }
+            b += block;
+        }
+    } else if (delta) die("%s: VXRT_AOT_BASE given and the image has no relocations", path);
 }
 static int exec_rva(const image *im, uint64_t rva) {
     for (int i = 0; i < im->nsec; i++)

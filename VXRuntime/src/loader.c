@@ -28,6 +28,8 @@
 #include <sys/resource.h>
 #include <limits.h>
 #include <mach-o/getsect.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach-o/ldsyms.h>
 
 vx_process vx_proc;
@@ -620,9 +622,24 @@ static vx_image *load_pe(const char *path, int is_main) {
         }
         free(real);
     }
+    uint64_t want = pref_base;
+#ifdef __aarch64__
+    // VXRT_AOT_DIR: a module made for this file at another base (a DLL whose preferred base is in macOS's shared cache,
+    // at 0x180000000) is used where it was made for: the file is mapped there when that is free (translator/aot.c)
+    if (getenv("VXRT_AOT_DIR") && reuse < 0) {
+        uint64_t b = xa_module_base(getenv("VXRT_AOT_DIR"), path, xa_hash(file, (uint64_t)len));
+        if (b && b != pref_base) {
+            // (exactly there when free: mmap takes a hint in some ranges as none)
+            mach_vm_address_t a = b;
+            if (mach_vm_allocate(mach_task_self(), &a, image_size, VM_FLAGS_FIXED) == KERN_SUCCESS) {
+                want = b;                                        // (reserved: the mapping below replaces it)
+            } else vx_log("aot: %s: its module's base %#llx is taken: the module is not used", path, (unsigned long long)b);
+        }
+    }
+#endif
     // Map at the preferred base when free, anywhere otherwise (then relocate).
     uint8_t *base = reuse >= 0 ? mmap(g_images[reuse]->base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0)
-                               : mmap((void *)pref_base, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                               : mmap((void *)want, image_size, VX_PROT_CODE, MAP_PRIVATE | MAP_ANON | (want != pref_base ? MAP_FIXED : 0), -1, 0);
     if (base == MAP_FAILED) { vx_log("cannot map %u bytes", image_size); free(file); return NULL; }
     memcpy(base, file, headers_size);
     const pe_section *sec = (const pe_section *)(file + section_table_offset);

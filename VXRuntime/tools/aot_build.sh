@@ -14,5 +14,5 @@ jobs=${AOT_JOBS:-$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || echo 8)}
 # (one part: <stem>.dylib; parts: <stem>.p<k>.dylib from <b>.p<k>.s)
 while read -r f; do
     case "$f" in *.p[0-9]*.s) k=${f##*.p}; k=${k%.s}; echo "$f $out/$stem.p$k.dylib" ;; *) echo "$f $out/$stem.dylib" ;; esac
-done < build/aot_s/$b.list | xargs -P "$jobs" -n 2 sh -c 'clang -arch arm64 -dynamiclib -Wl,-no_uuid -o "$1" "$0"'
+done < build/aot_s/$b.list | xargs -P "$jobs" -n 2 sh -c 'clang -arch arm64 -c -o "${0%.s}.o" "$0" && clang -arch arm64 -dynamiclib -o "$1" "${0%.s}.o"'
 ls -l "$out/$stem"*.dylib

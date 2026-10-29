@@ -5,6 +5,7 @@
 // nobody recompiled, which the engine translates (the fallback: counted, and an error with VXRT_AOT_STRICT=1, as it
 // would be where code cannot be generated at run time).
 #include "aot.h"
+#include <ctype.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <signal.h>
@@ -46,6 +47,20 @@ int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash) {
            (unsigned long long)d->nblocks, (unsigned long long)d->ncfns, (unsigned long long)((d->code_end - d->code) >> 10),
            (unsigned long long)base, d->part, d->nparts, (unsigned long long)d->part_lo, (unsigned long long)d->part_hi);
     return 0;
+}
+
+uint64_t xa_module_base(const char *dir, const char *path, uint64_t hash) {
+    const char *slash = strrchr(path, '/');
+    char lower[256], mod[4096];
+    size_t k = 0;
+    for (const char *n = slash ? slash + 1 : path; *n && k + 1 < sizeof lower; n++) lower[k++] = (char)tolower((unsigned char)*n);
+    lower[k] = 0;
+    snprintf(mod, sizeof mod, "%s/%s-%016llx.dylib", dir, lower, (unsigned long long)hash);
+    if (access(mod, R_OK)) snprintf(mod, sizeof mod, "%s/%s-%016llx.p0.dylib", dir, lower, (unsigned long long)hash);
+    if (access(mod, R_OK)) return 0;
+    void *h = dlopen(mod, RTLD_NOW | RTLD_LOCAL);              // (kept open: xa_load opens it again)
+    const xa_desc *d = h ? dlsym(h, "vxrt_aot_module") : NULL;
+    return d && d->magic == XA_MAGIC && d->version == XA_VERSION && d->file_hash == hash ? d->image_base : 0;
 }
 
 static const xa_block *block_at(const xa_desc *d, uint64_t rip);

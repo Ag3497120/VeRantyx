@@ -41,6 +41,8 @@ int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash);
 // The parts of the image with this hash branch to each other (after all of them are loaded); the number linked.
 int xa_link(uint64_t hash);
 int xa_any(void);
+// The base the module for this file (dir/<name lowercased>-<hash>[.p0].dylib) was made for; 0 when there is none.
+uint64_t xa_module_base(const char *dir, const char *path, uint64_t hash);
 // Runs the program from ctx->rip until stop like xe_run: in a module's code when the address is one of its blocks,
 // a native function (find) called from here, anything else on the engine (counted: the fallback; VXRT_AOT_STRICT=1
 // makes it an error instead).
