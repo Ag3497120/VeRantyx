@@ -92,10 +92,36 @@ Cyberpunk2077.exe (2.3, 66.7 MB):
 - 506 blocks were refused by the translator.
 - The dylibs total 730 MB. The imap, 16 bytes per x86 instruction, is 190 MB of that.
 
+### Runs (M1 Max, 2026-10-30; Low + FSR2 Performance, NPU race on with the game's motion vectors)
+
+| Build | Main menu | Mirror scene | El Coyote | Fallbacks |
+|---|---|---|---|---|
+| Rosetta (`build/vxrt`) | 60.8 fps | 16.6 fps | 20.4 fps real, 54–56 shown | — |
+| ARM64, JIT (`build/vxrt-arm64`) | 42–46 fps | — | — | — |
+| ARM64, modules (first profile) | 46.5 fps | 9.6 fps | 7.5 fps real, 60 shown | 2.6 M (220 addresses) |
+| ARM64, modules (second profile) | — | 16.5 fps | 20.8 fps real, 52–55 shown | 132 (18 addresses) |
+
+- **Split profile.** The first-profile run spent its time in 58 M signals. These come from LDAPR / STLR accesses
+  that cross 16 bytes, which a module cannot patch the way the engine does. After two runs'
+  `VXRT_AOT_SPLITS` (3 245 instructions) were fed back, 0.27 M signals were left.
+- **Coverage.** The modules cover 31 images: the exe and 30 DLLs, including Steam's, XeSS, Chroma, Aftermath and
+  FidelityFX. `VXRT_AOT_MISSES` from a run, given back as `VXRT_AOT_ROOTS`, closes the gaps.
+- **Fallbacks left.** 18 addresses: the exe (7), PhysX (4), REDGalaxy (4), tier0 (2) and the overlay (1).
+- **Native calls.** About 5 M a second each leave the module and enter it again; a thread's cache keeps their cost
+  down. In game the result matches Rosetta, because El Coyote is GPU-bound at about 48 ms a frame.
+- **Footprint.** 10–11 GB, the same as Rosetta's. The modules' `__TEXT` is 460 MB, clean and file-backed.
+
 ## visionOS: what the modules need there
 
 - **No fallback.** Without JIT, every address has to be in a module (`VXRT_AOT_STRICT=1`), or an interpreter has to
-  run what is not.
+  run what is not. The profile loop (misses → roots) is how coverage gets there.
+- **Ordering.** No TSO there, as here: the ordered accesses (LDAPR / STLR) and the split profile carry over as they
+  are. Any split the profile missed is still a signal, which works on visionOS but is slow.
+- **Arena.** The arena's fixed address (0xf00000000) has to be reserved before the system's randomized regions fall.
+  Here the process starts again when it is covered; an app can reserve it in its first initializer instead.
+- **Mac-only today.** Steam's DLLs and the Windows Steam client are not part of the visionOS app. `dlopen` from a
+  hash-named directory, `_NSGetExecutablePath` with `execv` for the restart, and the `vxrt-npu` helper process
+  (`posix_spawn`, not allowed on visionOS) all have to change.
 - **Loading.** The modules are dylibs found by `dlopen` on a hash-named path. An app links them, or embeds them as
   signed frameworks. `vxrt_aot_module` would need a unique name per module and a registry.
 - **Address space.** The DLLs' fixed bases and the 0x140000000 exe base have to fit in the app's address space,
