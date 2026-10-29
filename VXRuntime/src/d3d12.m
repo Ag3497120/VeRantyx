@@ -8985,8 +8985,8 @@ static void pass_dump_dispatch12(id<MTLCommandBuffer> cb, id<MTLComputeCommandEn
             if (![obj conformsToProtocol:@protocol(MTLTexture)]) continue;
             id<MTLTexture> t = obj;
             char what[96];
-            snprintf(what, sizeof what, "dispatch%d-cs%016llx-in%u-%lux%lu", step, (unsigned long long)p->cs_code, i,
-                     (unsigned long)t.width, (unsigned long)t.height);
+            snprintf(what, sizeof what, "dispatch%d-cs%016llx-in%u-%lux%lu-fmt%lu", step, (unsigned long long)p->cs_code, i,
+                     (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat);
             pass_dump_texture12(cb, ce, t, what);
         }
     for (uint32_t i = 0; i < n && shown < 4; i++) {
@@ -9070,6 +9070,24 @@ static void stereo_closed12(id<MTLCommandBuffer> cb) {
         [b endEncoding];
     }
     pthread_mutex_unlock(&g_st_lock12);
+}
+
+// (VXRT_NPU_INTERP=race: the scene's motion vectors and depth, as the game's upscaler (FSR2) reads them: a dispatch
+//  reading a two-channel float texture and a depth texture of the same size; npu_interp.m copies them at the present)
+static void npu_scene_note12(const pso12 *p, const gpu_ir_resource_access *a, uint32_t n) {
+    id<MTLTexture> mv = nil, dp = nil;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!(a[i].access_mask & GPU_IR_ACCESS_SHADER_READ) || (a[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
+        id obj = (__bridge id)gpu_ir_backend_object(a[i].resource);
+        if (![obj conformsToProtocol:@protocol(MTLTexture)]) continue;
+        id<MTLTexture> t = obj;
+        if (t.textureType != MTLTextureType2D) continue;
+        MTLPixelFormat f = t.pixelFormat;
+        if (f == MTLPixelFormatRG16Float || f == MTLPixelFormatRG16Snorm || f == MTLPixelFormatRG32Float) { if (!mv) mv = t; }
+        else if (f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatR32Float) { if (!dp) dp = t; }
+    }
+    if (mv && dp && mv.width == dp.width && mv.height == dp.height)
+        npu_interp_scene((__bridge void *)mv, (__bridge void *)dp, p ? p->cs_code : 0);
 }
 
 // ---- VXRT_D3D12_GPU_PROFILE=<folder>: one frame's encoders timed on the GPU ---------------------------------------
@@ -11120,6 +11138,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                     else rc = d3d12_gpu_ir_dispatch(&context, pso->gpu_pipeline, c->a, c->b, c->c, NULL, 0);
                 }
                 if (g_dump_armed12) pass_dump_dispatch12(cb, ce, pso, accesses.values, accesses.count, c->a, c->b, c->c);
+                if (npu_interp_wants_scene()) npu_scene_note12(pso, accesses.values, accesses.count);
                 if (trace_cs12(pso->cs_code)) trace_cs_accesses12(pso->cs_code, c->a, c->b, c->c, accesses.values, accesses.count);
                 if (trace_len12())                                 // (VXRT_D3D12_TRACE_LEN: who writes buffers that long)
                     for (uint32_t k = 0; k < accesses.count; k++) {
@@ -11154,11 +11173,12 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             [ce dispatchThreadgroups:MTLSizeMake(c->a, c->b, c->c) threadsPerThreadgroup:MTLSizeMake(pso->msl.threads[0], pso->msl.threads[1], pso->msl.threads[2])];
             if (g_dump_armed12) vx_log("D3D12: pass dump %d: dispatch %ux%ux%u of cs %016llx (direct path, its writes not shown)", g_dump_frame12,
                                        c->a, c->b, c->c, (unsigned long long)pso->cs_code);
-            if (trace_len12() || trace_cs12(pso->cs_code)) {
+            if (trace_len12() || trace_cs12(pso->cs_code) || npu_interp_wants_scene()) {
                 gpu_ir_access_list12 acc = { 0 };
                 pthread_rwlock_rdlock(&d->bufs_lock);   // (collection looks buffers up by address: their registry's lock)
                 if (gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE, compute, heap, sheap, &acc) == GPU_IR_OK)
                 {
+                    if (npu_interp_wants_scene()) npu_scene_note12(pso, acc.values, acc.count);
                     if (trace_len12()) trace_writer12("direct dispatch of cs", pso->cs_code, acc.values, acc.count);
                     if (trace_cs12(pso->cs_code)) trace_cs_accesses12(pso->cs_code, c->a, c->b, c->c, acc.values, acc.count);
                 }

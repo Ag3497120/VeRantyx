@@ -11,3 +11,7 @@ int npu_interp_on(void *layer);
 // The present of a back buffer texture (its w x h top-left region), encoded into the caller's MTLCommandBuffer,
 // which this commits; waitable (or NULL) is released when the GPU has copied the frame.
 void npu_interp_frame(void *layer, void *command_buffer, void *texture, uint32_t w, uint32_t h, HANDLE waitable);
+// VXRT_NPU_INTERP=race: 1 while the scene's motion vectors and depth are wanted (the D3D12 front end then passes those of
+// the dispatch that reads both, its upscaler's, with npu_interp_scene: MTLTextures, each frame)
+int npu_interp_wants_scene(void);
+void npu_interp_scene(void *motion_vectors, void *depth, uint64_t shader);
