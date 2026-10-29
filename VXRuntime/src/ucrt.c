@@ -355,10 +355,20 @@ static int g_errno_value(void) { return t_errno; }
 static void set_errno(int e) { t_errno = e; }
 
 // ---- heap, memory, strings ---------------------------------------------------------------------------------------------------
-static WINAPI void *vx_malloc(size_t n) { return vx_heap_alloc(n); }
-static WINAPI void *vx_calloc(size_t a, size_t b) { return b && a > SIZE_MAX / b ? NULL : vx_heap_zalloc(a * b); }
-static WINAPI void *vx_realloc(void *p, size_t n) { return realloc(p, n); }
-static WINAPI void vx_free(void *p) { free(p); }
+static WINAPI void *vx_malloc(size_t n) { void *p = vx_heap_alloc(n); VX_HEAP_NOTE(p, 1); return p; }
+static WINAPI void *vx_calloc(size_t a, size_t b) {
+    if (b && a > SIZE_MAX / b) return NULL;
+    void *p = vx_heap_zalloc(a * b);
+    VX_HEAP_NOTE(p, 1);
+    return p;
+}
+static WINAPI void *vx_realloc(void *p, size_t n) {
+    VX_HEAP_NOTE(p, -1);
+    void *q = realloc(p, n);
+    VX_HEAP_NOTE(q ? q : n ? p : NULL, 1);
+    return q;
+}
+static WINAPI void vx_free(void *p) { VX_HEAP_NOTE(p, -1); free(p); }
 static WINAPI void *vx_memcpy(void *d, const void *s, size_t n) { return memcpy(d, s, n); }
 static WINAPI void *vx_memmove(void *d, const void *s, size_t n) { return memmove(d, s, n); }
 static WINAPI void *vx_memset(void *d, int c, size_t n) { return memset(d, c, n); }
@@ -547,22 +557,24 @@ static WINAPI vfn vx_dllonexit(vfn f, vfn **begin, vfn **end) {
     return f;
 }
 // msvcrt's C++ operators new and delete (mangled names), for programs built against msvcrt.dll.
-static WINAPI void *vx_new(size_t n) { return vx_heap_alloc(n); }
-static WINAPI void vx_delete(void *p) { free(p); }
+static WINAPI void *vx_new(size_t n) { void *p = vx_heap_alloc(n); VX_HEAP_NOTE(p, 1); return p; }
+static WINAPI void vx_delete(void *p) { VX_HEAP_NOTE(p, -1); free(p); }
 
 // Aligned allocations: posix_memalign memory is released with free(), so _aligned_free is free().
 static WINAPI void *vx_aligned_malloc(size_t n, size_t align) {
     void *p = NULL;
     if (align < sizeof(void *)) align = sizeof(void *);
-    return posix_memalign(&p, align, n ? n : 1) ? NULL : p;
+    if (posix_memalign(&p, align, n ? n : 1)) return NULL;
+    VX_HEAP_NOTE(p, 1);
+    return p;
 }
-static WINAPI void vx_aligned_free(void *p) { free(p); }
+static WINAPI void vx_aligned_free(void *p) { VX_HEAP_NOTE(p, -1); free(p); }
 static WINAPI size_t vx_aligned_msize(void *p, size_t align, size_t offset) { (void)align; (void)offset; return p ? malloc_size(p) : 0; }
 static WINAPI void *vx_aligned_realloc(void *p, size_t n, size_t align) {
     if (!p) return vx_aligned_malloc(n, align);
-    if (!n) { free(p); return NULL; }
+    if (!n) { vx_aligned_free(p); return NULL; }
     void *q = vx_aligned_malloc(n, align);
-    if (q) { size_t old = malloc_size(p); memcpy(q, p, old < n ? old : n); free(p); }
+    if (q) { size_t old = malloc_size(p); memcpy(q, p, old < n ? old : n); vx_aligned_free(p); }
     return q;
 }
 

@@ -35,6 +35,7 @@
 #include "npu_interp.h"
 #include "stereo.h"
 #include <float.h>
+#include <malloc/malloc.h>
 #include <sys/stat.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -201,7 +202,7 @@ struct dev12 {
     int typed_uav_load_additional_formats;
     id<MTLLibrary> format_probe_library;
     id<MTLFunction> format_probe_vertex, format_probe_fragment;
-    NSMutableDictionary *pso_cache;  // MSL source -> id<MTLComputePipelineState>
+    NSMutableDictionary *pso_cache;  // compute: hash and length of the MSL source (UAV clears: the source) -> id<MTLComputePipelineState>
     gpu_ir_metal_device *common_metal; // shared Metal resource and command backend for API-neutral operations
     id<MTLCommandQueue> cpu_transfer_queue; // synchronous opaque-layout resource access
     id<MTLComputePipelineState> indirect_args_filter; // applies ExecuteIndirect count-buffer limits on the GPU
@@ -313,6 +314,9 @@ struct res12 {
     // Metal placement heaps of D3D12 heaps. Each tile's current mapping is kept for CopyTileMappings; a mapped heap
     // is held until its tiles are remapped or the resource is destroyed.
     uint8_t reserved;
+    // VXRT_D3D12_TEX_DOWNSCALE: the Metal texture leaves out the first mip_drop mips (desc stays the game's; its
+    // subresource m is the Metal texture's m - mip_drop, and copies to or from the left-out mips do nothing)
+    uint8_t mip_drop;
     uint32_t tile_count;
     memheap12 **tile_heaps;
     uint32_t *tile_offsets;
@@ -456,7 +460,7 @@ typedef struct {
     uint64_t allocator_generation;
     int allocator_recording;
     cmd12 *cmds;
-    uint32_t n, cap;
+    uint32_t n, cap, small_resets;
     pso12 *recording_pso;
     uint32_t recording_topology;
     int recording_topology_set;
@@ -600,8 +604,19 @@ static void cb_log_reset12(void) { t_cb_log12[0] = 0; t_cb_len12 = 0; }
 // *c, *i, *I, *g leave out every draw, dispatch, indirect dispatch, indirect draw, copy.
 static volatile uint32_t g_skip12[64];
 static volatile int g_skip_count12;
-static volatile int g_census12;
-static volatile int g_no_dispatch_barrier12;   // (a line "!dbarrier": no memory barrier after each dispatch, to compare)               // (a line "?" in the file: presents left to count shaders' uses)
+static volatile int g_census12;                // (a line "?" in the file: presents left to count shaders' uses)
+static volatile int g_mem_report12;            // (a line "?mem": the memory report at the next present)
+// (a line "!dbarrier": no memory barrier after each dispatch; "!concurrent": that, and compute encoders of concurrent
+//  dispatches - D3D12 orders dispatches only at its barriers, which end the encoder - to compare)
+// Concurrent is the default (D3D12 promises no order between dispatches without a barrier; every barrier ends the
+// encoder): measured on M1 Max in El Coyote, GPU busy 41.2 ms a frame against 44.1-46.4 serial, the picture the same.
+// VXRT_D3D12_CONCURRENT_DISPATCH=0, or a line "!serial" in the skip file: serial encoders, a barrier after each.
+static volatile int g_no_dispatch_barrier12;
+static int g_dispatch_default12;
+__attribute__((constructor)) static void dispatch_default_init12(void) {
+    const char *e = getenv("VXRT_D3D12_CONCURRENT_DISPATCH");
+    g_no_dispatch_barrier12 = g_dispatch_default12 = e && !atoi(e) ? 0 : 3;
+}
 static const char *skip_path12(void) {
     static const char *p = (const char *)-1;
     if (p == (const char *)-1) { p = getenv("VXRT_D3D12_SKIP"); if (p && !*p) p = NULL; }
@@ -612,16 +627,19 @@ static void skip_poll12(void) {
     if (!p) return;
     static struct timespec seen;
     struct stat st;
-    if (stat(p, &st)) { g_skip_count12 = 0; g_no_dispatch_barrier12 = 0; seen.tv_sec = 0; return; }
+    if (stat(p, &st)) { g_skip_count12 = 0; g_no_dispatch_barrier12 = g_dispatch_default12; seen.tv_sec = 0; return; }
     if (st.st_mtimespec.tv_sec == seen.tv_sec && st.st_mtimespec.tv_nsec == seen.tv_nsec) return;
     seen = st.st_mtimespec;
     FILE *f = fopen(p, "r");
-    int n = 0, nodbar = 0;
+    int n = 0, nodbar = g_dispatch_default12;
     char line[128];
     while (f && n < 64 && fgets(line, sizeof line, f)) {
         char *end;
+        if (!strncmp(line, "?mem", 4)) { g_mem_report12 = 1; continue; }
         if (line[0] == '?') { if (!g_census12) g_census12 = 31; continue; }
-        if (!strncmp(line, "!dbarrier", 9)) { nodbar = 1; continue; }
+        if (!strncmp(line, "!dbarrier", 9)) { nodbar |= 1; continue; }
+        if (!strncmp(line, "!concurrent", 11)) { nodbar |= 3; continue; }
+        if (!strncmp(line, "!serial", 7)) { nodbar = 0; continue; }
         if (line[0] == '*') { g_skip12[n++] = 0x80000000u | (uint8_t)line[1]; continue; }   // (*p every draw, *c every dispatch, *i every indirect one, *I indirect draws, *g copies)
         unsigned long v = strtoul(line, &end, 16);
         if (end != line) g_skip12[n++] = (uint32_t)v;
@@ -2047,6 +2065,43 @@ static int d3d12_tiled_tier_probe12(id<MTLDevice> mtl) {
     return 0;
 }
 
+// VXRT_D3D12_TEX_DOWNSCALE=<n> (1 to 3): committed textures in default heaps that are only sampled (no render target,
+// depth or UAV use), 2D (or 2D arrays and cubes) with more than n mips and at least VXRT_D3D12_TEX_DOWNSCALE_MIN
+// (default 1024) texels on their longer side are made without their n largest mips: about 1 - 4^-n less memory
+// each. The game sees its own description; copies to the mips left out are dropped, views and copies of the others
+// move up n Metal levels (their sizes are the same). Placed resources keep their size (their heap's memory is the
+// game's either way). Shaders that read texels by integer coordinates of the top mip would read the wrong ones.
+static volatile uint64_t g_tex_drop_bytes12, g_tex_drop_count12, g_tex_drop_copies12;
+static int tex_drop_levels12(const HEAP_PROPS *hp, const RES_DESC *desc, memheap12 *in, int reserved, uint32_t *logical_mips) {
+    static int n = -1, min = 1024;
+    if (n < 0) {
+        const char *e = getenv("VXRT_D3D12_TEX_DOWNSCALE"), *m = getenv("VXRT_D3D12_TEX_DOWNSCALE_MIN");
+        int v = e ? atoi(e) : 0;
+        if (m && atoi(m) > 0) min = atoi(m);
+        n = v < 0 ? 0 : v > 3 ? 3 : v;
+        if (n) vx_log("D3D12: sampled textures of at least %d texels are made without their %d largest mip%s (VXRT_D3D12_TEX_DOWNSCALE)",
+                      min, n, n > 1 ? "s" : "");
+    }
+    if (!n || in || reserved || !hp || hp->Type != 1 || desc->Dimension != 3 || desc->SampleCount > 1 || (desc->Flags & 0x7) ||
+        d3d12_resource_plane_count(desc->Format) != 1) return 0;
+    uint64_t w = desc->Width, h = desc->Height ? desc->Height : 1;
+    uint32_t mips = desc->MipLevels;
+    if (!mips) { uint64_t m = MAX(w, h); mips = 1; while (m > 1) { m >>= 1; mips++; } }
+    uint64_t q = 4ull << n;
+    if (mips <= (uint32_t)n || MAX(w, h) < (uint64_t)min || w % q || h % q) return 0;
+    *logical_mips = mips;
+    return n;
+}
+
+// A D3D12 subresource of a texture -> the Metal texture's (0: a mip left out by VXRT_D3D12_TEX_DOWNSCALE).
+static int tex_sub12(const res12 *r, uint32_t sub, uint32_t *metal) {
+    if (!r || !r->mip_drop) { *metal = sub; return 1; }
+    uint32_t mips = r->desc.MipLevels, m = sub % mips, slice = sub / mips;
+    if (m < r->mip_drop) return 0;
+    *metal = (m - r->mip_drop) + slice * (mips - r->mip_drop);
+    return 1;
+}
+
 // A committed resource (heap nil) or one placed in a heap at an offset.
 static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t initial_state,
                                const void *clear, memheap12 *in, uint64_t offset, int reserved, const GUID *iid, void **out) {
@@ -2100,7 +2155,11 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
             if (!in && hp->Type != 2) memset(r->buffer.contents, 0, r->buffer.length);
         }   // (default and readback heaps start zeroed)
     } else {
-        MTLTextureDescriptor *td = texture_descriptor(d, desc);
+        uint32_t logical_mips = 0;
+        int drop = tex_drop_levels12(hp, desc, in, reserved, &logical_mips);
+        RES_DESC smaller = *desc;
+        if (drop) { smaller.Width >>= drop; smaller.Height >>= drop; smaller.MipLevels = (uint16_t)(logical_mips - drop); }
+        MTLTextureDescriptor *td = texture_descriptor(d, drop ? &smaller : desc);
         if (!td) { d3d_release(&r->base); return E_INVALIDARG; }
         int texture_exception = 0;
         @try {
@@ -2120,6 +2179,12 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
                    exception.reason.UTF8String ? exception.reason.UTF8String : "unknown Metal exception");
         }
         if (!r->texture) { d3d_release(&r->base); return texture_exception || in ? E_INVALIDARG : E_OUTOFMEMORY; }
+        if (drop) {
+            r->mip_drop = (uint8_t)drop;
+            r->desc.MipLevels = (uint16_t)logical_mips;
+            __atomic_add_fetch(&g_tex_drop_count12, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&g_tex_drop_bytes12, r->texture.allocatedSize, __ATOMIC_RELAXED);
+        }
         if (r->desc.MipLevels == 0) r->desc.MipLevels = (uint16_t)td.mipmapLevelCount;
         uint64_t mapped_subresources = (uint64_t)r->desc.MipLevels *
             (r->desc.Dimension == 4 ? 1u : r->desc.DepthOrArraySize) * d3d12_resource_plane_count(r->desc.Format);
@@ -3413,7 +3478,7 @@ static WINAPI void dev_create_srv(void *this, void *resource, const SRV_DESC *de
         if (desc) {
             d3d12_srv_texture_range12 range;
             texture_view_valid = mapping_valid && d3d12_normalize_srv_texture_range12((uint32_t)dim, desc->raw,
-                (uint32_t)r->texture.mipmapLevelCount, (uint32_t)r->texture.arrayLength, &range);
+                r->mip_drop ? (uint32_t)r->desc.MipLevels : (uint32_t)r->texture.mipmapLevelCount, (uint32_t)r->texture.arrayLength, &range);
             if (texture_view_valid) {
                 view_mip = range.mip;
                 view_mips = range.mips;
@@ -3430,8 +3495,17 @@ static WINAPI void dev_create_srv(void *this, void *resource, const SRV_DESC *de
             vx_log("D3D12: nonzero ResourceMinLODClamp needs Metal Mac2/Apple6 sampling support and a non-1D texture view; descriptor left null");
             texture_view_valid = 0;
         }
+        uint32_t metal_mip = view_mip, metal_mips = view_mips;
+        if (r->mip_drop && texture_view_valid) {                // (the view's mips that the Metal texture has; the first
+            uint32_t end = desc ? view_mip + view_mips : r->desc.MipLevels;   //  one it has when it has none of them)
+            metal_mip = view_mip > r->mip_drop ? view_mip - r->mip_drop : 0;
+            metal_mips = end > r->mip_drop + metal_mip ? end - r->mip_drop - metal_mip : 1;
+            if (resource_min_lod != 0.0f) {
+                resource_min_lod = MAX(0.0f, resource_min_lod - r->mip_drop);
+            }
+        }
         id<MTLTexture> t = texture_view_valid ? texture_view(r, desc ? desc->format : 0, view_type(dim, 0),
-                                        view_mip, view_mips, view_slice, view_slices) : nil;
+                                        metal_mip, desc || r->mip_drop ? metal_mips : view_mips, view_slice, view_slices) : nil;
         texture_view_valid = t != nil;
         if (texture_view_valid) {
             v.res = resource_id(t);
@@ -3887,8 +3961,11 @@ static HRESULT create_compute_pso12(void *this, const COMPUTE_PSO_DESC *desc, co
     }
     rootsig12 *root = desc->root;
     NSString *src = @(p->msl.msl);
+    // (keyed by the source's hash and length, not the source: the keys of a game's compute shaders were tens of MB)
+    NSString *key = [NSString stringWithFormat:@"cs %016llx %zu", (unsigned long long)fnv1a12(0xcbf29ce484222325ull,
+                     p->msl.msl, strlen(p->msl.msl)), strlen(p->msl.msl)];
     pthread_mutex_lock(&d->lock);
-    id<MTLComputePipelineState> cached = d->pso_cache[src];
+    id<MTLComputePipelineState> cached = d->pso_cache[key];
     pthread_mutex_unlock(&d->lock);
     if (cached) p->compute = cached;
     else {
@@ -3909,7 +3986,7 @@ static HRESULT create_compute_pso12(void *this, const COMPUTE_PSO_DESC *desc, co
             return E_INVALIDARG;
         }
         pthread_mutex_lock(&d->lock);
-        d->pso_cache[src] = p->compute;
+        d->pso_cache[key] = p->compute;
         pthread_mutex_unlock(&d->lock);
     }
     gpu_ir_pipeline *common_metal_pipeline = NULL;
@@ -4099,8 +4176,13 @@ invalid:
 
 // ---- command lists: recording ------------------------------------------------------------------------------------------
 
+static uint64_t g_cmd_bytes12, g_replay_copy_bytes12, g_replay_copy_peak12;   // (atomic; the memory report)
 static cmd12 *rec(list12 *l, int op) {
-    if (l->n == l->cap) { l->cap = l->cap ? l->cap * 2 : 64; l->cmds = realloc(l->cmds, l->cap * sizeof *l->cmds); }
+    if (l->n == l->cap) {
+        uint32_t cap = l->cap ? l->cap * 2 : 64;
+        __atomic_add_fetch(&g_cmd_bytes12, (uint64_t)(cap - l->cap) * sizeof *l->cmds, __ATOMIC_RELAXED);
+        l->cap = cap; l->cmds = realloc(l->cmds, l->cap * sizeof *l->cmds);
+    }
     cmd12 *c = &l->cmds[l->n++];
     memset(c, 0, sizeof *c);
     c->op = op;
@@ -4131,6 +4213,19 @@ static void list_clear(list12 *l) {
         for (int k = 0; k < 9; k++) if (c->resource[k]) d3d_release(&c->resource[k]->base);
     }
     gpu_ir_stream_clear(&l->gpu_ir);
+    // (a list that used under a quarter of its commands' array at 8 resets in a row gets half of it back: lists
+    //  that once recorded a loading screen's thousands keep 712 bytes for each)
+    if (l->cap > 256 && l->n < l->cap / 4) {
+        if (++l->small_resets >= 8) {
+            uint32_t cap = l->cap / 2;
+            cmd12 *smaller = realloc(l->cmds, (size_t)cap * sizeof *l->cmds);
+            if (smaller) {
+                __atomic_sub_fetch(&g_cmd_bytes12, (uint64_t)(l->cap - cap) * sizeof *l->cmds, __ATOMIC_RELAXED);
+                l->cmds = smaller; l->cap = cap;
+            }
+            l->small_resets = 0;
+        }
+    } else l->small_resets = 0;
     l->recording_pso = NULL;
     l->recording_topology = 4; // D3D12 triangle list; matches the replay state's initial topology.
     l->recording_topology_set = 0;
@@ -4153,6 +4248,7 @@ static void list_destroy(d3d_object *o) {
     if (allocator) d3d_release(&allocator->base);
     list_clear(l);
     gpu_ir_stream_destroy(&l->gpu_ir);
+    __atomic_sub_fetch(&g_cmd_bytes12, (uint64_t)l->cap * sizeof *l->cmds, __ATOMIC_RELAXED);
     free(l->cmds);
     release_dev(o);
 }
@@ -4228,6 +4324,7 @@ static int list_reserve12(list12 *list, uint32_t additional) {
     if ((size_t)capacity > SIZE_MAX / sizeof *list->cmds) return 0;
     cmd12 *commands = realloc(list->cmds, (size_t)capacity * sizeof *commands);
     if (!commands) return 0;
+    __atomic_add_fetch(&g_cmd_bytes12, (uint64_t)(capacity - list->cap) * sizeof *commands, __ATOMIC_RELAXED);
     list->cmds = commands;
     list->cap = capacity;
     return 1;
@@ -4530,6 +4627,8 @@ static WINAPI void list_copy_buffer(void *this, void *dst, uint64_t dst_off, voi
     }
     list_record_gpu_buffer_copy(this, dst, dst_off, src, src_off, n);
 }
+static WINAPI void list_copy_texture(void *this, const COPY_LOC *dst, uint32_t x, uint32_t y, uint32_t z, const COPY_LOC *src, const BOX *box);
+static uint64_t resource_subresource_count12(const res12 *resource);
 static WINAPI void list_copy_resource(void *this, void *dst, void *src) {
     list12 *l = this;
     res12 *d = dst, *s = src;
@@ -4551,6 +4650,14 @@ static WINAPI void list_copy_resource(void *this, void *dst, void *src) {
             return;
         }
         vx_log("D3D12: buffer CopyResource source and destination do not match (error %d)", rc);
+        return;
+    }
+    if (d && s && d->texture && s->texture && d->mip_drop != s->mip_drop) {   // (one made smaller: subresource by subresource)
+        uint64_t n = resource_subresource_count12(d);
+        for (uint64_t k = 0; k < n && k < resource_subresource_count12(s); k++) {
+            COPY_LOC dl = { .res = d, .type = 0, .subresource = (uint32_t)k }, sl = { .res = s, .type = 0, .subresource = (uint32_t)k };
+            list_copy_texture(this, &dl, 0, 0, 0, &sl, NULL);
+        }
         return;
     }
     if (d && s && d->gpu_texture && s->gpu_texture && d->texture.pixelFormat == s->texture.pixelFormat) {
@@ -4620,6 +4727,12 @@ static int d3d12_resolve_location(res12 *resource, uint32_t subresource, gpu_ir_
     uint32_t planes = d3d12_resource_plane_count(resource->desc.Format);
     uint64_t plane_size = (uint64_t)mips * slices;
     if (subresource >= plane_size * planes || !plane_size || subresource / plane_size) return 0;
+    if (resource->mip_drop) {
+        uint32_t metal;
+        if (!tex_sub12(resource, subresource, &metal)) return 0;
+        mips -= resource->mip_drop;
+        subresource = metal;
+    }
     location->mip_level = subresource % mips;
     location->array_slice = subresource / mips;
     return 1;
@@ -4941,7 +5054,27 @@ static int list_record_gpu_texture_copy(list12 *list, res12 *dst, const COPY_LOC
 
 static WINAPI void list_copy_texture(void *this, const COPY_LOC *dst, uint32_t x, uint32_t y, uint32_t z, const COPY_LOC *src, const BOX *box) {
     list12 *list = this;
-    if (dst && src && list_record_gpu_texture_copy(list, dst->res, dst, x, y, z, src->res, src, box)) return;
+    COPY_LOC dst_metal, src_metal;
+    uint32_t dst_logical = 0, src_logical = 0;
+    int dropped = 0;
+    if (dst && src && ((dst->type == 0 && dst->res && ((res12 *)dst->res)->mip_drop) ||
+                       (src->type == 0 && src->res && ((res12 *)src->res)->mip_drop))) {
+        dst_metal = *dst; src_metal = *src;
+        dst_logical = dst->subresource; src_logical = src->subresource;
+        if (dst->type == 0 && !tex_sub12(dst->res, dst->subresource, &dst_metal.subresource)) dropped = 1;
+        if (src->type == 0 && !tex_sub12(src->res, src->subresource, &src_metal.subresource)) dropped = 1;
+        if (dropped) { __atomic_add_fetch(&g_tex_drop_copies12, 1, __ATOMIC_RELAXED); return; }
+        dst = &dst_metal; src = &src_metal;
+        uint32_t before = list->n;
+        if (list_record_gpu_texture_copy(list, dst->res, dst, x, y, z, src->res, src, box)) {
+            for (uint32_t i = before; i < list->n; i++)        // (the state tracking keeps the game's subresources)
+                if (list->cmds[i].op == C_GPU_IR && list->cmds[i].gfx == D3D12_TRACK_COPY_TEXTURE) {
+                    list->cmds[i].c = src->type == 0 ? src_logical : 0;
+                    list->cmds[i].off = dst->type == 0 ? dst_logical : 0;
+                }
+            return;
+        }
+    } else if (dst && src && list_record_gpu_texture_copy(list, dst->res, dst, x, y, z, src->res, src, box)) return;
     cmd12 *c = rec(this, C_COPY_TEXTURE);
     c->dst = *dst; c->src = *src;
     c->a = x; c->b = y; c->c = z;
@@ -6465,7 +6598,7 @@ typedef struct {
     d3d_object base; dev12 *dev;
     pthread_mutex_t lock;
     plib_entry12 *entries;
-    uint32_t n, cap;
+    uint32_t n, cap, small_resets;
 } plib12;
 
 #define D3D12_ERROR_ADAPTER_NOT_FOUND12 ((HRESULT)0x887E0001)
@@ -7232,6 +7365,7 @@ typedef struct {
 // 1 MB taken from the device's pool and given back when the command buffer completes (a new Metal buffer per
 // execution cost more than the draws: every first write to its pages faulted).
 enum { SCRATCH_CHUNK = 1 << 20, SCRATCH_POOL_MAX = 32 };
+static volatile uint64_t g_scratch_made12;     // (MB of scratch chunks made, for the memory report)
 typedef struct { id<MTLBuffer> buf; size_t used; NSMutableArray *bufs; } scratch;
 static id<MTLBuffer> scratch_chunk(dev12 *d, size_t size) {
     id<MTLBuffer> chunk = nil;
@@ -7241,6 +7375,7 @@ static id<MTLBuffer> scratch_chunk(dev12 *d, size_t size) {
         if (chunk) [d->scratch_pool removeLastObject];
         pthread_mutex_unlock(&d->scratch_lock);
     }
+    if (!chunk) __atomic_add_fetch(&g_scratch_made12, MAX((size_t)SCRATCH_CHUNK, size) >> 20, __ATOMIC_RELAXED);
     return chunk ?: [d->mtl newBufferWithLength:MAX((size_t)SCRATCH_CHUNK, size) options:MTLResourceStorageModeShared];
 }
 // The chunks of an execution the GPU is done with.
@@ -9249,7 +9384,7 @@ static void prof_note12(char kind, uint64_t hash) {
 }
 static id<MTLComputeCommandEncoder> new_compute12(id<MTLCommandBuffer> cb) {
     int k = prof_begin12(cb.device, 'C');
-    if (k < 0) return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    if (k < 0) return [cb computeCommandEncoderWithDispatchType:(g_no_dispatch_barrier12 & 2) ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
     MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
     pd.dispatchType = MTLDispatchTypeSerial;
     pd.sampleBufferAttachments[0].sampleBuffer = g_prof_buf12;
@@ -10707,6 +10842,19 @@ static int gpu_ir_execute_transient_draw(gpu_ir_pipeline *pipeline, const gpu_ir
     return rc;
 }
 
+// A replay's own copy of its list's commands (each knowing its index in the list), before the first insertion.
+static int replay_own12(cmd12 **commands, uint32_t count, uint64_t *bytes) {
+    cmd12 *copy = malloc((size_t)(count ? count : 1) * sizeof *copy);
+    if (!copy) { vx_log("D3D12: could not copy a command list for replay"); return 0; }
+    memcpy(copy, *commands, (size_t)count * sizeof *copy);
+    for (uint32_t i = 0; i < count; i++) copy[i].replay_source_index = i;
+    *commands = copy;
+    *bytes = (uint64_t)count * sizeof *copy;
+    uint64_t in_flight = __atomic_add_fetch(&g_replay_copy_bytes12, *bytes, __ATOMIC_RELAXED);
+    for (uint64_t peak = __atomic_load_n(&g_replay_copy_peak12, __ATOMIC_RELAXED); in_flight > peak &&
+         !__atomic_compare_exchange_n(&g_replay_copy_peak12, &peak, in_flight, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
+    return 1;
+}
 static int replay_insert(cmd12 **commands, uint32_t *count, uint32_t at, const cmd12 *items, uint32_t nitems) {
     if (!nitems) return 1;
     if (at > *count || nitems > UINT32_MAX - *count || (size_t)(*count + nitems) > SIZE_MAX / sizeof **commands) return 0;
@@ -10956,19 +11104,19 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                   id<MTLCommandBuffer> *command_buffer, scratch *sc) {
     id<MTLCommandBuffer> cb = *command_buffer;
     uint32_t command_count = l->n;
-    cmd12 *commands = command_count ? malloc((size_t)command_count * sizeof *commands) : NULL;
-    if (command_count && !commands) { vx_log("D3D12: could not copy a command list for replay"); return 0; }
-    if (command_count) {
-        memcpy(commands, l->cmds, (size_t)command_count * sizeof *commands);
-        for (uint32_t i = 0; i < command_count; i++) commands[i].replay_source_index = i;
-    }
+    // (the list's own commands, read in place: a copy is made only when an ExecuteIndirect expands into commands on the
+    //  CPU - replay_own12 - since the list cannot change before this replay is done; its copy's commands remember their
+    //  index in the list)
+    cmd12 *commands = l->cmds;
+    int commands_owned = 0;
+    uint64_t copy_bytes = 0;
     pso12 *pso = NULL;
     heap12 *heap = NULL, *sheap = NULL;
     root_binding *compute = calloc(1, sizeof *compute), *graphics = calloc(1, sizeof *graphics);
     gfx_state *g = calloc(1, sizeof *g);
     if (!compute || !graphics || !g) {
         vx_log("D3D12: could not allocate command-list replay state");
-        gfx_access_cache_release12(g); free(commands); free(compute); free(graphics); free(g);
+        gfx_access_cache_release12(g); __atomic_sub_fetch(&g_replay_copy_bytes12, copy_bytes, __ATOMIC_RELAXED); if (commands_owned) free(commands); free(compute); free(graphics); free(g);
         return 0;
     }
     g->prim = MTLPrimitiveTypeTriangle;
@@ -11455,12 +11603,13 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 if (sig->args[argument_index].type == INDIRECT_VERTEX_BUFFER ||
                     sig->args[argument_index].type == INDIRECT_INDEX_BUFFER) changes_indirect_state = 1;
             if (gpu_records_readback && changes_indirect_state && available) {
-                int validation_ready = c->replay_source_index != UINT32_MAX && state_shadows && state_count &&
+                uint32_t source_index = commands_owned ? c->replay_source_index : i;
+                int validation_ready = source_index != UINT32_MAX && state_shadows && state_count &&
                     replay_indirect_override_reserve12(&indirect_overrides, &indirect_override_capacity,
                                                        indirect_override_count + 1);
                 if (validation_ready) {
                     indirect_overrides[indirect_override_count++] = (d3d12_indirect_validation_override12){
-                        .command_index = c->replay_source_index, .available = available, .records = data };
+                        .command_index = source_index, .available = available, .records = data };
                     resource_state_shadow12 *validated_shadows = NULL;
                     uint32_t validated_count = 0;
                     int validation_result = queue_validate_list_states12(d, queue_type, queue, l,
@@ -11564,7 +11713,8 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                     out->op = C_ROOT_VA; out->a = a->a; out->gfx = sig->gfx; break;
                 }
             }
-            if (!replay_insert(&commands, &command_count, i + 1, generated, generated_count))
+            if (generated_count && !commands_owned && replay_own12(&commands, command_count, &copy_bytes)) commands_owned = 1;
+            if (generated_count && (!commands_owned || !replay_insert(&commands, &command_count, i + 1, generated, generated_count)))
                 vx_log("D3D12: could not insert expanded ExecuteIndirect commands");
             free(generated);
             break;
@@ -11683,13 +11833,13 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
     if (replay_failed) {
         close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
         free(indirect_overrides);
-        gfx_access_cache_release12(g); free(commands); free(compute); free(graphics); free(g);
+        gfx_access_cache_release12(g); __atomic_sub_fetch(&g_replay_copy_bytes12, copy_bytes, __ATOMIC_RELAXED); if (commands_owned) free(commands); free(compute); free(graphics); free(g);
         *command_buffer = cb;
         return 0;
     }
     close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
     free(indirect_overrides);
-    free(commands);
+    __atomic_sub_fetch(&g_replay_copy_bytes12, copy_bytes, __ATOMIC_RELAXED); if (commands_owned) free(commands);
     free(compute);
     free(graphics);
     gfx_access_cache_release12(g);
@@ -13348,6 +13498,158 @@ static void job_present12(queue12 *q, qjob12 *j) {
     swap_present_now12(sc, j->index, drawable, j->waitable);
     release_elsewhere12(&sc->base);
 }
+// The memory report (VXRT_D3D12_SKIP file line ?mem): the process's footprint, what Metal has allocated, and what
+// of it is the game's (its heaps, its committed resources) and what is ours (descriptor heaps on the GPU and their
+// per-descriptor bookkeeping, scratch chunks, the compute pipeline cache's keys).
+// malloc's blocks in use, by its size classes (tiny to 1008 bytes, small to 127 KB, medium to 8 MB, large), and the
+// block sizes holding the most of medium: an enumeration of every zone with the zone locked (the recorder allocates
+// nothing).
+typedef struct { uint64_t bytes[4], blocks[4]; struct { uint64_t size, n; } sizes[4096]; } heapcount12;
+static heapcount12 g_heapcount12;
+static kern_return_t census_reader12(task_t t, vm_address_t a, vm_size_t n, void **p) { (void)t; (void)n; *p = (void *)a; return KERN_SUCCESS; }
+static void census_record12(task_t t, void *ctx, unsigned type, vm_range_t *r, unsigned count) {
+    (void)t; (void)type;
+    heapcount12 *c = ctx;
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t n = r[i].size;
+        int k = n <= 1008 ? 0 : n <= (127u << 10) ? 1 : n <= (8u << 20) ? 2 : 3;
+        c->bytes[k] += n; c->blocks[k]++;
+        if (k != 2) continue;
+        for (uint32_t h = (uint32_t)((n * 0x9E3779B97F4A7C15ull) >> 52), j = 0; j < 4096; j++, h = (h + 1) & 4095)
+            if (!c->sizes[h].n || c->sizes[h].size == n) { c->sizes[h].size = n; c->sizes[h].n++; break; }
+    }
+}
+static void malloc_census12(char *out, size_t size) {
+    heapcount12 *c = &g_heapcount12;
+    memset(c, 0, sizeof *c);
+    vm_address_t *zones = NULL;
+    unsigned nzones = 0;
+    if (malloc_get_all_zones(mach_task_self(), NULL, &zones, &nzones) != KERN_SUCCESS) { snprintf(out, size, "?"); return; }
+    for (unsigned z = 0; z < nzones; z++) {
+        malloc_zone_t *zone = (malloc_zone_t *)zones[z];
+        if (!zone || !zone->introspect || !zone->introspect->enumerator) continue;
+        if (zone->introspect->force_lock) zone->introspect->force_lock(zone);
+        zone->introspect->enumerator(mach_task_self(), c, MALLOC_PTR_IN_USE_RANGE_TYPE, (vm_address_t)zone,
+                                     census_reader12, census_record12);
+        if (zone->introspect->force_unlock) zone->introspect->force_unlock(zone);
+    }
+    static const char *const name[4] = { "tiny", "small", "medium", "large" };
+    size_t o = 0;
+    for (int k = 0; k < 4 && o < size; k++)
+        o += (size_t)snprintf(out + o, size - o, "%s%s %.0f MB (%llu)", k ? ", " : "", name[k], c->bytes[k] / 1048576.0,
+                              (unsigned long long)c->blocks[k]);
+    for (int top = 0; top < 8 && o < size; top++) {          // (the medium sizes by total, largest first)
+        int best = -1;
+        for (int h = 0; h < 4096; h++)
+            if (c->sizes[h].n && (best < 0 || c->sizes[h].size * c->sizes[h].n > c->sizes[best].size * c->sizes[best].n)) best = h;
+        if (best < 0) break;
+        o += (size_t)snprintf(out + o, size - o, "%s%llu KB x%llu", top ? " " : "; medium by size: ",
+                              (unsigned long long)(c->sizes[best].size >> 10), (unsigned long long)c->sizes[best].n);
+        c->sizes[best].n = 0;
+    }
+}
+static void mem_report12(dev12 *d) {
+    task_vm_info_data_t vm = { 0 };
+    mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n);
+    uint64_t heaps = 0, committed = 0, desc_gpu = 0, desc_cpu = 0, views = 0, other = 0, count = 0;
+    NSMutableSet *seen = [NSMutableSet set], *dgpu = [NSMutableSet set];
+    pthread_mutex_lock(&g_heaps_lock);
+    for (uint32_t i = 0; i < g_nheaps; i++) {
+        heap12 *h = g_heaps[i];
+        size_t c = h->desc.NumDescriptors;
+        if (h->gpu) { desc_gpu += h->gpu.allocatedSize; [dgpu addObject:h->gpu]; }
+        else desc_cpu += 32 * c;
+        desc_cpu += c * (sizeof(id) + 1 + sizeof(void *) + sizeof(shader_view12) + sizeof(void *) + 8);
+        for (size_t k = 0; k < c; k++) if (h->keep[k]) views++;
+    }
+    pthread_mutex_unlock(&g_heaps_lock);
+    pthread_mutex_lock(&d->lock);
+    NSArray *all = [d->resources copy];
+    pthread_mutex_unlock(&d->lock);
+    // (what the textures are: [committed, placed] x [render/depth target, UAV, sampled with mips at least 1024 wide,
+    //  other sampled]; and buffers, committed and placed)
+    uint64_t tb[2][4] = { { 0 } }, tn[2][4] = { { 0 } }, bb[2] = { 0 }, bn[2] = { 0 };
+    for (id<MTLResource> r in all) {
+        count++;
+        if ([dgpu containsObject:r]) continue;
+        id<MTLHeap> hp = r.heap;
+        int placed = hp != nil;
+        if ([r conformsToProtocol:@protocol(MTLTexture)]) {
+            id<MTLTexture> t = (id<MTLTexture>)r;
+            int k = t.usage & MTLTextureUsageRenderTarget ? 0 : t.usage & MTLTextureUsageShaderWrite ? 1 :
+                    t.mipmapLevelCount > 1 && MAX(t.width, t.height) >= 1024 ? 2 : 3;
+            tb[placed][k] += r.allocatedSize; tn[placed][k]++;
+        } else if ([r conformsToProtocol:@protocol(MTLBuffer)]) { bb[placed] += r.allocatedSize; bn[placed]++; }
+        if (hp) { if (![seen containsObject:hp]) { [seen addObject:hp]; heaps += hp.size; } }
+        else if ([r conformsToProtocol:@protocol(MTLTexture)] || [r conformsToProtocol:@protocol(MTLBuffer)]) committed += r.allocatedSize;
+        else other += r.allocatedSize;
+    }
+    for (int placed = 0; placed < 2; placed++)
+        vx_log("D3D12: memory: %s textures: targets %.0f MB (%llu), UAVs %.0f MB (%llu), sampled with mips >=1024 %.0f MB (%llu), "
+               "other sampled %.0f MB (%llu); buffers %.0f MB (%llu)%s", placed ? "placed" : "committed",
+               tb[placed][0] / 1048576.0, (unsigned long long)tn[placed][0], tb[placed][1] / 1048576.0, (unsigned long long)tn[placed][1],
+               tb[placed][2] / 1048576.0, (unsigned long long)tn[placed][2], tb[placed][3] / 1048576.0, (unsigned long long)tn[placed][3],
+               bb[placed] / 1048576.0, (unsigned long long)bn[placed], placed ? "" : " (downscaled ones count at their new size)");
+    {   // (committed buffers by heap type: default, upload, readback, custom)
+        uint64_t hb[5] = { 0 }, hn[5] = { 0 };
+        pthread_rwlock_rdlock(&d->bufs_lock);
+        for (uint32_t i = 0; i < d->nbufs; i++) {
+            res12 *b = d->bufs[i];
+            if (b->owner_heap || b->reserved) continue;
+            int t = b->heap.Type >= 1 && b->heap.Type <= 4 ? b->heap.Type : 0;
+            hb[t] += b->buffer.allocatedSize; hn[t]++;
+        }
+        pthread_rwlock_unlock(&d->bufs_lock);
+        vx_log("D3D12: memory: committed buffers: default %.0f MB (%llu), upload %.0f MB (%llu), readback %.0f MB (%llu), custom %.0f MB (%llu)",
+               hb[1] / 1048576.0, (unsigned long long)hn[1], hb[2] / 1048576.0, (unsigned long long)hn[2],
+               hb[3] / 1048576.0, (unsigned long long)hn[3], hb[4] / 1048576.0, (unsigned long long)hn[4]);
+    }
+    if (__atomic_load_n(&g_tex_drop_count12, __ATOMIC_RELAXED))
+        vx_log("D3D12: memory: VXRT_D3D12_TEX_DOWNSCALE made %llu textures (%.0f MB as made, all time), %llu copies to or from "
+               "left-out mips dropped", (unsigned long long)g_tex_drop_count12, g_tex_drop_bytes12 / 1048576.0,
+               (unsigned long long)g_tex_drop_copies12);
+    uint64_t keys = 0, npso = 0;
+    pthread_mutex_lock(&d->lock);
+    for (NSString *k in d->pso_cache) { keys += [k lengthOfBytesUsingEncoding:NSUTF8StringEncoding]; npso++; }
+    pthread_mutex_unlock(&d->lock);
+    pthread_mutex_lock(&d->scratch_lock);
+    uint64_t pool = d->scratch_pool.count;
+    pthread_mutex_unlock(&d->scratch_lock);
+    vx_log("D3D12: memory: footprint %.0f MB (peak %.0f), Metal allocated %.0f MB; game heaps %.0f MB (%lu), game committed "
+           "resources %.0f MB (of %llu resources); ours: descriptor heaps %.0f MB on the GPU + %.0f MB bookkeeping (%llu views held), "
+           "scratch %llu MB pooled (%llu MB made), compute pipeline cache %llu entries keyed by %.1f MB of source",
+           vm.phys_footprint / 1048576.0, vm.ledger_phys_footprint_peak / 1048576.0, d->mtl.currentAllocatedSize / 1048576.0,
+           heaps / 1048576.0, (unsigned long)seen.count, committed / 1048576.0, (unsigned long long)count,
+           desc_gpu / 1048576.0, desc_cpu / 1048576.0, (unsigned long long)views, (unsigned long long)pool,
+           (unsigned long long)__atomic_load_n(&g_scratch_made12, __ATOMIC_RELAXED), (unsigned long long)npso, keys / 1048576.0);
+    char census[600], heap[200];
+    malloc_census12(census, sizeof census);
+    vx_log("D3D12: memory: malloc in use: %s", census);
+    vx_log("D3D12: memory: ours in malloc: recorded commands %.0f MB (%zu bytes each), their copies in replay %.0f MB (peak %.0f), "
+           "gpu_ir streams %.0f MB (%zu bytes each)", __atomic_load_n(&g_cmd_bytes12, __ATOMIC_RELAXED) / 1048576.0,
+           sizeof(cmd12), __atomic_load_n(&g_replay_copy_bytes12, __ATOMIC_RELAXED) / 1048576.0,
+           __atomic_load_n(&g_replay_copy_peak12, __ATOMIC_RELAXED) / 1048576.0,
+           __atomic_load_n(&gpu_ir_stream_bytes, __ATOMIC_RELAXED) / 1048576.0, gpu_ir_command_size());
+    if (vx_heap_report(heap, sizeof heap)) vx_log("D3D12: memory: the game's heap blocks (HeapAlloc, malloc, new): %s", heap);
+}
+// malloc keeps the pages of freed blocks (most in its medium size class, 1.3 GB of dirty pages for 0.5 GB in use in
+// Cyberpunk) until memory runs short. VXRT_MALLOC_RELIEF=1: every 300 presents malloc_zone_pressure_relief, off the
+// present's thread (measured in Cyberpunk: it gave back 0 MB, 10-38 ms each, so it is off by default).
+static void malloc_relief12(uint32_t presents) {
+    static int on = -1;
+    static volatile int busy;
+    if (on < 0) on = getenv("VXRT_MALLOC_RELIEF") && atoi(getenv("VXRT_MALLOC_RELIEF")) != 0;
+    if (!on || presents % 300 || !__sync_bool_compare_and_swap(&busy, 0, 1)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        uint64_t t0 = fs_now12();
+        size_t freed = malloc_zone_pressure_relief(NULL, 0);
+        static int told;
+        if (told++ < 3 || getenv("VXRT_MALLOC_RELIEF_LOG"))
+            vx_log("D3D12: malloc gave back %.0f MB of freed blocks' pages (%.1f ms)", freed / 1048576.0, (fs_now12() - t0) / 1e6);
+        busy = 0;
+    });
+}
 static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     swap12 *sc = this;
     if (flags & 1) return S_OK;                                    // DXGI_PRESENT_TEST
@@ -13375,6 +13677,8 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     sc->presents++;
     frame_stats_present12(sc->presents);
     cb_trace_poll12();
+    if (g_mem_report12) { g_mem_report12 = 0; mem_report12(sc->dev); }
+    malloc_relief12(sc->presents);
     skip_poll12();
     census_present12();
     pass_dump_present12();

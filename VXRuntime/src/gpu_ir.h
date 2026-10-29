@@ -1260,6 +1260,8 @@ typedef struct {
 } gpu_ir_backend;
 
 typedef struct { void *commands; uint32_t count, capacity; } gpu_ir_stream;
+extern uint64_t gpu_ir_stream_bytes;   // (atomic) the command arrays every stream holds, for memory reports
+size_t gpu_ir_command_size(void);
 
 void gpu_ir_stream_init(gpu_ir_stream *stream);
 void gpu_ir_stream_clear(gpu_ir_stream *stream);
