@@ -53,6 +53,7 @@ typedef struct {
     WCHAR    *command_line_w;
 } vx_process;
 extern vx_process vx_proc;
+void vx_shader_progress_exit(void);
 
 // A loaded PE image: the program or one of its DLLs.
 typedef struct {

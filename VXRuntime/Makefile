@@ -16,10 +16,54 @@ SRC    += src/winprops.c
 SRC    += src/a11y.c
 SRC    += src/mfplat.c
 SRC    += src/imagehlp.c src/spellcheck.c src/ime.c src/clipboard.m
+SRC    += src/shader_progress.m src/shader_cache.m
 MINGW   = x86_64-w64-mingw32-gcc
 MINGWXX = x86_64-w64-mingw32-g++
 
 all: build/vxrt tests
+
+build/vxrt build/vxrt-arm64: src/shader_progress.h src/shader_cache.h
+
+build/shader_progress_test: tests/shader_progress.m src/shader_progress.m src/shader_progress.h src/shader_cache.m src/shader_cache.h src/vx.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tests/shader_progress.m src/shader_progress.m src/shader_cache.m -framework Foundation -framework Metal
+
+check: build/shader_progress_test
+
+build/shader_cache_test: tests/shader_cache.m src/shader_cache.m src/shader_cache.h src/shader_progress.m src/shader_progress.h src/vx.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ tests/shader_cache.m src/shader_cache.m src/shader_progress.m -framework Foundation -framework Metal
+
+shader-cache-check: build/shader_cache_test
+	python3 tests/shader_cache_check.py
+
+check: build/shader_cache_test
+
+build/controller_hotplug.exe: ../VRDriver/tests/controller_hotplug.cpp ../VRDriver/src/openvr_capture_proxy.cpp ../VRDriver/include/openvr.h
+	@mkdir -p build
+	$(MINGWXX) -std=c++17 -O2 -static -static-libgcc -static-libstdc++ -o $@ $< -ld3d11 -ldxgi -lopengl32
+
+check: build/controller_hotplug.exe
+
+build/tracking_height.exe: ../VRDriver/tests/tracking_height.cpp ../VRDriver/src/driver_verantyx.cpp ../VRDriver/include/openvr_driver.h
+	@mkdir -p build
+	$(MINGWXX) -std=c++17 -O2 -static -static-libgcc -static-libstdc++ -I../VRDriver/include -o $@ $< -ld3d11 -ldxgi
+
+check: build/tracking_height.exe
+
+controller-hotplug-check: export VXRT_ROOT = build/root
+controller-hotplug-check: export VXRT_NO_ACTIVATE = 1
+controller-hotplug-check: build/vxrt build/controller_hotplug.exe
+	$(VXRT) build/controller_hotplug.exe
+
+shader-progress-check: export VXRT_ROOT = build/root
+shader-progress-check: export VXRT_NO_ACTIVATE = 1
+shader-progress-check: build/vxrt build/shader_progress_test build/d3d11.exe build/draw.exe build/compute.exe
+	build/shader_progress_test
+	python3 ../tests/loading_progress_test.py
+	$(VXRT) build/d3d11.exe
+	VXRT_SHADER_PROGRESS_FILE=$(abspath build/draw-shader-progress.json) VXRT_SHADER_PROGRESS_EXE=draw.exe $(VXRT) build/draw.exe
+	$(VXRT) build/compute.exe
 
 build/vxrt: $(SRC) src/vx.h src/pe.h src/dotnet_metadata.h src/dotnet_resources.h src/dotnet_baml.h src/dotnet_il.h src/dotnet_exec.h src/dotnet_host.h src/ui.h src/d3d_common.h src/d3d_format.h src/d3d12_view.h src/d3d_tables.h src/d3d12_tables.h src/dxil.h src/dxil_msl.h src/dxil_ir.h src/gpu_ir.h src/gpu_ir_msl.h src/gpu_ir_metal.h src/spirv.h src/spirv_ir.h src/vx_vulkan.h src/vk_impl.h src/vk_encode.h src/vk_msl.h src/vk_win32.h src/vk_dispatch_table.h src/directinput_buffer.h src/directinput_format.h src/audio_tables.h src/xaudio2_tables.h src/dwrite_tables.h src/dxbc.h src/aes_gcm.h
 	@mkdir -p build
@@ -1220,6 +1264,12 @@ check: all build/vkmsl build/x86dec_test build/x86dec_check build/ref_x86 build/
 	python3 ../tests/vxrt_run_profile_test.py
 	python3 ../tests/vxrt_doctor_pe_test.py
 	bash ../tests/launch_vxrt_windows_steam_test.sh
+	python3 ../tests/launch_vxrt_encoder_test.py
+	build/shader_progress_test
+	python3 tests/shader_cache_check.py
+	$(VXRT) build/controller_hotplug.exe
+	$(VXRT) build/tracking_height.exe
+	python3 ../tests/loading_progress_test.py
 	python3 ../tools/vxrt_agents.py check
 	python3 ../tools/vxrt_tune.py --selftest
 	python3 ../tools/vxrt_playtest.py --selftest
@@ -1444,4 +1494,4 @@ build/d3d12_bench.exe: tests/d3d12_bench.c tests/shaders/tex_vs.dxbc tests/shade
 clean:
 	rm -rf build
 
-.PHONY: vr-check all tests check bench d3d12-bench clean shaders translator-check vulkan-test-shaders
+.PHONY: vr-check all tests check bench d3d12-bench clean shaders translator-check vulkan-test-shaders shader-cache-check

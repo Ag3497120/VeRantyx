@@ -201,7 +201,8 @@ Debian extraction, separate app readiness / mode / quality, frame-rate math,
 and fake-process session restart, timeout, cancellation and owned cleanup.
 No test starts Steam, Alyx, an ALVR server or the real encoder. The host and
 encoder are compiled and linked, and nested ad-hoc signatures are verified.
-The full
+The Windows shader-progress, loading/HEVC loopback, encoder-supervisor,
+controller-hotplug, D3D11 drawing and compute checks also pass. The full
 `make -C VXRuntime check` currently stops at the translator differential test;
 a separate build of that test from `main` reproduces the same failures.
 These offline checks do not establish a game or headset regression run.

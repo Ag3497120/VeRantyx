@@ -74,7 +74,8 @@ struct PoseHistoryEntry {
 struct PoseHistory {
     volatile LONG writeCount;
     uint32_t magic;
-    uint32_t reserved[2];
+    uint32_t heightMagic;
+    volatile LONG heightOffsetBits;
     PoseHistoryEntry entries[16];
 };
 #pragma pack(pop)
@@ -107,6 +108,7 @@ static const size_t kHandsOffset = sizeof(SharedHeader) + 2 * kFrameBlockSize;
 static const size_t kMapSize = kHandsOffset + sizeof(SharedHands) + 1024;
 static const size_t kPoseHistoryOffset = kHandsOffset + 512;
 static const uint32_t kPoseHistoryMagic = 0x53485056; // "VPHS"
+static const uint32_t kHeightOffsetMagic = 0x464f4856; // "VHOF"
 static_assert(sizeof(SharedFrame) == 88, "Shared frame layout mismatch");
 static_assert(sizeof(SharedHands) == 312, "Shared hand layout mismatch");
 static_assert(sizeof(SharedHeader) == 64, "Shared header layout mismatch");
@@ -463,6 +465,24 @@ static bool QueueEyeTexture(vr::EVREye eye, const vr::Texture_t* texture,
     return true;
 }
 
+static void ApplyDriverHeight(SharedHands* snapshot) {
+    const PoseHistory* history = reinterpret_cast<const PoseHistory*>(g_sharedBytes + kPoseHistoryOffset);
+    if (history->magic != kPoseHistoryMagic || history->heightMagic != kHeightOffsetMagic) return;
+    const LONG bits = InterlockedCompareExchange(const_cast<volatile LONG*>(&history->heightOffsetBits), 0, 0);
+    float offset;
+    memcpy(&offset, &bits, sizeof(offset));
+    if (!std::isfinite(offset)) return;
+    snapshot->headTransform[13] += offset;
+    snapshot->leftTransform[13] += offset;
+    snapshot->rightTransform[13] += offset;
+    static LONG lastBits = 0;
+    if (InterlockedExchange(&lastBits, bits) != bits) {
+        char message[128];
+        snprintf(message, sizeof(message), "Tracking height from driver: offset=%.3f m (head and both hands)", offset);
+        Log(message);
+    }
+}
+
 static bool ReadSharedHandsSnapshot(SharedHands* snapshot) {
     if (!snapshot || !g_sharedBytes || !g_sharedHeader) return false;
     const size_t handsOffset = kHandsOffset;
@@ -474,7 +494,10 @@ static bool ReadSharedHandsSnapshot(SharedHands* snapshot) {
         memcpy(snapshot, sharedHands, sizeof(*snapshot));
         MemoryBarrier();
         const LONG after = InterlockedCompareExchange(&g_sharedHeader->poseSequence, 0, 0);
-        if (before == after && !(after & 1)) return true;
+        if (before == after && !(after & 1)) {
+            ApplyDriverHeight(snapshot);
+            return true;
+        }
     }
     return false;
 }
@@ -1012,30 +1035,87 @@ static double DisplayPeriodSeconds() {
     return period;
 }
 
-// Remembers the last pose set SteamVR returned and which device indices are
-// the two hands (by position, since the game process does not see the driver).
+static bool QueryControllerRoles(vr::TrackedDeviceIndex_t* left, vr::TrackedDeviceIndex_t* right) {
+    typedef void* (VR_CALLTYPE *GetInterface)(const char*, vr::EVRInitError*);
+    HMODULE real = LoadRealOpenVR();
+    GetInterface getInterface = real ? (GetInterface)GetProcAddress(real, "VR_GetGenericInterface") : nullptr;
+    vr::EVRInitError error = vr::VRInitError_None;
+    vr::IVRSystem* system = getInterface ? (vr::IVRSystem*)getInterface(vr::IVRSystem_Version, &error) : nullptr;
+    if (!system || error != vr::VRInitError_None) return false;
+    *left = system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
+    *right = system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+    return true;
+}
+
+static bool (*g_queryControllerRoles)(vr::TrackedDeviceIndex_t*, vr::TrackedDeviceIndex_t*) = QueryControllerRoles;
+static SRWLOCK g_controllerRoleLock = SRWLOCK_INIT;
+static ULONGLONG g_controllerRoleProbeAfter = 0;
+static bool g_controllerRolesAvailable = false;
+
+static bool RefreshControllerRoles() {
+    AcquireSRWLockExclusive(&g_controllerRoleLock);
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_controllerRoleProbeAfter) {
+        const bool available = g_controllerRolesAvailable;
+        ReleaseSRWLockExclusive(&g_controllerRoleLock);
+        return available;
+    }
+    g_controllerRoleProbeAfter = now + 500;
+    vr::TrackedDeviceIndex_t left = vr::k_unTrackedDeviceIndexInvalid, right = vr::k_unTrackedDeviceIndexInvalid;
+    const bool available = g_queryControllerRoles(&left, &right);
+    const bool first = available && !g_controllerRolesAvailable;
+    g_controllerRolesAvailable = available;
+    if (available) {
+        int l = left > 0 && left < vr::k_unMaxTrackedDeviceCount ? (int)left : -1;
+        int r = right > 0 && right < vr::k_unMaxTrackedDeviceCount ? (int)right : -1;
+        if (l == r) l = r = -1;
+        AcquireSRWLockExclusive(&g_lastPosesLock);
+        const int oldLeft = g_leftHandDeviceIndex, oldRight = g_rightHandDeviceIndex;
+        for (int old : { oldLeft, oldRight }) {
+            if (old > 0 && (uint32_t)old < g_lastRenderPoseCount && old != l && old != r) g_lastRenderPoses[old] = {};
+        }
+        g_leftHandDeviceIndex = l;
+        g_rightHandDeviceIndex = r;
+        ReleaseSRWLockExclusive(&g_lastPosesLock);
+        if (first || l != oldLeft || r != oldRight) {
+            char message[128];
+            snprintf(message, sizeof(message), "Controller roles from SteamVR: left=%d right=%d (was %d/%d)", l, r, oldLeft, oldRight);
+            Log(message);
+            OutputDebugStringA(message);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_controllerRoleLock);
+    return available;
+}
+
+// Roles are independent of tracking validity. Keep refreshing them even after real WaitGetPoses calls stop:
+// a headset/controller connected after that switch otherwise keeps an unknown hand index forever.
 static void RememberRenderPoses(const vr::TrackedDevicePose_t* renderPoses, uint32_t renderPoseCount) {
     if (!renderPoses || renderPoseCount == 0) return;
     const uint32_t count = renderPoseCount < vr::k_unMaxTrackedDeviceCount ? renderPoseCount : vr::k_unMaxTrackedDeviceCount;
     SharedHands hands = {};
     const bool haveHands = ReadSharedHandsSnapshot(&hands);
+    const bool haveRoles = RefreshControllerRoles();
     AcquireSRWLockExclusive(&g_lastPosesLock);
     memcpy(g_lastRenderPoses, renderPoses, count * sizeof(vr::TrackedDevicePose_t));
     g_lastRenderPoseCount = count;
-    if (haveHands) {
+    if (haveHands && !haveRoles) {
         for (uint32_t i = 1; i < count; ++i) {
             const vr::TrackedDevicePose_t& pose = renderPoses[i];
             if (!pose.bDeviceIsConnected || !pose.bPoseIsValid) continue;
             const float* candidates[2] = { hands.leftTransform, hands.rightTransform };
             const uint8_t tracked[2] = { hands.leftTracked, hands.rightTracked };
             for (int hand = 0; hand < 2; ++hand) {
+                int& index = hand == 0 ? g_leftHandDeviceIndex : g_rightHandDeviceIndex;
+                const int other = hand == 0 ? g_rightHandDeviceIndex : g_leftHandDeviceIndex;
+                if (index >= 0 || other == (int)i) continue;
                 if (!tracked[hand] || !TransformIsFinite(candidates[hand])) continue;
                 double error = 0.0;
                 for (int row = 0; row < 3; ++row) {
                     const double delta = pose.mDeviceToAbsoluteTracking.m[row][3] - candidates[hand][12 + row];
                     error += delta * delta;
                 }
-                if (sqrt(error) < 0.01) (hand == 0 ? g_leftHandDeviceIndex : g_rightHandDeviceIndex) = (int)i;
+                if (sqrt(error) < 0.01) index = (int)i;
             }
         }
     }
@@ -1046,6 +1126,7 @@ static void RememberRenderPoses(const vr::TrackedDevicePose_t* renderPoses, uint
 // the HMD and hands replaced by the headset's current shared-memory poses.
 static void SynthesizePoses(vr::TrackedDevicePose_t* poses, uint32_t poseCount) {
     if (!poses || poseCount == 0) return;
+    RefreshControllerRoles();
     const uint32_t count = poseCount < vr::k_unMaxTrackedDeviceCount ? poseCount : vr::k_unMaxTrackedDeviceCount;
     AcquireSRWLockShared(&g_lastPosesLock);
     const uint32_t cached = g_lastRenderPoseCount < count ? g_lastRenderPoseCount : count;
@@ -1106,8 +1187,12 @@ static uint32_t PendingStagedPairs() {
 static bool DecoupledWait(vr::TrackedDevicePose_t* renderPoses, uint32_t renderPoseCount,
     vr::TrackedDevicePose_t* gamePoses, uint32_t gamePoseCount) {
     if (!DecoupledPoses() || InterlockedCompareExchange(&g_realPoseSets, 0, 0) < 90 || !InitSharedMemory()) return false;
+    RefreshControllerRoles();
+    SharedHands hands = {};
+    if (!ReadSharedHandsSnapshot(&hands)) return false;
     AcquireSRWLockShared(&g_lastPosesLock);
-    const bool known = g_lastRenderPoseCount > 0;
+    const bool known = g_lastRenderPoseCount > 0 &&
+        (!hands.leftTracked || g_leftHandDeviceIndex >= 0) && (!hands.rightTracked || g_rightHandDeviceIndex >= 0);
     ReleaseSRWLockShared(&g_lastPosesLock);
     if (!known) return false;
     if (InterlockedExchange(&g_decoupled, 1) == 0) Log("WaitGetPoses: decoupled from SteamVR's compositor (VERANTYX_DECOUPLED_POSES=1)");
@@ -1165,6 +1250,10 @@ static void ApplySeatedOffset(vr::TrackedDevicePose_t* poses, uint32_t count) {
         for (int axis = 0; axis < 3; ++axis) poses[i].mDeviceToAbsoluteTracking.m[axis][3] -= g_seatedOffset[axis];
 }
 static void MaybeRecenterSeated(void* compositor, const vr::TrackedDevicePose_t* poses, uint32_t count) {
+    // A standing game must never change SteamVR's seated origin while the headset is put aside.
+    void** vtable = compositor ? *(void***)compositor : nullptr;
+    const vr::ETrackingUniverseOrigin space = vtable ? ((GetTrackingSpaceFn)vtable[1])(compositor) : vr::TrackingUniverseStanding;
+    if (space != vr::TrackingUniverseSeated) return;
     if (!poses || !count || !poses[0].bPoseIsValid || !poses[0].bDeviceIsConnected) { g_firstTrackedTicks = 0; return; }
     const uint64_t now = PerformanceTicks();
     if (memcmp(&g_lastHead, &poses[0].mDeviceToAbsoluteTracking, sizeof g_lastHead)) {
@@ -1193,14 +1282,6 @@ static void MaybeRecenterSeated(void* compositor, const vr::TrackedDevicePose_t*
     LogSeatedOrigin(system, "before");
     system->ResetSeatedZeroPose();
     LogSeatedOrigin(system, "after");
-    // IVRCompositor's second method, GetTrackingSpace, in every version
-    void** vtable = compositor ? *(void***)compositor : nullptr;
-    const vr::ETrackingUniverseOrigin space = vtable ? ((GetTrackingSpaceFn)vtable[1])(compositor) : vr::TrackingUniverseStanding;
-    if (space != vr::TrackingUniverseSeated) {
-        snprintf(message, sizeof(message), "The game uses tracking universe %d, not the seated one; its poses are left as they are", (int)space);
-        Log(message);
-        return;
-    }
     for (int axis = 0; axis < 3; ++axis) g_seatedOffset[axis] = head.m[axis][3];
     InterlockedExchange(&g_seatedOffsetSet, 1);
     snprintf(message, sizeof(message), "Seated game: its poses now start from the head (%.3f %.3f %.3f taken off)",

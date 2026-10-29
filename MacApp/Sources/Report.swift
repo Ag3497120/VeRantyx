@@ -36,7 +36,7 @@ enum Report {
     static func saveLogs() async -> URL? {
         let fm = FileManager.default
         var sources = ((try? fm.contentsOfDirectory(at: Paths.logs, includingPropertiesForKeys: nil)) ?? [])
-            .filter { $0.pathExtension == "log" }
+            .filter { $0.pathExtension == "log" || ["shader-progress.json", "shader-progress.prev.json"].contains($0.lastPathComponent) }
         let native = Paths.logs.appendingPathComponent("native")
         let sessions = ((try? fm.contentsOfDirectory(at: native, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }

@@ -116,6 +116,7 @@ func log(_ text: String) {
 /// What the game asks its loading page to show, from the game's messages to the page.
 struct GamePrompt {
     private(set) var text: String?
+    private(set) var phase = "gone"
     /// The words for a message the page shows: Alyx's start prompt in plain words (the pull has to last a moment:
     /// right after a level loads the game sees its input only a few times a second), in Japanese as well on a Mac
     /// set to Japanese; any other message as it is.
@@ -125,17 +126,25 @@ struct GamePrompt {
     }
     /// Takes one message; true when the text changed.
     mutating func take(_ message: [String: Any], japanese: Bool) -> Bool {
-        let before = text
+        let before = (text, phase)
         switch message["type"] as? String {
         case "show_message":
             let t = (message["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             text = t.isEmpty ? nil : GamePrompt.words(t, japanese: japanese)
-        case "begin_loading", "end_loading": text = nil
+            // This is the game's explicit wait for input, not a pause inferred from missing frames.
+            if t.lowercased() == "press trigger to start" { phase = "waiting" }
+            else if phase == "waiting" { phase = "loading" }
+        case "begin_loading": text = nil; phase = "loading"
+        case "end_loading": text = nil; phase = "running"
         default: break
         }
-        return text != before
+        return text != before.0 || phase != before.1
     }
-    mutating func clear() -> Bool { defer { text = nil }; return text != nil }
+    mutating func clear() -> Bool {
+        let changed = text != nil || phase != "gone"
+        text = nil; phase = "gone"
+        return changed
+    }
 }
 
 let japaneseMac = Locale.preferredLanguages.first?.hasPrefix("ja") ?? false
@@ -152,17 +161,31 @@ func writePrompt(_ text: String?, to path: String?) {
 
 var gamePrompt = GamePrompt()
 let promptFile = ProcessInfo.processInfo.environment["VERANTYX_GAME_PROMPT_FILE"]
+let stateFile = ProcessInfo.processInfo.environment["VERANTYX_GAME_STATE_FILE"]
+
+func writeGameState(to path: String?) {
+    guard let path, !path.isEmpty else { return }
+    let state: [String: Any] = ["version": 1, "phase": gamePrompt.phase, "message": gamePrompt.text as Any? ?? NSNull()]
+    if let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]) {
+        try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+}
+
+func publishGamePrompt() {
+    writePrompt(gamePrompt.text, to: promptFile)
+    writeGameState(to: stateFile)
+}
 
 func noteForThePage(_ text: String) {
     guard let message = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] else { return }
     if gamePrompt.take(message, japanese: japaneseMac) {
-        writePrompt(gamePrompt.text, to: promptFile)
+        publishGamePrompt()
         log(gamePrompt.text.map { "prompt shown: \($0.replacingOccurrences(of: "\n", with: " / "))" } ?? "prompt taken away")
     }
 }
 
 func webuiReplay(_ a: [String]) -> Never {
-    guard a.count == 1 else { fail("usage: vxrt-helper webui-replay <prompt file>") }
+    guard a.count == 1 || a.count == 2 else { fail("usage: vxrt-helper webui-replay <prompt file> [state file]") }
     while let line = readLine() {
         if line == "gone" {
             if gamePrompt.clear() { writePrompt(nil, to: a[0]) }
@@ -170,6 +193,7 @@ func webuiReplay(_ a: [String]) -> Never {
                   gamePrompt.take(message, japanese: false) {
             writePrompt(gamePrompt.text, to: a[0])
         }
+        if a.count == 2 { writeGameState(to: a[1]) }
         print(FileManager.default.contents(atPath: a[0]).map { String(decoding: $0, as: UTF8.self) } ?? "(none)")
     }
     exit(0)
@@ -278,6 +302,7 @@ func waitFor(_ s: WebSocket, _ request: String, _ mailbox: String, page: String,
 }
 
 func webuiStandin(_ a: [String]) -> Never {
+    publishGamePrompt()
     let page = a.count > 0 ? a[0] : "hlvr/interstitials"
     let game = a.count > 1 ? a[1] : "hlvr/mailbox"
     while true {
@@ -293,11 +318,11 @@ func webuiStandin(_ a: [String]) -> Never {
                 // Once per game: the next "ready" waits until this game's mailbox is gone (the game quit).
                 try waitFor(s, "request_mailbox_unavailable_notification", game, page: page, id: id + 1)
                 log("\(game) is gone")
-                if gamePrompt.clear() { writePrompt(nil, to: promptFile); log("prompt taken away (the game quit)") }
+                if gamePrompt.clear() { publishGamePrompt(); log("prompt taken away (the game quit)") }
                 id += 2
             }
         } catch {
-            if gamePrompt.clear() { writePrompt(nil, to: promptFile); log("prompt taken away (vrserver's web server went away)") }
+            if gamePrompt.clear() { publishGamePrompt(); log("prompt taken away (vrserver's web server went away)") }
             sleep(2)
         }
     }

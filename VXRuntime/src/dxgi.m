@@ -7,6 +7,7 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include "d3d_common.h"
+#include "shader_progress.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -342,13 +343,13 @@ static const char *g_present_msl =
 
 static void *present_pipeline(id<MTLDevice> dev, MTLPixelFormat format) {
     NSError *err = nil;
-    id<MTLLibrary> lib = [dev newLibraryWithSource:@(g_present_msl) options:nil error:&err];
+    id<MTLLibrary> lib = vx_metal_library_entries(dev, @(g_present_msl), @[@"present_vs", @"present_fs"], &err);
     if (!lib) { vx_log("Direct3D: the present shader did not compile: %s", err.localizedDescription.UTF8String); return NULL; }
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction = [lib newFunctionWithName:@"present_vs"];
-    pd.fragmentFunction = [lib newFunctionWithName:@"present_fs"];
+    pd.vertexFunction = vx_metal_function(lib, @"present_vs");
+    pd.fragmentFunction = vx_metal_function(lib, @"present_fs");
     pd.colorAttachments[0].pixelFormat = format;
-    id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    id<MTLRenderPipelineState> ps = vx_metal_render_pipeline(dev, pd, &err);
     if (!ps) { vx_log("Direct3D: the present pipeline failed: %s", err.localizedDescription.UTF8String); return NULL; }
     return (void *)CFBridgingRetain(ps);
 }

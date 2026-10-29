@@ -755,6 +755,39 @@ func saveHeadsetFrustum(_ tangents: UnsafeRawPointer) {
 
 // MARK: - A game's prompt over the picture
 
+struct GameLoadingState: Decodable {
+    let version: Int
+    let phase: String
+    let message: String?
+}
+
+struct ShaderCompilationStatus: Decodable {
+    struct Counts: Decodable {
+        let requested: UInt64
+        let completed: UInt64
+        let failed: UInt64
+        let pending: UInt64
+        var valid: Bool { completed <= requested && failed <= completed && pending == requested - completed }
+    }
+    let version: Int
+    let pid: Int32
+    let updated_at: Double
+    let last_activity_at: Double
+    let libraries: Counts
+    let pipelines: Counts
+
+    var pending: UInt64 { libraries.pending + pipelines.pending }
+    func valid(now: TimeInterval) -> Bool {
+        version == 1 && pid > 0 && updated_at.isFinite && last_activity_at.isFinite &&
+        (0...3).contains(now - updated_at) && last_activity_at <= updated_at &&
+        libraries.valid && pipelines.valid &&
+        libraries.requested <= UInt64.max / 2 && pipelines.requested <= UInt64.max / 2 &&
+        (kill(pid, 0) == 0 || errno == EPERM)
+    }
+    // An empty queue between two batches is not a reliable time to ask the player for input.
+    func busy(now: TimeInterval) -> Bool { pending > 0 || now - last_activity_at < 1 }
+}
+
 struct LoadingFrameClock {
     private var lastOutput: TimeInterval = -.infinity
     private var lastHadOverlay = false
@@ -769,80 +802,190 @@ struct LoadingFrameClock {
     }
 }
 
+struct GameFrameActivity {
+    let startedAt: TimeInterval
+    private var lastGameFrame: TimeInterval?
+    init(startedAt: TimeInterval) { self.startedAt = startedAt }
+    func stalled(now: TimeInterval) -> Bool { now - (lastGameFrame ?? startedAt) >= 1.5 }
+    mutating func noteFrame(sourceMode: UInt32, now: TimeInterval) -> Bool {
+        // Mode 2 is the game's Submit, not SteamVR's compositor or our loading heartbeat.
+        guard sourceMode == 2 else { return false }
+        let resumed = stalled(now: now)
+        lastGameFrame = now
+        return resumed
+    }
+}
+
+struct GamePromptContent: Equatable {
+    let text: String
+    var animated = false
+}
+
 // Half-Life: Alyx writes some things on its loading page, a SteamVR web UI that does not run on VXRuntime (the
 // web UI stand-in answers for it: scripts/vxrt_helper.swift). After a level has loaded the game waits, paused, for a
 // trigger pull and says so there ("Press Trigger To Start"); the player saw a black picture instead. The stand-in
-// writes what the page would show into the prompt file (VERANTYX_GAME_PROMPT_FILE) and takes it away when the game
-// goes on; while there is one, it is drawn here into both eyes' picture, before encoding, so the Vision Pro app and
-// ALVR's clients show it alike. Each eye has it where a point 2 m straight ahead of the head falls in that eye's view
-// (its frustum, from the driver; the eyes' distance from the headset, else 63 mm), so the two eyes agree on its depth.
+// publishes its loading/waiting/running state. Background compiles must not cover a game that is still submitting
+// frames. Outside an explicit load/input wait, preparation is shown only after game submissions stall. The small
+// notice sits just below the view's centre, at the same 2 m depth in both eyes.
 final class GamePromptOverlay {
     static let distance: Float = 2.0
     let path: String?
-    private(set) var text: String?
+    let statePath: String?
+    let shaderPath: String?
+    let language: String
+    private var content: GamePromptContent?
+    var text: String? { content?.text }
+    private var activity: GameFrameActivity
     private var lastCheck: TimeInterval = -.infinity
+    private var animationPhase: Int?
     private var image: CGImage?
     private var imageFor = (0, 0)
 
-    init(path: String?) { self.path = path.flatMap { $0.isEmpty ? nil : $0 } }
+    init(path: String?, statePath: String? = nil, shaderPath: String? = nil,
+         language: String = Locale.preferredLanguages.first ?? "en",
+         startedAt: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        self.path = path.flatMap { $0.isEmpty ? nil : $0 }
+        self.statePath = statePath.flatMap { $0.isEmpty ? nil : $0 }
+        self.shaderPath = shaderPath.flatMap { $0.isEmpty ? nil : $0 }
+        self.language = language
+        self.activity = GameFrameActivity(startedAt: startedAt)
+    }
+
+    func noteFrame(sourceMode: UInt32, now: TimeInterval) -> Bool { activity.noteFrame(sourceMode: sourceMode, now: now) }
+
+    func words(_ english: String, _ russian: String, _ japanese: String) -> String {
+        language.hasPrefix("ru") ? russian : language.hasPrefix("ja") ? japanese : english
+    }
+
+    func currentContent(now: TimeInterval, wallTime: TimeInterval) -> GamePromptContent? {
+        let decoder = JSONDecoder()
+        let state = statePath.flatMap { FileManager.default.contents(atPath: $0) }
+            .flatMap { try? decoder.decode(GameLoadingState.self, from: $0) }
+            .flatMap { $0.version == 1 ? $0 : nil }
+        let progress = shaderPath.flatMap { FileManager.default.contents(atPath: $0) }
+            .flatMap { try? decoder.decode(ShaderCompilationStatus.self, from: $0) }
+            .flatMap { $0.valid(now: wallTime) ? $0 : nil }
+        let loading = state?.phase == "loading" || state?.phase == "waiting"
+        if let progress, (loading && progress.busy(now: wallTime)) ||
+            (progress.pending > 0 && activity.stalled(now: now)) {
+            let title = words("Preparing graphics", "Подготовка графики", "グラフィックスを準備中")
+            return GamePromptContent(text: title + "\n\(progress.libraries.completed)/\(progress.libraries.requested)", animated: true)
+        }
+        if statePath != nil {
+            guard let state else { return nil }
+            let loading = GamePromptContent(text: words("Loading game\nPlease wait", "Загрузка игры\nПожалуйста, подождите", "ゲームを読み込み中\nしばらくお待ちください"), animated: true)
+            switch state.phase {
+            case "waiting":
+                // Unknown/stale compilation state must not enable an input prompt.
+                guard shaderPath == nil || progress != nil else { return loading }
+                return GamePromptContent(text: words("Hold the trigger to start", "Нажмите и удерживайте триггер", "トリガーを長押しして開始"))
+            case "loading": return state.message.map { GamePromptContent(text: $0, animated: true) } ?? loading
+            default: return nil
+            }
+        }
+        let legacy = path.flatMap { FileManager.default.contents(atPath: $0) }
+            .map { String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        return shaderPath == nil || progress != nil ? legacy.map { GamePromptContent(text: $0) } : nil
+    }
 
     /// Reads the prompt file, four times a second at most; true when the text changed.
     @discardableResult
-    func poll(now: TimeInterval) -> Bool {
-        guard let path, now - lastCheck >= 0.25 else { return false }
+    func poll(now: TimeInterval, wallTime: TimeInterval = Date().timeIntervalSince1970, force: Bool = false) -> Bool {
+        guard force || now - lastCheck >= 0.25 else { return false }
         lastCheck = now
-        let current = FileManager.default.contents(atPath: path).map { String(decoding: $0, as: UTF8.self) }
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
-        guard current != text else { return false }
-        text = current
+        let current = currentContent(now: now, wallTime: wallTime)
+        let phase = current?.animated == true ? Int(now * 4) % 8 : nil
+        let changed = current != content
+        guard changed || phase != animationPhase else { return false }
+        content = current
+        animationPhase = phase
         image = nil
-        print(current.map { "Game prompt drawn into the picture: \($0.replacingOccurrences(of: "\n", with: " / "))" }
-              ?? "Game prompt taken away")
+        if changed {
+            print(current.map { "Game prompt drawn into the picture: \($0.text.replacingOccurrences(of: "\n", with: " / "))" }
+                  ?? "Game prompt taken away")
+        }
         return true
     }
 
     /// The prompt's centre in each eye (pixels from the frame's top left; left eye in the left half).
-    static func centers(width: Int, height: Int, tangents: [Float]?, ipd: Float) -> [(x: Double, y: Double)] {
+    static func centers(width: Int, height: Int, tangents: [Float]?, ipd: Float, badgeSize: CGSize = .zero,
+                        offsetX: Double = 0, offsetY: Double = -tan(8 * .pi / 180)) -> [(x: Double, y: Double)] {
         let eyeWidth = Double(width) / 2
+        let valid = tangents?.count == 8 && (0..<2).allSatisfy { eye in
+            guard let t = tangents else { return false }
+            return t[(eye * 4)..<(eye * 4 + 4)].allSatisfy { $0.isFinite } && t[eye * 4] < t[eye * 4 + 1] && t[eye * 4 + 2] < t[eye * 4 + 3]
+        }
+        let t = valid ? tangents! : [-1, 1, -1, 1, -1, 1, -1, 1]
+        // Clamp a single point in the overlap of both frusta, so a safe inset does not change stereo depth.
+        let insetX = Double(badgeSize.width) / (2 * eyeWidth) + 0.1
+        let insetY = Double(badgeSize.height) / (2 * Double(height)) + 0.1
+        var minX = -Double.infinity, maxX = Double.infinity, minY = -Double.infinity, maxY = Double.infinity
+        for eye in 0..<2 {
+            let (l, r, b, top) = (Double(t[eye * 4]), Double(t[eye * 4 + 1]), Double(t[eye * 4 + 2]), Double(t[eye * 4 + 3]))
+            let eyeOffset = Double((eye == 0 ? 1 : -1) * (ipd / 2) / distance)
+            minX = max(minX, l + (r - l) * insetX - eyeOffset)
+            maxX = min(maxX, r - (r - l) * insetX - eyeOffset)
+            minY = max(minY, b + (top - b) * insetY)
+            maxY = min(maxY, top - (top - b) * insetY)
+        }
+        let x = minX <= maxX ? min(maxX, max(minX, offsetX)) : (minX + maxX) / 2
+        let y = minY <= maxY ? min(maxY, max(minY, offsetY)) : (minY + maxY) / 2
         return (0..<2).map { eye in
-            guard let t = tangents, t.count == 8 else { return (eyeWidth * (Double(eye) + 0.5), Double(height) / 2) }
-            let (l, r, bottom, top) = (t[eye * 4], t[eye * 4 + 1], t[eye * 4 + 2], t[eye * 4 + 3])
-            // (the left eye sees a point ahead of the head's centre a little to its right; the right eye to its left)
-            let x = (eye == 0 ? 1 : -1) * (ipd / 2) / distance
-            let u = Double((x - l) / (r - l)), v = Double(top / (top - bottom))
+            let (l, r, bottom, top) = (Double(t[eye * 4]), Double(t[eye * 4 + 1]), Double(t[eye * 4 + 2]), Double(t[eye * 4 + 3]))
+            let eyeOffset = Double((eye == 0 ? 1 : -1) * (ipd / 2) / distance)
+            let u = (x + eyeOffset - l) / (r - l), v = (top - y) / (top - bottom)
             return (eyeWidth * (Double(eye) + u), Double(height) * v)
         }
     }
 
     /// White text on a dark plate, sized for an eye of eyeWidth x eyeHeight pixels.
-    static func render(_ text: String, eyeWidth: Int, eyeHeight: Int) -> CGImage? {
-        let lines = text.split(separator: "\n").map(String.init)
-        guard !lines.isEmpty else { return nil }
+    static func render(_ text: String, eyeWidth: Int, eyeHeight: Int, activityPhase: Int? = nil) -> CGImage? {
+        guard !text.isEmpty else { return nil }
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
-        func layout(_ size: CGFloat) -> [CTLine] {
-            let font = CTFontCreateWithName("Helvetica Neue Medium" as CFString, size, nil)
-            return lines.map { line in
-                let attributes: [NSAttributedString.Key: Any] = [
-                    NSAttributedString.Key(kCTFontAttributeName as String): font,
-                    NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(colorSpace: space, components: [1, 1, 1, 1])!]
-                return CTLineCreateWithAttributedString(NSAttributedString(string: line, attributes: attributes))
+        let size = CGFloat(eyeHeight) / 60
+        let lineHeight = size * 1.25, pad = size * 0.5, leading = activityPhase == nil ? 0 : size * 1.75
+        let font = CTFontCreateWithName("Helvetica Neue Medium" as CFString, size, nil)
+        let attributes: [NSAttributedString.Key: Any] = [
+            NSAttributedString.Key(kCTFontAttributeName as String): font,
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(colorSpace: space, components: [1, 1, 1, 1])!]
+        let limit = max(size, CGFloat(eyeWidth) * 0.24 - 2 * pad)
+        // Wrap long prompts so input hints keep the loading notice's font size in every language.
+        let ctLines: [CTLine] = text.split(separator: "\n").flatMap { paragraph in
+            let attributed = NSAttributedString(string: String(paragraph), attributes: attributes)
+            let typesetter = CTTypesetterCreateWithAttributedString(attributed)
+            var lines: [CTLine] = [], start = 0
+            while start < attributed.length {
+                let count = max(1, CTTypesetterSuggestLineBreak(typesetter, start, Double(limit)))
+                lines.append(CTTypesetterCreateLine(typesetter, CFRange(location: start, length: count)))
+                start += count
             }
+            return lines
         }
-        var size = CGFloat(eyeHeight) * 0.05
-        var ctLines = layout(size)
-        func widest(_ ls: [CTLine]) -> CGFloat { ls.map { CGFloat(CTLineGetTypographicBounds($0, nil, nil, nil)) }.max() ?? 0 }
-        let limit = CGFloat(eyeWidth) * 0.6
-        if widest(ctLines) > limit { size *= limit / widest(ctLines); ctLines = layout(size) }
-        let lineHeight = size * 1.35, pad = size * 0.8
-        let w = Int(ceil(widest(ctLines) + 2 * pad)), h = Int(ceil(lineHeight * CGFloat(lines.count) + 2 * pad - (lineHeight - size)))
+        guard !ctLines.isEmpty else { return nil }
+        let textWidth = ctLines.map { CGFloat(CTLineGetTypographicBounds($0, nil, nil, nil) - CTLineGetTrailingWhitespaceWidth($0)) }.max() ?? 0
+        let w = Int(ceil(textWidth + 2 * pad + leading)), h = Int(ceil(lineHeight * CGFloat(ctLines.count) + 2 * pad - (lineHeight - size)))
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
                                   bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
         ctx.setFillColor(CGColor(colorSpace: space, components: [0.05, 0.05, 0.08, 0.8])!)
         ctx.addPath(CGPath(roundedRect: CGRect(x: 0, y: 0, width: w, height: h), cornerWidth: size * 0.6, cornerHeight: size * 0.6, transform: nil))
         ctx.fillPath()
+        if let phase = activityPhase {
+            let cx = pad + leading / 2, cy = CGFloat(h) / 2, radius = size * 0.65
+            ctx.setLineWidth(max(1, size * 0.14))
+            ctx.setLineCap(.round)
+            for segment in 0..<8 {
+                let angle = CGFloat(segment) * .pi / 4
+                let alpha = 1 - CGFloat((segment - phase + 8) % 8) * 0.1
+                ctx.setStrokeColor(CGColor(colorSpace: space, components: [1, 1, 1, alpha])!)
+                ctx.move(to: CGPoint(x: cx + cos(angle) * radius * 0.55, y: cy + sin(angle) * radius * 0.55))
+                ctx.addLine(to: CGPoint(x: cx + cos(angle) * radius, y: cy + sin(angle) * radius))
+                ctx.strokePath()
+            }
+        }
         for (i, line) in ctLines.enumerated() {
-            let lineWidth = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
-            ctx.textPosition = CGPoint(x: (CGFloat(w) - lineWidth) / 2, y: CGFloat(h) - pad - size * 0.8 - lineHeight * CGFloat(i))
+            let lineWidth = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil) - CTLineGetTrailingWhitespaceWidth(line))
+            ctx.textPosition = CGPoint(x: pad + leading + (textWidth - lineWidth) / 2, y: CGFloat(h) - pad - size * 0.8 - lineHeight * CGFloat(i))
             CTLineDraw(line, ctx)
         }
         return ctx.makeImage()
@@ -854,7 +997,7 @@ final class GamePromptOverlay {
         guard let text else { return false }
         let width = CVPixelBufferGetWidth(pb), height = CVPixelBufferGetHeight(pb)
         if image == nil || imageFor != (width, height) {
-            image = GamePromptOverlay.render(text, eyeWidth: width / 2, eyeHeight: height)
+            image = GamePromptOverlay.render(text, eyeWidth: width / 2, eyeHeight: height, activityPhase: animationPhase)
             imageFor = (width, height)
         }
         guard let image, CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return false }
@@ -864,7 +1007,8 @@ final class GamePromptOverlay {
                                   bytesPerRow: CVPixelBufferGetBytesPerRow(pb), space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                   bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return false }
         let eyeWidth = Double(width) / 2
-        for (eye, c) in GamePromptOverlay.centers(width: width, height: height, tangents: tangents, ipd: ipd).enumerated() {
+        for (eye, c) in GamePromptOverlay.centers(width: width, height: height, tangents: tangents, ipd: ipd,
+                                                badgeSize: CGSize(width: image.width, height: image.height)).enumerated() {
             ctx.saveGState()
             ctx.clip(to: CGRect(x: eyeWidth * Double(eye), y: 0, width: eyeWidth, height: Double(height)))   // (each in its own eye)
             // (the context's y goes up from the bottom row)
@@ -1429,11 +1573,13 @@ if let output = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_MAP_SELFTES
     exit(0)
 }
 
-let gamePrompt = GamePromptOverlay(path: ProcessInfo.processInfo.environment["VERANTYX_GAME_PROMPT_FILE"])
+let gamePrompt = GamePromptOverlay(path: ProcessInfo.processInfo.environment["VERANTYX_GAME_PROMPT_FILE"],
+                                  statePath: ProcessInfo.processInfo.environment["VERANTYX_GAME_STATE_FILE"],
+                                  shaderPath: ProcessInfo.processInfo.environment["VERANTYX_SHADER_PROGRESS_FILE"])
 
 // VERANTYX_PROMPT_SELFTEST=<png> [VERANTYX_PROMPT_SELFTEST_TEXT, _SIZE=WxH, _TANGENTS="8 numbers"]: draws the prompt
 // into a grey frame with a cross at each eye's straight-ahead point, writes the PNG and exits (nothing else starts).
-if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] {
+if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] ?? ProcessInfo.processInfo.environment["VERANTYX_LOADING_SELFTEST"] {
     let env = ProcessInfo.processInfo.environment
     let size = (env["VERANTYX_PROMPT_SELFTEST_SIZE"] ?? "2880x1620").split(separator: "x").compactMap { Int($0) }
     let tangents = env["VERANTYX_PROMPT_SELFTEST_TANGENTS"].map { $0.split(separator: " ").compactMap { Float($0) } }
@@ -1444,7 +1590,7 @@ if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] {
     CVPixelBufferLockBaseAddress(pb, [])
     let base = CVPixelBufferGetBaseAddress(pb)!, rowBytes = CVPixelBufferGetBytesPerRow(pb)
     for y in 0..<h { for x in 0..<w { base.storeBytes(of: UInt32(0xFF30_3030), toByteOffset: y * rowBytes + x * 4, as: UInt32.self) } }
-    for (cx, cy) in GamePromptOverlay.centers(width: w, height: h, tangents: tangents, ipd: 0) {   // (crosses: at infinity)
+    for (cx, cy) in GamePromptOverlay.centers(width: w, height: h, tangents: tangents, ipd: 0, offsetX: 0, offsetY: 0) {   // (crosses: at infinity)
         for d in -40...40 {
             for (x, y) in [(Int(cx) + d, Int(cy)), (Int(cx), Int(cy) + d)] where x >= 0 && x < w && y >= 0 && y < h {
                 base.storeBytes(of: UInt32(0xFFFF2020), toByteOffset: y * rowBytes + x * 4, as: UInt32.self)
@@ -1452,12 +1598,74 @@ if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] {
         }
     }
     CVPixelBufferUnlockBaseAddress(pb, [])
-    let text = env["VERANTYX_PROMPT_SELFTEST_TEXT"] ?? "Hold the trigger to start"
-    let file = NSTemporaryDirectory() + "verantyx-prompt-selftest-\(getpid()).txt"
-    try? Data(text.utf8).write(to: URL(fileURLWithPath: file))
-    let fromFile = GamePromptOverlay(path: file)
-    fromFile.poll(now: 0)
-    try? FileManager.default.removeItem(atPath: file)
+    let fromFile: GamePromptOverlay
+    if env["VERANTYX_LOADING_SELFTEST"] != nil {
+        fromFile = GamePromptOverlay(path: env["VERANTYX_GAME_PROMPT_FILE"], statePath: env["VERANTYX_GAME_STATE_FILE"],
+                                    shaderPath: env["VERANTYX_SHADER_PROGRESS_FILE"], language: env["VERANTYX_LOADING_SELFTEST_LANGUAGE"] ?? "en", startedAt: 0)
+        let now = Double(env["VERANTYX_LOADING_SELFTEST_UPTIME"] ?? "") ?? 2
+        let wall = Double(env["VERANTYX_LOADING_SELFTEST_NOW"] ?? "") ?? Date().timeIntervalSince1970
+        if let age = Double(env["VERANTYX_LOADING_SELFTEST_GAME_FRAME_AGE"] ?? "") {
+            _ = fromFile.noteFrame(sourceMode: 2, now: now - age)
+        }
+        fromFile.poll(now: now, wallTime: wall)
+        if env["VERANTYX_LOADING_SELFTEST_GAMEPLAY"] == "1" {
+            precondition(fromFile.text != nil)
+            _ = fromFile.noteFrame(sourceMode: 0, now: 2.1)
+            fromFile.poll(now: 2.1, wallTime: wall, force: true)
+            precondition(fromFile.text != nil) // Compositor frames do not prove that the game resumed.
+            for step in 0..<20 {
+                let time = 2.2 + Double(step) * 0.1
+                let resumed = fromFile.noteFrame(sourceMode: 2, now: time)
+                fromFile.poll(now: time, wallTime: wall, force: resumed)
+                precondition(fromFile.text == nil)
+            }
+            fromFile.poll(now: 5.4, wallTime: wall)
+            precondition(fromFile.text == nil) // A short hitch stays unobstructed.
+            fromFile.poll(now: 5.7, wallTime: wall)
+            precondition(fromFile.text != nil)
+            let resumed = fromFile.noteFrame(sourceMode: 2, now: 5.71)
+            precondition(resumed)
+            fromFile.poll(now: 5.71, wallTime: wall, force: resumed)
+            precondition(fromFile.text == nil)
+            print("loading selftest: gameplay, short hitch, stall and immediate resume -> ok")
+            exit(0)
+        }
+        if let expected = env["VERANTYX_LOADING_SELFTEST_EXPECT"], (fromFile.text ?? "(none)") != expected {
+            print("loading selftest: expected \(expected), got \(fromFile.text ?? "(none)")"); exit(1)
+        }
+        var clock = LoadingFrameClock()
+        precondition(clock.needsFrame(hasSource: false, hasOverlay: true, now: 0))
+        clock.sent(now: 0, hasOverlay: true, hasSource: false)
+        precondition(!clock.needsFrame(hasSource: false, hasOverlay: true, now: 0.05))
+        precondition(clock.needsFrame(hasSource: false, hasOverlay: true, now: 0.11))
+        precondition(clock.needsFrame(hasSource: false, hasOverlay: false, now: 1))
+        clock.sent(now: 1, hasOverlay: false, hasSource: false)
+        precondition(clock.needsFrame(hasSource: false, hasOverlay: false, now: 1.11))
+        clock.sent(now: 1.2, hasOverlay: false, hasSource: true)
+        precondition(!clock.needsFrame(hasSource: false, hasOverlay: false, now: 1.31))
+        precondition(clock.needsFrame(hasSource: true, hasOverlay: false, now: 0.05))
+        if fromFile.text == nil { print("loading selftest: no prompt -> ok"); exit(0) }
+        if let badge = GamePromptOverlay.render(fromFile.text!, eyeWidth: w / 2, eyeHeight: h, activityPhase: 0) {
+            precondition(Double(badge.width) <= Double(w / 2) * 0.28 + 1)
+            precondition(Double(badge.height) <= Double(h) * 0.09)
+            let size = CGSize(width: badge.width, height: badge.height)
+            let points = GamePromptOverlay.centers(width: w, height: h, tangents: tangents, ipd: 0.063, badgeSize: size)
+            for (eye, p) in points.enumerated() {
+                let rect = CGRect(x: p.x - size.width / 2, y: p.y - size.height / 2, width: size.width, height: size.height)
+                precondition(rect.minX >= Double(eye * (w / 2)) + Double(w / 2) * 0.1 - 1)
+                precondition(rect.maxX <= Double((eye + 1) * (w / 2)) - Double(w / 2) * 0.1 + 1)
+                precondition(rect.minY >= Double(h) * 0.1 - 1 && rect.maxY <= Double(h) * 0.9 + 1)
+            }
+            print("loading selftest: compact badge and binocular safe inset -> ok")
+        }
+    } else {
+        let text = env["VERANTYX_PROMPT_SELFTEST_TEXT"] ?? "Hold the trigger to start"
+        let file = NSTemporaryDirectory() + "verantyx-prompt-selftest-\(getpid()).txt"
+        try? Data(text.utf8).write(to: URL(fileURLWithPath: file))
+        fromFile = GamePromptOverlay(path: file)
+        fromFile.poll(now: 0)
+        try? FileManager.default.removeItem(atPath: file)
+    }
     let drew = fromFile.draw(into: pb, tangents: tangents, ipd: 0.063)
     let image = CIImage(cvPixelBuffer: pb)
     guard drew, let cg = CIContext().createCGImage(image, from: image.extent),
@@ -2468,7 +2676,10 @@ while isEncoding {
         let hasGameSource = readyIndex < 2 && sourceSeq != lastSeq && sourceSeq > 0
         let hasSource = hasGameSource && !nativeLoadingMap.active
         let currentSeq = hasGameSource ? sourceSeq : lastSeq
-        gamePrompt.poll(now: pollTime)
+        let validSize = headerPtr.pointee.width > 0 && headerPtr.pointee.height > 0 &&
+            headerPtr.pointee.width <= 8192 && headerPtr.pointee.height <= 4096
+        let resumed = hasSource && validSize && gamePrompt.noteFrame(sourceMode: sourceMode, now: pollTime)
+        gamePrompt.poll(now: pollTime, force: resumed)
         let hasLoadingOverlay = nativeLoadingMap.active || gamePrompt.text != nil
         let loadingInterval = nativeLoadingMap.active ? 1.0 / 60 : 0.1
         if readyIndex < 2 || loadingFrameClock.needsFrame(hasSource: false, hasOverlay: hasLoadingOverlay, now: pollTime, interval: loadingInterval) {
