@@ -1160,6 +1160,19 @@ build/stereo_test: src/stereo.m src/stereo.h tests/stereo.m
 	@mkdir -p build
 	$(HOSTCC) -fobjc-arc -Isrc -o $@ tests/stereo.m src/stereo.m -framework Foundation -framework Metal -framework CoreGraphics -framework ImageIO
 
+# The warp core (src/warp_core.m: prediction from motion vectors, reprojection, stereo eyes in one warp) on synthetic
+# frames; and, when the visionOS SDK is installed, the core compiled for visionOS (it must stay Metal + Foundation).
+build/warp_core_test: src/warp_core.m src/warp_core.h tests/warp_core_test.m
+	@mkdir -p build
+	$(HOSTCC) -arch arm64 -O1 -fobjc-arc -Isrc -o $@ tests/warp_core_test.m src/warp_core.m -framework Foundation -framework Metal
+check: build/warp_core_test xros-check
+xros-check: src/warp_core.m src/warp_core.h
+	@if xcrun --sdk xros --show-sdk-path >/dev/null 2>&1; then \
+	  mkdir -p build && xcrun -sdk xros clang -target arm64-apple-xros2.0 -fobjc-arc -Wall -Wextra -Werror -c -o build/warp_core_xros.o src/warp_core.m && \
+	  echo "xros-check: src/warp_core.m builds for visionOS ($$(xcrun --sdk xros --show-sdk-version))"; \
+	else echo "xros-check: no visionOS SDK, skipped"; fi
+.PHONY: xros-check
+
 build/aes_gcm_test: src/aes_gcm.c src/aes_gcm.h tests/aes_gcm.c
 	@mkdir -p build
 	$(HOSTCC) -Isrc -o $@ tests/aes_gcm.c src/aes_gcm.c
@@ -1309,6 +1322,7 @@ check: all build/vkmsl build/x86dec_test build/x86dec_check build/ref_x86 build/
 	build/pe_test
 	build/aes_gcm_test
 	build/stereo_test
+	build/warp_core_test
 	build/dotnet_metadata_test
 	build/dotnet_eh_test | tail -1
 	build/dotnet_resources_test
