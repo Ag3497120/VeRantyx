@@ -42,6 +42,16 @@ static void load(image *im, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) die("cannot open %s", path);
     fseek(f, 0, SEEK_END); im->len = (size_t)ftell(f); fseek(f, 0, SEEK_SET);
+    // (the image's range is taken before the file's copy is allocated, which could land there: a large file's did)
+    uint8_t h[4096] = { 0 };
+    size_t hn = fread(h, 1, sizeof h, f); fseek(f, 0, SEEK_SET);
+    uint32_t hpe = hn >= 0x40 ? r32(h + 0x3c) : 0;
+    if (hpe && hpe + 24 + 60 <= hn && !memcmp(h + hpe, "PE\0\0", 4) && r16(h + hpe + 24) == 0x20b) {
+        uint64_t b = r64(h + hpe + 24 + 24); uint32_t sz = r32(h + hpe + 24 + 56);
+        void *m = mmap((void *)(uintptr_t)b, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (m != MAP_FAILED && (uint64_t)(uintptr_t)m != b) munmap(m, sz);
+        else if (m != MAP_FAILED) im->mem = m;
+    }
     im->file = malloc(im->len);
     if (fread(im->file, 1, im->len, f) != im->len) die("cannot read %s", path);
     fclose(f);
@@ -61,7 +71,7 @@ static void load(image *im, const char *path) {
         memcpy(s->name, d + so, 8); s->name[8] = 0;
         s->vsize = r32(d + so + 8); s->va = r32(d + so + 12); s->raw_size = r32(d + so + 16); s->raw_ptr = r32(d + so + 20); s->flags = r32(d + so + 36);
     }
-    im->mem = mmap((void *)(uintptr_t)im->base, im->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (!im->mem) im->mem = mmap((void *)(uintptr_t)im->base, im->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (im->mem == MAP_FAILED || (uint64_t)(uintptr_t)im->mem != im->base) die("cannot map %s at its base %#llx", path, (unsigned long long)im->base);
     memcpy(im->mem, d, hdr < im->len ? hdr : im->len);
     for (int i = 0; i < im->nsec; i++) {
@@ -733,7 +743,7 @@ static void write_part(const image *im, FILE *o, size_t first, size_t end, uint6
         fprintf(o, "Lpart%d:\n", g_cur);
     }
     fprintf(o, "\teor x16, x17, x17, lsr #14\n\teor x16, x16, x17, lsr #29\n\tand x16, x16, #%#llx\n"
-               "\tadrp x30, Ltable@PAGE\n\tadd x30, x30, Ltable@PAGEOFF\n\tadd x30, x30, x16, lsl #4\n"
+               "\tadrp x30, _vxaot_table@PAGE\n\tadd x30, x30, _vxaot_table@PAGEOFF\n\tadd x30, x30, x16, lsl #4\n"
                "1:\n\tldp x22, x16, [x30], #16\n\tcmp x22, x17\n\tb.eq 2f\n\tcbnz x22, 1b\n\tb Lexit\n"
                "2:\n\tadrp x30, Lcode@PAGE\n\tadd x30, x30, Lcode@PAGEOFF\n\tadd x16, x30, x16\n\tbr x16\n",
             (unsigned long long)(tsize - 1));
@@ -752,7 +762,8 @@ static void write_part(const image *im, FILE *o, size_t first, size_t end, uint6
         fprintf(o, "LV%llx:\n\tadrp x16, LX%llx@PAGE\n\tldr x16, [x16, LX%llx@PAGEOFF]\n\tbr x16\n", (unsigned long long)g_x.rip[k],
                 (unsigned long long)g_x.rip[k], (unsigned long long)g_x.rip[k]);
     for (size_t k = 0; k < g_x.n; k++) { fprintf(o, "LW%llx:\n", (unsigned long long)g_x.rip[k]); mov64(o, 17, g_x.rip[k]); fprintf(o, "\tb Lexit_unlinked\n"); }
-    fprintf(o, "Lcode_end:\n\t.p2align 4\nLtable:\n");
+    // (a symbol, not an L label: ADRP to a label is section + addend, and Mach-O addends stop at 8 MB)
+    fprintf(o, "Lcode_end:\n\t.p2align 4\n_vxaot_table:\n");
     size_t tcap = tsize + nb + 1;
     uint64_t *tab = calloc(tcap, sizeof *tab);
     size_t tused = 0;
