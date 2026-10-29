@@ -1100,11 +1100,45 @@ static size_t virtual_query(const void *addr, MEMORY_BASIC_INFORMATION *mbi, siz
 static WINAPI HANDLE GetProcessHeap(void) { return (HANDLE)(intptr_t)0x48454150; }
 static WINAPI HANDLE HeapCreate(DWORD f, size_t a, size_t b) { (void)f; (void)a; (void)b; return GetProcessHeap(); }
 static WINAPI BOOL HeapDestroy(HANDLE h) { (void)h; return 1; }
-static WINAPI void *HeapAlloc(HANDLE h, DWORD flags, size_t n) { (void)h; return flags & HEAP_ZERO_MEMORY ? vx_heap_zalloc(n) : vx_heap_alloc(n); }
+int vx_heap_stats;
+// (malloc's classes on a large-memory Mac: tiny to 1008 bytes, small to 127 KB (MALLOC_SMALL), medium to 8 MB, large)
+static uint64_t heap_bytes[4], heap_blocks[4];
+static int heap_class(size_t n) { return n <= 1008 ? 0 : n <= (127u << 10) ? 1 : n <= (8u << 20) ? 2 : 3; }
+void vx_heap_note(const void *p, int sign) {
+    size_t n = malloc_size(p);
+    if (!n) return;                                  // (not malloc's: the ARM64 build's guest range)
+    int k = heap_class(n);
+    __atomic_add_fetch(&heap_bytes[k], (uint64_t)(int64_t)sign * n, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&heap_blocks[k], (uint64_t)(int64_t)sign, __ATOMIC_RELAXED);
+}
+int vx_heap_report(char *buf, size_t size) {
+    if (!vx_heap_stats) return 0;
+    static const char *const name[4] = { "tiny", "small", "medium", "large" };
+    size_t o = 0;
+    for (int k = 0; k < 4 && o < size; k++)
+        o += (size_t)snprintf(buf + o, size - o, "%s%s %.0f MB (%lld)", k ? ", " : "", name[k],
+                              (double)(int64_t)__atomic_load_n(&heap_bytes[k], __ATOMIC_RELAXED) / 1048576.0,
+                              (long long)__atomic_load_n(&heap_blocks[k], __ATOMIC_RELAXED));
+    return 1;
+}
+__attribute__((constructor)) static void heap_stats_init(void) {
+#ifndef __aarch64__
+    const char *e = getenv("VXRT_HEAP_STATS");
+    vx_heap_stats = e && *e && *e != '0';
+#endif
+}
+static WINAPI void *HeapAlloc(HANDLE h, DWORD flags, size_t n) {
+    (void)h;
+    void *p = flags & HEAP_ZERO_MEMORY ? vx_heap_zalloc(n) : vx_heap_alloc(n);
+    VX_HEAP_NOTE(p, 1);
+    return p;
+}
 static WINAPI void *HeapReAlloc(HANDLE h, DWORD flags, void *p, size_t n) {
     (void)h;
     size_t old = p ? malloc_size(p) : 0;
+    VX_HEAP_NOTE(p, -1);
     void *q = realloc(p, n ? n : 1);
+    VX_HEAP_NOTE(q ? q : p, 1);
     if (q && (flags & HEAP_ZERO_MEMORY) && n > old) memset((char *)q + old, 0, n - old);
     return q;
 }
@@ -1115,7 +1149,7 @@ static int heap_pointer(const void *p, const char *what, void *caller) {
     vx_set_last_error(87);
     return 0;
 }
-static WINAPI BOOL HeapFree(HANDLE h, DWORD f, void *p) { (void)h; (void)f; if (!heap_pointer(p, "HeapFree", VX_RETURN_ADDRESS())) return 0; free(p); return 1; }
+static WINAPI BOOL HeapFree(HANDLE h, DWORD f, void *p) { (void)h; (void)f; if (!heap_pointer(p, "HeapFree", VX_RETURN_ADDRESS())) return 0; VX_HEAP_NOTE(p, -1); free(p); return 1; }
 static WINAPI size_t HeapSize(HANDLE h, DWORD f, const void *p) { (void)h; (void)f; return malloc_size(p); }
 
 // ---- messages and debugging output ----------------------------------------------------------------------------------------
@@ -1129,8 +1163,12 @@ static WINAPI DWORD FormatMessageA(DWORD flags, const void *src, DWORD id, DWORD
     memcpy(buf, text, (size_t)n + 1);
     return (DWORD)n;
 }
-static WINAPI void *LocalAlloc(DWORD flags, size_t n) { return flags & 0x40 /* LMEM_ZEROINIT */ ? vx_heap_zalloc(n) : vx_heap_alloc(n); }
-static WINAPI void *LocalFree(void *p) { if (!heap_pointer(p, "LocalFree", VX_RETURN_ADDRESS())) return p; free(p); return NULL; }
+static WINAPI void *LocalAlloc(DWORD flags, size_t n) {
+    void *p = flags & 0x40 /* LMEM_ZEROINIT */ ? vx_heap_zalloc(n) : vx_heap_alloc(n);
+    VX_HEAP_NOTE(p, 1);
+    return p;
+}
+static WINAPI void *LocalFree(void *p) { if (!heap_pointer(p, "LocalFree", VX_RETURN_ADDRESS())) return p; VX_HEAP_NOTE(p, -1); free(p); return NULL; }
 // VXRT_DEBUG_OUTPUT=1: what programs send to OutputDebugString, without the rest of VXRT_TRACE (with VXRT_DEBUGGER=1,
 // a game's own console log: why it quit, for one).
 int vx_debug_output(void) { static int on = -1; if (on < 0) on = vx_trace || (getenv("VXRT_DEBUG_OUTPUT") && atoi(getenv("VXRT_DEBUG_OUTPUT"))); return on; }

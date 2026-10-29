@@ -125,6 +125,12 @@ int vxvm_owns(const void *p);
 #define vx_heap_zalloc(n) calloc(1, (n) ? (n) : 1)
 #define vx_heap_owns(p) 0
 #endif
+// VXRT_HEAP_STATS=1 (x86-64 build): the program's heap blocks (HeapAlloc, LocalAlloc, the CRT's malloc and new) are
+// counted by malloc's size classes, for the D3D12 memory report (kernel32.c). Off, a note is one test of a global.
+extern int vx_heap_stats;
+void vx_heap_note(const void *p, int sign);
+#define VX_HEAP_NOTE(p, sign) do { if (__builtin_expect(vx_heap_stats, 0) && (p)) vx_heap_note((p), (sign)); } while (0)
+int vx_heap_report(char *buf, size_t size);   // "<class> <MB> (<blocks>)..." of the counted blocks; 0 when off
 #ifdef __aarch64__
 // The program's memory below 4 GB (vCPU only: the host cannot map there): the host has it at vx_low_base + its
 // address, and vx_low_map marks the 64 KB granules handed out (vx_virtual_alloc_below), so that only a pointer into

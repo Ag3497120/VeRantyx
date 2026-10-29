@@ -33,6 +33,7 @@
 #include "gpu_ir_metal.h"
 #include "gpu_ir_msl.h"
 #include <float.h>
+#include <malloc/malloc.h>
 #include <sys/stat.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -4104,8 +4105,13 @@ invalid:
 
 // ---- command lists: recording ------------------------------------------------------------------------------------------
 
+static uint64_t g_cmd_bytes12, g_replay_copy_bytes12, g_replay_copy_peak12;   // (atomic; the memory report)
 static cmd12 *rec(list12 *l, int op) {
-    if (l->n == l->cap) { l->cap = l->cap ? l->cap * 2 : 64; l->cmds = realloc(l->cmds, l->cap * sizeof *l->cmds); }
+    if (l->n == l->cap) {
+        uint32_t cap = l->cap ? l->cap * 2 : 64;
+        __atomic_add_fetch(&g_cmd_bytes12, (uint64_t)(cap - l->cap) * sizeof *l->cmds, __ATOMIC_RELAXED);
+        l->cap = cap; l->cmds = realloc(l->cmds, l->cap * sizeof *l->cmds);
+    }
     cmd12 *c = &l->cmds[l->n++];
     memset(c, 0, sizeof *c);
     c->op = op;
@@ -4158,6 +4164,7 @@ static void list_destroy(d3d_object *o) {
     if (allocator) d3d_release(&allocator->base);
     list_clear(l);
     gpu_ir_stream_destroy(&l->gpu_ir);
+    __atomic_sub_fetch(&g_cmd_bytes12, (uint64_t)l->cap * sizeof *l->cmds, __ATOMIC_RELAXED);
     free(l->cmds);
     release_dev(o);
 }
@@ -4233,6 +4240,7 @@ static int list_reserve12(list12 *list, uint32_t additional) {
     if ((size_t)capacity > SIZE_MAX / sizeof *list->cmds) return 0;
     cmd12 *commands = realloc(list->cmds, (size_t)capacity * sizeof *commands);
     if (!commands) return 0;
+    __atomic_add_fetch(&g_cmd_bytes12, (uint64_t)(capacity - list->cap) * sizeof *commands, __ATOMIC_RELAXED);
     list->cmds = commands;
     list->cap = capacity;
     return 1;
@@ -10495,6 +10503,19 @@ static int gpu_ir_execute_transient_draw(gpu_ir_pipeline *pipeline, const gpu_ir
     return rc;
 }
 
+// A replay's own copy of its list's commands (each knowing its index in the list), before the first insertion.
+static int replay_own12(cmd12 **commands, uint32_t count, uint64_t *bytes) {
+    cmd12 *copy = malloc((size_t)(count ? count : 1) * sizeof *copy);
+    if (!copy) { vx_log("D3D12: could not copy a command list for replay"); return 0; }
+    memcpy(copy, *commands, (size_t)count * sizeof *copy);
+    for (uint32_t i = 0; i < count; i++) copy[i].replay_source_index = i;
+    *commands = copy;
+    *bytes = (uint64_t)count * sizeof *copy;
+    uint64_t in_flight = __atomic_add_fetch(&g_replay_copy_bytes12, *bytes, __ATOMIC_RELAXED);
+    for (uint64_t peak = __atomic_load_n(&g_replay_copy_peak12, __ATOMIC_RELAXED); in_flight > peak &&
+         !__atomic_compare_exchange_n(&g_replay_copy_peak12, &peak, in_flight, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {}
+    return 1;
+}
 static int replay_insert(cmd12 **commands, uint32_t *count, uint32_t at, const cmd12 *items, uint32_t nitems) {
     if (!nitems) return 1;
     if (at > *count || nitems > UINT32_MAX - *count || (size_t)(*count + nitems) > SIZE_MAX / sizeof **commands) return 0;
@@ -10744,19 +10765,19 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                   id<MTLCommandBuffer> *command_buffer, scratch *sc) {
     id<MTLCommandBuffer> cb = *command_buffer;
     uint32_t command_count = l->n;
-    cmd12 *commands = command_count ? malloc((size_t)command_count * sizeof *commands) : NULL;
-    if (command_count && !commands) { vx_log("D3D12: could not copy a command list for replay"); return 0; }
-    if (command_count) {
-        memcpy(commands, l->cmds, (size_t)command_count * sizeof *commands);
-        for (uint32_t i = 0; i < command_count; i++) commands[i].replay_source_index = i;
-    }
+    // (the list's own commands, read in place: a copy is made only when an ExecuteIndirect expands into commands on the
+    //  CPU - replay_own12 - since the list cannot change before this replay is done; its copy's commands remember their
+    //  index in the list)
+    cmd12 *commands = l->cmds;
+    int commands_owned = 0;
+    uint64_t copy_bytes = 0;
     pso12 *pso = NULL;
     heap12 *heap = NULL, *sheap = NULL;
     root_binding *compute = calloc(1, sizeof *compute), *graphics = calloc(1, sizeof *graphics);
     gfx_state *g = calloc(1, sizeof *g);
     if (!compute || !graphics || !g) {
         vx_log("D3D12: could not allocate command-list replay state");
-        gfx_access_cache_release12(g); free(commands); free(compute); free(graphics); free(g);
+        gfx_access_cache_release12(g); __atomic_sub_fetch(&g_replay_copy_bytes12, copy_bytes, __ATOMIC_RELAXED); if (commands_owned) free(commands); free(compute); free(graphics); free(g);
         return 0;
     }
     g->prim = MTLPrimitiveTypeTriangle;
@@ -11238,12 +11259,13 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                 if (sig->args[argument_index].type == INDIRECT_VERTEX_BUFFER ||
                     sig->args[argument_index].type == INDIRECT_INDEX_BUFFER) changes_indirect_state = 1;
             if (gpu_records_readback && changes_indirect_state && available) {
-                int validation_ready = c->replay_source_index != UINT32_MAX && state_shadows && state_count &&
+                uint32_t source_index = commands_owned ? c->replay_source_index : i;
+                int validation_ready = source_index != UINT32_MAX && state_shadows && state_count &&
                     replay_indirect_override_reserve12(&indirect_overrides, &indirect_override_capacity,
                                                        indirect_override_count + 1);
                 if (validation_ready) {
                     indirect_overrides[indirect_override_count++] = (d3d12_indirect_validation_override12){
-                        .command_index = c->replay_source_index, .available = available, .records = data };
+                        .command_index = source_index, .available = available, .records = data };
                     resource_state_shadow12 *validated_shadows = NULL;
                     uint32_t validated_count = 0;
                     int validation_result = queue_validate_list_states12(d, queue_type, queue, l,
@@ -11347,7 +11369,8 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                     out->op = C_ROOT_VA; out->a = a->a; out->gfx = sig->gfx; break;
                 }
             }
-            if (!replay_insert(&commands, &command_count, i + 1, generated, generated_count))
+            if (generated_count && !commands_owned && replay_own12(&commands, command_count, &copy_bytes)) commands_owned = 1;
+            if (generated_count && (!commands_owned || !replay_insert(&commands, &command_count, i + 1, generated, generated_count)))
                 vx_log("D3D12: could not insert expanded ExecuteIndirect commands");
             free(generated);
             break;
@@ -11466,13 +11489,13 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
     if (replay_failed) {
         close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
         free(indirect_overrides);
-        gfx_access_cache_release12(g); free(commands); free(compute); free(graphics); free(g);
+        gfx_access_cache_release12(g); __atomic_sub_fetch(&g_replay_copy_bytes12, copy_bytes, __ATOMIC_RELAXED); if (commands_owned) free(commands); free(compute); free(graphics); free(g);
         *command_buffer = cb;
         return 0;
     }
     close_pass(d, g, cb, &re); end_encoders(&ce, &be, &re);
     free(indirect_overrides);
-    free(commands);
+    __atomic_sub_fetch(&g_replay_copy_bytes12, copy_bytes, __ATOMIC_RELAXED); if (commands_owned) free(commands);
     free(compute);
     free(graphics);
     gfx_access_cache_release12(g);
@@ -13066,6 +13089,53 @@ static void job_present12(queue12 *q, qjob12 *j) {
 // The memory report (VXRT_D3D12_SKIP file line ?mem): the process's footprint, what Metal has allocated, and what
 // of it is the game's (its heaps, its committed resources) and what is ours (descriptor heaps on the GPU and their
 // per-descriptor bookkeeping, scratch chunks, the compute pipeline cache's keys).
+// malloc's blocks in use, by its size classes (tiny to 1008 bytes, small to 127 KB, medium to 8 MB, large), and the
+// block sizes holding the most of medium: an enumeration of every zone with the zone locked (the recorder allocates
+// nothing).
+typedef struct { uint64_t bytes[4], blocks[4]; struct { uint64_t size, n; } sizes[4096]; } heapcount12;
+static heapcount12 g_heapcount12;
+static kern_return_t census_reader12(task_t t, vm_address_t a, vm_size_t n, void **p) { (void)t; (void)n; *p = (void *)a; return KERN_SUCCESS; }
+static void census_record12(task_t t, void *ctx, unsigned type, vm_range_t *r, unsigned count) {
+    (void)t; (void)type;
+    heapcount12 *c = ctx;
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t n = r[i].size;
+        int k = n <= 1008 ? 0 : n <= (127u << 10) ? 1 : n <= (8u << 20) ? 2 : 3;
+        c->bytes[k] += n; c->blocks[k]++;
+        if (k != 2) continue;
+        for (uint32_t h = (uint32_t)((n * 0x9E3779B97F4A7C15ull) >> 52), j = 0; j < 4096; j++, h = (h + 1) & 4095)
+            if (!c->sizes[h].n || c->sizes[h].size == n) { c->sizes[h].size = n; c->sizes[h].n++; break; }
+    }
+}
+static void malloc_census12(char *out, size_t size) {
+    heapcount12 *c = &g_heapcount12;
+    memset(c, 0, sizeof *c);
+    vm_address_t *zones = NULL;
+    unsigned nzones = 0;
+    if (malloc_get_all_zones(mach_task_self(), NULL, &zones, &nzones) != KERN_SUCCESS) { snprintf(out, size, "?"); return; }
+    for (unsigned z = 0; z < nzones; z++) {
+        malloc_zone_t *zone = (malloc_zone_t *)zones[z];
+        if (!zone || !zone->introspect || !zone->introspect->enumerator) continue;
+        if (zone->introspect->force_lock) zone->introspect->force_lock(zone);
+        zone->introspect->enumerator(mach_task_self(), c, MALLOC_PTR_IN_USE_RANGE_TYPE, (vm_address_t)zone,
+                                     census_reader12, census_record12);
+        if (zone->introspect->force_unlock) zone->introspect->force_unlock(zone);
+    }
+    static const char *const name[4] = { "tiny", "small", "medium", "large" };
+    size_t o = 0;
+    for (int k = 0; k < 4 && o < size; k++)
+        o += (size_t)snprintf(out + o, size - o, "%s%s %.0f MB (%llu)", k ? ", " : "", name[k], c->bytes[k] / 1048576.0,
+                              (unsigned long long)c->blocks[k]);
+    for (int top = 0; top < 8 && o < size; top++) {          // (the medium sizes by total, largest first)
+        int best = -1;
+        for (int h = 0; h < 4096; h++)
+            if (c->sizes[h].n && (best < 0 || c->sizes[h].size * c->sizes[h].n > c->sizes[best].size * c->sizes[best].n)) best = h;
+        if (best < 0) break;
+        o += (size_t)snprintf(out + o, size - o, "%s%llu KB x%llu", top ? " " : "; medium by size: ",
+                              (unsigned long long)(c->sizes[best].size >> 10), (unsigned long long)c->sizes[best].n);
+        c->sizes[best].n = 0;
+    }
+}
 static void mem_report12(dev12 *d) {
     task_vm_info_data_t vm = { 0 };
     mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
@@ -13107,6 +13177,15 @@ static void mem_report12(dev12 *d) {
            heaps / 1048576.0, (unsigned long)seen.count, committed / 1048576.0, (unsigned long long)count,
            desc_gpu / 1048576.0, desc_cpu / 1048576.0, (unsigned long long)views, (unsigned long long)pool,
            (unsigned long long)__atomic_load_n(&g_scratch_made12, __ATOMIC_RELAXED), (unsigned long long)npso, keys / 1048576.0);
+    char census[600], heap[200];
+    malloc_census12(census, sizeof census);
+    vx_log("D3D12: memory: malloc in use: %s", census);
+    vx_log("D3D12: memory: ours in malloc: recorded commands %.0f MB (%zu bytes each), their copies in replay %.0f MB (peak %.0f), "
+           "gpu_ir streams %.0f MB (%zu bytes each)", __atomic_load_n(&g_cmd_bytes12, __ATOMIC_RELAXED) / 1048576.0,
+           sizeof(cmd12), __atomic_load_n(&g_replay_copy_bytes12, __ATOMIC_RELAXED) / 1048576.0,
+           __atomic_load_n(&g_replay_copy_peak12, __ATOMIC_RELAXED) / 1048576.0,
+           __atomic_load_n(&gpu_ir_stream_bytes, __ATOMIC_RELAXED) / 1048576.0, gpu_ir_command_size());
+    if (vx_heap_report(heap, sizeof heap)) vx_log("D3D12: memory: the game's heap blocks (HeapAlloc, malloc, new): %s", heap);
 }
 static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     swap12 *sc = this;
