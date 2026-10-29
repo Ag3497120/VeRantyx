@@ -34,13 +34,13 @@ targets:
         CLANG_ENABLE_OBJC_ARC: YES
         HEADER_SEARCH_PATHS: "$(SRCROOT)/../../src $(SRCROOT)/../../translator"
         OTHER_LDFLAGS: "-Wl,-force_load,$(VXRT_LIBDIR)/libvxrt.a -Wl,-force_load,$(VXRT_LIBDIR)/libaot.a -licucore -lz"
+        "OTHER_LDFLAGS[sdk=xros*]": "$(inherited) -Wl,-force_load,$(VXRT_LIBDIR)/libvxrt.a -Wl,-force_load,$(VXRT_LIBDIR)/libaot.a -licucore -lz -framework MetalFX"
         ENABLE_BITCODE: NO
         DEAD_CODE_STRIPPING: NO
         ENABLE_DEBUG_DYLIB: NO
     dependencies:
       - sdk: UIKit.framework
       - sdk: Metal.framework
-      - sdk: MetalFX.framework
       - sdk: QuartzCore.framework
       - sdk: CoreGraphics.framework
       - sdk: CoreText.framework

@@ -504,12 +504,20 @@ int npu_interp_on(void *layer) {
     char exe[1024]; uint32_t n = sizeof exe;
     if (_NSGetExecutablePath(exe, &n)) { g.state = -1; return 0; }
     snprintf(g.helper, sizeof g.helper, "%s/vxrt-npu", dirname(exe));
+#if VX_XROS
+    // visionOS (VISIONOS_PORT.md): an app starts no helper process, and VTOpticalFlow is API_UNAVAILABLE there. Race
+    // mode runs on the game's own motion vectors (FSR2's: no helper needed); without them it shows the real frames.
+    // Interpolation and extrapolation (the helper's) stay off.
+    g.interp_ok = 0; g.flow_ok = g.race;
+    if (g.race) vx_log("NPU mode (race), visionOS: the game's motion vectors only (no optical-flow helper here)");
+#else
     for (int k = 0; k < 2; k++) {
         pid_t pid; int status = -1;
         char *argv[] = { g.helper, "--check", k ? "flow" : NULL, NULL };
         if (posix_spawn(&pid, g.helper, NULL, NULL, argv, environ) == 0) waitpid(pid, &status, 0);
         if (k) g.flow_ok = status == 0; else g.interp_ok = status == 0;
     }
+#endif
     if (!(g.mode == NPU_MODE_FLOW ? g.flow_ok : g.interp_ok)) {
         vx_log("NPU mode: off (%s: %s)", g.helper, access(g.helper, X_OK) ? "not found" : "VideoToolbox's frame interpolation or optical flow is not supported on this Mac (macOS 26 and Apple silicon needed)");
         g.state = -1;
@@ -894,12 +902,16 @@ static void show(int kind, VXNpuSet *S, uint32_t slot, double at) {
         FILE *rec = record(cb, kind, S, slot, at);
         double asked = now_s();
         int immediate = !(at > asked + 0.001);
+#if VX_XROS_SIM   // (the visionOS simulator tells no presented times)
+        (void)immediate; if (rec) fclose(rec);
+#else
         [d addPresentedHandler:^(id<MTLDrawable> done) {
             if (done.presentedTime > 0) __atomic_add_fetch(&g.presented, 1, __ATOMIC_RELAXED);
             if (immediate && done.presentedTime > asked && done.presentedTime < asked + 0.1)
                 g.lag = g.lag * 0.9 + (done.presentedTime - asked) * 0.1;   // (a benign race: one writer)
             if (rec) { fprintf(rec, " %.6f\n", done.presentedTime); fclose(rec); }
         }];
+#endif
         if (at > now_s() + 0.001) [cb presentDrawable:d atTime:at];
         else [cb presentDrawable:d];
         [cb commit];
@@ -1592,6 +1604,9 @@ static int race_present(int kind, VXNpuSet *S, int slot, int a, uint32_t d, int 
         FILE *rec = record(cb, kind, S, (uint32_t)slot, 0);
         uint32_t pi = __atomic_fetch_add(&R.npres, 1, __ATOMIC_RELAXED);
         double content = R.rec_content;                            // (the content time it shows: recorded as a 5th field)
+#if VX_XROS_SIM
+        (void)pi; (void)content; if (rec) fclose(rec);
+#else
         [drawable addPresentedHandler:^(id<MTLDrawable> done) {
             double pt = done.presentedTime;
             if (pi < 1024) R.pres[pi] = pt;
@@ -1601,6 +1616,7 @@ static int race_present(int kind, VXNpuSet *S, int slot, int a, uint32_t d, int 
             }
             if (rec) { fprintf(rec, " %.6f %.6f\n", pt, content); fclose(rec); }
         }];
+#endif
         if (R.present_at > 0) [cb presentDrawable:drawable atTime:R.present_at];
         else [cb presentDrawable:drawable];
         [cb commit];
@@ -1612,7 +1628,7 @@ static int race_present(int kind, VXNpuSet *S, int slot, int a, uint32_t d, int 
 // (menus, a game without FSR2) and none have been usable: with them there is no flow, and no helper process at all
 static void race_helper_check(VXNpuSet *S, int has_scene, double t) {
     static int flow = -1;
-    if (flow < 0) flow = !getenv("VXRT_NPU_RACE_FLOW") || atoi(getenv("VXRT_NPU_RACE_FLOW"));
+    if (flow < 0) flow = !VX_XROS && (!getenv("VXRT_NPU_RACE_FLOW") || atoi(getenv("VXRT_NPU_RACE_FLOW")));   // (visionOS: no helper)
     if (has_scene) { R.noscene_t = 0; return; }
     if (!R.noscene_t) R.noscene_t = t;
     if (S->helper || R.mv_ok || !flow || t - R.noscene_t < 3) return;

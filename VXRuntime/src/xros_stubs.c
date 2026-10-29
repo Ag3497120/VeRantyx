@@ -49,3 +49,14 @@ void *vxvm_heap(void) { return NULL; }
 int vxvm_owns(const void *p) { (void)p; return 0; }
 void *vxvm_alloc(size_t n) { return malloc(n ? n : 1); }
 void *vxvm_zalloc(size_t n) { return calloc(1, n ? n : 1); }
+
+#if VX_XROS_SIM
+// The visionOS simulator has no MetalFX (src/upscale_core.m is left out there): no scaler.
+#include "upscale_core.h"
+int vxu_supported(void *device, int mode) { (void)device; (void)mode; return 0; }
+int vxu_encode(void *command_buffer, int mode, const vxu_frame *f, char *why, size_t why_len, int *note) {
+    (void)command_buffer; (void)mode; (void)f; (void)note;
+    snprintf(why, why_len, "no MetalFX in the visionOS simulator");
+    return 0;
+}
+#endif

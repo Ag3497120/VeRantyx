@@ -2070,6 +2070,7 @@ static void tiling12_locate(const tiling12 *t, uint32_t index, uint32_t *mip, ui
 
 static int d3d12_tiled_tier_probe12(id<MTLDevice> mtl) {
     if (getenv("VXRT_D3D12_NO_TILED") || getenv("VXRT_D3D12_NO_RESIDENCY_SET")) return 0;
+#if !VX_XROS_SIM   // (the visionOS simulator has no sparse placement: tier 0)
     if (@available(macOS 26.0, *)) {
         @autoreleasepool {
             id<MTLBuffer> probe = [mtl newBufferWithLength:TILE_BYTES12 options:MTLResourceStorageModePrivate
@@ -2077,6 +2078,7 @@ static int d3d12_tiled_tier_probe12(id<MTLDevice> mtl) {
             if (probe && [mtl sparseTileSizeInBytesForSparsePageSize:MTLSparsePageSize64] == TILE_BYTES12) return 2;
         }
     }
+#endif
     return 0;
 }
 
@@ -2146,9 +2148,11 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
     if (desc->Dimension == 1) {                                    // D3D12_RESOURCE_DIMENSION_BUFFER
         NSUInteger len = desc->Width ? desc->Width : 1;
         if (reserved) {
+#if !VX_XROS_SIM
             if (@available(macOS 26.0, *))
                 r->buffer = [d->mtl newBufferWithLength:(len + 0xffff) & ~(NSUInteger)0xffff
                                                 options:MTLResourceStorageModePrivate placementSparsePageSize:MTLSparsePageSize64];
+#endif
         } else if (in) r->buffer = [in->heap newBufferWithLength:len options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked offset:offset];
         else r->buffer = [d->mtl newBufferWithLength:len options:MTLResourceStorageModeShared];
         if (!r->buffer) { d3d_release(&r->base); return in ? E_INVALIDARG : E_OUTOFMEMORY; }
@@ -2179,10 +2183,12 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
         int texture_exception = 0;
         @try {
             if (reserved) {
+#if !VX_XROS_SIM
                 if (@available(macOS 26.0, *)) {
                     td.placementSparsePageSize = MTLSparsePageSize64;
                     r->texture = [d->mtl newTextureWithDescriptor:td];
                 }
+#endif
             } else if (in && !(in->heap.storageMode == MTLStorageModeShared && td.textureType == MTLTextureType3D && no_shared_3d12())) {
                 td.storageMode = in->heap.storageMode;
                 td.hazardTrackingMode = MTLHazardTrackingModeTracked;
@@ -2513,7 +2519,9 @@ static WINAPI HRESULT dev_create_memheap(void *this, const MEMHEAP_DESC *desc, c
     hd.storageMode = tex_only && desc->Properties.Type != 2 && desc->Properties.Type != 3 ? MTLStorageModePrivate : MTLStorageModeShared;
     hd.hazardTrackingMode = MTLHazardTrackingModeTracked;
     // (any heap may back reserved resources' tiles: placement-sparse pages of 64 KiB)
+#if !VX_XROS_SIM
     if (d->tiled_tier) if (@available(macOS 26.0, *)) hd.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
+#endif
     id<MTLHeap> h = [d->mtl newHeapWithDescriptor:hd];
     if (vx_trace || getenv("VXRT_D3D12_TRACE_MEMORY")) {
         static uint64_t total;
@@ -2691,6 +2699,10 @@ static int tiling12_region(const tiling12 *t, const TILE_COORD12 *start, const T
 static void tile_mappings_apply12(queue12 *q, res12 *r, const tiling12 *t, const uint32_t *tiles,
                                   memheap12 *const *heaps, const uint32_t *offsets, uint32_t n) {   // (submit_lock)
     dev12 *d = q->dev;
+#if VX_XROS_SIM
+    (void)d; (void)t;
+    vx_log("D3D12: no tile mappings in the visionOS simulator (no Metal 4)");
+#else
     if (@available(macOS 26.0, *)) {
         if (!d->tile_queue) d->tile_queue = [d->mtl newMTL4CommandQueue];
         id<MTL4CommandQueue> tq = d->tile_queue;
@@ -2734,6 +2746,7 @@ static void tile_mappings_apply12(queue12 *q, res12 *r, const tiling12 *t, const
         [after encodeWaitForEvent:q->timeline value:mapped];
         [after commit];
     }
+#endif
     for (uint32_t k = 0; k < n; k++) {
         uint32_t i = tiles[k];
         if (heaps[k]) d3d_addref(&heaps[k]->base);

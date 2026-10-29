@@ -9,6 +9,9 @@
 #ifndef VX_XROS
 #define VX_XROS 0                    // (1: the visionOS build, xros/vx_xros.h; VISIONOS_PORT.md)
 #endif
+#ifndef VX_XROS_SIM
+#define VX_XROS_SIM 0                // (1: its simulator)
+#endif
 #include <stddef.h>
 #include <stdint.h>
 

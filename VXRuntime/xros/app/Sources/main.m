@@ -7,6 +7,7 @@
 // module), none (only the memory and address-space probes). Documents/host_log.jsonl gets the probes, the
 // available memory every 2 s and the program's exit; Documents/vxrt.log the runtime's log (stderr, this launch).
 #import <UIKit/UIKit.h>
+#import <Metal/Metal.h>
 #include <crt_externs.h>
 #include <fcntl.h>
 #include <mach/mach.h>
@@ -30,7 +31,7 @@ static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_test[64] = "d3d12";
 static double t0;
 
-static double now(void) { return CFAbsoluteTimeGetCurrent(); }
+static double now(void) { return CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970; }   // (Unix time)
 static uint64_t footprint_mb(void) {
     task_vm_info_data_t info; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
     return task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &n) == KERN_SUCCESS ? info.phys_footprint >> 20 : 0;
@@ -81,6 +82,26 @@ __attribute__((constructor)) static void early(void) {
         if (r != MAP_FAILED) { best = g; munmap(r, g << 30); }
     }
     jlog("va_probe", "\"largest_reservation_gb\":%llu", (unsigned long long)best);
+}
+
+// What the GPU offers that Direct3D 12 games need (BC textures, argument buffers, sparse pages, Metal 4), for the log.
+static void metal_probe(void) {
+    id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+    if (!d) { jlog("metal", "\"device\":null"); return; }
+    int mtl4 = 0, sparse = 0;
+#if !TARGET_OS_SIMULATOR
+    if (@available(visionOS 26.0, *)) {
+        mtl4 = [d newMTL4CommandQueue] != nil;
+        sparse = [d newBufferWithLength:65536 options:MTLResourceStorageModePrivate placementSparsePageSize:MTLSparsePageSize64] != nil;
+    }
+#endif
+    jlog("metal", "\"device\":\"%s\",\"apple7\":%d,\"apple8\":%d,\"apple9\":%d,\"metal3\":%d,\"bc\":%d,\"argbuf_tier\":%d,"
+         "\"working_set_mb\":%llu,\"max_buffer_mb\":%llu,\"float32_filter\":%d,\"raytracing\":%d,\"mtl4_queue\":%d,\"placement_sparse\":%d,"
+         "\"sparse_tile\":%llu",
+         d.name.UTF8String, [d supportsFamily:MTLGPUFamilyApple7], [d supportsFamily:MTLGPUFamilyApple8], [d supportsFamily:MTLGPUFamilyApple9],
+         [d supportsFamily:MTLGPUFamilyMetal3], d.supportsBCTextureCompression, (int)d.argumentBuffersSupport,
+         (unsigned long long)(d.recommendedMaxWorkingSetSize >> 20), (unsigned long long)(d.maxBufferLength >> 20),
+         d.supports32BitFloatFiltering, d.supportsRaytracing, mtl4, sparse, (unsigned long long)d.sparseTileSizeInBytes);
 }
 
 static void *memory_ticker(void *arg) {
@@ -142,6 +163,7 @@ static void *runtime_thread(void *arg) {
     started = YES;
     CGSize s = self.view.bounds.size;
     jlog("window", "\"w\":%.0f,\"h\":%.0f,\"scale\":%.1f", s.width, s.height, self.view.traitCollection.displayScale);
+    metal_probe();
     vxrt_xros_attach(self.view);
     pthread_t t;
     pthread_create(&t, NULL, memory_ticker, NULL);

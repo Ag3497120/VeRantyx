@@ -4,6 +4,8 @@
 // where the last touch or pinch was.
 #pragma once
 #define VX_XROS 1
+#include <TargetConditionals.h>
+#define VX_XROS_SIM TARGET_OS_SIMULATOR   // (the visionOS simulator: no Metal 4, sparse placement, MetalFX or presented times)
 #ifndef __ASSEMBLER__
 #include <stdint.h>
 #include <CoreFoundation/CoreFoundation.h>
