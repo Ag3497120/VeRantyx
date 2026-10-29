@@ -137,6 +137,13 @@ static WINAPI HRESULT adapter_qi(void *this, const GUID *iid, void **out) {
                                          &IID_IDXGIAdapter3, &IID_IDXGIAdapter4 };
     return query(this, iid, out, known, 7);
 }
+// VXRT_GPU_BUDGET_MB: the memory the GPU may use, as a smaller device has it (the budget and the adapter's dedicated
+// memory), so the program's streaming sizes itself for it.
+static uint64_t gpu_budget(uint64_t natural) {
+    const char *e = getenv("VXRT_GPU_BUDGET_MB");
+    uint64_t b = e && atoll(e) > 0 ? (uint64_t)atoll(e) << 20 : 0;
+    return b && b < natural ? b : natural;
+}
 // DXGI_QUERY_VIDEO_MEMORY_INFO: budget, current usage, available for reservation, current reservation. The local
 // segment is the unified memory Metal lets the GPU use.
 static WINAPI HRESULT adapter_query_video_memory(void *this, uint32_t node, uint32_t group, uint64_t *info) {
@@ -146,7 +153,7 @@ static WINAPI HRESULT adapter_query_video_memory(void *this, uint32_t node, uint
         static id<MTLDevice> dev;                                  // (engines ask every frame: made once)
         static dispatch_once_t once;
         dispatch_once(&once, ^{ dev = MTLCreateSystemDefaultDevice(); });
-        info[0] = dev.recommendedMaxWorkingSetSize;
+        info[0] = gpu_budget(dev.recommendedMaxWorkingSetSize);
         info[1] = dev.currentAllocatedSize;
         info[2] = info[0] / 2;
     }
@@ -166,7 +173,7 @@ static void adapter_desc(uint8_t *d, int with_flags) {
     *(uint32_t *)(d + 256) = 0x106B;                                   // Apple
     uint64_t memory = 0; size_t len = sizeof memory;
     sysctlbyname("hw.memsize", &memory, &len, NULL, 0);
-    *(uint64_t *)(d + 272) = dev ? dev.recommendedMaxWorkingSetSize : memory / 2;   // unified memory the GPU may use
+    *(uint64_t *)(d + 272) = gpu_budget(dev ? dev.recommendedMaxWorkingSetSize : memory / 2);   // unified memory the GPU may use
     *(uint64_t *)(d + 288) = memory / 2;
     *(uint32_t *)(d + 296) = 0x5658;                                   // a stable LUID
 }

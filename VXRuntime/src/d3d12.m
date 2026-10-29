@@ -14023,6 +14023,38 @@ static void mem_report12(dev12 *d) {
            __atomic_load_n(&gpu_ir_stream_bytes, __ATOMIC_RELAXED) / 1048576.0, gpu_ir_command_size());
     if (vx_heap_report(heap, sizeof heap)) vx_log("D3D12: memory: the game's heap blocks (HeapAlloc, malloc, new): %s", heap);
 }
+// VXRT_MEM_LIMITS=<MB>[,<MB>...]: a device's footprint limit (jetsam's), watched from the presents. When the
+// footprint (or its peak, which counts the spikes between presents) first goes over one, the present, the time since
+// the first present and the memory report are logged: where the process would have been ended. Nothing is refused.
+static void mem_limits_present12(dev12 *d, uint32_t presents) {
+    static int n = -1; static uint64_t lim[8]; static int hit[8]; static uint64_t t0, peak_seen;
+    if (n < 0) {
+        n = 0;
+        const char *e = getenv("VXRT_MEM_LIMITS");
+        for (const char *p = e; p && *p && n < 8; ) { long long v = atoll(p); if (v > 0) lim[n++] = (uint64_t)v << 20; p = strchr(p, ','); if (p) p++; }
+        if (n) vx_log("D3D12: VXRT_MEM_LIMITS: %d footprint limits watched from the presents", n);
+        t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    }
+    if (!n || (presents % 10 && presents > 2)) return;
+    task_vm_info_data_t vm = { 0 };
+    mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &c) != KERN_SUCCESS) return;
+    double secs = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9;
+    uint64_t peak = vm.ledger_phys_footprint_peak > vm.phys_footprint ? vm.ledger_phys_footprint_peak : vm.phys_footprint;
+    if (presents % 600 == 0 || peak > peak_seen + (256ull << 20)) {
+        vx_log("D3D12: memory limits: present %u, %.0f s: footprint %.0f MB (peak %.0f), Metal allocated %.0f MB", presents, secs,
+               vm.phys_footprint / 1048576.0, peak / 1048576.0, d->mtl.currentAllocatedSize / 1048576.0);
+        if (peak > peak_seen) peak_seen = peak;
+    }
+    for (int k = 0; k < n; k++) {
+        if (hit[k] || peak <= lim[k]) continue;
+        hit[k] = 1;
+        vx_log("D3D12: memory limit %.0f MB crossed: present %u, %.0f s after the first, footprint %.0f MB (peak %.0f), Metal "
+               "allocated %.0f MB: a device with this limit ends the process here", lim[k] / 1048576.0, presents, secs,
+               vm.phys_footprint / 1048576.0, peak / 1048576.0, d->mtl.currentAllocatedSize / 1048576.0);
+        mem_report12(d);
+    }
+}
 // malloc keeps the pages of freed blocks (most in its medium size class, 1.3 GB of dirty pages for 0.5 GB in use in
 // Cyberpunk) until memory runs short. VXRT_MALLOC_RELIEF=1: every 300 presents malloc_zone_pressure_relief, off the
 // present's thread (measured in Cyberpunk: it gave back 0 MB, 10-38 ms each, so it is off by default).
@@ -14069,6 +14101,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     cb_trace_poll12();
     if (g_mem_report12) { g_mem_report12 = 0; mem_report12(sc->dev); }
     malloc_relief12(sc->presents);
+    mem_limits_present12(sc->dev, sc->presents);
     skip_poll12();
     mfx_poll12();
     census_present12();

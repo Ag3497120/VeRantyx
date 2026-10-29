@@ -524,6 +524,16 @@ static WINAPI BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX *m) {
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &count) == KERN_SUCCESS)
         avail = ((uint64_t)vs.free_count + vs.inactive_count + vs.purgeable_count) * vm_kernel_page_size;   // (the kernel's pages: 16 KB, also under Rosetta)
     if (avail > total) avail = total;                  // (purgeable pages are also counted as active or inactive)
+    // VXRT_DEVICE_MEMORY_MB: a smaller machine's memory (a Vision Pro's 16 GB, ...), so the program sizes itself for it;
+    // what is available is no more than that less the process's footprint.
+    const char *dm = getenv("VXRT_DEVICE_MEMORY_MB");
+    if (dm && atoll(dm) > 0 && (uint64_t)atoll(dm) << 20 < total) {
+        total = (uint64_t)atoll(dm) << 20;
+        task_vm_info_data_t vm = { 0 }; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+        uint64_t used = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n) == KERN_SUCCESS ? vm.phys_footprint : 0;
+        uint64_t left = used < total ? total - used : 0;
+        if (avail > left) avail = left;
+    }
     m->load = total ? (DWORD)(100 - avail * 100 / total) : 0;
     m->total_phys = total; m->avail_phys = avail;
     m->total_page = total * 2; m->avail_page = avail + total;
