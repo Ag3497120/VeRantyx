@@ -79,6 +79,9 @@ GPU recompilation. Entry point names include the source hash so the IR of unrela
 remains distinguishable inside a shared render pipeline archive. Identical and concurrent library requests
 within a process share one compiler request; the library memory cache holds at most 256 entries.
 
+`make check`, `make runtime-tests` and `make shader-progress-check` use fresh shader cache directories under
+`build/` and remove them on exit, including after a failed test.
+
 The disk cache keys include the generated Metal source, entry points, render/compute descriptor state, GPU
 identity and macOS build. A changed translator that emits different source, an OS update or a different GPU
 therefore cannot reuse incompatible code. The native Metal archive lookup also validates the descriptor.

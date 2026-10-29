@@ -176,6 +176,7 @@ class LoadingProgressTest(unittest.TestCase):
         draw = REPO / "VXRuntime/build/draw.exe"
         result = subprocess.run([str(runtime), str(draw)], env=environment(
             VXRT_ROOT=self.root / "windows", VXRT_NO_ACTIVATE=1,
+            VXRT_SHADER_CACHE_DIR=self.root / "shaders",
             VXRT_SHADER_PROGRESS_FILE=self.progress, VXRT_SHADER_PROGRESS_EXE="draw.exe"),
             cwd=REPO / "VXRuntime", capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
