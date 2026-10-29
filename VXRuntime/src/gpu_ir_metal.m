@@ -2220,7 +2220,9 @@ int gpu_ir_metal_present_texture(gpu_ir_metal_device *device, const gpu_ir_resou
     id<MTLRenderPipelineState> pipeline = metal_present_pipeline(device);
     pthread_mutex_unlock(&device->present_pipeline_lock);
     if (!pipeline) return GPU_IR_UNSUPPORTED;
+#if !VX_XROS   // (visionOS: the system paces CAMetalLayer)
     layer.displaySyncEnabled = display_sync_enabled != 0;
+#endif
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         if (!drawable) return GPU_IR_RANGE;

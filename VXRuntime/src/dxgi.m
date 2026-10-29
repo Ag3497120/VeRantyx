@@ -538,7 +538,9 @@ static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flag
     static uint64_t frames;
     if (every > 1 && frames++ % (uint64_t)every) { sc->presents++; return S_OK; }
     CAMetalLayer *layer = (__bridge CAMetalLayer *)sc->layer;
+#if !VX_XROS   // (visionOS: the system paces CAMetalLayer)
     layer.displaySyncEnabled = sync != 0;
+#endif
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         if (!drawable) return S_OK;                 // hidden or minimized: nothing to show

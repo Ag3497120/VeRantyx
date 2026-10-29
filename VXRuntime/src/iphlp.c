@@ -16,7 +16,15 @@
 #include <net/if_dl.h>
 #include <net/if_media.h>
 #include <net/if_types.h>
+#if VX_XROS
+// visionOS (VISIONOS_PORT.md): no <net/route.h> and no SCNetworkInterface; interfaces keep their BSD names
+#define RTM_IFINFO2 0x12
+#define SCNetworkInterfaceCopyAll() ((CFArrayRef)NULL)
+#define SCNetworkInterfaceGetLocalizedDisplayName(ni) ((void)(ni), (CFStringRef)NULL)
+#define SCNetworkInterfaceGetBSDName(ni) ((void)(ni), (CFStringRef)NULL)
+#else
 #include <net/route.h>
+#endif
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -328,6 +336,7 @@ static unsigned g_ip_generation[2];                                 // address c
 static HANDLE g_ip_file;                                            // the "file handle" the requests are made on
 static int g_ip_monitor;                                            // 1 running, -1 the routing socket could not open
 
+#if !VX_XROS   // (visionOS: no routing socket in the SDK, VISIONOS_PORT.md: no change notifications there)
 static void ip_changed(int route) {
     pthread_mutex_lock(&g_ip_lock);
     g_ip_generation[route]++;
@@ -373,10 +382,16 @@ static void *ip_monitor(void *arg) {
     close(s);
     return NULL;
 }
+#endif
 static int ip_monitor_start(void) {                                 // with g_ip_lock held
     if (g_ip_monitor) return g_ip_monitor > 0;
     if (!g_ip_file) g_ip_file = vx_handle_new(VX_HANDLE_IPNOTIFY, NULL, NULL);
+#if VX_XROS
+    int s = -1; errno = ENOTSUP;
+    void *(*ip_monitor)(void *) = NULL;
+#else
     int s = socket(PF_ROUTE, SOCK_RAW, AF_UNSPEC);
+#endif
     if (s >= 0) fcntl(s, F_SETFD, FD_CLOEXEC);                     // (not for the programs this one starts)
     pthread_t thread;
     pthread_attr_t attr;

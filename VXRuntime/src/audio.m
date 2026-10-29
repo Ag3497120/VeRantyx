@@ -56,6 +56,15 @@ static void *task_alloc(size_t n) {
 }
 
 // ---- the output device ------------------------------------------------------------------------------------------------
+#if VX_XROS
+// visionOS has no audio HAL: the session's route is the output (VISIONOS_PORT.md)
+#import <AVFAudio/AVFAudio.h>
+static double device_rate(void) { double r = [AVAudioSession sharedInstance].sampleRate; return r >= 8000 ? r : 48000; }
+static void device_name(char *out, size_t cap) {
+    AVAudioSessionPortDescription *o = [AVAudioSession sharedInstance].currentRoute.outputs.firstObject;
+    snprintf(out, cap, "%s", o ? o.portName.UTF8String : "Vision Pro output");
+}
+#else
 static AudioObjectID default_output(void) {
     AudioObjectPropertyAddress a = { kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     AudioObjectID id = 0; UInt32 size = sizeof id;
@@ -78,6 +87,7 @@ static void device_name(char *out, size_t cap) {
         CFRelease(name);
     } else snprintf(out, cap, "Mac output");
 }
+#endif
 static const char *g_device_id = "{0.0.0.00000000}.{56585254-0000-0000-0000-6f7574707574}";
 
 // WAVEFORMATEX(TENSIBLE): tag, channels, rate, bytes per second, block align, bits, extra size; then valid bits,

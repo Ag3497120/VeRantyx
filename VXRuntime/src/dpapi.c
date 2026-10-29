@@ -20,7 +20,9 @@
 #include <CommonCrypto/CommonCrypto.h>
 #include <CommonCrypto/CommonRandom.h>
 #include <CoreFoundation/CoreFoundation.h>
+#if !VX_XROS
 #include <Security/AuthSession.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -268,8 +270,12 @@ static DWORD memory_key(DWORD scope) {
         if (sysctlbyname("kern.bootsessionuuid", info + n, &boot_n, NULL, 0)) return NTE_BAD_KEYSET;
         n += boot_n;
         if (scope == CRYPTPROTECTMEMORY_SAME_LOGON) {
+#if VX_XROS
+            uint32_t session = 0;                                   // (visionOS: one user, no security sessions)
+#else
             SecuritySessionId session = 0;
             if (SessionGetInfo(callerSecuritySession, &session, NULL) != errSessionSuccess) return NTE_BAD_KEYSET;
+#endif
             uint32_t uid = (uint32_t)geteuid(), sid = (uint32_t)session;
             memcpy(info + n, &uid, 4); memcpy(info + n + 4, &sid, 4);
             n += 8;

@@ -478,7 +478,11 @@ static BOOL create_process(const char *app, const char *cmd, const void *env_blo
     posix_spawn_file_actions_init(&fa);
     char cwd_win[1024], cwd_unix[1024];
     if (dir && *dir) snprintf(cwd_win, sizeof cwd_win, "%s", dir); else vx_get_cwd(cwd_win, sizeof cwd_win);
+#if !VX_XROS   // (visionOS: an app starts no processes; posix_spawn fails there, VISIONOS_PORT.md)
     if (vx_unix_path(cwd_win, cwd_unix, sizeof cwd_unix)) posix_spawn_file_actions_addchdir_np(&fa, cwd_unix);
+#else
+    (void)cwd_unix;
+#endif
     if (si && (*(const DWORD *)((const char *)si + 60) & 0x100)) {
         for (int k = 0; k < 3; k++) {
             HANDLE h = *(HANDLE const *)((const char *)si + 80 + 8 * k);       // hStdInput, hStdOutput, hStdError

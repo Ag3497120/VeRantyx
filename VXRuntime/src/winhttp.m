@@ -11,6 +11,9 @@
 #include "vx.h"
 #include <stdlib.h>
 #include <string.h>
+#if VX_XROS
+#include "../xros/vx_xros_proxy.h"
+#endif
 
 enum { WH_SESSION = 1, WH_CONNECTION, WH_REQUEST };
 enum {

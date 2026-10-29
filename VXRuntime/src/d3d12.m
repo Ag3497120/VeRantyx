@@ -43,6 +43,14 @@
 #pragma clang diagnostic ignored "-Wunused-variable"
 #include "d3d12_tables.h"
 #include "d3d_tables.h"                                            // (IDXGISwapChain3, for swap chains on D3D12 queues)
+// visionOS has no 24-bit depth (VISIONOS_PORT.md): those comparisons never match there, as on Apple GPUs here.
+#if VX_XROS
+#define VX_MTL_D24S8 MTLPixelFormatInvalid
+#define VX_MTL_X24S8 MTLPixelFormatInvalid
+#else
+#define VX_MTL_D24S8 MTLPixelFormatDepth24Unorm_Stencil8
+#define VX_MTL_X24S8 MTLPixelFormatX24_Stencil8
+#endif
 #pragma clang diagnostic pop
 
 enum { K12_DEVICE = 1, K12_QUEUE, K12_ALLOCATOR, K12_LIST, K12_FENCE, K12_HEAP, K12_ROOTSIG, K12_PSO, K12_RESOURCE, K12_BLOB, K12_DEBUG, K12_MEMHEAP, K12_QUERYHEAP, K12_COMMAND_SIGNATURE, K12_PIPELINE_LIBRARY };
@@ -764,6 +772,11 @@ static uint64_t shader_cache_key12(NSString *source, MTLCompileOptions *options,
     return fnv1a12(h, flags, sizeof flags);
 }
 static void shader_cache_store12(NSString *source, uint64_t key, int std32, int min_lod, int safe) {
+#if VX_XROS
+    // visionOS: no offline compiler on the device (VISIONOS_PORT.md: the libraries come made from the Mac instead)
+    (void)source; (void)key; (void)std32; (void)min_lod; (void)safe;
+}
+#else
     const char *dir = shader_cache_dir12();
     if (!dir) return;
     static dispatch_queue_t q;
@@ -794,6 +807,7 @@ static void shader_cache_store12(NSString *source, uint64_t key, int std32, int 
         unlink(metal.UTF8String);
     });
 }
+#endif
 static id<MTLLibrary> library_with_timeout12(id<MTLDevice> mtl, NSString *source, MTLCompileOptions *options, NSError **error) {
     uint64_t t0 = fs_now12();
     int std32 = 0, min_lod = 0, safe = 0;
@@ -3273,14 +3287,14 @@ static id<MTLTexture> texture_view(res12 *r, uint32_t format, MTLTextureType typ
     // the stencil of a depth-stencil texture is its X32_Stencil8 / X24_Stencil8 view.
     MTLPixelFormat src = r->texture.pixelFormat;
     int depth_src = src == MTLPixelFormatDepth16Unorm || src == MTLPixelFormatDepth32Float ||
-                    src == MTLPixelFormatDepth32Float_Stencil8 || src == MTLPixelFormatDepth24Unorm_Stencil8;
+                    src == MTLPixelFormatDepth32Float_Stencil8 || src == VX_MTL_D24S8;
     if (depth_src && fmt != src) {
         // (the stencil views: X32_TYPELESS_G8X24_UINT 22, X24_TYPELESS_G8_UINT 47 - R32_FLOAT_X8X24 21 and
         //  R24_UNORM_X8 46 are the depth's)
         int stencil = format == 22 || format == 47 || format == 118 || format == 117;
         if (stencil && src == MTLPixelFormatDepth32Float_Stencil8) fmt = MTLPixelFormatX32_Stencil8;
-        else if (stencil && src == MTLPixelFormatDepth24Unorm_Stencil8) fmt = MTLPixelFormatX24_Stencil8;
-        else if (!stencil || (fmt != MTLPixelFormatX32_Stencil8 && fmt != MTLPixelFormatX24_Stencil8)) fmt = src;
+        else if (stencil && src == VX_MTL_D24S8) fmt = VX_MTL_X24S8;
+        else if (!stencil || (fmt != MTLPixelFormatX32_Stencil8 && fmt != VX_MTL_X24S8)) fmt = src;
     }
     uint32_t total_mips = (uint32_t)r->texture.mipmapLevelCount;
     if (mip >= total_mips) return nil;
@@ -3444,7 +3458,7 @@ static WINAPI void dev_create_srv(void *this, void *resource, const SRV_DESC *de
     // A stencil view: Metal reads the stencil in .r, D3D12 in .g (X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT: R
     // and B read 0, A 1). The view's mapping is composed with that, as a swizzle the shader applies.
     if (desc && (desc->format == 22 || desc->format == 47) && r && r->texture &&
-        (r->texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || r->texture.pixelFormat == MTLPixelFormatDepth24Unorm_Stencil8) &&
+        (r->texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || r->texture.pixelFormat == VX_MTL_D24S8) &&
         (raw_component_mapping & (1u << 12)) && !(raw_component_mapping & ~0x1fffu)) {
         static const uint32_t to_metal[6] = { 4, 0, 4, 5, 4, 5 };     // D3D12 source selector -> where Metal has it
         uint32_t composed = 1u << 12;
@@ -14044,7 +14058,9 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     swap12 *sc = this;
     if (flags & 1) return S_OK;                                    // DXGI_PRESENT_TEST
     if (sync > 4) return DXGI_ERROR_INVALID_CALL;
+#if !VX_XROS   // (visionOS: the system paces CAMetalLayer)
     sc->layer.displaySyncEnabled = sync != 0;
+#endif
     HANDLE waitable = sc->flags & SWAP_FLAG_FRAME_LATENCY_WAITABLE ? sc->waitable : NULL;
     @autoreleasepool {
         // (the drawable is waited for before the submission lock: a wait for the display holds up no other thread's

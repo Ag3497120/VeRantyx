@@ -6,6 +6,9 @@
 // server process for in-process objects.
 #ifndef VX_H
 #define VX_H
+#ifndef VX_XROS
+#define VX_XROS 0                    // (1: the visionOS build, xros/vx_xros.h; VISIONOS_PORT.md)
+#endif
 #include <stddef.h>
 #include <stdint.h>
 

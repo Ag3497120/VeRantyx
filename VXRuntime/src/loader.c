@@ -750,13 +750,13 @@ static vx_image *load_pe(const char *path, int is_main) {
         for (; m->name[k] && k + 1 < sizeof lower; k++) lower[k] = (char)tolower((unsigned char)m->name[k]);
         lower[k] = 0;
         snprintf(mod, sizeof mod, "%s/%s-%016llx.dylib", getenv("VXRT_AOT_DIR"), lower, (unsigned long long)aot_hash);
-        if (!access(mod, R_OK)) xa_load(mod, (uint64_t)(uintptr_t)base, image_size, aot_hash);
+        if (xa_module_exists(mod)) xa_load(mod, (uint64_t)(uintptr_t)base, image_size, aot_hash);
         else {
             // (a large image's module comes in parts: <name>-<hash>.p<k>.dylib)
             int parts = 0;
             for (;; parts++) {
                 snprintf(mod, sizeof mod, "%s/%s-%016llx.p%d.dylib", getenv("VXRT_AOT_DIR"), lower, (unsigned long long)aot_hash, parts);
-                if (access(mod, R_OK) || xa_load(mod, (uint64_t)(uintptr_t)base, image_size, aot_hash)) break;
+                if (!xa_module_exists(mod) || xa_load(mod, (uint64_t)(uintptr_t)base, image_size, aot_hash)) break;
             }
             if (parts) xa_link(aot_hash);
             else if (vx_trace) vx_log("aot: no module %s", mod);
@@ -1376,7 +1376,7 @@ int main(int argc, char **argv, char **envp) {
     // the program starts again, up to 5 times: they fall elsewhere)
     if (getenv("VXRT_AOT_DIR") && !xa_reserve()) {
         int tries = getenv("VXRT_AOT_RESTARTS") ? atoi(getenv("VXRT_AOT_RESTARTS")) : 0;
-        if (tries < 5) {
+        if (tries < 5 && !VX_XROS) {                // (visionOS: the app reserved it before anything else, or never will)
             char n[8]; snprintf(n, sizeof n, "%d", tries + 1);
             setenv("VXRT_AOT_RESTARTS", n, 1);
             char self[4096]; uint32_t len = sizeof self;

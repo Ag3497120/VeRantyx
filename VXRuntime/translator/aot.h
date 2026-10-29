@@ -41,6 +41,7 @@ int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash);
 // The parts of the image with this hash branch to each other (after all of them are loaded); the number linked.
 int xa_link(uint64_t hash);
 int xa_any(void);
+int xa_module_exists(const char *path);             // a module of that file name (Mac: a dylib; visionOS: linked in)
 // The base the module for this file (dir/<name lowercased>-<hash>[.p0].dylib) was made for; 0 when there is none.
 int xa_reserve(void);                              // VXRT_AOT_DIR: at start (aot.c); 0: the range is taken
 int xa_in_arena(uint64_t a, uint64_t n);

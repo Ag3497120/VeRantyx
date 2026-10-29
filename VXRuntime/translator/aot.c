@@ -29,10 +29,35 @@ const char *vx_image_name_at(uint64_t pc);            // (src/loader.c: an image
 static int g_strict = -1;
 int xa_any(void) { return g_nmod > 0; }
 
-int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash) {
+// Where a module comes from. On the Mac, a dylib (dir/<name>-<hash>[.p<k>].dylib, made by tools/aot_build.sh). On
+// visionOS an app may load no code made after it was signed, so the modules are linked into it and the app's
+// registry (xros/app, generated with the modules: vxrt_aot_static) answers for those same file names.
+#if VX_XROS
+typedef struct { const char *name; const xa_desc *desc; } xa_static;
+extern const xa_static vxrt_aot_static[];          // ({ NULL, NULL } at the end)
+static const xa_desc *static_module(const char *path) {
+    const char *slash = strrchr(path, '/'), *name = slash ? slash + 1 : path;
+    for (const xa_static *m = vxrt_aot_static; m->name; m++) if (!strcasecmp(m->name, name)) return m->desc;
+    return NULL;
+}
+int xa_module_exists(const char *path) { return static_module(path) != NULL; }
+static const xa_desc *open_module(const char *path) {
+    const xa_desc *d = static_module(path);
+    if (!d) vx_log("aot: %s is not linked into this app", path);
+    return d;
+}
+#else
+int xa_module_exists(const char *path) { return !access(path, R_OK); }
+static const xa_desc *open_module(const char *path) {
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!h) { vx_log("aot: %s: %s", path, dlerror()); return -1; }
-    const xa_desc *d = dlsym(h, "vxrt_aot_module");
+    if (!h) { vx_log("aot: %s: %s", path, dlerror()); return NULL; }
+    return dlsym(h, "vxrt_aot_module");
+}
+#endif
+
+int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash) {
+    const xa_desc *d = open_module(path);
+    if (!d) return -1;
     if (!d || d->magic != XA_MAGIC || d->version != XA_VERSION) { vx_log("aot: %s is not a module of this version", path); return -1; }
     if (d->image_base != base || d->image_size != size || d->file_hash != hash) {
         vx_log("aot: %s was made for another image (base %#llx, hash %016llx; this one %#llx, %016llx): not used", path,
@@ -61,6 +86,7 @@ int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash) {
 // An image whose base is in the arena is mapped over the reservation.
 static uint64_t g_arena_lo, g_arena_hi;
 int xa_reserve(void) {
+    if (g_arena_hi) return 1;                                  // (visionOS: the app reserves it first, xros/app)
     if (getenv("VXRT_AOT_MAPDUMP")) {
         mach_vm_address_t r = 0x100000000ull; mach_vm_size_t rs; vm_region_basic_info_data_64_t info; mach_port_t o;
         for (;;) {
@@ -94,10 +120,9 @@ uint64_t xa_module_base(const char *dir, const char *path, uint64_t hash) {
     for (const char *n = slash ? slash + 1 : path; *n && k + 1 < sizeof lower; n++) lower[k++] = (char)tolower((unsigned char)*n);
     lower[k] = 0;
     snprintf(mod, sizeof mod, "%s/%s-%016llx.dylib", dir, lower, (unsigned long long)hash);
-    if (access(mod, R_OK)) snprintf(mod, sizeof mod, "%s/%s-%016llx.p0.dylib", dir, lower, (unsigned long long)hash);
-    if (access(mod, R_OK)) return 0;
-    void *h = dlopen(mod, RTLD_NOW | RTLD_LOCAL);              // (kept open: xa_load opens it again)
-    const xa_desc *d = h ? dlsym(h, "vxrt_aot_module") : NULL;
+    if (!xa_module_exists(mod)) snprintf(mod, sizeof mod, "%s/%s-%016llx.p0.dylib", dir, lower, (unsigned long long)hash);
+    if (!xa_module_exists(mod)) return 0;
+    const xa_desc *d = open_module(mod);                       // (a dylib kept open: xa_load opens it again)
     return d && d->magic == XA_MAGIC && d->version == XA_VERSION && d->file_hash == hash ? d->image_base : 0;
 }
 

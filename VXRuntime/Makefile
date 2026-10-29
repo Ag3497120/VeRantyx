@@ -63,6 +63,41 @@ aot-suite: build/vxrt build/vxrt-arm64 build/vxrt-aot build/recomp/suite.exe
 	@# the same split into parts of 20 KB (a large image's dylibs, branching to each other through veneers)
 	VXRT_AOT_PART_MB=0.02 tools/aot_build.sh build/recomp/suite.exe build/aotp > /dev/null
 	AOT_DIR=build/aotp tools/aot_compare.sh build/recomp/suite.exe
+# The visionOS build (VISIONOS_PORT.md): the ARM64 runtime as a static library for the VX Runtime app (xros/app),
+# compiled for the device with xros/vx_xros.h included first and xros/include ahead of the SDK. AppKit's parts
+# (windows, menus, tray, clipboard), OpenGL, IOKit's DirectInput and the vCPU are left out; src/xros_ui.m stands in
+# for the windows, translator/engine_nojit.c for the engine (no JIT there: AOT modules only).
+# (XROS_SDK=xrsimulator: the same for the visionOS simulator, into build/xrsimulator)
+XROS_SDK ?= xros
+XROS_TARGET = arm64-apple-xros26.0$(if $(filter xrsimulator,$(XROS_SDK)),-simulator)
+XROS_DIR = build/$(XROS_SDK)
+XROS_CC = xcrun -sdk $(XROS_SDK) clang -target $(XROS_TARGET)
+XROS_CFLAGS = -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -include xros/vx_xros.h -Ixros/include -Isrc -Ibuild -Ithird_party/vulkan -fobjc-arc
+XROS_OUT = src/cocoa.m src/menus.m src/tray.m src/clipboard.m src/opengl.c src/directinput.m translator/engine.c translator/vcpu.c
+XROS_SRC = $(filter-out $(XROS_OUT),$(ARM64_SRC)) src/xros_ui.m src/xros_stubs.c translator/engine_nojit.c
+XROS_OBJ = $(patsubst %,$(XROS_DIR)/obj/%.o,$(XROS_SRC))
+$(XROS_DIR)/obj/%.o: % xros/vx_xros.h build/thunks/stamp
+	@mkdir -p $(dir $@)
+	$(XROS_CC) $(XROS_CFLAGS) -c -o $@ $<
+# (the app has its own main: the loader's is called from it, xros/app)
+$(XROS_DIR)/obj/src/loader.c.o: XROS_CFLAGS += -Dmain=vx_loader_main
+$(XROS_DIR)/libvxrt.a: $(XROS_OBJ)
+	@rm -f $@
+	xcrun -sdk $(XROS_SDK) libtool -static -o $@ $(XROS_OBJ)
+xros-lib: $(XROS_DIR)/libvxrt.a
+# Our own test programs for the app, their modules linked into it (tools/xros_aot.sh), the files they read beside them.
+XROS_TESTS = build/d3d12.exe build/recomp/suite.exe build/hello_crt.exe build/seh_try.exe build/unwind.exe build/cxx_exceptions.exe
+xros-aot-tests: build/vxrt-aot $(XROS_TESTS)
+	XROS_SDK=$(XROS_SDK) XROS_TARGET=$(XROS_TARGET) tools/xros_aot.sh $(XROS_TESTS)
+	rm -rf build/xros/bundle && mkdir -p build/xros/bundle/exe build/xros/bundle/tests/shaders12
+	cp $(XROS_TESTS) build/xros/bundle/exe/
+	cp tests/shaders12/*.dxil build/xros/bundle/tests/shaders12/
+# The app (xros/app, xcodegen): signed for the headset with the team's automatic profile.
+xros-app: xros-lib xros-aot-tests
+	cd xros/app && xcodegen generate --quiet
+	xcodebuild -project xros/app/VXRuntimeHost.xcodeproj -scheme VXRuntimeHost -destination 'generic/platform=$(if $(filter xrsimulator,$(XROS_SDK)),visionOS Simulator,visionOS)' -derivedDataPath $(XROS_DIR)/derived -allowProvisioningUpdates -quiet VXRT_LIBDIR=$(CURDIR)/$(XROS_DIR) build
+	@ls -d $(XROS_DIR)/derived/Build/Products/Debug-$(XROS_SDK)/VXRuntimeHost.app
+.PHONY: xros-lib xros-aot-tests xros-app
 # Code that runs inside the vCPU guest (translator/guest.c): no calls, no globals, no stack protector.
 GUEST_CFLAGS = -arch arm64 -O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-stack-check -mmacosx-version-min=14.0 -Itranslator
 build/guest.o: translator/guest.c translator/vcpu.h translator/xlat.h translator/xvheap.h

@@ -1,0 +1,60 @@
+# VX Runtime (marimokodai.VXRuntimeHost): VXRuntime as it is, on the headset (../../VISIONOS_PORT.md). Not VX Proto
+# (marimokodai.VisionOSProto) or the VeRantyx client (marimokodai.VisionSpatialTools). Build the libraries first:
+#   make xros-lib xros-aot-tests      (from VXRuntime/)
+name: VXRuntimeHost
+options:
+  bundleIdPrefix: marimokodai
+  deploymentTarget:
+    visionOS: "26.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: 7YNW843VY6
+    CODE_SIGN_STYLE: Automatic
+    XROS_DEPLOYMENT_TARGET: "26.0"
+    TARGETED_DEVICE_FAMILY: "7"
+    SUPPORTED_PLATFORMS: "xros xrsimulator"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    VXRT_LIBDIR: "$(SRCROOT)/../../build/xros"
+targets:
+  VXRuntimeHost:
+    type: application
+    platform: visionOS
+    sources:
+      - path: Sources
+      - path: ../../build/xros/bundle
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: marimokodai.VXRuntimeHost
+        PRODUCT_NAME: VXRuntimeHost
+        INFOPLIST_FILE: Sources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/VXRuntimeHost.entitlements
+        CLANG_ENABLE_OBJC_ARC: YES
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/../../src $(SRCROOT)/../../translator"
+        OTHER_LDFLAGS: "-Wl,-force_load,$(VXRT_LIBDIR)/libvxrt.a -Wl,-force_load,$(VXRT_LIBDIR)/libaot.a -licucore -lz"
+        ENABLE_BITCODE: NO
+        DEAD_CODE_STRIPPING: NO
+        ENABLE_DEBUG_DYLIB: NO
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: Metal.framework
+      - sdk: MetalFX.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreText.framework
+      - sdk: CoreServices.framework
+      - sdk: GameController.framework
+      - sdk: IOSurface.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFAudio.framework
+      - sdk: CoreAudio.framework
+      - sdk: ImageIO.framework
+      - sdk: IOKit.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: CFNetwork.framework
+      - sdk: Security.framework
+      - sdk: VideoToolbox.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreMedia.framework

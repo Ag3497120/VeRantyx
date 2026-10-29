@@ -6,6 +6,7 @@
 #include "d3d_common.h"
 #include "gpu_ir.h"
 #include <dlfcn.h>
+#include <sys/mman.h>
 #include <os/os_sync_wait_on_address.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"

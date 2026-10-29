@@ -383,7 +383,13 @@ static int adapter_interface(const WCHAR *adapter, char *ifname, size_t cap) {
     freeifaddrs(list);
     return found;
 }
+#if VX_XROS
+#define DHCPInfoGetOptionData(info, option) ((CFDataRef)NULL)   // (visionOS: never reached, dhcp_info answers NULL)
+#endif
 static CFDictionaryRef dhcp_info(const char *ifname) {          // the DHCP info of the network service on that interface
+#if VX_XROS
+    (void)ifname; return NULL;                                  // (visionOS: no SCDynamicStore; no DHCP details)
+#else
     SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("vxrt dhcpcsvc"), NULL, NULL);
     if (!store) return NULL;
     CFDictionaryRef info = NULL;
@@ -404,6 +410,7 @@ static CFDictionaryRef dhcp_info(const char *ifname) {          // the DHCP info
     if (want) CFRelease(want);
     CFRelease(store);
     return info;
+#endif
 }
 static WINAPI DWORD DhcpCApiInitialize(DWORD *version) { if (version) *version = 2; return 0; }   // DHCPCAPI_VERSION_V2
 static WINAPI void DhcpCApiCleanup(void) {}

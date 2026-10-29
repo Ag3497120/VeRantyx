@@ -54,7 +54,11 @@
 #include <math.h>
 #include <os/lock.h>
 #include <pthread.h>
+#if VX_XROS
+#import <UIKit/UIKit.h>
+#else
 #import <AppKit/AppKit.h>
+#endif
 #include "npu_interp.h"
 #include "npu_proto.h"
 #include "warp_core.h"
@@ -1974,17 +1978,27 @@ static void race_start(CAMetalLayer *layer) {
         R.even = getenv("VXRT_NPU_RACE_EVEN") ? atof(getenv("VXRT_NPU_RACE_EVEN")) : 1.5;
         if (hz && !R.hz) R.hz = (float)atof(hz);
     }
+#if VX_XROS
+    float hz = 90;                                                 // (visionOS: no screens to ask; Vision Pro's rate)
+#define VX_NPU_SCREEN_NAME "Vision Pro"
+#else
     NSScreen *screen = nil;
     for (NSWindow *w in [NSApp windows])                           // (reading: no change to the window)
         if (w.contentView.layer == layer || w.contentView.layer == layer.superlayer) screen = w.screen;
     if (!screen) screen = [NSScreen mainScreen];
     float hz = (float)screen.maximumFramesPerSecond;               // (real frames show at the display's rate; R.hz caps predictions)
+#define VX_NPU_SCREEN_NAME (screen.localizedName.UTF8String ?: "?")
+#endif
     const char *dhz = getenv("VXRT_NPU_RACE_DISPLAY_HZ");          // (another refresh rate asked of the display link: 90, as Vision Pro's)
     if (dhz && atof(dhz) > 0) hz = (float)atof(dhz);
     dispatch_semaphore_t started = dispatch_semaphore_create(0);
     NSThread *th = [[NSThread alloc] initWithBlock:^{
         VXNpuTick *target = [VXNpuTick new];
+#if VX_XROS
+        CADisplayLink *link = [CADisplayLink displayLinkWithTarget:target selector:@selector(tick:)];
+#else
         CADisplayLink *link = [screen displayLinkWithTarget:target selector:@selector(tick:)];
+#endif
         link.preferredFrameRateRange = CAFrameRateRangeMake(hz, hz, hz);
         [link addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
         R.link = link;
@@ -1999,7 +2013,7 @@ static void race_start(CAMetalLayer *layer) {
     dispatch_semaphore_wait(started, DISPATCH_TIME_FOREVER);
     R.layer = layer;
     vx_log("NPU mode (race): display link on (%s, %.0f Hz; decided %.1f ms before the next refresh, at most %.2f of an "
-           "interval on, a frame when the scene moved %.1f px)", screen.localizedName.UTF8String ?: "?", hz, R.margin * 1000,
+           "interval on, a frame when the scene moved %.1f px)", VX_NPU_SCREEN_NAME, hz, R.margin * 1000,
            R.max_t, R.min_px);
 }
 
@@ -2038,7 +2052,9 @@ void npu_interp_frame(void *layer_, void *cb_, void *texture, uint32_t w, uint32
     }
     if (w > tex.width) w = (uint32_t)tex.width;
     if (h > tex.height) h = (uint32_t)tex.height;
+#if !VX_XROS   // (visionOS: the system paces CAMetalLayer)
     layer.displaySyncEnabled = YES;
+#endif
     VXNpuSet *S;
     os_unfair_lock_lock(&g.lock);
     S = g.set;

@@ -142,7 +142,9 @@ VKFN VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice dev, const VkSwapchainCre
     layer.pixelFormat = lf;
     layer.drawableSize = CGSizeMake(w, h);
     layer.maximumDrawableCount = sc->count >= 3 ? 3 : 2;
+#if !VX_XROS   // (visionOS: the system paces CAMetalLayer)
     layer.displaySyncEnabled = info->presentMode == VK_PRESENT_MODE_FIFO_KHR || info->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+#endif
     layer.framebufferOnly = NO;
     [CATransaction commit];
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f->mtl width:w height:h mipmapped:NO];

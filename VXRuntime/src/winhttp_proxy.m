@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if VX_XROS
+#include "../xros/vx_xros_proxy.h"
+#endif
 
 typedef int32_t WINBOOL;
 enum {

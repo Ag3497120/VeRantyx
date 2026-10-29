@@ -7494,7 +7494,11 @@ static void wpf_open_hyperlink(clr_runtime *rt, clr_object *hyperlink) {
     if (!web_url) {
         clr_trace("WPF Hyperlink ignored: only absolute HTTP(S) URLs are supported");
     } else {
+#if VX_XROS
+        OSStatus status = -1;                                       // (visionOS: no Launch Services from here)
+#else
         OSStatus status = LSOpenCFURLRef(url, NULL);
+#endif
         if (status == noErr) clr_trace("WPF Hyperlink opened in the default browser");
         else clr_trace("WPF Hyperlink could not open in the default browser (status %d)", (int)status);
     }
