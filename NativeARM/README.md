@@ -959,3 +959,63 @@ Offline runtime, supervisor, probe, app and sanitizer checks cover the safe
 default and explicit force on synthetic processes. The full VXRuntime check
 still stops at the previously documented x86-to-ARM64 differential failures
 (`cpuid`, `xgetbv`, gather instructions); Windows runtime sources are unchanged.
+
+## Status (2026-10-29): native SDR matching to the Windows picture
+
+The user's `Screens/1 arm.jpeg`, `1 windows.jpeg`, `2 arm.jpeg` and
+`2 windows.jpeg` compare both VeRantyx modes on the same headset. All four
+files carry sRGB profiles. The existing native run logs show an RGBA8 sRGB
+eye image (`VkFormat 43`, `ColorSpace_Auto`); copying it to a buffer preserves
+the encoded bytes. Both routes use the same encoder, sRGB transfer metadata
+and BT.709 primaries/matrix. Both saved game configurations specify
+`r_fullscreen_gamma=2.2`. There is no demonstrated extra HDR conversion in
+the native transport. The precise source of the engine-side difference
+(different Linux ARM64/Vulkan and Windows/D3D11 render paths, exposure or
+tone mapping) remains unproven; changing the transport's sRGB interpretation
+would not be a justified fix for this submitted format.
+
+The second pair yields 50 locally corresponding textured patches with
+normalized contrast correlation at least 0.95 and reverse matching within
+two pixels at 512-square analysis resolution. Their median linear-light
+exposure difference is about 1.07 stops, native brighter. The first pair
+has substantially different viewpoints and only 17 such matches; it does
+not support an exact global match. These are screenshot comparisons,
+not game harness measurements or identical-pose captures.
+
+The native compositor now applies a fixed display curve before publishing
+both eyes to the shared encoder. In linear light it uses
+`out = gain * in / (1 + (gain - 1) * in)`, with `gain = 0.5` by default,
+then returns to sRGB. This gives approximately -1 EV in shadows and
+midtones while retaining black and display white; it does not grey out
+lamp cores with a uniform encoded-RGB multiplier. The same curve is applied
+to all RGB channels; alpha, poses, frame pairing and startup clear filtering
+are preserved. Loading rooms drawn by the encoder retain their own output.
+`VERANTYX_NATIVE_EXPOSURE_EV=0` gives a byte-exact neutral path for comparisons;
+finite values from -3 to 3 adjust the curve. It is a display calibration to
+these references, not a claim that a native HDR or shader defect is repaired.
+
+Using the actual compiled curve, median absolute RGB error in those patches
+falls from 14.96 to 1.48 code values (out of 255) in pair 2 and from 17.94
+to 6.56 in pair 1. This is a fit to the supplied images, not independent
+headset validation. The byte lookup uses ARM NEON on the readback worker;
+there are no per-pixel powers. A CPU-only synthetic 7,372,800-pixel buffer
+costs about 3.1 ms median in the host's `-O1` configuration on this Mac.
+This is conversion time, not a gameplay FPS result.
+
+Offline regressions cover the publish path in both eyes, a neutral mode,
+monotonicity and black/white anchors, invalid settings, every byte value,
+alpha, unaligned buffers and SIMD tails. Native checks and syntax pass.
+ASan, UBSan and TSan also pass. The publish regression fails against the
+previous compositor and passes with the correction. The app is rebuilt
+and its nested signatures verify.
+The full Windows check still reaches the pre-existing translator differential
+failures above.
+
+Packaged-host probe `20261029T150612Z-alyx-native-a2_quarantine_entrance`
+completes its 40-second collection without early exit (`o1`), captures five
+frames (`o9`-`o13`), records zero fatal diagnostics (`o14`) and exits normally
+after an acknowledged quit (`o18`, exit 0, no force). Its frozen log records
+the active -1 EV curve; all observation hashes and the ledger verify, and
+the host hash matches the delivered app. It does not compare the supplied
+viewpoints or validate the picture in a headset. That comparison remains
+required; no measured baseline or playtest level has been changed.

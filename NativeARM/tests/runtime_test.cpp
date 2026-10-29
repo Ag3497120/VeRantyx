@@ -483,6 +483,32 @@ static void test_loading_prompt(const char *framePath) {
     unsetenv("VERANTYX_NATIVE_LOADING_FILE");
 }
 
+static void test_display_color() {
+    vrrt::NativeDisplayCurve curve;
+    assert(curve.map(0) == 0 && curve.map(255) == 255);
+    assert(curve.map(40) == 27 && curve.map(60) == 42 && curve.map(128) == 98);
+    for (unsigned i = 1; i < 256; i++) assert(curve.map(i) >= curve.map(i-1));
+    assert(vrrt::NativeDisplayCurve(std::numeric_limits<float>::quiet_NaN()).exposure() == -1);
+    for (const char *bad : {"", "nan", "inf", "-4", "4", "0oops"}) {
+        setenv("VERANTYX_NATIVE_EXPOSURE_EV", bad, 1); assert(native_exposure() == -1);
+    }
+    setenv("VERANTYX_NATIVE_EXPOSURE_EV", "0", 1); assert(native_exposure() == 0);
+    unsetenv("VERANTYX_NATIVE_EXPOSURE_EV"); assert(native_exposure() == -1);
+    // All byte values, alpha, an unaligned address and scalar tails. The SIMD
+    // lookup must be byte-identical to the curve for both dimming and gain.
+    for (float ev : {-3.f, -1.f, 0.f, 1.f, 3.f}) for (size_t count : {1u, 3u, 4u, 257u, 258u, 259u}) {
+        vrrt::NativeDisplayCurve c(ev);
+        std::vector<uint8_t> pixels(count * 4 + 2, 0xa5);
+        for (size_t i = 0; i < count * 4; i++) pixels[i+1] = uint8_t(i * 37);
+        auto expected = pixels;
+        for (size_t i = 0; i < count; i++) for (unsigned ch = 0; ch < 3; ch++)
+            expected[1+i*4+ch] = c.map(expected[1+i*4+ch]);
+        c.apply_bgra(pixels.data()+1, count);
+        assert(pixels == expected);
+        if (ev == 0) for (size_t i = 0; i < count * 4; i++) assert(pixels[i+1] == uint8_t(i * 37));
+    }
+}
+
 static void test_pixels() {
     Readback::Staging s;
     uint8_t rgba[] = {255, 10, 0, 255, 0, 20, 255, 255, 20, 30, 40, 255, 50, 60, 70, 255};
@@ -588,10 +614,25 @@ static void test_compositor() {
         for (int i = 0; i < 32; i++) assert(out[4*i] == 0 && out[4*i+1] == 0 && out[4*i+2] == 0);
         out = publish(scene, pink); // neither eye may show a clear-only frame
         for (int i = 0; i < 32; i++) assert(out[4*i] == 0 && out[4*i+1] == 0 && out[4*i+2] == 0);
-        out = publish(scene, scene); assert(out[1] == 40 && out[2] == 60);
+        // Native display matching must reach both eyes through the real
+        // publish path, after startup filtering and before the encoder.
+        out = publish(scene, scene); assert(out[1] == 27 && out[2] == 42);
+        assert(out[17] == 27 && out[18] == 42);
         assert(frame()->visionTimestamp == 123);
         // Authored magenta after the intro, including a full-screen fade, survives.
         out = publish(pink, pink); assert(out[0] == 255 && out[1] == 0 && out[2] == 255);
+    }
+    {
+        setenv("VERANTYX_NATIVE_EXPOSURE_EV", "0", 1);
+        Compositor c;
+        unsetenv("VERANTYX_NATIVE_EXPOSURE_EV");
+        uint8_t grey[64]; memset(grey, 128, sizeof grey);
+        Readback::Staging s; s.map = grey; s.w = s.h = 4; s.fmt = VK_FORMAT_B8G8R8A8_UNORM;
+        bool flip[2] = {}; float head[16] = {};
+        c.publish_from(s, s, flip, flip, head, 321);
+        auto *f = frame(); auto *p = reinterpret_cast<uint8_t *>(f) + sizeof *f;
+        for (int i = 0; i < 128; i++) assert(p[i] == 128);
+        assert(f->visionTimestamp == 321); // neutral diagnostic mode changes no colour or metadata
     }
     VRVulkanTextureData_t image = {}; image.m_nImage = 100; image.m_pDevice = (VkDevice)1; image.m_pQueue = (VkQueue)2;
     image.m_nWidth = image.m_nHeight = 4; image.m_nFormat = VK_FORMAT_R8G8B8A8_UNORM; image.m_nSampleCount = 1;
@@ -740,7 +781,7 @@ int main(int argc, char **argv) {
     auto p = test_shared_memory();
     test_legacy_input(p);
     test_input(argv[2], p); test_mixed_input_sources(p); test_pose_contention(p);
-    test_locomotion(argv[2], p); test_loading_prompt(argv[1]); test_pixels(); test_compositor();
+    test_locomotion(argv[2], p); test_loading_prompt(argv[1]); test_display_color(); test_pixels(); test_compositor();
     test_quit(argv[1]);
     puts("NativeARM: shared memory, pose contention, mixed hand/gamepad input, locomotion, binding events, loading prompts, skeleton, haptics, compositor and cooperative quit tests passed");
 }

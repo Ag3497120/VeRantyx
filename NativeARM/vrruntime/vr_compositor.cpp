@@ -4,6 +4,7 @@
 #include "gen_stubs.h"
 #include "vr_runtime.h"
 #include "json_mini.h"
+#include "display_color.h"
 #include <cstring>
 #include <cmath>
 #include <vector>
@@ -24,6 +25,18 @@ extern "C" void kl_vulkan_async_begin_frame(void);
 namespace {
 
 using namespace vr;
+
+float native_exposure() {
+    const char *setting = getenv("VERANTYX_NATIVE_EXPOSURE_EV");
+    if (!setting) return -1.f;
+    char *end = nullptr;
+    float ev = strtof(setting, &end);
+    if (!*setting || *end || !std::isfinite(ev) || ev < -3.f || ev > 3.f) {
+        vrrt::log("invalid VERANTYX_NATIVE_EXPOSURE_EV; using -1 EV (allowed -3 to 3, 0 disables matching)");
+        return -1.f;
+    }
+    return ev;
+}
 
 // A small grid distinguishes a flat/black submitted picture from transport
 // loss without saving screenshots or scanning every pixel on the render path.
@@ -385,6 +398,7 @@ public:
     ETrackingUniverseOrigin m_origin = TrackingUniverseStanding;
     EVRCompositorTimingMode m_timing = VRCompositorTimingMode_Implicit;
     HmdColor_t m_fade = { 0, 0, 0, 0 };
+    vrrt::NativeDisplayCurve m_color{native_exposure()};
     Readback m_rb;
     // Asynchronous publishing (Readback::Slot): VERANTYX_SYNC_READBACK=1 restores
     // the old copy-and-wait path.
@@ -672,6 +686,8 @@ public:
                 vrrt::log("startup: first scene pair; %u clear-only pairs replaced", m_startupClears);
             }
         }
+        m_color.apply_bgra(dst, (size_t)w * h);
+        if (!m_published) vrrt::log("native display color: %.2f EV shadow/midtone matching, sRGB SDR, black/white preserved", m_color.exposure());
         vrrt::frame_publish(idx, w, h, fmt, head, visionTs);
         m_published++;
         std::lock_guard<std::mutex> l(m_statsMu);
