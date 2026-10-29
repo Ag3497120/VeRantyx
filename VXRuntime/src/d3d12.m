@@ -34,6 +34,7 @@
 #include "gpu_ir_msl.h"
 #include "npu_interp.h"
 #include "stereo.h"
+#include "upscale_core.h"
 #include <float.h>
 #include <sys/stat.h>
 #pragma clang diagnostic push
@@ -9283,6 +9284,326 @@ static void end_encoders(id<MTLComputeCommandEncoder> __strong *ce, id<MTLBlitCo
     if (*re) { [*re endEncoding]; *re = nil; }
 }
 
+// ---- VXRT_D3D12_METALFX=temporal|spatial (1: temporal): the game's FSR2 replaced by MetalFX (upscale_core.m) -------
+// FSR2's dispatches are known by their constants (cbFSR2, in a root CBV, a CBV table or root constants: FSR 2.0, 2.1,
+// 2.2 or the FSR 3.1 upscaler's layout, read by fsr_parse12). For the first frames FSR2 runs as it is and is learnt:
+// its dispatches in order, every texture they write (its own: history, locks, luma, dilated depth...) and what the last
+// one writes in every frame (the output). Then each frame's FSR2 dispatches are left out; the textures they read that
+// no FSR2 dispatch writes are the game's inputs (colour, depth, motion vectors, by format and size), and at the last one
+// one MetalFX encode upscales them into the output, with the render size, jitter, motion vector scale and reset (frame
+// index 0) from that frame's constants. A frame whose last FSR2 dispatch does not come (the sequence changed) puts
+// FSR2 back and learns again.
+// VXRT_D3D12_METALFX_SWITCH=<file>: its first word, reread at presents, picks the mode while it exists (fsr, temporal,
+// spatial), then key=value: jx=, jy= (jitter signs, 1), mx=, my= (motion vector scale factors, 1), rev= (depth reversed,
+// 1), ae= (auto exposure, 1), hdr= (spatial's HDR mode, 1), sync= (the final upscaler compiled at creation, 0). Every
+// change is logged with the frame, for A/B measurements in one scene.
+typedef struct {
+    int layout;                     // 22: FSR 2.2, 21: 2.1, 20: 2.0, 31: the FSR 3.1 upscaler
+    uint32_t render[2], display[2];
+    float jitter[2], mvs[2], pre_exposure, tan_half_fov;
+    double frame_index;
+} fsr_consts12;
+static int fsr_parse12(const uint32_t *w, uint32_t nwords, fsr_consts12 *o) {
+    const float *f = (const float *)w;
+    static const struct { int layout, display, frame, frame_float, d2v, jitter, mvs, pre, tan, jpc, words, mip; } L[4] = {
+        { 22, 4, 11, 0, 12, 16, 18, 24, 26, 27, 28, 10 },
+        { 31, 4, 31, 1, 12, 16, 20, -1, 26, 27, 32, -1 },
+        { 21, 2, 9, 0, 10, 14, 16, 22, 24, 25, 26, 8 },
+        { 20, 2, 9, 0, 14, 12, 24, 28, 29, -1, 30, 8 },
+    };
+    if (nwords < 26 || w[0] < 16 || w[1] < 16 || w[0] > 16384 || w[1] > 16384) return 0;
+    for (int k = 0; k < 4; k++) {
+        if ((uint32_t)L[k].words > nwords) continue;
+        uint32_t dw = w[L[k].display], dh = w[L[k].display + 1];
+        if (dw < w[0] || dh < w[1] || dw > 16384 || dh > 16384) continue;
+        if (L[k].mip >= 0 && w[L[k].mip] > 16) continue;
+        if (L[k].layout == 31 && (w[10] < dw || w[11] < dh || w[10] > 16384 || w[11] > 16384)) continue;
+        float t = f[L[k].tan], jx = f[L[k].jitter], jy = f[L[k].jitter + 1];
+        if (!(t > 0.05f && t < 5.0f) || !(fabsf(jx) <= 1.0f) || !(fabsf(jy) <= 1.0f)) continue;
+        if (L[k].jpc >= 0) { float p = f[L[k].jpc]; if (!(p >= 1.0f && p <= 4096.0f && p == floorf(p))) continue; }
+        int bad = 0;
+        for (int i = 0; i < 4; i++) if (!isfinite(f[L[k].d2v + i])) bad = 1;
+        if (bad || !isfinite(f[L[k].mvs]) || !isfinite(f[L[k].mvs + 1]) || fabsf(f[L[k].mvs]) > 1e4f || fabsf(f[L[k].mvs + 1]) > 1e4f) continue;
+        o->layout = L[k].layout;
+        o->render[0] = w[0]; o->render[1] = w[1]; o->display[0] = dw; o->display[1] = dh;
+        o->jitter[0] = jx; o->jitter[1] = jy;
+        o->mvs[0] = f[L[k].mvs]; o->mvs[1] = f[L[k].mvs + 1];
+        o->pre_exposure = L[k].pre >= 0 && f[L[k].pre] > 0 && isfinite(f[L[k].pre]) ? f[L[k].pre] : 1.0f;
+        o->tan_half_fov = t;
+        o->frame_index = L[k].frame_float ? (double)f[L[k].frame] : (double)w[L[k].frame];
+        return 1;
+    }
+    return 0;
+}
+// FSR2's constants among the dispatch's constant buffers (root constants, root CBVs, CBV tables)
+static int fsr_find_consts12(dev12 *d, root_binding *rb, heap12 *heap, fsr_consts12 *out) {
+    rootsig12 *rs = rb ? rb->rs : NULL;
+    if (!rs) return 0;
+    for (uint32_t i = 0; i < rs->nparams && i < 64; i++) {
+        const param12 *pa = &rs->params[i];
+        if (pa->type == 1) {
+            if (fsr_parse12(rb->st.constants[i], pa->n32 < 32 ? pa->n32 : 32, out)) return 1;
+            continue;
+        }
+        uint64_t va[8]; int nva = 0;
+        if (pa->type == 2) va[nva++] = rb->st.root_va[i];
+        else if (pa->type == 0 && heap && heap->gpu && heap->cpu && rb->st.table[i] >= heap->gpu.gpuAddress)
+            for (uint32_t k = 0; k < pa->nranges && nva < 8; k++) {
+                const range12 *r = &pa->ranges[k];
+                if (r->type != 2) continue;
+                for (uint32_t j = 0; j < (r->count == UINT32_MAX ? 1 : r->count) && nva < 8; j++) {
+                    uint64_t at = (rb->st.table[i] - heap->gpu.gpuAddress) / 32 + r->offset + j;
+                    if (at >= heap->desc.NumDescriptors) break;
+                    VxDesc v;
+                    memcpy(&v, heap->cpu + 32 * at, sizeof v);
+                    va[nva++] = v.va;
+                }
+            }
+        for (int k = 0; k < nva; k++) {
+            uint64_t off = 0;
+            id<MTLBuffer> b = va[k] ? buffer_at(d, va[k], &off) : nil;
+            if (!b || b.storageMode == MTLStorageModePrivate || off + 128 > b.length) continue;
+            if (fsr_parse12((const uint32_t *)((const uint8_t *)b.contents + off), 32, out)) return 1;
+        }
+    }
+    return 0;
+}
+
+static struct {
+    pthread_mutex_t lock;
+    volatile int mode;                        // now: 0 the game's FSR2, else VXU_TEMPORAL / VXU_SPATIAL
+    volatile float jx, jy, mx, my;
+    volatile int rev, ae, hdr, sync, reset_next;
+    struct { uint64_t cs; int8_t fsr; uint8_t misses; } seen[1024];
+    // this frame (FSR2's frame index)
+    double frame_key; float frame_jx, frame_jy; int have_frame, nseq, replacing, encoded, fails;
+    uint64_t seq[48];
+    void *last_writes[8]; int nlast;
+    void *cand[24]; int cand_n[24], ncand;
+    fsr_consts12 c;
+    // learnt
+    int learned, stable, learned_n;
+    uint64_t learned_last;
+    void *fsr_written[128]; int nfsr_written;
+    void *out_keep[8]; int nout_keep;
+    uint64_t replaced, ran, relearns;
+    int told_inputs;
+} M12 = { .lock = PTHREAD_MUTEX_INITIALIZER, .jx = 1, .jy = 1, .mx = 1, .my = 1, .rev = 1, .ae = 1, .hdr = 1 };
+static int mfx_env12(void) {
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("VXRT_D3D12_METALFX");
+        m = !e || !*e || !strcmp(e, "0") ? 0 : !strcmp(e, "spatial") ? VXU_SPATIAL : VXU_TEMPORAL;
+        M12.mode = m;
+        if (m) vx_log("D3D12: VXRT_D3D12_METALFX: FSR2's dispatches replaced by MetalFX's %s scaler once learnt",
+                      m == VXU_TEMPORAL ? "temporal" : "spatial");
+    }
+    return m;
+}
+// (presents) the switch file
+static void mfx_poll12(void) {
+    const char *p = getenv("VXRT_D3D12_METALFX_SWITCH");
+    if (!mfx_env12() || !p || !*p) return;
+    static struct timespec seen;
+    static int had = -1;
+    struct stat st;
+    if (stat(p, &st)) {
+        if (had != 0) { M12.mode = mfx_env12(); M12.reset_next = 1; vx_log("D3D12: MetalFX switch: no file, %s", M12.mode == VXU_SPATIAL ? "spatial" : "temporal"); }
+        had = 0; seen.tv_sec = 0;
+        return;
+    }
+    if (had == 1 && st.st_mtimespec.tv_sec == seen.tv_sec && st.st_mtimespec.tv_nsec == seen.tv_nsec) return;
+    had = 1; seen = st.st_mtimespec;
+    char line[256] = "";
+    FILE *f = fopen(p, "r");
+    if (f) { if (!fgets(line, sizeof line, f)) line[0] = 0; fclose(f); }
+    int mode = mfx_env12();
+    char *save = NULL;
+    for (char *tok = strtok_r(line, " \t\r\n", &save); tok; tok = strtok_r(NULL, " \t\r\n", &save)) {
+        if (!strcmp(tok, "fsr")) mode = 0;
+        else if (!strcmp(tok, "temporal")) mode = VXU_TEMPORAL;
+        else if (!strcmp(tok, "spatial")) mode = VXU_SPATIAL;
+        else if (!strncmp(tok, "jx=", 3)) M12.jx = (float)atof(tok + 3);
+        else if (!strncmp(tok, "jy=", 3)) M12.jy = (float)atof(tok + 3);
+        else if (!strncmp(tok, "mx=", 3)) M12.mx = (float)atof(tok + 3);
+        else if (!strncmp(tok, "my=", 3)) M12.my = (float)atof(tok + 3);
+        else if (!strncmp(tok, "rev=", 4)) M12.rev = atoi(tok + 4);
+        else if (!strncmp(tok, "ae=", 3)) M12.ae = atoi(tok + 3);
+        else if (!strncmp(tok, "hdr=", 4)) M12.hdr = atoi(tok + 4);
+        else if (!strncmp(tok, "sync=", 5)) M12.sync = atoi(tok + 5);
+    }
+    M12.mode = mode;
+    M12.reset_next = 1;
+    vx_log("D3D12: MetalFX switch: %s (jitter x%g y%g, motion x%g y%g, depth %s, auto exposure %d, hdr %d); %llu frames "
+           "replaced, %llu with FSR2 so far", mode == 0 ? "the game's FSR2" : mode == VXU_TEMPORAL ? "temporal" : "spatial",
+           M12.jx, M12.jy, M12.mx, M12.my, M12.rev ? "reversed" : "standard", M12.ae, M12.hdr,
+           (unsigned long long)M12.replaced, (unsigned long long)M12.ran);
+}
+static int mfx_has12(void *const *set, int n, void *p) { for (int i = 0; i < n; i++) if (set[i] == p) return 1; return 0; }
+static int mfx_colour_fmt12(MTLPixelFormat f) {
+    return f == MTLPixelFormatRGBA16Float || f == MTLPixelFormatRGBA32Float || f == MTLPixelFormatRG11B10Float ||
+           f == MTLPixelFormatRGB10A2Unorm || f == MTLPixelFormatBGR10A2Unorm || f == MTLPixelFormatRGBA8Unorm ||
+           f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB ||
+           f == MTLPixelFormatRGB9E5Float || f == MTLPixelFormatRGBA16Unorm;
+}
+static int mfx_depth_fmt12(MTLPixelFormat f) {
+    return f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatR32Float;
+}
+static int mfx_motion_fmt12(MTLPixelFormat f) {
+    return f == MTLPixelFormatRG16Float || f == MTLPixelFormatRG32Float || f == MTLPixelFormatRG16Snorm;
+}
+// (M12.lock held) a new FSR2 frame: the last one judged
+static void mfx_frame_end12(void) {
+    if (!M12.have_frame || !M12.nseq) return;
+    if (M12.replacing) {
+        if (M12.encoded) M12.replaced++;
+        else {
+            M12.learned = 0; M12.stable = 0; M12.nout_keep = 0; M12.relearns++;
+            vx_log("D3D12: MetalFX: FSR2's last dispatch (cs %016llx, %d of them) did not come in a frame (%d came, the last "
+                   "cs %016llx): FSR2 back, learning again", (unsigned long long)M12.learned_last, M12.learned_n, M12.nseq,
+                   (unsigned long long)M12.seq[M12.nseq - 1]);
+        }
+        return;
+    }
+    M12.ran++;
+    if (M12.learned) return;
+    uint64_t last = M12.seq[M12.nseq - 1];
+    if (M12.stable && last == M12.learned_last && M12.nseq == M12.learned_n) {
+        M12.stable++;
+        int n = 0;                                                 // (what the last one wrote every frame)
+        for (int i = 0; i < M12.nout_keep; i++) if (mfx_has12(M12.last_writes, M12.nlast, M12.out_keep[i])) M12.out_keep[n++] = M12.out_keep[i];
+        M12.nout_keep = n;
+    } else {
+        M12.stable = 1; M12.learned_last = last; M12.learned_n = M12.nseq;
+        M12.nout_keep = M12.nlast;
+        memcpy(M12.out_keep, M12.last_writes, sizeof(void *) * (size_t)M12.nlast);
+    }
+    if (M12.stable >= 8 && M12.nout_keep) {
+        M12.learned = 1;
+        char hashes[48 * 9 + 1] = "";
+        for (int i = 0; i < M12.nseq && i < 48; i++) snprintf(hashes + 9 * i, 10, "%08llx ", (unsigned long long)(M12.seq[i] >> 32));
+        id<MTLTexture> o = (__bridge id<MTLTexture>)M12.out_keep[0];
+        vx_log("D3D12: MetalFX: FSR %d.%d learnt: %d dispatches a frame (%s), %d textures of its own, output %lux%lu format %lu "
+               "(%d candidates); render %ux%u -> display %ux%u, jitter %.3f %.3f, motion vector scale %g %g, pre-exposure %g",
+               M12.c.layout / 10, M12.c.layout % 10, M12.nseq, hashes, M12.nfsr_written, (unsigned long)o.width,
+               (unsigned long)o.height, (unsigned long)o.pixelFormat, M12.nout_keep, M12.c.render[0], M12.c.render[1],
+               M12.c.display[0], M12.c.display[1], M12.c.jitter[0], M12.c.jitter[1], M12.c.mvs[0], M12.c.mvs[1], M12.c.pre_exposure);
+    }
+}
+// A dispatch: 1 when it is FSR2's and MetalFX does its work (the caller leaves it out)
+static int mfx_dispatch12(dev12 *d, gfx_state *g, pso12 *pso, root_binding *compute, heap12 *heap, heap12 *sheap,
+                          id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> __strong *ce,
+                          id<MTLBlitCommandEncoder> __strong *be, id<MTLRenderCommandEncoder> __strong *re) {
+    if (!mfx_env12() || !pso || !compute) return 0;
+    uint64_t cs = pso->cs_code;
+    uint32_t slot = (uint32_t)(cs ^ (cs >> 31)) & 1023;
+    int known = M12.seen[slot].cs == cs;
+    if (known && M12.seen[slot].fsr < 0 && M12.seen[slot].misses >= 4) return 0;
+    fsr_consts12 c;
+    if (!fsr_find_consts12(d, compute, heap, &c)) {
+        if (!known) { M12.seen[slot].cs = cs; M12.seen[slot].fsr = -1; M12.seen[slot].misses = 1; }
+        else if (M12.seen[slot].misses < 255) M12.seen[slot].misses++;
+        return 0;
+    }
+    M12.seen[slot].cs = cs; M12.seen[slot].fsr = 1; M12.seen[slot].misses = 0;
+    gpu_ir_access_list12 acc = { 0 };
+    pthread_rwlock_rdlock(&d->bufs_lock);
+    int ok = gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE, compute, heap, sheap, &acc) == GPU_IR_OK;
+    pthread_rwlock_unlock(&d->bufs_lock);
+    if (!ok) { gpu_ir_access_list_release12(&acc); return 0; }
+    void *writes[8]; int nw = 0;
+    for (uint32_t i = 0; i < acc.count; i++) {
+        if (!(acc.values[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
+        id obj = (__bridge id)gpu_ir_backend_object(acc.values[i].resource);
+        if ([obj conformsToProtocol:@protocol(MTLTexture)] && nw < 8) writes[nw++] = (__bridge void *)obj;
+    }
+    int skip = 0;
+    pthread_mutex_lock(&M12.lock);
+    if (!M12.have_frame || c.frame_index != M12.frame_key || c.jitter[0] != M12.frame_jx || c.jitter[1] != M12.frame_jy) {
+        mfx_frame_end12();
+        M12.have_frame = 1; M12.frame_key = c.frame_index; M12.frame_jx = c.jitter[0]; M12.frame_jy = c.jitter[1];
+        M12.nseq = 0; M12.nlast = 0; M12.ncand = 0; M12.encoded = 0;
+        M12.replacing = M12.learned && M12.mode;
+    }
+    M12.c = c;
+    if (M12.nseq < 48) M12.seq[M12.nseq++] = cs;
+    if (!M12.replacing) {
+        for (int i = 0; i < nw; i++) if (!mfx_has12(M12.fsr_written, M12.nfsr_written, writes[i]) && M12.nfsr_written < 128) M12.fsr_written[M12.nfsr_written++] = writes[i];
+        M12.nlast = nw;
+        memcpy(M12.last_writes, writes, sizeof(void *) * (size_t)nw);
+    } else {
+        skip = 1;
+        for (uint32_t i = 0; i < acc.count; i++) {
+            if (!(acc.values[i].access_mask & GPU_IR_ACCESS_SHADER_READ) || (acc.values[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
+            id obj = (__bridge id)gpu_ir_backend_object(acc.values[i].resource);
+            if (![obj conformsToProtocol:@protocol(MTLTexture)]) continue;
+            id<MTLTexture> t = obj;
+            void *p = (__bridge void *)t;
+            if (t.textureType != MTLTextureType2D || t.width < c.render[0] || t.height < c.render[1]) continue;
+            if (mfx_has12(M12.fsr_written, M12.nfsr_written, p)) continue;
+            int k = 0;
+            while (k < M12.ncand && M12.cand[k] != p) k++;
+            if (k == M12.ncand) { if (k == 24) continue; M12.cand[k] = p; M12.cand_n[k] = 0; M12.ncand++; }
+            M12.cand_n[k]++;
+        }
+        if (cs == M12.learned_last && !M12.encoded) {
+            id<MTLTexture> colour = nil, depth = nil, motion = nil, out = nil;
+            int best = 0;
+            for (int k = 0; k < M12.ncand; k++) {
+                id<MTLTexture> t = (__bridge id<MTLTexture>)M12.cand[k];
+                MTLPixelFormat f = t.pixelFormat;
+                if (mfx_motion_fmt12(f)) { if (!motion) motion = t; }
+                else if (mfx_depth_fmt12(f)) { if (!depth || (depth.pixelFormat == MTLPixelFormatR32Float && f != MTLPixelFormatR32Float)) depth = t; }
+                else if (mfx_colour_fmt12(f) && M12.cand_n[k] > best) { colour = t; best = M12.cand_n[k]; }
+            }
+            for (int i = 0; i < nw && !out; i++) if (mfx_has12(M12.out_keep, M12.nout_keep, writes[i])) out = (__bridge id<MTLTexture>)writes[i];
+            if (!M12.told_inputs++) {
+                vx_log("D3D12: MetalFX: the first replaced frame's inputs: colour %lux%lu format %lu, depth %lux%lu format %lu, motion "
+                       "%lux%lu format %lu, output %lux%lu format %lu (usage %#lx); %d candidates", (unsigned long)colour.width,
+                       (unsigned long)colour.height, (unsigned long)colour.pixelFormat, (unsigned long)depth.width, (unsigned long)depth.height,
+                       (unsigned long)depth.pixelFormat, (unsigned long)motion.width, (unsigned long)motion.height, (unsigned long)motion.pixelFormat,
+                       (unsigned long)out.width, (unsigned long)out.height, (unsigned long)out.pixelFormat, (unsigned long)out.usage, M12.ncand);
+                for (int k = 0; k < M12.ncand; k++) {
+                    id<MTLTexture> t = (__bridge id<MTLTexture>)M12.cand[k];
+                    vx_log("D3D12: MetalFX:   candidate %lux%lu format %lu, read by %d of FSR2's dispatches", (unsigned long)t.width,
+                           (unsigned long)t.height, (unsigned long)t.pixelFormat, M12.cand_n[k]);
+                }
+            }
+            int mode = M12.mode;
+            if (!colour || !out || (mode == VXU_TEMPORAL && (!depth || !motion))) {
+                M12.encoded = 0;   // (the frame's end puts FSR2 back)
+                skip = 0;
+                if (++M12.fails >= 3) { M12.mode = 0; vx_log("D3D12: MetalFX: the inputs were not found 3 times; the game's FSR2 from here on"); }
+            } else {
+                if (*be) { [*be endEncoding]; *be = nil; }
+                close_pass(d, g, cb, re);
+                if (*ce) { [*ce endEncoding]; *ce = nil; }
+                vxu_frame f = {
+                    (__bridge void *)colour, (__bridge void *)depth, (__bridge void *)motion, (__bridge void *)out,
+                    c.render[0], c.render[1], c.display[0], c.display[1],
+                    c.jitter[0] * M12.jx, c.jitter[1] * M12.jy,
+                    c.mvs[0] * (float)c.render[0] * M12.mx, c.mvs[1] * (float)c.render[1] * M12.my,
+                    c.pre_exposure, c.frame_index == 0 || M12.reset_next, M12.rev, M12.ae, M12.hdr, M12.sync
+                };
+                char why[512]; int note = 0;
+                if (vxu_encode((__bridge void *)cb, mode, &f, why, sizeof why, &note)) {
+                    vx_log("D3D12: MetalFX: %s", why);
+                    skip = 0;
+                    if (++M12.fails >= 3) { M12.mode = 0; vx_log("D3D12: MetalFX: given up after 3 failures; the game's FSR2 from here on"); }
+                } else {
+                    M12.encoded = 1; M12.reset_next = 0;
+                    if (note) vx_log("D3D12: MetalFX: %s", why);
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&M12.lock);
+    // (NPU mode race reads the motion vectors and depth from FSR2's dispatches: still told when they are left out)
+    if (skip && npu_interp_wants_scene()) npu_scene_note12(d, pso, compute, heap, acc.values, acc.count);
+    gpu_ir_access_list_release12(&acc);
+    return skip;
+}
+
 static int gpu_errors12(void) {
     static int on = -1;
     if (on < 0) on = getenv("VXRT_D3D12_GPU_ERRORS") != NULL;
@@ -11147,6 +11468,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             if (g_prof_armed12 && ce) { [ce endEncoding]; ce = nil; }   // (GPU profile: a compute encoder per dispatch)
             if (!pso || !pso->compute) { vx_log("D3D12: Dispatch without a compute pipeline state"); break; }
             if ((g_skip_count12 || g_census12) && skipped_shader12(pso->cs_code, 'c')) break;
+            if (mfx_env12() && mfx_dispatch12(d, g, pso, compute, heap, sheap, cb, &ce, &be, &re)) break;   // (FSR2: MetalFX did it)
             cb_log12('c', pso->cs_code, c->a, c->b, c->c);
             int mapping_result = d3d12_shader_component_mapping_read12(d, &pso->msl, GPU_IR_STAGE_COMPUTE,
                                                                         compute, heap, sheap);
@@ -13299,6 +13621,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     frame_stats_present12(sc->presents);
     cb_trace_poll12();
     skip_poll12();
+    mfx_poll12();
     census_present12();
     pass_dump_present12();
     watch_present12(sc->presents);
