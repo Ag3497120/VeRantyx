@@ -10758,6 +10758,7 @@ static void gs12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTLCo
     [*ce setBytes:vp length:sizeof vp atIndex:DXBC_VS_PARAMS];
     [*ce setBuffer:vs_out offset:0 atIndex:DXBC_GS_OUT];
     [*ce dispatchThreads:MTLSizeMake(count, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, vk.maxTotalThreadsPerThreadgroup), 1, 1)];
+    [*ce memoryBarrierWithScope:MTLBarrierScopeBuffers];          // (the encoder may be a concurrent one: the next kernel reads vs_out)
     // the geometry kernel: thread (x, y) is input primitive x of instance y
     [*ce setComputePipelineState:p->gs_kernel];
     stage_root(d, &p->gs, graphics, heap, sheap, sc, root, &words);
@@ -10848,6 +10849,7 @@ static void tess12_draw(dev12 *d, gfx_state *g, pso12 *p, const cmd12 *c, id<MTL
     [*ce setBytes:vp length:sizeof vp atIndex:DXBC_VS_PARAMS];
     [*ce setBuffer:vs_out offset:0 atIndex:DXBC_GS_OUT];
     [*ce dispatchThreads:MTLSizeMake(count, instances, 1) threadsPerThreadgroup:MTLSizeMake(MIN(64, vk.maxTotalThreadsPerThreadgroup), 1, 1)];
+    [*ce memoryBarrierWithScope:MTLBarrierScopeBuffers];          // (the encoder may be a concurrent one: the next kernel reads vs_out)
     // the hull kernel: thread (x, y) is patch x of instance y
     [*ce setComputePipelineState:p->hs_kernel];
     stage_root(d, &p->hs, graphics, heap, sheap, sc, root, &words);
@@ -11666,7 +11668,9 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             if (!ce || !d3d12_clear_uav_encode12(d, cb, &ce, c, heap)) {
                 vx_log("D3D12: could not execute ClearUnorderedAccessView%s", c->a ? "Float" : "Uint");
                 replay_failed = 1;
-            }
+            } else if (ce && (g_no_dispatch_barrier12 & 2))
+                // (concurrent dispatches: a clear is done before the next dispatch reads it, as drivers do without a UAV barrier)
+                [ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
             break;
         }
         case C_CLEAR_RTV: case C_CLEAR_DSV: {
