@@ -567,6 +567,13 @@ static void roots(const char *addresses) {
             if (v && exec_rva(G, v) && (!(v & 15) || (g_mark[v] & M_FUNC))) push(G->base + v, R_RVA);
         }
     }
+    if (getenv("VXRT_AOT_ROOTS")) {                                         // addresses a run fell back on (VXRT_AOT_MISSES)
+        FILE *f = fopen(getenv("VXRT_AOT_ROOTS"), "r");
+        char line[256]; uint64_t n = 0;
+        while (f && fgets(line, sizeof line, f)) { uint64_t a = strtoull(line, NULL, 16); if (exec_va(G, a)) { push(a, R_LIST); n++; } }
+        if (f) fclose(f);
+        fprintf(stderr, "vxrt-aot: %llu roots from %s\n", (unsigned long long)n, getenv("VXRT_AOT_ROOTS"));
+    }
     if (addresses) {                                                        // a list of addresses: "0001:<offset>" or hex RVAs
         FILE *f = fopen(addresses, "r");
         if (!f) die("cannot open %s", addresses);

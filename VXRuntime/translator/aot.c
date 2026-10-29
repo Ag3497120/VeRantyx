@@ -54,7 +54,7 @@ int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash) {
     return 0;
 }
 
-// The arena: 256 MB at 0xf00000000 (VXRT_AOT_ARENA=<hex>), where modules' images are made for (vxrt-aot with
+// The arena: 512 MB at 0xf00000000 (VXRT_AOT_ARENA=<hex>), where modules' images are made for (vxrt-aot with
 // VXRT_AOT_BASE: the exe relocated too), reserved at start. Below 0x1000000000 (a macOS 14 process's end) the system
 // has already placed randomized regions by main (malloc's 128 MB chunks, two 12 GB ones, the runtime's own dylibs near
 // 0x140000000 as ASLR falls); this range is free about 9 times in 10, and main starts again when it is not.
@@ -71,7 +71,7 @@ int xa_reserve(void) {
         }
     }
     mach_vm_address_t a = getenv("VXRT_AOT_ARENA") ? strtoull(getenv("VXRT_AOT_ARENA"), NULL, 16) : 0xf00000000ull;
-    mach_vm_size_t n = 0x10000000ull;
+    mach_vm_size_t n = 0x20000000ull;
     if (mach_vm_allocate(mach_task_self(), &a, n, VM_FLAGS_FIXED) == KERN_SUCCESS) { g_arena_lo = a; g_arena_hi = a + n; return 1; }
     else {
         vx_log("aot: the image arena at %#llx is taken: modules there are not used", (unsigned long long)a);
@@ -225,6 +225,10 @@ static void note_fallback(uint64_t rip) {
     while (seen[i] && seen[i] != rip && probes++ < 64) i = (i + 1) & (SEEN - 1);
     if (!seen[i]) {
         seen[i] = rip; g_fallback_rips++;
+        // VXRT_AOT_MISSES=<file>: each address once, with its image, for vxrt-aot (VXRT_AOT_ROOTS) or a module to add
+        static FILE *misses; static int opened;
+        if (!opened) { opened = 1; if (getenv("VXRT_AOT_MISSES")) misses = fopen(getenv("VXRT_AOT_MISSES"), "a"); }
+        if (misses) { const char *im = vx_image_name_at(rip); fprintf(misses, "%#llx %s\n", (unsigned long long)rip, im ? im : "-"); fflush(misses); }
         if (g_fallback_rips <= 32 || getenv("VXRT_AOT_TRACE")) {
             const xa_desc *d = module_for(rip);
             const char *img = vx_image_name_at(rip);
