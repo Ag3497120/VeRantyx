@@ -245,12 +245,38 @@ static void xa_tick(void) {                                  // (every 4M entrie
     uint64_t now = (uint64_t)ts.tv_sec;
     if (now - last >= 10) { last = now; xa_report(); }
 }
+typedef struct { uint64_t rip, p; const xa_desc *d; } xa_cached;
+enum { NCACHE = 1024 };
+static __thread xa_cached t_cache[NCACHE];
+// After a native function's thunk, as the engine's native block (xlat_block_native): the call made, RSP at its return
+// address; then RET, or on at ctx->rip when the function says so. The return-address ring steps back as RET would.
+static inline void native_return(x86_ctx *c) {
+    if (c->jump) { c->jump = 0; return; }
+    if (c->fault) return;
+    uint64_t *sp = (uint64_t *)(uintptr_t)c->gpr[4];
+    c->rip = *sp; c->gpr[4] += 8;
+    if (c->ras) c->ras = (c->ras & ~(uint64_t)((1u << XLAT_RAS_BITS) - 1)) | ((c->ras - 16) & ((1u << XLAT_RAS_BITS) - 1));
+}
 int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx *)) {
     if (g_strict < 0) g_strict = getenv("VXRT_AOT_STRICT") && atoi(getenv("VXRT_AOT_STRICT"));
     for (;;) {
         if (c->fault) return (int)c->fault;
         uint64_t rip = c->rip;
         if (rip == stop) return 0;
+        // (a thread's cache of the last addresses: a module's block, or a native function's thunk; most exits are
+        // native calls and the returns from them, and the searches below cost more than the call)
+        xa_cached *k = &t_cache[(rip ^ rip >> 12) & (NCACHE - 1)];
+        if (k->rip == rip) {
+            if (k->d) {
+                if (!(++g_entries & ((1u << 22) - 1))) xa_tick();
+                c->entry = k->p; c->link = 0; k->d->enter(c);
+                continue;
+            }
+            g_native++;
+            ((void (*)(x86_ctx *))k->p)(c);
+            native_return(c);
+            continue;
+        }
         const xa_desc *d = module_for(rip);
         if (d) {
             void (*fn)(x86_ctx *) = d->ncfns ? cfn_at(d, rip) : NULL;
@@ -260,6 +286,7 @@ int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx
                 if (!(++g_entries & ((1u << 22) - 1))) xa_tick();
                 c->entry = (uint64_t)(uintptr_t)(d->code + b->off);
                 c->link = 0;
+                k->rip = rip; k->p = c->entry; k->d = d;
                 d->enter(c);
                 continue;
             }
@@ -268,15 +295,10 @@ int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx
         if (vx_builtin_stub(rip, &to)) { g_stubs++; c->rip = to; continue; }   // (an x86 jmp [rip]: nothing else changes)
         void (*thunk)(x86_ctx *) = native ? native(rip) : NULL;
         if (thunk) {
-            // As the engine's native block (xlat_block_native): the call made, RSP at its return address; then RET,
-            // or on at ctx->rip when the function says so. The return-address ring steps back as RET would take it.
             g_native++;
+            k->rip = rip; k->p = (uint64_t)(uintptr_t)thunk; k->d = NULL;
             thunk(c);
-            if (c->jump) { c->jump = 0; continue; }
-            if (c->fault) continue;
-            uint64_t *sp = (uint64_t *)(uintptr_t)c->gpr[4];
-            c->rip = *sp; c->gpr[4] += 8;
-            if (c->ras) c->ras = (c->ras & ~(uint64_t)((1u << XLAT_RAS_BITS) - 1)) | ((c->ras - 16) & ((1u << XLAT_RAS_BITS) - 1));
+            native_return(c);
             continue;
         }
         note_fallback(rip);
