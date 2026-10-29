@@ -9148,6 +9148,7 @@ static id<MTLCounterSampleBuffer> g_prof_buf12;
 static volatile int g_prof_armed12, g_prof_next12, g_prof_frame12;
 static char *g_prof_label12[2048];
 static __thread char *t_prof_label12;
+static __thread int t_prof_frame12;      // (the profile t_prof_label12 belongs to)
 static __thread size_t t_prof_len12;
 static const char *gpu_profile_dir12(void) {
     static const char *dir = (const char *)-1;
@@ -9163,12 +9164,14 @@ static int prof_begin12(id<MTLDevice> mtl, char kind) {
     if (label) { label[0] = kind; label[1] = ':'; }
     g_prof_label12[k / 2] = label;
     t_prof_label12 = label;
+    t_prof_frame12 = g_prof_frame12;
     t_prof_len12 = label ? 2 : 0;
     (void)mtl;
     return k;
 }
 static void prof_note12(char kind, uint64_t hash) {
-    if (!g_prof_armed12 || !t_prof_label12 || t_prof_len12 > 480) return;
+    // (a label from this profile only: an earlier profile's were freed a second after it)
+    if (!g_prof_armed12 || !t_prof_label12 || t_prof_frame12 != g_prof_frame12 || t_prof_len12 > 480) return;
     t_prof_len12 += snprintf(t_prof_label12 + t_prof_len12, 512 - t_prof_len12, " %c%08llx", kind, (unsigned long long)(hash >> 32));
 }
 static id<MTLComputeCommandEncoder> new_compute12(id<MTLCommandBuffer> cb) {
@@ -9388,6 +9391,7 @@ static struct {
     void *out_keep[8]; int nout_keep;
     uint64_t replaced, ran, relearns;
     int told_inputs;
+    volatile int probe;                       // (switch word "probe": the next 400 dispatches logged with their textures and constants)
 } M12 = { .lock = PTHREAD_MUTEX_INITIALIZER, .jx = 1, .jy = 1, .mx = 1, .my = 1, .rev = 1, .ae = 1, .hdr = 1 };
 static int mfx_env12(void) {
     static int m = -1;
@@ -9431,6 +9435,7 @@ static void mfx_poll12(void) {
         else if (!strncmp(tok, "ae=", 3)) M12.ae = atoi(tok + 3);
         else if (!strncmp(tok, "hdr=", 4)) M12.hdr = atoi(tok + 4);
         else if (!strncmp(tok, "sync=", 5)) M12.sync = atoi(tok + 5);
+        else if (!strcmp(tok, "probe")) M12.probe = 400;
     }
     M12.mode = mode;
     M12.reset_next = 1;
@@ -9490,11 +9495,60 @@ static void mfx_frame_end12(void) {
                M12.c.display[0], M12.c.display[1], M12.c.jitter[0], M12.c.jitter[1], M12.c.mvs[0], M12.c.mvs[1], M12.c.pre_exposure);
     }
 }
+// (the switch word "probe") one dispatch: its textures and the first 34 words of each constant buffer, to find FSR2's
+static void mfx_probe12(dev12 *d, pso12 *pso, root_binding *rb, heap12 *heap, heap12 *sheap) {
+    char line[4096];
+    int n = snprintf(line, sizeof line, "D3D12: MetalFX probe %d: cs %016llx:", 400 - M12.probe, (unsigned long long)pso->cs_code);
+    gpu_ir_access_list12 acc = { 0 };
+    pthread_rwlock_rdlock(&d->bufs_lock);
+    int ok = gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE, rb, heap, sheap, &acc) == GPU_IR_OK;
+    pthread_rwlock_unlock(&d->bufs_lock);
+    for (uint32_t i = 0; ok && i < acc.count && n < 3000; i++) {
+        id obj = (__bridge id)gpu_ir_backend_object(acc.values[i].resource);
+        if (![obj conformsToProtocol:@protocol(MTLTexture)]) continue;
+        id<MTLTexture> t = obj;
+        n += snprintf(line + n, sizeof line - n, " %s%lux%lu/%lu@%llx", (acc.values[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE) ? "W" : "R",
+                      (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, (unsigned long long)(uintptr_t)(__bridge void *)t & 0xffffff);
+    }
+    gpu_ir_access_list_release12(&acc);
+    vx_log("%s", line);
+    rootsig12 *rs = rb ? rb->rs : NULL;
+    for (uint32_t i = 0; rs && i < rs->nparams && i < 16; i++) {
+        const param12 *pa = &rs->params[i];
+        const uint32_t *w = NULL; uint32_t nw = 0; const char *where = "";
+        uint64_t va = 0;
+        if (pa->type == 1) { w = rb->st.constants[i]; nw = pa->n32 < 34 ? pa->n32 : 34; where = "root constants"; }
+        else if (pa->type == 2) { va = rb->st.root_va[i]; where = "root CBV"; }
+        else if (pa->type == 0 && heap && heap->gpu && heap->cpu && rb->st.table[i] >= heap->gpu.gpuAddress) {
+            for (uint32_t k = 0; k < pa->nranges && !va; k++) {
+                const range12 *r = &pa->ranges[k];
+                if (r->type != 2) continue;
+                uint64_t at = (rb->st.table[i] - heap->gpu.gpuAddress) / 32 + r->offset;
+                if (at >= heap->desc.NumDescriptors) break;
+                VxDesc v; memcpy(&v, heap->cpu + 32 * at, sizeof v); va = v.va; where = "CBV table";
+            }
+        }
+        if (va) {
+            uint64_t off = 0;
+            id<MTLBuffer> b = buffer_at(d, va, &off);
+            if (!b) { vx_log("D3D12: MetalFX probe:   param %u %s %#llx: no buffer", i, where, (unsigned long long)va); continue; }
+            if (b.storageMode == MTLStorageModePrivate) { vx_log("D3D12: MetalFX probe:   param %u %s: a private buffer (%lu bytes)", i, where, (unsigned long)b.length); continue; }
+            if (off + 136 > b.length) continue;
+            w = (const uint32_t *)((const uint8_t *)b.contents + off); nw = 34;
+        }
+        if (!w) { vx_log("D3D12: MetalFX probe:   param %u type %d", i, pa->type); continue; }
+        char hex[34 * 9 + 1] = "";
+        for (uint32_t k = 0; k < nw; k++) snprintf(hex + 9 * k, 10, "%08x ", w[k]);
+        fsr_consts12 c;
+        vx_log("D3D12: MetalFX probe:   param %u %s: %s%s", i, where, hex, fsr_parse12(w, nw, &c) ? " (FSR)" : "");
+    }
+}
 // A dispatch: 1 when it is FSR2's and MetalFX does its work (the caller leaves it out)
 static int mfx_dispatch12(dev12 *d, gfx_state *g, pso12 *pso, root_binding *compute, heap12 *heap, heap12 *sheap,
                           id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> __strong *ce,
                           id<MTLBlitCommandEncoder> __strong *be, id<MTLRenderCommandEncoder> __strong *re) {
     if (!mfx_env12() || !pso || !compute) return 0;
+    if (M12.probe > 0) { M12.probe--; mfx_probe12(d, pso, compute, heap, sheap); }
     uint64_t cs = pso->cs_code;
     uint32_t slot = (uint32_t)(cs ^ (cs >> 31)) & 1023;
     int known = M12.seen[slot].cs == cs;
