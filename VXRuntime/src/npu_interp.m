@@ -1148,6 +1148,8 @@ static struct {
     int paced;
     float cap;
     double pace_next, pace_i;      // (the game thread's) the next frame's start, the frames' interval
+    double next_content;           // (the game thread's) the content time of the frame it is making now
+    double link_ts;                // the display link's time of the refresh being shown (its vsync)
     double vsync;                  // a refresh's time (the link's), to start frames on the refresh grid
     double dl, d;                  // the latency envelope (content time to ready), D
     int pend, pend_in, pend_scene; // the newest frame ready and not yet due
@@ -1730,7 +1732,9 @@ static void race_stats(double now) {
 // vectors (or the optical flow). Every refresh the window gets a frame whose content time is one refresh on: even steps,
 // whatever the GPU's time of each real frame (as long as it stays under D).
 static void race_tick_paced(double tick) {
-    double per = R.period, T = tick + per;
+    double per = R.period;
+    if (R.link_ts > tick - 2 * per && R.link_ts <= tick + 0.001) tick = R.link_ts;   // (the refresh's own time: the grid)
+    double T = tick + per;
     R.vsync = tick;
     // (D: the latency envelope and the decision's margin, rounded up to whole refreshes: content times start on the
     //  refresh grid, so a real frame comes due exactly on a refresh and is shown as it is)
@@ -1872,7 +1876,7 @@ static void race_tick(double tick, double period) {
 @end
 @implementation VXNpuTick
 - (void)tick:(CADisplayLink *)link {
-    @autoreleasepool { race_tick(now_s(), link.targetTimestamp - link.timestamp); }
+    @autoreleasepool { R.link_ts = link.timestamp; race_tick(now_s(), link.targetTimestamp - link.timestamp); }
 }
 @end
 
@@ -2010,13 +2014,15 @@ void npu_interp_frame(void *layer_, void *cb_, void *texture, uint32_t w, uint32
         if (R.paced) vx_log("NPU mode (race): the game's frames paced at %.1f a second (on the refresh grid), shown at their content time", R.cap);
         else vx_log("NPU mode (race): not paced");
     }
-    double content = race && R.paced ? race_pace() : now_s();
+    // (paced: this frame's content time is when its start was let go, at the end of the previous present)
+    double content = race && R.paced && R.next_content > 0 ? R.next_content : now_s();
     // (more frames waiting than the slots allow: this one is not shown)
     int rslot = race ? race_slot(S) : -1;
     if (race ? rslot < 0 : __atomic_load_n(&g.pending, __ATOMIC_ACQUIRE) >= 5) {
         dispatch_async(g.q, ^{ g.dropped++; });
         if (waitable) [cb addCompletedHandler:^(id<MTLCommandBuffer> done) { (void)done; vx_release_semaphore(waitable, 1); }];
         [cb commit];
+        R.next_content = race && R.paced ? race_pace() : 0;
         return;
     }
     uint32_t slot = race ? (uint32_t)rslot : g.next_slot++ % NSRC;
@@ -2058,4 +2064,6 @@ void npu_interp_frame(void *layer_, void *cb_, void *texture, uint32_t w, uint32
         dispatch_async(g.q, ^{ if (race) handle_race(S, slot, has_yuv, has_scene, t); else handle(S, slot, has_yuv, t); });
     }];
     [cb commit];
+    // (paced: the game's next frame starts on the refresh grid; this present's work is committed first)
+    R.next_content = race && R.paced ? race_pace() : 0;
 }
