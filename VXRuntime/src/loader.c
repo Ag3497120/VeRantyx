@@ -212,6 +212,24 @@ static void *builtin_handle(const char *name) {
     pthread_mutex_unlock(&lock);
     return h;
 }
+#ifdef __aarch64__
+// A built-in module's export stub at rip (jmp qword [rip+0]): its target (the function's thunk), for the recompiled
+// code's runner, which follows it rather than having the engine translate it (translator/aot.c: no JIT on visionOS)
+static uint32_t rd32(const uint8_t *p);
+static uint64_t rd64(const uint8_t *p);
+int vx_builtin_stub(uint64_t rip, uint64_t *target) {
+    int n = __atomic_load_n(&g_builtin_count, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        const uint8_t *img = g_builtins[i].image;
+        if (!img || rip < (uint64_t)(uintptr_t)img || rip - (uint64_t)(uintptr_t)img >= rd32(img + 0x40 + 24 + 56)) continue;
+        const uint8_t *p = (const uint8_t *)(uintptr_t)rip;
+        if (rip + 14 > (uint64_t)(uintptr_t)img + rd32(img + 0x40 + 24 + 56) || p[0] != 0xff || p[1] != 0x25) return 0;
+        *target = rd64(p + 6 + (int32_t)rd32(p + 2));
+        return 1;
+    }
+    return 0;
+}
+#endif
 // The DLL name of a built-in module's handle, NULL for anything else.
 static const char *builtin_name(const void *h) {
     int n = __atomic_load_n(&g_builtin_count, __ATOMIC_ACQUIRE);

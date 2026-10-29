@@ -20,7 +20,8 @@ void vx_log(const char *fmt, ...);
 enum { MAX_MODULES = 64 };
 static const xa_desc *g_mod[MAX_MODULES];
 static int g_nmod;
-static uint64_t g_fallback, g_fallback_rips, g_native, g_entries, g_cfn_calls;
+static uint64_t g_fallback, g_fallback_rips, g_native, g_entries, g_cfn_calls, g_stubs;
+int vx_builtin_stub(uint64_t rip, uint64_t *target);   // (src/loader.c)
 static int g_strict = -1;
 int xa_any(void) { return g_nmod > 0; }
 
@@ -190,6 +191,8 @@ int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx
                 continue;
             }
         }
+        uint64_t to;
+        if (vx_builtin_stub(rip, &to)) { g_stubs++; c->rip = to; continue; }   // (an x86 jmp [rip]: nothing else changes)
         void (*thunk)(x86_ctx *) = native ? native(rip) : NULL;
         if (thunk) {
             // As the engine's native block (xlat_block_native): the call made, RSP at its return address; then RET,
@@ -216,8 +219,8 @@ int xa_run(xe *e, x86_ctx *c, uint64_t stop, void (*(*native)(uint64_t))(x86_ctx
 
 void xa_report(void) {
     if (!g_nmod) return;
-    vx_log("aot: %llu entries into recompiled code, %llu C function calls, %llu native calls, %llu fallbacks to the translator (%llu addresses)",
-           (unsigned long long)g_entries, (unsigned long long)g_cfn_calls, (unsigned long long)g_native, (unsigned long long)g_fallback,
+    vx_log("aot: %llu entries into recompiled code, %llu C function calls, %llu native calls, %llu built-in export stubs followed, %llu fallbacks to the translator (%llu addresses)",
+           (unsigned long long)g_entries, (unsigned long long)g_cfn_calls, (unsigned long long)g_native, (unsigned long long)g_stubs, (unsigned long long)g_fallback,
            (unsigned long long)g_fallback_rips);
 }
 #endif
