@@ -52,7 +52,7 @@ def main():
     source = args.installation.resolve()
     run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-alyx-native-'+args.map
     run = REPO/'runs'/run_id
-    run.mkdir()
+    run.mkdir(parents=True)
     result = dict(run_id=run_id, backend='nativeARM64', scenario=args.map, observed=[], unknown=[
         'headset picture, audio, physical controls and playability',
         'exact frame-to-frame GPU timing: shared frame publication is sampled',
