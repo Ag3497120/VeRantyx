@@ -252,7 +252,7 @@ static const char *g_npu_msl =
     // from B's pixel to where it was in A); w = 1 + depth (the splat's order); the still and overlay tests as above
     "kernel void npu_race_mm_mv(texture2d<float> b [[texture(0)]], texture2d<float> a [[texture(1)]], texture2d<float> mv [[texture(2)]],\n"
     "                           texture2d<float> dp [[texture(3)]], texture2d<float, access::write> o [[texture(4)]],\n"
-    "                           constant R &e [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
+    "                           constant R &e [[buffer(0)]], device atomic_uint *mx [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {\n"
     "    if (g.x >= e.kw || g.y >= e.kh) return;\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
     "    constexpr sampler sn(filter::nearest, address::clamp_to_edge);\n"
@@ -277,6 +277,7 @@ static const char *g_npu_msl =
     "        }\n"
     "        if (e0 < 0.5 * e1 && e1 > 0.45) { o.write(float4(m, 0.7, 1 + d), g); return; }\n"
     "    }\n"
+    "    atomic_fetch_max_explicit(mx, uint(min(length(m), 4096.0) * 16), memory_order_relaxed);\n"   // (how far the scene moves)
     "    o.write(float4(m, 0, 1 + d), g);\n"
     "}\n"
     // the depth as R32Float, from a depth texture or a one-channel float one
@@ -360,7 +361,9 @@ static const char *g_npu_msl =
     // the game's motion vectors and depth (R32Float) with each frame, when the D3D12 front end found them
     id<MTLTexture> smv[NSRC], sdp[NSRC];
     uint8_t scene[NSRC];
-    id<MTLBuffer> rkeys;
+    uint32_t sconst[NSRC][32];     // (and FSR2's constants with them: the projection; shas_const[slot] when found)
+    uint8_t shas_const[NSRC];
+    id<MTLBuffer> rkeys, mvmax;    // (mvmax: the largest motion of B's moving blocks, frame pixels x 16)
     npu_race_params RP;
     uint32_t ex_prev, ex_dst;
     IOSurfaceRef surfaces[2 * NSRC * MAXT];
@@ -401,7 +404,9 @@ static struct {
     uint32_t seq, next_dst;
     int busy;                      // a request that missed its time is still running
     volatile int race_flow;        // race's flow queue is using the helper
-    volatile int race_noflow, race_nowarp;
+    volatile int race_noflow, race_nowarp, race_nomv;
+    volatile int switch_on;        // (the switch file's state: the D3D12 front end looks for nothing while off)
+    volatile float race_real_cap;  // (race: real frames shown at most this often, the rest only counted: a slow game simulated)
     // statistics (every 5 s)
     double stat_t0;
     uint32_t frames, real, interp, missed, skipped, dropped, failed;
@@ -425,7 +430,7 @@ static int switched_on(void) {
     static double next;
     static int on = 1;
     if (!path && !(path = getenv("VXRT_NPU_INTERP_SWITCH"))) path = "";
-    if (!*path) return 1;
+    if (!*path) { g.switch_on = 1; return 1; }
     double t = CACurrentMediaTime();
     if (t >= next) {
         next = t + 0.5;
@@ -441,10 +446,13 @@ static int switched_on(void) {
                     // ("race 60": predictions' rate; "noflow", "nowarp": no optical flow / no predictions shown, to
                     //  measure what each costs)
                     char opt[32];
-                    g.race_noflow = g.race_nowarp = 0;
+                    g.race_noflow = g.race_nowarp = g.race_nomv = 0;
+                    g.race_real_cap = 0;
                     while (fscanf(f, "%31s", opt) == 1) {
                         if (!strcmp(opt, "noflow")) g.race_noflow = 1;
                         else if (!strcmp(opt, "nowarp")) g.race_nowarp = 1;
+                        else if (!strcmp(opt, "nomv")) g.race_nomv = 1;  // (the optical flow even where the game's vectors are)
+                        else if (!strncmp(opt, "real", 4)) g.race_real_cap = (float)atof(opt + 4);   // ("real15": low fps simulated)
                         else if (atof(opt) != race_hz(-1)) race_hz((float)atof(opt));
                     }
                 }
@@ -455,6 +463,7 @@ static int switched_on(void) {
         if (now != on || mode != g.mode || race != g.race)
             vx_log("NPU mode: %s (%s)", now ? (race ? "race" : mode == NPU_MODE_FLOW ? "extrapolate" : "interpolate") : "switched off", path);
         on = now;
+        g.switch_on = now;
         g.mode = mode;
         g.race = race;
         if (!on || !race) race_stop();
@@ -574,6 +583,7 @@ static void flow_textures(VXNpuSet *S, const npu_init_reply *r) {
     S->mm = [g.dev newTextureWithDescriptor:md];
     S->rm = [g.dev newTextureWithDescriptor:md];
     S->rkeys = [g.dev newBufferWithLength:(NSUInteger)kw * kh * 4 options:MTLResourceStorageModePrivate];
+    S->mvmax = [g.dev newBufferWithLength:4 options:MTLResourceStorageModeShared];
     if (!S->mm || !S->rm || !S->rkeys) { vx_log("NPU mode: no buffers for race"); return; }
     const char *fb = getenv("VXRT_NPU_RACE_FB");
     S->RP = (npu_race_params){ (float)S->w, (float)S->h, S->E.sx, S->E.sy, 0, 2.0f / 255, fb ? (float)atof(fb) : 3.0f, 0.25f, kbits, kw, kh, 0, 0, 0,
@@ -1016,7 +1026,8 @@ static struct {
     int last; double last_t;       // the newest frame handled (slot, when it was ready)
     int a, b; double tb;           // the frame shown last (B), its predecessor (A), when B was presented
     uint32_t b_seq;                // counts the B's shown
-    double interval, period;       // between real frames (ready times), between refreshes
+    double interval, period;       // between real frames shown (ready times), between refreshes
+    double ginterval, glast_t;     // between the game's frames (all, shown or not: the game's motion vectors' interval)
     double shown_at, shown_t;      // when the last frame (real or not) was presented, and how far on from B
     int want_a, want_b, run_a, run_b, flow_busy;   // the flow's pairs (waiting, running)
     int flow_dst, flow_b; uint32_t flow_seq;       // the newest flow done: its dst slot, its pair's B, a count
@@ -1027,9 +1038,10 @@ static struct {
     uint32_t votes[9], moving;
     uint32_t mvgen;
     float flow_px;                                 // its motion, frame pixels an interval (98th percentile)
+    float mv_px;                                   // the game's vectors' largest motion (of the last motion map made)
     uint32_t mm_b_seq, mm_flow_seq;                // what the motion map was made from
     // statistics (every 5 s, the tick's thread; frames, superseded: the handlers')
-    uint32_t frames, real, gen, still, held, evened, stale, nflow, ngpu, nlat, nt, npres;
+    uint32_t frames, real, gen, still, held, evened, stale, nflow, ngpu, nlat, nt, npres, capped;
     double even;                   // no prediction this many refreshes before a real frame is due
     float flow_ms[512], gpu_ms[512], lat[512], ts[512];
     double pres[1024];
@@ -1059,20 +1071,53 @@ static void race_reset(VXNpuSet *S) {                              // (R.lock he
 
 // The scene's motion vectors and depth from the D3D12 front end (the upscaler's inputs; the last dispatch of a frame
 // that read both): taken with the frame at its present, copied into the slot's textures (depth as R32Float).
-static struct { os_unfair_lock lock; __strong id<MTLTexture> mv, dp; uint64_t cs; int off, told; } SC = { .lock = OS_UNFAIR_LOCK_INIT };
+static struct { os_unfair_lock lock; __strong id<MTLTexture> mv, dp; uint64_t cs; int off, told, ctold; uint32_t consts[32]; int has_consts; } SC = { .lock = OS_UNFAIR_LOCK_INIT };
 
 int npu_interp_wants_scene(void) {
     static int off = -1;                                           // (VXRT_NPU_RACE_MV=0: the optical flow only)
     if (off < 0) SC.off = off = getenv("VXRT_NPU_RACE_MV") && !atoi(getenv("VXRT_NPU_RACE_MV"));
-    return g.state > 0 && g.race && !off;
+    return g.state > 0 && g.race && !off && !g.race_nomv && g.switch_on;
 }
 
-void npu_interp_scene(void *mv_, void *dp_, uint64_t cs) {
+// FSR2's constants, as FSR 2.1/2.2 lay them out (ffx_fsr2 cbFSR2: render size, max render size, display size, input
+// colour size, luma mip size, mip level, frame index, device-to-view depth x4, jitter, motion vector scale, downscale,
+// jitter cancellation, pre-exposure x2, tan(half the vertical FOV), ...) and as FSR 2.0 did (render size, display size,
+// input colour size, luma mip size, mip level, frame index, 1/display size, jitter, device-to-view depth x4, ...);
+// the one whose tan(FOV/2) is plausible
+static int fsr2_parse(const uint32_t *w, float *tan_half_fov_y, float d2v[4], float mvs[2], uint32_t disp[2]) {
+    const float *f = (const float *)w;
+    static const struct { int d2v, mvs, tan, disp; } L[2] = { { 12, 18, 26, 4 }, { 14, 24, 29, 2 } };
+    for (int k = 0; k < 2; k++) {
+        float t = f[L[k].tan];
+        if (!(t > 0.05f && t < 5.0f) || !isfinite(f[L[k].d2v]) || !isfinite(f[L[k].d2v + 1]) || !(f[L[k].d2v + 2] > 0.01f) || !(f[L[k].d2v + 3] > 0.01f)) continue;
+        *tan_half_fov_y = t;
+        memcpy(d2v, f + L[k].d2v, 16);
+        mvs[0] = f[L[k].mvs]; mvs[1] = f[L[k].mvs + 1];
+        disp[0] = w[L[k].disp]; disp[1] = w[L[k].disp + 1];
+        return k + 1;
+    }
+    return 0;
+}
+
+void npu_interp_scene(void *mv_, void *dp_, uint64_t cs, const uint32_t *consts) {
     id<MTLTexture> mv = (__bridge id<MTLTexture>)mv_, dp = (__bridge id<MTLTexture>)dp_;
     os_unfair_lock_lock(&SC.lock);
     SC.mv = mv; SC.dp = dp; SC.cs = cs;
-    int tell = !SC.told++;
+    SC.has_consts = consts != NULL;
+    if (consts) memcpy(SC.consts, consts, sizeof SC.consts);
+    int tell = !SC.told++, ctell = consts && !SC.ctold++;
     os_unfair_lock_unlock(&SC.lock);
+    if (ctell) {
+        char hex[32 * 9 + 1] = "";
+        for (int k = 0; k < 32; k++) snprintf(hex + 9 * k, 10, "%08x ", consts[k]);
+        float th, d2v[4], mvs[2]; uint32_t disp[2];
+        int lay = fsr2_parse(consts, &th, d2v, mvs, disp);
+        vx_log("NPU mode (race): FSR2's constants with them: %s", hex);
+        if (lay) vx_log("NPU mode (race): read as FSR %s: display %ux%u, tan(vertical FOV/2) %.4f (%.1f degrees), device-to-view "
+                        "depth %g %g %g %g, motion vector scale %g %g", lay == 1 ? "2.1/2.2" : "2.0", disp[0], disp[1], th,
+                        2 * atanf(th) * 57.29578f, d2v[0], d2v[1], d2v[2], d2v[3], mvs[0], mvs[1]);
+        else vx_log("NPU mode (race): those constants are not laid out as FSR 2.0-2.2's (no plausible field of view)");
+    } else if (!consts && !SC.ctold && tell) vx_log("NPU mode (race): no FSR2 constants found with them (root constants, root CBVs, CBV tables)");
     if (tell)
         vx_log("NPU mode (race): the scene's motion vectors (%lux%lu, format %lu) and depth (%lux%lu, format %lu) from the "
                "dispatch of cs %016llx", (unsigned long)mv.width, (unsigned long)mv.height, (unsigned long)mv.pixelFormat,
@@ -1084,6 +1129,8 @@ static int scene_capture(id<MTLCommandBuffer> cb, VXNpuSet *S, uint32_t slot) {
     os_unfair_lock_lock(&SC.lock);
     id<MTLTexture> mv = SC.mv, dp = SC.dp;
     SC.mv = SC.dp = nil;
+    S->shas_const[slot] = (uint8_t)SC.has_consts;
+    memcpy(S->sconst[slot], SC.consts, sizeof SC.consts);
     os_unfair_lock_unlock(&SC.lock);
     S->scene[slot] = 0;
     if (!mv || !dp) return 0;
@@ -1245,6 +1292,11 @@ static int race_present(int kind, VXNpuSet *S, int slot, int a, uint32_t d, int 
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
         if (kind == KIND_RACE) {
             if (new_mm) {                                          // (once per flow, or per B with the game's vectors)
+                if (mv) {
+                    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+                    [blit fillBuffer:S->mvmax range:NSMakeRange(0, 4) value:0];
+                    [blit endEncoding];
+                }
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
                 [enc setComputePipelineState:mv ? g.mm_mv_ps : g.mm_ps];
                 [enc setTexture:S->copy[slot] atIndex:0];
@@ -1253,6 +1305,7 @@ static int race_present(int kind, VXNpuSet *S, int slot, int a, uint32_t d, int 
                 [enc setTexture:mv ? S->sdp[slot] : S->ffwd[d] atIndex:3];
                 [enc setTexture:S->mm atIndex:4];
                 [enc setBytes:&S->RP length:sizeof S->RP atIndex:0];
+                if (mv) [enc setBuffer:S->mvmax offset:0 atIndex:1];
                 [enc dispatchThreads:MTLSizeMake(S->RP.kw, S->RP.kh, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
                 [enc endEncoding];
             }
@@ -1288,6 +1341,18 @@ static void handle_race(VXNpuSet *S, uint32_t slot, int has_in, int has_scene, d
     if (R.set != S) race_reset(S);
     R.inflight &= ~bit((int)slot);
     R.frames++;
+    double gdt = t - R.glast_t;
+    if (gdt > 0.002 && gdt < 0.25) R.ginterval = R.ginterval ? R.ginterval * 0.8 + gdt * 0.2 : gdt;
+    R.glast_t = t;
+    // (a slow game simulated, "real15" in the switch file: a frame sooner than that after the last one shown is
+    //  counted and not shown)
+    float cap = g.race_real_cap;
+    if (cap > 0 && R.last >= 0 && t - R.last_t < 1.0 / cap - 0.003 && t - R.last_t > 0) {
+        R.capped++;
+        os_unfair_lock_unlock(&R.lock);
+        pthread_mutex_unlock(&R.present);
+        return;
+    }
     int prev = R.last;
     double dt = t - R.last_t;
     if (prev >= 0 && dt > 0.002 && dt < 0.25) R.interval = R.interval ? R.interval * 0.8 + dt * 0.2 : dt;
@@ -1350,15 +1415,16 @@ static void race_stats(double now) {
                "predict from), %u (a real frame due: even steps); %.1f Hz refresh; steps on screen in refreshes 1:%u 2:%u 3:%u 4:%u 5:%u 6+:%u (%u steps); optical "
                "flow %.1f ms median (%u), motion %.1f px an interval, %u%% of the predicted frames on the previous pair's flow; "
                "prediction on the GPU %.2f ms median, %.2f ms p95 (%.1f%% of the GPU's time), t %.2f median; real frames on "
-               "screen %.1f ms after they were ready (median, %.1f ms p95); %u predicted from the game's motion vectors%s",
+               "screen %.1f ms after they were ready (median, %.1f ms p95); %u predicted from the game's motion vectors%s; "
+               "%u real frames not shown (shown at most %.0f a second)",
                frames / dt, shown / dt, R.real, R.gen, R.real + R.gen ? 100.0 * R.gen / (R.real + R.gen) : 0, gone, R.still,
                R.held, R.evened, 1 / R.period, hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], shown ? shown - 1 : 0,
                pct(fl, nfl, 0.5f), nfl, R.flow_px, R.gen ? 100 * R.stale / R.gen : 0, gpu, pct(R.gpu_ms, ngpu, 0.95f),
                100.0 * gpu * R.gen / 1000 / dt, pct(R.ts, R.nt, 0.5f), pct(R.lat, nlat, 0.5f), pct(R.lat, nlat, 0.95f), R.mvgen,
-               R.mv_ok ? "" : R.scene ? " (their unit not known yet)" : " (none seen)");
+               R.mv_ok ? "" : R.scene ? " (their unit not known yet)" : " (none seen)", R.capped, g.race_real_cap);
     }
     R.stat_t0 = now;
-    R.real = R.gen = R.still = R.held = R.evened = R.stale = R.nt = R.mvgen = 0;
+    R.real = R.gen = R.still = R.held = R.evened = R.stale = R.nt = R.mvgen = R.capped = 0;
     __atomic_store_n(&R.ngpu, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&R.nlat, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&R.npres, 0, __ATOMIC_RELEASE);
@@ -1385,16 +1451,20 @@ static void race_tick(double tick, double period) {
         VXNpuSet *S = R.set;
         // (the game's motion vectors for B: always B's own; else the optical flow, a few frames old at most: one every
         //  3rd frame, taking 2)
-        int mv = S && R.mv_ok && R.b >= 0 && (R.scene & bit(R.b)) && !SC.off;
+        int mv = S && R.mv_ok && R.b >= 0 && (R.scene & bit(R.b)) && !SC.off && !g.race_nomv;
         int ok = S && S->mm && R.b >= 0 && R.a >= 0 && R.interval > 0 && (mv || (R.flow_seq && R.b_seq - R.flow_bseq <= 6));
         // how far on: B was presented at tb (and will be on screen as long after it as this one)
         double t = ok ? (now - R.tb) / R.interval : 0;
+        // (the game's vectors are a game frame's motion: with frames not shown, B is several of those old)
+        double tm = mv && R.ginterval > 0 ? (now - R.tb) / R.ginterval : t;
         // (even steps: no prediction VXRT_NPU_RACE_EVEN (1.5) refreshes before the next real frame is due; it would leave a
         //  1-refresh step)
         double due = R.last_t + R.interval - now;
+        // (the game's vectors: B's motion map not made yet counts as moving; else its largest motion)
+        if (mv) R.mv_px = R.mm_b_seq != R.b_seq || R.mm_mv != 1 || !S->mvmax ? 1e9f : *(volatile uint32_t *)S->mvmax.contents / 16.0f;
         if (!ok || t <= 0 || t > R.max_t + 1e-3 || g.race_nowarp) { R.held++; os_unfair_lock_unlock(&R.lock); }
         else if (due > 0 && due < R.even * R.period) { R.evened++; os_unfair_lock_unlock(&R.lock); }
-        else if ((t - R.shown_t) * R.flow_px < R.min_px) { R.still++; os_unfair_lock_unlock(&R.lock); }
+        else if ((t - R.shown_t) * (mv ? R.mv_px : R.flow_px) < R.min_px) { R.still++; os_unfair_lock_unlock(&R.lock); }
         else {
             int slot = R.b, a = R.a, fresh = mv || R.flow_bseq == R.b_seq;
             uint32_t d = (uint32_t)R.flow_dst;
@@ -1404,7 +1474,7 @@ static void race_tick(double tick, double period) {
             R.mm_b_seq = R.b_seq; R.mm_flow_seq = R.flow_seq; R.mm_mv = mv;
             if (mv) R.mvgen++;
             os_unfair_lock_unlock(&R.lock);
-            S->RP.t = (float)t;
+            S->RP.t = (float)tm;
             S->RP.mvmode = (uint32_t)mv;
             if (race_present(KIND_RACE, S, slot, a, d, new_mm, mv, 0)) {
                 R.shown_at = now; R.shown_t = t;
@@ -1543,7 +1613,7 @@ void npu_interp_frame(void *layer_, void *cb_, void *texture, uint32_t w, uint32
                 toTexture:S->copy[slot] destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
     [blit endEncoding];
     int has_yuv = __atomic_load_n(&S->ready, __ATOMIC_ACQUIRE);
-    int has_scene = race && has_yuv ? scene_capture(cb, S, slot) : 0;
+    int has_scene = race && has_yuv && !g.race_nomv ? scene_capture(cb, S, slot) : 0;
     if (has_scene && R.mv_ok) has_yuv = 0;                         // (the game's motion vectors: no flow, no flow input)
     if (has_yuv && S->mode == NPU_MODE_FLOW) {                      // (the flow's input)
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];

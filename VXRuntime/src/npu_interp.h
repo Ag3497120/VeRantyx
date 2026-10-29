@@ -14,4 +14,5 @@ void npu_interp_frame(void *layer, void *command_buffer, void *texture, uint32_t
 // VXRT_NPU_INTERP=race: 1 while the scene's motion vectors and depth are wanted (the D3D12 front end then passes those of
 // the dispatch that reads both, its upscaler's, with npu_interp_scene: MTLTextures, each frame)
 int npu_interp_wants_scene(void);
-void npu_interp_scene(void *motion_vectors, void *depth, uint64_t shader);
+// consts: the dispatch's FSR2 constants (32 words: render size, max render size, display size, ...), or NULL
+void npu_interp_scene(void *motion_vectors, void *depth, uint64_t shader, const uint32_t *consts);

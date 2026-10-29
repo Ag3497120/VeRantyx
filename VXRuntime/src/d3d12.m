@@ -9073,8 +9073,54 @@ static void stereo_closed12(id<MTLCommandBuffer> cb) {
 }
 
 // (VXRT_NPU_INTERP=race: the scene's motion vectors and depth, as the game's upscaler (FSR2) reads them: a dispatch
-//  reading a two-channel float texture and a depth texture of the same size; npu_interp.m copies them at the present)
-static void npu_scene_note12(const pso12 *p, const gpu_ir_resource_access *a, uint32_t n) {
+//  reading a two-channel float texture and a depth texture of the same size; npu_interp.m copies them at the present.
+//  With them, the dispatch's constants when one of its constant buffers starts as FSR2's does: the render size (the
+//  motion vectors' size), then a size at least as large; FSR2 keeps the camera's field of view, its depth-to-distance
+//  factors and the motion vectors' scale there - the projection the warp needs, without guessing it.)
+static int npu_fsr2_consts12(const uint32_t *w, uint32_t mw, uint32_t mh) {
+    if (w[0] != mw || w[1] != mh) return 0;
+    for (int k = 2; k <= 4; k += 2)
+        if (w[k] < mw || w[k + 1] < mh || w[k] > 16384 || w[k + 1] > 16384) return 0;
+    return 1;
+}
+static int npu_scene_consts12(dev12 *d, root_binding *rb, heap12 *heap, uint32_t mw, uint32_t mh, uint32_t out[32]) {
+    rootsig12 *rs = rb ? rb->rs : NULL;
+    if (!rs) return 0;
+    for (uint32_t i = 0; i < rs->nparams && i < 64; i++) {
+        const param12 *pa = &rs->params[i];
+        if (pa->type == 1) {                                       // (root constants)
+            if (pa->n32 >= 8 && npu_fsr2_consts12(rb->st.constants[i], mw, mh)) {
+                memset(out, 0, 128);
+                memcpy(out, rb->st.constants[i], 4 * (pa->n32 < 32 ? pa->n32 : 32));
+                return 1;
+            }
+            continue;
+        }
+        uint64_t va[8]; int nva = 0;
+        if (pa->type == 2) va[nva++] = rb->st.root_va[i];
+        else if (pa->type == 0 && heap && heap->gpu && heap->cpu && rb->st.table[i] >= heap->gpu.gpuAddress)
+            for (uint32_t k = 0; k < pa->nranges && nva < 8; k++) {
+                const range12 *r = &pa->ranges[k];
+                if (r->type != 2) continue;                        // (CBV ranges)
+                for (uint32_t j = 0; j < (r->count == UINT32_MAX ? 1 : r->count) && nva < 8; j++) {
+                    uint64_t at = (rb->st.table[i] - heap->gpu.gpuAddress) / 32 + r->offset + j;
+                    if (at >= heap->desc.NumDescriptors) break;
+                    VxDesc v;
+                    memcpy(&v, heap->cpu + 32 * at, sizeof v);
+                    va[nva++] = v.va;
+                }
+            }
+        for (int k = 0; k < nva; k++) {
+            uint64_t off = 0;
+            id<MTLBuffer> b = va[k] ? buffer_at(d, va[k], &off) : nil;
+            if (!b || b.storageMode == MTLStorageModePrivate || off + 128 > b.length) continue;
+            const uint32_t *c = (const uint32_t *)((const uint8_t *)b.contents + off);
+            if (npu_fsr2_consts12(c, mw, mh)) { memcpy(out, c, 128); return 1; }
+        }
+    }
+    return 0;
+}
+static void npu_scene_note12(dev12 *d, const pso12 *p, root_binding *rb, heap12 *heap, const gpu_ir_resource_access *a, uint32_t n) {
     id<MTLTexture> mv = nil, dp = nil;
     for (uint32_t i = 0; i < n; i++) {
         if (!(a[i].access_mask & GPU_IR_ACCESS_SHADER_READ) || (a[i].access_mask & GPU_IR_ACCESS_SHADER_WRITE)) continue;
@@ -9086,8 +9132,11 @@ static void npu_scene_note12(const pso12 *p, const gpu_ir_resource_access *a, ui
         if (f == MTLPixelFormatRG16Float || f == MTLPixelFormatRG16Snorm || f == MTLPixelFormatRG32Float) { if (!mv) mv = t; }
         else if (f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatR32Float) { if (!dp) dp = t; }
     }
-    if (mv && dp && mv.width == dp.width && mv.height == dp.height)
-        npu_interp_scene((__bridge void *)mv, (__bridge void *)dp, p ? p->cs_code : 0);
+    if (mv && dp && mv.width == dp.width && mv.height == dp.height) {
+        uint32_t consts[32];
+        int have = npu_scene_consts12(d, rb, heap, (uint32_t)mv.width, (uint32_t)mv.height, consts);
+        npu_interp_scene((__bridge void *)mv, (__bridge void *)dp, p ? p->cs_code : 0, have ? consts : NULL);
+    }
 }
 
 // ---- VXRT_D3D12_GPU_PROFILE=<folder>: one frame's encoders timed on the GPU ---------------------------------------
@@ -11138,7 +11187,7 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
                     else rc = d3d12_gpu_ir_dispatch(&context, pso->gpu_pipeline, c->a, c->b, c->c, NULL, 0);
                 }
                 if (g_dump_armed12) pass_dump_dispatch12(cb, ce, pso, accesses.values, accesses.count, c->a, c->b, c->c);
-                if (npu_interp_wants_scene()) npu_scene_note12(pso, accesses.values, accesses.count);
+                if (npu_interp_wants_scene()) npu_scene_note12(d, pso, compute, heap, accesses.values, accesses.count);
                 if (trace_cs12(pso->cs_code)) trace_cs_accesses12(pso->cs_code, c->a, c->b, c->c, accesses.values, accesses.count);
                 if (trace_len12())                                 // (VXRT_D3D12_TRACE_LEN: who writes buffers that long)
                     for (uint32_t k = 0; k < accesses.count; k++) {
@@ -11176,13 +11225,15 @@ static int replay(dev12 *d, id<MTLCommandQueue> queue, int32_t queue_type, list1
             if (trace_len12() || trace_cs12(pso->cs_code) || npu_interp_wants_scene()) {
                 gpu_ir_access_list12 acc = { 0 };
                 pthread_rwlock_rdlock(&d->bufs_lock);   // (collection looks buffers up by address: their registry's lock)
-                if (gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE, compute, heap, sheap, &acc) == GPU_IR_OK)
+                int acc_ok = gpu_ir_collect_shader_accesses12(d, &pso->msl, GPU_IR_STAGE_COMPUTE, compute, heap, sheap, &acc) == GPU_IR_OK;
+                if (acc_ok)
                 {
-                    if (npu_interp_wants_scene()) npu_scene_note12(pso, acc.values, acc.count);
                     if (trace_len12()) trace_writer12("direct dispatch of cs", pso->cs_code, acc.values, acc.count);
                     if (trace_cs12(pso->cs_code)) trace_cs_accesses12(pso->cs_code, c->a, c->b, c->c, acc.values, acc.count);
                 }
                 pthread_rwlock_unlock(&d->bufs_lock);
+                // (after the registry's lock: its constant buffers are looked up under the device's)
+                if (acc_ok && npu_interp_wants_scene()) npu_scene_note12(d, pso, compute, heap, acc.values, acc.count);
                 gpu_ir_access_list_release12(&acc);
             }
             // (the next dispatch sees this one's writes, as D3D12's UAV barriers promise; resources reached through
