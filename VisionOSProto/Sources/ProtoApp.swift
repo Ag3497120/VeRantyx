@@ -17,11 +17,18 @@ final class ProtoModel {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         logURL = docs.appendingPathComponent("proto_log.jsonl")
         box.value = settings
+        let d = UserDefaults.standard
         if let device = MTLCreateSystemDefaultDevice() {
             capabilities = CapabilityProbe.report(device: device)
+            if d.object(forKey: "preflight") == nil || d.bool(forKey: "preflight") {
+                capabilities += PreflightProbe.report(device: device)
+            }
         }
         for line in capabilities { append(["event": "capability", "text": line]) }
         append(["event": "launch", "settings": "\(settings)"])
+        if d.bool(forKey: "memfill"), let device = MTLCreateSystemDefaultDevice() {
+            PreflightProbe.memoryFill(device: device) { self.append(["event": "memfill", "text": $0]) }
+        }
     }
 
     func record(_ text: String) {

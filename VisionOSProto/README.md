@@ -27,4 +27,11 @@ Modes:
 - `repeat`: `LayerRenderer.minimumFrameRepeatCount`. visionOS shows each frame n+1 times and reprojects each repeat.
 - `hold`: the game renders offscreen at exactly the set rate. A 90 Hz present pass copies the newest frame with its depth and pose. This is the planned product architecture.
 
+At launch the app also runs `PreflightProbe` (`-preflight NO` skips it): fixed reservations at the AOT modules'
+arena (0xf00000000) and the exe's base, posix_spawn, the Metal features the D3D12 layer uses (BC, residency sets,
+MTL4 queue, placement-sparse heaps, D32S8), and a runtime `makeLibrary(source:)`. `-memfill YES` then fills shared
+Metal buffers in 256 MB steps until `os_proc_available_memory` is under 768 MB, logging each step (`memfill` events):
+how Metal memory counts against the app's limit. Launch with arguments after `--`:
+`xcrun devicectl device process launch --device $D marimokodai.VisionOSProto -- -memfill YES`.
+
 See DESIGN.md for the SDK findings and the hosting and data-layout design.
