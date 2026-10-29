@@ -9077,11 +9077,11 @@ static void stereo_closed12(id<MTLCommandBuffer> cb) {
 //  With them, the dispatch's constants when one of its constant buffers starts as FSR2's does: the render size (the
 //  motion vectors' size), then a size at least as large; FSR2 keeps the camera's field of view, its depth-to-distance
 //  factors and the motion vectors' scale there - the projection the warp needs, without guessing it.)
+// (render size, then max render size or display size, at least as large; FSR 2.0's layout (Cyberpunk 2077's) has the
+//  luma mip's size next, smaller - so only the second pair is checked)
 static int npu_fsr2_consts12(const uint32_t *w, uint32_t mw, uint32_t mh) {
     if (w[0] != mw || w[1] != mh) return 0;
-    for (int k = 2; k <= 4; k += 2)
-        if (w[k] < mw || w[k + 1] < mh || w[k] > 16384 || w[k + 1] > 16384) return 0;
-    return 1;
+    return w[2] >= mw && w[3] >= mh && w[2] <= 16384 && w[3] <= 16384;
 }
 static int npu_scene_consts12(dev12 *d, root_binding *rb, heap12 *heap, uint32_t mw, uint32_t mh, uint32_t out[32]) {
     rootsig12 *rs = rb ? rb->rs : NULL;

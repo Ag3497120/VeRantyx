@@ -1215,22 +1215,35 @@ int npu_interp_wants_scene(void) {
     return g.state > 0 && g.race && !off && !g.race_nomv && g.switch_on;
 }
 
-// FSR2's constants, as FSR 2.1/2.2 lay them out (ffx_fsr2 cbFSR2: render size, max render size, display size, input
-// colour size, luma mip size, mip level, frame index, device-to-view depth x4, jitter, motion vector scale, downscale,
-// jitter cancellation, pre-exposure x2, tan(half the vertical FOV), ...) and as FSR 2.0 did (render size, display size,
-// input colour size, luma mip size, mip level, frame index, 1/display size, jitter, device-to-view depth x4, ...);
-// the one whose tan(FOV/2) is plausible
+// FSR2's constants. Layouts:
+//   1. FSR 2.1/2.2 (ffx_fsr2 cbFSR2): render size, max render size, display size, input colour size, luma mip size, mip
+//      level, frame index, device-to-view depth x4 [12], jitter [16], motion vector scale [18], downscale, jitter
+//      cancellation, pre-exposure x2, tan(half the vertical FOV) [26], ...
+//   2. FSR 2.0 (as Cyberpunk 2077 has it, seen in its constant buffer): render size, display size, luma mip size [4],
+//      mip level, frame index, 1/display size [8], jitter [10], device-to-view [12] (FLT_EPSILON, -1, the near plane,
+//      FLT_EPSILON: reversed infinite depth, distance = near / d), depth clip / lock status / reactive mask scales
+//      [16-21], motion vector scale [22], downscale [24], pre-exposure, tan(half the vertical FOV) [27], ...
+// d2v comes out as warp_core wants it: [0] z_b, [1] z_a (distance = [1] / (d - [0])), [2] tan_x, [3] tan_y.
 static int fsr2_parse(const uint32_t *w, float *tan_half_fov_y, float d2v[4], float mvs[2], uint32_t disp[2]) {
     const float *f = (const float *)w;
-    static const struct { int d2v, mvs, tan, disp; } L[2] = { { 12, 18, 26, 4 }, { 14, 24, 29, 2 } };
-    for (int k = 0; k < 2; k++) {
-        float t = f[L[k].tan];
-        if (!(t > 0.05f && t < 5.0f) || !isfinite(f[L[k].d2v]) || !isfinite(f[L[k].d2v + 1]) || !(f[L[k].d2v + 2] > 0.01f) || !(f[L[k].d2v + 3] > 0.01f)) continue;
+    // 2.0: the luma mip's size small, 1/display size and the downscale factor consistent
+    if (w[2] >= w[0] && w[3] >= w[1] && w[4] < w[2] && w[5] < w[3] && fabsf(f[8] * w[2] - 1) < 1e-3f && fabsf(f[9] * w[3] - 1) < 1e-3f &&
+        fabsf(f[24] - (float)w[0] / w[2]) < 0.02f && f[27] > 0.05f && f[27] < 5) {
+        float near = f[14] > 1e-4f && f[14] < 10 ? f[14] : 1;
+        *tan_half_fov_y = f[27];
+        d2v[0] = 0; d2v[1] = near; d2v[2] = f[27] * w[2] / w[3]; d2v[3] = f[27];
+        mvs[0] = f[22]; mvs[1] = f[23];
+        disp[0] = w[2]; disp[1] = w[3];
+        return 2;
+    }
+    // 2.1/2.2
+    float t = f[26];
+    if (t > 0.05f && t < 5.0f && isfinite(f[12]) && isfinite(f[13]) && f[14] > 0.01f && f[15] > 0.01f && w[4] >= w[0] && w[5] >= w[1]) {
         *tan_half_fov_y = t;
-        memcpy(d2v, f + L[k].d2v, 16);
-        mvs[0] = f[L[k].mvs]; mvs[1] = f[L[k].mvs + 1];
-        disp[0] = w[L[k].disp]; disp[1] = w[L[k].disp + 1];
-        return k + 1;
+        memcpy(d2v, f + 12, 16);
+        mvs[0] = f[18]; mvs[1] = f[19];
+        disp[0] = w[4]; disp[1] = w[5];
+        return 1;
     }
     return 0;
 }
@@ -1274,7 +1287,7 @@ void npu_interp_scene(void *mv_, void *dp_, uint64_t cs, const uint32_t *consts)
         int lay = fsr2_parse(consts, &th, d2v, mvs, disp);
         vx_log("NPU mode (race): FSR2's constants with them: %s", hex);
         if (lay) vx_log("NPU mode (race): read as FSR %s: display %ux%u, tan(vertical FOV/2) %.4f (%.1f degrees), device-to-view "
-                        "depth %g %g %g %g, motion vector scale %g %g", lay == 1 ? "2.1/2.2" : "2.0", disp[0], disp[1], th,
+                        "depth %g %g %g %g, motion vector scale %g %g", lay == 1 ? "2.1/2.2" : "2.0 (Cyberpunk 2077's)", disp[0], disp[1], th,
                         2 * atanf(th) * 57.29578f, d2v[0], d2v[1], d2v[2], d2v[3], mvs[0], mvs[1]);
         else vx_log("NPU mode (race): those constants are not laid out as FSR 2.0-2.2's (no plausible field of view)");
     } else if (!consts && !SC.ctold && tell) vx_log("NPU mode (race): no FSR2 constants found with them (root constants, root CBVs, CBV tables)");
@@ -1607,6 +1620,12 @@ static void race_new_b(VXNpuSet *S, int slot, int has_in, int has_scene, double 
     R.a = prev; R.b = slot; R.b_seq++;
     R.ca = R.cb; R.cb = c;
     R.scene = has_scene ? R.scene | bit(slot) : R.scene & ~bit(slot);
+    if (R.mv_ok && S->helper && !R.flow_busy && S->sock >= 0 && R.want_b < 0) {   // (motion vectors work: no flow from now on)
+        __atomic_store_n(&S->ready, 0, __ATOMIC_RELEASE);
+        close(S->sock);
+        S->sock = -1;
+        vx_log("NPU mode (race): the game's motion vectors work: the optical flow's helper stops");
+    }
     if (has_scene && S->fsr[slot] && !R.mv_ok && g.wc) {
         R.mv_ok = 2;
         vx_log("NPU mode (race): predictions from the game's motion vectors with FSR2's scale (%g, %g frame pixels a unit), no "
