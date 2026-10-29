@@ -314,6 +314,9 @@ struct res12 {
     // Metal placement heaps of D3D12 heaps. Each tile's current mapping is kept for CopyTileMappings; a mapped heap
     // is held until its tiles are remapped or the resource is destroyed.
     uint8_t reserved;
+    // VXRT_D3D12_TEX_DOWNSCALE: the Metal texture leaves out the first mip_drop mips (desc stays the game's; its
+    // subresource m is the Metal texture's m - mip_drop, and copies to or from the left-out mips do nothing)
+    uint8_t mip_drop;
     uint32_t tile_count;
     memheap12 **tile_heaps;
     uint32_t *tile_offsets;
@@ -457,7 +460,7 @@ typedef struct {
     uint64_t allocator_generation;
     int allocator_recording;
     cmd12 *cmds;
-    uint32_t n, cap;
+    uint32_t n, cap, small_resets;
     pso12 *recording_pso;
     uint32_t recording_topology;
     int recording_topology_set;
@@ -2053,6 +2056,43 @@ static int d3d12_tiled_tier_probe12(id<MTLDevice> mtl) {
     return 0;
 }
 
+// VXRT_D3D12_TEX_DOWNSCALE=<n> (1 to 3): committed textures in default heaps that are only sampled (no render target,
+// depth or UAV use), 2D (or 2D arrays and cubes) with more than n mips and at least VXRT_D3D12_TEX_DOWNSCALE_MIN
+// (default 1024) texels on their longer side are made without their n largest mips: about 1 - 4^-n less memory
+// each. The game sees its own description; copies to the mips left out are dropped, views and copies of the others
+// move up n Metal levels (their sizes are the same). Placed resources keep their size (their heap's memory is the
+// game's either way). Shaders that read texels by integer coordinates of the top mip would read the wrong ones.
+static volatile uint64_t g_tex_drop_bytes12, g_tex_drop_count12, g_tex_drop_copies12;
+static int tex_drop_levels12(const HEAP_PROPS *hp, const RES_DESC *desc, memheap12 *in, int reserved, uint32_t *logical_mips) {
+    static int n = -1, min = 1024;
+    if (n < 0) {
+        const char *e = getenv("VXRT_D3D12_TEX_DOWNSCALE"), *m = getenv("VXRT_D3D12_TEX_DOWNSCALE_MIN");
+        int v = e ? atoi(e) : 0;
+        if (m && atoi(m) > 0) min = atoi(m);
+        n = v < 0 ? 0 : v > 3 ? 3 : v;
+        if (n) vx_log("D3D12: sampled textures of at least %d texels are made without their %d largest mip%s (VXRT_D3D12_TEX_DOWNSCALE)",
+                      min, n, n > 1 ? "s" : "");
+    }
+    if (!n || in || reserved || !hp || hp->Type != 1 || desc->Dimension != 3 || desc->SampleCount > 1 || (desc->Flags & 0x7) ||
+        d3d12_resource_plane_count(desc->Format) != 1) return 0;
+    uint64_t w = desc->Width, h = desc->Height ? desc->Height : 1;
+    uint32_t mips = desc->MipLevels;
+    if (!mips) { uint64_t m = MAX(w, h); mips = 1; while (m > 1) { m >>= 1; mips++; } }
+    uint64_t q = 4ull << n;
+    if (mips <= (uint32_t)n || MAX(w, h) < (uint64_t)min || w % q || h % q) return 0;
+    *logical_mips = mips;
+    return n;
+}
+
+// A D3D12 subresource of a texture -> the Metal texture's (0: a mip left out by VXRT_D3D12_TEX_DOWNSCALE).
+static int tex_sub12(const res12 *r, uint32_t sub, uint32_t *metal) {
+    if (!r || !r->mip_drop) { *metal = sub; return 1; }
+    uint32_t mips = r->desc.MipLevels, m = sub % mips, slice = sub / mips;
+    if (m < r->mip_drop) return 0;
+    *metal = (m - r->mip_drop) + slice * (mips - r->mip_drop);
+    return 1;
+}
+
 // A committed resource (heap nil) or one placed in a heap at an offset.
 static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flags, const RES_DESC *desc, int32_t initial_state,
                                const void *clear, memheap12 *in, uint64_t offset, int reserved, const GUID *iid, void **out) {
@@ -2106,7 +2146,11 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
             if (!in && hp->Type != 2) memset(r->buffer.contents, 0, r->buffer.length);
         }   // (default and readback heaps start zeroed)
     } else {
-        MTLTextureDescriptor *td = texture_descriptor(d, desc);
+        uint32_t logical_mips = 0;
+        int drop = tex_drop_levels12(hp, desc, in, reserved, &logical_mips);
+        RES_DESC smaller = *desc;
+        if (drop) { smaller.Width >>= drop; smaller.Height >>= drop; smaller.MipLevels = (uint16_t)(logical_mips - drop); }
+        MTLTextureDescriptor *td = texture_descriptor(d, drop ? &smaller : desc);
         if (!td) { d3d_release(&r->base); return E_INVALIDARG; }
         int texture_exception = 0;
         @try {
@@ -2126,6 +2170,12 @@ static HRESULT create_resource(dev12 *d, const HEAP_PROPS *hp, int32_t heap_flag
                    exception.reason.UTF8String ? exception.reason.UTF8String : "unknown Metal exception");
         }
         if (!r->texture) { d3d_release(&r->base); return texture_exception || in ? E_INVALIDARG : E_OUTOFMEMORY; }
+        if (drop) {
+            r->mip_drop = (uint8_t)drop;
+            r->desc.MipLevels = (uint16_t)logical_mips;
+            __atomic_add_fetch(&g_tex_drop_count12, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&g_tex_drop_bytes12, r->texture.allocatedSize, __ATOMIC_RELAXED);
+        }
         if (r->desc.MipLevels == 0) r->desc.MipLevels = (uint16_t)td.mipmapLevelCount;
         uint64_t mapped_subresources = (uint64_t)r->desc.MipLevels *
             (r->desc.Dimension == 4 ? 1u : r->desc.DepthOrArraySize) * d3d12_resource_plane_count(r->desc.Format);
@@ -3419,7 +3469,7 @@ static WINAPI void dev_create_srv(void *this, void *resource, const SRV_DESC *de
         if (desc) {
             d3d12_srv_texture_range12 range;
             texture_view_valid = mapping_valid && d3d12_normalize_srv_texture_range12((uint32_t)dim, desc->raw,
-                (uint32_t)r->texture.mipmapLevelCount, (uint32_t)r->texture.arrayLength, &range);
+                r->mip_drop ? (uint32_t)r->desc.MipLevels : (uint32_t)r->texture.mipmapLevelCount, (uint32_t)r->texture.arrayLength, &range);
             if (texture_view_valid) {
                 view_mip = range.mip;
                 view_mips = range.mips;
@@ -3436,8 +3486,17 @@ static WINAPI void dev_create_srv(void *this, void *resource, const SRV_DESC *de
             vx_log("D3D12: nonzero ResourceMinLODClamp needs Metal Mac2/Apple6 sampling support and a non-1D texture view; descriptor left null");
             texture_view_valid = 0;
         }
+        uint32_t metal_mip = view_mip, metal_mips = view_mips;
+        if (r->mip_drop && texture_view_valid) {                // (the view's mips that the Metal texture has; the first
+            uint32_t end = desc ? view_mip + view_mips : r->desc.MipLevels;   //  one it has when it has none of them)
+            metal_mip = view_mip > r->mip_drop ? view_mip - r->mip_drop : 0;
+            metal_mips = end > r->mip_drop + metal_mip ? end - r->mip_drop - metal_mip : 1;
+            if (resource_min_lod != 0.0f) {
+                resource_min_lod = MAX(0.0f, resource_min_lod - r->mip_drop);
+            }
+        }
         id<MTLTexture> t = texture_view_valid ? texture_view(r, desc ? desc->format : 0, view_type(dim, 0),
-                                        view_mip, view_mips, view_slice, view_slices) : nil;
+                                        metal_mip, desc || r->mip_drop ? metal_mips : view_mips, view_slice, view_slices) : nil;
         texture_view_valid = t != nil;
         if (texture_view_valid) {
             v.res = resource_id(t);
@@ -4145,6 +4204,19 @@ static void list_clear(list12 *l) {
         for (int k = 0; k < 9; k++) if (c->resource[k]) d3d_release(&c->resource[k]->base);
     }
     gpu_ir_stream_clear(&l->gpu_ir);
+    // (a list that used under a quarter of its commands' array at 8 resets in a row gets half of it back: lists
+    //  that once recorded a loading screen's thousands keep 712 bytes for each)
+    if (l->cap > 256 && l->n < l->cap / 4) {
+        if (++l->small_resets >= 8) {
+            uint32_t cap = l->cap / 2;
+            cmd12 *smaller = realloc(l->cmds, (size_t)cap * sizeof *l->cmds);
+            if (smaller) {
+                __atomic_sub_fetch(&g_cmd_bytes12, (uint64_t)(l->cap - cap) * sizeof *l->cmds, __ATOMIC_RELAXED);
+                l->cmds = smaller; l->cap = cap;
+            }
+            l->small_resets = 0;
+        }
+    } else l->small_resets = 0;
     l->recording_pso = NULL;
     l->recording_topology = 4; // D3D12 triangle list; matches the replay state's initial topology.
     l->recording_topology_set = 0;
@@ -4546,6 +4618,8 @@ static WINAPI void list_copy_buffer(void *this, void *dst, uint64_t dst_off, voi
     }
     list_record_gpu_buffer_copy(this, dst, dst_off, src, src_off, n);
 }
+static WINAPI void list_copy_texture(void *this, const COPY_LOC *dst, uint32_t x, uint32_t y, uint32_t z, const COPY_LOC *src, const BOX *box);
+static uint64_t resource_subresource_count12(const res12 *resource);
 static WINAPI void list_copy_resource(void *this, void *dst, void *src) {
     list12 *l = this;
     res12 *d = dst, *s = src;
@@ -4567,6 +4641,14 @@ static WINAPI void list_copy_resource(void *this, void *dst, void *src) {
             return;
         }
         vx_log("D3D12: buffer CopyResource source and destination do not match (error %d)", rc);
+        return;
+    }
+    if (d && s && d->texture && s->texture && d->mip_drop != s->mip_drop) {   // (one made smaller: subresource by subresource)
+        uint64_t n = resource_subresource_count12(d);
+        for (uint64_t k = 0; k < n && k < resource_subresource_count12(s); k++) {
+            COPY_LOC dl = { .res = d, .type = 0, .subresource = (uint32_t)k }, sl = { .res = s, .type = 0, .subresource = (uint32_t)k };
+            list_copy_texture(this, &dl, 0, 0, 0, &sl, NULL);
+        }
         return;
     }
     if (d && s && d->gpu_texture && s->gpu_texture && d->texture.pixelFormat == s->texture.pixelFormat) {
@@ -4636,6 +4718,12 @@ static int d3d12_resolve_location(res12 *resource, uint32_t subresource, gpu_ir_
     uint32_t planes = d3d12_resource_plane_count(resource->desc.Format);
     uint64_t plane_size = (uint64_t)mips * slices;
     if (subresource >= plane_size * planes || !plane_size || subresource / plane_size) return 0;
+    if (resource->mip_drop) {
+        uint32_t metal;
+        if (!tex_sub12(resource, subresource, &metal)) return 0;
+        mips -= resource->mip_drop;
+        subresource = metal;
+    }
     location->mip_level = subresource % mips;
     location->array_slice = subresource / mips;
     return 1;
@@ -4957,7 +5045,27 @@ static int list_record_gpu_texture_copy(list12 *list, res12 *dst, const COPY_LOC
 
 static WINAPI void list_copy_texture(void *this, const COPY_LOC *dst, uint32_t x, uint32_t y, uint32_t z, const COPY_LOC *src, const BOX *box) {
     list12 *list = this;
-    if (dst && src && list_record_gpu_texture_copy(list, dst->res, dst, x, y, z, src->res, src, box)) return;
+    COPY_LOC dst_metal, src_metal;
+    uint32_t dst_logical = 0, src_logical = 0;
+    int dropped = 0;
+    if (dst && src && ((dst->type == 0 && dst->res && ((res12 *)dst->res)->mip_drop) ||
+                       (src->type == 0 && src->res && ((res12 *)src->res)->mip_drop))) {
+        dst_metal = *dst; src_metal = *src;
+        dst_logical = dst->subresource; src_logical = src->subresource;
+        if (dst->type == 0 && !tex_sub12(dst->res, dst->subresource, &dst_metal.subresource)) dropped = 1;
+        if (src->type == 0 && !tex_sub12(src->res, src->subresource, &src_metal.subresource)) dropped = 1;
+        if (dropped) { __atomic_add_fetch(&g_tex_drop_copies12, 1, __ATOMIC_RELAXED); return; }
+        dst = &dst_metal; src = &src_metal;
+        uint32_t before = list->n;
+        if (list_record_gpu_texture_copy(list, dst->res, dst, x, y, z, src->res, src, box)) {
+            for (uint32_t i = before; i < list->n; i++)        // (the state tracking keeps the game's subresources)
+                if (list->cmds[i].op == C_GPU_IR && list->cmds[i].gfx == D3D12_TRACK_COPY_TEXTURE) {
+                    list->cmds[i].c = src->type == 0 ? src_logical : 0;
+                    list->cmds[i].off = dst->type == 0 ? dst_logical : 0;
+                }
+            return;
+        }
+    } else if (dst && src && list_record_gpu_texture_copy(list, dst->res, dst, x, y, z, src->res, src, box)) return;
     cmd12 *c = rec(this, C_COPY_TEXTURE);
     c->dst = *dst; c->src = *src;
     c->a = x; c->b = y; c->c = z;
@@ -6481,7 +6589,7 @@ typedef struct {
     d3d_object base; dev12 *dev;
     pthread_mutex_t lock;
     plib_entry12 *entries;
-    uint32_t n, cap;
+    uint32_t n, cap, small_resets;
 } plib12;
 
 #define D3D12_ERROR_ADAPTER_NOT_FOUND12 ((HRESULT)0x887E0001)
@@ -13397,6 +13505,24 @@ static void mem_report12(dev12 *d) {
                tb[placed][0] / 1048576.0, (unsigned long long)tn[placed][0], tb[placed][1] / 1048576.0, (unsigned long long)tn[placed][1],
                tb[placed][2] / 1048576.0, (unsigned long long)tn[placed][2], tb[placed][3] / 1048576.0, (unsigned long long)tn[placed][3],
                bb[placed] / 1048576.0, (unsigned long long)bn[placed], placed ? "" : " (downscaled ones count at their new size)");
+    {   // (committed buffers by heap type: default, upload, readback, custom)
+        uint64_t hb[5] = { 0 }, hn[5] = { 0 };
+        pthread_rwlock_rdlock(&d->bufs_lock);
+        for (uint32_t i = 0; i < d->nbufs; i++) {
+            res12 *b = d->bufs[i];
+            if (b->owner_heap || b->reserved) continue;
+            int t = b->heap.Type >= 1 && b->heap.Type <= 4 ? b->heap.Type : 0;
+            hb[t] += b->buffer.allocatedSize; hn[t]++;
+        }
+        pthread_rwlock_unlock(&d->bufs_lock);
+        vx_log("D3D12: memory: committed buffers: default %.0f MB (%llu), upload %.0f MB (%llu), readback %.0f MB (%llu), custom %.0f MB (%llu)",
+               hb[1] / 1048576.0, (unsigned long long)hn[1], hb[2] / 1048576.0, (unsigned long long)hn[2],
+               hb[3] / 1048576.0, (unsigned long long)hn[3], hb[4] / 1048576.0, (unsigned long long)hn[4]);
+    }
+    if (__atomic_load_n(&g_tex_drop_count12, __ATOMIC_RELAXED))
+        vx_log("D3D12: memory: VXRT_D3D12_TEX_DOWNSCALE made %llu textures (%.0f MB as made, all time), %llu copies to or from "
+               "left-out mips dropped", (unsigned long long)g_tex_drop_count12, g_tex_drop_bytes12 / 1048576.0,
+               (unsigned long long)g_tex_drop_copies12);
     uint64_t keys = 0, npso = 0;
     pthread_mutex_lock(&d->lock);
     for (NSString *k in d->pso_cache) { keys += [k lengthOfBytesUsingEncoding:NSUTF8StringEncoding]; npso++; }
@@ -13420,6 +13546,23 @@ static void mem_report12(dev12 *d) {
            __atomic_load_n(&g_replay_copy_peak12, __ATOMIC_RELAXED) / 1048576.0,
            __atomic_load_n(&gpu_ir_stream_bytes, __ATOMIC_RELAXED) / 1048576.0, gpu_ir_command_size());
     if (vx_heap_report(heap, sizeof heap)) vx_log("D3D12: memory: the game's heap blocks (HeapAlloc, malloc, new): %s", heap);
+}
+// malloc keeps the pages of freed blocks (most in its medium size class, 1.3 GB of dirty pages for 0.5 GB in use in
+// Cyberpunk) until memory runs short: every 300 presents they are given back, off the present's thread
+// (VXRT_MALLOC_RELIEF=0: not).
+static void malloc_relief12(uint32_t presents) {
+    static int on = -1;
+    static volatile int busy;
+    if (on < 0) on = !getenv("VXRT_MALLOC_RELIEF") || atoi(getenv("VXRT_MALLOC_RELIEF")) != 0;
+    if (!on || presents % 300 || !__sync_bool_compare_and_swap(&busy, 0, 1)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        uint64_t t0 = fs_now12();
+        size_t freed = malloc_zone_pressure_relief(NULL, 0);
+        static int told;
+        if (told++ < 3 || getenv("VXRT_MALLOC_RELIEF_LOG"))
+            vx_log("D3D12: malloc gave back %.0f MB of freed blocks' pages (%.1f ms)", freed / 1048576.0, (fs_now12() - t0) / 1e6);
+        busy = 0;
+    });
 }
 static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     swap12 *sc = this;
@@ -13449,6 +13592,7 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     frame_stats_present12(sc->presents);
     cb_trace_poll12();
     if (g_mem_report12) { g_mem_report12 = 0; mem_report12(sc->dev); }
+    malloc_relief12(sc->presents);
     skip_poll12();
     census_present12();
     pass_dump_present12();

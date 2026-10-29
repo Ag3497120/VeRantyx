@@ -5653,6 +5653,84 @@ static int typed_float_buffer_test(ID3D12Device *dev, ID3D12CommandQueue *queue)
     return failed;
 }
 
+// Mips of a 64x32 texture written from an upload buffer and read back through a readback buffer, subresource by
+// subresource (with VXRT_D3D12_TEX_DOWNSCALE=1 and VXRT_D3D12_TEX_DOWNSCALE_MIN at most 64, mip 0 is left out: its
+// copies do nothing, and mips 1 and 2 still read back as written).
+static int texture_mip_copy_test(ID3D12Device *dev, ID3D12CommandQueue *queue) {
+    const char *e = getenv("VXRT_D3D12_TEX_DOWNSCALE"), *m = getenv("VXRT_D3D12_TEX_DOWNSCALE_MIN");
+    int dropped = e && atoi(e) >= 1 && m && atoi(m) <= 64;
+    D3D12_HEAP_PROPERTIES default_heap = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC desc = { 0 };
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 64; desc.Height = 32; desc.DepthOrArraySize = 2; desc.MipLevels = 3;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+    ID3D12Resource *texture = NULL, *copy = NULL;
+    CHECK(ID3D12Device_CreateCommittedResource(dev, &default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&texture));
+    CHECK(ID3D12Device_CreateCommittedResource(dev, &default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&copy));
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[6];
+    UINT rows[6]; UINT64 row_bytes[6], total = 0;
+    ID3D12Device_GetCopyableFootprints(dev, &desc, 0, 6, 0, layouts, rows, row_bytes, &total);
+    ID3D12Resource *upload = buffer(dev, D3D12_HEAP_TYPE_UPLOAD, total, 0, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12Resource *readback = buffer(dev, D3D12_HEAP_TYPE_READBACK, total, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!upload || !readback) return 1;
+    unsigned char *data = NULL;
+    CHECK(ID3D12Resource_Map(upload, 0, NULL, (void **)&data));
+    for (UINT s = 0; s < 6; s++)
+        for (UINT y = 0; y < rows[s]; y++)
+            for (UINT x = 0; x < layouts[s].Footprint.Width; x++) {
+                UINT32 v = 0xff000000u | (s << 16) | (y << 8) | x;
+                memcpy(data + layouts[s].Offset + (UINT64)y * layouts[s].Footprint.RowPitch + x * 4, &v, 4);
+            }
+    ID3D12Resource_Unmap(upload, 0, NULL);
+    ID3D12CommandAllocator *allocator = NULL;
+    CHECK(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&allocator));
+    ID3D12GraphicsCommandList *list = NULL;
+    CHECK(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&list));
+    for (UINT s = 0; s < 6; s++) {
+        D3D12_TEXTURE_COPY_LOCATION dst = { texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX }, src = { upload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        dst.SubresourceIndex = s; src.PlacedFootprint = layouts[s];
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
+    }
+    D3D12_RESOURCE_BARRIER barriers[2] = { { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION }, { D3D12_RESOURCE_BARRIER_TYPE_TRANSITION } };
+    barriers[0].Transition = (D3D12_RESOURCE_TRANSITION_BARRIER){ texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE };
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, barriers);
+    ID3D12GraphicsCommandList_CopyResource(list, copy, texture);
+    barriers[0].Transition = (D3D12_RESOURCE_TRANSITION_BARRIER){ copy, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE };
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, barriers);
+    for (UINT s = 0; s < 6; s++) {
+        D3D12_TEXTURE_COPY_LOCATION dst = { readback, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT }, src = { copy, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX };
+        dst.PlacedFootprint = layouts[s]; src.SubresourceIndex = s;
+        ID3D12GraphicsCommandList_CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
+    }
+    CHECK(ID3D12GraphicsCommandList_Close(list));
+    ID3D12CommandList *lists[] = { (ID3D12CommandList *)list };
+    ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
+    wait_queue(dev, queue);
+    CHECK(ID3D12Resource_Map(readback, 0, NULL, (void **)&data));
+    int bad = 0;
+    for (UINT s = 0; s < 6 && !bad; s++) {
+        int left_out = dropped && s % 3 == 0;
+        for (UINT y = 0; y < rows[s] && !bad; y++)
+            for (UINT x = 0; x < layouts[s].Footprint.Width; x++) {
+                UINT32 v, want = left_out ? 0 : 0xff000000u | (s << 16) | (y << 8) | x;
+                memcpy(&v, data + layouts[s].Offset + (UINT64)y * layouts[s].Footprint.RowPitch + x * 4, 4);
+                if (v != want) { printf("d3d12 texture mips: subresource %u (%u, %u) is %#x, want %#x\n", s, x, y, v, want); bad = 1; break; }
+            }
+    }
+    ID3D12Resource_Unmap(readback, 0, NULL);
+    if (!bad) printf("d3d12 texture mips: 2 slices x 3 mips through upload, CopyResource and readback%s: ok\n",
+                     dropped ? " (mip 0 left out by VXRT_D3D12_TEX_DOWNSCALE)" : "");
+    ID3D12GraphicsCommandList_Release(list);
+    ID3D12CommandAllocator_Release(allocator);
+    ID3D12Resource_Release(readback); ID3D12Resource_Release(upload);
+    ID3D12Resource_Release(copy); ID3D12Resource_Release(texture);
+    return bad;
+}
+
 static int texture_dimensions_common_test(ID3D12Device *dev, ID3D12CommandQueue *queue, int multisampled) {
     unsigned char code[4096];
     size_t code_size = 0;
@@ -7909,6 +7987,7 @@ int main(void) {
     if (float_minmax_buffer_test(dev, queue)) bad++;
     if (signed_conversions_test(dev, queue)) bad++;
     if (typed_float_buffer_test(dev, queue)) bad++;
+    if (texture_mip_copy_test(dev, queue)) bad++;
     if (texture_dimensions_common_test(dev, queue, 0)) bad++;
     if (texture_dimensions_common_test(dev, queue, 1)) bad++;
     if (texture_load_msaa_common_test(dev, queue)) bad++;
