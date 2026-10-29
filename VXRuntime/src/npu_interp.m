@@ -1152,9 +1152,13 @@ static struct {
     double link_ts;                // the display link's time of the refresh being shown (its vsync)
     double rec_content;            // (the content time of the frame being presented, for recordings)
     double vsync;                  // a refresh's time (the link's), to start frames on the refresh grid
-    double dl, d;                  // the latency envelope (content time to ready), D
-    int pend, pend_in, pend_scene; // the newest frame ready and not yet due
-    double pend_c;
+    double dl, d;                  // the latency (content time to ready, p90 of the last 32), D
+    float lring[32]; uint32_t nl;
+    double d_down;                 // (when D last stepped down)
+    // the frames ready and not yet due, oldest first (with D longer than a frame interval several wait at once)
+    int pq[4], pq_in[4], pq_scene[4], npq;
+    double pq_c[4];
+    int pend;                      // (bit() of the queue's slots for race_slot: -1, kept for the old masks)
     double ca, cb;                 // A's and B's content times
     int b_shown;                   // B itself (t 0) shown
     uint32_t pend_dropped, nlat2, late_real;
@@ -1169,6 +1173,7 @@ static void race_reset(VXNpuSet *S) {                              // (R.lock he
     R.set = S;
     R.inflight = R.has_in = 0;
     R.last = R.a = R.b = R.want_a = R.want_b = R.pend = -1;
+    R.npq = 0;
     R.b_shown = 0; R.noscene_t = 0;
     R.interval = 0;
     R.flow_dst = R.flow_b = -1;
@@ -1459,7 +1464,8 @@ static void mv_calibrate(VXNpuSet *S, int a, int b) {
 static int race_slot(VXNpuSet *S) {
     os_unfair_lock_lock(&R.lock);
     if (R.set != S) race_reset(S);
-    uint32_t used = R.inflight | bit(R.last) | bit(R.a) | bit(R.b) | bit(R.want_a) | bit(R.want_b) | bit(R.run_a) | bit(R.run_b) | bit(R.pend);
+    uint32_t used = R.inflight | bit(R.last) | bit(R.a) | bit(R.b) | bit(R.want_a) | bit(R.want_b) | bit(R.run_a) | bit(R.run_b);
+    for (int k = 0; k < R.npq; k++) used |= bit(R.pq[k]);
     int slot = -1;
     for (uint32_t k = 0; k < NSRC && slot < 0; k++) {
         uint32_t s = (g.next_slot + k) % NSRC;
@@ -1661,16 +1667,26 @@ static void handle_race(VXNpuSet *S, uint32_t slot, int has_in, int has_scene, d
         // (the latency from the content time to ready: its envelope (up at once, down slowly) sets how far behind the
         //  display shows the content, so every real frame is in by its time)
         double lat = t - S->ctime[slot];
-        if (lat > 0 && lat < 0.5) R.dl = lat > R.dl ? lat : R.dl - (R.dl - lat) * 0.02;
+        if (lat > 0 && lat < 0.5) {
+            R.lring[R.nl++ % 32] = (float)lat;
+            uint32_t n = R.nl < 32 ? R.nl : 32;
+            float v[32];
+            memcpy(v, R.lring, n * sizeof *v);
+            R.dl = pct(v, n, 0.9f);                                // (a rare slow frame is shown late, warped on: not D)
+        }
         if (R.nlat2 < 512) R.lat2[R.nlat2++] = (float)(lat * 1000);
-        if (R.pend >= 0) R.pend_dropped++;                         // (the one waiting is replaced: never shown)
-        R.pend = (int)slot; R.pend_c = S->ctime[slot]; R.pend_in = has_in; R.pend_scene = has_scene;
+        if (R.npq == 4) {                                          // (full: the oldest goes, never shown)
+            memmove(R.pq, R.pq + 1, 3 * sizeof *R.pq); memmove(R.pq_c, R.pq_c + 1, 3 * sizeof *R.pq_c);
+            memmove(R.pq_in, R.pq_in + 1, 3 * sizeof *R.pq_in); memmove(R.pq_scene, R.pq_scene + 1, 3 * sizeof *R.pq_scene);
+            R.npq = 3; R.pend_dropped++;
+        }
+        R.pq[R.npq] = (int)slot; R.pq_c[R.npq] = S->ctime[slot]; R.pq_in[R.npq] = has_in; R.pq_scene[R.npq] = has_scene; R.npq++;
         os_unfair_lock_unlock(&R.lock);
         pthread_mutex_unlock(&R.present);
         dispatch_semaphore_signal(R.sem);
         return;
     }
-    R.pend = -1;                                                   // (paced just turned off: the one waiting is replaced)
+    R.npq = 0;                                                     // (paced just turned off: those waiting are dropped)
     // (a slow game simulated, "real15" in the switch file: a frame sooner than that after the last one shown is
     //  counted and not shown)
     float cap = g.race_real_cap;
@@ -1762,12 +1778,14 @@ static void race_tick_paced(double tick) {
     //  refresh grid, so a real frame comes due exactly on a refresh and is shown as it is)
     double d = ceil((R.dl + R.margin + 0.001) / per - 0.05) * per;
     if (d < per) d = per;
-    R.d = d;
+    if (d >= R.d || !R.d) R.d = d;                                 // (up at once; down a refresh at a time, every 0.5 s)
+    else if (d < R.d - 0.5 * per && tick - R.d_down > 0.5) { R.d -= per; R.d_down = tick; }
+    d = R.d;
     double tau = T - d, decide = tick + per - R.margin;
     for (;;) {                                                     // (until the frame due is in, or the decision's time)
         double now = now_s();
         os_unfair_lock_lock(&R.lock);
-        int in = R.pend >= 0 && R.pend_c <= tau + 0.25 * per;
+        int in = R.npq > 0 && R.pq_c[0] <= tau + 0.25 * per;
         os_unfair_lock_unlock(&R.lock);
         if (in || now >= decide) break;
         dispatch_semaphore_wait(R.sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((decide - now) * 1e9)));
@@ -1781,11 +1799,16 @@ static void race_tick_paced(double tick) {
     VXNpuSet *S = nil;
     os_unfair_lock_lock(&R.lock);
     S = R.set;
-    if (S && R.pend >= 0 && R.pend_c <= tau + 0.25 * per) {       // (the frame due: B from now on)
-        int p = R.pend;
-        R.pend = -1;
-        race_new_b(S, p, R.pend_in, R.pend_scene, R.pend_c);
+    int due = -1;                                                  // (the newest frame due: B from now on; older ones skipped)
+    for (int k = 0; k < R.npq; k++) if (R.pq_c[k] <= tau + 0.25 * per) due = k;
+    if (S && due >= 0) {
+        R.pend_dropped += (uint32_t)due;
+        race_new_b(S, R.pq[due], R.pq_in[due], R.pq_scene[due], R.pq_c[due]);
         R.b_shown = 0;
+        int n = R.npq - due - 1;
+        memmove(R.pq, R.pq + due + 1, n * sizeof *R.pq); memmove(R.pq_c, R.pq_c + due + 1, n * sizeof *R.pq_c);
+        memmove(R.pq_in, R.pq_in + due + 1, n * sizeof *R.pq_in); memmove(R.pq_scene, R.pq_scene + due + 1, n * sizeof *R.pq_scene);
+        R.npq = n;
     }
     if (S && R.b >= 0 && now - R.shown_at >= gap - 0.002) {
         double ival = R.a >= 0 && R.cb - R.ca > 0.002 ? R.cb - R.ca : R.pace_i;
