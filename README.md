@@ -23,16 +23,22 @@ or an ALVR headset. Some also play on the Mac's own screen.</p>
 > Quest players. **[Download VeRantyx for Mac →](https://github.com/Ag3497120/VeRantyx/releases/latest)** (also on
 > [verantyx.ai](https://verantyx.ai))
 >
-> **In progress:** Direct3D 12 — Cyberpunk 2077 reaches character creation with its characters lit correctly, on
-> the [`d3d12-games`](https://github.com/Ag3497120/VeRantyx/tree/d3d12-games) branch.
+> **In progress:** Direct3D 12 — Cyberpunk 2077 plays in game on the Mac (about 20 fps of real frames, more shown with
+> frame prediction) on the [`vr-main`](https://github.com/Ag3497120/VeRantyx/tree/vr-main) branch, not in the app yet;
+> and a first attempt to run it standalone on Vision Pro ([`avp-port`](https://github.com/Ag3497120/VeRantyx/tree/avp-port)).
 
 > **Want your game to run? Ask your AI assistant.** VeRantyx is built to be extended with Claude Code, Codex,
-> Gemini CLI or Cursor: run `/vxrt-support <your game>` in this repository and the agent measures the game, finds
-> what stops it and implements the missing Windows functions, with the test harness checking every claim
-> ([AGENTS.md](AGENTS.md)). Send what you get as a pull request or a report.
+> Gemini CLI or Cursor: run `/vxrt-support <your game>` in this repository and the agent measures the game, looks for
+> what stops it and tries to implement the missing Windows functions, recording its runs with the test harness
+> ([AGENTS.md](AGENTS.md)). Results vary by game; send what you get as a pull request or a report.
 
-**You need your own copy of each game.** Nothing from Valve, Microsoft or any game is in this repository or its
-releases: games and SteamVR come from your own Steam account. No anti-cheat is ever worked around.
+**You need your own copy of each game.** No game files, SteamVR or Microsoft DLLs are in this repository or its
+releases (only Valve's BSD-licensed OpenVR SDK headers, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)):
+games and SteamVR come from your own Steam account. No anti-cheat is ever worked around.
+
+**How it's made.** VeRantyx is developed by one person with AI coding agents (mostly Claude Code). Every number in
+this README comes from a recorded run, but much of the code has been tested only on the games listed below. It is
+not a sandbox: a Windows program under VXRuntime runs with your user's rights, so run only programs you trust.
 
 <p align="center">
   <a href="#get-started">Get started</a> ·
@@ -48,6 +54,8 @@ releases: games and SteamVR come from your own Steam account. No anti-cheat is e
 
 | Date | What changed |
 |---|---|
+| Oct 30 | **Native ARM64 Alyx merged into `main`** (#9 by medved91): shader caching, a normal quit instead of killing the game, darker shadows/midtones closer to the Windows version, shadow flicker fix. Elite Dangerous: why "this Frontier account does not own Elite" appears when the launcher can't reach Steam (#10) |
+| Oct 30 | **Toward Cyberpunk 2077 standalone on Vision Pro** ([`avp-port`](https://github.com/Ag3497120/VeRantyx/tree/avp-port)): VXRuntime builds for visionOS, our Windows test programs run on the headset ahead-of-time compiled (no JIT) and draw in an immersive space at 90 Hz; Cyberpunk itself starts but stops at its memory-pool reservations (the game reserves ~135 GB of address space, apps get ~63 GB). Not playable |
 | Oct 27 | **Native ARM64 Alyx in the Mac app**, on `nativeArmRefine`: Windows / Native ARM64 launch mode, a separate installation from the owner's Steam depots, ALVR for Pico / Quest, session supervision, FPS captures and fixes for tracking and controller input ([native notes](NativeARM/README.md)) |
 | Oct 27 | **Direct3D 12, first real game**: Cyberpunk 2077 (D3D12 only) gets through its logos, intro video and title to character creation, characters lit correctly; all 20,937 of its non-ray-tracing shaders translate and compile; the stall-heavy CPU side of `ExecuteCommandLists` cut by about half in a synthetic test. Branch [`d3d12-games`](https://github.com/Ag3497120/VeRantyx/tree/d3d12-games), not in the app yet |
 | Oct 27 | **[Discord server](https://discord.gg/h2znwYJt3)** opened: setup help, game reports, new versions |
@@ -103,17 +111,17 @@ Prefer Terminal? `scripts/setup_vxrt.sh` then `scripts/launch_vxrt_alyx.sh` — 
 | **Google Earth VR** | 🟡 Runs in VR, playtest pending | 56.7 fps, M1 Max |
 | **Elite Dangerous** | 🟡 Flies on the Mac's screen and in the headset (official launcher; keyboard, mouse, DualSense) | flat: about 52-122 fps in game; VR: 30-35 fps at 1700×1372 per eye; M1 Max, Low |
 | **No Man's Sky** | 🟡 Played on the Mac's screen (terrain drawn); in VR, picture and sound checked with both the Vision Pro's VeRantyx app and the ALVR app (hand input through ALVR too). Started by your own Windows Steam on VXRuntime (its DRM wrapper needs that Steam; you sign in yourself) | flat: 45.7 fps (1512×982, Medium, on a planet, 0.3.1); headset: 25-40 fps measured before 0.3.1 |
-| **Cyberpunk 2077** | 🧪 Direct3D 12, in progress on the `d3d12-games` branch: logos, intro video, title and character creation drawn correctly; not playable yet | character creation still slow (about 5-7 fps) |
+| **Cyberpunk 2077** | 🧪 Direct3D 12, in progress on the `vr-main` branch (not in the app): in game on the Mac's screen with NPU frame prediction; not playable in the headset yet | El Coyote, Low, FSR2 Performance: about 20 fps of real frames, about 50 shown with prediction (M1 Max) |
 | **The Lab** | 🟡 Runs in VR, but only the title scene has been measured; the mini-games are not optimized yet (a player saw 20-30 fps) | title scene 54.0 fps, M1 Max |
 | Other SteamVR games | ⚪ Most still need Windows functions VXRuntime lacks | [games/](games/) has what is known |
 
-Checked on a MacBook Pro M1 Max and a MacBook Air M5. Numbers come from harness runs with their run ids in
+Checked on a MacBook Pro M1 Max (most numbers) and a MacBook Air M5 (some games). Numbers come from harness runs with their run ids in
 [games/](games/), or from the recorded play named next to them. Not supported yet: Direct3D 12 games in the app
 (in progress, above), ray tracing; anti-cheat is never worked around.
 
 | Headset | How | Status |
 |---|---|---|
-| **Apple Vision Pro** (M2 or M5) | VeRantyx app: hand tracking + Joy-Con, or bare hands — **no VR controllers needed** | ✅ Checked |
+| **Apple Vision Pro** (checked on M2) | VeRantyx app: hand tracking + Joy-Con, or bare hands — **no VR controllers needed** | ✅ Checked |
 | **Apple Vision Pro** | "ALVR" app from the App Store | ✅ Checked (Alyx, Earth VR) |
 | **Meta Quest, Pico** | ALVR 20.x, Wi-Fi or USB cable | 🟡 Played by testers (Quest 1, Quest 3, Pico 4 Ultra); not tested by me — [reports welcome](https://github.com/Ag3497120/VeRantyx/issues/new?template=alvr-headset.yml) |
 
@@ -152,9 +160,10 @@ Everything below is in this repository, MIT licensed, and was written for this p
 
 | Branch | What it is | For | Status |
 |---|---|---|---|
-| **[`main`](https://github.com/Ag3497120/VeRantyx)** = [`vxrt`](https://github.com/Ag3497120/VeRantyx/tree/vxrt) | Windows games + real SteamVR on **VXRuntime** | Players (via the app) and developers | ⭐ Current, developed daily — [full guide](docs/VXRT.md) |
-| [`d3d12-games`](https://github.com/Ag3497120/VeRantyx/tree/d3d12-games) | Direct3D 12 toward real games (Cyberpunk 2077 first) | Developers | 🧪 Work in progress |
-| **`nativeArmRefine`** | Native ARM64 Alyx integrated into the Mac app, with our OpenVR runtime and ALVR | Developers and native Alyx testing | Active work — [native notes](NativeARM/README.md) |
+| **[`main`](https://github.com/Ag3497120/VeRantyx)** | Windows games + real SteamVR on **VXRuntime**, and native ARM64 Alyx in the Mac app (merged from `nativeArmRefine`) | Players (via the app) and developers | ⭐ Current — [full guide](docs/VXRT.md), [native notes](NativeARM/README.md) |
+| [`vr-main`](https://github.com/Ag3497120/VeRantyx/tree/vr-main) | Direct3D 12 (Cyberpunk 2077), NPU frame prediction, stereo, MetalFX, ahead-of-time ARM64 compilation, merged | Developers | 🧪 Work in progress, not in the app |
+| [`avp-port`](https://github.com/Ag3497120/VeRantyx/tree/avp-port) | VXRuntime on visionOS: Windows games standalone on Vision Pro | Developers | 🧪 Experimental: test programs run, no game yet |
+| [`d3d12-games`](https://github.com/Ag3497120/VeRantyx/tree/d3d12-games) | Direct3D 12 toward real games (included in `vr-main`) | Developers | 🧪 Work in progress |
 | [`native`](https://github.com/Ag3497120/VeRantyx/tree/native) | Valve's **Linux ARM64** Alyx runs natively on macOS (patched Klepton + our OpenVR runtime) | Alyx only; the fastest path, no CPU translation | Paused since 2026-10-11 (the code is also in `main` under `NativeARM/`) |
 | [`wine`](https://github.com/Ag3497120/VeRantyx/tree/wine) | Windows build + real SteamVR under **Wine 11**, DXVK → MoltenVK | Reference / history | Kept as of 2026-10-10, ~30 fps |
 
