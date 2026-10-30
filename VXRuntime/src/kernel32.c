@@ -136,6 +136,7 @@ static WINAPI void ExitProcess(DWORD code) {
     }
     vx_profile_finish();
     vx_jobs_process_exit();
+    vx_shader_progress_exit();
     fflush(stdout); fflush(stderr); _exit((int)code);
 }
 int vx_process_info(HANDLE h, DWORD *code);

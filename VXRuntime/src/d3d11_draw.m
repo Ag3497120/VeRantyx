@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include "d3d_common.h"
 #include "dxbc.h"
+#include "shader_progress.h"
 #include "gpu_ir.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -63,8 +64,8 @@ static id<MTLFunction> dual_source_function(d3d_device *dev, d3d_shader *s) {
         if (at) {
             NSString *source = [NSString stringWithFormat:@"%.*s o1 [[color(0), index(1)]];%s", (int)(at - msl), msl, at + strlen(" o1 [[color(1)]];")];
             NSError *err = nil;
-            id<MTLLibrary> lib = [(__bridge id<MTLDevice>)dev->mtl newLibraryWithSource:source options:nil error:&err];
-            id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+            id<MTLLibrary> lib = vx_metal_library((__bridge id<MTLDevice>)dev->mtl, source, &err);
+            id<MTLFunction> fn = vx_metal_function(lib, @"vx_main");
             if (fn) s->dual = (void *)CFBridgingRetain(fn);
             else vx_log("Direct3D: dual-source variant of shader %08x did not compile: %s", s->hash, err.localizedDescription.UTF8String);
         }
@@ -75,9 +76,11 @@ static id<MTLFunction> dual_source_function(d3d_device *dev, d3d_shader *s) {
 static id<MTLFunction> shader_function(d3d_shader *s) {
     if (!s) return nil;
     if (!__atomic_load_n(&s->ready, __ATOMIC_ACQUIRE)) {
+        uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         pthread_mutex_lock(&g_compile_lock);
         while (!s->ready) pthread_cond_wait(&g_compiled, &g_compile_lock);
         pthread_mutex_unlock(&g_compile_lock);
+        vx_shader_wait_finished(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start);
     }
     return (__bridge id<MTLFunction>)s->function;
 }
@@ -143,7 +146,9 @@ static HRESULT create_shader(d3d_device *dev, const void *code, size_t size, int
     d3d_shader *s = d3d_alloc(sizeof *s, K_SHADER, vtbl, dev);
     s->base.destroy = shader_destroy;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    if (dxbc_translate(code, size, &s->info) || s->info.type != want) {
+    int translated = !dxbc_translate(code, size, &s->info) && s->info.type == want;
+    vx_shader_translation_finished(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, translated);
+    if (!translated) {
         vx_log("Direct3D: shader not translated: %s", s->info.error[0] ? s->info.error : "wrong shader type");
         d3d_release(&s->base);
         return E_INVALIDARG;
@@ -160,7 +165,7 @@ static HRESULT create_shader(d3d_device *dev, const void *code, size_t size, int
     if (sync < 0) sync = getenv("VXRT_SYNC_SHADERS") != NULL;
     d3d_addref(&s->base);                              // kept until its compile is done
     void (^done)(id<MTLLibrary>, NSError *) = ^(id<MTLLibrary> lib, NSError *err) {
-        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+        id<MTLFunction> fn = vx_metal_function(lib, @"vx_main");
         if (vx_trace) shader_stats(t1 - t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t1);
         if (!fn) {
             vx_log("Direct3D: translated shader %08x did not compile: %s", s->hash, err.localizedDescription.UTF8String);
@@ -175,8 +180,9 @@ static HRESULT create_shader(d3d_device *dev, const void *code, size_t size, int
     };
     if (sync) {
         NSError *err = nil;
-        done([(__bridge id<MTLDevice>)dev->mtl newLibraryWithSource:source options:nil error:&err], err);
-    } else [(__bridge id<MTLDevice>)dev->mtl newLibraryWithSource:source options:nil completionHandler:done];
+        id<MTLLibrary> lib = vx_metal_library((__bridge id<MTLDevice>)dev->mtl, source, &err);
+        done(lib, err);
+    } else vx_metal_library_async((__bridge id<MTLDevice>)dev->mtl, source, done);
     *out = s;
     return S_OK;
 }
@@ -1049,8 +1055,8 @@ static id<MTLFunction> shader_variant(d3d_device *dev, d3d_shader *s, const char
     if (!s->variant_tried && msl) {
         s->variant_tried = 1;
         NSError *err = nil;
-        id<MTLLibrary> lib = [(__bridge id<MTLDevice>)dev->mtl newLibraryWithSource:@(msl) options:nil error:&err];
-        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+        id<MTLLibrary> lib = vx_metal_library((__bridge id<MTLDevice>)dev->mtl, @(msl), &err);
+        id<MTLFunction> fn = vx_metal_function(lib, @"vx_main");
         if (fn) s->variant = (void *)CFBridgingRetain(fn);
         else vx_log("Direct3D: %s of shader %08x did not compile: %s", what, s->hash, err.localizedDescription.UTF8String);
     }
@@ -1169,7 +1175,7 @@ static id<MTLRenderPipelineState> pipeline(d3d_context *c, d3d_draw_state *s, id
     }
     NSError *err = nil;
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    ps_state = [(__bridge id<MTLDevice>)c->base.dev->mtl newRenderPipelineStateWithDescriptor:pd error:&err];
+    ps_state = vx_metal_render_pipeline((__bridge id<MTLDevice>)c->base.dev->mtl, pd, &err);
     if (vx_trace) {                                    // VXRT_TRACE: every 200 pipeline states, the time spent making them
         static uint64_t n, ns;
         __atomic_add_fetch(&ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, __ATOMIC_RELAXED);
@@ -1778,8 +1784,8 @@ void d3d_flash_frame(d3d_device *dev, d3d_texture *t, d3d_texture *dst, const ui
             "    if (c.b - max(c.r, c.g) > 70 && c.b > 120) atomic_fetch_add_explicit(&n[2], 1, memory_order_relaxed);\n"
             "}\n";
         NSError *err = nil;
-        id<MTLLibrary> lib = [mdev newLibraryWithSource:@(msl) options:nil error:&err];
-        id<MTLComputePipelineState> pso = lib ? [mdev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"flash_thumb"] error:&err] : nil;
+        id<MTLLibrary> lib = vx_metal_library_entries(mdev, @(msl), @[@"flash_thumb"], &err);
+        id<MTLComputePipelineState> pso = lib ? vx_metal_compute_pipeline(mdev, vx_metal_function(lib, @"flash_thumb"), &err) : nil;
         if (!pso) { vx_log("flash capture: %s", err.localizedDescription.UTF8String); g_flash.on = 0; return; }
         g_flash.pso = (void *)CFBridgingRetain(pso);
     }
@@ -2184,8 +2190,8 @@ static id<MTLComputePipelineState> vs_kernel_pipeline(d3d_context *c, d3d_draw_s
         }
     }
     NSError *err = nil;
-    id<MTLLibrary> lib = source.length ? [(__bridge id<MTLDevice>)c->base.dev->mtl newLibraryWithSource:source options:nil error:&err] : nil;
-    id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"vx_main"] : nil;
+    id<MTLLibrary> lib = source.length ? vx_metal_library((__bridge id<MTLDevice>)c->base.dev->mtl, source, &err) : nil;
+    id<MTLFunction> fn = vx_metal_function(lib, @"vx_main");
     id<MTLComputePipelineState> pso = nil;
     if (!fn) {
         vx_log("Direct3D: kernel version of vertex shader %08x did not compile: %s", vs->hash, err.localizedDescription.UTF8String);
@@ -2211,7 +2217,7 @@ static id<MTLComputePipelineState> vs_kernel_pipeline(d3d_context *c, d3d_draw_s
     MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new];
     cd.computeFunction = fn;
     cd.stageInputDescriptor = sd;
-    pso = [(__bridge id<MTLDevice>)c->base.dev->mtl newComputePipelineStateWithDescriptor:cd options:0 reflection:nil error:&err];
+    pso = vx_metal_compute_descriptor((__bridge id<MTLDevice>)c->base.dev->mtl, cd, &err);
     if (!pso) vx_log("Direct3D: vertex kernel pipeline failed: %s", err.localizedDescription.UTF8String);
     pthread_mutex_lock(&lock);
     cache[key] = pso ? (id)pso : (id)[NSNull null];
@@ -2300,9 +2306,9 @@ static void so_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t
         pthread_mutex_lock(&lock);
         if (!pack) {
             NSError *err = nil;
-            id<MTLLibrary> lib = [dev newLibraryWithSource:@(g_so_source) options:nil error:&err];
-            id<MTLFunction> fn = [lib newFunctionWithName:@"vx_so"];
-            pack = fn ? [dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+            id<MTLLibrary> lib = vx_metal_library_entries(dev, @(g_so_source), @[@"vx_so"], &err);
+            id<MTLFunction> fn = vx_metal_function(lib, @"vx_so");
+            pack = fn ? vx_metal_compute_pipeline(dev, fn, &err) : nil;
             if (!pack) vx_log("Direct3D: stream output kernel failed: %s", err.localizedDescription.UTF8String);
         }
         pthread_mutex_unlock(&lock);
@@ -2377,7 +2383,7 @@ static void gs_draw(d3d_context *c, uint32_t count, uint32_t instances, uint32_t
     if (!vk) return;
     if (!gs->compute) {
         NSError *err = nil;
-        id<MTLComputePipelineState> p = [(__bridge id<MTLDevice>)c->base.dev->mtl newComputePipelineStateWithFunction:shader_function(gs) error:&err];
+        id<MTLComputePipelineState> p = vx_metal_compute_pipeline((__bridge id<MTLDevice>)c->base.dev->mtl, shader_function(gs), &err);
         if (!p) { vx_log("Direct3D: geometry kernel pipeline failed: %s", err.localizedDescription.UTF8String); return; }
         gs->compute = (void *)CFBridgingRetain(p);
     }
@@ -2532,7 +2538,7 @@ static WINAPI void ctx_dispatch(void *this, uint32_t x, uint32_t y, uint32_t z) 
     if (!cs->compute) {
         if (!shader_function(cs)) return;              // did not compile
         NSError *err = nil;
-        id<MTLComputePipelineState> pso = [(__bridge id<MTLDevice>)c->base.dev->mtl newComputePipelineStateWithFunction:shader_function(cs) error:&err];
+        id<MTLComputePipelineState> pso = vx_metal_compute_pipeline((__bridge id<MTLDevice>)c->base.dev->mtl, shader_function(cs), &err);
         if (!pso) { vx_log("Direct3D: compute pipeline failed: %s", err.localizedDescription.UTF8String); return; }
         cs->compute = (void *)CFBridgingRetain(pso);
     }

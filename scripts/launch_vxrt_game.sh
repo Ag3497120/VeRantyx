@@ -20,6 +20,7 @@ export VXRT_VR_ROOT="${VXRT_VR_ROOT:-$VERANTYX_VR_DRIVE/vxrt_root}"
 export VXRT_VR_OVERLAY="${VXRT_VR_OVERLAY:-$VERANTYX_VR_DRIVE/vxrt_steam_overlay}"
 LOG_DIR="${VXRT_VR_LOG_DIR:-$REPO_ROOT/logs}"
 export VXRT_VR_LOG_DIR="$LOG_DIR"
+export VERANTYX_SHADER_PROGRESS_FILE="${VERANTYX_SHADER_PROGRESS_FILE:-$LOG_DIR/shader-progress.json}"
 VXRT="$REPO_ROOT/VXRuntime/build/vxrt"
 [[ "${VXRT_ARM64:-0}" == 1 ]] && VXRT="$VXRT-arm64"   # (the ARM64 runtime, the program translated: experimental)
 
@@ -101,6 +102,7 @@ cd "$GAME_DIR"
 # Keep the optional control socket scoped to the game. SteamVR is already running in separate VXRuntime
 # processes, and sharing the same Unix socket path would let those processes replace each other's endpoint.
 GAME_ENV=("VXRT_ROOT=$VXRT_VR_ROOT" "VXRT_OVERLAY=$OVERLAY" "VXRT_DLL_PATH=$VXRT_DLL_DIRS"
+    "VXRT_SHADER_PROGRESS_FILE=$VERANTYX_SHADER_PROGRESS_FILE" "VXRT_SHADER_PROGRESS_EXE=$EXE_NAME"
     "VXRT_STEAM_BRIDGE=1" "VXRT_DEBUGGER=${VXRT_DEBUGGER:-1}" "VXRT_DEBUG_OUTPUT=1" "VXRT_LOG_TIME=1")
 # Played in the headset, the game's window seldom stays the Mac's frontmost one; told it is in the background, a game
 # stops reading its controllers (and keys). Flat, it is the window the player uses: it takes the Mac's focus.

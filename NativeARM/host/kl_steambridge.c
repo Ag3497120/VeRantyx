@@ -71,19 +71,32 @@ static const char *find_dylib(void) {
     return NULL;
 }
 
+const char *kl_steambridge_path(const char *path) {
+    const char *state = getenv("VERANTYX_STEAM_STATE"), *home = getenv("HOME");
+    if (!path || !state || !home) return path;
+    size_t n = strlen(home);
+    if (strncmp(path, home, n) || strncmp(path + n, "/.steam", 7) || (path[n + 7] && path[n + 7] != '/')) return path;
+    static _Thread_local char mapped[PATH_MAX];
+    snprintf(mapped, sizeof mapped, "%s%s", state, path + n + 7);
+    return mapped;
+}
+
 void kl_steambridge_install(void) {
     if (getenv("VERANTYX_NO_STEAM")) return;
     const char *dylib = find_dylib();
     const char *home = getenv("HOME");
     if (!home) return;
     char dir[PATH_MAX], sub[PATH_MAX], f[PATH_MAX];
-    snprintf(dir, sizeof dir, "%s/.steam", home);
-    snprintf(sub, sizeof sub, "%s/.steam/sdkarm64", home);
+    const char *state = getenv("VERANTYX_STEAM_STATE");
+    if (state) snprintf(dir, sizeof dir, "%s", state);
+    else snprintf(dir, sizeof dir, "%s/.steam", home);
+    snprintf(sub, sizeof sub, "%s/sdkarm64", dir);
     mkdir(dir, 0755); mkdir(sub, 0755);
     pid_t pid = steam_pid();
+    if (!pid) { fprintf(stderr, "  [steam] Steam.app must be running and signed in\n"); return; }
     snprintf(f, sizeof f, "%s/steam.pid", dir);
     FILE *fp = fopen(f, "w");
-    if (fp) { fprintf(fp, "%d\n", (int)(pid ? pid : getpid())); fclose(fp); }
+    if (fp) { fprintf(fp, "%d\n", (int)pid); fclose(fp); }
     snprintf(f, sizeof f, "%s/steamclient.so", sub);
     fp = fopen(f, "a"); if (fp) fclose(fp);             // the path must exist; dlopen is answered here
     if (dylib) {

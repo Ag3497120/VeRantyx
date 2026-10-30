@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <unistd.h>
+#include <atomic>
 
 // From Klepton: the MoltenVK physical device behind a guest VkInstance.
 extern "C" void *kl_vulkan_xr_physical_device(void *vk_instance);
@@ -48,7 +49,7 @@ public:
     }
     HmdMatrix34_t GetEyeToHeadTransform(EVREye eye) override {
         HmdMatrix34_t m; vrrt::identity34(&m);
-        m.m[0][3] = (eye == Eye_Left ? -0.5f : 0.5f) * vrrt::config().ipd;
+        m.m[0][3] = (eye == Eye_Left ? -0.5f : 0.5f) * vrrt::headset_ipd();
         return m;
     }
     bool GetTimeSinceLastVsync(float *seconds, uint64_t *counter) override {
@@ -163,7 +164,7 @@ public:
         case Prop_DeviceBatteryPercentage_Float: return 1.0f;
         case Prop_SecondsFromVsyncToPhotons_Float: return 0.011f;
         case Prop_DisplayFrequency_Float: return (float)vrrt::config().displayHz;
-        case Prop_UserIpdMeters_Float: return vrrt::config().ipd;
+        case Prop_UserIpdMeters_Float: return vrrt::headset_ipd();
         case Prop_UserHeadToEyeDepthMeters_Float: return 0.f;
         case Prop_DisplayMCOffset_Float: case Prop_DisplayMCScale_Float: return 0.f;
         case Prop_DisplayGCBlackClamp_Float: return 0.f;
@@ -280,6 +281,8 @@ public:
     bool PollNextEvent(VREvent_t *e, uint32_t size) override {
         VREvent_t ev;
         if (!vrrt::pop_event(&ev)) return false;
+        if (ev.eventType >= VREvent_Input_BindingLoadFailed && ev.eventType <= VREvent_Input_BindingsUpdated)
+            vrrt::log("input event delivered: %u", ev.eventType);
         memcpy(e, &ev, std::min<uint32_t>(size, sizeof ev));
         return true;
     }
@@ -299,8 +302,18 @@ public:
 
     // ---- legacy controller state ----
     bool GetControllerState(TrackedDeviceIndex_t dev, VRControllerState_t *st, uint32_t size) override {
-        if (dev != 1 && dev != 2) return false;
+        if ((dev != 1 && dev != 2) || !st) return false;
         VRControllerState_t s; memset(&s, 0, sizeof s);
+        if (!vrrt::legacy_input_enabled()) {
+            // Hybrid engines may also poll this old channel. Raw A/X presses
+            // here can trigger an operation outside the action bindings.
+            memcpy(st, &s, std::min<uint32_t>(size, sizeof s));
+            static std::atomic<uint32_t> reported{0};
+            const uint32_t bit = 1u << dev;
+            if (!(reported.fetch_or(bit, std::memory_order_relaxed) & bit))
+                vrrt::log("legacy controller input suppressed: device=%u; action manifest owns buttons and axes", dev);
+            return false;
+        }
         const vrrt::PoseSet &p = vrrt::last_poses();
         const vrrt::SharedHands &h = p.hands;
         const bool left = dev == 1;
@@ -325,11 +338,16 @@ public:
         return true;
     }
     bool GetControllerStateWithPose(ETrackingUniverseOrigin, TrackedDeviceIndex_t dev, VRControllerState_t *st, uint32_t size, TrackedDevicePose_t *pose) override {
-        if (!GetControllerState(dev, st, size)) return false;
+        if (!GetControllerState(dev, st, size)) {
+            if (pose) { memset(pose, 0, sizeof *pose); pose->eTrackingResult = TrackingResult_Uninitialized; }
+            return false;
+        }
         if (pose) *pose = vrrt::last_poses().dev[dev];
         return true;
     }
-    void TriggerHapticPulse(TrackedDeviceIndex_t, uint32_t, unsigned short) override {}
+    void TriggerHapticPulse(TrackedDeviceIndex_t dev, uint32_t, unsigned short microseconds) override {
+        if (dev == 1 || dev == 2) vrrt::haptic((int)dev - 1, 0, microseconds / 1000000.f, 0, 1.f);
+    }
     const char *GetButtonIdNameFromEnum(EVRButtonId b) override { static char buf[32]; snprintf(buf, sizeof buf, "k_EButton_%d", (int)b); return buf; }
     const char *GetControllerAxisTypeNameFromEnum(EVRControllerAxisType t) override { static char buf[40]; snprintf(buf, sizeof buf, "k_eControllerAxis_%d", (int)t); return buf; }
     bool IsInputAvailable() override { return true; }
@@ -337,7 +355,7 @@ public:
     bool ShouldApplicationPause() override { return false; }
     bool ShouldApplicationReduceRenderingWork() override { return false; }
     EVRFirmwareError PerformFirmwareUpdate(TrackedDeviceIndex_t) override { return VRFirmwareError_None; }
-    void AcknowledgeQuit_Exiting() override { vrrt::log("application acknowledged quit"); }
+    void AcknowledgeQuit_Exiting() override { vrrt::acknowledge_quit(); }
     uint32_t GetAppContainerFilePaths(char *buf, uint32_t cap) override { if (buf && cap) buf[0] = 0; return 1; }
     const char *GetRuntimeVersion() override { return "2.15.6"; }
     EVRInitError SetSDKVersion(uint32_t a, uint32_t b, uint32_t c) override { vrrt::log("application SDK version %u.%u.%u", a, b, c); return VRInitError_None; }

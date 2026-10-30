@@ -50,7 +50,12 @@ mkdir -p "$LOG_DIR" "$VXRT_VR_OVERLAY/config"
 # What a game's loading page would show (Half-Life: Alyx's "Press Trigger To Start" after a level loads): the web UI
 # stand-in writes it here, the encoder draws it into the picture (scripts/vxrt_helper.swift, GamePromptOverlay).
 export VERANTYX_GAME_PROMPT_FILE="${VERANTYX_GAME_PROMPT_FILE:-$LOG_DIR/game-prompt.txt}"
-rm -f "$VERANTYX_GAME_PROMPT_FILE"
+export VERANTYX_GAME_STATE_FILE="${VERANTYX_GAME_STATE_FILE:-$LOG_DIR/game-state.json}"
+export VERANTYX_SHADER_PROGRESS_FILE="${VERANTYX_SHADER_PROGRESS_FILE:-$LOG_DIR/shader-progress.json}"
+rm -f "$VERANTYX_GAME_PROMPT_FILE" "$VERANTYX_GAME_STATE_FILE"
+if [[ -s "$VERANTYX_SHADER_PROGRESS_FILE" ]]; then
+    mv -f "$VERANTYX_SHADER_PROGRESS_FILE" "${VERANTYX_SHADER_PROGRESS_FILE%.json}.prev.json"
+fi
 # The last start's logs are kept beside the new ones (<name>.prev.log), so two runs can be compared.
 for f in vxrt-steamvr.log hardware-encoder.log webui-standin.log; do
     [[ -s "$LOG_DIR/$f" ]] && mv -f "$LOG_DIR/$f" "$LOG_DIR/${f%.log}.prev.log"
@@ -188,7 +193,7 @@ cleanup() {
     [[ -n "${ENCODER_PID:-}" ]] && kill -TERM "$ENCODER_PID" 2>/dev/null || true
     pkill -TERM -f "^$ENCODER\$" 2>/dev/null || true             # (the encoder itself: ENCODER_PID is its restart loop)
     [[ -n "${WEBUI_PID:-}" ]] && kill -TERM "$WEBUI_PID" 2>/dev/null || true
-    rm -f "$VERANTYX_GAME_PROMPT_FILE"
+    rm -f "$VERANTYX_GAME_PROMPT_FILE" "$VERANTYX_GAME_STATE_FILE"
     [[ -n "${VR_PID:-}" ]] && kill -TERM "$VR_PID" 2>/dev/null || true
     pkill -TERM -f "$VXRT_PATTERN" 2>/dev/null || true   # vrserver and vrcompositor outlive vrcmd, as on Windows
     sleep 1
@@ -209,7 +214,14 @@ if [[ "${VERANTYX_ALVR:-0}" == 1 && ! -s "$TANGENTS" ]]; then
     [[ -f "$SHARED_FRAME" ]] || python3 -c "import sys; open(sys.argv[1], 'wb').truncate(64 + 2 * (88 + 4096 * 4096 * 8) + 312 + 1024)" "$SHARED_FRAME"
     touch "$FIRST_WAIT"
 fi
-(while :; do VERANTYX_SHARED_FRAME="$SHARED_FRAME" "$ENCODER"; [[ $? == 75 ]] || break; done) >"$LOG_DIR/hardware-encoder.log" 2>&1 &
+(
+    while :; do
+        encoder_status=0
+        # A negotiated display change or a stuck ALVR handshake requests a restart, not errexit.
+        VERANTYX_SHARED_FRAME="$SHARED_FRAME" "$ENCODER" || encoder_status=$?
+        [[ "$encoder_status" == 75 ]] || exit "$encoder_status"
+    done
+) >"$LOG_DIR/hardware-encoder.log" 2>&1 &
 ENCODER_PID=$!
 if [[ -f "$FIRST_WAIT" ]]; then
     echo "First start with this ALVR headset: open the ALVR app on the headset and connect now (SteamVR starts once it has; up to ${VERANTYX_ALVR_FIRST_WAIT:-180} s)"

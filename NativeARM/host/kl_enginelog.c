@@ -27,8 +27,10 @@ static fmt1_fn g_real_msg, g_real_warning;
 static void (*g_real_debug_print)(const char *);
 static int g_enabled = 1;
 static unsigned g_lines;
+extern void vrrt_loading_log(const char *text);
 
 static void emit(const char *kind, const char *text) {
+    vrrt_loading_log(text);
     if (!g_enabled) return;
     size_t n = strlen(text);
     fprintf(stderr, "[engine%s] %s%s", kind, text, n && text[n - 1] == '\n' ? "" : "\n");

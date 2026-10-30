@@ -89,7 +89,8 @@ struct PoseHistoryEntry {
 struct PoseHistory {
     volatile LONG writeCount;
     uint32_t magic;
-    uint32_t reserved[2];
+    uint32_t heightMagic;
+    volatile LONG heightOffsetBits;
     PoseHistoryEntry entries[16];
 };
 #pragma pack(pop)
@@ -127,6 +128,7 @@ static_assert(kSharedHapticsOffset >= kSharedExtrasOffset + sizeof(SharedExtras)
 static_assert(kSharedExtrasOffset >= kHandsOffset + sizeof(SharedHands) && kSharedExtrasOffset + sizeof(SharedExtras) <= kPoseHistoryOffset,
               "SharedExtras must sit between SharedHands and the pose history");
 static const uint32_t kPoseHistoryMagic = 0x53485056; // "VPHS"
+static const uint32_t kHeightOffsetMagic = 0x464f4856; // "VHOF"
 static_assert(kPoseHistoryOffset + sizeof(PoseHistory) <= kSharedMapSize, "Pose history must fit in the shared map");
 static HANDLE hMapFile = NULL;
 static void* g_sharedMap = nullptr;
@@ -208,6 +210,12 @@ static void KeepHeightAcrossBreaks(SharedHands* hands) {
         g_lastCorrectedHeight = raw + g_heightOffset;
     }
     const float offset = g_heightOffset;
+    // Action poses and the proxy's decoupled poses must use the same origin after tracking resumes.
+    if (g_poseHistory) {
+        LONG bits;
+        memcpy(&bits, &offset, sizeof(bits));
+        InterlockedExchange(&g_poseHistory->heightOffsetBits, bits);
+    }
     ReleaseSRWLockExclusive(&g_heightLock);
     if (message[0]) LogDriver(message);
     if (offset != 0.0f) {
@@ -554,6 +562,7 @@ static bool InitSharedMemoryDriver() {
     memset(pSharedHands, 0, sizeof(SharedHands));
     memset(g_poseHistory, 0, sizeof(PoseHistory));
     g_poseHistory->magic = kPoseHistoryMagic;
+    g_poseHistory->heightMagic = kHeightOffsetMagic;
     g_frameSequence = 0;
     MemoryBarrier();
 

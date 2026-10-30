@@ -1,0 +1,17 @@
+{
+  "action_sets": [{"name": "/actions/move"}, {"name": "/actions/buttons"}],
+  "actions": [
+    {"name": "/actions/move/in/walk", "type": "boolean"},
+    {"name": "/actions/move/in/walkdefault", "type": "boolean"},
+    {"name": "/actions/move/in/direction", "type": "vector2"},
+    {"name": "/actions/move/in/turnleft", "type": "boolean"},
+    {"name": "/actions/move/in/turnright", "type": "boolean"},
+    {"name": "/actions/move/in/continuousturn", "type": "vector2"},
+    {"name": "/actions/move/in/clickturn", "type": "boolean"},
+    {"name": "/actions/move/in/stickclick", "type": "boolean"},
+    {"name": "/actions/buttons/in/primary", "type": "boolean"},
+    {"name": "/actions/buttons/in/secondary", "type": "boolean"},
+    {"name": "/actions/buttons/in/ejectclip", "type": "boolean"}
+  ],
+  "default_bindings": [{"controller_type": "oculus_touch", "binding_url": "locomotion_touch.json"}]
+}

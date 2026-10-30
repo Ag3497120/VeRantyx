@@ -33,6 +33,10 @@ extern void vrrt_init(const char *gameDir);
 // openvr_api finds its runtime through a JSON path registry; point it (via
 // VR_PATHREG_OVERRIDE) at one naming a directory whose vrclient.so is ours.
 static void install_vr_path_registry(void) {
+    if (getenv("VR_PATHREG_OVERRIDE")) {
+        kl_dl_add_host_module("/vrclient.so", vrrt_dlsym);
+        return;                 // the app prepared its private, correctly escaped registry
+    }
     const char *home = getenv("HOME");
     char dir[PATH_MAX], sub[PATH_MAX], file[PATH_MAX], reg[PATH_MAX];
     snprintf(dir, sizeof dir, "%s/Verantyx_VR_Drive/verantyx_openvr", home ? home : "/tmp");
@@ -151,11 +155,24 @@ int main(int argc, char **argv) {
     // compile over more threads (macOS 13.3+). VERANTYX_MVK_DEFAULTS=0 skips.
     if (!getenv("VERANTYX_MVK_DEFAULTS") || strcmp(getenv("VERANTYX_MVK_DEFAULTS"), "0") != 0)
         setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
-    // ...and take those compiles off the render thread: an object whose
-    // pipeline is still compiling is drawn a few frames late instead of the
-    // frame freezing (Klepton kl_vk_async.inc). VERANTYX_ASYNC_PIPELINES=0 off.
+    // Argument-buffer bindings flicker sun shadows even with a fixed head and
+    // synchronous pipelines. Direct bindings keep the depth rendering intact.
+    // Retain an explicit override for driver comparisons.
+    setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
+    fprintf(stderr, "  [native] Vulkan resource bindings: %s (MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=%s)\n",
+            strcmp(getenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS"), "0") == 0 ? "direct" : "argument buffers",
+            getenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS"));
+    // Compile materials on workers. Pending colour/depth draws appear later,
+    // at a stereo frame boundary, without blocking the render thread.
+    // VERANTYX_ASYNC_PIPELINES=0 uses synchronous creation instead.
     if (!getenv("VERANTYX_ASYNC_PIPELINES") || strcmp(getenv("VERANTYX_ASYNC_PIPELINES"), "0") != 0)
         setenv("KL_VK_ASYNC_PIPELINES", "1", 0);
+    // Deckard assumes EDS3 includes dynamic colour masks. Select static variants
+    // on drivers without those masks; feature clamping after selection is late.
+    setenv("KL_VK_ALYX_STATIC_COLOR_WRITE", "1", 0);
+    // The persistent worker archive owns completed shaders. Keeping engine
+    // caches small avoids their synchronous serialization on frame workers.
+    setenv("KL_VK_PRIVATE_CACHE", "1", 0);
     kl_glibc_install(argv[0]);
     kl_set_library_path(g_libdir);
     kl_thread_init();
@@ -170,6 +187,7 @@ int main(int argc, char **argv) {
     // SDL2's dummy video driver: no X11, no Wayland. The HMD is our OpenVR runtime.
     setenv("SDL_VIDEODRIVER", "dummy", 0);
     setenv("SDL_AUDIODRIVER", "dummy", 0);
+    setenv("KL_PHONON_HRTF", "0", 1);     // this host uses the owned game's audio data
 
     if (do_probe) return probe(argc - first_lib, argv + first_lib);
 

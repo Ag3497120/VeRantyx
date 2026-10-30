@@ -35,6 +35,10 @@ VXRT_TRACE_TEXTURES=1 ...                  # every Direct3D texture made
 VXRT_TRACE_QI=1 ...                        # each interface a Direct3D/DXGI object was asked for and does not have
 VXRT_WAIT_DUMP=15,30 ...                   # at 15 and 30 s: the threads waiting for over 3 s, for what, from where
 VXRT_SYNC_SHADERS=1 ...                    # compile each shader before CreateXShader returns (not in the background)
+VXRT_SHADER_PROGRESS_FILE=/scratch/shader-progress.json ... # D3D11 library/pipeline counts and timings (atomic JSON)
+VXRT_SHADER_PROGRESS_EXE=hlvr.exe ...      # only this program publishes the JSON; inherited helper processes do not
+VXRT_SHADER_CACHE=0 ...                   # disable D3D11's persistent Metal cache (enabled by default)
+VXRT_SHADER_CACHE_DIR=/scratch/shaders ... # override ~/Library/Caches/VeRantyx/shaders
 VXRT_STATS=1 ...                           # keyed mutex waits and hold times, Map waits, GPU busy time, every few seconds
 VXRT_LOG_TIME=1 ...                        # log lines carry the time of day (the same clock in every process)
 VXRT_TRACE_KEYED=1 VXRT_TRACE_MAPS=1 ...   # every AcquireSync/ReleaseSync (and waits made while holding one); staging Maps
@@ -52,6 +56,54 @@ VXRT_VK_LIVE=switches.txt ...              # Vulkan tuning switches (HOIST_TESS,
 Half-Life: Alyx without Wine: `scripts/launch_vxrt_alyx.sh` (repository root; Steam running on the Mac and signed
 in) starts SteamVR on vxrt, the encoder and the web UI stand-in, then the game with the Steam bridge; extra
 arguments go to the game. The first start compiles the game's shaders (a few minutes).
+
+The Windows VR launchers put D3D11 compilation counters in `logs/shader-progress.json` (the previous session in
+`shader-progress.prev.json`) and a summary in the game's log. Library requests, distinct Metal source hashes,
+completed/failed/pending library and pipeline requests, DXBC translation time and shader wait time are separate.
+Request durations include compiler queue time and overlap across threads; their sum is not loading time or CPU
+time. The separate `cache` counters report library memory/disk hits, actual source compiler requests, strict
+GPU archive hits/misses, archives saved and cache errors. The encoder shows a compact preparation notice with
+library completion counts and an animated activity indicator, below the view's centre in both eyes.
+It appears during an explicit load/input wait, or after 1.5 seconds without the game's direct Submit frames while
+compilation is pending. Background compilation does not cover a running game; real submissions hide a stall
+notice immediately. Compositor frames and the encoder's own loading heartbeats do not reset that stall timer.
+Loading heartbeats do not increment the game's capture count. Detailed numbers stay in the logs and report.
+The trigger prompt requires the game's explicit `Press Trigger To Start` message, fresh compilation telemetry
+from the live game process, and an empty compiler queue for one second. Continuing, another load or a disconnect
+clears that input wait. No whole-game percentage is shown: the game can request further shader batches.
+
+D3D11 automatically saves Metal IR and GPU binaries in `~/Library/Caches/VeRantyx/shaders`. The first use of a
+render or compute pipeline records an `MTLBinaryArchive`; a later process loads its IR as an `MTLLibrary`, then
+reuses the GPU code with `MTLPipelineOptionFailOnBinaryArchiveMiss`. A counted archive hit therefore cannot hide
+GPU recompilation. Entry point names include the source hash so the IR of unrelated shaders named `vx_main`
+remains distinguishable inside a shared render pipeline archive. Identical and concurrent library requests
+within a process share one compiler request; the library memory cache holds at most 256 entries.
+
+`make check`, `make runtime-tests` and `make shader-progress-check` use fresh shader cache directories under
+`build/` and remove them on exit, including after a failed test.
+
+The disk cache keys include the generated Metal source, entry points, render/compute descriptor state, GPU
+identity and macOS build. A changed translator that emits different source, an OS update or a different GPU
+therefore cannot reuse incompatible code. The native Metal archive lookup also validates the descriptor.
+Each pipeline has its own archive; writes are asynchronous and atomic, and Windows process exit drains the
+write queue. Processes can populate the same cache concurrently. Missing, outdated, corrupt or unwritable
+entries fall back to compilation; failed compilations and failed pipelines are not saved. Oldest archives
+beyond 1 GiB per GPU/OS namespace are pruned at startup. The cache can be deleted safely while VXRuntime is
+stopped; it contains only generated artifacts and never changes game files or Apple's own shader cache.
+
+This removes both Apple compiler stages for previously captured pipelines, rather than all loading work:
+DXBC is still translated to recover binding metadata, native pipeline objects still need to be created,
+and new shader/state combinations must compile once. A shader that was created but never used in a pipeline
+has no captured archive yet. No game-wide shader list or first-launch precompilation is assumed.
+`make shader-cache-check` checks fresh-process reuse with actual GPU output, descriptor variants, invalidation,
+corruption, concurrent writers and a disabled/unwritable cache. It needs no game, SteamVR or external compiler.
+
+The capture proxy refreshes the left/right controller device indices from SteamVR's public controller roles even
+after switching to decoupled poses. A headset connected after the game starts therefore does not depend on hand
+poses being valid during the initial compositor exchanges. Role changes are logged as `Controller roles from
+SteamVR`; clients without that interface retain pose-based discovery. The standalone regression
+`make controller-hotplug-check` exercises late input, disconnect/reconnect, coincident hands and small pose arrays
+through VXRuntime without starting SteamVR or a game.
 
 SteamVR without Wine: `scripts/launch_vxrt_steamvr.sh` (repository root) runs vrserver, vrcompositor and the VeRantyx
 driver on vxrt next to the HEVC encoder, using the Wine prefix's SteamVR read-only. Measured on 2026-10-12 without a

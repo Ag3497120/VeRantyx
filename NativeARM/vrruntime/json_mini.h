@@ -9,6 +9,17 @@
 
 namespace json {
 
+inline std::string quote(const std::string &s) {
+    std::string out = "\"";
+    const char hex[] = "0123456789abcdef";
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') { out += '\\'; out += c; }
+        else if (c < 32) { out += "\\u00"; out += hex[c >> 4]; out += hex[c & 15]; }
+        else out += c;
+    }
+    return out + '"';
+}
+
 struct Value {
     enum Type { Null, Bool, Number, String, Array, Object } type = Null;
     bool b = false;

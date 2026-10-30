@@ -27,6 +27,7 @@ export VXRT_VR_ROOT="${VXRT_VR_ROOT:-$VERANTYX_VR_DRIVE/vxrt_root}"
 export VXRT_VR_OVERLAY="${VXRT_VR_OVERLAY:-$VERANTYX_VR_DRIVE/vxrt_steam_overlay}"
 LOG_DIR="${VXRT_VR_LOG_DIR:-$REPO_ROOT/logs}"
 export VXRT_VR_LOG_DIR="$LOG_DIR"
+export VERANTYX_SHADER_PROGRESS_FILE="${VERANTYX_SHADER_PROGRESS_FILE:-$LOG_DIR/shader-progress.json}"
 VXRT="$REPO_ROOT/VXRuntime/build/vxrt"
 [[ "${VXRT_ARM64:-0}" == 1 ]] && VXRT="$VXRT-arm64"   # (the ARM64 runtime, the program translated: experimental)
 
@@ -99,6 +100,7 @@ export VERANTYX_DECOUPLED_POSES="${VERANTYX_DECOUPLED_POSES:-1}"
 cd "$ALYX_BIN"
 VXRT_ROOT="$VXRT_VR_ROOT" VXRT_OVERLAY="$ALYX_STEAM:$VXRT_VR_OVERLAY" VXRT_DLL_PATH="$VXRT_DLL_DIRS" \
 VXRT_STEAM_BRIDGE=1 VXRT_NO_ACTIVATE=1 VXRT_DEBUGGER=1 VXRT_DEBUG_OUTPUT=1 VXRT_LOG_TIME=1 \
+VXRT_SHADER_PROGRESS_FILE="$VERANTYX_SHADER_PROGRESS_FILE" VXRT_SHADER_PROGRESS_EXE=hlvr.exe \
     "$VXRT" hlvr.exe -vr -steam -dx11 -noasserts -nopassiveasserts ${GAME_ARGS[@]+"${GAME_ARGS[@]}"} +map startup "$@" >"$LOG_DIR/vxrt-alyx.log" 2>&1 &
 GAME_PID=$!
 wait "$GAME_PID" || true

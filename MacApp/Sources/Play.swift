@@ -47,8 +47,8 @@ enum Quality: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .standard: return T("Smooth on any Apple silicon Mac.", "どの Apple silicon Mac でも滑らか。")
-        case .sharp: return T("Renders about 1300×1400 per eye (Recommended: 850×920), at 100 Mbps: for Pro and Max chips, best over a USB cable.",
-                              "片目 約 1300×1400 で描画（おすすめは 850×920）・100 Mbps。Pro・Max チップ向け、USB ケーブル推奨。")
+        case .sharp: return T("Renders about 1300×1400 per eye (Recommended: 850×920), at 150 Mbps: for Pro and Max chips, best over a USB cable.",
+                              "片目 約 1300×1400 で描画（おすすめは 850×920）・150 Mbps。Pro・Max チップ向け、USB ケーブル推奨。")
         case .k3: return T("1440×1620 per eye, 60 fps: for Pro and Max chips (24+ GPU cores).", "片目 1440×1620・60 fps。Pro・Max チップ向け（GPU 24 コア以上）。")
         case .k25: return T("2560×2880 per eye rendered: Max chips; 30–50 fps.", "片目 2560×2880 で描画。Max チップ向け、30〜50 fps。")
         case .max: return T("A Vision Pro eye's pixels: 16–21 fps on an M1 Max.", "Vision Pro の片目の画素数。M1 Max で 16〜21 fps。")
@@ -61,6 +61,15 @@ enum Quality: String, CaseIterable, Identifiable {
 
     let title: String
     let appID: String?
+    let backend: GameBackend
+    var captureSeconds: Int?
+    var captureMessage: String?
+    var captures: [FPSCapture] = FPSCapture.load()
+    var captureWired: Bool { wired }
+    @ObservationIgnored private(set) var nativeSession: URL?
+    @ObservationIgnored private var nativeConfig: URL?
+    @ObservationIgnored private var nativeFrameRate = NativeFrameRate()
+    var nativeQuitTimedOut = false
     /// On the Mac's screen, without SteamVR or a headset.
     let flat: Bool
     var phase: Phase = .starting
@@ -113,9 +122,10 @@ enum Quality: String, CaseIterable, Identifiable {
     nonisolated static var dryRun: Bool { ProcessInfo.processInfo.environment["VERANTYX_DRY_RUN"] == "1" }
 
     init(title: String, appID: String? = nil, exe: URL?, headset: Headset, wired: Bool, quality: Quality, known: Title? = nil,
-         flat: Bool = false) throws {
+         flat: Bool = false, backend: GameBackend = .vxrt) throws {
         self.title = title
         self.appID = appID
+        self.backend = backend
         self.headset = headset
         self.wired = wired
         self.quality = quality
@@ -143,14 +153,48 @@ enum Quality: String, CaseIterable, Identifiable {
                 //  issue #8. VXRT_VR_RENDER_SCALE sets supersampling to 1.0, as the Vision Pro app's 3k preset does;
                 //  1.6: the driver's 800x900 x 1.6 a side; the stream about the same size, both eyes)
                 env["VXRT_VR_RENDER_SCALE"] = "1.6"
-                env["VERANTYX_STREAM_WIDTH"] = "2560"; env["VERANTYX_STREAM_HEIGHT"] = "1440"; env["VERANTYX_BITRATE_MBPS"] = "100"
+                env["VERANTYX_STREAM_WIDTH"] = "2560"; env["VERANTYX_STREAM_HEIGHT"] = "1440"; env["VERANTYX_BITRATE_MBPS"] = "150"
+                // Raising the ceiling must not also raise the fallback floor.
+                if env["VERANTYX_BITRATE_MIN_MBPS"] == nil { env["VERANTYX_BITRATE_MIN_MBPS"] = backend == .nativeARM64 ? "28" : "40" }
             }
         } else if [.k3, .k25, .max].contains(quality) {
             env["VXRT_VR_QUALITY"] = quality.rawValue
         }
         if !flat, let proxy = known?.captureProxy { env["VXRT_CAPTURE_PROXY"] = proxy }
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        if known?.windowsSteam == true {
+        if backend == .nativeARM64 {
+            guard let support = known?.nativeSupport, !flat, headset.usesALVR else { throw NativeFailure("Native ARM64 requires a supported game and ALVR (Pico / Quest)") }
+            let layout = support.layout(drive: Paths.drive, runtime: Paths.runtime)
+            let installed = Play.dryRun ? nil : try layout.installation()
+            guard Play.dryRun || layout.bundled else { throw NativeFailure("Native components are missing from this app") }
+            let version = installed.map(layout.versionRoot) ?? layout.base.appendingPathComponent("versions/dry-run")
+            let session = Paths.logs.appendingPathComponent("native/" + UUID().uuidString)
+            nativeSession = session
+            let configFile = session.deletingLastPathComponent().appendingPathComponent("config-" + session.lastPathComponent + ".json")
+            nativeConfig = configFile
+            env["VERANTYX_ALVR"] = "1"
+            env["VERANTYX_ALVR_LIB"] = layout.bridge.path
+            env["KL_MVK_DIR"] = layout.moltenVK.path
+            env["VERANTYX_NATIVE_QUALITY"] = quality.rawValue
+            env["VERANTYX_EYE_PIXELS"] = quality == .sharp ? "2200000" : "1000000"
+            env["VERANTYX_STREAM_WIDTH"] = "2880"
+            env["VERANTYX_STREAM_HEIGHT"] = quality == .sharp ? "1620" : "1040"
+            env["VERANTYX_BITRATE_MBPS"] = quality == .sharp ? "150" : "40"
+            env["SteamAppId"] = support.appID; env["SteamGameId"] = support.appID
+            env.removeValue(forKey: "VERANTYX_NO_STEAM")
+            let steamClient = Paths.home.appendingPathComponent("Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/steamclient.dylib")
+            env["VERANTYX_STEAMCLIENT_DYLIB"] = steamClient.path
+            let config = NativeSessionConfig(host: layout.host, encoder: layout.encoder, game: version.appendingPathComponent("game-root"),
+                lib: version.appendingPathComponent("lib"), state: layout.state, logs: session, alvrLog: Paths.alvrLog, environment: env, parentPID: getpid())
+            if !Play.dryRun {
+                try FileManager.default.createDirectory(at: configFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(config).write(to: configFile, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configFile.path)
+            }
+            process.executableURL = layout.helper
+            process.arguments = ["--session", configFile.path]
+            gameLog = session.appendingPathComponent("alyx_host.log")
+        } else if known?.windowsSteam == true {
             // The player's Windows Steam starts the game, as its own Play button would (steam.exe -applaunch <id>,
             // with -HmdEnable 1 for VR; with SteamVR and the encoder in Steam's root first). VXRT_WSTEAM_NO_START:
             // Steam must be running already, opened and signed in to by the player (the script starts none itself,
@@ -171,7 +215,8 @@ enum Quality: String, CaseIterable, Identifiable {
         process.environment = env
         if Play.dryRun {
             let keys = env.keys.filter { k in ["VERANTYX_", "VXRT_"].contains { k.hasPrefix($0) } && ProcessInfo.processInfo.environment[k] != env[k] }.sorted()
-            let said = (process.arguments ?? []).map { "arg: \($0)" } + keys.map { "env: \($0)=\(env[$0]!)" }
+            let said = ["executable: \(process.executableURL!.path)", "backend: \(backend.rawValue)"] + (process.arguments ?? []).map { "arg: \($0)" } + keys.map { "env: \($0)=\(env[$0]!)" }
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
             process.arguments = ["-c", "printf '%s\\n' \"$@\"", "dry-run"] + said
         }
         FileManager.default.createFile(atPath: launcherLog.path, contents: nil)
@@ -193,9 +238,10 @@ enum Quality: String, CaseIterable, Identifiable {
 
     func stop() {
         guard process.isRunning else { return }
+        if backend == .nativeARM64, stopping { return }
         phase = .stopping
         stopping = true
-        process.terminate()                               // (the scripts' trap stops SteamVR, the encoder and the game)
+        process.terminate()                               // native helper requests a cooperative quit; scripts clean up Windows sessions
         if viaWindowsSteam, let exe = known?.gameExe {
             // (launch_vxrt_nms_vr.sh leaves the game to Steam: the game is ended here; Windows Steam keeps running.
             //  Steam starts it by an upper-case path, ".../BINARIES/NMS.EXE": the match ignores case)
@@ -203,11 +249,21 @@ enum Quality: String, CaseIterable, Identifiable {
             Task.detached { _ = await run("/usr/bin/pkill", ["-TERM", "-i", "-f", pattern]) }
         }
         let p = process
+        if backend == .nativeARM64 { return }             // helper stops and reaps only its own children
         DispatchQueue.global().asyncAfter(deadline: .now() + 15) {
             guard p.isRunning else { return }
             kill(p.processIdentifier, SIGKILL)
             Task { await Play.stopEverything() }
         }
+    }
+
+    func forceNativeStop() {
+        guard backend == .nativeARM64, process.isRunning, nativeQuitTimedOut, let nativeSession else { return }
+        do {
+            try NativeQuit.request(in: nativeSession, force: true)
+            nativeQuitTimedOut = false
+            notice = T("Forcing the game to stop…", "ゲームを強制終了しています…")
+        } catch { problem = error.localizedDescription }
     }
 
     /// Stops whatever VeRantyx started and left running (SteamVR on VXRuntime, a game, the encoder).
@@ -227,10 +283,17 @@ enum Quality: String, CaseIterable, Identifiable {
         timer?.invalidate()
         poll()
         phase = .ended
+        nativeQuitTimedOut = false
+        notice = nil
         endedAt = Date()
+        if let nativeConfig { try? FileManager.default.removeItem(at: nativeConfig) }
         headsetConnected = false
         headsetHint = nil
-        missingFunctions = !fresh(gameLog) ? [] : viaWindowsSteam ? Play.missingFunctions(inText: gameText(1 << 22)) : Play.missingFunctions(in: gameLog)
+        missingFunctions = backend == .nativeARM64 || !fresh(gameLog) ? [] : viaWindowsSteam ? Play.missingFunctions(inText: gameText(1 << 22)) : Play.missingFunctions(in: gameLog)
+        if backend == .nativeARM64 {
+            if !stopping && status != 0 && problem == nil { problem = Play.tail(launcherLog, 3000) }
+            return
+        }
         guard !stopping, problem == nil else { return }
         // (the game ended by itself: what its own last lines say; a child's, such as SteamVR's vrwebhelper, which
         //  cannot run here, are "[vxrt <name>:<pid>]" lines and say nothing about the game; in Windows Steam's log the
@@ -244,10 +307,11 @@ enum Quality: String, CaseIterable, Identifiable {
 
     /// A log written since this start (the last start's may still be there until the scripts rotate it).
     private func fresh(_ url: URL) -> Bool {
-        ((try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) > startedAt
+        Play.modificationDate(url) > startedAt
     }
 
     private func poll() {
+        guard running else { return }                    // a timer task queued before exit must not revive the session
         pollStatus()
         // (a sample a second while the game itself runs: its reported rate changes every 5 s, so this weighs by time)
         if let fps, running, usesLauncher ? gameStarted : phase == .playing { fpsSamples.append(fps) }
@@ -261,6 +325,7 @@ enum Quality: String, CaseIterable, Identifiable {
     }
 
     private func pollStatus() {
+        if backend == .nativeARM64 { pollNative(); return }
         if phase == .starting && !flat && listening(27062) { phase = .steamVR }
         let game = fresh(gameLog) ? gameText(8000) : ""
         gameLines = Array(game.split(separator: "\n", omittingEmptySubsequences: true).suffix(14).map(String.init))
@@ -289,10 +354,7 @@ enum Quality: String, CaseIterable, Identifiable {
         if headset.usesALVR {
             // (ALVR's own log: the bridge writes "VeRantyx: N frames in ..." every 5 s while a headset streams)
             let log = Play.tail(Paths.alvrLog, 6000)
-            let fresh = ((try? Paths.alvrLog.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) > Date().addingTimeInterval(-12)
-            let lastStream = log.range(of: "VeRantyx: ", options: .backwards)?.lowerBound
-            let lastGone = log.range(of: "Client disconnected", options: .backwards)?.lowerBound
-            headsetConnected = fresh && lastStream != nil && (lastGone == nil || lastStream! > lastGone!)
+            headsetConnected = Play.alvrConnected(log, modifiedAt: Play.modificationDate(Paths.alvrLog))
             readHeadset(log)
         }
         let launcher = Play.tail(launcherLog, 6000)
@@ -304,6 +366,35 @@ enum Quality: String, CaseIterable, Identifiable {
             ? T("First start with this headset: open ALVR on the headset and connect now. SteamVR starts once it has, so that the picture lines up in both eyes.",
                 "このヘッドセットで初めての起動です。ヘッドセットで ALVR を開いて接続してください。接続すると SteamVR が始まり、両目の映像がずれずに表示されます。")
             : launcherNotice
+    }
+
+    private func pollNative() {
+        guard let nativeSession else { return }
+        let game = Play.tail(gameLog, 10000)
+        gameLines = game.split(separator: "\n").suffix(14).map(String.init)
+        if let data = try? Data(contentsOf: nativeSession.appendingPathComponent("session.json")),
+           let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            switch state["state"] as? String {
+            case "waiting": if phase != .stopping { phase = .steamVR }; notice = T("Open ALVR on your Pico / Quest and connect. Waiting for live tracking and both eyes.", "Pico・Quest で ALVR を開いて接続してください。トラッキングと両目のデータを待っています。")
+            case "running": if phase != .stopping { phase = .playing; notice = nil }; gameStarted = true
+            case "reconnecting": notice = T("Reconnecting ALVR…", "ALVR を再接続中…")
+            case "stopping", "quit_timeout":
+                phase = .stopping; stopping = true
+                nativeQuitTimedOut = state["state"] as? String == "quit_timeout"
+                notice = nativeQuitTimedOut ?
+                    T("The game is still closing. You can quit in the headset, keep waiting, or choose Force stop.",
+                      "ゲームの終了を待っています。ヘッドセットで終了するか、そのまま待つか、強制終了を選べます。") :
+                    T("Waiting for the game to close normally…", "ゲームが通常終了するのを待っています…")
+            case "error": problem = state["message"] as? String
+            default: break
+            }
+        }
+        if let line = game.split(separator: "\n").last(where: { $0.contains("frame sample:") }) {
+            if let rate = nativeFrameRate.read(String(line)) { fps = rate }
+        }
+        let log = Play.tail(Paths.alvrLog, 6000)
+        headsetConnected = Play.alvrConnected(log, modifiedAt: Play.modificationDate(Paths.alvrLog), since: startedAt)
+        readHeadset(log)
     }
 
     /// The newest "VeRantyx: headset:" line: what the headset shows, against the frames the Mac makes.
@@ -396,6 +487,24 @@ enum Quality: String, CaseIterable, Identifiable {
 
     /// The last bytes of a log file, as text.
     /// (`from`: not before that offset; a log that has since become shorter, rotated, is read from its start)
+    nonisolated static func modificationDate(_ url: URL) -> Date {
+        // URL.resourceValues caches the first timestamp on reused URLs. The
+        // shared ALVR log then looks older than this play forever.
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? .distantPast
+    }
+
+    nonisolated static func alvrConnected(_ text: String, modifiedAt: Date, since: Date = .distantPast, now: Date = Date()) -> Bool {
+        guard modifiedAt > max(since, now.addingTimeInterval(-12)) else { return false }
+        var connected = false
+        for line in text.split(separator: "\n") {
+            if line.contains("Client disconnected") { connected = false }
+            else if line.contains("VeRantyx: ") && (line.contains(" connected;") || line.contains(" frames in ") || line.contains("VeRantyx: headset:")) {
+                connected = true
+            }
+        }
+        return connected
+    }
+
     nonisolated static func tail(_ url: URL, _ bytes: Int, from start: UInt64 = 0) -> String {
         guard let h = try? FileHandle(forReadingFrom: url) else { return "" }
         defer { try? h.close() }

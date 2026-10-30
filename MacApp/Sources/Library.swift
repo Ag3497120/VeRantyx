@@ -11,7 +11,7 @@ struct SteamApp: Identifiable, Hashable {
     var sizeOnDisk: Int64
 }
 
-/// The titles the app offers to fetch and knows how to start. SteamVR is needed for all of them.
+/// The titles the app offers to fetch and knows how to start, and their supported runtimes.
 struct Title: Identifiable, Hashable {
     var id: String
     var name: String
@@ -34,6 +34,9 @@ struct Title: Identifiable, Hashable {
     /// which they sign in to themselves: the game's executable is wrapped in Steam's DRM (SteamStub), which only that
     /// Steam answers. It comes from that Steam's own library, not from steamcmd.
     var windowsSteam = false
+    var nativeSupport: NativeGameSupport? = nil
+    var supportedBackends: Set<GameBackend> { nativeSupport == nil ? [.vxrt] : [.vxrt, .nativeARM64] }
+    func backend(preferred: GameBackend) -> GameBackend { supportedBackends.contains(preferred) ? preferred : .vxrt }
 
     /// Where the game's Windows files come from, and what it starts with.
     enum Source {
@@ -53,7 +56,7 @@ struct Title: Identifiable, Hashable {
               summary: T("Needed for every game. Free.", "どのゲームにも必要です。無料。"), works: true),
         Title(id: "546560", name: "Half-Life: Alyx", bytes: 73_476_413_180, free: false, exe: nil,
               summary: T("Plays in the headset, levels and saves included. 60 fps with the 3K preset on an M1 Max.",
-                         "ヘッドセットでプレイ済み（ステージの切り替えとセーブも）。M1 Max で 3K 設定 60 fps。"), works: true),
+                         "ヘッドセットでプレイ済み（ステージの切り替えとセーブも）。M1 Max で 3K 設定 60 fps。"), works: true, nativeSupport: .alyx),
         Title(id: "450390", name: "The Lab", bytes: 16_625_763_869, free: true, exe: "TheLab.exe",
               summary: T("Runs (title scene about 55 fps); not played through yet. Free.",
                          "動作（タイトル場面 約 55 fps）。通しのプレイはまだ。無料。"), works: false),

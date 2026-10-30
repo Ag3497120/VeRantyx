@@ -339,8 +339,8 @@ static void trace_exit(const char *what, int code, void *ret) {
     const vx_image *m = vx_image_at((uint64_t)(uintptr_t)ret);
     vx_log("%s(%d) from %s+%#llx", what, code, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)ret - m->base) : 0ull);
 }
-static WINAPI void vx_exit(int code) { trace_exit("exit", code, VX_RETURN_ADDRESS()); run_atexit(); vx_profile_finish(); vx_jobs_process_exit(); _exit(code); }
-static WINAPI void vx__exit(int code) { trace_exit("_exit", code, VX_RETURN_ADDRESS()); vx_profile_finish(); vx_jobs_process_exit(); _exit(code); }
+static WINAPI void vx_exit(int code) { trace_exit("exit", code, VX_RETURN_ADDRESS()); run_atexit(); vx_profile_finish(); vx_jobs_process_exit(); vx_shader_progress_exit(); _exit(code); }
+static WINAPI void vx__exit(int code) { trace_exit("_exit", code, VX_RETURN_ADDRESS()); vx_profile_finish(); vx_jobs_process_exit(); vx_shader_progress_exit(); _exit(code); }
 static WINAPI void vx_abort(void) {
     const vx_image *m = vx_image_at((uint64_t)(uintptr_t)VX_RETURN_ADDRESS());
     vx_log("the program called abort() from %s+%#llx", m ? m->name : "?", m ? (unsigned long long)((uint8_t *)VX_RETURN_ADDRESS() - m->base) : 0ull);

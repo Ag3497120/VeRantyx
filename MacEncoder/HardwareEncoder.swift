@@ -9,6 +9,8 @@ import Metal
 import CoreImage
 import ImageIO
 import CoreText
+import SceneKit
+import AppKit
 
 import simd
 
@@ -417,7 +419,7 @@ func environmentDouble(_ name: String, default fallback: Double, range: ClosedRa
 // IDRs are several times larger than predicted frames. Sending one every 0.5 s
 // made a visible hitch twice a second; lost frames already request an IDR.
 let keyFrameIntervalSeconds = environmentDouble("VERANTYX_KEYFRAME_INTERVAL", default: 3.0, range: 0.5...30)
-// (up to 300: the app's Sharper preset for ALVR asks for 100, which a ceiling of 80 turned into the default 20)
+// (up to 300: the app's Sharper preset for ALVR asks for 150, above the old ceiling of 80)
 let videoBitrate = Int32(environmentDouble("VERANTYX_BITRATE_MBPS", default: 20, range: 2...300) * 1_000_000)
 // ALVR (VERANTYX_ALVR=1): ALVR's streaming core (ALVRBridge/, its library loaded at run time from VERANTYX_ALVR_LIB)
 // takes the frames as well, for the ALVR client apps (Quest, Pico, the Vision Pro's "ALVR"); their poses and buttons
@@ -460,7 +462,10 @@ func loadALVRBridge() -> ALVRBridge? {
 // no loopback, so this makes one: an aggregate device of the Mac's output (so that it counts as an output device) and
 // a tap of the Mac's sound (its input), which ALVR, in this process, records. The tap mutes the speakers while it is
 // read (VERANTYX_AUDIO_KEEP_MAC_SPEAKERS=1: not). VERANTYX_ALVR_AUDIO=0: no game audio over ALVR.
-let alvrAudioDeviceName = "VeRantyx ALVR game audio"
+// A forced ALVR restart can leave Core Audio's old aggregate alive briefly.
+// Both UID and display name must be unique: ALVR selects by name substring.
+let alvrAudioInstance = "\(getpid())-\(UUID().uuidString)"
+let alvrAudioDeviceName = "VeRantyx ALVR game audio \(getpid())-\(alvrAudioInstance.suffix(8))"
 func makeALVRAudioDevice() -> Bool {
     guard ProcessInfo.processInfo.environment["VERANTYX_ALVR_AUDIO"] != "0" else { return false }
     guard #available(macOS 14.2, *) else { print("ALVR: game audio needs macOS 14.2 or later"); return false }
@@ -489,7 +494,7 @@ func makeALVRAudioDevice() -> Bool {
     }
     let aggregate: [String: Any] = [
         kAudioAggregateDeviceNameKey as String: alvrAudioDeviceName,
-        kAudioAggregateDeviceUIDKey as String: "com.verantyx.alvr.game-audio",
+        kAudioAggregateDeviceUIDKey as String: "com.verantyx.alvr.game-audio.\(alvrAudioInstance)",
         kAudioAggregateDeviceIsPrivateKey as String: true,
         kAudioAggregateDeviceMainSubDeviceKey as String: outputUID,
         kAudioAggregateDeviceSubDeviceListKey as String: [[kAudioSubDeviceUIDKey as String: outputUID]],
@@ -501,12 +506,23 @@ func makeALVRAudioDevice() -> Bool {
     ]
     var device = AudioObjectID(kAudioObjectUnknown)
     status = AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &device)
-    guard status == noErr else { print("ALVR: could not create the game audio device (\(status))"); return false }
+    guard status == noErr else {
+        AudioHardwareDestroyProcessTap(tap)
+        print("ALVR: could not create the game audio device (\(status)); game audio is unavailable")
+        return false
+    }
     print("ALVR: game audio from \"\(alvrAudioDeviceName)\" (the Mac's sound; its speakers \(description.muteBehavior == .unmuted ? "stay on" : "muted while a headset listens"))")
     return true
 }
-if alvrMode && makeALVRAudioDevice() { setenv("VERANTYX_ALVR_AUDIO_DEVICE", alvrAudioDeviceName, 1) }   // (ALVRBridge's session reads it)
+if alvrMode {
+    if makeALVRAudioDevice() { setenv("VERANTYX_ALVR_AUDIO_DEVICE", alvrAudioDeviceName, 1) }
+    else { unsetenv("VERANTYX_ALVR_AUDIO_DEVICE") }
+}
 let alvr: ALVRBridge? = alvrMode ? loadALVRBridge() : nil
+if alvrMode && alvr == nil {
+    print("ALVR was requested but could not start; stopping the encoder")
+    exit(1)
+}
 var alvrConfig = Data()
 
 // The encoded frame to ALVR: Annex-B, the parameter sets before an IDR (and given to the core when they change).
@@ -739,80 +755,237 @@ func saveHeadsetFrustum(_ tangents: UnsafeRawPointer) {
 
 // MARK: - A game's prompt over the picture
 
+struct GameLoadingState: Decodable {
+    let version: Int
+    let phase: String
+    let message: String?
+}
+
+struct ShaderCompilationStatus: Decodable {
+    struct Counts: Decodable {
+        let requested: UInt64
+        let completed: UInt64
+        let failed: UInt64
+        let pending: UInt64
+        var valid: Bool { completed <= requested && failed <= completed && pending == requested - completed }
+    }
+    let version: Int
+    let pid: Int32
+    let updated_at: Double
+    let last_activity_at: Double
+    let libraries: Counts
+    let pipelines: Counts
+
+    var pending: UInt64 { libraries.pending + pipelines.pending }
+    func valid(now: TimeInterval) -> Bool {
+        version == 1 && pid > 0 && updated_at.isFinite && last_activity_at.isFinite &&
+        (0...3).contains(now - updated_at) && last_activity_at <= updated_at &&
+        libraries.valid && pipelines.valid &&
+        libraries.requested <= UInt64.max / 2 && pipelines.requested <= UInt64.max / 2 &&
+        (kill(pid, 0) == 0 || errno == EPERM)
+    }
+    // An empty queue between two batches is not a reliable time to ask the player for input.
+    func busy(now: TimeInterval) -> Bool { pending > 0 || now - last_activity_at < 1 }
+}
+
+struct LoadingFrameClock {
+    private var lastOutput: TimeInterval = -.infinity
+    private var lastHadOverlay = false
+    private(set) var awaitingSource = false
+    func needsFrame(hasSource: Bool, hasOverlay: Bool, now: TimeInterval, interval: TimeInterval = 0.1) -> Bool {
+        hasSource || ((hasOverlay || awaitingSource) && now - lastOutput >= interval) || (!hasOverlay && lastHadOverlay)
+    }
+    mutating func sent(now: TimeInterval, hasOverlay: Bool, hasSource: Bool) {
+        // Keep sending cleared frames until the game resumes: a lost clear packet must not leave a stale prompt.
+        awaitingSource = !hasSource && (awaitingSource || (lastHadOverlay && !hasOverlay))
+        lastOutput = now; lastHadOverlay = hasOverlay
+    }
+}
+
+struct GameFrameActivity {
+    let startedAt: TimeInterval
+    private var lastGameFrame: TimeInterval?
+    init(startedAt: TimeInterval) { self.startedAt = startedAt }
+    func stalled(now: TimeInterval) -> Bool { now - (lastGameFrame ?? startedAt) >= 1.5 }
+    mutating func noteFrame(sourceMode: UInt32, now: TimeInterval) -> Bool {
+        // Mode 2 is the game's Submit, not SteamVR's compositor or our loading heartbeat.
+        guard sourceMode == 2 else { return false }
+        let resumed = stalled(now: now)
+        lastGameFrame = now
+        return resumed
+    }
+}
+
+struct GamePromptContent: Equatable {
+    let text: String
+    var animated = false
+}
+
 // Half-Life: Alyx writes some things on its loading page, a SteamVR web UI that does not run on VXRuntime (the
 // web UI stand-in answers for it: scripts/vxrt_helper.swift). After a level has loaded the game waits, paused, for a
 // trigger pull and says so there ("Press Trigger To Start"); the player saw a black picture instead. The stand-in
-// writes what the page would show into the prompt file (VERANTYX_GAME_PROMPT_FILE) and takes it away when the game
-// goes on; while there is one, it is drawn here into both eyes' picture, before encoding, so the Vision Pro app and
-// ALVR's clients show it alike. Each eye has it where a point 2 m straight ahead of the head falls in that eye's view
-// (its frustum, from the driver; the eyes' distance from the headset, else 63 mm), so the two eyes agree on its depth.
+// publishes its loading/waiting/running state. Background compiles must not cover a game that is still submitting
+// frames. Outside an explicit load/input wait, preparation is shown only after game submissions stall. The small
+// notice sits just below the view's centre, at the same 2 m depth in both eyes.
 final class GamePromptOverlay {
     static let distance: Float = 2.0
     let path: String?
-    private(set) var text: String?
+    let statePath: String?
+    let shaderPath: String?
+    let language: String
+    private var content: GamePromptContent?
+    var text: String? { content?.text }
+    private var activity: GameFrameActivity
     private var lastCheck: TimeInterval = -.infinity
+    private var animationPhase: Int?
     private var image: CGImage?
     private var imageFor = (0, 0)
 
-    init(path: String?) { self.path = path.flatMap { $0.isEmpty ? nil : $0 } }
+    init(path: String?, statePath: String? = nil, shaderPath: String? = nil,
+         language: String = Locale.preferredLanguages.first ?? "en",
+         startedAt: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        self.path = path.flatMap { $0.isEmpty ? nil : $0 }
+        self.statePath = statePath.flatMap { $0.isEmpty ? nil : $0 }
+        self.shaderPath = shaderPath.flatMap { $0.isEmpty ? nil : $0 }
+        self.language = language
+        self.activity = GameFrameActivity(startedAt: startedAt)
+    }
+
+    func noteFrame(sourceMode: UInt32, now: TimeInterval) -> Bool { activity.noteFrame(sourceMode: sourceMode, now: now) }
+
+    func words(_ english: String, _ russian: String, _ japanese: String) -> String {
+        language.hasPrefix("ru") ? russian : language.hasPrefix("ja") ? japanese : english
+    }
+
+    func currentContent(now: TimeInterval, wallTime: TimeInterval) -> GamePromptContent? {
+        let decoder = JSONDecoder()
+        let state = statePath.flatMap { FileManager.default.contents(atPath: $0) }
+            .flatMap { try? decoder.decode(GameLoadingState.self, from: $0) }
+            .flatMap { $0.version == 1 ? $0 : nil }
+        let progress = shaderPath.flatMap { FileManager.default.contents(atPath: $0) }
+            .flatMap { try? decoder.decode(ShaderCompilationStatus.self, from: $0) }
+            .flatMap { $0.valid(now: wallTime) ? $0 : nil }
+        let loading = state?.phase == "loading" || state?.phase == "waiting"
+        if let progress, (loading && progress.busy(now: wallTime)) ||
+            (progress.pending > 0 && activity.stalled(now: now)) {
+            let title = words("Preparing graphics", "Подготовка графики", "グラフィックスを準備中")
+            return GamePromptContent(text: title + "\n\(progress.libraries.completed)/\(progress.libraries.requested)", animated: true)
+        }
+        if statePath != nil {
+            guard let state else { return nil }
+            let loading = GamePromptContent(text: words("Loading game\nPlease wait", "Загрузка игры\nПожалуйста, подождите", "ゲームを読み込み中\nしばらくお待ちください"), animated: true)
+            switch state.phase {
+            case "waiting":
+                // Unknown/stale compilation state must not enable an input prompt.
+                guard shaderPath == nil || progress != nil else { return loading }
+                return GamePromptContent(text: words("Hold the trigger to start", "Нажмите и удерживайте триггер", "トリガーを長押しして開始"))
+            case "loading": return state.message.map { GamePromptContent(text: $0, animated: true) } ?? loading
+            default: return nil
+            }
+        }
+        let legacy = path.flatMap { FileManager.default.contents(atPath: $0) }
+            .map { String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        return shaderPath == nil || progress != nil ? legacy.map { GamePromptContent(text: $0) } : nil
+    }
 
     /// Reads the prompt file, four times a second at most; true when the text changed.
     @discardableResult
-    func poll(now: TimeInterval) -> Bool {
-        guard let path, now - lastCheck >= 0.25 else { return false }
+    func poll(now: TimeInterval, wallTime: TimeInterval = Date().timeIntervalSince1970, force: Bool = false) -> Bool {
+        guard force || now - lastCheck >= 0.25 else { return false }
         lastCheck = now
-        let current = FileManager.default.contents(atPath: path).map { String(decoding: $0, as: UTF8.self) }
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
-        guard current != text else { return false }
-        text = current
+        let current = currentContent(now: now, wallTime: wallTime)
+        let phase = current?.animated == true ? Int(now * 4) % 8 : nil
+        let changed = current != content
+        guard changed || phase != animationPhase else { return false }
+        content = current
+        animationPhase = phase
         image = nil
-        print(current.map { "Game prompt drawn into the picture: \($0.replacingOccurrences(of: "\n", with: " / "))" }
-              ?? "Game prompt taken away")
+        if changed {
+            print(current.map { "Game prompt drawn into the picture: \($0.text.replacingOccurrences(of: "\n", with: " / "))" }
+                  ?? "Game prompt taken away")
+        }
         return true
     }
 
     /// The prompt's centre in each eye (pixels from the frame's top left; left eye in the left half).
-    static func centers(width: Int, height: Int, tangents: [Float]?, ipd: Float) -> [(x: Double, y: Double)] {
+    static func centers(width: Int, height: Int, tangents: [Float]?, ipd: Float, badgeSize: CGSize = .zero,
+                        offsetX: Double = 0, offsetY: Double = -tan(8 * .pi / 180)) -> [(x: Double, y: Double)] {
         let eyeWidth = Double(width) / 2
+        let valid = tangents?.count == 8 && (0..<2).allSatisfy { eye in
+            guard let t = tangents else { return false }
+            return t[(eye * 4)..<(eye * 4 + 4)].allSatisfy { $0.isFinite } && t[eye * 4] < t[eye * 4 + 1] && t[eye * 4 + 2] < t[eye * 4 + 3]
+        }
+        let t = valid ? tangents! : [-1, 1, -1, 1, -1, 1, -1, 1]
+        // Clamp a single point in the overlap of both frusta, so a safe inset does not change stereo depth.
+        let insetX = Double(badgeSize.width) / (2 * eyeWidth) + 0.1
+        let insetY = Double(badgeSize.height) / (2 * Double(height)) + 0.1
+        var minX = -Double.infinity, maxX = Double.infinity, minY = -Double.infinity, maxY = Double.infinity
+        for eye in 0..<2 {
+            let (l, r, b, top) = (Double(t[eye * 4]), Double(t[eye * 4 + 1]), Double(t[eye * 4 + 2]), Double(t[eye * 4 + 3]))
+            let eyeOffset = Double((eye == 0 ? 1 : -1) * (ipd / 2) / distance)
+            minX = max(minX, l + (r - l) * insetX - eyeOffset)
+            maxX = min(maxX, r - (r - l) * insetX - eyeOffset)
+            minY = max(minY, b + (top - b) * insetY)
+            maxY = min(maxY, top - (top - b) * insetY)
+        }
+        let x = minX <= maxX ? min(maxX, max(minX, offsetX)) : (minX + maxX) / 2
+        let y = minY <= maxY ? min(maxY, max(minY, offsetY)) : (minY + maxY) / 2
         return (0..<2).map { eye in
-            guard let t = tangents, t.count == 8 else { return (eyeWidth * (Double(eye) + 0.5), Double(height) / 2) }
-            let (l, r, bottom, top) = (t[eye * 4], t[eye * 4 + 1], t[eye * 4 + 2], t[eye * 4 + 3])
-            // (the left eye sees a point ahead of the head's centre a little to its right; the right eye to its left)
-            let x = (eye == 0 ? 1 : -1) * (ipd / 2) / distance
-            let u = Double((x - l) / (r - l)), v = Double(top / (top - bottom))
+            let (l, r, bottom, top) = (Double(t[eye * 4]), Double(t[eye * 4 + 1]), Double(t[eye * 4 + 2]), Double(t[eye * 4 + 3]))
+            let eyeOffset = Double((eye == 0 ? 1 : -1) * (ipd / 2) / distance)
+            let u = (x + eyeOffset - l) / (r - l), v = (top - y) / (top - bottom)
             return (eyeWidth * (Double(eye) + u), Double(height) * v)
         }
     }
 
     /// White text on a dark plate, sized for an eye of eyeWidth x eyeHeight pixels.
-    static func render(_ text: String, eyeWidth: Int, eyeHeight: Int) -> CGImage? {
-        let lines = text.split(separator: "\n").map(String.init)
-        guard !lines.isEmpty else { return nil }
+    static func render(_ text: String, eyeWidth: Int, eyeHeight: Int, activityPhase: Int? = nil) -> CGImage? {
+        guard !text.isEmpty else { return nil }
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
-        func layout(_ size: CGFloat) -> [CTLine] {
-            let font = CTFontCreateWithName("Helvetica Neue Medium" as CFString, size, nil)
-            return lines.map { line in
-                let attributes: [NSAttributedString.Key: Any] = [
-                    NSAttributedString.Key(kCTFontAttributeName as String): font,
-                    NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(colorSpace: space, components: [1, 1, 1, 1])!]
-                return CTLineCreateWithAttributedString(NSAttributedString(string: line, attributes: attributes))
+        let size = CGFloat(eyeHeight) / 60
+        let lineHeight = size * 1.25, pad = size * 0.5, leading = activityPhase == nil ? 0 : size * 1.75
+        let font = CTFontCreateWithName("Helvetica Neue Medium" as CFString, size, nil)
+        let attributes: [NSAttributedString.Key: Any] = [
+            NSAttributedString.Key(kCTFontAttributeName as String): font,
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(colorSpace: space, components: [1, 1, 1, 1])!]
+        let limit = max(size, CGFloat(eyeWidth) * 0.24 - 2 * pad)
+        // Wrap long prompts so input hints keep the loading notice's font size in every language.
+        let ctLines: [CTLine] = text.split(separator: "\n").flatMap { paragraph in
+            let attributed = NSAttributedString(string: String(paragraph), attributes: attributes)
+            let typesetter = CTTypesetterCreateWithAttributedString(attributed)
+            var lines: [CTLine] = [], start = 0
+            while start < attributed.length {
+                let count = max(1, CTTypesetterSuggestLineBreak(typesetter, start, Double(limit)))
+                lines.append(CTTypesetterCreateLine(typesetter, CFRange(location: start, length: count)))
+                start += count
             }
+            return lines
         }
-        var size = CGFloat(eyeHeight) * 0.05
-        var ctLines = layout(size)
-        func widest(_ ls: [CTLine]) -> CGFloat { ls.map { CGFloat(CTLineGetTypographicBounds($0, nil, nil, nil)) }.max() ?? 0 }
-        let limit = CGFloat(eyeWidth) * 0.6
-        if widest(ctLines) > limit { size *= limit / widest(ctLines); ctLines = layout(size) }
-        let lineHeight = size * 1.35, pad = size * 0.8
-        let w = Int(ceil(widest(ctLines) + 2 * pad)), h = Int(ceil(lineHeight * CGFloat(lines.count) + 2 * pad - (lineHeight - size)))
+        guard !ctLines.isEmpty else { return nil }
+        let textWidth = ctLines.map { CGFloat(CTLineGetTypographicBounds($0, nil, nil, nil) - CTLineGetTrailingWhitespaceWidth($0)) }.max() ?? 0
+        let w = Int(ceil(textWidth + 2 * pad + leading)), h = Int(ceil(lineHeight * CGFloat(ctLines.count) + 2 * pad - (lineHeight - size)))
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
                                   bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
         ctx.setFillColor(CGColor(colorSpace: space, components: [0.05, 0.05, 0.08, 0.8])!)
         ctx.addPath(CGPath(roundedRect: CGRect(x: 0, y: 0, width: w, height: h), cornerWidth: size * 0.6, cornerHeight: size * 0.6, transform: nil))
         ctx.fillPath()
+        if let phase = activityPhase {
+            let cx = pad + leading / 2, cy = CGFloat(h) / 2, radius = size * 0.65
+            ctx.setLineWidth(max(1, size * 0.14))
+            ctx.setLineCap(.round)
+            for segment in 0..<8 {
+                let angle = CGFloat(segment) * .pi / 4
+                let alpha = 1 - CGFloat((segment - phase + 8) % 8) * 0.1
+                ctx.setStrokeColor(CGColor(colorSpace: space, components: [1, 1, 1, alpha])!)
+                ctx.move(to: CGPoint(x: cx + cos(angle) * radius * 0.55, y: cy + sin(angle) * radius * 0.55))
+                ctx.addLine(to: CGPoint(x: cx + cos(angle) * radius, y: cy + sin(angle) * radius))
+                ctx.strokePath()
+            }
+        }
         for (i, line) in ctLines.enumerated() {
-            let lineWidth = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
-            ctx.textPosition = CGPoint(x: (CGFloat(w) - lineWidth) / 2, y: CGFloat(h) - pad - size * 0.8 - lineHeight * CGFloat(i))
+            let lineWidth = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil) - CTLineGetTrailingWhitespaceWidth(line))
+            ctx.textPosition = CGPoint(x: pad + leading + (textWidth - lineWidth) / 2, y: CGFloat(h) - pad - size * 0.8 - lineHeight * CGFloat(i))
             CTLineDraw(line, ctx)
         }
         return ctx.makeImage()
@@ -824,7 +997,7 @@ final class GamePromptOverlay {
         guard let text else { return false }
         let width = CVPixelBufferGetWidth(pb), height = CVPixelBufferGetHeight(pb)
         if image == nil || imageFor != (width, height) {
-            image = GamePromptOverlay.render(text, eyeWidth: width / 2, eyeHeight: height)
+            image = GamePromptOverlay.render(text, eyeWidth: width / 2, eyeHeight: height, activityPhase: animationPhase)
             imageFor = (width, height)
         }
         guard let image, CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else { return false }
@@ -834,7 +1007,8 @@ final class GamePromptOverlay {
                                   bytesPerRow: CVPixelBufferGetBytesPerRow(pb), space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                   bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return false }
         let eyeWidth = Double(width) / 2
-        for (eye, c) in GamePromptOverlay.centers(width: width, height: height, tangents: tangents, ipd: ipd).enumerated() {
+        for (eye, c) in GamePromptOverlay.centers(width: width, height: height, tangents: tangents, ipd: ipd,
+                                                badgeSize: CGSize(width: image.width, height: image.height)).enumerated() {
             ctx.saveGState()
             ctx.clip(to: CGRect(x: eyeWidth * Double(eye), y: 0, width: eyeWidth, height: Double(height)))   // (each in its own eye)
             // (the context's y goes up from the bottom row)
@@ -845,11 +1019,567 @@ final class GamePromptOverlay {
         return true
     }
 }
-let gamePrompt = GamePromptOverlay(path: ProcessInfo.processInfo.environment["VERANTYX_GAME_PROMPT_FILE"])
+// Draw the native interstitial from the owner's installed assets. The room is
+// supplied by SetStageOverride, independently of the mailbox's map and text.
+// Loading and SceneKit work stay on one worker; cached frames retain the pose
+// they were rendered with, so ALVR can reproject them while the game is busy.
+final class NativeLoadingMap {
+    struct State: Decodable, Equatable {
+        let type: String
+        let mapName: String?
+        let chapter: String?
+        let description: String?
+        let loadingText: String?
+        let facingAngle: Float?
+        let messageText: String?
+        let visible: Bool?
+    }
+    struct Stage: Decodable, Equatable {
+        let model: String
+        let transform: [Float]
+        let settings: [Float]
+        let cull: Int
+        let greyscale: Int
+        let wireframe: Int
+        let token: UInt64
+    }
+    struct View {
+        let image: CGImage
+        let head: simd_float4x4
+        let timestamp: Double
+    }
+    struct MapInfo: Decodable {
+        struct Position: Decodable { let x: Float?; let y: Float?; let z: Float? }
+        let pos: Position
+        let cables: Int
+        let hidden: Bool?
+        let drawVault: Bool?
+    }
+    let path: String?
+    let game: URL?
+    let stagePath: String?
+    private let queue = DispatchQueue(label: "verantyx.loading-scene", qos: .userInitiated, autoreleaseFrequency: .workItem)
+    private let lock = NSLock()
+    private var generation = 0
+    private var image: View?
+    private var pending = false
+    private var lastCheck = -Double.infinity
+    private(set) var state: State?
+    private(set) var stage: Stage?
+    var active: Bool { state != nil }
+    var visible: Bool { state != nil && state?.visible != false }
+    fileprivate var renderer: Scene?
+
+    init(path: String?, game: String?, stagePath: String? = nil) {
+        self.path = path; self.stagePath = stagePath
+        self.game = game.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath() }
+    }
+    static func validName(_ name: String) -> Bool {
+        !name.isEmpty && name.utf8.count <= 96 && name.utf8.allSatisfy {
+            (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 95 || $0 == 45
+        }
+    }
+    static func read<T: Decodable>(_ path: String?, as: T.Type) -> T? {
+        guard let path, let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? NSNumber,
+              size.intValue <= 16384, let data = FileManager.default.contents(atPath: path) else { return nil }
+        return try? JSONDecoder().decode(T.self, from: data)
+    }
+    func poll(now: Double) {
+        guard now - lastCheck >= 0.1 else { return }; lastCheck = now
+        var next = Self.read(path, as: State.self)
+        if next?.type != "begin_loading" || !Self.validName(next?.mapName ?? "") || game == nil { next = nil }
+        var nextStage = Self.read(stagePath, as: Stage.self)
+        if let value = nextStage, value.transform.count != 12 || value.settings.count != 11 ||
+            !(value.transform + value.settings).allSatisfy(\.isFinite) { nextStage = nil }
+        guard next != state || nextStage != stage else { return }
+        state = next; stage = nextStage
+        lock.lock(); generation += 1; image = nil; lock.unlock()
+        // A game may wait for StageOverrideReady before beginning its load.
+        if let game {
+            let stage = nextStage, epoch = generation
+            queue.async { [self] in
+                if renderer == nil { renderer = Scene(game: game) }
+                if renderer?.setStage(stage) == true, let stage, let stagePath {
+                    lock.lock(); defer { lock.unlock() }
+                    if generation == epoch {
+                        try? Data(String(stage.token).utf8).write(to: URL(fileURLWithPath: stagePath + ".ready"), options: .atomic)
+                    }
+                }
+            }
+        }
+    }
+    @discardableResult func draw(into buffer: CVPixelBuffer, tangents: [Float]?, ipd: Double,
+                                 head: simd_float4x4 = simd_float4x4(diagonal: SIMD4(1,1,1,1)), timestamp: Double = 0,
+                                 now: Double = ProcessInfo.processInfo.systemUptime) -> View? {
+        guard visible, let state, let game else { return nil }
+        let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
+        lock.lock()
+        let current = image
+        if !pending {
+            pending = true
+            let epoch = generation
+            queue.async { [self] in
+                if renderer == nil { renderer = Scene(game: game) }
+                let rendered = renderer?.render(state, width: width, height: height, tangents: tangents,
+                                                ipd: Float(ipd), head: head, time: now)
+                lock.lock(); defer { lock.unlock() }
+                if epoch == generation { image = rendered.map { View(image: $0, head: head, timestamp: timestamp) } }
+                pending = false
+            }
+        }
+        lock.unlock()
+        guard let current, current.image.width == width, current.image.height == height,
+              CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer), space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        context.draw(current.image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return current
+    }
+
+    final class Scene {
+        let game: URL
+        let device: MTLDevice
+        let renderer: SCNRenderer
+        let scene = SCNScene()
+        let camera = SCNNode()
+        var geometry: [String: SCNGeometry] = [:]
+        var textures: [String: MTLTexture] = [:]
+        var stage: Stage?
+        var stageNode: SCNNode?
+        var mapNode: SCNNode?
+        var lastState: State?
+        var spinner: SCNNode?
+        var info: [String: MapInfo] = [:]
+        var order: [String] = []
+        var tertiary: [String] = []
+        var cables: [String] = []
+        var fonts: [String] = []
+        init?(game: URL) {
+            guard let device = MTLCreateSystemDefaultDevice() else { return nil }
+            self.game = game; self.device = device
+            renderer = SCNRenderer(device: device, options: nil)
+            renderer.scene = scene; renderer.pointOfView = camera
+            camera.camera = SCNCamera(); camera.camera?.automaticallyAdjustsZRange = false
+            scene.rootNode.addChildNode(camera)
+            scene.background.contents = NSColor.black
+            // Read only the authored data tables, without executing the game's JS.
+            if let script = asset("webui/interstitials.js", limit: 2 * 1024 * 1024),
+               let text = try? String(contentsOf: script, encoding: .utf8) {
+                func table(_ field: String, object: Bool = false) -> Data? {
+                    let pattern = "\\." + field + "=(" + (object ? "\\{.*?\\}),[A-Za-z_$][A-Za-z_0-9$]*\\.k_" : "\\[[^\\]]*\\]),")
+                    guard let re = try? NSRegularExpression(pattern: pattern),
+                          let match = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                          let range = Range(match.range(at: 1), in: text) else { return nil }
+                    var value = String(text[range])
+                    for (pattern, replacement) in [("([,{])([A-Za-z_][A-Za-z_0-9]*):", "$1\"$2\":"),
+                        ("!0", "true"), ("!1", "false")] {
+                        value = value.replacingOccurrences(of: pattern, with: replacement, options: .regularExpression)
+                    }
+                    value = value.replacingOccurrences(of: ":.", with: ":0.").replacingOccurrences(of: ":-.", with: ":-0.")
+                    return value.data(using: .utf8)
+                }
+                if let data = table("k_MapInfo", object: true) { info = (try? JSONDecoder().decode([String: MapInfo].self, from: data)) ?? [:] }
+                for field in ["k_sGameMaps", "k_sTertiaryMaps", "k_sVaultCables"] {
+                    let names = table(field).flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? []
+                    if field == "k_sGameMaps" { order = names }
+                    else if field == "k_sTertiaryMaps" { tertiary = names }
+                    else { cables = names }
+                }
+            }
+            if let font = asset("webui/fonts/raju-light.otf", limit: 2 * 1024 * 1024) {
+                CTFontManagerRegisterFontsForURL(font as CFURL, .process, nil)
+                if let descriptors = CTFontManagerCreateFontDescriptorsFromURL(font as CFURL) as? [CTFontDescriptor], let first = descriptors.first,
+                   let name = CTFontDescriptorCopyAttribute(first, kCTFontNameAttribute) as? String { fonts = [name] }
+            }
+        }
+        func asset(_ relative: String, limit: Int = 64 * 1024 * 1024) -> URL? {
+            guard !relative.contains("\\"), !relative.split(separator: "/").contains("..") else { return nil }
+            let url = game.appendingPathComponent(relative).resolvingSymlinksInPath()
+            guard url.path.hasPrefix(game.path + "/"),
+                  let n = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber,
+                  (1...limit).contains(n.intValue) else { return nil }
+            return url
+        }
+        func mesh(_ relative: String) -> SCNGeometry? {
+            if let known = geometry[relative] { return known }
+            guard let url = asset(relative, limit: 8 * 1024 * 1024), let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+            var v: [SCNVector3] = [], n: [SCNVector3] = [], uv: [CGPoint] = []
+            var positions: [SCNVector3] = [], normals: [SCNVector3] = [], coords: [CGPoint] = []
+            func index(_ value: Substring, _ count: Int) -> Int? {
+                guard let i = Int(value), i != 0 else { return nil }
+                let at = i > 0 ? i - 1 : count + i
+                return (0..<count).contains(at) ? at : nil
+            }
+            for line in text.split(whereSeparator: \.isNewline) {
+                let p = line.split(whereSeparator: \.isWhitespace)
+                if (p.first == "v" || p.first == "vn"), p.count >= 4,
+                   let x = Float(p[1]), let y = Float(p[2]), let z = Float(p[3]),
+                   [x,y,z].allSatisfy({ $0.isFinite && abs($0) < 10000 }) {
+                    if p[0] == "v" { v.append(SCNVector3(x,y,z)) } else { n.append(SCNVector3(x,y,z)) }
+                } else if p.first == "vt", p.count >= 3, let x = Double(p[1]), let y = Double(p[2]), x.isFinite, y.isFinite {
+                    uv.append(CGPoint(x: x, y: y))
+                } else if p.first == "f", (4...17).contains(p.count), positions.count < 600000 {
+                    let face = p.dropFirst().map { $0.split(separator: "/", omittingEmptySubsequences: false) }
+                    for i in 1..<(face.count - 1) {
+                        let triangle = [face[0], face[i], face[i+1]]
+                        let vi = triangle.compactMap { $0.first.flatMap { index($0, v.count) } }
+                        guard vi.count == 3 else { continue }
+                        let a = SIMD3<Float>(Float(v[vi[0]].x),Float(v[vi[0]].y),Float(v[vi[0]].z))
+                        let b = SIMD3<Float>(Float(v[vi[1]].x),Float(v[vi[1]].y),Float(v[vi[1]].z))
+                        let c = SIMD3<Float>(Float(v[vi[2]].x),Float(v[vi[2]].y),Float(v[vi[2]].z))
+                        let cross = simd_cross(b-a,c-a), normal = simd_length(cross) > 1e-8 ? simd_normalize(cross) : SIMD3<Float>(0,1,0)
+                        for j in 0..<3 {
+                            positions.append(v[vi[j]])
+                            let f = triangle[j]
+                            normals.append(f.count > 2 ? index(f[2], n.count).map { n[$0] } ?? SCNVector3(normal.x,normal.y,normal.z) : SCNVector3(normal.x,normal.y,normal.z))
+                            coords.append(f.count > 1 ? index(f[1], uv.count).map { uv[$0] } ?? .zero : .zero)
+                        }
+                    }
+                }
+            }
+            guard !positions.isEmpty else { return nil }
+            let indices = Array(0..<UInt32(positions.count))
+            let result = SCNGeometry(sources: [SCNGeometrySource(vertices: positions), SCNGeometrySource(normals: normals), SCNGeometrySource(textureCoordinates: coords)],
+                elements: [SCNGeometryElement(indices: indices, primitiveType: .triangles)])
+            geometry[relative] = result; return result
+        }
+        func texture(_ relative: String) -> MTLTexture? {
+            if let known = textures[relative] { return known }
+            // Shipped dioramas contain 8192-square DDS files (~85 MiB). Map the
+            // container and upload a bounded mip, rather than rejecting the room.
+            guard let url = asset(relative, limit: 512 * 1024 * 1024),
+                  let data = try? Data(contentsOf: url, options: .mappedIfSafe), data.count >= 128 else { return nil }
+            func word(_ at: Int) -> UInt32 { data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: at, as: UInt32.self) } }
+            guard word(0) == 0x20534444 else { return nil }
+            var width = Int(word(16)), height = Int(word(12)), offset = 128, block = 16
+            let format: MTLPixelFormat
+            switch word(84) {
+            case 0x55344342: format = .bc4_rUnorm; block = 8 // BC4U
+            case 0x30315844:
+                guard data.count >= 148 else { return nil }; offset = 148
+                switch word(128) {
+                case 71: format = .bc1_rgba; block = 8
+                case 72: format = .bc1_rgba_srgb; block = 8
+                case 77: format = .bc3_rgba
+                case 78: format = .bc3_rgba_srgb
+                case 80: format = .bc4_rUnorm; block = 8
+                case 98: format = .bc7_rgbaUnorm
+                case 99: format = .bc7_rgbaUnorm_srgb
+                default: return nil
+                }
+            default: return nil
+            }
+            guard (1...16384).contains(width), (1...16384).contains(height) else { return nil }
+            var levels = max(1, Int(word(28)))
+            while max(width,height) > 4096 && levels > 1 {
+                offset += ((width+3)/4) * ((height+3)/4) * block
+                width = max(1,width/2); height = max(1,height/2); levels -= 1
+            }
+            let row = ((width+3)/4) * block, size = row * ((height+3)/4)
+            guard offset + size <= data.count else { return nil }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
+            desc.usage = .shaderRead; desc.storageMode = .shared
+            guard let result = device.makeTexture(descriptor: desc) else { return nil }
+            data.withUnsafeBytes { result.replace(region: MTLRegionMake2D(0,0,width,height), mipmapLevel: 0,
+                withBytes: $0.baseAddress!.advanced(by: offset), bytesPerRow: row) }
+            textures[relative] = result; return result
+        }
+        func mapTexture(_ name: String, kind: String) -> MTLTexture? {
+            let folder = "models/ui/map_hologram_steamvr/"
+            // Several cable models share one material. OBJ/MTL references name
+            // PNGs, while the shipped images are DDS files with the same stem.
+            if let url = asset(folder + name + ".mtl", limit: 16384), let text = try? String(contentsOf: url, encoding: .utf8) {
+                for line in text.split(whereSeparator: \.isNewline) {
+                    let p = line.split(whereSeparator: \.isWhitespace)
+                    guard p.first == "map_Kd", p.count == 2 else { continue }
+                    let file = String(p[1]), stem = (file as NSString).deletingPathExtension
+                    guard NativeLoadingMap.validName(stem) else { continue }
+                    let target = kind == "ao" ? stem.replacingOccurrences(of: "_wire", with: "_ao") : stem
+                    if let result = texture(folder + target + ".dds") { return result }
+                }
+            }
+            return texture(folder + name + "_" + kind + ".dds")
+        }
+        func material(_ colour: UInt32, opacity: CGFloat = 1, texture: MTLTexture? = nil, additive: Bool = false) -> SCNMaterial {
+            let m = SCNMaterial(); m.lightingModel = .constant; m.isDoubleSided = true
+            let tint = NSColor(srgbRed: CGFloat((colour >> 16) & 255)/255, green: CGFloat((colour >> 8) & 255)/255,
+                               blue: CGFloat(colour & 255)/255, alpha: 1)
+            m.diffuse.contents = texture ?? tint as Any
+            if texture != nil {
+                // DDS rows run downward; OBJ V runs upward. Without this the
+                // texture atlas lands on unrelated triangles of the room/map.
+                m.diffuse.contentsTransform = SCNMatrix4Scale(SCNMatrix4MakeTranslation(0, 1, 0), 1, -1, 1)
+            }
+            m.multiply.contents = texture == nil ? NSColor.white : tint
+            m.transparency = opacity
+            m.blendMode = additive ? .add : .alpha
+            m.writesToDepthBuffer = !additive
+            return m
+        }
+        func node(_ geometry: SCNGeometry, material: SCNMaterial, parent: SCNNode) -> SCNNode {
+            let copy = geometry.copy() as! SCNGeometry; copy.materials = [material]
+            let node = SCNNode(geometry: copy); parent.addChildNode(node); return node
+        }
+        @discardableResult func setStage(_ next: Stage?) -> Bool {
+            if next == stage { return stageNode != nil }
+            stageNode?.removeFromParentNode(); stageNode = nil
+            geometry = geometry.filter { !$0.key.hasPrefix("models/ui/dioramas/") }
+            textures = textures.filter { !$0.key.hasPrefix("models/ui/dioramas/") }
+            stage = next
+            guard let next else { return false }
+            // The engine passes an absolute OBJ path. Keep it confined to this install.
+            let url = URL(fileURLWithPath: next.model.replacingOccurrences(of: "\\", with: "/")).resolvingSymlinksInPath()
+            let root = game.appendingPathComponent("models/ui/dioramas").path + "/"
+            guard url.path.hasPrefix(root), url.pathExtension == "obj", Self.validStage(next),
+                  let mesh = mesh("models/ui/dioramas/" + url.lastPathComponent) else { return false }
+            let name = url.deletingPathExtension().lastPathComponent
+            let tex = texture("models/ui/dioramas/" + name + ".dds")
+            guard tex != nil else { return false }
+            let m = material(0xffffff, texture: tex)
+            let s = next.settings
+            let grey = next.greyscale != 0 || tex?.pixelFormat == .bc4_rUnorm
+            m.shaderModifiers = [.surface: """
+                float3 colour = _surface.diffuse.rgb;
+                \(grey ? (tex?.pixelFormat == .bc4_rUnorm ? "colour = float3(colour.r);" : "colour = float3(dot(colour, float3(0.2126, 0.7152, 0.0722)));") : "")
+                float3 primary = float3(\(s[0]), \(s[1]), \(s[2]));
+                float3 secondary = float3(\(s[4]), \(s[5]), \(s[6]));
+                float fade = 0.0;
+                \(s[9] > s[8] ? "float3 world = (scn_frame.inverseViewTransform * float4(_surface.position, 1.0)).xyz; fade = smoothstep(\(s[8]), \(s[9]), length(world));" : "")
+                \(s[10] > 0 ? "fade = pow(1.0 - abs(dot(normalize(_surface.normal), normalize(_surface.view))), \(s[10]));" : "")
+                _surface.diffuse.rgb = mix(colour * primary, secondary, fade);
+                _surface.diffuse.a *= mix(\(s[3]), \(s[7]), fade);
+                """]
+            m.isDoubleSided = next.cull == 0; m.fillMode = next.wireframe == 0 ? .fill : .lines
+            let room = node(mesh, material: m, parent: scene.rootNode)
+            let t = next.transform
+            room.simdTransform = simd_float4x4(SIMD4(t[0],t[4],t[8],0), SIMD4(t[1],t[5],t[9],0),
+                SIMD4(t[2],t[6],t[10],0), SIMD4(t[3],t[7],t[11],1))
+            stageNode = room
+            guard renderer.prepare(room, shouldAbortBlock: nil) else { room.removeFromParentNode(); stageNode = nil; return false }
+            return true
+        }
+        static func validStage(_ stage: Stage) -> Bool { stage.transform.count == 12 && stage.settings.count == 11 }
+        func text(_ value: String, height: CGFloat, parent: SCNNode, position: SCNVector3, left: Bool = false) -> SCNNode {
+            let font = CTFontCreateWithName((fonts.first ?? "HelveticaNeue-Light") as CFString, 64, nil)
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: String(value.prefix(256)), attributes: [
+                kCTFontAttributeName as NSAttributedString.Key: font,
+                kCTForegroundColorAttributeName as NSAttributedString.Key: CGColor(gray: 1, alpha: 1)]))
+            let bounds = CTLineGetBoundsWithOptions(line, [.useOpticalBounds])
+            let w = max(1, Int(ceil(bounds.width + 8))), h = 88
+            let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w*4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            context.textPosition = CGPoint(x: 4 - bounds.minX, y: 18); CTLineDraw(line, context)
+            let plane = SCNPlane(width: height * CGFloat(w)/CGFloat(h), height: height)
+            let m = material(0xffffff); m.diffuse.contents = context.makeImage(); m.writesToDepthBuffer = false
+            let result = node(plane, material: m, parent: parent); result.position = position; result.renderingOrder = 10
+            if left { result.position.x += plane.width/2 }
+            return result
+        }
+        func buildMap(_ state: State) {
+            mapNode?.removeFromParentNode(); spinner = nil
+            let root = SCNNode(); scene.rootNode.addChildNode(root); mapNode = root
+            root.eulerAngles.y = CGFloat(state.facingAngle ?? 0) * .pi / 180
+            let name = state.mapName ?? "", current = info[name]
+            let visible = current != nil && current?.hidden != true
+            var prompt = state.messageText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if ["Press Right Hand To Start", "Press Left Hand To Start", "Press Trigger To Start"].contains(prompt) { prompt = "Pull Trigger To Start" }
+            if !prompt.isEmpty {
+                _ = text(prompt, height: 0.11, parent: root, position: SCNVector3(0,1.5,-1.5))
+            } else if !visible {
+                _ = text(state.loadingText ?? "LOADING", height: 0.12, parent: root, position: SCNVector3(0,1.8,-2))
+            }
+            guard visible else { return }
+            let map = SCNNode(); root.addChildNode(map)
+            map.position = SCNVector3(0,1.1,-1.5); map.eulerAngles.x = .pi / 6; map.scale = SCNVector3(0.8,0.8,0.8)
+            let models = SCNNode(); map.addChildNode(models); models.scale = SCNVector3(0.3,0.3,0.3)
+            let at = order.firstIndex(of: name) ?? max(0,order.count-1)
+            let selectedName = order.indices.contains(at) ? order[at] : name
+            let played = Array(order.prefix(at + 1))
+            let cableNames = Array(cables.dropFirst(max(0,current?.cables ?? cables.count)))
+            var names = tertiary + played + cableNames + ["combine_wall", "cables_citadel"]
+            if current?.drawVault == true { names.append("a5_vault") }
+            if at < order.count-1 { names.append("a4_c17_parking_garage_precrash") }
+            for name in names where NativeLoadingMap.validName(name) {
+                guard let g = mesh("models/ui/map_hologram_steamvr/" + name + ".obj") else { continue }
+                let selected = name == selectedName, visited = played.contains(name)
+                let ao = mapTexture(name, kind: "ao")
+                let fill = material(selected ? 0xffbe55 : visited || cableNames.contains(name) ? 0x805f2a : 0x553c18,
+                    opacity: selected || visited ? 1 : 0.75, texture: ao, additive: true)
+                fill.shaderModifiers = [.surface: """
+                    \(ao != nil ? "_surface.diffuse.rgb = float3(_surface.diffuse.r);" : "")
+                    float rim = pow(1.0 - abs(dot(normalize(_surface.normal), normalize(_surface.view))), 0.5);
+                    _surface.diffuse.a *= 1.0 - rim;
+                    """]
+                let mask = material(0); mask.colorBufferWriteMask = []
+                let depth = node(g, material: mask, parent: models); depth.renderingOrder = -2
+                let surface = node(g, material: fill, parent: models); surface.renderingOrder = 2
+                let wire = material(selected ? 0xffd155 : visited ? 0xcc953d : 0x66471d,
+                    opacity: selected ? 1 : visited ? 0.75 : name == "cables_citadel" ? 0.15 : 0.25,
+                    texture: mapTexture(name, kind: "wire"), additive: true)
+                if wire.diffuse.contents is MTLTexture {
+                    wire.shaderModifiers = [.surface: "_surface.transparent.a = _surface.diffuse.r; _surface.diffuse.rgb = float3(1.0);"]
+                } else { wire.fillMode = .lines }
+                let lines = node(g, material: wire, parent: models); lines.renderingOrder = 3
+            }
+            if let streets = mesh("models/ui/map_hologram_steamvr/map_streets.obj") {
+                let m = material(0x664c22, opacity: 0.1, texture: texture("models/ui/map_hologram_steamvr/map_streets_col.dds"), additive: true)
+                _ = node(streets, material: m, parent: models)
+            }
+            // The amber panel lies beneath the city, with its far edge elevated
+            // in the viewer's field of view just as in the authored interstitial.
+            let panel = SCNNode(); map.addChildNode(panel); panel.eulerAngles.x = -.pi/2
+            panel.position = SCNVector3(0,0.01,0.25)
+            func backdrop(_ colour: UInt32, height: CGFloat, opacity: CGFloat) -> SCNNode {
+                let m = material(colour, opacity: opacity, additive: true)
+                m.readsFromDepthBuffer = false
+                let context = CGContext(data: nil, width: 256, height: 2, bitsPerComponent: 8, bytesPerRow: 1024,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                let gradient = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB),
+                    colors: [CGColor(gray: 1, alpha: 0), CGColor(gray: 1, alpha: 1), CGColor(gray: 1, alpha: 1), CGColor(gray: 1, alpha: 0)] as CFArray,
+                    locations: [0,0.4,0.6,1])!
+                context.drawLinearGradient(gradient, start: .zero, end: CGPoint(x: 256,y: 0), options: [])
+                m.diffuse.contents = context.makeImage()
+                m.multiply.contents = material(colour).diffuse.contents
+                let result = node(SCNPlane(width: 8, height: height), material: m, parent: panel)
+                result.renderingOrder = 1
+                return result
+            }
+            _ = backdrop(0x553c18, height: 1.8, opacity: 0.2)
+            let edge = backdrop(0xffbe55, height: 0.028, opacity: 0.5)
+            edge.position.y = 0.9
+            if prompt.isEmpty, let p = current?.pos {
+                let anchor = SCNNode(); map.addChildNode(anchor); anchor.position = SCNVector3(p.x ?? 0,p.y ?? 0,p.z ?? 0)
+                let stem = node(SCNCylinder(radius: 0.0015, height: 0.1), material: material(0xffffff), parent: anchor)
+                stem.position.y = 0.05
+                let label = text((state.loadingText ?? "LOADING") + "...", height: 0.12, parent: anchor,
+                                 position: SCNVector3(0.035,0.12,0), left: true)
+                label.eulerAngles.x = -.pi/6
+                let context = CGContext(data: nil, width: 96, height: 96, bitsPerComponent: 8, bytesPerRow: 384,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                context.setStrokeColor(CGColor(gray: 1, alpha: 1)); context.setLineWidth(7); context.setLineCap(.round)
+                for radius in [27.0, 39.0] {
+                    context.addArc(center: CGPoint(x: 48,y: 48), radius: radius, startAngle: 0.3, endAngle: 5.3, clockwise: false)
+                    context.strokePath()
+                }
+                let ink = material(0xffffff); ink.diffuse.contents = context.makeImage(); ink.writesToDepthBuffer = false
+                let ring = node(SCNPlane(width: 0.06,height: 0.06), material: ink, parent: label)
+                ring.position.x = label.boundingBox.min.x - 0.035; ring.renderingOrder = 10; spinner = ring
+            }
+        }
+        func render(_ state: State, width: Int, height: Int, tangents: [Float]?, ipd: Float,
+                    head: simd_float4x4, time: Double) -> CGImage? {
+            guard width > 0, height > 0, width <= 8192, height <= 4096,
+                  head.columns.0.x.isFinite else { return nil }
+            if state != lastState { buildMap(state); lastState = state }
+            spinner?.eulerAngles.z = CGFloat(time * 2 * .pi)
+            guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                bytesPerRow: width*4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+            for eye in 0..<2 {
+                let t = tangents?.count == 8 ? Array(tangents!.dropFirst(eye*4).prefix(4)) : [-1,1,-1,1]
+                let l = t[0], r = t[1], b = t[2], u = t[3], near: Float = 0.05, far: Float = 100
+                guard t.allSatisfy(\.isFinite), r-l > 0.01, u-b > 0.01 else { return nil }
+                camera.camera?.projectionTransform = SCNMatrix4(simd_float4x4(
+                    SIMD4(2/(r-l),0,0,0), SIMD4(0,2/(u-b),0,0),
+                    SIMD4((r+l)/(r-l),(u+b)/(u-b),-(far+near)/(far-near),-1), SIMD4(0,0,-2*far*near/(far-near),0)))
+                var offset = matrix_identity_float4x4; offset.columns.3.x = (eye == 0 ? -0.5 : 0.5)*ipd
+                camera.simdTransform = head * offset
+                let shot = renderer.snapshot(atTime: time, with: CGSize(width: width/2,height: height), antialiasingMode: .multisampling4X)
+                guard let image = shot.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+                context.draw(image, in: CGRect(x: eye*width/2,y: 0,width: width/2,height: height))
+            }
+            return context.makeImage()
+        }
+    }
+}
+
+let nativeLoadingMap = NativeLoadingMap(path: ProcessInfo.processInfo.environment["VERANTYX_NATIVE_LOADING_FILE"],
+                                       game: ProcessInfo.processInfo.environment["VERANTYX_NATIVE_GAME_DIR"],
+                                       stagePath: ProcessInfo.processInfo.environment["VERANTYX_NATIVE_STAGE_FILE"])
+
+if let output = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_MAP_SELFTEST"],
+   let game = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_GAME_DIR"] {
+    let name = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_MAP_NAME"] ?? "a2_pistol"
+    precondition(NativeLoadingMap.validName(name) && !NativeLoadingMap.validName("../outside"))
+    let json = try! JSONSerialization.data(withJSONObject: ["type": "begin_loading", "mapName": name, "chapter": "HALF-LIFE: ALYX", "loadingText": "LOADING"])
+    let stateFile = output + ".state.json", stageFile = output + ".stage.json"
+    let stageName = ProcessInfo.processInfo.environment["VERANTYX_NATIVE_STAGE_MODEL"] ?? "synthetic"
+    let stage: [String: Any] = ["model": URL(fileURLWithPath: game).appendingPathComponent("models/ui/dioramas/" + stageName + ".obj").path,
+        "transform": [1,0,0,0,0,1,0,0,0,0,1,0], "settings": [0.22,0.22,0.22,1,0,0,0,1,0,0,0],
+        "cull": 0, "greyscale": 1, "wireframe": 0, "token": 1]
+    try! JSONSerialization.data(withJSONObject: stage).write(to: URL(fileURLWithPath: stageFile), options: .atomic)
+    try! json.write(to: URL(fileURLWithPath: stateFile), options: .atomic)
+    let probe = NativeLoadingMap(path: stateFile, game: game, stagePath: stageFile)
+    probe.poll(now: 0); precondition(probe.active)
+    var pixel: CVPixelBuffer?
+    precondition(CVPixelBufferCreate(nil, 1536, 864, kCVPixelFormatType_32BGRA, nil, &pixel) == kCVReturnSuccess)
+    // Sparse synthetic DDS: the real train room exceeds the former 64 MiB cap.
+    let largeRoot = URL(fileURLWithPath: output + ".large")
+    try! FileManager.default.createDirectory(at: largeRoot, withIntermediateDirectories: true)
+    let largeFile = largeRoot.appendingPathComponent("room.dds")
+    var header = Data(count: 148)
+    for (offset, value) in [(0, 0x20534444), (4, 124), (12, 8192), (16, 8192), (28, 14), (84, 0x30315844), (128, 99)] {
+        var word = UInt32(value).littleEndian
+        withUnsafeBytes(of: &word) { header.replaceSubrange(offset..<(offset+4), with: $0) }
+    }
+    try! header.write(to: largeFile)
+    let largeHandle = try! FileHandle(forWritingTo: largeFile)
+    try! largeHandle.truncate(atOffset: 89_478_660); try! largeHandle.close()
+    let largeScene = NativeLoadingMap.Scene(game: largeRoot)!
+    precondition(largeScene.texture("room.dds")?.width == 4096, "Large diorama must load its bounded mip")
+    try! FileManager.default.removeItem(at: largeRoot)
+    var head = matrix_identity_float4x4; head.columns.3.y = 1.7
+    let tilt = Float(-25) * .pi / 180
+    head = head * simd_float4x4(simd_quatf(angle: tilt, axis: SIMD3(1,0,0)))
+    func draw(_ transform: simd_float4x4, timestamp: Double) -> NativeLoadingMap.View {
+        for _ in 0..<3000 {
+            if let view = probe.draw(into: pixel!, tangents: [-1.1,1.1,-1,1,-1.1,1.1,-1,1], ipd: 0.064,
+                head: transform, timestamp: timestamp, now: 10), view.timestamp == timestamp { return view }
+            usleep(10_000)
+        }
+        fatalError("Loading renderer did not produce the requested pose")
+    }
+    func save(_ image: CGImage, _ path: String) {
+        let destination = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(destination, image, nil); precondition(CGImageDestinationFinalize(destination))
+    }
+    let loading = draw(head, timestamp: 1)
+    precondition(probe.renderer?.info[name] != nil, "No authored map metadata")
+    precondition(probe.renderer?.stageNode != nil, "The loading room was discarded")
+    precondition((probe.renderer?.geometry.count ?? 0) >= 3, "The city geometry was not loaded")
+    precondition((try? String(contentsOfFile: stageFile + ".ready", encoding: .utf8)) == "1")
+    save(loading.image, output)
+    var ready = try! JSONSerialization.jsonObject(with: json) as! [String: Any]
+    ready["messageText"] = "Press Trigger To Start"
+    try! JSONSerialization.data(withJSONObject: ready).write(to: URL(fileURLWithPath: stateFile), options: .atomic)
+    probe.poll(now: 1)
+    let waiting = draw(head, timestamp: 2); save(waiting.image, output + ".ready.png")
+    precondition(waiting.image.dataProvider!.data! as Data != loading.image.dataProvider!.data! as Data)
+    let turn = head * simd_float4x4(simd_quatf(angle: 0.25, axis: SIMD3(0,1,0)))
+    let turned = draw(turn, timestamp: 3); save(turned.image, output + ".turned.png")
+    precondition(turned.head == turn && turned.image.dataProvider!.data! as Data != waiting.image.dataProvider!.data! as Data)
+    var hidden = ready; hidden["visible"] = false
+    try! JSONSerialization.data(withJSONObject: hidden).write(to: URL(fileURLWithPath: stateFile), options: .atomic)
+    probe.poll(now: 1.5); precondition(probe.active && !probe.visible)
+    precondition(probe.draw(into: pixel!, tangents: nil, ipd: 0.064, head: head, timestamp: 4) == nil,
+                 "Initial boot must not display the room, city or trigger hint")
+    try! FileManager.default.removeItem(atPath: stateFile); probe.poll(now: 2); precondition(!probe.active)
+    try! Data("{\"type\":\"begin_loading\",\"mapName\":\"../outside\"}".utf8).write(to: URL(fileURLWithPath: stateFile))
+    probe.poll(now: 3); precondition(!probe.active)
+    for file in [stateFile, stageFile, stageFile + ".ready"] { try? FileManager.default.removeItem(atPath: file) }
+    print("Native loading scene: room, authored city, textures, world-space prompt, head motion, pose timestamps, load/end lifecycle and bounded paths passed")
+    exit(0)
+}
+
+let gamePrompt = GamePromptOverlay(path: ProcessInfo.processInfo.environment["VERANTYX_GAME_PROMPT_FILE"],
+                                  statePath: ProcessInfo.processInfo.environment["VERANTYX_GAME_STATE_FILE"],
+                                  shaderPath: ProcessInfo.processInfo.environment["VERANTYX_SHADER_PROGRESS_FILE"])
 
 // VERANTYX_PROMPT_SELFTEST=<png> [VERANTYX_PROMPT_SELFTEST_TEXT, _SIZE=WxH, _TANGENTS="8 numbers"]: draws the prompt
 // into a grey frame with a cross at each eye's straight-ahead point, writes the PNG and exits (nothing else starts).
-if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] {
+if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] ?? ProcessInfo.processInfo.environment["VERANTYX_LOADING_SELFTEST"] {
     let env = ProcessInfo.processInfo.environment
     let size = (env["VERANTYX_PROMPT_SELFTEST_SIZE"] ?? "2880x1620").split(separator: "x").compactMap { Int($0) }
     let tangents = env["VERANTYX_PROMPT_SELFTEST_TANGENTS"].map { $0.split(separator: " ").compactMap { Float($0) } }
@@ -860,7 +1590,7 @@ if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] {
     CVPixelBufferLockBaseAddress(pb, [])
     let base = CVPixelBufferGetBaseAddress(pb)!, rowBytes = CVPixelBufferGetBytesPerRow(pb)
     for y in 0..<h { for x in 0..<w { base.storeBytes(of: UInt32(0xFF30_3030), toByteOffset: y * rowBytes + x * 4, as: UInt32.self) } }
-    for (cx, cy) in GamePromptOverlay.centers(width: w, height: h, tangents: tangents, ipd: 0) {   // (crosses: at infinity)
+    for (cx, cy) in GamePromptOverlay.centers(width: w, height: h, tangents: tangents, ipd: 0, offsetX: 0, offsetY: 0) {   // (crosses: at infinity)
         for d in -40...40 {
             for (x, y) in [(Int(cx) + d, Int(cy)), (Int(cx), Int(cy) + d)] where x >= 0 && x < w && y >= 0 && y < h {
                 base.storeBytes(of: UInt32(0xFFFF2020), toByteOffset: y * rowBytes + x * 4, as: UInt32.self)
@@ -868,12 +1598,74 @@ if let out = ProcessInfo.processInfo.environment["VERANTYX_PROMPT_SELFTEST"] {
         }
     }
     CVPixelBufferUnlockBaseAddress(pb, [])
-    let text = env["VERANTYX_PROMPT_SELFTEST_TEXT"] ?? "Hold the trigger to start"
-    let file = NSTemporaryDirectory() + "verantyx-prompt-selftest-\(getpid()).txt"
-    try? Data(text.utf8).write(to: URL(fileURLWithPath: file))
-    let fromFile = GamePromptOverlay(path: file)
-    fromFile.poll(now: 0)
-    try? FileManager.default.removeItem(atPath: file)
+    let fromFile: GamePromptOverlay
+    if env["VERANTYX_LOADING_SELFTEST"] != nil {
+        fromFile = GamePromptOverlay(path: env["VERANTYX_GAME_PROMPT_FILE"], statePath: env["VERANTYX_GAME_STATE_FILE"],
+                                    shaderPath: env["VERANTYX_SHADER_PROGRESS_FILE"], language: env["VERANTYX_LOADING_SELFTEST_LANGUAGE"] ?? "en", startedAt: 0)
+        let now = Double(env["VERANTYX_LOADING_SELFTEST_UPTIME"] ?? "") ?? 2
+        let wall = Double(env["VERANTYX_LOADING_SELFTEST_NOW"] ?? "") ?? Date().timeIntervalSince1970
+        if let age = Double(env["VERANTYX_LOADING_SELFTEST_GAME_FRAME_AGE"] ?? "") {
+            _ = fromFile.noteFrame(sourceMode: 2, now: now - age)
+        }
+        fromFile.poll(now: now, wallTime: wall)
+        if env["VERANTYX_LOADING_SELFTEST_GAMEPLAY"] == "1" {
+            precondition(fromFile.text != nil)
+            _ = fromFile.noteFrame(sourceMode: 0, now: 2.1)
+            fromFile.poll(now: 2.1, wallTime: wall, force: true)
+            precondition(fromFile.text != nil) // Compositor frames do not prove that the game resumed.
+            for step in 0..<20 {
+                let time = 2.2 + Double(step) * 0.1
+                let resumed = fromFile.noteFrame(sourceMode: 2, now: time)
+                fromFile.poll(now: time, wallTime: wall, force: resumed)
+                precondition(fromFile.text == nil)
+            }
+            fromFile.poll(now: 5.4, wallTime: wall)
+            precondition(fromFile.text == nil) // A short hitch stays unobstructed.
+            fromFile.poll(now: 5.7, wallTime: wall)
+            precondition(fromFile.text != nil)
+            let resumed = fromFile.noteFrame(sourceMode: 2, now: 5.71)
+            precondition(resumed)
+            fromFile.poll(now: 5.71, wallTime: wall, force: resumed)
+            precondition(fromFile.text == nil)
+            print("loading selftest: gameplay, short hitch, stall and immediate resume -> ok")
+            exit(0)
+        }
+        if let expected = env["VERANTYX_LOADING_SELFTEST_EXPECT"], (fromFile.text ?? "(none)") != expected {
+            print("loading selftest: expected \(expected), got \(fromFile.text ?? "(none)")"); exit(1)
+        }
+        var clock = LoadingFrameClock()
+        precondition(clock.needsFrame(hasSource: false, hasOverlay: true, now: 0))
+        clock.sent(now: 0, hasOverlay: true, hasSource: false)
+        precondition(!clock.needsFrame(hasSource: false, hasOverlay: true, now: 0.05))
+        precondition(clock.needsFrame(hasSource: false, hasOverlay: true, now: 0.11))
+        precondition(clock.needsFrame(hasSource: false, hasOverlay: false, now: 1))
+        clock.sent(now: 1, hasOverlay: false, hasSource: false)
+        precondition(clock.needsFrame(hasSource: false, hasOverlay: false, now: 1.11))
+        clock.sent(now: 1.2, hasOverlay: false, hasSource: true)
+        precondition(!clock.needsFrame(hasSource: false, hasOverlay: false, now: 1.31))
+        precondition(clock.needsFrame(hasSource: true, hasOverlay: false, now: 0.05))
+        if fromFile.text == nil { print("loading selftest: no prompt -> ok"); exit(0) }
+        if let badge = GamePromptOverlay.render(fromFile.text!, eyeWidth: w / 2, eyeHeight: h, activityPhase: 0) {
+            precondition(Double(badge.width) <= Double(w / 2) * 0.28 + 1)
+            precondition(Double(badge.height) <= Double(h) * 0.09)
+            let size = CGSize(width: badge.width, height: badge.height)
+            let points = GamePromptOverlay.centers(width: w, height: h, tangents: tangents, ipd: 0.063, badgeSize: size)
+            for (eye, p) in points.enumerated() {
+                let rect = CGRect(x: p.x - size.width / 2, y: p.y - size.height / 2, width: size.width, height: size.height)
+                precondition(rect.minX >= Double(eye * (w / 2)) + Double(w / 2) * 0.1 - 1)
+                precondition(rect.maxX <= Double((eye + 1) * (w / 2)) - Double(w / 2) * 0.1 + 1)
+                precondition(rect.minY >= Double(h) * 0.1 - 1 && rect.maxY <= Double(h) * 0.9 + 1)
+            }
+            print("loading selftest: compact badge and binocular safe inset -> ok")
+        }
+    } else {
+        let text = env["VERANTYX_PROMPT_SELFTEST_TEXT"] ?? "Hold the trigger to start"
+        let file = NSTemporaryDirectory() + "verantyx-prompt-selftest-\(getpid()).txt"
+        try? Data(text.utf8).write(to: URL(fileURLWithPath: file))
+        fromFile = GamePromptOverlay(path: file)
+        fromFile.poll(now: 0)
+        try? FileManager.default.removeItem(atPath: file)
+    }
     let drew = fromFile.draw(into: pb, tangents: tangents, ipd: 0.063)
     let image = CIImage(cvPixelBuffer: pb)
     guard drew, let cg = CIContext().createCGImage(image, from: image.extent),
@@ -954,12 +1746,28 @@ func withSharedHandsWrite(_ write: () -> Void) {
     dbHeaderPtr.pointee.poseSequence = odd &+ 1
 }
 
+func loadingFrame() -> SharedFrame {
+    sharedHandsWriteLock.lock()
+    defer { sharedHandsWriteLock.unlock() }
+    var transform: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
+        = (1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)
+    let timestamp = handsMapPtr.loadUnaligned(fromByteOffset: 244, as: Double.self)
+    if timestamp.isFinite && timestamp > 0 { _ = withUnsafeMutableBytes(of: &transform) { memcpy($0.baseAddress!, handsMapPtr, 64) } }
+    return SharedFrame(sequenceNumber: 0, width: UInt32(outputWidth), height: UInt32(outputHeight), format: 87,
+                       renderHeadTransform: transform, visionTimestamp: timestamp.isFinite ? timestamp : 0)
+}
+
 // ALVR's input into SharedHands (offsets as the Vision Pro's POSE packet writes them; ALVRBridge's VxAlvrInput layout,
 // which its Rust side checks at compile time), and its clients' IDR requests to the encoder.
 if let alvr {
     Thread {
         let input = UnsafeMutableRawPointer.allocate(byteCount: 312, alignment: 8)
         var seq: UInt64 = 0
+        var previousControls: UInt64?
+        var previousTriggers: UInt8 = 0
+        var triggerPresses = [UInt64(0), UInt64(0)]
+        var controlsChanged = false
+        var lastInputLog: TimeInterval = -.infinity
         // The game's vibrations, which the driver writes per hand at 336 in the map's tail (SharedHaptic: seq, then
         // duration, frequency, amplitude), to the headset (the seqs already there are old ones: skipped)
         var hapticSeq = [handsMapPtr.advanced(by: 336).load(as: UInt32.self), handsMapPtr.advanced(by: 352).load(as: UInt32.self)]
@@ -998,6 +1806,26 @@ if let alvr {
             let next = alvr.input(input, seq)
             if next != seq {
                 seq = next
+                let leftTrigger = input.load(fromByteOffset: 307, as: UInt8.self)
+                let rightTrigger = input.load(fromByteOffset: 308, as: UInt8.self)
+                let rightButtons = input.load(fromByteOffset: 296, as: UInt32.self)
+                let leftButtons = input.load(fromByteOffset: 300, as: UInt32.self)
+                let triggers: UInt8 = (leftTrigger >= 192 ? 1 : 0) | (rightTrigger >= 192 ? 2 : 0)
+                for hand in 0..<2 where triggers & (1 << hand) != 0 && previousTriggers & (1 << hand) == 0 { triggerPresses[hand] &+= 1 }
+                let controls = UInt64(leftButtons) << 32 | UInt64(rightButtons)
+                controlsChanged = controlsChanged || previousControls != controls || previousTriggers != triggers
+                previousTriggers = triggers
+                previousControls = controls
+                let now = ProcessInfo.processInfo.systemUptime
+                if controlsChanged, now - lastInputLog >= 1 {
+                    lastInputLog = now; controlsChanged = false
+                    print("ALVR input: seq=\(seq) trigger=\(leftTrigger)/\(rightTrigger) presses=\(triggerPresses[0])/\(triggerPresses[1]) buttons=\(leftButtons)/\(rightButtons) hands=\(input.load(fromByteOffset: 305, as: UInt8.self))/\(input.load(fromByteOffset: 306, as: UInt8.self))")
+                }
+                encoderDiagnosticLock.lock()
+                posePacketCount += 1
+                lastPoseReceivedAt = ProcessInfo.processInfo.systemUptime
+                encoderDiagnosticLock.unlock()
+                let hasTangents = input.load(fromByteOffset: 311, as: UInt8.self) != 0
                 withSharedHandsWrite {
                     memcpy(handsMapPtr, input + 8, 64)                 // head, left, right (column-major)
                     memcpy(handsMapPtr + 64, input + 72, 64)
@@ -1009,15 +1837,16 @@ if let alvr {
                     memcpy(handsMapPtr + 220, input + 212, 12)         // right velocity
                     memcpy(handsMapPtr + 232, input + 200, 12)         // left velocity
                     memcpy(handsMapPtr + 244, input, 8)                // the sample's time (the frame's pose id)
-                    if input.load(fromByteOffset: 311, as: UInt8.self) != 0 {
+                    if hasTangents {
                         memcpy(handsMapPtr + 252, input + 264, 32)     // eye tangents, left then right
-                        saveHeadsetFrustum(input + 264)
                     }
                     memcpy(handsMapPtr + 284, input + 309, 2)          // grips
                     memcpy(handsMapPtr + 286, input + 304, 1)          // headTracked
                     memcpy(handsMapPtr + 287, input + 224, 24)         // angular velocities, left then right
                     handsMapPtr.advanced(by: 311).storeBytes(of: UInt8(1), as: UInt8.self)
                 }
+                // Formatting and disk I/O must not leave the pose sequence odd.
+                if hasTangents { saveHeadsetFrustum(input + 264) }
             }
             usleep(500)
         }
@@ -1358,6 +2187,7 @@ func copyFrameToBGRA(
 
 // MARK: - Joy-Con UDP Server
 DispatchQueue.global(qos: .userInteractive).async {
+    guard !alvrMode else { return } // ALVR owns the controller inputs in this mode.
     let jcSock = socket(AF_INET, SOCK_DGRAM, 0)
     var opt: Int32 = 1
     setsockopt(jcSock, SOL_SOCKET, SO_REUSEADDR, &opt, socklen_t(MemoryLayout<Int32>.size))
@@ -1428,6 +2258,7 @@ struct VRPosePacket {
 }
 
 func receiveVideoPeerPacket(_ packet: Data, from connection: NWConnection) {
+    guard !alvrMode else { return }
     peerLock.lock()
     let retired = retiredVideoPeers.contains(connection)
     peerLock.unlock()
@@ -1541,43 +2372,49 @@ func receiveFromVideoPeer(_ connection: NWConnection) {
 
 let networkParameters = NWParameters.udp
 networkParameters.includePeerToPeer = true
-let videoListener: NWListener
-do {
-    videoListener = try NWListener(using: networkParameters, on: 9999)
-} catch {
-    print("Could not listen for Vision Pro on port 9999: \(error)")
-    exit(1)
-}
-videoListener.service = NWListener.Service(name: "VerantyxVR", type: "_verantyxvr._udp")
-videoListener.stateUpdateHandler = { state in
-    if case .ready = state {
-        print("Published Bonjour _verantyxvr._udp on 9999 using peer-to-peer Network.framework")
-    } else if case .failed(let error) = state {
-        print("Vision Pro listener failed: \(error)")
+let videoListener: NWListener?
+if alvrMode {
+    videoListener = nil
+} else {
+    do {
+        videoListener = try NWListener(using: networkParameters, on: 9999)
+    } catch {
+        print("Could not listen for Vision Pro on port 9999: \(error)")
         exit(1)
     }
 }
-videoListener.newConnectionHandler = { connection in
-    connection.stateUpdateHandler = { state in
+if let videoListener {
+    videoListener.service = NWListener.Service(name: "VerantyxVR", type: "_verantyxvr._udp")
+    videoListener.stateUpdateHandler = { state in
         if case .ready = state {
-            print("Vision Pro flow ready: \(connection.endpoint), path=\(String(describing: connection.currentPath))")
-        }
-        if case .failed(let error) = state {
-            print("Vision Pro flow failed: \(error)")
-            connection.cancel()
-        }
-        if case .cancelled = state {
-            peerLock.lock()
-            retiredVideoPeers.add(connection)
-            if videoPeer === connection { videoPeer = nil; peerNeedsKeyFrame = true }
-            peerLock.unlock()
-            connection.stateUpdateHandler = nil
+            print("Published Bonjour _verantyxvr._udp on 9999 using peer-to-peer Network.framework")
+        } else if case .failed(let error) = state {
+            print("Vision Pro listener failed: \(error)")
+            exit(1)
         }
     }
-    connection.start(queue: transportQueue)
-    receiveFromVideoPeer(connection)
+    videoListener.newConnectionHandler = { connection in
+        connection.stateUpdateHandler = { state in
+            if case .ready = state {
+                print("Vision Pro flow ready: \(connection.endpoint), path=\(String(describing: connection.currentPath))")
+            }
+            if case .failed(let error) = state {
+                print("Vision Pro flow failed: \(error)")
+                connection.cancel()
+            }
+            if case .cancelled = state {
+                peerLock.lock()
+                retiredVideoPeers.add(connection)
+                if videoPeer === connection { videoPeer = nil; peerNeedsKeyFrame = true }
+                peerLock.unlock()
+                connection.stateUpdateHandler = nil
+            }
+        }
+        connection.start(queue: transportQueue)
+        receiveFromVideoPeer(connection)
+    }
+    videoListener.start(queue: transportQueue)
 }
-videoListener.start(queue: transportQueue)
 
 // MARK: - Game audio to the headset
 
@@ -1611,6 +2448,10 @@ final class GameAudioStreamer {
     }
 
     func start() {
+        guard !alvrMode else {
+            print("Game audio: ALVR records its dedicated tap; legacy UDP audio capture is off")
+            return
+        }
         guard ProcessInfo.processInfo.environment["VERANTYX_AUDIO"] != "0" else {
             print("Game audio streaming disabled (VERANTYX_AUDIO=0)")
             return
@@ -1645,7 +2486,7 @@ final class GameAudioStreamer {
 
         let aggregate: [String: Any] = [
             kAudioAggregateDeviceNameKey as String: "Verantyx VR tap",
-            kAudioAggregateDeviceUIDKey as String: "com.verantyx.vr.audio-tap",
+            kAudioAggregateDeviceUIDKey as String: "com.verantyx.vr.audio-tap.\(getpid()).\(UUID().uuidString)",
             kAudioAggregateDeviceIsPrivateKey as String: true,
             kAudioAggregateDeviceTapAutoStartKey as String: true,
             kAudioAggregateDeviceTapListKey as String: [[
@@ -1655,6 +2496,8 @@ final class GameAudioStreamer {
         ]
         status = AudioHardwareCreateAggregateDevice(aggregate as CFDictionary, &aggregateID)
         guard status == noErr else {
+            AudioHardwareDestroyProcessTap(tapID)
+            tapID = AudioObjectID(kAudioObjectUnknown)
             print("Game audio: could not create the tap device (\(status))")
             return
         }
@@ -1809,12 +2652,16 @@ func sendStreamStatsIfDue() {
 }
 
 print("Starting native read loop and UDP transmission on port 9999...")
+var loadingFrameClock = LoadingFrameClock()
+var loadingFrames = 0
 
 while isEncoding {
     autoreleasepool {
         reportDiagnosticsIfDue()
         sendSourceProjectionIfDue()
         sendStreamStatsIfDue()
+        let pollTime = ProcessInfo.processInfo.systemUptime
+        nativeLoadingMap.poll(now: pollTime)
         let sourceMode = dbHeaderPtr.pointee.captureSourceMode
         if sourceMode != lastCaptureSourceMode {
             print("Capture source changed \(lastCaptureSourceMode)->\(sourceMode); continuing stream sequence \(streamSequence)")
@@ -1824,17 +2671,27 @@ while isEncoding {
         }
         let readyIndex = dbHeaderPtr.pointee.latestReadyIndex
         OSMemoryBarrier()
-        if readyIndex < 2 {
-            let headerPtr = headers[Int(readyIndex)]
-            let currentSeq = headerPtr.pointee.sequenceNumber
-            
-            if currentSeq != lastSeq && currentSeq > 0 {
-                let frameHeader = headerPtr.pointee
+        let headerPtr = headers[Int(readyIndex < 2 ? readyIndex : 0)]
+        let sourceSeq = headerPtr.pointee.sequenceNumber
+        let hasGameSource = readyIndex < 2 && sourceSeq != lastSeq && sourceSeq > 0
+        let hasSource = hasGameSource && !nativeLoadingMap.active
+        let currentSeq = hasGameSource ? sourceSeq : lastSeq
+        let validSize = headerPtr.pointee.width > 0 && headerPtr.pointee.height > 0 &&
+            headerPtr.pointee.width <= 8192 && headerPtr.pointee.height <= 4096
+        let resumed = hasSource && validSize && gamePrompt.noteFrame(sourceMode: sourceMode, now: pollTime)
+        gamePrompt.poll(now: pollTime, force: resumed)
+        let hasLoadingOverlay = nativeLoadingMap.active || gamePrompt.text != nil
+        let loadingInterval = nativeLoadingMap.active ? 1.0 / 60 : 0.1
+        if readyIndex < 2 || loadingFrameClock.needsFrame(hasSource: false, hasOverlay: hasLoadingOverlay, now: pollTime, interval: loadingInterval) {
+            if loadingFrameClock.needsFrame(hasSource: hasSource, hasOverlay: hasLoadingOverlay, now: pollTime, interval: loadingInterval) {
+                var frameHeader = hasSource ? headerPtr.pointee : loadingFrame()
                 let width = Int(frameHeader.width)
                 let height = Int(frameHeader.height)
-                encoderDiagnosticLock.lock()
-                capturedFrameCount += 1
-                encoderDiagnosticLock.unlock()
+                if hasSource {
+                    encoderDiagnosticLock.lock()
+                    capturedFrameCount += 1
+                    encoderDiagnosticLock.unlock()
+                }
 
                 // (Wider than 4096 for 2.5K per eye side by side; a frame block holds 4096 x 4096 x 8 bytes.)
                 guard width > 0, height > 0, width <= 8192, height <= 4096, width * height * 4 <= 4096 * 4096 * 8 else {
@@ -1842,7 +2699,7 @@ while isEncoding {
                     return
                 }
 
-                let outputSizeChanged = resolveOutputSize(sourceWidth: width, sourceHeight: height)
+                let outputSizeChanged = hasSource && resolveOutputSize(sourceWidth: width, sourceHeight: height)
                 if outputSizeChanged, let oldSession = compressionSession {
                     // SteamVR can switch to the headset's measured frustum after
                     // the first Vision Pro pose arrives. Drain the old session
@@ -1859,7 +2716,7 @@ while isEncoding {
                 }
 
                 if compressionSession == nil {
-                    resolveOutputSize(sourceWidth: width, sourceHeight: height)
+                    if hasSource { resolveOutputSize(sourceWidth: width, sourceHeight: height) }
                     print("Initializing fixed-size VideoToolbox encoder for \(outputWidth)x\(outputHeight)...")
                     fflush(stdout)
                     setupEncoder(width: Int32(outputWidth), height: Int32(outputHeight))
@@ -1897,7 +2754,7 @@ while isEncoding {
                 }
                 let sourceFormat = frameHeader.format
                 let conversionStart = ProcessInfo.processInfo.systemUptime
-                let tryGPU = conversionSelector.preferGPU()
+                let tryGPU = hasSource && conversionSelector.preferGPU()
                 var didCopy = tryGPU && transferFrameOnGPU(
                     source: pixelDatas[Int(readyIndex)], sourceFormat: sourceFormat,
                     sourceWidth: width, sourceHeight: height, destination: pb)
@@ -1911,17 +2768,22 @@ while isEncoding {
                         return
                     }
                     if let destination = CVPixelBufferGetBaseAddress(pb) {
-                        didCopy = copyFrameToBGRA(
-                            source: pixelDatas[Int(readyIndex)],
-                            sourceFormat: sourceFormat,
-                            sourceWidth: width,
-                            sourceHeight: height,
-                            destination: destination,
-                            destinationBytesPerRow: CVPixelBufferGetBytesPerRow(pb)
-                        )
+                        if hasSource {
+                            didCopy = copyFrameToBGRA(
+                                source: pixelDatas[Int(readyIndex)],
+                                sourceFormat: sourceFormat,
+                                sourceWidth: width,
+                                sourceHeight: height,
+                                destination: destination,
+                                destinationBytesPerRow: CVPixelBufferGetBytesPerRow(pb)
+                            )
+                        } else {
+                            memset(destination, 0, CVPixelBufferGetBytesPerRow(pb) * CVPixelBufferGetHeight(pb))
+                            didCopy = true
+                        }
                     }
                     CVPixelBufferUnlockBaseAddress(pb, [])
-                    if didCopy {
+                    if didCopy && hasSource {
                         conversionSelector.record(gpu: false, milliseconds: (ProcessInfo.processInfo.systemUptime - conversionStart) * 1000)
                     }
                 }
@@ -1935,19 +2797,29 @@ while isEncoding {
                 // The two shared buffers can be reused if encoding falls behind. Drop
                 // a frame if its producer overwrote this slot while we copied it.
                 OSMemoryBarrier()
-                guard headerPtr.pointee.sequenceNumber == currentSeq,
-                      dbHeaderPtr.pointee.captureSourceMode == sourceMode else {
+                guard !hasSource || (headerPtr.pointee.sequenceNumber == currentSeq &&
+                      dbHeaderPtr.pointee.captureSourceMode == sourceMode) else {
                     encoderInFlightFrames.signal()
                     lastSeq = currentSeq
                     return
                 }
 
                 // (a game's prompt from its loading page, over both eyes: GamePromptOverlay)
-                gamePrompt.poll(now: ProcessInfo.processInfo.systemUptime)
-                if gamePrompt.text != nil {
+                if nativeLoadingMap.active || gamePrompt.text != nil {
                     let ipd = handsMapPtr.load(fromByteOffset: 320, as: UInt32.self) == 0x4450_4956
                         ? handsMapPtr.load(fromByteOffset: 324, as: Float.self) : 0.063
-                    gamePrompt.draw(into: pb, tangents: readSourceProjection(), ipd: (0.04...0.09).contains(ipd) ? ipd : 0.063)
+                    let safeIPD = (0.04...0.09).contains(ipd) ? ipd : 0.063
+                    if nativeLoadingMap.active {
+                        let head = withUnsafeBytes(of: frameHeader.renderHeadTransform) { $0.loadUnaligned(as: simd_float4x4.self) }
+                        if let view = nativeLoadingMap.draw(into: pb, tangents: readSourceProjection(), ipd: Double(safeIPD),
+                            head: head, timestamp: frameHeader.visionTimestamp) {
+                            withUnsafeBytes(of: view.head) { bytes in
+                                withUnsafeMutableBytes(of: &frameHeader.renderHeadTransform) { $0.copyMemory(from: bytes) }
+                            }
+                            frameHeader.visionTimestamp = view.timestamp
+                        }
+                    }
+                    else { gamePrompt.draw(into: pb, tangents: readSourceProjection(), ipd: safeIPD) }
                 }
 
                 streamSequence &+= 1
@@ -1991,8 +2863,12 @@ while isEncoding {
                                                              sourceFrameRefcon: UnsafeMutableRawPointer(refConPtr),
                                                              infoFlagsOut: nil)
 
-                if framesEncoded < 3 || framesEncoded % 90 == 0 {
+                if hasSource && (framesEncoded < 3 || framesEncoded % 90 == 0) {
                     print("Queued capture frame seq=\(currentSeq), source=\(width)x\(height) format=\(sourceFormat), status=\(status)")
+                } else if !hasSource {
+                    loadingFrames += 1
+                    if !hasLoadingOverlay && !loadingFrameClock.awaitingSource { print("Queued loading clear frame, status=\(status)") }
+                    else if loadingFrames == 1 || loadingFrames % 100 == 0 { print("Queued loading frame \(loadingFrames), status=\(status)") }
                 }
                 writeSnapshotIfDue(pb, now: now)
 
@@ -2003,6 +2879,7 @@ while isEncoding {
                     encoderInFlightFrames.signal()
                     requestKeyFrame()
                 } else {
+                    loadingFrameClock.sent(now: now, hasOverlay: hasLoadingOverlay, hasSource: hasSource)
                     encoderDiagnosticLock.lock()
                     submittedFrameCount += 1
                     encoderDiagnosticLock.unlock()

@@ -103,7 +103,7 @@ enum Paths {
     static let defaultDrive = home.appendingPathComponent("Verantyx_VR_Drive")
     /// Where SteamVR, the games and the Windows runtime files go (another disk can be chosen: they are large).
     static var drive: URL {
-        get { UserDefaults.standard.string(forKey: "drive").map { URL(fileURLWithPath: $0) } ?? defaultDrive }
+        get { (ProcessInfo.processInfo.environment["VERANTYX_VR_DRIVE"] ?? UserDefaults.standard.string(forKey: "drive")).map { URL(fileURLWithPath: $0) } ?? defaultDrive }
         set { UserDefaults.standard.set(newValue.path, forKey: "drive") }
     }
     static var steamLibrary: URL { drive.appendingPathComponent("vxrt_steam") }
@@ -117,7 +117,7 @@ enum Paths {
     static let support = home.appendingPathComponent("Library/Application Support/VeRantyx")
     static let steamcmd = support.appendingPathComponent("steamcmd")
     static let alvrLog = support.appendingPathComponent("ALVR/session_log.txt")
-    static let logs = home.appendingPathComponent("Library/Logs/VeRantyx")
+    static let logs = ProcessInfo.processInfo.environment["VERANTYX_LOG_DIR"].map { URL(fileURLWithPath: $0) } ?? home.appendingPathComponent("Library/Logs/VeRantyx")
     /// The runtime the app carries: the launch scripts, VXRuntime, the encoder, the SteamVR driver, ALVR's streaming
     /// core, laid out as in the repository (so the scripts find them where they look). VERANTYX_REPO points it at a
     /// checkout instead (development).

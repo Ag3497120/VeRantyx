@@ -1,0 +1,28 @@
+{
+  "bindings": {
+    "/actions/main": {
+      "sources": [
+        {"path": "/user/hand/left/input/grip", "mode": "grab", "parameters": {"value_hold_threshold": "0.6", "value_release_threshold": "0.4"}, "inputs": {"grab": {"output": "/actions/main/in/use"}}},
+        {"path": "/user/hand/right/input/grip", "mode": "grab", "parameters": {"value_hold_threshold": "0.6", "value_release_threshold": "0.4"}, "inputs": {"grab": {"output": "/actions/main/in/use"}}},
+        {"path": "/user/hand/right/input/trigger", "mode": "trigger", "parameters": {"click_activate_threshold": "0.2"}, "inputs": {"click": {"output": "/actions/main/in/pull"}}},
+        {"path": "/user/hand/left/input/joystick", "mode": "joystick", "inputs": {"position": {"output": "/actions/main/in/walk"}}},
+        {"path": "/user/hand/right/input/joystick", "mode": "joystick", "inputs": {"position": {"output": "/actions/main/in/walk"}}},
+        {"path": "/user/hand/right/input/joystick", "mode": "dpad", "parameters": {"deadzone_pct": "20"}, "inputs": {"north": {"output": "/actions/main/in/teleport"}}},
+        {"path": "/user/hand/left/input/x", "mode": "toggle_button", "inputs": {"click": {"output": "/actions/main/in/toggle"}}}
+      ],
+      "poses": [
+        {"path": "/user/hand/left/pose/raw", "output": "/actions/main/in/leftpose"},
+        {"path": "/user/hand/left/pose/raw", "output": "/actions/main/in/hands"},
+        {"path": "/user/hand/right/pose/raw", "output": "/actions/main/in/hands"}
+      ],
+      "skeleton": [{"path": "/user/hand/left/input/skeleton/left", "output": "/actions/main/in/leftskeleton"}],
+      "haptics": [
+        {"path": "/user/hand/left/output/haptic", "output": "/actions/main/out/haptic"},
+        {"path": "/user/hand/right/output/haptic", "output": "/actions/main/out/haptic"}
+      ]
+    },
+    "/actions/ui": {
+      "sources": [{"path": "/user/hand/right/input/trigger", "mode": "button", "inputs": {"click": {"output": "/actions/ui/in/select"}}}]
+    }
+  }
+}

@@ -36,7 +36,18 @@ enum Report {
     static func saveLogs() async -> URL? {
         let fm = FileManager.default
         var sources = ((try? fm.contentsOfDirectory(at: Paths.logs, includingPropertiesForKeys: nil)) ?? [])
-            .filter { $0.pathExtension == "log" }
+            .filter { $0.pathExtension == "log" || ["shader-progress.json", "shader-progress.prev.json"].contains($0.lastPathComponent) }
+        let native = Paths.logs.appendingPathComponent("native")
+        let sessions = ((try? fm.contentsOfDirectory(at: native, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+            .sorted { ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
+                > ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) }.prefix(5)
+        for session in sessions {
+            sources += ((try? fm.contentsOfDirectory(at: session, includingPropertiesForKeys: nil)) ?? [])
+                .filter { ["log", "json"].contains($0.pathExtension) }
+        }
+        sources += ((try? fm.contentsOfDirectory(at: FPSCapture.directory, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "json" }
         for alvr in [Paths.alvrLog, Paths.alvrLog.deletingPathExtension().appendingPathExtension("prev.txt")] where fm.fileExists(atPath: alvr.path) {
             sources.append(alvr)
         }
@@ -49,7 +60,9 @@ enum Report {
         for source in sources {
             guard let data = fm.contents(atPath: source.path) else { continue }
             let text = String(decoding: data, as: UTF8.self)
-            let target = folder.appendingPathComponent(source.deletingLastPathComponent().lastPathComponent == "ALVR" ? "alvr-" + source.lastPathComponent : source.lastPathComponent)
+            let parent = source.deletingLastPathComponent()
+            let prefix = parent.deletingLastPathComponent() == native ? "native-" + parent.lastPathComponent + "-" : parent.lastPathComponent == "ALVR" ? "alvr-" : ""
+            let target = folder.appendingPathComponent(prefix + source.lastPathComponent)
             try? redact(text).write(to: target, atomically: true, encoding: .utf8)
         }
         let desktop = fm.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")

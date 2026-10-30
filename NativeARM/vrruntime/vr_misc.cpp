@@ -2,6 +2,9 @@
 // models, headset view and the rest. Mostly honest "not available" answers.
 #include "gen_stubs.h"
 #include "vr_runtime.h"
+#include "json_mini.h"
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -167,8 +170,7 @@ public:
 // IVRMailbox_001 is Valve-internal; the layout is the one Proton's vrclient
 // wraps (vrclient_x64/winIVRMailbox.c): register, unregister, send, receive.
 // libvr refuses to start without it. Messages are JSON to SteamVR's processes
-// (vrserver, vrcompositor), none of which exist here: sends are logged and
-// acknowledged, receives report nothing pending.
+// (vrserver, vrcompositor), none of which exist here.
 class IVRMailbox_001 {
 public:
     virtual uint32_t RegisterMailbox(const char *name, uint64_t *handle) = 0;
@@ -183,8 +185,8 @@ public:
 // "Timed out waiting for response from Mongoose" if no "ready" has come within
 // 15 s. The stand-in says ready when the game's mailbox registers, and again
 // for each message the game sends to the service other than set_paths (the
-// game resets its "ready" state when it starts a transition). Nothing is drawn
-// for the interstitials themselves.
+// game resets its "ready" state when it starts a transition). Text goes through
+// the encoder's existing stereo prompt overlay, also used by the Windows path.
 class Mailbox : public IVRMailbox_001 {
 public:
     std::mutex m_mu;
@@ -192,6 +194,8 @@ public:
     std::map<uint64_t, std::string> m_names;
     std::map<std::string, std::deque<std::string>> m_inbox;   // by mailbox name
     int m_logged = 0;
+
+    void interstitial(const std::string &message) { vrrt::loading_message(message); }
 
     void post(const std::string &to, const std::string &msg) { m_inbox[to].push_back(msg); }
 
@@ -202,11 +206,13 @@ public:
         uint64_t h = m_next++;
         m_names[h] = n;
         if (handle) *handle = h;
-        if (n == "hlvr/mailbox") post(n, "{\"type\":\"ready\"}");
+        if (n == "hlvr/mailbox") { vrrt::loading_reset(); post(n, "{\"type\":\"ready\"}"); }
         return 0;
     }
     uint32_t UnregisterMailbox(uint64_t h) override {
         std::lock_guard<std::mutex> l(m_mu);
+        auto it = m_names.find(h);
+        if (it != m_names.end() && it->second == "hlvr/mailbox") { vrrt::loading_reset(); m_inbox.erase(it->second); }
         m_names.erase(h);
         return 0;
     }
@@ -214,6 +220,7 @@ public:
         std::lock_guard<std::mutex> l(m_mu);
         std::string d = dest ? dest : "", m = msg ? msg : "";
         if (m_logged++ < 200) vrrt::log("mailbox %s -> %s: %.400s", m_names.count(h) ? m_names[h].c_str() : "?", d.c_str(), m.c_str());
+        if (d == "hlvr/interstitials" && m_names.count(h)) interstitial(m);
         if (d == "hlvr/interstitials" && m.find("\"set_paths\"") == std::string::npos && m_names.count(h))
             post(m_names[h], "{\"type\":\"ready\"}");
         return 0;
