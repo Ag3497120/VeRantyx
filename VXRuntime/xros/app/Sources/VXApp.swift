@@ -6,10 +6,16 @@ import SwiftUI
 
 @main
 struct VXRuntimeApp: App {
+    @Environment(\.scenePhase) private var phase
+    init() {
+        vxrt_jlog("app_init", nil)
+        vxrt_boot_fallback()   // (main.m: the program starts without the window if no window has appeared within a few seconds)
+    }
     var body: some Scene {
         WindowGroup(id: "display") {
             VXDisplayView()
         }
+        .onChange(of: phase) { _, p in vxrt_jlog("scene_phase", "\"phase\":\"\(p)\"") }
         .windowResizability(.contentSize)
 
         ImmersiveSpace(id: "vr") {
@@ -46,6 +52,7 @@ struct VXDisplayView: View {
     var body: some View {
         VXRootControllerView()
             .frame(width: 1280, height: 720)
+            .onAppear { vxrt_jlog("display_view", nil) }
             .task {
                 guard !opened, vxrt_present_vr() != 0 else { return }
                 opened = true

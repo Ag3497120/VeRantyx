@@ -924,7 +924,7 @@ static int gen(const image *im, const char *out) {
 
 int main(int argc, char **argv) {
     g_argv = argv;
-    if (argc < 3) { fprintf(stderr, "usage: vxrt-aot analyze|gen|name <pe> [out] [--addresses file]\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: vxrt-aot analyze|gen|name|size <pe> [out] [--addresses file]\n"); return 2; }
     image im = { 0 };
     load(&im, argv[2]);
     const char *addresses = NULL;
@@ -936,6 +936,7 @@ int main(int argc, char **argv) {
         printf("%s-%016llx.dylib\n", lower, (unsigned long long)im.hash);
         return 0;
     }
+    if (!strcmp(argv[1], "size")) { printf("%u\n", im.size); return 0; }   // (SizeOfImage: packing images into an arena)
     if (!strcmp(argv[1], "analyze")) return analyze(&im, addresses, 0);
     if (!strcmp(argv[1], "gen") && argc >= 4) return gen(&im, argv[3]);
     fprintf(stderr, "vxrt-aot: unknown command %s\n", argv[1]);

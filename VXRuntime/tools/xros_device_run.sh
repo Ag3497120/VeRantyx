@@ -5,6 +5,8 @@
 # xros_child xros_input xros_vr_depth, arena_* (relocated into the arena), fw_* (frameworks), fwarena_suite; <test>@flat
 # for the window only (the default is the immersive space). WAIT=<s> per test.
 # VISIONOS_PORT.md has what each one shows.
+# NEVER uninstall the app (devicectl device uninstall app) or install with --remove-existing-content: that wipes its
+# container, Documents/root with the game data in it. `devicectl device install app` keeps Documents.
 DEV=${DEV:-717AC0D2-8713-5537-8D5F-A611235E7D35}
 APP=marimokodai.VXRuntimeHost
 OUT=${OUT:-$HOME/Verantyx_VR_Drive/wt/runs/avp-port/device}

@@ -207,6 +207,8 @@ static void *runtime_thread(void *arg) {
     return NULL;
 }
 
+static void vxrt_boot(UIView *display);
+static int g_booted;
 @interface VXRootController : UIViewController
 @end
 @implementation VXRootController {
@@ -229,19 +231,31 @@ static void *runtime_thread(void *arg) {
     started = YES;
     CGSize s = self.view.bounds.size;
     jlog("window", "\"w\":%.0f,\"h\":%.0f,\"scale\":%.1f", s.width, s.height, self.view.traitCollection.displayScale);
+    vxrt_boot(self.view);
+}
+@end
+
+// The program's start: the display (the window's view, or a view in no window when none appeared: the immersive space
+// shows the swap chain anyway), the probes, the memory log, the program's thread. Once.
+static void vxrt_boot(UIView *display) {
+    if (g_booted++) return;
     metal_probe();
-    vxrt_xros_attach(self.view);
+    vxrt_xros_attach(display);
     pthread_t t;
     pthread_create(&t, NULL, memory_ticker, NULL);
     if (!strcmp(g_test, "none")) { status(@"VX Runtime: probes only (Documents/host_log.jsonl)"); return; }
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8u << 20);
     pthread_create(&t, &a, runtime_thread, NULL);
 }
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    [self.view bringSubviewToFront:g_status];
+void vxrt_boot_fallback(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        static UIView *detached;
+        if (detached || g_booted) return;
+        detached = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 1280, 720)];
+        jlog("window_fallback", "\"why\":\"no window appeared in 4 s: a view in no window is the display\"");
+        vxrt_boot(detached);
+    });
 }
-@end
 
 // The SwiftUI app (VXApp.swift) hosts this controller in its window and opens the immersive space (VXImmersive.swift).
 UIViewController *vxrt_make_root_controller(void) { return [VXRootController new]; }

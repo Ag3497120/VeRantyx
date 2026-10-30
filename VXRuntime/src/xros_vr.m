@@ -62,6 +62,7 @@ typedef struct {
     uint32_t w, h, has_depth, has_mv, has_proj, flags;
     float tan_x, tan_y, z_a, z_b, mv_sx, mv_sy;
     float head[16];                  // (origin from the camera it is shown from: the head at its present)
+    int head_valid;                  // (0: presented before the first compositor frame; it takes the next frame's head)
     double content_time, interval;
     uint64_t serial;
     int writing, readers;
@@ -73,6 +74,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static float g_head[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 static double g_last_submit, g_interval = 1.0 / 30;
 static double g_present_time;
+static int g_head_valid;
 // (stats, reset each report)
 static unsigned g_frames, g_submits, g_draws, g_noframe, g_depth_frames, g_mv_frames;
 static double g_gpu_ms, g_age_ms; static unsigned g_gpu_n;
@@ -163,6 +165,7 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
     if (had_depth) g_hold = nil;                     // (the slot keeps reading this one; the next frame copies into a new one)
     if (s >= 0) g_slot[s].writing = 1;
     float head[16]; memcpy(head, g_head, sizeof head);
+    int head_valid = g_head_valid;
     double interval = g_interval;
     pthread_mutex_unlock(&g_lock);
     // the frame's scene from the D3D12 layer (FSR2's inputs: motion vectors, depth, constants), taken every frame
@@ -233,6 +236,7 @@ void vx_xros_vr_submit(void *cbp, void *backp, uint32_t w, uint32_t h, void (*re
         else { S->z_a = C.nearp; S->z_b = 0; S->flags = 0; }
     }
     memcpy(S->head, head, sizeof head);
+    S->head_valid = head_valid;
     S->content_time = now; S->interval = interval;
     uint64_t serial = ++g_serial;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> d) {
@@ -262,6 +266,8 @@ int vx_xros_vr_begin_frame(const float m[16], double presentation_time) {
     vx_xros_pace_tick();
     pthread_mutex_lock(&g_lock);
     memcpy(g_head, m, sizeof g_head);
+    g_head_valid = 1;
+    for (int k = 0; k < 3; k++) if (!g_slot[k].writing && !g_slot[k].head_valid) { memcpy(g_slot[k].head, m, sizeof g_head); g_slot[k].head_valid = 1; }
     g_present_time = presentation_time;
     g_frames++;
     if (g_newest >= 0) g_held = g_newest;
