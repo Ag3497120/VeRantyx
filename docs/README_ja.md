@@ -7,10 +7,10 @@ VR コントローラーは要りません。ゲームの動かし方が違う3�
 | 版 | ゲームの動かし方 | 状態 |
 |---|---|---|
 | vxrt版 | Windows 版のゲームと本物の Windows 版 SteamVR を、このリポジトリで一から書いた Windows ランタイム VXRuntime で動かす（Wine なし、Direct3D 11 / Vulkan → Metal） | 最新（2026-10-12〜、毎日更新）。Alyx は M1 Max で 3K プリセット60fps。Elite Dangerous、No Man's Sky、The Lab、Google Earth VR も動作。Direct3D 12 は開発中 |
-| ネイティブ版 | Valve の Linux ARM64 版 Alyx を、改造した Klepton と自作の glibc 層・OpenVR ランタイムで macOS 上でそのまま動かす | 2026-10-11 から休止中（コードは main の `NativeARM/` にもある） |
+| ネイティブ版 | Valve の Linux ARM64 版 Alyx を、改造した Klepton と自作の glibc 層・OpenVR ランタイムで macOS 上でそのまま動かす | 2026-10-30 に Mac アプリへの組み込み（#9、medved91 さん）を main にマージ（コードは `NativeARM/`） |
 | Wine版 | Windows 版のゲームと SteamVR を Wine 11 + DXVK → MoltenVK で動かす | 2026-10-10 から安定。約30fps |
 
-## 最新の状況（2026-10-27）
+## 最新の状況（2026-10-30）
 
 - **入手**：VeRantyx for Mac は [GitHub のリリース](https://github.com/Ag3497120/VeRantyx/releases/latest) と [verantyx.ai](https://verantyx.ai) にあります（同じ署名・公証済みのアプリ）。最新は 0.3.1 です。
 - **動くゲーム**：
@@ -22,10 +22,15 @@ VR コントローラーは要りません。ゲームの動かし方が違う3�
 | No Man's Sky | 🟡 自分の Windows 版 Steam（VXRuntime の上で動く。サインインは自分で）から起動。Mac の画面と、Vision Pro の VeRantyx アプリと ALVR アプリで映像と音を確認 | Mac の画面：45.7fps（1512×982、Medium、0.3.1）。ヘッドセット：0.3.1 より前に 25〜40fps |
 | The Lab | 🟡 VR で動くが、測ったのはタイトルの場面だけ。ミニゲームは未最適化 | タイトルの場面 54.0fps |
 | Google Earth VR | 🟡 VR で動作 | 56.7fps |
-| Cyberpunk 2077 | 🧪 Direct3D 12、`d3d12-games` ブランチで開発中。ロゴ、冒頭の動画、タイトル、キャラクター作成まで正しく描画。まだ遊べない | キャラクター作成は約 5〜7fps |
+| Cyberpunk 2077 | 🧪 Direct3D 12、`vr-main` ブランチで開発中（アプリには未収録）。Mac の画面ではゲーム内まで動き、NPU によるコマの予測も入っている。ヘッドセットではまだ遊べない | El Coyote、Low、FSR2 Performance：本物のコマ約 20fps、予測込みで約 50fps 表示（M1 Max） |
 
-- **ヘッドセット**：Apple Vision Pro（VeRantyx アプリ、または App Store の ALVR アプリ）。Quest 1・Quest 3・Pico 4 Ultra はテスターがプレイ済み（私自身は未確認）。
+- **ヘッドセット**：Apple Vision Pro（VeRantyx アプリ、または App Store の ALVR アプリ。確認したのは M2 の Vision Pro）。Quest 1・Quest 3・Pico 4 Ultra はテスターがプレイ済み（私自身は未確認）。
 - **0.3 の新機能**：No Man's Sky、ゲームごとに ALVR アプリか VeRantyx アプリかを選べる、「入手してプレイ」（持っているゲームをダウンロードして起動）、Pico と Quest のテスターの報告にもとづく修正（投げる速さ、再接続、Alyx の読み込み後の黒い画面）。
+- **Vision Pro 単体で動かす試み**（`avp-port` ブランチ、実験中）：VXRuntime を visionOS 向けにビルドし、自作の Windows テストプログラムをヘッドセットの上で事前変換（JIT なし）で動かし、没入空間に 90Hz で表示しています。Cyberpunk 本体は起動しますが、ゲームが約 135 GB のアドレス空間を予約するのに対し、アプリが使えるのは約 63 GB なので、その段階で止まります。まだ遊べません。
+- **Elite Dangerous の「この Frontier アカウントは所有していない」**（#10）：ランチャーが Mac の Steam につながらなかったときに出ることが分かりました。Mac の Steam のサインインが終わってから Play を押してください。
+- **リポジトリに含まれないもの**：ゲームのファイル、SteamVR、Microsoft の DLL は、このリポジトリにもリリースにも入っていません（入っているのは BSD ライセンスの Valve の OpenVR SDK のヘッダーだけ。[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)）。
+- **作り方**：一人で、AI のコーディングエージェント（主に Claude Code）を使って開発しています。数字はすべて記録した実行から取っていますが、多くのコードは上の表のゲームでしか試していません。
+- **サンドボックスではありません**：VXRuntime の上の Windows のプログラムは、あなたのユーザーの権限で動きます。信頼できるプログラムだけを動かしてください。
 - **Discord**：質問や、動いたゲーム・動かなかったゲームの報告は [Discord](https://discord.gg/h2znwYJt3) でも受け付けています（導入と接続は #setup-help、ゲームの報告は #game-reports）。
 - **GitHub**：アカウントが自動の判定で 10月24日から27日まで非表示になっていました。今は元に戻っています。
 - 英語の [README](../README.md) の「Updates」に、日ごとの変更があります。
@@ -162,7 +167,7 @@ MacBook Pro（M1 Max）、2026-10-14 時点:
 
 ```
 /vxrt-games              # 入っているゲーム、動作状況、最新の計測
-/vxrt-support thelab     # 動くようにする: 計測 → VXRuntime を直す → 実行で確かめる
+/vxrt-support thelab     # 動くようにする: 計測 → VXRuntime を直す → 実行で確かめる（結果はゲームによる）
 /vxrt-tune alyx          # 設定だけでこの Mac 向けに調整: 交互の計測 → 起動コマンド
 /vxrt-playtest alyx      # ヘッドセットで遊んでもらい、うまくいかない場所を記録して読み返す
 /vxrt-issue earth        # それでも動かない: 証拠から issue の下書き（投稿はあなただけ）
