@@ -840,6 +840,14 @@ static id<MTLLibrary> library_with_timeout12(id<MTLDevice> mtl, NSString *source
         key = shader_cache_key12(source, options, &std32, &min_lod, &safe);
         char path[1200];
         snprintf(path, sizeof path, "%s/%016llx.metallib", dir, (unsigned long long)key);
+        // (VXRT_D3D12_SHADER_CACHE_RO=<folder>: a second, read-only cache looked at when the first has no such
+        // library: on visionOS the app's own shadercache folder, installed with the app, xros_shadercache.sh)
+        const char *ro = getenv("VXRT_D3D12_SHADER_CACHE_RO");
+        if (ro && *ro && access(path, R_OK) != 0) {
+            char p2[1200];
+            snprintf(p2, sizeof p2, "%s/%016llx.metallib", ro, (unsigned long long)key);
+            if (access(p2, R_OK) == 0) snprintf(path, sizeof path, "%s", p2);
+        }
         if (access(path, R_OK) == 0) {
             NSError *le = nil;
             id<MTLLibrary> lib = [mtl newLibraryWithURL:[NSURL fileURLWithPath:@(path)] error:&le];
@@ -851,7 +859,7 @@ static id<MTLLibrary> library_with_timeout12(id<MTLDevice> mtl, NSString *source
                 return lib;
             }
             vx_log("D3D12: shader cache: %016llx.metallib unreadable (%s): compiled again", (unsigned long long)key, le.localizedDescription.UTF8String ?: "?");
-            unlink(path);                                          // (unreadable: compiled again)
+            if (!ro || strncmp(path, ro, strlen(ro))) unlink(path);   // (unreadable: compiled again)
         }
     }
     id<MTLLibrary> lib = library_with_timeout12_(mtl, source, options, error);

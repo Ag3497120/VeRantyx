@@ -950,6 +950,54 @@ static void *reset_pages(reservation *r, void *addr, size_t size, DWORD type) { 
     }
     return addr;
 }
+// visionOS: the app's address space is the default range (to about 0xfc0000000, mostly the system's), a guard ("void")
+// up to 0x7000000000 and the 64 GB that extended-virtual-addressing adds; Cyberpunk 2077 alone reserves 139 GB (16 +
+// 64 + 32 GB pools and 288 more). The app carves a range out of the void with mach_vm_range_create (MACH_VM_RANGE_FIXED:
+// served only to fixed allocations; main.m, VXRT_VA_RANGE=<lo>-<hi> hex) and the program's reservations of
+// VXRT_VA_RANGE_MIN_MB (64) or more are placed there, next fit (VISIONOS_PORT.md, "address space"). Elsewhere: none.
+static uint64_t g_xr_lo, g_xr_hi, g_xr_cursor, g_xr_min;
+static int xr_on(void) {
+    static int on = -1;
+    if (on >= 0) return on;
+    on = 0;
+#if VX_XROS
+    const char *e = getenv("VXRT_VA_RANGE"), *m = getenv("VXRT_VA_RANGE_MIN_MB");
+    unsigned long long lo = 0, hi = 0;
+    if (e && sscanf(e, "%llx-%llx", &lo, &hi) == 2 && hi > lo) {
+        g_xr_lo = g_xr_cursor = (lo + GRANULARITY - 1) & ~(uint64_t)(GRANULARITY - 1); g_xr_hi = hi & ~(uint64_t)(GRANULARITY - 1);
+        g_xr_min = (m && *m ? (uint64_t)atoll(m) : 64) << 20;
+        on = 1;
+        vx_log("VirtualAlloc: reservations of %llu MB or more in %#llx-%#llx (%llu GB, the app's range)", (unsigned long long)(g_xr_min >> 20),
+               (unsigned long long)g_xr_lo, (unsigned long long)g_xr_hi, (unsigned long long)((g_xr_hi - g_xr_lo) >> 30));
+    }
+#endif
+    return on;
+}
+// A free stretch of len bytes in the range (with g_vm_lock held), from the cursor on, then from the start.
+static kern_return_t xr_alloc(mach_vm_address_t *out, mach_vm_size_t len) {
+    for (int pass = 0; pass < 2; pass++) {
+        mach_vm_address_t a = pass ? g_xr_lo : g_xr_cursor, end = pass ? g_xr_cursor + len : g_xr_hi;
+        if (end > g_xr_hi) end = g_xr_hi;
+        while (a + len <= end) {
+            mach_vm_address_t region = a; mach_vm_size_t region_size = 0;
+            vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t object;
+            kern_return_t kr = mach_vm_region(mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
+            if (kr != KERN_SUCCESS || region >= a + len) {
+                mach_vm_address_t got = a;
+                kr = mach_vm_allocate(mach_task_self(), &got, len, VM_FLAGS_FIXED);
+                if (kr != KERN_SUCCESS) {
+                    static int said;
+                    if (said++ < 4) vx_log("VirtualAlloc: %#llx bytes at %#llx in the app's range: kr %d", (unsigned long long)len, (unsigned long long)a, kr);
+                    return kr;
+                }
+                *out = got; g_xr_cursor = got + len;
+                return KERN_SUCCESS;
+            }
+            a = (region + region_size + GRANULARITY - 1) & ~(mach_vm_address_t)(GRANULARITY - 1);
+        }
+    }
+    return KERN_NO_SPACE;
+}
 static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD protect) {
     if (!size) { vx_set_last_error(87); return NULL; }
     VX_NO_STOP_LOCK(&g_vm_lock);
@@ -988,14 +1036,17 @@ static WINAPI void *VirtualAlloc(void *addr, size_t size, DWORD type, DWORD prot
         g_spare_bytes -= g_spare[i].size;
         g_spare[i] = g_spare[--g_nspare];
     }
-    kern_return_t kr = addr
+    kern_return_t kr = KERN_NO_SPACE;
+    int in_range = !addr && xr_on() && mapped_size(len) >= g_xr_min && (kr = xr_alloc(&a, mapped_size(len))) == KERN_SUCCESS;
+    if (!in_range) kr = addr
         ? mach_vm_allocate(mach_task_self(), &a, mapped_size(len), VM_FLAGS_FIXED)
         : mach_vm_map(mach_task_self(), &a, mapped_size(len), GRANULARITY - 1, VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, 0,
                       VX_PROT_RWX, VX_PROT_RWX, VM_INHERIT_COPY);
+    if (kr != KERN_SUCCESS && !addr && xr_on() && !in_range && mapped_size(len) < g_xr_min) kr = xr_alloc(&a, mapped_size(len));   // (the rest full)
     if (kr != KERN_SUCCESS) {
         g_va_kind[addr ? 1 : 3]++; valloc_stats(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
         static uint64_t failed;
-        if (getenv("VXRT_TRACE_VALLOC") && failed++ < 20)
+        if ((getenv("VXRT_TRACE_VALLOC") || (VX_XROS && !addr)) && failed++ < 20)   // (visionOS: always, the address space is small there)
             valloc_trace(VX_RETURN_ADDRESS(), __builtin_frame_address(0), "(%p, %#zx, %#x) failed", addr, size, type);
         VX_NO_STOP_UNLOCK(&g_vm_lock);
         vx_set_last_error(addr ? 487 : 8 /* ERROR_NOT_ENOUGH_MEMORY */);

@@ -4,6 +4,7 @@
 // src/xros_vr.m), or with -present flat only in the window (debug).
 //
 //   xcrun devicectl device process launch --device <id> marimokodai.VXRuntimeHost -test d3d12 [-present flat]
+//   xcrun devicectl device process launch --device <id> marimokodai.VXRuntimeHost -game cyberpunk   (game_start below)
 //
 // Tests (bundle/exe): xros_clear (a swap chain cleared through the hues, 10 s), d3d12 (default), suite, hello_crt, seh_try, unwind, cxx_exceptions (stops: one address has no
 // module), none (only the memory and address-space probes). Documents/host_log.jsonl gets the probes, the
@@ -34,6 +35,7 @@ static char g_docs[1024];
 static int g_log = -1;
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_test[64] = "d3d12";
+static int g_game;                                          // (-game <name>: a game installed in Documents/root)
 static double t0;
 
 static double now(void) { return CFAbsoluteTimeGetCurrent() + kCFAbsoluteTimeIntervalSince1970; }   // (Unix time)
@@ -113,6 +115,33 @@ static void vm_map_probe(void) {
     jlog("va_large", "%s", buf);
 }
 
+// The program's large reservations need more address space than the app has (Cyberpunk 2077: 139 GB reserved; the
+// default range is mostly the system's, the extended one 64 GB). Between the two lies a guard ("void",
+// 0xfc0000000-0x7000000000 here) that mach_vm_range_create can hand to the process as a range only fixed allocations
+// are served from (MACH_VM_RANGE_FIXED, <mach/vm_types.h>). The runtime places reservations there (kernel32.c,
+// VXRT_VA_RANGE). Tried: the whole void, then smaller ones; then a 64 GB fixed allocation in it, written once.
+typedef struct __attribute__((packed)) { uint64_t flags : 48, range_tag : 8, vm_tag : 8; uint64_t min_address, max_address; } vx_range_recipe;
+extern kern_return_t mach_vm_range_create(vm_map_t map, uint32_t flavor, uint8_t *recipes, mach_msg_type_number_t bytes);
+static void va_range_make(void) {
+    static const uint64_t cand[][2] = { { 0xfc0000000ull, 0x7000000000ull }, { 0x1000000000ull, 0x6fc0000000ull }, { 0x1000000000ull, 0x6000000000ull },
+                                        { 0x2000000000ull, 0x4000000000ull } };
+    for (unsigned i = 0; i < sizeof cand / sizeof *cand; i++) {
+        vx_range_recipe r = { 0, 2 /* MACH_VM_RANGE_FIXED */, 0, cand[i][0], cand[i][1] };
+        kern_return_t kr = mach_vm_range_create(mach_task_self(), 1 /* MACH_VM_RANGE_FLAVOR_V1 */, (uint8_t *)&r, sizeof r);
+        vm_address_t a = cand[i][0] + (cand[i][0] == 0xfc0000000ull ? 0x40000000ull : 0);
+        kern_return_t ka = kr == KERN_SUCCESS ? vm_allocate(mach_task_self(), &a, 64ull << 30, VM_FLAGS_FIXED) : -1;
+        int wrote = 0;
+        if (ka == KERN_SUCCESS) { ((volatile char *)a)[0] = 1; ((volatile char *)a)[(64ull << 30) - 1] = 1; wrote = 1; vm_deallocate(mach_task_self(), a, 64ull << 30); }
+        jlog("va_range", "\"lo\":\"%#llx\",\"hi\":\"%#llx\",\"kr\":%d,\"fixed_64gb_kr\":%d,\"wrote\":%d",
+             (unsigned long long)cand[i][0], (unsigned long long)cand[i][1], kr, ka, wrote);
+        if (kr == KERN_SUCCESS) {
+            char v[64]; snprintf(v, sizeof v, "%llx-%llx", (unsigned long long)cand[i][0], (unsigned long long)cand[i][1]);
+            if (ka == KERN_SUCCESS) setenv("VXRT_VA_RANGE", v, 1);
+            return;
+        }
+    }
+}
+
 // Before anything else maps memory (a constructor, before main): the modules' arena, then what the address space and
 // the memory limit look like. (On the Mac the runtime starts itself again until the arena is free; an app cannot.)
 __attribute__((constructor)) static void early(void) {
@@ -129,11 +158,13 @@ __attribute__((constructor)) static void early(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     int argc = *_NSGetArgc(); char **argv = *_NSGetArgv();
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "-test")) snprintf(g_test, sizeof g_test, "%s", argv[i + 1]);
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "-game")) { snprintf(g_test, sizeof g_test, "%s", argv[i + 1]); g_game = 1; }
     uint64_t ram = 0; size_t sz = sizeof ram; sysctlbyname("hw.memsize", &ram, &sz, NULL, 0);
     jlog("launch", "\"device_ram_mb\":%llu,\"pid\":%d", (unsigned long long)(ram >> 20), getpid());
     uint64_t abase = xa_arena_base(), asize = xa_arena_size();
     int arena = xa_reserve();
     jlog("arena", "\"addr\":\"%#llx\",\"size_mb\":%llu,\"reserved\":%d", (unsigned long long)abase, (unsigned long long)(asize >> 20), arena);
+    va_range_make();
     vm_map_probe();
     // the exe's preferred base (0x140000000) and the DLL range above it: free now?
     vm_address_t a = 0x140000000ull;
@@ -177,6 +208,52 @@ static void *memory_ticker(void *arg) {
 static UILabel *g_status;
 static void status(NSString *s) { dispatch_async(dispatch_get_main_queue(), ^{ g_status.text = s; }); }
 
+// -game cyberpunk: Cyberpunk 2077 from Documents/root (copied there once from the user's own install; NOSTEAM.md), as a
+// Windows PC without Steam: no Steam variables, no Steam registry keys (the runtime writes none without
+// VXRT_STEAM_BRIDGE), no steamclient anywhere; steam_api finds no Steam and the engine goes on. The game's writes go to
+// Documents/root/overlay_game (VXRT_OVERLAY), never into the copy. Its working folder bin/x64, its arguments the Mac's
+// (--launcher-skip -skipStartScreen), AppData the root's (UserSettings.json: lowest settings, copied from the Mac;
+// no saves). The modules are the app's frameworks (tools/xros_aot.sh, XROS_AOT_GAME=1), the memory mechanisms of
+// avp-mem on (VXRT_PAGEFILE, VXRT_D3D12_FILE_BUFFERS, VXRT_IMAGE_CACHE in Documents/vxrt_mem), GPU budget 4096.
+// Each variable only when the launch did not set it (devicectl's --environment-variables wins).
+static int game_start(const char *root, char **exe_out, char ***argv_out, int *argc_out) {
+    if (strcmp(g_test, "cyberpunk")) { jlog("no_game", "\"game\":\"%s\"", g_test); return 0; }
+    static char install[1400], exe[1600], ov[3000], dir[1400];
+    snprintf(install, sizeof install, "%s/drive_c/Program Files (x86)/Steam/steamapps/common/Cyberpunk 2077", root);
+    snprintf(exe, sizeof exe, "%s/bin/x64/Cyberpunk2077.exe", install);
+    struct stat st;
+    if (stat(exe, &st)) { jlog("no_game", "\"exe\":\"%s\",\"why\":\"not installed\"", exe); return 0; }
+    static const char *steam[] = { "VXRT_STEAM_BRIDGE", "SteamAppId", "SteamGameId", "SteamClientLaunch", "SteamEnv", "SteamPath", "SteamOverlayGameId" };
+    for (unsigned i = 0; i < sizeof steam / sizeof *steam; i++) unsetenv(steam[i]);
+    char sys32[1400]; int steamclient = 0;
+    snprintf(sys32, sizeof sys32, "%s/drive_c/windows/system32/steamclient64.dll", root); steamclient |= !stat(sys32, &st);
+    snprintf(sys32, sizeof sys32, "%s/bin/x64/steamclient64.dll", install); steamclient |= !stat(sys32, &st);
+    snprintf(ov, sizeof ov, "%s:%s/overlay_game", install, root);
+    setenv("VXRT_OVERLAY", ov, 0);
+    snprintf(dir, sizeof dir, "%s/bundle/redist", NSBundle.mainBundle.resourcePath.fileSystemRepresentation);   // (msvcp140, mfc140u)
+    if (!stat(dir, &st)) setenv("VXRT_DLL_PATH", dir, 0);
+    snprintf(dir, sizeof dir, "%s/bundle/shadercache", NSBundle.mainBundle.resourcePath.fileSystemRepresentation);
+    if (!stat(dir, &st)) setenv("VXRT_D3D12_SHADER_CACHE_RO", dir, 0);
+    const char *mem[][2] = { { "VXRT_PAGEFILE", "pagefile" }, { "VXRT_D3D12_FILE_BUFFERS", "buffers" }, { "VXRT_IMAGE_CACHE", "imgcache" } };
+    snprintf(dir, sizeof dir, "%s/vxrt_mem", g_docs); mkdir(dir, 0755);
+    for (unsigned i = 0; i < 3; i++) { snprintf(dir, sizeof dir, "%s/vxrt_mem/%s", g_docs, mem[i][1]); mkdir(dir, 0755); setenv(mem[i][0], dir, 0); }
+    setenv("VXRT_GPU_BUDGET_MB", "4096", 0);
+    setenv("VXRT_D3D12_TEX_DOWNSCALE", "2", 0);
+    setenv("VXRT_D3D12_TEX_DOWNSCALE_MIN", "512", 0);
+    setenv("VXRT_D3D12_LENIENT_STATES", "1", 0);
+    setenv("VXRT_D3D12_FRAME_STATS", "10", 0);
+    setenv("VXRT_DEBUG_OUTPUT", "1", 0);
+    setenv("VXRT_MEM_LIMITS", "6144,7680", 0);
+    snprintf(dir, sizeof dir, "%s/aot.misses", g_docs); setenv("VXRT_AOT_MISSES", dir, 0);
+    snprintf(dir, sizeof dir, "%s/bin/x64", install);
+    if (chdir(dir)) { jlog("no_game", "\"why\":\"chdir %s\"", dir); return 0; }
+    static char *argv[] = { "vxrt", "Cyberpunk2077.exe", "--launcher-skip", "-skipStartScreen", NULL };
+    *exe_out = exe; *argv_out = argv; *argc_out = 4;
+    jlog("game", "\"exe\":\"%s\",\"steamclient_found\":%d,\"overlay\":\"%s\",\"dll_path\":\"%s\",\"va_range\":\"%s\"", exe, steamclient, ov,
+         getenv("VXRT_DLL_PATH") ?: "", getenv("VXRT_VA_RANGE") ?: "");
+    return 1;
+}
+
 static void *runtime_thread(void *arg) {
     NSString *res = NSBundle.mainBundle.resourcePath;
     NSString *bundle = [res stringByAppendingPathComponent:@"bundle"];
@@ -190,8 +267,19 @@ static void *runtime_thread(void *arg) {
     setenv("VXRT_LOG_TIME", "1", 0);
     setenv("VXRT_MESSAGEBOX", "auto", 0);
     setenv("VXRT_NPU_INTERP", "race", 0);                  // (the NPU race path, as in every Cyberpunk run: logged if off)
-    chdir(bundle.fileSystemRepresentation);                  // (the tests read tests/shaders12/... from here)
     vx_xros_vr_enable(vxrt_present_vr());
+    if (g_game) {
+        char *gexe, **gargv; int gargc;
+        if (!game_start(root, &gexe, &gargv, &gargc)) { status([NSString stringWithFormat:@"VX Runtime: no game %s", g_test]); return NULL; }
+        status([NSString stringWithFormat:@"VX Runtime: %s (AOT, no JIT)", g_test]);
+        jlog("start", "\"exe\":\"%s\"", gexe);
+        extern char **environ;
+        int rc = vx_loader_main(gargc, gargv, environ);
+        jlog("loader_returned", "\"rc\":%d", rc);
+        status([NSString stringWithFormat:@"VX Runtime: %s: loader returned %d", g_test, rc]);
+        return NULL;
+    }
+    chdir(bundle.fileSystemRepresentation);                  // (the tests read tests/shaders12/... from here)
     if (![NSFileManager.defaultManager fileExistsAtPath:exe]) {
         jlog("no_test", "\"exe\":\"%s\"", exe.UTF8String);
         status([NSString stringWithFormat:@"VX Runtime: no test %s", g_test]);

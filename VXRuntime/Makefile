@@ -128,6 +128,8 @@ xros-aot-tests: build/vxrt-aot $(XROS_TESTS) $(if $(filter-out 0,$(XROS_BIG_FUNC
 	rm -rf build/xros/bundle && mkdir -p build/xros/bundle/exe build/xros/bundle/tests/shaders12
 	cp $(XROS_TESTS) build/xros/t/*.exe $(if $(filter-out 0,$(XROS_BIG_FUNCS)),build/xros_big.exe) build/xros/bundle/exe/
 	cp tests/shaders12/*.dxil build/xros/bundle/tests/shaders12/
+	@# (a game's local extras, never committed: build/xros/game_bundle/redist (the Visual C++ DLLs it loads), shadercache)
+	[ ! -d build/xros/game_bundle ] || cp -R build/xros/game_bundle/. build/xros/bundle/
 # The app (xros/app, xcodegen): signed for the headset with the team's automatic profile.
 xros-app: xros-lib xros-aot-tests
 	cd xros/app && xcodegen generate --quiet
