@@ -50,7 +50,7 @@ static void *mac_lib(void) {
         sigaction(i, NULL, &now);
         if (now.sa_sigaction != before[i].sa_sigaction) { vx_log("Steam bridge: steamclient replaced the handler of signal %d; restored", i); sigaction(i, &before[i], NULL); }
     }
-    if (!g_lib) vx_log("Steam bridge: cannot load %s: %s", path, dlerror());
+    if (!g_lib) vx_log("Steam bridge: cannot load %s, so the program runs without Steam (its sign-in through Steam fails): %s", path, dlerror());
     else if (g_trace) vx_log("Steam bridge: loaded %s", path);
     return g_lib;
 }
@@ -214,6 +214,14 @@ static u64 call_method(proxy *p, int k, u64 *a) {
     if (!strncmp(p->name, "SteamClient", 11))
         for (int i = 1; i < 3 && !name && r; i++) name = version_string(a[i], ver, sizeof ver);
     if (name && r) r = (u64)(uintptr_t)wrap((void *)(uintptr_t)r, name);
+    // A program whose Steam sign-in fails says little about why (the Frontier launcher shows "this Frontier account does
+    // not own Elite Dangerous", issue #10): no pipe or no user from the Mac client is said in the log, always.
+    if (!strncmp(p->name, "SteamClient", 11) && !r && (k == 0 || k == 2)) {
+        static int said[3];
+        if (!said[k]++) vx_log("Steam bridge: Mac Steam %s; the program runs without Steam (its sign-in through Steam fails)",
+                              k == 0 ? "is not reachable (CreateSteamPipe failed: is Steam for Mac running?)"
+                                     : "has no signed-in user (ConnectToGlobalUser failed: is Steam for Mac signed in, and not still starting?)");
+    }
     if (g_trace > 2) { Dl_info di; if (dladdr((void *)fn, &di)) vx_log("Steam bridge: %s method %d is %s+%#lx", p->name, k, di.dli_fname, (unsigned long)((char *)fn - (char *)di.dli_fbase)); }
     if (g_trace && (first || g_trace > 1)) vx_log("Steam bridge: %s method %d (%#llx, %#llx, %#llx, %#llx) = %#llx%s%s", p->name, k,
                                  (unsigned long long)a[0], (unsigned long long)a[1], (unsigned long long)a[2], (unsigned long long)a[3],

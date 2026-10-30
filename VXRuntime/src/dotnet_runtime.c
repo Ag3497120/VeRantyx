@@ -9894,7 +9894,10 @@ static int web_load_response_headers(clr_runtime *rt, clr_module *module,
                                      clr_object *headers, HANDLE request,
                                      web_winhttp_query_headers_fn query_headers) {
     DWORD bytes = 0;
-    if (!query_headers(request, 22u /* WINHTTP_QUERY_RAW_HEADERS_CRLF */, NULL,
+    // WINHTTP_QUERY_RAW_HEADERS: one header per NUL-terminated line, which is what the loop below reads (the _CRLF
+    // form is one string, so the status line swallowed every header and HttpWebResponse.Headers came back empty:
+    // the Frontier launcher reads a redirect's Location from them)
+    if (!query_headers(request, 21u /* WINHTTP_QUERY_RAW_HEADERS */, NULL,
                        NULL, &bytes, NULL) || bytes < 2 * sizeof(WCHAR) ||
         bytes > 1024u * 1024u) {
         if (!bytes || bytes > 1024u * 1024u) {
@@ -9905,7 +9908,7 @@ static int web_load_response_headers(clr_runtime *rt, clr_module *module,
     WCHAR *raw = calloc(bytes / sizeof(WCHAR) + 1, sizeof(WCHAR));
     if (!raw) { set_error(rt, "out of memory reading HTTP response headers"); return 0; }
     DWORD available = bytes;
-    if (!query_headers(request, 22u, NULL, raw, &available, NULL)) {
+    if (!query_headers(request, 21u, NULL, raw, &available, NULL)) {
         free(raw);
         set_error(rt, "WinHTTP could not return HTTP response headers");
         return 0;
@@ -18920,8 +18923,14 @@ static int external_invoke(clr_runtime *rt, const clr_method *method,
                     return 0;
                 }
                 if (!found) {
-                    set_error(rt, "Dictionary.Item key was not found");
-                    return 0;
+                    // a KeyNotFoundException the program can catch, as .NET throws (the Frontier launcher's
+                    // Steam sign-in catches it when a server's answer lacks an entry)
+                    char message[200], key_text[96] = "";
+                    clr_object *key = arguments[1].kind == V_REF ? (clr_object *)(uintptr_t)arguments[1].bits : NULL;
+                    if (key && key->type_name && !strcmp(key->type_name, "String")) wpf_copy_ascii_string(key, key_text, sizeof key_text);
+                    snprintf(message, sizeof message, "The given key%s%s%s was not present in the dictionary.",
+                             *key_text ? " '" : "", key_text, *key_text ? "'" : "");
+                    return clr_throw(rt, method->module, "System.Collections.Generic", "KeyNotFoundException", message);
                 }
                 *result = dictionary->map_values[index];
                 return 1;
