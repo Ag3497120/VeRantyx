@@ -213,6 +213,25 @@ On the device every source the runtime compiles is also written to `Documents/sh
 (+ `.flags`); `tools/xros_shadercache.sh device` takes them to the Mac, compiles them with `xcrun -sdk xros metal`
 with the same options into `<key>.metallib` and puts them in `Documents/shadercache`, which the runtime reads first
 (log: `shader cache: <key>.metallib loaded` / `not in the cache: compiled from source`).
+Proven with d3d12.exe: a first run compiled 70 sources on the headset (39 distinct); the Mac compiled the 39 for
+visionOS in 18 s and copied them back (devicectl's copies took 22 min: one file per call, the headset's link is
+slow and stalls when it is not worn); the next d3d12.exe (in the immersive space) **loaded 70 from the cache, 0
+compiled from source** (0.2 ms each), still 108 "ok" lines, 0 failures. For the game: build its cache the same way
+from a first run, or from the Mac's own sources (`tools/xros_shadercache.sh compile <dir> <out>`).
+
+### d3d12.exe in the immersive space
+
+108 "ok" lines and no failure, the same as in the window (its swap-chain test presents 128x96 frames: they are
+warped into both eyes like any other; the head pose of frames presented before the first compositor frame is taken
+from that frame).
+
+### VX Proto's PreflightProbe with -memfill (11:22)
+
+Metal buffers counted against the app's limit: filled in 256 MB steps to **7424 MB in Metal buffers, footprint
+7432 MB, 760 MB still available**, no jetsam (the fill stops there). So the whole app, Metal included, has about
+8.1 GB: the game's 9.45 GB at El Coyote on the Mac (lowest settings) has to come down by about 2 GB. Also confirmed:
+`MAP_JIT` refused, `posix_spawn` refused (EPERM), 0xf00000000 refused, 0x140000000 granted that launch, largest
+reservation 64 GB, ANE 16 cores, rasterization rate maps for 2 layers.
 
 ### The game on the device: the plan (not run)
 
