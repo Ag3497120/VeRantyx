@@ -13,6 +13,7 @@
 
 extern int vx_xros_display_w, vx_xros_display_h, vx_xros_display_hz;    // (src/xros_ui.m)
 extern double vx_xros_pointer_x, vx_xros_pointer_y, vx_xros_last_input;  // (pointer in display pixels; CFAbsoluteTime)
+void vx_xros_vsync_wait(unsigned sync);                                    // (src/xros_ui.m: a present with this sync interval waits for its refreshes)
 
 typedef uint32_t CGDirectDisplayID;
 typedef struct vx_xros_display_mode *CGDisplayModeRef;   // never made: CGDisplayCopyDisplayMode answers NULL

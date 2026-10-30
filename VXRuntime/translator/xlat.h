@@ -101,6 +101,7 @@ extern const uint8_t xlat_parity[256];
 
 // Translates the instruction d (decoded from code at rip). Returns 0, or -1 if it is not supported (yet).
 int xlat_insn(xlat_buf *b, const x86_insn *d, const uint8_t *code, uint64_t rip);
+extern int64_t xlat_code_delta;                  // (0: code read at its x86 address; vxrt-aot: its copy's offset)
 // Translates the basic block at rip (its x86 code read from memory at that address) into a function
 // void block(x86_ctx *): it runs the block and leaves the next instruction's address in ctx->rip (and a fault, if
 // one happened, in ctx->fault with ctx->rip at the faulting instruction). Stops after a control transfer or max_insns.

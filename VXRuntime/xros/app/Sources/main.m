@@ -1,7 +1,9 @@
-// VX Runtime: VXRuntime on Vision Pro as it is (../../VISIONOS_PORT.md). One flat window; the Windows program named by
-// the launch arguments runs in it, from the bundle, on the AOT modules linked into the app (no JIT on visionOS).
+// VX Runtime: VXRuntime on Vision Pro (../../VISIONOS_PORT.md). The Windows program named by the launch arguments runs
+// from the bundle on the AOT modules linked into or embedded in the app (no JIT on visionOS); its swap chain is shown
+// in an immersive space (CompositorServices, both eyes warped from the game's frame: VXImmersive.swift,
+// src/xros_vr.m), or with -present flat only in the window (debug).
 //
-//   xcrun devicectl device process launch --device <id> marimokodai.VXRuntimeHost -test d3d12
+//   xcrun devicectl device process launch --device <id> marimokodai.VXRuntimeHost -test d3d12 [-present flat]
 //
 // Tests (bundle/exe): xros_clear (a swap chain cleared through the hues, 10 s), d3d12 (default), suite, hello_crt, seh_try, unwind, cxx_exceptions (stops: one address has no
 // module), none (only the memory and address-space probes). Documents/host_log.jsonl gets the probes, the
@@ -23,7 +25,10 @@
 
 int vx_loader_main(int argc, char **argv, char **envp);   // (src/loader.c, its main)
 int xa_reserve(void);                                       // (translator/aot.c: the modules' image arena)
+uint64_t xa_arena_base(void), xa_arena_size(void);
 void vxrt_xros_attach(UIView *display);                     // (src/xros_ui.m)
+void vx_xros_vr_enable(int on);                             // (src/xros_vr.m: the immersive presenter)
+int vxrt_present_vr(void);
 
 static char g_docs[1024];
 static int g_log = -1;
@@ -50,6 +55,64 @@ static void jlog(const char *event, const char *fmt, ...) {
 }
 void vxrt_xros_program_exited(int rc) { jlog("exit", "\"rc\":%d", rc); }
 
+// The address space as the system left it at launch (after the arena): every mapped region of 16 MB or more and every
+// gap of 64 MB or more up to 1 TB, then whether 1 GB can be had exactly at the candidate arena bases (each freed again).
+static void vm_map_probe(void) {
+    vm_address_t r = 0, prev_end = 0; vm_size_t rs = 0;
+    char buf[1400]; int k = 0, nreg = 0;
+    for (;;) {
+        natural_t depth = 0; vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &r, &rs, &depth, (vm_region_recurse_info_64_t)&info, &cnt) != KERN_SUCCESS) break;
+        if (r >= (1ull << 40)) break;
+        if (r > prev_end && r - prev_end >= (64ull << 20)) jlog("va_gap", "\"lo\":\"%#llx\",\"hi\":\"%#llx\",\"mb\":%llu",
+            (unsigned long long)prev_end, (unsigned long long)r, (unsigned long long)((r - prev_end) >> 20));
+        if (rs >= (16ull << 20)) {
+            k += snprintf(buf + k, sizeof buf - k, "%s{\"lo\":\"%#llx\",\"mb\":%llu,\"prot\":%d,\"max\":%d,\"tag\":%u,\"share\":%u,\"submap\":%d}",
+                          nreg ? "," : "", (unsigned long long)r, (unsigned long long)(rs >> 20), info.protection, info.max_protection,
+                          info.user_tag, info.share_mode, info.is_submap);
+            if (++nreg == 8 || k > 1100) { jlog("va_regions", "\"regions\":[%s]", buf); k = 0; nreg = 0; }
+        }
+        prev_end = r + rs; r += rs;
+    }
+    if (nreg) jlog("va_regions", "\"regions\":[%s]", buf);
+    jlog("va_end", "\"last_end\":\"%#llx\"", (unsigned long long)prev_end);
+    static const uint64_t cand[] = { 0x140000000ull, 0x180000000ull, 0x200000000ull, 0x240000000ull, 0x280000000ull, 0x2a0000000ull,
+                                     0xfc0000000ull, 0x1000000000ull, 0x2000000000ull, 0x4000000000ull, 0x6000000000ull, 0x7000000000ull, 0x7400000000ull,
+                                     0x7800000000ull, 0x7c00000000ull, 0x8000000000ull, 0x10000000000ull };
+    k = 0;
+    for (unsigned i = 0; i < sizeof cand / sizeof *cand; i++) {
+        vm_address_t a = cand[i];
+        kern_return_t kr = vm_allocate(mach_task_self(), &a, 1ull << 30, VM_FLAGS_FIXED);
+        if (kr == KERN_SUCCESS) vm_deallocate(mach_task_self(), a, 1ull << 30);
+        k += snprintf(buf + k, sizeof buf - k, "%s\"%#llx\":%d", i ? "," : "", (unsigned long long)cand[i], kr);
+    }
+    jlog("va_fixed_1gb", "\"kr\":{%s}", buf);
+    // where the system puts large reservations (the guard region from 0xfc0000000 up is not taken by vm_allocate
+    // fixed): mmap without a fixed address, with a hint, and fixed over the guard (each freed again)
+    k = 0;
+    static const uint64_t sizes_gb[] = { 1, 8, 64 };
+    for (unsigned i = 0; i < 3; i++) {
+        void *r = mmap(NULL, sizes_gb[i] << 30, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        k += snprintf(buf + k, sizeof buf - k, "%s\"any_%llugb\":\"%p\"", i ? "," : "", (unsigned long long)sizes_gb[i], r);
+        if (r != MAP_FAILED) munmap(r, sizes_gb[i] << 30);
+    }
+    static const uint64_t hints[] = { 0x1000000000ull, 0x2000000000ull, 0x4000000000ull };
+    for (unsigned i = 0; i < 3; i++) {
+        void *r = mmap((void *)(uintptr_t)hints[i], 1ull << 30, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        k += snprintf(buf + k, sizeof buf - k, ",\"hint_%#llx\":\"%p\"", (unsigned long long)hints[i], r);
+        if (r != MAP_FAILED) munmap(r, 1ull << 30);
+        r = mmap((void *)(uintptr_t)hints[i], 1ull << 30, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+        k += snprintf(buf + k, sizeof buf - k, ",\"fixed_%#llx\":\"%p\"", (unsigned long long)hints[i], r);
+        if (r != MAP_FAILED) {
+            void *rw = mmap(r, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);   // (usable?)
+            int ok = rw != MAP_FAILED; if (ok) { ((volatile char *)rw)[0] = 1; }
+            k += snprintf(buf + k, sizeof buf - k, ",\"fixed_%#llx_rw\":%d", (unsigned long long)hints[i], ok);
+            munmap(r, 1ull << 30);
+        }
+    }
+    jlog("va_large", "%s", buf);
+}
+
 // Before anything else maps memory (a constructor, before main): the modules' arena, then what the address space and
 // the memory limit look like. (On the Mac the runtime starts itself again until the arena is free; an app cannot.)
 __attribute__((constructor)) static void early(void) {
@@ -68,8 +131,10 @@ __attribute__((constructor)) static void early(void) {
     for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "-test")) snprintf(g_test, sizeof g_test, "%s", argv[i + 1]);
     uint64_t ram = 0; size_t sz = sizeof ram; sysctlbyname("hw.memsize", &ram, &sz, NULL, 0);
     jlog("launch", "\"device_ram_mb\":%llu,\"pid\":%d", (unsigned long long)(ram >> 20), getpid());
+    uint64_t abase = xa_arena_base(), asize = xa_arena_size();
     int arena = xa_reserve();
-    jlog("arena", "\"addr\":\"0xf00000000\",\"size_mb\":512,\"reserved\":%d", arena);
+    jlog("arena", "\"addr\":\"%#llx\",\"size_mb\":%llu,\"reserved\":%d", (unsigned long long)abase, (unsigned long long)(asize >> 20), arena);
+    vm_map_probe();
     // the exe's preferred base (0x140000000) and the DLL range above it: free now?
     vm_address_t a = 0x140000000ull;
     kern_return_t kr = vm_allocate(mach_task_self(), &a, 256ull << 20, VM_FLAGS_FIXED);
@@ -126,6 +191,7 @@ static void *runtime_thread(void *arg) {
     setenv("VXRT_MESSAGEBOX", "auto", 0);
     setenv("VXRT_NPU_INTERP", "race", 0);                  // (the NPU race path, as in every Cyberpunk run: logged if off)
     chdir(bundle.fileSystemRepresentation);                  // (the tests read tests/shaders12/... from here)
+    vx_xros_vr_enable(vxrt_present_vr());
     if (![NSFileManager.defaultManager fileExistsAtPath:exe]) {
         jlog("no_test", "\"exe\":\"%s\"", exe.UTF8String);
         status([NSString stringWithFormat:@"VX Runtime: no test %s", g_test]);
@@ -177,25 +243,13 @@ static void *runtime_thread(void *arg) {
 }
 @end
 
-@interface VXSceneDelegate : UIResponder <UIWindowSceneDelegate>
-@property (strong, nonatomic) UIWindow *window;
-@end
-@implementation VXSceneDelegate
-- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)options {
-    UIWindowScene *ws = (UIWindowScene *)scene;
-    ws.sizeRestrictions.minimumSize = CGSizeMake(1280, 720);
-    self.window = [[UIWindow alloc] initWithWindowScene:ws];
-    self.window.rootViewController = [VXRootController new];
-    [self.window makeKeyAndVisible];
+// The SwiftUI app (VXApp.swift) hosts this controller in its window and opens the immersive space (VXImmersive.swift).
+UIViewController *vxrt_make_root_controller(void) { return [VXRootController new]; }
+// -present vr (the default): the program's swap chain is shown in the immersive space (src/xros_vr.m); -present flat:
+// only in the window (a debug fallback).
+int vxrt_present_vr(void) {
+    int argc = *_NSGetArgc(); char **argv = *_NSGetArgv();
+    for (int i = 1; i + 1 < argc; i++) if (!strcmp(argv[i], "-present")) return strcmp(argv[i + 1], "flat") != 0;
+    return 1;
 }
-@end
-
-@interface VXAppDelegate : UIResponder <UIApplicationDelegate>
-@end
-@implementation VXAppDelegate
-- (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)options { return YES; }
-@end
-
-int main(int argc, char *argv[]) {
-    @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass([VXAppDelegate class])); }
-}
+void vxrt_jlog(const char *event, const char *fields) { jlog(event, "%s", fields ? fields : ""); }

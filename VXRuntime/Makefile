@@ -75,7 +75,7 @@ XROS_CC = xcrun -sdk $(XROS_SDK) clang -target $(XROS_TARGET)
 XROS_CFLAGS = -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -include xros/vx_xros.h -Ixros/include -Isrc -Ibuild -Ithird_party/vulkan -fobjc-arc
 XROS_OUT = src/cocoa.m src/menus.m src/tray.m src/clipboard.m src/opengl.c src/directinput.m translator/engine.c translator/vcpu.c
 XROS_OUT += $(if $(filter xrsimulator,$(XROS_SDK)),src/upscale_core.m)
-XROS_SRC = $(filter-out $(XROS_OUT),$(ARM64_SRC)) src/xros_ui.m src/xros_stubs.c translator/engine_nojit.c
+XROS_SRC = $(filter-out $(XROS_OUT),$(ARM64_SRC)) src/xros_ui.m src/xros_vr.m src/xros_stubs.c translator/engine_nojit.c
 XROS_OBJ = $(patsubst %,$(XROS_DIR)/obj/%.o,$(XROS_SRC))
 # (the sources whose calls through ms_abi pointers are wrapped for visionOS: copies in $(XROS_DIR)/src, VISIONOS_PORT.md)
 XROS_SCAN = $(filter %.c %.m,$(filter $(SRC),$(XROS_SRC)))
@@ -83,7 +83,7 @@ $(XROS_DIR)/src/stamp: $(XROS_SCAN) tools/xros_x86calls.py tools/vx_abi_scan.py
 	@mkdir -p $(dir $@)
 	python3 tools/xros_x86calls.py $(XROS_DIR)/src $(XROS_SCAN) > $(XROS_DIR)/src/list
 	@touch $@
-$(XROS_DIR)/obj/%.o: % xros/vx_xros.h build/thunks/stamp $(XROS_DIR)/src/stamp
+$(XROS_DIR)/obj/%.o: % xros/vx_xros.h src/xros_vr.h src/npu_interp.h build/thunks/stamp $(XROS_DIR)/src/stamp
 	@mkdir -p $(dir $@)
 	@f=$(XROS_DIR)/src/$<; [ -f $$f ] || f=$<; echo "$(XROS_CC) ... -c -o $@ $$f"; $(XROS_CC) $(XROS_CFLAGS) -c -o $@ $$f
 # (the app has its own main: the loader's is called from it, xros/app)
@@ -93,13 +93,40 @@ $(XROS_DIR)/libvxrt.a: $(XROS_OBJ)
 	xcrun -sdk $(XROS_SDK) libtool -static -o $@ $(XROS_OBJ)
 xros-lib: $(XROS_DIR)/libvxrt.a
 # Our own test programs for the app, their modules linked into it (tools/xros_aot.sh), the files they read beside them.
-XROS_TESTS = build/xros_clear.exe build/d3d12.exe build/recomp/suite.exe build/hello_crt.exe build/seh_try.exe build/unwind.exe build/cxx_exceptions.exe
+XROS_TESTS = build/xros_clear.exe build/d3d12.exe build/recomp/suite.exe build/hello_crt.exe build/seh_try.exe build/unwind.exe build/cxx_exceptions.exe build/xros_child.exe build/xros_input.exe build/xros_vr_depth.exe
 build/xros_clear.exe: tests/xros_clear.c
 	$(MINGW) -O1 -o $@ $< -ld3d12 -ldxgi
-xros-aot-tests: build/vxrt-aot $(XROS_TESTS)
-	XROS_SDK=$(XROS_SDK) XROS_TARGET=$(XROS_TARGET) tools/xros_aot.sh $(XROS_TESTS)
+build/xros_vr_depth.exe: tests/xros_vr_depth.c
+	$(MINGW) -O1 -o $@ $< -ld3d12 -ldxgi
+build/xros_child.exe: tests/xros_child.c
+	$(MINGW) -O1 -o $@ $<
+build/xros_input.exe: tests/xros_input.c
+	$(MINGW) -O1 -o $@ $< -lxinput
+# The arena on the headset (VISIONOS_PORT.md, "The arena"): the system maps 0x2e4000000-0xfc0000000 there, so the
+# images in the arena (a game's exe and DLLs) are made for XROS_ARENA; the app reserves it in its first constructor.
+XROS_ARENA ?= 0x7000000000
+XROS_ARENA_MB ?= 1024
+# Copies of tests under other names, so their modules are another kind: arena_* relocated into the arena (as a
+# game's exe is), fw_* as frameworks embedded in the app (dlopen), fwarena_* both. XROS_BIG_FUNCS=<n>: also
+# xros_big.exe (tools/gen_big_test.py: <n> functions; 27000 makes a module of about 300 MB) as a framework.
+XROS_ARENA_TESTS = arena_hello:hello_crt arena_seh:seh_try arena_unwind:unwind arena_suite:recomp/suite
+XROS_FW_TESTS = fw_hello:hello_crt fw_unwind:unwind fw_suite:recomp/suite
+XROS_FWARENA_TESTS = fwarena_suite:recomp/suite
+XROS_BIG_FUNCS ?= 0
+build/xros_big.exe: tools/gen_big_test.py
+	rm -rf build/xros_big && python3 tools/gen_big_test.py build/xros_big $(XROS_BIG_FUNCS) 32
+	cd build/xros_big && for f in *.c; do $(MINGW) -O1 -c $$f & done; wait
+	$(MINGW) -o $@ build/xros_big/*.o
+xros-aot-tests: build/vxrt-aot $(XROS_TESTS) $(if $(filter-out 0,$(XROS_BIG_FUNCS)),build/xros_big.exe)
+	rm -rf build/xros/t && mkdir -p build/xros/t
+	for t in $(XROS_ARENA_TESTS) $(XROS_FW_TESTS) $(XROS_FWARENA_TESTS); do cp build/$${t#*:}.exe build/xros/t/$${t%%:*}.exe; done
+	XROS_SDK=$(XROS_SDK) XROS_TARGET=$(XROS_TARGET) XROS_ARENA=$(XROS_ARENA) XROS_ARENA_MB=$(XROS_ARENA_MB) tools/xros_aot.sh $(XROS_TESTS) \
+	  $(foreach t,$(XROS_ARENA_TESTS),build/xros/t/$(firstword $(subst :, ,$(t))).exe@$(XROS_ARENA)) \
+	  $(foreach t,$(XROS_FW_TESTS),fw:build/xros/t/$(firstword $(subst :, ,$(t))).exe) \
+	  $(foreach t,$(XROS_FWARENA_TESTS),fw:build/xros/t/$(firstword $(subst :, ,$(t))).exe@$(XROS_ARENA)) \
+	  $(if $(filter-out 0,$(XROS_BIG_FUNCS)),fw:build/xros_big.exe)
 	rm -rf build/xros/bundle && mkdir -p build/xros/bundle/exe build/xros/bundle/tests/shaders12
-	cp $(XROS_TESTS) build/xros/bundle/exe/
+	cp $(XROS_TESTS) build/xros/t/*.exe $(if $(filter-out 0,$(XROS_BIG_FUNCS)),build/xros_big.exe) build/xros/bundle/exe/
 	cp tests/shaders12/*.dxil build/xros/bundle/tests/shaders12/
 # The app (xros/app, xcodegen): signed for the headset with the team's automatic profile.
 xros-app: xros-lib xros-aot-tests

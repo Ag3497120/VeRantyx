@@ -10,6 +10,7 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CATransaction.h>
+#import <GameController/GameController.h>
 #include <time.h>
 #include "ui.h"
 
@@ -21,6 +22,8 @@ static pthread_mutex_t g_ui_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_ui_cond = PTHREAD_COND_INITIALIZER;
 static int g_ui_ready;
 static UIView *g_display;                     // (the app's root view)
+static vx_window *g_key_window;               // (the top-level window last shown or activated: keyboard and mouse go there)
+static void input_start(void);
 static CGFloat g_scale = 2;
 
 void vxrt_xros_attach(UIView *display) {     // (the app, main thread: once its view has its size)
@@ -32,6 +35,7 @@ void vxrt_xros_attach(UIView *display) {     // (the app, main thread: once its 
     g_ui_ready = 1;
     pthread_cond_broadcast(&g_ui_cond);
     pthread_mutex_unlock(&g_ui_lock);
+    input_start();
 }
 static void ui_ensure(void) {
     pthread_mutex_lock(&g_ui_lock);
@@ -240,6 +244,7 @@ void vx_cocoa_destroy(vx_window *w) {
         VXWinView *v = (__bridge_transfer VXWinView *)w->native;
         w->native = w->delegate = NULL;
         v->w = NULL;
+        if (g_key_window == w) g_key_window = NULL;
         [v removeFromSuperview];
     });
 }
@@ -252,15 +257,15 @@ void vx_cocoa_show(vx_window *w, int cmd) {
         case 3:                                                                     // SW_MAXIMIZE: the whole display
             v.frame = g_display.bounds; v.hidden = NO; [g_display bringSubviewToFront:v];
             vx_window_resized(w, (int)v.bounds.size.width, (int)v.bounds.size.height);
-            vx_window_activated(w, 1);
+            vx_window_activated(w, 1); g_key_window = w;
             break;
-        default: v.hidden = NO; [g_display bringSubviewToFront:v]; vx_window_activated(w, 1);
+        default: v.hidden = NO; [g_display bringSubviewToFront:v]; vx_window_activated(w, 1); g_key_window = w;
         }
     });
 }
 void vx_cocoa_activate(vx_window *w) {
     if (!w->visible || !w->native) return;
-    on_main(^{ [g_display bringSubviewToFront:native(w)]; vx_window_activated(w, 1); });
+    on_main(^{ [g_display bringSubviewToFront:native(w)]; vx_window_activated(w, 1); g_key_window = w; });
 }
 void vx_cocoa_drag(vx_window *w) { }
 void vx_cocoa_ime_cancel(vx_window *w) { }
@@ -316,4 +321,160 @@ int vx_ui_clipboard_set(const char *utf8) {
     NSString *s = [NSString stringWithUTF8String:utf8] ?: @"";
     on_main(^{ UIPasteboard.generalPasteboard.string = s; });
     return 1;
+}
+
+// ---- present pacing -------------------------------------------------------------------------------------------------
+// visionOS has no CAMetalLayer.displaySyncEnabled, and nextDrawable did not block: Present(1) ran 1141 times a second
+// on the headset. A display link (90 Hz there) on a thread of its own counts refreshes; a present with sync interval
+// n waits until n refreshes have passed since the last one (as a flip-model present waits for its vblanks), and one
+// that is late does not wait. VXRT_XROS_PACE=0: no pacing.
+static pthread_mutex_t g_pace_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pace_cond = PTHREAD_COND_INITIALIZER;
+static uint64_t g_ticks, g_last_present_tick;
+static double g_vr_tick_time;
+float vx_xros_vr_real_hz(void);   // (src/xros_vr.m: VXRT_VR_REAL_HZ, a fixed real rate in VR)
+int vx_xros_vr_on(void);
+@interface VXPaceTarget : NSObject
+@end
+@implementation VXPaceTarget
+- (void)tick:(CADisplayLink *)l {
+    pthread_mutex_lock(&g_pace_lock);
+    if (CACurrentMediaTime() - g_vr_tick_time > 0.1) {      // (the immersive presenter's frames pace instead while they come)
+        g_ticks++;
+        pthread_cond_broadcast(&g_pace_cond);
+    }
+    pthread_mutex_unlock(&g_pace_lock);
+}
+@end
+// The immersive presenter's compositor frames (src/xros_vr.m): in VR, presents are paced by those, not the display link.
+void vx_xros_pace_tick(void) {
+    pthread_mutex_lock(&g_pace_lock);
+    g_vr_tick_time = CACurrentMediaTime();
+    g_ticks++;
+    pthread_cond_broadcast(&g_pace_cond);
+    pthread_mutex_unlock(&g_pace_lock);
+}
+static void *pace_thread(void *arg) {
+    @autoreleasepool {
+        VXPaceTarget *t = [VXPaceTarget new];
+        CADisplayLink *link = [CADisplayLink displayLinkWithTarget:t selector:@selector(tick:)];
+        int hz = vx_xros_display_hz >= 24 ? vx_xros_display_hz : 90;
+        link.preferredFrameRateRange = CAFrameRateRangeMake(hz, hz, hz);
+        [link addToRunLoop:NSRunLoop.currentRunLoop forMode:NSRunLoopCommonModes];
+        vx_log("present pacing: display link at %d Hz for sync-interval presents", hz);
+        for (;;) [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:NSDate.distantFuture];
+    }
+    return NULL;
+}
+static void pace_start(void) { pthread_t t; pthread_create(&t, NULL, pace_thread, NULL); pthread_detach(t); }
+void vx_xros_vsync_wait(unsigned sync) {
+    static int on = -1;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    if (on < 0) on = !getenv("VXRT_XROS_PACE") || atoi(getenv("VXRT_XROS_PACE")) != 0;
+    if (!on || !sync) return;
+    static unsigned min_ticks = ~0u;
+    if (min_ticks == ~0u) {                                   // (VR with VXRT_VR_REAL_HZ: at most that many real frames a second)
+        float hz = vx_xros_vr_on() ? vx_xros_vr_real_hz() : 0;
+        int dhz = vx_xros_display_hz >= 24 ? vx_xros_display_hz : 90;
+        min_ticks = hz > 0 ? (unsigned)lroundf(dhz / hz) : 0;
+        if (min_ticks) vx_log("present pacing: VR real rate %.1f a second: every %u compositor frames", hz, min_ticks);
+    }
+    if (sync < min_ticks) sync = min_ticks;
+    pthread_once(&once, pace_start);
+    pthread_mutex_lock(&g_pace_lock);
+    struct timespec deadline; clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 100 * 1000000L; if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    while (g_ticks < g_last_present_tick + sync)
+        if (pthread_cond_timedwait(&g_pace_cond, &g_pace_lock, &deadline)) break;   // (no ticks for 100 ms: the window is away)
+    g_last_present_tick = g_ticks;
+    pthread_mutex_unlock(&g_pace_lock);
+}
+
+// ---- keyboard and mouse ---------------------------------------------------------------------------------------------
+// A Bluetooth keyboard and mouse (or the Mac's, through the headset's keyboard sharing) through the Game Controller
+// framework: GCKeyboard's keys (HID usages) as the Mac key codes user32.c's table takes (WM_KEYDOWN, WM_CHAR for
+// letters, digits and space, raw keyboard input), GCMouse's moves as raw input (WM_INPUT, what games' cameras read)
+// and the pointer, its buttons as the mouse buttons at the pointer, its wheel as raw wheel input. Game controllers
+// are XInput's already (src/input.m). Touches stay the left button (VXWinView).
+static const uint8_t g_hid_to_mac[256] = {
+    [0x04] = 0x00, [0x05] = 0x0B, [0x06] = 0x08, [0x07] = 0x02, [0x08] = 0x0E, [0x09] = 0x03, [0x0A] = 0x05, [0x0B] = 0x04,   // a-h
+    [0x0C] = 0x22, [0x0D] = 0x26, [0x0E] = 0x28, [0x0F] = 0x25, [0x10] = 0x2E, [0x11] = 0x2D, [0x12] = 0x1F, [0x13] = 0x23,   // i-p
+    [0x14] = 0x0C, [0x15] = 0x0F, [0x16] = 0x01, [0x17] = 0x11, [0x18] = 0x20, [0x19] = 0x09, [0x1A] = 0x0D, [0x1B] = 0x07,   // q-x
+    [0x1C] = 0x10, [0x1D] = 0x06,                                                                                            // y z
+    [0x1E] = 0x12, [0x1F] = 0x13, [0x20] = 0x14, [0x21] = 0x15, [0x22] = 0x17, [0x23] = 0x16, [0x24] = 0x1A, [0x25] = 0x1C,   // 1-8
+    [0x26] = 0x19, [0x27] = 0x1D,                                                                                            // 9 0
+    [0x28] = 0x24, [0x29] = 0x35, [0x2A] = 0x33, [0x2B] = 0x30, [0x2C] = 0x31, [0x2D] = 0x1B, [0x2E] = 0x18, [0x2F] = 0x21,   // return esc bs tab space - = [
+    [0x30] = 0x1E, [0x31] = 0x2A, [0x33] = 0x29, [0x34] = 0x27, [0x35] = 0x32, [0x36] = 0x2B, [0x37] = 0x2F, [0x38] = 0x2C,   // ] \ ; ' ` , . /
+    [0x39] = 0x39,                                                                                                           // caps lock
+    [0x3A] = 0x7A, [0x3B] = 0x78, [0x3C] = 0x63, [0x3D] = 0x76, [0x3E] = 0x60, [0x3F] = 0x61, [0x40] = 0x62, [0x41] = 0x64,   // F1-F8
+    [0x42] = 0x65, [0x43] = 0x6D, [0x44] = 0x67, [0x45] = 0x6F,                                                              // F9-F12
+    [0x4A] = 0x73, [0x4B] = 0x74, [0x4C] = 0x75, [0x4D] = 0x77, [0x4E] = 0x79, [0x4F] = 0x7C, [0x50] = 0x7B, [0x51] = 0x7D,   // home pgup del end pgdn right left down
+    [0x52] = 0x7E,                                                                                                           // up
+    [0xE0] = 0x3B, [0xE1] = 0x38, [0xE2] = 0x3A, [0xE3] = 0x37, [0xE4] = 0x3E, [0xE5] = 0x3C, [0xE6] = 0x3D, [0xE7] = 0x36,   // ctrl shift alt cmd, right ones
+};
+static int g_shift, g_alt;
+static unsigned g_keys_seen, g_mouse_moves;
+static void key_changed(GCKeyCode usage, BOOL down) {
+    if (usage == 0xE1 || usage == 0xE5) g_shift = down;
+    if (usage == 0xE2 || usage == 0xE6) g_alt = down;
+    if (usage > 0xFF || (!g_hid_to_mac[usage] && usage != 0x04)) return;
+    int code = g_hid_to_mac[usage];
+    uint16_t ch = 0;
+    if (usage >= 0x04 && usage <= 0x1D) ch = (uint16_t)((g_shift ? 'A' : 'a') + (usage - 0x04));
+    else if (usage >= 0x1E && usage <= 0x26 && !g_shift) ch = (uint16_t)('1' + (usage - 0x1E));
+    else if (usage == 0x27 && !g_shift) ch = '0';
+    else if (usage == 0x2C) ch = ' ';
+    else if (usage == 0x28) ch = '\r';
+    if (g_keys_seen++ < 8) vx_log("input: key (HID %#x) %s -> Mac code %#x, window %p", (unsigned)usage, down ? "down" : "up", code, g_key_window);
+    if (!g_key_window) return;
+    if (down && ch) vx_key_event_chars(g_key_window, code, 1, 0, g_alt, &ch, 1, 0);
+    else vx_key_event(g_key_window, code, down, 0, g_alt);
+}
+static void mouse_button(int which, BOOL down) {
+    static const struct { int vk; uint32_t down, up; WPARAM mk; } b[3] = {
+        { 1, WM_LBUTTONDOWN, WM_LBUTTONUP, 0x01 }, { 2, WM_RBUTTONDOWN, WM_RBUTTONUP, 0x02 }, { 4, WM_MBUTTONDOWN, WM_MBUTTONUP, 0x10 } };
+    vx_mouse_button(b[which].vk, down);
+    vx_raw_mouse(0, 0, (uint16_t)((down ? 1 : 2) << (2 * which)), 0);
+    if (g_key_window) vx_mouse_input(g_key_window, down ? b[which].down : b[which].up, down ? b[which].mk : 0,
+                                     (int)vx_xros_pointer_x, (int)vx_xros_pointer_y);
+}
+static void mouse_attach(GCMouse *m) {
+    GCMouseInput *in = m.mouseInput;
+    vx_log("input: mouse connected (%s)", m.vendorName.UTF8String ?: "?");
+    in.mouseMovedHandler = ^(GCMouseInput *mi, float dx, float dy) {
+        (void)mi;
+        vx_raw_mouse((int)lroundf(dx), (int)lroundf(-dy), 0, 0);       // (GCMouse's y runs up; raw input's down)
+        vx_xros_pointer_x = fmin(fmax(vx_xros_pointer_x + dx, 0), vx_xros_display_w - 1);
+        vx_xros_pointer_y = fmin(fmax(vx_xros_pointer_y - dy, 0), vx_xros_display_h - 1);
+        vx_xros_last_input = CFAbsoluteTimeGetCurrent();
+        if (g_mouse_moves++ < 3) vx_log("input: mouse move %.1f %.1f", dx, dy);
+        if (g_key_window) vx_mouse_input(g_key_window, WM_MOUSEMOVE, 0, (int)vx_xros_pointer_x, (int)vx_xros_pointer_y);
+    };
+    in.leftButton.pressedChangedHandler = ^(GCControllerButtonInput *bi, float v, BOOL p) { (void)bi; (void)v; mouse_button(0, p); };
+    in.rightButton.pressedChangedHandler = ^(GCControllerButtonInput *bi, float v, BOOL p) { (void)bi; (void)v; mouse_button(1, p); };
+    in.middleButton.pressedChangedHandler = ^(GCControllerButtonInput *bi, float v, BOOL p) { (void)bi; (void)v; mouse_button(2, p); };
+    in.scroll.yAxis.valueChangedHandler = ^(GCControllerAxisInput *ax, float v) {
+        (void)ax;
+        if (v != 0) vx_raw_mouse(0, 0, 0x400 /* RI_MOUSE_WHEEL */, (int16_t)lroundf(v * 120));
+    };
+}
+static void keyboard_attach(GCKeyboard *k) {
+    vx_log("input: keyboard connected (%s)", k.vendorName.UTF8String ?: "?");
+    k.keyboardInput.keyChangedHandler = ^(GCKeyboardInput *ki, GCControllerButtonInput *b, GCKeyCode code, BOOL pressed) {
+        (void)ki; (void)b; key_changed(code, pressed);
+    };
+}
+static void input_start(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+        [nc addObserverForName:GCKeyboardDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
+                    usingBlock:^(NSNotification *n) { keyboard_attach(n.object); }];
+        [nc addObserverForName:GCMouseDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
+                    usingBlock:^(NSNotification *n) { mouse_attach(n.object); }];
+        if (GCKeyboard.coalescedKeyboard) keyboard_attach(GCKeyboard.coalescedKeyboard);
+        for (GCMouse *m in GCMouse.mice) mouse_attach(m);
+        vx_log("input: keyboard %s, %lu mice, %lu controllers at start", GCKeyboard.coalescedKeyboard ? "yes" : "no",
+               (unsigned long)GCMouse.mice.count, (unsigned long)GCController.controllers.count);
+    });
 }

@@ -31,3 +31,8 @@ void npu_interp_scene(void *motion_vectors, void *depth, uint64_t shader, const 
 // constants: the upscaled scene, before any UI) with npu_interp_scene_color, the last of each frame
 int npu_interp_wants_scene_color(uint32_t *w, uint32_t *h);
 void npu_interp_scene_color(void *texture, uint64_t shader);
+// The immersive presenter (src/xros_vr.m, visionOS) takes this frame's scene instead of the race's own slot: retained
+// motion vectors and depth (CFBridgingRelease them) and FSR2's constants; 0: none this frame, 1: without constants,
+// 3: with them. npu_fsr2_parse: those constants read as FSR 2.0-2.2's (0: not plausible; see npu_interp.m).
+int npu_interp_take_scene(void **mv, void **depth, uint32_t consts[32]);
+int npu_fsr2_parse(const uint32_t *consts, float *tan_half_fov_y, float d2v[4], float mvs[2], uint32_t disp[2]);

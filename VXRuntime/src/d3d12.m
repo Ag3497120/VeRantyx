@@ -34,6 +34,10 @@
 #include "gpu_ir_msl.h"
 #include "npu_interp.h"
 #include "stereo.h"
+#if VX_XROS
+#include "xros_vr.h"
+static void vr_release_waitable12(void *w) { vx_release_semaphore(w, 1); }
+#endif
 #include "upscale_core.h"
 #include <float.h>
 #include <malloc/malloc.h>
@@ -756,6 +760,10 @@ static const char *shader_cache_dir12(void) {
         const char *e = getenv("VXRT_D3D12_SHADER_CACHE");
         if (e && !strcmp(e, "0")) return;
         if (e && *e) snprintf(dir, sizeof dir, "%s", e);
+#if VX_XROS
+        // (visionOS: the app's Documents/shadercache, filled from the Mac: tools/xros_shadercache.sh)
+        else if (getenv("HOME")) snprintf(dir, sizeof dir, "%s/Documents/shadercache", getenv("HOME"));
+#endif
         else if (getenv("HOME")) snprintf(dir, sizeof dir, "%s/Library/Caches/VXRuntime/metallib", getenv("HOME"));
         if (*dir) [[NSFileManager defaultManager] createDirectoryAtPath:@(dir) withIntermediateDirectories:YES attributes:nil error:nil];
     });
@@ -773,8 +781,20 @@ static uint64_t shader_cache_key12(NSString *source, MTLCompileOptions *options,
 }
 static void shader_cache_store12(NSString *source, uint64_t key, int std32, int min_lod, int safe) {
 #if VX_XROS
-    // visionOS: no offline compiler on the device (VISIONOS_PORT.md: the libraries come made from the Mac instead)
-    (void)source; (void)key; (void)std32; (void)min_lod; (void)safe;
+    // visionOS: no offline compiler on the device. Every source compiled here is written to <folder>/pending/<key>.metal
+    // with its options (<key>.flags: std32 min_lod safe); tools/xros_shadercache.sh takes them to the Mac, compiles
+    // them there with xcrun -sdk xros metal into <key>.metallib under the same key and puts those in <folder>, which
+    // the next start loads instead of compiling (VISIONOS_PORT.md, "shaders").
+    const char *dir = shader_cache_dir12();
+    if (!dir) return;
+    char base[1200];
+    snprintf(base, sizeof base, "%s/pending", dir);
+    mkdir(base, 0755);
+    snprintf(base, sizeof base, "%s/pending/%016llx", dir, (unsigned long long)key);
+    NSString *b = @(base);
+    [source writeToFile:[b stringByAppendingString:@".metal"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [[NSString stringWithFormat:@"%d %d %d\n", std32, min_lod, safe] writeToFile:[b stringByAppendingString:@".flags"] atomically:YES
+                                                                         encoding:NSUTF8StringEncoding error:nil];
 }
 #else
     const char *dir = shader_cache_dir12();
@@ -808,6 +828,7 @@ static void shader_cache_store12(NSString *source, uint64_t key, int std32, int 
     });
 }
 #endif
+static unsigned g_cache_hits12, g_cache_misses12;
 static id<MTLLibrary> library_with_timeout12(id<MTLDevice> mtl, NSString *source, MTLCompileOptions *options, NSError **error) {
     uint64_t t0 = fs_now12();
     int std32 = 0, min_lod = 0, safe = 0;
@@ -818,15 +839,27 @@ static id<MTLLibrary> library_with_timeout12(id<MTLDevice> mtl, NSString *source
         char path[1200];
         snprintf(path, sizeof path, "%s/%016llx.metallib", dir, (unsigned long long)key);
         if (access(path, R_OK) == 0) {
-            id<MTLLibrary> lib = [mtl newLibraryWithURL:[NSURL fileURLWithPath:@(path)] error:nil];
-            if (lib) { FS_ADD12(compile_n, 1); FS_ADD12(compile_ns, fs_now12() - t0); return lib; }
+            NSError *le = nil;
+            id<MTLLibrary> lib = [mtl newLibraryWithURL:[NSURL fileURLWithPath:@(path)] error:&le];
+            if (lib) {
+                FS_ADD12(compile_n, 1); FS_ADD12(compile_ns, fs_now12() - t0);
+                unsigned n = __atomic_add_fetch(&g_cache_hits12, 1, __ATOMIC_RELAXED);
+                if (n <= 3 || !(n & (n - 1)) || VX_XROS) vx_log("D3D12: shader cache: %016llx.metallib loaded (%.1f ms; hit %u, %u compiled from source)",
+                                                 (unsigned long long)key, (fs_now12() - t0) / 1e6, n, g_cache_misses12);
+                return lib;
+            }
+            vx_log("D3D12: shader cache: %016llx.metallib unreadable (%s): compiled again", (unsigned long long)key, le.localizedDescription.UTF8String ?: "?");
             unlink(path);                                          // (unreadable: compiled again)
         }
     }
     id<MTLLibrary> lib = library_with_timeout12_(mtl, source, options, error);
     uint64_t took = fs_now12() - t0;
     FS_ADD12(compile_n, 1); FS_ADD12(compile_ns, took);
-    if (dir && took > 200000000ull) shader_cache_store12(source, key, std32, min_lod, safe);
+    if (dir) {
+        unsigned n = __atomic_add_fetch(&g_cache_misses12, 1, __ATOMIC_RELAXED);
+        if (VX_XROS) vx_log("D3D12: shader cache: %016llx not in the cache: compiled from source (%.1f ms; %u so far)", (unsigned long long)key, took / 1e6, n);
+    }
+    if (dir && (took > 200000000ull || VX_XROS)) shader_cache_store12(source, key, std32, min_lod, safe);
     return lib;
 }
 static id<MTLLibrary> library_with_timeout12_(id<MTLDevice> mtl, NSString *source, MTLCompileOptions *options, NSError **error) {
@@ -9187,6 +9220,9 @@ static const char *stereo_dir12(void) {
 static __thread uint32_t t_st_writes12;
 static int g_st_live12 = -1;                         // (VXRT_STEREO=1: stereo.m takes the scene's depth at each pass end)
 static int stereo_watch12(void) {
+#if VX_XROS
+    if (g_st_live12 < 0) g_st_live12 = vx_stereo_on() || vx_xros_vr_on();   // (the immersive presenter takes the scene's depth too)
+#endif
     if (g_st_live12 < 0) g_st_live12 = vx_stereo_on();
     return g_st_armed12 || g_st_live12;
 }
@@ -9207,7 +9243,10 @@ static void stereo_closed12(id<MTLCommandBuffer> cb) {
     if (!t_st_depth12) return;
     id<MTLTexture> t = (id<MTLTexture>)CFBridgingRelease(t_st_depth12);
     t_st_depth12 = NULL;
-    if (g_st_live12 > 0) vx_stereo_depth_pass((__bridge void *)cb, (__bridge void *)t, t_st_draws12, t_st_writes12, t_st_funcs12);
+    if (g_st_live12 > 0 && vx_stereo_on()) vx_stereo_depth_pass((__bridge void *)cb, (__bridge void *)t, t_st_draws12, t_st_writes12, t_st_funcs12);
+#if VX_XROS
+    if (g_st_live12 > 0 && vx_xros_vr_on()) vx_xros_vr_depth_pass((__bridge void *)cb, (__bridge void *)t, t_st_draws12, t_st_writes12, t_st_funcs12);
+#endif
     if (!g_st_armed12 || !t_st_draws12 || t.sampleCount > 1 || t.textureType != MTLTextureType2D) return;
     MTLPixelFormat f = t.pixelFormat;
     uint32_t bpp = f == MTLPixelFormatDepth16Unorm ? 2 : 4;
@@ -13869,6 +13908,20 @@ static void stereo_present12(swap12 *sc, uint32_t index) {
 }
 // (the copy of the back buffer into the drawable, and the present: on the queue's thread with VXRT_D3D12_ASYNC_SUBMIT)
 static void swap_present_now12(swap12 *sc, uint32_t index, id<CAMetalDrawable> drawable, HANDLE waitable) {
+#if VX_XROS
+    if (vx_xros_vr_on()) {                                         // (the immersive presenter shows it: src/xros_vr.m)
+        id<MTLCommandBuffer> vcb = [sc->queue->mtl_queue commandBuffer];
+        pthread_mutex_lock(&sc->dev->submit_lock);
+        @autoreleasepool {
+            vx_xros_vr_submit((__bridge void *)vcb, (__bridge void *)sc->buffers[index]->texture, sc->src_width, sc->src_height,
+                              waitable ? vr_release_waitable12 : NULL, waitable);
+            cb_trace12(vcb, (int)sc->queue->desc.Type, 'P', sc, sc->presents, 0, NULL);
+            [vcb commit];
+        }
+        pthread_mutex_unlock(&sc->dev->submit_lock);
+        return;
+    }
+#endif
     int queued = 0, npu = npu_interp_on((__bridge void *)sc->layer);   // (VXRT_NPU_INTERP: npu_interp.m shows it)
     id<MTLCommandBuffer> cb = drawable || npu ? [sc->queue->mtl_queue commandBuffer] : nil;   // (before the lock: may wait)
     // (the snapshot waits for the GPU: not with the submission lock held, which another queue's Signal the GPU may be
@@ -14071,7 +14124,9 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
     swap12 *sc = this;
     if (flags & 1) return S_OK;                                    // DXGI_PRESENT_TEST
     if (sync > 4) return DXGI_ERROR_INVALID_CALL;
-#if !VX_XROS   // (visionOS: the system paces CAMetalLayer)
+#if VX_XROS   // (no displaySyncEnabled there: a display link paces sync-interval presents, src/xros_ui.m)
+    vx_xros_vsync_wait(sync);
+#else
     sc->layer.displaySyncEnabled = sync != 0;
 #endif
     HANDLE waitable = sc->flags & SWAP_FLAG_FRAME_LATENCY_WAITABLE ? sc->waitable : NULL;
@@ -14079,7 +14134,11 @@ static WINAPI HRESULT swap_present(void *this, uint32_t sync, uint32_t flags) {
         // (the drawable is waited for before the submission lock: a wait for the display holds up no other thread's
         //  ExecuteCommandLists)
         uint64_t t0 = fs_now12();
+#if VX_XROS
+        id<CAMetalDrawable> drawable = vx_xros_vr_on() || npu_interp_on((__bridge void *)sc->layer) ? nil : [sc->layer nextDrawable];
+#else
         id<CAMetalDrawable> drawable = npu_interp_on((__bridge void *)sc->layer) ? nil : [sc->layer nextDrawable];
+#endif
         FS_ADD12(drawable_ns, fs_now12() - t0);
         if (sc->queue->async) {
             qjob12 *j = calloc(1, sizeof *j);

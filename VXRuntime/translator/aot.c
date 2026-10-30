@@ -33,6 +33,10 @@ int xa_any(void) { return g_nmod > 0; }
 // visionOS an app may load no code made after it was signed, so the modules are linked into it and the app's
 // registry (xros/app, generated with the modules: vxrt_aot_static) answers for those same file names.
 #if VX_XROS
+// Two ways in the app: a signed framework embedded in it (Frameworks/<fw>.framework/<fw>, opened with dlopen: an app
+// may load its own signed code), for large modules (a game's 36, 1.3 GB), and the static registry (modules linked
+// into the executable), for small test programs and as the fallback. <fw> is the module's file name made a bundle
+// name (xa_fw_name; tools/xros_aot.sh names them the same way).
 typedef struct { const char *name; const xa_desc *desc; } xa_static;
 extern const xa_static vxrt_aot_static[];          // ({ NULL, NULL } at the end)
 static const xa_desc *static_module(const char *path) {
@@ -40,10 +44,37 @@ static const xa_desc *static_module(const char *path) {
     for (const xa_static *m = vxrt_aot_static; m->name; m++) if (!strcasecmp(m->name, name)) return m->desc;
     return NULL;
 }
-int xa_module_exists(const char *path) { return static_module(path) != NULL; }
+#include <mach-o/dyld.h>
+static void fw_path(const char *path, char *out, size_t n) {
+    const char *slash = strrchr(path, '/'), *name = slash ? slash + 1 : path;
+    char fw[200] = "VXA_"; size_t k = 4;
+    for (const char *c = name; *c && k + 1 < sizeof fw; c++) {
+        if (!strcmp(c, ".dylib")) break;
+        fw[k++] = isalnum((unsigned char)*c) ? (char)tolower((unsigned char)*c) : '_';
+    }
+    fw[k] = 0;
+    char exe[2048]; uint32_t len = sizeof exe;
+    if (_NSGetExecutablePath(exe, &len)) exe[0] = 0;
+    char *e = strrchr(exe, '/'); if (e) *e = 0;          // (an app on visionOS is flat: <App>.app/<exe>, <App>.app/Frameworks)
+    snprintf(out, n, "%s/Frameworks/%s.framework/%s", exe, fw, fw);
+}
+int xa_module_exists(const char *path) {
+    char fw[2400]; fw_path(path, fw, sizeof fw);
+    return !access(fw, R_OK) || static_module(path) != NULL;
+}
 static const xa_desc *open_module(const char *path) {
+    char fw[2400]; fw_path(path, fw, sizeof fw);
+    if (!access(fw, R_OK)) {
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        void *h = dlopen(fw, RTLD_NOW | RTLD_LOCAL);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const xa_desc *d = h ? dlsym(h, "vxrt_aot_module") : NULL;
+        vx_log("aot: framework %s: %s in %.1f ms", strrchr(fw, '/') + 1, d ? "opened" : dlerror(),
+               (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);   // (twice a module: xa_module_base opens it first)
+        if (d) return d;
+    }
     const xa_desc *d = static_module(path);
-    if (!d) vx_log("aot: %s is not linked into this app", path);
+    if (!d) vx_log("aot: %s is neither a framework in the app nor linked into it", path);
     return d;
 }
 #else
@@ -79,12 +110,36 @@ int xa_load(const char *path, uint64_t base, uint64_t size, uint64_t hash) {
     return 0;
 }
 
-// The arena: 512 MB at 0xf00000000 (VXRT_AOT_ARENA=<hex>), where modules' images are made for (vxrt-aot with
-// VXRT_AOT_BASE: the exe relocated too), reserved at start. Below 0x1000000000 (a macOS 14 process's end) the system
+// The arena: 512 MB at 0xf00000000 (VXRT_AOT_ARENA=<hex>, VXRT_AOT_ARENA_MB), where modules' images are made for
+// (vxrt-aot with VXRT_AOT_BASE: the exe relocated too), reserved at start. Below 0x1000000000 (a macOS 14 process's end) the system
 // has already placed randomized regions by main (malloc's 128 MB chunks, two 12 GB ones, the runtime's own dylibs near
 // 0x140000000 as ASLR falls); this range is free about 9 times in 10, and main starts again when it is not.
 // An image whose base is in the arena is mapped over the reservation.
+// visionOS: the system maps 0x2e4000000-0xfc0000000 in every app on the headset, so the arena is wherever the
+// modules linked into (or embedded in) the app were made for: the registry says (vxrt_aot_arena_base/_size, from
+// tools/xros_aot.sh's XROS_ARENA), and the app reserves it in its first constructor.
 static uint64_t g_arena_lo, g_arena_hi;
+#if VX_XROS
+extern const uint64_t vxrt_aot_arena_base, vxrt_aot_arena_size;
+#endif
+uint64_t xa_arena_base(void) {
+    if (g_arena_hi) return g_arena_lo;
+    if (getenv("VXRT_AOT_ARENA")) return strtoull(getenv("VXRT_AOT_ARENA"), NULL, 16);
+#if VX_XROS
+    return vxrt_aot_arena_base;
+#else
+    return 0xf00000000ull;
+#endif
+}
+uint64_t xa_arena_size(void) {
+    if (g_arena_hi) return g_arena_hi - g_arena_lo;
+    if (getenv("VXRT_AOT_ARENA_MB")) return strtoull(getenv("VXRT_AOT_ARENA_MB"), NULL, 10) << 20;
+#if VX_XROS
+    return vxrt_aot_arena_size;
+#else
+    return 0x20000000ull;
+#endif
+}
 int xa_reserve(void) {
     if (g_arena_hi) return 1;                                  // (visionOS: the app reserves it first, xros/app)
     if (getenv("VXRT_AOT_MAPDUMP")) {
@@ -96,8 +151,8 @@ int xa_reserve(void) {
             r += rs;
         }
     }
-    mach_vm_address_t a = getenv("VXRT_AOT_ARENA") ? strtoull(getenv("VXRT_AOT_ARENA"), NULL, 16) : 0xf00000000ull;
-    mach_vm_size_t n = 0x20000000ull;
+    mach_vm_address_t a = xa_arena_base();
+    mach_vm_size_t n = xa_arena_size();
     if (mach_vm_allocate(mach_task_self(), &a, n, VM_FLAGS_FIXED) == KERN_SUCCESS) { g_arena_lo = a; g_arena_hi = a + n; return 1; }
     else {
         vx_log("aot: the image arena at %#llx is taken: modules there are not used", (unsigned long long)a);

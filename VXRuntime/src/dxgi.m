@@ -538,7 +538,9 @@ static WINAPI HRESULT swapchain_present(void *this, uint32_t sync, uint32_t flag
     static uint64_t frames;
     if (every > 1 && frames++ % (uint64_t)every) { sc->presents++; return S_OK; }
     CAMetalLayer *layer = (__bridge CAMetalLayer *)sc->layer;
-#if !VX_XROS   // (visionOS: the system paces CAMetalLayer)
+#if VX_XROS   // (no displaySyncEnabled there: a display link paces sync-interval presents, src/xros_ui.m)
+    vx_xros_vsync_wait(sync);
+#else
     layer.displaySyncEnabled = sync != 0;
 #endif
     @autoreleasepool {

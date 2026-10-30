@@ -45,6 +45,7 @@ int xa_module_exists(const char *path);             // a module of that file nam
 // The base the module for this file (dir/<name lowercased>-<hash>[.p0].dylib) was made for; 0 when there is none.
 int xa_reserve(void);                              // VXRT_AOT_DIR: at start (aot.c); 0: the range is taken
 int xa_in_arena(uint64_t a, uint64_t n);
+uint64_t xa_arena_base(void), xa_arena_size(void);   // (where the arena is or will be)
 uint64_t xa_module_base(const char *dir, const char *path, uint64_t hash);
 // Runs the program from ctx->rip until stop like xe_run: in a module's code when the address is one of its blocks,
 // a native function (find) called from here, anything else on the engine (counted: the fallback; VXRT_AOT_STRICT=1

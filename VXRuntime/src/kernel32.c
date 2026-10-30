@@ -468,6 +468,17 @@ static BOOL create_process(const char *app, const char *cmd, const void *env_blo
         vx_set_last_error(193 /* ERROR_BAD_EXE_FORMAT */);
         return 0;
     }
+#if VX_XROS
+    // An app on visionOS starts no processes (VISIONOS_PORT.md): CreateProcess fails as Windows' does when policy
+    // forbids the program, before anything is started, and the caller goes on (Cyberpunk starts
+    // REDEngineErrorReporter.exe beside itself and runs without it).
+    vx_log("CreateProcess: %s not started: this app may start no processes (ERROR_ACCESS_DENIED)", exe);
+    for (int i = 0; i < argc; i++) free(args[i]);
+    free(args);
+    (void)env_block; (void)wide_env; (void)dir; (void)si; (void)pi;
+    vx_set_last_error(5 /* ERROR_ACCESS_DENIED */);
+    return 0;
+#endif
     char self[1024]; uint32_t len = sizeof self;
     if (_NSGetExecutablePath(self, &len)) { vx_set_last_error(8); return 0; }
     char **argv = calloc((size_t)argc + 3, sizeof *argv);

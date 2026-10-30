@@ -1,6 +1,11 @@
 // x86-64 -> ARM64: general-purpose integer instructions (phase 2). See xlat.h for the register convention.
 #include <sys/sysctl.h>
 #include "xlat.h"
+// Where the x86 code being translated is read from: at its own address (the engine, the runtime), or, in vxrt-aot when
+// the image could not be mapped at the base its module is made for (the visionOS arena, a range this Mac's processes
+// do not have), at that address plus xlat_code_delta (the generator's copy).
+int64_t xlat_code_delta;
+#define XCODE(a) ((const uint8_t *)(uintptr_t)((uint64_t)(a) + (uint64_t)xlat_code_delta))
 #include "a64.h"
 #include "x87.h"
 #include <stdio.h>
@@ -1704,7 +1709,7 @@ static uint16_t flags_read_at(uint64_t r, uint64_t lo, uint64_t hi, uint64_t sto
     for (int k = 0; k < 16 && want; k++) {
         if (r < lo || r + 15 > hi || r == stop) return read | (want & unseen);
         x86_insn d;
-        if (!x86_decode((const uint8_t *)(uintptr_t)r, 15, &d)) return read | (want & unseen);
+        if (!x86_decode(XCODE(r), 15, &d)) return read | (want & unseen);
         fx f = flag_fx(&d);
         if (is_jmp_call(&d)) { r += d.len + (uint64_t)d.imm; continue; }   // (JMP, CALL: on at the target)
         if (known && d.map == X86_MAP_1 && (d.opcode == 0xC3 || d.opcode == 0xC2 || (d.opcode == 0xFF && ((d.reg & 7) == 2 || (d.reg & 7) == 4)))) return read;
@@ -1780,7 +1785,7 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
     x86_insn ins[MAXI]; uint16_t dead[MAXI];
     int n = 0;
     for (uint64_t r = rip; n < max_insns && n < MAXI; n++) {
-        if (!x86_decode((const uint8_t *)(uintptr_t)r, 15, &ins[n])) break;
+        if (!x86_decode(XCODE(r), 15, &ins[n])) break;
         r += ins[n].len;
         xlat_buf probe = { 0 };                                           // (a trap or a branch ends the block)
         int t = trap(&probe, &ins[n], r - ins[n].len);
@@ -1795,7 +1800,7 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
     if (n && b->check_bytes) {
         size_t slen = 0;
         for (int i = 0; i < n; i++) slen += ins[i].len;
-        memcpy(snap, (const uint8_t *)(uintptr_t)rip, slen);
+        memcpy(snap, XCODE(rip), slen);
         int m = 0;
         for (size_t at = 0; m < n; ) {
             if (!x86_decode(snap + at, slen - at, &ins[m])) break;
@@ -1821,7 +1826,7 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
         while (at < len) {
             int sz = len - at >= 8 ? 8 : len - at >= 4 ? 4 : len - at >= 2 ? 2 : 1;
             uint64_t want = 0;
-            memcpy(&want, snapped ? snap + at : (const uint8_t *)(uintptr_t)(rip + at), (size_t)sz);
+            memcpy(&want, snapped ? snap + at : XCODE(rip + at), (size_t)sz);
             E(b, a64_ld_post(sz, S0, T_ADDR, sz));
             mov_imm(b, S1, want);
             E(b, a64_cmp(S0, S1));
@@ -1911,7 +1916,7 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
     for (int i = 0; i < max_insns; i++) {
         x86_insn d;
         if (snapped) { if (i >= n) break; d = ins[i]; }                   // (the copy's: what the check compares)
-        else if (!x86_decode((const uint8_t *)(uintptr_t)rip, 15, &d)) return -1;
+        else if (!x86_decode(XCODE(rip), 15, &d)) return -1;
         b->dead_flags = i < n ? dead[i] : 0;
         b->keep_operands = fuse_k && i == fuse_p;
         imap_mark(b, rip);
@@ -1945,12 +1950,12 @@ static int block_linked(xlat_buf *b, uint64_t rip, int max_insns, uint64_t *end)
             int cc = ins[n - 1].opcode & 15;
             if (cc == 2 || cc == 3 || cc == 6 || cc == 7 || cc == 0xA || cc == 0xB) b->fp_fuse = cc + 1;
         }
-        int r = xlat_insn(b, &d, (const uint8_t *)(uintptr_t)rip, rip);
+        int r = xlat_insn(b, &d, XCODE(rip), rip);
         b->fp_fuse = 0;
         if (r >= 0 && i == lazy_at && !b->lazy_done) {                    // (not through flags_arith: computed after all)
             b->n = n0; b->nrelocs = r0; b->ncold = c0;
             b->lazy_record = 0; b->dead_flags = lazy_dead;
-            r = xlat_insn(b, &d, (const uint8_t *)(uintptr_t)rip, rip);
+            r = xlat_insn(b, &d, XCODE(rip), rip);
         }
         b->dead_flags = 0; b->keep_operands = 0; b->lazy_record = 0;
         if (r < 0) return -1;
@@ -1983,12 +1988,12 @@ int xlat_block(xlat_buf *b, uint64_t rip, int max_insns) {
     xlat_prologue(b);
     for (int i = 0; i < max_insns; i++) {
         x86_insn d;
-        if (!x86_decode((const uint8_t *)(uintptr_t)rip, 15, &d)) return -1;
+        if (!x86_decode(XCODE(rip), 15, &d)) return -1;
         if (trap(b, &d, rip)) { E(b, a64_str(8, S1, XC, CTX_RIP)); break; }
         int c = control(b, &d, rip);
         if (c < 0) return -1;
         if (c) { E(b, a64_str(8, S1, XC, CTX_RIP)); break; }
-        if (xlat_insn(b, &d, (const uint8_t *)(uintptr_t)rip, rip) < 0) return -1;
+        if (xlat_insn(b, &d, XCODE(rip), rip) < 0) return -1;
         if (d.map == X86_MAP_1 && (d.opcode == 0xF6 || d.opcode == 0xF7) && (d.reg & 7) >= 6 && nexits < 64) {
             // DIV / IDIV may raise #DE: then the block ends here, RIP at the instruction.
             E(b, a64_ldr(8, S0, XC, CTX_FAULT));

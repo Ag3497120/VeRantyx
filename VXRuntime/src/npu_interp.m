@@ -62,6 +62,9 @@
 #include "npu_interp.h"
 #include "npu_proto.h"
 #include "warp_core.h"
+#if VX_XROS
+#include "xros_vr.h"
+#endif
 
 extern char **environ;
 
@@ -1235,7 +1238,25 @@ void npu_interp_scene_color(void *texture, uint64_t cs) {
 int npu_interp_wants_scene(void) {
     static int off = -1;                                           // (VXRT_NPU_RACE_MV=0: the optical flow only)
     if (off < 0) SC.off = off = getenv("VXRT_NPU_RACE_MV") && !atoi(getenv("VXRT_NPU_RACE_MV"));
+#if VX_XROS
+    // (the immersive presenter, src/xros_vr.m: the race's predictions are its warps at the compositor's rate, from the
+    //  same motion vectors and depth; no CAMetalLayer present goes through npu_interp_frame then)
+    if (vx_xros_vr_on()) {
+        static int race = -1;
+        if (race < 0) race = getenv("VXRT_NPU_INTERP") && !strcmp(getenv("VXRT_NPU_INTERP"), "race");
+        return race && !off;
+    }
+#endif
     return g.state > 0 && g.race && !off && !g.race_nomv && g.switch_on;
+}
+int npu_interp_take_scene(void **mv, void **dp, uint32_t consts[32]) {
+    os_unfair_lock_lock(&SC.lock);
+    int r = SC.mv && SC.dp ? 1 + (SC.has_consts ? 2 : 0) : 0;
+    if (r) { *mv = (__bridge_retained void *)SC.mv; *dp = (__bridge_retained void *)SC.dp; memcpy(consts, SC.consts, sizeof SC.consts); }
+    SC.mv = SC.dp = SC.col = nil;
+    SC.prio = -1;
+    os_unfair_lock_unlock(&SC.lock);
+    return r;
 }
 
 // FSR2's constants. Layouts:
@@ -1269,6 +1290,9 @@ static int fsr2_parse(const uint32_t *w, float *tan_half_fov_y, float d2v[4], fl
         return 1;
     }
     return 0;
+}
+int npu_fsr2_parse(const uint32_t *w, float *tan_half_fov_y, float d2v[4], float mvs[2], uint32_t disp[2]) {
+    return fsr2_parse(w, tan_half_fov_y, d2v, mvs, disp);
 }
 
 // Which of a frame's candidates is FSR2's own input: several dispatches read a two-channel float texture and a depth of

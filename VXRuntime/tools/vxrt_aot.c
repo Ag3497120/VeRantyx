@@ -13,8 +13,10 @@
 // VXRT_AOT_BASE=<hex>: the image as loaded at that address (relocated), for a DLL the runtime cannot map at its
 // preferred base; the runtime then maps the file where its module says (src/loader.c).
 //
-// The image is mapped at its preferred base in this process, as the runtime maps it: the translator reads code at the
-// addresses it will run at.
+// The image is mapped at its preferred base (or VXRT_AOT_BASE) in this process, as the runtime maps it: the translator
+// reads code at the addresses it will run at. A base this process cannot have (the visionOS arena above 0xfc0000000,
+// VISIONOS_PORT.md) gets a copy elsewhere, read at its offset (xlat_code_delta; VXRT_AOT_COPY=1 forces it, the
+// output is the same byte for byte).
 #include "../translator/xlat.h"
 #include "../translator/x86dec.h"
 #include "../translator/aot.h"
@@ -59,8 +61,9 @@ static void load(image *im, const char *path) {
         uint32_t sz = r32(h + hpe + 24 + 56);
         // (exactly there, never over a mapping: mach_vm_allocate fixed; mmap takes some ranges' hints as no hint)
         mach_vm_address_t a = b;
-        if (mach_vm_allocate(mach_task_self(), &a, sz, VM_FLAGS_FIXED) == KERN_SUCCESS) im->mem = (uint8_t *)(uintptr_t)a;
-        else if (!getenv("VXRT_AOT_RESTARTS") || atoi(getenv("VXRT_AOT_RESTARTS")) < 8) {
+        if (getenv("VXRT_AOT_COPY")) im->mem = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);   // (the test of the copy)
+        else if (mach_vm_allocate(mach_task_self(), &a, sz, VM_FLAGS_FIXED) == KERN_SUCCESS) im->mem = (uint8_t *)(uintptr_t)a;
+        else if (b < 0xfc0000000ull && (!getenv("VXRT_AOT_RESTARTS") || atoi(getenv("VXRT_AOT_RESTARTS")) < 8)) {
             // (the system's randomized regions cover it this time: they fall elsewhere in a new process)
             char n[8], self[4096]; uint32_t len = sizeof self;
             snprintf(n, sizeof n, "%d", getenv("VXRT_AOT_RESTARTS") ? atoi(getenv("VXRT_AOT_RESTARTS")) + 1 : 1);
@@ -90,7 +93,13 @@ static void load(image *im, const char *path) {
         s->vsize = r32(d + so + 8); s->va = r32(d + so + 12); s->raw_size = r32(d + so + 16); s->raw_ptr = r32(d + so + 20); s->flags = r32(d + so + 36);
     }
     if (!im->mem) im->mem = mmap((void *)(uintptr_t)im->base, im->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (im->mem == MAP_FAILED || (uint64_t)(uintptr_t)im->mem != im->base) die("cannot map %s at its base %#llx", path, (unsigned long long)im->base);
+    if (im->mem == MAP_FAILED) die("cannot map %s (%u bytes)", path, im->size);
+    // (a base this Mac's processes cannot have: the visionOS arena, VISIONOS_PORT.md. Above 0xfc0000000 the system
+    // reserves up to 0x7000000000 here. The copy is elsewhere and the translator reads the code at its offset.)
+    if ((uint64_t)(uintptr_t)im->mem != im->base) {
+        xlat_code_delta = (int64_t)((uint64_t)(uintptr_t)im->mem - im->base);
+        fprintf(stderr, "vxrt-aot: %s: made for %#llx, read from a copy at %p\n", im->name, (unsigned long long)im->base, (void *)im->mem);
+    }
     memcpy(im->mem, d, hdr < im->len ? hdr : im->len);
     for (int i = 0; i < im->nsec; i++) {
         section *s = &im->sec[i];
